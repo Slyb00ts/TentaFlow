@@ -242,6 +242,32 @@ Ostatnia aktualizacja: 2026-07-20.
     Werdykt: fp8 NIE bije MMQ na Ada w żadnym kształcie → NON-DEFAULT, wyjątek CUDA
     MMQ NIE wycofany. Wygrałby na Hopper/Blackwell lub po przepisaniu kernela na
     cp.async-multistage + stream-K. `docs/CODEGEN_PROOF.md` Finding F.
+  - ✅ **Modularowy multistage fp8 GEMM SPRODUKTYZOWANY (`FORGE_GEMM=fp8mod`,
+    non-default, 2026-07-20)** — realizuje ścieżkę z Finding F/G: zamiast hand
+    jedno-PTX kernela, komituje PRAWDZIWY `multistage_gemm_kernel` Modulara (deep
+    cp.async multistage) jako samowystarczalny AOT-PTX. `src/gemm_fp8_modular.mojo`:
+    cienki wrapper `gemm_fp8_mod[N,K]` bierze GOŁE wskaźniki + `i64 m` (każdy param
+    = 1 slot 8B, kontrakt HAL), buduje `TileTensor` device-side z DYNAMICZNYM M
+    (`Coord(m, Idx[K])`) → **JEDEN PTX na (N,K) obsługuje KAŻDE T** (M czytane
+    runtime `c.dim[0]()`; T-buckets zbędne, zweryfikowane bit-exact też dla M=100).
+    Skala per-token×per-row + cast f16 FUZOWANE w epilogu (`elementwise_lambda_fn`)
+    → bez osobnego passa. 4 instancje committed (`gemm_fp8_mod_{4096_4096,1024_4096,
+    14336_4096,4096_14336}`, kształty Mistral-7B), `_finalize_fp8` `.version→8.4`,
+    PTX samowystarczalny (0 `.extern .func`, 64× mma e4m3, 38 cp.async). Launcher
+    `gemm_fp8_modular` (grid `(⌈N/128⌉,⌈T/128⌉)`, smem 65536 opt-in), route
+    `Model::gemm_fp8` gdy `weights.fp8_modular`. **Izolowany GEMM: 213–289 TFLOPS =
+    1.0–1.4× MMQ (208)** (dyn-M + fused f16-scale), poprawność 4.2e-4 (zaokrąglenie
+    f16). **Jakość: ppl 30.5211 vs 30.3113 = +0.69 %** (identyczna numeryka fp8 jak
+    hand `fp8`), coherence PASS (Paris/Tokyo/tlen), Bielik NVFP4 golden bit-w-bit.
+    **PERF (warm best): fp8mod NIE bije domyślnego CUDA MMQ e2e w żadnym kształcie**
+    — pp512 2920 vs 6909 (0.42×), pp4096 8101 vs 8549 (0.95×), pp8192 7640 vs 8130
+    (0.94×); dekod bez zmian; llama.cpp pp4096 11991. Izolowana wygrana 1.4× GINIE
+    e2e bo ścieżka `fp8mod` KWANTYZUJE aktywację PER-PROJEKCJA (q/k/v ×3, gate/up
+    ×2), gdy MMQ fuzuje quant w RMSNorm i DZIELI go między projekcje. Werdykt: trzymać
+    za flagą, wyjątek ADR-0001 CUDA MMQ NIE wycofany na Ada; wygrałby na
+    Hopper/Blackwell. Jedyny bloker do wygranej e2e: wydzielić `quantize_act_fp8`
+    z GEMM i współdzielić `xq/xs` (fuzja w RMSNorm jak `rmsnorm_q8_1_ds4`).
+    `docs/CODEGEN_PROOF.md` Finding H.
   - ℹ️ **Pas ILP/barier i8mma (2026-07-19): każdy lever zmierzony, NIC nie
     wdrożono (no-op lub regresja).** Zaimplementowane bit-identycznie (mma int
     jest dokładne): (1) rozdział wydania mma od epilogu f32, (2) 2 k-stage'y na

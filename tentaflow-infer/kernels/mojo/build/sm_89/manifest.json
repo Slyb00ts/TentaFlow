@@ -267,6 +267,10 @@
     "quantize_act_fp8": {"file": "quantize_act_fp8.ptx", "entry": "src_gemm_fp8_quantize_act_fp86A6A6A6AoA_99bd1ce1ba1ee01f"},
     "gemm_fp8_f16": {"file": "gemm_fp8_f16.ptx", "entry": "src_gemm_fp8_gemm_fp8_impl_S6A6A6A6AcB6A6A_457fdbdb3f553891"},
     "gemm_fp8_f16_bm64": {"file": "gemm_fp8_f16_bm64.ptx", "entry": "src_gemm_fp8_gemm_fp8_impl_S6A6A6A6AcB6A6A_f16e8b4b45225540"},
-    "gemm_fp8_f16_big": {"file": "gemm_fp8_f16_big.ptx", "entry": "src_gemm_fp8_gemm_fp8_impl_S6A6A6A6AcB6A6A_cf1ce78a0c1fffe0"}
+    "gemm_fp8_f16_big": {"file": "gemm_fp8_f16_big.ptx", "entry": "src_gemm_fp8_gemm_fp8_impl_S6A6A6A6AcB6A6A_cf1ce78a0c1fffe0"},
+    "gemm_fp8_mod_4096_4096": {"file": "gemm_fp8_mod_4096_4096.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_29d591bcccb36ad0"},
+    "gemm_fp8_mod_1024_4096": {"file": "gemm_fp8_mod_1024_4096.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_a4792c9a826a07e0"},
+    "gemm_fp8_mod_14336_4096": {"file": "gemm_fp8_mod_14336_4096.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_a2587545f9130a47"},
+    "gemm_fp8_mod_4096_14336": {"file": "gemm_fp8_mod_4096_14336.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_993c88f827241145"}
   }
 }

@@ -44,6 +44,12 @@ from src.gemm import gemm_q8_0_i8mma, gemm_q8_0_i8mma_bm64, gemm_q8_0_i8mma_big
 from src.gemm import quantize_act_q8_1
 from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64, gemm_q4_k_i8mma_big
 from src.gemm_fp8 import gemm_fp8_f16, gemm_fp8_f16_bm64, gemm_fp8_f16_big, quantize_act_fp8
+from src.gemm_fp8_modular import (
+    gemm_fp8_mod_4096_4096,
+    gemm_fp8_mod_1024_4096,
+    gemm_fp8_mod_14336_4096,
+    gemm_fp8_mod_4096_14336,
+)
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128, attn_prefill_f16_hd256
 from src.prefill import kv_append_batch_fp8, attn_prefill_fp8_hd64, attn_prefill_fp8_hd128
@@ -1013,6 +1019,18 @@ def main() raises:
 
     _ = ctx.compile_function[gemm_fp8_f16_big, dump_asm=Path("gemm_fp8_f16_big.ptx")]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_f16_big"))
+
+    _ = ctx.compile_function[gemm_fp8_mod_4096_4096, dump_asm=Path("gemm_fp8_mod_4096_4096.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_4096"))
+
+    _ = ctx.compile_function[gemm_fp8_mod_1024_4096, dump_asm=Path("gemm_fp8_mod_1024_4096.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_1024_4096"))
+
+    _ = ctx.compile_function[gemm_fp8_mod_14336_4096, dump_asm=Path("gemm_fp8_mod_14336_4096.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_14336_4096"))
+
+    _ = ctx.compile_function[gemm_fp8_mod_4096_14336, dump_asm=Path("gemm_fp8_mod_4096_14336.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_14336"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

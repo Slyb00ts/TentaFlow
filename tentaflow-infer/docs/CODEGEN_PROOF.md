@@ -498,3 +498,118 @@ using Modular's own multistage kernel removes that gap at the GEMM level.
 
 Everything in this finding is scratch (nothing committed to the engine default); the committed
 CUDA MMQ default is untouched.
+
+---
+
+## Finding H — Modular fp8 GEMM PRODUCTIONIZED (`FORGE_GEMM=fp8mod`): committed, near-lossless, but STILL not a clean e2e win on Ada (2026-07-20)
+
+Finding G proved the inner `multistage_gemm_kernel` AOT-exports + launches from cudarc at
+288–351 TFLOPS with no Mojo runtime. This pass turns that prototype into a real, committed FORGE
+kernel behind `FORGE_GEMM=fp8mod` and runs every gate. **The three Finding-G productionization
+items are all resolved; the isolated 1.3–1.5× GEMM win is real and committed — but it does NOT
+survive to end-to-end prefill on the 4090, for a reason that is now the ACTIVATION-QUANT
+INTEGRATION, not the GEMM.**
+
+### What shipped (all three Finding-G items)
+
+1. **Dynamic-M wrapper — one PTX per (N,K), not per (N,K,T).** The exported static kernel baked
+   M,N,K (per-shape symbol). Finding-G item #1 asked whether a runtime-M export is possible. It
+   is, cleanly: `src/gemm_fp8_modular.mojo` defines `gemm_fp8_mod[N,K]`, a thin GPU wrapper that
+   takes BARE pointers + an `i64 m` (so every kernel param is one 8-byte slot — FORGE's HAL
+   contract; the fully-dynamic RuntimeLayout packs `{ptr, M}` into a 16-byte param the 8-byte-slot
+   HAL cannot feed) and builds the operand `TileTensor`s device-side with `Coord(m, Idx[K])`
+   (dynamic M, static K/N), then calls `multistage_gemm_kernel`. `M` is read at runtime
+   (`c.dim[0]()`), so ONE PTX per (N,K) serves ANY token count T. Verified bit-exact incl. odd
+   M=100 (not a 128-multiple); T-buckets are therefore UNNECESSARY.
+2. **Scale via the epilogue hook — no extra HBM pass.** Finding-G item #2. The kernel's
+   `elementwise_lambda_fn` (signature `[dtype, width: SIMDSize, *, alignment](IndexList[2],
+   SIMD[dtype,width])`) receives each (row, col) + the f32 accumulator; the wrapper's lambda
+   applies `xs[t]·ws[col]` and casts to f16, writing the output directly. So the per-token ×
+   per-row scale + f16 downcast are FUSED into the GEMM store — no separate scale/downcast kernel.
+   (The kernel still requires `c_type=f32`, so the f32→f16 happens only inside the lambda; the c
+   pointer is never dereferenced when a lambda is set, so `y` is reused for it.)
+3. **Build-wired + registered.** `build_kernels.mojo` compiles four committed instances
+   (`gemm_fp8_mod_{4096_4096, 1024_4096, 14336_4096, 4096_14336}` — Mistral-7B Q/O, K/V, gate/up,
+   down) under the same `_finalize_fp8` `.version 8.1→8.4` lift as the hand fp8 kernel, emitting
+   self-contained PTX into `build/sm_89/` (0 `.extern .func`, 64× `mma…e4m3`, 38 `cp.async`).
+   Registered in `forge-kernels/registry.rs`; launched by `Kernels::gemm_fp8_modular`
+   (grid `(⌈N/128⌉, ⌈T/128⌉)`, block 128, dynamic smem 65536 — the >48 KB opt-in the HAL already
+   sets); routed by `Model::gemm_fp8` when `weights.fp8_modular` (set for `FORGE_GEMM=fp8mod`).
+   The old `fp8` slow path and the CUDA MMQ default are untouched.
+
+### Isolated GEMM — the win is real and committed (dynamic-M + fused scale, RTX 4090, best-of-40)
+
+| shape (T, N, K) | role | fp8mod TFLOPS (dyn-M, no scale) | fp8mod TFLOPS (fused scale, f16 out) | vs CUDA MMQ 208 |
+|---|---|---|---|---|
+| 2048, 4096, 14336 | down | 304 | 289 | 1.39× |
+| 2048, 14336, 4096 | gate/up | 313 | 262 | 1.26× |
+| 512, 4096, 14336 | down | 298 | 279 | 1.34× |
+| 512, 14336, 4096 | gate/up | 244 | 213 | 1.02× |
+
+Dynamic-M costs ~10 % vs the static 350 (the compiler can't specialize the K-loop bound); the
+fused f16 scale-epilogue costs another ~5–15 % over raw f32 out (extra scale reads + f16 cast in
+the store). Net still **1.0–1.4× the CUDA MMQ**, 100 % Mojo, and correct (raw max_rel_err = 0.0;
+with the f16 scale epilogue 4.2e-4 = f16 rounding).
+
+### Quality — PASS (decisive), Mistral-7B Q4_K_M, held-out passage
+
+| backend | perplexity | mean_nll | Δ vs default |
+|---|---|---|---|
+| default (Q4_K MMQ) | 30.3113 | 3.41152 | — |
+| **fp8mod** | 30.5211 | 3.41842 | **+0.69 %** |
+
+Byte-identical fp8 numerics to the hand `fp8` path (+0.69 %). Coherence PASS on 3 varied prompts
+(Eiffel→"Paris, France"; capital of Japan→"Tokyo"; water→"hydrogen and oxygen"). NVFP4 Bielik
+golden bit-exact on 1 and 4 lanes (default untouched).
+
+### PERF — fp8mod does NOT beat the CUDA MMQ default e2e, at any shape (RTX 4090, warm best)
+
+Prefill tok/s, `forge bench …--prefix-cache off`. **Both measured warm** (the 4090 idles at
+210 MHz; the first post-idle launch is throttled ~2×, so cold single-shots are meaningless — the
+default's own pp512 swung 2946→6909 cold→warm). Default = best-of-5 warm; fp8mod = best-of-3 warm
+(its 120 s requant leaves the GPU warm, so each launch's single prefill is already steady-state):
+
+| shape (pp/dec) | default (CUDA MMQ) | fp8mod | fp8mod vs default | decode |
+|---|---|---|---|---|
+| 512 / 128  | 6909 | 2920 | **0.42×** | unchanged (150→174, noise) |
+| 4096 / 2048 | 8549 | 8101 | **0.95×** | 146.2 = 146.2 |
+| 8192 / 1024 | 8130 | 7640 | **0.94×** | 130.3 = 130.4 |
+
+llama.cpp pp4096 (reconfirmed idle, `-fa 1`): **11991** tok/s. fp8mod 8101 = 0.68× llama.cpp,
+0.95× the FORGE default. **Decode never regresses** (separate gemv path; unchanged).
+
+### Why the isolated 1.4× GEMM win evaporates e2e — it is the activation quant, not the GEMM
+
+Contrary to Finding G's optimism ("using Modular's own multistage kernel removes that gap at the
+GEMM level" → e2e win), the e2e prefill is flat-to-slower. The GEMM IS faster now (Finding H
+isolated table); the loss is elsewhere and specific to the `fp8mod` *integration*:
+
+- **The `fp8mod` prefill re-quantizes the activation PER PROJECTION.** `Model::gemm_fp8` bundles
+  `quantize_act_fp8` into every call, so q/k/v quantize the SAME attn-norm output **three times**
+  and gate/up quantize the SAME ffn-norm output **twice** — 7 activation-quant passes per layer.
+  The **CUDA MMQ default fuses the quant into the RMSNorm** (`rmsnorm_q8_1_ds4`) and **shares one
+  quantized activation across q/k/v** (and one across gate/up) — ~4 passes, no redundancy, no f16
+  HBM round-trip. At small T the GEMM is tiny and this fixed per-projection quant overhead
+  dominates → pp512 collapses to 0.42×; at large T it is a smaller but still net-negative tax.
+- **Prefill is only ~81 % GEMM** (Exp 4): even a GEMM at ∞ TFLOPS caps the prefill speedup, and
+  the remaining attention/quant/norm tail is un-fused in the `fp8mod` path.
+- **On Ada fp8 and int8 tensor cores share the same peak** (Finding F): the multistage kernel's
+  edge over MMQ is scheduling, worth 1.3–1.5× in isolation — not enough headroom to also absorb
+  the quant redundancy above.
+
+### Verdict + recommendation
+
+- **The Finding-G "AOT + cudarc + dynamic-M + fused scale" mechanism is fully productionized,
+  committed, correct, and near-lossless (+0.69 % PPL).** The isolated Modular fp8 GEMM beats the
+  CUDA MMQ by 1.0–1.4× as a committed 100 %-Mojo kernel. This is real and reusable — and on
+  Hopper/Blackwell (2× fp8 rate) it should win outright.
+- **But on Ada it does NOT beat the CUDA MMQ default end-to-end** (0.42–0.95×). **Do NOT flip the
+  default; keep `fp8mod` behind the flag.** The ADR-0001 CUDA MMQ exception stays justified on Ada.
+- **The precise, single blocker to the e2e win** (documented for the follow-up): de-duplicate the
+  activation quant. Split `quantize_act_fp8` out of `gemm_fp8_modular`, quantize the attn-norm
+  output ONCE and share `xq/xs` across q/k/v, quantize the ffn-norm output once and share across
+  gate/up — ideally fusing the quant into the RMSNorm exactly as the MMQ path's `rmsnorm_q8_1_ds4`
+  does. That removes 3 of 7 per-layer quant passes and the f16 HBM round-trip; only then can the
+  1.3–1.5× isolated GEMM edge show through the ~81 %-GEMM prefill. Until that fusion lands, the
+  real win here is the **committed, quality-proven, faster-in-isolation** Modular fp8 kernel and
+  the dynamic-M/fused-scale build machinery — not an e2e speedup.

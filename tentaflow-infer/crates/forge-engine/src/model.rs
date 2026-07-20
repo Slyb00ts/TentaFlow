@@ -1693,6 +1693,11 @@ impl Model {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
+        if self.weights.fp8_modular {
+            return self.kernels.gemm_fp8_modular(
+                y, &w.qweight, &w.scales, x, w.rows, w.cols, n_tokens, stream,
+            );
+        }
         self.kernels
             .gemm_fp8(y, &w.qweight, &w.scales, x, w.rows, w.cols, n_tokens, stream)
     }
@@ -2685,6 +2690,7 @@ impl Model {
         self.weights.fp8 = None;
         let layers = self.weights.rebuild_fp8(self.device.as_ref(), path)?;
         self.weights.fp8 = Some(layers);
+        self.weights.fp8_modular = crate::weights::fp8_modular_enabled();
         Ok(())
     }
 

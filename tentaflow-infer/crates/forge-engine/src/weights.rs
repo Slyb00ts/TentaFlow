@@ -275,10 +275,20 @@ pub struct Fp8Layer {
     pub down: Fp8Weight,
 }
 
-/// Whether the fp8 (e4m3) prefill GEMM is selected (`FORGE_GEMM=fp8`). Default
-/// and any other value keep the committed CUDA MMQ Q4_K path.
+/// Whether an fp8 (e4m3) prefill GEMM is selected. `fp8` = the hand-written
+/// single-PTX kernel; `fp8mod` = Modular's multistage cp.async kernel (faster,
+/// docs/CODEGEN_PROOF.md Finding G). Both build the SAME e4m3 weight packs; only
+/// the launched GEMM differs. Any other value keeps the committed CUDA MMQ path.
 pub fn fp8_enabled() -> bool {
-    std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8")
+    matches!(
+        std::env::var("FORGE_GEMM").ok().as_deref(),
+        Some("fp8") | Some("fp8mod")
+    )
+}
+
+/// Whether the Modular multistage fp8 GEMM (`FORGE_GEMM=fp8mod`) is selected.
+pub fn fp8_modular_enabled() -> bool {
+    std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod")
 }
 
 /// Per-input-channel activation abs-max collected during the W4A8 calibration
@@ -458,6 +468,9 @@ pub struct ModelWeights {
     /// Per-layer fp8 (e4m3) packs for the prefill GEMM when `FORGE_GEMM=fp8`,
     /// else `None`. Dense models only; decode/logit keep the resident weights.
     pub fp8: Option<Vec<Fp8Layer>>,
+    /// When `fp8` packs are resident, route the prefill GEMM to Modular's
+    /// multistage kernel (`FORGE_GEMM=fp8mod`) instead of the hand kernel.
+    pub fp8_modular: bool,
 }
 
 /// Source-agnostic host-side tensor fetch: (bytes, dtype, quant, dims).
@@ -1678,6 +1691,7 @@ impl ModelWeights {
             fused_gate_up_layers,
             w4a8: None,
             fp8: None,
+            fp8_modular: false,
         })
     }
 
@@ -1828,6 +1842,7 @@ impl ModelWeights {
             fused_gate_up_layers: 0,
             w4a8: None,
             fp8: None,
+            fp8_modular: false,
         })
     }
 

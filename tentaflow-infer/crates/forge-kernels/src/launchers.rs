@@ -2547,6 +2547,98 @@ impl Kernels {
         self.device.launch(gk, &cfg, &args, stream)
     }
 
+    /// Per-token e4m3 activation quant + Modular's multistage cp.async fp8 GEMM
+    /// (one kernel per (rows,cols); docs/CODEGEN_PROOF.md Finding G). Same fp8
+    /// weight pack + activation quant as `gemm_fp8`, but the GEMM is the deeply
+    /// pipelined `multistage_gemm_kernel` (dynamic-M wrapper) that runs at
+    /// 260–313 TFLOPS on Ada — 1.3–1.5× the CUDA MMQ — with the per-token ×
+    /// per-row scale + f16 downcast fused into its epilogue (no extra HBM pass).
+    /// Grid (ceil(rows/128), ceil(n_tokens/128)); block 128; dynamic smem 65536
+    /// (the >48 KB opt-in the HAL sets automatically). Non-default
+    /// (`FORGE_GEMM=fp8mod`); errors if no committed PTX matches (rows,cols).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_modular(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        wscales: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_fp8_modular requires cols % 64 == 0, got {cols}"
+            )));
+        }
+        let gk = self
+            .artifacts
+            .get(&format!("gemm_fp8_mod_{rows}_{cols}"))
+            .map_err(|_| {
+                ForgeError::Kernel(format!(
+                    "gemm_fp8_modular: no committed Modular fp8 kernel for \
+                     (rows={rows}, cols={cols}); build one in gemm_fp8_modular.mojo"
+                ))
+            })?;
+
+        let need_codes = n_tokens * cols;
+        let mut sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
+        if sc.cap_codes < need_codes {
+            sc.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_codes;
+        }
+        if sc.cap_tokens < n_tokens {
+            sc.xs = Some(
+                self.device
+                    .alloc(n_tokens * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_tokens = n_tokens;
+        }
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let xs = sc.xs.as_ref().expect("xs allocated");
+
+        // Per-token activation quant → e4m3 codes + f32 scale (shared with the
+        // hand fp8 path).
+        let qk = self.artifacts.get("quantize_act_fp8")?;
+        let qcfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let qargs = LaunchArgs::new()
+            .buf(xq)
+            .buf(xs)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+
+        // multistage GEMM: y = diag(xs)·(xq·wᵀ)·diag(ws), fused epilogue. Params
+        // mirror gemm_fp8_mod(y, a=xq, b=w, xs, ws, m=n_tokens).
+        let cfg = LaunchConfig {
+            grid: (
+                (rows as u32).div_ceil(128),
+                (n_tokens as u32).div_ceil(128),
+                1,
+            ),
+            block: (128, 1, 1),
+            shared_mem_bytes: 65536,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(xq)
+            .buf(w)
+            .buf(xs)
+            .buf(wscales)
+            .scalar(n_tokens as i64);
+        self.device.launch(gk, &cfg, &args, stream)
+    }
+
     /// `gemm_q4_k_f16` over a row window of a fused weight matrix:
     /// `w_byte_off` addresses the first superblock of the window's first row.
     #[allow(clippy::too_many_arguments)]

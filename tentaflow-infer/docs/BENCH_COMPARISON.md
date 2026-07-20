@@ -1405,3 +1405,33 @@ scheduling Mojo does not match — so there is no wall to hit. FA does **not** n
 ADR-0001 exception the way the int8 GEMM does. The default stays `fa`=CUDA for now
 (`fa_mojo` wired and proven); flipping the default to the portable Mojo kernel is a low-risk
 follow-up once the AMDGPU/Metal targets are exercised.
+
+---
+
+## `FORGE_GEMM=fp8mod` — Modular multistage fp8 prefill GEMM (2026-07-20)
+
+Modular's `multistage_gemm_kernel` AOT-exported as a committed 100 %-Mojo kernel (dynamic-M,
+one PTX per (N,K), per-token×per-row scale + f16 fused into the epilogue). Full mechanism +
+root-cause in `docs/CODEGEN_PROOF.md` Finding H. Mistral-7B Q4_K_M, RTX 4090.
+
+**Isolated GEMM (best-of-40, dynamic-M + fused f16 scale):** 213–289 TFLOPS = 1.0–1.4× the
+CUDA MMQ (208). Correct: raw max_rel_err 0.0; f16-scale epilogue 4.2e-4 (f16 rounding).
+
+**Quality:** ppl 30.5211 vs default 30.3113 = **+0.69 %** (byte-identical fp8 numerics to the
+hand `fp8` path). Coherence PASS (Paris / Tokyo / oxygen). NVFP4 Bielik golden bit-exact (default
+untouched).
+
+**E2E prefill tok/s (both warm — the 4090's cold first launch is throttled ~2×):**
+
+| shape (pp/dec) | default (CUDA MMQ) | fp8mod | fp8mod vs default | llama.cpp |
+|----------------|--------------------|--------|-------------------|-----------|
+| 512 / 128   | 6909 (best-of-5) | 2920 (best-of-3) | 0.42× | — |
+| 4096 / 2048 | 8549 (best-of-5) | 8101 (best-of-3) | 0.95× | 11991 |
+| 8192 / 1024 | 8130 (best-of-5) | 7640 (best-of-2) | 0.94× | — |
+
+Decode unchanged (separate gemv path). **fp8mod does not beat the CUDA MMQ default e2e on Ada at
+any shape** — the isolated 1.4× GEMM win is lost to the `fp8mod` path re-quantizing the activation
+per projection (q/k/v ×3, gate/up ×2), where the MMQ default fuses the quant into the RMSNorm and
+shares it across projections. Keep `fp8mod` behind the flag; the ADR-0001 CUDA MMQ exception stays
+justified on Ada. Follow-up to unlock the e2e win: split the activation quant out and share it
+(fuse into RMSNorm, mirroring `rmsnorm_q8_1_ds4`).
