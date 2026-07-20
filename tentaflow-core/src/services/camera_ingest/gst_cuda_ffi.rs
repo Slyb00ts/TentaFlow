@@ -38,7 +38,11 @@
 // (so `cudaPointerGetAttributes` would not resolve) and no device-tensor path
 // exists to consume the pointer.
 
-#![cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 
 use std::marker::PhantomData;
 use std::os::raw::{c_int, c_void};

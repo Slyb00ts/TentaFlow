@@ -355,7 +355,10 @@ impl RfDetrDetector {
     /// `color` is the YUV→RGB matrix/range read from the frame colorimetry
     /// (default BT.709 limited) and applies to the WHOLE batch — callers batch
     /// only frames sharing colorimetry. `mean`/`std`/`s` match `fill_frame`.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-supertonic"
+    ))]
     pub fn detect_batch_gpu(
         &self,
         frames: &[crate::vision::gpu_preprocess::Nv12Frame<'_>],
@@ -393,7 +396,10 @@ impl RfDetrDetector {
     /// decode as [`detect_batch_gpu`], so detections are bit-identical to the
     /// download path (same kernel output, same shared decode). The tensor is
     /// kept alive by the caller (an `Arc`) for the whole blocking run.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-supertonic"
+    ))]
     pub fn detect_device_tensor(
         &self,
         tensor: &crate::vision::gpu_preprocess::OwnedDeviceTensor,
@@ -420,6 +426,7 @@ impl RfDetrDetector {
     /// `dev_ptr` is a CUDA device-0 buffer of exactly `n·3·res·res` f32 that the
     /// CALLER keeps alive for the whole (synchronous, blocking) run.
     #[cfg(feature = "inference-supertonic")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn forward_device_ptr(
         &self,
         dev_ptr: usize,

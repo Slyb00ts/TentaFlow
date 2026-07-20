@@ -23,7 +23,11 @@
 // Gated on both features because it only exists to feed the ort device-tensor
 // path; a build without either never links CUDA and never invokes nvcc.
 
-#![cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 
 use anyhow::{bail, Result};
 use std::cell::RefCell;

@@ -349,7 +349,10 @@ impl StateClassifier {
     /// `crops` are `(&[u8], cw, ch)` tightly-packed RGB24, `len == cw*ch*3`.
     /// Empty batch → empty vector. Device id is 0 (single-GPU smoke; the pool's
     /// per-session device wiring is deferred to the `run_cold_stages` integration).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-supertonic"
+    ))]
     pub fn classify_batch_gpu(&self, crops: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<String>>> {
         if crops.is_empty() {
             return Ok(Vec::new());

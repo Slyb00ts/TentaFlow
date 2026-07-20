@@ -22,7 +22,11 @@ pub mod nms;
 pub mod settings;
 // Generyczny runner ONNX dla dynamicznych modeli z rejestru `vision_models`
 // (silnik `onnx-cv`) + wspoldzielona warstwa ort i postprocess RF-DETR.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub mod gpu_preprocess;
 #[cfg(feature = "inference-supertonic")]
 pub mod onnx_cv;

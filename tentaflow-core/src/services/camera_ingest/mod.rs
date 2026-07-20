@@ -13,7 +13,11 @@ pub mod fakefile;
 /// Zero-copy NVDEC CUDA-buffer map (Stage 4) — device NV12 detect without a
 /// GPU→CPU→GPU round-trip. Only meaningful with the GPU inference features (they
 /// link cudart and provide the device-tensor detect path).
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub mod gst_cuda_ffi;
 pub mod local;
 pub mod metadata_bus;
