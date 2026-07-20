@@ -42,23 +42,29 @@ Ostatnia aktualizacja: 2026-07-20.
   Bit-exact + sm_80/sm_86. Scratch: `scratch/i8mod/multistage_i8_q4k_f16.mojo`,
   `multistage_i8_q4k_pack.mojo`, `scratch/bench_i8mod_q4k_{f16,pack}.mojo`.
 
-- 🟡 **UNIWERSALNOŚĆ: decyzja o wycofaniu CUDA MMQ na rzecz PACKED Mojo int8 Q4_K
-  (akceptacja ~0.79× dla 100 %-Mojo, przenośność sm_80+). Kernel WYLĄDOWAŁ in-tree,
-  okablowanie w toku (2026-07-20, Finding O).** Zatwierdzone przez użytkownika:
-  silnik ma być w pełni CUDA-free dla Q4_K prefill (dowolne sm_80+, cel NVIDIA/AMD/
-  Apple, dziś RTX 3090 sm_86) kosztem ~21 % wolniejszego prefillu; dług
-  optymalizacyjny (tańszy flush) zapisany. Wariant PACKED wybrany (1× VRAM, bez
-  podwajania wag). **Zrobione (zweryfikowane):** kernel `src/modular_i8/
-  multistage_i8_q4k_pack.mojo` zaadaptowany do kontraktu FORGE (f16-out + `m_real`,
-  f32 da/sa dzielone z `quantize_act_q8_1`); wrapper `gemm_q4k_i8_mod_pack[N,K,MPAD]`
-  + `q4k_repack_pack` (GGUF→packed nibbles + f16 skale kb-major), drabina MPAD
-  128–4096 × 4 kształty Mistral; AOT-kompiluje się (32 int8 mma + 18 cp.async),
-  `ptxas -arch=sm_86` i `-arch=sm_80` OK; nieokablowany UNPACKED wariant in-tree
-  USUNIĘTY. **Pozostaje:** eksport PTX w `build_kernels.mojo` + `registry.rs`;
-  launcher (bucket-select + repack-at-load); routing w `model.rs`; USUNIĘCIE całego
-  CUDA MMQ (mmq_q4k.cu, vendor/llama-cpp, cubin, MmqScratch, fused mmq); bramki
-  (build/clippy, Bielik golden, PPL≈30.3, coherence, bench). Do czasu tego default
-  BEZ ZMIAN.
+- 🟡 **UNIWERSALNOŚĆ: NATIVE-LAYOUT Mojo int8 Q4_K prefill GEMM (true 1× VRAM) —
+  Faza 1 WYLĄDOWAŁA in-tree, bit-exact; okablowanie + wycofanie CUDA MMQ = Faza 2
+  (2026-07-20, Finding P).** Wariant PACKED (Finding O) miał 1× *bajtów*, ale wymagał
+  osobnej rezydentnej kopii `[N,K/2]` + tensorów skal `dsc/dm` (ekstra VRAM ponad
+  natywne bajty GGUF, których i tak potrzebuje dekodowy dp4a GEMV). Faza 1 usuwa to:
+  kernel `src/modular_i8/multistage_i8_q4k_native.mojo` czyta **surowe 144-bajtowe
+  superbloki GGUF `block_q4_K` w kernelu** (te SAME bajty `DevWeight::Q4K.buf` co
+  dekod), de-interleave nibbli ggml + rozpakowanie ośmiu 6-bitowych sub-skal/minów
+  (`get_scale_min_k4`) IN-KERNEL → skale `dsc=d·sc`, `dm=dmin·m` liczone z nagłówka,
+  bez repacku i bez tensorów skal. Flush `acc += dsc·da·sumi − dm·sa` bez zmian, więc
+  PPL == Q4_K MMQ (30.31) z konstrukcji. `q4k_repack_pack`, `gemm_q4k_i8_mod_pack` i
+  `multistage_i8_q4k_pack.mojo` USUNIĘTE. **Zweryfikowane (RTX 4090):** bit-exact vs
+  CPU golden czytający TE SAME natywne bajty (`scratch/verify_q4k_native.mojo`:
+  `max_abs=0`, `max_rel=0`, `bad=0` dla 256×512×100 / 512×1024×200 / 256×14336×64);
+  true 1× VRAM z konstrukcji (launch podaje tylko `w_buf` + `da/sa`, zero drugiej
+  alokacji wag; smem 53 248 B); AOT-kompiluje się, `ptxas -arch=sm_86` i `-arch=sm_89`
+  OK po retargecie `.target sm_80`; wrapper `gemm_q4k_i8_native[N,K,MPAD]`, drabina
+  MPAD 128–4096 × 4 kształty Mistral. **Faza 2 (pozostaje, default BEZ ZMIAN):** eksport
+  24 instancji PTX w `build_kernels.mojo` + `registry.rs`; launcher (bucket-select +
+  zero-pad, podaje natywny `Q4K.buf`, BEZ repacku); routing `model.rs` (przerobienie
+  fused rmsnorm→`block_q8_1_mmq` na `quantize_act_q8_1`); USUNIĘCIE całego CUDA MMQ
+  (mmq_q4k.cu, vendor/llama-cpp, cubin, MmqScratch, fused mmq); bramki (build/clippy,
+  Bielik golden, PPL≈30.3, coherence, bench, VRAM). Do czasu tego default BEZ ZMIAN.
 
 - ✅ **Dekod Q4_K (dp4a GEMV) jest przy ścianie przepustowości — bije llama.cpp
   w płytkim kontekście, remis w głębokim (2026-07-20, nic nie wysłano).** Sesja

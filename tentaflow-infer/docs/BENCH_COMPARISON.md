@@ -1584,3 +1584,19 @@ HBM: the kernel is FLUSH-bound (smem scale reads + per-element scaled accumulate
 weight-HBM-bound, so packing adds unpack smem traffic for no gain (swizzle on/off <5 %, so bank
 conflicts are not the cause). Packed-layout hypothesis REFUTED for throughput on Ada; CUDA MMQ
 default retained (see CODEGEN_PROOF Finding N).
+
+### Finding P — native-GGUF-layout Q4_K int8 GEMM (true 1× VRAM), Phase 1: correctness only
+
+The native-layout kernel (`multistage_i8_q4k_native.mojo`) reads the raw 144-byte GGUF
+`block_q4_K` superblocks in-kernel (same bytes decode's dp4a GEMV consumes) — no repack, no
+separate `dsc/dm` scale tensors, so true 1× VRAM. Phase 1 landed the kernel bit-exact
+(`scratch/verify_q4k_native.mojo`: `max_abs = 0.0`, `max_rel = 0.0`, `bad = 0` on
+256×512×100 / 512×1024×200 / 256×14336×64) and sm_80-portable (`ptxas -arch=sm_86` +
+`-arch=sm_89` OK). Launch smem 53 248 B (the packed variant's `bp_smem` staging is gone).
+
+No new throughput numbers this pass: the kernel is NOT yet wired as the engine default (Phase 2
+= `build_kernels`/`registry`/`launcher`/`model` wiring + CUDA-MMQ deletion), so `forge bench`
+still measures the CUDA MMQ path. The native in-kernel scale unpack replaces the packed
+variant's smem scale-tensor reads with header reads + `get_scale_min_k4` arithmetic; whether
+that shifts the FLUSH-bound wall (Finding N) up or down is a Phase-2 measurement. Expectation
+from Finding N's packed result: ~146–166 TOPS ballpark, to be confirmed on the wired path.

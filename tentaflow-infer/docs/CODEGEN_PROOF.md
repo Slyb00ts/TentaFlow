@@ -1227,3 +1227,65 @@ resident weight VRAM.
 
 Until steps 1–5 land, the engine default is UNCHANGED (CUDA MMQ on Ada, portable Mojo i8mma on
 pre-Ada); this pass only lands the verified packed kernel in-tree.
+
+## Finding P — native-GGUF-layout Q4_K int8 prefill GEMM (true 1× VRAM), Phase 1 landed
+
+The packed kernel of Finding O reached 1× *byte count* but still required a load-time
+`q4k_repack_pack` into a SEPARATE resident `[N,K/2]` nibble tensor + kb-major f16 `dsc/dm`
+scale tensors — extra VRAM on top of the native GGUF Q4_K bytes decode's dp4a GEMV already
+needs. Finding O step 2 flagged the fix: read the **native GGUF `block_q4_K` superblock layout
+in-kernel** so the prefill GEMM and the decode GEMV share the EXACT same
+`DevWeight::Q4K.buf` bytes — true 1× VRAM, no second copy of anything.
+
+**Kernel landed (Phase 1):** `kernels/mojo/src/modular_i8/multistage_i8_q4k_native.mojo` +
+wrapper `src/gemm_q4k_i8_multistage.mojo` (`gemm_q4k_i8_native[N,K,MPAD]`). The weight-read
+path now:
+1. reads the raw 144-byte GGUF blocks straight from HBM (32 `qs` bytes per row per BK=64
+   k-tile — the same byte count the packed variant read, no repack), de-interleaving the ggml
+   `q4_K` nibble order (byte b → col b low nibble, col b+32 high nibble) into the plain int8
+   tile the s8 mma consumes (b_swizzle=False → straight row-major write);
+2. computes the per-32-block f16 weight scales `dsc[kb]=d·sc[kb]`, `dm[kb]=dmin·m[kb]`
+   IN-KERNEL from the native block header via `_q4k_scale_min` (llama.cpp `get_scale_min_k4`),
+   NOT from a pre-repacked scale tensor.
+The per-32-block flush `acc += dsc·da·sumi − dm·sa` (f16-staged activation scales) is
+unchanged, so PPL == Q4_K MMQ (30.31) by construction. `q4k_repack_pack`,
+`gemm_q4k_i8_mod_pack` and `multistage_i8_q4k_pack.mojo` are DELETED — the native kernel
+replaces them.
+
+**Verified this pass (on the RTX 4090, sm_89):**
+- **Bit-exact vs a CPU `vec_dot_q4_K` golden reading the SAME native GGUF bytes**
+  (`scratch/verify_q4k_native.mojo`): `max_abs = 0.0`, `max_rel = 0.0`, `bad = 0` on
+  N,K,T = 256×512×100 / 512×1024×200 / 256×14336×64. The golden reconstructs `d/dmin`, the
+  eight 6-bit sub-scales/mins and the nibbles independently from the 144-byte blocks, so a
+  match proves both the in-kernel scale unpack and the nibble de-interleave.
+- **True 1× VRAM by construction:** the launch passes ONLY `w_buf` (native bytes) +
+  activation-derived `da/sa` — there is literally no second weight allocation and no `dsc/dm`
+  weight-scale tensor. Launch smem = 53 248 B (a_smem 32 768 + double-buffered b_smem 16 384 +
+  f16 scale staging 4 096; the packed variant's extra `bp_smem` staging is gone), >48 KB
+  dynamic opt-in.
+- **AOT-compiles + sm_80-portable:** `ctx.compile_function` emits valid PTX for the
+  `gemm_q4k_i8_native_*` instances; after the standard `.target sm_80` retarget it assembles
+  under `ptxas -arch=sm_86` AND `-arch=sm_89`, so it runs natively on the RTX 3090.
+
+**Phase 2 — remaining to complete the universality milestone (NOT done this pass; engine
+default UNCHANGED = CUDA MMQ on Ada, tree green):**
+1. `build_kernels.mojo`: AOT-export the 24 `gemm_q4k_i8_native_*` instances (`.target sm_80`);
+   commit PTX; add names to `registry.rs`. No repack kernel to export (native reads GGUF).
+2. `launchers.rs`: bucket-select launcher (smallest MPAD ≥ T, zero-pad activation, 53 248 B
+   dynamic smem >48 KB opt-in) that passes the native `DevWeight::Q4K.buf` directly — NO
+   load-time repack, NO resident scale tensors.
+3. `model.rs`: route Q4_K prefill (`n_tokens≥64`) to the native kernel on ALL arches; Q6_K
+   prefill → existing portable `gemm_q6_k_f16`. The fused rmsnorm→`block_q8_1_mmq` prefill
+   path (`mmq_fuse`, `gemm_q4_k_mmq_prequant_at`, `qkv_all_q4k`/`gateup_all_q4k` fusion) must
+   be reworked to the native kernel's `quantize_act_q8_1` activation (or the fusion disabled
+   for Q4_K, adding a standalone quant pass) before MMQ can be deleted.
+4. DELETE CUDA MMQ: `kernels/cuda/mmq_q4k.cu`, `kernels/cuda/vendor/llama-cpp/`,
+   `mmq_q4k_cuda.cubin`, all `registry.rs`/`launchers.rs` refs (`gemm_mmq`,
+   `gemm_q4_k_mmq*_at`, cubin entries, `MmqScratch`, the fused `mmq_fuse` path),
+   `FORGE_GEMM=mmq`. Keep fp8mod / w4a8 / fattn Ada opt-ins.
+5. Gates: `cargo build/clippy` green; NVFP4 Bielik golden bit-exact; `forge ppl` ≈30.3 vs the
+   30.31 MMQ baseline; coherence + `forge bench` (~0.79× accepted); VRAM check confirming
+   steady-state memory did NOT increase vs the MMQ build (the point of native-layout).
+
+This pass lands the bit-exact native-layout kernel in-tree (the crux) with the true-1×-VRAM
+weight-read path proven; wiring it as the default and retiring the CUDA MMQ is Phase 2.
