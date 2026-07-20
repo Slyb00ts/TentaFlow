@@ -412,3 +412,89 @@ groundwork for those future GPUs; the CUDA MMQ remains the justified default on 
   the first concrete way to retire the ADR-0001 exception. bf16 is the safe fallback if fp8
   accuracy proves insufficient. Neither needs int8, so the CODEGEN_PROOF int8 conclusion and these
   new paths are consistent, not contradictory.
+
+---
+
+## Finding G — Modular's `multistage_gemm` INNER kernel AOT-exported + launched from cudarc: 288–351 TFLOPS, no Mojo runtime (2026-07-20)
+
+Finding F concluded that Modular's 305-TFLOPS `multistage_gemm` "CANNOT be AOT-compiled into
+FORGE's committed-PTX-only model (ADR-0001) without shipping the Mojo runtime, or reproducing
+its launch geometry ... in Rust by hand (fragile, deep)", and shipped instead a **hand-written**
+single-PTX fp8 kernel (`gemm_fp8.mojo`) that — being synchronous smem staging, no cp.async
+multistage — lost e2e to the CUDA MMQ. **That "CANNOT" is now REFUTED by direct measurement.**
+The inner kernel `multistage_gemm` enqueues IS AOT-exportable and DOES keep peak throughput
+when launched from FORGE's cudarc/PTX path with zero Mojo runtime.
+
+**What the inner kernel is.** `multistage_gemm` (host dispatcher, `linalg/matmul/gpu/__init__`)
+on the NVIDIA "standard GEMM (no split-K)" branch enqueues exactly one bare GPU kernel:
+`multistage_gemm_kernel[c_type, CLT, a_type, ALT, b_type, BLT, transpose_b, …, config]`
+(`linalg/matmul/gpu/_multistage_gemm_gpu`). It is a normal `@__llvm_metadata`/`@__name` GPU
+function — the multi-stage `cp.async` pipeline, `TensorCore` mma, and swizzled shared layouts
+all live inside it. No TMA (Ada has none; it uses `cp.async`/LDGSTS), no cluster dims, no
+split-K for this config (`num_k_partitions=1`).
+
+**AOT export — the SAME mechanism `build_kernels.mojo` already uses.** Instantiate the inner
+kernel at the fp8 FFN config and `ctx.compile_function[kernel, dump_asm=Path(...)]()` — compiles
+to PTX WITHOUT executing, identical to how every committed FORGE kernel is emitted. The kernel is
+parameterized on the operand `LayoutType`/`linear_idx_type` (taken off `TileTensor` values exactly
+as the host dispatcher does). fp8 needs the `.version 8.1→8.4` lift (the embedded ptxas gate);
+under `MODULAR_NVPTX_COMPILER_PATH=scripts/ptxas_fp8_shim.sh` `compile_function` completes and
+dumps the PTX, then a `.version` rewrite (same as `_finalize_fp8`) makes it self-contained.
+Exporter: `kernels/mojo/scratch/build_modular_fp8_gemm.mojo`; PTX in
+`kernels/mojo/scratch/modular_ptx/`.
+
+**The exported PTX is fully self-contained — NO Mojo runtime symbol.** `.version 8.4`,
+one `.visible .entry`, **zero `.extern .func`** (no runtime calls), no `_mojo_*`/`KGEN`/`malloc`;
+the only `.extern` is the standard `.extern .shared` dynamic-smem declaration. 64×
+`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`, 38 `cp.async.cg`, 24 `ldmatrix`. System
+`ptxas -arch=sm_89 -O3` assembles it to a 228-reg cubin with 64× `QMMA.16832.F32.E4M3.E4M3` SASS.
+Three parameters, each an 8-byte pointer slot (`c`, `a`, `b`) — the static layout collapses each
+`TileTensor` to a bare pointer.
+
+**Launch geometry (replicated in cudarc, NOT fragile).** For `config` block=128×128×64,
+warp=64×64×64, stages=4, k_part=1: `num_threads = (128/64)(128/64)(1)·32 = 128`;
+`grid = (⌈N/128⌉, ⌈M/128⌉, 1)`; dynamic smem `= 2 · 128·64·4·1 B = 65536 B`. That is the entire
+host side — three lines of arithmetic, not a "deep" reproduction. The >48 KB dynamic-smem opt-in
+(`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`) already exists in `forge-hal` for the MMQ path.
+
+**Measured — standalone cudarc harness, no Mojo runtime** (`scratch/modular_fp8_launch/`,
+`CudaContext` + `result::{module,launch_kernel,…}`, RTX 4090 idle-gated, steady-state best-of-40,
+correctness bit-exact vs CPU golden on e4m3-representable inputs — **max_rel_err = 0.0**):
+
+| shape (T, N, K) | role | cudarc TFLOPS | vs CUDA MMQ 208 | vs old Mojo int8 66 | Finding E (in-Mojo) |
+|---|---|---|---|---|---|
+| 2048, 4096, 14336 | down-proj | **350** | 1.68× | 5.3× | 305–326 |
+| 2048, 14336, 4096 | gate/up | **338** | 1.63× | 5.1× | 306–314 |
+| 512, 14336, 4096 | gate/up | **289** | 1.39× | 4.4× | 227–245 |
+| 512, 4096, 14336 | down-proj | **349** | 1.68× | 5.3× | 80–162 (host-overhead-bound) |
+
+**The isolated 305–326 TFLOPS SURVIVES the cudarc launch — 288–351, matching or exceeding
+Finding E.** The T=512 skinny shapes are actually FASTER via cudarc than through Mojo's
+`DeviceContext.enqueue_function` (349 vs 80–162): for a ~0.17 ms kernel, Mojo's runtime enqueue
+overhead (module-manager lookup per launch) dominated; cudarc's thin `cuLaunchKernel` removes it.
+This is the opposite of a runtime advantage — the runtime was a tax the AOT path avoids.
+
+**Verdict: the Finding-F wall is false for this kernel on Ada.** A 100 %-Mojo GEMM that BEATS the
+CUDA MMQ by 1.4–1.7× is loadable and launchable through FORGE's *existing* cudarc/PTX/HAL path
+(load_module already takes cubin or PTX; the smem opt-in already exists), with the kernel PTX
+carrying **no** Mojo runtime dependency. Finding F's e2e loss was a property of the *hand-written*
+`gemm_fp8.mojo` (synchronous, no cp.async multistage), NOT of "AOT + cudarc" and NOT of fp8 —
+using Modular's own multistage kernel removes that gap at the GEMM level.
+
+**Productionization path (prototype proven; engine default unchanged this pass):**
+1. **Per-shape PTX vs dynamic-M.** The exported entry bakes M,N,K statically (layout-hashed
+   symbol), so prefill T buckets each need a PTX, OR export with a runtime (UNKNOWN) M dimension —
+   the kernel already reads `M = c.dim[0]()` at runtime, so a dynamic-M `TileTensor` layout should
+   yield one PTX per (N,K); this is the main open item to verify.
+2. **Scaling.** This kernel is a plain e4m3×e4m3→f32 GEMM (no scale epilogue). Wiring it into the
+   forward pass needs the Q4_K→fp8-e4m3 weight pack (fidelity 2.15 % rel-L2, PPL +0.69 % per
+   Findings E/F) + per-token activation quant (`quantize_act_fp8`, already committed, ~3 % of GPU
+   time) + a per-row×per-token scale applied via the kernel's `elementwise_lambda_fn` epilogue hook
+   (also AOT-exportable) or a fold-after pass.
+3. **Build wiring.** Add an `_export`-style call for the inner kernel to `build_kernels.mojo` under
+   the same `_finalize_fp8` `.version` lift, emit its per-arch PTX into `build/<arch>/`, and route
+   the FFN prefill GEMM to it in `forge-kernels` behind a flag — retiring the ADR-0001 CUDA-cubin
+   exception with a faster, 100 %-Mojo kernel.
+
+Everything in this finding is scratch (nothing committed to the engine default); the committed
+CUDA MMQ default is untouched.
