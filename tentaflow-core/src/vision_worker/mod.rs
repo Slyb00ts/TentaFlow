@@ -82,18 +82,9 @@ pub async fn run_vision_worker(cfg: VisionWorkerConfig) -> Result<()> {
     // Apply operator-configured install locations exactly like the core does
     // at boot — vision model files / containers may live outside the default
     // portable home layout.
-    {
-        let models = crate::db::repository::get_setting(&db, "models_dir")
-            .ok()
-            .flatten();
-        let containers = crate::db::repository::get_setting(&db, "containers_dir")
-            .ok()
-            .flatten();
-        let cache = crate::db::repository::get_setting(&db, "cache_dir")
-            .ok()
-            .flatten();
-        crate::paths::set_path_overrides(models, containers, cache);
-    }
+    crate::paths::load_path_overrides(|key| {
+        crate::db::repository::get_setting(&db, key).ok().flatten()
+    });
 
     // GStreamer — the ingest pipelines arrive with Stage B camera assignment,
     // but init is cheap, idempotent and pulls the same plugin environment the
