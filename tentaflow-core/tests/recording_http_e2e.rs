@@ -206,13 +206,20 @@ async fn router(
                 .await;
                 let status = file_outcome.http_status();
                 match file_outcome {
-                    RecordingFileOutcome::Ok { bytes } => Response::builder()
-                        .status(status)
-                        .header("Content-Type", content_type)
-                        .header("X-Recording-Hash", hash_sha256)
-                        .header("X-Recording-Created-At", created_at.to_string())
-                        .body(Full::new(Bytes::from(bytes)))
-                        .unwrap(),
+                    RecordingFileOutcome::Ok { mut file, size } => {
+                        // The real handler streams this; the test harness slurps
+                        // the same handle so body assertions stay byte-for-byte.
+                        use tokio::io::AsyncReadExt;
+                        let mut bytes = Vec::with_capacity(size as usize);
+                        file.read_to_end(&mut bytes).await.expect("read recording");
+                        Response::builder()
+                            .status(status)
+                            .header("Content-Type", content_type)
+                            .header("X-Recording-Hash", hash_sha256)
+                            .header("X-Recording-Created-At", created_at.to_string())
+                            .body(Full::new(Bytes::from(bytes)))
+                            .unwrap()
+                    }
                     _ => Response::builder()
                         .status(status)
                         .header("Content-Type", "application/json")
