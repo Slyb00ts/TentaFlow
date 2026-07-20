@@ -1,7 +1,7 @@
 # =============================================================================
 # Plik: llm/python/qwen3-vl/bundle.toml
 # Opis: Zamiennik VLM Qwen3-VL dla GPU nie-NVIDIA (AMD/ROCm) jako natywny
-#       python-bundle — vLLM (PyPI pinned 0.23.0) serwowany w trybie
+#       python-bundle — vLLM (PyPI pinned 0.25.1) serwowany w trybie
 #       generacyjnym chat z obsluga obrazow. CUDA (cu130) oraz ROCm (rocm7.0).
 #       Eksponuje OpenAI-compatible /v1/chat/completions z modalnoscia
 #       tekst + obraz.
@@ -9,11 +9,11 @@
 
 [bundle]
 engine = "qwen3-vl"
-description = "Qwen3-VL (VLM chat) via vLLM (PyPI, pinned 0.23.0)"
+description = "Qwen3-VL (VLM chat) via vLLM (PyPI, pinned 0.25.1)"
 python_version = "3.12"
-# Pinned na 0.23.0 dla reproducibility — git main moze rozjechac sie z deps.
+# Pinned na 0.25.1 dla reproducibility — git main moze rozjechac sie z deps.
 source = "pypi"
-pypi_package = "vllm==0.23.0"
+pypi_package = "vllm==0.25.1"
 
 [launch]
 command = "python"

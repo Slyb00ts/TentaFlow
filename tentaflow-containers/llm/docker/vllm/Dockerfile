@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener LLM z vLLM 0.23.0 (PyPI wheels), direct-http (bez sidecara).
+# Opis: Kontener LLM z vLLM 0.25.1 (PyPI wheels), direct-http (bez sidecara).
 #       vLLM nasluchuje OpenAI API na 0.0.0.0:8000, Core gada HTTP wprost.
 # =============================================================================
 
@@ -16,7 +16,7 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG TORCH_VERSION=2.11.0
 ARG TORCHVISION_VERSION=0.26.0
 ARG TORCHAUDIO_VERSION=2.11.0
-ARG VLLM_VERSION=0.23.0
+ARG VLLM_VERSION=0.25.1
 FROM ${CUDA_IMAGE}
 ARG TORCH_INDEX
 ARG TORCH_VERSION
