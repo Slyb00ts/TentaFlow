@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: index.html
+     Opis: Spis mockupów "Magazyn danych" — jeden spójny root danych węzła,
+           każdy katalog sterowany z ustawień (drzewko zamiast wpisywania
+           ścieżki), migracja danych na żywo bez restartu aplikacji.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — Magazyn danych — mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<div class="index-page">
+  <h1>Magazyn danych — ścieżki katalogów i migracja</h1>
+  <p class="subtitle">
+    Ustawienia <strong>Magazyn danych</strong>: wszystkie katalogi danych węzła (modele, baza, cache, kontenery,
+    sync, blob-y, dane addonów, klucze) w jednym miejscu, każdy sterowany osobno. Zamiast wpisywania ścieżki —
+    okno z drzewkiem katalogów i tworzeniem nowych folderów. Zmiana katalogu z danymi pyta o migrację:
+    usługi zależne są wstrzymywane, dane <strong>przenoszone</strong> (nie kopiowane) i wszystko wznawia się
+    na nowej lokalizacji — <strong>bez restartu aplikacji</strong>.
+  </p>
+
+  <div class="v2-note">
+    <strong>Trzy zasady.</strong> (1) <strong>Spójność</strong> — koniec z rozjazdem <code>~/.tentaflow</code> vs
+    <code>.runtime</code>: wszystkie dane podlegają tym ustawieniom, jeden root + jawne wyjątki per katalog.
+    (2) <strong>Wybór z drzewka</strong> — żadnego wpisywania ścieżek ręcznie; drzewko pokazuje wolne miejsce i
+    pozwala utworzyć nowy katalog. (3) <strong>Migracja live</strong> — move, nie kopia; stop → przenieś →
+    przełącz → wznów, aplikacja działa cały czas.
+  </div>
+
+  <div class="grp-title">1 · Ustawienia<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card start" href="01-magazyn-danych.html"><div class="id">01 · START</div><h3>Ekran „Magazyn danych”</h3><p>Lista wszystkich katalogów danych węzła z rozmiarami i opisami, KPI dysku, przycisk <strong>Zmień katalog</strong> przy każdym wierszu. Ustawienia node-local (nie synchronizują się przez mesh).</p></a>
+    <a class="index-card" href="02-wybor-katalogu.html"><div class="id">02</div><h3>Wybór katalogu (drzewko)</h3><p>Okno tf-window z drzewkiem dysków/katalogów: wolne miejsce per dysk, breadcrumb, zaznaczenie, <strong>Nowy katalog</strong> tworzony inline w drzewku. Drzewko w mockupie jest klikalne.</p></a>
+  </div>
+
+  <div class="grp-title">2 · Migracja danych<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="03-pytanie-migracja.html"><div class="id">03</div><h3>Pytanie o migrację</h3><p>Diff ścieżek (stara przekreślona → nowa), tabela usług do wstrzymania, szacowany czas. Trzy wyjścia: Anuluj / Przełącz bez przenoszenia / <strong>Przenieś dane</strong>.</p></a>
+    <a class="index-card" href="04-migracja-postep.html"><div class="id">04</div><h3>Migracja na żywo</h3><p>Pionowa oś kroków (kropki 1:1 z kreatora deploy): wstrzymanie usług → przenoszenie z paskiem postępu (plik, %, GB/s, ETA) → przełączenie ścieżki → wznowienie. <strong>Animacja odtwarza się automatycznie.</strong></p></a>
+    <a class="index-card" href="05-migracja-sukces.html"><div class="id">05</div><h3>Podsumowanie sukcesu</h3><p>Statystyki migracji (ile, jak długo, usługi wznowione), wpis audytu, oraz wiersz ustawień z już zaktualizowaną ścieżką i znacznikiem „zmigrowano”.</p></a>
+  </div>
+</div>
+</body>
+</html>

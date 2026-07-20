@@ -1891,6 +1891,58 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Storage admin (Ustawienia → Magazyn danych)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::StorageAdminBody(OverviewRequest) — unit. */
+  storageOverviewRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeStorageOverviewRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::StorageAdminBody(BrowseRequest { path }). */
+  storageBrowseRequest(correlationId, { path }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeStorageBrowseRequest(String(path ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::StorageAdminBody(CreateDirRequest { parent, name }). */
+  storageCreateDirRequest(correlationId, { parent, name }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeStorageCreateDirRequest(String(parent), String(name));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::StorageAdminBody(MigrateRequest { key, newPath, moveData }). */
+  storageMigrateRequest(correlationId, { key, newPath, moveData }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeStorageMigrateRequest(String(key), String(newPath), moveData === true);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Network (interfejsy hosta + konfiguracja bind/filter mesh)
   // -------------------------------------------------------------------------
 

@@ -44,6 +44,7 @@ pub mod resume_token;
 pub mod robots;
 pub mod role_catalog;
 pub mod run_events;
+pub mod storage_admin;
 pub mod state;
 pub mod stream;
 pub mod stream_handlers;
@@ -1570,6 +1571,24 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::VisionImportPayload::ImportRequest(_) => "VisionImportModelRequest",
             tentaflow_protocol::VisionImportPayload::ImportResponse(_) => {
                 "VisionImportModelResponse"
+            }
+        },
+        MessageBody::StorageAdminBody(p) => match p {
+            tentaflow_protocol::StorageAdminPayload::OverviewRequest => "StorageOverviewRequest",
+            tentaflow_protocol::StorageAdminPayload::OverviewResponse(_) => {
+                "StorageOverviewResponse"
+            }
+            tentaflow_protocol::StorageAdminPayload::BrowseRequest(_) => "StorageBrowseRequest",
+            tentaflow_protocol::StorageAdminPayload::BrowseResponse(_) => "StorageBrowseResponse",
+            tentaflow_protocol::StorageAdminPayload::CreateDirRequest(_) => {
+                "StorageCreateDirRequest"
+            }
+            tentaflow_protocol::StorageAdminPayload::CreateDirResponse(_) => {
+                "StorageCreateDirResponse"
+            }
+            tentaflow_protocol::StorageAdminPayload::MigrateRequest(_) => "StorageMigrateRequest",
+            tentaflow_protocol::StorageAdminPayload::MigrateResponse(_) => {
+                "StorageMigrateResponse"
             }
         },
     }

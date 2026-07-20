@@ -63,6 +63,7 @@ pub mod service_call_rate_limit;
 pub mod signed_urls;
 pub mod slam_scene;
 pub mod snapshot_builder;
+pub mod storage_admin;
 pub mod storage_proxy;
 pub mod stream_hub;
 pub mod streaming;

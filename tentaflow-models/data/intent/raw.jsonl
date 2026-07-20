@@ -1634,7 +1634,7 @@
 {"input": "Sprawdź czujnik wilgotności w serwerowni A, jeśli przekracza 60% to włącz dodatkową klimatyzację i wyślij alert do admina", "output": "PLAN,RECALL"}
 {"input": "Ta odpowiedź jest super, dokładnie o to chodziło. Zapamiętaj ten format raportowania.", "output": "FEEDBACK,MEMORY"}
 {"input": "Pobierz dane z API pogodowego dla Warszawy i zapisz do InfluxDB", "output": "TOOLS,RECALL"}
-{"input": "Mieliśmy spotkanie z klientem Acme. Ustalono: budżet 500k, deadline 30.06.2026, stack: .NET + Angular. Zapamiętaj i wyślij podsumowanie do PM-a na Teams.", "output": "MEMORY,TOOLS,RECALL"}
+{"input": "Mieliśmy spotkanie z klientem Orlen. Ustalono: budżet 500k, deadline 30.06.2026, stack: .NET + Angular. Zapamiętaj i wyślij podsumowanie do PM-a na Teams.", "output": "MEMORY,TOOLS,RECALL"}
 {"input": "Review this Terraform plan and check if it follows our tagging policy before applying", "output": "MODEL,TOOLS,RECALL"}
 {"input": "Co to jest protokół MQTT?", "output": "TEXT"}
 {"input": "Jak działa garbage collector w Javie?", "output": "TEXT"}
@@ -2084,7 +2084,7 @@
 {"input": "Wyjaśnij mi czym się różni pub/sub od message queue", "output": "TEXT"}
 {"input": "Sprawdź status deploymentu na ArgoCD dla serwisu payment-api", "output": "TOOLS,RECALL"}
 {"input": "Ile mamy otwartych ticketów w Linear w bieżącym sprincie?", "output": "TOOLS,RECALL"}
-{"input": "Zapamiętaj: klient Acme ma dedykowany klaster K8s z SLA 99.99%", "output": "MEMORY"}
+{"input": "Zapamiętaj: klient Orlen ma dedykowany klaster K8s z SLA 99.99%", "output": "MEMORY"}
 {"input": "Wyciągnij z tego maila kto pisze i czego potrzebuje:\n\nSzanowni Państwo, w nawiązaniu do rozmowy telefonicznej z dnia 20.03 chciałbym potwierdzić zamówienie na 50 licencji.", "output": "EXTRACT,RECALL"}
 {"input": "Nie, źle — baza danych to ClickHouse a nie PostgreSQL", "output": "FEEDBACK,MEMORY"}
 {"input": "Ustaw temperaturę w serwerowni B na 19 stopni przez BMS", "output": "TOOLS,RECALL"}
@@ -4032,7 +4032,7 @@
 {"input": "Wygeneruj embedding dla tego dokumentu i dodaj do bazy wektorowej", "output": "MODEL,TOOLS,RECALL"}
 {"input": "Wracając do tematu migracji bazy — wczoraj źle zrobiłeś backup. Tym razem użyj pg_dump z flagą --format=custom i wrzuć na S3.", "output": "FEEDBACK,MEMORY,TOOLS,RECALL"}
 {"input": "Dostałem taki ticket:\n\nPriorytet: krytyczny\nOpis: Klient nie może się zalogować od 2h, błąd 503 na proxy\n\nWyciągnij priorytet i opis problemu, sprawdź logi nginx i prześlij raport na PagerDuty", "output": "EXTRACT,TOOLS,RECALL"}
-{"input": "Sprawdź co ustaliliśmy z klientem Acme w zeszłym tygodniu i wyślij follow-up maila", "output": "TOOLS,RECALL"}
+{"input": "Sprawdź co ustaliliśmy z klientem Orlen w zeszłym tygodniu i wyślij follow-up maila", "output": "TOOLS,RECALL"}
 {"input": "Przygotuj fakturę dla klienta ABC na podstawie zarejestrowanych godzin w Toggl i wyślij przez Comarch", "output": "PLAN,RECALL"}
 {"input": "Znajdź wszystkie maszyny wirtualne na Proxmoxie z RAM > 16GB, sprawdź ich load i wyślij raport do admina na Mattermost", "output": "PLAN,RECALL"}
 {"input": "No, that's wrong — we use WireGuard not OpenVPN. Remember that for future reference.", "output": "FEEDBACK,MEMORY"}
@@ -5430,7 +5430,7 @@
 {"input": "Sprawdź logi z Sentry za ostatni tydzień, wyciągnij top 5 błędów i wyślij raport na Teams do kanału #backend", "output": "PLAN,RECALL"}
 {"input": "Find the Q4 financial report in SharePoint, extract revenue by region, compare with Q3, and email the summary to the CFO and VP of Sales", "output": "PLAN,RECALL"}
 {"input": "Przejrzyj dokumentację w Confluence o onboardingu, wyciągnij checklistę, utwórz z niej ticket w Jira i przypisz do HR", "output": "PLAN,RECALL"}
-{"input": "Mieliśmy dziś spotkanie z klientem Acme. Ustaliliśmy: budżet 450k, deadline na koniec Q2, stack to .NET + Angular. Zaktualizuj to w CRM i wyślij podsumowanie do Ani.", "output": "MEMORY,TOOLS,RECALL"}
+{"input": "Mieliśmy dziś spotkanie z klientem Orlen. Ustaliliśmy: budżet 450k, deadline na koniec Q2, stack to .NET + Angular. Zaktualizuj to w CRM i wyślij podsumowanie do Ani.", "output": "MEMORY,TOOLS,RECALL"}
 {"input": "Ok działa, super. Zapamiętaj że tenfix z connection poolingiem rozwiązuje problem z timeoutami na produkcji i napisz na Slack do #devops.", "output": "FEEDBACK,MEMORY,TOOLS,RECALL"}
 {"input": "Sprawdź w BMS temperaturę i wilgotność w serwerowni i zapamiętaj że alarm ma się włączać powyżej 25 stopni", "output": "TOOLS,MEMORY,RECALL"}
 {"input": "Create a Terraform plan for a new VPC with 3 subnets and a NAT gateway on AWS", "output": "MODEL,RECALL"}

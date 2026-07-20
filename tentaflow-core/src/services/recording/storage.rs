@@ -51,11 +51,10 @@ impl From<RecordingRef> for String {
     }
 }
 
-/// Resolve `~/.tentaflow/recordings`. Fails if `HOME` cannot be located.
+/// Katalog nagran — `paths::recordings_dir()` (respektuje `recordings_dir`
+/// z Ustawien → Magazyn danych i wspolny `tentaflow_home()`).
 pub fn recording_base_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| RecordingError::BaseDirUnavailable("HOME not set".into()))?;
-    Ok(home.join(".tentaflow").join("recordings"))
+    Ok(crate::paths::recordings_dir())
 }
 
 /// `<base>/<camera_id>/<snapshots|segments>` — caller must `create_dir_all`.

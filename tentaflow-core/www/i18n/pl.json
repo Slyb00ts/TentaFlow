@@ -745,6 +745,7 @@
     "tab_oauth": "OAuth",
     "tab_tls": "TLS",
     "tab_mesh": "Mesh i Sieć",
+    "tab_storage": "Magazyn danych",
     "tab_external_access": "Dostępy zewnętrzne",
     "general_title": "Ustawienia globalne",
     "general_hint": "Surowe pary klucz–wartość z bazy. Zmiany aplikują się natychmiast. Sekcje specjalne (TLS, OAuth, dostępy zewnętrzne) są obsługiwane na dedykowanych zakładkach.",

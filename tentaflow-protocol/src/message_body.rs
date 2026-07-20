@@ -7527,6 +7527,12 @@ pub enum MessageBody {
     // `VisionImportPayload` — Core pobiera zdalny manifest przez klucz API i
     // importuje pojedynczy model wizyjny do lokalnego rejestru.
     VisionImportBody(VisionImportPayload),
+
+    // ----- Ustawienia → Magazyn danych (ścieżki katalogów + migracja) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym).
+    // JEDEN wariant na całą rodzinę (overview + browse + mkdir + migrate) w
+    // `StorageAdminPayload`.
+    StorageAdminBody(crate::storage::StorageAdminPayload),
 }
 
 // =============================================================================

@@ -231,7 +231,9 @@ pub fn init(
     if let Some(existing) = SYNC_RUNTIME.get() {
         return Ok(existing.clone());
     }
-    let ledger_path = paths::tentaflow_home().join("sync").join("ledger");
+    // `sync_dir()` respektuje `sync_dir` z storage-paths.conf (aplikowane przy
+    // starcie — ledger trzyma otwarty keyspace przez caly czas zycia procesu).
+    let ledger_path = paths::sync_dir().join("ledger");
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
     let needs_baseline_reset = ledger.needs_baseline_reset();
     let local_node_id = signer.ed25519_public_key_hex();
@@ -3519,8 +3521,7 @@ fn apply_blob_manifest_operation(operation: &SyncOperation) -> LedgerResult<Blob
 
 fn blob_path_for_sha(sha: &str) -> LedgerResult<std::path::PathBuf> {
     validate_blob_sha(sha)?;
-    Ok(crate::paths::tentaflow_home()
-        .join("blobs")
+    Ok(crate::paths::blobs_dir()
         .join(&sha[0..2])
         .join(&sha[2..4])
         .join(format!("{sha}.bin")))
@@ -3528,8 +3529,7 @@ fn blob_path_for_sha(sha: &str) -> LedgerResult<std::path::PathBuf> {
 
 fn blob_chunk_dir(sha: &str) -> LedgerResult<std::path::PathBuf> {
     validate_blob_sha(sha)?;
-    Ok(crate::paths::tentaflow_home()
-        .join("sync")
+    Ok(crate::paths::sync_dir()
         .join("blob-chunks")
         .join(&sha[0..2])
         .join(&sha[2..4])

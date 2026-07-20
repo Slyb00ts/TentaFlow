@@ -26,6 +26,7 @@ pub mod message_body;
 pub mod model_metrics;
 pub mod pii;
 pub mod profiling;
+pub mod storage;
 pub mod stream;
 pub mod token_usage;
 pub mod types;
@@ -49,6 +50,11 @@ pub use legal::{
     LegalDocumentsListRequest, LegalDocumentsListResponse,
 };
 pub use mesh::*;
+pub use storage::{
+    StorageAdminPayload, StorageBrowseRequest, StorageBrowseResponse, StorageCategoryInfo,
+    StorageCreateDirRequest, StorageCreateDirResponse, StorageDirEntry, StorageMigrateRequest,
+    StorageMigrateResponse, StorageOverviewResponse,
+};
 pub use message_body::{
     AccessConsumerEntry,
     AccessMutationResponse,

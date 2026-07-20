@@ -31,9 +31,6 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-/// Subdirectory under `tentaflow_home()` that holds all 32-byte keys.
-const KEY_SUBDIR: &str = "keys";
-
 /// Standard length of every key managed by this module. Picked to match
 /// HMAC-SHA256 block usage and AES-256.
 pub const KEY_LEN: usize = 32;
@@ -120,16 +117,16 @@ impl std::fmt::Debug for PersistentKey {
 
 /// Resolve the on-disk path for `<name>.key`. Honours
 /// `TENTAFLOW_KEY_<NAME>` env override; otherwise resolves to
-/// `<tentaflow_home>/keys/<name>.key`.
+/// `<keys_dir>/<name>.key` (respektuje `keys_dir` z Ustawien → Magazyn
+/// danych — sciezka liczona przy kazdym wywolaniu, wiec migracja katalogu
+/// kluczy dziala bez restartu).
 pub fn key_path(name: &str) -> Result<PathBuf, KeyStorageError> {
     validate_name(name)?;
     let env_var = format!("TENTAFLOW_KEY_{}", name.to_ascii_uppercase());
     if let Ok(p) = std::env::var(&env_var) {
         return Ok(PathBuf::from(p));
     }
-    Ok(crate::paths::tentaflow_home()
-        .join(KEY_SUBDIR)
-        .join(format!("{}.key", name)))
+    Ok(crate::paths::keys_dir().join(format!("{}.key", name)))
 }
 
 fn validate_name(name: &str) -> Result<(), KeyStorageError> {
@@ -370,9 +367,13 @@ pub mod watcher {
     /// the issuer singletons it serves are themselves `OnceLock`-static.
     /// Any panic inside the callback is caught and logged so a single bad
     /// rotate cannot kill the watcher loop.
+    ///
+    /// Sciezka jest RE-RESOLVOWANA przy kazdym ticku z `initial_path` /
+    /// `key_path(name)` — po migracji katalogu kluczy (Magazyn danych)
+    /// watcher automatycznie sledzi plik w nowej lokalizacji.
     pub fn spawn_key_watcher<F>(
         name: &'static str,
-        path: PathBuf,
+        initial_path: PathBuf,
         poll_interval: Duration,
         on_change: F,
     ) where
@@ -384,17 +385,29 @@ pub mod watcher {
             return;
         }
         tokio::spawn(async move {
+            // Watcher re-resolves the key path each tick ONLY when the
+            // caller passed the settings-derived path (issuer singletons).
+            // Tests pin an explicit tempfile; for them `key_path(name)`
+            // resolves elsewhere, so we keep the pinned path verbatim.
+            let follows_settings = super::key_path(name)
+                .map(|p| p == initial_path)
+                .unwrap_or(false);
             // Seed last_bytes from the current on-disk state so the very
             // first detected change is a real rotation, not the startup
             // load.
-            let mut last_bytes: Option<[u8; KEY_LEN]> = read_persistent_key(&path).ok();
-            let mut last_mtime: Option<SystemTime> = std::fs::metadata(&path)
+            let mut last_bytes: Option<[u8; KEY_LEN]> = read_persistent_key(&initial_path).ok();
+            let mut last_mtime: Option<SystemTime> = std::fs::metadata(&initial_path)
                 .ok()
                 .and_then(|m| m.modified().ok());
 
             loop {
                 tokio::time::sleep(poll_interval).await;
 
+                let path = if follows_settings {
+                    super::key_path(name).unwrap_or_else(|_| initial_path.clone())
+                } else {
+                    initial_path.clone()
+                };
                 let meta = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {

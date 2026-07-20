@@ -153,17 +153,12 @@ pub fn validate_org_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Returns `<HOME>/.tentaflow/orgs/<org_id>/addons/<addon_id>/vectors/<namespace>.usearch`.
+/// Returns `<orgs_dir>/<org_id>/addons/<addon_id>/vectors/<namespace>.usearch`.
 /// The org segment ensures the same addon installed in two tenants writes to
-/// physically separate directories.
+/// physically separate directories. Root idzie przez `paths::orgs_dir()`
+/// (respektuje `addons_data_dir` z Ustawien).
 fn namespace_file_path(org_id: &str, addon_id: &str, namespace: &str) -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| VectorError::Io {
-        path: None,
-        source: std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"),
-    })?;
-    Ok(home
-        .join(".tentaflow")
-        .join("orgs")
+    Ok(crate::paths::orgs_dir()
         .join(org_id)
         .join("addons")
         .join(addon_id)
@@ -352,6 +347,13 @@ impl NamespaceManager {
     /// in-memory handle cache is cleared.
     pub fn invalidate_addon(&self, addon_id: &str) {
         self.backends.retain(|k, _| k.addon_id != addon_id);
+    }
+
+    /// Zrzuca WSZYSTKIE otwarte backendy (migracja katalogu danych addonow —
+    /// uchwyty plikowe musza byc zamkniete przed przeniesieniem katalogu).
+    /// Nastepny dostep otwiera indeks z nowej lokalizacji zapisanej w bazie.
+    pub fn invalidate_all(&self) {
+        self.backends.clear();
     }
 
     fn file_path_for(&self, org_id: &str, addon_id: &str, namespace: &str) -> Result<PathBuf> {

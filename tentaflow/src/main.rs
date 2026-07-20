@@ -189,6 +189,14 @@ async fn run_server(args: Args) -> Result<()> {
     info!("Tentaflow home: {}", paths::tentaflow_home().display());
     info!("Konfiguracja: {:?}", args.config);
 
+    // Zaplanowane przeniesienia katalogow Data/Sync (Ustawienia → Magazyn
+    // danych) wykonuja sie TERAZ — przed otwarciem bazy i ledgera, gdy zadne
+    // uchwyty nie sa jeszcze otwarte. Zaraz po nich laduja sie override'y
+    // plikowe (storage-paths.conf), zeby `database_path()` wskazywala juz
+    // przeniesiony katalog; klucze live z bazy dociagane sa po `db::init`.
+    paths::apply_pending_boot_migrations();
+    paths::load_path_overrides(|_| None);
+
     // Materializuj portable layout: data/, models/, cache/, containers/.
     // Bez tego deploy strategie (python-bundle, binary, docker context) nie
     // znajda manifestow i nie wystartuja.
@@ -262,20 +270,14 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy danych: {}", e);
         e
     })?;
-    // Wczytaj konfigurowalne lokalizacje instalacji (models/containers/cache) z
-    // ustawien i zastosuj jako runtime override w `paths`. Wolane PO `db::init`
+    // Wczytaj konfigurowalne lokalizacje katalogow danych (Ustawienia → Magazyn
+    // danych) i zastosuj jako runtime override w `paths`. Wolane PO `db::init`
     // (pool dostepny), wiec ponawiamy `ensure_app_dirs()` — jest idempotentne —
-    // zeby katalogi powstaly w nowej lokalizacji. data_dir/baza ZOSTAJA pod
-    // tentaflow_home. Te 3 klucze sa node-local (nie syncowane).
+    // zeby katalogi powstaly w nowej lokalizacji. Data/Sync dociagane z
+    // storage-paths.conf wewnatrz `load_path_overrides`. Klucze `*_dir` sa
+    // node-local (nie syncowane).
     {
-        let models = db::repository::get_setting(&db, "models_dir")
-            .ok()
-            .flatten();
-        let containers = db::repository::get_setting(&db, "containers_dir")
-            .ok()
-            .flatten();
-        let cache = db::repository::get_setting(&db, "cache_dir").ok().flatten();
-        paths::set_path_overrides(models, containers, cache);
+        paths::load_path_overrides(|key| db::repository::get_setting(&db, key).ok().flatten());
         if let Err(e) = paths::ensure_app_dirs() {
             error!("ensure_app_dirs po wczytaniu override nieudany: {}", e);
             return Err(anyhow::anyhow!("ensure_app_dirs (override): {}", e));

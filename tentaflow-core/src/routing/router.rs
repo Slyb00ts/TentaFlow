@@ -249,33 +249,21 @@ impl Router {
             parking_lot::RwLock<Option<Arc<crate::services::model_residency::ModelResidency>>>,
         > = Arc::new(parking_lot::RwLock::new(None));
         let db_clone = db.clone();
-        // Etap 2: BlobStore default = FileBlobStore w `<TENTAFLOW_HOME>/blobs`.
-        // Override `TENTAFLOW_BLOB_STORE=memory` dla testów / lokalnych dev
-        // sesji bez persystencji audio.
+        // Etap 2: BlobStore default = FileBlobStore z korzeniem sterowanym
+        // Ustawieniami (`paths::blobs_dir()`, liczony per-operacja — zmiana
+        // `blobs_dir` dziala na zywo). Override `TENTAFLOW_BLOB_STORE=memory`
+        // dla testów / lokalnych dev sesji bez persystencji audio.
         let blobs: Arc<dyn crate::flow_engine::blob_store::BlobStore> =
             match std::env::var("TENTAFLOW_BLOB_STORE").as_deref() {
                 Ok("memory") => Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new()),
                 _ => {
-                    let root = std::env::var("TENTAFLOW_HOME")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|_| {
-                            dirs::home_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                .join(".tentaflow")
-                        })
-                        .join("blobs");
+                    let root = crate::paths::blobs_dir();
                     if let Err(e) = std::fs::create_dir_all(&root) {
                         tracing::warn!("FileBlobStore init {}: {e}", root.display());
                     }
-                    match db_clone.as_ref() {
-                        Some(db_for_blob_sync) => {
-                            Arc::new(crate::flow_engine::blob_store::FileBlobStore::with_sync(
-                                root,
-                                db_for_blob_sync.clone(),
-                            ))
-                        }
-                        None => Arc::new(crate::flow_engine::blob_store::FileBlobStore::new(root)),
-                    }
+                    Arc::new(crate::flow_engine::blob_store::FileBlobStore::with_settings_root(
+                        db_clone.as_ref().cloned(),
+                    ))
                 }
             };
         let flow_dispatcher = db.map(|pool| {
