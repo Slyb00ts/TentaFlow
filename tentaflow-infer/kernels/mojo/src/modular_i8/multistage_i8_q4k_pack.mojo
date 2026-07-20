@@ -11,24 +11,23 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 #
-# Per-32-block Q4_K int8 multistage GEMM. Derived from Modular's multistage
-# pipeline (forked in multistage_i8.mojo). BK=64 keeps the register double
-# buffer; each inner m16n8k32 mma covers exactly one Q4_K 32-column sub-block,
-# so its int32 dot is flushed into a persistent f32 accumulator with the
-# per-sub-block Q4_K scales:
+# PACKED Q4_K int8 multistage GEMM — reproduces MMQ's packed-weight data path.
+# Derived from the per-32-block Q4_K kernel (multistage_i8_q4k.mojo, Finding M).
+# Removes the two bottlenecks Finding M measured:
+#   1. Weights are read from HBM as PACKED 4-bit nibbles ([N, K/2] uint8) — HALF
+#      the bandwidth of the unpacked int8 [N,K] matrix. The packed bytes are
+#      cp.async'd into a pipelined smem staging buffer (num_pipeline_stages deep,
+#      exactly like the activation), then unpacked in-kernel into a double-
+#      buffered plain int8 smem tile that the s8 mma consumes (b_swizzle=False,
+#      so the unpack is a straight row-major write — no ldmatrix swizzle to
+#      reproduce). The unpack reads staged smem (fast), NOT global memory, so the
+#      HBM latency is hidden by the pipeline.
+#   2. Scales are f16 (half2), matching MMQ's block scale storage — halves the
+#      scale-tensor HBM traffic.
 #
-#   out[t,n] += d[n]*sc[n,kb]*d_a[t,kb]*sumi  -  dmin[n]*m[n,kb]*s_a[t,kb]
-#
-# where kb = k_tile_id*num_k_mmas + k_mma is the global 32-block index.
-# Scales are pre-folded on the host into dsc = d*sc, dm = dmin*m (weight side)
-# and da = d_a, sa = s_a = d_a*sum (activation q8_1 side). This mirrors
-# llama.cpp `vec_dot_q4_K_q8_1_impl_mmq` exactly, so a bit-exact per-block
-# kernel matches the Q4_K MMQ quality by construction.
-#
-# The per-k-tile scales are staged into shared memory once (cooperative load,
-# BM+BN reads across the whole block), so the flush reads them at smem latency
-# with no redundant per-fragment global loads — the difference between ~90 and
-# ~300 TOPS.
+# The activation stays q8_1 (int8 codes + per-32 f16 d_a / s_a). The per-32-block
+# flush is bit-identical to vec_dot_q4_K_q8_1_impl_mmq, so quality == Q4_K MMQ
+# by construction.
 
 from std.math import ceildiv
 from std.math.uutils import umod, ufloordiv, udivmod, uceildiv
@@ -73,12 +72,12 @@ from linalg.utils_gpu import MatmulConfig
 
 
 @always_inline
-def multistage_mma_q4k_f16[
+def multistage_mma_q4k_pack[
     a_type: DType,
     a_layout: Layout,
     a_smem_layout: Layout,
-    b_type: DType,
-    b_layout: Layout,
+    bp_layout: Layout,
+    bp_smem_layout: Layout,
     b_smem_layout: Layout,
     //,
     BM: Int,
@@ -93,22 +92,25 @@ def multistage_mma_q4k_f16[
         mut=True, DType.float32, _, address_space=AddressSpace.LOCAL, ...
     ],
     a_iter_arg: LayoutTensorIter[_, a_layout, ...],
-    b_iter_arg: LayoutTensorIter[b_type, b_layout, ...],
     a_smem_iter_arg: LayoutTensorIter[
         mut=True, a_type, a_smem_layout, address_space=AddressSpace.SHARED, ...
     ],
-    mut b_smem_iter: LayoutTensorIter[
-        mut=True, b_type, b_smem_layout, address_space=AddressSpace.SHARED, ...
+    bp_iter_arg: LayoutTensorIter[_, bp_layout, ...],
+    bp_smem_iter_arg: LayoutTensorIter[
+        mut=True, DType.uint8, bp_smem_layout, address_space=AddressSpace.SHARED, ...
+    ],
+    b_smem_full: LayoutTensor[
+        mut=True, a_type, b_smem_layout, address_space=AddressSpace.SHARED, ...
     ],
     num_iters: Int,
-    # per-sub-block weight scale tensors (global memory, f16)
+    # per-sub-block weight scale tensors (global memory, f16).
     dsc: UnsafePointer[Float16, ImmutAnyOrigin],
     dm: UnsafePointer[Float16, ImmutAnyOrigin],
     # per-sub-block activation scales (f32, from quantize_act_q8_1); staged into
     # smem as f16 so the per-block flush reproduces the proven f16-scale path.
     da: UnsafePointer[Float32, ImmutAnyOrigin],
     sa: UnsafePointer[Float32, ImmutAnyOrigin],
-    # per-k-tile scale scratch in shared memory (num_k_mmas sub-blocks each)
+    # per-k-tile scale scratch in shared memory (num_k_mmas sub-blocks each).
     da_sm: UnsafePointer[
         Float16, MutAnyOrigin, address_space = AddressSpace.SHARED
     ],
@@ -123,11 +125,14 @@ def multistage_mma_q4k_f16[
     ],
     M: Int,
     N: Int,
+    K: Int,
     nkb: Int,
     block_m_base: Int,
     block_n_base: Int,
 ):
     comptime simd_size = simd_width_of[a_type]()
+    comptime pbytes = BK // 2
+    comptime simd_bp = 16
     comptime transpose_b = True
 
     var full_tid = thread_idx.x
@@ -139,19 +144,17 @@ def multistage_mma_q4k_f16[
     var warp_y, warp_x = divmod(warp_id, UInt32(num_warps_n))
 
     var a_iter = a_iter_arg
-    var b_iter = b_iter_arg
     var a_smem_iter = a_smem_iter_arg
+    var bp_iter = bp_iter_arg
+    var bp_smem_iter = bp_smem_iter_arg
 
     comptime a_num_vecs = BM * BK // simd_size
     comptime async_copy_a_layout = Layout.row_major(
         min(num_threads, a_num_vecs) * simd_size // BK, BK // simd_size
     )
-    comptime b_num_ves = BN * BK // simd_size
-    comptime async_copy_b_layout = Layout.row_major(
-        min(num_threads, b_num_ves)
-        * simd_size
-        // b_smem_layout.shape[1].value(),
-        b_smem_layout.shape[1].value() // simd_size,
+    comptime bp_num_vecs = BN * pbytes // simd_bp
+    comptime async_copy_bp_layout = Layout.row_major(
+        min(num_threads, bp_num_vecs) * simd_bp // pbytes, pbytes // simd_bp
     )
 
     @always_inline
@@ -165,30 +168,57 @@ def multistage_mma_q4k_f16[
 
     @always_inline
     @parameter
-    def _copy_b_to_sram(dst: LayoutTensor[mut=True, ...], src: LayoutTensor):
+    def _copy_bp_to_sram(dst: LayoutTensor[mut=True, ...], src: LayoutTensor):
         copy_dram_to_sram_async[
-            thread_layout=async_copy_b_layout,
-            swizzle=True,
+            thread_layout=async_copy_bp_layout,
+            swizzle=False,
             num_threads=num_threads,
-        ](dst.vectorize[1, simd_size](), src.vectorize[1, simd_size]())
+        ](dst.vectorize[1, simd_bp](), src.vectorize[1, simd_bp]())
 
-    # Prefetch (num_pipeline_stages - 1) stages.
+    var b_base = b_smem_full.ptr
+
+    @always_inline
+    @parameter
+    def _unpack_b(
+        bp_sm: UnsafePointer[
+            UInt8, MutAnyOrigin, address_space = AddressSpace.SHARED
+        ],
+        buf: Int,
+    ):
+        # Unpack this k-tile's staged packed nibbles ([BN, BK/2] bytes in smem)
+        # into the plain int8 buffer. b_swizzle=False, so plain row-major write.
+        var buf_off = buf * BN * BK
+        var i = Int(full_tid)
+        while i < BN * pbytes:
+            var n = i // pbytes
+            var bc = i % pbytes
+            var byte = Int(bp_sm[n * pbytes + bc])
+            # b_swizzle=False on the mma load, so write plain row-major (no
+            # ldmatrix swizzle to reproduce).
+            var o = buf_off + n * BK + 2 * bc
+            b_base[o] = Scalar[a_type](byte & 0xF)
+            b_base[o + 1] = Scalar[a_type]((byte >> 4) & 0xF)
+            i += num_threads
+
+    # Prefetch (num_pipeline_stages - 1) A + packed-B stages.
     comptime for stage in range(num_pipeline_stages - 1):
         var a_smem_tile = a_smem_iter.next_unsafe(
             a_smem_iter.linear_uint_type(stage)
         )[]
         _copy_a_to_sram(a_smem_tile, a_iter[])
         a_iter._incr()
-
-        var b_smem_tile = b_smem_iter.next_unsafe(
-            b_smem_iter.linear_uint_type(stage)
+        var bp_smem_tile = bp_smem_iter.next_unsafe(
+            bp_smem_iter.linear_uint_type(stage)
         )[]
-        _copy_b_to_sram(b_smem_tile, b_iter[])
-        b_iter._incr()
-
+        _copy_bp_to_sram(bp_smem_tile, bp_iter[])
+        bp_iter._incr()
         async_copy_commit_group()
 
     async_copy_wait_group(Int32(num_pipeline_stages - 2))
+    barrier()
+
+    # Unpack B for k-tile 0 into buffer 0 (bp_smem_iter[] points at stage 0).
+    _unpack_b(bp_smem_iter[].ptr.as_unsafe_any_origin(), 0)
     barrier()
 
     comptime mma_shape = get_mma_shape[a_type, DType.int32]()
@@ -216,7 +246,7 @@ def multistage_mma_q4k_f16[
     comptime b_reg_layout = Layout.row_major(2 * num_n_mmas, b_frag_size)
     var b_reg_tiles = (
         LayoutTensor[
-            b_type, b_reg_layout, MutAnyOrigin, address_space=AddressSpace.LOCAL
+            a_type, b_reg_layout, MutAnyOrigin, address_space=AddressSpace.LOCAL
         ]
         .stack_allocation()
         .vectorize[1, b_frag_size]()
@@ -224,9 +254,13 @@ def multistage_mma_q4k_f16[
     )
 
     var a_warp_tile = a_smem_iter[].tile[WM, BK](Int(warp_y), 0)
-    var b_warp_tile = b_smem_iter[].tile[WN, BK](Int(warp_x), 0)
+    var b_warp_tile = b_smem_full.tile[BN, BK](0, 0).tile[WN, BK](
+        Int(warp_x), 0
+    )
 
-    var mma_op = TensorCore[DType.int32, a_type, mma_shape, transpose_b]()
+    var mma_op = TensorCore[
+        DType.int32, a_type, mma_shape, transpose_b, b_swizzle=False
+    ]()
 
     var c_tmp = LayoutTensor[
         DType.int32,
@@ -239,14 +273,12 @@ def multistage_mma_q4k_f16[
         a_type, a_warp_tile.stride[0]()
     ]()
 
-    # Per-thread fragment output coordinates within the block tile (constant
-    # across K): local row/col into the BM×BN scale smem staging buffers.
     var groupID = Int(lane) // 4
     var tgrp = Int(lane) % 4
     var warp_lrow = Int(warp_y) * WM
     var warp_lcol = Int(warp_x) * WN
 
-    # Load k=0 fragment (sub-block 0 of k-tile 0).
+    # Load k=0 fragment (sub-block 0 of k-tile 0) from B buffer 0.
     mma_op.load_a[swizzle_a_pattern](
         a_warp_tile, a_reg_tiles[0].vectorize[1, a_frag_size](), 0
     )
@@ -258,11 +290,8 @@ def multistage_mma_q4k_f16[
     @always_inline
     @parameter
     def _stage_scales(k_tile_id: Int, buf: Int):
-        # Cooperative load of this k-tile's sub-blocks of scales into smem.
         var ro = buf * row_stride
         var co = buf * col_stride
-        # kb-major scale layout (da[kb*M+t], dsc[kb*N+n]) makes this cooperative
-        # load fully coalesced across the BM rows / BN cols.
         var i = Int(full_tid)
         while i < row_stride:
             var sub = i // BM
@@ -285,7 +314,6 @@ def multistage_mma_q4k_f16[
     @always_inline
     @parameter
     def _flush(sub: Int, cur: Int, buf: Int):
-        # Hoist this thread's row/col scales from smem into registers.
         var ro = buf * row_stride + sub * BM
         var co = buf * col_stride + sub * BN
         var da_r = InlineArray[Float32, num_m_mmas * 2](fill=0)
@@ -303,8 +331,6 @@ def multistage_mma_q4k_f16[
                 dsc_r[n_mma * 2 + w] = Float32(dsc_sm[co + lc])
                 dm_r[n_mma * 2 + w] = Float32(dm_sm[co + lc])
 
-        # All sub-block mmas back-to-back into independent int32 accumulators
-        # (tensor-core ILP), then a single flush pass applies the scales.
         _ = c_tmp.fill(0)
         mma_op.mma(
             a_reg_tiles[cur].vectorize[1, a_frag_size](),
@@ -329,13 +355,13 @@ def multistage_mma_q4k_f16[
 
     for k_tile_id in range(num_iters):
         var buf = k_tile_id % 2
-        # Stage the next k-tile's scales into the other buffer; the global-load
-        # latency overlaps with this tile's mma work, hidden by the end barrier.
         if k_tile_id + 1 < num_iters:
             _stage_scales(k_tile_id + 1, (k_tile_id + 1) % 2)
 
         var a_wt = a_smem_iter[].tile[WM, BK](Int(warp_y), 0)
-        var b_wt = b_smem_iter[].tile[WN, BK](Int(warp_x), 0)
+        var b_wt = b_smem_full.tile[BN, BK](k_tile_id % 2, 0).tile[WN, BK](
+            Int(warp_x), 0
+        )
 
         comptime for k_mma in range(num_k_mmas):
             comptime k_mma_next = k_mma + 1
@@ -349,19 +375,25 @@ def multistage_mma_q4k_f16[
                     )[]
                     _copy_a_to_sram(a_pf, a_iter[])
                     a_iter._incr()
-                    var b_pf = b_smem_iter.next_unsafe(
-                        b_smem_iter.linear_uint_type(num_pipeline_stages - 1)
+                    var bp_pf = bp_smem_iter.next_unsafe(
+                        bp_smem_iter.linear_uint_type(num_pipeline_stages - 1)
                     )[]
-                    _copy_b_to_sram(b_pf, b_iter[])
-                    b_iter._incr()
+                    _copy_bp_to_sram(bp_pf, bp_iter[])
+                    bp_iter._incr()
                 async_copy_commit_group()
                 async_copy_wait_group(Int32(num_pipeline_stages - 2))
-                barrier()
 
                 a_smem_iter._incr()
-                b_smem_iter._incr()
+                bp_smem_iter._incr()
+                # Unpack the newly-current packed stage into the other buffer.
+                if k_tile_id + 1 < num_iters:
+                    _unpack_b(bp_smem_iter[].ptr.as_unsafe_any_origin(), (k_tile_id + 1) % 2)
+                barrier()
+
                 a_wt = a_smem_iter[].tile[WM, BK](Int(warp_y), 0)
-                b_wt = b_smem_iter[].tile[WN, BK](Int(warp_x), 0)
+                b_wt = b_smem_full.tile[BN, BK]((k_tile_id + 1) % 2, 0).tile[
+                    WN, BK
+                ](Int(warp_x), 0)
 
             comptime kidx = k_mma_next % num_k_mmas
             mma_op.load_a[swizzle_a_pattern](
@@ -372,20 +404,18 @@ def multistage_mma_q4k_f16[
             comptime cur = k_mma % num_reg_tiles
             _flush(k_mma, cur, buf)
 
-        # Publish the next tile's staged scales and complete this tile's reads
-        # before the following iteration overwrites this buffer.
         barrier()
 
 
-@__name(t"multistage_gemm_q4k_f16_kernel_{a_type}")
-def multistage_gemm_q4k_f16_kernel[
+@__name(t"multistage_gemm_q4k_pack_kernel_{a_type}")
+def multistage_gemm_q4k_pack_kernel[
     CLT: TensorLayout,
     a_type: DType,
     ALT: TensorLayout,
-    BLT: TensorLayout,
+    BPLT: TensorLayout,
     c_linear_idx_type: DType,
     a_linear_idx_type: DType,
-    b_linear_idx_type: DType,
+    bp_linear_idx_type: DType,
     config: MatmulConfig[a_type, a_type, DType.float32, True, ...],
 ](
     c_tt: TileTensor[
@@ -394,8 +424,8 @@ def multistage_gemm_q4k_f16_kernel[
     a_tt: TileTensor[
         a_type, ALT, ImmutAnyOrigin, linear_idx_type=a_linear_idx_type
     ],
-    b_tt: TileTensor[
-        a_type, BLT, ImmutAnyOrigin, linear_idx_type=b_linear_idx_type
+    bp_tt: TileTensor[
+        DType.uint8, BPLT, ImmutAnyOrigin, linear_idx_type=bp_linear_idx_type
     ],
     dsc: UnsafePointer[Float16, ImmutAnyOrigin],
     dm: UnsafePointer[Float16, ImmutAnyOrigin],
@@ -406,13 +436,13 @@ def multistage_gemm_q4k_f16_kernel[
 ):
     var c = c_tt.to_layout_tensor()
     var a = a_tt.to_layout_tensor()
-    var b = b_tt.to_layout_tensor()
+    var bp = bp_tt.to_layout_tensor()
 
     comptime assert a_type == DType.int8, "q4k pipeline only supports S8 mma"
 
     var M: Int = c.dim[0]()
-    var N: Int = b.dim[0]()
-    var K: Int = b.dim[1]()
+    var N: Int = c.dim[1]()
+    var K: Int = a.dim[1]()
     var nkb = K // 32
 
     comptime BM = config.block_tile_shape[0]
@@ -424,6 +454,7 @@ def multistage_gemm_q4k_f16_kernel[
     comptime num_warps_n = config.num_warps_n()
     comptime num_threads = config.num_threads()
     comptime num_k_mmas = BK // 32
+    comptime pbytes = BK // 2
 
     var tid = thread_idx.x
     var warp_id = ufloordiv(tid, WARP_SIZE)
@@ -447,23 +478,30 @@ def multistage_gemm_q4k_f16_kernel[
         a_smem, IteratorTypeA.linear_uint_type(a_smem_size)
     )
 
-    var b_smem = (a_smem + a_smem_size).bitcast[Scalar[a_type]]()
-    comptime b_smem_size: Int = num_pipeline_stages * BK * BN
-    comptime b_smem_layout = Layout.row_major(BN, BK)
-    comptime IteratorTypeB = LayoutTensorIter[
-        a_type,
-        b_smem_layout,
+    # Packed-B staging smem (pipelined, uint8 [BN, BK/2] per stage).
+    var bp_smem = (a_smem + a_smem_size).bitcast[UInt8]()
+    comptime bp_smem_size: Int = num_pipeline_stages * BN * pbytes
+    comptime IteratorTypeBP = LayoutTensorIter[
+        DType.uint8,
+        Layout.row_major(BN, pbytes),
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
         circular=True,
     ]
-    var b_smem_iter = IteratorTypeB(
-        b_smem.as_unsafe_any_origin(),
-        IteratorTypeB.linear_uint_type(b_smem_size),
+    var bp_smem_iter = IteratorTypeBP(
+        bp_smem.as_unsafe_any_origin(),
+        IteratorTypeBP.linear_uint_type(bp_smem_size),
     )
 
-    # Scale staging smem after the operand buffers (f32-aligned), double
-    # buffered so the next tile's scales load while this tile computes.
+    # B smem: double-buffered unpacked int8 [2*BN, BK].
+    var b_smem = (bp_smem + bp_smem_size).bitcast[Scalar[a_type]]()
+    comptime b_smem_size: Int = 2 * BN * BK
+    comptime b_smem_layout = Layout.row_major(2 * BN, BK)
+    var b_smem_full = LayoutTensor[
+        a_type, b_smem_layout, MutAnyOrigin, address_space=AddressSpace.SHARED
+    ](b_smem.as_unsafe_any_origin())
+
+    # Scale staging smem (f16, double buffered).
     var scale_sm = (b_smem + b_smem_size).bitcast[Float16]()
     var da_sm = scale_sm
     var sa_sm = da_sm + 2 * num_k_mmas * BM
@@ -471,7 +509,7 @@ def multistage_gemm_q4k_f16_kernel[
     var dm_sm = dsc_sm + 2 * num_k_mmas * BN
 
     var a_gmem_iter = a.tiled_iterator[BM, BK, axis=1](block_idx.y, 0)
-    var b_gmem_iter = b.tiled_iterator[BN, BK, axis=1](block_idx.x, 0)
+    var bp_gmem_iter = bp.tiled_iterator[BN, pbytes, axis=1](block_idx.x, 0)
 
     comptime mma_shape = get_mma_shape[a_type, DType.int32]()
     comptime MMA_M = mma_shape[0]
@@ -493,7 +531,7 @@ def multistage_gemm_q4k_f16_kernel[
     var block_m_base = Int(block_idx.y) * BM
     var block_n_base = Int(block_idx.x) * BN
 
-    multistage_mma_q4k_f16[
+    multistage_mma_q4k_pack[
         BM,
         BN,
         BK,
@@ -504,9 +542,10 @@ def multistage_gemm_q4k_f16_kernel[
     ](
         acc,
         a_gmem_iter,
-        b_gmem_iter,
         a_smem_iter,
-        b_smem_iter,
+        bp_gmem_iter,
+        bp_smem_iter,
+        b_smem_full,
         uceildiv(K, BK),
         dsc,
         dm,
@@ -518,6 +557,7 @@ def multistage_gemm_q4k_f16_kernel[
         dm_sm.as_unsafe_any_origin(),
         M,
         N,
+        K,
         nkb,
         block_m_base,
         block_n_base,

@@ -1161,3 +1161,69 @@ for `sm_86`/`sm_80`, Findings K/M), so they run natively on the RTX 3090.
 All Finding-N artifacts are scratch (`kernels/mojo/scratch/i8mod/multistage_i8_q4k_f16.mojo`,
 `multistage_i8_q4k_pack.mojo`, `scratch/bench_i8mod_q4k_f16.mojo`, `bench_i8mod_q4k_pack.mojo`);
 nothing committed to the engine.
+
+## Finding O — the UNIVERSALITY decision: retire CUDA MMQ for the packed Mojo int8 Q4_K default (accepting ~0.79× for 100 %-Mojo portability) — kernel landed in-tree, wiring in progress (2026-07-20)
+
+Findings M/N answered a THROUGHPUT question ("does a Mojo int8 Q4_K kernel BEAT MMQ?") and
+correctly said no — the per-block flush is the wall, packing attacks the wrong cost. The
+UNIVERSALITY milestone answers a different, explicitly user-approved question: **is a portable
+100 %-Mojo Q4_K prefill GEMM at ~0.79× MMQ worth retiring the last CUDA kernel (the vendored
+llama.cpp MMQ cubin)?** The decision is **YES**: the engine goes fully CUDA-free for the Q4_K
+prefill GEMM so it runs on ANY sm_80+ device (NVIDIA/AMD/Apple portability target, RTX 3090
+sm_86 today) with a single Mojo toolchain, at the cost of ~21 % slower Q4_K prefill. The
+optimization debt (a cheaper flush — scale-folded fixed-point accumulate, Finding N's verdict
+(b)) is recorded here for a future speed pass; it does NOT block the universality milestone.
+
+**Variant chosen: PACKED** (`kernels/mojo/src/modular_i8/multistage_i8_q4k_pack.mojo`). The
+weight is read as PACKED 4-bit nibbles ([N,K/2] uint8, 1× VRAM — same byte count as the GGUF
+4-bit quants, no int8 weight doubling), cp.async'd into a pipelined smem stage and unpacked
+in-kernel into the plain int8 tile the s8 mma consumes; scales are per-32-block f16 (dsc=d·sc,
+dm=dmin·m weight side; da/sa the q8_1 activation side). The per-block flush
+`acc += dsc·da·sumi − dm·sa` is bit-identical to `vec_dot_q4_K_q8_1_impl_mmq`, so PPL == Q4_K
+MMQ (30.31) by construction. The unpacked variant (~21 % faster) was REJECTED because it doubles
+resident weight VRAM.
+
+### State landed this pass (verified)
+
+- **Kernel in-tree, model-ready interface.** `multistage_i8_q4k_pack.mojo` adapted from the
+  proven scratch kernel to FORGE's launch contract: f16 output into `y[m_real,N]` (real-row
+  epilogue guard, zero-pad rows T..MPAD computed-not-stored), f32 activation scales da/sa
+  (shared `quantize_act_q8_1`, staged to f16 smem), packed weight + f16 scale tensors. The
+  unwired UNPACKED in-tree variant (`multistage_i8_q4k_f16.mojo`, prior pass) is DELETED — the
+  packed kernel replaces it.
+- **AOT wrapper + repack.** `src/gemm_q4k_i8_multistage.mojo`: `gemm_q4k_i8_mod_pack[N,K,MPAD]`
+  (one PTX per (N,K,MPAD) because the int8 masked cp.async path fails to compile — MPAD ladder
+  128/256/512/1024/2048/4096 × the four Mistral shapes (4096,4096)/(1024,4096)/(14336,4096)/
+  (4096,14336)) and `q4k_repack_pack` (native GGUF Q4_K → packed [N,K/2] nibbles + kb-major
+  f16 dsc/dm, one-time at load).
+- **AOT-compiles + portable, proven.** `ctx.compile_function` emits valid PTX (32 int8
+  `m16n8k32 s8` mma + 18 `cp.async` = the packed multistage pipeline); after the standard
+  `_finalize` `.target sm_80` retarget it assembles under `ptxas -arch=sm_86` AND `-arch=sm_80`,
+  so it runs natively on the RTX 3090. Bit-exactness is the Finding-N scratch-bench result
+  (`max_rel = 0.0` on 256×512×512 / 512×256×1024 / 128×256×14336), unchanged by the epilogue
+  port (the flush math is identical; only the store target changed f32-C → f16-y).
+
+### Remaining to complete the milestone (NOT done this pass — engine default UNCHANGED, tree green)
+
+1. `build_kernels.mojo`: AOT-export the 24 `gemm_q4k_i8_pack_*` instances + `q4k_repack_pack`;
+   commit their PTX; add names to `registry.rs`.
+2. `launchers.rs`: bucket-select launcher (smallest MPAD ≥ T, zero-pad activation, dynamic smem
+   ≈69 632 B >48 KB opt-in) + a load-time repack of each Q4_K weight into resident packed
+   nibbles + f16 scales. **VRAM note:** decode's dp4a GEMV still needs the native GGUF Q4_K
+   bytes, so the repacked packed-nibbles+scales are ADDITIONAL resident storage unless the
+   kernel is further adapted to unpack the native GGUF superblock layout in-kernel (extract
+   d/dmin/6-bit scales + de-interleave nibbles from the 144-byte block) — that native-GGUF
+   in-kernel path is what delivers the true "no extra storage / 1× VRAM" goal and is the
+   correct next kernel step (the current packed kernel reads a plain contiguous nibble layout,
+   which requires the repack).
+3. `model.rs`: route Q4_K prefill (`n_tokens≥64`) to the packed kernel on ALL arches; Q6_K
+   prefill → existing portable `gemm_q6_k_f16` (Q6_K speed is a later concern once MMQ is gone).
+4. DELETE CUDA MMQ: `kernels/cuda/mmq_q4k.cu`, `kernels/cuda/vendor/llama-cpp/`,
+   `mmq_q4k_cuda.cubin`, all `registry.rs`/`launchers.rs` refs (`gemm_mmq`,
+   `gemm_q4_k_mmq*_at`, the cubin entries, `MmqScratch`, the fused `mmq_fuse` path),
+   `FORGE_GEMM=mmq`. Keep fp8mod / w4a8 / fattn Ada opt-ins.
+5. Gates: `cargo build/clippy` green; NVFP4 Bielik golden bit-exact; `forge ppl` ≈30.3 vs the
+   30.31 MMQ baseline; coherence + `forge bench` (~0.79× accepted); VRAM check.
+
+Until steps 1–5 land, the engine default is UNCHANGED (CUDA MMQ on Ada, portable Mojo i8mma on
+pre-Ada); this pass only lands the verified packed kernel in-tree.
