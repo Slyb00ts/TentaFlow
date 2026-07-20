@@ -1443,3 +1443,88 @@ llama.cpp (11991). Decode never regresses (separate gemv path: 146.0/130.5/175.3
 `fp8mod` promoted to an e2e-win opt-in for latency-insensitive serving (kept non-default only for
 the ~120 s load-time requant + extra e4m3 VRAM + cold-start). Full detail: `CODEGEN_PROOF.md`
 Finding I.
+
+---
+
+## 2026-07-20 — DECODE (batch-1 Q4_K dp4a GEMV) investigation — GEMV is at the memory wall, beats llama.cpp, NOTHING shipped
+
+First decode-focused pass (all prior passes were prefill). Target: the assumed ~20 % decode
+gap to llama.cpp (146 vs ~175 tok/s, ~63 % of the 1008 GB/s ceiling). **That gap no longer
+exists** — the decode path improved since the brief was written (same commits that took
+prefill 2827→11095 tok/s). Every number below is a real run on the RTX 4090, GPU idle
+(`nvidia-smi` mem ~1.7 GiB), nothing else on the card.
+
+### e2e decode — FORGE already ≥ llama.cpp (Mistral-7B Q4_K_M, `--prefix-cache off`)
+
+| shape (prompt/gen) | FORGE decode | llama.cpp | FORGE vs llama | FORGE GB/s* |
+|---|--:|--:|--:|--:|
+| 8 / 512  (`bench --reps 5`) | **177.7** | `tg512` **169.6** | **+4.8 %** | 776 |
+| 4096 / 512 (`bench --reps 3`) | 149.9 | `tg512@d4096` 152.9 | −2.0 % | 655 |
+
+*GB/s under the brief's convention `4.37e9 × tok/s` (whole-file bytes; overcounts tok_embd
+which decode only gathers, undercounts KV/activation traffic). The deep-context −2 % is the
+attention-over-KV kernel, NOT the weight GEMV (KV adds ~0.5 GB/token of traffic at d4096).
+
+Raw:
+```
+$ forge bench mistral-7b-q4_k_m.gguf --prompt-tokens 8 --tokens 512 --prefix-cache off --reps 5
+rep 5/5: prefill 0.039s (206.6 tok/s) | decode 2.876s (177.7 tok/s)
+| decode  |    511 |   2.875 |   177.7 |
+$ llama-bench -m mistral-7b-q4_k_m.gguf -ngl 99 -p 0 -n 512
+| llama 7B Q4_K - Medium | CUDA | 99 | tg512 |  169.57 ± 0.18 |
+$ forge bench ... --prompt-tokens 4096 --tokens 512 ... : decode 149.9 tok/s
+$ llama-bench ... -n 512 -d 4096 : tg512 @ d4096  152.94 ± 0.07
+```
+
+### Isolated GEMV is at the achievable bandwidth wall (884 GB/s)
+
+The committed `bench_decode_mistral` reports impossible ">1000 GB/s" (e.g. dp4a_silu 2779)
+because its weight buffers (66 MB gate|up) fit the 72 MB L2 — it measures L2, not DRAM. A
+DRAM-bound microbench (`gemv_q4_k_dp4a_f16`, 302 MB weight buffer ≫ L2, 60 timed launches
+after 200 warmup) gives the true number:
+
+```
+weight bytes: 301.99 MB (L2 is ~72 MB)
+dp4a_q4k DRAM 131072 x 4096 : 0.3416 ms   884.0 GB/s  ( 87.7 % of 1008 peak )
+```
+
+This card's **achievable** copy bandwidth (plain f32 copy, 1 GB read + 1 GB write, same
+mojo/cudarc path) is **884 GB/s** — i.e. spec 1008 GB/s is only 87.7 % achievable on this
+consumer Ada part. **The Q4_K decode GEMV runs at the same 884 GB/s as a raw device memcpy:
+it is fully memory-saturated, with no reducible inefficiency.** That is exactly why FORGE
+decode beats llama.cpp at the gate shape — the kernel is maxed, and the e2e number
+(177.7 ≈ 776 GB/s weights-only) sits below 884 only because of the shared non-GEMV per-token
+tail (RMSNorm re-reads, KV read/write, attention, activation round-trips, ~200 sequential
+kernel launches per token), not the GEMV.
+
+### Kernel review (does it leave bandwidth on the table? no)
+
+`_dot_q4k_i8` (decode_dp4a.mojo) is llama.cpp's `vec_dot_q4_K_q8_1` mmvq decomposition
+(VDR=2, 16 lanes/superblock): a warp's weight loads are consecutive 4-byte words (the 4
+`w4` lanes cover offsets 16/20/24/28 → a coalesced 16-byte segment, then qp[4] covers the
+next 16), scales read from the 16-bit `get_scale_min_k4` header, int8 activations staged
+once per block in shared (`_norm_quant_to_shared` fuses RMSNorm→q8_1 so no f16 x is
+materialized — 16 KB shared saved vs the f16-x path → higher occupancy). Block = 256 (8
+warps), ROWS_PER_BLOCK = 8, FFN kernel uses ~10.4 KB shared. The measured 87.7 %-of-peak /
+100 %-of-achievable confirms there is no coalescing, vectorization, or occupancy defect to
+fix — the load pattern already saturates DRAM.
+
+### Modular library — nothing exportable/applicable for this GEMV
+
+The local Mojo env ships `linalg.mojoc` + `quantization.mojoc` (compiled, no plaintext
+GEMV symbols). Modular's fast matmuls are the host-dispatched `multistage_gemm` family —
+already proven in the fp8 pass (above) to be **non-AOT-exportable to self-contained PTX
+without shipping the Mojo runtime** (ADR-0001), and they target dense/fp8/GPTQ layouts, not
+GGUF Q4_K superblocks. There is no Modular gemv/mat-vec that matches our weight format or
+that we could launch via cudarc, and for a memory-bound GEMV already at the memcpy wall it
+could not be faster regardless.
+
+### Outcome — no win to ship
+
+The Q4_K decode GEMV is memory-bandwidth-saturated (884 GB/s = 100 % of this card's
+achievable, 87.7 % of spec) and already **beats llama.cpp** at the gate shape (+4.8 %) /
+ties at deep context (−2 %, attention-bound). The brief's 63 %→76 % gap is stale; the real
+kernel util is ~88 % of spec. The only sub-parity regime (deep-context attention KV) is a
+different kernel outside the GEMV scope. **Nothing shipped — the committed kernel is the
+win.** Golden Bielik NVFP4 bit-exact on 1 and 4 lanes; Q4_K greedy "The Eiffel Tower is
+located in the city of" → "Paris, France. It is one of the most famous landmarks…" unchanged.

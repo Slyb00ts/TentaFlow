@@ -12,6 +12,27 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-20.
 
+- ✅ **Dekod Q4_K (dp4a GEMV) jest przy ścianie przepustowości — bije llama.cpp
+  w płytkim kontekście, remis w głębokim (2026-07-20, nic nie wysłano).** Sesja
+  celowała w rzekomą lukę 20 % (146 vs 175 tok/s) do llama.cpp. Pomiar na tym 4090
+  pokazuje, że luka **już nie istnieje** — kod dekodowy poprawił się od czasu
+  postawienia zadania (prefill 2827→11095 tok/s). Mistral-7B Q4_K, `bench
+  --prefix-cache off --reps 5`, GPU bezczynny:
+  - Płytki (prompt 8, gen 512): **FORGE 177.7 tok/s** vs llama.cpp `tg512` **169.6**
+    → FORGE **+4.8 %**. (776 GB/s wg konwencji 4.37e9×tok/s.)
+  - Głęboki (prompt 4096, gen 512): FORGE **149.9** vs llama.cpp `tg512@d4096`
+    **152.9** → FORGE **−2.0 %** (różnica to atencja po KV, nie GEMV wagowy).
+  Izolowany DRAM-bound mikrobench GEMV (bufor wag 302 MB ≫ 72 MB L2): **884 GB/s =
+  87.7 % szczytu 1008**. Achievable copy-bandwidth tej karty (r+w 1 GB) to
+  **884 GB/s** — GEMV chodzi **dokładnie z prędkością surowego memcpy urządzenia**,
+  czyli jest w pełni wysycony pamięciowo, bez redukowalnej nieefektywności.
+  Wcześniejszy `bench_decode_mistral` dawał „2779 GB/s" (>szczyt) bo bufory (66 MB
+  gate|up) mieszczą się w L2 — mierzył L2, nie DRAM. Modular nie ma eksportowalnego
+  GEMV pod GGUF-Q4_K (biblioteka skompilowana, matmul host-dispatch/multistage —
+  nie AOT-single-PTX per ADR-0001; brak superbloków GGUF Q4_K). **Wniosek: brak
+  wygranej do wysłania — GEMV jest przy ścianie i już bije referencję.** Golden
+  Bielik NVFP4 bit-exact (1 i 4 lane); Q4_K greedy „Paris, France…" bez zmian.
+
 - ✅ **Fuzja RMSNorm→q8_1 (DS4) na ścieżce MMQ prefill** (`forge_rmsnorm_q8_1_ds4`
   / `forge_rmsnorm_residual_q8_1_ds4`, `kernels/cuda/mmq_q4k.cu`): norm poprzedzający
   projekcje Q4_K q/k/v (i osobno gate/up) emituje aktywację `block_q8_1_mmq` DS4
