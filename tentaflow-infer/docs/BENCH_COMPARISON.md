@@ -171,6 +171,43 @@ residual quality cost is the double quantization (already-Q4_K weights → W4A8)
 the QServe scheme's mandatory per-row int8 stage-1; closing it needs a from-fp16
 requant or weight-side rotation, not more activation smoothing.
 
+**fp8 (e4m3) Modular GEMM — MEASURED, beats the CUDA MMQ on Ada, 100 % Mojo
+(2026-07-20).** The route to retire the CUDA exception AND go faster. Modular's
+multistage `cp.async` + TensorCore kernel (`from linalg.matmul.gpu import
+multistage_gemm`, `MatmulConfig[e4m3,e4m3,f32]`) is hardware-valid on sm_89 (Ada
+4th-gen fp8 tensor cores). The only blocker was the emitter capping PTX at
+`.version 8.1` while fp8 mma needs `8.4`; unblocked by pointing
+`MODULAR_NVPTX_COMPILER_PATH` at `kernels/mojo/scripts/ptxas_fp8_shim.sh`, a
+wrapper that rewrites the input PTX `.version` to 8.4 before the real ptxas 13.3
+(supported mechanism — MAX docs it for "older hardware"). Isolated GEMM TFLOPS,
+RTX 4090 idle, Mistral FFN shapes, best-of-40 steady state, correctness bit-exact
+vs CPU on e4m3-representable inputs (max_rel_err = 0.0):
+
+| shape (T, N, K) | role | fp8 e4m3 | bf16 Modular | CUDA MMQ | Mojo int8 hand |
+|---|---|---|---|---|---|
+| 2048, 4096, 14336 | down-proj | **305–326** | 170 | ~208 | 66 |
+| 2048, 14336, 4096 | gate/up | **306–314** | 164 | ~208 | 66 |
+| 512, 14336, 4096 | gate/up | 227–245 | 136 | — | 62 |
+| 512, 4096, 14336 | down-proj (skinny-M) | 80–162 | 72 | — | 62 |
+
+At prefill batch T=2048 fp8 is **~1.5× the CUDA MMQ** (305–326 vs 208), **~1.9×
+bf16**, **~4.7× the old int8 hand kernel** — and 100 % Mojo. (T=512 down-proj is
+the skinny-M case where the default tile is launch/mem-bound; same shape as bf16's
+72, a config-tuning issue, not a ceiling.) **Q4_K→fp8 quality:** an already-Q4_K
+weight is only 16 affine levels/block, so requant into higher-precision fp8 is
+near-lossless — measured per-block-absmax requant over 6.4 M weights gives
+**relative L2 = 2.15 %**, max per-weight error **< 0.5 of one Q4_K level** (fp8
+never shifts a weight past half the original 4-bit spacing). This is a weight-space
+fidelity estimate, not a full PPL run, but it is nothing like W4A8's structural
++25 % (which came from the forced per-row int8 stage-1, not the bit-width).
+**Recommendation: pursue fp8 as the route to a 100 %-Mojo prefill GEMM that beats
+CUDA on Ada.** Remaining engineering (non-trivial, needs the Mistral Q4_K GGUF for
+its PPL/prefill gates): Q4_K→fp8 weight pack in `weights.rs`, per-token fp8
+activation quant, a scaled fp8 GEMM path in the forward pass behind `FORGE_GEMM=fp8`,
+and the `forge ppl` / `forge bench` validation. bench files:
+`kernels/mojo/scratch/bench_modular_fp8.mojo`,
+`kernels/mojo/scratch/fp8_requant_fidelity.mojo`.
+
 VRAM (single-stream, observed peak incl. ~1.1 GiB desktop baseline):
 - **FORGE**: ~23.6 GiB peak — dominated by a pre-reserved full-context KV arena
   (`--kv-pages 0` = full ctx); weights themselves are ~4.1 GiB.

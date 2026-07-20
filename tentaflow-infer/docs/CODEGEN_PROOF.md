@@ -286,6 +286,41 @@ already post-processes Mojo PTX and its HAL loads cubins, so a one-line `.versio
 can't emit 8.4); **projected ~2× the bf16 result (~300 TFLOPS, fp32-accum ceiling ~330 boost)**
 by the Ada fp8:bf16 = 2:1 hardware ratio.
 
+### Finding E — fp8 (e4m3) MEASURED on Ada: 305–326 TFLOPS, beats the CUDA MMQ (2026-07-20)
+
+The projection in Finding D is now a measurement. The unblock is a supported MAX
+mechanism, not a hack: `libmax` documents `MODULAR_NVPTX_COMPILER_PATH` ("For older
+hardware, set MODULAR_NVPTX_COMPILER_PATH to use an external ptxas binary"). Mojo's
+ptxas is otherwise statically embedded in `libNVPTX.so` (hashed `libnvptxcompiler_static_*`
+symbols — not LD_PRELOAD-interposable), so this env var is the only interception point.
+Pointing it at `kernels/mojo/scripts/ptxas_fp8_shim.sh` — a wrapper that rewrites the
+input PTX `.version 8.[0-3]` → `8.4` and forwards every arg to the real `ptxas 13.3` —
+makes the JIT `run` path assemble the fp8 mma and execute. The `.version` lift is the
+whole fix (Ada has 4th-gen fp8 tensor cores; ptxas 13.3 supports ISA 8.4); no kernel
+semantics change. Reproducible: `MODULAR_NVPTX_COMPILER_PATH=$PWD/scripts/ptxas_fp8_shim.sh
+pixi run mojo scratch/bench_modular_fp8.mojo`.
+
+Measured (`multistage_gemm`, `MatmulConfig[e4m3,e4m3,f32](block=128×128×64, warp=64×64×64)`,
+transpose_b, RTX 4090 idle, best-of-40 steady state, correctness bit-exact vs CPU on
+e4m3-representable inputs — max_rel_err 0.0):
+
+| shape (T, N, K) | role | fp8 e4m3 TFLOPS | vs CUDA MMQ 208 | vs bf16 170 |
+|---|---|---|---|---|
+| 2048, 4096, 14336 | down-proj | **305–326** | **1.47–1.57×** | 1.9× |
+| 2048, 14336, 4096 | gate/up | **306–314** | 1.47–1.51× | 1.9× |
+| 512, 14336, 4096 | gate/up | 227–245 | — | 1.7× |
+| 512, 4096, 14336 | down-proj (skinny-M) | 80–162 | — | ~1× (both tile-bound) |
+
+**Decisive go/no-go: fp8 CLEARS the CUDA MMQ (~208) by ~1.5× at prefill batch T=2048,
+while staying 100 % Mojo.** This is the first concrete path to retire the ADR-0001 CUDA
+GEMM exception AND go faster — the int8-on-Ada conclusion (Exp 1–5) is unchanged and
+consistent; fp8 simply uses a different, hardware-superior instruction (`QMMA.16832.E4M3`)
+that the int8 path never had. Q4_K→fp8 requant fidelity (offline, 6.4 M weights): relative
+L2 = 2.15 %, max per-weight error < 0.5 of one Q4_K level — fp8 preserves an already-4-bit
+source to sub-level precision, so it should avoid W4A8's +25 % PPL (that came from the
+QServe per-row int8 stage-1, not bit-width). Full engine integration + PPL/prefill gates
+are the remaining work (need the Mistral Q4_K GGUF).
+
 ### Bottom line (this pass) + recommendation
 
 - **Can a Mojo *int8* GEMM reach parity with the CUDA MMQ (~208 TOPS) on the 4090? NO.** Modular
@@ -298,12 +333,13 @@ by the Ada fp8:bf16 = 2:1 hardware ratio.
      measured = **0.82×** the CUDA int8 MMQ (208) and **2.6×** the old Mojo int8 (66). Cost: a
      dequant pass + 2× weight bandwidth (compute-bound at T≥2048, so the rate holds). This alone
      could retire the CUDA GEMM at a modest speed cost while staying 100 % Mojo.
-  2. **fp8 path — the real win, one build step away.** Modular's multistage fp8 GEMM compiles and
-     is hardware-valid on sm_89 (cubin proven); projected ~300 TFLOPS would **beat** the CUDA MMQ
-     *and* be 100 % Mojo. Blocker is solely Mojo emitting `.version 8.1`; unblock = patch the
-     emitted PTX to `8.4` before `ptxas` in `build_kernels` (FORGE already owns that step).
-     Follow-up needed: Q4_K→fp8-e4m3 dequant with per-block scales + accuracy validation, and the
-     measured fp8 TFLOPS via the patched-PTX cubin.
+  2. **fp8 path — the real win, now MEASURED (Finding E).** Modular's multistage fp8 GEMM runs on
+     sm_89 at **305–326 TFLOPS = 1.5× the CUDA MMQ** and 1.9× bf16, 100 % Mojo, bit-exact. Unblock
+     is the supported `MODULAR_NVPTX_COMPILER_PATH` external-ptxas hook + a `.version 8.1→8.4`
+     rewrite (`scripts/ptxas_fp8_shim.sh`). Q4_K→fp8 requant fidelity 2.15 % rel-L2 (< 0.5 Q4_K
+     level) indicates it dodges W4A8's +25 % PPL. Follow-up needed: wire the Q4_K→fp8-e4m3 weight
+     pack + per-token activation quant + scaled fp8 GEMM behind `FORGE_GEMM=fp8` in the forward
+     pass, and run `forge ppl`/`forge bench` (needs the Mistral Q4_K GGUF).
 - **Recommendation:** keep the CUDA MMQ as the committed default for now (unchanged this pass).
   Pursue the **fp8 path** as the route to a 100 %-Mojo prefill GEMM that beats CUDA on Ada — it is
   the first concrete way to retire the ADR-0001 exception. bf16 is the safe fallback if fp8
