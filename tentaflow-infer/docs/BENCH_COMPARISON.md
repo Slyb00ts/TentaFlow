@@ -1528,3 +1528,18 @@ kernel util is ~88 % of spec. The only sub-parity regime (deep-context attention
 different kernel outside the GEMV scope. **Nothing shipped — the committed kernel is the
 win.** Golden Bielik NVFP4 bit-exact on 1 and 4 lanes; Q4_K greedy "The Eiffel Tower is
 located in the city of" → "Paris, France. It is one of the most famous landmarks…" unchanged.
+
+---
+
+## Przenośność sm_80 + cleanup gemm_i8mma (2026-07-20)
+
+Retarget PTX `.target sm_89 → sm_80` (251/273 kerneli) jest neutralny wydajnościowo na
+RTX 4090 — driver re-JIT-uje do sm_89 SASS przy ładowaniu:
+
+| kształt (pp/dec) | default przed | default po retargecie |
+|---|---|---|
+| 4096 / 512 (warm best-of-5) | ~11148 / 149.9 | **11137 / 149.9** |
+
+Koherencja Mistral Q4_K → „Paris, France…" (default). NVFP4 Bielik golden bit-exact
+1 i 4 lanes. Baseline int8 Mojo `_big` (idle 4090): 55.9 @T128, 62.7 @T512, 65.7 @T2048
+TOPS — ~66 TOPS wall potwierdzony. Usunięty `FORGE_GEMM=cuda` (gemm_i8mma) był nie-default.

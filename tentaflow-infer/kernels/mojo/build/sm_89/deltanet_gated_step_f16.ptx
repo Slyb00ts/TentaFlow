@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810

@@ -696,3 +696,88 @@ lanes (default path untouched).
   `FORGE_GEMM=fp8mod` from "isolated-win / e2e-loss" to **"e2e-win on Ada, opt-in for latency-
   insensitive serving"**, and treat the ADR-0001 exception as retired-on-merit (the CUDA kernel
   is now a pragmatic default, not a necessity).
+
+---
+
+## Finding J — Portability pass: 100 %-Mojo prefill on pre-Ada (RTX 3090 sm_86) + dead-CUDA cleanup (2026-07-20)
+
+The user asks were (a) clean up CUDA where Mojo suffices and (b) run on a 3090.
+Both are structural, and both are now addressed WITHOUT needing the int8-multistage
+kernel (which is neither required for Ada — `fp8mod` already retires the exception,
+Finding I — nor for pre-Ada, where int8/f16 Mojo runs natively). All numbers below
+are raw from this machine; the 3090 is verified STRUCTURALLY via `ptxas -arch=sm_86`
+(cross-assembly is exactly what the driver JIT runs at load) since no sm_86 part is
+attached here.
+
+### The two concrete blockers (measured)
+
+1. **Every committed Mojo PTX was `.target sm_89`** (273/273). PTX JIT is
+   forward-only: an sm_89 module does NOT load on sm_86. So NONE of FORGE's Mojo
+   kernels would JIT on a 3090 — the CLAUDE.md claim "emitted portably … JIT on
+   sm_86" was false.
+2. **Four nvcc cubins load UNCONDITIONALLY at startup** (`gemm_i8mma`, `w4a8`,
+   `fattn`, `mmq_q4k`). Cubins are arch-specific sm_89 SASS with no PTX fallback,
+   so `cuModuleLoadData` HARD-FAILS on sm_86 → FORGE cannot start on a 3090.
+
+### The fix (shipped, gates green)
+
+- **PTX retarget → sm_80.** `build_kernels.mojo::_finalize` now rewrites
+  `.target sm_89 → .target sm_80` for every kernel whose name is not `*fp8*`/`*nvfp4*`.
+  Committed artifacts retargeted in place: **251/273** now `.target sm_80`, verified
+  to `ptxas -arch=sm_86 -O3` AND `-arch=sm_89 -O3` with **0 failures** (int8 mma,
+  f16 mma, attention, gemv, norm, rope, sampling — all sm_80-valid). The 22 that stay
+  sm_89 are the genuinely Ada-only kernels: fp8 mma (`gemm_fp8*`, 7), fp8-KV cvt
+  (`attn_*_fp8`, 4), NVFP4 fp8-scale cvt (`gemm/gemv_*nvfp4*`, 7) + fp8 helpers.
+  `ptxas -arch=sm_86` REJECTS these ("Feature 'mma with FP8' / 'cvt.f16x2.e4m3x2'
+  requires .target sm_89 or higher") — confirming they are hardware-Ada, not a target
+  artifact. Retarget is perf-neutral on Ada: the driver re-JITs sm_80 PTX to sm_89
+  SASS at load (Mistral pp4096 warm 11137 tok/s = the committed default; decode 149.9,
+  unchanged).
+- **Arch-gated loading.** `forge-kernels/registry.rs` now loads sm_89-target PTX and
+  the nvcc cubins only when `DeviceCaps.fp8_native` (sm ≥ 89). Discriminator: after the
+  retarget, any committed PTX still declaring `.target sm_89` IS by definition Ada-only,
+  so `is_sm89_only()` (a header-byte scan) cleanly skips exactly those 22 on pre-Ada —
+  no manifest schema change. A 3090 starts touching zero incompatible modules.
+- **Arch-aware default GEMM.** `gemm_mmq` (the vendored llama.cpp MMQ cubin) is now
+  `fp8_native && FORGE_GEMM∈{none,mmq}`. On pre-Ada it is false, so Q4_K/Q6_K prefill
+  falls through to the portable Mojo `gemm_*_i8mma` tiles (`.target sm_80`), and
+  `mmq_enabled()==false` routes the norm to the portable `rmsnorm_f16` (not the fused
+  MMQ-cubin norm). The whole default GGUF path — GEMM, gemv decode, attention, norm,
+  rope, sampling — is 100 % portable Mojo PTX on sm_86.
+- **Dead-CUDA cleanup.** `kernels/cuda/gemm_i8mma.cu` + its cubin + the
+  `EMBEDDED_CUDA_CUBIN_SM89`/`CUDA_CUBIN_ENTRIES` registry entries + the
+  `I8mmaBackend::Cuda` launcher path + `FORGE_I8MMA_BACKEND`/`FORGE_GEMM=cuda` routing
+  + the `cuda_i8mma.rs` test are REMOVED. That family was reachable only via the
+  non-default `FORGE_GEMM=cuda` opt-in and was fully superseded by the vendored MMQ
+  cubin (default) on Ada and by the Mojo i8mma tiles elsewhere. The remaining three
+  cubins (`w4a8`, `fattn`, `mmq_q4k`) are kept as Ada-only opt-ins/default, now
+  guarded so a missing/incompatible sm_89 cubin never blocks a pre-Ada start.
+
+### What a 3090 (sm_86) user must do
+
+Nothing beyond the normal build: the committed PTX already carries `.target sm_80`,
+so it JITs on the 3090 out of the box. If rebuilding kernels, `pixi run mojo
+build_kernels.mojo` on the local (Ada) box emits portable sm_80 PTX via the updated
+`_finalize`; on an actual 3090 it would emit sm_86 directly. NVFP4/fp8/W4A8 and the
+CUDA flash-attention opt-in remain Ada-only (hardware fp8/fp4) and are transparently
+skipped — a 3090 runs GGUF (Q4_K/Q8_0/Q6_K) models on the portable Mojo path.
+
+### The int8-multistage crux — honest status
+
+Not run to a fresh int8-multistage measurement this session. Building a novel int8
+GEMM on Modular's lower-level cp.async multistage building blocks is a multi-day kernel
+effort (Modular's `TensorCore`/`multistage_mma` hard-assert on NVIDIA int8 — Finding A —
+so it cannot be reused; a custom deep-pipeline int8 kernel with dynamic smem must be
+written by hand). It is ALSO not on the critical path for either user ask: `fp8mod`
+already beats the CUDA MMQ on Ada (Finding I) and the portable Mojo i8mma covers pre-Ada.
+The int8 baseline was re-measured to anchor the go/no-go: the committed hand int8 `_big`
+kernel reaches **56–66 TOPS** across the Mistral FFN shapes (55.9 @T128, 62.7 @T512,
+65.7 @T2048; RTX 4090 idle), reproducing the Exp-2/5 ~66-TOPS wall. The strong
+structural PREDICTION from decisive prior evidence — fp8 and int8 tensor cores share
+the SAME peak on Ada (Finding F.1), fp8 and int8 mma are both `m16n8k32` with identical
+fragment/ldmatrix/swizzle memory structure, and the fp8 multistage kernel reaches
+305–351 TFLOPS on that exact structure (Findings E/G) — is that an int8 kernel built on
+the same deep cp.async pipeline (dynamic smem, ≥3 stages) would break the 66 wall toward
+~300 TOPS. This remains UNVERIFIED for int8 specifically and is the open follow-up if a
+faster pre-Ada prefill is wanted; the shipped pre-Ada default (Mojo i8mma, ~66 TOPS) is
+the safe portable path that works today.

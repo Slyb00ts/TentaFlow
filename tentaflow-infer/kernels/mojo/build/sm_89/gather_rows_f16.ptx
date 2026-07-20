@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_misc_gather_rows_f16_Poi6A6A6A6AoA6A6A_7871a3a63b1cc76d

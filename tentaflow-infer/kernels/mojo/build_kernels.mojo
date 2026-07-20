@@ -163,9 +163,21 @@ def _entry_from_ptx(ptx_path: Path) raises -> String:
 def _finalize(out_dir: Path, name: StringSlice) raises -> String:
     # Relocate the statically-named dump into the per-arch directory and
     # return its manifest fragment.
+    #
+    # Portability: Mojo emits `.target sm_89` for the local Ada GPU, but PTX JIT
+    # is forward-only — an sm_89 module will NOT load on sm_86 (RTX 3090). The
+    # portable kernels (f16/bf16/int8 mma, attention, gemv, norm, rope, sampling)
+    # use only sm_80-level features, so lowering their target floor to sm_80 lets
+    # the driver JIT them onto ANY sm_80+ device (3090 sm_86 AND 4090 sm_89) while
+    # still producing arch-optimal SASS at load. Only the genuinely Ada-only
+    # kernels (fp8 mma/cvt, NVFP4 fp8-scale cvt) must stay sm_89; they are keyed
+    # by name and skipped at load on pre-Ada devices (forge-kernels registry).
     tmp = Path(String(name) + ".ptx")
     final = out_dir / (String(name) + ".ptx")
-    final.write_text(tmp.read_text())
+    text = tmp.read_text()
+    if "fp8" not in name and "nvfp4" not in name:
+        text = text.replace(".target sm_89", ".target sm_80")
+    final.write_text(text)
     os.remove(String(tmp))
     entry = _entry_from_ptx(final)
     print("  compiled", name, "->", entry)

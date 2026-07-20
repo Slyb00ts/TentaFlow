@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_moe_moe_router_f16_Point6A6A6A6AoA6A6A_3a6f89b08b39ed3c

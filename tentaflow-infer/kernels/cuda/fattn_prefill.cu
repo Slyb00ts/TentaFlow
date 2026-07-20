@@ -2,8 +2,7 @@
 //
 // Causal flash-attention prefill over FORGE's paged KV cache, computed with f16
 // tensor-core mma (m16n8k16) instead of the scalar/SIMD dot products of the Mojo
-// `attn_prefill` (kernels/mojo/src/prefill.mojo). ADR-0001 exception, same as the
-// int8 MMQ GEMM (gemm_i8mma.cu, docs/CODEGEN_PROOF.md): the CUDA cubin loads
+// `attn_prefill` (kernels/mojo/src/prefill.mojo). ADR-0001 exception (docs/CODEGEN_PROOF.md): the CUDA cubin loads
 // through the existing cuModuleLoadData path and is routed only under
 // FORGE_ATTN=fa, so the default scalar path stays bit-exact.
 //

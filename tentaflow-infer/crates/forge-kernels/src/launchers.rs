@@ -12,14 +12,6 @@ use crate::registry::KernelArtifacts;
 
 const BLOCK: u32 = 256;
 
-/// Compute backend for the int8 MMQ prefill GEMM (Q4_K / Q8_0).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum I8mmaBackend {
-    /// nvcc-compiled CUDA cubin (kernels/cuda/gemm_i8mma.cu; ADR-0001 exception).
-    Cuda,
-    /// The in-tree Mojo `gemm_i8mma_impl` tiles (decode-sized fallback).
-    Mojo,
-}
 /// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
 const ATTN_BLOCK: u32 = 128;
 
@@ -60,9 +52,10 @@ pub struct Kernels {
     /// `prequant`.
     mmq: Mutex<MmqScratch>,
     /// Route Q4_K + Q6_K prefill GEMM through the vendored llama.cpp MMQ cubin
-    /// (~2× the hand int8-MMQ TOPS; docs/CODEGEN_PROOF.md Exp 2). DEFAULT ON —
-    /// same native GGUF weights + q8_1 activation, no quality change.
-    /// `FORGE_GEMM=cuda|mojo|w4a8` selects the other backends.
+    /// (~2× the hand int8-MMQ TOPS; docs/CODEGEN_PROOF.md Exp 2). DEFAULT ON on
+    /// Ada+ — same native GGUF weights + q8_1 activation, no quality change.
+    /// Off on pre-Ada (sm_86) and under `FORGE_GEMM=mojo|fp8|fp8mod|w4a8`, which
+    /// fall through to the portable Mojo `gemm_*_i8mma` tiles or their own paths.
     gemm_mmq: bool,
     /// Dense prefill attention backend (f16 hd64/hd128 only; every other shape
     /// falls through to the scalar kernel). DEFAULT = the portable Mojo
@@ -175,6 +168,7 @@ impl Kernels {
     pub fn load(device: Arc<dyn Device>) -> Result<Self> {
         let artifacts = KernelArtifacts::load(device.as_ref())?;
         let iq_tables = IqTables::upload(device.as_ref())?;
+        let ada = device.caps().fp8_native;
         Ok(Self {
             device,
             artifacts,
@@ -183,10 +177,15 @@ impl Kernels {
             w4a8_act: Mutex::new(W4A8ActScratch::default()),
             fp8_act: Mutex::new(Fp8ActScratch::default()),
             mmq: Mutex::new(MmqScratch::default()),
-            gemm_mmq: matches!(
-                std::env::var("FORGE_GEMM").ok().as_deref(),
-                None | Some("mmq")
-            ),
+            // The vendored llama.cpp MMQ is an sm_89 SASS cubin (no PTX JIT
+            // fallback), so it exists only on Ada+. On pre-Ada parts (e.g. the
+            // RTX 3090, sm_86) the default Q4_K/Q6_K prefill GEMM falls through
+            // to the portable Mojo `gemm_*_i8mma` tiles.
+            gemm_mmq: ada
+                && matches!(
+                    std::env::var("FORGE_GEMM").ok().as_deref(),
+                    None | Some("mmq")
+                ),
             attn: match std::env::var("FORGE_ATTN").ok().as_deref() {
                 Some("scalar") => AttnBackend::Scalar,
                 Some("fa") | Some("cuda") => AttnBackend::Cuda,
@@ -2162,23 +2161,12 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         let qk = self.artifacts.get("quantize_act_q8_1")?;
-        // Prefill routes the GEMM compute to the nvcc-compiled CUDA cubin (the
-        // one ADR-0001 exception; docs/CODEGEN_PROOF.md) — same q8_1 pre-pass,
-        // same GGUF weights, same f16 output, ~3x the TOPS of the Mojo i8mma
-        // kernel. Decode-sized batches (n_tokens < 64) keep the tuned Mojo
-        // tiles. `FORGE_I8MMA_BACKEND=mojo|cuda` forces either path (A/B tests).
-        let (suffix, bm, bn, threads, gk) = match Self::i8mma_backend(kernel_base, n_tokens) {
-            I8mmaBackend::Cuda => {
-                let (suffix, bm, bn, threads) = Self::gemm_i8mma_cuda_tile(rows);
-                let gk = self.artifacts.get(&format!("{kernel_base}_cuda{suffix}"))?;
-                (suffix, bm, bn, threads, gk)
-            }
-            I8mmaBackend::Mojo => {
-                let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
-                let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
-                (suffix, bm, bn, threads, gk)
-            }
-        };
+        // Portable Mojo int8 tensor-core tiles (`.target sm_80`, JIT to any
+        // sm_80+ part). This is the default Q4_K/Q6_K prefill GEMM on pre-Ada
+        // GPUs and the Q8_0 prefill GEMM everywhere; on Ada the vendored MMQ
+        // cubin intercepts Q4_K/Q6_K upstream (`gemm_q4_k_i8mma_at`).
+        let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
+        let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
         let _ = suffix;
 
         let need_codes = n_tokens * cols;
@@ -2275,34 +2263,6 @@ impl Kernels {
             ("", 128, 64, 256)
         } else {
             ("_bm64", 64, 64, 256)
-        }
-    }
-
-    /// Backend for the i8mma GEMM. The nvcc CUDA cubin wins the Q4_K prefill
-    /// GEMM (1.6-1.9x the Mojo TOPS on the RTX 4090; docs/CODEGEN_PROOF.md). The
-    /// committed Mojo Q8_0 i8mma kernel is already ~120 TOPS — faster than this
-    /// CUDA kernel on Q8_0 — so Q8_0 stays on Mojo (no regression). Decode-sized
-    /// batches (rare `gemm_rows` at n_tokens < 64) also keep the Mojo tiles.
-    /// `FORGE_I8MMA_BACKEND=mojo|cuda` overrides for A/B testing.
-    fn i8mma_backend(kernel_base: &str, n_tokens: usize) -> I8mmaBackend {
-        match std::env::var("FORGE_I8MMA_BACKEND").ok().as_deref() {
-            Some("mojo") => I8mmaBackend::Mojo,
-            Some("cuda") => I8mmaBackend::Cuda,
-            _ if kernel_base == "gemm_q4_k_i8mma" && n_tokens >= 64 => I8mmaBackend::Cuda,
-            _ => I8mmaBackend::Mojo,
-        }
-    }
-
-    /// Tile for the CUDA i8mma cubin: `(name_suffix, BM, BN, block_threads)`.
-    /// BM=128 tokens (grid.y = ceil(T/128)); BN=128 rows for wide matrices,
-    /// BN=64 when the row count is small so the grid still fills the SMs. Both
-    /// are 256-thread (8-warp) blocks at ~193 regs = 1 CTA/SM, matching nvcc's
-    /// reference MMQ occupancy.
-    fn gemm_i8mma_cuda_tile(rows: usize) -> (&'static str, u32, u32, u32) {
-        if rows >= 128 {
-            ("", 128, 128, 256)
-        } else {
-            ("_bn64", 128, 64, 256)
         }
     }
 

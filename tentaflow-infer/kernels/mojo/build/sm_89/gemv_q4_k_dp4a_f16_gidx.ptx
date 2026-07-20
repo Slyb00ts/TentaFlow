@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_73e6592222fa7a41

@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_gemm_quantize_act_q8_1_P6A6A6A6AoA6A6A_863a1ec2b5322821

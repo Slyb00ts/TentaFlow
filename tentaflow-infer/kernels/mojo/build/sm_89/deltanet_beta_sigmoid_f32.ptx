@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_deltanet_deltanet_beta_sig6A6A6A6A_58be0279fc639699

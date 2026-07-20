@@ -1,7 +1,7 @@
 // ===== File: mmq_q4k.cu — vendored llama.cpp Q4_K + Q6_K MMQ tensor-core prefill GEMM =====
 //
-// The 208-TOPS reference GEMM (docs/CODEGEN_PROOF.md Exp 2). Unlike gemm_i8mma.cu
-// (FORGE's hand int8-MMQ kernel, ~107 TOPS), this file runs llama.cpp's ACTUAL
+// The 208-TOPS reference GEMM (docs/CODEGEN_PROOF.md Exp 2). Unlike the hand
+// Mojo int8-MMQ tiles (~66 TOPS), this file runs llama.cpp's ACTUAL
 // compiled `mul_mat_q` device code — the exact tensor-core inner loop nvcc/ptxas
 // schedules past 200 TOPS on the RTX 4090. The perf-critical compute is not
 // re-implemented: the per-type tile loaders and MMA dot products

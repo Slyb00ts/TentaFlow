@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_moe_moe_sigmoid_f16_to_f326A6A6A6A_2a39729fb96b296a

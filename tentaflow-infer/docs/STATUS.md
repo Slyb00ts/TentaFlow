@@ -828,3 +828,48 @@ jednym stream. Grow-only scratch `W4A8ActScratch`.
 smoothing (SmoothQuant) przy pakowaniu + odpowiadająca skala w quantizerze; dopiero
 wtedy koherencja może przejść. Osobno: fuzja attention/norm/quant (Phase-2) żeby e2e
 prefill przekroczył ~0.5× llama.cpp. Committed default bez zmian.
+
+---
+
+## Przenośność na pre-Ada (RTX 3090 sm_86) + sprzątanie CUDA (2026-07-20)
+
+Cel użytkownika: (a) usunąć martwy CUDA tam gdzie Mojo wystarcza, (b) uruchomić
+FORGE na 3090. Oba załatwione strukturalnie — bez potrzeby kernela int8-multistage
+(`fp8mod` już zdejmuje wyjątek ADR-0001 na Adzie, a na pre-Ada działa natywny int8/f16
+Mojo). 3090 zweryfikowany przez `ptxas -arch=sm_86` (cross-assembly = dokładnie to, co
+robi driver JIT przy ładowaniu); brak fizycznego sm_86 w tej maszynie.
+
+**Dwa blokery (zmierzone):**
+1. Wszystkie 273 committed PTX miały `.target sm_89` → JIT jest tylko w przód, więc
+   NIE ładują się na sm_86. Żaden kernel Mojo nie wstałby na 3090.
+2. Cztery cubiny nvcc (`gemm_i8mma`, `w4a8`, `fattn`, `mmq_q4k`) ładowane
+   BEZWARUNKOWO przy starcie — sm_89 SASS bez fallbacku PTX → twardy crash na sm_86.
+
+**Fix (scommitowany, gate'y zielone):**
+- `build_kernels.mojo::_finalize` przepisuje `.target sm_89 → sm_80` dla każdego
+  kernela poza `*fp8*`/`*nvfp4*`. Committed artefakty przetargetowane: **251/273** na
+  `.target sm_80`, zweryfikowane `ptxas -arch=sm_86` ORAZ `-arch=sm_89` z **0 błędów**.
+  22 zostają sm_89 (fp8 mma, fp8-KV cvt, NVFP4 fp8-scale cvt) — `ptxas -arch=sm_86` je
+  ODRZUCA (sprzętowo Ada). Neutralne wydajnościowo na Adzie: driver re-JIT-uje sm_80 PTX
+  do sm_89 SASS przy ładowaniu (Mistral pp4096 warm **11137 tok/s** = committed default;
+  decode 149.9 bez zmian).
+- `registry.rs` ładuje sm_89-target PTX i cubiny nvcc TYLKO przy `DeviceCaps.fp8_native`
+  (sm ≥ 89) — `is_sm89_only()` skanuje nagłówek PTX. 3090 startuje nie dotykając żadnego
+  niekompatybilnego modułu.
+- `gemm_mmq = fp8_native && FORGE_GEMM∈{brak,mmq}`. Na pre-Ada false → Q4_K/Q6_K prefill
+  spada na przenośne Mojo `gemm_*_i8mma`, a `mmq_enabled()==false` kieruje norm na
+  przenośny `rmsnorm_f16`. Cała domyślna ścieżka GGUF jest 100 % przenośnym Mojo PTX.
+- Usunięte: `kernels/cuda/gemm_i8mma.cu` + cubin + wpisy registry/launcher
+  (`I8mmaBackend::Cuda`, `FORGE_I8MMA_BACKEND`, `FORGE_GEMM=cuda`) + test `cuda_i8mma.rs`.
+  Rodzina była osiągalna tylko przez nie-domyślne `FORGE_GEMM=cuda` i w pełni zastąpiona
+  przez MMQ (Ada) / Mojo i8mma (reszta). Pozostałe cubiny (`w4a8`, `fattn`, `mmq_q4k`)
+  zostają jako Ada-only, teraz strażowane by brak sm_89 cubina nie blokował startu.
+
+**Co musi zrobić user 3090:** nic ponad zwykły build — committed PTX ma już
+`.target sm_80` i JIT-uje na 3090. NVFP4/fp8/W4A8 i CUDA-flash-attn zostają Ada-only
+(sprzętowe fp8/fp4) i są przezroczyście pomijane; 3090 uruchamia modele GGUF na Mojo.
+
+**Gate'y:** build+clippy zielone; NVFP4 Bielik golden bit-exact 1 i 4 lanes (default
+nietknięty); koherencja Mistral Q4_K → „Paris, France"; prefill 11137 / decode 149.9
+bez regresji. Crux int8-multistage: nie zmierzony w tej sesji (nie jest na ścieżce
+krytycznej); baseline int8 `_big` odtworzony = **56–66 TOPS** (ściana z Exp 2/5).

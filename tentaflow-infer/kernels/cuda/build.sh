@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # ===== File: build.sh — compile the CUDA MMQ kernel to a committed cubin =====
 #
-# The ONE raw-CUDA kernel family in FORGE (ADR-0001 exception; see gemm_i8mma.cu
-# and docs/CODEGEN_PROOF.md). Runs BESIDE the Mojo build (`pixi run mojo
-# build_kernels.mojo`); it does NOT touch manifest.json (Mojo-owned). The cubin
-# is committed like the PTX artifacts and embedded by forge-kernels.
+# The raw-CUDA kernel families in FORGE (ADR-0001 exceptions; see
+# docs/CODEGEN_PROOF.md). Run BESIDE the Mojo build (`pixi run mojo
+# build_kernels.mojo`); they do NOT touch manifest.json (Mojo-owned). Cubins are
+# committed like the PTX artifacts and embedded by forge-kernels.
+#
+# These cubins are sm_89 SASS with no PTX JIT fallback, so forge-kernels loads
+# them only on Ada+ parts; pre-Ada GPUs (e.g. RTX 3090 sm_86) run the portable
+# Mojo PTX paths instead.
 #
 # Requires nvcc on PATH. sm_89 matches the committed build/sm_89 convention and
 # gets offline ptxas scheduling (the whole point — a cubin, not JIT PTX).
@@ -16,13 +20,6 @@ ARCH="${1:-sm_89}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${HERE}/../mojo/build/${ARCH}"
 mkdir -p "${OUT}"
-
-nvcc -arch="${ARCH}" -cubin -O3 \
-    -o "${OUT}/gemm_i8mma_cuda.cubin" \
-    "${HERE}/gemm_i8mma.cu"
-
-echo "wrote ${OUT}/gemm_i8mma_cuda.cubin"
-cuobjdump -res-usage "${OUT}/gemm_i8mma_cuda.cubin" | grep -E 'Function|REG' || true
 
 # W4A8 (int4-weight x int8-activation) prefill GEMM — QServe dense_kernel0 in-tree
 # (ADR-0001 exception, MIT). Committed cubin, loaded via the same cuModuleLoadData

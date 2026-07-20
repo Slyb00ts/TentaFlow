@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_rotkv_attn_decode_rot_SI6A6A6A6AcB6A6A_6f514895e337c1d9

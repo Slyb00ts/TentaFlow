@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_attention_attn_decode_f166A6A6A6AcB_b07585d6fbd868f3

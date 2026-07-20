@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_decode_fused_gemv_norm_sil6A6A6A6A_6a98e8e9b915834b

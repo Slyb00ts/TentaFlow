@@ -1,6 +1,6 @@
 // ===== File: w4a8_gemm.cu — nvcc W4A8 (int4-weight x int8-activation) prefill GEMM =====
 //
-// Second raw-CUDA kernel family in FORGE (ADR-0001 exception, like gemm_i8mma.cu).
+// A raw-CUDA kernel family in FORGE (ADR-0001 exception).
 // QServe `w4a8_per_group` `dense_kernel0` (int4 weight, per-token int8 activation,
 // per-group int8 secondary scale + per-channel fp16 primary scale), brought in-tree
 // verbatim from mit-han-lab/qserve (MIT, (c) 2024 Lin/Tang/Yang/Han et al.;

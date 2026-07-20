@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_rope_rope_neox_f16_Point6A6A6A6AoA6A6A_8a932abd69147e53

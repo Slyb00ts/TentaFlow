@@ -47,26 +47,6 @@ const EMBEDDED_MANIFEST: &str = include_str!(concat!(
     "/../../kernels/mojo/build/sm_89/manifest.json"
 ));
 
-/// The single raw-CUDA kernel family (ADR-0001 exception): the int8 MMQ prefill
-/// GEMM, compiled by nvcc to a committed cubin (kernels/cuda/gemm_i8mma.cu,
-/// docs/CODEGEN_PROOF.md). It loads through the SAME `load_module`/cuModuleLoadData
-/// path as the Mojo PTX, but is embedded separately so it never has to appear in
-/// the Mojo-owned manifest.json. Entry names are the `extern "C"` symbols; the
-/// registry key mirrors the Mojo naming (`gemm_{q}_i8mma[_bn64]`) with a `_cuda`
-/// suffix so the launcher can select the backend.
-const EMBEDDED_CUDA_CUBIN_SM89: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../kernels/mojo/build/sm_89/gemm_i8mma_cuda.cubin"
-));
-
-/// (registry key, cubin entry symbol) for every kernel in the CUDA cubin.
-const CUDA_CUBIN_ENTRIES: &[(&str, &str)] = &[
-    ("gemm_q4_k_i8mma_cuda", "forge_gemm_q4_k_i8mma_cuda"),
-    ("gemm_q4_k_i8mma_cuda_bn64", "forge_gemm_q4_k_i8mma_cuda_bn64"),
-    ("gemm_q8_0_i8mma_cuda", "forge_gemm_q8_0_i8mma_cuda"),
-    ("gemm_q8_0_i8mma_cuda_bn64", "forge_gemm_q8_0_i8mma_cuda_bn64"),
-];
-
 /// W4A8 (int4-weight x int8-activation) prefill GEMM cubin (kernels/cuda/
 /// w4a8_gemm.cu; QServe dense_kernel0, ADR-0001 exception). Non-default: routed
 /// only under `FORGE_GEMM=w4a8`; the committed CUDA MMQ stays the default path.
@@ -104,7 +84,8 @@ const CUDA_FATTN_ENTRIES: &[(&str, &str)] = &[
 /// (kernels/cuda/mmq_q4k.cu; ADR-0001 exception, MIT). ggml's ACTUAL compiled
 /// Q4_K/Q6_K device code (~208 TOPS on the 4090; docs/CODEGEN_PROOF.md Exp 2),
 /// writing f16 directly. Loaded through the same cuModuleLoadData path. DEFAULT
-/// Q4_K/Q6_K prefill GEMM; `FORGE_GEMM=cuda|mojo` selects the other backends.
+/// Q4_K/Q6_K prefill GEMM on Ada+; `FORGE_GEMM=mojo` forces the portable Mojo
+/// int8 tiles (also the default on pre-Ada parts, where this cubin is skipped).
 const EMBEDDED_CUDA_CUBIN_MMQ_SM89: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../kernels/mojo/build/sm_89/mmq_q4k_cuda.cubin"
@@ -588,6 +569,17 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "lstm_f32",
 ];
 
+/// True if a Mojo PTX module is Ada-only, i.e. it declares `.target sm_89`
+/// (fp8 mma/cvt, NVFP4 fp8-scale cvt). build_kernels lowers every portable
+/// kernel to `.target sm_80`, so an sm_89 floor is a reliable marker that the
+/// module uses instructions absent on pre-Ada parts and must not be JIT-loaded
+/// there. Scans the PTX header bytes (the `.target` directive is near the top).
+fn is_sm89_only(ptx: &[u8]) -> bool {
+    let head = &ptx[..ptx.len().min(256)];
+    head.windows(b".target sm_89".len())
+        .any(|w| w == b".target sm_89")
+}
+
 /// Loaded modules + resolved kernel handles for one device.
 pub struct KernelArtifacts {
     handles: HashMap<String, KernelHandle>,
@@ -607,9 +599,13 @@ impl KernelArtifacts {
     }
 
     fn load_embedded(device: &dyn Device, arch: &str) -> Result<Self> {
-        // Embedded artifacts are compiled for sm_89; PTX is forward-compatible
-        // within a major architecture via driver JIT, so newer sm_8x/9x parts
-        // still load them. Older parts must supply FORGE_KERNEL_DIR.
+        // The portable Mojo PTX carries `.target sm_80`, so the driver JIT loads
+        // it onto ANY sm_80+ part (RTX 3090 sm_86 through Ada/Hopper) and emits
+        // arch-optimal SASS at load. Only Ada-only kernels (fp8 mma/cvt, NVFP4)
+        // keep `.target sm_89`; they and the nvcc sm_89 cubins are loaded solely
+        // when the device is Ada+ (`fp8_native`), so a pre-Ada GPU starts without
+        // touching an incompatible module.
+        let ada = device.caps().fp8_native;
         let manifest: Manifest = serde_json::from_str(EMBEDDED_MANIFEST)
             .map_err(|e| ForgeError::Kernel(format!("embedded manifest parse: {e}")))?;
         let mut handles = HashMap::new();
@@ -617,6 +613,9 @@ impl KernelArtifacts {
             let entry = manifest.kernels.get(art.name).ok_or_else(|| {
                 ForgeError::Kernel(format!("kernel {} missing from embedded manifest", art.name))
             })?;
+            if !ada && is_sm89_only(art.ptx) {
+                continue;
+            }
             let module = device.load_module(art.ptx)?;
             handles.insert(art.name.to_string(), module.kernel(&entry.entry)?);
         }
@@ -629,25 +628,27 @@ impl KernelArtifacts {
                 )));
             }
         }
-        Self::load_cuda_cubin(device, EMBEDDED_CUDA_CUBIN_SM89, CUDA_CUBIN_ENTRIES, &mut handles)?;
-        Self::load_cuda_cubin(
-            device,
-            EMBEDDED_CUDA_CUBIN_W4A8_SM89,
-            CUDA_W4A8_ENTRIES,
-            &mut handles,
-        )?;
-        Self::load_cuda_cubin(
-            device,
-            EMBEDDED_CUDA_CUBIN_FATTN_SM89,
-            CUDA_FATTN_ENTRIES,
-            &mut handles,
-        )?;
-        Self::load_cuda_cubin(
-            device,
-            EMBEDDED_CUDA_CUBIN_MMQ_SM89,
-            CUDA_MMQ_ENTRIES,
-            &mut handles,
-        )?;
+        // nvcc cubins are sm_89 SASS (no PTX JIT fallback) — load them only on Ada+.
+        if ada {
+            Self::load_cuda_cubin(
+                device,
+                EMBEDDED_CUDA_CUBIN_W4A8_SM89,
+                CUDA_W4A8_ENTRIES,
+                &mut handles,
+            )?;
+            Self::load_cuda_cubin(
+                device,
+                EMBEDDED_CUDA_CUBIN_FATTN_SM89,
+                CUDA_FATTN_ENTRIES,
+                &mut handles,
+            )?;
+            Self::load_cuda_cubin(
+                device,
+                EMBEDDED_CUDA_CUBIN_MMQ_SM89,
+                CUDA_MMQ_ENTRIES,
+                &mut handles,
+            )?;
+        }
         Ok(Self { handles, arch: arch.to_string() })
     }
 
@@ -674,30 +675,33 @@ impl KernelArtifacts {
         })?;
         let manifest: Manifest = serde_json::from_str(&manifest_src)
             .map_err(|e| ForgeError::Kernel(format!("manifest parse: {e}")))?;
+        let ada = device.caps().fp8_native;
         let mut handles = HashMap::new();
         for (name, entry) in &manifest.kernels {
             let ptx = std::fs::read(arch_dir.join(&entry.file)).map_err(|e| {
                 ForgeError::Kernel(format!("read {}: {e}", entry.file))
             })?;
+            if !ada && is_sm89_only(&ptx) {
+                continue;
+            }
             let module: Module = device.load_module(&ptx)?;
             handles.insert(name.clone(), module.kernel(&entry.entry)?);
         }
-        let cubin = std::fs::read(arch_dir.join("gemm_i8mma_cuda.cubin")).map_err(|e| {
-            ForgeError::Kernel(format!("read gemm_i8mma_cuda.cubin: {e}"))
-        })?;
-        Self::load_cuda_cubin(device, &cubin, CUDA_CUBIN_ENTRIES, &mut handles)?;
-        let w4a8 = std::fs::read(arch_dir.join("w4a8_gemm_cuda.cubin")).map_err(|e| {
-            ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}"))
-        })?;
-        Self::load_cuda_cubin(device, &w4a8, CUDA_W4A8_ENTRIES, &mut handles)?;
-        let fattn = std::fs::read(arch_dir.join("fattn_prefill_cuda.cubin")).map_err(|e| {
-            ForgeError::Kernel(format!("read fattn_prefill_cuda.cubin: {e}"))
-        })?;
-        Self::load_cuda_cubin(device, &fattn, CUDA_FATTN_ENTRIES, &mut handles)?;
-        let mmq = std::fs::read(arch_dir.join("mmq_q4k_cuda.cubin")).map_err(|e| {
-            ForgeError::Kernel(format!("read mmq_q4k_cuda.cubin: {e}"))
-        })?;
-        Self::load_cuda_cubin(device, &mmq, CUDA_MMQ_ENTRIES, &mut handles)?;
+        // nvcc cubins are sm_89 SASS — Ada+ only.
+        if ada {
+            let w4a8 = std::fs::read(arch_dir.join("w4a8_gemm_cuda.cubin")).map_err(|e| {
+                ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}"))
+            })?;
+            Self::load_cuda_cubin(device, &w4a8, CUDA_W4A8_ENTRIES, &mut handles)?;
+            let fattn = std::fs::read(arch_dir.join("fattn_prefill_cuda.cubin")).map_err(|e| {
+                ForgeError::Kernel(format!("read fattn_prefill_cuda.cubin: {e}"))
+            })?;
+            Self::load_cuda_cubin(device, &fattn, CUDA_FATTN_ENTRIES, &mut handles)?;
+            let mmq = std::fs::read(arch_dir.join("mmq_q4k_cuda.cubin")).map_err(|e| {
+                ForgeError::Kernel(format!("read mmq_q4k_cuda.cubin: {e}"))
+            })?;
+            Self::load_cuda_cubin(device, &mmq, CUDA_MMQ_ENTRIES, &mut handles)?;
+        }
         Ok(Self { handles, arch: arch.to_string() })
     }
 

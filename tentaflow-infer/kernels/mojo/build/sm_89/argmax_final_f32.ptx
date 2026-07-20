@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_sampling_argmax_final_f326A6A6A6AoA_3be698e5d78db4da

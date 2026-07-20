@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_onnx_ops_conv1d_f32_Poin6A6A6A6AoA6A6A_6a7a801c0ca73288
