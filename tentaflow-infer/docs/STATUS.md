@@ -167,6 +167,26 @@ Ostatnia aktualizacja: 2026-07-20.
     **2953→4638 (1.57×)**; dekod nietknięty (osobny kernel). Luka do llama.cpp
     (pp4096 11927) 3.18×→**2.62×**. Z W4A8 (teraz KOHERENTNY, patrz niżej) FA
     składa się do pp4096 **8725**, pp8192 **8849** tok/s. `docs/BENCH_COMPARISON.md`.
+  - ✅ **Portowalny Mojo tensor-core FA (`FORGE_ATTN=fa_mojo`, 2026-07-20)** —
+    `attn_prefill_fa_mma` (`kernels/mojo/src/prefill.mojo`) to Mojo mirror
+    `fattn_prefill.cu`: ten sam algorytm (f16 `m16n8k16` mma QK^T, online-softmax
+    w rejestrach, mma P·V, paged KV + GQA + causal), ten sam kontrakt tilingu
+    (BQ=64, BK=32, 4 warpy). mma/`ld_matrix[8]`/`ld_matrix[4]` z `std.gpu.compute.mma`,
+    redukcja 4-lane przez `shuffle_xor`, V transponowane w smem (`[head_dim][key]`)
+    → P·V czyta B non-transposed; layout akumulatora S == layout operandu A → P·V
+    bez repacku (pakowanie f32-prob → SIMD[f16,8]). Poprawność vs CPU-golden
+    (paged, GQA, causal, tile-tail, granica bloku BQ): max_abs **~1.2e-4**,
+    max_rel **~1.1e-3**; vs skalar max_abs ~1.2e-4 (`test_fa_mma.mojo`). Koherencja
+    Mistral greedy „Paris…" == fa/scalar. **WERDYKT: konkurencyjny.** nsys attn
+    kernel (Mistral, isolowany czas GPU): 4096 CUDA 97.9 → Mojo 102.2 ms
+    (**+4.4 %**), 8192 CUDA 349.8 → Mojo 359.2 ms (**+2.7 %**) — w progu ~15 %.
+    End-to-end prefill (warm, tok/s): 512 fa 5727 ≈ fa_mojo 6053, 4096 fa 7585 /
+    fa_mojo 8523, 8192 fa 8231 ≈ fa_mojo 8104. Dekod bit-nietknięty (osobny
+    kernel decode, 146/130 identycznie). W przeciwieństwie do int8-GEMM
+    (`CODEGEN_PROOF.md`, ściana 3.5×) struktura FA (krótka redukcja online-softmax,
+    NIE głęboki K-unroll pipeline) planuje się w Mojo konkurencyjnie → **kandydat
+    na portowalny default** (jedno źródło Mojo → PTX+AMDGPU+Metal, ADR-0001).
+    Default nietknięty (`fa`=CUDA). `docs/BENCH_COMPARISON.md`.
   - ✅ **W4A8 prefill GEMM teraz KOHERENTNY (`FORGE_GEMM=w4a8`), wciąż non-default
     (2026-07-19).** Prawdziwą przyczyną wcześniejszego „gibberish" był BŁĄD
     rekwantyzacji, NIE outliery aktywacji: zero-point QoQ `w ≈ s1·int8(s2·(q4−zero))`

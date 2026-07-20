@@ -61,12 +61,25 @@ pub struct Kernels {
     /// same native GGUF weights + q8_1 activation, no quality change.
     /// `FORGE_GEMM=cuda|mojo|w4a8` selects the other backends.
     gemm_mmq: bool,
-    /// Route dense prefill attention through the tensor-core flash-attention
-    /// cubin (kernels/cuda/fattn_prefill.cu) instead of the Mojo scalar
-    /// `attn_prefill`. Default ON (f16 hd64/hd128 only; other cases fall
-    /// through to the scalar kernel) — it is ~3.9× faster and token-identical
-    /// to the scalar path. `FORGE_ATTN=scalar` forces the old kernel.
-    attn_fa: bool,
+    /// Dense prefill attention backend (f16 hd64/hd128 only; every other shape
+    /// falls through to the scalar kernel). DEFAULT = the portable Mojo
+    /// tensor-core FA (`attn_prefill_fa_mma`, kernels/mojo/src/prefill.mojo) —
+    /// within ~4% of the CUDA cubin, keeps kernels Mojo (ADR-0001) and portable
+    /// to PTX/AMDGPU/Metal. `FORGE_ATTN=fa` (or `cuda`) selects the NVIDIA-only
+    /// cubin (kernels/cuda/fattn_prefill.cu) for max Ada throughput;
+    /// `FORGE_ATTN=scalar` forces the scalar kernel.
+    attn: AttnBackend,
+}
+
+/// Dense prefill attention routing (FORGE_ATTN).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttnBackend {
+    /// Scalar/SIMD online-softmax Mojo kernel (`attn_prefill`).
+    Scalar,
+    /// Tensor-core flash-attention CUDA cubin (`fattn_prefill.cu`).
+    Cuda,
+    /// Tensor-core flash-attention Mojo kernel (`attn_prefill_fa_mma`).
+    Mojo,
 }
 
 /// Device-resident q8_1 activation scratch shared by the i8mma GEMM launches.
@@ -156,7 +169,11 @@ impl Kernels {
                 std::env::var("FORGE_GEMM").ok().as_deref(),
                 None | Some("mmq")
             ),
-            attn_fa: std::env::var("FORGE_ATTN").ok().as_deref() != Some("scalar"),
+            attn: match std::env::var("FORGE_ATTN").ok().as_deref() {
+                Some("scalar") => AttnBackend::Scalar,
+                Some("fa") | Some("cuda") => AttnBackend::Cuda,
+                _ => AttnBackend::Mojo,
+            },
         })
     }
 
@@ -1537,14 +1554,25 @@ impl Kernels {
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        // Tensor-core flash-attention path (FORGE_ATTN=fa). Only the f16 cache
-        // with head_dim 64/128 has an FA specialization; every other shape falls
-        // through to the Mojo scalar kernel so nothing breaks.
-        if self.attn_fa && kv_dtype == DType::F16 && (head_dim == 64 || head_dim == 128) {
-            return self.attn_prefill_fa(
-                out, q, k_cache, v_cache, page_table, base_pos, n_tokens, n_q_heads, n_kv_heads,
-                head_dim, page_size, scale, stream,
-            );
+        // Tensor-core flash-attention paths. Only the f16 cache with head_dim
+        // 64/128 has an FA specialization; every other shape falls through to
+        // the Mojo scalar kernel so nothing breaks.
+        if kv_dtype == DType::F16 && (head_dim == 64 || head_dim == 128) {
+            match self.attn {
+                AttnBackend::Cuda => {
+                    return self.attn_prefill_fa(
+                        out, q, k_cache, v_cache, page_table, base_pos, n_tokens, n_q_heads,
+                        n_kv_heads, head_dim, page_size, scale, stream, false,
+                    );
+                }
+                AttnBackend::Mojo => {
+                    return self.attn_prefill_fa(
+                        out, q, k_cache, v_cache, page_table, base_pos, n_tokens, n_q_heads,
+                        n_kv_heads, head_dim, page_size, scale, stream, true,
+                    );
+                }
+                AttnBackend::Scalar => {}
+            }
         }
         let suffix = Self::kv_suffix(kv_dtype, "attn_prefill")?;
         let name = match (head_dim, kv_dtype) {
@@ -1582,11 +1610,13 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Tensor-core causal flash-attention prefill (FORGE_ATTN=fa; ADR-0001 CUDA
-    /// cubin kernels/cuda/fattn_prefill.cu). Same I/O contract as `attn_prefill`
-    /// (f16 cache, paged KV, GQA, causal) but QK^T and P·V run as f16 mma with an
-    /// online softmax kept in registers. Grid: (ceil(T/64), n_q_heads); one block
-    /// of 4 warps owns 64 query rows of one head.
+    /// Tensor-core causal flash-attention prefill. Same I/O contract as
+    /// `attn_prefill` (f16 cache, paged KV, GQA, causal) but QK^T and P·V run as
+    /// f16 mma with an online softmax kept in registers. Grid: (ceil(T/64),
+    /// n_q_heads); one block of 4 warps owns 64 query rows of one head. `mojo`
+    /// selects the portable Mojo kernel (`attn_prefill_fa_mma`,
+    /// kernels/mojo/src/prefill.mojo) over the CUDA cubin
+    /// (kernels/cuda/fattn_prefill.cu) — byte-identical tiling contract.
     #[allow(clippy::too_many_arguments)]
     fn attn_prefill_fa(
         &self,
@@ -1603,11 +1633,14 @@ impl Kernels {
         page_size: usize,
         scale: f32,
         stream: &Stream,
+        mojo: bool,
     ) -> Result<()> {
-        let name = match head_dim {
-            64 => "attn_prefill_fa_f16_hd64",
-            128 => "attn_prefill_fa_f16_hd128",
-            other => {
+        let name = match (head_dim, mojo) {
+            (64, false) => "attn_prefill_fa_f16_hd64",
+            (128, false) => "attn_prefill_fa_f16_hd128",
+            (64, true) => "attn_prefill_fa_mojo_f16_hd64",
+            (128, true) => "attn_prefill_fa_mojo_f16_hd128",
+            (other, _) => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_prefill_fa: head_dim {other} has no FA specialization"
                 )))

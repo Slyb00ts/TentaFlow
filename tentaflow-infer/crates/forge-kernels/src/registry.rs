@@ -364,6 +364,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "attn_prefill_f16_hd256",
     "attn_prefill_fp8_hd64",
     "attn_prefill_fp8_hd128",
+    "attn_prefill_fa_mojo_f16_hd64",
+    "attn_prefill_fa_mojo_f16_hd128",
     "qkv_post_f16",
     "gemv_q4_k_f16_v2",
     "gemv_q4_k_out_f32_v2",

@@ -75,6 +75,50 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
   (ISETP/BSSY per load) starve the tensor pipe; clamp out-of-range
   tokens/rows instead of branching and zero-fill only the W k-tail.
 
+## Tensor-core flash-attention prefill IS competitive in Mojo (unlike int8-GEMM)
+- **The FA counter-example to the int8-GEMM codegen wall.** `attn_prefill_fa_mma`
+  (`src/prefill.mojo`, `FORGE_ATTN=fa_mojo`) is a straight Mojo port of the CUDA
+  `fattn_prefill.cu`: f16 `m16n8k16` mma for QK^T and P·V, online softmax in
+  registers, paged KV + GQA + causal, BQ=64/BK=32/4-warp tiling, byte-identical
+  I/O contract. It schedules to **within ~2.7–4.4 % of the nvcc cubin** — NOT the
+  3.5× wall the int8-MMQ GEMM hit. Measured (RTX 4090, Mistral-7B Q4_K, nsys
+  isolated attention-kernel GPU time): 4096 prefill CUDA 97.9 ms → Mojo 102.2 ms
+  (+4.4 %); 8192 CUDA 349.8 ms → Mojo 359.2 ms (+2.7 %). End-to-end prefill tok/s
+  is at parity (warm): 512 5727/6053, 4096 7585/8523, 8192 8231/8104 (fa/fa_mojo).
+  Decode untouched (separate kernel). **Why FA works where the GEMM did not:** FA's
+  hot loop is a SHORT online-softmax reduction (running max/sum, a handful of mma
+  per KV tile, immediate f32 epilogue), not a deep-K-unrolled IMMA pipeline whose
+  throughput depends on ptxas LDS/mma dual-issue scheduling — the exact lever Mojo's
+  backend loses on (Exp 5 / `CODEGEN_PROOF.md`). The pure `m16n8k16` f16 mma was
+  already proven full-rate in Mojo, and FA leans on that mma plus scalar softmax,
+  so there is no scheduling wall to hit.
+- **Mojo mma-FA implementation notes (all worked first-shot):**
+  - `from std.gpu.compute.mma import mma, ld_matrix` + `from std.gpu.primitives.warp
+    import shuffle_xor`.
+  - **QK^T** maps 1:1 onto the GEMM's fragment convention: A = Q from row-major
+    `qs[query][head_dim]` via `ld_matrix[8]` (non-transposed, preloaded once/warp);
+    B = K from n-major `ks[key][head_dim]` via `ld_matrix[4]` (non-transposed — a K
+    row IS the B fragment, same as a W row in the GEMM). `mma(s[nt], qf[kc], bf,
+    s[nt])` accumulates over head-dim chunks.
+  - **Online softmax:** the mma D-layout has each lane own query rows ra=lane/4 and
+    rb=lane/4+8, with the 4 keys of a row spread across `lane&3`. Reduce max/sum over
+    those 4 lanes with `max(v, shuffle_xor(v, 1)); max(v, shuffle_xor(v, 2))`
+    (`shuffle_xor(v, k)` xor's the lane id — lanes 0-3 all converge, 4-7 converge …).
+  - **P·V:** the S-accumulator D-layout equals the mma **A-operand** layout, so P
+    needs NO ldmatrix repack — just pack the f32 probs of two adjacent 8-key subtiles
+    into one `SIMD[DType.float16, 8]` (elements `[s0_0,s0_1,s0_2,s0_3,s1_0…]` = the
+    4 h2 registers a[0:2],a[2:4],a[4:6],a[6:8]). B = V stored **transposed** in smem
+    (`vs[head_dim][key]`, scalar scatter on stage) so `ld_matrix[4]` reads it
+    non-transposed. `mma(acc[hn], pf, bv, acc[hn])`.
+  - Same guard-light staging as the GEMM: `.load/.store[width=8, alignment=16]`,
+    clamp out-of-range query rows (masked at write-out) instead of branching.
+  - `shuffle_xor` handles Float32 directly. `Float32(HD) ** 0.5` does NOT compile
+    (unsupported SIMD pow) — use `sqrt(Float32(HD))`.
+- **Verdict:** Mojo FA is a portable-default CANDIDATE (one Mojo source →
+  PTX + AMDGPU + Metal per ADR-0001, vs the NVIDIA-only `fattn_prefill.cu`). The
+  default stays `fa`=CUDA for now; `fa_mojo` is wired and proven. FA does NOT need
+  the CUDA exception the int8-GEMM does.
+
 ## int8 MMQ prefill Q4_K = CUDA kernel (nvcc), the ONE ADR-0001 exception
 - **Why raw CUDA:** `docs/CODEGEN_PROOF.md` proves the Mojo backend caps the
   int8-MMQ `gemm_i8mma_impl` at ~66 TOPS on the RTX 4090 while nvcc/ptxas

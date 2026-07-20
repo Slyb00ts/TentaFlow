@@ -1290,3 +1290,59 @@ failing the quality gate.)
 `rmsnorm_residual_q8_1_ds4`, `gemm_q4_k_mmq_prequant_at`, `mmq_gemm_and_fixup`,
 `mmq_q8_bytes`, `mmq_enabled`), `model.rs` (`prefill_forward` fused-norm wiring +
 `gemm_rows_q4k_prequant` + `PrefillBufs.q8_norm`).
+
+---
+
+## Portable Mojo tensor-core flash-attention vs the CUDA FA (2026-07-20)
+
+Question: is a **Mojo** tensor-core flash-attention prefill competitive with the NVIDIA-only
+CUDA cubin (`kernels/cuda/fattn_prefill.cu`)? A Mojo FA is portable (one source → PTX +
+AMDGPU + Metal per ADR-0001); the CUDA one is Ada-only. Implemented `attn_prefill_fa_mma`
+(`kernels/mojo/src/prefill.mojo`, `FORGE_ATTN=fa_mojo`) — a straight port: f16 `m16n8k16`
+mma QK^T, online softmax in registers, mma P·V, paged KV + GQA + causal, identical
+BQ=64/BK=32/4-warp tiling and byte-identical I/O contract. Same machine as above, RTX 4090,
+`test-models/gguf/mistral-7b-q4_k_m.gguf`, each run alone on an idle GPU.
+
+**Correctness** (`kernels/mojo/test_fa_mma.mojo`, GPU vs f32 CPU golden over the paged cache,
+GQA + causal + tile-tail + BQ-block boundary):
+```
+  HD 64  NQH 4  base 5   T 19  | fa-vs-cpu abs 5.78e-05 rel 1.10e-03 | fa-vs-scalar abs 6.10e-05
+  HD 128 NQH 16 base 768 T 200 | fa-vs-cpu abs 5.71e-05 rel 8.51e-04 | fa-vs-scalar abs 6.10e-05
+  HD 128 NQH 8  base 0   T 100 | fa-vs-cpu abs 1.17e-04 rel 1.10e-03 | fa-vs-scalar abs 1.22e-04
+  HD 64  NQH 8  base 100 T 140 | fa-vs-cpu abs 5.30e-05 rel 8.45e-04 | fa-vs-scalar abs 6.10e-05
+  ALL FA MMA CHECKS PASSED
+```
+Coherence (`forge run … "The Eiffel Tower is located in the city of" -n 16 --temp 0`), all
+three backends byte-identical: `Paris, France. It is one of the most famous landmarks in the
+world`. Bielik NVFP4 batched-decode golden still passes on the default path (`fa`=CUDA), 1
+and 4 lanes.
+
+**Isolated attention-kernel GPU time** (nsys `cuda_gpu_kern_sum`, prefill only, `--tokens 2`;
+256 launches at 8192 = 32 layers × 8 chunks, 128 at 4096):
+
+| prefill | CUDA `fattn_prefill.cu` | Mojo `attn_prefill_fa_mma` | Mojo vs CUDA |
+|---------|-------------------------|----------------------------|--------------|
+| 4096    | 97.9 ms                 | 102.2 ms                   | **+4.4 %**   |
+| 8192    | 349.8 ms                | 359.2 ms                   | **+2.7 %**   |
+
+**End-to-end prefill throughput** (`bench --prefix-cache off`, warm; the first launch of a
+short 512 prefill is cold-clock noise — the two 512 rows below are a 2nd warm rep):
+
+| shape (prompt/decode) | scalar | fa (CUDA) | fa_mojo |
+|-----------------------|--------|-----------|---------|
+| 512 / 8   (warm)      | —      | 5727      | 6053    |
+| 4096 / 2048           | 5142   | 7585      | 8523    |
+| 8192 / 1024           | 3779   | 8231      | 8104    |
+
+Decode is bit-unchanged across all three (separate decode kernel): 4096 case 146.0/146.1
+tok/s, 8192 case 130.2–130.4 tok/s — no regression.
+
+**Verdict: Mojo FA is competitive — a portable-default candidate.** The isolated attention
+kernel is within **2.7–4.4 %** of the nvcc cubin (well inside the ~15 % bar), and end-to-end
+prefill is at parity. This is the opposite of the int8-MMQ GEMM, which hit a 3.5× Mojo-codegen
+wall (`docs/CODEGEN_PROOF.md`). FA's hot loop is a short online-softmax reduction, not a
+deep-K-unrolled IMMA pipeline whose throughput hinges on the ptxas LDS/mma dual-issue
+scheduling Mojo does not match — so there is no wall to hit. FA does **not** need the CUDA
+ADR-0001 exception the way the int8 GEMM does. The default stays `fa`=CUDA for now
+(`fa_mojo` wired and proven); flipping the default to the portable Mojo kernel is a low-risk
+follow-up once the AMDGPU/Metal targets are exercised.

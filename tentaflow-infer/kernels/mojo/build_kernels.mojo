@@ -46,6 +46,7 @@ from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64, gemm_q4_k_i8mma_big
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128, attn_prefill_f16_hd256
 from src.prefill import kv_append_batch_fp8, attn_prefill_fp8_hd64, attn_prefill_fp8_hd128
+from src.prefill import attn_prefill_fa_f16_hd64, attn_prefill_fa_f16_hd128
 from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
 from src.attention import attn_decode_split_fp8_hd64, attn_decode_split_fp8_hd128
@@ -333,6 +334,12 @@ def main() raises:
 
     _ = ctx.compile_function[attn_prefill_fp8_hd128, dump_asm=Path("attn_prefill_fp8_hd128.ptx")]()
     entries.append(_finalize(out_dir, "attn_prefill_fp8_hd128"))
+
+    _ = ctx.compile_function[attn_prefill_fa_f16_hd64, dump_asm=Path("attn_prefill_fa_mojo_f16_hd64.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_fa_mojo_f16_hd64"))
+
+    _ = ctx.compile_function[attn_prefill_fa_f16_hd128, dump_asm=Path("attn_prefill_fa_mojo_f16_hd128.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_fa_mojo_f16_hd128"))
 
     _ = ctx.compile_function[qkv_post_f16, dump_asm=Path("qkv_post_f16.ptx")]()
     entries.append(_finalize(out_dir, "qkv_post_f16"))

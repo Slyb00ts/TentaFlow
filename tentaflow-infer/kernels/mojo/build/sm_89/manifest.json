@@ -52,6 +52,8 @@
     "kv_append_batch_fp8": {"file": "kv_append_batch_fp8.ptx", "entry": "src_prefill_kv_append_batch6A6A6A6AcB6A6A_a387d620eac391d4"},
     "attn_prefill_fp8_hd64": {"file": "attn_prefill_fp8_hd64.ptx", "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_1b4b060b68c4314a"},
     "attn_prefill_fp8_hd128": {"file": "attn_prefill_fp8_hd128.ptx", "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_c92011a5197fbdca"},
+    "attn_prefill_fa_mojo_f16_hd64": {"file": "attn_prefill_fa_mojo_f16_hd64.ptx", "entry": "src_prefill_attn_prefill_fa_mm6A6A6A6A_60cc3127c8e53f57"},
+    "attn_prefill_fa_mojo_f16_hd128": {"file": "attn_prefill_fa_mojo_f16_hd128.ptx", "entry": "src_prefill_attn_prefill_fa_mm6A6A6A6A_c78c75725e5e1273"},
     "qkv_post_f16": {"file": "qkv_post_f16.ptx", "entry": "src_qkv_post_qkv_post_f16_Po6A6A6A6AoA6A6A_58d752da1d0c71ad"},
     "gemv_q4_k_f16_v2": {"file": "gemv_q4_k_f16_v2.ptx", "entry": "src_gemv2_gemv_q4_k_f16_v2_P6A6A6A6AoA6A6A_75507fe2e4e6dca7"},
     "gemv_q4_k_out_f32_v2": {"file": "gemv_q4_k_out_f32_v2.ptx", "entry": "src_gemv2_gemv_q4_k_out_f32_v26A6A6A6A_236272e835d9bebb"},
