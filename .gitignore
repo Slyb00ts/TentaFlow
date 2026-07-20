@@ -234,3 +234,6 @@ thirparty/
 
 # Poufne nagrania klienta — NIE commitować (tylko lokalnie do testow rtsp-sim)
 /tools/rtsp-sim/clips/
+
+# Benchmark/experiment scratch
+/scratch/
