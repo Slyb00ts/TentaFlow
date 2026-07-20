@@ -12,6 +12,24 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-20.
 
+- ✅ **NATIVE-LAYOUT Mojo int8 Q6_K prefill GEMM (down-proj + attn_v) —
+  ODZYSKANIE REGRESJI PREFILL (2026-07-20).** Po wycofaniu CUDA MMQ (100 % Mojo)
+  prefill Q4_K spadł ~2× (5742 tok/s = 0.51× dawnego MMQ 11151), bo Q6_K
+  down-proj przeszedł na WOLNY f16 `gemm_q6_k_impl` (19 % pp4096 w nsys). Fork
+  Q4_K native → `modular_i8/multistage_i8_q6k_native.mojo` + wrapper
+  `gemm_q6k_i8_multistage.mojo`: czyta surowe bajty `block_q6_K` (210 B/256 wag,
+  ql+qh 6-bit rozpakowane w kernelu do int8 `q6−32`, true 1× VRAM). Ziarnistość
+  skali Q6_K to 16 (nie 32), więc jedno m16n8k32 mma obejmuje DWA sub-bloki skali:
+  flush robi PODWÓJNE mma na 32-region (pełne = S_lo+S_hi, drugie z wyzerowaną
+  górną połówką k = S_lo, S_hi = S_full−S_lo), potem
+  `acc += da·(dsc_lo·S_lo + dsc_hi·S_hi)` — bez members min (offset −32 w kodzie
+  wagi). Aktywacja dzieli q8_1 quant + scratch z Q4_K native. Routing w
+  `gemm_q6_k_f16_at` (native najpierw, fallback f16). Bit-exact vs CPU Q6_K×q8_1
+  (test `gemm_q6_k_native_prefill_matches_formats_dequant`, relL2 < 5e-3). **Efekt:
+  prefill pp4096 5742→11154 tok/s (1.94×, powyżej dawnego MMQ 11151), decode
+  BEZ ZMIAN 151, PPL 30.3113 (== 30.31 baseline), koherencja OK.** Lever 1 sam
+  odzyskał całą regresję → levery 2 (fuzja rmsnorm→q8_1) i 3 (MPAD) niepotrzebne.
+
 - 🟡 **Per-32-block Q4_K int8 GEMM (flush kernel) — ZBUDOWANY i BIT-EXACT, ale
   ~140–196 TOPS = remis/poniżej CUDA MMQ (208), NIE przełączony (2026-07-20,
   Finding M).** Odpowiedź na otwarte pytanie Finding K/L o koszt per-blokowego

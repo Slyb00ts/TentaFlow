@@ -1899,6 +1899,82 @@ impl Kernels {
         Ok(true)
     }
 
+    /// Native-GGUF-layout Mojo int8 Q6_K multistage prefill GEMM. Mirrors
+    /// `gemm_q4k_i8_native`: shares the q8_1 activation quant + `q4k_native`
+    /// scratch (identical int8 codes + block-major da), then runs the native GEMM
+    /// reading the RAW `w_q6k` GGUF bytes (210-byte block_q6_K unpacked in-kernel,
+    /// TRUE 1× VRAM). The kernel honors Q6_K's 16-element scale granularity with a
+    /// double m16n8k32 mma per 32-region, so it is bit-exact vs Q6_K × q8_1. `sa`
+    /// is passed for a shared signature but unused (Q6_K has no min term). Returns
+    /// `false` (caller falls back to the f16 Q6_K kernel) when `(rows,cols)` has no
+    /// committed instance or `n_tokens > 4096`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q6k_i8_native(
+        &self,
+        y: &DevBuffer,
+        w_q6k: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let Some(mpad) = Self::q4k_native_mpad(n_tokens) else {
+            return Ok(false);
+        };
+        let key = format!("gemm_q6k_i8_native_{rows}_{cols}_m{mpad}");
+        let Ok(gk) = self.artifacts.get(&key) else {
+            return Ok(false);
+        };
+        let qk = self.artifacts.get("quantize_act_q8_1")?;
+
+        let need_x = mpad * cols;
+        let need_blocks = mpad * (cols / 32);
+        let mut sc = self.q4k_native.lock().expect("q4k native scratch poisoned");
+        if sc.cap_x < need_x {
+            sc.xpad = Some(self.device.alloc(need_x * 2, MemKind::Device, Pool::Activations)?);
+            sc.xq = Some(self.device.alloc(need_x, MemKind::Device, Pool::Activations)?);
+            sc.cap_x = need_x;
+        }
+        if sc.cap_blocks < need_blocks {
+            sc.da = Some(self.device.alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?);
+            sc.sa = Some(self.device.alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?);
+            sc.cap_blocks = need_blocks;
+        }
+        let xpad = sc.xpad.as_ref().expect("xpad allocated");
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let da = sc.da.as_ref().expect("da allocated");
+        let sa = sc.sa.as_ref().expect("sa allocated");
+
+        self.device.copy(x, 0, xpad, 0, n_tokens * cols * 2, stream)?;
+
+        let qcfg = LaunchConfig::linear(need_blocks as u32, BLOCK);
+        let qargs = LaunchArgs::new()
+            .buf(xq)
+            .buf(da)
+            .buf(sa)
+            .buf(xpad)
+            .scalar(cols as i64)
+            .scalar(mpad as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(128), (mpad as u32) / 128, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 53248,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(xq)
+            .buf_at(w_q6k, w_byte_off)?
+            .buf(da)
+            .buf(sa)
+            .scalar(n_tokens as i64);
+        self.device.launch(gk, &cfg, &args, stream)?;
+        Ok(true)
+    }
+
     /// Pre-quantize the activation to q8_1 ONCE (`quantize_act_q8_1`) into the
     /// grow-only scratch, then run the int8-MMQ GEMM reading int8 X directly.
     /// This halves X read bandwidth and removes the redundant per-row-block
@@ -2716,6 +2792,16 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q6_k requires cols % 256 == 0, got {cols}"
             )));
+        }
+        // Prefer the native-GGUF-layout Mojo int8 Q6_K multistage GEMM (reads the
+        // raw `DevWeight::Q6K.buf` bytes in-kernel, bit-exact vs Q6_K × q8_1 by
+        // construction). Prefill-sized batches whose (rows,cols) has a committed
+        // (N,K,MPAD) instance and T ≤ 4096; anything else falls through to the f16
+        // Q6_K kernel below.
+        if n_tokens >= 64
+            && self.gemm_q6k_i8_native(y, w_q6k, w_byte_off, x, rows, cols, n_tokens, stream)?
+        {
+            return Ok(());
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q6_k_f16{suffix}"))?;

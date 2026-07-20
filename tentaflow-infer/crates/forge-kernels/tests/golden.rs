@@ -413,6 +413,53 @@ fn gemm_q6_k_matches_formats_dequant() {
     }
 }
 
+// Prefill-sized batch on a COMMITTED native (N,K,MPAD) shape (rows=1024,
+// cols=4096, n_tokens=128 → gemm_q6k_i8_native_1024_4096_m128) routes Q6_K
+// through the native-GGUF-layout int8 multistage GEMM. Compares against the CPU
+// formats dequant of the SAME bytes with the aggregate relative-L2 metric (the
+// q8_1 activation quant is per-element lossy; the double-mma per-16-scale flush is
+// otherwise bit-exact).
+#[test]
+fn gemm_q6_k_native_prefill_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (rows, cols, n_tokens) = (1024usize, 4096usize, 128usize);
+    let wq = build_q6k(rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q6K, &wq, rows * cols)
+            .unwrap();
+
+    let x: Vec<f32> = (0..n_tokens * cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    kernels
+        .gemm_q6_k_f16(&yb, &wb, &xb, rows, cols, n_tokens, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for t in 0..n_tokens {
+        for r in 0..rows {
+            let want: f32 = (0..cols)
+                .map(|c| w_f32[r * cols + c] * x[t * cols + c])
+                .sum();
+            let diff = (got[t * rows + r] - want) as f64;
+            num += diff * diff;
+            den += (want as f64) * (want as f64);
+        }
+    }
+    let rel_l2 = (num / den).sqrt();
+    assert!(rel_l2 < 5e-3, "Q6_K native relL2 {rel_l2:.3e} exceeds q8_1 tolerance");
+}
+
 #[test]
 fn gemv_nvfp4_matches_formats_dequant() {
     let Some(dev) = device() else { return };

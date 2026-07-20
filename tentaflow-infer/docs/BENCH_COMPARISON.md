@@ -1610,13 +1610,24 @@ the CUDA MMQ kernel (Finding Q in CODEGEN_PROOF). Measured on the RTX 4090 (sm_8
 | path                         | prefill pp4096 (tok/s) | decode (tok/s) | Q4_K PPL (ctx 2048) |
 |------------------------------|------------------------|----------------|---------------------|
 | CUDA MMQ (prior default)     | ~11151                 | ~151           | 30.31               |
-| native Mojo int8 (new default) | **~5740** (re-measured; agent 11120 was wrong) | **151** | **30.07** |
+| native Mojo int8, Q6_K on f16 (regressed) | ~5742          | 151            | 30.31               |
+| **native Mojo int8 + native Q6_K (new default)** | **11154** (rep 5, warm) | **151** | **30.3113** |
 
-Prefill is **~0.51× (~2× SLOWER)** than the deleted CUDA MMQ — independently re-measured (the "0.997×" claim was a measurement error). Cause: native Q4_K ~0.79× + Q6_K down-proj on slow f16 + lost fusion + MPAD. Milestone (CUDA-free, 100% Mojo, correct, 1× VRAM) is real; speed recovery is the optimization debt. NOT the 0.79× floor the plan
-accepted for disabling the MMQ rmsnorm→q8_1 fusion. The disabled fusion (one shared DS4
-activation across q/k/v & gate/up) is replaced by a per-projection `quantize_act_q8_1`; the
-extra quant passes are hidden by the multistage cp.async GEMM, so no measurable prefill loss.
-Decode is unchanged (untouched dp4a GEMV). PPL is bit-exact vs MMQ by construction (identical
+**Recovery (2026-07-20): prefill 5742 → 11154 tok/s (1.94×), at/above the deleted CUDA MMQ
+(11151).** The regression to 5742 (0.51×) was caused by the Q6_K down-proj falling onto the
+slow f16 `gemm_q6_k_impl` (19 % of pp4096 in nsys) after the MMQ deletion. Fixed by a
+native-GGUF-layout int8 Q6_K multistage GEMM (`multistage_i8_q6k_native.mojo`, forked from the
+Q4_K native kernel): reads raw `block_q6_K` bytes in-kernel, honors Q6_K's 16-element scale
+granularity with a double m16n8k32 mma per 32-region (full = S_lo+S_hi, upper-k-half-zeroed =
+S_lo, S_hi = S_full−S_lo), flush `acc += da·(dsc_lo·S_lo + dsc_hi·S_hi)` with no min term. This
+single lever recovered the entire regression, so the planned levers 2 (rmsnorm→q8_1 fusion) and
+3 (MPAD bucket) were not needed. Bit-exact vs CPU Q6_K×q8_1 (golden relL2 < 5e-3); PPL 30.3113
+== the 30.31 baseline; decode unchanged (untouched dp4a GEMV); coherence OK.
+
+The Q4_K native path itself was already fine (~0.79× MMQ, the kernel ceiling). The disabled MMQ
+rmsnorm→q8_1 fusion (one shared DS4 activation across q/k/v & gate/up) is replaced by a
+per-projection `quantize_act_q8_1`; the extra quant passes are hidden by the multistage cp.async
+GEMM, so no measurable prefill loss. PPL is bit-exact vs MMQ by construction (identical
 per-32-block flush `acc += dsc·da·sumi − dm·sa`).
 
 VRAM: weights 1× (native kernel reads the same `DevWeight::Q4K.buf` bytes decode reads — no
