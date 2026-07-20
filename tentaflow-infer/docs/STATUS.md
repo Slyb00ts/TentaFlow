@@ -28,6 +28,20 @@ Ostatnia aktualizacja: 2026-07-20.
   zweryfikowany (`ptxas -arch=sm_86`). Wszystko w scratch
   (`scratch/i8mod/multistage_i8_q4k.mojo`, `scratch/bench_i8mod_q4k.mojo`).
 
+- 🟡 **Upakowany layout Q4_K (weights 4-bit + skale f16) — ZBUDOWANY i BIT-EXACT,
+  ale upakowanie wag NIE bije MMQ; ściana to FLUSH, nie pasmo wag (2026-07-20,
+  Finding N).** Domknięcie otwartego pytania Finding M (upakowany layout jako droga
+  >208). (1) **skale f16** (half2, jak MMQ): unpacked int8 + per-blokowy flush z f16
+  = **160–197 TOPS**, bit-exact, podnosi shape'y scale-bound (gate/up T2048 138→189)
+  — NAJLEPSZY wariant, ale wciąż 0.91–0.95× MMQ (208). (2) **wagi 4-bit** (cp.async
+  upakowanych bajtów do pipelined SMEM + rozpakowanie w kernelu, `b_swizzle=False`):
+  **REGRESJA do 146–166 TOPS** mimo połowy pasma wag; swizzle on/off <5 % → wąskim
+  gardłem NIE są konflikty banków ani pasmo wag, tylko sam flush (odczyty skal z SMEM
+  + akumulacja per-element). Kernel nie jest weight-HBM-bound, więc upakowanie nie
+  pomaga. Reguła decyzyjna → **default BEZ ZMIAN (CUDA MMQ); MMQ NIE wycofany.**
+  Bit-exact + sm_80/sm_86. Scratch: `scratch/i8mod/multistage_i8_q4k_f16.mojo`,
+  `multistage_i8_q4k_pack.mojo`, `scratch/bench_i8mod_q4k_{f16,pack}.mojo`.
+
 - ✅ **Dekod Q4_K (dp4a GEMV) jest przy ścianie przepustowości — bije llama.cpp
   w płytkim kontekście, remis w głębokim (2026-07-20, nic nie wysłano).** Sesja
   celowała w rzekomą lukę 20 % (146 vs 175 tok/s) do llama.cpp. Pomiar na tym 4090

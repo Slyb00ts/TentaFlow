@@ -1564,3 +1564,23 @@ scale movement) = 290–402 TOPS; the bottleneck is the scale-tensor HBM traffic
 not spill/barriers/ILP. Plus the kernel reads unpacked int8 weights (2× bandwidth vs packed
 Q4_K). ⇒ MMQ parity only on the compute-heaviest shape, below on the rest — **not flipped**,
 CUDA MMQ default retained (see CODEGEN_PROOF Finding M). Portable sm_80/sm_86 (3090) verified.
+
+### Finding N — packed layout tested: f16 scales best (parity), weight-packing regresses
+
+Follow-up on Finding M's packed-layout hypothesis (RTX 4090 idle, best-of-5×40, bit-exact
+`max_rel = 0.0`). Two levers vs the f32 per-block kernel:
+
+| shape (T,N,K) | role | f32 (M) | **f16 scales** | packed 4-bit | CUDA MMQ |
+|---|---|---|---|---|---|
+| 512, 4096, 14336  | down | 180 | **194** | 158 | ~208 |
+| 2048, 4096, 14336 | down | 196 | **197** | 162 | 208 |
+| 512, 14336, 4096  | gate/up | 139 | **160** | 146 | ~208 |
+| 2048, 14336, 4096 | gate/up | 138 | **189** | 166 | 208 |
+
+f16 (half2) scales — matching MMQ's block-scale storage — lift the scale-bound gate/up shapes
+(138 → 189) and land the best variant at **160–197 TOPS = 0.91–0.95× MMQ (parity)**. Packing the
+weights to 4-bit (cp.async'd + unpacked in-kernel) **REGRESSES** to 146–166 despite halving weight
+HBM: the kernel is FLUSH-bound (smem scale reads + per-element scaled accumulate), not
+weight-HBM-bound, so packing adds unpack smem traffic for no gain (swizzle on/off <5 %, so bank
+conflicts are not the cause). Packed-layout hypothesis REFUTED for throughput on Ada; CUDA MMQ
+default retained (see CODEGEN_PROOF Finding N).

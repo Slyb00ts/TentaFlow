@@ -1068,3 +1068,96 @@ regs, 0 spill) retargeted `.target sm_89→sm_80` assembles with **`ptxas -arch=
 
 All Finding-M artifacts are scratch (`kernels/mojo/scratch/i8mod/multistage_i8_q4k.mojo`,
 `scratch/bench_i8mod_q4k.mojo`); nothing committed to the engine.
+
+---
+
+## Finding N — packed-Q4_K layout in the Mojo pipeline: BIT-EXACT, but weight-packing does NOT beat MMQ; the wall is the per-block FLUSH, not weight/scale HBM (2026-07-20)
+
+Finding M left one lever open: reproduce MMQ's **packed** Q4_K data path (4-bit weights +
+embedded scales read once with the weights) to remove the two costs it measured — the 2×
+unpacked-weight bandwidth and the separate-scale-tensor HBM traffic — predicting that would
+push the per-32-block kernel past the CUDA MMQ (208). This pass BUILT the packed path, proved
+it bit-exact, and measured it. **Result: packing the weights does NOT beat MMQ — it REGRESSES.
+The per-block kernel is bound by the FLUSH (smem scale reads + per-element scaled accumulate),
+NOT by weight HBM bandwidth, so halving the weight bytes buys nothing (and costs the unpack).
+The one lever that helped is f16 (half2) scales, which lifts the scale-bound shapes but still
+lands at MMQ PARITY (0.91–0.95×), not above.** Default UNCHANGED (CUDA MMQ on Ada, portable Mojo
+i8mma on pre-Ada). CUDA MMQ NOT retired.
+
+### Two changes measured, each bit-exact vs the CPU vec_dot_q4_K_q8_1 golden (max_rel = 0.0)
+
+1. **f16 scales** (`scratch/i8mod/multistage_i8_q4k_f16.mojo`, gate `scratch/bench_i8mod_q4k_f16.mojo`):
+   the per-32-block `dsc/dm/da/sa` are stored f16 (half2), exactly like MMQ's block scales,
+   halving the scale-tensor HBM traffic vs Finding M's f32. Weights stay UNPACKED int8 (the
+   fast swizzled cp.async path). This is the BEST variant.
+2. **Packed 4-bit weights** (`scratch/i8mod/multistage_i8_q4k_pack.mojo`, gate
+   `scratch/bench_i8mod_q4k_pack.mojo`): weights read from HBM as packed `[N, K/2]` uint8
+   (HALF the bytes), cp.async'd into a pipelined smem staging buffer (num_stages deep, like the
+   activation), then unpacked in-kernel into a double-buffered plain int8 smem tile the s8 mma
+   consumes. Because `load_b`'s ldmatrix swizzle is applied within 16-row sub-tiles (it does
+   NOT commute with a global row XOR, so a manual swizzled unpack write is wrong), the unpack
+   writes a PLAIN tile and the forked `TensorCore` reads it with `b_swizzle=False` (identity
+   swizzle) — correctness by construction. Scales are also f16.
+
+### Throughput — RTX 4090 idle (<1800 MiB), best-of-5×40, TOPS
+
+| shape (T,N,K) | role | Finding M (f32) | **f16 scales (best)** | packed 4-bit (pipelined) | CUDA MMQ |
+|---|---|---|---|---|---|
+| 512, 4096, 14336  | down | 180 | **194** | 158 | ~208 |
+| 2048, 4096, 14336 | down | 196 | **197** | 162 | 208 |
+| 512, 14336, 4096  | gate/up | 139 | **160** | 146 | ~208 |
+| 2048, 14336, 4096 | gate/up | 138 | **189** | 166 | 208 |
+
+- **f16 scales help the SCALE-BOUND shapes decisively** (gate/up T2048 138 → 189, +37 %;
+  T512 139 → 160) and the weight/compute-bound down-proj marginally (T512 180 → 194). Best
+  overall 160–197 TOPS = **0.91–0.95× the CUDA MMQ** — parity, not above.
+- **Packing the weights REGRESSES to 146–166 TOPS** — *below* the f16-unpacked variant on every
+  shape, despite halving the weight HBM. Swizzle-on vs `b_swizzle=False` changed throughput by
+  <5 %, so ldmatrix bank conflicts are NOT the cause: the unpack itself (reading the staged
+  packed smem + writing the full int8 tile to smem + the extra barrier) adds smem traffic that
+  exceeds the halved weight-HBM saving. **The kernel is not weight-HBM-bound**, so packing
+  cannot help.
+
+### Why — the FLUSH is the wall (consistent with Finding M's own isolation)
+
+Finding M's ladder already isolated it: plain int8 (no flush) = 490–587 TOPS; the same kernel
+with the per-32-block flush and **compile-time-constant** scales (zero scale data movement) =
+290–402; with real scales via separate tensors + smem staging = 139–196. The 2.5–4× drop from
+plain to per-block is the flush, and it is present in EVERY variant here. The remaining gap from
+the ~196 f16 result to the 290 constant-scale ceiling is the flush's **smem** scale reads + the
+per-element `acc += dsc·da·sumi − dm·sa` accumulate — neither weight packing nor scale embedding
+removes it (both still deliver scales HBM→smem→registers; only compile-time constants, which are
+not a real option, removed the smem round-trip). Halving weight bytes (packing) and halving
+scale bytes (f16) attack HBM streams that are NOT the binding constraint at these prefill shapes.
+
+**MMQ's 208 is a well-tuned implementation of the SAME per-block flush** (stream-K, deep unroll,
+packed load with embedded scales). A 100 %-Mojo per-block kernel matches it to 0.91–0.95× but
+does not clearly beat it, because the flush cost is shared and dominant. The packed-layout
+hypothesis (Finding M's proposed path to >208) is therefore **REFUTED for throughput on Ada**:
+the packed data path removes the wrong costs.
+
+### Portability + correctness
+
+All variants are bit-exact (`max_rel = 0.0`) at 256×512×512, 512×256×1024 and the full-K
+128×256×14336, and use only the sm_80 int8 `m16n8k32` instruction (the plain i8mod PTX assembles
+for `sm_86`/`sm_80`, Findings K/M), so they run natively on the RTX 3090.
+
+### Verdict + decision (task decision rule applied honestly)
+
+- **Correctness: PASS** (bit-exact, MMQ-quality by construction — same q8_1 activation + exact
+  per-32-block flush).
+- **Throughput: FAILS the ">208, clearly beats MMQ" bar.** Best (f16 scales) = 160–197 =
+  0.91–0.95× MMQ; packing weights regresses. **Per the task rule, engine default UNCHANGED
+  (CUDA MMQ on Ada, portable Mojo i8mma on pre-Ada). The CUDA MMQ is NOT retired.** The e2e
+  100 %-Mojo win on Ada remains `FORGE_GEMM=fp8mod` (Finding I); the portable Mojo Q4_K path
+  (per-block int8, now with f16 scales) is a proven-correct, portable, MMQ-parity alternative.
+- **What the flush wall means for retiring the last CUDA kernel:** a like-for-like per-block
+  int8 Q4_K GEMM on Ada is flush-bound and lands at MMQ parity in Mojo — not above — so retiring
+  the CUDA MMQ on THROUGHPUT grounds is not justified by a packed int8 kernel. The remaining
+  routes to a portable default that also goes faster are (a) `fp8mod` where fp8 is native, or
+  (b) a fundamentally cheaper flush (e.g. accumulating in a scale-folded fixed-point form) — a
+  separate kernel-algorithm question, not a data-layout one.
+
+All Finding-N artifacts are scratch (`kernels/mojo/scratch/i8mod/multistage_i8_q4k_f16.mojo`,
+`multistage_i8_q4k_pack.mojo`, `scratch/bench_i8mod_q4k_f16.mojo`, `bench_i8mod_q4k_pack.mojo`);
+nothing committed to the engine.
