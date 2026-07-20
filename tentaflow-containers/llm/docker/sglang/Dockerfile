@@ -12,7 +12,7 @@
 # ustawia SGL_KERNEL_INDEX — bez kompilacji ze zrodel.
 ARG CUDA_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
-ARG SGLANG_VERSION=0.5.13
+ARG SGLANG_VERSION=0.5.15.post1
 # Pusty = zostaw prebuilt sgl-kernel z sglang[all] (Hopper/Blackwell, cu130).
 # Ustawiony (np. https://docs.sglang.ai/whl/cu129/) = force-reinstall prebuilt
 # sgl-kernel z indeksu sglang pod CUDA 12 (Ampere/Ada, sm75+).

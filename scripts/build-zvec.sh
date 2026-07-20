@@ -23,11 +23,9 @@ SYS_CRATE="$ROOT/tentaflow-zvec-sys"
 VENDOR_INCLUDE="$SYS_CRATE/vendor/include/zvec"
 
 ZVEC_REPO="https://github.com/alibaba/zvec"
-# zvec FTS/hybrid-search API (zvec_fts_*, reranker, multi_query) wszedl po tagu
-# v0.4.0 (commit 02bfb31 #408) i nie ma go w zadnym tagu. Wrapper tentaflow-zvec
-# go uzywa, wiec pinujemy konkretny commit main, ktorego c_api.h zgadza sie z
-# zwendorowanym naglowkiem.
-ZVEC_REF="${ZVEC_REF:-f562bdd636d454f18128cb18b41578128d1415a4}"
+# Pin the stable v0.6.0 commit so every native target uses the same C API and
+# reproduces the library paired with the vendored header.
+ZVEC_REF="${ZVEC_REF:-ec8a78ee08b14a0b8c94158ffc1de42cd3f97f6d}"
 PLATFORM="${1:-linux-x86_64}"
 
 SRC_DIR="${ZVEC_SRC_DIR:-/tmp/zvec-build}"
