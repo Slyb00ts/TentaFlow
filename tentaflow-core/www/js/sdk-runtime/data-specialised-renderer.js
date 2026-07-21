@@ -439,7 +439,7 @@ function renderLiveRegion(component, ctx) {
 // -----------------------------------------------------------------------------
 
 const ZONE_EDITOR_TAG = 0x0f01;
-const ZONE_EDITOR_FIELD_KEYS = [0, 1];
+const ZONE_EDITOR_FIELD_KEYS = new Set([0, 1]);
 
 /// Parses the persisted zone shape: `[[[x,y],...], ...]` normalized 0..1.
 /// Anything malformed yields an empty set — the editor then starts blank
@@ -476,17 +476,26 @@ function renderZoneEditor(component, ctx) {
   if (zonesBind == null) throw new TypeError('ZoneEditor.zones_json is required (BindRef)');
   assertBindRef(zonesBind, 'ZoneEditor.zones_json');
 
+  // The drawing box owns its geometry instead of inheriting it from the image:
+  // with no background frame yet (a camera that has not recorded anything) an
+  // image-sized wrapper collapses to zero height and the operator cannot draw at
+  // all. Aspect ratio snaps to the real frame once one loads.
   const wrapper = document.createElement('div');
   wrapper.classList.add('tf-zone-editor');
-  wrapper.style.position = 'relative';
-  wrapper.style.display = 'inline-block';
-  wrapper.style.maxWidth = '100%';
+  Object.assign(wrapper.style, {
+    position: 'relative', display: 'block', width: '100%',
+    aspectRatio: '16 / 9', background: '#111', overflow: 'hidden',
+  });
 
   const img = document.createElement('img');
   img.classList.add('tf-zone-editor__img');
   img.alt = 'Podgląd kamery';
-  img.style.display = 'block';
-  img.style.maxWidth = '100%';
+  // `fill` (not `contain`) keeps normalized zone coordinates aligned with the
+  // box: the box IS the frame, so no letterboxing offset can creep in.
+  Object.assign(img.style, {
+    position: 'absolute', left: '0', top: '0',
+    width: '100%', height: '100%', objectFit: 'fill',
+  });
 
   const canvas = document.createElement('canvas');
   canvas.classList.add('tf-zone-editor__canvas');
@@ -499,8 +508,8 @@ function renderZoneEditor(component, ctx) {
   let current = [];
 
   const draw = () => {
-    const w = img.clientWidth || img.naturalWidth || 0;
-    const h = img.clientHeight || img.naturalHeight || 0;
+    const w = canvas.clientWidth || 0;
+    const h = canvas.clientHeight || 0;
     if (!w || !h) return;
     canvas.width = w; canvas.height = h;
     const g = canvas.getContext('2d');
@@ -540,7 +549,12 @@ function renderZoneEditor(component, ctx) {
   ctx.registerCleanup(subscribeBindRef(imageBind, ctx.store, applyImage));
   ctx.registerCleanup(subscribeBindRef(zonesBind, ctx.store, applyZones));
 
-  const onLoad = () => draw();
+  const onLoad = () => {
+    if (img.naturalWidth && img.naturalHeight) {
+      wrapper.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+    }
+    draw();
+  };
   img.addEventListener('load', onLoad);
   ctx.registerCleanup(() => img.removeEventListener('load', onLoad));
 
