@@ -21625,6 +21625,37 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
     Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
 }
 
+/// Detection zones drawn on one camera, as stored JSON: an array of polygons,
+/// each polygon an array of `[x, y]` points in NORMALIZED frame coordinates
+/// (0.0-1.0). `[]` (or a missing camera row) means "no zones" — the caller then
+/// treats the whole frame as live. Process-wide lookup like
+/// [`camera_analysis_fps`]: the analysis loop is keyed by `camera_id`.
+#[cfg(feature = "camera")]
+pub fn camera_zones_json(pool: &DbPool, camera_id: &str) -> Result<String> {
+    let conn = acquire(pool)?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT zones_json FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.unwrap_or_else(|| "[]".to_string()))
+}
+
+/// Replaces the detection zones of one camera. `zones_json` must already be a
+/// JSON array of polygons in normalized coordinates — validation lives at the
+/// API boundary so a malformed blob never reaches the analysis loop.
+#[cfg(feature = "camera")]
+pub fn set_camera_zones_json(pool: &DbPool, camera_id: &str, zones_json: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    Ok(conn.execute(
+        "UPDATE cameras SET zones_json = ?2, updated_at = datetime('now') \
+         WHERE camera_id = ?1 AND removed_at IS NULL",
+        rusqlite::params![camera_id, zones_json],
+    )?)
+}
+
 /// Identity columns the per-vehicle event recorder stamps onto its catalog
 /// rows: `(owner_addon_id, org_id, retention_class)` of the active LOCAL
 /// camera, or `None` when no such camera exists on this node. Process-wide

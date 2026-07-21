@@ -537,6 +537,12 @@ struct CamSlot {
     /// Last config warning already logged — resolve/parse failures repeat
     /// every recheck, so we warn once per DISTINCT message, not per tick.
     last_cfg_err: Option<String>,
+    /// Detection zones (`cameras.zones_json`), parsed into normalized polygons.
+    /// EMPTY = no zones = whole frame live. Shared with each frame job by
+    /// `Arc` clone so the hot path never re-parses or copies point data.
+    zones: Arc<Vec<Vec<(f32, f32)>>>,
+    /// Raw zones JSON of the parsed value — cheap change detection on recheck.
+    zones_raw: String,
 }
 
 /// Active-camera registry driven by the single engine task. Cameras join via
@@ -571,6 +577,8 @@ pub fn ensure_analysis(camera_id: &str) {
                     stage_due: HashMap::new(),
                     next_cfg_check: now,
                     last_cfg_err: None,
+                    zones: Arc::new(Vec::new()),
+                    zones_raw: String::new(),
                 },
             );
             info!("[vision_analysis] camera {camera_id} registered");
@@ -659,7 +667,9 @@ fn start_engine_once() {
 /// The pipeline result distinguishes "resolved to nothing" (`Ok(None)` — no
 /// pipeline exists at all, camera stops analyzing) from a resolve FAILURE
 /// (`Err` — DB error, keep the last good pipeline).
-async fn resolve_camera_config(camera_id: &str) -> (u32, Result<Option<(String, String)>, String>) {
+async fn resolve_camera_config(
+    camera_id: &str,
+) -> (u32, Result<Option<(String, String)>, String>, String) {
     let id = camera_id.to_string();
     tokio::task::spawn_blocking(move || match crate::db::global_pool() {
         Some(pool) => {
@@ -667,24 +677,102 @@ async fn resolve_camera_config(camera_id: &str) -> (u32, Result<Option<(String, 
                 .unwrap_or(DEFAULT_ANALYSIS_FPS);
             let pipeline = crate::db::repository::resolve_camera_cv_pipeline(&pool, &id)
                 .map_err(|e| e.to_string());
-            (fps, pipeline)
+            // Zones are advisory: a read failure must never stop analysis, it
+            // just means "no zones this tick" (whole frame stays live).
+            let zones = crate::db::repository::camera_zones_json(&pool, &id)
+                .unwrap_or_else(|_| "[]".to_string());
+            (fps, pipeline, zones)
         }
-        None => (DEFAULT_ANALYSIS_FPS, Err("no global DB pool".to_string())),
+        None => (
+            DEFAULT_ANALYSIS_FPS,
+            Err("no global DB pool".to_string()),
+            "[]".to_string(),
+        ),
     })
     .await
     .unwrap_or((
         DEFAULT_ANALYSIS_FPS,
         Err("camera config task panicked".to_string()),
+        "[]".to_string(),
     ))
 }
 
 /// Applies a freshly resolved camera config to the registry slot. Invalid or
 /// unresolvable pipelines never crash: a failure keeps the last good pipeline
 /// (warned once per distinct message), `Ok(None)` clears it (no analysis).
+/// Parses `cameras.zones_json` into normalized polygons. Shape:
+/// `[[[x,y],[x,y],...], ...]` with every coordinate in `0.0..=1.0`. Anything
+/// malformed is skipped rather than failing the camera — a bad zone must never
+/// take analysis down, it just does not constrain it. Polygons with fewer than
+/// three points cannot bound an area and are dropped.
+fn parse_zone_polygons(raw: &str) -> Vec<Vec<(f32, f32)>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(list) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for poly in list {
+        let Some(points) = poly.as_array() else {
+            continue;
+        };
+        let mut pts: Vec<(f32, f32)> = Vec::with_capacity(points.len());
+        for p in points {
+            let Some(pair) = p.as_array() else { continue };
+            if pair.len() < 2 {
+                continue;
+            }
+            let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64()) else {
+                continue;
+            };
+            pts.push((x as f32, y as f32));
+        }
+        if pts.len() >= 3 {
+            out.push(pts);
+        }
+    }
+    out
+}
+
+/// Ray-casting point-in-polygon on normalized coordinates. Points exactly on an
+/// edge may land either way — irrelevant for a hand-drawn operator zone.
+fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Keeps only detections whose box CENTRE falls inside at least one zone. With
+/// no zones every detection passes, so cameras without drawn zones behave
+/// exactly as before. Applied to the raw detector output — an out-of-zone box
+/// never reaches tracking, enrichment (OCR/classify), the overlay or the event
+/// recorder, so a zone also buys back the per-frame budget it excludes.
+fn retain_in_zones(dets: &mut Vec<Detection>, zones: &[Vec<(f32, f32)>]) {
+    if zones.is_empty() {
+        return;
+    }
+    dets.retain(|d| {
+        let cx = d.bbox[0] + d.bbox[2] * 0.5;
+        let cy = d.bbox[1] + d.bbox[3] * 0.5;
+        zones.iter().any(|p| point_in_polygon(cx, cy, p))
+    });
+}
+
 fn apply_camera_config(
     camera_id: &str,
     fps: u32,
     resolved: Result<Option<(String, String)>, String>,
+    zones_raw: String,
     now: std::time::Instant,
 ) {
     let mut reg = cameras().lock().unwrap();
@@ -692,6 +780,17 @@ fn apply_camera_config(
         return;
     };
     slot.fps = fps;
+    // Reparse zones only when the stored JSON actually changed — the recheck
+    // runs on every camera every few seconds.
+    if slot.zones_raw != zones_raw {
+        let parsed = parse_zone_polygons(&zones_raw);
+        info!(
+            "[vision_analysis] camera {camera_id}: {} detection zone(s) active",
+            parsed.len()
+        );
+        slot.zones = Arc::new(parsed);
+        slot.zones_raw = zones_raw;
+    }
     slot.next_cfg_check = now + CFG_RECHECK;
     let warn_changed = |slot: &mut CamSlot, msg: String| {
         if slot.last_cfg_err.as_deref() != Some(msg.as_str()) {
@@ -771,6 +870,10 @@ struct PendingItem {
 /// wiadomość overlay per przeanalizowana klatka.
 struct FrameJob {
     camera_id: String,
+    /// Detection zones of this camera at the moment the frame was queued.
+    /// EMPTY = whole frame live. Snapshotted per job so the hot path never
+    /// touches the camera registry lock.
+    zones: Arc<Vec<Vec<(f32, f32)>>>,
     frame: Arc<[u8]>,
     /// Zero-copy CROPS path ONLY: a DEVICE reference to the full-res NV12 frame.
     /// When `Some`, `frame` is EMPTY and enrichment cuts each detection's crop
@@ -1331,7 +1434,8 @@ async fn engine_loop() {
         // Collect due (camera, frame-stage) pairs + which cameras need a config
         // re-read (no DB under the lock). Also track the soonest upcoming
         // deadline so an idle wait sleeps exactly until the next stage is due.
-        let mut due: Vec<(String, Arc<CvPipeline>, Vec<String>)> = Vec::new();
+        let mut due: Vec<(String, Arc<CvPipeline>, Vec<String>, Arc<Vec<Vec<(f32, f32)>>>)> =
+            Vec::new();
         let mut recheck: Vec<String> = Vec::new();
         let mut earliest_next: Option<std::time::Instant> = None;
         {
@@ -1361,7 +1465,7 @@ async fn engine_loop() {
                     }
                 }
                 if !due_stages.is_empty() {
-                    due.push((id.clone(), pipeline.clone(), due_stages));
+                    due.push((id.clone(), pipeline.clone(), due_stages, slot.zones.clone()));
                 }
             }
         }
@@ -1370,8 +1474,8 @@ async fn engine_loop() {
         // BEFORE the executor gate, so pipelines keep refreshing while the
         // engine waits — the moment the slot arrives, analysis starts instantly.
         for id in &recheck {
-            let (fps, resolved) = resolve_camera_config(id).await;
-            apply_camera_config(id, fps, resolved, now);
+            let (fps, resolved, zones_raw) = resolve_camera_config(id).await;
+            apply_camera_config(id, fps, resolved, zones_raw, now);
         }
 
         // Etapy rozwiązują modele TYLKO przez executor — pusty slot (bootstrap,
@@ -1412,7 +1516,7 @@ async fn engine_loop() {
         // na wlasciwej klatce. Jedna kamera pobiera JEDNĄ klatkę per tick —
         // wszystkie jej due-etapy analizują TĘ SAMĄ klatkę (wspólny FrameJob),
         // więc ich wyniki scala jedna publikacja.
-        for (id, pipeline, due_stages) in &due {
+        for (id, pipeline, due_stages, zones) in &due {
             // Ordering gate: jedna klatka w locie per KAMERA (przez wszystkie
             // etapy). Szybszy etap nie może otworzyć joba dla captured_ms T+1,
             // dopóki wieloetapowy job T jest otwarty — inaczej starszy merge
@@ -1473,6 +1577,7 @@ async fn engine_loop() {
                 job_id,
                 FrameJob {
                     camera_id: id.clone(),
+                    zones: zones.clone(),
                     frame: crops,
                     frame_device: crops_device,
                     w,
@@ -1499,7 +1604,7 @@ async fn engine_loop() {
         // camera-level analysis_fps when the stage does not set one).
         {
             let mut reg = cameras().lock().unwrap();
-            for (id, pipeline, due_stages) in &due {
+            for (id, pipeline, due_stages, _zones) in &due {
                 if let Some(slot) = reg.get_mut(id) {
                     for sid in due_stages {
                         let Some(stage) = pipeline.stages.iter().find(|s| &s.stage_id == sid)
@@ -1861,6 +1966,9 @@ fn stage_completed(
     // track_id (== its vehicle_id for association). Attached to the job; the last
     // detect stage of a multi-stage frame wins (all share the frame).
     if let Some(mut veh) = vehicles {
+        // Zones gate the WHOLE frame: a vehicle outside every drawn zone is not
+        // detected at all — no track, no overlay box, no event, no reads.
+        retain_in_zones(&mut veh, &job.zones);
         if !veh.is_empty() {
             tracker::update(
                 &tracker::key(&job.camera_id, "vehicles"),
@@ -1872,6 +1980,9 @@ fn stage_completed(
     }
     match outcome {
         Some((mut dets, detect_ms)) => {
+            // Same gate for signs/plates: out-of-zone detections never reach the
+            // tracker, enrichment (OCR/classify), the overlay or the recorder.
+            retain_in_zones(&mut dets, &job.zones);
             // Tracker IOU per (kamera, etap detekcji): nadaje stabilne `track_id`
             // + prędkość (vx,vy) KAŻDEJ detekcji przed publikacją, tak by FAZA 1
             // i FAZA 2 niosly juz spojne identyfikatory sledzenia.
@@ -4184,15 +4295,22 @@ mod tests {
         assert!((winner.weight / total - 1.0).abs() < 1e-6, "agreement ~1.0");
     }
 
-    /// (d) A high-COUNT but low-confidence misread must LOSE to a lower-count but
-    /// high-confidence correct read: 4×"M88901"@0.30 vs 2×"WPL5HJ2"@0.95 —
-    /// weight 1.2 vs 1.9, so the correct plate wins and is reported.
+    /// (d) The winner is decided by RAW READ COUNT, never by confidence weight.
+    ///
+    /// This deliberately reverses the original confidence-weighted rule. The
+    /// plate-OCR softmax is near-uniform in production (~0.05) and its per-frame
+    /// noise does not correlate with correctness, so weighting handed the plate
+    /// to a 21-read blur over a 2018-read correct plate on real traffic. Raw
+    /// majority is the robust signal: 4×"M88901" beats 2×"WPL5HJ2" here, and on
+    /// real data the true plate is the one that accumulates the reads.
     #[test]
-    fn ocr_vote_high_conf_beats_high_count_misread() {
+    fn ocr_vote_winner_is_raw_count_not_confidence() {
         let mut votes: Vec<TekstVote> = Vec::new();
         let mut prev: Option<String> = None;
+        // Both variants clear the confidence floor, so this isolates the WINNER
+        // rule from the readability gate: only the read COUNT may decide.
         for _ in 0..4 {
-            prev = ocr_vote(&mut votes, "M88901", 0.30, MC, MA, prev.as_deref()).text;
+            prev = ocr_vote(&mut votes, "M88901", 0.60, MC, MA, prev.as_deref()).text;
         }
         for _ in 0..2 {
             prev = ocr_vote(&mut votes, "WPL5HJ2", 0.95, MC, MA, prev.as_deref()).text;
@@ -4200,8 +4318,8 @@ mod tests {
         let final_outcome = gate_votes(&votes, MC, MA, None);
         assert_eq!(
             final_outcome.text.as_deref(),
-            Some("WPL5HJ2"),
-            "high-confidence correct read must beat a high-count low-confidence misread"
+            Some("M88901"),
+            "most-read variant wins even though the other read scored higher"
         );
     }
 
@@ -4233,9 +4351,47 @@ mod tests {
         }
     }
 
+    /// Zones are a FULL attention gate: with zones drawn, a detection whose box
+    /// centre sits outside every polygon is dropped before tracking/enrichment;
+    /// with no zones nothing is filtered (existing cameras behave as before).
+    #[test]
+    fn zones_gate_detections_by_box_centre() {
+        let det = |x: f32, y: f32| Detection {
+            klasa: "tablica_adr".into(),
+            bbox: [x, y, 0.05, 0.05],
+            score: 0.9,
+            stan: Vec::new(),
+            tekst: None,
+            tekst_conf: None,
+            tekst_thumb_ref: None,
+            track_id: 0,
+            vehicle_id: 0,
+            vx: 0.,
+            vy: 0.,
+        };
+        // Square covering the LEFT half of the frame.
+        let zones = parse_zone_polygons("[[[0.0,0.0],[0.5,0.0],[0.5,1.0],[0.0,1.0]]]");
+        assert_eq!(zones.len(), 1, "one polygon parsed");
+
+        let mut dets = vec![det(0.10, 0.10), det(0.80, 0.10)];
+        retain_in_zones(&mut dets, &zones);
+        assert_eq!(dets.len(), 1, "only the in-zone detection survives");
+        assert!(dets[0].bbox[0] < 0.5);
+
+        // No zones → pass-through (backward compatible).
+        let mut all = vec![det(0.10, 0.10), det(0.80, 0.10)];
+        retain_in_zones(&mut all, &[]);
+        assert_eq!(all.len(), 2, "no zones means no filtering");
+
+        // Malformed / degenerate polygons are ignored, never partially applied.
+        assert!(parse_zone_polygons("nonsense").is_empty());
+        assert!(parse_zone_polygons("[[[0.1,0.1],[0.2,0.2]]]").is_empty(), "2 points is not an area");
+    }
+
     fn make_job(cam: &str, captured: u64, pipeline: &Arc<CvPipeline>, stage: &str) -> FrameJob {
         FrameJob {
             camera_id: cam.to_string(),
+            zones: Arc::new(Vec::new()),
             frame: Arc::from(vec![0u8; 12]),
             frame_device: None,
             w: 2,

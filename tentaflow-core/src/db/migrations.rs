@@ -622,6 +622,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "recordings_search_columns",
             MigrationStep::Rust(recordings_add_search_columns),
         ),
+        (
+            117,
+            "cameras_detection_zones",
+            MigrationStep::Rust(cameras_add_zones_column),
+        ),
     ]
 }
 
@@ -1549,6 +1554,21 @@ fn recordings_add_search_columns(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_recordings_created_at ON recordings(created_at);",
     )?;
+    Ok(())
+}
+
+/// Detection zones drawn on a camera: JSON array of polygons, each polygon a
+/// JSON array of `[x, y]` points in NORMALIZED frame coordinates (0.0-1.0), so
+/// a zone survives any resolution change. Empty array = no zones = the whole
+/// frame stays live (backward compatible for every existing camera).
+///
+/// The vision engine drops every detection whose box centre falls outside ALL
+/// zones BEFORE enrichment — an operator watching a wide scene then spends no
+/// OCR/classify budget on positions they do not care about.
+fn cameras_add_zones_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "zones_json")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN zones_json TEXT NOT NULL DEFAULT '[]';")?;
+    }
     Ok(())
 }
 
