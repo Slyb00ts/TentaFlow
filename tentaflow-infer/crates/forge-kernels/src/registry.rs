@@ -117,15 +117,23 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_q8_0_f16_v2",
     "gemv_q8_0_out_f32_v2",
     "gemv_nvfp4_f16_v2",
+    "gemv_batch_nvfp4_f16_b4",
+    "gemv_batch_nvfp4_f16_b8",
+    "gemv_batch_nvfp4_f16_b16",
+    "gemv_batch_f16_out_f32_b4",
+    "gemv_batch_f16_out_f32_b8",
     "gemv_f16_out_f32_v2",
+    "gemv_fp8_out_f32_v2",
     "gemm_q8_0_f16",
     "gemm_nvfp4_f16",
     "gemm_f16",
     "gemm_q8_0_f16_bm64",
     "gemm_nvfp4_f16_bm64",
+    "gemm_nvfp4_f16_bm32",
     "gemm_f16_bm64",
     "gemm_f16_out_f32",
     "gemm_f16_out_f32_bm64",
+    "gemm_f16_out_f32_bm32",
     "gemm_q8_0_out_f32",
     "gemm_q8_0_out_f32_bm64",
     "kv_append_batch_f16",
@@ -186,6 +194,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_q6k_i8_native_1024_4096_m2048",
     "gemm_q6k_i8_native_1024_4096_m4096",
     "quantize_act_fp8",
+    "pack_nvfp4_fp8",
+    "pack_f16_fp8",
     "gemm_fp8_f16",
     "gemm_fp8_f16_bm64",
     "gemm_fp8_f16_big",
@@ -193,12 +203,16 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_fp8_mod_1024_4096",
     "gemm_fp8_mod_14336_4096",
     "gemm_fp8_mod_4096_14336",
+    "gemm_fp8_mod_11264_4096",
+    "gemm_fp8_mod_4096_11264",
     "attn_decode_split_f16_hd64",
     "attn_decode_split_f16_hd128",
     "attn_decode_split_fp8_hd64",
     "attn_decode_split_fp8_hd128",
     "attn_decode_combine_f16_hd64",
     "attn_decode_combine_f16_hd128",
+    "attn_decode_split_gqa4_f16_hd128",
+    "attn_decode_combine_gqa2_f16_hd128",
     "gemv_norm_q8_0_f16",
     "gemv_norm_nvfp4_f16",
     "gemv_norm_f16",
@@ -423,12 +437,9 @@ impl KernelArtifacts {
     }
 
     fn load_embedded(device: &dyn Device, arch: &str) -> Result<Self> {
-        // The portable Mojo PTX carries `.target sm_80`, so the driver JIT loads
-        // it onto ANY sm_80+ part (RTX 3090 sm_86 through Ada/Hopper) and emits
-        // arch-optimal SASS at load. Only Ada-only kernels (fp8 mma/cvt, NVFP4)
-        // keep `.target sm_89`; they and the nvcc sm_89 cubins are loaded solely
-        // when the device is Ada+ (`fp8_native`), so a pre-Ada GPU starts without
-        // touching an incompatible module.
+        // Przenośny PTX Mojo ma `.target sm_80`, a sterownik JIT kompiluje go
+        // dla bieżącej karty. Moduły z `.target sm_89` wymagają Ada lub nowszej
+        // architektury, natomiast cubiny SASS są ładowane tylko na dokładnym sm_89.
         let ada = device.caps().fp8_native;
         let manifest: Manifest = serde_json::from_str(EMBEDDED_MANIFEST)
             .map_err(|e| ForgeError::Kernel(format!("embedded manifest parse: {e}")))?;
@@ -452,8 +463,9 @@ impl KernelArtifacts {
                 )));
             }
         }
-        // nvcc cubins are sm_89 SASS (no PTX JIT fallback) — load them only on Ada+.
-        if ada {
+        // Cubiny zawierają SASS dla sm_89 bez przenośnego PTX, więc wymagają
+        // dokładnie tej samej architektury. Kerneli Mojo PTX ten warunek nie dotyczy.
+        if arch == "sm_89" {
             Self::load_cuda_cubin(
                 device,
                 EMBEDDED_CUDA_CUBIN_W4A8_SM89,
@@ -493,6 +505,12 @@ impl KernelArtifacts {
         })?;
         let manifest: Manifest = serde_json::from_str(&manifest_src)
             .map_err(|e| ForgeError::Kernel(format!("manifest parse: {e}")))?;
+        if manifest.arch != arch {
+            return Err(ForgeError::Kernel(format!(
+                "manifest architecture {} does not match device {arch}",
+                manifest.arch
+            )));
+        }
         let ada = device.caps().fp8_native;
         let mut handles = HashMap::new();
         for (name, entry) in &manifest.kernels {
@@ -505,7 +523,8 @@ impl KernelArtifacts {
             let module: Module = device.load_module(&ptx)?;
             handles.insert(name.clone(), module.kernel(&entry.entry)?);
         }
-        // nvcc cubins are sm_89 SASS — Ada+ only.
+        // Katalog nadpisujący jest przypisany do konkretnej architektury, więc
+        // umieszczone w nim cubiny mogą być ładowane po walidacji manifestu.
         if ada {
             let w4a8 = std::fs::read(arch_dir.join("w4a8_gemm_cuda.cubin")).map_err(|e| {
                 ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}"))
@@ -527,5 +546,9 @@ impl KernelArtifacts {
         self.handles
             .get(name)
             .ok_or_else(|| ForgeError::Kernel(format!("kernel not loaded: {name}")))
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.handles.contains_key(name)
     }
 }

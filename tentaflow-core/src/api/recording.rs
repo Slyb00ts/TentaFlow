@@ -23,11 +23,6 @@ use crate::db::DbPool;
 use crate::services::recording::recording_base_dir;
 use crate::services::signed_urls::{SignedUrlError, SignedUrlIssuer};
 
-/// Hard cap on the file size we are willing to return in a single response.
-/// Recordings larger than this are treated as integrity errors — F1a does not
-/// stream, so a single oversized blob would block the runtime and bloat memory.
-pub const MAX_RECORDING_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-
 /// Strict reference-format gate. Snapshot refs are `snap_<uuid>`, segment
 /// refs are `clip_<uuid>` — anything else is impossible to reach via the
 /// issuer and would only cost a futile DB SELECT + HMAC verify.
@@ -102,17 +97,18 @@ impl RecordingOutcome {
 }
 
 /// Outcome of the async file-read step performed after `RecordingOutcome::Ok`.
-/// Wire-mapped by the HTTP layer to 200 / 404 / 413 / 500.
+/// Wire-mapped by the HTTP layer to 200 / 206 / 403 / 404 / 500.
 #[derive(Debug)]
 pub enum RecordingFileOutcome {
+    /// Open handle + size — the HTTP layer STREAMS it (optionally a byte range),
+    /// so a multi-GB clip never lands in memory and `<video>` can seek.
     Ok {
-        bytes: Vec<u8>,
+        file: tokio::fs::File,
+        size: u64,
     },
     /// File row exists in DB but the on-disk file is gone — wire-mapped to 404
     /// rather than 500 because the caller's signed URL is now stale.
     FileMissing,
-    /// On-disk file is larger than `MAX_RECORDING_RESPONSE_BYTES`.
-    FileTooLarge,
     /// On-disk file size disagrees with the size recorded in the DB row —
     /// corruption / tampering signal, surfaces as 500 with audit error.
     FileIntegrityError,
@@ -128,7 +124,6 @@ impl RecordingFileOutcome {
         match self {
             Self::Ok { .. } => 200,
             Self::FileMissing => 404,
-            Self::FileTooLarge => 413,
             Self::PathTraversal => 403,
             Self::FileIntegrityError | Self::IoError => 500,
         }
@@ -138,7 +133,6 @@ impl RecordingFileOutcome {
         match self {
             Self::Ok { .. } => "ok",
             Self::FileMissing => "not_found",
-            Self::FileTooLarge => "error",
             Self::PathTraversal => "denied",
             Self::FileIntegrityError | Self::IoError => "error",
         }
@@ -148,7 +142,6 @@ impl RecordingFileOutcome {
         match self {
             Self::Ok { .. } => None,
             Self::FileMissing => Some("file_missing_on_disk".to_string()),
-            Self::FileTooLarge => Some("file_exceeds_response_cap".to_string()),
             Self::FileIntegrityError => Some("file_size_mismatches_db".to_string()),
             Self::PathTraversal => Some("path_outside_recordings_base".to_string()),
             Self::IoError => Some("file_read_failed".to_string()),
@@ -160,13 +153,13 @@ impl RecordingFileOutcome {
             Self::Ok { .. } => "info",
             Self::FileMissing => "warn",
             Self::PathTraversal => "error",
-            Self::FileIntegrityError | Self::FileTooLarge | Self::IoError => "error",
+            Self::FileIntegrityError | Self::IoError => "error",
         }
     }
 
     fn audit_size(&self) -> Option<i64> {
         match self {
-            Self::Ok { bytes } => Some(bytes.len() as i64),
+            Self::Ok { size, .. } => Some(*size as i64),
             _ => None,
         }
     }
@@ -424,13 +417,13 @@ async fn read_recording_file_inner(file_path: &str, expected_size: i64) -> Recor
     match tokio::fs::metadata(&canonical).await {
         Ok(m) => {
             let len = m.len();
-            if len > MAX_RECORDING_RESPONSE_BYTES {
-                RecordingFileOutcome::FileTooLarge
-            } else if expected_size >= 0 && len != expected_size as u64 {
+            // No size cap: the response is STREAMED (optionally a byte range),
+            // so a multi-GB clip costs one chunk of memory, not its full length.
+            if expected_size >= 0 && len != expected_size as u64 {
                 RecordingFileOutcome::FileIntegrityError
             } else {
-                match tokio::fs::read(&canonical).await {
-                    Ok(b) => RecordingFileOutcome::Ok { bytes: b },
+                match tokio::fs::File::open(&canonical).await {
+                    Ok(f) => RecordingFileOutcome::Ok { file: f, size: len },
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         RecordingFileOutcome::FileMissing
                     }
@@ -649,12 +642,14 @@ mod tests {
     #[test]
     fn test_file_outcome_status_codes() {
         assert_eq!(RecordingFileOutcome::FileMissing.http_status(), 404);
-        assert_eq!(RecordingFileOutcome::FileTooLarge.http_status(), 413);
         assert_eq!(RecordingFileOutcome::FileIntegrityError.http_status(), 500);
         assert_eq!(RecordingFileOutcome::IoError.http_status(), 500);
         assert_eq!(RecordingFileOutcome::PathTraversal.http_status(), 403);
+        let f = tokio::fs::File::from_std(
+            std::fs::File::open("/dev/null").expect("open /dev/null"),
+        );
         assert_eq!(
-            RecordingFileOutcome::Ok { bytes: vec![] }.http_status(),
+            RecordingFileOutcome::Ok { file: f, size: 0 }.http_status(),
             200
         );
     }

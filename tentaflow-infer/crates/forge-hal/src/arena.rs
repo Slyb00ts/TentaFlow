@@ -46,6 +46,10 @@ impl BumpArena {
         self.cursor = end;
         Ok(offset)
     }
+
+    pub(crate) fn available(&self) -> usize {
+        self.capacity - self.cursor
+    }
 }
 
 /// Page-granular free-list allocator for the KV cache. Allocations are rounded
@@ -197,7 +201,9 @@ mod tests {
         assert_eq!(a.alloc(1).unwrap(), 0);
         assert_eq!(a.alloc(300).unwrap(), 256);
         // 1 B rounded to 256, 300 B rounded to 512 → cursor at 768.
+        assert_eq!(a.available(), 256);
         assert_eq!(a.alloc(256).unwrap(), 768);
+        assert_eq!(a.available(), 0);
         assert!(matches!(
             a.alloc(512),
             Err(ForgeError::OutOfMemory { .. })

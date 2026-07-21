@@ -5,6 +5,9 @@
 # global scale, so the host passes 1/global_scale).
 
 from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu.sync import barrier
+from std.gpu.memory import AddressSpace
+from std.memory import bitcast, stack_allocation
 from src.reduce import block_reduce_sum
 from src.kv_fp8 import _e4m3x2_to_f16x2
 
@@ -39,6 +42,106 @@ def _f8e4m3(b: UInt8) -> Float32:
     # instruction vs ~15-op generic float8 emulation). 0x7F/0xFF widen to NaN;
     # real NVFP4 block scales never contain them.
     return Float32(_e4m3x2_to_f16x2(b, 0)[0])
+
+
+def pack_nvfp4_fp8(
+    output: UnsafePointer[Int8, MutAnyOrigin],
+    output_scales: UnsafePointer[Float32, MutAnyOrigin],
+    packed: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[UInt8, MutAnyOrigin],
+    n_cols: Int,
+    source_row_offset: Int,
+    n_rows: Int,
+    inv_global_scale: Float32,
+):
+    """Przepakowuje wybrany zakres wierszy NVFP4 do E4M3 z jedną skalą na wiersz."""
+    row = Int(block_idx.x)
+    if row >= n_rows:
+        return
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+    source_row = source_row_offset + row
+    groups = n_cols // GROUP
+    packed_row = source_row * (n_cols // 2)
+    scales_row = source_row * groups
+
+    var local: Float32 = 0.0
+    var c = tid
+    while c < n_cols:
+        byte = packed[packed_row + c // 2]
+        nibble = byte & 0x0F if c % 2 == 0 else (byte >> 4) & 0x0F
+        value = _e2m1(nibble) * _f8e4m3(scales[scales_row + c // GROUP]) * inv_global_scale
+        magnitude = abs(value)
+        if magnitude > local:
+            local = magnitude
+        c += nthreads
+
+    reduction = stack_allocation[256, Float32, address_space = AddressSpace.SHARED]()
+    reduction[tid] = local
+    barrier()
+    var stride = nthreads // 2
+    while stride > 0:
+        if tid < stride and reduction[tid + stride] > reduction[tid]:
+            reduction[tid] = reduction[tid + stride]
+        barrier()
+        stride //= 2
+
+    amax = reduction[0]
+    if tid == 0:
+        output_scales[row] = amax / 448.0 if amax != 0.0 else 0.0
+    inv = 448.0 / amax if amax != 0.0 else 0.0
+    var q = tid
+    while q < n_cols:
+        byte = packed[packed_row + q // 2]
+        nibble = byte & 0x0F if q % 2 == 0 else (byte >> 4) & 0x0F
+        value = _e2m1(nibble) * _f8e4m3(scales[scales_row + q // GROUP]) * inv_global_scale
+        encoded = Scalar[DType.float8_e4m3fn](value * inv)
+        output[row * n_cols + q] = bitcast[DType.int8, 1](encoded)
+        q += nthreads
+
+
+def pack_f16_fp8(
+    output: UnsafePointer[Int8, MutAnyOrigin],
+    output_scales: UnsafePointer[Float32, MutAnyOrigin],
+    source: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Przepakowuje macierz F16 do E4M3 z jedną skalą na wiersz."""
+    row = Int(block_idx.x)
+    if row >= n_rows:
+        return
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+    base = row * n_cols
+
+    var local: Float32 = 0.0
+    var c = tid
+    while c < n_cols:
+        magnitude = abs(Float32(source[base + c]))
+        if magnitude > local:
+            local = magnitude
+        c += nthreads
+
+    reduction = stack_allocation[256, Float32, address_space = AddressSpace.SHARED]()
+    reduction[tid] = local
+    barrier()
+    var stride = nthreads // 2
+    while stride > 0:
+        if tid < stride and reduction[tid + stride] > reduction[tid]:
+            reduction[tid] = reduction[tid + stride]
+        barrier()
+        stride //= 2
+
+    amax = reduction[0]
+    if tid == 0:
+        output_scales[row] = amax / 448.0 if amax != 0.0 else 0.0
+    inv = 448.0 / amax if amax != 0.0 else 0.0
+    var q = tid
+    while q < n_cols:
+        encoded = Scalar[DType.float8_e4m3fn](Float32(source[base + q]) * inv)
+        output[base + q] = bitcast[DType.int8, 1](encoded)
+        q += nthreads
 
 
 def gemv_nvfp4_f16(

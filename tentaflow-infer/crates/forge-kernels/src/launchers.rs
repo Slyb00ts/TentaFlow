@@ -26,6 +26,16 @@ pub const SAMPLE_MAX_VOCAB: usize = 64 * SAMPLE_CHUNK;
 /// (top-k: MAX_SAMPLE_BLOCKS * MAX_TOPK partials; argmax: one per block).
 pub const SAMPLE_SCRATCH_PAIRS: usize = 64 * SAMPLE_MAX_TOPK;
 
+fn checked_buffer_bytes(name: &str, dimensions: &[usize], element_bytes: usize) -> Result<usize> {
+    dimensions.iter().try_fold(element_bytes, |bytes, dimension| {
+        bytes.checked_mul(*dimension).ok_or_else(|| {
+            ForgeError::Kernel(format!(
+                "{name}: przepełnienie rozmiaru bufora dla wymiarów {dimensions:?}"
+            ))
+        })
+    })
+}
+
 pub struct Kernels {
     device: Arc<dyn Device>,
     artifacts: KernelArtifacts,
@@ -51,13 +61,10 @@ pub struct Kernels {
     /// and block-major da/sa scales. Separate layout from `prequant` (padded to
     /// the compile-time token ceiling MPAD, not the real token count).
     q4k_native: Mutex<Q4kNativeScratch>,
-    /// Dense prefill attention backend (f16 hd64/hd128 only; every other shape
-    /// falls through to the scalar kernel). DEFAULT = the portable Mojo
-    /// tensor-core FA (`attn_prefill_fa_mma`, kernels/mojo/src/prefill.mojo) —
-    /// within ~4% of the CUDA cubin, keeps kernels Mojo (ADR-0001) and portable
-    /// to PTX/AMDGPU/Metal. `FORGE_ATTN=fa` (or `cuda`) selects the NVIDIA-only
-    /// cubin (kernels/cuda/fattn_prefill.cu) for max Ada throughput;
-    /// `FORGE_ATTN=scalar` forces the scalar kernel.
+    /// Backend attention dla prefill F16 hd64/hd128. Domyślnie wybiera kernel
+    /// Mojo skompilowany obecnie do PTX; obsługa AMDGPU i Metal wymaga osobnych
+    /// backendów HAL i artefaktów. `FORGE_ATTN=fa` wybiera cubin tylko wtedy,
+    /// gdy jest dostępny dla bieżącej architektury NVIDIA.
     attn: AttnBackend,
 }
 
@@ -164,9 +171,29 @@ impl IqTables {
 }
 
 impl Kernels {
+    pub fn supports_fp8_modular_shape(&self, rows: usize, cols: usize) -> bool {
+        self.artifacts
+            .has(&format!("gemm_fp8_mod_{rows}_{cols}"))
+    }
+
+    pub fn supports_fp8_hybrid_packers(&self) -> bool {
+        self.artifacts.has("pack_nvfp4_fp8") && self.artifacts.has("pack_f16_fp8")
+    }
+
+    pub fn supports_fp8_logits(&self) -> bool {
+        self.artifacts.has("gemv_fp8_out_f32_v2")
+    }
+
+    pub fn supports_attn_decode_gqa4_f16_hd128(&self) -> bool {
+        self.artifacts.has("attn_decode_split_gqa4_f16_hd128")
+            && self.artifacts.has("attn_decode_combine_gqa2_f16_hd128")
+    }
+
     pub fn load(device: Arc<dyn Device>) -> Result<Self> {
         let artifacts = KernelArtifacts::load(device.as_ref())?;
         let iq_tables = IqTables::upload(device.as_ref())?;
+        let cuda_attn_available = artifacts.has("attn_prefill_fa_f16_hd64")
+            && artifacts.has("attn_prefill_fa_f16_hd128");
         Ok(Self {
             device,
             artifacts,
@@ -177,7 +204,7 @@ impl Kernels {
             q4k_native: Mutex::new(Q4kNativeScratch::default()),
             attn: match std::env::var("FORGE_ATTN").ok().as_deref() {
                 Some("scalar") => AttnBackend::Scalar,
-                Some("fa") | Some("cuda") => AttnBackend::Cuda,
+                Some("fa") | Some("cuda") if cuda_attn_available => AttnBackend::Cuda,
                 _ => AttnBackend::Mojo,
             },
         })
@@ -754,6 +781,60 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Logity FP32 z wag E4M3 oraz jednej skali FP32 na wiersz.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_fp8_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        scales: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_fp8_out_f32 wymaga cols % 256 == 0, otrzymano {cols}"
+            )));
+        }
+        let output_bytes = rows.checked_mul(4).ok_or_else(|| {
+            ForgeError::Kernel("gemv_fp8_out_f32: przepełnienie rozmiaru wyjścia".into())
+        })?;
+        let weight_bytes = rows.checked_mul(cols).ok_or_else(|| {
+            ForgeError::Kernel("gemv_fp8_out_f32: przepełnienie rozmiaru wag".into())
+        })?;
+        let input_bytes = cols.checked_mul(2).ok_or_else(|| {
+            ForgeError::Kernel("gemv_fp8_out_f32: przepełnienie rozmiaru wejścia".into())
+        })?;
+        let grid_x = u32::try_from(rows.div_ceil(8)).map_err(|_| {
+            ForgeError::Kernel("gemv_fp8_out_f32: siatka przekracza u32".into())
+        })?;
+        if y_f32.len() < output_bytes
+            || w.len() < weight_bytes
+            || scales.len() < output_bytes
+            || x.len() < input_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "gemv_fp8_out_f32: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let k = self.artifacts.get("gemv_fp8_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(scales)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Logit GEMV over Q8_0 weights (tied embeddings) → f32 logits.
     pub fn gemv_q8_0_out_f32(
         &self,
@@ -1075,6 +1156,16 @@ impl Kernels {
         }
     }
 
+    /// Kafel dla małego batcha NVFP4. BM32 zachowuje ten sam łańcuch MMA,
+    /// ale nie wykonuje pustej drugiej połowy kafla BM64.
+    fn gemm_nvfp4_tile(rows: usize, n_tokens: usize) -> (&'static str, u32, u32) {
+        if (2..=32).contains(&n_tokens) {
+            ("_bm32", 64, 32)
+        } else {
+            Self::gemm_tile(rows, n_tokens)
+        }
+    }
+
     /// Y[t, row] = W·x[t] over Q8_0 weights and row-major f16 activations.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_q8_0_f16(
@@ -1173,15 +1264,40 @@ impl Kernels {
         inv_global_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        if !cols.is_multiple_of(16) {
+        if rows == 0 || cols < 16 || !cols.is_multiple_of(16) || n_tokens == 0 {
             return Err(ForgeError::Kernel(format!(
-                "gemm_nvfp4 requires cols % 16 == 0, got {cols}"
+                "gemm_nvfp4 requires rows > 0, cols >= 16, cols % 16 == 0 and n_tokens > 0, got rows={rows}, cols={cols}, n_tokens={n_tokens}"
             )));
         }
-        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
-        let k = self.artifacts.get(&format!("gemm_nvfp4_f16{suffix}"))?;
+        let (kernel_name, block, bm) = if (2..=4).contains(&n_tokens)
+            && self.artifacts.has("gemv_batch_nvfp4_f16_b4")
+        {
+            ("gemv_batch_nvfp4_f16_b4".to_string(), 256, n_tokens as u32)
+        } else if (5..=8).contains(&n_tokens)
+            && self.artifacts.has("gemv_batch_nvfp4_f16_b8")
+        {
+            ("gemv_batch_nvfp4_f16_b8".to_string(), 256, n_tokens as u32)
+        } else if (9..=16).contains(&n_tokens)
+            && self.artifacts.has("gemv_batch_nvfp4_f16_b16")
+        {
+            ("gemv_batch_nvfp4_f16_b16".to_string(), 256, n_tokens as u32)
+        } else {
+            let (mut suffix, mut block, mut bm) = Self::gemm_nvfp4_tile(rows, n_tokens);
+            if !self
+                .artifacts
+                .has(&format!("gemm_nvfp4_f16{suffix}"))
+            {
+                (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+            }
+            (format!("gemm_nvfp4_f16{suffix}"), block, bm)
+        };
+        let k = self.artifacts.get(&kernel_name)?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: if kernel_name.starts_with("gemv_batch_") {
+                ((rows as u32).div_ceil(8), 1, 1)
+            } else {
+                ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1)
+            },
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1267,15 +1383,32 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if !cols.is_multiple_of(8) {
+        if rows == 0 || cols < 8 || !cols.is_multiple_of(8) || n_tokens == 0 {
             return Err(ForgeError::Kernel(format!(
-                "gemm_f16_out_f32 requires cols % 8 == 0, got {cols}"
+                "gemm_f16_out_f32 requires rows > 0, cols >= 8, cols % 8 == 0 and n_tokens > 0, got rows={rows}, cols={cols}, n_tokens={n_tokens}"
             )));
         }
-        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
-        let k = self.artifacts.get(&format!("gemm_f16_out_f32{suffix}"))?;
+        let (kernel_name, block, bm) = if (2..=4).contains(&n_tokens)
+            && self.artifacts.has("gemv_batch_f16_out_f32_b4")
+        {
+            ("gemv_batch_f16_out_f32_b4".to_string(), 256, n_tokens as u32)
+        } else if (5..=8).contains(&n_tokens)
+            && self.artifacts.has("gemv_batch_f16_out_f32_b8")
+        {
+            ("gemv_batch_f16_out_f32_b8".to_string(), 256, n_tokens as u32)
+        } else if n_tokens <= 32 && self.artifacts.has("gemm_f16_out_f32_bm32") {
+            ("gemm_f16_out_f32_bm32".to_string(), 64, 32)
+        } else {
+            let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+            (format!("gemm_f16_out_f32{suffix}"), block, bm)
+        };
+        let k = self.artifacts.get(&kernel_name)?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: if kernel_name.starts_with("gemv_batch_") {
+                ((rows as u32).div_ceil(8), 1, 1)
+            } else {
+                ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1)
+            },
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -2341,6 +2474,120 @@ impl Kernels {
         self.device.launch(gk, &cfg, &args, stream)
     }
 
+    /// Przepakowuje zakres wierszy rezydentnej macierzy NVFP4 do E4M3 na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_nvfp4_fp8(
+        &self,
+        output: &DevBuffer,
+        output_scales: &DevBuffer,
+        packed: &DevBuffer,
+        scales: &DevBuffer,
+        cols: usize,
+        source_row_offset: usize,
+        rows: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 16 || !cols.is_multiple_of(16) {
+            return Err(ForgeError::Kernel(format!(
+                "pack_nvfp4_fp8 wymaga rows > 0 oraz cols >= 16 podzielnego przez 16, otrzymano [{rows}, {cols}]"
+            )));
+        }
+        let source_end = source_row_offset.checked_add(rows).ok_or_else(|| {
+            ForgeError::Kernel("pack_nvfp4_fp8: przepełnienie zakresu wierszy".into())
+        })?;
+        let output_bytes = rows.checked_mul(cols).ok_or_else(|| {
+            ForgeError::Kernel("pack_nvfp4_fp8: przepełnienie rozmiaru wyjścia".into())
+        })?;
+        let packed_bytes = source_end.checked_mul(cols / 2).ok_or_else(|| {
+            ForgeError::Kernel("pack_nvfp4_fp8: przepełnienie rozmiaru packed".into())
+        })?;
+        let scale_bytes = source_end.checked_mul(cols / 16).ok_or_else(|| {
+            ForgeError::Kernel("pack_nvfp4_fp8: przepełnienie rozmiaru scales".into())
+        })?;
+        let output_scale_bytes = rows.checked_mul(4).ok_or_else(|| {
+            ForgeError::Kernel("pack_nvfp4_fp8: przepełnienie rozmiaru skal wyjściowych".into())
+        })?;
+        let grid_x = u32::try_from(rows).map_err(|_| {
+            ForgeError::Kernel("pack_nvfp4_fp8: siatka przekracza u32".into())
+        })?;
+        if output.len() < output_bytes
+            || output_scales.len() < output_scale_bytes
+            || packed.len() < packed_bytes
+            || scales.len() < scale_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "pack_nvfp4_fp8: bufor jest mniejszy od żądanego zakresu".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("pack_nvfp4_fp8")?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(output_scales)
+            .buf(packed)
+            .buf(scales)
+            .scalar(cols as i64)
+            .scalar(source_row_offset as i64)
+            .scalar(rows as i64)
+            .scalar(inv_global_scale);
+        self.device.launch(kernel, &cfg, &args, stream)
+    }
+
+    /// Przepakowuje rezydentną macierz F16 do E4M3 na GPU.
+    pub fn pack_f16_fp8(
+        &self,
+        output: &DevBuffer,
+        output_scales: &DevBuffer,
+        source: &DevBuffer,
+        cols: usize,
+        rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols == 0 {
+            return Err(ForgeError::Kernel(
+                "pack_f16_fp8 wymaga niezerowego kształtu".into(),
+            ));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(|| {
+            ForgeError::Kernel("pack_f16_fp8: przepełnienie rozmiaru".into())
+        })?;
+        let source_bytes = elements.checked_mul(2).ok_or_else(|| {
+            ForgeError::Kernel("pack_f16_fp8: przepełnienie rozmiaru źródła".into())
+        })?;
+        let scale_bytes = rows.checked_mul(4).ok_or_else(|| {
+            ForgeError::Kernel("pack_f16_fp8: przepełnienie rozmiaru skal".into())
+        })?;
+        let grid_x = u32::try_from(rows).map_err(|_| {
+            ForgeError::Kernel("pack_f16_fp8: siatka przekracza u32".into())
+        })?;
+        if output.len() < elements
+            || output_scales.len() < scale_bytes
+            || source.len() < source_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "pack_f16_fp8: bufor jest mniejszy od żądanego kształtu".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("pack_f16_fp8")?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(output_scales)
+            .buf(source)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(kernel, &cfg, &args, stream)
+    }
+
     /// Per-token e4m3 activation quant + Modular's multistage cp.async fp8 GEMM
     /// (one kernel per (rows,cols); docs/CODEGEN_PROOF.md Finding G). Same fp8
     /// weight pack + activation quant as `gemm_fp8`, but the GEMM is the deeply
@@ -2949,8 +3196,8 @@ impl Kernels {
         let k = self.artifacts.get("gemv_norm_nvfp4_f16")?;
         let rpw = Self::fused_rows_per_warp(rows);
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
-            block: (BLOCK, 1, 1),
+            grid: ((rows as u32).div_ceil(16 * rpw as u32), 1, 1),
+            block: (512, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -3135,14 +3382,10 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 16, "gemv_norm_silu_nvfp4")?;
         let k = self.artifacts.get("gemv_norm_silu_nvfp4_f16")?;
-        // The NVFP4 gate|up dot is register-heavier than the Q4_K path, so the
-        // rows/warp sweet spot is lower: measured best at 3 on the Bielik
-        // inter=11264 shape (vs fused_rows_per_warp -> 5). This is scoped to
-        // the NVFP4 silu launcher, so Q4_K's inter=14336 rpw=7 is untouched.
         let rpw = 3usize;
         let cfg = LaunchConfig {
-            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
-            block: (BLOCK, 1, 1),
+            grid: ((inter as u32).div_ceil(16 * rpw as u32), 1, 1),
+            block: (512, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -3550,6 +3793,160 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Split attention F16 dla GQA 4:1, współdzielący odczyt K/V między głowicami Q.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_split_gqa4_f16_hd128(
+        &self,
+        parts: &DevBuffer,
+        q_in: &DevBuffer,
+        q_byte_off: usize,
+        k_in: &DevBuffer,
+        k_byte_off: usize,
+        v_in: &DevBuffer,
+        v_byte_off: usize,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        seq_lens: &DevBuffer,
+        positions: &DevBuffer,
+        n_seqs: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        max_pages: usize,
+        n_splits: usize,
+        eps: f32,
+        theta_base: f32,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let expected_q_heads = n_kv_heads.checked_mul(4).ok_or_else(|| {
+            ForgeError::Kernel("attn_decode_split_gqa4: liczba głowic przekracza zakres".into())
+        })?;
+        if n_seqs == 0
+            || n_q_heads == 0
+            || n_kv_heads == 0
+            || n_q_heads != expected_q_heads
+            || page_size == 0
+            || max_pages == 0
+            || n_splits == 0
+        {
+            return Err(ForgeError::Kernel(format!(
+                "attn_decode_split_gqa4 wymaga niezerowych wymiarów i GQA 4:1, otrzymano seqs={n_seqs}, heads={n_q_heads}:{n_kv_heads}, page={page_size}, max_pages={max_pages}, splits={n_splits}"
+            )));
+        }
+        if !q_byte_off.is_multiple_of(2)
+            || !k_byte_off.is_multiple_of(2)
+            || !v_byte_off.is_multiple_of(2)
+        {
+            return Err(ForgeError::Kernel(
+                "attn_decode_split_gqa4 wymaga offsetów wyrównanych do F16".into(),
+            ));
+        }
+        let parts_bytes = checked_buffer_bytes(
+            "attn_decode_split_gqa4 parts",
+            &[n_seqs, n_q_heads, n_splits, 130],
+            4,
+        )?;
+        let q_bytes = checked_buffer_bytes(
+            "attn_decode_split_gqa4 q",
+            &[n_seqs, n_q_heads, 128],
+            2,
+        )?;
+        let kv_bytes = checked_buffer_bytes(
+            "attn_decode_split_gqa4 kv",
+            &[n_seqs, n_kv_heads, 128],
+            2,
+        )?;
+        let cache_page_bytes = checked_buffer_bytes(
+            "attn_decode_split_gqa4 cache",
+            &[n_kv_heads, page_size, 128],
+            2,
+        )?;
+        let page_table_bytes = checked_buffer_bytes(
+            "attn_decode_split_gqa4 page_table",
+            &[n_seqs, max_pages],
+            4,
+        )?;
+        let metadata_bytes = checked_buffer_bytes("attn_decode_split_gqa4 metadata", &[n_seqs], 4)?;
+        let q_end = q_byte_off.checked_add(q_bytes).ok_or_else(|| {
+            ForgeError::Kernel("attn_decode_split_gqa4: przepełnienie zakresu Q".into())
+        })?;
+        let k_end = k_byte_off.checked_add(kv_bytes).ok_or_else(|| {
+            ForgeError::Kernel("attn_decode_split_gqa4: przepełnienie zakresu K".into())
+        })?;
+        let v_end = v_byte_off.checked_add(kv_bytes).ok_or_else(|| {
+            ForgeError::Kernel("attn_decode_split_gqa4: przepełnienie zakresu V".into())
+        })?;
+        if parts.len() < parts_bytes
+            || q_in.len() < q_end
+            || k_in.len() < k_end
+            || v_in.len() < v_end
+            || k_cache.len() < cache_page_bytes
+            || v_cache.len() < cache_page_bytes
+            || page_table.len() < page_table_bytes
+            || seq_lens.len() < metadata_bytes
+            || positions.len() < metadata_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "attn_decode_split_gqa4: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let grid_x = u32::try_from(n_seqs).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: n_seqs przekracza zakres siatki".into())
+        })?;
+        let grid_y = u32::try_from(n_kv_heads).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: n_kv_heads przekracza zakres siatki".into())
+        })?;
+        let grid_z = u32::try_from(n_splits).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: n_splits przekracza zakres siatki".into())
+        })?;
+        let n_q_heads_i64 = i64::try_from(n_q_heads).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: n_q_heads przekracza ABI Mojo".into())
+        })?;
+        let n_kv_heads_i64 = i64::try_from(n_kv_heads).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: n_kv_heads przekracza ABI Mojo".into())
+        })?;
+        let page_size_i64 = i64::try_from(page_size).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: page_size przekracza ABI Mojo".into())
+        })?;
+        let max_pages_i64 = i64::try_from(max_pages).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: max_pages przekracza ABI Mojo".into())
+        })?;
+        let n_splits_i64 = i64::try_from(n_splits).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: n_splits przekracza ABI Mojo".into())
+        })?;
+        let k = self.artifacts.get("attn_decode_split_gqa4_f16_hd128")?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, grid_y, grid_z),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(parts)
+            .buf_at(q_in, q_byte_off)?
+            .buf_at(k_in, k_byte_off)?
+            .buf_at(v_in, v_byte_off)?
+            .buf(q_in)
+            .buf(k_in)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .buf(seq_lens)
+            .buf(positions)
+            .scalar(n_q_heads_i64)
+            .scalar(n_kv_heads_i64)
+            .scalar(page_size_i64)
+            .scalar(max_pages_i64)
+            .scalar(n_splits_i64)
+            .scalar(0i64)
+            .scalar(0i64)
+            .scalar(eps)
+            .scalar(theta_base)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Merge attn_decode_split_f16 partials into the final [n_seqs,
     /// n_q_heads, head_dim] f16 output (one warp per head, split order).
     #[allow(clippy::too_many_arguments)]
@@ -3583,6 +3980,62 @@ impl Kernels {
             .buf(parts)
             .scalar(n_q_heads as i64)
             .scalar(n_splits as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Laczy partiale GQA hd128, przetwarzajac dwie glowice Q w jednym CTA.
+    pub fn attn_decode_combine_gqa2_f16_hd128(
+        &self,
+        out: &DevBuffer,
+        parts: &DevBuffer,
+        n_seqs: usize,
+        n_q_heads: usize,
+        n_splits: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n_seqs == 0 || n_q_heads == 0 || n_splits == 0 {
+            return Err(ForgeError::Kernel(
+                "attn_decode_combine_gqa2 wymaga niezerowych wymiarów".into(),
+            ));
+        }
+        let out_bytes = checked_buffer_bytes(
+            "attn_decode_combine_gqa2 out",
+            &[n_seqs, n_q_heads, 128],
+            2,
+        )?;
+        let parts_bytes = checked_buffer_bytes(
+            "attn_decode_combine_gqa2 parts",
+            &[n_seqs, n_q_heads, n_splits, 130],
+            4,
+        )?;
+        if out.len() < out_bytes || parts.len() < parts_bytes {
+            return Err(ForgeError::Kernel(
+                "attn_decode_combine_gqa2: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let grid_x = u32::try_from(n_seqs).map_err(|_| {
+            ForgeError::Kernel("attn_decode_combine_gqa2: n_seqs przekracza zakres siatki".into())
+        })?;
+        let grid_y = u32::try_from(n_q_heads.div_ceil(2)).map_err(|_| {
+            ForgeError::Kernel("attn_decode_combine_gqa2: n_q_heads przekracza zakres siatki".into())
+        })?;
+        let n_q_heads_i64 = i64::try_from(n_q_heads).map_err(|_| {
+            ForgeError::Kernel("attn_decode_combine_gqa2: n_q_heads przekracza ABI Mojo".into())
+        })?;
+        let n_splits_i64 = i64::try_from(n_splits).map_err(|_| {
+            ForgeError::Kernel("attn_decode_combine_gqa2: n_splits przekracza ABI Mojo".into())
+        })?;
+        let k = self.artifacts.get("attn_decode_combine_gqa2_f16_hd128")?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(parts)
+            .scalar(n_q_heads_i64)
+            .scalar(n_splits_i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 

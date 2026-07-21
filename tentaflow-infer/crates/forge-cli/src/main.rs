@@ -1075,7 +1075,7 @@ fn cmd_serve(
         tracing::info!("speculative decoding enabled; prefix cache disabled");
     }
     let t0 = Instant::now();
-    let (loaded, kv_pages, max_seq_len) = load_for_serve(
+    let (mut loaded, kv_pages, max_seq_len) = load_for_serve(
         model_path,
         kv_pages,
         weights_pool_gb,
@@ -1085,6 +1085,7 @@ fn cmd_serve(
         hot_pages,
         prefix_cache,
     )?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -1374,6 +1375,21 @@ fn maybe_calibrate_w4a8(
     tokenizer: &forge_tokenize::Tokenizer,
 ) -> Result<()> {
     let gemm = std::env::var("FORGE_GEMM").ok();
+    if gemm.as_deref() == Some("fp8mod-ffn") {
+        if !path.is_dir() {
+            bail!("FORGE_GEMM=fp8mod-ffn wymaga katalogu checkpointu NVFP4");
+        }
+        let t0 = Instant::now();
+        if model.build_fp8_ffn()? {
+            eprintln!(
+                "paczki FP8 Q/O/FFN/lm_head zbudowane na GPU w {:.3}s (K/V i warstwy decode pozostają NVFP4)",
+                t0.elapsed().as_secs_f32()
+            );
+        } else {
+            eprintln!("fp8mod-ffn niedostępny dla urządzenia, kształtów lub puli VRAM; pozostaje NVFP4");
+        }
+        return Ok(());
+    }
     if matches!(gemm.as_deref(), Some("fp8") | Some("fp8mod")) {
         if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
             bail!("FORGE_GEMM={} currently supports GGUF models only", gemm.unwrap());

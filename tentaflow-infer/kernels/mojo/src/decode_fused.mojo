@@ -598,8 +598,9 @@ def gemv_norm_nvfp4_f16(
     barrier()
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP
+    rows_per_block = Int(block_dim.x) // WARP
     for i in range(rows_per_warp):
-        row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
+        row = (Int(block_idx.x) * rows_per_warp + i) * rows_per_block + wid
         if row < n_rows:
             total = _dot_nvfp4(packed, scales, row, xs, lut, n_cols, lane, inv_global_scale)
             if lane == 0:
@@ -753,8 +754,9 @@ def gemv_norm_silu_nvfp4_f16(
     barrier()
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP
+    rows_per_block = Int(block_dim.x) // WARP
     for i in range(rows_per_warp):
-        row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
+        row = (Int(block_idx.x) * rows_per_warp + i) * rows_per_block + wid
         if row < inter:
             gu = _dot2_nvfp4(
                 packed, scales, row, inter + row, xs, lut, n_cols, lane, inv_global_scale
@@ -762,6 +764,8 @@ def gemv_norm_silu_nvfp4_f16(
             if lane == 0:
                 g = Float32(Float16(gu[0]))
                 act[row] = Float16(g / (1.0 + exp(-g)) * Float32(Float16(gu[1])))
+
+
 
 
 def gemv_norm_silu_q4_k_f16(
@@ -3162,4 +3166,3 @@ def gemv_residual_iq1_m_f16(
         v = Float32(h_io[row]) + Float32(Float16(total))
         h_io[row] = Float16(v)
         h32[row] = v
-

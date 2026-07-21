@@ -625,6 +625,14 @@ impl Device for CudaDevice {
         })))
     }
 
+    fn pool_available(&self, pool: Pool) -> Option<usize> {
+        let arena = self.pool(pool).arena.lock().expect("pool arena poisoned");
+        match &*arena {
+            PoolArena::Bump(bump) => Some(bump.available()),
+            _ => None,
+        }
+    }
+
     fn create_stream(&self) -> Result<Stream> {
         let stream = self
             .ctx

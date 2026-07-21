@@ -12,6 +12,25 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-20.
 
+- 🟡 **NVFP4 Bielik: hybrydowy prefill FP8 i GQA decode w Mojo
+  (2026-07-20).** Opcjonalne `FORGE_GEMM=fp8mod-ffn` przepakowuje na GPU
+  projekcje Q/O/gate/up/down z rezydentnych wag NVFP4 do FP8, a `lm_head` z F16
+  do FP8 dla pojedynczego strumienia; K/V i źródłowe wagi decode pozostają NVFP4.
+  Pakowanie całego modelu trwa około 49 ms i jest wykonywane raz przy ładowaniu.
+  Małe batche mają wyspecjalizowane Mojo GEMV B4/B8/B16 oraz GEMM BM32. Decode
+  modelu GQA 4:1, `head_dim=128`, KV F16 i bez Q/K norm współdzieli odczyt K/V
+  dla czterech głowic Q, a `combine2` łączy dwie głowice na CTA. Routing sprawdza
+  możliwości urządzenia, artefakty, kształty i dostępny VRAM przed alokacją;
+  w przeciwnym razie atomowo pozostaje na NVFP4. Golden GPU **49/49**, kanoniczny
+  prompt PASS, jakość `NLL=1,15248`, `PPL=3,1660` wobec baseline
+  `1,15260`/`3,1664`. Końcowy pomiar RTX 4090 pp4096: FORGE
+  **10 302,7 tok/s** wobec vLLM 0.25.1 **9 732,9** (**+5,85%**); decode FORGE
+  **143,100** wobec **146,372 tok/s** (**-2,24%**, cel nadal niespełniony).
+  Większe splity attention, BK64, RPB24 i prototyp Marlin były NO-GO po pomiarze.
+  `llama.cpp` nie obsługuje bezpośrednio badanego checkpointu compressed-tensors
+  NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
+  także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
+
 - ✅ **NATIVE-LAYOUT Mojo int8 Q6_K prefill GEMM (down-proj + attn_v) —
   ODZYSKANIE REGRESJI PREFILL (2026-07-20).** Po wycofaniu CUDA MMQ (100 % Mojo)
   prefill Q4_K spadł ~2× (5742 tok/s = 0.51× dawnego MMQ 11151), bo Q6_K

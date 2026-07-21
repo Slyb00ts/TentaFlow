@@ -7740,7 +7740,7 @@ fn recordings_search_input(label: &str, placeholder: &str, field: &str) -> Compo
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
-        tentaflow_sdk_spec::EventKind::Input,
+        tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
             action_id: "recordings-search-change".into(),
             params,
@@ -7786,7 +7786,7 @@ fn recordings_date_input(label: &str, field: &str) -> Component {
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
-        tentaflow_sdk_spec::EventKind::Input,
+        tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
             action_id: "recordings-search-change".into(),
             params,

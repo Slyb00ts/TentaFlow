@@ -27,6 +27,70 @@ use tracing::{debug, error, info, warn};
 type SseStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send>>;
 pub type DashboardBody = Either<Full<Bytes>, StreamBody<SseStream>>;
 
+/// Chunk size for streamed file bodies (recordings). Matches the model-bundle
+/// downloader so one slow client costs one chunk of memory, not a whole clip.
+const FILE_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Parses a single `Range: bytes=<start>-<end>` header against a known size and
+/// returns the INCLUSIVE byte range. `<video>` sends this to seek a multi-GB
+/// clip without downloading it whole. Multi-range, malformed and unsatisfiable
+/// specs return `None` — the caller then serves the full body (200), which is a
+/// valid HTTP response to any Range request.
+fn parse_byte_range(raw: Option<&str>, size: u64) -> Option<(u64, u64)> {
+    let spec = raw?.strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None; // multi-range: not worth the complexity, serve whole
+    }
+    let (from, to) = spec.split_once('-')?;
+    let (start, end) = if from.is_empty() {
+        // Suffix form `-N`: the LAST n bytes.
+        let n: u64 = to.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (size.saturating_sub(n), size.checked_sub(1)?)
+    } else {
+        let start: u64 = from.parse().ok()?;
+        let end = if to.is_empty() {
+            size.checked_sub(1)?
+        } else {
+            to.parse::<u64>().ok()?.min(size.checked_sub(1)?)
+        };
+        (start, end)
+    };
+    if start > end || start >= size {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Streams at most `limit` bytes from an already-positioned file handle. Unlike
+/// the model-bundle `file_stream` (which runs to EOF) this stops at the end of
+/// the requested range, so a 206 body matches its `Content-Length` exactly.
+fn ranged_file_stream(
+    file: tokio::fs::File,
+    limit: u64,
+) -> impl Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send {
+    futures::stream::unfold((Some(file), limit), |(state, remaining)| async move {
+        let mut file = state?;
+        if remaining == 0 {
+            return None;
+        }
+        use tokio::io::AsyncReadExt;
+        let want = remaining.min(FILE_STREAM_CHUNK_BYTES as u64) as usize;
+        let mut buf = vec![0u8; want];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                let left = remaining - n as u64;
+                Some((Ok(Frame::data(Bytes::from(buf))), (Some(file), left)))
+            }
+            Err(e) => Some((Err(e), (None, 0))),
+        }
+    })
+}
+
 /// Serwer HTTP dashboardu z JWT auth
 pub struct DashboardServer {
     db: DbPool,
@@ -1573,6 +1637,14 @@ pub async fn handle_request(
         {
             return Ok(resp);
         }
+        // Capture Range BEFORE `req` is released — the streamed response below
+        // needs it, and `size` (required to resolve the range) is only known
+        // after the file is opened.
+        let range_header = req
+            .headers()
+            .get(hyper::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         drop(req);
         let path_ref = path.strip_prefix("/recordings/").unwrap_or("");
         let q = match parse_query(&query_string) {
@@ -1615,15 +1687,44 @@ pub async fn handle_request(
                 .await;
                 let status = file_outcome.http_status();
                 return match file_outcome {
-                    RecordingFileOutcome::Ok { bytes } => Ok(apply_signed_url_security_headers(
-                        Response::builder()
-                            .status(status)
+                    RecordingFileOutcome::Ok { mut file, size } => {
+                        // STREAMED, never slurped: a clip can be gigabytes. `<video>`
+                        // seeks via Range — without 206 + Content-Range the browser
+                        // abandons the source and reports a bare "Format error".
+                        let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
+                            Some((s, e)) => (206u16, s, e - s + 1),
+                            None => (200u16, 0, size),
+                        };
+                        if start > 0 {
+                            use tokio::io::AsyncSeekExt;
+                            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                                return Ok(Response::builder()
+                                    .status(500)
+                                    .header("Content-Type", "application/json")
+                                    .body(Either::Left(Full::new(Bytes::from_static(
+                                        b"{\"error\":\"recording_unavailable\"}",
+                                    ))))
+                                    .unwrap());
+                            }
+                        }
+                        let stream: SseStream = Box::pin(ranged_file_stream(file, length));
+                        let mut builder = Response::builder()
+                            .status(code)
                             .header("Content-Type", content_type)
+                            .header("Accept-Ranges", "bytes")
+                            .header("Content-Length", length.to_string())
                             .header("X-Recording-Hash", hash_sha256)
-                            .header("X-Recording-Created-At", created_at.to_string()),
-                    )
-                    .body(Either::Left(Full::new(Bytes::from(bytes))))
-                    .unwrap()),
+                            .header("X-Recording-Created-At", created_at.to_string());
+                        if code == 206 {
+                            builder = builder.header(
+                                "Content-Range",
+                                format!("bytes {}-{}/{}", start, start + length - 1, size),
+                            );
+                        }
+                        Ok(apply_signed_url_security_headers(builder)
+                            .body(Either::Right(StreamBody::new(stream)))
+                            .unwrap())
+                    }
                     _ => Ok(Response::builder()
                         .status(status)
                         .header("Content-Type", "application/json")

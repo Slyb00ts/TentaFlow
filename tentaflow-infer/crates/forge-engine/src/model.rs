@@ -13,7 +13,7 @@ use std::sync::Arc;
 use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
 use forge_formats::PoolingType;
 use forge_kernels::Kernels;
-use forge_types::{ForgeError, MemKind, Result};
+use forge_types::{ForgeError, MemKind, Result, Vendor};
 use half::f16;
 
 use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
@@ -78,6 +78,7 @@ pub const MAX_SPEC_DRAFT: usize = 16;
 /// 0.087 (Bielik NVFP4) / 0.042 (Qwen3 Q8_0) with the argmax identical at
 /// every step. 1 reproduces the unsplit arithmetic bit-exactly.
 const ATTN_DECODE_SPLITS: usize = 8;
+const ATTN_DECODE_GQA_SPLITS: usize = 32;
 
 /// Coarse per-phase wall-clock attribution for `prefill_chunk`, enabled by
 /// FORGE_PREFILL_TRACE=1. Every probe synchronizes the device, so absolute
@@ -670,6 +671,14 @@ impl Model {
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
         let inter = p.intermediate_size;
+        let attn_parts_bytes = p
+            .n_heads
+            .checked_mul(ATTN_DECODE_GQA_SPLITS)
+            .and_then(|elements| elements.checked_mul(p.head_dim.checked_add(2)?))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| {
+                ForgeError::Format("przepełnienie bufora partiali attention GQA".into())
+            })?;
         // Persistent decode scratch lives in the activation pool: it is the
         // pool provisioned for exactly this purpose, and nothing else uses it
         // on the LLM path anymore (the ring never needs to wrap).
@@ -683,11 +692,7 @@ impl Model {
             k: alloc(kv_dim)?,
             v: alloc(kv_dim)?,
             attn_out: alloc(q_dim)?,
-            attn_parts: device.alloc(
-                p.n_heads * ATTN_DECODE_SPLITS * (p.head_dim + 2) * 4,
-                MemKind::Device,
-                Pool::Activations,
-            )?,
+            attn_parts: device.alloc(attn_parts_bytes, MemKind::Device, Pool::Activations)?,
             o_out: alloc(hidden)?,
             gate_up: alloc(2 * inter)?,
             gate: alloc(inter)?,
@@ -1562,6 +1567,17 @@ impl Model {
     }
 
     fn logits_gemv(&self, y_f32: &DevBuffer, x: &DevBuffer, stream: &Stream) -> Result<()> {
+        if let Some(weight) = &self.weights.fp8_lm_head {
+            return self.kernels.gemv_fp8_out_f32(
+                y_f32,
+                &weight.qweight,
+                &weight.scales,
+                x,
+                weight.rows,
+                weight.cols,
+                stream,
+            );
+        }
         match &self.weights.lm_head {
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
@@ -2186,6 +2202,9 @@ impl Model {
         // shared-activation reuse can be re-added on top of the native kernel later.
         let fp8mod_fuse =
             self.weights.fp8.is_some() && self.weights.fp8_modular && calib.is_none();
+        let fp8mod_ffn_fuse = self.weights.fp8_ffn.is_some()
+            && self.weights.fp8_modular
+            && calib.is_none();
 
         let mut trace = PrefillTrace::new();
         trace.start(self.device.as_ref());
@@ -2216,6 +2235,7 @@ impl Model {
             // loaded for decode + the logit head.
             let w4a8_layer = self.weights.w4a8.as_ref().map(|v| &v[l]);
             let fp8_layer = self.weights.fp8.as_ref().map(|v| &v[l]);
+            let fp8_ffn_layer = self.weights.fp8_ffn.as_ref().map(|v| &v[l]);
 
             // Calibration capture 1/4: q/k/v input (attn-norm output).
             if let Some(cal) = calib.as_mut() {
@@ -2242,6 +2262,22 @@ impl Model {
                     self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
                     self.gemm_fp8(&pb.k, &fl.k, &pb.x, t, stream)?;
                     self.gemm_fp8(&pb.v, &fl.v, &pb.x, t, stream)?;
+                }
+            } else if let Some(fl) = fp8_ffn_layer {
+                self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
+                match &layer.attn().attn_qkv {
+                    QkvWeights::Fused(w) => {
+                        self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
+                    }
+                    QkvWeights::FusedQk { qk, v } => {
+                        self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                    }
+                    QkvWeights::Split { k, v, .. } => {
+                        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                    }
                 }
             } else {
                 match &layer.attn().attn_qkv {
@@ -2437,11 +2473,14 @@ impl Model {
                 self.gemm_w4a8(&pb.o_out, &wl.attn_o, &pb.attn_out, t, stream)?;
             } else if let Some(fl) = fp8_layer {
                 self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, t, stream)?;
+            } else if let Some(fl) = fp8_ffn_layer {
+                self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, t, stream)?;
             } else {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
             }
             trace.mark(self.device.as_ref(), "gemm_o");
-            let fp8mod_fuse_gateup = fp8mod_fuse && matches!(layer.ffn, LayerFfn::Dense(_));
+            let fp8mod_fuse_gateup = (fp8mod_fuse || fp8mod_ffn_fuse)
+                && matches!(layer.ffn, LayerFfn::Dense(_));
             if fp8mod_fuse_gateup {
                 kernels.rmsnorm_residual_fp8_shared(
                     &pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream,
@@ -2470,6 +2509,9 @@ impl Model {
                             self.gemm_fp8(&pb.gate, &fl.gate, &pb.x, t, stream)?;
                             self.gemm_fp8(&pb.up, &fl.up, &pb.x, t, stream)?;
                         }
+                    } else if let Some(fl) = fp8_ffn_layer {
+                        self.gemm_fp8_prequant(&pb.gate, &fl.gate, t, stream)?;
+                        self.gemm_fp8_prequant(&pb.up, &fl.up, t, stream)?;
                     } else {
                         match &dffn.gate_up {
                             GateUpWeights::Fused(w) => {
@@ -2493,6 +2535,8 @@ impl Model {
                     if let Some(wl) = w4a8_layer {
                         self.gemm_w4a8(&pb.down, &wl.down, &pb.act, t, stream)?;
                     } else if let Some(fl) = fp8_layer {
+                        self.gemm_fp8(&pb.down, &fl.down, &pb.act, t, stream)?;
+                    } else if let Some(fl) = fp8_ffn_layer {
                         self.gemm_fp8(&pb.down, &fl.down, &pb.act, t, stream)?;
                     } else {
                         self.gemm(&pb.down, &dffn.down, &pb.act, t, stream)?;
@@ -2625,6 +2669,271 @@ impl Model {
         self.weights.fp8 = Some(layers);
         self.weights.fp8_modular = crate::weights::fp8_modular_enabled();
         Ok(())
+    }
+
+    fn pack_nvfp4_rows(
+        &self,
+        weight: &DevWeight,
+        row_offset: usize,
+        rows: usize,
+    ) -> Result<Fp8Weight> {
+        let DevWeight::NvFp4 {
+            packed,
+            scales,
+            inv_global_scale,
+            rows: source_rows,
+            cols,
+        } = weight
+        else {
+            return Err(ForgeError::Unsupported(
+                "fp8mod-ffn wymaga rezydentnych wag NVFP4".into(),
+            ));
+        };
+        let row_end = row_offset.checked_add(rows).ok_or_else(|| {
+            ForgeError::Format("przepełnienie zakresu wierszy FP8".into())
+        })?;
+        if row_end > *source_rows {
+            return Err(ForgeError::Format(format!(
+                "zakres wierszy FP8 {}..{} przekracza {source_rows}",
+                row_offset,
+                row_end
+            )));
+        }
+        let weight_bytes = rows.checked_mul(*cols).ok_or_else(|| {
+            ForgeError::OutOfMemory {
+                requested: usize::MAX,
+                available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+            }
+        })?;
+        let scale_bytes = rows.checked_mul(4).ok_or_else(|| {
+            ForgeError::OutOfMemory {
+                requested: usize::MAX,
+                available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+            }
+        })?;
+        let qweight = self
+            .device
+            .alloc(weight_bytes, MemKind::Device, Pool::Weights)?;
+        let output_scales = self
+            .device
+            .alloc(scale_bytes, MemKind::Device, Pool::Weights)?;
+        self.kernels.pack_nvfp4_fp8(
+            &qweight,
+            &output_scales,
+            packed,
+            scales,
+            *cols,
+            row_offset,
+            rows,
+            *inv_global_scale,
+            &self.stream,
+        )?;
+        Ok(Fp8Weight {
+            qweight,
+            scales: output_scales,
+            rows,
+            cols: *cols,
+        })
+    }
+
+    fn pack_f16_weight(&self, weight: &DevWeight) -> Result<Fp8Weight> {
+        let DevWeight::F16 { buf, rows, cols } = weight else {
+            return Err(ForgeError::Unsupported(
+                "przepakowanie lm_head FP8 wymaga źródła F16".into(),
+            ));
+        };
+        let weight_bytes = rows.checked_mul(*cols).ok_or_else(|| {
+            ForgeError::OutOfMemory {
+                requested: usize::MAX,
+                available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+            }
+        })?;
+        let scale_bytes = rows.checked_mul(4).ok_or_else(|| {
+            ForgeError::OutOfMemory {
+                requested: usize::MAX,
+                available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+            }
+        })?;
+        let qweight = self
+            .device
+            .alloc(weight_bytes, MemKind::Device, Pool::Weights)?;
+        let scales = self
+            .device
+            .alloc(scale_bytes, MemKind::Device, Pool::Weights)?;
+        self.kernels
+            .pack_f16_fp8(&qweight, &scales, buf, *cols, *rows, &self.stream)?;
+        Ok(Fp8Weight {
+            qweight,
+            scales,
+            rows: *rows,
+            cols: *cols,
+        })
+    }
+
+    fn fp8_pack_allocation_bytes(rows: usize, cols: usize) -> Option<usize> {
+        let weight = rows
+            .checked_mul(cols)?
+            .max(1)
+            .checked_next_multiple_of(256)?;
+        let scales = rows
+            .checked_mul(4)?
+            .max(1)
+            .checked_next_multiple_of(256)?;
+        weight.checked_add(scales)
+    }
+
+    fn preflight_nvfp4_pack(
+        &self,
+        weight: &DevWeight,
+        row_offset: usize,
+        rows: usize,
+    ) -> Option<usize> {
+        let DevWeight::NvFp4 {
+            rows: source_rows,
+            cols,
+            ..
+        } = weight
+        else {
+            return None;
+        };
+        let row_end = row_offset.checked_add(rows)?;
+        if rows == 0
+            || row_end > *source_rows
+            || !cols.is_multiple_of(16)
+            || !self.kernels.supports_fp8_modular_shape(rows, *cols)
+        {
+            return None;
+        }
+        Self::fp8_pack_allocation_bytes(rows, *cols)
+    }
+
+    /// Buduje na GPU opt-in paczki FP8 dla Q/O oraz projekcji FFN checkpointu NVFP4.
+    pub fn build_fp8_ffn(&mut self) -> Result<bool> {
+        if self.weights.fp8_ffn.is_some() {
+            return Ok(true);
+        }
+        if !self.device.caps().fp8_native
+            || !self.kernels.supports_fp8_hybrid_packers()
+            || !self.kernels.supports_fp8_logits()
+        {
+            return Ok(false);
+        }
+        if self.is_hybrid() || self.weights.is_moe() {
+            return Ok(false);
+        }
+        let mut required_bytes = 0usize;
+        let mut add_required = |bytes: Option<usize>| -> Option<()> {
+            required_bytes = required_bytes.checked_add(bytes?)?;
+            Some(())
+        };
+        let params = &self.weights.descriptor.params;
+        let Some(q_rows) = params.n_heads.checked_mul(params.head_dim) else {
+            return Ok(false);
+        };
+        for layer in &self.weights.layers {
+            let q_source = match &layer.attn().attn_qkv {
+                QkvWeights::Fused(weight) | QkvWeights::FusedQk { qk: weight, .. } => weight,
+                QkvWeights::Split { q, .. } => q,
+            };
+            if add_required(self.preflight_nvfp4_pack(q_source, 0, q_rows)).is_none()
+                || add_required(self.preflight_nvfp4_pack(
+                    &layer.attn().attn_o,
+                    0,
+                    layer.attn().attn_o.rows(),
+                ))
+                .is_none()
+            {
+                return Ok(false);
+            }
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return Ok(false);
+            };
+            match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    if weight.rows() % 2 != 0 {
+                        return Ok(false);
+                    }
+                    let rows = weight.rows() / 2;
+                    if add_required(self.preflight_nvfp4_pack(weight, 0, rows)).is_none()
+                        || add_required(self.preflight_nvfp4_pack(weight, rows, rows)).is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+                GateUpWeights::Split { gate, up } => {
+                    if add_required(self.preflight_nvfp4_pack(gate, 0, gate.rows())).is_none()
+                        || add_required(self.preflight_nvfp4_pack(up, 0, up.rows())).is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            if add_required(self.preflight_nvfp4_pack(&ffn.down, 0, ffn.down.rows())).is_none() {
+                return Ok(false);
+            }
+        }
+        let fp8_head_supported = match &self.weights.lm_head {
+            DevWeight::F16 { rows, cols, .. } => {
+                if !cols.is_multiple_of(256) {
+                    false
+                } else if add_required(Self::fp8_pack_allocation_bytes(*rows, *cols)).is_none() {
+                    return Ok(false);
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+        let Some(available) = self.device.pool_available(Pool::Weights) else {
+            return Ok(false);
+        };
+        if required_bytes > available {
+            return Ok(false);
+        }
+
+        self.device.synchronize()?;
+        self.weights.fp8_lm_head = None;
+        let mut layers = Vec::with_capacity(self.weights.layers.len());
+        for layer in &self.weights.layers {
+            let q = match &layer.attn().attn_qkv {
+                QkvWeights::Fused(weight) | QkvWeights::FusedQk { qk: weight, .. } => {
+                    self.pack_nvfp4_rows(weight, 0, q_rows)?
+                }
+                QkvWeights::Split { q, .. } => self.pack_nvfp4_rows(q, 0, q.rows())?,
+            };
+            let attn_o = self.pack_nvfp4_rows(&layer.attn().attn_o, 0, layer.attn().attn_o.rows())?;
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                unreachable!("modele MoE zostały odrzucone przed przepakowaniem")
+            };
+            let (gate, up) = match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    let rows = weight.rows() / 2;
+                    (
+                        self.pack_nvfp4_rows(weight, 0, rows)?,
+                        self.pack_nvfp4_rows(weight, rows, rows)?,
+                    )
+                }
+                GateUpWeights::Split { gate, up } => (
+                    self.pack_nvfp4_rows(gate, 0, gate.rows())?,
+                    self.pack_nvfp4_rows(up, 0, up.rows())?,
+                ),
+            };
+            let down = self.pack_nvfp4_rows(&ffn.down, 0, ffn.down.rows())?;
+            layers.push(crate::weights::Fp8FfnLayer { q, attn_o, gate, up, down });
+        }
+        let fp8_lm_head = match (&self.weights.lm_head, fp8_head_supported) {
+            (DevWeight::F16 { .. }, true) => Some(self.pack_f16_weight(&self.weights.lm_head)?),
+            _ => None,
+        };
+        self.stream.synchronize()?;
+        self.weights.fp8_lm_head = fp8_lm_head;
+        self.weights.fp8_ffn = Some(layers);
+        self.weights.fp8_modular = crate::weights::fp8_ffn_modular_enabled();
+        self.decode_graph = None;
+        self.decode_moe_graph = None;
+        self.decode_rot_graph = None;
+        self.batch_graphs.clear();
+        Ok(true)
     }
 
     /// Mean next-token negative log-likelihood over `tokens` (natural log),
@@ -4606,36 +4915,40 @@ impl Model {
                     (&b.q, 0usize, &b.k, 0usize, &b.v, 0usize)
                 }
             };
+            let gqa_q_heads = p.n_kv_heads.checked_mul(4);
+            let use_gqa = std::env::var("FORGE_ATTN_GQA").ok().as_deref() != Some("0")
+                && self.device.caps().vendor == Vendor::Nvidia
+                && kernels.supports_attn_decode_gqa4_f16_hd128()
+                && self.kv.cfg.dtype() == forge_types::DType::F16
+                && p.head_dim == 128
+                && gqa_q_heads == Some(p.n_heads)
+                && layer.attn().q_norm.is_none()
+                && layer.attn().k_norm.is_none();
+            let attn_splits = if use_gqa {
+                ATTN_DECODE_GQA_SPLITS
+            } else {
+                ATTN_DECODE_SPLITS
+            };
             match &src {
                 AttnSrc::Paged => {
-                    kernels.attn_decode_split(
-                        &b.attn_parts,
-                        q_buf,
-                        q_off,
-                        k_buf,
-                        k_off,
-                        v_buf,
-                        v_off,
-                        layer.attn().q_norm.as_ref(),
-                        layer.attn().k_norm.as_ref(),
-                        &self.kv.k[l],
-                        &self.kv.v[l],
-                        &self.page_table_dev,
-                        &self.seq_len_dev,
-                        &b.pos,
-                        1,
-                        p.n_heads,
-                        p.n_kv_heads,
-                        p.head_dim,
-                        self.kv.cfg.page_size,
-                        self.max_pages_per_seq,
-                        ATTN_DECODE_SPLITS,
-                        self.kv.cfg.dtype(),
-                        eps,
-                        p.rope_theta,
-                        scale,
-                        stream,
-                    )?;
+                    if use_gqa {
+                        kernels.attn_decode_split_gqa4_f16_hd128(
+                            &b.attn_parts, q_buf, q_off, k_buf, k_off, v_buf, v_off,
+                            &self.kv.k[l], &self.kv.v[l], &self.page_table_dev,
+                            &self.seq_len_dev, &b.pos, 1, p.n_heads, p.n_kv_heads,
+                            self.kv.cfg.page_size, self.max_pages_per_seq, attn_splits,
+                            eps, p.rope_theta, scale, stream,
+                        )?;
+                    } else {
+                        kernels.attn_decode_split(
+                            &b.attn_parts, q_buf, q_off, k_buf, k_off, v_buf, v_off,
+                            layer.attn().q_norm.as_ref(), layer.attn().k_norm.as_ref(),
+                            &self.kv.k[l], &self.kv.v[l], &self.page_table_dev,
+                            &self.seq_len_dev, &b.pos, 1, p.n_heads, p.n_kv_heads,
+                            p.head_dim, self.kv.cfg.page_size, self.max_pages_per_seq,
+                            attn_splits, self.kv.cfg.dtype(), eps, p.rope_theta, scale, stream,
+                        )?;
+                    }
                 }
                 AttnSrc::Staged(seq) => {
                     let tier = self.tier.as_ref().expect("staged attention requires tiering");
@@ -4651,45 +4964,46 @@ impl Model {
                         self.device.record_event(&tb.slots[ns].ready, xfer)?;
                     }
                     self.device.wait_event(stream, &tb.slots[s].ready)?;
-                    kernels.attn_decode_split(
-                        &b.attn_parts,
-                        q_buf,
-                        q_off,
-                        k_buf,
-                        k_off,
-                        v_buf,
-                        v_off,
-                        layer.attn().q_norm.as_ref(),
-                        layer.attn().k_norm.as_ref(),
-                        &tb.slots[s].stage[0],
-                        &tb.slots[s].stage[1],
-                        &tb.identity_pt,
-                        &self.seq_len_dev,
-                        &b.pos,
-                        1,
-                        p.n_heads,
-                        p.n_kv_heads,
-                        p.head_dim,
-                        self.kv.cfg.page_size,
-                        self.max_pages_per_seq,
-                        ATTN_DECODE_SPLITS,
-                        self.kv.cfg.dtype(),
-                        eps,
-                        p.rope_theta,
-                        scale,
-                        stream,
-                    )?;
+                    if use_gqa {
+                        kernels.attn_decode_split_gqa4_f16_hd128(
+                            &b.attn_parts, q_buf, q_off, k_buf, k_off, v_buf, v_off,
+                            &tb.slots[s].stage[0], &tb.slots[s].stage[1], &tb.identity_pt,
+                            &self.seq_len_dev, &b.pos, 1, p.n_heads, p.n_kv_heads,
+                            self.kv.cfg.page_size, self.max_pages_per_seq, attn_splits,
+                            eps, p.rope_theta, scale, stream,
+                        )?;
+                    } else {
+                        kernels.attn_decode_split(
+                            &b.attn_parts, q_buf, q_off, k_buf, k_off, v_buf, v_off,
+                            layer.attn().q_norm.as_ref(), layer.attn().k_norm.as_ref(),
+                            &tb.slots[s].stage[0], &tb.slots[s].stage[1], &tb.identity_pt,
+                            &self.seq_len_dev, &b.pos, 1, p.n_heads, p.n_kv_heads,
+                            p.head_dim, self.kv.cfg.page_size, self.max_pages_per_seq,
+                            attn_splits, self.kv.cfg.dtype(), eps, p.rope_theta, scale, stream,
+                        )?;
+                    }
                 }
             }
-            kernels.attn_decode_combine_f16(
-                &b.attn_out,
-                &b.attn_parts,
-                1,
-                p.n_heads,
-                p.head_dim,
-                ATTN_DECODE_SPLITS,
-                stream,
-            )?;
+            if use_gqa {
+                kernels.attn_decode_combine_gqa2_f16_hd128(
+                    &b.attn_out,
+                    &b.attn_parts,
+                    1,
+                    p.n_heads,
+                    attn_splits,
+                    stream,
+                )?;
+            } else {
+                kernels.attn_decode_combine_f16(
+                    &b.attn_out,
+                    &b.attn_parts,
+                    1,
+                    p.n_heads,
+                    p.head_dim,
+                    attn_splits,
+                    stream,
+                )?;
+            }
             if let AttnSrc::Staged(seq) = &src {
                 // The kernel appended this token's rope'd K/V into the staging
                 // tail page; mirror that page back into the canonical paged
@@ -4729,9 +5043,9 @@ impl Model {
         self.logits_gemv(&b.logits, &b.x, stream)
     }
 
-    /// Batched logit head: y[b, vocab] f32 = lm_head · x[b, hidden]. The head
-    /// is always f16 or Q8_0 (NVFP4 heads are materialized as f16 at load), so
-    /// the two batched f32-output GEMMs cover every model.
+    /// Batched logit head: y[b, vocab] f32 = lm_head · x[b, hidden].
+    /// Dodatkowa paczka FP8 obsługuje tylko single-stream GEMV; batching świadomie
+    /// pozostaje na bazowym F16/Q8_0, aby nie zmieniać jego sprawdzonego GEMM.
     fn logits_gemm(&self, y_f32: &DevBuffer, x: &DevBuffer, n_tokens: usize, stream: &Stream) -> Result<()> {
         match &self.weights.lm_head {
             DevWeight::F16 { buf, rows, cols } => self

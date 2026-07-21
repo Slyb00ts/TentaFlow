@@ -25,19 +25,21 @@ from src.deltanet import (
     deltanet_log_decay_f32,
     deltanet_beta_sigmoid_f32,
 )
-from src.nvfp4 import gemv_nvfp4_f16
+from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8
+from src.nvfp4_batch import gemv_batch_nvfp4_f16_b4, gemv_batch_nvfp4_f16_b8, gemv_batch_nvfp4_f16_b16, gemv_batch_f16_out_f32_b4, gemv_batch_f16_out_f32_b8
 from src.misc import gather_rows_f16, gemv_f16_out_f32, gemv_q8_0_out_f32
 from src.layernorm import layernorm_f16, layernorm_residual_f16
 from src.conv import gelu_f16, conv1d_k3_f16
 from src.attn_full import attn_full_f16_hd64, attn_full_f16_hd128
 from src.gemv import gemv_f16_bias
 from src.kv_append import kv_append_f16
-from src.gemv2 import gemv_q8_0_f16_v2, gemv_q8_0_out_f32_v2, gemv_nvfp4_f16_v2, gemv_f16_out_f32_v2
+from src.gemv2 import gemv_q8_0_f16_v2, gemv_q8_0_out_f32_v2, gemv_nvfp4_f16_v2, gemv_f16_out_f32_v2, gemv_fp8_out_f32_v2
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
 from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
 from src.gemm import gemm_q8_0_f16_bm64, gemm_nvfp4_f16_bm64, gemm_f16_bm64
 from src.gemm import gemm_f16_out_f32, gemm_f16_out_f32_bm64
+from src.gemm import gemm_nvfp4_f16_bm32, gemm_f16_out_f32_bm32
 from src.gemm import gemm_q8_0_out_f32, gemm_q8_0_out_f32_bm64
 from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import gemm_q8_0_i8mma, gemm_q8_0_i8mma_bm64, gemm_q8_0_i8mma_big
@@ -49,6 +51,8 @@ from src.gemm_fp8_modular import (
     gemm_fp8_mod_1024_4096,
     gemm_fp8_mod_14336_4096,
     gemm_fp8_mod_4096_14336,
+    gemm_fp8_mod_11264_4096,
+    gemm_fp8_mod_4096_11264,
 )
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.gemm_q4k_i8_multistage import (
@@ -84,6 +88,8 @@ from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
 from src.attention import attn_decode_split_fp8_hd64, attn_decode_split_fp8_hd128
 from src.attention import attn_decode_combine_f16_hd64, attn_decode_combine_f16_hd128
+from src.attention_gqa import attn_decode_split_gqa4_f16_hd128
+from src.attention_gqa_combine import attn_decode_combine_gqa2_f16_hd128
 from src.decode_fused import gemv_norm_q8_0_f16, gemv_norm_nvfp4_f16, gemv_norm_f16
 from src.decode_fused import gemv_norm_silu_q8_0_f16, gemv_norm_silu_nvfp4_f16, gemv_norm_silu_f16
 from src.decode_fused import gemv_residual_q8_0_f16, gemv_residual_nvfp4_f16, gemv_residual_f16
@@ -319,6 +325,10 @@ def main() raises:
 
     _ = ctx.compile_function[gemv_nvfp4_f16, dump_asm=Path("gemv_nvfp4_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_f16"))
+    _ = ctx.compile_function[pack_nvfp4_fp8, dump_asm=Path("pack_nvfp4_fp8.ptx")]()
+    entries.append(_finalize(out_dir, "pack_nvfp4_fp8"))
+    _ = ctx.compile_function[pack_f16_fp8, dump_asm=Path("pack_f16_fp8.ptx")]()
+    entries.append(_finalize(out_dir, "pack_f16_fp8"))
 
     _ = ctx.compile_function[gather_rows_f16, dump_asm=Path("gather_rows_f16.ptx")]()
     entries.append(_finalize(out_dir, "gather_rows_f16"))
@@ -362,8 +372,26 @@ def main() raises:
     _ = ctx.compile_function[gemv_nvfp4_f16_v2, dump_asm=Path("gemv_nvfp4_f16_v2.ptx")]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_f16_v2"))
 
+    _ = ctx.compile_function[gemv_batch_nvfp4_f16_b4, dump_asm=Path("gemv_batch_nvfp4_f16_b4.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_batch_nvfp4_f16_b4"))
+
+    _ = ctx.compile_function[gemv_batch_nvfp4_f16_b8, dump_asm=Path("gemv_batch_nvfp4_f16_b8.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_batch_nvfp4_f16_b8"))
+
+    _ = ctx.compile_function[gemv_batch_nvfp4_f16_b16, dump_asm=Path("gemv_batch_nvfp4_f16_b16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_batch_nvfp4_f16_b16"))
+
+    _ = ctx.compile_function[gemv_batch_f16_out_f32_b4, dump_asm=Path("gemv_batch_f16_out_f32_b4.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_batch_f16_out_f32_b4"))
+
+    _ = ctx.compile_function[gemv_batch_f16_out_f32_b8, dump_asm=Path("gemv_batch_f16_out_f32_b8.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_batch_f16_out_f32_b8"))
+
     _ = ctx.compile_function[gemv_f16_out_f32_v2, dump_asm=Path("gemv_f16_out_f32_v2.ptx")]()
     entries.append(_finalize(out_dir, "gemv_f16_out_f32_v2"))
+
+    _ = ctx.compile_function[gemv_fp8_out_f32_v2, dump_asm=Path("gemv_fp8_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_fp8_out_f32_v2"))
 
     _ = ctx.compile_function[gemm_q8_0_f16, dump_asm=Path("gemm_q8_0_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_f16"))
@@ -380,6 +408,9 @@ def main() raises:
     _ = ctx.compile_function[gemm_nvfp4_f16_bm64, dump_asm=Path("gemm_nvfp4_f16_bm64.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_f16_bm64"))
 
+    _ = ctx.compile_function[gemm_nvfp4_f16_bm32, dump_asm=Path("gemm_nvfp4_f16_bm32.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_f16_bm32"))
+
     _ = ctx.compile_function[gemm_f16_bm64, dump_asm=Path("gemm_f16_bm64.ptx")]()
     entries.append(_finalize(out_dir, "gemm_f16_bm64"))
 
@@ -388,6 +419,9 @@ def main() raises:
 
     _ = ctx.compile_function[gemm_f16_out_f32_bm64, dump_asm=Path("gemm_f16_out_f32_bm64.ptx")]()
     entries.append(_finalize(out_dir, "gemm_f16_out_f32_bm64"))
+
+    _ = ctx.compile_function[gemm_f16_out_f32_bm32, dump_asm=Path("gemm_f16_out_f32_bm32.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_f16_out_f32_bm32"))
 
     _ = ctx.compile_function[gemm_q8_0_out_f32, dump_asm=Path("gemm_q8_0_out_f32.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_out_f32"))
@@ -475,6 +509,12 @@ def main() raises:
 
     _ = ctx.compile_function[attn_decode_combine_f16_hd128, dump_asm=Path("attn_decode_combine_f16_hd128.ptx")]()
     entries.append(_finalize(out_dir, "attn_decode_combine_f16_hd128"))
+
+    _ = ctx.compile_function[attn_decode_split_gqa4_f16_hd128, dump_asm=Path("attn_decode_split_gqa4_f16_hd128.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_split_gqa4_f16_hd128"))
+
+    _ = ctx.compile_function[attn_decode_combine_gqa2_f16_hd128, dump_asm=Path("attn_decode_combine_gqa2_f16_hd128.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_combine_gqa2_f16_hd128"))
 
     _ = ctx.compile_function[gemv_norm_q8_0_f16, dump_asm=Path("gemv_norm_q8_0_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_norm_q8_0_f16"))
@@ -1075,6 +1115,12 @@ def main() raises:
 
     _ = ctx.compile_function[gemm_fp8_mod_4096_14336, dump_asm=Path("gemm_fp8_mod_4096_14336.ptx")]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_14336"))
+
+    _ = ctx.compile_function[gemm_fp8_mod_11264_4096, dump_asm=Path("gemm_fp8_mod_11264_4096.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_11264_4096"))
+
+    _ = ctx.compile_function[gemm_fp8_mod_4096_11264, dump_asm=Path("gemm_fp8_mod_4096_11264.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_11264"))
 
     _ = ctx.compile_function[gemm_q4k_i8_native_4096_4096_m128, dump_asm=Path("gemm_q4k_i8_native_4096_4096_m128.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_4096_m128"))
