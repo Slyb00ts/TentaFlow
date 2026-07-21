@@ -2810,7 +2810,7 @@ pub fn camera_zones_set_v1(
     let org = caller.data().org_id.clone();
     // Writing zones changes what the analysis engine sees, so require ownership
     // rather than the read grant that `camera_zones_get_v1` accepts.
-    match get_camera_for_addon(&db, &input.camera_id, &addon_id, org.as_deref()) {
+    match get_camera_for_addon(&db, &addon_id, &input.camera_id, org.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(
