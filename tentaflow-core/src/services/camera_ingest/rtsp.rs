@@ -233,6 +233,30 @@ fn degrade_ingest_path(p: IngestPath) -> IngestPath {
     }
 }
 
+/// True when a pre-first-frame pipeline failure came from the RTSP SOURCE
+/// (network / transport / auth) rather than from caps negotiation of the
+/// GPU (CUDA / NVDEC) branch.
+///
+/// The degrade ladders below fire on "died before the first frame", which is the
+/// right signal for a broken hardware chain — but a flaky camera fails the same
+/// way, and degrading on that permanently walks a perfectly healthy GPU pipeline
+/// down to CPU colour-convert and finally CPU decode (4K H.264 on cores), where
+/// it stays until the process restarts. Real negotiation faults still surface as
+/// `not-negotiated` / caps errors and MUST keep degrading, so this matches only
+/// the unambiguous source-side failures.
+fn is_transport_failure(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("gstrtspsrc.c")
+        || r.contains("could not setup transport")
+        || r.contains("could not get/set settings from/on resource")
+        || r.contains("could not read from resource")
+        || r.contains("could not open resource")
+        || r.contains("could not receive message")
+        || r.contains("could not connect")
+        || r.contains("could not resolve")
+        || r.contains("unauthorized")
+}
+
 /// Rozstrzyga, czy NA STARCIE próbować dekodowania sprzętowego dla tej kamery.
 /// `decoder_override` z konfiguracji ma pierwszeństwo nad auto-detekcją:
 ///   * `Some(Software)` → wymuś CPU (nigdy nie próbuj HW),
@@ -3305,7 +3329,7 @@ pub async fn run_rtsp_session(
         // tej samej wadliwej gałęzi). Detekcja dalej działa (CPU resize).
         // Gdy klatki już poszły (`online`), to awaria sieciowa — zostawiamy
         // GPU-resize włączone.
-        if gpu_resize && !online {
+        if gpu_resize && !online && !is_transport_failure(&reason) {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
@@ -3328,6 +3352,7 @@ pub async fn run_rtsp_session(
             ingest_path,
             IngestPath::GpuResidentNvidia | IngestPath::NvdecNv12 | IngestPath::NvdecCpuConvert
         ) && !online
+            && !is_transport_failure(&reason)
         {
             let next = degrade_ingest_path(ingest_path);
             tracing::warn!(
@@ -3351,7 +3376,7 @@ pub async fn run_rtsp_session(
         // do limitu prób), żeby kamera zadziałała zamiast wpaść w pętlę
         // reconnectów. Jeśli HW zdążyło dać klatki (`online`), traktujemy
         // awarię jako sieciową i zostajemy na HW.
-        if use_hw_decode && !online {
+        if use_hw_decode && !online && !is_transport_failure(&reason) {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
