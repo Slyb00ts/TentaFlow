@@ -84,6 +84,15 @@ display_name = "Qwen 3.5 9B (MLX 4-bit)"
 repo = "mlx-community/Qwen3.5-9B-MLX-4bit"
 quantization = "int4"
 
+# Bonsai 27B uses PrismML's binary g128 kernels in the pinned mlx-swift fork.
+# The 5.13 GB MLX package runs on Apple Silicon without expanding to FP16.
+[[model_preset]]
+id = "bonsai-27b-mlx-1bit"
+display_name = "Bonsai 27B (MLX 1-bit)"
+repo = "prism-ml/Bonsai-27B-mlx-1bit"
+quantization = "int1"
+featured = true
+
 [[model_preset]]
 id = "nemotron-3-super-120b-a12b-mlx-6bit"
 display_name = "Nemotron 3 Super 120B (MLX 6bit)"

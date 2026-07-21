@@ -381,6 +381,21 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
   (`config_json.model_file`) albo preset z `quantization`; downloader nie powinien
   pobierać wszystkich kwantyzacji z repozytorium.
 
+## tentaflow-infer (FORGE)
+
+Independent inference-engine project (own Cargo workspace, NOT part of the
+main binary): Rust systems layer + **Mojo GPU kernels** (AOT → PTX + manifest,
+zero Mojo runtime in the server; ADR-0001). Spec: `tentaflow-infer/docs/SPEC.md`,
+plan: `docs/PLAN.md`, Mojo 1.0b API quirks: `kernels/mojo/MOJO_NOTES.md`.
+Crates: forge-types/hal (CUDA via cudarc, VRAM arenas, CUDA graphs) /
+formats (GGUF+safetensors+NVFP4, CPU golden dequant) / tokenize / kernels
+(PTX registry + typed launchers, golden GPU tests) / engine (paged KV,
+forward pass, scheduler queue) / server+cli (OpenAI API). Kernel toolchain:
+`cd tentaflow-infer/kernels/mojo && pixi run mojo build_kernels.mojo`
+(pixi env, gitignored; artifacts in `build/<arch>/` are committed).
+E2E proven: Bielik-PL-Minitron-7B-NVFP4 (software FP4 dequant) generates
+coherent Polish on the RTX 4090.
+
 ## Conventions
 
 - Code comments, variable/function names, commit messages: **English**. Commit format:

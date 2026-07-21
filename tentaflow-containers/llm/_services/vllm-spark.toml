@@ -1,8 +1,8 @@
-# Manifest serwisu vLLM-Spark — vLLM 0.23.0 zbudowany ze zrodel pod
+# Manifest serwisu vLLM-Spark — vLLM 0.25.1 zbudowany ze zrodel pod
 # NVIDIA DGX Spark / GB10 Grace Blackwell (sm_121, aarch64). Osobny silnik
 # od `vllm.toml` bo PyPI wheels vllm/torch sm_120 max crashuja na sm_121
 # (FP8 / Mamba / NVFP4 kernels). Build from source z TORCH_CUDA_ARCH_LIST=12.1a
-# na chwile obecna jest jedyna droga zeby dostac dokladnie 0.23.0 dzialajace
+# na chwile obecna jest jedyna droga zeby dostac dokladnie 0.25.1 dzialajace
 # na Sparku — patrz `vllm-spark/Dockerfile` i `python/vllm-spark/bundle.toml`.
 
 [engine]
@@ -10,14 +10,14 @@ id = "vllm-spark"
 backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 category = "llm"
 name = "vLLM (DGX Spark)"
-description_pl = "vLLM 0.23.0 budowane ze zrodel pod DGX Spark (GB10, sm_121a). Dlugi pierwszy build."
-description_en = "vLLM 0.23.0 built from source for DGX Spark (GB10, sm_121a). Slow first build."
+description_pl = "vLLM 0.25.1 budowane ze zrodel pod DGX Spark (GB10, sm_121a). Dlugi pierwszy build."
+description_en = "vLLM 0.25.1 built from source for DGX Spark (GB10, sm_121a). Slow first build."
 homepage = "https://github.com/vllm-project/vllm"
 license = "Apache-2.0"
 icon = "vllm"
 default_port = 8000
 api = "openai-compatible"
-version = "0.23.0"
+version = "0.25.1"
 # Silnik widoczny TYLKO na Sparku — manifest-store filtruje po polu engine.dgx_spark.
 dgx_spark = true
 # Multi-node tensor-parallel deploy supported — the unified deploy wizard offers

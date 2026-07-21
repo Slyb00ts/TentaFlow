@@ -766,15 +766,26 @@ verify_archive_checksum "$ARCHIVE_PATH"
 
 UNPACK="$NATIVE_CACHE/build/onnxruntime-$PLATFORM-dynamic"
 reset_dir "$UNPACK"
+mkdir -p "$UNPACK/raw"
 case "$ARCHIVE" in
-  *.tgz) tar -xzf "$ARCHIVE_PATH" -C "$UNPACK" --strip-components=1 ;;
+  *.tgz) tar -xzf "$ARCHIVE_PATH" -C "$UNPACK/raw" ;;
   *.zip)
     require_cmd unzip
     unzip -q "$ARCHIVE_PATH" -d "$UNPACK/raw"
-    first_dir="$(find "$UNPACK/raw" -mindepth 1 -maxdepth 1 -type d | head -n1)"
-    cp -Rf "$first_dir/"* "$UNPACK/"
     ;;
 esac
+
+if [ -d "$UNPACK/raw/include" ] && [ -d "$UNPACK/raw/lib" ]; then
+  package_root="$UNPACK/raw"
+else
+  package_root="$(find "$UNPACK/raw" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+fi
+if [ -z "$package_root" ] || [ ! -d "$package_root/include" ] || [ ! -d "$package_root/lib" ]; then
+  echo "Invalid ONNX Runtime archive layout: expected include/ and lib/ in $ARCHIVE" >&2
+  exit 1
+fi
+cp -Rf "$package_root/." "$UNPACK/"
+rm -rf "$UNPACK/raw"
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/onnxruntime"
 cp -Rf "$UNPACK/include/"* "$NATIVE_ROOT/$PLATFORM/include/onnxruntime/"

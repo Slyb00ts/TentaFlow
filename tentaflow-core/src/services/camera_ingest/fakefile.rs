@@ -132,7 +132,11 @@ impl DeviceCropsFrame {
     }
 }
 
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 impl DeviceCropsFrame {
     /// Maps the device NV12 surface and returns its device plane pointers/strides.
     /// The returned map borrows `self.sample`'s buffer (kept alive by our held
@@ -791,7 +795,11 @@ pub(crate) fn install_detect_frame_callback_nv12(
 /// ALSO downloads the NV12 and runs the download preprocess, asserting the two
 /// device tensors are element-identical (same kernel, same pixels) on the first
 /// few frames — the correctness gate for the zero-copy path.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub(crate) fn install_detect_frame_callback_cuda(
     appsink: &gst_app::AppSink,
     mailbox: Arc<FrameMailbox>,
@@ -902,7 +910,11 @@ pub(crate) fn install_detect_frame_callback_cuda(
 /// pack `[Y | UV]`, and store a normal NV12 detect frame (`device: None`, the
 /// detector runs the download preprocess). Identical to the deployed NV12 detect
 /// callback — this is the guaranteed no-regress path.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 fn download_nv12_detect(
     mailbox: &Arc<FrameMailbox>,
     buffer: &gst::BufferRef,
@@ -943,7 +955,11 @@ fn download_nv12_detect(
 
 /// Logs the first zero-copy fallback (once) at warn, quieter afterwards — a
 /// camera silently degrading to the download path should be visible but not spammy.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 fn warn_zerocopy_fallback(logged: &std::sync::atomic::AtomicBool, reason: &str) {
     if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
@@ -957,7 +973,11 @@ fn warn_zerocopy_fallback(logged: &std::sync::atomic::AtomicBool, reason: &str) 
 /// assert its device tensor is element-identical to the zero-copy one (same
 /// kernel, same pixels → must be bit-identical). Logged, not panicking, so a
 /// mismatch surfaces without killing a live camera.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 fn verify_zerocopy(
     map: &super::gst_cuda_ffi::CudaNv12Map<'_>,
     info: &gst_video::VideoInfo,
@@ -1113,11 +1133,19 @@ pub(crate) fn install_frame_callback_nv12(
 /// frame. Only meaningful with the GPU inference features (they link cudart +
 /// provide the device crop path); false without them.
 pub fn zerocopy_crops_enabled() -> bool {
-    #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-vision-gpu",
+        feature = "inference-supertonic"
+    ))]
     {
         crate::vision::settings::get().zerocopy_crops
     }
-    #[cfg(not(all(feature = "inference-vision-gpu", feature = "inference-supertonic")))]
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-vision-gpu",
+        feature = "inference-supertonic"
+    )))]
     {
         false
     }
@@ -1140,7 +1168,11 @@ pub fn zerocopy_crops_enabled() -> bool {
 /// the buffer is not a 2-plane NV12 surface, this frame falls back to the FULL
 /// host download exactly like [`install_frame_callback_nv12`] (a normal NV12
 /// `LatestFrame`, `device: None`), logged once. A camera never breaks.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub(crate) fn install_frame_callback_crops_cuda(
     appsink: &gst_app::AppSink,
     _camera_id: String,

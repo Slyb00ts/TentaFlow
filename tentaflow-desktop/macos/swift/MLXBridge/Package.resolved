@@ -1,5 +1,5 @@
 {
-  "originHash" : "4af701b47bd86556ec136bb446bb91d5c500e36fd0127cb95fc0f087a85f1e43",
+  "originHash" : "be59b16a0c7ca0bda0f8a40ab6c869cddaa2f89188a63c18d9b47e738cdc099e",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -13,10 +13,9 @@
     {
       "identity" : "mlx-swift",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ml-explore/mlx-swift.git",
+      "location" : "https://github.com/PrismML-Eng/mlx-swift.git",
       "state" : {
-        "revision" : "61b9e011e09a62b489f6bd647958f1555bdf2896",
-        "version" : "0.31.3"
+        "revision" : "151184940bdf97c9117ec851b50d404b33d9474f"
       }
     },
     {

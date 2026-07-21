@@ -1,0 +1,10 @@
+target/
+kernels/mojo/.pixi/
+kernels/mojo/pixi.lock
+*.ptx-cache/
+.cache/
+test-models/
+
+# Throwaway experiment/benchmark working dirs (Modular clones, PTX probes, engine builds)
+scratch/
+kernels/mojo/scratch/

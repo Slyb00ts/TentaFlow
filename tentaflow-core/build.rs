@@ -15,8 +15,8 @@ fn main() {
     let out_dir_env = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // Compile the fused GPU crop-preprocess CUDA kernel (nvcc) and emit its link
-    // flags. Gated on the vision-gpu + supertonic features so non-GPU builds
-    // never need nvcc. Done early so a missing toolchain fails fast.
+    // flags. CUDA preprocessing is supported on Linux and Windows; macOS uses
+    // Metal. Done early so a missing CUDA toolchain fails fast.
     compile_cuda_preprocess(&out_dir_env);
 
     // Skanuj manifesty serwisow tentaflow-containers/*/_services/*.toml,
@@ -364,7 +364,9 @@ fn main() {
 /// with the CPU `resize_rgb` (an FMA-contracted `(d+0.5)*scale-0.5` rounds
 /// differently and could flip a Q8 boundary weight).
 fn compile_cuda_preprocess(out_dir: &Path) {
-    let want = std::env::var_os("CARGO_FEATURE_INFERENCE_VISION_GPU").is_some()
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS");
+    let want = matches!(target_os.as_deref(), Ok("linux" | "windows"))
+        && std::env::var_os("CARGO_FEATURE_INFERENCE_VISION_GPU").is_some()
         && std::env::var_os("CARGO_FEATURE_INFERENCE_SUPERTONIC").is_some();
     if !want {
         return;

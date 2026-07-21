@@ -656,7 +656,11 @@ pub(super) fn attach_detect_branch_nv12(
 /// callback maps the CUDA surface, runs the fused device preprocess, and hands
 /// the detector an owned device tensor (host-download fallback per frame on any
 /// map failure). Only built with the GPU inference features.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub(super) fn build_appsink_detect_cuda(mailbox: Arc<FrameMailbox>) -> Result<gst::Element> {
     let appsink = gst::ElementFactory::make("appsink")
         .property("name", "sink_detect_cuda")
@@ -685,7 +689,11 @@ pub(super) fn build_appsink_detect_cuda(mailbox: Arc<FrameMailbox>) -> Result<gs
 ///
 /// The capsfilter pins the CUDA memory feature + NV12 so negotiation keeps the
 /// frame on the GPU. Built before Playing (no `sync_state_with_parent`).
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub(super) fn attach_detect_branch_cuda(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
@@ -726,7 +734,11 @@ pub(super) fn attach_detect_branch_cuda(
 /// the per-frame path. The callback ([`install_frame_callback_crops_cuda`]) maps
 /// the CUDA surface and stores a device reference in the mailbox (host-download
 /// fallback per frame on map failure). Only built with the GPU inference features.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub(super) fn build_appsink_crops_cuda(
     camera_id: String,
     mailbox: Arc<FrameMailbox>,
@@ -760,7 +772,11 @@ pub(super) fn build_appsink_crops_cuda(
 /// The queue caps at ONE buffer (leaky downstream) so the branch pins at most one
 /// extra decode surface (plus the mailbox's latest) — never starving the pool.
 /// Built before Playing (no `sync_state_with_parent`).
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "inference-supertonic"
+))]
 pub(super) fn attach_crops_branch_cuda(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
@@ -824,11 +840,19 @@ pub(super) fn gpu_resize_enabled() -> bool {
 /// path). OFF by default: the deployed host-download NV12 detect is the
 /// guaranteed fallback.
 pub(super) fn zerocopy_enabled() -> bool {
-    #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-vision-gpu",
+        feature = "inference-supertonic"
+    ))]
     {
         crate::vision::settings::get().zerocopy_detect
     }
-    #[cfg(not(all(feature = "inference-vision-gpu", feature = "inference-supertonic")))]
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-vision-gpu",
+        feature = "inference-supertonic"
+    )))]
     {
         false
     }
@@ -1583,7 +1607,11 @@ fn build_rtsp_pipeline_nvdec(
     if let Some(tc) = &tee_cuda {
         #[allow(unused_mut)]
         let mut crops_on_cuda = false;
-        #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "windows"),
+            feature = "inference-vision-gpu",
+            feature = "inference-supertonic"
+        ))]
         {
             if zerocopy_crops {
                 // Crops read DEVICE NV12 off the CUDA tee — the full-4K download is
@@ -1613,7 +1641,11 @@ fn build_rtsp_pipeline_nvdec(
             })?;
         }
         // Device NV12 detect off the CUDA tee (no download for the detect branch).
-        #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "windows"),
+            feature = "inference-vision-gpu",
+            feature = "inference-supertonic"
+        ))]
         attach_detect_branch_cuda(&pipeline, tc, mailbox.clone())?;
     }
     // Host crops/display tail (only when NOT zero-copy crops — otherwise crops are

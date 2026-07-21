@@ -11,7 +11,7 @@ source "$SCRIPT_DIR/common.sh"
 PLATFORM="${1:-$(detect_platform)}"
 # Pinowany commit llama.cpp — wszyscy budują dokładnie tę samą wersję jako prebuilt
 # biblioteki w native-libs. Świeży master da się wymusić przez LLAMA_CPP_REF=origin/master.
-LLAMA_CPP_REF="${LLAMA_CPP_REF:-6b80c74f285390368b3c99c5e750f19e9b096e98}"
+LLAMA_CPP_REF="${LLAMA_CPP_REF:-91d2fc387529940230555abd297a8b5e99737d3f}"
 BACKENDS="${LLAMA_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake

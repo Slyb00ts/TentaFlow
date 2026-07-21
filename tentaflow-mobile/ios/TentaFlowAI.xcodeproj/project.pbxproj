@@ -505,10 +505,10 @@
 		};
 		27C5A0010000000000000001 /* XCRemoteSwiftPackageReference "mlx-swift" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/ml-explore/mlx-swift";
+			repositoryURL = "https://github.com/PrismML-Eng/mlx-swift";
 			requirement = {
-				kind = upToNextMinorVersion;
-				minimumVersion = 0.31.3;
+				kind = revision;
+				revision = 151184940bdf97c9117ec851b50d404b33d9474f;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

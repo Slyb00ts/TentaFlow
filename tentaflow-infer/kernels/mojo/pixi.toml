@@ -1,0 +1,11 @@
+[workspace]
+authors = ["Critix <piotr.jarocki@nextapp.pl>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "mojo"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+modular = ">=26.5.0.dev2026071614,<27"

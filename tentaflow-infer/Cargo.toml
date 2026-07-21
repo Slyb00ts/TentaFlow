@@ -1,0 +1,59 @@
+# ===== File: Cargo.toml — FORGE workspace manifest =====
+[workspace]
+resolver = "2"
+members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize", "crates/forge-grammar", "crates/forge-engine", "crates/forge-whisper", "crates/forge-onnx", "crates/forge-server", "crates/forge-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+forge-types = { path = "crates/forge-types" }
+forge-hal = { path = "crates/forge-hal" }
+forge-kernels = { path = "crates/forge-kernels" }
+forge-formats = { path = "crates/forge-formats" }
+forge-tokenize = { path = "crates/forge-tokenize" }
+forge-grammar = { path = "crates/forge-grammar" }
+forge-engine = { path = "crates/forge-engine" }
+forge-whisper = { path = "crates/forge-whisper" }
+forge-onnx = { path = "crates/forge-onnx" }
+forge-server = { path = "crates/forge-server" }
+cudarc = { version = "0.19.8", default-features = false, features = [
+    "std",
+    "driver",
+    "dynamic-loading",
+    "cuda-13030",
+] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+minijinja = { version = "2.21", features = ["json", "loop_controls", "fuel"] }
+minijinja-contrib = { version = "2.21", features = ["pycompat"] }
+chrono = "0.4"
+memmap2 = "0.9"
+ron = "0.8"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower = "0.5"
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+rustfft = "6"
+hound = "3.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

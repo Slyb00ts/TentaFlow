@@ -33,7 +33,12 @@ let package = Package(
     dependencies: [
         // Core MLX bindings (Array, GPU, etc.). mlx-swift-lm 3.x wymaga 0.31.x
         // (QuantizedKVCache + kvBits/kvGroupSize/quantizedKVStart).
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.3"),
+        // PrismML's fork preserves the 0.31.3 API and adds the binary g128
+        // kernels required by Bonsai models without affecting standard MLX models.
+        .package(
+            url: "https://github.com/PrismML-Eng/mlx-swift.git",
+            revision: "151184940bdf97c9117ec851b50d404b33d9474f"
+        ),
         // MLXLLM, MLXLMCommon, MLXHuggingFace — high-level LLM runtime.
         // Repo przemianowane z mlx-swift-examples; 3.x ma kwantyzacje KV cache.
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),

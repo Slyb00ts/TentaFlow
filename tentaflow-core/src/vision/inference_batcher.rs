@@ -242,12 +242,17 @@ pub(crate) async fn state_batcher() -> Option<&'static InferenceBatcher<Vec<Stri
         let run_batch: Arc<
             dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Vec<String>>> + Send + Sync,
         > = Arc::new(move |crops| {
-            let refs: Vec<(&[u8], u32, u32)> =
-                crops.iter().map(|(c, w, h)| (c.as_ref(), *w, *h)).collect();
-            classifier.classify_batch_gpu(&refs).or_else(|e| {
-                tracing::warn!("state batcher: GPU preprocess failed ({e}); CPU fallback");
-                classifier.classify_batch(crops)
-            })
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                let refs: Vec<(&[u8], u32, u32)> =
+                    crops.iter().map(|(c, w, h)| (c.as_ref(), *w, *h)).collect();
+                return classifier.classify_batch_gpu(&refs).or_else(|e| {
+                    tracing::warn!("state batcher: GPU preprocess failed ({e}); CPU fallback");
+                    classifier.classify_batch(crops)
+                });
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            classifier.classify_batch(crops)
         });
         Some(InferenceBatcher::new(MAX_BATCH, batch_window(), run_batch))
     })

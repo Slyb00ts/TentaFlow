@@ -203,6 +203,7 @@ impl VehicleDetector {
     /// ImageNet normalize) so the fused kernel yields the `/255` RGB the graph
     /// expects. Preprocesses on the GPU into a device buffer and hands its
     /// pointer to ort (zero host↔device copy of the model input).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn detect_batch_gpu(
         &self,
         frames: &[crate::vision::gpu_preprocess::Nv12Frame<'_>],
@@ -225,6 +226,7 @@ impl VehicleDetector {
     /// `(&[u8], w, h)`, `len == w*h*3`) — the RGB analogue of `detect_batch_gpu`.
     /// The launcher uses this when the detect frame is host RGB but a GPU
     /// preprocess is still cheaper than the CPU resize. Same YOLO mean/std.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn detect_device_pixels(
         &self,
         frames: &[(&[u8], u32, u32)],
@@ -244,6 +246,7 @@ impl VehicleDetector {
     /// Shared ort device-tensor forward + decode for both GPU preprocess paths.
     /// `dev_ptr` is a CUDA device-0 buffer of exactly `n·3·res·res` f32 that the
     /// caller keeps alive for the whole blocking run.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn forward_device_ptr(
         &self,
         dev_ptr: usize,
@@ -287,7 +290,9 @@ impl VehicleDetector {
 /// Per-channel YOLO normalize: `/255`, no ImageNet mean/std. Expressed as the
 /// mean/std pair the fused GPU kernel and `normalize_hwc` share
 /// (`v/255 → (v - 0) / 255`).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const YOLO_MEAN: [f32; 3] = [0.0, 0.0, 0.0];
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const YOLO_STD: [f32; 3] = [255.0, 255.0, 255.0];
 
 /// Resolves the vehicle detector pool size from `[vision] vehicle_sessions`

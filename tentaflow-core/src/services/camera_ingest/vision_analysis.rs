@@ -316,7 +316,11 @@ fn crop_for_detection(
     ch: u32,
 ) -> (Vec<u8>, u32, u32) {
     // Zero-copy crops: cut off the device surface (small per-crop download).
-    #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-vision-gpu",
+        feature = "inference-supertonic"
+    ))]
     if let Some(dev) = frame_device {
         if let Some(out) = dev.crop_detection_rgb(x0, y0, cw, ch) {
             return out;
@@ -797,7 +801,13 @@ struct FrameJob {
     /// When `Some`, the detect forward runs `detect_device_tensor` on it and
     /// ignores `detect_frame`/`detect_format`. Read only under the ORT GPU
     /// features; `None` on every other path.
-    #[cfg_attr(not(feature = "inference-supertonic"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            any(target_os = "linux", target_os = "windows"),
+            feature = "inference-supertonic"
+        )),
+        allow(dead_code)
+    )]
     detect_device: Option<super::fakefile::DeviceDetectTensor>,
     captured_ms: u64,
     pts_ns: Option<u64>,
@@ -890,7 +900,10 @@ const DEVICE_BATCH_KEY: (u32, u32, u32) = (u32::MAX, u32::MAX, u32::MAX);
 /// ort GPU features `detect_device` is always `None`, so this is just the format
 /// key).
 fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-supertonic"
+    ))]
     if job.detect_device.is_some() {
         return Some(DEVICE_BATCH_KEY);
     }
@@ -900,7 +913,10 @@ fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
 /// One NV12 detect-frame descriptor collected off a [`FrameJob`] for the device
 /// forward: the packed `[Y | UV]` bytes plus plane strides/offsets and frame
 /// dims. Owned (Arc-cloned) so the spawned forward can outlive the loop tick.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-supertonic"
+))]
 #[derive(Clone)]
 struct Nv12DetectInput {
     data: Arc<[u8]>,
@@ -913,7 +929,10 @@ struct Nv12DetectInput {
 }
 
 /// YUV→RGB coefficients for an NV12 detect frame, or `None` for RGB.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-supertonic"
+))]
 fn nv12_color(
     fmt: &super::fakefile::DetectFrameFormat,
 ) -> Option<crate::vision::gpu_preprocess::ColorCoeffs> {
@@ -934,7 +953,10 @@ fn nv12_color(
 /// zero CPU pixel work. Bypasses the executor (a device frame has no RGB wire
 /// form for mesh failover); the returned [`CameraCvResult::Detections`] mirrors
 /// the executor's Detect op so `apply_forward_result` treats both paths alike.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-supertonic"
+))]
 async fn run_nv12_detect_forward(
     frames: Vec<Nv12DetectInput>,
     color: crate::vision::gpu_preprocess::ColorCoeffs,
@@ -984,7 +1006,10 @@ async fn run_nv12_detect_forward(
 /// op so `apply_forward_result` treats every detect path alike. Each tensor is a
 /// separate device buffer, so they run one at a time (n=1) rather than as one
 /// concatenated ORT input; the batch just amortizes the loop bookkeeping.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-supertonic"
+))]
 async fn run_device_detect_forward(
     handles: Vec<super::fakefile::DeviceDetectTensor>,
     threshold: Option<f32>,
@@ -1024,7 +1049,10 @@ async fn run_device_detect_forward(
 /// gives independent CUDA streams, so this overlaps the RF-DETR forward. Any
 /// failure (model absent, forward error) degrades to an all-empty result, so
 /// vehicle detection can NEVER block or fail the primary detection.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-supertonic"
+))]
 async fn run_nv12_vehicle_forward(
     frames: Vec<Nv12DetectInput>,
     color: crate::vision::gpu_preprocess::ColorCoeffs,
@@ -1596,7 +1624,10 @@ async fn engine_loop() {
         // executor (a device tensor has no RGB wire form for mesh failover); the
         // result shape mirrors the executor's Detect op so `apply_forward_result`
         // handles it identically to every other detect path.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "windows"),
+            feature = "inference-supertonic"
+        ))]
         if batch_is_device {
             let mut handles: Vec<super::fakefile::DeviceDetectTensor> =
                 Vec::with_capacity(batch.len());
@@ -1650,7 +1681,10 @@ async fn engine_loop() {
         // handles both paths identically. Only compiled with the ort GPU
         // features; without them NV12 frames are never produced (see
         // `resolve_ingest_path` / `nv12_detect_bench_enabled`).
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(all(
+            any(target_os = "linux", target_os = "windows"),
+            feature = "inference-supertonic"
+        ))]
         if batch_is_nv12 {
             let color = batch
                 .first()

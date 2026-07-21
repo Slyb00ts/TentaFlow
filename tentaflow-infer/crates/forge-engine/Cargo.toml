@@ -1,0 +1,21 @@
+# ===== File: Cargo.toml — forge-engine: LLM execution engine =====
+[package]
+name = "forge-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+forge-hal.workspace = true
+forge-kernels.workspace = true
+forge-formats.workspace = true
+forge-tokenize.workspace = true
+forge-grammar.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
