@@ -5,6 +5,7 @@
 
 use super::cascade::{CascadeComposer, DraftSegment};
 use super::stats::ProposerStatsSnapshot;
+use forge_types::{ForgeError, Result};
 
 pub struct SpeculativeState {
     history: Vec<u32>,
@@ -43,23 +44,45 @@ impl SpeculativeState {
 
     /// Build one draft of at most `budget` tokens. Each draft must be
     /// resolved by `commit` before the next `draft` call.
-    pub fn draft(&mut self, budget: usize) -> Vec<u32> {
-        let (draft, segments) = self.composer.compose(&self.history, budget);
+    pub fn draft(&mut self, budget: usize) -> Result<Vec<u32>> {
+        if self.pending.is_some() {
+            return Err(ForgeError::Scheduler(
+                "previous speculative draft is still pending".into(),
+            ));
+        }
+        let (draft, segments) = self.composer.compose(&self.history, budget)?;
         self.pending = Some((draft.clone(), segments));
-        draft
+        Ok(draft)
+    }
+
+    pub fn cancel_draft(&mut self) {
+        self.pending = None;
     }
 
     /// Resolve the last draft: `drafted` must be the tokens `draft` returned
     /// and `n_accepted` the verified prefix length (e.g. from
     /// `verify_greedy`). Updates per-proposer stats and feeds the accepted
     /// tokens back into the history/index.
-    pub fn commit(&mut self, drafted: &[u32], n_accepted: usize) {
-        debug_assert!(n_accepted <= drafted.len());
-        if let Some((pending_draft, segments)) = self.pending.take() {
-            debug_assert_eq!(pending_draft, drafted);
-            self.composer.commit_feedback(&segments, n_accepted);
+    pub fn commit(&mut self, drafted: &[u32], n_accepted: usize) -> Result<()> {
+        if n_accepted > drafted.len() {
+            return Err(ForgeError::Scheduler(
+                "accepted speculative prefix exceeds draft length".into(),
+            ));
         }
+        let Some((pending_draft, segments)) = self.pending.take() else {
+            return Err(ForgeError::Scheduler(
+                "no speculative draft is pending".into(),
+            ));
+        };
+        if pending_draft != drafted {
+            self.pending = Some((pending_draft, segments));
+            return Err(ForgeError::Scheduler(
+                "committed speculative draft does not match pending draft".into(),
+            ));
+        }
+        self.composer.commit_feedback(&segments, n_accepted);
         self.observe_all(&drafted[..n_accepted.min(drafted.len())]);
+        Ok(())
     }
 
     pub fn stats(&self) -> Vec<ProposerStatsSnapshot> {

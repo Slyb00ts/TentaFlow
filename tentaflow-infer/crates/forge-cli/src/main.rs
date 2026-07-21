@@ -10,7 +10,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_engine::kv::KvQuant;
-use forge_engine::model::ModelConfig;
+use forge_engine::model::{ModelConfig, MAX_SPEC_DRAFT};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig};
@@ -550,21 +550,31 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
     // (amortizing its per-op launch overhead over many accepted tokens) is what
     // makes it a net win; 16 measured best on qwen3-0.6b.
     const DEFAULT_DRAFT: usize = 16;
-    match s {
-        "off" => Ok(SpeculativeConfig::off()),
-        "on" | "ngram" => Ok(SpeculativeConfig::ngram(DEFAULT_DRAFT)),
-        other => match other.strip_prefix("ngram:") {
-            Some(k) => {
-                let k: usize = k
-                    .parse()
-                    .with_context(|| format!("invalid draft budget in --speculative '{other}'"))?;
-                if k == 0 {
-                    bail!("--speculative draft budget must be >= 1");
-                }
-                Ok(SpeculativeConfig::ngram(k))
+    if s == "off" {
+        return Ok(SpeculativeConfig::off());
+    }
+    let explicit_budget = s.contains(':');
+    let (name, budget) = match s.split_once(':') {
+        Some((name, raw_budget)) => {
+            let budget = raw_budget
+                .parse::<usize>()
+                .with_context(|| format!("invalid draft budget in --speculative '{s}'"))?;
+            if !(1..=MAX_SPEC_DRAFT).contains(&budget) {
+                bail!("--speculative draft budget must be in 1..={MAX_SPEC_DRAFT}");
             }
-            None => bail!("unsupported --speculative '{other}' (expected off | on | ngram | ngram:<k>)"),
-        },
+            (name, budget)
+        }
+        None => (s, DEFAULT_DRAFT),
+    };
+    match name {
+        "on" if explicit_budget => {
+            bail!("--speculative 'on' does not accept a draft budget; use ngram:<k>")
+        }
+        "on" | "ngram" => SpeculativeConfig::ngram(budget).map_err(Into::into),
+        "draft-model" | "mtp" | "eagle" | "dflash" | "dspark" => bail!(
+            "--speculative proposer '{name}' requires an implemented neural loader and forge-speculation.json"
+        ),
+        other => bail!("unsupported --speculative proposer '{other}'"),
     }
 }
 
@@ -1070,8 +1080,8 @@ fn cmd_serve(
     // Speculation appends + rolls back draft KV on the plain paged cache; the
     // radix prefix cache donates/borrows pages and is mutually exclusive with
     // it, so enabling speculation forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.enabled;
-    if spec.enabled {
+    let prefix_cache = prefix_cache && !spec.is_enabled();
+    if spec.is_enabled() {
         tracing::info!("speculative decoding enabled; prefix cache disabled");
     }
     let t0 = Instant::now();
@@ -1122,7 +1132,7 @@ fn cmd_serve(
         prefill_chunk,
         batch_min as usize,
         spec,
-    );
+    )?;
 
     let whisper = match whisper_model {
         Some(dir) => {
@@ -1250,7 +1260,7 @@ fn cmd_run(
     let t0 = Instant::now();
     // Speculation is mutually exclusive with the radix prefix cache (both manage
     // paged KV ownership); enabling it forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.enabled;
+    let prefix_cache = prefix_cache && !spec.is_enabled();
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
@@ -1284,7 +1294,7 @@ fn cmd_run(
     let prompt_tokens = tokenizer
         .encode(&prompt_text, true)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec);
+    let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec)?;
 
     let submit_at = Instant::now();
     let (generated, prompt_len, _first, done_at) = drain_request(
@@ -1450,7 +1460,7 @@ fn cmd_bench(
         bail!("--reps must be at least 1");
     }
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache && !spec.enabled;
+    let prefix_cache = prefix_cache && !spec.is_enabled();
     let mut loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages, prefix_cache)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
@@ -1479,7 +1489,7 @@ fn cmd_bench(
         forge_engine::model::MAX_PREFILL_CHUNK,
         12,
         spec,
-    );
+    )?;
     // Warm best-of-N: re-submit the identical request `reps` times reusing the
     // loaded engine. With prefix caching off each rep re-runs the full prefill,
     // so the cold first GEMM launch (throttled ~2× on the 4090) lands in rep 1
@@ -1542,4 +1552,25 @@ fn cmd_bench(
     );
     eprintln!("note: prefill is timed to the first visible token, so it includes >=1 decode step");
     Ok(())
+}
+
+#[cfg(test)]
+mod speculation_cli_tests {
+    use super::parse_speculative;
+    use forge_engine::speculation::ProposerKind;
+
+    #[test]
+    fn parser_rejects_unsupported_budget_and_neural_proposer() {
+        assert!(parse_speculative("ngram:0").is_err());
+        assert!(parse_speculative("ngram:17").is_err());
+        assert!(parse_speculative("on:8").is_err());
+        assert!(parse_speculative("dspark:8").is_err());
+    }
+
+    #[test]
+    fn parser_accepts_explicit_ngram_budget() {
+        let config = parse_speculative("ngram:8").expect("konfiguracja powinna być poprawna");
+        assert_eq!(config.proposers(), &[ProposerKind::Ngram]);
+        assert_eq!(config.draft_tokens(), 8);
+    }
 }

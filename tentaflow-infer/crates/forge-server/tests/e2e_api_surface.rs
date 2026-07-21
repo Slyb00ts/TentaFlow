@@ -86,7 +86,8 @@ async fn api_surface_end_to_end() {
             let eos_ids = loaded.bundle.eos_ids.clone();
             let tokenizer = Arc::new(loaded.bundle.tokenizer);
             // max_active 8 so a 4-prompt batch shares one decode batch.
-            let handle = spawn_engine(loaded.model, tokenizer.clone(), 8, 16);
+            let handle = spawn_engine(loaded.model, tokenizer.clone(), 8, 16)
+                .expect("silnik powinien się uruchomić");
             (
                 handle,
                 tokenizer,

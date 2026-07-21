@@ -87,7 +87,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
     // max_active 1, batch_min 12: a single greedy request stays on the serial
     // (speculative) decode path rather than the batched throughput pass.
-    let handle = spawn_engine_batched(loaded.model, tokenizer.clone(), 1, 16, 12, spec);
+    let handle = spawn_engine_batched(loaded.model, tokenizer.clone(), 1, 16, 12, spec).ok()?;
     Some(Engine {
         handle,
         tokenizer,
@@ -153,7 +153,9 @@ fn speculative_is_exact_and_faster_on_repetitive() {
     let (norm_text_off, norm_tok_off, norm_dt_off) = run(&off, NORMAL, NORMAL_MAX_TOKENS);
     drop(off); // worker thread ends when the last handle drops
 
-    let Some(on) = load_engine(SpeculativeConfig::ngram(16)) else {
+    let Some(on) = load_engine(
+        SpeculativeConfig::ngram(16).expect("budżet powinien być poprawny"),
+    ) else {
         return;
     };
     run(&on, REPETITIVE, 16);
