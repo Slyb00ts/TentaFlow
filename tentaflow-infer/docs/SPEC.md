@@ -140,10 +140,99 @@ FP16/BF16 → FP8 (domyślny kandydat) → INT8 per-channel → INT4/NVFP4-KV �
 
 ## 6. Spekulacja: komponowalne propozery + wspólna weryfikacja
 
-`trait Proposer { fn propose(&self, ctx, budget) -> DraftTree; }`
-Implementacje: NgramProposer (suffix-automaton, CPU, koszt ~0), DraftModelProposer, MTPProposer, EagleProposer.
+### 6.1. Wspólny kontrakt
 
-**Zasada twarda: jedna wspólna weryfikacja.** Kompozycja: **kaskada** (model generuje rdzeń t+1..t+k, n-gram przedłuża t+k+1..t+N) lub **drzewo** (deduplikacja prefiksów, tree-attention mask, spec-sampling). Budżet węzłów adaptacyjny (bandit per proposer), statystyki akceptacji per proposer, usypianie gdy speedup < 1.05.
+`trait Proposer { fn propose(&mut self, ctx, budget) -> Result<DraftTree>; }`
+
+`DraftTree` składa się z topologicznie uporządkowanych `DraftNode`. Każdy
+węzeł zawiera token, indeks rodzica, głębokość, `source`, opcjonalny
+`proposal_logprob` (`q`) i opcjonalny `conditional_confidence`. Kontrakt
+reprezentuje łańcuch lub wiele gałęzi bez kopiowania wspólnych prefiksów.
+`proposal_logprob` jest obowiązkowy dla akceptacji stochastycznej; sama etykieta
+tokenu wystarcza wyłącznie dla ścieżki greedy.
+
+**Zasada twarda: jedna wspólna, lossless weryfikacja targetu.** Ten sam verifier
+obsługuje wszystkie propozery i ich kompozycje:
+
+- greedy: akceptuje najdłuższy prefiks zgodny z argmax targetu i zachowuje wynik
+  identyczny z sekwencyjnym greedy;
+- sampling: stosuje standardową akceptację względem `p/q`, a po odrzuceniu losuje
+  z rozkładu resztowego, zachowując dokładnie rozkład targetu;
+- drzewo: wykonuje jeden forward z maską tree-attention, mapuje logity targetu na
+  węzły i zatwierdza tylko wybraną ścieżkę KV.
+
+Kompozycja działa jako **kaskada** (proposer neuralny generuje rdzeń, a n-gram lub
+suffix przedłuża zaakceptowany prefiks) albo **drzewo** (propozery dostarczają
+gałęzie, koordynator deduplikuje prefiksy). N-gram pozostaje opcjonalnym, tanim
+fallbackiem lub rozszerzeniem każdego proposera, a nie osobną pętlą weryfikacji.
+`SpeculativeConfig::chain` przechowuje uporządkowaną listę proposerów. Odrzuca
+pusty łańcuch i duplikaty, a `NgramProposer`, jeśli występuje, musi być ostatnim
+rozszerzeniem. Bieżące CLI tworzy wyłącznie łańcuch jednoelementowy n-gram;
+łańcuchy neuralne są na razie dostępne tylko w typowanym API i kończą się
+jawnym `Unsupported` przed uruchomieniem silnika.
+Budżet węzłów jest adaptacyjny: statystyki akceptacji i rzeczywisty koszt są
+liczone per `source`, a proposer jest usypiany, gdy zmierzony speedup spada poniżej
+1.05.
+
+### 6.2. Rodziny proposerów
+
+- `NgramProposer` i opcjonalny `SuffixProposer`: bez treningu, używają historii
+  bieżącej sekwencji lub indeksu sufiksów; służą też do przedłużania innych draftów.
+- `DraftModelProposer`: mały autoregresyjny model zgodny z tokenizerem targetu.
+- `MTPProposer`: wykorzystuje głowy Multi-Token Prediction/NextN dostarczone z
+  modelem; liczba głów i układ tensora wynikają z manifestu checkpointu.
+- `Eagle3Proposer`: bezpośrednio przewiduje tokeny z fuzji cech wielu warstw
+  targetu; wymaga checkpointu trenowanego dla wskazanego modelu targetowego.
+- `DFlashProposer`: lekki block-diffusion drafter generujący blok równolegle i
+  kondycjonowany cechami/KV targetu.
+- `DSparkProposer`: półautoregresyjny drafter łączący równoległy backbone z lekką
+  sekwencyjną głową Markova albo RNN. Osobna głowa confidence przewiduje
+  warunkowe prawdopodobieństwo przeżycia każdej pozycji; Sequential Temperature
+  Scaling (STS) kalibruje skumulowane prawdopodobieństwa prefiksów. Scheduler
+  dobiera długość weryfikacji per żądanie na podstawie tych prawdopodobieństw,
+  bieżącego obciążenia i sprofilowanej krzywej throughputu verifiera. Decyzja jest
+  przyczynowa i kończy rozszerzanie prefiksu natychmiast po spadku oczekiwanego
+  throughputu, aby nie wprowadzić selection bias.
+- `PardProposer` (opcjonalny): równoległy draft adaptowany z modelu
+  autoregresyjnego, współdzielony przez zgodną rodzinę targetów.
+
+### 6.3. Checkpointy i licencje
+
+Każdy neuralny proposer jest osobnym artefaktem opisanym przez
+`forge-speculation.json`. Manifest zawiera wersję formatu i rodzaj proposera,
+źródło, licencje, opis targetu, fingerprinty targetu i tokenizera, tryb kompozycji,
+limity drzewa, artefakty i mapowanie tensorów, współdzielone tensory, warstwy i
+wymiary cech targetu, dtype, kwantyzację, parametry bloku/dyfuzji/kalibracji oraz
+obsługiwane tryby samplingu.
+
+Parser odrzuca nieznane pola, nieprawidłowe lub zduplikowane mapowania, niezgodne
+wymiary i wymagania per rodzaj proposera. `SpeculationManifest::load` dodatkowo
+kanonikalizuje każdą względną ścieżkę, nie pozwala wyjść poza katalog manifestu,
+porównuje SHA-256 i zwraca otwarte, zweryfikowane uchwyty artefaktów. Fingerprinty
+targetu i tokenizera są obecnie sprawdzane jako poprawne SHA-256; porównanie ich z
+załadowanym modelem nastąpi przy podłączeniu neuralnego runtime.
+
+Manifest podaje też źródło, SPDX ID licencji kodu i wag, warunki redystrybucji
+oraz wymagane attribution. Import nie oznacza prawa do redystrybucji: artefakty o
+niezgodnej albo nieznanej licencji mogą działać lokalnie tylko zgodnie z ich
+warunkami i nie trafiają do obrazów ani wydań FORGE.
+
+### 6.4. Stan realizacji
+
+Obecnie działa liniowy `NgramProposer` z weryfikacją greedy i rollbackiem KV.
+Zaimplementowany fundament obejmuje typowane `DraftTree`/`DraftNode`, walidację
+topologii, `ProposerKind`, `SpeculativeConfig`, `SpeculationCoordinator`, kaskadową
+kompozycję liniową, atrybucję statystyk per proposer i typowany parser manifestu.
+Reprezentacja przyjmuje gałęzie, lecz bieżący verifier świadomie zwraca
+`Unsupported` dla draftu rozgałęzionego. Konfiguracje `draft-model`, `mtp`,
+`eagle`, `dflash` i `dspark` są reprezentowane przez typowane API, ale koordynator zwraca `Unsupported`,
+dopóki nie ma zgodnych, licencjonowanych wag i wykonawczego proposera. Weryfikacja
+drzewiasta i stochastyczna oraz PARD/Suffix nie są jeszcze zaimplementowane.
+
+Źródła algorytmiczne: [DSpark](https://arxiv.org/abs/2607.05147),
+[DFlash](https://arxiv.org/abs/2602.06036),
+[EAGLE-3](https://arxiv.org/abs/2503.01840),
+[PARD](https://arxiv.org/abs/2504.18583).
 
 ---
 

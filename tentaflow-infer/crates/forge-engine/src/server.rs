@@ -14,12 +14,13 @@ use forge_types::{ForgeError, Result};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::metrics::{EngineMetrics, SeqTiming};
-use crate::model::{Model, MAX_PREFILL_CHUNK, MAX_SPEC_DRAFT};
+use crate::model::{Model, MAX_PREFILL_CHUNK};
 use crate::sample::{
     apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
     SeqSampleParams, TokenLogprob,
 };
-use crate::speculation::{CascadeComposer, NgramProposer, SpeculativeState};
+pub use crate::speculation::SpeculativeConfig;
+use crate::speculation::{SpeculationCoordinator, SpeculativeState};
 
 /// Shortest draft that is worth a verify forward (SPEC §6). The verify runs the
 /// ungraphed prefill path, so on a launch-bound small model it only wins when it
@@ -28,38 +29,6 @@ use crate::speculation::{CascadeComposer, NgramProposer, SpeculativeState};
 /// coincidental drafts) never verifies, low enough that genuine recurring
 /// context (which drafts to the full budget) always does.
 const MIN_VERIFY_DRAFT: usize = 8;
-
-/// Speculative decoding configuration (SPEC §6). `enabled` off = today's decode
-/// loop, byte-for-byte. When on, greedy sequences on the standard dense
-/// paged-KV path draft `draft_tokens` continuation tokens per step with an
-/// n-gram proposer and verify them in one forward; output stays identical to
-/// non-speculative greedy decode. Requests that are not greedy, use a
-/// repetition penalty, need host logits (grammar / logit_bias / min_tokens /
-/// logprobs), or run on an ineligible model silently fall back to plain decode.
-#[derive(Clone, Copy, Debug)]
-pub struct SpeculativeConfig {
-    pub enabled: bool,
-    /// Draft length per step (n-gram budget), clamped to `MAX_SPEC_DRAFT`.
-    pub draft_tokens: usize,
-}
-
-impl SpeculativeConfig {
-    pub fn off() -> Self {
-        Self {
-            enabled: false,
-            draft_tokens: 0,
-        }
-    }
-
-    /// N-gram speculation with a `draft_tokens` budget (clamped to
-    /// `1..=MAX_SPEC_DRAFT`).
-    pub fn ngram(draft_tokens: usize) -> Self {
-        Self {
-            enabled: true,
-            draft_tokens: draft_tokens.clamp(1, MAX_SPEC_DRAFT),
-        }
-    }
-}
 
 #[derive(Default)]
 pub struct EngineRequest {
@@ -201,7 +170,7 @@ pub fn spawn_engine(
     tokenizer: Arc<Tokenizer>,
     max_active: usize,
     prefill_chunk: usize,
-) -> EngineHandle {
+) -> Result<EngineHandle> {
     spawn_engine_batched(
         model,
         tokenizer,
@@ -238,23 +207,20 @@ pub fn spawn_engine_batched(
     prefill_chunk: usize,
     batch_min: usize,
     spec: SpeculativeConfig,
-) -> EngineHandle {
-    // Speculation needs the standard dense paged-KV path; log once if the model
-    // is ineligible so an operator who asked for it is not left guessing.
-    let spec = if spec.enabled && !model.speculation_eligible() {
-        tracing::warn!(
-            "speculative decoding requested but this model/config is ineligible \
-             (needs dense F16 paged KV, no tier, no prefix cache, f16/q8_0 head); \
-             running without speculation"
-        );
-        SpeculativeConfig::off()
-    } else {
-        spec
-    };
-    if spec.enabled {
+) -> Result<EngineHandle> {
+    let coordinator = SpeculationCoordinator::new(spec.clone())?;
+    if spec.is_enabled() {
+        model.validate_speculation_target()?;
+        let proposer_names = spec
+            .proposers()
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
         tracing::info!(
-            "speculative decoding: n-gram proposer, draft budget {}",
-            spec.draft_tokens
+            "speculative decoding: {} proposer, draft budget {}",
+            proposer_names,
+            spec.draft_tokens()
         );
     }
     let (tx, rx) = mpsc::channel::<Submission>();
@@ -271,11 +237,12 @@ pub fn spawn_engine_batched(
                 prefill_chunk,
                 batch_min,
                 spec,
+                coordinator,
                 &worker_metrics,
             )
         })
-        .expect("spawn engine worker");
-    EngineHandle { tx, metrics }
+        .map_err(ForgeError::Io)?;
+    Ok(EngineHandle { tx, metrics })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -287,6 +254,7 @@ fn worker<'t>(
     prefill_chunk: usize,
     batch_min: usize,
     spec: SpeculativeConfig,
+    coordinator: SpeculationCoordinator,
     metrics: &EngineMetrics,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
@@ -403,15 +371,20 @@ fn worker<'t>(
             let greedy = matches!(sampler, SeqSampler::Gpu(_))
                 && sub.req.sampling.clone().sanitized().temperature <= 0.0
                 && sub.req.sampling.repetition_penalty == 1.0;
-            let (spec_state, spec_budget) = if spec.enabled && greedy {
-                // A 3-gram floor keeps ordinary prose (where short-gram
-                // coincidences abound) on the plain decode path and only
-                // speculates on genuinely recurring context.
-                let composer =
-                    CascadeComposer::new(vec![Box::new(NgramProposer::with_min_gram(3))]);
-                let mut st = SpeculativeState::new(composer);
-                st.observe_all(&prompt);
-                (Some(st), spec.draft_tokens)
+            if spec.is_enabled() && !greedy {
+                tracing::debug!(
+                    "speculative decoding skipped for a request requiring non-greedy or host-logit sampling"
+                );
+            }
+            let (spec_state, spec_budget) = if spec.is_enabled() && greedy {
+                let state = match coordinator.new_state(&prompt) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        let _ = sub.events.send(EngineEvent::Error(error.to_string()));
+                        continue;
+                    }
+                };
+                (state, spec.draft_tokens())
             } else {
                 (None, 0)
             };
@@ -812,7 +785,14 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     let budget = a.spec_budget;
     let draft = {
         let s = a.spec.as_mut().expect("speculative_step on a spec sequence");
-        s.draft(budget)
+        match s.draft(budget) {
+            Ok(draft) => draft,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
     };
 
     // A verify forward runs the ungraphed prefill path; on a small model each
@@ -823,6 +803,9 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     // keeps ordinary prose (which only ever yields short coincidental drafts)
     // from regressing.
     if draft.len() < MIN_VERIFY_DRAFT.min(budget) {
+        if let Some(s) = &mut a.spec {
+            s.cancel_draft();
+        }
         // Short or absent draft — plain single-token greedy step (the
         // `serial_step` path), then record the confirmed token in the history.
         let SeqSampler::Gpu(g) = &mut a.sampler else {
@@ -847,6 +830,9 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     let (accepted, correction) = match model.verify_greedy_draft(&mut a.seq, fed, &draft) {
         Ok(r) => r,
         Err(e) => {
+            if let Some(s) = &mut a.spec {
+                s.cancel_draft();
+            }
             let _ = a.events.send(EngineEvent::Error(e.to_string()));
             a.dead = true;
             return;
@@ -857,7 +843,11 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     // Acceptance feedback: advances the proposer's own history over the accepted
     // drafts and updates the adaptive-disable stats (SPEC §6 sleep-on-no-gain).
     if let Some(s) = &mut a.spec {
-        s.commit(&draft, accepted);
+        if let Err(error) = s.commit(&draft, accepted) {
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+            return;
+        }
     }
 
     // Emit accepted drafts as generated output, in order. A stop / eos / length

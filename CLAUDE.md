@@ -416,6 +416,25 @@ coherent Polish on the RTX 4090.
   tych backendów. Użyty checkpoint compressed-tensors NVFP4 nie jest bezpośrednio
   obsługiwany przez badaną wersję `llama.cpp`.
 
+### Dekodowanie spekulatywne
+
+- `forge-engine::speculation` ma wspólny kontrakt `Proposer`, typowane
+  `DraftTree`/`DraftNode`, `SpeculationCoordinator`, kompozycję kaskadową i
+  statystyki akceptacji per proposer. Węzły przenoszą źródło,
+  `proposal_logprob` i `conditional_confidence`, dzięki czemu ten sam kontrakt
+  obsłuży później greedy oraz lossless stochastic acceptance.
+- Wykonawczo działa tylko liniowy `NgramProposer` z jednym forwardem weryfikacji
+  greedy i rollbackiem KV. `draft-model`, `mtp`, `eagle`, `dflash` i `dspark` są
+  typowanymi konfiguracjami, lecz zwracają `Unsupported` do czasu podłączenia
+  implementacji i zgodnych wag. Weryfikacja drzewa, sampling, PARD i suffix nie są
+  jeszcze zaimplementowane.
+- `forge-formats` udostępnia zamknięty parser `forge-speculation.json` dla
+  neuralnych proposerów. Manifest opisuje target, fingerprinty, tensory, cechy,
+  dtype/kwantyzację, sampling, kalibrację oraz osobne licencje kodu i wag.
+  `SpeculationManifest::load` ogranicza artefakty do katalogu manifestu i
+  weryfikuje SHA-256 każdego pliku; porównanie fingerprintu z aktywnym targetem
+  nastąpi przy integracji neuralnego runtime.
+
 ## Conventions
 
 - Code comments, variable/function names, commit messages: **English**. Commit format:

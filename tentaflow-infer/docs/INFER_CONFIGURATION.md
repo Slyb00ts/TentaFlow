@@ -244,9 +244,48 @@ odrzucone pozycje KV wycofuje (`KvCache::rollback`). Jeden forward daje 1..=k+1
 tokenów, **identycznych co do tokena** z dekodowaniem sekwencyjnym tam, gdzie
 argmax jest jednoznaczny — akcelerator dokładnego dekodowania, nie przybliżenie.
 
+To opis aktualnie wykonywanej ścieżki, a nie pełnego docelowego interfejsu ze
+`SPEC.md` §6. Fundament ma typowane `DraftTree`/`DraftNode`,
+`SpeculationCoordinator`, kaskadową kompozycję liniową i konfiguracje wielu
+proposerów. CLI odrzuca `draft-model`, `mtp`, `eagle`, `dflash` i `dspark` z
+jawnym komunikatem o wymaganym loaderze i `forge-speculation.json`, dopóki nie ma
+wykonawczego proposera i zgodnych wag. PARD i suffix nie są jeszcze wartościami CLI. N-gram docelowo
+pozostanie opcjonalnym fallbackiem lub rozszerzeniem ich draftów, korzystającym z
+tego samego lossless verifiera.
+
+Typowane API `SpeculativeConfig::chain` zachowuje kolejność proposerów, odrzuca
+pustą listę i duplikaty oraz dopuszcza n-gram wyłącznie jako ostatni element.
+CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
+
 | Flaga | Domyślnie | Opis |
 |---|---|---|
-| `--speculative <M>` | `off` | `off` \| `on` \| `ngram` \| `ngram:<k>`. `on`/`ngram` = proposer n-gram z budżetem draftu 16; `ngram:<k>` ustawia budżet (1..16). `off` = bajt-w-bajt dzisiejsza pętla decode. |
+| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>`. `on`/`ngram` = proposer n-gram z budżetem 16; sufiks `:<k>` wymaga budżetu 1..=16. Neuralne nazwy są odrzucane do czasu podłączenia loadera manifestu. |
+
+### Manifest neuralnego proposera
+
+Plik `forge-speculation.json` ma wersjonowany, zamknięty schemat; nieznane pola są
+błędem. Najważniejsze pola:
+
+| Pole | Znaczenie |
+|---|---|
+| `format_version`, `kind`, `composition` | Wersja formatu, `draft_model`/`mtp`/`eagle`/`dflash`/`dspark` oraz `standalone`/`cascade`/`tree`. |
+| `source` | Adres źródła i repozytorium HTTP(S). |
+| `license` | Osobne SPDX dla kodu i wag, zgoda na redystrybucję i wymagane attribution. `unknown` nie jest akceptowane. |
+| `target`, `target_fingerprint`, `tokenizer_fingerprint` | Id/revision/architektura i rozmiary targetu oraz fingerprinty SHA-256 modelu i tokenizera. |
+| `max_nodes`, `max_depth`, `block_size`, `diffusion_steps` | Granice propozycji; pola zależne od rodzaju proposera. |
+| `artifacts`, `tensor_map`, `shared_tensors` | Role i ścieżki plików, SHA-256, logiczne mapowanie tensorów oraz tensory współdzielone z targetem. |
+| `target_feature_layer_ids`, `feature_dimensions` | Warstwy i wymiary cech wymagane przez EAGLE/DFlash/DSpark. |
+| `dtype`, `quantization`, `supported_sampling_modes` | Reprezentacja wag i jawnie obsługiwane tryby samplingu. |
+| `confidence_calibration` | Metoda, próg, temperatura lub artefakt kalibracji; wymagana dla DFlash/DSpark. |
+
+`SpeculationManifest::load` weryfikuje składnię i zależności pól, kanonikalizuje
+ścieżki artefaktów wewnątrz katalogu manifestu, czyta pliki strumieniowo i porównuje
+ich obliczony SHA-256 z `artifacts[].sha256`. Zwraca otwarte, zweryfikowane uchwyty,
+aby runtime nie otwierał ponownie plików po kontroli integralności. Fingerprinty targetu i tokenizera są
+na tym etapie sprawdzane jako 64-znakowe SHA-256; ich porównanie z uruchomionym
+modelem będzie częścią integracji neuralnego runtime. Pole
+`redistribution_allowed=false` nie blokuje lokalnego odczytu, ale zabrania
+pakowania artefaktu w dystrybucji FORGE bez odrębnej podstawy licencyjnej.
 
 Zakres i komponowanie:
 

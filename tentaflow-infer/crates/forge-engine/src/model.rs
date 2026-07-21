@@ -461,6 +461,44 @@ struct VerifyBufs {
     pinned_ids: DevBuffer,
 }
 
+fn finish_greedy_verification(
+    kv: &mut KvCache,
+    page_table_seq: &mut u64,
+    seq: &mut SeqKv,
+    base: usize,
+    result: Result<(usize, u32)>,
+) -> Result<(usize, u32)> {
+    let result = match result {
+        Ok((accepted, correction)) => {
+            let target_len = accepted
+                .checked_add(1)
+                .and_then(|retained| base.checked_add(retained));
+            match target_len {
+                Some(target_len) if target_len <= seq.len => {
+                    kv.rollback(seq, target_len);
+                    Ok((accepted, correction))
+                }
+                _ => {
+                    if seq.len >= base {
+                        kv.rollback(seq, base);
+                    }
+                    Err(ForgeError::Scheduler(
+                        "invalid speculative verification rollback target".into(),
+                    ))
+                }
+            }
+        }
+        Err(error) => {
+            if seq.len >= base {
+                kv.rollback(seq, base);
+            }
+            Err(error)
+        }
+    };
+    *page_table_seq = 0;
+    result
+}
+
 /// Persistent continuous-batching decode scratch sized for `cap` sequences.
 /// Activation matrices are `[cap, cols]` row-major (the batched GEMM/attention
 /// kernels consume them directly, one row per active sequence). Per-step inputs
@@ -3665,16 +3703,38 @@ impl Model {
     /// forward appends draft K/V and rolls it back, which is only bit-clean and
     /// side-effect-free on the plain F16 cache with no tier/prefix bookkeeping.
     /// The batched verify logits also require an f16/q8_0 lm head.
-    pub fn speculation_eligible(&self) -> bool {
-        !self.is_hybrid()
-            && !self.weights.is_moe()
-            && matches!(self.kv.cfg.quant, KvQuant::F16)
-            && self.tier.is_none()
-            && self.prefix_cache.is_none()
-            && matches!(
-                self.weights.lm_head,
-                DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
-            )
+    pub fn validate_speculation_target(&self) -> Result<()> {
+        if self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "speculative verification does not support hybrid SSM models".into(),
+            ));
+        }
+        if self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "speculative verification does not support routed MoE models".into(),
+            ));
+        }
+        if !matches!(self.kv.cfg.quant, KvQuant::F16) {
+            return Err(ForgeError::Unsupported(
+                "speculative verification requires an F16 KV cache".into(),
+            ));
+        }
+        if self.tier.is_some() {
+            return Err(ForgeError::Unsupported(
+                "speculative verification does not support KV tiering".into(),
+            ));
+        }
+        if self.prefix_cache.is_some() {
+            return Err(ForgeError::Unsupported(
+                "speculative verification requires the prefix cache to be disabled".into(),
+            ));
+        }
+        if !matches!(self.weights.lm_head, DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }) {
+            return Err(ForgeError::Unsupported(
+                "speculative verification requires an F16 or Q8_0 language-model head".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Provision the verify-logit scratch for `cap` query positions (idempotent;
@@ -3706,8 +3766,8 @@ impl Model {
     /// resident. Returns `(accepted, correction)`: the number of accepted draft
     /// tokens and the model's argmax token at the first unaccepted position
     /// (the correction when `accepted < draft.len()`, else the bonus token).
-    /// Caller must ensure `speculation_eligible()` and a greedy sampler, so the
-    /// accepted + correction tokens are exactly the greedy-decode output.
+    /// Wywołujący musi wcześniej użyć `validate_speculation_target()` oraz
+    /// próbkowania greedy, aby wynik był zgodny z dekodowaniem sekwencyjnym.
     pub fn verify_greedy_draft(
         &mut self,
         seq: &mut SeqKv,
@@ -3724,52 +3784,39 @@ impl Model {
         let mut batch = Vec::with_capacity(t);
         batch.push(fed);
         batch.extend_from_slice(draft);
-        // Mini-prefill: appends the fed token + draft K/V at positions
-        // base..base+t and leaves the [T, hidden] final normed hidden in the
-        // prefill scratch. Eligibility guarantees no tier/prefix bookkeeping, so
-        // this only grows the F16 cache (rolled back below).
-        self.prefill_forward(seq, &batch)?;
+        let result = (|| {
+            self.prefill_forward(seq, &batch)?;
 
-        let stream = &self.stream;
-        let vb = self.verify_bufs.as_ref().expect("ensured above");
-        let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
-        // [T, vocab] logits, then one greedy argmax per row on the GPU (ties to
-        // the lowest id, matching the decode sampler); only T ids come back.
-        self.logits_gemm(&vb.logits, &pb.x, t, stream)?;
-        self.kernels
-            .sample_batched_argmax_f32(&vb.ids, &vb.logits, t, vocab, stream)?;
-        self.device
-            .copy(&vb.ids, 0, &vb.pinned_ids, 0, t * 4, stream)?;
-        self.device.synchronize()?;
+            let stream = &self.stream;
+            let vb = self.verify_bufs.as_ref().expect("ensured above");
+            let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
+            self.logits_gemm(&vb.logits, &pb.x, t, stream)?;
+            self.kernels
+                .sample_batched_argmax_f32(&vb.ids, &vb.logits, t, vocab, stream)?;
+            self.device
+                .copy(&vb.ids, 0, &vb.pinned_ids, 0, t * 4, stream)?;
+            self.device.synchronize()?;
 
-        let ptr = vb
-            .pinned_ids
-            .host_ptr()
-            .expect("pinned buffer has host mapping") as *const i32;
-        let argmax = unsafe { std::slice::from_raw_parts(ptr, t) };
-
-        // Position i's argmax is the model's own token for position base+i+1.
-        // Accept draft[i] while it matches; the first miss (or the bonus row
-        // when every draft is accepted) yields the correction token.
-        let mut accepted = 0usize;
-        let mut correction = 0u32;
-        for i in 0..t {
-            let am = argmax[i] as u32;
-            if i < draft.len() && am == draft[i] {
-                accepted += 1;
-            } else {
-                correction = am;
-                break;
+            let ptr = vb
+                .pinned_ids
+                .host_ptr()
+                .expect("pinned buffer has host mapping") as *const i32;
+            let argmax = unsafe { std::slice::from_raw_parts(ptr, t) };
+            let mut accepted = 0usize;
+            let mut correction = 0u32;
+            for i in 0..t {
+                let am = argmax[i] as u32;
+                if i < draft.len() && am == draft[i] {
+                    accepted += 1;
+                } else {
+                    correction = am;
+                    break;
+                }
             }
-        }
+            Ok((accepted, correction))
+        })();
 
-        // Keep fed + accepted drafts (accepted+1 positions from `base`); discard
-        // the rejected draft positions' K/V. The correction/bonus token is fed
-        // by the next step, so it is intentionally NOT resident yet.
-        self.kv.rollback(seq, base + accepted + 1);
-        // The device page table now lists freed tail slots; force a re-upload.
-        self.pt_seq = 0;
-        Ok((accepted, correction))
+        finish_greedy_verification(&mut self.kv, &mut self.pt_seq, seq, base, result)
     }
 
     /// Record every launch of one decode step into a replayable graph.
@@ -5608,5 +5655,58 @@ impl Model {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len());
         }
         device.copy(pinned, 0, dev, 0, bytes.len(), stream)
+    }
+}
+
+#[cfg(test)]
+mod verify_rollback_tests {
+    use super::{finish_greedy_verification, ForgeError, KvCache, KvConfig, KvQuant, Result, SeqKv};
+    use forge_hal::cpu::CpuDevice;
+
+    fn fail_after_kv_growth(
+        kv: &mut KvCache,
+        page_table_seq: &mut u64,
+        seq: &mut SeqKv,
+    ) -> Result<()> {
+        let base = seq.len;
+        let result: Result<(usize, u32)> = (|| {
+            for _ in 0..6 {
+                kv.grow(seq)?;
+            }
+            Err(ForgeError::Kernel("wymuszony błąd weryfikacji".into()))
+        })();
+        finish_greedy_verification(kv, page_table_seq, seq, base, result).map(|_| ())
+    }
+
+    #[test]
+    fn error_after_kv_growth_rolls_back_every_page() {
+        let device = CpuDevice::new();
+        let mut kv = KvCache::new(
+            device.as_ref(),
+            KvConfig {
+                n_layers: 1,
+                n_kv_heads: 1,
+                head_dim: 8,
+                page_size: 4,
+                n_pages: 8,
+                max_pages_per_seq: 8,
+                quant: KvQuant::F16,
+            },
+        )
+        .expect("cache KV powinien powstać");
+        let mut seq = kv.new_seq();
+        for _ in 0..3 {
+            kv.grow(&mut seq)
+                .expect("wzrost sekwencji powinien się udać");
+        }
+        let base_pages = seq.pages.len();
+        let base_free_pages = kv.free_page_count();
+        let mut page_table_seq = 17;
+
+        assert!(fail_after_kv_growth(&mut kv, &mut page_table_seq, &mut seq).is_err());
+        assert_eq!(seq.len, 3);
+        assert_eq!(seq.pages.len(), base_pages);
+        assert_eq!(kv.free_page_count(), base_free_pages);
+        assert_eq!(page_table_seq, 0);
     }
 }

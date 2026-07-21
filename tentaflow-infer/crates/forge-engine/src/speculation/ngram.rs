@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use super::{Proposer, SeqContext};
+use super::{DraftTree, Proposer, ProposerKind, SeqContext};
 
 const MAX_GRAM: usize = 4;
 /// Bounds both memory and per-propose candidate scanning; newest occurrences
@@ -79,10 +79,10 @@ impl Default for NgramProposer {
 }
 
 impl Proposer for NgramProposer {
-    fn propose(&mut self, ctx: &SeqContext<'_>, budget: usize) -> Vec<u32> {
+    fn propose(&mut self, ctx: &SeqContext<'_>, budget: usize) -> forge_types::Result<DraftTree> {
         let ctx_tokens = ctx.tokens();
         if budget == 0 || ctx_tokens.is_empty() {
-            return Vec::new();
+            return Ok(DraftTree::linear(ProposerKind::Ngram, Vec::new()));
         }
         for n in (self.min_gram..=MAX_GRAM).rev() {
             if ctx_tokens.len() < n {
@@ -104,9 +104,16 @@ impl Proposer for NgramProposer {
             }
             let Some((_, p)) = best else { continue };
             let end = (p + budget).min(self.history.len());
-            return self.history[p..end].to_vec();
+            return Ok(DraftTree::linear(
+                ProposerKind::Ngram,
+                self.history[p..end].to_vec(),
+            ));
         }
-        Vec::new()
+        Ok(DraftTree::linear(ProposerKind::Ngram, Vec::new()))
+    }
+
+    fn kind(&self) -> ProposerKind {
+        ProposerKind::Ngram
     }
 
     fn accept_feedback(&mut self, _proposed: usize, _accepted: usize) {
@@ -128,9 +135,5 @@ impl Proposer for NgramProposer {
             }
             list.push(pos as u32);
         }
-    }
-
-    fn name(&self) -> &str {
-        "ngram"
     }
 }

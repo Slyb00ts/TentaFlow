@@ -55,7 +55,8 @@ async fn chat_completions_end_to_end() {
         let template_vars = loaded.bundle.template_vars();
         let eos_ids = loaded.bundle.eos_ids.clone();
         let tokenizer = Arc::new(loaded.bundle.tokenizer);
-        let handle = spawn_engine(loaded.model, tokenizer.clone(), 4, 16);
+        let handle = spawn_engine(loaded.model, tokenizer.clone(), 4, 16)
+            .expect("silnik powinien się uruchomić");
         (
             handle,
             tokenizer,

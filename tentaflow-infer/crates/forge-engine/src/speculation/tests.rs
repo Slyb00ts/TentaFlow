@@ -4,7 +4,10 @@ use super::cascade::{CascadeComposer, DraftSegment};
 use super::ngram::NgramProposer;
 use super::state::SpeculativeState;
 use super::stats::ProposerStats;
-use super::{verify_greedy, Proposer, SeqContext};
+use super::{
+    verify_greedy, DraftNode, DraftTree, Proposer, ProposerKind, SeqContext,
+    SpeculationCoordinator, SpeculativeConfig,
+};
 
 /// Deterministic stand-in for a draft-model/MTP proposer: always proposes a
 /// fixed token run regardless of context.
@@ -12,16 +15,40 @@ struct FixedProposer {
     tokens: Vec<u32>,
 }
 
+struct MislabelledProposer;
+
 impl Proposer for FixedProposer {
-    fn propose(&mut self, _ctx: &SeqContext<'_>, budget: usize) -> Vec<u32> {
-        self.tokens.iter().copied().take(budget).collect()
+    fn propose(&mut self, _ctx: &SeqContext<'_>, budget: usize) -> forge_types::Result<DraftTree> {
+        Ok(DraftTree::linear(
+            ProposerKind::DraftModel,
+            self.tokens.iter().copied().take(budget).collect(),
+        ))
+    }
+
+    fn kind(&self) -> ProposerKind {
+        ProposerKind::DraftModel
     }
 
     fn accept_feedback(&mut self, _proposed: usize, _accepted: usize) {}
+}
 
-    fn name(&self) -> &str {
-        "fixed"
+impl Proposer for MislabelledProposer {
+    fn propose(&mut self, _ctx: &SeqContext<'_>, _budget: usize) -> forge_types::Result<DraftTree> {
+        Ok(DraftTree::linear(ProposerKind::DSpark, vec![1]))
     }
+
+    fn kind(&self) -> ProposerKind {
+        ProposerKind::DraftModel
+    }
+
+    fn accept_feedback(&mut self, _proposed: usize, _accepted: usize) {}
+}
+
+fn proposal_tokens(proposal: forge_types::Result<DraftTree>) -> Vec<u32> {
+    proposal
+        .expect("proposer powinien zwrócić szkic")
+        .linear_tokens()
+        .expect("szkic powinien być liniowy")
 }
 
 /// Small deterministic PRNG (splitmix-style) so property tests need no deps.
@@ -68,7 +95,7 @@ fn ngram_repetitive_stream_yields_full_budget_draft() {
     let mut p = NgramProposer::new();
     observe_all(&mut p, &history);
 
-    let draft = p.propose(&SeqContext::new(&history), 8);
+    let draft = proposal_tokens(p.propose(&SeqContext::new(&history), 8));
     assert_eq!(draft, pattern, "draft must continue the repeating pattern");
 }
 
@@ -78,7 +105,7 @@ fn ngram_non_repetitive_stream_yields_empty_draft() {
     let mut p = NgramProposer::new();
     observe_all(&mut p, &history);
 
-    let draft = p.propose(&SeqContext::new(&history), 8);
+    let draft = proposal_tokens(p.propose(&SeqContext::new(&history), 8));
     assert!(draft.is_empty(), "no recurrence → nothing to propose");
 }
 
@@ -90,7 +117,7 @@ fn ngram_longest_gram_wins_over_shorter_noise() {
     let mut p = NgramProposer::new();
     observe_all(&mut p, &history);
 
-    let draft = p.propose(&SeqContext::new(&history), 2);
+    let draft = proposal_tokens(p.propose(&SeqContext::new(&history), 2));
     assert_eq!(draft, vec![42, 99]);
 }
 
@@ -108,7 +135,7 @@ fn ngram_extends_context_beyond_observed_history() {
 
     let mut ctx = history.clone();
     ctx.extend_from_slice(&[10, 20]); // unverified draft core
-    let draft = p.propose(&SeqContext::new(&ctx), 4);
+    let draft = proposal_tokens(p.propose(&SeqContext::new(&ctx), 4));
     assert_eq!(draft, vec![30, 40, 50, 60]);
 }
 
@@ -130,7 +157,9 @@ fn cascade_ngram_extends_model_draft() {
     };
     let mut composer = CascadeComposer::new(vec![Box::new(core), Box::new(ngram)]);
 
-    let (draft, segments) = composer.compose(&history, 8);
+    let (draft, segments) = composer
+        .compose(&history, 8)
+        .expect("kompozycja powinna się udać");
     assert_eq!(draft, vec![10, 20, 30, 40, 50, 60, 70, 80]);
     assert_eq!(
         segments,
@@ -145,6 +174,16 @@ fn cascade_ngram_extends_model_draft() {
             },
         ]
     );
+    composer.commit_feedback(&segments, 5);
+    let stats = composer.stats();
+    assert_eq!(
+        (stats[0].name.as_str(), stats[0].proposed, stats[0].accepted),
+        ("draft-model", 2, 2)
+    );
+    assert_eq!(
+        (stats[1].name.as_str(), stats[1].proposed, stats[1].accepted),
+        ("ngram", 6, 3)
+    );
 }
 
 #[test]
@@ -157,13 +196,24 @@ fn cascade_respects_total_budget() {
     };
     let mut composer = CascadeComposer::new(vec![Box::new(core), Box::new(tail)]);
 
-    let (draft, segments) = composer.compose(&[0], 5);
+    let (draft, segments) = composer
+        .compose(&[0], 5)
+        .expect("kompozycja powinna się udać");
     assert_eq!(draft, vec![1, 2, 3, 4, 5]);
     assert_eq!(segments.len(), 1, "budget exhausted before second proposer");
 
-    let (draft, segments) = composer.compose(&[0], 10);
+    let (draft, segments) = composer
+        .compose(&[0], 10)
+        .expect("kompozycja powinna się udać");
     assert_eq!(draft, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 9]);
     assert_eq!(segments[1].len, 2, "tail truncated to remaining budget");
+}
+
+#[test]
+fn cascade_rejects_nodes_attributed_to_another_proposer() {
+    let mut composer = CascadeComposer::new(vec![Box::new(MislabelledProposer)]);
+    assert!(composer.compose(&[0], 1).is_err());
+    assert_eq!(composer.stats()[0].proposed, 0);
 }
 
 #[test]
@@ -176,7 +226,9 @@ fn commit_feedback_attributes_acceptance_in_draft_order() {
     };
     let mut composer = CascadeComposer::new(vec![Box::new(core), Box::new(tail)]);
 
-    let (draft, segments) = composer.compose(&[0], 8);
+    let (draft, segments) = composer
+        .compose(&[0], 8)
+        .expect("kompozycja powinna się udać");
     assert_eq!(draft.len(), 8);
     // 6 accepted: core gets 4/4, tail gets 2/4.
     composer.commit_feedback(&segments, 6);
@@ -197,12 +249,16 @@ fn adaptive_disable_kicks_in_and_recovers() {
 
     // 32 fully-rejected drafts fill the window and trip the disable rule.
     for _ in 0..super::stats::WINDOW_CALLS {
-        let (draft, segments) = composer.compose(&[0], 8);
+        let (draft, segments) = composer
+            .compose(&[0], 8)
+            .expect("kompozycja powinna się udać");
         assert!(!draft.is_empty());
         composer.commit_feedback(&segments, 0);
     }
     assert!(composer.stats()[0].sleeping);
-    let (draft, segments) = composer.compose(&[0], 8);
+    let (draft, segments) = composer
+        .compose(&[0], 8)
+        .expect("kompozycja powinna się udać");
     assert!(
         draft.is_empty() && segments.is_empty(),
         "sleeping proposer skipped"
@@ -213,7 +269,9 @@ fn adaptive_disable_kicks_in_and_recovers() {
         composer.observe(t as u32);
     }
     assert!(!composer.stats()[0].sleeping);
-    let (draft, _) = composer.compose(&[0], 8);
+    let (draft, _) = composer
+        .compose(&[0], 8)
+        .expect("kompozycja powinna się udać");
     assert_eq!(draft, vec![1, 2, 3, 4], "proposer active again after sleep");
 }
 
@@ -224,7 +282,9 @@ fn high_acceptance_never_disables() {
     };
     let mut composer = CascadeComposer::new(vec![Box::new(good)]);
     for _ in 0..3 * super::stats::WINDOW_CALLS {
-        let (draft, segments) = composer.compose(&[0], 8);
+        let (draft, segments) = composer
+            .compose(&[0], 8)
+            .expect("kompozycja powinna się udać");
         composer.commit_feedback(&segments, draft.len());
     }
     let stats = &composer.stats()[0];
@@ -259,20 +319,140 @@ fn speculative_state_draft_commit_roundtrip() {
     let mut state = SpeculativeState::new(composer);
     state.observe_all(&prompt);
 
-    let draft = state.draft(8);
+    let draft = state.draft(8).expect("szkic powinien powstać");
     assert_eq!(draft, pattern);
 
     // The model "actually" continues the pattern for 5 tokens then diverges.
     let sampled: Vec<u32> = vec![3, 1, 4, 1, 5, 7, 7, 7];
     let accepted = verify_greedy(&draft, &sampled);
     assert_eq!(accepted, 5);
-    state.commit(&draft, accepted);
+    state
+        .commit(&draft, accepted)
+        .expect("zatwierdzenie powinno się udać");
     // Bonus token: the model's own sample at the first rejected position.
     state.observe(sampled[accepted]);
 
     assert_eq!(state.history().len(), prompt.len() + accepted + 1);
     let stats = state.stats();
     assert_eq!((stats[0].proposed, stats[0].accepted), (8, 5));
+}
+
+#[test]
+fn speculative_state_rejects_overwriting_pending_draft() {
+    let composer = CascadeComposer::new(vec![Box::new(FixedProposer {
+        tokens: vec![1, 2, 3],
+    })]);
+    let mut state = SpeculativeState::new(composer);
+    let first = state.draft(3).expect("pierwszy szkic powinien powstać");
+    assert!(state.draft(3).is_err());
+    state.cancel_draft();
+    assert_eq!(
+        state
+            .draft(3)
+            .expect("szkic po anulowaniu powinien powstać"),
+        first
+    );
+}
+
+#[test]
+fn linear_verifier_rejects_branching_proposal() {
+    let proposal = DraftTree::new(vec![
+        DraftNode {
+            token_id: 1,
+            parent: None,
+            depth: 0,
+            source: ProposerKind::Eagle,
+            proposal_logprob: Some(-0.1),
+            conditional_confidence: Some(0.9),
+        },
+        DraftNode {
+            token_id: 2,
+            parent: Some(0),
+            depth: 1,
+            source: ProposerKind::Eagle,
+            proposal_logprob: Some(-0.2),
+            conditional_confidence: Some(0.8),
+        },
+        DraftNode {
+            token_id: 3,
+            parent: Some(0),
+            depth: 1,
+            source: ProposerKind::Eagle,
+            proposal_logprob: Some(-0.3),
+            conditional_confidence: Some(0.7),
+        },
+    ])
+    .expect("drzewo powinno mieć poprawny porządek topologiczny");
+
+    assert!(proposal.linear_tokens().is_err());
+}
+
+#[test]
+fn draft_tree_rejects_invalid_probability_metadata() {
+    for (logprob, confidence) in [
+        (Some(f32::NAN), None),
+        (Some(0.1), None),
+        (None, Some(f32::INFINITY)),
+        (None, Some(-0.1)),
+        (None, Some(1.1)),
+    ] {
+        let tree = DraftTree::new(vec![DraftNode {
+            token_id: 1,
+            parent: None,
+            depth: 0,
+            source: ProposerKind::DSpark,
+            proposal_logprob: logprob,
+            conditional_confidence: confidence,
+        }]);
+        assert!(tree.is_err());
+    }
+}
+
+#[test]
+fn coordinator_builds_ngram_and_rejects_unimplemented_proposers() {
+    let coordinator = SpeculationCoordinator::new(
+        SpeculativeConfig::ngram(8).expect("budżet powinien być poprawny"),
+    )
+    .expect("n-gram powinien być obsługiwany");
+    assert!(coordinator
+        .new_state(&[1, 2, 3])
+        .expect("stan powinien powstać")
+        .is_some());
+
+    for kind in [
+        ProposerKind::DraftModel,
+        ProposerKind::Mtp,
+        ProposerKind::Eagle,
+        ProposerKind::DFlash,
+        ProposerKind::DSpark,
+    ] {
+        let error = SpeculationCoordinator::new(
+            SpeculativeConfig::chain(vec![kind, ProposerKind::Ngram], 8)
+                .expect("łańcuch powinien być poprawny"),
+        )
+        .err()
+        .expect("niezaimplementowany proposer powinien zwrócić błąd");
+        assert!(matches!(error, forge_types::ForgeError::Unsupported(_)));
+    }
+}
+
+#[test]
+fn speculative_config_rejects_budget_outside_kernel_capacity() {
+    assert!(SpeculativeConfig::ngram(0).is_err());
+    assert!(SpeculativeConfig::ngram(crate::model::MAX_SPEC_DRAFT + 1).is_err());
+}
+
+#[test]
+fn speculative_config_validates_chain_order_and_duplicates() {
+    let config = SpeculativeConfig::chain(vec![ProposerKind::DSpark, ProposerKind::Ngram], 8)
+        .expect("neuralny proposer z rozszerzeniem n-gram powinien tworzyć łańcuch");
+    assert_eq!(
+        config.proposers(),
+        &[ProposerKind::DSpark, ProposerKind::Ngram]
+    );
+    assert!(SpeculativeConfig::chain(Vec::new(), 8).is_err());
+    assert!(SpeculativeConfig::chain(vec![ProposerKind::Ngram, ProposerKind::Ngram], 8,).is_err());
+    assert!(SpeculativeConfig::chain(vec![ProposerKind::Ngram, ProposerKind::DSpark], 8,).is_err());
 }
 
 #[test]
@@ -287,7 +467,7 @@ fn property_ngram_proposals_always_match_a_recurrence() {
             }
             let budget = 1 + rng.below(8) as usize;
             let history: Vec<u32> = p.observed().to_vec();
-            let draft = p.propose(&SeqContext::new(&history), budget);
+            let draft = proposal_tokens(p.propose(&SeqContext::new(&history), budget));
             assert!(draft.len() <= budget);
             if draft.is_empty() {
                 continue;
@@ -322,14 +502,16 @@ fn property_state_commit_observe_keeps_index_consistent() {
         let mut total_accepted = 0u64;
         for _ in 0..200 {
             let budget = 1 + rng.below(6) as usize;
-            let draft = state.draft(budget);
+            let draft = state.draft(budget).expect("szkic powinien powstać");
             assert!(draft.len() <= budget);
             let n_accepted = if draft.is_empty() {
                 0
             } else {
                 rng.below(draft.len() as u64 + 1) as usize
             };
-            state.commit(&draft, n_accepted);
+            state
+                .commit(&draft, n_accepted)
+                .expect("zatwierdzenie powinno się udać");
             expected_len += n_accepted;
             total_accepted += n_accepted as u64;
             // Engine always samples one real token per verify step.
