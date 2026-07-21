@@ -5,7 +5,11 @@ edition = "2021"
 description = "TentaFlow Core — wspolna biblioteka dla Router, Desktop i Mobile"
 
 [features]
-default = ["camera"]
+# Vision (camera CV) is NOT optional: the analysis engine, its pipeline and the
+# vision worker ship in every build. Keeping it behind an opt-in feature meant
+# `cargo test`/`cargo check` silently skipped the whole module, so regressions in
+# it went unnoticed until runtime.
+default = ["camera", "inference-vision-gpu", "inference-supertonic"]
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:tentaflow-wrappers", "tentaflow-wrappers/llama"]
 inference-whisper = ["dep:tentaflow-wrappers", "tentaflow-wrappers/whisper"]
