@@ -423,12 +423,15 @@ coherent Polish on the RTX 4090.
   statystyki akceptacji per proposer. Węzły przenoszą źródło,
   `proposal_logprob` i `conditional_confidence`, dzięki czemu ten sam kontrakt
   obsłuży później greedy oraz lossless stochastic acceptance.
-- Wykonawczo działają dwie rozłączne ścieżki: hostowy `NgramProposer` oraz natywne
-  MTP/NextN modelu dla gęstego hybrydowego GGUF `qwen35`. Natywne MTP wydziela
+- Wykonawczo działa hostowy `NgramProposer`, natywne MTP/NextN oraz ich router
+  priorytetowy dla gęstego hybrydowego GGUF `qwen35`. Natywne MTP wydziela
   bloki `nextn_predict_layers` z trunku, ładuje ich NVFP4/Q8_0/F32 bez drugiej
   kopii targetu i wykonuje proposer, weryfikację całego draftu oraz checkpointy
   DeltaNet/KV na GPU przez kernele Mojo. Serwer obsługuje `--speculative mtp`,
-  `mtp:2` i `mtp:3`; budżet 3 jest adaptacyjnie przełączany między K=2 i K=3.
+  `mtp:2`, `mtp:3` oraz priorytetowy router `mtp+ngram:2|3`; pełny draft n-gram
+  omija proposer MTP, stan MTP jest doganiany po zaakceptowanym prefiksie, a
+  brak pełnego draftu uruchamia natywne MTP. Budżet samodzielnego `mtp` 3 jest
+  adaptacyjnie przełączany między K=2 i K=3.
   Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
 - Natywne MTP jest obecnie greedy-exact, wymaga `max_active=1` z powodu stanu SSM
   należącego do modelu i zostało wykonawczo sprawdzone wyłącznie na CUDA/RTX 4090
@@ -438,10 +441,16 @@ coherent Polish on the RTX 4090.
   `dspark` nadal zwracają `Unsupported`; weryfikacja drzewa, sampling, PARD i
   suffix nie są jeszcze zaimplementowane.
 - Retained checkpointy stanu DeltaNet usuwają ponowny skan 48 warstw podczas
-  zatwierdzania zaakceptowanego prefiksu. Końcowy pomiar RTX 4090: około 59,8
-  tok/s dla raw128 oraz 57,7 tok/s dla raw512 w trybie MTP K=3. Referencja
-  llama.cpp na tym samym modelu osiąga odpowiednio
-  110,2 i 100,5 tok/s; luka wydajności pozostaje otwarta. Szczegóły:
+  zatwierdzania zaakceptowanego prefiksu. Wyspecjalizowana głowa Q8 B3/B4 oraz
+  scalone przygotowanie DeltaNet zmniejszają liczbę kerneli i kopii D2D. Stała
+  część verifiera T=3/T=4 działa jako trwały graf, a pozycję bazową attention
+  odczytuje z bufora GPU.
+  Fair prose RTX 4090: około 102,0 tok/s dla raw128 oraz 72,6 tok/s dla raw512
+  w trybie MTP K=3; `mtp+ngram:3` osiąga odpowiednio 118,897 tok/s oraz
+  76,688 tok/s. Referencja pure MTP bez n-gramu z
+  llama.cpp na tym samym modelu i prose osiąga około
+  111,079 i 87,652 tok/s. Wszystkie przebiegi FORGE zachowały identyczne ID
+  tokenów względem sekwencyjnego greedy; luka pure MTP pozostaje otwarta. Szczegóły:
   `tentaflow-infer/docs/BENCH_QWEN35_MTP_NVFP4.md`.
 - `forge-formats` udostępnia zamknięty parser `forge-speculation.json` dla
   neuralnych proposerów. Manifest opisuje target, fingerprinty, tensory, cechy,
@@ -449,6 +458,28 @@ coherent Polish on the RTX 4090.
   `SpeculationManifest::load` ogranicza artefakty do katalogu manifestu i
   weryfikuje SHA-256 każdego pliku; porównanie fingerprintu z aktywnym targetem
   nastąpi przy integracji neuralnego runtime.
+- Krótka weryfikacja DeltaNet T=2-4 ma scalony kernel Mojo
+  `deltanet_prepare_t{2,3,4}_f16`. W jednym launchu wykonuje przyczynowy splot,
+  zapis checkpointów okna, podział QKV, L2/repeat Q/K oraz bramki `g` i `beta`;
+  wejściowy stan okna pozostaje niemutowany. Artefakty PTX wymagają `sm_80+`.
+- NVFP4 B3/B4 na NVIDIA z warpem 32 używa dwóch wierszy na CTA, współdzielonej
+  LUT E2M1 i szerokich odczytów aktywacji. Osobne symbole NVIDIA są wybierane
+  przez launcher, a dotychczasowe B3/B4 pozostają przenośnym fallbackiem.
+- Krótki skan DeltaNet T3/T4 dla `d_state <= 128` dzieli kolumny stanu na kafle
+  szerokości warpa. Dla kształtu Qwen `32 x 128` daje 2,60-2,63x w izolowanym
+  profilu RTX 4090 i około 5,9% krótszy pełny cykl MTP, zachowując bitową
+  zgodność wyjścia i checkpointów. T2 i większe stany używają starej ścieżki.
+- Krótkie Q8_0 B3/B4 na NVIDIA z warpem 32 używają czterech wierszy na CTA i
+  DP4A dla dokładnych iloczynów int8. Przenośny kernel ośmiu wierszy pozostaje
+  fallbackiem; F16/F32 są bitowo zgodne, a ważony miks Qwen zyskuje około
+  11,5-13% w izolowanym pomiarze.
+- Jawny launcher NVFP4 Q8_1/DP4A ma batched, bitowo zgodne warianty T3/T4.
+  Zachowują kolejność szeregowego GEMV i współdzielą dekod wag między tokenami;
+  domyślny dispatch pozostaje F16 do czasu pełnego A/B long-parity.
+- NVIDIA NVFP4 B1 z dwoma wierszami na CTA ma tę samą matematykę co B3/B4 i
+  jest z nimi bitowo zgodny na wszystkich projekcjach ThinkingCap. W izolacji
+  jest 1,8-3,2x szybszy od starego B1 F16. Prose128/prose512, repeat i natywne
+  MTP zachowują parity po ujednoliceniu serial i verifier na tej matematyce.
 
 ## Conventions
 

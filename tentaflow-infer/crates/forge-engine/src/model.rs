@@ -211,6 +211,12 @@ pub struct Model {
     verify_bufs: Option<VerifyBufs>,
     /// Warstwowy verifier T=3/4 dla hybrydowego targetu MTP.
     hybrid_verify_bufs: Option<HybridVerifyBufs>,
+    /// Trwałe grafy stałej części verifiera MTP dla T=3 i T=4.
+    hybrid_verify_graph_t3: Option<ExecGraph>,
+    hybrid_verify_graph_t4: Option<ExecGraph>,
+    /// Nieudana próba przechwycenia wyłącza kolejne próby dla danego T.
+    hybrid_verify_graph_t3_disabled: bool,
+    hybrid_verify_graph_t4_disabled: bool,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
     /// Captured non-hybrid MoE decode step (fully device-side grouped expert
@@ -477,7 +483,9 @@ struct VerifyBufs {
 
 /// Sposób przechowania danych potrzebnych do zatwierdzenia stanu DeltaNet.
 enum DeltaVerifyCommit {
-    Retained { checkpoint_byte_offset: usize },
+    Retained {
+        checkpoint_byte_offset: usize,
+    },
     Recompute {
         q: DevBuffer,
         k: DevBuffer,
@@ -498,15 +506,14 @@ struct DeltaVerifyCache {
 /// Bufory krótkiego, warstwowego przebiegu weryfikacyjnego modelu hybrydowego.
 struct HybridVerifyBufs {
     cap: usize,
+    base_pos: DevBuffer,
+    visible_lens: DevBuffer,
     q_full: DevBuffer,
     qc: DevBuffer,
     gatec: DevBuffer,
     gated: DevBuffer,
     qkv_mixed: DevBuffer,
     z: DevBuffer,
-    conv_out: DevBuffer,
-    q16: DevBuffer,
-    k16: DevBuffer,
     q32: DevBuffer,
     k32: DevBuffer,
     vtok: DevBuffer,
@@ -519,6 +526,7 @@ struct HybridVerifyBufs {
     state_checkpoints: DevBuffer,
     retained_state_checkpoints: Option<DevBuffer>,
     accepted: DevBuffer,
+    pinned_decision: DevBuffer,
     pinned_embed: DevBuffer,
     delta: Vec<Option<DeltaVerifyCache>>,
 }
@@ -542,6 +550,7 @@ fn alloc_checked(
     device.alloc(bytes, kind, Pool::Activations)
 }
 
+#[cfg(test)]
 fn native_mtp_greedy_decision(draft: &[u32], predictions: &[i32]) -> (usize, u32) {
     debug_assert_eq!(predictions.len(), draft.len() + 1);
     let mut accepted = 0usize;
@@ -587,6 +596,33 @@ fn finish_greedy_verification(
     };
     *page_table_seq = 0;
     result
+}
+
+fn logical_kv_regions(
+    pages: &[i32],
+    seq_len: usize,
+    page_size: usize,
+    n_heads: usize,
+    head_bytes: usize,
+) -> Vec<(usize, usize)> {
+    let page_head_bytes = page_size * head_bytes;
+    let page_bytes = n_heads * page_head_bytes;
+    let mut regions = Vec::with_capacity(pages.len() * n_heads);
+    let mut remaining = seq_len;
+    for &page in pages {
+        if remaining == 0 {
+            break;
+        }
+        let tokens = remaining.min(page_size);
+        for head in 0..n_heads {
+            regions.push((
+                page as usize * page_bytes + head * page_head_bytes,
+                tokens * head_bytes,
+            ));
+        }
+        remaining -= tokens;
+    }
+    regions
 }
 
 /// Persistent continuous-batching decode scratch sized for `cap` sequences.
@@ -797,9 +833,10 @@ impl Model {
             (None, None)
         };
         let hidden = p.hidden_size;
-        let q_dim = p.n_heads.checked_mul(p.head_dim).ok_or_else(|| {
-            ForgeError::Scheduler("przepełnienie wymiaru Q verifiera MTP".into())
-        })?;
+        let q_dim = p
+            .n_heads
+            .checked_mul(p.head_dim)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie wymiaru Q verifiera MTP".into()))?;
         let kv_dim = p.n_kv_heads * p.head_dim;
         let inter = p.intermediate_size;
         let attn_parts_bytes = p
@@ -956,6 +993,10 @@ impl Model {
             prefill_bufs: None,
             verify_bufs: None,
             hybrid_verify_bufs: None,
+            hybrid_verify_graph_t3: None,
+            hybrid_verify_graph_t4: None,
+            hybrid_verify_graph_t3_disabled: false,
+            hybrid_verify_graph_t4_disabled: false,
             decode_graph: None,
             decode_moe_graph: None,
             decode_rot_graph: None,
@@ -1358,17 +1399,31 @@ impl Model {
                 output_scale,
                 rows,
                 cols,
-            } => self.kernels.gemv_nvfp4_gguf_q8_1_group_f16(
-                &[Nvfp4GgufQ8Projection {
-                    output: y,
-                    weights: buf,
-                    rows: *rows,
-                    output_scale: *output_scale,
-                }],
-                x,
-                *cols,
-                stream,
-            ),
+            } => {
+                if self.device.caps().vendor == Vendor::Nvidia {
+                    self.kernels.gemv_nvfp4_gguf_b1_f16(
+                        y,
+                        buf,
+                        x,
+                        *rows,
+                        *cols,
+                        *output_scale,
+                        stream,
+                    )
+                } else {
+                    self.kernels.gemv_nvfp4_gguf_q8_1_group_f16(
+                        &[Nvfp4GgufQ8Projection {
+                            output: y,
+                            weights: buf,
+                            rows: *rows,
+                            output_scale: *output_scale,
+                        }],
+                        x,
+                        *cols,
+                        stream,
+                    )
+                }
+            }
         }
     }
 
@@ -1406,8 +1461,22 @@ impl Model {
             });
         }
         let Some(cols) = cols else { return Ok(false) };
-        self.kernels
-            .gemv_nvfp4_gguf_q8_1_group_f16(&group, x, cols, stream)?;
+        if self.device.caps().vendor == Vendor::Nvidia {
+            for projection in group {
+                self.kernels.gemv_nvfp4_gguf_b1_f16(
+                    projection.output,
+                    projection.weights,
+                    x,
+                    projection.rows,
+                    cols,
+                    projection.output_scale,
+                    stream,
+                )?;
+            }
+        } else {
+            self.kernels
+                .gemv_nvfp4_gguf_q8_1_group_f16(&group, x, cols, stream)?;
+        }
         Ok(true)
     }
 
@@ -4647,7 +4716,7 @@ impl Model {
 
             for step in 0..=k {
                 self.mtp_gather_embedding(&mut state, step)?;
-                state.stage_step(&self.stream)?;
+                state.stage_step(&self.kernels, &self.stream)?;
                 self.mtp_forward_one(&mut state, step < k)?;
                 state.save_step_hidden(step, &self.stream)?;
                 if step == k {
@@ -4746,7 +4815,7 @@ impl Model {
             self.device
                 .write(&(token as i32).to_le_bytes(), &self.bufs.sample_out, 0)?;
             self.mtp_gather_embedding(&mut state, 0)?;
-            state.stage_step(&self.stream)?;
+            state.stage_step(&self.kernels, &self.stream)?;
             self.mtp_forward_one(&mut state, false)?;
             self.device.copy(
                 &state.catchup_hidden,
@@ -4765,6 +4834,74 @@ impl Model {
                 &self.stream,
             )
         })();
+        self.mtp_state = Some(state);
+        result
+    }
+
+    /// Dogania stan MTP po zaakceptowanym prefiksie targetu bez liczenia logits.
+    fn mtp_catchup_verified_prefix(&mut self, retained: usize) -> Result<()> {
+        if retained == 0 {
+            return Err(ForgeError::Scheduler(
+                "catch-up MTP wymaga co najmniej tokenu fed".into(),
+            ));
+        }
+        let hidden_bytes = self.weights.descriptor.params.hidden_size * 2;
+        let mut state = self.mtp_state.take().ok_or_else(|| {
+            ForgeError::Unsupported("stan wykonania MTP nie został zaalokowany".into())
+        })?;
+        let result = (|| {
+            state.checkpoint(&self.stream)?;
+            for row in 0..retained {
+                let pb = self
+                    .prefill_bufs
+                    .as_ref()
+                    .expect("bufory prefill są gotowe");
+                self.device.copy(
+                    &pb.x,
+                    row * hidden_bytes,
+                    &state.catchup_hidden,
+                    0,
+                    hidden_bytes,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &pb.ids,
+                    row * 4,
+                    &self.bufs.sample_out,
+                    0,
+                    4,
+                    &self.stream,
+                )?;
+                self.mtp_gather_embedding(&mut state, row)?;
+                state.stage_step(&self.kernels, &self.stream)?;
+                self.mtp_forward_one(&mut state, false)?;
+                self.device.copy(
+                    &state.catchup_hidden,
+                    0,
+                    &state.recurrent_hidden,
+                    0,
+                    state.recurrent_hidden.len(),
+                    &self.stream,
+                )?;
+            }
+            state.commit_catchup(retained)?;
+            let pb = self
+                .prefill_bufs
+                .as_ref()
+                .expect("bufory prefill są gotowe");
+            self.device.copy(
+                &pb.x,
+                (retained - 1) * hidden_bytes,
+                &self.bufs.x,
+                0,
+                hidden_bytes,
+                &self.stream,
+            )
+        })();
+        if result.is_err() && state.checkpoint_len().is_some() {
+            let _ = state.rollback(&self.stream);
+            let _ = self.device.synchronize();
+        }
         self.mtp_state = Some(state);
         result
     }
@@ -4826,7 +4963,8 @@ impl Model {
                 let ids = state
                     .pinned_token_ids
                     .host_ptr()
-                    .expect("pinned token IDs mają mapowanie hosta") as *const i32;
+                    .expect("pinned token IDs mają mapowanie hosta")
+                    as *const i32;
                 let token_id = unsafe { *ids.add(token_index) };
                 if token_id < 0 || token_id as usize >= p.vocab_size {
                     return Err(ForgeError::Kernel(format!(
@@ -4928,11 +5066,8 @@ impl Model {
                 "MTP wymaga rozdzielonych Q/K/V".into(),
             ));
         };
-        let qkv_grouped = self.gemv_nvfp4_gguf_group(
-            &[(&hb.q_full, q), (&b.k, k), (&b.v, v)],
-            &b.x,
-            stream,
-        )?;
+        let qkv_grouped =
+            self.gemv_nvfp4_gguf_group(&[(&hb.q_full, q), (&b.k, k), (&b.v, v)], &b.x, stream)?;
         if !qkv_grouped {
             self.gemv(&hb.q_full, q, &b.x, stream)?;
             self.gemv(&b.k, k, &b.x, stream)?;
@@ -5045,14 +5180,15 @@ impl Model {
         Ok(())
     }
 
-    /// Sprawdza obsługę liniowej spekulacji przez gęsty model z cache F16.
-    /// Weryfikacja dopisuje KV draftu i je wycofuje, dlatego wyklucza SSM,
-    /// MoE, tiering i cache prefiksu. Głowa logitów musi być F16 lub Q8_0.
-    pub fn validate_speculation_target(&self) -> Result<()> {
+    /// Sprawdza wspólne ograniczenia verifiera spekulacyjnego dla targetu.
+    pub fn validate_speculation_target(&self, draft_tokens: usize) -> Result<()> {
         if self.is_hybrid() {
-            return Err(ForgeError::Unsupported(
-                "speculative verification does not support hybrid SSM models".into(),
-            ));
+            if !matches!(draft_tokens, 2 | 3) {
+                return Err(ForgeError::Unsupported(
+                    "hybrydowy verifier spekulacyjny wymaga budżetu 2 lub 3".into(),
+                ));
+            }
+            return self.validate_hybrid_speculation_target();
         }
         if self.weights.is_moe() {
             return Err(ForgeError::Unsupported(
@@ -5080,6 +5216,46 @@ impl Model {
         ) {
             return Err(ForgeError::Unsupported(
                 "speculative verification requires an F16 or Q8_0 language-model head".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sprawdza target hybrydowy niezależnie od źródła tokenów draftu.
+    pub fn validate_hybrid_speculation_target(&self) -> Result<()> {
+        if !self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny wymaga hybrydowego targetu".into(),
+            ));
+        }
+        if self.weights.descriptor.params.head_dim != 256 {
+            return Err(ForgeError::Unsupported(format!(
+                "hybrydowy verifier spekulacyjny wymaga head_dim=256, otrzymano {}",
+                self.weights.descriptor.params.head_dim
+            )));
+        }
+        if self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny nie obsługuje jeszcze targetu MoE".into(),
+            ));
+        }
+        if !matches!(self.kv.cfg.quant, KvQuant::F16) {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny wymaga cache KV F16".into(),
+            ));
+        }
+        if self.tier.is_some() || self.prefix_cache.is_some() {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache"
+                    .into(),
+            ));
+        }
+        if !matches!(
+            self.weights.lm_head,
+            DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
+        ) {
+            return Err(ForgeError::Unsupported(
+                "batchowy head hybrydowego targetu wymaga F16 lub Q8_0".into(),
             ));
         }
         Ok(())
@@ -5121,18 +5297,15 @@ impl Model {
             .ok_or_else(|| ForgeError::Unsupported("target MTP nie jest hybrydowy".into()))?;
         let q_dim = p.n_heads * p.head_dim;
         let conv_dim = ssm.conv_dim();
-        let key_dim = ssm.key_dim();
         let value_dim = ssm.value_dim();
         let n_v = ssm.n_v_heads();
-        let conv_elems = conv_dim.checked_mul(ssm.d_conv - 1).ok_or_else(|| {
-            ForgeError::Scheduler("przepełnienie okna conv verifiera MTP".into())
-        })?;
+        let conv_elems = conv_dim
+            .checked_mul(ssm.d_conv - 1)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie okna conv verifiera MTP".into()))?;
         let state_elems = n_v
             .checked_mul(ssm.d_state)
             .and_then(|value| value.checked_mul(ssm.d_state))
-            .ok_or_else(|| {
-                ForgeError::Scheduler("przepełnienie stanu verifiera MTP".into())
-            })?;
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie stanu verifiera MTP".into()))?;
         let device = self.device.clone();
         let a16 = |name: &str, dims: &[usize]| {
             alloc_checked(device.as_ref(), name, dims, 2, MemKind::Device)
@@ -5146,15 +5319,14 @@ impl Model {
             .iter()
             .filter(|layer| matches!(layer.mixer, LayerMixer::DeltaNet(_)))
             .count();
+        let base_pos = a32("mtp base position", &[1])?;
+        let visible_lens = a32("mtp visible lengths", &[cap])?;
         let q_full = a16("mtp q full", &[cap, q_dim, 2])?;
         let qc = a16("mtp q", &[cap, q_dim])?;
         let gatec = a16("mtp q gate", &[cap, q_dim])?;
         let gated = a16("mtp gated attention", &[cap, q_dim])?;
         let qkv_mixed = a16("mtp mixed qkv", &[cap, conv_dim])?;
         let z = a16("mtp z", &[cap, value_dim])?;
-        let conv_out = a16("mtp conv output", &[cap, conv_dim])?;
-        let q16 = a16("mtp q16", &[cap, key_dim])?;
-        let k16 = a16("mtp k16", &[cap, key_dim])?;
         let q32 = a16("mtp q32", &[cap, value_dim])?;
         let k32 = a16("mtp k32", &[cap, value_dim])?;
         let vtok = a16("mtp v", &[cap, value_dim])?;
@@ -5165,7 +5337,14 @@ impl Model {
         let o = a16("mtp recurrence output", &[cap, value_dim])?;
         let normed = a16("mtp recurrence norm", &[cap, value_dim])?;
         let state_checkpoints = a32("mtp state checkpoints", &[cap, state_elems])?;
-        let accepted = a32("mtp accepted", &[1])?;
+        let accepted = a32("mtp accepted", &[2])?;
+        let pinned_decision = alloc_checked(
+            device.as_ref(),
+            "mtp pinned decision",
+            &[2],
+            4,
+            MemKind::PinnedHost,
+        )?;
         let pinned_embed = alloc_checked(
             device.as_ref(),
             "mtp pinned embedding",
@@ -5206,9 +5385,8 @@ impl Model {
             .into_iter()
             .map(|base| match base {
                 Some((conv_initial, conv_checkpoints, state_initial)) => {
-                    let checkpoint_byte_offset = delta_index
-                        .checked_mul(checkpoint_stride)
-                        .ok_or_else(|| {
+                    let checkpoint_byte_offset =
+                        delta_index.checked_mul(checkpoint_stride).ok_or_else(|| {
                             ForgeError::Scheduler(
                                 "przepełnienie offsetu warstwy DeltaNet MTP".into(),
                             )
@@ -5237,17 +5415,20 @@ impl Model {
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
+        self.hybrid_verify_graph_t3 = None;
+        self.hybrid_verify_graph_t4 = None;
+        self.hybrid_verify_graph_t3_disabled = false;
+        self.hybrid_verify_graph_t4_disabled = false;
         self.hybrid_verify_bufs = Some(HybridVerifyBufs {
             cap,
+            base_pos,
+            visible_lens,
             q_full,
             qc,
             gatec,
             gated,
             qkv_mixed,
             z,
-            conv_out,
-            q16,
-            k16,
             q32,
             k32,
             vtok,
@@ -5260,6 +5441,7 @@ impl Model {
             state_checkpoints,
             retained_state_checkpoints,
             accepted,
+            pinned_decision,
             pinned_embed,
             delta,
         });
@@ -5267,32 +5449,10 @@ impl Model {
     }
 
     pub fn validate_native_mtp_target(&self) -> Result<()> {
-        if !self.is_hybrid() {
+        self.validate_hybrid_speculation_target()?;
+        if !self.has_native_mtp() {
             return Err(ForgeError::Unsupported(
-                "natywny verifier MTP wymaga hybrydowego targetu".into(),
-            ));
-        }
-        if self.weights.is_moe() {
-            return Err(ForgeError::Unsupported(
-                "natywny verifier MTP nie obsługuje jeszcze targetu MoE".into(),
-            ));
-        }
-        if !matches!(self.kv.cfg.quant, KvQuant::F16) {
-            return Err(ForgeError::Unsupported(
-                "natywny verifier MTP wymaga cache KV F16".into(),
-            ));
-        }
-        if self.tier.is_some() || self.prefix_cache.is_some() {
-            return Err(ForgeError::Unsupported(
-                "natywny verifier MTP wymaga wyłączonego tieringu i prefix cache".into(),
-            ));
-        }
-        if !matches!(
-            self.weights.lm_head,
-            DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
-        ) {
-            return Err(ForgeError::Unsupported(
-                "batchowy head targetu MTP wymaga F16 lub Q8_0".into(),
+                "checkpoint nie ma obsługiwanego natywnego proposera MTP".into(),
             ));
         }
         Ok(())
@@ -5334,16 +5494,17 @@ impl Model {
         let p = &self.weights.descriptor.params;
         let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
         let conv_dim = ssm.conv_dim();
-        let key_dim = ssm.key_dim();
         let value_dim = ssm.value_dim();
         let n_k = ssm.n_k_heads();
         let n_v = ssm.n_v_heads();
         let d_state = ssm.d_state;
         let conv_elems = conv_dim * (ssm.d_conv - 1);
-        let rep = n_v / n_k;
         let stream = &self.stream;
         let kernels = &self.kernels;
-        let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
         let hv = self
             .hybrid_verify_bufs
             .as_ref()
@@ -5368,91 +5529,28 @@ impl Model {
             conv_elems * 2,
             stream,
         )?;
-        let conv_result: Result<()> = (|| {
-            for token in 0..t {
-                kernels.deltanet_conv_silu_f16_at(
-                    &hv.conv_out,
-                    token * conv_dim * 2,
-                    &state.conv,
-                    &hv.qkv_mixed,
-                    token * conv_dim * 2,
-                    &delta.conv1d,
-                    conv_dim,
-                    ssm.d_conv,
-                    stream,
-                )?;
-                self.device.copy(
-                    &state.conv,
-                    0,
-                    &cache.conv_checkpoints,
-                    token * conv_elems * 2,
-                    conv_elems * 2,
-                    stream,
-                )?;
-            }
-            Ok(())
-        })();
-        self.device.copy(
+        kernels.deltanet_prepare_f16(
+            &hv.q32,
+            &hv.k32,
+            &hv.vtok,
+            &hv.g,
+            &hv.beta_f,
+            &cache.conv_checkpoints,
             &cache.conv_initial,
-            0,
-            &state.conv,
-            0,
-            conv_elems * 2,
+            &hv.qkv_mixed,
+            &delta.conv1d,
+            &hv.alpha,
+            &hv.beta_raw,
+            &delta.dt_bias,
+            &delta.a,
+            t,
+            n_k,
+            n_v,
+            d_state,
+            ssm.d_conv,
+            p.rms_norm_eps,
             stream,
         )?;
-        conv_result?;
-
-        for token in 0..t {
-            let conv_base = token * conv_dim * 2;
-            self.device.copy(
-                &hv.conv_out,
-                conv_base,
-                &hv.q16,
-                token * key_dim * 2,
-                key_dim * 2,
-                stream,
-            )?;
-            self.device.copy(
-                &hv.conv_out,
-                conv_base + key_dim * 2,
-                &hv.k16,
-                token * key_dim * 2,
-                key_dim * 2,
-                stream,
-            )?;
-            self.device.copy(
-                &hv.conv_out,
-                conv_base + 2 * key_dim * 2,
-                &hv.vtok,
-                token * value_dim * 2,
-                value_dim * 2,
-                stream,
-            )?;
-        }
-        kernels.l2norm_heads_f16(&hv.q16, &hv.q16, t * n_k, d_state, p.rms_norm_eps, stream)?;
-        kernels.l2norm_heads_f16(&hv.k16, &hv.k16, t * n_k, d_state, p.rms_norm_eps, stream)?;
-        let key_bytes = n_k * d_state * 2;
-        for token in 0..t {
-            for repeat in 0..rep {
-                let source = token * key_bytes;
-                let target = (token * n_v + repeat * n_k) * d_state * 2;
-                self.device
-                    .copy(&hv.q16, source, &hv.q32, target, key_bytes, stream)?;
-                self.device
-                    .copy(&hv.k16, source, &hv.k32, target, key_bytes, stream)?;
-            }
-            kernels.deltanet_log_decay_f32_at(
-                &hv.g,
-                token * n_v * 4,
-                &hv.alpha,
-                token * n_v * 2,
-                &delta.dt_bias,
-                &delta.a,
-                n_v,
-                stream,
-            )?;
-        }
-        kernels.deltanet_beta_sigmoid_f32(&hv.beta_f, &hv.beta_raw, t * n_v, stream)?;
         let (state_checkpoints, checkpoint_byte_offset) = match &cache.commit {
             DeltaVerifyCommit::Retained {
                 checkpoint_byte_offset,
@@ -5507,7 +5605,6 @@ impl Model {
         &self,
         layer_index: usize,
         attention: &AttnWeights,
-        base_pos: usize,
         t: usize,
     ) -> Result<()> {
         let p = &self.weights.descriptor.params;
@@ -5515,7 +5612,10 @@ impl Model {
         let kv_dim = p.n_kv_heads * p.head_dim;
         let stream = &self.stream;
         let kernels = &self.kernels;
-        let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
         let hv = self
             .hybrid_verify_bufs
             .as_ref()
@@ -5579,53 +5679,319 @@ impl Model {
             p.rope_theta,
             stream,
         )?;
-        kernels.kv_append_batch(
+        kernels.kv_append_batch_device_pos_f16(
             &self.kv.k[layer_index],
             &self.kv.v[layer_index],
             &pb.k,
             &pb.v,
             &self.page_table_dev,
-            base_pos,
+            &hv.base_pos,
             t,
             p.n_kv_heads,
             self.kv.cfg.page_size,
             p.head_dim,
-            self.kv.cfg.dtype(),
             stream,
         )?;
-        kernels.attn_prefill(
-            &pb.attn_out,
-            &hv.qc,
-            &self.kv.k[layer_index],
-            &self.kv.v[layer_index],
-            &self.page_table_dev,
-            base_pos,
-            t,
-            p.n_heads,
-            p.n_kv_heads,
-            p.head_dim,
-            self.kv.cfg.page_size,
-            self.kv.cfg.dtype(),
-            1.0 / (p.head_dim as f32).sqrt(),
-            stream,
-        )?;
+        if self.device.caps().vendor == Vendor::Nvidia {
+            kernels.attn_decode_batch_exact_f16_hd256(
+                &pb.attn_out,
+                &hv.qc,
+                &self.kv.k[layer_index],
+                &self.kv.v[layer_index],
+                &self.page_table_dev,
+                &hv.visible_lens,
+                t,
+                p.n_heads,
+                p.n_kv_heads,
+                self.kv.cfg.page_size,
+                self.max_pages_per_seq,
+                1.0 / (p.head_dim as f32).sqrt(),
+                stream,
+            )?;
+        } else {
+            kernels.attn_prefill_device_pos_f16_hd256(
+                &pb.attn_out,
+                &hv.qc,
+                &self.kv.k[layer_index],
+                &self.kv.v[layer_index],
+                &self.page_table_dev,
+                &hv.base_pos,
+                t,
+                p.n_heads,
+                p.n_kv_heads,
+                self.kv.cfg.page_size,
+                1.0 / (p.head_dim as f32).sqrt(),
+                stream,
+            )?;
+        }
         kernels.sigmoid_mul_f16(&hv.gated, &pb.attn_out, &hv.gatec, t * q_dim, stream)?;
         debug_assert_eq!(attention.attn_o.cols(), q_dim);
         debug_assert!(pb.k.len() >= t * kv_dim * 2);
         self.gemm(&pb.o_out, &attention.attn_o, &hv.gated, t, stream)
     }
 
-    fn verify_native_mtp_hybrid(
+    /// Zatwierdza na GPU stan odpowiadający zaakceptowanemu prefiksowi.
+    fn run_hybrid_verify_postlude(&self, t: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let vb = self.verify_bufs.as_ref().expect("bufory verify są gotowe");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrid verify są gotowe");
+        self.kernels
+            .mtp_verify_decide(&hv.accepted, &vb.ids, &pb.ids, t, &self.stream)?;
+        self.kernels.mtp_select_row_f16(
+            &self.bufs.h,
+            &pb.h,
+            &hv.accepted,
+            p.hidden_size,
+            &self.stream,
+        )?;
+        self.kernels.mtp_select_row_f16(
+            &self.bufs.x,
+            &pb.x,
+            &hv.accepted,
+            p.hidden_size,
+            &self.stream,
+        )?;
+        self.kernels.mtp_select_row_f32(
+            &self.bufs.logits,
+            &vb.logits,
+            &hv.accepted,
+            p.vocab_size,
+            &self.stream,
+        )?;
+
+        let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
+        let conv_elems = ssm.conv_dim() * (ssm.d_conv - 1);
+        for (layer_index, cache) in hv.delta.iter().enumerate() {
+            let Some(cache) = cache else { continue };
+            let state = self.ssm[layer_index]
+                .as_ref()
+                .expect("warstwa DeltaNet ma stan");
+            match &cache.commit {
+                DeltaVerifyCommit::Retained {
+                    checkpoint_byte_offset,
+                } => self.kernels.deltanet_commit_checkpoint_f32_at(
+                    &state.state,
+                    hv.retained_state_checkpoints
+                        .as_ref()
+                        .expect("retained checkpointy DeltaNet są zaalokowane"),
+                    *checkpoint_byte_offset,
+                    &hv.accepted,
+                    t,
+                    ssm.n_v_heads(),
+                    ssm.d_state,
+                    &self.stream,
+                )?,
+                DeltaVerifyCommit::Recompute { q, k, v, g, beta } => {
+                    self.kernels.deltanet_gated_scan_f16(
+                        &hv.o,
+                        &hv.state_checkpoints,
+                        &state.state,
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        t,
+                        ssm.n_v_heads(),
+                        ssm.d_state,
+                        &self.stream,
+                    )?;
+                    self.kernels.deltanet_commit_checkpoint_f32(
+                        &state.state,
+                        &hv.state_checkpoints,
+                        &hv.accepted,
+                        t,
+                        ssm.n_v_heads(),
+                        ssm.d_state,
+                        &self.stream,
+                    )?;
+                }
+            }
+            self.kernels.mtp_select_row_f16(
+                &state.conv,
+                &cache.conv_checkpoints,
+                &hv.accepted,
+                conv_elems,
+                &self.stream,
+            )?;
+        }
+        self.device
+            .copy(&hv.accepted, 0, &hv.pinned_decision, 0, 8, &self.stream)
+    }
+
+    /// Uruchamia stałą część verifiera hybrydowego bez synchronizacji z hostem.
+    fn run_hybrid_verify_compute(&self, t: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        self.kernels.rmsnorm_f16(
+            &pb.x,
+            &pb.h,
+            &self.weights.layers[0].attn_norm,
+            t,
+            p.hidden_size,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+
+        for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+            match &layer.mixer {
+                LayerMixer::Attention(attention) => {
+                    self.hybrid_verify_attention_layer(layer_index, attention, t)?
+                }
+                LayerMixer::DeltaNet(delta) => {
+                    self.hybrid_verify_delta_layer(layer_index, delta, t)?
+                }
+            }
+            self.kernels.rmsnorm_residual_f16(
+                &pb.x,
+                &pb.h,
+                &pb.o_out,
+                &layer.ffn_norm,
+                t,
+                p.hidden_size,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return Err(ForgeError::Unsupported(
+                    "hybrydowy verifier MTP nie obsługuje jeszcze targetu MoE".into(),
+                ));
+            };
+            match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    self.gemm_rows(
+                        &pb.gate,
+                        weight,
+                        &pb.x,
+                        t,
+                        0,
+                        p.intermediate_size,
+                        &self.stream,
+                    )?;
+                    self.gemm_rows(
+                        &pb.up,
+                        weight,
+                        &pb.x,
+                        t,
+                        p.intermediate_size,
+                        p.intermediate_size,
+                        &self.stream,
+                    )?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemm(&pb.gate, gate, &pb.x, t, &self.stream)?;
+                    self.gemm(&pb.up, up, &pb.x, t, &self.stream)?;
+                }
+            }
+            self.kernels.silu_mul_f16(
+                &pb.act,
+                &pb.gate,
+                &pb.up,
+                t * p.intermediate_size,
+                &self.stream,
+            )?;
+            self.gemm(&pb.down, &ffn.down, &pb.act, t, &self.stream)?;
+            let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                &self.weights.layers[layer_index + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            self.kernels.rmsnorm_residual_f16(
+                &pb.x,
+                &pb.h,
+                &pb.down,
+                next_norm,
+                t,
+                p.hidden_size,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+        }
+
+        let vb = self.verify_bufs.as_ref().expect("bufory verify są gotowe");
+        self.logits_gemm(&vb.logits, &pb.x, t, &self.stream)?;
+        self.kernels.sample_batched_argmax_f32(
+            &vb.ids,
+            &vb.logits,
+            t,
+            p.vocab_size,
+            &self.stream,
+        )?;
+        self.run_hybrid_verify_postlude(t)
+    }
+
+    /// Przechwytuje rozgrzany łańcuch verifiera dla stałego T.
+    fn capture_hybrid_verify_compute(&self, t: usize) -> Result<ExecGraph> {
+        self.device.begin_capture(&self.stream)?;
+        match self.run_hybrid_verify_compute(t) {
+            Ok(()) => self.device.end_capture(&self.stream),
+            Err(error) => {
+                let _ = self.device.end_capture(&self.stream);
+                Err(error)
+            }
+        }
+    }
+
+    /// Po pierwszym wykonaniu eager zapisuje graf właściwy dla T=3 albo T=4.
+    fn capture_hybrid_verify_graph_if_needed(&mut self, t: usize) {
+        if std::env::var("FORGE_HYBRID_VERIFY_GRAPH").is_ok_and(|value| value == "0") {
+            return;
+        }
+        if !self.device.caps().supports_graph_capture {
+            return;
+        }
+        let needed = match t {
+            3 => self.hybrid_verify_graph_t3.is_none() && !self.hybrid_verify_graph_t3_disabled,
+            4 => self.hybrid_verify_graph_t4.is_none() && !self.hybrid_verify_graph_t4_disabled,
+            _ => return,
+        };
+        if !needed {
+            return;
+        }
+        match self.capture_hybrid_verify_compute(t) {
+            Ok(captured) => match t {
+                3 => self.hybrid_verify_graph_t3 = Some(captured),
+                4 => self.hybrid_verify_graph_t4 = Some(captured),
+                _ => unreachable!(),
+            },
+            Err(error) => {
+                tracing::warn!("wyłączono capture grafu hybrid verifier T={t}: {error}");
+                match t {
+                    3 => self.hybrid_verify_graph_t3_disabled = true,
+                    4 => self.hybrid_verify_graph_t4_disabled = true,
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn verify_hybrid_greedy_draft(
         &mut self,
         seq: &mut SeqKv,
         fed: u32,
         draft: &[u32],
+        catchup_mtp: bool,
     ) -> Result<(usize, u32)> {
+        if !matches!(draft.len(), 2 | 3) {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny obsługuje draft długości 2 lub 3".into(),
+            ));
+        }
         let t = draft.len() + 1;
-        self.validate_native_mtp_target()?;
+        self.validate_hybrid_speculation_target()?;
         self.ensure_prefill_bufs()?;
-        self.ensure_verify_bufs(t)?;
-        self.ensure_hybrid_verify_bufs(t)?;
+        self.ensure_verify_bufs(4)?;
+        self.ensure_hybrid_verify_bufs(4)?;
         let p = self.weights.descriptor.params.clone();
         let base = seq.len;
         if base + t > p.max_position_embeddings {
@@ -5678,7 +6044,10 @@ impl Model {
             self.device
                 .write(bytemuck::cast_slice(&page_table), &self.page_table_dev, 0)?;
             self.pt_seq = seq.id;
-            let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+            let pb = self
+                .prefill_bufs
+                .as_ref()
+                .expect("bufory prefill są gotowe");
             let hv = self
                 .hybrid_verify_bufs
                 .as_ref()
@@ -5686,9 +6055,14 @@ impl Model {
             let tokens: Vec<u32> = std::iter::once(fed).chain(draft.iter().copied()).collect();
             let ids: Vec<i32> = tokens.iter().map(|&id| id as i32).collect();
             let positions: Vec<i32> = (base..base + t).map(|pos| pos as i32).collect();
+            let visible_lens: Vec<i32> = (base + 1..=base + t).map(|len| len as i32).collect();
             self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
             self.device
                 .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
+            self.device
+                .write(&(base as i32).to_le_bytes(), &hv.base_pos, 0)?;
+            self.device
+                .write(bytemuck::cast_slice(&visible_lens), &hv.visible_lens, 0)?;
             let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
                 ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
             })?;
@@ -5720,199 +6094,44 @@ impl Model {
                 t * p.hidden_size * 2,
                 &self.stream,
             )?;
-            self.kernels.rmsnorm_f16(
-                &pb.x,
-                &pb.h,
-                &self.weights.layers[0].attn_norm,
-                t,
-                p.hidden_size,
-                p.rms_norm_eps,
-                &self.stream,
-            )?;
-
-            for (layer_index, layer) in self.weights.layers.iter().enumerate() {
-                match &layer.mixer {
-                    LayerMixer::Attention(attention) => {
-                        self.hybrid_verify_attention_layer(layer_index, attention, base, t)?
-                    }
-                    LayerMixer::DeltaNet(delta) => {
-                        self.hybrid_verify_delta_layer(layer_index, delta, t)?
-                    }
+            let graph = if std::env::var("FORGE_HYBRID_VERIFY_GRAPH")
+                .is_ok_and(|value| value == "0")
+            {
+                None
+            } else {
+                match t {
+                    3 => self.hybrid_verify_graph_t3.clone(),
+                    4 => self.hybrid_verify_graph_t4.clone(),
+                    _ => None,
                 }
-                self.kernels.rmsnorm_residual_f16(
-                    &pb.x,
-                    &pb.h,
-                    &pb.o_out,
-                    &layer.ffn_norm,
-                    t,
-                    p.hidden_size,
-                    p.rms_norm_eps,
-                    &self.stream,
-                )?;
-                let LayerFfn::Dense(ffn) = &layer.ffn else {
-                    return Err(ForgeError::Unsupported(
-                        "hybrydowy verifier MTP nie obsługuje jeszcze targetu MoE".into(),
-                    ));
-                };
-                match &ffn.gate_up {
-                    GateUpWeights::Fused(weight) => {
-                        self.gemm_rows(&pb.gate, weight, &pb.x, t, 0, p.intermediate_size, &self.stream)?;
-                        self.gemm_rows(
-                            &pb.up,
-                            weight,
-                            &pb.x,
-                            t,
-                            p.intermediate_size,
-                            p.intermediate_size,
-                            &self.stream,
-                        )?;
-                    }
-                    GateUpWeights::Split { gate, up } => {
-                        self.gemm(&pb.gate, gate, &pb.x, t, &self.stream)?;
-                        self.gemm(&pb.up, up, &pb.x, t, &self.stream)?;
-                    }
-                }
-                self.kernels.silu_mul_f16(
-                    &pb.act,
-                    &pb.gate,
-                    &pb.up,
-                    t * p.intermediate_size,
-                    &self.stream,
-                )?;
-                self.gemm(&pb.down, &ffn.down, &pb.act, t, &self.stream)?;
-                let next_norm = if layer_index + 1 < self.weights.layers.len() {
-                    &self.weights.layers[layer_index + 1].attn_norm
-                } else {
-                    &self.weights.output_norm
-                };
-                self.kernels.rmsnorm_residual_f16(
-                    &pb.x,
-                    &pb.h,
-                    &pb.down,
-                    next_norm,
-                    t,
-                    p.hidden_size,
-                    p.rms_norm_eps,
-                    &self.stream,
-                )?;
-            }
-
-            let vb = self.verify_bufs.as_ref().expect("bufory verify są gotowe");
-            self.logits_gemm(&vb.logits, &pb.x, t, &self.stream)?;
-            self.kernels.sample_batched_argmax_f32(
-                &vb.ids,
-                &vb.logits,
-                t,
-                p.vocab_size,
-                &self.stream,
-            )?;
-            self.device
-                .copy(&vb.ids, 0, &vb.pinned_ids, 0, t * 4, &self.stream)?;
-            self.device.synchronize()?;
-            let ids = unsafe {
-                std::slice::from_raw_parts(
-                    vb.pinned_ids
-                        .host_ptr()
-                        .expect("pinned IDs mają mapowanie hosta") as *const i32,
-                    t,
-                )
             };
-            if ids
-                .iter()
-                .any(|&token| token < 0 || token as usize >= p.vocab_size)
+            if let Some(graph) = graph {
+                self.device.launch_graph(&graph, &self.stream)?;
+            } else {
+                self.run_hybrid_verify_compute(t)?;
+            }
+            self.device.synchronize()?;
+            let decision =
+                hv.pinned_decision
+                    .host_ptr()
+                    .expect("pinned decision ma mapowanie hosta") as *const i32;
+            let retained = unsafe { *decision };
+            let correction = unsafe { *decision.add(1) };
+            if retained <= 0
+                || retained as usize > t
+                || correction < 0
+                || correction as usize >= p.vocab_size
             {
                 return Err(ForgeError::Kernel(
-                    "batchowy argmax MTP zwrócił token poza słownikiem".into(),
+                    "decyzja MTP z GPU ma wartość poza zakresem".into(),
                 ));
             }
-            let (accepted, correction) = native_mtp_greedy_decision(draft, ids);
-            let retained = accepted + 1;
-            self.device
-                .write(&(retained as i32).to_le_bytes(), &hv.accepted, 0)?;
-            self.device.copy(
-                &pb.h,
-                accepted * p.hidden_size * 2,
-                &self.bufs.h,
-                0,
-                p.hidden_size * 2,
-                &self.stream,
-            )?;
-            self.device.copy(
-                &pb.x,
-                accepted * p.hidden_size * 2,
-                &self.bufs.x,
-                0,
-                p.hidden_size * 2,
-                &self.stream,
-            )?;
-            self.device.copy(
-                &vb.logits,
-                accepted * p.vocab_size * 4,
-                &self.bufs.logits,
-                0,
-                p.vocab_size * 4,
-                &self.stream,
-            )?;
-
-            let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
-            let conv_bytes = ssm.conv_dim() * (ssm.d_conv - 1) * 2;
-            for (layer_index, cache) in hv.delta.iter().enumerate() {
-                let Some(cache) = cache else { continue };
-                let state = self.ssm[layer_index]
-                    .as_ref()
-                    .expect("warstwa DeltaNet ma stan");
-                match &cache.commit {
-                    DeltaVerifyCommit::Retained {
-                        checkpoint_byte_offset,
-                    } => self.kernels.deltanet_commit_checkpoint_f32_at(
-                        &state.state,
-                        hv.retained_state_checkpoints
-                            .as_ref()
-                            .expect("retained checkpointy DeltaNet są zaalokowane"),
-                        *checkpoint_byte_offset,
-                        &hv.accepted,
-                        t,
-                        ssm.n_v_heads(),
-                        ssm.d_state,
-                        &self.stream,
-                    )?,
-                    DeltaVerifyCommit::Recompute { q, k, v, g, beta } => {
-                        self.kernels.deltanet_gated_scan_f16(
-                            &hv.o,
-                            &hv.state_checkpoints,
-                            &state.state,
-                            q,
-                            k,
-                            v,
-                            g,
-                            beta,
-                            t,
-                            ssm.n_v_heads(),
-                            ssm.d_state,
-                            &self.stream,
-                        )?;
-                        self.kernels.deltanet_commit_checkpoint_f32(
-                            &state.state,
-                            &hv.state_checkpoints,
-                            &hv.accepted,
-                            t,
-                            ssm.n_v_heads(),
-                            ssm.d_state,
-                            &self.stream,
-                        )?;
-                    }
-                }
-                self.device.copy(
-                    &cache.conv_checkpoints,
-                    accepted * conv_bytes,
-                    &state.conv,
-                    0,
-                    conv_bytes,
-                    &self.stream,
-                )?;
+            let accepted = retained as usize - 1;
+            if catchup_mtp {
+                self.mtp_catchup_verified_prefix(accepted + 1)?;
             }
-            self.device.synchronize()?;
-            Ok((accepted, correction))
+            self.capture_hybrid_verify_graph_if_needed(t);
+            Ok((accepted, correction as u32))
         })();
         match result {
             Ok((accepted, correction)) => {
@@ -5987,7 +6206,7 @@ impl Model {
             )));
         }
         let draft = self.mtp_propose_pending(fed, budget)?;
-        match self.verify_native_mtp_hybrid(seq, fed, &draft) {
+        match self.verify_hybrid_greedy_draft(seq, fed, &draft, false) {
             Ok((accepted, correction)) => {
                 let state = self.mtp_state.as_mut().expect("stan MTP istnieje");
                 state.commit_prefix(accepted + 1, &self.stream)?;
@@ -6013,6 +6232,17 @@ impl Model {
         }
     }
 
+    /// Weryfikuje draft zewnętrznego proposera i dogania stan natywnego MTP.
+    pub fn verify_greedy_draft_with_mtp_catchup(
+        &mut self,
+        seq: &mut SeqKv,
+        fed: u32,
+        draft: &[u32],
+    ) -> Result<(usize, u32)> {
+        self.validate_native_mtp_target()?;
+        self.verify_hybrid_greedy_draft(seq, fed, draft, true)
+    }
+
     /// Verify one greedy speculative draft in a single forward (SPEC §6, linear
     /// path). Runs the model over `[fed, draft…]` as a mini-prefill chunk
     /// appended after the current position, greedy-argmaxes the logits at every
@@ -6035,6 +6265,9 @@ impl Model {
             draft.len() <= MAX_SPEC_DRAFT,
             "draft exceeds MAX_SPEC_DRAFT"
         );
+        if self.is_hybrid() {
+            return self.verify_hybrid_greedy_draft(seq, fed, draft, false);
+        }
         let vocab = self.weights.descriptor.params.vocab_size;
         let t = draft.len() + 1;
         self.ensure_verify_bufs(t)?;
@@ -6864,8 +7097,75 @@ impl Model {
     }
 
     /// Whether this is the hybrid attention/Gated-DeltaNet MoE arch (qwen35moe).
-    fn is_hybrid(&self) -> bool {
+    pub fn is_hybrid(&self) -> bool {
         self.weights.descriptor.params.ssm.is_some()
+    }
+
+    /// Zrzuca stan hybrydowy do diagnostyki zgodności batch kontra serial.
+    pub fn debug_hybrid_state_snapshot(&self) -> Result<Vec<(String, usize, Vec<u8>)>> {
+        self.device.synchronize()?;
+        let mut snapshot = Vec::new();
+        for (name, buffer, element_bytes) in [
+            ("h", &self.bufs.h, 2usize),
+            ("x", &self.bufs.x, 2usize),
+        ] {
+            let mut bytes = vec![0u8; buffer.len()];
+            self.device.read(buffer, 0, &mut bytes)?;
+            snapshot.push((name.into(), element_bytes, bytes));
+        }
+        for (layer, state) in self.ssm.iter().enumerate() {
+            let Some(state) = state else { continue };
+            for (kind, buffer, element_bytes) in [
+                ("conv", &state.conv, 2usize),
+                ("ssm", &state.state, 4usize),
+            ] {
+                let mut bytes = vec![0u8; buffer.len()];
+                self.device.read(buffer, 0, &mut bytes)?;
+                snapshot.push((format!("layer.{layer}.{kind}"), element_bytes, bytes));
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Zrzuca carry oraz aktywny prefiks KV MTP w kolejności logicznych stron.
+    pub fn debug_mtp_state_snapshot(&self) -> Result<Vec<(String, usize, Vec<u8>)>> {
+        self.device.synchronize()?;
+        let state = self.mtp_state.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("model nie ma aktywnego stanu MTP".into())
+        })?;
+        let mut hidden = vec![0u8; state.recurrent_hidden.len()];
+        self.device
+            .read(&state.recurrent_hidden, 0, &mut hidden)?;
+        let mut snapshot = vec![("mtp.hidden".into(), 2, hidden)];
+        let head_bytes = state.kv.cfg.head_dim * 2;
+        for (name, buffers) in [("mtp.k", &state.kv.k), ("mtp.v", &state.kv.v)] {
+            let mut bytes = Vec::with_capacity(
+                state.seq.len * state.kv.cfg.n_kv_heads * head_bytes,
+            );
+            for (offset, length) in logical_kv_regions(
+                &state.seq.pages,
+                state.seq.len,
+                state.kv.cfg.page_size,
+                state.kv.cfg.n_kv_heads,
+                head_bytes,
+            ) {
+                let mut chunk = vec![0u8; length];
+                self.device.read(&buffers[0], offset, &mut chunk)?;
+                bytes.extend_from_slice(&chunk);
+            }
+            snapshot.push((name.into(), 2usize, bytes));
+        }
+        snapshot.push((
+            "mtp.len".into(),
+            1,
+            state.seq.len.to_le_bytes().to_vec(),
+        ));
+        Ok(snapshot)
+    }
+
+    /// Wykonuje pojedynczy referencyjny catch-up MTP po kroku targetu.
+    pub fn debug_mtp_catchup_token(&mut self, token: u32) -> Result<()> {
+        self.mtp_catchup_token(token)
     }
 
     /// NEOX partial-rotary width for the hybrid attention layers: M-RoPE over
@@ -7088,11 +7388,8 @@ impl Model {
         };
         // Gated Q projection [2*q_dim], then de-interleave per head: q at
         // h*2*head_dim, gate at h*2*head_dim + head_dim.
-        let qkv_grouped = self.gemv_nvfp4_gguf_group(
-            &[(&hb.q_full, wq), (&b.k, wk), (&b.v, wv)],
-            &b.x,
-            stream,
-        )?;
+        let qkv_grouped =
+            self.gemv_nvfp4_gguf_group(&[(&hb.q_full, wq), (&b.k, wk), (&b.v, wv)], &b.x, stream)?;
         if !qkv_grouped {
             self.gemv(&hb.q_full, wq, &b.x, stream)?;
             self.gemv(&b.k, wk, &b.x, stream)?;
@@ -7289,6 +7586,9 @@ impl Model {
             let pos = seq.len;
             if pos == 0 {
                 self.zero_ssm()?;
+                if let Some(state) = &mut self.mtp_state {
+                    state.reset_hidden()?;
+                }
             }
             if pos >= p.max_position_embeddings {
                 return Err(ForgeError::Scheduler(format!(
@@ -7660,9 +7960,7 @@ impl Model {
         self.logits_gemv(&b.logits, &b.x, stream)
     }
 
-    /// Batched logit head: y[b, vocab] f32 = lm_head · x[b, hidden].
-    /// Dodatkowa paczka FP8 obsługuje tylko single-stream GEMV; batching świadomie
-    /// pozostaje na bazowym F16/Q8_0, aby nie zmieniać jego sprawdzonego GEMM.
+    /// Batchowa głowa logitów: y[b, vocab] f32 = lm_head · x[b, hidden].
     fn logits_gemm(
         &self,
         y_f32: &DevBuffer,
@@ -7674,6 +7972,11 @@ impl Model {
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
                 .gemm_f16_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
+            DevWeight::Q8_0 { buf, rows, cols } if matches!(n_tokens, 3 | 4) => self
+                .kernels
+                .gemm_q8_0_f16_exact_out_f32_at(
+                    y_f32, buf, 0, x, *rows, *cols, n_tokens, stream,
+                ),
             DevWeight::Q8_0 { buf, rows, cols } => self
                 .kernels
                 .gemm_q8_0_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
@@ -8342,10 +8645,17 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        finish_greedy_verification, native_mtp_greedy_decision, ForgeError, KvCache, KvConfig,
-        KvQuant, Result, SeqKv,
+        finish_greedy_verification, logical_kv_regions, native_mtp_greedy_decision, ForgeError,
+        KvCache, KvConfig, KvQuant, Result, SeqKv,
     };
     use forge_hal::cpu::CpuDevice;
+
+    #[test]
+    fn logical_kv_regions_zachowuja_layout_i_czesciowa_strone() {
+        let regions = logical_kv_regions(&[3, 1, 7], 5, 4, 2, 6);
+        assert_eq!(regions, vec![(144, 24), (168, 24), (48, 6), (72, 6)]);
+        assert_eq!(regions.iter().map(|(_, len)| len).sum::<usize>(), 5 * 2 * 6);
+    }
 
     fn fail_after_kv_growth(
         kv: &mut KvCache,
@@ -8396,8 +8706,17 @@ mod verify_rollback_tests {
 
     #[test]
     fn native_mtp_acceptance_excludes_fed_and_uses_bonus_row() {
-        assert_eq!(native_mtp_greedy_decision(&[11, 12, 13], &[11, 12, 13, 14]), (3, 14));
-        assert_eq!(native_mtp_greedy_decision(&[11, 12, 13], &[10, 99, 99, 99]), (0, 10));
-        assert_eq!(native_mtp_greedy_decision(&[11, 12, 13], &[11, 20, 99, 99]), (1, 20));
+        assert_eq!(
+            native_mtp_greedy_decision(&[11, 12, 13], &[11, 12, 13, 14]),
+            (3, 14)
+        );
+        assert_eq!(
+            native_mtp_greedy_decision(&[11, 12, 13], &[10, 99, 99, 99]),
+            (0, 10)
+        );
+        assert_eq!(
+            native_mtp_greedy_decision(&[11, 12, 13], &[11, 20, 99, 99]),
+            (1, 20)
+        );
     }
 }

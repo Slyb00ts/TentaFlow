@@ -77,9 +77,11 @@ const EMBEDDED_CUDA_CUBIN_FATTN_SM89: &[u8] = include_bytes!(concat!(
 /// (registry key, cubin entry symbol) for each flash-attention head_dim variant.
 const CUDA_FATTN_ENTRIES: &[(&str, &str)] = &[
     ("attn_prefill_fa_f16_hd64", "forge_attn_prefill_fa_f16_hd64"),
-    ("attn_prefill_fa_f16_hd128", "forge_attn_prefill_fa_f16_hd128"),
+    (
+        "attn_prefill_fa_f16_hd128",
+        "forge_attn_prefill_fa_f16_hd128",
+    ),
 ];
-
 
 const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "rmsnorm_f16",
@@ -99,9 +101,14 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "deltanet_conv_silu_f16",
     "l2norm_heads_f16",
     "deltanet_gated_step_f16",
+    "deltanet_prepare_t2_f16",
+    "deltanet_prepare_t3_f16",
+    "deltanet_prepare_t4_f16",
     "deltanet_gated_scan_t2_f16",
     "deltanet_gated_scan_t3_f16",
     "deltanet_gated_scan_t4_f16",
+    "deltanet_gated_scan_t3_d128_f16",
+    "deltanet_gated_scan_t4_d128_f16",
     "deltanet_commit_checkpoint_f32",
     "deltanet_gated_rmsnorm_f16",
     "deltanet_log_decay_f32",
@@ -110,12 +117,19 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_nvfp4_gguf_f16",
     "gemv_nvfp4_gguf_q8_1_f16",
     "mtp_prepare_f16",
+    "mtp_stage_step",
     "gather_f16_row_f16",
     "gather_q8_0_row_f16",
     "gather_nvfp4_gguf_row_f16",
+    "mtp_verify_decide",
+    "mtp_select_row_f16",
+    "mtp_select_row_f32",
     "gemm_nvfp4_gguf_f16_b2",
     "gemm_nvfp4_gguf_f16_b3",
     "gemm_nvfp4_gguf_f16_b4",
+    "gemm_nvfp4_gguf_f16_b1_nvidia",
+    "gemm_nvfp4_gguf_f16_b3_nvidia",
+    "gemm_nvfp4_gguf_f16_b4_nvidia",
     "gemm_nvfp4_gguf_f16_b8",
     "gemm_nvfp4_gguf_f16_b16",
     "gemm_nvfp4_gguf_mma_f16_bm32",
@@ -147,6 +161,12 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_q8_0_i8mma_b4",
     "gemm_q8_0_i8mma_out_f32_b3",
     "gemm_q8_0_i8mma_out_f32_b4",
+    "gemm_q8_0_dp4a_b3_nvidia",
+    "gemm_q8_0_dp4a_b4_nvidia",
+    "gemm_q8_0_dp4a_out_f32_b3_nvidia",
+    "gemm_q8_0_dp4a_out_f32_b4_nvidia",
+    "gemm_q8_0_f16_exact_out_f32_b3",
+    "gemm_q8_0_f16_exact_out_f32_b4",
     "gemm_nvfp4_f16",
     "gemm_f16",
     "gemm_q8_0_f16_bm64",
@@ -159,10 +179,13 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_q8_0_out_f32",
     "gemm_q8_0_out_f32_bm64",
     "kv_append_batch_f16",
+    "kv_append_batch_device_pos_f16",
     "kv_append_batch_fp8",
     "attn_prefill_f16_hd64",
     "attn_prefill_f16_hd128",
     "attn_prefill_f16_hd256",
+    "attn_prefill_device_pos_f16_hd256",
+    "attn_decode_batch_exact_f16_hd256",
     "attn_prefill_fp8_hd64",
     "attn_prefill_fp8_hd128",
     "attn_prefill_fa_mojo_f16_hd64",
@@ -455,14 +478,12 @@ fn resolve_artifact_path(arch_dir: &Path, file: &str) -> Result<PathBuf> {
         )));
     }
     let canonical_root = arch_dir.canonicalize().map_err(|error| {
-        ForgeError::Kernel(format!(
-            "canonicalize {}: {error}",
-            arch_dir.display()
-        ))
+        ForgeError::Kernel(format!("canonicalize {}: {error}", arch_dir.display()))
     })?;
-    let candidate = canonical_root.join(relative).canonicalize().map_err(|error| {
-        ForgeError::Kernel(format!("canonicalize {file}: {error}"))
-    })?;
+    let candidate = canonical_root
+        .join(relative)
+        .canonicalize()
+        .map_err(|error| ForgeError::Kernel(format!("canonicalize {file}: {error}")))?;
     if !candidate.starts_with(&canonical_root) {
         return Err(ForgeError::Kernel(format!(
             "artefakt wychodzi poza katalog architektury: {file}"
@@ -499,7 +520,10 @@ impl KernelArtifacts {
         let mut handles = HashMap::new();
         for art in EMBEDDED_SM89 {
             let entry = manifest.kernels.get(art.name).ok_or_else(|| {
-                ForgeError::Kernel(format!("kernel {} missing from embedded manifest", art.name))
+                ForgeError::Kernel(format!(
+                    "kernel {} missing from embedded manifest",
+                    art.name
+                ))
             })?;
             if !ada && is_sm89_only(art.ptx) {
                 continue;
@@ -532,7 +556,10 @@ impl KernelArtifacts {
                 &mut handles,
             )?;
         }
-        Ok(Self { handles, arch: arch.to_string() })
+        Ok(Self {
+            handles,
+            arch: arch.to_string(),
+        })
     }
 
     /// Resolve a raw-CUDA cubin's entry points into `handles`. The cubin
@@ -553,9 +580,8 @@ impl KernelArtifacts {
     fn load_dir(device: &dyn Device, dir: &Path, arch: &str) -> Result<Self> {
         let arch_dir = dir.join(arch);
         let manifest_path = arch_dir.join("manifest.json");
-        let manifest_src = std::fs::read_to_string(&manifest_path).map_err(|e| {
-            ForgeError::Kernel(format!("read {}: {e}", manifest_path.display()))
-        })?;
+        let manifest_src = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| ForgeError::Kernel(format!("read {}: {e}", manifest_path.display())))?;
         let manifest: Manifest = serde_json::from_str(&manifest_src)
             .map_err(|e| ForgeError::Kernel(format!("manifest parse: {e}")))?;
         if manifest.arch != arch {
@@ -581,16 +607,17 @@ impl KernelArtifacts {
         // Katalog nadpisujący jest przypisany do konkretnej architektury, więc
         // umieszczone w nim cubiny mogą być ładowane po walidacji manifestu.
         if ada {
-            let w4a8 = std::fs::read(arch_dir.join("w4a8_gemm_cuda.cubin")).map_err(|e| {
-                ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}"))
-            })?;
+            let w4a8 = std::fs::read(arch_dir.join("w4a8_gemm_cuda.cubin"))
+                .map_err(|e| ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}")))?;
             Self::load_cuda_cubin(device, &w4a8, CUDA_W4A8_ENTRIES, &mut handles)?;
-            let fattn = std::fs::read(arch_dir.join("fattn_prefill_cuda.cubin")).map_err(|e| {
-                ForgeError::Kernel(format!("read fattn_prefill_cuda.cubin: {e}"))
-            })?;
+            let fattn = std::fs::read(arch_dir.join("fattn_prefill_cuda.cubin"))
+                .map_err(|e| ForgeError::Kernel(format!("read fattn_prefill_cuda.cubin: {e}")))?;
             Self::load_cuda_cubin(device, &fattn, CUDA_FATTN_ENTRIES, &mut handles)?;
         }
-        Ok(Self { handles, arch: arch.to_string() })
+        Ok(Self {
+            handles,
+            arch: arch.to_string(),
+        })
     }
 
     pub fn arch(&self) -> &str {
@@ -616,11 +643,14 @@ mod tests {
         "gemv_nvfp4_gguf_f16",
         "gemv_nvfp4_gguf_q8_1_f16",
         "mtp_prepare_f16",
+        "mtp_stage_step",
         "gather_q8_0_row_f16",
         "gather_nvfp4_gguf_row_f16",
         "gemm_nvfp4_gguf_f16_b2",
         "gemm_nvfp4_gguf_f16_b3",
         "gemm_nvfp4_gguf_f16_b4",
+        "gemm_nvfp4_gguf_f16_b3_nvidia",
+        "gemm_nvfp4_gguf_f16_b4_nvidia",
         "gemm_nvfp4_gguf_f16_b8",
         "gemm_nvfp4_gguf_f16_b16",
         "gemm_nvfp4_gguf_mma_f16_bm32",
@@ -633,6 +663,19 @@ mod tests {
         "gemm_q8_0_i8mma_b4",
         "gemm_q8_0_i8mma_out_f32_b3",
         "gemm_q8_0_i8mma_out_f32_b4",
+        "gemm_q8_0_f16_exact_out_f32_b3",
+        "gemm_q8_0_f16_exact_out_f32_b4",
+    ];
+
+    const PORTABLE_DELTANET_PREPARE: &[&str] = &[
+        "deltanet_prepare_t2_f16",
+        "deltanet_prepare_t3_f16",
+        "deltanet_prepare_t4_f16",
+    ];
+
+    const PORTABLE_DELTANET_SCAN: &[&str] = &[
+        "deltanet_gated_scan_t3_d128_f16",
+        "deltanet_gated_scan_t4_d128_f16",
     ];
 
     #[test]
@@ -657,6 +700,28 @@ mod tests {
     #[test]
     fn male_q8_jest_dostepne_na_sm80_sm86_i_sm89() {
         for name in PORTABLE_Q8_SMALL {
+            let artifact = EMBEDDED_SM89
+                .iter()
+                .find(|artifact| artifact.name == *name)
+                .unwrap();
+            assert!(!is_sm89_only(artifact.ptx));
+        }
+    }
+
+    #[test]
+    fn fused_deltanet_prepare_jest_dostepne_od_sm80() {
+        for name in PORTABLE_DELTANET_PREPARE {
+            let artifact = EMBEDDED_SM89
+                .iter()
+                .find(|artifact| artifact.name == *name)
+                .unwrap();
+            assert!(!is_sm89_only(artifact.ptx));
+        }
+    }
+
+    #[test]
+    fn kafelkowany_deltanet_scan_jest_dostepny_od_sm80() {
+        for name in PORTABLE_DELTANET_SCAN {
             let artifact = EMBEDDED_SM89
                 .iter()
                 .find(|artifact| artifact.name == *name)

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use forge_formats::{Hyperparams, MtpDescriptor, MtpWeightRole};
 use forge_hal::{DevBuffer, Device, Pool, Stream};
+use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 
 use crate::kv::{KvCache, KvConfig, SeqKv};
@@ -370,10 +371,17 @@ pub struct MtpDraftState {
     pub pinned_token_ids: DevBuffer,
     checkpoint_hidden: DevBuffer,
     step_hidden: DevBuffer,
-    pinned_metadata: DevBuffer,
-    pinned_page_table: DevBuffer,
     checkpoint_len: Option<usize>,
     host_embedding_gathers: u64,
+}
+
+fn new_page_mapping(position: usize, page_size: usize, pages: &[i32]) -> Option<(usize, i32)> {
+    position.is_multiple_of(page_size).then(|| {
+        (
+            pages.len() - 1,
+            *pages.last().expect("grow dodał stronę na granicy"),
+        )
+    })
 }
 
 impl MtpDraftState {
@@ -409,25 +417,25 @@ impl MtpDraftState {
         let kv = KvCache::new(device.as_ref(), kv_config)?;
         let seq = kv.new_seq();
         let recurrent_hidden = device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?;
+        let page_table = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Activations)?;
+        let seq_len = device.alloc(4, MemKind::Device, Pool::Activations)?;
+        let position = device.alloc(4, MemKind::Device, Pool::Activations)?;
         device.write(&vec![0u8; hidden_bytes], &recurrent_hidden, 0)?;
+        device.write(&vec![0xff; max_pages_per_seq * 4], &page_table, 0)?;
+        device.write(&[0u8; 4], &seq_len, 0)?;
+        device.write(&[0u8; 4], &position, 0)?;
         Ok(Self {
             recurrent_hidden,
             catchup_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
             prepared_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
             logits: device.alloc(logits_bytes, MemKind::Device, Pool::Activations)?,
-            page_table: device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Activations)?,
-            seq_len: device.alloc(4, MemKind::Device, Pool::Activations)?,
-            position: device.alloc(4, MemKind::Device, Pool::Activations)?,
+            page_table,
+            seq_len,
+            position,
             token_ids: device.alloc(5 * 4, MemKind::Device, Pool::Activations)?,
             pinned_token_ids: device.alloc(5 * 4, MemKind::PinnedHost, Pool::Activations)?,
             checkpoint_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
             step_hidden: device.alloc(4 * hidden_bytes, MemKind::Device, Pool::Activations)?,
-            pinned_metadata: device.alloc(8, MemKind::PinnedHost, Pool::Activations)?,
-            pinned_page_table: device.alloc(
-                max_pages_per_seq * 4,
-                MemKind::PinnedHost,
-                Pool::Activations,
-            )?,
             device,
             kv,
             seq,
@@ -458,39 +466,31 @@ impl MtpDraftState {
         Ok(())
     }
 
-    pub fn stage_step(&mut self, stream: &Stream) -> Result<usize> {
+    /// Zeruje carry MTP przed rozpoczęciem nowej sekwencji targetu.
+    pub fn reset_hidden(&mut self) -> Result<()> {
+        self.device.write(
+            &vec![0u8; self.recurrent_hidden.len()],
+            &self.recurrent_hidden,
+            0,
+        )?;
+        self.device
+            .write(&vec![0xff; self.page_table.len()], &self.page_table, 0)?;
+        self.device.write(&[0u8; 4], &self.seq_len, 0)?;
+        self.device.write(&[0u8; 4], &self.position, 0)
+    }
+
+    pub fn stage_step(&mut self, kernels: &Kernels, stream: &Stream) -> Result<usize> {
         let position = self.seq.len;
         self.grow()?;
-        let metadata = self
-            .pinned_metadata
-            .host_ptr()
-            .expect("pinned metadata ma mapowanie hosta");
-        unsafe {
-            let values = [position as i32, self.seq.len as i32];
-            std::ptr::copy_nonoverlapping(values.as_ptr() as *const u8, metadata, 8);
-        }
-        let page_table = self
-            .pinned_page_table
-            .host_ptr()
-            .expect("pinned page table ma mapowanie hosta");
-        unsafe {
-            std::ptr::write_bytes(page_table, 0xff, self.pinned_page_table.len());
-            std::ptr::copy_nonoverlapping(
-                self.seq.pages.as_ptr() as *const u8,
-                page_table,
-                self.seq.pages.len() * 4,
-            );
-        }
-        self.device
-            .copy(&self.pinned_metadata, 0, &self.position, 0, 4, stream)?;
-        self.device
-            .copy(&self.pinned_metadata, 4, &self.seq_len, 0, 4, stream)?;
-        self.device.copy(
-            &self.pinned_page_table,
-            0,
+        let mapping = new_page_mapping(position, self.kv.cfg.page_size, &self.seq.pages);
+        kernels.mtp_stage_step(
+            &self.position,
+            &self.seq_len,
             &self.page_table,
-            0,
-            self.pinned_page_table.len(),
+            position,
+            self.seq.len,
+            mapping.map(|value| value.0),
+            mapping.map(|value| value.1),
             stream,
         )?;
         Ok(position)
@@ -553,6 +553,21 @@ impl MtpDraftState {
         Ok(())
     }
 
+    /// Zatwierdza sekwencyjny catch-up wykonany od aktywnego checkpointu.
+    pub fn commit_catchup(&mut self, retained: usize) -> Result<()> {
+        let base = self.checkpoint_len.ok_or_else(|| {
+            ForgeError::Scheduler("MTP: commit catch-up bez aktywnego checkpointu".into())
+        })?;
+        if retained == 0 || base + retained != self.seq.len {
+            return Err(ForgeError::Scheduler(format!(
+                "MTP: niepoprawna długość catch-up {retained} dla zakresu {base}..{}",
+                self.seq.len
+            )));
+        }
+        self.checkpoint_len = None;
+        Ok(())
+    }
+
     pub fn checkpoint_len(&self) -> Option<usize> {
         self.checkpoint_len
     }
@@ -578,6 +593,17 @@ mod tests {
     use super::*;
     use forge_formats::{MoeParams, PoolingType};
     use forge_hal::cpu::CpuDevice;
+
+    #[test]
+    fn mapowanie_stron_powstaje_tylko_na_granicy() {
+        assert_eq!(new_page_mapping(0, 2, &[7]), Some((0, 7)));
+        assert_eq!(new_page_mapping(1, 2, &[7]), None);
+        assert_eq!(new_page_mapping(2, 2, &[7, 11]), Some((1, 11)));
+        assert_eq!(new_page_mapping(3, 2, &[7, 11]), None);
+        assert_eq!(new_page_mapping(0, 4, &[5]), Some((0, 5)));
+        assert_eq!(new_page_mapping(3, 4, &[5]), None);
+        assert_eq!(new_page_mapping(4, 4, &[5, 9]), Some((1, 9)));
+    }
 
     struct SyntheticLoader {
         device: Arc<dyn Device>,
@@ -899,6 +925,32 @@ mod tests {
                 assert_eq!(state.kv.free_page_count(), 4);
             }
         }
+    }
+
+    #[test]
+    fn commit_catchup_zachowuje_caly_dogoniony_prefiks() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 2,
+            n_pages: 4,
+            max_pages_per_seq: 4,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut state = MtpDraftState::new(device, config, 4, 8).unwrap();
+        state.grow().unwrap();
+        state.checkpoint(&stream).unwrap();
+        state.grow().unwrap();
+        state.grow().unwrap();
+
+        assert!(state.commit_catchup(1).is_err());
+        assert_eq!(state.checkpoint_len(), Some(1));
+        state.commit_catchup(2).unwrap();
+        assert_eq!(state.seq.len, 3);
+        assert_eq!(state.checkpoint_len(), None);
     }
 
     #[test]

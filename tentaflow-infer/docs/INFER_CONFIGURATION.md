@@ -235,7 +235,8 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/prefix_cache.rs`):
 
 ## Dekodowanie spekulatywne (SPEC §6)
 
-Działają dwa tryby: hostowy proposer n-gram oraz natywna głowa MTP/NextN modelu.
+Działają trzy tryby: hostowy proposer n-gram, natywna głowa MTP/NextN modelu oraz
+priorytetowy router `mtp+ngram`.
 W trybie n-gram na każdym
 kroku greedy proposer szuka najdłuższego dopasowania sufiksu w WŁASNEJ historii
 sekwencji (prompt + wygenerowane) i drafuje kontynuację; silnik weryfikuje cały
@@ -254,6 +255,12 @@ budżet, przy czym K=3 nadal może spaść do K=2 przy końcu dostępnego kontek
 Wagi i stan NextN są ładowane tylko po jawnym wybraniu trybu MTP; przy
 `--speculative off` nie zwiększają zużycia VRAM ani czasu prefill.
 
+Router `mtp+ngram:2|3` najpierw próbuje pełnego draftu n-gram o długości K. Przy
+trafieniu target weryfikuje draft bez zależności od jego źródła, a stan MTP jest
+doganiany po `fed + accepted` bez liczenia logitów. Przy braku pełnego draftu
+router używa zwykłego natywnego MTP. Liczniki `ngram_forwards` i
+`mtp_fallback_forwards` rozdzielają obie ścieżki w logu końcowym.
+
 To opis aktualnie wykonywanych ścieżek, a nie pełnego docelowego interfejsu ze
 `SPEC.md` §6. Fundament ma typowane `DraftTree`/`DraftNode`,
 `SpeculationCoordinator`, kaskadową kompozycję liniową i konfiguracje wielu
@@ -269,13 +276,13 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 
 | Flaga | Domyślnie | Opis |
 |---|---|---|
-| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. |
+| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
 
 Przykład dla modelu z natywną głową MTP:
 
 ```bash
 cargo run -p forge-cli --release -- run MODEL.gguf "Przykładowy prompt" \
-  --temp 0 --prefix-cache off --speculative mtp
+  --temp 0 --prefix-cache off --speculative mtp+ngram:3
 ```
 
 Polecenie `serve` dobiera dla MTP domyślne `--max-active 1`; jawna większa
@@ -316,7 +323,7 @@ Zakres i komponowanie:
   żądania CICHO spadają do zwykłego dekodowania — wynik bez zmian.
 - **Wymusza `--prefix-cache off`** (obie funkcje zarządzają własnością stron KV;
   weryfikacja dopisuje i wycofuje draftowe strony na gołej puli).
-- Natywne MTP wymaga obsługiwanego modelowego runtime MTP, greedy z próbkowaniem
+- Natywne MTP i `mtp+ngram` wymagają obsługiwanego modelowego runtime MTP, greedy z próbkowaniem
   GPU bez repetition penalty oraz `--max-active 1`. Ograniczenie jednego aktywnego
   żądania wynika z model-owned stanu SSM. Nie ma cichego fallbacku: niezgodna
   konfiguracja kończy się błędem przed uruchomieniem workera.
@@ -349,8 +356,16 @@ Zweryfikowane natywne MTP (RTX 4090,
 
 - wielocyklowy wynik MTP jest porównywany token po tokenie z sekwencyjnym greedy;
 - retained checkpointy DeltaNet są używane podczas commit zaakceptowanego prefiksu;
-- K=3: raw128 około **59,8 tok/s**, raw512 około **57,7 tok/s**; tryb
-  adaptacyjny: odpowiednio około **58,4 tok/s** i **56,8 tok/s**;
+- catch-up routera przeszedł bitową zgodność target h/x/SSM i MTP hidden/K/V/len
+  dla wymuszonych długości akceptacji 0..K;
+- fair prose K=3: raw128 około **105,1 tok/s** przy akceptacji 96,0%, raw512
+  około **71,2 tok/s** przy akceptacji 59,3%;
+- `mtp+ngram:3` prose: raw128 **118,3-118,5 tok/s** przy akceptacji 97,0%,
+  raw512 **78,0-78,3 tok/s** przy akceptacji 63,7%. Są to wyniki actual;
+  `oracle_upper` pozostaje osobną górną granicą;
+- K=3: raw128 około **86,9 tok/s**, raw512 około **83,8 tok/s** po włączeniu
+  retained checkpointów, głowy Q8 B3/B4, scalonego przygotowania DeltaNet,
+  szybkich projekcji NVFP4 B3/B4 i grafów verifiera T=3/T=4;
 - pomiary dotyczą wyłącznie CUDA. Źródła kerneli Mojo są przenośnym punktem
   wyjścia dla AMDGPU/Metal, ale tych backendów nie uruchomiono ani nie
   zweryfikowano.

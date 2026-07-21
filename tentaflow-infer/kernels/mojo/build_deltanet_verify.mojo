@@ -8,9 +8,14 @@ import std.os as os
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
 from src.deltanet_verify import (
+    deltanet_prepare_t2_f16,
+    deltanet_prepare_t3_f16,
+    deltanet_prepare_t4_f16,
     deltanet_gated_scan_t2_f16,
     deltanet_gated_scan_t3_f16,
     deltanet_gated_scan_t4_f16,
+    deltanet_gated_scan_t3_d128_f16,
+    deltanet_gated_scan_t4_d128_f16,
     deltanet_commit_checkpoint_f32,
 )
 
@@ -42,11 +47,22 @@ def main() raises:
     out_dir = Path("build") / arch
     os.makedirs(String(out_dir), exist_ok=True)
 
+    _ = ctx.compile_function[deltanet_prepare_t2_f16, dump_asm=Path("deltanet_prepare_t2_f16.ptx")]()
+    _finalize(out_dir, "deltanet_prepare_t2_f16")
+    _ = ctx.compile_function[deltanet_prepare_t3_f16, dump_asm=Path("deltanet_prepare_t3_f16.ptx")]()
+    _finalize(out_dir, "deltanet_prepare_t3_f16")
+    _ = ctx.compile_function[deltanet_prepare_t4_f16, dump_asm=Path("deltanet_prepare_t4_f16.ptx")]()
+    _finalize(out_dir, "deltanet_prepare_t4_f16")
+
     _ = ctx.compile_function[deltanet_gated_scan_t2_f16, dump_asm=Path("deltanet_gated_scan_t2_f16.ptx")]()
     _finalize(out_dir, "deltanet_gated_scan_t2_f16")
     _ = ctx.compile_function[deltanet_gated_scan_t3_f16, dump_asm=Path("deltanet_gated_scan_t3_f16.ptx")]()
     _finalize(out_dir, "deltanet_gated_scan_t3_f16")
     _ = ctx.compile_function[deltanet_gated_scan_t4_f16, dump_asm=Path("deltanet_gated_scan_t4_f16.ptx")]()
     _finalize(out_dir, "deltanet_gated_scan_t4_f16")
+    _ = ctx.compile_function[deltanet_gated_scan_t3_d128_f16, dump_asm=Path("deltanet_gated_scan_t3_d128_f16.ptx")]()
+    _finalize(out_dir, "deltanet_gated_scan_t3_d128_f16")
+    _ = ctx.compile_function[deltanet_gated_scan_t4_d128_f16, dump_asm=Path("deltanet_gated_scan_t4_d128_f16.ptx")]()
+    _finalize(out_dir, "deltanet_gated_scan_t4_d128_f16")
     _ = ctx.compile_function[deltanet_commit_checkpoint_f32, dump_asm=Path("deltanet_commit_checkpoint_f32.ptx")]()
     _finalize(out_dir, "deltanet_commit_checkpoint_f32")

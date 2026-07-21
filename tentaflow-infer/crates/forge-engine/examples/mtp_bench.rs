@@ -2,7 +2,7 @@
 // Plik: mtp_bench.rs
 // Opis: Porównuje sekwencyjny greedy decode z natywnym MTP K=2/3 bez
 //       ponownego ładowania wag między próbami.
-// Przykład: cargo run -p forge-engine --release --example mtp_bench -- model.gguf 3 128 512
+// Przykład: cargo run -p forge-engine --release --example mtp_bench -- model.gguf 3 128 512 prose
 // =============================================================================
 
 use std::path::PathBuf;
@@ -194,6 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let budget = if adaptive { 3 } else { mode.parse()? };
     let target = args.next().map(|v| v.parse()).transpose()?.unwrap_or(32);
     let prompt_tokens: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
+    let prompt_kind = args.next().unwrap_or_else(|| "repeat".into());
     let max_seq_len = prompt_tokens
         .checked_add(target)
         .and_then(|length| length.checked_add(budget + 8))
@@ -220,7 +221,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
     drop(gguf);
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
-    let unit = tokenizer.encode(" abc", false)?;
+    let prompt_text = match prompt_kind.as_str() {
+        "repeat" => " abc",
+        "prose" => {
+            "Kraków przez stulecia był ważnym ośrodkiem nauki, kultury i handlu. Jego historia łączy średniowieczną architekturę z codziennym życiem współczesnego miasta. "
+        }
+        _ => return Err("rodzaj promptu musi być równy repeat albo prose".into()),
+    };
+    let unit = tokenizer.encode(prompt_text, false)?;
     if unit.is_empty() {
         return Err("tokenizer zwrócił pusty wzorzec promptu".into());
     }
@@ -296,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     println!(
-        "prompt={prompt_tokens}; serial tok/s={serial_tps:?}; mtp mode={mode} tok/s={mtp_tps:?}; acceptance={:.1}%; acceptance_by_position={accepted_by_position:?}; cycle_p50={:.3} ms",
+        "prompt={prompt_tokens}; kind={prompt_kind}; serial tok/s={serial_tps:?}; mtp mode={mode} tok/s={mtp_tps:?}; acceptance={:.1}%; acceptance_by_position={accepted_by_position:?}; cycle_p50={:.3} ms",
         accepted as f64 * 100.0 / drafted as f64,
         percentile_ms(&mut cycle_ms),
     );

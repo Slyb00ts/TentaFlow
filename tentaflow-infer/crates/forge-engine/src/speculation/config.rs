@@ -25,6 +25,7 @@ pub enum SpeculationKind {
     Off,
     HostProposer,
     NativeMtp,
+    NativeMtpNgram,
 }
 
 impl ProposerKind {
@@ -69,9 +70,12 @@ impl SpeculativeConfig {
                 "enabled speculative configuration requires at least one proposer".into(),
             ));
         }
-        if proposers.contains(&ProposerKind::Mtp) && proposers != [ProposerKind::Mtp] {
+        if proposers.contains(&ProposerKind::Mtp)
+            && proposers != [ProposerKind::Mtp]
+            && proposers != [ProposerKind::Mtp, ProposerKind::Ngram]
+        {
             return Err(ForgeError::Unsupported(
-                "native MTP must be the only speculative proposer".into(),
+                "native MTP może działać samodzielnie albo z priorytetowym n-gramem".into(),
             ));
         }
         for (index, kind) in proposers.iter().enumerate() {
@@ -87,7 +91,7 @@ impl SpeculativeConfig {
                 ));
             }
         }
-        if proposers == [ProposerKind::Mtp] && !matches!(draft_tokens, 2 | 3) {
+        if proposers.contains(&ProposerKind::Mtp) && !matches!(draft_tokens, 2 | 3) {
             return Err(ForgeError::Unsupported(
                 "native MTP draft budget must be 2 or 3".into(),
             ));
@@ -115,6 +119,7 @@ impl SpeculativeConfig {
         match self.proposers.as_slice() {
             [] => SpeculationKind::Off,
             [ProposerKind::Mtp] => SpeculationKind::NativeMtp,
+            [ProposerKind::Mtp, ProposerKind::Ngram] => SpeculationKind::NativeMtpNgram,
             _ => SpeculationKind::HostProposer,
         }
     }
@@ -145,15 +150,18 @@ impl SpeculationCoordinator {
     }
 
     pub fn new_state(&self, history: &[u32]) -> Result<Option<SpeculativeState>> {
-        if self.config.kind() != SpeculationKind::HostProposer {
-            return Ok(None);
-        }
-        let proposers = self
-            .config
-            .proposers()
-            .iter()
-            .map(|&kind| Self::build_proposer(kind))
-            .collect::<Result<Vec<_>>>()?;
+        let proposers = match self.config.kind() {
+            SpeculationKind::HostProposer => self
+                .config
+                .proposers()
+                .iter()
+                .map(|&kind| Self::build_proposer(kind))
+                .collect::<Result<Vec<_>>>()?,
+            SpeculationKind::NativeMtpNgram => {
+                vec![Self::build_proposer(ProposerKind::Ngram)?]
+            }
+            SpeculationKind::Off | SpeculationKind::NativeMtp => return Ok(None),
+        };
         let composer = CascadeComposer::new(proposers);
         let mut state = SpeculativeState::new(composer);
         state.observe_all(history);

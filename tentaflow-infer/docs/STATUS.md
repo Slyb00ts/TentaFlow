@@ -21,9 +21,11 @@ Ostatnia aktualizacja: 2026-07-21.
   batched verifier greedy, argmax oraz checkpointy KV/DeltaNet działają na GPU
   przez kernele Mojo. Retained checkpointy DeltaNet usuwają powtórny skan 48
   warstw przy commit; tryb `--speculative mtp` adaptacyjnie wybiera K=2/K=3.
-  Wielocyklowy benchmark sprawdza zgodność tokenów z serial greedy. Wynik retained
-  RTX 4090, K=3: raw128 około **59,8 tok/s**, raw512 około **57,7 tok/s**;
-  tryb adaptacyjny osiąga odpowiednio około **58,4** i **56,8 tok/s**.
+  Wielocyklowy benchmark sprawdza zgodność tokenów z serial greedy. Stała część
+  verifiera ma trwałe grafy T=3/T=4 z pozycją bazową odczytywaną na GPU. Wynik
+  RTX 4090, K=3: raw128 około **86,9 tok/s**, raw512 około **83,8 tok/s** po
+  włączeniu głowy Q8 B3/B4, scalonego przygotowania DeltaNet, szybkich projekcji
+  NVFP4 B3/B4 i grafów verifiera.
   llama.cpp osiąga **110,2** i **100,5 tok/s**. Cel
   wydajności nie jest jeszcze osiągnięty. vLLM 0.25.1 nie dostarczył porównywalnego
   wyniku, ponieważ jego loader nie przyjął lokalnego jednoplikowego GGUF jako
@@ -524,7 +526,10 @@ Ostatnia aktualizacja: 2026-07-21.
   na pojedynczy graf-krok). Domyślnie WYŁĄCZONA (`--speculative off` = bajt-w-bajt
   dzisiejsza pętla). Natywne MTP/NextN działa osobną, model-owned ścieżką dla
   gęstego hybrydowego `qwen35`: K=2/K=3, adaptacyjny wybór budżetu, batched
-  verifier i retained checkpointy DeltaNet. Wymaga greedy i `max_active=1`;
+  verifier i retained checkpointy DeltaNet. Router `mtp+ngram:2|3` daje
+  pierwszeństwo pełnemu draftowi n-gram, dogania MTP po zaakceptowanym prefiksie,
+  a na miss używa natywnego MTP; raportuje osobne liczniki obu ścieżek. Wymaga
+  greedy i `max_active=1`;
   sprawdzone wykonawczo tylko na CUDA. Braki: draft-model / EAGLE / DFlash /
   DSpark, tree-verification (spec-sampling), spekulacja stochastyczna (`temp>0`)
   oraz backendy AMD/Metal.
@@ -997,3 +1002,18 @@ NVFP4 Bielik golden bit-exact 1 i 4 lanes (default nietknięty); Mistral Q4_K PP
 France"; prefill warm **~5740 tok/s** vs ~11151 MMQ (**~0.51×, ~2× WOLNIEJ** — zmierzone niezależnie; wcześniejsze „11120/0.997×" było błędem pomiaru. Przyczyna: native Q4_K ~0.79×, Q6_K down-proj na wolnym f16 (był MMQ), utracona fuzja rmsnorm→q8_1 + narzut MPAD. Dług: przywrócić fuzję + szybki Q6_K Mojo + shared activation; próg
 0.79×); decode **151 tok/s** bez regresji; VRAM wag 1× (bez repacku), scratch aktywacji
 ~+124 MB (skala MB, pomijalne przy KV-cache).
+
+---
+
+## Scalony DeltaNet prepare T=2-4 (2026-07-21)
+
+- Dodano kernele Mojo `deltanet_prepare_t2_f16`, `t3` i `t4`, które jednym
+  wywołaniem wykonują splot przyczynowy z SiLU, checkpointy okna, podział QKV,
+  L2 i repeat Q/K oraz obliczenie `g` i `beta`. Stan wejściowy okna jest tylko
+  odczytywany, więc odrzucony draft nie wymaga przywracania stanu.
+- Golden CPU/GPU przeszedł dla T=2/3/4. PTX ma target `sm_80`, przechodzi
+  `ptxas -arch=sm_80` bez spillów; warianty T2/T3/T4 używają odpowiednio
+  64/68/78 rejestrów i 128 B pamięci współdzielonej.
+- Izolowany pomiar RTX 4090 dla `n_k=16`, `n_v=32`, `d_state=128`, `d_conv=4`:
+  fused T4 **0,00839 ms**, a 17 rozłożonych wywołań GPU bez kosztu kopii i repeat
+  **0,02953 ms**, czyli konserwatywne przyspieszenie **3,52×**.

@@ -186,3 +186,61 @@ def mtp_prepare_f16(
         stride //= 2
     if lane == 0 and row < hidden_size:
         output[row] = Float16(partials[row_in_block * LANES_PER_ROW])
+
+
+def mtp_stage_step(
+    position_out: UnsafePointer[Int32, MutAnyOrigin],
+    seq_len_out: UnsafePointer[Int32, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    position: Int,
+    seq_len: Int,
+    logical_page: Int,
+    physical_page: Int,
+):
+    """Ustawia metadane kroku i opcjonalnie dopisuje nową stronę logiczną."""
+    if Int(block_idx.x) == 0 and Int(thread_idx.x) == 0:
+        position_out[0] = Int32(position)
+        seq_len_out[0] = Int32(seq_len)
+        if logical_page >= 0:
+            page_table[logical_page] = Int32(physical_page)
+
+
+def mtp_verify_decide(
+    decision: UnsafePointer[Int32, MutAnyOrigin],
+    predictions: UnsafePointer[Int32, MutAnyOrigin],
+    input_ids: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+):
+    """Wyznacza długość zaakceptowanego draftu i token korekty na GPU."""
+    if Int(block_idx.x) == 0 and Int(thread_idx.x) == 0:
+        var accepted = 0
+        while accepted + 1 < n_tokens and predictions[accepted] == input_ids[accepted + 1]:
+            accepted += 1
+        decision[0] = Int32(accepted + 1)
+        decision[1] = predictions[accepted]
+
+
+def mtp_select_row_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    rows: UnsafePointer[Float16, MutAnyOrigin],
+    decision: UnsafePointer[Int32, MutAnyOrigin],
+    row_size: Int,
+):
+    """Kopiuje wiersz F16 wskazany wynikiem akceptacji na GPU."""
+    row = Int(decision[0]) - 1
+    var element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if element < row_size:
+        output[element] = rows[row * row_size + element]
+
+
+def mtp_select_row_f32(
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    rows: UnsafePointer[Float32, MutAnyOrigin],
+    decision: UnsafePointer[Int32, MutAnyOrigin],
+    row_size: Int,
+):
+    """Kopiuje wiersz F32 wskazany wynikiem akceptacji na GPU."""
+    row = Int(decision[0]) - 1
+    var element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if element < row_size:
+        output[element] = rows[row * row_size + element]

@@ -51,6 +51,24 @@ comptime kv_append_batch_f16 = kv_append_batch[DType.float16]
 comptime kv_append_batch_fp8 = kv_append_batch[DType.float8_e4m3fn]
 
 
+def kv_append_batch_device_pos_f16(
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    base_pos: UnsafePointer[Int32, MutAnyOrigin],
+    n_kv_heads: Int,
+    page_size: Int,
+    head_dim: Int,
+):
+    """Wariant F16 odczytujący bazową pozycję z bufora urządzenia."""
+    kv_append_batch[DType.float16](
+        k_cache, v_cache, k_in, v_in, page_table, Int(base_pos[0]),
+        n_kv_heads, page_size, head_dim,
+    )
+
+
 comptime QT = 16  # query tokens per block
 comptime PT = WARP_SIZE  # cached positions per smem tile (one lane per position)
 comptime QPW = QT // MAX_WARPS  # queries owned by one warp
@@ -223,6 +241,26 @@ comptime attn_prefill_f16_hd128 = attn_prefill[128, DType.float16]
 comptime attn_prefill_f16_hd256 = attn_prefill[256, DType.float16]
 comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn]
 comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn]
+
+
+def attn_prefill_device_pos_f16_hd256(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    base_pos: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    scale: Float32,
+    n_tokens: Int,
+):
+    """Wariant HD256 odczytujący bazową pozycję z bufora urządzenia."""
+    attn_prefill[256, DType.float16](
+        out_ptr, q, k_cache, v_cache, page_table, Int(base_pos[0]),
+        n_q_heads, n_kv_heads, page_size, scale, n_tokens,
+    )
 
 
 comptime BQ = 64  # query rows per block (4 warps x 16)

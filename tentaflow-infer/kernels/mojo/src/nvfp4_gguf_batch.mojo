@@ -176,8 +176,66 @@ def gemm_nvfp4_gguf_f16_small_impl[token_tile: Int](
             y[token * n_rows + row] = Float16(total * output_scale)
 
 
+def gemm_nvfp4_gguf_f16_nvidia_impl[token_tile: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    output_scale: Float32,
+):
+    """Wariant NVIDIA z LUT E2M1, szerokim odczytem i dwoma warpami CTA."""
+    tid = Int(thread_idx.x)
+    lut = stack_allocation[16, Float32, address_space=AddressSpace.SHARED]()
+    comptime values = SIMD[DType.float32, 16](
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    )
+    if tid < 16:
+        lut[tid] = values[tid]
+    barrier()
+
+    warp_id = tid // WARP_SIZE
+    lane = tid % WARP_SIZE
+    row = Int(block_idx.x) * 2 + warp_id
+    if row >= n_rows:
+        return
+    blocks_per_row = n_cols // 64
+    row_base = row * blocks_per_row * 36
+    var acc = InlineArray[Float32, token_tile](fill=0.0)
+    var group = lane
+    while group < blocks_per_row * 4:
+        block = group // 4
+        subblock = group % 4
+        base = row_base + block * 36
+        codes = (weights + base + 4 + subblock * 8).load[width=8, alignment=4]()
+        var low = SIMD[DType.float32, 8]()
+        var high = SIMD[DType.float32, 8]()
+        comptime for element in range(8):
+            low[element] = lut[Int(codes[element] & 0x0F)]
+            high[element] = lut[Int(codes[element] >> 4)]
+        scale = _ue4m3_value(weights[base + subblock])
+        column = block * 64 + subblock * 16
+        comptime for token in range(token_tile):
+            activation = (x + token * n_cols + column).load[
+                width=16, alignment=32
+            ]().cast[DType.float32]()
+            acc[token] += scale * (
+                (low * activation.slice[8, offset=0]()).reduce_add()
+                + (high * activation.slice[8, offset=8]()).reduce_add()
+            )
+        group += WARP_SIZE
+
+    comptime for token in range(token_tile):
+        total = warp.sum(acc[token])
+        if lane == 0 and token < n_tokens:
+            y[token * n_rows + row] = Float16(total * output_scale)
 comptime gemm_nvfp4_gguf_f16_b2 = gemm_nvfp4_gguf_f16_small_impl[2]
 comptime gemm_nvfp4_gguf_f16_b3 = gemm_nvfp4_gguf_f16_small_impl[3]
 comptime gemm_nvfp4_gguf_f16_b4 = gemm_nvfp4_gguf_f16_small_impl[4]
+comptime gemm_nvfp4_gguf_f16_b1_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[1]
+comptime gemm_nvfp4_gguf_f16_b3_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[3]
+comptime gemm_nvfp4_gguf_f16_b4_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[4]
 comptime gemm_nvfp4_gguf_f16_b8 = gemm_nvfp4_gguf_f16_impl[8]
 comptime gemm_nvfp4_gguf_f16_b16 = gemm_nvfp4_gguf_f16_impl[16]

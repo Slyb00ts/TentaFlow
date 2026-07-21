@@ -543,7 +543,7 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
     }
 }
 
-/// Parsuje `--speculative`: `off` | `on` | `ngram[:k]` | `mtp[:2|3]`.
+/// Parsuje `--speculative`: `off` | `on` | `ngram[:k]` | `mtp[:2|3]` | `mtp+ngram:2|3`.
 fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
     // The verify forward runs the ungraphed prefill path, so a long draft
     // (amortizing its per-op launch overhead over many accepted tokens) is what
@@ -563,7 +563,14 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
             }
             (name, budget)
         }
-        None => (s, if s == "mtp" { 3 } else { DEFAULT_DRAFT }),
+        None => (
+            s,
+            if matches!(s, "mtp" | "mtp+ngram") {
+                3
+            } else {
+                DEFAULT_DRAFT
+            },
+        ),
     };
     match name {
         "on" if explicit_budget => {
@@ -571,6 +578,11 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
         }
         "on" | "ngram" => SpeculativeConfig::ngram(budget).map_err(Into::into),
         "mtp" => SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget).map_err(Into::into),
+        "mtp+ngram" => SpeculativeConfig::chain(
+            vec![ProposerKind::Mtp, ProposerKind::Ngram],
+            budget,
+        )
+        .map_err(Into::into),
         "draft-model" | "eagle" | "dflash" | "dspark" => bail!(
             "--speculative proposer '{name}' requires an implemented neural loader and forge-speculation.json"
         ),
@@ -578,16 +590,33 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
     }
 }
 
-fn resolve_max_active(max_active: Option<u16>, spec: &SpeculativeConfig) -> Result<usize> {
+fn resolve_max_active(
+    max_active: Option<u16>,
+    spec: &SpeculativeConfig,
+    hybrid_model: bool,
+) -> Result<usize> {
     let max_active = usize::from(max_active.unwrap_or_else(|| {
-        if spec.kind() == SpeculationKind::NativeMtp {
+        if hybrid_model
+            || matches!(
+                spec.kind(),
+                SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+            )
+        {
             1
         } else {
             8
         }
     }));
-    if spec.kind() == SpeculationKind::NativeMtp && max_active != 1 {
-        bail!("--speculative mtp wymaga --max-active 1");
+    if max_active != 1 {
+        if hybrid_model {
+            bail!("modele hybrydowe wymagają --max-active 1, dopóki stan SSM należy do modelu");
+        }
+        if matches!(
+            spec.kind(),
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+        ) {
+            bail!("--speculative mtp oraz mtp+ngram wymagają --max-active 1");
+        }
     }
     Ok(max_active)
 }
@@ -1095,7 +1124,6 @@ fn cmd_serve(
     prefix_cache: bool,
     spec: SpeculativeConfig,
 ) -> Result<()> {
-    let max_active = resolve_max_active(max_active, &spec)?;
     // Speculation appends + rolls back draft KV on the plain paged cache; the
     // radix prefix cache donates/borrows pages and is mutually exclusive with
     // it, so enabling speculation forces prefix caching off.
@@ -1113,8 +1141,12 @@ fn cmd_serve(
         ctx,
         hot_pages,
         prefix_cache,
-        spec.kind() == SpeculationKind::NativeMtp,
+        matches!(
+            spec.kind(),
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+        ),
     )?;
+    let max_active = resolve_max_active(max_active, &spec, loaded.model.is_hybrid())?;
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
@@ -1609,6 +1641,19 @@ mod speculation_cli_tests {
     }
 
     #[test]
+    fn parser_accepts_hybrid_ngram_budgets() {
+        for budget in [2, 3] {
+            let config = parse_speculative(&format!("ngram:{budget}"))
+                .expect("budżet hybrydowego n-gram powinien być poprawny");
+            assert_eq!(config.kind(), SpeculationKind::HostProposer);
+            assert_eq!(config.draft_tokens(), budget);
+            assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
+            assert_eq!(resolve_max_active(None, &config, false).unwrap(), 8);
+            assert!(!config.proposers().contains(&ProposerKind::Mtp));
+        }
+    }
+
+    #[test]
     fn parser_accepts_native_mtp_budgets() {
         for (input, expected_budget) in [("mtp", 3), ("mtp:2", 2), ("mtp:3", 3)] {
             let config = parse_speculative(input).expect("MTP powinno być obsługiwane");
@@ -1619,12 +1664,30 @@ mod speculation_cli_tests {
     }
 
     #[test]
+    fn parser_accepts_mtp_ngram_router() {
+        for (input, expected_budget) in
+            [("mtp+ngram", 3), ("mtp+ngram:2", 2), ("mtp+ngram:3", 3)]
+        {
+            let config = parse_speculative(input).expect("router powinien być obsługiwany");
+            assert_eq!(
+                config.proposers(),
+                &[ProposerKind::Mtp, ProposerKind::Ngram]
+            );
+            assert_eq!(config.kind(), SpeculationKind::NativeMtpNgram);
+            assert_eq!(config.draft_tokens(), expected_budget);
+            assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
+            assert!(resolve_max_active(Some(2), &config, true).is_err());
+        }
+    }
+
+    #[test]
     fn mtp_domyslnie_ogranicza_serwer_do_jednej_sekwencji() {
         let mtp = parse_speculative("mtp").unwrap();
         let off = parse_speculative("off").unwrap();
-        assert_eq!(resolve_max_active(None, &mtp).unwrap(), 1);
-        assert_eq!(resolve_max_active(None, &off).unwrap(), 8);
-        assert_eq!(resolve_max_active(Some(1), &mtp).unwrap(), 1);
-        assert!(resolve_max_active(Some(2), &mtp).is_err());
+        assert_eq!(resolve_max_active(None, &mtp, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(None, &off, false).unwrap(), 8);
+        assert_eq!(resolve_max_active(None, &off, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(Some(1), &mtp, true).unwrap(), 1);
+        assert!(resolve_max_active(Some(2), &mtp, true).is_err());
     }
 }

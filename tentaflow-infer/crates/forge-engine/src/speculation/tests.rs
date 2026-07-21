@@ -449,8 +449,20 @@ fn coordinator_recognizes_model_owned_native_mtp() {
     }
     assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 1).is_err());
     assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 4).is_err());
+    for budget in [2, 3] {
+        let config = SpeculativeConfig::chain(
+            vec![ProposerKind::Mtp, ProposerKind::Ngram],
+            budget,
+        )
+        .expect("router MTP+n-gram powinien obsługiwać budżet 2 lub 3");
+        assert_eq!(config.kind(), SpeculationKind::NativeMtpNgram);
+        let coordinator = SpeculationCoordinator::new(config).expect("router powinien działać");
+        assert!(coordinator
+            .new_state(&[1, 2, 3, 1, 2, 3])
+            .expect("router powinien utworzyć stan n-gram")
+            .is_some());
+    }
     for chain in [
-        vec![ProposerKind::Mtp, ProposerKind::Ngram],
         vec![ProposerKind::Mtp, ProposerKind::DraftModel],
         vec![ProposerKind::DraftModel, ProposerKind::Mtp],
     ] {

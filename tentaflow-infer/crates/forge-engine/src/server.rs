@@ -157,6 +157,10 @@ struct ActiveSeq<'t> {
     /// Draft tokens accepted across all verifications (excludes correction/bonus
     /// tokens, which every forward also produces).
     spec_accepted: u64,
+    /// Liczba pełnych draftów n-gram zweryfikowanych przez router MTP+n-gram.
+    ngram_forwards: u64,
+    /// Liczba kroków, w których brak pełnego draftu uruchomił proposer MTP.
+    mtp_fallback_forwards: u64,
     mtp_k2_rate: Option<f64>,
     mtp_k3_rate: Option<f64>,
     /// TTFT / inter-token / decode-tps timing feeding the metrics histograms.
@@ -168,9 +172,11 @@ struct ActiveSeq<'t> {
 
 fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<SpeculationKind> {
     match (spec.kind(), greedy) {
-        (SpeculationKind::NativeMtp, false) => Err(ForgeError::Unsupported(
-            "native MTP requires greedy GPU sampling without repetition penalty".into(),
-        )),
+        (SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram, false) => {
+            Err(ForgeError::Unsupported(
+                "native MTP requires greedy GPU sampling without repetition penalty".into(),
+            ))
+        }
         (SpeculationKind::HostProposer, false) | (SpeculationKind::Off, _) => {
             Ok(SpeculationKind::Off)
         }
@@ -178,10 +184,23 @@ fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<Sp
     }
 }
 
-fn validate_native_mtp_server_config(kind: SpeculationKind, max_active: usize) -> Result<()> {
-    if kind == SpeculationKind::NativeMtp && max_active != 1 {
+fn validate_speculation_server_config(
+    kind: SpeculationKind,
+    max_active: usize,
+    hybrid_target: bool,
+) -> Result<()> {
+    if hybrid_target && max_active != 1 {
         return Err(ForgeError::Unsupported(
-            "native MTP currently requires max_active=1 because SSM state is model-owned".into(),
+            "model hybrydowy wymaga max_active=1, ponieważ stan SSM należy do modelu".into(),
+        ));
+    }
+    if matches!(
+        kind,
+        SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+    ) && max_active != 1
+    {
+        return Err(ForgeError::Unsupported(
+            "natywne MTP wymaga max_active=1, ponieważ stan draftu należy do modelu".into(),
         ));
     }
     Ok(())
@@ -274,16 +293,22 @@ pub fn spawn_engine_batched(
     spec: SpeculativeConfig,
 ) -> Result<EngineHandle> {
     let coordinator = SpeculationCoordinator::new(spec.clone())?;
-    validate_native_mtp_server_config(spec.kind(), max_active)?;
+    validate_speculation_server_config(spec.kind(), max_active, model.is_hybrid())?;
     if spec.is_enabled() {
         match spec.kind() {
-            SpeculationKind::NativeMtp if !model.has_native_mtp() => {
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+                if !model.has_native_mtp() =>
+            {
                 return Err(ForgeError::Unsupported(
                     "native MTP requires a supported model-owned MTP runtime".into(),
                 ));
             }
-            SpeculationKind::NativeMtp => model.validate_native_mtp_target()?,
-            SpeculationKind::HostProposer => model.validate_speculation_target()?,
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram => {
+                model.validate_native_mtp_target()?
+            }
+            SpeculationKind::HostProposer => {
+                model.validate_speculation_target(spec.draft_tokens())?
+            }
             SpeculationKind::Off => {}
         }
         let proposer_names = spec
@@ -494,6 +519,8 @@ fn worker<'t>(
                 spec_budget,
                 spec_forwards: 0,
                 spec_accepted: 0,
+                ngram_forwards: 0,
+                mtp_fallback_forwards: 0,
                 mtp_k2_rate: None,
                 mtp_k3_rate: None,
                 timing: SeqTiming::new(),
@@ -664,15 +691,7 @@ fn advance(
                 SeqSampler::Cpu(_) => PendingNext::Logits(logits),
                 // The prefill logits are still device-resident: draw now,
                 // before another sequence overwrites the shared buffer.
-                SeqSampler::Gpu(g) => {
-                    let t = model.sample_last_logits(g)?;
-                    // Keep the proposer's history in lock-step: the first token
-                    // is confirmed here, before it is ever used as a draft base.
-                    if let Some(s) = &mut a.spec {
-                        s.observe(t);
-                    }
-                    PendingNext::Token(t)
-                }
+                SeqSampler::Gpu(g) => PendingNext::Token(model.sample_last_logits(g)?),
             });
         }
         return Ok(());
@@ -765,6 +784,9 @@ fn batch_gpu_decode(
                 match a.spec_kind {
                     SpeculationKind::HostProposer => speculative_step(model, a, metrics),
                     SpeculationKind::NativeMtp => native_mtp_step(model, a, metrics),
+                    SpeculationKind::NativeMtpNgram => {
+                        native_mtp_ngram_step(model, a, metrics)
+                    }
                     SpeculationKind::Off => feed_idx.push(i),
                 }
             }
@@ -871,6 +893,7 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     let budget = a.spec_budget;
     let draft = {
         let s = a.spec.as_mut().expect("speculative_step on a spec sequence");
+        s.observe(fed);
         match s.draft(budget) {
             Ok(draft) => draft,
             Err(error) => {
@@ -899,12 +922,7 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
         };
         g.note_token(fed);
         match model.step_and_sample(&mut a.seq, fed, g) {
-            Ok(t) => {
-                if let Some(s) = &mut a.spec {
-                    s.observe(t);
-                }
-                a.next = Some(PendingNext::Token(t));
-            }
+            Ok(t) => a.next = Some(PendingNext::Token(t)),
             Err(e) => {
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
@@ -950,10 +968,80 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
             }
         }
     }
-    // The correction/bonus token is confirmed but not yet resident in KV (the
-    // next iteration feeds it); record it in the proposer history now.
-    if let Some(s) = &mut a.spec {
-        s.observe(correction);
+    // Token korekcyjny zostanie dodany do historii po emisji w następnym kroku.
+    a.next = Some(PendingNext::Token(correction));
+}
+
+/// Priorytetowy router: pełny draft n-gram omija proposer MTP, a brak pełnego
+/// draftu uruchamia zwykły krok natywnego MTP.
+fn native_mtp_ngram_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMetrics) {
+    let fed = *a.generated.last().expect("emit_token pushed the fed token");
+    let budget = a.spec_budget;
+    let draft = {
+        let state = a
+            .spec
+            .as_mut()
+            .expect("router MTP+n-gram ma stan hostowy");
+        state.observe(fed);
+        match state.draft(budget) {
+            Ok(draft) => draft,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
+    };
+    if draft.len() != budget {
+        if let Some(state) = &mut a.spec {
+            state.cancel_draft();
+        }
+        let generated_before = a.generated.len();
+        a.mtp_fallback_forwards += 1;
+        native_mtp_step(model, a, metrics);
+        let accepted = a.generated[generated_before..].to_vec();
+        if let Some(state) = &mut a.spec {
+            state.observe_all(&accepted);
+        }
+        return;
+    }
+
+    let SeqSampler::Gpu(sampler) = &mut a.sampler else {
+        unreachable!("router MTP+n-gram wymaga samplera GPU")
+    };
+    sampler.note_token(fed);
+    let (accepted, correction) =
+        match model.verify_greedy_draft_with_mtp_catchup(&mut a.seq, fed, &draft) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(state) = &mut a.spec {
+                    state.cancel_draft();
+                }
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        };
+    if let Some(state) = &mut a.spec {
+        if let Err(error) = state.commit(&draft, accepted) {
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+            return;
+        }
+    }
+    a.spec_forwards += 1;
+    a.ngram_forwards += 1;
+    a.spec_accepted += accepted as u64;
+    for &token in &draft[..accepted] {
+        match emit_token(a, token, None, metrics) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
     }
     a.next = Some(PendingNext::Token(correction));
 }
@@ -1063,6 +1151,13 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
                 tokens_from_spec / forwards,
                 s.stats(),
             );
+            if a.spec_kind == SpeculationKind::NativeMtpNgram {
+                tracing::info!(
+                    "router MTP+n-gram: {} n-gram verify, {} MTP fallback",
+                    a.ngram_forwards,
+                    a.mtp_fallback_forwards,
+                );
+            }
         }
     } else if a.spec_kind == SpeculationKind::NativeMtp && a.spec_forwards > 0 {
         let forwards = a.spec_forwards as f64;
@@ -1102,7 +1197,7 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
 mod tests {
     use super::{
         native_mtp_adaptive_budget, native_mtp_step_budget, request_speculation_kind,
-        update_mtp_rate, validate_native_mtp_server_config,
+        update_mtp_rate, validate_speculation_server_config,
     };
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
 
@@ -1117,6 +1212,16 @@ mod tests {
             );
             assert!(request_speculation_kind(&spec, false).is_err());
         }
+        let router = SpeculativeConfig::chain(
+            vec![ProposerKind::Mtp, ProposerKind::Ngram],
+            3,
+        )
+        .expect("konfiguracja routera powinna być poprawna");
+        assert_eq!(
+            request_speculation_kind(&router, true).expect("greedy router powinien działać"),
+            SpeculationKind::NativeMtpNgram
+        );
+        assert!(request_speculation_kind(&router, false).is_err());
     }
 
     #[test]
@@ -1134,11 +1239,26 @@ mod tests {
 
     #[test]
     fn native_mtp_requires_one_active_sequence() {
-        assert!(validate_native_mtp_server_config(SpeculationKind::NativeMtp, 0).is_err());
-        assert!(validate_native_mtp_server_config(SpeculationKind::NativeMtp, 1).is_ok());
-        assert!(validate_native_mtp_server_config(SpeculationKind::NativeMtp, 2).is_err());
-        assert!(validate_native_mtp_server_config(SpeculationKind::HostProposer, 8).is_ok());
-        assert!(validate_native_mtp_server_config(SpeculationKind::Off, 8).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 0, true).is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 1, true).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 2, true).is_err());
+        assert!(validate_speculation_server_config(
+            SpeculationKind::NativeMtpNgram,
+            1,
+            true
+        )
+        .is_ok());
+        assert!(validate_speculation_server_config(
+            SpeculationKind::NativeMtpNgram,
+            2,
+            true
+        )
+        .is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 8, false).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 8, true).is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 1, true).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::Off, 8, true).is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::Off, 1, true).is_ok());
     }
 
     #[test]
