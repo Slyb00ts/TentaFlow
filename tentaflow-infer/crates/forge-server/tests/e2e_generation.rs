@@ -57,6 +57,7 @@ async fn generation_api_end_to_end() {
                         kv_page_size,
                         kv_pages,
                         forge_engine::kv::KvQuant::F16,
+                        false,
                     ),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
@@ -74,6 +75,7 @@ async fn generation_api_end_to_end() {
                     kv_quant: forge_engine::kv::KvQuant::F16,
                     kv_tier: Default::default(),
                     prefix_cache: true,
+                    native_mtp: false,
                 },
             )
             .expect("load model");

@@ -1,8 +1,8 @@
-// ===== File: kv.rs — paged KV cache (per-layer K/V page pools + page tables) =====
-// Layout per layer: [n_pages, n_kv_heads, page_size, head_dim] elements of
-// `dtype` (f16 canonical | fp8-e4m3, half the bytes/bandwidth), matching the
-// attention kernels. v0 allocates one contiguous slab per layer and hands out
-// logical pages; the HAL KvCache pool arena underneath keeps frees cheap.
+// =============================================================================
+// Plik: kv.rs
+// Opis: Zarządza stronicowanym cache K/V oraz przydziałem stron sekwencji.
+// Przykład: KvCache::new(device, config)
+// =============================================================================
 
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_types::{DType, ForgeError, MemKind, Result};
@@ -193,12 +193,11 @@ impl KvCache {
         };
         let mut k = Vec::with_capacity(cfg.n_layers);
         let mut v = Vec::with_capacity(cfg.n_layers);
-        // The per-layer buffers are static for the model lifetime — paging is a
-        // logical overlay managed here — so they come from the bump (Weights)
-        // pool; the HAL KvCache slab arena serves fixed-size page churn only.
+        // Bufory warstw zajmują ciągłe zakresy dedykowanej puli KV; logiczne
+        // strony pozostają nakładką zarządzaną przez ten cache.
         for _ in 0..cfg.n_layers {
-            k.push(device.alloc(kv_bytes, MemKind::Device, Pool::Weights)?);
-            v.push(device.alloc(kv_bytes, MemKind::Device, Pool::Weights)?);
+            k.push(device.alloc(kv_bytes, MemKind::Device, Pool::KvCache)?);
+            v.push(device.alloc(kv_bytes, MemKind::Device, Pool::KvCache)?);
         }
         // Rotational low-bit region: packed codes (u8) + f16 scales per slot.
         let mut k_packed = Vec::new();
@@ -211,10 +210,10 @@ impl KvCache {
                 .ok_or_else(|| ForgeError::Scheduler("rot packed size overflow".into()))?;
             let scale_bytes = slots * 2;
             for _ in 0..cfg.n_layers {
-                k_packed.push(device.alloc(packed_bytes, MemKind::Device, Pool::Weights)?);
-                v_packed.push(device.alloc(packed_bytes, MemKind::Device, Pool::Weights)?);
-                k_scale.push(device.alloc(scale_bytes, MemKind::Device, Pool::Weights)?);
-                v_scale.push(device.alloc(scale_bytes, MemKind::Device, Pool::Weights)?);
+                k_packed.push(device.alloc(packed_bytes, MemKind::Device, Pool::KvCache)?);
+                v_packed.push(device.alloc(packed_bytes, MemKind::Device, Pool::KvCache)?);
+                k_scale.push(device.alloc(scale_bytes, MemKind::Device, Pool::KvCache)?);
+                v_scale.push(device.alloc(scale_bytes, MemKind::Device, Pool::KvCache)?);
             }
         }
         // Stack of free physical page ids shared across layers: a logical page
@@ -329,5 +328,182 @@ impl KvCache {
 
     pub(crate) fn push_free(&mut self, page: i32) {
         self.free_pages.push(page);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use forge_hal::cpu::CpuDevice;
+    use forge_hal::{Event, ExecGraph, KernelHandle, LaunchArgs, LaunchConfig, Module, Stream};
+    use forge_types::DeviceCaps;
+
+    use super::*;
+
+    struct PoolTrackingDevice {
+        inner: Arc<dyn Device>,
+        allocations: Mutex<Vec<(usize, MemKind, Pool)>>,
+    }
+
+    impl PoolTrackingDevice {
+        fn new() -> Self {
+            Self {
+                inner: CpuDevice::new(),
+                allocations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn pools(&self) -> Vec<Pool> {
+            self.allocations
+                .lock()
+                .expect("rejestr alokacji nie powinien być zatruty")
+                .iter()
+                .map(|(_, _, pool)| *pool)
+                .collect()
+        }
+    }
+
+    impl Device for PoolTrackingDevice {
+        fn caps(&self) -> &DeviceCaps {
+            self.inner.caps()
+        }
+
+        fn alloc(&self, bytes: usize, kind: MemKind, pool: Pool) -> Result<DevBuffer> {
+            self.allocations
+                .lock()
+                .expect("rejestr alokacji nie powinien być zatruty")
+                .push((bytes, kind, pool));
+            self.inner.alloc(bytes, kind, pool)
+        }
+
+        fn pool_available(&self, pool: Pool) -> Option<usize> {
+            self.inner.pool_available(pool)
+        }
+
+        fn create_stream(&self) -> Result<Stream> {
+            self.inner.create_stream()
+        }
+
+        fn create_event(&self) -> Result<Event> {
+            self.inner.create_event()
+        }
+
+        fn record_event(&self, event: &Event, stream: &Stream) -> Result<()> {
+            self.inner.record_event(event, stream)
+        }
+
+        fn wait_event(&self, stream: &Stream, event: &Event) -> Result<()> {
+            self.inner.wait_event(stream, event)
+        }
+
+        fn elapsed_event_ms(&self, start: &Event, end: &Event) -> Result<Option<f32>> {
+            self.inner.elapsed_event_ms(start, end)
+        }
+
+        fn copy(
+            &self,
+            src: &DevBuffer,
+            src_offset: usize,
+            dst: &DevBuffer,
+            dst_offset: usize,
+            bytes: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            self.inner
+                .copy(src, src_offset, dst, dst_offset, bytes, stream)
+        }
+
+        fn write(&self, src: &[u8], dst: &DevBuffer, dst_offset: usize) -> Result<()> {
+            self.inner.write(src, dst, dst_offset)
+        }
+
+        fn read(&self, src: &DevBuffer, src_offset: usize, dst: &mut [u8]) -> Result<()> {
+            self.inner.read(src, src_offset, dst)
+        }
+
+        fn load_module(&self, image: &[u8]) -> Result<Module> {
+            self.inner.load_module(image)
+        }
+
+        fn launch(
+            &self,
+            kernel: &KernelHandle,
+            cfg: &LaunchConfig,
+            args: &LaunchArgs,
+            stream: &Stream,
+        ) -> Result<()> {
+            self.inner.launch(kernel, cfg, args, stream)
+        }
+
+        fn synchronize(&self) -> Result<()> {
+            self.inner.synchronize()
+        }
+
+        fn begin_capture(&self, stream: &Stream) -> Result<()> {
+            self.inner.begin_capture(stream)
+        }
+
+        fn end_capture(&self, stream: &Stream) -> Result<ExecGraph> {
+            self.inner.end_capture(stream)
+        }
+
+        fn launch_graph(&self, graph: &ExecGraph, stream: &Stream) -> Result<()> {
+            self.inner.launch_graph(graph, stream)
+        }
+
+        fn reset_activations(&self) -> Result<u64> {
+            self.inner.reset_activations()
+        }
+    }
+
+    fn config(quant: KvQuant) -> KvConfig {
+        KvConfig {
+            n_layers: 2,
+            n_kv_heads: 2,
+            head_dim: 32,
+            page_size: 4,
+            n_pages: 3,
+            max_pages_per_seq: 3,
+            quant,
+        }
+    }
+
+    #[test]
+    fn wszystkie_bufory_kv_uzywaja_dedykowanej_puli() {
+        let device = PoolTrackingDevice::new();
+
+        let f16 = KvCache::new(&device, config(KvQuant::F16)).unwrap();
+        let rot = KvCache::new(
+            &device,
+            config(KvQuant::Rot {
+                bits: 4,
+                residual_window: 8,
+                activate_at: 16,
+            }),
+        )
+        .unwrap();
+        let pools = device.pools();
+
+        assert_eq!(pools.len(), 16);
+        assert!(pools.iter().all(|pool| *pool == Pool::KvCache));
+        drop((f16, rot));
+    }
+
+    #[test]
+    fn release_oddaje_wszystkie_przydzielone_strony() {
+        let device = CpuDevice::new();
+        let mut cache = KvCache::new(device.as_ref(), config(KvQuant::F16)).unwrap();
+        let mut seq = cache.new_seq();
+
+        for _ in 0..9 {
+            cache.grow(&mut seq).unwrap();
+        }
+        assert_eq!(cache.free_page_count(), 0);
+        cache.release(&mut seq);
+
+        assert_eq!(cache.free_page_count(), cache.cfg.n_pages);
+        assert_eq!(seq.len, 0);
+        assert!(seq.pages.is_empty());
     }
 }

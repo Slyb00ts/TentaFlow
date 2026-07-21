@@ -11,6 +11,10 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    /// Liczba ostatnich tokenów objętych karami; zero oznacza cały kontekst.
+    pub repeat_last_n: usize,
     pub seed: Option<u64>,
 }
 
@@ -22,6 +26,9 @@ impl Default for SamplingParams {
             top_p: 0.95,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            repeat_last_n: 0,
             seed: None,
         }
     }
@@ -49,7 +56,21 @@ impl SamplingParams {
         if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
             self.repetition_penalty = 1.0;
         }
+        if !self.frequency_penalty.is_finite() {
+            self.frequency_penalty = 0.0;
+        }
+        self.frequency_penalty = self.frequency_penalty.clamp(-2.0, 2.0);
+        if !self.presence_penalty.is_finite() {
+            self.presence_penalty = 0.0;
+        }
+        self.presence_penalty = self.presence_penalty.clamp(-2.0, 2.0);
         self
+    }
+
+    pub fn has_penalties(&self) -> bool {
+        self.repetition_penalty != 1.0
+            || self.frequency_penalty != 0.0
+            || self.presence_penalty != 0.0
     }
 
     /// The seed both samplers stream from: caller-provided or time-derived.
@@ -60,6 +81,35 @@ impl SamplingParams {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0x9E3779B97F4A7C15)
         })
+    }
+}
+
+/// Nakłada kary na tokeny obecne w wybranym oknie promptu i odpowiedzi.
+pub fn apply_penalties(logits: &mut [f32], recent: &[u32], params: &SamplingParams) {
+    if !params.has_penalties() {
+        return;
+    }
+    let start = if params.repeat_last_n == 0 {
+        0
+    } else {
+        recent.len().saturating_sub(params.repeat_last_n)
+    };
+    let mut counts = std::collections::HashMap::<u32, u32>::new();
+    for &token in &recent[start..] {
+        *counts.entry(token).or_default() += 1;
+    }
+    for (token, count) in counts {
+        let Some(logit) = logits.get_mut(token as usize) else {
+            continue;
+        };
+        if params.repetition_penalty != 1.0 {
+            *logit = if *logit > 0.0 {
+                *logit / params.repetition_penalty
+            } else {
+                *logit * params.repetition_penalty
+            };
+        }
+        *logit -= params.presence_penalty + params.frequency_penalty * count as f32;
     }
 }
 
@@ -178,23 +228,29 @@ impl Sampler {
         }
         let p = &self.params;
 
-        let mut logits = logits.to_vec();
-        if p.repetition_penalty != 1.0 {
-            // Penalize each distinct token once — repeated occurrences must
-            // not compound the penalty exponentially.
-            let distinct: std::collections::HashSet<u32> = recent.iter().copied().collect();
-            for t in distinct {
-                if let Some(l) = logits.get_mut(t as usize) {
-                    *l = if *l > 0.0 {
-                        *l / p.repetition_penalty
-                    } else {
-                        *l * p.repetition_penalty
-                    };
-                }
-            }
+        if p.temperature <= 0.0 && !p.has_penalties() {
+            let (best, _) = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .expect("non-empty");
+            return Ok(best as u32);
         }
 
-        // Greedy path: temperature 0 means argmax, no randomness.
+        let mut logits = logits.to_vec();
+        apply_penalties(&mut logits, recent, p);
+
+        self.sample_preprocessed(&logits)
+    }
+
+    /// Losuje z logitów po nałożeniu masek, biasów i kar przez wywołującego.
+    pub(crate) fn sample_preprocessed(&mut self, logits: &[f32]) -> Result<u32> {
+        if logits.is_empty() {
+            return Err(ForgeError::Scheduler("empty logits".into()));
+        }
+        let p = &self.params;
+
+        // Greedy z aktywnymi karami korzysta ze zmodyfikowanych logitów.
         if p.temperature <= 0.0 {
             let (best, _) = logits
                 .iter()
@@ -264,6 +320,10 @@ impl Sampler {
         }
         Ok(candidates.last().expect("non-empty").0)
     }
+
+    pub(crate) fn params(&self) -> &SamplingParams {
+        &self.params
+    }
 }
 
 /// Per-sequence state for on-GPU sampling: the sanitized params, the
@@ -278,7 +338,9 @@ pub struct GpuSampler {
     /// Distinct generated token ids, i32 for direct device upload. Only
     /// maintained when the penalty is active.
     penalized: Vec<i32>,
-    seen: std::collections::HashSet<u32>,
+    penalty_counts: Vec<i32>,
+    history: std::collections::VecDeque<u32>,
+    counts: std::collections::HashMap<u32, u32>,
 }
 
 impl GpuSampler {
@@ -288,7 +350,8 @@ impl GpuSampler {
     /// so an unbounded candidate set has no GPU form).
     pub fn compatible(params: &SamplingParams) -> bool {
         let p = params.clone().sanitized();
-        p.temperature <= 0.0 || (p.top_k >= 1 && p.top_k <= forge_kernels::SAMPLE_MAX_TOPK)
+        p.temperature <= 0.0
+            || (p.top_k >= 1 && p.top_k <= forge_kernels::SAMPLE_MAX_TOPK)
     }
 
     pub fn new(params: SamplingParams) -> Self {
@@ -299,15 +362,48 @@ impl GpuSampler {
             seed,
             step: 0,
             penalized: Vec::new(),
-            seen: std::collections::HashSet::new(),
+            penalty_counts: Vec::new(),
+            history: std::collections::VecDeque::new(),
+            counts: std::collections::HashMap::new(),
         }
     }
 
-    /// Record a generated token for the repetition penalty (distinct ids
-    /// only — the penalty must not compound across repeats).
+    /// Dopisuje token promptu lub odpowiedzi do licznika aktywnego okna kar.
     pub fn note_token(&mut self, id: u32) {
-        if self.params.repetition_penalty != 1.0 && self.seen.insert(id) {
+        if !self.params.has_penalties() {
+            return;
+        }
+        self.history.push_back(id);
+        let count = self.counts.entry(id).or_default();
+        *count += 1;
+        if *count == 1 {
             self.penalized.push(id as i32);
+            self.penalty_counts.push(1);
+        } else if let Some(index) = self.penalized.iter().position(|&token| token == id as i32) {
+            self.penalty_counts[index] = *count as i32;
+        }
+        while self.params.repeat_last_n > 0 && self.history.len() > self.params.repeat_last_n {
+            let expired = self.history.pop_front().expect("historia nie jest pusta");
+            let count = self.counts.get_mut(&expired).expect("token ma licznik");
+            *count -= 1;
+            let index = self
+                .penalized
+                .iter()
+                .position(|&token| token == expired as i32)
+                .expect("token jest na liście kar");
+            if *count == 0 {
+                self.counts.remove(&expired);
+                self.penalized.remove(index);
+                self.penalty_counts.remove(index);
+            } else {
+                self.penalty_counts[index] = *count as i32;
+            }
+        }
+    }
+
+    pub fn note_tokens(&mut self, ids: &[u32]) {
+        for &id in ids {
+            self.note_token(id);
         }
     }
 
@@ -322,6 +418,10 @@ impl GpuSampler {
     /// Distinct penalized ids, empty when the penalty is inactive.
     pub fn penalized(&self) -> &[i32] {
         &self.penalized
+    }
+
+    pub fn penalty_counts(&self) -> &[i32] {
+        &self.penalty_counts
     }
 
     /// Current step counter; advances once per drawn token.
@@ -354,8 +454,15 @@ impl GpuSampler {
             seed: self.seed,
             step,
             penalty: p.repetition_penalty,
-            penalty_ids: if p.repetition_penalty != 1.0 {
+            frequency_penalty: p.frequency_penalty,
+            presence_penalty: p.presence_penalty,
+            penalty_ids: if p.has_penalties() {
                 self.penalized.clone()
+            } else {
+                Vec::new()
+            },
+            penalty_counts: if p.has_penalties() {
+                self.penalty_counts.clone()
             } else {
                 Vec::new()
             },
@@ -375,7 +482,10 @@ pub struct SeqSampleParams {
     pub seed: u64,
     pub step: u64,
     pub penalty: f32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
     pub penalty_ids: Vec<i32>,
+    pub penalty_counts: Vec<i32>,
 }
 
 #[cfg(test)]
@@ -464,5 +574,68 @@ mod tests {
         assert_eq!(lp.token, 1);
         assert!(lp.top.is_empty());
         assert!(lp.logprob <= 0.0);
+    }
+
+    #[test]
+    fn frequency_i_presence_uzywaja_licznosci_z_okna() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            frequency_penalty: 0.5,
+            presence_penalty: 0.25,
+            repeat_last_n: 3,
+            ..SamplingParams::default()
+        };
+        let mut logits = [1.0, 8.0, -2.0, 4.0];
+        apply_penalties(&mut logits, &[1, 1, 2, 1], &params);
+
+        assert_eq!(logits, [1.0, 2.75, -4.75, 4.0]);
+    }
+
+    #[test]
+    fn kary_ignoruja_token_spoza_slownika() {
+        let params = SamplingParams {
+            repetition_penalty: 2.0,
+            frequency_penalty: 0.5,
+            presence_penalty: 0.25,
+            ..SamplingParams::default()
+        };
+        let mut logits = [1.0, f32::NAN];
+
+        apply_penalties(&mut logits, &[u32::MAX, 1], &params);
+
+        assert_eq!(logits[0], 1.0);
+        assert!(logits[1].is_nan());
+    }
+
+    #[test]
+    fn gpu_historia_uwzglednia_prompt_i_wyrzuca_stare_tokeny() {
+        let mut sampler = GpuSampler::new(SamplingParams {
+            frequency_penalty: 0.5,
+            repeat_last_n: 3,
+            ..SamplingParams::default()
+        });
+        sampler.note_tokens(&[7, 8, 7]);
+        sampler.note_token(9);
+
+        assert_eq!(sampler.penalized(), &[7, 8, 9]);
+        assert_eq!(sampler.penalty_counts(), &[1, 1, 1]);
+
+        sampler.note_token(10);
+        assert_eq!(sampler.penalized(), &[7, 9, 10]);
+        assert_eq!(sampler.penalty_counts(), &[1, 1, 1]);
+    }
+
+    #[test]
+    fn kary_sa_obslugiwane_przez_gpu() {
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        assert!(GpuSampler::compatible(&greedy));
+        assert!(GpuSampler::compatible(&SamplingParams {
+            frequency_penalty: 0.1,
+            ..greedy
+        }));
     }
 }

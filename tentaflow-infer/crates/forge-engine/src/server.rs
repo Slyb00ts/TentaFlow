@@ -15,10 +15,10 @@ use forge_types::{ForgeError, Result};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::metrics::{EngineMetrics, SeqTiming};
-use crate::model::{Model, MAX_PREFILL_CHUNK};
+use crate::model::{Model, PrefillProfile, MAX_PREFILL_CHUNK};
 use crate::sample::{
     apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
-    SeqSampleParams, TokenLogprob,
+    SeqSampleParams, TokenLogprob, apply_penalties,
 };
 pub use crate::speculation::SpeculativeConfig;
 use crate::speculation::{SpeculationCoordinator, SpeculationKind, SpeculativeState};
@@ -68,13 +68,23 @@ pub enum EngineEvent {
         prompt_tokens: usize,
         /// Prompt tokens served from the prefix cache (SPEC §5.2 prefix hit).
         cache_read_tokens: usize,
+        /// Diagnostyka dostępna tylko, gdy model przygotował profil benchmarku.
+        benchmark: Option<BenchmarkTimings>,
     },
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BenchmarkTimings {
+    pub target_gpu_ms: Option<f64>,
+    pub mtp_catchup_gpu_ms: Option<f64>,
+    pub ttft_ms: f64,
 }
 
 struct Submission {
     req: EngineRequest,
     events: mpsc::Sender<EngineEvent>,
+    submitted_at: Instant,
 }
 
 /// Cheap cloneable handle; the worker thread ends when all handles drop.
@@ -89,7 +99,11 @@ impl EngineHandle {
     pub fn submit(&self, req: EngineRequest) -> Result<mpsc::Receiver<EngineEvent>> {
         let (etx, erx) = mpsc::channel();
         self.tx
-            .send(Submission { req, events: etx })
+            .send(Submission {
+                req,
+                events: etx,
+                submitted_at: Instant::now(),
+            })
             .map_err(|_| ForgeError::Scheduler("engine worker stopped".into()))?;
         Ok(erx)
     }
@@ -127,6 +141,8 @@ struct ActiveSeq<'t> {
     /// Prompt tokens not yet prefilled (front = next).
     pending_prompt: VecDeque<u32>,
     generated: Vec<u32>,
+    /// Prompt i wygenerowane tokeny widoczne dla kar samplera CPU.
+    sampling_history: Vec<u32>,
     max_tokens: usize,
     eos_ids: Vec<u32>,
     /// `logit_bias` applied to the host logits before selection (CPU path).
@@ -168,6 +184,9 @@ struct ActiveSeq<'t> {
     /// Set once `finish` has emitted `Done`; distinguishes a clean completion
     /// from an errored / hung-up teardown for the requests_errored counter.
     finished_cleanly: bool,
+    submitted_at: Instant,
+    prefill_profile: Option<PrefillProfile>,
+    benchmark_ttft_ms: Option<f64>,
 }
 
 fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<SpeculationKind> {
@@ -453,10 +472,20 @@ fn worker<'t>(
                 || !sub.req.logit_bias.is_empty()
                 || sub.req.min_tokens > 0
                 || sub.req.logprobs.is_some();
-            let sampler = if !host_logits && model.gpu_sampling_supported(&sub.req.sampling) {
+            let mut sampler = if !host_logits && model.gpu_sampling_supported(&sub.req.sampling) {
                 SeqSampler::Gpu(GpuSampler::new(sub.req.sampling.clone()))
             } else {
                 SeqSampler::Cpu(Sampler::new(sub.req.sampling.clone()))
+            };
+            if let SeqSampler::Gpu(gpu_sampler) = &mut sampler {
+                gpu_sampler.note_tokens(&prompt);
+            }
+            let sampling_history = if matches!(sampler, SeqSampler::Cpu(_))
+                && sub.req.sampling.clone().sanitized().has_penalties()
+            {
+                prompt.clone()
+            } else {
+                Vec::new()
             };
             // Speculative decoding engages only for a greedy, penalty-free,
             // GPU-sampled sequence (the n-gram verifier reproduces greedy argmax
@@ -465,7 +494,7 @@ fn worker<'t>(
             // prefixes draft immediately.
             let greedy = matches!(sampler, SeqSampler::Gpu(_))
                 && sub.req.sampling.clone().sanitized().temperature <= 0.0
-                && sub.req.sampling.repetition_penalty == 1.0;
+                && !sub.req.sampling.clone().sanitized().has_penalties();
             let request_spec_kind = match request_speculation_kind(&spec, greedy) {
                 Ok(kind) => kind,
                 Err(error) => {
@@ -504,6 +533,7 @@ fn worker<'t>(
                 events: sub.events,
                 pending_prompt,
                 generated: Vec::new(),
+                sampling_history,
                 max_tokens: sub.req.max_tokens.max(1),
                 eos_ids: sub.req.eos_ids,
                 logit_bias: sub.req.logit_bias,
@@ -525,6 +555,9 @@ fn worker<'t>(
                 mtp_k3_rate: None,
                 timing: SeqTiming::new(),
                 finished_cleanly: false,
+                submitted_at: sub.submitted_at,
+                prefill_profile: None,
+                benchmark_ttft_ms: None,
             });
             EngineMetrics::inc(&metrics.requests_started);
         }
@@ -626,11 +659,17 @@ fn emit_token(
     logprob: Option<TokenLogprob>,
     metrics: &EngineMetrics,
 ) -> Result<StepOutcome> {
+    if a.benchmark_ttft_ms.is_none() && a.prefill_profile.is_some() {
+        a.benchmark_ttft_ms = Some(a.submitted_at.elapsed().as_secs_f64() * 1000.0);
+    }
     if a.eos_ids.contains(&next) {
         finish(a, FinishReason::Eos, metrics)?;
         return Ok(StepOutcome::Finished);
     }
     a.generated.push(next);
+    if !a.sampling_history.is_empty() {
+        a.sampling_history.push(next);
+    }
     // A produced token: feeds TTFT (first) or the inter-token gap (later).
     a.timing.record_token(metrics);
 
@@ -687,6 +726,7 @@ fn advance(
         let chunk: Vec<u32> = a.pending_prompt.drain(..take).collect();
         let logits = model.prefill_chunk(&mut a.seq, &chunk)?;
         if a.pending_prompt.is_empty() {
+            a.prefill_profile = model.take_prefill_profile()?;
             a.next = Some(match &mut a.sampler {
                 SeqSampler::Cpu(_) => PendingNext::Logits(logits),
                 // The prefill logits are still device-resident: draw now,
@@ -713,7 +753,8 @@ fn advance(
                 if let Some(m) = &a.matcher {
                     m.apply_mask(&mut logits);
                 }
-                let id = s.sample(&logits, &a.generated)?;
+                apply_penalties(&mut logits, &a.sampling_history, s.params());
+                let id = s.sample_preprocessed(&logits)?;
                 let lp = a.logprobs.map(|n| compute_logprob(&logits, id, n));
                 (id, lp)
             }
@@ -1187,6 +1228,13 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
         tokens: a.generated.len(),
         prompt_tokens: a.prompt_len,
         cache_read_tokens: a.cache_read,
+        benchmark: a.prefill_profile.zip(a.benchmark_ttft_ms).map(|(profile, ttft_ms)| {
+            BenchmarkTimings {
+                target_gpu_ms: profile.target_gpu_ms,
+                mtp_catchup_gpu_ms: profile.mtp_catchup_gpu_ms,
+                ttft_ms,
+            }
+        }),
     });
     a.dead = true;
     a.finished_cleanly = true;

@@ -12,6 +12,16 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-21.
 
+- ✅ **Kary samplingu OpenAI na CPU i GPU Mojo (2026-07-21).**
+  `frequency_penalty`, `presence_penalty`, `repetition_penalty` i okno
+  `repeat_last_n` działają w API, samplerze CPU oraz pojedynczej i batchowej
+  ścieżce GPU. Historia obejmuje prompt i odpowiedź. Mojo nakłada wszystkie
+  kary z histogramu jednym kernelem przed istniejącym równoległym argmax/top-k,
+  bez D2H histogramu w trybie release. `logprobs` są liczone po karach.
+  Greedy bez kar zachowuje niezmieniony fast path. Mikrobenchmark RTX 4090 dla
+  słownika 151936: greedy 6,99 us, top-k 20 z karą 53,73 us, top-k 64 z karą
+  160,05 us.
+
 - 🟡 **Natywne Qwen3.5/3.6 MTP/NextN dla gęstego NVFP4 GGUF
   (2026-07-21).** Rejestr `qwen35` oddziela jeden blok
   `nextn_predict_layers` od 64-warstwowego hybrydowego trunku modelu
@@ -21,6 +31,9 @@ Ostatnia aktualizacja: 2026-07-21.
   batched verifier greedy, argmax oraz checkpointy KV/DeltaNet działają na GPU
   przez kernele Mojo. Retained checkpointy DeltaNet usuwają powtórny skan 48
   warstw przy commit; tryb `--speculative mtp` adaptacyjnie wybiera K=2/K=3.
+  Prefill targetu działa w macierzowych chunkach, a catch-up MTP zapisuje tylko
+  K/V potrzebne przez draft: raw512 spadł z **227,696 ms do 11,262 ms** przy
+  identycznym SHA tokenów. Pula aktywacji hybrydowego MTP wynosi 1,125 GiB.
   Wielocyklowy benchmark sprawdza zgodność tokenów z serial greedy. Stała część
   verifiera ma trwałe grafy T=3/T=4 z pozycją bazową odczytywaną na GPU. Wynik
   RTX 4090, K=3: raw128 około **86,9 tok/s**, raw512 około **83,8 tok/s** po

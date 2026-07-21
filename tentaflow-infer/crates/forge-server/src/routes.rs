@@ -371,6 +371,7 @@ pub(crate) async fn collect_events(
                 tokens,
                 prompt_tokens,
                 cache_read_tokens,
+                ..
             } => {
                 return Ok(Collected {
                     text,
@@ -641,6 +642,7 @@ async fn stream_response(
                     tokens,
                     prompt_tokens,
                     cache_read_tokens,
+                    ..
                 } => {
                     let engine_reason = finish_reason_str(reason);
                     let mut choices = Vec::new();

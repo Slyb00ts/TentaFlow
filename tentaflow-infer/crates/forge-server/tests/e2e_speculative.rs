@@ -56,7 +56,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
         0,
         PoolSizes {
             weights: 3 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, KvQuant::F16),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, KvQuant::F16, false),
             activations: 1 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -80,6 +80,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
             // Speculation and the radix prefix cache both manage paged KV
             // ownership; the eligible speculative path requires prefix off.
             prefix_cache: false,
+            native_mtp: false,
         },
     )
     .expect("load model");

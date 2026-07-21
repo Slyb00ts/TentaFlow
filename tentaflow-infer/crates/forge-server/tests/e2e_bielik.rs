@@ -32,7 +32,7 @@ async fn chat_completions_end_to_end() {
             0,
             PoolSizes {
                 weights: 8 << 30,
-                kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16),
+                kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16, false),
                 activations: 1 << 30,
                 kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
             },
@@ -49,6 +49,7 @@ async fn chat_completions_end_to_end() {
                 kv_quant: forge_engine::kv::KvQuant::F16,
                 kv_tier: Default::default(),
                 prefix_cache: false,
+                native_mtp: false,
             },
         )
         .expect("load model");

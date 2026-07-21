@@ -11,11 +11,15 @@ from src.deltanet_verify import (
     deltanet_prepare_t2_f16,
     deltanet_prepare_t3_f16,
     deltanet_prepare_t4_f16,
+    deltanet_prepare_dynamic_f16,
     deltanet_gated_scan_t2_f16,
     deltanet_gated_scan_t3_f16,
     deltanet_gated_scan_t4_f16,
     deltanet_gated_scan_t3_d128_f16,
     deltanet_gated_scan_t4_d128_f16,
+    deltanet_gated_scan_dynamic_f16,
+    deltanet_gated_scan_dynamic_d128_f16,
+    deltanet_gated_scan_inplace_dynamic_d128_f16,
     deltanet_commit_checkpoint_f32,
 )
 
@@ -53,6 +57,8 @@ def main() raises:
     _finalize(out_dir, "deltanet_prepare_t3_f16")
     _ = ctx.compile_function[deltanet_prepare_t4_f16, dump_asm=Path("deltanet_prepare_t4_f16.ptx")]()
     _finalize(out_dir, "deltanet_prepare_t4_f16")
+    _ = ctx.compile_function[deltanet_prepare_dynamic_f16, dump_asm=Path("deltanet_prepare_dynamic_f16.ptx")]()
+    _finalize(out_dir, "deltanet_prepare_dynamic_f16")
 
     _ = ctx.compile_function[deltanet_gated_scan_t2_f16, dump_asm=Path("deltanet_gated_scan_t2_f16.ptx")]()
     _finalize(out_dir, "deltanet_gated_scan_t2_f16")
@@ -64,5 +70,11 @@ def main() raises:
     _finalize(out_dir, "deltanet_gated_scan_t3_d128_f16")
     _ = ctx.compile_function[deltanet_gated_scan_t4_d128_f16, dump_asm=Path("deltanet_gated_scan_t4_d128_f16.ptx")]()
     _finalize(out_dir, "deltanet_gated_scan_t4_d128_f16")
+    _ = ctx.compile_function[deltanet_gated_scan_dynamic_f16, dump_asm=Path("deltanet_gated_scan_dynamic_f16.ptx")]()
+    _finalize(out_dir, "deltanet_gated_scan_dynamic_f16")
+    _ = ctx.compile_function[deltanet_gated_scan_dynamic_d128_f16, dump_asm=Path("deltanet_gated_scan_dynamic_d128_f16.ptx")]()
+    _finalize(out_dir, "deltanet_gated_scan_dynamic_d128_f16")
+    _ = ctx.compile_function[deltanet_gated_scan_inplace_dynamic_d128_f16, dump_asm=Path("deltanet_gated_scan_inplace_dynamic_d128_f16.ptx")]()
+    _finalize(out_dir, "deltanet_gated_scan_inplace_dynamic_d128_f16")
     _ = ctx.compile_function[deltanet_commit_checkpoint_f32, dump_asm=Path("deltanet_commit_checkpoint_f32.ptx")]()
     _finalize(out_dir, "deltanet_commit_checkpoint_f32")

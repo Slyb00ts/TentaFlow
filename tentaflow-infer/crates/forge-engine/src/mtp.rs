@@ -46,6 +46,7 @@ impl MtpEmbedding {
 
 pub struct MtpWeights {
     pub descriptor: MtpDescriptor,
+    pub shares_target_embedding: bool,
     /// Jeden staged wiersz embeddingu używany jako wejście kernela MTP.
     pub token_embedding: DevBuffer,
     pub embedding: MtpEmbedding,
@@ -118,6 +119,8 @@ impl MtpWeights {
         let first_layer = descriptor.layers.first().ok_or_else(|| {
             ForgeError::Format("MTP: deskryptor nie zawiera mapy pierwszej warstwy".into())
         })?;
+        let shares_target_embedding = !first_layer.contains_key(&MtpWeightRole::Embedding)
+            && descriptor.share_target_embedding;
         let embedding = match first_layer.get(&MtpWeightRole::Embedding) {
             Some(name) => MtpEmbedding::Device(loader.matrix(
                 name,
@@ -213,6 +216,7 @@ impl MtpWeights {
 
         Ok(Self {
             descriptor: descriptor.clone(),
+            shares_target_embedding,
             token_embedding: target_embedding.clone(),
             embedding,
             output,
@@ -496,6 +500,29 @@ impl MtpDraftState {
         Ok(position)
     }
 
+    /// Rezerwuje ciąg pozycji MTP i aktualizuje jego tabelę stron jednym zapisem.
+    pub fn stage_batch(&mut self, n_tokens: usize) -> Result<usize> {
+        if n_tokens == 0 {
+            return Err(ForgeError::Scheduler("MTP: pusty batch catch-up".into()));
+        }
+        let base = self.seq.len;
+        for _ in 0..n_tokens {
+            self.grow()?;
+        }
+        let mut page_table = vec![-1i32; self.kv.cfg.max_pages_per_seq];
+        page_table[..self.seq.pages.len()].copy_from_slice(&self.seq.pages);
+        self.device
+            .write(bytemuck::cast_slice(&page_table), &self.page_table, 0)?;
+        self.device
+            .write(&(self.seq.len as i32).to_le_bytes(), &self.seq_len, 0)?;
+        self.device.write(
+            &((self.seq.len - 1) as i32).to_le_bytes(),
+            &self.position,
+            0,
+        )?;
+        Ok(base)
+    }
+
     pub fn rollback(&mut self, stream: &Stream) -> Result<()> {
         let len = self.checkpoint_len.ok_or_else(|| {
             ForgeError::Scheduler("MTP: rollback bez aktywnego checkpointu".into())
@@ -730,6 +757,7 @@ mod tests {
         )
         .expect("załaduj syntetyczne MTP");
         assert_eq!(weights.layers.len(), 1);
+        assert!(weights.shares_target_embedding);
         assert!(weights.runtime_supported());
         assert_eq!(weights.token_embedding.device_ptr(), embedding.device_ptr());
         let DevWeight::F16 { buf, .. } = &weights.output else {
@@ -784,6 +812,7 @@ mod tests {
             &output,
         )
         .expect("załaduj dedykowane MTP IO");
+        assert!(!weights.shares_target_embedding);
         let MtpEmbedding::Device(DevWeight::F16 {
             buf: embedding_buf, ..
         }) = &weights.embedding
@@ -951,6 +980,43 @@ mod tests {
         state.commit_catchup(2).unwrap();
         assert_eq!(state.seq.len, 3);
         assert_eq!(state.checkpoint_len(), None);
+    }
+
+    #[test]
+    fn stage_batch_obsluguje_kolejne_ogona_i_granice_stron() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 4,
+            n_pages: 8,
+            max_pages_per_seq: 8,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
+
+        state.checkpoint(&stream).unwrap();
+        assert_eq!(state.stage_batch(3).unwrap(), 0);
+        state.commit_catchup(3).unwrap();
+        state.checkpoint(&stream).unwrap();
+        assert_eq!(state.stage_batch(2).unwrap(), 3);
+        state.commit_catchup(2).unwrap();
+
+        let mut position = [0u8; 4];
+        let mut seq_len = [0u8; 4];
+        let mut page_table = vec![0u8; state.page_table.len()];
+        device.read(&state.position, 0, &mut position).unwrap();
+        device.read(&state.seq_len, 0, &mut seq_len).unwrap();
+        device.read(&state.page_table, 0, &mut page_table).unwrap();
+        let pages: &[i32] = bytemuck::cast_slice(&page_table);
+
+        assert_eq!(i32::from_le_bytes(position), 4);
+        assert_eq!(i32::from_le_bytes(seq_len), 5);
+        assert_eq!(&pages[..state.seq.pages.len()], &state.seq.pages);
+        assert_eq!(state.seq.pages.len(), 2);
+        assert!(state.stage_batch(0).is_err());
     }
 
     #[test]

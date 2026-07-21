@@ -771,11 +771,8 @@ impl Kernels {
             2 => "deltanet_prepare_t2_f16",
             3 => "deltanet_prepare_t3_f16",
             4 => "deltanet_prepare_t4_f16",
-            _ => {
-                return Err(ForgeError::Kernel(format!(
-                    "deltanet_prepare wymaga T równego 2, 3 lub 4, otrzymano {n_steps}"
-                )))
-            }
+            1.. => "deltanet_prepare_dynamic_f16",
+            _ => return Err(ForgeError::Kernel("deltanet_prepare wymaga T > 0".into())),
         };
         let caps = self.device.caps();
         if n_k_heads == 0
@@ -873,8 +870,13 @@ impl Kernels {
             .buf(alpha_raw)
             .buf(beta_raw)
             .buf(dt_bias)
-            .buf(a_scale)
-            .scalar(n_k_heads)
+            .buf(a_scale);
+        let args = if n_steps > 4 || n_steps == 1 {
+            args.scalar(n_steps as i64)
+        } else {
+            args
+        };
+        let args = args.scalar(n_k_heads)
             .scalar(n_v_heads)
             .scalar(d_state)
             .scalar(d_conv)
@@ -937,8 +939,10 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         let caps = self.device.caps();
+        let dynamic_tiled = std::env::var("FORGE_DELTANET_SCAN_TILED")
+            .map_or(true, |value| value != "0");
         let tiled = d_state <= 128
-            && matches!(n_steps, 3 | 4)
+            && (matches!(n_steps, 3 | 4) || (n_steps != 2 && dynamic_tiled))
             && caps.warp_size > 0
             && caps.warp_size <= caps.max_threads_per_block
             && caps.warp_size <= 128;
@@ -948,11 +952,9 @@ impl Kernels {
             (4, true) => "deltanet_gated_scan_t4_d128_f16",
             (3, false) => "deltanet_gated_scan_t3_f16",
             (4, false) => "deltanet_gated_scan_t4_f16",
-            _ => {
-                return Err(ForgeError::Kernel(format!(
-                    "deltanet_gated_scan wymaga T równego 2, 3 lub 4, otrzymano {n_steps}"
-                )))
-            }
+            (1 | 5.., true) => "deltanet_gated_scan_dynamic_d128_f16",
+            (1.., false) => "deltanet_gated_scan_dynamic_f16",
+            _ => return Err(ForgeError::Kernel("deltanet_gated_scan wymaga T > 0".into())),
         };
         if n_v_heads == 0 || d_state == 0 || d_state > 1024 {
             return Err(ForgeError::Kernel(format!(
@@ -1026,10 +1028,95 @@ impl Kernels {
             .buf(k)
             .buf(v)
             .buf(g)
-            .buf(beta)
-            .scalar(n_v_heads as i64)
+            .buf(beta);
+        let args = if n_steps > 4 || n_steps == 1 {
+            args.scalar(n_steps as i64)
+        } else {
+            args
+        };
+        let args = args.scalar(n_v_heads as i64)
             .scalar(d_state as i64);
         self.device.launch(k_art, &cfg, &args, stream)
+    }
+
+    /// Wykonuje dynamiczny skan prefill bezpośrednio na stanie końcowym.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_scan_inplace_f16(
+        &self,
+        out: &DevBuffer,
+        state_io: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let caps = self.device.caps();
+        if n_steps == 0
+            || n_v_heads == 0
+            || d_state == 0
+            || d_state > 128
+            || caps.warp_size == 0
+            || caps.warp_size > 128
+            || caps.warp_size > caps.max_threads_per_block
+        {
+            return Err(ForgeError::Kernel(format!(
+                "in-place DeltaNet wymaga T>0, heads>0, d_state<=128 i poprawnego warp, otrzymano T={n_steps}, heads={n_v_heads}, d_state={d_state}"
+            )));
+        }
+        let vector_bytes = checked_buffer_bytes(
+            "in-place DeltaNet vectors",
+            &[n_steps, n_v_heads, d_state],
+            2,
+        )?;
+        let state_bytes = checked_buffer_bytes(
+            "in-place DeltaNet state",
+            &[n_v_heads, d_state, d_state],
+            4,
+        )?;
+        let gate_bytes =
+            checked_buffer_bytes("in-place DeltaNet gates", &[n_steps, n_v_heads], 4)?;
+        if out.len() < vector_bytes
+            || state_io.len() < state_bytes
+            || q.len() < vector_bytes
+            || k.len() < vector_bytes
+            || v.len() < vector_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "in-place DeltaNet: co najmniej jeden bufor jest za mały".into(),
+            ));
+        }
+        let tiles = d_state.div_ceil(caps.warp_size as usize);
+        let grid = n_v_heads
+            .checked_mul(tiles)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ForgeError::Kernel("in-place DeltaNet: grid przekracza u32".into()))?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_gated_scan_inplace_dynamic_d128_f16")?;
+        let config = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (caps.warp_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(state_io)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(n_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
     }
 
     /// Zatwierdza na GPU checkpoint wskazany przez urządzeniowy licznik i32.
@@ -1071,10 +1158,10 @@ impl Kernels {
         d_state: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if !matches!(n_steps, 2..=4) {
-            return Err(ForgeError::Kernel(format!(
-                "deltanet_commit_checkpoint wymaga T równego 2, 3 lub 4, otrzymano {n_steps}"
-            )));
+        if n_steps == 0 {
+            return Err(ForgeError::Kernel(
+                "deltanet_commit_checkpoint wymaga T > 0".into(),
+            ));
         }
         if n_v_heads == 0 || d_state == 0 || d_state > 1024 {
             return Err(ForgeError::Kernel(format!(
@@ -1655,6 +1742,94 @@ impl Kernels {
             .buf(eh_proj)
             .scalar(hidden_size as i64)
             .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Normalizuje batch embeddingów i przesuniętych hidden targetu przed eh_proj.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_norm_join_shifted_f16(
+        &self,
+        output: &DevBuffer,
+        embeddings: &DevBuffer,
+        target_hidden: &DevBuffer,
+        initial_hidden: &DevBuffer,
+        enorm: &DevBuffer,
+        hnorm: &DevBuffer,
+        n_tokens: usize,
+        hidden_size: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n_tokens == 0 || hidden_size == 0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(ForgeError::Kernel(
+                "mtp_norm_join_shifted_f16 wymaga dodatnich wymiarów i eps".into(),
+            ));
+        }
+        let rows = checked_buffer_bytes("mtp shifted rows", &[n_tokens, hidden_size], 2)?;
+        let output_bytes = checked_buffer_bytes("mtp shifted output", &[n_tokens, 2, hidden_size], 2)?;
+        let vector = checked_buffer_bytes("mtp shifted vector", &[hidden_size], 2)?;
+        if output.len() < output_bytes
+            || embeddings.len() < rows
+            || target_hidden.len() < rows
+            || initial_hidden.len() < vector
+            || enorm.len() < vector
+            || hnorm.len() < vector
+        {
+            return Err(ForgeError::Kernel(
+                "mtp_norm_join_shifted_f16: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("mtp_norm_join_shifted_f16")?;
+        let config = LaunchConfig {
+            grid: (u32::try_from(n_tokens).map_err(|_| {
+                ForgeError::Kernel("mtp shifted: liczba tokenów przekracza u32".into())
+            })?, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(embeddings)
+            .buf(target_hidden)
+            .buf(initial_hidden)
+            .buf(enorm)
+            .buf(hnorm)
+            .scalar(n_tokens as i64)
+            .scalar(hidden_size as i64)
+            .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Projektuje złączony batch przez Q8_0 zgodnie z redukcją mtp_prepare.
+    pub fn mtp_project_joined_q8_f16(
+        &self,
+        output: &DevBuffer,
+        joined: &DevBuffer,
+        weights: &DevBuffer,
+        n_tokens: usize,
+        hidden_size: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let output_bytes = checked_buffer_bytes("mtp project output", &[n_tokens, hidden_size], 2)?;
+        let joined_bytes = checked_buffer_bytes("mtp project joined", &[n_tokens, 2, hidden_size], 2)?;
+        let weights_bytes = checked_buffer_bytes(
+            "mtp project weights", &[hidden_size, (2 * hidden_size) / 32], 34,
+        )?;
+        if n_tokens == 0 || !(2 * hidden_size).is_multiple_of(32)
+            || output.len() < output_bytes || joined.len() < joined_bytes
+            || weights.len() < weights_bytes
+        {
+            return Err(ForgeError::Kernel("mtp_project_joined_q8_f16: nieprawidłowy kształt".into()));
+        }
+        let kernel = self.artifacts.get("mtp_project_joined_q8_f16")?;
+        let config = LaunchConfig {
+            grid: ((hidden_size as u32).div_ceil(8), n_tokens as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output).buf(joined).buf(weights)
+            .scalar(hidden_size as i64).scalar(n_tokens as i64);
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -2667,16 +2842,18 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Batched in-place repetition penalty. `offsets` is n_seqs+1 i32 prefix
-    /// sums into the flat `ids` list; `penalties` is n_seqs f32.
+    /// Batchowe kary in-place z histogramów unikalnych tokenów.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_batched_penalize_f32(
         &self,
         logits: &DevBuffer,
         vocab: usize,
         ids: &DevBuffer,
+        counts: &DevBuffer,
         offsets: &DevBuffer,
         penalties: &DevBuffer,
+        frequency_penalties: &DevBuffer,
+        presence_penalties: &DevBuffer,
         n_seqs: usize,
         stream: &Stream,
     ) -> Result<()> {
@@ -2690,8 +2867,11 @@ impl Kernels {
             .buf(logits)
             .scalar(vocab as i64)
             .buf(ids)
+            .buf(counts)
             .buf(offsets)
-            .buf(penalties);
+            .buf(penalties)
+            .buf(frequency_penalties)
+            .buf(presence_penalties);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -6261,6 +6441,150 @@ impl Kernels {
             .scalar(n_ids as i64)
             .scalar(penalty);
         self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Nakłada kary z kompaktowego histogramu i wybiera greedy w jednym launchu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_penalized_argmax_f32(
+        &self,
+        out: &DevBuffer,
+        logits: &DevBuffer,
+        ids: &DevBuffer,
+        counts: &DevBuffer,
+        n_ids: usize,
+        vocab: usize,
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.validate_penalty_histogram(
+            Some(out),
+            logits,
+            ids,
+            counts,
+            n_ids,
+            vocab,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+        )?;
+        let kernel = self.artifacts.get("penalized_argmax_f32")?;
+        let config = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf_at(out, 4)?
+            .buf(logits)
+            .buf(ids)
+            .buf(counts)
+            .scalar(n_ids as i64)
+            .scalar(vocab as i64)
+            .scalar(repetition_penalty)
+            .scalar(frequency_penalty)
+            .scalar(presence_penalty);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Nakłada kary z histogramu unikalnych IDs przed równoległym samplingiem.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_penalize_histogram_f32(
+        &self,
+        logits: &DevBuffer,
+        ids: &DevBuffer,
+        counts: &DevBuffer,
+        n_ids: usize,
+        vocab: usize,
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.validate_penalty_histogram(
+            None,
+            logits,
+            ids,
+            counts,
+            n_ids,
+            vocab,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+        )?;
+        let kernel = self.artifacts.get("penalize_histogram_f32")?;
+        let config = LaunchConfig::linear(n_ids as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(logits)
+            .buf(ids)
+            .buf(counts)
+            .scalar(n_ids as i64)
+            .scalar(vocab as i64)
+            .scalar(repetition_penalty)
+            .scalar(frequency_penalty)
+            .scalar(presence_penalty);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_penalty_histogram(
+        &self,
+        out: Option<&DevBuffer>,
+        logits: &DevBuffer,
+        ids: &DevBuffer,
+        counts: &DevBuffer,
+        n_ids: usize,
+        vocab: usize,
+        repetition_penalty: f32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    ) -> Result<()> {
+        if n_ids == 0 || vocab == 0 || n_ids > vocab {
+            return Err(ForgeError::Kernel(
+                "fused sampling wymaga niepustego histogramu nie większego od słownika".into(),
+            ));
+        }
+        let logits_bytes = checked_buffer_bytes("sampling logits", &[vocab], 4)?;
+        let histogram_bytes = checked_buffer_bytes("sampling histogram", &[n_ids], 4)?;
+        if out.is_some_and(|buffer| buffer.len() < 8)
+            || logits.len() < logits_bytes
+            || ids.len() < histogram_bytes
+            || counts.len() < histogram_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "bufor fused sampling jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        if !repetition_penalty.is_finite()
+            || repetition_penalty <= 0.0
+            || !frequency_penalty.is_finite()
+            || !presence_penalty.is_finite()
+        {
+            return Err(ForgeError::Kernel(
+                "parametry kar fused sampling muszą być skończone".into(),
+            ));
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut host_ids = vec![0u8; histogram_bytes];
+            let mut host_counts = vec![0u8; histogram_bytes];
+            self.device.read(ids, 0, &mut host_ids)?;
+            self.device.read(counts, 0, &mut host_counts)?;
+            let mut unique = std::collections::HashSet::with_capacity(n_ids);
+            for (id, count) in host_ids.chunks_exact(4).zip(host_counts.chunks_exact(4)) {
+                let id = i32::from_le_bytes(id.try_into().expect("fragment i32"));
+                let count = i32::from_le_bytes(count.try_into().expect("fragment i32"));
+                if id < 0 || id as usize >= vocab || count <= 0 || !unique.insert(id) {
+                    return Err(ForgeError::Kernel(
+                        "histogram kar wymaga unikalnych IDs w zakresie vocab i dodatnich liczników"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Greedy argmax over f32 logits; the winning index lands in the first

@@ -104,11 +104,15 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "deltanet_prepare_t2_f16",
     "deltanet_prepare_t3_f16",
     "deltanet_prepare_t4_f16",
+    "deltanet_prepare_dynamic_f16",
     "deltanet_gated_scan_t2_f16",
     "deltanet_gated_scan_t3_f16",
     "deltanet_gated_scan_t4_f16",
     "deltanet_gated_scan_t3_d128_f16",
     "deltanet_gated_scan_t4_d128_f16",
+    "deltanet_gated_scan_dynamic_f16",
+    "deltanet_gated_scan_dynamic_d128_f16",
+    "deltanet_gated_scan_inplace_dynamic_d128_f16",
     "deltanet_commit_checkpoint_f32",
     "deltanet_gated_rmsnorm_f16",
     "deltanet_log_decay_f32",
@@ -118,6 +122,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_nvfp4_gguf_q8_1_f16",
     "mtp_prepare_f16",
     "mtp_stage_step",
+    "mtp_norm_join_shifted_f16",
+    "mtp_project_joined_q8_f16",
     "gather_f16_row_f16",
     "gather_q8_0_row_f16",
     "gather_nvfp4_gguf_row_f16",
@@ -312,6 +318,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "attn_prefill_rot_hd128_b4",
     "attn_prefill_rot_hd128_b3",
     "penalize_f32",
+    "penalized_argmax_f32",
+    "penalize_histogram_f32",
     "penalize_batched_f32",
     "argmax_batched_f32",
     "topk_batched_f32",
@@ -644,6 +652,8 @@ mod tests {
         "gemv_nvfp4_gguf_q8_1_f16",
         "mtp_prepare_f16",
         "mtp_stage_step",
+        "mtp_norm_join_shifted_f16",
+        "mtp_project_joined_q8_f16",
         "gather_q8_0_row_f16",
         "gather_nvfp4_gguf_row_f16",
         "gemm_nvfp4_gguf_f16_b2",
@@ -671,11 +681,21 @@ mod tests {
         "deltanet_prepare_t2_f16",
         "deltanet_prepare_t3_f16",
         "deltanet_prepare_t4_f16",
+        "deltanet_prepare_dynamic_f16",
     ];
 
     const PORTABLE_DELTANET_SCAN: &[&str] = &[
         "deltanet_gated_scan_t3_d128_f16",
         "deltanet_gated_scan_t4_d128_f16",
+        "deltanet_gated_scan_dynamic_f16",
+        "deltanet_gated_scan_dynamic_d128_f16",
+        "deltanet_gated_scan_inplace_dynamic_d128_f16",
+    ];
+
+    const PORTABLE_SAMPLING_PENALTIES: &[&str] = &[
+        "penalized_argmax_f32",
+        "penalize_histogram_f32",
+        "penalize_batched_f32",
     ];
 
     #[test]
@@ -722,6 +742,17 @@ mod tests {
     #[test]
     fn kafelkowany_deltanet_scan_jest_dostepny_od_sm80() {
         for name in PORTABLE_DELTANET_SCAN {
+            let artifact = EMBEDDED_SM89
+                .iter()
+                .find(|artifact| artifact.name == *name)
+                .unwrap();
+            assert!(!is_sm89_only(artifact.ptx));
+        }
+    }
+
+    #[test]
+    fn fused_sampling_penalties_jest_dostepne_od_sm80() {
+        for name in PORTABLE_SAMPLING_PENALTIES {
             let artifact = EMBEDDED_SM89
                 .iter()
                 .find(|artifact| artifact.name == *name)

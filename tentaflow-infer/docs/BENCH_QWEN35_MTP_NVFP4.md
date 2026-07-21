@@ -260,6 +260,38 @@ Kontrola repeat raw128 nie znalazła pełnego draftu n-gram: 40/40 cykli przesz�
 przez fallback MTP, zachowując parity i osiągając 86,97 tok/s. Wartości
 `oracle_upper` nie są raportowane jako wynik actual.
 
+## Batchowy KV-only catch-up MTP
+
+Catch-up po chunku targetu nie potrzebuje logitów ani wyjścia pełnego bloku MTP.
+Kernel Mojo `mtp_norm_join_shifted_f16` przygotowuje cały batch z carry sprzed
+chunka i przesuniętych hidden targetu. Runtime wykonuje potem wspólne `eh_proj`,
+normę wejścia, projekcje K/V, K-norm, RoPE i jeden zapis do osobnego KV MTP.
+
+Pomiar RTX 4090, chunk 128, trzy próby mierzone:
+
+| Prompt | target p50 | catch-up stary | catch-up KV-only | SHA parity |
+|---|---:|---:|---:|---|
+| raw128 | 171,008 ms | około 52,8 ms | **2,814 ms** | tak |
+| raw512 | 689,421 ms | 227,696 ms | **11,262 ms** | tak |
+
+Raw512 zachował SHA `c45733e9...be27` względem jawnego przebiegu referencyjnego.
+Decode 128 zachował SHA `1512c5c9...aacf`, 34
+forwardy weryfikacji i 94 zaakceptowane tokeny. Golden kernela obejmuje T=1, 2,
+31, 32 i 33 oraz bitową niezmienniczość podziału 32=2x16. Audyt byte-snapshot
+dla wymuszonych akceptacji 0..3 potwierdził bez różnic carry, logiczne K/V i
+długość KV MTP względem ścieżki tokenowej.
+
+Izolowany pomiar target prefill na tych samych ID tokenów, bez wliczania TTFT:
+
+| Silnik, pure MTP bez n-gramu | raw128 | raw512 |
+|---|---:|---:|
+| llama.cpp | **1995,54 tok/s** | **2651,05 tok/s** |
+| FORGE target | **748,5 tok/s** | **742,7 tok/s** |
+
+Referencyjny serial llama.cpp dla raw512 osiągnął **2758,09 tok/s**. Wyniki tej
+tabeli opisują wyłącznie target prefill; osobny catch-up MTP FORGE wyniósł
+11,262 ms, a pełny TTFT obejmuje oba etapy oraz pozostały narzut żądania.
+
 ## Odrzucone carry MTP w F32
 
 Sprawdzono eksperymentalne przechowywanie `h_nextn` w F32 przy zachowaniu

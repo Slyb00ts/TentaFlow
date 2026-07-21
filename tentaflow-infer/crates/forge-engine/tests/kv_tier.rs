@@ -233,7 +233,10 @@ fn batched_greedy(model: &mut Model, prompts: &[Vec<u32>], steps: usize) -> Vec<
             seed: 0,
             step: 0,
             penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             penalty_ids: Vec::new(),
+            penalty_counts: Vec::new(),
         })
         .collect();
     while ids[0].len() < steps {

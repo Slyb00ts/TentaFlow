@@ -358,6 +358,10 @@ Zweryfikowane natywne MTP (RTX 4090,
 - retained checkpointy DeltaNet są używane podczas commit zaakceptowanego prefiksu;
 - catch-up routera przeszedł bitową zgodność target h/x/SSM i MTP hidden/K/V/len
   dla wymuszonych długości akceptacji 0..K;
+- batchowy catch-up MTP normalizuje przesunięte pary embedding/target hidden,
+  wykonuje wspólne `eh_proj` i zapisuje wyłącznie K/V;
+- na raw128 catch-up spadł z około **52,8 ms do 2,814 ms**, a na raw512 z
+  **227,696 ms do 11,262 ms**, z identycznymi SHA tokenów względem referencji;
 - fair prose K=3: raw128 około **105,1 tok/s** przy akceptacji 96,0%, raw512
   około **71,2 tok/s** przy akceptacji 59,3%;
 - `mtp+ngram:3` prose: raw128 **118,3-118,5 tok/s** przy akceptacji 97,0%,
@@ -462,7 +466,10 @@ bloku tekstowego). Braki: bloki `tool_use`/`tool_result`, `thinking`,
 | `top_k` | 40 | Sampling na GPU dla 1..64; większe → ścieżka CPU. |
 | `top_p` | 0.95 | Nucleus. |
 | `min_p` | 0.0 | Próg względem najlepszego kandydata. |
-| `repetition_penalty` | 1.0 | Karane są UNIKALNE tokeny (bez składania wykładniczego). |
+| `repetition_penalty` | 1.0 | Każdy token w oknie jest transformowany raz, niezależnie od liczby wystąpień. |
+| `frequency_penalty` | 0.0 | OpenAI `[-2, 2]`; odejmuje wartość pomnożoną przez liczbę wystąpień tokenu. |
+| `presence_penalty` | 0.0 | OpenAI `[-2, 2]`; odejmuje wartość raz dla każdego obecnego tokenu. |
+| `repeat_last_n` | 0 | Okno historii dla wszystkich kar; `0` oznacza całą przekazaną historię. |
 | `seed` | czas | Deterministyczny strumień per (seed, krok). |
 | `max_tokens` / `max_completion_tokens` | — | Walidowane względem `--ctx`: prompt+max_tokens ≤ ctx, inaczej 400 `context_length_exceeded`. |
 | `stop` | — | String lub tablica; holdback bez wycieków częściowych dopasowań. |
@@ -478,6 +485,16 @@ obsłużony z radix prefix-cache (SPEC §5.2; pomijane gdy 0) — patrz sekcja
 | `min_tokens` | 0 | Dolny próg wygenerowanych tokenów: wszystkie EOS tłumione (logit → -inf) aż do progu. Musi być ≤ `max_tokens`. Wymusza sampler CPU. |
 | `logprobs` | — | Chat: `true` + `top_logprobs:N` (0..20) → `choices[].logprobs.content[]` (token, `logprob`, `bytes`, `top_logprobs[]`). Completions: `logprobs:N` (0..20) → legacy `{tokens, token_logprobs, top_logprobs, text_offset}`. Log-softmax na hoście; przy temp 0 top-1 = token próbkowany. Wymusza sampler CPU. Tylko non-streaming. |
 | `echo` (completions) | false | Dokleja prompt do odpowiedzi; z `logprobs` tokeny promptu dostają `token_logprobs=null`. Tylko non-streaming. |
+
+Aktywne kary korzystają z kompaktowego histogramu unikalnych tokenów na GPU.
+Kernel Mojo `penalize_histogram_f32` nakłada repetition, frequency i presence
+w jednym launchu, po którym działa istniejący równoległy argmax lub top-k.
+Ścieżka batchowa wykonuje tę samą operację jednym uruchomieniem dla wszystkich
+sekwencji. Historia obejmuje prompt i wygenerowaną odpowiedź oraz respektuje
+`repeat_last_n`; bufory IDs i liczników są trwałe, a w trybie release nie ma
+D2H histogramu. Domyślny greedy bez kar zachowuje dotychczasowy fast path bez
+dodatkowego kernela, alokacji w kroku ani synchronizacji. Żądania `logprobs`
+korzystają ze ścieżki CPU i raportują rozkład po nałożeniu kar.
 | `n` | 1 | Liczba niezależnych completions (1..128). Osobne ziarna (`seed+i·φ`), dzielą prefiks promptu przez radix prefix-cache; `choices[0..n]`. Non-streaming (streaming przy `n>1` = 400). |
 
 Usage przy `n>1`: `prompt_tokens` liczony raz, `completion_tokens` sumowany po

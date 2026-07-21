@@ -1,5 +1,6 @@
 // ===== File: main.rs — `forge` CLI: serve an OpenAI API, run one-shot generation, benchmark =====
 
+mod bench;
 mod hf;
 
 use std::net::SocketAddr;
@@ -13,7 +14,9 @@ use forge_engine::kv::KvQuant;
 use forge_engine::model::{ModelConfig, MAX_SPEC_DRAFT};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::sample::SamplingParams;
-use forge_engine::server::{EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig};
+use forge_engine::server::{
+    BenchmarkTimings, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
+};
 use forge_engine::speculation::{ProposerKind, SpeculationKind};
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
@@ -264,6 +267,12 @@ enum Command {
         /// Prompt length in tokens.
         #[arg(long, default_value_t = 512)]
         prompt_tokens: usize,
+        /// Dokładne tokeny promptu jako kolejne little-endian `u32`.
+        #[arg(long = "prompt-token-ids")]
+        prompt_token_ids: Option<PathBuf>,
+        /// Rozmiar puli wag w GiB; 0 dobiera pulę z aktualnie wolnego VRAM.
+        #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
+        weights_pool_gb: f64,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -311,10 +320,8 @@ enum Command {
         /// Włączenie wymusza `--prefix-cache off`.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
-        /// Warm best-of-N: submit the same request N times reusing the loaded
-        /// model and report the fastest prefill + decode. The 4090's cold first
-        /// GEMM launch throttles ~2×, so rep 1 is always discarded when N > 1.
-        #[arg(long = "reps", default_value_t = 1)]
+        /// Liczba mierzonych prób po jednym osobnym przebiegu rozgrzewającym.
+        #[arg(long = "reps", default_value_t = 5)]
         reps: usize,
     },
     /// Measure next-token perplexity on a fixed held-out passage (W4A8 quality
@@ -472,6 +479,8 @@ fn main() -> Result<()> {
             model_path,
             tokens,
             prompt_tokens,
+            prompt_token_ids,
+            weights_pool_gb,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -499,6 +508,8 @@ fn main() -> Result<()> {
                 &model_path,
                 tokens,
                 prompt_tokens,
+                prompt_token_ids.as_deref(),
+                weights_pool_gb,
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -726,6 +737,14 @@ fn default_model_id(path: &Path) -> String {
 /// KV pool sized for exactly `kv_pages` pages of this model (floored at
 /// 1 GiB), 1 GiB activations.
 #[allow(clippy::too_many_arguments)]
+fn activation_pool_bytes(native_mtp: bool, hybrid: bool) -> usize {
+    if native_mtp && hybrid {
+        9usize << 27
+    } else {
+        1usize << 30
+    }
+}
+
 fn load_for_serve(
     path: &Path,
     kv_pages: usize,
@@ -753,13 +772,14 @@ fn load_for_serve(
     } else {
         kv_pages.max(ctx_pages)
     };
-    let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30);
+    let kv_pool =
+        kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant, native_mtp).max(1 << 30);
     let stage = if kv_tier.enabled() {
         tier_stage_bytes(&desc, kv_page_size, ctx_pages, kv_quant)
     } else {
         0
     };
-    let activations = 1usize << 30;
+    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
     let free = CudaDevice::free_vram(0).context("query free VRAM")?;
@@ -772,7 +792,7 @@ fn load_for_serve(
         PoolSizes {
             weights,
             kv_cache: kv_pool,
-            activations: 1 << 30,
+            activations,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
     )
@@ -840,13 +860,10 @@ fn load_auto(
         0
     };
 
-    // Activations pool holds decode scratch + persistent decode buffers. The
-    // engine's paged KV slabs and (hybrid) SSM state allocate from the WEIGHTS
-    // pool, not the HAL kv_cache pool — that pool is unused by the LLM engine,
-    // so it is kept minimal (otherwise a full 1 GiB kv_cache arena is claimed
-    // but never used, needlessly starving the weights pool).
-    let activations = 1usize << 30;
-    let hal_kv = 4usize << 20;
+    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
+    // `KvCache` alokuje wszystkie slaby targetu i opcjonalnego MTP w dedykowanej
+    // puli; rozmiar uwzględnia wyrównanie każdego bufora do granulacji slabów.
+    let hal_kv = kv_pool_bytes(&desc, page_size, kv_pages, kv_quant, native_mtp);
     let weights = if weights_pool_gb > 0.0 {
         (weights_pool_gb * (1u64 << 30) as f64) as usize + stage
     } else {
@@ -1256,7 +1273,7 @@ fn cmd_serve(
 }
 
 /// Drive one engine request to completion, invoking `on_text` per emitted
-/// piece. Returns (generated_tokens, prompt_tokens, first_token_at, done_at).
+/// piece. Returns counts, first visible token, completion and profil benchmarku.
 /// Token counts come from the engine's `Done` usage, not from counting text
 /// pieces. `first_token_at` is the first VISIBLE text event: the engine only
 /// emits `Token` for non-empty decoded pieces, so UTF-8/stop-holdback in the
@@ -1265,19 +1282,20 @@ fn cmd_serve(
 fn drain_request(
     engine: &EngineHandle,
     req: EngineRequest,
-    mut on_text: impl FnMut(&str),
-) -> Result<(usize, usize, Instant, Instant)> {
+    mut on_token: impl FnMut(u32, &str),
+) -> Result<(usize, usize, Instant, Instant, Option<BenchmarkTimings>)> {
     let rx = engine.submit(req).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut first_token_at = None;
     loop {
         match rx.recv().context("engine stream ended unexpectedly")? {
-            EngineEvent::Token { text, .. } => {
+            EngineEvent::Token { id, text, .. } => {
                 first_token_at.get_or_insert_with(Instant::now);
-                on_text(&text);
+                on_token(id, &text);
             }
             EngineEvent::Done {
                 tokens,
                 prompt_tokens,
+                benchmark,
                 ..
             } => {
                 let done_at = Instant::now();
@@ -1286,6 +1304,7 @@ fn drain_request(
                     prompt_tokens,
                     first_token_at.unwrap_or(done_at),
                     done_at,
+                    benchmark,
                 ));
             }
             EngineEvent::Error(msg) => bail!("engine error: {msg}"),
@@ -1350,7 +1369,7 @@ fn cmd_run(
     let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec)?;
 
     let submit_at = Instant::now();
-    let (generated, prompt_len, _first, done_at) = drain_request(
+    let (generated, prompt_len, _first, done_at, _) = drain_request(
         &engine,
         EngineRequest {
             prompt_tokens,
@@ -1364,7 +1383,7 @@ fn cmd_run(
             grammar: None,
             ..Default::default()
         },
-        |piece| {
+        |_, piece| {
             use std::io::Write;
             print!("{piece}");
             std::io::stdout().flush().ok();
@@ -1495,6 +1514,8 @@ fn cmd_bench(
     model_path: &Path,
     tokens: usize,
     prompt_tokens: usize,
+    prompt_token_ids: Option<&Path>,
+    weights_pool_gb: f64,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1507,7 +1528,7 @@ fn cmd_bench(
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
     }
-    if prompt_tokens == 0 {
+    if prompt_tokens == 0 && prompt_token_ids.is_none() {
         bail!("--prompt-tokens must be at least 1");
     }
     if reps == 0 {
@@ -1517,7 +1538,7 @@ fn cmd_bench(
     let prefix_cache = prefix_cache && !spec.is_enabled();
     let mut loaded = load_auto(
         model_path,
-        0.0,
+        weights_pool_gb,
         kv_quant,
         kv_tier,
         ctx,
@@ -1530,20 +1551,66 @@ fn cmd_bench(
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
-    // Cycle a natural-language seed to the exact requested prompt length so
-    // prefill cost is measured on realistic token ids.
-    let seed_ids = tokenizer
-        .encode(
-            "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
-            false,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let prompt_ids: Vec<u32> = seed_ids
-        .iter()
-        .cycle()
-        .take(prompt_tokens)
-        .copied()
-        .collect();
+    let (prompt_ids, prompt_sha256, prompt_source) = if let Some(path) = prompt_token_ids {
+        let input = bench::TokenInput::read_u32le(path)?;
+        (input.ids, input.sha256, path.display().to_string())
+    } else {
+        let seed_ids = tokenizer
+            .encode(
+                "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
+                false,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ids: Vec<u32> = seed_ids
+            .iter()
+            .cycle()
+            .take(prompt_tokens)
+            .copied()
+            .collect();
+        let sha = bench::sha256_ids(&ids);
+        (ids, sha, "tokenizer-seed".into())
+    };
+    if prompt_ids.is_empty() {
+        bail!("benchmark prompt must contain at least one token");
+    }
+    let model_sha256 = model_path
+        .is_file()
+        .then(|| bench::sha256_file(model_path))
+        .transpose()?;
+    let bos_id = tokenizer.bos_id();
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "benchmark_input": {
+                "format": "u32le",
+                "source": prompt_source,
+                "sha256": prompt_sha256,
+                "token_count": prompt_ids.len(),
+                "first_token_id": prompt_ids.first(),
+                "tokenizer_bos_id": bos_id,
+                "starts_with_bos": bos_id.is_some_and(|id| prompt_ids.first() == Some(&id)),
+            },
+            "model": {
+                "path": model_path.display().to_string(),
+                "sha256": model_sha256,
+            },
+            "config": {
+                "ctx": ctx,
+                "kv_pages": kv_pages,
+                "hot_pages": hot_pages,
+                "weights_pool_gb": weights_pool_gb,
+                "kv_cache": format!("{kv_quant:?}"),
+                "prefix_cache": prefix_cache,
+                "speculation": format!("{:?}", spec.kind()),
+                "warmup_runs": 1,
+                "measured_runs": reps,
+            }
+        })
+    );
+
+    loaded
+        .model
+        .prepare_prefill_profiles(prompt_ids.len(), reps + 1)?;
 
     // Single-sequence bench: full-size prefill chunks, no ITL to protect.
     let engine = forge_engine::server::spawn_engine_batched(
@@ -1554,18 +1621,18 @@ fn cmd_bench(
         12,
         spec,
     )?;
-    // Warm best-of-N: re-submit the identical request `reps` times reusing the
-    // loaded engine. With prefix caching off each rep re-runs the full prefill,
-    // so the cold first GEMM launch (throttled ~2× on the 4090) lands in rep 1
-    // and is discarded when reps > 1. Best (fastest) prefill and decode win.
-    let mut best_prefill_s = f64::INFINITY;
-    let mut best_decode_s = f64::INFINITY;
+    let mut target_ms = Vec::with_capacity(reps);
+    let mut catchup_ms = Vec::with_capacity(reps);
+    let mut ttft_ms = Vec::with_capacity(reps);
+    let mut decode_s = Vec::with_capacity(reps);
     let mut last_prompt_len = 0usize;
     let mut last_generated = 0usize;
-    for rep in 0..reps {
+    let mut generated_sha256 = None;
+    for rep in 0..=reps {
         let submit_at = Instant::now();
+        let mut generated_ids = Vec::with_capacity(tokens);
         // No EOS ids: the benchmark must decode exactly `tokens` tokens.
-        let (generated, prompt_len, first_at, done_at) = drain_request(
+        let (generated, prompt_len, first_at, done_at, profile) = drain_request(
             &engine,
             EngineRequest {
                 prompt_tokens: prompt_ids.clone(),
@@ -1579,48 +1646,85 @@ fn cmd_bench(
                 grammar: None,
                 ..Default::default()
             },
-            |_| {},
+            |id, _| generated_ids.push(id),
         )?;
-        let prefill_s = first_at.duration_since(submit_at).as_secs_f64();
-        let decode_s = done_at.duration_since(first_at).as_secs_f64();
+        let run_sha256 = bench::sha256_ids(&generated_ids);
+        if let Some(expected) = &generated_sha256 {
+            if expected != &run_sha256 {
+                bail!("greedy token IDs differ between benchmark repetitions");
+            }
+        } else {
+            generated_sha256 = Some(run_sha256.clone());
+        }
+        let visible_ttft_s = first_at.duration_since(submit_at).as_secs_f64();
+        let decode_elapsed_s = done_at.duration_since(first_at).as_secs_f64();
         last_prompt_len = prompt_len;
         last_generated = generated;
-        let prefill_tps = prompt_len as f64 / prefill_s.max(1e-9);
-        let decode_tps = (generated.saturating_sub(1)) as f64 / decode_s.max(1e-9);
+        let profile = profile.context("worker nie zwrócił profilu prefill")?;
+        let target = profile
+            .target_gpu_ms
+            .context("backend nie udostępnia czasu GPU target prefill")?;
+        let catchup = profile
+            .mtp_catchup_gpu_ms
+            .context("backend nie udostępnia czasu GPU MTP catch-up")?;
+        let prefill_tps = prompt_len as f64 / (target / 1000.0).max(1e-9);
+        let decode_tps =
+            (generated.saturating_sub(1)) as f64 / decode_elapsed_s.max(1e-9);
         eprintln!(
-            "rep {}/{reps}: prefill {prefill_s:.3}s ({prefill_tps:.1} tok/s) | decode {decode_s:.3}s ({decode_tps:.1} tok/s)",
-            rep + 1
+            "{} {}/{}: target {:.3} ms ({prefill_tps:.1} tok/s) | MTP catch-up {:.3} ms | TTFT {:.3} ms | visible TTFT {:.3} ms | decode {:.1} tok/s",
+            if rep == 0 { "warmup" } else { "rep" },
+            if rep == 0 { 1 } else { rep },
+            if rep == 0 { 1 } else { reps },
+            target,
+            catchup,
+            profile.ttft_ms,
+            visible_ttft_s * 1000.0,
+            decode_tps,
         );
-        // Discard rep 1 (cold) from the best-of when averaging over multiple reps.
-        if reps > 1 && rep == 0 {
+        eprintln!("generated token SHA256: {run_sha256}");
+        if rep == 0 {
             continue;
         }
-        best_prefill_s = best_prefill_s.min(prefill_s);
-        best_decode_s = best_decode_s.min(decode_s);
+        target_ms.push(target);
+        catchup_ms.push(catchup);
+        ttft_ms.push(profile.ttft_ms);
+        decode_s.push(decode_elapsed_s);
     }
-
-    // Honest measurement note: "prefill" is submit → first visible token,
-    // which includes at least one decode step (and possibly a couple more if
-    // the decoder held back partial UTF-8); "decode" covers the remaining
-    // generated tokens as counted by the engine's usage numbers. Prefill runs
-    // through the batched chunked path (one chunk per scheduler iteration).
-    let prefill_tps = last_prompt_len as f64 / best_prefill_s.max(1e-9);
-    let decode_tps = (last_generated.saturating_sub(1)) as f64 / best_decode_s.max(1e-9);
-
-    println!("| phase   | tokens | seconds | tok/s   |");
-    println!("|---------|--------|---------|---------|");
-    println!("| prefill | {last_prompt_len:>6} | {best_prefill_s:>7.3} | {prefill_tps:>7.1} |");
+    let target = bench::Distribution::from_samples(&target_ms)?;
+    let catchup = bench::Distribution::from_samples(&catchup_ms)?;
+    let ttft = bench::Distribution::from_samples(&ttft_ms)?;
+    let decode = bench::Distribution::from_samples(&decode_s)?;
+    println!("| phase | tokens | p10 ms | median ms | p90 ms | median tok/s |");
+    println!("|---|---:|---:|---:|---:|---:|");
     println!(
-        "| decode  | {:>6} | {best_decode_s:>7.3} | {decode_tps:>7.1} |",
-        last_generated.saturating_sub(1)
+        "| target prefill | {last_prompt_len} | {:.3} | {:.3} | {:.3} | {:.1} |",
+        target.p10,
+        target.median,
+        target.p90,
+        last_prompt_len as f64 / (target.median / 1000.0).max(1e-9)
     );
-    eprintln!("note: prefill is timed to the first visible token, so it includes >=1 decode step");
+    println!(
+        "| MTP catch-up | {last_prompt_len} | {:.3} | {:.3} | {:.3} | - |",
+        catchup.p10, catchup.median, catchup.p90
+    );
+    println!(
+        "| TTFT | 1 | {:.3} | {:.3} | {:.3} | - |",
+        ttft.p10, ttft.median, ttft.p90
+    );
+    println!(
+        "| decode | {} | {:.3} | {:.3} | {:.3} | {:.1} |",
+        last_generated.saturating_sub(1),
+        decode.p10 * 1000.0,
+        decode.median * 1000.0,
+        decode.p90 * 1000.0,
+        last_generated.saturating_sub(1) as f64 / decode.median.max(1e-9)
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod speculation_cli_tests {
-    use super::{parse_speculative, resolve_max_active};
+    use super::{activation_pool_bytes, parse_speculative, resolve_max_active};
     use forge_engine::speculation::{ProposerKind, SpeculationKind};
 
     #[test]
@@ -1689,5 +1793,12 @@ mod speculation_cli_tests {
         assert_eq!(resolve_max_active(None, &off, true).unwrap(), 1);
         assert_eq!(resolve_max_active(Some(1), &mtp, true).unwrap(), 1);
         assert!(resolve_max_active(Some(2), &mtp, true).is_err());
+    }
+
+    #[test]
+    fn hybrydowe_mtp_dostaje_pule_aktywacji_1152_mib() {
+        assert_eq!(activation_pool_bytes(true, true), 1152 << 20);
+        assert_eq!(activation_pool_bytes(false, true), 1 << 30);
+        assert_eq!(activation_pool_bytes(true, false), 1 << 30);
     }
 }

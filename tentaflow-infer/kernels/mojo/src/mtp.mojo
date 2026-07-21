@@ -188,6 +188,111 @@ def mtp_prepare_f16(
         output[row] = Float16(partials[row_in_block * LANES_PER_ROW])
 
 
+def mtp_norm_join_shifted_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    embeddings: UnsafePointer[Float16, MutAnyOrigin],
+    target_hidden: UnsafePointer[Float16, MutAnyOrigin],
+    initial_hidden: UnsafePointer[Float16, MutAnyOrigin],
+    enorm: UnsafePointer[Float16, MutAnyOrigin],
+    hnorm: UnsafePointer[Float16, MutAnyOrigin],
+    n_tokens: Int,
+    hidden_size: Int,
+    eps: Float32,
+):
+    """Tworzy znormalizowane [embedding, poprzedni target hidden] dla batcha.
+
+    Pierwszy wiersz korzysta z carry sprzed chunka, a pozostale z poprzedniego
+    wiersza targetu. Grid.x odpowiada tokenom, a blok ma 256 watkow.
+    """
+    token = Int(block_idx.x)
+    if token >= n_tokens:
+        return
+    tid = Int(thread_idx.x)
+    embedding_base = token * hidden_size
+    hidden_base = (token - 1) * hidden_size
+
+    var embed_sq: Float32 = 0.0
+    var hidden_sq: Float32 = 0.0
+    var i = tid
+    while i < hidden_size:
+        embedding = Float32(embeddings[embedding_base + i])
+        hidden = Float32(
+            initial_hidden[i] if token == 0 else target_hidden[hidden_base + i]
+        )
+        embed_sq += embedding * embedding
+        hidden_sq += hidden * hidden
+        i += Int(block_dim.x)
+
+    embed_inv = rsqrt(_block_sum_portable(embed_sq) / Float32(hidden_size) + eps)
+    hidden_inv = rsqrt(_block_sum_portable(hidden_sq) / Float32(hidden_size) + eps)
+    output_base = token * 2 * hidden_size
+    i = tid
+    while i < hidden_size:
+        embedding = Float32(embeddings[embedding_base + i])
+        hidden = Float32(
+            initial_hidden[i] if token == 0 else target_hidden[hidden_base + i]
+        )
+        output[output_base + i] = Float16(
+            embedding * embed_inv * Float32(enorm[i])
+        )
+        output[output_base + hidden_size + i] = Float16(
+            hidden * hidden_inv * Float32(hnorm[i])
+        )
+        i += Int(block_dim.x)
+
+
+def mtp_project_joined_q8_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    joined: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    hidden_size: Int,
+    n_tokens: Int,
+):
+    """Projektuje batch z Q8_0 w kolejności redukcji zgodnej z mtp_prepare."""
+    token = Int(block_idx.y)
+    if token >= n_tokens:
+        return
+    tid = Int(thread_idx.x)
+    lane = tid % LANES_PER_ROW
+    row_in_block = tid // LANES_PER_ROW
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + row_in_block
+    partials = stack_allocation[
+        ROWS_PER_BLOCK * LANES_PER_ROW,
+        Float32,
+        address_space=AddressSpace.SHARED,
+    ]()
+    var acc: Float32 = 0.0
+    if row < hidden_size:
+        n_cols = 2 * hidden_size
+        blocks_per_row = n_cols // 32
+        row_base = row * blocks_per_row * 34
+        var block = lane
+        while block < blocks_per_row:
+            offset = row_base + block * 34
+            scale = Float32((weights + offset).bitcast[Float16]()[0])
+            packed = (weights + offset + 2).bitcast[UInt16]().load[width=16]()
+            codes = bitcast[DType.int8, 32](packed).cast[DType.float32]()
+            values = (joined + token * n_cols + block * 32).load[
+                width=32, alignment=64
+            ]().cast[DType.float32]()
+            acc += scale * (codes * values).reduce_add()
+            block += LANES_PER_ROW
+    partials[row_in_block * LANES_PER_ROW + lane] = acc
+    barrier()
+    var stride = LANES_PER_ROW // 2
+    while stride > 0:
+        if lane < stride:
+            partials[row_in_block * LANES_PER_ROW + lane] += partials[
+                row_in_block * LANES_PER_ROW + lane + stride
+            ]
+        barrier()
+        stride //= 2
+    if lane == 0 and row < hidden_size:
+        output[token * hidden_size + row] = Float16(
+            partials[row_in_block * LANES_PER_ROW]
+        )
+
+
 def mtp_stage_step(
     position_out: UnsafePointer[Int32, MutAnyOrigin],
     seq_len_out: UnsafePointer[Int32, MutAnyOrigin],

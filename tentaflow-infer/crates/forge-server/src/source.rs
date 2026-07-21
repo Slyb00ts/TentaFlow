@@ -1,7 +1,8 @@
-// ===== File: source.rs — model/tokenizer/chat-template resolution shared by server and CLI =====
-// One place decides, for a GGUF file or an HF snapshot directory, which
-// tokenizer to build, which special-token ids apply, which EOS ids terminate
-// generation, and which chat template source renders conversations.
+// =============================================================================
+// Plik: source.rs
+// Opis: Rozwiązuje model, tokenizer, tokeny specjalne i szablon rozmowy.
+// Przykład: load_model(device, path, config)
+// =============================================================================
 
 use std::path::Path;
 use std::sync::Arc;
@@ -214,34 +215,36 @@ pub fn read_descriptor(path: &Path) -> Result<ModelDescriptor> {
     }
 }
 
-/// Bytes the KV cache of this model needs for `kv_pages` pages of
-/// `kv_page_size` tokens in storage mode `quant`, plus per-buffer
-/// pool-granularity rounding headroom. F16/Fp8 reserve the full paged slab.
-/// Rot reserves the full-history packed low-bit region + f16 scales plus a
-/// small residual ring (`residual_window` tokens at f16) — NOT a full f16 slab,
-/// so its KV footprint is ~3.9× (rot4) / ~5× (rot3) below f16.
+/// Oblicza rozmiar puli KV z uwzględnieniem wyrównania każdego bufora.
+/// Tryb Rot rezerwuje historię niskobitową, skale F16 oraz residual ring.
+/// Model z włączonym natywnym MTP otrzymuje dodatkowo jedną parę pełnych slabów F16.
 pub fn kv_pool_bytes(
     desc: &ModelDescriptor,
     kv_page_size: usize,
     kv_pages: usize,
     quant: forge_engine::kv::KvQuant,
+    native_mtp: bool,
 ) -> usize {
     let p = &desc.params;
     let slots = p.n_kv_heads * kv_page_size * kv_pages;
     let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
     let round = |b: usize| b.div_ceil(granularity) * granularity;
     let per_layer_pair = if let Some(pb) = quant.packed_bytes(p.head_dim) {
-        // Rot: residual ring (f16) + packed low-bit codes (u8) + f16 scales,
-        // K and V per layer. No full-context f16 slab.
+        // Rot przechowuje residual ring F16, kody niskobitowe i skale F16.
         let ring_slots = quant.ring_slots().unwrap_or(1);
         let ring = ring_slots * p.n_kv_heads * p.head_dim * quant.slab_dtype().size();
         2 * round(ring) + 2 * round(slots * pb) + 2 * round(slots * 2)
     } else {
-        // K and V f16/fp8 slab per layer.
         let slab = slots * p.head_dim * quant.slab_dtype().size();
         2 * round(slab)
     };
-    p.block_count * per_layer_pair + 64 * (1 << 20)
+    let mtp_pair = if native_mtp && desc.mtp.is_some() {
+        let slab = slots * p.head_dim * forge_types::DType::F16.size();
+        2 * round(slab)
+    } else {
+        0
+    };
+    p.block_count * per_layer_pair + mtp_pair + 64 * (1 << 20)
 }
 
 /// Resolve the sequence pooling for an embedding model path. GGUF carries
@@ -327,7 +330,57 @@ pub fn load_model(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_formats::MtpDescriptor;
     use forge_tokenize::{ChatMessage, ChatTemplateEngine};
+
+    #[test]
+    fn pula_kv_rezerwuje_slab_mtp_tylko_gdy_runtime_jest_wlaczony() {
+        let config: HfConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "intermediate_size": 256,
+                "vocab_size": 1024,
+                "max_position_embeddings": 1024
+            }"#,
+        )
+        .unwrap();
+        let mut descriptor = ModelDescriptor::from_hf(&config).unwrap();
+        descriptor.mtp = Some(MtpDescriptor {
+            first_block: descriptor.params.block_count,
+            block_count: 1,
+            layers: vec![Default::default()],
+            share_target_embedding: true,
+            share_target_output: true,
+        });
+        let page_size = 32;
+        let pages = 8;
+        let without_mtp = kv_pool_bytes(
+            &descriptor,
+            page_size,
+            pages,
+            forge_engine::kv::KvQuant::F16,
+            false,
+        );
+        let with_mtp = kv_pool_bytes(
+            &descriptor,
+            page_size,
+            pages,
+            forge_engine::kv::KvQuant::F16,
+            true,
+        );
+        let slots = descriptor.params.n_kv_heads * page_size * pages;
+        let slab = slots * descriptor.params.head_dim * forge_types::DType::F16.size();
+        let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
+        let expected_mtp_pair = 2 * slab.div_ceil(granularity) * granularity;
+
+        assert_eq!(with_mtp - without_mtp, expected_mtp_pair);
+    }
 
     #[test]
     fn family_mapping() {

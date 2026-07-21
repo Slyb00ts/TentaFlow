@@ -6,7 +6,7 @@
 // adds the previous sublayer's output and produces the next sublayer's
 // normed input.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,6 +28,35 @@ use crate::weights::{
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
+const HYBRID_PREFILL_CHUNK: usize = 32;
+
+fn hybrid_prefill_chunk_size() -> usize {
+    std::env::var("FORGE_HYBRID_PREFILL_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 1 && value <= MAX_PREFILL_CHUNK)
+        .unwrap_or(HYBRID_PREFILL_CHUNK)
+}
+
+fn hybrid_prefill_profile_spans(prompt_tokens: usize, chunk_size: usize) -> usize {
+    let full_outer = prompt_tokens / MAX_PREFILL_CHUNK;
+    let remainder = prompt_tokens % MAX_PREFILL_CHUNK;
+    full_outer * MAX_PREFILL_CHUNK.div_ceil(chunk_size)
+        + if remainder == 0 {
+            0
+        } else {
+            remainder.div_ceil(chunk_size)
+        }
+}
+
+fn hybrid_q_full_cols(q_dim: usize, conv_dim: usize, hidden_size: usize) -> usize {
+    (q_dim * 2).max(conv_dim).max(hidden_size * 2)
+}
+
+fn restore_after<T>(result: Result<T>, restore: impl FnOnce()) -> Result<T> {
+    restore();
+    result
+}
 
 /// Fixed built-in calibration passage for W4A8 SmoothQuant. A few hundred
 /// tokens of representative English prose plus a code snippet — enough to
@@ -211,6 +240,8 @@ pub struct Model {
     verify_bufs: Option<VerifyBufs>,
     /// Warstwowy verifier T=3/4 dla hybrydowego targetu MTP.
     hybrid_verify_bufs: Option<HybridVerifyBufs>,
+    /// Trwały scratch batched prefill, oddzielony od verifiera decode cap=4.
+    hybrid_prefill_bufs: Option<HybridVerifyBufs>,
     /// Trwałe grafy stałej części verifiera MTP dla T=3 i T=4.
     hybrid_verify_graph_t3: Option<ExecGraph>,
     hybrid_verify_graph_t4: Option<ExecGraph>,
@@ -267,6 +298,26 @@ pub struct Model {
     calib: Option<CalibAccum>,
     /// Izolowany stan jednowarstwowego draftu NextN; nie uczestniczy w server flow.
     mtp_state: Option<MtpDraftState>,
+    /// Zdarzenia czasu GPU przygotowane wyłącznie przez `forge bench`.
+    prefill_profiles: VecDeque<PrefillProfileRun>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefillProfile {
+    pub target_gpu_ms: Option<f64>,
+    pub mtp_catchup_gpu_ms: Option<f64>,
+}
+
+struct ProfileSpan {
+    start: Event,
+    end: Event,
+}
+
+struct PrefillProfileRun {
+    target: Vec<ProfileSpan>,
+    catchup: Vec<ProfileSpan>,
+    target_cursor: usize,
+    catchup_cursor: usize,
 }
 
 /// Running per-input-channel activation abs-max for the W4A8 SmoothQuant
@@ -442,10 +493,12 @@ struct DecodeBufs {
     sample_out: DevBuffer,
     /// Pinned-host landing buffer for the 8-byte sampling result.
     pinned_sample: DevBuffer,
-    /// Device-resident distinct-token list for the repetition penalty.
+    /// Histogram kar samplingu przechowywany na urządzeniu.
     penalty_ids: DevBuffer,
-    /// Pinned-host staging for `penalty_ids`.
+    penalty_counts: DevBuffer,
+    /// Przypięty bufor hosta do przygotowania histogramu kar.
     pinned_penalty: DevBuffer,
+    pinned_penalty_counts: DevBuffer,
 }
 
 /// Persistent prefill scratch sized for MAX_PREFILL_CHUNK tokens. Activation
@@ -483,6 +536,7 @@ struct VerifyBufs {
 
 /// Sposób przechowania danych potrzebnych do zatwierdzenia stanu DeltaNet.
 enum DeltaVerifyCommit {
+    InPlacePrefill,
     Retained {
         checkpoint_byte_offset: usize,
     },
@@ -661,14 +715,19 @@ struct BatchBufs {
     samp_seed: DevBuffer,
     samp_step: DevBuffer,
     pinned_samp: DevBuffer,
-    /// Repetition-penalty staging: flat distinct-id list, prefix offsets,
-    /// per-seq penalty.
+    /// Histogramy kar: płaskie IDs i liczniki, offsety oraz parametry sekwencji.
     pen_ids: DevBuffer,
+    pen_counts: DevBuffer,
     pen_offsets: DevBuffer,
     pen_vals: DevBuffer,
+    pen_frequency: DevBuffer,
+    pen_presence: DevBuffer,
     pinned_pen_ids: DevBuffer,
+    pinned_pen_counts: DevBuffer,
     pinned_pen_offsets: DevBuffer,
     pinned_pen_vals: DevBuffer,
+    pinned_pen_frequency: DevBuffer,
+    pinned_pen_presence: DevBuffer,
     out_ids: DevBuffer,
     pinned_out: DevBuffer,
 }
@@ -894,7 +953,13 @@ impl Model {
             sample_out: device.alloc(8, MemKind::Device, Pool::Activations)?,
             pinned_sample: device.alloc(8, MemKind::PinnedHost, Pool::Activations)?,
             penalty_ids: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
+            penalty_counts: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
             pinned_penalty: device.alloc(
+                cfg.max_seq_len * 4,
+                MemKind::PinnedHost,
+                Pool::Activations,
+            )?,
+            pinned_penalty_counts: device.alloc(
                 cfg.max_seq_len * 4,
                 MemKind::PinnedHost,
                 Pool::Activations,
@@ -993,6 +1058,7 @@ impl Model {
             prefill_bufs: None,
             verify_bufs: None,
             hybrid_verify_bufs: None,
+            hybrid_prefill_bufs: None,
             hybrid_verify_graph_t3: None,
             hybrid_verify_graph_t4: None,
             hybrid_verify_graph_t3_disabled: false,
@@ -1013,7 +1079,146 @@ impl Model {
             prefix_cache,
             calib: None,
             mtp_state,
+            prefill_profiles: VecDeque::new(),
         })
+    }
+
+    /// Przygotowuje wszystkie eventy przed startem workera, aby ich alokacja
+    /// nie wchodziła do TTFT mierzonego żądania.
+    pub fn prepare_prefill_profiles(&mut self, prompt_tokens: usize, runs: usize) -> Result<()> {
+        if prompt_tokens == 0 || runs == 0 {
+            return Err(ForgeError::Scheduler(
+                "profil prefill wymaga dodatniej liczby tokenów i przebiegów".into(),
+            ));
+        }
+        if !self.prefill_profiles.is_empty() {
+            return Err(ForgeError::Scheduler(
+                "profil prefill został już przygotowany".into(),
+            ));
+        }
+        let hybrid = self.is_hybrid();
+        let hybrid_batched = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
+            .map_or(true, |value| value != "0")
+            && prompt_tokens > 1
+            && self.validate_hybrid_speculation_target().is_ok();
+        let target_spans = if hybrid_batched {
+            hybrid_prefill_profile_spans(prompt_tokens, hybrid_prefill_chunk_size())
+        } else if hybrid {
+            prompt_tokens
+        } else {
+            prompt_tokens.div_ceil(MAX_PREFILL_CHUNK)
+        };
+        for _ in 0..runs {
+            let mut target = Vec::with_capacity(target_spans);
+            for _ in 0..target_spans {
+                target.push(ProfileSpan {
+                    start: self.device.create_timing_event()?,
+                    end: self.device.create_timing_event()?,
+                });
+            }
+            let catchup_spans = if hybrid_batched {
+                target_spans
+            } else if hybrid {
+                prompt_tokens
+            } else {
+                0
+            };
+            let mut catchup = Vec::with_capacity(catchup_spans);
+            if hybrid {
+                for _ in 0..catchup_spans {
+                    catchup.push(ProfileSpan {
+                        start: self.device.create_timing_event()?,
+                        end: self.device.create_timing_event()?,
+                    });
+                }
+            }
+            self.prefill_profiles.push_back(PrefillProfileRun {
+                target,
+                catchup,
+                target_cursor: 0,
+                catchup_cursor: 0,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn take_prefill_profile(&mut self) -> Result<Option<PrefillProfile>> {
+        let Some(run) = self.prefill_profiles.pop_front() else {
+            return Ok(None);
+        };
+        if run.target_cursor != run.target.len() || run.catchup_cursor != run.catchup.len() {
+            return Err(ForgeError::Scheduler(format!(
+                "niepełny profil prefill: target {}/{}, MTP {}/{}",
+                run.target_cursor,
+                run.target.len(),
+                run.catchup_cursor,
+                run.catchup.len()
+            )));
+        }
+        let target_gpu_ms = self.sum_profile_spans(&run.target)?;
+        let mtp_catchup_gpu_ms = self.sum_profile_spans(&run.catchup)?;
+        Ok(Some(PrefillProfile {
+            target_gpu_ms,
+            mtp_catchup_gpu_ms,
+        }))
+    }
+
+    fn sum_profile_spans(&self, spans: &[ProfileSpan]) -> Result<Option<f64>> {
+        if spans.is_empty() {
+            return Ok(Some(0.0));
+        }
+        let mut total = 0.0;
+        for span in spans {
+            let Some(ms) = self.device.elapsed_event_ms(&span.start, &span.end)? else {
+                return Ok(None);
+            };
+            total += f64::from(ms);
+        }
+        Ok(Some(total))
+    }
+
+    fn profile_target_start(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front() else {
+            return Ok(());
+        };
+        let span = run.target.get(run.target_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil target prefill przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.start, &self.stream)
+    }
+
+    fn profile_target_end(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front_mut() else {
+            return Ok(());
+        };
+        let span = run.target.get(run.target_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil target prefill przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.end, &self.stream)?;
+        run.target_cursor += 1;
+        Ok(())
+    }
+
+    fn profile_catchup_start(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front() else {
+            return Ok(());
+        };
+        let span = run.catchup.get(run.catchup_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil MTP catch-up przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.start, &self.stream)
+    }
+
+    fn profile_catchup_end(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front_mut() else {
+            return Ok(());
+        };
+        let span = run.catchup.get(run.catchup_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil MTP catch-up przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.end, &self.stream)?;
+        run.catchup_cursor += 1;
+        Ok(())
     }
 
     pub fn new_seq(&self) -> SeqKv {
@@ -2798,10 +3003,20 @@ impl Model {
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
         let inter = p.intermediate_size;
-        let t_max = MAX_PREFILL_CHUNK;
+        let t_max = if self.is_hybrid() {
+            hybrid_prefill_chunk_size().max(4)
+        } else {
+            MAX_PREFILL_CHUNK
+        };
         let alloc = |elems: usize| {
             self.device
                 .alloc(elems * 2, MemKind::Device, Pool::Activations)
+        };
+        let gate = alloc(t_max * inter)?;
+        let act = if self.is_hybrid() {
+            gate.clone()
+        } else {
+            alloc(t_max * inter)?
         };
         self.prefill_bufs = Some(PrefillBufs {
             h: alloc(t_max * hidden)?,
@@ -2811,9 +3026,9 @@ impl Model {
             v: alloc(t_max * kv_dim)?,
             attn_out: alloc(t_max * q_dim)?,
             o_out: alloc(t_max * hidden)?,
-            gate: alloc(t_max * inter)?,
+            gate,
             up: alloc(t_max * inter)?,
-            act: alloc(t_max * inter)?,
+            act,
             down: alloc(t_max * hidden)?,
             ids: self
                 .device
@@ -3842,10 +4057,10 @@ impl Model {
         if self.is_hybrid() {
             return self.prefill_hybrid(seq, tokens);
         }
+        self.profile_target_start()?;
         let t = self.prefill_forward(seq, tokens)?;
         let hidden = self.weights.descriptor.params.hidden_size;
         let vocab = self.weights.descriptor.params.vocab_size;
-        let stream = &self.stream;
         let pb = self
             .prefill_bufs
             .as_ref()
@@ -3858,16 +4073,17 @@ impl Model {
             &self.bufs.x,
             0,
             hidden * 2,
-            stream,
+            &self.stream,
         )?;
-        self.logits_gemv(&self.bufs.logits, &self.bufs.x, stream)?;
+        self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        self.profile_target_end()?;
         self.device.copy(
             &self.bufs.logits,
             0,
             &self.bufs.pinned_logits,
             0,
             vocab * 4,
-            stream,
+            &self.stream,
         )?;
         self.device.synchronize()?;
 
@@ -4569,21 +4785,33 @@ impl Model {
         let sp = sampler.params().clone();
 
         let penalized = sampler.penalized();
-        if sp.repetition_penalty != 1.0 && !penalized.is_empty() {
-            if penalized.len() * 4 > b.pinned_penalty.len() {
+        let penalty_counts = sampler.penalty_counts();
+        if sp.has_penalties() && !penalized.is_empty() {
+            if penalized.len() != penalty_counts.len()
+                || penalized.len() * 4 > b.pinned_penalty.len()
+            {
                 return Err(ForgeError::Scheduler(format!(
-                    "penalty list {} exceeds staging capacity",
+                    "penalty histogram {} exceeds staging capacity",
                     penalized.len()
                 )));
             }
-            let host = b
+            let ids_host = b
                 .pinned_penalty
+                .host_ptr()
+                .expect("pinned buffer has host mapping");
+            let counts_host = b
+                .pinned_penalty_counts
                 .host_ptr()
                 .expect("pinned buffer has host mapping");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     penalized.as_ptr() as *const u8,
-                    host,
+                    ids_host,
+                    penalized.len() * 4,
+                );
+                std::ptr::copy_nonoverlapping(
+                    penalty_counts.as_ptr() as *const u8,
+                    counts_host,
                     penalized.len() * 4,
                 );
             }
@@ -4595,11 +4823,23 @@ impl Model {
                 penalized.len() * 4,
                 &self.stream,
             )?;
-            self.kernels.sample_penalize_f32(
+            self.device.copy(
+                &b.pinned_penalty_counts,
+                0,
+                &b.penalty_counts,
+                0,
+                penalized.len() * 4,
+                &self.stream,
+            )?;
+            self.kernels.sample_penalize_histogram_f32(
                 &b.logits,
                 &b.penalty_ids,
+                &b.penalty_counts,
                 penalized.len(),
+                p.vocab_size,
                 sp.repetition_penalty,
+                sp.frequency_penalty,
+                sp.presence_penalty,
                 &self.stream,
             )?;
         }
@@ -4838,6 +5078,102 @@ impl Model {
         result
     }
 
+    fn mtp_catchup_batch_host(&self, state: &mut MtpDraftState, t: usize) -> Result<()> {
+        let mtp = self.weights.mtp.as_ref().expect("stan MTP ma wagi");
+        let layer = mtp.layers.first().ok_or_else(|| {
+            ForgeError::Unsupported("batchowy catch-up MTP wymaga jednej warstwy".into())
+        })?;
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+            return Err(ForgeError::Unsupported(
+                "batchowy catch-up MTP wymaga eh_proj Q8_0".into(),
+            ));
+        };
+        let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrydowego catch-up są gotowe");
+        let stream = &self.stream;
+        let base = state.stage_batch(t)?;
+        let positions: Vec<i32> = (base..base + t).map(|value| value as i32).collect();
+        let visible: Vec<i32> = (base + 1..=base + t).map(|value| value as i32).collect();
+        self.device
+            .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
+        self.device
+            .write(&(base as i32).to_le_bytes(), &hv.base_pos, 0)?;
+        self.device
+            .write(bytemuck::cast_slice(&visible), &hv.visible_lens, 0)?;
+        self.device.copy(
+            &hv.pinned_embed,
+            0,
+            &pb.h,
+            0,
+            t * hidden * 2,
+            stream,
+        )?;
+        self.kernels.mtp_norm_join_shifted_f16(
+            &hv.q_full,
+            &pb.h,
+            &pb.x,
+            &state.recurrent_hidden,
+            &layer.enorm,
+            &layer.hnorm,
+            t,
+            hidden,
+            p.rms_norm_eps,
+            stream,
+        )?;
+        self.device.copy(
+            &pb.x,
+            (t - 1) * hidden * 2,
+            &state.catchup_hidden,
+            0,
+            hidden * 2,
+            stream,
+        )?;
+        self.kernels.mtp_project_joined_q8_f16(
+            &pb.h, &hv.q_full, eh_proj, t, hidden, stream,
+        )?;
+        self.kernels.rmsnorm_f16(
+            &pb.x,
+            &pb.h,
+            &layer.block.attn_norm,
+            t,
+            hidden,
+            p.rms_norm_eps,
+            stream,
+        )?;
+        let attention = layer.block.attn();
+        let QkvWeights::Split { q: _, k, v } = &attention.attn_qkv else {
+            return Err(ForgeError::Unsupported("MTP wymaga rozdzielonych Q/K/V".into()));
+        };
+        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+        if let Some(norm) = &attention.k_norm {
+            self.kernels.rmsnorm_f16(
+                &pb.k, &pb.k, norm, t * p.n_kv_heads, p.head_dim, p.rms_norm_eps, stream,
+            )?;
+        }
+        let n_rot = self.hybrid_n_rot();
+        self.kernels.rope_neox_partial_f16(
+            &pb.k, &pb.positions, t, p.n_kv_heads, p.head_dim, n_rot, p.rope_theta, stream,
+        )?;
+        self.kernels.kv_append_batch_device_pos_f16(
+            &state.kv.k[0], &state.kv.v[0], &pb.k, &pb.v, &state.page_table,
+            &hv.base_pos, t, p.n_kv_heads, state.kv.cfg.page_size, p.head_dim, stream,
+        )?;
+        self.device.copy(
+            &state.catchup_hidden,
+            0,
+            &state.recurrent_hidden,
+            0,
+            hidden * 2,
+            stream,
+        )
+    }
+
     /// Dogania stan MTP po zaakceptowanym prefiksie targetu bez liczenia logits.
     fn mtp_catchup_verified_prefix(&mut self, retained: usize) -> Result<()> {
         if retained == 0 {
@@ -4851,6 +5187,24 @@ impl Model {
         })?;
         let result = (|| {
             state.checkpoint(&self.stream)?;
+            if retained > 1
+                && self
+                    .weights
+                    .mtp
+                    .as_ref()
+                    .is_some_and(|mtp| mtp.shares_target_embedding)
+            {
+                self.mtp_catchup_batch_host(&mut state, retained)?;
+                state.commit_catchup(retained)?;
+                return self.device.copy(
+                    &state.catchup_hidden,
+                    0,
+                    &self.bufs.x,
+                    0,
+                    hidden_bytes,
+                    &self.stream,
+                );
+            }
             for row in 0..retained {
                 let pb = self
                     .prefill_bufs
@@ -5313,30 +5667,55 @@ impl Model {
         let a32 = |name: &str, dims: &[usize]| {
             alloc_checked(device.as_ref(), name, dims, 4, MemKind::Device)
         };
-        let delta_count = self
-            .weights
-            .layers
-            .iter()
-            .filter(|layer| matches!(layer.mixer, LayerMixer::DeltaNet(_)))
-            .count();
         let base_pos = a32("mtp base position", &[1])?;
         let visible_lens = a32("mtp visible lengths", &[cap])?;
-        let q_full = a16("mtp q full", &[cap, q_dim, 2])?;
-        let qc = a16("mtp q", &[cap, q_dim])?;
-        let gatec = a16("mtp q gate", &[cap, q_dim])?;
-        let gated = a16("mtp gated attention", &[cap, q_dim])?;
-        let qkv_mixed = a16("mtp mixed qkv", &[cap, conv_dim])?;
-        let z = a16("mtp z", &[cap, value_dim])?;
-        let q32 = a16("mtp q32", &[cap, value_dim])?;
-        let k32 = a16("mtp k32", &[cap, value_dim])?;
-        let vtok = a16("mtp v", &[cap, value_dim])?;
+        let q_full = a16(
+            "mtp q full",
+            &[cap, hybrid_q_full_cols(q_dim, conv_dim, p.hidden_size)],
+        )?;
+        let qc = a16("mtp q", &[cap, q_dim.max(value_dim)])?;
+        let gatec = a16("mtp q gate", &[cap, q_dim.max(value_dim)])?;
+        let gated = a16("mtp gated attention", &[cap, q_dim.max(value_dim)])?;
+        let qkv_mixed = if cap > 4 {
+            q_full.clone()
+        } else {
+            a16("mtp mixed qkv", &[cap, conv_dim])?
+        };
+        let z = if cap > 4 {
+            q_full.clone()
+        } else {
+            a16("mtp z", &[cap, value_dim])?
+        };
+        let q32 = if cap > 4 {
+            qc.clone()
+        } else {
+            a16("mtp q32", &[cap, value_dim])?
+        };
+        let k32 = if cap > 4 {
+            gatec.clone()
+        } else {
+            a16("mtp k32", &[cap, value_dim])?
+        };
+        let vtok = if cap > 4 {
+            gated.clone()
+        } else {
+            a16("mtp v", &[cap, value_dim])?
+        };
         let alpha = a16("mtp alpha", &[cap, n_v])?;
         let beta_raw = a16("mtp beta raw", &[cap, n_v])?;
         let g = a32("mtp g", &[cap, n_v])?;
         let beta_f = a32("mtp beta", &[cap, n_v])?;
         let o = a16("mtp recurrence output", &[cap, value_dim])?;
-        let normed = a16("mtp recurrence norm", &[cap, value_dim])?;
-        let state_checkpoints = a32("mtp state checkpoints", &[cap, state_elems])?;
+        let normed = if cap > 4 {
+            o.clone()
+        } else {
+            a16("mtp recurrence norm", &[cap, value_dim])?
+        };
+        let state_checkpoints = if cap > 4 {
+            a32("mtp state checkpoints", &[1])?
+        } else {
+            a32("mtp state checkpoints", &[cap, state_elems])?
+        };
         let accepted = a32("mtp accepted", &[2])?;
         let pinned_decision = alloc_checked(
             device.as_ref(),
@@ -5360,7 +5739,11 @@ impl Model {
                 LayerMixer::DeltaNet(_) => Ok(Some((
                     a16("mtp conv initial", &[conv_elems])?,
                     a16("mtp conv checkpoints", &[cap, conv_elems])?,
-                    a32("mtp state initial", &[state_elems])?,
+                    if cap > 4 {
+                        a32("mtp state initial", &[1])?
+                    } else {
+                        a32("mtp state initial", &[state_elems])?
+                    },
                 ))),
                 LayerMixer::Attention(_) => Ok(None),
             })
@@ -5371,13 +5754,21 @@ impl Model {
             .ok_or_else(|| {
                 ForgeError::Scheduler("przepełnienie offsetu checkpointów MTP".into())
             })?;
-        let retained_state_checkpoints = match a32(
-            "mtp retained state checkpoints",
-            &[delta_count, cap, state_elems],
-        ) {
-            Ok(buffer) => Some(buffer),
-            Err(ForgeError::OutOfMemory { .. }) => None,
-            Err(error) => return Err(error),
+        let retained_state_checkpoints = if cap <= 4 {
+            Some(a32(
+                "mtp retained state checkpoints",
+                &[
+                    self.weights
+                        .layers
+                        .iter()
+                        .filter(|layer| matches!(layer.mixer, LayerMixer::DeltaNet(_)))
+                        .count(),
+                    cap,
+                    state_elems,
+                ],
+            )?)
+        } else {
+            None
         };
         let retain_checkpoints = retained_state_checkpoints.is_some();
         let mut delta_index = 0usize;
@@ -5392,7 +5783,9 @@ impl Model {
                             )
                         })?;
                     delta_index += 1;
-                    let commit = if retain_checkpoints {
+                    let commit = if cap > 4 {
+                        DeltaVerifyCommit::InPlacePrefill
+                    } else if retain_checkpoints {
                         DeltaVerifyCommit::Retained {
                             checkpoint_byte_offset,
                         }
@@ -5490,6 +5883,7 @@ impl Model {
         layer_index: usize,
         delta: &DeltaNetWeights,
         t: usize,
+        inplace_prefill: bool,
     ) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
@@ -5517,7 +5911,9 @@ impl Model {
             .expect("warstwa DeltaNet ma stan");
 
         self.gemm(&hv.qkv_mixed, &delta.in_proj, &pb.x, t, stream)?;
-        self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+        if !inplace_prefill {
+            self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+        }
         self.gemm(&hv.alpha, &delta.alpha_proj, &pb.x, t, stream)?;
         self.gemm(&hv.beta_raw, &delta.beta_proj, &pb.x, t, stream)?;
 
@@ -5551,42 +5947,66 @@ impl Model {
             p.rms_norm_eps,
             stream,
         )?;
-        let (state_checkpoints, checkpoint_byte_offset) = match &cache.commit {
-            DeltaVerifyCommit::Retained {
+        if inplace_prefill {
+            self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+        }
+        if inplace_prefill {
+            kernels.deltanet_gated_scan_inplace_f16(
+                &hv.o,
+                &state.state,
+                &hv.q32,
+                &hv.k32,
+                &hv.vtok,
+                &hv.g,
+                &hv.beta_f,
+                t,
+                n_v,
+                d_state,
+                stream,
+            )?;
+        } else {
+            let (state_checkpoints, checkpoint_byte_offset) = match &cache.commit {
+                DeltaVerifyCommit::InPlacePrefill => {
+                    return Err(ForgeError::Scheduler(
+                        "scratch prefill wymaga skanu DeltaNet in-place".into(),
+                    ));
+                }
+                DeltaVerifyCommit::Retained {
+                    checkpoint_byte_offset,
+                } => (
+                    hv.retained_state_checkpoints
+                        .as_ref()
+                        .expect("retained checkpointy DeltaNet są zaalokowane"),
+                    *checkpoint_byte_offset,
+                ),
+                DeltaVerifyCommit::Recompute { .. } => (&hv.state_checkpoints, 0),
+            };
+            kernels.deltanet_gated_scan_f16_at(
+                &hv.o,
+                state_checkpoints,
                 checkpoint_byte_offset,
-            } => (
-                hv.retained_state_checkpoints
-                    .as_ref()
-                    .expect("retained checkpointy DeltaNet są zaalokowane"),
-                *checkpoint_byte_offset,
-            ),
-            DeltaVerifyCommit::Recompute { .. } => (&hv.state_checkpoints, 0),
-        };
-        kernels.deltanet_gated_scan_f16_at(
-            &hv.o,
-            state_checkpoints,
-            checkpoint_byte_offset,
-            &state.state,
-            &hv.q32,
-            &hv.k32,
-            &hv.vtok,
-            &hv.g,
-            &hv.beta_f,
-            t,
-            n_v,
-            d_state,
-            stream,
-        )?;
-        if let DeltaVerifyCommit::Recompute { q, k, v, g, beta } = &cache.commit {
-            self.device
-                .copy(&hv.q32, 0, q, 0, t * value_dim * 2, stream)?;
-            self.device
-                .copy(&hv.k32, 0, k, 0, t * value_dim * 2, stream)?;
-            self.device
-                .copy(&hv.vtok, 0, v, 0, t * value_dim * 2, stream)?;
-            self.device.copy(&hv.g, 0, g, 0, t * n_v * 4, stream)?;
-            self.device
-                .copy(&hv.beta_f, 0, beta, 0, t * n_v * 4, stream)?;
+                &state.state,
+                &hv.q32,
+                &hv.k32,
+                &hv.vtok,
+                &hv.g,
+                &hv.beta_f,
+                t,
+                n_v,
+                d_state,
+                stream,
+            )?;
+            if let DeltaVerifyCommit::Recompute { q, k, v, g, beta } = &cache.commit {
+                self.device
+                    .copy(&hv.q32, 0, q, 0, t * value_dim * 2, stream)?;
+                self.device
+                    .copy(&hv.k32, 0, k, 0, t * value_dim * 2, stream)?;
+                self.device
+                    .copy(&hv.vtok, 0, v, 0, t * value_dim * 2, stream)?;
+                self.device.copy(&hv.g, 0, g, 0, t * n_v * 4, stream)?;
+                self.device
+                    .copy(&hv.beta_f, 0, beta, 0, t * n_v * 4, stream)?;
+            }
         }
         kernels.deltanet_gated_rmsnorm_f16(
             &hv.normed,
@@ -5774,6 +6194,11 @@ impl Model {
                 .as_ref()
                 .expect("warstwa DeltaNet ma stan");
             match &cache.commit {
+                DeltaVerifyCommit::InPlacePrefill => {
+                    return Err(ForgeError::Scheduler(
+                        "scratch prefill nie może zatwierdzać verifiera MTP".into(),
+                    ));
+                }
                 DeltaVerifyCommit::Retained {
                     checkpoint_byte_offset,
                 } => self.kernels.deltanet_commit_checkpoint_f32_at(
@@ -5826,8 +6251,30 @@ impl Model {
             .copy(&hv.accepted, 0, &hv.pinned_decision, 0, 8, &self.stream)
     }
 
-    /// Uruchamia stałą część verifiera hybrydowego bez synchronizacji z hostem.
-    fn run_hybrid_verify_compute(&self, t: usize) -> Result<()> {
+    fn commit_hybrid_prefill_delta_layer(&self, layer_index: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrydowego prefill są gotowe");
+        let cache = hv.delta[layer_index]
+            .as_ref()
+            .expect("warstwa DeltaNet ma cache skanu");
+        let state = self.ssm[layer_index]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        self.kernels.mtp_select_row_f16(
+            &state.conv,
+            &cache.conv_checkpoints,
+            &hv.accepted,
+            ssm.conv_dim() * (ssm.d_conv - 1),
+            &self.stream,
+        )
+    }
+
+    /// Uruchamia wspólny batched forward hybrydowego targetu.
+    fn run_hybrid_batch_layers(&self, t: usize, commit_prefill: bool) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let pb = self
             .prefill_bufs
@@ -5849,7 +6296,10 @@ impl Model {
                     self.hybrid_verify_attention_layer(layer_index, attention, t)?
                 }
                 LayerMixer::DeltaNet(delta) => {
-                    self.hybrid_verify_delta_layer(layer_index, delta, t)?
+                    self.hybrid_verify_delta_layer(layer_index, delta, t, commit_prefill)?;
+                    if commit_prefill {
+                        self.commit_hybrid_prefill_delta_layer(layer_index)?;
+                    }
                 }
             }
             self.kernels.rmsnorm_residual_f16(
@@ -5917,6 +6367,18 @@ impl Model {
                 &self.stream,
             )?;
         }
+
+        Ok(())
+    }
+
+    /// Uruchamia stałą część verifiera hybrydowego bez synchronizacji z hostem.
+    fn run_hybrid_verify_compute(&self, t: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        self.run_hybrid_batch_layers(t, false)?;
 
         let vb = self.verify_bufs.as_ref().expect("bufory verify są gotowe");
         self.logits_gemm(&vb.logits, &pb.x, t, &self.stream)?;
@@ -7576,6 +8038,11 @@ impl Model {
     /// VRAM pool prefills by streaming older attention KV back per layer while
     /// the resident DeltaNet state advances untouched.
     fn prefill_hybrid(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        let batched_enabled = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
+            .map_or(true, |value| value != "0");
+        if batched_enabled && tokens.len() > 1 && self.validate_hybrid_speculation_target().is_ok() {
+            return self.prefill_hybrid_batched(seq, tokens);
+        }
         self.ensure_hybrid_bufs()?;
         let p = self.weights.descriptor.params.clone();
         let vocab = p.vocab_size;
@@ -7611,6 +8078,7 @@ impl Model {
             self.kv.grow(seq)?;
             self.upload_decode_inputs(tok, pos)?;
             let want = i + 1 == tokens.len();
+            self.profile_target_start()?;
             if staged {
                 self.tier
                     .as_mut()
@@ -7624,7 +8092,10 @@ impl Model {
                 }
                 self.hybrid_forward_token(tok, want, AttnSrc::Paged)?;
             }
+            self.profile_target_end()?;
+            self.profile_catchup_start()?;
             self.mtp_catchup_token(tok)?;
+            self.profile_catchup_end()?;
             if want {
                 self.device.copy(
                     &self.bufs.logits,
@@ -7651,6 +8122,181 @@ impl Model {
             }
         }
         Ok(last_logits)
+    }
+
+    /// Wykonuje prefill hybrydowego targetu w macierzowych chunkach i zatwierdza
+    /// ostatni checkpoint rekurencji po każdym chunku.
+    fn prefill_hybrid_batched(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(ForgeError::Scheduler("empty prefill chunk".into()));
+        }
+        let p = self.weights.descriptor.params.clone();
+        if seq.len + tokens.len() > p.max_position_embeddings {
+            return Err(ForgeError::Scheduler(format!(
+                "position {} exceeds model context {}",
+                seq.len + tokens.len() - 1,
+                p.max_position_embeddings
+            )));
+        }
+        if seq.len == 0 {
+            self.zero_ssm()?;
+            if let Some(state) = &mut self.mtp_state {
+                state.reset_hidden()?;
+            }
+        }
+        self.ensure_hybrid_bufs()?;
+        self.ensure_prefill_bufs()?;
+        let chunk_size = hybrid_prefill_chunk_size();
+        let prefill_cap = tokens.len().min(chunk_size);
+        let saved_graphs = if prefill_cap > 4 {
+            self.ensure_hybrid_verify_bufs(4)?;
+            std::mem::swap(
+                &mut self.hybrid_verify_bufs,
+                &mut self.hybrid_prefill_bufs,
+            );
+            Some((
+                self.hybrid_verify_graph_t3.take(),
+                self.hybrid_verify_graph_t4.take(),
+                self.hybrid_verify_graph_t3_disabled,
+                self.hybrid_verify_graph_t4_disabled,
+            ))
+        } else {
+            None
+        };
+        let result = (|| {
+            self.ensure_hybrid_verify_bufs(prefill_cap)?;
+
+            let hidden_bytes = p.hidden_size * 2;
+            let mut last_logits = Vec::new();
+            let chunk_count = tokens.len().div_ceil(chunk_size);
+            let mut offset = 0usize;
+            for chunk_index in 0..chunk_count {
+                let remaining = tokens.len() - offset;
+                let t = if remaining == chunk_size + 1 {
+                    chunk_size - 1
+                } else {
+                    remaining.min(chunk_size)
+                };
+                let chunk = &tokens[offset..offset + t];
+                offset += t;
+                let t = chunk.len();
+                let base = seq.len;
+                let new_pages = (base + t)
+                    .div_ceil(self.kv.cfg.page_size)
+                    .saturating_sub(seq.pages.len());
+                self.ensure_free_pages(new_pages);
+                for _ in 0..t {
+                    self.kv.grow(seq)?;
+                }
+
+                let mut page_table = vec![-1i32; self.max_pages_per_seq];
+                page_table[..seq.pages.len()].copy_from_slice(&seq.pages);
+                self.device
+                    .write(bytemuck::cast_slice(&page_table), &self.page_table_dev, 0)?;
+                self.pt_seq = seq.id;
+
+                let ids: Vec<i32> = chunk.iter().map(|&id| id as i32).collect();
+                let positions: Vec<i32> = (base..base + t).map(|position| position as i32).collect();
+                let visible_lens: Vec<i32> = (base + 1..=base + t).map(|len| len as i32).collect();
+                let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+                let hv = self
+                    .hybrid_verify_bufs
+                    .as_ref()
+                    .expect("bufory hybrydowego prefill są gotowe");
+                self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
+                self.device
+                    .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
+                self.device
+                    .write(&(base as i32).to_le_bytes(), &hv.base_pos, 0)?;
+                self.device
+                    .write(bytemuck::cast_slice(&visible_lens), &hv.visible_lens, 0)?;
+                self.device.write(&(t as i32).to_le_bytes(), &hv.accepted, 0)?;
+                let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+                    ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
+                })?;
+                let staging = hv
+                    .pinned_embed
+                    .host_ptr()
+                    .expect("pinned embedding ma mapowanie hosta");
+                for (row_index, &token) in chunk.iter().enumerate() {
+                    let source = table
+                        .get(token as usize * p.hidden_size..(token as usize + 1) * p.hidden_size)
+                        .ok_or_else(|| {
+                            ForgeError::Scheduler(format!(
+                                "token id {token} wykracza poza embedding targetu"
+                            ))
+                        })?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            source.as_ptr() as *const u8,
+                            staging.add(row_index * hidden_bytes),
+                            hidden_bytes,
+                        );
+                    }
+                }
+                self.device.copy(
+                    &hv.pinned_embed,
+                    0,
+                    &pb.h,
+                    0,
+                    t * hidden_bytes,
+                    &self.stream,
+                )?;
+
+                self.profile_target_start()?;
+                self.run_hybrid_batch_layers(t, true)?;
+                let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+                self.device.copy(
+                    &pb.x,
+                    (t - 1) * hidden_bytes,
+                    &self.bufs.x,
+                    0,
+                    hidden_bytes,
+                    &self.stream,
+                )?;
+                if chunk_index + 1 == chunk_count {
+                    self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+                    self.device.copy(
+                        &self.bufs.logits,
+                        0,
+                        &self.bufs.pinned_logits,
+                        0,
+                        p.vocab_size * 4,
+                        &self.stream,
+                    )?;
+                }
+                self.profile_target_end()?;
+
+                self.profile_catchup_start()?;
+                if self.mtp_state.is_some() {
+                    self.mtp_catchup_verified_prefix(t)?;
+                }
+                self.profile_catchup_end()?;
+            }
+            self.device.synchronize()?;
+            let logits = self
+                .bufs
+                .pinned_logits
+                .host_ptr()
+                .expect("pinned buffer has host mapping") as *const f32;
+            last_logits.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(logits, p.vocab_size)
+            });
+            Ok(last_logits)
+        })();
+        restore_after(result, || {
+            if let Some((graph_t3, graph_t4, disabled_t3, disabled_t4)) = saved_graphs {
+                // Verifier decode zachowuje własne bufory cap=4 i przechwycone grafy.
+                std::mem::swap(
+                    &mut self.hybrid_verify_bufs,
+                    &mut self.hybrid_prefill_bufs,
+                );
+                self.hybrid_verify_graph_t3 = graph_t3;
+                self.hybrid_verify_graph_t4 = graph_t4;
+                self.hybrid_verify_graph_t3_disabled = disabled_t3;
+                self.hybrid_verify_graph_t4_disabled = disabled_t4;
+            }
+        })
     }
 
     /// Fused decode step: six launches per layer instead of nine. The
@@ -8045,11 +8691,17 @@ impl Model {
             samp_step: dev.alloc(cap * 8, MemKind::Device, Pool::Activations)?,
             pinned_samp: pin(cap * (4 * 4 + 2 * 8))?,
             pen_ids: f32b(cap * max_seq)?,
+            pen_counts: f32b(cap * max_seq)?,
             pen_offsets: f32b(cap + 1)?,
             pen_vals: f32b(cap)?,
+            pen_frequency: f32b(cap)?,
+            pen_presence: f32b(cap)?,
             pinned_pen_ids: pin(cap * max_seq * 4)?,
+            pinned_pen_counts: pin(cap * max_seq * 4)?,
             pinned_pen_offsets: pin((cap + 1) * 4)?,
             pinned_pen_vals: pin(cap * 4)?,
+            pinned_pen_frequency: pin(cap * 4)?,
+            pinned_pen_presence: pin(cap * 4)?,
             out_ids: f32b(cap)?,
             pinned_out: pin(cap * 4)?,
         });
@@ -8503,25 +9155,30 @@ impl Model {
         let bb = self.batch_bufs.as_ref().expect("provisioned");
         let stream = &self.stream;
 
-        // Repetition penalty (skipped when no sequence has one active).
+        // Jedno uruchomienie kernela obsługuje wszystkie aktywne kary batcha.
         let any_penalty = params
             .iter()
-            .any(|p| p.penalty != 1.0 && !p.penalty_ids.is_empty());
+            .any(|p| !p.penalty_ids.is_empty());
         if any_penalty {
             let mut ids_flat: Vec<i32> = Vec::new();
+            let mut counts_flat: Vec<i32> = Vec::new();
             let mut offsets: Vec<i32> = Vec::with_capacity(b + 1);
             let mut vals: Vec<f32> = Vec::with_capacity(b);
+            let mut frequency: Vec<f32> = Vec::with_capacity(b);
+            let mut presence: Vec<f32> = Vec::with_capacity(b);
             offsets.push(0);
             for p in params.iter() {
-                if p.penalty != 1.0 {
-                    ids_flat.extend_from_slice(&p.penalty_ids);
+                if p.penalty_ids.len() != p.penalty_counts.len() {
+                    return Err(ForgeError::Scheduler(
+                        "penalty histogram ids/counts length mismatch".into(),
+                    ));
                 }
+                ids_flat.extend_from_slice(&p.penalty_ids);
+                counts_flat.extend_from_slice(&p.penalty_counts);
                 offsets.push(ids_flat.len() as i32);
-                vals.push(if p.penalty_ids.is_empty() {
-                    1.0
-                } else {
-                    p.penalty
-                });
+                vals.push(p.penalty);
+                frequency.push(p.frequency_penalty);
+                presence.push(p.presence_penalty);
             }
             if ids_flat.len() * 4 > bb.pinned_pen_ids.len() {
                 return Err(ForgeError::Scheduler("penalty id staging overflow".into()));
@@ -8531,6 +9188,13 @@ impl Model {
                 &bb.pinned_pen_ids,
                 &bb.pen_ids,
                 bytemuck::cast_slice(&ids_flat),
+                stream,
+            )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_counts,
+                &bb.pen_counts,
+                bytemuck::cast_slice(&counts_flat),
                 stream,
             )?;
             Self::stage(
@@ -8547,12 +9211,29 @@ impl Model {
                 bytemuck::cast_slice(&vals),
                 stream,
             )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_frequency,
+                &bb.pen_frequency,
+                bytemuck::cast_slice(&frequency),
+                stream,
+            )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_presence,
+                &bb.pen_presence,
+                bytemuck::cast_slice(&presence),
+                stream,
+            )?;
             self.kernels.sample_batched_penalize_f32(
                 &bb.logits,
                 vocab,
                 &bb.pen_ids,
+                &bb.pen_counts,
                 &bb.pen_offsets,
                 &bb.pen_vals,
+                &bb.pen_frequency,
+                &bb.pen_presence,
                 b,
                 stream,
             )?;
@@ -8645,8 +9326,9 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        finish_greedy_verification, logical_kv_regions, native_mtp_greedy_decision, ForgeError,
-        KvCache, KvConfig, KvQuant, Result, SeqKv,
+        finish_greedy_verification, hybrid_prefill_profile_spans, hybrid_q_full_cols,
+        logical_kv_regions, native_mtp_greedy_decision, restore_after, ForgeError, KvCache,
+        KvConfig, KvQuant, Result, SeqKv,
     };
     use forge_hal::cpu::CpuDevice;
 
@@ -8718,5 +9400,32 @@ mod verify_rollback_tests {
             native_mtp_greedy_decision(&[11, 12, 13], &[11, 20, 99, 99]),
             (1, 20)
         );
+    }
+
+    #[test]
+    fn profil_prefill_sumuje_wewnetrzne_chunki_kazdego_outer_chunku() {
+        assert_eq!(hybrid_prefill_profile_spans(1, 128), 1);
+        assert_eq!(hybrid_prefill_profile_spans(1024, 128), 8);
+        assert_eq!(hybrid_prefill_profile_spans(1025, 128), 9);
+        assert_eq!(hybrid_prefill_profile_spans(1153, 128), 10);
+        assert_eq!(hybrid_prefill_profile_spans(2048, 128), 16);
+    }
+
+    #[test]
+    fn scratch_join_mtp_miesci_dwa_wektory_hidden() {
+        assert_eq!(hybrid_q_full_cols(8, 12, 10), 20);
+        assert_eq!(hybrid_q_full_cols(16, 12, 10), 32);
+        assert_eq!(hybrid_q_full_cols(8, 40, 10), 40);
+    }
+
+    #[test]
+    fn restore_wykonuje_sie_takze_po_bledzie() {
+        let mut restored = false;
+        let result: Result<()> = restore_after(
+            Err(ForgeError::Kernel("wymuszony błąd prefill".into())),
+            || restored = true,
+        );
+        assert!(result.is_err());
+        assert!(restored);
     }
 }

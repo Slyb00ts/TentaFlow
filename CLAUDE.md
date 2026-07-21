@@ -481,6 +481,28 @@ coherent Polish on the RTX 4090.
   jest 1,8-3,2x szybszy od starego B1 F16. Prose128/prose512, repeat i natywne
   MTP zachowują parity po ujednoliceniu serial i verifier na tej matematyce.
 
+## Hybrydowy prefill i catch-up MTP
+
+- Hybrydowy target wykonuje prefill w macierzowych chunkach na GPU. Dynamiczne
+  kernele DeltaNet obsługują pełne chunki, a stan rekurencyjny jest zatwierdzany
+  po każdym z nich bez sekwencyjnego powrotu przez CPU.
+- Natywny proposer MTP ze współdzielonym embeddingiem targetu wykonuje catch-up
+  całego zaakceptowanego prefiksu jednym batchem. Scalony norm/join i dokładna
+  projekcja Q8 przygotowują wejście, po czym aktualizowane są tylko K/V i carry;
+  dedykowany embedding MTP pozostaje na legalnej ścieżce sekwencyjnej.
+- Tymczasowa zamiana buforów prefill/verifier zawsze odtwarza bufory i grafy
+  decode także po błędzie. Profilowanie liczy osobne spany dla każdego
+  wewnętrznego chunka, również gdy prompt przekracza zewnętrzny limit 1024.
+- Hybrydowe modele z natywnym MTP rezerwują 1152 MiB puli aktywacji, aby pomieścić
+  jednocześnie bufory prefill, verifiera, stany DeltaNet i batched catch-up.
+
+## Histogramowy sampling GPU
+
+- Aktywne kary repetition, frequency i presence są nakładane jednym kernelem
+  histogramowym, po którym działa istniejąca równoległa selekcja argmax lub top-k.
+- Domyślna ścieżka greedy bez kar nie wykonuje dodatkowego uruchomienia kernela,
+  alokacji ani synchronizacji.
+
 ## Conventions
 
 - Code comments, variable/function names, commit messages: **English**. Commit format:

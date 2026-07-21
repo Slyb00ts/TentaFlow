@@ -21,11 +21,15 @@
     "deltanet_prepare_t2_f16": {"file": "deltanet_prepare_t2_f16.ptx", "entry": "src_deltanet_verify_deltanet_p6A6A6A6A_10e47efe268b6210"},
     "deltanet_prepare_t3_f16": {"file": "deltanet_prepare_t3_f16.ptx", "entry": "src_deltanet_verify_deltanet_p6A6A6A6A_dff5e27b27b65fe5"},
     "deltanet_prepare_t4_f16": {"file": "deltanet_prepare_t4_f16.ptx", "entry": "src_deltanet_verify_deltanet_p6A6A6A6A_3b1914a8da88d64f"},
+    "deltanet_prepare_dynamic_f16": {"file": "deltanet_prepare_dynamic_f16.ptx", "entry": "src_deltanet_verify_deltanet_p6A6A6A6A_0e1ff068fdd86f93"},
     "deltanet_gated_scan_t2_f16": {"file": "deltanet_gated_scan_t2_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_9d4d95c4f691c846"},
     "deltanet_gated_scan_t3_f16": {"file": "deltanet_gated_scan_t3_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_b0c92df55fc2c59f"},
     "deltanet_gated_scan_t4_f16": {"file": "deltanet_gated_scan_t4_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_92c53241240f88b1"},
     "deltanet_gated_scan_t3_d128_f16": {"file": "deltanet_gated_scan_t3_d128_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_0191308c62cba267"},
     "deltanet_gated_scan_t4_d128_f16": {"file": "deltanet_gated_scan_t4_d128_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_ed3fa945b5aefae5"},
+    "deltanet_gated_scan_dynamic_f16": {"file": "deltanet_gated_scan_dynamic_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_4405620bb4f91f28"},
+    "deltanet_gated_scan_dynamic_d128_f16": {"file": "deltanet_gated_scan_dynamic_d128_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_51255c8a4ba36e43"},
+    "deltanet_gated_scan_inplace_dynamic_d128_f16": {"file": "deltanet_gated_scan_inplace_dynamic_d128_f16.ptx", "entry": "src_deltanet_verify_deltanet_g6A6A6A6A_057ead43f52588d7"},
     "deltanet_commit_checkpoint_f32": {"file": "deltanet_commit_checkpoint_f32.ptx", "entry": "src_deltanet_verify_deltanet_c6A6A6A6A_8ec1bb79ea17f1b6"},
     "deltanet_gated_rmsnorm_f16": {"file": "deltanet_gated_rmsnorm_f16.ptx", "entry": "src_deltanet_deltanet_gated_rm6A6A6A6A_ff97e06e032c05b9"},
     "deltanet_log_decay_f32": {"file": "deltanet_log_decay_f32.ptx", "entry": "src_deltanet_deltanet_log_deca6A6A6A6A_b1701032c3d1d823"},
@@ -35,6 +39,8 @@
     "gemv_nvfp4_gguf_q8_1_f16": {"file": "gemv_nvfp4_gguf_q8_1_f16.ptx", "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_fc8b310057cef5b3"},
     "mtp_prepare_f16": {"file": "mtp_prepare_f16.ptx", "entry": "src_mtp_mtp_prepare_f16_Poin6A6A6A6AoA6A6A_2335e5195b068162"},
     "mtp_stage_step": {"file": "mtp_stage_step.ptx", "entry": "src_mtp_mtp_stage_step_Point6A6A6A6AoA6A6A_cfcb594e0fe66fee"},
+    "mtp_norm_join_shifted_f16": {"file": "mtp_norm_join_shifted_f16.ptx", "entry": "src_mtp_mtp_norm_join_shifted_6A6A6A6A_42eb18dea87d42b8"},
+    "mtp_project_joined_q8_f16": {"file": "mtp_project_joined_q8_f16.ptx", "entry": "src_mtp_mtp_project_joined_q8_6A6A6A6A_67d9a2322a757a13"},
     "gather_f16_row_f16": {"file": "gather_f16_row_f16.ptx", "entry": "src_mtp_gather_f16_row_f16_P6A6A6A6AoA6A6A_f4fbea8880da4c48"},
     "gather_q8_0_row_f16": {"file": "gather_q8_0_row_f16.ptx", "entry": "src_mtp_gather_q8_0_row_f166A6A6A6AoA6A6A_59690f8d4404073c"},
     "gather_nvfp4_gguf_row_f16": {"file": "gather_nvfp4_gguf_row_f16.ptx", "entry": "src_mtp_gather_nvfp4_gguf_row_6A6A6A6A_d3ab211b73aa8f15"},
@@ -178,7 +184,7 @@
     "argmax_final_f32": {"file": "argmax_final_f32.ptx", "entry": "src_sampling_argmax_final_f326A6A6A6AoA_3be698e5d78db4da"},
     "topk_partial_f32": {"file": "topk_partial_f32.ptx", "entry": "src_sampling_topk_partial_f326A6A6A6AoA_e34c5ac66b81ea93"},
     "topk_final_f32": {"file": "topk_final_f32.ptx", "entry": "src_sampling_topk_final_f326A6A6A6AoA6A6A_d1b1b5166cf186bc"},
-    "penalize_batched_f32": {"file": "penalize_batched_f32.ptx", "entry": "src_sampling_penalize_batched_6A6A6A6A_54cd1faa6b5c1f15"},
+    "penalize_batched_f32": {"file": "penalize_batched_f32.ptx", "entry": "src_sampling_penalize_batched_6A6A6A6A_4d727debc52486b8"},
     "argmax_batched_f32": {"file": "argmax_batched_f32.ptx", "entry": "src_sampling_argmax_batched_f36A6A6A6A_6235ea989779b294"},
     "topk_batched_f32": {"file": "topk_batched_f32.ptx", "entry": "src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b"},
     "moe_router_f16": {"file": "moe_router_f16.ptx", "entry": "src_moe_moe_router_f16_Point6A6A6A6AoA6A6A_3a6f89b08b39ed3c"},
@@ -366,6 +372,8 @@
     "gemv_batch_f16_out_f32_b4": {"file": "gemv_batch_f16_out_f32_b4.ptx", "entry": "src_nvfp4_batch_gemv_batch_f166A6A6A6A_fe2ad2e9bb43fde0"},
     "gemv_batch_f16_out_f32_b8": {"file": "gemv_batch_f16_out_f32_b8.ptx", "entry": "src_nvfp4_batch_gemv_batch_f166A6A6A6A_b9dc9fad3d4f86d4"},
     "gemm_nvfp4_f16_bm32": {"file": "gemm_nvfp4_f16_bm32.ptx", "entry": "src_gemm_gemm_nvfp4_impl_SIM6A6A6A6AcB6A6A_0b8cbb17c0045ac3"},
-    "gemm_f16_out_f32_bm32": {"file": "gemm_f16_out_f32_bm32.ptx", "entry": "src_gemm_gemm_f16_out_f32_impl6A6A6A6A_b4bd4a26e48d3a98"}
+    "gemm_f16_out_f32_bm32": {"file": "gemm_f16_out_f32_bm32.ptx", "entry": "src_gemm_gemm_f16_out_f32_impl6A6A6A6A_b4bd4a26e48d3a98"},
+    "penalized_argmax_f32": {"file": "penalized_argmax_f32.ptx", "entry": "src_sampling_penalized_argmax_6A6A6A6A_26d3e3f112a17738"},
+    "penalize_histogram_f32": {"file": "penalize_histogram_f32.ptx", "entry": "src_sampling_penalize_histogra6A6A6A6A_136367abaa57d942"}
   }
 }

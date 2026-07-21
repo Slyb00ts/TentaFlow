@@ -343,11 +343,21 @@ pub trait Device: Send + Sync {
 
     fn create_event(&self) -> Result<Event>;
 
+    /// Zdarzenie z licznikiem czasu, używane tylko przez profilowanie.
+    fn create_timing_event(&self) -> Result<Event> {
+        self.create_event()
+    }
+
     /// Record `event` at the current tail of `stream`.
     fn record_event(&self, event: &Event, stream: &Stream) -> Result<()>;
 
     /// Make future work on `stream` wait until `event` completes.
     fn wait_event(&self, stream: &Stream, event: &Event) -> Result<()>;
+
+    /// Czas GPU między zdarzeniami. `None` oznacza backend bez liczników czasu.
+    fn elapsed_event_ms(&self, _start: &Event, _end: &Event) -> Result<Option<f32>> {
+        Ok(None)
+    }
 
     /// Stream-ordered copy between buffers; direction (H2D/D2H/D2D/H2H) is
     /// derived from the buffers' `MemKind`s. Host-side endpoints must be

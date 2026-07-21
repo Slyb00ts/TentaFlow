@@ -104,7 +104,7 @@ fn run_pass_ids(
         0,
         PoolSizes {
             weights: 8 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant, false).max(1 << 30),
             activations: 1 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -121,6 +121,7 @@ fn run_pass_ids(
             kv_quant,
             kv_tier: Default::default(),
             prefix_cache: false,
+            native_mtp: false,
         },
     )
     .expect("load model");

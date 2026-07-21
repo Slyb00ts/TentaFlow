@@ -18,7 +18,7 @@
 	.param .u64 src_sampling_argmax_final_f326A6A6A6AoA_3be698e5d78db4da_param_4
 )
 {
-	.reg .pred 	%p<15>;
+	.reg .pred 	%p<17>;
 	.reg .b32 	%r<22>;
 	.reg .b64 	%rd<20>;
 	// demoted variable
@@ -55,14 +55,16 @@ $L__BB0_2:
 	ld.global.s32 	%rd15, [%rd14];
 	setp.gt.s64 	%p3, %rd17, %rd15;
 	and.pred 	%p4, %p2, %p3;
-	setp.gt.f32 	%p5, %r8, %r19;
-	or.pred 	%p6, %p5, %p4;
-	selp.f32 	%r19, %r8, %r19, %p6;
-	selp.b64 	%rd17, %rd15, %rd17, %p6;
+	setp.eq.b64 	%p5, %rd17, 2147483647;
+	setp.gt.f32 	%p6, %r8, %r19;
+	or.pred 	%p7, %p5, %p6;
+	or.pred 	%p8, %p7, %p4;
+	selp.f32 	%r19, %r8, %r19, %p8;
+	selp.b64 	%rd17, %rd15, %rd17, %p8;
 	add.s64 	%rd18, %rd18, %rd5;
 	add.s64 	%rd16, %rd16, %rd7;
-	setp.lt.s64 	%p7, %rd18, %rd8;
-	@%p7 bra 	$L__BB0_2;
+	setp.lt.s64 	%p9, %rd18, %rd8;
+	@%p9 bra 	$L__BB0_2;
 	cvt.u32.u64 	%r20, %rd17;
 $L__BB0_4:
 	cvt.u32.u64 	%r9, %rd6;
@@ -77,8 +79,8 @@ $L__BB0_4:
 	st.shared.b32 	[%r2], %r20;
 	bar.sync 	0;
 	shr.u32 	%r21, %r10, 1;
-	setp.eq.b32 	%p8, %r21, 0;
-	@%p8 bra 	$L__BB0_12;
+	setp.eq.b32 	%p10, %r21, 0;
+	@%p10 bra 	$L__BB0_12;
 	cvt.u64.u32 	%rd19, %r21;
 	bra.uni 	$L__BB0_6;
 $L__BB0_10:
@@ -88,28 +90,28 @@ $L__BB0_11:
 	bar.sync 	0;
 	shr.u64 	%rd19, %rd19, 1;
 	cvt.u32.u64 	%r21, %rd19;
-	setp.ne.b64 	%p13, %rd19, 0;
-	@!%p13 bra 	$L__BB0_12;
+	setp.ne.b64 	%p15, %rd19, 0;
+	@!%p15 bra 	$L__BB0_12;
 $L__BB0_6:
-	setp.le.u64 	%p9, %rd19, %rd6;
-	@%p9 bra 	$L__BB0_11;
+	setp.le.u64 	%p11, %rd19, %rd6;
+	@%p11 bra 	$L__BB0_11;
 	shl.b32 	%r14, %r21, 2;
 	add.s32 	%r15, %r2, %r14;
 	add.s32 	%r16, %r1, %r14;
 	ld.shared.b32 	%r3, [%r16];
 	ld.shared.b32 	%r4, [%r15];
 	ld.shared.b32 	%r5, [%r1];
-	setp.gt.f32 	%p10, %r3, %r5;
-	@%p10 bra 	$L__BB0_10;
-	setp.neu.f32 	%p11, %r3, %r5;
-	@%p11 bra 	$L__BB0_11;
+	setp.gt.f32 	%p12, %r3, %r5;
+	@%p12 bra 	$L__BB0_10;
+	setp.neu.f32 	%p13, %r3, %r5;
+	@%p13 bra 	$L__BB0_11;
 	ld.shared.b32 	%r17, [%r2];
-	setp.ge.s32 	%p12, %r4, %r17;
-	@%p12 bra 	$L__BB0_11;
+	setp.ge.s32 	%p14, %r4, %r17;
+	@%p14 bra 	$L__BB0_11;
 	bra.uni 	$L__BB0_10;
 $L__BB0_12:
-	setp.ne.b32 	%p14, %r9, 0;
-	@%p14 bra 	$L__BB0_14;
+	setp.ne.b32 	%p16, %r9, 0;
+	@%p16 bra 	$L__BB0_14;
 	ld.shared.b32 	%r18, [src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_1_$__gpu_shared_mem];
 	st.global.b32 	[%rd3], %r18;
 	st.global.b32 	[%rd4], 0;

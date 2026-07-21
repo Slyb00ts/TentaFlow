@@ -24,9 +24,9 @@
 	.param .u64 .ptr .align 1 src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_param_8
 )
 {
-	.reg .pred 	%p<31>;
-	.reg .b32 	%r<69>;
-	.reg .b64 	%rd<69>;
+	.reg .pred 	%p<41>;
+	.reg .b32 	%r<72>;
+	.reg .b64 	%rd<67>;
 	// demoted variable
 	.shared .align 4 .b8 src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_0_$__gpu_shared_mem[1024];
 	// demoted variable
@@ -52,261 +52,282 @@
 	cvta.to.global.u64 	%rd30, %rd27;
 	cvta.to.global.u64 	%rd31, %rd24;
 	cvta.to.global.u64 	%rd1, %rd19;
-	mov.u32 	%r14, %ctaid.x;
-	mov.u32 	%r15, %tid.x;
-	cvt.u64.u32 	%rd3, %r15;
-	mul.wide.u32 	%rd32, %r14, 4;
+	mov.u32 	%r15, %ctaid.x;
+	mov.u32 	%r16, %tid.x;
+	cvt.u64.u32 	%rd3, %r16;
+	mul.wide.u32 	%rd32, %r15, 4;
 	add.s64 	%rd34, %rd31, %rd32;
-	ld.global.b32 	%r17, [%rd34];
-	min.s32 	%r18, %r17, 64;
-	cvt.s64.s32 	%rd35, %r18;
-	min.s64 	%rd66, %rd16, %rd35;
-	max.s64 	%rd64, %rd66, 0;
-	setp.lt.s64 	%p1, %rd66, 1;
-	cvt.u32.u64 	%r53, %rd3;
-	mov.b32 	%r57, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
-	@%p1 bra 	$L__BB0_17;
-	cvt.u64.u32 	%rd2, %r14;
-	mov.u32 	%r16, %ntid.x;
-	cvt.u64.u32 	%rd4, %r16;
-	cvt.u32.u64 	%r19, %rd4;
-	max.u64 	%rd36, %rd64, 1;
-	add.s64 	%rd55, %rd36, -1;
+	ld.global.b32 	%r18, [%rd34];
+	min.s32 	%r19, %r18, 64;
+	cvt.s64.s32 	%rd35, %r19;
+	min.s64 	%rd64, %rd16, %rd35;
+	max.s64 	%rd62, %rd64, 0;
+	setp.lt.s64 	%p3, %rd64, 1;
+	cvt.u32.u64 	%r55, %rd3;
+	mov.b32 	%r60, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
+	@%p3 bra 	$L__BB0_20;
+	cvt.u64.u32 	%rd2, %r15;
+	mov.u32 	%r17, %ntid.x;
+	cvt.u64.u32 	%rd4, %r17;
+	cvt.u32.u64 	%r20, %rd4;
+	max.u64 	%rd36, %rd62, 1;
+	add.s64 	%rd53, %rd36, -1;
 	mul.lo.s64 	%rd37, %rd16, %rd2;
 	shl.b64 	%rd38, %rd37, 2;
 	add.s64 	%rd11, %rd1, %rd38;
-	shl.b32 	%r20, %r53, 2;
-	mov.b32 	%r21, src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_0_$__gpu_shared_mem;
-	add.s32 	%r1, %r21, %r20;
-	mov.b32 	%r22, src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_1_$__gpu_shared_mem;
-	add.s32 	%r2, %r22, %r20;
-	shr.u32 	%r3, %r19, 1;
+	shl.b32 	%r21, %r55, 2;
+	mov.b32 	%r22, src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_0_$__gpu_shared_mem;
+	add.s32 	%r1, %r22, %r21;
+	mov.b32 	%r23, src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_1_$__gpu_shared_mem;
+	add.s32 	%r2, %r23, %r21;
+	shr.u32 	%r3, %r20, 1;
 	cvt.u64.u32 	%rd12, %r3;
-	shl.b64 	%rd39, %rd3, 2;
-	add.s64 	%rd40, %rd38, %rd39;
-	add.s64 	%rd13, %rd1, %rd40;
-	shl.b64 	%rd14, %rd4, 2;
-	setp.le.s64 	%p2, %rd16, %rd3;
-	mov.b32 	%r25, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_1_$__gpu_shared_mem;
-	setp.eq.b32 	%p9, %r3, 0;
-	mov.b64 	%rd56, %rd64;
+	setp.le.s64 	%p4, %rd16, %rd3;
+	mov.b32 	%r26, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_1_$__gpu_shared_mem;
+	mov.b64 	%rd54, %rd62;
 	bra.uni 	$L__BB0_2;
-$L__BB0_14:
-	setp.ne.b32 	%p15, %r53, 0;
-	@!%p15 bra 	$L__BB0_15;
-$L__BB0_16:
+$L__BB0_17:
+	setp.ne.b32 	%p23, %r55, 0;
+	@!%p23 bra 	$L__BB0_18;
+$L__BB0_19:
 	bar.sync 	0;
-	add.s64 	%rd55, %rd15, -1;
-	setp.ne.b64 	%p16, %rd15, 0;
-	mov.b64 	%rd56, %rd15;
-	@!%p16 bra 	$L__BB0_17;
+	add.s64 	%rd53, %rd13, -1;
+	setp.ne.b64 	%p24, %rd13, 0;
+	mov.b64 	%rd54, %rd13;
+	@!%p24 bra 	$L__BB0_20;
 $L__BB0_2:
-	mov.b64 	%rd15, %rd55;
-	mov.b32 	%r55, 2147483647;
-	mov.b32 	%r54, 0fFF7FFFFF;
-	@%p2 bra 	$L__BB0_6;
-	mov.b32 	%r54, 0fFF7FFFFF;
-	mov.b64 	%rd58, 2147483647;
-	mov.b64 	%rd57, %rd13;
-	mov.b64 	%rd59, %rd3;
+	mov.b64 	%rd13, %rd53;
+	sub.s64 	%rd14, %rd62, %rd54;
+	mov.b32 	%r58, 2147483647;
+	mov.b32 	%r57, 0fFF7FFFFF;
+	@%p4 bra 	$L__BB0_9;
+	max.s64 	%rd15, %rd14, 0;
+	mov.b32 	%r57, 0fFF7FFFFF;
+	mov.b64 	%rd55, 2147483647;
+	setp.lt.s64 	%p5, %rd14, 1;
+	mov.b64 	%rd56, %rd3;
+	bra.uni 	$L__BB0_4;
+$L__BB0_7:
+	and.pred 	%p14, %p2, %p1;
+	or.pred 	%p15, %p40, %p14;
+	selp.f32 	%r57, %r57, %r29, %p15;
+	selp.b64 	%rd55, %rd55, %rd56, %p15;
+	add.s64 	%rd56, %rd56, %rd4;
+	setp.lt.s64 	%p16, %rd56, %rd16;
+	@!%p16 bra 	$L__BB0_8;
 $L__BB0_4:
-	setp.lt.s64 	%p3, %rd59, %rd58;
-	ld.global.b32 	%r26, [%rd57];
-	setp.eq.f32 	%p4, %r26, %r54;
-	and.pred 	%p5, %p4, %p3;
-	setp.gt.f32 	%p6, %r26, %r54;
-	or.pred 	%p7, %p6, %p5;
-	selp.f32 	%r54, %r26, %r54, %p7;
-	selp.b64 	%rd58, %rd59, %rd58, %p7;
-	add.s64 	%rd59, %rd59, %rd4;
-	add.s64 	%rd57, %rd57, %rd14;
-	setp.lt.s64 	%p8, %rd59, %rd16;
-	@%p8 bra 	$L__BB0_4;
-	cvt.u32.u64 	%r55, %rd58;
+	setp.ge.s64 	%p6, %rd56, %rd55;
+	setp.ne.b64 	%p7, %rd55, 2147483647;
+	shl.b64 	%rd39, %rd56, 2;
+	add.s64 	%rd40, %rd11, %rd39;
+	ld.global.b32 	%r27, [%rd40];
+	setp.lt.f32 	%p8, %r27, 0fFF7FFFFF;
+	setp.nan.f32 	%p9, %r27, %r27;
+	selp.f32 	%r28, 0fFF7FFFFF, %r27, %p8;
+	selp.f32 	%r29, 0fFF7FFFFF, %r28, %p9;
+	setp.neu.f32 	%p10, %r29, %r57;
+	or.pred 	%p1, %p10, %p6;
+	setp.leu.f32 	%p11, %r29, %r57;
+	and.pred 	%p2, %p7, %p11;
+	mov.pred 	%p40, 0;
+	@%p5 bra 	$L__BB0_7;
+	mov.pred 	%p40, 0;
+	mov.b32 	%r56, %r26;
+	mov.b64 	%rd57, %rd15;
 $L__BB0_6:
+	add.s64 	%rd57, %rd57, -1;
+	ld.shared.s32 	%rd41, [%r56];
+	setp.eq.b64 	%p12, %rd56, %rd41;
+	or.pred 	%p40, %p12, %p40;
+	add.s32 	%r56, %r56, 4;
+	setp.ne.b64 	%p13, %rd57, 0;
+	@%p13 bra 	$L__BB0_6;
+	bra.uni 	$L__BB0_7;
+$L__BB0_8:
+	cvt.u32.u64 	%r58, %rd55;
+$L__BB0_9:
+	setp.eq.b32 	%p17, %r3, 0;
 	bar.sync 	0;
-	st.shared.b32 	[%r1], %r54;
-	st.shared.b32 	[%r2], %r55;
+	st.shared.b32 	[%r1], %r57;
+	st.shared.b32 	[%r2], %r58;
 	bar.sync 	0;
-	@%p9 bra 	$L__BB0_14;
-	mov.b32 	%r56, %r3;
-	mov.b64 	%rd60, %rd12;
-	bra.uni 	$L__BB0_8;
-$L__BB0_12:
+	@%p17 bra 	$L__BB0_17;
+	mov.b32 	%r59, %r3;
+	mov.b64 	%rd58, %rd12;
+	bra.uni 	$L__BB0_11;
+$L__BB0_15:
 	st.shared.b32 	[%r1], %r6;
 	st.shared.b32 	[%r2], %r7;
-$L__BB0_13:
+$L__BB0_16:
 	bar.sync 	0;
-	shr.u64 	%rd60, %rd60, 1;
-	cvt.u32.u64 	%r56, %rd60;
-	setp.ne.b64 	%p14, %rd60, 0;
-	@!%p14 bra 	$L__BB0_14;
-$L__BB0_8:
-	setp.le.u64 	%p10, %rd60, %rd3;
-	@%p10 bra 	$L__BB0_13;
-	shl.b32 	%r27, %r56, 2;
-	add.s32 	%r28, %r2, %r27;
-	add.s32 	%r29, %r1, %r27;
-	ld.shared.b32 	%r6, [%r29];
-	ld.shared.b32 	%r7, [%r28];
+	shr.u64 	%rd58, %rd58, 1;
+	cvt.u32.u64 	%r59, %rd58;
+	setp.ne.b64 	%p22, %rd58, 0;
+	@!%p22 bra 	$L__BB0_17;
+$L__BB0_11:
+	setp.le.u64 	%p18, %rd58, %rd3;
+	@%p18 bra 	$L__BB0_16;
+	shl.b32 	%r30, %r59, 2;
+	add.s32 	%r31, %r2, %r30;
+	add.s32 	%r32, %r1, %r30;
+	ld.shared.b32 	%r6, [%r32];
+	ld.shared.b32 	%r7, [%r31];
 	ld.shared.b32 	%r8, [%r1];
-	setp.gt.f32 	%p11, %r6, %r8;
-	@%p11 bra 	$L__BB0_12;
-	setp.neu.f32 	%p12, %r6, %r8;
-	@%p12 bra 	$L__BB0_13;
-	ld.shared.b32 	%r30, [%r2];
-	setp.ge.s32 	%p13, %r7, %r30;
-	@%p13 bra 	$L__BB0_13;
-	bra.uni 	$L__BB0_12;
-$L__BB0_15:
-	sub.s64 	%rd41, %rd64, %rd56;
-	cvt.u32.u64 	%r23, %rd41;
-	shl.b32 	%r24, %r23, 2;
-	add.s32 	%r4, %r25, %r24;
-	add.s32 	%r5, %r57, %r24;
-	ld.shared.b32 	%r31, [src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_0_$__gpu_shared_mem];
-	ld.shared.b32 	%r32, [src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_1_$__gpu_shared_mem];
-	mul.wide.s32 	%rd42, %r32, 4;
-	add.s64 	%rd43, %rd11, %rd42;
-	st.shared.b32 	[%r5], %r31;
-	st.shared.b32 	[%r4], %r32;
-	st.global.b32 	[%rd43], -8388609;
-	bra.uni 	$L__BB0_16;
-$L__BB0_17:
-	setp.ne.b32 	%p17, %r53, 0;
-	@%p17 bra 	$L__BB0_30;
+	setp.gt.f32 	%p19, %r6, %r8;
+	@%p19 bra 	$L__BB0_15;
+	setp.neu.f32 	%p20, %r6, %r8;
+	@%p20 bra 	$L__BB0_16;
+	ld.shared.b32 	%r33, [%r2];
+	setp.ge.s32 	%p21, %r7, %r33;
+	@%p21 bra 	$L__BB0_16;
+	bra.uni 	$L__BB0_15;
+$L__BB0_18:
+	cvt.u32.u64 	%r24, %rd14;
+	shl.b32 	%r25, %r24, 2;
+	add.s32 	%r4, %r26, %r25;
+	add.s32 	%r5, %r60, %r25;
+	ld.shared.b32 	%r34, [src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_0_$__gpu_shared_mem];
+	ld.shared.b32 	%r35, [src_sampling__block_argmax_S6A6A6A6AoA6A6A_c46fb3681a17c606_$__global_alloc_1_$__gpu_shared_mem];
+	st.shared.b32 	[%r5], %r34;
+	st.shared.b32 	[%r4], %r35;
+	bra.uni 	$L__BB0_19;
+$L__BB0_20:
+	setp.ne.b32 	%p25, %r55, 0;
+	@%p25 bra 	$L__BB0_34;
+	add.s64 	%rd5, %rd18, %rd32;
+	ld.shared.b32 	%r9, [src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem];
+	setp.eq.f32 	%p26, %r9, 0fFF7FFFFF;
+	mov.b32 	%r64, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_1_$__gpu_shared_mem;
+	@%p26 bra 	$L__BB0_33;
 	add.s64 	%rd8, %rd26, %rd32;
 	add.s64 	%rd9, %rd29, %rd32;
-	ld.global.b32 	%r11, [%rd8];
-	@%p1 bra 	$L__BB0_23;
+	ld.global.b32 	%r12, [%rd8];
+	@%p3 bra 	$L__BB0_27;
 	add.s64 	%rd10, %rd30, %rd32;
-	ld.global.b32 	%r9, [%rd10];
-	ld.shared.b32 	%r33, [src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem];
-	mul.f32 	%r12, %r9, %r33;
-	mov.b32 	%r58, 0f00000000;
-	neg.f32 	%r37, %r12;
-	mov.b64 	%rd61, %rd64;
-$L__BB0_20:
-	add.s64 	%rd61, %rd61, -1;
-	ld.shared.b32 	%r36, [%r57];
-	fma.rn.f32 	%r38, %r9, %r36, %r37;
-	mul.f32 	%r35, %r38, 0f3FB8AA3B;
-	ex2.approx.ftz.f32 %r34, %r35;
-	st.shared.b32 	[%r57], %r34;
-	add.f32 	%r58, %r58, %r34;
-	add.s32 	%r57, %r57, 4;
-	setp.ne.b64 	%p18, %rd61, 0;
-	@%p18 bra 	$L__BB0_20;
-	mov.b32 	%r59, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
-	mov.b64 	%rd62, %rd64;
-$L__BB0_22:
-	add.s64 	%rd62, %rd62, -1;
-	ld.shared.b32 	%r39, [%r59];
-	div.rn.f32 	%r40, %r39, %r58;
-	st.shared.b32 	[%r59], %r40;
-	add.s32 	%r59, %r59, 4;
-	setp.ne.b64 	%p19, %rd62, 0;
-	@%p19 bra 	$L__BB0_22;
-$L__BB0_23:
-	add.s64 	%rd5, %rd18, %rd32;
-	ld.global.b32 	%r10, [%rd9];
-	setp.leu.f32 	%p20, %r11, 0f00000000;
-	@%p20 bra 	$L__BB0_31;
-	mov.b64 	%rd64, 0;
-	@%p1 bra 	$L__BB0_28;
-	ld.shared.b32 	%r41, [src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem];
-	mul.f32 	%r13, %r11, %r41;
-	mov.b64 	%rd63, 0;
-	mov.b32 	%r60, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
-$L__BB0_26:
-	ld.shared.b32 	%r42, [%r60];
-	setp.ltu.f32 	%p21, %r42, %r13;
-	mov.b64 	%rd64, %rd63;
-	@%p21 bra 	$L__BB0_28;
-	add.s64 	%rd63, %rd63, 1;
+	ld.global.b32 	%r10, [%rd10];
+	mul.f32 	%r13, %r9, %r10;
+	mov.b32 	%r61, 0f00000000;
+	neg.f32 	%r39, %r13;
+	mov.b64 	%rd59, %rd62;
+$L__BB0_24:
+	add.s64 	%rd59, %rd59, -1;
+	ld.shared.b32 	%r38, [%r60];
+	fma.rn.f32 	%r40, %r10, %r38, %r39;
+	mul.f32 	%r37, %r40, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 %r36, %r37;
+	st.shared.b32 	[%r60], %r36;
+	add.f32 	%r61, %r61, %r36;
 	add.s32 	%r60, %r60, 4;
-	setp.ne.b64 	%p22, %rd66, %rd63;
-	mov.b64 	%rd64, %rd66;
-	@%p22 bra 	$L__BB0_26;
-$L__BB0_28:
-	setp.ne.b64 	%p23, %rd64, 0;
-	mov.b32 	%r61, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_1_$__gpu_shared_mem;
-	mov.b64 	%rd66, %rd64;
-	@!%p23 bra 	$L__BB0_29;
-$L__BB0_31:
-	mul.wide.u32 	%rd33, %r14, 8;
-	setp.geu.f32 	%p24, %r10, 0f3F800000;
-	@%p24 bra 	$L__BB0_36;
-	mov.b32 	%r63, 0f00000000;
-	mov.b64 	%rd65, 0;
+	setp.ne.b64 	%p27, %rd59, 0;
+	@%p27 bra 	$L__BB0_24;
 	mov.b32 	%r62, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
-$L__BB0_33:
-	setp.eq.b64 	%p25, %rd64, %rd65;
-	@%p25 bra 	$L__BB0_36;
-	ld.shared.b32 	%r43, [%r62];
-	add.f32 	%r63, %r63, %r43;
-	setp.ltu.f32 	%p26, %r63, %r10;
-	add.s64 	%rd65, %rd65, 1;
+	mov.b64 	%rd60, %rd62;
+$L__BB0_26:
+	add.s64 	%rd60, %rd60, -1;
+	ld.shared.b32 	%r41, [%r62];
+	div.rn.f32 	%r42, %r41, %r61;
+	st.shared.b32 	[%r62], %r42;
 	add.s32 	%r62, %r62, 4;
-	@%p26 bra 	$L__BB0_33;
-	max.s64 	%rd64, %rd65, 0;
-	mov.b64 	%rd66, %rd65;
-$L__BB0_36:
+	setp.ne.b64 	%p28, %rd60, 0;
+	@%p28 bra 	$L__BB0_26;
+$L__BB0_27:
+	ld.global.b32 	%r11, [%rd9];
+	setp.leu.f32 	%p29, %r12, 0f00000000;
+	@%p29 bra 	$L__BB0_35;
+	mov.b64 	%rd62, 0;
+	@%p3 bra 	$L__BB0_32;
+	ld.shared.b32 	%r43, [src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem];
+	mul.f32 	%r14, %r12, %r43;
+	mov.b64 	%rd61, 0;
+	mov.b32 	%r63, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
+$L__BB0_30:
+	ld.shared.b32 	%r44, [%r63];
+	setp.ltu.f32 	%p30, %r44, %r14;
+	mov.b64 	%rd62, %rd61;
+	@%p30 bra 	$L__BB0_32;
+	add.s64 	%rd61, %rd61, 1;
+	add.s32 	%r63, %r63, 4;
+	setp.ne.b64 	%p31, %rd64, %rd61;
+	mov.b64 	%rd62, %rd64;
+	@%p31 bra 	$L__BB0_30;
+$L__BB0_32:
+	setp.ne.b64 	%p32, %rd62, 0;
+	mov.b64 	%rd64, %rd62;
+	@!%p32 bra 	$L__BB0_33;
+$L__BB0_35:
+	mul.wide.u32 	%rd33, %r15, 8;
+	setp.geu.f32 	%p33, %r11, 0f3F800000;
+	@%p33 bra 	$L__BB0_40;
+	mov.b32 	%r66, 0f00000000;
+	mov.b64 	%rd63, 0;
+	mov.b32 	%r65, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
+$L__BB0_37:
+	setp.eq.b64 	%p34, %rd62, %rd63;
+	@%p34 bra 	$L__BB0_40;
+	ld.shared.b32 	%r45, [%r65];
+	add.f32 	%r66, %r66, %r45;
+	setp.ltu.f32 	%p35, %r66, %r11;
+	add.s64 	%rd63, %rd63, 1;
+	add.s32 	%r65, %r65, 4;
+	@%p35 bra 	$L__BB0_37;
+	max.s64 	%rd62, %rd63, 0;
+	mov.b64 	%rd64, %rd63;
+$L__BB0_40:
 	add.s64 	%rd6, %rd21, %rd33;
 	add.s64 	%rd7, %rd23, %rd33;
-	setp.lt.s64 	%p27, %rd66, 1;
-	mov.b32 	%r65, 0f00000000;
-	@%p27 bra 	$L__BB0_39;
-	mov.b32 	%r65, 0f00000000;
-	mov.b32 	%r64, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
-	mov.b64 	%rd67, %rd64;
-$L__BB0_38:
-	add.s64 	%rd67, %rd67, -1;
-	ld.shared.b32 	%r44, [%r64];
-	add.f32 	%r65, %r65, %r44;
-	add.s32 	%r64, %r64, 4;
-	setp.ne.b64 	%p28, %rd67, 0;
-	@%p28 bra 	$L__BB0_38;
-$L__BB0_39:
-	ld.global.b64 	%rd44, [%rd7];
-	ld.global.b64 	%rd45, [%rd6];
-	mad.lo.s64 	%rd46, %rd45, -7046029254386353131, %rd44;
-	add.s64 	%rd47, %rd46, -7046029254386353131;
-	shr.u64 	%rd48, %rd47, 30;
-	xor.b64 	%rd49, %rd48, %rd47;
-	mul.lo.s64 	%rd50, %rd49, -4658895280553007687;
-	shr.u64 	%rd51, %rd50, 27;
-	xor.b64 	%rd52, %rd51, %rd50;
-	mul.lo.s64 	%rd53, %rd52, -7723592293110705685;
-	shr.u64 	%rd54, %rd53, 40;
-	cvt.rn.f32.u64 	%r45, %rd54;
-	mul.f32 	%r46, %r45, 0f33800000;
-	mul.f32 	%r67, %r65, %r46;
-	mov.b64 	%rd68, 0;
-	mov.b32 	%r66, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
-$L__BB0_40:
-	setp.ne.b64 	%p29, %rd64, %rd68;
-	@!%p29 bra 	$L__BB0_41;
-	ld.shared.b32 	%r47, [%r66];
-	sub.f32 	%r67, %r67, %r47;
-	setp.gtu.f32 	%p30, %r67, 0f00000000;
-	add.s64 	%rd68, %rd68, 1;
-	add.s32 	%r66, %r66, 4;
-	@%p30 bra 	$L__BB0_40;
-	cvt.u32.u64 	%r48, %rd68;
-	add.s32 	%r68, %r48, -1;
-	bra.uni 	$L__BB0_44;
-$L__BB0_41:
-	cvt.u32.u64 	%r49, %rd66;
-	add.s32 	%r68, %r49, -1;
+	setp.lt.s64 	%p36, %rd64, 1;
+	mov.b32 	%r68, 0f00000000;
+	@%p36 bra 	$L__BB0_43;
+	mov.b32 	%r68, 0f00000000;
+	mov.b32 	%r67, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
+	mov.b64 	%rd65, %rd62;
+$L__BB0_42:
+	add.s64 	%rd65, %rd65, -1;
+	ld.shared.b32 	%r46, [%r67];
+	add.f32 	%r68, %r68, %r46;
+	add.s32 	%r67, %r67, 4;
+	setp.ne.b64 	%p37, %rd65, 0;
+	@%p37 bra 	$L__BB0_42;
+$L__BB0_43:
+	ld.global.b64 	%rd42, [%rd7];
+	ld.global.b64 	%rd43, [%rd6];
+	mad.lo.s64 	%rd44, %rd43, -7046029254386353131, %rd42;
+	add.s64 	%rd45, %rd44, -7046029254386353131;
+	shr.u64 	%rd46, %rd45, 30;
+	xor.b64 	%rd47, %rd46, %rd45;
+	mul.lo.s64 	%rd48, %rd47, -4658895280553007687;
+	shr.u64 	%rd49, %rd48, 27;
+	xor.b64 	%rd50, %rd49, %rd48;
+	mul.lo.s64 	%rd51, %rd50, -7723592293110705685;
+	shr.u64 	%rd52, %rd51, 40;
+	cvt.rn.f32.u64 	%r47, %rd52;
+	mul.f32 	%r48, %r47, 0f33800000;
+	mul.f32 	%r70, %r68, %r48;
+	mov.b64 	%rd66, 0;
+	mov.b32 	%r69, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_0_$__gpu_shared_mem;
 $L__BB0_44:
-	shl.b32 	%r50, %r68, 2;
-	mov.b32 	%r51, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_1_$__gpu_shared_mem;
-	add.s32 	%r61, %r51, %r50;
-$L__BB0_29:
-	ld.shared.b32 	%r52, [%r61];
-	st.global.b32 	[%rd5], %r52;
-$L__BB0_30:
+	setp.ne.b64 	%p38, %rd62, %rd66;
+	@!%p38 bra 	$L__BB0_45;
+	ld.shared.b32 	%r49, [%r69];
+	sub.f32 	%r70, %r70, %r49;
+	setp.gtu.f32 	%p39, %r70, 0f00000000;
+	add.s64 	%rd66, %rd66, 1;
+	add.s32 	%r69, %r69, 4;
+	@%p39 bra 	$L__BB0_44;
+	cvt.u32.u64 	%r50, %rd66;
+	add.s32 	%r71, %r50, -1;
+	bra.uni 	$L__BB0_48;
+$L__BB0_45:
+	cvt.u32.u64 	%r51, %rd64;
+	add.s32 	%r71, %r51, -1;
+$L__BB0_48:
+	shl.b32 	%r52, %r71, 2;
+	mov.b32 	%r53, src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b_$__global_alloc_1_$__gpu_shared_mem;
+	add.s32 	%r64, %r53, %r52;
+$L__BB0_33:
+	ld.shared.b32 	%r54, [%r64];
+	st.global.b32 	[%rd5], %r54;
+$L__BB0_34:
 	ret;
 
 }

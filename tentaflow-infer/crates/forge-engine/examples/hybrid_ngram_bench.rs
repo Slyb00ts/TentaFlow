@@ -448,8 +448,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let max_seq_len = prompt_len + target + budget + 8;
     let free = CudaDevice::free_vram(0)?;
-    let activations = 1usize << 30;
-    let kv_cache = 64usize << 20;
+    let activations = if mtp_router {
+        9usize << 27
+    } else {
+        1usize << 30
+    };
+    let kv_cache = 256usize << 20;
     let reserve = 512usize << 20;
     let weights = free
         .checked_sub(activations + kv_cache + reserve)
