@@ -30,7 +30,7 @@
 // x264enc, który przesuwa timestampy), więc kontrakt publishera fMP4
 // (init segment + fragmenty) jest identyczny.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -294,6 +294,9 @@ pub(super) fn build_mjpeg_pipeline(
         tee,
         decode_tee: None,
         decode_tee_is_cuda: false,
+        // No dynamically-built hardware branch on this path — nothing can fail
+        // after PLAYING, so the session never has a definitive demote signal here.
+        branch_build_error: Arc::new(Mutex::new(None)),
     })
 }
 

@@ -12,7 +12,8 @@
 // exponential backoff (capped) and ±20% jitter — internal rtspsrc retry is
 // disabled so we control the policy at one layer only.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gstreamer as gst;
@@ -169,6 +170,16 @@ pub struct RtspPipelineHandles {
     /// ([`attach_rgb_branch_cuda`]) rather than start from host NV12
     /// ([`attach_rgb_branch`]).
     pub decode_tee_is_cuda: bool,
+    /// Set by the dynamic decoder build when the hardware branch could NOT be
+    /// constructed (no NVDEC element for this codec, or a link/state-change
+    /// failure). This is the only DEFINITIVE evidence that the current ingest
+    /// path cannot work here: the build runs on the streaming thread after the
+    /// pipeline is already PLAYING, so the failure never reaches the bus as an
+    /// error and the session would otherwise perceive it only as "no frames".
+    /// The session polls this to demote a rung immediately — and, conversely,
+    /// treats a warmup timeout WITHOUT this flag as a slow camera rather than as
+    /// proof that the decode chain is broken.
+    pub branch_build_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Którą ścieżką dekodowania budujemy pipeline dla bieżącej próby. `Cpu` to
@@ -205,7 +216,40 @@ impl IngestPath {
             IngestPath::Cpu => "CPU decode",
         }
     }
+
+    /// Slot in [`PATH_EVER_DELIVERED`].
+    fn index(self) -> usize {
+        match self {
+            IngestPath::GpuResidentNvidia => 0,
+            IngestPath::NvdecNv12 => 1,
+            IngestPath::NvdecCpuConvert => 2,
+            IngestPath::Cpu => 3,
+        }
+    }
+
+    /// Record that this path produced a frame — unlocks it as an upgrade target.
+    fn mark_delivered(self) {
+        PATH_EVER_DELIVERED[self.index()].store(true, Ordering::Relaxed);
+    }
+
+    /// Has this path ever delivered a frame in this process?
+    fn ever_delivered(self) -> bool {
+        PATH_EVER_DELIVERED[self.index()].load(Ordering::Relaxed)
+    }
 }
+
+/// Per-path record of "this ingest path has delivered at least one frame in THIS
+/// process", indexed by [`IngestPath::index`]. Process-wide on purpose: whether
+/// NVDEC can decode at all is a property of the build and the machine, not of one
+/// camera or one session, so the first camera to prove a path works clears it for
+/// everyone — and a path nothing has ever proven is never worth tearing down a
+/// healthy stream for.
+static PATH_EVER_DELIVERED: [AtomicBool; 4] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
 /// Whether the GPU-resident NV12 detect path is usable: the ort GPU detect
 /// features must be compiled (`detect_batch_gpu` exists to consume the raw NV12
@@ -1227,6 +1271,9 @@ fn build_rtsp_pipeline_cpu(
         tee,
         decode_tee: None,
         decode_tee_is_cuda: false,
+        // No dynamically-built hardware branch on this path — nothing can fail
+        // after PLAYING, so the session never has a definitive demote signal here.
+        branch_build_error: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -1374,6 +1421,8 @@ fn build_rtsp_pipeline_gpu_resident(
         .static_pad("src")
         .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a src pad missing".into()))?;
     let built = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let branch_build_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let branch_build_error_cb = branch_build_error.clone();
     let build_decoder = move |caps: &gst::Caps| {
         if built.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -1392,14 +1441,17 @@ fn build_rtsp_pipeline_gpu_resident(
             .and_then(|s| s.get::<String>("encoding-name").ok())
             .unwrap_or_default();
         if let Err(e) = link_nvdec_branch(&pipeline, &queue_a, &cudaconvert, &encoding) {
-            // Nie panikujemy: brak NVDEC dla tego kodeka (np. MJPEG) oznacza,
-            // że branch A nie ruszy, pipeline nie da klatek, a sesja zejdzie
-            // na ścieżkę CPU. Logujemy, żeby było jasne dlaczego.
+            // Brak NVDEC dla tego kodeka (np. MJPEG) albo nieudany link: gałąź A
+            // nie ruszy i pipeline nie da ani jednej klatki. Publikujemy powód,
+            // żeby sesja zeszła o szczebel NATYCHMIAST zamiast czekać na koniec
+            // okna warmupu — ten błąd leci na wątku streamingu, więc nigdy nie
+            // trafi na bus.
             tracing::warn!(
                 encoding = %encoding,
                 error = %e,
-                "rtsp: nie udało się zbudować gałęzi NVDEC — fallback CPU nastąpi przez sesję"
+                "rtsp: nie udało się zbudować gałęzi NVDEC — sesja zejdzie o szczebel niżej"
             );
+            *branch_build_error_cb.lock().unwrap() = Some(format!("NVDEC branch build: {e}"));
         }
     };
     let build_decoder = std::sync::Arc::new(build_decoder);
@@ -1429,6 +1481,7 @@ fn build_rtsp_pipeline_gpu_resident(
         tee,
         decode_tee: None,
         decode_tee_is_cuda: false,
+        branch_build_error,
     })
 }
 
@@ -1750,6 +1803,8 @@ fn build_rtsp_pipeline_nvdec(
         .static_pad("src")
         .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a src pad missing".into()))?;
     let built = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let branch_build_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let branch_build_error_cb = branch_build_error.clone();
     let build_decoder = move |caps: &gst::Caps| {
         if built.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -1768,14 +1823,17 @@ fn build_rtsp_pipeline_nvdec(
             .and_then(|s| s.get::<String>("encoding-name").ok())
             .unwrap_or_default();
         if let Err(e) = link_nvdec_branch(&pipeline, &queue_a, &downstream, &encoding) {
-            // Nie panikujemy: brak NVDEC dla tego kodeka (np. MJPEG) oznacza,
-            // że branch A nie ruszy, pipeline nie da klatek, a sesja zejdzie na
-            // ścieżkę CPU. Logujemy, żeby było jasne dlaczego.
+            // Brak NVDEC dla tego kodeka (np. MJPEG) albo nieudany link: gałąź A
+            // nie ruszy i pipeline nie da ani jednej klatki. Publikujemy powód,
+            // żeby sesja zeszła o szczebel NATYCHMIAST zamiast czekać na koniec
+            // okna warmupu — ten błąd leci na wątku streamingu, więc nigdy nie
+            // trafi na bus.
             tracing::warn!(
                 encoding = %encoding,
                 error = %e,
-                "rtsp: nie udało się zbudować gałęzi NVDEC — fallback CPU nastąpi przez sesję"
+                "rtsp: nie udało się zbudować gałęzi NVDEC — sesja zejdzie o szczebel niżej"
             );
+            *branch_build_error_cb.lock().unwrap() = Some(format!("NVDEC branch build: {e}"));
         }
     };
     let build_decoder = std::sync::Arc::new(build_decoder);
@@ -1814,6 +1872,7 @@ fn build_rtsp_pipeline_nvdec(
         tee,
         decode_tee,
         decode_tee_is_cuda,
+        branch_build_error,
     })
 }
 
@@ -2713,6 +2772,17 @@ pub async fn run_rtsp_session(
     // Without this the UI sees `status_message = None` 99% of the time
     // because health ticks publish every second but failures publish once.
     let mut last_error: Option<String> = None;
+    // FPS is a property of the CAMERA, not of one pipeline incarnation. Declared
+    // outside `'outer` so a reconnect does not empty the window: rebuilding it per
+    // attempt made the reported rate collapse to 0 and crawl back up over the next
+    // 30 s after every reconnect, which is what the dashboard showed as "jumping
+    // FPS" even while frames flowed steadily.
+    let mut fps_window: std::collections::VecDeque<f32> =
+        std::collections::VecDeque::with_capacity(30);
+    // Periodic pipeline metrics (path / fps / stage timings). Throttled to keep
+    // one line per camera per interval out of the hot health tick.
+    const METRICS_EVERY: Duration = Duration::from_secs(30);
+    let mut last_metrics_at = tokio::time::Instant::now();
 
     publish(
         &health_tx,
@@ -2848,6 +2918,9 @@ pub async fn run_rtsp_session(
         // Whether `decode_tee` is the CUDA-memory tee (zero-copy crops): the
         // on-demand RGB attach then inserts its own `cudadownload`.
         let decode_tee_is_cuda = handles.decode_tee_is_cuda;
+        // Polled each tick: a hardware branch that failed to build reports here
+        // instead of on the bus.
+        let branch_build_error = handles.branch_build_error.clone();
         let mut rgb_branch: Option<Mp4BranchState> = None;
         // Branch B mux state — `Some` whenever a consumer is subscribed.
         // Dwa niezależne sloty na tym samym tee: pełna jakość (passthrough,
@@ -2968,8 +3041,6 @@ pub async fn run_rtsp_session(
         // instant stall -> reconnect storm (tens of thousands per night).
         let base_total = counters.snapshot().0;
         let mut last_total: u64 = base_total;
-        let mut fps_window: std::collections::VecDeque<f32> =
-            std::collections::VecDeque::with_capacity(30);
         let started_at = tokio::time::Instant::now();
         // `[vision] warmup_extra_secs` (default 20): grace past the connect
         // timeout for FIRST frames before the path degrades a rung — a camera
@@ -2984,6 +3055,14 @@ pub async fn run_rtsp_session(
         // restart (e.g. credentials rotation). On restart we want to skip
         // the reconnect backoff and try the new config immediately.
         let mut restart_requested = false;
+        // The inner loop ended because the warmup window expired without a frame.
+        // A TIMEOUT is not evidence that the decode chain is broken — a camera
+        // recovering from RTSP-session stress looks exactly the same — so this
+        // must NOT walk the ingest path down a rung (see the degrade blocks below).
+        let mut warmup_timed_out = false;
+        // The dynamic hardware branch could not be built. This IS evidence the
+        // path cannot work here, so it degrades immediately.
+        let mut branch_build_failed = false;
         // Inner loop owns the running pipeline. Terminate it by `break` →
         // outer reconnects; or `return` for a final stop.
         let inner_reason: Option<String> = loop {
@@ -3005,6 +3084,7 @@ pub async fn run_rtsp_session(
                             close_mp4_stream_on_teardown(&cam_id, &branch_b_preview_publisher);
                             publish(&health_tx, &cam_id, CameraStatus::Offline, None, &counters, None);
                             streaming_bus().close_camera(&cam_id, "stopped").await;
+                            super::stage_metrics::forget(&cam_id);
                             return;
                         }
                         Some(SessionCommand::UpdateConfig(_)) => {
@@ -3219,10 +3299,21 @@ pub async fn run_rtsp_session(
                         Some(fps_window.iter().sum::<f32>() / fps_window.len() as f32)
                     };
 
+                    // A hardware branch that failed to BUILD is definitive: it can
+                    // never deliver a frame, and because the failure happens on the
+                    // streaming thread it never reaches the bus. Demote at once
+                    // rather than burning the whole warmup window on a dead branch.
+                    let build_error = branch_build_error.lock().unwrap().clone();
+                    if let Some(e) = build_error {
+                        branch_build_failed = true;
+                        break Some(e);
+                    }
+
                     if !online {
                         if total > base_total {
                             online = true;
                             online_at = Some(tokio::time::Instant::now());
+                            ingest_path.mark_delivered();
                             // Successful connect — clear backoff state so the
                             // next disconnect starts the schedule fresh.
                             attempt = 0;
@@ -3231,21 +3322,27 @@ pub async fn run_rtsp_session(
                             tracing::info!(
                                 camera_id = %cam_id,
                                 total,
+                                path = ingest_path.label(),
                                 "rtsp: camera ONLINE — first frames flowing"
                             );
                         } else if tokio::time::Instant::now() >= warmup_deadline {
+                            warmup_timed_out = true;
                             break Some("no frames within warmup window".into());
                         }
                     } else if !path_upgrade_attempted
                         && ingest_path != preferred_path
+                        && preferred_path.ever_delivered()
                         && online_at.is_some_and(|t| t.elapsed() >= PATH_UPGRADE_AFTER)
                     {
                         // Self-heal a degraded path: stable ONLINE on a lower rung →
-                        // one reconnect at the preferred path this session. The
-                        // camera is warm now, so the preferred-path warmup gets
-                        // frames immediately; if it still fails, the normal degrade
-                        // cascade brings the stream back and no further upgrade is
-                        // attempted until the next session.
+                        // one reconnect at the preferred path this session.
+                        //
+                        // Gated on `preferred_path.ever_delivered()`: tearing down a
+                        // HEALTHY stream costs a ~70 s outage, so it is only worth
+                        // paying when the target path is known to work in this
+                        // process. Retrying a path that has never produced a single
+                        // frame just bought an outage and landed back on the same
+                        // rung, once every PATH_UPGRADE_AFTER, forever.
                         path_upgrade_attempted = true;
                         ingest_path = preferred_path;
                         tracing::info!(
@@ -3277,6 +3374,31 @@ pub async fn run_rtsp_session(
                                 break Some("stream stalled — no frames for 10 s".into());
                             }
                         }
+                    }
+
+                    // Periodic pipeline metrics. Until this line existed the only
+                    // way to tell which decode path a camera actually ended up on
+                    // was to correlate startup warnings, and detect/enrich timings
+                    // were measured but never printed at all.
+                    if last_metrics_at.elapsed() >= METRICS_EVERY {
+                        last_metrics_at = tokio::time::Instant::now();
+                        let (detect_ms, enrich_ms, analysed) =
+                            super::stage_metrics::drain_mean(&cam_id)
+                                .map(|(d, e, n)| (d as i64, e as i64, n as i64))
+                                .unwrap_or((-1, -1, 0));
+                        tracing::info!(
+                            camera_id = %cam_id,
+                            path = ingest_path.label(),
+                            online,
+                            fps_actual = avg.unwrap_or(0.0),
+                            frames_total = total,
+                            frames_dropped = dropped,
+                            // -1 = no frame went through analysis in this window.
+                            detect_ms,
+                            enrich_ms,
+                            analysed,
+                            "rtsp: ingest metrics"
+                        );
                     }
 
                     let status = if online {
@@ -3329,7 +3451,7 @@ pub async fn run_rtsp_session(
         // tej samej wadliwej gałęzi). Detekcja dalej działa (CPU resize).
         // Gdy klatki już poszły (`online`), to awaria sieciowa — zostawiamy
         // GPU-resize włączone.
-        if gpu_resize && !online && !is_transport_failure(&reason) {
+        if gpu_resize && !online && !is_transport_failure(&reason) && !warmup_timed_out {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
@@ -3341,18 +3463,25 @@ pub async fn run_rtsp_session(
             continue 'outer;
         }
 
-        // Fallback GPU (GPU-resident lub NVDEC) → niższa ścieżka. Pipeline
-        // sprzętowy padł na busie, ZANIM wszedł Online (brak ani jednej klatki)
-        // — typowy objaw nieudanej negocjacji łańcucha CUDA/NVDEC albo kodeka
-        // bez NVDEC (np. MJPEG, gdy gałąź NVDEC się nie wpięła). Schodzimy o
-        // jeden szczebel (NvdecNv12 → NvdecCpuConvert → Cpu) bez backoffu i bez
-        // liczenia do limitu prób. Gdy ścieżka sprzętowa zdążyła dać klatki
-        // (`online`), traktujemy awarię jako sieciową i zostajemy.
+        // Fallback GPU (GPU-resident lub NVDEC) → niższa ścieżka. Schodzimy TYLKO
+        // gdy mamy DOWÓD, że łańcuch sprzętowy nie działa: błąd na busie (nieudana
+        // negocjacja caps) albo nieudana budowa gałęzi (`branch_build_failed`).
+        //
+        // Samo wygaśnięcie okna warmupu dowodem NIE jest — kamera wracająca po
+        // stresie sesji RTSP wygląda identycznie. Traktowanie timeoutu jak awarii
+        // negocjacji zrzucało zdrową ścieżkę NVDEC na dekod programowy przy
+        // PIERWSZYM wolnym starcie i już nigdy nie wracała: stąd 0 udanych prób
+        // NVDEC przy 41 podejściach mimo w pełni sprawnego dekodera. Po timeoucie
+        // wracamy tą SAMĄ ścieżką (z backoffem), a nie o szczebel niżej.
+        // A failed branch BUILD is conclusive on its own — no need to also rule out
+        // a transport fault, the branch was never going to carry frames.
+        let hw_chain_broken =
+            branch_build_failed || (!is_transport_failure(&reason) && !warmup_timed_out);
         if matches!(
             ingest_path,
             IngestPath::GpuResidentNvidia | IngestPath::NvdecNv12 | IngestPath::NvdecCpuConvert
         ) && !online
-            && !is_transport_failure(&reason)
+            && hw_chain_broken
         {
             let next = degrade_ingest_path(ingest_path);
             tracing::warn!(
@@ -3376,7 +3505,7 @@ pub async fn run_rtsp_session(
         // do limitu prób), żeby kamera zadziałała zamiast wpaść w pętlę
         // reconnectów. Jeśli HW zdążyło dać klatki (`online`), traktujemy
         // awarię jako sieciową i zostajemy na HW.
-        if use_hw_decode && !online && !is_transport_failure(&reason) {
+        if use_hw_decode && !online && !is_transport_failure(&reason) && !warmup_timed_out {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
@@ -3846,6 +3975,55 @@ mod tests {
         assert!(IngestPath::GpuResidentNvidia.label().contains("GPU"));
         assert!(IngestPath::NvdecNv12.label().contains("NV12"));
         assert!(IngestPath::NvdecCpuConvert.label().contains("NVDEC"));
+    }
+
+    #[test]
+    fn path_index_is_unique_per_variant() {
+        // `PATH_EVER_DELIVERED` is indexed by `index()`; a collision would let one
+        // path's success unlock a different, unproven path as an upgrade target.
+        let idx = [
+            IngestPath::GpuResidentNvidia.index(),
+            IngestPath::NvdecNv12.index(),
+            IngestPath::NvdecCpuConvert.index(),
+            IngestPath::Cpu.index(),
+        ];
+        let mut deduped = idx.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), idx.len(), "indeksy muszą być unikalne");
+        assert!(
+            idx.iter().all(|i| *i < PATH_EVER_DELIVERED.len()),
+            "indeks poza tablicą"
+        );
+    }
+
+    #[test]
+    fn path_upgrade_requires_a_proven_path() {
+        // The whole point of the gate: a path nobody has ever gotten a frame out of
+        // is not worth a ~70 s outage. Uses GpuResidentNvidia because the runtime
+        // here lacks `cudaconvert`, so nothing else in the process marks it.
+        let untested = IngestPath::GpuResidentNvidia;
+        assert!(
+            !untested.ever_delivered(),
+            "ścieżka bez ani jednej klatki nie może być celem upgrade'u"
+        );
+        untested.mark_delivered();
+        assert!(
+            untested.ever_delivered(),
+            "po pierwszej klatce ścieżka staje się celem upgrade'u"
+        );
+    }
+
+    #[test]
+    fn warmup_timeout_is_not_a_transport_failure() {
+        // The warmup timeout must be distinguishable from both a transport fault
+        // and a negotiation fault: it is now gated by its own flag precisely
+        // because `is_transport_failure` does NOT match it, which is what made the
+        // degrade ladder treat a slow camera as a broken NVDEC chain.
+        assert!(!is_transport_failure("no frames within warmup window"));
+        assert!(is_transport_failure(
+            "gstrtspsrc.c(7003): could not connect"
+        ));
     }
 
     #[test]

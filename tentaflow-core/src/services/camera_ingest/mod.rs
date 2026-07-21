@@ -29,6 +29,7 @@ pub mod onvif_media;
 pub mod onvif_metadata_parser;
 pub mod rtsp;
 pub mod session;
+pub mod stage_metrics;
 pub mod stream_publisher;
 pub mod supervisor;
 pub mod webrtc_source;

@@ -1434,8 +1434,12 @@ async fn engine_loop() {
         // Collect due (camera, frame-stage) pairs + which cameras need a config
         // re-read (no DB under the lock). Also track the soonest upcoming
         // deadline so an idle wait sleeps exactly until the next stage is due.
-        let mut due: Vec<(String, Arc<CvPipeline>, Vec<String>, Arc<Vec<Vec<(f32, f32)>>>)> =
-            Vec::new();
+        let mut due: Vec<(
+            String,
+            Arc<CvPipeline>,
+            Vec<String>,
+            Arc<Vec<Vec<(f32, f32)>>>,
+        )> = Vec::new();
         let mut recheck: Vec<String> = Vec::new();
         let mut earliest_next: Option<std::time::Instant> = None;
         {
@@ -2545,6 +2549,9 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             .await;
             let enrich_ms = enrich_start.elapsed().as_millis() as u32;
             let proc_ms = detect_ms + enrich_ms;
+            // Feed the ingest session's periodic metrics line — these timings are
+            // otherwise measured and thrown away.
+            super::stage_metrics::record(&camera_id, detect_ms, enrich_ms);
             // Enriched signs now carry `vehicle_id`. Publish them WITH the vehicle
             // boxes (self-assigned vehicle_id) so the event recorder groups per
             // truck and the overlay keeps drawing vehicle rectangles.
@@ -4385,7 +4392,10 @@ mod tests {
 
         // Malformed / degenerate polygons are ignored, never partially applied.
         assert!(parse_zone_polygons("nonsense").is_empty());
-        assert!(parse_zone_polygons("[[[0.1,0.1],[0.2,0.2]]]").is_empty(), "2 points is not an area");
+        assert!(
+            parse_zone_polygons("[[[0.1,0.1],[0.2,0.2]]]").is_empty(),
+            "2 points is not an area"
+        );
     }
 
     fn make_job(cam: &str, captured: u64, pipeline: &Arc<CvPipeline>, stage: &str) -> FrameJob {
