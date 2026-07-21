@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use forge_formats::{Hyperparams, MtpDescriptor, MtpWeightRole};
-use forge_hal::{DevBuffer, Device, Pool, Stream};
+use forge_hal::{DevBuffer, Device, Pool, Stream, Event};
 use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 
@@ -373,6 +373,9 @@ pub struct MtpDraftState {
     pub position: DevBuffer,
     pub token_ids: DevBuffer,
     pub pinned_token_ids: DevBuffer,
+    pub pinned_scalar: DevBuffer,
+    pub pinned_scalar_ready: Event,
+    pub pinned_scalar_recorded: bool,
     checkpoint_hidden: DevBuffer,
     step_hidden: DevBuffer,
     checkpoint_len: Option<usize>,
@@ -438,6 +441,9 @@ impl MtpDraftState {
             position,
             token_ids: device.alloc(5 * 4, MemKind::Device, Pool::Activations)?,
             pinned_token_ids: device.alloc(5 * 4, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_scalar: device.alloc(4, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_scalar_ready: device.create_event()?,
+            pinned_scalar_recorded: false,
             checkpoint_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
             step_hidden: device.alloc(4 * hidden_bytes, MemKind::Device, Pool::Activations)?,
             device,
@@ -501,7 +507,7 @@ impl MtpDraftState {
     }
 
     /// Rezerwuje ciąg pozycji MTP i aktualizuje jego tabelę stron jednym zapisem.
-    pub fn stage_batch(&mut self, n_tokens: usize) -> Result<usize> {
+    pub fn stage_batch(&mut self, n_tokens: usize) -> Result<(usize, Vec<i32>, i32, i32)> {
         if n_tokens == 0 {
             return Err(ForgeError::Scheduler("MTP: pusty batch catch-up".into()));
         }
@@ -511,16 +517,12 @@ impl MtpDraftState {
         }
         let mut page_table = vec![-1i32; self.kv.cfg.max_pages_per_seq];
         page_table[..self.seq.pages.len()].copy_from_slice(&self.seq.pages);
-        self.device
-            .write(bytemuck::cast_slice(&page_table), &self.page_table, 0)?;
-        self.device
-            .write(&(self.seq.len as i32).to_le_bytes(), &self.seq_len, 0)?;
-        self.device.write(
-            &((self.seq.len - 1) as i32).to_le_bytes(),
-            &self.position,
-            0,
-        )?;
-        Ok(base)
+        Ok((
+            base,
+            page_table,
+            self.seq.len as i32,
+            (self.seq.len - 1) as i32,
+        ))
     }
 
     pub fn rollback(&mut self, stream: &Stream) -> Result<()> {
@@ -998,23 +1000,15 @@ mod tests {
         let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
 
         state.checkpoint(&stream).unwrap();
-        assert_eq!(state.stage_batch(3).unwrap(), 0);
+        let (base, _, seq_len, position) = state.stage_batch(3).unwrap();
+        assert_eq!((base, seq_len, position), (0, 3, 2));
         state.commit_catchup(3).unwrap();
         state.checkpoint(&stream).unwrap();
-        assert_eq!(state.stage_batch(2).unwrap(), 3);
+        let (base, page_table, seq_len, position) = state.stage_batch(2).unwrap();
+        assert_eq!((base, seq_len, position), (3, 5, 4));
         state.commit_catchup(2).unwrap();
 
-        let mut position = [0u8; 4];
-        let mut seq_len = [0u8; 4];
-        let mut page_table = vec![0u8; state.page_table.len()];
-        device.read(&state.position, 0, &mut position).unwrap();
-        device.read(&state.seq_len, 0, &mut seq_len).unwrap();
-        device.read(&state.page_table, 0, &mut page_table).unwrap();
-        let pages: &[i32] = bytemuck::cast_slice(&page_table);
-
-        assert_eq!(i32::from_le_bytes(position), 4);
-        assert_eq!(i32::from_le_bytes(seq_len), 5);
-        assert_eq!(&pages[..state.seq.pages.len()], &state.seq.pages);
+        assert_eq!(&page_table[..state.seq.pages.len()], &state.seq.pages);
         assert_eq!(state.seq.pages.len(), 2);
         assert!(state.stage_batch(0).is_err());
     }

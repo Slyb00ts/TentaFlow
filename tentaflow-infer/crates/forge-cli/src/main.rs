@@ -737,8 +737,8 @@ fn default_model_id(path: &Path) -> String {
 /// KV pool sized for exactly `kv_pages` pages of this model (floored at
 /// 1 GiB), 1 GiB activations.
 #[allow(clippy::too_many_arguments)]
-fn activation_pool_bytes(native_mtp: bool, hybrid: bool) -> usize {
-    if native_mtp && hybrid {
+fn activation_pool_bytes(_native_mtp: bool, hybrid: bool) -> usize {
+    if hybrid {
         9usize << 27
     } else {
         1usize << 30
@@ -1796,9 +1796,9 @@ mod speculation_cli_tests {
     }
 
     #[test]
-    fn hybrydowe_mtp_dostaje_pule_aktywacji_1152_mib() {
+    fn model_hybrydowy_dostaje_pule_aktywacji_1152_mib() {
         assert_eq!(activation_pool_bytes(true, true), 1152 << 20);
-        assert_eq!(activation_pool_bytes(false, true), 1 << 30);
+        assert_eq!(activation_pool_bytes(false, true), 1152 << 20);
         assert_eq!(activation_pool_bytes(true, false), 1 << 30);
     }
 }

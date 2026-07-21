@@ -495,6 +495,10 @@ coherent Polish on the RTX 4090.
   wewnętrznego chunka, również gdy prompt przekracza zewnętrzny limit 1024.
 - Hybrydowe modele z natywnym MTP rezerwują 1152 MiB puli aktywacji, aby pomieścić
   jednocześnie bufory prefill, verifiera, stany DeltaNet i batched catch-up.
+- Target KV ma zwartą mapę `global_layer -> kv_layer` i alokuje slaby wyłącznie
+  dla warstw `Attention`. Qwen3.6-27B z układem 48 DeltaNet + 16 attention
+  zużywa 64 KiB F16 KV na token zamiast 256 KiB; osobny cache MTP zachowuje
+  jednowarstwową mapę identity.
 
 ## Histogramowy sampling GPU
 

@@ -244,7 +244,12 @@ pub fn kv_pool_bytes(
     } else {
         0
     };
-    p.block_count * per_layer_pair + mtp_pair + 64 * (1 << 20)
+    let target_layers = desc
+        .layer_kinds
+        .iter()
+        .filter(|kind| matches!(kind, forge_formats::LayerKind::Attention))
+        .count();
+    target_layers * per_layer_pair + mtp_pair + 64 * (1 << 20)
 }
 
 /// Resolve the sequence pooling for an embedding model path. GGUF carries
@@ -330,7 +335,7 @@ pub fn load_model(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_formats::MtpDescriptor;
+    use forge_formats::{LayerKind, MtpDescriptor};
     use forge_tokenize::{ChatMessage, ChatTemplateEngine};
 
     #[test]
@@ -380,6 +385,43 @@ mod tests {
         let expected_mtp_pair = 2 * slab.div_ceil(granularity) * granularity;
 
         assert_eq!(with_mtp - without_mtp, expected_mtp_pair);
+    }
+
+    #[test]
+    fn hybrydowa_pula_kv_obejmuje_tylko_warstwy_attention() {
+        let config: HfConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 1024,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "intermediate_size": 2048,
+                "vocab_size": 1024,
+                "max_position_embeddings": 1024
+            }"#,
+        )
+        .unwrap();
+        let mut descriptor = ModelDescriptor::from_hf(&config).unwrap();
+        descriptor.layer_kinds = [
+            vec![LayerKind::DeltaNet; 48],
+            vec![LayerKind::Attention; 16],
+        ]
+        .concat();
+        let page_size = 32;
+        let pages = 4;
+
+        let bytes = kv_pool_bytes(
+            &descriptor,
+            page_size,
+            pages,
+            forge_engine::kv::KvQuant::F16,
+            false,
+        ) - 64 * (1 << 20);
+
+        assert_eq!(bytes / (page_size * pages), 64 * 1024);
     }
 
     #[test]

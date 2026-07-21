@@ -16,7 +16,7 @@ use forge_kernels::{Kernels, Nvfp4GgufQ8Projection};
 use forge_types::{ForgeError, MemKind, Result, Vendor};
 use half::f16;
 
-use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
+use crate::kv::{KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
 use crate::mtp::{MtpDraftState, MtpEmbedding};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
@@ -29,6 +29,7 @@ use crate::weights::{
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
 const HYBRID_PREFILL_CHUNK: usize = 32;
+const HYBRID_HOST_STAGING_SLOTS: usize = 3;
 
 fn hybrid_prefill_chunk_size() -> usize {
     std::env::var("FORGE_HYBRID_PREFILL_CHUNK")
@@ -581,8 +582,25 @@ struct HybridVerifyBufs {
     retained_state_checkpoints: Option<DevBuffer>,
     accepted: DevBuffer,
     pinned_decision: DevBuffer,
-    pinned_embed: DevBuffer,
+    host_staging: Vec<HybridHostStaging>,
     delta: Vec<Option<DeltaVerifyCache>>,
+}
+
+struct HybridHostStaging {
+    embedding: DevBuffer,
+    page_table: DevBuffer,
+    ids: DevBuffer,
+    positions: DevBuffer,
+    visible_lens: DevBuffer,
+    base_pos: DevBuffer,
+    accepted: DevBuffer,
+    mtp_page_table: DevBuffer,
+    mtp_positions: DevBuffer,
+    mtp_visible_lens: DevBuffer,
+    mtp_base_pos: DevBuffer,
+    mtp_seq_len: DevBuffer,
+    mtp_position: DevBuffer,
+    ready: Event,
 }
 
 fn alloc_checked(
@@ -602,6 +620,23 @@ fn alloc_checked(
             })
         })?;
     device.alloc(bytes, kind, Pool::Activations)
+}
+
+fn write_pinned(src: &[u8], dst: &DevBuffer) -> Result<()> {
+    if src.len() > dst.len() {
+        return Err(ForgeError::Scheduler(format!(
+            "dane stagingu mają {} bajtów, bufor ma {}",
+            src.len(),
+            dst.len()
+        )));
+    }
+    let host = dst
+        .host_ptr()
+        .ok_or_else(|| ForgeError::Device("bufor stagingu nie ma mapowania hosta".into()))?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), host, src.len());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -756,6 +791,12 @@ struct MoeBufs {
 }
 
 impl Model {
+    fn target_kv_layer(&self, global_layer: usize) -> usize {
+        self.kv
+            .layer_index(global_layer)
+            .expect("cache KV jest dostępny wyłącznie dla warstwy attention")
+    }
+
     pub fn load_gguf(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Result<Self> {
         let weights = ModelWeights::load_gguf(&device, path, cfg.native_mtp)?;
         Self::finish(device, weights, cfg)
@@ -829,10 +870,24 @@ impl Model {
         }
         let max_pages_per_seq = cfg.max_seq_len.div_ceil(cfg.kv_page_size);
         let kernels = Kernels::load(device.clone())?;
-        let kv = KvCache::new(
+        if weights.descriptor.layer_kinds.len() != p.block_count {
+            return Err(ForgeError::Format(format!(
+                "mapa typów warstw ma {} wpisów, oczekiwano {}",
+                weights.descriptor.layer_kinds.len(),
+                p.block_count
+            )));
+        }
+        let kv_layer_map = KvLayerMap::from_attention_mask(
+            weights
+                .descriptor
+                .layer_kinds
+                .iter()
+                .map(|kind| matches!(kind, forge_formats::LayerKind::Attention)),
+        );
+        let kv = KvCache::new_mapped(
             device.as_ref(),
             KvConfig {
-                n_layers: p.block_count,
+                n_layers: kv_layer_map.kv_layers(),
                 n_kv_heads: p.n_kv_heads,
                 head_dim: p.head_dim,
                 page_size: cfg.kv_page_size,
@@ -840,6 +895,7 @@ impl Model {
                 max_pages_per_seq,
                 quant: cfg.kv_quant,
             },
+            kv_layer_map,
         )?;
         let stream = device.create_stream()?;
         let page_table_dev = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
@@ -3329,12 +3385,12 @@ impl Model {
                     .ring_slots()
                     .expect("rot mode has ring_slots");
                 kernels.kv_pack_rot(
-                    &self.kv.k_packed[l],
-                    &self.kv.v_packed[l],
-                    &self.kv.k_scale[l],
-                    &self.kv.v_scale[l],
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k_packed[self.target_kv_layer(l)],
+                    &self.kv.v_packed[self.target_kv_layer(l)],
+                    &self.kv.k_scale[self.target_kv_layer(l)],
+                    &self.kv.v_scale[self.target_kv_layer(l)],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &pb.k,
                     0,
                     &pb.v,
@@ -3384,10 +3440,10 @@ impl Model {
                     kernels.attn_prefill_rot(
                         &pb.attn_out,
                         &pb.q,
-                        &self.kv.k_packed[l],
-                        &self.kv.v_packed[l],
-                        &self.kv.k_scale[l],
-                        &self.kv.v_scale[l],
+                        &self.kv.k_packed[self.target_kv_layer(l)],
+                        &self.kv.v_packed[self.target_kv_layer(l)],
+                        &self.kv.k_scale[self.target_kv_layer(l)],
+                        &self.kv.v_scale[self.target_kv_layer(l)],
                         &self.page_table_dev,
                         base_pos,
                         t,
@@ -3405,8 +3461,8 @@ impl Model {
                 // Causal attention reads the chunk's own K/V from the cache, so
                 // the batch append must land before the attention launch.
                 kernels.kv_append_batch(
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &pb.k,
                     &pb.v,
                     &self.page_table_dev,
@@ -3447,8 +3503,8 @@ impl Model {
                     kernels.attn_prefill(
                         &pb.attn_out,
                         &pb.q,
-                        &self.kv.k[l],
-                        &self.kv.v[l],
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
                         &self.page_table_dev,
                         base_pos,
                         t,
@@ -4622,12 +4678,12 @@ impl Model {
             // attend over the dual region (ring for the recent window, packed
             // for older). q_buf's q head occupies head_dim*n_heads at q_off.
             kernels.kv_pack_rot(
-                &self.kv.k_packed[l],
-                &self.kv.v_packed[l],
-                &self.kv.k_scale[l],
-                &self.kv.v_scale[l],
-                &self.kv.k[l],
-                &self.kv.v[l],
+                &self.kv.k_packed[self.target_kv_layer(l)],
+                &self.kv.v_packed[self.target_kv_layer(l)],
+                &self.kv.k_scale[self.target_kv_layer(l)],
+                &self.kv.v_scale[self.target_kv_layer(l)],
+                &self.kv.k[self.target_kv_layer(l)],
+                &self.kv.v[self.target_kv_layer(l)],
                 k_src,
                 k_off,
                 v_src,
@@ -4648,12 +4704,12 @@ impl Model {
                         &b.attn_parts,
                         q_buf,
                         q_off,
-                        &self.kv.k_packed[l],
-                        &self.kv.v_packed[l],
-                        &self.kv.k_scale[l],
-                        &self.kv.v_scale[l],
-                        &self.kv.k[l],
-                        &self.kv.v[l],
+                        &self.kv.k_packed[self.target_kv_layer(l)],
+                        &self.kv.v_packed[self.target_kv_layer(l)],
+                        &self.kv.k_scale[self.target_kv_layer(l)],
+                        &self.kv.v_scale[self.target_kv_layer(l)],
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
                         &self.page_table_dev,
                         &self.seq_len_dev,
                         1,
@@ -4689,8 +4745,8 @@ impl Model {
                         &slot.stage[1],
                         &slot.stage[2],
                         &slot.stage[3],
-                        &self.kv.k[l],
-                        &self.kv.v[l],
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
                         &tb.identity_pt,
                         &self.seq_len_dev,
                         1,
@@ -4910,6 +4966,31 @@ impl Model {
             .map(|weights| weights.embedding.mode())
     }
 
+    fn mtp_upload_scalar(
+        &self,
+        state: &mut MtpDraftState,
+        value: i32,
+        dst: &DevBuffer,
+        dst_offset: usize,
+    ) -> Result<()> {
+        if state.pinned_scalar_recorded {
+            state.pinned_scalar_ready.synchronize()?;
+        }
+        write_pinned(&value.to_le_bytes(), &state.pinned_scalar)?;
+        self.device.copy(
+            &state.pinned_scalar,
+            0,
+            dst,
+            dst_offset,
+            4,
+            &self.stream,
+        )?;
+        self.device
+            .record_event(&state.pinned_scalar_ready, &self.stream)?;
+        state.pinned_scalar_recorded = true;
+        Ok(())
+    }
+
     fn mtp_propose_pending(&mut self, fed: u32, k: usize) -> Result<Vec<u32>> {
         if k != 2 && k != 3 {
             return Err(ForgeError::Unsupported(
@@ -4935,8 +5016,8 @@ impl Model {
                 &self.stream,
             )?;
             state.checkpoint(&self.stream)?;
-            self.device
-                .write(&0i32.to_le_bytes(), &state.token_ids, 4 * 4)?;
+            let token_ids = state.token_ids.clone();
+            self.mtp_upload_scalar(&mut state, 0, &token_ids, 4 * 4)?;
             self.kernels.sample_argmax_f32(
                 &self.bufs.sample_out,
                 &self.bufs.sample_vals,
@@ -5052,8 +5133,8 @@ impl Model {
                 state.catchup_hidden.len(),
                 &self.stream,
             )?;
-            self.device
-                .write(&(token as i32).to_le_bytes(), &self.bufs.sample_out, 0)?;
+            let sample_out = self.bufs.sample_out.clone();
+            self.mtp_upload_scalar(&mut state, token as i32, &sample_out, 0)?;
             self.mtp_gather_embedding(&mut state, 0)?;
             state.stage_step(&self.kernels, &self.stream)?;
             self.mtp_forward_one(&mut state, false)?;
@@ -5078,7 +5159,13 @@ impl Model {
         result
     }
 
-    fn mtp_catchup_batch_host(&self, state: &mut MtpDraftState, t: usize) -> Result<()> {
+    fn mtp_catchup_batch_host(
+        &self,
+        state: &mut MtpDraftState,
+        t: usize,
+        staging_slot: usize,
+        staging_ready: Option<&Event>,
+    ) -> Result<()> {
         let mtp = self.weights.mtp.as_ref().expect("stan MTP ma wagi");
         let layer = mtp.layers.first().ok_or_else(|| {
             ForgeError::Unsupported("batchowy catch-up MTP wymaga jednej warstwy".into())
@@ -5096,23 +5183,84 @@ impl Model {
             .as_ref()
             .expect("bufory hybrydowego catch-up są gotowe");
         let stream = &self.stream;
-        let base = state.stage_batch(t)?;
+        let (base, page_table, seq_len, position) = state.stage_batch(t)?;
         let positions: Vec<i32> = (base..base + t).map(|value| value as i32).collect();
         let visible: Vec<i32> = (base + 1..=base + t).map(|value| value as i32).collect();
-        self.device
-            .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
-        self.device
-            .write(&(base as i32).to_le_bytes(), &hv.base_pos, 0)?;
-        self.device
-            .write(bytemuck::cast_slice(&visible), &hv.visible_lens, 0)?;
+        let host_staging = &hv.host_staging[staging_slot];
+        write_pinned(
+            bytemuck::cast_slice(&page_table),
+            &host_staging.mtp_page_table,
+        )?;
+        write_pinned(
+            bytemuck::cast_slice(&positions),
+            &host_staging.mtp_positions,
+        )?;
+        write_pinned(
+            bytemuck::cast_slice(&visible),
+            &host_staging.mtp_visible_lens,
+        )?;
+        write_pinned(&(base as i32).to_le_bytes(), &host_staging.mtp_base_pos)?;
+        write_pinned(&seq_len.to_le_bytes(), &host_staging.mtp_seq_len)?;
+        write_pinned(&position.to_le_bytes(), &host_staging.mtp_position)?;
         self.device.copy(
-            &hv.pinned_embed,
+            &host_staging.mtp_page_table,
+            0,
+            &state.page_table,
+            0,
+            page_table.len() * 4,
+            stream,
+        )?;
+        self.device.copy(
+            &host_staging.mtp_seq_len,
+            0,
+            &state.seq_len,
+            0,
+            4,
+            stream,
+        )?;
+        self.device.copy(
+            &host_staging.mtp_position,
+            0,
+            &state.position,
+            0,
+            4,
+            stream,
+        )?;
+        self.device.copy(
+            &host_staging.mtp_positions,
+            0,
+            &pb.positions,
+            0,
+            t * 4,
+            stream,
+        )?;
+        self.device.copy(
+            &host_staging.mtp_base_pos,
+            0,
+            &hv.base_pos,
+            0,
+            4,
+            stream,
+        )?;
+        self.device.copy(
+            &host_staging.mtp_visible_lens,
+            0,
+            &hv.visible_lens,
+            0,
+            t * 4,
+            stream,
+        )?;
+        self.device.copy(
+            &host_staging.embedding,
             0,
             &pb.h,
             0,
             t * hidden * 2,
             stream,
         )?;
+        if let Some(event) = staging_ready {
+            self.device.record_event(event, stream)?;
+        }
         self.kernels.mtp_norm_join_shifted_f16(
             &hv.q_full,
             &pb.h,
@@ -5175,7 +5323,12 @@ impl Model {
     }
 
     /// Dogania stan MTP po zaakceptowanym prefiksie targetu bez liczenia logits.
-    fn mtp_catchup_verified_prefix(&mut self, retained: usize) -> Result<()> {
+    fn mtp_catchup_verified_prefix(
+        &mut self,
+        retained: usize,
+        staging_slot: usize,
+        staging_ready: Option<&Event>,
+    ) -> Result<()> {
         if retained == 0 {
             return Err(ForgeError::Scheduler(
                 "catch-up MTP wymaga co najmniej tokenu fed".into(),
@@ -5194,7 +5347,12 @@ impl Model {
                     .as_ref()
                     .is_some_and(|mtp| mtp.shares_target_embedding)
             {
-                self.mtp_catchup_batch_host(&mut state, retained)?;
+                self.mtp_catchup_batch_host(
+                    &mut state,
+                    retained,
+                    staging_slot,
+                    staging_ready,
+                )?;
                 state.commit_catchup(retained)?;
                 return self.device.copy(
                     &state.catchup_hidden,
@@ -5724,13 +5882,43 @@ impl Model {
             4,
             MemKind::PinnedHost,
         )?;
-        let pinned_embed = alloc_checked(
-            device.as_ref(),
-            "mtp pinned embedding",
-            &[cap, p.hidden_size],
-            2,
-            MemKind::PinnedHost,
-        )?;
+        let pinned = |name: &str, dims: &[usize], element_bytes: usize| {
+            alloc_checked(
+                device.as_ref(),
+                name,
+                dims,
+                element_bytes,
+                MemKind::PinnedHost,
+            )
+        };
+        let host_staging = (0..HYBRID_HOST_STAGING_SLOTS)
+            .map(|_| {
+                Ok(HybridHostStaging {
+                    embedding: pinned("mtp pinned embedding", &[cap, p.hidden_size], 2)?,
+                    page_table: pinned("mtp pinned page table", &[self.max_pages_per_seq], 4)?,
+                    ids: pinned("mtp pinned ids", &[cap], 4)?,
+                    positions: pinned("mtp pinned positions", &[cap], 4)?,
+                    visible_lens: pinned("mtp pinned visible lengths", &[cap], 4)?,
+                    base_pos: pinned("mtp pinned base position", &[1], 4)?,
+                    accepted: pinned("mtp pinned accepted", &[2], 4)?,
+                    mtp_page_table: pinned(
+                        "mtp pinned catch-up page table",
+                        &[self.max_pages_per_seq],
+                        4,
+                    )?,
+                    mtp_positions: pinned("mtp pinned catch-up positions", &[cap], 4)?,
+                    mtp_visible_lens: pinned(
+                        "mtp pinned catch-up visible lengths",
+                        &[cap],
+                        4,
+                    )?,
+                    mtp_base_pos: pinned("mtp pinned catch-up base position", &[1], 4)?,
+                    mtp_seq_len: pinned("mtp pinned catch-up sequence length", &[1], 4)?,
+                    mtp_position: pinned("mtp pinned catch-up position", &[1], 4)?,
+                    ready: device.create_event()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let delta_base = self
             .weights
             .layers
@@ -5835,7 +6023,7 @@ impl Model {
             retained_state_checkpoints,
             accepted,
             pinned_decision,
-            pinned_embed,
+            host_staging,
             delta,
         });
         Ok(())
@@ -6100,8 +6288,8 @@ impl Model {
             stream,
         )?;
         kernels.kv_append_batch_device_pos_f16(
-            &self.kv.k[layer_index],
-            &self.kv.v[layer_index],
+            &self.kv.k[self.target_kv_layer(layer_index)],
+            &self.kv.v[self.target_kv_layer(layer_index)],
             &pb.k,
             &pb.v,
             &self.page_table_dev,
@@ -6116,8 +6304,8 @@ impl Model {
             kernels.attn_decode_batch_exact_f16_hd256(
                 &pb.attn_out,
                 &hv.qc,
-                &self.kv.k[layer_index],
-                &self.kv.v[layer_index],
+                &self.kv.k[self.target_kv_layer(layer_index)],
+                &self.kv.v[self.target_kv_layer(layer_index)],
                 &self.page_table_dev,
                 &hv.visible_lens,
                 t,
@@ -6132,8 +6320,8 @@ impl Model {
             kernels.attn_prefill_device_pos_f16_hd256(
                 &pb.attn_out,
                 &hv.qc,
-                &self.kv.k[layer_index],
-                &self.kv.v[layer_index],
+                &self.kv.k[self.target_kv_layer(layer_index)],
+                &self.kv.v[self.target_kv_layer(layer_index)],
                 &self.page_table_dev,
                 &hv.base_pos,
                 t,
@@ -6529,7 +6717,8 @@ impl Model {
                 ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
             })?;
             let staging = hv
-                .pinned_embed
+                .host_staging[0]
+                .embedding
                 .host_ptr()
                 .expect("pinned embedding ma mapowanie hosta");
             for (row_index, &token) in tokens.iter().enumerate() {
@@ -6549,7 +6738,7 @@ impl Model {
                 }
             }
             self.device.copy(
-                &hv.pinned_embed,
+                &hv.host_staging[0].embedding,
                 0,
                 &pb.h,
                 0,
@@ -6590,7 +6779,7 @@ impl Model {
             }
             let accepted = retained as usize - 1;
             if catchup_mtp {
-                self.mtp_catchup_verified_prefix(accepted + 1)?;
+                self.mtp_catchup_verified_prefix(accepted + 1, 0, None)?;
             }
             self.capture_hybrid_verify_graph_if_needed(t);
             Ok((accepted, correction as u32))
@@ -6885,8 +7074,8 @@ impl Model {
                             v_byte_off,
                             layer.attn().q_norm.as_ref(),
                             layer.attn().k_norm.as_ref(),
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &b.pos,
                             &self.page_table_dev,
                             &self.seq_len_dev,
@@ -6916,8 +7105,8 @@ impl Model {
                             0,
                             layer.attn().q_norm.as_ref(),
                             layer.attn().k_norm.as_ref(),
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &b.pos,
                             &self.page_table_dev,
                             &self.seq_len_dev,
@@ -6969,8 +7158,8 @@ impl Model {
                             stream,
                         )?;
                         kernels.kv_append_f16(
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &b.k,
                             &b.v,
                             &self.page_table_dev,
@@ -6989,8 +7178,8 @@ impl Model {
                         kernels.attn_decode_f16(
                             &b.attn_out,
                             q_buf,
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &self.page_table_dev,
                             &self.seq_len_dev,
                             1,
@@ -7155,8 +7344,8 @@ impl Model {
                 stream,
             )?;
             kernels.kv_append_f16(
-                &self.kv.k[l],
-                &self.kv.v[l],
+                &self.kv.k[self.target_kv_layer(l)],
+                &self.kv.v[self.target_kv_layer(l)],
                 &b.k,
                 &b.v,
                 &self.page_table_dev,
@@ -7169,8 +7358,8 @@ impl Model {
             kernels.attn_decode_f16(
                 &b.attn_out,
                 &b.q,
-                &self.kv.k[l],
-                &self.kv.v[l],
+                &self.kv.k[self.target_kv_layer(l)],
+                &self.kv.v[self.target_kv_layer(l)],
                 &self.page_table_dev,
                 &self.seq_len_dev,
                 1,
@@ -7868,8 +8057,8 @@ impl Model {
             .rope_neox_partial_f16(&hb.qc, &b.pos, 1, n_heads, head_dim, n_rot, theta, stream)?;
         kernels.rope_neox_partial_f16(&b.k, &b.pos, 1, n_kv, head_dim, n_rot, theta, stream)?;
         kernels.kv_append_f16(
-            &self.kv.k[l],
-            &self.kv.v[l],
+            &self.kv.k[self.target_kv_layer(l)],
+            &self.kv.v[self.target_kv_layer(l)],
             &b.k,
             &b.v,
             &self.page_table_dev,
@@ -7884,8 +8073,8 @@ impl Model {
                 kernels.attn_decode_f16(
                     &b.attn_out,
                     &hb.qc,
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &self.page_table_dev,
                     &self.seq_len_dev,
                     1,
@@ -8169,6 +8358,7 @@ impl Model {
             let hidden_bytes = p.hidden_size * 2;
             let mut last_logits = Vec::new();
             let chunk_count = tokens.len().div_ceil(chunk_size);
+            let mut staging_recorded = [false; HYBRID_HOST_STAGING_SLOTS];
             let mut offset = 0usize;
             for chunk_index in 0..chunk_count {
                 let remaining = tokens.len() - offset;
@@ -8191,8 +8381,6 @@ impl Model {
 
                 let mut page_table = vec![-1i32; self.max_pages_per_seq];
                 page_table[..seq.pages.len()].copy_from_slice(&seq.pages);
-                self.device
-                    .write(bytemuck::cast_slice(&page_table), &self.page_table_dev, 0)?;
                 self.pt_seq = seq.id;
 
                 let ids: Vec<i32> = chunk.iter().map(|&id| id as i32).collect();
@@ -8203,19 +8391,26 @@ impl Model {
                     .hybrid_verify_bufs
                     .as_ref()
                     .expect("bufory hybrydowego prefill są gotowe");
-                self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
-                self.device
-                    .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
-                self.device
-                    .write(&(base as i32).to_le_bytes(), &hv.base_pos, 0)?;
-                self.device
-                    .write(bytemuck::cast_slice(&visible_lens), &hv.visible_lens, 0)?;
-                self.device.write(&(t as i32).to_le_bytes(), &hv.accepted, 0)?;
                 let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
                     ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
                 })?;
-                let staging = hv
-                    .pinned_embed
+                let staging_slot = chunk_index % HYBRID_HOST_STAGING_SLOTS;
+                let host_staging = &hv.host_staging[staging_slot];
+                let staging_ready = host_staging.ready.clone();
+                if staging_recorded[staging_slot] {
+                    staging_ready.synchronize()?;
+                }
+                write_pinned(bytemuck::cast_slice(&page_table), &host_staging.page_table)?;
+                write_pinned(bytemuck::cast_slice(&ids), &host_staging.ids)?;
+                write_pinned(bytemuck::cast_slice(&positions), &host_staging.positions)?;
+                write_pinned(
+                    bytemuck::cast_slice(&visible_lens),
+                    &host_staging.visible_lens,
+                )?;
+                write_pinned(&(base as i32).to_le_bytes(), &host_staging.base_pos)?;
+                write_pinned(&(t as i32).to_le_bytes(), &host_staging.accepted)?;
+                let staging_buffer = &host_staging.embedding;
+                let staging = staging_buffer
                     .host_ptr()
                     .expect("pinned embedding ma mapowanie hosta");
                 for (row_index, &token) in chunk.iter().enumerate() {
@@ -8235,13 +8430,58 @@ impl Model {
                     }
                 }
                 self.device.copy(
-                    &hv.pinned_embed,
+                    &host_staging.page_table,
+                    0,
+                    &self.page_table_dev,
+                    0,
+                    page_table.len() * 4,
+                    &self.stream,
+                )?;
+                self.device
+                    .copy(&host_staging.ids, 0, &pb.ids, 0, t * 4, &self.stream)?;
+                self.device.copy(
+                    &host_staging.positions,
+                    0,
+                    &pb.positions,
+                    0,
+                    t * 4,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &host_staging.base_pos,
+                    0,
+                    &hv.base_pos,
+                    0,
+                    4,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &host_staging.visible_lens,
+                    0,
+                    &hv.visible_lens,
+                    0,
+                    t * 4,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &host_staging.accepted,
+                    0,
+                    &hv.accepted,
+                    0,
+                    4,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    staging_buffer,
                     0,
                     &pb.h,
                     0,
                     t * hidden_bytes,
                     &self.stream,
                 )?;
+                self.device
+                    .record_event(&staging_ready, &self.stream)?;
+                staging_recorded[staging_slot] = true;
 
                 self.profile_target_start()?;
                 self.run_hybrid_batch_layers(t, true)?;
@@ -8269,7 +8509,7 @@ impl Model {
 
                 self.profile_catchup_start()?;
                 if self.mtp_state.is_some() {
-                    self.mtp_catchup_verified_prefix(t)?;
+                    self.mtp_catchup_verified_prefix(t, staging_slot, Some(&staging_ready))?;
                 }
                 self.profile_catchup_end()?;
             }
@@ -8284,6 +8524,9 @@ impl Model {
             });
             Ok(last_logits)
         })();
+        if result.is_err() {
+            let _ = self.stream.synchronize();
+        }
         restore_after(result, || {
             if let Some((graph_t3, graph_t4, disabled_t3, disabled_t4)) = saved_graphs {
                 // Verifier decode zachowuje własne bufory cap=4 i przechwycone grafy.
@@ -8405,8 +8648,8 @@ impl Model {
                             k_off,
                             v_buf,
                             v_off,
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &self.page_table_dev,
                             &self.seq_len_dev,
                             &b.pos,
@@ -8432,8 +8675,8 @@ impl Model {
                             v_off,
                             layer.attn().q_norm.as_ref(),
                             layer.attn().k_norm.as_ref(),
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &self.page_table_dev,
                             &self.seq_len_dev,
                             &b.pos,
@@ -8559,7 +8802,7 @@ impl Model {
                 self.device.copy(
                     &tb.slots[s].stage[0],
                     lp * rb,
-                    &self.kv.k[l],
+                    &self.kv.k[self.target_kv_layer(l)],
                     phys * rb,
                     rb,
                     stream,
@@ -8567,7 +8810,7 @@ impl Model {
                 self.device.copy(
                     &tb.slots[s].stage[1],
                     lp * rb,
-                    &self.kv.v[l],
+                    &self.kv.v[self.target_kv_layer(l)],
                     phys * rb,
                     rb,
                     stream,
@@ -8789,8 +9032,8 @@ impl Model {
                     0,
                     layer.attn().q_norm.as_ref(),
                     layer.attn().k_norm.as_ref(),
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &bb.page_table,
                     &bb.seq_lens,
                     &bb.positions,
@@ -8885,7 +9128,7 @@ impl Model {
                 self.device.copy(
                     &slot.stage[0],
                     lp * rb,
-                    &self.kv.k[l],
+                    &self.kv.k[self.target_kv_layer(l)],
                     phys * rb,
                     rb,
                     stream,
@@ -8893,7 +9136,7 @@ impl Model {
                 self.device.copy(
                     &slot.stage[1],
                     lp * rb,
-                    &self.kv.v[l],
+                    &self.kv.v[self.target_kv_layer(l)],
                     phys * rb,
                     rb,
                     stream,

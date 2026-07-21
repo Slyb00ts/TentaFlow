@@ -79,6 +79,48 @@ pub struct KvConfig {
     pub quant: KvQuant,
 }
 
+/// Mapowanie indeksu warstwy modelu na zwarty indeks slabu KV.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvLayerMap {
+    global_to_kv: Vec<Option<usize>>,
+    kv_layers: usize,
+}
+
+impl KvLayerMap {
+    pub fn identity(n_layers: usize) -> Self {
+        Self {
+            global_to_kv: (0..n_layers).map(Some).collect(),
+            kv_layers: n_layers,
+        }
+    }
+
+    pub fn from_attention_mask(mask: impl IntoIterator<Item = bool>) -> Self {
+        let mut kv_layers = 0usize;
+        let global_to_kv = mask
+            .into_iter()
+            .map(|uses_kv| {
+                uses_kv.then(|| {
+                    let index = kv_layers;
+                    kv_layers += 1;
+                    index
+                })
+            })
+            .collect();
+        Self {
+            global_to_kv,
+            kv_layers,
+        }
+    }
+
+    pub fn kv_layers(&self) -> usize {
+        self.kv_layers
+    }
+
+    pub fn get(&self, global_layer: usize) -> Option<usize> {
+        self.global_to_kv.get(global_layer).copied().flatten()
+    }
+}
+
 impl KvConfig {
     /// Element type of the f16/fp8 slab (F16 for rot).
     pub fn dtype(&self) -> DType {
@@ -107,6 +149,7 @@ impl KvConfig {
 
 pub struct KvCache {
     pub cfg: KvConfig,
+    layer_map: KvLayerMap,
     /// K/V storage, one pair per layer. F16/Fp8: the full paged slab
     /// ([n_pages, n_kv_heads, page_size, head_dim]). Rot: the small residual
     /// ring ([ring_slots, n_kv_heads, head_dim] f16, rotated), indexed by
@@ -174,6 +217,18 @@ impl SeqKv {
 
 impl KvCache {
     pub fn new(device: &dyn Device, cfg: KvConfig) -> Result<Self> {
+        let layer_map = KvLayerMap::identity(cfg.n_layers);
+        Self::new_mapped(device, cfg, layer_map)
+    }
+
+    pub fn new_mapped(device: &dyn Device, cfg: KvConfig, layer_map: KvLayerMap) -> Result<Self> {
+        if layer_map.kv_layers() != cfg.n_layers {
+            return Err(ForgeError::Scheduler(format!(
+                "mapa KV ma {} warstw, a konfiguracja alokuje {}",
+                layer_map.kv_layers(),
+                cfg.n_layers
+            )));
+        }
         let page_elems = cfg.n_kv_heads * cfg.page_size * cfg.head_dim;
         let slots = cfg.n_pages * cfg.n_kv_heads * cfg.page_size;
         // Rot allocates only the residual ring here (the full history lives in
@@ -221,6 +276,7 @@ impl KvCache {
         let free_pages = (0..cfg.n_pages as i32).rev().collect();
         Ok(KvCache {
             cfg,
+            layer_map,
             k,
             v,
             k_packed,
@@ -231,9 +287,17 @@ impl KvCache {
         })
     }
 
+    /// Zwraca zwarty indeks KV dla globalnego indeksu warstwy attention.
+    pub fn layer_index(&self, global_layer: usize) -> Option<usize> {
+        self.layer_map.get(global_layer)
+    }
+
     /// Per-layer buffers the tier manager spills, in the region order of
     /// `KvConfig::tier_region_bytes`.
     pub fn tier_layer_regions(&self, l: usize) -> Vec<&DevBuffer> {
+        let l = self
+            .layer_index(l)
+            .expect("tier może obsługiwać wyłącznie warstwę attention");
         if self.cfg.quant.is_rot() {
             vec![
                 &self.k_packed[l],
@@ -505,5 +569,42 @@ mod tests {
         assert_eq!(cache.free_page_count(), cache.cfg.n_pages);
         assert_eq!(seq.len, 0);
         assert!(seq.pages.is_empty());
+    }
+
+    #[test]
+    fn mapa_hybrydowa_zageszcza_48_warstw_deltanet_i_16_attention() {
+        let map = KvLayerMap::from_attention_mask(
+            std::iter::repeat_n(false, 48).chain(std::iter::repeat_n(true, 16)),
+        );
+
+        assert_eq!(map.kv_layers(), 16);
+        assert_eq!(map.get(47), None);
+        assert_eq!(map.get(48), Some(0));
+        assert_eq!(map.get(63), Some(15));
+    }
+
+    #[test]
+    fn mapa_modelu_dense_jest_tozsamoscia() {
+        let map = KvLayerMap::from_attention_mask(std::iter::repeat_n(true, 64));
+
+        assert_eq!(map, KvLayerMap::identity(64));
+    }
+
+    #[test]
+    fn mapowany_cache_zachowuje_granice_stron_sekwencji() {
+        let device = CpuDevice::new();
+        let map = KvLayerMap::from_attention_mask([false, true, false, true]);
+        let mut cache = KvCache::new_mapped(device.as_ref(), config(KvQuant::F16), map).unwrap();
+        let mut seq = cache.new_seq();
+
+        for _ in 0..5 {
+            cache.grow(&mut seq).unwrap();
+        }
+
+        assert_eq!(cache.k.len(), 2);
+        assert_eq!(cache.layer_index(1), Some(0));
+        assert_eq!(cache.layer_index(3), Some(1));
+        assert_eq!(seq.pages.len(), 2);
+        assert_eq!(seq.len, 5);
     }
 }

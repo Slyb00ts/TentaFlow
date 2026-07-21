@@ -33,7 +33,9 @@ Ostatnia aktualizacja: 2026-07-21.
   warstw przy commit; tryb `--speculative mtp` adaptacyjnie wybiera K=2/K=3.
   Prefill targetu działa w macierzowych chunkach, a catch-up MTP zapisuje tylko
   K/V potrzebne przez draft: raw512 spadł z **227,696 ms do 11,262 ms** przy
-  identycznym SHA tokenów. Pula aktywacji hybrydowego MTP wynosi 1,125 GiB.
+  identycznym SHA tokenów. Pula aktywacji każdego modelu hybrydowego wynosi
+  1,125 GiB (+128 MiB względem ścieżki attention-only), także bez aktywnego MTP,
+  aby batchowy prefill `chunk128` mieścił pełny scratch.
   Wielocyklowy benchmark sprawdza zgodność tokenów z serial greedy. Stała część
   verifiera ma trwałe grafy T=3/T=4 z pozycją bazową odczytywaną na GPU. Wynik
   RTX 4090, K=3: raw128 około **86,9 tok/s**, raw512 około **83,8 tok/s** po
@@ -611,6 +613,11 @@ Ostatnia aktualizacja: 2026-07-21.
     tokenów gorące) → ~6k tokenów KV atencji spilnięte na NVMe, igła odzyskana,
     ids bit-identyczne z full-VRAM, VRAM stały; `--kvflash --kv-hot-pages 64`
     bez OOM na modelu 20 GB. Nie-hybrydowe MoE (OLMoE/qwen3moe) nadal bez tieru.
+  - ✅ **Zwarty target KV dla hybryd**: globalny indeks warstwy jest mapowany na
+    indeks fizycznego slabu wyłącznie dla `LayerKind::Attention`. Qwen3.6-27B
+    alokuje 16 par K/V zamiast 64, czyli 64 KiB/token F16 zamiast 256 KiB/token;
+    prefill, decode, verifier MTP i tiering używają tej samej mapy. Cache MTP
+    pozostaje osobny i jednowarstwowy, a modele dense zachowują mapę identity.
   - 🟡 **Wydajność ścieżki hybrydowej**: korektność najpierw. Router MoE +
     bramka shared-expert NIE robią już host round-tripu (device-side grouped
     dispatch `_gidx`, patrz §4.4) — per-warstwa MoE decode jest teraz bez

@@ -292,6 +292,28 @@ Referencyjny serial llama.cpp dla raw512 osiągnął **2758,09 tok/s**. Wyniki t
 tabeli opisują wyłącznie target prefill; osobny catch-up MTP FORGE wyniósł
 11,262 ms, a pełny TTFT obejmuje oba etapy oraz pozostały narzut żądania.
 
+## Współdzielona LUT E2M1 w exact BM128
+
+Produkcyjny kernel NVIDIA `gemm_nvfp4_gguf_mma_f16_bm128` dekoduje 16 wartości
+E2M1 przez jedną LUT FP32 w pamięci współdzielonej CTA. BM32 oraz przenośne
+kernele pozostają niezmienione. Golden porównuje wszystkie bity BM128 z BM32
+dla `T=129`, 67 wierszy, niepełnych kafli, skali wyjściowej 0,625 i specjalnej
+skali UE4M3 `0x7f`.
+
+Pomiar RTX 4090 używał pięciu osobnych procesów dla każdego wariantu, po jednym
+przebiegu rozgrzewającym w procesie, chunka 128 i tych samych plików tokenów:
+
+| Prompt | BM128 arytmetyczny | BM128 LUT | Przyspieszenie | SHA krótkiego decode |
+|---|---:|---:|---:|---|
+| raw128 | 170,695 ms | 162,643 ms | 1,0495x | `7afc17ec...fca9` |
+| raw512 | 689,329 ms | 655,513 ms | 1,0516x | `b415d6ba...4f38` |
+
+Łączny czas obu workloadów spadł z 860,024 do 818,156 ms, czyli o 5,1%.
+Pełny raw128 decode zachował SHA `1512c5c9...aacf`, 34 forwardy weryfikacji,
+94 zaakceptowane tokeny i osiągnął 102,8 tok/s. Profil `nsys` raw512 po zmianie
+wskazał 50,6% czasu w BM128, 21,2% w dynamicznym in-place scan DeltaNet, 14,6%
+w exact i8mma i 5,1% w dynamicznym prepare.
+
 ## Odrzucone carry MTP w F32
 
 Sprawdzono eksperymentalne przechowywanie `h_nextn` w F32 przy zachowaniu

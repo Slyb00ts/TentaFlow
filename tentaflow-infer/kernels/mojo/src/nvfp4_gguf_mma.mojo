@@ -48,6 +48,15 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
 
     xs = stack_allocation[2 * XTILE, Float16, address_space=AddressSpace.SHARED]()
     ws = stack_allocation[2 * WTILE, Float16, address_space=AddressSpace.SHARED]()
+    lut = stack_allocation[16, Float32, address_space=AddressSpace.SHARED]()
+    comptime e2m1_values = SIMD[DType.float32, 16](
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    )
+    comptime if BM == 128:
+        if tid < 16:
+            lut[tid] = e2m1_values[tid]
+        barrier()
 
     x_row = tid // 4
     column8 = (tid % 4) * 8
@@ -129,7 +138,13 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
             async_copy_commit_group()
 
         comptime for weight_pass in range(weight_passes):
-            values = (_e2m1x8(codes[weight_pass]) * scales[weight_pass]).cast[
+            var decoded = SIMD[DType.float32, 8]()
+            comptime if BM == 128:
+                comptime for element in range(8):
+                    decoded[element] = lut[Int(codes[weight_pass][element])]
+            else:
+                decoded = _e2m1x8(codes[weight_pass])
+            values = (decoded * scales[weight_pass]).cast[
                 DType.float16
             ]()
             (weight_target + (stage % 2) * WTILE + weight_pass * (NT // 4) * LDW).store[

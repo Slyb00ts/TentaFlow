@@ -61,6 +61,13 @@ DeltaNet trzyma rezydentny stan SSM, nigdy nie paged). Chunki pakują te warstwy
 po ich pozycji w liście (indeks „kompaktowy"), więc hybrydowy chunk niesie ~10
 warstw atencji zamiast 41 — patrz sekcja qwen35moe.
 
+Rezydentny target KV używa tego samego zwartego mapowania
+`global_layer -> kv_layer`: slaby są alokowane wyłącznie dla warstw
+`Attention`, a DeltaNet nie zajmuje pustych par K/V. Dla Qwen3.6-27B z 48
+warstwami DeltaNet i 16 warstwami pełnej atencji zmniejsza to surowy koszt
+F16 KV z 256 KiB do 64 KiB na token. Osobny, jednowarstwowy cache MTP nie
+wchodzi do tej mapy.
+
 | Flaga | Domyślnie | Opis |
 |---|---|---|
 | `--kv-tier <M>` | `off` | `off` \| `ram` \| `nvme`. `off` = dzisiejsze zachowanie (zero zmian). `ram` = spill do pinned RAM (twardy błąd po wyczerpaniu budżetu). `nvme` = RAM jako warm cache + append-only plik jako cold tier. |
