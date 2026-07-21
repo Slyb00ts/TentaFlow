@@ -44,6 +44,18 @@ def _f8e4m3(b: UInt8) -> Float32:
     return Float32(_e4m3x2_to_f16x2(b, 0)[0])
 
 
+def _ue4m3_portable(b: UInt8) -> Float32:
+    """Dekoduje dodatnią skalę UE4M3 bez instrukcji zależnych od producenta GPU."""
+    if b == 0 or b == 0x7F:
+        return 0.0
+    exponent = Int((b >> 3) & 0x0F)
+    mantissa = Int(b & 0x07)
+    if exponent == 0:
+        return Float32(mantissa) * (1.0 / 512.0)
+    bits = UInt32((exponent + 120) << 23 | mantissa << 20)
+    return bitcast[DType.float32, 1](SIMD[DType.uint32, 1](bits))[0]
+
+
 def pack_nvfp4_fp8(
     output: UnsafePointer[Int8, MutAnyOrigin],
     output_scales: UnsafePointer[Float32, MutAnyOrigin],
@@ -178,3 +190,41 @@ def gemv_nvfp4_f16(
     total = block_reduce_sum(acc)
     if Int(thread_idx.x) == 0:
         y[row] = Float16(total)
+
+
+def gemv_nvfp4_gguf_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    output_scale: Float32,
+):
+    """Liczy y[row] = dot(W[row], x) bezpośrednio z bloków GGUF NVFP4.
+
+    Każdy blok przechowuje cztery skale UE4M3, a po nich cztery grupy po
+    osiem bajtów E2M1. Dolna połówka bajtu opisuje element j, a górna j+8.
+    """
+    row = Int(block_idx.x)
+    groups = n_cols // GROUP
+    row_base = row * (n_cols // 64) * 36
+
+    var acc: Float32 = 0.0
+    var group = Int(thread_idx.x)
+    while group < groups:
+        block = group // 4
+        subblock = group % 4
+        block_base = row_base + block * 36
+        packed_base = block_base + 4 + subblock * 8
+        x_base = group * GROUP
+        scale = _ue4m3_portable(weights[block_base + subblock])
+        var dot: Float32 = 0.0
+        for j in range(8):
+            code = weights[packed_base + j]
+            dot += _e2m1(code & 0x0F) * Float32(x[x_base + j])
+            dot += _e2m1((code >> 4) & 0x0F) * Float32(x[x_base + j + 8])
+        acc += scale * dot
+        group += Int(block_dim.x)
+
+    total = block_reduce_sum(acc)
+    if Int(thread_idx.x) == 0:
+        y[row] = Float16(total * output_scale)

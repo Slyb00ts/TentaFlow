@@ -423,11 +423,26 @@ coherent Polish on the RTX 4090.
   statystyki akceptacji per proposer. Węzły przenoszą źródło,
   `proposal_logprob` i `conditional_confidence`, dzięki czemu ten sam kontrakt
   obsłuży później greedy oraz lossless stochastic acceptance.
-- Wykonawczo działa tylko liniowy `NgramProposer` z jednym forwardem weryfikacji
-  greedy i rollbackiem KV. `draft-model`, `mtp`, `eagle`, `dflash` i `dspark` są
-  typowanymi konfiguracjami, lecz zwracają `Unsupported` do czasu podłączenia
-  implementacji i zgodnych wag. Weryfikacja drzewa, sampling, PARD i suffix nie są
-  jeszcze zaimplementowane.
+- Wykonawczo działają dwie rozłączne ścieżki: hostowy `NgramProposer` oraz natywne
+  MTP/NextN modelu dla gęstego hybrydowego GGUF `qwen35`. Natywne MTP wydziela
+  bloki `nextn_predict_layers` z trunku, ładuje ich NVFP4/Q8_0/F32 bez drugiej
+  kopii targetu i wykonuje proposer, weryfikację całego draftu oraz checkpointy
+  DeltaNet/KV na GPU przez kernele Mojo. Serwer obsługuje `--speculative mtp`,
+  `mtp:2` i `mtp:3`; budżet 3 jest adaptacyjnie przełączany między K=2 i K=3.
+  Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
+- Natywne MTP jest obecnie greedy-exact, wymaga `max_active=1` z powodu stanu SSM
+  należącego do modelu i zostało wykonawczo sprawdzone wyłącznie na CUDA/RTX 4090
+  z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Źródła Mojo zachowują podział
+  umożliwiający przyszły codegen AMDGPU/Metal, ale backendy AMD i Metal nie są
+  jeszcze podłączone ani przetestowane. `draft-model`, `eagle`, `dflash` i
+  `dspark` nadal zwracają `Unsupported`; weryfikacja drzewa, sampling, PARD i
+  suffix nie są jeszcze zaimplementowane.
+- Retained checkpointy stanu DeltaNet usuwają ponowny skan 48 warstw podczas
+  zatwierdzania zaakceptowanego prefiksu. Końcowy pomiar RTX 4090: około 59,8
+  tok/s dla raw128 oraz 57,7 tok/s dla raw512 w trybie MTP K=3. Referencja
+  llama.cpp na tym samym modelu osiąga odpowiednio
+  110,2 i 100,5 tok/s; luka wydajności pozostaje otwarta. Szczegóły:
+  `tentaflow-infer/docs/BENCH_QWEN35_MTP_NVFP4.md`.
 - `forge-formats` udostępnia zamknięty parser `forge-speculation.json` dla
   neuralnych proposerów. Manifest opisuje target, fingerprinty, tensory, cechy,
   dtype/kwantyzację, sampling, kalibrację oraz osobne licencje kodu i wag.

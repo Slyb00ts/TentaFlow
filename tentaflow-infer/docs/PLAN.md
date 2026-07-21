@@ -147,7 +147,8 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
 - **Zrealizowane:** liniowy `NgramProposer` jest podłączony do pętli decode dla
   greedy. Jeden forward mini-prefill weryfikuje draft, a odrzucone KV są wycofywane
   przez `KvCache::rollback`. Ścieżka jest domyślnie wyłączona i ograniczona do
-  `--speculative on|off|ngram:<k>`. Dowody: `tests/e2e_speculative.rs`
+  `--speculative on|off|ngram:<k>`; natywne MTP ma osobną ścieżkę opisaną niżej.
+  Dowody: `tests/e2e_speculative.rs`
   (powtarzalny prompt około 1.5×, wynik zgodny z OFF) i `tests/kv_rollback.rs`.
 - **Zrealizowane:** wspólny `Proposer`, typowane `DraftTree`/`DraftNode`
   (`proposal_logprob`, `conditional_confidence`, `source`), walidacja topologii,
@@ -158,14 +159,22 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
   targetu/tensorów/kalibracji/licencji, limity wejścia, bezpieczne ścieżki względne,
   SHA-256 i zachowanie zweryfikowanych uchwytów artefaktów. Podłączenie manifestu do runtime neuralnego pozostaje do
   wykonania.
+- **Zrealizowane:** natywne MTP/NextN dla gęstego hybrydowego GGUF `qwen35`.
+  Loader oddziela `nextn_predict_layers` od 64-warstwowego trunku, obsługuje
+  wagi MTP NVFP4/Q8_0/F32 i współdzielone wejście/wyjście targetu. GPU proposer
+  K=2/K=3, batched greedy verifier oraz checkpointy KV/DeltaNet są podłączone do
+  pętli serwera przez `--speculative mtp[:2|3]`; retained checkpointy usuwają
+  powtórny skan DeltaNet przy commit. Tryb `mtp` używa budżetu 3 i adaptacyjnie
+  wybiera K=2/K=3. Zakres produkcyjny tego etapu: greedy, `max_active=1`, CUDA.
+  Raport: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 - **Do realizacji:** jedna lossless weryfikacja drzewa z greedy i stochastic
   acceptance, tree-attention i zatwierdzaniem wyłącznie zaakceptowanych KV;
-  statystyki i adaptacyjne wyłączanie per proposer.
+  statystyki i adaptacyjne wyłączanie dla proposerów innych niż natywne MTP.
 - **Do realizacji po pozyskaniu zgodnych wag:** `DraftModelProposer`,
-  `MTPProposer`, `Eagle3Proposer`, `DFlashProposer`, `DSparkProposer` i opcjonalny
+  `Eagle3Proposer`, `DFlashProposer`, `DSparkProposer` i opcjonalny
   `PardProposer`/`SuffixProposer`. DSpark obejmuje półautoregresyjny backbone,
   głowę Markova lub RNN, confidence head, kalibrację STS oraz scheduler długości
-  weryfikacji zależny od obciążenia. Konfiguracje pięciu pierwszych proposerów są
+  weryfikacji zależny od obciążenia. Konfiguracje tych proposerów są
   typowane, ale zwracają `Unsupported`, dopóki ich implementacje i wagi nie są
   dostępne.
 

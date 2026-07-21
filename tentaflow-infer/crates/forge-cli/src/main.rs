@@ -14,6 +14,7 @@ use forge_engine::model::{ModelConfig, MAX_SPEC_DRAFT};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig};
+use forge_engine::speculation::{ProposerKind, SpeculationKind};
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
@@ -63,9 +64,10 @@ enum Command {
         /// Require `Authorization: Bearer <key>` on /v1/*.
         #[arg(long)]
         api_key: Option<String>,
-        /// Max concurrently decoding sequences.
-        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
-        max_active: u16,
+        /// Maksymalna liczba równocześnie dekodowanych sekwencji.
+        /// Domyślnie 1 dla MTP, w pozostałych trybach 8.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        max_active: Option<u16>,
         /// Minimum simultaneously-decoding sequences before the batched forward
         /// path engages (below it the tuned fused single-seq path is faster).
         #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u16).range(2..))]
@@ -137,11 +139,9 @@ enum Command {
         /// with tiering / rot KV / hybrid arch.
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
-        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k>. `on`
-        /// enables the self-drafting n-gram proposer (draft budget 8) for
-        /// greedy, penalty-free requests on the dense F16 paged-KV path; output
-        /// stays identical to non-speculative decode. Forces `--prefix-cache
-        /// off` when enabled. `off` = today's decode loop, byte-for-byte.
+        /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3]. `on`
+        /// używa proposera n-gram. MTP wymaga greedy bez kar oraz
+        /// `--max-active 1`. Spekulacja wymusza `--prefix-cache off`.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
     },
@@ -224,8 +224,8 @@ enum Command {
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
-        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k> (see
-        /// `forge serve`). Forces `--prefix-cache off` when enabled.
+        /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
+        /// Włączenie wymusza `--prefix-cache off`.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
     },
@@ -307,8 +307,8 @@ enum Command {
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
-        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k> (see
-        /// `forge serve`). Forces `--prefix-cache off` when enabled.
+        /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
+        /// Włączenie wymusza `--prefix-cache off`.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
         /// Warm best-of-N: submit the same request N times reusing the loaded
@@ -543,8 +543,7 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
     }
 }
 
-/// Parse `--speculative`: `off` | `on` | `ngram` | `ngram:<k>`. `on`/`ngram`
-/// use the default draft budget; `ngram:<k>` sets it explicitly.
+/// Parsuje `--speculative`: `off` | `on` | `ngram[:k]` | `mtp[:2|3]`.
 fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
     // The verify forward runs the ungraphed prefill path, so a long draft
     // (amortizing its per-op launch overhead over many accepted tokens) is what
@@ -564,18 +563,33 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
             }
             (name, budget)
         }
-        None => (s, DEFAULT_DRAFT),
+        None => (s, if s == "mtp" { 3 } else { DEFAULT_DRAFT }),
     };
     match name {
         "on" if explicit_budget => {
             bail!("--speculative 'on' does not accept a draft budget; use ngram:<k>")
         }
         "on" | "ngram" => SpeculativeConfig::ngram(budget).map_err(Into::into),
-        "draft-model" | "mtp" | "eagle" | "dflash" | "dspark" => bail!(
+        "mtp" => SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget).map_err(Into::into),
+        "draft-model" | "eagle" | "dflash" | "dspark" => bail!(
             "--speculative proposer '{name}' requires an implemented neural loader and forge-speculation.json"
         ),
         other => bail!("unsupported --speculative proposer '{other}'"),
     }
+}
+
+fn resolve_max_active(max_active: Option<u16>, spec: &SpeculativeConfig) -> Result<usize> {
+    let max_active = usize::from(max_active.unwrap_or_else(|| {
+        if spec.kind() == SpeculationKind::NativeMtp {
+            1
+        } else {
+            8
+        }
+    }));
+    if spec.kind() == SpeculationKind::NativeMtp && max_active != 1 {
+        bail!("--speculative mtp wymaga --max-active 1");
+    }
+    Ok(max_active)
 }
 
 fn parse_prefix_cache(s: &str) -> Result<bool> {
@@ -692,6 +706,7 @@ fn load_for_serve(
     ctx: usize,
     hot_pages: usize,
     prefix_cache: bool,
+    native_mtp: bool,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
@@ -741,6 +756,7 @@ fn load_for_serve(
         kv_tier,
         max_seq_len,
         prefix_cache,
+        native_mtp,
     };
     let loaded = load_model(dev, path, cfg)?;
     Ok((loaded, kv_pages, max_seq_len))
@@ -771,6 +787,7 @@ fn load_auto(
     kv_pages_flag: usize,
     hot_pages: usize,
     prefix_cache: bool,
+    native_mtp: bool,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
@@ -829,6 +846,7 @@ fn load_auto(
             kv_pages,
             max_seq_len,
             prefix_cache,
+            native_mtp,
         },
     )
 }
@@ -922,6 +940,7 @@ fn cmd_embed(
         8192,
         0,
         0,
+        false,
         false,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -1061,7 +1080,7 @@ fn cmd_serve(
     bind: SocketAddr,
     model_id: Option<String>,
     api_key: Option<String>,
-    max_active: u16,
+    max_active: Option<u16>,
     batch_min: u16,
     prefill_chunk: usize,
     kv_pages: usize,
@@ -1076,7 +1095,7 @@ fn cmd_serve(
     prefix_cache: bool,
     spec: SpeculativeConfig,
 ) -> Result<()> {
-    let max_active = usize::from(max_active);
+    let max_active = resolve_max_active(max_active, &spec)?;
     // Speculation appends + rolls back draft KV on the plain paged cache; the
     // radix prefix cache donates/borrows pages and is mutually exclusive with
     // it, so enabling speculation forces prefix caching off.
@@ -1094,6 +1113,7 @@ fn cmd_serve(
         ctx,
         hot_pages,
         prefix_cache,
+        spec.kind() == SpeculationKind::NativeMtp,
     )?;
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
     tracing::info!(
@@ -1270,6 +1290,7 @@ fn cmd_run(
         kv_pages,
         hot_pages,
         prefix_cache,
+        spec.kind() == SpeculationKind::NativeMtp,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
@@ -1357,6 +1378,7 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         ctx,
         0,
         0,
+        false,
         false,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -1461,7 +1483,17 @@ fn cmd_bench(
     }
     let t0 = Instant::now();
     let prefix_cache = prefix_cache && !spec.is_enabled();
-    let mut loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages, prefix_cache)?;
+    let mut loaded = load_auto(
+        model_path,
+        0.0,
+        kv_quant,
+        kv_tier,
+        ctx,
+        kv_pages,
+        hot_pages,
+        prefix_cache,
+        spec.kind() == SpeculationKind::NativeMtp,
+    )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
 
@@ -1556,8 +1588,8 @@ fn cmd_bench(
 
 #[cfg(test)]
 mod speculation_cli_tests {
-    use super::parse_speculative;
-    use forge_engine::speculation::ProposerKind;
+    use super::{parse_speculative, resolve_max_active};
+    use forge_engine::speculation::{ProposerKind, SpeculationKind};
 
     #[test]
     fn parser_rejects_unsupported_budget_and_neural_proposer() {
@@ -1565,6 +1597,8 @@ mod speculation_cli_tests {
         assert!(parse_speculative("ngram:17").is_err());
         assert!(parse_speculative("on:8").is_err());
         assert!(parse_speculative("dspark:8").is_err());
+        assert!(parse_speculative("mtp:1").is_err());
+        assert!(parse_speculative("mtp:4").is_err());
     }
 
     #[test]
@@ -1572,5 +1606,25 @@ mod speculation_cli_tests {
         let config = parse_speculative("ngram:8").expect("konfiguracja powinna być poprawna");
         assert_eq!(config.proposers(), &[ProposerKind::Ngram]);
         assert_eq!(config.draft_tokens(), 8);
+    }
+
+    #[test]
+    fn parser_accepts_native_mtp_budgets() {
+        for (input, expected_budget) in [("mtp", 3), ("mtp:2", 2), ("mtp:3", 3)] {
+            let config = parse_speculative(input).expect("MTP powinno być obsługiwane");
+            assert_eq!(config.proposers(), &[ProposerKind::Mtp]);
+            assert_eq!(config.kind(), SpeculationKind::NativeMtp);
+            assert_eq!(config.draft_tokens(), expected_budget);
+        }
+    }
+
+    #[test]
+    fn mtp_domyslnie_ogranicza_serwer_do_jednej_sekwencji() {
+        let mtp = parse_speculative("mtp").unwrap();
+        let off = parse_speculative("off").unwrap();
+        assert_eq!(resolve_max_active(None, &mtp).unwrap(), 1);
+        assert_eq!(resolve_max_active(None, &off).unwrap(), 8);
+        assert_eq!(resolve_max_active(Some(1), &mtp).unwrap(), 1);
+        assert!(resolve_max_active(Some(2), &mtp).is_err());
     }
 }

@@ -139,8 +139,8 @@ pub fn ggml_type_to_forge(id: u32) -> Result<(DType, QuantKind)> {
         29 => q(QuantKind::IQ1M),
         30 => Ok((DType::BF16, QuantKind::None)),
         39 => q(QuantKind::MXFP4),
-        // 25=I16, 28=F64, 34/35=TQ*, 40=ggml NVFP4 (different block layout
-        // than the compressed-tensors NVFP4 this crate implements), 41=Q1_0.
+        40 => q(QuantKind::NVFP4Gguf),
+        // 25=I16, 28=F64, 34/35=TQ*, 41=Q1_0.
         other => Err(ForgeError::Unsupported(format!(
             "ggml tensor type id {other} is not supported"
         ))),
@@ -306,6 +306,9 @@ impl Gguf {
         let mut metadata = HashMap::with_capacity(kv_count);
         for _ in 0..kv_count {
             let key = cur.string()?;
+            if metadata.contains_key(&key) {
+                return Err(fmt_err(format!("gguf: duplicate metadata key '{key}'")));
+            }
             let type_id = cur.u32()?;
             let value = cur.value(type_id, 0)?;
             metadata.insert(key, value);
@@ -364,6 +367,12 @@ impl Gguf {
         let mut tensors = Vec::with_capacity(raw.len());
         let mut by_name = HashMap::with_capacity(raw.len());
         for t in raw {
+            if t.offset % alignment != 0 {
+                return Err(fmt_err(format!(
+                    "gguf: tensor '{}' offset {} is not aligned to {alignment} bytes",
+                    t.name, t.offset
+                )));
+            }
             let (dtype, quant) = ggml_type_to_forge(t.ggml_type)?;
             let mut numel: u64 = 1;
             for &d in &t.dims {
@@ -372,17 +381,7 @@ impl Gguf {
                     .ok_or_else(|| fmt_err(format!("gguf: tensor '{}' numel overflow", t.name)))?;
             }
             let size_bytes = tensor_byte_size(&t.name, dtype, quant, numel, t.dims[0])?;
-            let offset = usize::try_from(t.offset)
-                .map_err(|_| fmt_err(format!("gguf: tensor '{}' offset overflow", t.name)))?;
-            let end = offset
-                .checked_add(size_bytes)
-                .ok_or_else(|| fmt_err(format!("gguf: tensor '{}' extent overflow", t.name)))?;
-            if end > data_len {
-                return Err(fmt_err(format!(
-                    "gguf: tensor '{}' [{}..{}] exceeds data section of {} bytes",
-                    t.name, offset, end, data_len
-                )));
-            }
+            let offset = checked_tensor_extent(&t.name, t.offset, size_bytes, data_len)?;
             let idx = tensors.len();
             if by_name.insert(t.name.clone(), idx).is_some() {
                 return Err(fmt_err(format!("gguf: duplicate tensor name '{}'", t.name)));
@@ -398,6 +397,7 @@ impl Gguf {
                 size_bytes,
             });
         }
+        validate_tensor_ranges(&tensors)?;
 
         Ok(Gguf {
             mmap,
@@ -494,9 +494,94 @@ fn tensor_byte_size(
     usize::try_from(bytes).map_err(|_| fmt_err(format!("gguf: tensor '{name}' size overflow")))
 }
 
+fn checked_tensor_extent(
+    name: &str,
+    offset: u64,
+    size_bytes: usize,
+    data_len: usize,
+) -> Result<usize> {
+    let offset = usize::try_from(offset)
+        .map_err(|_| fmt_err(format!("gguf: tensor '{name}' offset overflow")))?;
+    let end = offset
+        .checked_add(size_bytes)
+        .ok_or_else(|| fmt_err(format!("gguf: tensor '{name}' extent overflow")))?;
+    if end > data_len {
+        return Err(fmt_err(format!(
+            "gguf: tensor '{name}' [{offset}..{end}] exceeds data section of {data_len} bytes"
+        )));
+    }
+    Ok(offset)
+}
+
+fn validate_tensor_ranges(tensors: &[GgufTensor]) -> Result<()> {
+    let mut ranges: Vec<_> = tensors
+        .iter()
+        .map(|tensor| {
+            (
+                tensor.offset,
+                tensor.offset + tensor.size_bytes as u64,
+                &tensor.name,
+            )
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|range| range.0);
+
+    let mut previous_end = 0;
+    let mut previous_name: Option<&str> = None;
+    for (start, end, name) in ranges {
+        if start < previous_end {
+            return Err(fmt_err(format!(
+                "gguf: tensor '{name}' overlaps tensor '{}'",
+                previous_name.unwrap_or("<unknown>")
+            )));
+        }
+        previous_end = end;
+        previous_name = Some(name);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn write_string(output: &mut Vec<u8>, value: &str) {
+        output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    fn open_test_gguf(metadata: &[(&str, u8)], tensor_offsets: &[u64]) -> Result<Gguf> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(tensor_offsets.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        for &(key, value) in metadata {
+            write_string(&mut bytes, key);
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.push(value);
+        }
+        for (index, &offset) in tensor_offsets.iter().enumerate() {
+            write_string(&mut bytes, &format!("tensor.{index}"));
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&16u64.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        bytes.resize((bytes.len() + 31) & !31, 0);
+        let data_len = tensor_offsets
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(64) as usize;
+        bytes.resize(bytes.len() + data_len, 0);
+
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(&bytes)?;
+        Gguf::open(file.path())
+    }
 
     #[test]
     fn ggml_type_table_matches_ggml_h() {
@@ -518,6 +603,7 @@ mod tests {
             (DType::BF16, QuantKind::None)
         );
         assert_eq!(ggml_type_to_forge(39).unwrap().1, QuantKind::MXFP4);
+        assert_eq!(ggml_type_to_forge(40).unwrap().1, QuantKind::NVFP4Gguf);
         assert!(ggml_type_to_forge(4).is_err()); // removed q4_2
         assert!(ggml_type_to_forge(28).is_err()); // f64 unsupported
         assert!(ggml_type_to_forge(42).is_err());
@@ -540,5 +626,46 @@ mod tests {
         buf.extend_from_slice(&(u32::MAX as u64).to_le_bytes());
         let mut cur = Cursor::new(&buf);
         assert!(cur.value(9, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_metadata_keys() {
+        let error = open_test_gguf(&[("key", 1), ("key", 2)], &[])
+            .err()
+            .expect("odrzuć zduplikowany klucz metadanych");
+        assert!(error.to_string().contains("duplicate metadata key 'key'"));
+    }
+
+    #[test]
+    fn rejects_misaligned_tensor_offset() {
+        let error = open_test_gguf(&[], &[1])
+            .err()
+            .expect("odrzuć niewyrównany offset tensora");
+        assert!(error.to_string().contains("is not aligned"));
+    }
+
+    #[test]
+    fn rejects_overlapping_tensor_ranges() {
+        let error = open_test_gguf(&[], &[0, 32])
+            .err()
+            .expect("odrzuć nakładające się tensory");
+        assert!(error.to_string().contains("overlaps tensor"));
+    }
+
+    #[test]
+    fn accepts_aligned_non_overlapping_tensor_ranges() {
+        assert!(open_test_gguf(&[], &[0, 64]).is_ok());
+    }
+
+    #[test]
+    fn nvfp4_gguf_size_is_checked() {
+        assert_eq!(
+            tensor_byte_size("weight", DType::U8, QuantKind::NVFP4Gguf, 128, 64).unwrap(),
+            72
+        );
+        assert!(tensor_byte_size("weight", DType::U8, QuantKind::NVFP4Gguf, 63, 63,).is_err());
+        assert_eq!(checked_tensor_extent("weight", 32, 36, 68).unwrap(), 32);
+        assert!(checked_tensor_extent("weight", u64::MAX, 36, usize::MAX).is_err());
+        assert!(checked_tensor_extent("weight", 64, 36, 99).is_err());
     }
 }

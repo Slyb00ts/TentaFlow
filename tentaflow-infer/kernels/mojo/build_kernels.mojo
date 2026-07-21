@@ -25,7 +25,15 @@ from src.deltanet import (
     deltanet_log_decay_f32,
     deltanet_beta_sigmoid_f32,
 )
-from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8
+from src.deltanet_verify import (
+    deltanet_gated_scan_t2_f16,
+    deltanet_gated_scan_t3_f16,
+    deltanet_gated_scan_t4_f16,
+    deltanet_commit_checkpoint_f32,
+)
+from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8, gemv_nvfp4_gguf_f16
+from src.nvfp4_gguf_dp4a import gemv_nvfp4_gguf_q8_1_f16
+from src.mtp import mtp_prepare_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16
 from src.nvfp4_batch import gemv_batch_nvfp4_f16_b4, gemv_batch_nvfp4_f16_b8, gemv_batch_nvfp4_f16_b16, gemv_batch_f16_out_f32_b4, gemv_batch_f16_out_f32_b8
 from src.misc import gather_rows_f16, gemv_f16_out_f32, gemv_q8_0_out_f32
 from src.layernorm import layernorm_f16, layernorm_residual_f16
@@ -37,6 +45,8 @@ from src.gemv2 import gemv_q8_0_f16_v2, gemv_q8_0_out_f32_v2, gemv_nvfp4_f16_v2,
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
 from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
+from src.q8_0_batch import gemm_q8_0_i8mma_b2, gemm_q8_0_i8mma_b3, gemm_q8_0_i8mma_b4
+from src.q8_0_batch import gemm_q8_0_i8mma_out_f32_b3, gemm_q8_0_i8mma_out_f32_b4
 from src.gemm import gemm_q8_0_f16_bm64, gemm_nvfp4_f16_bm64, gemm_f16_bm64
 from src.gemm import gemm_f16_out_f32, gemm_f16_out_f32_bm64
 from src.gemm import gemm_nvfp4_f16_bm32, gemm_f16_out_f32_bm32
@@ -176,6 +186,17 @@ from src.onnx_ops import (
     reduce_mean_f32,
     lstm_f32,
 )
+from src.nvfp4_gguf_batch import (
+    gemm_nvfp4_gguf_f16_b2,
+    gemm_nvfp4_gguf_f16_b3,
+    gemm_nvfp4_gguf_f16_b4,
+    gemm_nvfp4_gguf_f16_b8,
+    gemm_nvfp4_gguf_f16_b16,
+)
+from src.nvfp4_gguf_mma import (
+    gemm_nvfp4_gguf_mma_f16_bm32,
+    gemm_nvfp4_gguf_mma_f16_bm128,
+)
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -190,6 +211,26 @@ def _entry_from_ptx(ptx_path: Path) raises -> String:
     if j < 0:
         raise Error("malformed entry line in " + String(ptx_path))
     return String(text[byte = i + marker.byte_length():j])
+
+
+def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
+    # Te kernele dekoduja UE4M3 programowo i korzystaja najwyzej z F16 MMA,
+    # dlatego nie wymagaja instrukcji FP8 dostepnych dopiero od Ada.
+    return (
+        name == "gemv_nvfp4_gguf_f16"
+        or name == "gemv_nvfp4_gguf_q8_1_f16"
+        or name == "mtp_prepare_f16"
+        or name == "gather_f16_row_f16"
+        or name == "gather_q8_0_row_f16"
+        or name == "gather_nvfp4_gguf_row_f16"
+        or name == "gemm_nvfp4_gguf_f16_b2"
+        or name == "gemm_nvfp4_gguf_f16_b3"
+        or name == "gemm_nvfp4_gguf_f16_b4"
+        or name == "gemm_nvfp4_gguf_f16_b8"
+        or name == "gemm_nvfp4_gguf_f16_b16"
+        or name == "gemm_nvfp4_gguf_mma_f16_bm32"
+        or name == "gemm_nvfp4_gguf_mma_f16_bm128"
+    )
 
 
 def _finalize(out_dir: Path, name: StringSlice) raises -> String:
@@ -207,7 +248,7 @@ def _finalize(out_dir: Path, name: StringSlice) raises -> String:
     tmp = Path(String(name) + ".ptx")
     final = out_dir / (String(name) + ".ptx")
     text = tmp.read_text()
-    if "fp8" not in name and "nvfp4" not in name:
+    if _is_portable_raw_nvfp4(name) or ("fp8" not in name and "nvfp4" not in name):
         text = text.replace(".target sm_89", ".target sm_80")
     final.write_text(text)
     os.remove(String(tmp))
@@ -314,6 +355,18 @@ def main() raises:
     _ = ctx.compile_function[deltanet_gated_step_f16, dump_asm=Path("deltanet_gated_step_f16.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_gated_step_f16"))
 
+    _ = ctx.compile_function[deltanet_gated_scan_t2_f16, dump_asm=Path("deltanet_gated_scan_t2_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_gated_scan_t2_f16"))
+
+    _ = ctx.compile_function[deltanet_gated_scan_t3_f16, dump_asm=Path("deltanet_gated_scan_t3_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_gated_scan_t3_f16"))
+
+    _ = ctx.compile_function[deltanet_gated_scan_t4_f16, dump_asm=Path("deltanet_gated_scan_t4_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_gated_scan_t4_f16"))
+
+    _ = ctx.compile_function[deltanet_commit_checkpoint_f32, dump_asm=Path("deltanet_commit_checkpoint_f32.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_commit_checkpoint_f32"))
+
     _ = ctx.compile_function[deltanet_gated_rmsnorm_f16, dump_asm=Path("deltanet_gated_rmsnorm_f16.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_gated_rmsnorm_f16"))
 
@@ -325,6 +378,32 @@ def main() raises:
 
     _ = ctx.compile_function[gemv_nvfp4_f16, dump_asm=Path("gemv_nvfp4_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_f16"))
+    _ = ctx.compile_function[gemv_nvfp4_gguf_f16, dump_asm=Path("gemv_nvfp4_gguf_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_f16"))
+    _ = ctx.compile_function[gemv_nvfp4_gguf_q8_1_f16, dump_asm=Path("gemv_nvfp4_gguf_q8_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_q8_1_f16"))
+    _ = ctx.compile_function[mtp_prepare_f16, dump_asm=Path("mtp_prepare_f16.ptx")]()
+    entries.append(_finalize(out_dir, "mtp_prepare_f16"))
+    _ = ctx.compile_function[gather_f16_row_f16, dump_asm=Path("gather_f16_row_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gather_f16_row_f16"))
+    _ = ctx.compile_function[gather_q8_0_row_f16, dump_asm=Path("gather_q8_0_row_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gather_q8_0_row_f16"))
+    _ = ctx.compile_function[gather_nvfp4_gguf_row_f16, dump_asm=Path("gather_nvfp4_gguf_row_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gather_nvfp4_gguf_row_f16"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b2, dump_asm=Path("gemm_nvfp4_gguf_f16_b2.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b2"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b3, dump_asm=Path("gemm_nvfp4_gguf_f16_b3.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b3"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b4, dump_asm=Path("gemm_nvfp4_gguf_f16_b4.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b4"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b8, dump_asm=Path("gemm_nvfp4_gguf_f16_b8.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b8"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b16, dump_asm=Path("gemm_nvfp4_gguf_f16_b16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b16"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_mma_f16_bm32, dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm32.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm32"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_mma_f16_bm128, dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128"))
     _ = ctx.compile_function[pack_nvfp4_fp8, dump_asm=Path("pack_nvfp4_fp8.ptx")]()
     entries.append(_finalize(out_dir, "pack_nvfp4_fp8"))
     _ = ctx.compile_function[pack_f16_fp8, dump_asm=Path("pack_f16_fp8.ptx")]()
@@ -395,6 +474,21 @@ def main() raises:
 
     _ = ctx.compile_function[gemm_q8_0_f16, dump_asm=Path("gemm_q8_0_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_f16"))
+
+    _ = ctx.compile_function[gemm_q8_0_i8mma_b2, dump_asm=Path("gemm_q8_0_i8mma_b2.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_b2"))
+
+    _ = ctx.compile_function[gemm_q8_0_i8mma_b3, dump_asm=Path("gemm_q8_0_i8mma_b3.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_b3"))
+
+    _ = ctx.compile_function[gemm_q8_0_i8mma_b4, dump_asm=Path("gemm_q8_0_i8mma_b4.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_b4"))
+
+    _ = ctx.compile_function[gemm_q8_0_i8mma_out_f32_b3, dump_asm=Path("gemm_q8_0_i8mma_out_f32_b3.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_out_f32_b3"))
+
+    _ = ctx.compile_function[gemm_q8_0_i8mma_out_f32_b4, dump_asm=Path("gemm_q8_0_i8mma_out_f32_b4.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_out_f32_b4"))
 
     _ = ctx.compile_function[gemm_nvfp4_f16, dump_asm=Path("gemm_nvfp4_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_f16"))

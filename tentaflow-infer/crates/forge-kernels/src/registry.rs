@@ -1,7 +1,7 @@
 // ===== File: registry.rs — PTX artifact loading (embedded defaults + dir override) =====
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use forge_hal::{Device, KernelHandle, Module};
 use forge_types::{ForgeError, Result};
@@ -99,10 +99,27 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "deltanet_conv_silu_f16",
     "l2norm_heads_f16",
     "deltanet_gated_step_f16",
+    "deltanet_gated_scan_t2_f16",
+    "deltanet_gated_scan_t3_f16",
+    "deltanet_gated_scan_t4_f16",
+    "deltanet_commit_checkpoint_f32",
     "deltanet_gated_rmsnorm_f16",
     "deltanet_log_decay_f32",
     "deltanet_beta_sigmoid_f32",
     "gemv_nvfp4_f16",
+    "gemv_nvfp4_gguf_f16",
+    "gemv_nvfp4_gguf_q8_1_f16",
+    "mtp_prepare_f16",
+    "gather_f16_row_f16",
+    "gather_q8_0_row_f16",
+    "gather_nvfp4_gguf_row_f16",
+    "gemm_nvfp4_gguf_f16_b2",
+    "gemm_nvfp4_gguf_f16_b3",
+    "gemm_nvfp4_gguf_f16_b4",
+    "gemm_nvfp4_gguf_f16_b8",
+    "gemm_nvfp4_gguf_f16_b16",
+    "gemm_nvfp4_gguf_mma_f16_bm32",
+    "gemm_nvfp4_gguf_mma_f16_bm128",
     "gather_rows_f16",
     "gemv_f16_out_f32",
     "gemv_q8_0_out_f32",
@@ -125,6 +142,11 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_f16_out_f32_v2",
     "gemv_fp8_out_f32_v2",
     "gemm_q8_0_f16",
+    "gemm_q8_0_i8mma_b2",
+    "gemm_q8_0_i8mma_b3",
+    "gemm_q8_0_i8mma_b4",
+    "gemm_q8_0_i8mma_out_f32_b3",
+    "gemm_q8_0_i8mma_out_f32_b4",
     "gemm_nvfp4_f16",
     "gemm_f16",
     "gemm_q8_0_f16_bm64",
@@ -418,6 +440,37 @@ fn is_sm89_only(ptx: &[u8]) -> bool {
         .any(|w| w == b".target sm_89")
 }
 
+fn resolve_artifact_path(arch_dir: &Path, file: &str) -> Result<PathBuf> {
+    let relative = Path::new(file);
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ForgeError::Kernel(format!(
+            "niedozwolona ścieżka artefaktu: {file}"
+        )));
+    }
+    let canonical_root = arch_dir.canonicalize().map_err(|error| {
+        ForgeError::Kernel(format!(
+            "canonicalize {}: {error}",
+            arch_dir.display()
+        ))
+    })?;
+    let candidate = canonical_root.join(relative).canonicalize().map_err(|error| {
+        ForgeError::Kernel(format!("canonicalize {file}: {error}"))
+    })?;
+    if !candidate.starts_with(&canonical_root) {
+        return Err(ForgeError::Kernel(format!(
+            "artefakt wychodzi poza katalog architektury: {file}"
+        )));
+    }
+    Ok(candidate)
+}
+
 /// Loaded modules + resolved kernel handles for one device.
 pub struct KernelArtifacts {
     handles: HashMap<String, KernelHandle>,
@@ -514,9 +567,11 @@ impl KernelArtifacts {
         let ada = device.caps().fp8_native;
         let mut handles = HashMap::new();
         for (name, entry) in &manifest.kernels {
-            let ptx = std::fs::read(arch_dir.join(&entry.file)).map_err(|e| {
-                ForgeError::Kernel(format!("read {}: {e}", entry.file))
-            })?;
+            // Schemat manifestu nie ma obecnie digestu; jego dodanie wymaga
+            // osobnej wersjonowanej zmiany kontraktu artefaktów.
+            let artifact_path = resolve_artifact_path(&arch_dir, &entry.file)?;
+            let ptx = std::fs::read(artifact_path)
+                .map_err(|e| ForgeError::Kernel(format!("read {}: {e}", entry.file)))?;
             if !ada && is_sm89_only(&ptx) {
                 continue;
             }
@@ -550,5 +605,97 @@ impl KernelArtifacts {
 
     pub fn has(&self, name: &str) -> bool {
         self.handles.contains_key(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_sm89_only, resolve_artifact_path, EMBEDDED_SM89};
+
+    const PORTABLE_RAW_NVFP4: &[&str] = &[
+        "gemv_nvfp4_gguf_f16",
+        "gemv_nvfp4_gguf_q8_1_f16",
+        "mtp_prepare_f16",
+        "gather_q8_0_row_f16",
+        "gather_nvfp4_gguf_row_f16",
+        "gemm_nvfp4_gguf_f16_b2",
+        "gemm_nvfp4_gguf_f16_b3",
+        "gemm_nvfp4_gguf_f16_b4",
+        "gemm_nvfp4_gguf_f16_b8",
+        "gemm_nvfp4_gguf_f16_b16",
+        "gemm_nvfp4_gguf_mma_f16_bm32",
+        "gemm_nvfp4_gguf_mma_f16_bm128",
+    ];
+
+    const PORTABLE_Q8_SMALL: &[&str] = &[
+        "gemm_q8_0_i8mma_b2",
+        "gemm_q8_0_i8mma_b3",
+        "gemm_q8_0_i8mma_b4",
+        "gemm_q8_0_i8mma_out_f32_b3",
+        "gemm_q8_0_i8mma_out_f32_b4",
+    ];
+
+    #[test]
+    fn raw_nvfp4_jest_dostepne_na_sm80_sm86_i_sm89() {
+        for name in PORTABLE_RAW_NVFP4 {
+            let artifact = EMBEDDED_SM89
+                .iter()
+                .find(|artifact| artifact.name == *name)
+                .unwrap();
+            for (arch, fp8_native) in [("sm_80", false), ("sm_86", false), ("sm_89", true)] {
+                let available = fp8_native || !is_sm89_only(artifact.ptx);
+                assert!(available, "{name} powinien być dostępny na {arch}");
+            }
+        }
+        let ada_only = EMBEDDED_SM89
+            .iter()
+            .find(|artifact| artifact.name == "gemv_nvfp4_f16")
+            .unwrap();
+        assert!(is_sm89_only(ada_only.ptx));
+    }
+
+    #[test]
+    fn male_q8_jest_dostepne_na_sm80_sm86_i_sm89() {
+        for name in PORTABLE_Q8_SMALL {
+            let artifact = EMBEDDED_SM89
+                .iter()
+                .find(|artifact| artifact.name == *name)
+                .unwrap();
+            assert!(!is_sm89_only(artifact.ptx));
+        }
+    }
+
+    #[test]
+    fn odrzuca_absolute_i_parent_traversal() {
+        let missing_root = std::path::Path::new("/katalog/ktory/nie/istnieje");
+        assert!(resolve_artifact_path(missing_root, "../escape.ptx").is_err());
+        assert!(resolve_artifact_path(missing_root, "/tmp/escape.ptx").is_err());
+        assert!(resolve_artifact_path(missing_root, "").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn odrzuca_symlink_wychodzacy_poza_katalog() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "forge-kernel-registry-{}-{nonce}",
+            std::process::id()
+        ));
+        let arch_dir = base.join("sm_89");
+        let outside = base.join("outside.ptx");
+        std::fs::create_dir_all(&arch_dir).unwrap();
+        std::fs::write(&outside, b"ptx").unwrap();
+        symlink(&outside, arch_dir.join("escape.ptx")).unwrap();
+
+        assert!(resolve_artifact_path(&arch_dir, "escape.ptx").is_err());
+        std::fs::write(arch_dir.join("ok.ptx"), b"ptx").unwrap();
+        assert!(resolve_artifact_path(&arch_dir, "ok.ptx").is_ok());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -5,7 +5,7 @@ use super::ngram::NgramProposer;
 use super::state::SpeculativeState;
 use super::stats::ProposerStats;
 use super::{
-    verify_greedy, DraftNode, DraftTree, Proposer, ProposerKind, SeqContext,
+    verify_greedy, DraftNode, DraftTree, Proposer, ProposerKind, SeqContext, SpeculationKind,
     SpeculationCoordinator, SpeculativeConfig,
 };
 
@@ -421,7 +421,6 @@ fn coordinator_builds_ngram_and_rejects_unimplemented_proposers() {
 
     for kind in [
         ProposerKind::DraftModel,
-        ProposerKind::Mtp,
         ProposerKind::Eagle,
         ProposerKind::DFlash,
         ProposerKind::DSpark,
@@ -433,6 +432,29 @@ fn coordinator_builds_ngram_and_rejects_unimplemented_proposers() {
         .err()
         .expect("niezaimplementowany proposer powinien zwrócić błąd");
         assert!(matches!(error, forge_types::ForgeError::Unsupported(_)));
+    }
+}
+
+#[test]
+fn coordinator_recognizes_model_owned_native_mtp() {
+    for budget in [2, 3] {
+        let config = SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget)
+            .expect("natywne MTP powinno obsługiwać budżet 2 lub 3");
+        assert_eq!(config.kind(), SpeculationKind::NativeMtp);
+        let coordinator = SpeculationCoordinator::new(config).expect("MTP nie buduje CPU proposer");
+        assert!(coordinator
+            .new_state(&[1, 2, 3])
+            .expect("MTP nie potrzebuje stanu hostowego")
+            .is_none());
+    }
+    assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 1).is_err());
+    assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 4).is_err());
+    for chain in [
+        vec![ProposerKind::Mtp, ProposerKind::Ngram],
+        vec![ProposerKind::Mtp, ProposerKind::DraftModel],
+        vec![ProposerKind::DraftModel, ProposerKind::Mtp],
+    ] {
+        assert!(SpeculativeConfig::chain(chain, 3).is_err());
     }
 }
 

@@ -15,7 +15,7 @@ pub mod state;
 pub mod stats;
 
 pub use cascade::{CascadeComposer, DraftSegment};
-pub use config::{ProposerKind, SpeculationCoordinator, SpeculativeConfig};
+pub use config::{ProposerKind, SpeculationCoordinator, SpeculationKind, SpeculativeConfig};
 pub use ngram::NgramProposer;
 pub use state::SpeculativeState;
 pub use stats::{ProposerStats, ProposerStatsSnapshot};
