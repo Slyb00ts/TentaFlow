@@ -155,6 +155,29 @@ i 36,685 ms dla kafelkowanego, czyli około 5,9% krótszy cykl. `tok/s` nie jest
 tu porównywane bezpośrednio, ponieważ dwa przebiegi miały inną akceptację draftu.
 AMD/ROCm i Metal nie były mierzone wykonawczo.
 
+## Prefill DeltaNet block64
+
+Profil `nsys` dla raw512 i chunk128 wskazał 4805 uruchomień w 652,5 ms,
+przy 648,7 ms łącznego czasu kerneli. Luki między kernelami wynoszą zatem
+około 3,9 ms i nie są głównym ograniczeniem. NVFP4 MMA zajmuje 342,7 ms,
+skan DeltaNet 145,5 ms, a Q8 i8mma 101,0 ms.
+
+Dynamiczny skan `d_state=128` używa teraz kafla co najmniej 64-wątkowego.
+Na NVIDIA zmienia to `grid192/block32` na `grid96/block64`; AMD z wave64
+zachowuje szerokość 64. Wynik i stan są bitowo zgodne dla T=128, 48 głów oraz
+po 20 kolejnych iteracjach. Izolowany czas spadł z 790,75 us do 756,92 us.
+
+Kontrolne A/B pełnego raw512/chunk128, po pięć repetycji:
+
+| Wariant | Mediana prefill | Przepustowość |
+|---|---:|---:|
+| block32 | 652,417 ms | 784,8 tok/s |
+| block64 | 642,345 ms | 797,1 tok/s |
+
+GPU gather embeddingu nie jest obecnie opłacalnym kierunkiem dla tego modelu:
+transfer 512 wierszy zajmuje około 0,42 ms, natomiast pełna tabela F16 wymagałaby
+około 2,54 GB dodatkowego VRAM.
+
 ## Q8_0 B3/B4 DP4A na NVIDIA
 
 Krótkie projekcje Q8_0 w warstwach DeltaNet mają osobny wariant NVIDIA z

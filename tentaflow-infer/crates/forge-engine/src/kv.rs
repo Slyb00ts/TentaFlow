@@ -177,6 +177,13 @@ pub struct SpilledRange {
     pub chunk: u64,
 }
 
+/// Uchwyt stanu rekurencyjnego przypisanego do jednej sekwencji hybrydowej.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HybridStateLease {
+    pub slot: usize,
+    pub generation: u64,
+}
+
 /// One sequence's view of the cache: its page table (host mirror) and length.
 /// With tiering, `pages` entries of spilled pages are -1 and `spilled` maps
 /// them to tier chunks; `tokens` retains the token ids (recompute path).
@@ -199,6 +206,8 @@ pub struct SeqKv {
     /// Prefix-cache node whose borrow this sequence holds (deepest matched
     /// prefix), released and extended on completion. `None` = no borrow.
     pub prefix_node: Option<crate::prefix::NodeId>,
+    /// Slot stanu DeltaNet; `None` do pierwszego przebiegu modelu hybrydowego.
+    pub(crate) hybrid_state: Option<HybridStateLease>,
 }
 
 impl SeqKv {
@@ -321,6 +330,7 @@ impl KvCache {
             prefilled_len: 0,
             shared_pages: 0,
             prefix_node: None,
+            hybrid_state: None,
         }
     }
 

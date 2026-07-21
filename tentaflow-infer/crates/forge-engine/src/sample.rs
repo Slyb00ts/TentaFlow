@@ -154,15 +154,29 @@ pub fn suppress_eos(logits: &mut [f32], eos_ids: &[u32], generated: usize, min_t
 /// most-probable first. Numerically stable via the max-shifted log-sum-exp; a
 /// -inf logit (e.g. grammar/`min_tokens`-masked) maps to a -inf log-probability.
 pub fn compute_logprob(logits: &[f32], sampled: u32, top_n: usize) -> TokenLogprob {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
     let sum: f32 = if max.is_finite() {
-        logits.iter().map(|&l| (l - max).exp()).sum()
+        logits
+            .iter()
+            .filter(|value| value.is_finite())
+            .map(|&l| (l - max).exp())
+            .sum()
     } else {
         0.0
     };
     // log-sum-exp; guards the degenerate all -inf case (sum == 0 → lse -inf).
     let lse = if sum > 0.0 { max + sum.ln() } else { f32::NEG_INFINITY };
-    let lp = |l: f32| l - lse;
+    let lp = |l: f32| {
+        if l.is_finite() && lse.is_finite() {
+            l - lse
+        } else {
+            f32::NEG_INFINITY
+        }
+    };
 
     let sampled_lp = logits
         .get(sampled as usize)
@@ -174,13 +188,16 @@ pub fn compute_logprob(logits: &[f32], sampled: u32, top_n: usize) -> TokenLogpr
         let mut idx: Vec<(u32, f32)> = logits
             .iter()
             .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
             .map(|(i, &l)| (i as u32, l))
             .collect();
-        let k = top_n.min(idx.len());
-        idx.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
-        idx.truncate(k);
-        idx.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        top = idx.into_iter().map(|(i, l)| (i, lp(l))).collect();
+        if !idx.is_empty() {
+            let k = top_n.min(idx.len());
+            idx.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+            idx.truncate(k);
+            idx.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            top = idx.into_iter().map(|(i, l)| (i, lp(l))).collect();
+        }
     }
     TokenLogprob {
         token: sampled,
@@ -194,7 +211,11 @@ pub struct Rng(u64);
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Rng(seed.max(1))
+        Rng(if seed == 0 {
+            0x9E3779B97F4A7C15
+        } else {
+            seed
+        })
     }
 
     fn next_f32(&mut self) -> f32 {
@@ -232,8 +253,9 @@ impl Sampler {
             let (best, _) = logits
                 .iter()
                 .enumerate()
+                .filter(|(_, logit)| logit.is_finite())
                 .max_by(|a, b| a.1.total_cmp(b.1))
-                .expect("non-empty");
+                .ok_or_else(|| ForgeError::Scheduler("all logits are masked".into()))?;
             return Ok(best as u32);
         }
 
@@ -255,8 +277,9 @@ impl Sampler {
             let (best, _) = logits
                 .iter()
                 .enumerate()
+                .filter(|(_, logit)| logit.is_finite())
                 .max_by(|a, b| a.1.total_cmp(b.1))
-                .expect("non-empty");
+                .ok_or_else(|| ForgeError::Scheduler("all logits are masked".into()))?;
             return Ok(best as u32);
         }
 
@@ -264,8 +287,12 @@ impl Sampler {
         let mut candidates: Vec<(u32, f32)> = logits
             .iter()
             .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
             .map(|(i, &l)| (i as u32, l * inv_t))
             .collect();
+        if candidates.is_empty() {
+            return Err(ForgeError::Scheduler("all logits are masked".into()));
+        }
         candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
         if p.top_k > 0 && p.top_k < candidates.len() {
@@ -577,6 +604,18 @@ mod tests {
     }
 
     #[test]
+    fn logprob_pomija_nan_i_zamaskowane_tokeny_w_top() {
+        let logits = [2.0f32, f32::NAN, 1.0, f32::NEG_INFINITY, 0.0];
+        let result = compute_logprob(&logits, 0, 5);
+        let expected_lse = 2.0f32 + (1.0 + (-1.0f32).exp() + (-2.0f32).exp()).ln();
+
+        assert_eq!(result.top.len(), 3);
+        assert_eq!(result.top.iter().map(|entry| entry.0).collect::<Vec<_>>(), [0, 2, 4]);
+        assert!((result.logprob - (2.0 - expected_lse)).abs() < 1e-6);
+        assert!(result.top.iter().all(|entry| entry.1.is_finite()));
+    }
+
+    #[test]
     fn frequency_i_presence_uzywaja_licznosci_z_okna() {
         let params = SamplingParams {
             temperature: 0.0,
@@ -637,5 +676,106 @@ mod tests {
             frequency_penalty: 0.1,
             ..greedy
         }));
+    }
+
+    #[test]
+    fn seed_odtwarza_temperature_top_k_top_p_i_min_p() {
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_k: 3,
+            top_p: 0.85,
+            min_p: 0.1,
+            seed: Some(1234),
+            ..SamplingParams::default()
+        };
+        let logits = [4.0f32, 3.0, 2.0, 1.0, 0.0];
+        let mut first = Sampler::new(params.clone());
+        let mut second = Sampler::new(params);
+        let first_ids: Vec<u32> = (0..64)
+            .map(|_| first.sample(&logits, &[]).unwrap())
+            .collect();
+        let second_ids: Vec<u32> = (0..64)
+            .map(|_| second.sample(&logits, &[]).unwrap())
+            .collect();
+
+        assert_eq!(first_ids, second_ids);
+        assert!(first_ids.iter().all(|&id| id < 3));
+    }
+
+    #[test]
+    fn seed_zero_i_jeden_maja_rozne_strumienie() {
+        let logits = [1.0f32, 0.9, 0.8, 0.7];
+        let sample = |seed| {
+            let mut sampler = Sampler::new(SamplingParams {
+                temperature: 1.0,
+                top_k: 4,
+                top_p: 1.0,
+                seed: Some(seed),
+                ..SamplingParams::default()
+            });
+            (0..64)
+                .map(|_| sampler.sample(&logits, &[]).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        assert_ne!(sample(0), sample(1));
+    }
+
+    #[test]
+    fn top_k_top_p_i_min_p_moga_zredukowac_sampling_do_argmaxu() {
+        let logits = [5.0f32, 4.0, 3.0, 2.0];
+        for params in [
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 1,
+                top_p: 1.0,
+                min_p: 0.0,
+                seed: Some(7),
+                ..SamplingParams::default()
+            },
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 4,
+                top_p: 0.01,
+                min_p: 0.0,
+                seed: Some(7),
+                ..SamplingParams::default()
+            },
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 4,
+                top_p: 1.0,
+                min_p: 0.99,
+                seed: Some(7),
+                ..SamplingParams::default()
+            },
+        ] {
+            let mut sampler = Sampler::new(params);
+            for _ in 0..16 {
+                assert_eq!(sampler.sample(&logits, &[]).unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn calkowicie_zamaskowane_logity_zwracaja_blad() {
+        let logits = [f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY];
+        for temperature in [0.0, 0.7] {
+            let mut sampler = Sampler::new(SamplingParams {
+                temperature,
+                seed: Some(9),
+                ..SamplingParams::default()
+            });
+            assert!(sampler.sample(&logits, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn logprob_calkowicie_zamaskowanego_slownika_nie_jest_nan() {
+        let logits = [f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY];
+        let result = compute_logprob(&logits, 0, 3);
+
+        assert_eq!(result.logprob, f32::NEG_INFINITY);
+        assert!(result.top.is_empty());
     }
 }

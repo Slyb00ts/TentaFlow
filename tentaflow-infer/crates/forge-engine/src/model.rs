@@ -10,13 +10,13 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
-use forge_formats::PoolingType;
+use forge_formats::{PoolingType, LayerKind};
 use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
 use forge_kernels::{Kernels, Nvfp4GgufQ8Projection};
 use forge_types::{ForgeError, MemKind, Result, Vendor};
 use half::f16;
 
-use crate::kv::{KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
+use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
 use crate::mtp::{MtpDraftState, MtpEmbedding};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
@@ -278,11 +278,8 @@ pub struct Model {
     pt_seq: u64,
     /// MoE scratch; `Some` only for Mixture-of-Experts models.
     moe_bufs: Option<MoeBufs>,
-    /// Per-layer Gated-DeltaNet recurrent state (hybrid `qwen35moe` only):
-    /// `Some` for DeltaNet layers, `None` for attention layers. Persistent for
-    /// the model lifetime (single active sequence at a time on the hybrid
-    /// path), zeroed at each sequence start (`pos == 0`).
-    ssm: Vec<Option<SsmState>>,
+    /// Pula izolowanych stanów Gated-DeltaNet przypisanych do sekwencji.
+    hybrid_states: Option<HybridStatePool>,
     /// Gated-attention + DeltaNet single-token scratch; allocated lazily for a
     /// hybrid model on the first hybrid forward.
     hybrid_bufs: Option<HybridBufs>,
@@ -375,6 +372,260 @@ struct SsmState {
     conv: DevBuffer,
     /// Recurrent state matrices `[n_v_heads, d_state, d_state]` f32.
     state: DevBuffer,
+}
+
+struct HybridStateSlot {
+    layers: Vec<Option<SsmState>>,
+    generation: u64,
+    in_use: bool,
+    ready: Event,
+    ready_recorded: bool,
+    initialized_generation: u64,
+}
+
+struct HybridStatePool {
+    device: Arc<dyn Device>,
+    layer_kinds: Vec<LayerKind>,
+    conv_bytes: usize,
+    state_bytes: usize,
+    zero_conv: DevBuffer,
+    zero_state: DevBuffer,
+    slots: Vec<HybridStateSlot>,
+    free: Vec<usize>,
+    active: Option<HybridStateLease>,
+    poisoned: Option<String>,
+}
+
+impl HybridStatePool {
+    fn new(
+        device: Arc<dyn Device>,
+        layer_kinds: Vec<LayerKind>,
+        conv_bytes: usize,
+        state_bytes: usize,
+    ) -> Result<Self> {
+        let zero_conv = device.alloc(conv_bytes, MemKind::PinnedHost, Pool::Activations)?;
+        let zero_state = device.alloc(state_bytes, MemKind::PinnedHost, Pool::Activations)?;
+        unsafe {
+            std::ptr::write_bytes(
+                zero_conv.host_ptr().expect("pinned host mapping"),
+                0,
+                conv_bytes,
+            );
+            std::ptr::write_bytes(
+                zero_state.host_ptr().expect("pinned host mapping"),
+                0,
+                state_bytes,
+            );
+        }
+        let mut pool = Self {
+            device,
+            layer_kinds,
+            conv_bytes,
+            state_bytes,
+            zero_conv,
+            zero_state,
+            slots: Vec::new(),
+            free: Vec::new(),
+            active: None,
+            poisoned: None,
+        };
+        pool.allocate_slot()?;
+        Ok(pool)
+    }
+
+    fn allocate_slot(&mut self) -> Result<usize> {
+        let mut layers = Vec::with_capacity(self.layer_kinds.len());
+        for kind in &self.layer_kinds {
+            layers.push(match kind {
+                LayerKind::DeltaNet => Some(SsmState {
+                    conv: self
+                        .device
+                        .alloc(self.conv_bytes, MemKind::Device, Pool::Weights)?,
+                    state: self
+                        .device
+                        .alloc(self.state_bytes, MemKind::Device, Pool::Weights)?,
+                }),
+                LayerKind::Attention => None,
+            });
+        }
+        let slot = self.slots.len();
+        self.slots.push(HybridStateSlot {
+            layers,
+            generation: 0,
+            in_use: false,
+            ready: self.device.create_event()?,
+            ready_recorded: false,
+            initialized_generation: 0,
+        });
+        self.free.push(slot);
+        Ok(slot)
+    }
+
+    fn acquire(&mut self) -> Result<HybridStateLease> {
+        self.ensure_healthy()?;
+        if self.free.is_empty() {
+            self.allocate_slot()?;
+        }
+        let slot = self.free.pop().expect("wolny slot został przygotowany");
+        let state = &mut self.slots[slot];
+        state.generation = state.generation.checked_add(1).ok_or_else(|| {
+            ForgeError::Scheduler("licznik generacji stanu hybrydowego został wyczerpany".into())
+        })?;
+        state.in_use = true;
+        Ok(HybridStateLease {
+            slot,
+            generation: state.generation,
+        })
+    }
+
+    fn validate(&self, lease: HybridStateLease) -> Result<()> {
+        let Some(slot) = self.slots.get(lease.slot) else {
+            return Err(ForgeError::Scheduler(
+                "nieprawidłowy slot stanu hybrydowego".into(),
+            ));
+        };
+        if !slot.in_use || slot.generation != lease.generation {
+            return Err(ForgeError::Scheduler(
+                "nieaktualny lease stanu hybrydowego".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(reason) => Err(ForgeError::Device(format!(
+                "pula stanów hybrydowych jest zatruta: {reason}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn activate(&mut self, lease: HybridStateLease, stream: &Stream) -> Result<()> {
+        self.ensure_healthy()?;
+        self.validate(lease)?;
+        if self.active == Some(lease) {
+            return Ok(());
+        }
+        // Aktywne lease współdzielą jeden stream, więc ich praca jest już
+        // uporządkowana; event jest potrzebny dopiero między generacjami slotu.
+        let slot = &mut self.slots[lease.slot];
+        if slot.ready_recorded {
+            self.device.wait_event(stream, &slot.ready)?;
+            slot.ready_recorded = false;
+        }
+        if slot.initialized_generation != lease.generation {
+            for state in slot.layers.iter().flatten() {
+                self.device
+                    .copy(&self.zero_conv, 0, &state.conv, 0, self.conv_bytes, stream)?;
+                self.device.copy(
+                    &self.zero_state,
+                    0,
+                    &state.state,
+                    0,
+                    self.state_bytes,
+                    stream,
+                )?;
+            }
+            slot.initialized_generation = lease.generation;
+        }
+        self.active = Some(lease);
+        Ok(())
+    }
+
+    fn release(&mut self, lease: HybridStateLease, stream: &Stream) -> Result<()> {
+        self.ensure_healthy()?;
+        self.validate(lease)?;
+        let record_result = self
+            .device
+            .record_event(&self.slots[lease.slot].ready, stream);
+        self.finish_release(lease, record_result, || stream.synchronize())
+    }
+
+    fn finish_release(
+        &mut self,
+        lease: HybridStateLease,
+        record_result: Result<()>,
+        synchronize: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let event_recorded = match record_result {
+            Ok(()) => true,
+            Err(record_error) => match synchronize() {
+                Ok(()) => {
+                    if let Err(zero_error) = self.zero_slot_synchronously(lease.slot) {
+                        let reason = format!(
+                            "record eventu nie powiódł się ({record_error}); po synchronizacji nie udało się wyzerować slotu ({zero_error})"
+                        );
+                        self.poisoned = Some(reason.clone());
+                        return Err(ForgeError::Device(reason));
+                    }
+                    tracing::warn!(
+                        "record eventu zwolnienia stanu hybrydowego nie powiódł się; stream został zsynchronizowany: {record_error}"
+                    );
+                    false
+                }
+                Err(sync_error) => {
+                    let reason = format!(
+                        "record eventu nie powiódł się ({record_error}); synchronizacja streamu także nie powiodła się ({sync_error})"
+                    );
+                    self.poisoned = Some(reason.clone());
+                    return Err(ForgeError::Device(reason));
+                }
+            },
+        };
+        let slot = &mut self.slots[lease.slot];
+        slot.ready_recorded = event_recorded;
+        if self.active == Some(lease) {
+            self.active = None;
+        }
+        slot.in_use = false;
+        self.free.push(lease.slot);
+        Ok(())
+    }
+
+    fn zero_slot_synchronously(&self, slot_index: usize) -> Result<()> {
+        let zero_conv = unsafe {
+            std::slice::from_raw_parts(
+                self.zero_conv.host_ptr().expect("pinned host mapping"),
+                self.conv_bytes,
+            )
+        };
+        let zero_state = unsafe {
+            std::slice::from_raw_parts(
+                self.zero_state.host_ptr().expect("pinned host mapping"),
+                self.state_bytes,
+            )
+        };
+        for state in self.slots[slot_index].layers.iter().flatten() {
+            self.device.write(zero_conv, &state.conv, 0)?;
+            self.device.write(zero_state, &state.state, 0)?;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self, lease: HybridStateLease, stream: &Stream) -> Result<()> {
+        self.activate(lease, stream)?;
+        let slot = &mut self.slots[lease.slot];
+        for state in slot.layers.iter().flatten() {
+            self.device
+                .copy(&self.zero_conv, 0, &state.conv, 0, self.conv_bytes, stream)?;
+            self.device.copy(
+                &self.zero_state,
+                0,
+                &state.state,
+                0,
+                self.state_bytes,
+                stream,
+            )?;
+        }
+        slot.initialized_generation = lease.generation;
+        Ok(())
+    }
+
+    fn active_layers(&self) -> &[Option<SsmState>] {
+        let active = self.active.expect("stan hybrydowy został aktywowany");
+        &self.slots[active.slot].layers
+    }
 }
 
 /// Single-token scratch for the hybrid (gated-attention + DeltaNet) forward.
@@ -1049,26 +1300,19 @@ impl Model {
             }
             None => None,
         };
-        // Gated-DeltaNet recurrent state, one entry per DeltaNet layer (hybrid
-        // arch only). Allocated once and reused; zeroed at each sequence start.
-        let ssm = match &weights.descriptor.params.ssm {
+        // Pula stanów DeltaNet rośnie wraz z liczbą przeplatanych sekwencji.
+        let hybrid_states = match &weights.descriptor.params.ssm {
             Some(sp) => {
                 let conv_bytes = sp.conv_dim() * (sp.d_conv - 1) * 2;
                 let state_bytes = sp.n_v_heads() * sp.d_state * sp.d_state * 4;
-                weights
-                    .descriptor
-                    .layer_kinds
-                    .iter()
-                    .map(|k| match k {
-                        forge_formats::LayerKind::DeltaNet => Ok(Some(SsmState {
-                            conv: device.alloc(conv_bytes, MemKind::Device, Pool::Weights)?,
-                            state: device.alloc(state_bytes, MemKind::Device, Pool::Weights)?,
-                        })),
-                        forge_formats::LayerKind::Attention => Ok(None),
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                Some(HybridStatePool::new(
+                    device.clone(),
+                    weights.descriptor.layer_kinds.clone(),
+                    conv_bytes,
+                    state_bytes,
+                )?)
             }
-            None => Vec::new(),
+            None => None,
         };
         // Prefix caching is a strict optimization: engage only where a borrowed
         // prefix page is byte-identical to a fresh prefill and never mutated.
@@ -1129,7 +1373,7 @@ impl Model {
             tier_bufs,
             pt_seq: 0,
             moe_bufs,
-            ssm,
+            hybrid_states,
             hybrid_bufs: None,
             hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
             prefix_cache,
@@ -1282,6 +1526,19 @@ impl Model {
     }
 
     pub fn release_seq(&mut self, seq: &mut SeqKv) {
+        if let Some(lease) = seq.hybrid_state {
+            let release = self
+                .hybrid_states
+                .as_mut()
+                .expect("lease hybrydowy wymaga puli")
+                .release(lease, &self.stream);
+            match release {
+                Ok(()) => seq.hybrid_state = None,
+                Err(error) => {
+                    tracing::error!("nie można bezpiecznie zwolnić stanu hybrydowego: {error}");
+                }
+            }
+        }
         if let Some(t) = &mut self.tier {
             t.drop_seq(seq);
         }
@@ -1292,6 +1549,28 @@ impl Model {
         if let Some(state) = &mut self.mtp_state {
             state.release();
         }
+    }
+
+    fn activate_hybrid_sequence(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let pool = self.hybrid_states.as_mut().ok_or_else(|| {
+            ForgeError::Scheduler("model hybrydowy nie ma puli stanów DeltaNet".into())
+        })?;
+        let lease = match seq.hybrid_state {
+            Some(lease) => lease,
+            None => {
+                let lease = pool.acquire()?;
+                seq.hybrid_state = Some(lease);
+                lease
+            }
+        };
+        pool.activate(lease, &self.stream)
+    }
+
+    fn active_ssm(&self) -> &[Option<SsmState>] {
+        self.hybrid_states
+            .as_ref()
+            .expect("model hybrydowy ma pulę stanów")
+            .active_layers()
     }
 
     pub fn tier_enabled(&self) -> bool {
@@ -1549,6 +1828,9 @@ impl Model {
         }
         self.kv.release(seq);
         self.pt_seq = 0;
+        if let (Some(pool), Some(lease)) = (&mut self.hybrid_states, seq.hybrid_state) {
+            pool.reset(lease, &self.stream)?;
+        }
         for chunk in toks.chunks(MAX_PREFILL_CHUNK) {
             if self.is_hybrid() {
                 self.prefill_hybrid(seq, chunk)?;
@@ -4288,6 +4570,9 @@ impl Model {
                 p.max_position_embeddings
             )));
         }
+        if self.is_hybrid() {
+            self.activate_hybrid_sequence(seq)?;
+        }
 
         self.tier_ensure_capacity(seq, 1)?;
         if self.tier.is_some() {
@@ -4324,9 +4609,6 @@ impl Model {
         // resident SSM state, not graph-capturable (host readbacks per layer).
         if self.is_hybrid() {
             self.ensure_hybrid_bufs()?;
-            if pos == 0 {
-                self.zero_ssm()?;
-            }
             return self.hybrid_forward_token(token_id, true, AttnSrc::Paged);
         }
 
@@ -6094,7 +6376,7 @@ impl Model {
         let cache = hv.delta[layer_index]
             .as_ref()
             .expect("warstwa DeltaNet ma cache verifiera");
-        let state = self.ssm[layer_index]
+        let state = self.active_ssm()[layer_index]
             .as_ref()
             .expect("warstwa DeltaNet ma stan");
 
@@ -6378,7 +6660,7 @@ impl Model {
         let conv_elems = ssm.conv_dim() * (ssm.d_conv - 1);
         for (layer_index, cache) in hv.delta.iter().enumerate() {
             let Some(cache) = cache else { continue };
-            let state = self.ssm[layer_index]
+            let state = self.active_ssm()[layer_index]
                 .as_ref()
                 .expect("warstwa DeltaNet ma stan");
             match &cache.commit {
@@ -6449,7 +6731,7 @@ impl Model {
         let cache = hv.delta[layer_index]
             .as_ref()
             .expect("warstwa DeltaNet ma cache skanu");
-        let state = self.ssm[layer_index]
+        let state = self.active_ssm()[layer_index]
             .as_ref()
             .expect("warstwa DeltaNet ma stan");
         self.kernels.mtp_select_row_f16(
@@ -6637,6 +6919,7 @@ impl Model {
                 "hybrydowy verifier spekulacyjny obsługuje draft długości 2 lub 3".into(),
             ));
         }
+        self.activate_hybrid_sequence(seq)?;
         let t = draft.len() + 1;
         self.validate_hybrid_speculation_target()?;
         self.ensure_prefill_bufs()?;
@@ -6664,7 +6947,7 @@ impl Model {
                 .expect("bufory hybrid verify są gotowe");
             for (layer_index, cache) in hv.delta.iter().enumerate() {
                 let Some(cache) = cache else { continue };
-                let state = self.ssm[layer_index]
+                let state = self.active_ssm()[layer_index]
                     .as_ref()
                     .expect("warstwa DeltaNet ma stan");
                 self.device.copy(
@@ -6801,7 +7084,7 @@ impl Model {
                             .expect("bufory hybrid verify są gotowe");
                         for (layer_index, cache) in hv.delta.iter().enumerate() {
                             let Some(cache) = cache else { continue };
-                            let state = self.ssm[layer_index]
+                            let state = self.active_ssm()[layer_index]
                                 .as_ref()
                                 .expect("warstwa DeltaNet ma stan");
                             self.device.copy(
@@ -7764,7 +8047,7 @@ impl Model {
             self.device.read(buffer, 0, &mut bytes)?;
             snapshot.push((name.into(), element_bytes, bytes));
         }
-        for (layer, state) in self.ssm.iter().enumerate() {
+        for (layer, state) in self.active_ssm().iter().enumerate() {
             let Some(state) = state else { continue };
             for (kind, buffer, element_bytes) in [
                 ("conv", &state.conv, 2usize),
@@ -7872,23 +8155,6 @@ impl Model {
                 Pool::Activations,
             )?,
         });
-        Ok(())
-    }
-
-    /// Zero every DeltaNet layer's recurrent state (conv window + state matrix)
-    /// at the start of a new sequence.
-    fn zero_ssm(&self) -> Result<()> {
-        let Some(ssm) = &self.weights.descriptor.params.ssm else {
-            return Ok(());
-        };
-        let conv_bytes = ssm.conv_dim() * (ssm.d_conv - 1) * 2;
-        let state_bytes = ssm.n_v_heads() * ssm.d_state * ssm.d_state * 4;
-        let zc = vec![0u8; conv_bytes];
-        let zs = vec![0u8; state_bytes];
-        for s in self.ssm.iter().flatten() {
-            self.device.write(&zc, &s.conv, 0)?;
-            self.device.write(&zs, &s.state, 0)?;
-        }
         Ok(())
     }
 
@@ -8146,7 +8412,7 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
-        let st = self.ssm[l].as_ref().expect("DeltaNet layer has ssm state");
+        let st = self.active_ssm()[l].as_ref().expect("DeltaNet layer has ssm state");
 
         // Input projections: mixed q|k|v conv stream, output gate z, and the
         // per-head decay/write-gate projections.
@@ -8227,6 +8493,7 @@ impl Model {
     /// VRAM pool prefills by streaming older attention KV back per layer while
     /// the resident DeltaNet state advances untouched.
     fn prefill_hybrid(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.activate_hybrid_sequence(seq)?;
         let batched_enabled = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
             .map_or(true, |value| value != "0");
         if batched_enabled && tokens.len() > 1 && self.validate_hybrid_speculation_target().is_ok() {
@@ -8241,7 +8508,6 @@ impl Model {
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = seq.len;
             if pos == 0 {
-                self.zero_ssm()?;
                 if let Some(state) = &mut self.mtp_state {
                     state.reset_hidden()?;
                 }
@@ -8328,7 +8594,6 @@ impl Model {
             )));
         }
         if seq.len == 0 {
-            self.zero_ssm()?;
             if let Some(state) = &mut self.mtp_state {
                 state.reset_hidden()?;
             }
@@ -9570,10 +9835,143 @@ impl Model {
 mod verify_rollback_tests {
     use super::{
         finish_greedy_verification, hybrid_prefill_profile_spans, hybrid_q_full_cols,
-        logical_kv_regions, native_mtp_greedy_decision, restore_after, ForgeError, KvCache,
-        KvConfig, KvQuant, Result, SeqKv,
+        logical_kv_regions, native_mtp_greedy_decision, restore_after, ForgeError, HybridStatePool,
+        KvCache, KvConfig, KvQuant, LayerKind, Result, SeqKv,
     };
     use forge_hal::cpu::CpuDevice;
+    use forge_hal::Device;
+    use std::sync::Arc;
+
+    #[test]
+    fn pula_stanow_izoluje_przeplatane_sekwencje_i_zeruje_reuzyty_slot() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(
+            device.clone(),
+            vec![LayerKind::DeltaNet, LayerKind::Attention],
+            8,
+            16,
+        )
+        .expect("pula powinna powstać");
+        let first = pool.acquire().expect("pierwszy lease powinien powstać");
+        let second = pool.acquire().expect("drugi lease powinien powstać");
+        assert_ne!(first.slot, second.slot);
+
+        pool.activate(first, &stream)
+            .expect("pierwszy stan powinien się aktywować");
+        let first_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .write(&[7; 16], &first_state.state, 0)
+            .expect("zapis pierwszego stanu powinien się udać");
+
+        pool.activate(second, &stream)
+            .expect("drugi stan powinien się aktywować");
+        let second_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        let mut bytes = [0xff; 16];
+        device
+            .read(&second_state.state, 0, &mut bytes)
+            .expect("odczyt drugiego stanu powinien się udać");
+        assert_eq!(bytes, [0; 16]);
+        device
+            .write(&[9; 16], &second_state.state, 0)
+            .expect("zapis drugiego stanu powinien się udać");
+
+        pool.activate(first, &stream)
+            .expect("pierwszy stan powinien wrócić");
+        let first_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .read(&first_state.state, 0, &mut bytes)
+            .expect("odczyt pierwszego stanu powinien się udać");
+        assert_eq!(bytes, [7; 16]);
+
+        pool.release(first, &stream)
+            .expect("pierwszy lease powinien się zwolnić");
+        let reused = pool.acquire().expect("slot powinien wrócić do puli");
+        assert_eq!(reused.slot, first.slot);
+        assert!(reused.generation > first.generation);
+        pool.activate(reused, &stream)
+            .expect("ponownie użyty slot powinien się aktywować");
+        let reused_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .read(&reused_state.state, 0, &mut bytes)
+            .expect("odczyt ponownie użytego stanu powinien się udać");
+        assert_eq!(bytes, [0; 16]);
+        assert!(pool.release(first, &stream).is_err());
+    }
+
+    #[test]
+    fn blad_eventu_z_udanym_sync_nie_powoduje_wzrostu_puli() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16)
+            .expect("pula powinna powstać");
+
+        for _ in 0..64 {
+            let lease = pool.acquire().expect("slot powinien wrócić do puli");
+            pool.activate(lease, &stream)
+                .expect("slot powinien się aktywować");
+            let state = pool.active_layers()[0]
+                .as_ref()
+                .expect("warstwa DeltaNet ma stan");
+            pool.device
+                .write(&[7; 16], &state.state, 0)
+                .expect("zapis stanu powinien się udać");
+            pool.finish_release(
+                lease,
+                Err(ForgeError::Device("wymuszony błąd eventu".into())),
+                || Ok(()),
+            )
+            .expect("synchronizacja powinna bezpiecznie odzyskać slot");
+            let mut bytes = [0xff; 16];
+            pool.device
+                .read(
+                    &pool.slots[lease.slot].layers[0]
+                        .as_ref()
+                        .expect("warstwa DeltaNet ma stan")
+                        .state,
+                    0,
+                    &mut bytes,
+                )
+                .expect("odczyt stanu powinien się udać");
+            assert_eq!(bytes, [0; 16]);
+        }
+
+        assert_eq!(pool.slots.len(), 1);
+        assert_eq!(pool.free, vec![0]);
+        assert!(pool.poisoned.is_none());
+    }
+
+    #[test]
+    fn podwojny_blad_zwolnienia_zatruwa_pule_i_blokuje_alokacje() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16)
+            .expect("pula powinna powstać");
+        let lease = pool.acquire().expect("lease powinien powstać");
+        pool.activate(lease, &stream)
+            .expect("slot powinien się aktywować");
+
+        let result = pool.finish_release(
+            lease,
+            Err(ForgeError::Device("wymuszony błąd eventu".into())),
+            || Err(ForgeError::Device("wymuszony błąd synchronizacji".into())),
+        );
+
+        assert!(result.is_err());
+        assert!(pool.poisoned.is_some());
+        assert!(pool.slots[lease.slot].in_use);
+        assert!(pool.free.is_empty());
+        assert!(pool.acquire().is_err());
+        assert_eq!(pool.slots.len(), 1);
+    }
 
     #[test]
     fn logical_kv_regions_zachowuja_layout_i_czesciowa_strone() {

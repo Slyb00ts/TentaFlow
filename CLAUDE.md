@@ -433,8 +433,10 @@ coherent Polish on the RTX 4090.
   brak pełnego draftu uruchamia natywne MTP. Budżet samodzielnego `mtp` 3 jest
   adaptacyjnie przełączany między K=2 i K=3.
   Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
-- Natywne MTP jest obecnie greedy-exact, wymaga `max_active=1` z powodu stanu SSM
-  należącego do modelu i zostało wykonawczo sprawdzone wyłącznie na CUDA/RTX 4090
+- Natywne MTP jest obecnie greedy-exact i wymaga `max_active=1`. Target DeltaNet
+  ma izolowane per-sequence lease z generacją i eventem GPU, ale scheduler
+  hybrydowy oraz model-owned stan draftu MTP nie obsługują jeszcze wielu
+  aktywnych sekwencji. Ścieżkę sprawdzono wykonawczo wyłącznie na CUDA/RTX 4090
   z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Źródła Mojo zachowują podział
   umożliwiający przyszły codegen AMDGPU/Metal, ale backendy AMD i Metal nie są
   jeszcze podłączone ani przetestowane. `draft-model`, `eagle`, `dflash` i

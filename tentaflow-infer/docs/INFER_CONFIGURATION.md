@@ -746,9 +746,12 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   proj/`ssm_norm`/out-proj; atencja — bramkowane Q (split, bez fuzji) + QK-norm;
   MoE z bramką shared expert (`ffn_gate_inp_shexp`). Tabela embeddingów trzymana
   host-side (gather per token) — 22 GB kwantowanych wag mieści się w VRAM 24 GB.
-- **Stan SSM** (`Model.ssm`): rezydentny stan `[n_v_heads, d_state, d_state]` f32
-  + okno conv `[conv_dim, d_conv-1]` f16 per warstwa DeltaNet; zerowany na starcie
-  sekwencji, jedna aktywna sekwencja SSM naraz.
+- **Stan SSM** (`Model.hybrid_states`): pula rezydentnych slotów per sekwencja;
+  każdy przechowuje `[n_v_heads, d_state, d_state]` f32 oraz okno conv
+  `[conv_dim, d_conv-1]` f16 dla każdej warstwy DeltaNet. Lease zawiera numer
+  slotu i generację, a event GPU porządkuje przełączenie oraz bezpieczny reuse.
+  Serwer nadal wymusza `max_active=1`, dopóki scheduler hybrydowy i stan MTP nie
+  zostaną przełączone na ten kontrakt.
 - **Forward** (`hybrid_forward_token`): dispatch per-`LayerKind`; bramkowana
   atencja hd256 (deinterleave q/gate → QK-norm → partial M-RoPE `n_rot=64` →
   paged decode → `attn ⊙ σ(gate)` → o-proj), DeltaNet (conv+SiLU → split →
@@ -812,7 +815,8 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
 - MoE: tylko single-stream decode + KV f16 (patrz sekcja MoE). Hybrydy SSM+MoE
   (Qwen3.6 `qwen35moe`) generują E2E, ale ścieżka jest correctness-first
   (~17 tok/s, host round-tripy per warstwa, bez grafu/wsadu — patrz sekcja
-  qwen35moe); jedna aktywna sekwencja SSM naraz.
+  qwen35moe). Target ma izolowane sloty SSM, lecz serwer nadal wymusza
+  `max_active=1` do podłączenia schedulera hybrydowego i stanu MTP.
 - `logprobs`/`echo`/`n>1`: obsługiwane tylko na ścieżce non-streaming (streaming
   przy `n>1` lub completions z `echo`/`logprobs` = 400). Streaming chat NIE dokłada
   `logprobs` do delt (parser reorganizuje tekst — token↔delta nie są 1:1). Prompt-token

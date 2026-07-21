@@ -401,3 +401,68 @@ fn topk_draws_stay_in_topk_set_and_replay_deterministically() {
     dev.synchronize().unwrap();
     assert_eq!(read_id(dev.as_ref(), &b.out) as usize, cpu_argmax(&host));
 }
+
+#[test]
+fn batched_topk_obsluguje_mieszane_parametry_i_seed() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let vocab = 8usize;
+    let n_seqs = 4usize;
+    let host = [
+        1.0f32, 9.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        8.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+        0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 1.0,
+    ];
+    let ks = [1i32, 2, 4, 1];
+    let inv_t = [1.0f32; 4];
+    let top_p = [1.0f32; 4];
+    let min_p = [0.0f32, 0.0, 0.99, 0.0];
+    let seeds = [11u64, 22, 33, 44];
+    let steps = [0u64, 7, 3, 9];
+    let out = dev
+        .alloc(n_seqs * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let k_buf = dev.alloc(n_seqs * 4, MemKind::Device, Pool::Weights).unwrap();
+    let inv_t_buf = upload_f32(dev.as_ref(), &inv_t);
+    let top_p_buf = upload_f32(dev.as_ref(), &top_p);
+    let min_p_buf = upload_f32(dev.as_ref(), &min_p);
+    let seed_buf = dev.alloc(n_seqs * 8, MemKind::Device, Pool::Weights).unwrap();
+    let step_buf = dev.alloc(n_seqs * 8, MemKind::Device, Pool::Weights).unwrap();
+    dev.write(bytemuck::cast_slice(&ks), &k_buf, 0).unwrap();
+    dev.write(bytemuck::cast_slice(&seeds), &seed_buf, 0).unwrap();
+    dev.write(bytemuck::cast_slice(&steps), &step_buf, 0).unwrap();
+
+    let run = |logits: &DevBuffer| {
+        kernels
+            .sample_batched_topk_f32(
+                &out,
+                logits,
+                n_seqs,
+                vocab,
+                &k_buf,
+                &inv_t_buf,
+                &top_p_buf,
+                &min_p_buf,
+                &seed_buf,
+                &step_buf,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+        let mut bytes = vec![0u8; n_seqs * 4];
+        dev.read(&out, 0, &mut bytes).unwrap();
+        bytemuck::cast_slice::<u8, i32>(&bytes).to_vec()
+    };
+
+    let first = run(&upload_f32(dev.as_ref(), &host));
+    assert_eq!(first[0], 1);
+    assert!(matches!(first[1], 0 | 1));
+    assert_eq!(first[2], 7);
+    assert_eq!(first[3], 4);
+
+    // Kernel maskuje logity in-place, więc odtwarzalność wymaga świeżego wejścia.
+    let replay = run(&upload_f32(dev.as_ref(), &host));
+    assert_eq!(replay, first);
+}

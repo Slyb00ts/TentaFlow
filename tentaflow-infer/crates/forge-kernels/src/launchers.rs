@@ -1092,7 +1092,11 @@ impl Kernels {
                 "in-place DeltaNet: co najmniej jeden bufor jest za mały".into(),
             ));
         }
-        let tiles = d_state.div_ceil(caps.warp_size as usize);
+        let tile_width = (caps.warp_size as usize)
+            .max(64)
+            .min(d_state)
+            .min(caps.max_threads_per_block as usize);
+        let tiles = d_state.div_ceil(tile_width);
         let grid = n_v_heads
             .checked_mul(tiles)
             .and_then(|value| u32::try_from(value).ok())
@@ -1102,7 +1106,7 @@ impl Kernels {
             .get("deltanet_gated_scan_inplace_dynamic_d128_f16")?;
         let config = LaunchConfig {
             grid: (grid, 1, 1),
-            block: (caps.warp_size, 1, 1),
+            block: (tile_width as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()

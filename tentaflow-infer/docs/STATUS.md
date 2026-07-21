@@ -583,11 +583,13 @@ Ostatnia aktualizacja: 2026-07-21.
     (`kernels/mojo/test_deltanet.mojo`): conv 7.7e-5, l2norm 5.9e-5, delta_step
     1.2e-4 / state 2.4e-7, gated_rmsnorm 4.8e-4, log_decay 9.2e-8, beta 3.0e-8 —
     wszystko w tolerancji f16.
-  - ✅ **Stan SSM w silniku** (`Model.ssm`): rezydentny bufor stanu
-    `[n_v_heads, d_state, d_state]` f32 + okno conv `[conv_dim, d_conv-1]` f16 per
-    warstwa DeltaNet, alokowany raz (pula Weights), zerowany na starcie sekwencji
-    (`pos==0`). Persistent/nie-paged (jedna aktywna sekwencja SSM naraz — zgodnie
-    z jednostrumieniową ścieżką MoE decode). Warstwy atencji używają paged KV.
+  - ✅ **Stan SSM w silniku** (`Model.hybrid_states`): rezydentna pula slotów
+    `[n_v_heads, d_state, d_state]` f32 + okno conv f16 per warstwa DeltaNet.
+    Każda sekwencja dostaje lease `{slot, generation}`; event GPU chroni
+    przełączenie i reuse, a ponownie użyty slot jest zerowany na streamie.
+    Test Qwen3.6 NVFP4 potwierdza parity dwóch sekwencji przeplatanych A/B.
+    Scheduler nadal wymusza `max_active=1` do następnej fazy continuous batching.
+    Warstwy atencji używają paged KV.
   - ✅ **Wagi hybrydowe** (`weights.rs::load_hybrid`): `LayerMixer::{Attention,
     DeltaNet}`, atencja z bramkowanym Q (szerokość `2·n_heads·head_dim`, split,
     bez fuzji), zestaw DeltaNet (in-proj/conv1d f16/dt-bias+A f16/beta+alpha proj/

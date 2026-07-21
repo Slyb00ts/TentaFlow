@@ -69,6 +69,33 @@ fn serial_trial(
     })
 }
 
+fn interleaving_audit(
+    model: &mut Model,
+    first_prompt: &[u32],
+    second_prompt: &[u32],
+    target: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let first_serial = serial_trial(model, first_prompt, target)?.tokens;
+    let second_serial = serial_trial(model, second_prompt, target)?.tokens;
+    let (mut first_seq, mut first_fed) = prepare(model, first_prompt)?;
+    let (mut second_seq, mut second_fed) = prepare(model, second_prompt)?;
+    let mut first = Vec::with_capacity(target);
+    let mut second = Vec::with_capacity(target);
+    for _ in 0..target {
+        first.push(first_fed);
+        first_fed = model.step_and_sample(&mut first_seq, first_fed, &mut greedy_sampler())?;
+        second.push(second_fed);
+        second_fed = model.step_and_sample(&mut second_seq, second_fed, &mut greedy_sampler())?;
+    }
+    model.release_seq(&mut first_seq);
+    model.release_seq(&mut second_seq);
+    if first != first_serial || second != second_serial {
+        return Err("przeplatane stany DeltaNet różnią się od przebiegów serialnych".into());
+    }
+    println!("hybrid interleaving A/B: {target} + {target} tokenów, parity PASS");
+    Ok(())
+}
+
 fn ngram_trial(
     model: &mut Model,
     prompt: &[u32],
@@ -472,6 +499,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(gguf);
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
     let prompt = prompt_tokens(&tokenizer, &prompt_kind, prompt_len)?;
+    let second_prompt = tokenizer.encode(
+        "Write one concise sentence about deterministic GPU execution.",
+        true,
+    )?;
     let mut model = Model::load_gguf(
         device,
         &path,
@@ -498,6 +529,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("audyt catch-up wymaga trybu mtp+ngram".into());
         }
         diagnose_mtp_catchup_prefixes(&mut model, &prompt, budget)?;
+    }
+    if std::env::var_os("FORGE_HYBRID_INTERLEAVE_AUDIT").is_some() {
+        return interleaving_audit(&mut model, &prompt, &second_prompt, target.min(32));
     }
 
     let warm_oracle = serial_trial(&mut model, &prompt, 8)?;

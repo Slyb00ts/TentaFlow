@@ -191,12 +191,13 @@ struct ActiveSeq<'t> {
 
 fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<SpeculationKind> {
     match (spec.kind(), greedy) {
-        (SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram, false) => {
-            Err(ForgeError::Unsupported(
-                "native MTP requires greedy GPU sampling without repetition penalty".into(),
-            ))
-        }
-        (SpeculationKind::HostProposer, false) | (SpeculationKind::Off, _) => {
+        (
+            SpeculationKind::HostProposer
+            | SpeculationKind::NativeMtp
+            | SpeculationKind::NativeMtpNgram,
+            false,
+        )
+        | (SpeculationKind::Off, _) => {
             Ok(SpeculationKind::Off)
         }
         (kind, true) => Ok(kind),
@@ -210,7 +211,8 @@ fn validate_speculation_server_config(
 ) -> Result<()> {
     if hybrid_target && max_active != 1 {
         return Err(ForgeError::Unsupported(
-            "model hybrydowy wymaga max_active=1, ponieważ stan SSM należy do modelu".into(),
+            "model hybrydowy wymaga max_active=1 do czasu podłączenia schedulera do lease SSM"
+                .into(),
         ));
     }
     if matches!(
@@ -509,8 +511,10 @@ fn worker<'t>(
             let cache_read = model.acquire_prefix(&mut seq, &prompt);
             let pending_prompt: VecDeque<u32> = prompt[cache_read..].iter().copied().collect();
             if spec.is_enabled() && !greedy {
-                tracing::debug!(
-                    "speculative decoding skipped for a request requiring non-greedy or host-logit sampling"
+                tracing::info!(
+                    configured = ?spec.kind(),
+                    fallback = ?request_spec_kind,
+                    "spekulacja wyłączona dla żądania wymagającego non-greedy lub host logits"
                 );
             }
             let (spec_state, spec_kind, spec_budget) = if request_spec_kind != SpeculationKind::Off {
@@ -848,7 +852,10 @@ fn batch_gpu_decode(
     // size (the GEMMs process a fixed token tile). Serializing them here keeps
     // single-stream and low-concurrency latency from regressing; the batched
     // path engages once the flat cost amortizes across enough sequences.
-    if feed_idx.len() < batch_min.max(2) {
+    // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
+    // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
+    let serial_only = model.weights.is_moe() || model.kv.cfg.quant.is_rot();
+    if feed_idx.len() < batch_min.max(2) || serial_only {
         for &i in &feed_idx {
             serial_step(model, &mut active[i]);
         }
@@ -1250,7 +1257,7 @@ mod tests {
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
 
     #[test]
-    fn native_mtp_requires_greedy_sampling_instead_of_silent_fallback() {
+    fn native_mtp_przechodzi_na_zwykly_decode_dla_non_greedy() {
         for budget in [2, 3] {
             let spec = SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget)
                 .expect("konfiguracja MTP powinna być poprawna");
@@ -1258,7 +1265,11 @@ mod tests {
                 request_speculation_kind(&spec, true).expect("greedy MTP powinno działać"),
                 SpeculationKind::NativeMtp
             );
-            assert!(request_speculation_kind(&spec, false).is_err());
+            assert_eq!(
+                request_speculation_kind(&spec, false)
+                    .expect("non-greedy powinno wyłączyć spekulację per request"),
+                SpeculationKind::Off
+            );
         }
         let router = SpeculativeConfig::chain(
             vec![ProposerKind::Mtp, ProposerKind::Ngram],
@@ -1269,7 +1280,11 @@ mod tests {
             request_speculation_kind(&router, true).expect("greedy router powinien działać"),
             SpeculationKind::NativeMtpNgram
         );
-        assert!(request_speculation_kind(&router, false).is_err());
+        assert_eq!(
+            request_speculation_kind(&router, false)
+                .expect("non-greedy powinno wyłączyć router per request"),
+            SpeculationKind::Off
+        );
     }
 
     #[test]

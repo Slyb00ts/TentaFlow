@@ -1074,6 +1074,30 @@ mod tests {
     }
 
     #[test]
+    fn parametry_probkowania_sa_przekazywane_bez_zmian() {
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.4, "top_k": 17, "top_p": 0.8, "min_p": 0.15,
+            "seed": 0
+        }));
+        let sampling = r.generation_spec().unwrap().sampling;
+
+        assert_eq!(sampling.temperature, 0.4);
+        assert_eq!(sampling.top_k, 17);
+        assert_eq!(sampling.top_p, 0.8);
+        assert_eq!(sampling.min_p, 0.15);
+        assert_eq!(sampling.seed, Some(0));
+
+        for min_p in [-0.1, 1.1] {
+            let invalid = chat_req(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "min_p": min_p
+            }));
+            assert!(invalid.generation_spec().is_err());
+        }
+    }
+
+    #[test]
     fn openai_penalties_sa_walidowane_i_przekazywane() {
         let r = chat_req(serde_json::json!({
             "model": "m", "messages": [{"role": "user", "content": "hi"}],
