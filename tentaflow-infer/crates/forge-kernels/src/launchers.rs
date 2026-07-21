@@ -12,6 +12,14 @@ use crate::registry::KernelArtifacts;
 
 const BLOCK: u32 = 256;
 
+/// Jedna projekcja surowego GGUF NVFP4 korzystająca ze wspólnej aktywacji Q8_1.
+pub struct Nvfp4GgufQ8Projection<'a> {
+    pub output: &'a DevBuffer,
+    pub weights: &'a DevBuffer,
+    pub rows: usize,
+    pub output_scale: f32,
+}
+
 /// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
 const ATTN_BLOCK: u32 = 128;
 
@@ -34,6 +42,61 @@ fn checked_buffer_bytes(name: &str, dimensions: &[usize], element_bytes: usize) 
             ))
         })
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Nvfp4GgufDispatch {
+    kernel: &'static str,
+    token_tile: usize,
+    row_tile: usize,
+    block_threads: u32,
+}
+
+fn nvfp4_gguf_dispatch(
+    n_tokens: usize,
+    is_nvidia: bool,
+    warp_size: u32,
+    max_threads: u32,
+) -> Result<Nvfp4GgufDispatch> {
+    if n_tokens < 2 {
+        return Err(ForgeError::Kernel(
+            "gemm_nvfp4_gguf_f16 wymaga co najmniej dwóch tokenów".into(),
+        ));
+    }
+    let (kernel, token_tile, row_tile, block_threads) = match n_tokens {
+        2 => ("gemm_nvfp4_gguf_f16_b2", 2, 1, Some(warp_size)),
+        3 => ("gemm_nvfp4_gguf_f16_b3", 3, 1, Some(warp_size)),
+        4 => ("gemm_nvfp4_gguf_f16_b4", 4, 1, Some(warp_size)),
+        5..=8 => ("gemm_nvfp4_gguf_f16_b8", 8, 1, warp_size.checked_mul(8)),
+        9..=16 => ("gemm_nvfp4_gguf_f16_b16", 16, 1, warp_size.checked_mul(16)),
+        17..=32 if is_nvidia && warp_size == 32 => {
+            ("gemm_nvfp4_gguf_mma_f16_bm32", 32, 64, Some(64))
+        }
+        _ if is_nvidia && warp_size == 32 => ("gemm_nvfp4_gguf_mma_f16_bm128", 128, 64, Some(256)),
+        _ => {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_nvfp4_gguf_f16: backend bez NVIDIA MMA nie obsługuje T={n_tokens} > 16"
+            )));
+        }
+    };
+    let block_threads = block_threads.ok_or_else(|| {
+        ForgeError::Kernel("gemm_nvfp4_gguf_f16: przepełnienie rozmiaru bloku".into())
+    })?;
+    if block_threads == 0 || block_threads > max_threads {
+        return Err(ForgeError::Kernel(format!(
+            "gemm_nvfp4_gguf_f16: blok {block_threads} przekracza limit urządzenia {max_threads}"
+        )));
+    }
+    Ok(Nvfp4GgufDispatch {
+        kernel,
+        token_tile,
+        row_tile,
+        block_threads,
+    })
+}
+
+fn raw_nvfp4_dp4a_supported(is_nvidia: bool, warp_size: u32) -> bool {
+    is_nvidia && warp_size == 32
 }
 
 pub struct Kernels {
@@ -351,11 +414,7 @@ impl Kernels {
     ) -> Result<()> {
         let k = self.artifacts.get("sigmoid_mul_f16")?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
-        let args = LaunchArgs::new()
-            .buf(out)
-            .buf(a)
-            .buf(gate)
-            .scalar(n as i64);
+        let args = LaunchArgs::new().buf(out).buf(a).buf(gate).scalar(n as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -500,6 +559,36 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Jeden krok splotu dla wiersza macierzy batcha wskazanego offsetami.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_conv_silu_f16_at(
+        &self,
+        out: &DevBuffer,
+        out_byte_off: usize,
+        win_io: &DevBuffer,
+        x_new: &DevBuffer,
+        x_byte_off: usize,
+        weight: &DevBuffer,
+        conv_dim: usize,
+        d_conv: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_conv_silu_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((conv_dim as u32).div_ceil(256).min(256), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(out, out_byte_off)?
+            .buf(win_io)
+            .buf_at(x_new, x_byte_off)?
+            .buf(weight)
+            .scalar(conv_dim as i64)
+            .scalar(d_conv as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Per-head L2 normalization (out = x / sqrt(Σx² + eps)); one block per
     /// head, block covers `d_state`. Used on the DeltaNet conv q/k heads.
     pub fn l2norm_heads_f16(
@@ -566,6 +655,232 @@ impl Kernels {
         self.device.launch(k_art, &cfg, &args, stream)
     }
 
+    /// Przyczynowy skan 2-4 kroków Gated-DeltaNet bez modyfikowania stanu
+    /// wejściowego. Checkpointy mają układ [T, n_v_heads, d_state, d_state].
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_scan_f16(
+        &self,
+        out: &DevBuffer,
+        checkpoints: &DevBuffer,
+        state_in: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.deltanet_gated_scan_f16_at(
+            out,
+            checkpoints,
+            0,
+            state_in,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            n_steps,
+            n_v_heads,
+            d_state,
+            stream,
+        )
+    }
+
+    /// Przyczynowy skan Gated-DeltaNet zapisujący checkpointy od podanego
+    /// przesunięcia bajtowego w większym buforze współdzielonym przez warstwy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_scan_f16_at(
+        &self,
+        out: &DevBuffer,
+        checkpoints: &DevBuffer,
+        checkpoint_byte_offset: usize,
+        state_in: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let kernel_name = match n_steps {
+            2 => "deltanet_gated_scan_t2_f16",
+            3 => "deltanet_gated_scan_t3_f16",
+            4 => "deltanet_gated_scan_t4_f16",
+            _ => {
+                return Err(ForgeError::Kernel(format!(
+                    "deltanet_gated_scan wymaga T równego 2, 3 lub 4, otrzymano {n_steps}"
+                )))
+            }
+        };
+        if n_v_heads == 0 || d_state == 0 || d_state > 1024 {
+            return Err(ForgeError::Kernel(format!(
+                "deltanet_gated_scan wymaga n_v_heads > 0 i 1 <= d_state <= 1024, otrzymano n_v_heads={n_v_heads}, d_state={d_state}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes(
+            "deltanet_gated_scan output",
+            &[n_steps, n_v_heads, d_state],
+            2,
+        )?;
+        let state_bytes = checked_buffer_bytes(
+            "deltanet_gated_scan state",
+            &[n_v_heads, d_state, d_state],
+            4,
+        )?;
+        let checkpoint_bytes = checked_buffer_bytes(
+            "deltanet_gated_scan checkpoints",
+            &[n_steps, n_v_heads, d_state, d_state],
+            4,
+        )?;
+        let gate_bytes = checked_buffer_bytes(
+            "deltanet_gated_scan gates",
+            &[n_steps, n_v_heads],
+            4,
+        )?;
+        let checkpoint_end = checkpoint_byte_offset
+            .checked_add(checkpoint_bytes)
+            .ok_or_else(|| {
+                ForgeError::Kernel("deltanet_gated_scan: przepełnienie offsetu checkpointów".into())
+            })?;
+        if out.len() < output_bytes
+            || checkpoints.len() < checkpoint_end
+            || state_in.len() < state_bytes
+            || q.len() < output_bytes
+            || k.len() < output_bytes
+            || v.len() < output_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "deltanet_gated_scan: co najmniej jeden bufor jest za mały".into(),
+            ));
+        }
+        let grid_x = u32::try_from(n_v_heads).map_err(|_| {
+            ForgeError::Kernel("deltanet_gated_scan: liczba głów przekracza u32".into())
+        })?;
+        let k_art = self.artifacts.get(kernel_name)?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (d_state as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf_at(checkpoints, checkpoint_byte_offset)?
+            .buf(state_in)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(k_art, &cfg, &args, stream)
+    }
+
+    /// Zatwierdza na GPU checkpoint wskazany przez urządzeniowy licznik i32.
+    /// Wartość 0 pozostawia stan bez zmian, a wartości spoza [0, T] są ignorowane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_commit_checkpoint_f32(
+        &self,
+        state_out: &DevBuffer,
+        checkpoints: &DevBuffer,
+        accepted_index: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.deltanet_commit_checkpoint_f32_at(
+            state_out,
+            checkpoints,
+            0,
+            accepted_index,
+            n_steps,
+            n_v_heads,
+            d_state,
+            stream,
+        )
+    }
+
+    /// Zatwierdza checkpoint z fragmentu większego bufora zaczynającego się
+    /// pod podanym przesunięciem bajtowym.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_commit_checkpoint_f32_at(
+        &self,
+        state_out: &DevBuffer,
+        checkpoints: &DevBuffer,
+        checkpoint_byte_offset: usize,
+        accepted_index: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !matches!(n_steps, 2..=4) {
+            return Err(ForgeError::Kernel(format!(
+                "deltanet_commit_checkpoint wymaga T równego 2, 3 lub 4, otrzymano {n_steps}"
+            )));
+        }
+        if n_v_heads == 0 || d_state == 0 || d_state > 1024 {
+            return Err(ForgeError::Kernel(format!(
+                "deltanet_commit_checkpoint: niepoprawny kształt n_v_heads={n_v_heads}, d_state={d_state}"
+            )));
+        }
+        let state_elements = n_v_heads
+            .checked_mul(d_state)
+            .and_then(|elements| elements.checked_mul(d_state))
+            .ok_or_else(|| {
+                ForgeError::Kernel("deltanet_commit_checkpoint: przepełnienie stanu".into())
+            })?;
+        let state_bytes = state_elements.checked_mul(4).ok_or_else(|| {
+            ForgeError::Kernel("deltanet_commit_checkpoint: przepełnienie bajtów stanu".into())
+        })?;
+        let checkpoint_bytes = state_bytes.checked_mul(n_steps).ok_or_else(|| {
+            ForgeError::Kernel("deltanet_commit_checkpoint: przepełnienie checkpointów".into())
+        })?;
+        let state_elements_i64 = i64::try_from(state_elements).map_err(|_| {
+            ForgeError::Kernel("deltanet_commit_checkpoint: liczba elementów przekracza i64".into())
+        })?;
+        let checkpoint_end = checkpoint_byte_offset
+            .checked_add(checkpoint_bytes)
+            .ok_or_else(|| {
+                ForgeError::Kernel(
+                    "deltanet_commit_checkpoint: przepełnienie offsetu checkpointów".into(),
+                )
+            })?;
+        if state_out.len() < state_bytes
+            || checkpoints.len() < checkpoint_end
+            || accepted_index.len() < std::mem::size_of::<i32>()
+        {
+            return Err(ForgeError::Kernel(
+                "deltanet_commit_checkpoint: co najmniej jeden bufor jest za mały".into(),
+            ));
+        }
+        let grid_x = u32::try_from(state_elements.div_ceil(BLOCK as usize).min(65_535))
+            .map_err(|_| ForgeError::Kernel("deltanet_commit_checkpoint: siatka przekracza u32".into()))?;
+        let k_art = self.artifacts.get("deltanet_commit_checkpoint_f32")?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(state_out)
+            .buf_at(checkpoints, checkpoint_byte_offset)?
+            .buf(accepted_index)
+            .scalar(state_elements_i64)
+            .scalar(n_steps as i64);
+        self.device.launch(k_art, &cfg, &args, stream)
+    }
+
     /// Output gated RMSNorm per value-head: out = rmsnorm(o, weight)·silu(z).
     /// One block per head, block covers `d_state`.
     #[allow(clippy::too_many_arguments)]
@@ -615,6 +930,35 @@ impl Kernels {
         let args = LaunchArgs::new()
             .buf(g_out)
             .buf(alpha_in)
+            .buf(dt_bias)
+            .buf(a_scale)
+            .scalar(n_v_heads as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Wariant batchowy pojedynczego wiersza z przesunięciem buforów wejścia
+    /// i wyjścia; wektory parametrów warstwy zawsze zaczynają się od zera.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_log_decay_f32_at(
+        &self,
+        g_out: &DevBuffer,
+        g_byte_off: usize,
+        alpha_in: &DevBuffer,
+        alpha_byte_off: usize,
+        dt_bias: &DevBuffer,
+        a_scale: &DevBuffer,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_log_decay_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((n_v_heads as u32).div_ceil(256), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(g_out, g_byte_off)?
+            .buf_at(alpha_in, alpha_byte_off)?
             .buf(dt_bias)
             .buf(a_scale)
             .scalar(n_v_heads as i64);
@@ -688,16 +1032,12 @@ impl Kernels {
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        let args = LaunchArgs::new()
-            .buf(y)
-            .buf(w)
-            .buf(x)
-            .scalar(cols as i64);
+        let args = LaunchArgs::new().buf(y).buf(w).buf(x).scalar(cols as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// y = W·x with W in NVFP4 (compressed-tensors) packed layout.
-    /// `inv_global_scale` = 1 / weight_global_scale.
+    /// Mnoży y = W·x dla wag NVFP4 w układzie packed compressed-tensors.
+    /// `inv_global_scale` jest odwrotnością `weight_global_scale`.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_nvfp4_f16(
         &self,
@@ -730,6 +1070,437 @@ impl Kernels {
             .scalar(rows as i64)
             .scalar(inv_global_scale);
         self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Mnożenie macierz-wektor bezpośrednio z bloków GGUF NVFP4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_nvfp4_gguf_f16(
+        &self,
+        y: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_nvfp4_gguf_f16 wymaga rows > 0 i cols % 64 == 0, otrzymano rows={rows}, cols={cols}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_f16", &[rows], 2)?;
+        let weight_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_f16", &[rows, cols / 64], 36)?;
+        let input_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_f16", &[cols], 2)?;
+        let grid_x = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("gemv_nvfp4_gguf_f16: siatka przekracza u32".into()))?;
+        if y.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "gemv_nvfp4_gguf_f16: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let k = self.artifacts.get("gemv_nvfp4_gguf_f16")?;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(weights)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(output_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Kwantyzuje aktywację raz do Q8_1 i wykonuje grupę projekcji GGUF NVFP4
+    /// przez dp4a. Q/K/V oraz gate/up mogą współdzielić ten sam prepass.
+    pub fn gemv_nvfp4_gguf_q8_1_group_f16(
+        &self,
+        projections: &[Nvfp4GgufQ8Projection<'_>],
+        x: &DevBuffer,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if projections.is_empty() || cols < 64 || !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_nvfp4_gguf_q8_1 wymaga projekcji i cols % 64 == 0, otrzymano projekcji={}, cols={cols}",
+                projections.len()
+            )));
+        }
+        let input_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_q8_1 input", &[cols], 2)?;
+        if x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "gemv_nvfp4_gguf_q8_1: bufor wejścia jest za mały".into(),
+            ));
+        }
+        for projection in projections {
+            if projection.rows == 0 || !projection.output_scale.is_finite() {
+                return Err(ForgeError::Kernel(
+                    "gemv_nvfp4_gguf_q8_1 wymaga rows > 0 i skończonej skali".into(),
+                ));
+            }
+            let output_bytes = checked_buffer_bytes(
+                "gemv_nvfp4_gguf_q8_1 output",
+                &[projection.rows],
+                2,
+            )?;
+            let weight_bytes = checked_buffer_bytes(
+                "gemv_nvfp4_gguf_q8_1 weights",
+                &[projection.rows, cols / 64],
+                36,
+            )?;
+            if projection.output.len() < output_bytes
+                || projection.weights.len() < weight_bytes
+            {
+                return Err(ForgeError::Kernel(
+                    "gemv_nvfp4_gguf_q8_1: bufor projekcji jest za mały".into(),
+                ));
+            }
+        }
+        let caps = self.device.caps();
+        if !raw_nvfp4_dp4a_supported(
+            matches!(caps.vendor, forge_types::Vendor::Nvidia),
+            caps.warp_size,
+        ) {
+            for projection in projections {
+                self.gemv_nvfp4_gguf_f16(
+                    projection.output,
+                    projection.weights,
+                    x,
+                    projection.rows,
+                    cols,
+                    projection.output_scale,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        let need_codes = cols;
+        let need_blocks = cols / 32;
+        let mut scratch = self.prequant.lock().expect("prequant scratch poisoned");
+        if scratch.cap_codes < need_codes {
+            scratch.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            scratch.cap_codes = need_codes;
+        }
+        if scratch.cap_blocks < need_blocks {
+            scratch.xd = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            scratch.xsm = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            scratch.cap_blocks = need_blocks;
+        }
+        let xq = scratch.xq.as_ref().expect("xq zaalokowane");
+        let xd = scratch.xd.as_ref().expect("xd zaalokowane");
+        let xsm = scratch.xsm.as_ref().expect("xsm zaalokowane");
+        let quant = self.artifacts.get("quantize_act_q8_1")?;
+        let quant_cfg = LaunchConfig::linear(need_blocks as u32, BLOCK);
+        let quant_args = LaunchArgs::new()
+            .buf(xq)
+            .buf(xd)
+            .buf(xsm)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(1i64);
+        self.device.launch(quant, &quant_cfg, &quant_args, stream)?;
+
+        let kernel = self.artifacts.get("gemv_nvfp4_gguf_q8_1_f16")?;
+        for projection in projections {
+            let grid_x = u32::try_from(projection.rows.div_ceil(8)).map_err(|_| {
+                ForgeError::Kernel("gemv_nvfp4_gguf_q8_1: siatka przekracza u32".into())
+            })?;
+            let config = LaunchConfig {
+                grid: (grid_x, 1, 1),
+                block: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let args = LaunchArgs::new()
+                .buf(projection.output)
+                .buf(projection.weights)
+                .buf(xq)
+                .buf(xd)
+                .scalar(cols as i64)
+                .scalar(projection.rows as i64)
+                .scalar(projection.output_scale);
+            self.device.launch(kernel, &config, &args, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Kafelkowane mnożenie wielu tokenów bezpośrednio z bloków GGUF NVFP4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_gguf_f16(
+        &self,
+        y: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) || !output_scale.is_finite() {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_nvfp4_gguf_f16 wymaga rows > 0, cols % 64 == 0 i skończonej skali; otrzymano rows={rows}, cols={cols}, scale={output_scale}"
+            )));
+        }
+        let caps = self.device.caps();
+        let dispatch = nvfp4_gguf_dispatch(
+            n_tokens,
+            matches!(caps.vendor, forge_types::Vendor::Nvidia),
+            caps.warp_size,
+            caps.max_threads_per_block,
+        )?;
+        let output_bytes =
+            checked_buffer_bytes("gemm_nvfp4_gguf_f16 output", &[n_tokens, rows], 2)?;
+        let weight_bytes =
+            checked_buffer_bytes("gemm_nvfp4_gguf_f16 weights", &[rows, cols / 64], 36)?;
+        let input_bytes = checked_buffer_bytes("gemm_nvfp4_gguf_f16 input", &[n_tokens, cols], 2)?;
+        if y.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "gemm_nvfp4_gguf_f16: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let grid_x = u32::try_from(rows.div_ceil(dispatch.row_tile))
+            .map_err(|_| ForgeError::Kernel("gemm_nvfp4_gguf_f16: grid.x przekracza u32".into()))?;
+        let grid_y = u32::try_from(n_tokens.div_ceil(dispatch.token_tile))
+            .map_err(|_| ForgeError::Kernel("gemm_nvfp4_gguf_f16: grid.y przekracza u32".into()))?;
+        let rows = i64::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("gemm_nvfp4_gguf_f16: rows przekracza i64".into()))?;
+        let cols = i64::try_from(cols)
+            .map_err(|_| ForgeError::Kernel("gemm_nvfp4_gguf_f16: cols przekracza i64".into()))?;
+        let n_tokens = i64::try_from(n_tokens).map_err(|_| {
+            ForgeError::Kernel("gemm_nvfp4_gguf_f16: liczba tokenów przekracza i64".into())
+        })?;
+        let kernel = self.artifacts.get(dispatch.kernel)?;
+        let config = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (dispatch.block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(weights)
+            .buf(x)
+            .scalar(cols)
+            .scalar(rows)
+            .scalar(n_tokens)
+            .scalar(output_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Scalone przygotowanie wejścia MTP i projekcja Q8_0 z 2H do H.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_prepare_f16(
+        &self,
+        output: &DevBuffer,
+        embedding_row: &DevBuffer,
+        target_hidden: &DevBuffer,
+        enorm: &DevBuffer,
+        hnorm: &DevBuffer,
+        eh_proj: &DevBuffer,
+        hidden_size: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if hidden_size == 0
+            || hidden_size > 5120
+            || !(2 * hidden_size).is_multiple_of(32)
+            || !eps.is_finite()
+            || eps <= 0.0
+        {
+            return Err(ForgeError::Kernel(format!(
+                "mtp_prepare_f16 wymaga 0 < H <= 5120, 2H % 32 == 0 i eps > 0; otrzymano H={hidden_size}, eps={eps}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("mtp_prepare_f16 output", &[hidden_size], 2)?;
+        let vector_bytes = checked_buffer_bytes("mtp_prepare_f16 vector", &[hidden_size], 2)?;
+        let projection_bytes = checked_buffer_bytes(
+            "mtp_prepare_f16 eh_proj",
+            &[hidden_size, (2 * hidden_size) / 32],
+            34,
+        )?;
+        if output.len() < output_bytes
+            || embedding_row.len() < vector_bytes
+            || target_hidden.len() < vector_bytes
+            || enorm.len() < vector_bytes
+            || hnorm.len() < vector_bytes
+            || eh_proj.len() < projection_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "mtp_prepare_f16: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let grid_x = u32::try_from(hidden_size.div_ceil(8))
+            .map_err(|_| ForgeError::Kernel("mtp_prepare_f16: siatka przekracza u32".into()))?;
+        let kernel = self.artifacts.get("mtp_prepare_f16")?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(embedding_row)
+            .buf(target_hidden)
+            .buf(enorm)
+            .buf(hnorm)
+            .buf(eh_proj)
+            .scalar(hidden_size as i64)
+            .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Kopiuje staged embedding row z dedykowanej tabeli F16 według ID na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_f16_row_f16(
+        &self,
+        output: &DevBuffer,
+        weights: &DevBuffer,
+        token: &DevBuffer,
+        status: &DevBuffer,
+        status_offset: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if vocab_size == 0 || hidden_size == 0 {
+            return Err(ForgeError::Kernel(
+                "gather_f16_row_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let output_bytes = checked_buffer_bytes("gather_f16_row_f16 output", &[hidden_size], 2)?;
+        let weight_bytes =
+            checked_buffer_bytes("gather_f16_row_f16 weights", &[vocab_size, hidden_size], 2)?;
+        if output.len() < output_bytes
+            || weights.len() < weight_bytes
+            || token.len() < 4
+            || status_offset
+                .checked_add(4)
+                .is_none_or(|end| end > status.len())
+        {
+            return Err(ForgeError::Kernel(
+                "gather_f16_row_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("gather_f16_row_f16")?;
+        let config = LaunchConfig::linear(hidden_size as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(weights)
+            .buf(token)
+            .buf_at(status, status_offset)?
+            .scalar(vocab_size as i64)
+            .scalar(hidden_size as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Dekwantyzuje staged embedding row z tied Q8_0 według ID na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_q8_0_row_f16(
+        &self,
+        output: &DevBuffer,
+        weights: &DevBuffer,
+        token: &DevBuffer,
+        status: &DevBuffer,
+        status_offset: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(
+                "gather_q8_0_row_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let output_bytes = checked_buffer_bytes("gather_q8_0_row_f16 output", &[hidden_size], 2)?;
+        let weight_bytes = checked_buffer_bytes(
+            "gather_q8_0_row_f16 weights",
+            &[vocab_size, hidden_size / 32],
+            34,
+        )?;
+        if output.len() < output_bytes
+            || weights.len() < weight_bytes
+            || token.len() < 4
+            || status_offset
+                .checked_add(4)
+                .is_none_or(|end| end > status.len())
+        {
+            return Err(ForgeError::Kernel(
+                "gather_q8_0_row_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("gather_q8_0_row_f16")?;
+        let config = LaunchConfig::linear(hidden_size as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(weights)
+            .buf(token)
+            .buf_at(status, status_offset)?
+            .scalar(vocab_size as i64)
+            .scalar(hidden_size as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Dekwantyzuje staged embedding row z tied GGUF NVFP4 według ID na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_nvfp4_gguf_row_f16(
+        &self,
+        output: &DevBuffer,
+        weights: &DevBuffer,
+        token: &DevBuffer,
+        status: &DevBuffer,
+        status_offset: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(
+                "gather_nvfp4_gguf_row_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let output_bytes =
+            checked_buffer_bytes("gather_nvfp4_gguf_row_f16 output", &[hidden_size], 2)?;
+        let weight_bytes = checked_buffer_bytes(
+            "gather_nvfp4_gguf_row_f16 weights",
+            &[vocab_size, hidden_size / 64],
+            36,
+        )?;
+        if output.len() < output_bytes
+            || weights.len() < weight_bytes
+            || token.len() < 4
+            || status_offset
+                .checked_add(4)
+                .is_none_or(|end| end > status.len())
+        {
+            return Err(ForgeError::Kernel(
+                "gather_nvfp4_gguf_row_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("gather_nvfp4_gguf_row_f16")?;
+        let config = LaunchConfig::linear(hidden_size as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(weights)
+            .buf(token)
+            .buf_at(status, status_offset)?
+            .scalar(vocab_size as i64)
+            .scalar(hidden_size as i64)
+            .scalar(output_scale);
+        self.device.launch(kernel, &config, &args, stream)
     }
 
     /// out[t] = table[ids[t]] — token embedding gather (f16 rows).
@@ -807,9 +1578,8 @@ impl Kernels {
         let input_bytes = cols.checked_mul(2).ok_or_else(|| {
             ForgeError::Kernel("gemv_fp8_out_f32: przepełnienie rozmiaru wejścia".into())
         })?;
-        let grid_x = u32::try_from(rows.div_ceil(8)).map_err(|_| {
-            ForgeError::Kernel("gemv_fp8_out_f32: siatka przekracza u32".into())
-        })?;
+        let grid_x = u32::try_from(rows.div_ceil(8))
+            .map_err(|_| ForgeError::Kernel("gemv_fp8_out_f32: siatka przekracza u32".into()))?;
         if y_f32.len() < output_bytes
             || w.len() < weight_bytes
             || scales.len() < output_bytes
@@ -1203,7 +1973,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q8_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1273,20 +2047,13 @@ impl Kernels {
             && self.artifacts.has("gemv_batch_nvfp4_f16_b4")
         {
             ("gemv_batch_nvfp4_f16_b4".to_string(), 256, n_tokens as u32)
-        } else if (5..=8).contains(&n_tokens)
-            && self.artifacts.has("gemv_batch_nvfp4_f16_b8")
-        {
+        } else if (5..=8).contains(&n_tokens) && self.artifacts.has("gemv_batch_nvfp4_f16_b8") {
             ("gemv_batch_nvfp4_f16_b8".to_string(), 256, n_tokens as u32)
-        } else if (9..=16).contains(&n_tokens)
-            && self.artifacts.has("gemv_batch_nvfp4_f16_b16")
-        {
+        } else if (9..=16).contains(&n_tokens) && self.artifacts.has("gemv_batch_nvfp4_f16_b16") {
             ("gemv_batch_nvfp4_f16_b16".to_string(), 256, n_tokens as u32)
         } else {
             let (mut suffix, mut block, mut bm) = Self::gemm_nvfp4_tile(rows, n_tokens);
-            if !self
-                .artifacts
-                .has(&format!("gemm_nvfp4_f16{suffix}"))
-            {
+            if !self.artifacts.has(&format!("gemm_nvfp4_f16{suffix}")) {
                 (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
             }
             (format!("gemm_nvfp4_f16{suffix}"), block, bm)
@@ -1296,7 +2063,11 @@ impl Kernels {
             grid: if kernel_name.starts_with("gemv_batch_") {
                 ((rows as u32).div_ceil(8), 1, 1)
             } else {
-                ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1)
+                (
+                    (rows as u32).div_ceil(64),
+                    (n_tokens as u32).div_ceil(bm),
+                    1,
+                )
             },
             block: (block, 1, 1),
             shared_mem_bytes: 0,
@@ -1353,7 +2124,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1391,11 +2166,17 @@ impl Kernels {
         let (kernel_name, block, bm) = if (2..=4).contains(&n_tokens)
             && self.artifacts.has("gemv_batch_f16_out_f32_b4")
         {
-            ("gemv_batch_f16_out_f32_b4".to_string(), 256, n_tokens as u32)
-        } else if (5..=8).contains(&n_tokens)
-            && self.artifacts.has("gemv_batch_f16_out_f32_b8")
-        {
-            ("gemv_batch_f16_out_f32_b8".to_string(), 256, n_tokens as u32)
+            (
+                "gemv_batch_f16_out_f32_b4".to_string(),
+                256,
+                n_tokens as u32,
+            )
+        } else if (5..=8).contains(&n_tokens) && self.artifacts.has("gemv_batch_f16_out_f32_b8") {
+            (
+                "gemv_batch_f16_out_f32_b8".to_string(),
+                256,
+                n_tokens as u32,
+            )
         } else if n_tokens <= 32 && self.artifacts.has("gemm_f16_out_f32_bm32") {
             ("gemm_f16_out_f32_bm32".to_string(), 64, 32)
         } else {
@@ -1407,7 +2188,11 @@ impl Kernels {
             grid: if kernel_name.starts_with("gemv_batch_") {
                 ((rows as u32).div_ceil(8), 1, 1)
             } else {
-                ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1)
+                (
+                    (rows as u32).div_ceil(64),
+                    (n_tokens as u32).div_ceil(bm),
+                    1,
+                )
             },
             block: (block, 1, 1),
             shared_mem_bytes: 0,
@@ -1443,7 +2228,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q8_0_out_f32{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1902,7 +2691,50 @@ impl Kernels {
                 "gemm_q8_0_i8mma requires cols % 32 == 0, got {cols}"
             )));
         }
-        self.gemm_i8mma_run("gemm_q8_0_i8mma", y, w_q8, w_byte_off, x, rows, cols, n_tokens, stream)
+        self.gemm_i8mma_run(
+            "gemm_q8_0_i8mma",
+            false,
+            y,
+            w_q8,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )
+    }
+
+    /// Krótki GEMM Q8_0 x Q8_1 zapisujący pełne logity F32 dla weryfikatora.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_i8mma_out_f32_at(
+        &self,
+        y_f32: &DevBuffer,
+        w_q8: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) || !(3..=4).contains(&n_tokens) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q8_0_i8mma_out_f32 wymaga cols % 32 == 0 i T=3/4, otrzymano cols={cols}, T={n_tokens}"
+            )));
+        }
+        self.gemm_i8mma_run(
+            "gemm_q8_0_i8mma",
+            true,
+            y_f32,
+            w_q8,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )
     }
 
     /// int8 TENSOR-CORE MMQ prefill GEMM over Q4_K weights.
@@ -1935,7 +2767,18 @@ impl Kernels {
         {
             return Ok(());
         }
-        self.gemm_i8mma_run("gemm_q4_k_i8mma", y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)
+        self.gemm_i8mma_run(
+            "gemm_q4_k_i8mma",
+            false,
+            y,
+            w_q4k,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )
     }
 
     /// Smallest committed MPAD bucket ≥ `n_tokens`, or `None` if `n_tokens`
@@ -2118,6 +2961,7 @@ impl Kernels {
     fn gemm_i8mma_run(
         &self,
         kernel_base: &str,
+        output_f32: bool,
         y: &DevBuffer,
         w: &DevBuffer,
         w_byte_off: usize,
@@ -2132,10 +2976,6 @@ impl Kernels {
         // sm_80+ part). This is the default Q4_K/Q6_K prefill GEMM on pre-Ada
         // GPUs and the Q8_0 prefill GEMM everywhere; on Ada the vendored MMQ
         // cubin intercepts Q4_K/Q6_K upstream (`gemm_q4_k_i8mma_at`).
-        let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
-        let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
-        let _ = suffix;
-
         let need_codes = n_tokens * cols;
         let need_blocks = n_tokens * (cols / 32);
 
@@ -2148,11 +2988,10 @@ impl Kernels {
             sc.cap_codes = need_codes;
         }
         if sc.cap_blocks < need_blocks {
-            sc.xd = Some(self.device.alloc(
-                need_blocks * 4,
-                MemKind::Device,
-                Pool::Activations,
-            )?);
+            sc.xd = Some(
+                self.device
+                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
+            );
             sc.xsm = Some(self.device.alloc(
                 need_blocks * 4,
                 MemKind::Device,
@@ -2174,6 +3013,44 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
+        if kernel_base == "gemm_q8_0_i8mma" && (2..=4).contains(&n_tokens) {
+            let caps = self.device.caps();
+            let block_threads = caps.warp_size.checked_mul(8).ok_or_else(|| {
+                ForgeError::Kernel("gemm_q8_0 small: przepełnienie rozmiaru bloku".into())
+            })?;
+            if block_threads > caps.max_threads_per_block {
+                return Err(ForgeError::Kernel(format!(
+                    "gemm_q8_0 small: blok {block_threads} przekracza limit urządzenia {}",
+                    caps.max_threads_per_block
+                )));
+            }
+            let kernel_name = match (output_f32, n_tokens) {
+                (false, 2) => "gemm_q8_0_i8mma_b2",
+                (false, 3) => "gemm_q8_0_i8mma_b3",
+                (false, 4) => "gemm_q8_0_i8mma_b4",
+                (true, 3) => "gemm_q8_0_i8mma_out_f32_b3",
+                (true, 4) => "gemm_q8_0_i8mma_out_f32_b4",
+                _ => unreachable!(),
+            };
+            let kernel = self.artifacts.get(kernel_name)?;
+            let cfg = LaunchConfig {
+                grid: ((rows as u32).div_ceil(8), 1, 1),
+                block: (block_threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let args = LaunchArgs::new()
+                .buf(y)
+                .buf_at(w, w_byte_off)?
+                .buf(xq)
+                .buf(xd)
+                .scalar(cols as i64)
+                .scalar(rows as i64)
+                .scalar(n_tokens as i64);
+            return self.device.launch(kernel, &cfg, &args, stream);
+        }
+
+        let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
+        let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
         let cfg = LaunchConfig {
             grid: (
                 (rows as u32).div_ceil(bn),
@@ -2271,10 +3148,14 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         if !rows.is_multiple_of(64) {
-            return Err(ForgeError::Kernel(format!("w4a8 requires rows % 64 == 0, got {rows}")));
+            return Err(ForgeError::Kernel(format!(
+                "w4a8 requires rows % 64 == 0, got {rows}"
+            )));
         }
         if !cols.is_multiple_of(128) {
-            return Err(ForgeError::Kernel(format!("w4a8 requires cols % 128 == 0, got {cols}")));
+            return Err(ForgeError::Kernel(format!(
+                "w4a8 requires cols % 128 == 0, got {cols}"
+            )));
         }
         let (key, cta_m, cta_n, cta_k, warps, smem) = Self::w4a8_config(n_tokens, cols);
         if !cols.is_multiple_of(cta_k as usize) {
@@ -2296,7 +3177,11 @@ impl Kernels {
         };
         let tile_shift = 1u32 << log_tile;
         let cfg = LaunchConfig {
-            grid: (num_blocks_n * tile_shift, num_blocks_m.div_ceil(tile_shift), 1),
+            grid: (
+                num_blocks_n * tile_shift,
+                num_blocks_m.div_ceil(tile_shift),
+                1,
+            ),
             block: (32, warps, 1),
             shared_mem_bytes: smem,
         };
@@ -2348,10 +3233,11 @@ impl Kernels {
             sc.cap_codes = need_codes;
         }
         if sc.cap_tokens < n_tokens {
-            sc.ascales = Some(
-                self.device
-                    .alloc(n_tokens * 2, MemKind::Device, Pool::Activations)?,
-            );
+            sc.ascales = Some(self.device.alloc(
+                n_tokens * 2,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
             sc.cap_tokens = n_tokens;
         }
         let a_i8 = sc.a_i8.as_ref().expect("a_i8 allocated");
@@ -2508,9 +3394,8 @@ impl Kernels {
         let output_scale_bytes = rows.checked_mul(4).ok_or_else(|| {
             ForgeError::Kernel("pack_nvfp4_fp8: przepełnienie rozmiaru skal wyjściowych".into())
         })?;
-        let grid_x = u32::try_from(rows).map_err(|_| {
-            ForgeError::Kernel("pack_nvfp4_fp8: siatka przekracza u32".into())
-        })?;
+        let grid_x = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("pack_nvfp4_fp8: siatka przekracza u32".into()))?;
         if output.len() < output_bytes
             || output_scales.len() < output_scale_bytes
             || packed.len() < packed_bytes
@@ -2553,18 +3438,17 @@ impl Kernels {
                 "pack_f16_fp8 wymaga niezerowego kształtu".into(),
             ));
         }
-        let elements = rows.checked_mul(cols).ok_or_else(|| {
-            ForgeError::Kernel("pack_f16_fp8: przepełnienie rozmiaru".into())
-        })?;
+        let elements = rows
+            .checked_mul(cols)
+            .ok_or_else(|| ForgeError::Kernel("pack_f16_fp8: przepełnienie rozmiaru".into()))?;
         let source_bytes = elements.checked_mul(2).ok_or_else(|| {
             ForgeError::Kernel("pack_f16_fp8: przepełnienie rozmiaru źródła".into())
         })?;
         let scale_bytes = rows.checked_mul(4).ok_or_else(|| {
             ForgeError::Kernel("pack_f16_fp8: przepełnienie rozmiaru skal".into())
         })?;
-        let grid_x = u32::try_from(rows).map_err(|_| {
-            ForgeError::Kernel("pack_f16_fp8: siatka przekracza u32".into())
-        })?;
+        let grid_x = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("pack_f16_fp8: siatka przekracza u32".into()))?;
         if output.len() < elements
             || output_scales.len() < scale_bytes
             || source.len() < source_bytes
@@ -2811,7 +3695,8 @@ impl Kernels {
         if sc.cap_codes < n_tokens * cols || sc.cap_tokens < n_tokens {
             return Err(ForgeError::Kernel(
                 "gemm_fp8_modular_prequant: shared fp8 activation scratch not sized \
-                 by a preceding rmsnorm_fp8_shared".into(),
+                 by a preceding rmsnorm_fp8_shared"
+                    .into(),
             ));
         }
         let xq = sc.xq.as_ref().expect("xq filled by fused norm");
@@ -2857,7 +3742,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q4_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -3053,7 +3942,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q6_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -3848,26 +4741,17 @@ impl Kernels {
             &[n_seqs, n_q_heads, n_splits, 130],
             4,
         )?;
-        let q_bytes = checked_buffer_bytes(
-            "attn_decode_split_gqa4 q",
-            &[n_seqs, n_q_heads, 128],
-            2,
-        )?;
-        let kv_bytes = checked_buffer_bytes(
-            "attn_decode_split_gqa4 kv",
-            &[n_seqs, n_kv_heads, 128],
-            2,
-        )?;
+        let q_bytes =
+            checked_buffer_bytes("attn_decode_split_gqa4 q", &[n_seqs, n_q_heads, 128], 2)?;
+        let kv_bytes =
+            checked_buffer_bytes("attn_decode_split_gqa4 kv", &[n_seqs, n_kv_heads, 128], 2)?;
         let cache_page_bytes = checked_buffer_bytes(
             "attn_decode_split_gqa4 cache",
             &[n_kv_heads, page_size, 128],
             2,
         )?;
-        let page_table_bytes = checked_buffer_bytes(
-            "attn_decode_split_gqa4 page_table",
-            &[n_seqs, max_pages],
-            4,
-        )?;
+        let page_table_bytes =
+            checked_buffer_bytes("attn_decode_split_gqa4 page_table", &[n_seqs, max_pages], 4)?;
         let metadata_bytes = checked_buffer_bytes("attn_decode_split_gqa4 metadata", &[n_seqs], 4)?;
         let q_end = q_byte_off.checked_add(q_bytes).ok_or_else(|| {
             ForgeError::Kernel("attn_decode_split_gqa4: przepełnienie zakresu Q".into())
@@ -3998,11 +4882,8 @@ impl Kernels {
                 "attn_decode_combine_gqa2 wymaga niezerowych wymiarów".into(),
             ));
         }
-        let out_bytes = checked_buffer_bytes(
-            "attn_decode_combine_gqa2 out",
-            &[n_seqs, n_q_heads, 128],
-            2,
-        )?;
+        let out_bytes =
+            checked_buffer_bytes("attn_decode_combine_gqa2 out", &[n_seqs, n_q_heads, 128], 2)?;
         let parts_bytes = checked_buffer_bytes(
             "attn_decode_combine_gqa2 parts",
             &[n_seqs, n_q_heads, n_splits, 130],
@@ -4017,7 +4898,9 @@ impl Kernels {
             ForgeError::Kernel("attn_decode_combine_gqa2: n_seqs przekracza zakres siatki".into())
         })?;
         let grid_y = u32::try_from(n_q_heads.div_ceil(2)).map_err(|_| {
-            ForgeError::Kernel("attn_decode_combine_gqa2: n_q_heads przekracza zakres siatki".into())
+            ForgeError::Kernel(
+                "attn_decode_combine_gqa2: n_q_heads przekracza zakres siatki".into(),
+            )
         })?;
         let n_q_heads_i64 = i64::try_from(n_q_heads).map_err(|_| {
             ForgeError::Kernel("attn_decode_combine_gqa2: n_q_heads przekracza ABI Mojo".into())
@@ -4301,7 +5184,6 @@ impl Kernels {
     /// Column bound of the dp4a kernels that quantize x from global memory
     /// into shared int8 (plain + residual variants; X_MAX in decode_dp4a.mojo).
     pub const DP4A_MAX_COLS: usize = 16384;
-
 
     fn check_dp4a_cols(cols: usize, quant_mult: usize, name: &str) -> Result<()> {
         if cols > Self::DP4A_MAX_COLS || !cols.is_multiple_of(quant_mult) {
@@ -5024,7 +5906,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -5240,7 +6126,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q3_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -5456,7 +6346,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q2_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -5672,7 +6566,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q4_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -5888,7 +6786,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q4_1_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -6104,7 +7006,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -6320,7 +7226,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_1_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -6536,7 +7446,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq4_nl_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -6752,7 +7666,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq4_xs_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -6966,9 +7884,15 @@ impl Kernels {
             )));
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
-        let k = self.artifacts.get(&format!("gemm_mxfp4_gguf_f16{suffix}"))?;
+        let k = self
+            .artifacts
+            .get(&format!("gemm_mxfp4_gguf_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -7187,7 +8111,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq2_xs_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -7411,7 +8339,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq2_s_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -7631,7 +8563,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq3_s_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -7854,7 +8790,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq2_xxs_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -8080,7 +9020,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq3_xxs_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -8304,7 +9248,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq1_s_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -8524,7 +9472,11 @@ impl Kernels {
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_iq1_m_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            grid: (
+                (rows as u32).div_ceil(64),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -8811,7 +9763,13 @@ impl Kernels {
     }
 
     /// out = max(x, 0) over n f32 elements.
-    pub fn relu_f32(&self, out: &DevBuffer, x: &DevBuffer, n: usize, stream: &Stream) -> Result<()> {
+    pub fn relu_f32(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         let k = self.artifacts.get("relu_f32")?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
         let args = LaunchArgs::new().buf(out).buf(x).scalar(n as i64);
@@ -8819,7 +9777,13 @@ impl Kernels {
     }
 
     /// out = sigmoid(x) over n f32 elements.
-    pub fn sigmoid_f32(&self, out: &DevBuffer, x: &DevBuffer, n: usize, stream: &Stream) -> Result<()> {
+    pub fn sigmoid_f32(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         let k = self.artifacts.get("sigmoid_f32")?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
         let args = LaunchArgs::new().buf(out).buf(x).scalar(n as i64);
@@ -8857,7 +9821,13 @@ impl Kernels {
     }
 
     /// out = sqrt(x) over n f32 elements.
-    pub fn sqrt_f32(&self, out: &DevBuffer, x: &DevBuffer, n: usize, stream: &Stream) -> Result<()> {
+    pub fn sqrt_f32(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         let k = self.artifacts.get("sqrt_f32")?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
         let args = LaunchArgs::new().buf(out).buf(x).scalar(n as i64);
@@ -8932,5 +9902,60 @@ impl Kernels {
             .scalar(input_size as i64)
             .scalar(hidden as i64);
         self.device.launch(k, &cfg, &args, stream)
+    }
+}
+
+#[cfg(test)]
+mod nvfp4_gguf_dispatch_tests {
+    use super::{nvfp4_gguf_dispatch, raw_nvfp4_dp4a_supported};
+
+    #[test]
+    fn wybiera_dokladne_buckety_weryfikatora() {
+        for (tokens, expected, block) in [
+            (2, "gemm_nvfp4_gguf_f16_b2", 32),
+            (3, "gemm_nvfp4_gguf_f16_b3", 32),
+            (4, "gemm_nvfp4_gguf_f16_b4", 32),
+            (5, "gemm_nvfp4_gguf_f16_b8", 256),
+            (8, "gemm_nvfp4_gguf_f16_b8", 256),
+            (9, "gemm_nvfp4_gguf_f16_b16", 512),
+            (16, "gemm_nvfp4_gguf_f16_b16", 512),
+        ] {
+            let dispatch = nvfp4_gguf_dispatch(tokens, true, 32, 1024).unwrap();
+            assert_eq!(dispatch.kernel, expected);
+            assert_eq!(dispatch.block_threads, block);
+        }
+        for tokens in 2..=4 {
+            let dispatch = nvfp4_gguf_dispatch(tokens, false, 64, 1024).unwrap();
+            assert_eq!(dispatch.block_threads, 64);
+        }
+    }
+
+    #[test]
+    fn wybiera_mma_tylko_dla_nvidia() {
+        assert_eq!(
+            nvfp4_gguf_dispatch(17, true, 32, 1024).unwrap().kernel,
+            "gemm_nvfp4_gguf_mma_f16_bm32"
+        );
+        assert_eq!(
+            nvfp4_gguf_dispatch(128, true, 32, 1024).unwrap().kernel,
+            "gemm_nvfp4_gguf_mma_f16_bm128"
+        );
+        assert!(nvfp4_gguf_dispatch(17, false, 64, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(17, true, 64, 1024).is_err());
+    }
+
+    #[test]
+    fn odrzuca_nieprawidlowy_rozmiar_bloku() {
+        assert!(nvfp4_gguf_dispatch(1, true, 32, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(16, false, 64, 512).is_err());
+        assert!(nvfp4_gguf_dispatch(3, false, 0, 1024).is_err());
+    }
+
+    #[test]
+    fn dp4a_wymaga_nvidia_i_warp32() {
+        assert!(raw_nvfp4_dp4a_supported(true, 32));
+        assert!(!raw_nvfp4_dp4a_supported(true, 64));
+        assert!(!raw_nvfp4_dp4a_supported(false, 32));
+        assert!(!raw_nvfp4_dp4a_supported(false, 64));
     }
 }

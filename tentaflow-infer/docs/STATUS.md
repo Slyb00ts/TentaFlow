@@ -10,7 +10,27 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-20.
+Ostatnia aktualizacja: 2026-07-21.
+
+- 🟡 **Natywne Qwen3.5/3.6 MTP/NextN dla gęstego NVFP4 GGUF
+  (2026-07-21).** Rejestr `qwen35` oddziela jeden blok
+  `nextn_predict_layers` od 64-warstwowego hybrydowego trunku modelu
+  `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Loader zachowuje źródłowe
+  NVFP4/Q8_0/F32, współdzieli target embedding/head, jeśli checkpoint nie ma
+  dedykowanych tensorów, i nie ładuje drugiej kopii targetu. Proposer K=2/K=3,
+  batched verifier greedy, argmax oraz checkpointy KV/DeltaNet działają na GPU
+  przez kernele Mojo. Retained checkpointy DeltaNet usuwają powtórny skan 48
+  warstw przy commit; tryb `--speculative mtp` adaptacyjnie wybiera K=2/K=3.
+  Wielocyklowy benchmark sprawdza zgodność tokenów z serial greedy. Wynik retained
+  RTX 4090, K=3: raw128 około **59,8 tok/s**, raw512 około **57,7 tok/s**;
+  tryb adaptacyjny osiąga odpowiednio około **58,4** i **56,8 tok/s**.
+  llama.cpp osiąga **110,2** i **100,5 tok/s**. Cel
+  wydajności nie jest jeszcze osiągnięty. vLLM 0.25.1 nie dostarczył porównywalnego
+  wyniku, ponieważ jego loader nie przyjął lokalnego jednoplikowego GGUF jako
+  kompletnego repozytorium modelu i zakończył inicjalizację na etapie konfiguracji
+  HF/tokenizera. Ograniczenia: greedy, `max_active=1`, zweryfikowane tylko CUDA;
+  AMD/Metal pozostają celem przenośności źródeł Mojo, bez testów wykonawczych.
+  Raport: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 
 - 🟡 **NVFP4 Bielik: hybrydowy prefill FP8 i GQA decode w Mojo
   (2026-07-20).** Opcjonalne `FORGE_GEMM=fp8mod-ffn` przepakowuje na GPU
@@ -487,7 +507,7 @@ Ostatnia aktualizacja: 2026-07-20.
 
 ## Częściowe
 
-- ✅ **§6 Spekulacja (linear n-gram) WPIĘTA w decode loop**: NgramProposer
+- 🟡 **§6 Spekulacja (n-gram i natywne MTP) WPIĘTA w decode loop**: NgramProposer
   drafuje k tokenów z własnej historii sekwencji, silnik weryfikuje je JEDNYM
   forwardem (mini-prefill nad pozycjami draftu → `sample_batched_argmax_f32`
   per pozycja), akceptuje najdłuższy zgodny prefiks, a odrzucone pozycje KV są
@@ -502,11 +522,16 @@ Ostatnia aktualizacja: 2026-07-20.
   ścieżką prefill, więc na małym modelu opłaca się dopiero dla długich draftów
   (gate `MIN_VERIFY_DRAFT`); dla ordinary prose spekulacja nie regresuje (fallback
   na pojedynczy graf-krok). Domyślnie WYŁĄCZONA (`--speculative off` = bajt-w-bajt
-  dzisiejsza pętla). Braki: draft-model / MTP / EAGLE proposery, tree-verification
-  (spec-sampling) i spekulacja stochastyczna (temp>0) — na razie tylko greedy-exact.
+  dzisiejsza pętla). Natywne MTP/NextN działa osobną, model-owned ścieżką dla
+  gęstego hybrydowego `qwen35`: K=2/K=3, adaptacyjny wybór budżetu, batched
+  verifier i retained checkpointy DeltaNet. Wymaga greedy i `max_active=1`;
+  sprawdzone wykonawczo tylko na CUDA. Braki: draft-model / EAGLE / DFlash /
+  DSpark, tree-verification (spec-sampling), spekulacja stochastyczna (`temp>0`)
+  oraz backendy AMD/Metal.
 - 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral, olmoe (MoE), qwen3moe
-  (MoE), qwen35moe (hybrid SSM+MoE, ✅ E2E — patrz niżej). Brak: DeepSeek (MLA),
-  Gemma (sliding-window), Phi.
+  (MoE), qwen35 (gęsty hybrid SSM z natywnym MTP) i qwen35moe
+  (hybrid SSM+MoE, ✅ E2E — patrz niżej). Brak: DeepSeek (MLA), Gemma
+  (sliding-window), Phi.
 - ✅ **§4.2 qwen35moe (Qwen3.6-35B-A3B hybrid SSM+MoE)** — DZIAŁA E2E:
   generuje spójny tekst na RTX 4090, `forge run … "The capital of France is"`
   → „The capital of France is Paris.", a w trybie `--chat` strumień tokenów

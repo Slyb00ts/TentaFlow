@@ -235,7 +235,8 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/prefix_cache.rs`):
 
 ## Dekodowanie spekulatywne (SPEC §6)
 
-Samodrafujący proposer n-gram + wspólna weryfikacja jednym forwardem. Na każdym
+Działają dwa tryby: hostowy proposer n-gram oraz natywna głowa MTP/NextN modelu.
+W trybie n-gram na każdym
 kroku greedy proposer szuka najdłuższego dopasowania sufiksu w WŁASNEJ historii
 sekwencji (prompt + wygenerowane) i drafuje kontynuację; silnik weryfikuje cały
 draft JEDNYM przebiegiem (mini-prefill nad pozycjami draftu), akceptuje najdłuższy
@@ -244,10 +245,19 @@ odrzucone pozycje KV wycofuje (`KvCache::rollback`). Jeden forward daje 1..=k+1
 tokenów, **identycznych co do tokena** z dekodowaniem sekwencyjnym tam, gdzie
 argmax jest jednoznaczny — akcelerator dokładnego dekodowania, nie przybliżenie.
 
-To opis aktualnie wykonywanej ścieżki, a nie pełnego docelowego interfejsu ze
+Natywne MTP jest dostępne dla obsługiwanego, gęstego hybrydowego GGUF `qwen35`
+z `nextn_predict_layers`. Model generuje draft K=2 lub K=3 na GPU, a target
+weryfikuje cały blok jednym batched przebiegiem. Zaakceptowany prefiks zatwierdza
+KV oraz retained checkpointy DeltaNet bez ponownego skanu warstw. `mtp` oznacza
+budżet 3 z adaptacyjnym wyborem K=2/K=3; `mtp:2` i `mtp:3` wymuszają maksymalny
+budżet, przy czym K=3 nadal może spaść do K=2 przy końcu dostępnego kontekstu.
+Wagi i stan NextN są ładowane tylko po jawnym wybraniu trybu MTP; przy
+`--speculative off` nie zwiększają zużycia VRAM ani czasu prefill.
+
+To opis aktualnie wykonywanych ścieżek, a nie pełnego docelowego interfejsu ze
 `SPEC.md` §6. Fundament ma typowane `DraftTree`/`DraftNode`,
 `SpeculationCoordinator`, kaskadową kompozycję liniową i konfiguracje wielu
-proposerów. CLI odrzuca `draft-model`, `mtp`, `eagle`, `dflash` i `dspark` z
+proposerów. CLI odrzuca `draft-model`, `eagle`, `dflash` i `dspark` z
 jawnym komunikatem o wymaganym loaderze i `forge-speculation.json`, dopóki nie ma
 wykonawczego proposera i zgodnych wag. PARD i suffix nie są jeszcze wartościami CLI. N-gram docelowo
 pozostanie opcjonalnym fallbackiem lub rozszerzeniem ich draftów, korzystającym z
@@ -259,7 +269,17 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 
 | Flaga | Domyślnie | Opis |
 |---|---|---|
-| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>`. `on`/`ngram` = proposer n-gram z budżetem 16; sufiks `:<k>` wymaga budżetu 1..=16. Neuralne nazwy są odrzucane do czasu podłączenia loadera manifestu. |
+| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. |
+
+Przykład dla modelu z natywną głową MTP:
+
+```bash
+cargo run -p forge-cli --release -- run MODEL.gguf "Przykładowy prompt" \
+  --temp 0 --prefix-cache off --speculative mtp
+```
+
+Polecenie `serve` dobiera dla MTP domyślne `--max-active 1`; jawna większa
+wartość jest odrzucana. `run` zawsze obsługuje jedną sekwencję.
 
 ### Manifest neuralnego proposera
 
@@ -289,13 +309,17 @@ pakowania artefaktu w dystrybucji FORGE bez odrębnej podstawy licencyjnej.
 
 Zakres i komponowanie:
 
-- Włącza się TYLKO dla żądań **greedy** (`temperature == 0`, bez repetition
+- N-gram włącza się TYLKO dla żądań **greedy** (`temperature == 0`, bez repetition
   penalty i bez host-logit features: grammar / `logit_bias` / `min_tokens` /
   `logprobs`) na **gęstej ścieżce F16 paged-KV** (bez `--kv-tier`/`--kvflash`,
   bez `rot4`/`rot3`, nie-hybrid, nie-MoE, głowica `lm_head` f16/q8_0). Pozostałe
   żądania CICHO spadają do zwykłego dekodowania — wynik bez zmian.
 - **Wymusza `--prefix-cache off`** (obie funkcje zarządzają własnością stron KV;
   weryfikacja dopisuje i wycofuje draftowe strony na gołej puli).
+- Natywne MTP wymaga obsługiwanego modelowego runtime MTP, greedy z próbkowaniem
+  GPU bez repetition penalty oraz `--max-active 1`. Ograniczenie jednego aktywnego
+  żądania wynika z model-owned stanu SSM. Nie ma cichego fallbacku: niezgodna
+  konfiguracja kończy się błędem przed uruchomieniem workera.
 - Spekulacja stochastyczna (`temp > 0`) NIE jest zaimplementowana w v1 — tylko
   greedy-exact. Statystyki akceptacji per-proposer i adaptive-disable (usypianie
   proposera, gdy szacowany zysk < 1.05 w oknie) są aktywne.
@@ -319,6 +343,19 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/e2e_speculative.rs`):
   OFF jest bit-identyczna z dzisiejszą.
 - Rollback stron KV: jednostkowy `tests/kv_rollback.rs`; `verify_greedy`
   (długość akceptowanego prefiksu): `speculation::tests`.
+
+Zweryfikowane natywne MTP (RTX 4090,
+`protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`, lokalny wariant NVFP4):
+
+- wielocyklowy wynik MTP jest porównywany token po tokenie z sekwencyjnym greedy;
+- retained checkpointy DeltaNet są używane podczas commit zaakceptowanego prefiksu;
+- K=3: raw128 około **59,8 tok/s**, raw512 około **57,7 tok/s**; tryb
+  adaptacyjny: odpowiednio około **58,4 tok/s** i **56,8 tok/s**;
+- pomiary dotyczą wyłącznie CUDA. Źródła kerneli Mojo są przenośnym punktem
+  wyjścia dla AMDGPU/Metal, ale tych backendów nie uruchomiono ani nie
+  zweryfikowano.
+
+Pełny protokół i porównanie: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 
 ---
 
@@ -630,7 +667,8 @@ onnxruntime (|Δ| ~1e-6, tol 1e-3). Model VAD można wskazać przez
   `nvfp4-pack-quantized` (NVFP4, programowy FP4) i `float-quantized`
   (FP8 → f16 przy ładowaniu); sharding przez `model.safetensors.index.json`.
 - Architektury: qwen3, llama, mistral, **olmoe** (MoE), **qwen3moe** (MoE),
-  **qwen35moe** (hybrid SSM+MoE — działa E2E, patrz sekcja qwen35moe)
+  **qwen35** (gęsty hybrid SSM z natywnym MTP) oraz **qwen35moe**
+  (hybrid SSM+MoE — działa E2E, patrz sekcja qwen35moe)
   (rejestr deklaratywny w forge-formats); Whisper (osobny silnik); modele
   embeddingowe (pooling z metadanych).
 - head_dim: 64, 128 (specjalizacje attention generacji) i 256 (tylko f16 KV,

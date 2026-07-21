@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use forge_tokenize::{StopMatcher, StreamDecoder, Tokenizer};
 use forge_types::{ForgeError, Result};
@@ -20,7 +21,7 @@ use crate::sample::{
     SeqSampleParams, TokenLogprob,
 };
 pub use crate::speculation::SpeculativeConfig;
-use crate::speculation::{SpeculationCoordinator, SpeculativeState};
+use crate::speculation::{SpeculationCoordinator, SpeculationKind, SpeculativeState};
 
 /// Shortest draft that is worth a verify forward (SPEC §6). The verify runs the
 /// ungraphed prefill path, so on a launch-bound small model it only wins when it
@@ -144,22 +145,86 @@ struct ActiveSeq<'t> {
     next: Option<PendingNext>,
     /// Client hang-up detected; sequence is torn down at the next iteration.
     dead: bool,
-    /// Speculative-decode state (SPEC §6): `Some` only for an eligible greedy
-    /// sequence with speculation enabled. Holds the n-gram proposer's history
-    /// index and per-proposer acceptance stats; drives draft/verify/commit.
+    /// Stan hostowego proposera. Natywne MTP przechowuje stan w modelu.
     spec: Option<SpeculativeState>,
-    /// Draft budget per speculative step (0 when `spec` is `None`).
+    /// Jawny tryb spekulacji; natywne MTP jest własnością modelu i nie ma
+    /// hostowego `SpeculativeState` ani CPU proposera.
+    spec_kind: SpeculationKind,
+    /// Budżet draftu na krok, równy 0 wyłącznie dla `SpeculationKind::Off`.
     spec_budget: usize,
     /// Verification forwards run for this sequence (each yields 1..=k+1 tokens).
     spec_forwards: u64,
     /// Draft tokens accepted across all verifications (excludes correction/bonus
     /// tokens, which every forward also produces).
     spec_accepted: u64,
+    mtp_k2_rate: Option<f64>,
+    mtp_k3_rate: Option<f64>,
     /// TTFT / inter-token / decode-tps timing feeding the metrics histograms.
     timing: SeqTiming,
     /// Set once `finish` has emitted `Done`; distinguishes a clean completion
     /// from an errored / hung-up teardown for the requests_errored counter.
     finished_cleanly: bool,
+}
+
+fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<SpeculationKind> {
+    match (spec.kind(), greedy) {
+        (SpeculationKind::NativeMtp, false) => Err(ForgeError::Unsupported(
+            "native MTP requires greedy GPU sampling without repetition penalty".into(),
+        )),
+        (SpeculationKind::HostProposer, false) | (SpeculationKind::Off, _) => {
+            Ok(SpeculationKind::Off)
+        }
+        (kind, true) => Ok(kind),
+    }
+}
+
+fn validate_native_mtp_server_config(kind: SpeculationKind, max_active: usize) -> Result<()> {
+    if kind == SpeculationKind::NativeMtp && max_active != 1 {
+        return Err(ForgeError::Unsupported(
+            "native MTP currently requires max_active=1 because SSM state is model-owned".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn native_mtp_step_budget(available: usize) -> Option<usize> {
+    match available {
+        2 | 3 => Some(available),
+        _ => None,
+    }
+}
+
+fn native_mtp_adaptive_budget(
+    available: usize,
+    configured: usize,
+    forwards: u64,
+    k2_rate: Option<f64>,
+    k3_rate: Option<f64>,
+) -> Option<usize> {
+    let maximum = native_mtp_step_budget(available)?;
+    if configured != 3 {
+        return native_mtp_step_budget(maximum.min(configured));
+    }
+    if maximum != 3 {
+        return Some(maximum);
+    }
+    if forwards < 4 {
+        return Some(if forwards.is_multiple_of(2) { 3 } else { 2 });
+    }
+    let preferred = if k3_rate.unwrap_or(0.0) >= k2_rate.unwrap_or(0.0) {
+        3
+    } else {
+        2
+    };
+    if forwards.is_multiple_of(16) {
+        Some(if preferred == 3 { 2 } else { 3 })
+    } else {
+        Some(preferred)
+    }
+}
+
+fn update_mtp_rate(rate: &mut Option<f64>, sample: f64) {
+    *rate = Some(rate.map_or(sample, |previous| previous * 0.75 + sample * 0.25));
 }
 
 /// Spawn the GPU worker thread. `prefill_chunk` bounds how many prompt tokens
@@ -209,8 +274,18 @@ pub fn spawn_engine_batched(
     spec: SpeculativeConfig,
 ) -> Result<EngineHandle> {
     let coordinator = SpeculationCoordinator::new(spec.clone())?;
+    validate_native_mtp_server_config(spec.kind(), max_active)?;
     if spec.is_enabled() {
-        model.validate_speculation_target()?;
+        match spec.kind() {
+            SpeculationKind::NativeMtp if !model.has_native_mtp() => {
+                return Err(ForgeError::Unsupported(
+                    "native MTP requires a supported model-owned MTP runtime".into(),
+                ));
+            }
+            SpeculationKind::NativeMtp => model.validate_native_mtp_target()?,
+            SpeculationKind::HostProposer => model.validate_speculation_target()?,
+            SpeculationKind::Off => {}
+        }
         let proposer_names = spec
             .proposers()
             .iter()
@@ -358,11 +433,6 @@ fn worker<'t>(
             } else {
                 SeqSampler::Cpu(Sampler::new(sub.req.sampling.clone()))
             };
-            // Borrow the longest cached prefix (pins shared pages); only the
-            // divergent suffix stays to prefill.
-            let mut seq = model.new_seq();
-            let cache_read = model.acquire_prefix(&mut seq, &prompt);
-            let pending_prompt: VecDeque<u32> = prompt[cache_read..].iter().copied().collect();
             // Speculative decoding engages only for a greedy, penalty-free,
             // GPU-sampled sequence (the n-gram verifier reproduces greedy argmax
             // exactly; a repetition penalty or host-logit feature would diverge).
@@ -371,12 +441,25 @@ fn worker<'t>(
             let greedy = matches!(sampler, SeqSampler::Gpu(_))
                 && sub.req.sampling.clone().sanitized().temperature <= 0.0
                 && sub.req.sampling.repetition_penalty == 1.0;
+            let request_spec_kind = match request_speculation_kind(&spec, greedy) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    let _ = sub.events.send(EngineEvent::Error(error.to_string()));
+                    EngineMetrics::inc(&metrics.requests_errored);
+                    continue;
+                }
+            };
+            // Najdłuższy prefiks jest przypinany dopiero po sprawdzeniu MTP,
+            // aby odrzucone żądanie nie pozostawiło zajętych stron.
+            let mut seq = model.new_seq();
+            let cache_read = model.acquire_prefix(&mut seq, &prompt);
+            let pending_prompt: VecDeque<u32> = prompt[cache_read..].iter().copied().collect();
             if spec.is_enabled() && !greedy {
                 tracing::debug!(
                     "speculative decoding skipped for a request requiring non-greedy or host-logit sampling"
                 );
             }
-            let (spec_state, spec_budget) = if spec.is_enabled() && greedy {
+            let (spec_state, spec_kind, spec_budget) = if request_spec_kind != SpeculationKind::Off {
                 let state = match coordinator.new_state(&prompt) {
                     Ok(state) => state,
                     Err(error) => {
@@ -384,9 +467,9 @@ fn worker<'t>(
                         continue;
                     }
                 };
-                (state, spec.draft_tokens())
+                (state, request_spec_kind, spec.draft_tokens())
             } else {
-                (None, 0)
+                (None, SpeculationKind::Off, 0)
             };
             active.push(ActiveSeq {
                 seq,
@@ -407,9 +490,12 @@ fn worker<'t>(
                 next: None,
                 dead: false,
                 spec: spec_state,
+                spec_kind,
                 spec_budget,
                 spec_forwards: 0,
                 spec_accepted: 0,
+                mtp_k2_rate: None,
+                mtp_k3_rate: None,
                 timing: SeqTiming::new(),
                 finished_cleanly: false,
             });
@@ -676,10 +762,10 @@ fn batch_gpu_decode(
             // never joins the batched (or serial fallback) feed set — the n-gram
             // path is a single-sequence latency win, disabled under batch load.
             Ok(StepOutcome::Continue) => {
-                if a.spec.is_some() {
-                    speculative_step(model, a, metrics);
-                } else {
-                    feed_idx.push(i);
+                match a.spec_kind {
+                    SpeculationKind::HostProposer => speculative_step(model, a, metrics),
+                    SpeculationKind::NativeMtp => native_mtp_step(model, a, metrics),
+                    SpeculationKind::Off => feed_idx.push(i),
                 }
             }
             Ok(StepOutcome::Finished) => {}
@@ -872,6 +958,66 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     a.next = Some(PendingNext::Token(correction));
 }
 
+/// Jeden krok natywnego MTP. Model jest właścicielem draftu, weryfikatora i
+/// checkpointów; serwer emituje zaakceptowany prefiks i zachowuje token
+/// korekcyjny jako wejście następnej iteracji.
+fn native_mtp_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMetrics) {
+    let fed = *a.generated.last().expect("emit_token pushed the fed token");
+    let available = model.native_mtp_available_budget(&a.seq, a.spec_budget);
+    let Some(budget) = native_mtp_adaptive_budget(
+        available,
+        a.spec_budget,
+        a.spec_forwards,
+        a.mtp_k2_rate,
+        a.mtp_k3_rate,
+    ) else {
+        serial_step(model, a);
+        return;
+    };
+    let SeqSampler::Gpu(sampler) = &mut a.sampler else {
+        unreachable!("native MTP is GPU-sampled")
+    };
+    sampler.note_token(fed);
+    let started = Instant::now();
+    let (draft, accepted, correction) = match model.native_mtp_step(&mut a.seq, fed, budget) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+            return;
+        }
+    };
+    if a.spec_forwards > 0 {
+        let rate = (accepted + 1) as f64 / started.elapsed().as_secs_f64();
+        if budget == 2 {
+            update_mtp_rate(&mut a.mtp_k2_rate, rate);
+        } else {
+            update_mtp_rate(&mut a.mtp_k3_rate, rate);
+        }
+    }
+    if draft.len() != budget || accepted > draft.len() {
+        let _ = a.events.send(EngineEvent::Error(
+            "native MTP returned an invalid draft or acceptance length".into(),
+        ));
+        a.dead = true;
+        return;
+    }
+    a.spec_forwards += 1;
+    a.spec_accepted += accepted as u64;
+    for &token in &draft[..accepted] {
+        match emit_token(a, token, None, metrics) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
+    }
+    a.next = Some(PendingNext::Token(correction));
+}
+
 fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetrics) -> Result<()> {
     // Flush held text through the same stop/event path as live tokens.
     if reason != FinishReason::Stop {
@@ -918,6 +1064,17 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
                 s.stats(),
             );
         }
+    } else if a.spec_kind == SpeculationKind::NativeMtp && a.spec_forwards > 0 {
+        let forwards = a.spec_forwards as f64;
+        let tokens_from_spec = forwards + a.spec_accepted as f64;
+        tracing::info!(
+            "native MTP: {} verify forwards, {} accepted draft tokens \
+             ({:.2} accepted/step, {:.2}x tokens/forward)",
+            a.spec_forwards,
+            a.spec_accepted,
+            a.spec_accepted as f64 / forwards,
+            tokens_from_spec / forwards,
+        );
     }
     // Terminal accounting (SPEC §8.3): a finished request contributes its
     // prompt/generated/cache-read token totals, speculation acceptance and its
@@ -939,4 +1096,75 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
     a.dead = true;
     a.finished_cleanly = true;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        native_mtp_adaptive_budget, native_mtp_step_budget, request_speculation_kind,
+        update_mtp_rate, validate_native_mtp_server_config,
+    };
+    use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
+
+    #[test]
+    fn native_mtp_requires_greedy_sampling_instead_of_silent_fallback() {
+        for budget in [2, 3] {
+            let spec = SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget)
+                .expect("konfiguracja MTP powinna być poprawna");
+            assert_eq!(
+                request_speculation_kind(&spec, true).expect("greedy MTP powinno działać"),
+                SpeculationKind::NativeMtp
+            );
+            assert!(request_speculation_kind(&spec, false).is_err());
+        }
+    }
+
+    #[test]
+    fn host_proposer_keeps_existing_fallback() {
+        let spec = SpeculativeConfig::ngram(8).expect("konfiguracja n-gram");
+        assert_eq!(
+            request_speculation_kind(&spec, false).expect("n-gram może wyłączyć się per request"),
+            SpeculationKind::Off
+        );
+        assert_eq!(
+            request_speculation_kind(&spec, true).expect("greedy n-gram powinien działać"),
+            SpeculationKind::HostProposer
+        );
+    }
+
+    #[test]
+    fn native_mtp_requires_one_active_sequence() {
+        assert!(validate_native_mtp_server_config(SpeculationKind::NativeMtp, 0).is_err());
+        assert!(validate_native_mtp_server_config(SpeculationKind::NativeMtp, 1).is_ok());
+        assert!(validate_native_mtp_server_config(SpeculationKind::NativeMtp, 2).is_err());
+        assert!(validate_native_mtp_server_config(SpeculationKind::HostProposer, 8).is_ok());
+        assert!(validate_native_mtp_server_config(SpeculationKind::Off, 8).is_ok());
+    }
+
+    #[test]
+    fn native_mtp_clips_budget_or_selects_serial_step() {
+        assert_eq!(native_mtp_step_budget(3), Some(3));
+        assert_eq!(native_mtp_step_budget(2), Some(2));
+        assert_eq!(native_mtp_step_budget(0), None);
+        assert_eq!(native_mtp_step_budget(1), None);
+        assert_eq!(native_mtp_step_budget(4), None);
+    }
+
+    #[test]
+    fn native_mtp_adapts_budget_to_measured_cycle_rate() {
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 0, None, None), Some(3));
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 1, None, None), Some(2));
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 4, Some(40.0), Some(30.0)), Some(2));
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 5, Some(30.0), Some(40.0)), Some(3));
+        assert_eq!(native_mtp_adaptive_budget(3, 2, 5, Some(30.0), Some(40.0)), Some(2));
+        assert_eq!(native_mtp_adaptive_budget(2, 3, 5, Some(30.0), Some(40.0)), Some(2));
+    }
+
+    #[test]
+    fn native_mtp_rate_uses_exponential_average() {
+        let mut rate = None;
+        update_mtp_rate(&mut rate, 20.0);
+        update_mtp_rate(&mut rate, 40.0);
+        assert_eq!(rate, Some(25.0));
+    }
 }

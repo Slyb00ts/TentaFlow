@@ -219,15 +219,30 @@ warunkami i nie trafiają do obrazów ani wydań FORGE.
 
 ### 6.4. Stan realizacji
 
-Obecnie działa liniowy `NgramProposer` z weryfikacją greedy i rollbackiem KV.
-Zaimplementowany fundament obejmuje typowane `DraftTree`/`DraftNode`, walidację
-topologii, `ProposerKind`, `SpeculativeConfig`, `SpeculationCoordinator`, kaskadową
-kompozycję liniową, atrybucję statystyk per proposer i typowany parser manifestu.
-Reprezentacja przyjmuje gałęzie, lecz bieżący verifier świadomie zwraca
-`Unsupported` dla draftu rozgałęzionego. Konfiguracje `draft-model`, `mtp`,
-`eagle`, `dflash` i `dspark` są reprezentowane przez typowane API, ale koordynator zwraca `Unsupported`,
-dopóki nie ma zgodnych, licencjonowanych wag i wykonawczego proposera. Weryfikacja
-drzewiasta i stochastyczna oraz PARD/Suffix nie są jeszcze zaimplementowane.
+Obecnie działają liniowy `NgramProposer` oraz natywne MTP/NextN dla gęstego
+hybrydowego GGUF `qwen35`. Natywna ścieżka rozpoznaje
+`nextn_predict_layers`, wydziela głowę MTP z trunku i współdzieli embedding oraz
+głowę wyjściową targetu, jeśli GGUF nie dostarcza ich osobnych wersji. Proposer,
+weryfikacja draftu, argmax oraz checkpointy KV i DeltaNet wykonują się na GPU;
+retained checkpointy pozwalają zatwierdzić stan bez ponownego skanu warstw
+DeltaNet. W trybie z budżetem 3 scheduler adaptacyjnie wybiera K=2 lub K=3 na
+podstawie zmierzonego tempa zaakceptowanych tokenów.
+
+Natywne MTP zachowuje wynik sekwencyjnego greedy i obecnie wymaga
+`temperature=0`, próbkowania GPU, braku repetition penalty oraz
+`max_active=1`, ponieważ stan SSM należy do modelu. Zostało przetestowane na
+CUDA/RTX 4090 z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`; wspólne źródła
+Mojo są przygotowane do dalszego codegenu, ale nie stanowią dowodu uruchomienia
+na AMD ani Metal. Szczegółowy wynik znajduje się w
+`docs/BENCH_QWEN35_MTP_NVFP4.md`.
+
+Fundament nadal obejmuje typowane `DraftTree`/`DraftNode`, walidację topologii,
+`ProposerKind`, `SpeculativeConfig`, `SpeculationCoordinator`, kaskadową
+kompozycję liniową, atrybucję statystyk per proposer i parser manifestu.
+Reprezentacja przyjmuje gałęzie, lecz bieżący verifier zwraca `Unsupported` dla
+draftu rozgałęzionego. `draft-model`, `eagle`, `dflash` i `dspark` pozostają
+typowanymi konfiguracjami bez wykonawczego proposera. Weryfikacja drzewiasta i
+stochastyczna oraz PARD/Suffix nie są jeszcze zaimplementowane.
 
 Źródła algorytmiczne: [DSpark](https://arxiv.org/abs/2607.05147),
 [DFlash](https://arxiv.org/abs/2602.06036),

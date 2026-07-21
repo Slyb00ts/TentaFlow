@@ -19,6 +19,14 @@ pub enum ProposerKind {
     DSpark,
 }
 
+/// Określa właściciela stanu i wykonania spekulacji.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeculationKind {
+    Off,
+    HostProposer,
+    NativeMtp,
+}
+
 impl ProposerKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -61,6 +69,11 @@ impl SpeculativeConfig {
                 "enabled speculative configuration requires at least one proposer".into(),
             ));
         }
+        if proposers.contains(&ProposerKind::Mtp) && proposers != [ProposerKind::Mtp] {
+            return Err(ForgeError::Unsupported(
+                "native MTP must be the only speculative proposer".into(),
+            ));
+        }
         for (index, kind) in proposers.iter().enumerate() {
             if proposers[..index].contains(kind) {
                 return Err(ForgeError::Unsupported(format!(
@@ -73,6 +86,11 @@ impl SpeculativeConfig {
                     "ngram proposer must be the final cascade extension".into(),
                 ));
             }
+        }
+        if proposers == [ProposerKind::Mtp] && !matches!(draft_tokens, 2 | 3) {
+            return Err(ForgeError::Unsupported(
+                "native MTP draft budget must be 2 or 3".into(),
+            ));
         }
         Ok(Self {
             proposers,
@@ -91,6 +109,15 @@ impl SpeculativeConfig {
     pub fn draft_tokens(&self) -> usize {
         self.draft_tokens
     }
+
+    /// Rozróżnia wyłączoną spekulację, proposer hostowy i natywne MTP modelu.
+    pub fn kind(&self) -> SpeculationKind {
+        match self.proposers.as_slice() {
+            [] => SpeculationKind::Off,
+            [ProposerKind::Mtp] => SpeculationKind::NativeMtp,
+            _ => SpeculationKind::HostProposer,
+        }
+    }
 }
 
 pub struct SpeculationCoordinator {
@@ -99,8 +126,10 @@ pub struct SpeculationCoordinator {
 
 impl SpeculationCoordinator {
     pub fn new(config: SpeculativeConfig) -> Result<Self> {
-        for &kind in config.proposers() {
-            Self::build_proposer(kind)?;
+        if config.kind() == SpeculationKind::HostProposer {
+            for &kind in config.proposers() {
+                Self::build_proposer(kind)?;
+            }
         }
         Ok(Self { config })
     }
@@ -116,7 +145,7 @@ impl SpeculationCoordinator {
     }
 
     pub fn new_state(&self, history: &[u32]) -> Result<Option<SpeculativeState>> {
-        if !self.config.is_enabled() {
+        if self.config.kind() != SpeculationKind::HostProposer {
             return Ok(None);
         }
         let proposers = self

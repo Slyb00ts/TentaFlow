@@ -44,6 +44,22 @@ fn e8m0_to_f32_half(e: u8) -> f32 {
     f32::from_bits(bits)
 }
 
+/// GGML przechowuje skalę UE4M3 bez znaku, a tablicę E2M1 jako wartości
+/// podwojone, dlatego skala zwracana tutaj zawiera czynnik 0,5.
+fn ue4m3_to_f32_half(value: u8) -> f32 {
+    if value == 0 || value == 0x7f {
+        return 0.0;
+    }
+    let exponent = (value >> 3) & 0x0f;
+    let mantissa = (value & 0x07) as f32;
+    let decoded = if exponent == 0 {
+        mantissa * 2f32.powi(-9)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent as i32 - 7)
+    };
+    decoded * 0.5
+}
+
 /// Dequantize a full tensor to f32. `data` must be exactly the packed bytes
 /// for `numel` elements of the given format.
 pub fn dequantize_to_f32(
@@ -98,6 +114,14 @@ pub fn dequantize_to_f32(
             QuantKind::IQ4NL => dq_iq4_nl(block, y),
             QuantKind::IQ4XS => dq_iq4_xs(block, y),
             QuantKind::MXFP4 => dq_mxfp4(block, y),
+            QuantKind::NVFP4Gguf => {
+                if block[..4].iter().any(|scale| scale & 0x80 != 0) {
+                    return Err(fmt_err(format!(
+                        "dequant: NVFP4Gguf block {i} contains invalid UE4M3 scale"
+                    )));
+                }
+                dq_nvfp4_gguf(block, y)
+            }
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "dequant: no CPU reference for {other:?}"
@@ -621,6 +645,19 @@ fn dq_mxfp4(b: &[u8], y: &mut [f32]) {
     }
 }
 
+fn dq_nvfp4_gguf(b: &[u8], y: &mut [f32]) {
+    // Cztery podbloki po 16 elementów mają osobne skale i po osiem par E2M1.
+    for subblock in 0..4 {
+        let scale = ue4m3_to_f32_half(b[subblock]);
+        let packed = &b[4 + subblock * 8..4 + (subblock + 1) * 8];
+        let output = &mut y[subblock * 16..(subblock + 1) * 16];
+        for (index, &pair) in packed.iter().enumerate() {
+            output[index] = KVALUES_MXFP4[(pair & 0x0f) as usize] as f32 * scale;
+            output[index + 8] = KVALUES_MXFP4[(pair >> 4) as usize] as f32 * scale;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +878,42 @@ mod tests {
         assert_eq!(e8m0_to_f32_half(128), 1.0);
         assert_eq!(e8m0_to_f32_half(1), f32::from_bits(0x0040_0000));
         assert_eq!(e8m0_to_f32_half(0), f32::from_bits(0x0020_0000));
+    }
+
+    #[test]
+    fn nvfp4_gguf_ue4m3_e2m1_golden() {
+        let mut block = vec![0u8; 36];
+        block[..4].copy_from_slice(&[0x38, 0x40, 0x30, 0x7f]);
+        for subblock in 0..4 {
+            block[4 + subblock * 8..4 + (subblock + 1) * 8]
+                .copy_from_slice(&[0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
+        }
+
+        let values = dq(QuantKind::NVFP4Gguf, &block);
+        assert_eq!(
+            &values[..16],
+            &[
+                0.0, 1.0, 2.0, 4.0, 0.0, -1.0, -2.0, -4.0, 0.5, 1.5, 3.0, 6.0, -0.5, -1.5, -3.0,
+                -6.0,
+            ]
+        );
+        assert_eq!(values[16], 0.0);
+        assert_eq!(values[17], 2.0);
+        assert_eq!(values[24], 1.0);
+        assert_eq!(values[32], 0.0);
+        assert_eq!(values[33], 0.5);
+        assert!(values[48..].iter().all(|&value| value == 0.0));
+        assert_eq!(ue4m3_to_f32_half(0x01), 1.0 / 1024.0);
+        assert_eq!(ue4m3_to_f32_half(0x7e), 224.0);
+    }
+
+    #[test]
+    fn nvfp4_gguf_rejects_corrupt_blocks() {
+        assert!(dequantize_to_f32(DType::U8, QuantKind::NVFP4Gguf, &[0u8; 35], 64,).is_err());
+        assert!(dequantize_to_f32(DType::U8, QuantKind::NVFP4Gguf, &[0u8; 36], 63,).is_err());
+        let mut invalid_scale = [0u8; 36];
+        invalid_scale[0] = 0x80;
+        assert!(dequantize_to_f32(DType::U8, QuantKind::NVFP4Gguf, &invalid_scale, 64,).is_err());
     }
 
     #[test]
