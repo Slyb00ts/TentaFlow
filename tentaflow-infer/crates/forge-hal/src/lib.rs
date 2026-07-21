@@ -334,6 +334,11 @@ pub trait Device: Send + Sync {
     /// Freeing is RAII via `DevBuffer` drop.
     fn alloc(&self, bytes: usize, kind: MemKind, pool: Pool) -> Result<DevBuffer>;
 
+    /// Liczba wolnych bajtów w puli urządzenia, gdy backend potrafi ją raportować.
+    fn pool_available(&self, _pool: Pool) -> Option<usize> {
+        None
+    }
+
     fn create_stream(&self) -> Result<Stream>;
 
     fn create_event(&self) -> Result<Event>;

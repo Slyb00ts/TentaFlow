@@ -396,6 +396,26 @@ forward pass, scheduler queue) / server+cli (OpenAI API). Kernel toolchain:
 E2E proven: Bielik-PL-Minitron-7B-NVFP4 (software FP4 dequant) generates
 coherent Polish on the RTX 4090.
 
+### Ścieżka NVFP4/FP8
+
+- `FORGE_GEMM=fp8mod-ffn` włącza hybrydowy prefill: kernele Mojo przepakowują
+  projekcje Q/O/gate/up/down NVFP4 oraz pojedynczy `lm_head` F16 do FP8 na GPU.
+  Źródłowe NVFP4 pozostaje rezydentne dla decode; K/V nie są konwertowane.
+- Wyspecjalizowane kernele małych batchy NVFP4 obsługują B4/B8/B16 i BM32.
+  Decode GQA 4:1 dla `head_dim=128`, KV F16 i bez Q/K norm współdzieli K/V między
+  czterema głowicami Q oraz używa dwugłowicowego `combine2`.
+- Konwersję wolno rozpocząć dopiero po sprawdzeniu możliwości urządzenia,
+  obsługiwanych kształtów, kompletu artefaktów i dostępnego VRAM. Niespełnienie
+  warunków pozostawia całą warstwę na istniejącej ścieżce NVFP4.
+- Zweryfikowany wynik RTX 4090, pp4096/jeden strumień: FORGE 10 302,7 tok/s
+  prefill i 143,100 tok/s decode; vLLM 0.25.1 odpowiednio 9 732,9 i 146,372.
+  Prefill wygrywa o 5,85%, decode pozostaje 2,24% wolniejszy. Protokół i
+  ograniczenia są w `tentaflow-infer/docs/BENCH_NVFP4_VLLM.md`.
+- HAL FORGE nadal obsługuje tylko CUDA. AMD/ROCm, Metal i natywne instrukcje FP4
+  Blackwell nie są zaimplementowane; fallback możliwości nie oznacza obsługi
+  tych backendów. Użyty checkpoint compressed-tensors NVFP4 nie jest bezpośrednio
+  obsługiwany przez badaną wersję `llama.cpp`.
+
 ## Conventions
 
 - Code comments, variable/function names, commit messages: **English**. Commit format:

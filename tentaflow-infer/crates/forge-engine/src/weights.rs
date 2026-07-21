@@ -275,6 +275,15 @@ pub struct Fp8Layer {
     pub down: Fp8Weight,
 }
 
+/// Paczki FP8 dla Q/O i projekcji FFN hybrydowego prefillu.
+pub struct Fp8FfnLayer {
+    pub q: Fp8Weight,
+    pub attn_o: Fp8Weight,
+    pub gate: Fp8Weight,
+    pub up: Fp8Weight,
+    pub down: Fp8Weight,
+}
+
 /// Whether an fp8 (e4m3) prefill GEMM is selected. `fp8` = the hand-written
 /// single-PTX kernel; `fp8mod` = Modular's multistage cp.async kernel (faster,
 /// docs/CODEGEN_PROOF.md Finding G). Both build the SAME e4m3 weight packs; only
@@ -289,6 +298,11 @@ pub fn fp8_enabled() -> bool {
 /// Whether the Modular multistage fp8 GEMM (`FORGE_GEMM=fp8mod`) is selected.
 pub fn fp8_modular_enabled() -> bool {
     std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod")
+}
+
+/// Czy wybrano hybrydowy prefill FP8 tylko dla FFN.
+pub fn fp8_ffn_modular_enabled() -> bool {
+    std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod-ffn")
 }
 
 /// Per-input-channel activation abs-max collected during the W4A8 calibration
@@ -455,6 +469,8 @@ pub struct ModelWeights {
     /// LM head. For tied embeddings this is a separate f16 view built from the
     /// same host data (kept simple; dedup is a later optimization).
     pub lm_head: DevWeight,
+    /// Lm_head FP8 używany tylko przez single-stream decode w trybie opt-in.
+    pub fp8_lm_head: Option<Fp8Weight>,
     pub layers: Vec<LayerWeights>,
     /// Layers whose Q/K/V (resp. gate/up) landed as one fused matrix — the
     /// rest fell back to q|k fusion with separate v, or fully split storage
@@ -468,6 +484,8 @@ pub struct ModelWeights {
     /// Per-layer fp8 (e4m3) packs for the prefill GEMM when `FORGE_GEMM=fp8`,
     /// else `None`. Dense models only; decode/logit keep the resident weights.
     pub fp8: Option<Vec<Fp8Layer>>,
+    /// Dodatkowe paczki FP8 dla Q/O i FFN w opt-in prefill.
+    pub fp8_ffn: Option<Vec<Fp8FfnLayer>>,
     /// When `fp8` packs are resident, route the prefill GEMM to Modular's
     /// multistage kernel (`FORGE_GEMM=fp8mod`) instead of the hand kernel.
     pub fp8_modular: bool,
@@ -1685,12 +1703,14 @@ impl ModelWeights {
             token_embd_host: None,
             output_norm,
             lm_head,
+            fp8_lm_head: None,
             layers,
             fused_qkv_layers,
             fused_qk_layers,
             fused_gate_up_layers,
             w4a8: None,
             fp8: None,
+            fp8_ffn: None,
             fp8_modular: false,
         })
     }
@@ -1836,12 +1856,14 @@ impl ModelWeights {
             token_embd_host: Some(host_embed),
             output_norm,
             lm_head,
+            fp8_lm_head: None,
             layers,
             fused_qkv_layers: 0,
             fused_qk_layers: 0,
             fused_gate_up_layers: 0,
             w4a8: None,
             fp8: None,
+            fp8_ffn: None,
             fp8_modular: false,
         })
     }

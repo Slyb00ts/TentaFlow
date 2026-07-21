@@ -513,6 +513,42 @@ def gemv_f16_out_f32_v2(
         y[row] = total
 
 
+def gemv_fp8_out_f32_v2(
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Logity FP32 z wag E4M3 skalowanych osobno dla każdego wiersza."""
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+
+    base = row * n_cols
+    var acc: Float32 = 0.0
+    var i = lane * 8
+    stride = WARP * 8
+    while i + 8 <= n_cols:
+        raw = (w + base + i).bitcast[UInt16]().load[width=4, alignment=8]()
+        var pairs = SIMD[DType.uint32, 4](0)
+        comptime for j in range(4):
+            pairs[j] = bitcast[DType.uint32, 1](
+                _e4m3x2_to_f16x2(UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8))
+            )[0]
+        wv = bitcast[DType.float16, 8](pairs).cast[DType.float32]()
+        xv = (x + i).load[width=8, alignment=16]().cast[DType.float32]()
+        acc += (wv * xv).reduce_add()
+        i += stride
+
+    total = warp.sum(acc) * scales[row]
+    if lane == 0:
+        y[row] = total
+
+
 def _gemv_q5_k_row_acc(
     w: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
