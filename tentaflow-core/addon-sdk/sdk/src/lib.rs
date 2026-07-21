@@ -482,6 +482,14 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+    fn camera_zones_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_zones_set_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
     fn camera_update_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
@@ -3016,6 +3024,29 @@ pub fn camera_get(camera_id: &str) -> Result<CameraInfo, AbiError> {
     let bytes = call_sql_with_one_input(camera_get_v1, &payload)?;
     let out: tentaflow_sdk_spec::CameraInfoOut = decode_cbor(&bytes)?;
     Ok(CameraInfo::from(out))
+}
+
+/// Detection zones as normalized polygons, JSON-encoded (`[[[x,y],...],...]`).
+/// An empty list means the whole frame is analysed. Needs `cameras.read`.
+pub fn camera_zones_get(camera_id: &str) -> Result<String, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_zones_get_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraZonesOut = decode_cbor(&bytes)?;
+    Ok(out.zones_json)
+}
+
+/// Replaces the whole polygon set. The host rejects malformed JSON and
+/// out-of-range coordinates. Needs `cameras.write` and camera ownership.
+pub fn camera_zones_set(camera_id: &str, zones_json: &str) -> Result<String, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraZonesSetInput {
+        camera_id: camera_id.to_string(),
+        zones_json: zones_json.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_zones_set_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraZonesOut = decode_cbor(&bytes)?;
+    Ok(out.zones_json)
 }
 
 /// Patch on-the-fly. Vendor + URL sa niezmienne — change them by remove + add.

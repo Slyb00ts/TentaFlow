@@ -492,6 +492,20 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "camera_get_v1", camera::camera_get_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_get_v1: {e}"))?;
         linker
+            .func_wrap(
+                "tentaflow",
+                "camera_zones_get_v1",
+                camera::camera_zones_get_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_zones_get_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_zones_set_v1",
+                camera::camera_zones_set_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_zones_set_v1: {e}"))?;
+        linker
             .func_wrap("tentaflow", "camera_update_v1", camera::camera_update_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_update_v1: {e}"))?;
         linker

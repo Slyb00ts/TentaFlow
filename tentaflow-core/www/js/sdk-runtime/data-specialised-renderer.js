@@ -433,9 +433,173 @@ function renderLiveRegion(component, ctx) {
 // Registration
 // =============================================================================
 
+
+// -----------------------------------------------------------------------------
+// 0x0F01 — ZoneEditor (TentaFlow extension, outside catalog v1)
+// -----------------------------------------------------------------------------
+
+const ZONE_EDITOR_TAG = 0x0f01;
+const ZONE_EDITOR_FIELD_KEYS = [0, 1];
+
+/// Parses the persisted zone shape: `[[[x,y],...], ...]` normalized 0..1.
+/// Anything malformed yields an empty set — the editor then starts blank
+/// instead of throwing and taking the whole panel down.
+function parseZones(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return [];
+  let v;
+  try { v = JSON.parse(raw); } catch { return []; }
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const poly of v) {
+    if (!Array.isArray(poly)) continue;
+    const pts = [];
+    for (const p of poly) {
+      if (!Array.isArray(p) || p.length < 2) continue;
+      const x = Number(p[0]); const y = Number(p[1]);
+      if (Number.isFinite(x) && Number.isFinite(y)) pts.push([x, y]);
+    }
+    if (pts.length >= 3) out.push(pts);
+  }
+  return out;
+}
+
+/// Polygon zone editor over a still camera frame. Click places a vertex,
+/// "Zamknij" closes the polygon, "Zapisz" emits `commit` carrying the full set
+/// as the same JSON string the vision engine filters on. Coordinates are stored
+/// NORMALIZED so a zone keeps its meaning across resolutions.
+function renderZoneEditor(component, ctx) {
+  assertOnlyKnownFields(component.fields, ZONE_EDITOR_FIELD_KEYS, 'ZoneEditor');
+  const imageBind = ctx.readField(component.fields, 0);
+  if (imageBind == null) throw new TypeError('ZoneEditor.image_ref is required (BindRef)');
+  assertBindRef(imageBind, 'ZoneEditor.image_ref');
+  const zonesBind = ctx.readField(component.fields, 1);
+  if (zonesBind == null) throw new TypeError('ZoneEditor.zones_json is required (BindRef)');
+  assertBindRef(zonesBind, 'ZoneEditor.zones_json');
+
+  const wrapper = document.createElement('div');
+  wrapper.classList.add('tf-zone-editor');
+  wrapper.style.position = 'relative';
+  wrapper.style.display = 'inline-block';
+  wrapper.style.maxWidth = '100%';
+
+  const img = document.createElement('img');
+  img.classList.add('tf-zone-editor__img');
+  img.alt = 'Podgląd kamery';
+  img.style.display = 'block';
+  img.style.maxWidth = '100%';
+
+  const canvas = document.createElement('canvas');
+  canvas.classList.add('tf-zone-editor__canvas');
+  Object.assign(canvas.style, {
+    position: 'absolute', left: '0', top: '0',
+    width: '100%', height: '100%', cursor: 'crosshair',
+  });
+
+  let zones = parseZones(resolveBindRef(zonesBind, ctx.store));
+  let current = [];
+
+  const draw = () => {
+    const w = img.clientWidth || img.naturalWidth || 0;
+    const h = img.clientHeight || img.naturalHeight || 0;
+    if (!w || !h) return;
+    canvas.width = w; canvas.height = h;
+    const g = canvas.getContext('2d');
+    if (!g) return;
+    g.clearRect(0, 0, w, h);
+    const paint = (pts, close, stroke, fill) => {
+      if (!pts.length) return;
+      g.beginPath();
+      g.moveTo(pts[0][0] * w, pts[0][1] * h);
+      for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0] * w, pts[i][1] * h);
+      if (close) g.closePath();
+      if (fill) { g.fillStyle = fill; g.fill(); }
+      g.strokeStyle = stroke; g.lineWidth = 2; g.stroke();
+      g.fillStyle = stroke;
+      for (const [px, py] of pts) {
+        g.beginPath(); g.arc(px * w, py * h, 4, 0, Math.PI * 2); g.fill();
+      }
+    };
+    for (const z of zones) paint(z, true, '#22cc66', 'rgba(34,204,102,0.25)');
+    paint(current, false, '#ffcc00', null);
+  };
+
+  const applyImage = () => {
+    const src = resolveBindRef(imageBind, ctx.store);
+    if (typeof src !== 'string' || /^javascript:/i.test(src.trim())) {
+      img.removeAttribute('src');
+      return;
+    }
+    img.src = src;
+  };
+  const applyZones = () => {
+    zones = parseZones(resolveBindRef(zonesBind, ctx.store));
+    current = [];
+    draw();
+  };
+  applyImage();
+  ctx.registerCleanup(subscribeBindRef(imageBind, ctx.store, applyImage));
+  ctx.registerCleanup(subscribeBindRef(zonesBind, ctx.store, applyZones));
+
+  const onLoad = () => draw();
+  img.addEventListener('load', onLoad);
+  ctx.registerCleanup(() => img.removeEventListener('load', onLoad));
+
+  const onClick = (e) => {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    current.push([Number(x.toFixed(4)), Number(y.toFixed(4))]);
+    draw();
+  };
+  canvas.addEventListener('click', onClick);
+  ctx.registerCleanup(() => canvas.removeEventListener('click', onClick));
+
+  const bar = document.createElement('div');
+  bar.classList.add('tf-zone-editor__bar');
+  bar.style.marginTop = '8px';
+  bar.style.display = 'flex';
+  bar.style.gap = '8px';
+  bar.style.flexWrap = 'wrap';
+  const mkBtn = (label, fn) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    ctx.registerCleanup(() => b.removeEventListener('click', fn));
+    bar.appendChild(b);
+    return b;
+  };
+  // A polygon needs three vertices to bound an area; closing with fewer is a
+  // no-op rather than saving a degenerate zone the engine would discard.
+  mkBtn('Zamknij wielokąt', () => {
+    if (current.length >= 3) { zones.push(current); current = []; draw(); }
+  });
+  mkBtn('Cofnij punkt', () => {
+    if (current.length) current.pop();
+    else if (zones.length) current = zones.pop();
+    draw();
+  });
+  mkBtn('Wyczyść wszystko', () => { zones = []; current = []; draw(); });
+  mkBtn('Zapisz strefy', () => {
+    if (current.length >= 3) { zones.push(current); current = []; }
+    draw();
+    wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('commit', {
+      bubbles: false,
+      detail: { zones_json: JSON.stringify(zones) },
+    }));
+  });
+
+  wrapper.appendChild(img);
+  wrapper.appendChild(canvas);
+  wrapper.appendChild(bar);
+  return wrapper;
+}
+
 export function registerDataSpecialisedRenderers() {
   if (!lookupComponentRenderer(CALENDAR_MONTH_TAG)) registerComponentRenderer(CALENDAR_MONTH_TAG, renderCalendarMonth);
   if (!lookupComponentRenderer(IMAGE_TAG)) registerComponentRenderer(IMAGE_TAG, renderImage);
   if (!lookupComponentRenderer(VISUALLY_HIDDEN_TAG)) registerComponentRenderer(VISUALLY_HIDDEN_TAG, renderVisuallyHidden);
+  if (!lookupComponentRenderer(ZONE_EDITOR_TAG)) registerComponentRenderer(ZONE_EDITOR_TAG, renderZoneEditor);
   if (!lookupComponentRenderer(LIVE_REGION_TAG)) registerComponentRenderer(LIVE_REGION_TAG, renderLiveRegion);
 }
