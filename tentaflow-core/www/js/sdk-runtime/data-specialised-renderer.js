@@ -480,9 +480,17 @@ function renderZoneEditor(component, ctx) {
   // with no background frame yet (a camera that has not recorded anything) an
   // image-sized wrapper collapses to zero height and the operator cannot draw at
   // all. Aspect ratio snaps to the real frame once one loads.
+  // Outer column holds the frame box AND the toolbar. The toolbar must live
+  // OUTSIDE the frame box: inside it, a static-flow bar is painted underneath
+  // the absolutely-positioned image and canvas, leaving the operator with
+  // buttons that are invisible and unclickable.
   const wrapper = document.createElement('div');
   wrapper.classList.add('tf-zone-editor');
-  Object.assign(wrapper.style, {
+  Object.assign(wrapper.style, { display: 'block', width: '100%' });
+
+  const frameBox = document.createElement('div');
+  frameBox.classList.add('tf-zone-editor__frame');
+  Object.assign(frameBox.style, {
     position: 'relative', display: 'block', width: '100%',
     aspectRatio: '16 / 9', background: '#111', overflow: 'hidden',
   });
@@ -551,7 +559,7 @@ function renderZoneEditor(component, ctx) {
 
   const onLoad = () => {
     if (img.naturalWidth && img.naturalHeight) {
-      wrapper.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+      frameBox.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
     }
     draw();
   };
@@ -604,8 +612,9 @@ function renderZoneEditor(component, ctx) {
     }));
   });
 
-  wrapper.appendChild(img);
-  wrapper.appendChild(canvas);
+  frameBox.appendChild(img);
+  frameBox.appendChild(canvas);
+  wrapper.appendChild(frameBox);
   wrapper.appendChild(bar);
   return wrapper;
 }
