@@ -3055,11 +3055,11 @@ pub async fn run_rtsp_session(
         // restart (e.g. credentials rotation). On restart we want to skip
         // the reconnect backoff and try the new config immediately.
         let mut restart_requested = false;
-        // The inner loop ended because the warmup window expired without a frame.
-        // A TIMEOUT is not evidence that the decode chain is broken — a camera
-        // recovering from RTSP-session stress looks exactly the same — so this
-        // must NOT walk the ingest path down a rung (see the degrade blocks below).
-        let mut warmup_timed_out = false;
+        // A warmup timeout DOES walk the ingest path down a rung. Treating it as
+        // "just a slow camera" and retrying the same rung was tried and left the
+        // production camera with no frames at all: the NVDEC branch attaches and
+        // negotiates, then delivers nothing from this Axis, so without the demote
+        // there is no path to a working stream.
         // The dynamic hardware branch could not be built. This IS evidence the
         // path cannot work here, so it degrades immediately.
         let mut branch_build_failed = false;
@@ -3326,7 +3326,6 @@ pub async fn run_rtsp_session(
                                 "rtsp: camera ONLINE — first frames flowing"
                             );
                         } else if tokio::time::Instant::now() >= warmup_deadline {
-                            warmup_timed_out = true;
                             break Some("no frames within warmup window".into());
                         }
                     } else if !path_upgrade_attempted
@@ -3451,7 +3450,7 @@ pub async fn run_rtsp_session(
         // tej samej wadliwej gałęzi). Detekcja dalej działa (CPU resize).
         // Gdy klatki już poszły (`online`), to awaria sieciowa — zostawiamy
         // GPU-resize włączone.
-        if gpu_resize && !online && !is_transport_failure(&reason) && !warmup_timed_out {
+        if gpu_resize && !online && !is_transport_failure(&reason) {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
@@ -3476,7 +3475,7 @@ pub async fn run_rtsp_session(
         // A failed branch BUILD is conclusive on its own — no need to also rule out
         // a transport fault, the branch was never going to carry frames.
         let hw_chain_broken =
-            branch_build_failed || (!is_transport_failure(&reason) && !warmup_timed_out);
+            branch_build_failed || !is_transport_failure(&reason);
         if matches!(
             ingest_path,
             IngestPath::GpuResidentNvidia | IngestPath::NvdecNv12 | IngestPath::NvdecCpuConvert
@@ -3505,7 +3504,7 @@ pub async fn run_rtsp_session(
         // do limitu prób), żeby kamera zadziałała zamiast wpaść w pętlę
         // reconnectów. Jeśli HW zdążyło dać klatki (`online`), traktujemy
         // awarię jako sieciową i zostajemy na HW.
-        if use_hw_decode && !online && !is_transport_failure(&reason) && !warmup_timed_out {
+        if use_hw_decode && !online && !is_transport_failure(&reason) {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
