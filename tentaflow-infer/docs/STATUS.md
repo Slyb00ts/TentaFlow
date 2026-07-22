@@ -49,23 +49,35 @@ Ostatnia aktualizacja: 2026-07-22.
   dla wierszy `[5120, 48, 48]` i 5120 kolumn skrócił T6 z 53,452 do 47,691 us
   (+10,78%), a T8 z 58,537 do 54,451 us (+6,98%), redukując grupę z 6 do 4
   uruchomień. Dla 48 warstw DeltaNet oczekiwane jest 192 -> 96 wywołań
-  `quantize_act_q8_1` na cykl B2. To projekcja, nie wynik pełnego modelu.
+  `quantize_act_q8_1` na cykl B2. Pełny profil raw512 zawiera 224 kwantyzacje
+  na cykl: 96 dla tej grupy DeltaNet i 128 dla pozostałych projekcji targetu
+  oraz MTP.
   Testy exact/canary/top1, multistream T6 -> T8 z realokacją scratchu oraz
-  testy błędów eventu przeszły. Realny 27B E2E i nsys pozostają **PENDING**,
-  ponieważ obcy proces zmniejszył wolną pamięć GPU poniżej 22,5 GiB.
-  Eksperymentalne N/N B2 paruje dwa pełne drafty n-gram o tym samym K=2 lub
-  K=3 za ścisłą flagą `FORGE_MTP_NGRAM_BATCH=1`; brak flagi i `0` pozostawiają
-  dotychczasową ścieżkę seryjną. Segmentowany KV-only catch-up używa kerneli
+  testy błędów eventu przeszły. Realny 27B shared-Q8 zachował pełne ID; pięć
+  powtórzeń osiągnęło medianę 132,33 tok/s dla raw128 i 100,74 tok/s dla
+  raw512. Profil `nsys` potwierdził 16 warstw attention i 224 kwantyzacje na
+  cykl B2.
+  Rollout N/N B2 paruje dwa pełne drafty n-gram o tym samym K=2 lub K=3.
+  Brak `FORGE_MTP_NGRAM_BATCH` wybiera `auto` dla modelu z capability na
+  zweryfikowanym NVIDIA warp32, `0` wymusza B1, a `1` pozwala na eksperymentalny
+  backend przy zachowaniu wymagań strukturalnych modelu. AMD/Metal w `auto`
+  pozostają w B1. Segmentowany KV-only catch-up używa kerneli
   Mojo `mtp_norm_join_shifted_segmented_f16`,
   `kv_append_batch_segmented_masked_f16` i
   `mtp_commit_catchup_metadata_segmented`. NVIDIA używa dokładnej segmentowanej
   attention z czterema warpami, zgodnej bitowo z verifierem seryjnym. Golden
   obejmuje T1/ctx1, T6/ctx31/32/33/128, T8/ctx512/2048, zamianę lane, różne
   mapy stron i canary;
-  memcheck zakończył się bez błędów. Syntetyczna macierz retained 1..T,
-  izolacja lane/stron i prewalidacja commitu pary przeszły.
-  Realny N/N 27B E2E, cancel/reuse, A/B, pięciokrotne raw128/raw512 i nsys są
-  **PENDING** z tego samego powodu VRAM. Mieszane N/M nie jest zaimplementowane.
+  memcheck zakończył się bez błędów. Realna macierz retained 1..T dla K2/K3,
+  lane swap oraz cancel/reuse przeszły. Pięć powtórzeń N/N ON/OFF zachowało
+  identyczne pełne ID: raw128 159,70/122,87 tok/s (+29,98%), raw512
+  94,33/83,78 tok/s (+12,59%). Dedykowany licznik potwierdził odpowiednio 32
+  i 20 cykli N/N na przebieg oraz zero przy wyłączonej fladze. `nsys`
+  potwierdził po jednym norm/join, maskowanym append KV, commicie metadanych i
+  końcowej synchronizacji na cykl N/N. Prometheus eksportuje dedykowany licznik
+  `forge_engine_mtp_ngram_b2_steps_total`. Smoke raw128 potwierdził liczniki
+  `auto=32`, `0=0`, `1=32` i identyczny pełny hash ID; realne lane-swap oraz
+  cancel/reuse/izolacja przeszły. Mieszane N/M nie jest zaimplementowane.
   CUDA jest jedynym backendem sprawdzonym wykonawczo;
   źródła zachowują przenośny fallback dla AMD/Metal. Raport:
   `docs/BENCH_QWEN35_MTP_NVFP4.md`.

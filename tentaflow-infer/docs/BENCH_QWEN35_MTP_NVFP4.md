@@ -482,13 +482,15 @@ Kontrola repeat raw128 nie znalazła pełnego draftu n-gram: 40/40 cykli przesz�
 przez fallback MTP, zachowując parity i osiągając 86,97 tok/s. Wartości
 `oracle_upper` nie są raportowane jako wynik actual.
 
-### Eksperymentalne N/N B2
+### Rollout N/N B2
 
-`FORGE_MTP_NGRAM_BATCH=1` paruje dwa pełne drafty n-gram o tym samym K=2 albo
-K=3 i używa wspólnego source-agnostic target verifiera B2. Domyślna wartość
-wynosi `0`, dlatego produkcyjny router pozostaje seryjny. Draft ID są pakowane
-na GPU, a różne długości retained obu lane doganiają MTP bez logitów przez trzy
-kernele Mojo:
+Brak `FORGE_MTP_NGRAM_BATCH` wybiera `auto`: dwa pełne drafty n-gram o tym samym
+K=2 albo K=3 używają wspólnego source-agnostic target verifiera B2 tylko dla
+strukturalnie zgodnego modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1,
+a `1` pozwala uruchomić przenośną ścieżkę na eksperymentalnym backendzie, nadal
+wymagając capability modelu. AMD/Metal w `auto` pozostają w B1. Draft ID są
+pakowane na GPU, a różne długości retained obu lane doganiają MTP bez logitów
+przez trzy kernele Mojo:
 
 - `mtp_norm_join_shifted_segmented_f16`;
 - `kv_append_batch_segmented_masked_f16`;
@@ -510,10 +512,27 @@ przenośnego wyniósł 2,96/5,70 us dla ctx4, 19,58/111,92 us dla ctx128,
 wyniósł od 5,63e-9 do 2,97e-5, a maksymalny błąd od 5,96e-8 do 2,44e-4;
 benchmark przerywa pracę powyżej odpowiednio 0,002 i 0,001.
 
-Realny N/N E2E dla 27B, porównanie z seryjnym routerem, pełny target rollback,
-cancel/reuse serwera, pięć powtórzeń raw128/raw512 i profil nsys pozostają
-**PENDING**, ponieważ aktywny obcy proces pozostawił mniej niż 22,5 GiB wolnego
-VRAM. Mieszane parowanie N/M nie jest zaimplementowane.
+Realny N/N E2E dla 27B, jeden warmup i pięć prób mierzonych:
+
+| Prompt | gate ON | gate OFF | Zysk | E2E ON/OFF | N/N B2 / przebieg |
+|---|---:|---:|---:|---:|---:|
+| raw128 | 159,70 tok/s | 122,87 tok/s | +29,98% | 96,04/82,30 tok/s | 32/0 |
+| raw512 | 94,33 tok/s | 83,78 tok/s | +12,59% | 37,66/35,85 tok/s | 20/0 |
+
+Pełne ID są identyczne ON/OFF we wszystkich próbach. Macierz retained K2/K3,
+lane swap oraz cancel/reuse zachowały pełny snapshot MTP. Profil raw512 objął
+40 cykli N/N (warmup + próba) i dokładnie 40 uruchomień każdego kernela catch-up:
+norm/join, maskowanego append KV i commitu metadanych. Każdy commit miał osobną
+końcową synchronizację kontekstu. Mieszane parowanie N/M nie jest zaimplementowane.
+Licznik Prometheus `forge_engine_mtp_ngram_b2_steps_total` rośnie dopiero po
+udanej wspólnej weryfikacji.
+
+Smoke rollout raw128 po zmianie wartości domyślnej, jeden warmup i jedna próba,
+potwierdził `auto=32`, `0=0` i `1=32` wspólne kroki N/N. Próby mierzone
+osiągnęły odpowiednio 162,60, 122,76 i 162,72 tok/s. Pełne ID wszystkich trzech
+trybów są identyczne, SHA-256 listy ID:
+`1b4e2f2977962ce09f40540d3149a284a2a662a8025ecf45efe2432ce6af91bb`.
+Realne testy lane-swap i cancel/reuse/izolacji przeszły na tym samym modelu 27B.
 
 ## Batchowy KV-only catch-up MTP
 

@@ -300,7 +300,7 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 | `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
 | `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
 | `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
-| `FORGE_MTP_NGRAM_BATCH` | `0` | Eksperymentalne parowanie N/N B2 dwóch pełnych draftów n-gram o tym samym K=2 albo K=3. `1` włącza ścieżkę, `0` lub brak zmiennej pozostawia dotychczasowy router seryjny. Inna wartość jest błędem konfiguracji. Nie włączać produkcyjnie przed realnym E2E 27B. |
+| `FORGE_MTP_NGRAM_BATCH` | `auto` | Rollout parowania N/N B2 dwóch pełnych draftów n-gram o tym samym K=2 albo K=3. Brak zmiennej wybiera `auto`: ścieżka działa tylko dla strukturalnie zgodnego modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1. `1` wymusza eksperymentalny backend, także AMD/Metal, ale nadal odrzuca model bez strukturalnego capability. Inna wartość jest błędem konfiguracji. |
 
 W verifierze B2 dla T=6 i T=8 trzy projekcje Q8_0 `gate_proj`, `alpha_proj` i
 `beta_proj` współdzielą jedną kwantyzację wejścia `pb.x`, jeśli wszystkie mają
@@ -319,11 +319,13 @@ Polecenie `serve` dobiera dla MTP domyślne `--max-active 1`; jawna większa
 wartość uruchamia startup preflight puli stanów per sekwencja. Dwa requesty
 pure MTP z tym samym K mogą wykonać wspólny B2. Różne K, tiering, niepełna para
 albo niespełniony kontrakt capability przechodzą przed mutacją stanu na seryjne
-B1; `mtp+ngram` pozostaje seryjny przy domyślnej fladze N/N. Jeśli wymagane sloty nie mieszczą się w pulach
+B1. `mtp+ngram` domyślnie używa N/N na NVIDIA warp32, gdy model spełnia
+kontrakt strukturalny; AMD, Metal i pozostałe backendy pozostają w B1. Jeśli wymagane sloty nie mieszczą się w pulach
 weights/activations, worker nie startuje, a błąd podaje wymagane i dostępne
 bajty. `run` zawsze obsługuje jedną sekwencję.
 
-Po ustawieniu `FORGE_MTP_NGRAM_BATCH=1` dwa requesty `mtp+ngram` z pełnym
+W trybie `auto` na NVIDIA warp32 albo po ustawieniu
+`FORGE_MTP_NGRAM_BATCH=1` dwa requesty `mtp+ngram` z pełnym
 draftem n-gram i tym samym K=2/K=3 mogą współdzielić source-agnostic target
 verifier B2. Draft ID są pakowane na GPU, a stan MTP doganiany segmentowanym
 KV-only catch-up przez `mtp_norm_join_shifted_segmented_f16`,
@@ -333,12 +335,17 @@ przed zatwierdzeniem targetu i aplikowany bez kolejnego fallible kroku. Brak
 pełnego draftu, ogon bez pary albo niespełnione capability używają istniejącej
 ścieżki seryjnej. Mieszane N/M nie jest zaimplementowane.
 
+Licznik Prometheus `forge_engine_mtp_ngram_b2_steps_total` raportuje wyłącznie
+zakończone wspólne weryfikacje N/N B2. Wartość zero przy aktywnym ruchu
+`mtp+ngram` oznacza, że rollout pozostał w B1 albo nie powstały zgodne pary.
+
 Testy syntetyczne obejmują K2/K3, wszystkie kombinacje retained 1..T, osobny
 initial hidden, izolację lane i stron, granice buforów, canary, cancel/reuse
 pending draftu oraz błędną prewalidację lane0/lane1. Mały CUDA memcheck nie
-wykazał błędów. Realny N/N E2E na modelu 27B, target rollback w pełnym przebiegu,
-cancel/reuse serwera, A/B z routerem seryjnym, pięć powtórzeń raw128/raw512 i
-nsys pozostają pending, ponieważ wolny VRAM był niższy niż 22,5 GiB.
+wykazał błędów. Realny N/N E2E na modelu 27B, A/B z routerem seryjnym, pięć
+powtórzeń raw128/raw512, profil `nsys`, lane-swap oraz cancel/reuse/izolacja
+przeszły z pełną zgodnością ID i snapshotów stanu. Pending pozostaje wyłącznie
+mieszane parowanie N/M.
 
 ### Manifest neuralnego proposera
 

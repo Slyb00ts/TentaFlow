@@ -5855,7 +5855,15 @@ impl Model {
     /// Sprawdza niemutujący kontrakt pierwszego pionu native MTP B2.
     pub fn native_mtp_b2_capable(&self, seqs: [&SeqKv; 2], budget: usize) -> bool {
         matches!(budget, 2 | 3)
-            && self.validate_native_mtp_target().is_ok()
+            && self.mtp_ngram_b2_model_capable()
+            && seqs
+                .iter()
+                .all(|seq| self.native_mtp_available_budget(seq, budget) == budget)
+    }
+
+    /// Sprawdza strukturalny kontrakt wspólnego target verifiera N/N B2.
+    pub fn mtp_ngram_b2_model_capable(&self) -> bool {
+        self.validate_native_mtp_target().is_ok()
             && self.hybrid_batch_b2_weights_capable()
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
@@ -5867,9 +5875,6 @@ impl Model {
                     .as_ref()
                     .is_some_and(|mtp| mtp.shares_target_embedding),
             )
-            && seqs
-                .iter()
-                .all(|seq| self.native_mtp_available_budget(seq, budget) == budget)
     }
 
     /// Sprawdza kontrakt wspólnego target verifiera dla dwóch pełnych draftów n-gram.

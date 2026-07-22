@@ -13,7 +13,7 @@ use std::time::Instant;
 use std::time::Duration;
 
 use forge_tokenize::{StopMatcher, StreamDecoder, Tokenizer};
-use forge_types::{ForgeError, Result};
+use forge_types::{ForgeError, Result, Vendor};
 
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
@@ -294,14 +294,67 @@ fn parse_native_mtp_b2(value: Option<&str>) -> Result<bool> {
     }
 }
 
-fn parse_mtp_ngram_batch(value: Option<&str>) -> Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MtpNgramBatchMode {
+    Auto,
+    Off,
+    ForceOn,
+}
+
+fn parse_mtp_ngram_batch(value: Option<&str>) -> Result<MtpNgramBatchMode> {
     match value {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
+        None => Ok(MtpNgramBatchMode::Auto),
+        Some("0") => Ok(MtpNgramBatchMode::Off),
+        Some("1") => Ok(MtpNgramBatchMode::ForceOn),
         Some(value) => Err(ForgeError::Scheduler(format!(
             "FORGE_MTP_NGRAM_BATCH wymaga wartości 0 lub 1, otrzymano {value:?}"
         ))),
     }
+}
+
+fn mtp_ngram_auto_backend(vendor: Vendor, warp_size: u32) -> bool {
+    vendor == Vendor::Nvidia && warp_size == 32
+}
+
+fn resolve_mtp_ngram_batch(
+    mode: MtpNgramBatchMode,
+    vendor: Vendor,
+    warp_size: u32,
+    model_capable: bool,
+) -> Result<bool> {
+    match mode {
+        MtpNgramBatchMode::Auto => {
+            Ok(model_capable && mtp_ngram_auto_backend(vendor, warp_size))
+        }
+        MtpNgramBatchMode::Off => Ok(false),
+        MtpNgramBatchMode::ForceOn if model_capable => Ok(true),
+        MtpNgramBatchMode::ForceOn => Err(ForgeError::Unsupported(
+            "FORGE_MTP_NGRAM_BATCH=1 wymaga strukturalnej obsługi MTP N/N B2 modelu".into(),
+        )),
+    }
+}
+
+fn mtp_ngram_batch_plan(budgets: &[Option<usize>]) -> (Vec<[usize; 2]>, Vec<usize>) {
+    let mut pending: [Option<usize>; 2] = [None, None];
+    let mut pairs = Vec::new();
+    let mut singles = Vec::new();
+    for (position, budget) in budgets.iter().copied().enumerate() {
+        let Some(budget) = budget else {
+            continue;
+        };
+        let Some(group) = budget.checked_sub(2).filter(|&group| group < pending.len()) else {
+            singles.push(position);
+            continue;
+        };
+        if let Some(first) = pending[group].take() {
+            pairs.push([first, position]);
+        } else {
+            pending[group] = Some(position);
+        }
+    }
+    singles.extend(pending.into_iter().flatten());
+    singles.sort_unstable();
+    (pairs, singles)
 }
 
 fn update_mtp_rate(rate: &mut Option<f64>, sample: f64) {
@@ -432,8 +485,22 @@ pub fn spawn_engine_batched(
     spec: SpeculativeConfig,
 ) -> Result<EngineHandle> {
     let native_mtp_b2 = parse_native_mtp_b2(std::env::var("FORGE_NATIVE_MTP_B2").ok().as_deref())?;
-    let mtp_ngram_batch =
+    let mtp_ngram_mode =
         parse_mtp_ngram_batch(std::env::var("FORGE_MTP_NGRAM_BATCH").ok().as_deref())?;
+    let caps = model.device.caps();
+    let mtp_ngram_batch = resolve_mtp_ngram_batch(
+        mtp_ngram_mode,
+        caps.vendor,
+        caps.warp_size,
+        model.mtp_ngram_b2_model_capable(),
+    )?;
+    tracing::info!(
+        mode = ?mtp_ngram_mode,
+        enabled = mtp_ngram_batch,
+        vendor = ?caps.vendor,
+        warp_size = caps.warp_size,
+        "rollout MTP+n-gram N/N B2"
+    );
     let coordinator = SpeculationCoordinator::new(spec.clone())?;
     validate_speculation_server_config(spec.kind(), max_active, model.is_hybrid())?;
     if spec.is_enabled() {
@@ -1080,7 +1147,7 @@ fn batch_native_mtp_ngram_decode(
     indices: &[usize],
     metrics: &EngineMetrics,
 ) {
-    let mut by_budget: [Vec<(usize, Vec<u32>)>; 2] = [Vec::new(), Vec::new()];
+    let mut prepared = Vec::new();
     for &index in indices {
         let a = &mut active[index];
         let fed = *a.generated.last().expect("emit_token dodał fed routera");
@@ -1098,7 +1165,7 @@ fn batch_native_mtp_ngram_decode(
             }
         };
         if draft.len() == budget && matches!(budget, 2 | 3) {
-            by_budget[budget - 2].push((index, draft));
+            prepared.push((index, draft));
             continue;
         }
         if let Some(state) = &mut a.spec {
@@ -1113,41 +1180,50 @@ fn batch_native_mtp_ngram_decode(
         }
     }
 
-    for entries in &by_budget {
-        let mut pairs = entries.chunks_exact(2);
-        for pair in &mut pairs {
-            let (first_index, first_draft) = (&pair[0].0, &pair[0].1);
-            let (second_index, second_draft) = (&pair[1].0, &pair[1].1);
-            let capable = model.mtp_ngram_b2_capable(
-                [&active[*first_index].seq, &active[*second_index].seq],
-                first_draft.len(),
-            );
-            if !capable {
-                verify_native_mtp_ngram_prepared(
-                    model,
-                    &mut active[*first_index],
-                    first_draft,
-                    metrics,
-                );
-                verify_native_mtp_ngram_prepared(
-                    model,
-                    &mut active[*second_index],
-                    second_draft,
-                    metrics,
-                );
-                continue;
-            }
-            native_mtp_ngram_step_b2_prepared(
+    let budgets = prepared
+        .iter()
+        .map(|(_, draft)| Some(draft.len()))
+        .collect::<Vec<_>>();
+    let (pairs, singles) = mtp_ngram_batch_plan(&budgets);
+    for [first_position, second_position] in pairs {
+        let (first_index, first_draft) = (
+            &prepared[first_position].0,
+            &prepared[first_position].1,
+        );
+        let (second_index, second_draft) = (
+            &prepared[second_position].0,
+            &prepared[second_position].1,
+        );
+        let capable = model.mtp_ngram_b2_capable(
+            [&active[*first_index].seq, &active[*second_index].seq],
+            first_draft.len(),
+        );
+        if !capable {
+            verify_native_mtp_ngram_prepared(
                 model,
-                active,
-                [*first_index, *second_index],
-                [first_draft, second_draft],
+                &mut active[*first_index],
+                first_draft,
                 metrics,
             );
+            verify_native_mtp_ngram_prepared(
+                model,
+                &mut active[*second_index],
+                second_draft,
+                metrics,
+            );
+            continue;
         }
-        if let Some((index, draft)) = pairs.remainder().first() {
-            verify_native_mtp_ngram_prepared(model, &mut active[*index], draft, metrics);
-        }
+        native_mtp_ngram_step_b2_prepared(
+            model,
+            active,
+            [*first_index, *second_index],
+            [first_draft, second_draft],
+            metrics,
+        );
+    }
+    for position in singles {
+        let (index, draft) = &prepared[position];
+        verify_native_mtp_ngram_prepared(model, &mut active[*index], draft, metrics);
     }
 }
 
@@ -1463,6 +1539,7 @@ fn native_mtp_ngram_step_b2_prepared(
             return;
         }
     };
+    EngineMetrics::inc(&metrics.mtp_ngram_b2_steps_total);
     first
         .spec
         .as_mut()
@@ -1766,7 +1843,8 @@ mod tests {
         AdmissionDisposition, first_actionable_index, native_mtp_adaptive_budget,
         native_mtp_step_budget, parse_native_mtp_b2, request_speculation_kind,
         reservation_fits, update_mtp_rate, validate_speculation_server_config,
-        parse_mtp_ngram_batch,
+        mtp_ngram_auto_backend, mtp_ngram_batch_plan, parse_mtp_ngram_batch,
+        resolve_mtp_ngram_batch, MtpNgramBatchMode,
     };
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
 
@@ -1780,12 +1858,75 @@ mod tests {
     }
 
     #[test]
-    fn batch_mtp_ngram_jest_domyslnie_wylaczony_i_scisly() {
-        assert!(!parse_mtp_ngram_batch(None).unwrap());
-        assert!(!parse_mtp_ngram_batch(Some("0")).unwrap());
-        assert!(parse_mtp_ngram_batch(Some("1")).unwrap());
+    fn batch_mtp_ngram_ma_scisla_semantyke_rolloutu() {
+        assert_eq!(parse_mtp_ngram_batch(None).unwrap(), MtpNgramBatchMode::Auto);
+        assert_eq!(parse_mtp_ngram_batch(Some("0")).unwrap(), MtpNgramBatchMode::Off);
+        assert_eq!(parse_mtp_ngram_batch(Some("1")).unwrap(), MtpNgramBatchMode::ForceOn);
         assert!(parse_mtp_ngram_batch(Some("true")).is_err());
         assert!(parse_mtp_ngram_batch(Some("")).is_err());
+    }
+
+    #[test]
+    fn auto_mtp_ngram_wymaga_nvidia_warp32_i_capability_modelu() {
+        assert!(mtp_ngram_auto_backend(forge_types::Vendor::Nvidia, 32));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Nvidia, 64));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Amd, 32));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Amd, 64));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Apple, 32));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Cpu, 32));
+        assert!(resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::Auto,
+            forge_types::Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(!resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::Auto,
+            forge_types::Vendor::Nvidia,
+            32,
+            false,
+        )
+        .unwrap());
+        assert!(resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::ForceOn,
+            forge_types::Vendor::Amd,
+            64,
+            true,
+        )
+        .unwrap());
+        assert!(resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::ForceOn,
+            forge_types::Vendor::Nvidia,
+            32,
+            false,
+        )
+        .is_err());
+        assert!(!resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::Off,
+            forge_types::Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn scheduler_mtp_ngram_paruje_tylko_rowne_k_i_zostawia_tail_b1() {
+        let (pairs, singles) = mtp_ngram_batch_plan(&[
+            Some(2),
+            None,
+            Some(3),
+            Some(2),
+            None,
+            Some(3),
+            Some(2),
+        ]);
+        assert_eq!(pairs, vec![[0, 3], [2, 5]]);
+        assert_eq!(singles, vec![6]);
+        assert!(pairs.iter().flatten().all(|index| !matches!(index, 1 | 4)));
+        assert!(singles.iter().all(|index| !matches!(index, 1 | 4)));
+        assert_eq!(mtp_ngram_batch_plan(&[Some(3), None, Some(2)]).1, vec![0, 2]);
     }
 
     #[test]

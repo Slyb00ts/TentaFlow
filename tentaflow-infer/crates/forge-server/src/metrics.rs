@@ -151,6 +151,12 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
         "Native MTP steps executed by the paired B2 fast path.",
         load(&engine.native_mtp_b2_steps_total),
     );
+    counter(
+        &mut out,
+        "forge_engine_mtp_ngram_b2_steps_total",
+        "MTP+n-gram verifies executed by the paired N/N B2 fast path.",
+        load(&engine.mtp_ngram_b2_steps_total),
+    );
 
     // ---- Gauges ----
     gauge(
@@ -208,4 +214,21 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
     );
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::{render, HttpMetrics};
+    use forge_engine::metrics::EngineMetrics;
+
+    #[test]
+    fn prometheus_eksponuje_licznik_mtp_ngram_b2() {
+        let engine = EngineMetrics::new();
+        engine.mtp_ngram_b2_steps_total.store(7, Ordering::Relaxed);
+        let output = render(&engine, &HttpMetrics::default(), "test");
+        assert!(output.contains("# TYPE forge_engine_mtp_ngram_b2_steps_total counter"));
+        assert!(output.contains("forge_engine_mtp_ngram_b2_steps_total 7"));
+    }
 }

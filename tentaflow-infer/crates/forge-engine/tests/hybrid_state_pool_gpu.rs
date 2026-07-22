@@ -250,15 +250,15 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
                     [&drafts[0], &drafts[1]],
                 )?;
                 assert_eq!(actual, expected_results, "K={budget}, retained={retained:?}");
-                assert_eq!(
-                    model.debug_mtp_state_snapshot(&first)?,
-                    expected_states[0],
-                    "snapshot lane0 K={budget}, retained={retained:?}"
+                assert_mtp_snapshot_eq(
+                    &model.debug_mtp_state_snapshot(&first)?,
+                    &expected_states[0],
+                    &format!("lane0 K={budget}, retained={retained:?}"),
                 );
-                assert_eq!(
-                    model.debug_mtp_state_snapshot(&second)?,
-                    expected_states[1],
-                    "snapshot lane1 K={budget}, retained={retained:?}"
+                assert_mtp_snapshot_eq(
+                    &model.debug_mtp_state_snapshot(&second)?,
+                    &expected_states[1],
+                    &format!("lane1 K={budget}, retained={retained:?}"),
                 );
                 model.release_seq(&mut first);
                 model.release_seq(&mut second);
@@ -266,6 +266,96 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
         }
     }
     Ok(())
+}
+
+fn run_mtp_ngram_b2_retained_one_lane_orders(path: &Path) -> TestResult<()> {
+    let Some(mut model) = load_model(path, true) else {
+        return Ok(());
+    };
+    model.preflight_hybrid_state_slots(2)?;
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let source_prompts = [prompt(vocab, 941, 8), prompt(vocab, 1171, 8)];
+    for order in [[0usize, 1usize], [1usize, 0usize]] {
+        let prompts = [
+            source_prompts[order[0]].clone(),
+            source_prompts[order[1]].clone(),
+        ];
+        let greedy = [
+            generate(&mut model, &prompts[0], 4)?,
+            generate(&mut model, &prompts[1], 4)?,
+        ];
+        let mut drafts: [Vec<u32>; 2] =
+            std::array::from_fn(|lane| greedy[lane][1..=2].to_vec());
+        for lane in 0..2 {
+            let expected = greedy[lane][1];
+            let mut mismatch = expected.wrapping_add(1) % vocab as u32;
+            if mismatch == expected {
+                mismatch = expected.wrapping_add(2) % vocab as u32;
+            }
+            drafts[lane][0] = mismatch;
+        }
+
+        let mut expected_results = [(0usize, 0u32); 2];
+        let mut expected_states: [Vec<(String, usize, Vec<u8>)>; 2] =
+            std::array::from_fn(|_| Vec::new());
+        for lane in 0..2 {
+            let (mut seq, _, fed) = prepare(&mut model, &prompts[lane])?;
+            expected_results[lane] =
+                model.verify_greedy_draft_with_mtp_catchup(&mut seq, fed, &drafts[lane])?;
+            expected_states[lane] = model.debug_mtp_state_snapshot(&seq)?;
+            model.release_seq(&mut seq);
+        }
+
+        let (mut first, _, first_fed) = prepare(&mut model, &prompts[0])?;
+        let (mut second, _, second_fed) = prepare(&mut model, &prompts[1])?;
+        let actual = model.verify_greedy_draft_with_mtp_catchup_b2(
+            &mut [&mut first, &mut second],
+            [first_fed, second_fed],
+            [&drafts[0], &drafts[1]],
+        )?;
+        assert_eq!(actual, expected_results, "kolejność lane={order:?}");
+        assert_mtp_snapshot_eq(
+            &model.debug_mtp_state_snapshot(&first)?,
+            &expected_states[0],
+            &format!("lane0 retained=[1,1], kolejność={order:?}"),
+        );
+        assert_mtp_snapshot_eq(
+            &model.debug_mtp_state_snapshot(&second)?,
+            &expected_states[1],
+            &format!("lane1 retained=[1,1], kolejność={order:?}"),
+        );
+        model.release_seq(&mut first);
+        model.release_seq(&mut second);
+    }
+    Ok(())
+}
+
+fn assert_mtp_snapshot_eq(
+    actual: &[(String, usize, Vec<u8>)],
+    expected: &[(String, usize, Vec<u8>)],
+    context: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "liczba buforów {context}");
+    for ((actual_name, actual_element_bytes, actual_bytes), (expected_name, expected_element_bytes, expected_bytes)) in
+        actual.iter().zip(expected)
+    {
+        assert_eq!(actual_name, expected_name, "nazwa bufora {context}");
+        assert_eq!(
+            actual_element_bytes, expected_element_bytes,
+            "rozmiar elementu {actual_name} {context}"
+        );
+        assert_eq!(actual_bytes.len(), expected_bytes.len(), "długość {actual_name} {context}");
+        if let Some(index) = actual_bytes
+            .iter()
+            .zip(expected_bytes)
+            .position(|(actual_byte, expected_byte)| actual_byte != expected_byte)
+        {
+            panic!(
+                "pierwsza różnica {actual_name} {context}: bajt {index}, actual={}, expected={}",
+                actual_bytes[index], expected_bytes[index]
+            );
+        }
+    }
 }
 
 fn run_mtp_grouped_proposer_parity(path: &Path) -> TestResult<()> {
@@ -1068,7 +1158,17 @@ fn collect_pair_events(
     ))
 }
 
-fn run_exact_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult<()> {
+#[derive(Clone, Copy)]
+enum ExactB2Mode {
+    Native,
+    MtpNgram,
+}
+
+fn run_exact_native_mtp_b2_matrix(
+    path: &Path,
+    prompt_path: &Path,
+    mode: ExactB2Mode,
+) -> TestResult<()> {
     const OUTPUT_TOKENS: usize = 128;
     let reps = std::env::var("FORGE_BENCH_REPS")
         .ok()
@@ -1084,20 +1184,29 @@ fn run_exact_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult
     let Some(model) = load_model_sized(path, true, max_seq_len, kv_pages) else {
         return Err("macierz MTP B2 wymaga dostępnego CUDA".into());
     };
+    let spec = match mode {
+        ExactB2Mode::Native => SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?,
+        ExactB2Mode::MtpNgram => {
+            SpeculativeConfig::chain(vec![ProposerKind::Mtp, ProposerKind::Ngram], 3)?
+        }
+    };
     let engine = spawn_engine_batched(
         model,
         Arc::new(tokenizer(path)?),
         2,
         32,
         12,
-        SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?,
+        spec,
     )?;
     for rep in 0..=reps {
         let metrics = engine.metrics();
         let generated_before = metrics.generated_tokens_total.load(Ordering::Relaxed);
         let forwards_before = metrics.spec_forwards_total.load(Ordering::Relaxed);
         let accepted_before = metrics.spec_accepted_total.load(Ordering::Relaxed);
-        let b2_before = metrics.native_mtp_b2_steps_total.load(Ordering::Relaxed);
+        let b2_before = match mode {
+            ExactB2Mode::Native => metrics.native_mtp_b2_steps_total.load(Ordering::Relaxed),
+            ExactB2Mode::MtpNgram => metrics.mtp_ngram_b2_steps_total.load(Ordering::Relaxed),
+        };
         let ttft_before = metrics.ttft_seconds.snapshot();
         let itl_before = metrics.inter_token_seconds.snapshot();
         let started = Instant::now();
@@ -1122,17 +1231,28 @@ fn run_exact_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult
             .spec_accepted_total
             .load(Ordering::Relaxed)
             .saturating_sub(accepted_before);
-        let b2_steps = metrics
-            .native_mtp_b2_steps_total
-            .load(Ordering::Relaxed)
-            .saturating_sub(b2_before);
-        assert!(b2_steps > 0, "benchmark serwera nie wykonał ścieżki MTP B2");
+        let b2_steps = match mode {
+            ExactB2Mode::Native => metrics.native_mtp_b2_steps_total.load(Ordering::Relaxed),
+            ExactB2Mode::MtpNgram => metrics.mtp_ngram_b2_steps_total.load(Ordering::Relaxed),
+        }
+        .saturating_sub(b2_before);
+        let b2_expected = matches!(mode, ExactB2Mode::Native)
+            || std::env::var("FORGE_MTP_NGRAM_BATCH").map_or(true, |value| value == "1");
+        if b2_expected {
+            assert!(b2_steps > 0, "benchmark serwera nie wykonał oczekiwanej ścieżki B2");
+        } else {
+            assert_eq!(b2_steps, 0, "wyłączona ścieżka N/N wykonała B2");
+        }
         let ttft = metrics.ttft_seconds.snapshot();
         let itl = metrics.inter_token_seconds.snapshot();
         let ttft_count = ttft.count.saturating_sub(ttft_before.count);
         let itl_count = itl.count.saturating_sub(itl_before.count);
         println!(
-            "exact MTP B2 {} {}/{} raw={} generated={} aggregate_completion={:.2} tok/s aggregate_e2e={:.2} tok/s TTFT={:.2} ms effective_ITL={:.2} ms forwards={} accepted={} accepted/forward={:.3} IDs={:?}",
+            "exact {} B2 {} {}/{} raw={} generated={} aggregate_completion={:.2} tok/s aggregate_e2e={:.2} tok/s TTFT={:.2} ms effective_ITL={:.2} ms forwards={} accepted={} accepted/forward={:.3} b2_steps={} IDs={:?}",
+            match mode {
+                ExactB2Mode::Native => "MTP",
+                ExactB2Mode::MtpNgram => "MTP+n-gram",
+            },
             if rep == 0 { "warmup" } else { "rep" },
             if rep == 0 { 1 } else { rep },
             if rep == 0 { 1 } else { reps },
@@ -1145,6 +1265,7 @@ fn run_exact_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult
             forwards,
             accepted,
             accepted as f64 / forwards.max(1) as f64,
+            b2_steps,
             outputs[0],
         );
     }
@@ -1463,6 +1584,19 @@ fn mtp_ngram_b2_zachowuje_golden_dla_k2_k3_i_macierzy_retained() -> TestResult<(
 }
 
 #[test]
+fn mtp_ngram_b2_retained_jeden_zachowuje_golden_po_zamianie_lane() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E MTP+n-gram B2 lane swap: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_mtp_ngram_b2_retained_one_lane_orders(&path)
+}
+
+#[test]
 fn server_continuous_admission_mtp_i_router_obsluguje_concurrency_dwa() -> TestResult<()> {
     let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
         eprintln!("pominięto E2E serwera MTP: brak FORGE_TEST_HYBRID_GGUF");
@@ -1574,7 +1708,25 @@ fn benchmark_exact_native_mtp_b2_dwa_identyczne_requesty() -> TestResult<()> {
     let _gpu_lock = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    run_exact_native_mtp_b2_matrix(&path, &prompt_path)
+    run_exact_native_mtp_b2_matrix(&path, &prompt_path, ExactB2Mode::Native)
+}
+
+#[test]
+fn benchmark_exact_mtp_ngram_b2_dwa_identyczne_requesty() -> TestResult<()> {
+    if std::env::var_os("FORGE_BENCH_MTP_NGRAM_B2_MATRIX").is_none() {
+        eprintln!("pominięto dokładną macierz MTP+n-gram B2: brak FORGE_BENCH_MTP_NGRAM_B2_MATRIX");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("macierz wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let prompt_path = std::env::var_os("FORGE_BENCH_PROMPT_IDS")
+        .map(PathBuf::from)
+        .ok_or("macierz wymaga FORGE_BENCH_PROMPT_IDS")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_exact_native_mtp_b2_matrix(&path, &prompt_path, ExactB2Mode::MtpNgram)
 }
 
 #[test]
