@@ -19,6 +19,7 @@ use forge_engine::server::{spawn_engine_batched, EngineEvent, EngineRequest};
 use forge_engine::speculation::{
     ProposerKind, SpeculationCoordinator, SpeculativeConfig, SpeculativeState,
 };
+use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_formats::Gguf;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
@@ -213,6 +214,22 @@ fn load_model_sized(
     max_seq_len: usize,
     kv_pages: usize,
 ) -> Option<Model> {
+    load_model_sized_with_tier(
+        path,
+        native_mtp,
+        max_seq_len,
+        kv_pages,
+        KvTierConfig::default(),
+    )
+}
+
+fn load_model_sized_with_tier(
+    path: &Path,
+    native_mtp: bool,
+    max_seq_len: usize,
+    kv_pages: usize,
+    kv_tier: KvTierConfig,
+) -> Option<Model> {
     let free = match CudaDevice::free_vram(0) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -252,6 +269,7 @@ fn load_model_sized(
                 max_seq_len,
                 prefix_cache: false,
                 native_mtp,
+                kv_tier,
                 ..ModelConfig::default()
             },
         )
@@ -298,6 +316,8 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
     let vocab = oracle_model.weights.descriptor.params.vocab_size;
     let first_prompt = prompt(vocab, 29, 8);
     let second_prompt = prompt(vocab, 173, 8);
+    let replacement_prompt = prompt(vocab, 313, 8);
+    let reused_prompt = prompt(vocab, 367, 8);
     let oracle = spawn_engine_batched(
         oracle_model,
         Arc::new(tokenizer(path)?),
@@ -310,6 +330,11 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
         collect_events(oracle.submit(server_request(first_prompt.clone(), STEPS))?)?;
     let second_oracle =
         collect_events(oracle.submit(server_request(second_prompt.clone(), STEPS))?)?;
+    let replacement_oracle = collect_events(
+        oracle.submit(server_request(replacement_prompt.clone(), STEPS))?,
+    )?;
+    let reused_oracle =
+        collect_events(oracle.submit(server_request(reused_prompt.clone(), STEPS))?)?;
     oracle.shutdown()?;
 
     let Some(model) = load_model(path, true) else {
@@ -327,10 +352,10 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
 
     let cancelled = engine.submit(server_request(prompt(vocab, 257, 8), STEPS * 2))?;
     drop(cancelled);
-    let replacement = engine.submit(server_request(prompt(vocab, 313, 8), STEPS))?;
-    assert_eq!(collect_events(replacement)?.len(), STEPS);
-    let reused = engine.submit(server_request(prompt(vocab, 367, 8), STEPS))?;
-    assert_eq!(collect_events(reused)?.len(), STEPS);
+    let replacement = engine.submit(server_request(replacement_prompt, STEPS))?;
+    assert_eq!(collect_events(replacement)?, replacement_oracle);
+    let reused = engine.submit(server_request(reused_prompt, STEPS))?;
+    assert_eq!(collect_events(reused)?, reused_oracle);
 
     let metrics = engine.metrics();
     for _ in 0..200 {
@@ -356,6 +381,54 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
     Ok(())
 }
 
+fn run_server_tier_fallback(path: &Path) -> TestResult<()> {
+    let Some(oracle_model) = load_model(path, true) else {
+        return Ok(());
+    };
+    let vocab = oracle_model.weights.descriptor.params.vocab_size;
+    let first_prompt = prompt(vocab, 419, 8);
+    let second_prompt = prompt(vocab, 557, 8);
+    let oracle = spawn_engine_batched(
+        oracle_model,
+        Arc::new(tokenizer(path)?),
+        1,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let first_oracle =
+        collect_events(oracle.submit(server_request(first_prompt.clone(), STEPS))?)?;
+    let second_oracle =
+        collect_events(oracle.submit(server_request(second_prompt.clone(), STEPS))?)?;
+    oracle.shutdown()?;
+
+    let tier = KvTierConfig {
+        mode: KvTierMode::Ram,
+        ram_budget_bytes: 256 << 20,
+        watermark: 0.25,
+        ..KvTierConfig::default()
+    };
+    let Some(model) = load_model_sized_with_tier(path, true, 32, 40, tier) else {
+        return Err("CUDA zniknęła przed testem fallbacku tieringu".into());
+    };
+    assert!(!model.hybrid_batch_b2_capable());
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(path)?),
+        2,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let first = engine.submit(server_request(first_prompt, STEPS))?;
+    let second = engine.submit(server_request(second_prompt, STEPS))?;
+    assert_eq!(collect_events(first)?, first_oracle);
+    assert_eq!(collect_events(second)?, second_oracle);
+    assert_eq!(engine.metrics().requests_errored.load(Ordering::Relaxed), 0);
+    engine.shutdown()?;
+    Ok(())
+}
+
 struct ServerMeasurement {
     completion_tps: f64,
     end_to_end_tps: f64,
@@ -363,14 +436,17 @@ struct ServerMeasurement {
     itl_ms: f64,
 }
 
-fn measure_server(path: &Path, max_active: usize) -> TestResult<ServerMeasurement> {
+fn measure_server(
+    path: &Path,
+    max_active: usize,
+    spec: SpeculativeConfig,
+) -> TestResult<ServerMeasurement> {
     const BENCH_TOKENS: usize = 128;
     let kv_pages = max_active * (8 + BENCH_TOKENS).div_ceil(32) + 2;
     let Some(model) = load_model_sized(path, true, 160, kv_pages) else {
         return Err("benchmark wymaga dostępnego CUDA".into());
     };
     let vocab = model.weights.descriptor.params.vocab_size;
-    let spec = SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?;
     let engine =
         spawn_engine_batched(model, Arc::new(tokenizer(path)?), max_active, 160, 12, spec)?;
 
@@ -623,11 +699,25 @@ fn server_continuous_admission_mtp_i_router_obsluguje_concurrency_dwa() -> TestR
     let _gpu_lock = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_server_concurrency_two(&path, SpeculativeConfig::off())?;
     run_server_concurrency_two(&path, SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?)?;
     run_server_concurrency_two(
         &path,
         SpeculativeConfig::chain(vec![ProposerKind::Mtp, ProposerKind::Ngram], 3)?,
     )
+}
+
+#[test]
+fn hybrid_tiering_concurrency_dwa_uzywa_serial_fallback() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E tieringu B2: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_server_tier_fallback(&path)
 }
 
 #[test]
@@ -649,9 +739,38 @@ fn benchmark_server_mtp_max_active_jeden_kontra_dwa() -> TestResult<()> {
         .map_or_else(|| vec![1, 2], |max_active| vec![max_active]);
     for max_active in selected {
         assert!(matches!(max_active, 1 | 2));
-        let measurement = measure_server(&path, max_active)?;
+        let measurement = measure_server(
+            &path,
+            max_active,
+            SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?,
+        )?;
         println!(
             "server MTP max_active={max_active}: completion={:.2} tok/s end_to_end={:.2} tok/s TTFT={:.2} ms ITL={:.2} ms",
+            measurement.completion_tps,
+            measurement.end_to_end_tps,
+            measurement.ttft_ms,
+            measurement.itl_ms,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn benchmark_server_hybrid_target_b1_kontra_b2() -> TestResult<()> {
+    if std::env::var_os("FORGE_BENCH_HYBRID_TARGET").is_none() {
+        eprintln!("pominięto benchmark targetu hybrydowego: brak FORGE_BENCH_HYBRID_TARGET");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("benchmark wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for max_active in [1, 2] {
+        let measurement = measure_server(&path, max_active, SpeculativeConfig::off())?;
+        println!(
+            "server hybrid target max_active={max_active}: completion={:.2} tok/s end_to_end={:.2} tok/s TTFT={:.2} ms ITL={:.2} ms",
             measurement.completion_tps,
             measurement.end_to_end_tps,
             measurement.ttft_ms,

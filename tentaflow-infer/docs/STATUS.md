@@ -593,12 +593,15 @@ Ostatnia aktualizacja: 2026-07-21.
     paged cache MTP. Test Qwen3.6 NVFP4 potwierdza parity targetu, pure MTP oraz
     MTP+n-gram dla dwóch sekwencji przeplatanych A/B, wraz z cancel i release/reuse.
     Startup atomowo rezerwuje żądaną liczbę slotów albo zwraca wymagane i dostępne
-    bajty. Scheduler obsługuje continuous admission przez seryjne przeplatanie.
+    bajty. Scheduler obsługuje B2 niespekulacyjnego targetu: mixery pracują
+    per slot, a FFN i głowa logits używają wspólnych batch GEMM. Jedna brama
+    capability sprawdza rezydentny KV i formaty wag; tiering wybiera seryjny
+    fallback przed mutacją KV.
     Verifier przechowuje osobne grafy T=3/4 dla każdego stabilnego identyfikatora
     slotu. Profil `nsys` dla długiego przebiegu wykazał 2 capture i 46 replay przy
     `max_active=1` oraz 4 capture i 96 replay przy `max_active=2`.
-    Seryjne przeplatanie nie skaluje aggregate throughput; pełna ścieżka wymaga
-    batchowych kerneli hybrydowych.
+    Native MTP nadal przeplata lane seryjnie; pełna ścieżka wymaga batchowego
+    draftu oraz verifiera `[B,T]`.
     Warstwy atencji używają paged KV.
   - ✅ **Wagi hybrydowe** (`weights.rs::load_hybrid`): `LayerMixer::{Attention,
     DeltaNet}`, atencja z bramkowanym Q (szerokość `2·n_heads·head_dim`, split,

@@ -127,6 +127,24 @@ per slot działa, ale seryjnie przeplatany forward zachowuje praktycznie stały
 aggregate throughput i podwaja ITL. Ten etap zapewnia correctness, izolację i
 continuous admission; wzrost przepustowości wymaga batchowych kerneli
 hybrydowych dla targetu DeltaNet i draftu MTP.
+
+## Minimalny pion targetu B2
+
+Niespekulacyjny target B2 zachowuje mixer attention/DeltaNet osobno dla każdego
+slotu, ale scala FFN i głowę logits przez istniejące batch GEMM. B1 pozostaje na
+dotychczasowej ścieżce. Test porównał pełne ID dwóch concurrent streams z
+serialnym oracle. Benchmark miał 8 tokenów promptu, 128 tokenów wyjściowych,
+warmup każdego slotu i jawne `FORGE_HYBRID_PREFILL_CHUNK=128`.
+
+| `max_active` | Completion-only | End-to-end | Średni TTFT | Średni ITL |
+|---:|---:|---:|---:|---:|
+| 1 | 38,30 tok/s | 36,15 tok/s | 199,17 ms | 26,31 ms |
+| 2 | 41,79 tok/s | 39,24 tok/s | 398,92 ms | 48,23 ms |
+
+B2 zwiększa aggregate completion throughput o 9,1% i end-to-end o 8,5%.
+Native MTP nie korzysta jeszcze z tego pionu: zmienne K i długość zaakceptowanego
+prefiksu wymagają batchowego draftu oraz verifiera `[B,T]` z osobnym stanem per
+slot.
 Każda zmiana musi zachować porównanie token po tokenie z sekwencyjnym greedy.
 
 ## Szybka ścieżka NVFP4 B3/B4 na NVIDIA

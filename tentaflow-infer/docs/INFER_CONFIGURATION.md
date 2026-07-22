@@ -823,9 +823,11 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   (Qwen3.6 `qwen35moe`) generują E2E, ale ścieżka jest correctness-first
   (~17 tok/s, host round-tripy per warstwa, bez grafu/wsadu — patrz sekcja
   qwen35moe). Target i MTP mają izolowane sloty per sekwencja oraz wspólny paged
-  cache MTP. Wiele aktywnych sekwencji działa przez seryjnie przeplatany forward;
-  batchowy forward hybrydowy pozostaje wyłączony do czasu dedykowanych kerneli
-  batchowych dla targetu DeltaNet i draftu MTP.
+  cache MTP. Dwie niespekulacyjne sekwencje targetu używają B2 ze wspólnymi
+  batch GEMM FFN i głowy logits; mixery zachowują osobne sloty DeltaNet. Native
+  MTP nadal wykonuje lane seryjnie do czasu verifiera `[B,T]` i batchowego draftu.
+  B2 wymaga rezydentnego KV oraz obsługiwanych formatów dense FFN i lm_head;
+  tiering lub inny niespełniony warunek wybiera seryjny fallback przed zmianą KV.
 - `logprobs`/`echo`/`n>1`: obsługiwane tylko na ścieżce non-streaming (streaming
   przy `n>1` lub completions z `echo`/`logprobs` = 400). Streaming chat NIE dokłada
   `logprobs` do delt (parser reorganizuje tekst — token↔delta nie są 1:1). Prompt-token

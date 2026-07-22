@@ -166,9 +166,10 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
   pętli serwera przez `--speculative mtp[:2|3]`; retained checkpointy usuwają
   powtórny skan DeltaNet przy commit. Tryb `mtp` używa budżetu 3 i adaptacyjnie
   wybiera K=2/K=3. Zakres produkcyjny: greedy; continuous admission wielu
-  sekwencji używa seryjnie przeplatanego forwardu po startup preflightcie oraz
-  osobnych grafów verifiera T=3/4 per slot. Długi benchmark dwóch slotów nie
-  zwiększa aggregate throughput; kolejnym krokiem są batchowe kernele hybrydowe.
+  sekwencji używa startup preflightu oraz osobnych grafów verifiera T=3/4 per
+  slot. Niespekulacyjny target ma pion B2 ze wspólnymi batch GEMM FFN/logits;
+  natywne MTP nadal przeplata lane seryjnie. Kolejny krok to batchowy draft i
+  verifier `[B,T]` bez mieszania stanów slotów.
   Raport: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 - **Do realizacji:** jedna lossless weryfikacja drzewa z greedy i stochastic
   acceptance, tree-attention i zatwierdzaniem wyłącznie zaakceptowanych KV;

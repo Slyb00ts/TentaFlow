@@ -362,6 +362,12 @@ pub fn spawn_engine_batched(
     }
     if model.is_hybrid() {
         model.preflight_hybrid_state_slots(max_active)?;
+        if max_active >= 2
+            && spec.kind() == SpeculationKind::Off
+            && model.hybrid_batch_b2_capable()
+        {
+            model.ensure_batch(2)?;
+        }
     }
     let (tx, rx) = mpsc::channel::<Submission>();
     let metrics = Arc::new(EngineMetrics::new());
@@ -879,8 +885,11 @@ fn batch_gpu_decode(
     // path engages once the flat cost amortizes across enough sequences.
     // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
     // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
-    let serial_only = model.is_hybrid() || model.weights.is_moe() || model.kv.cfg.quant.is_rot();
-    if feed_idx.len() < batch_min.max(2) || serial_only {
+    let hybrid_b2 = model.hybrid_batch_b2_capable() && feed_idx.len() == 2;
+    let serial_only = model.weights.is_moe()
+        || model.kv.cfg.quant.is_rot()
+        || (model.is_hybrid() && !hybrid_b2);
+    if (!hybrid_b2 && feed_idx.len() < batch_min.max(2)) || serial_only {
         for &i in &feed_idx {
             serial_step(model, &mut active[i]);
         }

@@ -1167,6 +1167,8 @@ struct BatchBufs {
     /// Pinned staging: [ids | positions | seq_lens], i32, cap each.
     pinned_meta: DevBuffer,
     pinned_pt: DevBuffer,
+    /// Pinned embeddingi modeli hybrydowych `[cap, hidden]` f16.
+    pinned_embed: DevBuffer,
     /// Per-seq sampling params (device + pinned staging).
     samp_k: DevBuffer,
     samp_inv_t: DevBuffer,
@@ -8258,6 +8260,57 @@ impl Model {
         self.weights.descriptor.params.ssm.is_some()
     }
 
+    /// Sprawdza pełny, niemutujący kontrakt targetu hybrydowego B2.
+    pub fn hybrid_batch_b2_capable(&self) -> bool {
+        fn full_rows(weight: &DevWeight) -> bool {
+            matches!(
+                weight,
+                DevWeight::F16 { .. }
+                    | DevWeight::Q8_0 { .. }
+                    | DevWeight::Q4K { .. }
+                    | DevWeight::Q6K { .. }
+                    | DevWeight::Q5K { .. }
+                    | DevWeight::Q3K { .. }
+                    | DevWeight::Q2K { .. }
+                    | DevWeight::Q4_0 { .. }
+                    | DevWeight::Q4_1 { .. }
+                    | DevWeight::Q5_0 { .. }
+                    | DevWeight::Q5_1 { .. }
+                    | DevWeight::Iq4Nl { .. }
+                    | DevWeight::Iq4Xs { .. }
+                    | DevWeight::Mxfp4 { .. }
+                    | DevWeight::Iq2Xs { .. }
+                    | DevWeight::Iq2S { .. }
+                    | DevWeight::Iq3S { .. }
+                    | DevWeight::Iq2Xxs { .. }
+                    | DevWeight::Iq3Xxs { .. }
+                    | DevWeight::Iq1S { .. }
+                    | DevWeight::Iq1M { .. }
+                    | DevWeight::NvFp4 { .. }
+                    | DevWeight::NvFp4Gguf { .. }
+            )
+        }
+
+        fn window_rows(weight: &DevWeight) -> bool {
+            full_rows(weight) && !matches!(weight, DevWeight::NvFp4Gguf { .. })
+        }
+
+        self.is_hybrid()
+            && self.tier.is_none()
+            && self.weights.token_embd_host.is_some()
+            && matches!(self.weights.lm_head, DevWeight::F16 { .. } | DevWeight::Q8_0 { .. })
+            && self.weights.layers.iter().all(|layer| {
+                let LayerFfn::Dense(ffn) = &layer.ffn else {
+                    return false;
+                };
+                let gate_up = match &ffn.gate_up {
+                    GateUpWeights::Fused(weight) => window_rows(weight),
+                    GateUpWeights::Split { gate, up } => full_rows(gate) && full_rows(up),
+                };
+                gate_up && full_rows(&ffn.down)
+            })
+    }
+
     /// Zrzuca stan hybrydowy do diagnostyki zgodności batch kontra serial.
     pub fn debug_hybrid_state_snapshot(&self) -> Result<Vec<(String, usize, Vec<u8>)>> {
         self.device.synchronize()?;
@@ -9424,6 +9477,7 @@ impl Model {
             page_table: f32b(cap * mpp)?,
             pinned_meta: pin(cap * 3 * 4)?,
             pinned_pt: pin(cap * mpp * 4)?,
+            pinned_embed: pin(cap * hidden * 2)?,
             samp_k: f32b(cap)?,
             samp_inv_t: f32b(cap)?,
             samp_top_p: f32b(cap)?,
@@ -9450,6 +9504,168 @@ impl Model {
         self.batch_graphs.clear();
         self.batch_cap = cap;
         Ok(())
+    }
+
+    /// Wykonuje B2 targetu hybrydowego ze wspólnymi GEMM FFN i głowy logits.
+    /// Mixery zachowują osobny stan slotu i są porządkowane na jednym streamie.
+    fn record_hybrid_batch_forward(
+        &mut self,
+        seqs: &mut [&mut SeqKv],
+        tokens: &[u32],
+    ) -> Result<()> {
+        let n = seqs.len();
+        if n != 2 || tokens.len() != n {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy batch targetu obsługuje obecnie dokładnie B=2".into(),
+            ));
+        }
+        self.ensure_hybrid_bufs()?;
+        let p = self.weights.descriptor.params.clone();
+        let hidden = p.hidden_size;
+        let inter = p.intermediate_size;
+        let eps = p.rms_norm_eps;
+        let mpp = self.max_pages_per_seq;
+        let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("target hybrydowy nie ma hostowego embeddingu".into())
+        })?;
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        let staging = bb
+            .pinned_embed
+            .host_ptr()
+            .expect("pinned embedding ma mapowanie hosta");
+        for (lane, &token) in tokens.iter().enumerate() {
+            let row = table
+                .get(token as usize * hidden..(token as usize + 1) * hidden)
+                .ok_or_else(|| {
+                    ForgeError::Scheduler(format!(
+                        "token id {token} wykracza poza embedding targetu"
+                    ))
+                })?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr() as *const u8,
+                    staging.add(lane * hidden * 2),
+                    hidden * 2,
+                );
+            }
+        }
+        self.device.copy(
+            &bb.pinned_embed,
+            0,
+            &bb.h,
+            0,
+            n * hidden * 2,
+            &self.stream,
+        )?;
+        self.kernels.rmsnorm_f16(
+            &bb.x,
+            &bb.h,
+            &self.weights.layers[0].attn_norm,
+            n,
+            hidden,
+            eps,
+            &self.stream,
+        )?;
+
+        for layer_index in 0..self.weights.layers.len() {
+            for (lane, seq) in seqs.iter_mut().enumerate() {
+                self.activate_hybrid_sequence(seq)?;
+                let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                self.device.copy(
+                    &bb.x,
+                    lane * hidden * 2,
+                    &self.bufs.x,
+                    0,
+                    hidden * 2,
+                    &self.stream,
+                )?;
+                match &self.weights.layers[layer_index].mixer {
+                    LayerMixer::Attention(attention) => {
+                        self.device.copy(
+                            &bb.positions,
+                            lane * 4,
+                            &self.bufs.pos,
+                            0,
+                            4,
+                            &self.stream,
+                        )?;
+                        self.device.copy(
+                            &bb.seq_lens,
+                            lane * 4,
+                            &self.seq_len_dev,
+                            0,
+                            4,
+                            &self.stream,
+                        )?;
+                        self.device.copy(
+                            &bb.page_table,
+                            lane * mpp * 4,
+                            &self.page_table_dev,
+                            0,
+                            mpp * 4,
+                            &self.stream,
+                        )?;
+                        self.hybrid_attn_mixer(layer_index, attention, &AttnSrc::Paged)?;
+                    }
+                    LayerMixer::DeltaNet(delta) => {
+                        self.hybrid_delta_mixer(layer_index, delta)?;
+                    }
+                }
+                let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                self.device.copy(
+                    &self.bufs.o_out,
+                    0,
+                    &bb.o_out,
+                    lane * hidden * 2,
+                    hidden * 2,
+                    &self.stream,
+                )?;
+            }
+
+            let layer = &self.weights.layers[layer_index];
+            let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+            self.kernels.rmsnorm_residual_f16(
+                &bb.x,
+                &bb.h,
+                &bb.o_out,
+                &layer.ffn_norm,
+                n,
+                hidden,
+                eps,
+                &self.stream,
+            )?;
+            let ffn = layer.dense_ffn()?;
+            match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    self.gemm_rows(&bb.gate, weight, &bb.x, n, 0, inter, &self.stream)?;
+                    self.gemm_rows(&bb.up, weight, &bb.x, n, inter, inter, &self.stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemm(&bb.gate, gate, &bb.x, n, &self.stream)?;
+                    self.gemm(&bb.up, up, &bb.x, n, &self.stream)?;
+                }
+            }
+            self.kernels
+                .silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, &self.stream)?;
+            self.gemm(&bb.down, &ffn.down, &bb.act, n, &self.stream)?;
+            let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                &self.weights.layers[layer_index + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            self.kernels.rmsnorm_residual_f16(
+                &bb.x,
+                &bb.h,
+                &bb.down,
+                next_norm,
+                n,
+                hidden,
+                eps,
+                &self.stream,
+            )?;
+        }
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        self.logits_gemm(&bb.logits, &bb.x, n, &self.stream)
     }
 
     /// Record one batched forward + logit head over `n` rows into the model
@@ -9710,6 +9926,11 @@ impl Model {
                 "batched_decode: seqs/tokens/params length mismatch".into(),
             ));
         }
+        if self.is_hybrid() && (b != 2 || !self.hybrid_batch_b2_capable()) {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy batch B2 nie spełnia kontraktu modelu lub pamięci KV".into(),
+            ));
+        }
         // Rot modes commit each appended token into the packed low-bit store on
         // the single-stream decode path only; the batched path would append to
         // the f16 slab without packing, leaving the packed store stale. Refuse
@@ -9844,7 +10065,15 @@ impl Model {
             &self.stream,
         )?;
 
-        if mixed {
+        if self.is_hybrid() {
+            if mixed {
+                return Err(ForgeError::Unsupported(
+                    "hybrydowy batch B2 nie obsługuje tieringu KV".into(),
+                ));
+            }
+            self.record_hybrid_batch_forward(seqs, tokens)?;
+            self.pt_seq = 0;
+        } else if mixed {
             let tier = self.tier.as_mut().expect("mixed batch requires tiering");
             for &i in &order[resident..] {
                 tier.prepare_streaming(seqs[i])?;

@@ -441,9 +441,12 @@ coherent Polish on the RTX 4090.
   MTP. Preflight dwóch slotów oraz audyt GPU pure MTP i MTP+n-gram A/B przechodzą.
   Produkcyjny E2E admission/cancel/reuse przechodzi dla dwóch sekwencji. Verifier
   utrzymuje osobne grafy T=3/4 według stabilnego identyfikatora slotu; reuse lease
-  zachowuje adresy buforów GPU. Forward wielu sekwencji jest nadal seryjnie
-  przeplatany, więc wymaga batchowych kerneli hybrydowych do wzrostu aggregate
-  throughput. Ścieżkę sprawdzono wykonawczo wyłącznie na CUDA/RTX 4090
+  zachowuje adresy buforów GPU. Niespekulacyjny target ma pion B2: mixery
+  zachowują osobne sloty, a FFN i głowa logits używają batch GEMM. Native MTP
+  nadal wykonuje lane seryjnie i wymaga verifiera `[B,T]` do wzrostu aggregate
+  throughput. B2 wymaga rezydentnego KV i obsługiwanych formatów wag; tiering
+  przechodzi na seryjny fallback przed mutacją KV. Ścieżkę sprawdzono wykonawczo
+  wyłącznie na CUDA/RTX 4090
   z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Źródła Mojo zachowują podział
   umożliwiający przyszły codegen AMDGPU/Metal, ale backendy AMD i Metal nie są
   jeszcze podłączone ani przetestowane. `draft-model`, `eagle`, `dflash` i
