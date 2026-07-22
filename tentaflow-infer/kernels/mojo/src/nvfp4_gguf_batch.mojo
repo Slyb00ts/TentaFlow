@@ -218,13 +218,14 @@ def gemm_nvfp4_gguf_f16_nvidia_impl[token_tile: Int](
         scale = _ue4m3_value(weights[base + subblock])
         column = block * 64 + subblock * 16
         comptime for token in range(token_tile):
-            activation = (x + token * n_cols + column).load[
-                width=16, alignment=32
-            ]().cast[DType.float32]()
-            acc[token] += scale * (
-                (low * activation.slice[8, offset=0]()).reduce_add()
-                + (high * activation.slice[8, offset=8]()).reduce_add()
-            )
+            if token < n_tokens:
+                activation = (x + token * n_cols + column).load[
+                    width=16, alignment=32
+                ]().cast[DType.float32]()
+                acc[token] += scale * (
+                    (low * activation.slice[8, offset=0]()).reduce_add()
+                    + (high * activation.slice[8, offset=8]()).reduce_add()
+                )
         group += WARP_SIZE
 
     comptime for token in range(token_tile):
@@ -291,5 +292,6 @@ comptime gemm_nvfp4_gguf_f16_b1_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[1]
 comptime gemm_nvfp4_gguf_out_f32_b1_nvidia = gemv_nvfp4_gguf_out_f32_nvidia
 comptime gemm_nvfp4_gguf_f16_b3_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[3]
 comptime gemm_nvfp4_gguf_f16_b4_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[4]
+comptime gemm_nvfp4_gguf_f16_b8_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[8]
 comptime gemm_nvfp4_gguf_f16_b8 = gemm_nvfp4_gguf_f16_impl[8]
 comptime gemm_nvfp4_gguf_f16_b16 = gemm_nvfp4_gguf_f16_impl[16]

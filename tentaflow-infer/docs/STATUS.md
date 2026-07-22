@@ -23,31 +23,26 @@ Ostatnia aktualizacja: 2026-07-22.
   160,05 us.
 
 - 🟡 **Natywne Qwen3.5/3.6 MTP/NextN dla gęstego NVFP4 GGUF
-  (2026-07-21).** Rejestr `qwen35` oddziela jeden blok
-  `nextn_predict_layers` od 64-warstwowego hybrydowego trunku modelu
-  `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Loader zachowuje źródłowe
-  NVFP4/Q8_0/F32, współdzieli target embedding/head, jeśli checkpoint nie ma
-  dedykowanych tensorów, i nie ładuje drugiej kopii targetu. Proposer K=2/K=3,
-  batched verifier greedy, argmax oraz checkpointy KV/DeltaNet działają na GPU
-  przez kernele Mojo. Retained checkpointy DeltaNet usuwają powtórny skan 48
-  warstw przy commit; tryb `--speculative mtp` adaptacyjnie wybiera K=2/K=3.
-  Prefill targetu działa w macierzowych chunkach, a catch-up MTP zapisuje tylko
-  K/V potrzebne przez draft: raw512 spadł z **227,696 ms do 11,262 ms** przy
-  identycznym SHA tokenów. Pula aktywacji każdego modelu hybrydowego wynosi
-  1,125 GiB (+128 MiB względem ścieżki attention-only), także bez aktywnego MTP,
-  aby batchowy prefill `chunk128` mieścił pełny scratch.
-  Wielocyklowy benchmark sprawdza zgodność tokenów z serial greedy. Stała część
-  verifiera ma trwałe grafy T=3/T=4 z pozycją bazową odczytywaną na GPU. Wynik
-  RTX 4090, K=3: raw128 około **86,9 tok/s**, raw512 około **83,8 tok/s** po
-  włączeniu głowy Q8 B3/B4, scalonego przygotowania DeltaNet, szybkich projekcji
-  NVFP4 B3/B4 i grafów verifiera.
-  llama.cpp osiąga **110,2** i **100,5 tok/s**. Cel
-  wydajności nie jest jeszcze osiągnięty. vLLM 0.25.1 nie dostarczył porównywalnego
-  wyniku, ponieważ jego loader nie przyjął lokalnego jednoplikowego GGUF jako
-  kompletnego repozytorium modelu i zakończył inicjalizację na etapie konfiguracji
-  HF/tokenizera. Ograniczenia: greedy, `max_active=1`, zweryfikowane tylko CUDA;
-  AMD/Metal pozostają celem przenośności źródeł Mojo, bez testów wykonawczych.
-  Raport: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
+  (2026-07-22).** Rejestr `qwen35` oddziela blok `nextn_predict_layers` od
+  64-warstwowego trunku `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF` bez
+  drugiej kopii targetu. Proposer K=2/K=3, verifier greedy, argmax, KV i DeltaNet
+  działają na GPU przez kernele Mojo. Scheduler paruje dwa requesty o tym samym
+  K w natywnym B2. Segmentowane KV, attention, DeltaNet, decyzje i commit
+  zachowują stan per lane; commit odtwarza zaakceptowany stan ze wspólnego
+  forwardu bez puli retained checkpointów. Błąd checkpoint/rollback zatruwa i
+  poddaje kwarantannie oba lease'y pary. Pięć powtórzeń RTX 4090 dało medianę
+  B2 ON/OFF: raw128 **137,40/101,97 tok/s** (+34,75%), raw512
+  **97,78/76,38 tok/s** (+28,02%); stałe K=3 osiągnęło **136,97/94,34
+  tok/s**. Wszystkie przebiegi zachowały pełne ID względem serial greedy.
+  Szybsze pomiary llama.cpp B2 są nieważne porównawczo: tylko 5/24 wyjść
+  zgadzało się z oracle `np1`. Różne K, n-gram, tiering, niepełna para i
+  niespełniony kontrakt capability przechodzą na B1;
+  `FORGE_NATIVE_MTP_B2=0|1` jest ścisłym kill-switchem. vLLM 0.25.1 nie
+  dostarczył porównywalnego wyniku dla lokalnego jednoplikowego GGUF. Pozostały
+  narzut obejmuje hostowy gather embeddingu i dwa sync na cykl; jednorundowe GPU
+  pack/gather nie jest gotowe. CUDA jest jedynym backendem sprawdzonym
+  wykonawczo; źródła zachowują przenośny fallback dla AMD/Metal. Raport:
+  `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 
 - 🟡 **NVFP4 Bielik: hybrydowy prefill FP8 i GQA decode w Mojo
   (2026-07-20).** Opcjonalne `FORGE_GEMM=fp8mod-ffn` przepakowuje na GPU
@@ -540,13 +535,15 @@ Ostatnia aktualizacja: 2026-07-22.
   (gate `MIN_VERIFY_DRAFT`); dla ordinary prose spekulacja nie regresuje (fallback
   na pojedynczy graf-krok). Domyślnie WYŁĄCZONA (`--speculative off` = bajt-w-bajt
   dzisiejsza pętla). Natywne MTP/NextN działa osobną ścieżką dla gęstego
-  hybrydowego `qwen35`: K=2/K=3, adaptacyjny wybór budżetu, batched verifier
-  i retained checkpointy DeltaNet. Stan targetu i draftu MTP jest izolowany
+  hybrydowego `qwen35`: K=2/K=3, adaptacyjny wybór budżetu i batched verifier.
+  Pure MTP paruje dwa requesty z tym samym K; KV, attention, DeltaNet, decyzje i
+  commit są segmentowane per lane. Stan targetu i draftu MTP jest izolowany
   per sekwencja pod jednym lease, a strony draftu pochodzą ze współdzielonego
   paged cache MTP. Router `mtp+ngram:2|3` daje
   pierwszeństwo pełnemu draftowi n-gram, dogania MTP po zaakceptowanym prefiksie,
   a na miss używa natywnego MTP; raportuje osobne liczniki obu ścieżek. Wymaga
-  greedy; `max_active=2` przechodzi produkcyjny E2E admission/cancel/reuse;
+  greedy; `max_active=2` przechodzi produkcyjny E2E admission/cancel/reuse, a
+  błąd restore/rollback zatruwa i poddaje kwarantannie całą parę;
   sprawdzone wykonawczo tylko na CUDA. Braki: draft-model / EAGLE / DFlash /
   DSpark, tree-verification (spec-sampling), spekulacja stochastyczna (`temp>0`)
   oraz backendy AMD/Metal.
@@ -602,8 +599,8 @@ Ostatnia aktualizacja: 2026-07-22.
     Verifier przechowuje osobne grafy T=3/4 dla każdego stabilnego identyfikatora
     slotu. Profil `nsys` dla długiego przebiegu wykazał 2 capture i 46 replay przy
     `max_active=1` oraz 4 capture i 96 replay przy `max_active=2`.
-    Native MTP nadal przeplata lane seryjnie; pełna ścieżka wymaga batchowego
-    draftu oraz verifiera `[B,T]`.
+    Native MTP ma osobny same-K B2 z batchowym draftem i segmentowanym verifierem
+    `[B,T]`; różne K, n-gram i tiering zachowują seryjny fallback.
     Warstwy atencji używają paged KV.
   - ✅ **Wagi hybrydowe** (`weights.rs::load_hybrid`): `LayerMixer::{Attention,
     DeltaNet}`, atencja z bramkowanym Q (szerokość `2·n_heads·head_dim`, split,

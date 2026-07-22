@@ -220,6 +220,115 @@ def attn_decode_batch_exact_f16[head_dim: Int](
 comptime attn_decode_batch_exact_f16_hd256 = attn_decode_batch_exact_f16[256]
 
 
+def attn_verify_segmented_f16_hd256(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    visible_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+):
+    """Przenośna atencja verifiera dla segmentów sequence-major `[B,T]`."""
+    comptime head_dim = 256
+    token = Int(block_idx.x)
+    qh = Int(block_idx.y)
+    kvh = qh // (n_q_heads // n_kv_heads)
+    element = Int(thread_idx.x)
+    lane = token // n_tokens
+    ctx_len = Int(visible_lens[token])
+    q_base = (token * n_q_heads + qh) * head_dim
+    shared = stack_allocation[head_dim, Float32, address_space=AddressSpace.SHARED]()
+    var maximum: Float32 = NEG_INF
+    var denominator: Float32 = 0.0
+    var output: Float32 = 0.0
+
+    for pos in range(ctx_len):
+        page = Int(page_tables[lane * max_pages + pos // page_size])
+        kv_base = ((page * n_kv_heads + kvh) * page_size + pos % page_size) * head_dim
+        shared[element] = Float32(q[q_base + element]) * Float32(k_cache[kv_base + element])
+        barrier()
+        var stride = head_dim // 2
+        while stride > 0:
+            if element < stride:
+                shared[element] += shared[element + stride]
+            barrier()
+            stride //= 2
+        score = shared[0] * scale
+        next_maximum = max(maximum, score)
+        correction = exp(maximum - next_maximum) if maximum > NEG_INF else Float32(0.0)
+        probability = exp(score - next_maximum)
+        denominator = denominator * correction + probability
+        output = output * correction + probability * Float32(v_cache[kv_base + element])
+        maximum = next_maximum
+        barrier()
+
+    out_ptr[q_base + element] = Float16(output / denominator)
+
+
+def attn_verify_segmented_f16_hd256_warp32(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    visible_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+):
+    """Atencja verifiera NVIDIA z jednym warpem na query i head."""
+    comptime head_dim = 256
+    comptime elements_per_lane = head_dim // WARP_SIZE
+    token = Int(block_idx.x)
+    qh = Int(block_idx.y)
+    lane_id = Int(thread_idx.x)
+    kvh = qh // (n_q_heads // n_kv_heads)
+    sequence = token // n_tokens
+    ctx_len = Int(visible_lens[token])
+    q_base = (token * n_q_heads + qh) * head_dim
+    var q_frag = SIMD[DType.float32, elements_per_lane](0.0)
+    var output = SIMD[DType.float32, elements_per_lane](0.0)
+    comptime for element in range(elements_per_lane):
+        q_frag[element] = Float32(q[q_base + element * WARP_SIZE + lane_id])
+    var maximum: Float32 = NEG_INF
+    var denominator: Float32 = 0.0
+
+    for position in range(ctx_len):
+        page = Int(page_tables[sequence * max_pages + position // page_size])
+        kv_base = (
+            (page * n_kv_heads + kvh) * page_size + position % page_size
+        ) * head_dim
+        var key = SIMD[DType.float32, elements_per_lane](0.0)
+        var value = SIMD[DType.float32, elements_per_lane](0.0)
+        var partial: Float32 = 0.0
+        comptime for element in range(elements_per_lane):
+            offset = element * WARP_SIZE + lane_id
+            key[element] = Float32(k_cache[kv_base + offset])
+            partial += q_frag[element] * key[element]
+            value[element] = Float32(v_cache[kv_base + offset])
+        score = warp.sum(partial) * scale
+        next_maximum = max(maximum, score)
+        correction = exp(maximum - next_maximum) if maximum > NEG_INF else Float32(0.0)
+        probability = exp(score - next_maximum)
+        denominator = denominator * correction + probability
+        output = output * correction + probability * value
+        maximum = next_maximum
+
+    comptime for element in range(elements_per_lane):
+        out_ptr[q_base + element * WARP_SIZE + lane_id] = Float16(
+            output[element] / denominator
+        )
+
+
 def attn_decode_split[head_dim: Int, kv_dtype: DType](
     parts: UnsafePointer[Float32, MutAnyOrigin],
     q_in: UnsafePointer[Float16, MutAnyOrigin],

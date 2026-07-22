@@ -16,7 +16,7 @@ from src.activation import silu_mul_f16, sigmoid_mul_f16, deinterleave_gate_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import attn_decode_f16_hd64, attn_decode_f16_hd128, attn_decode_f16_hd256
-from src.attention import attn_decode_batch_exact_f16_hd256
+from src.attention import attn_decode_batch_exact_f16_hd256, attn_verify_segmented_f16_hd256, attn_verify_segmented_f16_hd256_warp32
 from src.rope import rope_neox_partial_f16
 from src.deltanet import (
     deltanet_conv_silu_f16,
@@ -31,6 +31,7 @@ from src.deltanet_verify import (
     deltanet_prepare_t3_f16,
     deltanet_prepare_t4_f16,
     deltanet_prepare_dynamic_f16,
+    deltanet_prepare_segmented_f16,
     deltanet_gated_scan_t2_f16,
     deltanet_gated_scan_t3_f16,
     deltanet_gated_scan_t4_f16,
@@ -38,13 +39,17 @@ from src.deltanet_verify import (
     deltanet_gated_scan_t4_d128_f16,
     deltanet_gated_scan_dynamic_f16,
     deltanet_gated_scan_dynamic_d128_f16,
+    deltanet_gated_scan_segmented_d128_f16,
+    deltanet_gated_scan_segmented_shared_d128_f16,
+    deltanet_commit_recompute_segmented_shared_d128_f32,
     deltanet_gated_scan_inplace_dynamic_d128_f16,
     deltanet_gated_scan_inplace_shared_d128_f16,
     deltanet_commit_checkpoint_f32,
+    deltanet_commit_checkpoint_segmented_f32,
 )
 from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8, gemv_nvfp4_gguf_f16, gemv_nvfp4_gguf_out_f32, pack_q8_0_nvfp4_gguf
 from src.nvfp4_gguf_dp4a import gemv_nvfp4_gguf_q8_1_f16
-from src.mtp import mtp_prepare_f16, mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16, mtp_verify_decide, mtp_select_row_f16, mtp_select_row_f32
+from src.mtp import mtp_prepare_f16, mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16, mtp_verify_decide, mtp_verify_decide_segmented, mtp_select_row_f16, mtp_select_row_f32, mtp_select_row_segmented_f16
 from src.nvfp4_batch import gemv_batch_nvfp4_f16_b4, gemv_batch_nvfp4_f16_b8, gemv_batch_nvfp4_f16_b16, gemv_batch_f16_out_f32_b4, gemv_batch_f16_out_f32_b8
 from src.misc import gather_rows_f16, gemv_f16_out_f32, gemv_q8_0_out_f32
 from src.layernorm import layernorm_f16, layernorm_residual_f16
@@ -58,6 +63,7 @@ from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
 from src.q8_0_batch import gemm_q8_0_i8mma_b2, gemm_q8_0_i8mma_b3, gemm_q8_0_i8mma_b4
 from src.q8_0_batch import gemm_q8_0_i8mma_out_f32_b3, gemm_q8_0_i8mma_out_f32_b4
+from src.q8_0_batch import gemm_q8_0_i8mma_b8, gemm_q8_0_f16_exact_out_f32_b8
 from src.q8_0_batch import gemm_q8_0_dp4a_b3_nvidia, gemm_q8_0_dp4a_b4_nvidia
 from src.q8_0_batch import gemm_q8_0_dp4a_out_f32_b3_nvidia, gemm_q8_0_dp4a_out_f32_b4_nvidia
 from src.q8_0_batch import gemm_q8_0_f16_exact_out_f32_b3, gemm_q8_0_f16_exact_out_f32_b4
@@ -108,7 +114,7 @@ from src.gemm_q4k_i8_multistage import (
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128, attn_prefill_f16_hd256
 from src.prefill import kv_append_batch_fp8, attn_prefill_fp8_hd64, attn_prefill_fp8_hd128
 from src.prefill import attn_prefill_fa_f16_hd64, attn_prefill_fa_f16_hd128
-from src.prefill import kv_append_batch_device_pos_f16, attn_prefill_device_pos_f16_hd256
+from src.prefill import kv_append_batch_device_pos_f16, kv_append_batch_segmented_f16, attn_prefill_device_pos_f16_hd256
 from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
 from src.attention import attn_decode_split_fp8_hd64, attn_decode_split_fp8_hd128
@@ -210,6 +216,7 @@ from src.nvfp4_gguf_batch import (
     gemm_nvfp4_gguf_out_f32_b1_nvidia,
     gemm_nvfp4_gguf_f16_b3_nvidia,
     gemm_nvfp4_gguf_f16_b4_nvidia,
+    gemm_nvfp4_gguf_f16_b8_nvidia,
     gemm_nvfp4_gguf_f16_b8,
     gemm_nvfp4_gguf_f16_b16,
 )
@@ -256,6 +263,7 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
         or name == "gemm_nvfp4_gguf_out_f32_b1_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b3_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b4_nvidia"
+        or name == "gemm_nvfp4_gguf_f16_b8_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b8"
         or name == "gemm_nvfp4_gguf_f16_b16"
         or name == "gemm_nvfp4_gguf_mma_f16_bm32"
@@ -376,6 +384,10 @@ def main() raises:
 
     _ = ctx.compile_function[attn_decode_batch_exact_f16_hd256, dump_asm=Path("attn_decode_batch_exact_f16_hd256.ptx")]()
     entries.append(_finalize(out_dir, "attn_decode_batch_exact_f16_hd256"))
+    _ = ctx.compile_function[attn_verify_segmented_f16_hd256, dump_asm=Path("attn_verify_segmented_f16_hd256.ptx")]()
+    entries.append(_finalize(out_dir, "attn_verify_segmented_f16_hd256"))
+    _ = ctx.compile_function[attn_verify_segmented_f16_hd256_warp32, dump_asm=Path("attn_verify_segmented_f16_hd256_warp32.ptx")]()
+    entries.append(_finalize(out_dir, "attn_verify_segmented_f16_hd256_warp32"))
 
     _ = ctx.compile_function[rope_neox_partial_f16, dump_asm=Path("rope_neox_partial_f16.ptx")]()
     entries.append(_finalize(out_dir, "rope_neox_partial_f16"))
@@ -399,6 +411,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "deltanet_prepare_t4_f16"))
     _ = ctx.compile_function[deltanet_prepare_dynamic_f16, dump_asm=Path("deltanet_prepare_dynamic_f16.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_prepare_dynamic_f16"))
+    _ = ctx.compile_function[deltanet_prepare_segmented_f16, dump_asm=Path("deltanet_prepare_segmented_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_prepare_segmented_f16"))
 
     _ = ctx.compile_function[deltanet_gated_scan_t2_f16, dump_asm=Path("deltanet_gated_scan_t2_f16.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_gated_scan_t2_f16"))
@@ -418,6 +432,12 @@ def main() raises:
     entries.append(_finalize(out_dir, "deltanet_gated_scan_dynamic_f16"))
     _ = ctx.compile_function[deltanet_gated_scan_dynamic_d128_f16, dump_asm=Path("deltanet_gated_scan_dynamic_d128_f16.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_gated_scan_dynamic_d128_f16"))
+    _ = ctx.compile_function[deltanet_gated_scan_segmented_d128_f16, dump_asm=Path("deltanet_gated_scan_segmented_d128_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_gated_scan_segmented_d128_f16"))
+    _ = ctx.compile_function[deltanet_gated_scan_segmented_shared_d128_f16, dump_asm=Path("deltanet_gated_scan_segmented_shared_d128_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_gated_scan_segmented_shared_d128_f16"))
+    _ = ctx.compile_function[deltanet_commit_recompute_segmented_shared_d128_f32, dump_asm=Path("deltanet_commit_recompute_segmented_shared_d128_f32.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_commit_recompute_segmented_shared_d128_f32"))
     _ = ctx.compile_function[deltanet_gated_scan_inplace_dynamic_d128_f16, dump_asm=Path("deltanet_gated_scan_inplace_dynamic_d128_f16.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_gated_scan_inplace_dynamic_d128_f16"))
     _ = ctx.compile_function[deltanet_gated_scan_inplace_shared_d128_f16, dump_asm=Path("deltanet_gated_scan_inplace_shared_d128_f16.ptx")]()
@@ -425,6 +445,8 @@ def main() raises:
 
     _ = ctx.compile_function[deltanet_commit_checkpoint_f32, dump_asm=Path("deltanet_commit_checkpoint_f32.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_commit_checkpoint_f32"))
+    _ = ctx.compile_function[deltanet_commit_checkpoint_segmented_f32, dump_asm=Path("deltanet_commit_checkpoint_segmented_f32.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_commit_checkpoint_segmented_f32"))
 
     _ = ctx.compile_function[deltanet_gated_rmsnorm_f16, dump_asm=Path("deltanet_gated_rmsnorm_f16.ptx")]()
     entries.append(_finalize(out_dir, "deltanet_gated_rmsnorm_f16"))
@@ -463,11 +485,17 @@ def main() raises:
     _ = ctx.compile_function[mtp_verify_decide, dump_asm=Path("mtp_verify_decide.ptx")]()
     entries.append(_finalize(out_dir, "mtp_verify_decide"))
 
+    _ = ctx.compile_function[mtp_verify_decide_segmented, dump_asm=Path("mtp_verify_decide_segmented.ptx")]()
+    entries.append(_finalize(out_dir, "mtp_verify_decide_segmented"))
+
     _ = ctx.compile_function[mtp_select_row_f16, dump_asm=Path("mtp_select_row_f16.ptx")]()
     entries.append(_finalize(out_dir, "mtp_select_row_f16"))
 
     _ = ctx.compile_function[mtp_select_row_f32, dump_asm=Path("mtp_select_row_f32.ptx")]()
     entries.append(_finalize(out_dir, "mtp_select_row_f32"))
+
+    _ = ctx.compile_function[mtp_select_row_segmented_f16, dump_asm=Path("mtp_select_row_segmented_f16.ptx")]()
+    entries.append(_finalize(out_dir, "mtp_select_row_segmented_f16"))
 
     _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b2, dump_asm=Path("gemm_nvfp4_gguf_f16_b2.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b2"))
@@ -483,6 +511,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b3_nvidia"))
     _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b4_nvidia, dump_asm=Path("gemm_nvfp4_gguf_f16_b4_nvidia.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b4_nvidia"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b8_nvidia, dump_asm=Path("gemm_nvfp4_gguf_f16_b8_nvidia.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b8_nvidia"))
     _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b8, dump_asm=Path("gemm_nvfp4_gguf_f16_b8.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b8"))
     _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b16, dump_asm=Path("gemm_nvfp4_gguf_f16_b16.ptx")]()
@@ -573,11 +603,17 @@ def main() raises:
     _ = ctx.compile_function[gemm_q8_0_i8mma_b4, dump_asm=Path("gemm_q8_0_i8mma_b4.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_b4"))
 
+    _ = ctx.compile_function[gemm_q8_0_i8mma_b8, dump_asm=Path("gemm_q8_0_i8mma_b8.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_b8"))
+
     _ = ctx.compile_function[gemm_q8_0_i8mma_out_f32_b3, dump_asm=Path("gemm_q8_0_i8mma_out_f32_b3.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_out_f32_b3"))
 
     _ = ctx.compile_function[gemm_q8_0_i8mma_out_f32_b4, dump_asm=Path("gemm_q8_0_i8mma_out_f32_b4.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_out_f32_b4"))
+
+    _ = ctx.compile_function[gemm_q8_0_f16_exact_out_f32_b8, dump_asm=Path("gemm_q8_0_f16_exact_out_f32_b8.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_f16_exact_out_f32_b8"))
 
     _ = ctx.compile_function[gemm_q8_0_dp4a_b3_nvidia, dump_asm=Path("gemm_q8_0_dp4a_b3_nvidia.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_dp4a_b3_nvidia"))
@@ -635,6 +671,8 @@ def main() raises:
 
     _ = ctx.compile_function[kv_append_batch_device_pos_f16, dump_asm=Path("kv_append_batch_device_pos_f16.ptx")]()
     entries.append(_finalize(out_dir, "kv_append_batch_device_pos_f16"))
+    _ = ctx.compile_function[kv_append_batch_segmented_f16, dump_asm=Path("kv_append_batch_segmented_f16.ptx")]()
+    entries.append(_finalize(out_dir, "kv_append_batch_segmented_f16"))
 
     _ = ctx.compile_function[attn_prefill_f16_hd64, dump_asm=Path("attn_prefill_f16_hd64.ptx")]()
     entries.append(_finalize(out_dir, "attn_prefill_f16_hd64"))

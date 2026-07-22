@@ -434,8 +434,9 @@ coherent Polish on the RTX 4090.
   adaptacyjnie przełączany między K=2 i K=3.
   Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
 - Natywne MTP jest obecnie greedy-exact; domyślne `max_active=1` ogranicza pulę,
-  a jawne `max_active > 1` przechodzi atomowy startup preflight i używa seryjnie
-  przeplatanego forwardu per sekwencja. Target DeltaNet
+  a jawne `max_active > 1` przechodzi atomowy startup preflight. Scheduler paruje
+  dwa requesty pure MTP z tym samym K w natywnym B2. Segmentowane KV, attention,
+  DeltaNet, decyzje acceptance/correction i commit zachowują stan per lane. Target DeltaNet
   oraz draft MTP mają izolowany stan per sekwencja pod wspólnym lease z generacją
   i eventem GPU; `SeqKv` draftów korzystają z jednej współdzielonej puli stron
   MTP. Preflight dwóch slotów oraz audyt GPU pure MTP i MTP+n-gram A/B przechodzą.
@@ -446,8 +447,9 @@ coherent Polish on the RTX 4090.
   seryjny ogon, B4 wykonuje dwie pary; test obejmuje parity ID, różne parametry
   samplingu per lane oraz cancel i ponowne użycie slotu. Na RTX 4090 mediany
   aggregate throughput wzrosły z 37,92 do 40,41 tok/s dla B3 (+6,58%) i z 37,90
-  do 41,32 tok/s dla B4 (+9,01%). Native MTP nadal wykonuje lane seryjnie i
-  wymaga verifiera `[B,T]` do wzrostu aggregate throughput. Parowanie B2 wymaga
+  do 41,32 tok/s dla B4 (+9,01%). Native MTP ma osobny segmentowany verifier
+  `[B,T]`; błąd restore/rollback zatruwa i poddaje kwarantannie oba lease'y.
+  Parowanie B2 wymaga
   rezydentnego KV i obsługiwanych formatów wag; tiering przechodzi na seryjny
   fallback przed mutacją KV. Ścieżkę sprawdzono wykonawczo
   wyłącznie na CUDA/RTX 4090
@@ -456,17 +458,23 @@ coherent Polish on the RTX 4090.
   jeszcze podłączone ani przetestowane. `draft-model`, `eagle`, `dflash` i
   `dspark` nadal zwracają `Unsupported`; weryfikacja drzewa, sampling, PARD i
   suffix nie są jeszcze zaimplementowane.
-- Retained checkpointy stanu DeltaNet usuwają ponowny skan 48 warstw podczas
-  zatwierdzania zaakceptowanego prefiksu. Wyspecjalizowana głowa Q8 B3/B4 oraz
+- Różne K, `mtp+ngram`, tiering, niepełna para i niespełniony kontrakt kerneli
+  przechodzą na seryjne B1. `FORGE_NATIVE_MTP_B2` akceptuje wyłącznie `0` lub
+  `1`; domyślnie B2 jest włączone. Sampling inny niż greedy-exact pozostaje poza
+  natywnym MTP.
+- Współdzielony forward DeltaNet i recompute commit usunęły około 1,125 GiB
+  retained checkpointów. Wyspecjalizowane głowy Q8 B8 oraz
   scalone przygotowanie DeltaNet zmniejszają liczbę kerneli i kopii D2D. Stała
   część verifiera T=3/T=4 działa jako trwały graf, a pozycję bazową attention
   odczytuje z bufora GPU.
-  Fair prose RTX 4090: około 102,0 tok/s dla raw128 oraz 72,6 tok/s dla raw512
-  w trybie MTP K=3; `mtp+ngram:3` osiąga odpowiednio 118,897 tok/s oraz
-  76,688 tok/s. Referencja pure MTP bez n-gramu z
-  llama.cpp na tym samym modelu i prose osiąga około
-  111,079 i 87,652 tok/s. Wszystkie przebiegi FORGE zachowały identyczne ID
-  tokenów względem sekwencyjnego greedy; luka pure MTP pozostaje otwarta. Szczegóły:
+  Pięć powtórzeń RTX 4090 B2 ON/OFF: raw128 137,40/101,97 tok/s
+  (+34,75%), raw512 97,78/76,38 tok/s (+28,02%); stałe K=3 osiąga
+  136,97/94,34 tok/s. Wszystkie przebiegi FORGE zachowały pełne ID względem
+  sekwencyjnego greedy. Wynik llama.cpp B2 nie jest baseline: tylko 5/24 wyjść
+  zgadzało się z oracle `np1`. Profil nadal pokazuje hostowy gather embeddingu,
+  dwa sync na cykl i konserwatywne naliczanie przypiętych stron prefiksu;
+  jednorundowe GPU pack/gather nie jest zaimplementowane. Pełny builder blokuje
+  FP8 wymagające PTX 8.4, gdy Mojo emituje PTX 8.1. Szczegóły:
   `tentaflow-infer/docs/BENCH_QWEN35_MTP_NVFP4.md`.
 - Admission rezerwuje logiczny budżet przyszłych stron KV każdej aktywnej
   sekwencji, egzekwuje `max_pages_per_seq` i wykonuje atomowy preflight wzrostu

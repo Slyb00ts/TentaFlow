@@ -82,6 +82,12 @@ fn nvfp4_gguf_dispatch(
         ),
         3 => ("gemm_nvfp4_gguf_f16_b3", 3, 1, Some(warp_size)),
         4 => ("gemm_nvfp4_gguf_f16_b4", 4, 1, Some(warp_size)),
+        5..=8 if is_nvidia && warp_size == 32 => (
+            "gemm_nvfp4_gguf_f16_b8_nvidia",
+            8,
+            2,
+            warp_size.checked_mul(2),
+        ),
         5..=8 => ("gemm_nvfp4_gguf_f16_b8", 8, 1, warp_size.checked_mul(8)),
         9..=16 => ("gemm_nvfp4_gguf_f16_b16", 16, 1, warp_size.checked_mul(16)),
         17..=32 if is_nvidia && warp_size == 32 => {
@@ -287,6 +293,35 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
+    /// Wyznacza acceptance i correction osobno dla każdego segmentu `[B,T]`.
+    pub fn mtp_verify_decide_segmented(
+        &self,
+        decisions: &DevBuffer,
+        predictions: &DevBuffer,
+        input_ids: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_tokens < 2 {
+            return Err(ForgeError::Kernel(format!(
+                "mtp segmented decision wymaga B>0 i T>=2, otrzymano B={batch}, T={n_tokens}"
+            )));
+        }
+        let kernel = self.artifacts.get("mtp_verify_decide_segmented")?;
+        let config = LaunchConfig {
+            grid: (batch as u32, 1, 1),
+            block: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(decisions)
+            .buf(predictions)
+            .buf(input_ids)
+            .scalar(n_tokens as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Kopiuje wiersz F16 wskazany pierwszą wartością bufora decyzji.
     pub fn mtp_select_row_f16(
         &self,
@@ -329,6 +364,38 @@ impl Kernels {
             .buf(output)
             .buf(rows)
             .buf(decision)
+            .scalar(row_size as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Kopiuje po jednym wierszu F16 wskazanym decyzją każdego segmentu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_select_row_segmented_f16(
+        &self,
+        output: &DevBuffer,
+        rows: &DevBuffer,
+        decisions: &DevBuffer,
+        batch: usize,
+        n_rows: usize,
+        row_size: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_rows == 0 || row_size == 0 {
+            return Err(ForgeError::Kernel(
+                "segmentowany wybór wiersza wymaga dodatnich wymiarów".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("mtp_select_row_segmented_f16")?;
+        let config = LaunchConfig {
+            grid: ((row_size as u32).div_ceil(BLOCK), batch as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(rows)
+            .buf(decisions)
+            .scalar(n_rows as i64)
             .scalar(row_size as i64);
         self.device.launch(kernel, &config, &args, stream)
     }
@@ -893,6 +960,244 @@ impl Kernels {
             .scalar(d_state)
             .scalar(d_conv)
             .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Przygotowuje niezależne segmenty DeltaNet w układzie `[B,T]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_prepare_segmented_f16(
+        &self,
+        q_out: &DevBuffer,
+        k_out: &DevBuffer,
+        v_out: &DevBuffer,
+        g_out: &DevBuffer,
+        beta_out: &DevBuffer,
+        conv_checkpoints: &DevBuffer,
+        conv_initial: &DevBuffer,
+        qkv_mixed: &DevBuffer,
+        conv_weight: &DevBuffer,
+        alpha_raw: &DevBuffer,
+        beta_raw: &DevBuffer,
+        dt_bias: &DevBuffer,
+        a_scale: &DevBuffer,
+        batch: usize,
+        n_steps: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        d_conv: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_steps == 0 || d_state == 0 || d_state > 1024 {
+            return Err(ForgeError::Kernel(
+                "segmentowane przygotowanie DeltaNet wymaga B,T,d_state > 0".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("deltanet_prepare_segmented_f16")?;
+        let config = LaunchConfig {
+            grid: ((n_k_heads + n_v_heads) as u32, batch as u32, 1),
+            block: (d_state.max(32) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(q_out)
+            .buf(k_out)
+            .buf(v_out)
+            .buf(g_out)
+            .buf(beta_out)
+            .buf(conv_checkpoints)
+            .buf(conv_initial)
+            .buf(qkv_mixed)
+            .buf(conv_weight)
+            .buf(alpha_raw)
+            .buf(beta_raw)
+            .buf(dt_bias)
+            .buf(a_scale)
+            .scalar(n_steps as i64)
+            .scalar(n_k_heads as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64)
+            .scalar(d_conv as i64)
+            .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Skanuje niezależne stany D128 dla segmentów `[B,T]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_scan_segmented_d128_f16(
+        &self,
+        output: &DevBuffer,
+        checkpoints: &DevBuffer,
+        states: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        batch: usize,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_steps == 0 || d_state != 128 {
+            return Err(ForgeError::Kernel(
+                "segmentowany skan DeltaNet wymaga B,T > 0 i d_state=128".into(),
+            ));
+        }
+        let tile_width = 64usize.min(self.device.caps().max_threads_per_block as usize);
+        let grid_x = n_v_heads.checked_mul(d_state.div_ceil(tile_width)).ok_or_else(|| {
+            ForgeError::Kernel("przepełnienie siatki segmentowanego skanu DeltaNet".into())
+        })?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_gated_scan_segmented_d128_f16")?;
+        let config = LaunchConfig {
+            grid: (grid_x as u32, batch as u32, 1),
+            block: (tile_width as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(checkpoints)
+            .buf(states)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(n_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Skanuje segmenty D128, utrzymując stan warstwy w pamięci współdzielonej.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_scan_segmented_shared_d128_f16(
+        &self,
+        output: &DevBuffer,
+        states: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        batch: usize,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_steps == 0 || d_state != 128 {
+            return Err(ForgeError::Kernel(
+                "współdzielony skan segmentowany wymaga B,T > 0 i d_state=128".into(),
+            ));
+        }
+        let grid_x = n_v_heads.checked_mul(2).ok_or_else(|| {
+            ForgeError::Kernel("przepełnienie siatki współdzielonego skanu".into())
+        })?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_gated_scan_segmented_shared_d128_f16")?;
+        let config = LaunchConfig {
+            grid: (grid_x as u32, batch as u32, 1),
+            block: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(states)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(n_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Odtwarza wybrany prefiks segmentu bez pośrednich checkpointów w VRAM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_commit_recompute_segmented_shared_d128_f32(
+        &self,
+        states: &DevBuffer,
+        initial_states: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        decisions: &DevBuffer,
+        batch: usize,
+        max_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || max_steps == 0 || d_state != 128 {
+            return Err(ForgeError::Kernel(
+                "commit segmentowany wymaga B,T > 0 i d_state=128".into(),
+            ));
+        }
+        let grid_x = n_v_heads
+            .checked_mul(2)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie siatki commitu DeltaNet".into()))?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_commit_recompute_segmented_shared_d128_f32")?;
+        let config = LaunchConfig {
+            grid: (grid_x as u32, batch as u32, 1),
+            block: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(states)
+            .buf(initial_states)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .buf(decisions)
+            .scalar(max_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Zatwierdza po jednej decyzji segmentowej dla każdego lane DeltaNet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_commit_checkpoint_segmented_f32(
+        &self,
+        states: &DevBuffer,
+        checkpoints: &DevBuffer,
+        decisions: &DevBuffer,
+        batch: usize,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let state_elements = n_v_heads
+            .checked_mul(d_state)
+            .and_then(|value| value.checked_mul(d_state))
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie stanu DeltaNet".into()))?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_commit_checkpoint_segmented_f32")?;
+        let config = LaunchConfig {
+            grid: ((state_elements as u32).div_ceil(BLOCK), batch as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(states)
+            .buf(checkpoints)
+            .buf(decisions)
+            .scalar(state_elements as i64)
+            .scalar(n_steps as i64);
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -3100,6 +3405,108 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Zapisuje K/V dla spłaszczonych segmentów sequence-major `[B,T]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append_batch_segmented_f16(
+        &self,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        k_in: &DevBuffer,
+        v_in: &DevBuffer,
+        page_tables: &DevBuffer,
+        base_positions: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        max_pages: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_tokens == 0 {
+            return Err(ForgeError::Kernel(
+                "segmentowany append KV wymaga B>0 i T>0".into(),
+            ));
+        }
+        let total = batch.checked_mul(n_tokens).ok_or_else(|| {
+            ForgeError::Kernel("przepełnienie liczby tokenów append KV".into())
+        })?;
+        let kernel = self.artifacts.get("kv_append_batch_segmented_f16")?;
+        let config = LaunchConfig {
+            grid: (total as u32, n_kv_heads as u32, 1),
+            block: ((head_dim as u32).clamp(32, 256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(k_in)
+            .buf(v_in)
+            .buf(page_tables)
+            .buf(base_positions)
+            .scalar(n_tokens as i64)
+            .scalar(max_pages as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(head_dim as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Uruchamia przenośną atencję verifiera dla `[B,T]` i osobnych tablic KV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_verify_segmented_f16_hd256(
+        &self,
+        output: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_tables: &DevBuffer,
+        visible_lens: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        max_pages: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_tokens == 0 {
+            return Err(ForgeError::Kernel(
+                "segmentowana atencja verifiera wymaga B>0 i T>0".into(),
+            ));
+        }
+        let total = batch.checked_mul(n_tokens).ok_or_else(|| {
+            ForgeError::Kernel("przepełnienie liczby tokenów atencji".into())
+        })?;
+        let caps = self.device.caps();
+        let warp32 = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        let kernel = self.artifacts.get(if warp32 {
+            "attn_verify_segmented_f16_hd256_warp32"
+        } else {
+            "attn_verify_segmented_f16_hd256"
+        })?;
+        let config = LaunchConfig {
+            grid: (total as u32, n_q_heads as u32, 1),
+            block: (if warp32 { 32 } else { 256 }, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_tables)
+            .buf(visible_lens)
+            .scalar(n_tokens as i64)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(max_pages as i64)
+            .scalar(scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Causal prefill attention over the paged cache. Query token t attends
     /// positions 0..base_pos+t, whose K/V must already be appended.
     /// `kv_dtype` selects the cache element type; the fp8 variant widens
@@ -3429,9 +3836,9 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if rows == 0 || !cols.is_multiple_of(32) || !matches!(n_tokens, 3 | 4) {
+        if rows == 0 || !cols.is_multiple_of(32) || !(3..=8).contains(&n_tokens) {
             return Err(ForgeError::Kernel(format!(
-                "gemm_q8_0_f16_exact_out_f32 wymaga rows > 0, cols % 32 == 0 i T=3/4, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
+                "gemm_q8_0_f16_exact_out_f32 wymaga rows > 0, cols % 32 == 0 i T=3..8, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
             )));
         }
         let output_bytes =
@@ -3468,6 +3875,7 @@ impl Kernels {
         let kernel_name = match n_tokens {
             3 => "gemm_q8_0_f16_exact_out_f32_b3",
             4 => "gemm_q8_0_f16_exact_out_f32_b4",
+            5..=8 => "gemm_q8_0_f16_exact_out_f32_b8",
             _ => unreachable!(),
         };
         let kernel = self.artifacts.get(kernel_name)?;
@@ -3788,7 +4196,10 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
-        if kernel_base == "gemm_q8_0_i8mma" && (2..=4).contains(&n_tokens) {
+        if kernel_base == "gemm_q8_0_i8mma"
+            && (2..=8).contains(&n_tokens)
+            && (!output_f32 || n_tokens >= 3)
+        {
             let caps = self.device.caps();
             let nvidia_dp4a = matches!(caps.vendor, forge_types::Vendor::Nvidia)
                 && caps.warp_size == 32
@@ -3811,6 +4222,7 @@ impl Kernels {
                 (true, 4) if nvidia_dp4a => "gemm_q8_0_dp4a_out_f32_b4_nvidia",
                 (false, 3) => "gemm_q8_0_i8mma_b3",
                 (false, 4) => "gemm_q8_0_i8mma_b4",
+                (false, 5..=8) => "gemm_q8_0_i8mma_b8",
                 (true, 3) => "gemm_q8_0_i8mma_out_f32_b3",
                 (true, 4) => "gemm_q8_0_i8mma_out_f32_b4",
                 _ => unreachable!(),
@@ -10929,8 +11341,8 @@ mod nvfp4_gguf_dispatch_tests {
             (2, "gemm_nvfp4_gguf_f16_b2", 32),
             (3, "gemm_nvfp4_gguf_f16_b3_nvidia", 64),
             (4, "gemm_nvfp4_gguf_f16_b4_nvidia", 64),
-            (5, "gemm_nvfp4_gguf_f16_b8", 256),
-            (8, "gemm_nvfp4_gguf_f16_b8", 256),
+            (5, "gemm_nvfp4_gguf_f16_b8_nvidia", 64),
+            (8, "gemm_nvfp4_gguf_f16_b8_nvidia", 64),
             (9, "gemm_nvfp4_gguf_f16_b16", 512),
             (16, "gemm_nvfp4_gguf_f16_b16", 512),
         ] {
@@ -10949,6 +11361,10 @@ mod nvfp4_gguf_dispatch_tests {
         assert_eq!(
             nvfp4_gguf_dispatch(4, 5120, false, 64, 1024).unwrap().kernel,
             "gemm_nvfp4_gguf_f16_b4"
+        );
+        assert_eq!(
+            nvfp4_gguf_dispatch(8, 5120, false, 64, 1024).unwrap().kernel,
+            "gemm_nvfp4_gguf_f16_b8"
         );
     }
 

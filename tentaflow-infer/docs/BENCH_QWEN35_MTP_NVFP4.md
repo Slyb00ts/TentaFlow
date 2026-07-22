@@ -28,18 +28,94 @@ zawiera ich dedykowanych odpowiedników. MTP generuje draft K=2 albo K=3 na GPU.
 Target weryfikuje draft blokowo, wykonuje batched argmax i zatwierdza KV oraz
 stan hybrydowego DeltaNet.
 
-Końcowy wariant retained przechowuje checkpoint stanu dla każdej warstwy
-DeltaNet podczas pierwszego skanu. Commit wybiera już obliczony stan odpowiadający
-zaakceptowanemu prefiksowi, zamiast uruchamiać drugi skan 48 warstw. Decyzja o
-długości zaakceptowanego prefiksu, wybór wiersza korekcyjnego i commit stanu
-verifiera należą do trwałego grafu GPU. CPU uruchamia cykl, synchronizuje jego
-wynik i odczytuje dwa słowa sterujące; obliczenia modelu i sampling greedy są na
-GPU.
+Aktualny wariant B2 wykonuje dwa greedy-exact requesty o tym samym K we wspólnym
+cyklu. KV, atencja, DeltaNet, decyzje acceptance/correction i commit mają
+segmentowane bufory per lane. DeltaNet przechowuje wspólny stan potrzebny przez
+forward i odtwarza zaakceptowany stan podczas commit, zamiast utrzymywać komplet
+checkpointów wszystkich kroków. Usunęło to około 1,125 GiB scratchu. CPU nadal
+uruchamia cykl i odczytuje wynik sterujący, natomiast obliczenia modelu i sampling
+greedy pozostają na GPU.
 
 `--speculative mtp` ustawia maksymalny budżet K=3 i adaptacyjnie porównuje tempo
 K=2 oraz K=3. Dostępne są też jawne `mtp:2` i `mtp:3`. Każda próba benchmarku
 porównuje pełną sekwencję tokenów z sekwencyjnym greedy i przerywa się przy
 różnicy.
+
+## Aktualny wynik MTP B2 (2026-07-22)
+
+Ta sekcja zastępuje starsze punkty kontrolne wydajności poniżej. Scheduler
+grupuje requesty według wybranego budżetu i paruje wyłącznie lane'y z tym samym
+K=2 albo K=3. Różne K, niepełna para, `mtp+ngram`, tiering, brak device-side
+embeddingu lub niespełniony kontrakt kerneli przechodzą na seryjne MTP B1.
+Sampling inny niż greedy-exact przechodzi poza natywną ścieżką MTP. Zmienna
+`FORGE_NATIVE_MTP_B2` jest ścisłym kill-switchem: brak wartości lub `1` włącza
+B2, `0` wymusza B1, a każda inna wartość zatrzymuje start z błędem.
+
+Pomiary RTX 4090 obejmują dwa identyczne requesty, 128 tokenów wyjścia i pięć
+powtórzeń. Każdy poprawny przebieg zachował pełną zgodność ID obu lane'ów z
+seryjnym greedy. `ON` oznacza adaptacyjne K=2/K=3 po włączeniu warp32 attention;
+`OFF` jest stabilną pięciopomiarową kontrolą B1 z tej samej serii.
+
+| Prompt | B2 ON, mediana (zakres) | B2 OFF, mediana (zakres) | Zmiana mediany |
+|---|---:|---:|---:|
+| raw128 | **137,40** (98,14-137,51) tok/s | 101,97 (97,12-102,06) tok/s | **+34,75%** |
+| raw512 | **97,78** (97,53-98,15) tok/s | 76,38 (76,35-76,48) tok/s | **+28,02%** |
+
+W czterech szybkich próbach raw128 wykonano 68 verifier forwardów i zaakceptowano
+188 tokenów; wolniejsza próba zmieniła reżim schedulera na 74/181, ale zachowała
+te same ID. Raw512 był stabilny: 90 forwardów i 170 zaakceptowanych tokenów w
+każdym przebiegu.
+
+Kontrola stałego K=3, także pięć powtórzeń i pełna parity:
+
+| Prompt | Mediana | Zakres | Verifier forwardy B2 |
+|---|---:|---:|---:|
+| raw128 | **136,97 tok/s** | 136,90-137,01 | 34 |
+| raw512 | **94,34 tok/s** | 94,25-94,41 | 46 |
+
+Artefakty pomiarów: `/tmp/mtp-b2-attn-adaptive-raw128.log`,
+`/tmp/mtp-b2-attn-adaptive-raw512.log`, `/tmp/mtp-b2-five-raw128-off.log` i
+`/tmp/mtp-b2-five-raw512-off.log`.
+
+### Profil po warp32 attention
+
+Na NVIDIA jedna warp32 obsługuje query/head segmentowanej atencji; przenośny
+wariant CTA pozostaje dla pozostałych urządzeń. Mikrobenchmark B2 T4, Q24/KV4,
+head_dim=256 skrócił attention z 112,319 do 52,799 us dla ctx128, z 441,683 do
+203,944 us dla ctx512 i z 1609,602 do 743,132 us dla ctx2048. Maksymalna różnica
+wyniku syntetycznego wyniosła zero.
+
+Profil raw512 zawierał 90 cykli B2 i 206 178 uruchomień kerneli. Największe
+pozycje GPU na cykl: projekcje NVFP4 B8 25,181 ms, draft head Q8 8,668 ms,
+segmentowana atencja warp32 5,664 ms, Q8 B8 5,379 ms, DeltaNet forward 2,393 ms,
+exact logits 2,176 ms i commit DeltaNet 1,296 ms. Po stronie runtime dominowało
+249 `cuCtxSynchronize` (10,304 s), 206 178 `cuLaunchKernel` (2,131 s) oraz 1422
+`cuMemcpyHtoD_v2` (2,007 s). Dekodowanie nadal wykonuje dwa
+`cuCtxSynchronize` na cykl B2. Artefakty: `/tmp/mtp-b2-warp-attn-raw512.nsys-rep`
+i `/tmp/mtp-b2-warp-attn-raw512.sqlite`.
+
+### Ograniczenia i odrzucone eksperymenty
+
+Pozostały narzut CPU to pobranie draft ID, budowa pozycji/widoczności/stron
+verifiera oraz hostowy gather embeddingu targetu i H2D. Jednorundowe GPU
+pack/gather nie jest zaimplementowane. Strony przypięte przez cache prefiksu są
+konserwatywnie liczone przez admission i mogą opóźnić przyjęcie requestu mimo
+fizycznego współdzielenia. Pełny builder blokuje obecnie FP8 wymagające PTX ISA
+8.4, ponieważ Mojo emituje PTX 8.1; izolowany AOT badanych kerneli działa.
+
+Próba skierowania B8 do istniejącego BM32 obniżyła raw512 z 82,13 do 38,66
+tok/s. Dedykowane warianty M8 MMA m16, BN64/BN128 również były wolniejsze od B8,
+więc eksperyment usunięto i nie jest częścią dispatchu.
+
+### llama.cpp B2: wynik diagnostyczny, nie baseline
+
+Harness llama.cpp raportował mediany pure MTP 197,37 tok/s dla raw128 i 131,15
+tok/s dla raw512 oraz MTP+n-gram 228,99 i 138,97 tok/s. Wyniki nie przeszły
+jednak bramki correctness: tylko **5 z 24** wyjść lane'ów zgadzało się z oracle
+`np1`. Zgodność lane0 z lane1 nie zastępuje zgodności z `np1`, dlatego tych
+liczb nie wolno traktować jako porównania wydajności. Dane diagnostyczne:
+`/tmp/llama-mtp-b2-results.json`, `/tmp/llama-nospec-np1.json` i
+`/tmp/llama-mtp-np1-oracle.json`.
 
 ## Wyniki retained
 
@@ -94,8 +170,8 @@ wydajności równy zero.
 ## Ograniczenia
 
 - Tylko greedy-exact: `temperature=0`, sampling GPU i brak repetition penalty.
-- Domyślne `max_active=1` ogranicza pulę; większa jawna wartość przechodzi startup
-  preflight. Verifier przechwytuje osobne grafy T=3/T=4 dla każdego slotu.
+- Większe `max_active` przechodzi startup preflight. Native MTP B2 paruje po dwa
+  zgodne sloty, a pozostałe sekwencje wykonuje seryjnie.
 - Budżet natywnego MTP wynosi wyłącznie K=2 lub K=3.
 - CUDA jest jedynym backendem sprawdzonym wykonawczo dla tego etapu.
 - EAGLE, DFlash, DSpark, draft-model, n-gram jako rozszerzenie natywnego MTP,
@@ -142,9 +218,9 @@ warmup każdego slotu i jawne `FORGE_HYBRID_PREFILL_CHUNK=128`.
 | 2 | 41,79 tok/s | 39,24 tok/s | 398,92 ms | 48,23 ms |
 
 B2 zwiększa aggregate completion throughput o 9,1% i end-to-end o 8,5%.
-Native MTP nie korzysta jeszcze z tego pionu: zmienne K i długość zaakceptowanego
-prefiksu wymagają batchowego draftu oraz verifiera `[B,T]` z osobnym stanem per
-slot.
+Native MTP korzysta z osobnego pionu B2 opisanego wyżej: scheduler paruje tylko
+sekwencje z tym samym K, a segmentowany verifier `[B,T]` zachowuje osobny stan
+per slot.
 Każda zmiana musi zachować porównanie token po tokenie z sekwencyjnym greedy.
 
 ## Parowanie B2 dla B3/B4
@@ -162,8 +238,9 @@ sekwencję. Wszystkie lane'y zachowały pełną zgodność ID z seryjnym oracle.
 | B4 | 37,90 tok/s | 41,32 tok/s | +9,01% |
 
 Test E2E obejmuje także różne parametry samplingu per lane oraz anulowanie
-środkowej sekwencji i ponowne użycie zwolnionego slotu. Natywne MTP nadal
-wykonuje lane'y seryjnie i nie korzysta z tego parowania.
+środkowej sekwencji i ponowne użycie zwolnionego slotu. Natywne MTP ma odrębne
+parowanie same-K B2; nie korzysta z pionu targetu niespekulacyjnego opisanego w
+tej sekcji.
 
 ## Szybka ścieżka NVFP4 B3/B4 na NVIDIA
 

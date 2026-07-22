@@ -69,6 +69,36 @@ def kv_append_batch_device_pos_f16(
     )
 
 
+def kv_append_batch_segmented_f16(
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    base_positions: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    max_pages: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    head_dim: Int,
+):
+    """Zapisuje spłaszczone `[B,T]` do osobnych tablic stron każdego lane."""
+    token = Int(block_idx.x)
+    kvh = Int(block_idx.y)
+    lane = token // n_tokens
+    local_token = token % n_tokens
+    pos = Int(base_positions[lane]) + local_token
+    page = Int(page_tables[lane * max_pages + pos // page_size])
+    slot = pos % page_size
+    dst = ((page * n_kv_heads + kvh) * page_size + slot) * head_dim
+    src = (token * n_kv_heads + kvh) * head_dim
+    var element = Int(thread_idx.x)
+    while element < head_dim:
+        k_cache[dst + element] = k_in[src + element]
+        v_cache[dst + element] = v_in[src + element]
+        element += Int(block_dim.x)
+
+
 comptime QT = 16  # query tokens per block
 comptime PT = WARP_SIZE  # cached positions per smem tile (one lane per position)
 comptime QPW = QT // MAX_WARPS  # queries owned by one warp

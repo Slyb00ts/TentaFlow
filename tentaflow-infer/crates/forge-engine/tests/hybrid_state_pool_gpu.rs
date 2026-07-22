@@ -83,7 +83,12 @@ struct MtpLane {
     tokens: Vec<u32>,
 }
 
-fn advance_mtp(model: &mut Model, lane: &mut MtpLane, target: usize) -> TestResult<()> {
+fn advance_mtp_budget(
+    model: &mut Model,
+    lane: &mut MtpLane,
+    target: usize,
+    budget: usize,
+) -> TestResult<()> {
     if lane.tokens.len() >= target {
         return Ok(());
     }
@@ -91,7 +96,8 @@ fn advance_mtp(model: &mut Model, lane: &mut MtpLane, target: usize) -> TestResu
     if lane.tokens.len() >= target {
         return Ok(());
     }
-    let (draft, accepted, correction) = model.native_mtp_step(&mut lane.seq, lane.next, 3)?;
+    let (draft, accepted, correction) =
+        model.native_mtp_step(&mut lane.seq, lane.next, budget)?;
     for &token in &draft[..accepted] {
         if lane.tokens.len() < target {
             lane.tokens.push(token);
@@ -102,6 +108,15 @@ fn advance_mtp(model: &mut Model, lane: &mut MtpLane, target: usize) -> TestResu
 }
 
 fn generate_mtp(model: &mut Model, prompt: &[u32], target: usize) -> TestResult<Vec<u32>> {
+    generate_mtp_budget(model, prompt, target, 3)
+}
+
+fn generate_mtp_budget(
+    model: &mut Model,
+    prompt: &[u32],
+    target: usize,
+    budget: usize,
+) -> TestResult<Vec<u32>> {
     let (seq, _, next) = prepare(model, prompt)?;
     let mut lane = MtpLane {
         seq,
@@ -109,10 +124,99 @@ fn generate_mtp(model: &mut Model, prompt: &[u32], target: usize) -> TestResult<
         tokens: Vec::with_capacity(target),
     };
     while lane.tokens.len() < target {
-        advance_mtp(model, &mut lane, target)?;
+        advance_mtp_budget(model, &mut lane, target, budget)?;
     }
     model.release_seq(&mut lane.seq);
     Ok(lane.tokens)
+}
+
+fn run_native_mtp_b2_full_id_parity(path: &Path) -> TestResult<()> {
+    let Some(mut model) = load_model(path, true) else {
+        return Ok(());
+    };
+    model.preflight_hybrid_state_slots(2)?;
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let prompts = [prompt(vocab, 613, 8), prompt(vocab, 829, 8)];
+
+    for budget in [2, 3] {
+        let expected = [
+            generate_mtp_budget(&mut model, &prompts[0], STEPS, budget)?,
+            generate_mtp_budget(&mut model, &prompts[1], STEPS, budget)?,
+        ];
+        let (first_seq, _, first_next) = prepare(&mut model, &prompts[0])?;
+        let (second_seq, _, second_next) = prepare(&mut model, &prompts[1])?;
+        let mut lanes = [
+            MtpLane {
+                seq: first_seq,
+                next: first_next,
+                tokens: Vec::with_capacity(STEPS),
+            },
+            MtpLane {
+                seq: second_seq,
+                next: second_next,
+                tokens: Vec::with_capacity(STEPS),
+            },
+        ];
+        while lanes.iter().any(|lane| lane.tokens.len() < STEPS) {
+            for lane in &mut lanes {
+                if lane.tokens.len() < STEPS {
+                    lane.tokens.push(lane.next);
+                }
+            }
+            if lanes.iter().all(|lane| lane.tokens.len() >= STEPS) {
+                break;
+            }
+            let fed = [lanes[0].next, lanes[1].next];
+            let (first, second) = lanes.split_at_mut(1);
+            let decisions = model.native_mtp_step_b2(
+                &mut [&mut first[0].seq, &mut second[0].seq],
+                fed,
+                budget,
+            )?;
+            for (lane, (draft, accepted, correction)) in lanes.iter_mut().zip(decisions) {
+                for token in draft.into_iter().take(accepted) {
+                    if lane.tokens.len() < STEPS {
+                        lane.tokens.push(token);
+                    }
+                }
+                lane.next = correction;
+            }
+        }
+        assert_eq!(lanes[0].tokens, expected[0], "pełne ID MTP B2 lane0 K={budget}");
+        assert_eq!(lanes[1].tokens, expected[1], "pełne ID MTP B2 lane1 K={budget}");
+        model.release_seq(&mut lanes[0].seq);
+        model.release_seq(&mut lanes[1].seq);
+    }
+    Ok(())
+}
+
+fn run_mtp_grouped_proposer_parity(path: &Path) -> TestResult<()> {
+    let Some(mut model) = load_model(path, true) else {
+        return Ok(());
+    };
+    model.preflight_hybrid_state_slots(2)?;
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let (mut first, _, first_next) = prepare(&mut model, &prompt(vocab, 401, 8))?;
+    let (mut second, _, second_next) = prepare(&mut model, &prompt(vocab, 557, 8))?;
+
+    for budget in [2, 3] {
+        let before_first = model.debug_mtp_state_snapshot(&first)?;
+        let before_second = model.debug_mtp_state_snapshot(&second)?;
+        let expected_first = model.mtp_propose_k(&mut first, first_next, budget)?;
+        let expected_second = model.mtp_propose_k(&mut second, second_next, budget)?;
+        let actual = model.mtp_propose_k_b2(
+            &mut [&mut first, &mut second],
+            [first_next, second_next],
+            budget,
+        )?;
+        assert_eq!(actual[0], expected_first, "draft MTP B2 lane0 K={budget}");
+        assert_eq!(actual[1], expected_second, "draft MTP B2 lane1 K={budget}");
+        assert_eq!(model.debug_mtp_state_snapshot(&first)?, before_first);
+        assert_eq!(model.debug_mtp_state_snapshot(&second)?, before_second);
+    }
+    model.release_seq(&mut first);
+    model.release_seq(&mut second);
+    Ok(())
 }
 
 struct ComboLane {
@@ -237,7 +341,7 @@ fn load_model_sized_with_tier(
             return None;
         }
     };
-    let activations = if native_mtp { 9usize << 27 } else { 1usize << 30 };
+    let activations = if native_mtp { 3usize << 29 } else { 1usize << 30 };
     let kv_cache = 256usize << 20;
     let reserve = 512usize << 20;
     let Some(weights) = free.checked_sub(activations + kv_cache + reserve) else {
@@ -834,6 +938,220 @@ fn measure_server(
     Ok(measurement)
 }
 
+fn read_raw_token_ids(path: &Path) -> TestResult<Vec<u32>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err("plik raw tokenów musi zawierać niepusty ciąg u32le".into());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunk ma cztery bajty")))
+        .collect())
+}
+
+fn collect_pair_events(
+    receivers: [Receiver<EngineEvent>; 2],
+) -> TestResult<([Vec<u32>; 2], Instant, Instant)> {
+    let mut outputs = [Vec::new(), Vec::new()];
+    let mut done = [false, false];
+    let mut first_token_at = None;
+    while done.iter().any(|&finished| !finished) {
+        let mut progressed = false;
+        for lane in 0..2 {
+            if done[lane] {
+                continue;
+            }
+            match receivers[lane].try_recv() {
+                Ok(EngineEvent::Token { id, .. }) => {
+                    first_token_at.get_or_insert_with(Instant::now);
+                    outputs[lane].push(id);
+                    progressed = true;
+                }
+                Ok(EngineEvent::Done { tokens, .. }) => {
+                    assert_eq!(outputs[lane].len(), tokens);
+                    done[lane] = true;
+                    progressed = true;
+                }
+                Ok(EngineEvent::Error(error)) => return Err(error.into()),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err("kanał benchmarku zamknięty przed Done".into());
+                }
+            }
+        }
+        if !progressed {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+    Ok((
+        outputs,
+        first_token_at.ok_or("benchmark nie zwrócił tokenu")?,
+        Instant::now(),
+    ))
+}
+
+fn run_exact_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult<()> {
+    const OUTPUT_TOKENS: usize = 128;
+    let reps = std::env::var("FORGE_BENCH_REPS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(3);
+    if reps == 0 {
+        return Err("FORGE_BENCH_REPS musi być większe od zera".into());
+    }
+    let prompt = read_raw_token_ids(prompt_path)?;
+    let max_seq_len = prompt.len() + OUTPUT_TOKENS + 32;
+    let kv_pages = 2 * max_seq_len.div_ceil(32) + 4;
+    let Some(model) = load_model_sized(path, true, max_seq_len, kv_pages) else {
+        return Err("macierz MTP B2 wymaga dostępnego CUDA".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(path)?),
+        2,
+        32,
+        12,
+        SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?,
+    )?;
+    for rep in 0..=reps {
+        let metrics = engine.metrics();
+        let generated_before = metrics.generated_tokens_total.load(Ordering::Relaxed);
+        let forwards_before = metrics.spec_forwards_total.load(Ordering::Relaxed);
+        let accepted_before = metrics.spec_accepted_total.load(Ordering::Relaxed);
+        let ttft_before = metrics.ttft_seconds.snapshot();
+        let itl_before = metrics.inter_token_seconds.snapshot();
+        let started = Instant::now();
+        let receivers = [
+            engine.submit(server_request(prompt.clone(), OUTPUT_TOKENS))?,
+            engine.submit(server_request(prompt.clone(), OUTPUT_TOKENS))?,
+        ];
+        let (outputs, first_token_at, finished) = collect_pair_events(receivers)?;
+        let elapsed = finished.duration_since(started).as_secs_f64();
+        let completion_elapsed = finished.duration_since(first_token_at).as_secs_f64();
+        assert_eq!(outputs[0], outputs[1], "identyczne lane'y zwróciły różne ID");
+        assert_eq!(outputs[0].len(), OUTPUT_TOKENS);
+        let generated = metrics
+            .generated_tokens_total
+            .load(Ordering::Relaxed)
+            .saturating_sub(generated_before);
+        let forwards = metrics
+            .spec_forwards_total
+            .load(Ordering::Relaxed)
+            .saturating_sub(forwards_before);
+        let accepted = metrics
+            .spec_accepted_total
+            .load(Ordering::Relaxed)
+            .saturating_sub(accepted_before);
+        let ttft = metrics.ttft_seconds.snapshot();
+        let itl = metrics.inter_token_seconds.snapshot();
+        let ttft_count = ttft.count.saturating_sub(ttft_before.count);
+        let itl_count = itl.count.saturating_sub(itl_before.count);
+        println!(
+            "exact MTP B2 {} {}/{} raw={} generated={} aggregate_completion={:.2} tok/s aggregate_e2e={:.2} tok/s TTFT={:.2} ms effective_ITL={:.2} ms forwards={} accepted={} accepted/forward={:.3} IDs={:?}",
+            if rep == 0 { "warmup" } else { "rep" },
+            if rep == 0 { 1 } else { rep },
+            if rep == 0 { 1 } else { reps },
+            prompt.len(),
+            generated,
+            generated.saturating_sub(1) as f64 / completion_elapsed,
+            generated as f64 / elapsed,
+            (ttft.sum - ttft_before.sum) * 1e3 / ttft_count.max(1) as f64,
+            (itl.sum - itl_before.sum) * 1e3 / itl_count.max(1) as f64,
+            forwards,
+            accepted,
+            accepted as f64 / forwards.max(1) as f64,
+            outputs[0],
+        );
+    }
+    engine.shutdown()?;
+    Ok(())
+}
+
+fn run_fixed_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult<()> {
+    const OUTPUT_TOKENS: usize = 128;
+    let reps = std::env::var("FORGE_BENCH_REPS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(3);
+    let budget = std::env::var("FORGE_BENCH_FIXED_K")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(3);
+    if reps == 0 || !matches!(budget, 2 | 3) {
+        return Err("stały benchmark wymaga reps>0 i K=2 lub K=3".into());
+    }
+    let prompt = read_raw_token_ids(prompt_path)?;
+    let max_seq_len = prompt.len() + OUTPUT_TOKENS + 32;
+    let kv_pages = 2 * max_seq_len.div_ceil(32) + 4;
+    let Some(mut model) = load_model_sized(path, true, max_seq_len, kv_pages) else {
+        return Err("stały benchmark MTP B2 wymaga dostępnego CUDA".into());
+    };
+    model.preflight_hybrid_state_slots(2)?;
+    for rep in 0..=reps {
+        let (first_seq, _, first_next) = prepare(&mut model, &prompt)?;
+        let (second_seq, _, second_next) = prepare(&mut model, &prompt)?;
+        let mut lanes = [
+            MtpLane {
+                seq: first_seq,
+                next: first_next,
+                tokens: Vec::with_capacity(OUTPUT_TOKENS),
+            },
+            MtpLane {
+                seq: second_seq,
+                next: second_next,
+                tokens: Vec::with_capacity(OUTPUT_TOKENS),
+            },
+        ];
+        let started = Instant::now();
+        let mut forwards = 0usize;
+        while lanes[0].tokens.len() < OUTPUT_TOKENS {
+            for lane in &mut lanes {
+                lane.tokens.push(lane.next);
+            }
+            if lanes[0].tokens.len() >= OUTPUT_TOKENS {
+                break;
+            }
+            let [first, second] = &mut lanes;
+            let results = model.native_mtp_step_b2(
+                &mut [&mut first.seq, &mut second.seq],
+                [first.next, second.next],
+                budget,
+            )?;
+            forwards += 1;
+            for (lane, (draft, accepted, correction)) in
+                lanes.iter_mut().zip(results)
+            {
+                for token in draft.into_iter().take(accepted) {
+                    if lane.tokens.len() < OUTPUT_TOKENS {
+                        lane.tokens.push(token);
+                    }
+                }
+                lane.next = correction;
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        assert_eq!(lanes[0].tokens, lanes[1].tokens);
+        println!(
+            "fixed MTP B2 {} {}/{} raw={} K={} generated={} completion={:.2} tok/s forwards={} IDs={:?}",
+            if rep == 0 { "warmup" } else { "rep" },
+            if rep == 0 { 1 } else { rep },
+            if rep == 0 { 1 } else { reps },
+            prompt.len(),
+            budget,
+            2 * OUTPUT_TOKENS,
+            (2 * OUTPUT_TOKENS) as f64 / elapsed,
+            forwards,
+            lanes[0].tokens,
+        );
+        model.release_seq(&mut lanes[0].seq);
+        model.release_seq(&mut lanes[1].seq);
+    }
+    Ok(())
+}
+
 fn measure_serial_round_robin(path: &Path, width: usize) -> TestResult<f64> {
     const BENCH_TOKENS: usize = 128;
     let kv_pages = width * (8 + BENCH_TOKENS).div_ceil(32) + 2;
@@ -980,8 +1298,8 @@ fn cuda_mtp_i_mtp_ngram_izoluja_przeplatane_sekwencje() -> TestResult<()> {
         tokens: Vec::with_capacity(STEPS),
     };
     while first.tokens.len() < STEPS || second.tokens.len() < STEPS {
-        advance_mtp(&mut model, &mut first, STEPS)?;
-        advance_mtp(&mut model, &mut second, STEPS)?;
+        advance_mtp_budget(&mut model, &mut first, STEPS, 3)?;
+        advance_mtp_budget(&mut model, &mut second, STEPS, 3)?;
     }
     model.release_seq(&mut first.seq);
     model.release_seq(&mut second.seq);
@@ -1035,6 +1353,19 @@ fn cuda_mtp_i_mtp_ngram_izoluja_przeplatane_sekwencje() -> TestResult<()> {
 }
 
 #[test]
+fn native_mtp_b2_zachowuje_pelne_id_dla_k2_i_k3() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E MTP B2: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_native_mtp_b2_full_id_parity(&path)
+}
+
+#[test]
 fn server_continuous_admission_mtp_i_router_obsluguje_concurrency_dwa() -> TestResult<()> {
     let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
         eprintln!("pominięto E2E serwera MTP: brak FORGE_TEST_HYBRID_GGUF");
@@ -1062,6 +1393,7 @@ fn server_hybrid_target_paruje_b3_i_b4_z_serialnym_ogonem() -> TestResult<()> {
     let _gpu_lock = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_mtp_grouped_proposer_parity(&path)?;
     run_model_batch_preflight_rollback(&path)?;
     run_server_hybrid_width(&path, 3)?;
     run_server_hybrid_width(&path, 4)?;
@@ -1128,6 +1460,42 @@ fn benchmark_server_mtp_max_active_jeden_kontra_dwa() -> TestResult<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn benchmark_exact_native_mtp_b2_dwa_identyczne_requesty() -> TestResult<()> {
+    if std::env::var_os("FORGE_BENCH_MTP_B2_MATRIX").is_none() {
+        eprintln!("pominięto dokładną macierz MTP B2: brak FORGE_BENCH_MTP_B2_MATRIX");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("macierz wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let prompt_path = std::env::var_os("FORGE_BENCH_PROMPT_IDS")
+        .map(PathBuf::from)
+        .ok_or("macierz wymaga FORGE_BENCH_PROMPT_IDS")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_exact_native_mtp_b2_matrix(&path, &prompt_path)
+}
+
+#[test]
+fn benchmark_stale_k_native_mtp_b2_dwa_identyczne_requesty() -> TestResult<()> {
+    if std::env::var_os("FORGE_BENCH_MTP_B2_FIXED").is_none() {
+        eprintln!("pominięto stały benchmark MTP B2: brak FORGE_BENCH_MTP_B2_FIXED");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("stały benchmark wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let prompt_path = std::env::var_os("FORGE_BENCH_PROMPT_IDS")
+        .map(PathBuf::from)
+        .ok_or("stały benchmark wymaga FORGE_BENCH_PROMPT_IDS")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_fixed_native_mtp_b2_matrix(&path, &prompt_path)
 }
 
 #[test]

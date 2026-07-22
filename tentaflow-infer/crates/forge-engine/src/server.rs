@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Instant;
+use std::time::Duration;
 
 use forge_tokenize::{StopMatcher, StreamDecoder, Tokenizer};
 use forge_types::{ForgeError, Result};
@@ -283,6 +284,16 @@ fn native_mtp_adaptive_budget(
     }
 }
 
+fn parse_native_mtp_b2(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_NATIVE_MTP_B2 wymaga wartości 0 lub 1, otrzymano {value:?}"
+        ))),
+    }
+}
+
 fn update_mtp_rate(rate: &mut Option<f64>, sample: f64) {
     *rate = Some(rate.map_or(sample, |previous| previous * 0.75 + sample * 0.25));
 }
@@ -410,6 +421,7 @@ pub fn spawn_engine_batched(
     batch_min: usize,
     spec: SpeculativeConfig,
 ) -> Result<EngineHandle> {
+    let native_mtp_b2 = parse_native_mtp_b2(std::env::var("FORGE_NATIVE_MTP_B2").ok().as_deref())?;
     let coordinator = SpeculationCoordinator::new(spec.clone())?;
     validate_speculation_server_config(spec.kind(), max_active, model.is_hybrid())?;
     if spec.is_enabled() {
@@ -465,6 +477,7 @@ pub fn spawn_engine_batched(
                 batch_min,
                 spec,
                 coordinator,
+                native_mtp_b2,
                 &worker_metrics,
             )
         })
@@ -486,6 +499,7 @@ fn worker<'t>(
     batch_min: usize,
     spec: SpeculativeConfig,
     coordinator: SpeculationCoordinator,
+    native_mtp_b2: bool,
     metrics: &EngineMetrics,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
@@ -723,7 +737,7 @@ fn worker<'t>(
                 a.dead = true;
             }
         }
-        batch_gpu_decode(model, &mut active, batch_min, metrics);
+        batch_gpu_decode(model, &mut active, batch_min, native_mtp_b2, metrics);
 
         // Tear down finished/dead sequences and release their pages (and any
         // tier chunks they spilled).
@@ -894,11 +908,13 @@ fn batch_gpu_decode(
     model: &mut Model,
     active: &mut [ActiveSeq<'_>],
     batch_min: usize,
+    native_mtp_b2: bool,
     metrics: &EngineMetrics,
 ) {
     // Phase 1: emit each ready sequence's pending token; collect the indices of
     // survivors that still need to be fed one more token.
     let mut feed_idx: Vec<usize> = Vec::new();
+    let mut mtp_idx: Vec<usize> = Vec::new();
     for (i, a) in active.iter_mut().enumerate() {
         if a.dead || !a.pending_prompt.is_empty() {
             continue;
@@ -924,7 +940,7 @@ fn batch_gpu_decode(
             Ok(StepOutcome::Continue) => {
                 match a.spec_kind {
                     SpeculationKind::HostProposer => speculative_step(model, a, metrics),
-                    SpeculationKind::NativeMtp => native_mtp_step(model, a, metrics),
+                    SpeculationKind::NativeMtp => mtp_idx.push(i),
                     SpeculationKind::NativeMtpNgram => {
                         native_mtp_ngram_step(model, a, metrics)
                     }
@@ -936,6 +952,13 @@ fn batch_gpu_decode(
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
             }
+        }
+    }
+    if native_mtp_b2 && !mtp_idx.is_empty() {
+        batch_native_mtp_decode(model, active, &mtp_idx, metrics);
+    } else {
+        for index in mtp_idx {
+            native_mtp_step(model, &mut active[index], metrics);
         }
     }
     if feed_idx.is_empty() {
@@ -973,6 +996,52 @@ fn batch_gpu_decode(
     }
 
     decode_gpu_group(model, active, &feed_idx);
+}
+
+fn batch_native_mtp_decode(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    mtp_idx: &[usize],
+    metrics: &EngineMetrics,
+) {
+    let mut by_budget = [Vec::new(), Vec::new()];
+    for &index in mtp_idx {
+        let a = &active[index];
+        let available = model.native_mtp_available_budget(&a.seq, a.spec_budget);
+        match native_mtp_adaptive_budget(
+            available,
+            a.spec_budget,
+            a.spec_forwards,
+            a.mtp_k2_rate,
+            a.mtp_k3_rate,
+        ) {
+            Some(2) => by_budget[0].push(index),
+            Some(3) => by_budget[1].push(index),
+            _ => serial_step(model, &mut active[index]),
+        }
+    }
+
+    for (slot, indices) in by_budget.iter().enumerate() {
+        let budget = slot + 2;
+        let mut pairs = indices.chunks_exact(2);
+        for pair in &mut pairs {
+            let first = pair[0];
+            let second = pair[1];
+            let capable = model.native_mtp_b2_capable(
+                [&active[first].seq, &active[second].seq],
+                budget,
+            );
+            if capable {
+                native_mtp_step_b2(model, active, [first, second], budget, metrics);
+            } else {
+                native_mtp_step(model, &mut active[first], metrics);
+                native_mtp_step(model, &mut active[second], metrics);
+            }
+        }
+        if let Some(&tail) = pairs.remainder().first() {
+            native_mtp_step(model, &mut active[tail], metrics);
+        }
+    }
 }
 
 fn decode_gpu_group(
@@ -1242,8 +1311,89 @@ fn native_mtp_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMet
             return;
         }
     };
+    finish_native_mtp_step(
+        a,
+        budget,
+        draft,
+        accepted,
+        correction,
+        started.elapsed(),
+        metrics,
+    );
+}
+
+fn native_mtp_step_b2(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    indices: [usize; 2],
+    budget: usize,
+    metrics: &EngineMetrics,
+) {
+    let [first_index, second_index] = indices;
+    let (left, right) = active.split_at_mut(second_index);
+    let first = &mut left[first_index];
+    let second = &mut right[0];
+    let fed = [
+        *first.generated.last().expect("emit_token dodał fed lane0"),
+        *second.generated.last().expect("emit_token dodał fed lane1"),
+    ];
+    let SeqSampler::Gpu(first_sampler) = &mut first.sampler else {
+        unreachable!("native MTP B2 wymaga samplera GPU")
+    };
+    first_sampler.note_token(fed[0]);
+    let SeqSampler::Gpu(second_sampler) = &mut second.sampler else {
+        unreachable!("native MTP B2 wymaga samplera GPU")
+    };
+    second_sampler.note_token(fed[1]);
+    let started = Instant::now();
+    let result = model.native_mtp_step_b2(
+        &mut [&mut first.seq, &mut second.seq],
+        fed,
+        budget,
+    );
+    let elapsed = started.elapsed();
+    let [first_result, second_result] = match result {
+        Ok(results) => results,
+        Err(error) => {
+            let message = error.to_string();
+            for a in [first, second] {
+                let _ = a.events.send(EngineEvent::Error(message.clone()));
+                a.dead = true;
+            }
+            return;
+        }
+    };
+    finish_native_mtp_step(
+        first,
+        budget,
+        first_result.0,
+        first_result.1,
+        first_result.2,
+        elapsed,
+        metrics,
+    );
+    finish_native_mtp_step(
+        second,
+        budget,
+        second_result.0,
+        second_result.1,
+        second_result.2,
+        elapsed,
+        metrics,
+    );
+}
+
+fn finish_native_mtp_step(
+    a: &mut ActiveSeq<'_>,
+    budget: usize,
+    draft: Vec<u32>,
+    accepted: usize,
+    correction: u32,
+    elapsed: Duration,
+    metrics: &EngineMetrics,
+) {
     if a.spec_forwards > 0 {
-        let rate = (accepted + 1) as f64 / started.elapsed().as_secs_f64();
+        let rate = (accepted + 1) as f64 / elapsed.as_secs_f64();
         if budget == 2 {
             update_mtp_rate(&mut a.mtp_k2_rate, rate);
         } else {
@@ -1371,10 +1521,19 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
 mod tests {
     use super::{
         AdmissionDisposition, first_actionable_index, native_mtp_adaptive_budget,
-        native_mtp_step_budget, request_speculation_kind, reservation_fits, update_mtp_rate,
-        validate_speculation_server_config,
+        native_mtp_step_budget, parse_native_mtp_b2, request_speculation_kind,
+        reservation_fits, update_mtp_rate, validate_speculation_server_config,
     };
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
+
+    #[test]
+    fn przelacznik_mtp_b2_wymaga_scislej_wartosci_logicznej() {
+        assert!(parse_native_mtp_b2(None).unwrap());
+        assert!(parse_native_mtp_b2(Some("1")).unwrap());
+        assert!(!parse_native_mtp_b2(Some("0")).unwrap());
+        assert!(parse_native_mtp_b2(Some("true")).is_err());
+        assert!(parse_native_mtp_b2(Some("")).is_err());
+    }
 
     #[test]
     fn admission_omija_chwilowo_zablokowany_front_bez_zmiany_fifo() {

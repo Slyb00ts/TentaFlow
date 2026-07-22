@@ -40,13 +40,14 @@ def gemm_q8_0_small_impl[output_type: DType, token_tile: Int](
         weight_quant = bitcast[DType.int8, 32](packed).cast[DType.int32]()
         column = block * 32
         comptime for token in range(token_tile):
-            activation_quant = (xq + token * n_cols + column).load[
-                width=32, alignment=32
-            ]().cast[DType.int32]()
-            activation_scale = xd[block * n_tokens + token]
-            acc[token] += scale * activation_scale * (
-                weight_quant * activation_quant
-            ).reduce_add().cast[DType.float32]()[0]
+            if token < n_tokens:
+                activation_quant = (xq + token * n_cols + column).load[
+                    width=32, alignment=32
+                ]().cast[DType.int32]()
+                activation_scale = xd[block * n_tokens + token]
+                acc[token] += scale * activation_scale * (
+                    weight_quant * activation_quant
+                ).reduce_add().cast[DType.float32]()[0]
         block += WARP_SIZE
 
     comptime for token in range(token_tile):
@@ -126,10 +127,11 @@ def gemm_q8_0_f16_exact_impl[output_type: DType, token_tile: Int, rows_per_block
         weight_quant = bitcast[DType.int8, 32](packed).cast[DType.float32]()
         column = block * 32
         comptime for token in range(token_tile):
-            activation = (x + token * n_cols + column).load[
-                width=32, alignment=64
-            ]().cast[DType.float32]()
-            acc[token] += scale * (weight_quant * activation).reduce_add()
+            if token < n_tokens:
+                activation = (x + token * n_cols + column).load[
+                    width=32, alignment=64
+                ]().cast[DType.float32]()
+                acc[token] += scale * (weight_quant * activation).reduce_add()
         block += WARP_SIZE
 
     comptime for token in range(token_tile):
@@ -141,6 +143,7 @@ def gemm_q8_0_f16_exact_impl[output_type: DType, token_tile: Int, rows_per_block
 comptime gemm_q8_0_i8mma_b2 = gemm_q8_0_small_impl[DType.float16, 2]
 comptime gemm_q8_0_i8mma_b3 = gemm_q8_0_small_impl[DType.float16, 3]
 comptime gemm_q8_0_i8mma_b4 = gemm_q8_0_small_impl[DType.float16, 4]
+comptime gemm_q8_0_i8mma_b8 = gemm_q8_0_small_impl[DType.float16, 8]
 comptime gemm_q8_0_i8mma_out_f32_b3 = gemm_q8_0_small_impl[DType.float32, 3]
 comptime gemm_q8_0_i8mma_out_f32_b4 = gemm_q8_0_small_impl[DType.float32, 4]
 comptime gemm_q8_0_dp4a_b3_nvidia = gemm_q8_0_small_dp4a_impl[DType.float16, 3]
@@ -149,3 +152,4 @@ comptime gemm_q8_0_dp4a_out_f32_b3_nvidia = gemm_q8_0_small_dp4a_impl[DType.floa
 comptime gemm_q8_0_dp4a_out_f32_b4_nvidia = gemm_q8_0_small_dp4a_impl[DType.float32, 4]
 comptime gemm_q8_0_f16_exact_out_f32_b3 = gemm_q8_0_f16_exact_impl[DType.float32, 3, 8]
 comptime gemm_q8_0_f16_exact_out_f32_b4 = gemm_q8_0_f16_exact_impl[DType.float32, 4, 8]
+comptime gemm_q8_0_f16_exact_out_f32_b8 = gemm_q8_0_f16_exact_impl[DType.float32, 8, 8]

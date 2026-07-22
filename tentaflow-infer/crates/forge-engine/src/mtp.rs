@@ -385,6 +385,10 @@ pub struct MtpDraftState {
     step_hidden: DevBuffer,
     checkpoint_len: Option<usize>,
     host_embedding_gathers: u64,
+    #[cfg(test)]
+    fail_rollback_once: bool,
+    #[cfg(test)]
+    fail_checkpoint_once: bool,
 }
 
 fn new_page_mapping(position: usize, page_size: usize, pages: &[i32]) -> Option<(usize, i32)> {
@@ -480,6 +484,10 @@ impl MtpDraftState {
             seq,
             checkpoint_len: None,
             host_embedding_gathers: 0,
+            #[cfg(test)]
+            fail_rollback_once: false,
+            #[cfg(test)]
+            fail_checkpoint_once: false,
         })
     }
 
@@ -488,6 +496,12 @@ impl MtpDraftState {
     }
 
     pub fn checkpoint(&mut self, stream: &Stream) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_checkpoint_once) {
+            return Err(ForgeError::Device(
+                "MTP: wymuszony błąd checkpointu".into(),
+            ));
+        }
         if self.checkpoint_len.is_some() {
             return Err(ForgeError::Scheduler(
                 "MTP: poprzedni checkpoint nie został rozstrzygnięty".into(),
@@ -578,6 +592,12 @@ impl MtpDraftState {
     }
 
     pub fn rollback(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_rollback_once) {
+            return Err(ForgeError::Device(
+                "MTP: wymuszony błąd rollbacku".into(),
+            ));
+        }
         let len = self.checkpoint_len.ok_or_else(|| {
             ForgeError::Scheduler("MTP: rollback bez aktywnego checkpointu".into())
         })?;
@@ -639,6 +659,25 @@ impl MtpDraftState {
         Ok(())
     }
 
+    pub(crate) fn validate_commit_prefix_metadata(&self, retained: usize) -> Result<usize> {
+        let base = self.checkpoint_len.ok_or_else(|| {
+            ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into())
+        })?;
+        if retained == 0 || retained > 4 || base + retained > self.seq.len {
+            return Err(ForgeError::Scheduler(format!(
+                "MTP: niepoprawna długość zatwierdzenia {retained} dla zakresu {}..{}",
+                base,
+                self.seq.len
+            )));
+        }
+        Ok(base + retained)
+    }
+
+    pub(crate) fn apply_commit_prefix_metadata(&mut self, kv: &mut KvCache, target: usize) {
+        kv.rollback(&mut self.seq, target);
+        self.checkpoint_len = None;
+    }
+
     /// Zatwierdza sekwencyjny catch-up wykonany od aktywnego checkpointu.
     pub fn commit_catchup(&mut self, retained: usize) -> Result<()> {
         let base = self.checkpoint_len.ok_or_else(|| {
@@ -656,6 +695,16 @@ impl MtpDraftState {
 
     pub fn checkpoint_len(&self) -> Option<usize> {
         self.checkpoint_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rollback_failure(&mut self) {
+        self.fail_rollback_once = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_checkpoint_failure(&mut self) {
+        self.fail_checkpoint_once = true;
     }
 
     pub fn record_host_embedding_gather(&mut self) {

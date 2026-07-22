@@ -325,6 +325,23 @@ def mtp_verify_decide(
         decision[1] = predictions[accepted]
 
 
+def mtp_verify_decide_segmented(
+    decisions: UnsafePointer[Int32, MutAnyOrigin],
+    predictions: UnsafePointer[Int32, MutAnyOrigin],
+    input_ids: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+):
+    """Wyznacza niezależne decyzje dla segmentów sequence-major `[B,T]`."""
+    lane = Int(block_idx.x)
+    if Int(thread_idx.x) == 0:
+        offset = lane * n_tokens
+        var accepted = 0
+        while accepted + 1 < n_tokens and predictions[offset + accepted] == input_ids[offset + accepted + 1]:
+            accepted += 1
+        decisions[2 * lane] = Int32(accepted + 1)
+        decisions[2 * lane + 1] = predictions[offset + accepted]
+
+
 def mtp_select_row_f16(
     output: UnsafePointer[Float16, MutAnyOrigin],
     rows: UnsafePointer[Float16, MutAnyOrigin],
@@ -349,3 +366,18 @@ def mtp_select_row_f32(
     var element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     if element < row_size:
         output[element] = rows[row * row_size + element]
+
+
+def mtp_select_row_segmented_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    rows: UnsafePointer[Float16, MutAnyOrigin],
+    decisions: UnsafePointer[Int32, MutAnyOrigin],
+    n_rows: Int,
+    row_size: Int,
+):
+    """Wybiera osobny wiersz F16 dla każdego segmentu."""
+    lane = Int(block_idx.y)
+    row = Int(decisions[2 * lane]) - 1
+    var element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row >= 0 and row < n_rows and element < row_size:
+        output[lane * row_size + element] = rows[(lane * n_rows + row) * row_size + element]

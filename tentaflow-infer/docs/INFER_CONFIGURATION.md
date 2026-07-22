@@ -270,7 +270,7 @@ argmax jest jednoznaczny — akcelerator dokładnego dekodowania, nie przybliże
 Natywne MTP jest dostępne dla obsługiwanego, gęstego hybrydowego GGUF `qwen35`
 z `nextn_predict_layers`. Model generuje draft K=2 lub K=3 na GPU, a target
 weryfikuje cały blok jednym batched przebiegiem. Zaakceptowany prefiks zatwierdza
-KV oraz retained checkpointy DeltaNet bez ponownego skanu warstw. `mtp` oznacza
+KV i odtwarza odpowiadający mu stan DeltaNet podczas commit. `mtp` oznacza
 budżet 3 z adaptacyjnym wyborem K=2/K=3; `mtp:2` i `mtp:3` wymuszają maksymalny
 budżet, przy czym K=3 nadal może spaść do K=2 przy końcu dostępnego kontekstu.
 Wagi i stan NextN są ładowane tylko po jawnym wybraniu trybu MTP; przy
@@ -299,6 +299,7 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 |---|---|---|
 | `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
 | `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
+| `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
 
 Przykład dla modelu z natywną głową MTP:
 
@@ -308,9 +309,12 @@ cargo run -p forge-cli --release -- run MODEL.gguf "Przykładowy prompt" \
 ```
 
 Polecenie `serve` dobiera dla MTP domyślne `--max-active 1`; jawna większa
-wartość uruchamia startup preflight puli stanów per sekwencja. Jeśli wymagane
-sloty nie mieszczą się w pulach weights/activations, worker nie startuje, a błąd
-podaje wymagane i dostępne bajty. `run` zawsze obsługuje jedną sekwencję.
+wartość uruchamia startup preflight puli stanów per sekwencja. Dwa requesty
+pure MTP z tym samym K mogą wykonać wspólny B2. Różne K, `mtp+ngram`, tiering,
+niepełna para albo niespełniony kontrakt capability przechodzą przed mutacją
+stanu na seryjne B1. Jeśli wymagane sloty nie mieszczą się w pulach
+weights/activations, worker nie startuje, a błąd podaje wymagane i dostępne
+bajty. `run` zawsze obsługuje jedną sekwencję.
 
 ### Manifest neuralnego proposera
 
@@ -351,7 +355,8 @@ Zakres i komponowanie:
   GPU bez repetition penalty. Target DeltaNet i draft MTP
   mają osobny stan per sekwencja pod wspólnym lease; strony KV draftu pochodzą
   z jednej współdzielonej puli MTP. `max_active > 1` wymaga udanego startup
-  preflightu i używa seryjnie przeplatanego forwardu per sekwencja. Nie ma cichego fallbacku: niezgodna
+  preflightu. Pure MTP greedy-exact paruje zgodne sekwencje same-K po B2;
+  router n-gram i niezgodne pary pozostają seryjne. Nie ma cichego fallbacku: niezgodna
   konfiguracja kończy się błędem przed uruchomieniem workera.
 - Spekulacja stochastyczna (`temp > 0`) NIE jest zaimplementowana w v1 — tylko
   greedy-exact. Statystyki akceptacji per-proposer i adaptive-disable (usypianie
@@ -381,7 +386,8 @@ Zweryfikowane natywne MTP (RTX 4090,
 `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`, lokalny wariant NVFP4):
 
 - wielocyklowy wynik MTP jest porównywany token po tokenie z sekwencyjnym greedy;
-- retained checkpointy DeltaNet są używane podczas commit zaakceptowanego prefiksu;
+- współdzielony forward DeltaNet i recompute commit zachowują stan zaakceptowanego
+  prefiksu bez puli checkpointów wszystkich kroków;
 - catch-up routera przeszedł bitową zgodność target h/x/SSM i MTP hidden/K/V/len
   dla wymuszonych długości akceptacji 0..K;
 - batchowy catch-up MTP normalizuje przesunięte pary embedding/target hidden,
@@ -393,9 +399,8 @@ Zweryfikowane natywne MTP (RTX 4090,
 - `mtp+ngram:3` prose: raw128 **118,3-118,5 tok/s** przy akceptacji 97,0%,
   raw512 **78,0-78,3 tok/s** przy akceptacji 63,7%. Są to wyniki actual;
   `oracle_upper` pozostaje osobną górną granicą;
-- K=3: raw128 około **86,9 tok/s**, raw512 około **83,8 tok/s** po włączeniu
-  retained checkpointów, głowy Q8 B3/B4, scalonego przygotowania DeltaNet,
-  szybkich projekcji NVFP4 B3/B4 i grafów verifiera T=3/T=4;
+- MTP B2 ON/OFF, mediana pięciu powtórzeń: raw128 **137,40/101,97 tok/s**,
+  raw512 **97,78/76,38 tok/s**; stałe K=3 osiąga **136,97/94,34 tok/s**;
 - pomiary dotyczą wyłącznie CUDA. Źródła kerneli Mojo są przenośnym punktem
   wyjścia dla AMDGPU/Metal, ale tych backendów nie uruchomiono ani nie
   zweryfikowano.
@@ -840,7 +845,7 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   qwen35moe). Target i MTP mają izolowane sloty per sekwencja oraz wspólny paged
   cache MTP. Dwie niespekulacyjne sekwencje targetu używają B2 ze wspólnymi
   batch GEMM FFN i głowy logits; mixery zachowują osobne sloty DeltaNet. Native
-  MTP nadal wykonuje lane seryjnie do czasu verifiera `[B,T]` i batchowego draftu.
+  MTP ma osobny same-K B2 z segmentowanym verifierem `[B,T]` i batchowym draftem.
   B2 wymaga rezydentnego KV oraz obsługiwanych formatów dense FFN i lm_head;
   tiering lub inny niespełniony warunek wybiera seryjny fallback przed zmianą KV.
 - `logprobs`/`echo`/`n>1`: obsługiwane tylko na ścieżce non-streaming (streaming

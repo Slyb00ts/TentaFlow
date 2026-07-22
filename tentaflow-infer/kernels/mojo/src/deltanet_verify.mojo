@@ -234,6 +234,44 @@ def deltanet_prepare_dynamic_f16(
                 beta_out[gate_index] = 1.0 / (1.0 + exp(-Float32(beta_raw[gate_index])))
 
 
+def deltanet_prepare_segmented_f16(
+    q_out: UnsafePointer[Float16, MutAnyOrigin], k_out: UnsafePointer[Float16, MutAnyOrigin],
+    v_out: UnsafePointer[Float16, MutAnyOrigin], g_out: UnsafePointer[Float32, MutAnyOrigin],
+    beta_out: UnsafePointer[Float32, MutAnyOrigin], conv_checkpoints: UnsafePointer[Float16, MutAnyOrigin],
+    conv_initial: UnsafePointer[Float16, MutAnyOrigin], qkv_mixed: UnsafePointer[Float16, MutAnyOrigin],
+    conv_weight: UnsafePointer[Float16, MutAnyOrigin], alpha_raw: UnsafePointer[Float16, MutAnyOrigin],
+    beta_raw: UnsafePointer[Float16, MutAnyOrigin], dt_bias: UnsafePointer[Float16, MutAnyOrigin],
+    a_scale: UnsafePointer[Float16, MutAnyOrigin], n_steps: Int, n_k_heads: Int,
+    n_v_heads: Int, d_state: Int, d_conv: Int, eps: Float32,
+):
+    """Przygotowuje niezależne segmenty DeltaNet `[B,T]`."""
+    lane = Int(block_idx.y)
+    conv_dim = (2 * n_k_heads + n_v_heads) * d_state
+    value_dim = n_v_heads * d_state
+    conv_elems = conv_dim * (d_conv - 1)
+    deltanet_prepare_dynamic_f16(
+        q_out + lane * n_steps * value_dim,
+        k_out + lane * n_steps * value_dim,
+        v_out + lane * n_steps * value_dim,
+        g_out + lane * n_steps * n_v_heads,
+        beta_out + lane * n_steps * n_v_heads,
+        conv_checkpoints + lane * n_steps * conv_elems,
+        conv_initial + lane * conv_elems,
+        qkv_mixed + lane * n_steps * conv_dim,
+        conv_weight,
+        alpha_raw + lane * n_steps * n_v_heads,
+        beta_raw + lane * n_steps * n_v_heads,
+        dt_bias,
+        a_scale,
+        n_steps,
+        n_k_heads,
+        n_v_heads,
+        d_state,
+        d_conv,
+        eps,
+    )
+
+
 def _deltanet_gated_scan_f16[steps: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     checkpoints: UnsafePointer[Float32, MutAnyOrigin],
@@ -479,7 +517,6 @@ def deltanet_gated_scan_dynamic_d128_f16(
             sq[i] = Float32(q_in[vector_base + i])
             i += tile_width
         barrier()
-
         if active:
             checkpoint_base = token * state_elements + head_state
             previous_base = head_state if token == 0 else checkpoint_base - state_elements
@@ -501,6 +538,177 @@ def deltanet_gated_scan_dynamic_d128_f16(
                 output += sq[key] * s
             out_ptr[vector_base + j] = Float16(output * inv_sqrt)
         barrier()
+
+
+def deltanet_gated_scan_segmented_d128_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin], checkpoints: UnsafePointer[Float32, MutAnyOrigin],
+    state_in: UnsafePointer[Float32, MutAnyOrigin], q_in: UnsafePointer[Float16, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin], v_in: UnsafePointer[Float16, MutAnyOrigin],
+    g_in: UnsafePointer[Float32, MutAnyOrigin], beta_in: UnsafePointer[Float32, MutAnyOrigin],
+    n_steps: Int, n_v_heads: Int, d_state: Int,
+):
+    """Skanuje niezależne stany DeltaNet dla segmentów `[B,T]`."""
+    lane = Int(block_idx.y)
+    value_elems = n_steps * n_v_heads * d_state
+    gate_elems = n_steps * n_v_heads
+    state_elems = n_v_heads * d_state * d_state
+    deltanet_gated_scan_dynamic_d128_f16(
+        out_ptr + lane * value_elems,
+        checkpoints + lane * n_steps * state_elems,
+        state_in + lane * state_elems,
+        q_in + lane * value_elems,
+        k_in + lane * value_elems,
+        v_in + lane * value_elems,
+        g_in + lane * gate_elems,
+        beta_in + lane * gate_elems,
+        n_steps,
+        n_v_heads,
+        d_state,
+    )
+
+
+def deltanet_gated_scan_segmented_shared_d128_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    state_in: UnsafePointer[Float32, MutAnyOrigin],
+    q_in: UnsafePointer[Float16, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin],
+    g_in: UnsafePointer[Float32, MutAnyOrigin],
+    beta_in: UnsafePointer[Float32, MutAnyOrigin],
+    n_steps: Int,
+    n_v_heads: Int,
+    d_state: Int,
+):
+    """Skanuje krótki batch bez zapisywania pośrednich stanów do VRAM."""
+    comptime TILE_WIDTH = 64
+    comptime MAX_D_STATE = 128
+    lane = Int(block_idx.y)
+    tid = Int(thread_idx.x)
+    block = Int(block_idx.x)
+    head = block // 2
+    tile = block % 2
+    if head >= n_v_heads:
+        return
+    j = tile * TILE_WIDTH + tid
+    state_elems = n_v_heads * d_state * d_state
+    value_elems = n_steps * n_v_heads * d_state
+    gate_elems = n_steps * n_v_heads
+    state_base = lane * state_elems + head * d_state * d_state
+    value_base = lane * value_elems
+    gate_base = lane * gate_elems
+    head_vector = head * d_state
+    inv_sqrt = rsqrt(Float32(d_state))
+
+    sk = stack_allocation[MAX_D_STATE, Float32, address_space=AddressSpace.SHARED]()
+    sq = stack_allocation[MAX_D_STATE, Float32, address_space=AddressSpace.SHARED]()
+    state_tile = stack_allocation[
+        MAX_D_STATE * TILE_WIDTH, Float32, address_space=AddressSpace.SHARED
+    ]()
+    for key in range(d_state):
+        state_tile[key * TILE_WIDTH + tid] = state_in[
+            state_base + key * d_state + j
+        ]
+
+    for token in range(n_steps):
+        vector = value_base + token * n_v_heads * d_state + head_vector
+        gate = gate_base + token * n_v_heads + head
+        var i = tid
+        while i < d_state:
+            sk[i] = Float32(k_in[vector + i])
+            sq[i] = Float32(q_in[vector + i])
+            i += TILE_WIDTH
+        barrier()
+
+        decay = exp(g_in[gate])
+        beta = beta_in[gate]
+        var kv: Float32 = 0.0
+        for key in range(d_state):
+            offset = key * TILE_WIDTH + tid
+            state = state_tile[offset] * decay
+            state_tile[offset] = state
+            kv += sk[key] * state
+        delta = beta * (Float32(v_in[vector + j]) - kv)
+
+        var output: Float32 = 0.0
+        for key in range(d_state):
+            offset = key * TILE_WIDTH + tid
+            state = state_tile[offset] + sk[key] * delta
+            state_tile[offset] = state
+            output += sq[key] * state
+        out_ptr[vector + j] = Float16(output * inv_sqrt)
+        barrier()
+
+
+def deltanet_commit_recompute_segmented_shared_d128_f32(
+    state_out: UnsafePointer[Float32, MutAnyOrigin],
+    state_in: UnsafePointer[Float32, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin],
+    g_in: UnsafePointer[Float32, MutAnyOrigin],
+    beta_in: UnsafePointer[Float32, MutAnyOrigin],
+    decisions: UnsafePointer[Int32, MutAnyOrigin],
+    max_steps: Int,
+    n_v_heads: Int,
+    d_state: Int,
+):
+    """Odtwarza tylko wybrany prefiks i zapisuje końcowy stan każdego lane."""
+    comptime TILE_WIDTH = 64
+    comptime MAX_D_STATE = 128
+    lane = Int(block_idx.y)
+    tid = Int(thread_idx.x)
+    block = Int(block_idx.x)
+    head = block // 2
+    tile = block % 2
+    if head >= n_v_heads:
+        return
+    j = tile * TILE_WIDTH + tid
+    state_elems = n_v_heads * d_state * d_state
+    value_elems = max_steps * n_v_heads * d_state
+    gate_elems = max_steps * n_v_heads
+    state_base = lane * state_elems + head * d_state * d_state
+    value_base = lane * value_elems
+    gate_base = lane * gate_elems
+    head_vector = head * d_state
+    selected_steps = Int(decisions[2 * lane])
+    if selected_steps > max_steps:
+        selected_steps = max_steps
+
+    sk = stack_allocation[MAX_D_STATE, Float32, address_space=AddressSpace.SHARED]()
+    state_tile = stack_allocation[
+        MAX_D_STATE * TILE_WIDTH, Float32, address_space=AddressSpace.SHARED
+    ]()
+    for key in range(d_state):
+        state_tile[key * TILE_WIDTH + tid] = state_in[
+            state_base + key * d_state + j
+        ]
+
+    for token in range(selected_steps):
+        vector = value_base + token * n_v_heads * d_state + head_vector
+        gate = gate_base + token * n_v_heads + head
+        var i = tid
+        while i < d_state:
+            sk[i] = Float32(k_in[vector + i])
+            i += TILE_WIDTH
+        barrier()
+
+        decay = exp(g_in[gate])
+        beta = beta_in[gate]
+        var kv: Float32 = 0.0
+        for key in range(d_state):
+            offset = key * TILE_WIDTH + tid
+            state = state_tile[offset] * decay
+            state_tile[offset] = state
+            kv += sk[key] * state
+        delta = beta * (Float32(v_in[vector + j]) - kv)
+        for key in range(d_state):
+            offset = key * TILE_WIDTH + tid
+            state_tile[offset] += sk[key] * delta
+        barrier()
+
+    for key in range(d_state):
+        state_out[state_base + key * d_state + j] = state_tile[
+            key * TILE_WIDTH + tid
+        ]
 
 
 def deltanet_gated_scan_inplace_dynamic_d128_f16(
@@ -660,3 +868,21 @@ def deltanet_commit_checkpoint_f32(
     while index < state_elements:
         state_out[index] = checkpoints[source_base + index]
         index += stride
+
+
+def deltanet_commit_checkpoint_segmented_f32(
+    states_out: UnsafePointer[Float32, MutAnyOrigin],
+    checkpoints: UnsafePointer[Float32, MutAnyOrigin],
+    decisions: UnsafePointer[Int32, MutAnyOrigin],
+    state_elements: Int,
+    max_steps: Int,
+):
+    """Zatwierdza osobny checkpoint stanu dla każdego lane."""
+    lane = Int(block_idx.y)
+    deltanet_commit_checkpoint_f32(
+        states_out + lane * state_elements,
+        checkpoints + lane * max_steps * state_elements,
+        decisions + lane * 2,
+        state_elements,
+        max_steps,
+    )
