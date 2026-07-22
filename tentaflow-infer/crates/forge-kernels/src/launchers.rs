@@ -295,6 +295,17 @@ fn q8_nvfp4_pack_launch(warp_size: u32) -> (usize, u32) {
     }
 }
 
+const HYBRID_PREFILL_B2_ARTIFACTS: [&str; 4] = [
+    "deltanet_prepare_segmented_final_f16",
+    "deltanet_gated_scan_segmented_shared_d128_f16",
+    "gemm_nvfp4_gguf_out_f32_b2",
+    "gemm_q8_0_f16_exact_out_f32_b2",
+];
+
+fn has_hybrid_prefill_b2_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
+    HYBRID_PREFILL_B2_ARTIFACTS.iter().all(|name| has(name))
+}
+
 pub struct Kernels {
     device: Arc<dyn Device>,
     artifacts: KernelArtifacts,
@@ -544,6 +555,11 @@ impl IqTables {
 }
 
 impl Kernels {
+    /// Sprawdza komplet artefaktów wymaganych przez ciągły prefill B2 T32.
+    pub fn hybrid_prefill_b2_artifacts_capable(&self) -> bool {
+        has_hybrid_prefill_b2_artifacts(|name| self.artifacts.has(name))
+    }
+
     /// Wyznacza długość zaakceptowanego draftu i token korekty na GPU.
     pub fn mtp_verify_decide(
         &self,
@@ -12339,6 +12355,7 @@ mod nvfp4_gguf_dispatch_tests {
         q8_nvfp4_pack_launch, raw_nvfp4_dp4a_supported, resolve_prepared_q8_marker, Kernels,
         PrequantScratch, PREPARED_Q8_GEMM_LAUNCHES, PREPARED_Q8_RECORD_FAILURES,
         PREPARED_Q8_SYNC_FAILURES, validate_kv_append_batch_segmented_masked_f16,
+        has_hybrid_prefill_b2_artifacts, HYBRID_PREFILL_B2_ARTIFACTS,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::cuda::{CudaDevice, PoolSizes};
@@ -12347,6 +12364,14 @@ mod nvfp4_gguf_dispatch_tests {
     use half::f16;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn prefill_b2_wymaga_pelnego_zestawu_artefaktow() {
+        assert!(has_hybrid_prefill_b2_artifacts(|_| true));
+        for missing in HYBRID_PREFILL_B2_ARTIFACTS {
+            assert!(!has_hybrid_prefill_b2_artifacts(|name| name != missing));
+        }
+    }
 
     #[test]
     fn maskowany_append_kv_odrzuca_wymiary_i_bufory_przed_launch() {

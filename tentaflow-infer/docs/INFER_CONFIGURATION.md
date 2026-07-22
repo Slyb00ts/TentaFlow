@@ -302,7 +302,7 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 | `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
 | `FORGE_MTP_NGRAM_BATCH` | `auto` | Rollout parowania N/N B2 dwóch pełnych draftów n-gram o tym samym K=2 albo K=3. Brak zmiennej wybiera `auto`: ścieżka działa tylko dla strukturalnie zgodnego modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1. `1` wymusza eksperymentalny backend, także AMD/Metal, ale nadal odrzuca model bez strukturalnego capability. Inna wartość jest błędem konfiguracji. |
 | `FORGE_MTP_NGRAM_MIXED_BATCH` | `0` | Eksperymentalne parowanie N/M i M/M przez wspólny verifier B2. `1` wymaga aktywnego `FORGE_MTP_NGRAM_BATCH` i zachowuje kill-switch `FORGE_NATIVE_MTP_B2`; `0` lub brak zmiennej pozostawia automatyczny rollout wyłącznie dla N/N. Inna wartość jest błędem konfiguracji. |
-| `FORGE_HYBRID_PREFILL_BATCH` | `0` | Eksperymentalny prefill dokładnie dwóch requestów w segmentach `B=2`, `T=32`. `1` wymaga strukturalnie zgodnego modelu i zweryfikowanego backendu NVIDIA warp32; NVIDIA warp64, AMD, Apple i CPU kończą start kontrolowanym `Unsupported`, zanim scheduler odwoła się do PTX. Inna wartość jest błędem konfiguracji. |
+| `FORGE_HYBRID_PREFILL_BATCH` | `auto` | Eksperymentalny prefill dokładnie dwóch requestów w segmentach `B=2`, `T=32`. Brak zmiennej włącza go wyłącznie dla pełnego capability modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1 bez alokacji dedykowanego scratchu. `1` rygorystycznie wymaga tego backendu, modelu i artefaktów; ich brak kończy start kontrolowanym `Unsupported`, zanim scheduler odwoła się do PTX. Inna wartość jest błędem konfiguracji. |
 
 W verifierze B2 dla T=6 i T=8 trzy projekcje Q8_0 `gate_proj`, `alpha_proj` i
 `beta_proj` współdzielą jedną kwantyzację wejścia `pb.x`, jeśli wszystkie mają
@@ -359,9 +359,10 @@ Mieszany rollout pozostaje domyślnie wyłączony.
 
 ### Hybrydowy prefill B2 T32
 
-`FORGE_HYBRID_PREFILL_BATCH=1` paruje wyłącznie dwa gotowe segmenty po 32
-tokeny. Ogony, brak pary i niespełniony kontrakt modelu pozostają w istniejącej
-ścieżce B1. Implementacja źródłowa kerneli pozostaje w Mojo i zachowuje typy
+Tryb auto i `FORGE_HYBRID_PREFILL_BATCH=1` parują wyłącznie dwa gotowe segmenty
+po 32 tokeny. W auto ogony, brak pary i niespełniony kontrakt modelu pozostają
+w istniejącej ścieżce B1; `1` odrzuca brak capability podczas startu.
+Implementacja źródłowa kerneli pozostaje w Mojo i zachowuje typy
 przenośne dla przyszłych backendów, ale wykonanie zostało sprawdzone wyłącznie
 na NVIDIA warp32. Nie ma obecnie dowodu wykonawczego ani artefaktów dla AMD i
 Metal.
@@ -378,6 +379,8 @@ GPU pozostawia logity na urządzeniu i zwraca po 8 B na zakończony krok pary;
 wariant wymagający `logprobs` używa wspólnego bufora hostowych logitów dla
 fallbacku CPU. W profilu dwóch requestów po osiem tokenów odnotowano 18 150
 launchy, osiem synchronizacji i łącznie 64 B D2H bez transferu słownika.
+Prometheus gauge `forge_engine_hybrid_prefill_b2_scratch_bytes` wynosi zero
+przed pierwszym B2 i przez cały tryb off, a po alokacji raportuje 450 692 688 B.
 
 Nowe wygenerowane artefakty PTX to:
 

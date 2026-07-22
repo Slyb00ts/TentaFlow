@@ -169,6 +169,12 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
         "Pary prefill skierowane do wykonania serialnego.",
         load(&engine.hybrid_prefill_b2_fallbacks_total),
     );
+    gauge(
+        &mut out,
+        "forge_engine_hybrid_prefill_b2_scratch_bytes",
+        "Logiczny rozmiar zaalokowanego dedykowanego scratchu prefill B2.",
+        load(&engine.hybrid_prefill_b2_scratch_bytes),
+    );
     counter(
         &mut out,
         "forge_engine_mtp_ngram_b2_steps_total",
@@ -271,6 +277,9 @@ mod tests {
         engine
             .hybrid_prefill_b2_fallbacks_total
             .store(4, Ordering::Relaxed);
+        engine
+            .hybrid_prefill_b2_scratch_bytes
+            .store(450_692_688, Ordering::Relaxed);
         engine.mtp_ngram_b2_steps_total.store(7, Ordering::Relaxed);
         engine.mtp_routed_nn_b2_steps_total.store(3, Ordering::Relaxed);
         engine.mtp_routed_nm_b2_steps_total.store(2, Ordering::Relaxed);
@@ -279,6 +288,7 @@ mod tests {
         assert!(output.contains("forge_engine_hybrid_prefill_b2_steps_total 5"));
         assert!(output.contains("forge_engine_hybrid_prefill_b2_tokens_total 320"));
         assert!(output.contains("forge_engine_hybrid_prefill_b2_fallbacks_total 4"));
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_scratch_bytes 450692688"));
         assert!(output.contains("# TYPE forge_engine_mtp_ngram_b2_steps_total counter"));
         assert!(output.contains("forge_engine_mtp_ngram_b2_steps_total 7"));
         assert!(output.contains("forge_engine_mtp_routed_nn_b2_steps_total 3"));

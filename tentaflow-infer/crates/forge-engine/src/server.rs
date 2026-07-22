@@ -325,10 +325,18 @@ fn parse_mtp_ngram_mixed_batch(value: Option<&str>) -> Result<bool> {
     }
 }
 
-fn parse_hybrid_prefill_batch(value: Option<&str>) -> Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HybridPrefillBatchMode {
+    Auto,
+    Off,
+    ForceOn,
+}
+
+fn parse_hybrid_prefill_batch(value: Option<&str>) -> Result<HybridPrefillBatchMode> {
     match value {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
+        None => Ok(HybridPrefillBatchMode::Auto),
+        Some("0") => Ok(HybridPrefillBatchMode::Off),
+        Some("1") => Ok(HybridPrefillBatchMode::ForceOn),
         Some(value) => Err(ForgeError::Scheduler(format!(
             "FORGE_HYBRID_PREFILL_BATCH wymaga wartości 0 lub 1, otrzymano {value:?}"
         ))),
@@ -336,20 +344,25 @@ fn parse_hybrid_prefill_batch(value: Option<&str>) -> Result<bool> {
 }
 
 fn resolve_hybrid_prefill_batch(
-    requested: bool,
+    mode: HybridPrefillBatchMode,
     vendor: Vendor,
     warp_size: u32,
     model_capable: bool,
 ) -> Result<bool> {
-    if !requested {
-        return Ok(false);
+    let backend_capable = hybrid_prefill_b2_backend_capable(vendor, warp_size);
+    match mode {
+        HybridPrefillBatchMode::Auto => Ok(backend_capable && model_capable),
+        HybridPrefillBatchMode::Off => Ok(false),
+        HybridPrefillBatchMode::ForceOn if backend_capable && model_capable => Ok(true),
+        HybridPrefillBatchMode::ForceOn if !backend_capable => Err(ForgeError::Unsupported(
+            format!(
+                "FORGE_HYBRID_PREFILL_BATCH=1 wymaga zweryfikowanego backendu NVIDIA warp32, otrzymano {vendor:?} warp{warp_size}"
+            ),
+        )),
+        HybridPrefillBatchMode::ForceOn => Err(ForgeError::Unsupported(
+            "FORGE_HYBRID_PREFILL_BATCH=1 wymaga pełnego capability modelu i artefaktów prefill B2 T32".into(),
+        )),
     }
-    if !hybrid_prefill_b2_backend_capable(vendor, warp_size) {
-        return Err(ForgeError::Unsupported(format!(
-            "FORGE_HYBRID_PREFILL_BATCH=1 wymaga zweryfikowanego backendu NVIDIA warp32, otrzymano {vendor:?} warp{warp_size}"
-        )));
-    }
-    Ok(model_capable)
 }
 
 fn mtp_ngram_auto_backend(vendor: Vendor, warp_size: u32) -> bool {
@@ -574,15 +587,16 @@ pub fn spawn_engine_batched(
     let mtp_ngram_mixed_batch = parse_mtp_ngram_mixed_batch(
         std::env::var("FORGE_MTP_NGRAM_MIXED_BATCH").ok().as_deref(),
     )?;
-    let hybrid_prefill_requested = parse_hybrid_prefill_batch(
+    let hybrid_prefill_mode = parse_hybrid_prefill_batch(
         std::env::var("FORGE_HYBRID_PREFILL_BATCH").ok().as_deref(),
     )?;
     let caps = model.device.caps();
+    let hybrid_prefill_capable = model.hybrid_prefill_b2_capable(32);
     let hybrid_prefill_batch = resolve_hybrid_prefill_batch(
-        hybrid_prefill_requested,
+        hybrid_prefill_mode,
         caps.vendor,
         caps.warp_size,
-        model.hybrid_prefill_b2_capable(32),
+        hybrid_prefill_capable,
     )?;
     let mtp_ngram_batch = resolve_mtp_ngram_batch(
         mtp_ngram_mode,
@@ -607,9 +621,11 @@ pub fn spawn_engine_batched(
         "eksperymentalny rollout MTP+n-gram N/M i M/M B2"
     );
     tracing::info!(
+        mode = ?hybrid_prefill_mode,
         enabled = hybrid_prefill_batch,
-        capable = model.hybrid_prefill_b2_capable(32),
-        execution_connected = hybrid_prefill_batch && model.hybrid_prefill_b2_capable(32),
+        vendor = ?caps.vendor,
+        warp_size = caps.warp_size,
+        capable = hybrid_prefill_capable,
         "eksperymentalny rollout hybrydowego prefill B2 T32"
     );
     let coordinator = SpeculationCoordinator::new(spec.clone())?;
@@ -654,6 +670,10 @@ pub fn spawn_engine_batched(
     }
     let (tx, rx) = mpsc::channel::<Submission>();
     let metrics = Arc::new(EngineMetrics::new());
+    EngineMetrics::set(
+        &metrics.hybrid_prefill_b2_scratch_bytes,
+        model.debug_hybrid_prefill_b2_scratch_bytes() as u64,
+    );
     let worker_metrics = metrics.clone();
     let worker = std::thread::Builder::new()
         .name("forge-engine-worker".into())
@@ -1186,6 +1206,10 @@ fn advance_hybrid_prefill_b2(
         }
         Ok::<(), ForgeError>(())
     })();
+    EngineMetrics::set(
+        &metrics.hybrid_prefill_b2_scratch_bytes,
+        model.debug_hybrid_prefill_b2_scratch_bytes() as u64,
+    );
     match result {
         Ok(()) => {
             EngineMetrics::inc(&metrics.hybrid_prefill_b2_steps_total);
@@ -2253,6 +2277,7 @@ mod tests {
     use super::mtp_routed_pair_enabled;
     use super::{
         hybrid_prefill_batch_plan, parse_hybrid_prefill_batch, resolve_hybrid_prefill_batch,
+        HybridPrefillBatchMode,
     };
     use crate::model::hybrid_prefill_b2_backend_capable;
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
@@ -2283,9 +2308,18 @@ mod tests {
 
     #[test]
     fn hybrid_prefill_batch_ma_scisla_flage_i_stabilny_plan_t32() {
-        assert!(!parse_hybrid_prefill_batch(None).unwrap());
-        assert!(!parse_hybrid_prefill_batch(Some("0")).unwrap());
-        assert!(parse_hybrid_prefill_batch(Some("1")).unwrap());
+        assert_eq!(
+            parse_hybrid_prefill_batch(None).unwrap(),
+            HybridPrefillBatchMode::Auto
+        );
+        assert_eq!(
+            parse_hybrid_prefill_batch(Some("0")).unwrap(),
+            HybridPrefillBatchMode::Off
+        );
+        assert_eq!(
+            parse_hybrid_prefill_batch(Some("1")).unwrap(),
+            HybridPrefillBatchMode::ForceOn
+        );
         assert!(parse_hybrid_prefill_batch(Some("true")).is_err());
         assert!(parse_hybrid_prefill_batch(Some("")).is_err());
 
@@ -2305,9 +2339,50 @@ mod tests {
         assert!(!hybrid_prefill_b2_backend_capable(Vendor::Cpu, 32));
         assert!(!hybrid_prefill_b2_backend_capable(Vendor::Intel, 32));
 
-        assert!(resolve_hybrid_prefill_batch(false, Vendor::Amd, 64, true).is_ok());
-        assert!(resolve_hybrid_prefill_batch(true, Vendor::Nvidia, 32, true).unwrap());
-        assert!(!resolve_hybrid_prefill_batch(true, Vendor::Nvidia, 32, false).unwrap());
+        assert!(
+            resolve_hybrid_prefill_batch(
+                HybridPrefillBatchMode::Auto,
+                Vendor::Nvidia,
+                32,
+                true,
+            )
+            .unwrap()
+        );
+        assert!(!resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::Auto,
+            Vendor::Nvidia,
+            32,
+            false,
+        )
+        .unwrap());
+        assert!(!resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::Auto,
+            Vendor::Amd,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(!resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::Off,
+            Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::ForceOn,
+            Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::ForceOn,
+            Vendor::Nvidia,
+            32,
+            false,
+        )
+        .is_err());
         for (vendor, warp_size) in [
             (Vendor::Nvidia, 64),
             (Vendor::Amd, 32),
@@ -2315,7 +2390,20 @@ mod tests {
             (Vendor::Apple, 32),
             (Vendor::Cpu, 32),
         ] {
-            assert!(resolve_hybrid_prefill_batch(true, vendor, warp_size, true).is_err());
+            assert!(!resolve_hybrid_prefill_batch(
+                HybridPrefillBatchMode::Auto,
+                vendor,
+                warp_size,
+                true,
+            )
+            .unwrap());
+            assert!(resolve_hybrid_prefill_batch(
+                HybridPrefillBatchMode::ForceOn,
+                vendor,
+                warp_size,
+                true,
+            )
+            .is_err());
         }
     }
 

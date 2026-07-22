@@ -24,8 +24,10 @@ Ostatnia aktualizacja: 2026-07-22.
 
 - 🟡 **Hybrydowy prefill NVFP4 B2 T32 w Mojo (2026-07-22).** Scheduler może
   połączyć dokładnie dwa requesty i wykonać segmenty `B=2`, `T=32`; funkcja
-  pozostaje domyślnie wyłączona przez `FORGE_HYBRID_PREFILL_BATCH=0`. Capability
-  wykonawcze wymaga NVIDIA warp32. Jawne włączenie na NVIDIA warp64, AMD,
+  domyślnie działa w trybie auto tylko przy pełnym capability modelu na
+  NVIDIA warp32. `FORGE_HYBRID_PREFILL_BATCH=0` wymusza B1 bez alokacji
+  dedykowanego scratchu, a `1` rygorystycznie wymaga kompletnego capability
+  i artefaktów. Jawne włączenie na NVIDIA warp64, AMD,
   Apple albo CPU zwraca `Unsupported` przed routingiem do PTX. Źródła Mojo są
   przygotowane do dalszego portowania, lecz AMD i Metal nie zostały wykonawczo
   zweryfikowane. Target B2 zachowuje pełne ID i bitowy parytet z dwoma
@@ -35,8 +37,10 @@ Ostatnia aktualizacja: 2026-07-22.
   450 692 688 B (429,81 MiB). Profil samplowania GPU dla dwóch requestów po
   osiem tokenów zawierał 18 150 launchy, osiem synchronizacji oraz osiem
   transferów D2H po 8 B, bez transferu logitów całego słownika.
-  Pięć końcowych prób raw128 dało medianę ON/OFF **309,5/248,6 tok/s**, TTFT
-  **827,24/1029,78 ms** i E2E **1120,08/1322,54 ms**. Raw512 ON dało
+  Gauge `forge_engine_hybrid_prefill_b2_scratch_bytes` pozostaje zerowy w trybie
+  off i raportuje faktyczny logiczny rozmiar po pierwszym udanym B2.
+  Pięć końcowych prób raw128 dało medianę Auto/OFF **309,7/248,6 tok/s**, TTFT
+  **826,69/1029,87 ms** i E2E **1119,60/1322,60 ms**. Raw512 ON dało
   **320,5/320,2/319,9/320,0/320,2 tok/s** z medianą **320,2 tok/s**, TTFT
   **3198,02 ms** i E2E **3505,75 ms**; odniesienie OFF wyniosło **251,4
   tok/s**, około **4073 ms TTFT** i **4380 ms E2E**. Artefakty `/tmp` nie są

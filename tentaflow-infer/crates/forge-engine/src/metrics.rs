@@ -111,6 +111,8 @@ pub struct EngineMetrics {
     pub hybrid_prefill_b2_tokens_total: AtomicU64,
     /// Pary prefill odrzucone przez capability i wykonane serialnie.
     pub hybrid_prefill_b2_fallbacks_total: AtomicU64,
+    /// Gauge: logiczny rozmiar zaalokowanego dedykowanego scratchu prefill B2.
+    pub hybrid_prefill_b2_scratch_bytes: AtomicU64,
     /// Wspólne weryfikacje dwóch pełnych draftów routera MTP+n-gram.
     pub mtp_ngram_b2_steps_total: AtomicU64,
     /// Wspólne weryfikacje routed B2 dla par N/N.
@@ -150,6 +152,7 @@ impl Default for EngineMetrics {
             hybrid_prefill_b2_steps_total: AtomicU64::new(0),
             hybrid_prefill_b2_tokens_total: AtomicU64::new(0),
             hybrid_prefill_b2_fallbacks_total: AtomicU64::new(0),
+            hybrid_prefill_b2_scratch_bytes: AtomicU64::new(0),
             mtp_ngram_b2_steps_total: AtomicU64::new(0),
             mtp_routed_nn_b2_steps_total: AtomicU64::new(0),
             mtp_routed_nm_b2_steps_total: AtomicU64::new(0),

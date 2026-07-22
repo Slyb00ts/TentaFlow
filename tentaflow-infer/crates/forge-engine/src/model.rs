@@ -10389,7 +10389,8 @@ impl Model {
         hybrid_prefill_b2_backend_capable(
             self.device.caps().vendor,
             self.device.caps().warp_size,
-        ) && chunk_tokens == 32
+        ) && self.kernels.hybrid_prefill_b2_artifacts_capable()
+            && chunk_tokens == 32
             && self.weights.descriptor.params.head_dim == 256
             && ssm.d_state == 128
             && ssm.d_conv > 0

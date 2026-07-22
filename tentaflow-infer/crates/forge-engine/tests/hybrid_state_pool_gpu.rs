@@ -2388,7 +2388,7 @@ fn benchmark_server_prefill_b2_raw() -> TestResult<()> {
         12,
         SpeculativeConfig::off(),
     )?;
-    let enabled = std::env::var("FORGE_HYBRID_PREFILL_BATCH").is_ok_and(|value| value == "1");
+    let enabled = std::env::var("FORGE_HYBRID_PREFILL_BATCH").map_or(true, |value| value == "1");
     let cpu_fallback = std::env::var_os("FORGE_BENCH_PREFILL_CPU_FALLBACK").is_some();
     let profile = std::env::var_os("FORGE_PROFILE_SERVER_PREFILL").is_some();
     for repetition in 0..=repetitions {
@@ -2613,6 +2613,83 @@ fn server_prefill_b2_t32_zachowuje_id_dla_ogonow_anulowania_i_reuse() -> TestRes
     let metrics = engine.metrics();
     assert!(metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed) >= 3);
     assert!(metrics.hybrid_prefill_b2_tokens_total.load(Ordering::Relaxed) >= 192);
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn server_prefill_b2_rollout_auto_off_force_zachowuje_pelne_id() -> TestResult<()> {
+    let Some(expected) = std::env::var_os("FORGE_TEST_HYBRID_PREFILL_EXPECT_B2") else {
+        eprintln!("pominięto smoke rollout prefill B2");
+        return Ok(());
+    };
+    let expected_enabled = match expected.to_string_lossy().as_ref() {
+        "0" => false,
+        "1" => true,
+        value => {
+            return Err(
+                format!("oczekiwanie smoke B2 wymaga 0 lub 1, otrzymano {value:?}").into(),
+            );
+        }
+    };
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("smoke rollout prefill B2 wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut oracle) = load_model_sized(&path, true, 128, 16) else {
+        return Ok(());
+    };
+    let vocab = oracle.weights.descriptor.params.vocab_size;
+    let prompts = [prompt(vocab, 3109, 32), prompt(vocab, 3701, 32)];
+    let expected_ids = [
+        generate(&mut oracle, &prompts[0], 4)?,
+        generate(&mut oracle, &prompts[1], 4)?,
+    ];
+    drop(oracle);
+    let Some(model) = load_model_sized(&path, true, 128, 16) else {
+        return Err("CUDA zniknęła przed smoke rollout prefill B2".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(&path)?),
+        2,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let blocker_prompt = prompt(vocab, 4001, 1);
+    let first_blocker = engine.submit(id_server_request(blocker_prompt.clone(), 96))?;
+    let second_blocker = engine.submit(id_server_request(blocker_prompt, 96))?;
+    let admission_deadline = Instant::now() + Duration::from_secs(5);
+    while engine.metrics().active_sequences.load(Ordering::Relaxed) != 2 {
+        if Instant::now() >= admission_deadline {
+            return Err("blockery smoke B2 nie zajęły obu slotów".into());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let first = engine.submit(id_server_request(prompts[0].clone(), 4))?;
+    let second = engine.submit(id_server_request(prompts[1].clone(), 4))?;
+    drop(first_blocker);
+    drop(second_blocker);
+    assert_eq!(collect_events(first)?, expected_ids[0]);
+    assert_eq!(collect_events(second)?, expected_ids[1]);
+    let metrics = engine.metrics();
+    let steps = metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed);
+    let tokens = metrics.hybrid_prefill_b2_tokens_total.load(Ordering::Relaxed);
+    let scratch = metrics
+        .hybrid_prefill_b2_scratch_bytes
+        .load(Ordering::Relaxed);
+    if expected_enabled {
+        assert_eq!(steps, 1);
+        assert_eq!(tokens, 64);
+        assert!(scratch > 0);
+    } else {
+        assert_eq!(steps, 0);
+        assert_eq!(tokens, 0);
+        assert_eq!(scratch, 0);
+    }
     engine.shutdown()?;
     Ok(())
 }
