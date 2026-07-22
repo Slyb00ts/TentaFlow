@@ -1903,7 +1903,15 @@ fn link_nvdec_branch(
     let depay = gst::ElementFactory::make(depay_name)
         .build()
         .map_err(|e| format!("{depay_name}: {e}"))?;
+    // Re-inject SPS/PPS before every IDR (`config-interval=-1`). A live Axis RTP
+    // stream sends codec parameters only periodically, and NVDEC is strict: it
+    // will not initialise its GPU decode session — and delivers ZERO frames while
+    // sitting in Playing — until it sees SPS/PPS. avdec_h264 (the CPU path)
+    // tolerates their absence, which is why software decode worked and hardware
+    // silently produced nothing. Branch B (mp4mux) already sets this on the same
+    // stream and records fine; the decode branch simply never did.
     let parse = gst::ElementFactory::make(parse_name)
+        .property_from_str("config-interval", "-1")
         .build()
         .map_err(|e| format!("{parse_name}: {e}"))?;
     let dec = gst::ElementFactory::make(dec_name)
