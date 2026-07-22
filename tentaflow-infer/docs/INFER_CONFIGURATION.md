@@ -32,8 +32,8 @@ LUB katalog snapshotu HF (safetensors + config.json + tokenizer.json).
 |---|---|---|
 | `--ctx <N>` | `0` | Maksymalna długość kontekstu w tokenach. `0` = maksimum modelu (`max_position_embeddings`). Dowolna wartość jest honorowana (256, 200000, …) do limitu modelu; KV cache jest sizowany pod tę wartość — o tym, czy się zmieści, decyduje VRAM. |
 | `--weights-pool-gb <F>` | serve: `16`; run/bench/embed: `0` | Rozmiar puli VRAM na wagi w GiB. `0` = automatyczny podział wolnego VRAM (KV dostaje swój wyliczony budżet najpierw, reszta minus margines idzie na wagi). W serve wartość jest przycinana, żeby wagi+KV+aktywacje zawsze mieściły się w wolnym VRAM. |
-| `--kv-pages <N>` (serve) | `512` | Liczba stron KV cache (32 tokeny/strona) współdzielonych przez wszystkie sekwencje. Bez tieringu automatycznie podnoszona do co najmniej jednego pełnego okna `--ctx` (budżet ponad okno = współbieżne sekwencje). Z `--kv-tier` przeciwnie: to jest GORĄCY budżet VRAM (przycinany do okna), a reszta kontekstu spilluje do RAM/NVMe. |
-| `--kv-pages <N>` (run / bench) | `0` | `0` = pula na pełne okno `--ctx` (dzisiejsze zachowanie). Jawna wartość ogranicza gorący working set VRAM — użyteczne z `--kv-tier`. |
+| `--kv-pages <N>` (serve) | `512` | Liczba stron KV cache (32 tokeny/strona) współdzielonych przez wszystkie sekwencje. Bez tieringu automatycznie podnoszona do co najmniej jednego pełnego okna `--ctx` (budżet ponad okno = współbieżne sekwencje). Z `--kv-tier` wartość `0` oznacza pełne okno, a wartość jawna jest przycinana do okna i musi spełniać minimum rezydencji. |
+| `--kv-pages <N>` (run / bench) | `0` | `0` = pula na pełne okno `--ctx`. Bez tieringu jawna wartość mniejsza od okna jest podnoszona do pełnego okna; z `--kv-tier` ogranicza gorący working set VRAM, a reszta kontekstu trafia do RAM/NVMe. |
 
 Wewnętrzne (ModelConfig, niewystawione jako flagi): `kv_page_size=32` tokeny/strona.
 
@@ -171,7 +171,7 @@ jawny błąd Unsupported — tracked follow-up).
 
 | Flaga | Domyślnie | Opis |
 |---|---|---|
-| `--max-active <N>` | `8` | Maksimum jednocześnie dekodujących sekwencji (górny rozmiar batcha; ≥1). Kwoty KV i admission control liczą się względem tej wartości. |
+| `--max-active <N>` | `8` dla modelu dense, `1` dla hybrydowego lub MTP | Maksimum jednocześnie dekodujących sekwencji (górny rozmiar batcha; ≥1). Jawna wartość zawsze ma pierwszeństwo. |
 | `--batch-min <N>` | `12` | Próg włączenia batched forward: poniżej N jednocześnie dekodujących sekwencji działa strojona ścieżka pojedynczej sekwencji (szybsza przy małej współbieżności — crossover z GEMM-ów tensor-core zmierzony ~12). |
 | `--prefill-chunk <N>` | `16` | Ile tokenów promptu jedna sekwencja może prefillować w jednej iteracji schedulera (chroni ITL pozostałych sekwencji). Wewnętrzny sufit chunka: 1024. |
 
@@ -183,6 +183,14 @@ rezerwacja obejmuje tylko limit stron rezydentnych. Wewnętrzny
 `max_pages_per_seq` ogranicza pojedynczą sekwencję niezależnie od liczby stron w
 całej puli, a batchowy krok sprawdza wszystkie potrzebne przyrosty przed
 jakąkolwiek mutacją KV.
+
+Pula KV jest liczona podczas startupu z efektywnego `--kv-pages`, a nie mnożona
+przez `--max-active`; scheduler dopuszcza najwyżej tyle pełnych okien, ile mieści
+współdzielona pula i limit aktywnych sekwencji. Domyślne `serve --kv-pages 512`
+dla Qwen3.6 z 16 warstwami Attention nadal zajmuje 1088 MiB w F16. Oszczędność
+po usunięciu dawnego minimum 1 GiB pojawia się przy efektywnych 128 stronach
+(`--ctx 4096 --kv-pages 128`): 320 MiB bez spekulacji albo 336 MiB z natywnym
+MTP. W tieringu pula mniejsza od minimum rezydencji jest odrzucana przy starcie.
 
 Scheduler szuka możliwego do przyjęcia requestu w ograniczonym oknie kolejki:
 `2 * max_active`, ograniczonym do 2-16 pozycji. Może ominąć duży request
@@ -299,6 +307,7 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 |---|---|---|
 | `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
 | `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
+| `FORGE_HYBRID_PREFILL_CHUNK` | `auto` | Wewnętrzny chunk C1 hybrydowego prefill, wybierany raz podczas ładowania modelu; `auto` i brak zmiennej są równoważne. Auto wybiera `128` wyłącznie dla zweryfikowanego gęstego qwen35 z `d_state=128`, FFN NVFP4 GGUF, kompletem artefaktów T2..T128, wystarczającym budżetem i NVIDIA warp32. Obowiązkowy scratch hybrydowy jest alokowany przed sprawdzeniem budżetu. Gdy T128 nie przechodzi gate, Auto wybiera największy istniejący wariant zgodny z backendem, artefaktami i budżetem: zweryfikowany NVIDIA zachowuje co najmniej T32, a backend przenośny wybiera do T16. Estymator uwzględnia zwykły prefill, verifier cap=4, wybrany cap oraz rezerwę 64 MiB; po wyborze extended wszystkie bufory i staging powstają podczas startupu. Pozostałe formaty zachowują `32`. Jawna wartość `3..=1024` pozostaje rygorystyczna: jest respektowana albo startup kończy się błędem `Unsupported`, bez automatycznego obniżenia. Nie zmienia osobnego prefill B2, który nadal ma stałe `B=2`, `T=32`. |
 | `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
 | `FORGE_MTP_NGRAM_BATCH` | `auto` | Rollout parowania N/N B2 dwóch pełnych draftów n-gram o tym samym K=2 albo K=3. Brak zmiennej wybiera `auto`: ścieżka działa tylko dla strukturalnie zgodnego modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1. `1` wymusza eksperymentalny backend, także AMD/Metal, ale nadal odrzuca model bez strukturalnego capability. Inna wartość jest błędem konfiguracji. |
 | `FORGE_MTP_NGRAM_MIXED_BATCH` | `0` | Eksperymentalne parowanie N/M i M/M przez wspólny verifier B2. `1` wymaga aktywnego `FORGE_MTP_NGRAM_BATCH` i zachowuje kill-switch `FORGE_NATIVE_MTP_B2`; `0` lub brak zmiennej pozostawia automatyczny rollout wyłącznie dla N/N. Inna wartość jest błędem konfiguracji. |

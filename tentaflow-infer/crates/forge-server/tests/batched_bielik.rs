@@ -63,7 +63,15 @@ fn batched_reproduces_golden() {
         0,
         PoolSizes {
             weights: 8 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16, false).max(1 << 30),
+            kv_cache: kv_pool_bytes(
+                &desc,
+                kv_page_size,
+                kv_pages,
+                forge_engine::kv::KvQuant::F16,
+                false,
+            )
+            .unwrap()
+            .max(1 << 30),
             activations: 2 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -106,7 +114,9 @@ fn batched_reproduces_golden() {
     while ids[0].len() < steps {
         let params: Vec<SeqSampleParams> = (0..n).map(|_| greedy_seq_params()).collect();
         let mut refs: Vec<&mut _> = seqs.iter_mut().collect();
-        let out = model.batched_decode(&mut refs, &cur, &params).expect("batched decode");
+        let out = model
+            .batched_decode(&mut refs, &cur, &params)
+            .expect("batched decode");
         for j in 0..n {
             ids[j].push(out[j]);
             cur[j] = out[j];

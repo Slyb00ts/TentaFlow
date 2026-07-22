@@ -275,7 +275,7 @@ fn rot_tier_spill_restore_roundtrip_is_bit_exact() {
         model.prefill_chunk(&mut seq, chunk).unwrap();
     }
     // Snapshot layer 0's packed + scale bytes per logical page.
-    let region_bytes = model.kv.cfg.tier_region_bytes();
+    let region_bytes = model.kv.cfg.tier_region_bytes().unwrap();
     let n_pages = seq.pages.len();
     let mut snap: Vec<Vec<Vec<u8>>> = Vec::new();
     {

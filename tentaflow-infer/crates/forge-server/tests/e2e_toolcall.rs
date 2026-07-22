@@ -69,7 +69,14 @@ async fn qwen3_tool_calls_end_to_end() {
                 0,
                 PoolSizes {
                     weights: 3 << 30,
-                    kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16, false),
+                    kv_cache: kv_pool_bytes(
+                        &desc,
+                        kv_page_size,
+                        kv_pages,
+                        forge_engine::kv::KvQuant::F16,
+                        false,
+                    )
+                    .unwrap(),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
                 },
@@ -181,7 +188,10 @@ async fn qwen3_tool_calls_end_to_end() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let forced = &body["choices"][0]["message"]["tool_calls"];
     let forced = forced.as_array().expect("forced tool_calls array");
-    assert!(!forced.is_empty(), "required must yield a tool call: {body}");
+    assert!(
+        !forced.is_empty(),
+        "required must yield a tool call: {body}"
+    );
     assert_eq!(forced[0]["function"]["name"], "get_weather");
     let forced_args = forced[0]["function"]["arguments"].as_str().unwrap();
     let _: serde_json::Value =
@@ -242,7 +252,10 @@ async fn qwen3_tool_calls_end_to_end() {
     }
     // Qwen3 thinks by default; reasoning must be extracted, never in content.
     if let Some(content) = message["content"].as_str() {
-        assert!(!content.contains("<think>"), "think block leaked: {content}");
+        assert!(
+            !content.contains("<think>"),
+            "think block leaked: {content}"
+        );
     }
 
     // Streaming: same request; tool calls arrive as incremental deltas.
@@ -300,7 +313,10 @@ async fn qwen3_tool_calls_end_to_end() {
         assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(calls[0]["index"], 0);
         assert_eq!(calls[0]["function"]["name"], "get_weather");
-        assert!(calls[0]["function"]["arguments"].as_str().unwrap().contains("Krak"));
+        assert!(calls[0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("Krak"));
     } else {
         assert!(
             !content.trim().is_empty() || !reasoning.trim().is_empty(),

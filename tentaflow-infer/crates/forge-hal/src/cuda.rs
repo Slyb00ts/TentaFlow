@@ -57,8 +57,11 @@ impl PoolSizes {
         }
     }
 
-    fn total(&self) -> usize {
-        self.weights + self.kv_cache + self.activations
+    fn total(&self) -> Result<usize> {
+        self.weights
+            .checked_add(self.kv_cache)
+            .and_then(|value| value.checked_add(self.activations))
+            .ok_or_else(|| ForgeError::Device("suma rozmiarów pul CUDA przekracza usize".into()))
     }
 }
 
@@ -404,9 +407,10 @@ impl CudaDevice {
         let (free, _total) = ctx
             .mem_get_info()
             .map_err(|e| cu_err("cuMemGetInfo", e))?;
-        if pools.total() > free {
+        let requested = pools.total()?;
+        if requested > free {
             return Err(ForgeError::OutOfMemory {
-                requested: pools.total(),
+                requested,
                 available: free,
             });
         }
@@ -967,5 +971,22 @@ impl Device for CudaDevice {
             PoolArena::Ring(ring) => ring.reset(),
             _ => unreachable!("activations pool is always a ring"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PoolSizes;
+
+    #[test]
+    fn suma_pul_cuda_odrzuca_przepelnienie() {
+        let pools = PoolSizes {
+            weights: usize::MAX,
+            kv_cache: 1,
+            activations: 0,
+            kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
+        };
+
+        assert!(pools.total().is_err());
     }
 }

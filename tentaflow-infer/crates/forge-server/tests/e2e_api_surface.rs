@@ -57,7 +57,8 @@ async fn api_surface_end_to_end() {
                         kv_pages,
                         forge_engine::kv::KvQuant::F16,
                         false,
-                    ),
+                    )
+                    .unwrap(),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
                 },
@@ -144,7 +145,10 @@ async fn api_surface_end_to_end() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    assert!(ct.contains("text/plain"), "wrong /metrics content-type: {ct}");
+    assert!(
+        ct.contains("text/plain"),
+        "wrong /metrics content-type: {ct}"
+    );
     let m0 = m0.text().await.unwrap();
     assert!(
         m0.contains("forge_engine_requests_finished_total"),
@@ -219,7 +223,10 @@ async fn api_surface_end_to_end() {
     )
     .await;
     assert_eq!(status, 200, "messages stop_sequence case failed: {body}");
-    println!("[messages] stop_sequence case stop_reason={}", body["stop_reason"]);
+    println!(
+        "[messages] stop_sequence case stop_reason={}",
+        body["stop_reason"]
+    );
     // The stop token may or may not appear depending on the model; when it does
     // the reason must be stop_sequence, otherwise end_turn/max_tokens.
     let stop = body["stop_reason"].as_str().unwrap();
@@ -272,7 +279,10 @@ async fn api_surface_end_to_end() {
     // Event order contract: message_start → content_block_start → (deltas) →
     // content_block_stop → message_delta → message_stop.
     assert_eq!(events.first().map(String::as_str), Some("message_start"));
-    assert_eq!(events.get(1).map(String::as_str), Some("content_block_start"));
+    assert_eq!(
+        events.get(1).map(String::as_str),
+        Some("content_block_start")
+    );
     assert_eq!(events.last().map(String::as_str), Some("message_stop"));
     assert!(events.iter().any(|e| e == "content_block_delta"));
     assert!(events.iter().any(|e| e == "content_block_stop"));
@@ -302,7 +312,11 @@ async fn api_surface_end_to_end() {
     let batch_secs = t_batch.elapsed().as_secs_f64();
     assert_eq!(status, 200, "batch completions failed: {body}");
     let choices = body["choices"].as_array().unwrap();
-    assert_eq!(choices.len(), 4, "must return one choice per prompt: {body}");
+    assert_eq!(
+        choices.len(),
+        4,
+        "must return one choice per prompt: {body}"
+    );
     for (i, c) in choices.iter().enumerate() {
         assert_eq!(c["index"].as_u64().unwrap(), i as u64, "choice index order");
         let t = c["text"].as_str().unwrap_or("");
@@ -315,7 +329,14 @@ async fn api_surface_end_to_end() {
     println!("[batch] 4 prompts completed in {batch_secs:.2}s (batched decode)");
 
     // ---- (5) /metrics moved after real work ----
-    let m1 = client.get(&metrics_url).send().await.unwrap().text().await.unwrap();
+    let m1 = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let finished1 = scrape_counter(&m1, "forge_engine_requests_finished_total");
     let gen1 = scrape_counter(&m1, "forge_engine_generated_tokens_total");
     let http_msgs = m1
