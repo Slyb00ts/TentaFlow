@@ -1941,8 +1941,29 @@ fn link_nvdec_branch(
     pipeline
         .add_many([&depay, &parse, &dec])
         .map_err(|e| format!("add_many nvdec: {e}"))?;
-    gst::Element::link_many([queue_a, &depay, &parse, &dec, downstream])
-        .map_err(|e| format!("link nvdec branch: {e}"))?;
+    // Feed the decoder Annex-B byte-stream, not AVC. The pad probes proved
+    // depay+parse emit valid buffers (SPS/PPS present in codec_data) while
+    // nvh264dec outputs nothing on the live Axis: it was being handed
+    // `stream-format=avc`, where parameter sets live only in codec_data. Forcing
+    // `byte-stream` makes h264parse put SPS/PPS inline — and only then does the
+    // `config-interval=-1` above take effect (it is a no-op in AVC mode) — which is
+    // the format hardware decoders reliably initialise on for a mid-stream RTSP
+    // join. Everything up to `parse` links normally; `parse → dec` carries the caps.
+    let byte_stream_caps = gst::Caps::builder(if encoding.eq_ignore_ascii_case("H264") {
+        "video/x-h264"
+    } else {
+        "video/x-h265"
+    })
+    .field("stream-format", "byte-stream")
+    .field("alignment", "au")
+    .build();
+    gst::Element::link_many([queue_a, &depay, &parse])
+        .map_err(|e| format!("link nvdec front: {e}"))?;
+    parse
+        .link_filtered(&dec, &byte_stream_caps)
+        .map_err(|e| format!("link parse->dec byte-stream: {e}"))?;
+    dec.link(downstream)
+        .map_err(|e| format!("link dec->downstream: {e}"))?;
 
     // Diagnostic pad probes on each stage's src pad: log the FIRST buffer and its
     // caps at depay, parse and decoder. NVDEC decodes this Axis stream fine from a
@@ -3285,6 +3306,27 @@ pub async fn run_rtsp_session(
                                 );
                                 terminate = Some(redact_url_in_text(&raw));
                                 break;
+                            }
+                            // Hardware decoders report a silent no-frames failure as
+                            // a non-fatal Warning, not an Error, so it never surfaced.
+                            // Log it (with the emitting element) so a stuck nvh264dec
+                            // says WHY instead of just timing out the warmup window.
+                            MessageView::Warning(w) => {
+                                let src = w
+                                    .src()
+                                    .map(|s| s.name().to_string())
+                                    .unwrap_or_default();
+                                let raw = format!(
+                                    "{} ({})",
+                                    w.error(),
+                                    w.debug().unwrap_or_default()
+                                );
+                                tracing::warn!(
+                                    camera_id = %cam_id,
+                                    element = %src,
+                                    "rtsp: element warning: {}",
+                                    redact_url_in_text(&raw)
+                                );
                             }
                             _ => {}
                         }
