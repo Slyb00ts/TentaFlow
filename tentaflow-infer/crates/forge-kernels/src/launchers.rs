@@ -117,6 +117,14 @@ fn raw_nvfp4_dp4a_supported(is_nvidia: bool, warp_size: u32) -> bool {
     is_nvidia && warp_size == 32
 }
 
+fn q8_nvfp4_pack_launch(warp_size: u32) -> (usize, u32) {
+    if warp_size == 32 {
+        (2, 256)
+    } else {
+        (1, 64)
+    }
+}
+
 pub struct Kernels {
     device: Arc<dyn Device>,
     artifacts: KernelArtifacts,
@@ -1510,6 +1518,57 @@ impl Kernels {
             .scalar(rows as i64)
             .scalar(1i64)
             .scalar(output_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Liczy draftowe logity F32 bezpośrednio z bloków GGUF NVFP4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_nvfp4_gguf_out_f32(
+        &self,
+        y: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) || !output_scale.is_finite() {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_nvfp4_gguf_out_f32 wymaga rows > 0, cols % 64 == 0 i skończonej skali; rows={rows}, cols={cols}, scale={output_scale}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_out_f32 output", &[rows], 4)?;
+        let weight_bytes =
+            checked_buffer_bytes("gemv_nvfp4_gguf_out_f32 weights", &[rows, cols / 64], 36)?;
+        let input_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_out_f32 input", &[cols], 2)?;
+        if y.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "gemv_nvfp4_gguf_out_f32: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        let nvidia = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        let name = if nvidia {
+            "gemm_nvfp4_gguf_out_f32_b1_nvidia"
+        } else {
+            "gemv_nvfp4_gguf_out_f32"
+        };
+        let grid_x = u32::try_from(if nvidia { rows.div_ceil(2) } else { rows }).map_err(|_| {
+            ForgeError::Kernel("gemv_nvfp4_gguf_out_f32: siatka przekracza u32".into())
+        })?;
+        let kernel = self.artifacts.get(name)?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (if nvidia { 64 } else { 256 }, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new().buf(y).buf(weights).buf(x).scalar(cols as i64);
+        let args = if nvidia {
+            args.scalar(rows as i64).scalar(1i64).scalar(output_scale)
+        } else {
+            args.scalar(output_scale)
+        };
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -4145,6 +4204,54 @@ impl Kernels {
             .scalar(rows as i64)
             .scalar(inv_global_scale);
         self.device.launch(kernel, &cfg, &args, stream)
+    }
+
+    /// Przepakowuje rezydentną macierz Q8_0 do bloków GGUF NVFP4 na GPU.
+    pub fn pack_q8_0_nvfp4_gguf(
+        &self,
+        output: &DevBuffer,
+        source: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "pack_q8_0_nvfp4_gguf wymaga rows > 0 i cols % 64 == 0, otrzymano [{rows}, {cols}]"
+            )));
+        }
+        let blocks = rows.checked_mul(cols / 64).ok_or_else(|| {
+            ForgeError::Kernel("pack_q8_0_nvfp4_gguf: przepełnienie liczby bloków".into())
+        })?;
+        let output_bytes = blocks.checked_mul(36).ok_or_else(|| {
+            ForgeError::Kernel("pack_q8_0_nvfp4_gguf: przepełnienie wyjścia".into())
+        })?;
+        let source_bytes = rows
+            .checked_mul(cols / 32)
+            .and_then(|count| count.checked_mul(34))
+            .ok_or_else(|| {
+                ForgeError::Kernel("pack_q8_0_nvfp4_gguf: przepełnienie wejścia".into())
+            })?;
+        if output.len() < output_bytes || source.len() < source_bytes {
+            return Err(ForgeError::Kernel(
+                "pack_q8_0_nvfp4_gguf: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let (blocks_per_cta, block_threads) = q8_nvfp4_pack_launch(self.device.caps().warp_size);
+        let grid_x = u32::try_from(blocks.div_ceil(blocks_per_cta)).map_err(|_| {
+            ForgeError::Kernel("pack_q8_0_nvfp4_gguf: siatka przekracza u32".into())
+        })?;
+        let kernel = self.artifacts.get("pack_q8_0_nvfp4_gguf")?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(source)
+            .scalar(blocks as i64);
+        self.device.launch(kernel, &config, &args, stream)
     }
 
     /// Przepakowuje rezydentną macierz F16 do E4M3 na GPU.
@@ -10814,7 +10921,7 @@ impl Kernels {
 
 #[cfg(test)]
 mod nvfp4_gguf_dispatch_tests {
-    use super::{nvfp4_gguf_dispatch, raw_nvfp4_dp4a_supported};
+    use super::{nvfp4_gguf_dispatch, q8_nvfp4_pack_launch, raw_nvfp4_dp4a_supported};
 
     #[test]
     fn wybiera_dokladne_buckety_weryfikatora() {
@@ -10878,5 +10985,11 @@ mod nvfp4_gguf_dispatch_tests {
         assert!(!raw_nvfp4_dp4a_supported(true, 64));
         assert!(!raw_nvfp4_dp4a_supported(false, 32));
         assert!(!raw_nvfp4_dp4a_supported(false, 64));
+    }
+
+    #[test]
+    fn packer_uzywa_logicznych_grup_dla_warp64() {
+        assert_eq!(q8_nvfp4_pack_launch(32), (2, 256));
+        assert_eq!(q8_nvfp4_pack_launch(64), (1, 64));
     }
 }

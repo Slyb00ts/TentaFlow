@@ -42,7 +42,7 @@ from src.deltanet_verify import (
     deltanet_gated_scan_inplace_shared_d128_f16,
     deltanet_commit_checkpoint_f32,
 )
-from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8, gemv_nvfp4_gguf_f16
+from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8, gemv_nvfp4_gguf_f16, gemv_nvfp4_gguf_out_f32, pack_q8_0_nvfp4_gguf
 from src.nvfp4_gguf_dp4a import gemv_nvfp4_gguf_q8_1_f16
 from src.mtp import mtp_prepare_f16, mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16, mtp_verify_decide, mtp_select_row_f16, mtp_select_row_f32
 from src.nvfp4_batch import gemv_batch_nvfp4_f16_b4, gemv_batch_nvfp4_f16_b8, gemv_batch_nvfp4_f16_b16, gemv_batch_f16_out_f32_b4, gemv_batch_f16_out_f32_b8
@@ -207,6 +207,7 @@ from src.nvfp4_gguf_batch import (
     gemm_nvfp4_gguf_f16_b3,
     gemm_nvfp4_gguf_f16_b4,
     gemm_nvfp4_gguf_f16_b1_nvidia,
+    gemm_nvfp4_gguf_out_f32_b1_nvidia,
     gemm_nvfp4_gguf_f16_b3_nvidia,
     gemm_nvfp4_gguf_f16_b4_nvidia,
     gemm_nvfp4_gguf_f16_b8,
@@ -238,6 +239,8 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
     # dlatego nie wymagaja instrukcji FP8 dostepnych dopiero od Ada.
     return (
         name == "gemv_nvfp4_gguf_f16"
+        or name == "gemv_nvfp4_gguf_out_f32"
+        or name == "pack_q8_0_nvfp4_gguf"
         or name == "gemv_nvfp4_gguf_q8_1_f16"
         or name == "mtp_prepare_f16"
         or name == "mtp_stage_step"
@@ -250,6 +253,7 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
         or name == "gemm_nvfp4_gguf_f16_b3"
         or name == "gemm_nvfp4_gguf_f16_b4"
         or name == "gemm_nvfp4_gguf_f16_b1_nvidia"
+        or name == "gemm_nvfp4_gguf_out_f32_b1_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b3_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b4_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b8"
@@ -435,6 +439,10 @@ def main() raises:
     entries.append(_finalize(out_dir, "gemv_nvfp4_f16"))
     _ = ctx.compile_function[gemv_nvfp4_gguf_f16, dump_asm=Path("gemv_nvfp4_gguf_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_f16"))
+    _ = ctx.compile_function[gemv_nvfp4_gguf_out_f32, dump_asm=Path("gemv_nvfp4_gguf_out_f32.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_out_f32"))
+    _ = ctx.compile_function[pack_q8_0_nvfp4_gguf, dump_asm=Path("pack_q8_0_nvfp4_gguf.ptx")]()
+    entries.append(_finalize(out_dir, "pack_q8_0_nvfp4_gguf"))
     _ = ctx.compile_function[gemv_nvfp4_gguf_q8_1_f16, dump_asm=Path("gemv_nvfp4_gguf_q8_1_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_q8_1_f16"))
     _ = ctx.compile_function[mtp_prepare_f16, dump_asm=Path("mtp_prepare_f16.ptx")]()
@@ -469,6 +477,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b4"))
     _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b1_nvidia, dump_asm=Path("gemm_nvfp4_gguf_f16_b1_nvidia.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b1_nvidia"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_out_f32_b1_nvidia, dump_asm=Path("gemm_nvfp4_gguf_out_f32_b1_nvidia.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_out_f32_b1_nvidia"))
     _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b3_nvidia, dump_asm=Path("gemm_nvfp4_gguf_f16_b3_nvidia.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b3_nvidia"))
     _ = ctx.compile_function[gemm_nvfp4_gguf_f16_b4_nvidia, dump_asm=Path("gemm_nvfp4_gguf_f16_b4_nvidia.ptx")]()

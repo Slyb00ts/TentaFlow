@@ -284,6 +284,7 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 | Flaga | Domyślnie | Opis |
 |---|---|---|
 | `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
+| `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
 
 Przykład dla modelu z natywną głową MTP:
 

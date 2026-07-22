@@ -120,6 +120,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "deltanet_beta_sigmoid_f32",
     "gemv_nvfp4_f16",
     "gemv_nvfp4_gguf_f16",
+    "gemv_nvfp4_gguf_out_f32",
+    "pack_q8_0_nvfp4_gguf",
     "gemv_nvfp4_gguf_q8_1_f16",
     "mtp_prepare_f16",
     "mtp_stage_step",
@@ -135,6 +137,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_nvfp4_gguf_f16_b3",
     "gemm_nvfp4_gguf_f16_b4",
     "gemm_nvfp4_gguf_f16_b1_nvidia",
+    "gemm_nvfp4_gguf_out_f32_b1_nvidia",
     "gemm_nvfp4_gguf_f16_b3_nvidia",
     "gemm_nvfp4_gguf_f16_b4_nvidia",
     "gemm_nvfp4_gguf_f16_b8",
@@ -651,6 +654,8 @@ mod tests {
 
     const PORTABLE_RAW_NVFP4: &[&str] = &[
         "gemv_nvfp4_gguf_f16",
+        "gemv_nvfp4_gguf_out_f32",
+        "pack_q8_0_nvfp4_gguf",
         "gemv_nvfp4_gguf_q8_1_f16",
         "mtp_prepare_f16",
         "mtp_stage_step",
@@ -662,6 +667,7 @@ mod tests {
         "gemm_nvfp4_gguf_f16_b3",
         "gemm_nvfp4_gguf_f16_b4",
         "gemm_nvfp4_gguf_f16_b3_nvidia",
+        "gemm_nvfp4_gguf_out_f32_b1_nvidia",
         "gemm_nvfp4_gguf_f16_b4_nvidia",
         "gemm_nvfp4_gguf_f16_b8",
         "gemm_nvfp4_gguf_f16_b16",

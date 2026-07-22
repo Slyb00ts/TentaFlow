@@ -492,6 +492,9 @@ coherent Polish on the RTX 4090.
   jest z nimi bitowo zgodny na wszystkich projekcjach ThinkingCap. W izolacji
   jest 1,8-3,2x szybszy od starego B1 F16. Prose128/prose512, repeat i natywne
   MTP zachowują parity po ujednoliceniu serial i verifier na tej matematyce.
+- Opcjonalny `FORGE_MTP_DRAFT_HEAD=nvfp4` przepakowuje współdzielony head Q8_0
+  do osobnej kopii GGUF NVFP4 wyłącznie dla propozycji MTP. Packer i F32 GEMV są
+  kernelami Mojo; target verifier nadal używa oryginalnego Q8_0.
 
 ## Hybrydowy prefill i catch-up MTP
 

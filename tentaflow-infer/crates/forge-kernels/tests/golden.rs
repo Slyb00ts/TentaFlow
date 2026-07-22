@@ -767,6 +767,140 @@ fn make_q8_0(rows: usize, cols: usize) -> Vec<u8> {
     weights
 }
 
+fn fp32_to_ue4m3(mut value: f32) -> u8 {
+    if value <= 0.0 {
+        return 0;
+    }
+    value = value.min(448.0);
+    let bits = value.to_bits();
+    let fp32_exp = ((bits >> 23) & 0xff) as i32 - 127;
+    let fp32_man = ((bits >> 20) & 7) as i32;
+    let mut exponent = fp32_exp + 7;
+    if exponent <= 0 {
+        return (value.mul_add(512.0, 0.5) as i32).clamp(0, 7) as u8;
+    }
+    if exponent >= 15 {
+        return 0x7e;
+    }
+    let mut mantissa = fp32_man + ((bits >> 19) & 1) as i32;
+    if mantissa > 7 {
+        mantissa = 0;
+        exponent += 1;
+        if exponent >= 15 {
+            return 0x7e;
+        }
+    }
+    ((exponent << 3) | mantissa) as u8
+}
+
+fn ue4m3(value: u8) -> f32 {
+    if value == 0 || value == 0x7f {
+        return 0.0;
+    }
+    let exponent = (value >> 3) & 0x0f;
+    let mantissa = (value & 7) as f32;
+    if exponent == 0 {
+        mantissa / 512.0
+    } else {
+        (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent as i32 - 7)
+    }
+}
+
+fn best_e2m1(value: f32, scale: f32) -> u8 {
+    const VALUES: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0,
+        -3.0, -4.0, -6.0,
+    ];
+    let mut best = 0;
+    let mut error = value.abs();
+    for (index, candidate) in VALUES.iter().enumerate().skip(1) {
+        let next = (candidate * scale - value).abs();
+        if next < error {
+            best = index as u8;
+            error = next;
+        }
+    }
+    best
+}
+
+fn q8_0_to_nvfp4_reference(source: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let blocks = rows * cols / 64;
+    let mut output = vec![0u8; blocks * 36];
+    for block in 0..blocks {
+        for subblock in 0..4 {
+            let q8_block = block * 2 + subblock / 2;
+            let q8_base = q8_block * 34;
+            let q8_scale = f16::from_le_bytes([source[q8_base], source[q8_base + 1]]).to_f32();
+            let q8_offset = q8_base + 2 + (subblock % 2) * 16;
+            let values: Vec<f32> = source[q8_offset..q8_offset + 16]
+                .iter()
+                .map(|value| (*value as i8) as f32 * q8_scale)
+                .collect();
+            let amax = values.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
+            let scale_code = fp32_to_ue4m3(amax / 6.0);
+            let scale = ue4m3(scale_code);
+            output[block * 36 + subblock] = scale_code;
+            for index in 0..8 {
+                let low = best_e2m1(values[index], scale);
+                let high = best_e2m1(values[index + 8], scale);
+                output[block * 36 + 4 + subblock * 8 + index] = low | (high << 4);
+            }
+        }
+    }
+    output
+}
+
+#[test]
+fn gpu_pack_q8_0_nvfp4_i_gemv_f32_zgadza_sie_z_referencja() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (17usize, 128usize);
+    let q8 = make_q8_0(rows, cols);
+    let expected = q8_0_to_nvfp4_reference(&q8, rows, cols);
+    let source = dev.alloc(q8.len(), MemKind::Device, Pool::Weights).unwrap();
+    let packed = dev
+        .alloc(expected.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&q8, &source, 0).unwrap();
+    kernels
+        .pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)
+        .unwrap();
+
+    let x: Vec<f32> = (0..cols)
+        .map(|index| f16::from_f32(fill(index) * 0.07).to_f32())
+        .collect();
+    let x_dev = upload_f16(dev.as_ref(), &x);
+    let logits = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+    kernels
+        .gemv_nvfp4_gguf_out_f32(&logits, &packed, &x_dev, rows, cols, 1.0, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    assert_eq!(download_u8(dev.as_ref(), &packed, expected.len()), expected);
+    let weights = forge_formats::dequant::dequantize_to_f32(
+        DType::F32,
+        QuantKind::NVFP4Gguf,
+        &expected,
+        rows * cols,
+    )
+    .unwrap();
+    let reference: Vec<f32> = (0..rows)
+        .map(|row| (0..cols).map(|col| weights[row * cols + col] * x[col]).sum())
+        .collect();
+    let got = download_f32(dev.as_ref(), &logits, rows);
+    assert!(max_abs_err(&got, &reference) < 0.02);
+    let top = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap()
+            .0
+    };
+    assert_eq!(top(&got), top(&reference));
+}
+
 fn q8_0_dot(weights: &[u8], row: usize, cols: usize, x: &[f32]) -> f32 {
     let blocks_per_row = cols / 32;
     let row_base = row * blocks_per_row * 34;

@@ -1238,7 +1238,7 @@ impl Model {
         Self::finish(device, weights, cfg)
     }
 
-    fn finish(device: Arc<dyn Device>, weights: ModelWeights, cfg: ModelConfig) -> Result<Self> {
+    fn finish(device: Arc<dyn Device>, mut weights: ModelWeights, cfg: ModelConfig) -> Result<Self> {
         let p = &weights.descriptor.params;
         // head_dim 256 has an f16-only attention specialization (qwen35moe
         // gated attention layers); the hybrid arch always uses the f16 cache.
@@ -1325,6 +1325,54 @@ impl Model {
             kv_layer_map,
         )?;
         let stream = device.create_stream()?;
+        let draft_head_mode = std::env::var("FORGE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "q8".into());
+        match draft_head_mode.as_str() {
+            "q8" => {}
+            "nvfp4" => {
+                let (source, rows, cols) = match weights.mtp.as_ref().map(|mtp| &mtp.output) {
+                    Some(DevWeight::Q8_0 { buf, rows, cols }) => (buf.clone(), *rows, *cols),
+                    Some(_) => {
+                        return Err(ForgeError::Unsupported(
+                            "FORGE_MTP_DRAFT_HEAD=nvfp4 wymaga headu źródłowego Q8_0".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(ForgeError::Unsupported(
+                            "FORGE_MTP_DRAFT_HEAD=nvfp4 wymaga modelu z MTP".into(),
+                        ));
+                    }
+                };
+                let bytes = rows
+                    .checked_mul(cols / 64)
+                    .and_then(|blocks| blocks.checked_mul(36))
+                    .ok_or_else(|| {
+                        ForgeError::Format("przepełnienie rozmiaru headu draftu NVFP4".into())
+                    })?;
+                if let Some(available) = device.pool_available(Pool::Weights) {
+                    if bytes > available {
+                        return Err(ForgeError::OutOfMemory {
+                            requested: bytes,
+                            available,
+                        });
+                    }
+                }
+                let packed = device.alloc(bytes, MemKind::Device, Pool::Weights)?;
+                kernels.pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)?;
+                device.synchronize()?;
+                weights.mtp.as_mut().expect("sprawdzono head MTP").draft_output =
+                    Some(DevWeight::NvFp4Gguf {
+                        buf: packed,
+                        output_scale: 1.0,
+                        rows,
+                        cols,
+                    });
+            }
+            value => {
+                return Err(ForgeError::Unsupported(format!(
+                    "FORGE_MTP_DRAFT_HEAD={value}: oczekiwano q8 lub nvfp4"
+                )));
+            }
+        }
         let page_table_dev = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
         let seq_len_dev = device.alloc(4, MemKind::Device, Pool::Weights)?;
         let (tier, tier_bufs) = if cfg.kv_tier.enabled() {
@@ -3099,9 +3147,20 @@ impl Model {
             DevWeight::NvFp4 { .. } => Err(ForgeError::Unsupported(
                 "NVFP4 lm_head has no f32-logit kernel yet".into(),
             )),
-            DevWeight::NvFp4Gguf { .. } => Err(ForgeError::Unsupported(
-                "GGUF NVFP4 lm_head nie ma jeszcze kernela logitów f32".into(),
-            )),
+            DevWeight::NvFp4Gguf {
+                buf,
+                output_scale,
+                rows,
+                cols,
+            } => self.kernels.gemv_nvfp4_gguf_out_f32(
+                y_f32,
+                buf,
+                x,
+                *rows,
+                *cols,
+                *output_scale,
+                stream,
+            ),
         }
     }
 
@@ -6195,7 +6254,8 @@ impl Model {
             stream,
         )?;
         if want_logits {
-            self.logits_weight_gemv(&state.logits, &b.x, &mtp.output, stream)?;
+            let output = mtp.draft_output.as_ref().unwrap_or(&mtp.output);
+            self.logits_weight_gemv(&state.logits, &b.x, output, stream)?;
         }
         Ok(())
     }

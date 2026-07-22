@@ -444,3 +444,29 @@ włączeniu B1 i dokładnej atencji, promptu prose oraz trzech powtórzeń.
 F32 poprawiło długi kontekst o około 2,8%, ale obniżyło przepustowość raw128 o
 około 5,8% i akceptację o 7,4 punktu procentowego. Wariant został całkowicie
 wycofany; produkcyjny carry MTP pozostaje w F16.
+
+## Opcjonalny draftowy head NVFP4
+
+`FORGE_MTP_DRAFT_HEAD=nvfp4` tworzy na GPU osobną kopię `output.weight` tylko
+dla proposera MTP. Target i verifier zachowują źródłowy Q8_0. Packer Mojo
+konwertuje Q8_0 bez pełnego bufora F16: każdy blok 64 wartości dostaje cztery
+skale UE4M3 i kody E2M1. Kopia ma 715 161 600 B wobec 1 350 860 800 B Q8_0.
+Domyślna wartość `q8` nie wykonuje dodatkowej alokacji ani konwersji.
+
+Golden porównał packed stream bajt w bajt z referencją CPU, a GEMV F32 przeszedł
+tolerancję i kontrolę top-1. Profil `nsys` zmierzył 780,97 us na wywołanie headu
+wobec 1,435 ms dla Q8_0, czyli przyspieszenie 1,84x. Jednorazowy pack podczas
+ładowania zajął 479,90 ms.
+
+Pięć osobnych procesów na RTX 4090 zachowało tokeny sekwencyjnego greedy:
+
+| Prompt | Mediana NVFP4 | Q8_0 | llama.cpp | Akceptacja | Verify |
+|---|---:|---:|---:|---:|---:|
+| raw128 | 110,759 tok/s | 101,7 tok/s | 111,0 tok/s | 98,0% | 33 |
+| raw512 | 78,495 tok/s | 76,0 tok/s | 87,65 tok/s | 62,2% | 45 |
+
+Wariant pozostaje opcjonalny: poprawia oba workloady, ale raw512 nadal nie
+osiąga wyniku llama.cpp. Serwer z `max_active=2` przeszedł preflight przy puli
+weights 20,5 GiB, `ctx=1024` i 40 stronach KV. Automatyczny podział puli na tej
+karcie był zbyt mały już dla źródłowego headu Q8_0, dlatego ten ciasny wariant
+konfiguracji wymaga jawnego `--weights-pool-gb`.

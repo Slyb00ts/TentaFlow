@@ -52,6 +52,8 @@ pub struct MtpWeights {
     pub embedding: MtpEmbedding,
     /// Waga współdzieląca alokacje LM headu targetu.
     pub output: DevWeight,
+    /// Opcjonalna, stratna kopia headu używana wyłącznie do propozycji draftu.
+    pub draft_output: Option<DevWeight>,
     pub layers: Vec<MtpLayerWeights>,
 }
 
@@ -220,6 +222,7 @@ impl MtpWeights {
             token_embedding: target_embedding.clone(),
             embedding,
             output,
+            draft_output: None,
             layers,
         })
     }

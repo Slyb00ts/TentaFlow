@@ -12,11 +12,13 @@ from src.nvfp4_gguf_batch import (
     gemm_nvfp4_gguf_f16_b3,
     gemm_nvfp4_gguf_f16_b4,
     gemm_nvfp4_gguf_f16_b1_nvidia,
+    gemm_nvfp4_gguf_out_f32_b1_nvidia,
     gemm_nvfp4_gguf_f16_b3_nvidia,
     gemm_nvfp4_gguf_f16_b4_nvidia,
     gemm_nvfp4_gguf_f16_b8,
     gemm_nvfp4_gguf_f16_b16,
 )
+from src.nvfp4 import gemv_nvfp4_gguf_out_f32, pack_q8_0_nvfp4_gguf
 from src.nvfp4_gguf_mma import (
     gemm_nvfp4_gguf_mma_f16_bm32,
     gemm_nvfp4_gguf_mma_f16_bm128,
@@ -58,6 +60,21 @@ def main() raises:
         dump_asm=Path("gemm_nvfp4_gguf_f16_b1_nvidia.ptx"),
     ]()
     _finalize(out_dir, "gemm_nvfp4_gguf_f16_b1_nvidia")
+    _ = ctx.compile_function[
+        gemm_nvfp4_gguf_out_f32_b1_nvidia,
+        dump_asm=Path("gemm_nvfp4_gguf_out_f32_b1_nvidia.ptx"),
+    ]()
+    _finalize(out_dir, "gemm_nvfp4_gguf_out_f32_b1_nvidia")
+    _ = ctx.compile_function[
+        gemv_nvfp4_gguf_out_f32,
+        dump_asm=Path("gemv_nvfp4_gguf_out_f32.ptx"),
+    ]()
+    _finalize(out_dir, "gemv_nvfp4_gguf_out_f32")
+    _ = ctx.compile_function[
+        pack_q8_0_nvfp4_gguf,
+        dump_asm=Path("pack_q8_0_nvfp4_gguf.ptx"),
+    ]()
+    _finalize(out_dir, "pack_q8_0_nvfp4_gguf")
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_f16_b3_nvidia,
         dump_asm=Path("gemm_nvfp4_gguf_f16_b3_nvidia.ptx"),
