@@ -140,6 +140,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_nvfp4_gguf_f16_b16",
     "gemm_nvfp4_gguf_mma_f16_bm32",
     "gemm_nvfp4_gguf_mma_f16_bm128",
+    "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
     "gather_rows_f16",
     "gemv_f16_out_f32",
     "gemv_q8_0_out_f32",
@@ -665,6 +666,7 @@ mod tests {
         "gemm_nvfp4_gguf_f16_b16",
         "gemm_nvfp4_gguf_mma_f16_bm32",
         "gemm_nvfp4_gguf_mma_f16_bm128",
+        "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
     ];
 
     const PORTABLE_Q8_SMALL: &[&str] = &[

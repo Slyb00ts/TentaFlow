@@ -20,6 +20,7 @@ from src.nvfp4_gguf_batch import (
 from src.nvfp4_gguf_mma import (
     gemm_nvfp4_gguf_mma_f16_bm32,
     gemm_nvfp4_gguf_mma_f16_bm128,
+    gemm_nvfp4_gguf_mma_f16_bm128_bn32,
 )
 
 
@@ -87,3 +88,8 @@ def main() raises:
         dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128.ptx"),
     ]()
     _finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128")
+    _ = ctx.compile_function[
+        gemm_nvfp4_gguf_mma_f16_bm128_bn32,
+        dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128_bn32.ptx"),
+    ]()
+    _finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128_bn32")

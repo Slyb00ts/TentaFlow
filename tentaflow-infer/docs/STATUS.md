@@ -539,9 +539,11 @@ Ostatnia aktualizacja: 2026-07-21.
   ścieżką prefill, więc na małym modelu opłaca się dopiero dla długich draftów
   (gate `MIN_VERIFY_DRAFT`); dla ordinary prose spekulacja nie regresuje (fallback
   na pojedynczy graf-krok). Domyślnie WYŁĄCZONA (`--speculative off` = bajt-w-bajt
-  dzisiejsza pętla). Natywne MTP/NextN działa osobną, model-owned ścieżką dla
-  gęstego hybrydowego `qwen35`: K=2/K=3, adaptacyjny wybór budżetu, batched
-  verifier i retained checkpointy DeltaNet. Router `mtp+ngram:2|3` daje
+  dzisiejsza pętla). Natywne MTP/NextN działa osobną ścieżką dla gęstego
+  hybrydowego `qwen35`: K=2/K=3, adaptacyjny wybór budżetu, batched verifier
+  i retained checkpointy DeltaNet. Stan targetu i draftu MTP jest izolowany
+  per sekwencja pod jednym lease, a strony draftu pochodzą ze współdzielonego
+  paged cache MTP. Router `mtp+ngram:2|3` daje
   pierwszeństwo pełnemu draftowi n-gram, dogania MTP po zaakceptowanym prefiksie,
   a na miss używa natywnego MTP; raportuje osobne liczniki obu ścieżek. Wymaga
   greedy i `max_active=1`;
@@ -587,8 +589,13 @@ Ostatnia aktualizacja: 2026-07-21.
     `[n_v_heads, d_state, d_state]` f32 + okno conv f16 per warstwa DeltaNet.
     Każda sekwencja dostaje lease `{slot, generation}`; event GPU chroni
     przełączenie i reuse, a ponownie użyty slot jest zerowany na streamie.
-    Test Qwen3.6 NVFP4 potwierdza parity dwóch sekwencji przeplatanych A/B.
+    Lease obejmuje też osobny stan draftu MTP i `SeqKv` korzystający ze wspólnego
+    paged cache MTP. Test Qwen3.6 NVFP4 potwierdza parity targetu, pure MTP oraz
+    MTP+n-gram dla dwóch sekwencji przeplatanych A/B, wraz z cancel i release/reuse.
     Scheduler nadal wymusza `max_active=1` do następnej fazy continuous batching.
+    Globalny graph verifiera
+    jest wyłączany po zaalokowaniu wielu slotów, ponieważ przechwycił adresy SSM
+    jednego lease; pełna ścieżka wymaga grafów per slot.
     Warstwy atencji używają paged KV.
   - ✅ **Wagi hybrydowe** (`weights.rs::load_hybrid`): `LayerMixer::{Attention,
     DeltaNet}`, atencja z bramkowanym Q (szerokość `2·n_heads·head_dim`, split,

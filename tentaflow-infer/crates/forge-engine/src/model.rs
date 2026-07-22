@@ -294,8 +294,6 @@ pub struct Model {
     /// prefill path records per-input-channel activation abs-max at the four
     /// linear-input points. Set only during `calibrate_w4a8`, `None` otherwise.
     calib: Option<CalibAccum>,
-    /// Izolowany stan jednowarstwowego draftu NextN; nie uczestniczy w server flow.
-    mtp_state: Option<MtpDraftState>,
     /// Zdarzenia czasu GPU przygotowane wyłącznie przez `forge bench`.
     prefill_profiles: VecDeque<PrefillProfileRun>,
 }
@@ -376,6 +374,7 @@ struct SsmState {
 
 struct HybridStateSlot {
     layers: Vec<Option<SsmState>>,
+    mtp: Option<MtpDraftState>,
     generation: u64,
     in_use: bool,
     ready: Event,
@@ -394,6 +393,8 @@ struct HybridStatePool {
     free: Vec<usize>,
     active: Option<HybridStateLease>,
     poisoned: Option<String>,
+    mtp_kv: Option<KvCache>,
+    mtp_shape: Option<(usize, usize)>,
 }
 
 impl HybridStatePool {
@@ -402,6 +403,7 @@ impl HybridStatePool {
         layer_kinds: Vec<LayerKind>,
         conv_bytes: usize,
         state_bytes: usize,
+        mtp_config: Option<(KvConfig, usize, usize)>,
     ) -> Result<Self> {
         let zero_conv = device.alloc(conv_bytes, MemKind::PinnedHost, Pool::Activations)?;
         let zero_state = device.alloc(state_bytes, MemKind::PinnedHost, Pool::Activations)?;
@@ -417,6 +419,13 @@ impl HybridStatePool {
                 state_bytes,
             );
         }
+        let (mtp_kv, mtp_shape) = match mtp_config {
+            Some((config, hidden_size, vocab_size)) => (
+                Some(KvCache::new(device.as_ref(), config)?),
+                Some((hidden_size, vocab_size)),
+            ),
+            None => (None, None),
+        };
         let mut pool = Self {
             device,
             layer_kinds,
@@ -428,6 +437,8 @@ impl HybridStatePool {
             free: Vec::new(),
             active: None,
             poisoned: None,
+            mtp_kv,
+            mtp_shape,
         };
         pool.allocate_slot()?;
         Ok(pool)
@@ -449,8 +460,23 @@ impl HybridStatePool {
             });
         }
         let slot = self.slots.len();
+        let mtp = match (&self.mtp_kv, self.mtp_shape) {
+            (Some(kv), Some((hidden_size, vocab_size))) => Some(MtpDraftState::new(
+                self.device.clone(),
+                kv,
+                hidden_size,
+                vocab_size,
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(ForgeError::Scheduler(
+                    "niespójna konfiguracja puli MTP".into(),
+                ))
+            }
+        };
         self.slots.push(HybridStateSlot {
             layers,
+            mtp,
             generation: 0,
             in_use: false,
             ready: self.device.create_event()?,
@@ -459,6 +485,14 @@ impl HybridStatePool {
         });
         self.free.push(slot);
         Ok(slot)
+    }
+
+    fn ensure_capacity(&mut self, slots: usize) -> Result<()> {
+        self.ensure_healthy()?;
+        while self.slots.len() < slots {
+            self.allocate_slot()?;
+        }
+        Ok(())
     }
 
     fn acquire(&mut self) -> Result<HybridStateLease> {
@@ -579,6 +613,9 @@ impl HybridStatePool {
             self.active = None;
         }
         slot.in_use = false;
+        if let (Some(kv), Some(mtp)) = (&mut self.mtp_kv, &mut slot.mtp) {
+            mtp.release(kv);
+        }
         self.free.push(lease.slot);
         Ok(())
     }
@@ -625,6 +662,53 @@ impl HybridStatePool {
     fn active_layers(&self) -> &[Option<SsmState>] {
         let active = self.active.expect("stan hybrydowy został aktywowany");
         &self.slots[active.slot].layers
+    }
+
+    fn has_mtp(&self) -> bool {
+        self.mtp_kv.is_some() && self.mtp_shape.is_some()
+    }
+
+    fn take_mtp(&mut self, lease: HybridStateLease) -> Result<(MtpDraftState, KvCache)> {
+        self.ensure_healthy()?;
+        self.validate(lease)?;
+        let kv = self.mtp_kv.take().ok_or_else(|| {
+            ForgeError::Unsupported("współdzielony cache MTP nie został zaalokowany".into())
+        })?;
+        let state = match self.slots[lease.slot].mtp.take() {
+            Some(state) => state,
+            None => {
+                self.mtp_kv = Some(kv);
+                return Err(ForgeError::Scheduler(
+                    "stan MTP aktywnej sekwencji jest już używany".into(),
+                ));
+            }
+        };
+        Ok((state, kv))
+    }
+
+    fn restore_mtp(
+        &mut self,
+        lease: HybridStateLease,
+        state: MtpDraftState,
+        kv: KvCache,
+    ) -> Result<()> {
+        self.validate(lease)?;
+        if self.mtp_kv.is_some() || self.slots[lease.slot].mtp.is_some() {
+            return Err(ForgeError::Scheduler(
+                "próba podwójnego przywrócenia stanu MTP".into(),
+            ));
+        }
+        self.mtp_kv = Some(kv);
+        self.slots[lease.slot].mtp = Some(state);
+        Ok(())
+    }
+
+    fn mtp_host_embedding_gathers(&self) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.mtp.as_ref())
+            .map(MtpDraftState::host_embedding_gathers)
+            .sum()
     }
 }
 
@@ -1300,7 +1384,22 @@ impl Model {
             }
             None => None,
         };
-        // Pula stanów DeltaNet rośnie wraz z liczbą przeplatanych sekwencji.
+        let mtp_config = weights.mtp.as_ref().map(|_| {
+            (
+                KvConfig {
+                    n_layers: 1,
+                    n_kv_heads: p.n_kv_heads,
+                    head_dim: p.head_dim,
+                    page_size: cfg.kv_page_size,
+                    n_pages: cfg.kv_pages,
+                    max_pages_per_seq,
+                    quant: KvQuant::F16,
+                },
+                hidden,
+                p.vocab_size,
+            )
+        });
+        // Pula stanów DeltaNet i MTP rośnie wraz z liczbą przeplatanych sekwencji.
         let hybrid_states = match &weights.descriptor.params.ssm {
             Some(sp) => {
                 let conv_bytes = sp.conv_dim() * (sp.d_conv - 1) * 2;
@@ -1310,6 +1409,7 @@ impl Model {
                     weights.descriptor.layer_kinds.clone(),
                     conv_bytes,
                     state_bytes,
+                    mtp_config,
                 )?)
             }
             None => None,
@@ -1327,24 +1427,6 @@ impl Model {
             && weights.descriptor.params.ssm.is_none();
         let prefix_cache =
             prefix_eligible.then(|| crate::prefix::PrefixCache::new(cfg.kv_page_size));
-        let mtp_state = if weights.mtp.is_some() {
-            Some(MtpDraftState::new(
-                device.clone(),
-                KvConfig {
-                    n_layers: 1,
-                    n_kv_heads: p.n_kv_heads,
-                    head_dim: p.head_dim,
-                    page_size: cfg.kv_page_size,
-                    n_pages: cfg.kv_pages,
-                    max_pages_per_seq,
-                    quant: KvQuant::F16,
-                },
-                hidden,
-                p.vocab_size,
-            )?)
-        } else {
-            None
-        };
         Ok(Model {
             device,
             kernels,
@@ -1378,7 +1460,6 @@ impl Model {
             hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
             prefix_cache,
             calib: None,
-            mtp_state,
             prefill_profiles: VecDeque::new(),
         })
     }
@@ -1525,6 +1606,19 @@ impl Model {
         self.kv.new_seq()
     }
 
+    /// Rezerwuje pamięć stanów targetu i MTP przed dopuszczeniem wielu requestów.
+    pub fn preflight_hybrid_state_slots(&mut self, slots: usize) -> Result<()> {
+        if slots == 0 {
+            return Err(ForgeError::Scheduler(
+                "preflight wymaga co najmniej jednego slotu".into(),
+            ));
+        }
+        self.hybrid_states
+            .as_mut()
+            .ok_or_else(|| ForgeError::Unsupported("model nie jest hybrydowy".into()))?
+            .ensure_capacity(slots)
+    }
+
     pub fn release_seq(&mut self, seq: &mut SeqKv) {
         if let Some(lease) = seq.hybrid_state {
             let release = self
@@ -1546,9 +1640,6 @@ impl Model {
             self.finalize_prefix(seq);
         }
         self.kv.release(seq);
-        if let Some(state) = &mut self.mtp_state {
-            state.release();
-        }
     }
 
     fn activate_hybrid_sequence(&mut self, seq: &mut SeqKv) -> Result<()> {
@@ -1571,6 +1662,51 @@ impl Model {
             .as_ref()
             .expect("model hybrydowy ma pulę stanów")
             .active_layers()
+    }
+
+    fn take_mtp_runtime(
+        &mut self,
+        seq: &mut SeqKv,
+    ) -> Result<(HybridStateLease, MtpDraftState, KvCache)> {
+        self.activate_hybrid_sequence(seq)?;
+        let lease = seq
+            .hybrid_state
+            .expect("aktywacja przydzieliła lease hybrydowy");
+        let (state, kv) = self
+            .hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .take_mtp(lease)?;
+        Ok((lease, state, kv))
+    }
+
+    fn restore_mtp_runtime(
+        &mut self,
+        lease: HybridStateLease,
+        state: MtpDraftState,
+        kv: KvCache,
+    ) -> Result<()> {
+        self.hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .restore_mtp(lease, state, kv)
+    }
+
+    fn finish_mtp_runtime<T>(
+        &mut self,
+        lease: HybridStateLease,
+        state: MtpDraftState,
+        kv: KvCache,
+        result: Result<T>,
+    ) -> Result<T> {
+        match (result, self.restore_mtp_runtime(lease, state, kv)) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(restore_error)) => Err(restore_error),
+            (Err(error), Err(restore_error)) => Err(ForgeError::Scheduler(format!(
+                "błąd wykonania MTP: {error}; błąd przywrócenia lease: {restore_error}"
+            ))),
+        }
     }
 
     pub fn tier_enabled(&self) -> bool {
@@ -5232,13 +5368,16 @@ impl Model {
             .mtp
             .as_ref()
             .is_some_and(|mtp| mtp.runtime_supported())
-            && self.mtp_state.is_some()
+            && self
+                .hybrid_states
+                .as_ref()
+                .is_some_and(HybridStatePool::has_mtp)
     }
 
     pub fn mtp_host_embedding_gathers(&self) -> u64 {
-        self.mtp_state
+        self.hybrid_states
             .as_ref()
-            .map_or(0, MtpDraftState::host_embedding_gathers)
+            .map_or(0, HybridStatePool::mtp_host_embedding_gathers)
     }
 
     pub fn mtp_embedding_mode(&self) -> Option<&'static str> {
@@ -5273,7 +5412,7 @@ impl Model {
         Ok(())
     }
 
-    fn mtp_propose_pending(&mut self, fed: u32, k: usize) -> Result<Vec<u32>> {
+    fn mtp_propose_pending(&mut self, seq: &mut SeqKv, fed: u32, k: usize) -> Result<Vec<u32>> {
         if k != 2 && k != 3 {
             return Err(ForgeError::Unsupported(
                 "MTP propose_k obsługuje wyłącznie K=2 lub K=3".into(),
@@ -5285,33 +5424,28 @@ impl Model {
             ));
         }
         self.ensure_hybrid_bufs()?;
-        let mut state = self.mtp_state.take().ok_or_else(|| {
-            ForgeError::Unsupported("stan wykonania MTP nie został zaalokowany".into())
-        })?;
-        let result: Result<()> = (|| {
-            self.device.copy(
-                &self.bufs.x,
-                0,
-                &state.recurrent_hidden,
-                0,
-                state.recurrent_hidden.len(),
-                &self.stream,
-            )?;
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let result: Result<Vec<u32>> = (|| {
+            if fed as usize >= self.weights.descriptor.params.vocab_size {
+                return Err(ForgeError::Scheduler(format!(
+                    "token wejściowy MTP {fed} wykracza poza słownik"
+                )));
+            }
             state.checkpoint(&self.stream)?;
-            let token_ids = state.token_ids.clone();
-            self.mtp_upload_scalar(&mut state, 0, &token_ids, 4 * 4)?;
-            self.kernels.sample_argmax_f32(
-                &self.bufs.sample_out,
-                &self.bufs.sample_vals,
-                &self.bufs.sample_idx,
-                &self.bufs.logits,
-                self.weights.descriptor.params.vocab_size,
-                &self.stream,
-            )?;
+            let initial_ids = [fed as i32, 0, 0, 0, 0];
+            write_pinned(bytemuck::cast_slice(&initial_ids), &state.pinned_token_ids)?;
             self.device.copy(
-                &self.bufs.sample_out,
+                &state.pinned_token_ids,
                 0,
                 &state.token_ids,
+                0,
+                initial_ids.len() * 4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &state.token_ids,
+                0,
+                &self.bufs.sample_out,
                 0,
                 4,
                 &self.stream,
@@ -5319,8 +5453,8 @@ impl Model {
 
             for step in 0..=k {
                 self.mtp_gather_embedding(&mut state, step)?;
-                state.stage_step(&self.kernels, &self.stream)?;
-                self.mtp_forward_one(&mut state, step < k)?;
+                state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
+                self.mtp_forward_one(&mut state, &mtp_kv, step < k)?;
                 state.save_step_hidden(step, &self.stream)?;
                 if step == k {
                     continue;
@@ -5350,62 +5484,57 @@ impl Model {
                 5 * 4,
                 &self.stream,
             )?;
-            Ok(())
+            self.device.synchronize()?;
+            let host = state
+                .pinned_token_ids
+                .host_ptr()
+                .expect("pinned token IDs mają mapowanie hosta");
+            let ids = unsafe { std::slice::from_raw_parts(host as *const i32, k + 1) };
+            let gather_status = unsafe { *(host as *const i32).add(4) };
+            if gather_status != 0 {
+                return Err(ForgeError::Kernel(
+                    "MTP GPU gather odrzucił token poza zakresem słownika".into(),
+                ));
+            }
+            Ok(ids[1..].iter().map(|&id| id as u32).collect())
         })();
-
         if result.is_err() && state.checkpoint_len().is_some() {
-            let _ = state.rollback(&self.stream);
+            let _ = state.rollback(&mut mtp_kv, &self.stream);
         }
         self.pt_seq = 0;
-        self.mtp_state = Some(state);
-        result?;
-        self.device.synchronize()?;
-        let state = self.mtp_state.as_ref().expect("stan przywrócony powyżej");
-        let host = state
-            .pinned_token_ids
-            .host_ptr()
-            .expect("pinned token IDs mają mapowanie hosta");
-        let ids = unsafe { std::slice::from_raw_parts(host as *const i32, k + 1) };
-        let gather_status = unsafe { *(host as *const i32).add(4) };
-        let draft = if gather_status != 0 {
-            Err(ForgeError::Kernel(
-                "MTP GPU gather odrzucił token poza zakresem słownika".into(),
-            ))
-        } else if ids[0] as u32 != fed {
-            Err(ForgeError::Scheduler(format!(
-                "token wejściowy MTP {fed} nie odpowiada bieżącemu argmaxowi targetu {}",
-                ids[0]
-            )))
-        } else {
-            Ok(ids[1..].iter().map(|&id| id as u32).collect())
-        };
-        if draft.is_err() {
-            self.rollback_mtp_pending()?;
-        }
-        draft
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
     }
 
     /// Buduje liniowy draft K=2/3 poza normalnym server flow i nie zmienia
     /// trwałego stanu KV/hidden bloku MTP.
-    pub fn mtp_propose_k(&mut self, fed: u32, k: usize) -> Result<Vec<u32>> {
-        let draft = self.mtp_propose_pending(fed, k)?;
-        self.rollback_mtp_pending()?;
+    pub fn mtp_propose_k(&mut self, seq: &mut SeqKv, fed: u32, k: usize) -> Result<Vec<u32>> {
+        let draft = self.mtp_propose_pending(seq, fed, k)?;
+        self.rollback_mtp_pending(seq)?;
         Ok(draft)
     }
 
-    fn rollback_mtp_pending(&mut self) -> Result<()> {
-        let state = self.mtp_state.as_mut().ok_or_else(|| {
-            ForgeError::Unsupported("stan wykonania MTP nie został zaalokowany".into())
-        })?;
-        state.rollback(&self.stream)?;
-        self.device.synchronize()
+    fn rollback_mtp_pending(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let result = state
+            .rollback(&mut mtp_kv, &self.stream)
+            .and_then(|_| self.device.synchronize());
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
     }
 
-    fn mtp_catchup_token(&mut self, token: u32) -> Result<()> {
-        if self.mtp_state.is_none() {
+    fn reset_mtp_runtime(&mut self, seq: &mut SeqKv) -> Result<()> {
+        if !self.has_native_mtp() {
             return Ok(());
         }
-        let mut state = self.mtp_state.take().expect("stan MTP sprawdzony powyżej");
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let result = state.reset(&mut mtp_kv, &self.stream);
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_catchup_token(&mut self, seq: &mut SeqKv, token: u32) -> Result<()> {
+        if !self.has_native_mtp() {
+            return Ok(());
+        }
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
         let result = (|| {
             self.device.copy(
                 &self.bufs.x,
@@ -5418,8 +5547,8 @@ impl Model {
             let sample_out = self.bufs.sample_out.clone();
             self.mtp_upload_scalar(&mut state, token as i32, &sample_out, 0)?;
             self.mtp_gather_embedding(&mut state, 0)?;
-            state.stage_step(&self.kernels, &self.stream)?;
-            self.mtp_forward_one(&mut state, false)?;
+            state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
+            self.mtp_forward_one(&mut state, &mtp_kv, false)?;
             self.device.copy(
                 &state.catchup_hidden,
                 0,
@@ -5437,13 +5566,13 @@ impl Model {
                 &self.stream,
             )
         })();
-        self.mtp_state = Some(state);
-        result
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
     }
 
     fn mtp_catchup_batch_host(
         &self,
         state: &mut MtpDraftState,
+        mtp_kv: &mut KvCache,
         t: usize,
         staging_slot: usize,
         staging_ready: Option<&Event>,
@@ -5459,13 +5588,16 @@ impl Model {
                 "batchowy catch-up MTP wymaga eh_proj Q8_0".into(),
             ));
         };
-        let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
         let hv = self
             .hybrid_verify_bufs
             .as_ref()
             .expect("bufory hybrydowego catch-up są gotowe");
         let stream = &self.stream;
-        let (base, page_table, seq_len, position) = state.stage_batch(t)?;
+        let (base, page_table, seq_len, position) = state.stage_batch(mtp_kv, t)?;
         let positions: Vec<i32> = (base..base + t).map(|value| value as i32).collect();
         let visible: Vec<i32> = (base + 1..=base + t).map(|value| value as i32).collect();
         let host_staging = &hv.host_staging[staging_slot];
@@ -5591,8 +5723,8 @@ impl Model {
             &pb.k, &pb.positions, t, p.n_kv_heads, p.head_dim, n_rot, p.rope_theta, stream,
         )?;
         self.kernels.kv_append_batch_device_pos_f16(
-            &state.kv.k[0], &state.kv.v[0], &pb.k, &pb.v, &state.page_table,
-            &hv.base_pos, t, p.n_kv_heads, state.kv.cfg.page_size, p.head_dim, stream,
+            &mtp_kv.k[0], &mtp_kv.v[0], &pb.k, &pb.v, &state.page_table,
+            &hv.base_pos, t, p.n_kv_heads, mtp_kv.cfg.page_size, p.head_dim, stream,
         )?;
         self.device.copy(
             &state.catchup_hidden,
@@ -5607,6 +5739,7 @@ impl Model {
     /// Dogania stan MTP po zaakceptowanym prefiksie targetu bez liczenia logits.
     fn mtp_catchup_verified_prefix(
         &mut self,
+        seq: &mut SeqKv,
         retained: usize,
         staging_slot: usize,
         staging_ready: Option<&Event>,
@@ -5617,9 +5750,7 @@ impl Model {
             ));
         }
         let hidden_bytes = self.weights.descriptor.params.hidden_size * 2;
-        let mut state = self.mtp_state.take().ok_or_else(|| {
-            ForgeError::Unsupported("stan wykonania MTP nie został zaalokowany".into())
-        })?;
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
         let result = (|| {
             state.checkpoint(&self.stream)?;
             if retained > 1
@@ -5631,6 +5762,7 @@ impl Model {
             {
                 self.mtp_catchup_batch_host(
                     &mut state,
+                    &mut mtp_kv,
                     retained,
                     staging_slot,
                     staging_ready,
@@ -5667,8 +5799,8 @@ impl Model {
                     &self.stream,
                 )?;
                 self.mtp_gather_embedding(&mut state, row)?;
-                state.stage_step(&self.kernels, &self.stream)?;
-                self.mtp_forward_one(&mut state, false)?;
+                state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
+                self.mtp_forward_one(&mut state, &mtp_kv, false)?;
                 self.device.copy(
                     &state.catchup_hidden,
                     0,
@@ -5693,11 +5825,10 @@ impl Model {
             )
         })();
         if result.is_err() && state.checkpoint_len().is_some() {
-            let _ = state.rollback(&self.stream);
+            let _ = state.rollback(&mut mtp_kv, &self.stream);
             let _ = self.device.synchronize();
         }
-        self.mtp_state = Some(state);
-        result
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
     }
 
     fn mtp_gather_embedding(&self, state: &mut MtpDraftState, token_index: usize) -> Result<()> {
@@ -5804,7 +5935,12 @@ impl Model {
         }
     }
 
-    fn mtp_forward_one(&self, state: &mut MtpDraftState, want_logits: bool) -> Result<()> {
+    fn mtp_forward_one(
+        &self,
+        state: &mut MtpDraftState,
+        mtp_kv: &KvCache,
+        want_logits: bool,
+    ) -> Result<()> {
         let mtp = self
             .weights
             .mtp
@@ -5899,30 +6035,30 @@ impl Model {
             stream,
         )?;
         self.kernels.kv_append_f16(
-            &state.kv.k[0],
-            &state.kv.v[0],
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
             &b.k,
             &b.v,
             &state.page_table,
             &state.seq_len,
             p.n_kv_heads,
-            state.kv.cfg.page_size,
+            mtp_kv.cfg.page_size,
             head_dim,
             stream,
         )?;
         self.kernels.attn_decode_f16(
             &b.attn_out,
             &hb.qc,
-            &state.kv.k[0],
-            &state.kv.v[0],
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
             &state.page_table,
             &state.seq_len,
             1,
             p.n_heads,
             p.n_kv_heads,
             head_dim,
-            state.kv.cfg.page_size,
-            state.kv.cfg.max_pages_per_seq,
+            mtp_kv.cfg.page_size,
+            mtp_kv.cfg.max_pages_per_seq,
             1.0 / (head_dim as f32).sqrt(),
             stream,
         )?;
@@ -6879,6 +7015,13 @@ impl Model {
         if std::env::var("FORGE_HYBRID_VERIFY_GRAPH").is_ok_and(|value| value == "0") {
             return;
         }
+        if self
+            .hybrid_states
+            .as_ref()
+            .is_some_and(|pool| pool.slots.len() > 1)
+        {
+            return;
+        }
         if !self.device.caps().supports_graph_capture {
             return;
         }
@@ -7030,6 +7173,10 @@ impl Model {
             )?;
             let graph = if std::env::var("FORGE_HYBRID_VERIFY_GRAPH")
                 .is_ok_and(|value| value == "0")
+                || self
+                    .hybrid_states
+                    .as_ref()
+                    .is_some_and(|pool| pool.slots.len() > 1)
             {
                 None
             } else {
@@ -7062,7 +7209,7 @@ impl Model {
             }
             let accepted = retained as usize - 1;
             if catchup_mtp {
-                self.mtp_catchup_verified_prefix(accepted + 1, 0, None)?;
+                self.mtp_catchup_verified_prefix(seq, accepted + 1, 0, None)?;
             }
             self.capture_hybrid_verify_graph_if_needed(t);
             Ok((accepted, correction as u32))
@@ -7139,24 +7286,28 @@ impl Model {
                 "brak pojemności targetu dla MTP K={budget}"
             )));
         }
-        let draft = self.mtp_propose_pending(fed, budget)?;
+        let draft = self.mtp_propose_pending(seq, fed, budget)?;
         match self.verify_hybrid_greedy_draft(seq, fed, &draft, false) {
             Ok((accepted, correction)) => {
-                let state = self.mtp_state.as_mut().expect("stan MTP istnieje");
-                state.commit_prefix(accepted + 1, &self.stream)?;
-                self.device.copy(
-                    &self.bufs.x,
-                    0,
-                    &state.recurrent_hidden,
-                    0,
-                    state.recurrent_hidden.len(),
-                    &self.stream,
-                )?;
-                self.device.synchronize()?;
+                let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+                let result = state
+                    .commit_prefix(&mut mtp_kv, accepted + 1, &self.stream)
+                    .and_then(|_| {
+                        self.device.copy(
+                            &self.bufs.x,
+                            0,
+                            &state.recurrent_hidden,
+                            0,
+                            state.recurrent_hidden.len(),
+                            &self.stream,
+                        )
+                    })
+                    .and_then(|_| self.device.synchronize());
+                self.finish_mtp_runtime(lease, state, mtp_kv, result)?;
                 Ok((draft, accepted, correction))
             }
             Err(error) => {
-                if let Err(rollback_error) = self.rollback_mtp_pending() {
+                if let Err(rollback_error) = self.rollback_mtp_pending(seq) {
                     return Err(ForgeError::Scheduler(format!(
                         "błąd verifiera MTP: {error}; błąd rollbacku draftu: {rollback_error}"
                     )));
@@ -8062,25 +8213,38 @@ impl Model {
     }
 
     /// Zrzuca carry oraz aktywny prefiks KV MTP w kolejności logicznych stron.
-    pub fn debug_mtp_state_snapshot(&self) -> Result<Vec<(String, usize, Vec<u8>)>> {
+    pub fn debug_mtp_state_snapshot(
+        &self,
+        seq: &SeqKv,
+    ) -> Result<Vec<(String, usize, Vec<u8>)>> {
         self.device.synchronize()?;
-        let state = self.mtp_state.as_ref().ok_or_else(|| {
+        let lease = seq.hybrid_state.ok_or_else(|| {
+            ForgeError::Unsupported("sekwencja nie ma lease stanu MTP".into())
+        })?;
+        let pool = self.hybrid_states.as_ref().ok_or_else(|| {
             ForgeError::Unsupported("model nie ma aktywnego stanu MTP".into())
+        })?;
+        pool.validate(lease)?;
+        let state = pool.slots[lease.slot].mtp.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("stan MTP sekwencji jest aktualnie używany".into())
+        })?;
+        let mtp_kv = pool.mtp_kv.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("cache MTP jest aktualnie używany".into())
         })?;
         let mut hidden = vec![0u8; state.recurrent_hidden.len()];
         self.device
             .read(&state.recurrent_hidden, 0, &mut hidden)?;
         let mut snapshot = vec![("mtp.hidden".into(), 2, hidden)];
-        let head_bytes = state.kv.cfg.head_dim * 2;
-        for (name, buffers) in [("mtp.k", &state.kv.k), ("mtp.v", &state.kv.v)] {
+        let head_bytes = mtp_kv.cfg.head_dim * 2;
+        for (name, buffers) in [("mtp.k", &mtp_kv.k), ("mtp.v", &mtp_kv.v)] {
             let mut bytes = Vec::with_capacity(
-                state.seq.len * state.kv.cfg.n_kv_heads * head_bytes,
+                state.seq.len * mtp_kv.cfg.n_kv_heads * head_bytes,
             );
             for (offset, length) in logical_kv_regions(
                 &state.seq.pages,
                 state.seq.len,
-                state.kv.cfg.page_size,
-                state.kv.cfg.n_kv_heads,
+                mtp_kv.cfg.page_size,
+                mtp_kv.cfg.n_kv_heads,
                 head_bytes,
             ) {
                 let mut chunk = vec![0u8; length];
@@ -8098,8 +8262,8 @@ impl Model {
     }
 
     /// Wykonuje pojedynczy referencyjny catch-up MTP po kroku targetu.
-    pub fn debug_mtp_catchup_token(&mut self, token: u32) -> Result<()> {
-        self.mtp_catchup_token(token)
+    pub fn debug_mtp_catchup_token(&mut self, seq: &mut SeqKv, token: u32) -> Result<()> {
+        self.mtp_catchup_token(seq, token)
     }
 
     /// NEOX partial-rotary width for the hybrid attention layers: M-RoPE over
@@ -8508,9 +8672,7 @@ impl Model {
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = seq.len;
             if pos == 0 {
-                if let Some(state) = &mut self.mtp_state {
-                    state.reset_hidden()?;
-                }
+                self.reset_mtp_runtime(seq)?;
             }
             if pos >= p.max_position_embeddings {
                 return Err(ForgeError::Scheduler(format!(
@@ -8549,7 +8711,7 @@ impl Model {
             }
             self.profile_target_end()?;
             self.profile_catchup_start()?;
-            self.mtp_catchup_token(tok)?;
+            self.mtp_catchup_token(seq, tok)?;
             self.profile_catchup_end()?;
             if want {
                 self.device.copy(
@@ -8594,9 +8756,7 @@ impl Model {
             )));
         }
         if seq.len == 0 {
-            if let Some(state) = &mut self.mtp_state {
-                state.reset_hidden()?;
-            }
+            self.reset_mtp_runtime(seq)?;
         }
         self.ensure_hybrid_bufs()?;
         self.ensure_prefill_bufs()?;
@@ -8773,8 +8933,13 @@ impl Model {
                 self.profile_target_end()?;
 
                 self.profile_catchup_start()?;
-                if self.mtp_state.is_some() {
-                    self.mtp_catchup_verified_prefix(t, staging_slot, Some(&staging_ready))?;
+                if self.has_native_mtp() {
+                    self.mtp_catchup_verified_prefix(
+                        seq,
+                        t,
+                        staging_slot,
+                        Some(&staging_ready),
+                    )?;
                 }
                 self.profile_catchup_end()?;
             }
@@ -9851,6 +10016,7 @@ mod verify_rollback_tests {
             vec![LayerKind::DeltaNet, LayerKind::Attention],
             8,
             16,
+            None,
         )
         .expect("pula powinna powstać");
         let first = pool.acquire().expect("pierwszy lease powinien powstać");
@@ -9908,10 +10074,100 @@ mod verify_rollback_tests {
     }
 
     #[test]
+    fn wspoldzielony_cache_mtp_obsluguje_cancel_release_i_reuse() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mtp_config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 8,
+            page_size: 2,
+            n_pages: 8,
+            max_pages_per_seq: 8,
+            quant: KvQuant::F16,
+        };
+        let mut pool = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            8,
+            16,
+            Some((mtp_config, 4, 8)),
+        )
+        .expect("pula z MTP powinna powstać");
+        let first = pool.acquire().expect("pierwszy lease powinien powstać");
+        let second = pool.acquire().expect("drugi lease powinien powstać");
+
+        pool.activate(first, &stream)
+            .expect("pierwszy lease powinien się aktywować");
+        let (mut first_state, mut kv) = pool
+            .take_mtp(first)
+            .expect("stan MTP powinien być dostępny");
+        first_state
+            .grow(&mut kv)
+            .expect("pierwsza strona powinna powstać");
+        first_state
+            .grow(&mut kv)
+            .expect("pierwsza strona powinna się wypełnić");
+        let first_pages = first_state.seq.pages.clone();
+        pool.restore_mtp(first, first_state, kv)
+            .expect("pierwszy stan powinien wrócić do slotu");
+
+        pool.activate(second, &stream)
+            .expect("drugi lease powinien się aktywować");
+        let (mut second_state, mut kv) = pool
+            .take_mtp(second)
+            .expect("stan MTP powinien być dostępny");
+        second_state
+            .grow(&mut kv)
+            .expect("druga strona powinna powstać");
+        assert!(!first_pages.contains(&second_state.seq.pages[0]));
+        second_state
+            .checkpoint(&stream)
+            .expect("checkpoint powinien powstać");
+        second_state
+            .grow(&mut kv)
+            .expect("draft powinien zająć kolejną pozycję");
+        second_state
+            .rollback(&mut kv, &stream)
+            .expect("cancel powinien odtworzyć długość bazową");
+        assert_eq!(second_state.seq.len, 1);
+        pool.restore_mtp(second, second_state, kv)
+            .expect("drugi stan powinien wrócić do slotu");
+
+        pool.release(first, &stream)
+            .expect("pierwszy lease powinien się zwolnić");
+        let reused = pool.acquire().expect("zwolniony slot powinien wrócić");
+        assert_eq!(reused.slot, first.slot);
+        assert!(reused.generation > first.generation);
+        pool.activate(reused, &stream)
+            .expect("ponownie użyty slot powinien się aktywować");
+        let (reused_state, kv) = pool
+            .take_mtp(reused)
+            .expect("stan MTP powinien być dostępny");
+        assert_eq!(reused_state.seq.len, 0);
+        assert!(reused_state.seq.pages.is_empty());
+        assert_eq!(kv.free_page_count(), 7);
+        pool.restore_mtp(reused, reused_state, kv)
+            .expect("stan po reuse powinien wrócić do slotu");
+
+        pool.release(second, &stream)
+            .expect("drugi lease powinien się zwolnić");
+        pool.release(reused, &stream)
+            .expect("ponownie użyty lease powinien się zwolnić");
+        assert_eq!(
+            pool.mtp_kv
+                .as_ref()
+                .expect("cache MTP powinien istnieć")
+                .free_page_count(),
+            8
+        );
+    }
+
+    #[test]
     fn blad_eventu_z_udanym_sync_nie_powoduje_wzrostu_puli() {
         let device: Arc<dyn Device> = CpuDevice::new();
         let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16)
+        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16, None)
             .expect("pula powinna powstać");
 
         for _ in 0..64 {
@@ -9953,7 +10209,7 @@ mod verify_rollback_tests {
     fn podwojny_blad_zwolnienia_zatruwa_pule_i_blokuje_alokacje() {
         let device: Arc<dyn Device> = CpuDevice::new();
         let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16)
+        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16, None)
             .expect("pula powinna powstać");
         let lease = pool.acquire().expect("lease powinien powstać");
         pool.activate(lease, &stream)

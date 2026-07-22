@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: mtp.rs
-// Opis: Typowane wagi MTP oraz niezależny stan KV i hidden dla draftu NextN.
+// Opis: Typowane wagi MTP i stan draftu NextN korzystający ze wspólnej puli KV.
 // Przykład: MtpWeights::load(descriptor, params, loader, embedding, output)
 // =============================================================================
 
@@ -11,7 +11,7 @@ use forge_hal::{DevBuffer, Device, Pool, Stream, Event};
 use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 
-use crate::kv::{KvCache, KvConfig, SeqKv};
+use crate::kv::{KvCache, SeqKv};
 use crate::weights::{
     AttnWeights, DenseFfn, DevWeight, GateUpWeights, LayerFfn, LayerMixer, LayerWeights, QkvWeights,
 };
@@ -359,10 +359,9 @@ fn share_weight(weight: &DevWeight) -> DevWeight {
     }
 }
 
-/// Właściciel odrębnego KV MTP i hidden przenoszonego między krokami draftu.
+/// Stan jednej sekwencji MTP korzystającej ze współdzielonego cache stron.
 pub struct MtpDraftState {
     device: Arc<dyn Device>,
-    pub kv: KvCache,
     pub seq: SeqKv,
     pub recurrent_hidden: DevBuffer,
     pub catchup_hidden: DevBuffer,
@@ -376,6 +375,9 @@ pub struct MtpDraftState {
     pub pinned_scalar: DevBuffer,
     pub pinned_scalar_ready: Event,
     pub pinned_scalar_recorded: bool,
+    zero_hidden: DevBuffer,
+    empty_page_table: DevBuffer,
+    zero_scalar: DevBuffer,
     checkpoint_hidden: DevBuffer,
     step_hidden: DevBuffer,
     checkpoint_len: Option<usize>,
@@ -394,14 +396,14 @@ fn new_page_mapping(position: usize, page_size: usize, pages: &[i32]) -> Option<
 impl MtpDraftState {
     pub fn new(
         device: Arc<dyn Device>,
-        kv_config: KvConfig,
+        kv: &KvCache,
         hidden_size: usize,
         vocab_size: usize,
     ) -> Result<Self> {
-        if kv_config.n_layers != 1 {
+        if kv.cfg.n_layers != 1 {
             return Err(ForgeError::Format(format!(
                 "MTP wymaga dokładnie jednej warstwy KV, otrzymano {}",
-                kv_config.n_layers
+                kv.cfg.n_layers
             )));
         }
         let hidden_bytes = hidden_size
@@ -420,8 +422,7 @@ impl MtpDraftState {
                 "MTP: vocab_size musi być dodatni".into(),
             ));
         }
-        let max_pages_per_seq = kv_config.max_pages_per_seq;
-        let kv = KvCache::new(device.as_ref(), kv_config)?;
+        let max_pages_per_seq = kv.cfg.max_pages_per_seq;
         let seq = kv.new_seq();
         let recurrent_hidden = device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?;
         let page_table = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Activations)?;
@@ -431,6 +432,29 @@ impl MtpDraftState {
         device.write(&vec![0xff; max_pages_per_seq * 4], &page_table, 0)?;
         device.write(&[0u8; 4], &seq_len, 0)?;
         device.write(&[0u8; 4], &position, 0)?;
+        let zero_hidden = device.alloc(hidden_bytes, MemKind::PinnedHost, Pool::Activations)?;
+        let empty_page_table =
+            device.alloc(max_pages_per_seq * 4, MemKind::PinnedHost, Pool::Activations)?;
+        let zero_scalar = device.alloc(4, MemKind::PinnedHost, Pool::Activations)?;
+        unsafe {
+            std::ptr::write_bytes(
+                zero_hidden.host_ptr().expect("pinned zero hidden ma mapowanie"),
+                0,
+                hidden_bytes,
+            );
+            std::ptr::write_bytes(
+                empty_page_table
+                    .host_ptr()
+                    .expect("pinned pusta tabela stron ma mapowanie"),
+                0xff,
+                max_pages_per_seq * 4,
+            );
+            std::ptr::write_bytes(
+                zero_scalar.host_ptr().expect("pinned zero scalar ma mapowanie"),
+                0,
+                4,
+            );
+        }
         Ok(Self {
             recurrent_hidden,
             catchup_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
@@ -444,18 +468,20 @@ impl MtpDraftState {
             pinned_scalar: device.alloc(4, MemKind::PinnedHost, Pool::Activations)?,
             pinned_scalar_ready: device.create_event()?,
             pinned_scalar_recorded: false,
+            zero_hidden,
+            empty_page_table,
+            zero_scalar,
             checkpoint_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
             step_hidden: device.alloc(4 * hidden_bytes, MemKind::Device, Pool::Activations)?,
             device,
-            kv,
             seq,
             checkpoint_len: None,
             host_embedding_gathers: 0,
         })
     }
 
-    pub fn grow(&mut self) -> Result<()> {
-        self.kv.grow(&mut self.seq)
+    pub fn grow(&mut self, kv: &mut KvCache) -> Result<()> {
+        kv.grow(&mut self.seq)
     }
 
     pub fn checkpoint(&mut self, stream: &Stream) -> Result<()> {
@@ -476,23 +502,42 @@ impl MtpDraftState {
         Ok(())
     }
 
-    /// Zeruje carry MTP przed rozpoczęciem nowej sekwencji targetu.
-    pub fn reset_hidden(&mut self) -> Result<()> {
-        self.device.write(
-            &vec![0u8; self.recurrent_hidden.len()],
+    /// Czyści cały stan sekwencji MTP na tym samym streamie co wcześniejszy compute.
+    pub fn reset(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
+        self.device.copy(
+            &self.zero_hidden,
+            0,
             &self.recurrent_hidden,
             0,
+            self.recurrent_hidden.len(),
+            stream,
+        )?;
+        self.device.copy(
+            &self.empty_page_table,
+            0,
+            &self.page_table,
+            0,
+            self.page_table.len(),
+            stream,
         )?;
         self.device
-            .write(&vec![0xff; self.page_table.len()], &self.page_table, 0)?;
-        self.device.write(&[0u8; 4], &self.seq_len, 0)?;
-        self.device.write(&[0u8; 4], &self.position, 0)
+            .copy(&self.zero_scalar, 0, &self.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.zero_scalar, 0, &self.position, 0, 4, stream)?;
+        kv.release(&mut self.seq);
+        self.checkpoint_len = None;
+        Ok(())
     }
 
-    pub fn stage_step(&mut self, kernels: &Kernels, stream: &Stream) -> Result<usize> {
+    pub fn stage_step(
+        &mut self,
+        kv: &mut KvCache,
+        kernels: &Kernels,
+        stream: &Stream,
+    ) -> Result<usize> {
         let position = self.seq.len;
-        self.grow()?;
-        let mapping = new_page_mapping(position, self.kv.cfg.page_size, &self.seq.pages);
+        self.grow(kv)?;
+        let mapping = new_page_mapping(position, kv.cfg.page_size, &self.seq.pages);
         kernels.mtp_stage_step(
             &self.position,
             &self.seq_len,
@@ -507,15 +552,19 @@ impl MtpDraftState {
     }
 
     /// Rezerwuje ciąg pozycji MTP i aktualizuje jego tabelę stron jednym zapisem.
-    pub fn stage_batch(&mut self, n_tokens: usize) -> Result<(usize, Vec<i32>, i32, i32)> {
+    pub fn stage_batch(
+        &mut self,
+        kv: &mut KvCache,
+        n_tokens: usize,
+    ) -> Result<(usize, Vec<i32>, i32, i32)> {
         if n_tokens == 0 {
             return Err(ForgeError::Scheduler("MTP: pusty batch catch-up".into()));
         }
         let base = self.seq.len;
         for _ in 0..n_tokens {
-            self.grow()?;
+            self.grow(kv)?;
         }
-        let mut page_table = vec![-1i32; self.kv.cfg.max_pages_per_seq];
+        let mut page_table = vec![-1i32; kv.cfg.max_pages_per_seq];
         page_table[..self.seq.pages.len()].copy_from_slice(&self.seq.pages);
         Ok((
             base,
@@ -525,7 +574,7 @@ impl MtpDraftState {
         ))
     }
 
-    pub fn rollback(&mut self, stream: &Stream) -> Result<()> {
+    pub fn rollback(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
         let len = self.checkpoint_len.ok_or_else(|| {
             ForgeError::Scheduler("MTP: rollback bez aktywnego checkpointu".into())
         })?;
@@ -537,7 +586,7 @@ impl MtpDraftState {
             self.recurrent_hidden.len(),
             stream,
         )?;
-        self.kv.rollback(&mut self.seq, len);
+        kv.rollback(&mut self.seq, len);
         self.checkpoint_len = None;
         Ok(())
     }
@@ -558,7 +607,12 @@ impl MtpDraftState {
         )
     }
 
-    pub fn commit_prefix(&mut self, retained: usize, stream: &Stream) -> Result<()> {
+    pub fn commit_prefix(
+        &mut self,
+        kv: &mut KvCache,
+        retained: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         let base = self.checkpoint_len.ok_or_else(|| {
             ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into())
         })?;
@@ -577,7 +631,7 @@ impl MtpDraftState {
             self.recurrent_hidden.len(),
             stream,
         )?;
-        self.kv.rollback(&mut self.seq, base + retained);
+        kv.rollback(&mut self.seq, base + retained);
         self.checkpoint_len = None;
         Ok(())
     }
@@ -609,8 +663,8 @@ impl MtpDraftState {
         self.host_embedding_gathers
     }
 
-    pub fn release(&mut self) {
-        self.kv.release(&mut self.seq);
+    pub fn release(&mut self, kv: &mut KvCache) {
+        kv.release(&mut self.seq);
         self.checkpoint_len = None;
     }
 }
@@ -622,6 +676,7 @@ mod tests {
     use super::*;
     use forge_formats::{MoeParams, PoolingType};
     use forge_hal::cpu::CpuDevice;
+    use crate::kv::KvConfig;
 
     #[test]
     fn mapowanie_stron_powstaje_tylko_na_granicy() {
@@ -890,31 +945,112 @@ mod tests {
             max_pages_per_seq: 4,
             quant: crate::kv::KvQuant::F16,
         };
-        let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
         for _ in 0..3 {
-            state.grow().unwrap();
+            state.grow(&mut kv).unwrap();
         }
         device
             .write(&[1, 2, 3, 4, 5, 6, 7, 8], &state.recurrent_hidden, 0)
             .unwrap();
         state.checkpoint(&stream).unwrap();
         for _ in 0..3 {
-            state.grow().unwrap();
+            state.grow(&mut kv).unwrap();
         }
         device.write(&[9; 8], &state.recurrent_hidden, 0).unwrap();
         assert_eq!(state.seq.len, 6);
-        assert_eq!(state.kv.free_page_count(), 1);
+        assert_eq!(kv.free_page_count(), 1);
 
-        state.rollback(&stream).unwrap();
+        state.rollback(&mut kv, &stream).unwrap();
         assert_eq!(state.seq.len, 3);
         assert_eq!(state.seq.pages.len(), 2);
-        assert_eq!(state.kv.free_page_count(), 2);
+        assert_eq!(kv.free_page_count(), 2);
         assert_eq!(state.checkpoint_len(), None);
         let mut hidden = [0u8; 8];
         device
             .read(&state.recurrent_hidden, 0, &mut hidden)
             .unwrap();
         assert_eq!(hidden, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn reset_oddaje_strony_i_czysci_caly_stan_sekwencji() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 2,
+            n_pages: 4,
+            max_pages_per_seq: 4,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
+        for _ in 0..3 {
+            state.grow(&mut kv).unwrap();
+        }
+        state.checkpoint(&stream).unwrap();
+        device
+            .write(&[7u8; 8], &state.recurrent_hidden, 0)
+            .unwrap();
+        device.write(&[3u8; 4], &state.seq_len, 0).unwrap();
+        device.write(&[2u8; 4], &state.position, 0).unwrap();
+        assert_eq!(kv.free_page_count(), 2);
+
+        state.reset(&mut kv, &stream).unwrap();
+        stream.synchronize().unwrap();
+
+        assert_eq!(state.seq.len, 0);
+        assert!(state.seq.pages.is_empty());
+        assert_eq!(state.checkpoint_len(), None);
+        assert_eq!(kv.free_page_count(), 4);
+        let mut hidden = [0xffu8; 8];
+        let mut page_table = [0u8; 16];
+        let mut seq_len = [0xffu8; 4];
+        let mut position = [0xffu8; 4];
+        device
+            .read(&state.recurrent_hidden, 0, &mut hidden)
+            .unwrap();
+        device.read(&state.page_table, 0, &mut page_table).unwrap();
+        device.read(&state.seq_len, 0, &mut seq_len).unwrap();
+        device.read(&state.position, 0, &mut position).unwrap();
+        assert_eq!(hidden, [0u8; 8]);
+        assert_eq!(page_table, [0xffu8; 16]);
+        assert_eq!(seq_len, [0u8; 4]);
+        assert_eq!(position, [0u8; 4]);
+    }
+
+    #[test]
+    fn blad_reset_nie_oddaje_stron_przed_zakolejkowaniem_zerowania() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 2,
+            n_pages: 4,
+            max_pages_per_seq: 4,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
+        for _ in 0..3 {
+            state.grow(&mut kv).unwrap();
+        }
+        state.checkpoint(&stream).unwrap();
+        let pages = state.seq.pages.clone();
+        state.empty_page_table = device
+            .alloc(1, MemKind::PinnedHost, Pool::Activations)
+            .unwrap();
+
+        assert!(state.reset(&mut kv, &stream).is_err());
+        assert_eq!(state.seq.len, 3);
+        assert_eq!(state.seq.pages, pages);
+        assert_eq!(state.checkpoint_len(), Some(3));
+        assert_eq!(kv.free_page_count(), 2);
     }
 
     #[test]
@@ -932,17 +1068,20 @@ mod tests {
                     max_pages_per_seq: 4,
                     quant: crate::kv::KvQuant::F16,
                 };
-                let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
+                let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+                let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
                 state.checkpoint(&stream).unwrap();
                 for step in 0..=budget {
-                    state.grow().unwrap();
+                    state.grow(&mut kv).unwrap();
                     device
                         .write(&[step as u8 + 1; 8], &state.recurrent_hidden, 0)
                         .unwrap();
                     state.save_step_hidden(step, &stream).unwrap();
                 }
 
-                state.commit_prefix(accepted + 1, &stream).unwrap();
+                state
+                    .commit_prefix(&mut kv, accepted + 1, &stream)
+                    .unwrap();
                 assert_eq!(state.seq.len, accepted + 1);
                 assert_eq!(state.checkpoint_len(), None);
                 let mut hidden = [0u8; 8];
@@ -951,9 +1090,9 @@ mod tests {
                     .unwrap();
                 assert_eq!(hidden, [accepted as u8 + 1; 8]);
 
-                state.release();
+                state.release(&mut kv);
                 assert_eq!(state.seq.len, 0);
-                assert_eq!(state.kv.free_page_count(), 4);
+                assert_eq!(kv.free_page_count(), 4);
             }
         }
     }
@@ -971,11 +1110,12 @@ mod tests {
             max_pages_per_seq: 4,
             quant: crate::kv::KvQuant::F16,
         };
-        let mut state = MtpDraftState::new(device, config, 4, 8).unwrap();
-        state.grow().unwrap();
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device, &kv, 4, 8).unwrap();
+        state.grow(&mut kv).unwrap();
         state.checkpoint(&stream).unwrap();
-        state.grow().unwrap();
-        state.grow().unwrap();
+        state.grow(&mut kv).unwrap();
+        state.grow(&mut kv).unwrap();
 
         assert!(state.commit_catchup(1).is_err());
         assert_eq!(state.checkpoint_len(), Some(1));
@@ -997,20 +1137,21 @@ mod tests {
             max_pages_per_seq: 8,
             quant: crate::kv::KvQuant::F16,
         };
-        let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
 
         state.checkpoint(&stream).unwrap();
-        let (base, _, seq_len, position) = state.stage_batch(3).unwrap();
+        let (base, _, seq_len, position) = state.stage_batch(&mut kv, 3).unwrap();
         assert_eq!((base, seq_len, position), (0, 3, 2));
         state.commit_catchup(3).unwrap();
         state.checkpoint(&stream).unwrap();
-        let (base, page_table, seq_len, position) = state.stage_batch(2).unwrap();
+        let (base, page_table, seq_len, position) = state.stage_batch(&mut kv, 2).unwrap();
         assert_eq!((base, seq_len, position), (3, 5, 4));
         state.commit_catchup(2).unwrap();
 
         assert_eq!(&page_table[..state.seq.pages.len()], &state.seq.pages);
         assert_eq!(state.seq.pages.len(), 2);
-        assert!(state.stage_batch(0).is_err());
+        assert!(state.stage_batch(&mut kv, 0).is_err());
     }
 
     #[test]
@@ -1026,17 +1167,18 @@ mod tests {
             max_pages_per_seq: 4,
             quant: crate::kv::KvQuant::F16,
         };
-        let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
-        state.grow().unwrap();
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
+        state.grow(&mut kv).unwrap();
         state.checkpoint(&stream).unwrap();
-        state.grow().unwrap();
+        state.grow(&mut kv).unwrap();
         let len = state.seq.len;
         let pages = state.seq.pages.clone();
         state.checkpoint_hidden = device
             .alloc(1, MemKind::Device, Pool::Activations)
             .unwrap();
 
-        assert!(state.rollback(&stream).is_err());
+        assert!(state.rollback(&mut kv, &stream).is_err());
         assert_eq!(state.seq.len, len);
         assert_eq!(state.seq.pages, pages);
         assert_eq!(state.checkpoint_len(), Some(1));

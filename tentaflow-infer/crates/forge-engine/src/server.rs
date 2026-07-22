@@ -211,7 +211,7 @@ fn validate_speculation_server_config(
 ) -> Result<()> {
     if hybrid_target && max_active != 1 {
         return Err(ForgeError::Unsupported(
-            "model hybrydowy wymaga max_active=1 do czasu podłączenia schedulera do lease SSM"
+            "model hybrydowy wymaga max_active=1 do czasu podłączenia startup preflightu i grafów per slot"
                 .into(),
         ));
     }
@@ -221,7 +221,8 @@ fn validate_speculation_server_config(
     ) && max_active != 1
     {
         return Err(ForgeError::Unsupported(
-            "natywne MTP wymaga max_active=1, ponieważ stan draftu należy do modelu".into(),
+            "natywne MTP wymaga max_active=1 do czasu podłączenia wielosekwencyjnego admission"
+                .into(),
         ));
     }
     Ok(())
@@ -321,7 +322,7 @@ pub fn spawn_engine_batched(
                 if !model.has_native_mtp() =>
             {
                 return Err(ForgeError::Unsupported(
-                    "native MTP requires a supported model-owned MTP runtime".into(),
+                    "natywne MTP wymaga obsługiwanego runtime per sekwencja".into(),
                 ));
             }
             SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram => {

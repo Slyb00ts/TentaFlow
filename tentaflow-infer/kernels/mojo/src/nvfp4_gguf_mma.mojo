@@ -13,14 +13,12 @@ from src.gemm import _issue_x, _store_tile
 from src.gemv2 import _e2m1x8
 from src.nvfp4_gguf_batch import _ue4m3_value
 
-comptime BN = 64
 comptime BK = 32
 comptime LDK = 40
 comptime LDW = 40
-comptime WTILE = BN * LDW
 
 
-def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
+def gemm_nvfp4_gguf_mma_impl[BM: Int, BN: Int, NW: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
@@ -31,10 +29,11 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
 ):
     """Liczy GEMM na tensor cores NVIDIA z dekwantyzacja wag w rejestrach.
 
-    Grid ma ksztalt (ceil(n_rows / 64), ceil(n_tokens / BM)), blok NW*WARP_SIZE,
+    Grid ma ksztalt (ceil(n_rows / BN), ceil(n_tokens / BM)), blok NW*WARP_SIZE,
     a n_cols musi byc wielokrotnoscia 64. Format zrodla pozostaje GGUF NVFP4.
     """
     comptime XTILE = BM * LDK
+    comptime WTILE = BN * LDW
     comptime NT = NW * WARP_SIZE
     comptime x_rows_per_pass = NT // 4
     comptime weight_passes = (BN * 4) // NT
@@ -66,14 +65,28 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
     var source_token1 = token0 + x_row + x_rows_per_pass
     if source_token1 > n_tokens - 1:
         source_token1 = n_tokens - 1
+    var source_token2 = token0 + x_row + 2 * x_rows_per_pass
+    if source_token2 > n_tokens - 1:
+        source_token2 = n_tokens - 1
+    var source_token3 = token0 + x_row + 3 * x_rows_per_pass
+    if source_token3 > n_tokens - 1:
+        source_token3 = n_tokens - 1
     x_source0 = (x + source_token0 * n_cols + column8).address_space_cast[
         AddressSpace.GLOBAL
     ]()
     x_source1 = (x + source_token1 * n_cols + column8).address_space_cast[
         AddressSpace.GLOBAL
     ]()
+    x_source2 = (x + source_token2 * n_cols + column8).address_space_cast[
+        AddressSpace.GLOBAL
+    ]()
+    x_source3 = (x + source_token3 * n_cols + column8).address_space_cast[
+        AddressSpace.GLOBAL
+    ]()
     x_target0 = xs + x_row * LDK + column8
     x_target1 = x_target0 + x_rows_per_pass * LDK
+    x_target2 = x_target0 + 2 * x_rows_per_pass * LDK
+    x_target3 = x_target0 + 3 * x_rows_per_pass * LDK
 
     part = tid % 4
     blocks_per_row = n_cols // 64
@@ -121,6 +134,10 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
     _issue_x[BM, NW](
         0, n_cols, column8, x_source0, x_source1, x_target0, x_target1
     )
+    comptime if BM == 128 and NW == 4:
+        _issue_x[BM, NW](
+            0, n_cols, column8, x_source2, x_source3, x_target2, x_target3
+        )
     async_copy_commit_group()
     var codes = InlineArray[SIMD[DType.uint8, 8], weight_passes](
         fill=SIMD[DType.uint8, 8](0)
@@ -135,6 +152,11 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
                 stage + 1, n_cols, column8, x_source0, x_source1,
                 x_target0, x_target1,
             )
+            comptime if BM == 128 and NW == 4:
+                _issue_x[BM, NW](
+                    stage + 1, n_cols, column8, x_source2, x_source3,
+                    x_target2, x_target3,
+                )
             async_copy_commit_group()
 
         comptime for weight_pass in range(weight_passes):
@@ -180,5 +202,6 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, NW: Int](
     )
 
 
-comptime gemm_nvfp4_gguf_mma_f16_bm32 = gemm_nvfp4_gguf_mma_impl[32, 2]
-comptime gemm_nvfp4_gguf_mma_f16_bm128 = gemm_nvfp4_gguf_mma_impl[128, 8]
+comptime gemm_nvfp4_gguf_mma_f16_bm32 = gemm_nvfp4_gguf_mma_impl[32, 64, 2]
+comptime gemm_nvfp4_gguf_mma_f16_bm128 = gemm_nvfp4_gguf_mma_impl[128, 64, 8]
+comptime gemm_nvfp4_gguf_mma_f16_bm128_bn32 = gemm_nvfp4_gguf_mma_impl[128, 32, 4]

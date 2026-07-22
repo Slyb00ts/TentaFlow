@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
-use forge_engine::speculation::{SpeculationCoordinator, SpeculativeConfig};
+use forge_engine::speculation::{SpeculationCoordinator, SpeculativeConfig, SpeculativeState};
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
@@ -93,6 +93,232 @@ fn interleaving_audit(
         return Err("przeplatane stany DeltaNet różnią się od przebiegów serialnych".into());
     }
     println!("hybrid interleaving A/B: {target} + {target} tokenów, parity PASS");
+    Ok(())
+}
+
+struct MtpLane {
+    seq: forge_engine::kv::SeqKv,
+    fed: u32,
+    tokens: Vec<u32>,
+}
+
+fn advance_pure_mtp(
+    model: &mut Model,
+    lane: &mut MtpLane,
+    budget: usize,
+    target: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if lane.tokens.len() >= target {
+        return Ok(());
+    }
+    lane.tokens.push(lane.fed);
+    if lane.tokens.len() >= target {
+        return Ok(());
+    }
+    let (draft, accepted, correction) = model.native_mtp_step(&mut lane.seq, lane.fed, budget)?;
+    for &token in &draft[..accepted] {
+        if lane.tokens.len() < target {
+            lane.tokens.push(token);
+        }
+    }
+    lane.fed = correction;
+    Ok(())
+}
+
+fn pure_mtp_tokens(
+    model: &mut Model,
+    prompt: &[u32],
+    budget: usize,
+    target: usize,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let (seq, fed) = prepare(model, prompt)?;
+    let mut lane = MtpLane {
+        seq,
+        fed,
+        tokens: Vec::with_capacity(target),
+    };
+    while lane.tokens.len() < target {
+        advance_pure_mtp(model, &mut lane, budget, target)?;
+    }
+    model.release_seq(&mut lane.seq);
+    Ok(lane.tokens)
+}
+
+struct ComboLane {
+    seq: forge_engine::kv::SeqKv,
+    fed: u32,
+    tokens: Vec<u32>,
+    proposer: SpeculativeState,
+}
+
+fn advance_mtp_ngram(
+    model: &mut Model,
+    lane: &mut ComboLane,
+    budget: usize,
+    target: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if lane.tokens.len() >= target {
+        return Ok(());
+    }
+    lane.tokens.push(lane.fed);
+    lane.proposer.observe(lane.fed);
+    if lane.tokens.len() >= target {
+        return Ok(());
+    }
+    let draft = lane.proposer.draft(budget)?;
+    let (accepted, correction) = if draft.len() == budget {
+        let result = model.verify_greedy_draft_with_mtp_catchup(&mut lane.seq, lane.fed, &draft)?;
+        lane.proposer.commit(&draft, result.0)?;
+        result
+    } else {
+        lane.proposer.cancel_draft();
+        let (mtp_draft, accepted, correction) =
+            model.native_mtp_step(&mut lane.seq, lane.fed, budget)?;
+        lane.proposer.observe_all(&mtp_draft[..accepted]);
+        for &token in &mtp_draft[..accepted] {
+            if lane.tokens.len() < target {
+                lane.tokens.push(token);
+            }
+        }
+        lane.fed = correction;
+        return Ok(());
+    };
+    for &token in &draft[..accepted] {
+        if lane.tokens.len() < target {
+            lane.tokens.push(token);
+        }
+    }
+    lane.fed = correction;
+    Ok(())
+}
+
+fn mtp_interleaving_audit(
+    model: &mut Model,
+    first_prompt: &[u32],
+    second_prompt: &[u32],
+    budget: usize,
+    target: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let first_serial = pure_mtp_tokens(model, first_prompt, budget, target)?;
+    let second_serial = pure_mtp_tokens(model, second_prompt, budget, target)?;
+    let (mut same_first_seq, same_first_fed) = prepare(model, first_prompt)?;
+    let (mut same_second_seq, same_second_fed) = prepare(model, first_prompt)?;
+    let same_first_snapshot = model.debug_mtp_state_snapshot(&same_first_seq)?;
+    let same_second_snapshot = model.debug_mtp_state_snapshot(&same_second_seq)?;
+    compare_snapshots(&same_first_snapshot, &same_second_snapshot)?;
+    let same_first_draft = model.mtp_propose_k(&mut same_first_seq, same_first_fed, budget)?;
+    let same_second_draft = model.mtp_propose_k(&mut same_second_seq, same_second_fed, budget)?;
+    model.release_seq(&mut same_first_seq);
+    model.release_seq(&mut same_second_seq);
+    if same_first_fed != same_second_fed || same_first_draft != same_second_draft {
+        return Err(format!(
+            "dwa świeże sloty MTP różnią się dla jednego promptu: fed {same_first_fed}/{same_second_fed}, draft {same_first_draft:?}/{same_second_draft:?}"
+        )
+        .into());
+    }
+    let (mut first_probe_seq, first_probe_fed) = prepare(model, first_prompt)?;
+    let first_probe = model.mtp_propose_k(&mut first_probe_seq, first_probe_fed, budget)?;
+    model.release_seq(&mut first_probe_seq);
+    let (mut second_probe_seq, second_probe_fed) = prepare(model, second_prompt)?;
+    let second_probe = model.mtp_propose_k(&mut second_probe_seq, second_probe_fed, budget)?;
+    model.release_seq(&mut second_probe_seq);
+    let (mut first_probe_seq, first_probe_fed_ab) = prepare(model, first_prompt)?;
+    let (mut second_probe_seq, second_probe_fed_ab) = prepare(model, second_prompt)?;
+    let first_probe_ab = model.mtp_propose_k(&mut first_probe_seq, first_probe_fed_ab, budget)?;
+    let second_probe_ab = model.mtp_propose_k(&mut second_probe_seq, second_probe_fed_ab, budget)?;
+    model.release_seq(&mut first_probe_seq);
+    model.release_seq(&mut second_probe_seq);
+    if first_probe_fed != first_probe_fed_ab
+        || second_probe_fed != second_probe_fed_ab
+        || first_probe != first_probe_ab
+        || second_probe != second_probe_ab
+    {
+        return Err(format!(
+            "proposer MTP różni się serial/A-B: A {first_probe_fed} {first_probe:?} / {first_probe_fed_ab} {first_probe_ab:?}; B {second_probe_fed} {second_probe:?} / {second_probe_fed_ab} {second_probe_ab:?}"
+        )
+        .into());
+    }
+    let (first_seq, first_fed) = prepare(model, first_prompt)?;
+    let (second_seq, second_fed) = prepare(model, second_prompt)?;
+    let mut first = MtpLane {
+        seq: first_seq,
+        fed: first_fed,
+        tokens: Vec::with_capacity(target),
+    };
+    let mut second = MtpLane {
+        seq: second_seq,
+        fed: second_fed,
+        tokens: Vec::with_capacity(target),
+    };
+    while first.tokens.len() < target || second.tokens.len() < target {
+        advance_pure_mtp(model, &mut first, budget, target)?;
+        advance_pure_mtp(model, &mut second, budget, target)?;
+    }
+    model.release_seq(&mut first.seq);
+    model.release_seq(&mut second.seq);
+    if first.tokens != first_serial || second.tokens != second_serial {
+        let first_mismatch = first
+            .tokens
+            .iter()
+            .zip(&first_serial)
+            .position(|(actual, expected)| actual != expected);
+        let second_mismatch = second
+            .tokens
+            .iter()
+            .zip(&second_serial)
+            .position(|(actual, expected)| actual != expected);
+        return Err(format!(
+            "przeplatany pure MTP różni się od serialnego: A={first_mismatch:?} actual={:?} expected={:?}; B={second_mismatch:?} actual={:?} expected={:?}",
+            first.tokens, first_serial, second.tokens, second_serial
+        )
+        .into());
+    }
+
+    let first_combo = ngram_trial(model, first_prompt, budget, target, None, true)?.tokens;
+    let second_combo = ngram_trial(model, second_prompt, budget, target, None, true)?.tokens;
+    let coordinator = SpeculationCoordinator::new(SpeculativeConfig::ngram(budget)?)?;
+    let (first_seq, first_fed) = prepare(model, first_prompt)?;
+    let (second_seq, second_fed) = prepare(model, second_prompt)?;
+    let mut first = ComboLane {
+        seq: first_seq,
+        fed: first_fed,
+        tokens: Vec::with_capacity(target),
+        proposer: coordinator
+            .new_state(first_prompt)?
+            .expect("n-gram ma stan hostowy"),
+    };
+    let mut second = ComboLane {
+        seq: second_seq,
+        fed: second_fed,
+        tokens: Vec::with_capacity(target),
+        proposer: coordinator
+            .new_state(second_prompt)?
+            .expect("n-gram ma stan hostowy"),
+    };
+    while first.tokens.len() < target || second.tokens.len() < target {
+        advance_mtp_ngram(model, &mut first, budget, target)?;
+        advance_mtp_ngram(model, &mut second, budget, target)?;
+    }
+    model.release_seq(&mut first.seq);
+    model.release_seq(&mut second.seq);
+    if first.tokens != first_combo || second.tokens != second_combo {
+        return Err("przeplatany MTP+n-gram różni się od przebiegów serialnych".into());
+    }
+    let (mut cancel_seq, cancel_fed) = prepare(model, first_prompt)?;
+    let before_cancel = model.debug_mtp_state_snapshot(&cancel_seq)?;
+    let first_draft = model.mtp_propose_k(&mut cancel_seq, cancel_fed, budget)?;
+    let after_cancel = model.debug_mtp_state_snapshot(&cancel_seq)?;
+    if before_cancel != after_cancel {
+        return Err("cancel MTP nie odtworzył stanu sekwencji".into());
+    }
+    model.release_seq(&mut cancel_seq);
+    let (mut reused_seq, reused_fed) = prepare(model, first_prompt)?;
+    let reused_draft = model.mtp_propose_k(&mut reused_seq, reused_fed, budget)?;
+    model.release_seq(&mut reused_seq);
+    if cancel_fed != reused_fed || first_draft != reused_draft {
+        return Err("release/reuse slotu MTP zmienił deterministyczny draft".into());
+    }
+    println!("MTP interleaving pure + n-gram: {target} + {target} tokenów, parity PASS");
     Ok(())
 }
 
@@ -346,7 +572,7 @@ fn diagnose_first_commit(
     };
     let batch = model.debug_hybrid_state_snapshot()?;
     let batch_mtp = mtp_router
-        .then(|| model.debug_mtp_state_snapshot())
+        .then(|| model.debug_mtp_state_snapshot(&batch_seq))
         .transpose()?;
     model.release_seq(&mut batch_seq);
 
@@ -360,7 +586,7 @@ fn diagnose_first_commit(
     }
     let serial = model.debug_hybrid_state_snapshot()?;
     let serial_mtp = mtp_router
-        .then(|| model.debug_mtp_state_snapshot())
+        .then(|| model.debug_mtp_state_snapshot(&serial_seq))
         .transpose()?;
     model.release_seq(&mut serial_seq);
     eprintln!(
@@ -381,20 +607,20 @@ fn diagnose_mtp_catchup_prefixes(
     let oracle = serial_trial(model, prompt, budget + 2)?.tokens;
     let vocab = model.weights.descriptor.params.vocab_size as u32;
     let (mut first_prompt_seq, _) = prepare(model, prompt)?;
-    let first_prompt_mtp = model.debug_mtp_state_snapshot()?;
+    let first_prompt_mtp = model.debug_mtp_state_snapshot(&first_prompt_seq)?;
     model.release_seq(&mut first_prompt_seq);
     let (mut second_prompt_seq, _) = prepare(model, prompt)?;
-    let second_prompt_mtp = model.debug_mtp_state_snapshot()?;
+    let second_prompt_mtp = model.debug_mtp_state_snapshot(&second_prompt_seq)?;
     model.release_seq(&mut second_prompt_seq);
     compare_snapshots(&first_prompt_mtp, &second_prompt_mtp)?;
     let (mut verifier_seq, verifier_fed) = prepare(model, prompt)?;
-    let verifier_mtp_before = model.debug_mtp_state_snapshot()?;
+    let verifier_mtp_before = model.debug_mtp_state_snapshot(&verifier_seq)?;
     let _ = model.verify_greedy_draft(
         &mut verifier_seq,
         verifier_fed,
         &oracle[1..=budget],
     )?;
-    let verifier_mtp_after = model.debug_mtp_state_snapshot()?;
+    let verifier_mtp_after = model.debug_mtp_state_snapshot(&verifier_seq)?;
     compare_snapshots(&verifier_mtp_before, &verifier_mtp_after)?;
     model.release_seq(&mut verifier_seq);
     for expected in 0..=budget {
@@ -406,10 +632,10 @@ fn diagnose_mtp_catchup_prefixes(
         for &token in &oracle[..=expected] {
             serial_correction =
                 model.step_and_sample(&mut serial_seq, token, &mut greedy_sampler())?;
-            model.debug_mtp_catchup_token(token)?;
+            model.debug_mtp_catchup_token(&mut serial_seq, token)?;
         }
         let serial_target = model.debug_hybrid_state_snapshot()?;
-        let serial_mtp = model.debug_mtp_state_snapshot()?;
+        let serial_mtp = model.debug_mtp_state_snapshot(&serial_seq)?;
         let serial_x = serial_target
             .iter()
             .find(|(name, _, _)| name == "x")
@@ -437,7 +663,7 @@ fn diagnose_mtp_catchup_prefixes(
             .into());
         }
         let batch_target = model.debug_hybrid_state_snapshot()?;
-        let batch_mtp = model.debug_mtp_state_snapshot()?;
+        let batch_mtp = model.debug_mtp_state_snapshot(&batch_seq)?;
         let batch_x = batch_target
             .iter()
             .find(|(name, _, _)| name == "x")
@@ -532,6 +758,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if std::env::var_os("FORGE_HYBRID_INTERLEAVE_AUDIT").is_some() {
         return interleaving_audit(&mut model, &prompt, &second_prompt, target.min(32));
+    }
+    if std::env::var_os("FORGE_MTP_INTERLEAVE_AUDIT").is_some() {
+        if !mtp_router {
+            return Err("audyt przeplatania MTP wymaga trybu mtp+ngram".into());
+        }
+        model.preflight_hybrid_state_slots(2)?;
+        return mtp_interleaving_audit(&mut model, &prompt, &second_prompt, budget, target.min(32));
     }
 
     let warm_oracle = serial_trial(&mut model, &prompt, 8)?;

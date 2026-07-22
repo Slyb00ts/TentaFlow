@@ -620,13 +620,13 @@ fn resolve_max_active(
     }));
     if max_active != 1 {
         if hybrid_model {
-            bail!("modele hybrydowe wymagają --max-active 1, dopóki stan SSM należy do modelu");
+            bail!("modele hybrydowe wymagają --max-active 1 do czasu podłączenia startup preflightu i grafów per slot");
         }
         if matches!(
             spec.kind(),
             SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
         ) {
-            bail!("--speculative mtp oraz mtp+ngram wymagają --max-active 1");
+            bail!("--speculative mtp oraz mtp+ngram wymagają --max-active 1 do czasu podłączenia wielosekwencyjnego admission");
         }
     }
     Ok(max_active)

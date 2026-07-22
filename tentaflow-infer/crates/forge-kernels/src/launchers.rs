@@ -56,6 +56,7 @@ struct Nvfp4GgufDispatch {
 
 fn nvfp4_gguf_dispatch(
     n_tokens: usize,
+    n_rows: usize,
     is_nvidia: bool,
     warp_size: u32,
     max_threads: u32,
@@ -85,6 +86,9 @@ fn nvfp4_gguf_dispatch(
         9..=16 => ("gemm_nvfp4_gguf_f16_b16", 16, 1, warp_size.checked_mul(16)),
         17..=32 if is_nvidia && warp_size == 32 => {
             ("gemm_nvfp4_gguf_mma_f16_bm32", 32, 64, Some(64))
+        }
+        128 if n_rows == 1024 && is_nvidia && warp_size == 32 => {
+            ("gemm_nvfp4_gguf_mma_f16_bm128_bn32", 128, 32, Some(128))
         }
         _ if is_nvidia && warp_size == 32 => ("gemm_nvfp4_gguf_mma_f16_bm128", 128, 64, Some(256)),
         _ => {
@@ -1645,6 +1649,7 @@ impl Kernels {
         let caps = self.device.caps();
         let dispatch = nvfp4_gguf_dispatch(
             n_tokens,
+            rows,
             matches!(caps.vendor, forge_types::Vendor::Nvidia),
             caps.warp_size,
             caps.max_threads_per_block,
@@ -10819,20 +10824,20 @@ mod nvfp4_gguf_dispatch_tests {
             (9, "gemm_nvfp4_gguf_f16_b16", 512),
             (16, "gemm_nvfp4_gguf_f16_b16", 512),
         ] {
-            let dispatch = nvfp4_gguf_dispatch(tokens, true, 32, 1024).unwrap();
+            let dispatch = nvfp4_gguf_dispatch(tokens, 5120, true, 32, 1024).unwrap();
             assert_eq!(dispatch.kernel, expected);
             assert_eq!(dispatch.block_threads, block);
         }
         for tokens in 2..=4 {
-            let dispatch = nvfp4_gguf_dispatch(tokens, false, 64, 1024).unwrap();
+            let dispatch = nvfp4_gguf_dispatch(tokens, 5120, false, 64, 1024).unwrap();
             assert_eq!(dispatch.block_threads, 64);
         }
         assert_eq!(
-            nvfp4_gguf_dispatch(3, false, 64, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(3, 5120, false, 64, 1024).unwrap().kernel,
             "gemm_nvfp4_gguf_f16_b3"
         );
         assert_eq!(
-            nvfp4_gguf_dispatch(4, false, 64, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(4, 5120, false, 64, 1024).unwrap().kernel,
             "gemm_nvfp4_gguf_f16_b4"
         );
     }
@@ -10840,22 +10845,28 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn wybiera_mma_tylko_dla_nvidia() {
         assert_eq!(
-            nvfp4_gguf_dispatch(17, true, 32, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(17, 5120, true, 32, 1024).unwrap().kernel,
             "gemm_nvfp4_gguf_mma_f16_bm32"
         );
         assert_eq!(
-            nvfp4_gguf_dispatch(128, true, 32, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(128, 5120, true, 32, 1024).unwrap().kernel,
             "gemm_nvfp4_gguf_mma_f16_bm128"
         );
-        assert!(nvfp4_gguf_dispatch(17, false, 64, 1024).is_err());
-        assert!(nvfp4_gguf_dispatch(17, true, 64, 1024).is_err());
+        assert_eq!(
+            nvfp4_gguf_dispatch(128, 1024, true, 32, 1024)
+                .unwrap()
+                .kernel,
+            "gemm_nvfp4_gguf_mma_f16_bm128_bn32"
+        );
+        assert!(nvfp4_gguf_dispatch(17, 5120, false, 64, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(17, 5120, true, 64, 1024).is_err());
     }
 
     #[test]
     fn odrzuca_nieprawidlowy_rozmiar_bloku() {
-        assert!(nvfp4_gguf_dispatch(1, true, 32, 1024).is_err());
-        assert!(nvfp4_gguf_dispatch(16, false, 64, 512).is_err());
-        assert!(nvfp4_gguf_dispatch(3, false, 0, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(1, 5120, true, 32, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(16, 5120, false, 64, 512).is_err());
+        assert!(nvfp4_gguf_dispatch(3, 5120, false, 0, 1024).is_err());
     }
 
     #[test]

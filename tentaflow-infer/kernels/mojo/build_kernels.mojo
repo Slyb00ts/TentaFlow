@@ -214,6 +214,7 @@ from src.nvfp4_gguf_batch import (
 from src.nvfp4_gguf_mma import (
     gemm_nvfp4_gguf_mma_f16_bm32,
     gemm_nvfp4_gguf_mma_f16_bm128,
+    gemm_nvfp4_gguf_mma_f16_bm128_bn32,
 )
 
 
@@ -254,6 +255,7 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
         or name == "gemm_nvfp4_gguf_f16_b16"
         or name == "gemm_nvfp4_gguf_mma_f16_bm32"
         or name == "gemm_nvfp4_gguf_mma_f16_bm128"
+        or name == "gemm_nvfp4_gguf_mma_f16_bm128_bn32"
     )
 
 
@@ -476,6 +478,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm32"))
     _ = ctx.compile_function[gemm_nvfp4_gguf_mma_f16_bm128, dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128.ptx")]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128"))
+    _ = ctx.compile_function[gemm_nvfp4_gguf_mma_f16_bm128_bn32, dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128_bn32.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128_bn32"))
     _ = ctx.compile_function[pack_nvfp4_fp8, dump_asm=Path("pack_nvfp4_fp8.ptx")]()
     entries.append(_finalize(out_dir, "pack_nvfp4_fp8"))
     _ = ctx.compile_function[pack_f16_fp8, dump_asm=Path("pack_f16_fp8.ptx")]()

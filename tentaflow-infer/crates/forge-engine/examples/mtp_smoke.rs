@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let draft = model.mtp_propose_k(target_before, k)?;
+    let draft = model.mtp_propose_k(&mut seq, target_before, k)?;
     let mut sampler = GpuSampler::new(SamplingParams {
         temperature: 0.0,
         ..SamplingParams::default()

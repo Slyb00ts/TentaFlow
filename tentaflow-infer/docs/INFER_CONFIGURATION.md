@@ -331,8 +331,10 @@ Zakres i komponowanie:
 - **Wymusza `--prefix-cache off`** (obie funkcje zarządzają własnością stron KV;
   weryfikacja dopisuje i wycofuje draftowe strony na gołej puli).
 - Natywne MTP i `mtp+ngram` wymagają obsługiwanego modelowego runtime MTP, greedy z próbkowaniem
-  GPU bez repetition penalty oraz `--max-active 1`. Ograniczenie jednego aktywnego
-  żądania wynika z model-owned stanu SSM. Nie ma cichego fallbacku: niezgodna
+  GPU bez repetition penalty oraz `--max-active 1`. Target DeltaNet i draft MTP
+  mają osobny stan per sekwencja pod wspólnym lease; strony KV draftu pochodzą
+  z jednej współdzielonej puli MTP. Limit pozostaje do czasu podłączenia schedulera,
+  preflightu VRAM i wykonawczego audytu A/B. Nie ma cichego fallbacku: niezgodna
   konfiguracja kończy się błędem przed uruchomieniem workera.
 - Spekulacja stochastyczna (`temp > 0`) NIE jest zaimplementowana w v1 — tylko
   greedy-exact. Statystyki akceptacji per-proposer i adaptive-disable (usypianie
@@ -750,8 +752,12 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   każdy przechowuje `[n_v_heads, d_state, d_state]` f32 oraz okno conv
   `[conv_dim, d_conv-1]` f16 dla każdej warstwy DeltaNet. Lease zawiera numer
   slotu i generację, a event GPU porządkuje przełączenie oraz bezpieczny reuse.
-  Serwer nadal wymusza `max_active=1`, dopóki scheduler hybrydowy i stan MTP nie
-  zostaną przełączone na ten kontrakt.
+  Ten sam lease wskazuje osobny stan draftu MTP i jego `SeqKv`, korzystający ze
+  współdzielonego paged cache MTP. Preflight dwóch slotów oraz audyt GPU pure MTP
+  i MTP+n-gram A/B przechodzą. Serwer nadal wymusza `max_active=1`, dopóki
+  scheduler hybrydowy nie dostanie grafów per slot i wielosekwencyjnego admission.
+  Globalny graph verifiera T=3/4 działa tylko dla puli z jednym slotem; pula
+  wielosekwencyjna używa eager do czasu dodania osobnych grafów per slot.
 - **Forward** (`hybrid_forward_token`): dispatch per-`LayerKind`; bramkowana
   atencja hd256 (deinterleave q/gate → QK-norm → partial M-RoPE `n_rot=64` →
   paged decode → `attn ⊙ σ(gate)` → o-proj), DeltaNet (conv+SiLU → split →
@@ -815,8 +821,9 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
 - MoE: tylko single-stream decode + KV f16 (patrz sekcja MoE). Hybrydy SSM+MoE
   (Qwen3.6 `qwen35moe`) generują E2E, ale ścieżka jest correctness-first
   (~17 tok/s, host round-tripy per warstwa, bez grafu/wsadu — patrz sekcja
-  qwen35moe). Target ma izolowane sloty SSM, lecz serwer nadal wymusza
-  `max_active=1` do podłączenia schedulera hybrydowego i stanu MTP.
+  qwen35moe). Target i MTP mają izolowane sloty per sekwencja oraz wspólny paged
+  cache MTP, lecz serwer nadal wymusza `max_active=1` do podłączenia schedulera
+  hybrydowego i grafów verifiera per slot.
 - `logprobs`/`echo`/`n>1`: obsługiwane tylko na ścieżce non-streaming (streaming
   przy `n>1` lub completions z `echo`/`logprobs` = 400). Streaming chat NIE dokłada
   `logprobs` do delt (parser reorganizuje tekst — token↔delta nie są 1:1). Prompt-token

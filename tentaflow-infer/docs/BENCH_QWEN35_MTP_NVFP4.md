@@ -94,8 +94,8 @@ wydajności równy zero.
 ## Ograniczenia
 
 - Tylko greedy-exact: `temperature=0`, sampling GPU i brak repetition penalty.
-- `max_active=1`, ponieważ stan SSM jest obecnie własnością modelu, a nie
-  niezależnej sekwencji.
+- `max_active=1` do czasu podłączenia startup preflightu, admission wielu
+  sekwencji i grafów verifiera per slot.
 - Budżet natywnego MTP wynosi wyłącznie K=2 lub K=3.
 - CUDA jest jedynym backendem sprawdzonym wykonawczo dla tego etapu.
 - EAGLE, DFlash, DSpark, draft-model, n-gram jako rozszerzenie natywnego MTP,
@@ -336,6 +336,29 @@ Pełny raw128 decode zachował SHA `1512c5c9...aacf`, 34 forwardy weryfikacji,
 94 zaakceptowane tokeny i osiągnął 102,8 tok/s. Profil `nsys` raw512 po zmianie
 wskazał 50,6% czasu w BM128, 21,2% w dynamicznym in-place scan DeltaNet, 14,6%
 w exact i8mma i 5,1% w dynamicznym prepare.
+
+## Kafelek BN32 dla projekcji 1024 w prefill
+
+Wariant `gemm_nvfp4_gguf_mma_f16_bm128_bn32` zmniejsza kafelek wyjściowy
+BM128 z 64 do 32 wierszy i używa czterech warpów. Dispatch wybiera go wyłącznie
+dla 128 tokenów, 1024 wierszy oraz GPU NVIDIA z warpem 32. Inne kształty nadal
+używają BN64, ponieważ pomiar samodzielny wykazał dla nich regresje od 6,1% do
+65,5%. Golden BN32 zachował bitową zgodność z BN64 dla niepełnych kafli,
+specjalnej skali UE4M3 `0x7f` i skali wyjścia 0,625.
+
+Pomiar raw512 na RTX 4090 obejmował pięć osobnych procesów, po jednym przebiegu
+rozgrzewającym i jednym mierzonym, chunk 128, bez speculative decode:
+
+| Wariant | Czasy target prefill | Mediana | Przepustowość | SHA decode |
+|---|---|---:|---:|---|
+| BN64 | 641,801; 645,780; 645,812; 646,508; 646,657 ms | 645,812 ms | 792,8 tok/s | `b415d6ba...4f38` |
+| BN32 dla 1024 | 637,434; 641,509; 641,454; 641,312; 641,808 ms | **641,454 ms** | **798,2 tok/s** | `b415d6ba...4f38` |
+
+Mediana poprawiła się o 0,675%. Profil `nsys` zachował 11 926 uruchomień
+kerneli. BN32 użył `grid=32`, `block=128` i zajął 24,853 ms dla 256 wywołań
+obejmujących warmup oraz pomiar, czyli około 12,43 ms na prefill wobec około
+17,18 ms dla poprzedniego kernela. Dodatkowy artefakt PTX ma 24 837 bajtów i
+nie wymaga dodatkowego bufora roboczego w VRAM.
 
 ## Odrzucone carry MTP w F32
 
