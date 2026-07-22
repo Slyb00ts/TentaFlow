@@ -1957,13 +1957,31 @@ fn link_nvdec_branch(
     .field("stream-format", "byte-stream")
     .field("alignment", "au")
     .build();
+    // Leaky queue directly on the decoder's output. PROVEN off-app on the live
+    // camera: nvh264dec decodes the Axis feed at 28 fps into a fakesink but only
+    // ~1.6 fps through the real tail (cudadownload → tee → queue → appsink),
+    // because the 4K NV12 host download (24.9 MB/frame) cannot sustain real-time
+    // and backpressures the decoder into a pool-exhaustion stall — which then
+    // propagates through the shared rtp_tee and stalls the whole ingest until the
+    // warmup timeout demotes it to CPU. The existing leaky queue sits AFTER
+    // cudadownload, so nothing decoupled the decoder from the download. This queue
+    // drops decoded frames when the download falls behind, keeping nvh264dec free-
+    // running; the analysis path already consumes latest-only, so dropping is fine.
+    let decode_out = build_raw_leaky_queue("queue_nvdec_out")
+        .map_err(|e| format!("nvdec leaky queue: {e}"))?;
+    pipeline
+        .add(&decode_out)
+        .map_err(|e| format!("add nvdec leaky queue: {e}"))?;
     gst::Element::link_many([queue_a, &depay, &parse])
         .map_err(|e| format!("link nvdec front: {e}"))?;
     parse
         .link_filtered(&dec, &byte_stream_caps)
         .map_err(|e| format!("link parse->dec byte-stream: {e}"))?;
-    dec.link(downstream)
-        .map_err(|e| format!("link dec->downstream: {e}"))?;
+    gst::Element::link_many([&dec, &decode_out, downstream])
+        .map_err(|e| format!("link dec->leaky->downstream: {e}"))?;
+    decode_out
+        .sync_state_with_parent()
+        .map_err(|e| format!("sync nvdec leaky queue: {e}"))?;
 
     // Diagnostic pad probes on each stage's src pad: log the FIRST buffer and its
     // caps at depay, parse and decoder. NVDEC decodes this Axis stream fine from a
