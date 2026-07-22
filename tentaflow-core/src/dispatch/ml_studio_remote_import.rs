@@ -121,7 +121,10 @@ struct RemoteManifest {
     datasets: Vec<MlStudioImportDatasetInfo>,
     classes: Vec<String>,
     archive_bytes: u64,
-    archive_sha256: String,
+    /// `None` when the manifest omits sha256 (metadata-only manifest that did not
+    /// build the archive). Integrity is then verified against the archive
+    /// endpoint's `X-Archive-Sha256` header instead.
+    archive_sha256: Option<String>,
     archive_rel_url: String,
     archive_version: u32,
 }
@@ -211,12 +214,15 @@ async fn fetch_remote_manifest(
         .get("archive")
         .ok_or_else(|| anyhow!("manifest bez obiektu 'archive'"))?;
     let archive_bytes = archive.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    // OPTIONAL: a metadata-only manifest (the source did not build the archive to
+    // stay under the request timeout) omits sha256. A present value must still be a
+    // well-formed digest; integrity is otherwise confirmed against the archive
+    // endpoint's `X-Archive-Sha256` header at download time.
     let archive_sha256 = archive
         .get("sha256")
         .and_then(|v| v.as_str())
         .map(str::to_ascii_lowercase)
-        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
-        .ok_or_else(|| anyhow!("manifest bez poprawnej sumy sha256 archiwum"))?;
+        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
     let archive_rel_url = archive
         .get("url")
         .and_then(|v| v.as_str())
@@ -244,17 +250,22 @@ async fn fetch_remote_manifest(
 // ---------------------------------------------------------------------------
 
 /// Streams the remote archive to `dest`, enforcing a Content-Length ceiling and a
-/// mid-stream byte ceiling, then verifies its sha256 against the manifest. Mirrors
+/// mid-stream byte ceiling, then verifies its sha256. Mirrors
 /// `camera_cv_models::download_signed_file`: no-redirect (a 3xx is rejected since
 /// `error_for_status` treats it as success), token-bearing query redacted, atomic
 /// `<dest>.partial` → rename. Returns the number of bytes written. Deletes the
 /// partial/dest on any failure.
+///
+/// Integrity precedence, fail-closed: the expected digest is the MANIFEST sha256 if
+/// present, else the archive endpoint's `X-Archive-Sha256` response header. If a
+/// manifest sha256 AND the header are both present they must agree. If NEITHER is
+/// available the download is rejected — unverified bytes are never imported.
 async fn download_archive(
     client: &reqwest::Client,
     url: reqwest::Url,
     bearer: &str,
     dest: &Path,
-    expected_sha256: &str,
+    manifest_sha256: Option<&str>,
     progress_job: &str,
 ) -> Result<u64> {
     use std::io::Write;
@@ -279,6 +290,32 @@ async fn download_archive(
             redact_query_strings(&e.to_string())
         )
     })?;
+
+    // Whole-archive digest advertised by the source (present even when the manifest
+    // omitted it). Normalized + validated like the manifest value.
+    let header_sha256 = response
+        .headers()
+        .get("X-Archive-Sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // Resolve the expected digest BEFORE spending bandwidth: manifest wins, header
+    // is the fallback, disagreement is fatal, and absence of both fails closed.
+    let expected_sha256 = match (manifest_sha256, header_sha256.as_deref()) {
+        (Some(m), Some(h)) if m != h => {
+            return Err(anyhow!(
+                "niezgodna suma sha256 archiwum: manifest ({m}) vs nagłówek ({h}) — odrzucono"
+            ))
+        }
+        (Some(m), _) => m.to_string(),
+        (None, Some(h)) => h.to_string(),
+        (None, None) => {
+            return Err(anyhow!(
+                "brak sumy sha256 archiwum (ani w manifeście, ani w nagłówku X-Archive-Sha256) — nie importuję niezweryfikowanych danych"
+            ))
+        }
+    };
 
     if response.content_length().unwrap_or(0) > MAX_REMOTE_ARCHIVE_BYTES {
         return Err(anyhow!(
@@ -467,12 +504,16 @@ pub async fn ml_studio_remote_import_start(
     let (manifest_url, _project_id) =
         parse_share_url(&payload.url).map_err(|e| ProtocolError::bad_request(e))?;
 
+    // Job id is returned NOW and every slow step (manifest fetch, the remote's own
+    // first-download archive build, the download, the import) runs inside the polled
+    // background job — nothing network-bound happens in this request-response path,
+    // so the handler always returns in well under a second regardless of remote speed.
     let job_id = uuid::Uuid::new_v4().to_string();
     init_progress(
         &job_id,
         RemoteImportProgress {
             status: "running".to_string(),
-            phase: "downloading".to_string(),
+            phase: "connecting".to_string(),
             owner_user_id: org.user_id.clone(),
             ..RemoteImportProgress::default()
         },
@@ -523,6 +564,7 @@ async fn run_remote_import(
         .map_err(|why| anyhow!("archiwum: {why}"))?;
 
     set_progress(job_id, |p| {
+        p.phase = "downloading".to_string();
         if manifest.archive_bytes > 0 {
             p.bytes_total = manifest.archive_bytes;
         }
@@ -539,7 +581,7 @@ async fn run_remote_import(
         archive_url,
         &bearer,
         &staged,
-        &manifest.archive_sha256,
+        manifest.archive_sha256.as_deref(),
         job_id,
     )
     .await;

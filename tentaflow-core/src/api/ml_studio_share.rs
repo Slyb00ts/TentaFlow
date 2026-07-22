@@ -42,7 +42,7 @@ use rusqlite::params;
 
 use crate::api::frames::FrameQuery;
 use crate::db::DbPool;
-use crate::ml_studio::project_archive::{build_export, read_manifest, ExportOptions, ARCHIVE_VERSION};
+use crate::ml_studio::project_archive::{self, build_export, ExportOptions, ARCHIVE_VERSION};
 use crate::paths::ml_studio_share_cache_dir;
 use crate::services::signed_urls::{SignedUrl, SignedUrlError, SignedUrlIssuer};
 
@@ -417,8 +417,16 @@ impl ShareManifestOutcome {
 #[derive(Debug)]
 pub enum ShareArchiveOutcome {
     /// Token/scope verified + archive opened (O_NOFOLLOW) + fstat'ed. The HTTP
-    /// layer streams the open handle (optionally a byte range).
-    Ok { file: tokio::fs::File, size: u64 },
+    /// layer streams the open handle (optionally a byte range). `sha256` is the
+    /// FULL-archive digest (already computed/cached by `ensure_archive`), emitted
+    /// as `X-Archive-Sha256` so the puller can verify integrity without the
+    /// manifest carrying it. With a Range request it still advertises the whole
+    /// file's digest, not the partial range.
+    Ok {
+        file: tokio::fs::File,
+        size: u64,
+        sha256: String,
+    },
     BadRequest(&'static str),
     Denied(SignedUrlError),
     Forbidden(&'static str),
@@ -559,34 +567,19 @@ async fn handle_share_manifest_inner(
         }
     };
 
-    if project_updated_at_unix(project_id).is_none() {
-        return ShareManifestOutcome::NotFound;
-    }
+    // Cheap project inventory read straight from the DB — NO archive build. This is
+    // what keeps the manifest well under the 30 s request-response limit even for
+    // multi-gigabyte projects; the archive is built lazily at download time.
+    let pid = project_id.to_string();
+    let preview =
+        match tokio::task::spawn_blocking(move || project_archive::load_project_preview(&pid)).await
+        {
+            Ok(Ok(Some(p))) => p,
+            Ok(Ok(None)) => return ShareManifestOutcome::NotFound,
+            _ => return ShareManifestOutcome::InternalError("project_preview_failed"),
+        };
 
-    let cached = match ensure_archive(project_id).await {
-        Ok(c) => c,
-        Err(ArchiveBuildError::NotFound) => return ShareManifestOutcome::NotFound,
-        Err(ArchiveBuildError::Internal) => {
-            return ShareManifestOutcome::InternalError("archive_build_failed")
-        }
-    };
-
-    let sha256 = match cached_archive_sha256(project_id, &cached).await {
-        Ok(h) => h,
-        Err(_) => return ShareManifestOutcome::InternalError("archive_hash_failed"),
-    };
-
-    // The archive's OWN manifest (embedded during the build) is the authoritative
-    // source of project meta + per-dataset inventory + classes — no duplicate DB
-    // queries, and it always matches the bytes being shared.
-    let archive_path = cached.path.clone();
-    let manifest = match tokio::task::spawn_blocking(move || read_manifest(&archive_path)).await {
-        Ok(Ok(m)) => m,
-        _ => return ShareManifestOutcome::InternalError("archive_manifest_read_failed"),
-    };
-
-    let datasets: Vec<serde_json::Value> = manifest
-        .contents
+    let datasets: Vec<serde_json::Value> = preview
         .datasets
         .iter()
         .map(|d| {
@@ -599,15 +592,25 @@ async fn handle_share_manifest_inner(
         })
         .collect();
 
-    let mut classes: Vec<String> = Vec::new();
-    for ds in &manifest.contents.datasets {
-        for c in &ds.category_names {
-            if !classes.contains(c) {
-                classes.push(c.clone());
-            }
+    // Archive size + digest: if a FRESH archive is already cached, advertise its real
+    // size and cached sha256; otherwise size is an on-disk ESTIMATE (no zip) and the
+    // sha256 is omitted (empty) — the authoritative digest is the archive endpoint's
+    // `X-Archive-Sha256` header, which the puller verifies against.
+    let (archive_size, archive_sha256) = match cached_if_fresh(&share_cache_path(project_id), project_id).await
+    {
+        Some(cached) => {
+            let sha = cached_archive_sha256(project_id, &cached).await.unwrap_or_default();
+            (cached.size, sha)
         }
-    }
-    classes.sort();
+        None => {
+            let pid = project_id.to_string();
+            let est = tokio::task::spawn_blocking(move || {
+                project_archive::estimate_export_size(&pid, SHARE_EXPORT_OPTIONS.include_models)
+            })
+            .await;
+            (est.ok().and_then(|r| r.ok()).unwrap_or(0), String::new())
+        }
+    };
 
     // Signed callers get a per-ref signed archive URL bound to the manifest
     // token's expiry; API-key callers carry a plain path and repeat the Bearer
@@ -625,15 +628,15 @@ async fn handle_share_manifest_inner(
 
     let body = serde_json::json!({
         "project": {
-            "id": manifest.project.project_id,
-            "name": manifest.project.name,
-            "type": manifest.project.project_type,
+            "id": preview.project_id,
+            "name": preview.name,
+            "type": preview.project_type,
         },
         "datasets": datasets,
-        "classes": classes,
+        "classes": preview.classes,
         "archive": {
-            "size": cached.size,
-            "sha256": sha256,
+            "size": archive_size,
+            "sha256": archive_sha256,
             "url": archive_url,
         },
         "archive_version": ARCHIVE_VERSION,
@@ -715,6 +718,15 @@ async fn handle_share_archive_inner(
         Err(ArchiveBuildError::Internal) => return ShareArchiveOutcome::IoError,
     };
 
+    // Authoritative full-archive digest, reused from the hash cache populated by
+    // `ensure_archive` (it just hashed a freshly built archive) — never re-hashed
+    // here. Emitted as `X-Archive-Sha256` so the puller can verify integrity even
+    // though the manifest no longer builds the archive to carry it.
+    let sha256 = match cached_archive_sha256(project_id, &cached).await {
+        Ok(h) => h,
+        Err(_) => return ShareArchiveOutcome::IoError,
+    };
+
     // The cache path is built from a UUID-validated id, so it is contained in
     // the share cache dir by construction. The file is opened here with
     // O_NOFOLLOW and fstat'ed through the handle — validation and serving use
@@ -764,6 +776,7 @@ async fn handle_share_archive_inner(
     ShareArchiveOutcome::Ok {
         file: tokio::fs::File::from_std(std_file),
         size: meta.len(),
+        sha256,
     }
 }
 
