@@ -38,10 +38,13 @@ Ostatnia aktualizacja: 2026-07-22.
   zgadzało się z oracle `np1`. Różne K, n-gram, tiering, niepełna para i
   niespełniony kontrakt capability przechodzą na B1;
   `FORGE_NATIVE_MTP_B2=0|1` jest ścisłym kill-switchem. vLLM 0.25.1 nie
-  dostarczył porównywalnego wyniku dla lokalnego jednoplikowego GGUF. Pozostały
-  narzut obejmuje hostowy gather embeddingu i dwa sync na cykl; jednorundowe GPU
-  pack/gather nie jest gotowe. CUDA jest jedynym backendem sprawdzonym
-  wykonawczo; źródła zachowują przenośny fallback dla AMD/Metal. Raport:
+  dostarczył porównywalnego wyniku dla lokalnego jednoplikowego GGUF. Draft ID,
+  pack `[B,T]` i gather embeddingu F16/Q8_0/NVFP4 działają na GPU, a cykl B2 ma
+  jeden końcowy D2H i sync. Profil 24 cykli potwierdził dokładnie jeden sync i
+  cztery małe H2D na cykl. Gather zeruje błędne ID bez GPU OOB, a finalna
+  walidacja zwraca kontrolowany błąd. Współczesne A/B względem `7d472a0a` dało
+  +0,56% dla raw128 i +0,12% dla raw512. CUDA jest jedynym backendem sprawdzonym wykonawczo;
+  źródła zachowują przenośny fallback dla AMD/Metal. Raport:
   `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 
 - 🟡 **NVFP4 Bielik: hybrydowy prefill FP8 i GQA decode w Mojo

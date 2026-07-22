@@ -1206,6 +1206,7 @@ struct MtpB2Bufs {
     visible_lens: DevBuffer,
     decisions: DevBuffer,
     pinned_decisions: DevBuffer,
+    pinned_metadata: DevBuffer,
     selected_states: DevBuffer,
     selected_conv: DevBuffer,
     selected_hidden: DevBuffer,
@@ -5797,6 +5798,11 @@ impl Model {
             && self.tier.is_none()
             && self.prefix_cache.is_none()
             && self.mtp_embedding_mode() == Some("device")
+            && self
+                .weights
+                .mtp
+                .as_ref()
+                .is_some_and(|mtp| mtp.shares_target_embedding)
             && seqs
                 .iter()
                 .all(|seq| self.native_mtp_available_budget(seq, budget) == budget)
@@ -5939,7 +5945,7 @@ impl Model {
         seqs: &mut [&mut SeqKv; 2],
         fed: [u32; 2],
         k: usize,
-    ) -> Result<[Vec<u32>; 2]> {
+    ) -> Result<()> {
         if !self.native_mtp_b2_capable([&*seqs[0], &*seqs[1]], k) {
             return Err(ForgeError::Unsupported(
                 "para nie spełnia kontraktu native MTP B2".into(),
@@ -5948,7 +5954,7 @@ impl Model {
         self.ensure_hybrid_bufs()?;
         let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
         let mut checkpoint_attempted = false;
-        let mut result: Result<[Vec<u32>; 2]> = (|| {
+        let mut result: Result<()> = (|| {
             let vocab = self.weights.descriptor.params.vocab_size;
             if fed.iter().any(|&token| token as usize >= vocab) {
                 return Err(ForgeError::Scheduler(
@@ -6028,41 +6034,14 @@ impl Model {
                     }
                 }
             }
-            for state in &states {
-                self.device.copy(
-                    &state.token_ids,
-                    0,
-                    &state.pinned_token_ids,
-                    0,
-                    5 * 4,
-                    &self.stream,
-                )?;
-            }
-            self.device.synchronize()?;
-            let mut drafts = [Vec::with_capacity(k), Vec::with_capacity(k)];
-            for (lane, state) in states.iter().enumerate() {
-                let host = state
-                    .pinned_token_ids
-                    .host_ptr()
-                    .expect("pinned token IDs mają mapowanie hosta");
-                let ids = unsafe { std::slice::from_raw_parts(host as *const i32, k + 1) };
-                let gather_status = unsafe { *(host as *const i32).add(4) };
-                if gather_status != 0 {
-                    return Err(ForgeError::Kernel(format!(
-                        "MTP GPU gather lane {lane} odrzucił token poza słownikiem"
-                    )));
-                }
-                drafts[lane].extend(ids[1..].iter().map(|&id| id as u32));
-            }
-            Ok(drafts)
+            Ok(())
         })();
         if result.is_err() {
             let checkpoints_complete = states.iter().all(|state| state.checkpoint_len().is_some());
             if let Err(rollback) = rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
                 let execution = result.expect_err("wynik propose B2 zawiera błąd");
-                result = Err(self.poison_mtp_runtime(format!(
-                    "błąd propose MTP B2: {execution}; {rollback}"
-                )));
+                result = Err(self
+                    .poison_mtp_runtime(format!("błąd propose MTP B2: {execution}; {rollback}")));
             } else if checkpoint_attempted && !checkpoints_complete {
                 let execution = result.expect_err("wynik propose B2 zawiera błąd");
                 result = Err(self.poison_mtp_runtime(format!(
@@ -6081,7 +6060,40 @@ impl Model {
         fed: [u32; 2],
         k: usize,
     ) -> Result<[Vec<u32>; 2]> {
-        let drafts = self.mtp_propose_pending_b2(seqs, fed, k)?;
+        self.mtp_propose_pending_b2(seqs, fed, k)?;
+        let (leases, states, mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
+        let readback = (|| {
+            for state in &states {
+                self.device.copy(
+                    &state.token_ids,
+                    0,
+                    &state.pinned_token_ids,
+                    0,
+                    5 * 4,
+                    &self.stream,
+                )?;
+            }
+            self.device.synchronize()?;
+            let mut drafts = [Vec::with_capacity(k), Vec::with_capacity(k)];
+            for (lane, state) in states.iter().enumerate() {
+                let host = state
+                    .pinned_token_ids
+                    .host_ptr()
+                    .expect("pinned token IDs mają mapowanie hosta");
+                let ids = unsafe { std::slice::from_raw_parts(host as *const i32, k + 1) };
+                if ids
+                    .iter()
+                    .any(|&id| id < 0 || id as usize >= self.weights.descriptor.params.vocab_size)
+                {
+                    return Err(ForgeError::Kernel(format!(
+                        "MTP GPU gather lane {lane} odrzucił token poza słownikiem"
+                    )));
+                }
+                drafts[lane].extend(ids[1..].iter().map(|&id| id as u32));
+            }
+            Ok(drafts)
+        })();
+        let drafts = self.finish_mtp_runtime_pair(leases, states, mtp_kv, readback)?;
         let first = self.rollback_mtp_pending(seqs[0]);
         let second = self.rollback_mtp_pending(seqs[1]);
         match (first, second) {
@@ -6217,22 +6229,10 @@ impl Model {
             page_table.len() * 4,
             stream,
         )?;
-        self.device.copy(
-            &host_staging.mtp_seq_len,
-            0,
-            &state.seq_len,
-            0,
-            4,
-            stream,
-        )?;
-        self.device.copy(
-            &host_staging.mtp_position,
-            0,
-            &state.position,
-            0,
-            4,
-            stream,
-        )?;
+        self.device
+            .copy(&host_staging.mtp_seq_len, 0, &state.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&host_staging.mtp_position, 0, &state.position, 0, 4, stream)?;
         self.device.copy(
             &host_staging.mtp_positions,
             0,
@@ -6241,14 +6241,8 @@ impl Model {
             t * 4,
             stream,
         )?;
-        self.device.copy(
-            &host_staging.mtp_base_pos,
-            0,
-            &hv.base_pos,
-            0,
-            4,
-            stream,
-        )?;
+        self.device
+            .copy(&host_staging.mtp_base_pos, 0, &hv.base_pos, 0, 4, stream)?;
         self.device.copy(
             &host_staging.mtp_visible_lens,
             0,
@@ -6257,14 +6251,8 @@ impl Model {
             t * 4,
             stream,
         )?;
-        self.device.copy(
-            &host_staging.embedding,
-            0,
-            &pb.h,
-            0,
-            t * hidden * 2,
-            stream,
-        )?;
+        self.device
+            .copy(&host_staging.embedding, 0, &pb.h, 0, t * hidden * 2, stream)?;
         if let Some(event) = staging_ready {
             self.device.record_event(event, stream)?;
         }
@@ -6288,9 +6276,8 @@ impl Model {
             hidden * 2,
             stream,
         )?;
-        self.kernels.mtp_project_joined_q8_f16(
-            &pb.h, &hv.q_full, eh_proj, t, hidden, stream,
-        )?;
+        self.kernels
+            .mtp_project_joined_q8_f16(&pb.h, &hv.q_full, eh_proj, t, hidden, stream)?;
         self.kernels.rmsnorm_f16(
             &pb.x,
             &pb.h,
@@ -6302,7 +6289,9 @@ impl Model {
         )?;
         let attention = layer.block.attn();
         let QkvWeights::Split { q: _, k, v } = &attention.attn_qkv else {
-            return Err(ForgeError::Unsupported("MTP wymaga rozdzielonych Q/K/V".into()));
+            return Err(ForgeError::Unsupported(
+                "MTP wymaga rozdzielonych Q/K/V".into(),
+            ));
         };
         self.gemm(&pb.k, k, &pb.x, t, stream)?;
         self.gemm(&pb.v, v, &pb.x, t, stream)?;
@@ -6383,14 +6372,8 @@ impl Model {
                     hidden_bytes,
                     &self.stream,
                 )?;
-                self.device.copy(
-                    &pb.ids,
-                    row * 4,
-                    &self.bufs.sample_out,
-                    0,
-                    4,
-                    &self.stream,
-                )?;
+                self.device
+                    .copy(&pb.ids, row * 4, &self.bufs.sample_out, 0, 4, &self.stream)?;
                 self.mtp_gather_embedding(&mut state, row)?;
                 state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
                 self.mtp_forward_one(&mut state, &mtp_kv, false)?;
@@ -6926,11 +6909,7 @@ impl Model {
                         4,
                     )?,
                     mtp_positions: pinned("mtp pinned catch-up positions", &[cap], 4)?,
-                    mtp_visible_lens: pinned(
-                        "mtp pinned catch-up visible lengths",
-                        &[cap],
-                        4,
-                    )?,
+                    mtp_visible_lens: pinned("mtp pinned catch-up visible lengths", &[cap], 4)?,
                     mtp_base_pos: pinned("mtp pinned catch-up base position", &[1], 4)?,
                     mtp_seq_len: pinned("mtp pinned catch-up sequence length", &[1], 4)?,
                     mtp_position: pinned("mtp pinned catch-up position", &[1], 4)?,
@@ -7080,9 +7059,10 @@ impl Model {
         let value_dim = checked_mul("mtp b2 value", ssm.d_state, n_v)?;
         let doubled_key = checked_mul("mtp b2 doubled key", key_dim, 2)?;
         let conv_dim = checked_add("mtp b2 conv", doubled_key, value_dim)?;
-        let conv_history = ssm.d_conv.checked_sub(1).ok_or_else(|| {
-            ForgeError::Scheduler("MTP B2 wymaga d_conv > 0".into())
-        })?;
+        let conv_history = ssm
+            .d_conv
+            .checked_sub(1)
+            .ok_or_else(|| ForgeError::Scheduler("MTP B2 wymaga d_conv > 0".into()))?;
         let conv_elems = checked_mul("mtp b2 conv history", conv_dim, conv_history)?;
         let state_head = checked_mul("mtp b2 state head", ssm.d_state, ssm.d_state)?;
         let state_elems = checked_mul("mtp b2 state", n_v, state_head)?;
@@ -7104,10 +7084,7 @@ impl Model {
                 LayerMixer::Attention(_) => Ok(None),
                 LayerMixer::DeltaNet(_) => Ok(Some(MtpB2DeltaCache {
                     conv_initial: a16("mtp b2 conv initial", &[BATCH, conv_elems])?,
-                    conv_checkpoints: a16(
-                        "mtp b2 conv checkpoints",
-                        &[BATCH, STEPS, conv_elems],
-                    )?,
+                    conv_checkpoints: a16("mtp b2 conv checkpoints", &[BATCH, STEPS, conv_elems])?,
                     state_initial: a32("mtp b2 state initial", &[BATCH, state_elems])?,
                     q: a16("mtp b2 delta q", &[total, value_dim])?,
                     k: a16("mtp b2 delta k", &[total, value_dim])?,
@@ -7118,10 +7095,7 @@ impl Model {
             })
             .collect::<Result<Vec<_>>>()?;
         self.mtp_b2_bufs = Some(MtpB2Bufs {
-            q_full: a16(
-                "mtp b2 q full",
-                &[total, q_full_cols],
-            )?,
+            q_full: a16("mtp b2 q full", &[total, q_full_cols])?,
             qc: a16("mtp b2 q", &[total, q_dim.max(value_dim)])?,
             gatec: a16("mtp b2 q gate", &[total, q_dim.max(value_dim)])?,
             gated: a16("mtp b2 gated", &[total, q_dim.max(value_dim)])?,
@@ -7138,7 +7112,14 @@ impl Model {
             pinned_decisions: alloc_checked(
                 device.as_ref(),
                 "mtp b2 pinned decisions",
-                &[BATCH, 2],
+                &[BATCH * 2 + BATCH * 5],
+                4,
+                MemKind::PinnedHost,
+            )?,
+            pinned_metadata: alloc_checked(
+                device.as_ref(),
+                "mtp b2 pinned metadata",
+                &[BATCH + BATCH * self.max_pages_per_seq],
                 4,
                 MemKind::PinnedHost,
             )?,
@@ -7746,16 +7727,15 @@ impl Model {
     fn verify_hybrid_greedy_draft_b2(
         &mut self,
         seqs: &mut [&mut SeqKv; 2],
-        fed: [u32; 2],
-        drafts: &[Vec<u32>; 2],
+        budget: usize,
         mtp_states: &mut [MtpDraftState; 2],
-    ) -> Result<[(usize, u32); 2]> {
-        if drafts[0].len() != drafts[1].len() || !matches!(drafts[0].len(), 2 | 3) {
+    ) -> Result<[(Vec<u32>, usize, u32); 2]> {
+        if !matches!(budget, 2 | 3) {
             return Err(ForgeError::Unsupported(
                 "verifier MTP B2 wymaga wspólnego K=2 lub K=3".into(),
             ));
         }
-        let t = drafts[0].len().checked_add(1).ok_or_else(|| {
+        let t = budget.checked_add(1).ok_or_else(|| {
             ForgeError::Scheduler("przepełnienie liczby kroków verifiera MTP B2".into())
         })?;
         let checked_elements = |name: &str, dimensions: &[usize]| {
@@ -7787,10 +7767,7 @@ impl Model {
         let delta_norm_rows = checked_elements("mtp b2 delta norm", &[total, ssm.n_v_heads()])?;
         let ffn_rows = checked_elements("mtp b2 ffn", &[total, p.intermediate_size])?;
         let key_width = checked_elements("mtp b2 key width", &[ssm.d_state, ssm.n_group])?;
-        let value_width = checked_elements(
-            "mtp b2 value width",
-            &[ssm.d_state, ssm.n_v_heads()],
-        )?;
+        let value_width = checked_elements("mtp b2 value width", &[ssm.d_state, ssm.n_v_heads()])?;
         let conv_width = key_width
             .checked_mul(2)
             .and_then(|key| key.checked_add(value_width))
@@ -7799,9 +7776,9 @@ impl Model {
             "mtp b2 conv state",
             &[
                 conv_width,
-                ssm.d_conv.checked_sub(1).ok_or_else(|| {
-                    ForgeError::Scheduler("MTP B2 wymaga d_conv > 0".into())
-                })?,
+                ssm.d_conv
+                    .checked_sub(1)
+                    .ok_or_else(|| ForgeError::Scheduler("MTP B2 wymaga d_conv > 0".into()))?,
             ],
         )?;
         let hidden_bytes = checked_elements("mtp b2 hidden bytes", &[p.hidden_size, 2])?;
@@ -7843,73 +7820,123 @@ impl Model {
         }
 
         let mut snapshot_ready = false;
+        let mut metadata_enqueued = false;
         let result = (|| {
             for seq in seqs.iter_mut() {
                 for _ in 0..t {
                     self.kv.grow(seq)?;
                 }
             }
-            let mut ids = Vec::with_capacity(total);
-            let mut positions = Vec::with_capacity(total);
-            let mut visible = Vec::with_capacity(total);
-            let page_table_elems = checked_elements(
-                "mtp b2 page tables",
-                &[2, self.max_pages_per_seq],
-            )?;
+            let page_table_elems =
+                checked_elements("mtp b2 page tables", &[2, self.max_pages_per_seq])?;
             let mut page_tables = vec![-1i32; page_table_elems];
             for lane in 0..2 {
-                ids.push(fed[lane] as i32);
-                ids.extend(drafts[lane].iter().map(|&token| token as i32));
-                positions.extend((bases[lane]..ends[lane]).map(|value| value as i32));
-                visible.extend((bases[lane] + 1..=ends[lane]).map(|value| value as i32));
-                let offset = checked_elements(
-                    "mtp b2 page table offset",
-                    &[lane, self.max_pages_per_seq],
-                )?;
+                let offset =
+                    checked_elements("mtp b2 page table offset", &[lane, self.max_pages_per_seq])?;
                 page_tables[offset..offset + seqs[lane].pages.len()]
                     .copy_from_slice(&seqs[lane].pages);
             }
             let pb = self.prefill_bufs.as_ref().expect("prefill gotowy");
             let b2 = self.mtp_b2_bufs.as_ref().expect("MTP B2 gotowy");
-            self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
-            self.device
-                .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
-            self.device.write(
-                bytemuck::cast_slice(&page_tables),
-                &b2.page_tables,
+            let mut metadata = Vec::with_capacity(2 + page_table_elems);
+            metadata.extend([bases[0] as i32, bases[1] as i32]);
+            metadata.extend_from_slice(&page_tables);
+            write_pinned(bytemuck::cast_slice(&metadata), &b2.pinned_metadata)?;
+            metadata_enqueued = true;
+            self.device.copy(
+                &b2.pinned_metadata,
                 0,
-            )?;
-            self.device.write(
-                bytemuck::cast_slice(&[bases[0] as i32, bases[1] as i32]),
                 &b2.base_positions,
                 0,
+                8,
+                &self.stream,
             )?;
-            self.device
-                .write(bytemuck::cast_slice(&visible), &b2.visible_lens, 0)?;
-            let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
-                ForgeError::Unsupported("target MTP B2 nie ma hostowego embeddingu".into())
-            })?;
-            let embedding_elems = checked_elements(
-                "mtp b2 embedding",
-                &[total, p.hidden_size],
+            self.device.copy(
+                &b2.pinned_metadata,
+                8,
+                &b2.page_tables,
+                0,
+                page_table_elems * 4,
+                &self.stream,
             )?;
-            let mut embedding = Vec::with_capacity(embedding_elems);
-            for &token in &ids {
-                let token = token as usize;
-                let start = checked_elements("mtp b2 embedding row", &[token, p.hidden_size])?;
-                let end = start.checked_add(p.hidden_size).ok_or_else(|| {
-                    ForgeError::Scheduler("przepełnienie końca embeddingu MTP B2".into())
+            self.kernels.mtp_pack_verify_inputs(
+                &pb.ids,
+                &pb.positions,
+                &b2.visible_lens,
+                &mtp_states[0].token_ids,
+                &mtp_states[1].token_ids,
+                &b2.base_positions,
+                t,
+                &self.stream,
+            )?;
+            let target_embedding = self
+                .weights
+                .mtp
+                .as_ref()
+                .and_then(|mtp| mtp.shares_target_embedding.then_some(&mtp.embedding))
+                .ok_or_else(|| {
+                    ForgeError::Unsupported("MTP B2 wymaga device-side target embeddingu".into())
                 })?;
-                embedding.extend_from_slice(
-                    table
-                        .get(start..end)
-                        .ok_or_else(|| {
-                            ForgeError::Scheduler("token MTP B2 poza embeddingiem".into())
-                        })?,
-                );
+            match target_embedding {
+                MtpEmbedding::Device(DevWeight::F16 { buf, rows, cols }) => {
+                    if *rows != p.vocab_size || *cols != p.hidden_size {
+                        return Err(ForgeError::Format(
+                            "target embedding F16 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_rows_f16(
+                        &pb.h,
+                        buf,
+                        &pb.ids,
+                        total,
+                        p.hidden_size,
+                        &self.stream,
+                    )?;
+                }
+                MtpEmbedding::Device(DevWeight::Q8_0 { buf, rows, cols }) => {
+                    if *rows != p.vocab_size || *cols != p.hidden_size {
+                        return Err(ForgeError::Format(
+                            "target embedding Q8_0 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_q8_0_rows_f16(
+                        &pb.h,
+                        buf,
+                        &pb.ids,
+                        total,
+                        p.vocab_size,
+                        p.hidden_size,
+                        &self.stream,
+                    )?;
+                }
+                MtpEmbedding::Device(DevWeight::NvFp4Gguf {
+                    buf,
+                    output_scale,
+                    rows,
+                    cols,
+                }) => {
+                    if *rows != p.vocab_size || *cols != p.hidden_size {
+                        return Err(ForgeError::Format(
+                            "target embedding NVFP4 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_nvfp4_gguf_rows_f16(
+                        &pb.h,
+                        buf,
+                        &pb.ids,
+                        total,
+                        p.vocab_size,
+                        p.hidden_size,
+                        *output_scale,
+                        &self.stream,
+                    )?;
+                }
+                _ => {
+                    return Err(ForgeError::Unsupported(
+                        "target MTP B2 wymaga embeddingu F16, Q8_0 lub GGUF NVFP4".into(),
+                    ));
+                }
             }
-            self.device
-                .write(bytemuck::cast_slice(&embedding), &pb.h, 0)?;
 
             for (layer_index, cache) in b2.delta.iter().enumerate() {
                 let Some(cache) = cache else { continue };
@@ -8130,13 +8157,8 @@ impl Model {
                 };
                 self.gemm(&pb.gate, gate, &pb.x, total, &self.stream)?;
                 self.gemm(&pb.up, up, &pb.x, total, &self.stream)?;
-                self.kernels.silu_mul_f16(
-                    &pb.act,
-                    &pb.gate,
-                    &pb.up,
-                    ffn_rows,
-                    &self.stream,
-                )?;
+                self.kernels
+                    .silu_mul_f16(&pb.act, &pb.gate, &pb.up, ffn_rows, &self.stream)?;
                 self.gemm(&pb.down, &ffn.down, &pb.act, total, &self.stream)?;
                 let next_norm = if layer_index + 1 < self.weights.layers.len() {
                     &self.weights.layers[layer_index + 1].attn_norm
@@ -8242,21 +8264,26 @@ impl Model {
                     &self.stream,
                 )?;
             }
-            self.device.copy(
-                &b2.decisions,
-                0,
-                &b2.pinned_decisions,
-                0,
-                16,
-                &self.stream,
-            )?;
+            self.device
+                .copy(&b2.decisions, 0, &b2.pinned_decisions, 0, 16, &self.stream)?;
+            for (lane, state) in mtp_states.iter().enumerate() {
+                self.device.copy(
+                    &state.token_ids,
+                    0,
+                    &b2.pinned_decisions,
+                    16 + lane * 20,
+                    20,
+                    &self.stream,
+                )?;
+            }
             self.device.synchronize()?;
             let decision_ptr = b2
                 .pinned_decisions
                 .host_ptr()
                 .expect("decyzje B2 mają mapowanie") as *const i32;
-            let mut decisions = [(0usize, 0u32); 2];
-            for (lane, decision) in decisions.iter_mut().enumerate() {
+            let mut results: [(Vec<u32>, usize, u32); 2] =
+                std::array::from_fn(|_| (Vec::with_capacity(budget), 0, 0));
+            for (lane, result) in results.iter_mut().enumerate() {
                 let retained = unsafe { *decision_ptr.add(2 * lane) };
                 let correction = unsafe { *decision_ptr.add(2 * lane + 1) };
                 if retained <= 0
@@ -8268,19 +8295,29 @@ impl Model {
                         "decyzja MTP B2 lane {lane} poza zakresem"
                     )));
                 }
-                *decision = (retained as usize - 1, correction as u32);
+                let ids = unsafe {
+                    std::slice::from_raw_parts(decision_ptr.add(4 + lane * 5), budget + 1)
+                };
+                if ids.iter().any(|&id| id < 0 || id as usize >= p.vocab_size) {
+                    return Err(ForgeError::Kernel(format!(
+                        "draft MTP B2 lane {lane} poza zakresem"
+                    )));
+                }
+                result.0.extend(ids[1..].iter().map(|&id| id as u32));
+                result.1 = retained as usize - 1;
+                result.2 = correction as u32;
             }
-            Ok(decisions)
+            Ok(results)
         })();
 
         match result {
-            Ok(decisions) => {
+            Ok(results) => {
                 for lane in 0..2 {
                     self.kv
-                        .rollback(seqs[lane], bases[lane] + decisions[lane].0 + 1);
+                        .rollback(seqs[lane], bases[lane] + results[lane].1 + 1);
                 }
                 self.pt_seq = 0;
-                Ok(decisions)
+                Ok(results)
             }
             Err(error) => {
                 for lane in 0..2 {
@@ -8315,6 +8352,8 @@ impl Model {
                             )?;
                         }
                     }
+                    self.device.synchronize()?;
+                } else if metadata_enqueued {
                     self.device.synchronize()?;
                 }
                 self.pt_seq = 0;
@@ -8598,38 +8637,33 @@ impl Model {
                 "para nie spełnia kontraktu native MTP B2".into(),
             ));
         }
-        let drafts = self.mtp_propose_pending_b2(seqs, fed, budget)?;
+        self.mtp_propose_pending_b2(seqs, fed, budget)?;
         let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
-        let result = match self.verify_hybrid_greedy_draft_b2(seqs, fed, &drafts, &mut states) {
-            Ok(decisions) => {
-                match commit_mtp_pair_metadata(
-                    &mut states,
-                    &mut mtp_kv,
-                    [decisions[0].0 + 1, decisions[1].0 + 1],
-                ) {
-                    Ok(()) => Ok([
-                        (drafts[0].clone(), decisions[0].0, decisions[0].1),
-                        (drafts[1].clone(), decisions[1].0, decisions[1].1),
-                    ]),
-                    Err(commit) => match rollback_mtp_pair(
+        let result =
+            match self.verify_hybrid_greedy_draft_b2(seqs, budget, &mut states) {
+                Ok(results) => {
+                    match commit_mtp_pair_metadata(
                         &mut states,
                         &mut mtp_kv,
-                        &self.stream,
+                        [results[0].1 + 1, results[1].1 + 1],
                     ) {
-                        Ok(()) => Err(commit),
-                        Err(rollback) => Err(self.poison_mtp_runtime(format!(
-                            "commit MTP B2 nie powiódł się: {commit}; {rollback}"
-                        ))),
-                    },
+                        Ok(()) => Ok(results),
+                        Err(commit) => {
+                            match rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
+                                Ok(()) => Err(commit),
+                                Err(rollback) => Err(self.poison_mtp_runtime(format!(
+                                    "commit MTP B2 nie powiódł się: {commit}; {rollback}"
+                                ))),
+                            }
+                        }
+                    }
                 }
-            }
-            Err(error) => match rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(self.poison_mtp_runtime(format!(
-                    "błąd verifiera MTP B2: {error}; {rollback}"
-                ))),
-            },
-        };
+                Err(error) => match rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(self
+                        .poison_mtp_runtime(format!("błąd verifiera MTP B2: {error}; {rollback}"))),
+                },
+            };
         self.pt_seq = 0;
         self.finish_mtp_runtime_pair(leases, states, mtp_kv, result)
     }
@@ -9558,20 +9592,18 @@ impl Model {
     pub fn debug_hybrid_state_snapshot(&self) -> Result<Vec<(String, usize, Vec<u8>)>> {
         self.device.synchronize()?;
         let mut snapshot = Vec::new();
-        for (name, buffer, element_bytes) in [
-            ("h", &self.bufs.h, 2usize),
-            ("x", &self.bufs.x, 2usize),
-        ] {
+        for (name, buffer, element_bytes) in
+            [("h", &self.bufs.h, 2usize), ("x", &self.bufs.x, 2usize)]
+        {
             let mut bytes = vec![0u8; buffer.len()];
             self.device.read(buffer, 0, &mut bytes)?;
             snapshot.push((name.into(), element_bytes, bytes));
         }
         for (layer, state) in self.active_ssm().iter().enumerate() {
             let Some(state) = state else { continue };
-            for (kind, buffer, element_bytes) in [
-                ("conv", &state.conv, 2usize),
-                ("ssm", &state.state, 4usize),
-            ] {
+            for (kind, buffer, element_bytes) in
+                [("conv", &state.conv, 2usize), ("ssm", &state.state, 4usize)]
+            {
                 let mut bytes = vec![0u8; buffer.len()];
                 self.device.read(buffer, 0, &mut bytes)?;
                 snapshot.push((format!("layer.{layer}.{kind}"), element_bytes, bytes));
@@ -9581,33 +9613,30 @@ impl Model {
     }
 
     /// Zrzuca carry oraz aktywny prefiks KV MTP w kolejności logicznych stron.
-    pub fn debug_mtp_state_snapshot(
-        &self,
-        seq: &SeqKv,
-    ) -> Result<Vec<(String, usize, Vec<u8>)>> {
+    pub fn debug_mtp_state_snapshot(&self, seq: &SeqKv) -> Result<Vec<(String, usize, Vec<u8>)>> {
         self.device.synchronize()?;
-        let lease = seq.hybrid_state.ok_or_else(|| {
-            ForgeError::Unsupported("sekwencja nie ma lease stanu MTP".into())
-        })?;
-        let pool = self.hybrid_states.as_ref().ok_or_else(|| {
-            ForgeError::Unsupported("model nie ma aktywnego stanu MTP".into())
-        })?;
+        let lease = seq
+            .hybrid_state
+            .ok_or_else(|| ForgeError::Unsupported("sekwencja nie ma lease stanu MTP".into()))?;
+        let pool = self
+            .hybrid_states
+            .as_ref()
+            .ok_or_else(|| ForgeError::Unsupported("model nie ma aktywnego stanu MTP".into()))?;
         pool.validate(lease)?;
         let state = pool.slots[lease.slot].mtp.as_ref().ok_or_else(|| {
             ForgeError::Unsupported("stan MTP sekwencji jest aktualnie używany".into())
         })?;
-        let mtp_kv = pool.mtp_kv.as_ref().ok_or_else(|| {
-            ForgeError::Unsupported("cache MTP jest aktualnie używany".into())
-        })?;
+        let mtp_kv = pool
+            .mtp_kv
+            .as_ref()
+            .ok_or_else(|| ForgeError::Unsupported("cache MTP jest aktualnie używany".into()))?;
         let mut hidden = vec![0u8; state.recurrent_hidden.len()];
         self.device
             .read(&state.recurrent_hidden, 0, &mut hidden)?;
         let mut snapshot = vec![("mtp.hidden".into(), 2, hidden)];
         let head_bytes = mtp_kv.cfg.head_dim * 2;
         for (name, buffers) in [("mtp.k", &mtp_kv.k), ("mtp.v", &mtp_kv.v)] {
-            let mut bytes = Vec::with_capacity(
-                state.seq.len * mtp_kv.cfg.n_kv_heads * head_bytes,
-            );
+            let mut bytes = Vec::with_capacity(state.seq.len * mtp_kv.cfg.n_kv_heads * head_bytes);
             for (offset, length) in logical_kv_regions(
                 &state.seq.pages,
                 state.seq.len,
@@ -9621,11 +9650,7 @@ impl Model {
             }
             snapshot.push((name.into(), 2usize, bytes));
         }
-        snapshot.push((
-            "mtp.len".into(),
-            1,
-            state.seq.len.to_le_bytes().to_vec(),
-        ));
+        snapshot.push(("mtp.len".into(), 1, state.seq.len.to_le_bytes().to_vec()));
         Ok(snapshot)
     }
 
@@ -10132,10 +10157,7 @@ impl Model {
         let prefill_cap = tokens.len().min(chunk_size);
         let saved_graphs = if prefill_cap > 4 {
             self.ensure_hybrid_verify_bufs(4)?;
-            std::mem::swap(
-                &mut self.hybrid_verify_bufs,
-                &mut self.hybrid_prefill_bufs,
-            );
+            std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
             Some((
                 std::mem::take(&mut self.hybrid_verify_graphs),
                 std::mem::take(&mut self.hybrid_verify_graph_disabled),
@@ -10238,14 +10260,8 @@ impl Model {
                     t * 4,
                     &self.stream,
                 )?;
-                self.device.copy(
-                    &host_staging.base_pos,
-                    0,
-                    &hv.base_pos,
-                    0,
-                    4,
-                    &self.stream,
-                )?;
+                self.device
+                    .copy(&host_staging.base_pos, 0, &hv.base_pos, 0, 4, &self.stream)?;
                 self.device.copy(
                     &host_staging.visible_lens,
                     0,
@@ -10254,24 +10270,11 @@ impl Model {
                     t * 4,
                     &self.stream,
                 )?;
-                self.device.copy(
-                    &host_staging.accepted,
-                    0,
-                    &hv.accepted,
-                    0,
-                    4,
-                    &self.stream,
-                )?;
-                self.device.copy(
-                    staging_buffer,
-                    0,
-                    &pb.h,
-                    0,
-                    t * hidden_bytes,
-                    &self.stream,
-                )?;
                 self.device
-                    .record_event(&staging_ready, &self.stream)?;
+                    .copy(&host_staging.accepted, 0, &hv.accepted, 0, 4, &self.stream)?;
+                self.device
+                    .copy(staging_buffer, 0, &pb.h, 0, t * hidden_bytes, &self.stream)?;
+                self.device.record_event(&staging_ready, &self.stream)?;
                 staging_recorded[staging_slot] = true;
 
                 self.profile_target_start()?;
@@ -10300,12 +10303,7 @@ impl Model {
 
                 self.profile_catchup_start()?;
                 if self.has_native_mtp() {
-                    self.mtp_catchup_verified_prefix(
-                        seq,
-                        t,
-                        staging_slot,
-                        Some(&staging_ready),
-                    )?;
+                    self.mtp_catchup_verified_prefix(seq, t, staging_slot, Some(&staging_ready))?;
                 }
                 self.profile_catchup_end()?;
             }
@@ -10326,10 +10324,7 @@ impl Model {
         restore_after(result, || {
             if let Some((graphs, disabled)) = saved_graphs {
                 // Verifier decode zachowuje własne bufory cap=4 i przechwycone grafy.
-                std::mem::swap(
-                    &mut self.hybrid_verify_bufs,
-                    &mut self.hybrid_prefill_bufs,
-                );
+                std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
                 self.hybrid_verify_graphs = graphs;
                 self.hybrid_verify_graph_disabled = disabled;
             }
@@ -10657,9 +10652,7 @@ impl Model {
                 .gemm_f16_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
             DevWeight::Q8_0 { buf, rows, cols } if (3..=8).contains(&n_tokens) => self
                 .kernels
-                .gemm_q8_0_f16_exact_out_f32_at(
-                    y_f32, buf, 0, x, *rows, *cols, n_tokens, stream,
-                ),
+                .gemm_q8_0_f16_exact_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
             DevWeight::Q8_0 { buf, rows, cols } => self
                 .kernels
                 .gemm_q8_0_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
@@ -10792,14 +10785,8 @@ impl Model {
                 );
             }
         }
-        self.device.copy(
-            &bb.pinned_embed,
-            0,
-            &bb.h,
-            0,
-            n * hidden * 2,
-            &self.stream,
-        )?;
+        self.device
+            .copy(&bb.pinned_embed, 0, &bb.h, 0, n * hidden * 2, &self.stream)?;
         self.kernels.rmsnorm_f16(
             &bb.x,
             &bb.h,

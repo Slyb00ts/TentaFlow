@@ -50,14 +50,7 @@ fn run_case(input: &[i32], predictions: &[i32], t: usize, expected: &[i32]) {
         .write(bytemuck::cast_slice(predictions), &prediction_buffer, 0)
         .unwrap();
     kernels
-        .mtp_verify_decide_segmented(
-            &decisions,
-            &prediction_buffer,
-            &input_buffer,
-            2,
-            t,
-            &stream,
-        )
+        .mtp_verify_decide_segmented(&decisions, &prediction_buffer, &input_buffer, 2, t, &stream)
         .unwrap();
     device.synchronize().unwrap();
     let mut bytes = vec![0u8; 4 * 4];
@@ -79,6 +72,149 @@ fn decyzje_b2_obejmuja_acceptance_od_zera_do_k_i_token_korekty() {
         4,
         &[4, 44, 3, 99],
     );
+}
+
+fn run_pack_i_batch_gather_embeddingu(steps: usize) {
+    let Some(device) = device() else { return };
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let total = 2 * steps;
+    let hidden = 64usize;
+    let vocab = 5usize;
+    let guard = 19usize;
+    let lane0_values = [3i32, 1, -1, 2, 0];
+    let lane1_values = [4i32, 0, vocab as i32, 3, 0];
+    let alloc = |bytes| {
+        device
+            .alloc(bytes, MemKind::Device, Pool::Activations)
+            .unwrap()
+    };
+    let lane0 = alloc(5 * 4);
+    let lane1 = alloc(5 * 4);
+    let bases = alloc(2 * 4);
+    let ids = alloc((total + guard) * 4);
+    let positions = alloc((total + guard) * 4);
+    let visible = alloc((total + guard) * 4);
+    device
+        .write(bytemuck::cast_slice(&lane0_values), &lane0, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&lane1_values), &lane1, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&[7i32, 19]), &bases, 0)
+        .unwrap();
+    for output in [&ids, &positions, &visible] {
+        device
+            .write(
+                bytemuck::cast_slice(&vec![0x6bad_cafeu32; total + guard]),
+                output,
+                0,
+            )
+            .unwrap();
+    }
+    kernels
+        .mtp_pack_verify_inputs(
+            &ids, &positions, &visible, &lane0, &lane1, &bases, steps, &stream,
+        )
+        .unwrap();
+
+    let mut f16_weights = Vec::with_capacity(vocab * hidden);
+    for row in 0..vocab {
+        f16_weights.extend(std::iter::repeat_n(f16::from_f32((row + 1) as f32), hidden));
+    }
+    let mut q8_weights = vec![0u8; vocab * (hidden / 32) * 34];
+    for block in q8_weights.chunks_exact_mut(34) {
+        block[..2].copy_from_slice(&f16::ONE.to_bits().to_le_bytes());
+        block[2..].fill(1);
+    }
+    let nvfp4_weights = vec![0u8; vocab * (hidden / 64) * 36];
+    let f16_table = device
+        .alloc(f16_weights.len() * 2, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let q8 = device
+        .alloc(q8_weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    let nvfp4 = device
+        .alloc(nvfp4_weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&f16_weights), &f16_table, 0)
+        .unwrap();
+    device.write(&q8_weights, &q8, 0).unwrap();
+    device.write(&nvfp4_weights, &nvfp4, 0).unwrap();
+    let canary = f16::from_bits(0x7bcd);
+    let output_values = vec![canary; total * hidden + guard];
+    let f16_output = alloc(output_values.len() * 2);
+    let q8_output = alloc(output_values.len() * 2);
+    let nvfp4_output = alloc(output_values.len() * 2);
+    for output in [&f16_output, &q8_output, &nvfp4_output] {
+        device
+            .write(bytemuck::cast_slice(&output_values), output, 0)
+            .unwrap();
+    }
+    kernels
+        .gather_rows_f16(&f16_output, &f16_table, &ids, total, hidden, &stream)
+        .unwrap();
+    kernels
+        .gather_q8_0_rows_f16(&q8_output, &q8, &ids, total, vocab, hidden, &stream)
+        .unwrap();
+    kernels
+        .gather_nvfp4_gguf_rows_f16(
+            &nvfp4_output,
+            &nvfp4,
+            &ids,
+            total,
+            vocab,
+            hidden,
+            1.0,
+            &stream,
+        )
+        .unwrap();
+    device.synchronize().unwrap();
+
+    let mut expected_ids = lane0_values[..steps].to_vec();
+    expected_ids.extend_from_slice(&lane1_values[..steps]);
+    let mut expected_positions: Vec<i32> = (7..7 + steps as i32).collect();
+    expected_positions.extend(19..19 + steps as i32);
+    let expected_visible: Vec<i32> = expected_positions.iter().map(|value| value + 1).collect();
+    for (buffer, expected) in [
+        (&ids, expected_ids.as_slice()),
+        (&positions, expected_positions.as_slice()),
+        (&visible, expected_visible.as_slice()),
+    ] {
+        let mut bytes = vec![0u8; (total + guard) * 4];
+        device.read(buffer, 0, &mut bytes).unwrap();
+        let values = bytemuck::cast_slice::<u8, i32>(&bytes);
+        assert_eq!(&values[..total], expected);
+        assert!(values[total..]
+            .iter()
+            .all(|value| *value as u32 == 0x6bad_cafe));
+    }
+    let invalid_rows = [2usize, steps + 2];
+    for output in [&f16_output, &q8_output, &nvfp4_output] {
+        let mut bytes = vec![0u8; output_values.len() * 2];
+        device.read(output, 0, &mut bytes).unwrap();
+        let values = bytemuck::cast_slice::<u8, f16>(&bytes);
+        assert!(values[..total * hidden]
+            .iter()
+            .all(|value| *value != canary));
+        for row in invalid_rows {
+            assert!(values[row * hidden..(row + 1) * hidden]
+                .iter()
+                .all(|value| *value == f16::ZERO));
+        }
+        assert!(values[total * hidden..]
+            .iter()
+            .all(|value| *value == canary));
+    }
+}
+
+#[test]
+fn pack_i_batch_gather_embeddingu_zachowuja_canary_dla_k2_i_k3() {
+    for steps in [3, 4] {
+        run_pack_i_batch_gather_embeddingu(steps);
+    }
 }
 
 #[test]
@@ -231,7 +367,11 @@ fn wspoldzielony_skan_i_commit_odtwarzaja_checkpointy_d128() {
         .write(bytemuck::cast_slice(&vec![-0.04f32; gate_elements]), &g, 0)
         .unwrap();
     device
-        .write(bytemuck::cast_slice(&vec![0.35f32; gate_elements]), &beta, 0)
+        .write(
+            bytemuck::cast_slice(&vec![0.35f32; gate_elements]),
+            &beta,
+            0,
+        )
         .unwrap();
     device
         .write(bytemuck::cast_slice(&[1i32, 7, 4, 9]), &decisions, 0)
@@ -349,10 +489,18 @@ fn kernele_b8_nie_czytaja_ani_nie_zapisuja_nieaktywnych_wierszy() {
         let f16_canary = f16::from_bits(0x7bcd);
         let f16_output_values = vec![f16_canary; tokens * rows + guard_elements];
         let q8_output = device
-            .alloc(f16_output_values.len() * 2, MemKind::Device, Pool::Activations)
+            .alloc(
+                f16_output_values.len() * 2,
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
         let nvfp4_output = device
-            .alloc(f16_output_values.len() * 2, MemKind::Device, Pool::Activations)
+            .alloc(
+                f16_output_values.len() * 2,
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
         device
             .write(bytemuck::cast_slice(&f16_output_values), &q8_output, 0)
@@ -379,7 +527,11 @@ fn kernele_b8_nie_czytaja_ani_nie_zapisuja_nieaktywnych_wierszy() {
         let f32_canary = f32::from_bits(0x7fc0_1234);
         let exact_output_values = vec![f32_canary; tokens * rows + guard_elements];
         let exact_output = device
-            .alloc(exact_output_values.len() * 4, MemKind::Device, Pool::Activations)
+            .alloc(
+                exact_output_values.len() * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
         device
             .write(bytemuck::cast_slice(&exact_output_values), &exact_output, 0)

@@ -2409,6 +2409,151 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
+    /// Pakuje GPU-resident drafty dwóch lane'ów oraz metadane target verifiera.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_pack_verify_inputs(
+        &self,
+        ids_out: &DevBuffer,
+        positions_out: &DevBuffer,
+        visible_out: &DevBuffer,
+        lane0_ids: &DevBuffer,
+        lane1_ids: &DevBuffer,
+        base_positions: &DevBuffer,
+        steps: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !(3..=4).contains(&steps) {
+            return Err(ForgeError::Kernel(format!(
+                "mtp_pack_verify_inputs wymaga T=3 lub T=4, otrzymano {steps}"
+            )));
+        }
+        let total = steps.checked_mul(2).ok_or_else(|| {
+            ForgeError::Kernel("mtp_pack_verify_inputs: przepełnienie liczby ID".into())
+        })?;
+        let bytes = checked_buffer_bytes("mtp_pack_verify_inputs output", &[total], 4)?;
+        if ids_out.len() < bytes
+            || positions_out.len() < bytes
+            || visible_out.len() < bytes
+            || lane0_ids.len() < steps * 4
+            || lane1_ids.len() < steps * 4
+            || base_positions.len() < 8
+        {
+            return Err(ForgeError::Kernel(
+                "mtp_pack_verify_inputs: zbyt mały bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("mtp_pack_verify_inputs")?;
+        let config = LaunchConfig::linear(total as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(ids_out)
+            .buf(positions_out)
+            .buf(visible_out)
+            .buf(lane0_ids)
+            .buf(lane1_ids)
+            .buf(base_positions)
+            .scalar(steps as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Dekwantyzuje batch wierszy target embeddingu Q8_0 według ID na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_q8_0_rows_f16(
+        &self,
+        output: &DevBuffer,
+        weights: &DevBuffer,
+        ids: &DevBuffer,
+        rows: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(
+                "gather_q8_0_rows_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let output_bytes =
+            checked_buffer_bytes("gather_q8_0_rows_f16 output", &[rows, hidden_size], 2)?;
+        let weight_bytes = checked_buffer_bytes(
+            "gather_q8_0_rows_f16 weights",
+            &[vocab_size, hidden_size / 32],
+            34,
+        )?;
+        if output.len() < output_bytes || weights.len() < weight_bytes || ids.len() < rows * 4 {
+            return Err(ForgeError::Kernel(
+                "gather_q8_0_rows_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("gather_q8_0_rows_f16")?;
+        let config = LaunchConfig {
+            grid: ((hidden_size as u32).div_ceil(BLOCK), rows as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(weights)
+            .buf(ids)
+            .scalar(rows as i64)
+            .scalar(vocab_size as i64)
+            .scalar(hidden_size as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Dekwantyzuje batch wierszy target embeddingu GGUF NVFP4 według ID na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_nvfp4_gguf_rows_f16(
+        &self,
+        output: &DevBuffer,
+        weights: &DevBuffer,
+        ids: &DevBuffer,
+        rows: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(
+                "gather_nvfp4_gguf_rows_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let output_bytes =
+            checked_buffer_bytes("gather_nvfp4_gguf_rows_f16 output", &[rows, hidden_size], 2)?;
+        let weight_bytes = checked_buffer_bytes(
+            "gather_nvfp4_gguf_rows_f16 weights",
+            &[vocab_size, hidden_size / 64],
+            36,
+        )?;
+        if output.len() < output_bytes || weights.len() < weight_bytes || ids.len() < rows * 4 {
+            return Err(ForgeError::Kernel(
+                "gather_nvfp4_gguf_rows_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        let nvidia = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        let (name, elements, block) = if nvidia {
+            ("gather_nvfp4_gguf_rows_f16_nvidia", hidden_size / 2, 128u32)
+        } else {
+            ("gather_nvfp4_gguf_rows_f16", hidden_size, BLOCK)
+        };
+        let kernel = self.artifacts.get(name)?;
+        let config = LaunchConfig {
+            grid: ((elements as u32).div_ceil(block), rows as u32, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(weights)
+            .buf(ids)
+            .scalar(rows as i64)
+            .scalar(vocab_size as i64)
+            .scalar(hidden_size as i64)
+            .scalar(output_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// out[t] = table[ids[t]] — token embedding gather (f16 rows).
     pub fn gather_rows_f16(
         &self,
@@ -2419,6 +2564,21 @@ impl Kernels {
         cols: usize,
         stream: &Stream,
     ) -> Result<()> {
+        let row_bytes = checked_buffer_bytes("gather_rows_f16 row", &[cols], 2)?;
+        let output_bytes = checked_buffer_bytes("gather_rows_f16 output", &[n_tokens, cols], 2)?;
+        let ids_bytes = checked_buffer_bytes("gather_rows_f16 ids", &[n_tokens], 4)?;
+        if n_tokens == 0
+            || cols == 0
+            || table.is_empty()
+            || !table.len().is_multiple_of(row_bytes)
+            || out.len() < output_bytes
+            || ids.len() < ids_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "gather_rows_f16: nieprawidłowy kształt lub zbyt mały bufor".into(),
+            ));
+        }
+        let rows = table.len() / row_bytes;
         let k = self.artifacts.get("gather_rows_f16")?;
         let cfg = LaunchConfig {
             grid: (n_tokens as u32, 1, 1),
@@ -2429,6 +2589,7 @@ impl Kernels {
             .buf(out)
             .buf(table)
             .buf(ids)
+            .scalar(rows as i64)
             .scalar(cols as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
@@ -3428,9 +3589,9 @@ impl Kernels {
                 "segmentowany append KV wymaga B>0 i T>0".into(),
             ));
         }
-        let total = batch.checked_mul(n_tokens).ok_or_else(|| {
-            ForgeError::Kernel("przepełnienie liczby tokenów append KV".into())
-        })?;
+        let total = batch
+            .checked_mul(n_tokens)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie liczby tokenów append KV".into()))?;
         let kernel = self.artifacts.get("kv_append_batch_segmented_f16")?;
         let config = LaunchConfig {
             grid: (total as u32, n_kv_heads as u32, 1),
@@ -3476,9 +3637,9 @@ impl Kernels {
                 "segmentowana atencja verifiera wymaga B>0 i T>0".into(),
             ));
         }
-        let total = batch.checked_mul(n_tokens).ok_or_else(|| {
-            ForgeError::Kernel("przepełnienie liczby tokenów atencji".into())
-        })?;
+        let total = batch
+            .checked_mul(n_tokens)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie liczby tokenów atencji".into()))?;
         let caps = self.device.caps();
         let warp32 = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
         let kernel = self.artifacts.get(if warp32 {

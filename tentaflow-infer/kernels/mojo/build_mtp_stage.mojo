@@ -7,7 +7,8 @@
 import std.os as os
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
-from src.mtp import mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, mtp_verify_decide_segmented, mtp_select_row_segmented_f16
+from src.mtp import mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, mtp_verify_decide_segmented, mtp_select_row_segmented_f16, mtp_pack_verify_inputs, gather_q8_0_rows_f16, gather_nvfp4_gguf_rows_f16, gather_nvfp4_gguf_rows_f16_nvidia
+from src.misc import gather_rows_f16
 from src.prefill import kv_append_batch_segmented_f16
 from src.attention import attn_verify_segmented_f16_hd256, attn_verify_segmented_f16_hd256_warp32
 from src.deltanet_verify import deltanet_prepare_segmented_f16, deltanet_gated_scan_segmented_d128_f16, deltanet_commit_checkpoint_segmented_f32, deltanet_gated_scan_segmented_shared_d128_f16, deltanet_commit_recompute_segmented_shared_d128_f32
@@ -19,9 +20,49 @@ def main() raises:
     var ctx = DeviceContext()
     out_dir = Path("build") / ctx.arch_name()
     os.makedirs(String(out_dir), exist_ok=True)
+    _ = ctx.compile_function[
+        gather_rows_f16,
+        dump_asm=Path("gather_rows_f16.ptx"),
+    ]()
+    source = Path("gather_rows_f16.ptx")
+    target = out_dir / "gather_rows_f16.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
     _ = ctx.compile_function[mtp_stage_step, dump_asm=Path("mtp_stage_step.ptx")]()
     source = Path("mtp_stage_step.ptx")
     target = out_dir / "mtp_stage_step.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
+        mtp_pack_verify_inputs,
+        dump_asm=Path("mtp_pack_verify_inputs.ptx"),
+    ]()
+    source = Path("mtp_pack_verify_inputs.ptx")
+    target = out_dir / "mtp_pack_verify_inputs.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
+        gather_q8_0_rows_f16,
+        dump_asm=Path("gather_q8_0_rows_f16.ptx"),
+    ]()
+    source = Path("gather_q8_0_rows_f16.ptx")
+    target = out_dir / "gather_q8_0_rows_f16.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
+        gather_nvfp4_gguf_rows_f16,
+        dump_asm=Path("gather_nvfp4_gguf_rows_f16.ptx"),
+    ]()
+    source = Path("gather_nvfp4_gguf_rows_f16.ptx")
+    target = out_dir / "gather_nvfp4_gguf_rows_f16.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
+        gather_nvfp4_gguf_rows_f16_nvidia,
+        dump_asm=Path("gather_nvfp4_gguf_rows_f16_nvidia.ptx"),
+    ]()
+    source = Path("gather_nvfp4_gguf_rows_f16_nvidia.ptx")
+    target = out_dir / "gather_nvfp4_gguf_rows_f16_nvidia.ptx"
     target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
     os.remove(String(source))
     _ = ctx.compile_function[

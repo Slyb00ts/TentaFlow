@@ -94,14 +94,48 @@ exact logits 2,176 ms i commit DeltaNet 1,296 ms. Po stronie runtime dominowało
 `cuCtxSynchronize` na cykl B2. Artefakty: `/tmp/mtp-b2-warp-attn-raw512.nsys-rep`
 i `/tmp/mtp-b2-warp-attn-raw512.sqlite`.
 
+### Jednorundowy pack/gather verifiera
+
+Draft ID pozostają na GPU od proposera do verifiera. Kernel Mojo pakuje wejście
+`[B,T]`, pozycje i widoczność w układzie sequence-major, a batchowy gather
+embeddingu targetu obsługuje F16, Q8_0 i GGUF NVFP4. NVFP4 ma wariant warp32
+dla NVIDIA oraz wariant przenośny dla pozostałych backendów. Host przekazuje
+wyłącznie znane pozycje bazowe i tablice stron przez pamięć pinned, bez odczytu
+draftu i bez hostowego `Vec`/H2D embeddingu. Jedyny odczyt D2H obejmuje końcowe
+decyzje i ID potrzebne do commit/emisji, po czym wykonywany jest jeden sync.
+Każdy format zeruje wynik dla ujemnego ID lub ID równego/większego od rozmiaru
+słownika bez odczytu wagi; finalna walidacja decyzji zwraca wtedy kontrolowany
+błąd zamiast dopuszczać GPU OOB.
+
+Profil `/tmp/mtp-b2-one-roundtrip-raw512.nsys-rep` objął 24 pełne cykle B2.
+Każdy cykl miał dokładnie jeden `cuCtxSynchronize` oraz cztery H2D: dwie pozycje
+bazowe i dwie tablice stron. Memcheck kerneli pack/gather zakończył się bez
+błędów i bez naruszenia canary dla K2/K3, F16/Q8_0/NVFP4 oraz błędnych ID `-1`
+i `vocab`.
+
+Współczesny pomiar A/B względem czystego `7d472a0a`, po pięć powtórzeń i z
+pełną zgodnością ID, dał:
+
+| Prompt | Jednorundowa mediana (zakres) | HEAD mediana (zakres) | Zmiana |
+|---|---:|---:|---:|
+| raw128 | **127,91** (126,99-128,62) tok/s | 127,20 (127,08-127,31) tok/s | **+0,56%** |
+| raw512 | **93,56** (93,53-93,72) tok/s | 93,45 (93,43-93,53) tok/s | **+0,12%** |
+
+Stałe K=3 dla raw128 osiągnęło 125,63 tok/s wobec 125,82 tok/s na HEAD
+(-0,15%), czyli różnicę w granicach szumu. Zmiana usuwa round-trip i pierwszy
+sync, ale w aktualnym profilu throughput nadal dominuje praca kerneli modelu.
+Logi: `/tmp/mtp-b2-one-roundtrip-five-raw128.log`,
+`/tmp/mtp-b2-one-roundtrip-five-raw512.log`,
+`/tmp/mtp-b2-head-contemporary-five-raw128.log` i
+`/tmp/mtp-b2-head-contemporary-five-raw512.log`.
+
 ### Ograniczenia i odrzucone eksperymenty
 
-Pozostały narzut CPU to pobranie draft ID, budowa pozycji/widoczności/stron
-verifiera oraz hostowy gather embeddingu targetu i H2D. Jednorundowe GPU
-pack/gather nie jest zaimplementowane. Strony przypięte przez cache prefiksu są
-konserwatywnie liczone przez admission i mogą opóźnić przyjęcie requestu mimo
-fizycznego współdzielenia. Pełny builder blokuje obecnie FP8 wymagające PTX ISA
-8.4, ponieważ Mojo emituje PTX 8.1; izolowany AOT badanych kerneli działa.
+Pozostały narzut CPU to przygotowanie pozycji bazowych i tablic stron oraz
+obsługa końcowej decyzji. Strony przypięte przez cache prefiksu są konserwatywnie
+liczone przez admission i mogą opóźnić przyjęcie requestu mimo fizycznego
+współdzielenia. Pełny builder blokuje obecnie FP8 wymagające PTX ISA 8.4,
+ponieważ Mojo emituje PTX 8.1; izolowany AOT badanych kerneli działa.
 
 Próba skierowania B8 do istniejącego BM32 obniżyła raw512 z 82,13 do 38,66
 tok/s. Dedykowane warianty M8 MMA m16, BN64/BN128 również były wolniejsze od B8,

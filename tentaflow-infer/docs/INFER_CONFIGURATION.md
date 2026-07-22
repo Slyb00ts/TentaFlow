@@ -401,6 +401,10 @@ Zweryfikowane natywne MTP (RTX 4090,
   `oracle_upper` pozostaje osobną górną granicą;
 - MTP B2 ON/OFF, mediana pięciu powtórzeń: raw128 **137,40/101,97 tok/s**,
   raw512 **97,78/76,38 tok/s**; stałe K=3 osiąga **136,97/94,34 tok/s**;
+- jednorundowy verifier utrzymuje draft ID na GPU, wykonuje pack `[B,T]` i
+  gather F16/Q8_0/NVFP4 w Mojo oraz kończy jednym D2H/sync; współczesne A/B
+  względem `7d472a0a` osiąga **127,91/127,20 tok/s** dla raw128 i
+  **93,56/93,45 tok/s** dla raw512;
 - pomiary dotyczą wyłącznie CUDA. Źródła kerneli Mojo są przenośnym punktem
   wyjścia dla AMDGPU/Metal, ale tych backendów nie uruchomiono ani nie
   zweryfikowano.

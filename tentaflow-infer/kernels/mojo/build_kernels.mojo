@@ -49,7 +49,7 @@ from src.deltanet_verify import (
 )
 from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8, gemv_nvfp4_gguf_f16, gemv_nvfp4_gguf_out_f32, pack_q8_0_nvfp4_gguf
 from src.nvfp4_gguf_dp4a import gemv_nvfp4_gguf_q8_1_f16
-from src.mtp import mtp_prepare_f16, mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16, mtp_verify_decide, mtp_verify_decide_segmented, mtp_select_row_f16, mtp_select_row_f32, mtp_select_row_segmented_f16
+from src.mtp import mtp_prepare_f16, mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16, mtp_pack_verify_inputs, gather_q8_0_rows_f16, gather_nvfp4_gguf_rows_f16, gather_nvfp4_gguf_rows_f16_nvidia, mtp_verify_decide, mtp_verify_decide_segmented, mtp_select_row_f16, mtp_select_row_f32, mtp_select_row_segmented_f16
 from src.nvfp4_batch import gemv_batch_nvfp4_f16_b4, gemv_batch_nvfp4_f16_b8, gemv_batch_nvfp4_f16_b16, gemv_batch_f16_out_f32_b4, gemv_batch_f16_out_f32_b8
 from src.misc import gather_rows_f16, gemv_f16_out_f32, gemv_q8_0_out_f32
 from src.layernorm import layernorm_f16, layernorm_residual_f16
@@ -256,6 +256,10 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
         or name == "gather_f16_row_f16"
         or name == "gather_q8_0_row_f16"
         or name == "gather_nvfp4_gguf_row_f16"
+        or name == "mtp_pack_verify_inputs"
+        or name == "gather_q8_0_rows_f16"
+        or name == "gather_nvfp4_gguf_rows_f16"
+        or name == "gather_nvfp4_gguf_rows_f16_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b2"
         or name == "gemm_nvfp4_gguf_f16_b3"
         or name == "gemm_nvfp4_gguf_f16_b4"
@@ -481,6 +485,14 @@ def main() raises:
     entries.append(_finalize(out_dir, "gather_q8_0_row_f16"))
     _ = ctx.compile_function[gather_nvfp4_gguf_row_f16, dump_asm=Path("gather_nvfp4_gguf_row_f16.ptx")]()
     entries.append(_finalize(out_dir, "gather_nvfp4_gguf_row_f16"))
+    _ = ctx.compile_function[mtp_pack_verify_inputs, dump_asm=Path("mtp_pack_verify_inputs.ptx")]()
+    entries.append(_finalize(out_dir, "mtp_pack_verify_inputs"))
+    _ = ctx.compile_function[gather_q8_0_rows_f16, dump_asm=Path("gather_q8_0_rows_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gather_q8_0_rows_f16"))
+    _ = ctx.compile_function[gather_nvfp4_gguf_rows_f16, dump_asm=Path("gather_nvfp4_gguf_rows_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gather_nvfp4_gguf_rows_f16"))
+    _ = ctx.compile_function[gather_nvfp4_gguf_rows_f16_nvidia, dump_asm=Path("gather_nvfp4_gguf_rows_f16_nvidia.ptx")]()
+    entries.append(_finalize(out_dir, "gather_nvfp4_gguf_rows_f16_nvidia"))
 
     _ = ctx.compile_function[mtp_verify_decide, dump_asm=Path("mtp_verify_decide.ptx")]()
     entries.append(_finalize(out_dir, "mtp_verify_decide"))

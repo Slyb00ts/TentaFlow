@@ -106,6 +106,112 @@ def gather_nvfp4_gguf_row_f16(
         output[element] = Float16(_e2m1(code) * scale)
 
 
+def mtp_pack_verify_inputs(
+    ids_out: UnsafePointer[Int32, MutAnyOrigin],
+    positions_out: UnsafePointer[Int32, MutAnyOrigin],
+    visible_out: UnsafePointer[Int32, MutAnyOrigin],
+    lane0_ids: UnsafePointer[Int32, MutAnyOrigin],
+    lane1_ids: UnsafePointer[Int32, MutAnyOrigin],
+    base_positions: UnsafePointer[Int32, MutAnyOrigin],
+    steps: Int,
+):
+    """Pakuje dwa drafty i metadane verifiera w układzie sequence-major."""
+    index = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    total = 2 * steps
+    if index < total:
+        lane = index // steps
+        step = index - lane * steps
+        token = lane0_ids[step] if lane == 0 else lane1_ids[step]
+        position = Int(base_positions[lane]) + step
+        ids_out[index] = token
+        positions_out[index] = Int32(position)
+        visible_out[index] = Int32(position + 1)
+
+
+def gather_q8_0_rows_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    rows: Int,
+    vocab_size: Int,
+    hidden_size: Int,
+):
+    """Dekwantyzuje batch wierszy tied embeddingu Q8_0 wskazanych na GPU."""
+    row_index = Int(block_idx.y)
+    element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row_index < rows and element < hidden_size:
+        row = Int(ids[row_index])
+        out_index = row_index * hidden_size + element
+        if row < 0 or row >= vocab_size:
+            output[out_index] = 0.0
+        else:
+            block = element // 32
+            offset = (row * (hidden_size // 32) + block) * 34
+            scale = Float32((weights + offset).bitcast[Float16]()[0])
+            code = (weights + offset + 2).bitcast[Int8]()[element % 32]
+            output[out_index] = Float16(scale * Float32(code))
+
+
+def gather_nvfp4_gguf_rows_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    rows: Int,
+    vocab_size: Int,
+    hidden_size: Int,
+    output_scale: Float32,
+):
+    """Przenośny batch gather tied embeddingu GGUF NVFP4."""
+    row_index = Int(block_idx.y)
+    element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row_index < rows and element < hidden_size:
+        row = Int(ids[row_index])
+        out_index = row_index * hidden_size + element
+        if row < 0 or row >= vocab_size:
+            output[out_index] = 0.0
+        else:
+            block = element // 64
+            subblock = (element % 64) // 16
+            within = element % 16
+            block_base = (row * (hidden_size // 64) + block) * 36
+            packed = weights[block_base + 4 + subblock * 8 + within % 8]
+            code = packed & 0x0F if within < 8 else (packed >> 4) & 0x0F
+            scale = _ue4m3_portable(weights[block_base + subblock]) * output_scale
+            output[out_index] = Float16(_e2m1(code) * scale)
+
+
+def gather_nvfp4_gguf_rows_f16_nvidia(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    rows: Int,
+    vocab_size: Int,
+    hidden_size: Int,
+    output_scale: Float32,
+):
+    """Czyta oba nible jednego bajtu NVFP4 na wątek NVIDIA warp32."""
+    row_index = Int(block_idx.y)
+    pair = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    pairs_per_row = hidden_size // 2
+    if row_index < rows and pair < pairs_per_row:
+        row = Int(ids[row_index])
+        block = pair // 32
+        within_block = pair % 32
+        subblock = within_block // 8
+        within = within_block % 8
+        first = block * 64 + subblock * 16 + within
+        out_base = row_index * hidden_size
+        if row < 0 or row >= vocab_size:
+            output[out_base + first] = 0.0
+            output[out_base + first + 8] = 0.0
+        else:
+            block_base = (row * (hidden_size // 64) + block) * 36
+            packed = weights[block_base + 4 + subblock * 8 + within]
+            scale = _ue4m3_portable(weights[block_base + subblock]) * output_scale
+            output[out_base + first] = Float16(_e2m1(packed & 0x0F) * scale)
+            output[out_base + first + 8] = Float16(_e2m1((packed >> 4) & 0x0F) * scale)
+
+
 def mtp_prepare_f16(
     output: UnsafePointer[Float16, MutAnyOrigin],
     embedding_row: UnsafePointer[Float16, MutAnyOrigin],

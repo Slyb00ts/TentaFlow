@@ -471,10 +471,13 @@ coherent Polish on the RTX 4090.
   (+34,75%), raw512 97,78/76,38 tok/s (+28,02%); stałe K=3 osiąga
   136,97/94,34 tok/s. Wszystkie przebiegi FORGE zachowały pełne ID względem
   sekwencyjnego greedy. Wynik llama.cpp B2 nie jest baseline: tylko 5/24 wyjść
-  zgadzało się z oracle `np1`. Profil nadal pokazuje hostowy gather embeddingu,
-  dwa sync na cykl i konserwatywne naliczanie przypiętych stron prefiksu;
-  jednorundowe GPU pack/gather nie jest zaimplementowane. Pełny builder blokuje
-  FP8 wymagające PTX 8.4, gdy Mojo emituje PTX 8.1. Szczegóły:
+  zgadzało się z oracle `np1`. Jednorundowa ścieżka pozostawia draft ID na GPU,
+  pakuje `[B,T]` i wykonuje formatowy gather F16/Q8_0/NVFP4 w Mojo. Profil 24
+  cykli potwierdził jeden końcowy sync i cztery małe H2D na cykl; współczesne A/B
+  względem `7d472a0a` dało +0,56% raw128 i +0,12% raw512. Każdy format zeruje
+  błędne ID bez GPU OOB, a finalna walidacja zwraca kontrolowany błąd. Nadal
+  konserwatywnie naliczane są przypięte strony prefiksu. Pełny builder blokuje FP8 wymagające
+  PTX 8.4, gdy Mojo emituje PTX 8.1. Szczegóły:
   `tentaflow-infer/docs/BENCH_QWEN35_MTP_NVFP4.md`.
 - Admission rezerwuje logiczny budżet przyszłych stron KV każdej aktywnej
   sekwencji, egzekwuje `max_pages_per_seq` i wykonuje atomowy preflight wzrostu
