@@ -18,6 +18,8 @@ pub mod legal;
 
 pub mod model_bundle;
 
+pub mod ml_studio_export;
+
 pub mod dashboard;
 
 pub mod unified_server;

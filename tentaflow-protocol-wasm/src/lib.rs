@@ -2951,6 +2951,180 @@ pub fn encode_ml_studio_recog_autolabel_status_request(job_id: String) -> Result
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioProjectExportStartRequest)]
+pub fn encode_ml_studio_project_export_start_request(
+    project_id: String,
+    include_models: bool,
+    include_history: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectExportStartRequest(
+            tentaflow_protocol::MlStudioProjectExportStartRequest {
+                project_id,
+                include_models,
+                include_history,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectExportStatusRequest)]
+pub fn encode_ml_studio_project_export_status_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectExportStatusRequest(
+            tentaflow_protocol::MlStudioProjectExportStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportUploadChunkRequest)]
+pub fn encode_ml_studio_project_import_upload_chunk_request(
+    upload_id: String,
+    seq: u32,
+    total_chunks: u32,
+    filename: String,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkRequest(
+            tentaflow_protocol::MlStudioProjectImportUploadChunkRequest {
+                upload_id,
+                seq,
+                total_chunks,
+                filename,
+                bytes,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportUploadStatusRequest)]
+pub fn encode_ml_studio_project_import_upload_status_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusRequest(
+            tentaflow_protocol::MlStudioProjectImportUploadStatusRequest { upload_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportPreviewRequest)]
+pub fn encode_ml_studio_project_import_preview_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportPreviewRequest(
+            tentaflow_protocol::MlStudioProjectImportPreviewRequest { upload_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportApplyRequest)]
+pub fn encode_ml_studio_project_import_apply_request(
+    upload_id: String,
+    mode: String,
+    name_override: Option<String>,
+    target_project_id: Option<String>,
+    target_dataset_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportApplyRequest(
+            tentaflow_protocol::MlStudioProjectImportApplyRequest {
+                upload_id,
+                mode,
+                name_override,
+                target_project_id,
+                target_dataset_id,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportStatusRequest)]
+pub fn encode_ml_studio_project_import_status_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportStatusRequest(
+            tentaflow_protocol::MlStudioProjectImportStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportCancelRequest)]
+pub fn encode_ml_studio_project_import_cancel_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportCancelRequest(
+            tentaflow_protocol::MlStudioProjectImportCancelRequest { upload_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecordingsListRequest)]
+pub fn encode_ml_studio_recordings_list_request(
+    camera_id: Option<String>,
+    date_from_ms: Option<f64>,
+    date_to_ms: Option<f64>,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecordingsListRequest(
+            tentaflow_protocol::MlStudioRecordingsListRequest {
+                camera_id: camera_id.filter(|s| !s.is_empty()),
+                date_from_ms: date_from_ms.map(|v| v as i64),
+                date_to_ms: date_to_ms.map(|v| v as i64),
+                limit,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecogImportRecordingsRequest)]
+pub fn encode_ml_studio_recog_import_recordings_request(
+    project_id: String,
+    dataset_id: String,
+    recording_refs: Vec<String>,
+    fps: u32,
+    autolabel: bool,
+    collision: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsRequest(
+            tentaflow_protocol::MlStudioRecogImportRecordingsRequest {
+                project_id,
+                dataset_id,
+                recording_refs,
+                fps,
+                autolabel,
+                collision,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecogImportRecordingsStatusRequest)]
+pub fn encode_ml_studio_recog_import_recordings_status_request(
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusRequest(
+            tentaflow_protocol::MlStudioRecogImportRecordingsStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -11074,6 +11248,341 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),
             }
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStartRequest(req) => {
+            set(obj, "variant", "MlStudioProjectExportStartRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "includeModels", req.include_models.into());
+            set(obj, "include_models", req.include_models.into());
+            set(obj, "includeHistory", req.include_history.into());
+            set(obj, "include_history", req.include_history.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStartResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectExportStartResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStatusRequest(req) => {
+            set(obj, "variant", "MlStudioProjectExportStatusRequest".into());
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectExportStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "filesTotal", (resp.files_total as f64).into());
+            set(obj, "files_total", (resp.files_total as f64).into());
+            set(obj, "filesDone", (resp.files_done as f64).into());
+            set(obj, "files_done", (resp.files_done as f64).into());
+            set(obj, "bytesTotal", (resp.bytes_total as f64).into());
+            set(obj, "bytes_total", (resp.bytes_total as f64).into());
+            set(obj, "bytesDone", (resp.bytes_done as f64).into());
+            set(obj, "bytes_done", (resp.bytes_done as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            let export_ref = match resp.export_ref {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "exportRef", export_ref.clone());
+            set(obj, "export_ref", export_ref);
+            let signed_url = match resp.signed_url {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "signedUrl", signed_url.clone());
+            set(obj, "signed_url", signed_url);
+            let archive_bytes = match resp.archive_bytes {
+                Some(v) => JsValue::from_f64(v as f64),
+                None => JsValue::NULL,
+            };
+            set(obj, "archiveBytes", archive_bytes.clone());
+            set(obj, "archive_bytes", archive_bytes);
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportUploadChunkRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+            set(obj, "seq", req.seq.into());
+            set(obj, "totalChunks", req.total_chunks.into());
+            set(obj, "total_chunks", req.total_chunks.into());
+            set(obj, "filename", req.filename.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportUploadChunkResponse".into());
+            set(obj, "uploadId", resp.upload_id.clone().into());
+            set(obj, "upload_id", resp.upload_id.into());
+            set(obj, "receivedChunks", resp.received_chunks.into());
+            set(obj, "received_chunks", resp.received_chunks.into());
+            set(obj, "receivedBytes", (resp.received_bytes as f64).into());
+            set(obj, "received_bytes", (resp.received_bytes as f64).into());
+            set(obj, "complete", resp.complete.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportUploadStatusRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportUploadStatusResponse".into());
+            set(obj, "uploadId", resp.upload_id.clone().into());
+            set(obj, "upload_id", resp.upload_id.into());
+            set(obj, "receivedChunks", resp.received_chunks.into());
+            set(obj, "received_chunks", resp.received_chunks.into());
+            set(obj, "receivedBytes", (resp.received_bytes as f64).into());
+            set(obj, "received_bytes", (resp.received_bytes as f64).into());
+            set(obj, "totalChunks", resp.total_chunks.into());
+            set(obj, "total_chunks", resp.total_chunks.into());
+            set(obj, "complete", resp.complete.into());
+            set(obj, "exists", resp.exists.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportPreviewRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportPreviewRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportPreviewResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportPreviewResponse".into());
+            set(obj, "projectName", resp.project_name.clone().into());
+            set(obj, "project_name", resp.project_name.into());
+            set(obj, "projectType", resp.project_type.clone().into());
+            set(obj, "project_type", resp.project_type.into());
+            let datasets = js_sys::Array::new();
+            for d in &resp.datasets {
+                let entry = js_sys::Object::new();
+                set(&entry, "datasetId", d.dataset_id.clone().into());
+                set(&entry, "dataset_id", d.dataset_id.clone().into());
+                set(&entry, "name", d.name.clone().into());
+                set(&entry, "imageCount", (d.image_count as f64).into());
+                set(&entry, "image_count", (d.image_count as f64).into());
+                set(&entry, "annotationCount", (d.annotation_count as f64).into());
+                set(&entry, "annotation_count", (d.annotation_count as f64).into());
+                datasets.push(&entry);
+            }
+            set(obj, "datasets", datasets.into());
+            let classes = js_sys::Array::new();
+            for c in &resp.classes {
+                classes.push(&JsValue::from_str(c));
+            }
+            set(obj, "classes", classes.into());
+            set(obj, "hasModels", resp.has_models.into());
+            set(obj, "has_models", resp.has_models.into());
+            set(obj, "hasHistory", resp.has_history.into());
+            set(obj, "has_history", resp.has_history.into());
+            set(
+                obj,
+                "totalUncompressedBytes",
+                (resp.total_uncompressed_bytes as f64).into(),
+            );
+            set(
+                obj,
+                "total_uncompressed_bytes",
+                (resp.total_uncompressed_bytes as f64).into(),
+            );
+            let missing = js_sys::Array::new();
+            for m in &resp.missing_artifacts {
+                let entry = js_sys::Object::new();
+                set(&entry, "path", m.path.clone().into());
+                set(&entry, "reason", m.reason.clone().into());
+                missing.push(&entry);
+            }
+            set(obj, "missingArtifacts", missing.clone().into());
+            set(obj, "missing_artifacts", missing.into());
+            set(obj, "archiveVersion", resp.archive_version.into());
+            set(obj, "archive_version", resp.archive_version.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportApplyRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportApplyRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+            set(obj, "mode", req.mode.into());
+            let name_override = match req.name_override {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "nameOverride", name_override.clone());
+            set(obj, "name_override", name_override);
+            let target_project_id = match req.target_project_id {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "targetProjectId", target_project_id.clone());
+            set(obj, "target_project_id", target_project_id);
+            let target_dataset_id = match req.target_dataset_id {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "targetDatasetId", target_dataset_id.clone());
+            set(obj, "target_dataset_id", target_dataset_id);
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportApplyResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportApplyResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportStatusRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportStatusRequest".into());
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "filesTotal", (resp.files_total as f64).into());
+            set(obj, "files_total", (resp.files_total as f64).into());
+            set(obj, "filesDone", (resp.files_done as f64).into());
+            set(obj, "files_done", (resp.files_done as f64).into());
+            set(obj, "bytesTotal", (resp.bytes_total as f64).into());
+            set(obj, "bytes_total", (resp.bytes_total as f64).into());
+            set(obj, "bytesDone", (resp.bytes_done as f64).into());
+            set(obj, "bytes_done", (resp.bytes_done as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportCancelRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportCancelRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportCancelResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportCancelResponse".into());
+            set(obj, "cancelled", resp.cancelled.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecordingsListRequest(req) => {
+            set(obj, "variant", "MlStudioRecordingsListRequest".into());
+            let camera_id = match req.camera_id {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "cameraId", camera_id.clone());
+            set(obj, "camera_id", camera_id);
+            let date_from_ms = match req.date_from_ms {
+                Some(v) => JsValue::from_f64(v as f64),
+                None => JsValue::NULL,
+            };
+            set(obj, "dateFromMs", date_from_ms.clone());
+            set(obj, "date_from_ms", date_from_ms);
+            let date_to_ms = match req.date_to_ms {
+                Some(v) => JsValue::from_f64(v as f64),
+                None => JsValue::NULL,
+            };
+            set(obj, "dateToMs", date_to_ms.clone());
+            set(obj, "date_to_ms", date_to_ms);
+            set(obj, "limit", req.limit.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecordingsListResponse(resp) => {
+            set(obj, "variant", "MlStudioRecordingsListResponse".into());
+            let items = js_sys::Array::new();
+            for it in &resp.items {
+                let entry = js_sys::Object::new();
+                set(&entry, "recordingRef", it.recording_ref.clone().into());
+                set(&entry, "recording_ref", it.recording_ref.clone().into());
+                set(&entry, "kind", it.kind.clone().into());
+                set(&entry, "cameraId", it.camera_id.clone().into());
+                set(&entry, "camera_id", it.camera_id.clone().into());
+                set(&entry, "createdAt", (it.created_at as f64).into());
+                set(&entry, "created_at", (it.created_at as f64).into());
+                let duration_ms = match it.duration_ms {
+                    Some(v) => JsValue::from_f64(v as f64),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "durationMs", duration_ms.clone());
+                set(&entry, "duration_ms", duration_ms);
+                set(&entry, "fileSizeBytes", (it.file_size_bytes as f64).into());
+                set(&entry, "file_size_bytes", (it.file_size_bytes as f64).into());
+                let plate_text = match &it.plate_text {
+                    Some(v) => v.clone().into(),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "plateText", plate_text.clone());
+                set(&entry, "plate_text", plate_text);
+                let adr_text = match &it.adr_text {
+                    Some(v) => v.clone().into(),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "adrText", adr_text.clone());
+                set(&entry, "adr_text", adr_text);
+                items.push(&entry);
+            }
+            set(obj, "items", items.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsRequest(req) => {
+            set(obj, "variant", "MlStudioRecogImportRecordingsRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            let refs = js_sys::Array::new();
+            for r in &req.recording_refs {
+                refs.push(&JsValue::from_str(r));
+            }
+            set(obj, "recordingRefs", refs.clone().into());
+            set(obj, "recording_refs", refs.into());
+            set(obj, "fps", req.fps.into());
+            set(obj, "autolabel", req.autolabel.into());
+            set(obj, "collision", req.collision.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsResponse(resp) => {
+            set(obj, "variant", "MlStudioRecogImportRecordingsResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusRequest(req) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogImportRecordingsStatusRequest".into(),
+            );
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusResponse(resp) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogImportRecordingsStatusResponse".into(),
+            );
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "recordingsTotal", resp.recordings_total.into());
+            set(obj, "recordings_total", resp.recordings_total.into());
+            set(obj, "recordingsDone", resp.recordings_done.into());
+            set(obj, "recordings_done", resp.recordings_done.into());
+            set(obj, "framesExtracted", (resp.frames_extracted as f64).into());
+            set(obj, "frames_extracted", (resp.frames_extracted as f64).into());
+            set(obj, "framesLabeled", (resp.frames_labeled as f64).into());
+            set(obj, "frames_labeled", (resp.frames_labeled as f64).into());
+            set(obj, "imagesAdded", (resp.images_added as f64).into());
+            set(obj, "images_added", (resp.images_added as f64).into());
+            set(obj, "detections", (resp.detections as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            let outcomes = js_sys::Array::new();
+            for o in &resp.outcomes {
+                let entry = js_sys::Object::new();
+                set(&entry, "recordingRef", o.recording_ref.clone().into());
+                set(&entry, "recording_ref", o.recording_ref.clone().into());
+                set(&entry, "frames", (o.frames as f64).into());
+                set(&entry, "detections", (o.detections as f64).into());
+                set(&entry, "skippedFrames", (o.skipped_frames as f64).into());
+                set(&entry, "skipped_frames", (o.skipped_frames as f64).into());
+                let skipped = match &o.skipped {
+                    Some(v) => v.clone().into(),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "skipped", skipped);
+                outcomes.push(&entry);
+            }
+            set(obj, "outcomes", outcomes.into());
         }
     }
 }

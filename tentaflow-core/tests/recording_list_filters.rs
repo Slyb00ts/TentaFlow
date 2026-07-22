@@ -1,6 +1,6 @@
 // ============ tests/recording_list_filters.rs — recordings-browser search SQL ============
 //
-// Proves the server-side filters added to `list_recordings_for_addon` for the
+// Proves the server-side filters added to `list_recordings` for the
 // recordings browser search: date range (`created_from`/`created_to` over
 // `created_at`), case-insensitive plate substring, and ADR substring — each in
 // isolation and composed. The plate/ADR columns are the ones the per-vehicle
@@ -77,11 +77,12 @@ fn filters_by_plate_case_insensitive_substring() {
 
     // Lowercase query matches the uppercase stored plate (NOCASE) as a substring.
     let filters = RecordingListFilters {
+        owner_addon_id: Some(ADDON),
         kind: Some("segment"),
         plate: Some("gm123"),
         ..Default::default()
     };
-    let rows = repo::list_recordings_for_addon(&pool, ADDON, Some(ORG), &filters, 100).unwrap();
+    let rows = repo::list_recordings(&pool, Some(ORG), &filters, 100).unwrap();
     assert_eq!(refs(&rows), vec!["clip_a".to_string()]);
 }
 
@@ -92,11 +93,12 @@ fn filters_by_adr_substring() {
     insert_event(&pool, "clip_b", "cam-1", None, Some("33/1088"), 2_000);
 
     let filters = RecordingListFilters {
+        owner_addon_id: Some(ADDON),
         kind: Some("segment"),
         adr: Some("1202"),
         ..Default::default()
     };
-    let rows = repo::list_recordings_for_addon(&pool, ADDON, Some(ORG), &filters, 100).unwrap();
+    let rows = repo::list_recordings(&pool, Some(ORG), &filters, 100).unwrap();
     assert_eq!(refs(&rows), vec!["clip_a".to_string()]);
 }
 
@@ -109,12 +111,13 @@ fn filters_by_created_at_range() {
 
     // Inclusive bounds keep only the middle row; results are newest-first.
     let filters = RecordingListFilters {
+        owner_addon_id: Some(ADDON),
         kind: Some("segment"),
         created_from: Some(2_000),
         created_to: Some(8_000),
         ..Default::default()
     };
-    let rows = repo::list_recordings_for_addon(&pool, ADDON, Some(ORG), &filters, 100).unwrap();
+    let rows = repo::list_recordings(&pool, Some(ORG), &filters, 100).unwrap();
     assert_eq!(refs(&rows), vec!["clip_mid".to_string()]);
 }
 
@@ -149,6 +152,7 @@ fn filters_compose_with_and() {
     );
 
     let filters = RecordingListFilters {
+        owner_addon_id: Some(ADDON),
         kind: Some("segment"),
         created_from: Some(4_000),
         created_to: Some(6_000),
@@ -156,7 +160,7 @@ fn filters_compose_with_and() {
         adr: Some("1202"),
         ..Default::default()
     };
-    let rows = repo::list_recordings_for_addon(&pool, ADDON, Some(ORG), &filters, 100).unwrap();
+    let rows = repo::list_recordings(&pool, Some(ORG), &filters, 100).unwrap();
     assert_eq!(refs(&rows), vec!["clip_hit".to_string()]);
 }
 
@@ -170,11 +174,12 @@ fn plate_like_metacharacters_are_escaped() {
     insert_event(&pool, "clip_plain", "cam-1", Some("ABXCD"), None, 2_000);
 
     let filters = RecordingListFilters {
+        owner_addon_id: Some(ADDON),
         kind: Some("segment"),
         plate: Some("AB%CD"),
         ..Default::default()
     };
-    let rows = repo::list_recordings_for_addon(&pool, ADDON, Some(ORG), &filters, 100).unwrap();
+    let rows = repo::list_recordings(&pool, Some(ORG), &filters, 100).unwrap();
     assert_eq!(refs(&rows), vec!["clip_pct".to_string()]);
 }
 
@@ -191,10 +196,11 @@ fn insert_populates_search_columns_and_thumbs() {
         1_000,
     );
     let filters = RecordingListFilters {
+        owner_addon_id: Some(ADDON),
         kind: Some("segment"),
         ..Default::default()
     };
-    let rows = repo::list_recordings_for_addon(&pool, ADDON, Some(ORG), &filters, 100).unwrap();
+    let rows = repo::list_recordings(&pool, Some(ORG), &filters, 100).unwrap();
     assert_eq!(rows.len(), 1);
     let r = &rows[0];
     assert_eq!(r.plate_text.as_deref(), Some("WGM12345"));

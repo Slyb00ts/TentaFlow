@@ -22836,14 +22836,17 @@ pub fn get_recording_for_addon(
     Ok(row)
 }
 
-/// Optional server-side filters for [`list_recordings_for_addon`]. Every field
-/// is `None` = "no filter"; they compose with AND. Dates are unix SECONDS
+/// Optional server-side filters for [`list_recordings`]. Every field is
+/// `None` = "no filter"; they compose with AND. Dates are unix SECONDS
 /// (matching `recordings.created_at`); `plate`/`adr` are case-insensitive
 /// substring (`LIKE %x%`) matches against the indexed `plate_text`/`adr_text`
-/// columns written by the event recorder.
+/// columns written by the event recorder. `owner_addon_id` scopes to a single
+/// owning addon (`Some`, reproducing the per-addon browser listing) or lists the
+/// whole node (`None`, org-bounded only); the org boundary is always enforced.
 #[cfg(feature = "camera")]
 #[derive(Debug, Default, Clone)]
 pub struct RecordingListFilters<'a> {
+    pub owner_addon_id: Option<&'a str>,
     pub kind: Option<&'a str>,
     pub camera_id: Option<&'a str>,
     pub created_from: Option<i64>,
@@ -22867,15 +22870,16 @@ fn like_contains(needle: &str) -> String {
     format!("%{escaped}%")
 }
 
-/// Lists active recordings owned by `addon_id`, newest first, applying the
-/// optional [`RecordingListFilters`]. `kind` filters to one recording kind
-/// (`"segment"` / `"snapshot"`); `None` returns both. `limit` caps the row count
-/// so a dashboard list never pulls an unbounded catalog into memory. The org
-/// scope mirrors `get_recording_for_addon` so cross-tenant rows cannot leak.
+/// Lists active recordings, newest first, applying the optional
+/// [`RecordingListFilters`]. `owner_addon_id = Some` scopes to one owning addon
+/// (the per-addon browser listing); `None` lists the whole node. `kind` filters to
+/// one recording kind (`"segment"` / `"snapshot"`); `None` returns both. `limit`
+/// caps the row count so a dashboard list never pulls an unbounded catalog into
+/// memory. The org scope is ALWAYS enforced (mirrors `get_recording_for_addon`) so
+/// cross-tenant rows cannot leak.
 #[cfg(feature = "camera")]
-pub fn list_recordings_for_addon(
+pub fn list_recordings(
     pool: &DbPool,
-    addon_id: &str,
     org_id: Option<&str>,
     filters: &RecordingListFilters<'_>,
     limit: u32,
@@ -22884,14 +22888,15 @@ pub fn list_recordings_for_addon(
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     // Bind params positionally; the optional filters are appended in a fixed
     // order so the placeholder indices stay stable regardless of which are set.
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(addon_id.to_string()),
-        Box::new(resolved_org.to_string()),
-    ];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(resolved_org.to_string())];
     let mut sql = format!(
         "SELECT {RECORDING_SELECT_COLS} FROM recordings \
-         WHERE owner_addon_id = ?1 AND org_id = ?2 AND purged_at IS NULL"
+         WHERE org_id = ?1 AND purged_at IS NULL"
     );
+    if let Some(addon_id) = filters.owner_addon_id {
+        params.push(Box::new(addon_id.to_string()));
+        sql.push_str(&format!(" AND owner_addon_id = ?{}", params.len()));
+    }
     if let Some(k) = filters.kind {
         params.push(Box::new(k.to_string()));
         sql.push_str(&format!(" AND kind = ?{}", params.len()));

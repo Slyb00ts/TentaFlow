@@ -38,7 +38,7 @@ use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmC
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
-    get_camera_for_addon, get_recording_for_addon, insert_recording, list_recordings_for_addon,
+    get_camera_for_addon, get_recording_for_addon, insert_recording, list_recordings,
     recording_stats_for_addon, soft_delete_recording, RecordingListFilters,
     RecordingStatsAggregate,
 };
@@ -1383,6 +1383,7 @@ fn list_core(state: &AddonState, input: &RecordingListInput) -> CoreResult<Recor
     let created_from = input.date_from.map(|ms| ms / 1000);
     let created_to = input.date_to.map(|ms| ms / 1000);
     let filters = RecordingListFilters {
+        owner_addon_id: Some(&state.addon_id),
         kind: Some("segment"),
         camera_id: input.camera_id.as_deref(),
         created_from,
@@ -1390,13 +1391,7 @@ fn list_core(state: &AddonState, input: &RecordingListInput) -> CoreResult<Recor
         plate: input.plate.as_deref(),
         adr: input.adr.as_deref(),
     };
-    let rows = match list_recordings_for_addon(
-        &state.db,
-        &state.addon_id,
-        state.org_id.as_deref(),
-        &filters,
-        limit,
-    ) {
+    let rows = match list_recordings(&state.db, state.org_id.as_deref(), &filters, limit) {
         Ok(r) => r,
         Err(_) => {
             audit(

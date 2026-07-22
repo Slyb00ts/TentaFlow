@@ -2456,6 +2456,243 @@ pub struct MlStudioDistillGenerateStatusResponse {
     pub samples: Vec<MlStudioDistillQaPair>,
 }
 
+// ---------------------------------------------------------------------------
+// Project export/import — pakowanie całego projektu ML Studio (datasety, klasy,
+// opcjonalnie modele i historia) do archiwum i odtwarzanie po stronie klienta.
+// ---------------------------------------------------------------------------
+
+/// Podsumowanie datasetu wykryte w podglądzie importowanego archiwum.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioImportDatasetInfo {
+    pub dataset_id: String,
+    pub name: String,
+    pub image_count: u64,
+    pub annotation_count: u64,
+}
+
+/// Artefakt zadeklarowany w manifeście archiwum, którego brakuje w paczce.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioImportMissingArtifact {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Pojedyncze nagranie dostępne do zaimportowania jako źródło klatek datasetu.
+/// `created_at` to unix w MILISEKUNDACH.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingItem {
+    pub recording_ref: String,
+    pub kind: String,
+    pub camera_id: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
+    pub file_size_bytes: i64,
+    #[serde(default)]
+    pub plate_text: Option<String>,
+    #[serde(default)]
+    pub adr_text: Option<String>,
+}
+
+/// Start pakowania projektu. Job w tle buduje archiwum; postęp przez
+/// `MlStudioProjectExportStatusRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStartRequest {
+    pub project_id: String,
+    pub include_models: bool,
+    pub include_history: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStartResponse {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStatusRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub files_total: u64,
+    pub files_done: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub export_ref: Option<String>,
+    #[serde(default)]
+    pub signed_url: Option<String>,
+    #[serde(default)]
+    pub archive_bytes: Option<u64>,
+}
+
+/// Jeden fragment przesyłanego archiwum projektu. Duże paczki przekraczają limit
+/// pojedynczej ramki WS, więc klient dzieli plik na części `seq` (0..total_chunks).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadChunkRequest {
+    pub upload_id: String,
+    pub seq: u32,
+    pub total_chunks: u32,
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadChunkResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadStatusRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadStatusResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub total_chunks: u32,
+    pub complete: bool,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportPreviewRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportPreviewResponse {
+    pub project_name: String,
+    pub project_type: String,
+    pub datasets: Vec<MlStudioImportDatasetInfo>,
+    pub classes: Vec<String>,
+    pub has_models: bool,
+    pub has_history: bool,
+    pub total_uncompressed_bytes: u64,
+    pub missing_artifacts: Vec<MlStudioImportMissingArtifact>,
+    pub archive_version: u32,
+}
+
+/// Zatwierdzenie importu. `mode`: "new_project" | "merge".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportApplyRequest {
+    pub upload_id: String,
+    pub mode: String,
+    #[serde(default)]
+    pub name_override: Option<String>,
+    #[serde(default)]
+    pub target_project_id: Option<String>,
+    #[serde(default)]
+    pub target_dataset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportApplyResponse {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportStatusRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub files_total: u64,
+    pub files_done: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportCancelRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportCancelResponse {
+    pub cancelled: bool,
+}
+
+/// Lista nagrań filtrowana po kamerze i zakresie czasu (unix w milisekundach).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingsListRequest {
+    #[serde(default)]
+    pub camera_id: Option<String>,
+    #[serde(default)]
+    pub date_from_ms: Option<i64>,
+    #[serde(default)]
+    pub date_to_ms: Option<i64>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingsListResponse {
+    pub items: Vec<MlStudioRecordingItem>,
+}
+
+/// Import nagrań do datasetu rozpoznawania: ekstrakcja klatek `fps`, opcjonalny
+/// autolabel. `collision`: "suffix" | "skip".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub recording_refs: Vec<String>,
+    pub fps: u32,
+    pub autolabel: bool,
+    pub collision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsResponse {
+    pub job_id: String,
+}
+
+/// Wynik importu pojedynczego nagrania. `skipped` = Some(powód) gdy pominięto.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingOutcome {
+    pub recording_ref: String,
+    pub frames: u64,
+    pub detections: u64,
+    pub skipped_frames: u64,
+    #[serde(default)]
+    pub skipped: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsStatusRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub recordings_total: u32,
+    pub recordings_done: u32,
+    pub frames_extracted: u64,
+    pub frames_labeled: u64,
+    pub images_added: u64,
+    pub detections: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub outcomes: Vec<MlStudioRecordingOutcome>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -2568,6 +2805,28 @@ pub enum MlStudioPayload {
     VisionModelsListResponse(MlStudioVisionModelsListResponse),
     VisionModelDeleteRequest(MlStudioVisionModelDeleteRequest),
     VisionModelDeleteResponse(MlStudioVisionModelDeleteResponse),
+    ProjectExportStartRequest(MlStudioProjectExportStartRequest),
+    ProjectExportStartResponse(MlStudioProjectExportStartResponse),
+    ProjectExportStatusRequest(MlStudioProjectExportStatusRequest),
+    ProjectExportStatusResponse(MlStudioProjectExportStatusResponse),
+    ProjectImportUploadChunkRequest(MlStudioProjectImportUploadChunkRequest),
+    ProjectImportUploadChunkResponse(MlStudioProjectImportUploadChunkResponse),
+    ProjectImportUploadStatusRequest(MlStudioProjectImportUploadStatusRequest),
+    ProjectImportUploadStatusResponse(MlStudioProjectImportUploadStatusResponse),
+    ProjectImportPreviewRequest(MlStudioProjectImportPreviewRequest),
+    ProjectImportPreviewResponse(MlStudioProjectImportPreviewResponse),
+    ProjectImportApplyRequest(MlStudioProjectImportApplyRequest),
+    ProjectImportApplyResponse(MlStudioProjectImportApplyResponse),
+    ProjectImportStatusRequest(MlStudioProjectImportStatusRequest),
+    ProjectImportStatusResponse(MlStudioProjectImportStatusResponse),
+    ProjectImportCancelRequest(MlStudioProjectImportCancelRequest),
+    ProjectImportCancelResponse(MlStudioProjectImportCancelResponse),
+    RecordingsListRequest(MlStudioRecordingsListRequest),
+    RecordingsListResponse(MlStudioRecordingsListResponse),
+    RecogImportRecordingsRequest(MlStudioRecogImportRecordingsRequest),
+    RecogImportRecordingsResponse(MlStudioRecogImportRecordingsResponse),
+    RecogImportRecordingsStatusRequest(MlStudioRecogImportRecordingsStatusRequest),
+    RecogImportRecordingsStatusResponse(MlStudioRecogImportRecordingsStatusResponse),
 }
 
 // ----- Robots screen (UserSession) -----

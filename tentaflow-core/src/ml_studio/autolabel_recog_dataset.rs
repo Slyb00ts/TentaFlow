@@ -82,15 +82,17 @@ pub fn autolabel_progress(job_id: &str) -> Option<AutolabelProgress> {
     progress_map().lock().ok()?.get(job_id).cloned()
 }
 
-// Per-dataset guard: only one auto-label may run at a time for a given dataset. A
-// second concurrent request for the same dataset is rejected.
+// Per-dataset guard shared by auto-label AND recording-import: only one such job
+// may run at a time for a given dataset, because both republish the same
+// `_annotations.coco.json` and must never interleave. A second concurrent request
+// for the same dataset (of either kind) is rejected.
 static ACTIVE: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
 fn active() -> &'static Mutex<std::collections::HashSet<String>> {
     ACTIVE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-fn try_claim_dataset(dataset_id: &str) -> bool {
+pub(crate) fn try_claim_dataset(dataset_id: &str) -> bool {
     if let Ok(mut s) = active().lock() {
         s.insert(dataset_id.to_string())
     } else {
@@ -98,7 +100,7 @@ fn try_claim_dataset(dataset_id: &str) -> bool {
     }
 }
 
-fn release_dataset(dataset_id: &str) {
+pub(crate) fn release_dataset(dataset_id: &str) {
     if let Ok(mut s) = active().lock() {
         s.remove(dataset_id);
     }
