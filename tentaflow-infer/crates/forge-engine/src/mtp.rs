@@ -382,6 +382,9 @@ pub struct MtpDraftState {
     empty_page_table: DevBuffer,
     zero_scalar: DevBuffer,
     checkpoint_hidden: DevBuffer,
+    checkpoint_page_table: DevBuffer,
+    checkpoint_seq_len: DevBuffer,
+    checkpoint_position: DevBuffer,
     step_hidden: DevBuffer,
     checkpoint_len: Option<usize>,
     host_embedding_gathers: u64,
@@ -479,6 +482,13 @@ impl MtpDraftState {
             empty_page_table,
             zero_scalar,
             checkpoint_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
+            checkpoint_page_table: device.alloc(
+                max_pages_per_seq * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?,
+            checkpoint_seq_len: device.alloc(4, MemKind::Device, Pool::Activations)?,
+            checkpoint_position: device.alloc(4, MemKind::Device, Pool::Activations)?,
             step_hidden: device.alloc(4 * hidden_bytes, MemKind::Device, Pool::Activations)?,
             device,
             seq,
@@ -515,7 +525,62 @@ impl MtpDraftState {
             self.recurrent_hidden.len(),
             stream,
         )?;
+        self.device.copy(
+            &self.page_table,
+            0,
+            &self.checkpoint_page_table,
+            0,
+            self.page_table.len(),
+            stream,
+        )?;
+        self.device.copy(
+            &self.seq_len,
+            0,
+            &self.checkpoint_seq_len,
+            0,
+            4,
+            stream,
+        )?;
+        self.device.copy(
+            &self.position,
+            0,
+            &self.checkpoint_position,
+            0,
+            4,
+            stream,
+        )?;
         self.checkpoint_len = Some(self.seq.len);
+        Ok(())
+    }
+
+    /// Zeruje pusty runtime w ramach aktywnej transakcji bez kasowania checkpointu.
+    pub fn reset_pending(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
+        if self.checkpoint_len != Some(0) || self.seq.len != 0 || !self.seq.pages.is_empty() {
+            return Err(ForgeError::Scheduler(
+                "MTP: transakcyjny reset wymaga pustego checkpointu".into(),
+            ));
+        }
+        self.device.copy(
+            &self.zero_hidden,
+            0,
+            &self.recurrent_hidden,
+            0,
+            self.recurrent_hidden.len(),
+            stream,
+        )?;
+        self.device.copy(
+            &self.empty_page_table,
+            0,
+            &self.page_table,
+            0,
+            self.page_table.len(),
+            stream,
+        )?;
+        self.device
+            .copy(&self.zero_scalar, 0, &self.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.zero_scalar, 0, &self.position, 0, 4, stream)?;
+        kv.release(&mut self.seq);
         Ok(())
     }
 
@@ -609,6 +674,30 @@ impl MtpDraftState {
             self.recurrent_hidden.len(),
             stream,
         )?;
+        self.device.copy(
+            &self.checkpoint_page_table,
+            0,
+            &self.page_table,
+            0,
+            self.page_table.len(),
+            stream,
+        )?;
+        self.device.copy(
+            &self.checkpoint_seq_len,
+            0,
+            &self.seq_len,
+            0,
+            4,
+            stream,
+        )?;
+        self.device.copy(
+            &self.checkpoint_position,
+            0,
+            &self.position,
+            0,
+            4,
+            stream,
+        )?;
         kv.rollback(&mut self.seq, len);
         self.checkpoint_len = None;
         Ok(())
@@ -680,6 +769,12 @@ impl MtpDraftState {
 
     /// Zatwierdza sekwencyjny catch-up wykonany od aktywnego checkpointu.
     pub fn commit_catchup(&mut self, retained: usize) -> Result<()> {
+        self.validate_commit_catchup(retained)?;
+        self.apply_commit_catchup();
+        Ok(())
+    }
+
+    pub(crate) fn validate_commit_catchup(&self, retained: usize) -> Result<()> {
         let base = self.checkpoint_len.ok_or_else(|| {
             ForgeError::Scheduler("MTP: commit catch-up bez aktywnego checkpointu".into())
         })?;
@@ -689,8 +784,11 @@ impl MtpDraftState {
                 self.seq.len
             )));
         }
-        self.checkpoint_len = None;
         Ok(())
+    }
+
+    pub(crate) fn apply_commit_catchup(&mut self) {
+        self.checkpoint_len = None;
     }
 
     pub fn checkpoint_len(&self) -> Option<usize> {

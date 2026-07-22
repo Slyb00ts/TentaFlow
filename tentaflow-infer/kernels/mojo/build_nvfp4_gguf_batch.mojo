@@ -9,6 +9,7 @@ from std.gpu.host import DeviceContext
 from std.pathlib import Path
 from src.nvfp4_gguf_batch import (
     gemm_nvfp4_gguf_f16_b2,
+    gemm_nvfp4_gguf_out_f32_b2,
     gemm_nvfp4_gguf_f16_b3,
     gemm_nvfp4_gguf_f16_b4,
     gemm_nvfp4_gguf_f16_b1_nvidia,
@@ -45,6 +46,11 @@ def main() raises:
         dump_asm=Path("gemm_nvfp4_gguf_f16_b2.ptx"),
     ]()
     _finalize(out_dir, "gemm_nvfp4_gguf_f16_b2")
+    _ = ctx.compile_function[
+        gemm_nvfp4_gguf_out_f32_b2,
+        dump_asm=Path("gemm_nvfp4_gguf_out_f32_b2.ptx"),
+    ]()
+    _finalize(out_dir, "gemm_nvfp4_gguf_out_f32_b2")
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_f16_b3,
         dump_asm=Path("gemm_nvfp4_gguf_f16_b3.ptx"),

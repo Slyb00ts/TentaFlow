@@ -176,6 +176,65 @@ def gemm_nvfp4_gguf_f16_small_impl[token_tile: Int](
             y[token * n_rows + row] = Float16(total * output_scale)
 
 
+def gemm_nvfp4_gguf_out_f32_b2(
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    output_scale: Float32,
+):
+    """Liczy dwa wiersze logitow F32 jednym odczytem wag na warp."""
+    row = Int(block_idx.x)
+    if row >= n_rows:
+        return
+
+    lane = Int(thread_idx.x)
+    blocks_per_row = n_cols // 64
+    row_base = row * blocks_per_row * 36
+    var acc0: Float32 = 0.0
+    var acc1: Float32 = 0.0
+    var group = lane
+    while group < blocks_per_row * 4:
+        block = group // 4
+        subblock = group % 4
+        base = row_base + block * 36
+        codes = (weights + base + 4 + subblock * 8).load[
+            width=8, alignment=4
+        ]()
+        low = _e2m1x8(codes & 0x0F)
+        high = _e2m1x8(codes >> 4)
+        scale = _ue4m3_value(weights[base + subblock])
+        column = block * 64 + subblock * 16
+        x0_low = (x + column).load[width=8, alignment=16]().cast[
+            DType.float32
+        ]()
+        x0_high = (x + column + 8).load[width=8, alignment=16]().cast[
+            DType.float32
+        ]()
+        x1_low = (x + n_cols + column).load[width=8, alignment=16]().cast[
+            DType.float32
+        ]()
+        x1_high = (x + n_cols + column + 8).load[
+            width=8, alignment=16
+        ]().cast[DType.float32]()
+        acc0 += scale * (
+            (low * x0_low).reduce_add() + (high * x0_high).reduce_add()
+        )
+        acc1 += scale * (
+            (low * x1_low).reduce_add() + (high * x1_high).reduce_add()
+        )
+        group += WARP_SIZE
+
+    total0 = warp.sum(acc0)
+    total1 = warp.sum(acc1)
+    if lane == 0:
+        y[row] = total0 * output_scale
+        if n_tokens > 1:
+            y[n_rows + row] = total1 * output_scale
+
+
 def gemm_nvfp4_gguf_f16_nvidia_impl[token_tile: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],

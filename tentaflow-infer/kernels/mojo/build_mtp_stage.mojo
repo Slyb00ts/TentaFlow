@@ -11,7 +11,7 @@ from src.mtp import mtp_stage_step, mtp_norm_join_shifted_f16, mtp_norm_join_shi
 from src.misc import gather_rows_f16
 from src.prefill import kv_append_batch_segmented_f16, kv_append_batch_segmented_masked_f16
 from src.attention import attn_verify_segmented_f16_hd256, attn_verify_segmented_f16_hd256_warp32
-from src.deltanet_verify import deltanet_prepare_segmented_f16, deltanet_gated_scan_segmented_d128_f16, deltanet_commit_checkpoint_segmented_f32, deltanet_gated_scan_segmented_shared_d128_f16, deltanet_commit_recompute_segmented_shared_d128_f32
+from src.deltanet_verify import deltanet_prepare_segmented_f16, deltanet_prepare_segmented_final_f16, deltanet_gated_scan_segmented_d128_f16, deltanet_commit_checkpoint_segmented_f32, deltanet_gated_scan_segmented_shared_d128_f16, deltanet_commit_recompute_segmented_shared_d128_f32
 from src.nvfp4_gguf_batch import gemm_nvfp4_gguf_f16_b8_nvidia
 from src.q8_0_batch import gemm_q8_0_i8mma_b8, gemm_q8_0_f16_exact_out_f32_b8
 
@@ -111,6 +111,14 @@ def main() raises:
     ]()
     source = Path("deltanet_prepare_segmented_f16.ptx")
     target = out_dir / "deltanet_prepare_segmented_f16.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
+        deltanet_prepare_segmented_final_f16,
+        dump_asm=Path("deltanet_prepare_segmented_final_f16.ptx"),
+    ]()
+    source = Path("deltanet_prepare_segmented_final_f16.ptx")
+    target = out_dir / "deltanet_prepare_segmented_final_f16.ptx"
     target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
     os.remove(String(source))
     _ = ctx.compile_function[

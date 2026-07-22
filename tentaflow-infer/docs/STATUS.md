@@ -22,6 +22,26 @@ Ostatnia aktualizacja: 2026-07-22.
   słownika 151936: greedy 6,99 us, top-k 20 z karą 53,73 us, top-k 64 z karą
   160,05 us.
 
+- 🟡 **Hybrydowy prefill NVFP4 B2 T32 w Mojo (2026-07-22).** Scheduler może
+  połączyć dokładnie dwa requesty i wykonać segmenty `B=2`, `T=32`; funkcja
+  pozostaje domyślnie wyłączona przez `FORGE_HYBRID_PREFILL_BATCH=0`. Capability
+  wykonawcze wymaga NVIDIA warp32. Jawne włączenie na NVIDIA warp64, AMD,
+  Apple albo CPU zwraca `Unsupported` przed routingiem do PTX. Źródła Mojo są
+  przygotowane do dalszego portowania, lecz AMD i Metal nie zostały wykonawczo
+  zweryfikowane. Target B2 zachowuje pełne ID i bitowy parytet z dwoma
+  seryjnymi lane; rollback i awaria rollbacku obejmują całą parę, a ta druga
+  zatruwa i poddaje kwarantannie oba stany MTP oraz wspólny cache. Catch-up MTP
+  nadal ma dwa seryjne przebiegi macierzowe lane po lane. Scratch wynosi
+  450 692 688 B (429,81 MiB). Profil samplowania GPU dla dwóch requestów po
+  osiem tokenów zawierał 18 150 launchy, osiem synchronizacji oraz osiem
+  transferów D2H po 8 B, bez transferu logitów całego słownika.
+  Pięć końcowych prób raw128 dało medianę ON/OFF **309,5/248,6 tok/s**, TTFT
+  **827,24/1029,78 ms** i E2E **1120,08/1322,54 ms**. Raw512 ON dało
+  **320,5/320,2/319,9/320,0/320,2 tok/s** z medianą **320,2 tok/s**, TTFT
+  **3198,02 ms** i E2E **3505,75 ms**; odniesienie OFF wyniosło **251,4
+  tok/s**, około **4073 ms TTFT** i **4380 ms E2E**. Artefakty `/tmp` nie są
+  wersjonowane.
+
 - 🟡 **Natywne Qwen3.5/3.6 MTP/NextN dla gęstego NVFP4 GGUF
   (2026-07-22).** Rejestr `qwen35` oddziela blok `nextn_predict_layers` od
   64-warstwowego trunku `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF` bez

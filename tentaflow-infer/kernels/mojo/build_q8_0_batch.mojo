@@ -11,7 +11,7 @@ from src.q8_0_batch import gemm_q8_0_i8mma_b2, gemm_q8_0_i8mma_b3, gemm_q8_0_i8m
 from src.q8_0_batch import gemm_q8_0_i8mma_out_f32_b3, gemm_q8_0_i8mma_out_f32_b4
 from src.q8_0_batch import gemm_q8_0_dp4a_b3_nvidia, gemm_q8_0_dp4a_b4_nvidia
 from src.q8_0_batch import gemm_q8_0_dp4a_out_f32_b3_nvidia, gemm_q8_0_dp4a_out_f32_b4_nvidia
-from src.q8_0_batch import gemm_q8_0_f16_exact_out_f32_b3, gemm_q8_0_f16_exact_out_f32_b4
+from src.q8_0_batch import gemm_q8_0_f16_exact_out_f32_b2, gemm_q8_0_f16_exact_out_f32_b3, gemm_q8_0_f16_exact_out_f32_b4
 
 
 def _finalize(out_dir: Path, name: StringSlice) raises:
@@ -68,6 +68,11 @@ def main() raises:
         dump_asm=Path("gemm_q8_0_dp4a_out_f32_b4_nvidia.ptx"),
     ]()
     _finalize(out_dir, "gemm_q8_0_dp4a_out_f32_b4_nvidia")
+    _ = ctx.compile_function[
+        gemm_q8_0_f16_exact_out_f32_b2,
+        dump_asm=Path("gemm_q8_0_f16_exact_out_f32_b2.ptx"),
+    ]()
+    _finalize(out_dir, "gemm_q8_0_f16_exact_out_f32_b2")
     _ = ctx.compile_function[
         gemm_q8_0_f16_exact_out_f32_b3,
         dump_asm=Path("gemm_q8_0_f16_exact_out_f32_b3.ptx"),

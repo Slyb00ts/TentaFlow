@@ -901,6 +901,138 @@ fn gpu_pack_q8_0_nvfp4_i_gemv_f32_zgadza_sie_z_referencja() {
     assert_eq!(top(&got), top(&reference));
 }
 
+#[test]
+fn gpu_nvfp4_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (257usize, 128usize);
+    let q8 = make_q8_0(rows, cols);
+    let packed_bytes = rows * (cols / 64) * 36;
+    let source = dev.alloc(q8.len(), MemKind::Device, Pool::Weights).unwrap();
+    let packed = dev
+        .alloc(packed_bytes, MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&q8, &source, 0).unwrap();
+    kernels
+        .pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)
+        .unwrap();
+    let first: Vec<f32> = (0..cols).map(|index| fill(index) * 0.03125).collect();
+    let second: Vec<f32> = (0..cols)
+        .map(|index| fill(index + 11) * -0.046875)
+        .collect();
+    let first_dev = upload_f16(dev.as_ref(), &first);
+    let second_dev = upload_f16(dev.as_ref(), &second);
+    let mut joined = first.clone();
+    joined.extend_from_slice(&second);
+    let joined_dev = upload_f16(dev.as_ref(), &joined);
+    let first_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let second_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let batch_logits = dev
+        .alloc(2 * rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    kernels
+        .gemv_nvfp4_gguf_out_f32(
+            &first_logits,
+            &packed,
+            &first_dev,
+            rows,
+            cols,
+            1.0,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemv_nvfp4_gguf_out_f32(
+            &second_logits,
+            &packed,
+            &second_dev,
+            rows,
+            cols,
+            1.0,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemm_nvfp4_gguf_out_f32_b2(
+            &batch_logits,
+            &packed,
+            &joined_dev,
+            rows,
+            cols,
+            1.0,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+    let mut expected = download_f32(dev.as_ref(), &first_logits, rows);
+    expected.extend(download_f32(dev.as_ref(), &second_logits, rows));
+    assert_eq!(download_f32(dev.as_ref(), &batch_logits, 2 * rows), expected);
+}
+
+#[test]
+fn gpu_q8_0_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (257usize, 128usize);
+    let weights = make_q8_0(rows, cols);
+    let weights_dev = dev
+        .alloc(weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&weights, &weights_dev, 0).unwrap();
+    let first: Vec<f32> = (0..cols).map(|index| fill(index) * 0.03125).collect();
+    let second: Vec<f32> = (0..cols)
+        .map(|index| fill(index + 11) * -0.046875)
+        .collect();
+    let first_dev = upload_f16(dev.as_ref(), &first);
+    let second_dev = upload_f16(dev.as_ref(), &second);
+    let mut joined = first.clone();
+    joined.extend_from_slice(&second);
+    let joined_dev = upload_f16(dev.as_ref(), &joined);
+    let first_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let second_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let batch_logits = dev
+        .alloc(2 * rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    kernels
+        .gemv_q8_0_out_f32(
+            &first_logits,
+            &weights_dev,
+            &first_dev,
+            rows,
+            cols,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemv_q8_0_out_f32(
+            &second_logits,
+            &weights_dev,
+            &second_dev,
+            rows,
+            cols,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemm_q8_0_f16_exact_out_f32_at(
+            &batch_logits,
+            &weights_dev,
+            0,
+            &joined_dev,
+            rows,
+            cols,
+            2,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+    let mut expected = download_f32(dev.as_ref(), &first_logits, rows);
+    expected.extend(download_f32(dev.as_ref(), &second_logits, rows));
+    assert_eq!(download_f32(dev.as_ref(), &batch_logits, 2 * rows), expected);
+}
+
 fn q8_0_dot(weights: &[u8], row: usize, cols: usize, x: &[f32]) -> f32 {
     let blocks_per_row = cols / 32;
     let row_base = row * blocks_per_row * 34;

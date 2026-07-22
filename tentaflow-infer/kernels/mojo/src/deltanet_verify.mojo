@@ -272,6 +272,99 @@ def deltanet_prepare_segmented_f16(
     )
 
 
+def deltanet_prepare_segmented_final_f16(
+    q_out: UnsafePointer[Float16, MutAnyOrigin], k_out: UnsafePointer[Float16, MutAnyOrigin],
+    v_out: UnsafePointer[Float16, MutAnyOrigin], g_out: UnsafePointer[Float32, MutAnyOrigin],
+    beta_out: UnsafePointer[Float32, MutAnyOrigin], conv_final: UnsafePointer[Float16, MutAnyOrigin],
+    conv_initial: UnsafePointer[Float16, MutAnyOrigin], qkv_mixed: UnsafePointer[Float16, MutAnyOrigin],
+    conv_weight: UnsafePointer[Float16, MutAnyOrigin], alpha_raw: UnsafePointer[Float16, MutAnyOrigin],
+    beta_raw: UnsafePointer[Float16, MutAnyOrigin], dt_bias: UnsafePointer[Float16, MutAnyOrigin],
+    a_scale: UnsafePointer[Float16, MutAnyOrigin], n_steps: Int, n_k_heads: Int,
+    n_v_heads: Int, d_state: Int, d_conv: Int, eps: Float32,
+):
+    """Przygotowuje segmenty i zapisuje wyłącznie końcowe okno conv."""
+    segment = Int(block_idx.y)
+    block = Int(block_idx.x)
+    thread = Int(thread_idx.x)
+    active = thread < d_state
+    conv_dim = (2 * n_k_heads + n_v_heads) * d_state
+    value_dim = n_v_heads * d_state
+    conv_elems = conv_dim * (d_conv - 1)
+    initial = conv_initial + segment * conv_elems
+    mixed = qkv_mixed + segment * n_steps * conv_dim
+    final = conv_final + segment * conv_elems
+    q_segment = q_out + segment * n_steps * value_dim
+    k_segment = k_out + segment * n_steps * value_dim
+    v_segment = v_out + segment * n_steps * value_dim
+    g_segment = g_out + segment * n_steps * n_v_heads
+    beta_segment = beta_out + segment * n_steps * n_v_heads
+    alpha_segment = alpha_raw + segment * n_steps * n_v_heads
+    beta_raw_segment = beta_raw + segment * n_steps * n_v_heads
+    window = d_conv - 1
+
+    if block < n_k_heads:
+        q_channel = block * d_state + thread
+        k_channel = n_k_heads * d_state + block * d_state + thread
+        repeats = n_v_heads // n_k_heads
+        for token in range(n_steps):
+            var q_value: Float32 = 0.0
+            var k_value: Float32 = 0.0
+            if active:
+                q_value = _deltanet_conv_value_f16(
+                    initial, mixed, conv_weight, q_channel, token, conv_dim, d_conv
+                )
+                k_value = _deltanet_conv_value_f16(
+                    initial, mixed, conv_weight, k_channel, token, conv_dim, d_conv
+                )
+                if token + 1 == n_steps:
+                    for slot in range(window):
+                        final[q_channel * window + slot] = Float16(
+                            _deltanet_conv_source_f16(
+                                initial, mixed, q_channel, token + slot + 1, conv_dim, window
+                            )
+                        )
+                        final[k_channel * window + slot] = Float16(
+                            _deltanet_conv_source_f16(
+                                initial, mixed, k_channel, token + slot + 1, conv_dim, window
+                            )
+                        )
+            q_inv = rsqrt(block_reduce_sum(q_value * q_value) + eps)
+            k_inv = rsqrt(block_reduce_sum(k_value * k_value) + eps)
+            if active:
+                for repeat in range(repeats):
+                    out_head = repeat * n_k_heads + block
+                    out_index = (token * n_v_heads + out_head) * d_state + thread
+                    q_segment[out_index] = Float16(q_value * q_inv)
+                    k_segment[out_index] = Float16(k_value * k_inv)
+    else:
+        v_head = block - n_k_heads
+        if v_head >= n_v_heads:
+            return
+        v_channel = 2 * n_k_heads * d_state + v_head * d_state + thread
+        for token in range(n_steps):
+            if active:
+                value = _deltanet_conv_value_f16(
+                    initial, mixed, conv_weight, v_channel, token, conv_dim, d_conv
+                )
+                out_index = (token * n_v_heads + v_head) * d_state + thread
+                v_segment[out_index] = Float16(value)
+                if token + 1 == n_steps:
+                    for slot in range(window):
+                        final[v_channel * window + slot] = Float16(
+                            _deltanet_conv_source_f16(
+                                initial, mixed, v_channel, token + slot + 1, conv_dim, window
+                            )
+                        )
+            if thread == 0:
+                gate_index = token * n_v_heads + v_head
+                alpha = Float32(alpha_segment[gate_index]) + Float32(dt_bias[v_head])
+                softplus = alpha if alpha > 20.0 else log(1.0 + exp(alpha))
+                g_segment[gate_index] = softplus * Float32(a_scale[v_head])
+                beta_segment[gate_index] = 1.0 / (
+                    1.0 + exp(-Float32(beta_raw_segment[gate_index]))
+                )
+
+
 def _deltanet_gated_scan_f16[steps: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     checkpoints: UnsafePointer[Float32, MutAnyOrigin],
@@ -569,6 +662,7 @@ def deltanet_gated_scan_segmented_d128_f16(
 
 def deltanet_gated_scan_segmented_shared_d128_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    state_out: UnsafePointer[Float32, MutAnyOrigin],
     state_in: UnsafePointer[Float32, MutAnyOrigin],
     q_in: UnsafePointer[Float16, MutAnyOrigin],
     k_in: UnsafePointer[Float16, MutAnyOrigin],
@@ -637,6 +731,11 @@ def deltanet_gated_scan_segmented_shared_d128_f16(
             output += sq[key] * state
         out_ptr[vector + j] = Float16(output * inv_sqrt)
         barrier()
+
+    for key in range(d_state):
+        state_out[state_base + key * d_state + j] = state_tile[
+            key * TILE_WIDTH + tid
+        ]
 
 
 def deltanet_commit_recompute_segmented_shared_d128_f32(

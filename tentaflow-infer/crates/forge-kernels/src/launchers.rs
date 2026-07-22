@@ -1298,6 +1298,118 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
+    /// Przygotowuje segmenty DeltaNet, zachowując tylko końcowe okno conv.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_prepare_segmented_final_f16(
+        &self,
+        q_out: &DevBuffer,
+        k_out: &DevBuffer,
+        v_out: &DevBuffer,
+        g_out: &DevBuffer,
+        beta_out: &DevBuffer,
+        conv_final: &DevBuffer,
+        conv_initial: &DevBuffer,
+        qkv_mixed: &DevBuffer,
+        conv_weight: &DevBuffer,
+        alpha_raw: &DevBuffer,
+        beta_raw: &DevBuffer,
+        dt_bias: &DevBuffer,
+        a_scale: &DevBuffer,
+        batch: usize,
+        n_steps: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        d_conv: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if [batch, n_steps, n_k_heads, n_v_heads, d_state, d_conv].contains(&0)
+            || d_state > 1024
+            || !n_v_heads.is_multiple_of(n_k_heads)
+        {
+            return Err(ForgeError::Kernel(
+                "segmentowane przygotowanie final wymaga poprawnych niezerowych wymiarów".into(),
+            ));
+        }
+        let total = batch
+            .checked_mul(n_steps)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie B×T DeltaNet final".into()))?;
+        let conv_dim = n_k_heads
+            .checked_mul(2)
+            .and_then(|heads| heads.checked_add(n_v_heads))
+            .and_then(|heads| heads.checked_mul(d_state))
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie conv_dim DeltaNet final".into()))?;
+        let value_dim = n_v_heads
+            .checked_mul(d_state)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie value_dim DeltaNet final".into()))?;
+        let conv_elems = conv_dim
+            .checked_mul(d_conv - 1)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie conv state DeltaNet final".into()))?;
+        let vector_bytes = checked_buffer_bytes("DeltaNet final vectors", &[total, value_dim], 2)?;
+        let gate_f32_bytes = checked_buffer_bytes("DeltaNet final gates", &[total, n_v_heads], 4)?;
+        let gate_f16_bytes = checked_buffer_bytes("DeltaNet final raw gates", &[total, n_v_heads], 2)?;
+        let conv_bytes = checked_buffer_bytes("DeltaNet final conv", &[batch, conv_elems], 2)?;
+        let mixed_bytes = checked_buffer_bytes("DeltaNet final mixed", &[total, conv_dim], 2)?;
+        let conv_weight_bytes =
+            checked_buffer_bytes("DeltaNet final conv weight", &[conv_dim, d_conv], 2)?;
+        let parameter_bytes = checked_buffer_bytes("DeltaNet final parameters", &[n_v_heads], 2)?;
+        if q_out.len() < vector_bytes
+            || k_out.len() < vector_bytes
+            || v_out.len() < vector_bytes
+            || g_out.len() < gate_f32_bytes
+            || beta_out.len() < gate_f32_bytes
+            || conv_final.len() < conv_bytes
+            || conv_initial.len() < conv_bytes
+            || qkv_mixed.len() < mixed_bytes
+            || alpha_raw.len() < gate_f16_bytes
+            || beta_raw.len() < gate_f16_bytes
+            || conv_weight.len() < conv_weight_bytes
+            || dt_bias.len() < parameter_bytes
+            || a_scale.len() < parameter_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "segmentowane przygotowanie final ma za mały bufor".into(),
+            ));
+        }
+        let grid_heads = n_k_heads
+            .checked_add(n_v_heads)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie grid.x DeltaNet final".into()))?;
+        let grid_x = u32::try_from(grid_heads)
+            .map_err(|_| ForgeError::Kernel("DeltaNet final grid.x przekracza u32".into()))?;
+        let grid_y = u32::try_from(batch)
+            .map_err(|_| ForgeError::Kernel("DeltaNet final grid.y przekracza u32".into()))?;
+        let block_x = u32::try_from(d_state.max(32))
+            .map_err(|_| ForgeError::Kernel("DeltaNet final block przekracza u32".into()))?;
+        let kernel = self.artifacts.get("deltanet_prepare_segmented_final_f16")?;
+        let config = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(q_out)
+            .buf(k_out)
+            .buf(v_out)
+            .buf(g_out)
+            .buf(beta_out)
+            .buf(conv_final)
+            .buf(conv_initial)
+            .buf(qkv_mixed)
+            .buf(conv_weight)
+            .buf(alpha_raw)
+            .buf(beta_raw)
+            .buf(dt_bias)
+            .buf(a_scale)
+            .scalar(n_steps as i64)
+            .scalar(n_k_heads as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64)
+            .scalar(d_conv as i64)
+            .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Skanuje niezależne stany D128 dla segmentów `[B,T]`.
     #[allow(clippy::too_many_arguments)]
     pub fn deltanet_gated_scan_segmented_d128_f16(
@@ -1353,6 +1465,7 @@ impl Kernels {
     pub fn deltanet_gated_scan_segmented_shared_d128_f16(
         &self,
         output: &DevBuffer,
+        final_states: &DevBuffer,
         states: &DevBuffer,
         q: &DevBuffer,
         k: &DevBuffer,
@@ -1365,24 +1478,62 @@ impl Kernels {
         d_state: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if batch == 0 || n_steps == 0 || d_state != 128 {
+        if batch == 0 || n_steps == 0 || n_v_heads == 0 || d_state != 128 {
             return Err(ForgeError::Kernel(
-                "współdzielony skan segmentowany wymaga B,T > 0 i d_state=128".into(),
+                "współdzielony skan segmentowany wymaga B,T,H > 0 i d_state=128".into(),
+            ));
+        }
+        let vector_bytes = checked_buffer_bytes(
+            "współdzielony skan segmentowany wektory",
+            &[batch, n_steps, n_v_heads, d_state],
+            2,
+        )?;
+        let state_bytes = checked_buffer_bytes(
+            "współdzielony skan segmentowany stany",
+            &[batch, n_v_heads, d_state, d_state],
+            4,
+        )?;
+        let gate_bytes = checked_buffer_bytes(
+            "współdzielony skan segmentowany bramki",
+            &[batch, n_steps, n_v_heads],
+            4,
+        )?;
+        if output.len() < vector_bytes
+            || final_states.len() < state_bytes
+            || states.len() < state_bytes
+            || q.len() < vector_bytes
+            || k.len() < vector_bytes
+            || v.len() < vector_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "współdzielony skan segmentowany ma za mały bufor".into(),
             ));
         }
         let grid_x = n_v_heads.checked_mul(2).ok_or_else(|| {
             ForgeError::Kernel("przepełnienie siatki współdzielonego skanu".into())
         })?;
+        let grid_x = u32::try_from(grid_x)
+            .map_err(|_| ForgeError::Kernel("siatka współdzielonego skanu przekracza u32".into()))?;
+        let grid_y = u32::try_from(batch)
+            .map_err(|_| ForgeError::Kernel("batch współdzielonego skanu przekracza u32".into()))?;
+        for (name, value) in [("T", n_steps), ("H", n_v_heads), ("D", d_state)] {
+            i64::try_from(value).map_err(|_| {
+                ForgeError::Kernel(format!("{name} współdzielonego skanu przekracza i64"))
+            })?;
+        }
         let kernel = self
             .artifacts
             .get("deltanet_gated_scan_segmented_shared_d128_f16")?;
         let config = LaunchConfig {
-            grid: (grid_x as u32, batch as u32, 1),
+            grid: (grid_x, grid_y, 1),
             block: (64, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
             .buf(output)
+            .buf(final_states)
             .buf(states)
             .buf(q)
             .buf(k)
@@ -2330,6 +2481,60 @@ impl Kernels {
             .scalar(cols)
             .scalar(rows)
             .scalar(n_tokens)
+            .scalar(output_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Liczy dwa wiersze logitów F32 bez dekwantyzacji głowy GGUF NVFP4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_gguf_out_f32_b2(
+        &self,
+        y: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) || !output_scale.is_finite() {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_nvfp4_gguf_out_f32_b2 wymaga rows > 0, cols % 64 == 0 i skończonej skali; rows={rows}, cols={cols}, scale={output_scale}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("NVFP4 B2 logits", &[2, rows], 4)?;
+        let weight_bytes = checked_buffer_bytes("NVFP4 B2 logits weights", &[rows, cols / 64], 36)?;
+        let input_bytes = checked_buffer_bytes("NVFP4 B2 logits input", &[2, cols], 2)?;
+        if y.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "gemm_nvfp4_gguf_out_f32_b2: bufor jest za mały".into(),
+            ));
+        }
+        let warp_size = self.device.caps().warp_size;
+        if warp_size == 0 || warp_size > self.device.caps().max_threads_per_block {
+            return Err(ForgeError::Kernel(
+                "gemm_nvfp4_gguf_out_f32_b2: nieprawidłowy rozmiar wave".into(),
+            ));
+        }
+        let grid_x = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("NVFP4 B2 logits grid przekracza u32".into()))?;
+        let rows = i64::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("NVFP4 B2 logits rows przekracza i64".into()))?;
+        let cols = i64::try_from(cols)
+            .map_err(|_| ForgeError::Kernel("NVFP4 B2 logits cols przekracza i64".into()))?;
+        let kernel = self.artifacts.get("gemm_nvfp4_gguf_out_f32_b2")?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (warp_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(weights)
+            .buf(x)
+            .scalar(cols)
+            .scalar(rows)
+            .scalar(2i64)
             .scalar(output_scale);
         self.device.launch(kernel, &config, &args, stream)
     }
@@ -4466,9 +4671,9 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if rows == 0 || !cols.is_multiple_of(32) || !(3..=8).contains(&n_tokens) {
+        if rows == 0 || !cols.is_multiple_of(32) || !(2..=8).contains(&n_tokens) {
             return Err(ForgeError::Kernel(format!(
-                "gemm_q8_0_f16_exact_out_f32 wymaga rows > 0, cols % 32 == 0 i T=3..8, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
+                "gemm_q8_0_f16_exact_out_f32 wymaga rows > 0, cols % 32 == 0 i T=2..8, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
             )));
         }
         let output_bytes =
@@ -4503,6 +4708,7 @@ impl Kernels {
             ForgeError::Kernel("gemm_q8_0_f16_exact_out_f32: siatka przekracza u32".into())
         })?;
         let kernel_name = match n_tokens {
+            2 => "gemm_q8_0_f16_exact_out_f32_b2",
             3 => "gemm_q8_0_f16_exact_out_f32_b3",
             4 => "gemm_q8_0_f16_exact_out_f32_b4",
             5..=8 => "gemm_q8_0_f16_exact_out_f32_b8",

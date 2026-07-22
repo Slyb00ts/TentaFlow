@@ -25,6 +25,33 @@ use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
 
+#[link(name = "dl")]
+unsafe extern "C" {
+    fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int)
+        -> *mut std::ffi::c_void;
+    fn dlsym(
+        handle: *mut std::ffi::c_void,
+        symbol: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
+}
+
+fn cuda_profiler_call(symbol: &[u8]) -> TestResult<()> {
+    let library = unsafe { dlopen(c"libcudart.so.13".as_ptr(), 1) };
+    if library.is_null() {
+        return Err("nie można otworzyć libcudart.so.13".into());
+    }
+    let function = unsafe { dlsym(library, symbol.as_ptr().cast()) };
+    if function.is_null() {
+        return Err("brak funkcji profilera CUDA".into());
+    }
+    let function: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(function) };
+    let status = unsafe { function() };
+    if status != 0 {
+        return Err(format!("funkcja profilera CUDA zwróciła {status}").into());
+    }
+    Ok(())
+}
+
 const STEPS: usize = 6;
 const EXTRA_STEPS: usize = 3;
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -637,9 +664,17 @@ fn load_model_sized_with_tier(
             return None;
         }
     };
-    let activations = if native_mtp { 3usize << 29 } else { 1usize << 30 };
+    let activations = std::env::var("FORGE_TEST_ACTIVATIONS_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value << 20)
+        .unwrap_or_else(|| if native_mtp { 3usize << 29 } else { 1usize << 30 });
     let kv_cache = 256usize << 20;
-    let reserve = 512usize << 20;
+    let reserve = std::env::var("FORGE_TEST_POOL_RESERVE_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(512)
+        << 20;
     let Some(weights) = free.checked_sub(activations + kv_cache + reserve) else {
         eprintln!("pominięto test puli hybrydowej: za mało wolnego VRAM");
         return None;
@@ -723,6 +758,13 @@ fn server_request(prompt_tokens: Vec<u32>, max_tokens: usize) -> EngineRequest {
     }
 }
 
+fn id_server_request(prompt_tokens: Vec<u32>, max_tokens: usize) -> EngineRequest {
+    EngineRequest {
+        emit_empty_tokens: true,
+        ..server_request(prompt_tokens, max_tokens)
+    }
+}
+
 fn mixed_server_request(prompt_tokens: Vec<u32>, max_tokens: usize, lane: usize) -> EngineRequest {
     let sampling = match lane {
         0 => SamplingParams {
@@ -763,6 +805,8 @@ fn mixed_server_request(prompt_tokens: Vec<u32>, max_tokens: usize, lane: usize)
 }
 
 fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResult<()> {
+    let expect_mixed = spec.kind() == forge_engine::speculation::SpeculationKind::NativeMtpNgram
+        && std::env::var("FORGE_MTP_NGRAM_MIXED_BATCH").is_ok_and(|value| value == "1");
     let Some(oracle_model) = load_model(path, true) else {
         return Ok(());
     };
@@ -780,14 +824,14 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
         spec.clone(),
     )?;
     let first_oracle =
-        collect_events(oracle.submit(server_request(first_prompt.clone(), STEPS))?)?;
+        collect_events(oracle.submit(id_server_request(first_prompt.clone(), STEPS))?)?;
     let second_oracle =
-        collect_events(oracle.submit(server_request(second_prompt.clone(), STEPS))?)?;
+        collect_events(oracle.submit(id_server_request(second_prompt.clone(), STEPS))?)?;
     let replacement_oracle = collect_events(
-        oracle.submit(server_request(replacement_prompt.clone(), STEPS))?,
+        oracle.submit(id_server_request(replacement_prompt.clone(), STEPS))?,
     )?;
     let reused_oracle =
-        collect_events(oracle.submit(server_request(reused_prompt.clone(), STEPS))?)?;
+        collect_events(oracle.submit(id_server_request(reused_prompt.clone(), STEPS))?)?;
     oracle.shutdown()?;
 
     let Some(model) = load_model(path, true) else {
@@ -795,19 +839,23 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
     };
     assert_eq!(model.weights.descriptor.params.vocab_size, vocab);
     let engine = spawn_engine_batched(model, Arc::new(tokenizer(path)?), 2, 32, 12, spec)?;
+    let profile = std::env::var_os("FORGE_PROFILE_SERVER_CONCURRENCY").is_some();
+    if profile {
+        cuda_profiler_call(b"cudaProfilerStart\0")?;
+    }
     let started = Instant::now();
-    let first = engine.submit(server_request(first_prompt, STEPS))?;
-    let second = engine.submit(server_request(second_prompt, STEPS))?;
+    let first = engine.submit(id_server_request(first_prompt, STEPS))?;
+    let second = engine.submit(id_server_request(second_prompt, STEPS))?;
     let first_tokens = collect_events(first)?;
     let second_tokens = collect_events(second)?;
     assert_eq!(first_tokens, first_oracle);
     assert_eq!(second_tokens, second_oracle);
 
-    let cancelled = engine.submit(server_request(prompt(vocab, 257, 8), STEPS * 2))?;
+    let cancelled = engine.submit(id_server_request(prompt(vocab, 257, 8), STEPS * 2))?;
     drop(cancelled);
-    let replacement = engine.submit(server_request(replacement_prompt, STEPS))?;
+    let replacement = engine.submit(id_server_request(replacement_prompt, STEPS))?;
     assert_eq!(collect_events(replacement)?, replacement_oracle);
-    let reused = engine.submit(server_request(reused_prompt, STEPS))?;
+    let reused = engine.submit(id_server_request(reused_prompt, STEPS))?;
     assert_eq!(collect_events(reused)?, reused_oracle);
 
     let metrics = engine.metrics();
@@ -830,6 +878,17 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
     assert!(metrics.requests_started.load(Ordering::Relaxed) >= 5);
     assert!(metrics.requests_finished.load(Ordering::Relaxed) >= 4);
     assert!(metrics.requests_errored.load(Ordering::Relaxed) >= 1);
+    if expect_mixed {
+        assert!(
+            metrics.mtp_routed_nm_b2_steps_total.load(Ordering::Relaxed)
+                + metrics.mtp_routed_mm_b2_steps_total.load(Ordering::Relaxed)
+                > 0,
+            "mixed rollout nie wykonał pary N/M ani M/M"
+        );
+    }
+    if profile {
+        cuda_profiler_call(b"cudaProfilerStop\0")?;
+    }
     engine.shutdown()?;
     Ok(())
 }
@@ -1294,7 +1353,7 @@ enum ExactB2Mode {
 
 fn run_exact_native_mtp_b2_matrix(
     path: &Path,
-    prompt_path: &Path,
+    prompt_path: Option<&Path>,
     mode: ExactB2Mode,
 ) -> TestResult<()> {
     const OUTPUT_TOKENS: usize = 128;
@@ -1306,12 +1365,24 @@ fn run_exact_native_mtp_b2_matrix(
     if reps == 0 {
         return Err("FORGE_BENCH_REPS musi być większe od zera".into());
     }
-    let prompt = read_raw_token_ids(prompt_path)?;
-    let second_prompt = std::env::var_os("FORGE_BENCH_PROMPT_IDS_SECOND")
-        .map(PathBuf::from)
-        .map(|path| read_raw_token_ids(&path))
-        .transpose()?
-        .unwrap_or_else(|| prompt.clone());
+    let (prompt, second_prompt) = if let Some(prompt_path) = prompt_path {
+        let first = read_raw_token_ids(prompt_path)?;
+        let second = std::env::var_os("FORGE_BENCH_PROMPT_IDS_SECOND")
+            .map(PathBuf::from)
+            .map(|path| read_raw_token_ids(&path))
+            .transpose()?
+            .unwrap_or_else(|| first.clone());
+        (first, second)
+    } else {
+        let length = std::env::var("FORGE_BENCH_SYNTHETIC_PROMPT_TOKENS")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(128);
+        let gguf = Gguf::open(path)?;
+        let vocab = gguf_vocab(&gguf)?.tokens.len();
+        (prompt(vocab, 1709, length), prompt(vocab, 2903, length))
+    };
     let max_seq_len = prompt.len().max(second_prompt.len()) + OUTPUT_TOKENS + 32;
     let kv_pages = 2 * max_seq_len.div_ceil(32) + 4;
     let Some(mut oracle_model) = load_model_sized(path, true, max_seq_len, kv_pages) else {
@@ -1345,6 +1416,7 @@ fn run_exact_native_mtp_b2_matrix(
         12,
         spec,
     )?;
+    let profile = std::env::var_os("FORGE_PROFILE_MTP_MATRIX").is_some();
     for rep in 0..=reps {
         let metrics = engine.metrics();
         let generated_before = metrics.generated_tokens_total.load(Ordering::Relaxed);
@@ -1361,12 +1433,18 @@ fn run_exact_native_mtp_b2_matrix(
         ];
         let ttft_before = metrics.ttft_seconds.snapshot();
         let itl_before = metrics.inter_token_seconds.snapshot();
+        if profile && rep == 1 {
+            cuda_profiler_call(b"cudaProfilerStart\0")?;
+        }
         let started = Instant::now();
         let receivers = [
-            engine.submit(server_request(prompt.clone(), OUTPUT_TOKENS))?,
-            engine.submit(server_request(second_prompt.clone(), OUTPUT_TOKENS))?,
+            engine.submit(id_server_request(prompt.clone(), OUTPUT_TOKENS))?,
+            engine.submit(id_server_request(second_prompt.clone(), OUTPUT_TOKENS))?,
         ];
         let (outputs, first_token_at, finished) = collect_pair_events(receivers)?;
+        if profile && rep == 1 {
+            cuda_profiler_call(b"cudaProfilerStop\0")?;
+        }
         let elapsed = finished.duration_since(started).as_secs_f64();
         let completion_elapsed = finished.duration_since(first_token_at).as_secs_f64();
         assert_eq!(outputs[0], oracle_outputs[0], "lane0 różni się od oracle B1");
@@ -1759,6 +1837,651 @@ fn native_mtp_b2_zachowuje_pelne_id_dla_k2_i_k3() -> TestResult<()> {
 }
 
 #[test]
+fn hybrid_prefill_b2_t32_jest_bitowo_zgodny_z_dwoma_serialnymi_lane() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto parity prefill B2 T32: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    if !model.hybrid_prefill_b2_capable(32) {
+        let p = &model.weights.descriptor.params;
+        let split_qkv = model
+            .weights
+            .layers
+            .iter()
+            .filter(|layer| matches!(
+                &layer.mixer,
+                forge_engine::weights::LayerMixer::Attention(attention)
+                    if matches!(attention.attn_qkv, forge_engine::weights::QkvWeights::Split { .. })
+            ))
+            .count();
+        let split_ffn = model
+            .weights
+            .layers
+            .iter()
+            .filter(|layer| matches!(
+                &layer.ffn,
+                forge_engine::weights::LayerFfn::Dense(ffn)
+                    if matches!(ffn.gate_up, forge_engine::weights::GateUpWeights::Split { .. })
+            ))
+            .count();
+        eprintln!(
+            "pominięto parity prefill B2 T32: arch={} hd={} ssm={:?} moe={} mtp_embedding={:?} base_b2={} split_qkv={split_qkv} split_ffn={split_ffn}/{} lm_head={}",
+            model.weights.descriptor.arch,
+            p.head_dim,
+            p.ssm.as_ref().map(|ssm| (ssm.d_state, ssm.d_conv)),
+            model.weights.is_moe(),
+            model.mtp_embedding_mode(),
+            model.hybrid_batch_b2_capable(),
+            model.weights.layers.len(),
+            match model.weights.lm_head {
+                forge_engine::weights::DevWeight::F16 { .. } => "f16",
+                forge_engine::weights::DevWeight::Q8_0 { .. } => "q8_0",
+                forge_engine::weights::DevWeight::NvFp4Gguf { .. } => "nvfp4_gguf",
+                _ => "inne",
+            }
+        );
+        return Ok(());
+    }
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let prompts = [prompt(vocab, 1709, 32), prompt(vocab, 2903, 32)];
+    let mut serial_seqs = [model.new_seq(), model.new_seq()];
+    let serial_logits = [
+        model.prefill_chunk(&mut serial_seqs[0], &prompts[0])?,
+        model.prefill_chunk(&mut serial_seqs[1], &prompts[1])?,
+    ];
+    let serial_snapshots = [
+        model.debug_hybrid_sequence_snapshot(&mut serial_seqs[0])?,
+        model.debug_hybrid_sequence_snapshot(&mut serial_seqs[1])?,
+    ];
+    for seq in &mut serial_seqs {
+        model.release_seq(seq);
+    }
+
+    let mut batch_seqs = [model.new_seq(), model.new_seq()];
+    let [first, second] = &mut batch_seqs;
+    let mut lanes = [first, second];
+    let batch_logits = model.hybrid_prefill_b2_t32(
+        &mut lanes,
+        [&prompts[0], &prompts[1]],
+    )?;
+    for lane in 0..2 {
+        let batch_snapshot = model.debug_hybrid_sequence_snapshot(lanes[lane])?;
+        if batch_snapshot != serial_snapshots[lane] {
+            let divergence = batch_snapshot
+                .iter()
+                .zip(&serial_snapshots[lane])
+                .find(|(batch, serial)| batch != serial)
+                .map(|(batch, serial)| {
+                    let byte = batch
+                        .2
+                        .iter()
+                        .zip(&serial.2)
+                        .position(|(left, right)| left != right);
+                    format!("{} vs {}, pierwszy bajt {byte:?}", batch.0, serial.0)
+                })
+                .unwrap_or_else(|| "inna liczba buforów".into());
+            return Err(format!("stan/KV lane {lane}: {divergence}").into());
+        }
+        if batch_logits[lane] != serial_logits[lane] {
+            let first = batch_logits[lane]
+                .iter()
+                .zip(&serial_logits[lane])
+                .position(|(batch, serial)| batch != serial);
+            return Err(format!("logity lane {lane}: pierwszy element {first:?}").into());
+        }
+        let serial_top1 = serial_logits[lane]
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index);
+        let batch_top1 = batch_logits[lane]
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index);
+        assert_eq!(batch_top1, serial_top1, "top1 lane {lane}");
+        assert_eq!(lanes[lane].len, 32);
+        assert_eq!(lanes[lane].pages.len(), 1);
+    }
+    model.release_seq(lanes[0]);
+    model.release_seq(lanes[1]);
+    Ok(())
+}
+
+#[test]
+fn hybrid_prefill_b2_gpu_sampler_zachowuje_parametry_seed_i_kary_lane() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto sampler prefill B2: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    if !model.hybrid_prefill_b2_capable(32) {
+        return Ok(());
+    }
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let prompts = [prompt(vocab, 1709, 32), prompt(vocab, 2903, 32)];
+    let sampling = [
+        SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 1.08,
+            frequency_penalty: 0.15,
+            presence_penalty: -0.1,
+            repeat_last_n: 17,
+            seed: Some(11),
+            ..SamplingParams::default()
+        },
+        SamplingParams {
+            temperature: 0.8,
+            top_k: 8,
+            top_p: 0.9,
+            min_p: 0.05,
+            repetition_penalty: 1.04,
+            frequency_penalty: -0.2,
+            presence_penalty: 0.25,
+            repeat_last_n: 23,
+            seed: Some(29),
+        },
+    ];
+
+    let mut serial_seqs = [model.new_seq(), model.new_seq()];
+    let [first, second] = &mut serial_seqs;
+    let mut serial_lanes = [first, second];
+    model.hybrid_prefill_b2_t32(&mut serial_lanes, [&prompts[0], &prompts[1]])?;
+    let mut serial_samplers = [
+        GpuSampler::new(sampling[0].clone()),
+        GpuSampler::new(sampling[1].clone()),
+    ];
+    serial_samplers[0].note_tokens(&prompts[0]);
+    serial_samplers[1].note_tokens(&prompts[1]);
+    let expected = [
+        model.sample_hybrid_prefill_b2_logits(0, &mut serial_samplers[0])?,
+        model.sample_hybrid_prefill_b2_logits(1, &mut serial_samplers[1])?,
+    ];
+    model.release_seq(serial_lanes[0]);
+    model.release_seq(serial_lanes[1]);
+
+    let mut batch_seqs = [model.new_seq(), model.new_seq()];
+    let [first, second] = &mut batch_seqs;
+    let mut batch_lanes = [first, second];
+    model.hybrid_prefill_b2_t32_device(&mut batch_lanes, [&prompts[0], &prompts[1]])?;
+    let mut batch_samplers = [
+        GpuSampler::new(sampling[0].clone()),
+        GpuSampler::new(sampling[1].clone()),
+    ];
+    batch_samplers[0].note_tokens(&prompts[0]);
+    batch_samplers[1].note_tokens(&prompts[1]);
+    let [first_sampler, second_sampler] = &mut batch_samplers;
+    let actual = model.sample_hybrid_prefill_b2_logits_batched(&mut [
+        first_sampler,
+        second_sampler,
+    ])?;
+    assert_eq!(actual, expected);
+    model.release_seq(batch_lanes[0]);
+    model.release_seq(batch_lanes[1]);
+    Ok(())
+}
+
+#[test]
+fn hybrid_prefill_b2_t32_przywraca_obie_sekwencje_po_bledzie_lane() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto rollback prefill B2 T32: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    if !model.hybrid_prefill_b2_capable(32) {
+        eprintln!("pominięto rollback prefill B2 T32: model bez capability");
+        return Ok(());
+    }
+    let vocab = model.weights.descriptor.params.vocab_size;
+    for failed_lane in 0..2 {
+        let mut seqs = [model.new_seq(), model.new_seq()];
+        model.prefill_chunk(&mut seqs[0], &prompt(vocab, 401 + failed_lane, 1))?;
+        model.prefill_chunk(&mut seqs[1], &prompt(vocab, 809 + failed_lane, 1))?;
+        let snapshots = [
+            model.debug_hybrid_sequence_snapshot(&mut seqs[0])?,
+            model.debug_hybrid_sequence_snapshot(&mut seqs[1])?,
+        ];
+        let lengths = [seqs[0].len, seqs[1].len];
+        let pages = [seqs[0].pages.clone(), seqs[1].pages.clone()];
+        let chunks = [
+            prompt(vocab, 1709 + failed_lane, 32),
+            prompt(vocab, 2903 + failed_lane, 32),
+        ];
+        let [first, second] = &mut seqs;
+        let mut lanes = [first, second];
+        let error = model
+            .debug_hybrid_prefill_b2_t32_rollback(
+                &mut lanes,
+                [&chunks[0], &chunks[1]],
+                failed_lane,
+            )
+            .expect_err("test wymusza błąd po zapisie stanu");
+        assert!(error.to_string().contains(&format!("lane {failed_lane}")));
+        for lane in 0..2 {
+            assert_eq!(lanes[lane].len, lengths[lane]);
+            assert_eq!(lanes[lane].pages, pages[lane]);
+            assert_eq!(
+                model.debug_hybrid_sequence_snapshot(lanes[lane])?,
+                snapshots[lane],
+                "rollback stanu lane {lane} po błędzie lane {failed_lane}"
+            );
+        }
+        model.release_seq(lanes[0]);
+        model.release_seq(lanes[1]);
+    }
+    Ok(())
+}
+
+#[test]
+fn hybrid_prefill_mtp_catchup_b2_przywraca_pare_po_bledzie_lane() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto rollback catch-up MTP B2: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    if !model.hybrid_prefill_b2_capable(32) {
+        return Ok(());
+    }
+    let vocab = model.weights.descriptor.params.vocab_size;
+    for failed_lane in 0..2 {
+        let chunks = [
+            prompt(vocab, 1201 + failed_lane, 32),
+            prompt(vocab, 1601 + failed_lane, 32),
+        ];
+        let mut seqs = [model.new_seq(), model.new_seq()];
+        let [first, second] = &mut seqs;
+        let mut lanes = [first, second];
+        model.hybrid_prefill_b2_t32_device(&mut lanes, [&chunks[0], &chunks[1]])?;
+        let before = [
+            model.debug_mtp_state_snapshot(lanes[0])?,
+            model.debug_mtp_state_snapshot(lanes[1])?,
+        ];
+        let error = model
+            .debug_hybrid_prefill_mtp_catchup_b2_rollback(
+                &mut lanes,
+                [&chunks[0], &chunks[1]],
+                [true, true],
+                failed_lane,
+            )
+            .expect_err("test wymusza błąd catch-up MTP");
+        assert!(error.to_string().contains(&format!("lane {failed_lane}")));
+        for lane in 0..2 {
+            assert_mtp_snapshot_eq(
+                &model.debug_mtp_state_snapshot(lanes[lane])?,
+                &before[lane],
+                &format!("rollback catch-up lane {lane} po błędzie {failed_lane}"),
+            );
+        }
+        model.release_seq(lanes[0]);
+        model.release_seq(lanes[1]);
+    }
+    Ok(())
+}
+
+#[test]
+fn hybrid_prefill_mtp_catchup_b2_kwarantannuje_pare_po_bledzie_rollbacku() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto błąd rollbacku catch-up MTP B2: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    if !model.hybrid_prefill_b2_capable(32) {
+        return Ok(());
+    }
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let chunks = [prompt(vocab, 2201, 32), prompt(vocab, 2601, 32)];
+    let mut seqs = [model.new_seq(), model.new_seq()];
+    let [first, second] = &mut seqs;
+    let mut lanes = [first, second];
+    model.hybrid_prefill_b2_t32_device(&mut lanes, [&chunks[0], &chunks[1]])?;
+
+    let error = model
+        .debug_hybrid_prefill_mtp_catchup_b2_rollback_failure(
+            &mut lanes,
+            [&chunks[0], &chunks[1]],
+            [true, true],
+            1,
+            0,
+        )
+        .expect_err("test wymusza błąd lane i rollbacku pary");
+    assert!(error.to_string().contains("rollback pary nie powiódł się"));
+
+    let reuse = model
+        .debug_hybrid_prefill_mtp_catchup_b2_rollback(
+            &mut lanes,
+            [&chunks[0], &chunks[1]],
+            [true, true],
+            0,
+        )
+        .expect_err("zatruta pula nie może ponownie wydać pary MTP");
+    assert!(reuse.to_string().contains("zatruta"));
+    Ok(())
+}
+
+#[test]
+fn benchmark_hybrid_prefill_b2_t32_kontra_dwa_serialne() -> TestResult<()> {
+    if std::env::var_os("FORGE_BENCH_HYBRID_PREFILL_B2").is_none() {
+        eprintln!("pominięto benchmark prefill B2 T32: brak FORGE_BENCH_HYBRID_PREFILL_B2");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("benchmark wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let repetitions = std::env::var("FORGE_BENCH_REPS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(10);
+    if repetitions < 10 {
+        return Err("benchmark prefill B2 wymaga co najmniej 10 powtórzeń".into());
+    }
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    if !model.hybrid_prefill_b2_capable(32) {
+        return Err("model benchmarku nie spełnia capability prefill B2 T32".into());
+    }
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let chunks = [prompt(vocab, 1709, 32), prompt(vocab, 2903, 32)];
+
+    let mut warm_serial = [model.new_seq(), model.new_seq()];
+    model.prefill_chunk(&mut warm_serial[0], &chunks[0])?;
+    model.prefill_chunk(&mut warm_serial[1], &chunks[1])?;
+    for seq in &mut warm_serial {
+        model.release_seq(seq);
+    }
+    let mut warm_batch = [model.new_seq(), model.new_seq()];
+    let [first, second] = &mut warm_batch;
+    let mut warm_lanes = [first, second];
+    model.hybrid_prefill_b2_t32(&mut warm_lanes, [&chunks[0], &chunks[1]])?;
+    model.release_seq(warm_lanes[0]);
+    model.release_seq(warm_lanes[1]);
+
+    let mut serial_ms = Vec::with_capacity(repetitions);
+    let mut batch_ms = Vec::with_capacity(repetitions);
+    for _ in 0..repetitions {
+        let mut serial = [model.new_seq(), model.new_seq()];
+        let (serial_first, first_ms) =
+            model.debug_prefill_chunk_gpu_ms(&mut serial[0], &chunks[0])?;
+        let (serial_second, second_ms) =
+            model.debug_prefill_chunk_gpu_ms(&mut serial[1], &chunks[1])?;
+        let serial_snapshots = [
+            model.debug_hybrid_sequence_snapshot(&mut serial[0])?,
+            model.debug_hybrid_sequence_snapshot(&mut serial[1])?,
+        ];
+        serial_ms.push(first_ms + second_ms);
+        for seq in &mut serial {
+            model.release_seq(seq);
+        }
+
+        let mut batch = [model.new_seq(), model.new_seq()];
+        let [first, second] = &mut batch;
+        let mut lanes = [first, second];
+        let (batch_logits, elapsed) = model.debug_hybrid_prefill_b2_t32_gpu_ms(
+            &mut lanes,
+            [&chunks[0], &chunks[1]],
+        )?;
+        batch_ms.push(elapsed);
+        assert_eq!(batch_logits[0], serial_first);
+        assert_eq!(batch_logits[1], serial_second);
+        for lane in 0..2 {
+            assert_eq!(
+                model.debug_hybrid_sequence_snapshot(lanes[lane])?,
+                serial_snapshots[lane]
+            );
+        }
+        model.release_seq(lanes[0]);
+        model.release_seq(lanes[1]);
+    }
+    let average = |values: &[f32]| values.iter().copied().sum::<f32>() / values.len() as f32;
+    let serial_average = average(&serial_ms);
+    let batch_average = average(&batch_ms);
+    println!(
+        "hybrid_prefill_b2_t32 reps={repetitions} serial_gpu_ms={serial_average:.3} b2_gpu_ms={batch_average:.3} serial_tok_s={:.1} b2_tok_s={:.1} speedup={:.3} scratch_bytes={}",
+        64_000.0 / serial_average,
+        64_000.0 / batch_average,
+        serial_average / batch_average,
+        model.debug_hybrid_prefill_b2_scratch_bytes(),
+    );
+    Ok(())
+}
+
+#[test]
+fn profil_launchy_hybrid_prefill_t32() -> TestResult<()> {
+    let Some(mode) = std::env::var_os("FORGE_PROFILE_HYBRID_PREFILL") else {
+        eprintln!("pominięto profil launchy prefill");
+        return Ok(());
+    };
+    let mode = mode.to_string_lossy();
+    if mode != "serial" && mode != "b2" {
+        return Err("profil prefill wymaga trybu serial lub b2".into());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("profil wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let chunks = [prompt(vocab, 1709, 32), prompt(vocab, 2903, 32)];
+    if mode == "serial" {
+        let mut warm = [model.new_seq(), model.new_seq()];
+        model.prefill_chunk(&mut warm[0], &chunks[0])?;
+        model.prefill_chunk(&mut warm[1], &chunks[1])?;
+        for seq in &mut warm {
+            model.release_seq(seq);
+        }
+    } else {
+        let mut warm = [model.new_seq(), model.new_seq()];
+        let [first, second] = &mut warm;
+        let mut lanes = [first, second];
+        model.hybrid_prefill_b2_t32(&mut lanes, [&chunks[0], &chunks[1]])?;
+        model.release_seq(lanes[0]);
+        model.release_seq(lanes[1]);
+    }
+    cuda_profiler_call(b"cudaProfilerStart\0")?;
+    if mode == "serial" {
+        let mut seqs = [model.new_seq(), model.new_seq()];
+        model.prefill_chunk(&mut seqs[0], &chunks[0])?;
+        model.prefill_chunk(&mut seqs[1], &chunks[1])?;
+        for seq in &mut seqs {
+            model.release_seq(seq);
+        }
+    } else {
+        let mut seqs = [model.new_seq(), model.new_seq()];
+        let [first, second] = &mut seqs;
+        let mut lanes = [first, second];
+        model.hybrid_prefill_b2_t32(&mut lanes, [&chunks[0], &chunks[1]])?;
+        model.release_seq(lanes[0]);
+        model.release_seq(lanes[1]);
+    }
+    cuda_profiler_call(b"cudaProfilerStop\0")?;
+    println!("profil prefill {mode} zakończony");
+    Ok(())
+}
+
+#[test]
+fn benchmark_server_prefill_b2_raw() -> TestResult<()> {
+    if std::env::var_os("FORGE_BENCH_HYBRID_PREFILL_SERVER").is_none() {
+        eprintln!("pominięto benchmark serwera prefill B2");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("benchmark wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let prompt_tokens = std::env::var("FORGE_BENCH_PROMPT_TOKENS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(128);
+    if !matches!(prompt_tokens, 128 | 512) {
+        return Err("benchmark raw wymaga 128 lub 512 tokenów".into());
+    }
+    let repetitions = std::env::var("FORGE_BENCH_REPS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(5);
+    if repetitions < 5 {
+        return Err("benchmark serwera wymaga co najmniej pięciu prób".into());
+    }
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let max_seq_len = prompt_tokens + 16;
+    let kv_pages = 2 * max_seq_len.div_ceil(32) + 4;
+    let Some(mut oracle) = load_model_sized(&path, true, max_seq_len, kv_pages) else {
+        return Ok(());
+    };
+    let vocab = oracle.weights.descriptor.params.vocab_size;
+    let prompts = [
+        prompt(vocab, 1709, prompt_tokens),
+        prompt(vocab, 2903, prompt_tokens),
+    ];
+    let expected = [
+        generate(&mut oracle, &prompts[0], 8)?,
+        generate(&mut oracle, &prompts[1], 8)?,
+    ];
+    drop(oracle);
+    let Some(model) = load_model_sized(&path, true, max_seq_len, kv_pages) else {
+        return Err("CUDA zniknęła przed benchmarkiem serwera".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(&path)?),
+        2,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let enabled = std::env::var("FORGE_HYBRID_PREFILL_BATCH").is_ok_and(|value| value == "1");
+    let cpu_fallback = std::env::var_os("FORGE_BENCH_PREFILL_CPU_FALLBACK").is_some();
+    let profile = std::env::var_os("FORGE_PROFILE_SERVER_PREFILL").is_some();
+    for repetition in 0..=repetitions {
+        let metrics = engine.metrics();
+        let steps_before = metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed);
+        let tokens_before = metrics.hybrid_prefill_b2_tokens_total.load(Ordering::Relaxed);
+        if profile && repetition == 1 {
+            cuda_profiler_call(b"cudaProfilerStart\0")?;
+        }
+        let started = Instant::now();
+        let mut first_request = id_server_request(prompts[0].clone(), 8);
+        let mut second_request = id_server_request(prompts[1].clone(), 8);
+        if cpu_fallback {
+            first_request.logprobs = Some(0);
+            second_request.logprobs = Some(0);
+        }
+        let receivers = [engine.submit(first_request)?, engine.submit(second_request)?];
+        let mut outputs = [Vec::new(), Vec::new()];
+        let mut first_token = [None, None];
+        let mut done = [false, false];
+        while done.iter().any(|&value| !value) {
+            let mut progressed = false;
+            for lane in 0..2 {
+                if done[lane] {
+                    continue;
+                }
+                match receivers[lane].try_recv() {
+                    Ok(EngineEvent::Token { id, .. }) => {
+                        first_token[lane].get_or_insert_with(Instant::now);
+                        outputs[lane].push(id);
+                        progressed = true;
+                    }
+                    Ok(EngineEvent::Done { tokens, .. }) => {
+                        assert_eq!(outputs[lane].len(), tokens);
+                        done[lane] = true;
+                        progressed = true;
+                    }
+                    Ok(EngineEvent::Error(error)) => return Err(error.into()),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        return Err("worker rozłączył benchmark prefill".into());
+                    }
+                }
+            }
+            if !progressed {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+        let finished = Instant::now();
+        if profile && repetition == 1 {
+            cuda_profiler_call(b"cudaProfilerStop\0")?;
+        }
+        assert_eq!(outputs, expected);
+        let ttft = [
+            first_token[0].ok_or("brak TTFT lane0")?.duration_since(started),
+            first_token[1].ok_or("brak TTFT lane1")?.duration_since(started),
+        ];
+        let prefill_elapsed = ttft[0].max(ttft[1]).as_secs_f64();
+        let steps = metrics
+            .hybrid_prefill_b2_steps_total
+            .load(Ordering::Relaxed)
+            .saturating_sub(steps_before);
+        let routed_tokens = metrics
+            .hybrid_prefill_b2_tokens_total
+            .load(Ordering::Relaxed)
+            .saturating_sub(tokens_before);
+        println!(
+            "server_prefill_raw={} gate={} sampler={} {}={}/{} input_tok_s={:.1} ttft_lane_ms={:.2}/{:.2} e2e_ms={:.2} b2_steps={} b2_tokens={}",
+            prompt_tokens,
+            if enabled { "on" } else { "off" },
+            if cpu_fallback { "cpu" } else { "gpu" },
+            if repetition == 0 { "warmup" } else { "rep" },
+            if repetition == 0 { 1 } else { repetition },
+            if repetition == 0 { 1 } else { repetitions },
+            (2 * prompt_tokens) as f64 / prefill_elapsed,
+            ttft[0].as_secs_f64() * 1e3,
+            ttft[1].as_secs_f64() * 1e3,
+            finished.duration_since(started).as_secs_f64() * 1e3,
+            steps,
+            routed_tokens,
+        );
+        if enabled {
+            assert_eq!(steps, (prompt_tokens / 32) as u64);
+            assert_eq!(routed_tokens, (2 * prompt_tokens) as u64);
+        } else {
+            assert_eq!((steps, routed_tokens), (0, 0));
+        }
+    }
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn mtp_ngram_b2_zachowuje_golden_dla_k2_k3_i_macierzy_retained() -> TestResult<()> {
     let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
         eprintln!("pominięto E2E MTP+n-gram B2: brak FORGE_TEST_HYBRID_GGUF");
@@ -1813,6 +2536,229 @@ fn server_continuous_admission_mtp_i_router_obsluguje_concurrency_dwa() -> TestR
         &path,
         SpeculativeConfig::chain(vec![ProposerKind::Mtp, ProposerKind::Ngram], 3)?,
     )
+}
+
+#[test]
+fn server_mtp_ngram_mixed_zachowuje_oracle_anulowanie_i_reuse() -> TestResult<()> {
+    if std::env::var_os("FORGE_TEST_MTP_NGRAM_MIXED_SERVER").is_none() {
+        eprintln!("pominięto E2E mixed MTP+n-gram");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("E2E mixed wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_server_concurrency_two(
+        &path,
+        SpeculativeConfig::chain(vec![ProposerKind::Mtp, ProposerKind::Ngram], 3)?,
+    )
+}
+
+#[test]
+fn server_prefill_b2_t32_zachowuje_id_dla_ogonow_anulowania_i_reuse() -> TestResult<()> {
+    if std::env::var_os("FORGE_TEST_HYBRID_PREFILL_SERVER").is_none() {
+        eprintln!("pominięto E2E serwera prefill B2: brak FORGE_TEST_HYBRID_PREFILL_SERVER");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("E2E prefill B2 wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut oracle) = load_model_sized(&path, true, 96, 8) else {
+        return Ok(());
+    };
+    let vocab = oracle.weights.descriptor.params.vocab_size;
+    let prompts = [
+        prompt(vocab, 29, 64),
+        prompt(vocab, 173, 47),
+        prompt(vocab, 313, 32),
+        prompt(vocab, 367, 32),
+        prompt(vocab, 419, 32),
+    ];
+    let mut expected = Vec::new();
+    for tokens in &prompts {
+        expected.push(generate(&mut oracle, tokens, 8)?);
+    }
+    drop(oracle);
+
+    let Some(model) = load_model_sized(&path, true, 96, 8) else {
+        return Err("CUDA zniknęła przed E2E prefill B2".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(&path)?),
+        2,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let first = engine.submit(id_server_request(prompts[0].clone(), 8))?;
+    let second = engine.submit(id_server_request(prompts[1].clone(), 8))?;
+    assert_eq!(collect_events(first)?, expected[0]);
+    assert_eq!(collect_events(second)?, expected[1]);
+
+    let cancelled = engine.submit(id_server_request(prompt(vocab, 257, 64), 16))?;
+    let replacement = engine.submit(id_server_request(prompts[2].clone(), 8))?;
+    drop(cancelled);
+    assert_eq!(collect_events(replacement)?, expected[2]);
+
+    let reused = engine.submit(id_server_request(prompts[3].clone(), 8))?;
+    let companion = engine.submit(id_server_request(prompts[4].clone(), 8))?;
+    assert_eq!(collect_events(reused)?, expected[3]);
+    assert_eq!(collect_events(companion)?, expected[4]);
+    let metrics = engine.metrics();
+    assert!(metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed) >= 3);
+    assert!(metrics.hybrid_prefill_b2_tokens_total.load(Ordering::Relaxed) >= 192);
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn server_prefill_b2_mieszany_gpu_cpu_uzywa_wspolnego_host_fallback() -> TestResult<()> {
+    if std::env::var_os("FORGE_TEST_HYBRID_PREFILL_SERVER").is_none() {
+        eprintln!("pominięto E2E mieszanego samplera prefill B2");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("E2E mieszanego samplera wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut oracle) = load_model_sized(&path, true, 64, 8) else {
+        return Ok(());
+    };
+    let vocab = oracle.weights.descriptor.params.vocab_size;
+    let prompts = [prompt(vocab, 701, 32), prompt(vocab, 809, 32)];
+    let expected = [
+        generate(&mut oracle, &prompts[0], 8)?,
+        generate(&mut oracle, &prompts[1], 8)?,
+    ];
+    drop(oracle);
+    let Some(model) = load_model_sized(&path, true, 64, 8) else {
+        return Err("CUDA zniknęła przed E2E mieszanego samplera".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(&path)?),
+        2,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let gpu_request = id_server_request(prompts[0].clone(), 8);
+    let mut cpu_request = id_server_request(prompts[1].clone(), 8);
+    cpu_request.logprobs = Some(0);
+    let gpu = engine.submit(gpu_request)?;
+    let cpu = engine.submit(cpu_request)?;
+    assert_eq!(collect_events(gpu)?, expected[0]);
+    assert_eq!(collect_events(cpu)?, expected[1]);
+    assert_eq!(
+        engine
+            .metrics()
+            .hybrid_prefill_b2_steps_total
+            .load(Ordering::Relaxed),
+        1
+    );
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn server_prefill_b2_nie_blokuje_live_decode_i_rotuje_pary() -> TestResult<()> {
+    if std::env::var_os("FORGE_TEST_HYBRID_PREFILL_PRIORITY").is_none() {
+        eprintln!("pominięto E2E priorytetu decode nad prefill B2");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("E2E priorytetu wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut oracle) = load_model_sized(&path, true, 96, 24) else {
+        return Ok(());
+    };
+    let vocab = oracle.weights.descriptor.params.vocab_size;
+    let decode_prompt = prompt(vocab, 101, 32);
+    let prefill_prompts = [
+        prompt(vocab, 211, 64),
+        prompt(vocab, 307, 64),
+        prompt(vocab, 401, 64),
+        prompt(vocab, 503, 64),
+    ];
+    let expected_decode = generate(&mut oracle, &decode_prompt, 8)?;
+    let mut expected_prefill = Vec::new();
+    for prompt in &prefill_prompts {
+        expected_prefill.push(generate(&mut oracle, prompt, 2)?);
+    }
+    drop(oracle);
+
+    let Some(model) = load_model_sized(&path, true, 96, 24) else {
+        return Err("CUDA zniknęła przed E2E priorytetu prefill".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(&path)?),
+        5,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let decode = engine.submit(id_server_request(decode_prompt, 8))?;
+    let (first_id, first_at) = loop {
+        match decode.recv()? {
+            EngineEvent::Token { id, .. } => break (id, Instant::now()),
+            EngineEvent::Error(error) => return Err(error.into()),
+            EngineEvent::Done { .. } => return Err("decode zakończył się bez tokenu".into()),
+        }
+    };
+    let prefill = prefill_prompts
+        .into_iter()
+        .map(|tokens| engine.submit(id_server_request(tokens, 2)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (second_id, second_at) = loop {
+        match decode.recv_timeout(Duration::from_secs(2))? {
+            EngineEvent::Token { id, .. } => break (id, Instant::now()),
+            EngineEvent::Error(error) => return Err(error.into()),
+            EngineEvent::Done { .. } => return Err("decode zakończył się po jednym tokenie".into()),
+        }
+    };
+    assert_eq!([first_id, second_id], expected_decode[..2]);
+    let live_itl = second_at.duration_since(first_at);
+    assert!(
+        live_itl < Duration::from_millis(500),
+        "prefill zwiększył live ITL do {:.2} ms",
+        live_itl.as_secs_f64() * 1e3
+    );
+    let mut decode_ids = vec![first_id, second_id];
+    loop {
+        match decode.recv()? {
+            EngineEvent::Token { id, .. } => decode_ids.push(id),
+            EngineEvent::Done { tokens, .. } => {
+                assert_eq!(decode_ids.len(), tokens);
+                break;
+            }
+            EngineEvent::Error(error) => return Err(error.into()),
+        }
+    }
+    assert_eq!(decode_ids, expected_decode);
+    for (lane, receiver) in prefill.into_iter().enumerate() {
+        assert_eq!(collect_events(receiver)?, expected_prefill[lane]);
+    }
+    let metrics = engine.metrics();
+    assert!(metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed) >= 4);
+    println!(
+        "live decode ITL z czterema prefill={:.2} ms, kroki B2={}",
+        live_itl.as_secs_f64() * 1e3,
+        metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed),
+    );
+    engine.shutdown()?;
+    Ok(())
 }
 
 #[test]
@@ -1903,13 +2849,11 @@ fn benchmark_exact_native_mtp_b2_dwa_identyczne_requesty() -> TestResult<()> {
     let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
         .map(PathBuf::from)
         .ok_or("macierz wymaga FORGE_TEST_HYBRID_GGUF")?;
-    let prompt_path = std::env::var_os("FORGE_BENCH_PROMPT_IDS")
-        .map(PathBuf::from)
-        .ok_or("macierz wymaga FORGE_BENCH_PROMPT_IDS")?;
+    let prompt_path = std::env::var_os("FORGE_BENCH_PROMPT_IDS").map(PathBuf::from);
     let _gpu_lock = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    run_exact_native_mtp_b2_matrix(&path, &prompt_path, ExactB2Mode::Native)
+    run_exact_native_mtp_b2_matrix(&path, prompt_path.as_deref(), ExactB2Mode::Native)
 }
 
 #[test]
@@ -1921,13 +2865,11 @@ fn benchmark_exact_mtp_ngram_b2_dwa_identyczne_requesty() -> TestResult<()> {
     let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
         .map(PathBuf::from)
         .ok_or("macierz wymaga FORGE_TEST_HYBRID_GGUF")?;
-    let prompt_path = std::env::var_os("FORGE_BENCH_PROMPT_IDS")
-        .map(PathBuf::from)
-        .ok_or("macierz wymaga FORGE_BENCH_PROMPT_IDS")?;
+    let prompt_path = std::env::var_os("FORGE_BENCH_PROMPT_IDS").map(PathBuf::from);
     let _gpu_lock = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    run_exact_native_mtp_b2_matrix(&path, &prompt_path, ExactB2Mode::MtpNgram)
+    run_exact_native_mtp_b2_matrix(&path, prompt_path.as_deref(), ExactB2Mode::MtpNgram)
 }
 
 #[test]

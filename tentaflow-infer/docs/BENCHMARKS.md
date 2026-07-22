@@ -90,3 +90,34 @@ TinyLlama F16 22/22); outputs are bit-identical to the unfused path.
 
 Before/after measured on the same tree (same GEMV kernels), fusion isolated
 via stash. Prefill moves within noise (11.2k→11.5k / 259→264 tok/s).
+
+## Aktualizacja 2026-07-22: hybrydowy prefill B2 T32
+
+Model `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`, wariant NVFP4, RTX 4090.
+Każda próba obejmuje dwa requesty, pełne porównanie ID i sampling GPU. Funkcja
+jest domyślnie wyłączona; ON oznacza `FORGE_HYBRID_PREFILL_BATCH=1`, OFF oznacza
+`0`. Zakres wykonawczy jest obecnie ograniczony do NVIDIA warp32 oraz dokładnie
+`B=2`, `T=32`.
+
+| Prompt | Tryb | Prefill tok/s, mediana | TTFT, mediana | E2E, mediana |
+|---|---|---:|---:|---:|
+| raw128 | ON | **309,5** | **827,24 ms** | **1120,08 ms** |
+| raw128 | OFF | 248,6 | 1029,78 ms | 1322,54 ms |
+| raw512 | ON | **320,2** | **3198,02 ms** | **3505,75 ms** |
+| raw512 | OFF | 251,4 | około 4073 ms | około 4380 ms |
+
+Pięć wyników raw512 ON to 320,5; 320,2; 319,9; 320,0; 320,2 tok/s. Każda
+próba wykonała dokładnie 16 kroków B2 i obsłużyła 1024 tokeny wejściowe. Pięć
+wyników raw128 ON to 309,9; 309,5; 309,4; 309,3; 309,5 tok/s; OFF to 248,6;
+248,6; 248,6; 248,5; 248,6 tok/s.
+
+Stały scratch wynosi 450 692 688 B (429,81 MiB). Profil dwóch requestów po
+osiem tokenów zawiera 18 150 launchy, osiem synchronizacji i osiem transferów
+D2H po 8 B, bez kopiowania logitów słownika. Catch-up MTP zachowuje atomową
+transakcję pary, lecz nadal wykonuje dwa seryjne przebiegi macierzowe lane po
+lane. Jest to główny pozostały koszt tej części ścieżki.
+
+Źródła kerneli są zapisane w Mojo z myślą o portowaniu, ale pomiary i testy
+wykonawcze dotyczą wyłącznie NVIDIA warp32. AMD i Metal nie są obecnie
+zweryfikowanymi backendami tej optymalizacji. Surowe logi i raporty `nsys`
+pozostają lokalnie w `/tmp`; nie są częścią repozytorium.

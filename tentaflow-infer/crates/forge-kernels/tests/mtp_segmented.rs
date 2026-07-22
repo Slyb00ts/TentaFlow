@@ -513,7 +513,7 @@ fn run_segmented_attention_exact_case(context: usize, tokens: usize, lane_swap: 
 
 #[test]
 fn segmentowana_atencja_nvidia_jest_bitowo_zgodna_z_serial() {
-    for (context, tokens) in [(1usize, 1usize), (31, 6), (32, 6), (33, 6), (128, 6), (512, 8), (2048, 8)] {
+    for (context, tokens) in [(1usize, 1usize), (31, 6), (32, 6), (32, 32), (33, 6), (64, 32), (128, 6), (512, 8), (2048, 8)] {
         for lane_swap in [false, true] {
             run_segmented_attention_exact_case(context, tokens, lane_swap);
         }
@@ -663,6 +663,7 @@ fn wspoldzielony_skan_i_commit_odtwarzaja_checkpointy_d128() {
     kernels
         .deltanet_gated_scan_segmented_shared_d128_f16(
             &new_output,
+            &new_states,
             &initial,
             &q,
             &k,
@@ -716,6 +717,151 @@ fn wspoldzielony_skan_i_commit_odtwarzaja_checkpointy_d128() {
     device.read(&new_states, 0, &mut new_state_bytes).unwrap();
     assert_eq!(new_output_bytes, old_output_bytes);
     assert_eq!(new_state_bytes, old_state_bytes);
+}
+
+#[test]
+fn wspoldzielony_skan_b2_t32_zachowuje_izolacje_lane_i_stan_koncowy() {
+    let Some(device) = device() else { return };
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let batch = 2usize;
+    let steps = 32usize;
+    let heads = 1usize;
+    let state_dim = 128usize;
+    let state_elements = heads * state_dim * state_dim;
+    let value_elements = batch * steps * heads * state_dim;
+    let gate_elements = batch * steps * heads;
+    let alloc = |bytes| {
+        device
+            .alloc(bytes, MemKind::Device, Pool::Activations)
+            .unwrap()
+    };
+    let initial = alloc(batch * state_elements * 4);
+    let q = alloc(value_elements * 2);
+    let k = alloc(value_elements * 2);
+    let v = alloc(value_elements * 2);
+    let g = alloc(gate_elements * 4);
+    let beta = alloc(gate_elements * 4);
+    let reference_output = alloc(value_elements * 2);
+    let shared_output = alloc(value_elements * 2);
+    let checkpoints = alloc(batch * steps * state_elements * 4);
+    let reference_states = alloc(batch * state_elements * 4);
+    let shared_states = alloc(batch * state_elements * 4);
+    let decisions = alloc(batch * 2 * 4);
+
+    let initial_values: Vec<f32> = (0..batch * state_elements)
+        .map(|index| {
+            let lane = index / state_elements;
+            (index % 29) as f32 * 0.00003 + lane as f32 * 0.0007 - 0.0004
+        })
+        .collect();
+    let q_values: Vec<f16> = (0..value_elements)
+        .map(|index| {
+            let lane = index / (steps * heads * state_dim);
+            f16::from_f32((index % 17) as f32 * 0.001 + lane as f32 * 0.006 - 0.008)
+        })
+        .collect();
+    let k_values: Vec<f16> = (0..value_elements)
+        .map(|index| f16::from_f32((index % 23) as f32 * 0.0008 - 0.009))
+        .collect();
+    let v_values: Vec<f16> = (0..value_elements)
+        .map(|index| {
+            let lane = index / (steps * heads * state_dim);
+            f16::from_f32((index % 19) as f32 * 0.0012 - lane as f32 * 0.004 - 0.01)
+        })
+        .collect();
+    device
+        .write(bytemuck::cast_slice(&initial_values), &initial, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&q_values), &q, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&k_values), &k, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&v_values), &v, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&vec![-0.03f32; gate_elements]), &g, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&vec![0.4f32; gate_elements]), &beta, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&[32i32, 0, 32, 0]), &decisions, 0)
+        .unwrap();
+
+    kernels
+        .deltanet_gated_scan_segmented_d128_f16(
+            &reference_output,
+            &checkpoints,
+            &initial,
+            &q,
+            &k,
+            &v,
+            &g,
+            &beta,
+            batch,
+            steps,
+            heads,
+            state_dim,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .deltanet_gated_scan_segmented_shared_d128_f16(
+            &shared_output,
+            &shared_states,
+            &initial,
+            &q,
+            &k,
+            &v,
+            &g,
+            &beta,
+            batch,
+            steps,
+            heads,
+            state_dim,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .deltanet_commit_checkpoint_segmented_f32(
+            &reference_states,
+            &checkpoints,
+            &decisions,
+            batch,
+            steps,
+            heads,
+            state_dim,
+            &stream,
+        )
+        .unwrap();
+    device.synchronize().unwrap();
+
+    let mut reference_output_bytes = vec![0u8; value_elements * 2];
+    let mut shared_output_bytes = vec![0u8; value_elements * 2];
+    let mut reference_state_bytes = vec![0u8; batch * state_elements * 4];
+    let mut shared_state_bytes = vec![0u8; batch * state_elements * 4];
+    device
+        .read(&reference_output, 0, &mut reference_output_bytes)
+        .unwrap();
+    device
+        .read(&shared_output, 0, &mut shared_output_bytes)
+        .unwrap();
+    device
+        .read(&reference_states, 0, &mut reference_state_bytes)
+        .unwrap();
+    device
+        .read(&shared_states, 0, &mut shared_state_bytes)
+        .unwrap();
+    assert_eq!(shared_output_bytes, reference_output_bytes);
+    assert_eq!(shared_state_bytes, reference_state_bytes);
+    assert_ne!(
+        &shared_state_bytes[..state_elements * 4],
+        &shared_state_bytes[state_elements * 4..]
+    );
 }
 
 #[test]
@@ -837,6 +983,128 @@ fn kernele_b8_nie_czytaja_ani_nie_zapisuja_nieaktywnych_wierszy() {
             .iter()
             .all(|value| value.to_bits() == f32_canary.to_bits()));
     }
+}
+
+#[test]
+fn prepare_segmented_final_b2_t32_jest_zgodny_z_ostatnim_checkpointem() {
+    let Some(device) = device() else { return };
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let (batch, steps, n_k_heads, n_v_heads, d_state, d_conv) =
+        (2usize, 32usize, 2usize, 4usize, 8usize, 4usize);
+    let total = batch * steps;
+    let value_dim = n_v_heads * d_state;
+    let conv_dim = (2 * n_k_heads + n_v_heads) * d_state;
+    let conv_elems = conv_dim * (d_conv - 1);
+    let gate_elems = total * n_v_heads;
+    let vector_elems = total * value_dim;
+    let alloc = |bytes| {
+        device
+            .alloc(bytes, MemKind::Device, Pool::Activations)
+            .unwrap()
+    };
+    let input_values: Vec<f16> = (0..total * conv_dim)
+        .map(|index| f16::from_f32((index % 37) as f32 * 0.0078125 - 0.125))
+        .collect();
+    let initial_values: Vec<f16> = (0..batch * conv_elems)
+        .map(|index| f16::from_f32((index % 19) as f32 * -0.00390625 + 0.03125))
+        .collect();
+    let weight_values: Vec<f16> = (0..conv_dim * d_conv)
+        .map(|index| f16::from_f32((index % 11) as f32 * 0.015625 - 0.078125))
+        .collect();
+    let raw_values: Vec<f16> = (0..gate_elems)
+        .map(|index| f16::from_f32((index % 13) as f32 * 0.03125 - 0.1875))
+        .collect();
+    let parameter_values: Vec<f16> = (0..n_v_heads)
+        .map(|index| f16::from_f32(0.015625 * (index + 1) as f32))
+        .collect();
+    let input = alloc(input_values.len() * 2);
+    let initial = alloc(initial_values.len() * 2);
+    let weight = alloc(weight_values.len() * 2);
+    let alpha = alloc(raw_values.len() * 2);
+    let beta_raw = alloc(raw_values.len() * 2);
+    let dt_bias = alloc(parameter_values.len() * 2);
+    let a_scale = alloc(parameter_values.len() * 2);
+    device.write(bytemuck::cast_slice(&input_values), &input, 0).unwrap();
+    device.write(bytemuck::cast_slice(&initial_values), &initial, 0).unwrap();
+    device.write(bytemuck::cast_slice(&weight_values), &weight, 0).unwrap();
+    device.write(bytemuck::cast_slice(&raw_values), &alpha, 0).unwrap();
+    device.write(bytemuck::cast_slice(&raw_values), &beta_raw, 0).unwrap();
+    device.write(bytemuck::cast_slice(&parameter_values), &dt_bias, 0).unwrap();
+    device.write(bytemuck::cast_slice(&parameter_values), &a_scale, 0).unwrap();
+
+    let old_q = alloc(vector_elems * 2);
+    let old_k = alloc(vector_elems * 2);
+    let old_v = alloc(vector_elems * 2);
+    let old_g = alloc(gate_elems * 4);
+    let old_beta = alloc(gate_elems * 4);
+    let checkpoints = alloc(batch * steps * conv_elems * 2);
+    let final_q = alloc(vector_elems * 2);
+    let final_k = alloc(vector_elems * 2);
+    let final_v = alloc(vector_elems * 2);
+    let final_g = alloc(gate_elems * 4);
+    let final_beta = alloc(gate_elems * 4);
+    let final_conv = alloc(batch * conv_elems * 2);
+    kernels
+        .deltanet_prepare_segmented_f16(
+            &old_q, &old_k, &old_v, &old_g, &old_beta, &checkpoints, &initial, &input,
+            &weight, &alpha, &beta_raw, &dt_bias, &a_scale, batch, steps, n_k_heads,
+            n_v_heads, d_state, d_conv, 1e-6, &stream,
+        )
+        .unwrap();
+    kernels
+        .deltanet_prepare_segmented_final_f16(
+            &final_q, &final_k, &final_v, &final_g, &final_beta, &final_conv, &initial,
+            &input, &weight, &alpha, &beta_raw, &dt_bias, &a_scale, batch, steps,
+            n_k_heads, n_v_heads, d_state, d_conv, 1e-6, &stream,
+        )
+        .unwrap();
+    device.synchronize().unwrap();
+    let read = |buffer: &forge_hal::DevBuffer| {
+        let mut bytes = vec![0u8; buffer.len()];
+        device.read(buffer, 0, &mut bytes).unwrap();
+        bytes
+    };
+    assert_eq!(read(&final_q), read(&old_q));
+    assert_eq!(read(&final_k), read(&old_k));
+    assert_eq!(read(&final_v), read(&old_v));
+    assert_eq!(read(&final_g), read(&old_g));
+    assert_eq!(read(&final_beta), read(&old_beta));
+    let all_checkpoints = read(&checkpoints);
+    let compact = read(&final_conv);
+    for lane in 0..batch {
+        let checkpoint_offset = (lane * steps + steps - 1) * conv_elems * 2;
+        let compact_offset = lane * conv_elems * 2;
+        assert_eq!(
+            &compact[compact_offset..compact_offset + conv_elems * 2],
+            &all_checkpoints[checkpoint_offset..checkpoint_offset + conv_elems * 2]
+        );
+    }
+    assert!(kernels
+        .deltanet_prepare_segmented_final_f16(
+            &final_q,
+            &final_k,
+            &final_v,
+            &final_g,
+            &final_beta,
+            &final_conv,
+            &initial,
+            &input,
+            &weight,
+            &alpha,
+            &beta_raw,
+            &dt_bias,
+            &a_scale,
+            usize::MAX,
+            2,
+            n_k_heads,
+            n_v_heads,
+            d_state,
+            d_conv,
+            1e-6,
+            &stream,
+        )
+        .is_err());
 }
 
 #[test]

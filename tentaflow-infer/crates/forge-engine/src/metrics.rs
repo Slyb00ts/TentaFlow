@@ -105,6 +105,12 @@ pub struct EngineMetrics {
     pub spec_accepted_total: AtomicU64,
     /// Wspólne kroki dwóch sekwencji wykonane przez natywną ścieżkę MTP B2.
     pub native_mtp_b2_steps_total: AtomicU64,
+    /// Wspólne chunki targetowego prefill B2 T32.
+    pub hybrid_prefill_b2_steps_total: AtomicU64,
+    /// Tokeny promptu wykonane przez targetowy prefill B2 T32.
+    pub hybrid_prefill_b2_tokens_total: AtomicU64,
+    /// Pary prefill odrzucone przez capability i wykonane serialnie.
+    pub hybrid_prefill_b2_fallbacks_total: AtomicU64,
     /// Wspólne weryfikacje dwóch pełnych draftów routera MTP+n-gram.
     pub mtp_ngram_b2_steps_total: AtomicU64,
     /// Wspólne weryfikacje routed B2 dla par N/N.
@@ -141,6 +147,9 @@ impl Default for EngineMetrics {
             spec_forwards_total: AtomicU64::new(0),
             spec_accepted_total: AtomicU64::new(0),
             native_mtp_b2_steps_total: AtomicU64::new(0),
+            hybrid_prefill_b2_steps_total: AtomicU64::new(0),
+            hybrid_prefill_b2_tokens_total: AtomicU64::new(0),
+            hybrid_prefill_b2_fallbacks_total: AtomicU64::new(0),
             mtp_ngram_b2_steps_total: AtomicU64::new(0),
             mtp_routed_nn_b2_steps_total: AtomicU64::new(0),
             mtp_routed_nm_b2_steps_total: AtomicU64::new(0),

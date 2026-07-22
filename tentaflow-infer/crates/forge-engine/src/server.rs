@@ -18,7 +18,7 @@ use forge_types::{ForgeError, Result, Vendor};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::metrics::{EngineMetrics, SeqTiming};
-use crate::model::{Model, PrefillProfile, MAX_PREFILL_CHUNK};
+use crate::model::{hybrid_prefill_b2_backend_capable, Model, PrefillProfile, MAX_PREFILL_CHUNK};
 use crate::sample::{
     apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
     SeqSampleParams, TokenLogprob, apply_penalties,
@@ -54,6 +54,8 @@ pub struct EngineRequest {
     /// `logprobs`/`top_logprobs` (SPEC §8.1.2): report each token's
     /// log-probability plus this many top alternatives. Forces the CPU sampler.
     pub logprobs: Option<usize>,
+    /// Emituj także ID tokenów, których fragment tekstu jest pusty.
+    pub emit_empty_tokens: bool,
 }
 
 #[derive(Debug)]
@@ -181,6 +183,7 @@ struct ActiveSeq<'t> {
     /// When set, each token carries a `logprobs` report with this many top
     /// alternatives (CPU path).
     logprobs: Option<usize>,
+    emit_empty_tokens: bool,
     /// Live grammar state for constrained decoding; `None` = unconstrained.
     matcher: Option<forge_grammar::GrammarMatcher>,
     prompt_len: usize,
@@ -322,6 +325,33 @@ fn parse_mtp_ngram_mixed_batch(value: Option<&str>) -> Result<bool> {
     }
 }
 
+fn parse_hybrid_prefill_batch(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_HYBRID_PREFILL_BATCH wymaga wartości 0 lub 1, otrzymano {value:?}"
+        ))),
+    }
+}
+
+fn resolve_hybrid_prefill_batch(
+    requested: bool,
+    vendor: Vendor,
+    warp_size: u32,
+    model_capable: bool,
+) -> Result<bool> {
+    if !requested {
+        return Ok(false);
+    }
+    if !hybrid_prefill_b2_backend_capable(vendor, warp_size) {
+        return Err(ForgeError::Unsupported(format!(
+            "FORGE_HYBRID_PREFILL_BATCH=1 wymaga zweryfikowanego backendu NVIDIA warp32, otrzymano {vendor:?} warp{warp_size}"
+        )));
+    }
+    Ok(model_capable)
+}
+
 fn mtp_ngram_auto_backend(vendor: Vendor, warp_size: u32) -> bool {
     vendor == Vendor::Nvidia && warp_size == 32
 }
@@ -364,6 +394,31 @@ fn mtp_ngram_batch_plan(budgets: &[Option<usize>]) -> (Vec<[usize; 2]>, Vec<usiz
     }
     singles.extend(pending.into_iter().flatten());
     singles.sort_unstable();
+    (pairs, singles)
+}
+
+fn hybrid_prefill_batch_plan(pending_lengths: &[usize]) -> (Vec<[usize; 2]>, Vec<usize>) {
+    const CHUNK: usize = 32;
+    let mut pending = None;
+    let mut pairs = Vec::new();
+    let mut paired = vec![false; pending_lengths.len()];
+    for (index, &length) in pending_lengths.iter().enumerate() {
+        if length < CHUNK {
+            continue;
+        }
+        if let Some(first) = pending.take() {
+            pairs.push([first, index]);
+            paired[first] = true;
+            paired[index] = true;
+        } else {
+            pending = Some(index);
+        }
+    }
+    let singles = paired
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &is_paired)| (!is_paired).then_some(index))
+        .collect();
     (pairs, singles)
 }
 
@@ -519,7 +574,16 @@ pub fn spawn_engine_batched(
     let mtp_ngram_mixed_batch = parse_mtp_ngram_mixed_batch(
         std::env::var("FORGE_MTP_NGRAM_MIXED_BATCH").ok().as_deref(),
     )?;
+    let hybrid_prefill_requested = parse_hybrid_prefill_batch(
+        std::env::var("FORGE_HYBRID_PREFILL_BATCH").ok().as_deref(),
+    )?;
     let caps = model.device.caps();
+    let hybrid_prefill_batch = resolve_hybrid_prefill_batch(
+        hybrid_prefill_requested,
+        caps.vendor,
+        caps.warp_size,
+        model.hybrid_prefill_b2_capable(32),
+    )?;
     let mtp_ngram_batch = resolve_mtp_ngram_batch(
         mtp_ngram_mode,
         caps.vendor,
@@ -541,6 +605,12 @@ pub fn spawn_engine_batched(
     tracing::info!(
         enabled = mtp_ngram_mixed_batch,
         "eksperymentalny rollout MTP+n-gram N/M i M/M B2"
+    );
+    tracing::info!(
+        enabled = hybrid_prefill_batch,
+        capable = model.hybrid_prefill_b2_capable(32),
+        execution_connected = hybrid_prefill_batch && model.hybrid_prefill_b2_capable(32),
+        "eksperymentalny rollout hybrydowego prefill B2 T32"
     );
     let coordinator = SpeculationCoordinator::new(spec.clone())?;
     validate_speculation_server_config(spec.kind(), max_active, model.is_hybrid())?;
@@ -600,6 +670,7 @@ pub fn spawn_engine_batched(
                 native_mtp_b2,
                 mtp_ngram_batch,
                 mtp_ngram_mixed_batch,
+                hybrid_prefill_batch,
                 &worker_metrics,
             )
         })
@@ -624,10 +695,12 @@ fn worker<'t>(
     native_mtp_b2: bool,
     mtp_ngram_batch: bool,
     mtp_ngram_mixed_batch: bool,
+    hybrid_prefill_batch: bool,
     metrics: &EngineMetrics,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
     let mut waiting: VecDeque<Submission> = VecDeque::new();
+    let mut hybrid_prefill_pair_cursor = 0usize;
     let admission_scan_window = max_active.saturating_mul(2).clamp(2, 16);
     let admission_bypass_budget = admission_scan_window.saturating_mul(2);
     // Total KV pages is fixed at startup; export it once as a gauge baseline.
@@ -778,6 +851,7 @@ fn worker<'t>(
                 logit_bias: sub.req.logit_bias,
                 min_tokens: sub.req.min_tokens,
                 logprobs: sub.req.logprobs,
+                emit_empty_tokens: sub.req.emit_empty_tokens,
                 matcher,
                 prompt_len,
                 cache_read,
@@ -843,24 +917,8 @@ fn worker<'t>(
             }
         }
 
-        // One scheduler iteration. Prefilling sequences and any CPU-sampled
-        // decode sequence advance individually (chunked prefill / one token);
-        // every GPU-sampled decode sequence runs through ONE batched forward
-        // pass (`batch_gpu_decode`) — the continuous-batching throughput path.
-        for a in active.iter_mut() {
-            if a.dead {
-                continue;
-            }
-            let gpu = matches!(a.sampler, SeqSampler::Gpu(_));
-            let decoding = a.pending_prompt.is_empty();
-            if gpu && decoding {
-                continue; // handled by the batch below
-            }
-            if let Err(e) = advance(model, a, prefill_chunk, metrics) {
-                let _ = a.events.send(EngineEvent::Error(e.to_string()));
-                a.dead = true;
-            }
-        }
+        // Gotowe decode ma pierwszeństwo przed pracą prefill, aby długi prompt
+        // nie zwiększał ITL już generowanych sekwencji.
         batch_gpu_decode(
             model,
             &mut active,
@@ -870,7 +928,71 @@ fn worker<'t>(
             mtp_ngram_mixed_batch,
             metrics,
         );
+        for a in active.iter_mut() {
+            if a.dead || !a.pending_prompt.is_empty() || matches!(a.sampler, SeqSampler::Gpu(_)) {
+                continue;
+            }
+            if let Err(e) = advance(model, a, prefill_chunk, metrics) {
+                let _ = a.events.send(EngineEvent::Error(e.to_string()));
+                a.dead = true;
+            }
+        }
 
+        let mut prefilled_b2 = None;
+        let mut deferred_b2 = None;
+        if hybrid_prefill_batch {
+            let pending_indices = active
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.dead && !a.pending_prompt.is_empty())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let pending = pending_indices
+                .iter()
+                .map(|&index| active[index].pending_prompt.len())
+                .collect::<Vec<_>>();
+            let (pairs, singles) = hybrid_prefill_batch_plan(&pending);
+            tracing::trace!(?pairs, ?singles, "plan hybrydowego prefill B2 T32");
+            if model.hybrid_prefill_b2_capable(32) && !pairs.is_empty() {
+                deferred_b2 = Some(Vec::with_capacity(pairs.len().saturating_sub(1) * 2));
+                let selected = hybrid_prefill_pair_cursor % pairs.len();
+                hybrid_prefill_pair_cursor = hybrid_prefill_pair_cursor.wrapping_add(1);
+                for (pair_index, [first, second]) in pairs.into_iter().enumerate() {
+                    let indices = [pending_indices[first], pending_indices[second]];
+                    if pair_index == selected {
+                        advance_hybrid_prefill_b2(model, &mut active, indices, metrics);
+                        prefilled_b2 = Some(indices);
+                    } else {
+                        deferred_b2
+                            .as_mut()
+                            .expect("lista odroczonych par jest gotowa")
+                            .extend(indices);
+                    }
+                }
+            } else {
+                EngineMetrics::add(&metrics.hybrid_prefill_b2_fallbacks_total, pairs.len() as u64);
+            }
+        }
+
+        // One scheduler iteration. Prefilling sequences and any CPU-sampled
+        // decode sequence advance individually (chunked prefill / one token);
+        // every GPU-sampled decode sequence runs through ONE batched forward
+        // pass (`batch_gpu_decode`) — the continuous-batching throughput path.
+        for (index, a) in active.iter_mut().enumerate() {
+            if a.dead {
+                continue;
+            }
+            if prefilled_b2.is_some_and(|pair| pair.contains(&index))
+                || deferred_b2.as_ref().is_some_and(|indices| indices.contains(&index))
+                || a.pending_prompt.is_empty()
+            {
+                continue;
+            }
+            if let Err(e) = advance(model, a, prefill_chunk, metrics) {
+                let _ = a.events.send(EngineEvent::Error(e.to_string()));
+                a.dead = true;
+            }
+        }
         // Tear down finished/dead sequences and release their pages (and any
         // tier chunks they spilled).
         active.retain_mut(|a| {
@@ -932,7 +1054,7 @@ fn emit_token(
     // Send a token event when there is text to surface or a per-token
     // `logprobs` report to deliver (the latter must reach the client even for
     // a token whose byte-level piece is still buffered by the decoder).
-    if (!emit_text.is_empty() || logprob.is_some())
+    if (a.emit_empty_tokens || !emit_text.is_empty() || logprob.is_some())
         && a.events
             .send(EngineEvent::Token {
                 id: next,
@@ -955,6 +1077,128 @@ fn emit_token(
         return Ok(StepOutcome::Finished);
     }
     Ok(StepOutcome::Continue)
+}
+
+fn finish_hybrid_prefill_b2_lane(
+    model: &mut Model,
+    active: &mut ActiveSeq<'_>,
+    logits: Vec<f32>,
+    lane: usize,
+) -> Result<()> {
+    if !active.pending_prompt.is_empty() {
+        return Ok(());
+    }
+    active.next = Some(match &mut active.sampler {
+        SeqSampler::Cpu(_) => PendingNext::Logits(logits),
+        SeqSampler::Gpu(sampler) => {
+            PendingNext::Token(model.sample_hybrid_prefill_b2_logits(lane, sampler)?)
+        }
+    });
+    Ok(())
+}
+
+fn advance_hybrid_prefill_b2(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    indices: [usize; 2],
+    metrics: &EngineMetrics,
+) {
+    const STEPS: usize = 32;
+    let [first_index, second_index] = indices;
+    let (left, right) = active.split_at_mut(second_index);
+    let first = &mut left[first_index];
+    let second = &mut right[0];
+    let chunks = [
+        first.pending_prompt.iter().take(STEPS).copied().collect::<Vec<_>>(),
+        second.pending_prompt.iter().take(STEPS).copied().collect::<Vec<_>>(),
+    ];
+    if chunks.iter().any(|chunk| chunk.len() != STEPS) {
+        EngineMetrics::inc(&metrics.hybrid_prefill_b2_fallbacks_total);
+        return;
+    }
+    let reset_mtp = [first.seq.len == 0, second.seq.len == 0];
+    let result = (|| {
+        let gpu_pair = matches!(first.sampler, SeqSampler::Gpu(_))
+            && matches!(second.sampler, SeqSampler::Gpu(_));
+        if gpu_pair {
+            let final_lanes = [
+                first.pending_prompt.len() == STEPS,
+                second.pending_prompt.len() == STEPS,
+            ];
+            model.hybrid_prefill_b2_t32_device(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+            )?;
+            model.hybrid_prefill_mtp_catchup_b2(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+                reset_mtp,
+            )?;
+            let mut ids = [None, None];
+            match final_lanes {
+                [true, true] => {
+                    let sampled = match (&mut first.sampler, &mut second.sampler) {
+                        (SeqSampler::Gpu(first_sampler), SeqSampler::Gpu(second_sampler)) => model
+                            .sample_hybrid_prefill_b2_logits_batched(&mut [
+                                first_sampler,
+                                second_sampler,
+                            ])?,
+                        _ => unreachable!("gpu_pair sprawdził oba samplery"),
+                    };
+                    ids = sampled.map(Some);
+                }
+                [true, false] => {
+                    let SeqSampler::Gpu(sampler) = &mut first.sampler else {
+                        unreachable!("gpu_pair sprawdził sampler lane 0")
+                    };
+                    ids[0] = Some(model.sample_hybrid_prefill_b2_logits(0, sampler)?);
+                }
+                [false, true] => {
+                    let SeqSampler::Gpu(sampler) = &mut second.sampler else {
+                        unreachable!("gpu_pair sprawdził sampler lane 1")
+                    };
+                    ids[1] = Some(model.sample_hybrid_prefill_b2_logits(1, sampler)?);
+                }
+                [false, false] => {}
+            };
+            first.pending_prompt.drain(..STEPS);
+            second.pending_prompt.drain(..STEPS);
+            if let Some(id) = ids[0] {
+                first.next = Some(PendingNext::Token(id));
+            }
+            if let Some(id) = ids[1] {
+                second.next = Some(PendingNext::Token(id));
+            }
+        } else {
+            let [first_logits, second_logits] = model.hybrid_prefill_b2_t32(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+            )?;
+            model.hybrid_prefill_mtp_catchup_b2(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+                reset_mtp,
+            )?;
+            first.pending_prompt.drain(..STEPS);
+            second.pending_prompt.drain(..STEPS);
+            finish_hybrid_prefill_b2_lane(model, first, first_logits, 0)?;
+            finish_hybrid_prefill_b2_lane(model, second, second_logits, 1)?;
+        }
+        Ok::<(), ForgeError>(())
+    })();
+    match result {
+        Ok(()) => {
+            EngineMetrics::inc(&metrics.hybrid_prefill_b2_steps_total);
+            EngineMetrics::add(&metrics.hybrid_prefill_b2_tokens_total, (2 * STEPS) as u64);
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = first.events.send(EngineEvent::Error(message.clone()));
+            let _ = second.events.send(EngineEvent::Error(message));
+            first.dead = true;
+            second.dead = true;
+        }
+    }
 }
 
 /// Advance one sequence by one scheduler quantum (prefill chunk or a single
@@ -2007,7 +2251,12 @@ mod tests {
     };
     use super::parse_mtp_ngram_mixed_batch;
     use super::mtp_routed_pair_enabled;
+    use super::{
+        hybrid_prefill_batch_plan, parse_hybrid_prefill_batch, resolve_hybrid_prefill_batch,
+    };
+    use crate::model::hybrid_prefill_b2_backend_capable;
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
+    use forge_types::Vendor;
 
     #[test]
     fn przelacznik_mtp_b2_wymaga_scislej_wartosci_logicznej() {
@@ -2030,6 +2279,44 @@ mod tests {
         assert!(parse_mtp_ngram_mixed_batch(Some("1")).unwrap());
         assert!(parse_mtp_ngram_mixed_batch(Some("true")).is_err());
         assert!(parse_mtp_ngram_mixed_batch(Some("")).is_err());
+    }
+
+    #[test]
+    fn hybrid_prefill_batch_ma_scisla_flage_i_stabilny_plan_t32() {
+        assert!(!parse_hybrid_prefill_batch(None).unwrap());
+        assert!(!parse_hybrid_prefill_batch(Some("0")).unwrap());
+        assert!(parse_hybrid_prefill_batch(Some("1")).unwrap());
+        assert!(parse_hybrid_prefill_batch(Some("true")).is_err());
+        assert!(parse_hybrid_prefill_batch(Some("")).is_err());
+
+        let (pairs, singles) = hybrid_prefill_batch_plan(&[32, 31, 96, 1, 32]);
+        assert_eq!(pairs, vec![[0, 2]]);
+        assert_eq!(singles, vec![1, 3, 4]);
+        assert_eq!(hybrid_prefill_batch_plan(&[31, 31]), (Vec::new(), vec![0, 1]));
+    }
+
+    #[test]
+    fn hybrid_prefill_b2_wymaga_zweryfikowanego_backendu_nvidia_warp32() {
+        assert!(hybrid_prefill_b2_backend_capable(Vendor::Nvidia, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Nvidia, 64));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Amd, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Amd, 64));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Apple, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Cpu, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Intel, 32));
+
+        assert!(resolve_hybrid_prefill_batch(false, Vendor::Amd, 64, true).is_ok());
+        assert!(resolve_hybrid_prefill_batch(true, Vendor::Nvidia, 32, true).unwrap());
+        assert!(!resolve_hybrid_prefill_batch(true, Vendor::Nvidia, 32, false).unwrap());
+        for (vendor, warp_size) in [
+            (Vendor::Nvidia, 64),
+            (Vendor::Amd, 32),
+            (Vendor::Amd, 64),
+            (Vendor::Apple, 32),
+            (Vendor::Cpu, 32),
+        ] {
+            assert!(resolve_hybrid_prefill_batch(true, vendor, warp_size, true).is_err());
+        }
     }
 
     #[test]

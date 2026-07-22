@@ -153,6 +153,24 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
     );
     counter(
         &mut out,
+        "forge_engine_hybrid_prefill_b2_steps_total",
+        "Wspólne kroki targetowego prefill B2 T32.",
+        load(&engine.hybrid_prefill_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_prefill_b2_tokens_total",
+        "Tokeny promptu wykonane przez targetowy prefill B2 T32.",
+        load(&engine.hybrid_prefill_b2_tokens_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_prefill_b2_fallbacks_total",
+        "Pary prefill skierowane do wykonania serialnego.",
+        load(&engine.hybrid_prefill_b2_fallbacks_total),
+    );
+    counter(
+        &mut out,
         "forge_engine_mtp_ngram_b2_steps_total",
         "MTP+n-gram verifies executed by the paired N/N B2 fast path.",
         load(&engine.mtp_ngram_b2_steps_total),
@@ -242,13 +260,25 @@ mod tests {
     use forge_engine::metrics::EngineMetrics;
 
     #[test]
-    fn prometheus_eksponuje_licznik_mtp_ngram_b2() {
+    fn prometheus_eksponuje_liczniki_prefill_i_mtp_ngram_b2() {
         let engine = EngineMetrics::new();
+        engine
+            .hybrid_prefill_b2_steps_total
+            .store(5, Ordering::Relaxed);
+        engine
+            .hybrid_prefill_b2_tokens_total
+            .store(320, Ordering::Relaxed);
+        engine
+            .hybrid_prefill_b2_fallbacks_total
+            .store(4, Ordering::Relaxed);
         engine.mtp_ngram_b2_steps_total.store(7, Ordering::Relaxed);
         engine.mtp_routed_nn_b2_steps_total.store(3, Ordering::Relaxed);
         engine.mtp_routed_nm_b2_steps_total.store(2, Ordering::Relaxed);
         engine.mtp_routed_mm_b2_steps_total.store(1, Ordering::Relaxed);
         let output = render(&engine, &HttpMetrics::default(), "test");
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_steps_total 5"));
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_tokens_total 320"));
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_fallbacks_total 4"));
         assert!(output.contains("# TYPE forge_engine_mtp_ngram_b2_steps_total counter"));
         assert!(output.contains("forge_engine_mtp_ngram_b2_steps_total 7"));
         assert!(output.contains("forge_engine_mtp_routed_nn_b2_steps_total 3"));

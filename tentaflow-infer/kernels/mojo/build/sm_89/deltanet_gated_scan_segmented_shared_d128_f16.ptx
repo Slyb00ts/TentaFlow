@@ -6,206 +6,218 @@
 .target sm_80
 .address_size 64
 
-	// .globl	src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862
-// src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_0_$__gpu_shared_mem has been demoted
-// src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_1_$__gpu_shared_mem has been demoted
-// src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_2_$__gpu_shared_mem has been demoted
+	// .globl	src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6
+// src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_0_$__gpu_shared_mem has been demoted
+// src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_1_$__gpu_shared_mem has been demoted
+// src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_2_$__gpu_shared_mem has been demoted
 
-.visible .entry src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862(
-	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_0,
-	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_1,
-	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_2,
-	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_3,
-	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_4,
-	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_5,
-	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_6,
-	.param .u64 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_7,
-	.param .u64 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_8,
-	.param .u64 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_9
+.visible .entry src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6(
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_0,
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_1,
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_2,
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_3,
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_4,
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_5,
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_6,
+	.param .u64 .ptr .align 1 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_7,
+	.param .u64 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_8,
+	.param .u64 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_9,
+	.param .u64 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_10
 )
 {
-	.reg .pred 	%p<10>;
+	.reg .pred 	%p<11>;
 	.reg .b16 	%rs<5>;
-	.reg .b32 	%r<42>;
-	.reg .b64 	%rd<67>;
+	.reg .b32 	%r<43>;
+	.reg .b64 	%rd<68>;
 	// demoted variable
-	.shared .align 4 .b8 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_0_$__gpu_shared_mem[512];
+	.shared .align 4 .b8 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_0_$__gpu_shared_mem[512];
 	// demoted variable
-	.shared .align 4 .b8 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_1_$__gpu_shared_mem[512];
+	.shared .align 4 .b8 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_1_$__gpu_shared_mem[512];
 	// demoted variable
-	.shared .align 4 .b8 src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_2_$__gpu_shared_mem[32768];
-	ld.param.b64 	%rd26, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_8];
-	ld.param.b64 	%rd28, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_0];
-	ld.param.b64 	%rd29, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_1];
-	cvta.to.global.u64 	%rd1, %rd29;
-	ld.param.b64 	%rd30, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_3];
-	cvta.to.global.u64 	%rd2, %rd30;
-	ld.param.b64 	%rd31, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_2];
-	cvta.to.global.u64 	%rd3, %rd31;
-	ld.param.b64 	%rd32, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_5];
-	cvta.to.global.u64 	%rd4, %rd32;
-	ld.param.b64 	%rd33, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_4];
-	ld.param.b64 	%rd34, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_6];
-	cvta.to.global.u64 	%rd5, %rd34;
+	.shared .align 4 .b8 src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_2_$__gpu_shared_mem[32768];
+	ld.param.b64 	%rd24, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_9];
+	ld.param.b64 	%rd26, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_0];
+	ld.param.b64 	%rd27, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_2];
+	cvta.to.global.u64 	%rd1, %rd27;
+	ld.param.b64 	%rd28, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_1];
+	cvta.to.global.u64 	%rd2, %rd28;
+	ld.param.b64 	%rd29, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_4];
+	cvta.to.global.u64 	%rd3, %rd29;
+	ld.param.b64 	%rd30, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_3];
+	cvta.to.global.u64 	%rd4, %rd30;
+	ld.param.b64 	%rd31, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_6];
+	cvta.to.global.u64 	%rd5, %rd31;
+	ld.param.b64 	%rd32, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_5];
+	ld.param.b64 	%rd33, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_7];
 	cvta.to.global.u64 	%rd6, %rd33;
-	cvta.to.global.u64 	%rd7, %rd28;
-	mov.u32 	%r10, %ctaid.x;
-	cvt.u64.u32 	%rd39, %r10;
-	shr.u64 	%rd13, %rd39, 1;
-	setp.ge.s64 	%p1, %rd13, %rd26;
-	@%p1 bra 	$L__BB0_16;
-	ld.param.b64 	%rd27, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_9];
-	ld.param.b64 	%rd25, [src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_param_7];
-	max.s64 	%rd9, %rd27, 0;
-	mov.u32 	%r8, %ctaid.y;
-	cvt.u64.u32 	%rd36, %r8;
-	mov.u32 	%r9, %tid.x;
-	cvt.u64.u32 	%rd12, %r9;
-	mul.wide.u32 	%rd41, %r10, 64;
-	and.b64 	%rd42, %rd41, 64;
-	add.s64 	%rd15, %rd42, %rd12;
-	cvt.u32.u64 	%r11, %rd12;
-	shl.b32 	%r12, %r11, 2;
-	mov.b32 	%r13, src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_2_$__gpu_shared_mem;
-	add.s32 	%r2, %r13, %r12;
-	setp.lt.s64 	%p2, %rd27, 1;
+	cvta.to.global.u64 	%rd7, %rd32;
+	cvta.to.global.u64 	%rd8, %rd26;
+	mov.u32 	%r9, %ctaid.x;
+	cvt.u64.u32 	%rd37, %r9;
+	shr.u64 	%rd12, %rd37, 1;
+	setp.ge.s64 	%p1, %rd12, %rd24;
+	@%p1 bra 	$L__BB0_19;
+	ld.param.b64 	%rd25, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_10];
+	ld.param.b64 	%rd23, [src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_param_8];
+	max.s64 	%rd67, %rd25, 0;
+	mov.u32 	%r7, %ctaid.y;
+	cvt.u64.u32 	%rd35, %r7;
+	mul.lo.s64 	%rd36, %rd25, %rd35;
+	mov.u32 	%r8, %tid.x;
+	cvt.u64.u32 	%rd11, %r8;
+	mul.lo.s64 	%rd38, %rd25, %rd12;
+	mad.lo.s64 	%rd39, %rd36, %rd24, %rd38;
+	mul.lo.s64 	%rd13, %rd39, %rd25;
+	mul.wide.u32 	%rd40, %r9, 64;
+	and.b64 	%rd41, %rd40, 64;
+	add.s64 	%rd14, %rd41, %rd11;
+	cvt.u32.u64 	%r10, %rd11;
+	shl.b32 	%r11, %r10, 2;
+	mov.b32 	%r12, src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_2_$__gpu_shared_mem;
+	add.s32 	%r42, %r12, %r11;
+	setp.lt.s64 	%p2, %rd25, 1;
+	shl.b64 	%rd54, %rd13, 2;
+	shl.b64 	%rd55, %rd14, 2;
+	shl.b64 	%rd56, %rd25, 2;
 	@%p2 bra 	$L__BB0_4;
-	mul.lo.s64 	%rd37, %rd27, %rd36;
-	mul.lo.s64 	%rd38, %rd37, %rd26;
-	mul.lo.s64 	%rd11, %rd38, %rd27;
-	mul.lo.s64 	%rd40, %rd27, %rd13;
-	mul.lo.s64 	%rd14, %rd40, %rd27;
-	shl.b64 	%rd43, %rd11, 2;
-	add.s64 	%rd44, %rd1, %rd43;
-	shl.b64 	%rd45, %rd14, 2;
-	add.s64 	%rd46, %rd44, %rd45;
-	shl.b64 	%rd47, %rd15, 2;
-	add.s64 	%rd58, %rd46, %rd47;
-	shl.b64 	%rd16, %rd27, 2;
-	mov.b32 	%r32, %r2;
-	mov.b64 	%rd59, %rd9;
+	add.s64 	%rd42, %rd1, %rd54;
+	add.s64 	%rd57, %rd42, %rd55;
+	mov.b32 	%r32, %r42;
+	mov.b64 	%rd58, %rd67;
 $L__BB0_3:
-	add.s64 	%rd59, %rd59, -1;
-	ld.global.b32 	%r14, [%rd58];
-	st.shared.b32 	[%r32], %r14;
+	add.s64 	%rd58, %rd58, -1;
+	ld.global.b32 	%r13, [%rd57];
+	st.shared.b32 	[%r32], %r13;
 	add.s32 	%r32, %r32, 256;
-	add.s64 	%rd58, %rd58, %rd16;
-	setp.eq.b64 	%p3, %rd59, 0;
+	add.s64 	%rd57, %rd57, %rd56;
+	setp.eq.b64 	%p3, %rd58, 0;
 	@!%p3 bra 	$L__BB0_3;
 $L__BB0_4:
-	setp.lt.s64 	%p4, %rd25, 1;
+	setp.lt.s64 	%p4, %rd23, 1;
 	@%p4 bra 	$L__BB0_16;
-	cvt.rn.f32.s64 	%r7, %rd27;
-	mul.lo.s64 	%rd35, %rd26, %rd25;
-	rsqrt.approx.ftz.f32 	%r1, %r7;
-	max.s64 	%rd8, %rd25, 0;
-	mul.lo.s64 	%rd10, %rd35, %rd36;
-	max.u64 	%rd48, %rd8, 1;
-	add.s64 	%rd60, %rd48, -1;
-	add.s64 	%rd17, %rd10, %rd13;
-	mov.b32 	%r15, src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_1_$__gpu_shared_mem;
-	add.s32 	%r3, %r15, %r12;
-	mov.b32 	%r16, src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_0_$__gpu_shared_mem;
-	add.s32 	%r4, %r16, %r12;
-	shl.b64 	%rd49, %rd12, 1;
-	add.s64 	%rd18, %rd2, %rd49;
-	shl.b64 	%rd19, %rd27, 1;
-	add.s64 	%rd20, %rd3, %rd49;
-	setp.le.s64 	%p5, %rd27, %rd12;
-	mov.b64 	%rd61, %rd8;
+	cvt.rn.f32.s64 	%r6, %rd25;
+	mul.lo.s64 	%rd34, %rd24, %rd23;
+	rsqrt.approx.ftz.f32 	%r1, %r6;
+	max.s64 	%rd9, %rd23, 0;
+	mul.lo.s64 	%rd10, %rd34, %rd35;
+	max.u64 	%rd43, %rd9, 1;
+	add.s64 	%rd59, %rd43, -1;
+	add.s64 	%rd15, %rd10, %rd12;
+	mov.b32 	%r14, src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_1_$__gpu_shared_mem;
+	add.s32 	%r2, %r14, %r11;
+	mov.b32 	%r15, src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_0_$__gpu_shared_mem;
+	add.s32 	%r3, %r15, %r11;
+	shl.b64 	%rd44, %rd11, 1;
+	add.s64 	%rd16, %rd3, %rd44;
+	shl.b64 	%rd17, %rd25, 1;
+	add.s64 	%rd18, %rd4, %rd44;
+	setp.le.s64 	%p5, %rd25, %rd11;
+	mov.b64 	%rd60, %rd9;
 	bra.uni 	$L__BB0_6;
 $L__BB0_15:
-	add.s64 	%rd57, %rd7, %rd55;
-	mul.f32 	%r31, %r1, %r41;
-	cvt.rn.f16.f32 	%rs4, %r31;
-	st.global.b16 	[%rd57], %rs4;
+	add.s64 	%rd52, %rd8, %rd50;
+	mul.f32 	%r30, %r1, %r41;
+	cvt.rn.f16.f32 	%rs4, %r30;
+	st.global.b16 	[%rd52], %rs4;
 	bar.sync 	0;
-	add.s64 	%rd60, %rd21, -1;
-	setp.ne.b64 	%p9, %rd21, 0;
-	mov.b64 	%rd61, %rd21;
-	@!%p9 bra 	$L__BB0_16;
+	add.s64 	%rd59, %rd19, -1;
+	setp.eq.b64 	%p9, %rd19, 0;
+	mov.b64 	%rd60, %rd19;
+	@%p9 bra 	$L__BB0_16;
 $L__BB0_6:
-	mov.b64 	%rd21, %rd60;
-	sub.s64 	%rd50, %rd8, %rd61;
-	mad.lo.s64 	%rd22, %rd50, %rd26, %rd17;
+	mov.b64 	%rd19, %rd59;
+	sub.s64 	%rd45, %rd9, %rd60;
+	mad.lo.s64 	%rd20, %rd45, %rd24, %rd15;
 	@%p5 bra 	$L__BB0_9;
-	mul.lo.s64 	%rd51, %rd19, %rd22;
-	add.s64 	%rd63, %rd18, %rd51;
-	add.s64 	%rd62, %rd20, %rd51;
-	mov.b32 	%r33, %r4;
-	mov.b32 	%r34, %r3;
-	mov.b64 	%rd64, %rd12;
+	mul.lo.s64 	%rd46, %rd17, %rd20;
+	add.s64 	%rd62, %rd16, %rd46;
+	add.s64 	%rd61, %rd18, %rd46;
+	mov.b32 	%r33, %r3;
+	mov.b32 	%r34, %r2;
+	mov.b64 	%rd63, %rd11;
 $L__BB0_8:
-	ld.global.b16 	%rs1, [%rd63];
-	cvt.f32.f16 	%r17, %rs1;
-	st.shared.b32 	[%r33], %r17;
-	ld.global.b16 	%rs2, [%rd62];
-	cvt.f32.f16 	%r18, %rs2;
-	st.shared.b32 	[%r34], %r18;
-	add.s64 	%rd64, %rd64, 64;
+	ld.global.b16 	%rs1, [%rd62];
+	cvt.f32.f16 	%r16, %rs1;
+	st.shared.b32 	[%r33], %r16;
+	ld.global.b16 	%rs2, [%rd61];
+	cvt.f32.f16 	%r17, %rs2;
+	st.shared.b32 	[%r34], %r17;
+	add.s64 	%rd63, %rd63, 64;
 	add.s32 	%r34, %r34, 256;
 	add.s32 	%r33, %r33, 256;
-	add.s64 	%rd63, %rd63, 128;
 	add.s64 	%rd62, %rd62, 128;
-	setp.lt.s64 	%p6, %rd64, %rd27;
+	add.s64 	%rd61, %rd61, 128;
+	setp.lt.s64 	%p6, %rd63, %rd25;
 	@%p6 bra 	$L__BB0_8;
 $L__BB0_9:
 	bar.sync 	0;
-	shl.b64 	%rd52, %rd22, 2;
-	add.s64 	%rd53, %rd4, %rd52;
-	ld.global.b32 	%r21, [%rd53];
-	mul.f32 	%r20, %r21, 0f3FB8AA3B;
-	ex2.approx.ftz.f32 %r19, %r20;
+	shl.b64 	%rd47, %rd20, 2;
+	add.s64 	%rd48, %rd5, %rd47;
+	ld.global.b32 	%r20, [%rd48];
+	mul.f32 	%r19, %r20, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 %r18, %r19;
 	mov.b32 	%r41, 0f00000000;
 	mov.b32 	%r37, %r41;
 	@%p2 bra 	$L__BB0_12;
 	mov.b32 	%r37, 0f00000000;
-	mov.b32 	%r35, %r2;
-	mov.b32 	%r36, %r16;
-	mov.b64 	%rd65, %rd9;
+	mov.b32 	%r35, %r42;
+	mov.b32 	%r36, %r15;
+	mov.b64 	%rd64, %rd67;
 $L__BB0_11:
-	add.s64 	%rd65, %rd65, -1;
-	ld.shared.b32 	%r22, [%r35];
-	mul.f32 	%r23, %r19, %r22;
-	st.shared.b32 	[%r35], %r23;
-	ld.shared.b32 	%r24, [%r36];
-	fma.rn.f32 	%r37, %r23, %r24, %r37;
+	add.s64 	%rd64, %rd64, -1;
+	ld.shared.b32 	%r21, [%r35];
+	mul.f32 	%r22, %r18, %r21;
+	st.shared.b32 	[%r35], %r22;
+	ld.shared.b32 	%r23, [%r36];
+	fma.rn.f32 	%r37, %r22, %r23, %r37;
 	add.s32 	%r36, %r36, 4;
 	add.s32 	%r35, %r35, 256;
-	setp.ne.b64 	%p7, %rd65, 0;
+	setp.ne.b64 	%p7, %rd64, 0;
 	@%p7 bra 	$L__BB0_11;
 $L__BB0_12:
-	mul.lo.s64 	%rd23, %rd22, %rd27;
-	add.s64 	%rd24, %rd23, %rd15;
-	shl.b64 	%rd55, %rd24, 1;
+	mul.lo.s64 	%rd21, %rd20, %rd25;
+	add.s64 	%rd22, %rd21, %rd14;
+	shl.b64 	%rd50, %rd22, 1;
 	@%p2 bra 	$L__BB0_15;
-	add.s64 	%rd54, %rd5, %rd52;
-	ld.global.b32 	%r5, [%rd54];
-	add.s64 	%rd56, %rd6, %rd55;
-	ld.global.b16 	%rs3, [%rd56];
-	cvt.f32.f16 	%r25, %rs3;
-	sub.f32 	%r26, %r25, %r37;
-	mul.f32 	%r6, %r5, %r26;
+	add.s64 	%rd49, %rd6, %rd47;
+	ld.global.b32 	%r4, [%rd49];
+	add.s64 	%rd51, %rd7, %rd50;
+	ld.global.b16 	%rs3, [%rd51];
+	cvt.f32.f16 	%r24, %rs3;
+	sub.f32 	%r25, %r24, %r37;
+	mul.f32 	%r5, %r4, %r25;
 	mov.b32 	%r41, 0f00000000;
-	mov.b32 	%r40, src_deltanet_verify_deltanet_g6A6A6A6A_3cc0633d04111862_$__global_alloc_0_$__gpu_shared_mem;
-	mov.b32 	%r38, %r2;
-	mov.b32 	%r39, %r15;
-	mov.b64 	%rd66, %rd9;
+	mov.b32 	%r40, src_deltanet_verify_deltanet_g6A6A6A6A_e6cdf5546d219fe6_$__global_alloc_0_$__gpu_shared_mem;
+	mov.b32 	%r38, %r42;
+	mov.b32 	%r39, %r14;
+	mov.b64 	%rd65, %rd67;
 $L__BB0_14:
-	add.s64 	%rd66, %rd66, -1;
-	ld.shared.b32 	%r27, [%r40];
-	ld.shared.b32 	%r28, [%r38];
-	fma.rn.f32 	%r29, %r6, %r27, %r28;
-	st.shared.b32 	[%r38], %r29;
-	ld.shared.b32 	%r30, [%r39];
-	fma.rn.f32 	%r41, %r29, %r30, %r41;
+	add.s64 	%rd65, %rd65, -1;
+	ld.shared.b32 	%r26, [%r40];
+	ld.shared.b32 	%r27, [%r38];
+	fma.rn.f32 	%r28, %r5, %r26, %r27;
+	st.shared.b32 	[%r38], %r28;
+	ld.shared.b32 	%r29, [%r39];
+	fma.rn.f32 	%r41, %r28, %r29, %r41;
 	add.s32 	%r40, %r40, 4;
 	add.s32 	%r39, %r39, 4;
 	add.s32 	%r38, %r38, 256;
-	setp.ne.b64 	%p8, %rd66, 0;
+	setp.ne.b64 	%p8, %rd65, 0;
 	@%p8 bra 	$L__BB0_14;
 	bra.uni 	$L__BB0_15;
 $L__BB0_16:
+	@%p2 bra 	$L__BB0_19;
+	add.s64 	%rd53, %rd2, %rd54;
+	add.s64 	%rd66, %rd53, %rd55;
+$L__BB0_18:
+	add.s64 	%rd67, %rd67, -1;
+	ld.shared.b32 	%r31, [%r42];
+	st.global.b32 	[%rd66], %r31;
+	add.s32 	%r42, %r42, 256;
+	add.s64 	%rd66, %rd66, %rd56;
+	setp.ne.b64 	%p10, %rd67, 0;
+	@%p10 bra 	$L__BB0_18;
+$L__BB0_19:
 	ret;
 
 }

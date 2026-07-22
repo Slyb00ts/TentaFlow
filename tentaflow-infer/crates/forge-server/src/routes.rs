@@ -307,6 +307,7 @@ pub(crate) async fn start_generation(
                             logit_bias: spec.logit_bias.clone(),
                             min_tokens: spec.min_tokens,
                             logprobs: spec.logprobs,
+                            emit_empty_tokens: false,
                         })
                         .map_err(|e| ApiError::internal(e.to_string()))?;
                     streams.push(rx);
