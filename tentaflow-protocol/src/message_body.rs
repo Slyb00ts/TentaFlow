@@ -2693,6 +2693,60 @@ pub struct MlStudioRecogImportRecordingsStatusResponse {
     pub outcomes: Vec<MlStudioRecordingOutcome>,
 }
 
+/// Podgląd projektu udostępnionego przez ZDALNĄ, niesparowaną instancję. `url` to
+/// link „share" (albo bezpośredni `/ml-studio/share/<id>/manifest`, albo baza),
+/// `api_key` to klucz Bearer. Handler pobiera TYLKO manifest (tani podgląd, bez
+/// pobierania archiwum) przez utwardzony klient HTTPS.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportPreviewRequest {
+    pub url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportPreviewResponse {
+    pub project_name: String,
+    pub project_type: String,
+    pub datasets: Vec<MlStudioImportDatasetInfo>,
+    pub classes: Vec<String>,
+    pub archive_bytes: u64,
+    pub archive_version: u32,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Start zdalnego importu: pobranie archiwum ZIP z instancji źródłowej i import
+/// jako NOWY projekt lokalny. Job w tle; postęp przez `RemoteImportStatusRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStartRequest {
+    pub url: String,
+    pub api_key: String,
+    #[serde(default)]
+    pub name_override: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStartResponse {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStatusRequest {
+    pub job_id: String,
+}
+
+/// Postęp zdalnego importu. `phase` obejmuje etap „downloading" przed fazami
+/// importu archiwum („extracting" | „registering").
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -2827,6 +2881,12 @@ pub enum MlStudioPayload {
     RecogImportRecordingsResponse(MlStudioRecogImportRecordingsResponse),
     RecogImportRecordingsStatusRequest(MlStudioRecogImportRecordingsStatusRequest),
     RecogImportRecordingsStatusResponse(MlStudioRecogImportRecordingsStatusResponse),
+    RemoteImportPreviewRequest(MlStudioRemoteImportPreviewRequest),
+    RemoteImportPreviewResponse(MlStudioRemoteImportPreviewResponse),
+    RemoteImportStartRequest(MlStudioRemoteImportStartRequest),
+    RemoteImportStartResponse(MlStudioRemoteImportStartResponse),
+    RemoteImportStatusRequest(MlStudioRemoteImportStatusRequest),
+    RemoteImportStatusResponse(MlStudioRemoteImportStatusResponse),
 }
 
 // ----- Robots screen (UserSession) -----

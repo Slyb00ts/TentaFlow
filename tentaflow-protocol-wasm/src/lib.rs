@@ -3125,6 +3125,49 @@ pub fn encode_ml_studio_recog_import_recordings_status_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioRemoteImportPreviewRequest)]
+pub fn encode_ml_studio_remote_import_preview_request(
+    url: String,
+    api_key: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RemoteImportPreviewRequest(
+            tentaflow_protocol::MlStudioRemoteImportPreviewRequest { url, api_key },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRemoteImportStartRequest)]
+pub fn encode_ml_studio_remote_import_start_request(
+    url: String,
+    api_key: String,
+    name_override: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RemoteImportStartRequest(
+            tentaflow_protocol::MlStudioRemoteImportStartRequest {
+                url,
+                api_key,
+                name_override,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRemoteImportStatusRequest)]
+pub fn encode_ml_studio_remote_import_status_request(
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RemoteImportStatusRequest(
+            tentaflow_protocol::MlStudioRemoteImportStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -11583,6 +11626,80 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 outcomes.push(&entry);
             }
             set(obj, "outcomes", outcomes.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportPreviewRequest(req) => {
+            set(obj, "variant", "MlStudioRemoteImportPreviewRequest".into());
+            set(obj, "url", req.url.into());
+            set(obj, "apiKey", req.api_key.clone().into());
+            set(obj, "api_key", req.api_key.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportPreviewResponse(resp) => {
+            set(obj, "variant", "MlStudioRemoteImportPreviewResponse".into());
+            set(obj, "projectName", resp.project_name.clone().into());
+            set(obj, "project_name", resp.project_name.into());
+            set(obj, "projectType", resp.project_type.clone().into());
+            set(obj, "project_type", resp.project_type.into());
+            let datasets = js_sys::Array::new();
+            for d in &resp.datasets {
+                let entry = js_sys::Object::new();
+                set(&entry, "datasetId", d.dataset_id.clone().into());
+                set(&entry, "dataset_id", d.dataset_id.clone().into());
+                set(&entry, "name", d.name.clone().into());
+                set(&entry, "imageCount", (d.image_count as f64).into());
+                set(&entry, "image_count", (d.image_count as f64).into());
+                set(&entry, "annotationCount", (d.annotation_count as f64).into());
+                set(&entry, "annotation_count", (d.annotation_count as f64).into());
+                datasets.push(&entry);
+            }
+            set(obj, "datasets", datasets.into());
+            let classes = js_sys::Array::new();
+            for c in &resp.classes {
+                classes.push(&JsValue::from_str(c));
+            }
+            set(obj, "classes", classes.into());
+            set(obj, "archiveBytes", (resp.archive_bytes as f64).into());
+            set(obj, "archive_bytes", (resp.archive_bytes as f64).into());
+            set(obj, "archiveVersion", resp.archive_version.into());
+            set(obj, "archive_version", resp.archive_version.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStartRequest(req) => {
+            set(obj, "variant", "MlStudioRemoteImportStartRequest".into());
+            set(obj, "url", req.url.into());
+            set(obj, "apiKey", req.api_key.clone().into());
+            set(obj, "api_key", req.api_key.into());
+            let name_override = match req.name_override {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "nameOverride", name_override.clone());
+            set(obj, "name_override", name_override);
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStartResponse(resp) => {
+            set(obj, "variant", "MlStudioRemoteImportStartResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStatusRequest(req) => {
+            set(obj, "variant", "MlStudioRemoteImportStatusRequest".into());
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioRemoteImportStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "bytesTotal", (resp.bytes_total as f64).into());
+            set(obj, "bytes_total", (resp.bytes_total as f64).into());
+            set(obj, "bytesDone", (resp.bytes_done as f64).into());
+            set(obj, "bytes_done", (resp.bytes_done as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
         }
     }
 }

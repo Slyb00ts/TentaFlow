@@ -38,6 +38,7 @@ pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod ml_studio;
+pub mod ml_studio_remote_import;
 pub mod model_metrics;
 pub mod recorder;
 pub mod resume_token;
@@ -934,6 +935,24 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusResponse(_) => {
                 "MlStudioRecogImportRecordingsStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportPreviewRequest(_) => {
+                "MlStudioRemoteImportPreviewRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportPreviewResponse(_) => {
+                "MlStudioRemoteImportPreviewResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStartRequest(_) => {
+                "MlStudioRemoteImportStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStartResponse(_) => {
+                "MlStudioRemoteImportStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStatusRequest(_) => {
+                "MlStudioRemoteImportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStatusResponse(_) => {
+                "MlStudioRemoteImportStatusResponse"
             }
         },
         MessageBody::RobotsBody(p) => match p {

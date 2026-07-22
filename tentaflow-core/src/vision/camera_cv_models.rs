@@ -510,7 +510,7 @@ fn per_file_ceiling(declared_size: u64, cumulative: u64) -> std::result::Result<
 /// Read a manifest response body with a hard cap. Content-Length MUST be
 /// present and within the cap, and the body is streamed with a running counter
 /// so a lying (or absent-then-huge) body is aborted before it is buffered.
-async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8>> {
+pub(crate) async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8>> {
     match response.content_length() {
         Some(len) if len <= MANIFEST_BODY_LIMIT => {}
         Some(_) => {
@@ -549,7 +549,7 @@ async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8
 /// Drop `?<query>` fragments from an error message so signed-URL tokens never
 /// land in deploy logs. Everything from a `?` to the next whitespace/quote is
 /// replaced with `?<redacted>`.
-fn redact_query_strings(msg: &str) -> String {
+pub(crate) fn redact_query_strings(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut skipping = false;
     for c in msg.chars() {
@@ -853,7 +853,7 @@ async fn download_signed_file(
 /// compromised serving node must not be able to bounce the pull (with its
 /// Bearer key) to an arbitrary destination. Pinning the resolved address closes
 /// the DNS-rebind window between the SSRF check and connect.
-fn bundle_http_client(base: &reqwest::Url) -> Result<reqwest::Client> {
+pub(crate) fn bundle_http_client(base: &reqwest::Url) -> Result<reqwest::Client> {
     let host = base
         .host_str()
         .ok_or_else(|| anyhow!("bundle URL has no host"))?;

@@ -3962,6 +3962,59 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(RemoteImportPreviewRequest) — fetches ONLY the remote
+   * share manifest from an unpaired instance for a cheap preview (no archive
+   * download). payload: { url, apiKey }.
+   */
+  mlStudioRemoteImportPreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRemoteImportPreviewRequest(
+      String(payload.url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RemoteImportStartRequest) — downloads the remote
+   * archive and imports it as a NEW local project. payload: { url, apiKey, nameOverride? }.
+   */
+  mlStudioRemoteImportStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const nameOverride = payload.nameOverride ?? payload.name_override;
+    const body = _wasm.encodeMlStudioRemoteImportStartRequest(
+      String(payload.url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+      nameOverride == null ? undefined : String(nameOverride),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(RemoteImportStatusRequest). payload: { jobId }. */
+  mlStudioRemoteImportStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRemoteImportStatusRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
    * with optional tag/source/status filters.
    * payload: { tag?, source?, status? }

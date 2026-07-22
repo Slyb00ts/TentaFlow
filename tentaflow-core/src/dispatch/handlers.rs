@@ -405,9 +405,12 @@ pub fn api_key_list_request(
 /// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
 /// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
 fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
-    if !matches!(resource_type, "model" | "flow" | "alias" | "model_bundle") {
+    if !matches!(
+        resource_type,
+        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export"
+    ) {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow', 'alias' or 'model_bundle'",
+            "resource_type must be 'model', 'flow', 'alias', 'model_bundle' or 'ml_studio_export'",
         ));
     }
     if resource_id.is_empty() {
@@ -420,6 +423,13 @@ fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(),
     {
         return Err(ProtocolError::bad_request(
             "resource_id is not a shareable model bundle",
+        ));
+    }
+    // ml_studio_export scopes gate the per-project export archive download — the
+    // resource_id is an ML Studio project id, which is a v4 UUID.
+    if resource_type == "ml_studio_export" && uuid::Uuid::parse_str(resource_id).is_err() {
+        return Err(ProtocolError::bad_request(
+            "resource_id is not a valid ML Studio project id",
         ));
     }
     Ok(())

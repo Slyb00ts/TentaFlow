@@ -751,6 +751,15 @@ pub fn ml_studio_import_staging_dir() -> PathBuf {
     cache_dir().join("ml-studio-imports")
 }
 
+/// Cache directory for on-demand ML Studio project SHARE archives served to
+/// unpaired instances over `/ml-studio/share/<project_id>/archive`. Separate
+/// from `ml_studio_exports_dir()` (user-initiated browser downloads) so the
+/// two lifecycles do not collide; lives under `cache_dir()` for the same
+/// off-root-disk reason as the sibling ML Studio dirs.
+pub fn ml_studio_share_cache_dir() -> PathBuf {
+    cache_dir().join("ml-studio-share-cache")
+}
+
 /// Idempotent: creates `data/`, `models/`, `models/torch/`, `cache/`, and
 /// extracts the embedded `tentaflow-containers/` bundle into `containers/`
 /// when the bundle fingerprint changes (or on first start). Re-extraction
