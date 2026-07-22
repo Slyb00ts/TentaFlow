@@ -229,9 +229,9 @@ DeltaNet. W trybie z budżetem 3 scheduler adaptacyjnie wybiera K=2 lub K=3 na
 podstawie zmierzonego tempa zaakceptowanych tokenów.
 
 Natywne MTP zachowuje wynik sekwencyjnego greedy i obecnie wymaga
-`temperature=0`, próbkowania GPU, braku repetition penalty oraz
-`max_active=1` do czasu podłączenia startup preflightu, admission wielu
-sekwencji i grafów verifiera per slot. Target DeltaNet oraz draft MTP mają już
+`temperature=0`, próbkowania GPU i braku repetition penalty. `max_active > 1`
+jest dopuszczane po atomowym startup preflightcie i działa przez seryjnie
+przeplatany forward per sekwencja. Target DeltaNet oraz draft MTP mają
 izolowany stan per sekwencja i wspólną pulę stron MTP. Zostało przetestowane na
 CUDA/RTX 4090 z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`; wspólne źródła
 Mojo są przygotowane do dalszego codegenu, ale nie stanowią dowodu uruchomienia

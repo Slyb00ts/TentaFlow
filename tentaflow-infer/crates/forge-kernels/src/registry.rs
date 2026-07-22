@@ -113,6 +113,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "deltanet_gated_scan_dynamic_f16",
     "deltanet_gated_scan_dynamic_d128_f16",
     "deltanet_gated_scan_inplace_dynamic_d128_f16",
+    "deltanet_gated_scan_inplace_shared_d128_f16",
     "deltanet_commit_checkpoint_f32",
     "deltanet_gated_rmsnorm_f16",
     "deltanet_log_decay_f32",
@@ -692,6 +693,7 @@ mod tests {
         "deltanet_gated_scan_dynamic_f16",
         "deltanet_gated_scan_dynamic_d128_f16",
         "deltanet_gated_scan_inplace_dynamic_d128_f16",
+        "deltanet_gated_scan_inplace_shared_d128_f16",
     ];
 
     const PORTABLE_SAMPLING_PENALTIES: &[&str] = &[

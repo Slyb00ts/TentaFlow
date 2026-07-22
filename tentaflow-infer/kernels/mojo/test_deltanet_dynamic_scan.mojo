@@ -11,6 +11,7 @@ from src.deltanet_verify import (
     deltanet_gated_scan_dynamic_f16,
     deltanet_gated_scan_dynamic_d128_f16,
     deltanet_gated_scan_inplace_dynamic_d128_f16,
+    deltanet_gated_scan_inplace_shared_d128_f16,
 )
 
 comptime N_V = 32
@@ -93,6 +94,7 @@ def _tile_width_case(ctx: DeviceContext) raises:
     comptime steps = 128
     var state32 = ctx.enqueue_create_buffer[DType.float32](REAL_STATE_ELEMENTS)
     var state64 = ctx.enqueue_create_buffer[DType.float32](REAL_STATE_ELEMENTS)
+    var state_shared = ctx.enqueue_create_buffer[DType.float32](REAL_STATE_ELEMENTS)
     var q = ctx.enqueue_create_buffer[DType.float16](steps * REAL_VECTOR_ELEMENTS)
     var k = ctx.enqueue_create_buffer[DType.float16](steps * REAL_VECTOR_ELEMENTS)
     var v = ctx.enqueue_create_buffer[DType.float16](steps * REAL_VECTOR_ELEMENTS)
@@ -100,12 +102,14 @@ def _tile_width_case(ctx: DeviceContext) raises:
     var beta = ctx.enqueue_create_buffer[DType.float32](steps * REAL_N_V)
     var out32 = ctx.enqueue_create_buffer[DType.float16](steps * REAL_VECTOR_ELEMENTS)
     var out64 = ctx.enqueue_create_buffer[DType.float16](steps * REAL_VECTOR_ELEMENTS)
+    var out_shared = ctx.enqueue_create_buffer[DType.float16](steps * REAL_VECTOR_ELEMENTS)
 
-    with state32.map_to_host() as host32, state64.map_to_host() as host64:
+    with state32.map_to_host() as host32, state64.map_to_host() as host64, state_shared.map_to_host() as host_shared:
         for i in range(len(host32)):
             value = Float32((i * 13 + 17) % 31 - 15) * 0.0001
             host32[i] = value
             host64[i] = value
+            host_shared[i] = value
     with q.map_to_host() as qh, k.map_to_host() as kh, v.map_to_host() as vh:
         for i in range(len(qh)):
             qh[i] = Float16(Float32((i * 7 + 3) % 19 - 9) * 0.003)
@@ -126,6 +130,11 @@ def _tile_width_case(ctx: DeviceContext) raises:
         v.unsafe_ptr(), g.unsafe_ptr(), beta.unsafe_ptr(), steps, REAL_N_V,
         D_STATE, grid_dim=REAL_N_V * 2, block_dim=64,
     )
+    ctx.enqueue_function[deltanet_gated_scan_inplace_shared_d128_f16](
+        out_shared.unsafe_ptr(), state_shared.unsafe_ptr(), q.unsafe_ptr(), k.unsafe_ptr(),
+        v.unsafe_ptr(), g.unsafe_ptr(), beta.unsafe_ptr(), steps, REAL_N_V,
+        D_STATE, grid_dim=REAL_N_V * 2, block_dim=64,
+    )
     ctx.synchronize()
 
     with out32.map_to_host() as reference, out64.map_to_host() as result:
@@ -136,6 +145,14 @@ def _tile_width_case(ctx: DeviceContext) raises:
         for i in range(len(reference)):
             if reference[i].to_bits() != result[i].to_bits():
                 raise Error("block64 zmienia stan skanu DeltaNet")
+    with out64.map_to_host() as reference, out_shared.map_to_host() as result:
+        for i in range(len(reference)):
+            if reference[i].to_bits() != result[i].to_bits():
+                raise Error("shared block64 zmienia wyjscie skanu DeltaNet")
+    with state64.map_to_host() as reference, state_shared.map_to_host() as result:
+        for i in range(len(reference)):
+            if reference[i].to_bits() != result[i].to_bits():
+                raise Error("shared block64 zmienia stan skanu DeltaNet")
 
     var started = perf_counter_ns()
     for _ in range(BENCH_ITERS):
@@ -156,13 +173,34 @@ def _tile_width_case(ctx: DeviceContext) raises:
         )
     ctx.synchronize()
     var elapsed64 = Float64(perf_counter_ns() - started) / 1e3 / BENCH_ITERS
-    print("T=128 block32:", elapsed32, "us; block64:", elapsed64, "us")
+
+    started = perf_counter_ns()
+    for _ in range(BENCH_ITERS):
+        ctx.enqueue_function[deltanet_gated_scan_inplace_shared_d128_f16](
+            out_shared.unsafe_ptr(), state_shared.unsafe_ptr(), q.unsafe_ptr(), k.unsafe_ptr(),
+            v.unsafe_ptr(), g.unsafe_ptr(), beta.unsafe_ptr(), steps, REAL_N_V,
+            D_STATE, grid_dim=REAL_N_V * 2, block_dim=64,
+        )
+    ctx.synchronize()
+    var elapsed_shared = Float64(perf_counter_ns() - started) / 1e3 / BENCH_ITERS
+    print(
+        "T=128 block32:", elapsed32, "us; block64:", elapsed64,
+        "us; shared block64:", elapsed_shared, "us",
+    )
 
     with out32.map_to_host() as reference, out64.map_to_host() as result:
         for i in range(len(reference)):
             if reference[i].to_bits() != result[i].to_bits():
                 raise Error("block64 traci zgodność po benchmarku")
-    print("PASS dynamic scan block32=block64 T=128")
+    with out64.map_to_host() as reference, out_shared.map_to_host() as result:
+        for i in range(len(reference)):
+            if reference[i].to_bits() != result[i].to_bits():
+                raise Error("shared block64 traci zgodnosc po benchmarku")
+    with state64.map_to_host() as reference, state_shared.map_to_host() as result:
+        for i in range(len(reference)):
+            if reference[i].to_bits() != result[i].to_bits():
+                raise Error("shared block64 zmienia stan po benchmarku")
+    print("PASS dynamic scan block32=block64=shared T=128")
 
 
 def main() raises:

@@ -143,8 +143,8 @@ enum Command {
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3]. `on`
-        /// używa proposera n-gram. MTP wymaga greedy bez kar oraz
-        /// `--max-active 1`. Spekulacja wymusza `--prefix-cache off`.
+        /// używa proposera n-gram. MTP wymaga greedy bez kar; `max-active > 1`
+        /// przechodzi startup preflight pamięci. Spekulacja wyłącza prefix cache.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
     },
@@ -618,16 +618,8 @@ fn resolve_max_active(
             8
         }
     }));
-    if max_active != 1 {
-        if hybrid_model {
-            bail!("modele hybrydowe wymagają --max-active 1 do czasu podłączenia startup preflightu i grafów per slot");
-        }
-        if matches!(
-            spec.kind(),
-            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
-        ) {
-            bail!("--speculative mtp oraz mtp+ngram wymagają --max-active 1 do czasu podłączenia wielosekwencyjnego admission");
-        }
+    if max_active == 0 {
+        bail!("--max-active musi być większe od zera");
     }
     Ok(max_active)
 }
@@ -1780,7 +1772,7 @@ mod speculation_cli_tests {
             assert_eq!(config.kind(), SpeculationKind::NativeMtpNgram);
             assert_eq!(config.draft_tokens(), expected_budget);
             assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
-            assert!(resolve_max_active(Some(2), &config, true).is_err());
+            assert_eq!(resolve_max_active(Some(2), &config, true).unwrap(), 2);
         }
     }
 
@@ -1792,7 +1784,8 @@ mod speculation_cli_tests {
         assert_eq!(resolve_max_active(None, &off, false).unwrap(), 8);
         assert_eq!(resolve_max_active(None, &off, true).unwrap(), 1);
         assert_eq!(resolve_max_active(Some(1), &mtp, true).unwrap(), 1);
-        assert!(resolve_max_active(Some(2), &mtp, true).is_err());
+        assert_eq!(resolve_max_active(Some(2), &mtp, true).unwrap(), 2);
+        assert!(resolve_max_active(Some(0), &mtp, true).is_err());
     }
 
     #[test]

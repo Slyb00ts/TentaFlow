@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 use forge_types::{DeviceCaps, ForgeError, MemKind, Result};
 
+pub const DEVICE_ALLOC_ALIGN: usize = 256;
+
 /// Logical VRAM sub-pool an allocation is served from (spec §3.2). Only
 /// meaningful for `MemKind::Device`; host-side kinds ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -546,7 +546,7 @@ Ostatnia aktualizacja: 2026-07-21.
   paged cache MTP. Router `mtp+ngram:2|3` daje
   pierwszeństwo pełnemu draftowi n-gram, dogania MTP po zaakceptowanym prefiksie,
   a na miss używa natywnego MTP; raportuje osobne liczniki obu ścieżek. Wymaga
-  greedy i `max_active=1`;
+  greedy; `max_active=2` przechodzi produkcyjny E2E admission/cancel/reuse;
   sprawdzone wykonawczo tylko na CUDA. Braki: draft-model / EAGLE / DFlash /
   DSpark, tree-verification (spec-sampling), spekulacja stochastyczna (`temp>0`)
   oraz backendy AMD/Metal.
@@ -592,10 +592,13 @@ Ostatnia aktualizacja: 2026-07-21.
     Lease obejmuje też osobny stan draftu MTP i `SeqKv` korzystający ze wspólnego
     paged cache MTP. Test Qwen3.6 NVFP4 potwierdza parity targetu, pure MTP oraz
     MTP+n-gram dla dwóch sekwencji przeplatanych A/B, wraz z cancel i release/reuse.
-    Scheduler nadal wymusza `max_active=1` do następnej fazy continuous batching.
-    Globalny graph verifiera
-    jest wyłączany po zaalokowaniu wielu slotów, ponieważ przechwycił adresy SSM
-    jednego lease; pełna ścieżka wymaga grafów per slot.
+    Startup atomowo rezerwuje żądaną liczbę slotów albo zwraca wymagane i dostępne
+    bajty. Scheduler obsługuje continuous admission przez seryjne przeplatanie.
+    Verifier przechowuje osobne grafy T=3/4 dla każdego stabilnego identyfikatora
+    slotu. Profil `nsys` dla długiego przebiegu wykazał 2 capture i 46 replay przy
+    `max_active=1` oraz 4 capture i 96 replay przy `max_active=2`.
+    Seryjne przeplatanie nie skaluje aggregate throughput; pełna ścieżka wymaga
+    batchowych kerneli hybrydowych.
     Warstwy atencji używają paged KV.
   - ✅ **Wagi hybrydowe** (`weights.rs::load_hybrid`): `LayerMixer::{Attention,
     DeltaNet}`, atencja z bramkowanym Q (szerokość `2·n_heads·head_dim`, split,

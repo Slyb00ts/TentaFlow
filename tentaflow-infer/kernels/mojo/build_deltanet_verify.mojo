@@ -20,6 +20,7 @@ from src.deltanet_verify import (
     deltanet_gated_scan_dynamic_f16,
     deltanet_gated_scan_dynamic_d128_f16,
     deltanet_gated_scan_inplace_dynamic_d128_f16,
+    deltanet_gated_scan_inplace_shared_d128_f16,
     deltanet_commit_checkpoint_f32,
 )
 
@@ -76,5 +77,7 @@ def main() raises:
     _finalize(out_dir, "deltanet_gated_scan_dynamic_d128_f16")
     _ = ctx.compile_function[deltanet_gated_scan_inplace_dynamic_d128_f16, dump_asm=Path("deltanet_gated_scan_inplace_dynamic_d128_f16.ptx")]()
     _finalize(out_dir, "deltanet_gated_scan_inplace_dynamic_d128_f16")
+    _ = ctx.compile_function[deltanet_gated_scan_inplace_shared_d128_f16, dump_asm=Path("deltanet_gated_scan_inplace_shared_d128_f16.ptx")]()
+    _finalize(out_dir, "deltanet_gated_scan_inplace_shared_d128_f16")
     _ = ctx.compile_function[deltanet_commit_checkpoint_f32, dump_asm=Path("deltanet_commit_checkpoint_f32.ptx")]()
     _finalize(out_dir, "deltanet_commit_checkpoint_f32")

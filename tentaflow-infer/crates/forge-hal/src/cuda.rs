@@ -636,6 +636,7 @@ impl Device for CudaDevice {
         let arena = self.pool(pool).arena.lock().expect("pool arena poisoned");
         match &*arena {
             PoolArena::Bump(bump) => Some(bump.available()),
+            PoolArena::Ring(ring) => Some(ring.available()),
             _ => None,
         }
     }

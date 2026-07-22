@@ -94,8 +94,8 @@ wydajności równy zero.
 ## Ograniczenia
 
 - Tylko greedy-exact: `temperature=0`, sampling GPU i brak repetition penalty.
-- `max_active=1` do czasu podłączenia startup preflightu, admission wielu
-  sekwencji i grafów verifiera per slot.
+- Domyślne `max_active=1` ogranicza pulę; większa jawna wartość przechodzi startup
+  preflight. Verifier przechwytuje osobne grafy T=3/T=4 dla każdego slotu.
 - Budżet natywnego MTP wynosi wyłącznie K=2 lub K=3.
 - CUDA jest jedynym backendem sprawdzonym wykonawczo dla tego etapu.
 - EAGLE, DFlash, DSpark, draft-model, n-gram jako rozszerzenie natywnego MTP,
@@ -108,6 +108,25 @@ optymalizacja dominujących projekcji NVFP4. Scalone przygotowanie
 DeltaNet usuwa 479 uruchomień kerneli i 1968 kopii D2D na cykl T=4. Ostatni
 krok proposera, który jedynie materializuje KV i hidden, pomija już głowę
 logits.
+
+## Continuous admission dla dwóch slotów
+
+Benchmark serwera używał jednego mierzonego żądania na slot, 8 tokenów promptu,
+128 tokenów wyjściowych i wcześniejszego warmupu każdego slotu. Completion-only
+liczono od pierwszego wyemitowanego tokenu do ostatniego `Done`, a end-to-end od
+submitu wszystkich mierzonych żądań.
+
+| `max_active` | Completion-only | End-to-end | Średni TTFT | Średni ITL |
+|---:|---:|---:|---:|---:|
+| 1 | 85,46 tok/s | 75,41 tok/s | 199,62 ms | 11,79 ms |
+| 2 | 85,02 tok/s | 75,05 tok/s | 418,03 ms | 23,43 ms |
+
+Profil `nsys` z tego samego protokołu wykazał 2 capture i 46 `cuGraphLaunch`
+dla jednego slotu oraz 4 capture i 96 `cuGraphLaunch` dla dwóch slotów. Cache
+per slot działa, ale seryjnie przeplatany forward zachowuje praktycznie stały
+aggregate throughput i podwaja ITL. Ten etap zapewnia correctness, izolację i
+continuous admission; wzrost przepustowości wymaga batchowych kerneli
+hybrydowych dla targetu DeltaNet i draftu MTP.
 Każda zmiana musi zachować porównanie token po tokenie z sekwencyjnym greedy.
 
 ## Szybka ścieżka NVFP4 B3/B4 na NVIDIA
@@ -359,6 +378,37 @@ kerneli. BN32 użył `grid=32`, `block=128` i zajął 24,853 ms dla 256 wywoła�
 obejmujących warmup oraz pomiar, czyli około 12,43 ms na prefill wobec około
 17,18 ms dla poprzedniego kernela. Dodatkowy artefakt PTX ma 24 837 bajtów i
 nie wymaga dodatkowego bufora roboczego w VRAM.
+
+## Exact shared-state scan DeltaNet
+
+Dla jednej głowy rekurencja ma postać
+`S_t = a_t (I - beta_t k_t k_t^T) S_(t-1) + beta_t k_t v_t^T`.
+Równoległy prefix-scan wymagałby składania par gęstych operatorów afinicznych.
+Traci to strukturę rank-1, zwiększa koszt względem sekwencyjnego `O(T D^2)` i
+zmienia kolejność działań FP32, więc nie może zachować bitowej zgodności
+wymaganej przez silnik.
+
+Zamiast zmieniać kolejność obliczeń kernel block64 przechowuje kafel stanu
+`128x64` FP32 w 33 792 bajtach pamięci współdzielonej przez cały chunk T=128.
+Stan jest czytany z globalnej pamięci raz i zapisywany raz po ostatnim tokenie.
+Dla 48 głów i D=128 ogranicza to globalny ruch stanu z około 1,50 GiB do 6 MiB,
+bez zmiany wzorów, kolejności akumulacji, liczby kerneli ani buforów runtime.
+
+Standalone zachował bitową zgodność wyjścia i stanu z dotychczasowym block64 i
+przyspieszył skan z 746,54 do 613,14 us, czyli o 17,9%. Pomiar raw512 na RTX
+4090 obejmował pięć osobnych procesów:
+
+| Wariant | Czasy target prefill | Mediana | Przepustowość | SHA decode |
+|---|---|---:|---:|---|
+| block64 global state | 637,434; 641,509; 641,454; 641,312; 641,808 ms | 641,454 ms | 798,2 tok/s | `b415d6ba...4f38` |
+| block64 shared state | 614,890; 613,038; 612,566; 612,880; 612,700 ms | **612,880 ms** | **835,4 tok/s** | `b415d6ba...4f38` |
+
+Mediana poprawiła się o 4,46%. Profil `nsys` wykazał spadek łącznego czasu
+skanu z 276,127 do 221,455 ms dla warmup i pomiaru, czyli o 19,8%, przy tej
+samej liczbie 11 926 uruchomień kerneli. Artefakt używa 40 rejestrów, nie ma
+spilli i jest wybierany wyłącznie dla T=128, D=128 oraz block64.
+Pełny raw128 decode Native MTP zachował SHA `1512c5c9...aacf`, 34 forwardy
+weryfikacji i 94 zaakceptowane tokeny, osiągając 102,1 tok/s.
 
 ## Odrzucone carry MTP w F32
 

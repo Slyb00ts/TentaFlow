@@ -433,14 +433,17 @@ coherent Polish on the RTX 4090.
   brak pełnego draftu uruchamia natywne MTP. Budżet samodzielnego `mtp` 3 jest
   adaptacyjnie przełączany między K=2 i K=3.
   Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
-- Natywne MTP jest obecnie greedy-exact i wymaga `max_active=1`. Target DeltaNet
+- Natywne MTP jest obecnie greedy-exact; domyślne `max_active=1` ogranicza pulę,
+  a jawne `max_active > 1` przechodzi atomowy startup preflight i używa seryjnie
+  przeplatanego forwardu per sekwencja. Target DeltaNet
   oraz draft MTP mają izolowany stan per sekwencja pod wspólnym lease z generacją
   i eventem GPU; `SeqKv` draftów korzystają z jednej współdzielonej puli stron
   MTP. Preflight dwóch slotów oraz audyt GPU pure MTP i MTP+n-gram A/B przechodzą.
-  Limit pozostaje do czasu podłączenia schedulera i grafów per slot. Globalny
-  graph verifiera T=3/4 jest używany tylko przez
-  pulę z jednym slotem; wiele slotów wymaga eager do czasu wdrożenia grafów per
-  slot. Ścieżkę sprawdzono wykonawczo wyłącznie na CUDA/RTX 4090
+  Produkcyjny E2E admission/cancel/reuse przechodzi dla dwóch sekwencji. Verifier
+  utrzymuje osobne grafy T=3/4 według stabilnego identyfikatora slotu; reuse lease
+  zachowuje adresy buforów GPU. Forward wielu sekwencji jest nadal seryjnie
+  przeplatany, więc wymaga batchowych kerneli hybrydowych do wzrostu aggregate
+  throughput. Ścieżkę sprawdzono wykonawczo wyłącznie na CUDA/RTX 4090
   z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Źródła Mojo zachowują podział
   umożliwiający przyszły codegen AMDGPU/Metal, ale backendy AMD i Metal nie są
   jeszcze podłączone ani przetestowane. `draft-model`, `eagle`, `dflash` i

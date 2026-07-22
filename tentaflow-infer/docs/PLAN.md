@@ -165,7 +165,10 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
   K=2/K=3, batched greedy verifier oraz checkpointy KV/DeltaNet są podłączone do
   pętli serwera przez `--speculative mtp[:2|3]`; retained checkpointy usuwają
   powtórny skan DeltaNet przy commit. Tryb `mtp` używa budżetu 3 i adaptacyjnie
-  wybiera K=2/K=3. Zakres produkcyjny tego etapu: greedy, `max_active=1`, CUDA.
+  wybiera K=2/K=3. Zakres produkcyjny: greedy; continuous admission wielu
+  sekwencji używa seryjnie przeplatanego forwardu po startup preflightcie oraz
+  osobnych grafów verifiera T=3/4 per slot. Długi benchmark dwóch slotów nie
+  zwiększa aggregate throughput; kolejnym krokiem są batchowe kernele hybrydowe.
   Raport: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 - **Do realizacji:** jedna lossless weryfikacja drzewa z greedy i stochastic
   acceptance, tree-attention i zatwierdzaniem wyłącznie zaakceptowanych KV;

@@ -6,7 +6,7 @@
 // adds the previous sublayer's output and produces the next sublayer's
 // normed input.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use forge_formats::{PoolingType, LayerKind};
 use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
 use forge_kernels::{Kernels, Nvfp4GgufQ8Projection};
 use forge_types::{ForgeError, MemKind, Result, Vendor};
+use forge_hal::DEVICE_ALLOC_ALIGN;
 use half::f16;
 
 use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
@@ -243,12 +244,10 @@ pub struct Model {
     hybrid_verify_bufs: Option<HybridVerifyBufs>,
     /// Trwały scratch batched prefill, oddzielony od verifiera decode cap=4.
     hybrid_prefill_bufs: Option<HybridVerifyBufs>,
-    /// Trwałe grafy stałej części verifiera MTP dla T=3 i T=4.
-    hybrid_verify_graph_t3: Option<ExecGraph>,
-    hybrid_verify_graph_t4: Option<ExecGraph>,
-    /// Nieudana próba przechwycenia wyłącza kolejne próby dla danego T.
-    hybrid_verify_graph_t3_disabled: bool,
-    hybrid_verify_graph_t4_disabled: bool,
+    /// Trwałe grafy stałej części verifiera MTP dla pary slotu i T.
+    hybrid_verify_graphs: HashMap<(usize, usize), ExecGraph>,
+    /// Nieudana próba przechwycenia wyłącza kolejne próby dla danej pary.
+    hybrid_verify_graph_disabled: HashSet<(usize, usize)>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
     /// Captured non-hybrid MoE decode step (fully device-side grouped expert
@@ -444,22 +443,7 @@ impl HybridStatePool {
         Ok(pool)
     }
 
-    fn allocate_slot(&mut self) -> Result<usize> {
-        let mut layers = Vec::with_capacity(self.layer_kinds.len());
-        for kind in &self.layer_kinds {
-            layers.push(match kind {
-                LayerKind::DeltaNet => Some(SsmState {
-                    conv: self
-                        .device
-                        .alloc(self.conv_bytes, MemKind::Device, Pool::Weights)?,
-                    state: self
-                        .device
-                        .alloc(self.state_bytes, MemKind::Device, Pool::Weights)?,
-                }),
-                LayerKind::Attention => None,
-            });
-        }
-        let slot = self.slots.len();
+    fn build_slot(&self) -> Result<HybridStateSlot> {
         let mtp = match (&self.mtp_kv, self.mtp_shape) {
             (Some(kv), Some((hidden_size, vocab_size))) => Some(MtpDraftState::new(
                 self.device.clone(),
@@ -474,24 +458,130 @@ impl HybridStatePool {
                 ))
             }
         };
-        self.slots.push(HybridStateSlot {
+        let ready = self.device.create_event()?;
+        let mut layers = Vec::with_capacity(self.layer_kinds.len());
+        for kind in &self.layer_kinds {
+            layers.push(match kind {
+                LayerKind::DeltaNet => Some(SsmState {
+                    conv: self
+                        .device
+                        .alloc(self.conv_bytes, MemKind::Device, Pool::Weights)?,
+                    state: self
+                        .device
+                        .alloc(self.state_bytes, MemKind::Device, Pool::Weights)?,
+                }),
+                LayerKind::Attention => None,
+            });
+        }
+        Ok(HybridStateSlot {
             layers,
             mtp,
             generation: 0,
             in_use: false,
-            ready: self.device.create_event()?,
+            ready,
             ready_recorded: false,
             initialized_generation: 0,
-        });
+        })
+    }
+
+    fn allocate_slot(&mut self) -> Result<usize> {
+        let state = self.build_slot()?;
+        let slot = self.slots.len();
+        self.slots.push(state);
         self.free.push(slot);
         Ok(slot)
     }
 
     fn ensure_capacity(&mut self, slots: usize) -> Result<()> {
         self.ensure_healthy()?;
-        while self.slots.len() < slots {
-            self.allocate_slot()?;
+        let additional = slots.saturating_sub(self.slots.len());
+        if additional == 0 {
+            return Ok(());
         }
+        let delta_layers = self
+            .layer_kinds
+            .iter()
+            .filter(|kind| matches!(kind, LayerKind::DeltaNet))
+            .count();
+        let reserve = |bytes: usize| {
+            bytes
+                .max(1)
+                .checked_next_multiple_of(DEVICE_ALLOC_ALIGN)
+                .ok_or_else(|| ForgeError::Scheduler("przepełnienie wyrównania alokacji".into()))
+        };
+        let weights_per_slot = reserve(self.conv_bytes)?
+            .checked_add(reserve(self.state_bytes)?)
+            .and_then(|bytes| bytes.checked_mul(delta_layers))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie rozmiaru slotu SSM".into()))?;
+        let activations_per_slot = match (self.mtp_shape, self.mtp_kv.as_ref()) {
+            (Some((hidden, vocab)), Some(kv)) => {
+                let hidden_bytes = hidden.checked_mul(2).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie rozmiaru hidden MTP".into())
+                })?;
+                let step_hidden = hidden_bytes.checked_mul(4).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie checkpointów hidden MTP".into())
+                })?;
+                let logits = vocab
+                    .checked_mul(4)
+                    .ok_or_else(|| ForgeError::Scheduler("przepełnienie logitów MTP".into()))?;
+                let page_table = kv.cfg.max_pages_per_seq.checked_mul(4).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie tabeli stron MTP".into())
+                })?;
+                [
+                    hidden_bytes,
+                    hidden_bytes,
+                    hidden_bytes,
+                    logits,
+                    page_table,
+                    4,
+                    4,
+                    20,
+                    hidden_bytes,
+                    step_hidden,
+                ]
+                .into_iter()
+                .try_fold(0usize, |total, bytes| {
+                    total.checked_add(reserve(bytes)?).ok_or_else(|| {
+                        ForgeError::Scheduler("przepełnienie rozmiaru slotu MTP".into())
+                    })
+                })?
+            }
+            (None, None) => 0,
+            _ => {
+                return Err(ForgeError::Scheduler(
+                    "niespójna konfiguracja puli MTP".into(),
+                ))
+            }
+        };
+        let required_weights = weights_per_slot
+            .checked_mul(additional)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie preflightu puli SSM".into()))?;
+        let required_activations = activations_per_slot
+            .checked_mul(additional)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie preflightu puli MTP".into()))?;
+        let available_weights = self.device.pool_available(Pool::Weights);
+        let available_activations = self.device.pool_available(Pool::Activations);
+        if available_weights.is_some_and(|available| required_weights > available)
+            || available_activations.is_some_and(|available| required_activations > available)
+        {
+            return Err(ForgeError::Scheduler(format!(
+                "preflight {slots} slotów hybrydowych wymaga {required_weights} B puli weights i {required_activations} B puli activations dla {additional} nowych slotów; dostępne odpowiednio {} B i {} B",
+                available_weights.map_or_else(|| "nieznane".into(), |bytes| bytes.to_string()),
+                available_activations
+                    .map_or_else(|| "nieznane".into(), |bytes| bytes.to_string()),
+            )));
+        }
+        let mut allocated = Vec::with_capacity(additional);
+        for _ in 0..additional {
+            allocated.push(self.build_slot().map_err(|error| {
+                ForgeError::Scheduler(format!(
+                    "preflight {slots} slotów hybrydowych nie zaalokował {additional} nowych slotów (weights {required_weights} B, activations {required_activations} B): {error}"
+                ))
+            })?);
+        }
+        let first = self.slots.len();
+        self.slots.extend(allocated);
+        self.free.extend(first..slots);
         Ok(())
     }
 
@@ -1441,10 +1531,8 @@ impl Model {
             verify_bufs: None,
             hybrid_verify_bufs: None,
             hybrid_prefill_bufs: None,
-            hybrid_verify_graph_t3: None,
-            hybrid_verify_graph_t4: None,
-            hybrid_verify_graph_t3_disabled: false,
-            hybrid_verify_graph_t4_disabled: false,
+            hybrid_verify_graphs: HashMap::new(),
+            hybrid_verify_graph_disabled: HashSet::new(),
             decode_graph: None,
             decode_moe_graph: None,
             decode_rot_graph: None,
@@ -6414,10 +6502,8 @@ impl Model {
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
-        self.hybrid_verify_graph_t3 = None;
-        self.hybrid_verify_graph_t4 = None;
-        self.hybrid_verify_graph_t3_disabled = false;
-        self.hybrid_verify_graph_t4_disabled = false;
+        self.hybrid_verify_graphs.clear();
+        self.hybrid_verify_graph_disabled.clear();
         self.hybrid_verify_bufs = Some(HybridVerifyBufs {
             cap,
             base_pos,
@@ -7010,42 +7096,32 @@ impl Model {
         }
     }
 
-    /// Po pierwszym wykonaniu eager zapisuje graf właściwy dla T=3 albo T=4.
-    fn capture_hybrid_verify_graph_if_needed(&mut self, t: usize) {
+    /// Po pierwszym wykonaniu eager zapisuje graf właściwy dla slotu i T.
+    fn capture_hybrid_verify_graph_if_needed(&mut self, slot: usize, t: usize) {
         if std::env::var("FORGE_HYBRID_VERIFY_GRAPH").is_ok_and(|value| value == "0") {
-            return;
-        }
-        if self
-            .hybrid_states
-            .as_ref()
-            .is_some_and(|pool| pool.slots.len() > 1)
-        {
             return;
         }
         if !self.device.caps().supports_graph_capture {
             return;
         }
-        let needed = match t {
-            3 => self.hybrid_verify_graph_t3.is_none() && !self.hybrid_verify_graph_t3_disabled,
-            4 => self.hybrid_verify_graph_t4.is_none() && !self.hybrid_verify_graph_t4_disabled,
-            _ => return,
-        };
-        if !needed {
+        if !matches!(t, 3 | 4) {
+            return;
+        }
+        let key = (slot, t);
+        if self.hybrid_verify_graphs.contains_key(&key)
+            || self.hybrid_verify_graph_disabled.contains(&key)
+        {
             return;
         }
         match self.capture_hybrid_verify_compute(t) {
-            Ok(captured) => match t {
-                3 => self.hybrid_verify_graph_t3 = Some(captured),
-                4 => self.hybrid_verify_graph_t4 = Some(captured),
-                _ => unreachable!(),
-            },
+            Ok(captured) => {
+                self.hybrid_verify_graphs.insert(key, captured);
+            }
             Err(error) => {
-                tracing::warn!("wyłączono capture grafu hybrid verifier T={t}: {error}");
-                match t {
-                    3 => self.hybrid_verify_graph_t3_disabled = true,
-                    4 => self.hybrid_verify_graph_t4_disabled = true,
-                    _ => unreachable!(),
-                }
+                tracing::warn!(
+                    "wyłączono capture grafu hybrid verifier slot={slot} T={t}: {error}"
+                );
+                self.hybrid_verify_graph_disabled.insert(key);
             }
         }
     }
@@ -7063,6 +7139,10 @@ impl Model {
             ));
         }
         self.activate_hybrid_sequence(seq)?;
+        let hybrid_slot = seq
+            .hybrid_state
+            .expect("aktywna sekwencja hybrydowa ma przypisany slot")
+            .slot;
         let t = draft.len() + 1;
         self.validate_hybrid_speculation_target()?;
         self.ensure_prefill_bufs()?;
@@ -7173,18 +7253,10 @@ impl Model {
             )?;
             let graph = if std::env::var("FORGE_HYBRID_VERIFY_GRAPH")
                 .is_ok_and(|value| value == "0")
-                || self
-                    .hybrid_states
-                    .as_ref()
-                    .is_some_and(|pool| pool.slots.len() > 1)
             {
                 None
             } else {
-                match t {
-                    3 => self.hybrid_verify_graph_t3.clone(),
-                    4 => self.hybrid_verify_graph_t4.clone(),
-                    _ => None,
-                }
+                self.hybrid_verify_graphs.get(&(hybrid_slot, t)).cloned()
             };
             if let Some(graph) = graph {
                 self.device.launch_graph(&graph, &self.stream)?;
@@ -7211,7 +7283,7 @@ impl Model {
             if catchup_mtp {
                 self.mtp_catchup_verified_prefix(seq, accepted + 1, 0, None)?;
             }
-            self.capture_hybrid_verify_graph_if_needed(t);
+            self.capture_hybrid_verify_graph_if_needed(hybrid_slot, t);
             Ok((accepted, correction as u32))
         })();
         match result {
@@ -8769,10 +8841,8 @@ impl Model {
                 &mut self.hybrid_prefill_bufs,
             );
             Some((
-                self.hybrid_verify_graph_t3.take(),
-                self.hybrid_verify_graph_t4.take(),
-                self.hybrid_verify_graph_t3_disabled,
-                self.hybrid_verify_graph_t4_disabled,
+                std::mem::take(&mut self.hybrid_verify_graphs),
+                std::mem::take(&mut self.hybrid_verify_graph_disabled),
             ))
         } else {
             None
@@ -8958,16 +9028,14 @@ impl Model {
             let _ = self.stream.synchronize();
         }
         restore_after(result, || {
-            if let Some((graph_t3, graph_t4, disabled_t3, disabled_t4)) = saved_graphs {
+            if let Some((graphs, disabled)) = saved_graphs {
                 // Verifier decode zachowuje własne bufory cap=4 i przechwycone grafy.
                 std::mem::swap(
                     &mut self.hybrid_verify_bufs,
                     &mut self.hybrid_prefill_bufs,
                 );
-                self.hybrid_verify_graph_t3 = graph_t3;
-                self.hybrid_verify_graph_t4 = graph_t4;
-                self.hybrid_verify_graph_t3_disabled = disabled_t3;
-                self.hybrid_verify_graph_t4_disabled = disabled_t4;
+                self.hybrid_verify_graphs = graphs;
+                self.hybrid_verify_graph_disabled = disabled;
             }
         })
     }

@@ -557,6 +557,73 @@ def deltanet_gated_scan_inplace_dynamic_d128_f16(
             out_ptr[vector_base + j] = Float16(output * inv_sqrt)
         barrier()
 
+
+def deltanet_gated_scan_inplace_shared_d128_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin], state_io: UnsafePointer[Float32, MutAnyOrigin],
+    q_in: UnsafePointer[Float16, MutAnyOrigin], k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin], g_in: UnsafePointer[Float32, MutAnyOrigin],
+    beta_in: UnsafePointer[Float32, MutAnyOrigin], n_steps: Int, n_v_heads: Int,
+    d_state: Int,
+):
+    """Trzyma kafel 128x64 stanu w pamieci wspoldzielonej przez caly prefill."""
+    comptime TILE_WIDTH = 64
+    comptime MAX_D_STATE = 128
+    tid = Int(thread_idx.x)
+    block = Int(block_idx.x)
+    head = block // 2
+    tile = block % 2
+    if head >= n_v_heads:
+        return
+    j = tile * TILE_WIDTH + tid
+
+    sk = stack_allocation[MAX_D_STATE, Float32, address_space=AddressSpace.SHARED]()
+    sq = stack_allocation[MAX_D_STATE, Float32, address_space=AddressSpace.SHARED]()
+    state_tile = stack_allocation[
+        MAX_D_STATE * TILE_WIDTH, Float32, address_space=AddressSpace.SHARED
+    ]()
+    head_state = head * d_state * d_state
+    head_vector = head * d_state
+    inv_sqrt = rsqrt(Float32(d_state))
+
+    for key in range(d_state):
+        state_tile[key * TILE_WIDTH + tid] = state_io[
+            head_state + key * d_state + j
+        ]
+
+    for token in range(n_steps):
+        vector_base = token * n_v_heads * d_state + head_vector
+        gate_base = token * n_v_heads + head
+        var i = tid
+        while i < d_state:
+            sk[i] = Float32(k_in[vector_base + i])
+            sq[i] = Float32(q_in[vector_base + i])
+            i += TILE_WIDTH
+        barrier()
+
+        decay = exp(g_in[gate_base])
+        beta = beta_in[gate_base]
+        var kv: Float32 = 0.0
+        for key in range(d_state):
+            offset = key * TILE_WIDTH + tid
+            s = state_tile[offset] * decay
+            state_tile[offset] = s
+            kv += sk[key] * s
+        dj = beta * (Float32(v_in[vector_base + j]) - kv)
+
+        var output: Float32 = 0.0
+        for key in range(d_state):
+            offset = key * TILE_WIDTH + tid
+            s = state_tile[offset] + sk[key] * dj
+            state_tile[offset] = s
+            output += sq[key] * s
+        out_ptr[vector_base + j] = Float16(output * inv_sqrt)
+        barrier()
+
+    for key in range(d_state):
+        state_io[head_state + key * d_state + j] = state_tile[
+            key * TILE_WIDTH + tid
+        ]
+
 def deltanet_gated_scan_t3_d128_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin], checkpoints: UnsafePointer[Float32, MutAnyOrigin],
     state_in: UnsafePointer[Float32, MutAnyOrigin], q_in: UnsafePointer[Float16, MutAnyOrigin],

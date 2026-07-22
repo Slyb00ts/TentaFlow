@@ -1105,9 +1105,12 @@ impl Kernels {
             .checked_mul(tiles)
             .and_then(|value| u32::try_from(value).ok())
             .ok_or_else(|| ForgeError::Kernel("in-place DeltaNet: grid przekracza u32".into()))?;
-        let kernel = self
-            .artifacts
-            .get("deltanet_gated_scan_inplace_dynamic_d128_f16")?;
+        let kernel_name = if n_steps == 128 && d_state == 128 && tile_width == 64 {
+            "deltanet_gated_scan_inplace_shared_d128_f16"
+        } else {
+            "deltanet_gated_scan_inplace_dynamic_d128_f16"
+        };
+        let kernel = self.artifacts.get(kernel_name)?;
         let config = LaunchConfig {
             grid: (grid, 1, 1),
             block: (tile_width as u32, 1, 1),

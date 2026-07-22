@@ -7,6 +7,8 @@
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use forge_tokenize::{StopMatcher, StreamDecoder, Tokenizer};
@@ -92,6 +94,7 @@ struct Submission {
 pub struct EngineHandle {
     tx: mpsc::Sender<Submission>,
     metrics: Arc<EngineMetrics>,
+    worker: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl EngineHandle {
@@ -112,6 +115,29 @@ impl EngineHandle {
     /// the worker thread. Read-only for callers.
     pub fn metrics(&self) -> &Arc<EngineMetrics> {
         &self.metrics
+    }
+
+    /// Zamyka ostatni handle i czeka na zwolnienie modelu przez worker.
+    pub fn shutdown(self) -> Result<()> {
+        let Self {
+            tx,
+            metrics: _,
+            worker,
+        } = self;
+        if Arc::strong_count(&worker) != 1 {
+            return Err(ForgeError::Scheduler(
+                "shutdown wymaga ostatniego klonu EngineHandle".into(),
+            ));
+        }
+        drop(tx);
+        let handle = worker
+            .lock()
+            .map_err(|_| ForgeError::Scheduler("blokada workera jest zatruta".into()))?
+            .take()
+            .ok_or_else(|| ForgeError::Scheduler("worker został już zatrzymany".into()))?;
+        handle
+            .join()
+            .map_err(|_| ForgeError::Scheduler("worker zakończył się panic".into()))
     }
 }
 
@@ -161,10 +187,10 @@ struct ActiveSeq<'t> {
     next: Option<PendingNext>,
     /// Client hang-up detected; sequence is torn down at the next iteration.
     dead: bool,
-    /// Stan hostowego proposera. Natywne MTP przechowuje stan w modelu.
+    /// Stan hostowego proposera; natywne MTP używa stanu per sekwencja w puli GPU.
     spec: Option<SpeculativeState>,
-    /// Jawny tryb spekulacji; natywne MTP jest własnością modelu i nie ma
-    /// hostowego `SpeculativeState` ani CPU proposera.
+    /// Jawny tryb spekulacji; natywne MTP nie ma hostowego `SpeculativeState`
+    /// ani CPU proposera.
     spec_kind: SpeculationKind,
     /// Budżet draftu na krok, równy 0 wyłącznie dla `SpeculationKind::Off`.
     spec_budget: usize,
@@ -205,24 +231,13 @@ fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<Sp
 }
 
 fn validate_speculation_server_config(
-    kind: SpeculationKind,
+    _kind: SpeculationKind,
     max_active: usize,
-    hybrid_target: bool,
+    _hybrid_target: bool,
 ) -> Result<()> {
-    if hybrid_target && max_active != 1 {
-        return Err(ForgeError::Unsupported(
-            "model hybrydowy wymaga max_active=1 do czasu podłączenia startup preflightu i grafów per slot"
-                .into(),
-        ));
-    }
-    if matches!(
-        kind,
-        SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
-    ) && max_active != 1
-    {
-        return Err(ForgeError::Unsupported(
-            "natywne MTP wymaga max_active=1 do czasu podłączenia wielosekwencyjnego admission"
-                .into(),
+    if max_active == 0 {
+        return Err(ForgeError::Scheduler(
+            "max_active musi być większe od zera".into(),
         ));
     }
     Ok(())
@@ -345,10 +360,13 @@ pub fn spawn_engine_batched(
             spec.draft_tokens()
         );
     }
+    if model.is_hybrid() {
+        model.preflight_hybrid_state_slots(max_active)?;
+    }
     let (tx, rx) = mpsc::channel::<Submission>();
     let metrics = Arc::new(EngineMetrics::new());
     let worker_metrics = metrics.clone();
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("forge-engine-worker".into())
         .spawn(move || {
             worker(
@@ -364,7 +382,11 @@ pub fn spawn_engine_batched(
             )
         })
         .map_err(ForgeError::Io)?;
-    Ok(EngineHandle { tx, metrics })
+    Ok(EngineHandle {
+        tx,
+        metrics,
+        worker: Arc::new(Mutex::new(Some(worker))),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -387,7 +409,9 @@ fn worker<'t>(
     // Provision the batched-decode scratch + graph buckets for the full active
     // width once. A failure here (VRAM pressure) is surfaced per-request by the
     // per-batch re-ensure inside `batched_decode`.
-    let _ = model.ensure_batch(max_active);
+    if !model.is_hybrid() {
+        let _ = model.ensure_batch(max_active);
+    }
 
     loop {
         // Drain the submission queue without blocking while work is active;
@@ -855,7 +879,7 @@ fn batch_gpu_decode(
     // path engages once the flat cost amortizes across enough sequences.
     // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
     // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
-    let serial_only = model.weights.is_moe() || model.kv.cfg.quant.is_rot();
+    let serial_only = model.is_hybrid() || model.weights.is_moe() || model.kv.cfg.quant.is_rot();
     if feed_idx.len() < batch_min.max(2) || serial_only {
         for &i in &feed_idx {
             serial_step(model, &mut active[i]);
@@ -1302,10 +1326,10 @@ mod tests {
     }
 
     #[test]
-    fn native_mtp_requires_one_active_sequence() {
+    fn hybrid_i_mtp_dopuszczaja_wiele_aktywnych_sekwencji() {
         assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 0, true).is_err());
         assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 1, true).is_ok());
-        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 2, true).is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 2, true).is_ok());
         assert!(validate_speculation_server_config(
             SpeculationKind::NativeMtpNgram,
             1,
@@ -1317,11 +1341,11 @@ mod tests {
             2,
             true
         )
-        .is_err());
+        .is_ok());
         assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 8, false).is_ok());
-        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 8, true).is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 8, true).is_ok());
         assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 1, true).is_ok());
-        assert!(validate_speculation_server_config(SpeculationKind::Off, 8, true).is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::Off, 8, true).is_ok());
         assert!(validate_speculation_server_config(SpeculationKind::Off, 1, true).is_ok());
     }
 

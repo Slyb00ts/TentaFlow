@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 /// Alignment applied to every sub-allocation. 256 B satisfies all CUDA
 /// texture/vector-load requirements and keeps kernels free to use the widest
 /// load instructions.
-pub(crate) const ALLOC_ALIGN: usize = 256;
+pub(crate) use crate::DEVICE_ALLOC_ALIGN as ALLOC_ALIGN;
 
 // Checked: near-usize::MAX requests must surface as OOM, not wrap around and
 // alias live allocations in release builds.
@@ -176,6 +176,10 @@ impl RingArena {
         if generation == self.generation {
             self.live -= 1;
         }
+    }
+
+    pub(crate) fn available(&self) -> usize {
+        self.capacity - self.cursor
     }
 
     pub(crate) fn reset(&mut self) -> Result<u64> {
