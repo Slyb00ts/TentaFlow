@@ -318,6 +318,272 @@ fn segmentowana_atencja_uzywa_osobnych_tablic_stron_lane() {
     }
 }
 
+fn run_segmented_attention_exact_case(context: usize, tokens: usize, lane_swap: bool) {
+    let Some(device) = device() else { return };
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let head_dim = 256usize;
+    let page_size = 32usize;
+    let max_pages = 64usize;
+    assert!(tokens > 0 && tokens <= context);
+    let batch = 2usize;
+    let q_heads = 2usize;
+    let kv_heads = 1usize;
+    let total = batch * tokens;
+    let query_elements = total * q_heads * head_dim;
+    let cache_elements = batch * max_pages * kv_heads * page_size * head_dim;
+    let guard = 128usize;
+    let canary = f16::from_bits(0x7bcd);
+
+    let q = device
+        .alloc(query_elements * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let k_cache = device
+        .alloc(cache_elements * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let v_cache = device
+        .alloc(cache_elements * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let page_tables = device
+        .alloc(batch * max_pages * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let visible_lens = device
+        .alloc(total * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let output = device
+        .alloc((query_elements + guard) * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+
+    let mut q_values = vec![f16::ZERO; query_elements];
+    for lane in 0..batch {
+        for token in 0..tokens {
+            for head in 0..q_heads {
+                for element in 0..head_dim {
+                    let index = ((lane * tokens + token) * q_heads + head) * head_dim + element;
+                    let value = ((lane * 23 + token * 17 + head * 11 + element * 7) % 61) as f32;
+                    q_values[index] = f16::from_f32((value - 30.0) / 128.0);
+                }
+            }
+        }
+    }
+    let mut page_values = vec![-1i32; batch * max_pages];
+    let mut k_values = vec![f16::ZERO; cache_elements];
+    let mut v_values = vec![f16::ZERO; cache_elements];
+    for lane in 0..batch {
+        for logical_page in 0..context.div_ceil(page_size) {
+            let physical_page = logical_page * batch + if lane_swap { 1 - lane } else { lane };
+            page_values[lane * max_pages + logical_page] = physical_page as i32;
+            for offset in 0..page_size {
+                let position = logical_page * page_size + offset;
+                for element in 0..head_dim {
+                    let index = (physical_page * page_size + offset) * head_dim + element;
+                    let key = ((lane * 29 + position * 13 + element * 5) % 67) as f32;
+                    let value = ((lane * 31 + position * 19 + element * 3) % 71) as f32;
+                    k_values[index] = f16::from_f32((key - 33.0) / 128.0);
+                    v_values[index] = f16::from_f32((value - 35.0) / 64.0);
+                }
+            }
+        }
+    }
+    let mut visible_values = Vec::with_capacity(total);
+    for _lane in 0..batch {
+        for token in 0..tokens {
+            visible_values.push((context - tokens + token + 1) as i32);
+        }
+    }
+    device.write(bytemuck::cast_slice(&q_values), &q, 0).unwrap();
+    device
+        .write(bytemuck::cast_slice(&k_values), &k_cache, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&v_values), &v_cache, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&page_values), &page_tables, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&visible_values), &visible_lens, 0)
+        .unwrap();
+    device
+        .write(
+            bytemuck::cast_slice(&vec![canary; query_elements + guard]),
+            &output,
+            0,
+        )
+        .unwrap();
+    kernels
+        .attn_verify_segmented_f16_hd256(
+            &output,
+            &q,
+            &k_cache,
+            &v_cache,
+            &page_tables,
+            &visible_lens,
+            batch,
+            tokens,
+            q_heads,
+            kv_heads,
+            page_size,
+            max_pages,
+            0.0625,
+            &stream,
+        )
+        .unwrap();
+
+    for lane in 0..batch {
+        let lane_elements = tokens * q_heads * head_dim;
+        let q_lane = device
+            .alloc(lane_elements * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let page_table_lane = device
+            .alloc(max_pages * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let visible_lane = device
+            .alloc(tokens * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let expected = device
+            .alloc(lane_elements * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        device
+            .write(
+                bytemuck::cast_slice(
+                    &q_values[lane * lane_elements..(lane + 1) * lane_elements],
+                ),
+                &q_lane,
+                0,
+            )
+            .unwrap();
+        device
+            .write(
+                bytemuck::cast_slice(
+                    &page_values[lane * max_pages..(lane + 1) * max_pages],
+                ),
+                &page_table_lane,
+                0,
+            )
+            .unwrap();
+        device
+            .write(
+                bytemuck::cast_slice(&visible_values[lane * tokens..(lane + 1) * tokens]),
+                &visible_lane,
+                0,
+            )
+            .unwrap();
+        kernels
+            .attn_decode_batch_exact_f16_hd256(
+                &expected,
+                &q_lane,
+                &k_cache,
+                &v_cache,
+                &page_table_lane,
+                &visible_lane,
+                tokens,
+                q_heads,
+                kv_heads,
+                page_size,
+                max_pages,
+                0.0625,
+                &stream,
+            )
+            .unwrap();
+        device.synchronize().unwrap();
+        let mut actual_bytes = vec![0u8; lane_elements * 2];
+        let mut expected_bytes = vec![0u8; lane_elements * 2];
+        device
+            .read(&output, lane * lane_elements * 2, &mut actual_bytes)
+            .unwrap();
+        device.read(&expected, 0, &mut expected_bytes).unwrap();
+        assert_eq!(
+            actual_bytes, expected_bytes,
+            "ctx={context}, lane_swap={lane_swap}, lane={lane}"
+        );
+    }
+
+    let mut guard_bytes = vec![0u8; guard * 2];
+    device
+        .read(&output, query_elements * 2, &mut guard_bytes)
+        .unwrap();
+    assert!(
+        bytemuck::cast_slice::<u8, f16>(&guard_bytes)
+            .iter()
+            .all(|value| *value == canary),
+        "canary ctx={context}, lane_swap={lane_swap}"
+    );
+}
+
+#[test]
+fn segmentowana_atencja_nvidia_jest_bitowo_zgodna_z_serial() {
+    for (context, tokens) in [(1usize, 1usize), (31, 6), (32, 6), (33, 6), (128, 6), (512, 8), (2048, 8)] {
+        for lane_swap in [false, true] {
+            run_segmented_attention_exact_case(context, tokens, lane_swap);
+        }
+    }
+}
+
+#[test]
+fn segmentowana_atencja_odrzuca_zerowe_i_niezgodne_ksztalty() {
+    let Some(device) = device() else { return };
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let output = device
+        .alloc(2 * 2 * 256, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let q = device
+        .alloc(2 * 2 * 256, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let cache = device
+        .alloc(32 * 256 * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let page_tables = device
+        .alloc(4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let visible = device
+        .alloc(4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let launch = |output, q, k_cache, v_cache, batch, tokens, q_heads, kv_heads, page_size, max_pages| {
+        kernels.attn_verify_segmented_f16_hd256(
+            output,
+            q,
+            k_cache,
+            v_cache,
+            &page_tables,
+            &visible,
+            batch,
+            tokens,
+            q_heads,
+            kv_heads,
+            page_size,
+            max_pages,
+            0.0625,
+            &stream,
+        )
+    };
+    assert!(launch(&output, &q, &cache, &cache, 1, 0, 2, 1, 32, 1).is_err());
+    assert!(launch(&output, &q, &cache, &cache, 1, 1, 3, 2, 32, 1).is_err());
+    let short = device
+        .alloc(2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    assert!(launch(&short, &q, &cache, &cache, 1, 1, 2, 1, 32, 1).is_err());
+    let unaligned_cache = device
+        .alloc(32 * 256 * 2 + 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    assert!(
+        launch(
+            &output,
+            &q,
+            &unaligned_cache,
+            &unaligned_cache,
+            1,
+            1,
+            2,
+            1,
+            32,
+            1,
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn wspoldzielony_skan_i_commit_odtwarzaja_checkpointy_d128() {
     let Some(device) = device() else { return };

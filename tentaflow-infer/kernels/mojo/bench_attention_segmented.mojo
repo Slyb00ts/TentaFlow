@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: bench_attention_segmented.mojo
-# Opis: Porównuje przenośną i jednowarpową atencję segmentowaną dla MTP B2.
+# Opis: Porównuje przenośną i dokładną atencję segmentowaną dla MTP B2.
 # Przykład: pixi run mojo bench_attention_segmented.mojo
 # =============================================================================
 
@@ -86,7 +86,7 @@ def run_context[context: Int](ctx: DeviceContext) raises:
             warp32.unsafe_ptr(), q.unsafe_ptr(), k.unsafe_ptr(), v.unsafe_ptr(),
             page_tables.unsafe_ptr(), visible.unsafe_ptr(), TOKENS, Q_HEADS,
             KV_HEADS, PAGE_SIZE, MAX_PAGES, Float32(0.0625),
-            grid_dim=(total, Q_HEADS), block_dim=32,
+            grid_dim=(total, Q_HEADS), block_dim=128,
         )
     ctx.synchronize()
 
@@ -109,7 +109,7 @@ def run_context[context: Int](ctx: DeviceContext) raises:
                 warp32.unsafe_ptr(), q.unsafe_ptr(), k.unsafe_ptr(),
                 v.unsafe_ptr(), page_tables.unsafe_ptr(), visible.unsafe_ptr(),
                 TOKENS, Q_HEADS, KV_HEADS, PAGE_SIZE, MAX_PAGES, Float32(0.0625),
-                grid_dim=(total, Q_HEADS), block_dim=32,
+                grid_dim=(total, Q_HEADS), block_dim=128,
             )
         ctx.synchronize()
         warp_samples[sample] = Float64(perf_counter_ns() - started) / 1e3 / ITERS
@@ -125,16 +125,17 @@ def run_context[context: Int](ctx: DeviceContext) raises:
             if abs(delta) > maximum:
                 maximum = abs(delta)
     relative = sqrt(error / norm)
-    if relative > 0.002:
-        raise Error("względny błąd atencji przekracza 0.002")
+    if relative > 0.002 or maximum > 0.001:
+        raise Error("dokładna atencja przekracza tolerancję względem fallbacku")
     print(
-        "ctx", context, "portable", median(portable_samples), "us; warp32",
+        "ctx", context, "portable", median(portable_samples), "us; exact4",
         median(warp_samples), "us; L2", relative, "max", maximum,
     )
 
 
 def main() raises:
     var ctx = DeviceContext()
+    run_context[4](ctx)
     run_context[128](ctx)
     run_context[512](ctx)
     run_context[2048](ctx)

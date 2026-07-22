@@ -25,6 +25,78 @@ pub struct Nvfp4GgufQ8Projection<'a> {
 /// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
 const ATTN_BLOCK: u32 = 128;
 
+#[allow(clippy::too_many_arguments)]
+fn validate_attn_verify_segmented_f16_hd256(
+    output_bytes: usize,
+    q_bytes: usize,
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    page_table_bytes: usize,
+    visible_bytes: usize,
+    batch: usize,
+    n_tokens: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    page_size: usize,
+    max_pages: usize,
+) -> Result<(u32, u32)> {
+    if [batch, n_tokens, n_q_heads, n_kv_heads, page_size, max_pages].contains(&0) {
+        return Err(ForgeError::Kernel(
+            "segmentowana atencja verifiera wymaga niezerowych wymiarów".into(),
+        ));
+    }
+    if !n_q_heads.is_multiple_of(n_kv_heads) {
+        return Err(ForgeError::Kernel(
+            "liczba głowic Q segmentowanej atencji musi być wielokrotnością głowic KV".into(),
+        ));
+    }
+    let total = batch
+        .checked_mul(n_tokens)
+        .ok_or_else(|| ForgeError::Kernel("przepełnienie liczby tokenów atencji".into()))?;
+    let query_bytes = checked_buffer_bytes(
+        "segmentowana atencja query/output",
+        &[total, n_q_heads, 256],
+        2,
+    )?;
+    let required_page_table_bytes =
+        checked_buffer_bytes("segmentowana atencja page tables", &[batch, max_pages], 4)?;
+    let required_visible_bytes =
+        checked_buffer_bytes("segmentowana atencja visible lengths", &[total], 4)?;
+    let cache_page_bytes = checked_buffer_bytes(
+        "segmentowana atencja strona KV",
+        &[n_kv_heads, page_size, 256],
+        2,
+    )?;
+    if output_bytes < query_bytes
+        || q_bytes < query_bytes
+        || page_table_bytes < required_page_table_bytes
+        || visible_bytes < required_visible_bytes
+        || k_cache_bytes < cache_page_bytes
+        || v_cache_bytes < cache_page_bytes
+        || k_cache_bytes != v_cache_bytes
+        || !k_cache_bytes.is_multiple_of(cache_page_bytes)
+    {
+        return Err(ForgeError::Kernel(
+            "segmentowana atencja verifiera ma za mały lub niezgodny bufor".into(),
+        ));
+    }
+    let grid_x = u32::try_from(total)
+        .map_err(|_| ForgeError::Kernel("liczba tokenów atencji przekracza u32".into()))?;
+    let grid_y = u32::try_from(n_q_heads)
+        .map_err(|_| ForgeError::Kernel("liczba głowic Q przekracza u32".into()))?;
+    for (name, value) in [
+        ("T", n_tokens),
+        ("głowice Q", n_q_heads),
+        ("głowice KV", n_kv_heads),
+        ("rozmiar strony", page_size),
+        ("liczba stron", max_pages),
+    ] {
+        i64::try_from(value)
+            .map_err(|_| ForgeError::Kernel(format!("{name} atencji przekracza i64")))?;
+    }
+    Ok((grid_x, grid_y))
+}
+
 /// Per-block logits slice of the sampling kernels (SAMPLE_CHUNK in
 /// sampling.mojo — staged in shared memory by topk_partial_f32).
 const SAMPLE_CHUNK: usize = 4096;
@@ -4023,14 +4095,20 @@ impl Kernels {
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        if batch == 0 || n_tokens == 0 {
-            return Err(ForgeError::Kernel(
-                "segmentowana atencja verifiera wymaga B>0 i T>0".into(),
-            ));
-        }
-        let total = batch
-            .checked_mul(n_tokens)
-            .ok_or_else(|| ForgeError::Kernel("przepełnienie liczby tokenów atencji".into()))?;
+        let (grid_x, grid_y) = validate_attn_verify_segmented_f16_hd256(
+            output.len(),
+            q.len(),
+            k_cache.len(),
+            v_cache.len(),
+            page_tables.len(),
+            visible_lens.len(),
+            batch,
+            n_tokens,
+            n_q_heads,
+            n_kv_heads,
+            page_size,
+            max_pages,
+        )?;
         let caps = self.device.caps();
         let warp32 = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
         let kernel = self.artifacts.get(if warp32 {
@@ -4039,8 +4117,8 @@ impl Kernels {
             "attn_verify_segmented_f16_hd256"
         })?;
         let config = LaunchConfig {
-            grid: (total as u32, n_q_heads as u32, 1),
-            block: (if warp32 { 32 } else { 256 }, 1, 1),
+            grid: (grid_x, grid_y, 1),
+            block: (if warp32 { ATTN_BLOCK } else { 256 }, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -4050,11 +4128,11 @@ impl Kernels {
             .buf(v_cache)
             .buf(page_tables)
             .buf(visible_lens)
-            .scalar(n_tokens as i64)
-            .scalar(n_q_heads as i64)
-            .scalar(n_kv_heads as i64)
-            .scalar(page_size as i64)
-            .scalar(max_pages as i64)
+            .scalar(i64::try_from(n_tokens).expect("T sprawdzone przez validator"))
+            .scalar(i64::try_from(n_q_heads).expect("głowice Q sprawdzone przez validator"))
+            .scalar(i64::try_from(n_kv_heads).expect("głowice KV sprawdzone przez validator"))
+            .scalar(i64::try_from(page_size).expect("rozmiar strony sprawdzony przez validator"))
+            .scalar(i64::try_from(max_pages).expect("liczba stron sprawdzona przez validator"))
             .scalar(scale);
         self.device.launch(kernel, &config, &args, stream)
     }

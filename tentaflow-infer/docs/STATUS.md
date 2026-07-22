@@ -58,8 +58,12 @@ Ostatnia aktualizacja: 2026-07-22.
   dotychczasową ścieżkę seryjną. Segmentowany KV-only catch-up używa kerneli
   Mojo `mtp_norm_join_shifted_segmented_f16`,
   `kv_append_batch_segmented_masked_f16` i
-  `mtp_commit_catchup_metadata_segmented`. Syntetyczna macierz retained 1..T,
-  canary, izolacja lane/stron, prewalidacja commitu pary i memcheck przeszły.
+  `mtp_commit_catchup_metadata_segmented`. NVIDIA używa dokładnej segmentowanej
+  attention z czterema warpami, zgodnej bitowo z verifierem seryjnym. Golden
+  obejmuje T1/ctx1, T6/ctx31/32/33/128, T8/ctx512/2048, zamianę lane, różne
+  mapy stron i canary;
+  memcheck zakończył się bez błędów. Syntetyczna macierz retained 1..T,
+  izolacja lane/stron i prewalidacja commitu pary przeszły.
   Realny N/N 27B E2E, cancel/reuse, A/B, pięciokrotne raw128/raw512 i nsys są
   **PENDING** z tego samego powodu VRAM. Mieszane N/M nie jest zaimplementowane.
   CUDA jest jedynym backendem sprawdzonym wykonawczo;

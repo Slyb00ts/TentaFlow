@@ -285,48 +285,81 @@ def attn_verify_segmented_f16_hd256_warp32(
     max_pages: Int,
     scale: Float32,
 ):
-    """Atencja verifiera NVIDIA z jednym warpem na query i head."""
+    """Dokładna atencja verifiera NVIDIA dla osobnych tablic stron."""
     comptime head_dim = 256
     comptime elements_per_lane = head_dim // WARP_SIZE
     token = Int(block_idx.x)
     qh = Int(block_idx.y)
-    lane_id = Int(thread_idx.x)
     kvh = qh // (n_q_heads // n_kv_heads)
     sequence = token // n_tokens
+    lane_id = Int(thread_idx.x) % WARP_SIZE
+    warp_id = Int(thread_idx.x) // WARP_SIZE
+    n_warps = Int(block_dim.x) // WARP_SIZE
     ctx_len = Int(visible_lens[token])
     q_base = (token * n_q_heads + qh) * head_dim
     var q_frag = SIMD[DType.float32, elements_per_lane](0.0)
-    var output = SIMD[DType.float32, elements_per_lane](0.0)
     comptime for element in range(elements_per_lane):
         q_frag[element] = Float32(q[q_base + element * WARP_SIZE + lane_id])
+
     var maximum: Float32 = NEG_INF
     var denominator: Float32 = 0.0
+    var output = SIMD[DType.float32, elements_per_lane](0.0)
+    var position = warp_id
 
-    for position in range(ctx_len):
+    while position < ctx_len:
         page = Int(page_tables[sequence * max_pages + position // page_size])
         kv_base = (
             (page * n_kv_heads + kvh) * page_size + position % page_size
         ) * head_dim
-        var key = SIMD[DType.float32, elements_per_lane](0.0)
-        var value = SIMD[DType.float32, elements_per_lane](0.0)
         var partial: Float32 = 0.0
         comptime for element in range(elements_per_lane):
             offset = element * WARP_SIZE + lane_id
-            key[element] = Float32(k_cache[kv_base + offset])
-            partial += q_frag[element] * key[element]
-            value[element] = Float32(v_cache[kv_base + offset])
+            partial += q_frag[element] * Float32(k_cache[kv_base + offset])
         score = warp.sum(partial) * scale
         next_maximum = max(maximum, score)
-        correction = exp(maximum - next_maximum) if maximum > NEG_INF else Float32(0.0)
+        correction = exp(maximum - next_maximum)
         probability = exp(score - next_maximum)
         denominator = denominator * correction + probability
-        output = output * correction + probability * value
+        comptime for element in range(elements_per_lane):
+            offset = element * WARP_SIZE + lane_id
+            output[element] = output[element] * correction + probability * Float32(
+                v_cache[kv_base + offset]
+            )
         maximum = next_maximum
+        position += n_warps
 
+    shared_maximum = stack_allocation[MAX_WARPS, Float32, address_space=AddressSpace.SHARED]()
+    shared_denominator = stack_allocation[MAX_WARPS, Float32, address_space=AddressSpace.SHARED]()
+    shared_output = stack_allocation[
+        MAX_WARPS * head_dim, Float32, address_space=AddressSpace.SHARED
+    ]()
+
+    if lane_id == 0:
+        shared_maximum[warp_id] = maximum
+        shared_denominator[warp_id] = denominator
     comptime for element in range(elements_per_lane):
-        out_ptr[q_base + element * WARP_SIZE + lane_id] = Float16(
-            output[element] / denominator
-        )
+        shared_output[warp_id * head_dim + element * WARP_SIZE + lane_id] = output[element]
+    barrier()
+
+    if warp_id == 0:
+        var merged_maximum: Float32 = NEG_INF
+        for source_warp in range(n_warps):
+            if shared_maximum[source_warp] > merged_maximum:
+                merged_maximum = shared_maximum[source_warp]
+        var merged_denominator: Float32 = 0.0
+        var merged_output = SIMD[DType.float32, elements_per_lane](0.0)
+        for source_warp in range(n_warps):
+            correction = exp(shared_maximum[source_warp] - merged_maximum)
+            merged_denominator += shared_denominator[source_warp] * correction
+            comptime for element in range(elements_per_lane):
+                merged_output[element] += shared_output[
+                    source_warp * head_dim + element * WARP_SIZE + lane_id
+                ] * correction
+        inverse_denominator = 1.0 / merged_denominator
+        comptime for element in range(elements_per_lane):
+            out_ptr[q_base + element * WARP_SIZE + lane_id] = Float16(
+                merged_output[element] * inverse_denominator
+            )
 
 
 def attn_decode_split[head_dim: Int, kv_dtype: DType](

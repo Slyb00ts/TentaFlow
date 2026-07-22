@@ -500,6 +500,16 @@ obejmują cancel/reuse pending draftu i atomową prewalidację commitu obu lane.
 Mały `compute-sanitizer --tool memcheck` dla poprawnego masked append zakończył
 się `ERROR SUMMARY: 0 errors`.
 
+Segmentowana attention NVIDIA zachowuje kolejność redukcji dokładnego verifiera
+seryjnego: cztery warpy dzielą pozycje kontekstu, a warp 0 scala części w tej
+samej kolejności. Porównanie bitowe obejmuje T1 przy ctx1, T6 przy granicach
+stron ctx31/32/33 i ctx128 oraz T8 przy ctx512/2048, obie kolejności lane,
+rozłączne mapy stron i canary. Mikrobenchmark produkcyjnego exact4/fallbacku
+przenośnego wyniósł 2,96/5,70 us dla ctx4, 19,58/111,92 us dla ctx128,
+67,33/440,77 us dla ctx512 i 239,19/1608,67 us dla ctx2048. Względny błąd L2
+wyniósł od 5,63e-9 do 2,97e-5, a maksymalny błąd od 5,96e-8 do 2,44e-4;
+benchmark przerywa pracę powyżej odpowiednio 0,002 i 0,001.
+
 Realny N/N E2E dla 27B, porównanie z seryjnym routerem, pełny target rollback,
 cancel/reuse serwera, pięć powtórzeń raw128/raw512 i profil nsys pozostają
 **PENDING**, ponieważ aktywny obcy proces pozostawił mniej niż 22,5 GiB wolnego
