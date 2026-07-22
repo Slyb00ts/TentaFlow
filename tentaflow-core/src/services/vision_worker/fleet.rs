@@ -307,6 +307,8 @@ impl WorkerFleet {
                         f.proc_ms,
                         f.enriched,
                         f.items,
+                        // Remote-fleet frames carry no local luma to estimate motion.
+                        detection_bus::MotionSignal::default(),
                     );
                 }
             }

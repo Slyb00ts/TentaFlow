@@ -10,6 +10,9 @@ pub mod credentials;
 pub mod decoder_detect;
 pub mod error;
 pub mod fakefile;
+/// Lighting-robust directional motion estimator (ZNCC block flow) — the event
+/// recorder's trigger, since the vehicle detector misses tankers that fill frame.
+pub mod motion;
 /// Zero-copy NVDEC CUDA-buffer map (Stage 4) — device NV12 detect without a
 /// GPU→CPU→GPU round-trip. Only meaningful with the GPU inference features (they
 /// link cudart and provide the device-tensor detect path).

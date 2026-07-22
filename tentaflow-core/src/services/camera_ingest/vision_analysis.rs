@@ -2077,6 +2077,71 @@ fn synthesize_forced_detections(pipeline: &CvPipeline, captured_ms: u64) -> Vec<
         .collect()
 }
 
+/// Per-camera motion estimator state (previous luma for directional flow). Held
+/// process-wide because `finalize_job` is stateless per call. The map lock is held
+/// only to fetch/insert the `Arc`; the estimate itself runs on the per-camera mutex.
+fn motion_estimators() -> &'static Mutex<HashMap<String, Arc<Mutex<super::motion::MotionEstimator>>>>
+{
+    static M: OnceLock<Mutex<HashMap<String, Arc<Mutex<super::motion::MotionEstimator>>>>> =
+        OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Directional zone motion for this frame, converted to the always-compiled wire
+/// type. Non-moving default when no host luma is available (device zero-copy path)
+/// or the frame is malformed. NV12 uses the Y plane directly; RGB24 is converted to
+/// luma once (BT.601 integer approximation).
+fn compute_zone_motion(
+    camera_id: &str,
+    frame: &[u8],
+    format: &super::fakefile::DetectFrameFormat,
+    w: u32,
+    h: u32,
+    zones: &[Vec<(f32, f32)>],
+) -> detection_bus::MotionSignal {
+    use super::fakefile::DetectFrameFormat;
+    if frame.is_empty() || w == 0 || h == 0 {
+        return detection_bus::MotionSignal::default();
+    }
+    let (luma, y_stride, y_offset): (std::borrow::Cow<[u8]>, u32, u32) = match *format {
+        DetectFrameFormat::Nv12 {
+            y_stride, y_offset, ..
+        } => (std::borrow::Cow::Borrowed(frame), y_stride, y_offset),
+        DetectFrameFormat::Rgb24 => {
+            let n = w as usize * h as usize;
+            if frame.len() < n * 3 {
+                return detection_bus::MotionSignal::default();
+            }
+            let mut y = vec![0u8; n];
+            for (i, px) in y.iter_mut().enumerate() {
+                let p = i * 3;
+                *px = ((77 * frame[p] as u32
+                    + 150 * frame[p + 1] as u32
+                    + 29 * frame[p + 2] as u32)
+                    >> 8) as u8;
+            }
+            (std::borrow::Cow::Owned(y), w, 0)
+        }
+    };
+    let est = {
+        let mut map = motion_estimators().lock().unwrap();
+        map.entry(camera_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(super::motion::MotionEstimator::new())))
+            .clone()
+    };
+    let sig = est
+        .lock()
+        .unwrap()
+        .estimate(&luma, w, h, y_stride, y_offset, zones);
+    detection_bus::MotionSignal {
+        moving: sig.moving,
+        dir_x: sig.dir_x,
+        magnitude: sig.magnitude,
+        centroid_x: sig.centroid_x,
+        coherence: sig.coherence,
+    }
+}
+
 /// Finalizacja klatki po domknięciu wszystkich jej etapów `frame`: scala wyniki
 /// etapów w JEDNĄ publikację overlay (FAZA 1, kolejność etapów pipeline'u) i —
 /// dla niepustych zestawów — oddaje ramkę do cold path (FAZA 2, wzbogacenie).
@@ -2114,6 +2179,16 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
     // rysuje ramki cieżarowek), NIE do `merged` uzytego do sygnatury/eventu.
     let mut overlay = merged.clone();
     overlay.extend(job.vehicles.iter().cloned());
+    // Directional zone motion for this frame — the event recorder's trigger. Runs
+    // on the host luma; the device zero-copy path yields a non-moving default.
+    let motion = compute_zone_motion(
+        &job.camera_id,
+        &job.frame,
+        &job.frame_format,
+        job.w,
+        job.h,
+        &job.zones,
+    );
     detection_bus::publish_detections(
         &job.camera_id,
         job.captured_ms,
@@ -2124,6 +2199,7 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
         // these (they would flood the unassigned `vehicle_id = 0` bucket).
         false,
         overlay,
+        motion,
     );
     // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay. Sam
     // pojazd bez znaku/tablicy NIE tworzy eventu (trigger to detekcje RF-DETR).
@@ -2572,6 +2648,9 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 // this is the ONLY publish the event recorder buckets per vehicle.
                 true,
                 merged.clone(),
+                // Motion is estimated once per frame on the hot FAZA 1 publish; the
+                // cold FAZA 2 republish of the same frame carries no fresh signal.
+                detection_bus::MotionSignal::default(),
             );
             if !merged.is_empty() {
                 if let (Some(flow_id), Some(disp)) = (
@@ -2792,6 +2871,7 @@ fn publish_flow_detections(
         // no vehicle association), so it feeds the overlay only — never bucketing.
         false,
         enriched.unwrap_or(original),
+        detection_bus::MotionSignal::default(),
     );
 }
 

@@ -338,6 +338,7 @@ mod tests {
                     vy: 0.,
                 },
             ],
+            motion: detection_bus::MotionSignal::default(),
         };
         let frame = to_wire(msg);
         assert_eq!(frame.camera_id, "cam_550e8400-e29b-41d4-a716-446655440000");
@@ -379,6 +380,7 @@ mod tests {
                 vx: 0.,
                 vy: 0.,
             }],
+            detection_bus::MotionSignal::default(),
         );
 
         let frame = match rx.recv().await {
@@ -411,6 +413,7 @@ mod tests {
                     vx: 0.,
                     vy: 0.,
                 }],
+                detection_bus::MotionSignal::default(),
             );
         }
         let mut saw_lag = false;

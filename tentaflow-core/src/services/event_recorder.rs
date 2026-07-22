@@ -1230,7 +1230,29 @@ async fn handle_detections(
     preroll: Duration,
     start_blocked_until: &mut Option<Instant>,
 ) {
-    if msg.items.is_empty() {
+    // Recording is driven by ZONE MOTION, not by "any detection". The old gate
+    // (start/keep on any non-empty frame) ran every event to the 60-min cap: the
+    // hot stream always carries some detection (a background sign/sticker inside
+    // the zone, an RF-DETR false-positive), so "scene empty" never arrived and the
+    // force-cut file had no finalised MP4 header → unplayable.
+    //
+    // `msg.motion` is directional optical flow inside the zone — robust to
+    // weather/lighting/flicker because it keys on coherent movement, not
+    // brightness. The vehicle detector misses tankers that fill the frame, so we
+    // do NOT require a vehicle box.
+    let moving = msg.motion.moving;
+    // `items` are already zone-filtered upstream, so any detection here is in-zone.
+    let has_detection = !msg.items.is_empty();
+    if !sm.recording() {
+        // START only on real coherent motion entering the zone. A static in-zone
+        // sign produces detections but no motion, so it can never start an event.
+        if !moving {
+            return;
+        }
+    } else if !(moving || has_detection) {
+        // KEEP alive on motion OR an in-zone detection: a truck stopped on the
+        // scale to be weighed shows no motion but its plate/ADR keeps detecting.
+        // Neither present → stop refreshing so the hysteresis tick closes it.
         return;
     }
     let now = Instant::now();
@@ -1241,11 +1263,8 @@ async fn handle_detections(
         *start_blocked_until = None;
     }
     let started = sm.on_presence(now);
-    // Presence (start/keep recording) fires on EVERY frame — a truck must trigger
-    // recording immediately via the hot FAZA 1 stream. But vehicle bucketing only
-    // folds ENRICHED (FAZA 2) frames: those alone carry the final `vehicle_id`
-    // association + OCR/stan. Bucketing the hot stream would flood `vehicle_id = 0`
-    // with every-frame, unstamped detections.
+    // Vehicle bucketing folds only ENRICHED (FAZA 2) frames: those alone carry the
+    // final `vehicle_id` association + OCR/stan.
     if msg.enriched {
         meta.absorb(&msg.items);
     }
