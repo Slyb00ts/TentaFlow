@@ -572,3 +572,250 @@ fn kernele_b8_nie_czytaja_ani_nie_zapisuja_nieaktywnych_wierszy() {
             .all(|value| value.to_bits() == f32_canary.to_bits()));
     }
 }
+
+#[test]
+fn segmentowany_join_mtp_zachowuje_osobny_initial_hidden_dla_k2_i_k3() {
+    let Some(device) = device() else { return };
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let batch = 2usize;
+    let hidden = 64usize;
+    let eps = 1e-6f32;
+    for t in [3usize, 4] {
+        let total = batch * t;
+        let embeddings: Vec<f16> = (0..total * hidden)
+            .map(|index| f16::from_f32(0.25 + (index % hidden) as f32 * 0.002))
+            .collect();
+        let target: Vec<f16> = (0..total * hidden)
+            .map(|index| {
+                let lane = index / (t * hidden);
+                let row = (index / hidden) % t;
+                f16::from_f32(1.0 + lane as f32 * 3.0 + row as f32 * 0.5)
+            })
+            .collect();
+        let initial: Vec<f16> = (0..batch * hidden)
+            .map(|index| f16::from_f32(if index < hidden { 2.0 } else { 7.0 }))
+            .collect();
+        let norm = vec![f16::ONE; hidden];
+        let canary = f16::from_bits(0x7bcd);
+        let guard = 23usize;
+        let output_values = vec![canary; total * 2 * hidden + guard];
+        let alloc = |bytes| {
+            device
+                .alloc(bytes, MemKind::Device, Pool::Activations)
+                .unwrap()
+        };
+        let embedding_buffer = alloc(embeddings.len() * 2);
+        let target_buffer = alloc(target.len() * 2);
+        let initial_buffer = alloc(initial.len() * 2);
+        let norm_buffer = alloc(norm.len() * 2);
+        let output = alloc(output_values.len() * 2);
+        device
+            .write(bytemuck::cast_slice(&embeddings), &embedding_buffer, 0)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice(&target), &target_buffer, 0)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice(&initial), &initial_buffer, 0)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice(&norm), &norm_buffer, 0)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice(&output_values), &output, 0)
+            .unwrap();
+        kernels
+            .mtp_norm_join_shifted_segmented_f16(
+                &output,
+                &embedding_buffer,
+                &target_buffer,
+                &initial_buffer,
+                &norm_buffer,
+                &norm_buffer,
+                batch,
+                t,
+                hidden,
+                eps,
+                &stream,
+            )
+            .unwrap();
+        device.synchronize().unwrap();
+        let mut bytes = vec![0u8; output_values.len() * 2];
+        device.read(&output, 0, &mut bytes).unwrap();
+        let actual = bytemuck::cast_slice::<u8, f16>(&bytes);
+        for lane in 0..batch {
+            for row in 0..t {
+                let input_row = lane * t + row;
+                let embedding = &embeddings[input_row * hidden..(input_row + 1) * hidden];
+                let hidden_row = if row == 0 {
+                    &initial[lane * hidden..(lane + 1) * hidden]
+                } else {
+                    &target[(input_row - 1) * hidden..input_row * hidden]
+                };
+                let embedding_inv = (embedding
+                    .iter()
+                    .map(|value| value.to_f32().powi(2))
+                    .sum::<f32>()
+                    / hidden as f32
+                    + eps)
+                    .sqrt()
+                    .recip();
+                let hidden_inv = (hidden_row
+                    .iter()
+                    .map(|value| value.to_f32().powi(2))
+                    .sum::<f32>()
+                    / hidden as f32
+                    + eps)
+                    .sqrt()
+                    .recip();
+                let output_row = &actual[input_row * 2 * hidden..(input_row + 1) * 2 * hidden];
+                for index in 0..hidden {
+                    assert!(
+                        (output_row[index].to_f32() - embedding[index].to_f32() * embedding_inv)
+                            .abs()
+                            < 0.002
+                    );
+                    assert!(
+                        (output_row[hidden + index].to_f32()
+                            - hidden_row[index].to_f32() * hidden_inv)
+                            .abs()
+                            < 0.002
+                    );
+                }
+            }
+        }
+        assert!(actual[total * 2 * hidden..]
+            .iter()
+            .all(|value| *value == canary));
+    }
+}
+
+#[test]
+fn maskowany_append_i_metadane_mtp_obsluguja_macierz_retained_1_do_t() {
+    let Some(device) = device() else { return };
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let batch = 2usize;
+    let page_size = 2usize;
+    let max_pages = 2usize;
+    let head_dim = 32usize;
+    let canary = f16::from_bits(0x7bcd);
+    for t in [3usize, 4] {
+        let total = batch * t;
+        let input: Vec<f16> = (0..total * head_dim)
+            .map(|index| f16::from_f32((index / head_dim + 1) as f32))
+            .collect();
+        let input_buffer = device
+            .alloc(input.len() * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let page_tables = device
+            .alloc(batch * max_pages * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let bases = device
+            .alloc(batch * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let decisions = device
+            .alloc(batch * 2 * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let seq_lens = device
+            .alloc((batch + 3) * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let positions = device
+            .alloc((batch + 3) * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let cache_elements = batch * max_pages * page_size * head_dim;
+        let k_cache = device
+            .alloc(cache_elements * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let v_cache = device
+            .alloc(cache_elements * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice(&input), &input_buffer, 0)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice(&[0i32, 1, 2, 3]), &page_tables, 0)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice(&[0i32, 0]), &bases, 0)
+            .unwrap();
+        for retained0 in 1..=t {
+            for retained1 in 1..=t {
+                let decisions_host = [retained0 as i32, 101, retained1 as i32, 202];
+                device
+                    .write(bytemuck::cast_slice(&decisions_host), &decisions, 0)
+                    .unwrap();
+                let cache = vec![canary; cache_elements];
+                device
+                    .write(bytemuck::cast_slice(&cache), &k_cache, 0)
+                    .unwrap();
+                device
+                    .write(bytemuck::cast_slice(&cache), &v_cache, 0)
+                    .unwrap();
+                let metadata_canary = vec![0x6bad_cafeu32; batch + 3];
+                device
+                    .write(bytemuck::cast_slice(&metadata_canary), &seq_lens, 0)
+                    .unwrap();
+                device
+                    .write(bytemuck::cast_slice(&metadata_canary), &positions, 0)
+                    .unwrap();
+                kernels
+                    .kv_append_batch_segmented_masked_f16(
+                        &k_cache,
+                        &v_cache,
+                        &input_buffer,
+                        &input_buffer,
+                        &page_tables,
+                        &bases,
+                        &decisions,
+                        batch,
+                        t,
+                        max_pages,
+                        1,
+                        page_size,
+                        head_dim,
+                        &stream,
+                    )
+                    .unwrap();
+                kernels
+                    .mtp_commit_catchup_metadata_segmented(
+                        &seq_lens, &positions, &bases, &decisions, batch, &stream,
+                    )
+                    .unwrap();
+                device.synchronize().unwrap();
+                let mut cache_bytes = vec![0u8; cache_elements * 2];
+                device.read(&k_cache, 0, &mut cache_bytes).unwrap();
+                let actual = bytemuck::cast_slice::<u8, f16>(&cache_bytes);
+                for lane in 0..batch {
+                    let retained = [retained0, retained1][lane];
+                    for row in 0..t {
+                        let page = lane * max_pages + row / page_size;
+                        let slot = row % page_size;
+                        let offset = (page * page_size + slot) * head_dim;
+                        let expected = if row < retained {
+                            f16::from_f32((lane * t + row + 1) as f32)
+                        } else {
+                            canary
+                        };
+                        assert!(actual[offset..offset + head_dim]
+                            .iter()
+                            .all(|value| *value == expected));
+                    }
+                }
+                for (buffer, expected) in [
+                    (&seq_lens, [retained0 as i32, retained1 as i32]),
+                    (&positions, [retained0 as i32 - 1, retained1 as i32 - 1]),
+                ] {
+                    let mut bytes = vec![0u8; (batch + 3) * 4];
+                    device.read(buffer, 0, &mut bytes).unwrap();
+                    let values = bytemuck::cast_slice::<u8, i32>(&bytes);
+                    assert_eq!(&values[..batch], &expected);
+                    assert!(values[batch..]
+                        .iter()
+                        .all(|value| *value as u32 == 0x6bad_cafe));
+                }
+            }
+        }
+    }
+}

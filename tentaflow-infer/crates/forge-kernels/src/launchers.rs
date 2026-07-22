@@ -48,6 +48,96 @@ fn checked_buffer_bytes(name: &str, dimensions: &[usize], element_bytes: usize) 
         })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_kv_append_batch_segmented_masked_f16(
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    k_input_bytes: usize,
+    v_input_bytes: usize,
+    page_table_bytes: usize,
+    base_position_bytes: usize,
+    decision_bytes: usize,
+    batch: usize,
+    n_tokens: usize,
+    max_pages: usize,
+    n_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+) -> Result<(u32, u32, u32)> {
+    if [batch, n_tokens, max_pages, n_kv_heads, page_size, head_dim]
+        .contains(&0)
+    {
+        return Err(ForgeError::Kernel(
+            "maskowany segmentowany append KV wymaga niezerowych wymiarów".into(),
+        ));
+    }
+    let total = batch.checked_mul(n_tokens).ok_or_else(|| {
+        ForgeError::Kernel("przepełnienie liczby tokenów maskowanego append KV".into())
+    })?;
+    let input_bytes = checked_buffer_bytes(
+        "maskowany segmentowany append KV input",
+        &[total, n_kv_heads, head_dim],
+        2,
+    )?;
+    let cache_page_bytes = checked_buffer_bytes(
+        "maskowany segmentowany append KV cache page",
+        &[n_kv_heads, page_size, head_dim],
+        2,
+    )?;
+    let required_page_table_bytes = checked_buffer_bytes(
+        "maskowany segmentowany append KV page table",
+        &[batch, max_pages],
+        4,
+    )?;
+    let required_base_bytes = checked_buffer_bytes(
+        "maskowany segmentowany append KV base positions",
+        &[batch],
+        4,
+    )?;
+    let required_decision_bytes = checked_buffer_bytes(
+        "maskowany segmentowany append KV decisions",
+        &[batch, 2],
+        4,
+    )?;
+    if k_input_bytes < input_bytes
+        || v_input_bytes < input_bytes
+        || page_table_bytes < required_page_table_bytes
+        || base_position_bytes < required_base_bytes
+        || decision_bytes < required_decision_bytes
+        || k_cache_bytes != v_cache_bytes
+        || k_cache_bytes < cache_page_bytes
+        || !k_cache_bytes.is_multiple_of(cache_page_bytes)
+    {
+        return Err(ForgeError::Kernel(
+            "maskowany segmentowany append KV ma bufor mniejszy lub niezgodny z układem F16"
+                .into(),
+        ));
+    }
+    for (name, value) in [
+        ("T", n_tokens),
+        ("max_pages", max_pages),
+        ("n_kv_heads", n_kv_heads),
+        ("page_size", page_size),
+        ("head_dim", head_dim),
+    ] {
+        i64::try_from(value).map_err(|_| {
+            ForgeError::Kernel(format!(
+                "{name} maskowanego segmentowanego append KV przekracza i64"
+            ))
+        })?;
+    }
+    let grid_x = u32::try_from(total).map_err(|_| {
+        ForgeError::Kernel("liczba tokenów maskowanego append KV przekracza u32".into())
+    })?;
+    let grid_y = u32::try_from(n_kv_heads).map_err(|_| {
+        ForgeError::Kernel("liczba głów maskowanego append KV przekracza u32".into())
+    })?;
+    let block = u32::try_from(head_dim)
+        .map_err(|_| ForgeError::Kernel("head_dim append KV przekracza u32".into()))?
+        .clamp(32, 256);
+    Ok((grid_x, grid_y, block))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Nvfp4GgufDispatch {
     kernel: &'static str,
@@ -2289,6 +2379,77 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
+    /// Normalizuje `[B,T]` z osobnym początkowym hidden dla każdego lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_norm_join_shifted_segmented_f16(
+        &self,
+        output: &DevBuffer,
+        embeddings: &DevBuffer,
+        target_hidden: &DevBuffer,
+        initial_hidden: &DevBuffer,
+        enorm: &DevBuffer,
+        hnorm: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        hidden_size: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0 || n_tokens == 0 || hidden_size == 0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(ForgeError::Kernel(
+                "segmentowany MTP join wymaga dodatnich wymiarów i eps".into(),
+            ));
+        }
+        let total = batch.checked_mul(n_tokens).ok_or_else(|| {
+            ForgeError::Kernel("przepełnienie liczby tokenów segmentowanego MTP join".into())
+        })?;
+        let rows = checked_buffer_bytes("mtp segmented shifted rows", &[total, hidden_size], 2)?;
+        let output_bytes =
+            checked_buffer_bytes("mtp segmented shifted output", &[total, 2, hidden_size], 2)?;
+        let initial_bytes =
+            checked_buffer_bytes("mtp segmented shifted initial", &[batch, hidden_size], 2)?;
+        let vector = checked_buffer_bytes("mtp segmented shifted vector", &[hidden_size], 2)?;
+        if output.len() < output_bytes
+            || embeddings.len() < rows
+            || target_hidden.len() < rows
+            || initial_hidden.len() < initial_bytes
+            || enorm.len() < vector
+            || hnorm.len() < vector
+        {
+            return Err(ForgeError::Kernel(
+                "mtp_norm_join_shifted_segmented_f16: bufor jest mniejszy od wymaganego kształtu"
+                    .into(),
+            ));
+        }
+        let grid = u32::try_from(total).map_err(|_| {
+            ForgeError::Kernel("segmentowany MTP join przekracza siatkę u32".into())
+        })?;
+        let kernel = self.artifacts.get("mtp_norm_join_shifted_segmented_f16")?;
+        let config = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(embeddings)
+            .buf(target_hidden)
+            .buf(initial_hidden)
+            .buf(enorm)
+            .buf(hnorm)
+            .scalar(i64::try_from(batch).map_err(|_| {
+                ForgeError::Kernel("batch segmentowanego MTP join przekracza i64".into())
+            })?)
+            .scalar(i64::try_from(n_tokens).map_err(|_| {
+                ForgeError::Kernel("T segmentowanego MTP join przekracza i64".into())
+            })?)
+            .scalar(i64::try_from(hidden_size).map_err(|_| {
+                ForgeError::Kernel("hidden segmentowanego MTP join przekracza i64".into())
+            })?)
+            .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Projektuje złączony batch przez Q8_0 zgodnie z redukcją mtp_prepare.
     pub fn mtp_project_joined_q8_f16(
         &self,
@@ -2378,6 +2539,50 @@ impl Kernels {
             .scalar(seq_len)
             .scalar(logical_page)
             .scalar(physical_page);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Zapisuje końcowe metadane MTP dla niezależnych decyzji lane.
+    pub fn mtp_commit_catchup_metadata_segmented(
+        &self,
+        seq_lens_out: &DevBuffer,
+        positions_out: &DevBuffer,
+        base_positions: &DevBuffer,
+        decisions: &DevBuffer,
+        batch: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let bytes = batch
+            .checked_mul(4)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie metadanych catch-up MTP".into()))?;
+        let decision_bytes = batch.checked_mul(8).ok_or_else(|| {
+            ForgeError::Kernel("przepełnienie decyzji metadanych catch-up MTP".into())
+        })?;
+        if batch == 0
+            || seq_lens_out.len() < bytes
+            || positions_out.len() < bytes
+            || base_positions.len() < bytes
+            || decisions.len() < decision_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "segmentowane metadane catch-up MTP mają nieprawidłowy kształt".into(),
+            ));
+        }
+        let grid = u32::try_from(batch)
+            .map_err(|_| ForgeError::Kernel("batch metadanych MTP przekracza u32".into()))?;
+        let kernel = self
+            .artifacts
+            .get("mtp_commit_catchup_metadata_segmented")?;
+        let config = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(seq_lens_out)
+            .buf(positions_out)
+            .buf(base_positions)
+            .buf(decisions);
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -3723,6 +3928,79 @@ impl Kernels {
             .scalar(n_kv_heads as i64)
             .scalar(page_size as i64)
             .scalar(head_dim as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Zapisuje K/V tylko dla prefiksu zatwierdzonego decyzją każdego lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append_batch_segmented_masked_f16(
+        &self,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        k_in: &DevBuffer,
+        v_in: &DevBuffer,
+        page_tables: &DevBuffer,
+        base_positions: &DevBuffer,
+        decisions: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        max_pages: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (grid_x, grid_y, block) = validate_kv_append_batch_segmented_masked_f16(
+            k_cache.len(),
+            v_cache.len(),
+            k_in.len(),
+            v_in.len(),
+            page_tables.len(),
+            base_positions.len(),
+            decisions.len(),
+            batch,
+            n_tokens,
+            max_pages,
+            n_kv_heads,
+            page_size,
+            head_dim,
+        )?;
+        let kernel = self.artifacts.get("kv_append_batch_segmented_masked_f16")?;
+        let config = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(k_in)
+            .buf(v_in)
+            .buf(page_tables)
+            .buf(base_positions)
+            .buf(decisions)
+            .scalar(
+                i64::try_from(n_tokens).map_err(|_| {
+                    ForgeError::Kernel("T maskowanego append KV przekracza i64".into())
+                })?,
+            )
+            .scalar(
+                i64::try_from(max_pages)
+                    .map_err(|_| ForgeError::Kernel("max_pages append KV przekracza i64".into()))?,
+            )
+            .scalar(
+                i64::try_from(n_kv_heads).map_err(|_| {
+                    ForgeError::Kernel("n_kv_heads append KV przekracza i64".into())
+                })?,
+            )
+            .scalar(
+                i64::try_from(page_size)
+                    .map_err(|_| ForgeError::Kernel("page_size append KV przekracza i64".into()))?,
+            )
+            .scalar(
+                i64::try_from(head_dim)
+                    .map_err(|_| ForgeError::Kernel("head_dim append KV przekracza i64".into()))?,
+            );
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -11776,7 +12054,7 @@ mod nvfp4_gguf_dispatch_tests {
         ensure_prepared_q8_usable, lock_prepared_q8_scratch, nvfp4_gguf_dispatch,
         q8_nvfp4_pack_launch, raw_nvfp4_dp4a_supported, resolve_prepared_q8_marker, Kernels,
         PrequantScratch, PREPARED_Q8_GEMM_LAUNCHES, PREPARED_Q8_RECORD_FAILURES,
-        PREPARED_Q8_SYNC_FAILURES,
+        PREPARED_Q8_SYNC_FAILURES, validate_kv_append_batch_segmented_masked_f16,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::cuda::{CudaDevice, PoolSizes};
@@ -11785,6 +12063,39 @@ mod nvfp4_gguf_dispatch_tests {
     use half::f16;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn maskowany_append_kv_odrzuca_wymiary_i_bufory_przed_launch() {
+        let valid = [256usize, 256, 128, 128, 16, 8, 16, 2, 2, 2, 2, 2, 8];
+        let validate = |values: [usize; 13]| {
+            validate_kv_append_batch_segmented_masked_f16(
+                values[0], values[1], values[2], values[3], values[4], values[5], values[6],
+                values[7], values[8], values[9], values[10], values[11], values[12],
+            )
+        };
+        assert_eq!(validate(valid).unwrap(), (4, 2, 32));
+
+        for dimension in 7..13 {
+            let mut values = valid;
+            values[dimension] = 0;
+            assert!(validate(values).is_err(), "wymiar {dimension} powinien być odrzucony");
+        }
+        for buffer in 0..7 {
+            let mut values = valid;
+            values[buffer] = values[buffer].saturating_sub(1);
+            assert!(validate(values).is_err(), "bufor {buffer} powinien być odrzucony");
+        }
+        let mut different_cache = valid;
+        different_cache[1] += 256;
+        assert!(validate(different_cache).is_err());
+        let mut misaligned_cache = valid;
+        misaligned_cache[0] += 2;
+        misaligned_cache[1] += 2;
+        assert!(validate(misaligned_cache).is_err());
+        let mut overflow = valid;
+        overflow[7] = usize::MAX;
+        assert!(validate(overflow).is_err());
+    }
 
     #[test]
     fn publiczny_flow_uniewaznia_handle_po_bledzie_record() {

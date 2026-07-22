@@ -347,6 +347,62 @@ def mtp_norm_join_shifted_f16(
         i += Int(block_dim.x)
 
 
+def mtp_norm_join_shifted_segmented_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    embeddings: UnsafePointer[Float16, MutAnyOrigin],
+    target_hidden: UnsafePointer[Float16, MutAnyOrigin],
+    initial_hidden: UnsafePointer[Float16, MutAnyOrigin],
+    enorm: UnsafePointer[Float16, MutAnyOrigin],
+    hnorm: UnsafePointer[Float16, MutAnyOrigin],
+    batch: Int,
+    n_tokens: Int,
+    hidden_size: Int,
+    eps: Float32,
+):
+    """Tworzy join dla `[B,T]` z niezależnym carry każdego segmentu."""
+    token = Int(block_idx.x)
+    total = batch * n_tokens
+    if token >= total:
+        return
+    lane = token // n_tokens
+    local_token = token - lane * n_tokens
+    tid = Int(thread_idx.x)
+    row_base = token * hidden_size
+    previous_base = (token - 1) * hidden_size
+    initial_base = lane * hidden_size
+
+    var embed_sq: Float32 = 0.0
+    var hidden_sq: Float32 = 0.0
+    var i = tid
+    while i < hidden_size:
+        embedding = Float32(embeddings[row_base + i])
+        hidden = Float32(
+            initial_hidden[initial_base + i]
+            if local_token == 0 else target_hidden[previous_base + i]
+        )
+        embed_sq += embedding * embedding
+        hidden_sq += hidden * hidden
+        i += Int(block_dim.x)
+
+    embed_inv = rsqrt(_block_sum_portable(embed_sq) / Float32(hidden_size) + eps)
+    hidden_inv = rsqrt(_block_sum_portable(hidden_sq) / Float32(hidden_size) + eps)
+    output_base = token * 2 * hidden_size
+    i = tid
+    while i < hidden_size:
+        embedding = Float32(embeddings[row_base + i])
+        hidden = Float32(
+            initial_hidden[initial_base + i]
+            if local_token == 0 else target_hidden[previous_base + i]
+        )
+        output[output_base + i] = Float16(
+            embedding * embed_inv * Float32(enorm[i])
+        )
+        output[output_base + hidden_size + i] = Float16(
+            hidden * hidden_inv * Float32(hnorm[i])
+        )
+        i += Int(block_dim.x)
+
+
 def mtp_project_joined_q8_f16(
     output: UnsafePointer[Float16, MutAnyOrigin],
     joined: UnsafePointer[Float16, MutAnyOrigin],
@@ -414,6 +470,21 @@ def mtp_stage_step(
         seq_len_out[0] = Int32(seq_len)
         if logical_page >= 0:
             page_table[logical_page] = Int32(physical_page)
+
+
+def mtp_commit_catchup_metadata_segmented(
+    seq_lens_out: UnsafePointer[Int32, MutAnyOrigin],
+    positions_out: UnsafePointer[Int32, MutAnyOrigin],
+    base_positions: UnsafePointer[Int32, MutAnyOrigin],
+    decisions: UnsafePointer[Int32, MutAnyOrigin],
+):
+    """Zatwierdza długość i pozycję MTP według decyzji każdego lane."""
+    lane = Int(block_idx.x)
+    if Int(thread_idx.x) == 0:
+        retained = Int(decisions[2 * lane])
+        length = Int(base_positions[lane]) + retained
+        seq_lens_out[lane] = Int32(length)
+        positions_out[lane] = Int32(length - 1)
 
 
 def mtp_verify_decide(

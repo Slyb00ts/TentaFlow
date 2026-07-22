@@ -482,6 +482,29 @@ Kontrola repeat raw128 nie znalazła pełnego draftu n-gram: 40/40 cykli przesz�
 przez fallback MTP, zachowując parity i osiągając 86,97 tok/s. Wartości
 `oracle_upper` nie są raportowane jako wynik actual.
 
+### Eksperymentalne N/N B2
+
+`FORGE_MTP_NGRAM_BATCH=1` paruje dwa pełne drafty n-gram o tym samym K=2 albo
+K=3 i używa wspólnego source-agnostic target verifiera B2. Domyślna wartość
+wynosi `0`, dlatego produkcyjny router pozostaje seryjny. Draft ID są pakowane
+na GPU, a różne długości retained obu lane doganiają MTP bez logitów przez trzy
+kernele Mojo:
+
+- `mtp_norm_join_shifted_segmented_f16`;
+- `kv_append_batch_segmented_masked_f16`;
+- `mtp_commit_catchup_metadata_segmented`.
+
+Golden syntetyczny obejmuje K2/K3, macierz retained 1..T dla obu lane, osobny
+initial hidden, izolację stron i lane, canary oraz granice buforów. Testy hostowe
+obejmują cancel/reuse pending draftu i atomową prewalidację commitu obu lane.
+Mały `compute-sanitizer --tool memcheck` dla poprawnego masked append zakończył
+się `ERROR SUMMARY: 0 errors`.
+
+Realny N/N E2E dla 27B, porównanie z seryjnym routerem, pełny target rollback,
+cancel/reuse serwera, pięć powtórzeń raw128/raw512 i profil nsys pozostają
+**PENDING**, ponieważ aktywny obcy proces pozostawił mniej niż 22,5 GiB wolnego
+VRAM. Mieszane parowanie N/M nie jest zaimplementowane.
+
 ## Batchowy KV-only catch-up MTP
 
 Catch-up po chunku targetu nie potrzebuje logitów ani wyjścia pełnego bloku MTP.

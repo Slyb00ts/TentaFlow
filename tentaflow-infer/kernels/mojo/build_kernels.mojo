@@ -49,7 +49,7 @@ from src.deltanet_verify import (
 )
 from src.nvfp4 import gemv_nvfp4_f16, pack_f16_fp8, pack_nvfp4_fp8, gemv_nvfp4_gguf_f16, gemv_nvfp4_gguf_out_f32, pack_q8_0_nvfp4_gguf
 from src.nvfp4_gguf_dp4a import gemv_nvfp4_gguf_q8_1_f16
-from src.mtp import mtp_prepare_f16, mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16, mtp_pack_verify_inputs, gather_q8_0_rows_f16, gather_nvfp4_gguf_rows_f16, gather_nvfp4_gguf_rows_f16_nvidia, mtp_verify_decide, mtp_verify_decide_segmented, mtp_select_row_f16, mtp_select_row_f32, mtp_select_row_segmented_f16
+from src.mtp import mtp_prepare_f16, mtp_stage_step, mtp_norm_join_shifted_f16, mtp_norm_join_shifted_segmented_f16, mtp_commit_catchup_metadata_segmented, mtp_project_joined_q8_f16, gather_f16_row_f16, gather_q8_0_row_f16, gather_nvfp4_gguf_row_f16, mtp_pack_verify_inputs, gather_q8_0_rows_f16, gather_nvfp4_gguf_rows_f16, gather_nvfp4_gguf_rows_f16_nvidia, mtp_verify_decide, mtp_verify_decide_segmented, mtp_select_row_f16, mtp_select_row_f32, mtp_select_row_segmented_f16
 from src.nvfp4_batch import gemv_batch_nvfp4_f16_b4, gemv_batch_nvfp4_f16_b8, gemv_batch_nvfp4_f16_b16, gemv_batch_f16_out_f32_b4, gemv_batch_f16_out_f32_b8
 from src.misc import gather_rows_f16, gemv_f16_out_f32, gemv_q8_0_out_f32
 from src.layernorm import layernorm_f16, layernorm_residual_f16
@@ -114,7 +114,7 @@ from src.gemm_q4k_i8_multistage import (
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128, attn_prefill_f16_hd256
 from src.prefill import kv_append_batch_fp8, attn_prefill_fp8_hd64, attn_prefill_fp8_hd128
 from src.prefill import attn_prefill_fa_f16_hd64, attn_prefill_fa_f16_hd128
-from src.prefill import kv_append_batch_device_pos_f16, kv_append_batch_segmented_f16, attn_prefill_device_pos_f16_hd256
+from src.prefill import kv_append_batch_device_pos_f16, kv_append_batch_segmented_f16, kv_append_batch_segmented_masked_f16, attn_prefill_device_pos_f16_hd256
 from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
 from src.attention import attn_decode_split_fp8_hd64, attn_decode_split_fp8_hd128
@@ -477,6 +477,10 @@ def main() raises:
     entries.append(_finalize(out_dir, "mtp_stage_step"))
     _ = ctx.compile_function[mtp_norm_join_shifted_f16, dump_asm=Path("mtp_norm_join_shifted_f16.ptx")]()
     entries.append(_finalize(out_dir, "mtp_norm_join_shifted_f16"))
+    _ = ctx.compile_function[mtp_norm_join_shifted_segmented_f16, dump_asm=Path("mtp_norm_join_shifted_segmented_f16.ptx")]()
+    entries.append(_finalize(out_dir, "mtp_norm_join_shifted_segmented_f16"))
+    _ = ctx.compile_function[mtp_commit_catchup_metadata_segmented, dump_asm=Path("mtp_commit_catchup_metadata_segmented.ptx")]()
+    entries.append(_finalize(out_dir, "mtp_commit_catchup_metadata_segmented"))
     _ = ctx.compile_function[mtp_project_joined_q8_f16, dump_asm=Path("mtp_project_joined_q8_f16.ptx")]()
     entries.append(_finalize(out_dir, "mtp_project_joined_q8_f16"))
     _ = ctx.compile_function[gather_f16_row_f16, dump_asm=Path("gather_f16_row_f16.ptx")]()
@@ -685,6 +689,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "kv_append_batch_device_pos_f16"))
     _ = ctx.compile_function[kv_append_batch_segmented_f16, dump_asm=Path("kv_append_batch_segmented_f16.ptx")]()
     entries.append(_finalize(out_dir, "kv_append_batch_segmented_f16"))
+    _ = ctx.compile_function[kv_append_batch_segmented_masked_f16, dump_asm=Path("kv_append_batch_segmented_masked_f16.ptx")]()
+    entries.append(_finalize(out_dir, "kv_append_batch_segmented_masked_f16"))
 
     _ = ctx.compile_function[attn_prefill_f16_hd64, dump_asm=Path("attn_prefill_f16_hd64.ptx")]()
     entries.append(_finalize(out_dir, "attn_prefill_f16_hd64"))

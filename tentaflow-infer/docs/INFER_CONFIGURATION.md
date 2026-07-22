@@ -300,6 +300,7 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 | `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
 | `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
 | `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
+| `FORGE_MTP_NGRAM_BATCH` | `0` | Eksperymentalne parowanie N/N B2 dwóch pełnych draftów n-gram o tym samym K=2 albo K=3. `1` włącza ścieżkę, `0` lub brak zmiennej pozostawia dotychczasowy router seryjny. Inna wartość jest błędem konfiguracji. Nie włączać produkcyjnie przed realnym E2E 27B. |
 
 W verifierze B2 dla T=6 i T=8 trzy projekcje Q8_0 `gate_proj`, `alpha_proj` i
 `beta_proj` współdzielą jedną kwantyzację wejścia `pb.x`, jeśli wszystkie mają
@@ -316,11 +317,28 @@ cargo run -p forge-cli --release -- run MODEL.gguf "Przykładowy prompt" \
 
 Polecenie `serve` dobiera dla MTP domyślne `--max-active 1`; jawna większa
 wartość uruchamia startup preflight puli stanów per sekwencja. Dwa requesty
-pure MTP z tym samym K mogą wykonać wspólny B2. Różne K, `mtp+ngram`, tiering,
-niepełna para albo niespełniony kontrakt capability przechodzą przed mutacją
-stanu na seryjne B1. Jeśli wymagane sloty nie mieszczą się w pulach
+pure MTP z tym samym K mogą wykonać wspólny B2. Różne K, tiering, niepełna para
+albo niespełniony kontrakt capability przechodzą przed mutacją stanu na seryjne
+B1; `mtp+ngram` pozostaje seryjny przy domyślnej fladze N/N. Jeśli wymagane sloty nie mieszczą się w pulach
 weights/activations, worker nie startuje, a błąd podaje wymagane i dostępne
 bajty. `run` zawsze obsługuje jedną sekwencję.
+
+Po ustawieniu `FORGE_MTP_NGRAM_BATCH=1` dwa requesty `mtp+ngram` z pełnym
+draftem n-gram i tym samym K=2/K=3 mogą współdzielić source-agnostic target
+verifier B2. Draft ID są pakowane na GPU, a stan MTP doganiany segmentowanym
+KV-only catch-up przez `mtp_norm_join_shifted_segmented_f16`,
+`kv_append_batch_segmented_masked_f16` i
+`mtp_commit_catchup_metadata_segmented`. Commit obu lane jest prewalidowany
+przed zatwierdzeniem targetu i aplikowany bez kolejnego fallible kroku. Brak
+pełnego draftu, ogon bez pary albo niespełnione capability używają istniejącej
+ścieżki seryjnej. Mieszane N/M nie jest zaimplementowane.
+
+Testy syntetyczne obejmują K2/K3, wszystkie kombinacje retained 1..T, osobny
+initial hidden, izolację lane i stron, granice buforów, canary, cancel/reuse
+pending draftu oraz błędną prewalidację lane0/lane1. Mały CUDA memcheck nie
+wykazał błędów. Realny N/N E2E na modelu 27B, target rollback w pełnym przebiegu,
+cancel/reuse serwera, A/B z routerem seryjnym, pięć powtórzeń raw128/raw512 i
+nsys pozostają pending, ponieważ wolny VRAM był niższy niż 22,5 GiB.
 
 ### Manifest neuralnego proposera
 

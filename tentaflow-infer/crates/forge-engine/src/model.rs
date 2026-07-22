@@ -64,18 +64,23 @@ fn restore_after<T>(result: Result<T>, restore: impl FnOnce()) -> Result<T> {
     result
 }
 
-fn commit_mtp_pair_metadata(
-    states: &mut [MtpDraftState; 2],
-    kv: &mut KvCache,
+fn validate_mtp_pair_metadata_commit(
+    states: &[MtpDraftState; 2],
     retained: [usize; 2],
-) -> Result<()> {
-    let targets = [
+) -> Result<[usize; 2]> {
+    Ok([
         states[0].validate_commit_prefix_metadata(retained[0])?,
         states[1].validate_commit_prefix_metadata(retained[1])?,
-    ];
+    ])
+}
+
+fn apply_mtp_pair_metadata_commit(
+    states: &mut [MtpDraftState; 2],
+    kv: &mut KvCache,
+    targets: [usize; 2],
+) {
     states[0].apply_commit_prefix_metadata(kv, targets[0]);
     states[1].apply_commit_prefix_metadata(kv, targets[1]);
-    Ok(())
 }
 
 fn rollback_mtp_pair(
@@ -1211,11 +1216,24 @@ struct MtpB2Bufs {
     decisions: DevBuffer,
     pinned_decisions: DevBuffer,
     pinned_metadata: DevBuffer,
+    pinned_mtp_metadata: DevBuffer,
+    catchup_embeddings: DevBuffer,
+    mtp_initial_hidden: DevBuffer,
+    mtp_seq_lens: DevBuffer,
+    mtp_positions: DevBuffer,
     selected_states: DevBuffer,
     selected_conv: DevBuffer,
     selected_hidden: DevBuffer,
     delta: Vec<Option<MtpB2DeltaCache>>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MtpB2StateMode {
+    Proposed,
+    Catchup,
+}
+
+type MtpB2Verification = ([(Vec<u32>, usize, u32); 2], [usize; 2]);
 
 struct HybridHostStaging {
     embedding: DevBuffer,
@@ -5854,6 +5872,11 @@ impl Model {
                 .all(|seq| self.native_mtp_available_budget(seq, budget) == budget)
     }
 
+    /// Sprawdza kontrakt wspólnego target verifiera dla dwóch pełnych draftów n-gram.
+    pub fn mtp_ngram_b2_capable(&self, seqs: [&SeqKv; 2], budget: usize) -> bool {
+        self.native_mtp_b2_capable(seqs, budget)
+    }
+
     fn mtp_upload_scalar(
         &self,
         state: &mut MtpDraftState,
@@ -6458,6 +6481,203 @@ impl Model {
             }
         }
         self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_catchup_verified_prefix_b2(
+        &self,
+        states: &mut [MtpDraftState; 2],
+        mtp_kv: &mut KvCache,
+        t: usize,
+    ) -> Result<()> {
+        let mtp = self.weights.mtp.as_ref().expect("stan MTP ma wagi");
+        let layer = mtp.layers.first().ok_or_else(|| {
+            ForgeError::Unsupported("segmentowany catch-up MTP wymaga jednej warstwy".into())
+        })?;
+        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+            return Err(ForgeError::Unsupported(
+                "segmentowany catch-up MTP wymaga eh_proj Q8_0".into(),
+            ));
+        };
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let total = 2usize
+            .checked_mul(t)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie catch-up MTP B2".into()))?;
+        let mut bases = [0i32; 2];
+        let mut page_tables = vec![-1i32; 2 * self.max_pages_per_seq];
+        for (lane, state) in states.iter_mut().enumerate() {
+            self.device.copy(
+                &state.recurrent_hidden,
+                0,
+                &self
+                    .mtp_b2_bufs
+                    .as_ref()
+                    .expect("MTP B2 gotowy")
+                    .mtp_initial_hidden,
+                lane * hidden * 2,
+                hidden * 2,
+                &self.stream,
+            )?;
+            let (base, table, _, _) = state.stage_batch(mtp_kv, t)?;
+            bases[lane] = i32::try_from(base).map_err(|_| {
+                ForgeError::Scheduler("pozycja bazowa catch-up MTP przekracza i32".into())
+            })?;
+            let offset = lane * self.max_pages_per_seq;
+            page_tables[offset..offset + table.len()].copy_from_slice(&table);
+        }
+        let b2 = self.mtp_b2_bufs.as_ref().expect("MTP B2 gotowy");
+        let mut metadata = Vec::with_capacity(2 + page_tables.len());
+        metadata.extend_from_slice(&bases);
+        metadata.extend_from_slice(&page_tables);
+        write_pinned(bytemuck::cast_slice(&metadata), &b2.pinned_mtp_metadata)?;
+        self.device.copy(
+            &b2.pinned_mtp_metadata,
+            0,
+            &b2.base_positions,
+            0,
+            8,
+            &self.stream,
+        )?;
+        self.device.copy(
+            &b2.pinned_mtp_metadata,
+            8,
+            &b2.page_tables,
+            0,
+            page_tables.len() * 4,
+            &self.stream,
+        )?;
+        for (lane, state) in states.iter().enumerate() {
+            self.device.copy(
+                &b2.page_tables,
+                lane * self.max_pages_per_seq * 4,
+                &state.page_table,
+                0,
+                self.max_pages_per_seq * 4,
+                &self.stream,
+            )?;
+        }
+
+        let pb = self.prefill_bufs.as_ref().expect("prefill gotowy");
+        self.kernels.mtp_pack_verify_inputs(
+            &pb.ids,
+            &pb.positions,
+            &b2.visible_lens,
+            &states[0].token_ids,
+            &states[1].token_ids,
+            &b2.base_positions,
+            t,
+            &self.stream,
+        )?;
+        self.kernels.mtp_norm_join_shifted_segmented_f16(
+            &b2.q_full,
+            &b2.catchup_embeddings,
+            &pb.x,
+            &b2.mtp_initial_hidden,
+            &layer.enorm,
+            &layer.hnorm,
+            2,
+            t,
+            hidden,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+        self.kernels.mtp_project_joined_q8_f16(
+            &pb.h,
+            &b2.q_full,
+            eh_proj,
+            total,
+            hidden,
+            &self.stream,
+        )?;
+        self.kernels.rmsnorm_f16(
+            &pb.x,
+            &pb.h,
+            &layer.block.attn_norm,
+            total,
+            hidden,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+        let attention = layer.block.attn();
+        let QkvWeights::Split { q: _, k, v } = &attention.attn_qkv else {
+            return Err(ForgeError::Unsupported(
+                "MTP wymaga rozdzielonych Q/K/V".into(),
+            ));
+        };
+        self.gemm(&pb.k, k, &pb.x, total, &self.stream)?;
+        self.gemm(&pb.v, v, &pb.x, total, &self.stream)?;
+        if let Some(norm) = &attention.k_norm {
+            self.kernels.rmsnorm_f16(
+                &pb.k,
+                &pb.k,
+                norm,
+                total * p.n_kv_heads,
+                p.head_dim,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+        }
+        self.kernels.rope_neox_partial_f16(
+            &pb.k,
+            &pb.positions,
+            total,
+            p.n_kv_heads,
+            p.head_dim,
+            self.hybrid_n_rot(),
+            p.rope_theta,
+            &self.stream,
+        )?;
+        self.kernels.kv_append_batch_segmented_masked_f16(
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
+            &pb.k,
+            &pb.v,
+            &b2.page_tables,
+            &b2.base_positions,
+            &b2.decisions,
+            2,
+            t,
+            self.max_pages_per_seq,
+            p.n_kv_heads,
+            mtp_kv.cfg.page_size,
+            p.head_dim,
+            &self.stream,
+        )?;
+        self.kernels.mtp_commit_catchup_metadata_segmented(
+            &b2.mtp_seq_lens,
+            &b2.mtp_positions,
+            &b2.base_positions,
+            &b2.decisions,
+            2,
+            &self.stream,
+        )?;
+        for (lane, state) in states.iter().enumerate() {
+            self.device.copy(
+                &b2.mtp_seq_lens,
+                lane * 4,
+                &state.seq_len,
+                0,
+                4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.mtp_positions,
+                lane * 4,
+                &state.position,
+                0,
+                4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.selected_hidden,
+                lane * hidden * 2,
+                &state.recurrent_hidden,
+                0,
+                hidden * 2,
+                &self.stream,
+            )?;
+        }
+        Ok(())
     }
 
     fn mtp_gather_embedding(&self, state: &mut MtpDraftState, token_index: usize) -> Result<()> {
@@ -7169,6 +7389,17 @@ impl Model {
                 4,
                 MemKind::PinnedHost,
             )?,
+            pinned_mtp_metadata: alloc_checked(
+                device.as_ref(),
+                "mtp b2 pinned catch-up metadata",
+                &[BATCH + BATCH * self.max_pages_per_seq],
+                4,
+                MemKind::PinnedHost,
+            )?,
+            catchup_embeddings: a16("mtp b2 catch-up embeddings", &[total, p.hidden_size])?,
+            mtp_initial_hidden: a16("mtp b2 catch-up initial hidden", &[BATCH, p.hidden_size])?,
+            mtp_seq_lens: a32("mtp b2 catch-up sequence lengths", &[BATCH])?,
+            mtp_positions: a32("mtp b2 catch-up positions", &[BATCH])?,
             selected_states: a32("mtp b2 selected states", &[BATCH, state_elems])?,
             selected_conv: a16("mtp b2 selected conv", &[BATCH, conv_elems])?,
             selected_hidden: a16("mtp b2 selected hidden", &[BATCH, p.hidden_size])?,
@@ -7792,7 +8023,9 @@ impl Model {
         seqs: &mut [&mut SeqKv; 2],
         budget: usize,
         mtp_states: &mut [MtpDraftState; 2],
-    ) -> Result<[(Vec<u32>, usize, u32); 2]> {
+        mtp_kv: &mut KvCache,
+        state_mode: MtpB2StateMode,
+    ) -> Result<MtpB2Verification> {
         if !matches!(budget, 2 | 3) {
             return Err(ForgeError::Unsupported(
                 "verifier MTP B2 wymaga wspólnego K=2 lub K=3".into(),
@@ -7999,6 +8232,16 @@ impl Model {
                         "target MTP B2 wymaga embeddingu F16, Q8_0 lub GGUF NVFP4".into(),
                     ));
                 }
+            }
+            if state_mode == MtpB2StateMode::Catchup {
+                self.device.copy(
+                    &pb.h,
+                    0,
+                    &b2.catchup_embeddings,
+                    0,
+                    total * p.hidden_size * 2,
+                    &self.stream,
+                )?;
             }
 
             for (layer_index, cache) in b2.delta.iter().enumerate() {
@@ -8342,15 +8585,19 @@ impl Model {
                     )?;
                 }
             }
-            for (lane, state) in mtp_states.iter_mut().enumerate() {
-                self.device.copy(
-                    &b2.selected_hidden,
-                    lane * hidden_bytes,
-                    &state.recurrent_hidden,
-                    0,
-                    hidden_bytes,
-                    &self.stream,
-                )?;
+            if state_mode == MtpB2StateMode::Proposed {
+                for (lane, state) in mtp_states.iter_mut().enumerate() {
+                    self.device.copy(
+                        &b2.selected_hidden,
+                        lane * hidden_bytes,
+                        &state.recurrent_hidden,
+                        0,
+                        hidden_bytes,
+                        &self.stream,
+                    )?;
+                }
+            } else {
+                self.mtp_catchup_verified_prefix_b2(mtp_states, mtp_kv, t)?;
             }
             self.device
                 .copy(&b2.decisions, 0, &b2.pinned_decisions, 0, 16, &self.stream)?;
@@ -8395,17 +8642,21 @@ impl Model {
                 result.1 = retained as usize - 1;
                 result.2 = correction as u32;
             }
-            Ok(results)
+            let metadata_targets = validate_mtp_pair_metadata_commit(
+                mtp_states,
+                [results[0].1 + 1, results[1].1 + 1],
+            )?;
+            Ok((results, metadata_targets))
         })();
 
         match result {
-            Ok(results) => {
+            Ok((results, metadata_targets)) => {
                 for lane in 0..2 {
                     self.kv
                         .rollback(seqs[lane], bases[lane] + results[lane].1 + 1);
                 }
                 self.pt_seq = 0;
-                Ok(results)
+                Ok((results, metadata_targets))
             }
             Err(error) => {
                 for lane in 0..2 {
@@ -8728,23 +8979,16 @@ impl Model {
         self.mtp_propose_pending_b2(seqs, fed, budget)?;
         let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
         let result =
-            match self.verify_hybrid_greedy_draft_b2(seqs, budget, &mut states) {
-                Ok(results) => {
-                    match commit_mtp_pair_metadata(
-                        &mut states,
-                        &mut mtp_kv,
-                        [results[0].1 + 1, results[1].1 + 1],
-                    ) {
-                        Ok(()) => Ok(results),
-                        Err(commit) => {
-                            match rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
-                                Ok(()) => Err(commit),
-                                Err(rollback) => Err(self.poison_mtp_runtime(format!(
-                                    "commit MTP B2 nie powiódł się: {commit}; {rollback}"
-                                ))),
-                            }
-                        }
-                    }
+            match self.verify_hybrid_greedy_draft_b2(
+                seqs,
+                budget,
+                &mut states,
+                &mut mtp_kv,
+                MtpB2StateMode::Proposed,
+            ) {
+                Ok((results, metadata_targets)) => {
+                    apply_mtp_pair_metadata_commit(&mut states, &mut mtp_kv, metadata_targets);
+                    Ok(results)
                 }
                 Err(error) => match rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
                     Ok(()) => Err(error),
@@ -8752,6 +8996,92 @@ impl Model {
                         .poison_mtp_runtime(format!("błąd verifiera MTP B2: {error}; {rollback}"))),
                 },
             };
+        self.pt_seq = 0;
+        self.finish_mtp_runtime_pair(leases, states, mtp_kv, result)
+    }
+
+    /// Weryfikuje dwa pełne drafty zewnętrznego proposera i dogania MTP na GPU.
+    pub fn verify_greedy_draft_with_mtp_catchup_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        fed: [u32; 2],
+        drafts: [&[u32]; 2],
+    ) -> Result<[(usize, u32); 2]> {
+        let budget = drafts[0].len();
+        if drafts[1].len() != budget || !matches!(budget, 2 | 3) {
+            return Err(ForgeError::Unsupported(
+                "MTP+n-gram B2 wymaga dwóch draftów z tym samym K=2 lub K=3".into(),
+            ));
+        }
+        if !self.mtp_ngram_b2_capable([&*seqs[0], &*seqs[1]], budget) {
+            return Err(ForgeError::Unsupported(
+                "para nie spełnia kontraktu MTP+n-gram B2".into(),
+            ));
+        }
+        self.ensure_hybrid_bufs()?;
+        let vocab = self.weights.descriptor.params.vocab_size;
+        if fed
+            .iter()
+            .copied()
+            .chain(drafts.iter().flat_map(|draft| draft.iter().copied()))
+            .any(|token| token as usize >= vocab)
+        {
+            return Err(ForgeError::Scheduler(
+                "draft MTP+n-gram B2 zawiera token poza słownikiem".into(),
+            ));
+        }
+        let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
+        let mut checkpoint_attempted = false;
+        let mut result = (|| {
+            checkpoint_attempted = true;
+            for (lane, state) in states.iter_mut().enumerate() {
+                state.checkpoint(&self.stream)?;
+                let mut ids = [0i32; 5];
+                ids[0] = i32::try_from(fed[lane]).map_err(|_| {
+                    ForgeError::Scheduler("fed MTP+n-gram B2 przekracza i32".into())
+                })?;
+                for (index, &token) in drafts[lane].iter().enumerate() {
+                    ids[index + 1] = i32::try_from(token).map_err(|_| {
+                        ForgeError::Scheduler("draft MTP+n-gram B2 przekracza i32".into())
+                    })?;
+                }
+                write_pinned(bytemuck::cast_slice(&ids), &state.pinned_token_ids)?;
+                self.device.copy(
+                    &state.pinned_token_ids,
+                    0,
+                    &state.token_ids,
+                    0,
+                    ids.len() * 4,
+                    &self.stream,
+                )?;
+            }
+            let (verified, metadata_targets) = self.verify_hybrid_greedy_draft_b2(
+                seqs,
+                budget,
+                &mut states,
+                &mut mtp_kv,
+                MtpB2StateMode::Catchup,
+            )?;
+            apply_mtp_pair_metadata_commit(&mut states, &mut mtp_kv, metadata_targets);
+            Ok([
+                (verified[0].1, verified[0].2),
+                (verified[1].1, verified[1].2),
+            ])
+        })();
+        if result.is_err() {
+            let checkpoints_complete = states.iter().all(|state| state.checkpoint_len().is_some());
+            if let Err(rollback) = rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
+                let execution = result.expect_err("wynik MTP+n-gram B2 zawiera błąd");
+                result = Err(
+                    self.poison_mtp_runtime(format!("błąd MTP+n-gram B2: {execution}; {rollback}"))
+                );
+            } else if checkpoint_attempted && !checkpoints_complete {
+                let execution = result.expect_err("wynik MTP+n-gram B2 zawiera błąd");
+                result = Err(self.poison_mtp_runtime(format!(
+                    "błąd MTP+n-gram B2 przed utworzeniem obu checkpointów: {execution}"
+                )));
+            }
+        }
         self.pt_seq = 0;
         self.finish_mtp_runtime_pair(leases, states, mtp_kv, result)
     }
@@ -11636,10 +11966,11 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        commit_mtp_pair_metadata, finish_greedy_verification, hybrid_prefill_profile_spans,
+        apply_mtp_pair_metadata_commit, finish_greedy_verification, hybrid_prefill_profile_spans,
         hybrid_q_full_cols, logical_kv_regions, native_mtp_b2_device_embedding,
-        native_mtp_greedy_decision, restore_after, rollback_mtp_pair, ForgeError,
-        HybridStatePool, KvCache, KvConfig, KvQuant, LayerKind, Result, SeqKv,
+        native_mtp_greedy_decision, restore_after, rollback_mtp_pair,
+        validate_mtp_pair_metadata_commit, ForgeError, HybridStatePool, KvCache, KvConfig,
+        KvQuant, LayerKind, Result, SeqKv,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
@@ -11825,7 +12156,7 @@ mod verify_rollback_tests {
     }
 
     #[test]
-    fn commit_pary_mtp_waliduje_obie_lane_przed_mutacja() {
+    fn prewalidacja_commitu_pary_mtp_nie_mutuje_zadnej_lane() {
         let device: Arc<dyn Device> = CpuDevice::new();
         let stream = device.create_stream().expect("stream CPU powinien powstać");
         let mut pool = testowa_pula_mtp(device);
@@ -11841,15 +12172,16 @@ mod verify_rollback_tests {
         let lengths = [states[0].seq.len, states[1].seq.len];
         let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
 
-        assert!(commit_mtp_pair_metadata(&mut states, &mut kv, [0, 1]).is_err());
+        assert!(validate_mtp_pair_metadata_commit(&states, [0, 1]).is_err());
         assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
         assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
-        assert!(commit_mtp_pair_metadata(&mut states, &mut kv, [1, 0]).is_err());
+        assert!(validate_mtp_pair_metadata_commit(&states, [1, 0]).is_err());
         assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
         assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
 
-        commit_mtp_pair_metadata(&mut states, &mut kv, [1, 1])
+        let targets = validate_mtp_pair_metadata_commit(&states, [1, 1])
             .expect("poprawny commit obu lane'ów powinien się udać");
+        apply_mtp_pair_metadata_commit(&mut states, &mut kv, targets);
         pool.restore_mtp_pair(leases, states, kv)
             .expect("para po commicie powinna wrócić do puli");
     }

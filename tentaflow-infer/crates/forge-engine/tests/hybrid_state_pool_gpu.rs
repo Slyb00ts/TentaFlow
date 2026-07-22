@@ -195,6 +195,79 @@ fn run_native_mtp_b2_full_id_parity(path: &Path) -> TestResult<()> {
     Ok(())
 }
 
+fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
+    let Some(mut model) = load_model(path, true) else {
+        return Ok(());
+    };
+    model.preflight_hybrid_state_slots(2)?;
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let prompts = [prompt(vocab, 941, 8), prompt(vocab, 1171, 8)];
+    for budget in [2usize, 3] {
+        let greedy = [
+            generate(&mut model, &prompts[0], budget + 2)?,
+            generate(&mut model, &prompts[1], budget + 2)?,
+        ];
+        for retained0 in 1..=budget + 1 {
+            for retained1 in 1..=budget + 1 {
+                let retained = [retained0, retained1];
+                let mut drafts: [Vec<u32>; 2] = std::array::from_fn(|lane| {
+                    greedy[lane][1..=budget].to_vec()
+                });
+                for lane in 0..2 {
+                    if retained[lane] <= budget {
+                        let index = retained[lane] - 1;
+                        let expected = greedy[lane][retained[lane]];
+                        let mut mismatch = expected.wrapping_add(1) % vocab as u32;
+                        if mismatch == expected {
+                            mismatch = expected.wrapping_add(2) % vocab as u32;
+                        }
+                        drafts[lane][index] = mismatch;
+                    }
+                }
+
+                let mut expected_results = [(0usize, 0u32); 2];
+                let mut expected_states: [Vec<(String, usize, Vec<u8>)>; 2] =
+                    std::array::from_fn(|_| Vec::new());
+                for lane in 0..2 {
+                    let (mut seq, _, fed) = prepare(&mut model, &prompts[lane])?;
+                    expected_results[lane] = model.verify_greedy_draft_with_mtp_catchup(
+                        &mut seq,
+                        fed,
+                        &drafts[lane],
+                    )?;
+                    expected_states[lane] = model.debug_mtp_state_snapshot(&seq)?;
+                    model.release_seq(&mut seq);
+                    assert_eq!(expected_results[lane].0 + 1, retained[lane]);
+                    assert_eq!(expected_results[lane].1, greedy[lane][retained[lane]]);
+                }
+
+                let (mut first, _, first_fed) = prepare(&mut model, &prompts[0])?;
+                let (mut second, _, second_fed) = prepare(&mut model, &prompts[1])?;
+                assert!(model.mtp_ngram_b2_capable([&first, &second], budget));
+                let actual = model.verify_greedy_draft_with_mtp_catchup_b2(
+                    &mut [&mut first, &mut second],
+                    [first_fed, second_fed],
+                    [&drafts[0], &drafts[1]],
+                )?;
+                assert_eq!(actual, expected_results, "K={budget}, retained={retained:?}");
+                assert_eq!(
+                    model.debug_mtp_state_snapshot(&first)?,
+                    expected_states[0],
+                    "snapshot lane0 K={budget}, retained={retained:?}"
+                );
+                assert_eq!(
+                    model.debug_mtp_state_snapshot(&second)?,
+                    expected_states[1],
+                    "snapshot lane1 K={budget}, retained={retained:?}"
+                );
+                model.release_seq(&mut first);
+                model.release_seq(&mut second);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_mtp_grouped_proposer_parity(path: &Path) -> TestResult<()> {
     let Some(mut model) = load_model(path, true) else {
         return Ok(());
@@ -1374,6 +1447,19 @@ fn native_mtp_b2_zachowuje_pelne_id_dla_k2_i_k3() -> TestResult<()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     run_native_mtp_b2_full_id_parity(&path)
+}
+
+#[test]
+fn mtp_ngram_b2_zachowuje_golden_dla_k2_k3_i_macierzy_retained() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E MTP+n-gram B2: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_mtp_ngram_b2_retained_matrix(&path)
 }
 
 #[test]

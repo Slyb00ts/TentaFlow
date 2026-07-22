@@ -35,7 +35,7 @@ Ostatnia aktualizacja: 2026-07-22.
   **97,78/76,38 tok/s** (+28,02%); stałe K=3 osiągnęło **136,97/94,34
   tok/s**. Wszystkie przebiegi zachowały pełne ID względem serial greedy.
   Szybsze pomiary llama.cpp B2 są nieważne porównawczo: tylko 5/24 wyjść
-  zgadzało się z oracle `np1`. Różne K, n-gram, tiering, niepełna para i
+  zgadzało się z oracle `np1`. Różne K, tiering, niepełna para i
   niespełniony kontrakt capability przechodzą na B1;
   `FORGE_NATIVE_MTP_B2=0|1` jest ścisłym kill-switchem. vLLM 0.25.1 nie
   dostarczył porównywalnego wyniku dla lokalnego jednoplikowego GGUF. Draft ID,
@@ -53,6 +53,15 @@ Ostatnia aktualizacja: 2026-07-22.
   Testy exact/canary/top1, multistream T6 -> T8 z realokacją scratchu oraz
   testy błędów eventu przeszły. Realny 27B E2E i nsys pozostają **PENDING**,
   ponieważ obcy proces zmniejszył wolną pamięć GPU poniżej 22,5 GiB.
+  Eksperymentalne N/N B2 paruje dwa pełne drafty n-gram o tym samym K=2 lub
+  K=3 za ścisłą flagą `FORGE_MTP_NGRAM_BATCH=1`; brak flagi i `0` pozostawiają
+  dotychczasową ścieżkę seryjną. Segmentowany KV-only catch-up używa kerneli
+  Mojo `mtp_norm_join_shifted_segmented_f16`,
+  `kv_append_batch_segmented_masked_f16` i
+  `mtp_commit_catchup_metadata_segmented`. Syntetyczna macierz retained 1..T,
+  canary, izolacja lane/stron, prewalidacja commitu pary i memcheck przeszły.
+  Realny N/N 27B E2E, cancel/reuse, A/B, pięciokrotne raw128/raw512 i nsys są
+  **PENDING** z tego samego powodu VRAM. Mieszane N/M nie jest zaimplementowane.
   CUDA jest jedynym backendem sprawdzonym wykonawczo;
   źródła zachowują przenośny fallback dla AMD/Metal. Raport:
   `docs/BENCH_QWEN35_MTP_NVFP4.md`.

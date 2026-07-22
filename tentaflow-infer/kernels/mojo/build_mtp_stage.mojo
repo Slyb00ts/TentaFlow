@@ -7,9 +7,9 @@
 import std.os as os
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
-from src.mtp import mtp_stage_step, mtp_norm_join_shifted_f16, mtp_project_joined_q8_f16, mtp_verify_decide_segmented, mtp_select_row_segmented_f16, mtp_pack_verify_inputs, gather_q8_0_rows_f16, gather_nvfp4_gguf_rows_f16, gather_nvfp4_gguf_rows_f16_nvidia
+from src.mtp import mtp_stage_step, mtp_norm_join_shifted_f16, mtp_norm_join_shifted_segmented_f16, mtp_commit_catchup_metadata_segmented, mtp_project_joined_q8_f16, mtp_verify_decide_segmented, mtp_select_row_segmented_f16, mtp_pack_verify_inputs, gather_q8_0_rows_f16, gather_nvfp4_gguf_rows_f16, gather_nvfp4_gguf_rows_f16_nvidia
 from src.misc import gather_rows_f16
-from src.prefill import kv_append_batch_segmented_f16
+from src.prefill import kv_append_batch_segmented_f16, kv_append_batch_segmented_masked_f16
 from src.attention import attn_verify_segmented_f16_hd256, attn_verify_segmented_f16_hd256_warp32
 from src.deltanet_verify import deltanet_prepare_segmented_f16, deltanet_gated_scan_segmented_d128_f16, deltanet_commit_checkpoint_segmented_f32, deltanet_gated_scan_segmented_shared_d128_f16, deltanet_commit_recompute_segmented_shared_d128_f32
 from src.nvfp4_gguf_batch import gemm_nvfp4_gguf_f16_b8_nvidia
@@ -162,6 +162,22 @@ def main() raises:
     target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
     os.remove(String(source))
     _ = ctx.compile_function[
+        mtp_norm_join_shifted_segmented_f16,
+        dump_asm=Path("mtp_norm_join_shifted_segmented_f16.ptx"),
+    ]()
+    source = Path("mtp_norm_join_shifted_segmented_f16.ptx")
+    target = out_dir / "mtp_norm_join_shifted_segmented_f16.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
+        mtp_commit_catchup_metadata_segmented,
+        dump_asm=Path("mtp_commit_catchup_metadata_segmented.ptx"),
+    ]()
+    source = Path("mtp_commit_catchup_metadata_segmented.ptx")
+    target = out_dir / "mtp_commit_catchup_metadata_segmented.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
         mtp_verify_decide_segmented,
         dump_asm=Path("mtp_verify_decide_segmented.ptx"),
     ]()
@@ -175,6 +191,14 @@ def main() raises:
     ]()
     source = Path("kv_append_batch_segmented_f16.ptx")
     target = out_dir / "kv_append_batch_segmented_f16.ptx"
+    target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
+    os.remove(String(source))
+    _ = ctx.compile_function[
+        kv_append_batch_segmented_masked_f16,
+        dump_asm=Path("kv_append_batch_segmented_masked_f16.ptx"),
+    ]()
+    source = Path("kv_append_batch_segmented_masked_f16.ptx")
+    target = out_dir / "kv_append_batch_segmented_masked_f16.ptx"
     target.write_text(source.read_text().replace(".target sm_89", ".target sm_80"))
     os.remove(String(source))
     _ = ctx.compile_function[

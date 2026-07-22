@@ -64,25 +64,38 @@ impl SpeculativeState {
     /// `verify_greedy`). Updates per-proposer stats and feeds the accepted
     /// tokens back into the history/index.
     pub fn commit(&mut self, drafted: &[u32], n_accepted: usize) -> Result<()> {
+        self.validate_commit(drafted, n_accepted)?;
+        self.commit_validated(drafted, n_accepted);
+        Ok(())
+    }
+
+    pub(crate) fn validate_commit(&self, drafted: &[u32], n_accepted: usize) -> Result<()> {
         if n_accepted > drafted.len() {
             return Err(ForgeError::Scheduler(
                 "accepted speculative prefix exceeds draft length".into(),
             ));
         }
-        let Some((pending_draft, segments)) = self.pending.take() else {
+        let Some((pending_draft, _)) = &self.pending else {
             return Err(ForgeError::Scheduler(
                 "no speculative draft is pending".into(),
             ));
         };
         if pending_draft != drafted {
-            self.pending = Some((pending_draft, segments));
             return Err(ForgeError::Scheduler(
                 "committed speculative draft does not match pending draft".into(),
             ));
         }
-        self.composer.commit_feedback(&segments, n_accepted);
-        self.observe_all(&drafted[..n_accepted.min(drafted.len())]);
         Ok(())
+    }
+
+    pub(crate) fn commit_validated(&mut self, drafted: &[u32], n_accepted: usize) {
+        let (pending_draft, segments) = self
+            .pending
+            .take()
+            .expect("validate_commit potwierdził pending draft");
+        debug_assert_eq!(pending_draft, drafted);
+        self.composer.commit_feedback(&segments, n_accepted);
+        self.observe_all(&drafted[..n_accepted]);
     }
 
     pub fn stats(&self) -> Vec<ProposerStatsSnapshot> {

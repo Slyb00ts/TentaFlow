@@ -294,6 +294,16 @@ fn parse_native_mtp_b2(value: Option<&str>) -> Result<bool> {
     }
 }
 
+fn parse_mtp_ngram_batch(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_MTP_NGRAM_BATCH wymaga wartości 0 lub 1, otrzymano {value:?}"
+        ))),
+    }
+}
+
 fn update_mtp_rate(rate: &mut Option<f64>, sample: f64) {
     *rate = Some(rate.map_or(sample, |previous| previous * 0.75 + sample * 0.25));
 }
@@ -422,6 +432,8 @@ pub fn spawn_engine_batched(
     spec: SpeculativeConfig,
 ) -> Result<EngineHandle> {
     let native_mtp_b2 = parse_native_mtp_b2(std::env::var("FORGE_NATIVE_MTP_B2").ok().as_deref())?;
+    let mtp_ngram_batch =
+        parse_mtp_ngram_batch(std::env::var("FORGE_MTP_NGRAM_BATCH").ok().as_deref())?;
     let coordinator = SpeculationCoordinator::new(spec.clone())?;
     validate_speculation_server_config(spec.kind(), max_active, model.is_hybrid())?;
     if spec.is_enabled() {
@@ -478,6 +490,7 @@ pub fn spawn_engine_batched(
                 spec,
                 coordinator,
                 native_mtp_b2,
+                mtp_ngram_batch,
                 &worker_metrics,
             )
         })
@@ -500,6 +513,7 @@ fn worker<'t>(
     spec: SpeculativeConfig,
     coordinator: SpeculationCoordinator,
     native_mtp_b2: bool,
+    mtp_ngram_batch: bool,
     metrics: &EngineMetrics,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
@@ -737,7 +751,14 @@ fn worker<'t>(
                 a.dead = true;
             }
         }
-        batch_gpu_decode(model, &mut active, batch_min, native_mtp_b2, metrics);
+        batch_gpu_decode(
+            model,
+            &mut active,
+            batch_min,
+            native_mtp_b2,
+            mtp_ngram_batch,
+            metrics,
+        );
 
         // Tear down finished/dead sequences and release their pages (and any
         // tier chunks they spilled).
@@ -909,12 +930,14 @@ fn batch_gpu_decode(
     active: &mut [ActiveSeq<'_>],
     batch_min: usize,
     native_mtp_b2: bool,
+    mtp_ngram_batch: bool,
     metrics: &EngineMetrics,
 ) {
     // Phase 1: emit each ready sequence's pending token; collect the indices of
     // survivors that still need to be fed one more token.
     let mut feed_idx: Vec<usize> = Vec::new();
     let mut mtp_idx: Vec<usize> = Vec::new();
+    let mut mtp_ngram_idx: Vec<usize> = Vec::new();
     for (i, a) in active.iter_mut().enumerate() {
         if a.dead || !a.pending_prompt.is_empty() {
             continue;
@@ -942,7 +965,11 @@ fn batch_gpu_decode(
                     SpeculationKind::HostProposer => speculative_step(model, a, metrics),
                     SpeculationKind::NativeMtp => mtp_idx.push(i),
                     SpeculationKind::NativeMtpNgram => {
-                        native_mtp_ngram_step(model, a, metrics)
+                        if mtp_ngram_batch {
+                            mtp_ngram_idx.push(i);
+                        } else {
+                            native_mtp_ngram_step(model, a, metrics)
+                        }
                     }
                     SpeculationKind::Off => feed_idx.push(i),
                 }
@@ -953,6 +980,9 @@ fn batch_gpu_decode(
                 a.dead = true;
             }
         }
+    }
+    if !mtp_ngram_idx.is_empty() {
+        batch_native_mtp_ngram_decode(model, active, &mtp_ngram_idx, metrics);
     }
     if native_mtp_b2 && !mtp_idx.is_empty() {
         batch_native_mtp_decode(model, active, &mtp_idx, metrics);
@@ -1040,6 +1070,83 @@ fn batch_native_mtp_decode(
         }
         if let Some(&tail) = pairs.remainder().first() {
             native_mtp_step(model, &mut active[tail], metrics);
+        }
+    }
+}
+
+fn batch_native_mtp_ngram_decode(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    indices: &[usize],
+    metrics: &EngineMetrics,
+) {
+    let mut by_budget: [Vec<(usize, Vec<u32>)>; 2] = [Vec::new(), Vec::new()];
+    for &index in indices {
+        let a = &mut active[index];
+        let fed = *a.generated.last().expect("emit_token dodał fed routera");
+        let budget = a.spec_budget;
+        let draft = {
+            let state = a.spec.as_mut().expect("router MTP+n-gram ma stan hostowy");
+            state.observe(fed);
+            match state.draft(budget) {
+                Ok(draft) => draft,
+                Err(error) => {
+                    let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                    a.dead = true;
+                    continue;
+                }
+            }
+        };
+        if draft.len() == budget && matches!(budget, 2 | 3) {
+            by_budget[budget - 2].push((index, draft));
+            continue;
+        }
+        if let Some(state) = &mut a.spec {
+            state.cancel_draft();
+        }
+        let generated_before = a.generated.len();
+        a.mtp_fallback_forwards += 1;
+        native_mtp_step(model, a, metrics);
+        let accepted = a.generated[generated_before..].to_vec();
+        if let Some(state) = &mut a.spec {
+            state.observe_all(&accepted);
+        }
+    }
+
+    for entries in &by_budget {
+        let mut pairs = entries.chunks_exact(2);
+        for pair in &mut pairs {
+            let (first_index, first_draft) = (&pair[0].0, &pair[0].1);
+            let (second_index, second_draft) = (&pair[1].0, &pair[1].1);
+            let capable = model.mtp_ngram_b2_capable(
+                [&active[*first_index].seq, &active[*second_index].seq],
+                first_draft.len(),
+            );
+            if !capable {
+                verify_native_mtp_ngram_prepared(
+                    model,
+                    &mut active[*first_index],
+                    first_draft,
+                    metrics,
+                );
+                verify_native_mtp_ngram_prepared(
+                    model,
+                    &mut active[*second_index],
+                    second_draft,
+                    metrics,
+                );
+                continue;
+            }
+            native_mtp_ngram_step_b2_prepared(
+                model,
+                active,
+                [*first_index, *second_index],
+                [first_draft, second_draft],
+                metrics,
+            );
+        }
+        if let Some((index, draft)) = pairs.remainder().first() {
+            verify_native_mtp_ngram_prepared(model, &mut active[*index], draft, metrics);
         }
     }
 }
@@ -1210,6 +1317,178 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
 
 /// Priorytetowy router: pełny draft n-gram omija proposer MTP, a brak pełnego
 /// draftu uruchamia zwykły krok natywnego MTP.
+fn finish_native_mtp_ngram_verified(
+    a: &mut ActiveSeq<'_>,
+    draft: &[u32],
+    accepted: usize,
+    correction: u32,
+    metrics: &EngineMetrics,
+) {
+    a.spec_forwards += 1;
+    a.ngram_forwards += 1;
+    a.spec_accepted += accepted as u64;
+    for &token in &draft[..accepted] {
+        match emit_token(a, token, None, metrics) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
+    }
+    a.next = Some(PendingNext::Token(correction));
+}
+
+fn verify_native_mtp_ngram_prepared(
+    model: &mut Model,
+    a: &mut ActiveSeq<'_>,
+    draft: &[u32],
+    metrics: &EngineMetrics,
+) {
+    let fed = *a.generated.last().expect("emit_token dodał fed routera");
+    let SeqSampler::Gpu(sampler) = &mut a.sampler else {
+        unreachable!("router MTP+n-gram wymaga samplera GPU")
+    };
+    sampler.note_token(fed);
+    if let Err(error) = a
+        .spec
+        .as_ref()
+        .expect("router MTP+n-gram ma stan hostowy")
+        .validate_commit(draft, 0)
+    {
+        if let Some(state) = &mut a.spec {
+            state.cancel_draft();
+        }
+        let _ = a.events.send(EngineEvent::Error(error.to_string()));
+        a.dead = true;
+        return;
+    }
+    let (accepted, correction) =
+        match model.verify_greedy_draft_with_mtp_catchup(&mut a.seq, fed, draft) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(state) = &mut a.spec {
+                    state.cancel_draft();
+                }
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        };
+    a.spec
+        .as_mut()
+        .expect("router MTP+n-gram ma stan hostowy")
+        .commit_validated(draft, accepted);
+    finish_native_mtp_ngram_verified(a, draft, accepted, correction, metrics);
+}
+
+fn native_mtp_ngram_step_b2_prepared(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    indices: [usize; 2],
+    drafts: [&[u32]; 2],
+    metrics: &EngineMetrics,
+) {
+    let [first_index, second_index] = indices;
+    if first_index >= second_index || second_index >= active.len() {
+        let error = ForgeError::Scheduler(
+            "MTP+n-gram B2 wymaga dwóch rosnących, różnych indeksów sekwencji".into(),
+        );
+        let active_len = active.len();
+        for index in indices.into_iter().filter(|&index| index < active_len) {
+            let a = &mut active[index];
+            if let Some(state) = &mut a.spec {
+                state.cancel_draft();
+            }
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+        }
+        return;
+    }
+    let (left, right) = active.split_at_mut(second_index);
+    let first = &mut left[first_index];
+    let second = &mut right[0];
+    let fed = [
+        *first.generated.last().expect("emit_token dodał fed lane0"),
+        *second.generated.last().expect("emit_token dodał fed lane1"),
+    ];
+    let validation = first
+        .spec
+        .as_ref()
+        .expect("lane0 routera ma stan")
+        .validate_commit(drafts[0], 0)
+        .and_then(|_| {
+            second
+                .spec
+                .as_ref()
+                .expect("lane1 routera ma stan")
+                .validate_commit(drafts[1], 0)
+        });
+    if let Err(error) = validation {
+        for a in [first, second] {
+            if let Some(state) = &mut a.spec {
+                state.cancel_draft();
+            }
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+        }
+        return;
+    }
+    let SeqSampler::Gpu(first_sampler) = &mut first.sampler else {
+        unreachable!("MTP+n-gram B2 wymaga samplera GPU")
+    };
+    first_sampler.note_token(fed[0]);
+    let SeqSampler::Gpu(second_sampler) = &mut second.sampler else {
+        unreachable!("MTP+n-gram B2 wymaga samplera GPU")
+    };
+    second_sampler.note_token(fed[1]);
+    let result = model.verify_greedy_draft_with_mtp_catchup_b2(
+        &mut [&mut first.seq, &mut second.seq],
+        fed,
+        drafts,
+    );
+    let [first_result, second_result] = match result {
+        Ok(results) => results,
+        Err(error) => {
+            let message = error.to_string();
+            for a in [first, second] {
+                if let Some(state) = &mut a.spec {
+                    state.cancel_draft();
+                }
+                let _ = a.events.send(EngineEvent::Error(message.clone()));
+                a.dead = true;
+            }
+            return;
+        }
+    };
+    first
+        .spec
+        .as_mut()
+        .expect("lane0 routera ma stan")
+        .commit_validated(drafts[0], first_result.0);
+    second
+        .spec
+        .as_mut()
+        .expect("lane1 routera ma stan")
+        .commit_validated(drafts[1], second_result.0);
+    finish_native_mtp_ngram_verified(
+        first,
+        drafts[0],
+        first_result.0,
+        first_result.1,
+        metrics,
+    );
+    finish_native_mtp_ngram_verified(
+        second,
+        drafts[1],
+        second_result.0,
+        second_result.1,
+        metrics,
+    );
+}
+
 fn native_mtp_ngram_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMetrics) {
     let fed = *a.generated.last().expect("emit_token pushed the fed token");
     let budget = a.spec_budget;
@@ -1242,44 +1521,7 @@ fn native_mtp_ngram_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &Eng
         return;
     }
 
-    let SeqSampler::Gpu(sampler) = &mut a.sampler else {
-        unreachable!("router MTP+n-gram wymaga samplera GPU")
-    };
-    sampler.note_token(fed);
-    let (accepted, correction) =
-        match model.verify_greedy_draft_with_mtp_catchup(&mut a.seq, fed, &draft) {
-            Ok(result) => result,
-            Err(error) => {
-                if let Some(state) = &mut a.spec {
-                    state.cancel_draft();
-                }
-                let _ = a.events.send(EngineEvent::Error(error.to_string()));
-                a.dead = true;
-                return;
-            }
-        };
-    if let Some(state) = &mut a.spec {
-        if let Err(error) = state.commit(&draft, accepted) {
-            let _ = a.events.send(EngineEvent::Error(error.to_string()));
-            a.dead = true;
-            return;
-        }
-    }
-    a.spec_forwards += 1;
-    a.ngram_forwards += 1;
-    a.spec_accepted += accepted as u64;
-    for &token in &draft[..accepted] {
-        match emit_token(a, token, None, metrics) {
-            Ok(StepOutcome::Continue) => {}
-            Ok(StepOutcome::Finished) => return,
-            Err(error) => {
-                let _ = a.events.send(EngineEvent::Error(error.to_string()));
-                a.dead = true;
-                return;
-            }
-        }
-    }
-    a.next = Some(PendingNext::Token(correction));
+    verify_native_mtp_ngram_prepared(model, a, &draft, metrics);
 }
 
 /// Jeden krok natywnego MTP. Model jest właścicielem draftu, weryfikatora i
@@ -1524,6 +1766,7 @@ mod tests {
         AdmissionDisposition, first_actionable_index, native_mtp_adaptive_budget,
         native_mtp_step_budget, parse_native_mtp_b2, request_speculation_kind,
         reservation_fits, update_mtp_rate, validate_speculation_server_config,
+        parse_mtp_ngram_batch,
     };
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
 
@@ -1534,6 +1777,15 @@ mod tests {
         assert!(!parse_native_mtp_b2(Some("0")).unwrap());
         assert!(parse_native_mtp_b2(Some("true")).is_err());
         assert!(parse_native_mtp_b2(Some("")).is_err());
+    }
+
+    #[test]
+    fn batch_mtp_ngram_jest_domyslnie_wylaczony_i_scisly() {
+        assert!(!parse_mtp_ngram_batch(None).unwrap());
+        assert!(!parse_mtp_ngram_batch(Some("0")).unwrap());
+        assert!(parse_mtp_ngram_batch(Some("1")).unwrap());
+        assert!(parse_mtp_ngram_batch(Some("true")).is_err());
+        assert!(parse_mtp_ngram_batch(Some("")).is_err());
     }
 
     #[test]
