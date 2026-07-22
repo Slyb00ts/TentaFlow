@@ -175,12 +175,26 @@ jawny błąd Unsupported — tracked follow-up).
 | `--batch-min <N>` | `12` | Próg włączenia batched forward: poniżej N jednocześnie dekodujących sekwencji działa strojona ścieżka pojedynczej sekwencji (szybsza przy małej współbieżności — crossover z GEMM-ów tensor-core zmierzony ~12). |
 | `--prefill-chunk <N>` | `16` | Ile tokenów promptu jedna sekwencja może prefillować w jednej iteracji schedulera (chroni ITL pozostałych sekwencji). Wewnętrzny sufit chunka: 1024. |
 
-Admission control: żądanie, którego prompt+max_tokens nie mieści się w stronach
-KV, dostaje natychmiast 429 (przejściowy brak) albo 400 `context_length_exceeded`
-(trwałe przekroczenie `--ctx`), nigdy OOM w połowie generacji. Trafienie w
-prefix-cache (niżej) zmniejsza projekcję stron przy przyjęciu, a strony
-odzyskiwalne z cache liczą się jako dostępne — pełny-ale-odzyskiwalny cache nigdy
-nie blokuje przyjęcia żądania, które by się zmieściło.
+Admission control wylicza dla każdego żądania logiczny budżet stron na cały
+zadeklarowany prompt i generację. Suma niewykorzystanych części budżetów
+aktywnych sekwencji jest rezerwacją przyszłego wzrostu KV, więc nowy request nie
+może odebrać stron potrzebnych już przyjętym sekwencjom. W trybie tieringu
+rezerwacja obejmuje tylko limit stron rezydentnych. Wewnętrzny
+`max_pages_per_seq` ogranicza pojedynczą sekwencję niezależnie od liczby stron w
+całej puli, a batchowy krok sprawdza wszystkie potrzebne przyrosty przed
+jakąkolwiek mutacją KV.
+
+Scheduler szuka możliwego do przyjęcia requestu w ograniczonym oknie kolejki:
+`2 * max_active`, ograniczonym do 2-16 pozycji. Może ominąć duży request
+czekający na KV, aby uruchomić mniejszy, ale licznik ominięć zatrzymuje dalsze
+wyprzedzanie najstarszego wpisu i zapobiega jego zagłodzeniu. Trwałe
+przekroczenie kontekstu lub `max_pages_per_seq` jest odrzucane; przejściowy brak
+KV pozostawia request w kolejce.
+
+Znane ograniczenie: strony pożyczonego, przypiętego prefiksu nie są odejmowane
+od logicznego budżetu requestu. To konserwatywne rozliczenie może opóźnić
+admission mimo fizycznego współdzielenia stron, ale nie narusza zobowiązań KV
+już aktywnych sekwencji.
 
 ---
 

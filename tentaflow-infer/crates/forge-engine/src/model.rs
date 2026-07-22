@@ -1984,7 +1984,7 @@ impl Model {
         if self.tier.is_some() {
             self.max_pages_per_seq
         } else {
-            self.kv.cfg.n_pages
+            self.kv.cfg.n_pages.min(self.max_pages_per_seq)
         }
     }
 
@@ -10010,6 +10010,24 @@ impl Model {
                 "MoE models support single-stream decode only; disable batching".into(),
             ));
         }
+        let p = self.weights.descriptor.params.clone();
+        for (seq, &token) in seqs.iter().zip(tokens) {
+            if seq.len >= p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {} exceeds model context {}",
+                    seq.len, p.max_position_embeddings
+                )));
+            }
+            if token as usize >= p.vocab_size {
+                return Err(ForgeError::Scheduler(format!(
+                    "token id {token} exceeds model vocabulary {}",
+                    p.vocab_size
+                )));
+            }
+        }
+        let growth_pages = self
+            .kv
+            .batch_growth_pages(seqs.iter().map(|seq| &**seq))?;
         // Batched growth appends pages without refreshing the single-stream
         // page table; invalidate it so the next single-stream step re-uploads.
         self.pt_seq = 0;
@@ -10027,12 +10045,8 @@ impl Model {
                 }
             }
             self.tier_balance(seqs, b)?;
-            for (seq, &tok) in seqs.iter_mut().zip(tokens) {
-                seq.tokens.push(tok);
-            }
         }
         self.ensure_batch(b)?;
-        let p = self.weights.descriptor.params.clone();
         // Streamed lanes (spilled KV) pack at the tail of the lane order: the
         // batch-wide paged attention launch covers exactly the leading
         // resident lanes, and each streamed lane attends over the staging
@@ -10053,7 +10067,18 @@ impl Model {
 
         // Reclaim cached prefix pages if the free stack cannot cover a boundary
         // page for every lane (no-op when the prefix cache is inactive/empty).
-        self.ensure_free_pages(b);
+        self.ensure_free_pages(growth_pages);
+        if growth_pages > self.kv.free_page_count() {
+            return Err(ForgeError::Scheduler(format!(
+                "batch KV growth needs {growth_pages} pages, cache has {} free",
+                self.kv.free_page_count()
+            )));
+        }
+        if self.tier.is_some() {
+            for (seq, &tok) in seqs.iter_mut().zip(tokens) {
+                seq.tokens.push(tok);
+            }
+        }
 
         // Grow each sequence by one token and gather its position/page table
         // in lane order. Streamed lanes' page tables keep -1 for spilled
@@ -10064,12 +10089,6 @@ impl Model {
         for (lane, &i) in order.iter().enumerate() {
             let seq = &mut *seqs[i];
             let pos = seq.len;
-            if pos >= p.max_position_embeddings {
-                return Err(ForgeError::Scheduler(format!(
-                    "position {pos} exceeds model context {}",
-                    p.max_position_embeddings
-                )));
-            }
             self.kv.grow(seq)?;
             meta[lane] = tokens[i] as i32;
             meta[bucket + lane] = pos as i32;

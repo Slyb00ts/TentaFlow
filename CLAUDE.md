@@ -441,11 +441,15 @@ coherent Polish on the RTX 4090.
   MTP. Preflight dwóch slotów oraz audyt GPU pure MTP i MTP+n-gram A/B przechodzą.
   Produkcyjny E2E admission/cancel/reuse przechodzi dla dwóch sekwencji. Verifier
   utrzymuje osobne grafy T=3/4 według stabilnego identyfikatora slotu; reuse lease
-  zachowuje adresy buforów GPU. Niespekulacyjny target ma pion B2: mixery
-  zachowują osobne sloty, a FFN i głowa logits używają batch GEMM. Native MTP
-  nadal wykonuje lane seryjnie i wymaga verifiera `[B,T]` do wzrostu aggregate
-  throughput. B2 wymaga rezydentnego KV i obsługiwanych formatów wag; tiering
-  przechodzi na seryjny fallback przed mutacją KV. Ścieżkę sprawdzono wykonawczo
+  zachowuje adresy buforów GPU. Niespekulacyjny target paruje lane'y po B2:
+  mixery zachowują osobne sloty, a FFN i głowa logits używają batch GEMM. B3 ma
+  seryjny ogon, B4 wykonuje dwie pary; test obejmuje parity ID, różne parametry
+  samplingu per lane oraz cancel i ponowne użycie slotu. Na RTX 4090 mediany
+  aggregate throughput wzrosły z 37,92 do 40,41 tok/s dla B3 (+6,58%) i z 37,90
+  do 41,32 tok/s dla B4 (+9,01%). Native MTP nadal wykonuje lane seryjnie i
+  wymaga verifiera `[B,T]` do wzrostu aggregate throughput. Parowanie B2 wymaga
+  rezydentnego KV i obsługiwanych formatów wag; tiering przechodzi na seryjny
+  fallback przed mutacją KV. Ścieżkę sprawdzono wykonawczo
   wyłącznie na CUDA/RTX 4090
   z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Źródła Mojo zachowują podział
   umożliwiający przyszły codegen AMDGPU/Metal, ale backendy AMD i Metal nie są
@@ -464,6 +468,12 @@ coherent Polish on the RTX 4090.
   111,079 i 87,652 tok/s. Wszystkie przebiegi FORGE zachowały identyczne ID
   tokenów względem sekwencyjnego greedy; luka pure MTP pozostaje otwarta. Szczegóły:
   `tentaflow-infer/docs/BENCH_QWEN35_MTP_NVFP4.md`.
+- Admission rezerwuje logiczny budżet przyszłych stron KV każdej aktywnej
+  sekwencji, egzekwuje `max_pages_per_seq` i wykonuje atomowy preflight wzrostu
+  całego batcha. Ograniczone okno kolejki (`2 * max_active`, zakres 2-16) omija
+  requesty chwilowo blokowane przez KV, a aging ogranicza zagłodzenie. Przypięte
+  strony pożyczonego prefiksu są rozliczane konserwatywnie i nie zmniejszają
+  budżetu admission; może to opóźnić przyjęcie mimo fizycznego współdzielenia KV.
 - `forge-formats` udostępnia zamknięty parser `forge-speculation.json` dla
   neuralnych proposerów. Manifest opisuje target, fingerprinty, tensory, cechy,
   dtype/kwantyzację, sampling, kalibrację oraz osobne licencje kodu i wag.

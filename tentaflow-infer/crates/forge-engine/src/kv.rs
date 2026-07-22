@@ -334,6 +334,29 @@ impl KvCache {
         }
     }
 
+    /// Wylicza strony potrzebne do jednego kroku wszystkich sekwencji bez mutacji.
+    pub fn batch_growth_pages<'a>(
+        &self,
+        seqs: impl IntoIterator<Item = &'a SeqKv>,
+    ) -> Result<usize> {
+        let mut required = 0usize;
+        for seq in seqs {
+            if !seq.len.is_multiple_of(self.cfg.page_size) {
+                continue;
+            }
+            if seq.pages.len() >= self.cfg.max_pages_per_seq {
+                return Err(ForgeError::Scheduler(format!(
+                    "sequence exceeds max_pages_per_seq {}",
+                    self.cfg.max_pages_per_seq
+                )));
+            }
+            required = required.checked_add(1).ok_or_else(|| {
+                ForgeError::Scheduler("batch KV growth page count overflow".into())
+            })?;
+        }
+        Ok(required)
+    }
+
     /// Ensure capacity for one more token; allocates a page on boundary.
     pub fn grow(&mut self, seq: &mut SeqKv) -> Result<()> {
         if seq.len.is_multiple_of(self.cfg.page_size) {
@@ -579,6 +602,30 @@ mod tests {
         assert_eq!(cache.free_page_count(), cache.cfg.n_pages);
         assert_eq!(seq.len, 0);
         assert!(seq.pages.is_empty());
+    }
+
+    #[test]
+    fn plan_batchowego_wzrostu_nie_mutuje_wczesniejszej_sekwencji_po_bledzie() {
+        let device = CpuDevice::new();
+        let mut cache = KvCache::new(device.as_ref(), config(KvQuant::F16)).unwrap();
+        let mut first = cache.new_seq();
+        let mut exhausted = cache.new_seq();
+        for _ in 0..4 {
+            cache.grow(&mut first).unwrap();
+        }
+        for _ in 0..8 {
+            cache.grow(&mut exhausted).unwrap();
+        }
+        exhausted.pages.push(99);
+        exhausted.len = 12;
+        let first_len = first.len;
+        let first_pages = first.pages.clone();
+        let free = cache.free_page_count();
+
+        assert!(cache.batch_growth_pages([&first, &exhausted]).is_err());
+        assert_eq!(first.len, first_len);
+        assert_eq!(first.pages, first_pages);
+        assert_eq!(cache.free_page_count(), free);
     }
 
     #[test]

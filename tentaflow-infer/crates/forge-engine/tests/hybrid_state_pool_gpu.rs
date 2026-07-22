@@ -297,6 +297,20 @@ fn collect_events(rx: Receiver<EngineEvent>) -> TestResult<Vec<u32>> {
     }
 }
 
+fn wait_for_engine_state(
+    description: &str,
+    predicate: impl Fn() -> bool,
+) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !predicate() {
+        if Instant::now() >= deadline {
+            return Err(format!("timeout oczekiwania na stan silnika: {description}").into());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
 fn server_request(prompt_tokens: Vec<u32>, max_tokens: usize) -> EngineRequest {
     EngineRequest {
         prompt_tokens,
@@ -305,6 +319,45 @@ fn server_request(prompt_tokens: Vec<u32>, max_tokens: usize) -> EngineRequest {
             temperature: 0.0,
             ..SamplingParams::default()
         },
+        ..EngineRequest::default()
+    }
+}
+
+fn mixed_server_request(prompt_tokens: Vec<u32>, max_tokens: usize, lane: usize) -> EngineRequest {
+    let sampling = match lane {
+        0 => SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        },
+        1 => SamplingParams {
+            temperature: 0.8,
+            top_k: 24,
+            seed: Some(101),
+            ..SamplingParams::default()
+        },
+        2 => SamplingParams {
+            temperature: 0.65,
+            top_k: 16,
+            repetition_penalty: 1.12,
+            frequency_penalty: 0.15,
+            presence_penalty: 0.1,
+            repeat_last_n: 16,
+            seed: Some(202),
+            ..SamplingParams::default()
+        },
+        _ => SamplingParams {
+            temperature: 0.9,
+            top_k: 32,
+            top_p: 0.85,
+            min_p: 0.03,
+            seed: Some(303),
+            ..SamplingParams::default()
+        },
+    };
+    EngineRequest {
+        prompt_tokens,
+        max_tokens,
+        sampling,
         ..EngineRequest::default()
     }
 }
@@ -429,6 +482,264 @@ fn run_server_tier_fallback(path: &Path) -> TestResult<()> {
     Ok(())
 }
 
+fn run_server_hybrid_width(path: &Path, width: usize) -> TestResult<()> {
+    let Some(oracle_model) = load_model(path, false) else {
+        return Ok(());
+    };
+    let vocab = oracle_model.weights.descriptor.params.vocab_size;
+    let prompts = (0..width)
+        .map(|lane| prompt(vocab, 811 + lane * 137, 8))
+        .collect::<Vec<_>>();
+    let oracle = spawn_engine_batched(
+        oracle_model,
+        Arc::new(tokenizer(path)?),
+        1,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let mut expected = Vec::with_capacity(width);
+    for lane_prompt in &prompts {
+        expected.push(collect_events(
+            oracle.submit(server_request(lane_prompt.clone(), STEPS))?,
+        )?);
+    }
+    oracle.shutdown()?;
+
+    let Some(model) = load_model(path, false) else {
+        return Err("CUDA zniknęła przed testem szerokości hybrid batch".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(path)?),
+        width,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let receivers = prompts
+        .into_iter()
+        .map(|lane_prompt| engine.submit(server_request(lane_prompt, STEPS)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (lane, receiver) in receivers.into_iter().enumerate() {
+        let actual = collect_events(receiver)?;
+        assert_eq!(
+            actual,
+            expected[lane],
+            "lane {lane} B={width}"
+        );
+        println!("hybrid parity B={width} lane={lane}: IDs={actual:?}");
+    }
+    assert_eq!(engine.metrics().requests_errored.load(Ordering::Relaxed), 0);
+    engine.shutdown()?;
+    Ok(())
+}
+
+fn run_server_dynamic_width_and_sampling(path: &Path) -> TestResult<()> {
+    let Some(oracle_model) = load_model_sized(path, false, 96, 8) else {
+        return Ok(());
+    };
+    let vocab = oracle_model.weights.descriptor.params.vocab_size;
+    let prompts = (0..5)
+        .map(|lane| prompt(vocab, 1301 + lane * 97, 8))
+        .collect::<Vec<_>>();
+    let budgets = [88, 88, 84, 80];
+    let replacement_budget = 76;
+    let oracle = spawn_engine_batched(
+        oracle_model,
+        Arc::new(tokenizer(path)?),
+        1,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let mut expected = Vec::with_capacity(4);
+    for lane in [0, 2, 3] {
+        expected.push((lane, collect_events(oracle.submit(mixed_server_request(
+            prompts[lane].clone(),
+            budgets[lane],
+            lane,
+        ))?)?));
+    }
+    let replacement_expected = collect_events(oracle.submit(mixed_server_request(
+        prompts[4].clone(),
+        replacement_budget,
+        2,
+    ))?)?;
+    oracle.shutdown()?;
+
+    let Some(model) = load_model_sized(path, false, 96, 12) else {
+        return Err("CUDA zniknęła przed testem dynamicznego batchu".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(path)?),
+        4,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let mut receivers = (0..4)
+        .map(|lane| {
+            engine.submit(mixed_server_request(
+                prompts[lane].clone(),
+                budgets[lane],
+                lane,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+
+    let metrics = engine.metrics();
+    wait_for_engine_state("cztery aktywne lane'y", || {
+        metrics.requests_started.load(Ordering::Relaxed) >= 4
+            && metrics.active_sequences.load(Ordering::Relaxed) == 4
+    })?;
+    let cancelled = receivers[1]
+        .take()
+        .expect("środkowy lane powinien być aktywny");
+    match cancelled.recv_timeout(Duration::from_secs(120))? {
+        EngineEvent::Token { .. } => {}
+        EngineEvent::Done { .. } => return Err("cancel test zakończył request przed drop".into()),
+        EngineEvent::Error(error) => return Err(error.into()),
+    }
+    assert_eq!(
+        metrics.requests_finished.load(Ordering::Relaxed),
+        0,
+        "cancel musi nastąpić, gdy pozostałe lane'y nadal są aktywne"
+    );
+    drop(cancelled);
+    wait_for_engine_state("trzy lane'y po anulowaniu", || {
+        metrics.requests_errored.load(Ordering::Relaxed) >= 1
+            && metrics.active_sequences.load(Ordering::Relaxed) == 3
+    })?;
+    let replacement = engine.submit(mixed_server_request(
+        prompts[4].clone(),
+        replacement_budget,
+        2,
+    ))?;
+    wait_for_engine_state("ponownie cztery lane'y po reuse", || {
+        metrics.requests_started.load(Ordering::Relaxed) >= 5
+            && metrics.active_sequences.load(Ordering::Relaxed) == 4
+    })?;
+    for (lane, lane_expected) in expected {
+        let receiver = receivers[lane]
+            .take()
+            .expect("zdrowy lane powinien zachować receiver");
+        assert_eq!(collect_events(receiver)?, lane_expected);
+    }
+    assert_eq!(collect_events(replacement)?, replacement_expected);
+    assert!(metrics.requests_errored.load(Ordering::Relaxed) > 0);
+    assert_eq!(metrics.requests_finished.load(Ordering::Relaxed), 4);
+    engine.shutdown()?;
+    Ok(())
+}
+
+fn run_model_batch_preflight_rollback(path: &Path) -> TestResult<()> {
+    let Some(mut model) = load_model_sized(path, false, 32, 4) else {
+        return Ok(());
+    };
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let (mut first, mut first_sampler, first_next) =
+        prepare(&mut model, &prompt(vocab, 1069, 8))?;
+    let (mut exhausted, mut exhausted_sampler, exhausted_next) =
+        prepare(&mut model, &prompt(vocab, 1117, 32))?;
+    let first_len = first.len;
+    let first_pages = first.pages.clone();
+    let exhausted_len = exhausted.len;
+    let exhausted_pages = exhausted.pages.clone();
+    let params = [
+        first_sampler.batch_params(vocab),
+        exhausted_sampler.batch_params(vocab),
+    ];
+
+    let result = model.batched_decode(
+        &mut [&mut first, &mut exhausted],
+        &[first_next, exhausted_next],
+        &params,
+    );
+    assert!(result.is_err());
+    assert_eq!(first.len, first_len);
+    assert_eq!(first.pages, first_pages);
+    assert_eq!(exhausted.len, exhausted_len);
+    assert_eq!(exhausted.pages, exhausted_pages);
+    model.release_seq(&mut first);
+    model.release_seq(&mut exhausted);
+
+    drop(model);
+    let Some(mut model) = load_model_sized(path, false, 64, 2) else {
+        return Err("CUDA zniknęła przed testem rezerwacji KV".into());
+    };
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let (mut growing, mut growing_sampler, growing_next) =
+        prepare(&mut model, &prompt(vocab, 1181, 32))?;
+    let (mut stable, mut stable_sampler, stable_next) =
+        prepare(&mut model, &prompt(vocab, 1237, 8))?;
+    let growing_snapshot = (
+        growing.len,
+        growing.tokens.clone(),
+        growing.pages.clone(),
+    );
+    let stable_snapshot = (stable.len, stable.tokens.clone(), stable.pages.clone());
+    let free_pages = model.kv.free_page_count();
+    assert_eq!(free_pages, 0);
+    let params = [
+        growing_sampler.batch_params(vocab),
+        stable_sampler.batch_params(vocab),
+    ];
+
+    let result = model.batched_decode(
+        &mut [&mut growing, &mut stable],
+        &[growing_next, stable_next],
+        &params,
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        (growing.len, growing.tokens.clone(), growing.pages.clone()),
+        growing_snapshot
+    );
+    assert_eq!(
+        (stable.len, stable.tokens.clone(), stable.pages.clone()),
+        stable_snapshot
+    );
+    assert_eq!(model.kv.free_page_count(), free_pages);
+    model.release_seq(&mut growing);
+    model.release_seq(&mut stable);
+    Ok(())
+}
+
+fn run_server_hol_admission(path: &Path) -> TestResult<()> {
+    let Some(model) = load_model_sized(path, false, 192, 6) else {
+        return Ok(());
+    };
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(path)?),
+        2,
+        32,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let blocker = engine.submit(server_request(prompt(vocab, 919, 8), 88))?;
+    match blocker.recv_timeout(Duration::from_secs(120))? {
+        EngineEvent::Token { .. } => {}
+        EngineEvent::Done { .. } => {
+            return Err("request blokujący skończył się przed testem HOL".into());
+        }
+        EngineEvent::Error(error) => return Err(error.into()),
+    }
+    let delayed = engine.submit(server_request(prompt(vocab, 977, 8), 120))?;
+    let small = engine.submit(server_request(prompt(vocab, 1031, 8), STEPS))?;
+    assert_eq!(collect_events(small)?.len(), STEPS);
+    assert!(matches!(delayed.try_recv(), Err(TryRecvError::Empty)));
+    drop((blocker, delayed));
+    engine.shutdown()?;
+    Ok(())
+}
+
 struct ServerMeasurement {
     completion_tps: f64,
     end_to_end_tps: f64,
@@ -440,10 +751,11 @@ fn measure_server(
     path: &Path,
     max_active: usize,
     spec: SpeculativeConfig,
+    native_mtp: bool,
 ) -> TestResult<ServerMeasurement> {
     const BENCH_TOKENS: usize = 128;
     let kv_pages = max_active * (8 + BENCH_TOKENS).div_ceil(32) + 2;
-    let Some(model) = load_model_sized(path, true, 160, kv_pages) else {
+    let Some(model) = load_model_sized(path, native_mtp, 160, kv_pages) else {
         return Err("benchmark wymaga dostępnego CUDA".into());
     };
     let vocab = model.weights.descriptor.params.vocab_size;
@@ -520,6 +832,39 @@ fn measure_server(
     };
     engine.shutdown()?;
     Ok(measurement)
+}
+
+fn measure_serial_round_robin(path: &Path, width: usize) -> TestResult<f64> {
+    const BENCH_TOKENS: usize = 128;
+    let kv_pages = width * (8 + BENCH_TOKENS).div_ceil(32) + 2;
+    let Some(mut model) = load_model_sized(path, false, 160, kv_pages) else {
+        return Err("benchmark serialny wymaga dostępnego CUDA".into());
+    };
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let mut lanes = (0..width)
+        .map(|lane| prepare(&mut model, &prompt(vocab, 29 + lane * 144, 8)))
+        .collect::<TestResult<Vec<_>>>()?;
+    for _ in 0..12 {
+        for (seq, sampler, next) in &mut lanes {
+            *next = advance(&mut model, seq, sampler, *next)?;
+        }
+    }
+    let started = Instant::now();
+    for _ in 0..BENCH_TOKENS {
+        for (seq, sampler, next) in &mut lanes {
+            *next = advance(&mut model, seq, sampler, *next)?;
+        }
+    }
+    let aggregate = (width * BENCH_TOKENS) as f64 / started.elapsed().as_secs_f64();
+    for (mut seq, _, _) in lanes {
+        model.release_seq(&mut seq);
+    }
+    Ok(aggregate)
+}
+
+fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
 }
 
 #[test]
@@ -708,6 +1053,35 @@ fn server_continuous_admission_mtp_i_router_obsluguje_concurrency_dwa() -> TestR
 }
 
 #[test]
+fn server_hybrid_target_paruje_b3_i_b4_z_serialnym_ogonem() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E hybrid B3/B4: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_model_batch_preflight_rollback(&path)?;
+    run_server_hybrid_width(&path, 3)?;
+    run_server_hybrid_width(&path, 4)?;
+    run_server_dynamic_width_and_sampling(&path)
+}
+
+#[test]
+fn server_admission_omija_duzy_request_czekajacy_na_kv() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E HOL admission: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_server_hol_admission(&path)
+}
+
+#[test]
 fn hybrid_tiering_concurrency_dwa_uzywa_serial_fallback() -> TestResult<()> {
     let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
         eprintln!("pominięto E2E tieringu B2: brak FORGE_TEST_HYBRID_GGUF");
@@ -743,6 +1117,7 @@ fn benchmark_server_mtp_max_active_jeden_kontra_dwa() -> TestResult<()> {
             &path,
             max_active,
             SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?,
+            true,
         )?;
         println!(
             "server MTP max_active={max_active}: completion={:.2} tok/s end_to_end={:.2} tok/s TTFT={:.2} ms ITL={:.2} ms",
@@ -767,8 +1142,27 @@ fn benchmark_server_hybrid_target_b1_kontra_b2() -> TestResult<()> {
     let _gpu_lock = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for max_active in [1, 2] {
-        let measurement = measure_server(&path, max_active, SpeculativeConfig::off())?;
+    let selected = std::env::var("FORGE_BENCH_MAX_ACTIVE")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .map_or_else(|| vec![1, 2, 3, 4], |max_active| vec![max_active]);
+    for max_active in selected {
+        assert!((1..=4).contains(&max_active));
+        let repetitions = if max_active >= 3 { 3 } else { 1 };
+        let mut serial_samples = Vec::with_capacity(repetitions);
+        let mut paired_samples = Vec::with_capacity(repetitions);
+        let mut last_measurement = None;
+        for _ in 0..repetitions {
+            if max_active >= 3 {
+                serial_samples.push(measure_serial_round_robin(&path, max_active)?);
+            }
+            let measurement =
+                measure_server(&path, max_active, SpeculativeConfig::off(), false)?;
+            paired_samples.push(measurement.completion_tps);
+            last_measurement = Some(measurement);
+        }
+        let measurement = last_measurement.expect("benchmark wykonuje co najmniej jedną próbę");
         println!(
             "server hybrid target max_active={max_active}: completion={:.2} tok/s end_to_end={:.2} tok/s TTFT={:.2} ms ITL={:.2} ms",
             measurement.completion_tps,
@@ -776,6 +1170,15 @@ fn benchmark_server_hybrid_target_b1_kontra_b2() -> TestResult<()> {
             measurement.ttft_ms,
             measurement.itl_ms,
         );
+        if max_active >= 3 {
+            let serial = median(serial_samples.clone());
+            let paired = median(paired_samples.clone());
+            println!(
+                "hybrid target B={max_active}: serial samples={serial_samples:?}, paired samples={paired_samples:?}, serial median={serial:.2} tok/s, paired median={paired:.2} tok/s, difference={:.2}%, speedup={:.3}x",
+                (paired / serial - 1.0) * 100.0,
+                paired / serial,
+            );
+        }
     }
     Ok(())
 }

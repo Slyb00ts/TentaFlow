@@ -87,6 +87,7 @@ struct Submission {
     req: EngineRequest,
     events: mpsc::Sender<EngineEvent>,
     submitted_at: Instant,
+    bypasses: usize,
 }
 
 /// Cheap cloneable handle; the worker thread ends when all handles drop.
@@ -106,6 +107,7 @@ impl EngineHandle {
                 req,
                 events: etx,
                 submitted_at: Instant::now(),
+                bypasses: 0,
             })
             .map_err(|_| ForgeError::Scheduler("engine worker stopped".into()))?;
         Ok(erx)
@@ -213,6 +215,8 @@ struct ActiveSeq<'t> {
     submitted_at: Instant,
     prefill_profile: Option<PrefillProfile>,
     benchmark_ttft_ms: Option<f64>,
+    /// Maksymalna liczba stron, do której admission zobowiązał pulę KV.
+    kv_page_budget: usize,
 }
 
 fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<SpeculationKind> {
@@ -281,6 +285,83 @@ fn native_mtp_adaptive_budget(
 
 fn update_mtp_rate(rate: &mut Option<f64>, sample: f64) {
     *rate = Some(rate.map_or(sample, |previous| previous * 0.75 + sample * 0.25));
+}
+
+enum AdmissionDisposition {
+    Admit { page_budget: usize },
+    Reject(String),
+    Wait,
+}
+
+fn reservation_fits(available_pages: usize, reserved_pages: usize, page_budget: usize) -> bool {
+    page_budget <= available_pages.saturating_sub(reserved_pages)
+}
+
+fn admission_disposition(
+    model: &Model,
+    request: &EngineRequest,
+    reserved_pages: usize,
+) -> AdmissionDisposition {
+    let page = model.kv.cfg.page_size;
+    let need_pages = request
+        .prompt_tokens
+        .len()
+        .checked_add(request.max_tokens.max(1))
+        .map(|total| total.div_ceil(page));
+    let capacity = model.max_request_pages();
+    let Some(need_pages) = need_pages else {
+        return AdmissionDisposition::Reject(
+            "request size overflows: prompt_tokens + max_tokens".into(),
+        );
+    };
+    if need_pages > capacity {
+        return AdmissionDisposition::Reject(format!(
+            "request needs {need_pages} KV pages, cache has {capacity} total"
+        ));
+    }
+    let page_budget = if model.tier_enabled() {
+        need_pages.min(crate::tier::min_resident_pages(page))
+    } else {
+        need_pages
+    };
+    if reservation_fits(model.available_pages(), reserved_pages, page_budget) {
+        AdmissionDisposition::Admit { page_budget }
+    } else {
+        AdmissionDisposition::Wait
+    }
+}
+
+fn first_actionable_index(
+    len: usize,
+    scan_window: usize,
+    oldest_bypasses: usize,
+    bypass_budget: usize,
+    mut classify: impl FnMut(usize) -> AdmissionDisposition,
+) -> Option<(usize, AdmissionDisposition)> {
+    let limit = if oldest_bypasses >= bypass_budget {
+        len.min(1)
+    } else {
+        len.min(scan_window)
+    };
+    (0..limit).find_map(|index| {
+        let disposition = classify(index);
+        (!matches!(&disposition, AdmissionDisposition::Wait)).then_some((index, disposition))
+    })
+}
+
+fn reserved_future_pages(active: &[ActiveSeq<'_>], tier_enabled: bool) -> usize {
+    active
+        .iter()
+        .filter(|seq| !seq.dead)
+        .map(|seq| {
+            let allocated = if tier_enabled {
+                seq.seq.pages.iter().filter(|&&page| page >= 0).count()
+            } else {
+                seq.seq.pages.len()
+            };
+            seq.kv_page_budget.saturating_sub(allocated)
+        })
+        .fold(0usize, usize::saturating_add)
 }
 
 /// Spawn the GPU worker thread. `prefill_chunk` bounds how many prompt tokens
@@ -409,6 +490,8 @@ fn worker<'t>(
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
     let mut waiting: VecDeque<Submission> = VecDeque::new();
+    let admission_scan_window = max_active.saturating_mul(2).clamp(2, 16);
+    let admission_bypass_budget = admission_scan_window.saturating_mul(2);
     // Total KV pages is fixed at startup; export it once as a gauge baseline.
     EngineMetrics::set(&metrics.kv_pages_total, model.kv.cfg.n_pages as u64);
 
@@ -444,51 +527,34 @@ fn worker<'t>(
         // (the VRAM pool, or the tier-extended context window when tiering
         // is on — a tiered sequence only needs its hot working set resident).
         while active.len() < max_active {
-            let Some(sub) = waiting.front() else { break };
-            let page = model.kv.cfg.page_size;
-            // A request that can never fit is rejected permanently; one that
-            // only exceeds the currently free pages waits for a slot. The
-            // error strings differ so the API layer can map them to 400 vs
-            // transient handling.
-            let need_pages = sub
-                .req
-                .prompt_tokens
-                .len()
-                .checked_add(sub.req.max_tokens)
-                .map(|total| total.div_ceil(page));
-            let capacity = model.max_request_pages();
-            let permanently_too_large = match need_pages {
-                None => true,
-                Some(n) => n > capacity,
+            let reserved_pages = reserved_future_pages(&active, model.tier_enabled());
+            let oldest_bypasses = waiting.front().map_or(0, |sub| sub.bypasses);
+            let Some((index, disposition)) = first_actionable_index(
+                waiting.len(),
+                admission_scan_window,
+                oldest_bypasses,
+                admission_bypass_budget,
+                |index| admission_disposition(model, &waiting[index].req, reserved_pages),
+            ) else {
+                break;
             };
-            if permanently_too_large {
-                let sub = waiting.pop_front().unwrap();
-                let _ = sub.events.send(EngineEvent::Error(match need_pages {
-                    Some(n) => format!(
-                        "request needs {n} KV pages, cache has {capacity} total"
-                    ),
-                    None => "request size overflows: prompt_tokens + max_tokens".into(),
-                }));
-                EngineMetrics::inc(&metrics.requests_errored);
-                continue;
+            for skipped in waiting.iter_mut().take(index) {
+                skipped.bypasses = skipped.bypasses.saturating_add(1);
             }
-            // A prefix-cache hit (SPEC §5.2) shrinks the pages this request must
-            // prefill: the shared prefix is already resident. The projection
-            // uses a read-only match; the actual borrow happens once the
-            // sequence exists. Admission counts reclaimable cached pages as
-            // available, so a full-but-reclaimable cache never blocks work.
-            let cache_read_pages = model.prefix_match_len(&sub.req.prompt_tokens) / page;
-            let admit_floor = if model.tier_enabled() {
-                need_pages
-                    .unwrap()
-                    .min(crate::tier::min_resident_pages(page))
-            } else {
-                need_pages.unwrap().saturating_sub(cache_read_pages)
+            waiting.rotate_left(index);
+            let sub = waiting
+                .pop_front()
+                .expect("wybrany request admission istnieje w kolejce");
+            waiting.rotate_right(index);
+            let page_budget = match disposition {
+                AdmissionDisposition::Admit { page_budget } => page_budget,
+                AdmissionDisposition::Reject(error) => {
+                    let _ = sub.events.send(EngineEvent::Error(error));
+                    EngineMetrics::inc(&metrics.requests_errored);
+                    continue;
+                }
+                AdmissionDisposition::Wait => unreachable!("wait nie jest wybierany przez admission"),
             };
-            if admit_floor > model.available_pages() {
-                break; // transient KV pressure: retry when a sequence finishes
-            }
-            let sub = waiting.pop_front().unwrap();
             if sub.req.prompt_tokens.is_empty() {
                 let _ = sub.events.send(EngineEvent::Error("empty prompt".into()));
                 EngineMetrics::inc(&metrics.requests_errored);
@@ -593,6 +659,7 @@ fn worker<'t>(
                 submitted_at: sub.submitted_at,
                 prefill_profile: None,
                 benchmark_ttft_ms: None,
+                kv_page_budget: page_budget,
             });
             EngineMetrics::inc(&metrics.requests_started);
         }
@@ -829,8 +896,6 @@ fn batch_gpu_decode(
     batch_min: usize,
     metrics: &EngineMetrics,
 ) {
-    let vocab = model.weights.descriptor.params.vocab_size;
-
     // Phase 1: emit each ready sequence's pending token; collect the indices of
     // survivors that still need to be fed one more token.
     let mut feed_idx: Vec<usize> = Vec::new();
@@ -885,7 +950,7 @@ fn batch_gpu_decode(
     // path engages once the flat cost amortizes across enough sequences.
     // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
     // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
-    let hybrid_b2 = model.hybrid_batch_b2_capable() && feed_idx.len() == 2;
+    let hybrid_b2 = model.hybrid_batch_b2_capable() && feed_idx.len() >= 2;
     let serial_only = model.weights.is_moe()
         || model.kv.cfg.quant.is_rot()
         || (model.is_hybrid() && !hybrid_b2);
@@ -896,6 +961,26 @@ fn batch_gpu_decode(
         return;
     }
 
+    if hybrid_b2 {
+        let mut pairs = feed_idx.chunks_exact(2);
+        for pair in &mut pairs {
+            decode_gpu_group(model, active, pair);
+        }
+        if let Some(&tail) = pairs.remainder().first() {
+            serial_step(model, &mut active[tail]);
+        }
+        return;
+    }
+
+    decode_gpu_group(model, active, &feed_idx);
+}
+
+fn decode_gpu_group(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    feed_idx: &[usize],
+) {
+    let vocab = model.weights.descriptor.params.vocab_size;
     // Phase 2: gather the batch. Disjoint field borrows let one pass hand the
     // KV handle to the model while snapshotting each sampler's params.
     let mut seqs: Vec<&mut SeqKv> = Vec::with_capacity(feed_idx.len());
@@ -1285,10 +1370,56 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
 #[cfg(test)]
 mod tests {
     use super::{
-        native_mtp_adaptive_budget, native_mtp_step_budget, request_speculation_kind,
-        update_mtp_rate, validate_speculation_server_config,
+        AdmissionDisposition, first_actionable_index, native_mtp_adaptive_budget,
+        native_mtp_step_budget, request_speculation_kind, reservation_fits, update_mtp_rate,
+        validate_speculation_server_config,
     };
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
+
+    #[test]
+    fn admission_omija_chwilowo_zablokowany_front_bez_zmiany_fifo() {
+        let states = [false, true, true];
+        let (first, _) = first_actionable_index(states.len(), 3, 0, 4, |index| {
+            if states[index] {
+                AdmissionDisposition::Admit { page_budget: 1 }
+            } else {
+                AdmissionDisposition::Wait
+            }
+        })
+        .expect("drugi request powinien mieścić się w KV");
+        assert_eq!(first, 1);
+
+        let blocked = first_actionable_index(2, 2, 0, 4, |_| AdmissionDisposition::Wait);
+        assert!(blocked.is_none());
+    }
+
+    #[test]
+    fn admission_ogranicza_okno_i_blokuje_bypass_po_zestarzeniu() {
+        let outside_window = first_actionable_index(4, 2, 0, 4, |index| {
+            if index == 2 {
+                AdmissionDisposition::Admit { page_budget: 1 }
+            } else {
+                AdmissionDisposition::Wait
+            }
+        });
+        assert!(outside_window.is_none());
+
+        let aged = first_actionable_index(3, 3, 4, 4, |index| {
+            if index == 1 {
+                AdmissionDisposition::Admit { page_budget: 1 }
+            } else {
+                AdmissionDisposition::Wait
+            }
+        });
+        assert!(aged.is_none());
+    }
+
+    #[test]
+    fn admission_odejmuje_wczesniejsze_zobowiazania_od_dostepnych_stron() {
+        assert!(reservation_fits(8, 3, 5));
+        assert!(!reservation_fits(8, 4, 5));
+        assert!(!reservation_fits(3, 8, 1));
+    }
 
     #[test]
     fn native_mtp_przechodzi_na_zwykly_decode_dla_non_greedy() {

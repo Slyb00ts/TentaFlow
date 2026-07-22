@@ -147,6 +147,24 @@ prefiksu wymagają batchowego draftu oraz verifiera `[B,T]` z osobnym stanem per
 slot.
 Każda zmiana musi zachować porównanie token po tokenie z sekwencyjnym greedy.
 
+## Parowanie B2 dla B3/B4
+
+Scheduler niespekulacyjnego targetu dzieli aktywne sekwencje na pary B2. B3
+wykonuje jedną parę i jeden seryjny ogon, a B4 dwie pary. Pomiar na RTX 4090 dla
+modelu o SHA-256
+`d627e7e4abeac0ddefe92278bc2c37103116ac03e271ce0d44cb7763ded63b3a` obejmował
+trzy powtórzenia po warmupie, 8 tokenów promptu i 128 tokenów wyjściowych na
+sekwencję. Wszystkie lane'y zachowały pełną zgodność ID z seryjnym oracle.
+
+| Szerokość | Mediana serial round-robin | Mediana parowania B2 | Zmiana |
+|---:|---:|---:|---:|
+| B3 | 37,92 tok/s | 40,41 tok/s | +6,58% |
+| B4 | 37,90 tok/s | 41,32 tok/s | +9,01% |
+
+Test E2E obejmuje także różne parametry samplingu per lane oraz anulowanie
+środkowej sekwencji i ponowne użycie zwolnionego slotu. Natywne MTP nadal
+wykonuje lane'y seryjnie i nie korzysta z tego parowania.
+
 ## Szybka ścieżka NVFP4 B3/B4 na NVIDIA
 
 Krótkie GEMM B3/B4 mają osobny kernel Mojo wybierany tylko dla NVIDIA z warpem

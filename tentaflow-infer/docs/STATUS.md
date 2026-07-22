@@ -10,7 +10,7 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-21.
+Ostatnia aktualizacja: 2026-07-22.
 
 - ✅ **Kary samplingu OpenAI na CPU i GPU Mojo (2026-07-21).**
   `frequency_penalty`, `presence_penalty`, `repetition_penalty` i okno
@@ -593,10 +593,12 @@ Ostatnia aktualizacja: 2026-07-21.
     paged cache MTP. Test Qwen3.6 NVFP4 potwierdza parity targetu, pure MTP oraz
     MTP+n-gram dla dwóch sekwencji przeplatanych A/B, wraz z cancel i release/reuse.
     Startup atomowo rezerwuje żądaną liczbę slotów albo zwraca wymagane i dostępne
-    bajty. Scheduler obsługuje B2 niespekulacyjnego targetu: mixery pracują
-    per slot, a FFN i głowa logits używają wspólnych batch GEMM. Jedna brama
-    capability sprawdza rezydentny KV i formaty wag; tiering wybiera seryjny
-    fallback przed mutacją KV.
+    bajty. Scheduler paruje lane'y niespekulacyjnego targetu po B2: mixery pracują
+    per slot, a FFN i głowa logits używają wspólnych batch GEMM; B3 ma jeden
+    seryjny ogon, a B4 wykonuje dwie pary. Jedna brama capability sprawdza
+    rezydentny KV i formaty wag; tiering wybiera seryjny fallback przed mutacją
+    KV. E2E zachowuje parity dla B3/B4, izoluje różne parametry samplingu per lane
+    i sprawdza cancel środkowej sekwencji z ponownym użyciem slotu.
     Verifier przechowuje osobne grafy T=3/4 dla każdego stabilnego identyfikatora
     slotu. Profil `nsys` dla długiego przebiegu wykazał 2 capture i 46 replay przy
     `max_active=1` oraz 4 capture i 96 replay przy `max_active=2`.
@@ -725,8 +727,12 @@ Ostatnia aktualizacja: 2026-07-21.
 - ✅ **§5.2 Radix-tree prefix caching** (dedup system-promptów/few-shot/multi-turn):
   drzewo radix na granularności strony (`forge-engine/src/prefix.rs`), pożyczka
   najdłuższego wspólnego prefiksu (refcount, read-only) przed prefillem + donacja
-  własnych prefill-stron po zakończeniu; LRU eviction refcount-0 liści; admission
-  liczy trafienie i strony odzyskiwalne. Aktywny dla verbatim `f16`/`fp8` bez
+  własnych prefill-stron po zakończeniu; LRU eviction refcount-0 liści. Admission
+  rezerwuje logiczny przyszły wzrost aktywnych sekwencji, respektuje
+  `max_pages_per_seq` i przegląda ograniczone okno kolejki z agingiem. Przypięte
+  strony pożyczonego prefiksu są nadal rozliczane konserwatywnie w pełnym budżecie
+  requestu, więc współdzielenie może nie przyspieszyć admission. Cache jest
+  aktywny dla verbatim `f16`/`fp8` bez
   tieringu i arch nie-hybrydowej (`--prefix-cache on|off`, default on). Usage
   `prompt_tokens_details.cached_tokens`. Współdzielenie CAŁYCH stron → borrower
   nigdy nie pisze do współdzielonej strony (bez CoW granicznej strony). Dowód
