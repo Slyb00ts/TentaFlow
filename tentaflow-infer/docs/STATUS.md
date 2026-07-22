@@ -77,7 +77,15 @@ Ostatnia aktualizacja: 2026-07-22.
   końcowej synchronizacji na cykl N/N. Prometheus eksportuje dedykowany licznik
   `forge_engine_mtp_ngram_b2_steps_total`. Smoke raw128 potwierdził liczniki
   `auto=32`, `0=0`, `1=32` i identyczny pełny hash ID; realne lane-swap oraz
-  cancel/reuse/izolacja przeszły. Mieszane N/M nie jest zaimplementowane.
+  cancel/reuse/izolacja przeszły. Mieszane N/M, M/N i M/M używa tego samego
+  verifiera po jawnym ustawieniu `FORGE_MTP_NGRAM_MIXED_BATCH=1`; brak zmiennej
+  pozostawia auto wyłącznie dla N/N. Macierz raw128 dała około +3,6% względem
+  N/N-only i +5,6% względem B1, ale raw512 była około 0,1% wolniejsza od
+  N/N-only. Te liczby poprzedzają osobny oracle B1 per lane i są wyłącznie
+  pomiarem przepustowości. Direct model/source-mask, syntetyczna macierz i
+  memcheck mixed przeszły; realny server parity per lane oraz pełny `nsys`
+  oczekują na co najmniej 22,5 GiB wolnego VRAM. Auto rollout mixed pozostaje
+  wyłączony.
   CUDA jest jedynym backendem sprawdzonym wykonawczo;
   źródła zachowują przenośny fallback dla AMD/Metal. Raport:
   `docs/BENCH_QWEN35_MTP_NVFP4.md`.

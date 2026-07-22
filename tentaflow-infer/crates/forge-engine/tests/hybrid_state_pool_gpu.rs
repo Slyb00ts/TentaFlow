@@ -268,6 +268,108 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
     Ok(())
 }
 
+fn run_mtp_routed_b2_source_masks(path: &Path) -> TestResult<()> {
+    let Some(mut model) = load_model(path, true) else {
+        return Ok(());
+    };
+    model.preflight_hybrid_state_slots(2)?;
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let prompts = [prompt(vocab, 1301, 8), prompt(vocab, 1601, 8)];
+    for budget in [2usize, 3] {
+        let greedy = [
+            generate(&mut model, &prompts[0], budget + 2)?,
+            generate(&mut model, &prompts[1], budget + 2)?,
+        ];
+        for source_mask in 0u8..4 {
+            let retained_values = std::array::from_fn::<_, 2, _>(|lane| {
+                if source_mask & (1 << lane) != 0 {
+                    (1..=budget + 1).collect::<Vec<_>>()
+                } else {
+                    vec![0]
+                }
+            });
+            for &retained0 in &retained_values[0] {
+                for &retained1 in &retained_values[1] {
+                    let retained = [retained0, retained1];
+                    let mut drafts: [Vec<u32>; 2] =
+                        std::array::from_fn(|lane| greedy[lane][1..=budget].to_vec());
+                    for lane in 0..2 {
+                        if retained[lane] > 0 && retained[lane] <= budget {
+                            let index = retained[lane] - 1;
+                            let expected = greedy[lane][index + 1];
+                            drafts[lane][index] = expected.wrapping_add(1) % vocab as u32;
+                        }
+                    }
+                    let mut expected: [(Vec<u32>, usize, u32); 2] =
+                        std::array::from_fn(|_| (Vec::new(), 0, 0));
+                    let mut expected_states: [Vec<(String, usize, Vec<u8>)>; 2] =
+                        std::array::from_fn(|_| Vec::new());
+                    for lane in 0..2 {
+                        let (mut seq, _, fed) = prepare(&mut model, &prompts[lane])?;
+                        expected[lane] = if retained[lane] > 0 {
+                            let (accepted, correction) = model.verify_greedy_draft_with_mtp_catchup(
+                                &mut seq,
+                                fed,
+                                &drafts[lane],
+                            )?;
+                            assert_eq!(accepted + 1, retained[lane]);
+                            (drafts[lane].clone(), accepted, correction)
+                        } else {
+                            model.native_mtp_step(&mut seq, fed, budget)?
+                        };
+                        expected_states[lane] = model.debug_mtp_state_snapshot(&seq)?;
+                        model.release_seq(&mut seq);
+                    }
+
+                    let (mut first, _, first_fed) = prepare(&mut model, &prompts[0])?;
+                    let (mut second, _, second_fed) = prepare(&mut model, &prompts[1])?;
+                    let external = [
+                        (retained[0] > 0).then_some(drafts[0].as_slice()),
+                        (retained[1] > 0).then_some(drafts[1].as_slice()),
+                    ];
+                    let available = [
+                        model.native_mtp_available_budget(&first, budget),
+                        model.native_mtp_available_budget(&second, budget),
+                    ];
+                    let model_capable = model.mtp_ngram_b2_model_capable();
+                    let embedding_mode = model.mtp_embedding_mode();
+                    let actual = model.native_mtp_routed_step_b2(
+                        &mut [&mut first, &mut second],
+                        [first_fed, second_fed],
+                        budget,
+                        external,
+                    ).map_err(|error| {
+                        format!(
+                            "routed source_mask={source_mask:02b}, K={budget}, retained={retained:?}, available={available:?}, model_capable={model_capable}, embedding={embedding_mode:?}: {error}"
+                        )
+                    })?;
+                    assert_eq!(
+                        actual, expected,
+                        "source_mask={source_mask:02b}, K={budget}, retained={retained:?}"
+                    );
+                    assert_mtp_snapshot_eq(
+                        &model.debug_mtp_state_snapshot(&first)?,
+                        &expected_states[0],
+                        &format!(
+                            "lane0 source_mask={source_mask:02b}, K={budget}, retained={retained:?}"
+                        ),
+                    );
+                    assert_mtp_snapshot_eq(
+                        &model.debug_mtp_state_snapshot(&second)?,
+                        &expected_states[1],
+                        &format!(
+                            "lane1 source_mask={source_mask:02b}, K={budget}, retained={retained:?}"
+                        ),
+                    );
+                    model.release_seq(&mut first);
+                    model.release_seq(&mut second);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_mtp_ngram_b2_retained_one_lane_orders(path: &Path) -> TestResult<()> {
     let Some(mut model) = load_model(path, true) else {
         return Ok(());
@@ -473,6 +575,32 @@ fn generate_combo(model: &mut Model, prompt: &[u32], target: usize) -> TestResul
     }
     model.release_seq(&mut lane.seq);
     assert!(lane.ngram_forwards > 0, "serial MTP+n-gram nie wykonał pełnego draftu");
+    Ok(lane.tokens)
+}
+
+fn generate_combo_b1_oracle(
+    model: &mut Model,
+    prompt: &[u32],
+    target: usize,
+) -> TestResult<Vec<u32>> {
+    let coordinator = SpeculationCoordinator::new(SpeculativeConfig::chain(
+        vec![ProposerKind::Mtp, ProposerKind::Ngram],
+        3,
+    )?)?;
+    let (seq, _, next) = prepare(model, prompt)?;
+    let mut lane = ComboLane {
+        seq,
+        next,
+        tokens: Vec::with_capacity(target),
+        proposer: coordinator
+            .new_state(prompt)?
+            .expect("n-gram powinien mieć stan hostowy"),
+        ngram_forwards: 0,
+    };
+    while lane.tokens.len() < target {
+        advance_combo(model, &mut lane, target)?;
+    }
+    model.release_seq(&mut lane.seq);
     Ok(lane.tokens)
 }
 
@@ -1179,8 +1307,27 @@ fn run_exact_native_mtp_b2_matrix(
         return Err("FORGE_BENCH_REPS musi być większe od zera".into());
     }
     let prompt = read_raw_token_ids(prompt_path)?;
-    let max_seq_len = prompt.len() + OUTPUT_TOKENS + 32;
+    let second_prompt = std::env::var_os("FORGE_BENCH_PROMPT_IDS_SECOND")
+        .map(PathBuf::from)
+        .map(|path| read_raw_token_ids(&path))
+        .transpose()?
+        .unwrap_or_else(|| prompt.clone());
+    let max_seq_len = prompt.len().max(second_prompt.len()) + OUTPUT_TOKENS + 32;
     let kv_pages = 2 * max_seq_len.div_ceil(32) + 4;
+    let Some(mut oracle_model) = load_model_sized(path, true, max_seq_len, kv_pages) else {
+        return Err("oracle B1 wymaga dostępnego CUDA".into());
+    };
+    let oracle_outputs = match mode {
+        ExactB2Mode::Native => [
+            generate_mtp(&mut oracle_model, &prompt, OUTPUT_TOKENS)?,
+            generate_mtp(&mut oracle_model, &second_prompt, OUTPUT_TOKENS)?,
+        ],
+        ExactB2Mode::MtpNgram => [
+            generate_combo_b1_oracle(&mut oracle_model, &prompt, OUTPUT_TOKENS)?,
+            generate_combo_b1_oracle(&mut oracle_model, &second_prompt, OUTPUT_TOKENS)?,
+        ],
+    };
+    drop(oracle_model);
     let Some(model) = load_model_sized(path, true, max_seq_len, kv_pages) else {
         return Err("macierz MTP B2 wymaga dostępnego CUDA".into());
     };
@@ -1203,22 +1350,27 @@ fn run_exact_native_mtp_b2_matrix(
         let generated_before = metrics.generated_tokens_total.load(Ordering::Relaxed);
         let forwards_before = metrics.spec_forwards_total.load(Ordering::Relaxed);
         let accepted_before = metrics.spec_accepted_total.load(Ordering::Relaxed);
-        let b2_before = match mode {
+        let legacy_b2_before = match mode {
             ExactB2Mode::Native => metrics.native_mtp_b2_steps_total.load(Ordering::Relaxed),
             ExactB2Mode::MtpNgram => metrics.mtp_ngram_b2_steps_total.load(Ordering::Relaxed),
         };
+        let routed_before = [
+            metrics.mtp_routed_nn_b2_steps_total.load(Ordering::Relaxed),
+            metrics.mtp_routed_nm_b2_steps_total.load(Ordering::Relaxed),
+            metrics.mtp_routed_mm_b2_steps_total.load(Ordering::Relaxed),
+        ];
         let ttft_before = metrics.ttft_seconds.snapshot();
         let itl_before = metrics.inter_token_seconds.snapshot();
         let started = Instant::now();
         let receivers = [
             engine.submit(server_request(prompt.clone(), OUTPUT_TOKENS))?,
-            engine.submit(server_request(prompt.clone(), OUTPUT_TOKENS))?,
+            engine.submit(server_request(second_prompt.clone(), OUTPUT_TOKENS))?,
         ];
         let (outputs, first_token_at, finished) = collect_pair_events(receivers)?;
         let elapsed = finished.duration_since(started).as_secs_f64();
         let completion_elapsed = finished.duration_since(first_token_at).as_secs_f64();
-        assert_eq!(outputs[0], outputs[1], "identyczne lane'y zwróciły różne ID");
-        assert_eq!(outputs[0].len(), OUTPUT_TOKENS);
+        assert_eq!(outputs[0], oracle_outputs[0], "lane0 różni się od oracle B1");
+        assert_eq!(outputs[1], oracle_outputs[1], "lane1 różni się od oracle B1");
         let generated = metrics
             .generated_tokens_total
             .load(Ordering::Relaxed)
@@ -1231,24 +1383,55 @@ fn run_exact_native_mtp_b2_matrix(
             .spec_accepted_total
             .load(Ordering::Relaxed)
             .saturating_sub(accepted_before);
-        let b2_steps = match mode {
+        let legacy_b2_steps = match mode {
             ExactB2Mode::Native => metrics.native_mtp_b2_steps_total.load(Ordering::Relaxed),
             ExactB2Mode::MtpNgram => metrics.mtp_ngram_b2_steps_total.load(Ordering::Relaxed),
         }
-        .saturating_sub(b2_before);
+        .saturating_sub(legacy_b2_before);
+        let routed_steps = [
+            metrics
+                .mtp_routed_nn_b2_steps_total
+                .load(Ordering::Relaxed)
+                .saturating_sub(routed_before[0]),
+            metrics
+                .mtp_routed_nm_b2_steps_total
+                .load(Ordering::Relaxed)
+                .saturating_sub(routed_before[1]),
+            metrics
+                .mtp_routed_mm_b2_steps_total
+                .load(Ordering::Relaxed)
+                .saturating_sub(routed_before[2]),
+        ];
+        let routed_total = routed_steps.iter().sum::<u64>();
         let b2_expected = matches!(mode, ExactB2Mode::Native)
             || std::env::var("FORGE_MTP_NGRAM_BATCH").map_or(true, |value| value == "1");
         if b2_expected {
-            assert!(b2_steps > 0, "benchmark serwera nie wykonał oczekiwanej ścieżki B2");
+            assert!(routed_total > 0, "benchmark serwera nie wykonał oczekiwanej ścieżki B2");
         } else {
-            assert_eq!(b2_steps, 0, "wyłączona ścieżka N/N wykonała B2");
+            assert_eq!(routed_total, 0, "wyłączona ścieżka routed wykonała B2");
+        }
+        if matches!(mode, ExactB2Mode::MtpNgram) {
+            let mixed_enabled = std::env::var("FORGE_MTP_NGRAM_MIXED_BATCH")
+                .is_ok_and(|value| value == "1");
+            if mixed_enabled && prompt != second_prompt {
+                assert!(
+                    routed_steps[1] + routed_steps[2] > 0,
+                    "włączony mixed routing nie wykonał N/M ani M/M"
+                );
+            } else if !mixed_enabled {
+                assert_eq!(
+                    [routed_steps[1], routed_steps[2]],
+                    [0, 0],
+                    "wyłączony mixed routing wykonał N/M albo M/M"
+                );
+            }
         }
         let ttft = metrics.ttft_seconds.snapshot();
         let itl = metrics.inter_token_seconds.snapshot();
         let ttft_count = ttft.count.saturating_sub(ttft_before.count);
         let itl_count = itl.count.saturating_sub(itl_before.count);
         println!(
-            "exact {} B2 {} {}/{} raw={} generated={} aggregate_completion={:.2} tok/s aggregate_e2e={:.2} tok/s TTFT={:.2} ms effective_ITL={:.2} ms forwards={} accepted={} accepted/forward={:.3} b2_steps={} IDs={:?}",
+            "exact {} B2 {} {}/{} raw={}/{} generated={} aggregate_completion={:.2} tok/s aggregate_e2e={:.2} tok/s TTFT={:.2} ms effective_ITL={:.2} ms forwards={} accepted={} accepted/forward={:.3} legacy_b2={} routed_NN/NM/MM={}/{}/{} IDs={:?}/{:?}",
             match mode {
                 ExactB2Mode::Native => "MTP",
                 ExactB2Mode::MtpNgram => "MTP+n-gram",
@@ -1257,6 +1440,7 @@ fn run_exact_native_mtp_b2_matrix(
             if rep == 0 { 1 } else { rep },
             if rep == 0 { 1 } else { reps },
             prompt.len(),
+            second_prompt.len(),
             generated,
             generated.saturating_sub(1) as f64 / completion_elapsed,
             generated as f64 / elapsed,
@@ -1265,8 +1449,12 @@ fn run_exact_native_mtp_b2_matrix(
             forwards,
             accepted,
             accepted as f64 / forwards.max(1) as f64,
-            b2_steps,
+            legacy_b2_steps,
+            routed_steps[0],
+            routed_steps[1],
+            routed_steps[2],
             outputs[0],
+            outputs[1],
         );
     }
     engine.shutdown()?;
@@ -1581,6 +1769,19 @@ fn mtp_ngram_b2_zachowuje_golden_dla_k2_k3_i_macierzy_retained() -> TestResult<(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     run_mtp_ngram_b2_retained_matrix(&path)
+}
+
+#[test]
+fn mtp_routed_b2_zachowuje_golden_dla_masek_zrodel() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E routed MTP B2: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_mtp_routed_b2_source_masks(&path)
 }
 
 #[test]

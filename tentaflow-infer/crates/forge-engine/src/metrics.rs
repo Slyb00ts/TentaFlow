@@ -107,6 +107,12 @@ pub struct EngineMetrics {
     pub native_mtp_b2_steps_total: AtomicU64,
     /// Wspólne weryfikacje dwóch pełnych draftów routera MTP+n-gram.
     pub mtp_ngram_b2_steps_total: AtomicU64,
+    /// Wspólne weryfikacje routed B2 dla par N/N.
+    pub mtp_routed_nn_b2_steps_total: AtomicU64,
+    /// Wspólne weryfikacje routed B2 dla par N/M lub M/N.
+    pub mtp_routed_nm_b2_steps_total: AtomicU64,
+    /// Wspólne weryfikacje routed B2 dla par M/M.
+    pub mtp_routed_mm_b2_steps_total: AtomicU64,
     /// Gauge: sequences currently decoding/prefilling.
     pub active_sequences: AtomicU64,
     /// Gauge: submissions admitted-but-waiting behind KV pressure (queue depth).
@@ -136,6 +142,9 @@ impl Default for EngineMetrics {
             spec_accepted_total: AtomicU64::new(0),
             native_mtp_b2_steps_total: AtomicU64::new(0),
             mtp_ngram_b2_steps_total: AtomicU64::new(0),
+            mtp_routed_nn_b2_steps_total: AtomicU64::new(0),
+            mtp_routed_nm_b2_steps_total: AtomicU64::new(0),
+            mtp_routed_mm_b2_steps_total: AtomicU64::new(0),
             active_sequences: AtomicU64::new(0),
             queued_sequences: AtomicU64::new(0),
             kv_pages_total: AtomicU64::new(0),

@@ -15,35 +15,39 @@
 	.param .u64 .ptr .align 1 src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_3
 )
 {
-	.reg .pred 	%p<2>;
+	.reg .pred 	%p<3>;
 	.reg .b32 	%r<7>;
-	.reg .b64 	%rd<15>;
+	.reg .b64 	%rd<17>;
 
-	ld.param.b64 	%rd5, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_0];
-	ld.param.b64 	%rd6, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_3];
-	cvta.to.global.u64 	%rd1, %rd6;
-	ld.param.b64 	%rd7, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_1];
-	ld.param.b64 	%rd8, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_2];
-	cvta.to.global.u64 	%rd2, %rd8;
-	cvta.to.global.u64 	%rd3, %rd5;
-	cvta.to.global.u64 	%rd4, %rd7;
-	mov.u32 	%r1, %tid.x;
-	setp.ne.b32 	%p1, %r1, 0;
-	@%p1 bra 	$L__BB0_2;
+	ld.param.b64 	%rd6, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_0];
+	ld.param.b64 	%rd7, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_3];
+	cvta.to.global.u64 	%rd8, %rd7;
+	ld.param.b64 	%rd9, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_1];
+	cvta.to.global.u64 	%rd10, %rd9;
+	ld.param.b64 	%rd11, [src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9_param_2];
+	cvta.to.global.u64 	%rd12, %rd6;
+	cvta.to.global.u64 	%rd1, %rd11;
+	mov.u32 	%r3, %tid.x;
+	setp.ne.b32 	%p1, %r3, 0;
+	@%p1 bra 	$L__BB0_3;
 	mov.u32 	%r2, %ctaid.x;
-	mul.wide.u32 	%rd9, %r2, 8;
-	add.s64 	%rd10, %rd1, %rd9;
-	mul.wide.u32 	%rd11, %r2, 4;
-	add.s64 	%rd12, %rd2, %rd11;
-	add.s64 	%rd13, %rd3, %rd11;
-	add.s64 	%rd14, %rd4, %rd11;
-	ld.global.b32 	%r3, [%rd10];
-	ld.global.b32 	%r4, [%rd12];
-	add.s32 	%r5, %r4, %r3;
-	st.global.b32 	[%rd13], %r5;
+	cvt.u64.u32 	%rd2, %r2;
+	shl.b64 	%rd15, %rd2, 2;
+	add.s64 	%rd16, %rd1, %rd15;
+	ld.global.b32 	%r1, [%rd16];
+	setp.lt.s32 	%p2, %r1, 0;
+	@%p2 bra 	$L__BB0_3;
+	mul.wide.u32 	%rd13, %r2, 8;
+	add.s64 	%rd3, %rd8, %rd13;
+	mul.wide.u32 	%rd14, %r2, 4;
+	add.s64 	%rd4, %rd10, %rd14;
+	add.s64 	%rd5, %rd12, %rd14;
+	ld.global.b32 	%r4, [%rd3];
+	add.s32 	%r5, %r4, %r1;
+	st.global.b32 	[%rd5], %r5;
 	add.s32 	%r6, %r5, -1;
-	st.global.b32 	[%rd14], %r6;
-$L__BB0_2:
+	st.global.b32 	[%rd4], %r6;
+$L__BB0_3:
 	ret;
 
 }

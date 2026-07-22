@@ -301,6 +301,7 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 | `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
 | `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
 | `FORGE_MTP_NGRAM_BATCH` | `auto` | Rollout parowania N/N B2 dwóch pełnych draftów n-gram o tym samym K=2 albo K=3. Brak zmiennej wybiera `auto`: ścieżka działa tylko dla strukturalnie zgodnego modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1. `1` wymusza eksperymentalny backend, także AMD/Metal, ale nadal odrzuca model bez strukturalnego capability. Inna wartość jest błędem konfiguracji. |
+| `FORGE_MTP_NGRAM_MIXED_BATCH` | `0` | Eksperymentalne parowanie N/M i M/M przez wspólny verifier B2. `1` wymaga aktywnego `FORGE_MTP_NGRAM_BATCH` i zachowuje kill-switch `FORGE_NATIVE_MTP_B2`; `0` lub brak zmiennej pozostawia automatyczny rollout wyłącznie dla N/N. Inna wartość jest błędem konfiguracji. |
 
 W verifierze B2 dla T=6 i T=8 trzy projekcje Q8_0 `gate_proj`, `alpha_proj` i
 `beta_proj` współdzielą jedną kwantyzację wejścia `pb.x`, jeśli wszystkie mają
@@ -320,7 +321,8 @@ wartość uruchamia startup preflight puli stanów per sekwencja. Dwa requesty
 pure MTP z tym samym K mogą wykonać wspólny B2. Różne K, tiering, niepełna para
 albo niespełniony kontrakt capability przechodzą przed mutacją stanu na seryjne
 B1. `mtp+ngram` domyślnie używa N/N na NVIDIA warp32, gdy model spełnia
-kontrakt strukturalny; AMD, Metal i pozostałe backendy pozostają w B1. Jeśli wymagane sloty nie mieszczą się w pulach
+kontrakt strukturalny; N/M i M/M wymagają jawnego
+`FORGE_MTP_NGRAM_MIXED_BATCH=1`. AMD, Metal i pozostałe backendy pozostają w B1. Jeśli wymagane sloty nie mieszczą się w pulach
 weights/activations, worker nie startuje, a błąd podaje wymagane i dostępne
 bajty. `run` zawsze obsługuje jedną sekwencję.
 
@@ -331,21 +333,28 @@ verifier B2. Draft ID są pakowane na GPU, a stan MTP doganiany segmentowanym
 KV-only catch-up przez `mtp_norm_join_shifted_segmented_f16`,
 `kv_append_batch_segmented_masked_f16` i
 `mtp_commit_catchup_metadata_segmented`. Commit obu lane jest prewalidowany
-przed zatwierdzeniem targetu i aplikowany bez kolejnego fallible kroku. Brak
-pełnego draftu, ogon bez pary albo niespełnione capability używają istniejącej
-ścieżki seryjnej. Mieszane N/M nie jest zaimplementowane.
+przed zatwierdzeniem targetu i aplikowany bez kolejnego fallible kroku. Po
+jawnym włączeniu ścieżka routed paruje N/N, N/M, M/N i M/M o tym samym K. Lane
+N używa pending ID i maskowanego catch-up, a lane M zachowuje staged KV
+natywnego proposera. Ogon, różne K albo niespełnione capability używają B1.
 
 Licznik Prometheus `forge_engine_mtp_ngram_b2_steps_total` raportuje wyłącznie
 zakończone wspólne weryfikacje N/N B2. Wartość zero przy aktywnym ruchu
 `mtp+ngram` oznacza, że rollout pozostał w B1 albo nie powstały zgodne pary.
+Liczniki `forge_engine_mtp_routed_nn_b2_steps_total`,
+`forge_engine_mtp_routed_nm_b2_steps_total` i
+`forge_engine_mtp_routed_mm_b2_steps_total` rozdzielają źródła zakończonych
+transakcji routed; wariant M/N jest raportowany razem z N/M.
 
 Testy syntetyczne obejmują K2/K3, wszystkie kombinacje retained 1..T, osobny
 initial hidden, izolację lane i stron, granice buforów, canary, cancel/reuse
 pending draftu oraz błędną prewalidację lane0/lane1. Mały CUDA memcheck nie
 wykazał błędów. Realny N/N E2E na modelu 27B, A/B z routerem seryjnym, pięć
 powtórzeń raw128/raw512, profil `nsys`, lane-swap oraz cancel/reuse/izolacja
-przeszły z pełną zgodnością ID i snapshotów stanu. Pending pozostaje wyłącznie
-mieszane parowanie N/M.
+przeszły z pełną zgodnością ID i snapshotów stanu. Direct model/source-mask i
+syntetyczna macierz mixed przeszły. Realny server oracle B1 osobno dla obu lane
+oraz pełny profil mixed `nsys` pozostają oczekujące z powodu dostępnego VRAM.
+Mieszany rollout pozostaje domyślnie wyłączony.
 
 ### Manifest neuralnego proposera
 

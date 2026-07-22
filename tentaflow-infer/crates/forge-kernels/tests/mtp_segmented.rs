@@ -1003,11 +1003,16 @@ fn maskowany_append_i_metadane_mtp_obsluguja_macierz_retained_1_do_t() {
         device
             .write(bytemuck::cast_slice(&[0i32, 1, 2, 3]), &page_tables, 0)
             .unwrap();
-        device
-            .write(bytemuck::cast_slice(&[0i32, 0]), &bases, 0)
-            .unwrap();
-        for retained0 in 1..=t {
-            for retained1 in 1..=t {
+        for source_mask in 0u8..4 {
+            let bases_host = [
+                if source_mask & 1 != 0 { 0i32 } else { -1 },
+                if source_mask & 2 != 0 { 0i32 } else { -1 },
+            ];
+            device
+                .write(bytemuck::cast_slice(&bases_host), &bases, 0)
+                .unwrap();
+            for retained0 in 1..=t {
+                for retained1 in 1..=t {
                 let decisions_host = [retained0 as i32, 101, retained1 as i32, 202];
                 device
                     .write(bytemuck::cast_slice(&decisions_host), &decisions, 0)
@@ -1055,11 +1060,12 @@ fn maskowany_append_i_metadane_mtp_obsluguja_macierz_retained_1_do_t() {
                 let actual = bytemuck::cast_slice::<u8, f16>(&cache_bytes);
                 for lane in 0..batch {
                     let retained = [retained0, retained1][lane];
+                    let enabled = source_mask & (1 << lane) != 0;
                     for row in 0..t {
                         let page = lane * max_pages + row / page_size;
                         let slot = row % page_size;
                         let offset = (page * page_size + slot) * head_dim;
-                        let expected = if row < retained {
+                        let expected = if enabled && row < retained {
                             f16::from_f32((lane * t + row + 1) as f32)
                         } else {
                             canary
@@ -1070,8 +1076,20 @@ fn maskowany_append_i_metadane_mtp_obsluguja_macierz_retained_1_do_t() {
                     }
                 }
                 for (buffer, expected) in [
-                    (&seq_lens, [retained0 as i32, retained1 as i32]),
-                    (&positions, [retained0 as i32 - 1, retained1 as i32 - 1]),
+                    (
+                        &seq_lens,
+                        [
+                            if source_mask & 1 != 0 { retained0 as i32 } else { 0x6bad_cafeu32 as i32 },
+                            if source_mask & 2 != 0 { retained1 as i32 } else { 0x6bad_cafeu32 as i32 },
+                        ],
+                    ),
+                    (
+                        &positions,
+                        [
+                            if source_mask & 1 != 0 { retained0 as i32 - 1 } else { 0x6bad_cafeu32 as i32 },
+                            if source_mask & 2 != 0 { retained1 as i32 - 1 } else { 0x6bad_cafeu32 as i32 },
+                        ],
+                    ),
                 ] {
                     let mut bytes = vec![0u8; (batch + 3) * 4];
                     device.read(buffer, 0, &mut bytes).unwrap();
@@ -1082,6 +1100,7 @@ fn maskowany_append_i_metadane_mtp_obsluguja_macierz_retained_1_do_t() {
                         .all(|value| *value as u32 == 0x6bad_cafe));
                 }
             }
+        }
         }
     }
 }

@@ -59,6 +59,52 @@ fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_embedding: b
     mode == Some("device") && shares_target_embedding
 }
 
+fn validate_mtp_routed_inputs(
+    vocab: usize,
+    fed: [u32; 2],
+    k: usize,
+    external_drafts: [Option<&[u32]>; 2],
+) -> Result<[i32; 2]> {
+    let [fed0, fed1] = fed.map(|token| {
+        i32::try_from(token)
+            .map_err(|_| ForgeError::Format("fed routed MTP przekracza i32".into()))
+    });
+    let fed_i32 = [fed0?, fed1?];
+    if external_drafts
+        .iter()
+        .flatten()
+        .any(|draft| draft.len() != k)
+    {
+        return Err(ForgeError::Scheduler(
+            "zewnętrzny draft routed MTP ma niezgodne K".into(),
+        ));
+    }
+    if fed
+        .iter()
+        .copied()
+        .chain(
+            external_drafts
+                .iter()
+                .flatten()
+                .flat_map(|draft| draft.iter().copied()),
+        )
+        .any(|token| token as usize >= vocab)
+    {
+        return Err(ForgeError::Scheduler(
+            "token wejściowy pary routed MTP wykracza poza słownik".into(),
+        ));
+    }
+    for token in external_drafts
+        .iter()
+        .flatten()
+        .flat_map(|draft| draft.iter().copied())
+    {
+        i32::try_from(token)
+            .map_err(|_| ForgeError::Format("draft routed MTP przekracza i32".into()))?;
+    }
+    Ok(fed_i32)
+}
+
 fn restore_after<T>(result: Result<T>, restore: impl FnOnce()) -> Result<T> {
     restore();
     result
@@ -1225,12 +1271,6 @@ struct MtpB2Bufs {
     selected_conv: DevBuffer,
     selected_hidden: DevBuffer,
     delta: Vec<Option<MtpB2DeltaCache>>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MtpB2StateMode {
-    Proposed,
-    Catchup,
 }
 
 type MtpB2Verification = ([(Vec<u32>, usize, u32); 2], [usize; 2]);
@@ -6019,22 +6059,19 @@ impl Model {
         seqs: &mut [&mut SeqKv; 2],
         fed: [u32; 2],
         k: usize,
+        external_drafts: [Option<&[u32]>; 2],
     ) -> Result<()> {
         if !self.native_mtp_b2_capable([&*seqs[0], &*seqs[1]], k) {
             return Err(ForgeError::Unsupported(
                 "para nie spełnia kontraktu native MTP B2".into(),
             ));
         }
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let fed_i32 = validate_mtp_routed_inputs(vocab, fed, k, external_drafts)?;
         self.ensure_hybrid_bufs()?;
         let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
         let mut checkpoint_attempted = false;
         let mut result: Result<()> = (|| {
-            let vocab = self.weights.descriptor.params.vocab_size;
-            if fed.iter().any(|&token| token as usize >= vocab) {
-                return Err(ForgeError::Scheduler(
-                    "token wejściowy pary MTP wykracza poza słownik".into(),
-                ));
-            }
             let mut required_pages = 0usize;
             for state in &states {
                 let end = state.seq.len.checked_add(k + 1).ok_or_else(|| {
@@ -6062,7 +6099,14 @@ impl Model {
             checkpoint_attempted = true;
             for (lane, state) in states.iter_mut().enumerate() {
                 state.checkpoint(&self.stream)?;
-                let initial_ids = [fed[lane] as i32, 0, 0, 0, 0];
+                let mut initial_ids = [fed_i32[lane], 0, 0, 0, 0];
+                if let Some(draft) = external_drafts[lane] {
+                    for (index, &token) in draft.iter().enumerate() {
+                        initial_ids[index + 1] = i32::try_from(token).map_err(|_| {
+                            ForgeError::Format("draft routed MTP przekracza i32".into())
+                        })?;
+                    }
+                }
                 write_pinned(bytemuck::cast_slice(&initial_ids), &state.pinned_token_ids)?;
                 self.device.copy(
                     &state.pinned_token_ids,
@@ -6075,7 +6119,10 @@ impl Model {
             }
 
             for step in 0..=k {
-                for state in &mut states {
+                for (lane, state) in states.iter_mut().enumerate() {
+                    if external_drafts[lane].is_some() {
+                        continue;
+                    }
                     self.device.copy(
                         &state.token_ids,
                         step * 4,
@@ -6134,7 +6181,7 @@ impl Model {
         fed: [u32; 2],
         k: usize,
     ) -> Result<[Vec<u32>; 2]> {
-        self.mtp_propose_pending_b2(seqs, fed, k)?;
+        self.mtp_propose_pending_b2(seqs, fed, k, [None, None])?;
         let (leases, states, mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
         let readback = (|| {
             for state in &states {
@@ -6493,6 +6540,7 @@ impl Model {
         states: &mut [MtpDraftState; 2],
         mtp_kv: &mut KvCache,
         t: usize,
+        external_sources: [bool; 2],
     ) -> Result<()> {
         let mtp = self.weights.mtp.as_ref().expect("stan MTP ma wagi");
         let layer = mtp.layers.first().ok_or_else(|| {
@@ -6511,6 +6559,9 @@ impl Model {
         let mut bases = [0i32; 2];
         let mut page_tables = vec![-1i32; 2 * self.max_pages_per_seq];
         for (lane, state) in states.iter_mut().enumerate() {
+            if !external_sources[lane] {
+                continue;
+            }
             self.device.copy(
                 &state.recurrent_hidden,
                 0,
@@ -6552,6 +6603,9 @@ impl Model {
             &self.stream,
         )?;
         for (lane, state) in states.iter().enumerate() {
+            if !external_sources[lane] {
+                continue;
+            }
             self.device.copy(
                 &b2.page_tables,
                 lane * self.max_pages_per_seq * 4,
@@ -6571,6 +6625,22 @@ impl Model {
             &states[1].token_ids,
             &b2.base_positions,
             t,
+            &self.stream,
+        )?;
+        let masked_bases = [
+            if external_sources[0] { bases[0] } else { -1 },
+            if external_sources[1] { bases[1] } else { -1 },
+        ];
+        write_pinned(
+            bytemuck::cast_slice(&masked_bases),
+            &b2.pinned_mtp_metadata,
+        )?;
+        self.device.copy(
+            &b2.pinned_mtp_metadata,
+            0,
+            &b2.base_positions,
+            0,
+            8,
             &self.stream,
         )?;
         self.kernels.mtp_norm_join_shifted_segmented_f16(
@@ -6657,6 +6727,9 @@ impl Model {
             &self.stream,
         )?;
         for (lane, state) in states.iter().enumerate() {
+            if !external_sources[lane] {
+                continue;
+            }
             self.device.copy(
                 &b2.mtp_seq_lens,
                 lane * 4,
@@ -8029,7 +8102,7 @@ impl Model {
         budget: usize,
         mtp_states: &mut [MtpDraftState; 2],
         mtp_kv: &mut KvCache,
-        state_mode: MtpB2StateMode,
+        external_sources: [bool; 2],
     ) -> Result<MtpB2Verification> {
         if !matches!(budget, 2 | 3) {
             return Err(ForgeError::Unsupported(
@@ -8238,7 +8311,7 @@ impl Model {
                     ));
                 }
             }
-            if state_mode == MtpB2StateMode::Catchup {
+            if external_sources.into_iter().any(|external| external) {
                 self.device.copy(
                     &pb.h,
                     0,
@@ -8590,8 +8663,8 @@ impl Model {
                     )?;
                 }
             }
-            if state_mode == MtpB2StateMode::Proposed {
-                for (lane, state) in mtp_states.iter_mut().enumerate() {
+            for (lane, state) in mtp_states.iter_mut().enumerate() {
+                if !external_sources[lane] {
                     self.device.copy(
                         &b2.selected_hidden,
                         lane * hidden_bytes,
@@ -8601,8 +8674,14 @@ impl Model {
                         &self.stream,
                     )?;
                 }
-            } else {
-                self.mtp_catchup_verified_prefix_b2(mtp_states, mtp_kv, t)?;
+            }
+            if external_sources.into_iter().any(|external| external) {
+                self.mtp_catchup_verified_prefix_b2(
+                    mtp_states,
+                    mtp_kv,
+                    t,
+                    external_sources,
+                )?;
             }
             self.device
                 .copy(&b2.decisions, 0, &b2.pinned_decisions, 0, 16, &self.stream)?;
@@ -8976,20 +9055,32 @@ impl Model {
         fed: [u32; 2],
         budget: usize,
     ) -> Result<[(Vec<u32>, usize, u32); 2]> {
+        self.native_mtp_routed_step_b2(seqs, fed, budget, [None, None])
+    }
+
+    /// Wykonuje wspólny verifier B2 dla dowolnej pary źródeł MTP/n-gram.
+    pub fn native_mtp_routed_step_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        fed: [u32; 2],
+        budget: usize,
+        external_drafts: [Option<&[u32]>; 2],
+    ) -> Result<[(Vec<u32>, usize, u32); 2]> {
         if !self.native_mtp_b2_capable([&*seqs[0], &*seqs[1]], budget) {
             return Err(ForgeError::Unsupported(
-                "para nie spełnia kontraktu native MTP B2".into(),
+                "para nie spełnia kontraktu routed MTP B2".into(),
             ));
         }
-        self.mtp_propose_pending_b2(seqs, fed, budget)?;
+        self.mtp_propose_pending_b2(seqs, fed, budget, external_drafts)?;
         let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
+        let external_sources = external_drafts.map(|draft| draft.is_some());
         let result =
             match self.verify_hybrid_greedy_draft_b2(
                 seqs,
                 budget,
                 &mut states,
                 &mut mtp_kv,
-                MtpB2StateMode::Proposed,
+                external_sources,
             ) {
                 Ok((results, metadata_targets)) => {
                     apply_mtp_pair_metadata_commit(&mut states, &mut mtp_kv, metadata_targets);
@@ -9018,77 +9109,16 @@ impl Model {
                 "MTP+n-gram B2 wymaga dwóch draftów z tym samym K=2 lub K=3".into(),
             ));
         }
-        if !self.mtp_ngram_b2_capable([&*seqs[0], &*seqs[1]], budget) {
-            return Err(ForgeError::Unsupported(
-                "para nie spełnia kontraktu MTP+n-gram B2".into(),
-            ));
-        }
-        self.ensure_hybrid_bufs()?;
-        let vocab = self.weights.descriptor.params.vocab_size;
-        if fed
-            .iter()
-            .copied()
-            .chain(drafts.iter().flat_map(|draft| draft.iter().copied()))
-            .any(|token| token as usize >= vocab)
-        {
-            return Err(ForgeError::Scheduler(
-                "draft MTP+n-gram B2 zawiera token poza słownikiem".into(),
-            ));
-        }
-        let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
-        let mut checkpoint_attempted = false;
-        let mut result = (|| {
-            checkpoint_attempted = true;
-            for (lane, state) in states.iter_mut().enumerate() {
-                state.checkpoint(&self.stream)?;
-                let mut ids = [0i32; 5];
-                ids[0] = i32::try_from(fed[lane]).map_err(|_| {
-                    ForgeError::Scheduler("fed MTP+n-gram B2 przekracza i32".into())
-                })?;
-                for (index, &token) in drafts[lane].iter().enumerate() {
-                    ids[index + 1] = i32::try_from(token).map_err(|_| {
-                        ForgeError::Scheduler("draft MTP+n-gram B2 przekracza i32".into())
-                    })?;
-                }
-                write_pinned(bytemuck::cast_slice(&ids), &state.pinned_token_ids)?;
-                self.device.copy(
-                    &state.pinned_token_ids,
-                    0,
-                    &state.token_ids,
-                    0,
-                    ids.len() * 4,
-                    &self.stream,
-                )?;
-            }
-            let (verified, metadata_targets) = self.verify_hybrid_greedy_draft_b2(
-                seqs,
-                budget,
-                &mut states,
-                &mut mtp_kv,
-                MtpB2StateMode::Catchup,
-            )?;
-            apply_mtp_pair_metadata_commit(&mut states, &mut mtp_kv, metadata_targets);
-            Ok([
-                (verified[0].1, verified[0].2),
-                (verified[1].1, verified[1].2),
-            ])
-        })();
-        if result.is_err() {
-            let checkpoints_complete = states.iter().all(|state| state.checkpoint_len().is_some());
-            if let Err(rollback) = rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
-                let execution = result.expect_err("wynik MTP+n-gram B2 zawiera błąd");
-                result = Err(
-                    self.poison_mtp_runtime(format!("błąd MTP+n-gram B2: {execution}; {rollback}"))
-                );
-            } else if checkpoint_attempted && !checkpoints_complete {
-                let execution = result.expect_err("wynik MTP+n-gram B2 zawiera błąd");
-                result = Err(self.poison_mtp_runtime(format!(
-                    "błąd MTP+n-gram B2 przed utworzeniem obu checkpointów: {execution}"
-                )));
-            }
-        }
-        self.pt_seq = 0;
-        self.finish_mtp_runtime_pair(leases, states, mtp_kv, result)
+        self.native_mtp_routed_step_b2(
+            seqs,
+            fed,
+            budget,
+            [Some(drafts[0]), Some(drafts[1])],
+        )
+        .map(|verified| [
+            (verified[0].1, verified[0].2),
+            (verified[1].1, verified[1].2),
+        ])
     }
 
     /// Weryfikuje draft zewnętrznego proposera i dogania stan natywnego MTP.
@@ -11974,12 +12004,38 @@ mod verify_rollback_tests {
         apply_mtp_pair_metadata_commit, finish_greedy_verification, hybrid_prefill_profile_spans,
         hybrid_q_full_cols, logical_kv_regions, native_mtp_b2_device_embedding,
         native_mtp_greedy_decision, restore_after, rollback_mtp_pair,
-        validate_mtp_pair_metadata_commit, ForgeError, HybridStatePool, KvCache, KvConfig,
-        KvQuant, LayerKind, Result, SeqKv,
+        validate_mtp_pair_metadata_commit, validate_mtp_routed_inputs, ForgeError,
+        HybridStatePool, KvCache, KvConfig, KvQuant, LayerKind, Result, SeqKv,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
     use std::sync::Arc;
+
+    #[test]
+    fn fed_routed_mtp_ponad_i32_konczy_sie_przed_mutacja() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut pool = testowa_pula_mtp(device);
+        let leases = [
+            pool.acquire().expect("lane0 powinien powstać"),
+            pool.acquire().expect("lane1 powinien powstać"),
+        ];
+        let (states, kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+        let lengths = [states[0].seq.len, states[1].seq.len];
+        let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
+        let free_pages = kv.free_page_count();
+        let result = validate_mtp_routed_inputs(
+            usize::MAX,
+            [u32::MAX, 7],
+            2,
+            [None, None],
+        );
+        assert!(matches!(result, Err(ForgeError::Format(_))));
+        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
+        assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
+        assert_eq!(kv.free_page_count(), free_pages);
+        pool.restore_mtp_pair(leases, states, kv)
+            .expect("niezmieniona para powinna wrócić do puli");
+    }
 
     #[test]
     fn pula_stanow_izoluje_przeplatane_sekwencje_i_zeruje_reuzyty_slot() {

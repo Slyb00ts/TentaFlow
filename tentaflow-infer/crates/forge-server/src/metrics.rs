@@ -157,6 +157,24 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
         "MTP+n-gram verifies executed by the paired N/N B2 fast path.",
         load(&engine.mtp_ngram_b2_steps_total),
     );
+    counter(
+        &mut out,
+        "forge_engine_mtp_routed_nn_b2_steps_total",
+        "Routed MTP B2 verifies for N/N source pairs.",
+        load(&engine.mtp_routed_nn_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_mtp_routed_nm_b2_steps_total",
+        "Routed MTP B2 verifies for N/M or M/N source pairs.",
+        load(&engine.mtp_routed_nm_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_mtp_routed_mm_b2_steps_total",
+        "Routed MTP B2 verifies for M/M source pairs.",
+        load(&engine.mtp_routed_mm_b2_steps_total),
+    );
 
     // ---- Gauges ----
     gauge(
@@ -227,8 +245,14 @@ mod tests {
     fn prometheus_eksponuje_licznik_mtp_ngram_b2() {
         let engine = EngineMetrics::new();
         engine.mtp_ngram_b2_steps_total.store(7, Ordering::Relaxed);
+        engine.mtp_routed_nn_b2_steps_total.store(3, Ordering::Relaxed);
+        engine.mtp_routed_nm_b2_steps_total.store(2, Ordering::Relaxed);
+        engine.mtp_routed_mm_b2_steps_total.store(1, Ordering::Relaxed);
         let output = render(&engine, &HttpMetrics::default(), "test");
         assert!(output.contains("# TYPE forge_engine_mtp_ngram_b2_steps_total counter"));
         assert!(output.contains("forge_engine_mtp_ngram_b2_steps_total 7"));
+        assert!(output.contains("forge_engine_mtp_routed_nn_b2_steps_total 3"));
+        assert!(output.contains("forge_engine_mtp_routed_nm_b2_steps_total 2"));
+        assert!(output.contains("forge_engine_mtp_routed_mm_b2_steps_total 1"));
     }
 }

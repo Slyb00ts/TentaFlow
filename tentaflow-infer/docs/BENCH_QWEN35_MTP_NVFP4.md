@@ -502,6 +502,29 @@ obejmują cancel/reuse pending draftu i atomową prewalidację commitu obu lane.
 Mały `compute-sanitizer --tool memcheck` dla poprawnego masked append zakończył
 się `ERROR SUMMARY: 0 errors`.
 
+### Eksperymentalny routing N/M i M/M
+
+`FORGE_MTP_NGRAM_MIXED_BATCH=1` rozszerza planner tego samego B2 o pary N/M,
+M/N i M/M ze wspólnym K=2 albo K=3. Lane N zachowuje pending ID i wykonuje
+maskowany catch-up MTP, a lane M używa staged KV natywnego proposera. Transakcja
+checkpointuje oba stany, zatwierdza je dopiero po jednym exact4 verifierze i
+cofa albo zatruwa oba stany przy błędzie. Bez tej zmiennej auto rollout pozostaje
+wyłącznie N/N.
+
+Wstępny pomiar przepustowości RTX 4090, NVFP4, 1 warmup + 5 powtórzeń, dwa
+requesty po 128 tokenów. Ten pomiar poprzedzał dodanie osobnego oracle B1 per
+lane i nie jest gate'em poprawności:
+
+| Prompty | routed N/M | N/N-only | B1 | Wynik routed |
+|---|---:|---:|---:|---:|
+| raw128 / raw31 | 83,12 tok/s | 80,30 tok/s | 78,74 tok/s | +3,5% / +5,6% |
+| raw512 / raw128 | 62,85 tok/s | 62,94 tok/s | 62,46 tok/s | -0,1% / +0,6% |
+
+Raw512 nie uzasadnia jeszcze automatycznego rolloutu mieszanego. Ścieżka
+pozostaje jawnie eksperymentalna do dalszego profilowania i przeglądu.
+`compute-sanitizer --tool memcheck` dla pełnej syntetycznej macierzy masek
+00/01/10/11, K2/K3 i retained 1..T zakończył się `ERROR SUMMARY: 0 errors`.
+
 Segmentowana attention NVIDIA zachowuje kolejność redukcji dokładnego verifiera
 seryjnego: cztery warpy dzielą pozycje kontekstu, a warp 0 scala części w tej
 samej kolejności. Porównanie bitowe obejmuje T1 przy ctx1, T6 przy granicach
@@ -523,7 +546,9 @@ Pełne ID są identyczne ON/OFF we wszystkich próbach. Macierz retained K2/K3,
 lane swap oraz cancel/reuse zachowały pełny snapshot MTP. Profil raw512 objął
 40 cykli N/N (warmup + próba) i dokładnie 40 uruchomień każdego kernela catch-up:
 norm/join, maskowanego append KV i commitu metadanych. Każdy commit miał osobną
-końcową synchronizację kontekstu. Mieszane parowanie N/M nie jest zaimplementowane.
+końcową synchronizację kontekstu. Core mieszanego N/M, M/N i M/M jest
+zaimplementowany i dostępny wyłącznie po jawnym włączeniu; osobny realny server
+oracle per lane oraz pełny `nsys` pozostają oczekującymi gate'ami z powodu VRAM.
 Licznik Prometheus `forge_engine_mtp_ngram_b2_steps_total` rośnie dopiero po
 udanej wspólnej weryfikacji.
 

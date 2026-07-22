@@ -481,6 +481,8 @@ def mtp_commit_catchup_metadata_segmented(
     """Zatwierdza długość i pozycję MTP według decyzji każdego lane."""
     lane = Int(block_idx.x)
     if Int(thread_idx.x) == 0:
+        if Int(base_positions[lane]) < 0:
+            return
         retained = Int(decisions[2 * lane])
         length = Int(base_positions[lane]) + retained
         seq_lens_out[lane] = Int32(length)

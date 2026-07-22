@@ -118,9 +118,10 @@ def kv_append_batch_segmented_masked_f16(
     kvh = Int(block_idx.y)
     lane = token // n_tokens
     local_token = token % n_tokens
-    if local_token >= Int(decisions[2 * lane]):
+    base_position = Int(base_positions[lane])
+    if base_position < 0 or local_token >= Int(decisions[2 * lane]):
         return
-    pos = Int(base_positions[lane]) + local_token
+    pos = base_position + local_token
     page = Int(page_tables[lane * max_pages + pos // page_size])
     slot = pos % page_size
     dst = ((page * n_kv_heads + kvh) * page_size + slot) * head_dim
