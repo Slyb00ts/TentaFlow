@@ -21649,8 +21649,11 @@ pub fn camera_zones_json(pool: &DbPool, camera_id: &str) -> Result<String> {
 #[cfg(feature = "camera")]
 pub fn set_camera_zones_json(pool: &DbPool, camera_id: &str, zones_json: &str) -> Result<usize> {
     let conn = acquire(pool)?;
+    // `updated_at` is a unix-epoch INTEGER; `datetime('now')` writes a TEXT string
+    // into it, corrupting the column type so the camera-ingest hydrate query
+    // (which reads it as i64) fails at the next startup and no camera loads.
     Ok(conn.execute(
-        "UPDATE cameras SET zones_json = ?2, updated_at = datetime('now') \
+        "UPDATE cameras SET zones_json = ?2, updated_at = strftime('%s','now') \
          WHERE camera_id = ?1 AND removed_at IS NULL",
         rusqlite::params![camera_id, zones_json],
     )?)
