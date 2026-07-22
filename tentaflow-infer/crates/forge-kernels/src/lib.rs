@@ -7,7 +7,7 @@ mod registry;
 mod launchers;
 
 pub use launchers::{
-    Kernels, Nvfp4GgufQ8Projection, SAMPLE_MAX_TOPK, SAMPLE_MAX_VOCAB,
+    Kernels, Nvfp4GgufQ8Projection, Q8ActPrepared, SAMPLE_MAX_TOPK, SAMPLE_MAX_VOCAB,
     SAMPLE_SCRATCH_PAIRS,
 };
 pub use registry::{KernelArtifacts, Manifest};

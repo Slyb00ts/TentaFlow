@@ -129,6 +129,39 @@ Logi: `/tmp/mtp-b2-one-roundtrip-five-raw128.log`,
 `/tmp/mtp-b2-head-contemporary-five-raw128.log` i
 `/tmp/mtp-b2-head-contemporary-five-raw512.log`.
 
+### Współdzielona kwantyzacja Q8 wejścia DeltaNet
+
+Checkpoint shared-Q8 przygotowuje `pb.x` raz i używa go dla trzech projekcji
+Q8_0: `gate_proj`, `alpha_proj` i `beta_proj`. `out_proj` nie należy do grupy:
+osobno kwantyzuje `normed`, które ma inną semantykę i może mieć inny wymiar.
+Routing wymaga zgodnego typu Q8_0 i liczby kolumn wszystkich trzech wag; w innym
+przypadku pozostaje dotychczasowa ścieżka.
+
+Izolowany mikrobenchmark RTX 4090 używał wierszy `[5120, 48, 48]`, 5120 kolumn,
+siedmiu naprzemiennych próbek po 200 iteracji i mediany czasów GPU. Nie jest to
+pomiar E2E modelu.
+
+| Wariant | T=6 | T=8 | Uruchomienia grupy |
+|---|---:|---:|---:|
+| Osobna kwantyzacja | 53,452 us | 58,537 us | 6 |
+| Shared-Q8 | **47,691 us** | **54,451 us** | **4** |
+| Zmiana | **+10,78%** | **+6,98%** | **-2** |
+
+W pełnym B2 każda z 48 warstw DeltaNet wykonywała dotąd cztery kwantyzacje:
+trzy dla grupy `gate`/`alpha`/`beta` i jedną dla `out`. Po zmianie oczekiwane są
+dwie, czyli łącznie **192 -> 96** wywołań `quantize_act_q8_1` na cykl B2. Jest
+to projekcja wymagająca potwierdzenia przez nsys.
+
+Testy T6/T8 potwierdziły exact bits, canary i top1, trzy GEMM-y enqueue przed
+jednym sync, osobny oracle `out_proj`, niezerowy offset wagi, dwa strumienie z
+przejściem T6 -> T8 i realokacją scratchu oraz kontrolowane błędy eventu,
+unieważnienie uchwytu i zatrucie scratchu.
+
+**PENDING:** realny 27B full-ID K2/K3, pięciopomiarowe A/B raw128/raw512 oraz
+liczniki i czas nsys. Obcy proces `tentaflow` zmniejszył wolną pamięć GPU poniżej
+22,5 GiB, dlatego tego etapu nie uruchomiono. Powyższych liczb nie należy
+przedstawiać jako wyniku E2E.
+
 ### Ograniczenia i odrzucone eksperymenty
 
 Pozostały narzut CPU to przygotowanie pozycji bazowych i tablic stron oraz

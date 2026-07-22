@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use forge_formats::{PoolingType, LayerKind};
 use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
-use forge_kernels::{Kernels, Nvfp4GgufQ8Projection};
+use forge_kernels::{Kernels, Nvfp4GgufQ8Projection, Q8ActPrepared};
 use forge_types::{ForgeError, MemKind, Result, Vendor};
 use forge_hal::DEVICE_ALLOC_ALIGN;
 use half::f16;
@@ -3431,6 +3431,47 @@ impl Model {
         stream: &Stream,
     ) -> Result<()> {
         self.gemm_rows(y, w, x, n_tokens, 0, w.rows(), stream)
+    }
+
+    fn delta_input_q8_cols(delta: &DeltaNetWeights) -> Option<usize> {
+        let weights = [&delta.gate_proj, &delta.alpha_proj, &delta.beta_proj];
+        let mut shared_cols = None;
+        for weight in weights {
+            let DevWeight::Q8_0 { cols, .. } = weight else {
+                return None;
+            };
+            if shared_cols.is_some_and(|value| value != *cols) {
+                return None;
+            }
+            shared_cols = Some(*cols);
+        }
+        shared_cols
+    }
+
+    fn gemm_q8_prepared(
+        &self,
+        y: &DevBuffer,
+        weight: &DevWeight,
+        prepared: &mut Q8ActPrepared<'_>,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let DevWeight::Q8_0 {
+            buf, rows, cols, ..
+        } = weight
+        else {
+            return Err(ForgeError::Format(
+                "przygotowana grupa DeltaNet wymaga wag Q8_0".into(),
+            ));
+        };
+        self.kernels.gemm_q8_0_i8mma_prepared_at(
+            y,
+            buf,
+            0,
+            prepared,
+            *rows,
+            *cols,
+            n_tokens,
+        )
     }
 
     /// W4A8 prefill projection GEMM (per-token int8 activation quant + int4xint8
@@ -7206,11 +7247,23 @@ impl Model {
             .expect("warstwa DeltaNet ma stan");
 
         self.gemm(&hv.qkv_mixed, &delta.in_proj, &pb.x, t, stream)?;
-        if !inplace_prefill {
-            self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+        let mut prepared = Self::delta_input_q8_cols(delta)
+            .filter(|_| matches!(t, 6 | 8))
+            .map(|cols| self.kernels.prepare_q8_1(&pb.x, cols, t, stream))
+            .transpose()?;
+        if let Some(prepared) = prepared.as_mut() {
+            if !inplace_prefill {
+                self.gemm_q8_prepared(&hv.z, &delta.gate_proj, prepared, t)?;
+            }
+            self.gemm_q8_prepared(&hv.alpha, &delta.alpha_proj, prepared, t)?;
+            self.gemm_q8_prepared(&hv.beta_raw, &delta.beta_proj, prepared, t)?;
+        } else {
+            if !inplace_prefill {
+                self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+            }
+            self.gemm(&hv.alpha, &delta.alpha_proj, &pb.x, t, stream)?;
+            self.gemm(&hv.beta_raw, &delta.beta_proj, &pb.x, t, stream)?;
         }
-        self.gemm(&hv.alpha, &delta.alpha_proj, &pb.x, t, stream)?;
-        self.gemm(&hv.beta_raw, &delta.beta_proj, &pb.x, t, stream)?;
 
         self.device.copy(
             &state.conv,
@@ -7243,8 +7296,13 @@ impl Model {
             stream,
         )?;
         if inplace_prefill {
-            self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+            if let Some(prepared) = prepared.as_mut() {
+                self.gemm_q8_prepared(&hv.z, &delta.gate_proj, prepared, t)?;
+            } else {
+                self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+            }
         }
+        drop(prepared);
         if inplace_prefill {
             kernels.deltanet_gated_scan_inplace_f16(
                 &hv.o,
@@ -8089,9 +8147,34 @@ impl Model {
                             .as_ref()
                             .expect("warstwa DeltaNet ma cache B2");
                         self.gemm(&b2.qkv_mixed, &delta.in_proj, &pb.x, total, &self.stream)?;
-                        self.gemm(&b2.z, &delta.gate_proj, &pb.x, total, &self.stream)?;
-                        self.gemm(&b2.alpha, &delta.alpha_proj, &pb.x, total, &self.stream)?;
-                        self.gemm(&b2.beta_raw, &delta.beta_proj, &pb.x, total, &self.stream)?;
+                        if let Some(cols) = Self::delta_input_q8_cols(delta)
+                            .filter(|_| matches!(total, 6 | 8))
+                        {
+                            let mut prepared =
+                                self.kernels.prepare_q8_1(&pb.x, cols, total, &self.stream)?;
+                            self.gemm_q8_prepared(
+                                &b2.z,
+                                &delta.gate_proj,
+                                &mut prepared,
+                                total,
+                            )?;
+                            self.gemm_q8_prepared(
+                                &b2.alpha,
+                                &delta.alpha_proj,
+                                &mut prepared,
+                                total,
+                            )?;
+                            self.gemm_q8_prepared(
+                                &b2.beta_raw,
+                                &delta.beta_proj,
+                                &mut prepared,
+                                total,
+                            )?;
+                        } else {
+                            self.gemm(&b2.z, &delta.gate_proj, &pb.x, total, &self.stream)?;
+                            self.gemm(&b2.alpha, &delta.alpha_proj, &pb.x, total, &self.stream)?;
+                            self.gemm(&b2.beta_raw, &delta.beta_proj, &pb.x, total, &self.stream)?;
+                        }
                         self.kernels.deltanet_prepare_segmented_f16(
                             &cache.q,
                             &cache.k,

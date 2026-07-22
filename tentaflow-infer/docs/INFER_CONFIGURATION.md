@@ -301,6 +301,12 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 | `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
 | `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
 
+W verifierze B2 dla T=6 i T=8 trzy projekcje Q8_0 `gate_proj`, `alpha_proj` i
+`beta_proj` współdzielą jedną kwantyzację wejścia `pb.x`, jeśli wszystkie mają
+zgodną liczbę kolumn. Nie wymaga to dodatkowej flagi. `out_proj` pozostaje poza
+grupą i osobno kwantyzuje `normed`; przy niespełnieniu kontraktu routingu
+wykonywana jest dotychczasowa ścieżka projekcji.
+
 Przykład dla modelu z natywną głową MTP:
 
 ```bash
@@ -405,9 +411,18 @@ Zweryfikowane natywne MTP (RTX 4090,
   gather F16/Q8_0/NVFP4 w Mojo oraz kończy jednym D2H/sync; współczesne A/B
   względem `7d472a0a` osiąga **127,91/127,20 tok/s** dla raw128 i
   **93,56/93,45 tok/s** dla raw512;
+- testy shared-Q8 potwierdzają exact/canary/top1 dla T6/T8, osobny `out_proj`,
+  dwa strumienie z realokacją scratchu i kontrolowane ścieżki błędów eventu;
+- izolowany mikrobenchmark shared-Q8 skrócił grupę z 6 do 4 uruchomień i osiągnął
+  +10,78% dla T6 oraz +6,98% dla T8; oczekiwane 192 -> 96 kwantyzacji na cykl
+  B2 nie zostało jeszcze potwierdzone profilem pełnego modelu;
 - pomiary dotyczą wyłącznie CUDA. Źródła kerneli Mojo są przenośnym punktem
   wyjścia dla AMDGPU/Metal, ale tych backendów nie uruchomiono ani nie
   zweryfikowano.
+
+Realny 27B E2E A/B i nsys dla shared-Q8 pozostają **PENDING**, ponieważ obcy
+proces zmniejszył wolną pamięć GPU poniżej 22,5 GiB. Wynik izolowanego kernela
+nie jest wynikiem E2E modelu.
 
 Pełny protokół i porównanie: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 

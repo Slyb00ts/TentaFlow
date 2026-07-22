@@ -43,7 +43,17 @@ Ostatnia aktualizacja: 2026-07-22.
   jeden końcowy D2H i sync. Profil 24 cykli potwierdził dokładnie jeden sync i
   cztery małe H2D na cykl. Gather zeruje błędne ID bez GPU OOB, a finalna
   walidacja zwraca kontrolowany błąd. Współczesne A/B względem `7d472a0a` dało
-  +0,56% dla raw128 i +0,12% dla raw512. CUDA jest jedynym backendem sprawdzonym wykonawczo;
+  +0,56% dla raw128 i +0,12% dla raw512. Checkpoint shared-Q8 współdzieli jedną
+  kwantyzację `pb.x` wyłącznie między `gate_proj`, `alpha_proj` i `beta_proj`;
+  `out_proj` nadal osobno kwantyzuje `normed`. Izolowany mikrobenchmark RTX 4090
+  dla wierszy `[5120, 48, 48]` i 5120 kolumn skrócił T6 z 53,452 do 47,691 us
+  (+10,78%), a T8 z 58,537 do 54,451 us (+6,98%), redukując grupę z 6 do 4
+  uruchomień. Dla 48 warstw DeltaNet oczekiwane jest 192 -> 96 wywołań
+  `quantize_act_q8_1` na cykl B2. To projekcja, nie wynik pełnego modelu.
+  Testy exact/canary/top1, multistream T6 -> T8 z realokacją scratchu oraz
+  testy błędów eventu przeszły. Realny 27B E2E i nsys pozostają **PENDING**,
+  ponieważ obcy proces zmniejszył wolną pamięć GPU poniżej 22,5 GiB.
+  CUDA jest jedynym backendem sprawdzonym wykonawczo;
   źródła zachowują przenośny fallback dla AMD/Metal. Raport:
   `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 

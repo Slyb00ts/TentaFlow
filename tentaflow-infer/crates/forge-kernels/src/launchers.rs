@@ -4,8 +4,10 @@
 // `Float32` as f32.
 
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool, Stream};
+use forge_hal::{DevBuffer, Device, Event, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_types::{DType, ForgeError, MemKind, Result};
 
 use crate::registry::KernelArtifacts;
@@ -143,6 +145,8 @@ pub struct Kernels {
     /// (f32 [T,K/32]) here, then every weight-row block reads int8 X directly
     /// instead of re-quantizing f16 X per block. Sized to the largest (T*K) seen.
     prequant: Mutex<PrequantScratch>,
+    /// Scratch grupy prepared-Q8 ma osobny cykl życia i zależność między streamami.
+    prepared_q8: Mutex<PrequantScratch>,
     /// Grow-only per-token int8 activation scratch for the W4A8 GEMM: `x` is
     /// quantized ONCE into `a_i8` (int8 [T,K]) + `ascales` (f16 [T]) by
     /// `w4a8_quant_act`, then `w4a8_gemm` reads them directly. Non-default path
@@ -184,6 +188,114 @@ struct PrequantScratch {
     cap_codes: usize,
     /// Current f32 capacity (elements) of `xd`/`xsm`.
     cap_blocks: usize,
+    /// Marker ostatniego użycia buforów przez asynchroniczny stream.
+    ready: Option<Event>,
+    /// Błąd synchronizacji zabrania ponownego użycia niepewnych buforów.
+    poisoned: bool,
+}
+
+fn ensure_prepared_q8_usable(scratch: &PrequantScratch) -> Result<()> {
+    if scratch.poisoned {
+        return Err(ForgeError::Kernel(
+            "prepared Q8 scratch jest zatruty po błędzie synchronizacji".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn lock_prepared_q8_scratch(
+    scratch: &Mutex<PrequantScratch>,
+) -> Result<std::sync::MutexGuard<'_, PrequantScratch>> {
+    match scratch.lock() {
+        Ok(guard) => {
+            ensure_prepared_q8_usable(&guard)?;
+            Ok(guard)
+        }
+        Err(mut error) => {
+            error.get_mut().poisoned = true;
+            Err(ForgeError::Kernel(
+                "prepared Q8 scratch jest zatruty przez panic podczas użycia".into(),
+            ))
+        }
+    }
+}
+
+fn resolve_prepared_q8_marker(
+    scratch: &mut PrequantScratch,
+    record_result: Result<()>,
+    synchronize: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let Err(record_error) = record_result else {
+        return Ok(());
+    };
+    match synchronize() {
+        Ok(()) => {
+            scratch.ready = None;
+            Err(record_error)
+        }
+        Err(sync_error) => {
+            scratch.ready = None;
+            scratch.poisoned = true;
+            Err(ForgeError::Kernel(format!(
+                "prepared Q8: zapis markera nie powiódł się: {record_error}; synchronizacja awaryjna nie powiodła się: {sync_error}"
+            )))
+        }
+    }
+}
+
+fn mark_prepared_q8_ready(
+    device: &dyn Device,
+    scratch: &mut PrequantScratch,
+    stream: &Stream,
+) -> Result<()> {
+    let ready =
+        scratch.ready.as_ref().cloned().ok_or_else(|| {
+            ForgeError::Kernel("prepared Q8: brak eventu gotowości scratch".into())
+        })?;
+    #[cfg(test)]
+    let record_result = if take_prepared_q8_fault(&PREPARED_Q8_RECORD_FAILURES) {
+        Err(ForgeError::Kernel(
+            "wstrzyknięty błąd record prepared Q8".into(),
+        ))
+    } else {
+        device.record_event(&ready, stream)
+    };
+    #[cfg(not(test))]
+    let record_result = device.record_event(&ready, stream);
+    resolve_prepared_q8_marker(scratch, record_result, || {
+        #[cfg(test)]
+        if take_prepared_q8_fault(&PREPARED_Q8_SYNC_FAILURES) {
+            return Err(ForgeError::Device(
+                "wstrzyknięty błąd sync prepared Q8".into(),
+            ));
+        }
+        stream.synchronize()
+    })
+}
+
+/// Krótkotrwały widok aktywacji Q8_1 utrzymujący scratch do końca grupy GEMM.
+pub struct Q8ActPrepared<'a> {
+    scratch: std::sync::MutexGuard<'a, PrequantScratch>,
+    stream: &'a Stream,
+    cols: usize,
+    n_tokens: usize,
+    valid: bool,
+}
+
+#[cfg(test)]
+static PREPARED_Q8_RECORD_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PREPARED_Q8_SYNC_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PREPARED_Q8_GEMM_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn take_prepared_q8_fault(counter: &AtomicUsize) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_sub(1)
+        })
+        .is_ok()
 }
 
 /// Device-resident per-token int8 activation scratch for the W4A8 GEMM.
@@ -427,6 +539,7 @@ impl Kernels {
             artifacts,
             iq_tables,
             prequant: Mutex::new(PrequantScratch::default()),
+            prepared_q8: Mutex::new(PrequantScratch::default()),
             w4a8_act: Mutex::new(W4A8ActScratch::default()),
             fp8_act: Mutex::new(Fp8ActScratch::default()),
             q4k_native: Mutex::new(Q4kNativeScratch::default()),
@@ -4301,6 +4414,171 @@ impl Kernels {
     /// requant the old in-kernel quant paid across the grid's `ceil(rows/64)`
     /// blocks. Both launches share one `stream`, so the GEMM sees the quantized
     /// X without an explicit sync.
+    pub fn prepare_q8_1<'a>(
+        &'a self,
+        x: &DevBuffer,
+        cols: usize,
+        n_tokens: usize,
+        stream: &'a Stream,
+    ) -> Result<Q8ActPrepared<'a>> {
+        if !matches!(n_tokens, 6 | 8) || cols == 0 || !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "prepare_q8_1 wymaga T=6/8 i cols > 0 podzielnego przez 32, otrzymano T={n_tokens}, cols={cols}"
+            )));
+        }
+        let input_bytes = checked_buffer_bytes("prepare_q8_1 input", &[n_tokens, cols], 2)?;
+        if x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "prepare_q8_1: bufor wejścia jest za mały".into(),
+            ));
+        }
+        let need_codes = checked_buffer_bytes("prepare_q8_1 codes", &[n_tokens, cols], 1)?;
+        let scale_bytes = checked_buffer_bytes("prepare_q8_1 scales", &[n_tokens, cols / 32], 4)?;
+        let need_blocks = scale_bytes / 4;
+        let blocks_u32 = u32::try_from(need_blocks)
+            .map_err(|_| ForgeError::Kernel("prepare_q8_1: liczba bloków przekracza u32".into()))?;
+        let cols_i64 = i64::try_from(cols)
+            .map_err(|_| ForgeError::Kernel("prepare_q8_1: cols przekracza i64".into()))?;
+        let n_tokens_i64 = i64::try_from(n_tokens)
+            .map_err(|_| ForgeError::Kernel("prepare_q8_1: T przekracza i64".into()))?;
+        let mut scratch = lock_prepared_q8_scratch(&self.prepared_q8)?;
+        let grows = scratch.cap_codes < need_codes || scratch.cap_blocks < need_blocks;
+        if let Some(ready) = scratch.ready.as_ref() {
+            if grows {
+                if let Err(error) = ready.synchronize() {
+                    scratch.poisoned = true;
+                    return Err(ForgeError::Kernel(format!(
+                        "prepared Q8: synchronizacja przed zmianą pojemności nie powiodła się: {error}"
+                    )));
+                }
+            } else {
+                self.device.wait_event(stream, ready)?;
+            }
+        }
+        if scratch.cap_codes < need_codes {
+            scratch.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            scratch.cap_codes = need_codes;
+        }
+        if scratch.cap_blocks < need_blocks {
+            scratch.xd = Some(self.device.alloc(
+                scale_bytes,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            scratch.xsm = Some(self.device.alloc(
+                scale_bytes,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            scratch.cap_blocks = need_blocks;
+        }
+        if scratch.ready.is_none() {
+            scratch.ready = Some(self.device.create_event()?);
+        }
+        let qk = self.artifacts.get("quantize_act_q8_1")?;
+        let qcfg = LaunchConfig::linear(blocks_u32, BLOCK);
+        let qargs = LaunchArgs::new()
+            .buf(scratch.xq.as_ref().expect("xq allocated"))
+            .buf(scratch.xd.as_ref().expect("xd allocated"))
+            .buf(scratch.xsm.as_ref().expect("xsm allocated"))
+            .buf(x)
+            .scalar(cols_i64)
+            .scalar(n_tokens_i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+        mark_prepared_q8_ready(self.device.as_ref(), &mut scratch, stream)?;
+        Ok(Q8ActPrepared {
+            scratch,
+            stream,
+            cols,
+            n_tokens,
+            valid: true,
+        })
+    }
+
+    /// Uruchamia Q8_0 GEMM na wcześniej przygotowanej aktywacji Q8_1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_i8mma_prepared_at(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        w_byte_off: usize,
+        prepared: &mut Q8ActPrepared<'_>,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        if !prepared.valid {
+            return Err(ForgeError::Kernel(
+                "prepared Q8 handle jest nieważny po błędzie markera".into(),
+            ));
+        }
+        if prepared.cols != cols
+            || prepared.n_tokens != n_tokens
+            || !matches!(n_tokens, 6 | 8)
+            || rows == 0
+        {
+            return Err(ForgeError::Kernel(format!(
+                "prepared Q8_0 wymaga zgodnych wymiarów T=6/8 i rows > 0, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("prepared Q8_0 output", &[n_tokens, rows], 2)?;
+        let weight_bytes = checked_buffer_bytes("prepared Q8_0 weights", &[rows, cols / 32], 34)?;
+        let weight_end = w_byte_off
+            .checked_add(weight_bytes)
+            .ok_or_else(|| ForgeError::Kernel("prepared Q8_0: przepełnienie wag".into()))?;
+        if y.len() < output_bytes || w_q8.len() < weight_end {
+            return Err(ForgeError::Kernel(
+                "prepared Q8_0: bufor wyjścia lub wag jest za mały".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        let rows_per_block = 8u32;
+        let block_threads = caps.warp_size.checked_mul(rows_per_block).ok_or_else(|| {
+            ForgeError::Kernel("prepared Q8_0: przepełnienie rozmiaru bloku".into())
+        })?;
+        if block_threads > caps.max_threads_per_block {
+            return Err(ForgeError::Kernel(format!(
+                "prepared Q8_0: blok {block_threads} przekracza limit urządzenia {}",
+                caps.max_threads_per_block
+            )));
+        }
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("prepared Q8_0: rows przekracza u32".into()))?;
+        let cols_i64 = i64::try_from(cols)
+            .map_err(|_| ForgeError::Kernel("prepared Q8_0: cols przekracza i64".into()))?;
+        let rows_i64 = i64::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("prepared Q8_0: rows przekracza i64".into()))?;
+        let n_tokens_i64 = i64::try_from(n_tokens)
+            .map_err(|_| ForgeError::Kernel("prepared Q8_0: T przekracza i64".into()))?;
+        let kernel = self.artifacts.get("gemm_q8_0_i8mma_b8")?;
+        let cfg = LaunchConfig {
+            grid: (rows_u32.div_ceil(rows_per_block), 1, 1),
+            block: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q8, w_byte_off)?
+            .buf(prepared.scratch.xq.as_ref().expect("xq prepared"))
+            .buf(prepared.scratch.xd.as_ref().expect("xd prepared"))
+            .scalar(cols_i64)
+            .scalar(rows_i64)
+            .scalar(n_tokens_i64);
+        #[cfg(test)]
+        PREPARED_Q8_GEMM_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+        self.device.launch(kernel, &cfg, &args, prepared.stream)?;
+        if let Err(error) =
+            mark_prepared_q8_ready(self.device.as_ref(), &mut prepared.scratch, prepared.stream)
+        {
+            prepared.valid = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemm_i8mma_run(
         &self,
@@ -11494,7 +11772,237 @@ impl Kernels {
 
 #[cfg(test)]
 mod nvfp4_gguf_dispatch_tests {
-    use super::{nvfp4_gguf_dispatch, q8_nvfp4_pack_launch, raw_nvfp4_dp4a_supported};
+    use super::{
+        ensure_prepared_q8_usable, lock_prepared_q8_scratch, nvfp4_gguf_dispatch,
+        q8_nvfp4_pack_launch, raw_nvfp4_dp4a_supported, resolve_prepared_q8_marker, Kernels,
+        PrequantScratch, PREPARED_Q8_GEMM_LAUNCHES, PREPARED_Q8_RECORD_FAILURES,
+        PREPARED_Q8_SYNC_FAILURES,
+    };
+    use forge_hal::cpu::CpuDevice;
+    use forge_hal::cuda::{CudaDevice, PoolSizes};
+    use forge_hal::{Device, Pool};
+    use forge_types::{ForgeError, MemKind};
+    use half::f16;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn publiczny_flow_uniewaznia_handle_po_bledzie_record() {
+        let device = match CudaDevice::new(
+            0,
+            PoolSizes {
+                weights: 16 << 20,
+                kv_cache: 4 << 20,
+                activations: 16 << 20,
+                kv_page_size: 256 << 10,
+            },
+        ) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("pominięto test fault injection prepared Q8 bez CUDA: {error}");
+                return;
+            }
+        };
+        let kernels = Kernels::load(device.clone()).unwrap();
+        let stream = device.create_stream().unwrap();
+        let tokens = 6usize;
+        let rows = 16usize;
+        let cols = 32usize;
+        let weight_offset = 68usize;
+        let host_x = (0..tokens * cols)
+            .map(|index| f16::from_f32((index as f32 % 29.0 - 14.0) / 8.0))
+            .collect::<Vec<_>>();
+        let x = device
+            .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+            .unwrap();
+        let mut host_weights = vec![0xa5; weight_offset];
+        for block_index in 0..rows {
+            host_weights.extend(f16::from_f32(0.0078125).to_bits().to_le_bytes());
+            host_weights.extend((0..32).map(|byte| ((block_index * 17 + byte * 13) & 0xff) as u8));
+        }
+        let weights = device
+            .alloc(host_weights.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        device.write(&host_weights, &weights, 0).unwrap();
+        let baseline = device
+            .alloc(tokens * rows * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        kernels
+            .gemm_q8_0_i8mma_at(
+                &baseline,
+                &weights,
+                weight_offset,
+                &x,
+                rows,
+                cols,
+                tokens,
+                &stream,
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+        let mut baseline_bytes = vec![0u8; tokens * rows * 2];
+        device.read(&baseline, 0, &mut baseline_bytes).unwrap();
+
+        PREPARED_Q8_RECORD_FAILURES.store(0, Ordering::SeqCst);
+        PREPARED_Q8_SYNC_FAILURES.store(0, Ordering::SeqCst);
+        PREPARED_Q8_GEMM_LAUNCHES.store(0, Ordering::SeqCst);
+        let failed_output = device
+            .alloc(tokens * rows * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let mut prepared = kernels.prepare_q8_1(&x, cols, tokens, &stream).unwrap();
+        PREPARED_Q8_RECORD_FAILURES.store(1, Ordering::SeqCst);
+        assert!(kernels
+            .gemm_q8_0_i8mma_prepared_at(
+                &failed_output,
+                &weights,
+                weight_offset,
+                &mut prepared,
+                rows,
+                cols,
+                tokens,
+            )
+            .is_err());
+        assert_eq!(PREPARED_Q8_GEMM_LAUNCHES.load(Ordering::SeqCst), 1);
+        assert!(kernels
+            .gemm_q8_0_i8mma_prepared_at(
+                &failed_output,
+                &weights,
+                weight_offset,
+                &mut prepared,
+                rows,
+                cols,
+                tokens,
+            )
+            .is_err());
+        assert_eq!(PREPARED_Q8_GEMM_LAUNCHES.load(Ordering::SeqCst), 1);
+        drop(prepared);
+
+        let recovered_output = device
+            .alloc(tokens * rows * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let mut recovered = kernels.prepare_q8_1(&x, cols, tokens, &stream).unwrap();
+        kernels
+            .gemm_q8_0_i8mma_prepared_at(
+                &recovered_output,
+                &weights,
+                weight_offset,
+                &mut recovered,
+                rows,
+                cols,
+                tokens,
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+        let mut recovered_bytes = vec![0u8; tokens * rows * 2];
+        device
+            .read(&recovered_output, 0, &mut recovered_bytes)
+            .unwrap();
+        assert_eq!(recovered_bytes, baseline_bytes);
+        drop(recovered);
+
+        PREPARED_Q8_GEMM_LAUNCHES.store(0, Ordering::SeqCst);
+        let poisoned_output = device
+            .alloc(tokens * rows * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let mut poisoned = kernels.prepare_q8_1(&x, cols, tokens, &stream).unwrap();
+        PREPARED_Q8_RECORD_FAILURES.store(1, Ordering::SeqCst);
+        PREPARED_Q8_SYNC_FAILURES.store(1, Ordering::SeqCst);
+        assert!(kernels
+            .gemm_q8_0_i8mma_prepared_at(
+                &poisoned_output,
+                &weights,
+                weight_offset,
+                &mut poisoned,
+                rows,
+                cols,
+                tokens,
+            )
+            .is_err());
+        assert_eq!(PREPARED_Q8_GEMM_LAUNCHES.load(Ordering::SeqCst), 1);
+        assert!(kernels
+            .gemm_q8_0_i8mma_prepared_at(
+                &poisoned_output,
+                &weights,
+                weight_offset,
+                &mut poisoned,
+                rows,
+                cols,
+                tokens,
+            )
+            .is_err());
+        assert_eq!(PREPARED_Q8_GEMM_LAUNCHES.load(Ordering::SeqCst), 1);
+        drop(poisoned);
+        stream.synchronize().unwrap();
+        assert!(kernels.prepare_q8_1(&x, cols, tokens, &stream).is_err());
+        PREPARED_Q8_RECORD_FAILURES.store(0, Ordering::SeqCst);
+        PREPARED_Q8_SYNC_FAILURES.store(0, Ordering::SeqCst);
+        PREPARED_Q8_GEMM_LAUNCHES.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn blad_record_z_udanym_sync_resetuje_marker_bez_zatrucia() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut scratch = PrequantScratch {
+            ready: Some(device.create_event().unwrap()),
+            ..PrequantScratch::default()
+        };
+        let error = resolve_prepared_q8_marker(
+            &mut scratch,
+            Err(ForgeError::Kernel("wstrzyknięty błąd record".into())),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("wstrzyknięty błąd record"));
+        assert!(scratch.ready.is_none());
+        assert!(!scratch.poisoned);
+        assert!(ensure_prepared_q8_usable(&scratch).is_ok());
+        assert!(lock_prepared_q8_scratch(&Mutex::new(scratch)).is_ok());
+    }
+
+    #[test]
+    fn blad_record_i_sync_zatruwa_scratch_i_blokuje_nastepne_prepare() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut scratch = PrequantScratch {
+            ready: Some(device.create_event().unwrap()),
+            ..PrequantScratch::default()
+        };
+        let error = resolve_prepared_q8_marker(
+            &mut scratch,
+            Err(ForgeError::Kernel("wstrzyknięty błąd record".into())),
+            || Err(ForgeError::Device("wstrzyknięty błąd sync".into())),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("wstrzyknięty błąd record"));
+        assert!(error.to_string().contains("wstrzyknięty błąd sync"));
+        assert!(scratch.ready.is_none());
+        assert!(scratch.poisoned);
+        assert!(ensure_prepared_q8_usable(&scratch).is_err());
+        assert!(lock_prepared_q8_scratch(&Mutex::new(scratch)).is_err());
+    }
+
+    #[test]
+    fn zatruty_mutex_zwraca_blad_bez_odzyskania_scratch() {
+        let scratch = Arc::new(Mutex::new(PrequantScratch::default()));
+        let panicking = scratch.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = panicking.lock().unwrap();
+            panic!("wstrzyknięty panic pod blokadą");
+        })
+        .join()
+        .is_err());
+
+        assert!(lock_prepared_q8_scratch(&scratch).is_err());
+        let poisoned = match scratch.lock() {
+            Ok(_) => panic!("mutex powinien pozostać zatruty"),
+            Err(error) => error.into_inner().poisoned,
+        };
+        assert!(poisoned);
+    }
 
     #[test]
     fn wybiera_dokladne_buckety_weryfikatora() {
