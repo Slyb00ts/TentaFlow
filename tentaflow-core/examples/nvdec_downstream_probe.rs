@@ -28,8 +28,14 @@ const RUN_FOR: Duration = Duration::from_secs(20);
 fn main() {
     let clip = std::env::args()
         .nth(1)
-        .expect("usage: nvdec_downstream_probe <clip.mp4>");
+        .expect("usage: nvdec_downstream_probe <clip.mp4> [strip-dts]");
+    // `strip-dts` reproduces the live RTP condition on a file: rtph264depay often
+    // hands the decoder buffers with no DTS, and nvh264dec needs DTS to reorder
+    // B-frames. If clearing DTS here makes the decoder go silent, the live failure
+    // is confirmed as a missing-DTS reorder stall — provable off-camera.
+    let strip_dts = std::env::args().nth(2).as_deref() == Some("strip-dts");
     gst::init().expect("gst init");
+    println!("== mode: {} ==", if strip_dts { "STRIP DTS (simulate live RTP)" } else { "normal (file DTS intact)" });
 
     println!("== element registry ==");
     for n in ["nvh264dec", "cudadownload", "cudaconvert", "cudascale"] {
@@ -37,13 +43,13 @@ fn main() {
         println!("  {n:<14} {}", if ok { "present" } else { "MISSING" });
     }
 
-    match probe(&clip) {
+    match probe(&clip, strip_dts) {
         Ok(()) => {}
         Err(e) => println!("\npipeline error: {e}"),
     }
 }
 
-fn probe(clip: &str) -> Result<(), String> {
+fn probe(clip: &str, strip_dts: bool) -> Result<(), String> {
     let pipeline = gst::Pipeline::new();
     let src = mk("filesrc")?;
     src.set_property("location", clip);
@@ -85,6 +91,21 @@ fn probe(clip: &str) -> Result<(), String> {
             }
         }
     });
+
+    // Simulate the live RTP condition: clear DTS on every buffer entering the
+    // decoder so nvh264dec sees PTS-only access units, exactly as rtph264depay
+    // tends to deliver them.
+    if strip_dts {
+        if let Some(pad) = dec.static_pad("sink") {
+            pad.add_probe(gst::PadProbeType::BUFFER, |_, info| {
+                if let Some(gst::PadProbeData::Buffer(ref mut buf)) = info.data {
+                    let b = buf.make_mut();
+                    b.set_dts(gst::ClockTime::NONE);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+    }
 
     // Count buffers AND capture caps at the decoder src and the download src, so
     // we see whether nvh264dec emits and what NV12 memory type it produces.
