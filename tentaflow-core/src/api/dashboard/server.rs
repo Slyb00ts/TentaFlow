@@ -2255,7 +2255,7 @@ pub async fn handle_request(
         let outcome = handle_share_archive(project_id, &auth, issuer, &db, ctx).await;
         let status = outcome.http_status();
         return match outcome {
-            ShareArchiveOutcome::Ok { mut file, size } => {
+            ShareArchiveOutcome::Ok { mut file, size, sha256 } => {
                 // STREAMED, never slurped: an archive can be gigabytes. A paused
                 // download resumes via Range → 206 + Content-Range.
                 let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
@@ -2280,6 +2280,9 @@ pub async fn handle_request(
                     .header("Content-Type", "application/zip")
                     .header("Accept-Ranges", "bytes")
                     .header("Content-Length", length.to_string())
+                    // Whole-archive digest (NOT the partial range on a 206) so the
+                    // puller verifies integrity without the manifest carrying sha256.
+                    .header("X-Archive-Sha256", sha256)
                     .header(
                         "Content-Disposition",
                         format!(

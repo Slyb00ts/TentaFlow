@@ -585,6 +585,120 @@ pub fn build_export(
     export_into(None, project_id, opts, dest_zip)
 }
 
+/// Per-dataset preview row derived from the DB only (no archive). image/annotation
+/// counts and classes come from the dataset's stored `profile_json`, so they are as
+/// fresh as the last profile; an out-of-band COCO edit is not re-scanned here (that
+/// is the archive build's job).
+pub struct DatasetPreview {
+    pub dataset_id: String,
+    pub name: String,
+    pub image_count: u64,
+    pub annotation_count: u64,
+    pub category_names: Vec<String>,
+}
+
+/// Cheap project metadata for the share manifest — read straight from the DB,
+/// never builds or reads the export archive, so it always fits well under the
+/// 30 s request-response limit even for multi-gigabyte projects.
+pub struct ProjectPreview {
+    pub project_id: String,
+    pub name: String,
+    pub project_type: String,
+    pub datasets: Vec<DatasetPreview>,
+    pub classes: Vec<String>,
+}
+
+/// Load the project's inventory (project row + datasets + classes) from the DB
+/// without touching the archive. `None` = project does not exist. Per-dataset
+/// image/annotation counts and classes are read from each dataset's stored
+/// `profile_json`; `image_count` falls back to `row_count` (COCO uploads store the
+/// image count there) when the profile omits it.
+pub fn load_project_preview(project_id: &str) -> Result<Option<ProjectPreview>> {
+    let Some(project) = load_project_row(project_id)? else {
+        return Ok(None);
+    };
+    let datasets = load_dataset_rows(project_id)?;
+
+    let mut previews: Vec<DatasetPreview> = Vec::with_capacity(datasets.len());
+    let mut classes: Vec<String> = Vec::new();
+    for ds in &datasets {
+        let profile: Value = serde_json::from_str(&ds.row.profile_json).unwrap_or(Value::Null);
+        let image_count = profile
+            .get("image_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(ds.row.row_count.max(0) as u64);
+        let annotation_count = profile
+            .get("annotation_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let category_names: Vec<String> = profile
+            .get("classes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for c in &category_names {
+            if !classes.contains(c) {
+                classes.push(c.clone());
+            }
+        }
+        previews.push(DatasetPreview {
+            dataset_id: ds.row.dataset_id.clone(),
+            name: ds.row.name.clone(),
+            image_count,
+            annotation_count,
+            category_names,
+        });
+    }
+    classes.sort();
+
+    Ok(Some(ProjectPreview {
+        project_id: project.project_id,
+        name: project.name,
+        project_type: project.project_type,
+        datasets: previews,
+        classes,
+    }))
+}
+
+/// Approximate on-disk byte size of what an export of this project WOULD contain,
+/// computed WITHOUT zipping: it sums the raw sizes of every dataset payload (COCO
+/// directory trees + inline blobs) and, when `include_models`, the model artifact
+/// directories. This is an ESTIMATE for the manifest preview — the compressed
+/// archive and its per-file/manifest overhead differ; the authoritative size is the
+/// built archive's own length returned by the archive endpoint.
+pub fn estimate_export_size(project_id: &str, include_models: bool) -> Result<u64> {
+    let datasets = load_dataset_rows(project_id)?;
+    let mut total: u64 = 0;
+    for ds in &datasets {
+        if let Some(dir) = ds.source_dir.as_ref() {
+            for (_, abs) in walk_sorted(dir)? {
+                total = total.saturating_add(std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0));
+            }
+        } else if let Some(blob) = ds.raw_blob.as_ref() {
+            total = total.saturating_add(blob.len() as u64);
+        }
+    }
+    if include_models {
+        for run in load_training_run_rows(project_id)? {
+            for kind in ARTIFACT_KINDS {
+                let dir = artifact_dir(kind, project_id, &run.run_id);
+                if !dir.is_dir() {
+                    continue;
+                }
+                for (_, abs) in walk_sorted(&dir)? {
+                    total =
+                        total.saturating_add(std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0));
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
 fn export_into(
     job_id: Option<&str>,
     project_id: &str,

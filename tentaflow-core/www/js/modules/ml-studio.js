@@ -7801,9 +7801,9 @@ function openProjectRemoteImportModal() {
   modal.appendChild(body);
   modal.appendChild(footer);
 
-  // Poświadczenia trzymamy w zmiennych domknięcia, nie w DOM: po wyjściu z etapu
+  // Poświadczenia trzymamy w zmiennych domknięcia, nie w DOM: po wysłaniu
   // formularza znikają z widoku i nigdy nie są logowane.
-  const state = { url: '', apiKey: '', nameOverride: '', preview: null };
+  const state = { url: '', apiKey: '', nameOverride: '' };
 
   modal.addEventListener('close', () => modal.remove(), { once: true });
   const closeModal = () => {
@@ -7812,7 +7812,7 @@ function openProjectRemoteImportModal() {
   };
 
   const renderError = (message) => {
-    body.innerHTML = `<div class="ml-studio-export-error">${sprite('alert')} <span>${escapeHtml(message || 'Import nie powiódł się.')}</span></div>`;
+    body.innerHTML = `<tf-alert tone="danger">${escapeHtml(message || 'Import nie powiódł się.')}</tf-alert>`;
     footer.innerHTML = `
       <tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>
       <tf-button variant="outline" icon="external-link" id="ml-studio-remote-back">Wróć do formularza</tf-button>
@@ -7821,11 +7821,12 @@ function openProjectRemoteImportModal() {
     footer.querySelector('#ml-studio-remote-back')?.addEventListener('click', () => renderForm());
   };
 
-  // Etap 1: URL + klucz API + opcjonalna nazwa. Zachowujemy wpisane wartości,
-  // gdy wracamy tu z podglądu/błędu.
+  // Widok (a): URL + klucz API + opcjonalna nazwa. Przycisk "Importuj" startuje
+  // import od razu — bez etapu podglądu. Zachowujemy wpisane wartości, gdy
+  // wracamy tu po błędzie.
   const renderForm = () => {
     body.innerHTML = `
-      <p class="ml-studio-export-intro">Wklej URL manifestu udostępnionego projektu z drugiej instancji oraz klucz API, który tam otrzymałeś. Podgląd pobiera tylko manifest (bez danych), więc możesz sprawdzić zawartość przed pełnym importem. Projekt powstanie u Ciebie jako NOWY, lokalny projekt.</p>
+      <p class="ml-studio-export-intro">Wklej URL manifestu udostępnionego projektu z drugiej instancji oraz klucz API, który tam otrzymałeś. Import pobierze archiwum ze zdalnej instancji i utworzy u Ciebie NOWY, lokalny projekt. Pusta nazwa = nazwa z manifestu.</p>
       <div style="display:flex;flex-direction:column;gap:12px">
         <tf-input id="ml-studio-remote-url" label="URL manifestu" placeholder="https://inna-instancja:8090/ml-studio/share/&lt;id&gt;/manifest" value="${escapeAttr(state.url)}"></tf-input>
         <tf-input id="ml-studio-remote-key" type="password" label="Klucz API (Bearer)" value="${escapeAttr(state.apiKey)}"></tf-input>
@@ -7835,123 +7836,21 @@ function openProjectRemoteImportModal() {
     `;
     footer.innerHTML = `
       <tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>
-      <tf-button variant="primary" icon="eye" id="ml-studio-remote-preview">Podgląd</tf-button>
+      <tf-button variant="primary" icon="download" id="ml-studio-remote-import">Importuj</tf-button>
     `;
     footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
-    footer.querySelector('#ml-studio-remote-preview')?.addEventListener('click', loadPreview);
-  };
-
-  const readForm = () => {
-    state.url = String(modal.querySelector('#ml-studio-remote-url')?.value || '').trim();
-    state.apiKey = String(modal.querySelector('#ml-studio-remote-key')?.value || '').trim();
-    state.nameOverride = String(modal.querySelector('#ml-studio-remote-name')?.value || '').trim();
-  };
-
-  const loadPreview = async () => {
-    readForm();
-    const msg = body.querySelector('#ml-studio-remote-form-msg');
-    if (!state.url) {
-      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Podaj URL manifestu.</div>`;
-      return;
-    }
-    if (!state.apiKey) {
-      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Podaj klucz API.</div>`;
-      return;
-    }
-    const previewBtn = footer.querySelector('#ml-studio-remote-preview');
-    if (previewBtn) previewBtn.setAttribute('disabled', '');
-    if (msg) msg.innerHTML = '<tf-spinner></tf-spinner> pobieranie manifestu…';
-    let resp;
-    try {
-      resp = await ApiBinary.one('mlStudioRemoteImportPreviewRequest', { url: state.url, apiKey: state.apiKey });
-    } catch (err) {
-      if (!modal.isConnected) return;
-      if (previewBtn) previewBtn.removeAttribute('disabled');
-      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(err.message || 'Błąd protokołu podglądu.')}</div>`;
-      return;
-    }
-    if (!modal.isConnected) return;
-    // Backend zwraca graceful error (zły URL/klucz/manifest) — pokazujemy dosłownie.
-    if (resp && resp.error) {
-      if (previewBtn) previewBtn.removeAttribute('disabled');
-      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(String(resp.error))}</div>`;
-      return;
-    }
-    state.preview = resp;
-    renderPreview(resp);
-  };
-
-  // Etap 2: inwentarz zdalnego projektu z manifestu + potwierdzenie importu.
-  const renderPreview = (preview) => {
-    const projName = preview.projectName ?? preview.project_name ?? '(bez nazwy)';
-    const projTypeSlug = preview.projectType ?? preview.project_type ?? '—';
-    const datasets = Array.isArray(preview.datasets) ? preview.datasets : [];
-    const classes = Array.isArray(preview.classes) ? preview.classes : [];
-    const archiveBytes = preview.archiveBytes ?? preview.archive_bytes ?? 0;
-    const archiveVersion = preview.archiveVersion ?? preview.archive_version ?? '—';
-
-    const classChips = classes.length
-      ? classes.map((c) => `<tf-chip label="${escapeAttr(String(c))}"></tf-chip>`).join('')
-      : '<span class="ml-studio-section-sub">brak zdefiniowanych klas</span>';
-
-    body.innerHTML = `
-      <div class="ml-studio-section-card">
-        <div class="ml-studio-section-card-head">
-          <div class="title">${sprite('catalog')} ${escapeHtml(String(projName))}</div>
-        </div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
-          <tf-chip status="accent" icon="brain" label="typ: ${escapeAttr(String(projTypeSlug))}"></tf-chip>
-          <tf-chip icon="database" label="${datasets.length} ${escapeAttr(plural(datasets.length, 'dataset', 'datasety', 'datasetów'))}"></tf-chip>
-          <tf-chip icon="grid-2x2" label="${classes.length} ${escapeAttr(plural(classes.length, 'klasa', 'klasy', 'klas'))}"></tf-chip>
-          <tf-chip icon="info" label="wersja archiwum: ${escapeAttr(String(archiveVersion))}"></tf-chip>
-          <tf-chip icon="cloud" label="rozmiar: ${escapeAttr(formatFileSize(archiveBytes))}"></tf-chip>
-        </div>
-        <div id="ml-studio-remote-datasets"></div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">${classChips}</div>
-      </div>
-      <div style="margin-top:12px">
-        <tf-input id="ml-studio-remote-name2" label="Nazwa nowego projektu (opcjonalnie)" placeholder="${escapeAttr(String(projName))}" value="${escapeAttr(state.nameOverride)}"></tf-input>
-        <p class="ml-studio-section-sub">Import pobierze archiwum ze zdalnej instancji i utworzy NOWY, lokalny projekt należący do Ciebie. Pusta nazwa = nazwa z manifestu.</p>
-      </div>
-    `;
-
-    const dsHost = body.querySelector('#ml-studio-remote-datasets');
-    if (dsHost) {
-      if (!datasets.length) {
-        dsHost.innerHTML = '<span class="ml-studio-section-sub">Projekt nie zawiera datasetów.</span>';
-      } else {
-        const table = document.createElement('tf-table');
-        table.setAttribute('variant', 'lined');
-        table.innerHTML = `
-          <tf-column key="name" label="Dataset"></tf-column>
-          <tf-column key="images" label="Obrazy" renderer="num"></tf-column>
-          <tf-column key="annotations" label="Anotacje" renderer="num"></tf-column>
-        `;
-        table.rows = datasets.map((d) => ({
-          name: String(d.name ?? d.datasetId ?? d.dataset_id ?? '—'),
-          images: Number(d.imageCount ?? d.image_count ?? 0),
-          annotations: Number(d.annotationCount ?? d.annotation_count ?? 0),
-        }));
-        dsHost.appendChild(table);
-      }
-    }
-
-    footer.innerHTML = `
-      <tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>
-      <tf-button variant="outline" icon="external-link" id="ml-studio-remote-back">Wróć</tf-button>
-      <tf-button variant="primary" icon="check" id="ml-studio-remote-import">Importuj</tf-button>
-    `;
-    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
-    footer.querySelector('#ml-studio-remote-back')?.addEventListener('click', () => renderForm());
     footer.querySelector('#ml-studio-remote-import')?.addEventListener('click', runImport);
   };
 
-  // Etap 3: pełny import — pobranie archiwum + fazy importu, polling statusu.
+  // Widok (b): postęp importu — fazy + pasek bajtów; spinner gdy bajtów brak.
   const renderImportProgress = () => {
     body.innerHTML = `
       <div style="display:flex;flex-direction:column;gap:10px;padding:6px 0">
-        <div class="ml-studio-export-progress-text" style="text-align:left" id="ml-studio-remote-phase">Pobieranie archiwum…</div>
-        <tf-progress-bar id="ml-studio-remote-bar" value="0" tone="accent"></tf-progress-bar>
+        <div class="ml-studio-export-progress-text" style="text-align:left;display:flex;align-items:center;gap:8px" id="ml-studio-remote-phase-row">
+          <tf-spinner id="ml-studio-remote-spinner"></tf-spinner>
+          <span id="ml-studio-remote-phase">Łączenie…</span>
+        </div>
+        <tf-progress-bar id="ml-studio-remote-bar" value="0" tone="accent" hidden></tf-progress-bar>
         <div class="ml-studio-export-note" id="ml-studio-remote-bytes"></div>
       </div>
     `;
@@ -7959,7 +7858,15 @@ function openProjectRemoteImportModal() {
     footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
   };
 
-  const phaseLabel = (phase) => (phase === 'downloading' ? 'Pobieranie archiwum…' : (phase || 'Import w toku…'));
+  // Mapowanie faz backendu na etykiety. Faza importu (rozpakowanie/zapis do DB)
+  // może przyjść pod różnymi nazwami zawierającymi "import".
+  const phaseLabel = (phase) => {
+    const p = String(phase || '').toLowerCase();
+    if (p === 'connecting' || p === 'connect') return 'Łączenie…';
+    if (p === 'downloading' || p === 'download') return 'Pobieranie archiwum…';
+    if (p.includes('import') || p === 'unpacking' || p === 'importing') return 'Import…';
+    return p ? 'Import…' : 'Łączenie…';
+  };
 
   const pollImport = (jobId) => {
     const tick = async () => {
@@ -7980,16 +7887,13 @@ function openProjectRemoteImportModal() {
       const pct = bytesTotal > 0 ? Math.min(100, Math.round((bytesDone / bytesTotal) * 100)) : 0;
       const bytesText = bytesTotal > 0 ? `${formatFileSize(bytesDone)} / ${formatFileSize(bytesTotal)}` : '';
       if (status === 'failed') {
-        // Błędy zdalne (zły klucz = denied, niezgodność klas z importu wewnętrznego)
-        // przechodzą tu i pokazujemy je dosłownie.
+        // Błędy zdalne (zły klucz = denied, nieosiągalny host, niezgodność sha
+        // lub klas) przechodzą tu i pokazujemy je dosłownie.
         renderError(String(st.error ?? '') || 'Import nie powiódł się.');
         return;
       }
       if (status === 'succeeded') {
-        const phaseEl = body.querySelector('#ml-studio-remote-phase');
-        if (phaseEl) phaseEl.textContent = 'Import zakończony.';
-        const bar = body.querySelector('#ml-studio-remote-bar');
-        if (bar) bar.setAttribute('value', '100');
+        body.innerHTML = `<tf-alert tone="success">Projekt zaimportowany z innej instancji.</tf-alert>`;
         toast('Projekt zaimportowany z innej instancji.', 'success');
         closeModal();
         loadAll();
@@ -7998,8 +7902,16 @@ function openProjectRemoteImportModal() {
       const phaseEl = body.querySelector('#ml-studio-remote-phase');
       if (phaseEl) phaseEl.textContent = phaseLabel(phase);
       const bar = body.querySelector('#ml-studio-remote-bar');
-      if (bar) bar.setAttribute('value', String(pct));
+      const spinner = body.querySelector('#ml-studio-remote-spinner');
       const bytesEl = body.querySelector('#ml-studio-remote-bytes');
+      // Bajty znane → pasek postępu; nieznane (build/łączenie/import) → spinner.
+      if (bytesTotal > 0) {
+        if (bar) { bar.removeAttribute('hidden'); bar.setAttribute('value', String(pct)); }
+        if (spinner) spinner.setAttribute('hidden', '');
+      } else {
+        if (bar) bar.setAttribute('hidden', '');
+        if (spinner) spinner.removeAttribute('hidden');
+      }
       if (bytesEl) bytesEl.textContent = bytesText;
       setTimeout(tick, PROJECT_TRANSFER_POLL_MS);
     };
@@ -8007,10 +7919,23 @@ function openProjectRemoteImportModal() {
   };
 
   const runImport = async () => {
-    const nameOverride = String(modal.querySelector('#ml-studio-remote-name2')?.value || '').trim();
-    state.nameOverride = nameOverride;
+    state.url = String(modal.querySelector('#ml-studio-remote-url')?.value || '').trim();
+    state.apiKey = String(modal.querySelector('#ml-studio-remote-key')?.value || '').trim();
+    state.nameOverride = String(modal.querySelector('#ml-studio-remote-name')?.value || '').trim();
+
+    const msg = body.querySelector('#ml-studio-remote-form-msg');
+    const showMsg = (text) => { if (msg) msg.innerHTML = `<tf-alert tone="danger">${escapeHtml(text)}</tf-alert>`; };
+    if (!/^https:\/\/\S+/i.test(state.url)) {
+      showMsg('Podaj poprawny URL manifestu (https://…).');
+      return;
+    }
+    if (!state.apiKey) {
+      showMsg('Podaj klucz API.');
+      return;
+    }
+
     const payload = { url: state.url, apiKey: state.apiKey };
-    if (nameOverride) payload.nameOverride = nameOverride;
+    if (state.nameOverride) payload.nameOverride = state.nameOverride;
     const importBtn = footer.querySelector('#ml-studio-remote-import');
     if (importBtn) importBtn.setAttribute('disabled', '');
     let jobId;
@@ -8018,8 +7943,9 @@ function openProjectRemoteImportModal() {
       const resp = await ApiBinary.one('mlStudioRemoteImportStartRequest', payload);
       jobId = resp.jobId ?? resp.job_id;
     } catch (err) {
+      if (!modal.isConnected) return;
       if (importBtn) importBtn.removeAttribute('disabled');
-      toast(err.message || 'Nie udało się rozpocząć importu.', 'error');
+      showMsg(err.message || 'Nie udało się rozpocząć importu.');
       return;
     }
     if (!jobId) {
