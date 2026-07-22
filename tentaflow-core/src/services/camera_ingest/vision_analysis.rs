@@ -3410,6 +3410,120 @@ fn stamp_vehicle_ids(stage_dets: &mut [(String, Vec<Detection>)], vehicles: &[Ve
     }
 }
 
+/// A cold stage resolved to its parent detections and pre-cut crops, ready for a
+/// batched forward. Built in one sequential pass so the forward (phase 2) borrows
+/// nothing from `stage_dets` (`items` owns index + crop) and independent stages
+/// overlap; results are applied back in pipeline order (phase 3).
+struct ColdStagePlan {
+    /// Detect-stage id whose `stage_dets` entry holds the parent detections.
+    parent: String,
+    stage_id: String,
+    op: CvOp,
+    ocr_mode: CvOcrMode,
+    model: String,
+    output: Option<CvStageOutput>,
+    /// Local batchable engine alias when the model resolves to one, else `None`
+    /// (mesh/remote/onnx-cv → per-crop executor fallback).
+    engine: Option<String>,
+    /// `(detection index in parent dets, crop, crop_w, crop_h, class)` per crop.
+    items: Vec<(usize, Arc<[u8]>, u32, u32, String)>,
+}
+
+/// Runs ONE cold stage's batched forward over its pre-cut crops and returns a
+/// `CachedEnrich` per crop (order == `items`). Touches no shared detection state,
+/// so several stages' forwards overlap via `join_all`; the caller applies the
+/// results sequentially in pipeline order. Batchowana sciezka lokalna dla znanych
+/// silnikow; kazdy inny przypadek (w tym zwrot None / niezgodna dlugosc batcha)
+/// schodzi na per-crop fallback, wiec porazka batcha nigdy cicho nie gubi
+/// wzbogacenia.
+async fn cold_stage_forward(
+    executor: &Arc<ModelRuntimeExecutor>,
+    model: &str,
+    op: CvOp,
+    ocr_mode: &CvOcrMode,
+    engine: Option<&str>,
+    items: &[(usize, Arc<[u8]>, u32, u32, String)],
+    crops: &[(Arc<[u8]>, u32, u32)],
+) -> Vec<CachedEnrich> {
+    match (op, engine) {
+        (CvOp::Classify, Some("nalepka-stan")) => match classify_batch_local(crops).await {
+            Some(labels) if labels.len() == crops.len() => labels
+                .into_iter()
+                .map(|stan| CachedEnrich {
+                    stan,
+                    tekst: None,
+                    tekst_conf: None,
+                    tekst_votes: Vec::new(),
+                    at: Instant::now(),
+                })
+                .collect(),
+            _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
+        },
+        (CvOp::Ocr, Some("plate-ocr"))
+            if matches!(ocr_mode, CvOcrMode::Plate | CvOcrMode::Generic) =>
+        {
+            match read_batch_local(crops).await {
+                Some(reads) if reads.len() == crops.len() => reads
+                    .into_iter()
+                    .map(|(tekst, conf)| CachedEnrich {
+                        stan: Vec::new(),
+                        tekst_conf: tekst.as_ref().map(|_| conf),
+                        tekst,
+                        tekst_votes: Vec::new(),
+                        at: Instant::now(),
+                    })
+                    .collect(),
+                _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
+            }
+        }
+        // ADR placards: submit every crop to the cross-camera ADR batcher — the
+        // rows of ALL placards (from all cameras) run as ONE forward instead of one
+        // tiny 2-row forward per placard. A crop the CRNN could not read (or whose
+        // UN failed the `snap_adr` catalog snap) keeps today's per-crop executor
+        // path, which retries the CRNN and then falls back to PP-OCRv5 — exactly
+        // `ocr_adr_local`'s semantics, so no read is ever lost to batching.
+        #[cfg(all(
+            feature = "inference-supertonic",
+            not(any(target_os = "macos", target_os = "ios"))
+        ))]
+        (CvOp::Ocr, Some("plate-ocr")) if matches!(ocr_mode, CvOcrMode::Adr) => {
+            match adr_batch_local(crops).await {
+                Some(reads) if reads.len() == crops.len() => {
+                    let mut outputs: Vec<CachedEnrich> = reads
+                        .into_iter()
+                        .map(|(tekst, conf)| CachedEnrich {
+                            stan: Vec::new(),
+                            tekst_conf: tekst.as_ref().map(|_| conf),
+                            tekst,
+                            tekst_votes: Vec::new(),
+                            at: Instant::now(),
+                        })
+                        .collect();
+                    let missed: Vec<usize> = outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, o)| o.tekst.is_none())
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !missed.is_empty() {
+                        let missed_items: Vec<_> =
+                            missed.iter().map(|&i| items[i].clone()).collect();
+                        let fallback =
+                            cold_stage_per_crop(executor, model, op, ocr_mode.clone(), &missed_items)
+                                .await;
+                        for (&i, value) in missed.iter().zip(fallback) {
+                            outputs[i] = value;
+                        }
+                    }
+                    outputs
+                }
+                _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
+            }
+        }
+        _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
+    }
+}
+
 /// COLD: generyczny interpreter etapow `stage` pipeline'u. Dla kazdego etapu
 /// wybiera detekcje rodzica pasujace klasami (`class_matches`), wycina crop z
 /// paddingiem etapu i wzbogaca: classify → `stan`, ocr → `tekst` (tryb z
@@ -3449,6 +3563,15 @@ async fn run_cold_stages(
             det.tekst = None;
         }
     }
+    // PHASE 1 (sequential, cheap): resolve each enabled cold stage to its parent
+    // detections and cut every matching crop. Reads `stage_dets` immutably. The
+    // produced `items` own their (index + crop) data, so the forwards in phase 2
+    // borrow nothing from `stage_dets` and can overlap. The pipeline validator's
+    // depth-2 invariant (`cv_pipeline::validate`: a crop stage may only hang off a
+    // detect/frame stage, never another crop stage) guarantees no cold stage reads
+    // another cold stage's output — the crops select on `bbox`/`klasa`/`track_id`,
+    // which cold stages never write — so the stages are provably independent.
+    let mut plans: Vec<ColdStagePlan> = Vec::new();
     for stage in cv_pipeline::cold_stages(pipeline) {
         let CvStageInput::Stage {
             stage_id: parent,
@@ -3482,7 +3605,7 @@ async fn run_cold_stages(
             "plate" => CvOcrMode::Plate,
             _ => CvOcrMode::Generic,
         };
-        let Some((_, dets)) = stage_dets.iter_mut().find(|(sid, _)| sid == parent) else {
+        let Some((_, dets)) = stage_dets.iter().find(|(sid, _)| sid == parent) else {
             continue;
         };
         // Zbierz WSZYSTKIE pasujace klasami detekcje tego etapu w JEDNA liste
@@ -3522,130 +3645,75 @@ async fn run_cold_stages(
             let mut ctx = RuntimeContext::new(None);
             executor.local_camera_cv_engine(&stage.model, &mut ctx)
         };
-        let crops: Vec<(Arc<[u8]>, u32, u32)> = items
+        plans.push(ColdStagePlan {
+            parent: parent.clone(),
+            stage_id: stage.stage_id.clone(),
+            op,
+            ocr_mode,
+            model: stage.model.clone(),
+            output: stage.output,
+            engine,
+            items,
+        });
+    }
+
+    // PHASE 2 (concurrent, expensive): overlap the independent stage forwards.
+    // OCR now dominates the cold path (enrich_ms≈70-86 vs detect_ms≈18-32) and the
+    // plate-OCR / ADR-OCR / classify stages operate on disjoint crops with no data
+    // dependency, so their batched forwards run at max(stage) latency instead of
+    // sum(stages). Each forward carries owned `items`/`crops` and touches no shared
+    // detection state; the process-wide batchers are built for concurrent submit.
+    let forwards = plans.iter().map(|plan| {
+        let executor = executor.clone();
+        let crops: Vec<(Arc<[u8]>, u32, u32)> = plan
+            .items
             .iter()
             .map(|(_, crop, cw, ch, _)| (crop.clone(), *cw, *ch))
             .collect();
+        async move {
+            cold_stage_forward(
+                &executor,
+                &plan.model,
+                plan.op,
+                &plan.ocr_mode,
+                plan.engine.as_deref(),
+                &plan.items,
+                &crops,
+            )
+            .await
+        }
+    });
+    let all_outputs: Vec<Vec<CachedEnrich>> = futures::future::join_all(forwards).await;
 
-        // Wynik per crop (kolejnosc == kolejnosc `items`). Batchowana sciezka
-        // lokalna dla znanych silnikow; kazdy inny przypadek (w tym zwrot None /
-        // niezgodna dlugosc batcha) schodzi na per-crop fallback, wiec porazka
-        // batcha nigdy cicho nie gubi wzbogacenia.
-        let outputs: Vec<CachedEnrich> = match (op, engine.as_deref()) {
-            (CvOp::Classify, Some("nalepka-stan")) => match classify_batch_local(&crops).await {
-                Some(labels) if labels.len() == crops.len() => labels
-                    .into_iter()
-                    .map(|stan| CachedEnrich {
-                        stan,
-                        tekst: None,
-                        tekst_conf: None,
-                        tekst_votes: Vec::new(),
-                        at: Instant::now(),
-                    })
-                    .collect(),
-                _ => {
-                    cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items).await
-                }
-            },
-            (CvOp::Ocr, Some("plate-ocr"))
-                if matches!(ocr_mode, CvOcrMode::Plate | CvOcrMode::Generic) =>
-            {
-                match read_batch_local(&crops).await {
-                    Some(reads) if reads.len() == crops.len() => reads
-                        .into_iter()
-                        .map(|(tekst, conf)| CachedEnrich {
-                            stan: Vec::new(),
-                            tekst_conf: tekst.as_ref().map(|_| conf),
-                            tekst,
-                            tekst_votes: Vec::new(),
-                            at: Instant::now(),
-                        })
-                        .collect(),
-                    _ => {
-                        cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items)
-                            .await
-                    }
-                }
-            }
-            // ADR placards: submit every crop to the cross-camera ADR batcher —
-            // the rows of ALL placards (from all cameras) run as ONE forward
-            // instead of one tiny 2-row forward per placard. A crop the CRNN
-            // could not read (or whose UN failed the `snap_adr` catalog snap)
-            // keeps today's per-crop executor path, which retries the CRNN and
-            // then falls back to PP-OCRv5 — exactly `ocr_adr_local`'s
-            // semantics, so no read is ever lost to batching.
-            #[cfg(all(
-                feature = "inference-supertonic",
-                not(any(target_os = "macos", target_os = "ios"))
-            ))]
-            (CvOp::Ocr, Some("plate-ocr")) if matches!(ocr_mode, CvOcrMode::Adr) => {
-                match adr_batch_local(&crops).await {
-                    Some(reads) if reads.len() == crops.len() => {
-                        let mut outputs: Vec<CachedEnrich> = reads
-                            .into_iter()
-                            .map(|(tekst, conf)| CachedEnrich {
-                                stan: Vec::new(),
-                                tekst_conf: tekst.as_ref().map(|_| conf),
-                                tekst,
-                                tekst_votes: Vec::new(),
-                                at: Instant::now(),
-                            })
-                            .collect();
-                        let missed: Vec<usize> = outputs
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, o)| o.tekst.is_none())
-                            .map(|(i, _)| i)
-                            .collect();
-                        if !missed.is_empty() {
-                            let missed_items: Vec<_> =
-                                missed.iter().map(|&i| items[i].clone()).collect();
-                            let fallback = cold_stage_per_crop(
-                                &executor,
-                                &stage.model,
-                                op,
-                                ocr_mode.clone(),
-                                &missed_items,
-                            )
-                            .await;
-                            for (&i, value) in missed.iter().zip(fallback) {
-                                outputs[i] = value;
-                            }
-                        }
-                        outputs
-                    }
-                    _ => {
-                        cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items)
-                            .await
-                    }
-                }
-            }
-            _ => cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items).await,
+    // PHASE 3 (sequential, cheap): apply each stage's results IN PIPELINE ORDER so
+    // OCR vote histograms, thumbnail throttles and `stan` extends stay byte-for-byte
+    // identical to the pre-concurrency sequential path. Naloz wyniki na wlasciwe
+    // detekcje po indeksie z `items` (bez pomieszania cropow). OCR: glosowanie
+    // temporalne per track stabilizuje chwiejny znak (surowy odczyt wciela sie do
+    // histogramu, `det.tekst` = zwyciezca); track bez id (track_id=0) emituje
+    // surowy odczyt wprost. Classify: `stan` przypisany od zera, bez cache-put.
+    for (plan, outputs) in plans.iter().zip(all_outputs) {
+        let Some((_, dets)) = stage_dets.iter_mut().find(|(sid, _)| sid == &plan.parent) else {
+            continue;
         };
-
-        // Naloz wyniki na wlasciwe detekcje po indeksie z `items` (bez pomieszania
-        // cropow). OCR: glosowanie temporalne per track stabilizuje chwiejny znak
-        // (surowy odczyt wciela sie do histogramu, `det.tekst` = zwyciezca); track
-        // bez id (track_id=0) emituje surowy odczyt wprost. Classify: `stan`
-        // przypisany od zera, bez cache-put (kazda klatka czyta na nowo).
-        let (min_conf, min_agreement) = ocr_gate_thresholds(&ocr_mode);
+        let (min_conf, min_agreement) = ocr_gate_thresholds(&plan.ocr_mode);
         // Key thumbnail throttling by the READ MODE (plate vs adr) so a plate and
         // an ADR read on the same track_id keep independent best-confidence
         // baselines and each produces its own scene thumbnail.
-        let thumb_mode_key = match ocr_mode {
+        let thumb_mode_key = match &plan.ocr_mode {
             CvOcrMode::Adr => "adr",
             CvOcrMode::Plate | CvOcrMode::Generic => "plate",
         };
         // Lazily built full-scene RGB frame (whole camera image), produced at most
         // once per stage and only when a capture actually fires — the NV12
         // download/convert on the zero-copy path is not free.
-        for ((idx, _, _, _, _), value) in items.iter().zip(outputs) {
+        for ((idx, _, _, _, _), value) in plan.items.iter().zip(outputs) {
             let det = &mut dets[*idx];
-            if op == CvOp::Ocr && det.track_id > 0 {
+            if plan.op == CvOp::Ocr && det.track_id > 0 {
                 let read = value.tekst.map(|t| (t, value.tekst_conf.unwrap_or(0.0)));
                 let (tekst, conf) = enrich_cache_vote_ocr(
                     camera_id,
-                    &stage.stage_id,
+                    &plan.stage_id,
                     det.track_id,
                     read,
                     min_conf,
@@ -3670,7 +3738,7 @@ async fn run_cold_stages(
                 det.tekst = tekst;
                 det.tekst_conf = conf;
             } else {
-                apply_stage_output(det, stage.output, &value);
+                apply_stage_output(det, plan.output, &value);
             }
         }
     }
