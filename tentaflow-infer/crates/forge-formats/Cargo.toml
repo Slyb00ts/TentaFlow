@@ -10,6 +10,10 @@ rust-version.workspace = true
 forge-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 half = { workspace = true }
 memmap2 = { workspace = true }
 ron = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -122,7 +122,6 @@ def gemm_f16_impl[BM: Int, NW: Int](
 
     xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
     ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
-
     xrow = tid // 4
     kc8 = (tid % 4) * 8
     var xr0 = t0 + xrow
@@ -646,6 +645,15 @@ def gemm_nvfp4_impl[BM: Int, NW: Int](
 
     xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
     ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    comptime e2m1_vals = SIMD[DType.float32, 16](
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    )
+    comptime if BM == 32:
+        if tid < 16:
+            lut[tid] = e2m1_vals[tid]
+        barrier()
 
     xrow = tid // 4
     kc8 = (tid % 4) * 8
@@ -729,7 +737,12 @@ def gemm_nvfp4_impl[BM: Int, NW: Int](
             lo = qv[wp] & 0x0F
             hi = qv[wp] >> 4
             codes = lo.interleave(hi)
-            wv = (_e2m1x8(codes) * sc[wp]).cast[DType.float16]()
+            var wv = SIMD[DType.float16, 8]()
+            comptime if BM == 32:
+                comptime for j in range(8):
+                    wv[j] = Float16(lut[Int(codes[j])] * sc[wp])
+            else:
+                wv = (_e2m1x8(codes) * sc[wp]).cast[DType.float16]()
             (wdst + (s % 2) * WTILE + wp * (NT // 4) * LDW).store[
                 width=8, alignment=16
             ](wv)
@@ -3166,6 +3179,8 @@ comptime gemm_q4_k_i8mma_big = gemm_i8mma_impl[128, 128, 16, 1]
 
 comptime gemm_f16_out_f32 = gemm_f16_out_f32_impl[128, 8]
 comptime gemm_f16_out_f32_bm64 = gemm_f16_out_f32_impl[64, 4]
+# Małe batche dekodu wykorzystują dwa warpy i nie liczą pustej połowy kafla BM64.
+comptime gemm_f16_out_f32_bm32 = gemm_f16_out_f32_impl[32, 2]
 comptime gemm_q8_0_out_f32 = gemm_q8_0_out_f32_impl[128, 8]
 comptime gemm_q8_0_out_f32_bm64 = gemm_q8_0_out_f32_impl[64, 4]
 comptime gemm_f16 = gemm_f16_impl[128, 8]
@@ -3178,6 +3193,7 @@ comptime gemm_q6_k_f16 = gemm_q6_k_impl[128, 8]
 comptime gemm_q6_k_f16_bm64 = gemm_q6_k_impl[64, 4]
 comptime gemm_nvfp4_f16 = gemm_nvfp4_impl[128, 8]
 comptime gemm_nvfp4_f16_bm64 = gemm_nvfp4_impl[64, 4]
+comptime gemm_nvfp4_f16_bm32 = gemm_nvfp4_impl[32, 2]
 comptime gemm_q5_k_f16 = gemm_q5_k_impl[128, 8]
 comptime gemm_q5_k_f16_bm64 = gemm_q5_k_impl[64, 4]
 comptime gemm_q3_k_f16 = gemm_q3_k_impl[128, 8]

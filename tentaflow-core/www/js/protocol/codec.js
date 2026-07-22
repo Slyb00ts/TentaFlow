@@ -3757,6 +3757,264 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(ProjectExportStartRequest) — starts a background job
+   * that packs the whole ML Studio project (datasets, classes, optional models and
+   * history) into an archive. Poll progress via mlStudioProjectExportStatusRequest.
+   * payload: { projectId, includeModels, includeHistory }.
+   */
+  mlStudioProjectExportStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectExportStartRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      Boolean(payload.includeModels ?? payload.include_models ?? false),
+      Boolean(payload.includeHistory ?? payload.include_history ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectExportStatusRequest). payload: { jobId }. */
+  mlStudioProjectExportStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectExportStatusRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(ProjectImportUploadChunkRequest) — one fragment of a
+   * multi-GB project archive. The client splits the file into seq (0..totalChunks)
+   * parts under a shared uploadId. payload: { uploadId, seq, totalChunks, filename, bytes }.
+   */
+  mlStudioProjectImportUploadChunkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const raw = payload.bytes;
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
+    const body = _wasm.encodeMlStudioProjectImportUploadChunkRequest(
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+      (payload.seq ?? 0) >>> 0,
+      (payload.totalChunks ?? payload.total_chunks ?? 0) >>> 0,
+      String(payload.filename ?? ''),
+      bytes,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectImportUploadStatusRequest). payload: { uploadId }. */
+  mlStudioProjectImportUploadStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectImportUploadStatusRequest(
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectImportPreviewRequest). payload: { uploadId }. */
+  mlStudioProjectImportPreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectImportPreviewRequest(
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(ProjectImportApplyRequest) — commits an uploaded
+   * archive. mode: 'new_project' | 'merge'. The three optional apply fields encode
+   * as undefined (None) when absent, NOT empty string.
+   * payload: { uploadId, mode, nameOverride?, targetProjectId?, targetDatasetId? }.
+   */
+  mlStudioProjectImportApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const nameOverride = payload.nameOverride ?? payload.name_override;
+    const targetProjectId = payload.targetProjectId ?? payload.target_project_id;
+    const targetDatasetId = payload.targetDatasetId ?? payload.target_dataset_id;
+    const body = _wasm.encodeMlStudioProjectImportApplyRequest(
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+      String(payload.mode ?? ''),
+      nameOverride != null && nameOverride !== '' ? String(nameOverride) : undefined,
+      targetProjectId != null && targetProjectId !== '' ? String(targetProjectId) : undefined,
+      targetDatasetId != null && targetDatasetId !== '' ? String(targetDatasetId) : undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectImportStatusRequest). payload: { jobId }. */
+  mlStudioProjectImportStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectImportStatusRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectImportCancelRequest). payload: { uploadId }. */
+  mlStudioProjectImportCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectImportCancelRequest(
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecordingsListRequest) — lists recordings filtered by
+   * camera and time range (unix ms). Absent filters encode as undefined (None).
+   * payload: { cameraId?, dateFromMs?, dateToMs?, limit }.
+   */
+  mlStudioRecordingsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const cameraId = payload.cameraId ?? payload.camera_id;
+    const dateFromMs = payload.dateFromMs ?? payload.date_from_ms;
+    const dateToMs = payload.dateToMs ?? payload.date_to_ms;
+    const body = _wasm.encodeMlStudioRecordingsListRequest(
+      cameraId != null && cameraId !== '' ? String(cameraId) : undefined,
+      dateFromMs != null ? Number(dateFromMs) : undefined,
+      dateToMs != null ? Number(dateToMs) : undefined,
+      (payload.limit ?? 0) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogImportRecordingsRequest) — imports recordings into
+   * a recognition dataset: extracts frames at fps, optional autolabel. collision:
+   * 'suffix' | 'skip'. payload: { projectId, datasetId, recordingRefs, fps, autolabel, collision }.
+   */
+  mlStudioRecogImportRecordingsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const refs = Array.isArray(payload.recordingRefs ?? payload.recording_refs)
+      ? (payload.recordingRefs ?? payload.recording_refs).map((r) => String(r))
+      : [];
+    const body = _wasm.encodeMlStudioRecogImportRecordingsRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      refs,
+      (payload.fps ?? 5) >>> 0,
+      Boolean(payload.autolabel ?? false),
+      String(payload.collision ?? 'suffix'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(RecogImportRecordingsStatusRequest). payload: { jobId }. */
+  mlStudioRecogImportRecordingsStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogImportRecordingsStatusRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RemoteImportPreviewRequest) — fetches ONLY the remote
+   * share manifest from an unpaired instance for a cheap preview (no archive
+   * download). payload: { url, apiKey }.
+   */
+  mlStudioRemoteImportPreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRemoteImportPreviewRequest(
+      String(payload.url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RemoteImportStartRequest) — downloads the remote
+   * archive and imports it as a NEW local project. payload: { url, apiKey, nameOverride? }.
+   */
+  mlStudioRemoteImportStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const nameOverride = payload.nameOverride ?? payload.name_override;
+    const body = _wasm.encodeMlStudioRemoteImportStartRequest(
+      String(payload.url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+      nameOverride == null ? undefined : String(nameOverride),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(RemoteImportStatusRequest). payload: { jobId }. */
+  mlStudioRemoteImportStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRemoteImportStatusRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
    * with optional tag/source/status filters.
    * payload: { tag?, source?, status? }

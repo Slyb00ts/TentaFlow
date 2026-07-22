@@ -7,6 +7,7 @@
 
 use super::stats::{ProposerStats, ProposerStatsSnapshot};
 use super::{Proposer, SeqContext};
+use forge_types::{ForgeError, Result};
 
 /// One contiguous run of draft tokens attributed to a single proposer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +41,37 @@ impl CascadeComposer {
     /// Compose one draft over `ctx_tokens` under a total token budget.
     /// Sleeping proposers are skipped but keep receiving `observe`, so their
     /// index is current when they wake.
-    pub fn compose(&mut self, ctx_tokens: &[u32], budget: usize) -> (Vec<u32>, Vec<DraftSegment>) {
+    pub fn compose(
+        &mut self,
+        ctx_tokens: &[u32],
+        budget: usize,
+    ) -> Result<(Vec<u32>, Vec<DraftSegment>)> {
+        if self.slots.len() == 1 {
+            let slot = &mut self.slots[0];
+            if slot.stats.is_sleeping() {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            let kind = slot.proposer.kind();
+            let proposal = slot
+                .proposer
+                .propose(&SeqContext::new(ctx_tokens), budget)?;
+            if proposal.nodes().iter().any(|node| node.source != kind) {
+                return Err(ForgeError::Scheduler(format!(
+                    "speculative proposer '{}' returned a node with a different source",
+                    kind.as_str()
+                )));
+            }
+            let mut tokens = proposal.linear_tokens()?;
+            tokens.truncate(budget);
+            let segments = (!tokens.is_empty())
+                .then_some(DraftSegment {
+                    proposer_idx: 0,
+                    len: tokens.len(),
+                })
+                .into_iter()
+                .collect();
+            return Ok((tokens, segments));
+        }
         let mut extended = ctx_tokens.to_vec();
         let base = extended.len();
         let mut segments = Vec::new();
@@ -53,9 +84,17 @@ impl CascadeComposer {
                 continue;
             }
             let remaining = budget - used;
-            let mut tokens = slot
+            let kind = slot.proposer.kind();
+            let proposal = slot
                 .proposer
-                .propose(&SeqContext::new(&extended), remaining);
+                .propose(&SeqContext::new(&extended), remaining)?;
+            if proposal.nodes().iter().any(|node| node.source != kind) {
+                return Err(ForgeError::Scheduler(format!(
+                    "speculative proposer '{}' returned a node with a different source",
+                    kind.as_str()
+                )));
+            }
+            let mut tokens = proposal.linear_tokens()?;
             tokens.truncate(remaining);
             if tokens.is_empty() {
                 continue;
@@ -66,7 +105,7 @@ impl CascadeComposer {
             });
             extended.extend_from_slice(&tokens);
         }
-        (extended.split_off(base), segments)
+        Ok((extended.split_off(base), segments))
     }
 
     /// Attribute the accepted prefix across segments in draft order: a
@@ -95,7 +134,7 @@ impl CascadeComposer {
     pub fn stats(&self) -> Vec<ProposerStatsSnapshot> {
         self.slots
             .iter()
-            .map(|slot| slot.stats.snapshot(slot.proposer.name()))
+            .map(|slot| slot.stats.snapshot(slot.proposer.kind().as_str()))
             .collect()
     }
 }

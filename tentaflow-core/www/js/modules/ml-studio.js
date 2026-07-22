@@ -30,6 +30,9 @@ import '/js/components/tf-progress-bar.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-tag-input.js';
+import '/js/components/tf-alert.js';
+import '/js/components/tf-checkbox.js';
+import '/js/components/tf-key-value.js';
 
 let projects = [];
 let projectTypes = [];
@@ -195,6 +198,8 @@ const MlStudioScreen = {
         <div class="actions" id="ml-studio-actions">
           <tf-button variant="ghost" icon="refresh" id="ml-studio-refresh">Odśwież</tf-button>
           <tf-button variant="outline" icon="cpu" id="ml-studio-jobs">Joby</tf-button>
+          <tf-button variant="outline" icon="cloud" id="ml-studio-import">Importuj projekt</tf-button>
+          <tf-button variant="outline" icon="external-link" id="ml-studio-import-url">Importuj z URL</tf-button>
           <tf-button variant="primary" icon="plus" id="ml-studio-new">Nowy projekt</tf-button>
         </div>
       </div>
@@ -229,6 +234,8 @@ const MlStudioScreen = {
     byId('ml-studio-refresh')?.addEventListener('click', loadAll);
     byId('ml-studio-new')?.addEventListener('click', () => Router.navigate('ml-studio', { create: '1' }));
     byId('ml-studio-jobs')?.addEventListener('click', () => Router.navigate('ml-studio', { jobs: '1' }));
+    byId('ml-studio-import')?.addEventListener('click', () => openProjectImportModal());
+    byId('ml-studio-import-url')?.addEventListener('click', () => openProjectRemoteImportModal());
 
     const filters = byId('ml-studio-filters');
     filters?.addEventListener('change', (e) => {
@@ -1251,11 +1258,28 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
     </div>
     <div class="ml-studio-section-card">
       <div class="ml-studio-section-card-head">
+        <div class="title">${sprite('transform')} Przenieś projekt <span class="ml-studio-section-sub">— eksport do archiwum i import na innym węźle (poza mesh)</span></div>
+        <tf-button variant="outline" icon="download" id="ml-studio-ov-export">Eksportuj projekt</tf-button>
+      </div>
+      <p class="ml-studio-section-sub">Spakuj projekt (schemat, dane, opcjonalnie modele i historię treningów) do pobieralnego archiwum, a następnie zaimportuj je na innym węźle TentaFlow, który nie jest w tym samym meshu.</p>
+    </div>
+    <div class="ml-studio-section-card">
+      <div class="ml-studio-section-card-head">
+        <div class="title">${sprite('share')} Udostępnij projekt <span class="ml-studio-section-sub">— import bezpośrednio z innej instancji przez URL (poza mesh)</span></div>
+        <tf-button variant="outline" icon="share" id="ml-studio-ov-share-project">Udostępnij projekt</tf-button>
+      </div>
+      <p class="ml-studio-section-sub">Wygeneruj link do manifestu tego projektu. Operator drugiej instancji wkleja go razem z kluczem API w „Importuj z URL", a projekt ląduje u niego jako nowy, lokalny projekt — bez ręcznego pobierania archiwum.</p>
+    </div>
+    <div class="ml-studio-section-card">
+      <div class="ml-studio-section-card-head">
         <div class="title">${sprite('play')} Szybkie skróty</div>
       </div>
       <div class="ml-studio-shortcut-grid" id="ml-studio-ov-shortcuts"></div>
     </div>
   `;
+
+  byId('ml-studio-ov-export')?.addEventListener('click', () => openProjectExportModal(p));
+  byId('ml-studio-ov-share-project')?.addEventListener('click', () => openProjectShareModal(p));
 
   // Akcje członków (owner): zarządzanie dostępem + "Zaproś" — oba na ekran share.
   byId('ml-studio-ov-share')?.addEventListener('click', shareNav);
@@ -3130,6 +3154,11 @@ function renderRecogDataTab(panel, p) {
             <span class="st-name">Kamera TentaFlow</span>
             <span class="st-desc">Klatki z kamery na żywo przez TentaVision.</span>
           </button>
+          <button type="button" class="ml-studio-source-tile" data-source="recordings">
+            <span class="st-ico">${sprite('record')}</span>
+            <span class="st-name">Import z nagrań TentaVision</span>
+            <span class="st-desc">Wytnij klatki z nagrań i dołącz do istniejącego zbioru — z auto-etykietami modeli.</span>
+          </button>
         </div>
 
         <div class="ml-studio-source-body" id="ml-studio-source-upload">
@@ -3153,6 +3182,16 @@ function renderRecogDataTab(panel, p) {
           <div class="ml-studio-callout">
             <span class="co-ico">${sprite('info')}</span>
             <p>Pobieranie klatek z kamer na żywo odbywa się w <strong>TentaVision</strong> — tam wybierzesz kamerę i zapiszesz nagrania jako materiał źródłowy, a następnie wczytasz je tutaj jako folder na serwerze. Bezpośrednie wpięcie kamery w ML Studio nie jest jeszcze podłączone.</p>
+          </div>
+        </div>
+
+        <div class="ml-studio-source-body" id="ml-studio-source-recordings" hidden>
+          <div class="ml-studio-callout">
+            <span class="co-ico">${sprite('info')}</span>
+            <p>Wybierz nagrania z <strong>TentaVision</strong>, wytnij z nich klatki i dołącz do <strong>istniejącego, oznaczonego zbioru</strong>. Nowe klatki mogą zostać wstępnie oznaczone przez modele (tablice ADR, tablice rejestracyjne, naklejki i ich stan) — człowiek tylko poprawia. Zatwierdzona praca pozostaje nietknięta.</p>
+          </div>
+          <div style="margin-top:12px">
+            <tf-button variant="primary" icon="plus" id="ml-studio-recog-recordings-open">Wybierz nagrania i importuj…</tf-button>
           </div>
         </div>
 
@@ -3206,6 +3245,7 @@ function renderRecogDataTab(panel, p) {
     upload: byId('ml-studio-source-upload'),
     folder: byId('ml-studio-source-folder'),
     camera: byId('ml-studio-source-camera'),
+    recordings: byId('ml-studio-source-recordings'),
   };
   const buildFields = byId('ml-studio-source-fields');
   const buildProgress = byId('ml-studio-recog-build-progress');
@@ -3214,15 +3254,18 @@ function renderRecogDataTab(panel, p) {
       el.classList.toggle('selected', el.getAttribute('data-source') === src);
     });
     for (const [key, el] of Object.entries(sourceBodies)) { if (el) el.hidden = key !== src; }
-    // Kamera nie buduje datasetu w ML Studio — chowamy pola budowy, by nie udawać akcji.
-    const cameraOnly = src === 'camera';
-    if (buildFields) buildFields.hidden = cameraOnly;
-    if (buildProgress) buildProgress.hidden = cameraOnly;
+    // Kamera oraz import z nagrań nie budują datasetu tą ścieżką (nagrania mają
+    // własny modal) — chowamy pola budowy, by nie udawać akcji.
+    const externalPath = src === 'camera' || src === 'recordings';
+    if (buildFields) buildFields.hidden = externalPath;
+    if (buildProgress) buildProgress.hidden = externalPath;
   }
   byId('ml-studio-source-tiles')?.querySelectorAll('.ml-studio-source-tile').forEach((el) => {
     el.addEventListener('click', () => selectSource(el.getAttribute('data-source')));
   });
   selectSource('upload');
+
+  byId('ml-studio-recog-recordings-open')?.addEventListener('click', () => openRecogImportRecordingsModal(pid));
 
   let recogBuildFiles = [];
   byId('ml-studio-recog-build-files')?.addEventListener('change', (e) => {
@@ -3416,6 +3459,482 @@ async function loadDataPreview(pid) {
     if (gallery) gallery.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`;
     renderSplit(0, '');
   }
+}
+
+// Modal: import klatek z nagrań TentaVision do ISTNIEJĄCEGO zbioru COCO.
+// Wybierasz nagrania (tabela + filtry), fps, auto-etykietowanie i politykę kolizji;
+// klatki są wycinane, wstępnie etykietowane modelami i dopisywane jako NIEzatwierdzone
+// (approved:false), więc zatwierdzona praca człowieka pozostaje nietknięta.
+function openRecogImportRecordingsModal(pid) {
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('size', 'lg');
+  modal.setAttribute('title', 'Import klatek z nagrań TentaVision');
+
+  const body = document.createElement('div');
+  body.setAttribute('slot', 'body');
+  body.className = 'ml-studio-export-body';
+
+  const footer = document.createElement('div');
+  footer.setAttribute('slot', 'footer');
+  footer.className = 'ml-studio-export-footer';
+
+  modal.appendChild(body);
+  modal.appendChild(footer);
+  modal.addEventListener('close', () => modal.remove(), { once: true });
+  const closeModal = () => {
+    modal.removeAttribute('open');
+    modal.dispatchEvent(new CustomEvent('close', { bubbles: true }));
+  };
+
+  // Single source of truth for the multi-select. tf-table `selectable` cannot be
+  // driven programmatically (the `.selected` class lives in shadow DOM with no
+  // getter/setter and select-all only emits an event), so we own selection here as
+  // a Set of recordingRef, driven by row-click and rendered as a checkbox column.
+  const selected = new Set();
+  const state = {
+    recordings: [], datasets: [], fps: 5, collision: 'suffix',
+    targetDatasetId: '', cameraFilter: '', dateFrom: '', dateTo: '',
+  };
+
+  const PHASE_LABELS = {
+    extracting: 'Ekstrakcja klatek…',
+    labeling: 'Etykietowanie klatek…',
+    publishing: 'Publikacja do zbioru…',
+  };
+
+  const refKey = (r) => r.recordingRef ?? r.recording_ref ?? '';
+  const isSnapshot = (r) => (r.kind ?? '') === 'snapshot';
+  const durationOf = (r) => r.durationMs ?? r.duration_ms ?? null;
+
+  const formatDuration = (ms) => {
+    const s = Math.round(Number(ms) / 1000);
+    if (!Number.isFinite(s) || s <= 0) return '—';
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return m > 0 ? `${m} min ${sec} s` : `${sec} s`;
+  };
+
+  // Snapshots are one frame each and fps does not apply; clips estimate from
+  // durationMs, and a null duration must NOT fabricate a frame count.
+  const estFrames = (r, fps) => {
+    if (isSnapshot(r)) return 1;
+    const dur = durationOf(r);
+    if (dur == null) return null;
+    return Math.max(1, Math.round((Number(dur) / 1000) * fps));
+  };
+
+  const visibleRecordings = () => state.recordings.filter((r) => {
+    if (state.cameraFilter && String(r.cameraId ?? r.camera_id ?? '') !== state.cameraFilter) return false;
+    const created = Number(r.createdAt ?? r.created_at ?? 0);
+    if (state.dateFrom) {
+      const from = Date.parse(`${state.dateFrom}T00:00:00`);
+      if (Number.isFinite(from) && created < from) return false;
+    }
+    if (state.dateTo) {
+      const to = Date.parse(`${state.dateTo}T23:59:59.999`);
+      if (Number.isFinite(to) && created > to) return false;
+    }
+    return true;
+  });
+
+  const preflight = () => {
+    const chosen = state.recordings.filter((r) => selected.has(refKey(r)));
+    let clips = 0;
+    let snaps = 0;
+    let clipFrames = 0;
+    let unknownClips = 0;
+    for (const r of chosen) {
+      if (isSnapshot(r)) { snaps += 1; continue; }
+      clips += 1;
+      const f = estFrames(r, state.fps);
+      if (f == null) unknownClips += 1;
+      else clipFrames += f;
+    }
+    return { chosen: chosen.length, clips, snaps, clipFrames, unknownClips, totalFrames: clipFrames + snaps };
+  };
+
+  const checkCell = (on) => on
+    ? `<span class="tf-chip accent" style="padding:2px 6px;display:inline-flex">${sprite('check')}</span>`
+    : '<span style="display:inline-block;width:16px;height:16px;border:1.5px solid var(--border,#ccc);border-radius:4px"></span>';
+
+  const updatePreflight = () => {
+    const pf = preflight();
+    const selcount = body.querySelector('#ml-studio-rec-selcount');
+    if (selcount) selcount.textContent = pf.chosen ? `Wybrano: ${formatNumber(pf.chosen)}` : 'Nic nie wybrano';
+    const kv = body.querySelector('#ml-studio-rec-preflight');
+    if (kv) {
+      kv.entries = [
+        { key: 'Wybrane nagrania', value: formatNumber(pf.chosen) },
+        {
+          key: 'Klipy × fps',
+          value: pf.clips
+            ? `${formatNumber(pf.clips)} × ${state.fps} fps → ~${formatNumber(pf.clipFrames)} klatek${pf.unknownClips ? ` (+${pf.unknownClips} o nieznanej długości)` : ''}`
+            : '—',
+        },
+        { key: 'Zdjęcia', value: pf.snaps ? `${formatNumber(pf.snaps)} (po 1 klatce, fps nie dotyczy)` : '—' },
+        { key: 'Razem klatek (szac.)', value: `~${formatNumber(pf.totalFrames)}${pf.unknownClips ? ' + nieznane' : ''}` },
+      ];
+    }
+    const startBtn = footer.querySelector('#ml-studio-rec-start');
+    if (startBtn) {
+      const ok = pf.chosen > 0 && !!state.targetDatasetId && state.datasets.length > 0;
+      if (ok) startBtn.removeAttribute('disabled');
+      else startBtn.setAttribute('disabled', '');
+    }
+  };
+
+  const renderTableRows = () => {
+    const table = body.querySelector('#ml-studio-rec-table');
+    if (!table) return;
+    const vis = visibleRecordings();
+    table.rows = vis.map((r) => {
+      const ref = refKey(r);
+      const snap = isSnapshot(r);
+      const created = Number(r.createdAt ?? r.created_at ?? 0);
+      const dur = durationOf(r);
+      const durText = snap
+        ? '— (pojedyncza klatka)'
+        : (dur == null ? 'nieznana długość' : formatDuration(dur));
+      const f = estFrames(r, state.fps);
+      const framesText = snap
+        ? '1 · fps nie dotyczy'
+        : (f == null ? 'nieznana długość' : `~${formatNumber(f)}`);
+      const plate = r.plateText ?? r.plate_text;
+      const adr = r.adrText ?? r.adr_text;
+      return {
+        recordingRef: ref,
+        sel: checkCell(selected.has(ref)),
+        kind: { status: snap ? 'info' : 'accent', label: snap ? 'zdjęcie' : 'klip' },
+        camera: String(r.cameraId ?? r.camera_id ?? '—'),
+        created: created ? new Date(created).toLocaleString('pl-PL') : '—',
+        duration: durText,
+        frames: framesText,
+        size: formatFileSize(r.fileSizeBytes ?? r.file_size_bytes),
+        plate: plate ? String(plate) : '—',
+        adr: adr ? String(adr) : '—',
+      };
+    });
+    const cbAll = body.querySelector('#ml-studio-rec-selectall');
+    if (cbAll) {
+      const visRefs = vis.map(refKey);
+      const selCount = visRefs.filter((ref) => selected.has(ref)).length;
+      cbAll.indeterminate = selCount > 0 && selCount < visRefs.length;
+      cbAll.checked = visRefs.length > 0 && selCount === visRefs.length;
+    }
+    updatePreflight();
+  };
+
+  const renderError = (message) => {
+    body.innerHTML = `<div class="ml-studio-export-error">${sprite('alert')} <span>${escapeHtml(message || 'Import nie powiódł się.')}</span></div>`;
+    footer.innerHTML = '<tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>';
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  const renderProgress = () => {
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:10px;padding:6px 0">
+        <div id="ml-studio-rec-phase" style="text-align:left">Ekstrakcja klatek…</div>
+        <tf-progress-bar id="ml-studio-rec-bar" value="0" tone="accent"></tf-progress-bar>
+        <tf-key-value id="ml-studio-rec-counts"></tf-key-value>
+      </div>
+    `;
+    footer.innerHTML = '<tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>';
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  // Per-recording outcomes on completion (and on failure). A skipped clip (missing
+  // or purged file) stays visible with its verbatim reason — never collapsed away.
+  const renderOutcomes = (st) => {
+    const failed = String(st.status || '') === 'failed';
+    const outcomes = Array.isArray(st.outcomes) ? st.outcomes : [];
+    const framesExtracted = Number(st.framesExtracted ?? st.frames_extracted ?? 0);
+    const framesLabeled = Number(st.framesLabeled ?? st.frames_labeled ?? 0);
+    const imagesAdded = Number(st.imagesAdded ?? st.images_added ?? 0);
+    const detections = Number(st.detections ?? 0);
+    const errMsg = String(st.error ?? '');
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div style="display:flex;align-items:center;gap:8px">
+          ${failed ? sprite('alert') : sprite('check')}
+          <strong>${failed ? 'Import zakończony z błędem' : 'Import zakończony'}</strong>
+          <tf-badge tone="${failed ? 'danger' : 'success'}" value="${failed ? 'Błąd' : 'Gotowe'}"></tf-badge>
+        </div>
+        ${failed && errMsg ? `<tf-alert tone="danger" title="Błąd serwera" message="${escapeAttr(errMsg)}"></tf-alert>` : ''}
+        <tf-key-value id="ml-studio-rec-summary"></tf-key-value>
+        <div id="ml-studio-rec-outcomes-host"></div>
+      </div>
+    `;
+    footer.innerHTML = '<tf-button variant="primary" data-transfer-close>Zamknij</tf-button>';
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+
+    const sum = body.querySelector('#ml-studio-rec-summary');
+    if (sum) {
+      sum.entries = [
+        { key: 'Klatki wycięte', value: formatNumber(framesExtracted) },
+        { key: 'Klatki oznaczone', value: formatNumber(framesLabeled) },
+        { key: 'Obrazy dodane (NIEzatwierdzone)', value: formatNumber(imagesAdded) },
+        { key: 'Wykrycia', value: formatNumber(detections) },
+      ];
+    }
+    const host = body.querySelector('#ml-studio-rec-outcomes-host');
+    if (host) {
+      if (!outcomes.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'info');
+        empty.setAttribute('title', 'Brak rozbicia per nagranie');
+        empty.setAttribute('message', 'Serwer nie zwrócił szczegółów dla poszczególnych nagrań.');
+        host.appendChild(empty);
+      } else {
+        const table = document.createElement('tf-table');
+        table.setAttribute('variant', 'lined');
+        table.innerHTML = `
+          <tf-column key="stan" label="Stan" renderer="chip"></tf-column>
+          <tf-column key="recording" label="Nagranie"></tf-column>
+          <tf-column key="frames" label="Klatki" renderer="num"></tf-column>
+          <tf-column key="detections" label="Wykrycia" renderer="num"></tf-column>
+          <tf-column key="skippedFrames" label="Pominięte klatki" renderer="num"></tf-column>
+          <tf-column key="reason" label="Powód pominięcia"></tf-column>
+        `;
+        table.rows = outcomes.map((o) => {
+          const skipped = o.skipped ?? null;
+          return {
+            stan: skipped ? { status: 'warn', label: 'pominięto' } : { status: 'ok', label: 'ok' },
+            recording: String(o.recordingRef ?? o.recording_ref ?? '—'),
+            frames: formatNumber(o.frames ?? 0),
+            detections: formatNumber(o.detections ?? 0),
+            skippedFrames: formatNumber(o.skippedFrames ?? o.skipped_frames ?? 0),
+            reason: skipped ? String(skipped) : '—',
+          };
+        });
+        host.appendChild(table);
+      }
+    }
+    // Odśwież galerię/statystyki zakładki „Dane" — doszły nowe obrazy do zbioru.
+    loadDataPreview(pid);
+  };
+
+  const pollImport = (jobId) => {
+    const tick = async () => {
+      if (!modal.isConnected) return;
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioRecogImportRecordingsStatusRequest', { jobId });
+      } catch (err) {
+        if (!modal.isConnected) return;
+        renderError(err.message || 'Błąd protokołu importu.');
+        return;
+      }
+      if (!modal.isConnected) return;
+      const status = String(st.status || 'running');
+      if (status === 'succeeded' || status === 'failed') {
+        renderOutcomes(st);
+        return;
+      }
+      const phase = String(st.phase ?? '');
+      const recTotal = Number(st.recordingsTotal ?? st.recordings_total ?? 0);
+      const recDone = Number(st.recordingsDone ?? st.recordings_done ?? 0);
+      const phaseEl = body.querySelector('#ml-studio-rec-phase');
+      if (phaseEl) phaseEl.textContent = PHASE_LABELS[phase] || 'Przetwarzanie…';
+      const bar = body.querySelector('#ml-studio-rec-bar');
+      if (bar) bar.setAttribute('value', String(recTotal ? Math.min(100, Math.round((recDone / recTotal) * 100)) : 0));
+      const kv = body.querySelector('#ml-studio-rec-counts');
+      if (kv) {
+        kv.entries = [
+          { key: 'Nagrania', value: `${formatNumber(recDone)} / ${formatNumber(recTotal)}` },
+          { key: 'Klatki wycięte', value: formatNumber(st.framesExtracted ?? st.frames_extracted ?? 0) },
+          { key: 'Klatki oznaczone', value: formatNumber(st.framesLabeled ?? st.frames_labeled ?? 0) },
+          { key: 'Obrazy dodane', value: formatNumber(st.imagesAdded ?? st.images_added ?? 0) },
+          { key: 'Wykrycia', value: formatNumber(st.detections ?? 0) },
+        ];
+      }
+      setTimeout(tick, PROJECT_TRANSFER_POLL_MS);
+    };
+    tick();
+  };
+
+  const startImport = async () => {
+    const refs = Array.from(selected);
+    if (!refs.length) { toast('Wybierz przynajmniej jedno nagranie.', 'error'); return; }
+    if (!state.targetDatasetId) { toast('Wybierz zbiór docelowy.', 'error'); return; }
+    const autolabel = modal.querySelector('#ml-studio-rec-autolabel')?.checked === true;
+    const startBtn = footer.querySelector('#ml-studio-rec-start');
+    if (startBtn) startBtn.setAttribute('disabled', '');
+    let jobId;
+    try {
+      const resp = await ApiBinary.one('mlStudioRecogImportRecordingsRequest', {
+        projectId: pid,
+        datasetId: state.targetDatasetId,
+        recordingRefs: refs,
+        fps: state.fps,
+        autolabel,
+        collision: state.collision,
+      });
+      jobId = resp.jobId ?? resp.job_id;
+    } catch (err) {
+      if (startBtn) startBtn.removeAttribute('disabled');
+      toast(err.message || 'Nie udało się uruchomić importu.', 'error');
+      return;
+    }
+    if (!jobId) {
+      renderError('Serwer nie zwrócił identyfikatora zadania importu.');
+      return;
+    }
+    renderProgress();
+    pollImport(jobId);
+  };
+
+  const renderForm = () => {
+    const noDatasets = state.datasets.length === 0;
+    const noRecordings = state.recordings.length === 0;
+    body.innerHTML = `
+      <p class="ml-studio-export-intro">Wytnij klatki z nagrań TentaVision i dołącz je do <strong>istniejącego</strong> zbioru oznaczeń. Nowe klatki mogą zostać wstępnie oznaczone przez modele (tablice ADR, tablice rejestracyjne, naklejki i ich stan) — człowiek tylko poprawia. Zatwierdzona praca pozostaje nietknięta.</p>
+      ${noDatasets ? '<tf-alert tone="warning" title="Brak zbioru docelowego" message="Ten import tylko UZUPEŁNIA istniejący zbiór COCO. Zarejestruj lub zbuduj dataset w zakładce „Dane", zanim zaimportujesz klatki z nagrań."></tf-alert>' : ''}
+      <div style="display:flex;flex-direction:column;gap:14px;margin-top:12px">
+        <tf-select id="ml-studio-rec-dataset" label="Zbiór docelowy (istniejący)" placeholder="wybierz zbiór COCO"></tf-select>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <tf-select id="ml-studio-rec-camera" label="Kamera" style="min-width:180px"></tf-select>
+          <tf-input id="ml-studio-rec-from" type="date" label="Od dnia" style="min-width:150px"></tf-input>
+          <tf-input id="ml-studio-rec-to" type="date" label="Do dnia" style="min-width:150px"></tf-input>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <tf-checkbox id="ml-studio-rec-selectall" label="Zaznacz wszystkie widoczne"></tf-checkbox>
+          <span id="ml-studio-rec-selcount" style="font-size:12px;color:var(--text-3,#888)"></span>
+        </div>
+        ${noRecordings ? '<tf-alert tone="info" message="Brak nagrań TentaVision do zaimportowania."></tf-alert>' : '<div id="ml-studio-rec-table-host"></div>'}
+        <div style="display:flex;gap:24px;flex-wrap:wrap">
+          <div>
+            <div style="font-size:12px;font-weight:600;margin-bottom:4px">Klatki na sekundę (klipy)</div>
+            <tf-segmented id="ml-studio-rec-fps" value="5">
+              <option value="1">1</option>
+              <option value="3">3</option>
+              <option value="5">5</option>
+              <option value="10">10</option>
+            </tf-segmented>
+          </div>
+          <div>
+            <div style="font-size:12px;font-weight:600;margin-bottom:4px">Auto-etykietowanie</div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <tf-toggle id="ml-studio-rec-autolabel" checked></tf-toggle>
+              <span style="font-size:12px;color:var(--text-3,#888)">wstępne oznaczenia modeli — punkt startu do poprawy</span>
+            </div>
+          </div>
+          <div>
+            <div style="font-size:12px;font-weight:600;margin-bottom:4px">Kolizja nazw</div>
+            <tf-segmented id="ml-studio-rec-collision" value="suffix">
+              <option value="suffix">Sufiks</option>
+              <option value="skip">Pomiń</option>
+            </tf-segmented>
+            <div style="font-size:11px;color:var(--text-3,#888);max-width:280px;margin-top:4px">Nadpisywania nie ma świadomie — istniejący obraz może już nieść zatwierdzoną pracę człowieka.</div>
+          </div>
+        </div>
+        <tf-key-value id="ml-studio-rec-preflight"></tf-key-value>
+        <tf-alert tone="info" message="Nowe klatki trafiają jako NIEzatwierdzone (do przeglądu). Auto-etykiety to punkt startu, nie ostateczna prawda. Istniejąca, zatwierdzona praca pozostaje nietknięta."></tf-alert>
+      </div>
+    `;
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="download" id="ml-studio-rec-start" disabled>Importuj klatki</tf-button>
+    `;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    footer.querySelector('#ml-studio-rec-start')?.addEventListener('click', startImport);
+
+    const dsSel = body.querySelector('#ml-studio-rec-dataset');
+    if (dsSel?.setOptions) {
+      const opts = state.datasets.map((d) => ({
+        value: String(d.datasetId ?? d.dataset_id ?? ''),
+        label: d.name || String(d.datasetId ?? d.dataset_id ?? ''),
+      }));
+      dsSel.setOptions(opts, opts.length ? opts[0].value : null);
+      state.targetDatasetId = opts.length ? opts[0].value : '';
+      dsSel.addEventListener('change', (e) => { state.targetDatasetId = e.detail?.value || ''; updatePreflight(); });
+    }
+
+    const camSel = body.querySelector('#ml-studio-rec-camera');
+    if (camSel?.setOptions) {
+      const cams = Array.from(new Set(
+        state.recordings.map((r) => String(r.cameraId ?? r.camera_id ?? '')).filter(Boolean),
+      ));
+      const opts = [{ value: '', label: 'Wszystkie kamery' }, ...cams.map((c) => ({ value: c, label: c }))];
+      camSel.setOptions(opts, '');
+      camSel.addEventListener('change', (e) => { state.cameraFilter = e.detail?.value || ''; renderTableRows(); });
+    }
+
+    body.querySelector('#ml-studio-rec-from')?.addEventListener('change', (e) => {
+      state.dateFrom = (e.detail?.value ?? e.target?.value) || '';
+      renderTableRows();
+    });
+    body.querySelector('#ml-studio-rec-to')?.addEventListener('change', (e) => {
+      state.dateTo = (e.detail?.value ?? e.target?.value) || '';
+      renderTableRows();
+    });
+    body.querySelector('#ml-studio-rec-fps')?.addEventListener('change', (e) => {
+      state.fps = parseInt(e.detail?.value || '5', 10) || 5;
+      renderTableRows();
+    });
+    body.querySelector('#ml-studio-rec-collision')?.addEventListener('change', (e) => {
+      state.collision = e.detail?.value === 'skip' ? 'skip' : 'suffix';
+    });
+    body.querySelector('#ml-studio-rec-selectall')?.addEventListener('change', (e) => {
+      const on = e.detail?.checked;
+      const vis = visibleRecordings();
+      if (on) vis.forEach((r) => selected.add(refKey(r)));
+      else vis.forEach((r) => selected.delete(refKey(r)));
+      renderTableRows();
+    });
+
+    const host = body.querySelector('#ml-studio-rec-table-host');
+    if (host) {
+      const table = document.createElement('tf-table');
+      table.id = 'ml-studio-rec-table';
+      table.setAttribute('variant', 'lined');
+      table.innerHTML = `
+        <tf-column key="sel" label="" renderer="html"></tf-column>
+        <tf-column key="kind" label="Typ" renderer="chip"></tf-column>
+        <tf-column key="camera" label="Kamera"></tf-column>
+        <tf-column key="created" label="Data i czas"></tf-column>
+        <tf-column key="duration" label="Długość"></tf-column>
+        <tf-column key="frames" label="Klatki (szac.)"></tf-column>
+        <tf-column key="size" label="Rozmiar" renderer="num"></tf-column>
+        <tf-column key="plate" label="Rejestracja"></tf-column>
+        <tf-column key="adr" label="ADR"></tf-column>
+      `;
+      table.addEventListener('row-click', (e) => {
+        const ref = e.detail?.row?.recordingRef;
+        if (!ref) return;
+        if (selected.has(ref)) selected.delete(ref);
+        else selected.add(ref);
+        renderTableRows();
+      });
+      host.appendChild(table);
+    }
+    renderTableRows();
+  };
+
+  const loadInitial = async () => {
+    body.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+    footer.innerHTML = '<tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>';
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    try {
+      const [dsResp, recResp] = await Promise.all([
+        ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid }),
+        ApiBinary.one('mlStudioRecordingsListRequest', { limit: 500 }),
+      ]);
+      if (!modal.isConnected) return;
+      state.datasets = (Array.isArray(dsResp.datasets) ? dsResp.datasets : [])
+        .filter((d) => (d.kind ?? '') === 'coco_path');
+      state.recordings = Array.isArray(recResp.items) ? recResp.items : [];
+    } catch (err) {
+      if (!modal.isConnected) return;
+      renderError(err.message || 'Nie udało się wczytać nagrań.');
+      return;
+    }
+    renderForm();
+  };
+
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  loadInitial();
 }
 
 // Zakładka "Anotacje" — edytor bboxów COCO: galeria obrazów + płótno z rysowaniem,
@@ -6527,6 +7046,988 @@ function openFtExportPanel(p, modelId, modelName) {
       if (startBtn) startBtn.removeAttribute('disabled');
       toast(err.message || 'Nie udało się uruchomić eksportu.', 'error');
     }
+  };
+
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  renderForm();
+}
+
+// =============================================================================
+// Przenoszenie projektu między węzłami spoza jednego meshu (przez pobrane/wgrane
+// archiwum). Eksport pakuje projekt asynchronicznie i udostępnia jednorazowy
+// signed URL do natywnego pobrania (streaming na dysk, wznawialne). Import
+// strumieniuje archiwum chunkami z wznawianiem po zerwaniu połączenia, pokazuje
+// pełen inwentarz paczki, a następnie tworzy nowy projekt albo scala z istniejącym.
+// =============================================================================
+
+// Interwał odpytywania statusu eksportu/importu. Każdy tick jest guardowany przez
+// modal.isConnected — po zamknięciu modala pętla przestaje się wznawiać.
+const PROJECT_TRANSFER_POLL_MS = 1500;
+
+// Cztery próby wznowienia uploadu z rosnącym backoffem. Licznik prób jest zerowany
+// po KAŻDYM udanym chunku, dzięki czemu długi transfer przeżywa wiele osobnych blipów.
+const IMPORT_RETRY_DELAYS_MS = [1000, 3000, 8000, 20000];
+
+function openProjectExportModal(project) {
+  const pid = projectId(project);
+  if (!pid) return;
+
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('size', 'md');
+  modal.setAttribute('title', `Eksport projektu — ${project.name || pid}`);
+
+  const body = document.createElement('div');
+  body.setAttribute('slot', 'body');
+  body.className = 'ml-studio-export-body';
+
+  const footer = document.createElement('div');
+  footer.setAttribute('slot', 'footer');
+  footer.className = 'ml-studio-export-footer';
+
+  modal.appendChild(body);
+  modal.appendChild(footer);
+  modal.addEventListener('close', () => modal.remove(), { once: true });
+
+  const closeModal = () => {
+    modal.removeAttribute('open');
+    modal.dispatchEvent(new CustomEvent('close', { bubbles: true }));
+  };
+
+  // Widok 1: wybór zawartości archiwum + start eksportu.
+  const renderForm = () => {
+    body.innerHTML = `
+      <p class="ml-studio-export-intro">Spakuj projekt do archiwum, które przeniesiesz na inny węzeł TentaFlow — także spoza tego meshu. Schemat i dane są zawsze w paczce; modele i historię treningów dołączasz opcjonalnie.</p>
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div class="ml-studio-transfer-opt" style="display:flex;align-items:flex-start;gap:12px">
+          <tf-toggle id="ml-studio-export-models"></tf-toggle>
+          <span class="ml-studio-transfer-opt-text" style="display:flex;flex-direction:column;gap:2px;cursor:pointer">
+            <span style="font-size:13.5px;font-weight:600">Dołącz modele</span>
+            <span style="font-size:12px;color:var(--text-3,#888)">Wytrenowane wersje wyprodukowane w tym projekcie.</span>
+          </span>
+        </div>
+        <div class="ml-studio-transfer-opt" style="display:flex;align-items:flex-start;gap:12px">
+          <tf-toggle id="ml-studio-export-history"></tf-toggle>
+          <span class="ml-studio-transfer-opt-text" style="display:flex;flex-direction:column;gap:2px;cursor:pointer">
+            <span style="font-size:13.5px;font-weight:600">Dołącz historię treningów</span>
+            <span style="font-size:12px;color:var(--text-3,#888)">Metryki i przebiegi jobów treningowych.</span>
+          </span>
+        </div>
+      </div>
+    `;
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="download" id="ml-studio-export-start">Eksportuj</tf-button>
+    `;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    footer.querySelector('#ml-studio-export-start')?.addEventListener('click', startExport);
+    // Kliknięcie opisu przy przełączniku przełącza sam tf-toggle (tf-toggle
+    // renderuje tylko sam switch, więc etykieta musi ręcznie forwardować klik).
+    body.querySelectorAll('.ml-studio-transfer-opt').forEach((row) => {
+      row.querySelector('.ml-studio-transfer-opt-text')?.addEventListener('click', () => {
+        const toggle = row.querySelector('tf-toggle');
+        if (toggle) toggle.checked = !toggle.checked;
+      });
+    });
+  };
+
+  // Widok 2: skeleton postępu — patchowany co tick, żeby pasek nie migotał.
+  const renderProgress = () => {
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:10px;padding:6px 0">
+        <div class="ml-studio-export-progress-text" style="text-align:left" id="ml-studio-export-phase">Pakowanie projektu…</div>
+        <tf-progress-bar id="ml-studio-export-bar" value="0" tone="accent"></tf-progress-bar>
+        <div class="ml-studio-export-note" id="ml-studio-export-bytes"></div>
+      </div>
+    `;
+    footer.innerHTML = `<tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  const updateProgress = (phase, pct, bytesText) => {
+    const phaseEl = body.querySelector('#ml-studio-export-phase');
+    if (phaseEl) phaseEl.textContent = phase;
+    const bar = body.querySelector('#ml-studio-export-bar');
+    if (bar) bar.setAttribute('value', String(pct));
+    const bytesEl = body.querySelector('#ml-studio-export-bytes');
+    if (bytesEl) bytesEl.textContent = bytesText;
+  };
+
+  // Widok 3: archiwum gotowe — rozmiar + akcja pobrania natywnym downloaderem.
+  const renderResult = (st, signedUrl) => {
+    const sizeText = formatFileSize(st.archiveBytes ?? st.archive_bytes);
+    body.innerHTML = `
+      <div class="ml-studio-export-result">
+        <div class="ml-studio-export-result-head">${sprite('check')} <span>Archiwum gotowe</span> <tf-badge tone="success" value="Gotowe"></tf-badge></div>
+        <p class="ml-studio-export-note">Pobierz paczkę i wgraj ją na docelowym węźle przez „Importuj projekt". Link do pobrania jest jednorazowy i wygasa — pobierz teraz.</p>
+        <div class="ml-studio-export-result-row"><span class="lbl">Rozmiar archiwum</span><span class="val">${escapeHtml(sizeText)}</span></div>
+      </div>
+    `;
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>
+      <tf-button variant="primary" icon="download" id="ml-studio-export-download">Pobierz archiwum</tf-button>
+    `;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    footer.querySelector('#ml-studio-export-download')?.addEventListener('click', () => {
+      // Natywny downloader: streaming na dysk, wznawialny. Signed URL niesie token
+      // HMAC — nie logujemy go i nie umieszczamy w widocznym DOM.
+      window.location.href = signedUrl;
+    });
+  };
+
+  const renderError = (message) => {
+    body.innerHTML = `<div class="ml-studio-export-error">${sprite('alert')} <span>${escapeHtml(message || 'Eksport nie powiódł się.')}</span></div>`;
+    footer.innerHTML = `<tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  const pollExport = (jobId) => {
+    const tick = async () => {
+      if (!modal.isConnected) return;
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioProjectExportStatusRequest', { jobId });
+      } catch (err) {
+        if (!modal.isConnected) return;
+        renderError(err.message || 'Błąd protokołu eksportu.');
+        return;
+      }
+      if (!modal.isConnected) return;
+      const status = String(st.status || 'running');
+      const phase = String(st.phase ?? '') || 'Pakowanie projektu…';
+      const bytesTotal = Number(st.bytesTotal ?? st.bytes_total ?? 0);
+      const bytesDone = Number(st.bytesDone ?? st.bytes_done ?? 0);
+      const filesTotal = Number(st.filesTotal ?? st.files_total ?? 0);
+      const filesDone = Number(st.filesDone ?? st.files_done ?? 0);
+      const pct = bytesTotal > 0
+        ? Math.min(100, Math.round((bytesDone / bytesTotal) * 100))
+        : (filesTotal > 0 ? Math.min(100, Math.round((filesDone / filesTotal) * 100)) : 0);
+      const bytesText = bytesTotal > 0
+        ? `${formatFileSize(bytesDone)} / ${formatFileSize(bytesTotal)}`
+        : (filesTotal > 0 ? `${filesDone} / ${filesTotal} plików` : '');
+      if (status === 'failed') {
+        renderError(String(st.error ?? '') || 'Eksport nie powiódł się.');
+        return;
+      }
+      const signedUrl = st.signedUrl ?? st.signed_url ?? '';
+      if (signedUrl) {
+        renderResult(st, signedUrl);
+        return;
+      }
+      if (status === 'succeeded') {
+        renderError('Eksport zakończony, ale serwer nie udostępnił linku do pobrania.');
+        return;
+      }
+      updateProgress(phase, pct, bytesText);
+      setTimeout(tick, PROJECT_TRANSFER_POLL_MS);
+    };
+    tick();
+  };
+
+  const startExport = async () => {
+    const includeModels = modal.querySelector('#ml-studio-export-models')?.checked === true;
+    const includeHistory = modal.querySelector('#ml-studio-export-history')?.checked === true;
+    const startBtn = footer.querySelector('#ml-studio-export-start');
+    if (startBtn) startBtn.setAttribute('disabled', '');
+    let jobId;
+    try {
+      const resp = await ApiBinary.one('mlStudioProjectExportStartRequest', {
+        projectId: pid, includeModels, includeHistory,
+      });
+      jobId = resp.jobId ?? resp.job_id;
+    } catch (err) {
+      if (startBtn) startBtn.removeAttribute('disabled');
+      toast(err.message || 'Nie udało się uruchomić eksportu.', 'error');
+      return;
+    }
+    if (!jobId) {
+      renderError('Serwer nie zwrócił identyfikatora zadania eksportu.');
+      return;
+    }
+    renderProgress();
+    pollExport(jobId);
+  };
+
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  renderForm();
+}
+
+function openProjectImportModal() {
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('size', 'lg');
+  modal.setAttribute('title', 'Import projektu z archiwum');
+
+  const body = document.createElement('div');
+  body.setAttribute('slot', 'body');
+  body.className = 'ml-studio-export-body';
+
+  const footer = document.createElement('div');
+  footer.setAttribute('slot', 'footer');
+  footer.className = 'ml-studio-export-footer';
+
+  modal.appendChild(body);
+  modal.appendChild(footer);
+
+  // Stan współdzielony między etapami modala. `file` przeżywa restart uploadu
+  // (plik pozostaje wybrany), `uploadId` bywa wymieniany przy restarcie od zera.
+  const state = { file: null, uploadId: '', preview: null };
+
+  modal.addEventListener('close', () => modal.remove(), { once: true });
+  const closeModal = () => {
+    modal.removeAttribute('open');
+    modal.dispatchEvent(new CustomEvent('close', { bubbles: true }));
+  };
+
+  const freshUploadId = () => (crypto.randomUUID && crypto.randomUUID())
+    || `imp-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Best-effort kasowanie odłożonego pliku po stronie serwera (zwolnienie stagingu).
+  const cancelServerSide = async (uploadId) => {
+    if (!uploadId) return;
+    try { await ApiBinary.one('mlStudioProjectImportCancelRequest', { uploadId }); } catch (_) {}
+  };
+
+  // Etap 1: wybór pliku archiwum. `notice` (opcjonalny) tłumaczy, czemu wróciliśmy
+  // tu z etapu uploadu — plik pozostaje wybrany, więc showPicked od razu go pokaże.
+  const renderPick = (notice) => {
+    body.innerHTML = `
+      ${notice ? `<tf-alert tone="warning" message="${escapeAttr(notice)}"></tf-alert>` : ''}
+      <p class="ml-studio-export-intro">Wgraj archiwum projektu wyeksportowane na innym węźle. Duże pliki są wysyłane fragmentami i wznawiane po zerwaniu połączenia.</p>
+      <tf-file-input id="ml-studio-import-file" accept=".zip" label="Przeciągnij archiwum .zip lub kliknij, aby wybrać"></tf-file-input>
+      <div class="ml-studio-transfer-picked" id="ml-studio-import-picked" style="margin-top:10px;font-size:13px;color:var(--text-2,#aaa);display:flex;align-items:center;gap:6px"></div>
+    `;
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="cloud" id="ml-studio-import-upload" disabled>Wyślij archiwum</tf-button>
+    `;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    const uploadBtn = footer.querySelector('#ml-studio-import-upload');
+    const picked = body.querySelector('#ml-studio-import-picked');
+    const showPicked = () => {
+      if (state.file) {
+        picked.innerHTML = `${sprite('file-text')} <span class="ml-studio-mono">${escapeHtml(state.file.name)}</span> · ${escapeHtml(formatFileSize(state.file.size))}`;
+        uploadBtn?.removeAttribute('disabled');
+      } else {
+        picked.innerHTML = '';
+        uploadBtn?.setAttribute('disabled', '');
+      }
+    };
+    showPicked();
+    body.querySelector('#ml-studio-import-file')?.addEventListener('change', (e) => {
+      const files = e.detail?.files;
+      state.file = files && files.length ? files[0] : null;
+      showPicked();
+    });
+    uploadBtn?.addEventListener('click', () => { if (state.file) runUpload(); });
+  };
+
+  // Etap 2: skeleton postępu uploadu — patchowany, nie re-renderowany (bez migotania).
+  const renderUploadProgress = () => {
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:10px;padding:6px 0">
+        <div class="ml-studio-export-progress-text" style="text-align:left" id="ml-studio-import-phase">Wysyłanie archiwum…</div>
+        <tf-progress-bar id="ml-studio-import-bar" value="0" tone="accent"></tf-progress-bar>
+        <div class="ml-studio-export-note" id="ml-studio-import-bytes"></div>
+      </div>
+    `;
+    footer.innerHTML = `<tf-button variant="ghost" icon="close" id="ml-studio-import-cancel">Anuluj wysyłanie</tf-button>`;
+    footer.querySelector('#ml-studio-import-cancel')?.addEventListener('click', async () => {
+      await cancelServerSide(state.uploadId);
+      closeModal();
+    });
+  };
+  const setUploadPhase = (text) => {
+    const el = body.querySelector('#ml-studio-import-phase');
+    if (el) el.textContent = text;
+  };
+  const setUploadProgress = (pct, bytesText) => {
+    const bar = body.querySelector('#ml-studio-import-bar');
+    if (bar) bar.setAttribute('value', String(pct));
+    const bytesEl = body.querySelector('#ml-studio-import-bytes');
+    if (bytesEl) bytesEl.textContent = bytesText;
+  };
+
+  const runUpload = async () => {
+    const file = state.file;
+    if (!file) return;
+    renderUploadProgress();
+
+    // Hoisted i identyczne przez cały transfer, także po wznowieniu — serwer
+    // odrzuca wznowienie z inną nazwą/liczbą chunków/rozmiarem. uploadId wolno
+    // wymienić TYLKO gdy odłożony plik przepadł (pełny restart od zera).
+    const filename = file.name || 'projekt.zip';
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    state.uploadId = freshUploadId();
+
+    let seq = 0;
+    let attempt = 0;
+    let sentBytes = 0;
+    let complete = false;
+
+    const pct = () => (file.size > 0 ? Math.min(100, Math.round((sentBytes / file.size) * 100)) : 100);
+    const bytesText = () => `${formatFileSize(sentBytes)} / ${formatFileSize(file.size)}`;
+
+    // Potwierdza `complete` z endpointu statusu, gdy wysłano już wszystkie chunki,
+    // ale ostatni ack nie przyniósł flagi (utracony ack != niekompletne archiwum).
+    const confirmComplete = async () => {
+      try {
+        const st = await ApiBinary.one('mlStudioProjectImportUploadStatusRequest', { uploadId: state.uploadId });
+        return st.complete === true;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    while (!complete) {
+      if (!modal.isConnected) return;
+
+      // Wszystkie chunki już po stronie serwera (np. po wznowieniu seq z
+      // receivedChunks) — potwierdź finalizację zamiast wysyłać pusty fragment.
+      if (seq >= totalChunks) {
+        complete = await confirmComplete();
+        if (!modal.isConnected) return;
+        if (complete) break;
+        if (attempt >= IMPORT_RETRY_DELAYS_MS.length) {
+          await cancelServerSide(state.uploadId);
+          if (!modal.isConnected) return;
+          renderPick(`Serwer nie potwierdził kompletności archiwum po ${IMPORT_RETRY_DELAYS_MS.length} próbach. Spróbuj ponownie.`);
+          return;
+        }
+        const delay = IMPORT_RETRY_DELAYS_MS[attempt];
+        attempt += 1;
+        setUploadPhase('Finalizacja po stronie serwera…');
+        await sleep(delay);
+        continue;
+      }
+
+      const start = seq * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, file.size);
+      let chunkBytes;
+      try {
+        // Leniwy odczyt: do RAM trafia TYLKO bieżący fragment (nigdy cały plik).
+        chunkBytes = new Uint8Array(await file.slice(start, end).arrayBuffer());
+      } catch (err) {
+        if (!modal.isConnected) return;
+        renderPick(`Nie udało się odczytać pliku z dysku: ${err.message || 'błąd odczytu'}. Wybierz archiwum ponownie.`);
+        return;
+      }
+
+      try {
+        const resp = await ApiBinary.one('mlStudioProjectImportUploadChunkRequest', {
+          uploadId: state.uploadId, seq, totalChunks, filename, bytes: chunkBytes,
+        });
+        if (!modal.isConnected) return;
+        // Postęp z prawdy serwera, nie z lokalnego licznika (ten może wyprzedzać
+        // to, co faktycznie wylądowało po stronie serwera).
+        seq = resp.receivedChunks ?? resp.received_chunks ?? (seq + 1);
+        sentBytes = resp.receivedBytes ?? resp.received_bytes ?? end;
+        complete = resp.complete === true;
+        attempt = 0; // reset po każdym udanym chunku
+        setUploadPhase('Wysyłanie archiwum…');
+        setUploadProgress(pct(), bytesText());
+        // Gdy to był ostatni chunk bez flagi `complete`, finalizację potwierdza
+        // strażnik na górze pętli (confirmComplete), nie wysyłając pustego chunku.
+      } catch (err) {
+        if (!modal.isConnected) return;
+        // NIE ponawiaj tego samego seq na ślepo — serwer mógł dopisać chunk, zanim
+        // transport padł. Zapytaj o prawdę serwera i wznów od receivedChunks.
+        let st = null;
+        try {
+          st = await ApiBinary.one('mlStudioProjectImportUploadStatusRequest', { uploadId: state.uploadId });
+        } catch (_) {
+          st = null;
+        }
+        if (!modal.isConnected) return;
+        if (st && st.complete === true) {
+          sentBytes = st.receivedBytes ?? st.received_bytes ?? file.size;
+          setUploadProgress(pct(), bytesText());
+          complete = true;
+          break;
+        }
+        if (st && st.exists === false) {
+          // Odłożony plik przepadł — transfer trzeba zacząć od nowa. Plik zostaje
+          // wybrany; startujemy od seq 0 ze świeżym uploadId.
+          state.uploadId = freshUploadId();
+          seq = 0; sentBytes = 0; attempt = 0;
+          setUploadPhase('Odłożony plik przepadł na serwerze — zaczynam wysyłkę od nowa…');
+          setUploadProgress(0, bytesText());
+          continue;
+        }
+        let resumed = false;
+        if (st && (st.receivedChunks != null || st.received_chunks != null)) {
+          // Serwer zna postęp — wznów od jego pozycji i pokaż to uczciwie.
+          seq = st.receivedChunks ?? st.received_chunks ?? seq;
+          sentBytes = st.receivedBytes ?? st.received_bytes ?? seq * CHUNK_SIZE;
+          setUploadProgress(pct(), bytesText());
+          resumed = true;
+        }
+        if (attempt >= IMPORT_RETRY_DELAYS_MS.length) {
+          await cancelServerSide(state.uploadId);
+          if (!modal.isConnected) return;
+          renderPick(`Wysyłanie przerwane po ${IMPORT_RETRY_DELAYS_MS.length} próbach wznowienia. Sprawdź połączenie i spróbuj ponownie.`);
+          return;
+        }
+        const delay = IMPORT_RETRY_DELAYS_MS[attempt];
+        attempt += 1;
+        const secs = Math.round(delay / 1000);
+        setUploadPhase(resumed
+          ? `Wznawiam od ${pct()}% (próba ${attempt}/${IMPORT_RETRY_DELAYS_MS.length}, za ${secs} s)…`
+          : `Połączenie zerwane — ponawiam (próba ${attempt}/${IMPORT_RETRY_DELAYS_MS.length}) za ${secs} s…`);
+        await sleep(delay);
+        if (!modal.isConnected) return;
+        continue;
+      }
+    }
+
+    if (!modal.isConnected) return;
+    setUploadPhase('Archiwum wysłane — analizuję zawartość…');
+    setUploadProgress(100, bytesText());
+    await loadPreview();
+  };
+
+  const loadPreview = async () => {
+    body.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+    footer.innerHTML = '';
+    let preview;
+    try {
+      preview = await ApiBinary.one('mlStudioProjectImportPreviewRequest', { uploadId: state.uploadId });
+    } catch (err) {
+      if (!modal.isConnected) return;
+      renderPick(`Nie udało się odczytać zawartości archiwum: ${err.message || 'błąd protokołu'}.`);
+      return;
+    }
+    if (!modal.isConnected) return;
+    state.preview = preview;
+    renderPreview(preview);
+  };
+
+  // Etap 3: inwentarz paczki + wybór trybu importu (nowy projekt / scalenie).
+  const renderPreview = (preview) => {
+    const projName = preview.projectName ?? preview.project_name ?? '(bez nazwy)';
+    const projTypeSlug = preview.projectType ?? preview.project_type ?? '—';
+    const datasets = Array.isArray(preview.datasets) ? preview.datasets : [];
+    const classes = Array.isArray(preview.classes) ? preview.classes : [];
+    const hasModels = preview.hasModels === true || preview.has_models === true;
+    const hasHistory = preview.hasHistory === true || preview.has_history === true;
+    const totalBytes = preview.totalUncompressedBytes ?? preview.total_uncompressed_bytes ?? 0;
+    const missing = Array.isArray(preview.missingArtifacts ?? preview.missing_artifacts)
+      ? (preview.missingArtifacts ?? preview.missing_artifacts) : [];
+    const archiveVersion = preview.archiveVersion ?? preview.archive_version ?? '—';
+
+    const classChips = classes.length
+      ? classes.map((c) => `<tf-chip label="${escapeAttr(String(c))}"></tf-chip>`).join('')
+      : '<span class="ml-studio-section-sub">brak zdefiniowanych klas</span>';
+
+    const missingText = missing.map((m) => {
+      const path = m.path ?? '';
+      const reason = m.reason ?? '';
+      return reason ? `${path} — ${reason}` : String(path);
+    }).join(' · ');
+    const missingAlert = missing.length
+      ? `<tf-alert tone="warning" title="Brakujące artefakty w archiwum" message="${escapeAttr(missingText)}"></tf-alert>`
+      : '';
+
+    body.innerHTML = `
+      ${missingAlert}
+      <div class="ml-studio-section-card">
+        <div class="ml-studio-section-card-head">
+          <div class="title">${sprite('catalog')} ${escapeHtml(String(projName))}</div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+          <tf-chip status="accent" icon="brain" label="typ: ${escapeAttr(String(projTypeSlug))}"></tf-chip>
+          <tf-chip icon="database" label="${datasets.length} ${escapeAttr(plural(datasets.length, 'dataset', 'datasety', 'datasetów'))}"></tf-chip>
+          <tf-chip icon="grid-2x2" label="${classes.length} ${escapeAttr(plural(classes.length, 'klasa', 'klasy', 'klas'))}"></tf-chip>
+          ${hasModels ? '<tf-chip status="ok" icon="catalog" label="modele"></tf-chip>' : ''}
+          ${hasHistory ? '<tf-chip status="ok" icon="clock" label="historia treningów"></tf-chip>' : ''}
+          <tf-chip icon="info" label="wersja archiwum: ${escapeAttr(String(archiveVersion))}"></tf-chip>
+          <tf-chip icon="cloud" label="rozmiar: ${escapeAttr(formatFileSize(totalBytes))}"></tf-chip>
+        </div>
+        <div id="ml-studio-import-datasets"></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">${classChips}</div>
+      </div>
+
+      <div class="ml-studio-section-card" style="margin-top:12px">
+        <div class="ml-studio-section-card-head"><div class="title">${sprite('play')} Jak zaimportować?</div></div>
+        <tf-segmented id="ml-studio-import-mode" value="new_project">
+          <option value="new_project">Nowy projekt</option>
+          <option value="merge">Scal z istniejącym</option>
+        </tf-segmented>
+        <div id="ml-studio-import-mode-body" style="display:flex;flex-direction:column;gap:10px;margin-top:12px"></div>
+      </div>
+    `;
+
+    const dsHost = body.querySelector('#ml-studio-import-datasets');
+    if (dsHost) {
+      if (!datasets.length) {
+        dsHost.innerHTML = '<span class="ml-studio-section-sub">Archiwum nie zawiera datasetów.</span>';
+      } else {
+        const table = document.createElement('tf-table');
+        table.setAttribute('variant', 'lined');
+        table.innerHTML = `
+          <tf-column key="name" label="Dataset"></tf-column>
+          <tf-column key="images" label="Obrazy" renderer="num"></tf-column>
+          <tf-column key="annotations" label="Anotacje" renderer="num"></tf-column>
+        `;
+        table.rows = datasets.map((d) => ({
+          name: String(d.name ?? d.datasetId ?? d.dataset_id ?? '—'),
+          images: Number(d.imageCount ?? d.image_count ?? 0),
+          annotations: Number(d.annotationCount ?? d.annotation_count ?? 0),
+        }));
+        dsHost.appendChild(table);
+      }
+    }
+
+    const modeBody = body.querySelector('#ml-studio-import-mode-body');
+    const renderModeBody = (mode) => {
+      if (!modeBody) return;
+      if (mode === 'merge') {
+        modeBody.innerHTML = `
+          <tf-select id="ml-studio-import-target-project" label="Projekt docelowy"></tf-select>
+          <tf-select id="ml-studio-import-target-dataset" label="Dataset docelowy"></tf-select>
+          <p class="ml-studio-section-sub">Scalanie dołoży dane z archiwum do wybranego datasetu. Serwer odrzuci scalanie, jeśli archiwum deklaruje klasę, której nie ma w projekcie docelowym.</p>
+        `;
+        const projSel = modeBody.querySelector('#ml-studio-import-target-project');
+        const dsSel = modeBody.querySelector('#ml-studio-import-target-dataset');
+        const projOptions = projects.map((p) => ({ value: projectId(p), label: p.name || projectId(p) }));
+        projSel?.setOptions(projOptions, projOptions.length ? projOptions[0].value : null);
+        const loadTargetDatasets = async (targetPid) => {
+          dsSel?.setOptions([{ value: '', label: 'Wczytywanie…' }]);
+          try {
+            const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: targetPid });
+            const list = Array.isArray(resp.datasets) ? resp.datasets : [];
+            if (!modal.isConnected) return;
+            const opts = list.map((d) => ({
+              value: String(d.datasetId ?? d.dataset_id ?? ''),
+              label: String(d.name ?? d.datasetId ?? d.dataset_id ?? '—'),
+            }));
+            dsSel?.setOptions(opts.length ? opts : [{ value: '', label: 'Brak datasetów w projekcie' }], opts.length ? opts[0].value : '');
+          } catch (_) {
+            if (!modal.isConnected) return;
+            dsSel?.setOptions([{ value: '', label: 'Nie udało się wczytać datasetów' }]);
+          }
+        };
+        if (projOptions.length) loadTargetDatasets(projOptions[0].value);
+        projSel?.addEventListener('change', (e) => loadTargetDatasets(e.detail.value));
+      } else {
+        modeBody.innerHTML = `
+          <tf-input id="ml-studio-import-name" label="Nazwa nowego projektu (opcjonalnie)" placeholder="${escapeAttr(String(projName))}"></tf-input>
+          <p class="ml-studio-section-sub">Powstanie nowy projekt z zawartości archiwum. Pusta nazwa = nazwa z archiwum.</p>
+        `;
+      }
+    };
+    renderModeBody('new_project');
+    body.querySelector('#ml-studio-import-mode')?.addEventListener('change', (e) => renderModeBody(e.detail.value));
+
+    footer.innerHTML = `
+      <tf-button variant="ghost" icon="close" id="ml-studio-import-preview-cancel">Anuluj import</tf-button>
+      <tf-button variant="primary" icon="check" id="ml-studio-import-apply">Zaimportuj</tf-button>
+    `;
+    footer.querySelector('#ml-studio-import-preview-cancel')?.addEventListener('click', async () => {
+      await cancelServerSide(state.uploadId);
+      closeModal();
+    });
+    footer.querySelector('#ml-studio-import-apply')?.addEventListener('click', runApply);
+  };
+
+  // Etap 4: zastosowanie importu + polling statusu joba.
+  const renderApplyProgress = () => {
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:10px;padding:6px 0">
+        <div class="ml-studio-export-progress-text" style="text-align:left" id="ml-studio-import-apply-phase">Import w toku…</div>
+        <tf-progress-bar id="ml-studio-import-apply-bar" value="0" tone="accent"></tf-progress-bar>
+        <div class="ml-studio-export-note" id="ml-studio-import-apply-bytes"></div>
+      </div>
+    `;
+    footer.innerHTML = `<tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  const pollImport = (jobId) => {
+    const tick = async () => {
+      if (!modal.isConnected) return;
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioProjectImportStatusRequest', { jobId });
+      } catch (err) {
+        if (!modal.isConnected) return;
+        renderError(err.message || 'Błąd protokołu importu.');
+        return;
+      }
+      if (!modal.isConnected) return;
+      const status = String(st.status || 'running');
+      const phase = String(st.phase ?? '') || 'Import w toku…';
+      const bytesTotal = Number(st.bytesTotal ?? st.bytes_total ?? 0);
+      const bytesDone = Number(st.bytesDone ?? st.bytes_done ?? 0);
+      const filesTotal = Number(st.filesTotal ?? st.files_total ?? 0);
+      const filesDone = Number(st.filesDone ?? st.files_done ?? 0);
+      const pct = bytesTotal > 0
+        ? Math.min(100, Math.round((bytesDone / bytesTotal) * 100))
+        : (filesTotal > 0 ? Math.min(100, Math.round((filesDone / filesTotal) * 100)) : 0);
+      const bytesText = bytesTotal > 0
+        ? `${formatFileSize(bytesDone)} / ${formatFileSize(bytesTotal)}`
+        : (filesTotal > 0 ? `${filesDone} / ${filesTotal} plików` : '');
+      if (status === 'failed') {
+        renderError(String(st.error ?? '') || 'Import nie powiódł się.');
+        return;
+      }
+      if (status === 'succeeded') {
+        const phaseEl = body.querySelector('#ml-studio-import-apply-phase');
+        if (phaseEl) phaseEl.textContent = 'Import zakończony.';
+        const bar = body.querySelector('#ml-studio-import-apply-bar');
+        if (bar) bar.setAttribute('value', '100');
+        toast('Projekt zaimportowany.', 'success');
+        closeModal();
+        loadAll();
+        return;
+      }
+      const phaseEl = body.querySelector('#ml-studio-import-apply-phase');
+      if (phaseEl) phaseEl.textContent = phase;
+      const bar = body.querySelector('#ml-studio-import-apply-bar');
+      if (bar) bar.setAttribute('value', String(pct));
+      const bytesEl = body.querySelector('#ml-studio-import-apply-bytes');
+      if (bytesEl) bytesEl.textContent = bytesText;
+      setTimeout(tick, PROJECT_TRANSFER_POLL_MS);
+    };
+    tick();
+  };
+
+  const runApply = async () => {
+    const mode = modal.querySelector('#ml-studio-import-mode')?.value || 'new_project';
+    const payload = { uploadId: state.uploadId, mode };
+    if (mode === 'merge') {
+      const targetProjectId = modal.querySelector('#ml-studio-import-target-project')?.value || '';
+      const targetDatasetId = modal.querySelector('#ml-studio-import-target-dataset')?.value || '';
+      if (!targetProjectId) {
+        toast('Wybierz projekt docelowy do scalenia.', 'error');
+        return;
+      }
+      payload.targetProjectId = targetProjectId;
+      if (targetDatasetId) payload.targetDatasetId = targetDatasetId;
+    } else {
+      const nameOverride = (modal.querySelector('#ml-studio-import-name')?.value || '').trim();
+      if (nameOverride) payload.nameOverride = nameOverride;
+    }
+    const applyBtn = footer.querySelector('#ml-studio-import-apply');
+    if (applyBtn) applyBtn.setAttribute('disabled', '');
+    let jobId;
+    try {
+      const resp = await ApiBinary.one('mlStudioProjectImportApplyRequest', payload);
+      jobId = resp.jobId ?? resp.job_id;
+    } catch (err) {
+      if (applyBtn) applyBtn.removeAttribute('disabled');
+      // Uczciwość scalania: serwer odrzuca import, gdy archiwum deklaruje klasę,
+      // której brak w celu — komunikat serwera pokazujemy DOSŁOWNIE, nie połykamy.
+      toast(err.message || 'Nie udało się rozpocząć importu.', 'error');
+      return;
+    }
+    if (!jobId) {
+      renderError('Serwer nie zwrócił identyfikatora zadania importu.');
+      return;
+    }
+    renderApplyProgress();
+    pollImport(jobId);
+  };
+
+  const renderError = (message) => {
+    body.innerHTML = `<div class="ml-studio-export-error">${sprite('alert')} <span>${escapeHtml(message || 'Import nie powiódł się.')}</span></div>`;
+    footer.innerHTML = `<tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  renderPick();
+}
+
+// Strona źródłowa udostępniania: pokazuje bazowy URL manifestu projektu do
+// wklejenia na drugiej instancji. Autoryzacją jest wyłącznie klucz API — URL
+// NIE niesie żadnego tokenu (nie mintujemy tu podpisanych linków `?token=`).
+function openProjectShareModal(project) {
+  const pid = projectId(project);
+  if (!pid) return;
+  const manifestUrl = `${window.location.origin}/ml-studio/share/${pid}/manifest`;
+  const projName = project.name || pid;
+
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('size', 'md');
+  modal.setAttribute('title', `Udostępnij projekt — ${projName}`);
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">Inna instancja TentaFlow może zaimportować ten projekt bez parowania mesh. Podaj operatorowi drugiej instancji poniższy URL manifestu oraz klucz API — u niego wkleja je w „Importuj z URL". Projekt powstanie tam jako NOWY, lokalny projekt należący do osoby importującej.</p>
+      <div class="form-group">
+        <tf-input id="ml-studio-project-share-url" label="URL manifestu (gotowy do wklejenia)" value="${escapeAttr(manifestUrl)}" readonly></tf-input>
+      </div>
+      <tf-alert tone="info" message="Dostęp wymaga klucza API typu „Ogólny" z zakresem ml_studio_export ograniczonym do TEGO projektu — utwórz go w „Dostęp i klucze API". Klucz jest przesyłany jako nagłówek Authorization: Bearer, a URL sam w sobie nie daje dostępu (brak tokenu w linku). Każdy dostęp trafia do audytu."></tf-alert>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-project-share-close>Zamknij</tf-button>
+      <tf-button variant="primary" icon="copy" id="ml-studio-project-share-copy">Kopiuj URL</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-project-share-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+  modal.querySelector('#ml-studio-project-share-copy')?.addEventListener('click', () => {
+    navigator.clipboard?.writeText(manifestUrl);
+    toast('URL manifestu skopiowany', 'success');
+  });
+}
+
+// Strona docelowa: import projektu bezpośrednio z URL manifestu innej instancji.
+// Najpierw tani podgląd samego manifestu (bez pobierania archiwum), potem
+// pełny import ze streamingiem pobierania. Klucz API nigdy nie trafia do logów
+// ani do widocznego DOM po wpisaniu.
+function openProjectRemoteImportModal() {
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('size', 'lg');
+  modal.setAttribute('title', 'Import projektu z innej instancji');
+
+  const body = document.createElement('div');
+  body.setAttribute('slot', 'body');
+  body.className = 'ml-studio-export-body';
+
+  const footer = document.createElement('div');
+  footer.setAttribute('slot', 'footer');
+  footer.className = 'ml-studio-export-footer';
+
+  modal.appendChild(body);
+  modal.appendChild(footer);
+
+  // Poświadczenia trzymamy w zmiennych domknięcia, nie w DOM: po wyjściu z etapu
+  // formularza znikają z widoku i nigdy nie są logowane.
+  const state = { url: '', apiKey: '', nameOverride: '', preview: null };
+
+  modal.addEventListener('close', () => modal.remove(), { once: true });
+  const closeModal = () => {
+    modal.removeAttribute('open');
+    modal.dispatchEvent(new CustomEvent('close', { bubbles: true }));
+  };
+
+  const renderError = (message) => {
+    body.innerHTML = `<div class="ml-studio-export-error">${sprite('alert')} <span>${escapeHtml(message || 'Import nie powiódł się.')}</span></div>`;
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>
+      <tf-button variant="outline" icon="external-link" id="ml-studio-remote-back">Wróć do formularza</tf-button>
+    `;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    footer.querySelector('#ml-studio-remote-back')?.addEventListener('click', () => renderForm());
+  };
+
+  // Etap 1: URL + klucz API + opcjonalna nazwa. Zachowujemy wpisane wartości,
+  // gdy wracamy tu z podglądu/błędu.
+  const renderForm = () => {
+    body.innerHTML = `
+      <p class="ml-studio-export-intro">Wklej URL manifestu udostępnionego projektu z drugiej instancji oraz klucz API, który tam otrzymałeś. Podgląd pobiera tylko manifest (bez danych), więc możesz sprawdzić zawartość przed pełnym importem. Projekt powstanie u Ciebie jako NOWY, lokalny projekt.</p>
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <tf-input id="ml-studio-remote-url" label="URL manifestu" placeholder="https://inna-instancja:8090/ml-studio/share/&lt;id&gt;/manifest" value="${escapeAttr(state.url)}"></tf-input>
+        <tf-input id="ml-studio-remote-key" type="password" label="Klucz API (Bearer)" value="${escapeAttr(state.apiKey)}"></tf-input>
+        <tf-input id="ml-studio-remote-name" label="Nazwa nowego projektu (opcjonalnie)" value="${escapeAttr(state.nameOverride)}"></tf-input>
+      </div>
+      <div id="ml-studio-remote-form-msg" style="margin-top:10px"></div>
+    `;
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="eye" id="ml-studio-remote-preview">Podgląd</tf-button>
+    `;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    footer.querySelector('#ml-studio-remote-preview')?.addEventListener('click', loadPreview);
+  };
+
+  const readForm = () => {
+    state.url = String(modal.querySelector('#ml-studio-remote-url')?.value || '').trim();
+    state.apiKey = String(modal.querySelector('#ml-studio-remote-key')?.value || '').trim();
+    state.nameOverride = String(modal.querySelector('#ml-studio-remote-name')?.value || '').trim();
+  };
+
+  const loadPreview = async () => {
+    readForm();
+    const msg = body.querySelector('#ml-studio-remote-form-msg');
+    if (!state.url) {
+      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Podaj URL manifestu.</div>`;
+      return;
+    }
+    if (!state.apiKey) {
+      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Podaj klucz API.</div>`;
+      return;
+    }
+    const previewBtn = footer.querySelector('#ml-studio-remote-preview');
+    if (previewBtn) previewBtn.setAttribute('disabled', '');
+    if (msg) msg.innerHTML = '<tf-spinner></tf-spinner> pobieranie manifestu…';
+    let resp;
+    try {
+      resp = await ApiBinary.one('mlStudioRemoteImportPreviewRequest', { url: state.url, apiKey: state.apiKey });
+    } catch (err) {
+      if (!modal.isConnected) return;
+      if (previewBtn) previewBtn.removeAttribute('disabled');
+      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(err.message || 'Błąd protokołu podglądu.')}</div>`;
+      return;
+    }
+    if (!modal.isConnected) return;
+    // Backend zwraca graceful error (zły URL/klucz/manifest) — pokazujemy dosłownie.
+    if (resp && resp.error) {
+      if (previewBtn) previewBtn.removeAttribute('disabled');
+      if (msg) msg.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(String(resp.error))}</div>`;
+      return;
+    }
+    state.preview = resp;
+    renderPreview(resp);
+  };
+
+  // Etap 2: inwentarz zdalnego projektu z manifestu + potwierdzenie importu.
+  const renderPreview = (preview) => {
+    const projName = preview.projectName ?? preview.project_name ?? '(bez nazwy)';
+    const projTypeSlug = preview.projectType ?? preview.project_type ?? '—';
+    const datasets = Array.isArray(preview.datasets) ? preview.datasets : [];
+    const classes = Array.isArray(preview.classes) ? preview.classes : [];
+    const archiveBytes = preview.archiveBytes ?? preview.archive_bytes ?? 0;
+    const archiveVersion = preview.archiveVersion ?? preview.archive_version ?? '—';
+
+    const classChips = classes.length
+      ? classes.map((c) => `<tf-chip label="${escapeAttr(String(c))}"></tf-chip>`).join('')
+      : '<span class="ml-studio-section-sub">brak zdefiniowanych klas</span>';
+
+    body.innerHTML = `
+      <div class="ml-studio-section-card">
+        <div class="ml-studio-section-card-head">
+          <div class="title">${sprite('catalog')} ${escapeHtml(String(projName))}</div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+          <tf-chip status="accent" icon="brain" label="typ: ${escapeAttr(String(projTypeSlug))}"></tf-chip>
+          <tf-chip icon="database" label="${datasets.length} ${escapeAttr(plural(datasets.length, 'dataset', 'datasety', 'datasetów'))}"></tf-chip>
+          <tf-chip icon="grid-2x2" label="${classes.length} ${escapeAttr(plural(classes.length, 'klasa', 'klasy', 'klas'))}"></tf-chip>
+          <tf-chip icon="info" label="wersja archiwum: ${escapeAttr(String(archiveVersion))}"></tf-chip>
+          <tf-chip icon="cloud" label="rozmiar: ${escapeAttr(formatFileSize(archiveBytes))}"></tf-chip>
+        </div>
+        <div id="ml-studio-remote-datasets"></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">${classChips}</div>
+      </div>
+      <div style="margin-top:12px">
+        <tf-input id="ml-studio-remote-name2" label="Nazwa nowego projektu (opcjonalnie)" placeholder="${escapeAttr(String(projName))}" value="${escapeAttr(state.nameOverride)}"></tf-input>
+        <p class="ml-studio-section-sub">Import pobierze archiwum ze zdalnej instancji i utworzy NOWY, lokalny projekt należący do Ciebie. Pusta nazwa = nazwa z manifestu.</p>
+      </div>
+    `;
+
+    const dsHost = body.querySelector('#ml-studio-remote-datasets');
+    if (dsHost) {
+      if (!datasets.length) {
+        dsHost.innerHTML = '<span class="ml-studio-section-sub">Projekt nie zawiera datasetów.</span>';
+      } else {
+        const table = document.createElement('tf-table');
+        table.setAttribute('variant', 'lined');
+        table.innerHTML = `
+          <tf-column key="name" label="Dataset"></tf-column>
+          <tf-column key="images" label="Obrazy" renderer="num"></tf-column>
+          <tf-column key="annotations" label="Anotacje" renderer="num"></tf-column>
+        `;
+        table.rows = datasets.map((d) => ({
+          name: String(d.name ?? d.datasetId ?? d.dataset_id ?? '—'),
+          images: Number(d.imageCount ?? d.image_count ?? 0),
+          annotations: Number(d.annotationCount ?? d.annotation_count ?? 0),
+        }));
+        dsHost.appendChild(table);
+      }
+    }
+
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>
+      <tf-button variant="outline" icon="external-link" id="ml-studio-remote-back">Wróć</tf-button>
+      <tf-button variant="primary" icon="check" id="ml-studio-remote-import">Importuj</tf-button>
+    `;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+    footer.querySelector('#ml-studio-remote-back')?.addEventListener('click', () => renderForm());
+    footer.querySelector('#ml-studio-remote-import')?.addEventListener('click', runImport);
+  };
+
+  // Etap 3: pełny import — pobranie archiwum + fazy importu, polling statusu.
+  const renderImportProgress = () => {
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:10px;padding:6px 0">
+        <div class="ml-studio-export-progress-text" style="text-align:left" id="ml-studio-remote-phase">Pobieranie archiwum…</div>
+        <tf-progress-bar id="ml-studio-remote-bar" value="0" tone="accent"></tf-progress-bar>
+        <div class="ml-studio-export-note" id="ml-studio-remote-bytes"></div>
+      </div>
+    `;
+    footer.innerHTML = `<tf-button variant="ghost" data-transfer-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  const phaseLabel = (phase) => (phase === 'downloading' ? 'Pobieranie archiwum…' : (phase || 'Import w toku…'));
+
+  const pollImport = (jobId) => {
+    const tick = async () => {
+      if (!modal.isConnected) return;
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioRemoteImportStatusRequest', { jobId });
+      } catch (err) {
+        if (!modal.isConnected) return;
+        renderError(err.message || 'Błąd protokołu importu.');
+        return;
+      }
+      if (!modal.isConnected) return;
+      const status = String(st.status || 'running');
+      const phase = String(st.phase ?? '');
+      const bytesTotal = Number(st.bytesTotal ?? st.bytes_total ?? 0);
+      const bytesDone = Number(st.bytesDone ?? st.bytes_done ?? 0);
+      const pct = bytesTotal > 0 ? Math.min(100, Math.round((bytesDone / bytesTotal) * 100)) : 0;
+      const bytesText = bytesTotal > 0 ? `${formatFileSize(bytesDone)} / ${formatFileSize(bytesTotal)}` : '';
+      if (status === 'failed') {
+        // Błędy zdalne (zły klucz = denied, niezgodność klas z importu wewnętrznego)
+        // przechodzą tu i pokazujemy je dosłownie.
+        renderError(String(st.error ?? '') || 'Import nie powiódł się.');
+        return;
+      }
+      if (status === 'succeeded') {
+        const phaseEl = body.querySelector('#ml-studio-remote-phase');
+        if (phaseEl) phaseEl.textContent = 'Import zakończony.';
+        const bar = body.querySelector('#ml-studio-remote-bar');
+        if (bar) bar.setAttribute('value', '100');
+        toast('Projekt zaimportowany z innej instancji.', 'success');
+        closeModal();
+        loadAll();
+        return;
+      }
+      const phaseEl = body.querySelector('#ml-studio-remote-phase');
+      if (phaseEl) phaseEl.textContent = phaseLabel(phase);
+      const bar = body.querySelector('#ml-studio-remote-bar');
+      if (bar) bar.setAttribute('value', String(pct));
+      const bytesEl = body.querySelector('#ml-studio-remote-bytes');
+      if (bytesEl) bytesEl.textContent = bytesText;
+      setTimeout(tick, PROJECT_TRANSFER_POLL_MS);
+    };
+    tick();
+  };
+
+  const runImport = async () => {
+    const nameOverride = String(modal.querySelector('#ml-studio-remote-name2')?.value || '').trim();
+    state.nameOverride = nameOverride;
+    const payload = { url: state.url, apiKey: state.apiKey };
+    if (nameOverride) payload.nameOverride = nameOverride;
+    const importBtn = footer.querySelector('#ml-studio-remote-import');
+    if (importBtn) importBtn.setAttribute('disabled', '');
+    let jobId;
+    try {
+      const resp = await ApiBinary.one('mlStudioRemoteImportStartRequest', payload);
+      jobId = resp.jobId ?? resp.job_id;
+    } catch (err) {
+      if (importBtn) importBtn.removeAttribute('disabled');
+      toast(err.message || 'Nie udało się rozpocząć importu.', 'error');
+      return;
+    }
+    if (!jobId) {
+      renderError('Serwer nie zwrócił identyfikatora zadania importu.');
+      return;
+    }
+    renderImportProgress();
+    pollImport(jobId);
   };
 
   document.body.appendChild(modal);

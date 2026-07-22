@@ -8,16 +8,23 @@ def gather_rows_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     table: UnsafePointer[Float16, MutAnyOrigin],
     ids: UnsafePointer[Int32, MutAnyOrigin],
+    n_rows: Int,
     n_cols: Int,
 ):
-    """out[t] = table[ids[t]] — token embedding lookup. Grid.x = tokens."""
+    """Bezpiecznie pobiera batch wierszy F16; błędne ID zeruje bez odczytu tabeli."""
     t = Int(block_idx.x)
-    src = Int(ids[t]) * n_cols
+    row = Int(ids[t])
     dst = t * n_cols
     var i = Int(thread_idx.x)
-    while i < n_cols:
-        out_ptr[dst + i] = table[src + i]
-        i += Int(block_dim.x)
+    if row < 0 or row >= n_rows:
+        while i < n_cols:
+            out_ptr[dst + i] = 0.0
+            i += Int(block_dim.x)
+    else:
+        src = row * n_cols
+        while i < n_cols:
+            out_ptr[dst + i] = table[src + i]
+            i += Int(block_dim.x)
 
 
 def gemv_f16_out_f32(

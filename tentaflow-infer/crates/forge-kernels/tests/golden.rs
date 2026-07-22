@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::{DevBuffer, Device, Pool};
+use forge_kernels::{Kernels, Nvfp4GgufQ8Projection};
 use forge_types::MemKind;
-use forge_kernels::Kernels;
 use forge_types::{DType, QuantKind};
 use half::f16;
 
@@ -39,6 +39,17 @@ fn fill(i: usize) -> f32 {
 fn upload_f16(dev: &dyn Device, vals: &[f32]) -> DevBuffer {
     let host: Vec<f16> = vals.iter().map(|&v| f16::from_f32(v)).collect();
     let bytes: &[u8] = bytemuck_cast(&host);
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(bytes, &buf, 0).unwrap();
+    buf
+}
+
+fn upload_f32(dev: &dyn Device, vals: &[f32]) -> DevBuffer {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(vals.as_ptr() as *const u8, std::mem::size_of_val(vals))
+    };
     let buf = dev
         .alloc(bytes.len(), MemKind::Device, Pool::Weights)
         .unwrap();
@@ -254,7 +265,11 @@ fn gemm_q4_k_matches_formats_dequant() {
                 .map(|c| w_f32[r * cols + c] * x[t * cols + c])
                 .sum();
             let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
-            assert!(rel < 0.02, "t {t} row {r}: got {} want {want}", got[t * rows + r]);
+            assert!(
+                rel < 0.02,
+                "t {t} row {r}: got {} want {want}",
+                got[t * rows + r]
+            );
         }
     }
 }
@@ -372,7 +387,10 @@ fn gemm_q6_k_mmq_prefill_matches_formats_dequant() {
         }
     }
     let rel_l2 = (num / den).sqrt();
-    assert!(rel_l2 < 5e-3, "Q6_K MMQ relL2 {rel_l2:.3e} exceeds q8_1 tolerance");
+    assert!(
+        rel_l2 < 5e-3,
+        "Q6_K MMQ relL2 {rel_l2:.3e} exceeds q8_1 tolerance"
+    );
 }
 
 #[test]
@@ -408,7 +426,11 @@ fn gemm_q6_k_matches_formats_dequant() {
                 .map(|c| w_f32[r * cols + c] * x[t * cols + c])
                 .sum();
             let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
-            assert!(rel < 0.02, "t {t} row {r}: got {} want {want}", got[t * rows + r]);
+            assert!(
+                rel < 0.02,
+                "t {t} row {r}: got {} want {want}",
+                got[t * rows + r]
+            );
         }
     }
 }
@@ -457,7 +479,10 @@ fn gemm_q6_k_native_prefill_matches_formats_dequant() {
         }
     }
     let rel_l2 = (num / den).sqrt();
-    assert!(rel_l2 < 5e-3, "Q6_K native relL2 {rel_l2:.3e} exceeds q8_1 tolerance");
+    assert!(
+        rel_l2 < 5e-3,
+        "Q6_K native relL2 {rel_l2:.3e} exceeds q8_1 tolerance"
+    );
 }
 
 #[test]
@@ -477,15 +502,9 @@ fn gemv_nvfp4_matches_formats_dequant() {
         .map(|i| (((i * 29 + 3) % 96) + 16) as u8) // exponents 2..13, positive
         .collect();
 
-    let w_f32 = forge_formats::nvfp4::dequantize_nvfp4(
-        &packed,
-        &scales,
-        global_scale,
-        rows,
-        cols,
-        16,
-    )
-    .unwrap();
+    let w_f32 =
+        forge_formats::nvfp4::dequantize_nvfp4(&packed, &scales, global_scale, rows, cols, 16)
+            .unwrap();
 
     let x: Vec<f32> = (0..cols)
         .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
@@ -512,6 +531,1251 @@ fn gemv_nvfp4_matches_formats_dequant() {
         let rel = (got[r] - want).abs() / (want.abs() + 1.0);
         assert!(rel < 0.02, "row {r}: got {} want {want}", got[r]);
     }
+}
+
+fn e2m1_reference(code: u8) -> f32 {
+    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let magnitude = MAGNITUDES[(code & 0x07) as usize];
+    if code & 0x08 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+fn make_nvfp4_gguf(rows: usize, cols: usize) -> Vec<u8> {
+    let blocks_per_row = cols / 64;
+    let mut weights = vec![0u8; rows * blocks_per_row * 36];
+    for row in 0..rows {
+        for block in 0..blocks_per_row {
+            let base = (row * blocks_per_row + block) * 36;
+            for subblock in 0..4 {
+                weights[base + subblock] = 0x20 + ((row + block * 3 + subblock * 5) % 25) as u8;
+                for j in 0..8 {
+                    let low = ((row * 7 + block * 11 + subblock * 3 + j * 5) % 16) as u8;
+                    let high = ((row * 13 + block * 5 + subblock * 7 + j * 3 + 1) % 16) as u8;
+                    weights[base + 4 + subblock * 8 + j] = low | (high << 4);
+                }
+            }
+        }
+    }
+    weights
+}
+
+fn nvfp4_gguf_dot(weights: &[u8], row: usize, cols: usize, x: &[f32], output_scale: f32) -> f32 {
+    let blocks_per_row = cols / 64;
+    let row_base = row * blocks_per_row * 36;
+    let mut sum = 0.0f32;
+    for group in 0..cols / 16 {
+        let block = group / 4;
+        let subblock = group % 4;
+        let block_base = row_base + block * 36;
+        let scale_byte = weights[block_base + subblock];
+        let scale = if scale_byte == 0x7f {
+            0.0
+        } else {
+            forge_formats::nvfp4::f8e4m3_to_f32(scale_byte)
+        };
+        let packed_base = block_base + 4 + subblock * 8;
+        let x_base = group * 16;
+        let mut dot = 0.0f32;
+        for j in 0..8 {
+            let code = weights[packed_base + j];
+            dot += e2m1_reference(code & 0x0f) * x[x_base + j];
+            dot += e2m1_reference(code >> 4) * x[x_base + j + 8];
+        }
+        sum += scale * dot;
+    }
+    sum * output_scale
+}
+
+#[test]
+fn gemv_nvfp4_gguf_matches_cpu_for_block_and_model_shape() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for (rows, cols) in [(7usize, 64usize), (5120usize, 5120usize)] {
+        let mut weights = make_nvfp4_gguf(rows, cols);
+        weights[0] = 0x7f;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| f16::from_f32(fill(i) * 0.025).to_f32())
+            .collect();
+        let wb = dev
+            .alloc(weights.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        dev.write(&weights, &wb, 0).unwrap();
+        let xb = upload_f16(dev.as_ref(), &x);
+        let yb = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+
+        let output_scale = 0.3125;
+        kernels
+            .gemv_nvfp4_gguf_f16(&yb, &wb, &xb, rows, cols, output_scale, &stream)
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let got = download_f16(dev.as_ref(), &yb, rows);
+        for (row, &value) in got.iter().enumerate() {
+            let want = nvfp4_gguf_dot(&weights, row, cols, &x, output_scale);
+            let rel = (value - want).abs() / (want.abs() + 1.0);
+            assert!(
+                rel < 0.02,
+                "kształt {rows}x{cols}, wiersz {row}: otrzymano {value}, oczekiwano {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gemv_nvfp4_gguf_q8_1_matches_cpu_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for (rows, cols) in [(7usize, 64usize), (5120usize, 5120usize)] {
+        let mut weights = make_nvfp4_gguf(rows, cols);
+        weights[0] = 0x7f;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| f16::from_f32(fill(i) * 0.025).to_f32())
+            .collect();
+        let weights_buffer = dev
+            .alloc(weights.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        dev.write(&weights, &weights_buffer, 0).unwrap();
+        let input = upload_f16(dev.as_ref(), &x);
+        let output = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+        let output_scale = 0.3125;
+        kernels
+            .gemv_nvfp4_gguf_q8_1_group_f16(
+                &[Nvfp4GgufQ8Projection {
+                    output: &output,
+                    weights: &weights_buffer,
+                    rows,
+                    output_scale,
+                }],
+                &input,
+                cols,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let got = download_f16(dev.as_ref(), &output, rows);
+        let want: Vec<f32> = (0..rows)
+            .map(|row| nvfp4_gguf_dot(&weights, row, cols, &x, output_scale))
+            .collect();
+        let error = got
+            .iter()
+            .zip(&want)
+            .map(|(&actual, &reference)| (actual - reference).powi(2))
+            .sum::<f32>();
+        let norm = want.iter().map(|value| value.powi(2)).sum::<f32>();
+        let relative_l2 = (error / norm.max(1e-12)).sqrt();
+        assert!(
+            relative_l2 < 0.02,
+            "kształt {rows}x{cols}: względny błąd L2 {relative_l2:.4}"
+        );
+    }
+}
+
+#[test]
+fn gemm_nvfp4_gguf_dispatch_matches_cpu() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (11usize, 576usize);
+    let mut weights = make_nvfp4_gguf(rows, cols);
+    weights[0] = 0x7f;
+    let weights_buffer = dev
+        .alloc(weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&weights, &weights_buffer, 0).unwrap();
+
+    for n_tokens in [2usize, 3, 4, 5, 8, 9, 16, 17, 128, 129] {
+        let input: Vec<f32> = (0..n_tokens * cols)
+            .map(|i| f16::from_f32(fill(i + n_tokens) * 0.025).to_f32())
+            .collect();
+        let input_buffer = upload_f16(dev.as_ref(), &input);
+        let output_buffer = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+        let output_scale = 0.625;
+        kernels
+            .gemm_nvfp4_gguf_f16(
+                &output_buffer,
+                &weights_buffer,
+                &input_buffer,
+                rows,
+                cols,
+                n_tokens,
+                output_scale,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let got = download_f16(dev.as_ref(), &output_buffer, n_tokens * rows);
+        for token in 0..n_tokens {
+            let token_input = &input[token * cols..(token + 1) * cols];
+            for row in 0..rows {
+                let want = nvfp4_gguf_dot(&weights, row, cols, token_input, output_scale);
+                let value = got[token * rows + row];
+                let rel = (value - want).abs() / (want.abs() + 1.0);
+                assert!(
+                    rel < 0.02,
+                    "T={n_tokens}, wiersz {row}: otrzymano {value}, oczekiwano {want}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gemm_nvfp4_gguf_rejects_invalid_buffers_and_scale() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let tiny = upload_f16(dev.as_ref(), &[0.0]);
+
+    assert!(kernels
+        .gather_f16_row_f16(&tiny, &tiny, &tiny, &tiny, 0, 1, 0, &stream)
+        .is_err());
+    assert!(kernels
+        .gather_f16_row_f16(&tiny, &tiny, &tiny, &tiny, 0, 1, 1, &stream)
+        .is_err());
+    assert!(kernels
+        .gemm_nvfp4_gguf_f16(&tiny, &tiny, &tiny, 2, 64, 3, 1.0, &stream)
+        .is_err());
+    assert!(kernels
+        .gemm_nvfp4_gguf_f16(&tiny, &tiny, &tiny, 1, 64, 3, f32::NAN, &stream)
+        .is_err());
+    assert!(kernels
+        .gemm_nvfp4_gguf_f16(&tiny, &tiny, &tiny, 1, 64, 1, 1.0, &stream)
+        .is_err());
+}
+
+fn make_q8_0(rows: usize, cols: usize) -> Vec<u8> {
+    let blocks_per_row = cols / 32;
+    let mut weights = Vec::with_capacity(rows * blocks_per_row * 34);
+    for row in 0..rows {
+        for block in 0..blocks_per_row {
+            let scale = f16::from_f32(0.003 + ((row + block) % 7) as f32 * 0.001);
+            weights.extend_from_slice(&scale.to_le_bytes());
+            for k in 0..32 {
+                weights.push((((row * 17 + block * 13 + k * 7) % 63) as i32 - 31) as i8 as u8);
+            }
+        }
+    }
+    weights
+}
+
+fn fp32_to_ue4m3(mut value: f32) -> u8 {
+    if value <= 0.0 {
+        return 0;
+    }
+    value = value.min(448.0);
+    let bits = value.to_bits();
+    let fp32_exp = ((bits >> 23) & 0xff) as i32 - 127;
+    let fp32_man = ((bits >> 20) & 7) as i32;
+    let mut exponent = fp32_exp + 7;
+    if exponent <= 0 {
+        return (value.mul_add(512.0, 0.5) as i32).clamp(0, 7) as u8;
+    }
+    if exponent >= 15 {
+        return 0x7e;
+    }
+    let mut mantissa = fp32_man + ((bits >> 19) & 1) as i32;
+    if mantissa > 7 {
+        mantissa = 0;
+        exponent += 1;
+        if exponent >= 15 {
+            return 0x7e;
+        }
+    }
+    ((exponent << 3) | mantissa) as u8
+}
+
+fn ue4m3(value: u8) -> f32 {
+    if value == 0 || value == 0x7f {
+        return 0.0;
+    }
+    let exponent = (value >> 3) & 0x0f;
+    let mantissa = (value & 7) as f32;
+    if exponent == 0 {
+        mantissa / 512.0
+    } else {
+        (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent as i32 - 7)
+    }
+}
+
+fn best_e2m1(value: f32, scale: f32) -> u8 {
+    const VALUES: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0,
+        -3.0, -4.0, -6.0,
+    ];
+    let mut best = 0;
+    let mut error = value.abs();
+    for (index, candidate) in VALUES.iter().enumerate().skip(1) {
+        let next = (candidate * scale - value).abs();
+        if next < error {
+            best = index as u8;
+            error = next;
+        }
+    }
+    best
+}
+
+fn q8_0_to_nvfp4_reference(source: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let blocks = rows * cols / 64;
+    let mut output = vec![0u8; blocks * 36];
+    for block in 0..blocks {
+        for subblock in 0..4 {
+            let q8_block = block * 2 + subblock / 2;
+            let q8_base = q8_block * 34;
+            let q8_scale = f16::from_le_bytes([source[q8_base], source[q8_base + 1]]).to_f32();
+            let q8_offset = q8_base + 2 + (subblock % 2) * 16;
+            let values: Vec<f32> = source[q8_offset..q8_offset + 16]
+                .iter()
+                .map(|value| (*value as i8) as f32 * q8_scale)
+                .collect();
+            let amax = values.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
+            let scale_code = fp32_to_ue4m3(amax / 6.0);
+            let scale = ue4m3(scale_code);
+            output[block * 36 + subblock] = scale_code;
+            for index in 0..8 {
+                let low = best_e2m1(values[index], scale);
+                let high = best_e2m1(values[index + 8], scale);
+                output[block * 36 + 4 + subblock * 8 + index] = low | (high << 4);
+            }
+        }
+    }
+    output
+}
+
+#[test]
+fn gpu_pack_q8_0_nvfp4_i_gemv_f32_zgadza_sie_z_referencja() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (17usize, 128usize);
+    let q8 = make_q8_0(rows, cols);
+    let expected = q8_0_to_nvfp4_reference(&q8, rows, cols);
+    let source = dev.alloc(q8.len(), MemKind::Device, Pool::Weights).unwrap();
+    let packed = dev
+        .alloc(expected.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&q8, &source, 0).unwrap();
+    kernels
+        .pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)
+        .unwrap();
+
+    let x: Vec<f32> = (0..cols)
+        .map(|index| f16::from_f32(fill(index) * 0.07).to_f32())
+        .collect();
+    let x_dev = upload_f16(dev.as_ref(), &x);
+    let logits = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+    kernels
+        .gemv_nvfp4_gguf_out_f32(&logits, &packed, &x_dev, rows, cols, 1.0, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    assert_eq!(download_u8(dev.as_ref(), &packed, expected.len()), expected);
+    let weights = forge_formats::dequant::dequantize_to_f32(
+        DType::F32,
+        QuantKind::NVFP4Gguf,
+        &expected,
+        rows * cols,
+    )
+    .unwrap();
+    let reference: Vec<f32> = (0..rows)
+        .map(|row| (0..cols).map(|col| weights[row * cols + col] * x[col]).sum())
+        .collect();
+    let got = download_f32(dev.as_ref(), &logits, rows);
+    assert!(max_abs_err(&got, &reference) < 0.02);
+    let top = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap()
+            .0
+    };
+    assert_eq!(top(&got), top(&reference));
+}
+
+#[test]
+fn gpu_nvfp4_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (257usize, 128usize);
+    let q8 = make_q8_0(rows, cols);
+    let packed_bytes = rows * (cols / 64) * 36;
+    let source = dev.alloc(q8.len(), MemKind::Device, Pool::Weights).unwrap();
+    let packed = dev
+        .alloc(packed_bytes, MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&q8, &source, 0).unwrap();
+    kernels
+        .pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)
+        .unwrap();
+    let first: Vec<f32> = (0..cols).map(|index| fill(index) * 0.03125).collect();
+    let second: Vec<f32> = (0..cols)
+        .map(|index| fill(index + 11) * -0.046875)
+        .collect();
+    let first_dev = upload_f16(dev.as_ref(), &first);
+    let second_dev = upload_f16(dev.as_ref(), &second);
+    let mut joined = first.clone();
+    joined.extend_from_slice(&second);
+    let joined_dev = upload_f16(dev.as_ref(), &joined);
+    let first_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let second_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let batch_logits = dev
+        .alloc(2 * rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    kernels
+        .gemv_nvfp4_gguf_out_f32(
+            &first_logits,
+            &packed,
+            &first_dev,
+            rows,
+            cols,
+            1.0,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemv_nvfp4_gguf_out_f32(
+            &second_logits,
+            &packed,
+            &second_dev,
+            rows,
+            cols,
+            1.0,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemm_nvfp4_gguf_out_f32_b2(
+            &batch_logits,
+            &packed,
+            &joined_dev,
+            rows,
+            cols,
+            1.0,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+    let mut expected = download_f32(dev.as_ref(), &first_logits, rows);
+    expected.extend(download_f32(dev.as_ref(), &second_logits, rows));
+    assert_eq!(download_f32(dev.as_ref(), &batch_logits, 2 * rows), expected);
+}
+
+#[test]
+fn gpu_q8_0_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (257usize, 128usize);
+    let weights = make_q8_0(rows, cols);
+    let weights_dev = dev
+        .alloc(weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&weights, &weights_dev, 0).unwrap();
+    let first: Vec<f32> = (0..cols).map(|index| fill(index) * 0.03125).collect();
+    let second: Vec<f32> = (0..cols)
+        .map(|index| fill(index + 11) * -0.046875)
+        .collect();
+    let first_dev = upload_f16(dev.as_ref(), &first);
+    let second_dev = upload_f16(dev.as_ref(), &second);
+    let mut joined = first.clone();
+    joined.extend_from_slice(&second);
+    let joined_dev = upload_f16(dev.as_ref(), &joined);
+    let first_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let second_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let batch_logits = dev
+        .alloc(2 * rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    kernels
+        .gemv_q8_0_out_f32(
+            &first_logits,
+            &weights_dev,
+            &first_dev,
+            rows,
+            cols,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemv_q8_0_out_f32(
+            &second_logits,
+            &weights_dev,
+            &second_dev,
+            rows,
+            cols,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemm_q8_0_f16_exact_out_f32_at(
+            &batch_logits,
+            &weights_dev,
+            0,
+            &joined_dev,
+            rows,
+            cols,
+            2,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+    let mut expected = download_f32(dev.as_ref(), &first_logits, rows);
+    expected.extend(download_f32(dev.as_ref(), &second_logits, rows));
+    assert_eq!(download_f32(dev.as_ref(), &batch_logits, 2 * rows), expected);
+}
+
+fn q8_0_dot(weights: &[u8], row: usize, cols: usize, x: &[f32]) -> f32 {
+    let blocks_per_row = cols / 32;
+    let row_base = row * blocks_per_row * 34;
+    let mut sum = 0.0f32;
+    for block in 0..blocks_per_row {
+        let offset = row_base + block * 34;
+        let scale = f16::from_le_bytes([weights[offset], weights[offset + 1]]).to_f32();
+        let mut dot = 0.0f32;
+        for k in 0..32 {
+            dot += (weights[offset + 2 + k] as i8) as f32 * x[block * 32 + k];
+        }
+        sum += scale * dot;
+    }
+    sum
+}
+
+#[test]
+fn mtp_gather_q8_0_row_matches_cpu() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (vocab_size, hidden_size, token) = (5usize, 128usize, 3usize);
+    let weights = make_q8_0(vocab_size, hidden_size);
+    let weights_buffer = dev
+        .alloc(weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&weights, &weights_buffer, 0).unwrap();
+    let token_buffer = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&(token as i32).to_le_bytes(), &token_buffer, 0)
+        .unwrap();
+    let status = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&0i32.to_le_bytes(), &status, 0).unwrap();
+    let output = upload_f16(dev.as_ref(), &vec![0.0; hidden_size]);
+
+    kernels
+        .gather_q8_0_row_f16(
+            &output,
+            &weights_buffer,
+            &token_buffer,
+            &status,
+            0,
+            vocab_size,
+            hidden_size,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &output, hidden_size);
+    let row_base = token * (hidden_size / 32) * 34;
+    for (element, &value) in got.iter().enumerate() {
+        let block = element / 32;
+        let offset = row_base + block * 34;
+        let scale = f16::from_le_bytes([weights[offset], weights[offset + 1]]).to_f32();
+        let want = scale * (weights[offset + 2 + element % 32] as i8) as f32;
+        assert!(
+            (value - want).abs() < 0.002,
+            "element {element}: otrzymano {value}, oczekiwano {want}"
+        );
+    }
+}
+
+#[test]
+fn mtp_gather_f16_row_matches_cpu() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (vocab_size, hidden_size, token) = (5usize, 128usize, 3usize);
+    let weights: Vec<f32> = (0..vocab_size * hidden_size)
+        .map(|index| f16::from_f32(fill(index) * 0.05).to_f32())
+        .collect();
+    let weights_buffer = upload_f16(dev.as_ref(), &weights);
+    let token_buffer = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&(token as i32).to_le_bytes(), &token_buffer, 0)
+        .unwrap();
+    let status = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&0i32.to_le_bytes(), &status, 0).unwrap();
+    let output = upload_f16(dev.as_ref(), &vec![0.0; hidden_size]);
+
+    kernels
+        .gather_f16_row_f16(
+            &output,
+            &weights_buffer,
+            &token_buffer,
+            &status,
+            0,
+            vocab_size,
+            hidden_size,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    assert_eq!(
+        download_f16(dev.as_ref(), &output, hidden_size),
+        weights[token * hidden_size..(token + 1) * hidden_size]
+    );
+}
+
+#[test]
+fn mtp_gather_nvfp4_gguf_row_matches_cpu() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (vocab_size, hidden_size, token) = (5usize, 128usize, 3usize);
+    let output_scale = 0.3125f32;
+    let mut weights = make_nvfp4_gguf(vocab_size, hidden_size);
+    let row_base = token * (hidden_size / 64) * 36;
+    weights[row_base] = 0x7f;
+    let weights_buffer = dev
+        .alloc(weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&weights, &weights_buffer, 0).unwrap();
+    let token_buffer = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&(token as i32).to_le_bytes(), &token_buffer, 0)
+        .unwrap();
+    let status = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&0i32.to_le_bytes(), &status, 0).unwrap();
+    let output = upload_f16(dev.as_ref(), &vec![0.0; hidden_size]);
+
+    kernels
+        .gather_nvfp4_gguf_row_f16(
+            &output,
+            &weights_buffer,
+            &token_buffer,
+            &status,
+            0,
+            vocab_size,
+            hidden_size,
+            output_scale,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &output, hidden_size);
+    for (element, &value) in got.iter().enumerate() {
+        let block = element / 64;
+        let subblock = (element % 64) / 16;
+        let within = element % 16;
+        let block_base = row_base + block * 36;
+        let scale_byte = weights[block_base + subblock];
+        let scale = if scale_byte == 0x7f {
+            0.0
+        } else {
+            forge_formats::nvfp4::f8e4m3_to_f32(scale_byte)
+        };
+        let packed = weights[block_base + 4 + subblock * 8 + within % 8];
+        let code = if within < 8 {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
+        let want = e2m1_reference(code) * scale * output_scale;
+        assert!(
+            (value - want).abs() < 0.002,
+            "element {element}: otrzymano {value}, oczekiwano {want}"
+        );
+    }
+}
+
+#[test]
+fn mtp_gather_rejects_invalid_shapes_and_buffers() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let tiny = upload_f16(dev.as_ref(), &[0.0]);
+
+    assert!(kernels
+        .gather_q8_0_row_f16(&tiny, &tiny, &tiny, &tiny, 0, 1, 31, &stream)
+        .is_err());
+    assert!(kernels
+        .gather_q8_0_row_f16(&tiny, &tiny, &tiny, &tiny, 0, 1, 32, &stream)
+        .is_err());
+    assert!(kernels
+        .gather_nvfp4_gguf_row_f16(&tiny, &tiny, &tiny, &tiny, 0, 1, 63, 1.0, &stream)
+        .is_err());
+    assert!(kernels
+        .gather_nvfp4_gguf_row_f16(&tiny, &tiny, &tiny, &tiny, 0, 1, 64, 1.0, &stream)
+        .is_err());
+}
+
+#[test]
+fn mtp_gather_guards_device_token_out_of_range() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (vocab_size, hidden_size) = (2usize, 64usize);
+    let q8 = make_q8_0(vocab_size, hidden_size);
+    let nvfp4 = make_nvfp4_gguf(vocab_size, hidden_size);
+    let f16_weights: Vec<f32> = (0..vocab_size * hidden_size).map(fill).collect();
+    let f16_buffer = upload_f16(dev.as_ref(), &f16_weights);
+    let q8_buffer = dev.alloc(q8.len(), MemKind::Device, Pool::Weights).unwrap();
+    let nvfp4_buffer = dev
+        .alloc(nvfp4.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&q8, &q8_buffer, 0).unwrap();
+    dev.write(&nvfp4, &nvfp4_buffer, 0).unwrap();
+
+    for token in [-1i32, vocab_size as i32] {
+        let token_buffer = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+        let status = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+        dev.write(&token.to_le_bytes(), &token_buffer, 0).unwrap();
+        dev.write(&0i32.to_le_bytes(), &status, 0).unwrap();
+        let q8_output = upload_f16(dev.as_ref(), &vec![1.0; hidden_size]);
+        kernels
+            .gather_q8_0_row_f16(
+                &q8_output,
+                &q8_buffer,
+                &token_buffer,
+                &status,
+                0,
+                vocab_size,
+                hidden_size,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+        let mut status_bytes = [0u8; 4];
+        dev.read(&status, 0, &mut status_bytes).unwrap();
+        assert_eq!(i32::from_le_bytes(status_bytes), 1);
+        assert!(download_f16(dev.as_ref(), &q8_output, hidden_size)
+            .iter()
+            .all(|&value| value == 0.0));
+
+        dev.write(&0i32.to_le_bytes(), &status, 0).unwrap();
+        let f16_output = upload_f16(dev.as_ref(), &vec![1.0; hidden_size]);
+        kernels
+            .gather_f16_row_f16(
+                &f16_output,
+                &f16_buffer,
+                &token_buffer,
+                &status,
+                0,
+                vocab_size,
+                hidden_size,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+        dev.read(&status, 0, &mut status_bytes).unwrap();
+        assert_eq!(i32::from_le_bytes(status_bytes), 1);
+        assert!(download_f16(dev.as_ref(), &f16_output, hidden_size)
+            .iter()
+            .all(|&value| value == 0.0));
+
+        dev.write(&0i32.to_le_bytes(), &status, 0).unwrap();
+        let nvfp4_output = upload_f16(dev.as_ref(), &vec![1.0; hidden_size]);
+        kernels
+            .gather_nvfp4_gguf_row_f16(
+                &nvfp4_output,
+                &nvfp4_buffer,
+                &token_buffer,
+                &status,
+                0,
+                vocab_size,
+                hidden_size,
+                1.0,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+        dev.read(&status, 0, &mut status_bytes).unwrap();
+        assert_eq!(i32::from_le_bytes(status_bytes), 1);
+        assert!(download_f16(dev.as_ref(), &nvfp4_output, hidden_size)
+            .iter()
+            .all(|&value| value == 0.0));
+    }
+}
+
+fn rmsnorm_reference(values: &[f32], weight: &[f32]) -> Vec<f32> {
+    let mean_sq = values.iter().map(|value| value * value).sum::<f32>() / values.len() as f32;
+    let inv = 1.0 / (mean_sq + EPS).sqrt();
+    values
+        .iter()
+        .zip(weight)
+        .map(|(value, weight)| f16::from_f32(value * inv * weight).to_f32())
+        .collect()
+}
+
+#[test]
+fn mtp_prepare_matches_cpu_for_small_and_qwen_hidden() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for hidden_size in [128usize, 5120usize] {
+        let embedding_row: Vec<f32> = (0..hidden_size)
+            .map(|i| f16::from_f32(fill(i) * 0.05).to_f32())
+            .collect();
+        let hidden: Vec<f32> = (0..hidden_size)
+            .map(|i| f16::from_f32(fill(i + 11) * 0.04).to_f32())
+            .collect();
+        let enorm: Vec<f32> = (0..hidden_size)
+            .map(|i| f16::from_f32(0.8 + (i % 9) as f32 * 0.025).to_f32())
+            .collect();
+        let hnorm: Vec<f32> = (0..hidden_size)
+            .map(|i| f16::from_f32(0.9 + (i % 7) as f32 * 0.02).to_f32())
+            .collect();
+        let projection = make_q8_0(hidden_size, 2 * hidden_size);
+
+        let output_buffer = upload_f16(dev.as_ref(), &vec![0.0; hidden_size]);
+        let embedding_buffer = upload_f16(dev.as_ref(), &embedding_row);
+        let hidden_buffer = upload_f16(dev.as_ref(), &hidden);
+        let enorm_buffer = upload_f16(dev.as_ref(), &enorm);
+        let hnorm_buffer = upload_f16(dev.as_ref(), &hnorm);
+        let projection_buffer = dev
+            .alloc(projection.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        dev.write(&projection, &projection_buffer, 0).unwrap();
+
+        kernels
+            .mtp_prepare_f16(
+                &output_buffer,
+                &embedding_buffer,
+                &hidden_buffer,
+                &enorm_buffer,
+                &hnorm_buffer,
+                &projection_buffer,
+                hidden_size,
+                EPS,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let mut joined = rmsnorm_reference(&embedding_row, &enorm);
+        joined.extend(rmsnorm_reference(&hidden, &hnorm));
+        let got = download_f16(dev.as_ref(), &output_buffer, hidden_size);
+        for (row, &value) in got.iter().enumerate() {
+            let want = q8_0_dot(&projection, row, 2 * hidden_size, &joined);
+            let rel = (value - want).abs() / (want.abs() + 1.0);
+            assert!(
+                rel < 0.02,
+                "MTP H={hidden_size}, wiersz {row}: otrzymano {value}, oczekiwano {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mtp_prepare_rejects_invalid_shapes_and_buffers() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let tiny = upload_f16(dev.as_ref(), &[0.0]);
+
+    assert!(kernels
+        .mtp_prepare_f16(&tiny, &tiny, &tiny, &tiny, &tiny, &tiny, 5136, EPS, &stream,)
+        .is_err());
+    assert!(kernels
+        .mtp_prepare_f16(&tiny, &tiny, &tiny, &tiny, &tiny, &tiny, 16, 0.0, &stream)
+        .is_err());
+    assert!(kernels
+        .mtp_prepare_f16(&tiny, &tiny, &tiny, &tiny, &tiny, &tiny, 16, EPS, &stream)
+        .is_err());
+}
+
+#[test]
+fn deltanet_batched_scan_matches_sequential_checkpoints_and_gpu_commit() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let n_v_heads = 4usize;
+    let d_state = 128usize;
+    let vector_elements = n_v_heads * d_state;
+    let state_elements = n_v_heads * d_state * d_state;
+    let state_bytes = state_elements * 4;
+    let initial_state: Vec<f32> = (0..state_elements)
+        .map(|index| fill(index + 17) * 0.0025)
+        .collect();
+
+    for n_steps in 2..=4 {
+        let q: Vec<f32> = (0..n_steps * vector_elements)
+            .map(|index| f16::from_f32(fill(index * 3 + 5) * 0.04).to_f32())
+            .collect();
+        let k: Vec<f32> = (0..n_steps * vector_elements)
+            .map(|index| f16::from_f32(fill(index * 5 + 7) * 0.04).to_f32())
+            .collect();
+        let v: Vec<f32> = (0..n_steps * vector_elements)
+            .map(|index| f16::from_f32(fill(index * 7 + 11) * 0.03).to_f32())
+            .collect();
+        let g: Vec<f32> = (0..n_steps * n_v_heads)
+            .map(|index| -0.05 - (index % 7) as f32 * 0.025)
+            .collect();
+        let beta: Vec<f32> = (0..n_steps * n_v_heads)
+            .map(|index| 0.2 + (index % 5) as f32 * 0.1)
+            .collect();
+
+        let sequential_state = upload_f32(dev.as_ref(), &initial_state);
+        let sequential_checkpoints = dev
+            .alloc(n_steps * state_bytes, MemKind::Device, Pool::Weights)
+            .unwrap();
+        let sequential_outputs = dev
+            .alloc(n_steps * vector_elements * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        for token in 0..n_steps {
+            let vector_range = token * vector_elements..(token + 1) * vector_elements;
+            let gate_range = token * n_v_heads..(token + 1) * n_v_heads;
+            let q_token = upload_f16(dev.as_ref(), &q[vector_range.clone()]);
+            let k_token = upload_f16(dev.as_ref(), &k[vector_range.clone()]);
+            let v_token = upload_f16(dev.as_ref(), &v[vector_range]);
+            let g_token = upload_f32(dev.as_ref(), &g[gate_range.clone()]);
+            let beta_token = upload_f32(dev.as_ref(), &beta[gate_range]);
+            let output_token = dev
+                .alloc(vector_elements * 2, MemKind::Device, Pool::Activations)
+                .unwrap();
+            kernels
+                .deltanet_gated_step_f16(
+                    &output_token,
+                    &sequential_state,
+                    &q_token,
+                    &k_token,
+                    &v_token,
+                    &g_token,
+                    &beta_token,
+                    n_v_heads,
+                    d_state,
+                    &stream,
+                )
+                .unwrap();
+            dev.copy(
+                &sequential_state,
+                0,
+                &sequential_checkpoints,
+                token * state_bytes,
+                state_bytes,
+                &stream,
+            )
+            .unwrap();
+            dev.copy(
+                &output_token,
+                0,
+                &sequential_outputs,
+                token * vector_elements * 2,
+                vector_elements * 2,
+                &stream,
+            )
+            .unwrap();
+        }
+
+        let state_in = upload_f32(dev.as_ref(), &initial_state);
+        let q_all = upload_f16(dev.as_ref(), &q);
+        let k_all = upload_f16(dev.as_ref(), &k);
+        let v_all = upload_f16(dev.as_ref(), &v);
+        let g_all = upload_f32(dev.as_ref(), &g);
+        let beta_all = upload_f32(dev.as_ref(), &beta);
+        let checkpoint_byte_offset = n_steps * state_bytes;
+        let checkpoints = dev
+            .alloc(2 * n_steps * state_bytes, MemKind::Device, Pool::Weights)
+            .unwrap();
+        let outputs = dev
+            .alloc(n_steps * vector_elements * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        kernels
+            .deltanet_gated_scan_f16_at(
+                &outputs,
+                &checkpoints,
+                checkpoint_byte_offset,
+                &state_in,
+                &q_all,
+                &k_all,
+                &v_all,
+                &g_all,
+                &beta_all,
+                n_steps,
+                n_v_heads,
+                d_state,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let expected_states = download_f32(
+            dev.as_ref(),
+            &sequential_checkpoints,
+            n_steps * state_elements,
+        );
+        let retained_states = download_f32(dev.as_ref(), &checkpoints, 2 * n_steps * state_elements);
+        let actual_states = &retained_states[n_steps * state_elements..];
+        let expected_outputs = download_f16(
+            dev.as_ref(),
+            &sequential_outputs,
+            n_steps * vector_elements,
+        );
+        let actual_outputs = download_f16(dev.as_ref(), &outputs, n_steps * vector_elements);
+        assert_eq!(actual_states, expected_states, "T={n_steps}: checkpointy");
+        assert_eq!(actual_outputs, expected_outputs, "T={n_steps}: wyjścia");
+        assert_eq!(
+            download_f32(dev.as_ref(), &state_in, state_elements),
+            initial_state,
+            "T={n_steps}: skan zmodyfikował stan wejściowy"
+        );
+
+        let accepted_index = dev
+            .alloc(std::mem::size_of::<i32>(), MemKind::Device, Pool::Activations)
+            .unwrap();
+        let accepted_cases = -1..=n_steps as i32 + 1;
+        for accepted in accepted_cases {
+            let committed = upload_f32(dev.as_ref(), &initial_state);
+            dev.write(&accepted.to_le_bytes(), &accepted_index, 0)
+                .unwrap();
+            kernels
+                .deltanet_commit_checkpoint_f32_at(
+                    &committed,
+                    &checkpoints,
+                    checkpoint_byte_offset,
+                    &accepted_index,
+                    n_steps,
+                    n_v_heads,
+                    d_state,
+                    &stream,
+                )
+                .unwrap();
+            dev.synchronize().unwrap();
+            let actual = download_f32(dev.as_ref(), &committed, state_elements);
+            let expected = if (1..=n_steps as i32).contains(&accepted) {
+                let checkpoint = accepted as usize - 1;
+                &expected_states[checkpoint * state_elements..(checkpoint + 1) * state_elements]
+            } else {
+                &initial_state
+            };
+            assert_eq!(actual, expected, "T={n_steps}, accepted={accepted}");
+        }
+    }
+}
+
+#[test]
+fn deltanet_batched_scan_rejects_invalid_shapes_and_buffers() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let tiny = dev
+        .alloc(4, MemKind::Device, Pool::Activations)
+        .unwrap();
+
+    for n_steps in [0, 1, 5, usize::MAX] {
+        assert!(kernels
+            .deltanet_gated_scan_f16(
+                &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, n_steps, 1, 128,
+                &stream,
+            )
+            .is_err());
+    }
+    assert!(kernels
+        .deltanet_gated_scan_f16(
+            &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, 4, usize::MAX, 1024,
+            &stream,
+        )
+        .is_err());
+    assert!(kernels
+        .deltanet_commit_checkpoint_f32(&tiny, &tiny, &tiny, 4, usize::MAX, 1024, &stream)
+        .is_err());
+    assert!(kernels
+        .deltanet_gated_scan_f16_at(
+            &tiny,
+            &tiny,
+            usize::MAX,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            2,
+            1,
+            1,
+            &stream,
+        )
+        .is_err());
+    assert!(kernels
+        .deltanet_commit_checkpoint_f32_at(
+            &tiny,
+            &tiny,
+            usize::MAX,
+            &tiny,
+            2,
+            1,
+            1,
+            &stream,
+        )
+        .is_err());
+}
+
+#[test]
+fn batched_nvfp4_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (24usize, 256usize);
+    let global_scale = 12.5f32;
+    let packed: Vec<u8> = (0..rows * cols / 2)
+        .map(|i| ((i * 41 + 7) % 256) as u8)
+        .collect();
+    let scales: Vec<u8> = (0..rows * cols / 16)
+        .map(|i| (((i * 29 + 3) % 96) + 16) as u8)
+        .collect();
+    let weights =
+        forge_formats::nvfp4::dequantize_nvfp4(&packed, &scales, global_scale, rows, cols, 16)
+            .unwrap();
+    let packed_buf = dev
+        .alloc(packed.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    let scales_buf = dev
+        .alloc(scales.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&packed, &packed_buf, 0).unwrap();
+    dev.write(&scales, &scales_buf, 0).unwrap();
+
+    // Rozmiary obejmują B1, pełne buckety i ich niepełne warianty.
+    for batch in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+        let x: Vec<f32> = (0..batch * cols)
+            .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+            .collect();
+        let x_buf = upload_f16(dev.as_ref(), &x);
+        let y_buf = upload_f16(dev.as_ref(), &vec![0.0; batch * rows]);
+        kernels
+            .gemm_nvfp4_f16(
+                &y_buf,
+                &packed_buf,
+                &scales_buf,
+                &x_buf,
+                rows,
+                cols,
+                batch,
+                1.0 / global_scale,
+                &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+        let got = download_f16(dev.as_ref(), &y_buf, batch * rows);
+        for token in 0..batch {
+            for row in 0..rows {
+                let want: f32 = (0..cols)
+                    .map(|col| weights[row * cols + col] * x[token * cols + col])
+                    .sum();
+                let rel = (got[token * rows + row] - want).abs() / (want.abs() + 1.0);
+                assert!(
+                    rel < 0.02,
+                    "batch {batch}, token {token}, row {row}: got {} want {want}",
+                    got[token * rows + row]
+                );
+            }
+        }
+    }
+    let x_buf = upload_f16(dev.as_ref(), &vec![0.0; cols]);
+    let y_buf = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+    assert!(kernels
+        .gemm_nvfp4_f16(
+            &y_buf,
+            &packed_buf,
+            &scales_buf,
+            &x_buf,
+            rows,
+            cols,
+            0,
+            1.0 / global_scale,
+            &stream,
+        )
+        .is_err());
+    assert!(kernels
+        .gemm_nvfp4_f16(
+            &y_buf,
+            &packed_buf,
+            &scales_buf,
+            &x_buf,
+            rows,
+            0,
+            1,
+            1.0 / global_scale,
+            &stream,
+        )
+        .is_err());
+    assert!(kernels
+        .gemm_nvfp4_f16(
+            &y_buf,
+            &packed_buf,
+            &scales_buf,
+            &x_buf,
+            rows,
+            8,
+            1,
+            1.0 / global_scale,
+            &stream,
+        )
+        .is_err());
+}
+
+#[test]
+fn batched_f16_logits_match_reference() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (24usize, 256usize);
+    let weights: Vec<f32> = (0..rows * cols)
+        .map(|i| f16::from_f32(fill(i) * 0.05).to_f32())
+        .collect();
+    let weights_buf = upload_f16(dev.as_ref(), &weights);
+
+    // Rozmiary obejmują B1 oraz pełne i niepełne buckety B4/B8.
+    for batch in [1usize, 2, 3, 4, 5, 7, 8, 17, 31, 33] {
+        let x: Vec<f32> = (0..batch * cols)
+            .map(|i| f16::from_f32(fill(i + 11) * 0.1).to_f32())
+            .collect();
+        let x_buf = upload_f16(dev.as_ref(), &x);
+        let y_buf = dev
+            .alloc(batch * rows * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        kernels
+            .gemm_f16_out_f32_at(&y_buf, &weights_buf, 0, &x_buf, rows, cols, batch, &stream)
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let mut bytes = vec![0u8; batch * rows * 4];
+        dev.read(&y_buf, 0, &mut bytes).unwrap();
+        let got: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for token in 0..batch {
+            for row in 0..rows {
+                let want: f32 = (0..cols)
+                    .map(|col| weights[row * cols + col] * x[token * cols + col])
+                    .sum();
+                let rel = (got[token * rows + row] - want).abs() / (want.abs() + 1.0);
+                assert!(
+                    rel < 1e-4,
+                    "batch {batch}, token {token}, row {row}: got {} want {want}",
+                    got[token * rows + row]
+                );
+            }
+        }
+    }
+    let x_buf = upload_f16(dev.as_ref(), &vec![0.0; cols]);
+    let y_buf = dev
+        .alloc(rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    assert!(kernels
+        .gemm_f16_out_f32_at(&y_buf, &weights_buf, 0, &x_buf, rows, cols, 0, &stream,)
+        .is_err());
+    assert!(kernels
+        .gemm_f16_out_f32_at(&y_buf, &weights_buf, 0, &x_buf, rows, 4, 1, &stream,)
+        .is_err());
 }
 
 #[test]
@@ -580,9 +1844,7 @@ fn attn_decode_matches_reference() {
             for pos in 0..ctx_len {
                 let page = page_of(s, pos);
                 let kv_off = ((page * n_kv_heads + kvh) * page_size + pos % page_size) * head_dim;
-                let dot: f32 = (0..head_dim)
-                    .map(|e| q[qb_off + e] * kc[kv_off + e])
-                    .sum();
+                let dot: f32 = (0..head_dim).map(|e| q[qb_off + e] * kc[kv_off + e]).sum();
                 scores.push(dot * scale);
             }
             let m = scores.iter().cloned().fold(f32::MIN, f32::max);
@@ -605,6 +1867,36 @@ fn attn_decode_matches_reference() {
             }
         }
     }
+}
+
+#[test]
+fn gqa_decode_capability_odpowiada_zaladowanym_artefaktom() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+
+    assert_eq!(
+        kernels.supports_attn_decode_gqa4_f16_hd128(),
+        dev.caps().fp8_native,
+        "wbudowany split GQA sm_89 ma być dostępny wyłącznie tam, gdzie loader go załadował"
+    );
+}
+
+#[test]
+fn gqa_decode_odrzuca_zbyt_male_bufory_i_overflow() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let tiny = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+
+    assert!(kernels
+        .attn_decode_split_gqa4_f16_hd128(
+            &tiny, &tiny, 0, &tiny, 0, &tiny, 0, &tiny, &tiny, &tiny, &tiny, &tiny, 1, 4, 1, 1, 1,
+            1, 1e-5, 10_000.0, 0.125, &stream,
+        )
+        .is_err());
+    assert!(kernels
+        .attn_decode_combine_gqa2_f16_hd128(&tiny, &tiny, usize::MAX, 4, 1, &stream,)
+        .is_err());
 }
 
 // The dp4a GEMVs quantize activations to q8_1 (int8) before the dot, so
@@ -726,7 +2018,11 @@ fn build_quant(quant: QuantKind, rows: usize, cols: usize) -> Vec<u8> {
             // dot products stay in comparable range.
             match quant {
                 QuantKind::Q5K | QuantKind::Q2K => {
-                    let (doff, moff) = if quant == QuantKind::Q5K { (0, 2) } else { (80, 82) };
+                    let (doff, moff) = if quant == QuantKind::Q5K {
+                        (0, 2)
+                    } else {
+                        (80, 82)
+                    };
                     block[doff..doff + 2].copy_from_slice(&d.to_le_bytes());
                     block[moff..moff + 2].copy_from_slice(&dmin.to_le_bytes());
                 }
@@ -740,9 +2036,7 @@ fn build_quant(quant: QuantKind, rows: usize, cols: usize) -> Vec<u8> {
                 | QuantKind::IQ3S
                 | QuantKind::IQ2XXS
                 | QuantKind::IQ3XXS
-                | QuantKind::IQ1S => {
-                    block[0..2].copy_from_slice(&d.to_le_bytes())
-                }
+                | QuantKind::IQ1S => block[0..2].copy_from_slice(&d.to_le_bytes()),
                 // E8M0 scale byte: keep exponents small (2^-9 .. 2^-3).
                 QuantKind::MXFP4 => block[0] = 118 + ((r + b) % 7) as u8,
                 // IQ1_M packs d in the top nibbles of the 4 scale words;
@@ -825,7 +2119,11 @@ fn gemv_case(quant: QuantKind, gemv: GemvFn, out32: GemvFn) {
     for r in 0..rows {
         let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
         let rel = (got32[r] - want).abs() / (want.abs() + 1.0);
-        assert!(rel < 0.02, "{quant:?} f32 row {r}: got {} want {want}", got32[r]);
+        assert!(
+            rel < 0.02,
+            "{quant:?} f32 row {r}: got {} want {want}",
+            got32[r]
+        );
     }
 }
 
@@ -1020,3 +2318,126 @@ quant_golden!(
     gemv_iq1_m_out_f32,
     gemm_iq1_m_f16
 );
+
+fn download_u8(dev: &dyn Device, buf: &DevBuffer, n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n];
+    dev.read(buf, 0, &mut out).unwrap();
+    out
+}
+
+fn download_f32(dev: &dyn Device, buf: &DevBuffer, n: usize) -> Vec<f32> {
+    let bytes = download_u8(dev, buf, n * 4);
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+#[test]
+fn gpu_pack_nvfp4_wspolpracuje_z_fp8_gemm_i_gemv() {
+    let Some(dev) = device() else { return };
+    if !dev.caps().fp8_native {
+        return;
+    }
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let cols = 512usize;
+    let source_rows = 12usize;
+    let groups = cols / 16;
+    let mut packed = vec![0u8; source_rows * cols / 2];
+    let mut source_scales = vec![0x38u8; source_rows * groups];
+    for row in 0..source_rows {
+        for byte in 0..cols / 2 {
+            let lo = ((row * 3 + byte * 5) % 15 + 1) as u8;
+            let hi = ((row * 7 + byte * 3) % 15 + 1) as u8;
+            packed[row * cols / 2 + byte] = lo | (hi << 4);
+        }
+        for group in 0..groups {
+            source_scales[row * groups + group] = [0x30, 0x38, 0x40][(row + group) % 3];
+        }
+    }
+    let packed_dev = dev
+        .alloc(packed.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    let source_scales_dev = dev
+        .alloc(source_scales.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&packed, &packed_dev, 0).unwrap();
+    dev.write(&source_scales, &source_scales_dev, 0).unwrap();
+    let x: Vec<f32> = (0..cols)
+        .map(|i| f16::from_f32(fill(i) * 0.05).to_f32())
+        .collect();
+    let x_dev = upload_f16(dev.as_ref(), &x);
+
+    // Offset Q w sklejonej macierzy, dwie połówki gate/up oraz samodzielne O/down.
+    let cases = [
+        ("q", 1usize),
+        ("gate", 4),
+        ("up", 6),
+        ("o", 8),
+        ("down", 10),
+    ];
+    for (label, offset) in cases {
+        let rows = 2usize;
+        let qweight = dev
+            .alloc(rows * cols, MemKind::Device, Pool::Weights)
+            .unwrap();
+        let scales = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+        kernels
+            .pack_nvfp4_fp8(
+                &qweight,
+                &scales,
+                &packed_dev,
+                &source_scales_dev,
+                cols,
+                offset,
+                rows,
+                1.0,
+                &stream,
+            )
+            .unwrap();
+        let y = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+        kernels
+            .gemm_fp8(&y, &qweight, &scales, &x_dev, rows, cols, 1, &stream)
+            .unwrap();
+        let logits = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+        kernels
+            .gemv_fp8_out_f32(&logits, &qweight, &scales, &x_dev, rows, cols, &stream)
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let codes = download_u8(dev.as_ref(), &qweight, rows * cols);
+        let row_scales = download_f32(dev.as_ref(), &scales, rows);
+        let gemm = download_f16(dev.as_ref(), &y, rows);
+        let gemv = download_f32(dev.as_ref(), &logits, rows);
+        let absmax = x.iter().fold(0.0f32, |m, value| m.max(value.abs()));
+        let x_scale = absmax / 448.0;
+        let x_codes: Vec<u8> = x
+            .iter()
+            .map(|value| forge_formats::nvfp4::f32_to_f8e4m3(value * 448.0 / absmax))
+            .collect();
+        for row in 0..rows {
+            let mut expected_gemm = 0.0f32;
+            let mut expected_gemv = 0.0f32;
+            for col in 0..cols {
+                let weight =
+                    forge_formats::nvfp4::f8e4m3_to_f32(codes[row * cols + col]) * row_scales[row];
+                expected_gemm +=
+                    weight * forge_formats::nvfp4::f8e4m3_to_f32(x_codes[col]) * x_scale;
+                expected_gemv += weight * x[col];
+            }
+            let gemm_rel = (gemm[row] - expected_gemm).abs() / (expected_gemm.abs() + 1.0);
+            let gemv_rel = (gemv[row] - expected_gemv).abs() / (expected_gemv.abs() + 1.0);
+            assert!(
+                gemm_rel < 0.03,
+                "{label} GEMM: {} != {expected_gemm}",
+                gemm[row]
+            );
+            assert!(
+                gemv_rel < 0.03,
+                "{label} GEMV: {} != {expected_gemv}",
+                gemv[row]
+            );
+        }
+    }
+}

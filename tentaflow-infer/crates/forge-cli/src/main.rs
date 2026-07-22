@@ -1,5 +1,6 @@
 // ===== File: main.rs — `forge` CLI: serve an OpenAI API, run one-shot generation, benchmark =====
 
+mod bench;
 mod hf;
 
 use std::net::SocketAddr;
@@ -10,10 +11,13 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_engine::kv::KvQuant;
-use forge_engine::model::ModelConfig;
+use forge_engine::model::{ModelConfig, MAX_SPEC_DRAFT};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::sample::SamplingParams;
-use forge_engine::server::{EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig};
+use forge_engine::server::{
+    BenchmarkTimings, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
+};
+use forge_engine::speculation::{ProposerKind, SpeculationKind};
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
@@ -63,9 +67,10 @@ enum Command {
         /// Require `Authorization: Bearer <key>` on /v1/*.
         #[arg(long)]
         api_key: Option<String>,
-        /// Max concurrently decoding sequences.
-        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
-        max_active: u16,
+        /// Maksymalna liczba równocześnie dekodowanych sekwencji.
+        /// Domyślnie 1 dla MTP, w pozostałych trybach 8.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        max_active: Option<u16>,
         /// Minimum simultaneously-decoding sequences before the batched forward
         /// path engages (below it the tuned fused single-seq path is faster).
         #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u16).range(2..))]
@@ -137,11 +142,9 @@ enum Command {
         /// with tiering / rot KV / hybrid arch.
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
-        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k>. `on`
-        /// enables the self-drafting n-gram proposer (draft budget 8) for
-        /// greedy, penalty-free requests on the dense F16 paged-KV path; output
-        /// stays identical to non-speculative decode. Forces `--prefix-cache
-        /// off` when enabled. `off` = today's decode loop, byte-for-byte.
+        /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3]. `on`
+        /// używa proposera n-gram. MTP wymaga greedy bez kar; `max-active > 1`
+        /// przechodzi startup preflight pamięci. Spekulacja wyłącza prefix cache.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
     },
@@ -224,8 +227,8 @@ enum Command {
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
-        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k> (see
-        /// `forge serve`). Forces `--prefix-cache off` when enabled.
+        /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
+        /// Włączenie wymusza `--prefix-cache off`.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
     },
@@ -264,6 +267,12 @@ enum Command {
         /// Prompt length in tokens.
         #[arg(long, default_value_t = 512)]
         prompt_tokens: usize,
+        /// Dokładne tokeny promptu jako kolejne little-endian `u32`.
+        #[arg(long = "prompt-token-ids")]
+        prompt_token_ids: Option<PathBuf>,
+        /// Rozmiar puli wag w GiB; 0 dobiera pulę z aktualnie wolnego VRAM.
+        #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
+        weights_pool_gb: f64,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -307,14 +316,12 @@ enum Command {
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
-        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k> (see
-        /// `forge serve`). Forces `--prefix-cache off` when enabled.
+        /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
+        /// Włączenie wymusza `--prefix-cache off`.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
-        /// Warm best-of-N: submit the same request N times reusing the loaded
-        /// model and report the fastest prefill + decode. The 4090's cold first
-        /// GEMM launch throttles ~2×, so rep 1 is always discarded when N > 1.
-        #[arg(long = "reps", default_value_t = 1)]
+        /// Liczba mierzonych prób po jednym osobnym przebiegu rozgrzewającym.
+        #[arg(long = "reps", default_value_t = 5)]
         reps: usize,
     },
     /// Measure next-token perplexity on a fixed held-out passage (W4A8 quality
@@ -472,6 +479,8 @@ fn main() -> Result<()> {
             model_path,
             tokens,
             prompt_tokens,
+            prompt_token_ids,
+            weights_pool_gb,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -499,6 +508,8 @@ fn main() -> Result<()> {
                 &model_path,
                 tokens,
                 prompt_tokens,
+                prompt_token_ids.as_deref(),
+                weights_pool_gb,
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -543,29 +554,74 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
     }
 }
 
-/// Parse `--speculative`: `off` | `on` | `ngram` | `ngram:<k>`. `on`/`ngram`
-/// use the default draft budget; `ngram:<k>` sets it explicitly.
+/// Parsuje `--speculative`: `off` | `on` | `ngram[:k]` | `mtp[:2|3]` | `mtp+ngram:2|3`.
 fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
     // The verify forward runs the ungraphed prefill path, so a long draft
     // (amortizing its per-op launch overhead over many accepted tokens) is what
     // makes it a net win; 16 measured best on qwen3-0.6b.
     const DEFAULT_DRAFT: usize = 16;
-    match s {
-        "off" => Ok(SpeculativeConfig::off()),
-        "on" | "ngram" => Ok(SpeculativeConfig::ngram(DEFAULT_DRAFT)),
-        other => match other.strip_prefix("ngram:") {
-            Some(k) => {
-                let k: usize = k
-                    .parse()
-                    .with_context(|| format!("invalid draft budget in --speculative '{other}'"))?;
-                if k == 0 {
-                    bail!("--speculative draft budget must be >= 1");
-                }
-                Ok(SpeculativeConfig::ngram(k))
-            }
-            None => bail!("unsupported --speculative '{other}' (expected off | on | ngram | ngram:<k>)"),
-        },
+    if s == "off" {
+        return Ok(SpeculativeConfig::off());
     }
+    let explicit_budget = s.contains(':');
+    let (name, budget) = match s.split_once(':') {
+        Some((name, raw_budget)) => {
+            let budget = raw_budget
+                .parse::<usize>()
+                .with_context(|| format!("invalid draft budget in --speculative '{s}'"))?;
+            if !(1..=MAX_SPEC_DRAFT).contains(&budget) {
+                bail!("--speculative draft budget must be in 1..={MAX_SPEC_DRAFT}");
+            }
+            (name, budget)
+        }
+        None => (
+            s,
+            if matches!(s, "mtp" | "mtp+ngram") {
+                3
+            } else {
+                DEFAULT_DRAFT
+            },
+        ),
+    };
+    match name {
+        "on" if explicit_budget => {
+            bail!("--speculative 'on' does not accept a draft budget; use ngram:<k>")
+        }
+        "on" | "ngram" => SpeculativeConfig::ngram(budget).map_err(Into::into),
+        "mtp" => SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget).map_err(Into::into),
+        "mtp+ngram" => SpeculativeConfig::chain(
+            vec![ProposerKind::Mtp, ProposerKind::Ngram],
+            budget,
+        )
+        .map_err(Into::into),
+        "draft-model" | "eagle" | "dflash" | "dspark" => bail!(
+            "--speculative proposer '{name}' requires an implemented neural loader and forge-speculation.json"
+        ),
+        other => bail!("unsupported --speculative proposer '{other}'"),
+    }
+}
+
+fn resolve_max_active(
+    max_active: Option<u16>,
+    spec: &SpeculativeConfig,
+    hybrid_model: bool,
+) -> Result<usize> {
+    let max_active = usize::from(max_active.unwrap_or_else(|| {
+        if hybrid_model
+            || matches!(
+                spec.kind(),
+                SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+            )
+        {
+            1
+        } else {
+            8
+        }
+    }));
+    if max_active == 0 {
+        bail!("--max-active musi być większe od zera");
+    }
+    Ok(max_active)
 }
 
 fn parse_prefix_cache(s: &str) -> Result<bool> {
@@ -673,6 +729,14 @@ fn default_model_id(path: &Path) -> String {
 /// KV pool sized for exactly `kv_pages` pages of this model (floored at
 /// 1 GiB), 1 GiB activations.
 #[allow(clippy::too_many_arguments)]
+fn activation_pool_bytes(_native_mtp: bool, hybrid: bool) -> usize {
+    if hybrid {
+        9usize << 27
+    } else {
+        1usize << 30
+    }
+}
+
 fn load_for_serve(
     path: &Path,
     kv_pages: usize,
@@ -682,6 +746,7 @@ fn load_for_serve(
     ctx: usize,
     hot_pages: usize,
     prefix_cache: bool,
+    native_mtp: bool,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
@@ -699,13 +764,14 @@ fn load_for_serve(
     } else {
         kv_pages.max(ctx_pages)
     };
-    let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30);
+    let kv_pool =
+        kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant, native_mtp).max(1 << 30);
     let stage = if kv_tier.enabled() {
         tier_stage_bytes(&desc, kv_page_size, ctx_pages, kv_quant)
     } else {
         0
     };
-    let activations = 1usize << 30;
+    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
     let free = CudaDevice::free_vram(0).context("query free VRAM")?;
@@ -718,7 +784,7 @@ fn load_for_serve(
         PoolSizes {
             weights,
             kv_cache: kv_pool,
-            activations: 1 << 30,
+            activations,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
     )
@@ -731,6 +797,7 @@ fn load_for_serve(
         kv_tier,
         max_seq_len,
         prefix_cache,
+        native_mtp,
     };
     let loaded = load_model(dev, path, cfg)?;
     Ok((loaded, kv_pages, max_seq_len))
@@ -761,6 +828,7 @@ fn load_auto(
     kv_pages_flag: usize,
     hot_pages: usize,
     prefix_cache: bool,
+    native_mtp: bool,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
@@ -784,13 +852,10 @@ fn load_auto(
         0
     };
 
-    // Activations pool holds decode scratch + persistent decode buffers. The
-    // engine's paged KV slabs and (hybrid) SSM state allocate from the WEIGHTS
-    // pool, not the HAL kv_cache pool — that pool is unused by the LLM engine,
-    // so it is kept minimal (otherwise a full 1 GiB kv_cache arena is claimed
-    // but never used, needlessly starving the weights pool).
-    let activations = 1usize << 30;
-    let hal_kv = 4usize << 20;
+    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
+    // `KvCache` alokuje wszystkie slaby targetu i opcjonalnego MTP w dedykowanej
+    // puli; rozmiar uwzględnia wyrównanie każdego bufora do granulacji slabów.
+    let hal_kv = kv_pool_bytes(&desc, page_size, kv_pages, kv_quant, native_mtp);
     let weights = if weights_pool_gb > 0.0 {
         (weights_pool_gb * (1u64 << 30) as f64) as usize + stage
     } else {
@@ -819,6 +884,7 @@ fn load_auto(
             kv_pages,
             max_seq_len,
             prefix_cache,
+            native_mtp,
         },
     )
 }
@@ -912,6 +978,7 @@ fn cmd_embed(
         8192,
         0,
         0,
+        false,
         false,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -1051,7 +1118,7 @@ fn cmd_serve(
     bind: SocketAddr,
     model_id: Option<String>,
     api_key: Option<String>,
-    max_active: u16,
+    max_active: Option<u16>,
     batch_min: u16,
     prefill_chunk: usize,
     kv_pages: usize,
@@ -1066,16 +1133,15 @@ fn cmd_serve(
     prefix_cache: bool,
     spec: SpeculativeConfig,
 ) -> Result<()> {
-    let max_active = usize::from(max_active);
     // Speculation appends + rolls back draft KV on the plain paged cache; the
     // radix prefix cache donates/borrows pages and is mutually exclusive with
     // it, so enabling speculation forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.enabled;
-    if spec.enabled {
+    let prefix_cache = prefix_cache && !spec.is_enabled();
+    if spec.is_enabled() {
         tracing::info!("speculative decoding enabled; prefix cache disabled");
     }
     let t0 = Instant::now();
-    let (loaded, kv_pages, max_seq_len) = load_for_serve(
+    let (mut loaded, kv_pages, max_seq_len) = load_for_serve(
         model_path,
         kv_pages,
         weights_pool_gb,
@@ -1084,7 +1150,13 @@ fn cmd_serve(
         ctx,
         hot_pages,
         prefix_cache,
+        matches!(
+            spec.kind(),
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+        ),
     )?;
+    let max_active = resolve_max_active(max_active, &spec, loaded.model.is_hybrid())?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -1121,7 +1193,7 @@ fn cmd_serve(
         prefill_chunk,
         batch_min as usize,
         spec,
-    );
+    )?;
 
     let whisper = match whisper_model {
         Some(dir) => {
@@ -1193,7 +1265,7 @@ fn cmd_serve(
 }
 
 /// Drive one engine request to completion, invoking `on_text` per emitted
-/// piece. Returns (generated_tokens, prompt_tokens, first_token_at, done_at).
+/// piece. Returns counts, first visible token, completion and profil benchmarku.
 /// Token counts come from the engine's `Done` usage, not from counting text
 /// pieces. `first_token_at` is the first VISIBLE text event: the engine only
 /// emits `Token` for non-empty decoded pieces, so UTF-8/stop-holdback in the
@@ -1202,19 +1274,20 @@ fn cmd_serve(
 fn drain_request(
     engine: &EngineHandle,
     req: EngineRequest,
-    mut on_text: impl FnMut(&str),
-) -> Result<(usize, usize, Instant, Instant)> {
+    mut on_token: impl FnMut(u32, &str),
+) -> Result<(usize, usize, Instant, Instant, Option<BenchmarkTimings>)> {
     let rx = engine.submit(req).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut first_token_at = None;
     loop {
         match rx.recv().context("engine stream ended unexpectedly")? {
-            EngineEvent::Token { text, .. } => {
+            EngineEvent::Token { id, text, .. } => {
                 first_token_at.get_or_insert_with(Instant::now);
-                on_text(&text);
+                on_token(id, &text);
             }
             EngineEvent::Done {
                 tokens,
                 prompt_tokens,
+                benchmark,
                 ..
             } => {
                 let done_at = Instant::now();
@@ -1223,6 +1296,7 @@ fn drain_request(
                     prompt_tokens,
                     first_token_at.unwrap_or(done_at),
                     done_at,
+                    benchmark,
                 ));
             }
             EngineEvent::Error(msg) => bail!("engine error: {msg}"),
@@ -1249,7 +1323,7 @@ fn cmd_run(
     let t0 = Instant::now();
     // Speculation is mutually exclusive with the radix prefix cache (both manage
     // paged KV ownership); enabling it forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.enabled;
+    let prefix_cache = prefix_cache && !spec.is_enabled();
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
@@ -1259,6 +1333,7 @@ fn cmd_run(
         kv_pages,
         hot_pages,
         prefix_cache,
+        spec.kind() == SpeculationKind::NativeMtp,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
@@ -1283,10 +1358,10 @@ fn cmd_run(
     let prompt_tokens = tokenizer
         .encode(&prompt_text, true)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec);
+    let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec)?;
 
     let submit_at = Instant::now();
-    let (generated, prompt_len, _first, done_at) = drain_request(
+    let (generated, prompt_len, _first, done_at, _) = drain_request(
         &engine,
         EngineRequest {
             prompt_tokens,
@@ -1300,7 +1375,7 @@ fn cmd_run(
             grammar: None,
             ..Default::default()
         },
-        |piece| {
+        |_, piece| {
             use std::io::Write;
             print!("{piece}");
             std::io::stdout().flush().ok();
@@ -1347,6 +1422,7 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         0,
         0,
         false,
+        false,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
@@ -1374,6 +1450,21 @@ fn maybe_calibrate_w4a8(
     tokenizer: &forge_tokenize::Tokenizer,
 ) -> Result<()> {
     let gemm = std::env::var("FORGE_GEMM").ok();
+    if gemm.as_deref() == Some("fp8mod-ffn") {
+        if !path.is_dir() {
+            bail!("FORGE_GEMM=fp8mod-ffn wymaga katalogu checkpointu NVFP4");
+        }
+        let t0 = Instant::now();
+        if model.build_fp8_ffn()? {
+            eprintln!(
+                "paczki FP8 Q/O/FFN/lm_head zbudowane na GPU w {:.3}s (K/V i warstwy decode pozostają NVFP4)",
+                t0.elapsed().as_secs_f32()
+            );
+        } else {
+            eprintln!("fp8mod-ffn niedostępny dla urządzenia, kształtów lub puli VRAM; pozostaje NVFP4");
+        }
+        return Ok(());
+    }
     if matches!(gemm.as_deref(), Some("fp8") | Some("fp8mod")) {
         if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
             bail!("FORGE_GEMM={} currently supports GGUF models only", gemm.unwrap());
@@ -1415,6 +1506,8 @@ fn cmd_bench(
     model_path: &Path,
     tokens: usize,
     prompt_tokens: usize,
+    prompt_token_ids: Option<&Path>,
+    weights_pool_gb: f64,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1427,33 +1520,89 @@ fn cmd_bench(
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
     }
-    if prompt_tokens == 0 {
+    if prompt_tokens == 0 && prompt_token_ids.is_none() {
         bail!("--prompt-tokens must be at least 1");
     }
     if reps == 0 {
         bail!("--reps must be at least 1");
     }
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache && !spec.enabled;
-    let mut loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages, prefix_cache)?;
+    let prefix_cache = prefix_cache && !spec.is_enabled();
+    let mut loaded = load_auto(
+        model_path,
+        weights_pool_gb,
+        kv_quant,
+        kv_tier,
+        ctx,
+        kv_pages,
+        hot_pages,
+        prefix_cache,
+        spec.kind() == SpeculationKind::NativeMtp,
+    )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
-    // Cycle a natural-language seed to the exact requested prompt length so
-    // prefill cost is measured on realistic token ids.
-    let seed_ids = tokenizer
-        .encode(
-            "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
-            false,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let prompt_ids: Vec<u32> = seed_ids
-        .iter()
-        .cycle()
-        .take(prompt_tokens)
-        .copied()
-        .collect();
+    let (prompt_ids, prompt_sha256, prompt_source) = if let Some(path) = prompt_token_ids {
+        let input = bench::TokenInput::read_u32le(path)?;
+        (input.ids, input.sha256, path.display().to_string())
+    } else {
+        let seed_ids = tokenizer
+            .encode(
+                "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
+                false,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ids: Vec<u32> = seed_ids
+            .iter()
+            .cycle()
+            .take(prompt_tokens)
+            .copied()
+            .collect();
+        let sha = bench::sha256_ids(&ids);
+        (ids, sha, "tokenizer-seed".into())
+    };
+    if prompt_ids.is_empty() {
+        bail!("benchmark prompt must contain at least one token");
+    }
+    let model_sha256 = model_path
+        .is_file()
+        .then(|| bench::sha256_file(model_path))
+        .transpose()?;
+    let bos_id = tokenizer.bos_id();
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "benchmark_input": {
+                "format": "u32le",
+                "source": prompt_source,
+                "sha256": prompt_sha256,
+                "token_count": prompt_ids.len(),
+                "first_token_id": prompt_ids.first(),
+                "tokenizer_bos_id": bos_id,
+                "starts_with_bos": bos_id.is_some_and(|id| prompt_ids.first() == Some(&id)),
+            },
+            "model": {
+                "path": model_path.display().to_string(),
+                "sha256": model_sha256,
+            },
+            "config": {
+                "ctx": ctx,
+                "kv_pages": kv_pages,
+                "hot_pages": hot_pages,
+                "weights_pool_gb": weights_pool_gb,
+                "kv_cache": format!("{kv_quant:?}"),
+                "prefix_cache": prefix_cache,
+                "speculation": format!("{:?}", spec.kind()),
+                "warmup_runs": 1,
+                "measured_runs": reps,
+            }
+        })
+    );
+
+    loaded
+        .model
+        .prepare_prefill_profiles(prompt_ids.len(), reps + 1)?;
 
     // Single-sequence bench: full-size prefill chunks, no ITL to protect.
     let engine = forge_engine::server::spawn_engine_batched(
@@ -1463,19 +1612,19 @@ fn cmd_bench(
         forge_engine::model::MAX_PREFILL_CHUNK,
         12,
         spec,
-    );
-    // Warm best-of-N: re-submit the identical request `reps` times reusing the
-    // loaded engine. With prefix caching off each rep re-runs the full prefill,
-    // so the cold first GEMM launch (throttled ~2× on the 4090) lands in rep 1
-    // and is discarded when reps > 1. Best (fastest) prefill and decode win.
-    let mut best_prefill_s = f64::INFINITY;
-    let mut best_decode_s = f64::INFINITY;
+    )?;
+    let mut target_ms = Vec::with_capacity(reps);
+    let mut catchup_ms = Vec::with_capacity(reps);
+    let mut ttft_ms = Vec::with_capacity(reps);
+    let mut decode_s = Vec::with_capacity(reps);
     let mut last_prompt_len = 0usize;
     let mut last_generated = 0usize;
-    for rep in 0..reps {
+    let mut generated_sha256 = None;
+    for rep in 0..=reps {
         let submit_at = Instant::now();
+        let mut generated_ids = Vec::with_capacity(tokens);
         // No EOS ids: the benchmark must decode exactly `tokens` tokens.
-        let (generated, prompt_len, first_at, done_at) = drain_request(
+        let (generated, prompt_len, first_at, done_at, profile) = drain_request(
             &engine,
             EngineRequest {
                 prompt_tokens: prompt_ids.clone(),
@@ -1489,41 +1638,160 @@ fn cmd_bench(
                 grammar: None,
                 ..Default::default()
             },
-            |_| {},
+            |id, _| generated_ids.push(id),
         )?;
-        let prefill_s = first_at.duration_since(submit_at).as_secs_f64();
-        let decode_s = done_at.duration_since(first_at).as_secs_f64();
+        let run_sha256 = bench::sha256_ids(&generated_ids);
+        if let Some(expected) = &generated_sha256 {
+            if expected != &run_sha256 {
+                bail!("greedy token IDs differ between benchmark repetitions");
+            }
+        } else {
+            generated_sha256 = Some(run_sha256.clone());
+        }
+        let visible_ttft_s = first_at.duration_since(submit_at).as_secs_f64();
+        let decode_elapsed_s = done_at.duration_since(first_at).as_secs_f64();
         last_prompt_len = prompt_len;
         last_generated = generated;
-        let prefill_tps = prompt_len as f64 / prefill_s.max(1e-9);
-        let decode_tps = (generated.saturating_sub(1)) as f64 / decode_s.max(1e-9);
+        let profile = profile.context("worker nie zwrócił profilu prefill")?;
+        let target = profile
+            .target_gpu_ms
+            .context("backend nie udostępnia czasu GPU target prefill")?;
+        let catchup = profile
+            .mtp_catchup_gpu_ms
+            .context("backend nie udostępnia czasu GPU MTP catch-up")?;
+        let prefill_tps = prompt_len as f64 / (target / 1000.0).max(1e-9);
+        let decode_tps =
+            (generated.saturating_sub(1)) as f64 / decode_elapsed_s.max(1e-9);
         eprintln!(
-            "rep {}/{reps}: prefill {prefill_s:.3}s ({prefill_tps:.1} tok/s) | decode {decode_s:.3}s ({decode_tps:.1} tok/s)",
-            rep + 1
+            "{} {}/{}: target {:.3} ms ({prefill_tps:.1} tok/s) | MTP catch-up {:.3} ms | TTFT {:.3} ms | visible TTFT {:.3} ms | decode {:.1} tok/s",
+            if rep == 0 { "warmup" } else { "rep" },
+            if rep == 0 { 1 } else { rep },
+            if rep == 0 { 1 } else { reps },
+            target,
+            catchup,
+            profile.ttft_ms,
+            visible_ttft_s * 1000.0,
+            decode_tps,
         );
-        // Discard rep 1 (cold) from the best-of when averaging over multiple reps.
-        if reps > 1 && rep == 0 {
+        eprintln!("generated token SHA256: {run_sha256}");
+        if rep == 0 {
             continue;
         }
-        best_prefill_s = best_prefill_s.min(prefill_s);
-        best_decode_s = best_decode_s.min(decode_s);
+        target_ms.push(target);
+        catchup_ms.push(catchup);
+        ttft_ms.push(profile.ttft_ms);
+        decode_s.push(decode_elapsed_s);
+    }
+    let target = bench::Distribution::from_samples(&target_ms)?;
+    let catchup = bench::Distribution::from_samples(&catchup_ms)?;
+    let ttft = bench::Distribution::from_samples(&ttft_ms)?;
+    let decode = bench::Distribution::from_samples(&decode_s)?;
+    println!("| phase | tokens | p10 ms | median ms | p90 ms | median tok/s |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    println!(
+        "| target prefill | {last_prompt_len} | {:.3} | {:.3} | {:.3} | {:.1} |",
+        target.p10,
+        target.median,
+        target.p90,
+        last_prompt_len as f64 / (target.median / 1000.0).max(1e-9)
+    );
+    println!(
+        "| MTP catch-up | {last_prompt_len} | {:.3} | {:.3} | {:.3} | - |",
+        catchup.p10, catchup.median, catchup.p90
+    );
+    println!(
+        "| TTFT | 1 | {:.3} | {:.3} | {:.3} | - |",
+        ttft.p10, ttft.median, ttft.p90
+    );
+    println!(
+        "| decode | {} | {:.3} | {:.3} | {:.3} | {:.1} |",
+        last_generated.saturating_sub(1),
+        decode.p10 * 1000.0,
+        decode.median * 1000.0,
+        decode.p90 * 1000.0,
+        last_generated.saturating_sub(1) as f64 / decode.median.max(1e-9)
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod speculation_cli_tests {
+    use super::{activation_pool_bytes, parse_speculative, resolve_max_active};
+    use forge_engine::speculation::{ProposerKind, SpeculationKind};
+
+    #[test]
+    fn parser_rejects_unsupported_budget_and_neural_proposer() {
+        assert!(parse_speculative("ngram:0").is_err());
+        assert!(parse_speculative("ngram:17").is_err());
+        assert!(parse_speculative("on:8").is_err());
+        assert!(parse_speculative("dspark:8").is_err());
+        assert!(parse_speculative("mtp:1").is_err());
+        assert!(parse_speculative("mtp:4").is_err());
     }
 
-    // Honest measurement note: "prefill" is submit → first visible token,
-    // which includes at least one decode step (and possibly a couple more if
-    // the decoder held back partial UTF-8); "decode" covers the remaining
-    // generated tokens as counted by the engine's usage numbers. Prefill runs
-    // through the batched chunked path (one chunk per scheduler iteration).
-    let prefill_tps = last_prompt_len as f64 / best_prefill_s.max(1e-9);
-    let decode_tps = (last_generated.saturating_sub(1)) as f64 / best_decode_s.max(1e-9);
+    #[test]
+    fn parser_accepts_explicit_ngram_budget() {
+        let config = parse_speculative("ngram:8").expect("konfiguracja powinna być poprawna");
+        assert_eq!(config.proposers(), &[ProposerKind::Ngram]);
+        assert_eq!(config.draft_tokens(), 8);
+    }
 
-    println!("| phase   | tokens | seconds | tok/s   |");
-    println!("|---------|--------|---------|---------|");
-    println!("| prefill | {last_prompt_len:>6} | {best_prefill_s:>7.3} | {prefill_tps:>7.1} |");
-    println!(
-        "| decode  | {:>6} | {best_decode_s:>7.3} | {decode_tps:>7.1} |",
-        last_generated.saturating_sub(1)
-    );
-    eprintln!("note: prefill is timed to the first visible token, so it includes >=1 decode step");
-    Ok(())
+    #[test]
+    fn parser_accepts_hybrid_ngram_budgets() {
+        for budget in [2, 3] {
+            let config = parse_speculative(&format!("ngram:{budget}"))
+                .expect("budżet hybrydowego n-gram powinien być poprawny");
+            assert_eq!(config.kind(), SpeculationKind::HostProposer);
+            assert_eq!(config.draft_tokens(), budget);
+            assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
+            assert_eq!(resolve_max_active(None, &config, false).unwrap(), 8);
+            assert!(!config.proposers().contains(&ProposerKind::Mtp));
+        }
+    }
+
+    #[test]
+    fn parser_accepts_native_mtp_budgets() {
+        for (input, expected_budget) in [("mtp", 3), ("mtp:2", 2), ("mtp:3", 3)] {
+            let config = parse_speculative(input).expect("MTP powinno być obsługiwane");
+            assert_eq!(config.proposers(), &[ProposerKind::Mtp]);
+            assert_eq!(config.kind(), SpeculationKind::NativeMtp);
+            assert_eq!(config.draft_tokens(), expected_budget);
+        }
+    }
+
+    #[test]
+    fn parser_accepts_mtp_ngram_router() {
+        for (input, expected_budget) in
+            [("mtp+ngram", 3), ("mtp+ngram:2", 2), ("mtp+ngram:3", 3)]
+        {
+            let config = parse_speculative(input).expect("router powinien być obsługiwany");
+            assert_eq!(
+                config.proposers(),
+                &[ProposerKind::Mtp, ProposerKind::Ngram]
+            );
+            assert_eq!(config.kind(), SpeculationKind::NativeMtpNgram);
+            assert_eq!(config.draft_tokens(), expected_budget);
+            assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
+            assert_eq!(resolve_max_active(Some(2), &config, true).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn mtp_domyslnie_ogranicza_serwer_do_jednej_sekwencji() {
+        let mtp = parse_speculative("mtp").unwrap();
+        let off = parse_speculative("off").unwrap();
+        assert_eq!(resolve_max_active(None, &mtp, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(None, &off, false).unwrap(), 8);
+        assert_eq!(resolve_max_active(None, &off, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(Some(1), &mtp, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(Some(2), &mtp, true).unwrap(), 2);
+        assert!(resolve_max_active(Some(0), &mtp, true).is_err());
+    }
+
+    #[test]
+    fn model_hybrydowy_dostaje_pule_aktywacji_1152_mib() {
+        assert_eq!(activation_pool_bytes(true, true), 1152 << 20);
+        assert_eq!(activation_pool_bytes(false, true), 1152 << 20);
+        assert_eq!(activation_pool_bytes(true, false), 1 << 30);
+    }
 }

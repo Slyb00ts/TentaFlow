@@ -65,7 +65,10 @@ fn greedy_seq_params() -> SeqSampleParams {
         seed: 0,
         step: 0,
         penalty: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
         penalty_ids: Vec::new(),
+        penalty_counts: Vec::new(),
     }
 }
 

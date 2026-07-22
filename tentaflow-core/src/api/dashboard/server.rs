@@ -1778,6 +1778,142 @@ pub async fn handle_request(
         }
     }
 
+    // GET /ml-studio/exports/<ref>?token=&exp=&ref= — signed URL for an ML
+    // Studio project export archive (zip). HMAC-only auth, exactly like
+    // /recordings/. The ref IS the archive identity — there is no catalogue
+    // table — so existence + containment are decided on the filesystem.
+    if method == Method::GET
+        && path.starts_with("/ml-studio/exports/")
+        && path.len() > "/ml-studio/exports/".len()
+    {
+        use crate::api::ml_studio_export::{
+            export_download_filename, handle_ml_studio_export_url, parse_query, read_export_file,
+            ExportFileOutcome, ExportOutcome, RequestContext,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/ml-studio/exports")
+        {
+            return Ok(resp);
+        }
+        // Capture Range BEFORE `req` is released — the streamed response below
+        // needs it, and `size` (required to resolve the range) is only known
+        // after the file is opened.
+        let range_header = req
+            .headers()
+            .get(hyper::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        drop(req);
+        let path_ref = path.strip_prefix("/ml-studio/exports/").unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::ml_studio_export_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_ml_studio_export_url(path_ref, &q, issuer, &db, ctx);
+        let auth_status = outcome.http_status();
+        match outcome {
+            ExportOutcome::Ok => {
+                let file_outcome = read_export_file(&db, path_ref, ctx).await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    ExportFileOutcome::Ok { mut file, size } => {
+                        // STREAMED, never slurped: an export can be gigabytes.
+                        // A paused download resumes via Range → 206 + Content-Range.
+                        let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
+                            Some((s, e)) => (206u16, s, e - s + 1),
+                            None => (200u16, 0, size),
+                        };
+                        if start > 0 {
+                            use tokio::io::AsyncSeekExt;
+                            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                                return Ok(Response::builder()
+                                    .status(500)
+                                    .header("Content-Type", "application/json")
+                                    .body(Either::Left(Full::new(Bytes::from_static(
+                                        b"{\"error\":\"export_unavailable\"}",
+                                    ))))
+                                    .unwrap());
+                            }
+                        }
+                        let stream: SseStream = Box::pin(ranged_file_stream(file, length));
+                        let mut builder = Response::builder()
+                            .status(code)
+                            .header("Content-Type", "application/zip")
+                            .header("Accept-Ranges", "bytes")
+                            .header("Content-Length", length.to_string())
+                            .header(
+                                "Content-Disposition",
+                                format!(
+                                    "attachment; filename=\"{}\"",
+                                    export_download_filename(path_ref)
+                                ),
+                            );
+                        if code == 206 {
+                            builder = builder.header(
+                                "Content-Range",
+                                format!("bytes {}-{}/{}", start, start + length - 1, size),
+                            );
+                        }
+                        Ok(apply_signed_url_security_headers(builder)
+                            .body(Either::Right(StreamBody::new(stream)))
+                            .unwrap())
+                    }
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"export_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
+            }
+            ExportOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            ExportOutcome::Denied(_) => {
+                // Token verification FAILED (forged / expired / scope mismatch).
+                // Charge the strict invalid-token bucket: exhausted → 429 instead
+                // of 403. `handle_ml_studio_export_url` already emitted the
+                // "denied" audit above.
+                if let Some(resp) = charge_invalid_signed_token(
+                    &db,
+                    &client_ip,
+                    user_agent.as_deref(),
+                    "/ml-studio/exports",
+                ) {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"export_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
     // GET /models/manifest/<bundle_ref> — vision model-bundle manifest for
     // instance-to-instance distribution. Auth: signed query (?token=&exp=&ref=,
     // same shape as /recordings) OR `Authorization: Bearer <api-key>` with an
@@ -1952,6 +2088,232 @@ pub async fn handle_request(
                 .header("Content-Type", "application/json")
                 .body(Either::Left(Full::new(Bytes::from_static(
                     b"{\"error\":\"model_bundle_denied\"}",
+                ))))
+                .unwrap()),
+        };
+    }
+
+    // GET /ml-studio/share/<project_id>/manifest — cross-instance ML Studio
+    // project share manifest. Auth mirrors /models/manifest: signed query
+    // (?token=&exp=&ref=) OR `Authorization: Bearer <api-key>` with an explicit
+    // ('ml_studio_export', <project_id>) allow scope. The archive URL inside the
+    // manifest mirrors the auth mode (per-ref signed vs token-less + Bearer).
+    if method == Method::GET
+        && path.starts_with("/ml-studio/share/")
+        && path.ends_with("/manifest")
+        && path.len() > "/ml-studio/share//manifest".len()
+    {
+        use crate::api::ml_studio_share::{
+            handle_share_manifest, RequestContext, ShareAuth, ShareManifestOutcome,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/ml-studio/share",
+        ) {
+            return Ok(resp);
+        }
+        let bearer_token = models_bearer_token(req.headers());
+        drop(req);
+        let project_id = path
+            .strip_prefix("/ml-studio/share/")
+            .and_then(|r| r.strip_suffix("/manifest"))
+            .unwrap_or("");
+        let mb_ctx = crate::api::model_bundle::RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let (query_storage, key_storage);
+        let auth = match resolve_models_auth(
+            &db,
+            &settings_cipher,
+            bearer_token,
+            &query_string,
+            project_id,
+            mb_ctx,
+        ) {
+            Ok(ModelsAuth::Signed(q)) => {
+                query_storage = q;
+                ShareAuth::Signed(&query_storage)
+            }
+            Ok(ModelsAuth::ApiKey(uid)) => {
+                key_storage = uid;
+                ShareAuth::ApiKey {
+                    key_uid: &key_storage,
+                }
+            }
+            Err(resp) => return Ok(resp),
+        };
+        let issuer = crate::services::ml_studio_export_url_issuer();
+        let outcome = handle_share_manifest(project_id, &auth, issuer, &db, ctx).await;
+        let status = outcome.http_status();
+        return match outcome {
+            ShareManifestOutcome::Ok { body } => Ok(apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            )
+            .body(Either::Left(Full::new(Bytes::from(body))))
+            .unwrap()),
+            ShareManifestOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+            ShareManifestOutcome::Denied(_)
+            | ShareManifestOutcome::Forbidden(_)
+            | ShareManifestOutcome::NotFound
+            | ShareManifestOutcome::InternalError(_) => Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"ml_studio_share_denied\"}",
+                ))))
+                .unwrap()),
+        };
+    }
+
+    // GET /ml-studio/share/<project_id>/archive — on-demand project export ZIP
+    // (up to ~8 GB) for the same signed query OR Bearer API key that fetched the
+    // manifest. Range is supported so a paused download resumes; the archive is
+    // built/cached on demand behind a global build semaphore.
+    if method == Method::GET
+        && path.starts_with("/ml-studio/share/")
+        && path.ends_with("/archive")
+        && path.len() > "/ml-studio/share//archive".len()
+    {
+        use crate::api::ml_studio_share::{
+            archive_download_filename, handle_share_archive, RequestContext, ShareArchiveOutcome,
+            ShareAuth,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/ml-studio/share",
+        ) {
+            return Ok(resp);
+        }
+        // Capture Range BEFORE `req` is released — the streamed response needs
+        // it, and `size` (to resolve the range) is only known after the open.
+        let range_header = req
+            .headers()
+            .get(hyper::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bearer_token = models_bearer_token(req.headers());
+        drop(req);
+        let project_id = path
+            .strip_prefix("/ml-studio/share/")
+            .and_then(|r| r.strip_suffix("/archive"))
+            .unwrap_or("");
+        let audit_ref = format!("{}/archive", project_id);
+        let mb_ctx = crate::api::model_bundle::RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let (query_storage, key_storage);
+        let auth = match resolve_models_auth(
+            &db,
+            &settings_cipher,
+            bearer_token,
+            &query_string,
+            &audit_ref,
+            mb_ctx,
+        ) {
+            Ok(ModelsAuth::Signed(q)) => {
+                query_storage = q;
+                ShareAuth::Signed(&query_storage)
+            }
+            Ok(ModelsAuth::ApiKey(uid)) => {
+                key_storage = uid;
+                ShareAuth::ApiKey {
+                    key_uid: &key_storage,
+                }
+            }
+            Err(resp) => return Ok(resp),
+        };
+        let issuer = crate::services::ml_studio_export_url_issuer();
+        let outcome = handle_share_archive(project_id, &auth, issuer, &db, ctx).await;
+        let status = outcome.http_status();
+        return match outcome {
+            ShareArchiveOutcome::Ok { mut file, size } => {
+                // STREAMED, never slurped: an archive can be gigabytes. A paused
+                // download resumes via Range → 206 + Content-Range.
+                let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
+                    Some((s, e)) => (206u16, s, e - s + 1),
+                    None => (200u16, 0, size),
+                };
+                if start > 0 {
+                    use tokio::io::AsyncSeekExt;
+                    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                        return Ok(Response::builder()
+                            .status(500)
+                            .header("Content-Type", "application/json")
+                            .body(Either::Left(Full::new(Bytes::from_static(
+                                b"{\"error\":\"ml_studio_share_denied\"}",
+                            ))))
+                            .unwrap());
+                    }
+                }
+                let stream: SseStream = Box::pin(ranged_file_stream(file, length));
+                let mut builder = Response::builder()
+                    .status(code)
+                    .header("Content-Type", "application/zip")
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Length", length.to_string())
+                    .header(
+                        "Content-Disposition",
+                        format!(
+                            "attachment; filename=\"{}\"",
+                            archive_download_filename(project_id)
+                        ),
+                    );
+                if code == 206 {
+                    builder = builder.header(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", start, start + length - 1, size),
+                    );
+                }
+                Ok(apply_signed_url_security_headers(builder)
+                    .body(Either::Right(StreamBody::new(stream)))
+                    .unwrap())
+            }
+            ShareArchiveOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+            ShareArchiveOutcome::Denied(_)
+            | ShareArchiveOutcome::Forbidden(_)
+            | ShareArchiveOutcome::NotFound
+            | ShareArchiveOutcome::PathTraversal
+            | ShareArchiveOutcome::IoError => Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"ml_studio_share_denied\"}",
                 ))))
                 .unwrap()),
         };

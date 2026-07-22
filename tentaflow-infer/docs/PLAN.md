@@ -143,21 +143,44 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
   feature-gated CPU sampler, no-feature GPU path bit-identical, Bielik golden unchanged).
 - forge-cli: `serve`, `run` (interactive), `bench`, `pull` (HF Hub).
 
-### Chunk 8 — speculation framework (composable proposers)
-- `Proposer` trait; NgramProposer (suffix automaton, CPU, async) first;
-  cascade composition + single tree verification (tree-attention mask);
-  acceptance stats per proposer; adaptive disable.
-- MTP/EAGLE/draft-model slots defined, implemented when a target model with
-  MTP head is in scope (Qwen3.6-class).
-- ✅ **Linear n-gram path WIRED into the engine decode loop**: greedy sequences
-  draft k tokens, one verify forward (mini-prefill + per-position GPU argmax)
-  accepts the longest matching prefix, rejected KV rolled back
-  (`KvCache::rollback`). Greedy-exact (spec ON == OFF token-for-token where
-  argmax is unambiguous), gated to dense F16 paged-KV, default off
-  (`--speculative on|off|ngram:<k>`). Proof: `tests/e2e_speculative.rs`
-  (qwen3-0.6b repetitive == exact, ~1.5×; ordinary no-regression),
-  `tests/kv_rollback.rs`. TODO: tree verification (spec-sampling), MTP/EAGLE
-  proposers, stochastic (temp>0) speculative sampling.
+### Chunk 8 — fundament spekulacji i komponowalne propozery
+- **Zrealizowane:** liniowy `NgramProposer` jest podłączony do pętli decode dla
+  greedy. Jeden forward mini-prefill weryfikuje draft, a odrzucone KV są wycofywane
+  przez `KvCache::rollback`. Ścieżka jest domyślnie wyłączona i ograniczona do
+  `--speculative on|off|ngram:<k>`; natywne MTP ma osobną ścieżkę opisaną niżej.
+  Dowody: `tests/e2e_speculative.rs`
+  (powtarzalny prompt około 1.5×, wynik zgodny z OFF) i `tests/kv_rollback.rs`.
+- **Zrealizowane:** wspólny `Proposer`, typowane `DraftTree`/`DraftNode`
+  (`proposal_logprob`, `conditional_confidence`, `source`), walidacja topologii,
+  `SpeculationCoordinator`, kaskadowa kompozycja liniowa oraz statystyki per
+  proposer. Rozgałęzione propozycje są reprezentowalne, lecz bieżący verifier
+  odrzuca je jako `Unsupported`.
+- **Zrealizowane:** parser i walidator `forge-speculation.json`, w tym schemat
+  targetu/tensorów/kalibracji/licencji, limity wejścia, bezpieczne ścieżki względne,
+  SHA-256 i zachowanie zweryfikowanych uchwytów artefaktów. Podłączenie manifestu do runtime neuralnego pozostaje do
+  wykonania.
+- **Zrealizowane:** natywne MTP/NextN dla gęstego hybrydowego GGUF `qwen35`.
+  Loader oddziela `nextn_predict_layers` od 64-warstwowego trunku, obsługuje
+  wagi MTP NVFP4/Q8_0/F32 i współdzielone wejście/wyjście targetu. GPU proposer
+  K=2/K=3, batched greedy verifier oraz checkpointy KV/DeltaNet są podłączone do
+  pętli serwera przez `--speculative mtp[:2|3]`; retained checkpointy usuwają
+  powtórny skan DeltaNet przy commit. Tryb `mtp` używa budżetu 3 i adaptacyjnie
+  wybiera K=2/K=3. Zakres produkcyjny: greedy; continuous admission wielu
+  sekwencji używa startup preflightu oraz osobnych grafów verifiera T=3/4 per
+  slot. Niespekulacyjny target ma pion B2 ze wspólnymi batch GEMM FFN/logits;
+  natywne MTP nadal przeplata lane seryjnie. Kolejny krok to batchowy draft i
+  verifier `[B,T]` bez mieszania stanów slotów.
+  Raport: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
+- **Do realizacji:** jedna lossless weryfikacja drzewa z greedy i stochastic
+  acceptance, tree-attention i zatwierdzaniem wyłącznie zaakceptowanych KV;
+  statystyki i adaptacyjne wyłączanie dla proposerów innych niż natywne MTP.
+- **Do realizacji po pozyskaniu zgodnych wag:** `DraftModelProposer`,
+  `Eagle3Proposer`, `DFlashProposer`, `DSparkProposer` i opcjonalny
+  `PardProposer`/`SuffixProposer`. DSpark obejmuje półautoregresyjny backbone,
+  głowę Markova lub RNN, confidence head, kalibrację STS oraz scheduler długości
+  weryfikacji zależny od obciążenia. Konfiguracje tych proposerów są
+  typowane, ale zwracają `Unsupported`, dopóki ich implementacje i wagi nie są
+  dostępne.
 
 ### Chunk 9+ — later phases (tracked, not this milestone)
 KV quant ladder (FP8→INT8→NVFP4-KV→rotational 3-bit), TierManager (expert

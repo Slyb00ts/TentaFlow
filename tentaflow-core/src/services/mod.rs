@@ -92,6 +92,7 @@ static FRAME_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock:
 static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static MODEL_BUNDLE_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+static ML_STUDIO_EXPORT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
 #[cfg(feature = "graph")]
 static GRAPH_MANAGER: OnceLock<Arc<graph::GraphManager>> = OnceLock::new();
@@ -282,6 +283,34 @@ pub fn model_bundle_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                         iss.rotate_in_memory(*new);
                     }
                     trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::ModelBundle.key_name());
+                },
+            );
+        }
+        issuer
+    })
+}
+
+/// Process-wide signing key for `/ml-studio/exports/<ref>` archive download
+/// URLs (ML Studio project export distribution to the browser). Same
+/// disk-backed rotation contract as the other signed-URL issuers.
+pub fn ml_studio_export_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    ML_STUDIO_EXPORT_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::MlStudioExport,
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::MlStudioExport.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::MlStudioExport.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::MlStudioExport.key_name(),
+                    );
                 },
             );
         }

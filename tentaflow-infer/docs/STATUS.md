@@ -10,7 +10,128 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-20.
+Ostatnia aktualizacja: 2026-07-22.
+
+- ✅ **Kary samplingu OpenAI na CPU i GPU Mojo (2026-07-21).**
+  `frequency_penalty`, `presence_penalty`, `repetition_penalty` i okno
+  `repeat_last_n` działają w API, samplerze CPU oraz pojedynczej i batchowej
+  ścieżce GPU. Historia obejmuje prompt i odpowiedź. Mojo nakłada wszystkie
+  kary z histogramu jednym kernelem przed istniejącym równoległym argmax/top-k,
+  bez D2H histogramu w trybie release. `logprobs` są liczone po karach.
+  Greedy bez kar zachowuje niezmieniony fast path. Mikrobenchmark RTX 4090 dla
+  słownika 151936: greedy 6,99 us, top-k 20 z karą 53,73 us, top-k 64 z karą
+  160,05 us.
+
+- 🟡 **Hybrydowy prefill NVFP4 B2 T32 w Mojo (2026-07-22).** Scheduler może
+  połączyć dokładnie dwa requesty i wykonać segmenty `B=2`, `T=32`; funkcja
+  domyślnie działa w trybie auto tylko przy pełnym capability modelu na
+  NVIDIA warp32. `FORGE_HYBRID_PREFILL_BATCH=0` wymusza B1 bez alokacji
+  dedykowanego scratchu, a `1` rygorystycznie wymaga kompletnego capability
+  i artefaktów. Jawne włączenie na NVIDIA warp64, AMD,
+  Apple albo CPU zwraca `Unsupported` przed routingiem do PTX. Źródła Mojo są
+  przygotowane do dalszego portowania, lecz AMD i Metal nie zostały wykonawczo
+  zweryfikowane. Target B2 zachowuje pełne ID i bitowy parytet z dwoma
+  seryjnymi lane; rollback i awaria rollbacku obejmują całą parę, a ta druga
+  zatruwa i poddaje kwarantannie oba stany MTP oraz wspólny cache. Catch-up MTP
+  nadal ma dwa seryjne przebiegi macierzowe lane po lane. Scratch wynosi
+  450 692 688 B (429,81 MiB). Profil samplowania GPU dla dwóch requestów po
+  osiem tokenów zawierał 18 150 launchy, osiem synchronizacji oraz osiem
+  transferów D2H po 8 B, bez transferu logitów całego słownika.
+  Gauge `forge_engine_hybrid_prefill_b2_scratch_bytes` pozostaje zerowy w trybie
+  off i raportuje faktyczny logiczny rozmiar po pierwszym udanym B2.
+  Pięć końcowych prób raw128 dało medianę Auto/OFF **309,7/248,6 tok/s**, TTFT
+  **826,69/1029,87 ms** i E2E **1119,60/1322,60 ms**. Raw512 ON dało
+  **320,5/320,2/319,9/320,0/320,2 tok/s** z medianą **320,2 tok/s**, TTFT
+  **3198,02 ms** i E2E **3505,75 ms**; odniesienie OFF wyniosło **251,4
+  tok/s**, około **4073 ms TTFT** i **4380 ms E2E**. Artefakty `/tmp` nie są
+  wersjonowane.
+
+- 🟡 **Natywne Qwen3.5/3.6 MTP/NextN dla gęstego NVFP4 GGUF
+  (2026-07-22).** Rejestr `qwen35` oddziela blok `nextn_predict_layers` od
+  64-warstwowego trunku `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF` bez
+  drugiej kopii targetu. Proposer K=2/K=3, verifier greedy, argmax, KV i DeltaNet
+  działają na GPU przez kernele Mojo. Scheduler paruje dwa requesty o tym samym
+  K w natywnym B2. Segmentowane KV, attention, DeltaNet, decyzje i commit
+  zachowują stan per lane; commit odtwarza zaakceptowany stan ze wspólnego
+  forwardu bez puli retained checkpointów. Błąd checkpoint/rollback zatruwa i
+  poddaje kwarantannie oba lease'y pary. Pięć powtórzeń RTX 4090 dało medianę
+  B2 ON/OFF: raw128 **137,40/101,97 tok/s** (+34,75%), raw512
+  **97,78/76,38 tok/s** (+28,02%); stałe K=3 osiągnęło **136,97/94,34
+  tok/s**. Wszystkie przebiegi zachowały pełne ID względem serial greedy.
+  Szybsze pomiary llama.cpp B2 są nieważne porównawczo: tylko 5/24 wyjść
+  zgadzało się z oracle `np1`. Różne K, tiering, niepełna para i
+  niespełniony kontrakt capability przechodzą na B1;
+  `FORGE_NATIVE_MTP_B2=0|1` jest ścisłym kill-switchem. vLLM 0.25.1 nie
+  dostarczył porównywalnego wyniku dla lokalnego jednoplikowego GGUF. Draft ID,
+  pack `[B,T]` i gather embeddingu F16/Q8_0/NVFP4 działają na GPU, a cykl B2 ma
+  jeden końcowy D2H i sync. Profil 24 cykli potwierdził dokładnie jeden sync i
+  cztery małe H2D na cykl. Gather zeruje błędne ID bez GPU OOB, a finalna
+  walidacja zwraca kontrolowany błąd. Współczesne A/B względem `7d472a0a` dało
+  +0,56% dla raw128 i +0,12% dla raw512. Checkpoint shared-Q8 współdzieli jedną
+  kwantyzację `pb.x` wyłącznie między `gate_proj`, `alpha_proj` i `beta_proj`;
+  `out_proj` nadal osobno kwantyzuje `normed`. Izolowany mikrobenchmark RTX 4090
+  dla wierszy `[5120, 48, 48]` i 5120 kolumn skrócił T6 z 53,452 do 47,691 us
+  (+10,78%), a T8 z 58,537 do 54,451 us (+6,98%), redukując grupę z 6 do 4
+  uruchomień. Dla 48 warstw DeltaNet oczekiwane jest 192 -> 96 wywołań
+  `quantize_act_q8_1` na cykl B2. Pełny profil raw512 zawiera 224 kwantyzacje
+  na cykl: 96 dla tej grupy DeltaNet i 128 dla pozostałych projekcji targetu
+  oraz MTP.
+  Testy exact/canary/top1, multistream T6 -> T8 z realokacją scratchu oraz
+  testy błędów eventu przeszły. Realny 27B shared-Q8 zachował pełne ID; pięć
+  powtórzeń osiągnęło medianę 132,33 tok/s dla raw128 i 100,74 tok/s dla
+  raw512. Profil `nsys` potwierdził 16 warstw attention i 224 kwantyzacje na
+  cykl B2.
+  Rollout N/N B2 paruje dwa pełne drafty n-gram o tym samym K=2 lub K=3.
+  Brak `FORGE_MTP_NGRAM_BATCH` wybiera `auto` dla modelu z capability na
+  zweryfikowanym NVIDIA warp32, `0` wymusza B1, a `1` pozwala na eksperymentalny
+  backend przy zachowaniu wymagań strukturalnych modelu. AMD/Metal w `auto`
+  pozostają w B1. Segmentowany KV-only catch-up używa kerneli
+  Mojo `mtp_norm_join_shifted_segmented_f16`,
+  `kv_append_batch_segmented_masked_f16` i
+  `mtp_commit_catchup_metadata_segmented`. NVIDIA używa dokładnej segmentowanej
+  attention z czterema warpami, zgodnej bitowo z verifierem seryjnym. Golden
+  obejmuje T1/ctx1, T6/ctx31/32/33/128, T8/ctx512/2048, zamianę lane, różne
+  mapy stron i canary;
+  memcheck zakończył się bez błędów. Realna macierz retained 1..T dla K2/K3,
+  lane swap oraz cancel/reuse przeszły. Pięć powtórzeń N/N ON/OFF zachowało
+  identyczne pełne ID: raw128 159,70/122,87 tok/s (+29,98%), raw512
+  94,33/83,78 tok/s (+12,59%). Dedykowany licznik potwierdził odpowiednio 32
+  i 20 cykli N/N na przebieg oraz zero przy wyłączonej fladze. `nsys`
+  potwierdził po jednym norm/join, maskowanym append KV, commicie metadanych i
+  końcowej synchronizacji na cykl N/N. Prometheus eksportuje dedykowany licznik
+  `forge_engine_mtp_ngram_b2_steps_total`. Smoke raw128 potwierdził liczniki
+  `auto=32`, `0=0`, `1=32` i identyczny pełny hash ID; realne lane-swap oraz
+  cancel/reuse/izolacja przeszły. Mieszane N/M, M/N i M/M używa tego samego
+  verifiera po jawnym ustawieniu `FORGE_MTP_NGRAM_MIXED_BATCH=1`; brak zmiennej
+  pozostawia auto wyłącznie dla N/N. Macierz raw128 dała około +3,6% względem
+  N/N-only i +5,6% względem B1, ale raw512 była około 0,1% wolniejsza od
+  N/N-only. Te liczby poprzedzają osobny oracle B1 per lane i są wyłącznie
+  pomiarem przepustowości. Direct model/source-mask, syntetyczna macierz i
+  memcheck mixed przeszły; realny server parity per lane oraz pełny `nsys`
+  oczekują na co najmniej 22,5 GiB wolnego VRAM. Auto rollout mixed pozostaje
+  wyłączony.
+  CUDA jest jedynym backendem sprawdzonym wykonawczo;
+  źródła zachowują przenośny fallback dla AMD/Metal. Raport:
+  `docs/BENCH_QWEN35_MTP_NVFP4.md`.
+
+- 🟡 **NVFP4 Bielik: hybrydowy prefill FP8 i GQA decode w Mojo
+  (2026-07-20).** Opcjonalne `FORGE_GEMM=fp8mod-ffn` przepakowuje na GPU
+  projekcje Q/O/gate/up/down z rezydentnych wag NVFP4 do FP8, a `lm_head` z F16
+  do FP8 dla pojedynczego strumienia; K/V i źródłowe wagi decode pozostają NVFP4.
+  Pakowanie całego modelu trwa około 49 ms i jest wykonywane raz przy ładowaniu.
+  Małe batche mają wyspecjalizowane Mojo GEMV B4/B8/B16 oraz GEMM BM32. Decode
+  modelu GQA 4:1, `head_dim=128`, KV F16 i bez Q/K norm współdzieli odczyt K/V
+  dla czterech głowic Q, a `combine2` łączy dwie głowice na CTA. Routing sprawdza
+  możliwości urządzenia, artefakty, kształty i dostępny VRAM przed alokacją;
+  w przeciwnym razie atomowo pozostaje na NVFP4. Golden GPU **49/49**, kanoniczny
+  prompt PASS, jakość `NLL=1,15248`, `PPL=3,1660` wobec baseline
+  `1,15260`/`3,1664`. Końcowy pomiar RTX 4090 pp4096: FORGE
+  **10 302,7 tok/s** wobec vLLM 0.25.1 **9 732,9** (**+5,85%**); decode FORGE
+  **143,100** wobec **146,372 tok/s** (**-2,24%**, cel nadal niespełniony).
+  Większe splity attention, BK64, RPB24 i prototyp Marlin były NO-GO po pomiarze.
+  `llama.cpp` nie obsługuje bezpośrednio badanego checkpointu compressed-tensors
+  NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
+  także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
 - ✅ **NATIVE-LAYOUT Mojo int8 Q6_K prefill GEMM (down-proj + attn_v) —
   ODZYSKANIE REGRESJI PREFILL (2026-07-20).** Po wycofaniu CUDA MMQ (100 % Mojo)
@@ -468,7 +589,7 @@ Ostatnia aktualizacja: 2026-07-20.
 
 ## Częściowe
 
-- ✅ **§6 Spekulacja (linear n-gram) WPIĘTA w decode loop**: NgramProposer
+- 🟡 **§6 Spekulacja (n-gram i natywne MTP) WPIĘTA w decode loop**: NgramProposer
   drafuje k tokenów z własnej historii sekwencji, silnik weryfikuje je JEDNYM
   forwardem (mini-prefill nad pozycjami draftu → `sample_batched_argmax_f32`
   per pozycja), akceptuje najdłuższy zgodny prefiks, a odrzucone pozycje KV są
@@ -483,11 +604,23 @@ Ostatnia aktualizacja: 2026-07-20.
   ścieżką prefill, więc na małym modelu opłaca się dopiero dla długich draftów
   (gate `MIN_VERIFY_DRAFT`); dla ordinary prose spekulacja nie regresuje (fallback
   na pojedynczy graf-krok). Domyślnie WYŁĄCZONA (`--speculative off` = bajt-w-bajt
-  dzisiejsza pętla). Braki: draft-model / MTP / EAGLE proposery, tree-verification
-  (spec-sampling) i spekulacja stochastyczna (temp>0) — na razie tylko greedy-exact.
+  dzisiejsza pętla). Natywne MTP/NextN działa osobną ścieżką dla gęstego
+  hybrydowego `qwen35`: K=2/K=3, adaptacyjny wybór budżetu i batched verifier.
+  Pure MTP paruje dwa requesty z tym samym K; KV, attention, DeltaNet, decyzje i
+  commit są segmentowane per lane. Stan targetu i draftu MTP jest izolowany
+  per sekwencja pod jednym lease, a strony draftu pochodzą ze współdzielonego
+  paged cache MTP. Router `mtp+ngram:2|3` daje
+  pierwszeństwo pełnemu draftowi n-gram, dogania MTP po zaakceptowanym prefiksie,
+  a na miss używa natywnego MTP; raportuje osobne liczniki obu ścieżek. Wymaga
+  greedy; `max_active=2` przechodzi produkcyjny E2E admission/cancel/reuse, a
+  błąd restore/rollback zatruwa i poddaje kwarantannie całą parę;
+  sprawdzone wykonawczo tylko na CUDA. Braki: draft-model / EAGLE / DFlash /
+  DSpark, tree-verification (spec-sampling), spekulacja stochastyczna (`temp>0`)
+  oraz backendy AMD/Metal.
 - 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral, olmoe (MoE), qwen3moe
-  (MoE), qwen35moe (hybrid SSM+MoE, ✅ E2E — patrz niżej). Brak: DeepSeek (MLA),
-  Gemma (sliding-window), Phi.
+  (MoE), qwen35 (gęsty hybrid SSM z natywnym MTP) i qwen35moe
+  (hybrid SSM+MoE, ✅ E2E — patrz niżej). Brak: DeepSeek (MLA), Gemma
+  (sliding-window), Phi.
 - ✅ **§4.2 qwen35moe (Qwen3.6-35B-A3B hybrid SSM+MoE)** — DZIAŁA E2E:
   generuje spójny tekst na RTX 4090, `forge run … "The capital of France is"`
   → „The capital of France is Paris.", a w trybie `--chat` strumień tokenów
@@ -519,11 +652,26 @@ Ostatnia aktualizacja: 2026-07-20.
     (`kernels/mojo/test_deltanet.mojo`): conv 7.7e-5, l2norm 5.9e-5, delta_step
     1.2e-4 / state 2.4e-7, gated_rmsnorm 4.8e-4, log_decay 9.2e-8, beta 3.0e-8 —
     wszystko w tolerancji f16.
-  - ✅ **Stan SSM w silniku** (`Model.ssm`): rezydentny bufor stanu
-    `[n_v_heads, d_state, d_state]` f32 + okno conv `[conv_dim, d_conv-1]` f16 per
-    warstwa DeltaNet, alokowany raz (pula Weights), zerowany na starcie sekwencji
-    (`pos==0`). Persistent/nie-paged (jedna aktywna sekwencja SSM naraz — zgodnie
-    z jednostrumieniową ścieżką MoE decode). Warstwy atencji używają paged KV.
+  - ✅ **Stan SSM w silniku** (`Model.hybrid_states`): rezydentna pula slotów
+    `[n_v_heads, d_state, d_state]` f32 + okno conv f16 per warstwa DeltaNet.
+    Każda sekwencja dostaje lease `{slot, generation}`; event GPU chroni
+    przełączenie i reuse, a ponownie użyty slot jest zerowany na streamie.
+    Lease obejmuje też osobny stan draftu MTP i `SeqKv` korzystający ze wspólnego
+    paged cache MTP. Test Qwen3.6 NVFP4 potwierdza parity targetu, pure MTP oraz
+    MTP+n-gram dla dwóch sekwencji przeplatanych A/B, wraz z cancel i release/reuse.
+    Startup atomowo rezerwuje żądaną liczbę slotów albo zwraca wymagane i dostępne
+    bajty. Scheduler paruje lane'y niespekulacyjnego targetu po B2: mixery pracują
+    per slot, a FFN i głowa logits używają wspólnych batch GEMM; B3 ma jeden
+    seryjny ogon, a B4 wykonuje dwie pary. Jedna brama capability sprawdza
+    rezydentny KV i formaty wag; tiering wybiera seryjny fallback przed mutacją
+    KV. E2E zachowuje parity dla B3/B4, izoluje różne parametry samplingu per lane
+    i sprawdza cancel środkowej sekwencji z ponownym użyciem slotu.
+    Verifier przechowuje osobne grafy T=3/4 dla każdego stabilnego identyfikatora
+    slotu. Profil `nsys` dla długiego przebiegu wykazał 2 capture i 46 replay przy
+    `max_active=1` oraz 4 capture i 96 replay przy `max_active=2`.
+    Native MTP ma osobny same-K B2 z batchowym draftem i segmentowanym verifierem
+    `[B,T]`; różne K, n-gram i tiering zachowują seryjny fallback.
+    Warstwy atencji używają paged KV.
   - ✅ **Wagi hybrydowe** (`weights.rs::load_hybrid`): `LayerMixer::{Attention,
     DeltaNet}`, atencja z bramkowanym Q (szerokość `2·n_heads·head_dim`, split,
     bez fuzji), zestaw DeltaNet (in-proj/conv1d f16/dt-bias+A f16/beta+alpha proj/
@@ -549,6 +697,11 @@ Ostatnia aktualizacja: 2026-07-20.
     tokenów gorące) → ~6k tokenów KV atencji spilnięte na NVMe, igła odzyskana,
     ids bit-identyczne z full-VRAM, VRAM stały; `--kvflash --kv-hot-pages 64`
     bez OOM na modelu 20 GB. Nie-hybrydowe MoE (OLMoE/qwen3moe) nadal bez tieru.
+  - ✅ **Zwarty target KV dla hybryd**: globalny indeks warstwy jest mapowany na
+    indeks fizycznego slabu wyłącznie dla `LayerKind::Attention`. Qwen3.6-27B
+    alokuje 16 par K/V zamiast 64, czyli 64 KiB/token F16 zamiast 256 KiB/token;
+    prefill, decode, verifier MTP i tiering używają tej samej mapy. Cache MTP
+    pozostaje osobny i jednowarstwowy, a modele dense zachowują mapę identity.
   - 🟡 **Wydajność ścieżki hybrydowej**: korektność najpierw. Router MoE +
     bramka shared-expert NIE robią już host round-tripu (device-side grouped
     dispatch `_gidx`, patrz §4.4) — per-warstwa MoE decode jest teraz bez
@@ -641,8 +794,12 @@ Ostatnia aktualizacja: 2026-07-20.
 - ✅ **§5.2 Radix-tree prefix caching** (dedup system-promptów/few-shot/multi-turn):
   drzewo radix na granularności strony (`forge-engine/src/prefix.rs`), pożyczka
   najdłuższego wspólnego prefiksu (refcount, read-only) przed prefillem + donacja
-  własnych prefill-stron po zakończeniu; LRU eviction refcount-0 liści; admission
-  liczy trafienie i strony odzyskiwalne. Aktywny dla verbatim `f16`/`fp8` bez
+  własnych prefill-stron po zakończeniu; LRU eviction refcount-0 liści. Admission
+  rezerwuje logiczny przyszły wzrost aktywnych sekwencji, respektuje
+  `max_pages_per_seq` i przegląda ograniczone okno kolejki z agingiem. Przypięte
+  strony pożyczonego prefiksu są nadal rozliczane konserwatywnie w pełnym budżecie
+  requestu, więc współdzielenie może nie przyspieszyć admission. Cache jest
+  aktywny dla verbatim `f16`/`fp8` bez
   tieringu i arch nie-hybrydowej (`--prefix-cache on|off`, default on). Usage
   `prompt_tokens_details.cached_tokens`. Współdzielenie CAŁYCH stron → borrower
   nigdy nie pisze do współdzielonej strony (bez CoW granicznej strony). Dowód
@@ -953,3 +1110,18 @@ NVFP4 Bielik golden bit-exact 1 i 4 lanes (default nietknięty); Mistral Q4_K PP
 France"; prefill warm **~5740 tok/s** vs ~11151 MMQ (**~0.51×, ~2× WOLNIEJ** — zmierzone niezależnie; wcześniejsze „11120/0.997×" było błędem pomiaru. Przyczyna: native Q4_K ~0.79×, Q6_K down-proj na wolnym f16 (był MMQ), utracona fuzja rmsnorm→q8_1 + narzut MPAD. Dług: przywrócić fuzję + szybki Q6_K Mojo + shared activation; próg
 0.79×); decode **151 tok/s** bez regresji; VRAM wag 1× (bez repacku), scratch aktywacji
 ~+124 MB (skala MB, pomijalne przy KV-cache).
+
+---
+
+## Scalony DeltaNet prepare T=2-4 (2026-07-21)
+
+- Dodano kernele Mojo `deltanet_prepare_t2_f16`, `t3` i `t4`, które jednym
+  wywołaniem wykonują splot przyczynowy z SiLU, checkpointy okna, podział QKV,
+  L2 i repeat Q/K oraz obliczenie `g` i `beta`. Stan wejściowy okna jest tylko
+  odczytywany, więc odrzucony draft nie wymaga przywracania stanu.
+- Golden CPU/GPU przeszedł dla T=2/3/4. PTX ma target `sm_80`, przechodzi
+  `ptxas -arch=sm_80` bez spillów; warianty T2/T3/T4 używają odpowiednio
+  64/68/78 rejestrów i 128 B pamięci współdzielonej.
+- Izolowany pomiar RTX 4090 dla `n_k=16`, `n_v=32`, `d_state=128`, `d_conv=4`:
+  fused T4 **0,00839 ms**, a 17 rozłożonych wywołań GPU bez kosztu kopii i repeat
+  **0,02953 ms**, czyli konserwatywne przyspieszenie **3,52×**.

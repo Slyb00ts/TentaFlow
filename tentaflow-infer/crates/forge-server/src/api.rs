@@ -1,8 +1,7 @@
 // ===== File: api.rs — OpenAI request/response types + pure request validation =====
 // Everything here is transport-only and unit-testable without a GPU: parse
 // the wire shapes, validate them, and produce the sampling spec the engine
-// consumes. Unknown request fields (frequency_penalty, presence_penalty,
-// logit_bias, ...) are accepted and ignored by serde's default behavior.
+// consumes. Unknown request fields are accepted and ignored by serde.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -70,6 +69,13 @@ pub struct ChatCompletionRequest {
     pub n: Option<u32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// Rozszerzenie zgodne z llama.cpp; zero obejmuje cały prompt i odpowiedź.
+    #[serde(default)]
+    pub repeat_last_n: Option<usize>,
     /// `logit_bias` (SPEC §8.1.2): `{token_id: bias}` with string keys, bias in
     /// [-100, 100]. ±100 ≈ hard force/ban.
     #[serde(default)]
@@ -186,6 +192,12 @@ pub struct CompletionRequest {
     pub echo: Option<bool>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub repeat_last_n: Option<usize>,
     /// `logit_bias` (SPEC §8.1.2): `{token_id: bias}`, bias in [-100, 100].
     #[serde(default)]
     pub logit_bias: Option<HashMap<String, f32>>,
@@ -232,6 +244,9 @@ fn sampling_core(
     top_k: Option<usize>,
     min_p: Option<f32>,
     repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    repeat_last_n: Option<usize>,
     seed: Option<u64>,
     max_tokens: Option<usize>,
     max_completion_tokens: Option<usize>,
@@ -269,6 +284,23 @@ fn sampling_core(
         }
         sampling.repetition_penalty = rp;
     }
+    if let Some(value) = frequency_penalty {
+        if !value.is_finite() || !(-2.0..=2.0).contains(&value) {
+            return Err(ApiError::invalid_request(
+                "frequency_penalty must be in [-2, 2]",
+            ));
+        }
+        sampling.frequency_penalty = value;
+    }
+    if let Some(value) = presence_penalty {
+        if !value.is_finite() || !(-2.0..=2.0).contains(&value) {
+            return Err(ApiError::invalid_request(
+                "presence_penalty must be in [-2, 2]",
+            ));
+        }
+        sampling.presence_penalty = value;
+    }
+    sampling.repeat_last_n = repeat_last_n.unwrap_or(0);
     sampling.seed = seed;
 
     let max_tokens = max_tokens
@@ -380,6 +412,9 @@ impl ChatCompletionRequest {
             self.top_k,
             self.min_p,
             self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+            self.repeat_last_n,
             self.seed,
             self.max_tokens,
             self.max_completion_tokens,
@@ -516,6 +551,9 @@ impl CompletionRequest {
             self.top_k,
             self.min_p,
             self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+            self.repeat_last_n,
             self.seed,
             self.max_tokens,
             self.max_completion_tokens,
@@ -1036,13 +1074,59 @@ mod tests {
     }
 
     #[test]
-    fn ignored_openai_fields_are_accepted() {
+    fn parametry_probkowania_sa_przekazywane_bez_zmian() {
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.4, "top_k": 17, "top_p": 0.8, "min_p": 0.15,
+            "seed": 0
+        }));
+        let sampling = r.generation_spec().unwrap().sampling;
+
+        assert_eq!(sampling.temperature, 0.4);
+        assert_eq!(sampling.top_k, 17);
+        assert_eq!(sampling.top_p, 0.8);
+        assert_eq!(sampling.min_p, 0.15);
+        assert_eq!(sampling.seed, Some(0));
+
+        for min_p in [-0.1, 1.1] {
+            let invalid = chat_req(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "min_p": min_p
+            }));
+            assert!(invalid.generation_spec().is_err());
+        }
+    }
+
+    #[test]
+    fn openai_penalties_sa_walidowane_i_przekazywane() {
         let r = chat_req(serde_json::json!({
             "model": "m", "messages": [{"role": "user", "content": "hi"}],
             "frequency_penalty": 0.5, "presence_penalty": 0.1,
+            "repetition_penalty": 1.2, "repeat_last_n": 64,
             "logit_bias": {"5": -100}, "user": "abc"
         }));
-        r.generation_spec().unwrap();
+        let sampling = r.generation_spec().unwrap().sampling;
+        assert_eq!(sampling.frequency_penalty, 0.5);
+        assert_eq!(sampling.presence_penalty, 0.1);
+        assert_eq!(sampling.repetition_penalty, 1.2);
+        assert_eq!(sampling.repeat_last_n, 64);
+
+        let invalid = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "frequency_penalty": 2.1
+        }));
+        assert!(invalid.generation_spec().is_err());
+
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": [1, 2, 3],
+            "frequency_penalty": -0.25, "presence_penalty": 0.75,
+            "repeat_last_n": 2
+        }))
+        .unwrap();
+        let sampling = completion.generation_spec().unwrap().sampling;
+        assert_eq!(sampling.frequency_penalty, -0.25);
+        assert_eq!(sampling.presence_penalty, 0.75);
+        assert_eq!(sampling.repeat_last_n, 2);
     }
 
     #[test]

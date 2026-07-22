@@ -396,6 +396,153 @@ forward pass, scheduler queue) / server+cli (OpenAI API). Kernel toolchain:
 E2E proven: Bielik-PL-Minitron-7B-NVFP4 (software FP4 dequant) generates
 coherent Polish on the RTX 4090.
 
+### Ścieżka NVFP4/FP8
+
+- `FORGE_GEMM=fp8mod-ffn` włącza hybrydowy prefill: kernele Mojo przepakowują
+  projekcje Q/O/gate/up/down NVFP4 oraz pojedynczy `lm_head` F16 do FP8 na GPU.
+  Źródłowe NVFP4 pozostaje rezydentne dla decode; K/V nie są konwertowane.
+- Wyspecjalizowane kernele małych batchy NVFP4 obsługują B4/B8/B16 i BM32.
+  Decode GQA 4:1 dla `head_dim=128`, KV F16 i bez Q/K norm współdzieli K/V między
+  czterema głowicami Q oraz używa dwugłowicowego `combine2`.
+- Konwersję wolno rozpocząć dopiero po sprawdzeniu możliwości urządzenia,
+  obsługiwanych kształtów, kompletu artefaktów i dostępnego VRAM. Niespełnienie
+  warunków pozostawia całą warstwę na istniejącej ścieżce NVFP4.
+- Zweryfikowany wynik RTX 4090, pp4096/jeden strumień: FORGE 10 302,7 tok/s
+  prefill i 143,100 tok/s decode; vLLM 0.25.1 odpowiednio 9 732,9 i 146,372.
+  Prefill wygrywa o 5,85%, decode pozostaje 2,24% wolniejszy. Protokół i
+  ograniczenia są w `tentaflow-infer/docs/BENCH_NVFP4_VLLM.md`.
+- HAL FORGE nadal obsługuje tylko CUDA. AMD/ROCm, Metal i natywne instrukcje FP4
+  Blackwell nie są zaimplementowane; fallback możliwości nie oznacza obsługi
+  tych backendów. Użyty checkpoint compressed-tensors NVFP4 nie jest bezpośrednio
+  obsługiwany przez badaną wersję `llama.cpp`.
+
+### Dekodowanie spekulatywne
+
+- `forge-engine::speculation` ma wspólny kontrakt `Proposer`, typowane
+  `DraftTree`/`DraftNode`, `SpeculationCoordinator`, kompozycję kaskadową i
+  statystyki akceptacji per proposer. Węzły przenoszą źródło,
+  `proposal_logprob` i `conditional_confidence`, dzięki czemu ten sam kontrakt
+  obsłuży później greedy oraz lossless stochastic acceptance.
+- Wykonawczo działa hostowy `NgramProposer`, natywne MTP/NextN oraz ich router
+  priorytetowy dla gęstego hybrydowego GGUF `qwen35`. Natywne MTP wydziela
+  bloki `nextn_predict_layers` z trunku, ładuje ich NVFP4/Q8_0/F32 bez drugiej
+  kopii targetu i wykonuje proposer, weryfikację całego draftu oraz checkpointy
+  DeltaNet/KV na GPU przez kernele Mojo. Serwer obsługuje `--speculative mtp`,
+  `mtp:2`, `mtp:3` oraz priorytetowy router `mtp+ngram:2|3`; pełny draft n-gram
+  omija proposer MTP, stan MTP jest doganiany po zaakceptowanym prefiksie, a
+  brak pełnego draftu uruchamia natywne MTP. Budżet samodzielnego `mtp` 3 jest
+  adaptacyjnie przełączany między K=2 i K=3.
+  Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
+- Natywne MTP jest obecnie greedy-exact; domyślne `max_active=1` ogranicza pulę,
+  a jawne `max_active > 1` przechodzi atomowy startup preflight. Scheduler paruje
+  dwa requesty pure MTP z tym samym K w natywnym B2. Segmentowane KV, attention,
+  DeltaNet, decyzje acceptance/correction i commit zachowują stan per lane. Target DeltaNet
+  oraz draft MTP mają izolowany stan per sekwencja pod wspólnym lease z generacją
+  i eventem GPU; `SeqKv` draftów korzystają z jednej współdzielonej puli stron
+  MTP. Preflight dwóch slotów oraz audyt GPU pure MTP i MTP+n-gram A/B przechodzą.
+  Produkcyjny E2E admission/cancel/reuse przechodzi dla dwóch sekwencji. Verifier
+  utrzymuje osobne grafy T=3/4 według stabilnego identyfikatora slotu; reuse lease
+  zachowuje adresy buforów GPU. Niespekulacyjny target paruje lane'y po B2:
+  mixery zachowują osobne sloty, a FFN i głowa logits używają batch GEMM. B3 ma
+  seryjny ogon, B4 wykonuje dwie pary; test obejmuje parity ID, różne parametry
+  samplingu per lane oraz cancel i ponowne użycie slotu. Na RTX 4090 mediany
+  aggregate throughput wzrosły z 37,92 do 40,41 tok/s dla B3 (+6,58%) i z 37,90
+  do 41,32 tok/s dla B4 (+9,01%). Native MTP ma osobny segmentowany verifier
+  `[B,T]`; błąd restore/rollback zatruwa i poddaje kwarantannie oba lease'y.
+  Parowanie B2 wymaga
+  rezydentnego KV i obsługiwanych formatów wag; tiering przechodzi na seryjny
+  fallback przed mutacją KV. Ścieżkę sprawdzono wykonawczo
+  wyłącznie na CUDA/RTX 4090
+  z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Źródła Mojo zachowują podział
+  umożliwiający przyszły codegen AMDGPU/Metal, ale backendy AMD i Metal nie są
+  jeszcze podłączone ani przetestowane. `draft-model`, `eagle`, `dflash` i
+  `dspark` nadal zwracają `Unsupported`; weryfikacja drzewa, sampling, PARD i
+  suffix nie są jeszcze zaimplementowane.
+- Różne K, `mtp+ngram`, tiering, niepełna para i niespełniony kontrakt kerneli
+  przechodzą na seryjne B1. `FORGE_NATIVE_MTP_B2` akceptuje wyłącznie `0` lub
+  `1`; domyślnie B2 jest włączone. Sampling inny niż greedy-exact pozostaje poza
+  natywnym MTP.
+- Współdzielony forward DeltaNet i recompute commit usunęły około 1,125 GiB
+  retained checkpointów. Wyspecjalizowane głowy Q8 B8 oraz
+  scalone przygotowanie DeltaNet zmniejszają liczbę kerneli i kopii D2D. Stała
+  część verifiera T=3/T=4 działa jako trwały graf, a pozycję bazową attention
+  odczytuje z bufora GPU.
+  Pięć powtórzeń RTX 4090 B2 ON/OFF: raw128 137,40/101,97 tok/s
+  (+34,75%), raw512 97,78/76,38 tok/s (+28,02%); stałe K=3 osiąga
+  136,97/94,34 tok/s. Wszystkie przebiegi FORGE zachowały pełne ID względem
+  sekwencyjnego greedy. Wynik llama.cpp B2 nie jest baseline: tylko 5/24 wyjść
+  zgadzało się z oracle `np1`. Jednorundowa ścieżka pozostawia draft ID na GPU,
+  pakuje `[B,T]` i wykonuje formatowy gather F16/Q8_0/NVFP4 w Mojo. Profil 24
+  cykli potwierdził jeden końcowy sync i cztery małe H2D na cykl; współczesne A/B
+  względem `7d472a0a` dało +0,56% raw128 i +0,12% raw512. Każdy format zeruje
+  błędne ID bez GPU OOB, a finalna walidacja zwraca kontrolowany błąd. Nadal
+  konserwatywnie naliczane są przypięte strony prefiksu. Pełny builder blokuje FP8 wymagające
+  PTX 8.4, gdy Mojo emituje PTX 8.1. Szczegóły:
+  `tentaflow-infer/docs/BENCH_QWEN35_MTP_NVFP4.md`.
+- Admission rezerwuje logiczny budżet przyszłych stron KV każdej aktywnej
+  sekwencji, egzekwuje `max_pages_per_seq` i wykonuje atomowy preflight wzrostu
+  całego batcha. Ograniczone okno kolejki (`2 * max_active`, zakres 2-16) omija
+  requesty chwilowo blokowane przez KV, a aging ogranicza zagłodzenie. Przypięte
+  strony pożyczonego prefiksu są rozliczane konserwatywnie i nie zmniejszają
+  budżetu admission; może to opóźnić przyjęcie mimo fizycznego współdzielenia KV.
+- `forge-formats` udostępnia zamknięty parser `forge-speculation.json` dla
+  neuralnych proposerów. Manifest opisuje target, fingerprinty, tensory, cechy,
+  dtype/kwantyzację, sampling, kalibrację oraz osobne licencje kodu i wag.
+  `SpeculationManifest::load` ogranicza artefakty do katalogu manifestu i
+  weryfikuje SHA-256 każdego pliku; porównanie fingerprintu z aktywnym targetem
+  nastąpi przy integracji neuralnego runtime.
+- Krótka weryfikacja DeltaNet T=2-4 ma scalony kernel Mojo
+  `deltanet_prepare_t{2,3,4}_f16`. W jednym launchu wykonuje przyczynowy splot,
+  zapis checkpointów okna, podział QKV, L2/repeat Q/K oraz bramki `g` i `beta`;
+  wejściowy stan okna pozostaje niemutowany. Artefakty PTX wymagają `sm_80+`.
+- NVFP4 B3/B4 na NVIDIA z warpem 32 używa dwóch wierszy na CTA, współdzielonej
+  LUT E2M1 i szerokich odczytów aktywacji. Osobne symbole NVIDIA są wybierane
+  przez launcher, a dotychczasowe B3/B4 pozostają przenośnym fallbackiem.
+- Krótki skan DeltaNet T3/T4 dla `d_state <= 128` dzieli kolumny stanu na kafle
+  szerokości warpa. Dla kształtu Qwen `32 x 128` daje 2,60-2,63x w izolowanym
+  profilu RTX 4090 i około 5,9% krótszy pełny cykl MTP, zachowując bitową
+  zgodność wyjścia i checkpointów. T2 i większe stany używają starej ścieżki.
+- Krótkie Q8_0 B3/B4 na NVIDIA z warpem 32 używają czterech wierszy na CTA i
+  DP4A dla dokładnych iloczynów int8. Przenośny kernel ośmiu wierszy pozostaje
+  fallbackiem; F16/F32 są bitowo zgodne, a ważony miks Qwen zyskuje około
+  11,5-13% w izolowanym pomiarze.
+- Jawny launcher NVFP4 Q8_1/DP4A ma batched, bitowo zgodne warianty T3/T4.
+  Zachowują kolejność szeregowego GEMV i współdzielą dekod wag między tokenami;
+  domyślny dispatch pozostaje F16 do czasu pełnego A/B long-parity.
+- NVIDIA NVFP4 B1 z dwoma wierszami na CTA ma tę samą matematykę co B3/B4 i
+  jest z nimi bitowo zgodny na wszystkich projekcjach ThinkingCap. W izolacji
+  jest 1,8-3,2x szybszy od starego B1 F16. Prose128/prose512, repeat i natywne
+  MTP zachowują parity po ujednoliceniu serial i verifier na tej matematyce.
+- Opcjonalny `FORGE_MTP_DRAFT_HEAD=nvfp4` przepakowuje współdzielony head Q8_0
+  do osobnej kopii GGUF NVFP4 wyłącznie dla propozycji MTP. Packer i F32 GEMV są
+  kernelami Mojo; target verifier nadal używa oryginalnego Q8_0.
+
+## Hybrydowy prefill i catch-up MTP
+
+- Hybrydowy target wykonuje prefill w macierzowych chunkach na GPU. Dynamiczne
+  kernele DeltaNet obsługują pełne chunki, a stan rekurencyjny jest zatwierdzany
+  po każdym z nich bez sekwencyjnego powrotu przez CPU.
+- Natywny proposer MTP ze współdzielonym embeddingiem targetu wykonuje catch-up
+  całego zaakceptowanego prefiksu jednym batchem. Scalony norm/join i dokładna
+  projekcja Q8 przygotowują wejście, po czym aktualizowane są tylko K/V i carry;
+  dedykowany embedding MTP pozostaje na legalnej ścieżce sekwencyjnej.
+- Tymczasowa zamiana buforów prefill/verifier zawsze odtwarza bufory i grafy
+  decode także po błędzie. Profilowanie liczy osobne spany dla każdego
+  wewnętrznego chunka, również gdy prompt przekracza zewnętrzny limit 1024.
+- Hybrydowe modele z natywnym MTP rezerwują 1152 MiB puli aktywacji, aby pomieścić
+  jednocześnie bufory prefill, verifiera, stany DeltaNet i batched catch-up.
+- Target KV ma zwartą mapę `global_layer -> kv_layer` i alokuje slaby wyłącznie
+  dla warstw `Attention`. Qwen3.6-27B z układem 48 DeltaNet + 16 attention
+  zużywa 64 KiB F16 KV na token zamiast 256 KiB; osobny cache MTP zachowuje
+  jednowarstwową mapę identity.
+
+## Histogramowy sampling GPU
+
+- Aktywne kary repetition, frequency i presence są nakładane jednym kernelem
+  histogramowym, po którym działa istniejąca równoległa selekcja argmax lub top-k.
+- Domyślna ścieżka greedy bez kar nie wykonuje dodatkowego uruchomienia kernela,
+  alokacji ani synchronizacji.
+
 ## Conventions
 
 - Code comments, variable/function names, commit messages: **English**. Commit format:

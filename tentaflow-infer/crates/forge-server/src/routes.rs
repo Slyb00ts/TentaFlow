@@ -307,6 +307,7 @@ pub(crate) async fn start_generation(
                             logit_bias: spec.logit_bias.clone(),
                             min_tokens: spec.min_tokens,
                             logprobs: spec.logprobs,
+                            emit_empty_tokens: false,
                         })
                         .map_err(|e| ApiError::internal(e.to_string()))?;
                     streams.push(rx);
@@ -371,6 +372,7 @@ pub(crate) async fn collect_events(
                 tokens,
                 prompt_tokens,
                 cache_read_tokens,
+                ..
             } => {
                 return Ok(Collected {
                     text,
@@ -641,6 +643,7 @@ async fn stream_response(
                     tokens,
                     prompt_tokens,
                     cache_read_tokens,
+                    ..
                 } => {
                     let engine_reason = finish_reason_str(reason);
                     let mut choices = Vec::new();

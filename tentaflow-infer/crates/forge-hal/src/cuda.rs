@@ -571,20 +571,27 @@ impl Device for CudaDevice {
         self.bind()?;
         let backing = match kind {
             MemKind::Device => {
-                let pool = self.pool(pool).clone();
+                let pool_kind = pool;
+                let pool = self.pool(pool_kind).clone();
                 let (offset, reserved, generation) = {
                     let mut arena = pool.arena.lock().expect("pool arena poisoned");
                     match &mut *arena {
                         PoolArena::Bump(bump) => {
-                            let offset = bump.alloc(bytes)?;
+                            let offset = bump.alloc(bytes).map_err(|error| {
+                                ForgeError::Device(format!("pula {pool_kind:?}: {error}"))
+                            })?;
                             (offset, 0, None)
                         }
                         PoolArena::Slab(slab) => {
-                            let (offset, reserved) = slab.alloc(bytes)?;
+                            let (offset, reserved) = slab.alloc(bytes).map_err(|error| {
+                                ForgeError::Device(format!("pula {pool_kind:?}: {error}"))
+                            })?;
                             (offset, reserved, None)
                         }
                         PoolArena::Ring(ring) => {
-                            let (offset, generation) = ring.alloc(bytes)?;
+                            let (offset, generation) = ring.alloc(bytes).map_err(|error| {
+                                ForgeError::Device(format!("pula {pool_kind:?}: {error}"))
+                            })?;
                             (offset, 0, Some(generation))
                         }
                     }
@@ -625,6 +632,15 @@ impl Device for CudaDevice {
         })))
     }
 
+    fn pool_available(&self, pool: Pool) -> Option<usize> {
+        let arena = self.pool(pool).arena.lock().expect("pool arena poisoned");
+        match &*arena {
+            PoolArena::Bump(bump) => Some(bump.available()),
+            PoolArena::Ring(ring) => Some(ring.available()),
+            _ => None,
+        }
+    }
+
     fn create_stream(&self) -> Result<Stream> {
         let stream = self
             .ctx
@@ -640,6 +656,14 @@ impl Device for CudaDevice {
         let event = self
             .ctx
             .new_event(None)
+            .map_err(|e| cu_err("cuEventCreate", e))?;
+        Ok(Event::from_impl(Arc::new(CudaEventImpl { event })))
+    }
+
+    fn create_timing_event(&self) -> Result<Event> {
+        let event = self
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
             .map_err(|e| cu_err("cuEventCreate", e))?;
         Ok(Event::from_impl(Arc::new(CudaEventImpl { event })))
     }
@@ -664,6 +688,18 @@ impl Device for CudaDevice {
             .stream
             .wait(&event.event)
             .map_err(|e| cu_err("cuStreamWaitEvent", e))
+    }
+
+    fn elapsed_event_ms(&self, start: &Event, end: &Event) -> Result<Option<f32>> {
+        let start = start.downcast::<CudaEventImpl>()?;
+        let end = end.downcast::<CudaEventImpl>()?;
+        self.check_same_device(start.event.context(), "Event")?;
+        self.check_same_device(end.event.context(), "Event")?;
+        start
+            .event
+            .elapsed_ms(&end.event)
+            .map(Some)
+            .map_err(|e| cu_err("cuEventElapsedTime", e))
     }
 
     fn copy(

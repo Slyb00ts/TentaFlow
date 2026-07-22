@@ -7,19 +7,24 @@
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread::JoinHandle;
+use std::time::Instant;
+use std::time::Duration;
 
 use forge_tokenize::{StopMatcher, StreamDecoder, Tokenizer};
-use forge_types::{ForgeError, Result};
+use forge_types::{ForgeError, Result, Vendor};
 
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::metrics::{EngineMetrics, SeqTiming};
-use crate::model::{Model, MAX_PREFILL_CHUNK, MAX_SPEC_DRAFT};
+use crate::model::{hybrid_prefill_b2_backend_capable, Model, PrefillProfile, MAX_PREFILL_CHUNK};
 use crate::sample::{
     apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
-    SeqSampleParams, TokenLogprob,
+    SeqSampleParams, TokenLogprob, apply_penalties,
 };
-use crate::speculation::{CascadeComposer, NgramProposer, SpeculativeState};
+pub use crate::speculation::SpeculativeConfig;
+use crate::speculation::{SpeculationCoordinator, SpeculationKind, SpeculativeState};
 
 /// Shortest draft that is worth a verify forward (SPEC §6). The verify runs the
 /// ungraphed prefill path, so on a launch-bound small model it only wins when it
@@ -28,38 +33,6 @@ use crate::speculation::{CascadeComposer, NgramProposer, SpeculativeState};
 /// coincidental drafts) never verifies, low enough that genuine recurring
 /// context (which drafts to the full budget) always does.
 const MIN_VERIFY_DRAFT: usize = 8;
-
-/// Speculative decoding configuration (SPEC §6). `enabled` off = today's decode
-/// loop, byte-for-byte. When on, greedy sequences on the standard dense
-/// paged-KV path draft `draft_tokens` continuation tokens per step with an
-/// n-gram proposer and verify them in one forward; output stays identical to
-/// non-speculative greedy decode. Requests that are not greedy, use a
-/// repetition penalty, need host logits (grammar / logit_bias / min_tokens /
-/// logprobs), or run on an ineligible model silently fall back to plain decode.
-#[derive(Clone, Copy, Debug)]
-pub struct SpeculativeConfig {
-    pub enabled: bool,
-    /// Draft length per step (n-gram budget), clamped to `MAX_SPEC_DRAFT`.
-    pub draft_tokens: usize,
-}
-
-impl SpeculativeConfig {
-    pub fn off() -> Self {
-        Self {
-            enabled: false,
-            draft_tokens: 0,
-        }
-    }
-
-    /// N-gram speculation with a `draft_tokens` budget (clamped to
-    /// `1..=MAX_SPEC_DRAFT`).
-    pub fn ngram(draft_tokens: usize) -> Self {
-        Self {
-            enabled: true,
-            draft_tokens: draft_tokens.clamp(1, MAX_SPEC_DRAFT),
-        }
-    }
-}
 
 #[derive(Default)]
 pub struct EngineRequest {
@@ -81,6 +54,8 @@ pub struct EngineRequest {
     /// `logprobs`/`top_logprobs` (SPEC §8.1.2): report each token's
     /// log-probability plus this many top alternatives. Forces the CPU sampler.
     pub logprobs: Option<usize>,
+    /// Emituj także ID tokenów, których fragment tekstu jest pusty.
+    pub emit_empty_tokens: bool,
 }
 
 #[derive(Debug)]
@@ -98,13 +73,24 @@ pub enum EngineEvent {
         prompt_tokens: usize,
         /// Prompt tokens served from the prefix cache (SPEC §5.2 prefix hit).
         cache_read_tokens: usize,
+        /// Diagnostyka dostępna tylko, gdy model przygotował profil benchmarku.
+        benchmark: Option<BenchmarkTimings>,
     },
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BenchmarkTimings {
+    pub target_gpu_ms: Option<f64>,
+    pub mtp_catchup_gpu_ms: Option<f64>,
+    pub ttft_ms: f64,
 }
 
 struct Submission {
     req: EngineRequest,
     events: mpsc::Sender<EngineEvent>,
+    submitted_at: Instant,
+    bypasses: usize,
 }
 
 /// Cheap cloneable handle; the worker thread ends when all handles drop.
@@ -112,6 +98,7 @@ struct Submission {
 pub struct EngineHandle {
     tx: mpsc::Sender<Submission>,
     metrics: Arc<EngineMetrics>,
+    worker: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl EngineHandle {
@@ -119,7 +106,12 @@ impl EngineHandle {
     pub fn submit(&self, req: EngineRequest) -> Result<mpsc::Receiver<EngineEvent>> {
         let (etx, erx) = mpsc::channel();
         self.tx
-            .send(Submission { req, events: etx })
+            .send(Submission {
+                req,
+                events: etx,
+                submitted_at: Instant::now(),
+                bypasses: 0,
+            })
             .map_err(|_| ForgeError::Scheduler("engine worker stopped".into()))?;
         Ok(erx)
     }
@@ -128,6 +120,29 @@ impl EngineHandle {
     /// the worker thread. Read-only for callers.
     pub fn metrics(&self) -> &Arc<EngineMetrics> {
         &self.metrics
+    }
+
+    /// Zamyka ostatni handle i czeka na zwolnienie modelu przez worker.
+    pub fn shutdown(self) -> Result<()> {
+        let Self {
+            tx,
+            metrics: _,
+            worker,
+        } = self;
+        if Arc::strong_count(&worker) != 1 {
+            return Err(ForgeError::Scheduler(
+                "shutdown wymaga ostatniego klonu EngineHandle".into(),
+            ));
+        }
+        drop(tx);
+        let handle = worker
+            .lock()
+            .map_err(|_| ForgeError::Scheduler("blokada workera jest zatruta".into()))?
+            .take()
+            .ok_or_else(|| ForgeError::Scheduler("worker został już zatrzymany".into()))?;
+        handle
+            .join()
+            .map_err(|_| ForgeError::Scheduler("worker zakończył się panic".into()))
     }
 }
 
@@ -157,6 +172,8 @@ struct ActiveSeq<'t> {
     /// Prompt tokens not yet prefilled (front = next).
     pending_prompt: VecDeque<u32>,
     generated: Vec<u32>,
+    /// Prompt i wygenerowane tokeny widoczne dla kar samplera CPU.
+    sampling_history: Vec<u32>,
     max_tokens: usize,
     eos_ids: Vec<u32>,
     /// `logit_bias` applied to the host logits before selection (CPU path).
@@ -166,6 +183,7 @@ struct ActiveSeq<'t> {
     /// When set, each token carries a `logprobs` report with this many top
     /// alternatives (CPU path).
     logprobs: Option<usize>,
+    emit_empty_tokens: bool,
     /// Live grammar state for constrained decoding; `None` = unconstrained.
     matcher: Option<forge_grammar::GrammarMatcher>,
     prompt_len: usize,
@@ -175,22 +193,346 @@ struct ActiveSeq<'t> {
     next: Option<PendingNext>,
     /// Client hang-up detected; sequence is torn down at the next iteration.
     dead: bool,
-    /// Speculative-decode state (SPEC §6): `Some` only for an eligible greedy
-    /// sequence with speculation enabled. Holds the n-gram proposer's history
-    /// index and per-proposer acceptance stats; drives draft/verify/commit.
+    /// Stan hostowego proposera; natywne MTP używa stanu per sekwencja w puli GPU.
     spec: Option<SpeculativeState>,
-    /// Draft budget per speculative step (0 when `spec` is `None`).
+    /// Jawny tryb spekulacji; natywne MTP nie ma hostowego `SpeculativeState`
+    /// ani CPU proposera.
+    spec_kind: SpeculationKind,
+    /// Budżet draftu na krok, równy 0 wyłącznie dla `SpeculationKind::Off`.
     spec_budget: usize,
     /// Verification forwards run for this sequence (each yields 1..=k+1 tokens).
     spec_forwards: u64,
     /// Draft tokens accepted across all verifications (excludes correction/bonus
     /// tokens, which every forward also produces).
     spec_accepted: u64,
+    /// Liczba pełnych draftów n-gram zweryfikowanych przez router MTP+n-gram.
+    ngram_forwards: u64,
+    /// Liczba kroków, w których brak pełnego draftu uruchomił proposer MTP.
+    mtp_fallback_forwards: u64,
+    mtp_k2_rate: Option<f64>,
+    mtp_k3_rate: Option<f64>,
     /// TTFT / inter-token / decode-tps timing feeding the metrics histograms.
     timing: SeqTiming,
     /// Set once `finish` has emitted `Done`; distinguishes a clean completion
     /// from an errored / hung-up teardown for the requests_errored counter.
     finished_cleanly: bool,
+    submitted_at: Instant,
+    prefill_profile: Option<PrefillProfile>,
+    benchmark_ttft_ms: Option<f64>,
+    /// Maksymalna liczba stron, do której admission zobowiązał pulę KV.
+    kv_page_budget: usize,
+}
+
+fn request_speculation_kind(spec: &SpeculativeConfig, greedy: bool) -> Result<SpeculationKind> {
+    match (spec.kind(), greedy) {
+        (
+            SpeculationKind::HostProposer
+            | SpeculationKind::NativeMtp
+            | SpeculationKind::NativeMtpNgram,
+            false,
+        )
+        | (SpeculationKind::Off, _) => {
+            Ok(SpeculationKind::Off)
+        }
+        (kind, true) => Ok(kind),
+    }
+}
+
+fn validate_speculation_server_config(
+    _kind: SpeculationKind,
+    max_active: usize,
+    _hybrid_target: bool,
+) -> Result<()> {
+    if max_active == 0 {
+        return Err(ForgeError::Scheduler(
+            "max_active musi być większe od zera".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn native_mtp_step_budget(available: usize) -> Option<usize> {
+    match available {
+        2 | 3 => Some(available),
+        _ => None,
+    }
+}
+
+fn native_mtp_adaptive_budget(
+    available: usize,
+    configured: usize,
+    forwards: u64,
+    k2_rate: Option<f64>,
+    k3_rate: Option<f64>,
+) -> Option<usize> {
+    let maximum = native_mtp_step_budget(available)?;
+    if configured != 3 {
+        return native_mtp_step_budget(maximum.min(configured));
+    }
+    if maximum != 3 {
+        return Some(maximum);
+    }
+    if forwards < 4 {
+        return Some(if forwards.is_multiple_of(2) { 3 } else { 2 });
+    }
+    let preferred = if k3_rate.unwrap_or(0.0) >= k2_rate.unwrap_or(0.0) {
+        3
+    } else {
+        2
+    };
+    if forwards.is_multiple_of(16) {
+        Some(if preferred == 3 { 2 } else { 3 })
+    } else {
+        Some(preferred)
+    }
+}
+
+fn parse_native_mtp_b2(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_NATIVE_MTP_B2 wymaga wartości 0 lub 1, otrzymano {value:?}"
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MtpNgramBatchMode {
+    Auto,
+    Off,
+    ForceOn,
+}
+
+fn parse_mtp_ngram_batch(value: Option<&str>) -> Result<MtpNgramBatchMode> {
+    match value {
+        None => Ok(MtpNgramBatchMode::Auto),
+        Some("0") => Ok(MtpNgramBatchMode::Off),
+        Some("1") => Ok(MtpNgramBatchMode::ForceOn),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_MTP_NGRAM_BATCH wymaga wartości 0 lub 1, otrzymano {value:?}"
+        ))),
+    }
+}
+
+fn parse_mtp_ngram_mixed_batch(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_MTP_NGRAM_MIXED_BATCH wymaga wartości 0 lub 1, otrzymano {value:?}"
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HybridPrefillBatchMode {
+    Auto,
+    Off,
+    ForceOn,
+}
+
+fn parse_hybrid_prefill_batch(value: Option<&str>) -> Result<HybridPrefillBatchMode> {
+    match value {
+        None => Ok(HybridPrefillBatchMode::Auto),
+        Some("0") => Ok(HybridPrefillBatchMode::Off),
+        Some("1") => Ok(HybridPrefillBatchMode::ForceOn),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_HYBRID_PREFILL_BATCH wymaga wartości 0 lub 1, otrzymano {value:?}"
+        ))),
+    }
+}
+
+fn resolve_hybrid_prefill_batch(
+    mode: HybridPrefillBatchMode,
+    vendor: Vendor,
+    warp_size: u32,
+    model_capable: bool,
+) -> Result<bool> {
+    let backend_capable = hybrid_prefill_b2_backend_capable(vendor, warp_size);
+    match mode {
+        HybridPrefillBatchMode::Auto => Ok(backend_capable && model_capable),
+        HybridPrefillBatchMode::Off => Ok(false),
+        HybridPrefillBatchMode::ForceOn if backend_capable && model_capable => Ok(true),
+        HybridPrefillBatchMode::ForceOn if !backend_capable => Err(ForgeError::Unsupported(
+            format!(
+                "FORGE_HYBRID_PREFILL_BATCH=1 wymaga zweryfikowanego backendu NVIDIA warp32, otrzymano {vendor:?} warp{warp_size}"
+            ),
+        )),
+        HybridPrefillBatchMode::ForceOn => Err(ForgeError::Unsupported(
+            "FORGE_HYBRID_PREFILL_BATCH=1 wymaga pełnego capability modelu i artefaktów prefill B2 T32".into(),
+        )),
+    }
+}
+
+fn mtp_ngram_auto_backend(vendor: Vendor, warp_size: u32) -> bool {
+    vendor == Vendor::Nvidia && warp_size == 32
+}
+
+fn resolve_mtp_ngram_batch(
+    mode: MtpNgramBatchMode,
+    vendor: Vendor,
+    warp_size: u32,
+    model_capable: bool,
+) -> Result<bool> {
+    match mode {
+        MtpNgramBatchMode::Auto => {
+            Ok(model_capable && mtp_ngram_auto_backend(vendor, warp_size))
+        }
+        MtpNgramBatchMode::Off => Ok(false),
+        MtpNgramBatchMode::ForceOn if model_capable => Ok(true),
+        MtpNgramBatchMode::ForceOn => Err(ForgeError::Unsupported(
+            "FORGE_MTP_NGRAM_BATCH=1 wymaga strukturalnej obsługi MTP N/N B2 modelu".into(),
+        )),
+    }
+}
+
+fn mtp_ngram_batch_plan(budgets: &[Option<usize>]) -> (Vec<[usize; 2]>, Vec<usize>) {
+    let mut pending: [Option<usize>; 2] = [None, None];
+    let mut pairs = Vec::new();
+    let mut singles = Vec::new();
+    for (position, budget) in budgets.iter().copied().enumerate() {
+        let Some(budget) = budget else {
+            continue;
+        };
+        let Some(group) = budget.checked_sub(2).filter(|&group| group < pending.len()) else {
+            singles.push(position);
+            continue;
+        };
+        if let Some(first) = pending[group].take() {
+            pairs.push([first, position]);
+        } else {
+            pending[group] = Some(position);
+        }
+    }
+    singles.extend(pending.into_iter().flatten());
+    singles.sort_unstable();
+    (pairs, singles)
+}
+
+fn hybrid_prefill_batch_plan(pending_lengths: &[usize]) -> (Vec<[usize; 2]>, Vec<usize>) {
+    const CHUNK: usize = 32;
+    let mut pending = None;
+    let mut pairs = Vec::new();
+    let mut paired = vec![false; pending_lengths.len()];
+    for (index, &length) in pending_lengths.iter().enumerate() {
+        if length < CHUNK {
+            continue;
+        }
+        if let Some(first) = pending.take() {
+            pairs.push([first, index]);
+            paired[first] = true;
+            paired[index] = true;
+        } else {
+            pending = Some(index);
+        }
+    }
+    let singles = paired
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &is_paired)| (!is_paired).then_some(index))
+        .collect();
+    (pairs, singles)
+}
+
+fn mtp_routed_pair_enabled(
+    has_native_source: bool,
+    native_mtp_b2: bool,
+    mtp_ngram_mixed_batch: bool,
+) -> bool {
+    !has_native_source || (native_mtp_b2 && mtp_ngram_mixed_batch)
+}
+
+enum MtpRoutedSource {
+    Native { observe_ngram: bool },
+    Ngram(Vec<u32>),
+}
+
+struct MtpRoutedCandidate {
+    index: usize,
+    budget: usize,
+    source: MtpRoutedSource,
+}
+
+fn update_mtp_rate(rate: &mut Option<f64>, sample: f64) {
+    *rate = Some(rate.map_or(sample, |previous| previous * 0.75 + sample * 0.25));
+}
+
+enum AdmissionDisposition {
+    Admit { page_budget: usize },
+    Reject(String),
+    Wait,
+}
+
+fn reservation_fits(available_pages: usize, reserved_pages: usize, page_budget: usize) -> bool {
+    page_budget <= available_pages.saturating_sub(reserved_pages)
+}
+
+fn admission_disposition(
+    model: &Model,
+    request: &EngineRequest,
+    reserved_pages: usize,
+) -> AdmissionDisposition {
+    let page = model.kv.cfg.page_size;
+    let need_pages = request
+        .prompt_tokens
+        .len()
+        .checked_add(request.max_tokens.max(1))
+        .map(|total| total.div_ceil(page));
+    let capacity = model.max_request_pages();
+    let Some(need_pages) = need_pages else {
+        return AdmissionDisposition::Reject(
+            "request size overflows: prompt_tokens + max_tokens".into(),
+        );
+    };
+    if need_pages > capacity {
+        return AdmissionDisposition::Reject(format!(
+            "request needs {need_pages} KV pages, cache has {capacity} total"
+        ));
+    }
+    let page_budget = if model.tier_enabled() {
+        need_pages.min(crate::tier::min_resident_pages(page))
+    } else {
+        need_pages
+    };
+    if reservation_fits(model.available_pages(), reserved_pages, page_budget) {
+        AdmissionDisposition::Admit { page_budget }
+    } else {
+        AdmissionDisposition::Wait
+    }
+}
+
+fn first_actionable_index(
+    len: usize,
+    scan_window: usize,
+    oldest_bypasses: usize,
+    bypass_budget: usize,
+    mut classify: impl FnMut(usize) -> AdmissionDisposition,
+) -> Option<(usize, AdmissionDisposition)> {
+    let limit = if oldest_bypasses >= bypass_budget {
+        len.min(1)
+    } else {
+        len.min(scan_window)
+    };
+    (0..limit).find_map(|index| {
+        let disposition = classify(index);
+        (!matches!(&disposition, AdmissionDisposition::Wait)).then_some((index, disposition))
+    })
+}
+
+fn reserved_future_pages(active: &[ActiveSeq<'_>], tier_enabled: bool) -> usize {
+    active
+        .iter()
+        .filter(|seq| !seq.dead)
+        .map(|seq| {
+            let allocated = if tier_enabled {
+                seq.seq.pages.iter().filter(|&&page| page >= 0).count()
+            } else {
+                seq.seq.pages.len()
+            };
+            seq.kv_page_budget.saturating_sub(allocated)
+        })
+        .fold(0usize, usize::saturating_add)
 }
 
 /// Spawn the GPU worker thread. `prefill_chunk` bounds how many prompt tokens
@@ -201,7 +543,7 @@ pub fn spawn_engine(
     tokenizer: Arc<Tokenizer>,
     max_active: usize,
     prefill_chunk: usize,
-) -> EngineHandle {
+) -> Result<EngineHandle> {
     spawn_engine_batched(
         model,
         tokenizer,
@@ -238,29 +580,102 @@ pub fn spawn_engine_batched(
     prefill_chunk: usize,
     batch_min: usize,
     spec: SpeculativeConfig,
-) -> EngineHandle {
-    // Speculation needs the standard dense paged-KV path; log once if the model
-    // is ineligible so an operator who asked for it is not left guessing.
-    let spec = if spec.enabled && !model.speculation_eligible() {
-        tracing::warn!(
-            "speculative decoding requested but this model/config is ineligible \
-             (needs dense F16 paged KV, no tier, no prefix cache, f16/q8_0 head); \
-             running without speculation"
-        );
-        SpeculativeConfig::off()
-    } else {
-        spec
-    };
-    if spec.enabled {
+) -> Result<EngineHandle> {
+    let native_mtp_b2 = parse_native_mtp_b2(std::env::var("FORGE_NATIVE_MTP_B2").ok().as_deref())?;
+    let mtp_ngram_mode =
+        parse_mtp_ngram_batch(std::env::var("FORGE_MTP_NGRAM_BATCH").ok().as_deref())?;
+    let mtp_ngram_mixed_batch = parse_mtp_ngram_mixed_batch(
+        std::env::var("FORGE_MTP_NGRAM_MIXED_BATCH").ok().as_deref(),
+    )?;
+    let hybrid_prefill_mode = parse_hybrid_prefill_batch(
+        std::env::var("FORGE_HYBRID_PREFILL_BATCH").ok().as_deref(),
+    )?;
+    let caps = model.device.caps();
+    let hybrid_prefill_capable = model.hybrid_prefill_b2_capable(32);
+    let hybrid_prefill_batch = resolve_hybrid_prefill_batch(
+        hybrid_prefill_mode,
+        caps.vendor,
+        caps.warp_size,
+        hybrid_prefill_capable,
+    )?;
+    let mtp_ngram_batch = resolve_mtp_ngram_batch(
+        mtp_ngram_mode,
+        caps.vendor,
+        caps.warp_size,
+        model.mtp_ngram_b2_model_capable(),
+    )?;
+    if mtp_ngram_mixed_batch && !mtp_ngram_batch {
+        return Err(ForgeError::Scheduler(
+            "FORGE_MTP_NGRAM_MIXED_BATCH=1 wymaga aktywnego FORGE_MTP_NGRAM_BATCH".into(),
+        ));
+    }
+    tracing::info!(
+        mode = ?mtp_ngram_mode,
+        enabled = mtp_ngram_batch,
+        vendor = ?caps.vendor,
+        warp_size = caps.warp_size,
+        "rollout MTP+n-gram N/N B2"
+    );
+    tracing::info!(
+        enabled = mtp_ngram_mixed_batch,
+        "eksperymentalny rollout MTP+n-gram N/M i M/M B2"
+    );
+    tracing::info!(
+        mode = ?hybrid_prefill_mode,
+        enabled = hybrid_prefill_batch,
+        vendor = ?caps.vendor,
+        warp_size = caps.warp_size,
+        capable = hybrid_prefill_capable,
+        "eksperymentalny rollout hybrydowego prefill B2 T32"
+    );
+    let coordinator = SpeculationCoordinator::new(spec.clone())?;
+    validate_speculation_server_config(spec.kind(), max_active, model.is_hybrid())?;
+    if spec.is_enabled() {
+        match spec.kind() {
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+                if !model.has_native_mtp() =>
+            {
+                return Err(ForgeError::Unsupported(
+                    "natywne MTP wymaga obsługiwanego runtime per sekwencja".into(),
+                ));
+            }
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram => {
+                model.validate_native_mtp_target()?
+            }
+            SpeculationKind::HostProposer => {
+                model.validate_speculation_target(spec.draft_tokens())?
+            }
+            SpeculationKind::Off => {}
+        }
+        let proposer_names = spec
+            .proposers()
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
         tracing::info!(
-            "speculative decoding: n-gram proposer, draft budget {}",
-            spec.draft_tokens
+            "speculative decoding: {} proposer, draft budget {}",
+            proposer_names,
+            spec.draft_tokens()
         );
+    }
+    if model.is_hybrid() {
+        model.preflight_hybrid_state_slots(max_active)?;
+        if max_active >= 2
+            && spec.kind() == SpeculationKind::Off
+            && model.hybrid_batch_b2_capable()
+        {
+            model.ensure_batch(2)?;
+        }
     }
     let (tx, rx) = mpsc::channel::<Submission>();
     let metrics = Arc::new(EngineMetrics::new());
+    EngineMetrics::set(
+        &metrics.hybrid_prefill_b2_scratch_bytes,
+        model.debug_hybrid_prefill_b2_scratch_bytes() as u64,
+    );
     let worker_metrics = metrics.clone();
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("forge-engine-worker".into())
         .spawn(move || {
             worker(
@@ -271,11 +686,20 @@ pub fn spawn_engine_batched(
                 prefill_chunk,
                 batch_min,
                 spec,
+                coordinator,
+                native_mtp_b2,
+                mtp_ngram_batch,
+                mtp_ngram_mixed_batch,
+                hybrid_prefill_batch,
                 &worker_metrics,
             )
         })
-        .expect("spawn engine worker");
-    EngineHandle { tx, metrics }
+        .map_err(ForgeError::Io)?;
+    Ok(EngineHandle {
+        tx,
+        metrics,
+        worker: Arc::new(Mutex::new(Some(worker))),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -287,17 +711,27 @@ fn worker<'t>(
     prefill_chunk: usize,
     batch_min: usize,
     spec: SpeculativeConfig,
+    coordinator: SpeculationCoordinator,
+    native_mtp_b2: bool,
+    mtp_ngram_batch: bool,
+    mtp_ngram_mixed_batch: bool,
+    hybrid_prefill_batch: bool,
     metrics: &EngineMetrics,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
     let mut waiting: VecDeque<Submission> = VecDeque::new();
+    let mut hybrid_prefill_pair_cursor = 0usize;
+    let admission_scan_window = max_active.saturating_mul(2).clamp(2, 16);
+    let admission_bypass_budget = admission_scan_window.saturating_mul(2);
     // Total KV pages is fixed at startup; export it once as a gauge baseline.
     EngineMetrics::set(&metrics.kv_pages_total, model.kv.cfg.n_pages as u64);
 
     // Provision the batched-decode scratch + graph buckets for the full active
     // width once. A failure here (VRAM pressure) is surfaced per-request by the
     // per-batch re-ensure inside `batched_decode`.
-    let _ = model.ensure_batch(max_active);
+    if !model.is_hybrid() {
+        let _ = model.ensure_batch(max_active);
+    }
 
     loop {
         // Drain the submission queue without blocking while work is active;
@@ -324,51 +758,34 @@ fn worker<'t>(
         // (the VRAM pool, or the tier-extended context window when tiering
         // is on — a tiered sequence only needs its hot working set resident).
         while active.len() < max_active {
-            let Some(sub) = waiting.front() else { break };
-            let page = model.kv.cfg.page_size;
-            // A request that can never fit is rejected permanently; one that
-            // only exceeds the currently free pages waits for a slot. The
-            // error strings differ so the API layer can map them to 400 vs
-            // transient handling.
-            let need_pages = sub
-                .req
-                .prompt_tokens
-                .len()
-                .checked_add(sub.req.max_tokens)
-                .map(|total| total.div_ceil(page));
-            let capacity = model.max_request_pages();
-            let permanently_too_large = match need_pages {
-                None => true,
-                Some(n) => n > capacity,
+            let reserved_pages = reserved_future_pages(&active, model.tier_enabled());
+            let oldest_bypasses = waiting.front().map_or(0, |sub| sub.bypasses);
+            let Some((index, disposition)) = first_actionable_index(
+                waiting.len(),
+                admission_scan_window,
+                oldest_bypasses,
+                admission_bypass_budget,
+                |index| admission_disposition(model, &waiting[index].req, reserved_pages),
+            ) else {
+                break;
             };
-            if permanently_too_large {
-                let sub = waiting.pop_front().unwrap();
-                let _ = sub.events.send(EngineEvent::Error(match need_pages {
-                    Some(n) => format!(
-                        "request needs {n} KV pages, cache has {capacity} total"
-                    ),
-                    None => "request size overflows: prompt_tokens + max_tokens".into(),
-                }));
-                EngineMetrics::inc(&metrics.requests_errored);
-                continue;
+            for skipped in waiting.iter_mut().take(index) {
+                skipped.bypasses = skipped.bypasses.saturating_add(1);
             }
-            // A prefix-cache hit (SPEC §5.2) shrinks the pages this request must
-            // prefill: the shared prefix is already resident. The projection
-            // uses a read-only match; the actual borrow happens once the
-            // sequence exists. Admission counts reclaimable cached pages as
-            // available, so a full-but-reclaimable cache never blocks work.
-            let cache_read_pages = model.prefix_match_len(&sub.req.prompt_tokens) / page;
-            let admit_floor = if model.tier_enabled() {
-                need_pages
-                    .unwrap()
-                    .min(crate::tier::min_resident_pages(page))
-            } else {
-                need_pages.unwrap().saturating_sub(cache_read_pages)
+            waiting.rotate_left(index);
+            let sub = waiting
+                .pop_front()
+                .expect("wybrany request admission istnieje w kolejce");
+            waiting.rotate_right(index);
+            let page_budget = match disposition {
+                AdmissionDisposition::Admit { page_budget } => page_budget,
+                AdmissionDisposition::Reject(error) => {
+                    let _ = sub.events.send(EngineEvent::Error(error));
+                    EngineMetrics::inc(&metrics.requests_errored);
+                    continue;
+                }
+                AdmissionDisposition::Wait => unreachable!("wait nie jest wybierany przez admission"),
             };
-            if admit_floor > model.available_pages() {
-                break; // transient KV pressure: retry when a sequence finishes
-            }
-            let sub = waiting.pop_front().unwrap();
             if sub.req.prompt_tokens.is_empty() {
                 let _ = sub.events.send(EngineEvent::Error("empty prompt".into()));
                 EngineMetrics::inc(&metrics.requests_errored);
@@ -385,16 +802,21 @@ fn worker<'t>(
                 || !sub.req.logit_bias.is_empty()
                 || sub.req.min_tokens > 0
                 || sub.req.logprobs.is_some();
-            let sampler = if !host_logits && model.gpu_sampling_supported(&sub.req.sampling) {
+            let mut sampler = if !host_logits && model.gpu_sampling_supported(&sub.req.sampling) {
                 SeqSampler::Gpu(GpuSampler::new(sub.req.sampling.clone()))
             } else {
                 SeqSampler::Cpu(Sampler::new(sub.req.sampling.clone()))
             };
-            // Borrow the longest cached prefix (pins shared pages); only the
-            // divergent suffix stays to prefill.
-            let mut seq = model.new_seq();
-            let cache_read = model.acquire_prefix(&mut seq, &prompt);
-            let pending_prompt: VecDeque<u32> = prompt[cache_read..].iter().copied().collect();
+            if let SeqSampler::Gpu(gpu_sampler) = &mut sampler {
+                gpu_sampler.note_tokens(&prompt);
+            }
+            let sampling_history = if matches!(sampler, SeqSampler::Cpu(_))
+                && sub.req.sampling.clone().sanitized().has_penalties()
+            {
+                prompt.clone()
+            } else {
+                Vec::new()
+            };
             // Speculative decoding engages only for a greedy, penalty-free,
             // GPU-sampled sequence (the n-gram verifier reproduces greedy argmax
             // exactly; a repetition penalty or host-logit feature would diverge).
@@ -402,18 +824,38 @@ fn worker<'t>(
             // prefixes draft immediately.
             let greedy = matches!(sampler, SeqSampler::Gpu(_))
                 && sub.req.sampling.clone().sanitized().temperature <= 0.0
-                && sub.req.sampling.repetition_penalty == 1.0;
-            let (spec_state, spec_budget) = if spec.enabled && greedy {
-                // A 3-gram floor keeps ordinary prose (where short-gram
-                // coincidences abound) on the plain decode path and only
-                // speculates on genuinely recurring context.
-                let composer =
-                    CascadeComposer::new(vec![Box::new(NgramProposer::with_min_gram(3))]);
-                let mut st = SpeculativeState::new(composer);
-                st.observe_all(&prompt);
-                (Some(st), spec.draft_tokens)
+                && !sub.req.sampling.clone().sanitized().has_penalties();
+            let request_spec_kind = match request_speculation_kind(&spec, greedy) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    let _ = sub.events.send(EngineEvent::Error(error.to_string()));
+                    EngineMetrics::inc(&metrics.requests_errored);
+                    continue;
+                }
+            };
+            // Najdłuższy prefiks jest przypinany dopiero po sprawdzeniu MTP,
+            // aby odrzucone żądanie nie pozostawiło zajętych stron.
+            let mut seq = model.new_seq();
+            let cache_read = model.acquire_prefix(&mut seq, &prompt);
+            let pending_prompt: VecDeque<u32> = prompt[cache_read..].iter().copied().collect();
+            if spec.is_enabled() && !greedy {
+                tracing::info!(
+                    configured = ?spec.kind(),
+                    fallback = ?request_spec_kind,
+                    "spekulacja wyłączona dla żądania wymagającego non-greedy lub host logits"
+                );
+            }
+            let (spec_state, spec_kind, spec_budget) = if request_spec_kind != SpeculationKind::Off {
+                let state = match coordinator.new_state(&prompt) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        let _ = sub.events.send(EngineEvent::Error(error.to_string()));
+                        continue;
+                    }
+                };
+                (state, request_spec_kind, spec.draft_tokens())
             } else {
-                (None, 0)
+                (None, SpeculationKind::Off, 0)
             };
             active.push(ActiveSeq {
                 seq,
@@ -423,22 +865,33 @@ fn worker<'t>(
                 events: sub.events,
                 pending_prompt,
                 generated: Vec::new(),
+                sampling_history,
                 max_tokens: sub.req.max_tokens.max(1),
                 eos_ids: sub.req.eos_ids,
                 logit_bias: sub.req.logit_bias,
                 min_tokens: sub.req.min_tokens,
                 logprobs: sub.req.logprobs,
+                emit_empty_tokens: sub.req.emit_empty_tokens,
                 matcher,
                 prompt_len,
                 cache_read,
                 next: None,
                 dead: false,
                 spec: spec_state,
+                spec_kind,
                 spec_budget,
                 spec_forwards: 0,
                 spec_accepted: 0,
+                ngram_forwards: 0,
+                mtp_fallback_forwards: 0,
+                mtp_k2_rate: None,
+                mtp_k3_rate: None,
                 timing: SeqTiming::new(),
                 finished_cleanly: false,
+                submitted_at: sub.submitted_at,
+                prefill_profile: None,
+                benchmark_ttft_ms: None,
+                kv_page_budget: page_budget,
             });
             EngineMetrics::inc(&metrics.requests_started);
         }
@@ -484,26 +937,82 @@ fn worker<'t>(
             }
         }
 
-        // One scheduler iteration. Prefilling sequences and any CPU-sampled
-        // decode sequence advance individually (chunked prefill / one token);
-        // every GPU-sampled decode sequence runs through ONE batched forward
-        // pass (`batch_gpu_decode`) — the continuous-batching throughput path.
+        // Gotowe decode ma pierwszeństwo przed pracą prefill, aby długi prompt
+        // nie zwiększał ITL już generowanych sekwencji.
+        batch_gpu_decode(
+            model,
+            &mut active,
+            batch_min,
+            native_mtp_b2,
+            mtp_ngram_batch,
+            mtp_ngram_mixed_batch,
+            metrics,
+        );
         for a in active.iter_mut() {
-            if a.dead {
+            if a.dead || !a.pending_prompt.is_empty() || matches!(a.sampler, SeqSampler::Gpu(_)) {
                 continue;
-            }
-            let gpu = matches!(a.sampler, SeqSampler::Gpu(_));
-            let decoding = a.pending_prompt.is_empty();
-            if gpu && decoding {
-                continue; // handled by the batch below
             }
             if let Err(e) = advance(model, a, prefill_chunk, metrics) {
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
             }
         }
-        batch_gpu_decode(model, &mut active, batch_min, metrics);
 
+        let mut prefilled_b2 = None;
+        let mut deferred_b2 = None;
+        if hybrid_prefill_batch {
+            let pending_indices = active
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.dead && !a.pending_prompt.is_empty())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let pending = pending_indices
+                .iter()
+                .map(|&index| active[index].pending_prompt.len())
+                .collect::<Vec<_>>();
+            let (pairs, singles) = hybrid_prefill_batch_plan(&pending);
+            tracing::trace!(?pairs, ?singles, "plan hybrydowego prefill B2 T32");
+            if model.hybrid_prefill_b2_capable(32) && !pairs.is_empty() {
+                deferred_b2 = Some(Vec::with_capacity(pairs.len().saturating_sub(1) * 2));
+                let selected = hybrid_prefill_pair_cursor % pairs.len();
+                hybrid_prefill_pair_cursor = hybrid_prefill_pair_cursor.wrapping_add(1);
+                for (pair_index, [first, second]) in pairs.into_iter().enumerate() {
+                    let indices = [pending_indices[first], pending_indices[second]];
+                    if pair_index == selected {
+                        advance_hybrid_prefill_b2(model, &mut active, indices, metrics);
+                        prefilled_b2 = Some(indices);
+                    } else {
+                        deferred_b2
+                            .as_mut()
+                            .expect("lista odroczonych par jest gotowa")
+                            .extend(indices);
+                    }
+                }
+            } else {
+                EngineMetrics::add(&metrics.hybrid_prefill_b2_fallbacks_total, pairs.len() as u64);
+            }
+        }
+
+        // One scheduler iteration. Prefilling sequences and any CPU-sampled
+        // decode sequence advance individually (chunked prefill / one token);
+        // every GPU-sampled decode sequence runs through ONE batched forward
+        // pass (`batch_gpu_decode`) — the continuous-batching throughput path.
+        for (index, a) in active.iter_mut().enumerate() {
+            if a.dead {
+                continue;
+            }
+            if prefilled_b2.is_some_and(|pair| pair.contains(&index))
+                || deferred_b2.as_ref().is_some_and(|indices| indices.contains(&index))
+                || a.pending_prompt.is_empty()
+            {
+                continue;
+            }
+            if let Err(e) = advance(model, a, prefill_chunk, metrics) {
+                let _ = a.events.send(EngineEvent::Error(e.to_string()));
+                a.dead = true;
+            }
+        }
         // Tear down finished/dead sequences and release their pages (and any
         // tier chunks they spilled).
         active.retain_mut(|a| {
@@ -540,11 +1049,17 @@ fn emit_token(
     logprob: Option<TokenLogprob>,
     metrics: &EngineMetrics,
 ) -> Result<StepOutcome> {
+    if a.benchmark_ttft_ms.is_none() && a.prefill_profile.is_some() {
+        a.benchmark_ttft_ms = Some(a.submitted_at.elapsed().as_secs_f64() * 1000.0);
+    }
     if a.eos_ids.contains(&next) {
         finish(a, FinishReason::Eos, metrics)?;
         return Ok(StepOutcome::Finished);
     }
     a.generated.push(next);
+    if !a.sampling_history.is_empty() {
+        a.sampling_history.push(next);
+    }
     // A produced token: feeds TTFT (first) or the inter-token gap (later).
     a.timing.record_token(metrics);
 
@@ -559,7 +1074,7 @@ fn emit_token(
     // Send a token event when there is text to surface or a per-token
     // `logprobs` report to deliver (the latter must reach the client even for
     // a token whose byte-level piece is still buffered by the decoder).
-    if (!emit_text.is_empty() || logprob.is_some())
+    if (a.emit_empty_tokens || !emit_text.is_empty() || logprob.is_some())
         && a.events
             .send(EngineEvent::Token {
                 id: next,
@@ -584,6 +1099,132 @@ fn emit_token(
     Ok(StepOutcome::Continue)
 }
 
+fn finish_hybrid_prefill_b2_lane(
+    model: &mut Model,
+    active: &mut ActiveSeq<'_>,
+    logits: Vec<f32>,
+    lane: usize,
+) -> Result<()> {
+    if !active.pending_prompt.is_empty() {
+        return Ok(());
+    }
+    active.next = Some(match &mut active.sampler {
+        SeqSampler::Cpu(_) => PendingNext::Logits(logits),
+        SeqSampler::Gpu(sampler) => {
+            PendingNext::Token(model.sample_hybrid_prefill_b2_logits(lane, sampler)?)
+        }
+    });
+    Ok(())
+}
+
+fn advance_hybrid_prefill_b2(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    indices: [usize; 2],
+    metrics: &EngineMetrics,
+) {
+    const STEPS: usize = 32;
+    let [first_index, second_index] = indices;
+    let (left, right) = active.split_at_mut(second_index);
+    let first = &mut left[first_index];
+    let second = &mut right[0];
+    let chunks = [
+        first.pending_prompt.iter().take(STEPS).copied().collect::<Vec<_>>(),
+        second.pending_prompt.iter().take(STEPS).copied().collect::<Vec<_>>(),
+    ];
+    if chunks.iter().any(|chunk| chunk.len() != STEPS) {
+        EngineMetrics::inc(&metrics.hybrid_prefill_b2_fallbacks_total);
+        return;
+    }
+    let reset_mtp = [first.seq.len == 0, second.seq.len == 0];
+    let result = (|| {
+        let gpu_pair = matches!(first.sampler, SeqSampler::Gpu(_))
+            && matches!(second.sampler, SeqSampler::Gpu(_));
+        if gpu_pair {
+            let final_lanes = [
+                first.pending_prompt.len() == STEPS,
+                second.pending_prompt.len() == STEPS,
+            ];
+            model.hybrid_prefill_b2_t32_device(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+            )?;
+            model.hybrid_prefill_mtp_catchup_b2(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+                reset_mtp,
+            )?;
+            let mut ids = [None, None];
+            match final_lanes {
+                [true, true] => {
+                    let sampled = match (&mut first.sampler, &mut second.sampler) {
+                        (SeqSampler::Gpu(first_sampler), SeqSampler::Gpu(second_sampler)) => model
+                            .sample_hybrid_prefill_b2_logits_batched(&mut [
+                                first_sampler,
+                                second_sampler,
+                            ])?,
+                        _ => unreachable!("gpu_pair sprawdził oba samplery"),
+                    };
+                    ids = sampled.map(Some);
+                }
+                [true, false] => {
+                    let SeqSampler::Gpu(sampler) = &mut first.sampler else {
+                        unreachable!("gpu_pair sprawdził sampler lane 0")
+                    };
+                    ids[0] = Some(model.sample_hybrid_prefill_b2_logits(0, sampler)?);
+                }
+                [false, true] => {
+                    let SeqSampler::Gpu(sampler) = &mut second.sampler else {
+                        unreachable!("gpu_pair sprawdził sampler lane 1")
+                    };
+                    ids[1] = Some(model.sample_hybrid_prefill_b2_logits(1, sampler)?);
+                }
+                [false, false] => {}
+            };
+            first.pending_prompt.drain(..STEPS);
+            second.pending_prompt.drain(..STEPS);
+            if let Some(id) = ids[0] {
+                first.next = Some(PendingNext::Token(id));
+            }
+            if let Some(id) = ids[1] {
+                second.next = Some(PendingNext::Token(id));
+            }
+        } else {
+            let [first_logits, second_logits] = model.hybrid_prefill_b2_t32(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+            )?;
+            model.hybrid_prefill_mtp_catchup_b2(
+                &mut [&mut first.seq, &mut second.seq],
+                [&chunks[0], &chunks[1]],
+                reset_mtp,
+            )?;
+            first.pending_prompt.drain(..STEPS);
+            second.pending_prompt.drain(..STEPS);
+            finish_hybrid_prefill_b2_lane(model, first, first_logits, 0)?;
+            finish_hybrid_prefill_b2_lane(model, second, second_logits, 1)?;
+        }
+        Ok::<(), ForgeError>(())
+    })();
+    EngineMetrics::set(
+        &metrics.hybrid_prefill_b2_scratch_bytes,
+        model.debug_hybrid_prefill_b2_scratch_bytes() as u64,
+    );
+    match result {
+        Ok(()) => {
+            EngineMetrics::inc(&metrics.hybrid_prefill_b2_steps_total);
+            EngineMetrics::add(&metrics.hybrid_prefill_b2_tokens_total, (2 * STEPS) as u64);
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = first.events.send(EngineEvent::Error(message.clone()));
+            let _ = second.events.send(EngineEvent::Error(message));
+            first.dead = true;
+            second.dead = true;
+        }
+    }
+}
+
 /// Advance one sequence by one scheduler quantum (prefill chunk or a single
 /// CPU-sampled decode step). GPU-sampled decode goes through the batched path.
 fn advance(
@@ -601,19 +1242,12 @@ fn advance(
         let chunk: Vec<u32> = a.pending_prompt.drain(..take).collect();
         let logits = model.prefill_chunk(&mut a.seq, &chunk)?;
         if a.pending_prompt.is_empty() {
+            a.prefill_profile = model.take_prefill_profile()?;
             a.next = Some(match &mut a.sampler {
                 SeqSampler::Cpu(_) => PendingNext::Logits(logits),
                 // The prefill logits are still device-resident: draw now,
                 // before another sequence overwrites the shared buffer.
-                SeqSampler::Gpu(g) => {
-                    let t = model.sample_last_logits(g)?;
-                    // Keep the proposer's history in lock-step: the first token
-                    // is confirmed here, before it is ever used as a draft base.
-                    if let Some(s) = &mut a.spec {
-                        s.observe(t);
-                    }
-                    PendingNext::Token(t)
-                }
+                SeqSampler::Gpu(g) => PendingNext::Token(model.sample_last_logits(g)?),
             });
         }
         return Ok(());
@@ -635,7 +1269,8 @@ fn advance(
                 if let Some(m) = &a.matcher {
                     m.apply_mask(&mut logits);
                 }
-                let id = s.sample(&logits, &a.generated)?;
+                apply_penalties(&mut logits, &a.sampling_history, s.params());
+                let id = s.sample_preprocessed(&logits)?;
                 let lp = a.logprobs.map(|n| compute_logprob(&logits, id, n));
                 (id, lp)
             }
@@ -673,13 +1308,16 @@ fn batch_gpu_decode(
     model: &mut Model,
     active: &mut [ActiveSeq<'_>],
     batch_min: usize,
+    native_mtp_b2: bool,
+    mtp_ngram_batch: bool,
+    mtp_ngram_mixed_batch: bool,
     metrics: &EngineMetrics,
 ) {
-    let vocab = model.weights.descriptor.params.vocab_size;
-
     // Phase 1: emit each ready sequence's pending token; collect the indices of
     // survivors that still need to be fed one more token.
     let mut feed_idx: Vec<usize> = Vec::new();
+    let mut mtp_idx: Vec<usize> = Vec::new();
+    let mut mtp_ngram_idx: Vec<usize> = Vec::new();
     for (i, a) in active.iter_mut().enumerate() {
         if a.dead || !a.pending_prompt.is_empty() {
             continue;
@@ -703,10 +1341,17 @@ fn batch_gpu_decode(
             // never joins the batched (or serial fallback) feed set — the n-gram
             // path is a single-sequence latency win, disabled under batch load.
             Ok(StepOutcome::Continue) => {
-                if a.spec.is_some() {
-                    speculative_step(model, a, metrics);
-                } else {
-                    feed_idx.push(i);
+                match a.spec_kind {
+                    SpeculationKind::HostProposer => speculative_step(model, a, metrics),
+                    SpeculationKind::NativeMtp => mtp_idx.push(i),
+                    SpeculationKind::NativeMtpNgram => {
+                        if mtp_ngram_batch {
+                            mtp_ngram_idx.push(i);
+                        } else {
+                            native_mtp_ngram_step(model, a, metrics)
+                        }
+                    }
+                    SpeculationKind::Off => feed_idx.push(i),
                 }
             }
             Ok(StepOutcome::Finished) => {}
@@ -714,6 +1359,33 @@ fn batch_gpu_decode(
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
             }
+        }
+    }
+    if mtp_ngram_batch && (!mtp_idx.is_empty() || !mtp_ngram_idx.is_empty()) {
+        let routed_mtp_indices = if mtp_ngram_mixed_batch {
+            mtp_idx.as_slice()
+        } else {
+            &[]
+        };
+        batch_native_mtp_routed_decode(
+            model,
+            active,
+            routed_mtp_indices,
+            &mtp_ngram_idx,
+            native_mtp_b2,
+            mtp_ngram_mixed_batch,
+            metrics,
+        );
+    } else {
+        for index in mtp_ngram_idx {
+            native_mtp_ngram_step(model, &mut active[index], metrics);
+        }
+    }
+    if (!mtp_ngram_batch || !mtp_ngram_mixed_batch) && native_mtp_b2 && !mtp_idx.is_empty() {
+        batch_native_mtp_decode(model, active, &mtp_idx, metrics);
+    } else if !mtp_ngram_batch || !mtp_ngram_mixed_batch {
+        for index in mtp_idx {
+            native_mtp_step(model, &mut active[index], metrics);
         }
     }
     if feed_idx.is_empty() {
@@ -726,13 +1398,222 @@ fn batch_gpu_decode(
     // size (the GEMMs process a fixed token tile). Serializing them here keeps
     // single-stream and low-concurrency latency from regressing; the batched
     // path engages once the flat cost amortizes across enough sequences.
-    if feed_idx.len() < batch_min.max(2) {
+    // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
+    // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
+    let hybrid_b2 = model.hybrid_batch_b2_capable() && feed_idx.len() >= 2;
+    let serial_only = model.weights.is_moe()
+        || model.kv.cfg.quant.is_rot()
+        || (model.is_hybrid() && !hybrid_b2);
+    if (!hybrid_b2 && feed_idx.len() < batch_min.max(2)) || serial_only {
         for &i in &feed_idx {
             serial_step(model, &mut active[i]);
         }
         return;
     }
 
+    if hybrid_b2 {
+        let mut pairs = feed_idx.chunks_exact(2);
+        for pair in &mut pairs {
+            decode_gpu_group(model, active, pair);
+        }
+        if let Some(&tail) = pairs.remainder().first() {
+            serial_step(model, &mut active[tail]);
+        }
+        return;
+    }
+
+    decode_gpu_group(model, active, &feed_idx);
+}
+
+fn batch_native_mtp_decode(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    mtp_idx: &[usize],
+    metrics: &EngineMetrics,
+) {
+    let mut by_budget = [Vec::new(), Vec::new()];
+    for &index in mtp_idx {
+        let a = &active[index];
+        let available = model.native_mtp_available_budget(&a.seq, a.spec_budget);
+        match native_mtp_adaptive_budget(
+            available,
+            a.spec_budget,
+            a.spec_forwards,
+            a.mtp_k2_rate,
+            a.mtp_k3_rate,
+        ) {
+            Some(2) => by_budget[0].push(index),
+            Some(3) => by_budget[1].push(index),
+            _ => serial_step(model, &mut active[index]),
+        }
+    }
+
+    for (slot, indices) in by_budget.iter().enumerate() {
+        let budget = slot + 2;
+        let mut pairs = indices.chunks_exact(2);
+        for pair in &mut pairs {
+            let first = pair[0];
+            let second = pair[1];
+            let capable = model.native_mtp_b2_capable(
+                [&active[first].seq, &active[second].seq],
+                budget,
+            );
+            if capable {
+                native_mtp_step_b2(model, active, [first, second], budget, metrics);
+            } else {
+                native_mtp_step(model, &mut active[first], metrics);
+                native_mtp_step(model, &mut active[second], metrics);
+            }
+        }
+        if let Some(&tail) = pairs.remainder().first() {
+            native_mtp_step(model, &mut active[tail], metrics);
+        }
+    }
+}
+
+fn batch_native_mtp_routed_decode(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    mtp_indices: &[usize],
+    ngram_indices: &[usize],
+    native_mtp_b2: bool,
+    mtp_ngram_mixed_batch: bool,
+    metrics: &EngineMetrics,
+) {
+    let mut prepared = Vec::with_capacity(mtp_indices.len() + ngram_indices.len());
+    for &index in mtp_indices {
+        let a = &active[index];
+        let available = model.native_mtp_available_budget(&a.seq, a.spec_budget);
+        if let Some(budget) = native_mtp_adaptive_budget(
+            available,
+            a.spec_budget,
+            a.spec_forwards,
+            a.mtp_k2_rate,
+            a.mtp_k3_rate,
+        ) {
+            prepared.push(MtpRoutedCandidate {
+                index,
+                budget,
+                source: MtpRoutedSource::Native {
+                    observe_ngram: false,
+                },
+            });
+        } else {
+            serial_step(model, &mut active[index]);
+        }
+    }
+    for &index in ngram_indices {
+        let a = &mut active[index];
+        let fed = *a.generated.last().expect("emit_token dodał fed routera");
+        let configured_budget = a.spec_budget;
+        let draft = {
+            let state = a.spec.as_mut().expect("router MTP+n-gram ma stan hostowy");
+            state.observe(fed);
+            match state.draft(configured_budget) {
+                Ok(draft) => draft,
+                Err(error) => {
+                    let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                    a.dead = true;
+                    continue;
+                }
+            }
+        };
+        if draft.len() == configured_budget && matches!(configured_budget, 2 | 3) {
+            prepared.push(MtpRoutedCandidate {
+                index,
+                budget: configured_budget,
+                source: MtpRoutedSource::Ngram(draft),
+            });
+            continue;
+        }
+        if let Some(state) = &mut a.spec {
+            state.cancel_draft();
+        }
+        let available = model.native_mtp_available_budget(&a.seq, configured_budget);
+        if let Some(budget) = native_mtp_adaptive_budget(
+            available,
+            configured_budget,
+            a.spec_forwards,
+            a.mtp_k2_rate,
+            a.mtp_k3_rate,
+        ) {
+            a.mtp_fallback_forwards += 1;
+            prepared.push(MtpRoutedCandidate {
+                index,
+                budget,
+                source: MtpRoutedSource::Native {
+                    observe_ngram: true,
+                },
+            });
+        } else {
+            serial_step(model, a);
+        }
+    }
+
+    prepared.sort_by_key(|candidate| candidate.index);
+    let budgets = prepared.iter().map(|candidate| Some(candidate.budget)).collect::<Vec<_>>();
+    let (pairs, singles) = mtp_ngram_batch_plan(&budgets);
+    for [first_position, second_position] in pairs {
+        let first = &prepared[first_position];
+        let second = &prepared[second_position];
+        let has_native_source = matches!(first.source, MtpRoutedSource::Native { .. })
+            || matches!(second.source, MtpRoutedSource::Native { .. });
+        let capable = model.mtp_ngram_b2_capable(
+            [&active[first.index].seq, &active[second.index].seq],
+            first.budget,
+        );
+        if !capable
+            || !mtp_routed_pair_enabled(
+                has_native_source,
+                native_mtp_b2,
+                mtp_ngram_mixed_batch,
+            )
+        {
+            run_mtp_routed_b1(model, active, first, metrics);
+            run_mtp_routed_b1(model, active, second, metrics);
+            continue;
+        }
+        native_mtp_routed_step_b2_prepared(
+            model,
+            active,
+            [first, second],
+            metrics,
+        );
+    }
+    for position in singles {
+        run_mtp_routed_b1(model, active, &prepared[position], metrics);
+    }
+}
+
+fn run_mtp_routed_b1(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    candidate: &MtpRoutedCandidate,
+    metrics: &EngineMetrics,
+) {
+    match &candidate.source {
+        MtpRoutedSource::Ngram(draft) => {
+            verify_native_mtp_ngram_prepared(model, &mut active[candidate.index], draft, metrics)
+        }
+        MtpRoutedSource::Native { observe_ngram } => {
+            let generated_before = active[candidate.index].generated.len();
+            native_mtp_step(model, &mut active[candidate.index], metrics);
+            if *observe_ngram {
+                let accepted = active[candidate.index].generated[generated_before..].to_vec();
+                if let Some(state) = &mut active[candidate.index].spec {
+                    state.observe_all(&accepted);
+                }
+            }
+        }
+    }
+}
+
+fn decode_gpu_group(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    feed_idx: &[usize],
+) {
+    let vocab = model.weights.descriptor.params.vocab_size;
     // Phase 2: gather the batch. Disjoint field borrows let one pass hand the
     // KV handle to the model while snapshotting each sampler's params.
     let mut seqs: Vec<&mut SeqKv> = Vec::with_capacity(feed_idx.len());
@@ -812,7 +1693,15 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     let budget = a.spec_budget;
     let draft = {
         let s = a.spec.as_mut().expect("speculative_step on a spec sequence");
-        s.draft(budget)
+        s.observe(fed);
+        match s.draft(budget) {
+            Ok(draft) => draft,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
     };
 
     // A verify forward runs the ungraphed prefill path; on a small model each
@@ -823,6 +1712,9 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     // keeps ordinary prose (which only ever yields short coincidental drafts)
     // from regressing.
     if draft.len() < MIN_VERIFY_DRAFT.min(budget) {
+        if let Some(s) = &mut a.spec {
+            s.cancel_draft();
+        }
         // Short or absent draft — plain single-token greedy step (the
         // `serial_step` path), then record the confirmed token in the history.
         let SeqSampler::Gpu(g) = &mut a.sampler else {
@@ -830,12 +1722,7 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
         };
         g.note_token(fed);
         match model.step_and_sample(&mut a.seq, fed, g) {
-            Ok(t) => {
-                if let Some(s) = &mut a.spec {
-                    s.observe(t);
-                }
-                a.next = Some(PendingNext::Token(t));
-            }
+            Ok(t) => a.next = Some(PendingNext::Token(t)),
             Err(e) => {
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
@@ -847,6 +1734,9 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     let (accepted, correction) = match model.verify_greedy_draft(&mut a.seq, fed, &draft) {
         Ok(r) => r,
         Err(e) => {
+            if let Some(s) = &mut a.spec {
+                s.cancel_draft();
+            }
             let _ = a.events.send(EngineEvent::Error(e.to_string()));
             a.dead = true;
             return;
@@ -857,7 +1747,11 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
     // Acceptance feedback: advances the proposer's own history over the accepted
     // drafts and updates the adaptive-disable stats (SPEC §6 sleep-on-no-gain).
     if let Some(s) = &mut a.spec {
-        s.commit(&draft, accepted);
+        if let Err(error) = s.commit(&draft, accepted) {
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+            return;
+        }
     }
 
     // Emit accepted drafts as generated output, in order. A stop / eos / length
@@ -874,10 +1768,404 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMe
             }
         }
     }
-    // The correction/bonus token is confirmed but not yet resident in KV (the
-    // next iteration feeds it); record it in the proposer history now.
-    if let Some(s) = &mut a.spec {
-        s.observe(correction);
+    // Token korekcyjny zostanie dodany do historii po emisji w następnym kroku.
+    a.next = Some(PendingNext::Token(correction));
+}
+
+/// Priorytetowy router: pełny draft n-gram omija proposer MTP, a brak pełnego
+/// draftu uruchamia zwykły krok natywnego MTP.
+fn finish_native_mtp_ngram_verified(
+    a: &mut ActiveSeq<'_>,
+    draft: &[u32],
+    accepted: usize,
+    correction: u32,
+    metrics: &EngineMetrics,
+) {
+    a.spec_forwards += 1;
+    a.ngram_forwards += 1;
+    a.spec_accepted += accepted as u64;
+    for &token in &draft[..accepted] {
+        match emit_token(a, token, None, metrics) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
+    }
+    a.next = Some(PendingNext::Token(correction));
+}
+
+fn verify_native_mtp_ngram_prepared(
+    model: &mut Model,
+    a: &mut ActiveSeq<'_>,
+    draft: &[u32],
+    metrics: &EngineMetrics,
+) {
+    let fed = *a.generated.last().expect("emit_token dodał fed routera");
+    let SeqSampler::Gpu(sampler) = &mut a.sampler else {
+        unreachable!("router MTP+n-gram wymaga samplera GPU")
+    };
+    sampler.note_token(fed);
+    if let Err(error) = a
+        .spec
+        .as_ref()
+        .expect("router MTP+n-gram ma stan hostowy")
+        .validate_commit(draft, 0)
+    {
+        if let Some(state) = &mut a.spec {
+            state.cancel_draft();
+        }
+        let _ = a.events.send(EngineEvent::Error(error.to_string()));
+        a.dead = true;
+        return;
+    }
+    let (accepted, correction) =
+        match model.verify_greedy_draft_with_mtp_catchup(&mut a.seq, fed, draft) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(state) = &mut a.spec {
+                    state.cancel_draft();
+                }
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        };
+    a.spec
+        .as_mut()
+        .expect("router MTP+n-gram ma stan hostowy")
+        .commit_validated(draft, accepted);
+    finish_native_mtp_ngram_verified(a, draft, accepted, correction, metrics);
+}
+
+fn native_mtp_routed_step_b2_prepared(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    candidates: [&MtpRoutedCandidate; 2],
+    metrics: &EngineMetrics,
+) {
+    let indices = [candidates[0].index, candidates[1].index];
+    let [first_index, second_index] = indices;
+    if first_index >= second_index || second_index >= active.len() {
+        let error = ForgeError::Scheduler(
+            "MTP+n-gram B2 wymaga dwóch rosnących, różnych indeksów sekwencji".into(),
+        );
+        let active_len = active.len();
+        for index in indices.into_iter().filter(|&index| index < active_len) {
+            let a = &mut active[index];
+            if let Some(state) = &mut a.spec {
+                state.cancel_draft();
+            }
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+        }
+        return;
+    }
+    let (left, right) = active.split_at_mut(second_index);
+    let first = &mut left[first_index];
+    let second = &mut right[0];
+    let fed = [
+        *first.generated.last().expect("emit_token dodał fed lane0"),
+        *second.generated.last().expect("emit_token dodał fed lane1"),
+    ];
+    let drafts = candidates.map(|candidate| match &candidate.source {
+        MtpRoutedSource::Native { .. } => None,
+        MtpRoutedSource::Ngram(draft) => Some(draft.as_slice()),
+    });
+    let validation = drafts
+        .iter()
+        .enumerate()
+        .filter_map(|(lane, draft)| draft.map(|draft| (lane, draft)))
+        .try_for_each(|(lane, draft)| {
+            let a = if lane == 0 { &*first } else { &*second };
+            a.spec
+                .as_ref()
+                .expect("lane N routera ma stan")
+                .validate_commit(draft, 0)
+        });
+    if let Err(error) = validation {
+        for (lane, a) in [first, second].into_iter().enumerate() {
+            if drafts[lane].is_some() {
+                if let Some(state) = &mut a.spec {
+                    state.cancel_draft();
+                }
+            }
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+        }
+        return;
+    }
+    let SeqSampler::Gpu(first_sampler) = &mut first.sampler else {
+        unreachable!("MTP+n-gram B2 wymaga samplera GPU")
+    };
+    first_sampler.note_token(fed[0]);
+    let SeqSampler::Gpu(second_sampler) = &mut second.sampler else {
+        unreachable!("MTP+n-gram B2 wymaga samplera GPU")
+    };
+    second_sampler.note_token(fed[1]);
+    let started = Instant::now();
+    let result = model.native_mtp_routed_step_b2(
+        &mut [&mut first.seq, &mut second.seq],
+        fed,
+        candidates[0].budget,
+        drafts,
+    );
+    let elapsed = started.elapsed();
+    let [first_result, second_result] = match result {
+        Ok(results) => results,
+        Err(error) => {
+            let message = error.to_string();
+            for (lane, a) in [first, second].into_iter().enumerate() {
+                if drafts[lane].is_some() {
+                    if let Some(state) = &mut a.spec {
+                        state.cancel_draft();
+                    }
+                }
+                let _ = a.events.send(EngineEvent::Error(message.clone()));
+                a.dead = true;
+            }
+            return;
+        }
+    };
+    match [drafts[0].is_some(), drafts[1].is_some()] {
+        [true, true] => {
+            EngineMetrics::inc(&metrics.mtp_ngram_b2_steps_total);
+            EngineMetrics::inc(&metrics.mtp_routed_nn_b2_steps_total);
+        }
+        [false, false] => {
+            EngineMetrics::inc(&metrics.native_mtp_b2_steps_total);
+            EngineMetrics::inc(&metrics.mtp_routed_mm_b2_steps_total);
+        }
+        _ => EngineMetrics::inc(&metrics.mtp_routed_nm_b2_steps_total),
+    }
+    finish_mtp_routed_lane(
+        first,
+        candidates[0],
+        first_result,
+        elapsed,
+        metrics,
+    );
+    finish_mtp_routed_lane(
+        second,
+        candidates[1],
+        second_result,
+        elapsed,
+        metrics,
+    );
+}
+
+fn finish_mtp_routed_lane(
+    a: &mut ActiveSeq<'_>,
+    candidate: &MtpRoutedCandidate,
+    result: (Vec<u32>, usize, u32),
+    elapsed: Duration,
+    metrics: &EngineMetrics,
+) {
+    match &candidate.source {
+        MtpRoutedSource::Ngram(draft) => {
+            a.spec
+                .as_mut()
+                .expect("lane N routera ma stan")
+                .commit_validated(draft, result.1);
+            finish_native_mtp_ngram_verified(a, draft, result.1, result.2, metrics);
+        }
+        MtpRoutedSource::Native { observe_ngram } => {
+            let generated_before = a.generated.len();
+            finish_native_mtp_step(
+                a,
+                candidate.budget,
+                result.0,
+                result.1,
+                result.2,
+                elapsed,
+                metrics,
+            );
+            if *observe_ngram {
+                let accepted = a.generated[generated_before..].to_vec();
+                if let Some(state) = &mut a.spec {
+                    state.observe_all(&accepted);
+                }
+            }
+        }
+    }
+}
+
+fn native_mtp_ngram_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMetrics) {
+    let fed = *a.generated.last().expect("emit_token pushed the fed token");
+    let budget = a.spec_budget;
+    let draft = {
+        let state = a
+            .spec
+            .as_mut()
+            .expect("router MTP+n-gram ma stan hostowy");
+        state.observe(fed);
+        match state.draft(budget) {
+            Ok(draft) => draft,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
+    };
+    if draft.len() != budget {
+        if let Some(state) = &mut a.spec {
+            state.cancel_draft();
+        }
+        let generated_before = a.generated.len();
+        a.mtp_fallback_forwards += 1;
+        native_mtp_step(model, a, metrics);
+        let accepted = a.generated[generated_before..].to_vec();
+        if let Some(state) = &mut a.spec {
+            state.observe_all(&accepted);
+        }
+        return;
+    }
+
+    verify_native_mtp_ngram_prepared(model, a, &draft, metrics);
+}
+
+/// Jeden krok natywnego MTP. Model jest właścicielem draftu, weryfikatora i
+/// checkpointów; serwer emituje zaakceptowany prefiks i zachowuje token
+/// korekcyjny jako wejście następnej iteracji.
+fn native_mtp_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMetrics) {
+    let fed = *a.generated.last().expect("emit_token pushed the fed token");
+    let available = model.native_mtp_available_budget(&a.seq, a.spec_budget);
+    let Some(budget) = native_mtp_adaptive_budget(
+        available,
+        a.spec_budget,
+        a.spec_forwards,
+        a.mtp_k2_rate,
+        a.mtp_k3_rate,
+    ) else {
+        serial_step(model, a);
+        return;
+    };
+    let SeqSampler::Gpu(sampler) = &mut a.sampler else {
+        unreachable!("native MTP is GPU-sampled")
+    };
+    sampler.note_token(fed);
+    let started = Instant::now();
+    let (draft, accepted, correction) = match model.native_mtp_step(&mut a.seq, fed, budget) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = a.events.send(EngineEvent::Error(error.to_string()));
+            a.dead = true;
+            return;
+        }
+    };
+    finish_native_mtp_step(
+        a,
+        budget,
+        draft,
+        accepted,
+        correction,
+        started.elapsed(),
+        metrics,
+    );
+}
+
+fn native_mtp_step_b2(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    indices: [usize; 2],
+    budget: usize,
+    metrics: &EngineMetrics,
+) {
+    let [first_index, second_index] = indices;
+    let (left, right) = active.split_at_mut(second_index);
+    let first = &mut left[first_index];
+    let second = &mut right[0];
+    let fed = [
+        *first.generated.last().expect("emit_token dodał fed lane0"),
+        *second.generated.last().expect("emit_token dodał fed lane1"),
+    ];
+    let SeqSampler::Gpu(first_sampler) = &mut first.sampler else {
+        unreachable!("native MTP B2 wymaga samplera GPU")
+    };
+    first_sampler.note_token(fed[0]);
+    let SeqSampler::Gpu(second_sampler) = &mut second.sampler else {
+        unreachable!("native MTP B2 wymaga samplera GPU")
+    };
+    second_sampler.note_token(fed[1]);
+    let started = Instant::now();
+    let result = model.native_mtp_step_b2(
+        &mut [&mut first.seq, &mut second.seq],
+        fed,
+        budget,
+    );
+    let elapsed = started.elapsed();
+    let [first_result, second_result] = match result {
+        Ok(results) => results,
+        Err(error) => {
+            let message = error.to_string();
+            for a in [first, second] {
+                let _ = a.events.send(EngineEvent::Error(message.clone()));
+                a.dead = true;
+            }
+            return;
+        }
+    };
+    EngineMetrics::inc(&metrics.native_mtp_b2_steps_total);
+    finish_native_mtp_step(
+        first,
+        budget,
+        first_result.0,
+        first_result.1,
+        first_result.2,
+        elapsed,
+        metrics,
+    );
+    finish_native_mtp_step(
+        second,
+        budget,
+        second_result.0,
+        second_result.1,
+        second_result.2,
+        elapsed,
+        metrics,
+    );
+}
+
+fn finish_native_mtp_step(
+    a: &mut ActiveSeq<'_>,
+    budget: usize,
+    draft: Vec<u32>,
+    accepted: usize,
+    correction: u32,
+    elapsed: Duration,
+    metrics: &EngineMetrics,
+) {
+    if a.spec_forwards > 0 {
+        let rate = (accepted + 1) as f64 / elapsed.as_secs_f64();
+        if budget == 2 {
+            update_mtp_rate(&mut a.mtp_k2_rate, rate);
+        } else {
+            update_mtp_rate(&mut a.mtp_k3_rate, rate);
+        }
+    }
+    if draft.len() != budget || accepted > draft.len() {
+        let _ = a.events.send(EngineEvent::Error(
+            "native MTP returned an invalid draft or acceptance length".into(),
+        ));
+        a.dead = true;
+        return;
+    }
+    a.spec_forwards += 1;
+    a.spec_accepted += accepted as u64;
+    for &token in &draft[..accepted] {
+        match emit_token(a, token, None, metrics) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return,
+            Err(error) => {
+                let _ = a.events.send(EngineEvent::Error(error.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
     }
     a.next = Some(PendingNext::Token(correction));
 }
@@ -927,7 +2215,25 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
                 tokens_from_spec / forwards,
                 s.stats(),
             );
+            if a.spec_kind == SpeculationKind::NativeMtpNgram {
+                tracing::info!(
+                    "router MTP+n-gram: {} n-gram verify, {} MTP fallback",
+                    a.ngram_forwards,
+                    a.mtp_fallback_forwards,
+                );
+            }
         }
+    } else if a.spec_kind == SpeculationKind::NativeMtp && a.spec_forwards > 0 {
+        let forwards = a.spec_forwards as f64;
+        let tokens_from_spec = forwards + a.spec_accepted as f64;
+        tracing::info!(
+            "native MTP: {} verify forwards, {} accepted draft tokens \
+             ({:.2} accepted/step, {:.2}x tokens/forward)",
+            a.spec_forwards,
+            a.spec_accepted,
+            a.spec_accepted as f64 / forwards,
+            tokens_from_spec / forwards,
+        );
     }
     // Terminal accounting (SPEC §8.3): a finished request contributes its
     // prompt/generated/cache-read token totals, speculation acceptance and its
@@ -945,8 +2251,361 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetri
         tokens: a.generated.len(),
         prompt_tokens: a.prompt_len,
         cache_read_tokens: a.cache_read,
+        benchmark: a.prefill_profile.zip(a.benchmark_ttft_ms).map(|(profile, ttft_ms)| {
+            BenchmarkTimings {
+                target_gpu_ms: profile.target_gpu_ms,
+                mtp_catchup_gpu_ms: profile.mtp_catchup_gpu_ms,
+                ttft_ms,
+            }
+        }),
     });
     a.dead = true;
     a.finished_cleanly = true;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AdmissionDisposition, first_actionable_index, native_mtp_adaptive_budget,
+        native_mtp_step_budget, parse_native_mtp_b2, request_speculation_kind,
+        reservation_fits, update_mtp_rate, validate_speculation_server_config,
+        mtp_ngram_auto_backend, mtp_ngram_batch_plan, parse_mtp_ngram_batch,
+        resolve_mtp_ngram_batch, MtpNgramBatchMode,
+    };
+    use super::parse_mtp_ngram_mixed_batch;
+    use super::mtp_routed_pair_enabled;
+    use super::{
+        hybrid_prefill_batch_plan, parse_hybrid_prefill_batch, resolve_hybrid_prefill_batch,
+        HybridPrefillBatchMode,
+    };
+    use crate::model::hybrid_prefill_b2_backend_capable;
+    use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
+    use forge_types::Vendor;
+
+    #[test]
+    fn przelacznik_mtp_b2_wymaga_scislej_wartosci_logicznej() {
+        assert!(parse_native_mtp_b2(None).unwrap());
+        assert!(parse_native_mtp_b2(Some("1")).unwrap());
+        assert!(!parse_native_mtp_b2(Some("0")).unwrap());
+        assert!(parse_native_mtp_b2(Some("true")).is_err());
+        assert!(parse_native_mtp_b2(Some("")).is_err());
+    }
+
+    #[test]
+    fn batch_mtp_ngram_ma_scisla_semantyke_rolloutu() {
+        assert_eq!(parse_mtp_ngram_batch(None).unwrap(), MtpNgramBatchMode::Auto);
+        assert_eq!(parse_mtp_ngram_batch(Some("0")).unwrap(), MtpNgramBatchMode::Off);
+        assert_eq!(parse_mtp_ngram_batch(Some("1")).unwrap(), MtpNgramBatchMode::ForceOn);
+        assert!(parse_mtp_ngram_batch(Some("true")).is_err());
+        assert!(parse_mtp_ngram_batch(Some("")).is_err());
+        assert!(!parse_mtp_ngram_mixed_batch(None).unwrap());
+        assert!(!parse_mtp_ngram_mixed_batch(Some("0")).unwrap());
+        assert!(parse_mtp_ngram_mixed_batch(Some("1")).unwrap());
+        assert!(parse_mtp_ngram_mixed_batch(Some("true")).is_err());
+        assert!(parse_mtp_ngram_mixed_batch(Some("")).is_err());
+    }
+
+    #[test]
+    fn hybrid_prefill_batch_ma_scisla_flage_i_stabilny_plan_t32() {
+        assert_eq!(
+            parse_hybrid_prefill_batch(None).unwrap(),
+            HybridPrefillBatchMode::Auto
+        );
+        assert_eq!(
+            parse_hybrid_prefill_batch(Some("0")).unwrap(),
+            HybridPrefillBatchMode::Off
+        );
+        assert_eq!(
+            parse_hybrid_prefill_batch(Some("1")).unwrap(),
+            HybridPrefillBatchMode::ForceOn
+        );
+        assert!(parse_hybrid_prefill_batch(Some("true")).is_err());
+        assert!(parse_hybrid_prefill_batch(Some("")).is_err());
+
+        let (pairs, singles) = hybrid_prefill_batch_plan(&[32, 31, 96, 1, 32]);
+        assert_eq!(pairs, vec![[0, 2]]);
+        assert_eq!(singles, vec![1, 3, 4]);
+        assert_eq!(hybrid_prefill_batch_plan(&[31, 31]), (Vec::new(), vec![0, 1]));
+    }
+
+    #[test]
+    fn hybrid_prefill_b2_wymaga_zweryfikowanego_backendu_nvidia_warp32() {
+        assert!(hybrid_prefill_b2_backend_capable(Vendor::Nvidia, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Nvidia, 64));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Amd, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Amd, 64));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Apple, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Cpu, 32));
+        assert!(!hybrid_prefill_b2_backend_capable(Vendor::Intel, 32));
+
+        assert!(
+            resolve_hybrid_prefill_batch(
+                HybridPrefillBatchMode::Auto,
+                Vendor::Nvidia,
+                32,
+                true,
+            )
+            .unwrap()
+        );
+        assert!(!resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::Auto,
+            Vendor::Nvidia,
+            32,
+            false,
+        )
+        .unwrap());
+        assert!(!resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::Auto,
+            Vendor::Amd,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(!resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::Off,
+            Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::ForceOn,
+            Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(resolve_hybrid_prefill_batch(
+            HybridPrefillBatchMode::ForceOn,
+            Vendor::Nvidia,
+            32,
+            false,
+        )
+        .is_err());
+        for (vendor, warp_size) in [
+            (Vendor::Nvidia, 64),
+            (Vendor::Amd, 32),
+            (Vendor::Amd, 64),
+            (Vendor::Apple, 32),
+            (Vendor::Cpu, 32),
+        ] {
+            assert!(!resolve_hybrid_prefill_batch(
+                HybridPrefillBatchMode::Auto,
+                vendor,
+                warp_size,
+                true,
+            )
+            .unwrap());
+            assert!(resolve_hybrid_prefill_batch(
+                HybridPrefillBatchMode::ForceOn,
+                vendor,
+                warp_size,
+                true,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn auto_mtp_ngram_wymaga_nvidia_warp32_i_capability_modelu() {
+        assert!(mtp_ngram_auto_backend(forge_types::Vendor::Nvidia, 32));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Nvidia, 64));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Amd, 32));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Amd, 64));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Apple, 32));
+        assert!(!mtp_ngram_auto_backend(forge_types::Vendor::Cpu, 32));
+        assert!(resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::Auto,
+            forge_types::Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+        assert!(!resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::Auto,
+            forge_types::Vendor::Nvidia,
+            32,
+            false,
+        )
+        .unwrap());
+        assert!(resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::ForceOn,
+            forge_types::Vendor::Amd,
+            64,
+            true,
+        )
+        .unwrap());
+        assert!(resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::ForceOn,
+            forge_types::Vendor::Nvidia,
+            32,
+            false,
+        )
+        .is_err());
+        assert!(!resolve_mtp_ngram_batch(
+            MtpNgramBatchMode::Off,
+            forge_types::Vendor::Nvidia,
+            32,
+            true,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn scheduler_routed_paruje_mieszane_zrodla_po_k_i_zostawia_tail_b1() {
+        let sources = [false, true, true, false, false];
+        let (pairs, singles) =
+            mtp_ngram_batch_plan(&[Some(2), Some(3), Some(2), Some(3), Some(2)]);
+        assert_eq!(pairs, vec![[0, 2], [1, 3]]);
+        assert_eq!(singles, vec![4]);
+        assert_eq!([sources[pairs[0][0]], sources[pairs[0][1]]], [false, true]);
+        assert_eq!([sources[pairs[1][0]], sources[pairs[1][1]]], [true, false]);
+        assert_eq!(mtp_ngram_batch_plan(&[Some(3), Some(2)]).1, vec![0, 1]);
+        assert!(mtp_routed_pair_enabled(false, false, false));
+        assert!(mtp_routed_pair_enabled(false, true, false));
+        assert!(!mtp_routed_pair_enabled(true, true, false));
+        assert!(!mtp_routed_pair_enabled(true, false, true));
+        assert!(mtp_routed_pair_enabled(true, true, true));
+    }
+
+    #[test]
+    fn admission_omija_chwilowo_zablokowany_front_bez_zmiany_fifo() {
+        let states = [false, true, true];
+        let (first, _) = first_actionable_index(states.len(), 3, 0, 4, |index| {
+            if states[index] {
+                AdmissionDisposition::Admit { page_budget: 1 }
+            } else {
+                AdmissionDisposition::Wait
+            }
+        })
+        .expect("drugi request powinien mieścić się w KV");
+        assert_eq!(first, 1);
+
+        let blocked = first_actionable_index(2, 2, 0, 4, |_| AdmissionDisposition::Wait);
+        assert!(blocked.is_none());
+    }
+
+    #[test]
+    fn admission_ogranicza_okno_i_blokuje_bypass_po_zestarzeniu() {
+        let outside_window = first_actionable_index(4, 2, 0, 4, |index| {
+            if index == 2 {
+                AdmissionDisposition::Admit { page_budget: 1 }
+            } else {
+                AdmissionDisposition::Wait
+            }
+        });
+        assert!(outside_window.is_none());
+
+        let aged = first_actionable_index(3, 3, 4, 4, |index| {
+            if index == 1 {
+                AdmissionDisposition::Admit { page_budget: 1 }
+            } else {
+                AdmissionDisposition::Wait
+            }
+        });
+        assert!(aged.is_none());
+    }
+
+    #[test]
+    fn admission_odejmuje_wczesniejsze_zobowiazania_od_dostepnych_stron() {
+        assert!(reservation_fits(8, 3, 5));
+        assert!(!reservation_fits(8, 4, 5));
+        assert!(!reservation_fits(3, 8, 1));
+    }
+
+    #[test]
+    fn native_mtp_przechodzi_na_zwykly_decode_dla_non_greedy() {
+        for budget in [2, 3] {
+            let spec = SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget)
+                .expect("konfiguracja MTP powinna być poprawna");
+            assert_eq!(
+                request_speculation_kind(&spec, true).expect("greedy MTP powinno działać"),
+                SpeculationKind::NativeMtp
+            );
+            assert_eq!(
+                request_speculation_kind(&spec, false)
+                    .expect("non-greedy powinno wyłączyć spekulację per request"),
+                SpeculationKind::Off
+            );
+        }
+        let router = SpeculativeConfig::chain(
+            vec![ProposerKind::Mtp, ProposerKind::Ngram],
+            3,
+        )
+        .expect("konfiguracja routera powinna być poprawna");
+        assert_eq!(
+            request_speculation_kind(&router, true).expect("greedy router powinien działać"),
+            SpeculationKind::NativeMtpNgram
+        );
+        assert_eq!(
+            request_speculation_kind(&router, false)
+                .expect("non-greedy powinno wyłączyć router per request"),
+            SpeculationKind::Off
+        );
+    }
+
+    #[test]
+    fn host_proposer_keeps_existing_fallback() {
+        let spec = SpeculativeConfig::ngram(8).expect("konfiguracja n-gram");
+        assert_eq!(
+            request_speculation_kind(&spec, false).expect("n-gram może wyłączyć się per request"),
+            SpeculationKind::Off
+        );
+        assert_eq!(
+            request_speculation_kind(&spec, true).expect("greedy n-gram powinien działać"),
+            SpeculationKind::HostProposer
+        );
+    }
+
+    #[test]
+    fn hybrid_i_mtp_dopuszczaja_wiele_aktywnych_sekwencji() {
+        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 0, true).is_err());
+        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 1, true).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::NativeMtp, 2, true).is_ok());
+        assert!(validate_speculation_server_config(
+            SpeculationKind::NativeMtpNgram,
+            1,
+            true
+        )
+        .is_ok());
+        assert!(validate_speculation_server_config(
+            SpeculationKind::NativeMtpNgram,
+            2,
+            true
+        )
+        .is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 8, false).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 8, true).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::HostProposer, 1, true).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::Off, 8, true).is_ok());
+        assert!(validate_speculation_server_config(SpeculationKind::Off, 1, true).is_ok());
+    }
+
+    #[test]
+    fn native_mtp_clips_budget_or_selects_serial_step() {
+        assert_eq!(native_mtp_step_budget(3), Some(3));
+        assert_eq!(native_mtp_step_budget(2), Some(2));
+        assert_eq!(native_mtp_step_budget(0), None);
+        assert_eq!(native_mtp_step_budget(1), None);
+        assert_eq!(native_mtp_step_budget(4), None);
+    }
+
+    #[test]
+    fn native_mtp_adapts_budget_to_measured_cycle_rate() {
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 0, None, None), Some(3));
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 1, None, None), Some(2));
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 4, Some(40.0), Some(30.0)), Some(2));
+        assert_eq!(native_mtp_adaptive_budget(3, 3, 5, Some(30.0), Some(40.0)), Some(3));
+        assert_eq!(native_mtp_adaptive_budget(3, 2, 5, Some(30.0), Some(40.0)), Some(2));
+        assert_eq!(native_mtp_adaptive_budget(2, 3, 5, Some(30.0), Some(40.0)), Some(2));
+    }
+
+    #[test]
+    fn native_mtp_rate_uses_exponential_average() {
+        let mut rate = None;
+        update_mtp_rate(&mut rate, 20.0);
+        update_mtp_rate(&mut rate, 40.0);
+        assert_eq!(rate, Some(25.0));
+    }
 }

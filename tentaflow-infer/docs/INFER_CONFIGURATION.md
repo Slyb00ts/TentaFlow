@@ -61,6 +61,13 @@ DeltaNet trzyma rezydentny stan SSM, nigdy nie paged). Chunki pakują te warstwy
 po ich pozycji w liście (indeks „kompaktowy"), więc hybrydowy chunk niesie ~10
 warstw atencji zamiast 41 — patrz sekcja qwen35moe.
 
+Rezydentny target KV używa tego samego zwartego mapowania
+`global_layer -> kv_layer`: slaby są alokowane wyłącznie dla warstw
+`Attention`, a DeltaNet nie zajmuje pustych par K/V. Dla Qwen3.6-27B z 48
+warstwami DeltaNet i 16 warstwami pełnej atencji zmniejsza to surowy koszt
+F16 KV z 256 KiB do 64 KiB na token. Osobny, jednowarstwowy cache MTP nie
+wchodzi do tej mapy.
+
 | Flaga | Domyślnie | Opis |
 |---|---|---|
 | `--kv-tier <M>` | `off` | `off` \| `ram` \| `nvme`. `off` = dzisiejsze zachowanie (zero zmian). `ram` = spill do pinned RAM (twardy błąd po wyczerpaniu budżetu). `nvme` = RAM jako warm cache + append-only plik jako cold tier. |
@@ -168,12 +175,26 @@ jawny błąd Unsupported — tracked follow-up).
 | `--batch-min <N>` | `12` | Próg włączenia batched forward: poniżej N jednocześnie dekodujących sekwencji działa strojona ścieżka pojedynczej sekwencji (szybsza przy małej współbieżności — crossover z GEMM-ów tensor-core zmierzony ~12). |
 | `--prefill-chunk <N>` | `16` | Ile tokenów promptu jedna sekwencja może prefillować w jednej iteracji schedulera (chroni ITL pozostałych sekwencji). Wewnętrzny sufit chunka: 1024. |
 
-Admission control: żądanie, którego prompt+max_tokens nie mieści się w stronach
-KV, dostaje natychmiast 429 (przejściowy brak) albo 400 `context_length_exceeded`
-(trwałe przekroczenie `--ctx`), nigdy OOM w połowie generacji. Trafienie w
-prefix-cache (niżej) zmniejsza projekcję stron przy przyjęciu, a strony
-odzyskiwalne z cache liczą się jako dostępne — pełny-ale-odzyskiwalny cache nigdy
-nie blokuje przyjęcia żądania, które by się zmieściło.
+Admission control wylicza dla każdego żądania logiczny budżet stron na cały
+zadeklarowany prompt i generację. Suma niewykorzystanych części budżetów
+aktywnych sekwencji jest rezerwacją przyszłego wzrostu KV, więc nowy request nie
+może odebrać stron potrzebnych już przyjętym sekwencjom. W trybie tieringu
+rezerwacja obejmuje tylko limit stron rezydentnych. Wewnętrzny
+`max_pages_per_seq` ogranicza pojedynczą sekwencję niezależnie od liczby stron w
+całej puli, a batchowy krok sprawdza wszystkie potrzebne przyrosty przed
+jakąkolwiek mutacją KV.
+
+Scheduler szuka możliwego do przyjęcia requestu w ograniczonym oknie kolejki:
+`2 * max_active`, ograniczonym do 2-16 pozycji. Może ominąć duży request
+czekający na KV, aby uruchomić mniejszy, ale licznik ominięć zatrzymuje dalsze
+wyprzedzanie najstarszego wpisu i zapobiega jego zagłodzeniu. Trwałe
+przekroczenie kontekstu lub `max_pages_per_seq` jest odrzucane; przejściowy brak
+KV pozostawia request w kolejce.
+
+Znane ograniczenie: strony pożyczonego, przypiętego prefiksu nie są odejmowane
+od logicznego budżetu requestu. To konserwatywne rozliczenie może opóźnić
+admission mimo fizycznego współdzielenia stron, ale nie narusza zobowiązań KV
+już aktywnych sekwencji.
 
 ---
 
@@ -235,7 +256,9 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/prefix_cache.rs`):
 
 ## Dekodowanie spekulatywne (SPEC §6)
 
-Samodrafujący proposer n-gram + wspólna weryfikacja jednym forwardem. Na każdym
+Działają trzy tryby: hostowy proposer n-gram, natywna głowa MTP/NextN modelu oraz
+priorytetowy router `mtp+ngram`.
+W trybie n-gram na każdym
 kroku greedy proposer szuka najdłuższego dopasowania sufiksu w WŁASNEJ historii
 sekwencji (prompt + wygenerowane) i drafuje kontynuację; silnik weryfikuje cały
 draft JEDNYM przebiegiem (mini-prefill nad pozycjami draftu), akceptuje najdłuższy
@@ -244,19 +267,176 @@ odrzucone pozycje KV wycofuje (`KvCache::rollback`). Jeden forward daje 1..=k+1
 tokenów, **identycznych co do tokena** z dekodowaniem sekwencyjnym tam, gdzie
 argmax jest jednoznaczny — akcelerator dokładnego dekodowania, nie przybliżenie.
 
+Natywne MTP jest dostępne dla obsługiwanego, gęstego hybrydowego GGUF `qwen35`
+z `nextn_predict_layers`. Model generuje draft K=2 lub K=3 na GPU, a target
+weryfikuje cały blok jednym batched przebiegiem. Zaakceptowany prefiks zatwierdza
+KV i odtwarza odpowiadający mu stan DeltaNet podczas commit. `mtp` oznacza
+budżet 3 z adaptacyjnym wyborem K=2/K=3; `mtp:2` i `mtp:3` wymuszają maksymalny
+budżet, przy czym K=3 nadal może spaść do K=2 przy końcu dostępnego kontekstu.
+Wagi i stan NextN są ładowane tylko po jawnym wybraniu trybu MTP; przy
+`--speculative off` nie zwiększają zużycia VRAM ani czasu prefill.
+
+Router `mtp+ngram:2|3` najpierw próbuje pełnego draftu n-gram o długości K. Przy
+trafieniu target weryfikuje draft bez zależności od jego źródła, a stan MTP jest
+doganiany po `fed + accepted` bez liczenia logitów. Przy braku pełnego draftu
+router używa zwykłego natywnego MTP. Liczniki `ngram_forwards` i
+`mtp_fallback_forwards` rozdzielają obie ścieżki w logu końcowym.
+
+To opis aktualnie wykonywanych ścieżek, a nie pełnego docelowego interfejsu ze
+`SPEC.md` §6. Fundament ma typowane `DraftTree`/`DraftNode`,
+`SpeculationCoordinator`, kaskadową kompozycję liniową i konfiguracje wielu
+proposerów. CLI odrzuca `draft-model`, `eagle`, `dflash` i `dspark` z
+jawnym komunikatem o wymaganym loaderze i `forge-speculation.json`, dopóki nie ma
+wykonawczego proposera i zgodnych wag. PARD i suffix nie są jeszcze wartościami CLI. N-gram docelowo
+pozostanie opcjonalnym fallbackiem lub rozszerzeniem ich draftów, korzystającym z
+tego samego lossless verifiera.
+
+Typowane API `SpeculativeConfig::chain` zachowuje kolejność proposerów, odrzuca
+pustą listę i duplikaty oraz dopuszcza n-gram wyłącznie jako ostatni element.
+CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
+
 | Flaga | Domyślnie | Opis |
 |---|---|---|
-| `--speculative <M>` | `off` | `off` \| `on` \| `ngram` \| `ngram:<k>`. `on`/`ngram` = proposer n-gram z budżetem draftu 16; `ngram:<k>` ustawia budżet (1..16). `off` = bajt-w-bajt dzisiejsza pętla decode. |
+| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
+| `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
+| `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
+| `FORGE_MTP_NGRAM_BATCH` | `auto` | Rollout parowania N/N B2 dwóch pełnych draftów n-gram o tym samym K=2 albo K=3. Brak zmiennej wybiera `auto`: ścieżka działa tylko dla strukturalnie zgodnego modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1. `1` wymusza eksperymentalny backend, także AMD/Metal, ale nadal odrzuca model bez strukturalnego capability. Inna wartość jest błędem konfiguracji. |
+| `FORGE_MTP_NGRAM_MIXED_BATCH` | `0` | Eksperymentalne parowanie N/M i M/M przez wspólny verifier B2. `1` wymaga aktywnego `FORGE_MTP_NGRAM_BATCH` i zachowuje kill-switch `FORGE_NATIVE_MTP_B2`; `0` lub brak zmiennej pozostawia automatyczny rollout wyłącznie dla N/N. Inna wartość jest błędem konfiguracji. |
+| `FORGE_HYBRID_PREFILL_BATCH` | `auto` | Eksperymentalny prefill dokładnie dwóch requestów w segmentach `B=2`, `T=32`. Brak zmiennej włącza go wyłącznie dla pełnego capability modelu na zweryfikowanym NVIDIA warp32. `0` wymusza B1 bez alokacji dedykowanego scratchu. `1` rygorystycznie wymaga tego backendu, modelu i artefaktów; ich brak kończy start kontrolowanym `Unsupported`, zanim scheduler odwoła się do PTX. Inna wartość jest błędem konfiguracji. |
+
+W verifierze B2 dla T=6 i T=8 trzy projekcje Q8_0 `gate_proj`, `alpha_proj` i
+`beta_proj` współdzielą jedną kwantyzację wejścia `pb.x`, jeśli wszystkie mają
+zgodną liczbę kolumn. Nie wymaga to dodatkowej flagi. `out_proj` pozostaje poza
+grupą i osobno kwantyzuje `normed`; przy niespełnieniu kontraktu routingu
+wykonywana jest dotychczasowa ścieżka projekcji.
+
+Przykład dla modelu z natywną głową MTP:
+
+```bash
+cargo run -p forge-cli --release -- run MODEL.gguf "Przykładowy prompt" \
+  --temp 0 --prefix-cache off --speculative mtp+ngram:3
+```
+
+Polecenie `serve` dobiera dla MTP domyślne `--max-active 1`; jawna większa
+wartość uruchamia startup preflight puli stanów per sekwencja. Dwa requesty
+pure MTP z tym samym K mogą wykonać wspólny B2. Różne K, tiering, niepełna para
+albo niespełniony kontrakt capability przechodzą przed mutacją stanu na seryjne
+B1. `mtp+ngram` domyślnie używa N/N na NVIDIA warp32, gdy model spełnia
+kontrakt strukturalny; N/M i M/M wymagają jawnego
+`FORGE_MTP_NGRAM_MIXED_BATCH=1`. AMD, Metal i pozostałe backendy pozostają w B1. Jeśli wymagane sloty nie mieszczą się w pulach
+weights/activations, worker nie startuje, a błąd podaje wymagane i dostępne
+bajty. `run` zawsze obsługuje jedną sekwencję.
+
+W trybie `auto` na NVIDIA warp32 albo po ustawieniu
+`FORGE_MTP_NGRAM_BATCH=1` dwa requesty `mtp+ngram` z pełnym
+draftem n-gram i tym samym K=2/K=3 mogą współdzielić source-agnostic target
+verifier B2. Draft ID są pakowane na GPU, a stan MTP doganiany segmentowanym
+KV-only catch-up przez `mtp_norm_join_shifted_segmented_f16`,
+`kv_append_batch_segmented_masked_f16` i
+`mtp_commit_catchup_metadata_segmented`. Commit obu lane jest prewalidowany
+przed zatwierdzeniem targetu i aplikowany bez kolejnego fallible kroku. Po
+jawnym włączeniu ścieżka routed paruje N/N, N/M, M/N i M/M o tym samym K. Lane
+N używa pending ID i maskowanego catch-up, a lane M zachowuje staged KV
+natywnego proposera. Ogon, różne K albo niespełnione capability używają B1.
+
+Licznik Prometheus `forge_engine_mtp_ngram_b2_steps_total` raportuje wyłącznie
+zakończone wspólne weryfikacje N/N B2. Wartość zero przy aktywnym ruchu
+`mtp+ngram` oznacza, że rollout pozostał w B1 albo nie powstały zgodne pary.
+Liczniki `forge_engine_mtp_routed_nn_b2_steps_total`,
+`forge_engine_mtp_routed_nm_b2_steps_total` i
+`forge_engine_mtp_routed_mm_b2_steps_total` rozdzielają źródła zakończonych
+transakcji routed; wariant M/N jest raportowany razem z N/M.
+
+Testy syntetyczne obejmują K2/K3, wszystkie kombinacje retained 1..T, osobny
+initial hidden, izolację lane i stron, granice buforów, canary, cancel/reuse
+pending draftu oraz błędną prewalidację lane0/lane1. Mały CUDA memcheck nie
+wykazał błędów. Realny N/N E2E na modelu 27B, A/B z routerem seryjnym, pięć
+powtórzeń raw128/raw512, profil `nsys`, lane-swap oraz cancel/reuse/izolacja
+przeszły z pełną zgodnością ID i snapshotów stanu. Direct model/source-mask i
+syntetyczna macierz mixed przeszły. Realny server oracle B1 osobno dla obu lane
+oraz pełny profil mixed `nsys` pozostają oczekujące z powodu dostępnego VRAM.
+Mieszany rollout pozostaje domyślnie wyłączony.
+
+### Hybrydowy prefill B2 T32
+
+Tryb auto i `FORGE_HYBRID_PREFILL_BATCH=1` parują wyłącznie dwa gotowe segmenty
+po 32 tokeny. W auto ogony, brak pary i niespełniony kontrakt modelu pozostają
+w istniejącej ścieżce B1; `1` odrzuca brak capability podczas startu.
+Implementacja źródłowa kerneli pozostaje w Mojo i zachowuje typy
+przenośne dla przyszłych backendów, ale wykonanie zostało sprawdzone wyłącznie
+na NVIDIA warp32. Nie ma obecnie dowodu wykonawczego ani artefaktów dla AMD i
+Metal.
+
+Target wykonuje wspólny skan DeltaNet i wyspecjalizowane projekcje B2 dla F16,
+Q8_0 oraz NVFP4. Catch-up natywnego MTP jest transakcją pary: oba stany są
+checkpointowane przed mutacją, oba commity prewalidowane, a błąd dowolnego lane
+cofa oba. Awaria rollbacku zatruwa pulę i poddaje kwarantannie oba stany oraz
+wspólny cache. Catch-up nadal wykonuje dwa seryjne przebiegi macierzowe lane po
+lane; jest to znany pozostały koszt.
+
+Stały scratch tej ścieżki wynosi 450 692 688 B, czyli 429,81 MiB. Samplowanie
+GPU pozostawia logity na urządzeniu i zwraca po 8 B na zakończony krok pary;
+wariant wymagający `logprobs` używa wspólnego bufora hostowych logitów dla
+fallbacku CPU. W profilu dwóch requestów po osiem tokenów odnotowano 18 150
+launchy, osiem synchronizacji i łącznie 64 B D2H bez transferu słownika.
+Prometheus gauge `forge_engine_hybrid_prefill_b2_scratch_bytes` wynosi zero
+przed pierwszym B2 i przez cały tryb off, a po alokacji raportuje 450 692 688 B.
+
+Nowe wygenerowane artefakty PTX to:
+
+- `deltanet_prepare_segmented_final_f16.ptx`,
+- `gemm_nvfp4_gguf_out_f32_b2.ptx`,
+- `gemm_q8_0_f16_exact_out_f32_b2.ptx`.
+
+Istniejący `deltanet_gated_scan_segmented_shared_d128_f16.ptx` został
+przebudowany dla zmienionego wspólnego skanu; odpowiadający mu wpis oraz trzy
+nowe wpisy znajdują się w `manifest.json`.
+
+Surowe logi i profile są artefaktami lokalnymi w `/tmp` i nie należą do
+wersjonowanego drzewa repozytorium.
+
+### Manifest neuralnego proposera
+
+Plik `forge-speculation.json` ma wersjonowany, zamknięty schemat; nieznane pola są
+błędem. Najważniejsze pola:
+
+| Pole | Znaczenie |
+|---|---|
+| `format_version`, `kind`, `composition` | Wersja formatu, `draft_model`/`mtp`/`eagle`/`dflash`/`dspark` oraz `standalone`/`cascade`/`tree`. |
+| `source` | Adres źródła i repozytorium HTTP(S). |
+| `license` | Osobne SPDX dla kodu i wag, zgoda na redystrybucję i wymagane attribution. `unknown` nie jest akceptowane. |
+| `target`, `target_fingerprint`, `tokenizer_fingerprint` | Id/revision/architektura i rozmiary targetu oraz fingerprinty SHA-256 modelu i tokenizera. |
+| `max_nodes`, `max_depth`, `block_size`, `diffusion_steps` | Granice propozycji; pola zależne od rodzaju proposera. |
+| `artifacts`, `tensor_map`, `shared_tensors` | Role i ścieżki plików, SHA-256, logiczne mapowanie tensorów oraz tensory współdzielone z targetem. |
+| `target_feature_layer_ids`, `feature_dimensions` | Warstwy i wymiary cech wymagane przez EAGLE/DFlash/DSpark. |
+| `dtype`, `quantization`, `supported_sampling_modes` | Reprezentacja wag i jawnie obsługiwane tryby samplingu. |
+| `confidence_calibration` | Metoda, próg, temperatura lub artefakt kalibracji; wymagana dla DFlash/DSpark. |
+
+`SpeculationManifest::load` weryfikuje składnię i zależności pól, kanonikalizuje
+ścieżki artefaktów wewnątrz katalogu manifestu, czyta pliki strumieniowo i porównuje
+ich obliczony SHA-256 z `artifacts[].sha256`. Zwraca otwarte, zweryfikowane uchwyty,
+aby runtime nie otwierał ponownie plików po kontroli integralności. Fingerprinty targetu i tokenizera są
+na tym etapie sprawdzane jako 64-znakowe SHA-256; ich porównanie z uruchomionym
+modelem będzie częścią integracji neuralnego runtime. Pole
+`redistribution_allowed=false` nie blokuje lokalnego odczytu, ale zabrania
+pakowania artefaktu w dystrybucji FORGE bez odrębnej podstawy licencyjnej.
 
 Zakres i komponowanie:
 
-- Włącza się TYLKO dla żądań **greedy** (`temperature == 0`, bez repetition
+- N-gram włącza się TYLKO dla żądań **greedy** (`temperature == 0`, bez repetition
   penalty i bez host-logit features: grammar / `logit_bias` / `min_tokens` /
   `logprobs`) na **gęstej ścieżce F16 paged-KV** (bez `--kv-tier`/`--kvflash`,
   bez `rot4`/`rot3`, nie-hybrid, nie-MoE, głowica `lm_head` f16/q8_0). Pozostałe
   żądania CICHO spadają do zwykłego dekodowania — wynik bez zmian.
 - **Wymusza `--prefix-cache off`** (obie funkcje zarządzają własnością stron KV;
   weryfikacja dopisuje i wycofuje draftowe strony na gołej puli).
+- Natywne MTP i `mtp+ngram` wymagają obsługiwanego modelowego runtime MTP oraz greedy z próbkowaniem
+  GPU bez repetition penalty. Target DeltaNet i draft MTP
+  mają osobny stan per sekwencja pod wspólnym lease; strony KV draftu pochodzą
+  z jednej współdzielonej puli MTP. `max_active > 1` wymaga udanego startup
+  preflightu. Pure MTP greedy-exact paruje zgodne sekwencje same-K po B2;
+  router n-gram i niezgodne pary pozostają seryjne. Nie ma cichego fallbacku: niezgodna
+  konfiguracja kończy się błędem przed uruchomieniem workera.
 - Spekulacja stochastyczna (`temp > 0`) NIE jest zaimplementowana w v1 — tylko
   greedy-exact. Statystyki akceptacji per-proposer i adaptive-disable (usypianie
   proposera, gdy szacowany zysk < 1.05 w oknie) są aktywne.
@@ -280,6 +460,44 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/e2e_speculative.rs`):
   OFF jest bit-identyczna z dzisiejszą.
 - Rollback stron KV: jednostkowy `tests/kv_rollback.rs`; `verify_greedy`
   (długość akceptowanego prefiksu): `speculation::tests`.
+
+Zweryfikowane natywne MTP (RTX 4090,
+`protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`, lokalny wariant NVFP4):
+
+- wielocyklowy wynik MTP jest porównywany token po tokenie z sekwencyjnym greedy;
+- współdzielony forward DeltaNet i recompute commit zachowują stan zaakceptowanego
+  prefiksu bez puli checkpointów wszystkich kroków;
+- catch-up routera przeszedł bitową zgodność target h/x/SSM i MTP hidden/K/V/len
+  dla wymuszonych długości akceptacji 0..K;
+- batchowy catch-up MTP normalizuje przesunięte pary embedding/target hidden,
+  wykonuje wspólne `eh_proj` i zapisuje wyłącznie K/V;
+- na raw128 catch-up spadł z około **52,8 ms do 2,814 ms**, a na raw512 z
+  **227,696 ms do 11,262 ms**, z identycznymi SHA tokenów względem referencji;
+- fair prose K=3: raw128 około **105,1 tok/s** przy akceptacji 96,0%, raw512
+  około **71,2 tok/s** przy akceptacji 59,3%;
+- `mtp+ngram:3` prose: raw128 **118,3-118,5 tok/s** przy akceptacji 97,0%,
+  raw512 **78,0-78,3 tok/s** przy akceptacji 63,7%. Są to wyniki actual;
+  `oracle_upper` pozostaje osobną górną granicą;
+- MTP B2 ON/OFF, mediana pięciu powtórzeń: raw128 **137,40/101,97 tok/s**,
+  raw512 **97,78/76,38 tok/s**; stałe K=3 osiąga **136,97/94,34 tok/s**;
+- jednorundowy verifier utrzymuje draft ID na GPU, wykonuje pack `[B,T]` i
+  gather F16/Q8_0/NVFP4 w Mojo oraz kończy jednym D2H/sync; współczesne A/B
+  względem `7d472a0a` osiąga **127,91/127,20 tok/s** dla raw128 i
+  **93,56/93,45 tok/s** dla raw512;
+- testy shared-Q8 potwierdzają exact/canary/top1 dla T6/T8, osobny `out_proj`,
+  dwa strumienie z realokacją scratchu i kontrolowane ścieżki błędów eventu;
+- izolowany mikrobenchmark shared-Q8 skrócił grupę z 6 do 4 uruchomień i osiągnął
+  +10,78% dla T6 oraz +6,98% dla T8; oczekiwane 192 -> 96 kwantyzacji na cykl
+  B2 nie zostało jeszcze potwierdzone profilem pełnego modelu;
+- pomiary dotyczą wyłącznie CUDA. Źródła kerneli Mojo są przenośnym punktem
+  wyjścia dla AMDGPU/Metal, ale tych backendów nie uruchomiono ani nie
+  zweryfikowano.
+
+Realny 27B E2E A/B i nsys dla shared-Q8 pozostają **PENDING**, ponieważ obcy
+proces zmniejszył wolną pamięć GPU poniżej 22,5 GiB. Wynik izolowanego kernela
+nie jest wynikiem E2E modelu.
+
+Pełny protokół i porównanie: `docs/BENCH_QWEN35_MTP_NVFP4.md`.
 
 ---
 
@@ -371,7 +589,10 @@ bloku tekstowego). Braki: bloki `tool_use`/`tool_result`, `thinking`,
 | `top_k` | 40 | Sampling na GPU dla 1..64; większe → ścieżka CPU. |
 | `top_p` | 0.95 | Nucleus. |
 | `min_p` | 0.0 | Próg względem najlepszego kandydata. |
-| `repetition_penalty` | 1.0 | Karane są UNIKALNE tokeny (bez składania wykładniczego). |
+| `repetition_penalty` | 1.0 | Każdy token w oknie jest transformowany raz, niezależnie od liczby wystąpień. |
+| `frequency_penalty` | 0.0 | OpenAI `[-2, 2]`; odejmuje wartość pomnożoną przez liczbę wystąpień tokenu. |
+| `presence_penalty` | 0.0 | OpenAI `[-2, 2]`; odejmuje wartość raz dla każdego obecnego tokenu. |
+| `repeat_last_n` | 0 | Okno historii dla wszystkich kar; `0` oznacza całą przekazaną historię. |
 | `seed` | czas | Deterministyczny strumień per (seed, krok). |
 | `max_tokens` / `max_completion_tokens` | — | Walidowane względem `--ctx`: prompt+max_tokens ≤ ctx, inaczej 400 `context_length_exceeded`. |
 | `stop` | — | String lub tablica; holdback bez wycieków częściowych dopasowań. |
@@ -387,6 +608,16 @@ obsłużony z radix prefix-cache (SPEC §5.2; pomijane gdy 0) — patrz sekcja
 | `min_tokens` | 0 | Dolny próg wygenerowanych tokenów: wszystkie EOS tłumione (logit → -inf) aż do progu. Musi być ≤ `max_tokens`. Wymusza sampler CPU. |
 | `logprobs` | — | Chat: `true` + `top_logprobs:N` (0..20) → `choices[].logprobs.content[]` (token, `logprob`, `bytes`, `top_logprobs[]`). Completions: `logprobs:N` (0..20) → legacy `{tokens, token_logprobs, top_logprobs, text_offset}`. Log-softmax na hoście; przy temp 0 top-1 = token próbkowany. Wymusza sampler CPU. Tylko non-streaming. |
 | `echo` (completions) | false | Dokleja prompt do odpowiedzi; z `logprobs` tokeny promptu dostają `token_logprobs=null`. Tylko non-streaming. |
+
+Aktywne kary korzystają z kompaktowego histogramu unikalnych tokenów na GPU.
+Kernel Mojo `penalize_histogram_f32` nakłada repetition, frequency i presence
+w jednym launchu, po którym działa istniejący równoległy argmax lub top-k.
+Ścieżka batchowa wykonuje tę samą operację jednym uruchomieniem dla wszystkich
+sekwencji. Historia obejmuje prompt i wygenerowaną odpowiedź oraz respektuje
+`repeat_last_n`; bufory IDs i liczników są trwałe, a w trybie release nie ma
+D2H histogramu. Domyślny greedy bez kar zachowuje dotychczasowy fast path bez
+dodatkowego kernela, alokacji w kroku ani synchronizacji. Żądania `logprobs`
+korzystają ze ścieżki CPU i raportują rozkład po nałożeniu kar.
 | `n` | 1 | Liczba niezależnych completions (1..128). Osobne ziarna (`seed+i·φ`), dzielą prefiks promptu przez radix prefix-cache; `choices[0..n]`. Non-streaming (streaming przy `n>1` = 400). |
 
 Usage przy `n>1`: `prompt_tokens` liczony raz, `completion_tokens` sumowany po
@@ -591,7 +822,8 @@ onnxruntime (|Δ| ~1e-6, tol 1e-3). Model VAD można wskazać przez
   `nvfp4-pack-quantized` (NVFP4, programowy FP4) i `float-quantized`
   (FP8 → f16 przy ładowaniu); sharding przez `model.safetensors.index.json`.
 - Architektury: qwen3, llama, mistral, **olmoe** (MoE), **qwen3moe** (MoE),
-  **qwen35moe** (hybrid SSM+MoE — działa E2E, patrz sekcja qwen35moe)
+  **qwen35** (gęsty hybrid SSM z natywnym MTP) oraz **qwen35moe**
+  (hybrid SSM+MoE — działa E2E, patrz sekcja qwen35moe)
   (rejestr deklaratywny w forge-formats); Whisper (osobny silnik); modele
   embeddingowe (pooling z metadanych).
 - head_dim: 64, 128 (specjalizacje attention generacji) i 256 (tylko f16 KV,
@@ -630,9 +862,15 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   proj/`ssm_norm`/out-proj; atencja — bramkowane Q (split, bez fuzji) + QK-norm;
   MoE z bramką shared expert (`ffn_gate_inp_shexp`). Tabela embeddingów trzymana
   host-side (gather per token) — 22 GB kwantowanych wag mieści się w VRAM 24 GB.
-- **Stan SSM** (`Model.ssm`): rezydentny stan `[n_v_heads, d_state, d_state]` f32
-  + okno conv `[conv_dim, d_conv-1]` f16 per warstwa DeltaNet; zerowany na starcie
-  sekwencji, jedna aktywna sekwencja SSM naraz.
+- **Stan SSM** (`Model.hybrid_states`): pula rezydentnych slotów per sekwencja;
+  każdy przechowuje `[n_v_heads, d_state, d_state]` f32 oraz okno conv
+  `[conv_dim, d_conv-1]` f16 dla każdej warstwy DeltaNet. Lease zawiera numer
+  slotu i generację, a event GPU porządkuje przełączenie oraz bezpieczny reuse.
+  Ten sam lease wskazuje osobny stan draftu MTP i jego `SeqKv`, korzystający ze
+  współdzielonego paged cache MTP. Preflight dwóch slotów, produkcyjny admission
+  oraz audyt GPU pure MTP i MTP+n-gram A/B przechodzą dla `max_active=2`.
+  Verifier utrzymuje osobne grafy T=3/4 według stabilnego identyfikatora slotu;
+  pierwsze wykonanie danej pary slot/T przechwytuje graf, a kolejne go odtwarzają.
 - **Forward** (`hybrid_forward_token`): dispatch per-`LayerKind`; bramkowana
   atencja hd256 (deinterleave q/gate → QK-norm → partial M-RoPE `n_rot=64` →
   paged decode → `attn ⊙ σ(gate)` → o-proj), DeltaNet (conv+SiLU → split →
@@ -696,7 +934,12 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
 - MoE: tylko single-stream decode + KV f16 (patrz sekcja MoE). Hybrydy SSM+MoE
   (Qwen3.6 `qwen35moe`) generują E2E, ale ścieżka jest correctness-first
   (~17 tok/s, host round-tripy per warstwa, bez grafu/wsadu — patrz sekcja
-  qwen35moe); jedna aktywna sekwencja SSM naraz.
+  qwen35moe). Target i MTP mają izolowane sloty per sekwencja oraz wspólny paged
+  cache MTP. Dwie niespekulacyjne sekwencje targetu używają B2 ze wspólnymi
+  batch GEMM FFN i głowy logits; mixery zachowują osobne sloty DeltaNet. Native
+  MTP ma osobny same-K B2 z segmentowanym verifierem `[B,T]` i batchowym draftem.
+  B2 wymaga rezydentnego KV oraz obsługiwanych formatów dense FFN i lm_head;
+  tiering lub inny niespełniony warunek wybiera seryjny fallback przed zmianą KV.
 - `logprobs`/`echo`/`n>1`: obsługiwane tylko na ścieżce non-streaming (streaming
   przy `n>1` lub completions z `echo`/`logprobs` = 400). Streaming chat NIE dokłada
   `logprobs` do delt (parser reorganizuje tekst — token↔delta nie są 1:1). Prompt-token

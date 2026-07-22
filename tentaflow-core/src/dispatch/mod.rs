@@ -38,6 +38,7 @@ pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod ml_studio;
+pub mod ml_studio_remote_import;
 pub mod model_metrics;
 pub mod recorder;
 pub mod resume_token;
@@ -868,6 +869,90 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::MlStudioPayload::ServiceModelsListResponse(_) => {
                 "MlStudioServiceModelsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStartRequest(_) => {
+                "MlStudioProjectExportStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStartResponse(_) => {
+                "MlStudioProjectExportStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStatusRequest(_) => {
+                "MlStudioProjectExportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStatusResponse(_) => {
+                "MlStudioProjectExportStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkRequest(_) => {
+                "MlStudioProjectImportUploadChunkRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkResponse(_) => {
+                "MlStudioProjectImportUploadChunkResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusRequest(_) => {
+                "MlStudioProjectImportUploadStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusResponse(_) => {
+                "MlStudioProjectImportUploadStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportPreviewRequest(_) => {
+                "MlStudioProjectImportPreviewRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportPreviewResponse(_) => {
+                "MlStudioProjectImportPreviewResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportApplyRequest(_) => {
+                "MlStudioProjectImportApplyRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportApplyResponse(_) => {
+                "MlStudioProjectImportApplyResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportStatusRequest(_) => {
+                "MlStudioProjectImportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportStatusResponse(_) => {
+                "MlStudioProjectImportStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportCancelRequest(_) => {
+                "MlStudioProjectImportCancelRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportCancelResponse(_) => {
+                "MlStudioProjectImportCancelResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecordingsListRequest(_) => {
+                "MlStudioRecordingsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecordingsListResponse(_) => {
+                "MlStudioRecordingsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsRequest(_) => {
+                "MlStudioRecogImportRecordingsRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsResponse(_) => {
+                "MlStudioRecogImportRecordingsResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusRequest(_) => {
+                "MlStudioRecogImportRecordingsStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusResponse(_) => {
+                "MlStudioRecogImportRecordingsStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportPreviewRequest(_) => {
+                "MlStudioRemoteImportPreviewRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportPreviewResponse(_) => {
+                "MlStudioRemoteImportPreviewResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStartRequest(_) => {
+                "MlStudioRemoteImportStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStartResponse(_) => {
+                "MlStudioRemoteImportStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStatusRequest(_) => {
+                "MlStudioRemoteImportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStatusResponse(_) => {
+                "MlStudioRemoteImportStatusResponse"
             }
         },
         MessageBody::RobotsBody(p) => match p {

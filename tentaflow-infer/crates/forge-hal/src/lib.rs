@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 use forge_types::{DeviceCaps, ForgeError, MemKind, Result};
 
+pub const DEVICE_ALLOC_ALIGN: usize = 256;
+
 /// Logical VRAM sub-pool an allocation is served from (spec §3.2). Only
 /// meaningful for `MemKind::Device`; host-side kinds ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -334,15 +336,30 @@ pub trait Device: Send + Sync {
     /// Freeing is RAII via `DevBuffer` drop.
     fn alloc(&self, bytes: usize, kind: MemKind, pool: Pool) -> Result<DevBuffer>;
 
+    /// Liczba wolnych bajtów w puli urządzenia, gdy backend potrafi ją raportować.
+    fn pool_available(&self, _pool: Pool) -> Option<usize> {
+        None
+    }
+
     fn create_stream(&self) -> Result<Stream>;
 
     fn create_event(&self) -> Result<Event>;
+
+    /// Zdarzenie z licznikiem czasu, używane tylko przez profilowanie.
+    fn create_timing_event(&self) -> Result<Event> {
+        self.create_event()
+    }
 
     /// Record `event` at the current tail of `stream`.
     fn record_event(&self, event: &Event, stream: &Stream) -> Result<()>;
 
     /// Make future work on `stream` wait until `event` completes.
     fn wait_event(&self, stream: &Stream, event: &Event) -> Result<()>;
+
+    /// Czas GPU między zdarzeniami. `None` oznacza backend bez liczników czasu.
+    fn elapsed_event_ms(&self, _start: &Event, _end: &Event) -> Result<Option<f32>> {
+        Ok(None)
+    }
 
     /// Stream-ordered copy between buffers; direction (H2D/D2H/D2D/H2H) is
     /// derived from the buffers' `MemKind`s. Host-side endpoints must be

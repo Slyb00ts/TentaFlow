@@ -103,6 +103,24 @@ pub struct EngineMetrics {
     pub spec_forwards_total: AtomicU64,
     /// Speculative draft tokens accepted across those forwards.
     pub spec_accepted_total: AtomicU64,
+    /// Wspólne kroki dwóch sekwencji wykonane przez natywną ścieżkę MTP B2.
+    pub native_mtp_b2_steps_total: AtomicU64,
+    /// Wspólne chunki targetowego prefill B2 T32.
+    pub hybrid_prefill_b2_steps_total: AtomicU64,
+    /// Tokeny promptu wykonane przez targetowy prefill B2 T32.
+    pub hybrid_prefill_b2_tokens_total: AtomicU64,
+    /// Pary prefill odrzucone przez capability i wykonane serialnie.
+    pub hybrid_prefill_b2_fallbacks_total: AtomicU64,
+    /// Gauge: logiczny rozmiar zaalokowanego dedykowanego scratchu prefill B2.
+    pub hybrid_prefill_b2_scratch_bytes: AtomicU64,
+    /// Wspólne weryfikacje dwóch pełnych draftów routera MTP+n-gram.
+    pub mtp_ngram_b2_steps_total: AtomicU64,
+    /// Wspólne weryfikacje routed B2 dla par N/N.
+    pub mtp_routed_nn_b2_steps_total: AtomicU64,
+    /// Wspólne weryfikacje routed B2 dla par N/M lub M/N.
+    pub mtp_routed_nm_b2_steps_total: AtomicU64,
+    /// Wspólne weryfikacje routed B2 dla par M/M.
+    pub mtp_routed_mm_b2_steps_total: AtomicU64,
     /// Gauge: sequences currently decoding/prefilling.
     pub active_sequences: AtomicU64,
     /// Gauge: submissions admitted-but-waiting behind KV pressure (queue depth).
@@ -130,6 +148,15 @@ impl Default for EngineMetrics {
             cache_read_tokens_total: AtomicU64::new(0),
             spec_forwards_total: AtomicU64::new(0),
             spec_accepted_total: AtomicU64::new(0),
+            native_mtp_b2_steps_total: AtomicU64::new(0),
+            hybrid_prefill_b2_steps_total: AtomicU64::new(0),
+            hybrid_prefill_b2_tokens_total: AtomicU64::new(0),
+            hybrid_prefill_b2_fallbacks_total: AtomicU64::new(0),
+            hybrid_prefill_b2_scratch_bytes: AtomicU64::new(0),
+            mtp_ngram_b2_steps_total: AtomicU64::new(0),
+            mtp_routed_nn_b2_steps_total: AtomicU64::new(0),
+            mtp_routed_nm_b2_steps_total: AtomicU64::new(0),
+            mtp_routed_mm_b2_steps_total: AtomicU64::new(0),
             active_sequences: AtomicU64::new(0),
             queued_sequences: AtomicU64::new(0),
             kv_pages_total: AtomicU64::new(0),

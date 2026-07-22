@@ -8,19 +8,26 @@
 pub mod arch;
 pub mod deltanet;
 pub mod dequant;
-pub mod iq_tables;
 pub mod gguf;
 pub mod hf_config;
+pub mod iq_tables;
 pub mod nvfp4;
 pub mod safetensors;
+pub mod speculation_manifest;
 pub mod w4a8;
 
 pub use arch::{
-    ArchSpec, Hyperparams, LayerKind, ModelDescriptor, MoeParams, PoolingType, SsmParams,
-    WeightRole,
+    ArchSpec, Hyperparams, LayerKind, ModelDescriptor, MoeParams, MtpDescriptor, MtpWeightRole,
+    PoolingType, SsmParams, WeightRole,
 };
 pub use dequant::dequantize_to_f32;
 pub use gguf::{Gguf, GgufTensor, MetaValue};
 pub use hf_config::HfConfig;
 pub use nvfp4::{NvFp4Scheme, NvFp4TensorNames};
 pub use safetensors::{SafeTensors, ShardedSafeTensors, StTensor};
+pub use speculation_manifest::{
+    ArtifactRole, ArtifactSpec, CompositionMode, ConfidenceCalibration, ConfidenceMethod,
+    FeatureDimension, Fingerprint, FingerprintAlgorithm, LicenseInfo, NeuralProposerKind,
+    Quantization, SamplingMode, SharedTensor, SourceInfo, SpeculationDType, SpeculationManifest,
+    TargetModel, TensorMapping, VerifiedArtifact, VerifiedSpeculationManifest,
+};

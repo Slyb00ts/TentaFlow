@@ -36,7 +36,14 @@ use tentaflow_core::services::key_storage::{
 
 /// Names accepted by `tentaflow-cli keys rotate <name>`. Validated at parse
 /// time so the operator gets a clear error before any disk I/O runs.
-const ROTATABLE: &[&str] = &["pickup_token", "frame_url", "recording_url", "legal_url"];
+const ROTATABLE: &[&str] = &[
+    "pickup_token",
+    "frame_url",
+    "recording_url",
+    "legal_url",
+    "model_bundle_url",
+    "ml_studio_export_url",
+];
 
 #[derive(Subcommand, Debug)]
 pub enum KeysCommand {

@@ -34,6 +34,8 @@ pub enum UrlScope {
     /// Vision model-bundle distribution between TentaFlow instances —
     /// `/models/manifest/<bundle_ref>` + `/models/file/<bundle_ref>/<name>`.
     ModelBundle,
+    /// ML Studio project export archives — `/ml-studio/exports/<ref>`.
+    MlStudioExport,
 }
 
 impl UrlScope {
@@ -43,6 +45,7 @@ impl UrlScope {
             Self::Recording => "recording",
             Self::LegalUrl => "legal",
             Self::ModelBundle => "model_bundle",
+            Self::MlStudioExport => "ml_studio_export",
         }
     }
 
@@ -55,6 +58,7 @@ impl UrlScope {
             Self::Recording => 60,
             Self::LegalUrl => 60,
             Self::ModelBundle => 300,
+            Self::MlStudioExport => 300,
         }
     }
 
@@ -67,6 +71,10 @@ impl UrlScope {
             // large (a 126 MB ONNX over a slow WAN) — a week-long ceiling lets
             // a link survive an overnight transfer window.
             Self::ModelBundle => 7 * 24 * 3600,
+            // Export archives are large (up to ~8 GB) and downloaded over
+            // arbitrary WAN links; a week-long ceiling lets a paused download
+            // resume via Range across an overnight window.
+            Self::MlStudioExport => 7 * 24 * 3600,
         }
     }
 
@@ -79,6 +87,7 @@ impl UrlScope {
             Self::Recording => "recording_url",
             Self::LegalUrl => "legal_url",
             Self::ModelBundle => "model_bundle_url",
+            Self::MlStudioExport => "ml_studio_export_url",
         }
     }
 }
@@ -308,6 +317,7 @@ impl SignedUrlIssuer {
             UrlScope::Recording => crate::services::mesh_keys::KeyScope::RecordingUrl,
             UrlScope::LegalUrl => crate::services::mesh_keys::KeyScope::LegalUrl,
             UrlScope::ModelBundle => crate::services::mesh_keys::KeyScope::ModelBundleUrl,
+            UrlScope::MlStudioExport => crate::services::mesh_keys::KeyScope::MlStudioExportUrl,
         };
         for peer_key in crate::services::mesh_keys::mesh_key_pool().verify_keys_for(scope) {
             let expected = hmac_sign(&peer_key, payload.as_bytes());

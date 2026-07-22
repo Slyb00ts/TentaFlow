@@ -6,27 +6,178 @@
 // adds the previous sublayer's output and produces the next sublayer's
 // normed input.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use forge_formats::{PoolingType, LayerKind};
 use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
-use forge_formats::PoolingType;
-use forge_kernels::Kernels;
-use forge_types::{ForgeError, MemKind, Result};
+use forge_kernels::{Kernels, Nvfp4GgufQ8Projection, Q8ActPrepared};
+use forge_types::{ForgeError, MemKind, Result, Vendor};
+use forge_hal::DEVICE_ALLOC_ALIGN;
 use half::f16;
 
-use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
+use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
+use crate::mtp::{MtpDraftState, MtpEmbedding};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weights::{
-    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, GateUpWeights, LayerFfn, LayerMixer,
-    Fp8Weight, MoeFfn, ModelWeights, QkvWeights, W4A8Weight,
+    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Weight, GateUpWeights, LayerFfn,
+    LayerMixer, ModelWeights, MoeFfn, QkvWeights, W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
+const HYBRID_PREFILL_CHUNK: usize = 32;
+const HYBRID_HOST_STAGING_SLOTS: usize = 3;
+
+fn hybrid_prefill_chunk_size() -> usize {
+    std::env::var("FORGE_HYBRID_PREFILL_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 1 && value <= MAX_PREFILL_CHUNK)
+        .unwrap_or(HYBRID_PREFILL_CHUNK)
+}
+
+fn hybrid_prefill_profile_spans(prompt_tokens: usize, chunk_size: usize) -> usize {
+    let full_outer = prompt_tokens / MAX_PREFILL_CHUNK;
+    let remainder = prompt_tokens % MAX_PREFILL_CHUNK;
+    full_outer * MAX_PREFILL_CHUNK.div_ceil(chunk_size)
+        + if remainder == 0 {
+            0
+        } else {
+            remainder.div_ceil(chunk_size)
+        }
+}
+
+fn hybrid_q_full_cols(q_dim: usize, conv_dim: usize, hidden_size: usize) -> usize {
+    (q_dim * 2).max(conv_dim).max(hidden_size * 2)
+}
+
+fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_embedding: bool) -> bool {
+    mode == Some("device") && shares_target_embedding
+}
+
+fn validate_mtp_routed_inputs(
+    vocab: usize,
+    fed: [u32; 2],
+    k: usize,
+    external_drafts: [Option<&[u32]>; 2],
+) -> Result<[i32; 2]> {
+    let [fed0, fed1] = fed.map(|token| {
+        i32::try_from(token)
+            .map_err(|_| ForgeError::Format("fed routed MTP przekracza i32".into()))
+    });
+    let fed_i32 = [fed0?, fed1?];
+    if external_drafts
+        .iter()
+        .flatten()
+        .any(|draft| draft.len() != k)
+    {
+        return Err(ForgeError::Scheduler(
+            "zewnętrzny draft routed MTP ma niezgodne K".into(),
+        ));
+    }
+    if fed
+        .iter()
+        .copied()
+        .chain(
+            external_drafts
+                .iter()
+                .flatten()
+                .flat_map(|draft| draft.iter().copied()),
+        )
+        .any(|token| token as usize >= vocab)
+    {
+        return Err(ForgeError::Scheduler(
+            "token wejściowy pary routed MTP wykracza poza słownik".into(),
+        ));
+    }
+    for token in external_drafts
+        .iter()
+        .flatten()
+        .flat_map(|draft| draft.iter().copied())
+    {
+        i32::try_from(token)
+            .map_err(|_| ForgeError::Format("draft routed MTP przekracza i32".into()))?;
+    }
+    Ok(fed_i32)
+}
+
+fn restore_after<T>(result: Result<T>, restore: impl FnOnce()) -> Result<T> {
+    restore();
+    result
+}
+
+fn validate_mtp_pair_metadata_commit(
+    states: &[MtpDraftState; 2],
+    retained: [usize; 2],
+) -> Result<[usize; 2]> {
+    Ok([
+        states[0].validate_commit_prefix_metadata(retained[0])?,
+        states[1].validate_commit_prefix_metadata(retained[1])?,
+    ])
+}
+
+fn apply_mtp_pair_metadata_commit(
+    states: &mut [MtpDraftState; 2],
+    kv: &mut KvCache,
+    targets: [usize; 2],
+) {
+    states[0].apply_commit_prefix_metadata(kv, targets[0]);
+    states[1].apply_commit_prefix_metadata(kv, targets[1]);
+}
+
+fn rollback_mtp_pair(
+    states: &mut [MtpDraftState; 2],
+    kv: &mut KvCache,
+    stream: &Stream,
+) -> Result<()> {
+    rollback_mtp_pair_inner(states, kv, stream, None)
+}
+
+fn rollback_mtp_pair_inner(
+    states: &mut [MtpDraftState; 2],
+    kv: &mut KvCache,
+    stream: &Stream,
+    fail_lane: Option<usize>,
+) -> Result<()> {
+    let first = if states[0].checkpoint_len().is_some() {
+        if fail_lane == Some(0) {
+            Err(ForgeError::Device(
+                "MTP: wymuszony błąd rollbacku lane0".into(),
+            ))
+        } else {
+            states[0].rollback(kv, stream)
+        }
+    } else {
+        Ok(())
+    };
+    let second = if states[1].checkpoint_len().is_some() {
+        if fail_lane == Some(1) {
+            Err(ForgeError::Device(
+                "MTP: wymuszony błąd rollbacku lane1".into(),
+            ))
+        } else {
+            states[1].rollback(kv, stream)
+        }
+    } else {
+        Ok(())
+    };
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(ForgeError::Device(format!(
+            "rollback MTP B2 lane0 nie powiódł się: {error}"
+        ))),
+        (Ok(()), Err(error)) => Err(ForgeError::Device(format!(
+            "rollback MTP B2 lane1 nie powiódł się: {error}"
+        ))),
+        (Err(first), Err(second)) => Err(ForgeError::Device(format!(
+            "rollback MTP B2 obu lane'ów nie powiódł się: lane0={first}; lane1={second}"
+        ))),
+    }
+}
 
 /// Fixed built-in calibration passage for W4A8 SmoothQuant. A few hundred
 /// tokens of representative English prose plus a code snippet — enough to
@@ -78,6 +229,7 @@ pub const MAX_SPEC_DRAFT: usize = 16;
 /// 0.087 (Bielik NVFP4) / 0.042 (Qwen3 Q8_0) with the argmax identical at
 /// every step. 1 reproduces the unsplit arithmetic bit-exactly.
 const ATTN_DECODE_SPLITS: usize = 8;
+const ATTN_DECODE_GQA_SPLITS: usize = 32;
 
 /// Coarse per-phase wall-clock attribution for `prefill_chunk`, enabled by
 /// FORGE_PREFILL_TRACE=1. Every probe synchronizes the device, so absolute
@@ -160,6 +312,8 @@ pub struct ModelConfig {
     /// (default) engages only when it is a strict optimization — F16/Fp8 KV,
     /// no tiering, non-hybrid arch; otherwise silently inactive.
     pub prefix_cache: bool,
+    /// Ładuje i uruchamia opcjonalną głowę MTP/NextN modelu.
+    pub native_mtp: bool,
 }
 
 impl Default for ModelConfig {
@@ -171,6 +325,7 @@ impl Default for ModelConfig {
             kv_quant: KvQuant::F16,
             kv_tier: KvTierConfig::default(),
             prefix_cache: true,
+            native_mtp: false,
         }
     }
 }
@@ -204,6 +359,18 @@ pub struct Model {
     /// logits of one draft-verification forward. Allocated lazily on the first
     /// `verify_greedy_draft`; `None` until speculation runs.
     verify_bufs: Option<VerifyBufs>,
+    /// Warstwowy verifier T=3/4 dla hybrydowego targetu MTP.
+    hybrid_verify_bufs: Option<HybridVerifyBufs>,
+    /// Segmentowany scratch native MTP dla dokładnie dwóch sekwencji.
+    mtp_b2_bufs: Option<MtpB2Bufs>,
+    /// Trwały scratch batched prefill, oddzielony od verifiera decode cap=4.
+    hybrid_prefill_bufs: Option<HybridVerifyBufs>,
+    /// Dedykowany scratch ciągłego prefill dokładnie B2×T32.
+    hybrid_prefill_b2_bufs: Option<HybridPrefillB2Bufs>,
+    /// Trwałe grafy stałej części verifiera MTP dla pary slotu i T.
+    hybrid_verify_graphs: HashMap<(usize, usize), ExecGraph>,
+    /// Nieudana próba przechwycenia wyłącza kolejne próby dla danej pary.
+    hybrid_verify_graph_disabled: HashSet<(usize, usize)>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
     /// Captured non-hybrid MoE decode step (fully device-side grouped expert
@@ -233,11 +400,8 @@ pub struct Model {
     pt_seq: u64,
     /// MoE scratch; `Some` only for Mixture-of-Experts models.
     moe_bufs: Option<MoeBufs>,
-    /// Per-layer Gated-DeltaNet recurrent state (hybrid `qwen35moe` only):
-    /// `Some` for DeltaNet layers, `None` for attention layers. Persistent for
-    /// the model lifetime (single active sequence at a time on the hybrid
-    /// path), zeroed at each sequence start (`pos == 0`).
-    ssm: Vec<Option<SsmState>>,
+    /// Pula izolowanych stanów Gated-DeltaNet przypisanych do sekwencji.
+    hybrid_states: Option<HybridStatePool>,
     /// Gated-attention + DeltaNet single-token scratch; allocated lazily for a
     /// hybrid model on the first hybrid forward.
     hybrid_bufs: Option<HybridBufs>,
@@ -252,6 +416,26 @@ pub struct Model {
     /// prefill path records per-input-channel activation abs-max at the four
     /// linear-input points. Set only during `calibrate_w4a8`, `None` otherwise.
     calib: Option<CalibAccum>,
+    /// Zdarzenia czasu GPU przygotowane wyłącznie przez `forge bench`.
+    prefill_profiles: VecDeque<PrefillProfileRun>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefillProfile {
+    pub target_gpu_ms: Option<f64>,
+    pub mtp_catchup_gpu_ms: Option<f64>,
+}
+
+struct ProfileSpan {
+    start: Event,
+    end: Event,
+}
+
+struct PrefillProfileRun {
+    target: Vec<ProfileSpan>,
+    catchup: Vec<ProfileSpan>,
+    target_cursor: usize,
+    catchup_cursor: usize,
 }
 
 /// Running per-input-channel activation abs-max for the W4A8 SmoothQuant
@@ -278,7 +462,13 @@ impl CalibAccum {
     }
 
     /// Fold `t` rows of an f16 activation buffer into a per-channel abs-max acc.
-    fn absorb(device: &dyn Device, buf: &DevBuffer, acc: &mut [f32], t: usize, scratch: &mut Vec<u8>) -> Result<()> {
+    fn absorb(
+        device: &dyn Device,
+        buf: &DevBuffer,
+        acc: &mut [f32],
+        t: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<()> {
         let dim = acc.len();
         let bytes = t * dim * 2;
         if scratch.len() < bytes {
@@ -302,6 +492,560 @@ struct SsmState {
     conv: DevBuffer,
     /// Recurrent state matrices `[n_v_heads, d_state, d_state]` f32.
     state: DevBuffer,
+}
+
+struct HybridStateSlot {
+    layers: Vec<Option<SsmState>>,
+    mtp: Option<MtpDraftState>,
+    generation: u64,
+    in_use: bool,
+    ready: Event,
+    ready_recorded: bool,
+    initialized_generation: u64,
+}
+
+struct HybridStatePool {
+    device: Arc<dyn Device>,
+    layer_kinds: Vec<LayerKind>,
+    conv_bytes: usize,
+    state_bytes: usize,
+    zero_conv: DevBuffer,
+    zero_state: DevBuffer,
+    slots: Vec<HybridStateSlot>,
+    free: Vec<usize>,
+    active: Option<HybridStateLease>,
+    poisoned: Option<String>,
+    mtp_kv: Option<KvCache>,
+    mtp_shape: Option<(usize, usize)>,
+    quarantined_mtp_states: Vec<MtpDraftState>,
+    quarantined_mtp_kv: Vec<KvCache>,
+}
+
+impl HybridStatePool {
+    fn new(
+        device: Arc<dyn Device>,
+        layer_kinds: Vec<LayerKind>,
+        conv_bytes: usize,
+        state_bytes: usize,
+        mtp_config: Option<(KvConfig, usize, usize)>,
+    ) -> Result<Self> {
+        let zero_conv = device.alloc(conv_bytes, MemKind::PinnedHost, Pool::Activations)?;
+        let zero_state = device.alloc(state_bytes, MemKind::PinnedHost, Pool::Activations)?;
+        unsafe {
+            std::ptr::write_bytes(
+                zero_conv.host_ptr().expect("pinned host mapping"),
+                0,
+                conv_bytes,
+            );
+            std::ptr::write_bytes(
+                zero_state.host_ptr().expect("pinned host mapping"),
+                0,
+                state_bytes,
+            );
+        }
+        let (mtp_kv, mtp_shape) = match mtp_config {
+            Some((config, hidden_size, vocab_size)) => (
+                Some(KvCache::new(device.as_ref(), config)?),
+                Some((hidden_size, vocab_size)),
+            ),
+            None => (None, None),
+        };
+        let mut pool = Self {
+            device,
+            layer_kinds,
+            conv_bytes,
+            state_bytes,
+            zero_conv,
+            zero_state,
+            slots: Vec::new(),
+            free: Vec::new(),
+            active: None,
+            poisoned: None,
+            mtp_kv,
+            mtp_shape,
+            quarantined_mtp_states: Vec::new(),
+            quarantined_mtp_kv: Vec::new(),
+        };
+        pool.allocate_slot()?;
+        Ok(pool)
+    }
+
+    fn build_slot(&self) -> Result<HybridStateSlot> {
+        let mtp = match (&self.mtp_kv, self.mtp_shape) {
+            (Some(kv), Some((hidden_size, vocab_size))) => Some(MtpDraftState::new(
+                self.device.clone(),
+                kv,
+                hidden_size,
+                vocab_size,
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(ForgeError::Scheduler(
+                    "niespójna konfiguracja puli MTP".into(),
+                ))
+            }
+        };
+        let ready = self.device.create_event()?;
+        let mut layers = Vec::with_capacity(self.layer_kinds.len());
+        for kind in &self.layer_kinds {
+            layers.push(match kind {
+                LayerKind::DeltaNet => Some(SsmState {
+                    conv: self
+                        .device
+                        .alloc(self.conv_bytes, MemKind::Device, Pool::Weights)?,
+                    state: self
+                        .device
+                        .alloc(self.state_bytes, MemKind::Device, Pool::Weights)?,
+                }),
+                LayerKind::Attention => None,
+            });
+        }
+        Ok(HybridStateSlot {
+            layers,
+            mtp,
+            generation: 0,
+            in_use: false,
+            ready,
+            ready_recorded: false,
+            initialized_generation: 0,
+        })
+    }
+
+    fn allocate_slot(&mut self) -> Result<usize> {
+        let state = self.build_slot()?;
+        let slot = self.slots.len();
+        self.slots.push(state);
+        self.free.push(slot);
+        Ok(slot)
+    }
+
+    fn ensure_capacity(&mut self, slots: usize) -> Result<()> {
+        self.ensure_healthy()?;
+        let additional = slots.saturating_sub(self.slots.len());
+        if additional == 0 {
+            return Ok(());
+        }
+        let delta_layers = self
+            .layer_kinds
+            .iter()
+            .filter(|kind| matches!(kind, LayerKind::DeltaNet))
+            .count();
+        let reserve = |bytes: usize| {
+            bytes
+                .max(1)
+                .checked_next_multiple_of(DEVICE_ALLOC_ALIGN)
+                .ok_or_else(|| ForgeError::Scheduler("przepełnienie wyrównania alokacji".into()))
+        };
+        let weights_per_slot = reserve(self.conv_bytes)?
+            .checked_add(reserve(self.state_bytes)?)
+            .and_then(|bytes| bytes.checked_mul(delta_layers))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie rozmiaru slotu SSM".into()))?;
+        let activations_per_slot = match (self.mtp_shape, self.mtp_kv.as_ref()) {
+            (Some((hidden, vocab)), Some(kv)) => {
+                let hidden_bytes = hidden.checked_mul(2).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie rozmiaru hidden MTP".into())
+                })?;
+                let step_hidden = hidden_bytes.checked_mul(4).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie checkpointów hidden MTP".into())
+                })?;
+                let logits = vocab
+                    .checked_mul(4)
+                    .ok_or_else(|| ForgeError::Scheduler("przepełnienie logitów MTP".into()))?;
+                let page_table = kv.cfg.max_pages_per_seq.checked_mul(4).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie tabeli stron MTP".into())
+                })?;
+                [
+                    hidden_bytes,
+                    hidden_bytes,
+                    hidden_bytes,
+                    logits,
+                    page_table,
+                    4,
+                    4,
+                    20,
+                    hidden_bytes,
+                    step_hidden,
+                ]
+                .into_iter()
+                .try_fold(0usize, |total, bytes| {
+                    total.checked_add(reserve(bytes)?).ok_or_else(|| {
+                        ForgeError::Scheduler("przepełnienie rozmiaru slotu MTP".into())
+                    })
+                })?
+            }
+            (None, None) => 0,
+            _ => {
+                return Err(ForgeError::Scheduler(
+                    "niespójna konfiguracja puli MTP".into(),
+                ))
+            }
+        };
+        let required_weights = weights_per_slot
+            .checked_mul(additional)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie preflightu puli SSM".into()))?;
+        let required_activations = activations_per_slot
+            .checked_mul(additional)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie preflightu puli MTP".into()))?;
+        let available_weights = self.device.pool_available(Pool::Weights);
+        let available_activations = self.device.pool_available(Pool::Activations);
+        if available_weights.is_some_and(|available| required_weights > available)
+            || available_activations.is_some_and(|available| required_activations > available)
+        {
+            return Err(ForgeError::Scheduler(format!(
+                "preflight {slots} slotów hybrydowych wymaga {required_weights} B puli weights i {required_activations} B puli activations dla {additional} nowych slotów; dostępne odpowiednio {} B i {} B",
+                available_weights.map_or_else(|| "nieznane".into(), |bytes| bytes.to_string()),
+                available_activations
+                    .map_or_else(|| "nieznane".into(), |bytes| bytes.to_string()),
+            )));
+        }
+        let mut allocated = Vec::with_capacity(additional);
+        for _ in 0..additional {
+            allocated.push(self.build_slot().map_err(|error| {
+                ForgeError::Scheduler(format!(
+                    "preflight {slots} slotów hybrydowych nie zaalokował {additional} nowych slotów (weights {required_weights} B, activations {required_activations} B): {error}"
+                ))
+            })?);
+        }
+        let first = self.slots.len();
+        self.slots.extend(allocated);
+        self.free.extend(first..slots);
+        Ok(())
+    }
+
+    fn acquire(&mut self) -> Result<HybridStateLease> {
+        self.ensure_healthy()?;
+        if self.free.is_empty() {
+            self.allocate_slot()?;
+        }
+        let slot = self.free.pop().expect("wolny slot został przygotowany");
+        let state = &mut self.slots[slot];
+        state.generation = state.generation.checked_add(1).ok_or_else(|| {
+            ForgeError::Scheduler("licznik generacji stanu hybrydowego został wyczerpany".into())
+        })?;
+        state.in_use = true;
+        Ok(HybridStateLease {
+            slot,
+            generation: state.generation,
+        })
+    }
+
+    fn validate(&self, lease: HybridStateLease) -> Result<()> {
+        let Some(slot) = self.slots.get(lease.slot) else {
+            return Err(ForgeError::Scheduler(
+                "nieprawidłowy slot stanu hybrydowego".into(),
+            ));
+        };
+        if !slot.in_use || slot.generation != lease.generation {
+            return Err(ForgeError::Scheduler(
+                "nieaktualny lease stanu hybrydowego".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(reason) => Err(ForgeError::Device(format!(
+                "pula stanów hybrydowych jest zatruta: {reason}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&mut self, reason: String) -> ForgeError {
+        self.poisoned = Some(reason.clone());
+        ForgeError::Device(format!("pula stanów hybrydowych została zatruta: {reason}"))
+    }
+
+    fn quarantine_mtp(
+        &mut self,
+        reason: String,
+        states: impl IntoIterator<Item = MtpDraftState>,
+        kv: KvCache,
+    ) -> ForgeError {
+        self.quarantined_mtp_states.extend(states);
+        self.quarantined_mtp_kv.push(kv);
+        self.poison(reason)
+    }
+
+    fn activate(&mut self, lease: HybridStateLease, stream: &Stream) -> Result<()> {
+        self.ensure_healthy()?;
+        self.validate(lease)?;
+        if self.active == Some(lease) {
+            return Ok(());
+        }
+        // Aktywne lease współdzielą jeden stream, więc ich praca jest już
+        // uporządkowana; event jest potrzebny dopiero między generacjami slotu.
+        let slot = &mut self.slots[lease.slot];
+        if slot.ready_recorded {
+            self.device.wait_event(stream, &slot.ready)?;
+            slot.ready_recorded = false;
+        }
+        if slot.initialized_generation != lease.generation {
+            for state in slot.layers.iter().flatten() {
+                self.device
+                    .copy(&self.zero_conv, 0, &state.conv, 0, self.conv_bytes, stream)?;
+                self.device.copy(
+                    &self.zero_state,
+                    0,
+                    &state.state,
+                    0,
+                    self.state_bytes,
+                    stream,
+                )?;
+            }
+            slot.initialized_generation = lease.generation;
+        }
+        self.active = Some(lease);
+        Ok(())
+    }
+
+    fn release(&mut self, lease: HybridStateLease, stream: &Stream) -> Result<()> {
+        self.ensure_healthy()?;
+        self.validate(lease)?;
+        let record_result = self
+            .device
+            .record_event(&self.slots[lease.slot].ready, stream);
+        self.finish_release(lease, record_result, || stream.synchronize())
+    }
+
+    fn finish_release(
+        &mut self,
+        lease: HybridStateLease,
+        record_result: Result<()>,
+        synchronize: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let event_recorded = match record_result {
+            Ok(()) => true,
+            Err(record_error) => match synchronize() {
+                Ok(()) => {
+                    if let Err(zero_error) = self.zero_slot_synchronously(lease.slot) {
+                        let reason = format!(
+                            "record eventu nie powiódł się ({record_error}); po synchronizacji nie udało się wyzerować slotu ({zero_error})"
+                        );
+                        self.poisoned = Some(reason.clone());
+                        return Err(ForgeError::Device(reason));
+                    }
+                    tracing::warn!(
+                        "record eventu zwolnienia stanu hybrydowego nie powiódł się; stream został zsynchronizowany: {record_error}"
+                    );
+                    false
+                }
+                Err(sync_error) => {
+                    let reason = format!(
+                        "record eventu nie powiódł się ({record_error}); synchronizacja streamu także nie powiodła się ({sync_error})"
+                    );
+                    self.poisoned = Some(reason.clone());
+                    return Err(ForgeError::Device(reason));
+                }
+            },
+        };
+        let slot = &mut self.slots[lease.slot];
+        slot.ready_recorded = event_recorded;
+        if self.active == Some(lease) {
+            self.active = None;
+        }
+        slot.in_use = false;
+        if let (Some(kv), Some(mtp)) = (&mut self.mtp_kv, &mut slot.mtp) {
+            mtp.release(kv);
+        }
+        self.free.push(lease.slot);
+        Ok(())
+    }
+
+    fn zero_slot_synchronously(&self, slot_index: usize) -> Result<()> {
+        let zero_conv = unsafe {
+            std::slice::from_raw_parts(
+                self.zero_conv.host_ptr().expect("pinned host mapping"),
+                self.conv_bytes,
+            )
+        };
+        let zero_state = unsafe {
+            std::slice::from_raw_parts(
+                self.zero_state.host_ptr().expect("pinned host mapping"),
+                self.state_bytes,
+            )
+        };
+        for state in self.slots[slot_index].layers.iter().flatten() {
+            self.device.write(zero_conv, &state.conv, 0)?;
+            self.device.write(zero_state, &state.state, 0)?;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self, lease: HybridStateLease, stream: &Stream) -> Result<()> {
+        self.activate(lease, stream)?;
+        let slot = &mut self.slots[lease.slot];
+        for state in slot.layers.iter().flatten() {
+            self.device
+                .copy(&self.zero_conv, 0, &state.conv, 0, self.conv_bytes, stream)?;
+            self.device.copy(
+                &self.zero_state,
+                0,
+                &state.state,
+                0,
+                self.state_bytes,
+                stream,
+            )?;
+        }
+        slot.initialized_generation = lease.generation;
+        Ok(())
+    }
+
+    fn active_layers(&self) -> &[Option<SsmState>] {
+        let active = self.active.expect("stan hybrydowy został aktywowany");
+        &self.slots[active.slot].layers
+    }
+
+    fn state_buffers(
+        &self,
+        lease: HybridStateLease,
+        layer: usize,
+    ) -> Result<Option<(DevBuffer, DevBuffer)>> {
+        self.validate(lease)?;
+        Ok(self.slots[lease.slot]
+            .layers
+            .get(layer)
+            .ok_or_else(|| ForgeError::Scheduler("warstwa stanu hybrydowego poza zakresem".into()))?
+            .as_ref()
+            .map(|state| (state.conv.clone(), state.state.clone())))
+    }
+
+    fn has_mtp(&self) -> bool {
+        self.mtp_kv.is_some() && self.mtp_shape.is_some()
+    }
+
+    fn take_mtp(&mut self, lease: HybridStateLease) -> Result<(MtpDraftState, KvCache)> {
+        self.ensure_healthy()?;
+        self.validate(lease)?;
+        let kv = self.mtp_kv.take().ok_or_else(|| {
+            ForgeError::Unsupported("współdzielony cache MTP nie został zaalokowany".into())
+        })?;
+        let state = match self.slots[lease.slot].mtp.take() {
+            Some(state) => state,
+            None => {
+                self.mtp_kv = Some(kv);
+                return Err(ForgeError::Scheduler(
+                    "stan MTP aktywnej sekwencji jest już używany".into(),
+                ));
+            }
+        };
+        Ok((state, kv))
+    }
+
+    fn take_mtp_pair(
+        &mut self,
+        leases: [HybridStateLease; 2],
+    ) -> Result<([MtpDraftState; 2], KvCache)> {
+        self.ensure_healthy()?;
+        if leases[0].slot == leases[1].slot {
+            return Err(ForgeError::Scheduler(
+                "para MTP wymaga dwóch różnych slotów".into(),
+            ));
+        }
+        self.validate(leases[0])?;
+        self.validate(leases[1])?;
+        let kv = self.mtp_kv.take().ok_or_else(|| {
+            ForgeError::Unsupported("współdzielony cache MTP nie został zaalokowany".into())
+        })?;
+        let first = match self.slots[leases[0].slot].mtp.take() {
+            Some(state) => state,
+            None => {
+                self.mtp_kv = Some(kv);
+                return Err(ForgeError::Scheduler(
+                    "pierwszy stan pary MTP jest już używany".into(),
+                ));
+            }
+        };
+        let second = match self.slots[leases[1].slot].mtp.take() {
+            Some(state) => state,
+            None => {
+                self.slots[leases[0].slot].mtp = Some(first);
+                self.mtp_kv = Some(kv);
+                return Err(ForgeError::Scheduler(
+                    "drugi stan pary MTP jest już używany".into(),
+                ));
+            }
+        };
+        Ok(([first, second], kv))
+    }
+
+    fn restore_mtp(
+        &mut self,
+        lease: HybridStateLease,
+        state: MtpDraftState,
+        kv: KvCache,
+    ) -> Result<()> {
+        let preflight = self
+            .ensure_healthy()
+            .and_then(|_| self.validate(lease))
+            .and_then(|_| {
+                if self.mtp_kv.is_some() || self.slots[lease.slot].mtp.is_some() {
+                    Err(ForgeError::Scheduler(
+                        "próba podwójnego przywrócenia stanu MTP".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = preflight {
+            let reason = format!("przywrócenie stanu MTP nie powiodło się: {error}");
+            return Err(self.quarantine_mtp(reason, [state], kv));
+        }
+        self.mtp_kv = Some(kv);
+        self.slots[lease.slot].mtp = Some(state);
+        Ok(())
+    }
+
+    fn restore_mtp_pair(
+        &mut self,
+        leases: [HybridStateLease; 2],
+        states: [MtpDraftState; 2],
+        kv: KvCache,
+    ) -> Result<()> {
+        let preflight = self
+            .ensure_healthy()
+            .and_then(|_| {
+                if leases[0].slot == leases[1].slot {
+                    Err(ForgeError::Scheduler(
+                        "para MTP wymaga dwóch różnych slotów".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|_| self.validate(leases[0]))
+            .and_then(|_| self.validate(leases[1]))
+            .and_then(|_| {
+                if self.mtp_kv.is_some()
+                    || self.slots[leases[0].slot].mtp.is_some()
+                    || self.slots[leases[1].slot].mtp.is_some()
+                {
+                    Err(ForgeError::Scheduler(
+                        "próba podwójnego przywrócenia pary stanów MTP".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = preflight {
+            let reason = format!("przywrócenie pary stanów MTP nie powiodło się: {error}");
+            return Err(self.quarantine_mtp(reason, states, kv));
+        }
+        let [first, second] = states;
+        self.mtp_kv = Some(kv);
+        self.slots[leases[0].slot].mtp = Some(first);
+        self.slots[leases[1].slot].mtp = Some(second);
+        Ok(())
+    }
+
+    fn mtp_host_embedding_gathers(&self) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.mtp.as_ref())
+            .map(MtpDraftState::host_embedding_gathers)
+            .sum()
+    }
 }
 
 /// Single-token scratch for the hybrid (gated-attention + DeltaNet) forward.
@@ -421,10 +1165,12 @@ struct DecodeBufs {
     sample_out: DevBuffer,
     /// Pinned-host landing buffer for the 8-byte sampling result.
     pinned_sample: DevBuffer,
-    /// Device-resident distinct-token list for the repetition penalty.
+    /// Histogram kar samplingu przechowywany na urządzeniu.
     penalty_ids: DevBuffer,
-    /// Pinned-host staging for `penalty_ids`.
+    penalty_counts: DevBuffer,
+    /// Przypięty bufor hosta do przygotowania histogramu kar.
     pinned_penalty: DevBuffer,
+    pinned_penalty_counts: DevBuffer,
 }
 
 /// Persistent prefill scratch sized for MAX_PREFILL_CHUNK tokens. Activation
@@ -460,6 +1206,272 @@ struct VerifyBufs {
     pinned_ids: DevBuffer,
 }
 
+/// Sposób przechowania danych potrzebnych do zatwierdzenia stanu DeltaNet.
+enum DeltaVerifyCommit {
+    InPlacePrefill,
+    Retained {
+        checkpoint_byte_offset: usize,
+    },
+    Recompute {
+        q: DevBuffer,
+        k: DevBuffer,
+        v: DevBuffer,
+        g: DevBuffer,
+        beta: DevBuffer,
+    },
+}
+
+/// Dane jednej warstwy DeltaNet potrzebne do zatwierdzenia prefiksu.
+struct DeltaVerifyCache {
+    commit: DeltaVerifyCommit,
+    conv_initial: DevBuffer,
+    conv_checkpoints: DevBuffer,
+    state_initial: DevBuffer,
+}
+
+/// Bufory krótkiego, warstwowego przebiegu weryfikacyjnego modelu hybrydowego.
+struct HybridVerifyBufs {
+    cap: usize,
+    base_pos: DevBuffer,
+    visible_lens: DevBuffer,
+    q_full: DevBuffer,
+    qc: DevBuffer,
+    gatec: DevBuffer,
+    gated: DevBuffer,
+    qkv_mixed: DevBuffer,
+    z: DevBuffer,
+    q32: DevBuffer,
+    k32: DevBuffer,
+    vtok: DevBuffer,
+    alpha: DevBuffer,
+    beta_raw: DevBuffer,
+    g: DevBuffer,
+    beta_f: DevBuffer,
+    o: DevBuffer,
+    normed: DevBuffer,
+    state_checkpoints: DevBuffer,
+    retained_state_checkpoints: Option<DevBuffer>,
+    accepted: DevBuffer,
+    pinned_decision: DevBuffer,
+    host_staging: Vec<HybridHostStaging>,
+    delta: Vec<Option<DeltaVerifyCache>>,
+}
+
+struct MtpB2DeltaCache {
+    conv_initial: DevBuffer,
+    conv_checkpoints: DevBuffer,
+    state_initial: DevBuffer,
+    q: DevBuffer,
+    k: DevBuffer,
+    v: DevBuffer,
+    g: DevBuffer,
+    beta: DevBuffer,
+}
+
+struct HybridPrefillB2DeltaCache {
+    conv_initial: DevBuffer,
+    state_initial: DevBuffer,
+    q: DevBuffer,
+    k: DevBuffer,
+    v: DevBuffer,
+    g: DevBuffer,
+    beta: DevBuffer,
+}
+
+struct MtpB2Bufs {
+    q_full: DevBuffer,
+    qc: DevBuffer,
+    gatec: DevBuffer,
+    gated: DevBuffer,
+    qkv_mixed: DevBuffer,
+    z: DevBuffer,
+    alpha: DevBuffer,
+    beta_raw: DevBuffer,
+    o: DevBuffer,
+    normed: DevBuffer,
+    page_tables: DevBuffer,
+    base_positions: DevBuffer,
+    visible_lens: DevBuffer,
+    decisions: DevBuffer,
+    pinned_decisions: DevBuffer,
+    pinned_metadata: DevBuffer,
+    pinned_mtp_metadata: DevBuffer,
+    catchup_embeddings: DevBuffer,
+    mtp_initial_hidden: DevBuffer,
+    mtp_seq_lens: DevBuffer,
+    mtp_positions: DevBuffer,
+    selected_states: DevBuffer,
+    selected_conv: DevBuffer,
+    selected_hidden: DevBuffer,
+    delta: Vec<Option<MtpB2DeltaCache>>,
+}
+
+struct HybridPrefillB2Bufs {
+    h: DevBuffer,
+    x: DevBuffer,
+    k: DevBuffer,
+    v: DevBuffer,
+    attn_out: DevBuffer,
+    o_out: DevBuffer,
+    gate: DevBuffer,
+    up: DevBuffer,
+    act: DevBuffer,
+    down: DevBuffer,
+    ids: DevBuffer,
+    positions: DevBuffer,
+    q_full: DevBuffer,
+    qc: DevBuffer,
+    gatec: DevBuffer,
+    gated: DevBuffer,
+    qkv_mixed: DevBuffer,
+    z: DevBuffer,
+    alpha: DevBuffer,
+    beta_raw: DevBuffer,
+    o: DevBuffer,
+    normed: DevBuffer,
+    page_tables: DevBuffer,
+    base_positions: DevBuffer,
+    visible_lens: DevBuffer,
+    decisions: DevBuffer,
+    final_hidden: DevBuffer,
+    logits: DevBuffer,
+    pinned_metadata: DevBuffer,
+    pinned_logits: DevBuffer,
+    final_conv: DevBuffer,
+    final_states: DevBuffer,
+    delta: Vec<Option<HybridPrefillB2DeltaCache>>,
+}
+
+type MtpB2Verification = ([(Vec<u32>, usize, u32); 2], [usize; 2]);
+
+struct HybridHostStaging {
+    embedding: DevBuffer,
+    page_table: DevBuffer,
+    ids: DevBuffer,
+    positions: DevBuffer,
+    visible_lens: DevBuffer,
+    base_pos: DevBuffer,
+    accepted: DevBuffer,
+    mtp_page_table: DevBuffer,
+    mtp_positions: DevBuffer,
+    mtp_visible_lens: DevBuffer,
+    mtp_base_pos: DevBuffer,
+    mtp_seq_len: DevBuffer,
+    mtp_position: DevBuffer,
+    ready: Event,
+}
+
+fn alloc_checked(
+    device: &dyn Device,
+    name: &str,
+    dimensions: &[usize],
+    element_bytes: usize,
+    kind: MemKind,
+) -> Result<DevBuffer> {
+    let bytes = dimensions
+        .iter()
+        .try_fold(element_bytes, |size, &dimension| {
+            size.checked_mul(dimension).ok_or_else(|| {
+                ForgeError::Scheduler(format!(
+                    "przepełnienie rozmiaru bufora {name}: {dimensions:?}"
+                ))
+            })
+        })?;
+    device.alloc(bytes, kind, Pool::Activations)
+}
+
+fn write_pinned(src: &[u8], dst: &DevBuffer) -> Result<()> {
+    if src.len() > dst.len() {
+        return Err(ForgeError::Scheduler(format!(
+            "dane stagingu mają {} bajtów, bufor ma {}",
+            src.len(),
+            dst.len()
+        )));
+    }
+    let host = dst
+        .host_ptr()
+        .ok_or_else(|| ForgeError::Device("bufor stagingu nie ma mapowania hosta".into()))?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), host, src.len());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn native_mtp_greedy_decision(draft: &[u32], predictions: &[i32]) -> (usize, u32) {
+    debug_assert_eq!(predictions.len(), draft.len() + 1);
+    let mut accepted = 0usize;
+    while accepted < draft.len() && predictions[accepted] as u32 == draft[accepted] {
+        accepted += 1;
+    }
+    (accepted, predictions[accepted] as u32)
+}
+
+fn finish_greedy_verification(
+    kv: &mut KvCache,
+    page_table_seq: &mut u64,
+    seq: &mut SeqKv,
+    base: usize,
+    result: Result<(usize, u32)>,
+) -> Result<(usize, u32)> {
+    let result = match result {
+        Ok((accepted, correction)) => {
+            let target_len = accepted
+                .checked_add(1)
+                .and_then(|retained| base.checked_add(retained));
+            match target_len {
+                Some(target_len) if target_len <= seq.len => {
+                    kv.rollback(seq, target_len);
+                    Ok((accepted, correction))
+                }
+                _ => {
+                    if seq.len >= base {
+                        kv.rollback(seq, base);
+                    }
+                    Err(ForgeError::Scheduler(
+                        "invalid speculative verification rollback target".into(),
+                    ))
+                }
+            }
+        }
+        Err(error) => {
+            if seq.len >= base {
+                kv.rollback(seq, base);
+            }
+            Err(error)
+        }
+    };
+    *page_table_seq = 0;
+    result
+}
+
+fn logical_kv_regions(
+    pages: &[i32],
+    seq_len: usize,
+    page_size: usize,
+    n_heads: usize,
+    head_bytes: usize,
+) -> Vec<(usize, usize)> {
+    let page_head_bytes = page_size * head_bytes;
+    let page_bytes = n_heads * page_head_bytes;
+    let mut regions = Vec::with_capacity(pages.len() * n_heads);
+    let mut remaining = seq_len;
+    for &page in pages {
+        if remaining == 0 {
+            break;
+        }
+        let tokens = remaining.min(page_size);
+        for head in 0..n_heads {
+            regions.push((
+                page as usize * page_bytes + head * page_head_bytes,
+                tokens * head_bytes,
+            ));
+        }
+        remaining -= tokens;
+    }
+    regions
+}
+
 /// Persistent continuous-batching decode scratch sized for `cap` sequences.
 /// Activation matrices are `[cap, cols]` row-major (the batched GEMM/attention
 /// kernels consume them directly, one row per active sequence). Per-step inputs
@@ -488,6 +1500,8 @@ struct BatchBufs {
     /// Pinned staging: [ids | positions | seq_lens], i32, cap each.
     pinned_meta: DevBuffer,
     pinned_pt: DevBuffer,
+    /// Pinned embeddingi modeli hybrydowych `[cap, hidden]` f16.
+    pinned_embed: DevBuffer,
     /// Per-seq sampling params (device + pinned staging).
     samp_k: DevBuffer,
     samp_inv_t: DevBuffer,
@@ -496,14 +1510,19 @@ struct BatchBufs {
     samp_seed: DevBuffer,
     samp_step: DevBuffer,
     pinned_samp: DevBuffer,
-    /// Repetition-penalty staging: flat distinct-id list, prefix offsets,
-    /// per-seq penalty.
+    /// Histogramy kar: płaskie IDs i liczniki, offsety oraz parametry sekwencji.
     pen_ids: DevBuffer,
+    pen_counts: DevBuffer,
     pen_offsets: DevBuffer,
     pen_vals: DevBuffer,
+    pen_frequency: DevBuffer,
+    pen_presence: DevBuffer,
     pinned_pen_ids: DevBuffer,
+    pinned_pen_counts: DevBuffer,
     pinned_pen_offsets: DevBuffer,
     pinned_pen_vals: DevBuffer,
+    pinned_pen_frequency: DevBuffer,
+    pinned_pen_presence: DevBuffer,
     out_ids: DevBuffer,
     pinned_out: DevBuffer,
 }
@@ -531,9 +1550,19 @@ struct MoeBufs {
     shared_scale: DevBuffer,
 }
 
+pub(crate) fn hybrid_prefill_b2_backend_capable(vendor: Vendor, warp_size: u32) -> bool {
+    vendor == Vendor::Nvidia && warp_size == 32
+}
+
 impl Model {
+    fn target_kv_layer(&self, global_layer: usize) -> usize {
+        self.kv
+            .layer_index(global_layer)
+            .expect("cache KV jest dostępny wyłącznie dla warstwy attention")
+    }
+
     pub fn load_gguf(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Result<Self> {
-        let weights = ModelWeights::load_gguf(&device, path)?;
+        let weights = ModelWeights::load_gguf(&device, path, cfg.native_mtp)?;
         Self::finish(device, weights, cfg)
     }
 
@@ -542,11 +1571,11 @@ impl Model {
         dir: &Path,
         cfg: ModelConfig,
     ) -> Result<Self> {
-        let weights = ModelWeights::load_safetensors_dir(&device, dir)?;
+        let weights = ModelWeights::load_safetensors_dir(&device, dir, cfg.native_mtp)?;
         Self::finish(device, weights, cfg)
     }
 
-    fn finish(device: Arc<dyn Device>, weights: ModelWeights, cfg: ModelConfig) -> Result<Self> {
+    fn finish(device: Arc<dyn Device>, mut weights: ModelWeights, cfg: ModelConfig) -> Result<Self> {
         let p = &weights.descriptor.params;
         // head_dim 256 has an f16-only attention specialization (qwen35moe
         // gated attention layers); the hybrid arch always uses the f16 cache.
@@ -605,10 +1634,24 @@ impl Model {
         }
         let max_pages_per_seq = cfg.max_seq_len.div_ceil(cfg.kv_page_size);
         let kernels = Kernels::load(device.clone())?;
-        let kv = KvCache::new(
+        if weights.descriptor.layer_kinds.len() != p.block_count {
+            return Err(ForgeError::Format(format!(
+                "mapa typów warstw ma {} wpisów, oczekiwano {}",
+                weights.descriptor.layer_kinds.len(),
+                p.block_count
+            )));
+        }
+        let kv_layer_map = KvLayerMap::from_attention_mask(
+            weights
+                .descriptor
+                .layer_kinds
+                .iter()
+                .map(|kind| matches!(kind, forge_formats::LayerKind::Attention)),
+        );
+        let kv = KvCache::new_mapped(
             device.as_ref(),
             KvConfig {
-                n_layers: p.block_count,
+                n_layers: kv_layer_map.kv_layers(),
                 n_kv_heads: p.n_kv_heads,
                 head_dim: p.head_dim,
                 page_size: cfg.kv_page_size,
@@ -616,8 +1659,57 @@ impl Model {
                 max_pages_per_seq,
                 quant: cfg.kv_quant,
             },
+            kv_layer_map,
         )?;
         let stream = device.create_stream()?;
+        let draft_head_mode = std::env::var("FORGE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "q8".into());
+        match draft_head_mode.as_str() {
+            "q8" => {}
+            "nvfp4" => {
+                let (source, rows, cols) = match weights.mtp.as_ref().map(|mtp| &mtp.output) {
+                    Some(DevWeight::Q8_0 { buf, rows, cols }) => (buf.clone(), *rows, *cols),
+                    Some(_) => {
+                        return Err(ForgeError::Unsupported(
+                            "FORGE_MTP_DRAFT_HEAD=nvfp4 wymaga headu źródłowego Q8_0".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(ForgeError::Unsupported(
+                            "FORGE_MTP_DRAFT_HEAD=nvfp4 wymaga modelu z MTP".into(),
+                        ));
+                    }
+                };
+                let bytes = rows
+                    .checked_mul(cols / 64)
+                    .and_then(|blocks| blocks.checked_mul(36))
+                    .ok_or_else(|| {
+                        ForgeError::Format("przepełnienie rozmiaru headu draftu NVFP4".into())
+                    })?;
+                if let Some(available) = device.pool_available(Pool::Weights) {
+                    if bytes > available {
+                        return Err(ForgeError::OutOfMemory {
+                            requested: bytes,
+                            available,
+                        });
+                    }
+                }
+                let packed = device.alloc(bytes, MemKind::Device, Pool::Weights)?;
+                kernels.pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)?;
+                device.synchronize()?;
+                weights.mtp.as_mut().expect("sprawdzono head MTP").draft_output =
+                    Some(DevWeight::NvFp4Gguf {
+                        buf: packed,
+                        output_scale: 1.0,
+                        rows,
+                        cols,
+                    });
+            }
+            value => {
+                return Err(ForgeError::Unsupported(format!(
+                    "FORGE_MTP_DRAFT_HEAD={value}: oczekiwano q8 lub nvfp4"
+                )));
+            }
+        }
         let page_table_dev = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
         let seq_len_dev = device.alloc(4, MemKind::Device, Pool::Weights)?;
         let (tier, tier_bufs) = if cfg.kv_tier.enabled() {
@@ -635,7 +1727,8 @@ impl Model {
                 });
             }
             let identity: Vec<i32> = (0..max_pages_per_seq as i32).collect();
-            let identity_pt = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
+            let identity_pt =
+                device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
             device.write(bytemuck::cast_slice(&identity), &identity_pt, 0)?;
             // Tier only the attention layers: for a dense/rot model that is
             // every layer (`layer_kinds` is all-Attention, so behavior is
@@ -667,9 +1760,20 @@ impl Model {
             (None, None)
         };
         let hidden = p.hidden_size;
-        let q_dim = p.n_heads * p.head_dim;
+        let q_dim = p
+            .n_heads
+            .checked_mul(p.head_dim)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie wymiaru Q verifiera MTP".into()))?;
         let kv_dim = p.n_kv_heads * p.head_dim;
         let inter = p.intermediate_size;
+        let attn_parts_bytes = p
+            .n_heads
+            .checked_mul(ATTN_DECODE_GQA_SPLITS)
+            .and_then(|elements| elements.checked_mul(p.head_dim.checked_add(2)?))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| {
+                ForgeError::Format("przepełnienie bufora partiali attention GQA".into())
+            })?;
         // Persistent decode scratch lives in the activation pool: it is the
         // pool provisioned for exactly this purpose, and nothing else uses it
         // on the LLM path anymore (the ring never needs to wrap).
@@ -683,11 +1787,7 @@ impl Model {
             k: alloc(kv_dim)?,
             v: alloc(kv_dim)?,
             attn_out: alloc(q_dim)?,
-            attn_parts: device.alloc(
-                p.n_heads * ATTN_DECODE_SPLITS * (p.head_dim + 2) * 4,
-                MemKind::Device,
-                Pool::Activations,
-            )?,
+            attn_parts: device.alloc(attn_parts_bytes, MemKind::Device, Pool::Activations)?,
             o_out: alloc(hidden)?,
             gate_up: alloc(2 * inter)?,
             gate: alloc(inter)?,
@@ -698,8 +1798,16 @@ impl Model {
             ids: device.alloc(4, MemKind::Device, Pool::Activations)?,
             pos: device.alloc(4, MemKind::Device, Pool::Activations)?,
             pinned_in: device.alloc(12, MemKind::PinnedHost, Pool::Activations)?,
-            pinned_pt: device.alloc(max_pages_per_seq * 4, MemKind::PinnedHost, Pool::Activations)?,
-            pinned_logits: device.alloc(p.vocab_size * 4, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_pt: device.alloc(
+                max_pages_per_seq * 4,
+                MemKind::PinnedHost,
+                Pool::Activations,
+            )?,
+            pinned_logits: device.alloc(
+                p.vocab_size * 4,
+                MemKind::PinnedHost,
+                Pool::Activations,
+            )?,
             sample_vals: device.alloc(
                 forge_kernels::SAMPLE_SCRATCH_PAIRS * 4,
                 MemKind::Device,
@@ -713,7 +1821,17 @@ impl Model {
             sample_out: device.alloc(8, MemKind::Device, Pool::Activations)?,
             pinned_sample: device.alloc(8, MemKind::PinnedHost, Pool::Activations)?,
             penalty_ids: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
-            pinned_penalty: device.alloc(cfg.max_seq_len * 4, MemKind::PinnedHost, Pool::Activations)?,
+            penalty_counts: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
+            pinned_penalty: device.alloc(
+                cfg.max_seq_len * 4,
+                MemKind::PinnedHost,
+                Pool::Activations,
+            )?,
+            pinned_penalty_counts: device.alloc(
+                cfg.max_seq_len * 4,
+                MemKind::PinnedHost,
+                Pool::Activations,
+            )?,
         };
         let moe_bufs = match &weights.descriptor.params.moe {
             Some(m) => {
@@ -723,7 +1841,11 @@ impl Model {
                     ids: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
                     weights: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
                     pinned_ids: device.alloc(idw * 4, MemKind::PinnedHost, Pool::Activations)?,
-                    pinned_weights: device.alloc(idw * 4, MemKind::PinnedHost, Pool::Activations)?,
+                    pinned_weights: device.alloc(
+                        idw * 4,
+                        MemKind::PinnedHost,
+                        Pool::Activations,
+                    )?,
                     xrow: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
                     tmp: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
                     pinned_shared: device.alloc(2, MemKind::PinnedHost, Pool::Activations)?,
@@ -739,26 +1861,35 @@ impl Model {
             }
             None => None,
         };
-        // Gated-DeltaNet recurrent state, one entry per DeltaNet layer (hybrid
-        // arch only). Allocated once and reused; zeroed at each sequence start.
-        let ssm = match &weights.descriptor.params.ssm {
+        let mtp_config = weights.mtp.as_ref().map(|_| {
+            (
+                KvConfig {
+                    n_layers: 1,
+                    n_kv_heads: p.n_kv_heads,
+                    head_dim: p.head_dim,
+                    page_size: cfg.kv_page_size,
+                    n_pages: cfg.kv_pages,
+                    max_pages_per_seq,
+                    quant: KvQuant::F16,
+                },
+                hidden,
+                p.vocab_size,
+            )
+        });
+        // Pula stanów DeltaNet i MTP rośnie wraz z liczbą przeplatanych sekwencji.
+        let hybrid_states = match &weights.descriptor.params.ssm {
             Some(sp) => {
                 let conv_bytes = sp.conv_dim() * (sp.d_conv - 1) * 2;
                 let state_bytes = sp.n_v_heads() * sp.d_state * sp.d_state * 4;
-                weights
-                    .descriptor
-                    .layer_kinds
-                    .iter()
-                    .map(|k| match k {
-                        forge_formats::LayerKind::DeltaNet => Ok(Some(SsmState {
-                            conv: device.alloc(conv_bytes, MemKind::Device, Pool::Weights)?,
-                            state: device.alloc(state_bytes, MemKind::Device, Pool::Weights)?,
-                        })),
-                        forge_formats::LayerKind::Attention => Ok(None),
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                Some(HybridStatePool::new(
+                    device.clone(),
+                    weights.descriptor.layer_kinds.clone(),
+                    conv_bytes,
+                    state_bytes,
+                    mtp_config,
+                )?)
             }
-            None => Vec::new(),
+            None => None,
         };
         // Prefix caching is a strict optimization: engage only where a borrowed
         // prefix page is byte-identical to a fresh prefill and never mutated.
@@ -785,6 +1916,12 @@ impl Model {
             bufs,
             prefill_bufs: None,
             verify_bufs: None,
+            hybrid_verify_bufs: None,
+            mtp_b2_bufs: None,
+            hybrid_prefill_bufs: None,
+            hybrid_prefill_b2_bufs: None,
+            hybrid_verify_graphs: HashMap::new(),
+            hybrid_verify_graph_disabled: HashSet::new(),
             decode_graph: None,
             decode_moe_graph: None,
             decode_rot_graph: None,
@@ -795,19 +1932,184 @@ impl Model {
             tier_bufs,
             pt_seq: 0,
             moe_bufs,
-            ssm,
+            hybrid_states,
             hybrid_bufs: None,
             hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
             prefix_cache,
             calib: None,
+            prefill_profiles: VecDeque::new(),
         })
+    }
+
+    /// Przygotowuje wszystkie eventy przed startem workera, aby ich alokacja
+    /// nie wchodziła do TTFT mierzonego żądania.
+    pub fn prepare_prefill_profiles(&mut self, prompt_tokens: usize, runs: usize) -> Result<()> {
+        if prompt_tokens == 0 || runs == 0 {
+            return Err(ForgeError::Scheduler(
+                "profil prefill wymaga dodatniej liczby tokenów i przebiegów".into(),
+            ));
+        }
+        if !self.prefill_profiles.is_empty() {
+            return Err(ForgeError::Scheduler(
+                "profil prefill został już przygotowany".into(),
+            ));
+        }
+        let hybrid = self.is_hybrid();
+        let hybrid_batched = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
+            .map_or(true, |value| value != "0")
+            && prompt_tokens > 1
+            && self.validate_hybrid_speculation_target().is_ok();
+        let target_spans = if hybrid_batched {
+            hybrid_prefill_profile_spans(prompt_tokens, hybrid_prefill_chunk_size())
+        } else if hybrid {
+            prompt_tokens
+        } else {
+            prompt_tokens.div_ceil(MAX_PREFILL_CHUNK)
+        };
+        for _ in 0..runs {
+            let mut target = Vec::with_capacity(target_spans);
+            for _ in 0..target_spans {
+                target.push(ProfileSpan {
+                    start: self.device.create_timing_event()?,
+                    end: self.device.create_timing_event()?,
+                });
+            }
+            let catchup_spans = if hybrid_batched {
+                target_spans
+            } else if hybrid {
+                prompt_tokens
+            } else {
+                0
+            };
+            let mut catchup = Vec::with_capacity(catchup_spans);
+            if hybrid {
+                for _ in 0..catchup_spans {
+                    catchup.push(ProfileSpan {
+                        start: self.device.create_timing_event()?,
+                        end: self.device.create_timing_event()?,
+                    });
+                }
+            }
+            self.prefill_profiles.push_back(PrefillProfileRun {
+                target,
+                catchup,
+                target_cursor: 0,
+                catchup_cursor: 0,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn take_prefill_profile(&mut self) -> Result<Option<PrefillProfile>> {
+        let Some(run) = self.prefill_profiles.pop_front() else {
+            return Ok(None);
+        };
+        if run.target_cursor != run.target.len() || run.catchup_cursor != run.catchup.len() {
+            return Err(ForgeError::Scheduler(format!(
+                "niepełny profil prefill: target {}/{}, MTP {}/{}",
+                run.target_cursor,
+                run.target.len(),
+                run.catchup_cursor,
+                run.catchup.len()
+            )));
+        }
+        let target_gpu_ms = self.sum_profile_spans(&run.target)?;
+        let mtp_catchup_gpu_ms = self.sum_profile_spans(&run.catchup)?;
+        Ok(Some(PrefillProfile {
+            target_gpu_ms,
+            mtp_catchup_gpu_ms,
+        }))
+    }
+
+    fn sum_profile_spans(&self, spans: &[ProfileSpan]) -> Result<Option<f64>> {
+        if spans.is_empty() {
+            return Ok(Some(0.0));
+        }
+        let mut total = 0.0;
+        for span in spans {
+            let Some(ms) = self.device.elapsed_event_ms(&span.start, &span.end)? else {
+                return Ok(None);
+            };
+            total += f64::from(ms);
+        }
+        Ok(Some(total))
+    }
+
+    fn profile_target_start(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front() else {
+            return Ok(());
+        };
+        let span = run.target.get(run.target_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil target prefill przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.start, &self.stream)
+    }
+
+    fn profile_target_end(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front_mut() else {
+            return Ok(());
+        };
+        let span = run.target.get(run.target_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil target prefill przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.end, &self.stream)?;
+        run.target_cursor += 1;
+        Ok(())
+    }
+
+    fn profile_catchup_start(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front() else {
+            return Ok(());
+        };
+        let span = run.catchup.get(run.catchup_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil MTP catch-up przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.start, &self.stream)
+    }
+
+    fn profile_catchup_end(&mut self) -> Result<()> {
+        let Some(run) = self.prefill_profiles.front_mut() else {
+            return Ok(());
+        };
+        let span = run.catchup.get(run.catchup_cursor).ok_or_else(|| {
+            ForgeError::Scheduler("profil MTP catch-up przekroczył pojemność".into())
+        })?;
+        self.device.record_event(&span.end, &self.stream)?;
+        run.catchup_cursor += 1;
+        Ok(())
     }
 
     pub fn new_seq(&self) -> SeqKv {
         self.kv.new_seq()
     }
 
+    /// Rezerwuje pamięć stanów targetu i MTP przed dopuszczeniem wielu requestów.
+    pub fn preflight_hybrid_state_slots(&mut self, slots: usize) -> Result<()> {
+        if slots == 0 {
+            return Err(ForgeError::Scheduler(
+                "preflight wymaga co najmniej jednego slotu".into(),
+            ));
+        }
+        self.hybrid_states
+            .as_mut()
+            .ok_or_else(|| ForgeError::Unsupported("model nie jest hybrydowy".into()))?
+            .ensure_capacity(slots)
+    }
+
     pub fn release_seq(&mut self, seq: &mut SeqKv) {
+        if let Some(lease) = seq.hybrid_state {
+            let release = self
+                .hybrid_states
+                .as_mut()
+                .expect("lease hybrydowy wymaga puli")
+                .release(lease, &self.stream);
+            match release {
+                Ok(()) => seq.hybrid_state = None,
+                Err(error) => {
+                    tracing::error!("nie można bezpiecznie zwolnić stanu hybrydowego: {error}");
+                }
+            }
+        }
         if let Some(t) = &mut self.tier {
             t.drop_seq(seq);
         }
@@ -815,6 +2117,123 @@ impl Model {
             self.finalize_prefix(seq);
         }
         self.kv.release(seq);
+    }
+
+    fn activate_hybrid_sequence(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let pool = self.hybrid_states.as_mut().ok_or_else(|| {
+            ForgeError::Scheduler("model hybrydowy nie ma puli stanów DeltaNet".into())
+        })?;
+        let lease = match seq.hybrid_state {
+            Some(lease) => lease,
+            None => {
+                let lease = pool.acquire()?;
+                seq.hybrid_state = Some(lease);
+                lease
+            }
+        };
+        pool.activate(lease, &self.stream)
+    }
+
+    fn active_ssm(&self) -> &[Option<SsmState>] {
+        self.hybrid_states
+            .as_ref()
+            .expect("model hybrydowy ma pulę stanów")
+            .active_layers()
+    }
+
+    fn take_mtp_runtime(
+        &mut self,
+        seq: &mut SeqKv,
+    ) -> Result<(HybridStateLease, MtpDraftState, KvCache)> {
+        self.activate_hybrid_sequence(seq)?;
+        let lease = seq
+            .hybrid_state
+            .expect("aktywacja przydzieliła lease hybrydowy");
+        let (state, kv) = self
+            .hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .take_mtp(lease)?;
+        Ok((lease, state, kv))
+    }
+
+    fn take_mtp_runtime_pair(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+    ) -> Result<([HybridStateLease; 2], [MtpDraftState; 2], KvCache)> {
+        self.activate_hybrid_sequence(seqs[0])?;
+        let first = seqs[0]
+            .hybrid_state
+            .expect("aktywacja przydzieliła pierwszy lease hybrydowy");
+        self.activate_hybrid_sequence(seqs[1])?;
+        let second = seqs[1]
+            .hybrid_state
+            .expect("aktywacja przydzieliła drugi lease hybrydowy");
+        let leases = [first, second];
+        let (states, kv) = self
+            .hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .take_mtp_pair(leases)?;
+        Ok((leases, states, kv))
+    }
+
+    fn restore_mtp_runtime(
+        &mut self,
+        lease: HybridStateLease,
+        state: MtpDraftState,
+        kv: KvCache,
+    ) -> Result<()> {
+        self.hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .restore_mtp(lease, state, kv)
+    }
+
+    fn poison_mtp_runtime(&mut self, reason: String) -> ForgeError {
+        self.hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .poison(reason)
+    }
+
+    fn finish_mtp_runtime<T>(
+        &mut self,
+        lease: HybridStateLease,
+        state: MtpDraftState,
+        kv: KvCache,
+        result: Result<T>,
+    ) -> Result<T> {
+        match (result, self.restore_mtp_runtime(lease, state, kv)) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(restore_error)) => Err(restore_error),
+            (Err(error), Err(restore_error)) => Err(ForgeError::Scheduler(format!(
+                "błąd wykonania MTP: {error}; błąd przywrócenia lease: {restore_error}"
+            ))),
+        }
+    }
+
+    fn finish_mtp_runtime_pair<T>(
+        &mut self,
+        leases: [HybridStateLease; 2],
+        states: [MtpDraftState; 2],
+        kv: KvCache,
+        result: Result<T>,
+    ) -> Result<T> {
+        let restore = self
+            .hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .restore_mtp_pair(leases, states, kv);
+        match (result, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(restore_error)) => Err(restore_error),
+            (Err(error), Err(restore_error)) => Err(ForgeError::Scheduler(format!(
+                "błąd wykonania pary MTP: {error}; błąd przywrócenia lease: {restore_error}"
+            ))),
+        }
     }
 
     pub fn tier_enabled(&self) -> bool {
@@ -954,7 +2373,7 @@ impl Model {
         if self.tier.is_some() {
             self.max_pages_per_seq
         } else {
-            self.kv.cfg.n_pages
+            self.kv.cfg.n_pages.min(self.max_pages_per_seq)
         }
     }
 
@@ -1072,6 +2491,9 @@ impl Model {
         }
         self.kv.release(seq);
         self.pt_seq = 0;
+        if let (Some(pool), Some(lease)) = (&mut self.hybrid_states, seq.hybrid_state) {
+            pool.reset(lease, &self.stream)?;
+        }
         for chunk in toks.chunks(MAX_PREFILL_CHUNK) {
             if self.is_hybrid() {
                 self.prefill_hybrid(seq, chunk)?;
@@ -1094,14 +2516,16 @@ impl Model {
             }
             DevWeight::Q8_0 { buf, rows, cols } => {
                 if *cols <= Kernels::DP4A_MAX_COLS {
-                    self.kernels.gemv_q8_0_dp4a_f16(y, buf, x, *rows, *cols, stream)
+                    self.kernels
+                        .gemv_q8_0_dp4a_f16(y, buf, x, *rows, *cols, stream)
                 } else {
                     self.kernels.gemv_q8_0_f16(y, buf, x, *rows, *cols, stream)
                 }
             }
             DevWeight::Q4K { buf, rows, cols } => {
                 if *cols <= Kernels::DP4A_MAX_COLS {
-                    self.kernels.gemv_q4_k_dp4a_f16(y, buf, x, *rows, *cols, stream)
+                    self.kernels
+                        .gemv_q4_k_dp4a_f16(y, buf, x, *rows, *cols, stream)
                 } else {
                     self.kernels.gemv_q4_k_f16(y, buf, x, *rows, *cols, stream)
                 }
@@ -1130,30 +2554,30 @@ impl Model {
             DevWeight::Q5_1 { buf, rows, cols } => {
                 self.kernels.gemv_q5_1_f16(y, buf, x, *rows, *cols, stream)
             }
-            DevWeight::Iq4Nl { buf, rows, cols } => {
-                self.kernels.gemv_iq4_nl_f16(y, buf, x, *rows, *cols, stream)
-            }
-            DevWeight::Iq4Xs { buf, rows, cols } => {
-                self.kernels.gemv_iq4_xs_f16(y, buf, x, *rows, *cols, stream)
-            }
+            DevWeight::Iq4Nl { buf, rows, cols } => self
+                .kernels
+                .gemv_iq4_nl_f16(y, buf, x, *rows, *cols, stream),
+            DevWeight::Iq4Xs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq4_xs_f16(y, buf, x, *rows, *cols, stream),
             DevWeight::Mxfp4 { buf, rows, cols } => {
                 self.kernels.gemv_mxfp4_f16(y, buf, x, *rows, *cols, stream)
             }
-            DevWeight::Iq2Xs { buf, rows, cols } => {
-                self.kernels.gemv_iq2_xs_f16(y, buf, x, *rows, *cols, stream)
-            }
+            DevWeight::Iq2Xs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq2_xs_f16(y, buf, x, *rows, *cols, stream),
             DevWeight::Iq2S { buf, rows, cols } => {
                 self.kernels.gemv_iq2_s_f16(y, buf, x, *rows, *cols, stream)
             }
             DevWeight::Iq3S { buf, rows, cols } => {
                 self.kernels.gemv_iq3_s_f16(y, buf, x, *rows, *cols, stream)
             }
-            DevWeight::Iq2Xxs { buf, rows, cols } => {
-                self.kernels.gemv_iq2_xxs_f16(y, buf, x, *rows, *cols, stream)
-            }
-            DevWeight::Iq3Xxs { buf, rows, cols } => {
-                self.kernels.gemv_iq3_xxs_f16(y, buf, x, *rows, *cols, stream)
-            }
+            DevWeight::Iq2Xxs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq2_xxs_f16(y, buf, x, *rows, *cols, stream),
+            DevWeight::Iq3Xxs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq3_xxs_f16(y, buf, x, *rows, *cols, stream),
             DevWeight::Iq1S { buf, rows, cols } => {
                 self.kernels.gemv_iq1_s_f16(y, buf, x, *rows, *cols, stream)
             }
@@ -1176,7 +2600,90 @@ impl Model {
                 *inv_global_scale,
                 stream,
             ),
+            DevWeight::NvFp4Gguf {
+                buf,
+                output_scale,
+                rows,
+                cols,
+            } => {
+                if self.device.caps().vendor == Vendor::Nvidia {
+                    self.kernels.gemv_nvfp4_gguf_b1_f16(
+                        y,
+                        buf,
+                        x,
+                        *rows,
+                        *cols,
+                        *output_scale,
+                        stream,
+                    )
+                } else {
+                    self.kernels.gemv_nvfp4_gguf_q8_1_group_f16(
+                        &[Nvfp4GgufQ8Projection {
+                            output: y,
+                            weights: buf,
+                            rows: *rows,
+                            output_scale: *output_scale,
+                        }],
+                        x,
+                        *cols,
+                        stream,
+                    )
+                }
+            }
         }
+    }
+
+    /// Wykonuje kilka pełnych projekcji GGUF NVFP4 ze wspólną kwantyzacją
+    /// aktywacji Q8_1. Zwraca `false`, gdy choć jedna waga ma inny format.
+    fn gemv_nvfp4_gguf_group(
+        &self,
+        projections: &[(&DevBuffer, &DevWeight)],
+        x: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let mut cols = None;
+        let mut group = Vec::with_capacity(projections.len());
+        for &(output, weight) in projections {
+            let DevWeight::NvFp4Gguf {
+                buf,
+                output_scale,
+                rows,
+                cols: weight_cols,
+            } = weight
+            else {
+                return Ok(false);
+            };
+            if cols.is_some_and(|value| value != *weight_cols) {
+                return Err(ForgeError::Format(
+                    "projekcje NVFP4 współdzielące Q8_1 mają różne szerokości".into(),
+                ));
+            }
+            cols = Some(*weight_cols);
+            group.push(Nvfp4GgufQ8Projection {
+                output,
+                weights: buf,
+                rows: *rows,
+                output_scale: *output_scale,
+            });
+        }
+        let Some(cols) = cols else { return Ok(false) };
+        if self.device.caps().vendor == Vendor::Nvidia {
+            for projection in group {
+                self.kernels.gemv_nvfp4_gguf_b1_f16(
+                    projection.output,
+                    projection.weights,
+                    x,
+                    projection.rows,
+                    cols,
+                    projection.output_scale,
+                    stream,
+                )?;
+            }
+        } else {
+            self.kernels
+                .gemv_nvfp4_gguf_q8_1_group_f16(&group, x, cols, stream)?;
+        }
+        Ok(true)
     }
 
     /// True when `w` can be consumed by the fused decode kernels
@@ -1186,6 +2693,7 @@ impl Model {
             DevWeight::F16 { cols, .. } => cols.is_multiple_of(8),
             DevWeight::Q8_0 { cols, .. } => cols.is_multiple_of(32),
             DevWeight::NvFp4 { cols, .. } => cols.is_multiple_of(16),
+            DevWeight::NvFp4Gguf { .. } => false,
             // Q4_K stages per-32-column x sums in shared memory
             // (Q4K_MAX_SEGS in gemv2.mojo bounds cols at 32768).
             DevWeight::Q4K { cols, .. } => cols.is_multiple_of(256) && *cols <= 32768,
@@ -1270,10 +2778,28 @@ impl Model {
         let b = &self.bufs;
         match w {
             DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_q8_0_dp4a_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::NvFp4 {
                 packed,
@@ -1296,62 +2822,236 @@ impl Model {
                 stream,
             ),
             DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_q4_k_dp4a_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_q6_k_dp4a_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q5K { buf, rows, cols } => self.kernels.gemv_norm_q5_k_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q3K { buf, rows, cols } => self.kernels.gemv_norm_q3_k_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q2K { buf, rows, cols } => self.kernels.gemv_norm_q2_k_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q4_0 { buf, rows, cols } => self.kernels.gemv_norm_q4_0_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q4_1 { buf, rows, cols } => self.kernels.gemv_norm_q4_1_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q5_0 { buf, rows, cols } => self.kernels.gemv_norm_q5_0_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Q5_1 { buf, rows, cols } => self.kernels.gemv_norm_q5_1_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq4Nl { buf, rows, cols } => self.kernels.gemv_norm_iq4_nl_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq4Xs { buf, rows, cols } => self.kernels.gemv_norm_iq4_xs_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Mxfp4 { buf, rows, cols } => self.kernels.gemv_norm_mxfp4_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq2Xs { buf, rows, cols } => self.kernels.gemv_norm_iq2_xs_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq2S { buf, rows, cols } => self.kernels.gemv_norm_iq2_s_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq3S { buf, rows, cols } => self.kernels.gemv_norm_iq3_s_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq2Xxs { buf, rows, cols } => self.kernels.gemv_norm_iq2_xxs_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq3Xxs { buf, rows, cols } => self.kernels.gemv_norm_iq3_xxs_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq1S { buf, rows, cols } => self.kernels.gemv_norm_iq1_s_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
             DevWeight::Iq1M { buf, rows, cols } => self.kernels.gemv_norm_iq1_m_f16(
-                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+                y,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                ss_from_h16,
+                eps,
+                stream,
             ),
+            DevWeight::NvFp4Gguf { .. } => Err(ForgeError::Unsupported(
+                "scalony gemv_norm nie obsługuje jeszcze GGUF NVFP4".into(),
+            )),
         }
     }
 
@@ -1368,10 +3068,26 @@ impl Model {
         let b = &self.bufs;
         match w {
             DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_silu_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q8_0_dp4a_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::NvFp4 {
                 packed,
@@ -1393,62 +3109,217 @@ impl Model {
                 stream,
             ),
             DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_k_dp4a_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_silu_q6_k_dp4a_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q5K { buf, rows, cols } => self.kernels.gemv_norm_silu_q5_k_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q3K { buf, rows, cols } => self.kernels.gemv_norm_silu_q3_k_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q2K { buf, rows, cols } => self.kernels.gemv_norm_silu_q2_k_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q4_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_0_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q4_1 { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_1_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q5_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q5_0_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Q5_1 { buf, rows, cols } => self.kernels.gemv_norm_silu_q5_1_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq4Nl { buf, rows, cols } => self.kernels.gemv_norm_silu_iq4_nl_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq4Xs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq4_xs_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Mxfp4 { buf, rows, cols } => self.kernels.gemv_norm_silu_mxfp4_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq2Xs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq2_xs_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq2S { buf, rows, cols } => self.kernels.gemv_norm_silu_iq2_s_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq3S { buf, rows, cols } => self.kernels.gemv_norm_silu_iq3_s_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq2Xxs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq2_xxs_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq3Xxs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq3_xxs_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq1S { buf, rows, cols } => self.kernels.gemv_norm_silu_iq1_s_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
             DevWeight::Iq1M { buf, rows, cols } => self.kernels.gemv_norm_silu_iq1_m_f16(
-                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+                act,
+                buf,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                eps,
+                stream,
             ),
+            DevWeight::NvFp4Gguf { .. } => Err(ForgeError::Unsupported(
+                "scalony gemv_norm_silu nie obsługuje jeszcze GGUF NVFP4".into(),
+            )),
         }
     }
 
@@ -1558,11 +3429,35 @@ impl Model {
             DevWeight::Iq1M { buf, rows, cols } => self
                 .kernels
                 .gemv_residual_iq1_m_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::NvFp4Gguf { .. } => Err(ForgeError::Unsupported(
+                "scalony gemv_residual nie obsługuje jeszcze GGUF NVFP4".into(),
+            )),
         }
     }
 
     fn logits_gemv(&self, y_f32: &DevBuffer, x: &DevBuffer, stream: &Stream) -> Result<()> {
-        match &self.weights.lm_head {
+        if let Some(weight) = &self.weights.fp8_lm_head {
+            return self.kernels.gemv_fp8_out_f32(
+                y_f32,
+                &weight.qweight,
+                &weight.scales,
+                x,
+                weight.rows,
+                weight.cols,
+                stream,
+            );
+        }
+        self.logits_weight_gemv(y_f32, x, &self.weights.lm_head, stream)
+    }
+
+    fn logits_weight_gemv(
+        &self,
+        y_f32: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevWeight,
+        stream: &Stream,
+    ) -> Result<()> {
+        match weight {
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
                 .gemv_f16_out_f32(y_f32, buf, x, *rows, *cols, stream),
@@ -1574,7 +3469,8 @@ impl Model {
                     self.kernels
                         .gemv_q4_k_dp4a_out_f32(y_f32, buf, x, *rows, *cols, stream)
                 } else {
-                    self.kernels.gemv_q4_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                    self.kernels
+                        .gemv_q4_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
                 }
             }
             DevWeight::Q6K { buf, rows, cols } => {
@@ -1582,7 +3478,8 @@ impl Model {
                     self.kernels
                         .gemv_q6_k_dp4a_out_f32(y_f32, buf, x, *rows, *cols, stream)
                 } else {
-                    self.kernels.gemv_q6_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                    self.kernels
+                        .gemv_q6_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
                 }
             }
             DevWeight::Q5K { buf, rows, cols } => self
@@ -1639,6 +3536,20 @@ impl Model {
             DevWeight::NvFp4 { .. } => Err(ForgeError::Unsupported(
                 "NVFP4 lm_head has no f32-logit kernel yet".into(),
             )),
+            DevWeight::NvFp4Gguf {
+                buf,
+                output_scale,
+                rows,
+                cols,
+            } => self.kernels.gemv_nvfp4_gguf_out_f32(
+                y_f32,
+                buf,
+                x,
+                *rows,
+                *cols,
+                *output_scale,
+                stream,
+            ),
         }
     }
 
@@ -1652,6 +3563,47 @@ impl Model {
         stream: &Stream,
     ) -> Result<()> {
         self.gemm_rows(y, w, x, n_tokens, 0, w.rows(), stream)
+    }
+
+    fn delta_input_q8_cols(delta: &DeltaNetWeights) -> Option<usize> {
+        let weights = [&delta.gate_proj, &delta.alpha_proj, &delta.beta_proj];
+        let mut shared_cols = None;
+        for weight in weights {
+            let DevWeight::Q8_0 { cols, .. } = weight else {
+                return None;
+            };
+            if shared_cols.is_some_and(|value| value != *cols) {
+                return None;
+            }
+            shared_cols = Some(*cols);
+        }
+        shared_cols
+    }
+
+    fn gemm_q8_prepared(
+        &self,
+        y: &DevBuffer,
+        weight: &DevWeight,
+        prepared: &mut Q8ActPrepared<'_>,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let DevWeight::Q8_0 {
+            buf, rows, cols, ..
+        } = weight
+        else {
+            return Err(ForgeError::Format(
+                "przygotowana grupa DeltaNet wymaga wag Q8_0".into(),
+            ));
+        };
+        self.kernels.gemm_q8_0_i8mma_prepared_at(
+            y,
+            buf,
+            0,
+            prepared,
+            *rows,
+            *cols,
+            n_tokens,
+        )
     }
 
     /// W4A8 prefill projection GEMM (per-token int8 activation quant + int4xint8
@@ -1695,8 +3647,9 @@ impl Model {
                 y, &w.qweight, &w.scales, x, w.rows, w.cols, n_tokens, stream,
             );
         }
-        self.kernels
-            .gemm_fp8(y, &w.qweight, &w.scales, x, w.rows, w.cols, n_tokens, stream)
+        self.kernels.gemm_fp8(
+            y, &w.qweight, &w.scales, x, w.rows, w.cols, n_tokens, stream,
+        )
     }
 
     /// fp8mod projection over the shared per-token e4m3 activation the preceding
@@ -1709,9 +3662,8 @@ impl Model {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        self.kernels.gemm_fp8_modular_prequant(
-            y, &w.qweight, &w.scales, w.rows, w.cols, n_tokens, stream,
-        )
+        self.kernels
+            .gemm_fp8_modular_prequant(y, &w.qweight, &w.scales, w.rows, w.cols, n_tokens, stream)
     }
 
     /// Batched GEMM over a row window of `w`: y = W[row_off..row_off+n_rows]·x.
@@ -1966,6 +3918,24 @@ impl Model {
                 *inv_global_scale,
                 stream,
             ),
+            DevWeight::NvFp4Gguf {
+                buf,
+                output_scale,
+                rows,
+                cols,
+            } if row_off == 0 && n_rows == *rows => self.kernels.gemm_nvfp4_gguf_f16(
+                y,
+                buf,
+                x,
+                *rows,
+                *cols,
+                n_tokens,
+                *output_scale,
+                stream,
+            ),
+            DevWeight::NvFp4Gguf { .. } => Err(ForgeError::Unsupported(
+                "GGUF NVFP4 GEMM nie obsługuje okna wierszy".into(),
+            )),
         }
     }
 
@@ -1986,12 +3956,26 @@ impl Model {
         stream: &Stream,
     ) -> Result<()> {
         match w {
-            DevWeight::Q4K { buf, cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
-                .kernels
-                .gemv_q4_k_dp4a_f16_at(y, buf, row_off * (cols / 256) * 144, x, n_rows, *cols, stream),
-            DevWeight::Q6K { buf, cols, .. } => self
-                .kernels
-                .gemv_q6_k_f16_at(y, buf, row_off * (cols / 256) * 210, x, n_rows, *cols, stream),
+            DevWeight::Q4K { buf, cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => {
+                self.kernels.gemv_q4_k_dp4a_f16_at(
+                    y,
+                    buf,
+                    row_off * (cols / 256) * 144,
+                    x,
+                    n_rows,
+                    *cols,
+                    stream,
+                )
+            }
+            DevWeight::Q6K { buf, cols, .. } => self.kernels.gemv_q6_k_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 210,
+                x,
+                n_rows,
+                *cols,
+                stream,
+            ),
             _ => self.gemm_rows(y, w, x, 1, row_off, n_rows, stream),
         }
     }
@@ -2033,12 +4017,30 @@ impl Model {
         stream: &Stream,
     ) -> Result<()> {
         match w {
-            DevWeight::Q4K { buf, cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
-                .kernels
-                .gemv_q4_k_dp4a_f16_gidx(y, buf, x, n_rows, *cols, ids, sel, rows_per_expert, stream),
-            DevWeight::Q6K { buf, cols, .. } => self
-                .kernels
-                .gemv_q6_k_f16_gidx(y, buf, x, n_rows, *cols, ids, sel, rows_per_expert, stream),
+            DevWeight::Q4K { buf, cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => {
+                self.kernels.gemv_q4_k_dp4a_f16_gidx(
+                    y,
+                    buf,
+                    x,
+                    n_rows,
+                    *cols,
+                    ids,
+                    sel,
+                    rows_per_expert,
+                    stream,
+                )
+            }
+            DevWeight::Q6K { buf, cols, .. } => self.kernels.gemv_q6_k_f16_gidx(
+                y,
+                buf,
+                x,
+                n_rows,
+                *cols,
+                ids,
+                sel,
+                rows_per_expert,
+                stream,
+            ),
             _ => Err(ForgeError::Unsupported(
                 "gemv_rows_gidx called for a non-gidx expert quant".into(),
             )),
@@ -2054,10 +4056,20 @@ impl Model {
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
         let inter = p.intermediate_size;
-        let t_max = MAX_PREFILL_CHUNK;
+        let t_max = if self.is_hybrid() {
+            hybrid_prefill_chunk_size().max(4)
+        } else {
+            MAX_PREFILL_CHUNK
+        };
         let alloc = |elems: usize| {
             self.device
                 .alloc(elems * 2, MemKind::Device, Pool::Activations)
+        };
+        let gate = alloc(t_max * inter)?;
+        let act = if self.is_hybrid() {
+            gate.clone()
+        } else {
+            alloc(t_max * inter)?
         };
         self.prefill_bufs = Some(PrefillBufs {
             h: alloc(t_max * hidden)?,
@@ -2067,9 +4079,9 @@ impl Model {
             v: alloc(t_max * kv_dim)?,
             attn_out: alloc(t_max * q_dim)?,
             o_out: alloc(t_max * hidden)?,
-            gate: alloc(t_max * inter)?,
+            gate,
             up: alloc(t_max * inter)?,
-            act: alloc(t_max * inter)?,
+            act,
             down: alloc(t_max * hidden)?,
             ids: self
                 .device
@@ -2184,13 +4196,21 @@ impl Model {
         // path was an MMQ-only perf optimization (one shared DS4 activation across
         // q/k/v & gate/up); it was retired with the CUDA MMQ kernel. The
         // shared-activation reuse can be re-added on top of the native kernel later.
-        let fp8mod_fuse =
-            self.weights.fp8.is_some() && self.weights.fp8_modular && calib.is_none();
+        let fp8mod_fuse = self.weights.fp8.is_some() && self.weights.fp8_modular && calib.is_none();
+        let fp8mod_ffn_fuse =
+            self.weights.fp8_ffn.is_some() && self.weights.fp8_modular && calib.is_none();
 
         let mut trace = PrefillTrace::new();
         trace.start(self.device.as_ref());
 
-        kernels.gather_rows_f16(&pb.h, &self.weights.token_embd_f16, &pb.ids, t, hidden, stream)?;
+        kernels.gather_rows_f16(
+            &pb.h,
+            &self.weights.token_embd_f16,
+            &pb.ids,
+            t,
+            hidden,
+            stream,
+        )?;
         // Layer 0's attn-norm feeds the q/k/v projections.
         if fp8mod_fuse {
             kernels.rmsnorm_fp8_shared(
@@ -2203,7 +4223,15 @@ impl Model {
                 stream,
             )?;
         } else {
-            kernels.rmsnorm_f16(&pb.x, &pb.h, &self.weights.layers[0].attn_norm, t, hidden, eps, stream)?;
+            kernels.rmsnorm_f16(
+                &pb.x,
+                &pb.h,
+                &self.weights.layers[0].attn_norm,
+                t,
+                hidden,
+                eps,
+                stream,
+            )?;
         }
         trace.mark(self.device.as_ref(), "embed");
 
@@ -2216,11 +4244,18 @@ impl Model {
             // loaded for decode + the logit head.
             let w4a8_layer = self.weights.w4a8.as_ref().map(|v| &v[l]);
             let fp8_layer = self.weights.fp8.as_ref().map(|v| &v[l]);
+            let fp8_ffn_layer = self.weights.fp8_ffn.as_ref().map(|v| &v[l]);
 
             // Calibration capture 1/4: q/k/v input (attn-norm output).
             if let Some(cal) = calib.as_mut() {
                 self.device.synchronize()?;
-                CalibAccum::absorb(self.device.as_ref(), &pb.x, &mut cal.attn_in[l], t, &mut cal.scratch)?;
+                CalibAccum::absorb(
+                    self.device.as_ref(),
+                    &pb.x,
+                    &mut cal.attn_in[l],
+                    t,
+                    &mut cal.scratch,
+                )?;
             }
 
             // Prefill outputs must stay [T, dim] contiguous per projection
@@ -2242,6 +4277,22 @@ impl Model {
                     self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
                     self.gemm_fp8(&pb.k, &fl.k, &pb.x, t, stream)?;
                     self.gemm_fp8(&pb.v, &fl.v, &pb.x, t, stream)?;
+                }
+            } else if let Some(fl) = fp8_ffn_layer {
+                self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
+                match &layer.attn().attn_qkv {
+                    QkvWeights::Fused(w) => {
+                        self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
+                    }
+                    QkvWeights::FusedQk { qk, v } => {
+                        self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                    }
+                    QkvWeights::Split { k, v, .. } => {
+                        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                    }
                 }
             } else {
                 match &layer.attn().attn_qkv {
@@ -2272,19 +4323,51 @@ impl Model {
                 if p.qk_norm_over_hidden {
                     kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t, q_dim, eps, stream)?;
                 } else {
-                    kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, p.head_dim, eps, stream)?;
+                    kernels.rmsnorm_f16(
+                        &pb.q,
+                        &pb.q,
+                        qn,
+                        t * p.n_heads,
+                        p.head_dim,
+                        eps,
+                        stream,
+                    )?;
                 }
             }
             if let Some(kn) = &layer.attn().k_norm {
                 if p.qk_norm_over_hidden {
                     kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t, kv_dim, eps, stream)?;
                 } else {
-                    kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t * p.n_kv_heads, p.head_dim, eps, stream)?;
+                    kernels.rmsnorm_f16(
+                        &pb.k,
+                        &pb.k,
+                        kn,
+                        t * p.n_kv_heads,
+                        p.head_dim,
+                        eps,
+                        stream,
+                    )?;
                 }
             }
 
-            kernels.rope_neox_f16(&pb.q, &pb.positions, t, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-            kernels.rope_neox_f16(&pb.k, &pb.positions, t, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+            kernels.rope_neox_f16(
+                &pb.q,
+                &pb.positions,
+                t,
+                p.n_heads,
+                p.head_dim,
+                p.rope_theta,
+                stream,
+            )?;
+            kernels.rope_neox_f16(
+                &pb.k,
+                &pb.positions,
+                t,
+                p.n_kv_heads,
+                p.head_dim,
+                p.rope_theta,
+                stream,
+            )?;
             trace.mark(self.device.as_ref(), "norm_rope");
 
             if let KvQuant::Rot { bits, .. } = self.kv.cfg.quant {
@@ -2299,12 +4382,12 @@ impl Model {
                     .ring_slots()
                     .expect("rot mode has ring_slots");
                 kernels.kv_pack_rot(
-                    &self.kv.k_packed[l],
-                    &self.kv.v_packed[l],
-                    &self.kv.k_scale[l],
-                    &self.kv.v_scale[l],
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k_packed[self.target_kv_layer(l)],
+                    &self.kv.v_packed[self.target_kv_layer(l)],
+                    &self.kv.k_scale[self.target_kv_layer(l)],
+                    &self.kv.v_scale[self.target_kv_layer(l)],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &pb.k,
                     0,
                     &pb.v,
@@ -2325,7 +4408,10 @@ impl Model {
                     // pages; staging pulls the full logical history (spilled
                     // chunks + resident pages) so the causal attention sees
                     // every position through the identity page table.
-                    let tier = self.tier.as_ref().expect("streamed prefill requires tiering");
+                    let tier = self
+                        .tier
+                        .as_ref()
+                        .expect("streamed prefill requires tiering");
                     let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                     let slot = &tb.slots[0];
                     tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
@@ -2351,10 +4437,10 @@ impl Model {
                     kernels.attn_prefill_rot(
                         &pb.attn_out,
                         &pb.q,
-                        &self.kv.k_packed[l],
-                        &self.kv.v_packed[l],
-                        &self.kv.k_scale[l],
-                        &self.kv.v_scale[l],
+                        &self.kv.k_packed[self.target_kv_layer(l)],
+                        &self.kv.v_packed[self.target_kv_layer(l)],
+                        &self.kv.k_scale[self.target_kv_layer(l)],
+                        &self.kv.v_scale[self.target_kv_layer(l)],
                         &self.page_table_dev,
                         base_pos,
                         t,
@@ -2372,8 +4458,8 @@ impl Model {
                 // Causal attention reads the chunk's own K/V from the cache, so
                 // the batch append must land before the attention launch.
                 kernels.kv_append_batch(
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &pb.k,
                     &pb.v,
                     &self.page_table_dev,
@@ -2387,7 +4473,10 @@ impl Model {
                 )?;
                 trace.mark(self.device.as_ref(), "kv_append");
                 if streamed {
-                    let tier = self.tier.as_ref().expect("streamed prefill requires tiering");
+                    let tier = self
+                        .tier
+                        .as_ref()
+                        .expect("streamed prefill requires tiering");
                     let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                     let slot = &tb.slots[0];
                     tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
@@ -2411,8 +4500,8 @@ impl Model {
                     kernels.attn_prefill(
                         &pb.attn_out,
                         &pb.q,
-                        &self.kv.k[l],
-                        &self.kv.v[l],
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
                         &self.page_table_dev,
                         base_pos,
                         t,
@@ -2431,30 +4520,61 @@ impl Model {
             // Calibration capture 2/4: o_proj input (attention output).
             if let Some(cal) = calib.as_mut() {
                 self.device.synchronize()?;
-                CalibAccum::absorb(self.device.as_ref(), &pb.attn_out, &mut cal.attn_out[l], t, &mut cal.scratch)?;
+                CalibAccum::absorb(
+                    self.device.as_ref(),
+                    &pb.attn_out,
+                    &mut cal.attn_out[l],
+                    t,
+                    &mut cal.scratch,
+                )?;
             }
             if let Some(wl) = w4a8_layer {
                 self.gemm_w4a8(&pb.o_out, &wl.attn_o, &pb.attn_out, t, stream)?;
             } else if let Some(fl) = fp8_layer {
                 self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, t, stream)?;
+            } else if let Some(fl) = fp8_ffn_layer {
+                self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, t, stream)?;
             } else {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
             }
             trace.mark(self.device.as_ref(), "gemm_o");
-            let fp8mod_fuse_gateup = fp8mod_fuse && matches!(layer.ffn, LayerFfn::Dense(_));
+            let fp8mod_fuse_gateup =
+                (fp8mod_fuse || fp8mod_ffn_fuse) && matches!(layer.ffn, LayerFfn::Dense(_));
             if fp8mod_fuse_gateup {
                 kernels.rmsnorm_residual_fp8_shared(
-                    &pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream,
+                    &pb.x,
+                    &pb.h,
+                    &pb.o_out,
+                    &layer.ffn_norm,
+                    t,
+                    hidden,
+                    eps,
+                    stream,
                 )?;
             } else {
-                kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream)?;
+                kernels.rmsnorm_residual_f16(
+                    &pb.x,
+                    &pb.h,
+                    &pb.o_out,
+                    &layer.ffn_norm,
+                    t,
+                    hidden,
+                    eps,
+                    stream,
+                )?;
             }
             trace.mark(self.device.as_ref(), "norm_res");
 
             // Calibration capture 3/4: gate/up input (ffn-norm output).
             if let Some(cal) = calib.as_mut() {
                 self.device.synchronize()?;
-                CalibAccum::absorb(self.device.as_ref(), &pb.x, &mut cal.ffn_in[l], t, &mut cal.scratch)?;
+                CalibAccum::absorb(
+                    self.device.as_ref(),
+                    &pb.x,
+                    &mut cal.ffn_in[l],
+                    t,
+                    &mut cal.scratch,
+                )?;
             }
 
             match &layer.ffn {
@@ -2470,6 +4590,9 @@ impl Model {
                             self.gemm_fp8(&pb.gate, &fl.gate, &pb.x, t, stream)?;
                             self.gemm_fp8(&pb.up, &fl.up, &pb.x, t, stream)?;
                         }
+                    } else if let Some(fl) = fp8_ffn_layer {
+                        self.gemm_fp8_prequant(&pb.gate, &fl.gate, t, stream)?;
+                        self.gemm_fp8_prequant(&pb.up, &fl.up, t, stream)?;
                     } else {
                         match &dffn.gate_up {
                             GateUpWeights::Fused(w) => {
@@ -2488,11 +4611,19 @@ impl Model {
                     // Calibration capture 4/4: down_proj input (SwiGLU output).
                     if let Some(cal) = calib.as_mut() {
                         self.device.synchronize()?;
-                        CalibAccum::absorb(self.device.as_ref(), &pb.act, &mut cal.down_in[l], t, &mut cal.scratch)?;
+                        CalibAccum::absorb(
+                            self.device.as_ref(),
+                            &pb.act,
+                            &mut cal.down_in[l],
+                            t,
+                            &mut cal.scratch,
+                        )?;
                     }
                     if let Some(wl) = w4a8_layer {
                         self.gemm_w4a8(&pb.down, &wl.down, &pb.act, t, stream)?;
                     } else if let Some(fl) = fp8_layer {
+                        self.gemm_fp8(&pb.down, &fl.down, &pb.act, t, stream)?;
+                    } else if let Some(fl) = fp8_ffn_layer {
                         self.gemm_fp8(&pb.down, &fl.down, &pb.act, t, stream)?;
                     } else {
                         self.gemm(&pb.down, &dffn.down, &pb.act, t, stream)?;
@@ -2518,7 +4649,9 @@ impl Model {
                     &pb.x, &pb.h, &pb.down, next_norm, t, hidden, eps, stream,
                 )?;
             } else {
-                kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.down, next_norm, t, hidden, eps, stream)?;
+                kernels.rmsnorm_residual_f16(
+                    &pb.x, &pb.h, &pb.down, next_norm, t, hidden, eps, stream,
+                )?;
             }
             trace.mark(self.device.as_ref(), "norm_res2");
         }
@@ -2554,11 +4687,7 @@ impl Model {
         }
         let p = &self.weights.descriptor.params;
         let n_layers = self.weights.layers.len();
-        let (hidden, q_dim, inter) = (
-            p.hidden_size,
-            p.n_heads * p.head_dim,
-            p.intermediate_size,
-        );
+        let (hidden, q_dim, inter) = (p.hidden_size, p.n_heads * p.head_dim, p.intermediate_size);
         // Default is the identity requant (no SmoothQuant): measured best on the
         // Q4_K→W4A8 path, where the two-level requant error dominates and
         // migrating activation outliers only inflates the weights (see
@@ -2627,6 +4756,270 @@ impl Model {
         Ok(())
     }
 
+    fn pack_nvfp4_rows(
+        &self,
+        weight: &DevWeight,
+        row_offset: usize,
+        rows: usize,
+    ) -> Result<Fp8Weight> {
+        let DevWeight::NvFp4 {
+            packed,
+            scales,
+            inv_global_scale,
+            rows: source_rows,
+            cols,
+        } = weight
+        else {
+            return Err(ForgeError::Unsupported(
+                "fp8mod-ffn wymaga rezydentnych wag NVFP4".into(),
+            ));
+        };
+        let row_end = row_offset
+            .checked_add(rows)
+            .ok_or_else(|| ForgeError::Format("przepełnienie zakresu wierszy FP8".into()))?;
+        if row_end > *source_rows {
+            return Err(ForgeError::Format(format!(
+                "zakres wierszy FP8 {}..{} przekracza {source_rows}",
+                row_offset, row_end
+            )));
+        }
+        let weight_bytes = rows
+            .checked_mul(*cols)
+            .ok_or_else(|| ForgeError::OutOfMemory {
+                requested: usize::MAX,
+                available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+            })?;
+        let scale_bytes = rows.checked_mul(4).ok_or_else(|| ForgeError::OutOfMemory {
+            requested: usize::MAX,
+            available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+        })?;
+        let qweight = self
+            .device
+            .alloc(weight_bytes, MemKind::Device, Pool::Weights)?;
+        let output_scales = self
+            .device
+            .alloc(scale_bytes, MemKind::Device, Pool::Weights)?;
+        self.kernels.pack_nvfp4_fp8(
+            &qweight,
+            &output_scales,
+            packed,
+            scales,
+            *cols,
+            row_offset,
+            rows,
+            *inv_global_scale,
+            &self.stream,
+        )?;
+        Ok(Fp8Weight {
+            qweight,
+            scales: output_scales,
+            rows,
+            cols: *cols,
+        })
+    }
+
+    fn pack_f16_weight(&self, weight: &DevWeight) -> Result<Fp8Weight> {
+        let DevWeight::F16 { buf, rows, cols } = weight else {
+            return Err(ForgeError::Unsupported(
+                "przepakowanie lm_head FP8 wymaga źródła F16".into(),
+            ));
+        };
+        let weight_bytes = rows
+            .checked_mul(*cols)
+            .ok_or_else(|| ForgeError::OutOfMemory {
+                requested: usize::MAX,
+                available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+            })?;
+        let scale_bytes = rows.checked_mul(4).ok_or_else(|| ForgeError::OutOfMemory {
+            requested: usize::MAX,
+            available: self.device.pool_available(Pool::Weights).unwrap_or(0),
+        })?;
+        let qweight = self
+            .device
+            .alloc(weight_bytes, MemKind::Device, Pool::Weights)?;
+        let scales = self
+            .device
+            .alloc(scale_bytes, MemKind::Device, Pool::Weights)?;
+        self.kernels
+            .pack_f16_fp8(&qweight, &scales, buf, *cols, *rows, &self.stream)?;
+        Ok(Fp8Weight {
+            qweight,
+            scales,
+            rows: *rows,
+            cols: *cols,
+        })
+    }
+
+    fn fp8_pack_allocation_bytes(rows: usize, cols: usize) -> Option<usize> {
+        let weight = rows
+            .checked_mul(cols)?
+            .max(1)
+            .checked_next_multiple_of(256)?;
+        let scales = rows.checked_mul(4)?.max(1).checked_next_multiple_of(256)?;
+        weight.checked_add(scales)
+    }
+
+    fn preflight_nvfp4_pack(
+        &self,
+        weight: &DevWeight,
+        row_offset: usize,
+        rows: usize,
+    ) -> Option<usize> {
+        let DevWeight::NvFp4 {
+            rows: source_rows,
+            cols,
+            ..
+        } = weight
+        else {
+            return None;
+        };
+        let row_end = row_offset.checked_add(rows)?;
+        if rows == 0
+            || row_end > *source_rows
+            || !cols.is_multiple_of(16)
+            || !self.kernels.supports_fp8_modular_shape(rows, *cols)
+        {
+            return None;
+        }
+        Self::fp8_pack_allocation_bytes(rows, *cols)
+    }
+
+    /// Buduje na GPU opt-in paczki FP8 dla Q/O oraz projekcji FFN checkpointu NVFP4.
+    pub fn build_fp8_ffn(&mut self) -> Result<bool> {
+        if self.weights.fp8_ffn.is_some() {
+            return Ok(true);
+        }
+        if !self.device.caps().fp8_native
+            || !self.kernels.supports_fp8_hybrid_packers()
+            || !self.kernels.supports_fp8_logits()
+        {
+            return Ok(false);
+        }
+        if self.is_hybrid() || self.weights.is_moe() {
+            return Ok(false);
+        }
+        let mut required_bytes = 0usize;
+        let mut add_required = |bytes: Option<usize>| -> Option<()> {
+            required_bytes = required_bytes.checked_add(bytes?)?;
+            Some(())
+        };
+        let params = &self.weights.descriptor.params;
+        let Some(q_rows) = params.n_heads.checked_mul(params.head_dim) else {
+            return Ok(false);
+        };
+        for layer in &self.weights.layers {
+            let q_source = match &layer.attn().attn_qkv {
+                QkvWeights::Fused(weight) | QkvWeights::FusedQk { qk: weight, .. } => weight,
+                QkvWeights::Split { q, .. } => q,
+            };
+            if add_required(self.preflight_nvfp4_pack(q_source, 0, q_rows)).is_none()
+                || add_required(self.preflight_nvfp4_pack(
+                    &layer.attn().attn_o,
+                    0,
+                    layer.attn().attn_o.rows(),
+                ))
+                .is_none()
+            {
+                return Ok(false);
+            }
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return Ok(false);
+            };
+            match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    if weight.rows() % 2 != 0 {
+                        return Ok(false);
+                    }
+                    let rows = weight.rows() / 2;
+                    if add_required(self.preflight_nvfp4_pack(weight, 0, rows)).is_none()
+                        || add_required(self.preflight_nvfp4_pack(weight, rows, rows)).is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+                GateUpWeights::Split { gate, up } => {
+                    if add_required(self.preflight_nvfp4_pack(gate, 0, gate.rows())).is_none()
+                        || add_required(self.preflight_nvfp4_pack(up, 0, up.rows())).is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            if add_required(self.preflight_nvfp4_pack(&ffn.down, 0, ffn.down.rows())).is_none() {
+                return Ok(false);
+            }
+        }
+        let fp8_head_supported = match &self.weights.lm_head {
+            DevWeight::F16 { rows, cols, .. } => {
+                if !cols.is_multiple_of(256) {
+                    false
+                } else if add_required(Self::fp8_pack_allocation_bytes(*rows, *cols)).is_none() {
+                    return Ok(false);
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+        let Some(available) = self.device.pool_available(Pool::Weights) else {
+            return Ok(false);
+        };
+        if required_bytes > available {
+            return Ok(false);
+        }
+
+        self.device.synchronize()?;
+        self.weights.fp8_lm_head = None;
+        let mut layers = Vec::with_capacity(self.weights.layers.len());
+        for layer in &self.weights.layers {
+            let q = match &layer.attn().attn_qkv {
+                QkvWeights::Fused(weight) | QkvWeights::FusedQk { qk: weight, .. } => {
+                    self.pack_nvfp4_rows(weight, 0, q_rows)?
+                }
+                QkvWeights::Split { q, .. } => self.pack_nvfp4_rows(q, 0, q.rows())?,
+            };
+            let attn_o =
+                self.pack_nvfp4_rows(&layer.attn().attn_o, 0, layer.attn().attn_o.rows())?;
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                unreachable!("modele MoE zostały odrzucone przed przepakowaniem")
+            };
+            let (gate, up) = match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    let rows = weight.rows() / 2;
+                    (
+                        self.pack_nvfp4_rows(weight, 0, rows)?,
+                        self.pack_nvfp4_rows(weight, rows, rows)?,
+                    )
+                }
+                GateUpWeights::Split { gate, up } => (
+                    self.pack_nvfp4_rows(gate, 0, gate.rows())?,
+                    self.pack_nvfp4_rows(up, 0, up.rows())?,
+                ),
+            };
+            let down = self.pack_nvfp4_rows(&ffn.down, 0, ffn.down.rows())?;
+            layers.push(crate::weights::Fp8FfnLayer {
+                q,
+                attn_o,
+                gate,
+                up,
+                down,
+            });
+        }
+        let fp8_lm_head = match (&self.weights.lm_head, fp8_head_supported) {
+            (DevWeight::F16 { .. }, true) => Some(self.pack_f16_weight(&self.weights.lm_head)?),
+            _ => None,
+        };
+        self.stream.synchronize()?;
+        self.weights.fp8_lm_head = fp8_lm_head;
+        self.weights.fp8_ffn = Some(layers);
+        self.weights.fp8_modular = crate::weights::fp8_ffn_modular_enabled();
+        self.decode_graph = None;
+        self.decode_moe_graph = None;
+        self.decode_rot_graph = None;
+        self.batch_graphs.clear();
+        Ok(true)
+    }
+
     /// Mean next-token negative log-likelihood over `tokens` (natural log),
     /// i.e. `ln(perplexity)`. Runs the forward pass through whatever prefill
     /// GEMM is active (W4A8 when calibrated, else Q4_K), then maps every
@@ -2664,7 +5057,10 @@ impl Model {
                 }
                 let next = tokens[global + 1] as usize;
                 let stream = &self.stream;
-                let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
+                let pb = self
+                    .prefill_bufs
+                    .as_ref()
+                    .expect("prefill_forward allocated");
                 if let Err(e) = self
                     .device
                     .copy(&pb.x, i * hidden * 2, &self.bufs.x, 0, hidden * 2, stream)
@@ -2684,11 +5080,11 @@ impl Model {
                     result = Err(e);
                     break 'outer;
                 }
-                let lp = self
-                    .bufs
-                    .pinned_logits
-                    .host_ptr()
-                    .expect("pinned buffer has host mapping") as *const f32;
+                let lp =
+                    self.bufs
+                        .pinned_logits
+                        .host_ptr()
+                        .expect("pinned buffer has host mapping") as *const f32;
                 let logits = unsafe { std::slice::from_raw_parts(lp, vocab) };
                 // logsumexp for a stable NLL = logsumexp(logits) - logits[next].
                 let maxv = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2714,18 +5110,34 @@ impl Model {
         if self.is_hybrid() {
             return self.prefill_hybrid(seq, tokens);
         }
+        self.profile_target_start()?;
         let t = self.prefill_forward(seq, tokens)?;
         let hidden = self.weights.descriptor.params.hidden_size;
         let vocab = self.weights.descriptor.params.vocab_size;
-        let stream = &self.stream;
-        let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("prefill_forward allocated");
         // Only the last token's logits matter; route its hidden state through
         // the decode logits path (same GEMV + pinned landing).
-        self.device
-            .copy(&pb.x, (t - 1) * hidden * 2, &self.bufs.x, 0, hidden * 2, stream)?;
-        self.logits_gemv(&self.bufs.logits, &self.bufs.x, stream)?;
-        self.device
-            .copy(&self.bufs.logits, 0, &self.bufs.pinned_logits, 0, vocab * 4, stream)?;
+        self.device.copy(
+            &pb.x,
+            (t - 1) * hidden * 2,
+            &self.bufs.x,
+            0,
+            hidden * 2,
+            &self.stream,
+        )?;
+        self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        self.profile_target_end()?;
+        self.device.copy(
+            &self.bufs.logits,
+            0,
+            &self.bufs.pinned_logits,
+            0,
+            vocab * 4,
+            &self.stream,
+        )?;
         self.device.synchronize()?;
 
         let lp = self
@@ -2795,7 +5207,10 @@ impl Model {
         let mut scratch = vec![0u8; MAX_PREFILL_CHUNK * hidden * 2];
         for chunk in tokens.chunks(MAX_PREFILL_CHUNK) {
             let t = self.prefill_forward(seq, chunk)?;
-            let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
+            let pb = self
+                .prefill_bufs
+                .as_ref()
+                .expect("prefill_forward allocated");
             let bytes = &mut scratch[..t * hidden * 2];
             self.device.read(&pb.x, 0, bytes)?;
             let rows: &[f16] = bytemuck::cast_slice(bytes);
@@ -2870,6 +5285,9 @@ impl Model {
                 p.max_position_embeddings
             )));
         }
+        if self.is_hybrid() {
+            self.activate_hybrid_sequence(seq)?;
+        }
 
         self.tier_ensure_capacity(seq, 1)?;
         if self.tier.is_some() {
@@ -2906,9 +5324,6 @@ impl Model {
         // resident SSM state, not graph-capturable (host readbacks per layer).
         if self.is_hybrid() {
             self.ensure_hybrid_bufs()?;
-            if pos == 0 {
-                self.zero_ssm()?;
-            }
             return self.hybrid_forward_token(token_id, true, AttnSrc::Paged);
         }
 
@@ -2975,8 +5390,14 @@ impl Model {
             .copy(&self.bufs.pinned_in, 0, &self.bufs.ids, 0, 4, &self.stream)?;
         self.device
             .copy(&self.bufs.pinned_in, 4, &self.bufs.pos, 0, 4, &self.stream)?;
-        self.device
-            .copy(&self.bufs.pinned_in, 8, &self.seq_len_dev, 0, 4, &self.stream)?;
+        self.device.copy(
+            &self.bufs.pinned_in,
+            8,
+            &self.seq_len_dev,
+            0,
+            4,
+            &self.stream,
+        )?;
         Ok(())
     }
 
@@ -3092,8 +5513,23 @@ impl Model {
         let v_byte_off = (q_dim + kv_dim) * 2;
         let bits = self.kv.cfg.quant.bits().expect("rot mode has bits");
 
-        kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
-        kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+        kernels.gather_rows_f16(
+            &b.h,
+            &self.weights.token_embd_f16,
+            &b.ids,
+            1,
+            hidden,
+            stream,
+        )?;
+        kernels.rmsnorm_f16(
+            &b.x,
+            &b.h,
+            &self.weights.layers[0].attn_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
 
         let ring_slots = self
             .kv
@@ -3119,30 +5555,80 @@ impl Model {
                 QkvWeights::Fused(w) => {
                     self.gemv(&b.qkv, w, &b.x, stream)?;
                     if let Some(qn) = &layer.attn().q_norm {
-                        kernels.rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
+                        kernels
+                            .rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
                     }
                     if let Some(kn) = &layer.attn().k_norm {
                         kernels.rmsnorm_f16_at(
-                            &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream,
+                            &b.qkv,
+                            k_byte_off,
+                            kn,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            eps,
+                            stream,
                         )?;
                     }
-                    kernels.rope_neox_f16_at(&b.qkv, 0, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-                    kernels.rope_neox_f16_at(&b.qkv, k_byte_off, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                    kernels.rope_neox_f16_at(
+                        &b.qkv,
+                        0,
+                        &b.pos,
+                        1,
+                        p.n_heads,
+                        p.head_dim,
+                        p.rope_theta,
+                        stream,
+                    )?;
+                    kernels.rope_neox_f16_at(
+                        &b.qkv,
+                        k_byte_off,
+                        &b.pos,
+                        1,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        p.rope_theta,
+                        stream,
+                    )?;
                     (&b.qkv, 0, &b.qkv, k_byte_off, &b.qkv, v_byte_off)
                 }
                 QkvWeights::FusedQk { qk, v } => {
                     self.gemv(&b.qkv, qk, &b.x, stream)?;
                     self.gemv(&b.v, v, &b.x, stream)?;
                     if let Some(qn) = &layer.attn().q_norm {
-                        kernels.rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
+                        kernels
+                            .rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
                     }
                     if let Some(kn) = &layer.attn().k_norm {
                         kernels.rmsnorm_f16_at(
-                            &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream,
+                            &b.qkv,
+                            k_byte_off,
+                            kn,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            eps,
+                            stream,
                         )?;
                     }
-                    kernels.rope_neox_f16_at(&b.qkv, 0, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-                    kernels.rope_neox_f16_at(&b.qkv, k_byte_off, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                    kernels.rope_neox_f16_at(
+                        &b.qkv,
+                        0,
+                        &b.pos,
+                        1,
+                        p.n_heads,
+                        p.head_dim,
+                        p.rope_theta,
+                        stream,
+                    )?;
+                    kernels.rope_neox_f16_at(
+                        &b.qkv,
+                        k_byte_off,
+                        &b.pos,
+                        1,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        p.rope_theta,
+                        stream,
+                    )?;
                     (&b.qkv, 0, &b.qkv, k_byte_off, &b.v, 0)
                 }
                 QkvWeights::Split { q, k, v } => {
@@ -3153,10 +5639,34 @@ impl Model {
                         kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
                     }
                     if let Some(kn) = &layer.attn().k_norm {
-                        kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
+                        kernels.rmsnorm_f16(
+                            &b.k,
+                            &b.k,
+                            kn,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            eps,
+                            stream,
+                        )?;
                     }
-                    kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-                    kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                    kernels.rope_neox_f16(
+                        &b.q,
+                        &b.pos,
+                        1,
+                        p.n_heads,
+                        p.head_dim,
+                        p.rope_theta,
+                        stream,
+                    )?;
+                    kernels.rope_neox_f16(
+                        &b.k,
+                        &b.pos,
+                        1,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        p.rope_theta,
+                        stream,
+                    )?;
                     (&b.q, 0, &b.k, 0, &b.v, 0)
                 }
             };
@@ -3165,24 +5675,51 @@ impl Model {
             // attend over the dual region (ring for the recent window, packed
             // for older). q_buf's q head occupies head_dim*n_heads at q_off.
             kernels.kv_pack_rot(
-                &self.kv.k_packed[l], &self.kv.v_packed[l],
-                &self.kv.k_scale[l], &self.kv.v_scale[l],
-                &self.kv.k[l], &self.kv.v[l],
-                k_src, k_off, v_src, v_off,
+                &self.kv.k_packed[self.target_kv_layer(l)],
+                &self.kv.v_packed[self.target_kv_layer(l)],
+                &self.kv.k_scale[self.target_kv_layer(l)],
+                &self.kv.v_scale[self.target_kv_layer(l)],
+                &self.kv.k[self.target_kv_layer(l)],
+                &self.kv.v[self.target_kv_layer(l)],
+                k_src,
+                k_off,
+                v_src,
+                v_off,
                 &self.page_table_dev,
-                &self.bufs.pos, 1, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, ring_slots, bits, stream,
+                &self.bufs.pos,
+                1,
+                p.n_kv_heads,
+                self.kv.cfg.page_size,
+                p.head_dim,
+                ring_slots,
+                bits,
+                stream,
             )?;
             match &src {
                 AttnSrc::Paged => {
                     kernels.attn_decode_rot(
-                        &b.attn_parts, q_buf, q_off,
-                        &self.kv.k_packed[l], &self.kv.v_packed[l],
-                        &self.kv.k_scale[l], &self.kv.v_scale[l],
-                        &self.kv.k[l], &self.kv.v[l],
-                        &self.page_table_dev, &self.seq_len_dev,
-                        1, p.n_heads, p.n_kv_heads, p.head_dim,
-                        self.kv.cfg.page_size, self.max_pages_per_seq,
-                        ATTN_DECODE_SPLITS, ring_slots, bits, scale, stream,
+                        &b.attn_parts,
+                        q_buf,
+                        q_off,
+                        &self.kv.k_packed[self.target_kv_layer(l)],
+                        &self.kv.v_packed[self.target_kv_layer(l)],
+                        &self.kv.k_scale[self.target_kv_layer(l)],
+                        &self.kv.v_scale[self.target_kv_layer(l)],
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
+                        &self.page_table_dev,
+                        &self.seq_len_dev,
+                        1,
+                        p.n_heads,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        self.kv.cfg.page_size,
+                        self.max_pages_per_seq,
+                        ATTN_DECODE_SPLITS,
+                        ring_slots,
+                        bits,
+                        scale,
+                        stream,
                     )?;
                 }
                 AttnSrc::Staged(seq) => {
@@ -3190,29 +5727,60 @@ impl Model {
                     // store's resident tail page; staging materializes the full
                     // packed history (spilled chunks + resident pages) for this
                     // layer behind the identity page table.
-                    let tier = self.tier.as_ref().expect("staged attention requires tiering");
+                    let tier = self
+                        .tier
+                        .as_ref()
+                        .expect("staged attention requires tiering");
                     let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                     let slot = &tb.slots[0];
                     tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
                     kernels.attn_decode_rot(
-                        &b.attn_parts, q_buf, q_off,
-                        &slot.stage[0], &slot.stage[1],
-                        &slot.stage[2], &slot.stage[3],
-                        &self.kv.k[l], &self.kv.v[l],
-                        &tb.identity_pt, &self.seq_len_dev,
-                        1, p.n_heads, p.n_kv_heads, p.head_dim,
-                        self.kv.cfg.page_size, self.max_pages_per_seq,
-                        ATTN_DECODE_SPLITS, ring_slots, bits, scale, stream,
+                        &b.attn_parts,
+                        q_buf,
+                        q_off,
+                        &slot.stage[0],
+                        &slot.stage[1],
+                        &slot.stage[2],
+                        &slot.stage[3],
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
+                        &tb.identity_pt,
+                        &self.seq_len_dev,
+                        1,
+                        p.n_heads,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        self.kv.cfg.page_size,
+                        self.max_pages_per_seq,
+                        ATTN_DECODE_SPLITS,
+                        ring_slots,
+                        bits,
+                        scale,
+                        stream,
                     )?;
                 }
             }
             kernels.attn_decode_combine_rot(
-                &b.attn_out, &b.attn_parts,
-                1, p.n_heads, p.head_dim, ATTN_DECODE_SPLITS, stream,
+                &b.attn_out,
+                &b.attn_parts,
+                1,
+                p.n_heads,
+                p.head_dim,
+                ATTN_DECODE_SPLITS,
+                stream,
             )?;
 
             self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
-            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                &b.x,
+                &b.h,
+                &b.o_out,
+                &layer.ffn_norm,
+                1,
+                hidden,
+                eps,
+                stream,
+            )?;
 
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
@@ -3270,21 +5838,33 @@ impl Model {
         let sp = sampler.params().clone();
 
         let penalized = sampler.penalized();
-        if sp.repetition_penalty != 1.0 && !penalized.is_empty() {
-            if penalized.len() * 4 > b.pinned_penalty.len() {
+        let penalty_counts = sampler.penalty_counts();
+        if sp.has_penalties() && !penalized.is_empty() {
+            if penalized.len() != penalty_counts.len()
+                || penalized.len() * 4 > b.pinned_penalty.len()
+            {
                 return Err(ForgeError::Scheduler(format!(
-                    "penalty list {} exceeds staging capacity",
+                    "penalty histogram {} exceeds staging capacity",
                     penalized.len()
                 )));
             }
-            let host = b
+            let ids_host = b
                 .pinned_penalty
+                .host_ptr()
+                .expect("pinned buffer has host mapping");
+            let counts_host = b
+                .pinned_penalty_counts
                 .host_ptr()
                 .expect("pinned buffer has host mapping");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     penalized.as_ptr() as *const u8,
-                    host,
+                    ids_host,
+                    penalized.len() * 4,
+                );
+                std::ptr::copy_nonoverlapping(
+                    penalty_counts.as_ptr() as *const u8,
+                    counts_host,
                     penalized.len() * 4,
                 );
             }
@@ -3296,11 +5876,23 @@ impl Model {
                 penalized.len() * 4,
                 &self.stream,
             )?;
-            self.kernels.sample_penalize_f32(
+            self.device.copy(
+                &b.pinned_penalty_counts,
+                0,
+                &b.penalty_counts,
+                0,
+                penalized.len() * 4,
+                &self.stream,
+            )?;
+            self.kernels.sample_penalize_histogram_f32(
                 &b.logits,
                 &b.penalty_ids,
+                &b.penalty_counts,
                 penalized.len(),
+                p.vocab_size,
                 sp.repetition_penalty,
+                sp.frequency_penalty,
+                sp.presence_penalty,
                 &self.stream,
             )?;
         }
@@ -3349,27 +5941,1281 @@ impl Model {
         Ok(id as u32)
     }
 
-    /// Whether this model can run the linear speculative-decode path (SPEC §6):
-    /// the standard dense paged-KV forward only. Hybrid SSM (recurrent state not
-    /// in KV pages), routed MoE (no multi-token verify chain here), non-F16 KV,
-    /// KV tiering and the radix prefix cache are all excluded — the verify
-    /// forward appends draft K/V and rolls it back, which is only bit-clean and
-    /// side-effect-free on the plain F16 cache with no tier/prefix bookkeeping.
-    /// The batched verify logits also require an f16/q8_0 lm head.
-    pub fn speculation_eligible(&self) -> bool {
-        !self.is_hybrid()
-            && !self.weights.is_moe()
+    /// Zwraca, czy checkpoint zawiera kompletny blok NextN gotowy do smoke MTP.
+    pub fn has_native_mtp(&self) -> bool {
+        self.weights
+            .mtp
+            .as_ref()
+            .is_some_and(|mtp| mtp.runtime_supported())
+            && self
+                .hybrid_states
+                .as_ref()
+                .is_some_and(HybridStatePool::has_mtp)
+    }
+
+    pub fn mtp_host_embedding_gathers(&self) -> u64 {
+        self.hybrid_states
+            .as_ref()
+            .map_or(0, HybridStatePool::mtp_host_embedding_gathers)
+    }
+
+    pub fn mtp_embedding_mode(&self) -> Option<&'static str> {
+        self.weights
+            .mtp
+            .as_ref()
+            .map(|weights| weights.embedding.mode())
+    }
+
+    /// Sprawdza niemutujący kontrakt pierwszego pionu native MTP B2.
+    pub fn native_mtp_b2_capable(&self, seqs: [&SeqKv; 2], budget: usize) -> bool {
+        matches!(budget, 2 | 3)
+            && self.mtp_ngram_b2_model_capable()
+            && seqs
+                .iter()
+                .all(|seq| self.native_mtp_available_budget(seq, budget) == budget)
+    }
+
+    /// Sprawdza strukturalny kontrakt wspólnego target verifiera N/N B2.
+    pub fn mtp_ngram_b2_model_capable(&self) -> bool {
+        self.validate_native_mtp_target().is_ok()
+            && self.hybrid_batch_b2_weights_capable()
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
             && self.prefix_cache.is_none()
-            && matches!(
-                self.weights.lm_head,
-                DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
+            && native_mtp_b2_device_embedding(
+                self.mtp_embedding_mode(),
+                self.weights
+                    .mtp
+                    .as_ref()
+                    .is_some_and(|mtp| mtp.shares_target_embedding),
             )
     }
 
-    /// Provision the verify-logit scratch for `cap` query positions (idempotent;
-    /// grows on a larger `cap`).
+    /// Sprawdza kontrakt wspólnego target verifiera dla dwóch pełnych draftów n-gram.
+    pub fn mtp_ngram_b2_capable(&self, seqs: [&SeqKv; 2], budget: usize) -> bool {
+        self.native_mtp_b2_capable(seqs, budget)
+    }
+
+    fn mtp_upload_scalar(
+        &self,
+        state: &mut MtpDraftState,
+        value: i32,
+        dst: &DevBuffer,
+        dst_offset: usize,
+    ) -> Result<()> {
+        if state.pinned_scalar_recorded {
+            state.pinned_scalar_ready.synchronize()?;
+        }
+        write_pinned(&value.to_le_bytes(), &state.pinned_scalar)?;
+        self.device.copy(
+            &state.pinned_scalar,
+            0,
+            dst,
+            dst_offset,
+            4,
+            &self.stream,
+        )?;
+        self.device
+            .record_event(&state.pinned_scalar_ready, &self.stream)?;
+        state.pinned_scalar_recorded = true;
+        Ok(())
+    }
+
+    fn mtp_propose_pending(&mut self, seq: &mut SeqKv, fed: u32, k: usize) -> Result<Vec<u32>> {
+        if k != 2 && k != 3 {
+            return Err(ForgeError::Unsupported(
+                "MTP propose_k obsługuje wyłącznie K=2 lub K=3".into(),
+            ));
+        }
+        if !self.has_native_mtp() {
+            return Err(ForgeError::Unsupported(
+                "checkpoint MTP nie spełnia ograniczeń natywnego runtime".into(),
+            ));
+        }
+        self.ensure_hybrid_bufs()?;
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let mut checkpoint_attempted = false;
+        let mut result: Result<Vec<u32>> = (|| {
+            if fed as usize >= self.weights.descriptor.params.vocab_size {
+                return Err(ForgeError::Scheduler(format!(
+                    "token wejściowy MTP {fed} wykracza poza słownik"
+                )));
+            }
+            checkpoint_attempted = true;
+            state.checkpoint(&self.stream)?;
+            let initial_ids = [fed as i32, 0, 0, 0, 0];
+            write_pinned(bytemuck::cast_slice(&initial_ids), &state.pinned_token_ids)?;
+            self.device.copy(
+                &state.pinned_token_ids,
+                0,
+                &state.token_ids,
+                0,
+                initial_ids.len() * 4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &state.token_ids,
+                0,
+                &self.bufs.sample_out,
+                0,
+                4,
+                &self.stream,
+            )?;
+
+            for step in 0..=k {
+                self.mtp_gather_embedding(&mut state, step)?;
+                state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
+                self.mtp_forward_one(&mut state, &mtp_kv, step < k)?;
+                state.save_step_hidden(step, &self.stream)?;
+                if step == k {
+                    continue;
+                }
+                self.kernels.sample_argmax_f32(
+                    &self.bufs.sample_out,
+                    &self.bufs.sample_vals,
+                    &self.bufs.sample_idx,
+                    &state.logits,
+                    self.weights.descriptor.params.vocab_size,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &self.bufs.sample_out,
+                    0,
+                    &state.token_ids,
+                    (step + 1) * 4,
+                    4,
+                    &self.stream,
+                )?;
+            }
+            self.device.copy(
+                &state.token_ids,
+                0,
+                &state.pinned_token_ids,
+                0,
+                5 * 4,
+                &self.stream,
+            )?;
+            self.device.synchronize()?;
+            let host = state
+                .pinned_token_ids
+                .host_ptr()
+                .expect("pinned token IDs mają mapowanie hosta");
+            let ids = unsafe { std::slice::from_raw_parts(host as *const i32, k + 1) };
+            let gather_status = unsafe { *(host as *const i32).add(4) };
+            if gather_status != 0 {
+                return Err(ForgeError::Kernel(
+                    "MTP GPU gather odrzucił token poza zakresem słownika".into(),
+                ));
+            }
+            Ok(ids[1..].iter().map(|&id| id as u32).collect())
+        })();
+        if result.is_err() {
+            if state.checkpoint_len().is_some() {
+                if let Err(rollback) = state.rollback(&mut mtp_kv, &self.stream) {
+                    let execution = result.expect_err("wynik propose zawiera błąd");
+                    result = Err(self.poison_mtp_runtime(format!(
+                        "błąd propose MTP: {execution}; rollback nie powiódł się: {rollback}"
+                    )));
+                }
+            } else if checkpoint_attempted {
+                let execution = result.expect_err("wynik propose zawiera błąd");
+                result = Err(self.poison_mtp_runtime(format!(
+                    "błąd propose MTP przed utworzeniem checkpointu: {execution}"
+                )));
+            }
+        }
+        self.pt_seq = 0;
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_propose_pending_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        fed: [u32; 2],
+        k: usize,
+        external_drafts: [Option<&[u32]>; 2],
+    ) -> Result<()> {
+        if !self.native_mtp_b2_capable([&*seqs[0], &*seqs[1]], k) {
+            return Err(ForgeError::Unsupported(
+                "para nie spełnia kontraktu native MTP B2".into(),
+            ));
+        }
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let fed_i32 = validate_mtp_routed_inputs(vocab, fed, k, external_drafts)?;
+        self.ensure_hybrid_bufs()?;
+        let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
+        let mut checkpoint_attempted = false;
+        let mut result: Result<()> = (|| {
+            let mut required_pages = 0usize;
+            for state in &states {
+                let end = state.seq.len.checked_add(k + 1).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie długości draftu MTP B2".into())
+                })?;
+                let end_pages = end.div_ceil(mtp_kv.cfg.page_size);
+                if end_pages > mtp_kv.cfg.max_pages_per_seq {
+                    return Err(ForgeError::Scheduler(
+                        "draft MTP B2 przekracza limit stron sekwencji".into(),
+                    ));
+                }
+                required_pages = required_pages
+                    .checked_add(end_pages.saturating_sub(state.seq.pages.len()))
+                    .ok_or_else(|| {
+                        ForgeError::Scheduler("przepełnienie rezerwacji KV MTP B2".into())
+                    })?;
+            }
+            if required_pages > mtp_kv.free_page_count() {
+                return Err(ForgeError::Scheduler(format!(
+                    "draft MTP B2 wymaga {required_pages} stron, dostępne {}",
+                    mtp_kv.free_page_count()
+                )));
+            }
+
+            checkpoint_attempted = true;
+            for (lane, state) in states.iter_mut().enumerate() {
+                state.checkpoint(&self.stream)?;
+                let mut initial_ids = [fed_i32[lane], 0, 0, 0, 0];
+                if let Some(draft) = external_drafts[lane] {
+                    for (index, &token) in draft.iter().enumerate() {
+                        initial_ids[index + 1] = i32::try_from(token).map_err(|_| {
+                            ForgeError::Format("draft routed MTP przekracza i32".into())
+                        })?;
+                    }
+                }
+                write_pinned(bytemuck::cast_slice(&initial_ids), &state.pinned_token_ids)?;
+                self.device.copy(
+                    &state.pinned_token_ids,
+                    0,
+                    &state.token_ids,
+                    0,
+                    initial_ids.len() * 4,
+                    &self.stream,
+                )?;
+            }
+
+            for step in 0..=k {
+                for (lane, state) in states.iter_mut().enumerate() {
+                    if external_drafts[lane].is_some() {
+                        continue;
+                    }
+                    self.device.copy(
+                        &state.token_ids,
+                        step * 4,
+                        &self.bufs.sample_out,
+                        0,
+                        4,
+                        &self.stream,
+                    )?;
+                    self.mtp_gather_embedding(state, step)?;
+                    state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
+                    self.mtp_forward_one(state, &mtp_kv, step < k)?;
+                    state.save_step_hidden(step, &self.stream)?;
+                    if step < k {
+                        self.kernels.sample_argmax_f32(
+                            &self.bufs.sample_out,
+                            &self.bufs.sample_vals,
+                            &self.bufs.sample_idx,
+                            &state.logits,
+                            vocab,
+                            &self.stream,
+                        )?;
+                        self.device.copy(
+                            &self.bufs.sample_out,
+                            0,
+                            &state.token_ids,
+                            (step + 1) * 4,
+                            4,
+                            &self.stream,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let checkpoints_complete = states.iter().all(|state| state.checkpoint_len().is_some());
+            if let Err(rollback) = rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
+                let execution = result.expect_err("wynik propose B2 zawiera błąd");
+                result = Err(self
+                    .poison_mtp_runtime(format!("błąd propose MTP B2: {execution}; {rollback}")));
+            } else if checkpoint_attempted && !checkpoints_complete {
+                let execution = result.expect_err("wynik propose B2 zawiera błąd");
+                result = Err(self.poison_mtp_runtime(format!(
+                    "błąd propose MTP B2 przed utworzeniem obu checkpointów: {execution}"
+                )));
+            }
+        }
+        self.pt_seq = 0;
+        self.finish_mtp_runtime_pair(leases, states, mtp_kv, result)
+    }
+
+    /// Buduje dwa drafty K=2/3 w kolejności per krok i odtwarza oba stany MTP.
+    pub fn mtp_propose_k_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        fed: [u32; 2],
+        k: usize,
+    ) -> Result<[Vec<u32>; 2]> {
+        self.mtp_propose_pending_b2(seqs, fed, k, [None, None])?;
+        let (leases, states, mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
+        let readback = (|| {
+            for state in &states {
+                self.device.copy(
+                    &state.token_ids,
+                    0,
+                    &state.pinned_token_ids,
+                    0,
+                    5 * 4,
+                    &self.stream,
+                )?;
+            }
+            self.device.synchronize()?;
+            let mut drafts = [Vec::with_capacity(k), Vec::with_capacity(k)];
+            for (lane, state) in states.iter().enumerate() {
+                let host = state
+                    .pinned_token_ids
+                    .host_ptr()
+                    .expect("pinned token IDs mają mapowanie hosta");
+                let ids = unsafe { std::slice::from_raw_parts(host as *const i32, k + 1) };
+                if ids
+                    .iter()
+                    .any(|&id| id < 0 || id as usize >= self.weights.descriptor.params.vocab_size)
+                {
+                    return Err(ForgeError::Kernel(format!(
+                        "MTP GPU gather lane {lane} odrzucił token poza słownikiem"
+                    )));
+                }
+                drafts[lane].extend(ids[1..].iter().map(|&id| id as u32));
+            }
+            Ok(drafts)
+        })();
+        let drafts = self.finish_mtp_runtime_pair(leases, states, mtp_kv, readback)?;
+        let first = self.rollback_mtp_pending(seqs[0]);
+        let second = self.rollback_mtp_pending(seqs[1]);
+        match (first, second) {
+            (Ok(()), Ok(())) => Ok(drafts),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(first), Err(second)) => Err(ForgeError::Scheduler(format!(
+                "rollback obu lane'ów MTP B2 nie powiódł się: lane0={first}; lane1={second}"
+            ))),
+        }
+    }
+
+    /// Buduje liniowy draft K=2/3 poza normalnym server flow i nie zmienia
+    /// trwałego stanu KV/hidden bloku MTP.
+    pub fn mtp_propose_k(&mut self, seq: &mut SeqKv, fed: u32, k: usize) -> Result<Vec<u32>> {
+        let draft = self.mtp_propose_pending(seq, fed, k)?;
+        self.rollback_mtp_pending(seq)?;
+        Ok(draft)
+    }
+
+    fn rollback_mtp_pending(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let mut result = state
+            .rollback(&mut mtp_kv, &self.stream)
+            .and_then(|_| self.device.synchronize());
+        if let Err(rollback) = &result {
+            result = Err(self.poison_mtp_runtime(format!(
+                "rollback stanu MTP nie powiódł się: {rollback}"
+            )));
+        }
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn reset_mtp_runtime(&mut self, seq: &mut SeqKv) -> Result<()> {
+        if !self.has_native_mtp() {
+            return Ok(());
+        }
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let result = state.reset(&mut mtp_kv, &self.stream);
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_catchup_token(&mut self, seq: &mut SeqKv, token: u32) -> Result<()> {
+        if !self.has_native_mtp() {
+            return Ok(());
+        }
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let result = (|| {
+            self.device.copy(
+                &self.bufs.x,
+                0,
+                &state.catchup_hidden,
+                0,
+                state.catchup_hidden.len(),
+                &self.stream,
+            )?;
+            let sample_out = self.bufs.sample_out.clone();
+            self.mtp_upload_scalar(&mut state, token as i32, &sample_out, 0)?;
+            self.mtp_gather_embedding(&mut state, 0)?;
+            state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
+            self.mtp_forward_one(&mut state, &mtp_kv, false)?;
+            self.device.copy(
+                &state.catchup_hidden,
+                0,
+                &state.recurrent_hidden,
+                0,
+                state.recurrent_hidden.len(),
+                &self.stream,
+            )?;
+            self.device.copy(
+                &state.catchup_hidden,
+                0,
+                &self.bufs.x,
+                0,
+                state.catchup_hidden.len(),
+                &self.stream,
+            )
+        })();
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_catchup_batch_host(
+        &self,
+        state: &mut MtpDraftState,
+        mtp_kv: &mut KvCache,
+        t: usize,
+        staging_slot: usize,
+        staging_ready: Option<&Event>,
+    ) -> Result<()> {
+        let mtp = self.weights.mtp.as_ref().expect("stan MTP ma wagi");
+        let layer = mtp.layers.first().ok_or_else(|| {
+            ForgeError::Unsupported("batchowy catch-up MTP wymaga jednej warstwy".into())
+        })?;
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+            return Err(ForgeError::Unsupported(
+                "batchowy catch-up MTP wymaga eh_proj Q8_0".into(),
+            ));
+        };
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrydowego catch-up są gotowe");
+        let stream = &self.stream;
+        let (base, page_table, seq_len, position) = state.stage_batch(mtp_kv, t)?;
+        let positions: Vec<i32> = (base..base + t).map(|value| value as i32).collect();
+        let visible: Vec<i32> = (base + 1..=base + t).map(|value| value as i32).collect();
+        let host_staging = &hv.host_staging[staging_slot];
+        write_pinned(
+            bytemuck::cast_slice(&page_table),
+            &host_staging.mtp_page_table,
+        )?;
+        write_pinned(
+            bytemuck::cast_slice(&positions),
+            &host_staging.mtp_positions,
+        )?;
+        write_pinned(
+            bytemuck::cast_slice(&visible),
+            &host_staging.mtp_visible_lens,
+        )?;
+        write_pinned(&(base as i32).to_le_bytes(), &host_staging.mtp_base_pos)?;
+        write_pinned(&seq_len.to_le_bytes(), &host_staging.mtp_seq_len)?;
+        write_pinned(&position.to_le_bytes(), &host_staging.mtp_position)?;
+        self.device.copy(
+            &host_staging.mtp_page_table,
+            0,
+            &state.page_table,
+            0,
+            page_table.len() * 4,
+            stream,
+        )?;
+        self.device
+            .copy(&host_staging.mtp_seq_len, 0, &state.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&host_staging.mtp_position, 0, &state.position, 0, 4, stream)?;
+        self.device.copy(
+            &host_staging.mtp_positions,
+            0,
+            &pb.positions,
+            0,
+            t * 4,
+            stream,
+        )?;
+        self.device
+            .copy(&host_staging.mtp_base_pos, 0, &hv.base_pos, 0, 4, stream)?;
+        self.device.copy(
+            &host_staging.mtp_visible_lens,
+            0,
+            &hv.visible_lens,
+            0,
+            t * 4,
+            stream,
+        )?;
+        self.device
+            .copy(&host_staging.embedding, 0, &pb.h, 0, t * hidden * 2, stream)?;
+        if let Some(event) = staging_ready {
+            self.device.record_event(event, stream)?;
+        }
+        self.kernels.mtp_norm_join_shifted_f16(
+            &hv.q_full,
+            &pb.h,
+            &pb.x,
+            &state.recurrent_hidden,
+            &layer.enorm,
+            &layer.hnorm,
+            t,
+            hidden,
+            p.rms_norm_eps,
+            stream,
+        )?;
+        self.device.copy(
+            &pb.x,
+            (t - 1) * hidden * 2,
+            &state.catchup_hidden,
+            0,
+            hidden * 2,
+            stream,
+        )?;
+        self.kernels
+            .mtp_project_joined_q8_f16(&pb.h, &hv.q_full, eh_proj, t, hidden, stream)?;
+        self.kernels.rmsnorm_f16(
+            &pb.x,
+            &pb.h,
+            &layer.block.attn_norm,
+            t,
+            hidden,
+            p.rms_norm_eps,
+            stream,
+        )?;
+        let attention = layer.block.attn();
+        let QkvWeights::Split { q: _, k, v } = &attention.attn_qkv else {
+            return Err(ForgeError::Unsupported(
+                "MTP wymaga rozdzielonych Q/K/V".into(),
+            ));
+        };
+        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+        if let Some(norm) = &attention.k_norm {
+            self.kernels.rmsnorm_f16(
+                &pb.k, &pb.k, norm, t * p.n_kv_heads, p.head_dim, p.rms_norm_eps, stream,
+            )?;
+        }
+        let n_rot = self.hybrid_n_rot();
+        self.kernels.rope_neox_partial_f16(
+            &pb.k, &pb.positions, t, p.n_kv_heads, p.head_dim, n_rot, p.rope_theta, stream,
+        )?;
+        self.kernels.kv_append_batch_device_pos_f16(
+            &mtp_kv.k[0], &mtp_kv.v[0], &pb.k, &pb.v, &state.page_table,
+            &hv.base_pos, t, p.n_kv_heads, mtp_kv.cfg.page_size, p.head_dim, stream,
+        )?;
+        self.device.copy(
+            &state.catchup_hidden,
+            0,
+            &state.recurrent_hidden,
+            0,
+            hidden * 2,
+            stream,
+        )
+    }
+
+    /// Dogania stan MTP po zaakceptowanym prefiksie targetu bez liczenia logits.
+    fn mtp_catchup_verified_prefix(
+        &mut self,
+        seq: &mut SeqKv,
+        retained: usize,
+        staging_slot: usize,
+        staging_ready: Option<&Event>,
+    ) -> Result<()> {
+        if retained == 0 {
+            return Err(ForgeError::Scheduler(
+                "catch-up MTP wymaga co najmniej tokenu fed".into(),
+            ));
+        }
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let mut result = (|| {
+            state.checkpoint(&self.stream)?;
+            self.mtp_catchup_verified_prefix_pending(
+                &mut state,
+                &mut mtp_kv,
+                retained,
+                staging_slot,
+                staging_ready,
+            )?;
+            state.commit_catchup(retained)?;
+            Ok(())
+        })();
+        if result.is_err() && state.checkpoint_len().is_some() {
+            let rollback = state
+                .rollback(&mut mtp_kv, &self.stream)
+                .and_then(|_| self.device.synchronize());
+            if let Err(rollback) = rollback {
+                let execution = result.expect_err("wynik catch-up zawiera błąd");
+                result = Err(self.poison_mtp_runtime(format!(
+                    "błąd catch-up MTP: {execution}; rollback nie powiódł się: {rollback}"
+                )));
+            }
+        }
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_catchup_verified_prefix_pending(
+        &mut self,
+        state: &mut MtpDraftState,
+        mtp_kv: &mut KvCache,
+        retained: usize,
+        staging_slot: usize,
+        staging_ready: Option<&Event>,
+    ) -> Result<()> {
+        if retained == 0 {
+            return Err(ForgeError::Scheduler(
+                "catch-up MTP wymaga co najmniej tokenu fed".into(),
+            ));
+        }
+        let hidden_bytes = self.weights.descriptor.params.hidden_size * 2;
+        if retained > 1
+            && self
+                .weights
+                .mtp
+                .as_ref()
+                .is_some_and(|mtp| mtp.shares_target_embedding)
+        {
+            self.mtp_catchup_batch_host(
+                state,
+                mtp_kv,
+                retained,
+                staging_slot,
+                staging_ready,
+            )?;
+            return self.device.copy(
+                &state.catchup_hidden,
+                0,
+                &self.bufs.x,
+                0,
+                hidden_bytes,
+                &self.stream,
+            );
+        }
+        for row in 0..retained {
+            let pb = self
+                .prefill_bufs
+                .as_ref()
+                .expect("bufory prefill są gotowe");
+            self.device.copy(
+                &pb.x,
+                row * hidden_bytes,
+                &state.catchup_hidden,
+                0,
+                hidden_bytes,
+                &self.stream,
+            )?;
+            self.device
+                .copy(&pb.ids, row * 4, &self.bufs.sample_out, 0, 4, &self.stream)?;
+            self.mtp_gather_embedding(state, row)?;
+            state.stage_step(mtp_kv, &self.kernels, &self.stream)?;
+            self.mtp_forward_one(state, mtp_kv, false)?;
+            self.device.copy(
+                &state.catchup_hidden,
+                0,
+                &state.recurrent_hidden,
+                0,
+                state.recurrent_hidden.len(),
+                &self.stream,
+            )?;
+        }
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        self.device.copy(
+            &pb.x,
+            (retained - 1) * hidden_bytes,
+            &self.bufs.x,
+            0,
+            hidden_bytes,
+            &self.stream,
+        )
+    }
+
+    fn mtp_catchup_verified_prefix_b2(
+        &self,
+        states: &mut [MtpDraftState; 2],
+        mtp_kv: &mut KvCache,
+        t: usize,
+        external_sources: [bool; 2],
+    ) -> Result<()> {
+        let mtp = self.weights.mtp.as_ref().expect("stan MTP ma wagi");
+        let layer = mtp.layers.first().ok_or_else(|| {
+            ForgeError::Unsupported("segmentowany catch-up MTP wymaga jednej warstwy".into())
+        })?;
+        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+            return Err(ForgeError::Unsupported(
+                "segmentowany catch-up MTP wymaga eh_proj Q8_0".into(),
+            ));
+        };
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let total = 2usize
+            .checked_mul(t)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie catch-up MTP B2".into()))?;
+        let mut bases = [0i32; 2];
+        let mut page_tables = vec![-1i32; 2 * self.max_pages_per_seq];
+        for (lane, state) in states.iter_mut().enumerate() {
+            if !external_sources[lane] {
+                continue;
+            }
+            self.device.copy(
+                &state.recurrent_hidden,
+                0,
+                &self
+                    .mtp_b2_bufs
+                    .as_ref()
+                    .expect("MTP B2 gotowy")
+                    .mtp_initial_hidden,
+                lane * hidden * 2,
+                hidden * 2,
+                &self.stream,
+            )?;
+            let (base, table, _, _) = state.stage_batch(mtp_kv, t)?;
+            bases[lane] = i32::try_from(base).map_err(|_| {
+                ForgeError::Scheduler("pozycja bazowa catch-up MTP przekracza i32".into())
+            })?;
+            let offset = lane * self.max_pages_per_seq;
+            page_tables[offset..offset + table.len()].copy_from_slice(&table);
+        }
+        let b2 = self.mtp_b2_bufs.as_ref().expect("MTP B2 gotowy");
+        let mut metadata = Vec::with_capacity(2 + page_tables.len());
+        metadata.extend_from_slice(&bases);
+        metadata.extend_from_slice(&page_tables);
+        write_pinned(bytemuck::cast_slice(&metadata), &b2.pinned_mtp_metadata)?;
+        self.device.copy(
+            &b2.pinned_mtp_metadata,
+            0,
+            &b2.base_positions,
+            0,
+            8,
+            &self.stream,
+        )?;
+        self.device.copy(
+            &b2.pinned_mtp_metadata,
+            8,
+            &b2.page_tables,
+            0,
+            page_tables.len() * 4,
+            &self.stream,
+        )?;
+        for (lane, state) in states.iter().enumerate() {
+            if !external_sources[lane] {
+                continue;
+            }
+            self.device.copy(
+                &b2.page_tables,
+                lane * self.max_pages_per_seq * 4,
+                &state.page_table,
+                0,
+                self.max_pages_per_seq * 4,
+                &self.stream,
+            )?;
+        }
+
+        let pb = self.prefill_bufs.as_ref().expect("prefill gotowy");
+        self.kernels.mtp_pack_verify_inputs(
+            &pb.ids,
+            &pb.positions,
+            &b2.visible_lens,
+            &states[0].token_ids,
+            &states[1].token_ids,
+            &b2.base_positions,
+            t,
+            &self.stream,
+        )?;
+        let masked_bases = [
+            if external_sources[0] { bases[0] } else { -1 },
+            if external_sources[1] { bases[1] } else { -1 },
+        ];
+        write_pinned(
+            bytemuck::cast_slice(&masked_bases),
+            &b2.pinned_mtp_metadata,
+        )?;
+        self.device.copy(
+            &b2.pinned_mtp_metadata,
+            0,
+            &b2.base_positions,
+            0,
+            8,
+            &self.stream,
+        )?;
+        self.kernels.mtp_norm_join_shifted_segmented_f16(
+            &b2.q_full,
+            &b2.catchup_embeddings,
+            &pb.x,
+            &b2.mtp_initial_hidden,
+            &layer.enorm,
+            &layer.hnorm,
+            2,
+            t,
+            hidden,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+        self.kernels.mtp_project_joined_q8_f16(
+            &pb.h,
+            &b2.q_full,
+            eh_proj,
+            total,
+            hidden,
+            &self.stream,
+        )?;
+        self.kernels.rmsnorm_f16(
+            &pb.x,
+            &pb.h,
+            &layer.block.attn_norm,
+            total,
+            hidden,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+        let attention = layer.block.attn();
+        let QkvWeights::Split { q: _, k, v } = &attention.attn_qkv else {
+            return Err(ForgeError::Unsupported(
+                "MTP wymaga rozdzielonych Q/K/V".into(),
+            ));
+        };
+        self.gemm(&pb.k, k, &pb.x, total, &self.stream)?;
+        self.gemm(&pb.v, v, &pb.x, total, &self.stream)?;
+        if let Some(norm) = &attention.k_norm {
+            self.kernels.rmsnorm_f16(
+                &pb.k,
+                &pb.k,
+                norm,
+                total * p.n_kv_heads,
+                p.head_dim,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+        }
+        self.kernels.rope_neox_partial_f16(
+            &pb.k,
+            &pb.positions,
+            total,
+            p.n_kv_heads,
+            p.head_dim,
+            self.hybrid_n_rot(),
+            p.rope_theta,
+            &self.stream,
+        )?;
+        self.kernels.kv_append_batch_segmented_masked_f16(
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
+            &pb.k,
+            &pb.v,
+            &b2.page_tables,
+            &b2.base_positions,
+            &b2.decisions,
+            2,
+            t,
+            self.max_pages_per_seq,
+            p.n_kv_heads,
+            mtp_kv.cfg.page_size,
+            p.head_dim,
+            &self.stream,
+        )?;
+        self.kernels.mtp_commit_catchup_metadata_segmented(
+            &b2.mtp_seq_lens,
+            &b2.mtp_positions,
+            &b2.base_positions,
+            &b2.decisions,
+            2,
+            &self.stream,
+        )?;
+        for (lane, state) in states.iter().enumerate() {
+            if !external_sources[lane] {
+                continue;
+            }
+            self.device.copy(
+                &b2.mtp_seq_lens,
+                lane * 4,
+                &state.seq_len,
+                0,
+                4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.mtp_positions,
+                lane * 4,
+                &state.position,
+                0,
+                4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.selected_hidden,
+                lane * hidden * 2,
+                &state.recurrent_hidden,
+                0,
+                hidden * 2,
+                &self.stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn mtp_gather_embedding(&self, state: &mut MtpDraftState, token_index: usize) -> Result<()> {
+        let mtp = self
+            .weights
+            .mtp
+            .as_ref()
+            .expect("sprawdzone przez propose_k");
+        let p = &self.weights.descriptor.params;
+        match &mtp.embedding {
+            MtpEmbedding::Device(DevWeight::F16 { buf, .. }) => self.kernels.gather_f16_row_f16(
+                &mtp.token_embedding,
+                buf,
+                &self.bufs.sample_out,
+                &state.token_ids,
+                4 * 4,
+                p.vocab_size,
+                p.hidden_size,
+                &self.stream,
+            ),
+            MtpEmbedding::Device(DevWeight::Q8_0 { buf, .. }) => self.kernels.gather_q8_0_row_f16(
+                &mtp.token_embedding,
+                buf,
+                &self.bufs.sample_out,
+                &state.token_ids,
+                4 * 4,
+                p.vocab_size,
+                p.hidden_size,
+                &self.stream,
+            ),
+            MtpEmbedding::Device(DevWeight::NvFp4Gguf {
+                buf, output_scale, ..
+            }) => self.kernels.gather_nvfp4_gguf_row_f16(
+                &mtp.token_embedding,
+                buf,
+                &self.bufs.sample_out,
+                &state.token_ids,
+                4 * 4,
+                p.vocab_size,
+                p.hidden_size,
+                *output_scale,
+                &self.stream,
+            ),
+            MtpEmbedding::Device(_) => Err(ForgeError::Unsupported(
+                "GPU MTP wymaga embeddingu F16, Q8_0 lub GGUF NVFP4".into(),
+            )),
+            MtpEmbedding::HostF16 => {
+                self.device.copy(
+                    &self.bufs.sample_out,
+                    0,
+                    &state.pinned_token_ids,
+                    token_index * 4,
+                    4,
+                    &self.stream,
+                )?;
+                self.device.synchronize()?;
+                let ids = state
+                    .pinned_token_ids
+                    .host_ptr()
+                    .expect("pinned token IDs mają mapowanie hosta")
+                    as *const i32;
+                let token_id = unsafe { *ids.add(token_index) };
+                if token_id < 0 || token_id as usize >= p.vocab_size {
+                    return Err(ForgeError::Kernel(format!(
+                        "MTP argmax zwrócił token poza zakresem: {token_id}"
+                    )));
+                }
+                let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+                    ForgeError::Unsupported("brak hostowego embeddingu dla MTP low-memory".into())
+                })?;
+                let base = token_id as usize * p.hidden_size;
+                let row = table.get(base..base + p.hidden_size).ok_or_else(|| {
+                    ForgeError::Format("wiersz embeddingu MTP wykracza poza tabelę".into())
+                })?;
+                let staging = self
+                    .hybrid_bufs
+                    .as_ref()
+                    .expect("bufory hybrid zaalokowane")
+                    .pinned_embed
+                    .host_ptr()
+                    .expect("pinned embedding ma mapowanie hosta");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr() as *const u8,
+                        staging,
+                        p.hidden_size * 2,
+                    );
+                }
+                self.device.copy(
+                    &self
+                        .hybrid_bufs
+                        .as_ref()
+                        .expect("bufory hybrid zaalokowane")
+                        .pinned_embed,
+                    0,
+                    &mtp.token_embedding,
+                    0,
+                    p.hidden_size * 2,
+                    &self.stream,
+                )?;
+                state.record_host_embedding_gather();
+                Ok(())
+            }
+        }
+    }
+
+    fn mtp_forward_one(
+        &self,
+        state: &mut MtpDraftState,
+        mtp_kv: &KvCache,
+        want_logits: bool,
+    ) -> Result<()> {
+        let mtp = self
+            .weights
+            .mtp
+            .as_ref()
+            .expect("sprawdzone przez propose_k");
+        if mtp.layers.len() != 1 {
+            return Err(ForgeError::Unsupported(format!(
+                "runtime MTP obsługuje jeden blok, otrzymano {}",
+                mtp.layers.len()
+            )));
+        }
+        let layer = &mtp.layers[0];
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let head_dim = p.head_dim;
+        let q_dim = p.n_heads * head_dim;
+        let inter = p.intermediate_size;
+        let eps = p.rms_norm_eps;
+        let b = &self.bufs;
+        let hb = self
+            .hybrid_bufs
+            .as_ref()
+            .expect("bufory hybrid zaalokowane");
+        let stream = &self.stream;
+        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+            return Err(ForgeError::Unsupported(
+                "mtp_prepare wymaga eh_proj w Q8_0".into(),
+            ));
+        };
+        self.kernels.mtp_prepare_f16(
+            &state.prepared_hidden,
+            &mtp.token_embedding,
+            &state.recurrent_hidden,
+            &layer.enorm,
+            &layer.hnorm,
+            eh_proj,
+            hidden,
+            eps,
+            stream,
+        )?;
+        self.kernels.rmsnorm_f16(
+            &b.x,
+            &state.prepared_hidden,
+            &layer.block.attn_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
+        let attention = layer.block.attn();
+        let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
+            return Err(ForgeError::Unsupported(
+                "MTP wymaga rozdzielonych Q/K/V".into(),
+            ));
+        };
+        let qkv_grouped =
+            self.gemv_nvfp4_gguf_group(&[(&hb.q_full, q), (&b.k, k), (&b.v, v)], &b.x, stream)?;
+        if !qkv_grouped {
+            self.gemv(&hb.q_full, q, &b.x, stream)?;
+            self.gemv(&b.k, k, &b.x, stream)?;
+            self.gemv(&b.v, v, &b.x, stream)?;
+        }
+        self.kernels
+            .deinterleave_gate_f16(&hb.qc, &hb.gatec, &hb.q_full, head_dim, q_dim, stream)?;
+        if let Some(norm) = &attention.q_norm {
+            self.kernels
+                .rmsnorm_f16(&hb.qc, &hb.qc, norm, p.n_heads, head_dim, eps, stream)?;
+        }
+        if let Some(norm) = &attention.k_norm {
+            self.kernels
+                .rmsnorm_f16(&b.k, &b.k, norm, p.n_kv_heads, head_dim, eps, stream)?;
+        }
+        let n_rot = self.hybrid_n_rot();
+        self.kernels.rope_neox_partial_f16(
+            &hb.qc,
+            &state.position,
+            1,
+            p.n_heads,
+            head_dim,
+            n_rot,
+            p.rope_theta,
+            stream,
+        )?;
+        self.kernels.rope_neox_partial_f16(
+            &b.k,
+            &state.position,
+            1,
+            p.n_kv_heads,
+            head_dim,
+            n_rot,
+            p.rope_theta,
+            stream,
+        )?;
+        self.kernels.kv_append_f16(
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
+            &b.k,
+            &b.v,
+            &state.page_table,
+            &state.seq_len,
+            p.n_kv_heads,
+            mtp_kv.cfg.page_size,
+            head_dim,
+            stream,
+        )?;
+        self.kernels.attn_decode_f16(
+            &b.attn_out,
+            &hb.qc,
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
+            &state.page_table,
+            &state.seq_len,
+            1,
+            p.n_heads,
+            p.n_kv_heads,
+            head_dim,
+            mtp_kv.cfg.page_size,
+            mtp_kv.cfg.max_pages_per_seq,
+            1.0 / (head_dim as f32).sqrt(),
+            stream,
+        )?;
+        self.kernels
+            .sigmoid_mul_f16(&hb.gated, &b.attn_out, &hb.gatec, q_dim, stream)?;
+        self.gemv(&b.o_out, &attention.attn_o, &hb.gated, stream)?;
+        self.kernels.rmsnorm_residual_f16(
+            &b.x,
+            &state.prepared_hidden,
+            &b.o_out,
+            &layer.block.ffn_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
+        let ffn = layer.block.dense_ffn()?;
+        let GateUpWeights::Split { gate, up } = &ffn.gate_up else {
+            return Err(ForgeError::Unsupported(
+                "MTP wymaga rozdzielonych gate/up".into(),
+            ));
+        };
+        self.gemv(&b.gate, gate, &b.x, stream)?;
+        self.gemv(&b.up, up, &b.x, stream)?;
+        self.kernels
+            .silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+        self.gemv(&b.down, &ffn.down, &b.act, stream)?;
+        self.kernels.rmsnorm_residual_f16(
+            &b.x,
+            &state.prepared_hidden,
+            &b.down,
+            &layer.shared_head_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
+        self.device.copy(
+            &b.x,
+            0,
+            &state.recurrent_hidden,
+            0,
+            state.recurrent_hidden.len(),
+            stream,
+        )?;
+        if want_logits {
+            let output = mtp.draft_output.as_ref().unwrap_or(&mtp.output);
+            self.logits_weight_gemv(&state.logits, &b.x, output, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Sprawdza wspólne ograniczenia verifiera spekulacyjnego dla targetu.
+    pub fn validate_speculation_target(&self, draft_tokens: usize) -> Result<()> {
+        if self.is_hybrid() {
+            if !matches!(draft_tokens, 2 | 3) {
+                return Err(ForgeError::Unsupported(
+                    "hybrydowy verifier spekulacyjny wymaga budżetu 2 lub 3".into(),
+                ));
+            }
+            return self.validate_hybrid_speculation_target();
+        }
+        if self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "speculative verification does not support routed MoE models".into(),
+            ));
+        }
+        if !matches!(self.kv.cfg.quant, KvQuant::F16) {
+            return Err(ForgeError::Unsupported(
+                "speculative verification requires an F16 KV cache".into(),
+            ));
+        }
+        if self.tier.is_some() {
+            return Err(ForgeError::Unsupported(
+                "speculative verification does not support KV tiering".into(),
+            ));
+        }
+        if self.prefix_cache.is_some() {
+            return Err(ForgeError::Unsupported(
+                "speculative verification requires the prefix cache to be disabled".into(),
+            ));
+        }
+        if !matches!(
+            self.weights.lm_head,
+            DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
+        ) {
+            return Err(ForgeError::Unsupported(
+                "speculative verification requires an F16 or Q8_0 language-model head".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sprawdza target hybrydowy niezależnie od źródła tokenów draftu.
+    pub fn validate_hybrid_speculation_target(&self) -> Result<()> {
+        if !self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny wymaga hybrydowego targetu".into(),
+            ));
+        }
+        if self.weights.descriptor.params.head_dim != 256 {
+            return Err(ForgeError::Unsupported(format!(
+                "hybrydowy verifier spekulacyjny wymaga head_dim=256, otrzymano {}",
+                self.weights.descriptor.params.head_dim
+            )));
+        }
+        if self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny nie obsługuje jeszcze targetu MoE".into(),
+            ));
+        }
+        if !matches!(self.kv.cfg.quant, KvQuant::F16) {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny wymaga cache KV F16".into(),
+            ));
+        }
+        if self.tier.is_some() || self.prefix_cache.is_some() {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache"
+                    .into(),
+            ));
+        }
+        if !matches!(
+            self.weights.lm_head,
+            DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
+        ) {
+            return Err(ForgeError::Unsupported(
+                "batchowy head hybrydowego targetu wymaga F16 lub Q8_0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Zapewnia scratch logitów weryfikatora dla `cap` pozycji.
     fn ensure_verify_bufs(&mut self, cap: usize) -> Result<()> {
         if self.verify_bufs.as_ref().is_some_and(|b| b.cap >= cap) {
             return Ok(());
@@ -3380,12 +7226,2220 @@ impl Model {
             logits: self
                 .device
                 .alloc(cap * vocab * 4, MemKind::Device, Pool::Activations)?,
-            ids: self.device.alloc(cap * 4, MemKind::Device, Pool::Activations)?,
+            ids: self
+                .device
+                .alloc(cap * 4, MemKind::Device, Pool::Activations)?,
             pinned_ids: self
                 .device
                 .alloc(cap * 4, MemKind::PinnedHost, Pool::Activations)?,
         });
         Ok(())
+    }
+
+    fn ensure_hybrid_verify_bufs(&mut self, cap: usize) -> Result<()> {
+        if self
+            .hybrid_verify_bufs
+            .as_ref()
+            .is_some_and(|bufs| bufs.cap >= cap)
+        {
+            return Ok(());
+        }
+        let p = &self.weights.descriptor.params;
+        let ssm = p
+            .ssm
+            .as_ref()
+            .ok_or_else(|| ForgeError::Unsupported("target MTP nie jest hybrydowy".into()))?;
+        let q_dim = p.n_heads * p.head_dim;
+        let conv_dim = ssm.conv_dim();
+        let value_dim = ssm.value_dim();
+        let n_v = ssm.n_v_heads();
+        let conv_elems = conv_dim
+            .checked_mul(ssm.d_conv - 1)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie okna conv verifiera MTP".into()))?;
+        let state_elems = n_v
+            .checked_mul(ssm.d_state)
+            .and_then(|value| value.checked_mul(ssm.d_state))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie stanu verifiera MTP".into()))?;
+        let device = self.device.clone();
+        let a16 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 2, MemKind::Device)
+        };
+        let a32 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 4, MemKind::Device)
+        };
+        let base_pos = a32("mtp base position", &[1])?;
+        let visible_lens = a32("mtp visible lengths", &[cap])?;
+        let q_full = a16(
+            "mtp q full",
+            &[cap, hybrid_q_full_cols(q_dim, conv_dim, p.hidden_size)],
+        )?;
+        let qc = a16("mtp q", &[cap, q_dim.max(value_dim)])?;
+        let gatec = a16("mtp q gate", &[cap, q_dim.max(value_dim)])?;
+        let gated = a16("mtp gated attention", &[cap, q_dim.max(value_dim)])?;
+        let qkv_mixed = if cap > 4 {
+            q_full.clone()
+        } else {
+            a16("mtp mixed qkv", &[cap, conv_dim])?
+        };
+        let z = if cap > 4 {
+            q_full.clone()
+        } else {
+            a16("mtp z", &[cap, value_dim])?
+        };
+        let q32 = if cap > 4 {
+            qc.clone()
+        } else {
+            a16("mtp q32", &[cap, value_dim])?
+        };
+        let k32 = if cap > 4 {
+            gatec.clone()
+        } else {
+            a16("mtp k32", &[cap, value_dim])?
+        };
+        let vtok = if cap > 4 {
+            gated.clone()
+        } else {
+            a16("mtp v", &[cap, value_dim])?
+        };
+        let alpha = a16("mtp alpha", &[cap, n_v])?;
+        let beta_raw = a16("mtp beta raw", &[cap, n_v])?;
+        let g = a32("mtp g", &[cap, n_v])?;
+        let beta_f = a32("mtp beta", &[cap, n_v])?;
+        let o = a16("mtp recurrence output", &[cap, value_dim])?;
+        let normed = if cap > 4 {
+            o.clone()
+        } else {
+            a16("mtp recurrence norm", &[cap, value_dim])?
+        };
+        let state_checkpoints = if cap > 4 {
+            a32("mtp state checkpoints", &[1])?
+        } else {
+            a32("mtp state checkpoints", &[cap, state_elems])?
+        };
+        let accepted = a32("mtp accepted", &[2])?;
+        let pinned_decision = alloc_checked(
+            device.as_ref(),
+            "mtp pinned decision",
+            &[2],
+            4,
+            MemKind::PinnedHost,
+        )?;
+        let pinned = |name: &str, dims: &[usize], element_bytes: usize| {
+            alloc_checked(
+                device.as_ref(),
+                name,
+                dims,
+                element_bytes,
+                MemKind::PinnedHost,
+            )
+        };
+        let host_staging = (0..HYBRID_HOST_STAGING_SLOTS)
+            .map(|_| {
+                Ok(HybridHostStaging {
+                    embedding: pinned("mtp pinned embedding", &[cap, p.hidden_size], 2)?,
+                    page_table: pinned("mtp pinned page table", &[self.max_pages_per_seq], 4)?,
+                    ids: pinned("mtp pinned ids", &[cap], 4)?,
+                    positions: pinned("mtp pinned positions", &[cap], 4)?,
+                    visible_lens: pinned("mtp pinned visible lengths", &[cap], 4)?,
+                    base_pos: pinned("mtp pinned base position", &[1], 4)?,
+                    accepted: pinned("mtp pinned accepted", &[2], 4)?,
+                    mtp_page_table: pinned(
+                        "mtp pinned catch-up page table",
+                        &[self.max_pages_per_seq],
+                        4,
+                    )?,
+                    mtp_positions: pinned("mtp pinned catch-up positions", &[cap], 4)?,
+                    mtp_visible_lens: pinned("mtp pinned catch-up visible lengths", &[cap], 4)?,
+                    mtp_base_pos: pinned("mtp pinned catch-up base position", &[1], 4)?,
+                    mtp_seq_len: pinned("mtp pinned catch-up sequence length", &[1], 4)?,
+                    mtp_position: pinned("mtp pinned catch-up position", &[1], 4)?,
+                    ready: device.create_event()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let delta_base = self
+            .weights
+            .layers
+            .iter()
+            .map(|layer| match &layer.mixer {
+                LayerMixer::DeltaNet(_) => Ok(Some((
+                    a16("mtp conv initial", &[conv_elems])?,
+                    a16("mtp conv checkpoints", &[cap, conv_elems])?,
+                    if cap > 4 {
+                        a32("mtp state initial", &[1])?
+                    } else {
+                        a32("mtp state initial", &[state_elems])?
+                    },
+                ))),
+                LayerMixer::Attention(_) => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let checkpoint_stride = cap
+            .checked_mul(state_elems)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie offsetu checkpointów MTP".into())
+            })?;
+        let retained_state_checkpoints = if cap <= 4 {
+            Some(a32(
+                "mtp retained state checkpoints",
+                &[
+                    self.weights
+                        .layers
+                        .iter()
+                        .filter(|layer| matches!(layer.mixer, LayerMixer::DeltaNet(_)))
+                        .count(),
+                    cap,
+                    state_elems,
+                ],
+            )?)
+        } else {
+            None
+        };
+        let retain_checkpoints = retained_state_checkpoints.is_some();
+        let mut delta_index = 0usize;
+        let delta = delta_base
+            .into_iter()
+            .map(|base| match base {
+                Some((conv_initial, conv_checkpoints, state_initial)) => {
+                    let checkpoint_byte_offset =
+                        delta_index.checked_mul(checkpoint_stride).ok_or_else(|| {
+                            ForgeError::Scheduler(
+                                "przepełnienie offsetu warstwy DeltaNet MTP".into(),
+                            )
+                        })?;
+                    delta_index += 1;
+                    let commit = if cap > 4 {
+                        DeltaVerifyCommit::InPlacePrefill
+                    } else if retain_checkpoints {
+                        DeltaVerifyCommit::Retained {
+                            checkpoint_byte_offset,
+                        }
+                    } else {
+                        DeltaVerifyCommit::Recompute {
+                            q: a16("mtp delta q", &[cap, value_dim])?,
+                            k: a16("mtp delta k", &[cap, value_dim])?,
+                            v: a16("mtp delta v", &[cap, value_dim])?,
+                            g: a32("mtp delta g", &[cap, n_v])?,
+                            beta: a32("mtp delta beta", &[cap, n_v])?,
+                        }
+                    };
+                    Ok(Some(DeltaVerifyCache {
+                        commit,
+                        conv_initial,
+                        conv_checkpoints,
+                        state_initial,
+                    }))
+                }
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.hybrid_verify_graphs.clear();
+        self.hybrid_verify_graph_disabled.clear();
+        self.hybrid_verify_bufs = Some(HybridVerifyBufs {
+            cap,
+            base_pos,
+            visible_lens,
+            q_full,
+            qc,
+            gatec,
+            gated,
+            qkv_mixed,
+            z,
+            q32,
+            k32,
+            vtok,
+            alpha,
+            beta_raw,
+            g,
+            beta_f,
+            o,
+            normed,
+            state_checkpoints,
+            retained_state_checkpoints,
+            accepted,
+            pinned_decision,
+            host_staging,
+            delta,
+        });
+        Ok(())
+    }
+
+    fn ensure_mtp_b2_bufs(&mut self) -> Result<()> {
+        if self.mtp_b2_bufs.is_some() {
+            return Ok(());
+        }
+        const BATCH: usize = 2;
+        const STEPS: usize = 4;
+        let checked_mul = |name: &str, left: usize, right: usize| {
+            left.checked_mul(right).ok_or_else(|| {
+                ForgeError::Scheduler(format!("przepełnienie wymiaru {name}: {left} * {right}"))
+            })
+        };
+        let checked_add = |name: &str, left: usize, right: usize| {
+            left.checked_add(right).ok_or_else(|| {
+                ForgeError::Scheduler(format!("przepełnienie wymiaru {name}: {left} + {right}"))
+            })
+        };
+        let total = checked_mul("mtp b2 total", BATCH, STEPS)?;
+        let p = &self.weights.descriptor.params;
+        let ssm = p
+            .ssm
+            .as_ref()
+            .ok_or_else(|| ForgeError::Unsupported("target MTP B2 nie jest hybrydowy".into()))?;
+        if ssm.d_state != 128 {
+            return Err(ForgeError::Unsupported(format!(
+                "target MTP B2 wymaga d_state=128, otrzymano {}",
+                ssm.d_state
+            )));
+        }
+        let q_dim = checked_mul("mtp b2 q", p.n_heads, p.head_dim)?;
+        let key_dim = checked_mul("mtp b2 key", ssm.d_state, ssm.n_group)?;
+        let n_v = ssm.n_v_heads();
+        let value_dim = checked_mul("mtp b2 value", ssm.d_state, n_v)?;
+        let doubled_key = checked_mul("mtp b2 doubled key", key_dim, 2)?;
+        let conv_dim = checked_add("mtp b2 conv", doubled_key, value_dim)?;
+        let conv_history = ssm
+            .d_conv
+            .checked_sub(1)
+            .ok_or_else(|| ForgeError::Scheduler("MTP B2 wymaga d_conv > 0".into()))?;
+        let conv_elems = checked_mul("mtp b2 conv history", conv_dim, conv_history)?;
+        let state_head = checked_mul("mtp b2 state head", ssm.d_state, ssm.d_state)?;
+        let state_elems = checked_mul("mtp b2 state", n_v, state_head)?;
+        let doubled_q = checked_mul("mtp b2 doubled q", q_dim, 2)?;
+        let doubled_hidden = checked_mul("mtp b2 doubled hidden", p.hidden_size, 2)?;
+        let q_full_cols = doubled_q.max(conv_dim).max(doubled_hidden);
+        let device = self.device.clone();
+        let a16 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 2, MemKind::Device)
+        };
+        let a32 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 4, MemKind::Device)
+        };
+        let delta = self
+            .weights
+            .layers
+            .iter()
+            .map(|layer| match layer.mixer {
+                LayerMixer::Attention(_) => Ok(None),
+                LayerMixer::DeltaNet(_) => Ok(Some(MtpB2DeltaCache {
+                    conv_initial: a16("mtp b2 conv initial", &[BATCH, conv_elems])?,
+                    conv_checkpoints: a16("mtp b2 conv checkpoints", &[BATCH, STEPS, conv_elems])?,
+                    state_initial: a32("mtp b2 state initial", &[BATCH, state_elems])?,
+                    q: a16("mtp b2 delta q", &[total, value_dim])?,
+                    k: a16("mtp b2 delta k", &[total, value_dim])?,
+                    v: a16("mtp b2 delta v", &[total, value_dim])?,
+                    g: a32("mtp b2 delta g", &[total, n_v])?,
+                    beta: a32("mtp b2 delta beta", &[total, n_v])?,
+                })),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.mtp_b2_bufs = Some(MtpB2Bufs {
+            q_full: a16("mtp b2 q full", &[total, q_full_cols])?,
+            qc: a16("mtp b2 q", &[total, q_dim.max(value_dim)])?,
+            gatec: a16("mtp b2 q gate", &[total, q_dim.max(value_dim)])?,
+            gated: a16("mtp b2 gated", &[total, q_dim.max(value_dim)])?,
+            qkv_mixed: a16("mtp b2 qkv mixed", &[total, conv_dim])?,
+            z: a16("mtp b2 z", &[total, value_dim])?,
+            alpha: a16("mtp b2 alpha", &[total, n_v])?,
+            beta_raw: a16("mtp b2 beta raw", &[total, n_v])?,
+            o: a16("mtp b2 recurrence output", &[total, value_dim])?,
+            normed: a16("mtp b2 recurrence norm", &[total, value_dim])?,
+            page_tables: a32("mtp b2 page tables", &[BATCH, self.max_pages_per_seq])?,
+            base_positions: a32("mtp b2 base positions", &[BATCH])?,
+            visible_lens: a32("mtp b2 visible lengths", &[total])?,
+            decisions: a32("mtp b2 decisions", &[BATCH, 2])?,
+            pinned_decisions: alloc_checked(
+                device.as_ref(),
+                "mtp b2 pinned decisions",
+                &[BATCH * 2 + BATCH * 5],
+                4,
+                MemKind::PinnedHost,
+            )?,
+            pinned_metadata: alloc_checked(
+                device.as_ref(),
+                "mtp b2 pinned metadata",
+                &[BATCH + BATCH * self.max_pages_per_seq],
+                4,
+                MemKind::PinnedHost,
+            )?,
+            pinned_mtp_metadata: alloc_checked(
+                device.as_ref(),
+                "mtp b2 pinned catch-up metadata",
+                &[BATCH + BATCH * self.max_pages_per_seq],
+                4,
+                MemKind::PinnedHost,
+            )?,
+            catchup_embeddings: a16("mtp b2 catch-up embeddings", &[total, p.hidden_size])?,
+            mtp_initial_hidden: a16("mtp b2 catch-up initial hidden", &[BATCH, p.hidden_size])?,
+            mtp_seq_lens: a32("mtp b2 catch-up sequence lengths", &[BATCH])?,
+            mtp_positions: a32("mtp b2 catch-up positions", &[BATCH])?,
+            selected_states: a32("mtp b2 selected states", &[BATCH, state_elems])?,
+            selected_conv: a16("mtp b2 selected conv", &[BATCH, conv_elems])?,
+            selected_hidden: a16("mtp b2 selected hidden", &[BATCH, p.hidden_size])?,
+            delta,
+        });
+        Ok(())
+    }
+
+    fn ensure_hybrid_prefill_b2_bufs(&mut self) -> Result<()> {
+        if self.hybrid_prefill_b2_bufs.is_some() {
+            return Ok(());
+        }
+        const BATCH: usize = 2;
+        const STEPS: usize = 32;
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("prefill B2 T32 wymaga targetu hybrydowego".into())
+        })?;
+        let elements = |name: &str, dimensions: &[usize]| {
+            dimensions.iter().try_fold(1usize, |total, &dimension| {
+                total.checked_mul(dimension).ok_or_else(|| {
+                    ForgeError::Scheduler(format!(
+                        "przepełnienie wymiaru {name}: {dimensions:?}"
+                    ))
+                })
+            })
+        };
+        let bytes = |name: &str, dimensions: &[usize], element_bytes: usize| {
+            elements(name, dimensions)?
+                .checked_mul(element_bytes)
+                .ok_or_else(|| ForgeError::Scheduler(format!("przepełnienie bufora {name}")))
+        };
+        let total = elements("prefill B2 total", &[BATCH, STEPS])?;
+        let q_dim = elements("prefill B2 q", &[p.n_heads, p.head_dim])?;
+        let kv_dim = elements("prefill B2 kv", &[p.n_kv_heads, p.head_dim])?;
+        let key_dim = elements("prefill B2 key", &[ssm.d_state, ssm.n_group])?;
+        let n_v = ssm.n_v_heads();
+        let value_dim = elements("prefill B2 value", &[ssm.d_state, n_v])?;
+        let conv_dim = key_dim
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(value_dim))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie conv prefill B2".into()))?;
+        let conv_history = ssm
+            .d_conv
+            .checked_sub(1)
+            .ok_or_else(|| ForgeError::Scheduler("prefill B2 wymaga d_conv > 0".into()))?;
+        let conv_elems = elements("prefill B2 conv state", &[conv_dim, conv_history])?;
+        let state_elems = elements(
+            "prefill B2 state",
+            &[n_v, ssm.d_state, ssm.d_state],
+        )?;
+        let q_full_cols = hybrid_q_full_cols(q_dim, conv_dim, p.hidden_size);
+        let page_table_elems = elements(
+            "prefill B2 page tables",
+            &[BATCH, self.max_pages_per_seq],
+        )?;
+        let metadata_elems = elements("prefill B2 metadata rows", &[3, total])?
+            .checked_add(BATCH)
+            .and_then(|value| value.checked_add(page_table_elems))
+            .and_then(|value| value.checked_add(BATCH * 2))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie metadata prefill B2".into()))?;
+        let mut required = 0usize;
+        let mut reserve = |name: &str, dimensions: &[usize], element_bytes: usize| -> Result<()> {
+            let allocation = bytes(name, dimensions, element_bytes)?
+                .max(1)
+                .checked_next_multiple_of(DEVICE_ALLOC_ALIGN)
+                .ok_or_else(|| ForgeError::Scheduler(format!("przepełnienie alokacji {name}")))?;
+            required = required
+                .checked_add(allocation)
+                .ok_or_else(|| ForgeError::Scheduler("przepełnienie preflightu prefill B2".into()))?;
+            Ok(())
+        };
+        for (name, rows, cols, element_bytes) in [
+            ("h", total, p.hidden_size, 2),
+            ("x", total, p.hidden_size, 2),
+            ("k", total, kv_dim, 2),
+            ("v", total, kv_dim, 2),
+            ("attn", total, q_dim, 2),
+            ("o_out", total, p.hidden_size, 2),
+            ("gate", total, p.intermediate_size, 2),
+            ("up", total, p.intermediate_size, 2),
+            ("down", total, p.hidden_size, 2),
+            ("q_full", total, q_full_cols, 2),
+            ("qc", total, q_dim.max(value_dim), 2),
+            ("gatec", total, q_dim.max(value_dim), 2),
+            ("gated", total, q_dim.max(value_dim), 2),
+            ("qkv_mixed", total, conv_dim, 2),
+            ("z", total, value_dim, 2),
+            ("alpha", total, n_v, 2),
+            ("beta_raw", total, n_v, 2),
+            ("recurrence", total, value_dim, 2),
+            ("normed", total, value_dim, 2),
+        ] {
+            reserve(name, &[rows, cols], element_bytes)?;
+        }
+        reserve("ids", &[total], 4)?;
+        reserve("positions", &[total], 4)?;
+        reserve("page tables", &[page_table_elems], 4)?;
+        reserve("base positions", &[BATCH], 4)?;
+        reserve("visible lengths", &[total], 4)?;
+        reserve("decisions", &[BATCH, 2], 4)?;
+        reserve("final hidden", &[BATCH, p.hidden_size], 2)?;
+        reserve("logits", &[BATCH, p.vocab_size], 4)?;
+        reserve("pinned metadata", &[metadata_elems], 4)?;
+        reserve("pinned logits", &[BATCH, p.vocab_size], 4)?;
+        reserve("final conv", &[BATCH, conv_elems], 2)?;
+        reserve("final states", &[BATCH, state_elems], 4)?;
+        let delta_layers = self
+            .weights
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.mixer, LayerMixer::DeltaNet(_)))
+            .count();
+        let mut per_delta = 0usize;
+        for (name, dimensions, element_bytes) in [
+            ("conv initial", vec![BATCH, conv_elems], 2),
+            ("state initial", vec![BATCH, state_elems], 4),
+            ("delta q", vec![total, value_dim], 2),
+            ("delta k", vec![total, value_dim], 2),
+            ("delta v", vec![total, value_dim], 2),
+            ("delta g", vec![total, n_v], 4),
+            ("delta beta", vec![total, n_v], 4),
+        ] {
+            let allocation = bytes(name, &dimensions, element_bytes)?
+                .max(1)
+                .checked_next_multiple_of(DEVICE_ALLOC_ALIGN)
+                .ok_or_else(|| ForgeError::Scheduler(format!("przepełnienie alokacji {name}")))?;
+            per_delta = per_delta.checked_add(allocation).ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie scratchu warstwy Delta prefill B2".into())
+            })?;
+        }
+        required = per_delta
+            .checked_mul(delta_layers)
+            .and_then(|delta| required.checked_add(delta))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie preflightu prefill B2".into()))?;
+        if self
+            .device
+            .pool_available(Pool::Activations)
+            .is_some_and(|available| required > available)
+        {
+            return Err(ForgeError::OutOfMemory {
+                requested: required,
+                available: self.device.pool_available(Pool::Activations).unwrap_or(0),
+            });
+        }
+
+        let device = self.device.clone();
+        let a16 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 2, MemKind::Device)
+        };
+        let a32 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 4, MemKind::Device)
+        };
+        let gate = a16("prefill B2 gate", &[total, p.intermediate_size])?;
+        let delta = self
+            .weights
+            .layers
+            .iter()
+            .map(|layer| match layer.mixer {
+                LayerMixer::Attention(_) => Ok(None),
+                LayerMixer::DeltaNet(_) => Ok(Some(HybridPrefillB2DeltaCache {
+                    conv_initial: a16("prefill B2 conv initial", &[BATCH, conv_elems])?,
+                    state_initial: a32("prefill B2 state initial", &[BATCH, state_elems])?,
+                    q: a16("prefill B2 delta q", &[total, value_dim])?,
+                    k: a16("prefill B2 delta k", &[total, value_dim])?,
+                    v: a16("prefill B2 delta v", &[total, value_dim])?,
+                    g: a32("prefill B2 delta g", &[total, n_v])?,
+                    beta: a32("prefill B2 delta beta", &[total, n_v])?,
+                })),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.hybrid_prefill_b2_bufs = Some(HybridPrefillB2Bufs {
+            h: a16("prefill B2 h", &[total, p.hidden_size])?,
+            x: a16("prefill B2 x", &[total, p.hidden_size])?,
+            k: a16("prefill B2 k", &[total, kv_dim])?,
+            v: a16("prefill B2 v", &[total, kv_dim])?,
+            attn_out: a16("prefill B2 attention", &[total, q_dim])?,
+            o_out: a16("prefill B2 mixer output", &[total, p.hidden_size])?,
+            gate: gate.clone(),
+            up: a16("prefill B2 up", &[total, p.intermediate_size])?,
+            act: gate,
+            down: a16("prefill B2 down", &[total, p.hidden_size])?,
+            ids: a32("prefill B2 ids", &[total])?,
+            positions: a32("prefill B2 positions", &[total])?,
+            q_full: a16("prefill B2 q full", &[total, q_full_cols])?,
+            qc: a16("prefill B2 qc", &[total, q_dim.max(value_dim)])?,
+            gatec: a16("prefill B2 gatec", &[total, q_dim.max(value_dim)])?,
+            gated: a16("prefill B2 gated", &[total, q_dim.max(value_dim)])?,
+            qkv_mixed: a16("prefill B2 qkv mixed", &[total, conv_dim])?,
+            z: a16("prefill B2 z", &[total, value_dim])?,
+            alpha: a16("prefill B2 alpha", &[total, n_v])?,
+            beta_raw: a16("prefill B2 beta raw", &[total, n_v])?,
+            o: a16("prefill B2 recurrence", &[total, value_dim])?,
+            normed: a16("prefill B2 recurrence norm", &[total, value_dim])?,
+            page_tables: a32("prefill B2 page tables", &[page_table_elems])?,
+            base_positions: a32("prefill B2 base positions", &[BATCH])?,
+            visible_lens: a32("prefill B2 visible lengths", &[total])?,
+            decisions: a32("prefill B2 decisions", &[BATCH, 2])?,
+            final_hidden: a16("prefill B2 final hidden", &[BATCH, p.hidden_size])?,
+            logits: a32("prefill B2 logits", &[BATCH, p.vocab_size])?,
+            pinned_metadata: alloc_checked(
+                device.as_ref(),
+                "prefill B2 pinned metadata",
+                &[metadata_elems],
+                4,
+                MemKind::PinnedHost,
+            )?,
+            pinned_logits: alloc_checked(
+                device.as_ref(),
+                "prefill B2 pinned logits",
+                &[BATCH, p.vocab_size],
+                4,
+                MemKind::PinnedHost,
+            )?,
+            final_conv: a16("prefill B2 final conv", &[BATCH, conv_elems])?,
+            final_states: a32("prefill B2 final states", &[BATCH, state_elems])?,
+            delta,
+        });
+        Ok(())
+    }
+
+    pub fn validate_native_mtp_target(&self) -> Result<()> {
+        self.validate_hybrid_speculation_target()?;
+        if !self.has_native_mtp() {
+            return Err(ForgeError::Unsupported(
+                "checkpoint nie ma obsługiwanego natywnego proposera MTP".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Zwraca dostępny budget 0/2/3 po sprawdzeniu targetu, kontekstu i stron
+    /// dla `fed` oraz draftu. Żądane K=3 może zostać przycięte do K=2.
+    pub fn native_mtp_available_budget(&self, seq: &SeqKv, requested: usize) -> usize {
+        if self.validate_native_mtp_target().is_err() || requested < 2 {
+            return 0;
+        }
+        for budget in (2..=requested.min(3)).rev() {
+            let Some(end) = seq
+                .len
+                .checked_add(1)
+                .and_then(|length| length.checked_add(budget))
+            else {
+                continue;
+            };
+            if end > self.weights.descriptor.params.max_position_embeddings {
+                continue;
+            }
+            let required_pages = end
+                .div_ceil(self.kv.cfg.page_size)
+                .saturating_sub(seq.pages.len());
+            if required_pages <= self.available_pages() {
+                return budget;
+            }
+        }
+        0
+    }
+
+    fn hybrid_verify_delta_layer(
+        &self,
+        layer_index: usize,
+        delta: &DeltaNetWeights,
+        t: usize,
+        inplace_prefill: bool,
+    ) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
+        let conv_dim = ssm.conv_dim();
+        let value_dim = ssm.value_dim();
+        let n_k = ssm.n_k_heads();
+        let n_v = ssm.n_v_heads();
+        let d_state = ssm.d_state;
+        let conv_elems = conv_dim * (ssm.d_conv - 1);
+        let stream = &self.stream;
+        let kernels = &self.kernels;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrid verify są gotowe");
+        let cache = hv.delta[layer_index]
+            .as_ref()
+            .expect("warstwa DeltaNet ma cache verifiera");
+        let state = self.active_ssm()[layer_index]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+
+        self.gemm(&hv.qkv_mixed, &delta.in_proj, &pb.x, t, stream)?;
+        let mut prepared = Self::delta_input_q8_cols(delta)
+            .filter(|_| matches!(t, 6 | 8))
+            .map(|cols| self.kernels.prepare_q8_1(&pb.x, cols, t, stream))
+            .transpose()?;
+        if let Some(prepared) = prepared.as_mut() {
+            if !inplace_prefill {
+                self.gemm_q8_prepared(&hv.z, &delta.gate_proj, prepared, t)?;
+            }
+            self.gemm_q8_prepared(&hv.alpha, &delta.alpha_proj, prepared, t)?;
+            self.gemm_q8_prepared(&hv.beta_raw, &delta.beta_proj, prepared, t)?;
+        } else {
+            if !inplace_prefill {
+                self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+            }
+            self.gemm(&hv.alpha, &delta.alpha_proj, &pb.x, t, stream)?;
+            self.gemm(&hv.beta_raw, &delta.beta_proj, &pb.x, t, stream)?;
+        }
+
+        self.device.copy(
+            &state.conv,
+            0,
+            &cache.conv_initial,
+            0,
+            conv_elems * 2,
+            stream,
+        )?;
+        kernels.deltanet_prepare_f16(
+            &hv.q32,
+            &hv.k32,
+            &hv.vtok,
+            &hv.g,
+            &hv.beta_f,
+            &cache.conv_checkpoints,
+            &cache.conv_initial,
+            &hv.qkv_mixed,
+            &delta.conv1d,
+            &hv.alpha,
+            &hv.beta_raw,
+            &delta.dt_bias,
+            &delta.a,
+            t,
+            n_k,
+            n_v,
+            d_state,
+            ssm.d_conv,
+            p.rms_norm_eps,
+            stream,
+        )?;
+        if inplace_prefill {
+            if let Some(prepared) = prepared.as_mut() {
+                self.gemm_q8_prepared(&hv.z, &delta.gate_proj, prepared, t)?;
+            } else {
+                self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
+            }
+        }
+        drop(prepared);
+        if inplace_prefill {
+            kernels.deltanet_gated_scan_inplace_f16(
+                &hv.o,
+                &state.state,
+                &hv.q32,
+                &hv.k32,
+                &hv.vtok,
+                &hv.g,
+                &hv.beta_f,
+                t,
+                n_v,
+                d_state,
+                stream,
+            )?;
+        } else {
+            let (state_checkpoints, checkpoint_byte_offset) = match &cache.commit {
+                DeltaVerifyCommit::InPlacePrefill => {
+                    return Err(ForgeError::Scheduler(
+                        "scratch prefill wymaga skanu DeltaNet in-place".into(),
+                    ));
+                }
+                DeltaVerifyCommit::Retained {
+                    checkpoint_byte_offset,
+                } => (
+                    hv.retained_state_checkpoints
+                        .as_ref()
+                        .expect("retained checkpointy DeltaNet są zaalokowane"),
+                    *checkpoint_byte_offset,
+                ),
+                DeltaVerifyCommit::Recompute { .. } => (&hv.state_checkpoints, 0),
+            };
+            kernels.deltanet_gated_scan_f16_at(
+                &hv.o,
+                state_checkpoints,
+                checkpoint_byte_offset,
+                &state.state,
+                &hv.q32,
+                &hv.k32,
+                &hv.vtok,
+                &hv.g,
+                &hv.beta_f,
+                t,
+                n_v,
+                d_state,
+                stream,
+            )?;
+            if let DeltaVerifyCommit::Recompute { q, k, v, g, beta } = &cache.commit {
+                self.device
+                    .copy(&hv.q32, 0, q, 0, t * value_dim * 2, stream)?;
+                self.device
+                    .copy(&hv.k32, 0, k, 0, t * value_dim * 2, stream)?;
+                self.device
+                    .copy(&hv.vtok, 0, v, 0, t * value_dim * 2, stream)?;
+                self.device.copy(&hv.g, 0, g, 0, t * n_v * 4, stream)?;
+                self.device
+                    .copy(&hv.beta_f, 0, beta, 0, t * n_v * 4, stream)?;
+            }
+        }
+        kernels.deltanet_gated_rmsnorm_f16(
+            &hv.normed,
+            &hv.o,
+            &hv.z,
+            &delta.ssm_norm,
+            t * n_v,
+            d_state,
+            p.rms_norm_eps,
+            stream,
+        )?;
+        self.gemm(&pb.o_out, &delta.out_proj, &hv.normed, t, stream)
+    }
+
+    fn hybrid_verify_attention_layer(
+        &self,
+        layer_index: usize,
+        attention: &AttnWeights,
+        t: usize,
+    ) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        let stream = &self.stream;
+        let kernels = &self.kernels;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrid verify są gotowe");
+        let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier MTP wymaga rozdzielonych Q/K/V".into(),
+            ));
+        };
+        self.gemm(&hv.q_full, q, &pb.x, t, stream)?;
+        kernels.deinterleave_gate_f16(
+            &hv.qc,
+            &hv.gatec,
+            &hv.q_full,
+            p.head_dim,
+            t * q_dim,
+            stream,
+        )?;
+        if let Some(norm) = &attention.q_norm {
+            kernels.rmsnorm_f16(
+                &hv.qc,
+                &hv.qc,
+                norm,
+                t * p.n_heads,
+                p.head_dim,
+                p.rms_norm_eps,
+                stream,
+            )?;
+        }
+        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+        if let Some(norm) = &attention.k_norm {
+            kernels.rmsnorm_f16(
+                &pb.k,
+                &pb.k,
+                norm,
+                t * p.n_kv_heads,
+                p.head_dim,
+                p.rms_norm_eps,
+                stream,
+            )?;
+        }
+        let n_rot = self.hybrid_n_rot();
+        kernels.rope_neox_partial_f16(
+            &hv.qc,
+            &pb.positions,
+            t,
+            p.n_heads,
+            p.head_dim,
+            n_rot,
+            p.rope_theta,
+            stream,
+        )?;
+        kernels.rope_neox_partial_f16(
+            &pb.k,
+            &pb.positions,
+            t,
+            p.n_kv_heads,
+            p.head_dim,
+            n_rot,
+            p.rope_theta,
+            stream,
+        )?;
+        kernels.kv_append_batch_device_pos_f16(
+            &self.kv.k[self.target_kv_layer(layer_index)],
+            &self.kv.v[self.target_kv_layer(layer_index)],
+            &pb.k,
+            &pb.v,
+            &self.page_table_dev,
+            &hv.base_pos,
+            t,
+            p.n_kv_heads,
+            self.kv.cfg.page_size,
+            p.head_dim,
+            stream,
+        )?;
+        if self.device.caps().vendor == Vendor::Nvidia {
+            kernels.attn_decode_batch_exact_f16_hd256(
+                &pb.attn_out,
+                &hv.qc,
+                &self.kv.k[self.target_kv_layer(layer_index)],
+                &self.kv.v[self.target_kv_layer(layer_index)],
+                &self.page_table_dev,
+                &hv.visible_lens,
+                t,
+                p.n_heads,
+                p.n_kv_heads,
+                self.kv.cfg.page_size,
+                self.max_pages_per_seq,
+                1.0 / (p.head_dim as f32).sqrt(),
+                stream,
+            )?;
+        } else {
+            kernels.attn_prefill_device_pos_f16_hd256(
+                &pb.attn_out,
+                &hv.qc,
+                &self.kv.k[self.target_kv_layer(layer_index)],
+                &self.kv.v[self.target_kv_layer(layer_index)],
+                &self.page_table_dev,
+                &hv.base_pos,
+                t,
+                p.n_heads,
+                p.n_kv_heads,
+                self.kv.cfg.page_size,
+                1.0 / (p.head_dim as f32).sqrt(),
+                stream,
+            )?;
+        }
+        kernels.sigmoid_mul_f16(&hv.gated, &pb.attn_out, &hv.gatec, t * q_dim, stream)?;
+        debug_assert_eq!(attention.attn_o.cols(), q_dim);
+        debug_assert!(pb.k.len() >= t * kv_dim * 2);
+        self.gemm(&pb.o_out, &attention.attn_o, &hv.gated, t, stream)
+    }
+
+    /// Zatwierdza na GPU stan odpowiadający zaakceptowanemu prefiksowi.
+    fn run_hybrid_verify_postlude(&self, t: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let vb = self.verify_bufs.as_ref().expect("bufory verify są gotowe");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrid verify są gotowe");
+        self.kernels
+            .mtp_verify_decide(&hv.accepted, &vb.ids, &pb.ids, t, &self.stream)?;
+        self.kernels.mtp_select_row_f16(
+            &self.bufs.h,
+            &pb.h,
+            &hv.accepted,
+            p.hidden_size,
+            &self.stream,
+        )?;
+        self.kernels.mtp_select_row_f16(
+            &self.bufs.x,
+            &pb.x,
+            &hv.accepted,
+            p.hidden_size,
+            &self.stream,
+        )?;
+        self.kernels.mtp_select_row_f32(
+            &self.bufs.logits,
+            &vb.logits,
+            &hv.accepted,
+            p.vocab_size,
+            &self.stream,
+        )?;
+
+        let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
+        let conv_elems = ssm.conv_dim() * (ssm.d_conv - 1);
+        for (layer_index, cache) in hv.delta.iter().enumerate() {
+            let Some(cache) = cache else { continue };
+            let state = self.active_ssm()[layer_index]
+                .as_ref()
+                .expect("warstwa DeltaNet ma stan");
+            match &cache.commit {
+                DeltaVerifyCommit::InPlacePrefill => {
+                    return Err(ForgeError::Scheduler(
+                        "scratch prefill nie może zatwierdzać verifiera MTP".into(),
+                    ));
+                }
+                DeltaVerifyCommit::Retained {
+                    checkpoint_byte_offset,
+                } => self.kernels.deltanet_commit_checkpoint_f32_at(
+                    &state.state,
+                    hv.retained_state_checkpoints
+                        .as_ref()
+                        .expect("retained checkpointy DeltaNet są zaalokowane"),
+                    *checkpoint_byte_offset,
+                    &hv.accepted,
+                    t,
+                    ssm.n_v_heads(),
+                    ssm.d_state,
+                    &self.stream,
+                )?,
+                DeltaVerifyCommit::Recompute { q, k, v, g, beta } => {
+                    self.kernels.deltanet_gated_scan_f16(
+                        &hv.o,
+                        &hv.state_checkpoints,
+                        &state.state,
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        t,
+                        ssm.n_v_heads(),
+                        ssm.d_state,
+                        &self.stream,
+                    )?;
+                    self.kernels.deltanet_commit_checkpoint_f32(
+                        &state.state,
+                        &hv.state_checkpoints,
+                        &hv.accepted,
+                        t,
+                        ssm.n_v_heads(),
+                        ssm.d_state,
+                        &self.stream,
+                    )?;
+                }
+            }
+            self.kernels.mtp_select_row_f16(
+                &state.conv,
+                &cache.conv_checkpoints,
+                &hv.accepted,
+                conv_elems,
+                &self.stream,
+            )?;
+        }
+        self.device
+            .copy(&hv.accepted, 0, &hv.pinned_decision, 0, 8, &self.stream)
+    }
+
+    fn commit_hybrid_prefill_delta_layer(&self, layer_index: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrydowego prefill są gotowe");
+        let cache = hv.delta[layer_index]
+            .as_ref()
+            .expect("warstwa DeltaNet ma cache skanu");
+        let state = self.active_ssm()[layer_index]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        self.kernels.mtp_select_row_f16(
+            &state.conv,
+            &cache.conv_checkpoints,
+            &hv.accepted,
+            ssm.conv_dim() * (ssm.d_conv - 1),
+            &self.stream,
+        )
+    }
+
+    /// Uruchamia wspólny batched forward hybrydowego targetu.
+    fn run_hybrid_batch_layers(&self, t: usize, commit_prefill: bool) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        self.kernels.rmsnorm_f16(
+            &pb.x,
+            &pb.h,
+            &self.weights.layers[0].attn_norm,
+            t,
+            p.hidden_size,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+
+        for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+            match &layer.mixer {
+                LayerMixer::Attention(attention) => {
+                    self.hybrid_verify_attention_layer(layer_index, attention, t)?
+                }
+                LayerMixer::DeltaNet(delta) => {
+                    self.hybrid_verify_delta_layer(layer_index, delta, t, commit_prefill)?;
+                    if commit_prefill {
+                        self.commit_hybrid_prefill_delta_layer(layer_index)?;
+                    }
+                }
+            }
+            self.kernels.rmsnorm_residual_f16(
+                &pb.x,
+                &pb.h,
+                &pb.o_out,
+                &layer.ffn_norm,
+                t,
+                p.hidden_size,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return Err(ForgeError::Unsupported(
+                    "hybrydowy verifier MTP nie obsługuje jeszcze targetu MoE".into(),
+                ));
+            };
+            match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    self.gemm_rows(
+                        &pb.gate,
+                        weight,
+                        &pb.x,
+                        t,
+                        0,
+                        p.intermediate_size,
+                        &self.stream,
+                    )?;
+                    self.gemm_rows(
+                        &pb.up,
+                        weight,
+                        &pb.x,
+                        t,
+                        p.intermediate_size,
+                        p.intermediate_size,
+                        &self.stream,
+                    )?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemm(&pb.gate, gate, &pb.x, t, &self.stream)?;
+                    self.gemm(&pb.up, up, &pb.x, t, &self.stream)?;
+                }
+            }
+            self.kernels.silu_mul_f16(
+                &pb.act,
+                &pb.gate,
+                &pb.up,
+                t * p.intermediate_size,
+                &self.stream,
+            )?;
+            self.gemm(&pb.down, &ffn.down, &pb.act, t, &self.stream)?;
+            let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                &self.weights.layers[layer_index + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            self.kernels.rmsnorm_residual_f16(
+                &pb.x,
+                &pb.h,
+                &pb.down,
+                next_norm,
+                t,
+                p.hidden_size,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Uruchamia stałą część verifiera hybrydowego bez synchronizacji z hostem.
+    fn run_hybrid_verify_compute(&self, t: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        self.run_hybrid_batch_layers(t, false)?;
+
+        let vb = self.verify_bufs.as_ref().expect("bufory verify są gotowe");
+        self.logits_gemm(&vb.logits, &pb.x, t, &self.stream)?;
+        self.kernels.sample_batched_argmax_f32(
+            &vb.ids,
+            &vb.logits,
+            t,
+            p.vocab_size,
+            &self.stream,
+        )?;
+        self.run_hybrid_verify_postlude(t)
+    }
+
+    /// Przechwytuje rozgrzany łańcuch verifiera dla stałego T.
+    fn capture_hybrid_verify_compute(&self, t: usize) -> Result<ExecGraph> {
+        self.device.begin_capture(&self.stream)?;
+        match self.run_hybrid_verify_compute(t) {
+            Ok(()) => self.device.end_capture(&self.stream),
+            Err(error) => {
+                let _ = self.device.end_capture(&self.stream);
+                Err(error)
+            }
+        }
+    }
+
+    /// Po pierwszym wykonaniu eager zapisuje graf właściwy dla slotu i T.
+    fn capture_hybrid_verify_graph_if_needed(&mut self, slot: usize, t: usize) {
+        if std::env::var("FORGE_HYBRID_VERIFY_GRAPH").is_ok_and(|value| value == "0") {
+            return;
+        }
+        if !self.device.caps().supports_graph_capture {
+            return;
+        }
+        if !matches!(t, 3 | 4) {
+            return;
+        }
+        let key = (slot, t);
+        if self.hybrid_verify_graphs.contains_key(&key)
+            || self.hybrid_verify_graph_disabled.contains(&key)
+        {
+            return;
+        }
+        match self.capture_hybrid_verify_compute(t) {
+            Ok(captured) => {
+                self.hybrid_verify_graphs.insert(key, captured);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "wyłączono capture grafu hybrid verifier slot={slot} T={t}: {error}"
+                );
+                self.hybrid_verify_graph_disabled.insert(key);
+            }
+        }
+    }
+
+    fn verify_hybrid_greedy_draft_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        budget: usize,
+        mtp_states: &mut [MtpDraftState; 2],
+        mtp_kv: &mut KvCache,
+        external_sources: [bool; 2],
+    ) -> Result<MtpB2Verification> {
+        if !matches!(budget, 2 | 3) {
+            return Err(ForgeError::Unsupported(
+                "verifier MTP B2 wymaga wspólnego K=2 lub K=3".into(),
+            ));
+        }
+        let t = budget.checked_add(1).ok_or_else(|| {
+            ForgeError::Scheduler("przepełnienie liczby kroków verifiera MTP B2".into())
+        })?;
+        let checked_elements = |name: &str, dimensions: &[usize]| {
+            dimensions.iter().try_fold(1usize, |elements, &dimension| {
+                elements.checked_mul(dimension).ok_or_else(|| {
+                    ForgeError::Scheduler(format!(
+                        "przepełnienie wymiaru {name}: {dimensions:?}"
+                    ))
+                })
+            })
+        };
+        let total = checked_elements("mtp b2 total", &[2, t])?;
+        self.validate_hybrid_speculation_target()?;
+        self.ensure_prefill_bufs()?;
+        self.ensure_verify_bufs(total)?;
+        self.ensure_mtp_b2_bufs()?;
+        for seq in seqs.iter_mut() {
+            self.activate_hybrid_sequence(seq)?;
+        }
+        let leases = [
+            seqs[0].hybrid_state.expect("lane0 ma lease"),
+            seqs[1].hybrid_state.expect("lane1 ma lease"),
+        ];
+        let p = self.weights.descriptor.params.clone();
+        let ssm = p.ssm.as_ref().expect("target B2 ma DeltaNet");
+        let q_elements = checked_elements("mtp b2 q", &[total, p.n_heads, p.head_dim])?;
+        let q_norm_rows = checked_elements("mtp b2 q norm", &[total, p.n_heads])?;
+        let kv_norm_rows = checked_elements("mtp b2 kv norm", &[total, p.n_kv_heads])?;
+        let delta_norm_rows = checked_elements("mtp b2 delta norm", &[total, ssm.n_v_heads()])?;
+        let ffn_rows = checked_elements("mtp b2 ffn", &[total, p.intermediate_size])?;
+        let key_width = checked_elements("mtp b2 key width", &[ssm.d_state, ssm.n_group])?;
+        let value_width = checked_elements("mtp b2 value width", &[ssm.d_state, ssm.n_v_heads()])?;
+        let conv_width = key_width
+            .checked_mul(2)
+            .and_then(|key| key.checked_add(value_width))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie szerokości conv MTP B2".into()))?;
+        let conv_elems = checked_elements(
+            "mtp b2 conv state",
+            &[
+                conv_width,
+                ssm.d_conv
+                    .checked_sub(1)
+                    .ok_or_else(|| ForgeError::Scheduler("MTP B2 wymaga d_conv > 0".into()))?,
+            ],
+        )?;
+        let hidden_bytes = checked_elements("mtp b2 hidden bytes", &[p.hidden_size, 2])?;
+        let bases = [seqs[0].len, seqs[1].len];
+        let ends = [
+            bases[0].checked_add(t).ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie pozycji verifiera MTP B2 lane0".into())
+            })?,
+            bases[1].checked_add(t).ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie pozycji verifiera MTP B2 lane1".into())
+            })?,
+        ];
+        for end in ends {
+            if end > p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {} exceeds model context {}",
+                    end - 1,
+                    p.max_position_embeddings
+                )));
+            }
+        }
+        let required_pages = seqs
+            .iter()
+            .enumerate()
+            .try_fold(0usize, |sum, (lane, seq)| {
+                let pages = ends[lane]
+                    .div_ceil(self.kv.cfg.page_size)
+                    .saturating_sub(seq.pages.len());
+                sum.checked_add(pages).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie stron verifiera MTP B2".into())
+                })
+            })?;
+        self.ensure_free_pages(required_pages);
+        if required_pages > self.kv.free_page_count() {
+            return Err(ForgeError::Scheduler(format!(
+                "verifier MTP B2 wymaga {required_pages} stron KV, dostępne {}",
+                self.kv.free_page_count()
+            )));
+        }
+
+        let mut snapshot_ready = false;
+        let mut metadata_enqueued = false;
+        let result = (|| {
+            for seq in seqs.iter_mut() {
+                for _ in 0..t {
+                    self.kv.grow(seq)?;
+                }
+            }
+            let page_table_elems =
+                checked_elements("mtp b2 page tables", &[2, self.max_pages_per_seq])?;
+            let mut page_tables = vec![-1i32; page_table_elems];
+            for lane in 0..2 {
+                let offset =
+                    checked_elements("mtp b2 page table offset", &[lane, self.max_pages_per_seq])?;
+                page_tables[offset..offset + seqs[lane].pages.len()]
+                    .copy_from_slice(&seqs[lane].pages);
+            }
+            let pb = self.prefill_bufs.as_ref().expect("prefill gotowy");
+            let b2 = self.mtp_b2_bufs.as_ref().expect("MTP B2 gotowy");
+            let mut metadata = Vec::with_capacity(2 + page_table_elems);
+            metadata.extend([bases[0] as i32, bases[1] as i32]);
+            metadata.extend_from_slice(&page_tables);
+            write_pinned(bytemuck::cast_slice(&metadata), &b2.pinned_metadata)?;
+            metadata_enqueued = true;
+            self.device.copy(
+                &b2.pinned_metadata,
+                0,
+                &b2.base_positions,
+                0,
+                8,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.pinned_metadata,
+                8,
+                &b2.page_tables,
+                0,
+                page_table_elems * 4,
+                &self.stream,
+            )?;
+            self.kernels.mtp_pack_verify_inputs(
+                &pb.ids,
+                &pb.positions,
+                &b2.visible_lens,
+                &mtp_states[0].token_ids,
+                &mtp_states[1].token_ids,
+                &b2.base_positions,
+                t,
+                &self.stream,
+            )?;
+            let target_embedding = self
+                .weights
+                .mtp
+                .as_ref()
+                .and_then(|mtp| mtp.shares_target_embedding.then_some(&mtp.embedding))
+                .ok_or_else(|| {
+                    ForgeError::Unsupported("MTP B2 wymaga device-side target embeddingu".into())
+                })?;
+            match target_embedding {
+                MtpEmbedding::Device(DevWeight::F16 { buf, rows, cols }) => {
+                    if *rows != p.vocab_size || *cols != p.hidden_size {
+                        return Err(ForgeError::Format(
+                            "target embedding F16 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_rows_f16(
+                        &pb.h,
+                        buf,
+                        &pb.ids,
+                        total,
+                        p.hidden_size,
+                        &self.stream,
+                    )?;
+                }
+                MtpEmbedding::Device(DevWeight::Q8_0 { buf, rows, cols }) => {
+                    if *rows != p.vocab_size || *cols != p.hidden_size {
+                        return Err(ForgeError::Format(
+                            "target embedding Q8_0 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_q8_0_rows_f16(
+                        &pb.h,
+                        buf,
+                        &pb.ids,
+                        total,
+                        p.vocab_size,
+                        p.hidden_size,
+                        &self.stream,
+                    )?;
+                }
+                MtpEmbedding::Device(DevWeight::NvFp4Gguf {
+                    buf,
+                    output_scale,
+                    rows,
+                    cols,
+                }) => {
+                    if *rows != p.vocab_size || *cols != p.hidden_size {
+                        return Err(ForgeError::Format(
+                            "target embedding NVFP4 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_nvfp4_gguf_rows_f16(
+                        &pb.h,
+                        buf,
+                        &pb.ids,
+                        total,
+                        p.vocab_size,
+                        p.hidden_size,
+                        *output_scale,
+                        &self.stream,
+                    )?;
+                }
+                _ => {
+                    return Err(ForgeError::Unsupported(
+                        "target MTP B2 wymaga embeddingu F16, Q8_0 lub GGUF NVFP4".into(),
+                    ));
+                }
+            }
+            if external_sources.into_iter().any(|external| external) {
+                self.device.copy(
+                    &pb.h,
+                    0,
+                    &b2.catchup_embeddings,
+                    0,
+                    total * p.hidden_size * 2,
+                    &self.stream,
+                )?;
+            }
+
+            for (layer_index, cache) in b2.delta.iter().enumerate() {
+                let Some(cache) = cache else { continue };
+                for (lane, &lease) in leases.iter().enumerate() {
+                    let (conv, state) = self
+                        .hybrid_states
+                        .as_ref()
+                        .expect("model ma pulę hybrydową")
+                        .state_buffers(lease, layer_index)?
+                        .expect("warstwa DeltaNet ma stan");
+                    self.device.copy(
+                        &conv,
+                        0,
+                        &cache.conv_initial,
+                        lane * conv.len(),
+                        conv.len(),
+                        &self.stream,
+                    )?;
+                    self.device.copy(
+                        &state,
+                        0,
+                        &cache.state_initial,
+                        lane * state.len(),
+                        state.len(),
+                        &self.stream,
+                    )?;
+                }
+            }
+            snapshot_ready = true;
+
+            self.kernels.rmsnorm_f16(
+                &pb.x,
+                &pb.h,
+                &self.weights.layers[0].attn_norm,
+                total,
+                p.hidden_size,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+            for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+                match &layer.mixer {
+                    LayerMixer::Attention(attention) => {
+                        let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
+                            return Err(ForgeError::Unsupported(
+                                "target MTP B2 wymaga rozdzielonych Q/K/V".into(),
+                            ));
+                        };
+                        self.gemm(&b2.q_full, q, &pb.x, total, &self.stream)?;
+                        self.kernels.deinterleave_gate_f16(
+                            &b2.qc,
+                            &b2.gatec,
+                            &b2.q_full,
+                            p.head_dim,
+                            q_elements,
+                            &self.stream,
+                        )?;
+                        if let Some(norm) = &attention.q_norm {
+                            self.kernels.rmsnorm_f16(
+                                &b2.qc,
+                                &b2.qc,
+                                norm,
+                                q_norm_rows,
+                                p.head_dim,
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        }
+                        self.gemm(&pb.k, k, &pb.x, total, &self.stream)?;
+                        self.gemm(&pb.v, v, &pb.x, total, &self.stream)?;
+                        if let Some(norm) = &attention.k_norm {
+                            self.kernels.rmsnorm_f16(
+                                &pb.k,
+                                &pb.k,
+                                norm,
+                                kv_norm_rows,
+                                p.head_dim,
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        }
+                        let n_rot = self.hybrid_n_rot();
+                        self.kernels.rope_neox_partial_f16(
+                            &b2.qc,
+                            &pb.positions,
+                            total,
+                            p.n_heads,
+                            p.head_dim,
+                            n_rot,
+                            p.rope_theta,
+                            &self.stream,
+                        )?;
+                        self.kernels.rope_neox_partial_f16(
+                            &pb.k,
+                            &pb.positions,
+                            total,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            n_rot,
+                            p.rope_theta,
+                            &self.stream,
+                        )?;
+                        let kv_layer = self.target_kv_layer(layer_index);
+                        self.kernels.kv_append_batch_segmented_f16(
+                            &self.kv.k[kv_layer],
+                            &self.kv.v[kv_layer],
+                            &pb.k,
+                            &pb.v,
+                            &b2.page_tables,
+                            &b2.base_positions,
+                            2,
+                            t,
+                            self.max_pages_per_seq,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            p.head_dim,
+                            &self.stream,
+                        )?;
+                        self.kernels.attn_verify_segmented_f16_hd256(
+                            &pb.attn_out,
+                            &b2.qc,
+                            &self.kv.k[kv_layer],
+                            &self.kv.v[kv_layer],
+                            &b2.page_tables,
+                            &b2.visible_lens,
+                            2,
+                            t,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            1.0 / (p.head_dim as f32).sqrt(),
+                            &self.stream,
+                        )?;
+                        self.kernels.sigmoid_mul_f16(
+                            &b2.gated,
+                            &pb.attn_out,
+                            &b2.gatec,
+                            q_elements,
+                            &self.stream,
+                        )?;
+                        self.gemm(&pb.o_out, &attention.attn_o, &b2.gated, total, &self.stream)?;
+                    }
+                    LayerMixer::DeltaNet(delta) => {
+                        let cache = b2.delta[layer_index]
+                            .as_ref()
+                            .expect("warstwa DeltaNet ma cache B2");
+                        self.gemm(&b2.qkv_mixed, &delta.in_proj, &pb.x, total, &self.stream)?;
+                        if let Some(cols) = Self::delta_input_q8_cols(delta)
+                            .filter(|_| matches!(total, 6 | 8))
+                        {
+                            let mut prepared =
+                                self.kernels.prepare_q8_1(&pb.x, cols, total, &self.stream)?;
+                            self.gemm_q8_prepared(
+                                &b2.z,
+                                &delta.gate_proj,
+                                &mut prepared,
+                                total,
+                            )?;
+                            self.gemm_q8_prepared(
+                                &b2.alpha,
+                                &delta.alpha_proj,
+                                &mut prepared,
+                                total,
+                            )?;
+                            self.gemm_q8_prepared(
+                                &b2.beta_raw,
+                                &delta.beta_proj,
+                                &mut prepared,
+                                total,
+                            )?;
+                        } else {
+                            self.gemm(&b2.z, &delta.gate_proj, &pb.x, total, &self.stream)?;
+                            self.gemm(&b2.alpha, &delta.alpha_proj, &pb.x, total, &self.stream)?;
+                            self.gemm(&b2.beta_raw, &delta.beta_proj, &pb.x, total, &self.stream)?;
+                        }
+                        self.kernels.deltanet_prepare_segmented_f16(
+                            &cache.q,
+                            &cache.k,
+                            &cache.v,
+                            &cache.g,
+                            &cache.beta,
+                            &cache.conv_checkpoints,
+                            &cache.conv_initial,
+                            &b2.qkv_mixed,
+                            &delta.conv1d,
+                            &b2.alpha,
+                            &b2.beta_raw,
+                            &delta.dt_bias,
+                            &delta.a,
+                            2,
+                            t,
+                            ssm.n_k_heads(),
+                            ssm.n_v_heads(),
+                            ssm.d_state,
+                            ssm.d_conv,
+                            p.rms_norm_eps,
+                            &self.stream,
+                        )?;
+                        self.kernels.deltanet_gated_scan_segmented_shared_d128_f16(
+                            &b2.o,
+                            &b2.selected_states,
+                            &cache.state_initial,
+                            &cache.q,
+                            &cache.k,
+                            &cache.v,
+                            &cache.g,
+                            &cache.beta,
+                            2,
+                            t,
+                            ssm.n_v_heads(),
+                            ssm.d_state,
+                            &self.stream,
+                        )?;
+                        self.kernels.deltanet_gated_rmsnorm_f16(
+                            &b2.normed,
+                            &b2.o,
+                            &b2.z,
+                            &delta.ssm_norm,
+                            delta_norm_rows,
+                            ssm.d_state,
+                            p.rms_norm_eps,
+                            &self.stream,
+                        )?;
+                        self.gemm(&pb.o_out, &delta.out_proj, &b2.normed, total, &self.stream)?;
+                    }
+                }
+                self.kernels.rmsnorm_residual_f16(
+                    &pb.x,
+                    &pb.h,
+                    &pb.o_out,
+                    &layer.ffn_norm,
+                    total,
+                    p.hidden_size,
+                    p.rms_norm_eps,
+                    &self.stream,
+                )?;
+                let LayerFfn::Dense(ffn) = &layer.ffn else {
+                    return Err(ForgeError::Unsupported("MTP B2 nie obsługuje MoE".into()));
+                };
+                let GateUpWeights::Split { gate, up } = &ffn.gate_up else {
+                    return Err(ForgeError::Unsupported(
+                        "MTP B2 wymaga rozdzielonych gate/up".into(),
+                    ));
+                };
+                self.gemm(&pb.gate, gate, &pb.x, total, &self.stream)?;
+                self.gemm(&pb.up, up, &pb.x, total, &self.stream)?;
+                self.kernels
+                    .silu_mul_f16(&pb.act, &pb.gate, &pb.up, ffn_rows, &self.stream)?;
+                self.gemm(&pb.down, &ffn.down, &pb.act, total, &self.stream)?;
+                let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                    &self.weights.layers[layer_index + 1].attn_norm
+                } else {
+                    &self.weights.output_norm
+                };
+                self.kernels.rmsnorm_residual_f16(
+                    &pb.x,
+                    &pb.h,
+                    &pb.down,
+                    next_norm,
+                    total,
+                    p.hidden_size,
+                    p.rms_norm_eps,
+                    &self.stream,
+                )?;
+            }
+
+            let vb = self.verify_bufs.as_ref().expect("verify gotowy");
+            self.logits_gemm(&vb.logits, &pb.x, total, &self.stream)?;
+            self.kernels.sample_batched_argmax_f32(
+                &vb.ids,
+                &vb.logits,
+                total,
+                p.vocab_size,
+                &self.stream,
+            )?;
+            self.kernels.mtp_verify_decide_segmented(
+                &b2.decisions,
+                &vb.ids,
+                &pb.ids,
+                2,
+                t,
+                &self.stream,
+            )?;
+            self.kernels.mtp_select_row_segmented_f16(
+                &b2.selected_hidden,
+                &pb.x,
+                &b2.decisions,
+                2,
+                t,
+                p.hidden_size,
+                &self.stream,
+            )?;
+
+            for (layer_index, cache) in b2.delta.iter().enumerate() {
+                let Some(cache) = cache else { continue };
+                self.kernels.deltanet_commit_recompute_segmented_shared_d128_f32(
+                    &b2.selected_states,
+                    &cache.state_initial,
+                    &cache.k,
+                    &cache.v,
+                    &cache.g,
+                    &cache.beta,
+                    &b2.decisions,
+                    2,
+                    t,
+                    ssm.n_v_heads(),
+                    ssm.d_state,
+                    &self.stream,
+                )?;
+                self.kernels.mtp_select_row_segmented_f16(
+                    &b2.selected_conv,
+                    &cache.conv_checkpoints,
+                    &b2.decisions,
+                    2,
+                    t,
+                    conv_elems,
+                    &self.stream,
+                )?;
+                for (lane, &lease) in leases.iter().enumerate() {
+                    let (conv, state) = self
+                        .hybrid_states
+                        .as_ref()
+                        .expect("model ma pulę hybrydową")
+                        .state_buffers(lease, layer_index)?
+                        .expect("warstwa DeltaNet ma stan");
+                    self.device.copy(
+                        &b2.selected_conv,
+                        lane * conv.len(),
+                        &conv,
+                        0,
+                        conv.len(),
+                        &self.stream,
+                    )?;
+                    self.device.copy(
+                        &b2.selected_states,
+                        lane * state.len(),
+                        &state,
+                        0,
+                        state.len(),
+                        &self.stream,
+                    )?;
+                }
+            }
+            for (lane, state) in mtp_states.iter_mut().enumerate() {
+                if !external_sources[lane] {
+                    self.device.copy(
+                        &b2.selected_hidden,
+                        lane * hidden_bytes,
+                        &state.recurrent_hidden,
+                        0,
+                        hidden_bytes,
+                        &self.stream,
+                    )?;
+                }
+            }
+            if external_sources.into_iter().any(|external| external) {
+                self.mtp_catchup_verified_prefix_b2(
+                    mtp_states,
+                    mtp_kv,
+                    t,
+                    external_sources,
+                )?;
+            }
+            self.device
+                .copy(&b2.decisions, 0, &b2.pinned_decisions, 0, 16, &self.stream)?;
+            for (lane, state) in mtp_states.iter().enumerate() {
+                self.device.copy(
+                    &state.token_ids,
+                    0,
+                    &b2.pinned_decisions,
+                    16 + lane * 20,
+                    20,
+                    &self.stream,
+                )?;
+            }
+            self.device.synchronize()?;
+            let decision_ptr = b2
+                .pinned_decisions
+                .host_ptr()
+                .expect("decyzje B2 mają mapowanie") as *const i32;
+            let mut results: [(Vec<u32>, usize, u32); 2] =
+                std::array::from_fn(|_| (Vec::with_capacity(budget), 0, 0));
+            for (lane, result) in results.iter_mut().enumerate() {
+                let retained = unsafe { *decision_ptr.add(2 * lane) };
+                let correction = unsafe { *decision_ptr.add(2 * lane + 1) };
+                if retained <= 0
+                    || retained as usize > t
+                    || correction < 0
+                    || correction as usize >= p.vocab_size
+                {
+                    return Err(ForgeError::Kernel(format!(
+                        "decyzja MTP B2 lane {lane} poza zakresem"
+                    )));
+                }
+                let ids = unsafe {
+                    std::slice::from_raw_parts(decision_ptr.add(4 + lane * 5), budget + 1)
+                };
+                if ids.iter().any(|&id| id < 0 || id as usize >= p.vocab_size) {
+                    return Err(ForgeError::Kernel(format!(
+                        "draft MTP B2 lane {lane} poza zakresem"
+                    )));
+                }
+                result.0.extend(ids[1..].iter().map(|&id| id as u32));
+                result.1 = retained as usize - 1;
+                result.2 = correction as u32;
+            }
+            let metadata_targets = validate_mtp_pair_metadata_commit(
+                mtp_states,
+                [results[0].1 + 1, results[1].1 + 1],
+            )?;
+            Ok((results, metadata_targets))
+        })();
+
+        match result {
+            Ok((results, metadata_targets)) => {
+                for lane in 0..2 {
+                    self.kv
+                        .rollback(seqs[lane], bases[lane] + results[lane].1 + 1);
+                }
+                self.pt_seq = 0;
+                Ok((results, metadata_targets))
+            }
+            Err(error) => {
+                for lane in 0..2 {
+                    self.kv.rollback(seqs[lane], bases[lane]);
+                }
+                if snapshot_ready {
+                    let b2 = self.mtp_b2_bufs.as_ref().expect("MTP B2 gotowy");
+                    for (layer_index, cache) in b2.delta.iter().enumerate() {
+                        let Some(cache) = cache else { continue };
+                        for (lane, &lease) in leases.iter().enumerate() {
+                            let (conv, state) = self
+                                .hybrid_states
+                                .as_ref()
+                                .expect("model ma pulę hybrydową")
+                                .state_buffers(lease, layer_index)?
+                                .expect("warstwa DeltaNet ma stan");
+                            self.device.copy(
+                                &cache.conv_initial,
+                                lane * conv.len(),
+                                &conv,
+                                0,
+                                conv.len(),
+                                &self.stream,
+                            )?;
+                            self.device.copy(
+                                &cache.state_initial,
+                                lane * state.len(),
+                                &state,
+                                0,
+                                state.len(),
+                                &self.stream,
+                            )?;
+                        }
+                    }
+                    self.device.synchronize()?;
+                } else if metadata_enqueued {
+                    self.device.synchronize()?;
+                }
+                self.pt_seq = 0;
+                Err(error)
+            }
+        }
+    }
+
+    fn verify_hybrid_greedy_draft(
+        &mut self,
+        seq: &mut SeqKv,
+        fed: u32,
+        draft: &[u32],
+        catchup_mtp: bool,
+    ) -> Result<(usize, u32)> {
+        if !matches!(draft.len(), 2 | 3) {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier spekulacyjny obsługuje draft długości 2 lub 3".into(),
+            ));
+        }
+        self.activate_hybrid_sequence(seq)?;
+        let hybrid_slot = seq
+            .hybrid_state
+            .expect("aktywna sekwencja hybrydowa ma przypisany slot")
+            .slot;
+        let t = draft.len() + 1;
+        self.validate_hybrid_speculation_target()?;
+        self.ensure_prefill_bufs()?;
+        self.ensure_verify_bufs(4)?;
+        self.ensure_hybrid_verify_bufs(4)?;
+        let p = self.weights.descriptor.params.clone();
+        let base = seq.len;
+        if base + t > p.max_position_embeddings {
+            return Err(ForgeError::Scheduler(format!(
+                "position {} exceeds model context {}",
+                base + t - 1,
+                p.max_position_embeddings
+            )));
+        }
+        self.ensure_free_pages(
+            (base + t)
+                .div_ceil(self.kv.cfg.page_size)
+                .saturating_sub(seq.pages.len()),
+        );
+        let mut snapshot_ready = false;
+        let result = (|| {
+            let hv = self
+                .hybrid_verify_bufs
+                .as_ref()
+                .expect("bufory hybrid verify są gotowe");
+            for (layer_index, cache) in hv.delta.iter().enumerate() {
+                let Some(cache) = cache else { continue };
+                let state = self.active_ssm()[layer_index]
+                    .as_ref()
+                    .expect("warstwa DeltaNet ma stan");
+                self.device.copy(
+                    &state.state,
+                    0,
+                    &cache.state_initial,
+                    0,
+                    state.state.len(),
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &state.conv,
+                    0,
+                    &cache.conv_initial,
+                    0,
+                    state.conv.len(),
+                    &self.stream,
+                )?;
+            }
+            self.device.synchronize()?;
+            snapshot_ready = true;
+            for _ in 0..t {
+                self.kv.grow(seq)?;
+            }
+            let mut page_table = vec![-1i32; self.max_pages_per_seq];
+            page_table[..seq.pages.len()].copy_from_slice(&seq.pages);
+            self.device
+                .write(bytemuck::cast_slice(&page_table), &self.page_table_dev, 0)?;
+            self.pt_seq = seq.id;
+            let pb = self
+                .prefill_bufs
+                .as_ref()
+                .expect("bufory prefill są gotowe");
+            let hv = self
+                .hybrid_verify_bufs
+                .as_ref()
+                .expect("bufory hybrid verify są gotowe");
+            let tokens: Vec<u32> = std::iter::once(fed).chain(draft.iter().copied()).collect();
+            let ids: Vec<i32> = tokens.iter().map(|&id| id as i32).collect();
+            let positions: Vec<i32> = (base..base + t).map(|pos| pos as i32).collect();
+            let visible_lens: Vec<i32> = (base + 1..=base + t).map(|len| len as i32).collect();
+            self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
+            self.device
+                .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
+            self.device
+                .write(&(base as i32).to_le_bytes(), &hv.base_pos, 0)?;
+            self.device
+                .write(bytemuck::cast_slice(&visible_lens), &hv.visible_lens, 0)?;
+            let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+                ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
+            })?;
+            let staging = hv
+                .host_staging[0]
+                .embedding
+                .host_ptr()
+                .expect("pinned embedding ma mapowanie hosta");
+            for (row_index, &token) in tokens.iter().enumerate() {
+                let source = table
+                    .get(token as usize * p.hidden_size..(token as usize + 1) * p.hidden_size)
+                    .ok_or_else(|| {
+                        ForgeError::Scheduler(format!(
+                            "token id {token} wykracza poza embedding targetu"
+                        ))
+                    })?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr() as *const u8,
+                        staging.add(row_index * p.hidden_size * 2),
+                        p.hidden_size * 2,
+                    );
+                }
+            }
+            self.device.copy(
+                &hv.host_staging[0].embedding,
+                0,
+                &pb.h,
+                0,
+                t * p.hidden_size * 2,
+                &self.stream,
+            )?;
+            let graph = if std::env::var("FORGE_HYBRID_VERIFY_GRAPH")
+                .is_ok_and(|value| value == "0")
+            {
+                None
+            } else {
+                self.hybrid_verify_graphs.get(&(hybrid_slot, t)).cloned()
+            };
+            if let Some(graph) = graph {
+                self.device.launch_graph(&graph, &self.stream)?;
+            } else {
+                self.run_hybrid_verify_compute(t)?;
+            }
+            self.device.synchronize()?;
+            let decision =
+                hv.pinned_decision
+                    .host_ptr()
+                    .expect("pinned decision ma mapowanie hosta") as *const i32;
+            let retained = unsafe { *decision };
+            let correction = unsafe { *decision.add(1) };
+            if retained <= 0
+                || retained as usize > t
+                || correction < 0
+                || correction as usize >= p.vocab_size
+            {
+                return Err(ForgeError::Kernel(
+                    "decyzja MTP z GPU ma wartość poza zakresem".into(),
+                ));
+            }
+            let accepted = retained as usize - 1;
+            if catchup_mtp {
+                self.mtp_catchup_verified_prefix(seq, accepted + 1, 0, None)?;
+            }
+            self.capture_hybrid_verify_graph_if_needed(hybrid_slot, t);
+            Ok((accepted, correction as u32))
+        })();
+        match result {
+            Ok((accepted, correction)) => {
+                self.kv.rollback(seq, base + accepted + 1);
+                self.pt_seq = 0;
+                Ok((accepted, correction))
+            }
+            Err(error) => {
+                self.kv.rollback(seq, base);
+                self.pt_seq = 0;
+                if snapshot_ready {
+                    let restore = (|| {
+                        let hv = self
+                            .hybrid_verify_bufs
+                            .as_ref()
+                            .expect("bufory hybrid verify są gotowe");
+                        for (layer_index, cache) in hv.delta.iter().enumerate() {
+                            let Some(cache) = cache else { continue };
+                            let state = self.active_ssm()[layer_index]
+                                .as_ref()
+                                .expect("warstwa DeltaNet ma stan");
+                            self.device.copy(
+                                &cache.state_initial,
+                                0,
+                                &state.state,
+                                0,
+                                state.state.len(),
+                                &self.stream,
+                            )?;
+                            self.device.copy(
+                                &cache.conv_initial,
+                                0,
+                                &state.conv,
+                                0,
+                                state.conv.len(),
+                                &self.stream,
+                            )?;
+                        }
+                        self.device.synchronize()
+                    })();
+                    if let Err(restore_error) = restore {
+                        return Err(ForgeError::Scheduler(format!(
+                            "błąd verifiera MTP: {error}; błąd odtworzenia SSM: {restore_error}"
+                        )));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Wykonuje jeden cykl natywnego MTP. Bieżące logity targetu przewidziały
+    /// już `fed`, więc draft powstaje bez osobnego kroku targetu, a target
+    /// zatwierdza `[fed, draft...]` przebiegiem T=3/4. Zwracany correction
+    /// pozostaje tokenem do podania w następnym cyklu i nie jest jeszcze
+    /// zapisany w stanie targetu.
+    pub fn native_mtp_step(
+        &mut self,
+        seq: &mut SeqKv,
+        fed: u32,
+        budget: usize,
+    ) -> Result<(Vec<u32>, usize, u32)> {
+        if budget != 2 && budget != 3 {
+            return Err(ForgeError::Unsupported(
+                "natywny MTP obsługuje budget 2 lub 3".into(),
+            ));
+        }
+        self.validate_native_mtp_target()?;
+        if self.native_mtp_available_budget(seq, budget) != budget {
+            return Err(ForgeError::Scheduler(format!(
+                "brak pojemności targetu dla MTP K={budget}"
+            )));
+        }
+        let draft = self.mtp_propose_pending(seq, fed, budget)?;
+        match self.verify_hybrid_greedy_draft(seq, fed, &draft, false) {
+            Ok((accepted, correction)) => {
+                let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+                let result = state
+                    .commit_prefix(&mut mtp_kv, accepted + 1, &self.stream)
+                    .and_then(|_| {
+                        self.device.copy(
+                            &self.bufs.x,
+                            0,
+                            &state.recurrent_hidden,
+                            0,
+                            state.recurrent_hidden.len(),
+                            &self.stream,
+                        )
+                    })
+                    .and_then(|_| self.device.synchronize());
+                self.finish_mtp_runtime(lease, state, mtp_kv, result)?;
+                Ok((draft, accepted, correction))
+            }
+            Err(error) => {
+                if let Err(rollback_error) = self.rollback_mtp_pending(seq) {
+                    return Err(ForgeError::Scheduler(format!(
+                        "błąd verifiera MTP: {error}; błąd rollbacku draftu: {rollback_error}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Wykonuje wspólny cykl natywnego MTP dla dwóch sekwencji z tym samym K.
+    pub fn native_mtp_step_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        fed: [u32; 2],
+        budget: usize,
+    ) -> Result<[(Vec<u32>, usize, u32); 2]> {
+        self.native_mtp_routed_step_b2(seqs, fed, budget, [None, None])
+    }
+
+    /// Wykonuje wspólny verifier B2 dla dowolnej pary źródeł MTP/n-gram.
+    pub fn native_mtp_routed_step_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        fed: [u32; 2],
+        budget: usize,
+        external_drafts: [Option<&[u32]>; 2],
+    ) -> Result<[(Vec<u32>, usize, u32); 2]> {
+        if !self.native_mtp_b2_capable([&*seqs[0], &*seqs[1]], budget) {
+            return Err(ForgeError::Unsupported(
+                "para nie spełnia kontraktu routed MTP B2".into(),
+            ));
+        }
+        self.mtp_propose_pending_b2(seqs, fed, budget, external_drafts)?;
+        let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
+        let external_sources = external_drafts.map(|draft| draft.is_some());
+        let result =
+            match self.verify_hybrid_greedy_draft_b2(
+                seqs,
+                budget,
+                &mut states,
+                &mut mtp_kv,
+                external_sources,
+            ) {
+                Ok((results, metadata_targets)) => {
+                    apply_mtp_pair_metadata_commit(&mut states, &mut mtp_kv, metadata_targets);
+                    Ok(results)
+                }
+                Err(error) => match rollback_mtp_pair(&mut states, &mut mtp_kv, &self.stream) {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(self
+                        .poison_mtp_runtime(format!("błąd verifiera MTP B2: {error}; {rollback}"))),
+                },
+            };
+        self.pt_seq = 0;
+        self.finish_mtp_runtime_pair(leases, states, mtp_kv, result)
+    }
+
+    /// Weryfikuje dwa pełne drafty zewnętrznego proposera i dogania MTP na GPU.
+    pub fn verify_greedy_draft_with_mtp_catchup_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        fed: [u32; 2],
+        drafts: [&[u32]; 2],
+    ) -> Result<[(usize, u32); 2]> {
+        let budget = drafts[0].len();
+        if drafts[1].len() != budget || !matches!(budget, 2 | 3) {
+            return Err(ForgeError::Unsupported(
+                "MTP+n-gram B2 wymaga dwóch draftów z tym samym K=2 lub K=3".into(),
+            ));
+        }
+        self.native_mtp_routed_step_b2(
+            seqs,
+            fed,
+            budget,
+            [Some(drafts[0]), Some(drafts[1])],
+        )
+        .map(|verified| [
+            (verified[0].1, verified[0].2),
+            (verified[1].1, verified[1].2),
+        ])
+    }
+
+    /// Weryfikuje draft zewnętrznego proposera i dogania stan natywnego MTP.
+    pub fn verify_greedy_draft_with_mtp_catchup(
+        &mut self,
+        seq: &mut SeqKv,
+        fed: u32,
+        draft: &[u32],
+    ) -> Result<(usize, u32)> {
+        self.validate_native_mtp_target()?;
+        self.verify_hybrid_greedy_draft(seq, fed, draft, true)
     }
 
     /// Verify one greedy speculative draft in a single forward (SPEC §6, linear
@@ -3397,8 +9451,8 @@ impl Model {
     /// resident. Returns `(accepted, correction)`: the number of accepted draft
     /// tokens and the model's argmax token at the first unaccepted position
     /// (the correction when `accepted < draft.len()`, else the bonus token).
-    /// Caller must ensure `speculation_eligible()` and a greedy sampler, so the
-    /// accepted + correction tokens are exactly the greedy-decode output.
+    /// Wywołujący musi wcześniej użyć `validate_speculation_target()` oraz
+    /// próbkowania greedy, aby wynik był zgodny z dekodowaniem sekwencyjnym.
     pub fn verify_greedy_draft(
         &mut self,
         seq: &mut SeqKv,
@@ -3406,7 +9460,13 @@ impl Model {
         draft: &[u32],
     ) -> Result<(usize, u32)> {
         debug_assert!(!draft.is_empty(), "verify called with an empty draft");
-        debug_assert!(draft.len() <= MAX_SPEC_DRAFT, "draft exceeds MAX_SPEC_DRAFT");
+        debug_assert!(
+            draft.len() <= MAX_SPEC_DRAFT,
+            "draft exceeds MAX_SPEC_DRAFT"
+        );
+        if self.is_hybrid() {
+            return self.verify_hybrid_greedy_draft(seq, fed, draft, false);
+        }
         let vocab = self.weights.descriptor.params.vocab_size;
         let t = draft.len() + 1;
         self.ensure_verify_bufs(t)?;
@@ -3415,52 +9475,42 @@ impl Model {
         let mut batch = Vec::with_capacity(t);
         batch.push(fed);
         batch.extend_from_slice(draft);
-        // Mini-prefill: appends the fed token + draft K/V at positions
-        // base..base+t and leaves the [T, hidden] final normed hidden in the
-        // prefill scratch. Eligibility guarantees no tier/prefix bookkeeping, so
-        // this only grows the F16 cache (rolled back below).
-        self.prefill_forward(seq, &batch)?;
+        let result = (|| {
+            self.prefill_forward(seq, &batch)?;
 
-        let stream = &self.stream;
-        let vb = self.verify_bufs.as_ref().expect("ensured above");
-        let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
-        // [T, vocab] logits, then one greedy argmax per row on the GPU (ties to
-        // the lowest id, matching the decode sampler); only T ids come back.
-        self.logits_gemm(&vb.logits, &pb.x, t, stream)?;
-        self.kernels
-            .sample_batched_argmax_f32(&vb.ids, &vb.logits, t, vocab, stream)?;
-        self.device
-            .copy(&vb.ids, 0, &vb.pinned_ids, 0, t * 4, stream)?;
-        self.device.synchronize()?;
+            let stream = &self.stream;
+            let vb = self.verify_bufs.as_ref().expect("ensured above");
+            let pb = self
+                .prefill_bufs
+                .as_ref()
+                .expect("prefill_forward allocated");
+            self.logits_gemm(&vb.logits, &pb.x, t, stream)?;
+            self.kernels
+                .sample_batched_argmax_f32(&vb.ids, &vb.logits, t, vocab, stream)?;
+            self.device
+                .copy(&vb.ids, 0, &vb.pinned_ids, 0, t * 4, stream)?;
+            self.device.synchronize()?;
 
-        let ptr = vb
-            .pinned_ids
-            .host_ptr()
-            .expect("pinned buffer has host mapping") as *const i32;
-        let argmax = unsafe { std::slice::from_raw_parts(ptr, t) };
-
-        // Position i's argmax is the model's own token for position base+i+1.
-        // Accept draft[i] while it matches; the first miss (or the bonus row
-        // when every draft is accepted) yields the correction token.
-        let mut accepted = 0usize;
-        let mut correction = 0u32;
-        for i in 0..t {
-            let am = argmax[i] as u32;
-            if i < draft.len() && am == draft[i] {
-                accepted += 1;
-            } else {
-                correction = am;
-                break;
+            let ptr = vb
+                .pinned_ids
+                .host_ptr()
+                .expect("pinned buffer has host mapping") as *const i32;
+            let argmax = unsafe { std::slice::from_raw_parts(ptr, t) };
+            let mut accepted = 0usize;
+            let mut correction = 0u32;
+            for i in 0..t {
+                let am = argmax[i] as u32;
+                if i < draft.len() && am == draft[i] {
+                    accepted += 1;
+                } else {
+                    correction = am;
+                    break;
+                }
             }
-        }
+            Ok((accepted, correction))
+        })();
 
-        // Keep fed + accepted drafts (accepted+1 positions from `base`); discard
-        // the rejected draft positions' K/V. The correction/bonus token is fed
-        // by the next step, so it is intentionally NOT resident yet.
-        self.kv.rollback(seq, base + accepted + 1);
-        // The device page table now lists freed tail slots; force a re-upload.
-        self.pt_seq = 0;
-        Ok((accepted, correction))
+        finish_greedy_verification(&mut self.kv, &mut self.pt_seq, seq, base, result)
     }
 
     /// Record every launch of one decode step into a replayable graph.
@@ -3525,8 +9575,23 @@ impl Model {
         let b = &self.bufs;
 
         {
-            kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
-            kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+            kernels.gather_rows_f16(
+                &b.h,
+                &self.weights.token_embd_f16,
+                &b.ids,
+                1,
+                hidden,
+                stream,
+            )?;
+            kernels.rmsnorm_f16(
+                &b.x,
+                &b.h,
+                &self.weights.layers[0].attn_norm,
+                1,
+                hidden,
+                eps,
+                stream,
+            )?;
 
             let scale = 1.0 / (p.head_dim as f32).sqrt();
             // Byte offsets of the K and V sections inside the fused q|k|v
@@ -3557,8 +9622,8 @@ impl Model {
                             v_byte_off,
                             layer.attn().q_norm.as_ref(),
                             layer.attn().k_norm.as_ref(),
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &b.pos,
                             &self.page_table_dev,
                             &self.seq_len_dev,
@@ -3588,8 +9653,8 @@ impl Model {
                             0,
                             layer.attn().q_norm.as_ref(),
                             layer.attn().k_norm.as_ref(),
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &b.pos,
                             &self.page_table_dev,
                             &self.seq_len_dev,
@@ -3608,16 +9673,41 @@ impl Model {
                         self.gemv(&b.k, k, &b.x, stream)?;
                         self.gemv(&b.v, v, &b.x, stream)?;
                         if let Some(qn) = &layer.attn().q_norm {
-                            kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
+                            kernels
+                                .rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
                         }
                         if let Some(kn) = &layer.attn().k_norm {
-                            kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
+                            kernels.rmsnorm_f16(
+                                &b.k,
+                                &b.k,
+                                kn,
+                                p.n_kv_heads,
+                                p.head_dim,
+                                eps,
+                                stream,
+                            )?;
                         }
-                        kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-                        kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                        kernels.rope_neox_f16(
+                            &b.q,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            p.head_dim,
+                            p.rope_theta,
+                            stream,
+                        )?;
+                        kernels.rope_neox_f16(
+                            &b.k,
+                            &b.pos,
+                            1,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            p.rope_theta,
+                            stream,
+                        )?;
                         kernels.kv_append_f16(
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &b.k,
                             &b.v,
                             &self.page_table_dev,
@@ -3636,8 +9726,8 @@ impl Model {
                         kernels.attn_decode_f16(
                             &b.attn_out,
                             q_buf,
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
                             &self.page_table_dev,
                             &self.seq_len_dev,
                             1,
@@ -3654,7 +9744,10 @@ impl Model {
                         // qkv_post / kv_append above already committed the new
                         // token to the canonical paged slab; staging picks it
                         // up through the resident-page D2D copies.
-                        let tier = self.tier.as_ref().expect("staged attention requires tiering");
+                        let tier = self
+                            .tier
+                            .as_ref()
+                            .expect("staged attention requires tiering");
                         let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                         let slot = &tb.slots[0];
                         tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
@@ -3678,7 +9771,16 @@ impl Model {
                 }
 
                 self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
-                kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+                kernels.rmsnorm_residual_f16(
+                    &b.x,
+                    &b.h,
+                    &b.o_out,
+                    &layer.ffn_norm,
+                    1,
+                    hidden,
+                    eps,
+                    stream,
+                )?;
 
                 match &layer.dense_ffn()?.gate_up {
                     GateUpWeights::Fused(w) => {
@@ -3698,7 +9800,8 @@ impl Model {
                 } else {
                     &self.weights.output_norm
                 };
-                kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
+                kernels
+                    .rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
             }
 
             self.logits_gemv(&b.logits, &b.x, stream)
@@ -3722,8 +9825,23 @@ impl Model {
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
 
-        kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
-        kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+        kernels.gather_rows_f16(
+            &b.h,
+            &self.weights.token_embd_f16,
+            &b.ids,
+            1,
+            hidden,
+            stream,
+        )?;
+        kernels.rmsnorm_f16(
+            &b.x,
+            &b.h,
+            &self.weights.layers[0].attn_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
 
         let n_layers = self.weights.layers.len();
         for l in 0..n_layers {
@@ -3764,10 +9882,18 @@ impl Model {
                 }
             }
             kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-            kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+            kernels.rope_neox_f16(
+                &b.k,
+                &b.pos,
+                1,
+                p.n_kv_heads,
+                p.head_dim,
+                p.rope_theta,
+                stream,
+            )?;
             kernels.kv_append_f16(
-                &self.kv.k[l],
-                &self.kv.v[l],
+                &self.kv.k[self.target_kv_layer(l)],
+                &self.kv.v[self.target_kv_layer(l)],
                 &b.k,
                 &b.v,
                 &self.page_table_dev,
@@ -3780,8 +9906,8 @@ impl Model {
             kernels.attn_decode_f16(
                 &b.attn_out,
                 &b.q,
-                &self.kv.k[l],
-                &self.kv.v[l],
+                &self.kv.k[self.target_kv_layer(l)],
+                &self.kv.v[self.target_kv_layer(l)],
                 &self.page_table_dev,
                 &self.seq_len_dev,
                 1,
@@ -3795,7 +9921,16 @@ impl Model {
             )?;
 
             self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
-            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                &b.x,
+                &b.h,
+                &b.o_out,
+                &layer.ffn_norm,
+                1,
+                hidden,
+                eps,
+                stream,
+            )?;
 
             match &layer.ffn {
                 LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, hidden, stream)?,
@@ -3826,7 +9961,10 @@ impl Model {
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
         let inter = moe.moe_inter;
         let k = moe.n_experts_used;
-        let DevWeight::F16 { buf: router_buf, .. } = &moe.router else {
+        let DevWeight::F16 {
+            buf: router_buf, ..
+        } = &moe.router
+        else {
             return Err(ForgeError::Unsupported("MoE router must be f16".into()));
         };
 
@@ -3853,7 +9991,8 @@ impl Model {
                 moe.norm_topk,
                 stream,
             )?;
-            return self.moe_experts_accumulate_device(moe, &b.x, &b.down, 0, inter, hidden, k, stream);
+            return self
+                .moe_experts_accumulate_device(moe, &b.x, &b.down, 0, inter, hidden, k, stream);
         }
 
         // Fallback (expert quant without a `_gidx` kernel, e.g. Q8_0 down
@@ -3864,7 +10003,8 @@ impl Model {
         // rather than forcing a second per-layer host round-trip.
         if let Some(sg) = &moe.shared_gate {
             self.gemv(&mb.tmp, sg, &b.x, stream)?;
-            self.device.copy(&mb.tmp, 0, &mb.pinned_shared, 0, 2, stream)?;
+            self.device
+                .copy(&mb.tmp, 0, &mb.pinned_shared, 0, 2, stream)?;
         }
         self.kernels.moe_router_f16(
             &mb.ids,
@@ -3878,7 +10018,8 @@ impl Model {
             moe.norm_topk,
             stream,
         )?;
-        self.device.copy(&mb.ids, 0, &mb.pinned_ids, 0, k * 4, stream)?;
+        self.device
+            .copy(&mb.ids, 0, &mb.pinned_ids, 0, k * 4, stream)?;
         self.device
             .copy(&mb.weights, 0, &mb.pinned_weights, 0, k * 4, stream)?;
         self.device.synchronize()?;
@@ -3942,12 +10083,40 @@ impl Model {
         let b = &self.bufs;
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
         for j in 0..k {
-            self.gemv_rows_gidx(&b.gate, &moe.gate_exps, x_in, &mb.ids, j, inter, inter, stream)?;
+            self.gemv_rows_gidx(
+                &b.gate,
+                &moe.gate_exps,
+                x_in,
+                &mb.ids,
+                j,
+                inter,
+                inter,
+                stream,
+            )?;
             self.gemv_rows_gidx(&b.up, &moe.up_exps, x_in, &mb.ids, j, inter, inter, stream)?;
-            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
-            self.gemv_rows_gidx(&mb.tmp, &moe.down_exps, &b.act, &mb.ids, j, hidden, hidden, stream)?;
             self.kernels
-                .moe_scale_add_gidx_f16(out, out_off, &mb.tmp, 0, hidden, &mb.weights, j, j == 0, stream)?;
+                .silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+            self.gemv_rows_gidx(
+                &mb.tmp,
+                &moe.down_exps,
+                &b.act,
+                &mb.ids,
+                j,
+                hidden,
+                hidden,
+                stream,
+            )?;
+            self.kernels.moe_scale_add_gidx_f16(
+                out,
+                out_off,
+                &mb.tmp,
+                0,
+                hidden,
+                &mb.weights,
+                j,
+                j == 0,
+                stream,
+            )?;
         }
         if let Some(sh) = &moe.shared {
             let sh_inter = sh.down.cols();
@@ -3961,7 +10130,8 @@ impl Model {
                     self.gemv_rows(&b.up, up, x_in, 0, up.rows(), stream)?;
                 }
             }
-            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
+            self.kernels
+                .silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
             self.gemv_rows(&mb.tmp, &sh.down, &b.act, 0, sh.down.rows(), stream)?;
             // mb.shared_scale holds this layer's device sigmoid gate scale when
             // the arch has a shared gate; for a gate-less shared expert it stays
@@ -4015,7 +10185,8 @@ impl Model {
             }
             self.gemv_rows(&b.gate, &moe.gate_exps, x_in, e * inter, inter, stream)?;
             self.gemv_rows(&b.up, &moe.up_exps, x_in, e * inter, inter, stream)?;
-            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+            self.kernels
+                .silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
             self.gemv_rows(&mb.tmp, &moe.down_exps, &b.act, e * hidden, hidden, stream)?;
             self.kernels
                 .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, wt, j == 0, stream)?;
@@ -4036,10 +10207,19 @@ impl Model {
                     self.gemv_rows(&b.up, up, x_in, 0, up.rows(), stream)?;
                 }
             }
-            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
-            self.gemv_rows(&mb.tmp, &sh.down, &b.act, 0, sh.down.rows(), stream)?;
             self.kernels
-                .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, shared_scale, false, stream)?;
+                .silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
+            self.gemv_rows(&mb.tmp, &sh.down, &b.act, 0, sh.down.rows(), stream)?;
+            self.kernels.moe_scale_add_f16(
+                out,
+                out_off,
+                &mb.tmp,
+                0,
+                hidden,
+                shared_scale,
+                false,
+                stream,
+            )?;
         }
         Ok(())
     }
@@ -4059,7 +10239,10 @@ impl Model {
         let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
         let inter = moe.moe_inter;
         let k = moe.n_experts_used;
-        let DevWeight::F16 { buf: router_buf, .. } = &moe.router else {
+        let DevWeight::F16 {
+            buf: router_buf, ..
+        } = &moe.router
+        else {
             return Err(ForgeError::Unsupported("MoE router must be f16".into()));
         };
         self.kernels.moe_router_f16(
@@ -4074,7 +10257,8 @@ impl Model {
             moe.norm_topk,
             stream,
         )?;
-        self.device.copy(&mb.ids, 0, &mb.pinned_ids, 0, t * k * 4, stream)?;
+        self.device
+            .copy(&mb.ids, 0, &mb.pinned_ids, 0, t * k * 4, stream)?;
         self.device
             .copy(&mb.weights, 0, &mb.pinned_weights, 0, t * k * 4, stream)?;
         self.device.synchronize()?;
@@ -4112,8 +10296,1242 @@ impl Model {
     }
 
     /// Whether this is the hybrid attention/Gated-DeltaNet MoE arch (qwen35moe).
-    fn is_hybrid(&self) -> bool {
+    pub fn is_hybrid(&self) -> bool {
         self.weights.descriptor.params.ssm.is_some()
+    }
+
+    fn hybrid_batch_b2_weights_capable(&self) -> bool {
+        fn full_rows(weight: &DevWeight) -> bool {
+            matches!(
+                weight,
+                DevWeight::F16 { .. }
+                    | DevWeight::Q8_0 { .. }
+                    | DevWeight::Q4K { .. }
+                    | DevWeight::Q6K { .. }
+                    | DevWeight::Q5K { .. }
+                    | DevWeight::Q3K { .. }
+                    | DevWeight::Q2K { .. }
+                    | DevWeight::Q4_0 { .. }
+                    | DevWeight::Q4_1 { .. }
+                    | DevWeight::Q5_0 { .. }
+                    | DevWeight::Q5_1 { .. }
+                    | DevWeight::Iq4Nl { .. }
+                    | DevWeight::Iq4Xs { .. }
+                    | DevWeight::Mxfp4 { .. }
+                    | DevWeight::Iq2Xs { .. }
+                    | DevWeight::Iq2S { .. }
+                    | DevWeight::Iq3S { .. }
+                    | DevWeight::Iq2Xxs { .. }
+                    | DevWeight::Iq3Xxs { .. }
+                    | DevWeight::Iq1S { .. }
+                    | DevWeight::Iq1M { .. }
+                    | DevWeight::NvFp4 { .. }
+                    | DevWeight::NvFp4Gguf { .. }
+            )
+        }
+
+        fn window_rows(weight: &DevWeight) -> bool {
+            full_rows(weight) && !matches!(weight, DevWeight::NvFp4Gguf { .. })
+        }
+
+        self.is_hybrid()
+            && self.tier.is_none()
+            && matches!(
+                self.weights.lm_head,
+                DevWeight::F16 { .. }
+                    | DevWeight::Q8_0 { .. }
+                    | DevWeight::NvFp4Gguf { .. }
+            )
+            && self.weights.layers.iter().all(|layer| {
+                let LayerFfn::Dense(ffn) = &layer.ffn else {
+                    return false;
+                };
+                let gate_up = match &ffn.gate_up {
+                    GateUpWeights::Fused(weight) => window_rows(weight),
+                    GateUpWeights::Split { gate, up } => full_rows(gate) && full_rows(up),
+                };
+                gate_up && full_rows(&ffn.down)
+            })
+    }
+
+    /// Sprawdza pełny, niemutujący kontrakt targetu hybrydowego B2.
+    pub fn hybrid_batch_b2_capable(&self) -> bool {
+        self.weights.token_embd_host.is_some() && self.hybrid_batch_b2_weights_capable()
+    }
+
+    /// Sprawdza semantyczny kontrakt kerneli eksperymentalnego prefill B2 T32.
+    pub fn hybrid_prefill_b2_capable(&self, chunk_tokens: usize) -> bool {
+        let Some(ssm) = self.weights.descriptor.params.ssm.as_ref() else {
+            return false;
+        };
+        let device_embedding = self.weights.mtp.as_ref().is_some_and(|mtp| {
+            mtp.shares_target_embedding
+                && matches!(
+                    mtp.embedding,
+                    MtpEmbedding::Device(DevWeight::F16 { .. })
+                        | MtpEmbedding::Device(DevWeight::Q8_0 { .. })
+                        | MtpEmbedding::Device(DevWeight::NvFp4Gguf { .. })
+                )
+        });
+        let split_layout = self.weights.layers.iter().all(|layer| {
+            let attention_ok = match &layer.mixer {
+                LayerMixer::Attention(attention) => {
+                    matches!(attention.attn_qkv, QkvWeights::Split { .. })
+                }
+                LayerMixer::DeltaNet(_) => true,
+            };
+            let ffn_ok = match &layer.ffn {
+                LayerFfn::Dense(ffn) => matches!(ffn.gate_up, GateUpWeights::Split { .. }),
+                LayerFfn::Moe(_) => false,
+            };
+            attention_ok && ffn_ok
+        });
+        hybrid_prefill_b2_backend_capable(
+            self.device.caps().vendor,
+            self.device.caps().warp_size,
+        ) && self.kernels.hybrid_prefill_b2_artifacts_capable()
+            && chunk_tokens == 32
+            && self.weights.descriptor.params.head_dim == 256
+            && ssm.d_state == 128
+            && ssm.d_conv > 0
+            && !self.weights.is_moe()
+            && matches!(self.kv.cfg.quant, KvQuant::F16)
+            && self.tier.is_none()
+            && self.prefix_cache.is_none()
+            && device_embedding
+            && split_layout
+            && self.hybrid_batch_b2_weights_capable()
+    }
+
+    /// Wykonuje atomowy target-only prefill dwóch segmentów T32 bez catch-up MTP.
+    pub fn hybrid_prefill_b2_t32(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+    ) -> Result<[Vec<f32>; 2]> {
+        self.hybrid_prefill_b2_t32_inner(seqs, tokens, None, true)
+    }
+
+    /// Wykonuje target prefill B2, pozostawiając oba wiersze logits na urządzeniu.
+    pub fn hybrid_prefill_b2_t32_device(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+    ) -> Result<()> {
+        self.hybrid_prefill_b2_t32_inner(seqs, tokens, None, false)
+            .map(drop)
+    }
+
+    /// Mierzy zdarzeniami urządzenia pojedynczy serialny chunk prefill.
+    #[doc(hidden)]
+    pub fn debug_prefill_chunk_gpu_ms(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+    ) -> Result<(Vec<f32>, f32)> {
+        let start = self.device.create_timing_event()?;
+        let end = self.device.create_timing_event()?;
+        self.device.record_event(&start, &self.stream)?;
+        let logits = self.prefill_chunk(seq, tokens)?;
+        self.device.record_event(&end, &self.stream)?;
+        self.device.synchronize()?;
+        let elapsed = self.device.elapsed_event_ms(&start, &end)?.ok_or_else(|| {
+            ForgeError::Unsupported("urządzenie nie obsługuje zdarzeń czasowych".into())
+        })?;
+        Ok((logits, elapsed))
+    }
+
+    /// Mierzy zdarzeniami urządzenia bezpośredni prefill B2 T32.
+    #[doc(hidden)]
+    pub fn debug_hybrid_prefill_b2_t32_gpu_ms(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+    ) -> Result<([Vec<f32>; 2], f32)> {
+        let start = self.device.create_timing_event()?;
+        let end = self.device.create_timing_event()?;
+        self.device.record_event(&start, &self.stream)?;
+        let logits = self.hybrid_prefill_b2_t32(seqs, tokens)?;
+        self.device.record_event(&end, &self.stream)?;
+        self.device.synchronize()?;
+        let elapsed = self.device.elapsed_event_ms(&start, &end)?.ok_or_else(|| {
+            ForgeError::Unsupported("urządzenie nie obsługuje zdarzeń czasowych".into())
+        })?;
+        Ok((logits, elapsed))
+    }
+
+    /// Zwraca sumę logicznych rozmiarów dedykowanego scratchu prefill B2.
+    #[doc(hidden)]
+    pub fn debug_hybrid_prefill_b2_scratch_bytes(&self) -> usize {
+        let Some(bufs) = self.hybrid_prefill_b2_bufs.as_ref() else {
+            return 0;
+        };
+        let fixed = [
+            &bufs.h,
+            &bufs.x,
+            &bufs.k,
+            &bufs.v,
+            &bufs.attn_out,
+            &bufs.o_out,
+            &bufs.gate,
+            &bufs.up,
+            &bufs.act,
+            &bufs.down,
+            &bufs.ids,
+            &bufs.positions,
+            &bufs.q_full,
+            &bufs.qc,
+            &bufs.gatec,
+            &bufs.gated,
+            &bufs.qkv_mixed,
+            &bufs.z,
+            &bufs.alpha,
+            &bufs.beta_raw,
+            &bufs.o,
+            &bufs.normed,
+            &bufs.page_tables,
+            &bufs.base_positions,
+            &bufs.visible_lens,
+            &bufs.decisions,
+            &bufs.final_hidden,
+            &bufs.logits,
+            &bufs.pinned_metadata,
+            &bufs.pinned_logits,
+            &bufs.final_conv,
+            &bufs.final_states,
+        ]
+        .into_iter()
+        .map(DevBuffer::len)
+        .sum::<usize>();
+        fixed
+            + bufs
+                .delta
+                .iter()
+                .flatten()
+                .map(|cache| {
+                    cache.conv_initial.len()
+                        + cache.state_initial.len()
+                        + cache.q.len()
+                        + cache.k.len()
+                        + cache.v.len()
+                        + cache.g.len()
+                        + cache.beta.len()
+                })
+                .sum::<usize>()
+    }
+
+    /// Odtwarza stany MTP po target-only prefill B2 macierzowo, lane po lane.
+    pub fn hybrid_prefill_mtp_catchup_b2(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+        reset: [bool; 2],
+    ) -> Result<()> {
+        self.hybrid_prefill_mtp_catchup_b2_inner(seqs, tokens, reset, None, None)
+    }
+
+    /// Wymusza błąd po wykonaniu wskazanego lane transakcji catch-up MTP.
+    #[doc(hidden)]
+    pub fn debug_hybrid_prefill_mtp_catchup_b2_rollback(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+        reset: [bool; 2],
+        failed_lane: usize,
+    ) -> Result<()> {
+        if failed_lane >= 2 {
+            return Err(ForgeError::Scheduler(
+                "test rollbacku catch-up MTP wymaga lane 0 lub 1".into(),
+            ));
+        }
+        self.hybrid_prefill_mtp_catchup_b2_inner(seqs, tokens, reset, Some(failed_lane), None)
+    }
+
+    /// Wymusza błąd lane oraz następującego po nim rollbacku pary MTP.
+    #[doc(hidden)]
+    pub fn debug_hybrid_prefill_mtp_catchup_b2_rollback_failure(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+        reset: [bool; 2],
+        failed_lane: usize,
+        rollback_failed_lane: usize,
+    ) -> Result<()> {
+        if failed_lane >= 2 || rollback_failed_lane >= 2 {
+            return Err(ForgeError::Scheduler(
+                "test błędu rollbacku catch-up MTP wymaga lane 0 lub 1".into(),
+            ));
+        }
+        self.hybrid_prefill_mtp_catchup_b2_inner(
+            seqs,
+            tokens,
+            reset,
+            Some(failed_lane),
+            Some(rollback_failed_lane),
+        )
+    }
+
+    fn hybrid_prefill_mtp_catchup_b2_inner(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+        reset: [bool; 2],
+        fail_after_lane: Option<usize>,
+        fail_rollback_lane: Option<usize>,
+    ) -> Result<()> {
+        if let Some(pool) = self.hybrid_states.as_ref() {
+            pool.ensure_healthy()?;
+        }
+        if !self.has_native_mtp() {
+            return Ok(());
+        }
+        const STEPS: usize = 32;
+        if tokens.iter().any(|lane| lane.len() != STEPS) {
+            return Err(ForgeError::Scheduler(
+                "catch-up MTP B2 wymaga dwóch segmentów T32".into(),
+            ));
+        }
+        self.ensure_hybrid_bufs()?;
+        self.ensure_prefill_bufs()?;
+        self.ensure_hybrid_verify_bufs(4)?;
+        std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+        let saved_graphs = (
+            std::mem::take(&mut self.hybrid_verify_graphs),
+            std::mem::take(&mut self.hybrid_verify_graph_disabled),
+        );
+        let result = (|| {
+            self.ensure_hybrid_verify_bufs(STEPS)?;
+            let hidden = self.weights.descriptor.params.hidden_size;
+            let hidden_bytes = hidden * 2;
+            let direct_x = self
+                .hybrid_prefill_b2_bufs
+                .as_ref()
+                .expect("target B2 przygotował scratch")
+                .x
+                .clone();
+            for (lane, lane_tokens) in tokens.iter().enumerate() {
+                let staging = &self
+                    .hybrid_verify_bufs
+                    .as_ref()
+                    .expect("catch-up MTP ma scratch")
+                    .host_staging[lane]
+                    .embedding;
+                let destination = staging
+                    .host_ptr()
+                    .expect("embedding catch-up ma mapowanie hosta");
+                {
+                    let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+                        ForgeError::Unsupported(
+                            "catch-up MTP B2 wymaga hostowego embeddingu".into(),
+                        )
+                    })?;
+                    for (row, &token) in lane_tokens.iter().enumerate() {
+                        let source = table
+                            .get(token as usize * hidden..(token as usize + 1) * hidden)
+                            .ok_or_else(|| {
+                                ForgeError::Scheduler(format!(
+                                    "token id {token} wykracza poza embedding catch-up"
+                                ))
+                            })?;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                source.as_ptr() as *const u8,
+                                destination.add(row * hidden_bytes),
+                                hidden_bytes,
+                            );
+                        }
+                    }
+                }
+            }
+            let (leases, mut states, mut mtp_kv) = self.take_mtp_runtime_pair(seqs)?;
+            let mut pair_result = (|| {
+                states[0].checkpoint(&self.stream)?;
+                states[1].checkpoint(&self.stream)?;
+                for (lane, state) in states.iter_mut().enumerate() {
+                    if reset[lane] {
+                        state.reset_pending(&mut mtp_kv, &self.stream)?;
+                    }
+                }
+                for (lane, state) in states.iter_mut().enumerate() {
+                    let prefill_x = self
+                        .prefill_bufs
+                        .as_ref()
+                        .expect("catch-up MTP ma bufory prefill")
+                        .x
+                        .clone();
+                    self.device.copy(
+                        &direct_x,
+                        lane * STEPS * hidden_bytes,
+                        &prefill_x,
+                        0,
+                        STEPS * hidden_bytes,
+                        &self.stream,
+                    )?;
+                    self.profile_catchup_start()?;
+                    let execution = self.mtp_catchup_verified_prefix_pending(
+                        state,
+                        &mut mtp_kv,
+                        STEPS,
+                        lane,
+                        None,
+                    );
+                    let profile_end = self.profile_catchup_end();
+                    execution?;
+                    profile_end?;
+                    if fail_after_lane == Some(lane) {
+                        return Err(ForgeError::Scheduler(format!(
+                            "wymuszony błąd catch-up MTP po lane {lane}"
+                        )));
+                    }
+                }
+                states[0].validate_commit_catchup(STEPS)?;
+                states[1].validate_commit_catchup(STEPS)?;
+                self.device.synchronize()?;
+                states[0].apply_commit_catchup();
+                states[1].apply_commit_catchup();
+                Ok(())
+            })();
+            if pair_result.is_err() {
+                let rollback = rollback_mtp_pair_inner(
+                    &mut states,
+                    &mut mtp_kv,
+                    &self.stream,
+                    fail_rollback_lane,
+                )
+                .and_then(|_| self.device.synchronize());
+                if let Err(rollback) = rollback {
+                    let execution = pair_result.expect_err("catch-up pary zawiera błąd");
+                    pair_result = Err(self.poison_mtp_runtime(format!(
+                        "błąd catch-up MTP B2: {execution}; rollback pary nie powiódł się: {rollback}"
+                    )));
+                }
+            }
+            self.finish_mtp_runtime_pair(leases, states, mtp_kv, pair_result)
+        })();
+        restore_after(result, || {
+            std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+            self.hybrid_verify_graphs = saved_graphs.0;
+            self.hybrid_verify_graph_disabled = saved_graphs.1;
+        })
+    }
+
+    /// Próbkuje wskazany wiersz logits ostatniego prefill B2 na GPU.
+    pub fn sample_hybrid_prefill_b2_logits(
+        &mut self,
+        lane: usize,
+        sampler: &mut GpuSampler,
+    ) -> Result<u32> {
+        if lane >= 2 {
+            return Err(ForgeError::Scheduler(
+                "logity prefill B2 wymagają lane 0 lub 1".into(),
+            ));
+        }
+        let logits = &self
+            .hybrid_prefill_b2_bufs
+            .as_ref()
+            .ok_or_else(|| ForgeError::Scheduler("brak logits prefill B2".into()))?
+            .logits;
+        let bytes = self.weights.descriptor.params.vocab_size * 4;
+        self.device.copy(
+            logits,
+            lane * bytes,
+            &self.bufs.logits,
+            0,
+            bytes,
+            &self.stream,
+        )?;
+        self.sample_last_logits(sampler)
+    }
+
+    /// Próbkuje oba wiersze prefill B2 na GPU i odczytuje tylko dwa ID.
+    pub fn sample_hybrid_prefill_b2_logits_batched(
+        &mut self,
+        samplers: &mut [&mut GpuSampler; 2],
+    ) -> Result<[u32; 2]> {
+        const BATCH: usize = 2;
+        self.ensure_batch(BATCH)?;
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let [first, second] = samplers;
+        let params = [first.batch_params(vocab), second.batch_params(vocab)];
+        let logits = self
+            .hybrid_prefill_b2_bufs
+            .as_ref()
+            .ok_or_else(|| ForgeError::Scheduler("brak logits prefill B2".into()))?
+            .logits
+            .clone();
+        self.batch_sample_from(&logits, BATCH, &params)?;
+        let batch = self.batch_bufs.as_ref().expect("batch sampler ma bufory");
+        self.device.copy(
+            &batch.out_ids,
+            0,
+            &batch.pinned_out,
+            0,
+            BATCH * 4,
+            &self.stream,
+        )?;
+        self.device.synchronize()?;
+        let output = batch.pinned_out.host_ptr().expect("pinned output ma mapowanie") as *const i32;
+        let ids = unsafe { std::slice::from_raw_parts(output, BATCH) };
+        let mut result = [0u32; BATCH];
+        for lane in 0..BATCH {
+            let id = ids[lane];
+            if id < 0 || id as usize >= vocab {
+                return Err(ForgeError::Kernel(format!(
+                    "batch sampler prefill zwrócił token {id} poza słownikiem dla lane {lane}"
+                )));
+            }
+            result[lane] = id as u32;
+        }
+        Ok(result)
+    }
+
+    /// Wymusza błąd po pierwszym zapisie stanu na potrzeby testu rollbacku.
+    #[doc(hidden)]
+    pub fn debug_hybrid_prefill_b2_t32_rollback(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+        failed_lane: usize,
+    ) -> Result<[Vec<f32>; 2]> {
+        if failed_lane >= 2 {
+            return Err(ForgeError::Scheduler(
+                "test rollbacku prefill B2 wymaga lane 0 lub 1".into(),
+            ));
+        }
+        self.hybrid_prefill_b2_t32_inner(seqs, tokens, Some(failed_lane), true)
+    }
+
+    fn hybrid_prefill_b2_t32_inner(
+        &mut self,
+        seqs: &mut [&mut SeqKv; 2],
+        tokens: [&[u32]; 2],
+        fail_after_state_commit: Option<usize>,
+        read_host_logits: bool,
+    ) -> Result<[Vec<f32>; 2]> {
+        const BATCH: usize = 2;
+        const STEPS: usize = 32;
+        const TOTAL: usize = BATCH * STEPS;
+        if tokens.iter().any(|lane| lane.len() != STEPS) {
+            return Err(ForgeError::Scheduler(
+                "prefill B2 T32 wymaga dokładnie 32 tokenów w każdym lane".into(),
+            ));
+        }
+        if !self.hybrid_prefill_b2_capable(STEPS) {
+            return Err(ForgeError::Unsupported(
+                "model nie spełnia semantycznego kontraktu prefill B2 T32".into(),
+            ));
+        }
+        if seqs[0].id == seqs[1].id {
+            return Err(ForgeError::Scheduler(
+                "prefill B2 T32 wymaga dwóch różnych sekwencji".into(),
+            ));
+        }
+        let p = self.weights.descriptor.params.clone();
+        if tokens
+            .iter()
+            .flat_map(|lane| lane.iter())
+            .any(|&token| token as usize >= p.vocab_size)
+        {
+            return Err(ForgeError::Scheduler(
+                "prefill B2 T32 otrzymał token poza słownikiem".into(),
+            ));
+        }
+        let bases = [seqs[0].len, seqs[1].len];
+        let ends = [
+            bases[0].checked_add(STEPS).ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie pozycji prefill B2 T32 lane0".into())
+            })?,
+            bases[1].checked_add(STEPS).ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie pozycji prefill B2 T32 lane1".into())
+            })?,
+        ];
+        for end in ends {
+            if end > p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {} exceeds model context {}",
+                    end - 1,
+                    p.max_position_embeddings
+                )));
+            }
+        }
+        let required_pages = seqs
+            .iter()
+            .enumerate()
+            .try_fold(0usize, |total, (lane, seq)| {
+                let pages = ends[lane]
+                    .div_ceil(self.kv.cfg.page_size)
+                    .saturating_sub(seq.pages.len());
+                total.checked_add(pages).ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie stron prefill B2 T32".into())
+                })
+            })?;
+        self.ensure_free_pages(required_pages);
+        if required_pages > self.kv.free_page_count() {
+            return Err(ForgeError::Scheduler(format!(
+                "prefill B2 T32 wymaga {required_pages} stron KV, dostępne {}",
+                self.kv.free_page_count()
+            )));
+        }
+        self.preflight_hybrid_state_slots(2)?;
+        self.ensure_hybrid_prefill_b2_bufs()?;
+        for seq in seqs.iter_mut() {
+            self.activate_hybrid_sequence(seq)?;
+        }
+        let leases = [
+            seqs[0].hybrid_state.expect("lane0 ma lease"),
+            seqs[1].hybrid_state.expect("lane1 ma lease"),
+        ];
+        let ssm = p.ssm.as_ref().expect("prefill B2 ma parametry SSM");
+        let q_elements = TOTAL * p.n_heads * p.head_dim;
+        let q_norm_rows = TOTAL * p.n_heads;
+        let kv_norm_rows = TOTAL * p.n_kv_heads;
+        let delta_norm_rows = TOTAL * ssm.n_v_heads();
+        let ffn_rows = TOTAL * p.intermediate_size;
+        let state_bytes = ssm.n_v_heads() * ssm.d_state * ssm.d_state * 4;
+        let mut snapshot_ready = false;
+        let mut work_enqueued = false;
+        let result = (|| {
+            for seq in seqs.iter_mut() {
+                for _ in 0..STEPS {
+                    self.kv.grow(seq)?;
+                }
+            }
+            let page_table_elems = BATCH * self.max_pages_per_seq;
+            let mut metadata = Vec::with_capacity(3 * TOTAL + BATCH + page_table_elems + BATCH * 2);
+            metadata.extend(tokens[0].iter().chain(tokens[1].iter()).map(|&token| token as i32));
+            for lane in 0..BATCH {
+                metadata.extend((bases[lane]..ends[lane]).map(|position| position as i32));
+            }
+            for lane in 0..BATCH {
+                metadata.extend((bases[lane] + 1..=ends[lane]).map(|visible| visible as i32));
+            }
+            metadata.extend(bases.map(|base| base as i32));
+            let page_table_offset = metadata.len();
+            for seq in seqs.iter() {
+                metadata.extend(seq.pages.iter().copied());
+                metadata.resize(metadata.len() + self.max_pages_per_seq - seq.pages.len(), -1);
+            }
+            metadata.extend([STEPS as i32, 0, STEPS as i32, 0]);
+            let b2 = self
+                .hybrid_prefill_b2_bufs
+                .as_ref()
+                .expect("scratch prefill B2 jest gotowy");
+            write_pinned(bytemuck::cast_slice(&metadata), &b2.pinned_metadata)?;
+            work_enqueued = true;
+            let rows_bytes = TOTAL * 4;
+            self.device.copy(
+                &b2.pinned_metadata,
+                0,
+                &b2.ids,
+                0,
+                rows_bytes,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.pinned_metadata,
+                rows_bytes,
+                &b2.positions,
+                0,
+                rows_bytes,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.pinned_metadata,
+                2 * rows_bytes,
+                &b2.visible_lens,
+                0,
+                rows_bytes,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.pinned_metadata,
+                3 * rows_bytes,
+                &b2.base_positions,
+                0,
+                BATCH * 4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.pinned_metadata,
+                page_table_offset * 4,
+                &b2.page_tables,
+                0,
+                page_table_elems * 4,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &b2.pinned_metadata,
+                (page_table_offset + page_table_elems) * 4,
+                &b2.decisions,
+                0,
+                BATCH * 2 * 4,
+                &self.stream,
+            )?;
+
+            let embedding = self
+                .weights
+                .mtp
+                .as_ref()
+                .and_then(|mtp| mtp.shares_target_embedding.then_some(&mtp.embedding))
+                .expect("capability sprawdziło device embedding");
+            match embedding {
+                MtpEmbedding::Device(DevWeight::F16 { buf, rows, cols }) => {
+                    if (*rows, *cols) != (p.vocab_size, p.hidden_size) {
+                        return Err(ForgeError::Format(
+                            "embedding F16 prefill B2 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_rows_f16(
+                        &b2.h,
+                        buf,
+                        &b2.ids,
+                        TOTAL,
+                        p.hidden_size,
+                        &self.stream,
+                    )?;
+                }
+                MtpEmbedding::Device(DevWeight::Q8_0 { buf, rows, cols }) => {
+                    if (*rows, *cols) != (p.vocab_size, p.hidden_size) {
+                        return Err(ForgeError::Format(
+                            "embedding Q8_0 prefill B2 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_q8_0_rows_f16(
+                        &b2.h,
+                        buf,
+                        &b2.ids,
+                        TOTAL,
+                        p.vocab_size,
+                        p.hidden_size,
+                        &self.stream,
+                    )?;
+                }
+                MtpEmbedding::Device(DevWeight::NvFp4Gguf {
+                    buf,
+                    output_scale,
+                    rows,
+                    cols,
+                }) => {
+                    if (*rows, *cols) != (p.vocab_size, p.hidden_size) {
+                        return Err(ForgeError::Format(
+                            "embedding NVFP4 prefill B2 ma niezgodny kształt".into(),
+                        ));
+                    }
+                    self.kernels.gather_nvfp4_gguf_rows_f16(
+                        &b2.h,
+                        buf,
+                        &b2.ids,
+                        TOTAL,
+                        p.vocab_size,
+                        p.hidden_size,
+                        *output_scale,
+                        &self.stream,
+                    )?;
+                }
+                _ => unreachable!("capability ogranicza format embeddingu"),
+            }
+
+            for (layer_index, cache) in b2.delta.iter().enumerate() {
+                let Some(cache) = cache else { continue };
+                for (lane, &lease) in leases.iter().enumerate() {
+                    let (conv, state) = self
+                        .hybrid_states
+                        .as_ref()
+                        .expect("model ma pulę hybrydową")
+                        .state_buffers(lease, layer_index)?
+                        .expect("warstwa DeltaNet ma stan");
+                    self.device.copy(
+                        &conv,
+                        0,
+                        &cache.conv_initial,
+                        lane * conv.len(),
+                        conv.len(),
+                        &self.stream,
+                    )?;
+                    self.device.copy(
+                        &state,
+                        0,
+                        &cache.state_initial,
+                        lane * state.len(),
+                        state.len(),
+                        &self.stream,
+                    )?;
+                }
+            }
+            snapshot_ready = true;
+            self.kernels.rmsnorm_f16(
+                &b2.x,
+                &b2.h,
+                &self.weights.layers[0].attn_norm,
+                TOTAL,
+                p.hidden_size,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+            for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+                match &layer.mixer {
+                    LayerMixer::Attention(attention) => {
+                        let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
+                            unreachable!("capability wymaga rozdzielonych Q/K/V")
+                        };
+                        self.gemm(&b2.q_full, q, &b2.x, TOTAL, &self.stream)?;
+                        self.kernels.deinterleave_gate_f16(
+                            &b2.qc,
+                            &b2.gatec,
+                            &b2.q_full,
+                            p.head_dim,
+                            q_elements,
+                            &self.stream,
+                        )?;
+                        if let Some(norm) = &attention.q_norm {
+                            self.kernels.rmsnorm_f16(
+                                &b2.qc,
+                                &b2.qc,
+                                norm,
+                                q_norm_rows,
+                                p.head_dim,
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        }
+                        self.gemm(&b2.k, k, &b2.x, TOTAL, &self.stream)?;
+                        self.gemm(&b2.v, v, &b2.x, TOTAL, &self.stream)?;
+                        if let Some(norm) = &attention.k_norm {
+                            self.kernels.rmsnorm_f16(
+                                &b2.k,
+                                &b2.k,
+                                norm,
+                                kv_norm_rows,
+                                p.head_dim,
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        }
+                        let n_rot = self.hybrid_n_rot();
+                        self.kernels.rope_neox_partial_f16(
+                            &b2.qc,
+                            &b2.positions,
+                            TOTAL,
+                            p.n_heads,
+                            p.head_dim,
+                            n_rot,
+                            p.rope_theta,
+                            &self.stream,
+                        )?;
+                        self.kernels.rope_neox_partial_f16(
+                            &b2.k,
+                            &b2.positions,
+                            TOTAL,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            n_rot,
+                            p.rope_theta,
+                            &self.stream,
+                        )?;
+                        let kv_layer = self.target_kv_layer(layer_index);
+                        self.kernels.kv_append_batch_segmented_f16(
+                            &self.kv.k[kv_layer],
+                            &self.kv.v[kv_layer],
+                            &b2.k,
+                            &b2.v,
+                            &b2.page_tables,
+                            &b2.base_positions,
+                            BATCH,
+                            STEPS,
+                            self.max_pages_per_seq,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            p.head_dim,
+                            &self.stream,
+                        )?;
+                        self.kernels.attn_verify_segmented_f16_hd256(
+                            &b2.attn_out,
+                            &b2.qc,
+                            &self.kv.k[kv_layer],
+                            &self.kv.v[kv_layer],
+                            &b2.page_tables,
+                            &b2.visible_lens,
+                            BATCH,
+                            STEPS,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            1.0 / (p.head_dim as f32).sqrt(),
+                            &self.stream,
+                        )?;
+                        self.kernels.sigmoid_mul_f16(
+                            &b2.gated,
+                            &b2.attn_out,
+                            &b2.gatec,
+                            q_elements,
+                            &self.stream,
+                        )?;
+                        self.gemm(&b2.o_out, &attention.attn_o, &b2.gated, TOTAL, &self.stream)?;
+                    }
+                    LayerMixer::DeltaNet(delta) => {
+                        let cache = b2.delta[layer_index]
+                            .as_ref()
+                            .expect("warstwa DeltaNet ma scratch B2");
+                        self.gemm(&b2.qkv_mixed, &delta.in_proj, &b2.x, TOTAL, &self.stream)?;
+                        self.gemm(&b2.z, &delta.gate_proj, &b2.x, TOTAL, &self.stream)?;
+                        self.gemm(&b2.alpha, &delta.alpha_proj, &b2.x, TOTAL, &self.stream)?;
+                        self.gemm(&b2.beta_raw, &delta.beta_proj, &b2.x, TOTAL, &self.stream)?;
+                        self.kernels.deltanet_prepare_segmented_final_f16(
+                            &cache.q,
+                            &cache.k,
+                            &cache.v,
+                            &cache.g,
+                            &cache.beta,
+                            &b2.final_conv,
+                            &cache.conv_initial,
+                            &b2.qkv_mixed,
+                            &delta.conv1d,
+                            &b2.alpha,
+                            &b2.beta_raw,
+                            &delta.dt_bias,
+                            &delta.a,
+                            BATCH,
+                            STEPS,
+                            ssm.n_k_heads(),
+                            ssm.n_v_heads(),
+                            ssm.d_state,
+                            ssm.d_conv,
+                            p.rms_norm_eps,
+                            &self.stream,
+                        )?;
+                        self.kernels.deltanet_gated_scan_segmented_shared_d128_f16(
+                            &b2.o,
+                            &b2.final_states,
+                            &cache.state_initial,
+                            &cache.q,
+                            &cache.k,
+                            &cache.v,
+                            &cache.g,
+                            &cache.beta,
+                            BATCH,
+                            STEPS,
+                            ssm.n_v_heads(),
+                            ssm.d_state,
+                            &self.stream,
+                        )?;
+                        for (lane, &lease) in leases.iter().enumerate() {
+                            let (conv, state) = self
+                                .hybrid_states
+                                .as_ref()
+                                .expect("model ma pulę hybrydową")
+                                .state_buffers(lease, layer_index)?
+                                .expect("warstwa DeltaNet ma stan");
+                            self.device.copy(
+                                &b2.final_conv,
+                                lane * conv.len(),
+                                &conv,
+                                0,
+                                conv.len(),
+                                &self.stream,
+                            )?;
+                            self.device.copy(
+                                &b2.final_states,
+                                lane * state_bytes,
+                                &state,
+                                0,
+                                state.len(),
+                                &self.stream,
+                            )?;
+                        }
+                        if let Some(lane) = fail_after_state_commit {
+                            return Err(ForgeError::Scheduler(format!(
+                                "wymuszony błąd rollbacku prefill B2 lane {lane}"
+                            )));
+                        }
+                        self.kernels.deltanet_gated_rmsnorm_f16(
+                            &b2.normed,
+                            &b2.o,
+                            &b2.z,
+                            &delta.ssm_norm,
+                            delta_norm_rows,
+                            ssm.d_state,
+                            p.rms_norm_eps,
+                            &self.stream,
+                        )?;
+                        self.gemm(&b2.o_out, &delta.out_proj, &b2.normed, TOTAL, &self.stream)?;
+                    }
+                }
+                self.kernels.rmsnorm_residual_f16(
+                    &b2.x,
+                    &b2.h,
+                    &b2.o_out,
+                    &layer.ffn_norm,
+                    TOTAL,
+                    p.hidden_size,
+                    p.rms_norm_eps,
+                    &self.stream,
+                )?;
+                let LayerFfn::Dense(ffn) = &layer.ffn else {
+                    unreachable!("capability odrzuca MoE")
+                };
+                let GateUpWeights::Split { gate, up } = &ffn.gate_up else {
+                    unreachable!("capability wymaga rozdzielonych gate/up")
+                };
+                self.gemm(&b2.gate, gate, &b2.x, TOTAL, &self.stream)?;
+                self.gemm(&b2.up, up, &b2.x, TOTAL, &self.stream)?;
+                self.kernels.silu_mul_f16(
+                    &b2.act,
+                    &b2.gate,
+                    &b2.up,
+                    ffn_rows,
+                    &self.stream,
+                )?;
+                self.gemm(&b2.down, &ffn.down, &b2.act, TOTAL, &self.stream)?;
+                let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                    &self.weights.layers[layer_index + 1].attn_norm
+                } else {
+                    &self.weights.output_norm
+                };
+                self.kernels.rmsnorm_residual_f16(
+                    &b2.x,
+                    &b2.h,
+                    &b2.down,
+                    next_norm,
+                    TOTAL,
+                    p.hidden_size,
+                    p.rms_norm_eps,
+                    &self.stream,
+                )?;
+            }
+            self.kernels.mtp_select_row_segmented_f16(
+                &b2.final_hidden,
+                &b2.x,
+                &b2.decisions,
+                BATCH,
+                STEPS,
+                p.hidden_size,
+                &self.stream,
+            )?;
+            self.logits_gemm(&b2.logits, &b2.final_hidden, BATCH, &self.stream)?;
+            if read_host_logits {
+                self.device.copy(
+                    &b2.logits,
+                    0,
+                    &b2.pinned_logits,
+                    0,
+                    BATCH * p.vocab_size * 4,
+                    &self.stream,
+                )?;
+                self.device.synchronize()?;
+                let logits = b2
+                    .pinned_logits
+                    .host_ptr()
+                    .expect("logity B2 mają mapowanie") as *const f32;
+                Ok(std::array::from_fn(|lane| unsafe {
+                    std::slice::from_raw_parts(logits.add(lane * p.vocab_size), p.vocab_size).to_vec()
+                }))
+            } else {
+                Ok(std::array::from_fn(|_| Vec::new()))
+            }
+        })();
+
+        self.pt_seq = 0;
+        if let Err(error) = result {
+            for lane in 0..BATCH {
+                self.kv.rollback(seqs[lane], bases[lane]);
+            }
+            if snapshot_ready {
+                let b2 = self
+                    .hybrid_prefill_b2_bufs
+                    .as_ref()
+                    .expect("scratch prefill B2 jest gotowy");
+                let rollback = (|| {
+                    for (layer_index, cache) in b2.delta.iter().enumerate() {
+                        let Some(cache) = cache else { continue };
+                        for (lane, &lease) in leases.iter().enumerate() {
+                            let (conv, state) = self
+                                .hybrid_states
+                                .as_ref()
+                                .expect("model ma pulę hybrydową")
+                                .state_buffers(lease, layer_index)?
+                                .expect("warstwa DeltaNet ma stan");
+                            self.device.copy(
+                                &cache.conv_initial,
+                                lane * conv.len(),
+                                &conv,
+                                0,
+                                conv.len(),
+                                &self.stream,
+                            )?;
+                            self.device.copy(
+                                &cache.state_initial,
+                                lane * state.len(),
+                                &state,
+                                0,
+                                state.len(),
+                                &self.stream,
+                            )?;
+                        }
+                    }
+                    self.device.synchronize()
+                })();
+                if let Err(rollback) = rollback {
+                    return Err(self
+                        .hybrid_states
+                        .as_mut()
+                        .expect("model ma pulę hybrydową")
+                        .poison(format!(
+                            "błąd prefill B2 T32: {error}; rollback stanów nie powiódł się: {rollback}"
+                        )));
+                }
+            } else if work_enqueued {
+                if let Err(sync) = self.device.synchronize() {
+                    return Err(self
+                        .hybrid_states
+                        .as_mut()
+                        .expect("model ma pulę hybrydową")
+                        .poison(format!(
+                            "błąd prefill B2 T32: {error}; synchronizacja rollbacku nie powiodła się: {sync}"
+                        )));
+                }
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    /// Zrzuca stan hybrydowy do diagnostyki zgodności batch kontra serial.
+    pub fn debug_hybrid_state_snapshot(&self) -> Result<Vec<(String, usize, Vec<u8>)>> {
+        self.device.synchronize()?;
+        let mut snapshot = Vec::new();
+        for (name, buffer, element_bytes) in
+            [("h", &self.bufs.h, 2usize), ("x", &self.bufs.x, 2usize)]
+        {
+            let mut bytes = vec![0u8; buffer.len()];
+            self.device.read(buffer, 0, &mut bytes)?;
+            snapshot.push((name.into(), element_bytes, bytes));
+        }
+        for (layer, state) in self.active_ssm().iter().enumerate() {
+            let Some(state) = state else { continue };
+            for (kind, buffer, element_bytes) in
+                [("conv", &state.conv, 2usize), ("ssm", &state.state, 4usize)]
+            {
+                let mut bytes = vec![0u8; buffer.len()];
+                self.device.read(buffer, 0, &mut bytes)?;
+                snapshot.push((format!("layer.{layer}.{kind}"), element_bytes, bytes));
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Zrzuca logiczny KV i stany DeltaNet jednej sekwencji do testów parytetu.
+    pub fn debug_hybrid_sequence_snapshot(
+        &mut self,
+        seq: &mut SeqKv,
+    ) -> Result<Vec<(String, usize, Vec<u8>)>> {
+        self.activate_hybrid_sequence(seq)?;
+        self.device.synchronize()?;
+        let lease = seq
+            .hybrid_state
+            .expect("aktywna sekwencja hybrydowa ma lease");
+        let mut snapshot = Vec::new();
+        for layer_index in 0..self.weights.layers.len() {
+            if let Some((conv, state)) = self
+                .hybrid_states
+                .as_ref()
+                .expect("model ma pulę hybrydową")
+                .state_buffers(lease, layer_index)?
+            {
+                for (kind, buffer, element_bytes) in
+                    [("conv", conv, 2usize), ("state", state, 4usize)]
+                {
+                    let mut data = vec![0u8; buffer.len()];
+                    self.device.read(&buffer, 0, &mut data)?;
+                    snapshot.push((format!("layer.{layer_index}.{kind}"), element_bytes, data));
+                }
+            }
+        }
+        let page_bytes = self.kv.cfg.n_kv_heads
+            * self.kv.cfg.page_size
+            * self.kv.cfg.head_dim
+            * 2;
+        for layer_index in 0..self.weights.layers.len() {
+            let LayerMixer::Attention(_) = self.weights.layers[layer_index].mixer else {
+                continue;
+            };
+            let kv_layer = self.target_kv_layer(layer_index);
+            for (kind, slab) in [("k", &self.kv.k[kv_layer]), ("v", &self.kv.v[kv_layer])] {
+                let mut data = vec![0u8; seq.pages.len() * page_bytes];
+                for (logical, &physical) in seq.pages.iter().enumerate() {
+                    if physical < 0 {
+                        return Err(ForgeError::Scheduler(
+                            "snapshot prefill B2 nie obsługuje stron spilled".into(),
+                        ));
+                    }
+                    self.device.read(
+                        slab,
+                        physical as usize * page_bytes,
+                        &mut data[logical * page_bytes..(logical + 1) * page_bytes],
+                    )?;
+                }
+                snapshot.push((format!("layer.{layer_index}.kv.{kind}"), 2, data));
+            }
+        }
+        snapshot.push(("seq.len".into(), 1, seq.len.to_le_bytes().to_vec()));
+        snapshot.push(("seq.tokens".into(), 4, bytemuck::cast_slice(&seq.tokens).to_vec()));
+        Ok(snapshot)
+    }
+
+    /// Zrzuca carry oraz aktywny prefiks KV MTP w kolejności logicznych stron.
+    pub fn debug_mtp_state_snapshot(&self, seq: &SeqKv) -> Result<Vec<(String, usize, Vec<u8>)>> {
+        self.device.synchronize()?;
+        let lease = seq
+            .hybrid_state
+            .ok_or_else(|| ForgeError::Unsupported("sekwencja nie ma lease stanu MTP".into()))?;
+        let pool = self
+            .hybrid_states
+            .as_ref()
+            .ok_or_else(|| ForgeError::Unsupported("model nie ma aktywnego stanu MTP".into()))?;
+        pool.validate(lease)?;
+        let state = pool.slots[lease.slot].mtp.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("stan MTP sekwencji jest aktualnie używany".into())
+        })?;
+        let mtp_kv = pool
+            .mtp_kv
+            .as_ref()
+            .ok_or_else(|| ForgeError::Unsupported("cache MTP jest aktualnie używany".into()))?;
+        let mut hidden = vec![0u8; state.recurrent_hidden.len()];
+        self.device
+            .read(&state.recurrent_hidden, 0, &mut hidden)?;
+        let mut snapshot = vec![("mtp.hidden".into(), 2, hidden)];
+        for (name, buffer) in [
+            ("mtp.page_table", &state.page_table),
+            ("mtp.seq_len", &state.seq_len),
+            ("mtp.position", &state.position),
+        ] {
+            let mut bytes = vec![0u8; buffer.len()];
+            self.device.read(buffer, 0, &mut bytes)?;
+            snapshot.push((name.into(), 4, bytes));
+        }
+        let head_bytes = mtp_kv.cfg.head_dim * 2;
+        for (name, buffers) in [("mtp.k", &mtp_kv.k), ("mtp.v", &mtp_kv.v)] {
+            let mut bytes = Vec::with_capacity(state.seq.len * mtp_kv.cfg.n_kv_heads * head_bytes);
+            for (offset, length) in logical_kv_regions(
+                &state.seq.pages,
+                state.seq.len,
+                mtp_kv.cfg.page_size,
+                mtp_kv.cfg.n_kv_heads,
+                head_bytes,
+            ) {
+                let mut chunk = vec![0u8; length];
+                self.device.read(&buffers[0], offset, &mut chunk)?;
+                bytes.extend_from_slice(&chunk);
+            }
+            snapshot.push((name.into(), 2usize, bytes));
+        }
+        snapshot.push(("mtp.len".into(), 1, state.seq.len.to_le_bytes().to_vec()));
+        Ok(snapshot)
+    }
+
+    /// Wykonuje pojedynczy referencyjny catch-up MTP po kroku targetu.
+    pub fn debug_mtp_catchup_token(&mut self, seq: &mut SeqKv, token: u32) -> Result<()> {
+        self.mtp_catchup_token(seq, token)
     }
 
     /// NEOX partial-rotary width for the hybrid attention layers: M-RoPE over
@@ -4172,23 +11590,6 @@ impl Model {
         Ok(())
     }
 
-    /// Zero every DeltaNet layer's recurrent state (conv window + state matrix)
-    /// at the start of a new sequence.
-    fn zero_ssm(&self) -> Result<()> {
-        let Some(ssm) = &self.weights.descriptor.params.ssm else {
-            return Ok(());
-        };
-        let conv_bytes = ssm.conv_dim() * (ssm.d_conv - 1) * 2;
-        let state_bytes = ssm.n_v_heads() * ssm.d_state * ssm.d_state * 4;
-        let zc = vec![0u8; conv_bytes];
-        let zs = vec![0u8; state_bytes];
-        for s in self.ssm.iter().flatten() {
-            self.device.write(&zc, &s.conv, 0)?;
-            self.device.write(&zs, &s.state, 0)?;
-        }
-        Ok(())
-    }
-
     /// One token through the hybrid (gated-attention / Gated-DeltaNet + MoE)
     /// stack. Mirrors `run_step_moe`'s residual/norm skeleton, dispatching the
     /// token mixer by layer kind and folding in the gated shared expert. Inputs
@@ -4197,6 +11598,7 @@ impl Model {
     fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
         let p = self.weights.descriptor.params.clone();
         let hidden = p.hidden_size;
+        let inter = p.intermediate_size;
         let eps = p.rms_norm_eps;
         let kernels = &self.kernels;
         let stream = &self.stream;
@@ -4227,7 +11629,15 @@ impl Model {
         }
         self.device
             .copy(&hb.pinned_embed, 0, &b.h, 0, hidden * 2, stream)?;
-        kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+        kernels.rmsnorm_f16(
+            &b.x,
+            &b.h,
+            &self.weights.layers[0].attn_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
 
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
@@ -4236,13 +11646,38 @@ impl Model {
                 LayerMixer::DeltaNet(d) => self.hybrid_delta_mixer(l, d)?,
             }
             // Residual add (mixer output) + post-attention norm for the FFN.
-            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                &b.x,
+                &b.h,
+                &b.o_out,
+                &layer.ffn_norm,
+                1,
+                hidden,
+                eps,
+                stream,
+            )?;
             match &layer.ffn {
                 LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, hidden, stream)?,
-                LayerFfn::Dense(_) => {
-                    return Err(ForgeError::Unsupported(
-                        "dense FFN inside the hybrid MoE forward".into(),
-                    ))
+                LayerFfn::Dense(ffn) => {
+                    match &ffn.gate_up {
+                        GateUpWeights::Fused(weight) => {
+                            self.gemv(&b.gate_up, weight, &b.x, stream)?;
+                            kernels.silu_mul_f16_at(
+                                &b.act,
+                                &b.gate_up,
+                                0,
+                                inter * 2,
+                                inter,
+                                stream,
+                            )?;
+                        }
+                        GateUpWeights::Split { gate, up } => {
+                            self.gemv(&b.gate, gate, &b.x, stream)?;
+                            self.gemv(&b.up, up, &b.x, stream)?;
+                            kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                        }
+                    }
+                    self.gemv(&b.down, &ffn.down, &b.act, stream)?;
                 }
             }
             let next_norm = if l + 1 < n_layers {
@@ -4302,21 +11737,26 @@ impl Model {
         };
         // Gated Q projection [2*q_dim], then de-interleave per head: q at
         // h*2*head_dim, gate at h*2*head_dim + head_dim.
-        self.gemv(&hb.q_full, wq, &b.x, stream)?;
+        let qkv_grouped =
+            self.gemv_nvfp4_gguf_group(&[(&hb.q_full, wq), (&b.k, wk), (&b.v, wv)], &b.x, stream)?;
+        if !qkv_grouped {
+            self.gemv(&hb.q_full, wq, &b.x, stream)?;
+            self.gemv(&b.k, wk, &b.x, stream)?;
+            self.gemv(&b.v, wv, &b.x, stream)?;
+        }
         kernels.deinterleave_gate_f16(&hb.qc, &hb.gatec, &hb.q_full, head_dim, q_dim, stream)?;
         if let Some(qn) = &a.q_norm {
             kernels.rmsnorm_f16(&hb.qc, &hb.qc, qn, n_heads, head_dim, eps, stream)?;
         }
-        self.gemv(&b.k, wk, &b.x, stream)?;
-        self.gemv(&b.v, wv, &b.x, stream)?;
         if let Some(kn) = &a.k_norm {
             kernels.rmsnorm_f16(&b.k, &b.k, kn, n_kv, head_dim, eps, stream)?;
         }
-        kernels.rope_neox_partial_f16(&hb.qc, &b.pos, 1, n_heads, head_dim, n_rot, theta, stream)?;
+        kernels
+            .rope_neox_partial_f16(&hb.qc, &b.pos, 1, n_heads, head_dim, n_rot, theta, stream)?;
         kernels.rope_neox_partial_f16(&b.k, &b.pos, 1, n_kv, head_dim, n_rot, theta, stream)?;
         kernels.kv_append_f16(
-            &self.kv.k[l],
-            &self.kv.v[l],
+            &self.kv.k[self.target_kv_layer(l)],
+            &self.kv.v[self.target_kv_layer(l)],
             &b.k,
             &b.v,
             &self.page_table_dev,
@@ -4331,8 +11771,8 @@ impl Model {
                 kernels.attn_decode_f16(
                     &b.attn_out,
                     &hb.qc,
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &self.page_table_dev,
                     &self.seq_len_dev,
                     1,
@@ -4353,7 +11793,10 @@ impl Model {
                 // attention runs over it via the identity page table. Same
                 // kernel + order as the paged path, so greedy tokens are
                 // bit-identical to an untiered run.
-                let tier = self.tier.as_ref().expect("staged attention requires tiering");
+                let tier = self
+                    .tier
+                    .as_ref()
+                    .expect("staged attention requires tiering");
                 let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                 let slot = &tb.slots[0];
                 tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
@@ -4401,7 +11844,7 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
-        let st = self.ssm[l].as_ref().expect("DeltaNet layer has ssm state");
+        let st = self.active_ssm()[l].as_ref().expect("DeltaNet layer has ssm state");
 
         // Input projections: mixed q|k|v conv stream, output gate z, and the
         // per-head decay/write-gate projections.
@@ -4421,11 +11864,24 @@ impl Model {
             stream,
         )?;
         // Split conv output into q/k (key_dim each) and v (value_dim).
-        self.device.copy(&hb.conv_out, 0, &hb.q16src, 0, key_dim * 2, stream)?;
         self.device
-            .copy(&hb.conv_out, key_dim * 2, &hb.k16src, 0, key_dim * 2, stream)?;
-        self.device
-            .copy(&hb.conv_out, 2 * key_dim * 2, &hb.vtok, 0, value_dim * 2, stream)?;
+            .copy(&hb.conv_out, 0, &hb.q16src, 0, key_dim * 2, stream)?;
+        self.device.copy(
+            &hb.conv_out,
+            key_dim * 2,
+            &hb.k16src,
+            0,
+            key_dim * 2,
+            stream,
+        )?;
+        self.device.copy(
+            &hb.conv_out,
+            2 * key_dim * 2,
+            &hb.vtok,
+            0,
+            value_dim * 2,
+            stream,
+        )?;
         // Per-head L2 norm on the key-head q/k (n_k heads over d_state).
         kernels.l2norm_heads_f16(&hb.q16, &hb.q16src, n_k, d_state, eps, stream)?;
         kernels.l2norm_heads_f16(&hb.k16, &hb.k16src, n_k, d_state, eps, stream)?;
@@ -4449,7 +11905,14 @@ impl Model {
         )?;
         // Output gated RMSNorm then the value-dim → hidden out projection.
         kernels.deltanet_gated_rmsnorm_f16(
-            &hb.normed, &hb.o, &hb.z, &d.ssm_norm, n_v, d_state, eps, stream,
+            &hb.normed,
+            &hb.o,
+            &hb.z,
+            &d.ssm_norm,
+            n_v,
+            d_state,
+            eps,
+            stream,
         )?;
         self.gemv(&b.o_out, &d.out_proj, &hb.normed, stream)?;
         Ok(())
@@ -4462,6 +11925,12 @@ impl Model {
     /// VRAM pool prefills by streaming older attention KV back per layer while
     /// the resident DeltaNet state advances untouched.
     fn prefill_hybrid(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.activate_hybrid_sequence(seq)?;
+        let batched_enabled = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
+            .map_or(true, |value| value != "0");
+        if batched_enabled && tokens.len() > 1 && self.validate_hybrid_speculation_target().is_ok() {
+            return self.prefill_hybrid_batched(seq, tokens);
+        }
         self.ensure_hybrid_bufs()?;
         let p = self.weights.descriptor.params.clone();
         let vocab = p.vocab_size;
@@ -4471,7 +11940,7 @@ impl Model {
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = seq.len;
             if pos == 0 {
-                self.zero_ssm()?;
+                self.reset_mtp_runtime(seq)?;
             }
             if pos >= p.max_position_embeddings {
                 return Err(ForgeError::Scheduler(format!(
@@ -4494,6 +11963,7 @@ impl Model {
             self.kv.grow(seq)?;
             self.upload_decode_inputs(tok, pos)?;
             let want = i + 1 == tokens.len();
+            self.profile_target_start()?;
             if staged {
                 self.tier
                     .as_mut()
@@ -4507,6 +11977,10 @@ impl Model {
                 }
                 self.hybrid_forward_token(tok, want, AttnSrc::Paged)?;
             }
+            self.profile_target_end()?;
+            self.profile_catchup_start()?;
+            self.mtp_catchup_token(seq, tok)?;
+            self.profile_catchup_end()?;
             if want {
                 self.device.copy(
                     &self.bufs.logits,
@@ -4517,11 +11991,11 @@ impl Model {
                     &self.stream,
                 )?;
                 self.device.synchronize()?;
-                let lp = self
-                    .bufs
-                    .pinned_logits
-                    .host_ptr()
-                    .expect("pinned buffer has host mapping") as *const f32;
+                let lp =
+                    self.bufs
+                        .pinned_logits
+                        .host_ptr()
+                        .expect("pinned buffer has host mapping") as *const f32;
                 last_logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
             }
         }
@@ -4533,6 +12007,203 @@ impl Model {
             }
         }
         Ok(last_logits)
+    }
+
+    /// Wykonuje prefill hybrydowego targetu w macierzowych chunkach i zatwierdza
+    /// ostatni checkpoint rekurencji po każdym chunku.
+    fn prefill_hybrid_batched(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(ForgeError::Scheduler("empty prefill chunk".into()));
+        }
+        let p = self.weights.descriptor.params.clone();
+        if seq.len + tokens.len() > p.max_position_embeddings {
+            return Err(ForgeError::Scheduler(format!(
+                "position {} exceeds model context {}",
+                seq.len + tokens.len() - 1,
+                p.max_position_embeddings
+            )));
+        }
+        if seq.len == 0 {
+            self.reset_mtp_runtime(seq)?;
+        }
+        self.ensure_hybrid_bufs()?;
+        self.ensure_prefill_bufs()?;
+        let chunk_size = hybrid_prefill_chunk_size();
+        let prefill_cap = tokens.len().min(chunk_size);
+        let saved_graphs = if prefill_cap > 4 {
+            self.ensure_hybrid_verify_bufs(4)?;
+            std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+            Some((
+                std::mem::take(&mut self.hybrid_verify_graphs),
+                std::mem::take(&mut self.hybrid_verify_graph_disabled),
+            ))
+        } else {
+            None
+        };
+        let result = (|| {
+            self.ensure_hybrid_verify_bufs(prefill_cap)?;
+
+            let hidden_bytes = p.hidden_size * 2;
+            let mut last_logits = Vec::new();
+            let chunk_count = tokens.len().div_ceil(chunk_size);
+            let mut staging_recorded = [false; HYBRID_HOST_STAGING_SLOTS];
+            let mut offset = 0usize;
+            for chunk_index in 0..chunk_count {
+                let remaining = tokens.len() - offset;
+                let t = if remaining == chunk_size + 1 {
+                    chunk_size - 1
+                } else {
+                    remaining.min(chunk_size)
+                };
+                let chunk = &tokens[offset..offset + t];
+                offset += t;
+                let t = chunk.len();
+                let base = seq.len;
+                let new_pages = (base + t)
+                    .div_ceil(self.kv.cfg.page_size)
+                    .saturating_sub(seq.pages.len());
+                self.ensure_free_pages(new_pages);
+                for _ in 0..t {
+                    self.kv.grow(seq)?;
+                }
+
+                let mut page_table = vec![-1i32; self.max_pages_per_seq];
+                page_table[..seq.pages.len()].copy_from_slice(&seq.pages);
+                self.pt_seq = seq.id;
+
+                let ids: Vec<i32> = chunk.iter().map(|&id| id as i32).collect();
+                let positions: Vec<i32> = (base..base + t).map(|position| position as i32).collect();
+                let visible_lens: Vec<i32> = (base + 1..=base + t).map(|len| len as i32).collect();
+                let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+                let hv = self
+                    .hybrid_verify_bufs
+                    .as_ref()
+                    .expect("bufory hybrydowego prefill są gotowe");
+                let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+                    ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
+                })?;
+                let staging_slot = chunk_index % HYBRID_HOST_STAGING_SLOTS;
+                let host_staging = &hv.host_staging[staging_slot];
+                let staging_ready = host_staging.ready.clone();
+                if staging_recorded[staging_slot] {
+                    staging_ready.synchronize()?;
+                }
+                write_pinned(bytemuck::cast_slice(&page_table), &host_staging.page_table)?;
+                write_pinned(bytemuck::cast_slice(&ids), &host_staging.ids)?;
+                write_pinned(bytemuck::cast_slice(&positions), &host_staging.positions)?;
+                write_pinned(
+                    bytemuck::cast_slice(&visible_lens),
+                    &host_staging.visible_lens,
+                )?;
+                write_pinned(&(base as i32).to_le_bytes(), &host_staging.base_pos)?;
+                write_pinned(&(t as i32).to_le_bytes(), &host_staging.accepted)?;
+                let staging_buffer = &host_staging.embedding;
+                let staging = staging_buffer
+                    .host_ptr()
+                    .expect("pinned embedding ma mapowanie hosta");
+                for (row_index, &token) in chunk.iter().enumerate() {
+                    let source = table
+                        .get(token as usize * p.hidden_size..(token as usize + 1) * p.hidden_size)
+                        .ok_or_else(|| {
+                            ForgeError::Scheduler(format!(
+                                "token id {token} wykracza poza embedding targetu"
+                            ))
+                        })?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            source.as_ptr() as *const u8,
+                            staging.add(row_index * hidden_bytes),
+                            hidden_bytes,
+                        );
+                    }
+                }
+                self.device.copy(
+                    &host_staging.page_table,
+                    0,
+                    &self.page_table_dev,
+                    0,
+                    page_table.len() * 4,
+                    &self.stream,
+                )?;
+                self.device
+                    .copy(&host_staging.ids, 0, &pb.ids, 0, t * 4, &self.stream)?;
+                self.device.copy(
+                    &host_staging.positions,
+                    0,
+                    &pb.positions,
+                    0,
+                    t * 4,
+                    &self.stream,
+                )?;
+                self.device
+                    .copy(&host_staging.base_pos, 0, &hv.base_pos, 0, 4, &self.stream)?;
+                self.device.copy(
+                    &host_staging.visible_lens,
+                    0,
+                    &hv.visible_lens,
+                    0,
+                    t * 4,
+                    &self.stream,
+                )?;
+                self.device
+                    .copy(&host_staging.accepted, 0, &hv.accepted, 0, 4, &self.stream)?;
+                self.device
+                    .copy(staging_buffer, 0, &pb.h, 0, t * hidden_bytes, &self.stream)?;
+                self.device.record_event(&staging_ready, &self.stream)?;
+                staging_recorded[staging_slot] = true;
+
+                self.profile_target_start()?;
+                self.run_hybrid_batch_layers(t, true)?;
+                let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+                self.device.copy(
+                    &pb.x,
+                    (t - 1) * hidden_bytes,
+                    &self.bufs.x,
+                    0,
+                    hidden_bytes,
+                    &self.stream,
+                )?;
+                if chunk_index + 1 == chunk_count {
+                    self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+                    self.device.copy(
+                        &self.bufs.logits,
+                        0,
+                        &self.bufs.pinned_logits,
+                        0,
+                        p.vocab_size * 4,
+                        &self.stream,
+                    )?;
+                }
+                self.profile_target_end()?;
+
+                self.profile_catchup_start()?;
+                if self.has_native_mtp() {
+                    self.mtp_catchup_verified_prefix(seq, t, staging_slot, Some(&staging_ready))?;
+                }
+                self.profile_catchup_end()?;
+            }
+            self.device.synchronize()?;
+            let logits = self
+                .bufs
+                .pinned_logits
+                .host_ptr()
+                .expect("pinned buffer has host mapping") as *const f32;
+            last_logits.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(logits, p.vocab_size)
+            });
+            Ok(last_logits)
+        })();
+        if result.is_err() {
+            let _ = self.stream.synchronize();
+        }
+        restore_after(result, || {
+            if let Some((graphs, disabled)) = saved_graphs {
+                // Verifier decode zachowuje własne bufory cap=4 i przechwycone grafy.
+                std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+                self.hybrid_verify_graphs = graphs;
+                self.hybrid_verify_graph_disabled = disabled;
+            }
+        })
     }
 
     /// Fused decode step: six launches per layer instead of nine. The
@@ -4562,14 +12233,24 @@ impl Model {
         let k_byte_off = q_dim * 2;
         let v_byte_off = (q_dim + kv_dim) * 2;
 
-        kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
+        kernels.gather_rows_f16(
+            &b.h,
+            &self.weights.token_embd_f16,
+            &b.ids,
+            1,
+            hidden,
+            stream,
+        )?;
 
         let n_layers = self.weights.layers.len();
         if let AttnSrc::Staged(seq) = &src {
             // Ping-pong staging: layer l+1 restores on the tier's transfer
             // stream while layer l computes. Both slots start "free" relative
             // to any prior compute work, and slot 0 prestages layer 0.
-            let tier = self.tier.as_ref().expect("staged attention requires tiering");
+            let tier = self
+                .tier
+                .as_ref()
+                .expect("staged attention requires tiering");
             let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
             let xfer = tier.xfer_stream();
             for slot in &tb.slots {
@@ -4606,39 +12287,83 @@ impl Model {
                     (&b.q, 0usize, &b.k, 0usize, &b.v, 0usize)
                 }
             };
+            let gqa_q_heads = p.n_kv_heads.checked_mul(4);
+            let use_gqa = std::env::var("FORGE_ATTN_GQA").ok().as_deref() != Some("0")
+                && self.device.caps().vendor == Vendor::Nvidia
+                && kernels.supports_attn_decode_gqa4_f16_hd128()
+                && self.kv.cfg.dtype() == forge_types::DType::F16
+                && p.head_dim == 128
+                && gqa_q_heads == Some(p.n_heads)
+                && layer.attn().q_norm.is_none()
+                && layer.attn().k_norm.is_none();
+            let attn_splits = if use_gqa {
+                ATTN_DECODE_GQA_SPLITS
+            } else {
+                ATTN_DECODE_SPLITS
+            };
             match &src {
                 AttnSrc::Paged => {
-                    kernels.attn_decode_split(
-                        &b.attn_parts,
-                        q_buf,
-                        q_off,
-                        k_buf,
-                        k_off,
-                        v_buf,
-                        v_off,
-                        layer.attn().q_norm.as_ref(),
-                        layer.attn().k_norm.as_ref(),
-                        &self.kv.k[l],
-                        &self.kv.v[l],
-                        &self.page_table_dev,
-                        &self.seq_len_dev,
-                        &b.pos,
-                        1,
-                        p.n_heads,
-                        p.n_kv_heads,
-                        p.head_dim,
-                        self.kv.cfg.page_size,
-                        self.max_pages_per_seq,
-                        ATTN_DECODE_SPLITS,
-                        self.kv.cfg.dtype(),
-                        eps,
-                        p.rope_theta,
-                        scale,
-                        stream,
-                    )?;
+                    if use_gqa {
+                        kernels.attn_decode_split_gqa4_f16_hd128(
+                            &b.attn_parts,
+                            q_buf,
+                            q_off,
+                            k_buf,
+                            k_off,
+                            v_buf,
+                            v_off,
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
+                            &self.page_table_dev,
+                            &self.seq_len_dev,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            attn_splits,
+                            eps,
+                            p.rope_theta,
+                            scale,
+                            stream,
+                        )?;
+                    } else {
+                        kernels.attn_decode_split(
+                            &b.attn_parts,
+                            q_buf,
+                            q_off,
+                            k_buf,
+                            k_off,
+                            v_buf,
+                            v_off,
+                            layer.attn().q_norm.as_ref(),
+                            layer.attn().k_norm.as_ref(),
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
+                            &self.page_table_dev,
+                            &self.seq_len_dev,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            attn_splits,
+                            self.kv.cfg.dtype(),
+                            eps,
+                            p.rope_theta,
+                            scale,
+                            stream,
+                        )?;
+                    }
                 }
                 AttnSrc::Staged(seq) => {
-                    let tier = self.tier.as_ref().expect("staged attention requires tiering");
+                    let tier = self
+                        .tier
+                        .as_ref()
+                        .expect("staged attention requires tiering");
                     let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                     let xfer = tier.xfer_stream();
                     let s = l % STAGE_SLOTS;
@@ -4651,45 +12376,83 @@ impl Model {
                         self.device.record_event(&tb.slots[ns].ready, xfer)?;
                     }
                     self.device.wait_event(stream, &tb.slots[s].ready)?;
-                    kernels.attn_decode_split(
-                        &b.attn_parts,
-                        q_buf,
-                        q_off,
-                        k_buf,
-                        k_off,
-                        v_buf,
-                        v_off,
-                        layer.attn().q_norm.as_ref(),
-                        layer.attn().k_norm.as_ref(),
-                        &tb.slots[s].stage[0],
-                        &tb.slots[s].stage[1],
-                        &tb.identity_pt,
-                        &self.seq_len_dev,
-                        &b.pos,
-                        1,
-                        p.n_heads,
-                        p.n_kv_heads,
-                        p.head_dim,
-                        self.kv.cfg.page_size,
-                        self.max_pages_per_seq,
-                        ATTN_DECODE_SPLITS,
-                        self.kv.cfg.dtype(),
-                        eps,
-                        p.rope_theta,
-                        scale,
-                        stream,
-                    )?;
+                    if use_gqa {
+                        kernels.attn_decode_split_gqa4_f16_hd128(
+                            &b.attn_parts,
+                            q_buf,
+                            q_off,
+                            k_buf,
+                            k_off,
+                            v_buf,
+                            v_off,
+                            &tb.slots[s].stage[0],
+                            &tb.slots[s].stage[1],
+                            &tb.identity_pt,
+                            &self.seq_len_dev,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            attn_splits,
+                            eps,
+                            p.rope_theta,
+                            scale,
+                            stream,
+                        )?;
+                    } else {
+                        kernels.attn_decode_split(
+                            &b.attn_parts,
+                            q_buf,
+                            q_off,
+                            k_buf,
+                            k_off,
+                            v_buf,
+                            v_off,
+                            layer.attn().q_norm.as_ref(),
+                            layer.attn().k_norm.as_ref(),
+                            &tb.slots[s].stage[0],
+                            &tb.slots[s].stage[1],
+                            &tb.identity_pt,
+                            &self.seq_len_dev,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            attn_splits,
+                            self.kv.cfg.dtype(),
+                            eps,
+                            p.rope_theta,
+                            scale,
+                            stream,
+                        )?;
+                    }
                 }
             }
-            kernels.attn_decode_combine_f16(
-                &b.attn_out,
-                &b.attn_parts,
-                1,
-                p.n_heads,
-                p.head_dim,
-                ATTN_DECODE_SPLITS,
-                stream,
-            )?;
+            if use_gqa {
+                kernels.attn_decode_combine_gqa2_f16_hd128(
+                    &b.attn_out,
+                    &b.attn_parts,
+                    1,
+                    p.n_heads,
+                    attn_splits,
+                    stream,
+                )?;
+            } else {
+                kernels.attn_decode_combine_f16(
+                    &b.attn_out,
+                    &b.attn_parts,
+                    1,
+                    p.n_heads,
+                    p.head_dim,
+                    attn_splits,
+                    stream,
+                )?;
+            }
             if let AttnSrc::Staged(seq) = &src {
                 // The kernel appended this token's rope'd K/V into the staging
                 // tail page; mirror that page back into the canonical paged
@@ -4700,10 +12463,22 @@ impl Model {
                 let rb = tb.region_bytes[0];
                 let lp = seq.pages.len() - 1;
                 let phys = seq.pages[lp] as usize;
-                self.device
-                    .copy(&tb.slots[s].stage[0], lp * rb, &self.kv.k[l], phys * rb, rb, stream)?;
-                self.device
-                    .copy(&tb.slots[s].stage[1], lp * rb, &self.kv.v[l], phys * rb, rb, stream)?;
+                self.device.copy(
+                    &tb.slots[s].stage[0],
+                    lp * rb,
+                    &self.kv.k[self.target_kv_layer(l)],
+                    phys * rb,
+                    rb,
+                    stream,
+                )?;
+                self.device.copy(
+                    &tb.slots[s].stage[1],
+                    lp * rb,
+                    &self.kv.v[self.target_kv_layer(l)],
+                    phys * rb,
+                    rb,
+                    stream,
+                )?;
                 self.device.record_event(&tb.slots[s].free, stream)?;
             }
             self.gemv_residual(&layer.attn().attn_o, &b.attn_out, stream)?;
@@ -4725,23 +12500,53 @@ impl Model {
             self.gemv_residual(&layer.dense_ffn()?.down, &b.act, stream)?;
         }
 
-        kernels.rmsnorm_h32_f16(&b.x, &b.h, &b.h32, &self.weights.output_norm, 1, hidden, eps, stream)?;
+        kernels.rmsnorm_h32_f16(
+            &b.x,
+            &b.h,
+            &b.h32,
+            &self.weights.output_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
         self.logits_gemv(&b.logits, &b.x, stream)
     }
 
-    /// Batched logit head: y[b, vocab] f32 = lm_head · x[b, hidden]. The head
-    /// is always f16 or Q8_0 (NVFP4 heads are materialized as f16 at load), so
-    /// the two batched f32-output GEMMs cover every model.
-    fn logits_gemm(&self, y_f32: &DevBuffer, x: &DevBuffer, n_tokens: usize, stream: &Stream) -> Result<()> {
+    /// Batchowa głowa logitów: y[b, vocab] f32 = lm_head · x[b, hidden].
+    fn logits_gemm(
+        &self,
+        y_f32: &DevBuffer,
+        x: &DevBuffer,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         match &self.weights.lm_head {
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
                 .gemm_f16_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
+            DevWeight::Q8_0 { buf, rows, cols } if (2..=8).contains(&n_tokens) => self
+                .kernels
+                .gemm_q8_0_f16_exact_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
             DevWeight::Q8_0 { buf, rows, cols } => self
                 .kernels
                 .gemm_q8_0_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
+            DevWeight::NvFp4Gguf {
+                buf,
+                output_scale,
+                rows,
+                cols,
+            } if n_tokens == 2 => self.kernels.gemm_nvfp4_gguf_out_f32_b2(
+                y_f32,
+                buf,
+                x,
+                *rows,
+                *cols,
+                *output_scale,
+                stream,
+            ),
             _ => Err(ForgeError::Unsupported(
-                "batched logits head must be f16 or q8_0".into(),
+                "batchowa głowa logitów nie obsługuje tego formatu ani szerokości".into(),
             )),
         }
     }
@@ -4797,6 +12602,7 @@ impl Model {
             page_table: f32b(cap * mpp)?,
             pinned_meta: pin(cap * 3 * 4)?,
             pinned_pt: pin(cap * mpp * 4)?,
+            pinned_embed: pin(cap * hidden * 2)?,
             samp_k: f32b(cap)?,
             samp_inv_t: f32b(cap)?,
             samp_top_p: f32b(cap)?,
@@ -4805,11 +12611,17 @@ impl Model {
             samp_step: dev.alloc(cap * 8, MemKind::Device, Pool::Activations)?,
             pinned_samp: pin(cap * (4 * 4 + 2 * 8))?,
             pen_ids: f32b(cap * max_seq)?,
+            pen_counts: f32b(cap * max_seq)?,
             pen_offsets: f32b(cap + 1)?,
             pen_vals: f32b(cap)?,
+            pen_frequency: f32b(cap)?,
+            pen_presence: f32b(cap)?,
             pinned_pen_ids: pin(cap * max_seq * 4)?,
+            pinned_pen_counts: pin(cap * max_seq * 4)?,
             pinned_pen_offsets: pin((cap + 1) * 4)?,
             pinned_pen_vals: pin(cap * 4)?,
+            pinned_pen_frequency: pin(cap * 4)?,
+            pinned_pen_presence: pin(cap * 4)?,
             out_ids: f32b(cap)?,
             pinned_out: pin(cap * 4)?,
         });
@@ -4817,6 +12629,162 @@ impl Model {
         self.batch_graphs.clear();
         self.batch_cap = cap;
         Ok(())
+    }
+
+    /// Wykonuje B2 targetu hybrydowego ze wspólnymi GEMM FFN i głowy logits.
+    /// Mixery zachowują osobny stan slotu i są porządkowane na jednym streamie.
+    fn record_hybrid_batch_forward(
+        &mut self,
+        seqs: &mut [&mut SeqKv],
+        tokens: &[u32],
+    ) -> Result<()> {
+        let n = seqs.len();
+        if n != 2 || tokens.len() != n {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy batch targetu obsługuje obecnie dokładnie B=2".into(),
+            ));
+        }
+        self.ensure_hybrid_bufs()?;
+        let p = self.weights.descriptor.params.clone();
+        let hidden = p.hidden_size;
+        let inter = p.intermediate_size;
+        let eps = p.rms_norm_eps;
+        let mpp = self.max_pages_per_seq;
+        let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("target hybrydowy nie ma hostowego embeddingu".into())
+        })?;
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        let staging = bb
+            .pinned_embed
+            .host_ptr()
+            .expect("pinned embedding ma mapowanie hosta");
+        for (lane, &token) in tokens.iter().enumerate() {
+            let row = table
+                .get(token as usize * hidden..(token as usize + 1) * hidden)
+                .ok_or_else(|| {
+                    ForgeError::Scheduler(format!(
+                        "token id {token} wykracza poza embedding targetu"
+                    ))
+                })?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr() as *const u8,
+                    staging.add(lane * hidden * 2),
+                    hidden * 2,
+                );
+            }
+        }
+        self.device
+            .copy(&bb.pinned_embed, 0, &bb.h, 0, n * hidden * 2, &self.stream)?;
+        self.kernels.rmsnorm_f16(
+            &bb.x,
+            &bb.h,
+            &self.weights.layers[0].attn_norm,
+            n,
+            hidden,
+            eps,
+            &self.stream,
+        )?;
+
+        for layer_index in 0..self.weights.layers.len() {
+            for (lane, seq) in seqs.iter_mut().enumerate() {
+                self.activate_hybrid_sequence(seq)?;
+                let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                self.device.copy(
+                    &bb.x,
+                    lane * hidden * 2,
+                    &self.bufs.x,
+                    0,
+                    hidden * 2,
+                    &self.stream,
+                )?;
+                match &self.weights.layers[layer_index].mixer {
+                    LayerMixer::Attention(attention) => {
+                        self.device.copy(
+                            &bb.positions,
+                            lane * 4,
+                            &self.bufs.pos,
+                            0,
+                            4,
+                            &self.stream,
+                        )?;
+                        self.device.copy(
+                            &bb.seq_lens,
+                            lane * 4,
+                            &self.seq_len_dev,
+                            0,
+                            4,
+                            &self.stream,
+                        )?;
+                        self.device.copy(
+                            &bb.page_table,
+                            lane * mpp * 4,
+                            &self.page_table_dev,
+                            0,
+                            mpp * 4,
+                            &self.stream,
+                        )?;
+                        self.hybrid_attn_mixer(layer_index, attention, &AttnSrc::Paged)?;
+                    }
+                    LayerMixer::DeltaNet(delta) => {
+                        self.hybrid_delta_mixer(layer_index, delta)?;
+                    }
+                }
+                let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                self.device.copy(
+                    &self.bufs.o_out,
+                    0,
+                    &bb.o_out,
+                    lane * hidden * 2,
+                    hidden * 2,
+                    &self.stream,
+                )?;
+            }
+
+            let layer = &self.weights.layers[layer_index];
+            let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+            self.kernels.rmsnorm_residual_f16(
+                &bb.x,
+                &bb.h,
+                &bb.o_out,
+                &layer.ffn_norm,
+                n,
+                hidden,
+                eps,
+                &self.stream,
+            )?;
+            let ffn = layer.dense_ffn()?;
+            match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => {
+                    self.gemm_rows(&bb.gate, weight, &bb.x, n, 0, inter, &self.stream)?;
+                    self.gemm_rows(&bb.up, weight, &bb.x, n, inter, inter, &self.stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemm(&bb.gate, gate, &bb.x, n, &self.stream)?;
+                    self.gemm(&bb.up, up, &bb.x, n, &self.stream)?;
+                }
+            }
+            self.kernels
+                .silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, &self.stream)?;
+            self.gemm(&bb.down, &ffn.down, &bb.act, n, &self.stream)?;
+            let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                &self.weights.layers[layer_index + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            self.kernels.rmsnorm_residual_f16(
+                &bb.x,
+                &bb.h,
+                &bb.down,
+                next_norm,
+                n,
+                hidden,
+                eps,
+                &self.stream,
+            )?;
+        }
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        self.logits_gemm(&bb.logits, &bb.x, n, &self.stream)
     }
 
     /// Record one batched forward + logit head over `n` rows into the model
@@ -4847,8 +12815,23 @@ impl Model {
         let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
         let n_layers = self.weights.layers.len();
 
-        kernels.gather_rows_f16(&bb.h, &self.weights.token_embd_f16, &bb.ids, n, hidden, stream)?;
-        kernels.rmsnorm_f16(&bb.x, &bb.h, &self.weights.layers[0].attn_norm, n, hidden, eps, stream)?;
+        kernels.gather_rows_f16(
+            &bb.h,
+            &self.weights.token_embd_f16,
+            &bb.ids,
+            n,
+            hidden,
+            stream,
+        )?;
+        kernels.rmsnorm_f16(
+            &bb.x,
+            &bb.h,
+            &self.weights.layers[0].attn_norm,
+            n,
+            hidden,
+            eps,
+            stream,
+        )?;
 
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
@@ -4882,8 +12865,8 @@ impl Model {
                     0,
                     layer.attn().q_norm.as_ref(),
                     layer.attn().k_norm.as_ref(),
-                    &self.kv.k[l],
-                    &self.kv.v[l],
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
                     &bb.page_table,
                     &bb.seq_lens,
                     &bb.positions,
@@ -4922,7 +12905,8 @@ impl Model {
                 let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                 let slot = &tb.slots[0];
                 let db = &self.bufs;
-                self.device.copy(&bb.positions, lane * 4, &db.pos, 0, 4, stream)?;
+                self.device
+                    .copy(&bb.positions, lane * 4, &db.pos, 0, 4, stream)?;
                 self.device
                     .copy(&bb.seq_lens, lane * 4, &self.seq_len_dev, 0, 4, stream)?;
                 tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
@@ -4963,18 +12947,45 @@ impl Model {
                     ATTN_DECODE_SPLITS,
                     stream,
                 )?;
-                self.device
-                    .copy(&db.attn_out, 0, &bb.attn_out, lane * q_dim * 2, q_dim * 2, stream)?;
+                self.device.copy(
+                    &db.attn_out,
+                    0,
+                    &bb.attn_out,
+                    lane * q_dim * 2,
+                    q_dim * 2,
+                    stream,
+                )?;
                 let rb = tb.region_bytes[0];
                 let lp = seq.pages.len() - 1;
                 let phys = seq.pages[lp] as usize;
-                self.device
-                    .copy(&slot.stage[0], lp * rb, &self.kv.k[l], phys * rb, rb, stream)?;
-                self.device
-                    .copy(&slot.stage[1], lp * rb, &self.kv.v[l], phys * rb, rb, stream)?;
+                self.device.copy(
+                    &slot.stage[0],
+                    lp * rb,
+                    &self.kv.k[self.target_kv_layer(l)],
+                    phys * rb,
+                    rb,
+                    stream,
+                )?;
+                self.device.copy(
+                    &slot.stage[1],
+                    lp * rb,
+                    &self.kv.v[self.target_kv_layer(l)],
+                    phys * rb,
+                    rb,
+                    stream,
+                )?;
             }
             self.gemm(&bb.o_out, &layer.attn().attn_o, &bb.attn_out, n, stream)?;
-            kernels.rmsnorm_residual_f16(&bb.x, &bb.h, &bb.o_out, &layer.ffn_norm, n, hidden, eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                &bb.x,
+                &bb.h,
+                &bb.o_out,
+                &layer.ffn_norm,
+                n,
+                hidden,
+                eps,
+                stream,
+            )?;
 
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
@@ -4994,7 +13005,8 @@ impl Model {
             } else {
                 &self.weights.output_norm
             };
-            kernels.rmsnorm_residual_f16(&bb.x, &bb.h, &bb.down, next_norm, n, hidden, eps, stream)?;
+            kernels
+                .rmsnorm_residual_f16(&bb.x, &bb.h, &bb.down, next_norm, n, hidden, eps, stream)?;
         }
 
         self.logits_gemm(&bb.logits, &bb.x, n, stream)
@@ -5033,6 +13045,11 @@ impl Model {
                 "batched_decode: seqs/tokens/params length mismatch".into(),
             ));
         }
+        if self.is_hybrid() && (b != 2 || !self.hybrid_batch_b2_capable()) {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy batch B2 nie spełnia kontraktu modelu lub pamięci KV".into(),
+            ));
+        }
         // Rot modes commit each appended token into the packed low-bit store on
         // the single-stream decode path only; the batched path would append to
         // the f16 slab without packing, leaving the packed store stale. Refuse
@@ -5052,6 +13069,24 @@ impl Model {
                 "MoE models support single-stream decode only; disable batching".into(),
             ));
         }
+        let p = self.weights.descriptor.params.clone();
+        for (seq, &token) in seqs.iter().zip(tokens) {
+            if seq.len >= p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {} exceeds model context {}",
+                    seq.len, p.max_position_embeddings
+                )));
+            }
+            if token as usize >= p.vocab_size {
+                return Err(ForgeError::Scheduler(format!(
+                    "token id {token} exceeds model vocabulary {}",
+                    p.vocab_size
+                )));
+            }
+        }
+        let growth_pages = self
+            .kv
+            .batch_growth_pages(seqs.iter().map(|seq| &**seq))?;
         // Batched growth appends pages without refreshing the single-stream
         // page table; invalidate it so the next single-stream step re-uploads.
         self.pt_seq = 0;
@@ -5063,19 +13098,14 @@ impl Model {
             // free page per lane's potential boundary growth, spilling the
             // globally coldest prefixes — after it, lane residency is fixed.
             for seq in seqs.iter_mut() {
-                if !seq.spilled.is_empty()
-                    && seq.spilled_page_count() <= self.kv.free_page_count()
+                if !seq.spilled.is_empty() && seq.spilled_page_count() <= self.kv.free_page_count()
                 {
                     self.tier_restore_or_recompute(seq)?;
                 }
             }
             self.tier_balance(seqs, b)?;
-            for (seq, &tok) in seqs.iter_mut().zip(tokens) {
-                seq.tokens.push(tok);
-            }
         }
         self.ensure_batch(b)?;
-        let p = self.weights.descriptor.params.clone();
         // Streamed lanes (spilled KV) pack at the tail of the lane order: the
         // batch-wide paged attention launch covers exactly the leading
         // resident lanes, and each streamed lane attends over the staging
@@ -5096,7 +13126,18 @@ impl Model {
 
         // Reclaim cached prefix pages if the free stack cannot cover a boundary
         // page for every lane (no-op when the prefix cache is inactive/empty).
-        self.ensure_free_pages(b);
+        self.ensure_free_pages(growth_pages);
+        if growth_pages > self.kv.free_page_count() {
+            return Err(ForgeError::Scheduler(format!(
+                "batch KV growth needs {growth_pages} pages, cache has {} free",
+                self.kv.free_page_count()
+            )));
+        }
+        if self.tier.is_some() {
+            for (seq, &tok) in seqs.iter_mut().zip(tokens) {
+                seq.tokens.push(tok);
+            }
+        }
 
         // Grow each sequence by one token and gather its position/page table
         // in lane order. Streamed lanes' page tables keep -1 for spilled
@@ -5107,12 +13148,6 @@ impl Model {
         for (lane, &i) in order.iter().enumerate() {
             let seq = &mut *seqs[i];
             let pos = seq.len;
-            if pos >= p.max_position_embeddings {
-                return Err(ForgeError::Scheduler(format!(
-                    "position {pos} exceeds model context {}",
-                    p.max_position_embeddings
-                )));
-            }
             self.kv.grow(seq)?;
             meta[lane] = tokens[i] as i32;
             meta[bucket + lane] = pos as i32;
@@ -5137,19 +13172,46 @@ impl Model {
         unsafe {
             std::ptr::copy_nonoverlapping(meta.as_ptr() as *const u8, meta_host, bucket * 3 * 4);
         }
-        self.device.copy(&bb.pinned_meta, 0, &bb.ids, 0, bucket * 4, &self.stream)?;
         self.device
-            .copy(&bb.pinned_meta, bucket * 4, &bb.positions, 0, bucket * 4, &self.stream)?;
-        self.device
-            .copy(&bb.pinned_meta, 2 * bucket * 4, &bb.seq_lens, 0, bucket * 4, &self.stream)?;
+            .copy(&bb.pinned_meta, 0, &bb.ids, 0, bucket * 4, &self.stream)?;
+        self.device.copy(
+            &bb.pinned_meta,
+            bucket * 4,
+            &bb.positions,
+            0,
+            bucket * 4,
+            &self.stream,
+        )?;
+        self.device.copy(
+            &bb.pinned_meta,
+            2 * bucket * 4,
+            &bb.seq_lens,
+            0,
+            bucket * 4,
+            &self.stream,
+        )?;
         let pt_host = bb.pinned_pt.host_ptr().expect("pinned mapping");
         unsafe {
             std::ptr::copy_nonoverlapping(pt.as_ptr() as *const u8, pt_host, bucket * mpp * 4);
         }
-        self.device
-            .copy(&bb.pinned_pt, 0, &bb.page_table, 0, bucket * mpp * 4, &self.stream)?;
+        self.device.copy(
+            &bb.pinned_pt,
+            0,
+            &bb.page_table,
+            0,
+            bucket * mpp * 4,
+            &self.stream,
+        )?;
 
-        if mixed {
+        if self.is_hybrid() {
+            if mixed {
+                return Err(ForgeError::Unsupported(
+                    "hybrydowy batch B2 nie obsługuje tieringu KV".into(),
+                ));
+            }
+            self.record_hybrid_batch_forward(seqs, tokens)?;
+            self.pt_seq = 0;
+        } else if mixed {
             let tier = self.tier.as_mut().expect("mixed batch requires tiering");
             for &i in &order[resident..] {
                 tier.prepare_streaming(seqs[i])?;
@@ -5173,12 +13235,18 @@ impl Model {
         // Sample the B live rows on the GPU (outside the graph so the per-seq
         // param mix is free), in lane order. Greedy-only batches take the
         // argmax fast path.
-        let lane_params: Vec<SeqSampleParams> =
-            order.iter().map(|&i| params[i].clone()).collect();
-        self.batch_sample(b, &lane_params)?;
+        let lane_params: Vec<SeqSampleParams> = order.iter().map(|&i| params[i].clone()).collect();
+        let logits = self
+            .batch_bufs
+            .as_ref()
+            .expect("provisioned")
+            .logits
+            .clone();
+        self.batch_sample_from(&logits, b, &lane_params)?;
 
         let bb = self.batch_bufs.as_ref().expect("provisioned");
-        self.device.copy(&bb.out_ids, 0, &bb.pinned_out, 0, b * 4, &self.stream)?;
+        self.device
+            .copy(&bb.out_ids, 0, &bb.pinned_out, 0, b * 4, &self.stream)?;
         self.device.synchronize()?;
         let op = bb.pinned_out.host_ptr().expect("pinned mapping") as *const i32;
         let ids = unsafe { std::slice::from_raw_parts(op, b) };
@@ -5195,39 +13263,104 @@ impl Model {
         Ok(out)
     }
 
-    /// GPU sampling over the `b` live logit rows currently in `batch_bufs`.
-    fn batch_sample(&mut self, b: usize, params: &[SeqSampleParams]) -> Result<()> {
+    /// GPU sampling over `b` contiguous live rows of device logits.
+    fn batch_sample_from(
+        &mut self,
+        logits: &DevBuffer,
+        b: usize,
+        params: &[SeqSampleParams],
+    ) -> Result<()> {
         let vocab = self.weights.descriptor.params.vocab_size;
         let bb = self.batch_bufs.as_ref().expect("provisioned");
         let stream = &self.stream;
 
-        // Repetition penalty (skipped when no sequence has one active).
-        let any_penalty = params.iter().any(|p| p.penalty != 1.0 && !p.penalty_ids.is_empty());
+        // Jedno uruchomienie kernela obsługuje wszystkie aktywne kary batcha.
+        let any_penalty = params
+            .iter()
+            .any(|p| !p.penalty_ids.is_empty());
         if any_penalty {
             let mut ids_flat: Vec<i32> = Vec::new();
+            let mut counts_flat: Vec<i32> = Vec::new();
             let mut offsets: Vec<i32> = Vec::with_capacity(b + 1);
             let mut vals: Vec<f32> = Vec::with_capacity(b);
+            let mut frequency: Vec<f32> = Vec::with_capacity(b);
+            let mut presence: Vec<f32> = Vec::with_capacity(b);
             offsets.push(0);
             for p in params.iter() {
-                if p.penalty != 1.0 {
-                    ids_flat.extend_from_slice(&p.penalty_ids);
+                if p.penalty_ids.len() != p.penalty_counts.len() {
+                    return Err(ForgeError::Scheduler(
+                        "penalty histogram ids/counts length mismatch".into(),
+                    ));
                 }
+                ids_flat.extend_from_slice(&p.penalty_ids);
+                counts_flat.extend_from_slice(&p.penalty_counts);
                 offsets.push(ids_flat.len() as i32);
-                vals.push(if p.penalty_ids.is_empty() { 1.0 } else { p.penalty });
+                vals.push(p.penalty);
+                frequency.push(p.frequency_penalty);
+                presence.push(p.presence_penalty);
             }
             if ids_flat.len() * 4 > bb.pinned_pen_ids.len() {
                 return Err(ForgeError::Scheduler("penalty id staging overflow".into()));
             }
-            Self::stage(&self.device, &bb.pinned_pen_ids, &bb.pen_ids, bytemuck::cast_slice(&ids_flat), stream)?;
-            Self::stage(&self.device, &bb.pinned_pen_offsets, &bb.pen_offsets, bytemuck::cast_slice(&offsets), stream)?;
-            Self::stage(&self.device, &bb.pinned_pen_vals, &bb.pen_vals, bytemuck::cast_slice(&vals), stream)?;
-            self.kernels
-                .sample_batched_penalize_f32(&bb.logits, vocab, &bb.pen_ids, &bb.pen_offsets, &bb.pen_vals, b, stream)?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_ids,
+                &bb.pen_ids,
+                bytemuck::cast_slice(&ids_flat),
+                stream,
+            )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_counts,
+                &bb.pen_counts,
+                bytemuck::cast_slice(&counts_flat),
+                stream,
+            )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_offsets,
+                &bb.pen_offsets,
+                bytemuck::cast_slice(&offsets),
+                stream,
+            )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_vals,
+                &bb.pen_vals,
+                bytemuck::cast_slice(&vals),
+                stream,
+            )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_frequency,
+                &bb.pen_frequency,
+                bytemuck::cast_slice(&frequency),
+                stream,
+            )?;
+            Self::stage(
+                &self.device,
+                &bb.pinned_pen_presence,
+                &bb.pen_presence,
+                bytemuck::cast_slice(&presence),
+                stream,
+            )?;
+            self.kernels.sample_batched_penalize_f32(
+                logits,
+                vocab,
+                &bb.pen_ids,
+                &bb.pen_counts,
+                &bb.pen_offsets,
+                &bb.pen_vals,
+                &bb.pen_frequency,
+                &bb.pen_presence,
+                b,
+                stream,
+            )?;
         }
 
         if params.iter().all(|p| p.greedy) {
             self.kernels
-                .sample_batched_argmax_f32(&bb.out_ids, &bb.logits, b, vocab, stream)?;
+                .sample_batched_argmax_f32(&bb.out_ids, logits, b, vocab, stream)?;
             return Ok(());
         }
 
@@ -5260,20 +13393,26 @@ impl Model {
         put(bytemuck::cast_slice(&seed), &mut off);
         put(bytemuck::cast_slice(&step), &mut off);
         let mut o = 0usize;
-        self.device.copy(&bb.pinned_samp, o, &bb.samp_k, 0, b * 4, stream)?;
+        self.device
+            .copy(&bb.pinned_samp, o, &bb.samp_k, 0, b * 4, stream)?;
         o += b * 4;
-        self.device.copy(&bb.pinned_samp, o, &bb.samp_inv_t, 0, b * 4, stream)?;
+        self.device
+            .copy(&bb.pinned_samp, o, &bb.samp_inv_t, 0, b * 4, stream)?;
         o += b * 4;
-        self.device.copy(&bb.pinned_samp, o, &bb.samp_top_p, 0, b * 4, stream)?;
+        self.device
+            .copy(&bb.pinned_samp, o, &bb.samp_top_p, 0, b * 4, stream)?;
         o += b * 4;
-        self.device.copy(&bb.pinned_samp, o, &bb.samp_min_p, 0, b * 4, stream)?;
+        self.device
+            .copy(&bb.pinned_samp, o, &bb.samp_min_p, 0, b * 4, stream)?;
         o += b * 4;
-        self.device.copy(&bb.pinned_samp, o, &bb.samp_seed, 0, b * 8, stream)?;
+        self.device
+            .copy(&bb.pinned_samp, o, &bb.samp_seed, 0, b * 8, stream)?;
         o += b * 8;
-        self.device.copy(&bb.pinned_samp, o, &bb.samp_step, 0, b * 8, stream)?;
+        self.device
+            .copy(&bb.pinned_samp, o, &bb.samp_step, 0, b * 8, stream)?;
         self.kernels.sample_batched_topk_f32(
             &bb.out_ids,
-            &bb.logits,
+            logits,
             b,
             vocab,
             &bb.samp_k,
@@ -5288,11 +13427,519 @@ impl Model {
 
     /// Copy `bytes` into a pinned staging buffer and enqueue the H2D to its
     /// device buffer on `stream`.
-    fn stage(device: &Arc<dyn Device>, pinned: &DevBuffer, dev: &DevBuffer, bytes: &[u8], stream: &Stream) -> Result<()> {
+    fn stage(
+        device: &Arc<dyn Device>,
+        pinned: &DevBuffer,
+        dev: &DevBuffer,
+        bytes: &[u8],
+        stream: &Stream,
+    ) -> Result<()> {
         let host = pinned.host_ptr().expect("pinned mapping");
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len());
         }
         device.copy(pinned, 0, dev, 0, bytes.len(), stream)
+    }
+}
+
+#[cfg(test)]
+mod verify_rollback_tests {
+    use super::{
+        apply_mtp_pair_metadata_commit, finish_greedy_verification, hybrid_prefill_profile_spans,
+        hybrid_q_full_cols, logical_kv_regions, native_mtp_b2_device_embedding,
+        native_mtp_greedy_decision, restore_after, rollback_mtp_pair,
+        validate_mtp_pair_metadata_commit, validate_mtp_routed_inputs, ForgeError,
+        HybridStatePool, KvCache, KvConfig, KvQuant, LayerKind, Result, SeqKv,
+    };
+    use forge_hal::cpu::CpuDevice;
+    use forge_hal::Device;
+    use std::sync::Arc;
+
+    #[test]
+    fn fed_routed_mtp_ponad_i32_konczy_sie_przed_mutacja() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut pool = testowa_pula_mtp(device);
+        let leases = [
+            pool.acquire().expect("lane0 powinien powstać"),
+            pool.acquire().expect("lane1 powinien powstać"),
+        ];
+        let (states, kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+        let lengths = [states[0].seq.len, states[1].seq.len];
+        let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
+        let free_pages = kv.free_page_count();
+        let result = validate_mtp_routed_inputs(
+            usize::MAX,
+            [u32::MAX, 7],
+            2,
+            [None, None],
+        );
+        assert!(matches!(result, Err(ForgeError::Format(_))));
+        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
+        assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
+        assert_eq!(kv.free_page_count(), free_pages);
+        pool.restore_mtp_pair(leases, states, kv)
+            .expect("niezmieniona para powinna wrócić do puli");
+    }
+
+    #[test]
+    fn pula_stanow_izoluje_przeplatane_sekwencje_i_zeruje_reuzyty_slot() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(
+            device.clone(),
+            vec![LayerKind::DeltaNet, LayerKind::Attention],
+            8,
+            16,
+            None,
+        )
+        .expect("pula powinna powstać");
+        let first = pool.acquire().expect("pierwszy lease powinien powstać");
+        let second = pool.acquire().expect("drugi lease powinien powstać");
+        assert_ne!(first.slot, second.slot);
+
+        pool.activate(first, &stream)
+            .expect("pierwszy stan powinien się aktywować");
+        let first_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .write(&[7; 16], &first_state.state, 0)
+            .expect("zapis pierwszego stanu powinien się udać");
+
+        pool.activate(second, &stream)
+            .expect("drugi stan powinien się aktywować");
+        let second_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        let mut bytes = [0xff; 16];
+        device
+            .read(&second_state.state, 0, &mut bytes)
+            .expect("odczyt drugiego stanu powinien się udać");
+        assert_eq!(bytes, [0; 16]);
+        device
+            .write(&[9; 16], &second_state.state, 0)
+            .expect("zapis drugiego stanu powinien się udać");
+
+        pool.activate(first, &stream)
+            .expect("pierwszy stan powinien wrócić");
+        let first_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .read(&first_state.state, 0, &mut bytes)
+            .expect("odczyt pierwszego stanu powinien się udać");
+        assert_eq!(bytes, [7; 16]);
+
+        pool.release(first, &stream)
+            .expect("pierwszy lease powinien się zwolnić");
+        let reused = pool.acquire().expect("slot powinien wrócić do puli");
+        assert_eq!(reused.slot, first.slot);
+        assert!(reused.generation > first.generation);
+        pool.activate(reused, &stream)
+            .expect("ponownie użyty slot powinien się aktywować");
+        let reused_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .read(&reused_state.state, 0, &mut bytes)
+            .expect("odczyt ponownie użytego stanu powinien się udać");
+        assert_eq!(bytes, [0; 16]);
+        assert!(pool.release(first, &stream).is_err());
+    }
+
+    #[test]
+    fn wspoldzielony_cache_mtp_obsluguje_cancel_release_i_reuse() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mtp_config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 8,
+            page_size: 2,
+            n_pages: 8,
+            max_pages_per_seq: 8,
+            quant: KvQuant::F16,
+        };
+        let mut pool = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            8,
+            16,
+            Some((mtp_config, 4, 8)),
+        )
+        .expect("pula z MTP powinna powstać");
+        let first = pool.acquire().expect("pierwszy lease powinien powstać");
+        let second = pool.acquire().expect("drugi lease powinien powstać");
+
+        pool.activate(first, &stream)
+            .expect("pierwszy lease powinien się aktywować");
+        let (mut first_state, mut kv) = pool
+            .take_mtp(first)
+            .expect("stan MTP powinien być dostępny");
+        first_state
+            .grow(&mut kv)
+            .expect("pierwsza strona powinna powstać");
+        first_state
+            .grow(&mut kv)
+            .expect("pierwsza strona powinna się wypełnić");
+        let first_pages = first_state.seq.pages.clone();
+        pool.restore_mtp(first, first_state, kv)
+            .expect("pierwszy stan powinien wrócić do slotu");
+
+        pool.activate(second, &stream)
+            .expect("drugi lease powinien się aktywować");
+        let (mut second_state, mut kv) = pool
+            .take_mtp(second)
+            .expect("stan MTP powinien być dostępny");
+        second_state
+            .grow(&mut kv)
+            .expect("druga strona powinna powstać");
+        assert!(!first_pages.contains(&second_state.seq.pages[0]));
+        second_state
+            .checkpoint(&stream)
+            .expect("checkpoint powinien powstać");
+        second_state
+            .grow(&mut kv)
+            .expect("draft powinien zająć kolejną pozycję");
+        second_state
+            .rollback(&mut kv, &stream)
+            .expect("cancel powinien odtworzyć długość bazową");
+        assert_eq!(second_state.seq.len, 1);
+        pool.restore_mtp(second, second_state, kv)
+            .expect("drugi stan powinien wrócić do slotu");
+
+        pool.release(first, &stream)
+            .expect("pierwszy lease powinien się zwolnić");
+        let reused = pool.acquire().expect("zwolniony slot powinien wrócić");
+        assert_eq!(reused.slot, first.slot);
+        assert!(reused.generation > first.generation);
+        pool.activate(reused, &stream)
+            .expect("ponownie użyty slot powinien się aktywować");
+        let (reused_state, kv) = pool
+            .take_mtp(reused)
+            .expect("stan MTP powinien być dostępny");
+        assert_eq!(reused_state.seq.len, 0);
+        assert!(reused_state.seq.pages.is_empty());
+        assert_eq!(kv.free_page_count(), 7);
+        pool.restore_mtp(reused, reused_state, kv)
+            .expect("stan po reuse powinien wrócić do slotu");
+
+        pool.release(second, &stream)
+            .expect("drugi lease powinien się zwolnić");
+        pool.release(reused, &stream)
+            .expect("ponownie użyty lease powinien się zwolnić");
+        assert_eq!(
+            pool.mtp_kv
+                .as_ref()
+                .expect("cache MTP powinien istnieć")
+                .free_page_count(),
+            8
+        );
+    }
+
+    fn testowa_pula_mtp(device: Arc<dyn Device>) -> HybridStatePool {
+        HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            8,
+            16,
+            Some((
+                KvConfig {
+                    n_layers: 1,
+                    n_kv_heads: 1,
+                    head_dim: 8,
+                    page_size: 2,
+                    n_pages: 8,
+                    max_pages_per_seq: 8,
+                    quant: KvQuant::F16,
+                },
+                4,
+                8,
+            )),
+        )
+        .expect("testowa pula MTP powinna powstać")
+    }
+
+    #[test]
+    fn prewalidacja_commitu_pary_mtp_nie_mutuje_zadnej_lane() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = testowa_pula_mtp(device);
+        let leases = [
+            pool.acquire().expect("lane0 powinien powstać"),
+            pool.acquire().expect("lane1 powinien powstać"),
+        ];
+        let (mut states, mut kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+        for state in &mut states {
+            state.checkpoint(&stream).expect("checkpoint powinien powstać");
+            state.grow(&mut kv).expect("krok draftu powinien powstać");
+        }
+        let lengths = [states[0].seq.len, states[1].seq.len];
+        let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
+
+        assert!(validate_mtp_pair_metadata_commit(&states, [0, 1]).is_err());
+        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
+        assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
+        assert!(validate_mtp_pair_metadata_commit(&states, [1, 0]).is_err());
+        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
+        assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
+
+        let targets = validate_mtp_pair_metadata_commit(&states, [1, 1])
+            .expect("poprawny commit obu lane'ów powinien się udać");
+        apply_mtp_pair_metadata_commit(&mut states, &mut kv, targets);
+        pool.restore_mtp_pair(leases, states, kv)
+            .expect("para po commicie powinna wrócić do puli");
+    }
+
+    #[test]
+    fn blad_restore_pary_kwarantannuje_stany_i_cache() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut pool = testowa_pula_mtp(device);
+        let leases = [
+            pool.acquire().expect("lane0 powinien powstać"),
+            pool.acquire().expect("lane1 powinien powstać"),
+        ];
+        let (states, kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+
+        assert!(pool
+            .restore_mtp_pair([leases[0], leases[0]], states, kv)
+            .is_err());
+        assert!(pool.poisoned.is_some());
+        assert_eq!(pool.quarantined_mtp_states.len(), 2);
+        assert_eq!(pool.quarantined_mtp_kv.len(), 1);
+        assert!(pool.mtp_kv.is_none());
+        assert!(pool.acquire().is_err());
+    }
+
+    #[test]
+    fn blad_rollback_lane_zatruwa_cala_pare() {
+        for failed_lane in 0..2 {
+            let device: Arc<dyn Device> = CpuDevice::new();
+            let stream = device.create_stream().expect("stream CPU powinien powstać");
+            let mut pool = testowa_pula_mtp(device.clone());
+            let leases = [
+                pool.acquire().expect("lane0 powinien powstać"),
+                pool.acquire().expect("lane1 powinien powstać"),
+            ];
+            let (mut states, mut kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+            for state in &mut states {
+                state.checkpoint(&stream).expect("checkpoint powinien powstać");
+                state.grow(&mut kv).expect("krok draftu powinien powstać");
+            }
+            states[failed_lane].inject_rollback_failure();
+
+            let rollback = rollback_mtp_pair(&mut states, &mut kv, &stream)
+                .expect_err("rollback wskazanego lane powinien się nie udać");
+            assert!(rollback.to_string().contains(&format!("lane{failed_lane}")));
+            pool.poison(format!("wymuszony błąd propose: {rollback}"));
+            assert!(pool.restore_mtp_pair(leases, states, kv).is_err());
+            assert!(pool.poisoned.is_some());
+            assert_eq!(pool.quarantined_mtp_states.len(), 2);
+            assert_eq!(pool.quarantined_mtp_kv.len(), 1);
+            assert!(pool.take_mtp_pair(leases).is_err());
+        }
+    }
+
+    #[test]
+    fn blad_checkpointu_propose_lane_zatruwa_cala_pare() {
+        for failed_lane in 0..2 {
+            let device: Arc<dyn Device> = CpuDevice::new();
+            let stream = device.create_stream().expect("stream CPU powinien powstać");
+            let mut pool = testowa_pula_mtp(device);
+            let leases = [
+                pool.acquire().expect("lane0 powinien powstać"),
+                pool.acquire().expect("lane1 powinien powstać"),
+            ];
+            let (mut states, mut kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+            states[failed_lane].inject_checkpoint_failure();
+
+            let propose = (|| {
+                states[0].checkpoint(&stream)?;
+                states[1].checkpoint(&stream)
+            })();
+            let propose_error = propose.expect_err("checkpoint wskazanego lane powinien zawieść");
+            let checkpoints_complete = states.iter().all(|state| state.checkpoint_len().is_some());
+            rollback_mtp_pair(&mut states, &mut kv, &stream)
+                .expect("utworzony checkpoint drugiego lane powinien się cofnąć");
+            assert!(!checkpoints_complete);
+            pool.poison(format!(
+                "błąd propose przed utworzeniem obu checkpointów: {propose_error}"
+            ));
+            assert!(pool.restore_mtp_pair(leases, states, kv).is_err());
+            assert_eq!(pool.quarantined_mtp_states.len(), 2);
+            assert_eq!(pool.quarantined_mtp_kv.len(), 1);
+            assert!(pool.acquire().is_err());
+        }
+    }
+
+    #[test]
+    fn blad_eventu_z_udanym_sync_nie_powoduje_wzrostu_puli() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16, None)
+            .expect("pula powinna powstać");
+
+        for _ in 0..64 {
+            let lease = pool.acquire().expect("slot powinien wrócić do puli");
+            pool.activate(lease, &stream)
+                .expect("slot powinien się aktywować");
+            let state = pool.active_layers()[0]
+                .as_ref()
+                .expect("warstwa DeltaNet ma stan");
+            pool.device
+                .write(&[7; 16], &state.state, 0)
+                .expect("zapis stanu powinien się udać");
+            pool.finish_release(
+                lease,
+                Err(ForgeError::Device("wymuszony błąd eventu".into())),
+                || Ok(()),
+            )
+            .expect("synchronizacja powinna bezpiecznie odzyskać slot");
+            let mut bytes = [0xff; 16];
+            pool.device
+                .read(
+                    &pool.slots[lease.slot].layers[0]
+                        .as_ref()
+                        .expect("warstwa DeltaNet ma stan")
+                        .state,
+                    0,
+                    &mut bytes,
+                )
+                .expect("odczyt stanu powinien się udać");
+            assert_eq!(bytes, [0; 16]);
+        }
+
+        assert_eq!(pool.slots.len(), 1);
+        assert_eq!(pool.free, vec![0]);
+        assert!(pool.poisoned.is_none());
+    }
+
+    #[test]
+    fn podwojny_blad_zwolnienia_zatruwa_pule_i_blokuje_alokacje() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16, None)
+            .expect("pula powinna powstać");
+        let lease = pool.acquire().expect("lease powinien powstać");
+        pool.activate(lease, &stream)
+            .expect("slot powinien się aktywować");
+
+        let result = pool.finish_release(
+            lease,
+            Err(ForgeError::Device("wymuszony błąd eventu".into())),
+            || Err(ForgeError::Device("wymuszony błąd synchronizacji".into())),
+        );
+
+        assert!(result.is_err());
+        assert!(pool.poisoned.is_some());
+        assert!(pool.slots[lease.slot].in_use);
+        assert!(pool.free.is_empty());
+        assert!(pool.acquire().is_err());
+        assert_eq!(pool.slots.len(), 1);
+    }
+
+    #[test]
+    fn logical_kv_regions_zachowuja_layout_i_czesciowa_strone() {
+        let regions = logical_kv_regions(&[3, 1, 7], 5, 4, 2, 6);
+        assert_eq!(regions, vec![(144, 24), (168, 24), (48, 6), (72, 6)]);
+        assert_eq!(regions.iter().map(|(_, len)| len).sum::<usize>(), 5 * 2 * 6);
+    }
+
+    fn fail_after_kv_growth(
+        kv: &mut KvCache,
+        page_table_seq: &mut u64,
+        seq: &mut SeqKv,
+    ) -> Result<()> {
+        let base = seq.len;
+        let result: Result<(usize, u32)> = (|| {
+            for _ in 0..6 {
+                kv.grow(seq)?;
+            }
+            Err(ForgeError::Kernel("wymuszony błąd weryfikacji".into()))
+        })();
+        finish_greedy_verification(kv, page_table_seq, seq, base, result).map(|_| ())
+    }
+
+    #[test]
+    fn error_after_kv_growth_rolls_back_every_page() {
+        let device = CpuDevice::new();
+        let mut kv = KvCache::new(
+            device.as_ref(),
+            KvConfig {
+                n_layers: 1,
+                n_kv_heads: 1,
+                head_dim: 8,
+                page_size: 4,
+                n_pages: 8,
+                max_pages_per_seq: 8,
+                quant: KvQuant::F16,
+            },
+        )
+        .expect("cache KV powinien powstać");
+        let mut seq = kv.new_seq();
+        for _ in 0..3 {
+            kv.grow(&mut seq)
+                .expect("wzrost sekwencji powinien się udać");
+        }
+        let base_pages = seq.pages.len();
+        let base_free_pages = kv.free_page_count();
+        let mut page_table_seq = 17;
+
+        assert!(fail_after_kv_growth(&mut kv, &mut page_table_seq, &mut seq).is_err());
+        assert_eq!(seq.len, 3);
+        assert_eq!(seq.pages.len(), base_pages);
+        assert_eq!(kv.free_page_count(), base_free_pages);
+        assert_eq!(page_table_seq, 0);
+    }
+
+    #[test]
+    fn native_mtp_acceptance_excludes_fed_and_uses_bonus_row() {
+        assert_eq!(
+            native_mtp_greedy_decision(&[11, 12, 13], &[11, 12, 13, 14]),
+            (3, 14)
+        );
+        assert_eq!(
+            native_mtp_greedy_decision(&[11, 12, 13], &[10, 99, 99, 99]),
+            (0, 10)
+        );
+        assert_eq!(
+            native_mtp_greedy_decision(&[11, 12, 13], &[11, 20, 99, 99]),
+            (1, 20)
+        );
+    }
+
+    #[test]
+    fn native_mtp_b2_wymaga_wspoldzielonego_device_embeddingu() {
+        assert!(native_mtp_b2_device_embedding(Some("device"), true));
+        assert!(!native_mtp_b2_device_embedding(Some("device"), false));
+        assert!(!native_mtp_b2_device_embedding(Some("host"), true));
+        assert!(!native_mtp_b2_device_embedding(None, true));
+    }
+
+    #[test]
+    fn profil_prefill_sumuje_wewnetrzne_chunki_kazdego_outer_chunku() {
+        assert_eq!(hybrid_prefill_profile_spans(1, 128), 1);
+        assert_eq!(hybrid_prefill_profile_spans(1024, 128), 8);
+        assert_eq!(hybrid_prefill_profile_spans(1025, 128), 9);
+        assert_eq!(hybrid_prefill_profile_spans(1153, 128), 10);
+        assert_eq!(hybrid_prefill_profile_spans(2048, 128), 16);
+    }
+
+    #[test]
+    fn scratch_join_mtp_miesci_dwa_wektory_hidden() {
+        assert_eq!(hybrid_q_full_cols(8, 12, 10), 20);
+        assert_eq!(hybrid_q_full_cols(16, 12, 10), 32);
+        assert_eq!(hybrid_q_full_cols(8, 40, 10), 40);
+    }
+
+    #[test]
+    fn restore_wykonuje_sie_takze_po_bledzie() {
+        let mut restored = false;
+        let result: Result<()> = restore_after(
+            Err(ForgeError::Kernel("wymuszony błąd prefill".into())),
+            || restored = true,
+        );
+        assert!(result.is_err());
+        assert!(restored);
     }
 }

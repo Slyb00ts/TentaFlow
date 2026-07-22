@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::mtp::{MtpEmbedding, MtpTensorLoader, MtpWeights};
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
 use forge_formats::w4a8::{col_absmax, smoothing_scale, w4a8_pack_smoothed, W4A8_GROUP};
@@ -151,6 +152,13 @@ pub enum DevWeight {
         rows: usize,
         cols: usize,
     },
+    /// Surowy strumień bloków GGUF NVFP4 (36 bajtów / 64 elementy).
+    NvFp4Gguf {
+        buf: DevBuffer,
+        output_scale: f32,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 impl DevWeight {
@@ -177,7 +185,8 @@ impl DevWeight {
             | DevWeight::Iq3Xxs { rows, .. }
             | DevWeight::Iq1S { rows, .. }
             | DevWeight::Iq1M { rows, .. }
-            | DevWeight::NvFp4 { rows, .. } => *rows,
+            | DevWeight::NvFp4 { rows, .. }
+            | DevWeight::NvFp4Gguf { rows, .. } => *rows,
         }
     }
 
@@ -204,7 +213,8 @@ impl DevWeight {
             | DevWeight::Iq3Xxs { cols, .. }
             | DevWeight::Iq1S { cols, .. }
             | DevWeight::Iq1M { cols, .. }
-            | DevWeight::NvFp4 { cols, .. } => *cols,
+            | DevWeight::NvFp4 { cols, .. }
+            | DevWeight::NvFp4Gguf { cols, .. } => *cols,
         }
     }
 }
@@ -275,6 +285,15 @@ pub struct Fp8Layer {
     pub down: Fp8Weight,
 }
 
+/// Paczki FP8 dla Q/O i projekcji FFN hybrydowego prefillu.
+pub struct Fp8FfnLayer {
+    pub q: Fp8Weight,
+    pub attn_o: Fp8Weight,
+    pub gate: Fp8Weight,
+    pub up: Fp8Weight,
+    pub down: Fp8Weight,
+}
+
 /// Whether an fp8 (e4m3) prefill GEMM is selected. `fp8` = the hand-written
 /// single-PTX kernel; `fp8mod` = Modular's multistage cp.async kernel (faster,
 /// docs/CODEGEN_PROOF.md Finding G). Both build the SAME e4m3 weight packs; only
@@ -289,6 +308,11 @@ pub fn fp8_enabled() -> bool {
 /// Whether the Modular multistage fp8 GEMM (`FORGE_GEMM=fp8mod`) is selected.
 pub fn fp8_modular_enabled() -> bool {
     std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod")
+}
+
+/// Czy wybrano hybrydowy prefill FP8 tylko dla FFN.
+pub fn fp8_ffn_modular_enabled() -> bool {
+    std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod-ffn")
 }
 
 /// Per-input-channel activation abs-max collected during the W4A8 calibration
@@ -315,7 +339,10 @@ pub struct CalibStats {
 /// order is q, then k, then v.
 pub enum QkvWeights {
     Fused(DevWeight),
-    FusedQk { qk: DevWeight, v: DevWeight },
+    FusedQk {
+        qk: DevWeight,
+        v: DevWeight,
+    },
     Split {
         q: DevWeight,
         k: DevWeight,
@@ -455,6 +482,8 @@ pub struct ModelWeights {
     /// LM head. For tied embeddings this is a separate f16 view built from the
     /// same host data (kept simple; dedup is a later optimization).
     pub lm_head: DevWeight,
+    /// Lm_head FP8 używany tylko przez single-stream decode w trybie opt-in.
+    pub fp8_lm_head: Option<Fp8Weight>,
     pub layers: Vec<LayerWeights>,
     /// Layers whose Q/K/V (resp. gate/up) landed as one fused matrix — the
     /// rest fell back to q|k fusion with separate v, or fully split storage
@@ -468,19 +497,57 @@ pub struct ModelWeights {
     /// Per-layer fp8 (e4m3) packs for the prefill GEMM when `FORGE_GEMM=fp8`,
     /// else `None`. Dense models only; decode/logit keep the resident weights.
     pub fp8: Option<Vec<Fp8Layer>>,
+    /// Dodatkowe paczki FP8 dla Q/O i FFN w opt-in prefill.
+    pub fp8_ffn: Option<Vec<Fp8FfnLayer>>,
     /// When `fp8` packs are resident, route the prefill GEMM to Modular's
     /// multistage kernel (`FORGE_GEMM=fp8mod`) instead of the hand kernel.
     pub fp8_modular: bool,
+    /// Opcjonalna natywna warstwa NextN współdzieląca embedding i LM head targetu.
+    pub mtp: Option<MtpWeights>,
 }
 
 /// Source-agnostic host-side tensor fetch: (bytes, dtype, quant, dims).
+type TensorFetch = (Vec<u8>, DType, QuantKind, Vec<usize>);
+
 trait TensorSource {
-    fn fetch(&self, name: &str) -> Result<(Vec<u8>, DType, QuantKind, Vec<usize>)>;
+    fn fetch(&self, name: &str) -> Result<TensorFetch>;
+    fn fetch_optional(&self, name: &str) -> Result<Option<TensorFetch>>;
     /// NVFP4 triple fetch; None when the tensor is not NVFP4-packed.
     fn fetch_nvfp4(&self, name: &str) -> Result<Option<NvFp4Host>>;
     /// compressed-tensors FP8 ("float-quantized"): f8e4m3 weight + sibling
     /// `<base>.weight_scale` (per-channel or per-tensor). None when absent.
     fn fetch_fp8(&self, name: &str) -> Result<Option<Fp8Host>>;
+}
+
+struct SourceMtpLoader<'a> {
+    device: &'a dyn Device,
+    source: &'a dyn TensorSource,
+}
+
+impl MtpTensorLoader for SourceMtpLoader<'_> {
+    fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight> {
+        let weight = fetch_matrix(self.source, name)?;
+        if weight.rows() != rows || weight.cols() != cols {
+            return Err(ForgeError::Format(format!(
+                "MTP {name}: kształt [{}, {}], wymagano [{rows}, {cols}]",
+                weight.rows(),
+                weight.cols()
+            )));
+        }
+        upload_weight(self.device, weight)
+    }
+
+    fn vector(&mut self, name: &str, len: usize) -> Result<DevBuffer> {
+        let (data, dtype, quant, dims) = self.source.fetch(name)?;
+        let elements = dims.iter().product::<usize>();
+        if elements != len {
+            return Err(ForgeError::Format(format!(
+                "MTP {name}: długość {elements}, wymagano {len}"
+            )));
+        }
+        let values = dequantize_to_f32(dtype, quant, &data, elements)?;
+        upload(self.device, &f32s_to_f16_bytes(&values))
+    }
 }
 
 struct Fp8Host {
@@ -502,7 +569,7 @@ struct NvFp4Host {
 struct GgufSource<'a>(&'a Gguf);
 
 impl TensorSource for GgufSource<'_> {
-    fn fetch(&self, name: &str) -> Result<(Vec<u8>, DType, QuantKind, Vec<usize>)> {
+    fn fetch(&self, name: &str) -> Result<TensorFetch> {
         let t = self
             .0
             .tensor(name)
@@ -512,6 +579,13 @@ impl TensorSource for GgufSource<'_> {
         let mut dims: Vec<usize> = t.dims.iter().map(|&d| d as usize).collect();
         dims.reverse();
         Ok((data, t.dtype, t.quant, dims))
+    }
+
+    fn fetch_optional(&self, name: &str) -> Result<Option<TensorFetch>> {
+        if self.0.tensor(name).is_none() {
+            return Ok(None);
+        }
+        self.fetch(name).map(Some)
     }
 
     fn fetch_nvfp4(&self, _name: &str) -> Result<Option<NvFp4Host>> {
@@ -531,13 +605,20 @@ struct StSource<'a> {
 }
 
 impl TensorSource for StSource<'_> {
-    fn fetch(&self, name: &str) -> Result<(Vec<u8>, DType, QuantKind, Vec<usize>)> {
+    fn fetch(&self, name: &str) -> Result<TensorFetch> {
         let t = self
             .st
             .tensor(name)
             .ok_or_else(|| ForgeError::Format(format!("missing tensor {name}")))?;
         let data = self.st.data(name)?.to_vec();
         Ok((data, t.dtype, QuantKind::None, t.shape.clone()))
+    }
+
+    fn fetch_optional(&self, name: &str) -> Result<Option<TensorFetch>> {
+        if self.st.tensor(name).is_none() {
+            return Ok(None);
+        }
+        self.fetch(name).map(Some)
     }
 
     fn fetch_nvfp4(&self, name: &str) -> Result<Option<NvFp4Host>> {
@@ -640,6 +721,38 @@ fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
     let buf = device.alloc(bytes.len(), MemKind::Device, Pool::Weights)?;
     device.write(bytes, &buf, 0)?;
     Ok(buf)
+}
+
+fn nvfp4_gguf_output_scale(
+    src: &dyn TensorSource,
+    name: &str,
+    quant: QuantKind,
+) -> Result<f32> {
+    if quant != QuantKind::NVFP4Gguf {
+        return Ok(1.0);
+    }
+    let Some(base) = name.strip_suffix(".weight") else {
+        return Ok(1.0);
+    };
+    let scale_name = format!("{base}.scale");
+    let Some((scale_data, scale_dtype, scale_quant, scale_dims)) =
+        src.fetch_optional(&scale_name)?
+    else {
+        return Ok(1.0);
+    };
+    let numel: usize = scale_dims.iter().product();
+    if numel != 1 {
+        return Err(ForgeError::Format(format!(
+            "{scale_name}: oczekiwano skalarnej skali NVFP4, otrzymano {scale_dims:?}"
+        )));
+    }
+    let scale = dequantize_to_f32(scale_dtype, scale_quant, &scale_data, numel)?[0];
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(ForgeError::Format(format!(
+            "{scale_name}: skala NVFP4 musi być skończona i dodatnia, otrzymano {scale}"
+        )));
+    }
+    Ok(scale)
 }
 
 /// Upload a norm-style vector as f16 (dequantizing if needed).
@@ -783,9 +896,24 @@ enum HostWeight {
         rows: usize,
         cols: usize,
     },
+    NvFp4Gguf {
+        data: Vec<u8>,
+        output_scale: f32,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 impl HostWeight {
+    fn mtp_device_bytes(&self) -> Option<usize> {
+        match self {
+            HostWeight::Q8_0 { data, .. } | HostWeight::NvFp4Gguf { data, .. } => {
+                Some(data.len())
+            }
+            _ => None,
+        }
+    }
+
     fn rows(&self) -> usize {
         match self {
             HostWeight::F16 { rows, .. }
@@ -809,7 +937,8 @@ impl HostWeight {
             | HostWeight::Iq3Xxs { rows, .. }
             | HostWeight::Iq1S { rows, .. }
             | HostWeight::Iq1M { rows, .. }
-            | HostWeight::NvFp4 { rows, .. } => *rows,
+            | HostWeight::NvFp4 { rows, .. }
+            | HostWeight::NvFp4Gguf { rows, .. } => *rows,
         }
     }
 
@@ -836,7 +965,8 @@ impl HostWeight {
             | HostWeight::Iq3Xxs { cols, .. }
             | HostWeight::Iq1S { cols, .. }
             | HostWeight::Iq1M { cols, .. }
-            | HostWeight::NvFp4 { cols, .. } => *cols,
+            | HostWeight::NvFp4 { cols, .. }
+            | HostWeight::NvFp4Gguf { cols, .. } => *cols,
         }
     }
 }
@@ -888,7 +1018,8 @@ fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
         )));
     }
     let (rows, cols) = (dims[0], dims[1]);
-    quant_host_weight(name, data, dtype, quant, rows, cols)
+    let output_scale = nvfp4_gguf_output_scale(src, name, quant)?;
+    quant_host_weight(name, data, dtype, quant, rows, cols, output_scale)
 }
 
 /// Map a [rows, cols] block stream in storage quant `quant` to the on-device
@@ -902,8 +1033,22 @@ fn quant_host_weight(
     quant: QuantKind,
     rows: usize,
     cols: usize,
+    output_scale: f32,
 ) -> Result<HostWeight> {
     match quant {
+        QuantKind::NVFP4Gguf if cols.is_multiple_of(64) => {
+            if !output_scale.is_finite() || output_scale <= 0.0 {
+                return Err(ForgeError::Format(format!(
+                    "{name}: skala NVFP4 musi być skończona i dodatnia, otrzymano {output_scale}"
+                )));
+            }
+            Ok(HostWeight::NvFp4Gguf {
+                data,
+                output_scale,
+                rows,
+                cols,
+            })
+        }
         QuantKind::Q8_0 => Ok(HostWeight::Q8_0 { data, rows, cols }),
         // Whole 256-element superblocks per row keep every 144-byte block
         // 16-byte aligned for the fused kernels' wide loads (Q4K_MAX_SEGS in
@@ -931,13 +1076,9 @@ fn quant_host_weight(
         QuantKind::Q5_0 => Ok(HostWeight::Q5_0 { data, rows, cols }),
         QuantKind::Q5_1 => Ok(HostWeight::Q5_1 { data, rows, cols }),
         QuantKind::IQ4NL => Ok(HostWeight::Iq4Nl { data, rows, cols }),
-        QuantKind::IQ4XS if cols.is_multiple_of(256) => {
-            Ok(HostWeight::Iq4Xs { data, rows, cols })
-        }
+        QuantKind::IQ4XS if cols.is_multiple_of(256) => Ok(HostWeight::Iq4Xs { data, rows, cols }),
         QuantKind::MXFP4 => Ok(HostWeight::Mxfp4 { data, rows, cols }),
-        QuantKind::IQ2XS if cols.is_multiple_of(256) => {
-            Ok(HostWeight::Iq2Xs { data, rows, cols })
-        }
+        QuantKind::IQ2XS if cols.is_multiple_of(256) => Ok(HostWeight::Iq2Xs { data, rows, cols }),
         QuantKind::IQ2S if cols.is_multiple_of(256) => Ok(HostWeight::Iq2S { data, rows, cols }),
         QuantKind::IQ3S if cols.is_multiple_of(256) => Ok(HostWeight::Iq3S { data, rows, cols }),
         QuantKind::IQ2XXS if cols.is_multiple_of(256) => {
@@ -983,7 +1124,7 @@ fn fetch_expert_stack(src: &dyn TensorSource, name: &str) -> Result<HostWeight> 
     // GGUF dims are innermost-first and `fetch` already reversed them, so
     // dims = [n_expert, a, b].
     let (n_expert, a, b) = (dims[0], dims[1], dims[2]);
-    quant_host_weight(name, data, dtype, quant, n_expert * a, b)
+    quant_host_weight(name, data, dtype, quant, n_expert * a, b, 1.0)
 }
 
 /// Upload a host matrix as-is.
@@ -1104,6 +1245,17 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
             packed: upload(device, &packed)?,
             scales: upload(device, &scales)?,
             inv_global_scale: 1.0 / global_scale,
+            rows,
+            cols,
+        }),
+        HostWeight::NvFp4Gguf {
+            data,
+            output_scale,
+            rows,
+            cols,
+        } => Ok(DevWeight::NvFp4Gguf {
+            buf: upload(device, &data)?,
+            output_scale,
             rows,
             cols,
         }),
@@ -1235,40 +1387,40 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         HostWeight::Q5K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q5K { .. })) => {}
         HostWeight::Q3K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q3K { .. })) => {}
         HostWeight::Q2K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q2K { .. })) => {}
-        HostWeight::Q4_0 { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Q4_0 { .. })) => {}
-        HostWeight::Q4_1 { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Q4_1 { .. })) => {}
-        HostWeight::Q5_0 { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Q5_0 { .. })) => {}
-        HostWeight::Q5_1 { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Q5_1 { .. })) => {}
-        HostWeight::Iq4Nl { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Iq4Nl { .. })) => {}
-        HostWeight::Iq4Xs { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Iq4Xs { .. })) => {}
-        HostWeight::Mxfp4 { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Mxfp4 { .. })) => {}
-        HostWeight::Iq2Xs { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Iq2Xs { .. })) => {}
-        HostWeight::Iq2S { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Iq2S { .. })) => {}
-        HostWeight::Iq3S { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Iq3S { .. })) => {}
+        HostWeight::Q4_0 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q4_0 { .. })) => {}
+        HostWeight::Q4_1 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q4_1 { .. })) => {}
+        HostWeight::Q5_0 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q5_0 { .. })) => {}
+        HostWeight::Q5_1 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q5_1 { .. })) => {}
+        HostWeight::Iq4Nl { .. } if parts.iter().all(|p| matches!(p, HostWeight::Iq4Nl { .. })) => {
+        }
+        HostWeight::Iq4Xs { .. } if parts.iter().all(|p| matches!(p, HostWeight::Iq4Xs { .. })) => {
+        }
+        HostWeight::Mxfp4 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Mxfp4 { .. })) => {
+        }
+        HostWeight::Iq2Xs { .. } if parts.iter().all(|p| matches!(p, HostWeight::Iq2Xs { .. })) => {
+        }
+        HostWeight::Iq2S { .. } if parts.iter().all(|p| matches!(p, HostWeight::Iq2S { .. })) => {}
+        HostWeight::Iq3S { .. } if parts.iter().all(|p| matches!(p, HostWeight::Iq3S { .. })) => {}
         HostWeight::Iq2Xxs { .. }
             if parts.iter().all(|p| matches!(p, HostWeight::Iq2Xxs { .. })) => {}
         HostWeight::Iq3Xxs { .. }
             if parts.iter().all(|p| matches!(p, HostWeight::Iq3Xxs { .. })) => {}
-        HostWeight::Iq1S { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Iq1S { .. })) => {}
-        HostWeight::Iq1M { .. }
-            if parts.iter().all(|p| matches!(p, HostWeight::Iq1M { .. })) => {}
+        HostWeight::Iq1S { .. } if parts.iter().all(|p| matches!(p, HostWeight::Iq1S { .. })) => {}
+        HostWeight::Iq1M { .. } if parts.iter().all(|p| matches!(p, HostWeight::Iq1M { .. })) => {}
         HostWeight::NvFp4 { global_scale, .. } => {
             let gs = global_scale.to_bits();
             let ok = parts.iter().all(
                 |p| matches!(p, HostWeight::NvFp4 { global_scale, .. } if global_scale.to_bits() == gs),
             );
             if !ok {
+                return Err(parts);
+            }
+        }
+        HostWeight::NvFp4Gguf { output_scale, .. } => {
+            let scale = output_scale.to_bits();
+            if !parts.iter().all(
+                |p| matches!(p, HostWeight::NvFp4Gguf { output_scale, .. } if output_scale.to_bits() == scale),
+            ) {
                 return Err(parts);
             }
         }
@@ -1298,7 +1450,8 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
             | (HostWeight::Iq2Xxs { data, .. }, HostWeight::Iq2Xxs { data: d, .. })
             | (HostWeight::Iq3Xxs { data, .. }, HostWeight::Iq3Xxs { data: d, .. })
             | (HostWeight::Iq1S { data, .. }, HostWeight::Iq1S { data: d, .. })
-            | (HostWeight::Iq1M { data, .. }, HostWeight::Iq1M { data: d, .. }) => {
+            | (HostWeight::Iq1M { data, .. }, HostWeight::Iq1M { data: d, .. })
+            | (HostWeight::NvFp4Gguf { data, .. }, HostWeight::NvFp4Gguf { data: d, .. }) => {
                 data.extend_from_slice(&d)
             }
             (
@@ -1337,7 +1490,8 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         | HostWeight::Iq3Xxs { rows: r, .. }
         | HostWeight::Iq1S { rows: r, .. }
         | HostWeight::Iq1M { rows: r, .. }
-        | HostWeight::NvFp4 { rows: r, .. } => *r = rows,
+        | HostWeight::NvFp4 { rows: r, .. }
+        | HostWeight::NvFp4Gguf { rows: r, .. } => *r = rows,
     }
     Ok(fused)
 }
@@ -1347,7 +1501,7 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
 fn fetch_embedding_host(
     src: &dyn TensorSource,
     name: &str,
-) -> Result<(Vec<f16>, usize, usize)> {
+) -> Result<(Vec<f16>, HostWeight, usize, usize)> {
     let (data, dtype, quant, dims) = src.fetch(name)?;
     if dims.len() != 2 {
         return Err(ForgeError::Format(format!(
@@ -1355,9 +1509,16 @@ fn fetch_embedding_host(
         )));
     }
     let (rows, cols) = (dims[0], dims[1]);
-    let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+    let output_scale = nvfp4_gguf_output_scale(src, name, quant)?;
+    let mut f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+    if quant == QuantKind::NVFP4Gguf {
+        for value in &mut f32s {
+            *value *= output_scale;
+        }
+    }
     let f16s = f32s.iter().map(|&v| f16::from_f32(v)).collect();
-    Ok((f16s, rows, cols))
+    let weight = quant_host_weight(name, data, dtype, quant, rows, cols, output_scale)?;
+    Ok((f16s, weight, rows, cols))
 }
 
 /// Upload the embedding table as f16 regardless of storage quant.
@@ -1373,19 +1534,33 @@ fn upload_embedding(
         )));
     }
     let (rows, cols) = (dims[0], dims[1]);
-    let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+    let output_scale = nvfp4_gguf_output_scale(src, name, quant)?;
+    let mut f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+    if quant == QuantKind::NVFP4Gguf {
+        for value in &mut f32s {
+            *value *= output_scale;
+        }
+    }
     Ok((upload(device, &f32s_to_f16_bytes(&f32s))?, rows, cols))
 }
 
 impl ModelWeights {
-    pub fn load_gguf(device: &Arc<dyn Device>, path: &Path) -> Result<Self> {
+    pub fn load_gguf(
+        device: &Arc<dyn Device>,
+        path: &Path,
+        native_mtp: bool,
+    ) -> Result<Self> {
         let gguf = Gguf::open(path)?;
         let descriptor = ModelDescriptor::detect(&gguf)?;
         let src = GgufSource(&gguf);
-        Self::load(device.as_ref(), descriptor, &src)
+        Self::load(device.as_ref(), descriptor, &src, native_mtp)
     }
 
-    pub fn load_safetensors_dir(device: &Arc<dyn Device>, dir: &Path) -> Result<Self> {
+    pub fn load_safetensors_dir(
+        device: &Arc<dyn Device>,
+        dir: &Path,
+        native_mtp: bool,
+    ) -> Result<Self> {
         let config: HfConfig = {
             let text = std::fs::read_to_string(dir.join("config.json"))?;
             serde_json::from_str::<HfConfig>(&text)
@@ -1400,14 +1575,19 @@ impl ModelWeights {
             .and_then(|qc| qc.get("format"))
             .and_then(|f| f.as_str())
             == Some("float-quantized");
-        let src = StSource { st: &st, scheme, fp8 };
-        Self::load(device.as_ref(), descriptor, &src)
+        let src = StSource {
+            st: &st,
+            scheme,
+            fp8,
+        };
+        Self::load(device.as_ref(), descriptor, &src, native_mtp)
     }
 
     fn load(
         device: &dyn Device,
         descriptor: ModelDescriptor,
         src: &dyn TensorSource,
+        native_mtp: bool,
     ) -> Result<Self> {
         // Hybrid attention/DeltaNet arches (qwen35moe) have per-layer weight
         // sets that differ by kind and a gated attention Q projection the
@@ -1418,7 +1598,7 @@ impl ModelWeights {
                     "FORGE_GEMM=w4a8 supports dense (non-hybrid) models only".into(),
                 ));
             }
-            return Self::load_hybrid(device, descriptor, src);
+            return Self::load_hybrid(device, descriptor, src, native_mtp);
         }
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
@@ -1679,19 +1859,43 @@ impl ModelWeights {
             });
         }
 
+        let mtp = if let Some(mtp_descriptor) = descriptor.mtp.as_ref() {
+            let mut loader = SourceMtpLoader {
+                device,
+                source: src,
+            };
+            Some(MtpWeights::load(
+                mtp_descriptor,
+                &descriptor.params,
+                &mut loader,
+                &token_embd_f16,
+                MtpEmbedding::Device(DevWeight::F16 {
+                    buf: token_embd_f16.clone(),
+                    rows: vocab,
+                    cols: hidden,
+                }),
+                &lm_head,
+            )?)
+        } else {
+            None
+        };
+
         Ok(ModelWeights {
             descriptor,
             token_embd_f16,
             token_embd_host: None,
             output_norm,
             lm_head,
+            fp8_lm_head: None,
             layers,
             fused_qkv_layers,
             fused_qk_layers,
             fused_gate_up_layers,
             w4a8: None,
             fp8: None,
+            fp8_ffn: None,
             fp8_modular: false,
+            mtp,
         })
     }
 
@@ -1703,6 +1907,7 @@ impl ModelWeights {
         device: &dyn Device,
         descriptor: ModelDescriptor,
         src: &dyn TensorSource,
+        native_mtp: bool,
     ) -> Result<Self> {
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
@@ -1713,7 +1918,7 @@ impl ModelWeights {
         let embd_name = global(WeightRole::TokenEmbd)?;
         // The embedding table (~1 GiB f16) stays on the host so the 22 GB of
         // quantized weights fit VRAM; the gather runs host-side per token.
-        let (host_embed, vocab, hidden) = fetch_embedding_host(src, embd_name)?;
+        let (host_embed, host_embedding, vocab, hidden) = fetch_embedding_host(src, embd_name)?;
         let token_embd_f16 = upload(device, &vec![0u8; hidden * 2])?;
         let output_norm = upload_norm(device, src, global(WeightRole::OutputNorm)?)?;
         let lm_head_name = descriptor
@@ -1745,7 +1950,7 @@ impl ModelWeights {
         }
 
         let p = &descriptor.params;
-        let moe = p.moe.clone().expect("hybrid model is MoE");
+        let moe = p.moe.clone();
 
         let mut layers = Vec::with_capacity(p.block_count);
         for (idx, layer_map) in descriptor.layers.iter().enumerate() {
@@ -1770,12 +1975,21 @@ impl ModelWeights {
                     }))
                 }
                 LayerKind::DeltaNet => LayerMixer::DeltaNet(Box::new(DeltaNetWeights {
-                    in_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmInProj)?)?)?,
-                    gate_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmGate)?)?)?,
+                    in_proj: upload_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::SsmInProj)?)?,
+                    )?,
+                    gate_proj: upload_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::SsmGate)?)?,
+                    )?,
                     conv1d: upload_norm(device, src, name(WeightRole::SsmConv1d)?)?,
                     dt_bias: upload_norm(device, src, name(WeightRole::SsmDt)?)?,
                     a: upload_norm(device, src, name(WeightRole::SsmA)?)?,
-                    beta_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmBeta)?)?)?,
+                    beta_proj: upload_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::SsmBeta)?)?,
+                    )?,
                     alpha_proj: upload_weight(
                         device,
                         fetch_matrix(src, name(WeightRole::SsmAlpha)?)?,
@@ -1785,42 +1999,55 @@ impl ModelWeights {
                 })),
             };
 
-            // Routed experts + always-on gated shared expert (every layer).
-            let router = match fetch_matrix(src, name(WeightRole::FfnGateInp)?)? {
-                r @ HostWeight::F16 { .. } => upload_weight(device, r)?,
-                other => {
-                    return Err(ForgeError::Unsupported(format!(
-                        "layer {idx} ffn_gate_inp must be f16-materializable, got {:?}",
-                        std::mem::discriminant(&other)
-                    )))
-                }
-            };
-            let gate_exps = fetch_expert_stack(src, name(WeightRole::FfnGateExps)?)?;
-            let up_exps = fetch_expert_stack(src, name(WeightRole::FfnUpExps)?)?;
-            let down_exps = fetch_expert_stack(src, name(WeightRole::FfnDownExps)?)?;
-            let sh_gate = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnGateShExp)?)?)?;
-            let sh_up = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnUpShExp)?)?)?;
-            let sh_down = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnDownShExp)?)?)?;
-            let shared_gate = load_vector_weight(device, src, name(WeightRole::FfnGateInpShExp)?)?;
+            let ffn = if let Some(moe) = &moe {
+                let router = match fetch_matrix(src, name(WeightRole::FfnGateInp)?)? {
+                    r @ HostWeight::F16 { .. } => upload_weight(device, r)?,
+                    other => {
+                        return Err(ForgeError::Unsupported(format!(
+                            "layer {idx} ffn_gate_inp must be f16-materializable, got {:?}",
+                            std::mem::discriminant(&other)
+                        )))
+                    }
+                };
+                let gate_exps = fetch_expert_stack(src, name(WeightRole::FfnGateExps)?)?;
+                let up_exps = fetch_expert_stack(src, name(WeightRole::FfnUpExps)?)?;
+                let down_exps = fetch_expert_stack(src, name(WeightRole::FfnDownExps)?)?;
+                let sh_gate =
+                    upload_weight(device, fetch_matrix(src, name(WeightRole::FfnGateShExp)?)?)?;
+                let sh_up =
+                    upload_weight(device, fetch_matrix(src, name(WeightRole::FfnUpShExp)?)?)?;
+                let sh_down =
+                    upload_weight(device, fetch_matrix(src, name(WeightRole::FfnDownShExp)?)?)?;
+                let shared_gate =
+                    load_vector_weight(device, src, name(WeightRole::FfnGateInpShExp)?)?;
 
-            let ffn = LayerFfn::Moe(Box::new(MoeFfn {
-                router,
-                gate_exps: upload_weight(device, gate_exps)?,
-                up_exps: upload_weight(device, up_exps)?,
-                down_exps: upload_weight(device, down_exps)?,
-                shared: Some(DenseFfn {
-                    gate_up: GateUpWeights::Split {
-                        gate: sh_gate,
-                        up: sh_up,
-                    },
-                    down: sh_down,
-                }),
-                shared_gate: Some(shared_gate),
-                n_experts: moe.n_experts,
-                n_experts_used: moe.n_experts_used,
-                moe_inter: moe.moe_intermediate_size,
-                norm_topk: moe.norm_topk_prob,
-            }));
+                LayerFfn::Moe(Box::new(MoeFfn {
+                    router,
+                    gate_exps: upload_weight(device, gate_exps)?,
+                    up_exps: upload_weight(device, up_exps)?,
+                    down_exps: upload_weight(device, down_exps)?,
+                    shared: Some(DenseFfn {
+                        gate_up: GateUpWeights::Split {
+                            gate: sh_gate,
+                            up: sh_up,
+                        },
+                        down: sh_down,
+                    }),
+                    shared_gate: Some(shared_gate),
+                    n_experts: moe.n_experts,
+                    n_experts_used: moe.n_experts_used,
+                    moe_inter: moe.moe_intermediate_size,
+                    norm_topk: moe.norm_topk_prob,
+                }))
+            } else {
+                let gate = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnGate)?)?)?;
+                let up = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnUp)?)?)?;
+                let down = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnDown)?)?)?;
+                LayerFfn::Dense(DenseFfn {
+                    gate_up: GateUpWeights::Split { gate, up },
+                    down,
+                })
+            };
 
             layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
@@ -1830,19 +2057,89 @@ impl ModelWeights {
             });
         }
 
+        let mtp = if native_mtp {
+            let mtp_descriptor = descriptor.mtp.as_ref().ok_or_else(|| {
+                ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into())
+            })?;
+            let embedding_bytes = host_embedding.mtp_device_bytes().ok_or_else(|| {
+                ForgeError::Unsupported(
+                    "MTP hybrid obsługuje embedding Q8_0 lub GGUF NVFP4".into(),
+                )
+            })?;
+            let mut loader = SourceMtpLoader {
+                device,
+                source: src,
+            };
+            let mut weights = MtpWeights::load(
+                mtp_descriptor,
+                &descriptor.params,
+                &mut loader,
+                &token_embd_f16,
+                MtpEmbedding::HostF16,
+                &lm_head,
+            )?;
+            if matches!(&weights.embedding, MtpEmbedding::HostF16) {
+                let aligned_bytes = embedding_bytes
+                    .checked_add(255)
+                    .map(|bytes| bytes & !255)
+                    .ok_or_else(|| ForgeError::OutOfMemory {
+                        requested: embedding_bytes,
+                        available: device.pool_available(Pool::Weights).unwrap_or(0),
+                    })?;
+                let requested = aligned_bytes.checked_add(64 << 20).ok_or_else(|| {
+                    ForgeError::OutOfMemory {
+                        requested: aligned_bytes,
+                        available: device.pool_available(Pool::Weights).unwrap_or(0),
+                    }
+                })?;
+                let available = device.pool_available(Pool::Weights).unwrap_or(0);
+                let embedding_mode = std::env::var("FORGE_MTP_EMBEDDING")
+                    .unwrap_or_else(|_| "auto".into());
+                let use_device = match embedding_mode.as_str() {
+                    "auto" => available >= requested,
+                    "device" if available >= requested => true,
+                    "device" => {
+                        return Err(ForgeError::OutOfMemory {
+                            requested,
+                            available,
+                        })
+                    }
+                    "host" => false,
+                    value => {
+                        return Err(ForgeError::Unsupported(format!(
+                            "FORGE_MTP_EMBEDDING={value}: oczekiwano auto, device lub host"
+                        )))
+                    }
+                };
+                if use_device {
+                    match upload_weight(device, host_embedding) {
+                        Ok(embedding) => weights.embedding = MtpEmbedding::Device(embedding),
+                        Err(_) if embedding_mode == "auto" => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Some(weights)
+        } else {
+            None
+        };
+
         Ok(ModelWeights {
             descriptor,
             token_embd_f16,
             token_embd_host: Some(host_embed),
             output_norm,
             lm_head,
+            fp8_lm_head: None,
             layers,
             fused_qkv_layers: 0,
             fused_qk_layers: 0,
             fused_gate_up_layers: 0,
             w4a8: None,
             fp8: None,
+            fp8_ffn: None,
             fp8_modular: false,
+            mtp,
         })
     }
 
@@ -1975,18 +2272,154 @@ impl ModelWeights {
             "layers".into(),
             self.descriptor.params.block_count.to_string(),
         );
-        m.insert(
-            "fused_qkv_layers".into(),
-            self.fused_qkv_layers.to_string(),
-        );
-        m.insert(
-            "fused_qk_layers".into(),
-            self.fused_qk_layers.to_string(),
-        );
+        m.insert("fused_qkv_layers".into(), self.fused_qkv_layers.to_string());
+        m.insert("fused_qk_layers".into(), self.fused_qk_layers.to_string());
         m.insert(
             "fused_gate_up_layers".into(),
             self.fused_gate_up_layers.to_string(),
         );
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Nvfp4EmbeddingSource {
+        scale: f32,
+        scale_dims: Vec<usize>,
+    }
+
+    impl TensorSource for Nvfp4EmbeddingSource {
+        fn fetch(&self, name: &str) -> Result<TensorFetch> {
+            match name {
+                "token_embd.weight" => {
+                    let mut block = vec![0u8; 36];
+                    block[0] = 0x38;
+                    block[4] = 0x01;
+                    Ok((block, DType::U8, QuantKind::NVFP4Gguf, vec![1, 64]))
+                }
+                "token_embd.scale" => Ok((
+                    self.scale.to_le_bytes().to_vec(),
+                    DType::F32,
+                    QuantKind::None,
+                    self.scale_dims.clone(),
+                )),
+                _ => Err(ForgeError::Format(format!("brak tensora {name}"))),
+            }
+        }
+
+        fn fetch_optional(&self, name: &str) -> Result<Option<TensorFetch>> {
+            if name == "token_embd.scale" {
+                self.fetch(name).map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn fetch_nvfp4(&self, _name: &str) -> Result<Option<NvFp4Host>> {
+            Ok(None)
+        }
+
+        fn fetch_fp8(&self, _name: &str) -> Result<Option<Fp8Host>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn embedding_nvfp4_respektuje_skale_companion() {
+        let source = Nvfp4EmbeddingSource {
+            scale: 0.25,
+            scale_dims: vec![1],
+        };
+        let (host, weight, rows, cols) =
+            fetch_embedding_host(&source, "token_embd.weight").unwrap();
+        assert_eq!((rows, cols), (1, 64));
+        assert_eq!(host[0], f16::from_f32(0.125));
+        assert!(matches!(
+            weight,
+            HostWeight::NvFp4Gguf {
+                output_scale: 0.25,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn embedding_nvfp4_odrzuca_nieprawidlowa_skale_companion() {
+        for scale in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            let source = Nvfp4EmbeddingSource {
+                scale,
+                scale_dims: vec![1],
+            };
+            assert!(fetch_embedding_host(&source, "token_embd.weight").is_err());
+        }
+        let source = Nvfp4EmbeddingSource {
+            scale: 1.0,
+            scale_dims: vec![2],
+        };
+        assert!(fetch_embedding_host(&source, "token_embd.weight").is_err());
+    }
+
+    #[test]
+    fn keeps_gguf_nvfp4_in_native_layout() {
+        let mut block = vec![0u8; 36];
+        block[..4].copy_from_slice(&[0x38, 0x40, 0x48, 0x7f]);
+        for subblock in 0..4 {
+            block[4 + subblock * 8..4 + (subblock + 1) * 8]
+                .copy_from_slice(&[0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
+        }
+
+        let expected = block.clone();
+        let converted = quant_host_weight(
+            "weight",
+            block,
+            DType::U8,
+            QuantKind::NVFP4Gguf,
+            1,
+            64,
+            0.25,
+        )
+        .expect("zachowaj NVFP4");
+        let HostWeight::NvFp4Gguf {
+            data,
+            output_scale,
+            rows,
+            cols,
+        } = converted
+        else {
+            panic!("oczekiwano wagi GGUF NVFP4");
+        };
+        assert_eq!(rows, 1);
+        assert_eq!(cols, 64);
+        assert_eq!(output_scale, 0.25);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn rejects_invalid_gguf_nvfp4_layout() {
+        assert!(quant_host_weight(
+            "weight",
+            vec![0; 36],
+            DType::U8,
+            QuantKind::NVFP4Gguf,
+            1,
+            63,
+            1.0,
+        )
+        .is_err());
+        for output_scale in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            assert!(quant_host_weight(
+                "weight",
+                vec![0; 36],
+                DType::U8,
+                QuantKind::NVFP4Gguf,
+                1,
+                64,
+                output_scale,
+            )
+            .is_err());
+        }
     }
 }

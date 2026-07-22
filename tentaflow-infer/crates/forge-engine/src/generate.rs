@@ -6,7 +6,7 @@ use forge_types::{ForgeError, Result};
 use crate::model::Model;
 use crate::sample::{
     apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
-    TokenLogprob,
+    TokenLogprob, apply_penalties,
 };
 
 #[derive(Default)]
@@ -94,15 +94,17 @@ fn sample_cpu(
     sampler: &mut Sampler,
     matcher: &Option<forge_grammar::GrammarMatcher>,
     logits: &mut [f32],
-    tokens: &[u32],
+    history: &[u32],
+    generated_len: usize,
     req: &GenerateRequest,
 ) -> Result<(u32, Option<TokenLogprob>)> {
     apply_logit_bias(logits, &req.logit_bias);
-    suppress_eos(logits, &req.eos_ids, tokens.len(), req.min_tokens);
+    suppress_eos(logits, &req.eos_ids, generated_len, req.min_tokens);
     if let Some(m) = matcher {
         m.apply_mask(logits);
     }
-    let id = sampler.sample(logits, tokens)?;
+    apply_penalties(logits, history, sampler.params());
+    let id = sampler.sample_preprocessed(logits)?;
     let lp = req.logprobs.map(|n| compute_logprob(logits, id, n));
     Ok((id, lp))
 }
@@ -129,6 +131,9 @@ fn run(
     } else {
         NextSource::Cpu(Sampler::new(req.sampling.clone()))
     };
+    if let NextSource::Gpu(sampler) = &mut source {
+        sampler.note_tokens(&req.prompt_tokens);
+    }
     let mut decoder = StreamDecoder::new(tokenizer, true);
     let mut stops = StopMatcher::new(req.stop.clone());
 
@@ -140,12 +145,19 @@ fn run(
 
     let mut text = String::new();
     let mut tokens = Vec::new();
+    let mut sampling_history = if matches!(source, NextSource::Cpu(_))
+        && req.sampling.clone().sanitized().has_penalties()
+    {
+        req.prompt_tokens.clone()
+    } else {
+        Vec::new()
+    };
     let mut finish = FinishReason::Length;
 
     // First draw comes from the prefill logits (still resident on device for
     // the GPU path); subsequent draws ride the decode step.
     let (mut next, mut next_lp) = match &mut source {
-        NextSource::Cpu(s) => sample_cpu(s, &matcher, &mut logits, &tokens, req)?,
+        NextSource::Cpu(s) => sample_cpu(s, &matcher, &mut logits, &sampling_history, 0, req)?,
         NextSource::Gpu(g) => (model.sample_last_logits(g)?, None),
     };
     if let Some(m) = &mut matcher {
@@ -157,6 +169,9 @@ fn run(
             break;
         }
         tokens.push(next);
+        if !sampling_history.is_empty() {
+            sampling_history.push(next);
+        }
 
         let piece = decoder.push(next)?;
         if !piece.is_empty() {
@@ -181,7 +196,14 @@ fn run(
         match &mut source {
             NextSource::Cpu(s) => {
                 logits = model.step(seq, next)?;
-                let (id, lp) = sample_cpu(s, &matcher, &mut logits, &tokens, req)?;
+                let (id, lp) = sample_cpu(
+                    s,
+                    &matcher,
+                    &mut logits,
+                    &sampling_history,
+                    tokens.len(),
+                    req,
+                )?;
                 next = id;
                 next_lp = lp;
             }
@@ -231,4 +253,50 @@ fn run(
         finish,
         prompt_tokens: req.prompt_tokens.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_logprob_uzywa_logitow_po_karze_promptu() {
+        let req = GenerateRequest {
+            sampling: SamplingParams {
+                temperature: 0.0,
+                repetition_penalty: 2.0,
+                ..SamplingParams::default()
+            },
+            logprobs: Some(2),
+            ..GenerateRequest::default()
+        };
+        let mut sampler = Sampler::new(req.sampling.clone());
+        let mut logits = [0.0, 5.0, 4.0];
+
+        let (id, report) = sample_cpu(&mut sampler, &None, &mut logits, &[1], 0, &req).unwrap();
+
+        assert_eq!(id, 2);
+        assert_eq!(logits[1], 2.5);
+        assert_eq!(report.unwrap().top[0].0, 2);
+    }
+
+    #[test]
+    fn prompt_nie_wlicza_sie_do_min_tokens() {
+        let req = GenerateRequest {
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            eos_ids: vec![1],
+            min_tokens: 2,
+            ..GenerateRequest::default()
+        };
+        let mut sampler = Sampler::new(req.sampling.clone());
+        let mut logits = [1.0, 5.0];
+
+        let (id, _) = sample_cpu(&mut sampler, &None, &mut logits, &[7, 8, 9], 0, &req).unwrap();
+
+        assert_eq!(id, 0);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+    }
 }

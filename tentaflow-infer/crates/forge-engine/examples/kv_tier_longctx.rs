@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             watermark: 0.10,
         },
         prefix_cache: false,
+        native_mtp: false,
     };
     // The engine's paged KV slabs + (hybrid) SSM state allocate from the
     // WEIGHTS pool, not the HAL kv_cache pool, so keep the latter tiny (a full

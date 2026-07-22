@@ -401,21 +401,33 @@ const TOTAL_IMPORT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 /// Setting key: when truthy, model-bundle pulls may reach loopback/private/
 /// link-local hosts. Absent/false → deny (the safe default).
 const ALLOW_PRIVATE_HOSTS_SETTING: &str = "vision_bundle_allow_private_hosts";
+const ALLOW_INVALID_TLS_SETTING: &str = "vision_bundle_allow_invalid_tls";
 
-/// Whether the admin opted into pulling from private/LAN hosts. Deploy-time
-/// only, read from the global settings row.
-fn allow_private_bundle_hosts() -> bool {
+/// Read a boolean global setting (accepts `1`/`true`/`yes`), default false.
+fn bundle_bool_setting(key: &str) -> bool {
     crate::db::global_pool()
-        .and_then(|pool| {
-            crate::db::repository::get_setting(&pool, ALLOW_PRIVATE_HOSTS_SETTING)
-                .ok()
-                .flatten()
-        })
+        .and_then(|pool| crate::db::repository::get_setting(&pool, key).ok().flatten())
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "yes"
         })
         .unwrap_or(false)
+}
+
+/// Whether the admin opted into pulling from private/LAN hosts. Deploy-time
+/// only, read from the global settings row.
+fn allow_private_bundle_hosts() -> bool {
+    bundle_bool_setting(ALLOW_PRIVATE_HOSTS_SETTING)
+}
+
+/// Whether the admin opted into accepting self-signed / otherwise-invalid TLS
+/// certificates when pulling a bundle or shared project. Cross-instance and
+/// intra-fleet nodes commonly serve self-signed certs; this opt-in (default
+/// false → full validation) mirrors the `curl -k` intra-fleet trust the deploy
+/// runbook assumes. It weakens transport authentication (MITM), so it is
+/// deliberately off unless an admin sets it for a trusted fleet.
+fn allow_invalid_bundle_tls() -> bool {
+    bundle_bool_setting(ALLOW_INVALID_TLS_SETTING)
 }
 
 /// Resolve `base`'s host to socket addresses and reject non-public IPs unless
@@ -510,7 +522,7 @@ fn per_file_ceiling(declared_size: u64, cumulative: u64) -> std::result::Result<
 /// Read a manifest response body with a hard cap. Content-Length MUST be
 /// present and within the cap, and the body is streamed with a running counter
 /// so a lying (or absent-then-huge) body is aborted before it is buffered.
-async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8>> {
+pub(crate) async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8>> {
     match response.content_length() {
         Some(len) if len <= MANIFEST_BODY_LIMIT => {}
         Some(_) => {
@@ -549,7 +561,7 @@ async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8
 /// Drop `?<query>` fragments from an error message so signed-URL tokens never
 /// land in deploy logs. Everything from a `?` to the next whitespace/quote is
 /// replaced with `?<redacted>`.
-fn redact_query_strings(msg: &str) -> String {
+pub(crate) fn redact_query_strings(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut skipping = false;
     for c in msg.chars() {
@@ -853,17 +865,21 @@ async fn download_signed_file(
 /// compromised serving node must not be able to bounce the pull (with its
 /// Bearer key) to an arbitrary destination. Pinning the resolved address closes
 /// the DNS-rebind window between the SSRF check and connect.
-fn bundle_http_client(base: &reqwest::Url) -> Result<reqwest::Client> {
+pub(crate) fn bundle_http_client(base: &reqwest::Url) -> Result<reqwest::Client> {
     let host = base
         .host_str()
         .ok_or_else(|| anyhow!("bundle URL has no host"))?;
     let addrs = vet_bundle_host(base)?;
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(600))
         .connect_timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
-        .resolve_to_addrs(host, &addrs)
+        .resolve_to_addrs(host, &addrs);
+    if allow_invalid_bundle_tls() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder
         .build()
         .map_err(|e| anyhow!("build HTTP client: {}", e))
 }

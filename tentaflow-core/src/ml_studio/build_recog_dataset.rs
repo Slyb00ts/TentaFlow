@@ -48,8 +48,8 @@ const CATEGORIES: &[&str] = &[
 
 // Server-side caps — UI caps are bypassable, so these are the real limits enforced
 // in Rust before any tool runs.
-const FPS_MIN: u32 = 1;
-const FPS_MAX: u32 = 30;
+pub(crate) const FPS_MIN: u32 = 1;
+pub(crate) const FPS_MAX: u32 = 30;
 /// Max staged source files consumed by a single build.
 const MAX_SOURCE_FILES: usize = 2000;
 /// Max images a single build may produce across all sources (copies + frames).
@@ -665,51 +665,64 @@ fn process_source(src: &Path, train_dir: &Path, fps: u32, frame_budget: u64) -> 
             }
             Ok(1)
         }
-        "mp4" | "mov" => {
-            // Per-video frame cap: min of the hard per-clip limit and the remaining
-            // global budget. ffmpeg `-frames:v` bounds extraction server-side.
-            let cap = MAX_FRAMES_PER_VIDEO.min(frame_budget);
-            if cap == 0 {
-                anyhow::bail!("przekroczono globalny limit obrazów");
-            }
-            // Pattern uses %04d → up to 9999 frames per clip; start at 1.
-            let pattern = train_dir.join(format!("{}_f%04d.jpg", stem));
-            // Wrapped in OS `timeout` so a corrupt clip can't hang the build.
-            let status = std::process::Command::new("timeout")
-                .arg(PER_FILE_TIMEOUT_SECS.to_string())
-                .arg("ffmpeg")
-                .arg("-y")
-                .arg("-i")
-                .arg(src)
-                .args(["-vf", &format!("fps={}", fps)])
-                .args(["-frames:v", &cap.to_string()])
-                .args(["-q:v", "2"])
-                .args(["-start_number", "1"])
-                .arg(&pattern)
-                .status()
-                .with_context(|| "uruchomienie ffmpeg (czy zainstalowany?)")?;
-            if !status.success() {
-                if status.code() == Some(124) {
-                    anyhow::bail!("ffmpeg przekroczył limit czasu dla {}", src.display());
-                }
-                anyhow::bail!("ffmpeg zwrócił błąd dla {}", src.display());
-            }
-            // Count the frames actually written for this clip's prefix.
-            let prefix = format!("{}_f", stem);
-            let mut produced = 0u64;
-            for entry in std::fs::read_dir(train_dir)?.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with(&prefix) && name.ends_with(".jpg") {
-                    produced += 1;
-                }
-            }
-            Ok(produced)
-        }
+        "mp4" | "mov" => extract_video_frames(src, train_dir, fps, &stem, frame_budget),
         other => {
             anyhow::bail!("nieobsługiwany typ pliku: .{}", other);
         }
     }
+}
+
+/// Decodes a video clip into `<stem>_f%04d.jpg` frames inside `out_dir` and returns
+/// how many frames were actually written for that prefix (never estimated from
+/// duration). `frame_budget` is the remaining global allowance; the per-clip cap is
+/// the min of it and the hard per-video limit. Shared by the dataset build and the
+/// TentaVision recording import so both decode segments identically.
+pub(crate) fn extract_video_frames(
+    src: &Path,
+    out_dir: &Path,
+    fps: u32,
+    stem: &str,
+    frame_budget: u64,
+) -> Result<u64> {
+    // Per-video frame cap: min of the hard per-clip limit and the remaining
+    // global budget. ffmpeg `-frames:v` bounds extraction server-side.
+    let cap = MAX_FRAMES_PER_VIDEO.min(frame_budget);
+    if cap == 0 {
+        anyhow::bail!("przekroczono globalny limit obrazów");
+    }
+    // Pattern uses %04d → up to 9999 frames per clip; start at 1.
+    let pattern = out_dir.join(format!("{}_f%04d.jpg", stem));
+    // Wrapped in OS `timeout` so a corrupt clip can't hang the build.
+    let status = std::process::Command::new("timeout")
+        .arg(PER_FILE_TIMEOUT_SECS.to_string())
+        .arg("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(src)
+        .args(["-vf", &format!("fps={}", fps)])
+        .args(["-frames:v", &cap.to_string()])
+        .args(["-q:v", "2"])
+        .args(["-start_number", "1"])
+        .arg(&pattern)
+        .status()
+        .with_context(|| "uruchomienie ffmpeg (czy zainstalowany?)")?;
+    if !status.success() {
+        if status.code() == Some(124) {
+            anyhow::bail!("ffmpeg przekroczył limit czasu dla {}", src.display());
+        }
+        anyhow::bail!("ffmpeg zwrócił błąd dla {}", src.display());
+    }
+    // Count the frames actually written for this clip's prefix.
+    let prefix = format!("{}_f", stem);
+    let mut produced = 0u64;
+    for entry in std::fs::read_dir(out_dir)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".jpg") {
+            produced += 1;
+        }
+    }
+    Ok(produced)
 }
 
 /// Writes `_annotations.coco.json` describing every jpg/png in `train_dir`, with

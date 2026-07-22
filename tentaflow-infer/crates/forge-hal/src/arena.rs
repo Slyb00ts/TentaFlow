@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 /// Alignment applied to every sub-allocation. 256 B satisfies all CUDA
 /// texture/vector-load requirements and keeps kernels free to use the widest
 /// load instructions.
-pub(crate) const ALLOC_ALIGN: usize = 256;
+pub(crate) use crate::DEVICE_ALLOC_ALIGN as ALLOC_ALIGN;
 
 // Checked: near-usize::MAX requests must surface as OOM, not wrap around and
 // alias live allocations in release builds.
@@ -45,6 +45,10 @@ impl BumpArena {
         let offset = self.cursor;
         self.cursor = end;
         Ok(offset)
+    }
+
+    pub(crate) fn available(&self) -> usize {
+        self.capacity - self.cursor
     }
 }
 
@@ -174,6 +178,10 @@ impl RingArena {
         }
     }
 
+    pub(crate) fn available(&self) -> usize {
+        self.capacity - self.cursor
+    }
+
     pub(crate) fn reset(&mut self) -> Result<u64> {
         if self.live > 0 {
             return Err(ForgeError::Device(format!(
@@ -197,7 +205,9 @@ mod tests {
         assert_eq!(a.alloc(1).unwrap(), 0);
         assert_eq!(a.alloc(300).unwrap(), 256);
         // 1 B rounded to 256, 300 B rounded to 512 → cursor at 768.
+        assert_eq!(a.available(), 256);
         assert_eq!(a.alloc(256).unwrap(), 768);
+        assert_eq!(a.available(), 0);
         assert!(matches!(
             a.alloc(512),
             Err(ForgeError::OutOfMemory { .. })

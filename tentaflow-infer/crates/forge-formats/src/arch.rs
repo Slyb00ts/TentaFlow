@@ -183,6 +183,7 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/olmoe.ron"),
     include_str!("../arch/qwen3moe.ron"),
     include_str!("../arch/qwen35moe.ron"),
+    include_str!("../arch/qwen35.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -254,6 +255,46 @@ pub struct Hyperparams {
     pub attn_gated: bool,
 }
 
+/// Rola tensora należącego do jednej warstwy NextN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MtpWeightRole {
+    Embedding,
+    SharedHead,
+    AttnK,
+    AttnKNorm,
+    AttnNorm,
+    AttnO,
+    AttnQ,
+    AttnQNorm,
+    AttnV,
+    FfnDown,
+    FfnGate,
+    FfnUp,
+    FfnNorm,
+    EhProj,
+    ENorm,
+    HNorm,
+    SharedHeadNorm,
+    FfnGateInp,
+    FfnGateExps,
+    FfnUpExps,
+    FfnDownExps,
+    FfnGateShExp,
+    FfnUpShExp,
+    FfnDownShExp,
+    FfnGateInpShExp,
+}
+
+/// Zakres bloków NextN zapisanych po trunku modelu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtpDescriptor {
+    pub first_block: usize,
+    pub block_count: usize,
+    pub layers: Vec<HashMap<MtpWeightRole, String>>,
+    pub share_target_embedding: bool,
+    pub share_target_output: bool,
+}
+
 /// Architecture + hyperparams + fully resolved weight-name map.
 #[derive(Debug, Clone)]
 pub struct ModelDescriptor {
@@ -266,10 +307,207 @@ pub struct ModelDescriptor {
     /// Per-layer computation kind. All `Attention` for non-hybrid models;
     /// interleaved `Attention`/`DeltaNet` for `qwen35moe`. Index = layer.
     pub layer_kinds: Vec<LayerKind>,
+    /// Bloki MTP są opisane osobno i nie wchodzą do podstawowego forwardu.
+    pub mtp: Option<MtpDescriptor>,
 }
 
 fn expand(template: &str, layer: usize) -> String {
     template.replace("{layer}", &layer.to_string())
+}
+
+fn checked_block_counts(gguf: &Gguf, key: &str) -> Result<(usize, usize)> {
+    let block_count_all = gguf
+        .get_u64(&format!("{key}.block_count"))
+        .ok_or_else(|| fmt_err(format!("gguf: missing metadata key {key}.block_count")))?;
+    let block_count_all = usize::try_from(block_count_all)
+        .map_err(|_| fmt_err("gguf: block_count does not fit usize"))?;
+    if block_count_all > gguf.tensors().len() {
+        return Err(fmt_err(format!(
+            "gguf: block_count {block_count_all} exceeds tensor count {}",
+            gguf.tensors().len()
+        )));
+    }
+    let nextn = gguf
+        .get_u64(&format!("{key}.nextn_predict_layers"))
+        .unwrap_or(0);
+    let nextn = usize::try_from(nextn)
+        .map_err(|_| fmt_err("gguf: nextn_predict_layers does not fit usize"))?;
+    let block_count = block_count_all.checked_sub(nextn).ok_or_else(|| {
+        fmt_err(format!(
+            "gguf: nextn_predict_layers {nextn} exceeds block_count {block_count_all}"
+        ))
+    })?;
+    if nextn > 0 && block_count == 0 {
+        return Err(fmt_err(
+            "gguf: nextn_predict_layers nie może obejmować całego trunku",
+        ));
+    }
+    Ok((block_count, nextn))
+}
+
+fn required_mtp_tensor(
+    gguf: &Gguf,
+    weights: &mut HashMap<MtpWeightRole, String>,
+    role: MtpWeightRole,
+    name: String,
+) -> Result<()> {
+    if gguf.tensor(&name).is_none() {
+        return Err(fmt_err(format!("gguf: MTP requires tensor '{name}'")));
+    }
+    weights.insert(role, name);
+    Ok(())
+}
+
+fn optional_mtp_tensor(
+    gguf: &Gguf,
+    weights: &mut HashMap<MtpWeightRole, String>,
+    role: MtpWeightRole,
+    name: String,
+) {
+    if gguf.tensor(&name).is_some() {
+        weights.insert(role, name);
+    }
+}
+
+fn build_dense_mtp(
+    gguf: &Gguf,
+    spec: &ArchSpec,
+    first_block: usize,
+    block_count: usize,
+) -> Result<Option<MtpDescriptor>> {
+    if block_count == 0 {
+        return Ok(None);
+    }
+    let role_map = [
+        (WeightRole::AttnK, MtpWeightRole::AttnK),
+        (WeightRole::AttnKNorm, MtpWeightRole::AttnKNorm),
+        (WeightRole::AttnNorm, MtpWeightRole::AttnNorm),
+        (WeightRole::AttnO, MtpWeightRole::AttnO),
+        (WeightRole::AttnQ, MtpWeightRole::AttnQ),
+        (WeightRole::AttnQNorm, MtpWeightRole::AttnQNorm),
+        (WeightRole::AttnV, MtpWeightRole::AttnV),
+        (WeightRole::FfnDown, MtpWeightRole::FfnDown),
+        (WeightRole::FfnGate, MtpWeightRole::FfnGate),
+        (WeightRole::FfnUp, MtpWeightRole::FfnUp),
+        (WeightRole::FfnNorm, MtpWeightRole::FfnNorm),
+    ];
+    let mut layers = Vec::with_capacity(block_count);
+    for block in first_block..first_block + block_count {
+        let mut weights = HashMap::with_capacity(15);
+        for (weight_role, mtp_role) in role_map {
+            let template = spec
+                .roles
+                .iter()
+                .find(|entry| entry.role == weight_role && entry.per_layer)
+                .ok_or_else(|| {
+                    fmt_err(format!(
+                        "{} spec missing MTP role {weight_role:?}",
+                        spec.name
+                    ))
+                })?;
+            required_mtp_tensor(gguf, &mut weights, mtp_role, expand(&template.gguf, block))?;
+        }
+        for (role, suffix) in [
+            (MtpWeightRole::EhProj, "eh_proj.weight"),
+            (MtpWeightRole::ENorm, "enorm.weight"),
+            (MtpWeightRole::HNorm, "hnorm.weight"),
+            (MtpWeightRole::SharedHeadNorm, "shared_head_norm.weight"),
+        ] {
+            required_mtp_tensor(
+                gguf,
+                &mut weights,
+                role,
+                format!("blk.{block}.nextn.{suffix}"),
+            )?;
+        }
+        optional_mtp_tensor(
+            gguf,
+            &mut weights,
+            MtpWeightRole::Embedding,
+            format!("blk.{block}.nextn.embed_tokens.weight"),
+        );
+        optional_mtp_tensor(
+            gguf,
+            &mut weights,
+            MtpWeightRole::SharedHead,
+            format!("blk.{block}.nextn.shared_head_head.weight"),
+        );
+        layers.push(weights);
+    }
+    Ok(Some(MtpDescriptor {
+        first_block,
+        block_count,
+        layers,
+        share_target_embedding: true,
+        share_target_output: true,
+    }))
+}
+
+fn build_moe_mtp(
+    gguf: &Gguf,
+    first_block: usize,
+    block_count: usize,
+) -> Result<Option<MtpDescriptor>> {
+    if block_count == 0 {
+        return Ok(None);
+    }
+    let mut layers = Vec::with_capacity(block_count);
+    for block in first_block..first_block + block_count {
+        let mut weights = HashMap::with_capacity(20);
+        for (role, suffix) in [
+            (MtpWeightRole::AttnK, "attn_k.weight"),
+            (MtpWeightRole::AttnKNorm, "attn_k_norm.weight"),
+            (MtpWeightRole::AttnNorm, "attn_norm.weight"),
+            (MtpWeightRole::AttnO, "attn_output.weight"),
+            (MtpWeightRole::AttnQ, "attn_q.weight"),
+            (MtpWeightRole::AttnQNorm, "attn_q_norm.weight"),
+            (MtpWeightRole::AttnV, "attn_v.weight"),
+            (MtpWeightRole::FfnGateInp, "ffn_gate_inp.weight"),
+            (MtpWeightRole::FfnGateExps, "ffn_gate_exps.weight"),
+            (MtpWeightRole::FfnUpExps, "ffn_up_exps.weight"),
+            (MtpWeightRole::FfnDownExps, "ffn_down_exps.weight"),
+            (MtpWeightRole::FfnGateShExp, "ffn_gate_shexp.weight"),
+            (MtpWeightRole::FfnUpShExp, "ffn_up_shexp.weight"),
+            (MtpWeightRole::FfnDownShExp, "ffn_down_shexp.weight"),
+            (MtpWeightRole::FfnGateInpShExp, "ffn_gate_inp_shexp.weight"),
+            (MtpWeightRole::FfnNorm, "post_attention_norm.weight"),
+        ] {
+            required_mtp_tensor(gguf, &mut weights, role, format!("blk.{block}.{suffix}"))?;
+        }
+        for (role, suffix) in [
+            (MtpWeightRole::EhProj, "eh_proj.weight"),
+            (MtpWeightRole::ENorm, "enorm.weight"),
+            (MtpWeightRole::HNorm, "hnorm.weight"),
+            (MtpWeightRole::SharedHeadNorm, "shared_head_norm.weight"),
+        ] {
+            required_mtp_tensor(
+                gguf,
+                &mut weights,
+                role,
+                format!("blk.{block}.nextn.{suffix}"),
+            )?;
+        }
+        optional_mtp_tensor(
+            gguf,
+            &mut weights,
+            MtpWeightRole::Embedding,
+            format!("blk.{block}.nextn.embed_tokens.weight"),
+        );
+        optional_mtp_tensor(
+            gguf,
+            &mut weights,
+            MtpWeightRole::SharedHead,
+            format!("blk.{block}.nextn.shared_head_head.weight"),
+        );
+        layers.push(weights);
+    }
+    Ok(Some(MtpDescriptor {
+        first_block,
+        block_count,
+        layers,
+        share_target_embedding: true,
+        share_target_output: true,
+    }))
 }
 
 impl ModelDescriptor {
@@ -285,8 +523,8 @@ impl ModelDescriptor {
                 ForgeError::Unsupported(format!("no architecture spec for gguf arch '{arch}'"))
             })?;
 
-        if arch == "qwen35moe" {
-            return build_qwen35moe(gguf, spec);
+        if matches!(arch, "qwen35" | "qwen35moe") {
+            return build_qwen35_hybrid(gguf, spec);
         }
 
         let key = |suffix: &str| format!("{arch}.{suffix}");
@@ -299,10 +537,8 @@ impl ModelDescriptor {
         // `nextn_predict_layers` blocks; they are not part of the autoregressive
         // main forward, so drop them from the transformer stack (basic decode
         // never runs them and they carry non-standard tensors).
-        let nextn = gguf
-            .get_u64(&key("nextn_predict_layers"))
-            .unwrap_or(0) as usize;
-        let block_count = req_u("block_count")?.saturating_sub(nextn);
+        let (block_count, nextn) = checked_block_counts(gguf, arch)?;
+        let mtp = build_dense_mtp(gguf, spec, block_count, nextn)?;
         let hidden_size = req_u("embedding_length")?;
         let n_heads = req_u("attention.head_count")?;
         let n_kv_heads = gguf
@@ -371,7 +607,12 @@ impl ModelDescriptor {
             let n_experts_used = gguf
                 .get_u64(&key("expert_used_count"))
                 .map(|v| v as usize)
-                .ok_or_else(|| fmt_err(format!("gguf: MoE model missing {}", key("expert_used_count"))))?;
+                .ok_or_else(|| {
+                    fmt_err(format!(
+                        "gguf: MoE model missing {}",
+                        key("expert_used_count")
+                    ))
+                })?;
             let moe_intermediate_size = gguf
                 .get_u64(&key("expert_feed_forward_length"))
                 .map(|v| v as usize)
@@ -437,6 +678,7 @@ impl ModelDescriptor {
             globals,
             layers,
             layer_kinds: vec![LayerKind::Attention; block_count],
+            mtp,
         })
     }
 
@@ -505,6 +747,7 @@ impl ModelDescriptor {
             globals,
             layers,
             layer_kinds: vec![LayerKind::Attention; block_count],
+            mtp: None,
         })
     }
 }
@@ -515,17 +758,15 @@ impl ModelDescriptor {
 /// (`(idx+1) % interval == 0`) is attention; the rest are DeltaNet. The final
 /// `nextn_predict_layers` blocks are MTP/NextN speculation heads and are
 /// dropped from the autoregressive stack (basic decode never runs them).
-fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
-    let key = |suffix: &str| format!("qwen35moe.{suffix}");
+fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
+    let key = |suffix: &str| format!("{}.{suffix}", spec.gguf_arch);
     let req_u = |suffix: &str| {
         gguf.get_u64(&key(suffix))
             .map(|v| v as usize)
             .ok_or_else(|| fmt_err(format!("gguf: missing metadata key {}", key(suffix))))
     };
 
-    let block_count_all = req_u("block_count")?;
-    let nextn = gguf.get_u64(&key("nextn_predict_layers")).unwrap_or(0) as usize;
-    let block_count = block_count_all.saturating_sub(nextn);
+    let (block_count, nextn) = checked_block_counts(gguf, &spec.gguf_arch)?;
     let hidden_size = req_u("embedding_length")?;
     let n_heads = req_u("attention.head_count")?;
     let n_kv_heads = gguf
@@ -564,7 +805,10 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
     let rope_sections = gguf
         .get_array(&key("rope.dimension_sections"))
         .and_then(|a| {
-            let v: Vec<u32> = a.iter().filter_map(|e| e.as_u64().map(|x| x as u32)).collect();
+            let v: Vec<u32> = a
+                .iter()
+                .filter_map(|e| e.as_u64().map(|x| x as u32))
+                .collect();
             if v.len() >= 4 {
                 Some([v[0], v[1], v[2], v[3]])
             } else {
@@ -572,26 +816,37 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
             }
         });
 
-    // Routed experts + always-on gated shared expert.
-    let n_experts = req_u("expert_count")?;
-    let n_experts_used = req_u("expert_used_count")?;
-    let moe_intermediate_size = gguf
-        .get_u64(&key("expert_feed_forward_length"))
-        .map(|v| v as usize)
-        .unwrap_or(feed_forward_length);
-    let shared_intermediate_size = gguf
-        .get_u64(&key("expert_shared_feed_forward_length"))
-        .map(|v| v as usize)
-        .unwrap_or(0);
-    let moe = Some(MoeParams {
-        n_experts,
-        n_experts_used,
-        moe_intermediate_size,
-        // qwen35moe renormalizes the top-k softmax weights (build_moe_ffn
-        // norm_w = true in the reference graph).
-        norm_topk_prob: true,
-        shared_intermediate_size,
-    });
+    let n_experts = gguf.get_u64(&key("expert_count")).unwrap_or(0) as usize;
+    let moe = if n_experts > 0 {
+        let n_experts_used = req_u("expert_used_count")?;
+        let moe_intermediate_size = gguf
+            .get_u64(&key("expert_feed_forward_length"))
+            .map(|v| v as usize)
+            .unwrap_or(feed_forward_length);
+        let shared_intermediate_size = gguf
+            .get_u64(&key("expert_shared_feed_forward_length"))
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        Some(MoeParams {
+            n_experts,
+            n_experts_used,
+            moe_intermediate_size,
+            norm_topk_prob: true,
+            shared_intermediate_size,
+        })
+    } else {
+        None
+    };
+    if moe.is_some() && nextn > 0 {
+        return Err(fmt_err(
+            "qwen35moe: natywny runtime MTP nie obsługuje jeszcze bloku MoE",
+        ));
+    }
+    let mtp = if moe.is_some() {
+        build_moe_mtp(gguf, block_count, nextn)?
+    } else {
+        build_dense_mtp(gguf, spec, block_count, nextn)?
+    };
 
     let vocab_size = gguf
         .tensor("token_embd.weight")
@@ -609,7 +864,10 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
             .map(|r| r.gguf.clone())
             .ok_or_else(|| fmt_err(format!("qwen35moe spec missing global role {role:?}")))?;
         if gguf.tensor(&name).is_none() {
-            return Err(fmt_err(format!("qwen35moe: missing global tensor '{name}'")));
+            return Err(fmt_err(format!(
+                "{}: missing global tensor '{name}'",
+                spec.name
+            )));
         }
         globals.insert(role, name);
     }
@@ -620,13 +878,14 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
     }
 
     // Common per-layer roles shared by both attention and DeltaNet layers.
-    let insert = |m: &mut HashMap<WeightRole, String>, role: WeightRole, name: String| -> Result<()> {
-        if gguf.tensor(&name).is_none() {
-            return Err(fmt_err(format!("qwen35moe: missing tensor '{name}'")));
-        }
-        m.insert(role, name);
-        Ok(())
-    };
+    let insert =
+        |m: &mut HashMap<WeightRole, String>, role: WeightRole, name: String| -> Result<()> {
+            if gguf.tensor(&name).is_none() {
+                return Err(fmt_err(format!("qwen35moe: missing tensor '{name}'")));
+            }
+            m.insert(role, name);
+            Ok(())
+        };
 
     let mut layers: Vec<HashMap<WeightRole, String>> = Vec::with_capacity(block_count);
     let mut layer_kinds = Vec::with_capacity(block_count);
@@ -637,9 +896,17 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
             LayerKind::DeltaNet
         };
         let mut m = HashMap::new();
-        insert(&mut m, WeightRole::AttnNorm, format!("blk.{il}.attn_norm.weight"))?;
+        insert(
+            &mut m,
+            WeightRole::AttnNorm,
+            format!("blk.{il}.attn_norm.weight"),
+        )?;
         // Post-attention norm feeds the MoE FFN (GGUF: post_attention_norm).
-        insert(&mut m, WeightRole::FfnNorm, format!("blk.{il}.post_attention_norm.weight"))?;
+        insert(
+            &mut m,
+            WeightRole::FfnNorm,
+            format!("blk.{il}.post_attention_norm.weight"),
+        )?;
 
         match kind {
             LayerKind::Attention => {
@@ -647,32 +914,117 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
                 insert(&mut m, WeightRole::AttnQ, format!("blk.{il}.attn_q.weight"))?;
                 insert(&mut m, WeightRole::AttnK, format!("blk.{il}.attn_k.weight"))?;
                 insert(&mut m, WeightRole::AttnV, format!("blk.{il}.attn_v.weight"))?;
-                insert(&mut m, WeightRole::AttnO, format!("blk.{il}.attn_output.weight"))?;
-                insert(&mut m, WeightRole::AttnQNorm, format!("blk.{il}.attn_q_norm.weight"))?;
-                insert(&mut m, WeightRole::AttnKNorm, format!("blk.{il}.attn_k_norm.weight"))?;
+                insert(
+                    &mut m,
+                    WeightRole::AttnO,
+                    format!("blk.{il}.attn_output.weight"),
+                )?;
+                insert(
+                    &mut m,
+                    WeightRole::AttnQNorm,
+                    format!("blk.{il}.attn_q_norm.weight"),
+                )?;
+                insert(
+                    &mut m,
+                    WeightRole::AttnKNorm,
+                    format!("blk.{il}.attn_k_norm.weight"),
+                )?;
             }
             LayerKind::DeltaNet => {
-                insert(&mut m, WeightRole::SsmInProj, format!("blk.{il}.attn_qkv.weight"))?;
-                insert(&mut m, WeightRole::SsmGate, format!("blk.{il}.attn_gate.weight"))?;
-                insert(&mut m, WeightRole::SsmConv1d, format!("blk.{il}.ssm_conv1d.weight"))?;
+                insert(
+                    &mut m,
+                    WeightRole::SsmInProj,
+                    format!("blk.{il}.attn_qkv.weight"),
+                )?;
+                insert(
+                    &mut m,
+                    WeightRole::SsmGate,
+                    format!("blk.{il}.attn_gate.weight"),
+                )?;
+                insert(
+                    &mut m,
+                    WeightRole::SsmConv1d,
+                    format!("blk.{il}.ssm_conv1d.weight"),
+                )?;
                 insert(&mut m, WeightRole::SsmDt, format!("blk.{il}.ssm_dt.bias"))?;
                 insert(&mut m, WeightRole::SsmA, format!("blk.{il}.ssm_a"))?;
-                insert(&mut m, WeightRole::SsmBeta, format!("blk.{il}.ssm_beta.weight"))?;
-                insert(&mut m, WeightRole::SsmAlpha, format!("blk.{il}.ssm_alpha.weight"))?;
-                insert(&mut m, WeightRole::SsmNorm, format!("blk.{il}.ssm_norm.weight"))?;
-                insert(&mut m, WeightRole::SsmOut, format!("blk.{il}.ssm_out.weight"))?;
+                insert(
+                    &mut m,
+                    WeightRole::SsmBeta,
+                    format!("blk.{il}.ssm_beta.weight"),
+                )?;
+                insert(
+                    &mut m,
+                    WeightRole::SsmAlpha,
+                    format!("blk.{il}.ssm_alpha.weight"),
+                )?;
+                insert(
+                    &mut m,
+                    WeightRole::SsmNorm,
+                    format!("blk.{il}.ssm_norm.weight"),
+                )?;
+                insert(
+                    &mut m,
+                    WeightRole::SsmOut,
+                    format!("blk.{il}.ssm_out.weight"),
+                )?;
             }
         }
 
-        // Routed experts + gated shared expert (present on every trunk layer).
-        insert(&mut m, WeightRole::FfnGateInp, format!("blk.{il}.ffn_gate_inp.weight"))?;
-        insert(&mut m, WeightRole::FfnGateExps, format!("blk.{il}.ffn_gate_exps.weight"))?;
-        insert(&mut m, WeightRole::FfnUpExps, format!("blk.{il}.ffn_up_exps.weight"))?;
-        insert(&mut m, WeightRole::FfnDownExps, format!("blk.{il}.ffn_down_exps.weight"))?;
-        insert(&mut m, WeightRole::FfnGateShExp, format!("blk.{il}.ffn_gate_shexp.weight"))?;
-        insert(&mut m, WeightRole::FfnUpShExp, format!("blk.{il}.ffn_up_shexp.weight"))?;
-        insert(&mut m, WeightRole::FfnDownShExp, format!("blk.{il}.ffn_down_shexp.weight"))?;
-        insert(&mut m, WeightRole::FfnGateInpShExp, format!("blk.{il}.ffn_gate_inp_shexp.weight"))?;
+        if moe.is_some() {
+            insert(
+                &mut m,
+                WeightRole::FfnGateInp,
+                format!("blk.{il}.ffn_gate_inp.weight"),
+            )?;
+            insert(
+                &mut m,
+                WeightRole::FfnGateExps,
+                format!("blk.{il}.ffn_gate_exps.weight"),
+            )?;
+            insert(
+                &mut m,
+                WeightRole::FfnUpExps,
+                format!("blk.{il}.ffn_up_exps.weight"),
+            )?;
+            insert(
+                &mut m,
+                WeightRole::FfnDownExps,
+                format!("blk.{il}.ffn_down_exps.weight"),
+            )?;
+            insert(
+                &mut m,
+                WeightRole::FfnGateShExp,
+                format!("blk.{il}.ffn_gate_shexp.weight"),
+            )?;
+            insert(
+                &mut m,
+                WeightRole::FfnUpShExp,
+                format!("blk.{il}.ffn_up_shexp.weight"),
+            )?;
+            insert(
+                &mut m,
+                WeightRole::FfnDownShExp,
+                format!("blk.{il}.ffn_down_shexp.weight"),
+            )?;
+            insert(
+                &mut m,
+                WeightRole::FfnGateInpShExp,
+                format!("blk.{il}.ffn_gate_inp_shexp.weight"),
+            )?;
+        } else {
+            insert(
+                &mut m,
+                WeightRole::FfnGate,
+                format!("blk.{il}.ffn_gate.weight"),
+            )?;
+            insert(&mut m, WeightRole::FfnUp, format!("blk.{il}.ffn_up.weight"))?;
+            insert(
+                &mut m,
+                WeightRole::FfnDown,
+                format!("blk.{il}.ffn_down.weight"),
+            )?;
+        }
 
         layers.push(m);
         layer_kinds.push(kind);
@@ -680,7 +1032,10 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
 
     // The MoE expert scratch is sized from intermediate_size; fold the expert
     // and shared-expert FFN widths into it.
-    let intermediate_size = moe_intermediate_size.max(shared_intermediate_size);
+    let intermediate_size = moe
+        .as_ref()
+        .map(|m| m.moe_intermediate_size.max(m.shared_intermediate_size))
+        .unwrap_or(feed_forward_length);
 
     Ok(ModelDescriptor {
         arch: spec.name.clone(),
@@ -708,27 +1063,220 @@ fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
         globals,
         layers,
         layer_kinds,
+        mtp,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    struct SyntheticTensor {
+        name: String,
+        dims: Vec<u64>,
+        ggml_type: u32,
+        data: Vec<u8>,
+    }
+
+    fn write_string(output: &mut Vec<u8>, value: &str) {
+        output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    fn metadata_u32(key: &str, value: u32) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_string(&mut output, key);
+        output.extend_from_slice(&4u32.to_le_bytes());
+        output.extend_from_slice(&value.to_le_bytes());
+        output
+    }
+
+    fn metadata_f32(key: &str, value: f32) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_string(&mut output, key);
+        output.extend_from_slice(&6u32.to_le_bytes());
+        output.extend_from_slice(&value.to_le_bytes());
+        output
+    }
+
+    fn metadata_string(key: &str, value: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_string(&mut output, key);
+        output.extend_from_slice(&8u32.to_le_bytes());
+        write_string(&mut output, value);
+        output
+    }
+
+    fn metadata_u32_array(key: &str, values: &[u32]) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_string(&mut output, key);
+        output.extend_from_slice(&9u32.to_le_bytes());
+        output.extend_from_slice(&4u32.to_le_bytes());
+        output.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        output
+    }
+
+    fn tensor(name: impl Into<String>, dims: Vec<u64>) -> SyntheticTensor {
+        let element_count = dims.iter().product::<u64>() as usize;
+        SyntheticTensor {
+            name: name.into(),
+            dims,
+            ggml_type: 0,
+            data: vec![0; element_count * 4],
+        }
+    }
+
+    fn write_synthetic_gguf(metadata: Vec<Vec<u8>>, tensors: Vec<SyntheticTensor>) -> Gguf {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        for entry in metadata {
+            bytes.extend_from_slice(&entry);
+        }
+
+        let mut offset = 0u64;
+        for entry in &tensors {
+            write_string(&mut bytes, &entry.name);
+            bytes.extend_from_slice(&(entry.dims.len() as u32).to_le_bytes());
+            for dim in &entry.dims {
+                bytes.extend_from_slice(&dim.to_le_bytes());
+            }
+            bytes.extend_from_slice(&entry.ggml_type.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            offset += entry.data.len() as u64;
+        }
+        let aligned = (bytes.len() + 31) & !31;
+        bytes.resize(aligned, 0);
+        for entry in tensors {
+            bytes.extend_from_slice(&entry.data);
+        }
+
+        let mut file = tempfile::NamedTempFile::new().expect("utwórz plik GGUF");
+        file.write_all(&bytes).expect("zapisz plik GGUF");
+        Gguf::open(file.path()).expect("otwórz syntetyczny GGUF")
+    }
+
+    fn synthetic_qwen35(
+        block_count: u32,
+        nextn: u32,
+        include_mtp: bool,
+        dedicated_mtp_io: bool,
+    ) -> Gguf {
+        let metadata = vec![
+            metadata_string("general.architecture", "qwen35"),
+            metadata_u32("qwen35.block_count", block_count),
+            metadata_u32("qwen35.nextn_predict_layers", nextn),
+            metadata_u32("qwen35.embedding_length", 64),
+            metadata_u32("qwen35.feed_forward_length", 128),
+            metadata_u32("qwen35.attention.head_count", 1),
+            metadata_u32("qwen35.attention.head_count_kv", 1),
+            metadata_u32("qwen35.attention.key_length", 64),
+            metadata_u32("qwen35.context_length", 1024),
+            metadata_f32("qwen35.rope.freq_base", 10_000_000.0),
+            metadata_f32("qwen35.attention.layer_norm_rms_epsilon", 1e-6),
+            metadata_u32("qwen35.full_attention_interval", 2),
+            metadata_u32("qwen35.ssm.conv_kernel", 4),
+            metadata_u32("qwen35.ssm.inner_size", 128),
+            metadata_u32("qwen35.ssm.state_size", 64),
+            metadata_u32("qwen35.ssm.time_step_rank", 2),
+            metadata_u32("qwen35.ssm.group_count", 1),
+            metadata_u32_array("qwen35.rope.dimension_sections", &[8, 8, 8, 0]),
+        ];
+
+        let mut tensors = vec![
+            tensor("token_embd.weight", vec![64, 32]),
+            tensor("output_norm.weight", vec![64]),
+        ];
+        for name in [
+            "blk.0.attn_norm.weight",
+            "blk.0.post_attention_norm.weight",
+            "blk.0.attn_qkv.weight",
+            "blk.0.attn_gate.weight",
+            "blk.0.ssm_conv1d.weight",
+            "blk.0.ssm_dt.bias",
+            "blk.0.ssm_a",
+            "blk.0.ssm_beta.weight",
+            "blk.0.ssm_alpha.weight",
+            "blk.0.ssm_norm.weight",
+            "blk.0.ssm_out.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.1.attn_norm.weight",
+            "blk.1.post_attention_norm.weight",
+            "blk.1.attn_q.weight",
+            "blk.1.attn_k.weight",
+            "blk.1.attn_v.weight",
+            "blk.1.attn_output.weight",
+            "blk.1.attn_q_norm.weight",
+            "blk.1.attn_k_norm.weight",
+            "blk.1.ffn_gate.weight",
+            "blk.1.ffn_up.weight",
+            "blk.1.ffn_down.weight",
+        ] {
+            tensors.push(tensor(name, vec![64]));
+        }
+        if include_mtp {
+            for name in [
+                "blk.2.attn_k.weight",
+                "blk.2.attn_k_norm.weight",
+                "blk.2.attn_norm.weight",
+                "blk.2.attn_output.weight",
+                "blk.2.attn_q.weight",
+                "blk.2.attn_q_norm.weight",
+                "blk.2.attn_v.weight",
+                "blk.2.ffn_down.weight",
+                "blk.2.ffn_gate.weight",
+                "blk.2.ffn_up.weight",
+                "blk.2.post_attention_norm.weight",
+                "blk.2.nextn.eh_proj.weight",
+                "blk.2.nextn.enorm.weight",
+                "blk.2.nextn.hnorm.weight",
+                "blk.2.nextn.shared_head_norm.weight",
+            ] {
+                tensors.push(tensor(name, vec![64]));
+            }
+            if dedicated_mtp_io {
+                tensors.push(tensor("blk.2.nextn.embed_tokens.weight", vec![64, 32]));
+                tensors.push(tensor(
+                    "blk.2.nextn.shared_head_head.weight",
+                    vec![64, 32],
+                ));
+            }
+        }
+        write_synthetic_gguf(metadata, tensors)
+    }
 
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 6);
+        assert_eq!(specs.len(), 7);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
         assert_eq!(specs[3].name, "olmoe");
         assert_eq!(specs[4].name, "qwen3moe");
         assert_eq!(specs[5].name, "qwen35moe");
+        assert_eq!(specs[6].name, "qwen35");
         // The MoE specs carry the router + stacked-expert roles.
-        assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGateInp));
-        assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGateExps));
-        assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnDownExps));
+        assert!(specs[3]
+            .roles
+            .iter()
+            .any(|r| r.role == WeightRole::FfnGateInp));
+        assert!(specs[3]
+            .roles
+            .iter()
+            .any(|r| r.role == WeightRole::FfnGateExps));
+        assert!(specs[3]
+            .roles
+            .iter()
+            .any(|r| r.role == WeightRole::FfnDownExps));
         // MoE FFN replaces the dense gate/up/down entirely.
         assert!(!specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGate));
         // qwen3 has QK-norm roles, llama does not.
@@ -744,6 +1292,84 @@ mod tests {
         // before mistral, which shares the gguf arch name).
         let first_llama = specs.iter().find(|s| s.gguf_arch == "llama").unwrap();
         assert_eq!(first_llama.name, "llama");
+    }
+
+    #[test]
+    fn dense_qwen35_separates_mtp_from_trunk() {
+        let gguf = synthetic_qwen35(3, 1, true, false);
+        let descriptor = ModelDescriptor::detect(&gguf).expect("wykryj qwen35");
+
+        assert_eq!(descriptor.arch, "qwen35");
+        assert_eq!(descriptor.params.block_count, 2);
+        assert_eq!(descriptor.layers.len(), 2);
+        assert_eq!(
+            descriptor.layer_kinds,
+            [LayerKind::DeltaNet, LayerKind::Attention]
+        );
+        let mtp = descriptor.mtp.as_ref().expect("wydziel MTP");
+        assert_eq!(mtp.first_block, 2);
+        assert_eq!(mtp.block_count, 1);
+        assert_eq!(mtp.layers.len(), 1);
+        assert_eq!(mtp.layers[0].len(), 15);
+        assert_eq!(
+            mtp.layers[0][&MtpWeightRole::EhProj],
+            "blk.2.nextn.eh_proj.weight"
+        );
+        assert!(descriptor.params.moe.is_none());
+        assert_eq!(descriptor.params.intermediate_size, 128);
+        assert!(descriptor.layers[0].contains_key(&WeightRole::SsmInProj));
+        assert!(descriptor.layers[0].contains_key(&WeightRole::FfnGate));
+        assert!(descriptor.layers[1].contains_key(&WeightRole::AttnQ));
+        assert!(descriptor.layers[1].contains_key(&WeightRole::FfnDown));
+        assert!(descriptor
+            .layers
+            .iter()
+            .flat_map(HashMap::values)
+            .all(|name| !name.starts_with("blk.2.")));
+        assert!(gguf.tensor("blk.2.nextn.eh_proj.weight").is_some());
+    }
+
+    #[test]
+    fn dense_qwen35_prefers_dedicated_mtp_embedding_and_head() {
+        let gguf = synthetic_qwen35(3, 1, true, true);
+        let descriptor = ModelDescriptor::detect(&gguf).expect("wykryj dedykowane MTP IO");
+        let mtp = descriptor.mtp.as_ref().expect("wydziel MTP");
+        assert_eq!(
+            mtp.layers[0][&MtpWeightRole::Embedding],
+            "blk.2.nextn.embed_tokens.weight"
+        );
+        assert_eq!(
+            mtp.layers[0][&MtpWeightRole::SharedHead],
+            "blk.2.nextn.shared_head_head.weight"
+        );
+    }
+
+    #[test]
+    fn dense_qwen35_rejects_mtp_bez_trunku() {
+        let gguf = synthetic_qwen35(1, 1, false, false);
+        let error = ModelDescriptor::detect(&gguf).expect_err("odrzuć pusty trunk");
+        assert!(error.to_string().contains("całego trunku"));
+    }
+
+    #[test]
+    fn dense_qwen35_rejects_mtp_count_larger_than_stack() {
+        let gguf = synthetic_qwen35(1, 2, false, false);
+        let error = ModelDescriptor::detect(&gguf).expect_err("odrzuć błędną liczbę bloków");
+        assert!(error.to_string().contains("exceeds block_count"));
+    }
+
+    #[test]
+    fn dense_qwen35_rejects_missing_mtp_tensor() {
+        let gguf = synthetic_qwen35(3, 1, false, false);
+        let error = ModelDescriptor::detect(&gguf).expect_err("odrzuć niepełny blok MTP");
+        assert!(error.to_string().contains("blk.2.attn_k.weight"));
+    }
+
+    #[test]
+    fn dense_qwen35_rejects_block_count_larger_than_tensor_table() {
+        let gguf = synthetic_qwen35(1_000, 0, false, false);
+        let error = ModelDescriptor::detect(&gguf).expect_err("odrzuć niebezpieczną liczbę bloków");
+        assert!(error.to_string().contains("exceeds tensor count"));
     }
 
     #[test]
@@ -838,7 +1464,10 @@ mod tests {
         let moe = desc.params.moe.as_ref().expect("olmoe is MoE");
         assert_eq!(moe.n_experts, 64, "OLMoE has 64 experts");
         assert_eq!(moe.n_experts_used, 8, "OLMoE routes top-8");
-        assert_eq!(moe.shared_intermediate_size, 0, "OLMoE has no shared expert");
+        assert_eq!(
+            moe.shared_intermediate_size, 0,
+            "OLMoE has no shared expert"
+        );
         // OLMoE normalizes the full query/key vector, not per head.
         assert!(desc.params.qk_norm_over_hidden);
         // Every layer resolved the router + three stacked expert tensors.
@@ -851,9 +1480,7 @@ mod tests {
         }
     }
 
-    /// Detect the Qwen3.6-35B-A3B hybrid MoE from the real GGUF and assert the
-    /// interleaved attention/DeltaNet split, SSM params, M-RoPE sections, shared
-    /// expert and MTP drop. Skipped cleanly when the model is not present.
+    /// Odrzuca realny Qwen3.6 MoE z MTP, dopóki runtime nie wykonuje bloku MoE.
     #[test]
     fn detect_qwen35moe_hybrid_metadata() {
         let path = concat!(
@@ -865,68 +1492,8 @@ mod tests {
             return;
         }
         let gguf = Gguf::open(path).expect("open qwen36 gguf");
-        let desc = ModelDescriptor::detect(&gguf).expect("detect qwen35moe");
-        assert_eq!(desc.arch, "qwen35moe");
-        // 41 blocks total, 1 MTP head dropped → 40 trunk layers.
-        assert_eq!(desc.params.block_count, 40);
-        assert_eq!(desc.layer_kinds.len(), 40);
-        assert_eq!(desc.params.hidden_size, 2048);
-        assert_eq!(desc.params.n_heads, 16);
-        assert_eq!(desc.params.n_kv_heads, 2);
-        assert_eq!(desc.params.head_dim, 256);
-        assert_eq!(desc.params.full_attention_interval, 4);
-        assert!((desc.params.rope_theta - 1.0e7).abs() < 1.0);
-        assert_eq!(desc.params.rope_sections, Some([11, 11, 10, 0]));
-        assert!(desc.params.attn_gated);
-
-        // Hybrid rule: (idx+1) % 4 == 0 → attention, else DeltaNet.
-        for (il, &kind) in desc.layer_kinds.iter().enumerate() {
-            let want = if (il + 1) % 4 == 0 {
-                LayerKind::Attention
-            } else {
-                LayerKind::DeltaNet
-            };
-            assert_eq!(kind, want, "layer {il} kind");
-        }
-        // Layers 0,1,2 are DeltaNet; layer 3 is attention.
-        assert_eq!(desc.layer_kinds[0], LayerKind::DeltaNet);
-        assert_eq!(desc.layer_kinds[3], LayerKind::Attention);
-
-        let ssm = desc.params.ssm.as_ref().expect("qwen35moe has SSM params");
-        assert_eq!(ssm.d_conv, 4);
-        assert_eq!(ssm.d_inner, 4096);
-        assert_eq!(ssm.d_state, 128);
-        assert_eq!(ssm.dt_rank, 32);
-        assert_eq!(ssm.n_group, 16);
-        assert_eq!(ssm.n_k_heads(), 16);
-        assert_eq!(ssm.n_v_heads(), 32);
-        assert_eq!(ssm.key_dim(), 2048);
-        assert_eq!(ssm.value_dim(), 4096);
-        assert_eq!(ssm.conv_dim(), 8192);
-
-        let moe = desc.params.moe.as_ref().expect("qwen35moe is MoE");
-        assert_eq!(moe.n_experts, 256);
-        assert_eq!(moe.n_experts_used, 8);
-        assert_eq!(moe.moe_intermediate_size, 512);
-        assert_eq!(moe.shared_intermediate_size, 512);
-
-        // DeltaNet layer 0 resolved its SSM tensors, not attention Q/K/V.
-        let l0 = &desc.layers[0];
-        assert!(l0.contains_key(&WeightRole::SsmInProj));
-        assert!(l0.contains_key(&WeightRole::SsmConv1d));
-        assert!(l0.contains_key(&WeightRole::SsmOut));
-        assert!(l0.contains_key(&WeightRole::FfnGateInpShExp));
-        assert!(!l0.contains_key(&WeightRole::AttnQ));
-        // Attention layer 3 resolved Q/K/V + QK-norm, not SSM tensors.
-        let l3 = &desc.layers[3];
-        assert!(l3.contains_key(&WeightRole::AttnQ));
-        assert!(l3.contains_key(&WeightRole::AttnQNorm));
-        assert!(!l3.contains_key(&WeightRole::SsmInProj));
-        // Every trunk layer carries routed + shared expert weights.
-        for m in &desc.layers {
-            assert!(m.contains_key(&WeightRole::FfnGateExps));
-            assert!(m.contains_key(&WeightRole::FfnDownShExp));
-        }
+        let error = ModelDescriptor::detect(&gguf).expect_err("odrzuć MTP MoE");
+        assert!(error.to_string().contains("runtime MTP"));
     }
 
     #[test]

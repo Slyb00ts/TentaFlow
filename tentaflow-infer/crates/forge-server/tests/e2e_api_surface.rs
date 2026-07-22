@@ -56,6 +56,7 @@ async fn api_surface_end_to_end() {
                         kv_page_size,
                         kv_pages,
                         forge_engine::kv::KvQuant::F16,
+                        false,
                     ),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
@@ -73,6 +74,7 @@ async fn api_surface_end_to_end() {
                     kv_quant: forge_engine::kv::KvQuant::F16,
                     kv_tier: Default::default(),
                     prefix_cache: true,
+                    native_mtp: false,
                 },
             )
             .expect("load model");
@@ -86,7 +88,8 @@ async fn api_surface_end_to_end() {
             let eos_ids = loaded.bundle.eos_ids.clone();
             let tokenizer = Arc::new(loaded.bundle.tokenizer);
             // max_active 8 so a 4-prompt batch shares one decode batch.
-            let handle = spawn_engine(loaded.model, tokenizer.clone(), 8, 16);
+            let handle = spawn_engine(loaded.model, tokenizer.clone(), 8, 16)
+                .expect("silnik powinien się uruchomić");
             (
                 handle,
                 tokenizer,

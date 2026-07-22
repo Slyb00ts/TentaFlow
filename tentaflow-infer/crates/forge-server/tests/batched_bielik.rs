@@ -40,7 +40,10 @@ fn greedy_seq_params() -> SeqSampleParams {
         seed: 0,
         step: 0,
         penalty: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
         penalty_ids: Vec::new(),
+        penalty_counts: Vec::new(),
     }
 }
 
@@ -60,7 +63,7 @@ fn batched_reproduces_golden() {
         0,
         PoolSizes {
             weights: 8 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16).max(1 << 30),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16, false).max(1 << 30),
             activations: 2 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -77,6 +80,7 @@ fn batched_reproduces_golden() {
             kv_quant: forge_engine::kv::KvQuant::F16,
             kv_tier: Default::default(),
             prefix_cache: false,
+            native_mtp: false,
         },
     )
     .expect("load model");

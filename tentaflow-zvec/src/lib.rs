@@ -876,29 +876,8 @@ impl Collection {
             out_c.iter().map(|c| c.as_ptr()).collect();
 
         unsafe {
-            // Reranker (RRF or weighted over the two vector fields).
-            let reranker = match fusion {
-                Fusion::Rrf(c) => sys::zvec_reranker_create_rrf(c as i32),
-                Fusion::Weighted { dense, sparse } => {
-                    let fields = [
-                        VEC_FIELD.as_ptr() as *const std::os::raw::c_char,
-                        SPARSE_FIELD.as_ptr() as *const std::os::raw::c_char,
-                    ];
-                    let weights = [dense as f64, sparse as f64];
-                    sys::zvec_reranker_create_weighted(
-                        fields.as_ptr() as *mut *const std::os::raw::c_char,
-                        weights.as_ptr(),
-                        2,
-                    )
-                }
-            };
-            if reranker.is_null() {
-                return Err(ZvecError::NullHandle("reranker_create"));
-            }
-
             let mvq = sys::zvec_multi_query_create();
             if mvq.is_null() {
-                sys::zvec_reranker_destroy(reranker);
                 return Err(ZvecError::NullHandle("multi_query_create"));
             }
             let _ = sys::zvec_multi_query_set_topk(mvq, k as i32);
@@ -941,7 +920,13 @@ impl Collection {
             let _ = sys::zvec_sub_query_set_num_candidates(sq, k as i32);
             let _ = sys::zvec_multi_query_add_sub_query(mvq, sq);
 
-            let _ = sys::zvec_multi_query_set_reranker(mvq, reranker);
+            let _ = match fusion {
+                Fusion::Rrf(c) => sys::zvec_multi_query_set_rerank_rrf(mvq, c as i32),
+                Fusion::Weighted { dense, sparse } => {
+                    let weights = [dense as f64, sparse as f64];
+                    sys::zvec_multi_query_set_rerank_weighted(mvq, weights.as_ptr(), weights.len())
+                }
+            };
 
             let mut results: *mut *mut sys::zvec_doc_t = ptr::null_mut();
             let mut count: usize = 0;
@@ -950,7 +935,6 @@ impl Collection {
             sys::zvec_sub_query_destroy(dq);
             sys::zvec_sub_query_destroy(sq);
             sys::zvec_multi_query_destroy(mvq);
-            sys::zvec_reranker_destroy(reranker);
             check(r)?;
             self.read_hits(results, count, output_fields)
         }
