@@ -1363,6 +1363,7 @@ fn native_mtp_step_b2(
             return;
         }
     };
+    EngineMetrics::inc(&metrics.native_mtp_b2_steps_total);
     finish_native_mtp_step(
         first,
         budget,

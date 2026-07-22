@@ -145,6 +145,12 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
         "Speculative draft tokens accepted across verify forwards.",
         load(&engine.spec_accepted_total),
     );
+    counter(
+        &mut out,
+        "forge_engine_native_mtp_b2_steps_total",
+        "Native MTP steps executed by the paired B2 fast path.",
+        load(&engine.native_mtp_b2_steps_total),
+    );
 
     // ---- Gauges ----
     gauge(

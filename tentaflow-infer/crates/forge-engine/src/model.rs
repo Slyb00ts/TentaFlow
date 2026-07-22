@@ -55,6 +55,10 @@ fn hybrid_q_full_cols(q_dim: usize, conv_dim: usize, hidden_size: usize) -> usiz
     (q_dim * 2).max(conv_dim).max(hidden_size * 2)
 }
 
+fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_embedding: bool) -> bool {
+    mode == Some("device") && shares_target_embedding
+}
+
 fn restore_after<T>(result: Result<T>, restore: impl FnOnce()) -> Result<T> {
     restore();
     result
@@ -5793,16 +5797,17 @@ impl Model {
     pub fn native_mtp_b2_capable(&self, seqs: [&SeqKv; 2], budget: usize) -> bool {
         matches!(budget, 2 | 3)
             && self.validate_native_mtp_target().is_ok()
-            && self.hybrid_batch_b2_capable()
+            && self.hybrid_batch_b2_weights_capable()
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
             && self.prefix_cache.is_none()
-            && self.mtp_embedding_mode() == Some("device")
-            && self
-                .weights
-                .mtp
-                .as_ref()
-                .is_some_and(|mtp| mtp.shares_target_embedding)
+            && native_mtp_b2_device_embedding(
+                self.mtp_embedding_mode(),
+                self.weights
+                    .mtp
+                    .as_ref()
+                    .is_some_and(|mtp| mtp.shares_target_embedding),
+            )
             && seqs
                 .iter()
                 .all(|seq| self.native_mtp_available_budget(seq, budget) == budget)
@@ -9537,8 +9542,7 @@ impl Model {
         self.weights.descriptor.params.ssm.is_some()
     }
 
-    /// Sprawdza pełny, niemutujący kontrakt targetu hybrydowego B2.
-    pub fn hybrid_batch_b2_capable(&self) -> bool {
+    fn hybrid_batch_b2_weights_capable(&self) -> bool {
         fn full_rows(weight: &DevWeight) -> bool {
             matches!(
                 weight,
@@ -9574,7 +9578,6 @@ impl Model {
 
         self.is_hybrid()
             && self.tier.is_none()
-            && self.weights.token_embd_host.is_some()
             && matches!(self.weights.lm_head, DevWeight::F16 { .. } | DevWeight::Q8_0 { .. })
             && self.weights.layers.iter().all(|layer| {
                 let LayerFfn::Dense(ffn) = &layer.ffn else {
@@ -9586,6 +9589,11 @@ impl Model {
                 };
                 gate_up && full_rows(&ffn.down)
             })
+    }
+
+    /// Sprawdza pełny, niemutujący kontrakt targetu hybrydowego B2.
+    pub fn hybrid_batch_b2_capable(&self) -> bool {
+        self.weights.token_embd_host.is_some() && self.hybrid_batch_b2_weights_capable()
     }
 
     /// Zrzuca stan hybrydowy do diagnostyki zgodności batch kontra serial.
@@ -11546,9 +11554,9 @@ impl Model {
 mod verify_rollback_tests {
     use super::{
         commit_mtp_pair_metadata, finish_greedy_verification, hybrid_prefill_profile_spans,
-        hybrid_q_full_cols, logical_kv_regions, native_mtp_greedy_decision, restore_after,
-        rollback_mtp_pair, ForgeError, HybridStatePool, KvCache, KvConfig, KvQuant, LayerKind,
-        Result, SeqKv,
+        hybrid_q_full_cols, logical_kv_regions, native_mtp_b2_device_embedding,
+        native_mtp_greedy_decision, restore_after, rollback_mtp_pair, ForgeError,
+        HybridStatePool, KvCache, KvConfig, KvQuant, LayerKind, Result, SeqKv,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
@@ -11978,6 +11986,14 @@ mod verify_rollback_tests {
             native_mtp_greedy_decision(&[11, 12, 13], &[11, 20, 99, 99]),
             (1, 20)
         );
+    }
+
+    #[test]
+    fn native_mtp_b2_wymaga_wspoldzielonego_device_embeddingu() {
+        assert!(native_mtp_b2_device_embedding(Some("device"), true));
+        assert!(!native_mtp_b2_device_embedding(Some("device"), false));
+        assert!(!native_mtp_b2_device_embedding(Some("host"), true));
+        assert!(!native_mtp_b2_device_embedding(None, true));
     }
 
     #[test]

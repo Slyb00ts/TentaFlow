@@ -103,6 +103,8 @@ pub struct EngineMetrics {
     pub spec_forwards_total: AtomicU64,
     /// Speculative draft tokens accepted across those forwards.
     pub spec_accepted_total: AtomicU64,
+    /// Wspólne kroki dwóch sekwencji wykonane przez natywną ścieżkę MTP B2.
+    pub native_mtp_b2_steps_total: AtomicU64,
     /// Gauge: sequences currently decoding/prefilling.
     pub active_sequences: AtomicU64,
     /// Gauge: submissions admitted-but-waiting behind KV pressure (queue depth).
@@ -130,6 +132,7 @@ impl Default for EngineMetrics {
             cache_read_tokens_total: AtomicU64::new(0),
             spec_forwards_total: AtomicU64::new(0),
             spec_accepted_total: AtomicU64::new(0),
+            native_mtp_b2_steps_total: AtomicU64::new(0),
             active_sequences: AtomicU64::new(0),
             queued_sequences: AtomicU64::new(0),
             kv_pages_total: AtomicU64::new(0),

@@ -145,6 +145,11 @@ fn run_native_mtp_b2_full_id_parity(path: &Path) -> TestResult<()> {
         ];
         let (first_seq, _, first_next) = prepare(&mut model, &prompts[0])?;
         let (second_seq, _, second_next) = prepare(&mut model, &prompts[1])?;
+        assert_eq!(model.mtp_embedding_mode(), Some("device"));
+        assert!(
+            model.native_mtp_b2_capable([&first_seq, &second_seq], budget),
+            "device-only embedding musi spełniać kontrakt B2 dla K={budget}"
+        );
         let mut lanes = [
             MtpLane {
                 seq: first_seq,
@@ -1019,6 +1024,7 @@ fn run_exact_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult
         let generated_before = metrics.generated_tokens_total.load(Ordering::Relaxed);
         let forwards_before = metrics.spec_forwards_total.load(Ordering::Relaxed);
         let accepted_before = metrics.spec_accepted_total.load(Ordering::Relaxed);
+        let b2_before = metrics.native_mtp_b2_steps_total.load(Ordering::Relaxed);
         let ttft_before = metrics.ttft_seconds.snapshot();
         let itl_before = metrics.inter_token_seconds.snapshot();
         let started = Instant::now();
@@ -1043,6 +1049,11 @@ fn run_exact_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult
             .spec_accepted_total
             .load(Ordering::Relaxed)
             .saturating_sub(accepted_before);
+        let b2_steps = metrics
+            .native_mtp_b2_steps_total
+            .load(Ordering::Relaxed)
+            .saturating_sub(b2_before);
+        assert!(b2_steps > 0, "benchmark serwera nie wykonał ścieżki MTP B2");
         let ttft = metrics.ttft_seconds.snapshot();
         let itl = metrics.inter_token_seconds.snapshot();
         let ttft_count = ttft.count.saturating_sub(ttft_before.count);
