@@ -1944,6 +1944,35 @@ fn link_nvdec_branch(
     gst::Element::link_many([queue_a, &depay, &parse, &dec, downstream])
         .map_err(|e| format!("link nvdec branch: {e}"))?;
 
+    // Diagnostic pad probes on each stage's src pad: log the FIRST buffer and its
+    // caps at depay, parse and decoder. NVDEC decodes this Axis stream fine from a
+    // file (1015 frames) yet delivers nothing live, so we need to see exactly
+    // where frames stop — if depay/parse emit but the decoder does not, the
+    // decoder is eating access units; if parse never emits, the fault is upstream.
+    // Probes fire once (AtomicBool) and remove themselves, so there is no per-frame
+    // cost past the first buffer.
+    for (label, el) in [("depay", &depay), ("parse", &parse), ("nvdec", &dec)] {
+        if let Some(pad) = el.static_pad("src") {
+            let once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stage = label.to_string();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |probe_pad, _info| {
+                if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let caps = probe_pad
+                        .current_caps()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "<none>".into());
+                    tracing::info!(
+                        stage = %stage,
+                        caps = %caps,
+                        "rtsp: NVDEC branch first buffer at stage"
+                    );
+                    return gst::PadProbeReturn::Remove;
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+    }
+
     for el in [&depay, &parse, &dec] {
         el.sync_state_with_parent()
             .map_err(|e| format!("sync_state nvdec element: {e}"))?;
