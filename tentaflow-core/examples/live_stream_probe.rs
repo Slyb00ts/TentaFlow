@@ -99,6 +99,10 @@ fn probe(url: &str) -> Result<(), String> {
     if full_downstream {
         // The app's real NvdecNv12 tail: nvh264dec → cudadownload → tee →
         // queue → appsink that actually pulls (mimicking analysis consumption).
+        // `fixed-tail`: insert a leaky=downstream queue BETWEEN the decoder and
+        // cudadownload — the proposed fix. It lets a slow 4K download drop decoded
+        // frames instead of backpressuring nvh264dec into a stall.
+        let fixed_tail = std::env::args().any(|a| a == "fixed-tail");
         let dl = mk("cudadownload")?;
         let dtee = gst::ElementFactory::make("tee")
             .property("allow-not-linked", true)
@@ -119,7 +123,19 @@ fn probe(url: &str) -> Result<(), String> {
             .build()
             .map_err(|e| e.to_string())?;
         pipeline.add_many([&dl, &dtee, &qd, &asink]).map_err(|e| e.to_string())?;
-        gst::Element::link_many([&hdec, &dl, &dtee, &qd, &asink]).map_err(|e| format!("full tail: {e}"))?;
+        if fixed_tail {
+            let protect = mk("queue")?;
+            protect.set_property_from_str("leaky", "downstream");
+            protect.set_property("max-size-buffers", 2u32);
+            protect.set_property("max-size-bytes", 0u32);
+            protect.set_property("max-size-time", 0u64);
+            pipeline.add(&protect).map_err(|e| e.to_string())?;
+            gst::Element::link_many([&hdec, &protect, &dl, &dtee, &qd, &asink])
+                .map_err(|e| format!("fixed tail: {e}"))?;
+        } else {
+            gst::Element::link_many([&hdec, &dl, &dtee, &qd, &asink])
+                .map_err(|e| format!("full tail: {e}"))?;
+        }
         // Pull samples like the analysis appsink does, so backpressure is realistic.
         let appsink = asink.dynamic_cast::<gstreamer_app::AppSink>().unwrap();
         appsink.set_callbacks(
