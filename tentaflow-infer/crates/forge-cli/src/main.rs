@@ -12,12 +12,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_engine::kv::KvQuant;
 use forge_engine::model::{ModelConfig, MAX_SPEC_DRAFT};
-use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{
     BenchmarkTimings, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
 };
 use forge_engine::speculation::{ProposerKind, SpeculationKind};
+use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
@@ -548,8 +548,16 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
     match s {
         "f16" => Ok(KvQuant::F16),
         "fp8" => Ok(KvQuant::Fp8),
-        "rot4" => Ok(KvQuant::Rot { bits: 4, residual_window, activate_at }),
-        "rot3" => Ok(KvQuant::Rot { bits: 3, residual_window, activate_at }),
+        "rot4" => Ok(KvQuant::Rot {
+            bits: 4,
+            residual_window,
+            activate_at,
+        }),
+        "rot3" => Ok(KvQuant::Rot {
+            bits: 3,
+            residual_window,
+            activate_at,
+        }),
         other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8 | rot4 | rot3)"),
     }
 }
@@ -713,9 +721,14 @@ fn tier_stage_bytes(
     kv_page_size: usize,
     ctx_pages: usize,
     quant: KvQuant,
-) -> usize {
-    2 * ctx_pages * desc.params.n_kv_heads * kv_page_size * desc.params.head_dim
-        * quant.slab_dtype().size()
+) -> Result<usize> {
+    2usize
+        .checked_mul(ctx_pages)
+        .and_then(|value| value.checked_mul(desc.params.n_kv_heads))
+        .and_then(|value| value.checked_mul(kv_page_size))
+        .and_then(|value| value.checked_mul(desc.params.head_dim))
+        .and_then(|value| value.checked_mul(quant.slab_dtype().size()))
+        .context("rozmiar bufora staging KV przekracza zakres usize")
 }
 
 fn default_model_id(path: &Path) -> String {
@@ -725,9 +738,79 @@ fn default_model_id(path: &Path) -> String {
         .unwrap_or_else(|| "model".into())
 }
 
-/// Load a model for the fixed-pool `serve` layout: weights sized by flag,
-/// KV pool sized for exactly `kv_pages` pages of this model (floored at
-/// 1 GiB), 1 GiB activations.
+#[derive(Debug, Eq, PartialEq)]
+struct KvPoolLayout {
+    pages: usize,
+    bytes: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_kv_pool_layout(
+    desc: &forge_formats::ModelDescriptor,
+    page_size: usize,
+    ctx_pages: usize,
+    requested_pages: usize,
+    hot_pages: usize,
+    tier: &KvTierConfig,
+    quant: KvQuant,
+    native_mtp: bool,
+) -> Result<KvPoolLayout> {
+    if hot_pages > 0 && !tier.enabled() {
+        bail!("--kv-hot-pages wymaga --kv-tier ram|nvme");
+    }
+    let pages = if hot_pages > 0 {
+        hot_pages
+    } else if tier.enabled() {
+        if requested_pages == 0 {
+            ctx_pages
+        } else {
+            requested_pages.min(ctx_pages)
+        }
+    } else if requested_pages == 0 {
+        ctx_pages
+    } else {
+        requested_pages.max(ctx_pages)
+    };
+    if tier.enabled() {
+        let floor = forge_engine::tier::min_resident_pages(page_size);
+        if pages < floor {
+            bail!(
+                "efektywna pula KV ma {pages} stron, poniżej minimum rezydencji {floor}; zwiększ --kv-pages lub --kv-hot-pages"
+            );
+        }
+    }
+    Ok(KvPoolLayout {
+        pages,
+        bytes: kv_pool_bytes(desc, page_size, pages, quant, native_mtp)?,
+    })
+}
+
+fn kv_full_context_admission_capacity(
+    pages: usize,
+    ctx_pages: usize,
+    page_size: usize,
+    tier_enabled: bool,
+    max_active: usize,
+) -> usize {
+    let pages_per_request = if tier_enabled {
+        ctx_pages.min(forge_engine::tier::min_resident_pages(page_size))
+    } else {
+        ctx_pages
+    };
+    if pages_per_request == 0 {
+        return 0;
+    }
+    max_active.min(pages / pages_per_request)
+}
+
+fn pool_reserve_bytes(kv_bytes: usize, activation_bytes: usize) -> Result<usize> {
+    kv_bytes
+        .checked_add(activation_bytes)
+        .and_then(|value| value.checked_add(512 << 20))
+        .context("suma pul KV, aktywacji i rezerwy przekracza zakres usize")
+}
+
+/// Ładuje model w stałym układzie pul `serve`.
 #[allow(clippy::too_many_arguments)]
 fn activation_pool_bytes(_native_mtp: bool, hybrid: bool) -> usize {
     if hybrid {
@@ -737,6 +820,7 @@ fn activation_pool_bytes(_native_mtp: bool, hybrid: bool) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_for_serve(
     path: &Path,
     kv_pages: usize,
@@ -757,17 +841,20 @@ fn load_for_serve(
     // stays constant as the context grows.
     let (max_seq_len, ctx_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, kv_page_size);
-    let kv_pages = if hot_pages > 0 {
-        hot_pages
-    } else if kv_tier.enabled() {
-        kv_pages.min(ctx_pages)
-    } else {
-        kv_pages.max(ctx_pages)
-    };
-    let kv_pool =
-        kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant, native_mtp).max(1 << 30);
+    let layout = resolve_kv_pool_layout(
+        &desc,
+        kv_page_size,
+        ctx_pages,
+        kv_pages,
+        hot_pages,
+        &kv_tier,
+        kv_quant,
+        native_mtp,
+    )?;
+    let kv_pages = layout.pages;
+    let kv_pool = layout.bytes;
     let stage = if kv_tier.enabled() {
-        tier_stage_bytes(&desc, kv_page_size, ctx_pages, kv_quant)
+        tier_stage_bytes(&desc, kv_page_size, ctx_pages, kv_quant)?
     } else {
         0
     };
@@ -775,8 +862,11 @@ fn load_for_serve(
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
     let free = CudaDevice::free_vram(0).context("query free VRAM")?;
-    let weights_budget = free.saturating_sub(kv_pool + activations + (512 << 20));
-    let weights = ((weights_pool_gb * (1u64 << 30) as f64) as usize + stage)
+    let weights_budget = free.saturating_sub(pool_reserve_bytes(kv_pool, activations)?);
+    let requested_weights = (weights_pool_gb * (1u64 << 30) as f64) as usize;
+    let weights = requested_weights
+        .checked_add(stage)
+        .context("rozmiar puli wag i staging przekracza zakres usize")?
         .min(weights_budget)
         .max(1 << 30);
     let device = CudaDevice::new(
@@ -808,7 +898,11 @@ fn load_for_serve(
 /// `requested == 0` defaults to the model's own maximum; a non-zero request is
 /// honored as-is (down to a single page, up to the model's positional limit).
 /// Whether the resulting KV pool fits VRAM is decided later by pool sizing.
-fn resolve_ctx(max_position_embeddings: usize, requested: usize, page_size: usize) -> (usize, usize) {
+fn resolve_ctx(
+    max_position_embeddings: usize,
+    requested: usize,
+    page_size: usize,
+) -> (usize, usize) {
     let model_max = max_position_embeddings.max(page_size);
     let target = if requested == 0 {
         model_max
@@ -834,20 +928,23 @@ fn load_auto(
     // the requested context up front (its slabs are allocated during load).
     let desc = read_descriptor(path)?;
     let page_size = ModelConfig::default().kv_page_size;
-    let (max_seq_len, ctx_pages) =
-        resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
+    let (max_seq_len, ctx_pages) = resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
     // KVFlash (`hot_pages > 0`) fixes the VRAM pool to a constant page count
     // regardless of --ctx; else 0 = a pool covering the whole context (today's
     // behavior) and an explicit --kv-pages caps the hot VRAM working set.
-    let kv_pages = if hot_pages > 0 {
-        hot_pages
-    } else if kv_pages_flag > 0 {
-        kv_pages_flag.min(ctx_pages)
-    } else {
-        ctx_pages
-    };
+    let layout = resolve_kv_pool_layout(
+        &desc,
+        page_size,
+        ctx_pages,
+        kv_pages_flag,
+        hot_pages,
+        &kv_tier,
+        kv_quant,
+        native_mtp,
+    )?;
+    let kv_pages = layout.pages;
     let stage = if kv_tier.enabled() {
-        tier_stage_bytes(&desc, page_size, ctx_pages, kv_quant)
+        tier_stage_bytes(&desc, page_size, ctx_pages, kv_quant)?
     } else {
         0
     };
@@ -855,12 +952,14 @@ fn load_auto(
     let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
     // `KvCache` alokuje wszystkie slaby targetu i opcjonalnego MTP w dedykowanej
     // puli; rozmiar uwzględnia wyrównanie każdego bufora do granulacji slabów.
-    let hal_kv = kv_pool_bytes(&desc, page_size, kv_pages, kv_quant, native_mtp);
+    let hal_kv = layout.bytes;
     let weights = if weights_pool_gb > 0.0 {
-        (weights_pool_gb * (1u64 << 30) as f64) as usize + stage
+        ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+            .checked_add(stage)
+            .context("rozmiar puli wag i staging przekracza zakres usize")?
     } else {
         let free = CudaDevice::free_vram(0).context("query free VRAM")?;
-        free.saturating_sub(activations + hal_kv + (512 << 20))
+        free.saturating_sub(pool_reserve_bytes(hal_kv, activations)?)
             .max(1 << 30)
     };
     let device = CudaDevice::new(
@@ -935,8 +1034,8 @@ fn parse_pooling(s: &str) -> Result<PoolingType> {
 /// Pools auto-size from free VRAM (the model loads after the chat engine has
 /// already taken its own device pool).
 fn load_embed(path: &Path, model_id: String) -> Result<SharedEmbed> {
-    let device = CudaDevice::with_default_pools(0)
-        .context("create CUDA device for embedding model")?;
+    let device =
+        CudaDevice::with_default_pools(0).context("create CUDA device for embedding model")?;
     let dev: Arc<dyn Device> = device;
     let loaded = load_model(dev, path, ModelConfig::default())
         .with_context(|| format!("load embedding model from {}", path.display()))?;
@@ -1057,7 +1156,9 @@ fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Res
     }
 
     let inputs = &model.graph.input;
-    let is_vad = ["input", "state", "sr"].iter().all(|n| inputs.iter().any(|i| i == n));
+    let is_vad = ["input", "state", "sr"]
+        .iter()
+        .all(|n| inputs.iter().any(|i| i == n));
     if !is_vad {
         println!(
             "\nparsed {} nodes; no Silero VAD input signature (input/state/sr) — \
@@ -1089,7 +1190,10 @@ fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Res
     let session = forge_onnx::load_session(dev, model_path)?;
 
     let mut named = std::collections::HashMap::new();
-    named.insert("input".to_string(), forge_onnx::Tensor::from_f32(vec![1, samples], frame));
+    named.insert(
+        "input".to_string(),
+        forge_onnx::Tensor::from_f32(vec![1, samples], frame),
+    );
     named.insert(
         "state".to_string(),
         forge_onnx::Tensor::from_f32(vec![2, 1, 128], vec![0.0; 256]),
@@ -1156,14 +1260,22 @@ fn cmd_serve(
         ),
     )?;
     let max_active = resolve_max_active(max_active, &spec, loaded.model.is_hybrid())?;
+    let full_context_admission = kv_full_context_admission_capacity(
+        kv_pages,
+        max_seq_len.div_ceil(ModelConfig::default().kv_page_size),
+        ModelConfig::default().kv_page_size,
+        loaded.model.tier_enabled(),
+        max_active,
+    );
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
     tracing::info!(
-        "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
+        "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}, full_context_admission={}",
         model_path.display(),
         loaded.model.weights.descriptor.arch,
         t0.elapsed().as_secs_f32(),
         loaded.model.weights.descriptor.params.block_count,
         kv_pages,
+        full_context_admission,
     );
 
     let template_vars = loaded.bundle.template_vars();
@@ -1358,7 +1470,8 @@ fn cmd_run(
     let prompt_tokens = tokenizer
         .encode(&prompt_text, true)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec)?;
+    let engine =
+        forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec)?;
 
     let submit_at = Instant::now();
     let (generated, prompt_len, _first, done_at, _) = drain_request(
@@ -1461,13 +1574,18 @@ fn maybe_calibrate_w4a8(
                 t0.elapsed().as_secs_f32()
             );
         } else {
-            eprintln!("fp8mod-ffn niedostępny dla urządzenia, kształtów lub puli VRAM; pozostaje NVFP4");
+            eprintln!(
+                "fp8mod-ffn niedostępny dla urządzenia, kształtów lub puli VRAM; pozostaje NVFP4"
+            );
         }
         return Ok(());
     }
     if matches!(gemm.as_deref(), Some("fp8") | Some("fp8mod")) {
         if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
-            bail!("FORGE_GEMM={} currently supports GGUF models only", gemm.unwrap());
+            bail!(
+                "FORGE_GEMM={} currently supports GGUF models only",
+                gemm.unwrap()
+            );
         }
         let t0 = Instant::now();
         model.build_fp8(path)?;
@@ -1660,8 +1778,7 @@ fn cmd_bench(
             .mtp_catchup_gpu_ms
             .context("backend nie udostępnia czasu GPU MTP catch-up")?;
         let prefill_tps = prompt_len as f64 / (target / 1000.0).max(1e-9);
-        let decode_tps =
-            (generated.saturating_sub(1)) as f64 / decode_elapsed_s.max(1e-9);
+        let decode_tps = (generated.saturating_sub(1)) as f64 / decode_elapsed_s.max(1e-9);
         eprintln!(
             "{} {}/{}: target {:.3} ms ({prefill_tps:.1} tok/s) | MTP catch-up {:.3} ms | TTFT {:.3} ms | visible TTFT {:.3} ms | decode {:.1} tok/s",
             if rep == 0 { "warmup" } else { "rep" },
@@ -1716,8 +1833,140 @@ fn cmd_bench(
 
 #[cfg(test)]
 mod speculation_cli_tests {
-    use super::{activation_pool_bytes, parse_speculative, resolve_max_active};
+    use super::{
+        activation_pool_bytes, kv_full_context_admission_capacity, parse_speculative,
+        resolve_kv_pool_layout, resolve_max_active,
+    };
+    use forge_engine::kv::KvQuant;
     use forge_engine::speculation::{ProposerKind, SpeculationKind};
+    use forge_engine::tier::{KvTierConfig, KvTierMode};
+    use forge_formats::{HfConfig, LayerKind, ModelDescriptor};
+
+    fn qwen_hybrid_descriptor() -> ModelDescriptor {
+        let config: HfConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 4096,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "intermediate_size": 12288,
+                "vocab_size": 248320,
+                "max_position_embeddings": 262144
+            }"#,
+        )
+        .unwrap();
+        let mut descriptor = ModelDescriptor::from_hf(&config).unwrap();
+        descriptor.layer_kinds = [
+            vec![LayerKind::DeltaNet; 48],
+            vec![LayerKind::Attention; 16],
+        ]
+        .concat();
+        descriptor
+    }
+
+    fn ram_tier() -> KvTierConfig {
+        KvTierConfig {
+            mode: KvTierMode::Ram,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn layout_serve_dla_4096_tokenow_nie_ma_progu_jeden_gib() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout = resolve_kv_pool_layout(
+            &descriptor,
+            32,
+            128,
+            128,
+            0,
+            &KvTierConfig::default(),
+            KvQuant::F16,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(layout.bytes, 320 << 20);
+    }
+
+    #[test]
+    fn layout_serve_zachowuje_domyslne_512_stron() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout = resolve_kv_pool_layout(
+            &descriptor,
+            32,
+            128,
+            512,
+            0,
+            &KvTierConfig::default(),
+            KvQuant::F16,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(layout.pages, 512);
+    }
+
+    #[test]
+    fn layout_tier_zero_oznacza_pelny_kontekst() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout =
+            resolve_kv_pool_layout(&descriptor, 32, 128, 0, 0, &ram_tier(), KvQuant::F16, false)
+                .unwrap();
+
+        assert_eq!(layout.pages, 128);
+    }
+
+    #[test]
+    fn layout_tier_odrzuca_pule_ponizej_minimum_rezydencji() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let result =
+            resolve_kv_pool_layout(&descriptor, 32, 128, 1, 0, &ram_tier(), KvQuant::F16, false);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn layout_hot_ma_pierwszenstwo_nad_liczba_stron() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout = resolve_kv_pool_layout(
+            &descriptor,
+            32,
+            128,
+            512,
+            64,
+            &ram_tier(),
+            KvQuant::F16,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(layout.pages, 64);
+    }
+
+    #[test]
+    fn admission_pelnego_kontekstu_respektuje_max_active_i_pule() {
+        let capacity = kv_full_context_admission_capacity(512, 128, 32, false, 8);
+
+        assert_eq!(capacity, 4);
+    }
+
+    #[test]
+    fn admission_tier_uzywa_minimum_stron_rezydentnych() {
+        let floor = forge_engine::tier::min_resident_pages(32);
+
+        let capacity = kv_full_context_admission_capacity(floor * 3, 128, 32, true, 8);
+
+        assert_eq!(capacity, 3);
+    }
 
     #[test]
     fn parser_rejects_unsupported_budget_and_neural_proposer() {
@@ -1761,9 +2010,7 @@ mod speculation_cli_tests {
 
     #[test]
     fn parser_accepts_mtp_ngram_router() {
-        for (input, expected_budget) in
-            [("mtp+ngram", 3), ("mtp+ngram:2", 2), ("mtp+ngram:3", 3)]
-        {
+        for (input, expected_budget) in [("mtp+ngram", 3), ("mtp+ngram:2", 2), ("mtp+ngram:3", 3)] {
             let config = parse_speculative(input).expect("router powinien być obsługiwany");
             assert_eq!(
                 config.proposers(),

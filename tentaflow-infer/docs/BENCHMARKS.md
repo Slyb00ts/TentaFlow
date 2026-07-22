@@ -98,7 +98,10 @@ Każda próba obejmuje dwa requesty, pełne porównanie ID i sampling GPU. Pomia
 Auto pozostawia `FORGE_HYBRID_PREFILL_BATCH` bez wartości, a OFF używa `0`;
 osobny smoke potwierdza równoważne pełne ID i aktywację B2 dla wartości `1`.
 Zakres wykonawczy jest obecnie ograniczony do NVIDIA warp32 oraz dokładnie
-`B=2`, `T=32`.
+`B=2`, `T=32`. To historyczne A/B mierzyło C1 z wewnętrznym T32. Po zmianie
+Auto C1 na T128 dla zweryfikowanego qwen35 NVFP4 poniższy wiersz OFF nie jest
+wynikiem aktualnego domyślnego C1; odtworzenie wymaga
+`FORGE_HYBRID_PREFILL_CHUNK=32`.
 
 | Prompt | Tryb | Prefill tok/s, mediana | TTFT, mediana | E2E, mediana |
 |---|---|---:|---:|---:|

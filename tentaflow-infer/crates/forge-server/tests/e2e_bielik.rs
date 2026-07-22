@@ -32,7 +32,14 @@ async fn chat_completions_end_to_end() {
             0,
             PoolSizes {
                 weights: 8 << 30,
-                kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16, false),
+                kv_cache: kv_pool_bytes(
+                    &desc,
+                    kv_page_size,
+                    kv_pages,
+                    forge_engine::kv::KvQuant::F16,
+                    false,
+                )
+                .unwrap(),
                 activations: 1 << 30,
                 kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
             },

@@ -64,7 +64,8 @@ async fn constrained_decoding_end_to_end() {
                         kv_pages,
                         forge_engine::kv::KvQuant::F16,
                         false,
-                    ),
+                    )
+                    .unwrap(),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
                 },
@@ -211,11 +212,16 @@ async fn constrained_decoding_end_to_end() {
         let bytes = content.as_bytes();
         let digit = |i: usize| bytes[i].is_ascii_digit();
         assert!(
-            digit(0) && digit(1) && digit(2) && digit(3)
+            digit(0)
+                && digit(1)
+                && digit(2)
+                && digit(3)
                 && bytes[4] == b'-'
-                && digit(5) && digit(6)
+                && digit(5)
+                && digit(6)
                 && bytes[7] == b'-'
-                && digit(8) && digit(9),
+                && digit(8)
+                && digit(9),
             "output did not match {date_re}: {content:?}"
         );
     }
@@ -257,7 +263,10 @@ async fn constrained_decoding_end_to_end() {
         let args = calls[0]["function"]["arguments"].as_str().unwrap();
         let args_json: serde_json::Value =
             serde_json::from_str(args).expect("arguments must be valid JSON");
-        assert!(args_json["city"].is_string(), "city must be a string: {args}");
+        assert!(
+            args_json["city"].is_string(),
+            "city must be a string: {args}"
+        );
         println!("[tool] prompt={p:?} -> {args}");
     }
     println!("forced tool-call validity: 100%");

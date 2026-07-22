@@ -302,8 +302,69 @@ const HYBRID_PREFILL_B2_ARTIFACTS: [&str; 4] = [
     "gemm_q8_0_f16_exact_out_f32_b2",
 ];
 
+const HYBRID_PREFILL_T128_ARTIFACTS: [&str; 10] = [
+    "deltanet_gated_scan_inplace_shared_d128_f16",
+    "deltanet_gated_scan_inplace_dynamic_d128_f16",
+    "gemm_nvfp4_gguf_f16_b2",
+    "gemm_nvfp4_gguf_f16_b3_nvidia",
+    "gemm_nvfp4_gguf_f16_b4_nvidia",
+    "gemm_nvfp4_gguf_f16_b8_nvidia",
+    "gemm_nvfp4_gguf_f16_b16",
+    "gemm_nvfp4_gguf_mma_f16_bm32",
+    "gemm_nvfp4_gguf_mma_f16_bm128",
+    "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
+];
+
 fn has_hybrid_prefill_b2_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
     HYBRID_PREFILL_B2_ARTIFACTS.iter().all(|name| has(name))
+}
+
+fn has_hybrid_prefill_t128_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
+    HYBRID_PREFILL_T128_ARTIFACTS.iter().all(|name| has(name))
+}
+
+fn hybrid_prefill_nvfp4_artifact_chunk_limit(
+    nvidia_warp32: bool,
+    mut has: impl FnMut(&str) -> bool,
+) -> usize {
+    let variant = |generic, nvidia| if nvidia_warp32 { nvidia } else { generic };
+    if !has("deltanet_gated_scan_inplace_dynamic_d128_f16")
+        || !has("gemm_nvfp4_gguf_f16_b2")
+        || !has(variant(
+            "gemm_nvfp4_gguf_f16_b3",
+            "gemm_nvfp4_gguf_f16_b3_nvidia",
+        ))
+    {
+        return 0;
+    }
+    if !has(variant(
+        "gemm_nvfp4_gguf_f16_b4",
+        "gemm_nvfp4_gguf_f16_b4_nvidia",
+    )) {
+        return 3;
+    }
+    if !has(variant(
+        "gemm_nvfp4_gguf_f16_b8",
+        "gemm_nvfp4_gguf_f16_b8_nvidia",
+    )) {
+        return 4;
+    }
+    if !has("gemm_nvfp4_gguf_f16_b16") {
+        return 8;
+    }
+    if !nvidia_warp32 {
+        return 16;
+    }
+    if !has("gemm_nvfp4_gguf_mma_f16_bm32") {
+        return 16;
+    }
+    if !has("deltanet_gated_scan_inplace_shared_d128_f16")
+        || !has("gemm_nvfp4_gguf_mma_f16_bm128")
+        || !has("gemm_nvfp4_gguf_mma_f16_bm128_bn32")
+    {
+        return 32;
+    }
+    128
 }
 
 pub struct Kernels {
@@ -558,6 +619,19 @@ impl Kernels {
     /// Sprawdza komplet artefaktów wymaganych przez ciągły prefill B2 T32.
     pub fn hybrid_prefill_b2_artifacts_capable(&self) -> bool {
         has_hybrid_prefill_b2_artifacts(|name| self.artifacts.has(name))
+    }
+
+    /// Sprawdza artefakty specjalizowanej ścieżki C1 T128 NVFP4.
+    pub fn hybrid_prefill_t128_artifacts_capable(&self) -> bool {
+        has_hybrid_prefill_t128_artifacts(|name| self.artifacts.has(name))
+    }
+
+    /// Zwraca największy chunk NVFP4 obsługiwany przez załadowane artefakty.
+    pub fn hybrid_prefill_nvfp4_artifact_chunk_limit(&self) -> usize {
+        let caps = self.device.caps();
+        let nvidia_warp32 =
+            matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        hybrid_prefill_nvfp4_artifact_chunk_limit(nvidia_warp32, |name| self.artifacts.has(name))
     }
 
     /// Wyznacza długość zaakceptowanego draftu i token korekty na GPU.
@@ -12356,6 +12430,8 @@ mod nvfp4_gguf_dispatch_tests {
         PrequantScratch, PREPARED_Q8_GEMM_LAUNCHES, PREPARED_Q8_RECORD_FAILURES,
         PREPARED_Q8_SYNC_FAILURES, validate_kv_append_batch_segmented_masked_f16,
         has_hybrid_prefill_b2_artifacts, HYBRID_PREFILL_B2_ARTIFACTS,
+        has_hybrid_prefill_t128_artifacts, hybrid_prefill_nvfp4_artifact_chunk_limit,
+        HYBRID_PREFILL_T128_ARTIFACTS,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::cuda::{CudaDevice, PoolSizes};
@@ -12371,6 +12447,82 @@ mod nvfp4_gguf_dispatch_tests {
         for missing in HYBRID_PREFILL_B2_ARTIFACTS {
             assert!(!has_hybrid_prefill_b2_artifacts(|name| name != missing));
         }
+    }
+
+    #[test]
+    fn prefill_t128_wymaga_pelnego_zestawu_artefaktow() {
+        assert!(has_hybrid_prefill_t128_artifacts(|_| true));
+        for missing in HYBRID_PREFILL_T128_ARTIFACTS {
+            assert!(!has_hybrid_prefill_t128_artifacts(|name| name != missing));
+        }
+    }
+
+    #[test]
+    fn limit_artefaktow_prefill_nvidia_sprawdza_kazdy_poziom_dispatchera() {
+        assert_eq!(
+            hybrid_prefill_nvfp4_artifact_chunk_limit(true, |_| true),
+            128
+        );
+        for missing in [
+            "deltanet_gated_scan_inplace_dynamic_d128_f16",
+            "gemm_nvfp4_gguf_f16_b2",
+            "gemm_nvfp4_gguf_f16_b3_nvidia",
+        ] {
+            assert_eq!(
+                hybrid_prefill_nvfp4_artifact_chunk_limit(true, |name| name != missing),
+                0,
+                "brak {missing} powinien wyłączyć automatyczny NVFP4 prefill"
+            );
+        }
+        for (missing, expected) in [
+            ("gemm_nvfp4_gguf_f16_b4_nvidia", 3),
+            ("gemm_nvfp4_gguf_f16_b8_nvidia", 4),
+            ("gemm_nvfp4_gguf_f16_b16", 8),
+            ("gemm_nvfp4_gguf_mma_f16_bm32", 16),
+            ("deltanet_gated_scan_inplace_shared_d128_f16", 32),
+            ("gemm_nvfp4_gguf_mma_f16_bm128", 32),
+            ("gemm_nvfp4_gguf_mma_f16_bm128_bn32", 32),
+        ] {
+            assert_eq!(
+                hybrid_prefill_nvfp4_artifact_chunk_limit(true, |name| name != missing),
+                expected,
+                "brak {missing} powinien ograniczyć chunk do T{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_artefaktow_prefill_przenosny_uzywa_wariantow_generic() {
+        assert_eq!(
+            hybrid_prefill_nvfp4_artifact_chunk_limit(false, |_| true),
+            16
+        );
+        for missing in [
+            "deltanet_gated_scan_inplace_dynamic_d128_f16",
+            "gemm_nvfp4_gguf_f16_b2",
+            "gemm_nvfp4_gguf_f16_b3",
+        ] {
+            assert_eq!(
+                hybrid_prefill_nvfp4_artifact_chunk_limit(false, |name| name != missing),
+                0
+            );
+        }
+        for (missing, expected) in [
+            ("gemm_nvfp4_gguf_f16_b4", 3),
+            ("gemm_nvfp4_gguf_f16_b8", 4),
+            ("gemm_nvfp4_gguf_f16_b16", 8),
+        ] {
+            assert_eq!(
+                hybrid_prefill_nvfp4_artifact_chunk_limit(false, |name| name != missing),
+                expected
+            );
+        }
+        assert_eq!(
+            hybrid_prefill_nvfp4_artifact_chunk_limit(false, |name| {
+                name != "gemm_nvfp4_gguf_f16_b3_nvidia"
+            }),
+            16
+        );
     }
 
     #[test]

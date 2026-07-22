@@ -58,7 +58,8 @@ async fn generation_api_end_to_end() {
                         kv_pages,
                         forge_engine::kv::KvQuant::F16,
                         false,
-                    ),
+                    )
+                    .unwrap(),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
                 },
@@ -271,14 +272,19 @@ async fn generation_api_end_to_end() {
             prev = v;
             sum_exp += v.exp();
         }
-        assert!(sum_exp <= 1.0 + 1e-3, "top-N prob mass exceeds 1: {sum_exp}");
+        assert!(
+            sum_exp <= 1.0 + 1e-3,
+            "top-N prob mass exceeds 1: {sum_exp}"
+        );
         // Greedy: the sampled token is the top-1 alternative.
         assert_eq!(
             entry["token"].as_str().unwrap(),
             top[0]["token"].as_str().unwrap(),
             "at temp 0 the sampled token must be the top-1 logprob token"
         );
-        assert!((entry["logprob"].as_f64().unwrap() - top[0]["logprob"].as_f64().unwrap()).abs() < 1e-6);
+        assert!(
+            (entry["logprob"].as_f64().unwrap() - top[0]["logprob"].as_f64().unwrap()).abs() < 1e-6
+        );
     }
     println!("[logprobs] {} well-formed entries", content.len());
 
@@ -320,7 +326,10 @@ async fn generation_api_end_to_end() {
         .iter()
         .map(|c| c["text"].as_str().unwrap_or("").to_string())
         .collect();
-    assert_eq!(texts, texts2, "seeded n-way generation must be deterministic");
+    assert_eq!(
+        texts, texts2,
+        "seeded n-way generation must be deterministic"
+    );
     println!("[n=3] deterministic across runs");
 
     // Streaming with n>1 is rejected.

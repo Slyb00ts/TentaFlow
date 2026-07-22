@@ -24,10 +24,10 @@ use std::time::{Duration, Instant};
 
 use forge_engine::kv::KvQuant;
 use forge_engine::model::ModelConfig;
+use forge_engine::sample::SamplingParams;
 use forge_engine::server::{
     spawn_engine_batched, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
 };
-use forge_engine::sample::SamplingParams;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
@@ -56,7 +56,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
         0,
         PoolSizes {
             weights: 3 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, KvQuant::F16, false),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, KvQuant::F16, false).unwrap(),
             activations: 1 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -100,7 +100,10 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
 /// tokens, wall-clock). Greedy + deterministic, so text + token count together
 /// pin the exact token sequence.
 fn run(engine: &Engine, prompt: &str, max_tokens: usize) -> (String, u64, Duration) {
-    let prompt_tokens = engine.tokenizer.encode(prompt, true).expect("encode prompt");
+    let prompt_tokens = engine
+        .tokenizer
+        .encode(prompt, true)
+        .expect("encode prompt");
     let req = EngineRequest {
         prompt_tokens,
         max_tokens,
@@ -154,9 +157,8 @@ fn speculative_is_exact_and_faster_on_repetitive() {
     let (norm_text_off, norm_tok_off, norm_dt_off) = run(&off, NORMAL, NORMAL_MAX_TOKENS);
     drop(off); // worker thread ends when the last handle drops
 
-    let Some(on) = load_engine(
-        SpeculativeConfig::ngram(16).expect("budżet powinien być poprawny"),
-    ) else {
+    let Some(on) = load_engine(SpeculativeConfig::ngram(16).expect("budżet powinien być poprawny"))
+    else {
         return;
     };
     run(&on, REPETITIVE, 16);

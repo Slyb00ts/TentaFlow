@@ -63,8 +63,15 @@ impl KvQuant {
     }
 
     /// Packed low-bit bytes per (token, head) vector for `head_dim`.
-    pub fn packed_bytes(self, head_dim: usize) -> Option<usize> {
-        self.bits().map(|b| head_dim * b as usize / 8)
+    pub fn packed_bytes(self, head_dim: usize) -> Result<Option<usize>> {
+        self.bits()
+            .map(|bits| {
+                head_dim
+                    .checked_mul(bits as usize)
+                    .map(|value| value / 8)
+                    .ok_or_else(|| ForgeError::Scheduler("rot packed vector size overflow".into()))
+            })
+            .transpose()
     }
 }
 
@@ -131,17 +138,27 @@ impl KvConfig {
     /// order `KvCache::tier_layer_regions` returns the buffers. F16/Fp8 spill
     /// the paged K and V slabs; rot spills the paged packed store + scales
     /// (the residual ring is a small global overlay and never spills).
-    pub fn tier_region_bytes(&self) -> Vec<usize> {
-        let slots = self.n_kv_heads * self.page_size;
-        match self.quant.packed_bytes(self.head_dim) {
+    pub fn tier_region_bytes(&self) -> Result<Vec<usize>> {
+        let slots = self
+            .n_kv_heads
+            .checked_mul(self.page_size)
+            .ok_or_else(|| ForgeError::Scheduler("tier page slot count overflow".into()))?;
+        match self.quant.packed_bytes(self.head_dim)? {
             Some(pb) => {
-                let packed = slots * pb;
-                let scale = slots * 2;
-                vec![packed, packed, scale, scale]
+                let packed = slots.checked_mul(pb).ok_or_else(|| {
+                    ForgeError::Scheduler("tier packed page size overflow".into())
+                })?;
+                let scale = slots
+                    .checked_mul(2)
+                    .ok_or_else(|| ForgeError::Scheduler("tier scale page size overflow".into()))?;
+                Ok(vec![packed, packed, scale, scale])
             }
             None => {
-                let page = slots * self.head_dim * self.dtype().size();
-                vec![page, page]
+                let page = slots
+                    .checked_mul(self.head_dim)
+                    .and_then(|value| value.checked_mul(self.dtype().size()))
+                    .ok_or_else(|| ForgeError::Scheduler("tier KV page size overflow".into()))?;
+                Ok(vec![page, page])
             }
         }
     }
@@ -238,15 +255,26 @@ impl KvCache {
                 cfg.n_layers
             )));
         }
-        let page_elems = cfg.n_kv_heads * cfg.page_size * cfg.head_dim;
-        let slots = cfg.n_pages * cfg.n_kv_heads * cfg.page_size;
+        let page_elems = cfg
+            .n_kv_heads
+            .checked_mul(cfg.page_size)
+            .and_then(|value| value.checked_mul(cfg.head_dim))
+            .ok_or_else(|| ForgeError::Scheduler("kv page size overflow".into()))?;
+        let slots = cfg
+            .n_pages
+            .checked_mul(cfg.n_kv_heads)
+            .and_then(|value| value.checked_mul(cfg.page_size))
+            .ok_or_else(|| ForgeError::Scheduler("kv slot count overflow".into()))?;
+        let page_count = i32::try_from(cfg.n_pages)
+            .map_err(|_| ForgeError::Scheduler("kv page count exceeds i32 range".into()))?;
         // Rot allocates only the residual ring here (the full history lives in
         // the low-bit packed region below); f16/fp8 allocate the full paged
         // slab. `ring_slots` reuses the same page/head/head_dim element layout
         // but with `ring_slots` slots instead of `n_pages * page_size`.
         let kv_bytes = if let Some(ring_slots) = cfg.quant.ring_slots() {
             ring_slots
-                .checked_mul(cfg.n_kv_heads * cfg.head_dim)
+                .checked_mul(cfg.n_kv_heads)
+                .and_then(|value| value.checked_mul(cfg.head_dim))
                 .and_then(|e| e.checked_mul(cfg.dtype().size()))
                 .ok_or_else(|| ForgeError::Scheduler("kv ring size overflow".into()))?
         } else {
@@ -255,6 +283,37 @@ impl KvCache {
                 .and_then(|e| e.checked_mul(cfg.dtype().size()))
                 .ok_or_else(|| ForgeError::Scheduler("kv cache size overflow".into()))?
         };
+        let packed_layout = if let Some(pb) = cfg.quant.packed_bytes(cfg.head_dim)? {
+            let packed_bytes = slots
+                .checked_mul(pb)
+                .ok_or_else(|| ForgeError::Scheduler("rot packed size overflow".into()))?;
+            let scale_bytes = slots
+                .checked_mul(2)
+                .ok_or_else(|| ForgeError::Scheduler("rot scale size overflow".into()))?;
+            Some((packed_bytes, scale_bytes))
+        } else {
+            None
+        };
+        let base_total = cfg
+            .n_layers
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(kv_bytes))
+            .ok_or_else(|| ForgeError::Scheduler("całkowity rozmiar KV overflow".into()))?;
+        let packed_total = packed_layout
+            .map(|(packed, scale)| {
+                packed
+                    .checked_add(scale)
+                    .and_then(|value| value.checked_mul(2))
+                    .and_then(|value| value.checked_mul(cfg.n_layers))
+                    .ok_or_else(|| {
+                        ForgeError::Scheduler("całkowity rozmiar rot KV overflow".into())
+                    })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let _total_bytes = base_total
+            .checked_add(packed_total)
+            .ok_or_else(|| ForgeError::Scheduler("całkowity rozmiar KV overflow".into()))?;
         let mut k = Vec::with_capacity(cfg.n_layers);
         let mut v = Vec::with_capacity(cfg.n_layers);
         // Bufory warstw zajmują ciągłe zakresy dedykowanej puli KV; logiczne
@@ -268,11 +327,7 @@ impl KvCache {
         let mut v_packed = Vec::new();
         let mut k_scale = Vec::new();
         let mut v_scale = Vec::new();
-        if let Some(pb) = cfg.quant.packed_bytes(cfg.head_dim) {
-            let packed_bytes = slots
-                .checked_mul(pb)
-                .ok_or_else(|| ForgeError::Scheduler("rot packed size overflow".into()))?;
-            let scale_bytes = slots * 2;
+        if let Some((packed_bytes, scale_bytes)) = packed_layout {
             for _ in 0..cfg.n_layers {
                 k_packed.push(device.alloc(packed_bytes, MemKind::Device, Pool::KvCache)?);
                 v_packed.push(device.alloc(packed_bytes, MemKind::Device, Pool::KvCache)?);
@@ -282,7 +337,7 @@ impl KvCache {
         }
         // Stack of free physical page ids shared across layers: a logical page
         // maps to the same physical index in every layer, halving bookkeeping.
-        let free_pages = (0..cfg.n_pages as i32).rev().collect();
+        let free_pages = (0..page_count).rev().collect();
         Ok(KvCache {
             cfg,
             layer_map,
@@ -585,6 +640,36 @@ mod tests {
         assert_eq!(pools.len(), 16);
         assert!(pools.iter().all(|pool| *pool == Pool::KvCache));
         drop((f16, rot));
+    }
+
+    #[test]
+    fn przepelniony_rozmiar_kv_jest_odrzucany_przed_alokacja() {
+        let device = PoolTrackingDevice::new();
+        let mut cfg = config(KvQuant::F16);
+        cfg.n_pages = usize::MAX;
+
+        let result = KvCache::new(&device, cfg);
+
+        assert!(result.is_err());
+        assert!(device.pools().is_empty());
+    }
+
+    #[test]
+    fn przepelniony_rozmiar_rot_jest_odrzucany_przed_alokacja() {
+        let device = PoolTrackingDevice::new();
+        let mut cfg = config(KvQuant::Rot {
+            bits: 4,
+            residual_window: 1,
+            activate_at: 1,
+        });
+        cfg.n_kv_heads = 1;
+        cfg.page_size = 1;
+        cfg.head_dim = usize::MAX / 4 + 1;
+
+        let result = KvCache::new(&device, cfg);
+
+        assert!(result.is_err());
+        assert!(device.pools().is_empty());
     }
 
     #[test]

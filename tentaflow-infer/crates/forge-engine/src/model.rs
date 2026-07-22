@@ -29,26 +29,324 @@ use crate::weights::{
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
-const HYBRID_PREFILL_CHUNK: usize = 32;
+const HYBRID_PREFILL_PORTABLE_CHUNK: usize = 16;
+const HYBRID_PREFILL_LEGACY_CHUNK: usize = 32;
+const HYBRID_PREFILL_AUTO_CHUNK: usize = 128;
+const HYBRID_PREFILL_ACTIVATION_RESERVE: usize = 64 * 1024 * 1024;
 const HYBRID_HOST_STAGING_SLOTS: usize = 3;
 
-fn hybrid_prefill_chunk_size() -> usize {
-    std::env::var("FORGE_HYBRID_PREFILL_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 1 && value <= MAX_PREFILL_CHUNK)
-        .unwrap_or(HYBRID_PREFILL_CHUNK)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HybridPrefillChunkConfig {
+    Auto,
+    Explicit(usize),
+}
+
+fn parse_hybrid_prefill_chunk_config(value: Option<&str>) -> Result<HybridPrefillChunkConfig> {
+    let Some(value) = value else {
+        return Ok(HybridPrefillChunkConfig::Auto);
+    };
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(HybridPrefillChunkConfig::Auto);
+    }
+    let chunk = value.parse::<usize>().map_err(|_| {
+        ForgeError::Unsupported(format!(
+            "FORGE_HYBRID_PREFILL_CHUNK wymaga auto albo liczby całkowitej 3..={MAX_PREFILL_CHUNK}"
+        ))
+    })?;
+    if !(3..=MAX_PREFILL_CHUNK).contains(&chunk) {
+        return Err(ForgeError::Unsupported(format!(
+            "FORGE_HYBRID_PREFILL_CHUNK={chunk} jest poza zakresem 3..={MAX_PREFILL_CHUNK}"
+        )));
+    }
+    Ok(HybridPrefillChunkConfig::Explicit(chunk))
+}
+
+fn hybrid_prefill_chunk_config_for_model(
+    is_hybrid: bool,
+    value: Option<&str>,
+) -> Result<HybridPrefillChunkConfig> {
+    if is_hybrid {
+        parse_hybrid_prefill_chunk_config(value)
+    } else {
+        Ok(HybridPrefillChunkConfig::Auto)
+    }
+}
+
+fn resolve_hybrid_prefill_chunk_size(
+    config: HybridPrefillChunkConfig,
+    auto_extended_capable: bool,
+    auto_t128_capable: bool,
+    contains_nvfp4: bool,
+    auto_chunk_limit: usize,
+    nvfp4_chunk_limit: usize,
+) -> Result<usize> {
+    if contains_nvfp4 && nvfp4_chunk_limit < 3 {
+        return Err(ForgeError::Unsupported(
+            "backend lub artefakty nie obsługują minimalnego wykonania T3 dla NVFP4".into(),
+        ));
+    }
+    if let HybridPrefillChunkConfig::Explicit(chunk) = config {
+        if chunk < 3 {
+            return Err(ForgeError::Unsupported(
+                "jawny chunk hybrydowego prefill musi mieć co najmniej T3".into(),
+            ));
+        }
+        if contains_nvfp4 && chunk > nvfp4_chunk_limit {
+            return Err(ForgeError::Unsupported(format!(
+                "FORGE_HYBRID_PREFILL_CHUNK={chunk} przekracza limit NVFP4 backendu lub artefaktów {nvfp4_chunk_limit}"
+            )));
+        }
+        return Ok(chunk);
+    }
+    if !contains_nvfp4 {
+        return Ok(HYBRID_PREFILL_LEGACY_CHUNK);
+    }
+    let policy_limit = if auto_extended_capable {
+        auto_chunk_limit.min(if auto_t128_capable {
+            HYBRID_PREFILL_AUTO_CHUNK
+        } else {
+            HYBRID_PREFILL_LEGACY_CHUNK
+        })
+    } else {
+        auto_chunk_limit.min(HYBRID_PREFILL_PORTABLE_CHUNK)
+    };
+    [128, 32, 16, 8, 4, 3]
+        .into_iter()
+        .find(|&chunk| chunk <= policy_limit)
+        .ok_or_else(|| {
+            ForgeError::Unsupported(
+                "backend, artefakty lub budżet nie obsługują minimalnego chunka Auto T3 NVFP4"
+                    .into(),
+            )
+        })
+}
+
+fn hybrid_prefill_t128_backend_capable(vendor: Vendor, warp_size: u32) -> bool {
+    vendor == Vendor::Nvidia && warp_size == 32
+}
+
+fn hybrid_prefill_nvfp4_chunk_limit(
+    vendor: Vendor,
+    warp_size: u32,
+    max_threads_per_block: u32,
+) -> usize {
+    if warp_size == 0 || warp_size > max_threads_per_block {
+        return 0;
+    }
+    if vendor == Vendor::Nvidia && warp_size == 32 {
+        return if max_threads_per_block >= 512 {
+            MAX_PREFILL_CHUNK
+        } else if max_threads_per_block >= 64 {
+            8
+        } else {
+            2
+        };
+    }
+    if warp_size
+        .checked_mul(16)
+        .is_some_and(|threads| threads <= max_threads_per_block)
+    {
+        16
+    } else if warp_size
+        .checked_mul(8)
+        .is_some_and(|threads| threads <= max_threads_per_block)
+    {
+        8
+    } else {
+        4
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HybridPrefillScratchShape {
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    inter: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    n_v_heads: usize,
+    d_state: usize,
+    d_conv: usize,
+    delta_layers: usize,
+    max_pages_per_seq: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HybridPrefillScratchEstimate {
+    device_bytes: usize,
+    pinned_bytes: usize,
+}
+
+fn checked_scratch_bytes(name: &str, dimensions: &[usize], element_bytes: usize) -> Result<usize> {
+    dimensions
+        .iter()
+        .try_fold(element_bytes, |bytes, &dimension| {
+            bytes.checked_mul(dimension).ok_or_else(|| {
+                ForgeError::Scheduler(format!("przepełnienie estymatora scratchu {name}"))
+            })
+        })
+}
+
+fn checked_scratch_sum(name: &str, values: impl IntoIterator<Item = usize>) -> Result<usize> {
+    values.into_iter().try_fold(0usize, |total, value| {
+        total.checked_add(value).ok_or_else(|| {
+            ForgeError::Scheduler(format!("przepełnienie estymatora scratchu {name}"))
+        })
+    })
+}
+
+fn hybrid_verify_scratch_estimate(
+    shape: HybridPrefillScratchShape,
+    cap: usize,
+) -> Result<HybridPrefillScratchEstimate> {
+    let q_full_cols = hybrid_q_full_cols(shape.q_dim, shape.conv_dim, shape.hidden);
+    let wide_cols = shape.q_dim.max(shape.value_dim);
+    let conv_elems = shape
+        .conv_dim
+        .checked_mul(shape.d_conv.saturating_sub(1))
+        .ok_or_else(|| ForgeError::Scheduler("przepełnienie estymatora okna conv".into()))?;
+    let state_elems = shape
+        .n_v_heads
+        .checked_mul(shape.d_state)
+        .and_then(|value| value.checked_mul(shape.d_state))
+        .ok_or_else(|| ForgeError::Scheduler("przepełnienie estymatora stanu DeltaNet".into()))?;
+    let mut device = vec![
+        4,
+        checked_scratch_bytes("visible lengths", &[cap], 4)?,
+        checked_scratch_bytes("q full", &[cap, q_full_cols], 2)?,
+        checked_scratch_bytes("q, gate i gated", &[3, cap, wide_cols], 2)?,
+        checked_scratch_bytes("alpha i beta raw", &[2, cap, shape.n_v_heads], 2)?,
+        checked_scratch_bytes("g i beta", &[2, cap, shape.n_v_heads], 4)?,
+        8,
+    ];
+    if cap > 4 {
+        device.extend([
+            checked_scratch_bytes("recurrence output", &[cap, shape.value_dim], 2)?,
+            4,
+        ]);
+    } else {
+        device.extend([
+            checked_scratch_bytes("mixed qkv", &[cap, shape.conv_dim], 2)?,
+            checked_scratch_bytes("z, q32, k32 i v", &[4, cap, shape.value_dim], 2)?,
+            checked_scratch_bytes("recurrence output i norm", &[2, cap, shape.value_dim], 2)?,
+            checked_scratch_bytes("state checkpoints", &[cap, state_elems], 4)?,
+            checked_scratch_bytes(
+                "retained state checkpoints",
+                &[shape.delta_layers, cap, state_elems],
+                4,
+            )?,
+        ]);
+    }
+    device.push(checked_scratch_bytes(
+        "warstwy DeltaNet",
+        &[
+            shape.delta_layers,
+            checked_scratch_sum(
+                "warstwy DeltaNet",
+                [
+                    checked_scratch_bytes("conv initial", &[conv_elems], 2)?,
+                    checked_scratch_bytes("conv checkpoints", &[cap, conv_elems], 2)?,
+                    if cap > 4 {
+                        4
+                    } else {
+                        checked_scratch_bytes("state initial", &[state_elems], 4)?
+                    },
+                ],
+            )?,
+        ],
+        1,
+    )?);
+    let staging_slot = checked_scratch_sum(
+        "staging hostowy",
+        [
+            checked_scratch_bytes("embedding staging", &[cap, shape.hidden], 2)?,
+            checked_scratch_bytes("page table staging", &[2, shape.max_pages_per_seq], 4)?,
+            checked_scratch_bytes("wektory staging", &[5, cap], 4)?,
+            24,
+        ],
+    )?;
+    Ok(HybridPrefillScratchEstimate {
+        device_bytes: checked_scratch_sum("verifier device", device)?,
+        pinned_bytes: checked_scratch_sum(
+            "verifier pinned",
+            [
+                8,
+                checked_scratch_bytes(
+                    "potrójny staging",
+                    &[HYBRID_HOST_STAGING_SLOTS, staging_slot],
+                    1,
+                )?,
+            ],
+        )?,
+    })
+}
+
+fn hybrid_prefill_scratch_estimate(
+    shape: HybridPrefillScratchShape,
+    chunk: usize,
+) -> Result<HybridPrefillScratchEstimate> {
+    let prefill_device = checked_scratch_sum(
+        "prefill device",
+        [
+            checked_scratch_bytes("prefill hidden", &[4, chunk, shape.hidden], 2)?,
+            checked_scratch_bytes("prefill q", &[2, chunk, shape.q_dim], 2)?,
+            checked_scratch_bytes("prefill kv", &[2, chunk, shape.kv_dim], 2)?,
+            checked_scratch_bytes("prefill ffn", &[2, chunk, shape.inter], 2)?,
+            checked_scratch_bytes("prefill metadata", &[2, chunk], 4)?,
+        ],
+    )?;
+    let verifier = hybrid_verify_scratch_estimate(shape, 4)?;
+    let prefill_verifier = hybrid_verify_scratch_estimate(shape, chunk.max(4))?;
+    Ok(HybridPrefillScratchEstimate {
+        device_bytes: checked_scratch_sum(
+            "łączne bufory device",
+            [
+                prefill_device,
+                verifier.device_bytes,
+                prefill_verifier.device_bytes,
+            ],
+        )?,
+        pinned_bytes: checked_scratch_sum(
+            "łączne bufory pinned",
+            [verifier.pinned_bytes, prefill_verifier.pinned_bytes],
+        )?,
+    })
+}
+
+fn hybrid_prefill_activation_budget_capable(
+    estimate: HybridPrefillScratchEstimate,
+    available: Option<usize>,
+) -> bool {
+    estimate
+        .device_bytes
+        .checked_add(HYBRID_PREFILL_ACTIVATION_RESERVE)
+        .zip(available)
+        .is_some_and(|(required, available)| required <= available)
 }
 
 fn hybrid_prefill_profile_spans(prompt_tokens: usize, chunk_size: usize) -> usize {
     let full_outer = prompt_tokens / MAX_PREFILL_CHUNK;
     let remainder = prompt_tokens % MAX_PREFILL_CHUNK;
-    full_outer * MAX_PREFILL_CHUNK.div_ceil(chunk_size)
-        + if remainder == 0 {
-            0
-        } else {
-            remainder.div_ceil(chunk_size)
-        }
+    full_outer * hybrid_prefill_inner_chunk_count(MAX_PREFILL_CHUNK, chunk_size)
+        + hybrid_prefill_inner_chunk_count(remainder, chunk_size)
+}
+
+fn hybrid_prefill_inner_chunk_count(mut tokens: usize, chunk_size: usize) -> usize {
+    let mut chunks = 0;
+    while tokens > 0 {
+        tokens -= hybrid_prefill_step_size(tokens, chunk_size);
+        chunks += 1;
+    }
+    chunks
+}
+
+fn hybrid_prefill_step_size(remaining: usize, chunk_size: usize) -> usize {
+    if remaining == chunk_size + 1 {
+        chunk_size - 1
+    } else {
+        remaining.min(chunk_size)
+    }
 }
 
 fn hybrid_q_full_cols(q_dim: usize, conv_dim: usize, hidden_size: usize) -> usize {
@@ -355,6 +653,8 @@ pub struct Model {
     bufs: DecodeBufs,
     /// Batched-prefill scratch; allocated lazily on the first prefill_chunk.
     prefill_bufs: Option<PrefillBufs>,
+    /// Rozmiar wewnętrznego chunka hybrydowego prefill, wybrany raz przy ładowaniu.
+    hybrid_prefill_chunk_size: usize,
     /// Speculative-verification logit scratch (SPEC §6): the [T, vocab] f32
     /// logits of one draft-verification forward. Allocated lazily on the first
     /// `verify_greedy_draft`; `None` until speculation runs.
@@ -1177,6 +1477,7 @@ struct DecodeBufs {
 /// matrices are [T, cols] row-major; the batched GEMMs consume them directly
 /// (token/column tails are clamped inside the kernels).
 struct PrefillBufs {
+    cap: usize,
     h: DevBuffer,
     x: DevBuffer,
     q: DevBuffer,
@@ -1713,12 +2014,17 @@ impl Model {
         let page_table_dev = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
         let seq_len_dev = device.alloc(4, MemKind::Device, Pool::Weights)?;
         let (tier, tier_bufs) = if cfg.kv_tier.enabled() {
-            let region_bytes = kv.cfg.tier_region_bytes();
+            let region_bytes = kv.cfg.tier_region_bytes()?;
             let mut slots = Vec::with_capacity(STAGE_SLOTS);
             for _ in 0..STAGE_SLOTS {
                 let stage = region_bytes
                     .iter()
-                    .map(|&rb| device.alloc(max_pages_per_seq * rb, MemKind::Device, Pool::Weights))
+                    .map(|&rb| {
+                        let bytes = max_pages_per_seq.checked_mul(rb).ok_or_else(|| {
+                            ForgeError::Scheduler("rozmiar staging tier KV przekracza usize".into())
+                        })?;
+                        device.alloc(bytes, MemKind::Device, Pool::Weights)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 slots.push(StageSlot {
                     stage,
@@ -1904,7 +2210,7 @@ impl Model {
             && weights.descriptor.params.ssm.is_none();
         let prefix_cache =
             prefix_eligible.then(|| crate::prefix::PrefixCache::new(cfg.kv_page_size));
-        Ok(Model {
+        let mut model = Model {
             device,
             kernels,
             weights,
@@ -1915,6 +2221,7 @@ impl Model {
             max_pages_per_seq,
             bufs,
             prefill_bufs: None,
+            hybrid_prefill_chunk_size: HYBRID_PREFILL_PORTABLE_CHUNK,
             verify_bufs: None,
             hybrid_verify_bufs: None,
             mtp_b2_bufs: None,
@@ -1938,7 +2245,58 @@ impl Model {
             prefix_cache,
             calib: None,
             prefill_profiles: VecDeque::new(),
-        })
+        };
+        let configured = model
+            .is_hybrid()
+            .then(|| std::env::var("FORGE_HYBRID_PREFILL_CHUNK").ok())
+            .flatten();
+        let chunk_config =
+            hybrid_prefill_chunk_config_for_model(model.is_hybrid(), configured.as_deref())?;
+        let contains_nvfp4 = model.hybrid_prefill_contains_nvfp4();
+        let extended_requested = contains_nvfp4
+            && match chunk_config {
+                HybridPrefillChunkConfig::Auto => {
+                    model.hybrid_prefill_extended_structural_capable()
+                        && model.kernels.hybrid_prefill_nvfp4_artifact_chunk_limit()
+                            > HYBRID_PREFILL_PORTABLE_CHUNK
+                }
+                HybridPrefillChunkConfig::Explicit(chunk) => chunk > HYBRID_PREFILL_PORTABLE_CHUNK,
+            };
+        if extended_requested {
+            let structurally_capable = match chunk_config {
+                HybridPrefillChunkConfig::Auto => {
+                    model.hybrid_prefill_extended_structural_capable()
+                }
+                HybridPrefillChunkConfig::Explicit(_) => {
+                    model.hybrid_prefill_t128_structural_capable()
+                }
+            };
+            if !structurally_capable {
+                return Err(ForgeError::Unsupported(
+                    "rozszerzony chunk NVFP4 wymaga kompletnej ścieżki qwen35 T128".into(),
+                ));
+            }
+            model.ensure_hybrid_bufs()?;
+        }
+        let selected = model.resolve_hybrid_prefill_chunk_size(chunk_config)?;
+        if contains_nvfp4 && selected > HYBRID_PREFILL_PORTABLE_CHUNK {
+            if !model.hybrid_prefill_extended_budget_capable(selected) {
+                return Err(ForgeError::Unsupported(format!(
+                    "pula activations nie mieści scratchu NVFP4 T{selected} z rezerwą"
+                )));
+            }
+            model.hybrid_prefill_chunk_size = selected;
+            model.ensure_hybrid_prefill_capacity(selected)?;
+        } else {
+            model.hybrid_prefill_chunk_size = selected;
+        }
+        if model.is_hybrid() {
+            tracing::info!(
+                chunk = model.hybrid_prefill_chunk_size,
+                "wybrano wewnętrzny chunk hybrydowego prefill"
+            );
+        }
+        Ok(model)
     }
 
     /// Przygotowuje wszystkie eventy przed startem workera, aby ich alokacja
@@ -1960,7 +2318,7 @@ impl Model {
             && prompt_tokens > 1
             && self.validate_hybrid_speculation_target().is_ok();
         let target_spans = if hybrid_batched {
-            hybrid_prefill_profile_spans(prompt_tokens, hybrid_prefill_chunk_size())
+            hybrid_prefill_profile_spans(prompt_tokens, self.hybrid_prefill_chunk_size)
         } else if hybrid {
             prompt_tokens
         } else {
@@ -4048,19 +4406,23 @@ impl Model {
     }
 
     fn ensure_prefill_bufs(&mut self) -> Result<()> {
-        if self.prefill_bufs.is_some() {
-            return Ok(());
-        }
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
         let inter = p.intermediate_size;
         let t_max = if self.is_hybrid() {
-            hybrid_prefill_chunk_size().max(4)
+            self.hybrid_prefill_chunk_size.max(4)
         } else {
             MAX_PREFILL_CHUNK
         };
+        if self
+            .prefill_bufs
+            .as_ref()
+            .is_some_and(|bufs| bufs.cap >= t_max)
+        {
+            return Ok(());
+        }
         let alloc = |elems: usize| {
             self.device
                 .alloc(elems * 2, MemKind::Device, Pool::Activations)
@@ -4072,6 +4434,7 @@ impl Model {
             alloc(t_max * inter)?
         };
         self.prefill_bufs = Some(PrefillBufs {
+            cap: t_max,
             h: alloc(t_max * hidden)?,
             x: alloc(t_max * hidden)?,
             q: alloc(t_max * q_dim)?,
@@ -10300,6 +10663,139 @@ impl Model {
         self.weights.descriptor.params.ssm.is_some()
     }
 
+    fn hybrid_prefill_contains_nvfp4(&self) -> bool {
+        self.weights.layers.iter().any(|layer| {
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return false;
+            };
+            let gate_up = match &ffn.gate_up {
+                GateUpWeights::Fused(weight) => matches!(weight, DevWeight::NvFp4Gguf { .. }),
+                GateUpWeights::Split { gate, up } => {
+                    matches!(gate, DevWeight::NvFp4Gguf { .. })
+                        || matches!(up, DevWeight::NvFp4Gguf { .. })
+                }
+            };
+            gate_up || matches!(ffn.down, DevWeight::NvFp4Gguf { .. })
+        })
+    }
+
+    fn hybrid_prefill_scratch_shape(&self) -> Option<HybridPrefillScratchShape> {
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.as_ref()?;
+        Some(HybridPrefillScratchShape {
+            hidden: p.hidden_size,
+            q_dim: p.n_heads.checked_mul(p.head_dim)?,
+            kv_dim: p.n_kv_heads.checked_mul(p.head_dim)?,
+            inter: p.intermediate_size,
+            conv_dim: ssm.conv_dim(),
+            value_dim: ssm.value_dim(),
+            n_v_heads: ssm.n_v_heads(),
+            d_state: ssm.d_state,
+            d_conv: ssm.d_conv,
+            delta_layers: self
+                .weights
+                .layers
+                .iter()
+                .filter(|layer| matches!(layer.mixer, LayerMixer::DeltaNet(_)))
+                .count(),
+            max_pages_per_seq: self.max_pages_per_seq,
+        })
+    }
+
+    fn hybrid_prefill_extended_structural_capable(&self) -> bool {
+        let caps = self.device.caps();
+        hybrid_prefill_t128_backend_capable(caps.vendor, caps.warp_size)
+            && caps.max_threads_per_block >= 512
+            && self.weights.descriptor.arch == "qwen35"
+            && self.weights.token_embd_host.is_some()
+            && self.validate_hybrid_speculation_target().is_ok()
+            && self
+                .weights
+                .descriptor
+                .params
+                .ssm
+                .as_ref()
+                .is_some_and(|ssm| ssm.d_state == 128)
+            && self.weights.layers.iter().all(|layer| {
+                let LayerFfn::Dense(ffn) = &layer.ffn else {
+                    return false;
+                };
+                let gate_up = match &ffn.gate_up {
+                    GateUpWeights::Fused(weight) => {
+                        matches!(weight, DevWeight::NvFp4Gguf { .. })
+                    }
+                    GateUpWeights::Split { gate, up } => {
+                        matches!(gate, DevWeight::NvFp4Gguf { .. })
+                            && matches!(up, DevWeight::NvFp4Gguf { .. })
+                    }
+                };
+                gate_up && matches!(ffn.down, DevWeight::NvFp4Gguf { .. })
+            })
+    }
+
+    fn hybrid_prefill_t128_structural_capable(&self) -> bool {
+        self.hybrid_prefill_extended_structural_capable()
+            && self.kernels.hybrid_prefill_t128_artifacts_capable()
+    }
+
+    fn hybrid_prefill_extended_budget_capable(&self, chunk: usize) -> bool {
+        let Some(shape) = self.hybrid_prefill_scratch_shape() else {
+            return false;
+        };
+        let Ok(estimate) = hybrid_prefill_scratch_estimate(shape, chunk) else {
+            return false;
+        };
+        hybrid_prefill_activation_budget_capable(
+            estimate,
+            self.device.pool_available(Pool::Activations),
+        )
+    }
+
+    fn resolve_hybrid_prefill_chunk_size(&self, config: HybridPrefillChunkConfig) -> Result<usize> {
+        if !self.is_hybrid() {
+            return Ok(HYBRID_PREFILL_PORTABLE_CHUNK);
+        }
+        let caps = self.device.caps();
+        let nvfp4_chunk_limit = hybrid_prefill_nvfp4_chunk_limit(
+            caps.vendor,
+            caps.warp_size,
+            caps.max_threads_per_block,
+        );
+        let artifact_chunk_limit = self.kernels.hybrid_prefill_nvfp4_artifact_chunk_limit();
+        let extended_capable = self.hybrid_prefill_extended_structural_capable();
+        let executable_chunk_limit = nvfp4_chunk_limit.min(artifact_chunk_limit);
+        let supported_limit = executable_chunk_limit.min(HYBRID_PREFILL_AUTO_CHUNK);
+        let budget_chunk_limit = if extended_capable && supported_limit > 16 {
+            [128, 32]
+                .into_iter()
+                .find(|&chunk| {
+                    chunk <= supported_limit && self.hybrid_prefill_extended_budget_capable(chunk)
+                })
+                .unwrap_or(HYBRID_PREFILL_PORTABLE_CHUNK)
+        } else {
+            supported_limit.min(HYBRID_PREFILL_PORTABLE_CHUNK)
+        };
+        let auto_chunk_limit = supported_limit.min(budget_chunk_limit);
+        resolve_hybrid_prefill_chunk_size(
+            config,
+            extended_capable,
+            self.hybrid_prefill_t128_structural_capable()
+                && auto_chunk_limit >= HYBRID_PREFILL_AUTO_CHUNK,
+            self.hybrid_prefill_contains_nvfp4(),
+            auto_chunk_limit,
+            executable_chunk_limit,
+        )
+    }
+
+    fn ensure_hybrid_prefill_capacity(&mut self, cap: usize) -> Result<()> {
+        self.ensure_prefill_bufs()?;
+        self.ensure_hybrid_verify_bufs(4)?;
+        std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+        let result = self.ensure_hybrid_verify_bufs(cap.max(4));
+        std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+        result
+    }
+
     fn hybrid_batch_b2_weights_capable(&self) -> bool {
         fn full_rows(weight: &DevWeight) -> bool {
             matches!(
@@ -12028,7 +12524,7 @@ impl Model {
         }
         self.ensure_hybrid_bufs()?;
         self.ensure_prefill_bufs()?;
-        let chunk_size = hybrid_prefill_chunk_size();
+        let chunk_size = self.hybrid_prefill_chunk_size;
         let prefill_cap = tokens.len().min(chunk_size);
         let saved_graphs = if prefill_cap > 4 {
             self.ensure_hybrid_verify_bufs(4)?;
@@ -12045,16 +12541,12 @@ impl Model {
 
             let hidden_bytes = p.hidden_size * 2;
             let mut last_logits = Vec::new();
-            let chunk_count = tokens.len().div_ceil(chunk_size);
             let mut staging_recorded = [false; HYBRID_HOST_STAGING_SLOTS];
             let mut offset = 0usize;
-            for chunk_index in 0..chunk_count {
+            let mut chunk_index = 0usize;
+            while offset < tokens.len() {
                 let remaining = tokens.len() - offset;
-                let t = if remaining == chunk_size + 1 {
-                    chunk_size - 1
-                } else {
-                    remaining.min(chunk_size)
-                };
+                let t = hybrid_prefill_step_size(remaining, chunk_size);
                 let chunk = &tokens[offset..offset + t];
                 offset += t;
                 let t = chunk.len();
@@ -12163,7 +12655,7 @@ impl Model {
                     hidden_bytes,
                     &self.stream,
                 )?;
-                if chunk_index + 1 == chunk_count {
+                if offset == tokens.len() {
                     self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
                     self.device.copy(
                         &self.bufs.logits,
@@ -12181,6 +12673,7 @@ impl Model {
                     self.mtp_catchup_verified_prefix(seq, t, staging_slot, Some(&staging_ready))?;
                 }
                 self.profile_catchup_end()?;
+                chunk_index += 1;
             }
             self.device.synchronize()?;
             let logits = self
@@ -13450,6 +13943,12 @@ mod verify_rollback_tests {
         native_mtp_greedy_decision, restore_after, rollback_mtp_pair,
         validate_mtp_pair_metadata_commit, validate_mtp_routed_inputs, ForgeError,
         HybridStatePool, KvCache, KvConfig, KvQuant, LayerKind, Result, SeqKv,
+        hybrid_prefill_activation_budget_capable, hybrid_prefill_chunk_config_for_model,
+        hybrid_prefill_inner_chunk_count, hybrid_prefill_nvfp4_chunk_limit,
+        hybrid_prefill_scratch_estimate, hybrid_prefill_step_size,
+        hybrid_prefill_t128_backend_capable, parse_hybrid_prefill_chunk_config,
+        resolve_hybrid_prefill_chunk_size, HybridPrefillChunkConfig,
+        HybridPrefillScratchShape, Vendor,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
@@ -13923,6 +14422,310 @@ mod verify_rollback_tests {
         assert_eq!(hybrid_prefill_profile_spans(1025, 128), 9);
         assert_eq!(hybrid_prefill_profile_spans(1153, 128), 10);
         assert_eq!(hybrid_prefill_profile_spans(2048, 128), 16);
+        assert_eq!(hybrid_prefill_profile_spans(4, 3), 2);
+        assert_eq!(hybrid_prefill_profile_spans(5, 3), 2);
+    }
+
+    #[test]
+    fn auto_prefill_wybiera_t128_tylko_dla_pelnego_gate() {
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Auto,
+                true,
+                true,
+                true,
+                128,
+                1024,
+            )
+            .unwrap(),
+            128
+        );
+    }
+
+    #[test]
+    fn auto_prefill_nvidia_po_braku_budzetu_t128_wybiera_t32() {
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Auto,
+                true,
+                false,
+                true,
+                32,
+                1024,
+            )
+            .unwrap(),
+            32
+        );
+    }
+
+    #[test]
+    fn auto_prefill_backend_przenosny_wybiera_t16() {
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Auto,
+                false,
+                false,
+                true,
+                16,
+                16,
+            )
+            .unwrap(),
+            16
+        );
+    }
+
+    #[test]
+    fn auto_prefill_respektuje_limit_artefaktow() {
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Auto,
+                true,
+                false,
+                true,
+                32,
+                1024,
+            )
+            .unwrap(),
+            32
+        );
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Auto,
+                true,
+                false,
+                true,
+                16,
+                1024,
+            )
+            .unwrap(),
+            16
+        );
+        for chunk in [8, 4, 3] {
+            assert_eq!(
+                resolve_hybrid_prefill_chunk_size(
+                    HybridPrefillChunkConfig::Auto,
+                    false,
+                    false,
+                    true,
+                    chunk,
+                    1024,
+                )
+                .unwrap(),
+                chunk
+            );
+        }
+        assert!(resolve_hybrid_prefill_chunk_size(
+            HybridPrefillChunkConfig::Auto,
+            false,
+            false,
+            true,
+            2,
+            1024,
+        )
+        .is_err());
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Auto,
+                false,
+                false,
+                false,
+                0,
+                0,
+            )
+            .unwrap(),
+            32
+        );
+        assert!(hybrid_prefill_t128_backend_capable(Vendor::Nvidia, 32));
+        assert!(!hybrid_prefill_t128_backend_capable(Vendor::Nvidia, 64));
+        assert!(!hybrid_prefill_t128_backend_capable(Vendor::Amd, 32));
+        assert!(!hybrid_prefill_t128_backend_capable(Vendor::Apple, 32));
+        assert!(!hybrid_prefill_t128_backend_capable(Vendor::Cpu, 32));
+        assert_eq!(
+            hybrid_prefill_nvfp4_chunk_limit(Vendor::Nvidia, 32, 1024),
+            1024
+        );
+        assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Nvidia, 32, 256), 8);
+        assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Amd, 64, 1024), 16);
+        assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Apple, 32, 256), 8);
+        assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Cpu, 1, 1), 4);
+        assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Cpu, 32, 1), 0);
+    }
+
+    #[test]
+    fn jawny_chunk_prefill_zachowuje_wartosc_lub_konczy_startup_bledem() {
+        for chunk in [3, 16, 64, 128, 1024] {
+            assert_eq!(
+                resolve_hybrid_prefill_chunk_size(
+                    HybridPrefillChunkConfig::Explicit(chunk),
+                    false,
+                    false,
+                    true,
+                    0,
+                    1024,
+                )
+                .unwrap(),
+                chunk
+            );
+        }
+        assert!(resolve_hybrid_prefill_chunk_size(
+            HybridPrefillChunkConfig::Explicit(64),
+            false,
+            false,
+            true,
+            0,
+            16
+        )
+        .is_err());
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Explicit(16),
+                false,
+                false,
+                true,
+                0,
+                16
+            )
+            .unwrap(),
+            16
+        );
+        assert!(resolve_hybrid_prefill_chunk_size(
+            HybridPrefillChunkConfig::Explicit(4),
+            false,
+            false,
+            true,
+            0,
+            3,
+        )
+        .is_err());
+        assert!(resolve_hybrid_prefill_chunk_size(
+            HybridPrefillChunkConfig::Explicit(2),
+            false,
+            false,
+            true,
+            0,
+            2,
+        )
+        .is_err());
+        assert!(resolve_hybrid_prefill_chunk_size(
+            HybridPrefillChunkConfig::Explicit(2),
+            false,
+            false,
+            true,
+            0,
+            3,
+        )
+        .is_err());
+        assert!(resolve_hybrid_prefill_chunk_size(
+            HybridPrefillChunkConfig::Auto,
+            false,
+            false,
+            true,
+            0,
+            0
+        )
+        .is_err());
+        assert_eq!(
+            parse_hybrid_prefill_chunk_config(None).unwrap(),
+            HybridPrefillChunkConfig::Auto
+        );
+        assert_eq!(
+            parse_hybrid_prefill_chunk_config(Some("auto")).unwrap(),
+            HybridPrefillChunkConfig::Auto
+        );
+        assert_eq!(
+            parse_hybrid_prefill_chunk_config(Some("128")).unwrap(),
+            HybridPrefillChunkConfig::Explicit(128)
+        );
+        assert!(parse_hybrid_prefill_chunk_config(Some("1")).is_err());
+        assert!(parse_hybrid_prefill_chunk_config(Some("2")).is_err());
+        assert!(parse_hybrid_prefill_chunk_config(Some("1025")).is_err());
+        assert!(parse_hybrid_prefill_chunk_config(Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn konfiguracja_chunka_dotyczy_tylko_modelu_hybrydowego() {
+        assert_eq!(
+            hybrid_prefill_chunk_config_for_model(false, Some("invalid")).unwrap(),
+            HybridPrefillChunkConfig::Auto
+        );
+        assert!(hybrid_prefill_chunk_config_for_model(true, Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn chunk_prefill_omija_jednoelementowy_ogon() {
+        assert_eq!(hybrid_prefill_step_size(129, 128), 127);
+        assert_eq!(hybrid_prefill_step_size(4, 3), 2);
+        assert_eq!(hybrid_prefill_step_size(3, 3), 3);
+        assert_eq!(hybrid_prefill_step_size(2, 3), 2);
+        assert_eq!(hybrid_prefill_step_size(1, 3), 1);
+        assert_eq!(hybrid_prefill_step_size(2, 128), 2);
+        assert_eq!(hybrid_prefill_step_size(128, 128), 128);
+
+        for chunk_size in [3, 4, 8, 16, 32, 128] {
+            for prompt_tokens in 2..=257 {
+                let mut remaining = prompt_tokens;
+                let mut chunks = 0;
+                while remaining > 0 {
+                    let step = hybrid_prefill_step_size(remaining, chunk_size);
+                    assert!(step >= 2, "T1 dla promptu {prompt_tokens} i T{chunk_size}");
+                    assert!(step <= chunk_size);
+                    remaining -= step;
+                    chunks += 1;
+                }
+                assert_eq!(
+                    chunks,
+                    hybrid_prefill_inner_chunk_count(prompt_tokens, chunk_size)
+                );
+            }
+        }
+    }
+
+    fn testowy_ksztalt_scratchu() -> HybridPrefillScratchShape {
+        HybridPrefillScratchShape {
+            hidden: 5120,
+            q_dim: 6144,
+            kv_dim: 1024,
+            inter: 17408,
+            conv_dim: 6144,
+            value_dim: 4096,
+            n_v_heads: 16,
+            d_state: 128,
+            d_conv: 4,
+            delta_layers: 12,
+            max_pages_per_seq: 256,
+        }
+    }
+
+    #[test]
+    fn estimator_scratchu_uwzglednia_cap4_cap128_i_staging() {
+        let t16 = hybrid_prefill_scratch_estimate(testowy_ksztalt_scratchu(), 16).unwrap();
+        let t128 = hybrid_prefill_scratch_estimate(testowy_ksztalt_scratchu(), 128).unwrap();
+        assert!(t128.device_bytes > t16.device_bytes);
+        assert!(t128.pinned_bytes > t16.pinned_bytes);
+        assert!(t128.device_bytes > 64 * 1024 * 1024);
+        assert!(t128.pinned_bytes > 3 * 128 * 5120 * 2);
+    }
+
+    #[test]
+    fn auto_t128_wymaga_pelnego_budzetu_z_rezerwa() {
+        let estimate = hybrid_prefill_scratch_estimate(testowy_ksztalt_scratchu(), 128).unwrap();
+        let required = estimate.device_bytes + super::HYBRID_PREFILL_ACTIVATION_RESERVE;
+        assert!(hybrid_prefill_activation_budget_capable(
+            estimate,
+            Some(required)
+        ));
+        assert!(!hybrid_prefill_activation_budget_capable(
+            estimate,
+            Some(required - 1)
+        ));
+        assert!(!hybrid_prefill_activation_budget_capable(estimate, None));
+    }
+
+    #[test]
+    fn estimator_scratchu_odrzuca_przepelnienie() {
+        let mut shape = testowy_ksztalt_scratchu();
+        shape.hidden = usize::MAX;
+        assert!(hybrid_prefill_scratch_estimate(shape, 128).is_err());
     }
 
     #[test]

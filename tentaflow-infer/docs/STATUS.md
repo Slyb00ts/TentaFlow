@@ -12,6 +12,25 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-22.
 
+- ✅ **Auto C1 T128 dla hybrydowego NVFP4 (2026-07-22).** Brak
+  `FORGE_HYBRID_PREFILL_CHUNK` wybiera chunk 128 wyłącznie dla gęstego qwen35
+  z `d_state=128`, FFN NVFP4 GGUF, kompletem artefaktów T128 i NVIDIA warp32.
+  Checked estimator wymaga miejsca na jednoczesny scratch zwykłego prefill,
+  verifiera cap=4 i prefill cap=128 oraz 64 MiB rezerwy puli activations;
+  obowiązkowy `HybridBufs` powstaje przed sprawdzeniem budżetu. Po wyborze T128
+  wszystkie bufory cap4/cap128 i oba zestawy potrójnego stagingu pinned-host
+  są alokowane przed zakończeniem startupu, co usuwa okno między selekcją a
+  pierwszym prefillem. Gdy pełny gate T128 nie mieści się w budżecie, Auto
+  wybiera największy istniejący wariant zgodny z backendem, artefaktami i pulą;
+  na zweryfikowanym NVIDIA jest to co najmniej T32, a backend przenośny wybiera
+  T2/T3/T4/T8/T16 zgodnie z warpem i `max_threads_per_block`. Jawny zakres 3..=1024 nadal nadpisuje Auto do limitu
+  danego backendu; extended przechodzi pełny gate także dla jawnej wartości,
+  a niemożliwa konfiguracja kończy startup błędem `Unsupported`. Literalne
+  `auto` jest równoważne brakowi zmiennej.
+  Wybór jest niezmienny w instancji modelu, a profil, alokacja i wykonanie
+  korzystają z tej samej wartości. Bufory sprawdzają zapisaną pojemność przed
+  ponownym użyciem. Nie ma wykonawczej deklaracji wydajności AMD ani Metal.
+
 - ✅ **Kary samplingu OpenAI na CPU i GPU Mojo (2026-07-21).**
   `frequency_penalty`, `presence_penalty`, `repetition_penalty` i okno
   `repeat_last_n` działają w API, samplerze CPU oraz pojedynczej i batchowej
@@ -39,6 +58,8 @@ Ostatnia aktualizacja: 2026-07-22.
   transferów D2H po 8 B, bez transferu logitów całego słownika.
   Gauge `forge_engine_hybrid_prefill_b2_scratch_bytes` pozostaje zerowy w trybie
   off i raportuje faktyczny logiczny rozmiar po pierwszym udanym B2.
+  Poniższe historyczne A/B używało ówczesnego domyślnego C1 T32; po włączeniu
+  Auto C1 T128 nie jest aktualnym porównaniem B2 do domyślnego C1.
   Pięć końcowych prób raw128 dało medianę Auto/OFF **309,7/248,6 tok/s**, TTFT
   **826,69/1029,87 ms** i E2E **1119,60/1322,60 ms**. Raw512 ON dało
   **320,5/320,2/319,9/320,0/320,2 tok/s** z medianą **320,2 tok/s**, TTFT
