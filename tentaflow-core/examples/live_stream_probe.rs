@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_app as gstreamer_app;
 
 use tentaflow_core::services::camera_ingest::credentials::credentials_cipher;
 
@@ -70,6 +71,10 @@ fn probe(url: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     // Hardware branch — byte-stream into nvh264dec, exactly like production.
+    // With `full-downstream` the decoder feeds the app's real tail
+    // (cudadownload → tee → queue → appsink) instead of a fakesink, to test
+    // whether that tail — not the decoder — is what stalls nvdec in the app.
+    let full_downstream = std::env::args().any(|a| a == "full-downstream");
     let hq = mk("queue")?;
     let hdec = mk("nvh264dec")?;
     let hsink = mk("fakesink")?;
@@ -91,7 +96,43 @@ fn probe(url: &str) -> Result<(), String> {
         .build();
     gst::Element::link(&tee, &hq).map_err(|e| e.to_string())?;
     hq.link_filtered(&hdec, &bs).map_err(|e| format!("hq->hdec: {e}"))?;
-    gst::Element::link(&hdec, &hsink).map_err(|e| e.to_string())?;
+    if full_downstream {
+        // The app's real NvdecNv12 tail: nvh264dec → cudadownload → tee →
+        // queue → appsink that actually pulls (mimicking analysis consumption).
+        let dl = mk("cudadownload")?;
+        let dtee = gst::ElementFactory::make("tee")
+            .property("allow-not-linked", true)
+            .build()
+            .map_err(|e| e.to_string())?;
+        // Match the app EXACTLY: leaky=downstream queue + appsink max-buffers=1
+        // drop=true. The app is built to DROP, never backpressure, so if the
+        // decoder still stalls with this config the downstream is genuinely at
+        // fault; if it flows, an earlier probe artifact (drop=false) misled me.
+        let qd = mk("queue")?;
+        qd.set_property_from_str("leaky", "downstream");
+        qd.set_property("max-size-buffers", 1u32);
+        let asink = gst::ElementFactory::make("appsink")
+            .property("emit-signals", false)
+            .property("max-buffers", 1u32)
+            .property("drop", true)
+            .property("sync", false)
+            .build()
+            .map_err(|e| e.to_string())?;
+        pipeline.add_many([&dl, &dtee, &qd, &asink]).map_err(|e| e.to_string())?;
+        gst::Element::link_many([&hdec, &dl, &dtee, &qd, &asink]).map_err(|e| format!("full tail: {e}"))?;
+        // Pull samples like the analysis appsink does, so backpressure is realistic.
+        let appsink = asink.dynamic_cast::<gstreamer_app::AppSink>().unwrap();
+        appsink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(|s| {
+                    let _ = s.pull_sample();
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    } else {
+        gst::Element::link(&hdec, &hsink).map_err(|e| e.to_string())?;
+    }
     gst::Element::link(&tee, &sq).map_err(|e| e.to_string())?;
     gst::Element::link_many([&sq, &sdec, &ssink]).map_err(|e| e.to_string())?;
 
