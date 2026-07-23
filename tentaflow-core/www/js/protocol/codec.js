@@ -3900,18 +3900,21 @@ export const encode = {
   /**
    * MessageBody::MlStudioBody(RecordingsListRequest) — lists recordings filtered by
    * camera and time range (unix ms). Absent filters encode as undefined (None).
-   * payload: { cameraId?, dateFromMs?, dateToMs?, limit }.
+   * `sourceNodeId` names a paired node to list from; absent = local node.
+   * payload: { cameraId?, dateFromMs?, dateToMs?, limit, sourceNodeId? }.
    */
   mlStudioRecordingsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const cameraId = payload.cameraId ?? payload.camera_id;
     const dateFromMs = payload.dateFromMs ?? payload.date_from_ms;
     const dateToMs = payload.dateToMs ?? payload.date_to_ms;
+    const sourceNodeId = payload.sourceNodeId ?? payload.source_node_id;
     const body = _wasm.encodeMlStudioRecordingsListRequest(
       cameraId != null && cameraId !== '' ? String(cameraId) : undefined,
       dateFromMs != null ? Number(dateFromMs) : undefined,
       dateToMs != null ? Number(dateToMs) : undefined,
       (payload.limit ?? 0) >>> 0,
+      sourceNodeId != null && sourceNodeId !== '' ? String(sourceNodeId) : undefined,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
@@ -3924,13 +3927,16 @@ export const encode = {
   /**
    * MessageBody::MlStudioBody(RecogImportRecordingsRequest) — imports recordings into
    * a recognition dataset: extracts frames at fps, optional autolabel. collision:
-   * 'suffix' | 'skip'. payload: { projectId, datasetId, recordingRefs, fps, autolabel, collision }.
+   * 'suffix' | 'skip'. `sourceNodeId` pulls the clips from a paired node; absent =
+   * local node. payload: { projectId, datasetId, recordingRefs, fps, autolabel,
+   * collision, sourceNodeId? }.
    */
   mlStudioRecogImportRecordingsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const refs = Array.isArray(payload.recordingRefs ?? payload.recording_refs)
       ? (payload.recordingRefs ?? payload.recording_refs).map((r) => String(r))
       : [];
+    const sourceNodeId = payload.sourceNodeId ?? payload.source_node_id;
     const body = _wasm.encodeMlStudioRecogImportRecordingsRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
@@ -3938,6 +3944,7 @@ export const encode = {
       (payload.fps ?? 5) >>> 0,
       Boolean(payload.autolabel ?? false),
       String(payload.collision ?? 'suffix'),
+      sourceNodeId != null && sourceNodeId !== '' ? String(sourceNodeId) : undefined,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

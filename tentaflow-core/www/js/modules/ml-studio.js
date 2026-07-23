@@ -7,7 +7,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, bytesToHex } from '/js/utils.js';
 import { Router } from '/js/router.js';
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
@@ -3495,6 +3495,23 @@ function openRecogImportRecordingsModal(pid) {
   const state = {
     recordings: [], datasets: [], fps: 5, collision: 'suffix',
     targetDatasetId: '', cameraFilter: '', dateFrom: '', dateTo: '',
+    // Recordings source: '' = local node, otherwise a hex mesh node id.
+    peers: [], sourceNodeId: '',
+  };
+
+  // MeshPeerSummary.node_id is a [u8;32] that decodes to a byte array; some codec
+  // paths deliver it already hex-encoded. Normalize both to a hex string (mirrors
+  // how the mesh/cluster UI keys peers by hex node id).
+  const peerNodeIdHex = (p) => {
+    const raw = p?.nodeId ?? p?.node_id;
+    if (raw == null) return '';
+    if (typeof raw === 'string') return raw;
+    if (Array.isArray(raw) || raw instanceof Uint8Array) return bytesToHex(raw);
+    return '';
+  };
+  const isTrustedPeer = (p) => {
+    const t = String(p?.trustState ?? p?.trust_state ?? '').toLowerCase();
+    return t.includes('trusted');
   };
 
   const PHASE_LABELS = {
@@ -3735,7 +3752,9 @@ function openRecogImportRecordingsModal(pid) {
       const recTotal = Number(st.recordingsTotal ?? st.recordings_total ?? 0);
       const recDone = Number(st.recordingsDone ?? st.recordings_done ?? 0);
       const phaseEl = body.querySelector('#ml-studio-rec-phase');
-      if (phaseEl) phaseEl.textContent = PHASE_LABELS[phase] || 'Przetwarzanie…';
+      // Known phases map to a friendly label; any other non-empty phase string
+      // (e.g. "pobieranie z węzła NodeB") is shown verbatim, never blanked.
+      if (phaseEl) phaseEl.textContent = PHASE_LABELS[phase] || (phase || 'Przetwarzanie…');
       const bar = body.querySelector('#ml-studio-rec-bar');
       if (bar) bar.setAttribute('value', String(recTotal ? Math.min(100, Math.round((recDone / recTotal) * 100)) : 0));
       const kv = body.querySelector('#ml-studio-rec-counts');
@@ -3769,6 +3788,7 @@ function openRecogImportRecordingsModal(pid) {
         fps: state.fps,
         autolabel,
         collision: state.collision,
+        sourceNodeId: state.sourceNodeId,
       });
       jobId = resp.jobId ?? resp.job_id;
     } catch (err) {
@@ -3784,6 +3804,45 @@ function openRecogImportRecordingsModal(pid) {
     pollImport(jobId);
   };
 
+  // Rebuild the camera filter options from the currently loaded recordings.
+  // Called on first render and after a source-node reload (cameras differ per node).
+  const applyCameraOptions = () => {
+    const camSel = body.querySelector('#ml-studio-rec-camera');
+    if (!camSel?.setOptions) return;
+    const cams = Array.from(new Set(
+      state.recordings.map((r) => String(r.cameraId ?? r.camera_id ?? '')).filter(Boolean),
+    ));
+    const opts = [{ value: '', label: 'Wszystkie kamery' }, ...cams.map((c) => ({ value: c, label: c }))];
+    camSel.setOptions(opts, state.cameraFilter || '');
+  };
+
+  // Reload the recordings table from the chosen source node (empty = local).
+  // Selection refs from one node do not apply to another, so the Set is cleared.
+  const reloadRecordingsFromSource = async () => {
+    const errHost = body.querySelector('#ml-studio-rec-source-error');
+    if (errHost) errHost.innerHTML = '';
+    selected.clear();
+    state.recordings = [];
+    // Fetch the full list from the chosen node; camera/date stay client-side filters
+    // (visibleRecordings) so the camera dropdown keeps every camera of that node.
+    const payload = { limit: 500 };
+    if (state.sourceNodeId) payload.sourceNodeId = state.sourceNodeId;
+    try {
+      const recResp = await ApiBinary.one('mlStudioRecordingsListRequest', payload);
+      if (!modal.isConnected) return;
+      state.recordings = Array.isArray(recResp.items) ? recResp.items : [];
+    } catch (err) {
+      if (!modal.isConnected) return;
+      // Node unreachable / not trusted / timeout — show the server error verbatim
+      // and leave the table empty instead of crashing the modal.
+      if (errHost) {
+        errHost.innerHTML = `<tf-alert tone="danger" title="Nie udało się wczytać nagrań z węzła" message="${escapeAttr(err.message || 'Błąd protokołu.')}"></tf-alert>`;
+      }
+    }
+    applyCameraOptions();
+    renderTableRows();
+  };
+
   const renderForm = () => {
     const noDatasets = state.datasets.length === 0;
     const noRecordings = state.recordings.length === 0;
@@ -3792,6 +3851,9 @@ function openRecogImportRecordingsModal(pid) {
       ${noDatasets ? '<tf-alert tone="warning" title="Brak zbioru docelowego" message="Ten import tylko UZUPEŁNIA istniejący zbiór COCO. Zarejestruj lub zbuduj dataset w zakładce „Dane", zanim zaimportujesz klatki z nagrań."></tf-alert>' : ''}
       <div style="display:flex;flex-direction:column;gap:14px;margin-top:12px">
         <tf-select id="ml-studio-rec-dataset" label="Zbiór docelowy (istniejący)" placeholder="wybierz zbiór COCO"></tf-select>
+        <tf-select id="ml-studio-rec-source" label="Źródło nagrań"></tf-select>
+        <div id="ml-studio-rec-source-hint"></div>
+        <div id="ml-studio-rec-source-error"></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
           <tf-select id="ml-studio-rec-camera" label="Kamera" style="min-width:180px"></tf-select>
           <tf-input id="ml-studio-rec-from" type="date" label="Od dnia" style="min-width:150px"></tf-input>
@@ -3801,7 +3863,8 @@ function openRecogImportRecordingsModal(pid) {
           <tf-checkbox id="ml-studio-rec-selectall" label="Zaznacz wszystkie widoczne"></tf-checkbox>
           <span id="ml-studio-rec-selcount" style="font-size:12px;color:var(--text-3,#888)"></span>
         </div>
-        ${noRecordings ? '<tf-alert tone="info" message="Brak nagrań TentaVision do zaimportowania."></tf-alert>' : '<div id="ml-studio-rec-table-host"></div>'}
+        ${noRecordings && !state.sourceNodeId ? '<tf-alert tone="info" message="Brak nagrań TentaVision do zaimportowania."></tf-alert>' : ''}
+        <div id="ml-studio-rec-table-host"></div>
         <div style="display:flex;gap:24px;flex-wrap:wrap">
           <div>
             <div style="font-size:12px;font-weight:600;margin-bottom:4px">Klatki na sekundę (klipy)</div>
@@ -3850,13 +3913,38 @@ function openRecogImportRecordingsModal(pid) {
       dsSel.addEventListener('change', (e) => { state.targetDatasetId = e.detail?.value || ''; updatePreflight(); });
     }
 
+    const srcSel = body.querySelector('#ml-studio-rec-source');
+    const srcHint = body.querySelector('#ml-studio-rec-source-hint');
+    const renderSourceHint = () => {
+      if (!srcHint) return;
+      srcHint.innerHTML = state.sourceNodeId
+        ? '<tf-alert tone="info" message="Nagrania zostaną pobrane z wybranego węzła przez mesh, a klatki wyodrębnione i oznaczone lokalnie."></tf-alert>'
+        : '';
+    };
+    if (srcSel?.setOptions) {
+      const trusted = state.peers.filter(isTrustedPeer);
+      const opts = [
+        { value: '', label: 'Ten węzeł (lokalny)' },
+        ...trusted.map((p) => ({
+          value: peerNodeIdHex(p),
+          label: p.displayName || p.display_name || peerNodeIdHex(p).slice(0, 12),
+        })).filter((o) => o.value),
+      ];
+      srcSel.setOptions(opts, state.sourceNodeId || '');
+      srcSel.addEventListener('change', async (e) => {
+        state.sourceNodeId = e.detail?.value || '';
+        // A camera id from the previous node may not exist on the new one; reset the
+        // client-side camera filter so a stale value cannot hide the whole list.
+        state.cameraFilter = '';
+        renderSourceHint();
+        await reloadRecordingsFromSource();
+      });
+    }
+    renderSourceHint();
+
     const camSel = body.querySelector('#ml-studio-rec-camera');
     if (camSel?.setOptions) {
-      const cams = Array.from(new Set(
-        state.recordings.map((r) => String(r.cameraId ?? r.camera_id ?? '')).filter(Boolean),
-      ));
-      const opts = [{ value: '', label: 'Wszystkie kamery' }, ...cams.map((c) => ({ value: c, label: c }))];
-      camSel.setOptions(opts, '');
+      applyCameraOptions();
       camSel.addEventListener('change', (e) => { state.cameraFilter = e.detail?.value || ''; renderTableRows(); });
     }
 
@@ -3916,14 +4004,21 @@ function openRecogImportRecordingsModal(pid) {
     footer.innerHTML = '<tf-button variant="ghost" data-transfer-close>Anuluj</tf-button>';
     footer.querySelector('[data-transfer-close]')?.addEventListener('click', () => closeModal());
     try {
-      const [dsResp, recResp] = await Promise.all([
+      // Peers are optional context for the source picker: a failed call or an empty
+      // mesh must not break the modal — we just fall back to the local-only option.
+      const peersP = ApiBinary.one('meshPeersListRequest', {})
+        .then((r) => (Array.isArray(r.peers) ? r.peers : []))
+        .catch(() => []);
+      const [dsResp, recResp, peers] = await Promise.all([
         ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid }),
         ApiBinary.one('mlStudioRecordingsListRequest', { limit: 500 }),
+        peersP,
       ]);
       if (!modal.isConnected) return;
       state.datasets = (Array.isArray(dsResp.datasets) ? dsResp.datasets : [])
         .filter((d) => (d.kind ?? '') === 'coco_path');
       state.recordings = Array.isArray(recResp.items) ? recResp.items : [];
+      state.peers = peers;
     } catch (err) {
       if (!modal.isConnected) return;
       renderError(err.message || 'Nie udało się wczytać nagrań.');

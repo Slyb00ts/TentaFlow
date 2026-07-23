@@ -751,6 +751,14 @@ pub fn ml_studio_import_staging_dir() -> PathBuf {
     cache_dir().join("ml-studio-imports")
 }
 
+/// Temp landing directory for camera recordings pulled from a paired node over
+/// the mesh (`recording|<ref>|<ext>` ALPN_ARTIFACT transfers). Lives under
+/// `cache_dir()` so multi-hundred-megabyte clips do not land on the root disk;
+/// the ML Studio import layer deletes the files here after ingesting them.
+pub fn mesh_recordings_pull_dir() -> PathBuf {
+    cache_dir().join("mesh-recordings-pull")
+}
+
 /// Cache directory for on-demand ML Studio project SHARE archives served to
 /// unpaired instances over `/ml-studio/share/<project_id>/archive`. Separate
 /// from `ml_studio_exports_dir()` (user-initiated browser downloads) so the

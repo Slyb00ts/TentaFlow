@@ -3075,6 +3075,7 @@ pub fn encode_ml_studio_recordings_list_request(
     date_from_ms: Option<f64>,
     date_to_ms: Option<f64>,
     limit: u32,
+    source_node_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecordingsListRequest(
@@ -3083,6 +3084,7 @@ pub fn encode_ml_studio_recordings_list_request(
                 date_from_ms: date_from_ms.map(|v| v as i64),
                 date_to_ms: date_to_ms.map(|v| v as i64),
                 limit,
+                source_node_id: source_node_id.filter(|s| !s.is_empty()),
             },
         ),
     ))
@@ -3097,6 +3099,7 @@ pub fn encode_ml_studio_recog_import_recordings_request(
     fps: u32,
     autolabel: bool,
     collision: String,
+    source_node_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecogImportRecordingsRequest(
@@ -3107,6 +3110,7 @@ pub fn encode_ml_studio_recog_import_recordings_request(
                 fps,
                 autolabel,
                 collision,
+                source_node_id: source_node_id.filter(|s| !s.is_empty()),
             },
         ),
     ))
@@ -11519,6 +11523,12 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "dateToMs", date_to_ms.clone());
             set(obj, "date_to_ms", date_to_ms);
             set(obj, "limit", req.limit.into());
+            let source_node_id = match &req.source_node_id {
+                Some(v) => v.clone().into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "sourceNodeId", source_node_id.clone());
+            set(obj, "source_node_id", source_node_id);
         }
         tentaflow_protocol::MlStudioPayload::RecordingsListResponse(resp) => {
             set(obj, "variant", "MlStudioRecordingsListResponse".into());
@@ -11571,6 +11581,12 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "fps", req.fps.into());
             set(obj, "autolabel", req.autolabel.into());
             set(obj, "collision", req.collision.into());
+            let source_node_id = match &req.source_node_id {
+                Some(v) => v.clone().into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "sourceNodeId", source_node_id.clone());
+            set(obj, "source_node_id", source_node_id);
         }
         tentaflow_protocol::MlStudioPayload::RecogImportRecordingsResponse(resp) => {
             set(obj, "variant", "MlStudioRecogImportRecordingsResponse".into());

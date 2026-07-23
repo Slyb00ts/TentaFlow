@@ -30,6 +30,17 @@ const MAX_HF_MODEL_BYTES: u64 = 400 * 1024 * 1024 * 1024;
 /// routuje takie transfery do cache HF zamiast do `ml-studio/mesh-artifacts`.
 const HF_MODEL_NAME_PREFIX: &str = "hf-model|";
 
+/// Prefiks nazwy strumienia dla nagrania kamery ciągniętego ze sparowanego węzła
+/// (mesh recordings pull). Format nazwy: `recording|<ref>|<ext>`. Odbiorca
+/// (`store_artifact_zip`) routuje taki transfer do `paths::mesh_recordings_pull_dir()`
+/// jako `<ref>.<ext>` zamiast do artefaktów ML Studio / cache HF.
+const RECORDING_NAME_PREFIX: &str = "recording|";
+
+/// Górny limit rozmiaru pojedynczego nagrania kamery ciągniętego przez mesh.
+/// Klip zdarzenia to sekundy wideo — hojne 512 MiB zapobiega ściąganiu
+/// nieograniczonego/złośliwego pliku podszytego pod `file_path` nagrania.
+pub const MAX_RECORDING_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Ziarno strumienia: bajty przesuwamy porcjami tej wielkości, żeby watchdog
 /// STALL mógł działać na granulacji porcji (a nie całego pliku).
 pub const ARTIFACT_CHUNK_BYTES: usize = 1024 * 1024;
@@ -310,6 +321,8 @@ pub async fn recv_artifact_stream(
     // wyższy limit; artefakty ML Studio zostają na węższym limicie DoS.
     let max_bytes = if name.starts_with(HF_MODEL_NAME_PREFIX) {
         MAX_HF_MODEL_BYTES
+    } else if name.starts_with(RECORDING_NAME_PREFIX) {
+        MAX_RECORDING_BYTES
     } else {
         MAX_ARTIFACT_BYTES
     };
@@ -380,6 +393,14 @@ pub fn store_artifact_zip(name: &str, zip_path: &Path) -> anyhow::Result<String>
             .split_once('|')
             .ok_or_else(|| anyhow::anyhow!("zła nazwa transferu modelu HF: {name}"))?;
         return store_hf_model_zip(models_dir, hash, zip_path);
+    }
+    // Nagranie kamery ciągnięte ze sparowanego węzła: `recording|<ref>|<ext>`
+    // ląduje w dedykowanym katalogu tymczasowym jako `<ref>.<ext>`.
+    if let Some(rest) = name.strip_prefix(RECORDING_NAME_PREFIX) {
+        let (rec_ref, ext) = rest
+            .split_once('|')
+            .ok_or_else(|| anyhow::anyhow!("zła nazwa transferu nagrania: {name}"))?;
+        return store_recording_zip(rec_ref, ext, zip_path);
     }
     let id = file_content_hash(zip_path)?;
     let dest = artifact_dest_root().join(format!("{}-{}", safe_artifact_name(name), id));
@@ -456,6 +477,124 @@ fn store_hf_model_zip(models_dir: &str, hash: &str, zip_path: &Path) -> anyhow::
     std::fs::create_dir_all(&refs)?;
     std::fs::write(refs.join("main"), hash.as_bytes())?;
     Ok(dest.to_string_lossy().to_string())
+}
+
+/// Czy segment (`ref` / `ext` nagrania) jest bezpieczny do zbudowania nazwy pliku
+/// docelowego — fail-closed wobec path-traversal od peera. Pusty `ext` jest dozwolony
+/// (plik bez rozszerzenia), więc walidujemy go osobno u wołającego.
+fn recording_segment_safe(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Węzeł-inicjator (A, accept loop): rozpakowuje odebrany ZIP jednego nagrania do
+/// `paths::mesh_recordings_pull_dir()/<ref>.<ext>`. Zawartość ZIP to dokładnie jeden
+/// plik; zachowujemy tę samą ochronę unzip (staging + `enclosed_name`) co pozostałe
+/// ścieżki. Zwraca ścieżkę zapisanego pliku.
+fn store_recording_zip(rec_ref: &str, ext: &str, zip_path: &Path) -> anyhow::Result<String> {
+    if !recording_segment_safe(rec_ref) {
+        anyhow::bail!("niebezpieczny ref nagrania: {rec_ref}");
+    }
+    let ext_clean = ext.trim_start_matches('.');
+    if !ext_clean.is_empty() && !recording_segment_safe(ext_clean) {
+        anyhow::bail!("niebezpieczne rozszerzenie nagrania: {ext}");
+    }
+    let pull_dir = crate::paths::mesh_recordings_pull_dir();
+    std::fs::create_dir_all(&pull_dir)?;
+    // Staging dir pod pull_dir (ten sam FS → atomowy rename w unzip_to_dir).
+    let staging_dir = pull_dir.join(format!("stage-{rec_ref}-{}", uuid::Uuid::new_v4().simple()));
+    unzip_to_dir(zip_path, &staging_dir, |staging| {
+        if dir_is_empty(staging) {
+            anyhow::bail!("nagranie jest puste po rozpakowaniu");
+        }
+        Ok(())
+    })?;
+    // Rozpakowany ZIP zawiera dokładnie jeden plik — przenosimy go pod `<ref>.<ext>`.
+    let file = std::fs::read_dir(&staging_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.is_file());
+    let Some(src_file) = file else {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        anyhow::bail!("archiwum nagrania nie zawiera pliku");
+    };
+    let final_name = if ext_clean.is_empty() {
+        rec_ref.to_string()
+    } else {
+        format!("{rec_ref}.{ext_clean}")
+    };
+    let dest = pull_dir.join(&final_name);
+    let _ = std::fs::remove_file(&dest);
+    if let Err(e) = std::fs::rename(&src_file, &dest) {
+        // Cross-device rename może zawieść (pull_dir i staging na tym samym FS,
+        // ale bądźmy odporni) — kopiujemy w fallbacku.
+        std::fs::copy(&src_file, &dest)
+            .map_err(|_| anyhow::anyhow!("zapis nagrania do {}: {e}", dest.display()))?;
+    }
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Pakuje pojedynczy PLIK do ZIP-a (Stored + zip64) pod jego basename. Strumieniowo
+/// — stały RAM niezależnie od rozmiaru klipu. Zwraca rozmiar wynikowego pliku.
+fn zip_file_to_file(file: &Path, dest: &Path) -> anyhow::Result<u64> {
+    let out = std::fs::File::create(dest)?;
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(out));
+    let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(true);
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recording");
+    zip.start_file(name, opts)?;
+    let mut src = std::fs::File::open(file)?;
+    std::io::copy(&mut src, &mut zip)?;
+    zip.finish()?;
+    Ok(std::fs::metadata(dest)?.len())
+}
+
+/// Węzeł-źródło (B): pakuje pojedynczy plik nagrania i przepycha go JEDNYM
+/// strumieniem mesh do `target_node_id` (inicjator A). Nazwa strumienia koduje
+/// `ref` i rozszerzenie, więc odbiorca odtworzy `<ref>.<ext>`.
+pub async fn push_recording_to(
+    iroh: &crate::mesh::iroh_manager::IrohMeshManager,
+    target_node_id: &str,
+    rec_ref: &str,
+    file_path: &Path,
+) -> anyhow::Result<()> {
+    if !file_path.is_file() {
+        anyhow::bail!("nagranie do transferu nie jest plikiem: {}", file_path.display());
+    }
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    let name = format!("{RECORDING_NAME_PREFIX}{rec_ref}|{ext}");
+    let zip_path = transfer_tmp_file("rec-push")?;
+    let file_for_task = file_path.to_path_buf();
+    let zip_for_task = zip_path.clone();
+    let zipped = tokio::task::spawn_blocking(move || zip_file_to_file(&file_for_task, &zip_for_task))
+        .await
+        .map_err(|e| anyhow::anyhow!("zip nagrania: join: {e}"))?;
+    let size = match zipped {
+        Ok(s) => s,
+        Err(e) => {
+            remove_transfer_tmp(&zip_path);
+            return Err(e);
+        }
+    };
+    if size > MAX_RECORDING_BYTES {
+        remove_transfer_tmp(&zip_path);
+        anyhow::bail!("nagranie przekracza limit transferu ({size} B)");
+    }
+    let res = iroh
+        .push_artifact_stream(target_node_id, &name, &zip_path, None)
+        .await;
+    remove_transfer_tmp(&zip_path);
+    res.map(|_| ())
 }
 
 /// Rozpakowuje ZIP do TYMCZASOWEGO katalogu obok `dest`, uruchamia `validate` na

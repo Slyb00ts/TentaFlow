@@ -6045,7 +6045,7 @@ pub fn ml_studio_project_import_cancel(
 #[handler(variant = "MlStudioRecordingsListRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
-pub fn ml_studio_recordings_list(
+pub async fn ml_studio_recordings_list(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -6058,6 +6058,54 @@ pub fn ml_studio_recordings_list(
         }
     };
     let org = require_org(ctx)?;
+
+    // Remote source: list a PAIRED node's recordings over the mesh. Both sides
+    // carry unix MILLISECONDS, so no conversion is needed, and the remote item maps
+    // onto the SAME `MlStudioRecordingItem`. A value equal to the local node id
+    // falls through to the local path below.
+    if let Some(node) = payload
+        .source_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if crate::sync::runtime::local_node_id().as_deref() != Some(node) {
+            let filters = crate::mesh::recordings_pull::RemoteRecordingFilters {
+                camera_id: payload
+                    .camera_id
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
+                date_from_ms: payload.date_from_ms,
+                date_to_ms: payload.date_to_ms,
+                limit: payload.limit.clamp(1, 1000),
+            };
+            let items = crate::mesh::recordings_pull::list_remote(node, filters)
+                .await
+                .map_err(|e| {
+                    ProtocolError::internal(format!(
+                        "nie udało się pobrać listy nagrań z węzła {node}: {e:#}"
+                    ))
+                })?
+                .into_iter()
+                .map(|r| tentaflow_protocol::MlStudioRecordingItem {
+                    recording_ref: r.recording_ref,
+                    kind: r.kind,
+                    camera_id: r.camera_id,
+                    created_at: r.created_at_ms,
+                    duration_ms: r.duration_ms,
+                    file_size_bytes: r.file_size_bytes,
+                    plate_text: r.plate_text,
+                    adr_text: r.adr_text,
+                })
+                .collect();
+            return Ok(MessageBody::MlStudioBody(
+                MlStudioPayload::RecordingsListResponse(
+                    tentaflow_protocol::MlStudioRecordingsListResponse { items },
+                ),
+            ));
+        }
+    }
 
     #[cfg(feature = "camera")]
     {
@@ -6160,6 +6208,12 @@ pub fn ml_studio_recog_import_recordings(
         fps: payload.fps,
         autolabel: payload.autolabel,
         collision,
+        source_node_id: payload
+            .source_node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     };
     let job_id = import_recordings::spawn_import_recordings(spec)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;

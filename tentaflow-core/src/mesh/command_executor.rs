@@ -572,6 +572,16 @@ impl MeshCommandExecutor {
                 )
                 .await
             }
+            MeshCommandType::CameraRecordingsList { filters_json } => {
+                self.handle_camera_recordings_list(filters_json).await
+            }
+            MeshCommandType::CameraRecordingPull {
+                recording_refs,
+                target_node_id,
+            } => {
+                self.handle_camera_recording_pull(recording_refs, target_node_id)
+                    .await
+            }
         }
     }
 
@@ -615,6 +625,157 @@ impl MeshCommandExecutor {
                 error: Some(e.to_string()),
             }),
         }
+    }
+
+    /// B side: list THIS node's recordings for a paired puller. Resolves the local
+    /// org context (`None` → default org, exactly like the local recordings-list
+    /// handler) and applies the JSON-carried filters. Recordings are node-global;
+    /// the org boundary still scopes the rows.
+    #[cfg(feature = "camera")]
+    async fn handle_camera_recordings_list(&self, filters_json: String) -> CommandResponse {
+        use crate::mesh::recordings_pull::{RemoteRecordingFilters, RemoteRecordingItem};
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("recordings list context is not initialized");
+        };
+        let filters = match serde_json::from_str::<RemoteRecordingFilters>(&filters_json) {
+            Ok(f) => f,
+            Err(e) => return CommandResponse::fail(format!("invalid recordings filters: {e}")),
+        };
+        let db = ctx.db.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let limit = filters.limit.clamp(1, 1000);
+            let camera_id = filters.camera_id.as_deref().filter(|s| !s.trim().is_empty());
+            // Wire timestamps are unix MILLISECONDS; the recordings table is SECONDS.
+            let created_from = filters.date_from_ms.map(|ms| ms / 1000);
+            let created_to = filters.date_to_ms.map(|ms| ms / 1000);
+            let repo_filters = crate::db::repository::RecordingListFilters {
+                owner_addon_id: None,
+                kind: None,
+                camera_id,
+                created_from,
+                created_to,
+                plate: None,
+                adr: None,
+            };
+            crate::db::repository::list_recordings(&db, None, &repo_filters, limit)
+        })
+        .await;
+        let rows = match result {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => return CommandResponse::fail(format!("list recordings: {e}")),
+            Err(e) => return CommandResponse::fail(format!("recordings list task failed: {e}")),
+        };
+        let items: Vec<RemoteRecordingItem> = rows
+            .into_iter()
+            .map(|r| RemoteRecordingItem {
+                recording_ref: r.recording_ref,
+                kind: r.kind,
+                camera_id: r.camera_id,
+                created_at_ms: r.created_at.saturating_mul(1000),
+                duration_ms: r.duration_ms,
+                file_size_bytes: r.file_size_bytes,
+                plate_text: r.plate_text,
+                adr_text: r.adr_text,
+            })
+            .collect();
+        match serde_json::to_string(&items) {
+            Ok(recordings_json) => CommandResponse::ok(
+                MeshCommandResponsePayload::CameraRecordingsListResult { recordings_json },
+            ),
+            Err(e) => CommandResponse::fail(format!("serialize recordings list: {e}")),
+        }
+    }
+
+    #[cfg(not(feature = "camera"))]
+    async fn handle_camera_recordings_list(&self, _filters_json: String) -> CommandResponse {
+        CommandResponse::fail("recordings require the camera module")
+    }
+
+    /// B side: stream the requested recording files to `target_node_id` over
+    /// ALPN_ARTIFACT. Each `file_path` is re-validated for containment (never
+    /// trusting the DB path), a per-file size cap protects the puller's disk, and
+    /// a max ref count bounds the number of streams. Returns the refs actually
+    /// streamed.
+    #[cfg(feature = "camera")]
+    async fn handle_camera_recording_pull(
+        &self,
+        recording_refs: Vec<String>,
+        target_node_id: String,
+    ) -> CommandResponse {
+        use crate::mesh::recordings_pull::MAX_REFS_PER_PULL;
+        use crate::ml_studio::mesh_artifact::MAX_RECORDING_BYTES;
+        if !self.security.is_trusted(&target_node_id) {
+            return CommandResponse::fail(format!("target {target_node_id} nie jest zaufany"));
+        }
+        if recording_refs.len() > MAX_REFS_PER_PULL {
+            return CommandResponse::fail(format!(
+                "pull requests {} recordings, max is {}",
+                recording_refs.len(),
+                MAX_REFS_PER_PULL
+            ));
+        }
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("recordings pull context is not initialized");
+        };
+        let mut pulled_refs = Vec::with_capacity(recording_refs.len());
+        for rec_ref in &recording_refs {
+            let db = ctx.db.clone();
+            let ref_for_task = rec_ref.clone();
+            let row = tokio::task::spawn_blocking(move || {
+                crate::db::repository::get_recording_by_ref(&db, &ref_for_task)
+            })
+            .await;
+            let file_path = match row {
+                Ok(Ok(Some(r))) => r.file_path,
+                Ok(Ok(None)) => {
+                    warn!(recording = %rec_ref, "recordings pull: unknown ref — skipping");
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    warn!(recording = %rec_ref, "recordings pull: lookup failed: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(recording = %rec_ref, "recordings pull: lookup task failed: {e}");
+                    continue;
+                }
+            };
+            let canonical = match crate::mesh::recordings_pull::validate_local_recording_path(
+                &file_path,
+                MAX_RECORDING_BYTES as i64,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(recording = %rec_ref, "recordings pull: path rejected: {e}");
+                    continue;
+                }
+            };
+            match crate::ml_studio::mesh_artifact::push_recording_to(
+                &ctx.iroh,
+                &target_node_id,
+                rec_ref,
+                &canonical,
+            )
+            .await
+            {
+                Ok(()) => pulled_refs.push(rec_ref.clone()),
+                Err(e) => {
+                    warn!(recording = %rec_ref, "recordings pull: stream failed: {e}")
+                }
+            }
+        }
+        CommandResponse::ok(MeshCommandResponsePayload::CameraRecordingPullResult { pulled_refs })
+    }
+
+    #[cfg(not(feature = "camera"))]
+    async fn handle_camera_recording_pull(
+        &self,
+        _recording_refs: Vec<String>,
+        _target_node_id: String,
+    ) -> CommandResponse {
+        CommandResponse::fail("recordings require the camera module")
     }
 
     /// Autoryzacja komendy P0 cluster-deploy (EnsureModelLocal / ModelPresentLocal /
