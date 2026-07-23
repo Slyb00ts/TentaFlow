@@ -2169,21 +2169,6 @@ fn install_base_pts_probe(pad: gst::Pad, publisher: &Arc<Mp4StreamPublisher>) {
     });
 }
 
-/// Pad-probe na src-padzie h264parse (bufory wchodzace do mp4mux): PIERWSZY
-/// bufor z ustawionym PTS ustala `mux_base_pts_ns` w publisherze i probe sam
-/// sie odpina. To ta sama oś czasu (media-timeline) co PTS appsink Branch A,
-/// bo Branch A i B dziela `tee` przed dekodem/muxem — klient odejmuje te baze
-/// od PTS detekcji, kotwiczac overlay na wlasciwej klatce MSE. WYLACZNIE dla
-/// gałęzi passthrough (bez transkodu) — za x264enc PTS jest juz przesuniety.
-pub(super) fn install_mux_base_pts_probe(
-    parse: &gst::Element,
-    publisher: &Arc<Mp4StreamPublisher>,
-) {
-    if let Some(parse_src) = parse.static_pad("src") {
-        install_base_pts_probe(parse_src, publisher);
-    }
-}
-
 /// Pad-probe na src-padzie pierwszej kolejki gałęzi B ZA tee (przed
 /// depay/dekodem/transkodem): PIERWSZY bufor z ustawionym PTS ustala
 /// `mux_base_pts_ns` i probe sam sie odpina. Dla gałęzi TRANSKODUJACYCH
@@ -2200,167 +2185,6 @@ pub(super) fn install_branch_input_base_pts_probe(
     if let Some(queue_src) = queue.static_pad("src") {
         install_base_pts_probe(queue_src, publisher);
     }
-}
-
-/// Build and link Branch B (RTP → rtph264depay → h264parse → mp4mux → appsink)
-/// onto the running pipeline. Returns the branch state for later teardown,
-/// or `None` if the RTP caps say the stream is not H.264 (HEVC, MJPEG, …).
-///
-/// The mp4mux output goes through an appsink whose callback forwards each
-/// buffer to the supplied publisher via a `Weak` ref — that keeps the
-/// pipeline from accidentally pinning the hub-side `Arc` alive past the
-/// last subscriber.
-fn attach_mp4_branch(
-    pipeline: &gst::Pipeline,
-    tee: &gst::Element,
-    publisher: &Arc<Mp4StreamPublisher>,
-) -> std::result::Result<Mp4BranchState, String> {
-    // Codec gate: branch B muxer is hardwired for H.264 ES. We probe the RTP
-    // caps via the static sink pad on `tee` — by the time the first
-    // subscriber subscribes the pipeline is already PLAYING and caps have
-    // been negotiated. A missing caps probe means rtspsrc has not produced
-    // a pad yet; we treat that as transient and refuse politely.
-    let tee_sink = tee
-        .static_pad("sink")
-        .ok_or_else(|| "tee has no sink pad".to_string())?;
-    let caps = tee_sink
-        .current_caps()
-        .ok_or_else(|| "tee caps not yet negotiated".to_string())?;
-    let s = caps
-        .structure(0)
-        .ok_or_else(|| "empty caps on tee sink".to_string())?;
-    let encoding_name: String = s
-        .get::<String>("encoding-name")
-        .map_err(|e| format!("rtp caps missing encoding-name: {e}"))?;
-    if !encoding_name.eq_ignore_ascii_case("H264") {
-        return Err(format!(
-            "mp4 streaming requires H.264 (rtp encoding={})",
-            encoding_name
-        ));
-    }
-
-    // Kolejka gałęzi B — NIE-leaky: bufory to surowe pakiety RTP, a mux fMP4
-    // wymaga kompletnego elementary stream (drop pakietu = uszkodzone AU =
-    // artefakty w MSE). Gdy klient nie nadąża, przepełnienie obsługuje
-    // broadcast/subscriber_lagged wyżej (po stronie publishera), nie gstreamer.
-    let queue_b = gst::ElementFactory::make("queue")
-        .property("name", "queue_branch_b")
-        .property("max-size-buffers", 120u32)
-        .build()
-        .map_err(|e| format!("queue_b build: {e}"))?;
-    let depay = gst::ElementFactory::make("rtph264depay")
-        .build()
-        .map_err(|e| format!("rtph264depay build: {e}"))?;
-    let parse = gst::ElementFactory::make("h264parse")
-        // mp4mux needs AVC sample format (length-prefixed NALUs) — the
-        // default byte-stream out of rtph264depay would otherwise force
-        // mp4mux to refuse with `not-negotiated`.
-        .property_from_str("config-interval", "-1")
-        .build()
-        .map_err(|e| format!("h264parse build: {e}"))?;
-    // `streamable=true` writes ftyp+moov on the first fragment (init segment
-    // for MSE) and produces moof+mdat fragments thereafter, without an
-    // ending mfra/mvex finalize — exactly what a live MSE consumer needs.
-    // `fragment-duration` is in milliseconds; 200 ms strikes a balance
-    // between latency and overhead.
-    let mux = gst::ElementFactory::make("mp4mux")
-        .property("fragment-duration", 200u32)
-        .property("streamable", true)
-        .build()
-        .map_err(|e| format!("mp4mux build: {e}"))?;
-    let sink = gst::ElementFactory::make("appsink")
-        .property("name", "sink_mp4")
-        .property("emit-signals", false)
-        // Mux fragments must be drained promptly to keep latency bounded —
-        // sync=false lets the appsink consume as fast as the muxer emits.
-        .property("sync", false)
-        .property("max-buffers", 8u32)
-        .property("drop", false)
-        .build()
-        .map_err(|e| format!("appsink_b build: {e}"))?;
-
-    pipeline
-        .add_many([&queue_b, &depay, &parse, &mux, &sink])
-        .map_err(|e| format!("add_many branch B: {e}"))?;
-
-    let queue_b_sink = queue_b
-        .static_pad("sink")
-        .ok_or_else(|| "queue_b sink pad missing".to_string())?;
-    gst::Element::link_many([&queue_b, &depay, &parse, &mux, &sink])
-        .map_err(|e| format!("link branch B: {e}"))?;
-
-    wire_mp4_appsink(&sink, publisher)?;
-
-    // Rebuild pipeline'u (reconnect) resetuje oś PTS mediów wraz z nowym
-    // init-segmentem. Ten sam publisher moze przezyc reconnect, wiec kasujemy
-    // stara baze — inaczej `set_base_pts_ns` (ustawia tylko gdy pusto) zostawilby
-    // baze z poprzedniej osi i overlay rozjechalby sie po reconnectcie. Po
-    // skasowaniu pierwszy bufor tej Branch B ustali baze spojna z init-segmentem.
-    publisher.reset_base_pts_ns();
-
-    install_mux_base_pts_probe(&parse, publisher);
-
-    // Bring every new element up to the pipeline's current state so the
-    // mux branch starts producing without needing a full pipeline restart.
-    for el in [&queue_b, &depay, &parse, &mux, &sink] {
-        el.sync_state_with_parent()
-            .map_err(|e| format!("sync_state branch B element: {e}"))?;
-    }
-
-    // Pad tee linkujemy DOPIERO po aktywacji całej gałęzi. Push tee w okno
-    // między linkiem a aktywacją queue_b zwraca FLUSHING, a tee trwale
-    // oznacza taki pad jako usunięty i nigdy więcej do niego nie pcha —
-    // gałąź wygląda na wpiętą, ale mux nie dostaje ani bajta i init segment
-    // nigdy nie powstaje.
-    // Gałąź jest już AKTYWNA w pipeline — przy błędzie tego kroku trzeba ją
-    // rozebrać (Null + remove), inaczej kolejny attach wywali się na kolizji
-    // stałych nazw elementów, a osierocone elementy dalej mieliłyby dane.
-    let Some(tee_src_pad) = tee.request_pad_simple("src_%u") else {
-        for el in [&queue_b, &depay, &parse, &mux, &sink] {
-            let _ = el.set_state(gst::State::Null);
-        }
-        let _ = pipeline.remove_many([&queue_b, &depay, &parse, &mux, &sink]);
-        return Err("tee src_%u request for branch B failed".to_string());
-    };
-    if let Err(e) = tee_src_pad.link(&queue_b_sink) {
-        detach_mp4_branch(
-            pipeline,
-            tee,
-            Mp4BranchState {
-                tee_src_pad,
-                elements: vec![queue_b, depay, parse, mux, sink],
-            },
-        );
-        return Err(format!("tee → queue_b: {e:?}"));
-    }
-
-    // Wymuś natychmiastową klatkę kluczową w GÓRĘ pipeline'u. Nowy widz podpina
-    // się do już działającego strumienia — bez tego `mp4mux`/`h264parse` czeka
-    // na najbliższy naturalny keyframe (IDR) kamery zanim wyemituje init
-    // segment (ftyp+moov+IDR), co daje ~2 s czarnego ekranu w podglądzie MSE.
-    // Zdarzenie force-key-unit puszczone upstream na `tee` propaguje się do
-    // źródła RTP (rtspsrc) — dla RTSP tłumaczone na RTCP PLI/żądanie IDR;
-    // wiele kamer (w tym UniFi) oraz nasz symulator MediaMTX reagują od razu,
-    // skracając czas do pierwszej klatki. `all_headers=true` wymusza dołączenie
-    // SPS/PPS przy nowym keyframie, dzięki czemu init segment jest kompletny.
-    let force_key_unit = gst_video::UpstreamForceKeyUnitEvent::builder()
-        .all_headers(true)
-        .build();
-    if !tee.send_event(force_key_unit) {
-        // Nie każde źródło honoruje force-key-unit — to best-effort. Jeśli tee
-        // nie połknęło zdarzenia, spróbuj na całym pipeline (trafi do sink pada
-        // propagującego upstream). Brak reakcji nie jest błędem: strumień i tak
-        // ruszy przy najbliższym naturalnym IDR.
-        let fallback = gst_video::UpstreamForceKeyUnitEvent::builder()
-            .all_headers(true)
-            .build();
-        let _ = pipeline.send_event(fallback);
-    }
-
-    Ok(Mp4BranchState {
-        tee_src_pad,
-        elements: vec![queue_b, depay, parse, mux, sink],
-    })
 }
 
 /// Dowiesza wariant PODGLĄDU gałęzi B: zamiast passthroughu pełnego strumienia
@@ -2384,6 +2208,11 @@ fn attach_mp4_branch_preview(
     tee: &gst::Element,
     publisher: &Arc<Mp4StreamPublisher>,
     source_fps: u32,
+    // Transcode target: the single tile uses 1080p, the grid tiles 720p. Full 4K
+    // passthrough overwhelmed the browser's real-time decoder (≈5 fps, jumpy
+    // playback), which also broke the detection overlay's media-time sync.
+    target_width: i32,
+    bitrate: u32,
 ) -> std::result::Result<Mp4BranchState, String> {
     // Bramka kodeka jak w `attach_mp4_branch`: depay jest przykręcony do
     // H.264, inne kodeki (HEVC, MJPEG) odrzucamy zanim ruszy budowa gałęzi.
@@ -2430,9 +2259,10 @@ fn attach_mp4_branch_preview(
     let scale = gst::ElementFactory::make("videoscale")
         .build()
         .map_err(|e| format!("videoscale build: {e}"))?;
+    // 16:9 source (4K 3840×2160), so height follows width to preserve aspect.
     let scale_caps = gst::Caps::builder("video/x-raw")
-        .field("width", 1280i32)
-        .field("height", 720i32)
+        .field("width", target_width)
+        .field("height", target_width * 9 / 16)
         .build();
     let scale_filter = gst::ElementFactory::make("capsfilter")
         .property("caps", &scale_caps)
@@ -2443,7 +2273,7 @@ fn attach_mp4_branch_preview(
     // źródła) — MSE potrzebuje regularnych punktów wejścia. Te same parametry
     // co transkoder MJPEG, tylko niższy bitrate pod kafelki Live view przez WAN.
     let enc = gst::ElementFactory::make("x264enc")
-        .property("bitrate", 1500u32)
+        .property("bitrate", bitrate)
         .property("key-int-max", transcoder_key_int_max(source_fps))
         .build()
         .map_err(|e| format!("x264enc build: {e}"))?;
@@ -3242,9 +3072,28 @@ pub async fn run_rtsp_session(
                                 let attach_result = if is_mjpeg {
                                     super::mjpeg::attach_mp4_branch_mjpeg(pipeline, &tee, &publisher, preview, config.target_fps)
                                 } else if preview {
-                                    attach_mp4_branch_preview(pipeline, &tee, &publisher, config.target_fps)
+                                    // Grid tiles: 720p / 1.5 Mbit/s.
+                                    attach_mp4_branch_preview(
+                                        pipeline,
+                                        &tee,
+                                        &publisher,
+                                        config.target_fps,
+                                        1280,
+                                        1500,
+                                    )
                                 } else {
-                                    attach_mp4_branch(pipeline, &tee, &publisher)
+                                    // Single tile: transcode to 1080p / 4 Mbit/s instead of
+                                    // forwarding raw 4K — the browser could not decode 4K in
+                                    // real time (jumpy ≈5 fps playback that also broke the
+                                    // detection overlay's media-time sync).
+                                    attach_mp4_branch_preview(
+                                        pipeline,
+                                        &tee,
+                                        &publisher,
+                                        config.target_fps,
+                                        1920,
+                                        4000,
+                                    )
                                 };
                                 match attach_result {
                                     Ok(state) => {
