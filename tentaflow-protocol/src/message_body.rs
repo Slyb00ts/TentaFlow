@@ -2638,6 +2638,10 @@ pub struct MlStudioRecordingsListRequest {
     #[serde(default)]
     pub date_to_ms: Option<i64>,
     pub limit: u32,
+    /// Hex node_id of a PAIRED node to list recordings from. `None`/absent =
+    /// local node (unchanged behaviour).
+    #[serde(default)]
+    pub source_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -2655,6 +2659,10 @@ pub struct MlStudioRecogImportRecordingsRequest {
     pub fps: u32,
     pub autolabel: bool,
     pub collision: String,
+    /// Hex node_id of a PAIRED node to pull recordings from. `None`/absent =
+    /// local node (unchanged behaviour).
+    #[serde(default)]
+    pub source_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

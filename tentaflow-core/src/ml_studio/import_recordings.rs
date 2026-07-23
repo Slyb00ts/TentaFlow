@@ -79,6 +79,11 @@ pub struct ImportRecordingsSpec {
     pub fps: u32,
     pub autolabel: bool,
     pub collision: CollisionPolicy,
+    /// Hex node_id of a PAIRED node to pull the recordings from over the mesh.
+    /// `None` = local node: the DB row and on-disk file are read directly. A
+    /// remote value routes every ref through `mesh::recordings_pull::pull_remote`
+    /// into a temp dir first, and the DB / local-disk seams are bypassed.
+    pub source_node_id: Option<String>,
 }
 
 /// Outcome of one source recording, so the UI can show what actually happened
@@ -208,10 +213,16 @@ pub fn spawn_import_recordings(spec: ImportRecordingsSpec) -> Result<String> {
         tokio::spawn(async move {
             let jid = job_id_task.clone();
             let did = spec.dataset_id.clone();
+            // Captured on the async worker so the blocking body can drive the async
+            // `pull_remote` round trip (block_on on a spawn_blocking thread is safe;
+            // that thread is not itself an async execution context).
+            let handle = tokio::runtime::Handle::current();
             // ffmpeg + decode + GPU inference are blocking — keep them off the
             // async worker.
-            let result =
-                tokio::task::spawn_blocking(move || run_import(&job_id_task, &spec, &pool)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                run_import(&job_id_task, &spec, &pool, &handle)
+            })
+            .await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -509,9 +520,39 @@ impl Drop for ScratchDir {
     }
 }
 
-/// Synchronous import body run inside `spawn_blocking`.
+/// One recording pulled from a paired node: the temp file it landed in plus the
+/// metadata that would otherwise come from the local DB row. Carries only what the
+/// extraction step needs (`kind` selects snapshot vs segment; the on-disk path).
 #[cfg(feature = "camera")]
-fn run_import(job_id: &str, spec: &ImportRecordingsSpec, pool: &crate::db::DbPool) -> Result<()> {
+struct RemotePulled {
+    path: PathBuf,
+    kind: String,
+}
+
+/// Deletes the pulled temp files on drop, so an early `?`, a cap or a timeout never
+/// leaks the transferred clips onto the pull disk. Files already removed eagerly
+/// after their extraction are a no-op here.
+#[cfg(feature = "camera")]
+struct TempPullFiles(Vec<PathBuf>);
+
+#[cfg(feature = "camera")]
+impl Drop for TempPullFiles {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Synchronous import body run inside `spawn_blocking`. `handle` drives the async
+/// remote-pull round trip when the source is a paired node.
+#[cfg(feature = "camera")]
+fn run_import(
+    job_id: &str,
+    spec: &ImportRecordingsSpec,
+    pool: &crate::db::DbPool,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
     let started = std::time::Instant::now();
     let train_dir = spec.dataset_dir.join("train");
     let annot_path = train_dir.join("_annotations.coco.json");
@@ -523,6 +564,44 @@ fn run_import(job_id: &str, spec: &ImportRecordingsSpec, pool: &crate::db::DbPoo
     );
     std::fs::create_dir_all(&scratch.0)
         .with_context(|| format!("utworzenie katalogu roboczego {}", scratch.0.display()))?;
+
+    // Remote source: pull every selected ref from the paired node UP FRONT (one
+    // round trip), then the per-recording loop consumes local temp files exactly
+    // like local recordings. `_temp_guard` owns cleanup of anything not deleted
+    // eagerly. Refs the node refused to stream are simply absent from the map and
+    // surface as per-recording skips below.
+    let remote_by_ref: Option<HashMap<String, RemotePulled>>;
+    let _temp_guard: Option<TempPullFiles>;
+    match spec.source_node_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(node) => {
+            update_progress(job_id, |p| p.phase = format!("pobieranie z węzła {node}"));
+            let pulled = handle
+                .block_on(crate::mesh::recordings_pull::pull_remote(
+                    node,
+                    &spec.recording_refs,
+                ))
+                .with_context(|| format!("pobieranie nagrań z węzła {node}"))?;
+            let mut map = HashMap::with_capacity(pulled.len());
+            let mut temps = Vec::with_capacity(pulled.len());
+            for (rec_ref, path, item) in pulled {
+                temps.push(path.clone());
+                map.insert(
+                    rec_ref,
+                    RemotePulled {
+                        path,
+                        kind: item.kind,
+                    },
+                );
+            }
+            _temp_guard = Some(TempPullFiles(temps));
+            remote_by_ref = Some(map);
+            update_progress(job_id, |p| p.phase = "extracting".to_string());
+        }
+        None => {
+            remote_by_ref = None;
+            _temp_guard = None;
+        }
+    }
 
     let mut outcomes: Vec<RecordingOutcome> = Vec::with_capacity(spec.recording_refs.len());
     let mut pending: Vec<PendingFrame> = Vec::new();
@@ -552,6 +631,7 @@ fn run_import(job_id: &str, spec: &ImportRecordingsSpec, pool: &crate::db::DbPoo
             &scratch.0,
             idx,
             budget,
+            remote_by_ref.as_ref(),
         ) {
             Ok(frames) => {
                 frames_extracted += frames.len() as u64;
@@ -560,6 +640,12 @@ fn run_import(job_id: &str, spec: &ImportRecordingsSpec, pool: &crate::db::DbPoo
             // `{:#}` keeps the whole context chain, so the UI shows the real cause
             // ("plik nagrania niedostępny: …") instead of just the outermost line.
             Err(reason) => outcomes[idx].skipped = Some(format!("{reason:#}")),
+        }
+
+        // The pulled clip has been decoded into `scratch`; drop the transferred
+        // temp file now instead of holding the whole set until job end.
+        if let Some(pulled) = remote_by_ref.as_ref().and_then(|m| m.get(recording_ref)) {
+            let _ = std::fs::remove_file(&pulled.path);
         }
 
         let done = idx as u64 + 1;
@@ -599,6 +685,7 @@ fn run_import(job_id: &str, spec: &ImportRecordingsSpec, pool: &crate::db::DbPoo
 /// the recorder captures it at the best OCR read), so `fps` does not apply to them;
 /// segments are decoded with the shared ffmpeg helper.
 #[cfg(feature = "camera")]
+#[allow(clippy::too_many_arguments)]
 fn extract_recording(
     pool: &crate::db::DbPool,
     recording_ref: &str,
@@ -607,22 +694,37 @@ fn extract_recording(
     scratch: &Path,
     outcome_idx: usize,
     frame_budget: u64,
+    remote: Option<&HashMap<String, RemotePulled>>,
 ) -> Result<Vec<PendingFrame>> {
-    let row = crate::db::repository::get_recording_by_ref(pool, recording_ref)
-        .with_context(|| format!("odczyt nagrania {recording_ref}"))?
-        .ok_or_else(|| anyhow::anyhow!("nagranie nie istnieje lub zostało usunięte"))?;
-    // The lookup already filters `purged_at IS NULL`; asserting it here keeps the
-    // invariant local, so widening that query can never silently import purged media.
-    if row.purged_at.is_some() {
-        anyhow::bail!("nagranie zostało usunięte");
-    }
-    let src = validated_recording_path(&row.file_path)?;
+    // Remote source: the file was already pulled into a temp path and its metadata
+    // travelled in the listing — never touch the local DB row or local disk. A ref
+    // missing from the map is one the node refused to stream.
+    let (src, kind) = match remote {
+        Some(map) => {
+            let pulled = map.get(recording_ref).ok_or_else(|| {
+                anyhow::anyhow!("węzeł nie udostępnił tego nagrania do pobrania")
+            })?;
+            (pulled.path.clone(), pulled.kind.clone())
+        }
+        None => {
+            let row = crate::db::repository::get_recording_by_ref(pool, recording_ref)
+                .with_context(|| format!("odczyt nagrania {recording_ref}"))?
+                .ok_or_else(|| anyhow::anyhow!("nagranie nie istnieje lub zostało usunięte"))?;
+            // The lookup already filters `purged_at IS NULL`; asserting it here keeps
+            // the invariant local, so widening that query can never silently import
+            // purged media.
+            if row.purged_at.is_some() {
+                anyhow::bail!("nagranie zostało usunięte");
+            }
+            (validated_recording_path(&row.file_path)?, row.kind)
+        }
+    };
 
     let dir = scratch.join(format!("r{outcome_idx}"));
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("utworzenie katalogu {}", dir.display()))?;
 
-    let produced: Vec<PathBuf> = match row.kind.as_str() {
+    let produced: Vec<PathBuf> = match kind.as_str() {
         "snapshot" => {
             let ext = src
                 .extension()
@@ -1234,6 +1336,7 @@ mod tests {
             fps,
             autolabel: false,
             collision: CollisionPolicy::Suffix,
+            source_node_id: None,
         }
     }
 

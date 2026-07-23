@@ -583,6 +583,25 @@ pub enum MeshCommandType {
         model_repo: String,
         target_node_id: String,
     },
+    /// Cross-node camera recordings listing. Node A asks paired node B for its
+    /// recordings list. B resolves its own org context, applies the filters
+    /// (serialized JSON — keeps this crate free of the recordings filter types)
+    /// and returns `CameraRecordingsListResult { recordings_json }`. Appended
+    /// at END (ciborium index rule).
+    CameraRecordingsList {
+        filters_json: String,
+    },
+    /// Cross-node camera recordings pull. Node A asks paired node B to stream the
+    /// selected recording files back to `target_node_id` over ALPN_ARTIFACT. B
+    /// validates each recording path (canonicalize + containment under its own
+    /// recordings dir, reject symlinks), caps count + per-file size, streams each
+    /// file with an artifact name key `recording|<ref>|<ext>` and returns
+    /// `CameraRecordingPullResult { pulled_refs }`. The files themselves travel
+    /// over ALPN_ARTIFACT, not in the CBOR response. Appended at END.
+    CameraRecordingPull {
+        recording_refs: Vec<String>,
+        target_node_id: String,
+    },
 }
 
 /// Per-node spec distributed-deployu policzony przez koordynatora z
@@ -811,6 +830,17 @@ pub enum MeshCommandResponsePayload {
     /// P0 cluster deploy: wynik `ModelPresentLocal`. Appended at END.
     ModelPresentResult {
         present: bool,
+    },
+    /// Serialized recordings list JSON (`Vec<RemoteRecordingItem>`) produced by
+    /// the receiver for `CameraRecordingsList`. Appended at END.
+    CameraRecordingsListResult {
+        recordings_json: String,
+    },
+    /// Recording refs the receiver successfully streamed over ALPN_ARTIFACT for
+    /// `CameraRecordingPull`. Confirms which files travelled; the bytes are not
+    /// in this CBOR. Appended at END.
+    CameraRecordingPullResult {
+        pulled_refs: Vec<String>,
     },
 }
 
@@ -1064,6 +1094,18 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("PushModelToPeer")
                 .field("deployment_cluster_id", deployment_cluster_id)
                 .field("model_repo", model_repo)
+                .field("target_node_id", target_node_id)
+                .finish(),
+            Self::CameraRecordingsList { filters_json } => f
+                .debug_struct("CameraRecordingsList")
+                .field("filters_json", filters_json)
+                .finish(),
+            Self::CameraRecordingPull {
+                recording_refs,
+                target_node_id,
+            } => f
+                .debug_struct("CameraRecordingPull")
+                .field("recording_refs", recording_refs)
                 .field("target_node_id", target_node_id)
                 .finish(),
         }

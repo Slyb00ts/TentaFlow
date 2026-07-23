@@ -266,6 +266,14 @@ impl DashboardServer {
                     local_node_id: local_node_id.to_string(),
                 },
             );
+            // Wire the recordings-pull context so the ML Studio layer can pull
+            // camera recordings from a paired node without threading AppState.
+            crate::mesh::recordings_pull::set_context(
+                crate::mesh::recordings_pull::RecordingsPullContext {
+                    iroh: qm.clone(),
+                    local_node_id: local_node_id.to_string(),
+                },
+            );
         }
 
         loop {

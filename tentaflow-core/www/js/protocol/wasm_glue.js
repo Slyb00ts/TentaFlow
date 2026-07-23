@@ -4668,9 +4668,10 @@ export function encodeMlStudioRecogImagesListRequest(dataset_id) {
  * @param {number} fps
  * @param {boolean} autolabel
  * @param {string} collision
+ * @param {string | null} [source_node_id]
  * @returns {Uint8Array}
  */
-export function encodeMlStudioRecogImportRecordingsRequest(project_id, dataset_id, recording_refs, fps, autolabel, collision) {
+export function encodeMlStudioRecogImportRecordingsRequest(project_id, dataset_id, recording_refs, fps, autolabel, collision, source_node_id) {
     const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -4679,13 +4680,15 @@ export function encodeMlStudioRecogImportRecordingsRequest(project_id, dataset_i
     const len2 = WASM_VECTOR_LEN;
     const ptr3 = passStringToWasm0(collision, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len3 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeMlStudioRecogImportRecordingsRequest(ptr0, len0, ptr1, len1, ptr2, len2, fps, autolabel, ptr3, len3);
+    var ptr4 = isLikeNone(source_node_id) ? 0 : passStringToWasm0(source_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogImportRecordingsRequest(ptr0, len0, ptr1, len1, ptr2, len2, fps, autolabel, ptr3, len3, ptr4, len4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v5;
+    return v6;
 }
 
 /**
@@ -4806,18 +4809,21 @@ export function encodeMlStudioRecogTrainStatusRequest(run_id) {
  * @param {number | null | undefined} date_from_ms
  * @param {number | null | undefined} date_to_ms
  * @param {number} limit
+ * @param {string | null} [source_node_id]
  * @returns {Uint8Array}
  */
-export function encodeMlStudioRecordingsListRequest(camera_id, date_from_ms, date_to_ms, limit) {
+export function encodeMlStudioRecordingsListRequest(camera_id, date_from_ms, date_to_ms, limit, source_node_id) {
     var ptr0 = isLikeNone(camera_id) ? 0 : passStringToWasm0(camera_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeMlStudioRecordingsListRequest(ptr0, len0, !isLikeNone(date_from_ms), isLikeNone(date_from_ms) ? 0 : date_from_ms, !isLikeNone(date_to_ms), isLikeNone(date_to_ms) ? 0 : date_to_ms, limit);
+    var ptr1 = isLikeNone(source_node_id) ? 0 : passStringToWasm0(source_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecordingsListRequest(ptr0, len0, !isLikeNone(date_from_ms), isLikeNone(date_from_ms) ? 0 : date_from_ms, !isLikeNone(date_to_ms), isLikeNone(date_to_ms) ? 0 : date_to_ms, limit, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v2;
+    return v3;
 }
 
 /**

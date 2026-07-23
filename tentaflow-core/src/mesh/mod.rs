@@ -28,6 +28,7 @@ pub mod proto_conv;
 #[cfg(any(feature = "rdma-probe", target_os = "macos"))]
 pub mod rdma_probe;
 pub mod reconnect;
+pub mod recordings_pull;
 pub mod relay_health;
 pub mod robot_control;
 pub mod robot_dispatch;
