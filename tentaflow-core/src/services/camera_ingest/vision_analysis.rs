@@ -520,6 +520,17 @@ const EXECUTOR_STALL_ERROR_AFTER: Duration = Duration::from_secs(30);
 /// Minimum spacing between repeated stall `error!` lines while still waiting.
 const EXECUTOR_STALL_ERROR_EVERY: Duration = Duration::from_secs(300);
 
+/// A detection forward that hangs (blocked on a lock/resource, GPU idle) leaves
+/// its job in `jobs`, and the per-camera ordering gate then blocks EVERY new
+/// frame of that camera until it clears — observed as a 2–4 min analysis outage
+/// (emitted+coalesced frozen, overlay blank). Nothing aborts a stuck
+/// `spawn_blocking`, so the loop force-evicts any job older than this, freeing the
+/// gate; a fresh forward spawns on a free inflight permit and analysis resumes in
+/// seconds. The evicted forward, when it finally returns, hits a missing job in
+/// `stage_completed` and is dropped. Chosen well above a normal forward (~20 ms)
+/// so healthy frames are never evicted.
+const FORWARD_STALL_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// One registered camera's scheduling state inside the shared engine.
 struct CamSlot {
     /// Camera-level `cameras.analysis_fps` — the fallback cadence for frame
@@ -929,6 +940,13 @@ struct FrameJob {
     /// path do asocjacji znak→pojazd. Puste, gdy model pojazdow niedostepny
     /// (degradacja do RF-DETR-only).
     vehicles: Vec<Detection>,
+    /// Kiedy job trafił do `jobs` (in-flight). Bramka kolejności blokuje kolejne
+    /// klatki kamery, dopóki jej job tu wisi; gdy forward inferencji zawiśnie na
+    /// locku/zasobie, job nigdy się nie domyka i analiza kamery STOI na minuty.
+    /// Pętla po [`FORWARD_STALL_TIMEOUT`] siłą usuwa taki job — bramka się zwalnia
+    /// i analiza rusza w sekundę (zawieszony forward, gdy w końcu skończy, trafia
+    /// na brak joba w `stage_completed` i jest pomijany).
+    submitted_at: std::time::Instant,
 }
 
 /// Wynik jednego współbieżnego forwardu batcha zwrócony ze spawnowanego zadania
@@ -1403,6 +1421,36 @@ async fn engine_loop() {
     loop {
         let now = std::time::Instant::now();
 
+        // Anti-stall: force-evict any job whose forward has been in flight past
+        // FORWARD_STALL_TIMEOUT. A hung forward otherwise keeps the job in `jobs`,
+        // and the ordering gate below (`jobs.values().any(camera_id == id)`) then
+        // blocks every new frame of that camera indefinitely — the multi-minute
+        // "analysis stopped, overlay blank" outage. Evicting frees the gate; the
+        // next iteration spawns a fresh forward on a free inflight permit.
+        {
+            let stale: Vec<(u64, String, Vec<String>, u64)> = jobs
+                .iter()
+                .filter(|(_, j)| now.duration_since(j.submitted_at) >= FORWARD_STALL_TIMEOUT)
+                .map(|(id, j)| {
+                    (
+                        *id,
+                        j.camera_id.clone(),
+                        j.open_stages.clone(),
+                        now.duration_since(j.submitted_at).as_millis() as u64,
+                    )
+                })
+                .collect();
+            for (job_id, cam, open, age_ms) in stale {
+                tracing::error!(
+                    camera_id = %cam,
+                    age_ms,
+                    open_stages = ?open,
+                    "[vision_analysis] forward stalled — evicting job to unblock the camera (a detection forward hung on a lock/resource; ordering gate was blocking every new frame)"
+                );
+                jobs.remove(&job_id);
+            }
+        }
+
         // Graceful shutdown (drain): dokończ WSZYSTKIE trwające forwardy —
         // awaitem, nie abortem — aplikując ich wyniki (finalne publikacje), po
         // czym wyjdź. Abort anulowałby tylko async-task; biegnący `spawn_blocking`
@@ -1600,6 +1648,7 @@ async fn engine_loop() {
                     detect_ms_total: 0,
                     failed_stages: 0,
                     vehicles: Vec::new(),
+                    submitted_at: now,
                 },
             );
         }
