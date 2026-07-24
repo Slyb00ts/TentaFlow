@@ -2,7 +2,7 @@
 // File: tf-modal.js
 // Description: <tf-modal> — modal/drawer overlay component.
 //   Attributes: open (boolean), title, subtitle, variant (modal|drawer-right|
-//   drawer-left|drawer-bottom|drawer-top), size (xs|sm|md|lg|xl|fullscreen),
+//   drawer-left|drawer-bottom|drawer-top), size (xs|sm|md|lg|xl|xxl|fullscreen),
 //   no-dismiss (boolean — ESC/backdrop do not close), no-close (boolean —
 //   hides the header close button).
 //   Events: close.
@@ -14,7 +14,8 @@ import './tf-button.js';
 
 const MODAL_SIZE_CLASSES = [
   'tf-modal--size-xs', 'tf-modal--size-sm', 'tf-modal--size-md',
-  'tf-modal--size-lg', 'tf-modal--size-xl', 'tf-modal--size-fullscreen',
+  'tf-modal--size-lg', 'tf-modal--size-xl', 'tf-modal--size-xxl',
+  'tf-modal--size-fullscreen',
 ];
 
 class TfModal extends HTMLElement {

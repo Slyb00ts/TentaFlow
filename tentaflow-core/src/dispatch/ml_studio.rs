@@ -6042,6 +6042,11 @@ pub fn ml_studio_project_import_cancel(
     }
 }
 
+/// TTL for the signed clip-preview `/frames/` URLs. Long enough that the import
+/// modal can stay open and lazy-load thumbnails as the user scrolls.
+#[cfg(feature = "camera")]
+const RECORDING_THUMB_TTL_SECS: u64 = 3600;
+
 #[handler(variant = "MlStudioRecordingsListRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -6088,6 +6093,9 @@ pub async fn ml_studio_recordings_list(
                     ))
                 })?
                 .into_iter()
+                // Clips only, mirroring the local path; a remote node serves its
+                // own `/frames/` surface so no cross-node preview URL is minted.
+                .filter(|r| r.kind == "segment")
                 .map(|r| tentaflow_protocol::MlStudioRecordingItem {
                     recording_ref: r.recording_ref,
                     kind: r.kind,
@@ -6097,6 +6105,7 @@ pub async fn ml_studio_recordings_list(
                     file_size_bytes: r.file_size_bytes,
                     plate_text: r.plate_text,
                     adr_text: r.adr_text,
+                    thumb_url: None,
                 })
                 .collect();
             return Ok(MessageBody::MlStudioBody(
@@ -6116,9 +6125,11 @@ pub async fn ml_studio_recordings_list(
         // Wire timestamps are unix MILLISECONDS; the recordings table is SECONDS.
         let created_from = payload.date_from_ms.map(|ms| ms / 1000);
         let created_to = payload.date_to_ms.map(|ms| ms / 1000);
+        // Frame import only makes sense for video clips; snapshots (single OCR
+        // frames) are excluded so they don't crowd out clips under the row limit.
         let filters = crate::db::repository::RecordingListFilters {
             owner_addon_id: None,
-            kind: None,
+            kind: Some("segment"),
             camera_id,
             created_from,
             created_to,
@@ -6131,15 +6142,31 @@ pub async fn ml_studio_recordings_list(
                 .map_err(db_err)?;
         let items = rows
             .into_iter()
-            .map(|r| tentaflow_protocol::MlStudioRecordingItem {
-                recording_ref: r.recording_ref,
-                kind: r.kind,
-                camera_id: r.camera_id,
-                created_at: r.created_at.saturating_mul(1000),
-                duration_ms: r.duration_ms,
-                file_size_bytes: r.file_size_bytes,
-                plate_text: r.plate_text,
-                adr_text: r.adr_text,
+            .map(|r| {
+                // Representative preview: the full downscaled scene captured at the
+                // best plate/ADR read of the event, served through the signed
+                // `/frames/<ref>` surface. Falls back to the ADR thumb.
+                let thumb_url = r
+                    .plate_thumb_ref
+                    .as_deref()
+                    .or(r.adr_thumb_ref.as_deref())
+                    .and_then(|thumb_ref| {
+                        crate::services::frame_url_issuer()
+                            .issue(thumb_ref.to_string(), RECORDING_THUMB_TTL_SECS)
+                            .ok()
+                            .map(|url| format!("/frames/{}?{}", thumb_ref, url.query_string()))
+                    });
+                tentaflow_protocol::MlStudioRecordingItem {
+                    recording_ref: r.recording_ref,
+                    kind: r.kind,
+                    camera_id: r.camera_id,
+                    created_at: r.created_at.saturating_mul(1000),
+                    duration_ms: r.duration_ms,
+                    file_size_bytes: r.file_size_bytes,
+                    plate_text: r.plate_text,
+                    adr_text: r.adr_text,
+                    thumb_url,
+                }
             })
             .collect();
         Ok(MessageBody::MlStudioBody(

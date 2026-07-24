@@ -3468,7 +3468,7 @@ async function loadDataPreview(pid) {
 function openRecogImportRecordingsModal(pid) {
   const modal = document.createElement('tf-modal');
   modal.setAttribute('variant', 'modal');
-  modal.setAttribute('size', 'xl');
+  modal.setAttribute('size', 'xxl');
   modal.setAttribute('title', 'Import klatek z nagrań TentaVision');
 
   const body = document.createElement('div');
@@ -3521,7 +3521,6 @@ function openRecogImportRecordingsModal(pid) {
   };
 
   const refKey = (r) => r.recordingRef ?? r.recording_ref ?? '';
-  const isSnapshot = (r) => (r.kind ?? '') === 'snapshot';
   const durationOf = (r) => r.durationMs ?? r.duration_ms ?? null;
 
   const formatDuration = (ms) => {
@@ -3532,10 +3531,9 @@ function openRecogImportRecordingsModal(pid) {
     return m > 0 ? `${m} min ${sec} s` : `${sec} s`;
   };
 
-  // Snapshots are one frame each and fps does not apply; clips estimate from
-  // durationMs, and a null duration must NOT fabricate a frame count.
+  // Clips estimate their frame count from durationMs; a null duration must NOT
+  // fabricate a count.
   const estFrames = (r, fps) => {
-    if (isSnapshot(r)) return 1;
     const dur = durationOf(r);
     if (dur == null) return null;
     return Math.max(1, Math.round((Number(dur) / 1000) * fps));
@@ -3558,17 +3556,15 @@ function openRecogImportRecordingsModal(pid) {
   const preflight = () => {
     const chosen = state.recordings.filter((r) => selected.has(refKey(r)));
     let clips = 0;
-    let snaps = 0;
     let clipFrames = 0;
     let unknownClips = 0;
     for (const r of chosen) {
-      if (isSnapshot(r)) { snaps += 1; continue; }
       clips += 1;
       const f = estFrames(r, state.fps);
       if (f == null) unknownClips += 1;
       else clipFrames += f;
     }
-    return { chosen: chosen.length, clips, snaps, clipFrames, unknownClips, totalFrames: clipFrames + snaps };
+    return { chosen: chosen.length, clips, clipFrames, unknownClips, totalFrames: clipFrames };
   };
 
   // Visual-only selection indicator rendered as a real tf-* primitive. The
@@ -3591,7 +3587,6 @@ function openRecogImportRecordingsModal(pid) {
             ? `${formatNumber(pf.clips)} × ${state.fps} fps → ~${formatNumber(pf.clipFrames)} klatek${pf.unknownClips ? ` (+${pf.unknownClips} o nieznanej długości)` : ''}`
             : '—',
         },
-        { key: 'Zdjęcia', value: pf.snaps ? `${formatNumber(pf.snaps)} (po 1 klatce, fps nie dotyczy)` : '—' },
         { key: 'Razem klatek (szac.)', value: `~${formatNumber(pf.totalFrames)}${pf.unknownClips ? ' + nieznane' : ''}` },
       ];
     }
@@ -3609,22 +3604,21 @@ function openRecogImportRecordingsModal(pid) {
     const vis = visibleRecordings();
     table.rows = vis.map((r) => {
       const ref = refKey(r);
-      const snap = isSnapshot(r);
       const created = Number(r.createdAt ?? r.created_at ?? 0);
       const dur = durationOf(r);
-      const durText = snap
-        ? '— (pojedyncza klatka)'
-        : (dur == null ? 'nieznana długość' : formatDuration(dur));
+      const durText = dur == null ? 'nieznana długość' : formatDuration(dur);
       const f = estFrames(r, state.fps);
-      const framesText = snap
-        ? '1 · fps nie dotyczy'
-        : (f == null ? 'nieznana długość' : `~${formatNumber(f)}`);
+      const framesText = f == null ? 'nieznana długość' : `~${formatNumber(f)}`;
       const plate = r.plateText ?? r.plate_text;
       const adr = r.adrText ?? r.adr_text;
+      const thumbUrl = r.thumbUrl ?? r.thumb_url ?? '';
+      const preview = thumbUrl
+        ? `<img src="${escapeAttr(thumbUrl)}" loading="lazy" alt="" style="width:72px;height:44px;object-fit:cover;border-radius:6px;display:block;background:var(--surface-2)">`
+        : `<div style="width:72px;height:44px;border-radius:6px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;color:var(--text-3,#888);font-size:10px">brak</div>`;
       return {
         recordingRef: ref,
         sel: checkCell(selected.has(ref)),
-        kind: { status: snap ? 'info' : 'accent', label: snap ? 'zdjęcie' : 'klip' },
+        preview,
         camera: String(r.cameraId ?? r.camera_id ?? '—'),
         created: created ? new Date(created).toLocaleString('pl-PL') : '—',
         duration: durText,
@@ -3980,7 +3974,7 @@ function openRecogImportRecordingsModal(pid) {
       table.setAttribute('variant', 'lined');
       table.innerHTML = `
         <tf-column key="sel" label="" renderer="html"></tf-column>
-        <tf-column key="kind" label="Typ" renderer="chip"></tf-column>
+        <tf-column key="preview" label="Podgląd" renderer="html"></tf-column>
         <tf-column key="camera" label="Kamera"></tf-column>
         <tf-column key="created" label="Data i czas"></tf-column>
         <tf-column key="duration" label="Długość"></tf-column>

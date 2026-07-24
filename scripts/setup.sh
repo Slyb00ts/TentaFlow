@@ -363,6 +363,9 @@ install_base() {
                 gst-plugins-bad
                 gst-plugins-ugly
                 gst-libav
+                # ML Studio frame extraction shells out to ffmpeg to decode
+                # recording segments into training frames.
+                ffmpeg
                 openssl
                 vulkan-icd-loader
                 sqlite
@@ -392,7 +395,7 @@ install_base() {
                 run_privileged pacman -S --needed --noconfirm protobuf
                 INSTALLED+=("protobuf")
             fi
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "jdk17-openjdk" "unzip" "glib2" "gstreamer" "gst-plugins-base-libs" "gst-plugins-good" "gst-plugins-bad" "gst-plugins-ugly" "gst-libav" "vulkan-loader" "sqlite" "perf" "sysstat")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "jdk17-openjdk" "unzip" "glib2" "gstreamer" "gst-plugins-base-libs" "gst-plugins-good" "gst-plugins-bad" "gst-plugins-ugly" "gst-libav" "ffmpeg" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -422,6 +425,9 @@ install_base() {
                 gstreamer1.0-plugins-bad
                 gstreamer1.0-plugins-ugly
                 gstreamer1.0-libav
+                # ML Studio frame extraction shells out to ffmpeg to decode
+                # recording segments into training frames.
+                ffmpeg
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
@@ -445,7 +451,7 @@ install_base() {
             fi
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "gstreamer1.0-plugins-good" "gstreamer1.0-plugins-bad" "gstreamer1.0-plugins-ugly" "gstreamer1.0-libav" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "gstreamer1.0-plugins-good" "gstreamer1.0-plugins-bad" "gstreamer1.0-plugins-ugly" "gstreamer1.0-libav" "ffmpeg" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -487,6 +493,11 @@ install_base() {
                 gstreamer1-plugins-bad-free
                 gstreamer1-plugins-ugly
                 gstreamer1-libav
+                # ML Studio frame extraction shells out to ffmpeg to decode
+                # recording segments into training frames. Full ffmpeg (H.264)
+                # lives in RPM Fusion, same as gstreamer1-libav above;
+                # --skip-unavailable keeps setup green when the repo is absent.
+                ffmpeg
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
@@ -507,7 +518,7 @@ install_base() {
             # --skip-unavailable: nie przerywaj calej transakcji gdy jeden pakiet
             # zniknal w danej wersji Fedory (np. java-17 na F44) — reszta wchodzi.
             run_privileged dnf install -y --skip-unavailable "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "gstreamer1-plugins-good" "gstreamer1-plugins-bad-free" "gstreamer1-plugins-ugly (RPM Fusion)" "gstreamer1-libav (RPM Fusion)" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "gstreamer1-plugins-good" "gstreamer1-plugins-bad-free" "gstreamer1-plugins-ugly (RPM Fusion)" "gstreamer1-libav (RPM Fusion)" "ffmpeg (RPM Fusion)" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -535,6 +546,9 @@ install_base() {
                 # with it — no separate plugin formulas needed.
                 gstreamer
                 gst-plugins-base
+                # ML Studio frame extraction shells out to ffmpeg to decode
+                # recording segments into training frames.
+                ffmpeg
                 openssl@3
                 sqlite
                 protobuf
@@ -543,7 +557,7 @@ install_base() {
             brew install "${pkgs[@]}"
             configure_macos_gstreamer_pkg_config
             ensure_macos_metal_toolchain
-            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "git-lfs" "openjdk@17" "unzip" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
+            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "git-lfs" "openjdk@17" "unzip" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "ffmpeg" "openssl@3" "sqlite")
             ;;
     esac
 

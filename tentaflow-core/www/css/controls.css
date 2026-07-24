@@ -7682,6 +7682,7 @@ tf-relation-graph {
 .tf-modal--size-md  { width: min(560px, 90vw); }
 .tf-modal--size-lg  { width: min(720px, 90vw); }
 .tf-modal--size-xl  { width: min(960px, 90vw); }
+.tf-modal--size-xxl { width: min(92vw, max(960px, 80vw)); }
 .tf-modal--size-fullscreen {
   width: 100vw;
   height: 100vh;

@@ -2492,6 +2492,11 @@ pub struct MlStudioRecordingItem {
     pub plate_text: Option<String>,
     #[serde(default)]
     pub adr_text: Option<String>,
+    /// Signed `/frames/<ref>` URL of a representative full frame (the scene at
+    /// the best OCR read of the event), used as a clip preview. `None` when the
+    /// recording carries no thumb ref or lives on a remote node.
+    #[serde(default)]
+    pub thumb_url: Option<String>,
 }
 
 /// Start pakowania projektu. Job w tle buduje archiwum; postęp przez
