@@ -152,6 +152,26 @@ pub struct OverviewKpis {
     pub member_count: u32,
     pub open_ingest_jobs: u32,
     pub my_chat_count: u32,
+    // F2 counters appended with #[serde(default)] so frames produced by F1
+    // peers (which omit them) still decode — struct fields are append-only
+    // on the wire, same as enum variants.
+    #[serde(default)]
+    pub cases_total: u32,
+    #[serde(default)]
+    pub cases_approved: u32,
+    #[serde(default)]
+    pub suites_total: u32,
+    #[serde(default)]
+    pub runs_open: u32,
+    /// Pending run items assigned to (or claimable by) the caller.
+    #[serde(default)]
+    pub my_run_items_pending: u32,
+    #[serde(default)]
+    pub tasks_open: u32,
+    #[serde(default)]
+    pub defects_open: u32,
+    #[serde(default)]
+    pub generations_running: u32,
 }
 
 /// One activity-log entry for the project feed.
@@ -219,6 +239,280 @@ pub struct ProjectSettings {
     pub modules: Vec<String>,
     pub agents: Vec<ProjectAgentBinding>,
     pub tags: Vec<TagInfo>,
+}
+
+/// Attachment reference stored on cases, run items, steps and tasks.
+/// Bytes are content-addressed by `sha256`; download goes through
+/// `AttachmentGetRequest`, upload reuses `SourceUploadChunkRequest`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentWire {
+    pub sha256: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub mime: String,
+}
+
+/// Manual test case row for lists. Cases with `review_state == "pending"`
+/// (agent output awaiting review) are excluded from every list/search —
+/// they surface only inside `GenerationGetResponse.pending_cases`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestCaseInfo {
+    pub case_id: String,
+    /// 'manual' | 'ui' | 'api' | 'unit' | 'perf' | 'security' (F2 accepts
+    /// only 'manual', the rest is rejected until later phases).
+    pub kind: String,
+    pub title: String,
+    /// 'low' | 'medium' | 'high' | 'critical'.
+    pub priority: String,
+    /// 'draft' | 'review' | 'approved' | 'deprecated'.
+    pub status: String,
+    /// Reason for the last status change (required on every downgrade).
+    pub status_reason: String,
+    /// '' | 'pending' | 'accepted' — agent-generated cases start 'pending'.
+    pub review_state: String,
+    /// 'user' | 'agent'.
+    pub origin: String,
+    /// Generation run that produced the case ('' for user-authored).
+    pub generation_run_id: String,
+    pub language: String,
+    pub current_version: u32,
+    pub tag_ids: Vec<String>,
+    pub linked_source_ids: Vec<String>,
+    pub attachment_count: u32,
+    /// Latest run-item verdict for the case, `None` = never executed.
+    pub last_result: Option<String>,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One entry of the append-only case version history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaseVersionInfo {
+    pub version: u32,
+    pub change_note: String,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub created_at: String,
+}
+
+/// Full case view: current content plus attachments and version history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestCaseDetail {
+    pub info: TestCaseInfo,
+    pub content_json: String,
+    pub attachments: Vec<AttachmentWire>,
+    pub versions: Vec<CaseVersionInfo>,
+}
+
+/// One rejected CSV row from the import (line numbers are 1-based).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CsvImportError {
+    pub line: u32,
+    pub message: String,
+}
+
+/// Test suite summary with the latest run (if any).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SuiteInfo {
+    pub suite_id: String,
+    pub name: String,
+    pub description: String,
+    pub case_count: u32,
+    /// True when the suite still references deprecated cases.
+    pub has_deprecated: bool,
+    pub last_run: Option<TestRunInfo>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Ordered case reference inside a suite.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SuiteCaseRef {
+    pub case_id: String,
+    pub position: u32,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    pub priority: String,
+}
+
+/// Test run header. Result counters are SQL aggregates over run items
+/// (never denormalized), so a plain `RunGetRequest` poll is consistent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestRunInfo {
+    pub run_id: String,
+    /// Human-friendly sequential number, unique per project.
+    pub run_no: u32,
+    pub name: String,
+    pub suite_id: String,
+    pub suite_name: String,
+    /// 'manual' (automated run types arrive in later phases).
+    pub run_type: String,
+    /// Reserved for environments (F3+); always '' in F2.
+    pub environment_id: String,
+    pub env_note: String,
+    /// 'single' | 'per_case' | 'pool'.
+    pub assignment_mode: String,
+    /// 'running' | 'completed' | 'cancelled'.
+    pub status: String,
+    pub total: u32,
+    pub passed: u32,
+    pub failed: u32,
+    pub blocked: u32,
+    pub skipped: u32,
+    pub pending: u32,
+    pub in_progress: u32,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Per-case assignment sent by the client for 'per_case' runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAssignmentWire {
+    pub case_id: String,
+    pub user_id: String,
+}
+
+/// One executable item of a run. The item pins `case_version` + `case_title`
+/// at run creation, so later case edits never mutate a running execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunItemWire {
+    pub item_id: String,
+    pub run_id: String,
+    pub case_id: String,
+    pub case_title: String,
+    pub case_version: u32,
+    pub position: u32,
+    /// '' = pool item (claimable by any tester).
+    pub assigned_to: String,
+    pub assigned_to_name: String,
+    /// 'pending' | 'in_progress' | 'passed' | 'failed' | 'blocked' | 'skipped'.
+    pub status: String,
+    pub result_note: String,
+    pub tester_config: String,
+    pub duration_secs: u32,
+    pub attachments: Vec<AttachmentWire>,
+    pub steps_total: u32,
+    pub steps_done: u32,
+    pub claimed_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// One step of a run item (action/expected are snapshots copied from the
+/// case content at run creation).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStepWire {
+    pub step_index: u32,
+    pub action: String,
+    pub expected: String,
+    pub status: String,
+    pub note: String,
+    pub attachments: Vec<AttachmentWire>,
+}
+
+/// Cross-project "my test work" aggregate for the caller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MyWorkEntry {
+    pub project_id: String,
+    pub project_name: String,
+    pub run_id: String,
+    pub run_no: u32,
+    pub run_name: String,
+    pub items_pending: u32,
+    pub items_in_progress: u32,
+}
+
+/// Task / defect row for lists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub task_id: String,
+    /// Human-friendly sequential number, unique per project.
+    pub task_no: u32,
+    /// 'task' | 'defect'.
+    pub task_type: String,
+    pub title: String,
+    /// Defect severity ('' for plain tasks).
+    pub severity: String,
+    pub priority: String,
+    /// 'todo' | 'in_progress' | 'review' | 'done'.
+    pub status: String,
+    pub assigned_to: String,
+    pub assigned_to_name: String,
+    pub due_date: String,
+    /// JSON array of `{kind:'case'|'run'|'run_item'|'step', id, label}`.
+    pub links_json: String,
+    pub comment_count: u32,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Task comment with author display data resolved server-side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskCommentWire {
+    pub comment_id: String,
+    pub author_user_id: String,
+    pub author_name: String,
+    pub body_md: String,
+    pub created_at: String,
+    pub edited_at: Option<String>,
+}
+
+/// Full task view for the detail panel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskDetail {
+    pub info: TaskInfo,
+    pub description_md: String,
+    pub attachments: Vec<AttachmentWire>,
+    pub comments: Vec<TaskCommentWire>,
+}
+
+/// Agent generation run. Polling `GenerationGetRequest` every 2-4 s is the
+/// source of truth; the agent-run event stream is only a live view for the
+/// initiator (run-scope ACL).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenerationRunInfo {
+    pub gen_id: String,
+    pub kind: String,
+    /// 'running' | 'review' | 'accepted' | 'rejected' | 'failed' | 'cancelled'.
+    pub status: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub agent_run_id: String,
+    pub source_ids: Vec<String>,
+    pub instructions: String,
+    pub requested_count: u32,
+    pub max_cases: u32,
+    pub cases_generated: u32,
+    pub cases_accepted: u32,
+    pub cases_rejected: u32,
+    pub error: Option<String>,
+    pub started_by: String,
+    pub started_by_name: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Personal notification row. Rows live in the central DB and every query is
+/// filtered by the authenticated caller — the wire never exposes another
+/// user's notifications.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotificationWire {
+    pub notification_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    /// 'run_item_assigned' | 'run_closed' | 'generation_finished' | 'task_assigned'.
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub link_json: String,
+    pub read_at: Option<String>,
+    pub created_at: String,
 }
 
 /// Project Studio message family (request + response + stream). ciborium
@@ -585,11 +879,502 @@ pub enum ProjectStudioPayload {
         error: Option<String>,
         message_id: String,
     },
+    // ---- F2: manual test cases (T01, T02) ----
+    /// Cases with `review_state == 'pending'` are ALWAYS excluded
+    /// server-side — agent output surfaces only via GenerationGetResponse
+    /// until it passes review.
+    CasesListRequest {
+        project_id: String,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        priority: String,
+        #[serde(default)]
+        tag_id: String,
+        #[serde(default)]
+        origin: String,
+        #[serde(default)]
+        search: String,
+        offset: u32,
+        limit: u32,
+    },
+    CasesListResponse {
+        cases: Vec<TestCaseInfo>,
+        total: u32,
+    },
+    CaseGetRequest {
+        project_id: String,
+        case_id: String,
+        #[serde(default)]
+        include_versions: bool,
+    },
+    CaseGetResponse {
+        detail: TestCaseDetail,
+    },
+    /// `case_id: None` = create. `expected_version` drives optimistic
+    /// locking on edit: a stale version yields a conflict error, the client
+    /// reloads instead of silently overwriting. A new version is recorded
+    /// only when `content_json` actually changed.
+    CaseSaveRequest {
+        project_id: String,
+        #[serde(default)]
+        case_id: Option<String>,
+        kind: String,
+        title: String,
+        priority: String,
+        content_json: String,
+        tag_ids: Vec<String>,
+        linked_source_ids: Vec<String>,
+        attachments_json: String,
+        #[serde(default)]
+        expected_version: Option<u32>,
+        #[serde(default)]
+        change_note: String,
+    },
+    CaseSaveResponse {
+        case_id: String,
+        version: u32,
+    },
+    /// Every status downgrade requires `reason`.
+    CaseStatusSetRequest {
+        project_id: String,
+        case_id: String,
+        status: String,
+        #[serde(default)]
+        reason: String,
+    },
+    CaseStatusSetResult {
+        ok: bool,
+    },
+    CasesBulkStatusRequest {
+        project_id: String,
+        case_ids: Vec<String>,
+        status: String,
+        #[serde(default)]
+        reason: String,
+    },
+    CasesBulkStatusResponse {
+        updated: u32,
+    },
+    CaseDuplicateRequest {
+        project_id: String,
+        case_id: String,
+    },
+    CaseDuplicateResponse {
+        case_id: String,
+    },
+    CaseDeleteRequest {
+        project_id: String,
+        case_id: String,
+    },
+    CaseDeleteResult {
+        ok: bool,
+    },
+    CaseVersionGetRequest {
+        project_id: String,
+        case_id: String,
+        version: u32,
+    },
+    CaseVersionGetResponse {
+        content_json: String,
+        change_note: String,
+        created_by_name: String,
+        created_at: String,
+    },
+    /// Restore creates a NEW version carrying the old content — history is
+    /// append-only, nothing is rewritten, running executions keep their
+    /// pinned snapshots.
+    CaseRestoreVersionRequest {
+        project_id: String,
+        case_id: String,
+        version: u32,
+        expected_version: u32,
+    },
+    CaseRestoreVersionResponse {
+        case_id: String,
+        version: u32,
+    },
+    /// Server-side parsing with hard clamps (2 MiB / 500 rows); the import
+    /// transaction is all-or-nothing, `dry_run` only validates.
+    CasesImportCsvRequest {
+        project_id: String,
+        csv_text: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    CasesImportCsvResponse {
+        created: u32,
+        errors: Vec<CsvImportError>,
+    },
+    /// Attachment download by content hash (server clamps `max_bytes` to
+    /// 8 MiB); upload reuses the existing SourceUploadChunkRequest.
+    AttachmentGetRequest {
+        project_id: String,
+        sha256: String,
+        max_bytes: u32,
+    },
+    AttachmentGetResponse {
+        /// Raw attachment bytes. `serde_bytes` forces a CBOR byte-string
+        /// (length-prefixed) — a bare `Vec<u8>` would encode as an
+        /// array-of-integers (~2x the size), unacceptable for downloads.
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+        mime: String,
+        truncated: bool,
+    },
+    // ---- F2: test suites (T04) ----
+    SuitesListRequest {
+        project_id: String,
+    },
+    SuitesListResponse {
+        suites: Vec<SuiteInfo>,
+    },
+    SuiteGetRequest {
+        project_id: String,
+        suite_id: String,
+    },
+    SuiteGetResponse {
+        suite: SuiteInfo,
+        cases: Vec<SuiteCaseRef>,
+    },
+    /// `suite_id: None` = create; `case_ids` order defines member positions.
+    SuiteSaveRequest {
+        project_id: String,
+        #[serde(default)]
+        suite_id: Option<String>,
+        name: String,
+        description: String,
+        case_ids: Vec<String>,
+    },
+    SuiteSaveResponse {
+        suite_id: String,
+    },
+    SuiteDeleteRequest {
+        project_id: String,
+        suite_id: String,
+    },
+    SuiteDeleteResult {
+        ok: bool,
+    },
+    // ---- F2: test runs + execution (T06, T07, T08, T09) ----
+    RunsListRequest {
+        project_id: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        run_type: String,
+        offset: u32,
+        limit: u32,
+    },
+    RunsListResponse {
+        runs: Vec<TestRunInfo>,
+        total: u32,
+    },
+    /// Exactly ONE of `suite_id` / `case_ids` / `from_failed_run_id` selects
+    /// the case source; the server rejects any other combination. Items
+    /// snapshot case version, title and steps at creation.
+    RunCreateRequest {
+        project_id: String,
+        name: String,
+        #[serde(default)]
+        suite_id: String,
+        #[serde(default)]
+        case_ids: Vec<String>,
+        #[serde(default)]
+        from_failed_run_id: String,
+        #[serde(default)]
+        env_note: String,
+        assignment_mode: String,
+        #[serde(default)]
+        single_assignee: String,
+        #[serde(default)]
+        assignments: Vec<RunAssignmentWire>,
+    },
+    RunCreateResponse {
+        run_id: String,
+        run_no: u32,
+    },
+    RunGetRequest {
+        project_id: String,
+        run_id: String,
+    },
+    RunGetResponse {
+        run: TestRunInfo,
+        items: Vec<RunItemWire>,
+    },
+    RunCloseRequest {
+        project_id: String,
+        run_id: String,
+        #[serde(default)]
+        cancelled: bool,
+    },
+    RunCloseResult {
+        ok: bool,
+    },
+    RunDeleteRequest {
+        project_id: String,
+        run_id: String,
+    },
+    RunDeleteResult {
+        ok: bool,
+    },
+    /// `item_id: None` claims the nearest pool item — a single atomic
+    /// UPDATE…RETURNING server-side, so two testers never claim the same
+    /// item (no select-then-update race).
+    RunItemClaimRequest {
+        project_id: String,
+        run_id: String,
+        #[serde(default)]
+        item_id: Option<String>,
+    },
+    /// `item: None` = nothing left to claim in this run.
+    RunItemClaimResponse {
+        item: Option<RunItemWire>,
+    },
+    RunItemReleaseRequest {
+        project_id: String,
+        item_id: String,
+    },
+    RunItemReleaseResult {
+        ok: bool,
+    },
+    RunItemGetRequest {
+        project_id: String,
+        item_id: String,
+    },
+    RunItemGetResponse {
+        item: RunItemWire,
+        steps: Vec<RunStepWire>,
+        preconditions: String,
+        test_data: String,
+    },
+    RunStepSetRequest {
+        project_id: String,
+        item_id: String,
+        step_index: u32,
+        status: String,
+        #[serde(default)]
+        note: String,
+        #[serde(default)]
+        attachments_json: String,
+    },
+    RunStepSetResult {
+        ok: bool,
+    },
+    /// Empty `status` = server derives the verdict from step results
+    /// (fail > blocked > skip > pass); an explicit override requires
+    /// `result_note`. `next_item` lets the tester chain into the next
+    /// claimable item without a separate claim round-trip.
+    RunItemFinishRequest {
+        project_id: String,
+        item_id: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        result_note: String,
+        #[serde(default)]
+        tester_config: String,
+        duration_secs: u32,
+        #[serde(default)]
+        attachments_json: String,
+    },
+    RunItemFinishResponse {
+        ok: bool,
+        next_item: Option<RunItemWire>,
+    },
+    /// Cross-project: aggregates the caller's open run items over all active
+    /// projects with the tests module enabled — hence no `project_id`.
+    MyTestWorkRequest,
+    MyTestWorkResponse {
+        entries: Vec<MyWorkEntry>,
+    },
+    // ---- F2: tasks + defects (Z01, Z02) ----
+    TasksListRequest {
+        project_id: String,
+        #[serde(default)]
+        task_type: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        assigned_to: String,
+        #[serde(default)]
+        search: String,
+        offset: u32,
+        limit: u32,
+    },
+    TasksListResponse {
+        tasks: Vec<TaskInfo>,
+        total: u32,
+    },
+    TaskGetRequest {
+        project_id: String,
+        task_id: String,
+    },
+    TaskGetResponse {
+        detail: TaskDetail,
+    },
+    /// `task_id: None` = create; defects require `severity`.
+    TaskSaveRequest {
+        project_id: String,
+        #[serde(default)]
+        task_id: Option<String>,
+        task_type: String,
+        title: String,
+        description_md: String,
+        #[serde(default)]
+        severity: String,
+        priority: String,
+        status: String,
+        #[serde(default)]
+        assigned_to: String,
+        #[serde(default)]
+        due_date: String,
+        #[serde(default)]
+        links_json: String,
+        #[serde(default)]
+        attachments_json: String,
+    },
+    TaskSaveResponse {
+        task_id: String,
+        task_no: u32,
+    },
+    TaskDeleteRequest {
+        project_id: String,
+        task_id: String,
+    },
+    TaskDeleteResult {
+        ok: bool,
+    },
+    TaskCommentAddRequest {
+        project_id: String,
+        task_id: String,
+        body_md: String,
+    },
+    TaskCommentAddResponse {
+        comment: TaskCommentWire,
+    },
+    TaskCommentEditRequest {
+        project_id: String,
+        comment_id: String,
+        body_md: String,
+    },
+    TaskCommentEditResult {
+        ok: bool,
+    },
+    TaskCommentDeleteRequest {
+        project_id: String,
+        comment_id: String,
+    },
+    TaskCommentDeleteResult {
+        ok: bool,
+    },
+    // ---- F2: agent case generation (G01/T05) ----
+    /// `requested_count` 0 = server default (10); `agent_id: None` = the
+    /// project's 'generator_manual' binding (seeded system agent fallback).
+    GenerationStartRequest {
+        project_id: String,
+        kind: String,
+        source_ids: Vec<String>,
+        #[serde(default)]
+        requested_count: u32,
+        #[serde(default)]
+        instructions: String,
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    GenerationStartResponse {
+        gen_id: String,
+        agent_run_id: String,
+    },
+    GenerationsListRequest {
+        project_id: String,
+    },
+    GenerationsListResponse {
+        generations: Vec<GenerationRunInfo>,
+    },
+    /// Polling every 2-4 s is the source of truth for generation progress;
+    /// the agent-run event stream is only a live view for the initiator.
+    GenerationGetRequest {
+        project_id: String,
+        gen_id: String,
+    },
+    GenerationGetResponse {
+        run: GenerationRunInfo,
+        pending_cases: Vec<TestCaseInfo>,
+    },
+    GenerationCancelRequest {
+        project_id: String,
+        gen_id: String,
+    },
+    GenerationCancelResult {
+        ok: bool,
+    },
+    GenerationReviewRequest {
+        project_id: String,
+        gen_id: String,
+        #[serde(default)]
+        accept_case_ids: Vec<String>,
+        #[serde(default)]
+        reject_case_ids: Vec<String>,
+    },
+    GenerationReviewResponse {
+        accepted: u32,
+        rejected: u32,
+        run_status: String,
+    },
+    GenerationDeleteRequest {
+        project_id: String,
+        gen_id: String,
+    },
+    GenerationDeleteResult {
+        ok: bool,
+    },
+    // ---- F2: notifications (G02) — central DB, always caller-scoped ----
+    NotificationsListRequest {
+        #[serde(default)]
+        only_unread: bool,
+        #[serde(default)]
+        before_id: Option<String>,
+        limit: u32,
+    },
+    NotificationsListResponse {
+        notifications: Vec<NotificationWire>,
+        unread_count: u32,
+        has_more: bool,
+    },
+    /// Empty `notification_ids` = mark ALL of the caller's as read.
+    NotificationsMarkReadRequest {
+        #[serde(default)]
+        notification_ids: Vec<String>,
+    },
+    NotificationsMarkReadResult {
+        ok: bool,
+    },
+    // ---- F2: reports (T14) ----
+    /// One generic report variant on purpose: later phases add report kinds
+    /// ('runs_over_time' | 'suite_pass_rate' | 'tester_stats' |
+    /// 'source_coverage' | 'defects' in F2) without touching the wire —
+    /// `rows_json` schema is per report.
+    ReportQueryRequest {
+        project_id: String,
+        report: String,
+        #[serde(default)]
+        from_date: String,
+        #[serde(default)]
+        to_date: String,
+        #[serde(default)]
+        suite_id: String,
+    },
+    ReportQueryResponse {
+        rows_json: String,
+    },
     // ================================================================
-    // Append-only past this point (F2: test_cases, suites, runs,
-    // generations, documents, tasks, notifications). Never insert above:
-    // ciborium encodes variants by index, inserting or reordering breaks
-    // older peers on the wire.
+    // Append-only past this point (F3+: environments, coded cases,
+    // automated runs, schedules). Never insert above: reordering existing
+    // variants breaks the wire contract with older peers, so new variants
+    // go strictly at the end.
     // ================================================================
 }
 
@@ -715,6 +1500,44 @@ mod tests {
                 "a173536f75726365734c697374526573706f6e7365a167736f757263657381ad69736f757263655f6964627331646b696e6468646f63756d656e74646e616d65616e667374617475736572656164796b636f6e6669675f6a736f6e627b7d656572726f72f66a66696c655f636f756e74016b6368756e6b5f636f756e74026a637265617465645f62796275316f637265617465645f62795f6e616d6561556a637265617465645f617461746a757064617465645f61746174686c6173745f6a6f62a9666a6f625f6964626a3169736f757263655f69646273316673746174757367737563636573736b66696c65735f746f74616c016a66696c65735f646f6e65016b6368756e6b735f646f6e6502656572726f72f66a737461727465645f617461746b66696e69736865645f61746174"
             ),
             "SourcesListResponse wire drift"
+        );
+
+        // F2: CasesListRequest — pins the first appended F2 variant (name +
+        // full field set with defaulted filters).
+        let cases = ProjectStudioPayload::CasesListRequest {
+            project_id: "p1".to_string(),
+            kind: String::new(),
+            status: String::new(),
+            priority: String::new(),
+            tag_id: String::new(),
+            origin: String::new(),
+            search: String::new(),
+            offset: 0,
+            limit: 50,
+        };
+        let bytes = crate::cbor::encode(&cases).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17043617365734c69737452657175657374a96a70726f6a6563745f6964627031646b696e64606673746174757360687072696f7269747960667461675f696460666f726967696e606673656172636860666f666673657400656c696d69741832"
+            ),
+            "CasesListRequest wire drift"
+        );
+
+        // F2: RunItemClaimRequest with item_id: None — pins the Option
+        // encoding (CBOR null) for the pool-claim path.
+        let claim = ProjectStudioPayload::RunItemClaimRequest {
+            project_id: "p1".to_string(),
+            run_id: "r1".to_string(),
+            item_id: None,
+        };
+        let bytes = crate::cbor::encode(&claim).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17352756e4974656d436c61696d52657175657374a36a70726f6a6563745f69646270316672756e5f6964627231676974656d5f6964f6"
+            ),
+            "RunItemClaimRequest wire drift"
         );
     }
 

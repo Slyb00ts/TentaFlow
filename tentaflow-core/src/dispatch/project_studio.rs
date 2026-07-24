@@ -528,6 +528,12 @@ pub async fn project_studio_dispatch(
         | P::ChatStreamEnd { .. } => Err(ProtocolError::bad_request(
             "variant is not a valid project studio request",
         )),
+        // F2 variants (cases/suites/runs/tasks/generations/notifications/
+        // reports) get real handlers in the F2 backend step; a wildcard keeps
+        // this match compiling until then without listing 84 unhandled arms.
+        _ => Err(ProtocolError::bad_request(
+            "project studio variant not handled yet",
+        )),
     }
 }
 
@@ -2103,6 +2109,16 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
             member_count,
             open_ingest_jobs: kpis.open_ingest_jobs,
             my_chat_count,
+            // F2 objects (cases/suites/runs/tasks/generations) are not yet
+            // queried here — the F2 backend step computes these for real.
+            cases_total: 0,
+            cases_approved: 0,
+            suites_total: 0,
+            runs_open: 0,
+            my_run_items_pending: 0,
+            tasks_open: 0,
+            defects_open: 0,
+            generations_running: 0,
         },
         activity: activity_to_wire(entries, &names),
     }))
