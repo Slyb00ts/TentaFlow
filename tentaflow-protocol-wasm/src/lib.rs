@@ -9605,6 +9605,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
         MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
+        MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -9692,6 +9693,94 @@ fn decode_storage_admin_payload(
         P::CreateDirRequest(_) => set(obj, "variant", "StorageCreateDirRequest".into()),
         P::MigrateRequest(_) => set(obj, "variant", "StorageMigrateRequest".into()),
     }
+}
+
+/// Decodes `ProjectStudioPayload` generically: serde's external tagging yields
+/// `{"VariantName": {fields}}` (or a bare string for unit variants), so the
+/// variant tag becomes "ProjectStudio" + name and every field is copied with
+/// both snake_case and camelCase keys. Future append-only F2 variants decode
+/// without touching this crate. `bytes` of the upload request would arrive as
+/// a number array, but request variants never legitimately decode in the
+/// response path.
+fn decode_project_studio_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::project_studio::ProjectStudioPayload,
+) {
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "ProjectStudioDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("ProjectStudio{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("ProjectStudio{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "ProjectStudioDecodeError".into()),
+    }
+}
+
+/// Recursive serde_json::Value → JsValue conversion; object keys are emitted
+/// under both snake_case and camelCase (same dual-key convention as the
+/// hand-written decoders above).
+fn json_value_to_js_dual(value: &serde_json::Value) -> JsValue {
+    match value {
+        serde_json::Value::Null => JsValue::NULL,
+        serde_json::Value::Bool(b) => (*b).into(),
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0).into(),
+        serde_json::Value::String(s) => s.clone().into(),
+        serde_json::Value::Array(items) => {
+            let arr = js_sys::Array::new();
+            for item in items {
+                arr.push(&json_value_to_js_dual(item));
+            }
+            arr.into()
+        }
+        serde_json::Value::Object(map) => {
+            let obj = js_sys::Object::new();
+            for (key, val) in map {
+                let js_val = json_value_to_js_dual(val);
+                let camel = snake_key_to_camel(key);
+                if &camel != key {
+                    set(&obj, &camel, js_val.clone());
+                }
+                set(&obj, key, js_val);
+            }
+            obj.into()
+        }
+    }
+}
+
+fn snake_key_to_camel(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut upper_next = false;
+    for c in key.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
@@ -17040,3 +17129,652 @@ pub fn encode_robot_geo_anchor_get_request(robot_id: String) -> Result<Vec<u8>, 
     .map_err(|e| JsError::new(&e))
 }
 
+
+// ----- Project Studio ("Projekty") -----
+// One encoder per ProjectStudioPayload request variant. Requests carrying
+// arrays/maps of structs take a JSON string parsed via serde (same pattern as
+// encode_benchmark_save_request); simple fields are explicit parameters.
+// i64 fields (ActivityList.before_id) cross the JS boundary as Option<String>
+// and are parsed here — JS numbers cannot represent the full i64 range.
+
+/// MessageBody::ProjectStudioBody(ProjectsListRequest) — project registry.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectsListRequest)]
+pub fn encode_project_studio_projects_list_request(
+    include_archived: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectsListRequest {
+            include_archived,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectCreateRequest). `modules_json` is a
+/// JSON array of module names; `members_json` is a JSON array of
+/// MemberInputWire objects ({user_id, role}).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectCreateRequest)]
+pub fn encode_project_studio_project_create_request(
+    name: String,
+    description: String,
+    template: String,
+    modules_json: String,
+    members_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let modules: Vec<String> = serde_json::from_str(&modules_json)
+        .map_err(|e| JsError::new(&format!("invalid modules_json: {e}")))?;
+    let members: Vec<tentaflow_protocol::project_studio::MemberInputWire> =
+        serde_json::from_str(&members_json)
+            .map_err(|e| JsError::new(&format!("invalid members_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectCreateRequest {
+            name,
+            description,
+            template,
+            modules,
+            members,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectGetRequest)]
+pub fn encode_project_studio_project_get_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectGetRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectUpdateRequest) — name/description.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectUpdateRequest)]
+pub fn encode_project_studio_project_update_request(
+    project_id: String,
+    name: String,
+    description: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectUpdateRequest {
+            project_id,
+            name,
+            description,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectArchiveRequest) — archive/unarchive.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectArchiveRequest)]
+pub fn encode_project_studio_project_archive_request(
+    project_id: String,
+    archived: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectArchiveRequest {
+            project_id,
+            archived,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectDeleteRequest)]
+pub fn encode_project_studio_project_delete_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectDeleteRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MembersListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMembersListRequest)]
+pub fn encode_project_studio_members_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MembersListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MemberCandidatesRequest). `project_id: None`
+/// = creation wizard (grant holders), `Some` = the "Invite" modal (manager+).
+#[wasm_bindgen(js_name = encodeProjectStudioMemberCandidatesRequest)]
+pub fn encode_project_studio_member_candidates_request(
+    project_id: Option<String>,
+    query: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MemberCandidatesRequest {
+            project_id,
+            query,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MembersAddRequest). `members_json` is a JSON
+/// array of MemberInputWire objects ({user_id, role}).
+#[wasm_bindgen(js_name = encodeProjectStudioMembersAddRequest)]
+pub fn encode_project_studio_members_add_request(
+    project_id: String,
+    members_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let members: Vec<tentaflow_protocol::project_studio::MemberInputWire> =
+        serde_json::from_str(&members_json)
+            .map_err(|e| JsError::new(&format!("invalid members_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MembersAddRequest {
+            project_id,
+            members,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MemberRoleSetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMemberRoleSetRequest)]
+pub fn encode_project_studio_member_role_set_request(
+    project_id: String,
+    user_id: String,
+    role: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MemberRoleSetRequest {
+            project_id,
+            user_id,
+            role,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MemberRemoveRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMemberRemoveRequest)]
+pub fn encode_project_studio_member_remove_request(
+    project_id: String,
+    user_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MemberRemoveRequest {
+            project_id,
+            user_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(OwnershipTransferRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioOwnershipTransferRequest)]
+pub fn encode_project_studio_ownership_transfer_request(
+    project_id: String,
+    new_owner_user_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::OwnershipTransferRequest {
+            project_id,
+            new_owner_user_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CreatorGrantsListRequest) — admin only.
+#[wasm_bindgen(js_name = encodeProjectStudioCreatorGrantsListRequest)]
+pub fn encode_project_studio_creator_grants_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CreatorGrantsListRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CreatorGrantSetRequest) — admin only.
+#[wasm_bindgen(js_name = encodeProjectStudioCreatorGrantSetRequest)]
+pub fn encode_project_studio_creator_grant_set_request(
+    user_id: String,
+    granted: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CreatorGrantSetRequest {
+            user_id,
+            granted,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourcesListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourcesListRequest)]
+pub fn encode_project_studio_sources_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourcesListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceUploadChunkRequest) — one raw chunk of
+/// an uploaded file (`bytes` is a Uint8Array on the JS side).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceUploadChunkRequest)]
+pub fn encode_project_studio_source_upload_chunk_request(
+    project_id: String,
+    upload_id: String,
+    filename: String,
+    mime: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceUploadChunkRequest {
+            project_id,
+            upload_id,
+            filename,
+            mime,
+            seq,
+            total_chunks,
+            bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceCreateRequest). `config_json` passes
+/// through as-is (server validates per kind); `file_refs_json` is a JSON array
+/// of sha256 refs returned by the upload.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceCreateRequest)]
+pub fn encode_project_studio_source_create_request(
+    project_id: String,
+    kind: String,
+    name: String,
+    config_json: String,
+    file_refs_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let file_refs: Vec<String> = serde_json::from_str(&file_refs_json)
+        .map_err(|e| JsError::new(&format!("invalid file_refs_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceCreateRequest {
+            project_id,
+            kind,
+            name,
+            config_json,
+            file_refs,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceUpdateRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceUpdateRequest)]
+pub fn encode_project_studio_source_update_request(
+    project_id: String,
+    source_id: String,
+    name: String,
+    config_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceUpdateRequest {
+            project_id,
+            source_id,
+            name,
+            config_json,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceDeleteRequest)]
+pub fn encode_project_studio_source_delete_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceDeleteRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceReingestRequest). `file_id: Some` =
+/// re-ingest a single file, `None` = the whole source.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceReingestRequest)]
+pub fn encode_project_studio_source_reingest_request(
+    project_id: String,
+    source_id: String,
+    file_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceReingestRequest {
+            project_id,
+            source_id,
+            file_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(IngestCancelRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioIngestCancelRequest)]
+pub fn encode_project_studio_ingest_cancel_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::IngestCancelRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(IngestStatusRequest) — polling is the source
+/// of truth for job state; the stream is only a live view.
+#[wasm_bindgen(js_name = encodeProjectStudioIngestStatusRequest)]
+pub fn encode_project_studio_ingest_status_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::IngestStatusRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceFilesListRequest) — paged file list.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceFilesListRequest)]
+pub fn encode_project_studio_source_files_list_request(
+    project_id: String,
+    source_id: String,
+    offset: u32,
+    limit: u32,
+    filter: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceFilesListRequest {
+            project_id,
+            source_id,
+            offset,
+            limit,
+            filter,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceFileDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceFileDeleteRequest)]
+pub fn encode_project_studio_source_file_delete_request(
+    project_id: String,
+    file_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceFileDeleteRequest {
+            project_id,
+            file_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceFilePreviewRequest) — text-only
+/// preview; the server clamps `max_bytes`.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceFilePreviewRequest)]
+pub fn encode_project_studio_source_file_preview_request(
+    project_id: String,
+    file_id: String,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceFilePreviewRequest {
+            project_id,
+            file_id,
+            max_bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(KbSearchRequest). `source_ids_json` is a
+/// JSON array of source ids ([] = search all sources).
+#[wasm_bindgen(js_name = encodeProjectStudioKbSearchRequest)]
+pub fn encode_project_studio_kb_search_request(
+    project_id: String,
+    query: String,
+    source_ids_json: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    let source_ids: Vec<String> = serde_json::from_str(&source_ids_json)
+        .map_err(|e| JsError::new(&format!("invalid source_ids_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::KbSearchRequest {
+            project_id,
+            query,
+            source_ids,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(OverviewRequest) — KPIs + recent activity.
+#[wasm_bindgen(js_name = encodeProjectStudioOverviewRequest)]
+pub fn encode_project_studio_overview_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::OverviewRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ActivityListRequest). `before_id` crosses
+/// the JS boundary as a decimal string (i64 does not fit in a JS number) and
+/// is parsed here.
+#[wasm_bindgen(js_name = encodeProjectStudioActivityListRequest)]
+pub fn encode_project_studio_activity_list_request(
+    project_id: String,
+    before_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    let before_id = match before_id {
+        Some(s) => Some(
+            s.parse::<i64>()
+                .map_err(|e| JsError::new(&format!("invalid before_id: {e}")))?,
+        ),
+        None => None,
+    };
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ActivityListRequest {
+            project_id,
+            before_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatsListRequest) — caller's own chats only.
+#[wasm_bindgen(js_name = encodeProjectStudioChatsListRequest)]
+pub fn encode_project_studio_chats_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatsListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatCreateRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioChatCreateRequest)]
+pub fn encode_project_studio_chat_create_request(
+    project_id: String,
+    title: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatCreateRequest {
+            project_id,
+            title,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatRenameRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioChatRenameRequest)]
+pub fn encode_project_studio_chat_rename_request(
+    project_id: String,
+    chat_id: String,
+    title: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatRenameRequest {
+            project_id,
+            chat_id,
+            title,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioChatDeleteRequest)]
+pub fn encode_project_studio_chat_delete_request(
+    project_id: String,
+    chat_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatDeleteRequest {
+            project_id,
+            chat_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatHistoryRequest) — paged, newest first;
+/// `before_message_id: None` = latest page.
+#[wasm_bindgen(js_name = encodeProjectStudioChatHistoryRequest)]
+pub fn encode_project_studio_chat_history_request(
+    project_id: String,
+    chat_id: String,
+    before_message_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatHistoryRequest {
+            project_id,
+            chat_id,
+            before_message_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SettingsGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSettingsGetRequest)]
+pub fn encode_project_studio_settings_get_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SettingsGetRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save; `None`
+/// fields are left untouched. `agents_json` is a JSON array of
+/// ProjectAgentBinding objects.
+#[wasm_bindgen(js_name = encodeProjectStudioSettingsSaveRequest)]
+pub fn encode_project_studio_settings_save_request(
+    project_id: String,
+    name: Option<String>,
+    description: Option<String>,
+    agents_json: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SettingsSaveRequest {
+            project_id,
+            name,
+            description,
+            agents_json,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TagSaveRequest). `tag_id: None` = create,
+/// `Some` = rename.
+#[wasm_bindgen(js_name = encodeProjectStudioTagSaveRequest)]
+pub fn encode_project_studio_tag_save_request(
+    project_id: String,
+    tag_id: Option<String>,
+    name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TagSaveRequest {
+            project_id,
+            tag_id,
+            name,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TagDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTagDeleteRequest)]
+pub fn encode_project_studio_tag_delete_request(
+    project_id: String,
+    tag_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TagDeleteRequest {
+            project_id,
+            tag_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(IngestStreamRequest) — subscribe to live
+/// ingest logs/progress (chunks = IngestStreamChunk, end = IngestStreamEnd).
+#[wasm_bindgen(js_name = encodeProjectStudioIngestStreamRequest)]
+pub fn encode_project_studio_ingest_stream_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::IngestStreamRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatStreamRequest) — send one user message
+/// and stream the assistant reply (chunks = ChatStreamChunk, end =
+/// ChatStreamEnd).
+#[wasm_bindgen(js_name = encodeProjectStudioChatStreamRequest)]
+pub fn encode_project_studio_chat_stream_request(
+    project_id: String,
+    chat_id: String,
+    message: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatStreamRequest {
+            project_id,
+            chat_id,
+            message,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
