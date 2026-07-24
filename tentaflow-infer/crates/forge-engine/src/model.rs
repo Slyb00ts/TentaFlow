@@ -4787,16 +4787,17 @@ impl Model {
             // throughput + zero dequant bandwidth). Decode still uses the dp4a
             // GEMV (see gemv). Marshalling the mma's 4x s32 output uses
             // inlined_assembly + _RegisterPackType (see kernels/mojo/MOJO_NOTES.md).
-            DevWeight::Q8_0 { buf, cols, .. } => self.kernels.gemm_q8_0_i8mma_at(
-                y,
-                buf,
-                row_off * (cols / 32) * 34,
-                x,
-                n_rows,
-                *cols,
-                n_tokens,
-                stream,
-            ),
+            DevWeight::Q8_0 { buf, cols, .. } => {
+                let off = row_off * (cols / 32) * 34;
+                if self
+                    .kernels
+                    .gemm_q8_0_small_batch_at(y, buf, off, x, n_rows, *cols, n_tokens, stream)?
+                {
+                    return Ok(());
+                }
+                self.kernels
+                    .gemm_q8_0_i8mma_at(y, buf, off, x, n_rows, *cols, n_tokens, stream)
+            }
             // Small decode batches (T=2/4/8/16) take the weight-stationary
             // dp4a GEMV: one weight sweep serves every token instead of the
             // >=64-token tile the GEMM kernels pad to.

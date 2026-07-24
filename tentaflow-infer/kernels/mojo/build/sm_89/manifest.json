@@ -1840,6 +1840,10 @@
     "gemv_q6_k_dp4a_batch_b16": {
       "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_bd8ac77acfa75f02",
       "file": "gemv_q6_k_dp4a_batch_b16.ptx"
+    },
+    "gemm_q8_0_i8mma_b16": {
+      "entry": "src_q8_0_batch_gemm_q8_0_small6A6A6A6A_78aff41654bc5848",
+      "file": "gemm_q8_0_i8mma_b16.ptx"
     }
   }
 }

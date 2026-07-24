@@ -154,6 +154,21 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **Q8_0 small-batch decode + równoległy pack fp8 (2026-07-24).**
+  (1) Batched decode Q8_0 routuje T=2/4/8/16 na istniejące weight-stationary
+  `gemm_q8_0_i8mma_b*` (nowa instancja b16, 95 rej., 0 spill; launcher
+  `gemm_q8_0_small_batch_at` dzieli scratch `qk_batch` z dp4a);
+  `small_batch_decode_capable` obejmuje Q8_0 → auto batch-min=2. Pomiar
+  `batched_decode::throughput_scaling` (qwen3-0.6b-q8_0, RTX 4090): agregat
+  B=4 **110→2031 tok/s**, B=8 **3131**, B=16 **2730** (B=1/32 bez zmian).
+  Wariant T=16 jako dwie połówki b8 ZMIERZONY i odrzucony (2510 vs 2730 —
+  drugi przebieg wag kosztuje więcej niż ulga rejestrowa); monolityczny b16
+  zostaje, dalsze strojenie = praca kernelowa.
+  (2) `rebuild_fp8` liczy dequant+kody e4m3 siedmioma wątkami na warstwę
+  (upload na wątku głównym, peak RAM = jedna warstwa f32): budowa paczek dla
+  Mistrala-7B **117 s → 39,5 s**. Pełne zejście <1 s wymaga packa na GPU
+  (dequant Q4_K/Q6_K→e4m3 kernelem, jak `pack_nvfp4_fp8` w fp8mod-ffn) —
+  otwarte.
 - ✅ **Small-batch dp4a GEMV dla Q4_K/Q6_K batched decode (2026-07-24).**
   Nowe kernele Mojo `gemv_q{4,6}_k_dp4a_batch_b{2,4,8,16}`
   (`src/decode_dp4a_batch.mojo`, builder `build_decode_dp4a_batch.mojo`,

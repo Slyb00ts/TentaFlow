@@ -239,6 +239,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_q8_0_i8mma_b3",
     "gemm_q8_0_i8mma_b4",
     "gemm_q8_0_i8mma_b8",
+    "gemm_q8_0_i8mma_b16",
     "gemm_q8_0_f16_exact_out_f32_b8",
     "gemm_q8_0_i8mma_out_f32_b3",
     "gemm_q8_0_i8mma_out_f32_b4",

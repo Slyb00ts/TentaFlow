@@ -2174,14 +2174,9 @@ fn dequant_matrix_f32_fp8(src: &dyn TensorSource, name: &str) -> Result<(Vec<f32
 }
 
 /// Pack an already-dequantized fp32 projection to e4m3 with ONE scale per
-/// output row (`scale[r] = absmax(row r) / 448`), then upload. Rows whose
-/// weights are all zero get scale 0 (their e4m3 codes are zero too).
-fn pack_fp8_from_f32(
-    device: &dyn Device,
-    w: &[f32],
-    rows: usize,
-    cols: usize,
-) -> Result<Fp8Weight> {
+/// output row (`scale[r] = absmax(row r) / 448`). Rows whose weights are all
+/// zero get scale 0 (their e4m3 codes are zero too).
+fn pack_fp8_host(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
     let mut codes = vec![0u8; rows * cols];
     let mut scales = vec![0f32; rows];
     for r in 0..rows {
@@ -2199,12 +2194,7 @@ fn pack_fp8_from_f32(
         }
     }
     let scale_bytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
-    Ok(Fp8Weight {
-        qweight: upload(device, &codes)?,
-        scales: upload(device, &scale_bytes)?,
-        rows,
-        cols,
-    })
+    (codes, scale_bytes)
 }
 
 /// Row-concatenate projection matrices into one [Σrows, cols] matrix. Every
@@ -3192,24 +3182,65 @@ impl ModelWeights {
         let gguf = Gguf::open(path)?;
         let src = GgufSource(&gguf);
         let mut out = Vec::with_capacity(self.descriptor.layers.len());
+        const ROLES: [WeightRole; 7] = [
+            WeightRole::AttnQ,
+            WeightRole::AttnK,
+            WeightRole::AttnV,
+            WeightRole::AttnO,
+            WeightRole::FfnGate,
+            WeightRole::FfnUp,
+            WeightRole::FfnDown,
+        ];
         for (idx, layer_map) in self.descriptor.layers.iter().enumerate() {
             let name = |role: WeightRole| -> Result<&String> {
                 layer_map
                     .get(&role)
                     .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
             };
-            let pack = |role: WeightRole| -> Result<Fp8Weight> {
-                let (w, r, c) = dequant_matrix_f32_fp8(&src, name(role)?)?;
-                pack_fp8_from_f32(device, &w, r, c)
+            // The dequant + e4m3 code computation dominates the build (f32
+            // expansion of every projection); run the layer's seven
+            // projections on worker threads and keep the device uploads on
+            // this thread. Peak host memory stays one layer of f32.
+            let mut packed = std::thread::scope(
+                |scope| -> Result<Vec<(Vec<u8>, Vec<u8>, usize, usize)>> {
+                    let handles: Vec<_> = ROLES
+                        .iter()
+                        .map(|&role| {
+                            let src = &src;
+                            scope.spawn(move || -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
+                                let (w, r, c) = dequant_matrix_f32_fp8(src, name(role)?)?;
+                                let (codes, scales) = pack_fp8_host(&w, r, c);
+                                Ok((codes, scales, r, c))
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .map_err(|_| ForgeError::Format("fp8 pack worker panicked".into()))?
+                        })
+                        .collect()
+                },
+            )?
+            .into_iter();
+            let mut next = || -> Result<Fp8Weight> {
+                let (codes, scales, rows, cols) = packed.next().expect("seven packed projections");
+                Ok(Fp8Weight {
+                    qweight: upload(device, &codes)?,
+                    scales: upload(device, &scales)?,
+                    rows,
+                    cols,
+                })
             };
             out.push(Fp8Layer {
-                q: pack(WeightRole::AttnQ)?,
-                k: pack(WeightRole::AttnK)?,
-                v: pack(WeightRole::AttnV)?,
-                attn_o: pack(WeightRole::AttnO)?,
-                gate: pack(WeightRole::FfnGate)?,
-                up: pack(WeightRole::FfnUp)?,
-                down: pack(WeightRole::FfnDown)?,
+                q: next()?,
+                k: next()?,
+                v: next()?,
+                attn_o: next()?,
+                gate: next()?,
+                up: next()?,
+                down: next()?,
             });
         }
         Ok(out)
@@ -3221,7 +3252,7 @@ impl ModelWeights {
     }
 
     /// Whether every dense projection has a small-batch decode kernel family
-    /// (NVFP4 B4/B8/B16/BM32 GEMV; Q4_K/Q6_K weight-stationary dp4a batch),
+    /// (NVFP4 B4/B8/B16/BM32 GEMV; Q4_K/Q6_K/Q8_0 weight-stationary batch),
     /// so a batched decode step costs roughly one weight sweep instead of a
     /// fixed >=64-token GEMM tile. Decides the batched-path engagement
     /// default: 2 with small-batch kernels, else the tile cost only amortizes
@@ -3234,6 +3265,7 @@ impl ModelWeights {
                     | DevWeight::NvFp4Gguf { .. }
                     | DevWeight::Q4K { .. }
                     | DevWeight::Q6K { .. }
+                    | DevWeight::Q8_0 { .. }
             )
         };
         self.layers.iter().all(|layer| {

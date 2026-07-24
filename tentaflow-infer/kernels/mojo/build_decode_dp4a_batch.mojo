@@ -6,6 +6,7 @@
 import std.os as os
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
+from src.q8_0_batch import gemm_q8_0_i8mma_b16
 from src.decode_dp4a_batch import (
     gemv_q4_k_dp4a_batch_b2,
     gemv_q4_k_dp4a_batch_b4,
@@ -72,3 +73,8 @@ def main() raises:
         dump_asm=Path("gemv_q6_k_dp4a_batch_b16.ptx"),
     ]()
     _finalize(out_dir, "gemv_q6_k_dp4a_batch_b16")
+    _ = ctx.compile_function[
+        gemm_q8_0_i8mma_b16,
+        dump_asm=Path("gemm_q8_0_i8mma_b16.ptx"),
+    ]()
+    _finalize(out_dir, "gemm_q8_0_i8mma_b16")
