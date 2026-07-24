@@ -58,6 +58,21 @@ Ostatnia aktualizacja: 2026-07-24.
   jest jedynym, w którym oba silniki mierzono tego samego dnia na wolnym GPU.
   Wykonawczo sprawdzono wyłącznie CUDA/RTX 4090; źródła zachowują przenośny
   fallback, ale AMD i Metal nie były uruchamiane.
+- 🟡 **Katalog kerneli rozjechał się z manifestem — pełny build regresuje
+  (znalezione 2026-07-24).** `scripts/build_kernel_catalog.py` nie parsował
+  `dump_asm=Path(` złamanego na dwie linie i wywracał się na
+  `deltanet_commit_recompute_segmented_shared_d128_f32`, więc `pixi run mojo
+  build_kernels.mojo` ORAZ `test_build_kernel_catalog.py` failowały na czystym
+  HEAD. Parser jest naprawiony i pokazuje teraz prawdziwy problem: 14 kerneli
+  jest w `manifest.json`, ale NIE w katalogu (`topk_batched_{partial,final}_f32`,
+  `gemv_q{4,6}_k_dp4a_batch_b{2,4,8,16}`, `pack_q{4_k,6_k,8_0}_fp8`,
+  `gemm_q8_0_i8mma_b16` — dodane wczoraj wyłącznie izolowanymi builderami),
+  a 13 jest w katalogu, ale nie w manifeście (`gemm_q6k_i8_native_*` po
+  rewercie i stary `topk_batched_f32`). Skutek: pełny build katalogu USUNIE
+  dwuprzebiegowy sampler i small-batch GEMV Q4_K/Q6_K, a przywróci zrewertowany
+  Q6_K native. Do czasu uzgodnienia obu list nowe kernele należy publikować
+  izolowanym builderem w wariancie z manifestem (5-argumentowe
+  `validate_sm80_ptx.py`), tak jak `build_nvfp4_ct_bm32.mojo`.
 - ✅ **Deficyt puli wag dla paczek FP8 jest zgłaszany wprost (2026-07-24).**
   `build_fp8_ffn` i `build_fp8_modular_auto` zwracają `Fp8PackOutcome`
   (`Built` / `Unsupported` / `PoolShortfall { required, available }`) zamiast
