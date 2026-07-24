@@ -154,6 +154,20 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **Scheduler: FIFO serial prefill — jedna sekwencja na iterację
+  (2026-07-24).** Pętla schedulera prefillowała KAŻDĄ oczekującą sekwencję
+  pełnym kwantem w jednej iteracji, więc burst nowych promptów wstrzymywał
+  decode na N×chunk (C=16: ~16×50 ms między krokami decode) i TTFT wszystkich
+  promptów degenerował do ogona bursta. Teraz serial prefill przesuwa najwyżej
+  JEDNĄ (najstarszą — `active` trzyma porządek przyjęć) sekwencję na iterację;
+  batched dense prefill dalej zbiera całe grupy 4/8/16, decode dostaje krok co
+  najwyżej jeden chunk. Pomiar p1024/o128: Bielik NVFP4 C=16 TTFT med
+  **937→330 ms** (mean 1012→428), out **543→594 tok/s**; C=8 TTFT med 276→209.
+  Mistral Q4_K C=8 TTFT med 320→182 ms (out bez zmian). Ograniczenia dalej:
+  batched dense prefill wymaga lm_head F16/Q8_0/NvFp4Gguf (Q6_K Mistrala nie
+  łapie się — kandydat: per-lane głowa jak w batched decode) i dokładnych grup
+  4/8/16; pełny mixed prefill+decode forward (tokeny decode doklejone do GEMM
+  chunka) pozostaje otwarty.
 - ✅ **GPU pack GGUF→e4m3: paczki fp8 w 0,1 s (2026-07-24).** Kernele Mojo
   `pack_q{4,6}_k_fp8` i `pack_q8_0_fp8` (`src/pack_gguf_fp8.mojo`, builder
   `build_pack_gguf_fp8.mojo`, 36-40 rej., 0 spill, `.target sm_80`) pakują

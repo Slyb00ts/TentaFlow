@@ -1170,8 +1170,15 @@ fn worker<'t>(
                 }
             }
         }
+        // FIFO: at most ONE pending sequence advances a serial prefill quantum
+        // per iteration (`active` keeps arrival order). A burst of new prompts
+        // used to stack one chunk PER sequence between decode steps, so at
+        // C=16 a decode step waited for ~16 chunks (~800 ms ITL spike) and
+        // every prompt's TTFT degenerated to the burst's tail. The batched
+        // dense path above still takes whole groups when they align.
+        let mut advanced_serial = false;
         for (index, a) in active.iter_mut().enumerate() {
-            if a.dead {
+            if a.dead || advanced_serial {
                 continue;
             }
             if prefilled_b2.is_some_and(|pair| pair.contains(&index))
@@ -1187,6 +1194,7 @@ fn worker<'t>(
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
             }
+            advanced_serial = true;
         }
         // Tear down finished/dead sequences and release their pages (and any
         // tier chunks they spilled).
