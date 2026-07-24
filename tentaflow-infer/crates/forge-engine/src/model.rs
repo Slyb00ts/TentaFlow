@@ -106,6 +106,23 @@ fn nvfp4_ct_buffer_plan(
     })
 }
 
+/// Wynik próby zbudowania rezydentnych paczek FP8. Rozdzielenie braku wsparcia
+/// od zbyt małej puli wag pozwala wywołującemu zgłosić operatorowi konkretny,
+/// naprawialny powód zamiast jednego zbiorczego "niedostępne".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fp8PackOutcome {
+    Built,
+    Unsupported,
+    PoolShortfall { required: usize, available: usize },
+}
+
+impl Fp8PackOutcome {
+    #[must_use]
+    pub fn built(self) -> bool {
+        self == Self::Built
+    }
+}
+
 fn cleanup_after_error<T, F>(result: Result<T>, cleanup: F) -> Result<T>
 where
     F: FnOnce(),
@@ -6241,9 +6258,9 @@ impl Model {
     /// holds the e4m3 packs. Returns `Ok(false)` (prefill stays on the native
     /// GGUF path) when any gate fails; nothing is allocated before all gates
     /// pass, so a refusal leaves the model untouched.
-    pub fn build_fp8_modular_auto(&mut self, path: &Path) -> Result<bool> {
+    pub fn build_fp8_modular_auto(&mut self, path: &Path) -> Result<Fp8PackOutcome> {
         if self.is_hybrid() || self.weights.is_moe() || !self.device.caps().fp8_native {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::Unsupported);
         }
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
@@ -6263,7 +6280,7 @@ impl Model {
             .iter()
             .any(|(rows, cols, _)| !arts.has(&format!("gemm_fp8_mod_{rows}_{cols}")))
         {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::Unsupported);
         }
         let per_layer: usize = shapes
             .iter()
@@ -6273,16 +6290,19 @@ impl Model {
         let available = self.device.pool_available(Pool::Weights).unwrap_or(0);
         tracing::info!(required, available, "preflight paczek fp8mod dla GGUF");
         if required > available {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::PoolShortfall {
+                required,
+                available,
+            });
         }
         self.weights.fp8 = None;
         if self.build_fp8_gpu()? {
-            return Ok(true);
+            return Ok(Fp8PackOutcome::Built);
         }
         let layers = self.weights.rebuild_fp8(self.device.as_ref(), path)?;
         self.weights.fp8 = Some(layers);
         self.weights.fp8_modular = true;
-        Ok(true)
+        Ok(Fp8PackOutcome::Built)
     }
 
     fn pack_nvfp4_rows(
@@ -6451,18 +6471,18 @@ impl Model {
     }
 
     /// Buduje na GPU opt-in paczki FP8 dla Q/O oraz projekcji FFN checkpointu NVFP4.
-    pub fn build_fp8_ffn(&mut self) -> Result<bool> {
+    pub fn build_fp8_ffn(&mut self) -> Result<Fp8PackOutcome> {
         if self.weights.fp8_ffn.is_some() {
-            return Ok(true);
+            return Ok(Fp8PackOutcome::Built);
         }
         if !self.device.caps().fp8_native
             || !self.kernels.supports_fp8_hybrid_packers()
             || !self.kernels.supports_fp8_logits()
         {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::Unsupported);
         }
         if self.is_hybrid() || self.weights.is_moe() {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::Unsupported);
         }
         let mut required_bytes = 0usize;
         let mut add_required = |bytes: Option<usize>| -> Option<()> {
@@ -6471,7 +6491,7 @@ impl Model {
         };
         let params = &self.weights.descriptor.params;
         let Some(q_rows) = params.n_heads.checked_mul(params.head_dim) else {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::Unsupported);
         };
         for layer in &self.weights.layers {
             let q_source = match &layer.attn().attn_qkv {
@@ -6486,33 +6506,33 @@ impl Model {
                 ))
                 .is_none()
             {
-                return Ok(false);
+                return Ok(Fp8PackOutcome::Unsupported);
             }
             let LayerFfn::Dense(ffn) = &layer.ffn else {
-                return Ok(false);
+                return Ok(Fp8PackOutcome::Unsupported);
             };
             match &ffn.gate_up {
                 GateUpWeights::Fused(weight) => {
                     if weight.rows() % 2 != 0 {
-                        return Ok(false);
+                        return Ok(Fp8PackOutcome::Unsupported);
                     }
                     let rows = weight.rows() / 2;
                     if add_required(self.preflight_nvfp4_pack(weight, 0, rows)).is_none()
                         || add_required(self.preflight_nvfp4_pack(weight, rows, rows)).is_none()
                     {
-                        return Ok(false);
+                        return Ok(Fp8PackOutcome::Unsupported);
                     }
                 }
                 GateUpWeights::Split { gate, up } => {
                     if add_required(self.preflight_nvfp4_pack(gate, 0, gate.rows())).is_none()
                         || add_required(self.preflight_nvfp4_pack(up, 0, up.rows())).is_none()
                     {
-                        return Ok(false);
+                        return Ok(Fp8PackOutcome::Unsupported);
                     }
                 }
             }
             if add_required(self.preflight_nvfp4_pack(&ffn.down, 0, ffn.down.rows())).is_none() {
-                return Ok(false);
+                return Ok(Fp8PackOutcome::Unsupported);
             }
         }
         let fp8_head_supported = match &self.weights.lm_head {
@@ -6520,7 +6540,7 @@ impl Model {
                 if !cols.is_multiple_of(256) {
                     false
                 } else if add_required(Self::fp8_pack_allocation_bytes(*rows, *cols)).is_none() {
-                    return Ok(false);
+                    return Ok(Fp8PackOutcome::Unsupported);
                 } else {
                     true
                 }
@@ -6528,7 +6548,7 @@ impl Model {
             _ => false,
         };
         let Some(available) = self.device.pool_available(Pool::Weights) else {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::Unsupported);
         };
         tracing::info!(
             required_bytes,
@@ -6536,7 +6556,10 @@ impl Model {
             "preflight rezydentnych paczek FP8"
         );
         if required_bytes > available {
-            return Ok(false);
+            return Ok(Fp8PackOutcome::PoolShortfall {
+                required: required_bytes,
+                available,
+            });
         }
 
         self.device.synchronize()?;
@@ -6604,7 +6627,7 @@ impl Model {
         self.decode_moe_graph = None;
         self.decode_rot_graph = None;
         self.batch_graphs.clear();
-        Ok(true)
+        Ok(Fp8PackOutcome::Built)
     }
 
     /// Mean next-token negative log-likelihood over `tokens` (natural log),

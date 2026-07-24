@@ -146,7 +146,7 @@ fn batched_reproduces_golden() {
     .expect("load model");
     if std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod-ffn") {
         assert!(
-            loaded.model.build_fp8_ffn().expect("budowa paczek FP8"),
+            loaded.model.build_fp8_ffn().expect("budowa paczek FP8").built(),
             "Bielik test wymaga aktywnych paczek FP8"
         );
         eprintln!("Bielik test: resident FP8 Q/O/FFN/lm_head aktywne");
@@ -374,7 +374,7 @@ fn scheduler_prefill_p1024_o256_b1_b4_b8_b16() {
     )
     .expect("load model");
     if std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod-ffn") {
-        assert!(loaded.model.build_fp8_ffn().expect("budowa paczek FP8"));
+        assert!(loaded.model.build_fp8_ffn().expect("budowa paczek FP8").built());
     }
     let seed = loaded
         .bundle

@@ -22,6 +22,7 @@ use forge_engine::weights::NvFp4CtLayoutPolicy;
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_engine::model::Fp8PackOutcome;
 use forge_server::source::{
     kv_pool_bytes, load_model, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
 };
@@ -1338,7 +1339,34 @@ fn cmd_serve(
         loaded.model.tier_enabled(),
         max_active,
     );
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true)?;
+    // Koszt jednej strony KV pozwala przeliczyć deficyt puli wag na liczbę
+    // stron, które operator musi zwolnić, gdy paczki FP8 się nie mieszczą.
+    let native_mtp = matches!(
+        spec.kind(),
+        SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+    );
+    let kv_descriptor = loaded.model.weights.descriptor.clone();
+    let kv_bytes_for = |pages: usize| {
+        kv_pool_bytes(
+            &kv_descriptor,
+            ModelConfig::default().kv_page_size,
+            pages,
+            kv_quant,
+            native_mtp,
+        )
+        .ok()
+    };
+    let kv_probe = KvPoolProbe {
+        pages: kv_pages,
+        bytes_for: &kv_bytes_for,
+    };
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        true,
+        Some(&kv_probe),
+    )?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}, full_context_admission={}",
         model_path.display(),
@@ -1523,7 +1551,7 @@ fn cmd_run(
         Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false, None)?;
 
     let prompt_text = if chat {
         ChatTemplateEngine::new()
@@ -1621,7 +1649,7 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false, None)?;
 
     let tokens = loaded
         .bundle
@@ -1641,6 +1669,56 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
 /// one-time calibration over the embedded passage; GGUF sources only (the dense
 /// W4A8 gate model). No-op for any other GEMM backend.
 ///
+/// Pozwala przeliczyć deficyt puli wag na liczbę stron KV, których zwolnienie
+/// REALNIE go pokryje. Slab każdej warstwy jest zaokrąglany do granulacji
+/// alokatora osobno, więc pula maleje skokami i średnia na stronę zaniża wynik.
+struct KvPoolProbe<'a> {
+    pages: usize,
+    bytes_for: &'a dyn Fn(usize) -> Option<usize>,
+}
+
+impl KvPoolProbe<'_> {
+    fn pages_to_free(&self, deficit: usize) -> Option<usize> {
+        let current = (self.bytes_for)(self.pages)?;
+        (1..self.pages).find(|freed| {
+            (self.bytes_for)(self.pages - freed)
+                .is_some_and(|smaller| current.saturating_sub(smaller) >= deficit)
+        })
+    }
+}
+
+/// Zgłasza operatorowi, że szybki prefill FP8 wypadł WYŁĄCZNIE przez budżet
+/// puli wag — wcześniej ten przypadek był nieodróżnialny od braku wsparcia
+/// sprzętowego i cicho zostawiał serwer na wolniejszym prefillu NVFP4.
+fn report_fp8_pool_shortfall(
+    label: &str,
+    required: usize,
+    available: usize,
+    kv_probe: Option<&KvPoolProbe<'_>>,
+) {
+    let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+    let deficit = required.saturating_sub(available);
+    let remedy = match kv_probe.and_then(|probe| probe.pages_to_free(deficit)) {
+        Some(pages) => format!(
+            "zmniejsz --kv-pages o co najmniej {pages} (albo --ctx), lub podnieś --weights-pool-gb"
+        ),
+        None => "zmniejsz --kv-pages albo --ctx, lub podnieś --weights-pool-gb".to_string(),
+    };
+    tracing::warn!(
+        required_bytes = required,
+        available_bytes = available,
+        deficit_bytes = deficit,
+        "paczki FP8 nie mieszczą się w puli wag"
+    );
+    eprintln!(
+        "{label}: paczki FP8 wymagają {:.2} GiB, pula wag ma {:.2} GiB (brakuje {:.2} GiB) \
+         — prefill zostaje na wolniejszej ścieżce; {remedy}",
+        gib(required),
+        gib(available),
+        gib(deficit)
+    );
+}
+
 /// `auto_gguf_fp8` (serve only): with FORGE_GEMM unset, a dense GGUF model on
 /// an fp8-native device whose projection shapes all have committed Modular fp8
 /// instances gets the fp8mod prefill automatically (near-lossless, ~2× the
@@ -1650,6 +1728,7 @@ fn maybe_calibrate_w4a8(
     path: &Path,
     tokenizer: &forge_tokenize::Tokenizer,
     auto_gguf_fp8: bool,
+    kv_probe: Option<&KvPoolProbe<'_>>,
 ) -> Result<()> {
     let gemm = std::env::var("FORGE_GEMM").ok();
     let auto_fp8_ffn = gemm.is_none() && path.is_dir();
@@ -1658,28 +1737,36 @@ fn maybe_calibrate_w4a8(
             bail!("FORGE_GEMM=fp8mod-ffn wymaga katalogu checkpointu NVFP4");
         }
         let t0 = Instant::now();
-        if model.build_fp8_ffn()? {
-            eprintln!(
+        match model.build_fp8_ffn()? {
+            Fp8PackOutcome::Built => eprintln!(
                 "paczki FP8 Q/O/FFN/lm_head zbudowane na GPU w {:.3}s (K/V i warstwy decode pozostają NVFP4)",
                 t0.elapsed().as_secs_f32()
-            );
-        } else {
-            eprintln!(
-                "fp8mod-ffn niedostępny dla urządzenia, kształtów lub puli VRAM; pozostaje NVFP4"
-            );
+            ),
+            Fp8PackOutcome::Unsupported => {
+                eprintln!("fp8mod-ffn niedostępny dla urządzenia lub kształtów; pozostaje NVFP4")
+            }
+            Fp8PackOutcome::PoolShortfall {
+                required,
+                available,
+            } => report_fp8_pool_shortfall("fp8mod-ffn", required, available, kv_probe),
         }
         return Ok(());
     }
     if gemm.is_none() && auto_gguf_fp8 && path.extension().and_then(|e| e.to_str()) == Some("gguf")
     {
         let t0 = Instant::now();
-        if model.build_fp8_modular_auto(path)? {
-            eprintln!(
+        match model.build_fp8_modular_auto(path)? {
+            Fp8PackOutcome::Built => eprintln!(
                 "auto fp8mod: paczki e4m3 zbudowane w {:.1}s (prefill Modular fp8, decode zostaje na natywnym GGUF)",
                 t0.elapsed().as_secs_f32()
-            );
-        } else {
-            eprintln!("auto fp8mod niedostępny dla urządzenia, kształtów lub puli VRAM; prefill zostaje natywny");
+            ),
+            Fp8PackOutcome::Unsupported => {
+                eprintln!("auto fp8mod niedostępny dla urządzenia lub kształtów; prefill zostaje natywny")
+            }
+            Fp8PackOutcome::PoolShortfall {
+                required,
+                available,
+            } => report_fp8_pool_shortfall("auto fp8mod", required, available, kv_probe),
         }
         return Ok(());
     }
@@ -1765,7 +1852,7 @@ fn cmd_bench(
         resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false, None)?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
     let (prompt_ids, prompt_sha256, prompt_source) = if let Some(path) = prompt_token_ids {
