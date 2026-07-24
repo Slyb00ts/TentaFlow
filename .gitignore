@@ -237,3 +237,7 @@ thirparty/
 
 # Benchmark/experiment scratch
 /scratch/
+target_concurrency/
+target_prefill_finish/
+target_fixedk3/
+target_clippy_fixed/
