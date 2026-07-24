@@ -850,6 +850,13 @@ pub const MAX_SPEC_DRAFT: usize = 16;
 /// 0.087 (Bielik NVFP4) / 0.042 (Qwen3 Q8_0) with the argmax identical at
 /// every step. 1 reproduces the unsplit arithmetic bit-exactly.
 const ATTN_DECODE_SPLITS: usize = 8;
+
+/// Decode rows riding a mixed prefill+decode forward: `b` sequences' input
+/// token ids (their attention metadata lives in the batch buffers).
+pub struct MixedDecodeRows {
+    pub b: usize,
+    pub ids: Vec<i32>,
+}
 const ATTN_DECODE_GQA_SPLITS: usize = 32;
 
 /// Coarse per-phase wall-clock attribution for `prefill_chunk`, enabled by
@@ -5235,7 +5242,7 @@ impl Model {
         tokens: &[u32],
         wait_for_completion: bool,
     ) -> Result<usize> {
-        self.prefill_forward_lanes(&mut [seq], &[tokens], wait_for_completion)
+        self.prefill_forward_lanes(&mut [seq], &[tokens], wait_for_completion, None)
     }
 
     fn prefill_forward_lanes(
@@ -5243,6 +5250,7 @@ impl Model {
         seqs: &mut [&mut SeqKv],
         token_lanes: &[&[u32]],
         wait_for_completion: bool,
+        mixed_decode: Option<&MixedDecodeRows>,
     ) -> Result<usize> {
         self.ensure_kv_reuse_healthy()?;
         let p = self.weights.descriptor.params.clone();
@@ -5264,9 +5272,27 @@ impl Model {
         let t = batch
             .checked_mul(n_tokens)
             .ok_or_else(|| ForgeError::Scheduler("przepełnienie batch prefill".into()))?;
-        if t > MAX_PREFILL_CHUNK {
+        // Mixed step: `db` decode rows ride the chunk's GEMMs/norms at row
+        // offset `t`. They stay RAW through the chunk's qk-norm/rope/append —
+        // `attn_decode_split` folds its own norm + RoPE + paged append. The
+        // caller uploaded their ids into `MixedDecodeRows` and their attention
+        // metadata (page tables, seq_lens, positions) into the batch buffers.
+        let db = mixed_decode.map_or(0, |m| m.b);
+        if db > 0
+            && (batch != 1
+                || self.calib.is_some()
+                || self.tier.is_some()
+                || self.kv.cfg.quant.is_rot()
+                || self.weights.is_moe())
+        {
+            return Err(ForgeError::Unsupported(
+                "mixed prefill+decode wymaga pojedynczego gęstego lane bez rot/tier/kalibracji".into(),
+            ));
+        }
+        let rows = t + db;
+        if rows > MAX_PREFILL_CHUNK {
             return Err(ForgeError::Scheduler(format!(
-                "prefill chunk {t} exceeds MAX_PREFILL_CHUNK {MAX_PREFILL_CHUNK}"
+                "prefill chunk {rows} exceeds MAX_PREFILL_CHUNK {MAX_PREFILL_CHUNK}"
             )));
         }
         if batch > 1 && !self.dense_prefill_batch_capable(batch, n_tokens) {
@@ -5356,6 +5382,10 @@ impl Model {
             self.pt_seq = 0;
             Some((bb.page_table.clone(), bb.seq_lens.clone()))
         };
+        let mut ids = ids;
+        if let Some(m) = mixed_decode {
+            ids.extend_from_slice(&m.ids);
+        }
         let pb = self.prefill_bufs.as_ref().expect("allocated above");
         self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
         self.device
@@ -5398,7 +5428,7 @@ impl Model {
             &pb.h,
             &self.weights.token_embd_f16,
             &pb.ids,
-            t,
+            rows,
             hidden,
             stream,
         )?;
@@ -5408,7 +5438,7 @@ impl Model {
                 &pb.x,
                 &pb.h,
                 &self.weights.layers[0].attn_norm,
-                t,
+                rows,
                 hidden,
                 eps,
                 stream,
@@ -5418,7 +5448,7 @@ impl Model {
                 &pb.x,
                 &pb.h,
                 &self.weights.layers[0].attn_norm,
-                t,
+                rows,
                 hidden,
                 eps,
                 stream,
@@ -5454,32 +5484,32 @@ impl Model {
             // matrix is consumed as three row-window GEMMs into separate
             // buffers — same weight bytes, no second copy in VRAM.
             if let Some(wl) = w4a8_layer {
-                self.gemm_w4a8(&pb.q, &wl.q, &pb.x, t, stream)?;
-                self.gemm_w4a8(&pb.k, &wl.k, &pb.x, t, stream)?;
-                self.gemm_w4a8(&pb.v, &wl.v, &pb.x, t, stream)?;
+                self.gemm_w4a8(&pb.q, &wl.q, &pb.x, rows, stream)?;
+                self.gemm_w4a8(&pb.k, &wl.k, &pb.x, rows, stream)?;
+                self.gemm_w4a8(&pb.v, &wl.v, &pb.x, rows, stream)?;
             } else if let Some(fl) = fp8_layer {
                 if fp8mod_fuse {
                     // q/k/v read the shared per-token e4m3 activation the attn-norm
                     // already emitted — no per-projection requant.
-                    self.gemm_fp8_prequant(&pb.q, &fl.q, t, stream)?;
-                    self.gemm_fp8_prequant(&pb.k, &fl.k, t, stream)?;
-                    self.gemm_fp8_prequant(&pb.v, &fl.v, t, stream)?;
+                    self.gemm_fp8_prequant(&pb.q, &fl.q, rows, stream)?;
+                    self.gemm_fp8_prequant(&pb.k, &fl.k, rows, stream)?;
+                    self.gemm_fp8_prequant(&pb.v, &fl.v, rows, stream)?;
                 } else {
-                    self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
-                    self.gemm_fp8(&pb.k, &fl.k, &pb.x, t, stream)?;
-                    self.gemm_fp8(&pb.v, &fl.v, &pb.x, t, stream)?;
+                    self.gemm_fp8(&pb.q, &fl.q, &pb.x, rows, stream)?;
+                    self.gemm_fp8(&pb.k, &fl.k, &pb.x, rows, stream)?;
+                    self.gemm_fp8(&pb.v, &fl.v, &pb.x, rows, stream)?;
                 }
             } else if let Some(fl) = fp8_ffn_layer {
-                self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
+                self.gemm_fp8(&pb.q, &fl.q, &pb.x, rows, stream)?;
                 match &layer.attn().attn_qkv {
                     QkvWeights::Fused(w) => {
-                        self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm_rows(&pb.k, w, &pb.x, rows, q_dim, kv_dim, stream)?;
                     }
                     QkvWeights::FusedQk { qk, .. } => {
-                        self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm_rows(&pb.k, qk, &pb.x, rows, q_dim, kv_dim, stream)?;
                     }
                     QkvWeights::Split { k, .. } => {
-                        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+                        self.gemm(&pb.k, k, &pb.x, rows, stream)?;
                     }
                 }
                 match &layer.attn().attn_qkv {
@@ -5488,35 +5518,35 @@ impl Model {
                             &pb.v,
                             w,
                             &pb.x,
-                            t,
+                            rows,
                             q_dim + kv_dim,
                             kv_dim,
                             stream,
                         )?;
                     }
                     QkvWeights::FusedQk { v, .. } => {
-                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
                     }
                     QkvWeights::Split { v, .. } => {
-                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
                     }
                 }
             } else {
                 match &layer.attn().attn_qkv {
                     QkvWeights::Fused(w) => {
-                        self.gemm_rows(&pb.q, w, &pb.x, t, 0, q_dim, stream)?;
-                        self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
-                        self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
+                        self.gemm_rows(&pb.q, w, &pb.x, rows, 0, q_dim, stream)?;
+                        self.gemm_rows(&pb.k, w, &pb.x, rows, q_dim, kv_dim, stream)?;
+                        self.gemm_rows(&pb.v, w, &pb.x, rows, q_dim + kv_dim, kv_dim, stream)?;
                     }
                     QkvWeights::FusedQk { qk, v } => {
-                        self.gemm_rows(&pb.q, qk, &pb.x, t, 0, q_dim, stream)?;
-                        self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
-                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                        self.gemm_rows(&pb.q, qk, &pb.x, rows, 0, q_dim, stream)?;
+                        self.gemm_rows(&pb.k, qk, &pb.x, rows, q_dim, kv_dim, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
                     }
                     QkvWeights::Split { q, k, v } => {
-                        self.gemm(&pb.q, q, &pb.x, t, stream)?;
-                        self.gemm(&pb.k, k, &pb.x, t, stream)?;
-                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                        self.gemm(&pb.q, q, &pb.x, rows, stream)?;
+                        self.gemm(&pb.k, k, &pb.x, rows, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
                     }
                 }
             }
@@ -5779,6 +5809,59 @@ impl Model {
                 trace.mark(self.device.as_ref(), "attn");
             }
 
+            if let Some(m) = mixed_decode {
+                // Decode rows: RAW q/k/v at row offset `t` — the fused split
+                // kernel applies qk-norm + RoPE, appends each row's K/V to its
+                // own sequence and attends over its pages (batch metadata
+                // uploaded by `mixed_prefill_decode_step`).
+                let bb = self.batch_bufs.as_ref().expect("mixed step ma batch bufory");
+                kernels.attn_decode_split(
+                    &bb.attn_parts,
+                    &pb.q,
+                    t * q_dim * 2,
+                    &pb.k,
+                    t * kv_dim * 2,
+                    &pb.v,
+                    t * kv_dim * 2,
+                    layer.attn().q_norm.as_ref(),
+                    layer.attn().k_norm.as_ref(),
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
+                    &bb.page_table,
+                    &bb.seq_lens,
+                    &bb.positions,
+                    m.b,
+                    p.n_heads,
+                    p.n_kv_heads,
+                    p.head_dim,
+                    self.kv.cfg.page_size,
+                    self.max_pages_per_seq,
+                    ATTN_DECODE_SPLITS,
+                    self.kv.cfg.dtype(),
+                    eps,
+                    p.rope_theta,
+                    scale,
+                    stream,
+                )?;
+                kernels.attn_decode_combine_f16(
+                    &bb.attn_out,
+                    &bb.attn_parts,
+                    m.b,
+                    p.n_heads,
+                    p.head_dim,
+                    ATTN_DECODE_SPLITS,
+                    stream,
+                )?;
+                self.device.copy(
+                    &bb.attn_out,
+                    0,
+                    &pb.attn_out,
+                    t * q_dim * 2,
+                    m.b * q_dim * 2,
+                    stream,
+                )?;
+            }
+
             // Calibration capture 2/4: o_proj input (attention output).
             if let Some(cal) = calib.as_mut() {
                 self.device.synchronize()?;
@@ -5791,13 +5874,13 @@ impl Model {
                 )?;
             }
             if let Some(wl) = w4a8_layer {
-                self.gemm_w4a8(&pb.o_out, &wl.attn_o, &pb.attn_out, t, stream)?;
+                self.gemm_w4a8(&pb.o_out, &wl.attn_o, &pb.attn_out, rows, stream)?;
             } else if let Some(fl) = fp8_layer {
-                self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, t, stream)?;
+                self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, rows, stream)?;
             } else if let Some(fl) = fp8_ffn_layer {
-                self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, t, stream)?;
+                self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, rows, stream)?;
             } else {
-                self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
+                self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, rows, stream)?;
             }
             trace.mark(self.device.as_ref(), "gemm_o");
             let fp8mod_fuse_gateup =
@@ -5808,7 +5891,7 @@ impl Model {
                     &pb.h,
                     &pb.o_out,
                     &layer.ffn_norm,
-                    t,
+                    rows,
                     hidden,
                     eps,
                     stream,
@@ -5819,7 +5902,7 @@ impl Model {
                     &pb.h,
                     &pb.o_out,
                     &layer.ffn_norm,
-                    t,
+                    rows,
                     hidden,
                     eps,
                     stream,
@@ -5842,33 +5925,33 @@ impl Model {
             match &layer.ffn {
                 LayerFfn::Dense(dffn) => {
                     if let Some(wl) = w4a8_layer {
-                        self.gemm_w4a8(&pb.gate, &wl.gate, &pb.x, t, stream)?;
-                        self.gemm_w4a8(&pb.up, &wl.up, &pb.x, t, stream)?;
+                        self.gemm_w4a8(&pb.gate, &wl.gate, &pb.x, rows, stream)?;
+                        self.gemm_w4a8(&pb.up, &wl.up, &pb.x, rows, stream)?;
                     } else if let Some(fl) = fp8_layer {
                         if fp8mod_fuse {
-                            self.gemm_fp8_prequant(&pb.gate, &fl.gate, t, stream)?;
-                            self.gemm_fp8_prequant(&pb.up, &fl.up, t, stream)?;
+                            self.gemm_fp8_prequant(&pb.gate, &fl.gate, rows, stream)?;
+                            self.gemm_fp8_prequant(&pb.up, &fl.up, rows, stream)?;
                         } else {
-                            self.gemm_fp8(&pb.gate, &fl.gate, &pb.x, t, stream)?;
-                            self.gemm_fp8(&pb.up, &fl.up, &pb.x, t, stream)?;
+                            self.gemm_fp8(&pb.gate, &fl.gate, &pb.x, rows, stream)?;
+                            self.gemm_fp8(&pb.up, &fl.up, &pb.x, rows, stream)?;
                         }
                     } else if let Some(fl) = fp8_ffn_layer {
-                        self.gemm_fp8_prequant(&pb.gate, &fl.gate, t, stream)?;
-                        self.gemm_fp8_prequant(&pb.up, &fl.up, t, stream)?;
+                        self.gemm_fp8_prequant(&pb.gate, &fl.gate, rows, stream)?;
+                        self.gemm_fp8_prequant(&pb.up, &fl.up, rows, stream)?;
                     } else {
                         match &dffn.gate_up {
                             GateUpWeights::Fused(w) => {
-                                self.gemm_rows(&pb.gate, w, &pb.x, t, 0, inter, stream)?;
-                                self.gemm_rows(&pb.up, w, &pb.x, t, inter, inter, stream)?;
+                                self.gemm_rows(&pb.gate, w, &pb.x, rows, 0, inter, stream)?;
+                                self.gemm_rows(&pb.up, w, &pb.x, rows, inter, inter, stream)?;
                             }
                             GateUpWeights::Split { gate, up } => {
-                                self.gemm(&pb.gate, gate, &pb.x, t, stream)?;
-                                self.gemm(&pb.up, up, &pb.x, t, stream)?;
+                                self.gemm(&pb.gate, gate, &pb.x, rows, stream)?;
+                                self.gemm(&pb.up, up, &pb.x, rows, stream)?;
                             }
                         }
                     }
                     trace.mark(self.device.as_ref(), "gemm_gateup");
-                    kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, t * inter, stream)?;
+                    kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, rows * inter, stream)?;
                     trace.mark(self.device.as_ref(), "silu");
                     // Calibration capture 4/4: down_proj input (SwiGLU output).
                     if let Some(cal) = calib.as_mut() {
@@ -5882,13 +5965,13 @@ impl Model {
                         )?;
                     }
                     if let Some(wl) = w4a8_layer {
-                        self.gemm_w4a8(&pb.down, &wl.down, &pb.act, t, stream)?;
+                        self.gemm_w4a8(&pb.down, &wl.down, &pb.act, rows, stream)?;
                     } else if let Some(fl) = fp8_layer {
-                        self.gemm_fp8(&pb.down, &fl.down, &pb.act, t, stream)?;
+                        self.gemm_fp8(&pb.down, &fl.down, &pb.act, rows, stream)?;
                     } else if let Some(fl) = fp8_ffn_layer {
-                        self.gemm_fp8(&pb.down, &fl.down, &pb.act, t, stream)?;
+                        self.gemm_fp8(&pb.down, &fl.down, &pb.act, rows, stream)?;
                     } else {
-                        self.gemm(&pb.down, &dffn.down, &pb.act, t, stream)?;
+                        self.gemm(&pb.down, &dffn.down, &pb.act, rows, stream)?;
                     }
                     trace.mark(self.device.as_ref(), "gemm_down");
                 }
@@ -5908,11 +5991,11 @@ impl Model {
             // logit head — never fused, keeps the f16 hidden state).
             if l + 1 < n_layers && fp8mod_fuse {
                 kernels.rmsnorm_residual_fp8_shared(
-                    &pb.x, &pb.h, &pb.down, next_norm, t, hidden, eps, stream,
+                    &pb.x, &pb.h, &pb.down, next_norm, rows, hidden, eps, stream,
                 )?;
             } else {
                 kernels.rmsnorm_residual_f16(
-                    &pb.x, &pb.h, &pb.down, next_norm, t, hidden, eps, stream,
+                    &pb.x, &pb.h, &pb.down, next_norm, rows, hidden, eps, stream,
                 )?;
             }
             trace.mark(self.device.as_ref(), "norm_res2");
@@ -6759,7 +6842,7 @@ impl Model {
             self,
             seqs,
             |model, seqs| {
-                model.prefill_forward_lanes(seqs, token_lanes, false)?;
+                model.prefill_forward_lanes(seqs, token_lanes, false, None)?;
                 let hidden = model.weights.descriptor.params.hidden_size;
                 let row_bytes = hidden * 2;
                 let source = model
@@ -6818,7 +6901,7 @@ impl Model {
             self,
             seqs,
             |model, seqs| {
-                model.prefill_forward_lanes(seqs, token_lanes, true)?;
+                model.prefill_forward_lanes(seqs, token_lanes, true, None)?;
                 Ok(())
             },
             |model| model.synchronize_kv_fatal("rollback dense prefill"),
@@ -16857,6 +16940,208 @@ impl Model {
             out[i] = id as u32;
         }
         Ok(out)
+    }
+
+    /// Whether one scheduler iteration may fold `b` decode rows into a dense
+    /// prefill chunk forward (`mixed_prefill_decode_step`).
+    pub fn mixed_step_capable(&self, b: usize) -> bool {
+        // The head runs at b(+1) rows — an arbitrary count, so it must be a
+        // format whose batched logits path takes any row count (F16/Q8_0
+        // GEMMs, Q4_K/Q6_K per-lane GEMV). NvFp4Gguf heads only have
+        // power-of-two batch kernels and keep the two-phase iteration.
+        let head_ok = matches!(
+            self.weights.lm_head,
+            DevWeight::F16 { .. }
+                | DevWeight::Q8_0 { .. }
+                | DevWeight::Q4K { .. }
+                | DevWeight::Q6K { .. }
+        );
+        b > 0
+            && b <= self.batch_cap.max(1)
+            && head_ok
+            && !self.is_hybrid()
+            && !self.weights.is_moe()
+            && !self.kv.cfg.quant.is_rot()
+            && self.tier.is_none()
+            && self.calib.is_none()
+    }
+
+    /// One mixed step: the `b` decode sequences' tokens ride the prefill
+    /// chunk's GEMMs/norms as extra rows (decode attention runs through the
+    /// fused split kernel over the batch metadata), so a long prompt no longer
+    /// stalls decode. Returns the decode sequences' next tokens and — when the
+    /// chunk completes the prompt — the prefill sequence's first token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mixed_prefill_decode_step(
+        &mut self,
+        decode_seqs: &mut [&mut SeqKv],
+        decode_tokens: &[u32],
+        decode_params: &[SeqSampleParams],
+        prefill_seq: &mut SeqKv,
+        chunk: &[u32],
+        final_params: Option<SeqSampleParams>,
+    ) -> Result<(Vec<u32>, Option<u32>)> {
+        self.ensure_kv_reuse_healthy()?;
+        let b = decode_seqs.len();
+        if !self.mixed_step_capable(b) || chunk.is_empty() {
+            return Err(ForgeError::Unsupported(
+                "mixed step nie spełnia kontraktu modelu".into(),
+            ));
+        }
+        if decode_tokens.len() != b || decode_params.len() != b {
+            return Err(ForgeError::Scheduler(
+                "mixed step: seqs/tokens/params length mismatch".into(),
+            ));
+        }
+        let p = self.weights.descriptor.params.clone();
+        for (seq, &token) in decode_seqs.iter().zip(decode_tokens) {
+            if seq.len >= p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {} exceeds model context {}",
+                    seq.len, p.max_position_embeddings
+                )));
+            }
+            if token as usize >= p.vocab_size {
+                return Err(ForgeError::Scheduler(format!(
+                    "token id {token} exceeds model vocabulary {}",
+                    p.vocab_size
+                )));
+            }
+            if !seq.spilled.is_empty() {
+                return Err(ForgeError::Unsupported(
+                    "mixed step nie obsługuje spillowanych sekwencji".into(),
+                ));
+            }
+        }
+        let growth_pages = self
+            .kv
+            .batch_growth_pages(decode_seqs.iter().map(|seq| &**seq))?;
+        self.pt_seq = 0;
+        self.ensure_batch(b)?;
+        self.ensure_free_pages(growth_pages);
+        if growth_pages > self.kv.free_page_count() {
+            return Err(ForgeError::Scheduler(format!(
+                "mixed step: wzrost KV wymaga {growth_pages} stron, wolnych {}",
+                self.kv.free_page_count()
+            )));
+        }
+
+        // Grow each decode sequence by one token; upload ids into the mixed
+        // rows and positions/seq_lens/page tables into the batch buffers the
+        // fused decode attention reads.
+        let mpp = self.max_pages_per_seq;
+        let mut meta = vec![0i32; b * 2]; // [positions | seq_lens]
+        let mut pt = vec![-1i32; b * mpp];
+        let mut ids = Vec::with_capacity(b);
+        for (lane, seq) in decode_seqs.iter_mut().enumerate() {
+            let pos = seq.len;
+            self.kv.grow(seq)?;
+            ids.push(decode_tokens[lane] as i32);
+            meta[lane] = pos as i32;
+            meta[b + lane] = (pos + 1) as i32;
+            pt[lane * mpp..lane * mpp + seq.pages.len()].copy_from_slice(&seq.pages);
+        }
+        {
+            // Pinned H2D like `batched_decode` — pageable `device.write`
+            // staggers the stream with synchronous staging copies.
+            let bb = self.batch_bufs.as_ref().expect("provisioned above");
+            let meta_host = bb.pinned_meta.host_ptr().expect("pinned mapping");
+            unsafe {
+                std::ptr::copy_nonoverlapping(meta.as_ptr() as *const u8, meta_host, b * 2 * 4);
+            }
+            self.device
+                .copy(&bb.pinned_meta, 0, &bb.positions, 0, b * 4, &self.stream)?;
+            self.device
+                .copy(&bb.pinned_meta, b * 4, &bb.seq_lens, 0, b * 4, &self.stream)?;
+            let pt_host = bb.pinned_pt.host_ptr().expect("pinned mapping");
+            unsafe {
+                std::ptr::copy_nonoverlapping(pt.as_ptr() as *const u8, pt_host, b * mpp * 4);
+            }
+            self.device
+                .copy(&bb.pinned_pt, 0, &bb.page_table, 0, b * mpp * 4, &self.stream)?;
+        }
+
+        let mixed = MixedDecodeRows { b, ids };
+        let t = self.prefill_forward_lanes(
+            &mut [prefill_seq],
+            &[chunk],
+            false,
+            Some(&mixed),
+        )?;
+
+        // Logits: decode rows [t..t+b] (+ the chunk's last row when the prompt
+        // completes) copied into the batch scratch, one GEMM, batched sampling.
+        let hidden = p.hidden_size;
+        let row_bytes = hidden * 2;
+        let sample_rows = b + usize::from(final_params.is_some());
+        {
+            let pb = self.prefill_bufs.as_ref().expect("prefill bufs live");
+            let bb = self.batch_bufs.as_ref().expect("provisioned above");
+            self.device.copy(
+                &pb.x,
+                t * row_bytes,
+                &bb.x,
+                0,
+                b * row_bytes,
+                &self.stream,
+            )?;
+            if final_params.is_some() {
+                self.device.copy(
+                    &pb.x,
+                    (t - 1) * row_bytes,
+                    &bb.x,
+                    b * row_bytes,
+                    row_bytes,
+                    &self.stream,
+                )?;
+            }
+            let logits = bb.logits.clone();
+            self.logits_gemm(&logits, &bb.x, sample_rows, &self.stream)?;
+        }
+        let mut lane_params: Vec<SeqSampleParams> = decode_params.to_vec();
+        if let Some(fp) = final_params {
+            lane_params.push(fp);
+        }
+        let logits = self
+            .batch_bufs
+            .as_ref()
+            .expect("provisioned")
+            .logits
+            .clone();
+        self.batch_sample_from(&logits, sample_rows, &lane_params)?;
+        let bb = self.batch_bufs.as_ref().expect("provisioned");
+        self.device.copy(
+            &bb.out_ids,
+            0,
+            &bb.pinned_out,
+            0,
+            sample_rows * 4,
+            &self.stream,
+        )?;
+        self.device.synchronize()?;
+        let op = bb.pinned_out.host_ptr().expect("pinned mapping") as *const i32;
+        let raw = unsafe { std::slice::from_raw_parts(op, sample_rows) };
+        let mut out = Vec::with_capacity(b);
+        for (lane, &id) in raw.iter().take(b).enumerate() {
+            if id < 0 || id as usize >= p.vocab_size {
+                return Err(ForgeError::Kernel(format!(
+                    "mixed sampler returned out-of-range token {id} for lane {lane}"
+                )));
+            }
+            out.push(id as u32);
+        }
+        let final_id = if sample_rows > b {
+            let id = raw[b];
+            if id < 0 || id as usize >= p.vocab_size {
+                return Err(ForgeError::Kernel(format!(
+                    "mixed sampler returned out-of-range prompt token {id}"
+                )));
+            }
+            Some(id as u32)
+        } else {
+            None
+        };
+        Ok((out, final_id))
     }
 
     /// Odczytuje pełne logity pozostałe po ostatnim dense batch decode.

@@ -154,7 +154,25 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
-- 🟡 **Mixed prefill+decode forward — zmierzony headroom i plan (2026-07-24).**
+- ✅ **Mixed prefill+decode forward — WYKONANY (2026-07-24/25).** Tokeny
+  decode (B sekwencji GPU-sampled, spec off) jadą jako dodatkowe wiersze w
+  forwardzie chunka prefillu: `prefill_forward_lanes` dostał
+  `MixedDecodeRows` (wiersze decode ZA chunkiem, surowe przez qk-norm/rope
+  chunka — `attn_decode_split` sam robi norm+RoPE+append+attention po
+  metadanych z batch bufs), `Model::mixed_prefill_decode_step` (wzrost KV,
+  pinned upload metadanych, wspólna głowa logitów B(+finalny wiersz chunka),
+  batchowy sampling), scheduler: `mixed_gpu_group` zamiast pary
+  (batched decode + FIFO chunk); `FORGE_MIXED_STEP=0` = kill-switch.
+  Wiersze decode WLICZAJĄ się do kwantu (take = quantum − B — 1024+16 wpadało
+  w dodatkowy kafel GEMM, −12%). Gate'y: capable = dense, non-hybrid/moe/rot,
+  bez tier/kalibracji, głowa F16/Q8_0/Q4_K/Q6_K (NvFp4Gguf ma tylko kernele
+  potęg dwójki). Pomiary p1024/o128: Mistral C=16 out **245→281 tok/s
+  (+15%)**, TTFT med 918→713 ms, TPOT 54,5→47,2; C=8 TTFT 221→170. Bielik
+  TTFT med C=8 209→180, C=16 224→197 przy neutralnym out (−2..4%, w szumie —
+  jego baseline decode był już graphowany i tani). Greedy parity: teksty
+  identyczne z trybem off; engagement potwierdzony trace'em. Dalsze możliwe:
+  graf części decode w mixed passie, polityka per model.
+- 🟡 *(zrealizowane wyżej)* **Mixed prefill+decode forward — zmierzony headroom i plan (2026-07-24).**
   Pomiar rozstrzygający: czysty decode B=16 Bielika (in32/out256) daje
   **12,2 ms TPOT / 1253 tok/s** — poziom vLLM; cała pozostała luka przy p1024
   (628 vs 906 tok/s, TPOT 22,4 vs 12) to interferencja chunków prefillu.

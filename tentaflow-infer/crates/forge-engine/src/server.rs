@@ -820,6 +820,11 @@ fn worker<'t>(
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
     let mut waiting: VecDeque<Submission> = VecDeque::new();
+    // Mixed prefill+decode step (decode rows folded into the prefill chunk's
+    // forward); `FORGE_MIXED_STEP=0` is the kill-switch.
+    let mixed_step_enabled = std::env::var("FORGE_MIXED_STEP")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let mut hybrid_prefill_pair_cursor = 0usize;
     let admission_scan_window = max_active.saturating_mul(2).clamp(2, 16);
     let admission_bypass_budget = admission_scan_window.saturating_mul(2);
@@ -1067,14 +1072,35 @@ fn worker<'t>(
         }
 
         // Gotowe decode ma pierwszeństwo przed pracą prefill, aby długi prompt
-        // nie zwiększał ITL już generowanych sekwencji.
-        batch_gpu_decode(
+        // nie zwiększał ITL już generowanych sekwencji. Jeśli czeka prefill,
+        // krok decode może pojechać w jego chunku (mixed step).
+        let mixed_prefill = if mixed_step_enabled {
+            active
+                .iter()
+                .position(|a| {
+                    !a.dead
+                        && !a.pending_prompt.is_empty()
+                        && matches!(a.sampler, SeqSampler::Gpu(_))
+                })
+                .map(|pidx| {
+                    let quantum = layer_major_scheduler_quantum(
+                        model.hybrid_layer_major_prefill_limit(),
+                        prefill_chunk,
+                        true,
+                    );
+                    (pidx, quantum)
+                })
+        } else {
+            None
+        };
+        let mixed_done = batch_gpu_decode(
             model,
             &mut active,
             batch_min,
             native_mtp_b2,
             mtp_ngram_batch,
             mtp_ngram_mixed_batch,
+            mixed_prefill,
             metrics,
         );
         for a in active.iter_mut() {
@@ -1180,7 +1206,7 @@ fn worker<'t>(
         // C=16 a decode step waited for ~16 chunks (~800 ms ITL spike) and
         // every prompt's TTFT degenerated to the burst's tail. The batched
         // dense path above still takes whole groups when they align.
-        let mut advanced_serial = false;
+        let mut advanced_serial = mixed_done;
         for (index, a) in active.iter_mut().enumerate() {
             if a.dead || advanced_serial {
                 continue;
@@ -1650,8 +1676,9 @@ fn batch_gpu_decode(
     native_mtp_b2: bool,
     mtp_ngram_batch: bool,
     mtp_ngram_mixed_batch: bool,
+    mixed_prefill: Option<(usize, usize)>,
     metrics: &EngineMetrics,
-) {
+) -> bool {
     // Phase 1: emit each ready sequence's pending token; collect the indices of
     // survivors that still need to be fed one more token.
     let mut feed_idx: Vec<usize> = Vec::new();
@@ -1726,7 +1753,24 @@ fn batch_gpu_decode(
         }
     }
     if feed_idx.is_empty() {
-        return;
+        return false;
+    }
+
+    let hybrid_b2 = model.hybrid_batch_b2_capable() && feed_idx.len() >= 2;
+    let serial_only =
+        model.weights.is_moe() || model.kv.cfg.quant.is_rot() || (model.is_hybrid() && !hybrid_b2);
+    // Mixed step: fold this decode step into the oldest pending sequence's
+    // prefill chunk — the decode rows ride the chunk's GEMMs, so a long
+    // prompt costs the decoding sequences (almost) no ITL. Falls back to the
+    // plain paths when the model or the chunk cannot take it.
+    if let Some((pidx, quantum)) = mixed_prefill {
+        if !serial_only
+            && !feed_idx.contains(&pidx)
+            && model.mixed_step_capable(feed_idx.len())
+            && mixed_gpu_group(model, active, &feed_idx, pidx, quantum)
+        {
+            return true;
+        }
     }
 
     // Below `batch_min` sequences, the tuned fused single-seq decode path
@@ -1737,14 +1781,11 @@ fn batch_gpu_decode(
     // path engages once the flat cost amortizes across enough sequences.
     // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
     // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
-    let hybrid_b2 = model.hybrid_batch_b2_capable() && feed_idx.len() >= 2;
-    let serial_only =
-        model.weights.is_moe() || model.kv.cfg.quant.is_rot() || (model.is_hybrid() && !hybrid_b2);
     if (!hybrid_b2 && feed_idx.len() < batch_min.max(2)) || serial_only {
         for &i in &feed_idx {
             serial_step(model, &mut active[i]);
         }
-        return;
+        return false;
     }
 
     if hybrid_b2 {
@@ -1755,10 +1796,11 @@ fn batch_gpu_decode(
         if let Some(&tail) = pairs.remainder().first() {
             serial_step(model, &mut active[tail]);
         }
-        return;
+        return false;
     }
 
     decode_gpu_group(model, active, &feed_idx);
+    false
 }
 
 fn batch_native_mtp_decode(
@@ -1914,6 +1956,116 @@ fn run_mtp_routed_b1(
                     state.observe_all(&accepted);
                 }
             }
+        }
+    }
+}
+
+/// One mixed forward: the feed set's decode tokens ride the prefill chunk of
+/// `active[pidx]` (see `Model::mixed_prefill_decode_step`). Returns `false`
+/// without touching any state when the chunk cannot be taken; on a model
+/// error every involved sequence is failed (the chunk is already consumed).
+fn mixed_gpu_group(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    feed_idx: &[usize],
+    pidx: usize,
+    quantum: usize,
+) -> bool {
+    let b = feed_idx.len();
+    // The decode rows count against the quantum: rows = take + b stays on the
+    // configured chunk's GEMM tile boundary (1024 + 16 rows would spill into
+    // an extra 128-row tile and cost ~12% more than the rows are worth).
+    let take = quantum
+        .saturating_sub(b)
+        .min(MAX_PREFILL_CHUNK.saturating_sub(b))
+        .min(active[pidx].pending_prompt.len());
+    if take == 0 {
+        return false;
+    }
+    let vocab = model.weights.descriptor.params.vocab_size;
+
+    let mut seqs: Vec<&mut SeqKv> = Vec::with_capacity(b);
+    let mut tokens: Vec<u32> = Vec::with_capacity(b);
+    let mut params: Vec<SeqSampleParams> = Vec::with_capacity(b);
+    let mut prefill: Option<&mut ActiveSeq<'_>> = None;
+    let mut fi = 0usize;
+    for (i, a) in active.iter_mut().enumerate() {
+        if i == pidx {
+            prefill = Some(a);
+            continue;
+        }
+        if fi >= feed_idx.len() || feed_idx[fi] != i {
+            continue;
+        }
+        fi += 1;
+        let fed = *a.generated.last().expect("emit_token pushed the fed token");
+        let SeqSampler::Gpu(g) = &mut a.sampler else {
+            unreachable!("feed set is GPU-only")
+        };
+        g.note_token(fed);
+        params.push(g.batch_params(vocab));
+        tokens.push(fed);
+        seqs.push(&mut a.seq);
+    }
+    let pf = prefill.expect("pending prefill index in bounds");
+    let chunk: Vec<u32> = pf.pending_prompt.drain(..take).collect();
+    let final_chunk = pf.pending_prompt.is_empty();
+    let final_params = if final_chunk {
+        let SeqSampler::Gpu(g) = &mut pf.sampler else {
+            // CPU-sampled prompt needs host logits — not producible here;
+            // restore the chunk and let the serial path prefill it.
+            for &token in chunk.iter().rev() {
+                pf.pending_prompt.push_front(token);
+            }
+            return false;
+        };
+        Some(g.batch_params(vocab))
+    } else {
+        None
+    };
+
+    let result =
+        model.mixed_prefill_decode_step(&mut seqs, &tokens, &params, &mut pf.seq, &chunk, final_params);
+    drop(seqs);
+    let pf_result = match &result {
+        Ok((_, final_id)) => Some(*final_id),
+        Err(_) => None,
+    };
+    match result {
+        Ok((next_ids, _)) => {
+            let mut ri = 0usize;
+            for (i, a) in active.iter_mut().enumerate() {
+                if i == pidx {
+                    if let Some(Some(id)) = pf_result {
+                        a.next = Some(PendingNext::Token(id));
+                        a.prefill_profile = match model.take_prefill_profile() {
+                            Ok(profile) => profile,
+                            Err(_) => None,
+                        };
+                    }
+                    continue;
+                }
+                if ri < feed_idx.len() && feed_idx[ri] == i {
+                    a.next = Some(PendingNext::Token(next_ids[ri]));
+                    ri += 1;
+                }
+            }
+            tracing::trace!(b, take, final_chunk, "mixed prefill+decode step");
+            true
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let mut ri = 0usize;
+            for (i, a) in active.iter_mut().enumerate() {
+                if i == pidx || (ri < feed_idx.len() && feed_idx[ri] == i) {
+                    if i != pidx {
+                        ri += 1;
+                    }
+                    let _ = a.events.send(EngineEvent::Error(msg.clone()));
+                    a.dead = true;
+                }
+            }
+            true
         }
     }
 }
