@@ -8692,6 +8692,28 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "status", status.into());
                 set(&obj, "message", message.into());
             }
+            tentaflow_protocol::SystemEventPayload::UserNotification {
+                user_id,
+                notification_id,
+                project_id,
+                kind,
+                title,
+                body,
+                link_json,
+            } => {
+                set(&obj, "variant", "UserNotification".into());
+                set(&obj, "userId", user_id.clone().into());
+                set(&obj, "user_id", user_id.into());
+                set(&obj, "notificationId", notification_id.clone().into());
+                set(&obj, "notification_id", notification_id.into());
+                set(&obj, "projectId", project_id.clone().into());
+                set(&obj, "project_id", project_id.into());
+                set(&obj, "kind", kind.into());
+                set(&obj, "title", title.into());
+                set(&obj, "body", body.into());
+                set(&obj, "linkJson", link_json.clone().into());
+                set(&obj, "link_json", link_json.into());
+            }
         },
         MessageBody::AddonPermissionChangedEventBody(evt) => {
             set(&obj, "variant", "AddonPermissionChangedEvent".into());
@@ -9698,14 +9720,32 @@ fn decode_storage_admin_payload(
 /// Decodes `ProjectStudioPayload` generically: serde's external tagging yields
 /// `{"VariantName": {fields}}` (or a bare string for unit variants), so the
 /// variant tag becomes "ProjectStudio" + name and every field is copied with
-/// both snake_case and camelCase keys. Future append-only F2 variants decode
+/// both snake_case and camelCase keys. Future append-only variants decode
 /// without touching this crate. `bytes` of the upload request would arrive as
 /// a number array, but request variants never legitimately decode in the
-/// response path.
+/// response path. AttachmentGetResponse is special-cased BEFORE the generic
+/// path: its serde_bytes payload (up to 8 MiB) must reach JS as a Uint8Array,
+/// not a per-byte number array built through serde_json.
 fn decode_project_studio_payload(
     obj: &js_sys::Object,
     payload: tentaflow_protocol::project_studio::ProjectStudioPayload,
 ) {
+    if let tentaflow_protocol::project_studio::ProjectStudioPayload::AttachmentGetResponse {
+        bytes,
+        mime,
+        truncated,
+    } = payload
+    {
+        set(obj, "variant", "ProjectStudioAttachmentGetResponse".into());
+        set(
+            obj,
+            "bytes",
+            js_sys::Uint8Array::from(bytes.as_slice()).into(),
+        );
+        set(obj, "mime", mime.into());
+        set(obj, "truncated", truncated.into());
+        return;
+    }
     let value = match serde_json::to_value(&payload) {
         Ok(v) => v,
         Err(_) => {
@@ -17777,4 +17817,631 @@ pub fn encode_project_studio_chat_stream_request(
         },
     ))
     .map_err(|e| JsError::new(&e))
+}
+
+// ----- Project Studio F2: tests, runs, tasks, generation, notifications -----
+// Multi-field mutating requests (CaseSave, RunCreate, TaskSave, ...) take ONE
+// snake_case JSON string deserialized straight into the enum variant via its
+// external tag — serde enforces field types and applies #[serde(default)], so
+// the wasm signature never drifts from the protocol. Simple requests keep
+// explicit parameters like the F1 section above.
+
+/// Parses `fields_json` (snake_case object) into the `variant` struct variant
+/// of ProjectStudioPayload through serde's external tagging and encodes the
+/// full MessageBody.
+fn encode_project_studio_json_request(
+    variant: &str,
+    fields_json: &str,
+) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::project_studio::ProjectStudioPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CasesListRequest) — filtered + paged manual
+/// test cases; empty filter strings mean "all".
+#[wasm_bindgen(js_name = encodeProjectStudioCasesListRequest)]
+pub fn encode_project_studio_cases_list_request(
+    project_id: String,
+    kind: String,
+    status: String,
+    priority: String,
+    tag_id: String,
+    origin: String,
+    search: String,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CasesListRequest {
+            project_id,
+            kind,
+            status,
+            priority,
+            tag_id,
+            origin,
+            search,
+            offset,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseGetRequest)]
+pub fn encode_project_studio_case_get_request(
+    project_id: String,
+    case_id: String,
+    include_versions: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseGetRequest {
+            project_id,
+            case_id,
+            include_versions,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseSaveRequest). `request_json` is the full
+/// snake_case field set (case_id null = create, expected_version drives
+/// optimistic locking).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseSaveRequest)]
+pub fn encode_project_studio_case_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("CaseSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(CaseStatusSetRequest) — every downgrade
+/// requires `reason`.
+#[wasm_bindgen(js_name = encodeProjectStudioCaseStatusSetRequest)]
+pub fn encode_project_studio_case_status_set_request(
+    project_id: String,
+    case_id: String,
+    status: String,
+    reason: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseStatusSetRequest {
+            project_id,
+            case_id,
+            status,
+            reason,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CasesBulkStatusRequest). `request_json`
+/// carries {project_id, case_ids, status, reason}.
+#[wasm_bindgen(js_name = encodeProjectStudioCasesBulkStatusRequest)]
+pub fn encode_project_studio_cases_bulk_status_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("CasesBulkStatusRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(CaseDuplicateRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseDuplicateRequest)]
+pub fn encode_project_studio_case_duplicate_request(
+    project_id: String,
+    case_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseDuplicateRequest {
+            project_id,
+            case_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseDeleteRequest)]
+pub fn encode_project_studio_case_delete_request(
+    project_id: String,
+    case_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseDeleteRequest {
+            project_id,
+            case_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseVersionGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseVersionGetRequest)]
+pub fn encode_project_studio_case_version_get_request(
+    project_id: String,
+    case_id: String,
+    version: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseVersionGetRequest {
+            project_id,
+            case_id,
+            version,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseRestoreVersionRequest) — restore creates
+/// a NEW version (append-only history).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseRestoreVersionRequest)]
+pub fn encode_project_studio_case_restore_version_request(
+    project_id: String,
+    case_id: String,
+    version: u32,
+    expected_version: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseRestoreVersionRequest {
+            project_id,
+            case_id,
+            version,
+            expected_version,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CasesImportCsvRequest). `request_json`
+/// carries {project_id, csv_text, dry_run}.
+#[wasm_bindgen(js_name = encodeProjectStudioCasesImportCsvRequest)]
+pub fn encode_project_studio_cases_import_csv_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("CasesImportCsvRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(AttachmentGetRequest) — download by content
+/// hash; the server clamps `max_bytes` to 8 MiB.
+#[wasm_bindgen(js_name = encodeProjectStudioAttachmentGetRequest)]
+pub fn encode_project_studio_attachment_get_request(
+    project_id: String,
+    sha256: String,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::AttachmentGetRequest {
+            project_id,
+            sha256,
+            max_bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SuitesListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSuitesListRequest)]
+pub fn encode_project_studio_suites_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SuitesListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SuiteGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSuiteGetRequest)]
+pub fn encode_project_studio_suite_get_request(
+    project_id: String,
+    suite_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SuiteGetRequest {
+            project_id,
+            suite_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SuiteSaveRequest). `request_json` carries
+/// {project_id, suite_id?, name, description, case_ids} — case order defines
+/// member positions.
+#[wasm_bindgen(js_name = encodeProjectStudioSuiteSaveRequest)]
+pub fn encode_project_studio_suite_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("SuiteSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(SuiteDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSuiteDeleteRequest)]
+pub fn encode_project_studio_suite_delete_request(
+    project_id: String,
+    suite_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SuiteDeleteRequest {
+            project_id,
+            suite_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunsListRequest) — filtered + paged runs.
+#[wasm_bindgen(js_name = encodeProjectStudioRunsListRequest)]
+pub fn encode_project_studio_runs_list_request(
+    project_id: String,
+    status: String,
+    run_type: String,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunsListRequest {
+            project_id,
+            status,
+            run_type,
+            offset,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunCreateRequest). `request_json` carries
+/// the full field set; exactly ONE of suite_id / case_ids / from_failed_run_id
+/// selects the case source (server-enforced).
+#[wasm_bindgen(js_name = encodeProjectStudioRunCreateRequest)]
+pub fn encode_project_studio_run_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunCreateRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunGetRequest)]
+pub fn encode_project_studio_run_get_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunGetRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunCloseRequest) — `cancelled` = abort
+/// instead of complete.
+#[wasm_bindgen(js_name = encodeProjectStudioRunCloseRequest)]
+pub fn encode_project_studio_run_close_request(
+    project_id: String,
+    run_id: String,
+    cancelled: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunCloseRequest {
+            project_id,
+            run_id,
+            cancelled,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunDeleteRequest)]
+pub fn encode_project_studio_run_delete_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunDeleteRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunItemClaimRequest). `item_id: None` claims
+/// the nearest pool item atomically server-side.
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemClaimRequest)]
+pub fn encode_project_studio_run_item_claim_request(
+    project_id: String,
+    run_id: String,
+    item_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunItemClaimRequest {
+            project_id,
+            run_id,
+            item_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunItemReleaseRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemReleaseRequest)]
+pub fn encode_project_studio_run_item_release_request(
+    project_id: String,
+    item_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunItemReleaseRequest {
+            project_id,
+            item_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunItemGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemGetRequest)]
+pub fn encode_project_studio_run_item_get_request(
+    project_id: String,
+    item_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunItemGetRequest {
+            project_id,
+            item_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunStepSetRequest). `request_json` carries
+/// {project_id, item_id, step_index, status, note, attachments_json}.
+#[wasm_bindgen(js_name = encodeProjectStudioRunStepSetRequest)]
+pub fn encode_project_studio_run_step_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunStepSetRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunItemFinishRequest). `request_json`
+/// carries the full field set; empty status = server derives the verdict.
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemFinishRequest)]
+pub fn encode_project_studio_run_item_finish_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunItemFinishRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MyTestWorkRequest) — cross-project, no
+/// project_id (aggregates the caller's open run items).
+#[wasm_bindgen(js_name = encodeProjectStudioMyTestWorkRequest)]
+pub fn encode_project_studio_my_test_work_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MyTestWorkRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TasksListRequest) — filtered + paged tasks
+/// and defects.
+#[wasm_bindgen(js_name = encodeProjectStudioTasksListRequest)]
+pub fn encode_project_studio_tasks_list_request(
+    project_id: String,
+    task_type: String,
+    status: String,
+    assigned_to: String,
+    search: String,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TasksListRequest {
+            project_id,
+            task_type,
+            status,
+            assigned_to,
+            search,
+            offset,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskGetRequest)]
+pub fn encode_project_studio_task_get_request(
+    project_id: String,
+    task_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskGetRequest {
+            project_id,
+            task_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskSaveRequest). `request_json` is the full
+/// snake_case field set (task_id null = create; defects require severity).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskSaveRequest)]
+pub fn encode_project_studio_task_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(TaskDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskDeleteRequest)]
+pub fn encode_project_studio_task_delete_request(
+    project_id: String,
+    task_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskDeleteRequest {
+            project_id,
+            task_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskCommentAddRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskCommentAddRequest)]
+pub fn encode_project_studio_task_comment_add_request(
+    project_id: String,
+    task_id: String,
+    body_md: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentAddRequest {
+            project_id,
+            task_id,
+            body_md,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskCommentEditRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskCommentEditRequest)]
+pub fn encode_project_studio_task_comment_edit_request(
+    project_id: String,
+    comment_id: String,
+    body_md: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentEditRequest {
+            project_id,
+            comment_id,
+            body_md,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskCommentDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskCommentDeleteRequest)]
+pub fn encode_project_studio_task_comment_delete_request(
+    project_id: String,
+    comment_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentDeleteRequest {
+            project_id,
+            comment_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationStartRequest). `request_json`
+/// carries {project_id, kind, source_ids, requested_count, instructions,
+/// agent_id?} — agent_id null = the project's 'generator_manual' binding.
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationStartRequest)]
+pub fn encode_project_studio_generation_start_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("GenerationStartRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(GenerationsListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationsListRequest)]
+pub fn encode_project_studio_generations_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationsListRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationGetRequest) — polling is the
+/// source of truth for generation progress.
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationGetRequest)]
+pub fn encode_project_studio_generation_get_request(
+    project_id: String,
+    gen_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationGetRequest {
+            project_id,
+            gen_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationCancelRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationCancelRequest)]
+pub fn encode_project_studio_generation_cancel_request(
+    project_id: String,
+    gen_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationCancelRequest {
+            project_id,
+            gen_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationReviewRequest). `request_json`
+/// carries {project_id, gen_id, accept_case_ids, reject_case_ids}.
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationReviewRequest)]
+pub fn encode_project_studio_generation_review_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("GenerationReviewRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(GenerationDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationDeleteRequest)]
+pub fn encode_project_studio_generation_delete_request(
+    project_id: String,
+    gen_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationDeleteRequest {
+            project_id,
+            gen_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(NotificationsListRequest) — always
+/// caller-scoped, no project_id.
+#[wasm_bindgen(js_name = encodeProjectStudioNotificationsListRequest)]
+pub fn encode_project_studio_notifications_list_request(
+    only_unread: bool,
+    before_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::NotificationsListRequest {
+            only_unread,
+            before_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(NotificationsMarkReadRequest).
+/// `request_json` carries {notification_ids} — empty = mark ALL as read.
+#[wasm_bindgen(js_name = encodeProjectStudioNotificationsMarkReadRequest)]
+pub fn encode_project_studio_notifications_mark_read_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("NotificationsMarkReadRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ReportQueryRequest). `request_json` carries
+/// {project_id, report, from_date, to_date, suite_id} — one generic variant,
+/// rows_json schema is per report.
+#[wasm_bindgen(js_name = encodeProjectStudioReportQueryRequest)]
+pub fn encode_project_studio_report_query_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ReportQueryRequest", &request_json)
 }

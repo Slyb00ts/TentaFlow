@@ -1551,3 +1551,977 @@
   color: var(--text-3);
   font-size: 12.5px;
 }
+
+/* ---------------------------------------------------------------------------
+ * F2 — tests module: shared toolbar, bulk bar, editors, runs, exec, reports
+ * ------------------------------------------------------------------------- */
+
+.ps-tests-toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.ps-tests-toolbar tf-searchbox {
+  min-width: 220px;
+}
+
+.ps-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.ps-bulk-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-right: 4px;
+}
+
+.ps-origin-agent .icon,
+.ps-origin-user .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.ps-origin-agent {
+  color: var(--accent-2);
+}
+
+.ps-origin-user {
+  color: var(--text-3);
+}
+
+.ps-csv-errors {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.ps-csv-err-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* ---- drill-in editor header (case / suite / run / gen / exec) ------------ */
+
+.ps-editor-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.ps-editor-title {
+  flex: 1;
+  min-width: 240px;
+}
+
+.ps-editor-title-static {
+  flex: 1;
+  min-width: 240px;
+}
+
+.ps-detail-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ps-detail-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.ps-editor-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ps-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ps-editor-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 14px;
+  align-items: start;
+}
+
+.ps-editor-main,
+.ps-editor-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+@media (max-width: 980px) {
+  .ps-editor-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-editor-meta-grid {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+@media (max-width: 720px) {
+  .ps-editor-meta-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-editor-savebar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.ps-editor-savebar tf-input {
+  flex: 1;
+}
+
+.ps-linked-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ps-linked-sources tf-chip {
+  cursor: pointer;
+}
+
+/* ---- case steps ---------------------------------------------------------- */
+
+.ps-step-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-step-row:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-step-num {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--bg-3);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 4px;
+}
+
+.ps-step-fields {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+@media (max-width: 860px) {
+  .ps-step-fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-step-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ps-rotate-180 {
+  transform: rotate(180deg);
+}
+
+/* ---- version history ------------------------------------------------------ */
+
+.ps-version-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-version-row:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-version-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-version-note {
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ps-version-meta {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ps-version-block {
+  padding: 10px 12px;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+}
+
+.ps-version-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.ps-version-step:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-case-info-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.ps-case-info-list > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ps-case-info-list span {
+  color: var(--text-3);
+}
+
+.ps-case-info-list b {
+  color: var(--text-2);
+  font-weight: 600;
+  text-align: right;
+}
+
+/* ---- generation wizard + detail ------------------------------------------ */
+
+.ps-gen-source-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-gen-source-row:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-gen-source-row.is-disabled {
+  opacity: 0.55;
+}
+
+.ps-gen-source-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-gen-source-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ps-gen-source-meta {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ps-gen-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 12.5px;
+}
+
+.ps-gen-summary > div {
+  display: flex;
+  gap: 10px;
+}
+
+.ps-gen-summary span {
+  color: var(--text-3);
+  min-width: 90px;
+}
+
+.ps-gen-summary b {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.ps-gen-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.ps-gen-progress tf-progress-bar {
+  flex: 1;
+}
+
+.ps-gen-progress span {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.ps-gen-timeline {
+  margin-top: 10px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.ps-gen-pending-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-gen-pending-row:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-gen-pending-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-gen-pending-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.ps-gen-pending-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* ---- suites two-pane + shared pane lists ---------------------------------- */
+
+.ps-two-pane {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .ps-two-pane {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-pane-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: 8px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.ps-run-case-pool {
+  max-height: 260px;
+}
+
+.ps-pane-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-pane-row:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-pane-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ps-pane-row-title {
+  font-size: 12.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ps-pane-row-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* ---- run detail ------------------------------------------------------------ */
+
+.ps-run-kpis {
+  margin-bottom: 10px;
+}
+
+.ps-run-progressbar {
+  margin-bottom: 14px;
+}
+
+.ps-item-expansion {
+  padding: 10px 12px;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+}
+
+.ps-exp-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-exp-step:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-exp-step-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-exp-step-action {
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.ps-exp-step-expected {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.ps-exp-step-note {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  padding: 6px 8px;
+  background: var(--bg-2);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+}
+
+.ps-exp-atts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.ps-exp-att {
+  width: 72px;
+  height: 54px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--text-3);
+  text-align: center;
+  padding: 2px;
+  background: var(--bg-2);
+}
+
+.ps-exp-att img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ---- tester execution desk -------------------------------------------------- */
+
+.ps-exec-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.ps-exec-progress tf-progress-bar {
+  flex: 1;
+}
+
+.ps-exec-progress span {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.ps-exec-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 10px;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+}
+
+.ps-exec-step:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-exec-step.is-passed {
+  border-left-color: var(--success);
+}
+
+.ps-exec-step.is-failed {
+  border-left-color: var(--danger);
+}
+
+.ps-exec-step.is-blocked {
+  border-left-color: var(--accent-1);
+}
+
+.ps-exec-step.is-skipped {
+  border-left-color: var(--border-hover);
+}
+
+.ps-exec-step-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-verdict-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.ps-exec-step-note {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 8px;
+  align-items: start;
+  margin-top: 8px;
+}
+
+@media (max-width: 720px) {
+  .ps-exec-step-note {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-exec-summary-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+@media (max-width: 720px) {
+  .ps-exec-summary-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- attachments preview ----------------------------------------------------- */
+
+.ps-att-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+}
+
+.ps-att-preview img {
+  max-width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+}
+
+/* ---- reports ------------------------------------------------------------------ */
+
+.ps-reports-toolbar {
+  align-items: flex-end;
+}
+
+.ps-reports-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .ps-reports-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-report-body {
+  min-height: 120px;
+}
+
+.ps-coverage-head,
+.ps-coverage-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px 130px;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 8px;
+  font-size: 12.5px;
+}
+
+.ps-coverage-head {
+  color: var(--text-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-coverage-row {
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+}
+
+.ps-coverage-row:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-coverage-row.is-uncovered {
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
+.ps-coverage-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- tasks -------------------------------------------------------------------- */
+
+.ps-toggle-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.ps-task-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.ps-task-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ps-task-comments {
+  display: flex;
+  flex-direction: column;
+  margin-top: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.ps-task-comment {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-task-comment:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-task-comment-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-task-comment-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.ps-task-comment-head span {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ps-task-comment-body {
+  font-size: 12.5px;
+  color: var(--text-2);
+  margin-top: 2px;
+  white-space: pre-wrap;
+}
+
+.ps-task-comment-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.ps-task-comment-add {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.ps-task-comment-add tf-textarea {
+  flex: 1;
+}
+
+/* ---- notification bell + panel + my work ---------------------------------------- */
+
+.ps-bell-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.ps-bell-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.ps-notif-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.ps-notif-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 6px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.ps-notif-item:hover {
+  background: var(--bg-3);
+}
+
+.ps-notif-item.is-unread .ps-notif-title {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ps-notif-ico {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  color: var(--accent-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ps-notif-ico .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.ps-notif-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-notif-title {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.ps-notif-body {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 1px;
+}
+
+.ps-notif-meta {
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin-top: 3px;
+}
+
+.ps-notif-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-2);
+  flex-shrink: 0;
+  margin-top: 6px;
+}
+
+.ps-notif-more {
+  text-align: center;
+  padding: 8px 0 2px;
+}
+
+.ps-mywork-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 6px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.ps-mywork-row:hover {
+  background: var(--bg-3);
+}
+
+.ps-mywork-row:last-of-type {
+  border-bottom: 0;
+}
+
+.ps-mywork-counts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ---- print: report sections come out as a clean, light document -------------- */
+
+@media print {
+  body {
+    background: #fff;
+  }
+
+  .sidebar,
+  .page-header .actions,
+  .ps-project-crumbs,
+  .ps-project-tabs,
+  .ps-subnav,
+  .ps-tests-toolbar,
+  tf-detail-header,
+  tf-toast {
+    display: none !important;
+  }
+
+  .ps-reports-grid {
+    display: block;
+  }
+
+  .ps-report-card {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    margin-bottom: 16px;
+    border: 1px solid #ccc;
+  }
+
+  .ps-report-card,
+  .ps-report-body,
+  .ps-coverage-row,
+  .ps-coverage-head {
+    color: #000 !important;
+    background: #fff !important;
+  }
+
+  .ps-coverage-row.is-uncovered {
+    background: #ffe4e4 !important;
+  }
+}
