@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Zadania: lista + tablica (Z01)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  /* Z01 — drobiazgi ekranowe (reszta z shared) */
+  @keyframes cardIn { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+  @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+  /* pasek narzędzi: przełącznik widoku + akcje */
+  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  /* rząd filtrów */
+  .filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  .filters .select { width: auto; min-width: 150px; padding-top: 6px; padding-bottom: 6px; }
+
+  /* tabela zadań */
+  .table-wrap { overflow-x: auto; }
+  .task-table td, .task-table th { white-space: nowrap; }
+  .task-table td.t-title { white-space: normal; min-width: 240px; }
+  .task-table td.t-act, .task-table th.t-act { width: 40px; text-align: right; }
+  .task-table tr.crit td { background: rgba(239,68,68,0.06); }
+  .task-table tr.crit td.t-title { box-shadow: inset 3px 0 0 var(--danger); }
+  .t-title .tt { font-weight: 700; font-size: 12.5px; }
+  .t-id { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+
+  /* typ zadania (task/defect) */
+  .ttype { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 12px; border: 1px solid var(--border); }
+  .ttype .icon { width: 12px; height: 12px; }
+  .ttype.defect { background: rgba(239,68,68,0.12); color: var(--danger); border-color: rgba(239,68,68,0.3); }
+  .ttype.task { background: rgba(167,139,250,0.12); color: var(--accent-2); border-color: rgba(167,139,250,0.35); }
+
+  /* severity */
+  .sev { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 800; padding: 3px 9px; border-radius: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  .sev .d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }
+  .sev.crit { background: rgba(239,68,68,0.15); color: var(--danger); }
+  .sev.high { background: rgba(245,158,11,0.15); color: var(--warning); }
+  .sev.med  { background: rgba(96,165,250,0.15); color: var(--info); }
+  .sev.low  { background: var(--bg-3); color: var(--text-3); }
+  .sev-none { color: var(--text-3); font-weight: 700; }
+
+  /* status pill: w toku (pulsujący) */
+  .status-pill.run { color: var(--accent-2); background: var(--accent-glow); }
+  .status-pill.run::before { animation: pulseDot 1.2s infinite; }
+
+  /* przypisany */
+  .who { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); }
+  .who.none { color: var(--text-3); }
+
+  /* termin */
+  .due { font-size: 11.5px; color: var(--text-2); display: inline-flex; align-items: center; gap: 5px; }
+  .due .icon { width: 12px; height: 12px; color: var(--text-3); }
+  .due.over { color: var(--danger); font-weight: 700; }
+  .due.over .icon { color: var(--danger); }
+
+  /* powiązania */
+  .rel-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .rel { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 10px; background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2); cursor: pointer; }
+  .rel:hover { border-color: var(--accent-1); color: var(--accent-2); }
+  .rel .icon { width: 11px; height: 11px; color: var(--text-3); }
+  .rel:hover .icon { color: var(--accent-2); }
+  .rel-none { color: var(--text-3); font-size: 11.5px; }
+
+  /* menu wiersza (⋯) */
+  .row-menu { position: relative; display: inline-block; }
+  .tf-menu { position: absolute; top: 32px; right: 0; width: 208px; background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); box-shadow: var(--shadow-lg); z-index: 30; padding: 4px; animation: cardIn .16s ease; }
+  .tf-menu .mi { display: flex; align-items: center; gap: 9px; padding: 8px 10px; font-size: 12px; color: var(--text-2); border-radius: var(--radius-sm); cursor: pointer; }
+  .tf-menu .mi:hover { background: var(--bg-3); color: var(--text); }
+  .tf-menu .mi .icon { width: 14px; height: 14px; }
+  .tf-menu .mi.danger { color: var(--danger); }
+  .tf-menu .mi.danger:hover { background: rgba(239,68,68,0.12); }
+  .tf-menu .mi-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+
+  /* nagłówek kolumny kanban z akcją dodania */
+  .kanban-col .kc-head { align-items: center; }
+  .kc-head .kc-left { display: flex; align-items: center; gap: 8px; }
+  .kc-head .kc-add { width: 24px; height: 24px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--bg-3); color: var(--text-3); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+  .kc-head .kc-add:hover { color: var(--accent-2); border-color: var(--accent-1); }
+  .kc-head .kc-add .icon { width: 13px; height: 13px; }
+
+  /* karta kanban — nagłówek z typem + menu, meta */
+  .kanban-card.crit { border-left: 3px solid var(--danger); }
+  .kanban-card .kk-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .kanban-card .kk-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .kanban-card .kk-id { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-3); }
+  .card-menu { position: relative; }
+  .card-menu > .icon-btn { width: 24px; height: 24px; }
+  .card-menu .tf-menu { top: 28px; width: 190px; }
+
+  /* stopka kanban z relacją + terminem + avatar */
+  .kanban-card .kk-foot { justify-content: space-between; }
+  .kanban-card .kk-foot .kk-left { display: flex; align-items: center; gap: 8px; }
+
+  /* pusta kolumna – wskazówka */
+  .kc-empty { text-align: center; color: var(--text-3); font-size: 11px; padding: 18px 8px; border: 1px dashed var(--border); border-radius: var(--radius-sm); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+</defs></svg>
+
+<!-- ============================================================ -->
+<!-- Z01a — ZADANIA: WIDOK LISTY                                   -->
+<!-- ============================================================ -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">Z01a</span>
+    <h2>Zadania — Lista</h2>
+    <div class="desc">Wszystkie zadania i usterki projektu w formie tabeli: typ, waga, status, przypisanie, termin i powiązania z przypadkami, przebiegami oraz dokumentami.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Zadania</span>
+        </div>
+
+        <!-- Nagłówek projektu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Portal Klienta B2B <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Zadania i usterki zebrane z przebiegów, zgłoszeń testerów i pracy agentów</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-check-circle"/></svg>12 otwartych</span>
+              <span class="chip danger"><svg class="icon"><use href="#i-bug"/></svg>2 krytyczne</span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Testy + Dokumentacja</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Menedżer</b></span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><!-- otwiera: G02 --><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+
+        <!-- Zakładki modułów -->
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab active"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <!-- Pasek: przełącznik widoku + akcje -->
+        <div class="toolbar">
+          <div class="segmented">
+            <button class="active"><svg class="icon"><use href="#i-list"/></svg>Lista</button>
+            <button><svg class="icon"><use href="#i-grid"/></svg>Tablica</button>
+          </div>
+          <div class="actions">
+            <div class="search-box" style="min-width:240px;">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input placeholder="Szukaj zadania lub usterki…">
+            </div>
+            <button class="btn btn-primary"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-plus"/></svg>Nowe zadanie</button>
+          </div>
+        </div>
+
+        <!-- Rząd filtrów -->
+        <div class="filters">
+          <select class="select" aria-label="Filtr typu">
+            <option>Typ: wszystkie</option>
+            <option>Zadanie</option>
+            <option>Usterka</option>
+          </select>
+          <select class="select" aria-label="Filtr statusu">
+            <option>Status: wszystkie</option>
+            <option>Do zrobienia</option>
+            <option>W toku</option>
+            <option>Przegląd</option>
+            <option>Gotowe</option>
+          </select>
+          <select class="select" aria-label="Filtr wagi">
+            <option>Waga: wszystkie</option>
+            <option>Krytyczna</option>
+            <option>Wysoka</option>
+            <option>Średnia</option>
+            <option>Niska</option>
+          </select>
+          <span class="filter-chip active"><svg class="icon"><use href="#i-users"/></svg>Moje</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-filter"/></svg>Więcej filtrów</span>
+        </div>
+
+        <!-- Tabela zadań -->
+        <div class="table-wrap">
+          <table class="tf-table task-table">
+            <thead>
+              <tr>
+                <th>Zadanie</th>
+                <th>Typ</th>
+                <th>Waga</th>
+                <th>Status</th>
+                <th>Przypisany</th>
+                <th>Termin</th>
+                <th>Powiązania</th>
+                <th class="t-act"></th>
+              </tr>
+            </thead>
+            <tbody>
+
+              <!-- DEF-042 — usterka krytyczna, w toku (menu otwarte) -->
+              <tr class="crit">
+                <td class="t-title"><div class="tt">Koszyk nie przelicza rabatu B2B</div><div class="t-id">#DEF-042 · z kroku 2 przebiegu #241</div></td>
+                <td><span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span></td>
+                <td><span class="sev crit"><span class="d"></span>krytyczna</span></td>
+                <td><span class="status-pill run">w toku</span></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td><span class="due over"><svg class="icon"><use href="#i-clock"/></svg>28.06 · po terminie</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-clipboard"/></svg>TC-118</span>
+                    <span class="rel"><svg class="icon"><use href="#i-play"/></svg>#241</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi"><svg class="icon"><use href="#i-check"/></svg>Zmień status</div>
+                      <div class="mi"><svg class="icon"><use href="#i-copy"/></svg>Duplikuj</div>
+                      <div class="mi-sep"></div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- DEF-039 — usterka wysoka, do zrobienia -->
+              <tr>
+                <td class="t-title"><div class="tt">Błąd 500 przy eksporcie faktury PDF</div><div class="t-id">#DEF-039</div></td>
+                <td><span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span></td>
+                <td><span class="sev high"><span class="d"></span>wysoka</span></td>
+                <td><span class="status-pill idle">do zrobienia</span></td>
+                <td><span class="who"><span class="av-mini">AK</span>Anna K.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>25.07.2026</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-clipboard"/></svg>TC-090</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" style="display:none;">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- TASK-051 — zadanie, przegląd -->
+              <tr>
+                <td class="t-title"><div class="tt">Uzupełnić testy API dla /orders</div><div class="t-id">#TASK-051</div></td>
+                <td><span class="ttype task"><svg class="icon"><use href="#i-check-circle"/></svg>zadanie</span></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill warn">przegląd</span></td>
+                <td><span class="who"><span class="av-mini">AK</span>Anna K.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>30.07.2026</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-doc"/></svg>Spec API v2</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" style="display:none;">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- DEF-041 — usterka średnia, do zrobienia, nieprzypisana -->
+              <tr>
+                <td class="t-title"><div class="tt">Sesja wygasa zbyt szybko na Staging</div><div class="t-id">#DEF-041</div></td>
+                <td><span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span></td>
+                <td><span class="sev med"><span class="d"></span>średnia</span></td>
+                <td><span class="status-pill idle">do zrobienia</span></td>
+                <td><span class="who none"><span class="av-mini unassigned">?</span>nieprzypisane</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>01.08.2026</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-play"/></svg>#242</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" style="display:none;">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi"><svg class="icon"><use href="#i-user-plus"/></svg>Przypisz</div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- TASK-048 — zadanie, w toku -->
+              <tr>
+                <td class="t-title"><div class="tt">Zaktualizować dokumentację logowania SSO</div><div class="t-id">#TASK-048</div></td>
+                <td><span class="ttype task"><svg class="icon"><use href="#i-check-circle"/></svg>zadanie</span></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill run">w toku</span></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>29.07.2026</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-doc"/></svg>Instrukcja SSO</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" style="display:none;">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- DEF-036 — usterka średnia, przegląd -->
+              <tr>
+                <td class="t-title"><div class="tt">Brak walidacji pola telefon w formularzu</div><div class="t-id">#DEF-036</div></td>
+                <td><span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span></td>
+                <td><span class="sev med"><span class="d"></span>średnia</span></td>
+                <td><span class="status-pill warn">przegląd</span></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>31.07.2026</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-clipboard"/></svg>TC-061</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" style="display:none;">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- DEF-037 — usterka niska, gotowe -->
+              <tr>
+                <td class="t-title"><div class="tt">Literówka w komunikacie walidacji NIP</div><div class="t-id">#DEF-037</div></td>
+                <td><span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span></td>
+                <td><span class="sev low"><span class="d"></span>niska</span></td>
+                <td><span class="status-pill ok">gotowe</span></td>
+                <td><span class="who"><span class="av-mini">AK</span>Anna K.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>20.07.2026</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-clipboard"/></svg>TC-045</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" style="display:none;">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- TASK-045 — zadanie, gotowe -->
+              <tr>
+                <td class="t-title"><div class="tt">Przygotować zestaw regresji checkout</div><div class="t-id">#TASK-045</div></td>
+                <td><span class="ttype task"><svg class="icon"><use href="#i-check-circle"/></svg>zadanie</span></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill ok">gotowe</span></td>
+                <td><span class="who"><span class="av-mini">AK</span>Anna K.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>18.07.2026</span></td>
+                <td>
+                  <div class="rel-chips">
+                    <span class="rel"><svg class="icon"><use href="#i-layers"/></svg>Regresja checkout</span>
+                  </div>
+                </td>
+                <td class="t-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" style="display:none;">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+            </tbody>
+          </table>
+        </div>
+
+        <div class="text-3 text-xs mt-md" style="display:flex;align-items:center;gap:6px;">
+          <svg class="icon icon-sm"><use href="#i-check-circle"/></svg>
+          Pokazano 8 z 12 zadań · filtr „Moje" wyłącz, aby zobaczyć zadania całego zespołu.
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- Z01b — ZADANIA: WIDOK TABLICY (KANBAN)                        -->
+<!-- ============================================================ -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">Z01b</span>
+    <h2>Zadania — Tablica</h2>
+    <div class="desc">Ten sam zbiór zadań w układzie kanban: cztery kolumny stanu, karty z wagą i przypisaniem, przeciągnij kartę między kolumnami, aby zmienić status.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Zadania</span>
+        </div>
+
+        <!-- Nagłówek projektu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Portal Klienta B2B <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Zadania i usterki zebrane z przebiegów, zgłoszeń testerów i pracy agentów</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-check-circle"/></svg>12 otwartych</span>
+              <span class="chip danger"><svg class="icon"><use href="#i-bug"/></svg>2 krytyczne</span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Testy + Dokumentacja</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Menedżer</b></span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><!-- otwiera: G02 --><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+
+        <!-- Zakładki modułów -->
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab active"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <!-- Pasek: przełącznik widoku + akcje -->
+        <div class="toolbar">
+          <div class="segmented">
+            <button><svg class="icon"><use href="#i-list"/></svg>Lista</button>
+            <button class="active"><svg class="icon"><use href="#i-grid"/></svg>Tablica</button>
+          </div>
+          <div class="actions">
+            <div class="search-box" style="min-width:240px;">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input placeholder="Szukaj zadania lub usterki…">
+            </div>
+            <button class="btn btn-primary"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-plus"/></svg>Nowe zadanie</button>
+          </div>
+        </div>
+
+        <!-- Rząd filtrów -->
+        <div class="filters">
+          <select class="select" aria-label="Filtr typu">
+            <option>Typ: wszystkie</option>
+            <option>Zadanie</option>
+            <option>Usterka</option>
+          </select>
+          <select class="select" aria-label="Filtr wagi">
+            <option>Waga: wszystkie</option>
+            <option>Krytyczna</option>
+            <option>Wysoka</option>
+            <option>Średnia</option>
+            <option>Niska</option>
+          </select>
+          <span class="filter-chip active"><svg class="icon"><use href="#i-users"/></svg>Moje</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-filter"/></svg>Więcej filtrów</span>
+        </div>
+
+        <!-- Tablica kanban -->
+        <div class="kanban">
+
+          <!-- Kolumna: Do zrobienia -->
+          <div class="kanban-col">
+            <div class="kc-head">
+              <div class="kc-left">Do zrobienia <span class="cnt">2</span></div>
+              <button class="kc-add" title="Dodaj w tej kolumnie"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-plus"/></svg></button>
+            </div>
+
+            <div class="kanban-card">
+              <div class="kk-head">
+                <span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu" style="display:none;">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Błąd 500 przy eksporcie faktury PDF</div>
+              <div class="kk-meta"><span class="sev high"><span class="d"></span>wysoka</span><span class="kk-id">#DEF-039</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="due"><svg class="icon"><use href="#i-clock"/></svg>25.07</span></div>
+                <span class="kk-av">AK</span>
+              </div>
+            </div>
+
+            <div class="kanban-card">
+              <div class="kk-head">
+                <span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu" style="display:none;">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi"><svg class="icon"><use href="#i-user-plus"/></svg>Przypisz</div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Sesja wygasa zbyt szybko na Staging</div>
+              <div class="kk-meta"><span class="sev med"><span class="d"></span>średnia</span><span class="kk-id">#DEF-041</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="due"><svg class="icon"><use href="#i-clock"/></svg>01.08</span></div>
+                <span class="av-mini unassigned">?</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kolumna: W toku -->
+          <div class="kanban-col">
+            <div class="kc-head">
+              <div class="kc-left">W toku <span class="cnt">2</span></div>
+              <button class="kc-add" title="Dodaj w tej kolumnie"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-plus"/></svg></button>
+            </div>
+
+            <!-- karta krytyczna z otwartym menu -->
+            <div class="kanban-card crit">
+              <div class="kk-head">
+                <span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi"><svg class="icon"><use href="#i-check"/></svg>Zmień status</div>
+                    <div class="mi-sep"></div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Koszyk nie przelicza rabatu B2B</div>
+              <div class="kk-meta"><span class="sev crit"><span class="d"></span>krytyczna</span><span class="kk-id">#DEF-042</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="due over"><svg class="icon"><use href="#i-clock"/></svg>po terminie</span></div>
+                <span class="kk-av">MN</span>
+              </div>
+            </div>
+
+            <div class="kanban-card">
+              <div class="kk-head">
+                <span class="ttype task"><svg class="icon"><use href="#i-check-circle"/></svg>zadanie</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu" style="display:none;">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Zaktualizować dokumentację logowania SSO</div>
+              <div class="kk-meta"><span class="sev-none">bez wagi</span><span class="kk-id">#TASK-048</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="due"><svg class="icon"><use href="#i-clock"/></svg>29.07</span></div>
+                <span class="kk-av">MN</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kolumna: Przegląd -->
+          <div class="kanban-col">
+            <div class="kc-head">
+              <div class="kc-left">Przegląd <span class="cnt">2</span></div>
+              <button class="kc-add" title="Dodaj w tej kolumnie"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-plus"/></svg></button>
+            </div>
+
+            <div class="kanban-card">
+              <div class="kk-head">
+                <span class="ttype task"><svg class="icon"><use href="#i-check-circle"/></svg>zadanie</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu" style="display:none;">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Uzupełnić testy API dla /orders</div>
+              <div class="kk-meta"><span class="sev-none">bez wagi</span><span class="kk-id">#TASK-051</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="due"><svg class="icon"><use href="#i-clock"/></svg>30.07</span></div>
+                <span class="kk-av">AK</span>
+              </div>
+            </div>
+
+            <div class="kanban-card">
+              <div class="kk-head">
+                <span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu" style="display:none;">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Brak walidacji pola telefon w formularzu</div>
+              <div class="kk-meta"><span class="sev med"><span class="d"></span>średnia</span><span class="kk-id">#DEF-036</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="due"><svg class="icon"><use href="#i-clock"/></svg>31.07</span></div>
+                <span class="kk-av">MN</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kolumna: Gotowe -->
+          <div class="kanban-col">
+            <div class="kc-head">
+              <div class="kc-left">Gotowe <span class="cnt">2</span></div>
+              <button class="kc-add" title="Dodaj w tej kolumnie"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-plus"/></svg></button>
+            </div>
+
+            <div class="kanban-card">
+              <div class="kk-head">
+                <span class="ttype defect"><svg class="icon"><use href="#i-bug"/></svg>usterka</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu" style="display:none;">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Literówka w komunikacie walidacji NIP</div>
+              <div class="kk-meta"><span class="sev low"><span class="d"></span>niska</span><span class="kk-id">#DEF-037</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>zamknięte</span></div>
+                <span class="kk-av">AK</span>
+              </div>
+            </div>
+
+            <div class="kanban-card">
+              <div class="kk-head">
+                <span class="ttype task"><svg class="icon"><use href="#i-check-circle"/></svg>zadanie</span>
+                <div class="card-menu">
+                  <button class="icon-btn" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <div class="tf-menu" style="display:none;">
+                    <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                    <div class="mi"><!-- otwiera: Z02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</div>
+                    <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</div>
+                  </div>
+                </div>
+              </div>
+              <div class="kk-title">Przygotować zestaw regresji checkout</div>
+              <div class="kk-meta"><span class="sev-none">bez wagi</span><span class="kk-id">#TASK-045</span></div>
+              <div class="kk-foot">
+                <div class="kk-left"><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>zamknięte</span></div>
+                <span class="kk-av">AK</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="text-3 text-xs mt-md" style="display:flex;align-items:center;gap:6px;">
+          <svg class="icon icon-sm"><use href="#i-grid"/></svg>
+          Przeciągnij kartę, aby zmienić status · użyj „+" w nagłówku kolumny, aby dodać zadanie w danym stanie.
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

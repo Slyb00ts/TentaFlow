@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty (Project Studio) · Mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  .grp { margin-bottom: 34px; }
+  .grp-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-2); font-weight: 800; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .grp-title .icon { color: var(--accent-1); }
+  .grp-title .ln { flex: 1; height: 1px; background: var(--border); margin-left: 6px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+</defs></svg>
+
+<div class="index-page">
+  <h1>Projekty · Project Studio</h1>
+  <p class="subtitle">Kompletny zestaw mockupów modułu „Projekty" — centralna przestrzeń projektu z bazą wiedzy (RAG), testami (manualne / UI / API / jednostkowe / wydajnościowe / bezpieczeństwa pisane przez agentów), dokumentacją, chatem, zadaniami, artefaktami i połączeniem z ML Studio. Zawiera też przeprojektowane, przyjazne UI tworzenia agentów. Motyw i komponenty spójne z <span class="mono">tentaflow-core/www</span>. Kliknij ekran, aby otworzyć.</p>
+
+  <div class="grp">
+    <div class="grp-title"><svg class="icon"><use href="#i-folder"/></svg>Projekt — rdzeń <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="p01-lista.html"><div class="id">P01</div><h3>Lista projektów</h3><p>Karty/tabela projektów, filtry, tworzenie (grant), menu Otwórz/Archiwizuj/Usuń/Eksport.</p></a>
+      <a class="index-card" href="p02-kreator.html"><div class="id">P02 · okno</div><h3>Kreator projektu</h3><p>Okno-kreator 3 kroki: Podstawy → Moduły → Zespół.</p></a>
+      <a class="index-card" href="p03-przeglad.html"><div class="id">P03</div><h3>Przegląd projektu</h3><p>Pulpit: KPI, trend pass-rate, aktywność, szybkie akcje, zakładki modułów.</p></a>
+      <a class="index-card" href="x03-czlonkowie.html"><div class="id">X03</div><h3>Członkowie</h3><p>Role per projekt, zaproszenia, transfer własności.</p></a>
+      <a class="index-card" href="x04-ustawienia.html"><div class="id">X04</div><h3>Ustawienia</h3><p>Podstawy, moduły, agenci projektu, tagi, retencja, usunięcie.</p></a>
+      <a class="index-card" href="x02-polaczenia-ml.html"><div class="id">X02</div><h3>Połączenia · ML Studio</h3><p>Podsumowanie projektu ML, „Utwórz projekt ML", mapa ról.</p></a>
+      <a class="index-card" href="g02-powiadomienia.html"><div class="id">G02</div><h3>Powiadomienia</h3><p>Panel dzwonka: przydziały, przebiegi, usterki, zatwierdzenia.</p></a>
+      <a class="index-card" href="g01-okno-usun.html"><div class="id">G01 · okno</div><h3>Potwierdzenie usunięcia</h3><p>Reużywalne okno danger z przepisaniem nazwy.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title"><svg class="icon"><use href="#i-book"/></svg>Wiedza (RAG) <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="w01-wiedza-zrodla.html"><div class="id">W01</div><h3>Źródła</h3><p>Dokumenty, URL, repo git, ZIP kodu, spec API — statusy ingestu, Odśwież, Anuluj.</p></a>
+      <a class="index-card" href="w02-dodaj-zrodlo.html"><div class="id">W02 · okno</div><h3>Dodaj źródło</h3><p>Wybór typu + formularze (dokument / git / spec API).</p></a>
+      <a class="index-card" href="w03-wiedza-szukaj.html"><div class="id">W03</div><h3>Przeszukaj</h3><p>Semantyczne wyszukiwanie z cytowaniami i podglądem.</p></a>
+      <a class="index-card" href="w04-wiedza-pliki.html"><div class="id">W04</div><h3>Pliki</h3><p>Drzewo repo + podgląd kodu z kolorowaniem.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="t01-przypadki.html"><div class="id">T01</div><h3>Przypadki</h3><p>Lista wszystkich typów, filtry, akcje zbiorcze, import CSV, generowanie.</p></a>
+      <a class="index-card" href="t02-edytor-manualny.html"><div class="id">T02</div><h3>Edytor manualny</h3><p>Kroki (akcja/oczekiwany rezultat), wersje, załączniki.</p></a>
+      <a class="index-card" href="t03-edytor-kod.html"><div class="id">T03</div><h3>Edytor kodu + AI</h3><p>Własny edytor z kolorowaniem i panelem AI (generuj/popraw/diff).</p></a>
+      <a class="index-card" href="t04-generuj.html"><div class="id">T04 · okno</div><h3>Generuj testy</h3><p>Kreator 3 kroki: Co → Z czego → Jak (agent + krytyk).</p></a>
+      <a class="index-card" href="t05-generowania.html"><div class="id">T05</div><h3>Generowania</h3><p>Lista + postęp agenta na żywo + przegląd/akceptacja wyników.</p></a>
+      <a class="index-card" href="t06-zestawy.html"><div class="id">T06</div><h3>Zestawy</h3><p>Lista + dwupanelowy edytor zestawu z kolejnością.</p></a>
+      <a class="index-card" href="t07-przebiegi.html"><div class="id">T07</div><h3>Przebiegi</h3><p>Lista wykonań, statusy, postęp, akcje.</p></a>
+      <a class="index-card" href="t08-nowy-przebieg.html"><div class="id">T08 · okno</div><h3>Nowy przebieg</h3><p>Typ, zestaw, środowisko, przypisania testerów / pula.</p></a>
+      <a class="index-card" href="t09-pulpit-testera.html"><div class="id">T09</div><h3>Pulpit testera</h3><p>Checklist wykonania: Pass/Fail/Blocked/Skip, zrzuty, zgłoś usterkę.</p></a>
+      <a class="index-card" href="t10-przebieg-auto.html"><div class="id">T10</div><h3>Przebieg auto/perf</h3><p>Live: macierz, log, watchdog, metryki wydajności.</p></a>
+      <a class="index-card" href="t11-przebieg-wyniki.html"><div class="id">T11</div><h3>Wyniki przebiegu</h3><p>Podsumowanie, artefakty, „z nieudanych", eksport, raport.</p></a>
+      <a class="index-card" href="t12-srodowiska.html"><div class="id">T12</div><h3>Środowiska</h3><p>CRUD + zatwierdzanie przez admina (kolejka).</p></a>
+      <a class="index-card" href="t13-harmonogramy.html"><div class="id">T13</div><h3>Harmonogramy</h3><p>Cykliczne przebiegi auto/perf.</p></a>
+      <a class="index-card" href="t14-raporty.html"><div class="id">T14</div><h3>Raporty</h3><p>Trend, wyniki, flaky, czas, pokrycie źródeł, usterki.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja · Chat · Zadania <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="d01-dokumenty.html"><div class="id">D01</div><h3>Dokumentacja</h3><p>Drzewo folderów + lista dokumentów, statusy, generowanie.</p></a>
+      <a class="index-card" href="d02-edytor-dokumentu.html"><div class="id">D02</div><h3>Edytor dokumentu</h3><p>Split markdown + „Popraw z agentem" (diff).</p></a>
+      <a class="index-card" href="c01-chat.html"><div class="id">C01</div><h3>Chat projektu</h3><p>Prywatne rozmowy, kontekst projektu, cytowania.</p></a>
+      <a class="index-card" href="z01-zadania.html"><div class="id">Z01</div><h3>Zadania</h3><p>Lista + kanban; taski i usterki.</p></a>
+      <a class="index-card" href="z02-zadanie.html"><div class="id">Z02 · okno</div><h3>Zadanie / usterka</h3><p>Panel edycji, powiązania, komentarze.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title"><svg class="icon"><use href="#i-bot"/></svg>Agenci — przyjazny kreator (UC3) <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="a01-agenci-lista.html"><div class="id">A01</div><h3>Lista agentów</h3><p>Galeria agentów z rolami, narzędziami, akcjami.</p></a>
+      <a class="index-card" href="a02-kreator-agenta.html"><div class="id">A02 · okno</div><h3>Kreator agenta</h3><p>3 kroki: Kim jest (persona + przykłady) → Co potrafi → Jak działa.</p></a>
+      <a class="index-card" href="a03-playground.html"><div class="id">A03</div><h3>Playground</h3><p>„Wypróbuj" agenta z podglądem iteracji na żywo.</p></a>
+      <a class="index-card" href="a04-asystent-budowy.html"><div class="id">A04 · okno</div><h3>Asystent budowy</h3><p>Wbudowany agent pomaga napisać agenta.</p></a>
+      <a class="index-card" href="a05-szablony-zespolow.html"><div class="id">A05 · okno</div><h3>Szablony zespołów</h3><p>Gotowe zespoły: pisarz + krytyk + nadzorca.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title"><svg class="icon"><use href="#i-layers"/></svg>Dokumenty projektowe <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="shared/SPEC_MOCKUPY.md"><div class="id">DOC</div><h3>SPEC_MOCKUPY.md</h3><p>Opis zawartości każdego ekranu.</p></a>
+      <a class="index-card" href="shared/BUILD_CONTRACT.md"><div class="id">DOC</div><h3>BUILD_CONTRACT.md</h3><p>Reguły spójności, sidebar, ikony.</p></a>
+      <a class="index-card" href="IMPLEMENTATION.md"><div class="id">DOC</div><h3>IMPLEMENTATION.md</h3><p>Przewodnik realizacji dla zespołu/agenta wykonawczego.</p></a>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

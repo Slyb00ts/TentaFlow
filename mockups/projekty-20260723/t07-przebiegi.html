@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Przebiegi: lista (T07)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  /* T07 — drobiazgi ekranowe (reszta z shared) */
+  @keyframes cardIn { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+  @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+  .subnav-wrap { overflow-x: auto; margin-bottom: 16px; }
+  .subnav { margin-bottom: 0; }
+
+  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .toolbar .filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .toolbar .filters .select { width: auto; min-width: 138px; padding-top: 6px; padding-bottom: 6px; }
+  .toolbar .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  /* wskaźnik „na żywo" */
+  .live-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 14px; font-size: 11px; font-weight: 700; background: rgba(96,165,250,0.12); color: var(--info); border: 1px solid rgba(96,165,250,0.3); }
+  .live-chip .d { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; animation: pulseDot 1.2s infinite; }
+
+  .table-wrap { overflow-x: auto; }
+  .runs-table td, .runs-table th { white-space: nowrap; }
+  .runs-table td.r-name { white-space: normal; min-width: 220px; }
+  .runs-table tr.running td { background: rgba(99,102,241,0.06); }
+  .runs-table td.r-act, .runs-table th.r-act { width: 40px; text-align: right; }
+
+  .r-id { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+  .r-name .tt { font-weight: 700; font-size: 12.5px; }
+
+  /* mały chip rodzaju testów obok typu przebiegu */
+  .k-chip { display: inline-block; margin-left: 4px; padding: 2px 7px; border-radius: 10px; font-size: 10px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; background: var(--bg-3); color: var(--text-3); border: 1px solid var(--border); }
+
+  /* status przebiegu — „w toku" (pulsujący) + „anulowany" */
+  .status-pill.run { color: var(--accent-2); background: var(--accent-glow); }
+  .status-pill.run::before { animation: pulseDot 1.2s infinite; }
+  .status-pill.cancel { color: var(--text-3); background: var(--bg-3); }
+  .status-pill.cancel::before { box-shadow: none; opacity: .5; }
+
+  /* pasek postępu w wierszu */
+  .run-progress { display: flex; align-items: center; gap: 8px; min-width: 148px; }
+  .run-progress .progress { flex: 1; }
+  .run-progress .pct { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; width: 34px; text-align: right; }
+  .progress.err > span   { background: var(--danger); }
+  .progress.warn > span  { background: var(--warning); }
+  .progress.cancel > span{ background: var(--text-3); opacity: .7; }
+
+  /* wynik x/y */
+  .mini-res { display: inline-flex; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .mini-res .p { color: var(--success); }
+  .mini-res .f { color: var(--danger); }
+  .mini-res .b { color: var(--warning); }
+  .mini-res .muted { color: var(--text-3); font-weight: 600; }
+  .mini-res .icon { width: 13px; height: 13px; }
+
+  /* wyzwolenie */
+  .trig { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-2); }
+  .trig .icon { width: 13px; height: 13px; color: var(--text-3); }
+
+  /* środowisko */
+  .env .e-name { font-size: 12px; font-weight: 700; }
+  .env .e-sub { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+
+  /* start / koniec */
+  .when { font-size: 11.5px; color: var(--text-2); }
+  .when .end { color: var(--text-3); }
+
+  /* kto */
+  .who { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--text-2); }
+  .who .av-mini.sys { background: var(--bg-3); color: var(--accent-2); border: 1px solid var(--border); }
+  .who .av-mini.sys .icon { width: 12px; height: 12px; }
+
+  /* menu wiersza (⋯) */
+  .row-menu { position: relative; display: inline-block; }
+  .tf-menu { position: absolute; top: 32px; right: 0; width: 200px; background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); box-shadow: var(--shadow-lg); z-index: 30; padding: 4px; animation: cardIn .16s ease; }
+  .tf-menu .mi { display: flex; align-items: center; gap: 9px; padding: 8px 10px; font-size: 12px; color: var(--text-2); border-radius: var(--radius-sm); cursor: pointer; }
+  .tf-menu .mi:hover { background: var(--bg-3); color: var(--text); }
+  .tf-menu .mi .icon { width: 14px; height: 14px; }
+  .tf-menu .mi.danger { color: var(--danger); }
+  .tf-menu .mi.danger:hover { background: rgba(239,68,68,0.12); }
+  .tf-menu .mi-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+
+  .table-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; font-size: 11.5px; color: var(--text-3); flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">T07</span>
+    <h2>Przebiegi: lista</h2>
+    <div class="desc">Historia i bieżące uruchomienia testów w projekcie: różne typy i statusy, pasek postępu na żywo, kto i czym wyzwolił oraz akcje na każdym przebiegu.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Testy · Przebiegi</span>
+        </div>
+
+        <!-- Nagłówek projektu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Portal Klienta B2B <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Testy, dokumentacja i baza wiedzy dla portalu zamówień B2B · utworzono 12.05.2026</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-users"/></svg>6 członków</span>
+              <span class="chip info"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Testy + Dokumentacja</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Menedżer</b></span>
+              <span class="chip info"><svg class="icon"><use href="#i-play"/></svg>243 przebiegi</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+
+        <!-- Zakładki modułów -->
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab"><svg class="icon"><use href="#i-check-square"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <!-- Pod-nawigacja modułu Testy -->
+        <div class="subnav-wrap">
+          <div class="segmented subnav">
+            <button><svg class="icon"><use href="#i-clipboard"/></svg>Przypadki</button>
+            <button><svg class="icon"><use href="#i-layers"/></svg>Zestawy</button>
+            <button class="active"><svg class="icon"><use href="#i-play"/></svg>Przebiegi</button>
+            <button><svg class="icon"><use href="#i-sparkles"/></svg>Generowania</button>
+            <button><svg class="icon"><use href="#i-server"/></svg>Środowiska</button>
+            <button><svg class="icon"><use href="#i-calendar"/></svg>Harmonogramy</button>
+            <button><svg class="icon"><use href="#i-chart"/></svg>Raporty</button>
+          </div>
+        </div>
+
+        <!-- Pasek narzędzi: szukaj + filtry + akcje -->
+        <div class="toolbar">
+          <div class="filters">
+            <div class="search-box" style="min-width:240px;">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input type="text" placeholder="Szukaj przebiegu, zestawu lub ID…" value="">
+            </div>
+            <select class="select" aria-label="Filtr typu">
+              <option>Typ: wszystkie</option>
+              <option>Manualny</option>
+              <option>Automatyczny</option>
+            </select>
+            <select class="select" aria-label="Filtr statusu">
+              <option>Status: wszystkie</option>
+              <option>W toku</option>
+              <option>Zaliczony</option>
+              <option>Częściowy</option>
+              <option>Anulowany</option>
+              <option>Błąd</option>
+            </select>
+            <select class="select" aria-label="Filtr wyzwolenia">
+              <option>Wyzwolenie: wszystkie</option>
+              <option>Ręczne</option>
+              <option>Harmonogram</option>
+            </select>
+          </div>
+          <div class="actions">
+            <span class="live-chip"><span class="d"></span>na żywo</span>
+            <button class="btn"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież</button>
+            <button class="btn btn-primary"><!-- otwiera: T08 --><svg class="icon"><use href="#i-plus"/></svg>Nowy przebieg</button>
+          </div>
+        </div>
+
+        <!-- Tabela przebiegów -->
+        <div class="table-wrap">
+          <table class="tf-table runs-table">
+            <thead>
+              <tr>
+                <th>Przebieg</th>
+                <th>Zestaw</th>
+                <th>Typ</th>
+                <th>Środowisko</th>
+                <th>Status</th>
+                <th>Postęp</th>
+                <th>Wynik</th>
+                <th>Wyzwolenie</th>
+                <th>Start / koniec</th>
+                <th>Kto</th>
+                <th class="r-act"></th>
+              </tr>
+            </thead>
+            <tbody>
+
+              <!-- #243 — w toku (running, na żywo) -->
+              <tr class="running">
+                <td class="r-name"><div class="tt">Regresja checkout — sprint 24</div><div class="r-id">#243</div></td>
+                <td><span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Regresja checkout</span></td>
+                <td><span class="chip">manualny</span><span class="k-chip">ui</span></td>
+                <td><div class="env"><div class="e-name">Staging</div><div class="e-sub">web · staging.portalb2b.pl</div></div></td>
+                <td><span class="status-pill run">w toku</span></td>
+                <td><div class="run-progress"><div class="progress"><span style="width:45%"></span></div><span class="pct">45%</span></div></td>
+                <td><span class="mini-res"><span class="spin-sm"></span><span class="muted">8 / 18</span></span></td>
+                <td><span class="trig"><svg class="icon"><use href="#i-play"/></svg>ręcznie</span></td>
+                <td><div class="when">dziś 14:22<br><span class="end">trwa…</span></div></td>
+                <td><span class="who"><span class="av-mini">AK</span>Anna K.</span></td>
+                <td class="r-act">
+                  <div class="row-menu">
+                    <button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu">
+                      <div class="mi"><svg class="icon"><use href="#i-eye"/></svg>Otwórz</div>
+                      <div class="mi-sep"></div>
+                      <div class="mi danger"><svg class="icon"><use href="#i-stop"/></svg>Zatrzymaj przebieg</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- #242 — błąd: utracono kontakt z runnerem -->
+              <tr>
+                <td class="r-name"><div class="tt">Nightly smoke API</div><div class="r-id">#242</div></td>
+                <td><span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Smoke API</span></td>
+                <td><span class="chip info">automatyczny</span><span class="k-chip">api</span></td>
+                <td><div class="env"><div class="e-name">Staging API</div><div class="e-sub">api · api.staging.portalb2b.pl</div></div></td>
+                <td><span class="status-pill err" title="Runner przestał odpowiadać — utracono kontakt">błąd</span></td>
+                <td><div class="run-progress"><div class="progress err"><span style="width:62%"></span></div><span class="pct">62%</span></div></td>
+                <td><span class="mini-res"><span class="p">12</span><span class="f">0</span><span class="muted">/ 20</span></span></td>
+                <td><span class="trig"><svg class="icon"><use href="#i-calendar"/></svg>harmonogram</span></td>
+                <td><div class="when">dziś 03:00<br><span class="end">— przerwany 03:07</span></div></td>
+                <td><span class="who"><span class="av-mini sys"><svg class="icon"><use href="#i-clock"/></svg></span>Harmonogram</span></td>
+                <td class="r-act"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></td>
+              </tr>
+
+              <!-- #241 — częściowy (passed z failami) -->
+              <tr>
+                <td class="r-name"><div class="tt">Pełna regresja przed release</div><div class="r-id">#241</div></td>
+                <td><span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Pełna regresja</span></td>
+                <td><span class="chip info">automatyczny</span><span class="k-chip">ui</span></td>
+                <td><div class="env"><div class="e-name">Staging</div><div class="e-sub">web · staging.portalb2b.pl</div></div></td>
+                <td><span class="status-pill warn">częściowy</span></td>
+                <td><div class="run-progress"><div class="progress warn"><span style="width:100%"></span></div><span class="pct">100%</span></div></td>
+                <td><span class="mini-res"><span class="p">58</span><span class="f">2</span><span class="muted">/ 60</span></span></td>
+                <td><span class="trig"><svg class="icon"><use href="#i-play"/></svg>ręcznie</span></td>
+                <td><div class="when">wczoraj 22:04<br><span class="end">— 22:41 (37 min)</span></div></td>
+                <td><span class="who"><span class="av-mini">AK</span>Anna K.</span></td>
+                <td class="r-act"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></td>
+              </tr>
+
+              <!-- #240 — zaliczony (manualny, produkcja) -->
+              <tr>
+                <td class="r-name"><div class="tt">Regresja checkout (produkcja)</div><div class="r-id">#240</div></td>
+                <td><span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Regresja checkout</span></td>
+                <td><span class="chip">manualny</span><span class="k-chip">ui</span></td>
+                <td><div class="env"><div class="e-name">Produkcja</div><div class="e-sub">web · portalb2b.pl</div></div></td>
+                <td><span class="status-pill ok">zaliczony</span></td>
+                <td><div class="run-progress"><div class="progress"><span style="width:100%"></span></div><span class="pct">100%</span></div></td>
+                <td><span class="mini-res"><span class="p">18</span><span class="muted">/ 18</span></span></td>
+                <td><span class="trig"><svg class="icon"><use href="#i-play"/></svg>ręcznie</span></td>
+                <td><div class="when">wczoraj 16:10<br><span class="end">— 17:35 (1 h 25 min)</span></div></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td class="r-act"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></td>
+              </tr>
+
+              <!-- #239 — zaliczony (automatyczny, perf) -->
+              <tr>
+                <td class="r-name"><div class="tt">Wydajność zamówień · 200 RPS</div><div class="r-id">#239</div></td>
+                <td><span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Wydajność zamówień</span></td>
+                <td><span class="chip info">automatyczny</span><span class="k-chip">perf</span></td>
+                <td><div class="env"><div class="e-name">Staging API</div><div class="e-sub">api · api.staging.portalb2b.pl</div></div></td>
+                <td><span class="status-pill ok">zaliczony</span></td>
+                <td><div class="run-progress"><div class="progress"><span style="width:100%"></span></div><span class="pct">100%</span></div></td>
+                <td><span class="mini-res"><svg class="icon" style="color:var(--success)"><use href="#i-gauge"/></svg><span class="p">p95 412 ms</span></span></td>
+                <td><span class="trig"><svg class="icon"><use href="#i-play"/></svg>ręcznie</span></td>
+                <td><div class="when">wczoraj 11:20<br><span class="end">— 11:35 (15 min)</span></div></td>
+                <td><span class="who"><span class="av-mini">AK</span>Anna K.</span></td>
+                <td class="r-act"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></td>
+              </tr>
+
+              <!-- #238 — anulowany -->
+              <tr>
+                <td class="r-name"><div class="tt">Smoke API (przerwany ręcznie)</div><div class="r-id">#238</div></td>
+                <td><span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Smoke API</span></td>
+                <td><span class="chip info">automatyczny</span><span class="k-chip">api</span></td>
+                <td><div class="env"><div class="e-name">Staging API</div><div class="e-sub">api · api.staging.portalb2b.pl</div></div></td>
+                <td><span class="status-pill cancel">anulowany</span></td>
+                <td><div class="run-progress"><div class="progress cancel"><span style="width:30%"></span></div><span class="pct">30%</span></div></td>
+                <td><span class="mini-res"><span class="p">6</span><span class="muted">/ 20</span></span></td>
+                <td><span class="trig"><svg class="icon"><use href="#i-calendar"/></svg>harmonogram</span></td>
+                <td><div class="when">21.07 03:00<br><span class="end">— anulowany 03:02</span></div></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td class="r-act"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></td>
+              </tr>
+
+              <!-- #237 — częściowy (bezpieczeństwo) -->
+              <tr>
+                <td class="r-name"><div class="tt">Testy bezpieczeństwa API</div><div class="r-id">#237</div></td>
+                <td><span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Testy bezpieczeństwa</span></td>
+                <td><span class="chip info">automatyczny</span><span class="k-chip">security</span></td>
+                <td><div class="env"><div class="e-name">Staging</div><div class="e-sub">web · staging.portalb2b.pl</div></div></td>
+                <td><span class="status-pill warn">częściowy</span></td>
+                <td><div class="run-progress"><div class="progress warn"><span style="width:100%"></span></div><span class="pct">100%</span></div></td>
+                <td><span class="mini-res"><span class="p">22</span><span class="f">3</span><span class="muted">/ 25</span></span></td>
+                <td><span class="trig"><svg class="icon"><use href="#i-play"/></svg>ręcznie</span></td>
+                <td><div class="when">21.07 15:40<br><span class="end">— 16:05 (25 min)</span></div></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td class="r-act"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></td>
+              </tr>
+
+            </tbody>
+          </table>
+        </div>
+
+        <div class="table-foot">
+          <span>Pokazano <b class="text-2">7</b> z <b class="text-2">243</b> przebiegów · <b class="text-2">1</b> w toku</span>
+          <div class="flex gap-sm align-center">
+            <button class="btn btn-sm btn-ghost" disabled><svg class="icon"><use href="#i-arrow-left"/></svg>Poprzednia</button>
+            <span class="text-3">strona 1 / 35</span>
+            <button class="btn btn-sm btn-ghost">Następna<svg class="icon"><use href="#i-chevron-r"/></svg></button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

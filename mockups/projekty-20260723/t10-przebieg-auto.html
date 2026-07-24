@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Przebieg auto/perf live (T10)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  /* Drobiazgi ekranowe T10 — reszta z shared CSS */
+  .run-ico { width: 52px; height: 52px; border-radius: var(--radius); background: var(--gradient-accent);
+    display: flex; align-items: center; justify-content: center; color: #fff; flex-shrink: 0; }
+  .run-ico .icon { width: 24px; height: 24px; }
+  .status-pill.running { color: var(--accent-2); background: var(--accent-glow); }
+  .status-pill.running::before { animation: blink 1.2s infinite; }
+  .run-matrix td.cell.fail { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.3); color: var(--danger); }
+  .run-matrix .cell-in { display: inline-flex; align-items: center; gap: 6px; justify-content: center; }
+  .run-matrix td.act { width: 44px; text-align: center; }
+  .row-menu { position: relative; display: inline-block; }
+  .icon-btn-sm { width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--bg-3); color: var(--text-2); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+  .icon-btn-sm:hover { color: var(--text); border-color: var(--border-hover); }
+  .icon-btn-sm .icon { width: 15px; height: 15px; }
+  .tf-menu { position: absolute; right: 0; top: calc(100% + 4px); background: var(--bg-2);
+    border: 1px solid var(--border-hover); border-radius: var(--radius-sm); box-shadow: var(--shadow-lg);
+    min-width: 200px; z-index: 30; padding: 5px; animation: cardIn 0.16s ease; }
+  .tf-menu button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 10px; background: transparent;
+    border: 0; color: var(--text-2); font: inherit; font-size: 12px; border-radius: var(--radius-sm); cursor: pointer; text-align: left; }
+  .tf-menu button:hover { background: var(--bg-3); color: var(--text); }
+  .tf-menu button.danger { color: var(--danger); }
+  .tf-menu button.danger:hover { background: rgba(239,68,68,0.12); }
+  .tf-menu .icon { width: 14px; height: 14px; }
+  .tf-menu .sep { height: 1px; background: var(--border); margin: 4px 2px; }
+  @keyframes cardIn { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+  .metric-live { color: var(--success); display: inline-flex; align-items: center; gap: 5px; }
+  .metric-live .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+    box-shadow: 0 0 6px currentColor; animation: blink 1.3s infinite; }
+  .kpi .spark { margin-top: 8px; }
+  .run-head-timer { display: flex; align-items: center; gap: 8px; }
+  .run-head-timer .mono { font-size: 16px; font-weight: 800; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+</defs></svg>
+
+<!-- =====================================================================
+     T10a — Przebieg AUTOMATYCZNY na żywo
+     ===================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">T10a</span>
+    <h2>Przebieg automatyczny — na żywo</h2>
+    <div class="desc">Monitor wykonania przebiegu auto: postęp, lista przypadków ze statusami inkrementalnymi, log na żywo i watchdog runnera.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Testy</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Przebiegi</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Przebieg #242 · Na żywo</span>
+        </div>
+
+        <!-- Zakładki modułów -->
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <!-- Pod-nav Testów -->
+        <div class="segmented" style="margin-bottom:20px; flex-wrap:wrap;">
+          <button><svg class="icon"><use href="#i-clipboard"/></svg>Przypadki</button>
+          <button><svg class="icon"><use href="#i-layers"/></svg>Zestawy</button>
+          <button class="active"><svg class="icon"><use href="#i-play"/></svg>Przebiegi</button>
+          <button><svg class="icon"><use href="#i-sparkles"/></svg>Generowania</button>
+          <button><svg class="icon"><use href="#i-globe"/></svg>Środowiska</button>
+          <button><svg class="icon"><use href="#i-calendar"/></svg>Harmonogramy</button>
+          <button><svg class="icon"><use href="#i-chart"/></svg>Raporty</button>
+        </div>
+
+        <!-- Nagłówek przebiegu -->
+        <div class="section-card">
+          <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
+            <div class="run-ico"><svg class="icon"><use href="#i-play"/></svg></div>
+            <div style="flex:1; min-width:260px;">
+              <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                <div style="font-size:18px; font-weight:800;">Przebieg #242 · Regresja Checkout</div>
+                <span class="status-pill running">na żywo</span>
+                <span class="chip"><svg class="icon"><use href="#i-zap"/></svg>automatyczny</span>
+              </div>
+              <div style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">
+                <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Zestaw: Regresja Checkout</span>
+                <span class="chip info"><svg class="icon"><use href="#i-globe"/></svg>Środowisko: Staging</span>
+                <span class="chip"><svg class="icon"><use href="#i-server"/></svg>Runner: rig24</span>
+                <span class="chip"><svg class="icon"><use href="#i-clock"/></svg>Wyzwolenie: manualne · Anna Kowalska</span>
+                <span class="chip accent">Twoja rola: Menedżer</span>
+              </div>
+              <div style="margin-top:14px;">
+                <div style="display:flex; justify-content:space-between; font-size:11.5px; color:var(--text-2); margin-bottom:6px;">
+                  <span><b style="color:var(--text)">1</b> / 6 zaliczone · 2 w toku · 2 oczekuje · <span style="color:var(--danger)">1 nieudany</span></span>
+                  <span class="mono">33%</span>
+                </div>
+                <div class="progress"><span style="width:33%;"></span></div>
+              </div>
+            </div>
+            <div style="display:flex; flex-direction:column; align-items:flex-end; gap:12px;">
+              <div class="run-head-timer">
+                <span class="spin-sm"></span>
+                <span class="mono">12:47</span>
+                <span class="text-3 text-xs">elapsed</span>
+              </div>
+              <div style="display:flex; gap:8px;">
+                <button class="btn btn-danger"><!-- otwiera: G01 --><svg class="icon"><use href="#i-stop"/></svg>Stop</button>
+                <div class="row-menu">
+                  <button class="icon-btn-sm" aria-label="Więcej akcji przebiegu"><svg class="icon"><use href="#i-more"/></svg></button>
+                  <!-- menu zwinięte; przykład rozwinięcia widoczny przy wierszu macierzy niżej -->
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Watchdog -->
+        <div class="banner warn">
+          <svg class="icon icon-lg"><use href="#i-alert"/></svg>
+          <div class="b-text"><b>Runner nie odpowiada od 6 s</b> — sprawdzam połączenie z rig24. Jeśli heartbeat nie wróci w ciągu 30 s, przebieg zostanie oznaczony jako <b>error</b>, a niedokończone przypadki wrócą do kolejki.</div>
+          <button class="btn btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Sprawdź teraz</button>
+        </div>
+
+        <!-- Macierz wykonania -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-grid"/></svg>Wykonanie przypadków</div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="run-matrix">
+              <thead>
+                <tr>
+                  <th style="min-width:280px;">Przypadek</th>
+                  <th>Status</th>
+                  <th class="num-r">Czas</th>
+                  <th class="act"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="rowhead">Checkout — płatność kartą<span class="sub">ui · Playwright</span></td>
+                  <td><span class="status-pill running">w toku</span></td>
+                  <td class="num-r mono">—</td>
+                  <td class="act">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje przypadku"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="rowhead">Checkout — płatność BLIK<span class="sub">ui · Playwright</span></td>
+                  <td><span class="status-pill running">w toku</span></td>
+                  <td class="num-r mono">—</td>
+                  <td class="act">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje przypadku"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="rowhead">Logowanie SSO<span class="sub">ui · Playwright</span></td>
+                  <td><span class="status-pill ok">zaliczony</span></td>
+                  <td class="num-r mono">2,22 s</td>
+                  <td class="act">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje przypadku"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="rowhead">Koszyk — przeliczanie rabatu<span class="sub">ui · Playwright</span></td>
+                  <td><span class="status-pill err">nieudany</span></td>
+                  <td class="num-r mono">0,72 s</td>
+                  <td class="act">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje przypadku"><svg class="icon"><use href="#i-more"/></svg></button>
+                      <!-- Przykład otwartego menu akcji per-wiersz (przebieg w toku jest niemutowalny) -->
+                      <div class="tf-menu">
+                        <button><svg class="icon"><use href="#i-eye"/></svg>Podgląd logu i zrzutu</button>
+                        <button><!-- otwiera: Z02 --><svg class="icon"><use href="#i-bug"/></svg>Zgłoś usterkę</button>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="rowhead">Rejestracja konta<span class="sub">ui · Playwright</span></td>
+                  <td><span class="status-pill">oczekuje</span></td>
+                  <td class="num-r mono">—</td>
+                  <td class="act">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje przypadku"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="rowhead">Wylogowanie<span class="sub">ui · Playwright</span></td>
+                  <td><span class="status-pill">oczekuje</span></td>
+                  <td class="num-r mono">—</td>
+                  <td class="act">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje przypadku"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="flex gap-lg mt-md" style="font-size:11px; color:var(--text-3); flex-wrap:wrap;">
+            <span class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:2px;background:rgba(34,197,94,0.35);display:inline-block;"></span>zaliczony</span>
+            <span class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:2px;background:var(--accent-glow);display:inline-block;"></span>w toku</span>
+            <span class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:2px;background:rgba(239,68,68,0.35);display:inline-block;"></span>nieudany</span>
+            <span class="flex align-center gap-sm"><span style="width:10px;height:10px;border-radius:2px;background:var(--bg-3);display:inline-block;"></span>oczekuje</span>
+          </div>
+        </div>
+
+        <!-- Log na żywo -->
+        <div class="section-card" style="margin-bottom:0;">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-terminal"/></svg>Log na żywo</div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span class="chip"><span class="dot" style="color:var(--success)"></span>auto-scroll</span>
+              <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-download"/></svg>Pobierz log</button>
+            </div>
+          </div>
+          <div class="live-log">
+<span class="ts">12:47:02</span> runner ▸ start suite "Regresja Checkout" (6 przypadków)
+<span class="ts">12:47:04</span> <span class="run">RUN </span> logowanie_sso …
+<span class="ts">12:47:08</span> <span class="ok">PASS</span> logowanie_sso 2.22s
+<span class="ts">12:47:11</span> <span class="run">RUN </span> koszyk_rabat …
+<span class="ts">12:47:19</span> <span class="warn">FAIL</span> koszyk_rabat 0.72s — AssertionError: oczekiwano 90.00 zł, otrzymano 100.00 zł
+<span class="ts">12:47:19</span>        └─ zrzut: run-242/koszyk_rabat.png · trace zapisany
+<span class="ts">12:47:21</span> <span class="run">RUN </span> checkout_card_payment …
+<span class="ts">12:47:22</span> <span class="run">RUN </span> checkout_blik …
+<span class="ts">12:47:24</span> <span class="warn">WARN</span> heartbeat runnera rig24 opóźniony (6s) — ponawiam nasłuch
+<span class="cursor"></span>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- =====================================================================
+     T10b — Przebieg WYDAJNOŚCIOWY na żywo (metryki)
+     ===================================================================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">T10b</span>
+    <h2>Przebieg wydajnościowy — na żywo (metryki)</h2>
+    <div class="desc">Monitor przebiegu perf: live metryki (RPS, p90, p99, błędy) z iskierkami, mini-wykres przepustowości, tabela endpointów i log obciążenia.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Testy</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Przebiegi</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Przebieg #243 · Na żywo</span>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <div class="segmented" style="margin-bottom:20px; flex-wrap:wrap;">
+          <button><svg class="icon"><use href="#i-clipboard"/></svg>Przypadki</button>
+          <button><svg class="icon"><use href="#i-layers"/></svg>Zestawy</button>
+          <button class="active"><svg class="icon"><use href="#i-play"/></svg>Przebiegi</button>
+          <button><svg class="icon"><use href="#i-sparkles"/></svg>Generowania</button>
+          <button><svg class="icon"><use href="#i-globe"/></svg>Środowiska</button>
+          <button><svg class="icon"><use href="#i-calendar"/></svg>Harmonogramy</button>
+          <button><svg class="icon"><use href="#i-chart"/></svg>Raporty</button>
+        </div>
+
+        <!-- Nagłówek przebiegu perf -->
+        <div class="section-card">
+          <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
+            <div class="run-ico"><svg class="icon"><use href="#i-gauge"/></svg></div>
+            <div style="flex:1; min-width:260px;">
+              <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                <div style="font-size:18px; font-weight:800;">Przebieg #243 · Wydajność API zamówień</div>
+                <span class="status-pill running">na żywo</span>
+                <span class="chip warning"><svg class="icon"><use href="#i-zap"/></svg>wydajnościowy</span>
+              </div>
+              <div style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">
+                <span class="chip"><svg class="icon"><use href="#i-target"/></svg>Scenariusz: Rampa do 200 VU</span>
+                <span class="chip info"><svg class="icon"><use href="#i-globe"/></svg>Środowisko: Staging</span>
+                <span class="chip"><svg class="icon"><use href="#i-server"/></svg>Runner: rig24-perf</span>
+                <span class="chip"><svg class="icon"><use href="#i-calendar"/></svg>Wyzwolenie: harmonogram „Nocna wydajność"</span>
+                <span class="chip accent">Twoja rola: Menedżer</span>
+              </div>
+              <div style="margin-top:14px;">
+                <div style="display:flex; justify-content:space-between; font-size:11.5px; color:var(--text-2); margin-bottom:6px;">
+                  <span>Faza obciążenia: <b style="color:var(--text)">03:20</b> / 10:00 · 168 / 200 VU aktywnych</span>
+                  <span class="mono">33%</span>
+                </div>
+                <div class="progress"><span style="width:33%;"></span></div>
+              </div>
+            </div>
+            <div style="display:flex; flex-direction:column; align-items:flex-end; gap:12px;">
+              <div class="run-head-timer">
+                <span class="spin-sm"></span>
+                <span class="mono">03:20</span>
+                <span class="text-3 text-xs">elapsed</span>
+              </div>
+              <div style="display:flex; gap:8px;">
+                <button class="btn btn-danger"><!-- otwiera: G01 --><svg class="icon"><use href="#i-stop"/></svg>Stop</button>
+                <div class="row-menu">
+                  <button class="icon-btn-sm" aria-label="Więcej akcji przebiegu"><svg class="icon"><use href="#i-more"/></svg></button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Faza rampy -->
+        <div class="banner info">
+          <svg class="icon icon-lg"><use href="#i-trend"/></svg>
+          <div class="b-text"><b>Faza: rampa do 200 VU</b> (03:20 / 10:00). Metryki stabilizują się po fazie rozgrzewki — pierwsze 60 s (rozgrzewka) liczone jest osobno.</div>
+          <span class="chip"><span class="dot" style="color:var(--warning)"></span>rozgrzewka zakończona</span>
+        </div>
+
+        <!-- Live metryki -->
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-zap"/></svg>RPS <span class="metric-live"><span class="dot"></span></span></div>
+            <div class="value">1 842 <span class="small">żąd./s</span></div>
+            <svg class="sparkline spark" viewBox="0 0 90 24" preserveAspectRatio="none">
+              <polyline points="0,20 12,18 24,15 36,16 48,11 60,9 72,7 90,6" stroke="var(--success)"/>
+            </svg>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-clock"/></svg>Latencja p90 <span class="metric-live"><span class="dot"></span></span></div>
+            <div class="value">218 <span class="small">ms</span></div>
+            <svg class="sparkline spark" viewBox="0 0 90 24" preserveAspectRatio="none">
+              <polyline points="0,10 12,11 24,9 36,12 48,10 60,13 72,11 90,12" stroke="var(--accent-2)"/>
+            </svg>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-gauge"/></svg>Latencja p99 <span class="metric-live"><span class="dot"></span></span></div>
+            <div class="value">512 <span class="small">ms</span></div>
+            <svg class="sparkline spark" viewBox="0 0 90 24" preserveAspectRatio="none">
+              <polyline points="0,14 12,12 24,13 36,10 48,9 60,7 72,8 90,6" stroke="var(--warning)"/>
+            </svg>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-alert"/></svg>Błędy <span class="metric-live"><span class="dot"></span></span></div>
+            <div class="value">0,7<span class="small">%</span></div>
+            <svg class="sparkline spark" viewBox="0 0 90 24" preserveAspectRatio="none">
+              <polyline points="0,22 12,21 24,20 36,19 48,18 60,15 72,14 90,12" stroke="var(--danger)"/>
+            </svg>
+          </div>
+        </div>
+
+        <!-- Mini-wykres przepustowości -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-trend"/></svg>Przepustowość i błędy — ostatnie 60 s</div>
+            <div class="chart-legend">
+              <span class="lg"><span class="sw" style="background:var(--success)"></span>RPS</span>
+              <span class="lg"><span class="sw" style="background:var(--danger)"></span>błędy %</span>
+            </div>
+          </div>
+          <svg class="chart-svg" viewBox="0 0 480 140" preserveAspectRatio="none" style="height:140px;">
+            <line class="gridline" x1="0" y1="35" x2="480" y2="35"/>
+            <line class="gridline" x1="0" y1="70" x2="480" y2="70"/>
+            <line class="gridline" x1="0" y1="105" x2="480" y2="105"/>
+            <polyline points="0,110 40,102 80,96 120,90 160,84 200,74 240,70 280,60 320,54 360,48 400,42 440,38 480,36" fill="none" stroke="#22c55e" stroke-width="2.5"/>
+            <polyline points="0,128 40,126 80,127 120,124 160,125 200,122 240,120 280,118 320,116 360,112 400,110 440,108 480,106" fill="none" stroke="#ef4444" stroke-width="2" stroke-dasharray="4 3"/>
+          </svg>
+        </div>
+
+        <!-- Tabela endpointów (tf-table poza paddingiem karty) -->
+        <div style="margin-bottom:16px;">
+          <div class="section-card-head" style="margin-bottom:12px;">
+            <div class="title"><svg class="icon"><use href="#i-server"/></svg>Endpointy pod obciążeniem</div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-download"/></svg>Eksport metryk</button>
+            </div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="tf-table results-table">
+              <thead>
+                <tr>
+                  <th>Endpoint</th>
+                  <th>Metoda</th>
+                  <th class="num-r">Żądania</th>
+                  <th class="num-r">RPS</th>
+                  <th class="num-r">p90</th>
+                  <th class="num-r">p99</th>
+                  <th class="num-r">Błędy</th>
+                  <th style="width:44px;"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="mono">/api/products</td>
+                  <td><span class="chip info">GET</span></td>
+                  <td class="num-r">42 310</td>
+                  <td class="num-r best">620</td>
+                  <td class="num-r">142 ms</td>
+                  <td class="num-r">260 ms</td>
+                  <td class="num-r">0,1%</td>
+                  <td class="center">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje endpointu"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mono">/api/products/{id}</td>
+                  <td><span class="chip info">GET</span></td>
+                  <td class="num-r">28 004</td>
+                  <td class="num-r">410</td>
+                  <td class="num-r">165 ms</td>
+                  <td class="num-r">300 ms</td>
+                  <td class="num-r">0,2%</td>
+                  <td class="center">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje endpointu"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mono">/api/cart</td>
+                  <td><span class="chip accent">POST</span></td>
+                  <td class="num-r">15 220</td>
+                  <td class="num-r">220</td>
+                  <td class="num-r">240 ms</td>
+                  <td class="num-r">520 ms</td>
+                  <td class="num-r">0,9%</td>
+                  <td class="center">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje endpointu"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mono">/api/checkout</td>
+                  <td><span class="chip accent">POST</span></td>
+                  <td class="num-r">9 880</td>
+                  <td class="num-r">140</td>
+                  <td class="num-r">380 ms</td>
+                  <td class="num-r" style="color:var(--danger); font-weight:800;">910 ms</td>
+                  <td class="num-r" style="color:var(--danger); font-weight:800;">2,4%</td>
+                  <td class="center">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje endpointu"><svg class="icon"><use href="#i-more"/></svg></button>
+                      <!-- Przebieg perf w toku jest niemutowalny — endpointy wynikają ze skryptu Locust -->
+                      <div class="tf-menu">
+                        <button><svg class="icon"><use href="#i-chart"/></svg>Szczegóły metryk</button>
+                        <button><!-- otwiera: Z02 --><svg class="icon"><use href="#i-bug"/></svg>Zgłoś usterkę wydajności</button>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mono">/api/auth/login</td>
+                  <td><span class="chip accent">POST</span></td>
+                  <td class="num-r">12 100</td>
+                  <td class="num-r">175</td>
+                  <td class="num-r">190 ms</td>
+                  <td class="num-r">410 ms</td>
+                  <td class="num-r">0,3%</td>
+                  <td class="center">
+                    <div class="row-menu">
+                      <button class="icon-btn-sm" aria-label="Akcje endpointu"><svg class="icon"><use href="#i-more"/></svg></button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Log obciążenia -->
+        <div class="section-card" style="margin-bottom:0;">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-terminal"/></svg>Log obciążenia</div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span class="chip"><span class="dot" style="color:var(--success)"></span>auto-scroll</span>
+              <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-download"/></svg>Pobierz log</button>
+            </div>
+          </div>
+          <div class="live-log">
+<span class="ts">03:19:52</span> perf ▸ rampa VU: 152 → 160 aktywnych
+<span class="ts">03:19:58</span> perf ▸ rampa VU: 160 → 168 aktywnych
+<span class="ts">03:20:00</span> <span class="ok">checkpoint</span> rps=1842 p90=218ms p99=512ms err=0.7%
+<span class="ts">03:20:01</span> <span class="run">GET </span> /api/products 200 (142ms) · 620 rps
+<span class="ts">03:20:01</span> <span class="run">POST</span> /api/cart 200 (240ms) · 220 rps
+<span class="ts">03:20:02</span> <span class="warn">WARN</span> /api/checkout p99=910ms · wzrost latencji
+<span class="ts">03:20:03</span> <span class="warn">ERR </span> POST /api/checkout 500 (timeout płatności) · udział błędów 2.4%
+<span class="ts">03:20:03</span>        └─ 24 żądania odrzucone w oknie 5s — kandydat na usterkę wydajności
+<span class="ts">03:20:04</span> <span class="run">POST</span> /api/auth/login 200 (190ms) · 175 rps
+<span class="cursor"></span>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
