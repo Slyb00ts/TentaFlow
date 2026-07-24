@@ -505,3 +505,63 @@ fn nvfp4_bm16_full_logits_audit() {
         _ => panic!("nieznany tryb audytu: {mode}"),
     }
 }
+
+/// Generuje `steps` tokenów greedy dla `batch` sekwencji jednym batchowym
+/// dekodem i zwraca kontynuację per lane.
+fn free_generate(model: &mut Model, prompts: &[Vec<u32>], steps: usize) -> Vec<Vec<u32>> {
+    let batch = prompts.len();
+    let params = vec![greedy_params(); batch];
+    let mut seqs = (0..batch).map(|_| model.new_seq()).collect::<Vec<_>>();
+    let initial = prefill_serial_batch(model, &mut seqs, prompts);
+    let vocab = initial.len() / batch;
+    let mut current = (0..batch)
+        .map(|lane| top2(&initial[lane * vocab..(lane + 1) * vocab]).0 as u32)
+        .collect::<Vec<_>>();
+    let mut ids = vec![Vec::with_capacity(steps); batch];
+    for step in 0..steps {
+        for lane in 0..batch {
+            ids[lane].push(current[lane]);
+        }
+        if step + 1 < steps {
+            let mut refs = seqs.iter_mut().collect::<Vec<_>>();
+            current = model
+                .batched_decode(&mut refs, &current, &params)
+                .expect("batchowy dekod");
+        }
+    }
+    for seq in &mut seqs {
+        model.release_seq(seq);
+    }
+    ids
+}
+
+/// Kafel BM32 nie ma zewnętrznej referencji pełnych logitów, więc parytet
+/// sprawdzamy strukturalnie: obie połowy kafla liczą to samo dla tych samych
+/// promptów, a lane 0..15 muszą zgadzać się z audytowanym kaflem BM16.
+#[test]
+#[ignore = "wymaga CUDA i lokalnego Bielika"]
+fn nvfp4_bm32_zgadza_sie_z_bm16_i_obiema_polowkami_kafla() {
+    if !Path::new(BIELIK_DIR).is_dir() {
+        eprintln!("pominięto: brak modelu Bielik");
+        return;
+    }
+    const STEPS_PARITY: usize = 32;
+    let prompts = read_prompts();
+    assert_eq!(prompts.len(), 16, "test zakłada 16 promptów bazowych");
+    let doubled: Vec<Vec<u32>> = prompts.iter().chain(prompts.iter()).cloned().collect();
+
+    let mut model = load_bielik(32, NvFp4CtLayoutPolicy::S0N64K128);
+    let wide = free_generate(&mut model, &doubled, STEPS_PARITY);
+    let narrow = free_generate(&mut model, &prompts, STEPS_PARITY);
+
+    for lane in 0..16 {
+        assert_eq!(
+            wide[lane], wide[lane + 16],
+            "połówki kafla BM32 rozjechały się na lane {lane}"
+        );
+        assert_eq!(
+            wide[lane], narrow[lane],
+            "BM32 rozjechał się z BM16 na lane {lane}"
+        );
+    }
+}
