@@ -154,6 +154,20 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **Split flash-decode: efektywne splity zależne od kontekstu (2026-07-25).**
+  `attn_decode_split` płacił prolog (redukcje q/k-norm, RoPE, append) w KAŻDYM
+  z 8 splitów per (seq, głowa) — przy ctx ~200 (grid 16×32×8 = 4096 bloków ×
+  ~1,5 µs prologu w falach) attention kosztowała 2,25 ms z 8,9 ms kroku B16.
+  Teraz `eff_splits = clamp(ceil(ctx/256), 1, n_splits)`; nadmiarowe bloki
+  publikują neutralny partial (m=-inf, l=0 — zero wagi w combine) i wychodzą
+  przed prologiem; przy ctx >= 256·n_splits chunking bitowo identyczny ze
+  stałym splitem. Pomiar Bielik decode-only C=16: **1 512 → 1 670 tok/s**
+  (TPOT 9,83 → 9,11 ms). ZMIERZONE PUŁAPKI infrastruktury: (1) --kv-pages
+  2048 przy auto-puli wag wypycha paczki FP8 poza preflight (7,0 GB vs 6,6) i
+  cicho gasi szybki prefill — C=32 wymaga kv-pages ~1536; (2) decode B=17..32
+  spada z kerneli bm16/B16 na generyczny dequant-GEMM: TPOT 58 ms przy B=32
+  (533 tok/s decode-only) — brakujący lever pod C>16: split n>16 na dwa
+  przebiegi bm16 albo prawdziwe kernele BM32 dla RowMajor.
 - ✅ **Batchowy sampler top-k: O(k²·V) → dwuprzebiegowy (2026-07-25).**
   Profil perf+nsys serve pod obciążeniem pokazał, że `topk_batched_f32`
   zjadał **10,08 ms na krok** (98,8% czasu GPU przy qwen3-0.6b: k=40 rund ×

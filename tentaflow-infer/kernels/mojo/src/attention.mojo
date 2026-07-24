@@ -559,7 +559,30 @@ def attn_decode_split[head_dim: Int, kv_dtype: DType](
     wid = tid // WARP_SIZE
     n_warps = Int(block_dim.x) // WARP_SIZE
     ctx_len = Int(seq_lens[seq])
-    chunk = (ctx_len + n_splits - 1) // n_splits
+    # Short contexts collapse to fewer effective splits (>= 256 tokens per
+    # split): the prologue (q/k norm reductions, RoPE, paged append) repeats
+    # per split block, so at ctx ~200 a fixed 8-way split pays 8x prologue
+    # for ~25-token attention chunks. Surplus split blocks publish a neutral
+    # partial (m = -inf, l = 0 — zero weight in the combine) and exit before
+    # the prologue; the surviving blocks each still perform the full benign
+    # duplicate append. At ctx >= 256 * n_splits the chunking (and rounding)
+    # is bit-identical to the fixed split.
+    var eff_splits = (ctx_len + 255) // 256
+    if eff_splits > n_splits:
+        eff_splits = n_splits
+    if eff_splits < 1:
+        eff_splits = 1
+    if split >= eff_splits:
+        parts_base = ((seq * n_q_heads + qh) * n_splits + split) * (head_dim + 2)
+        var pi = tid
+        while pi < head_dim:
+            parts[parts_base + pi] = 0.0
+            pi += Int(block_dim.x)
+        if tid == 0:
+            parts[parts_base + head_dim] = NEG_INF
+            parts[parts_base + head_dim + 1] = 0.0
+        return
+    chunk = (ctx_len + eff_splits - 1) // eff_splits
     start = split * chunk
     var end = start + chunk
     if end > ctx_len:
