@@ -10,8 +10,68 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-22.
+Ostatnia aktualizacja: 2026-07-24.
 
+- ✅ **Kernele BM32 NVFP4-CT: batchowy decode 17..32 (2026-07-24).** Batche
+  B=17..32 spadały z wyspecjalizowanych kafli na generyczny dequant-GEMM
+  (TPOT 58 ms, 533 tok/s decode-only przy B=32). Moduł
+  `kernels/mojo/src/nvfp4_ct_direct.mojo` (dawniej `nvfp4_ct_bm16.mojo`) ma
+  teraz drugi kafel fizyczny: `gemm_nvfp4_ct_direct_bm32_bn64_bk128`, BN64/BK128,
+  128 wątków, trzy etapy `cp.async` (39 936 B shared, 96-116 rejestrów, zero
+  spilli). Jeden dekod wagi w rejestrach zasila dwa kafle M16 przez podwójne
+  `ld_matrix` — odczyt wag na token spada o połowę względem dwóch przebiegów
+  BM16. Osiem wrapperów `gemm_nvfp4_ct_bm32_{qkv,o,gateup,down}_{m24,m32}`;
+  M24 obsługuje wyłącznie ścieżkę z tieringiem KV (bucket schedulera jest
+  potęgą dwójki, więc pure decode zawsze trafia w M32).
+  Routing w Ruście jest wspólny dla obu kafli: `nvfp4_ct_physical_m` mapuje
+  logiczne M4/M8/M16 → BM16 i M24/M32 → BM32, `gemm_nvfp4_ct_padded` dobiera
+  kafel N, wątki i głębokość potoku, a `record_batch_forward` liczy offsety
+  segmentów QKV/gate-up z fizycznego M, nie ze stałej 16. Bufory segmentowane
+  rosną do M32 dopiero od `cap >= 24`.
+  Bramki: golden Mojo BM32 8/8 wobec niezależnej referencji
+  `gemv_batch_nvfp4_f16_b16` (wszystkie cztery projekcje × M24/M32,
+  rel_l2 1,5-1,9e-05, top1 dokładne, ogon fizyczny wyzerowany, canary czyste);
+  `forge-kernels` golden 69/69 i `sampling` 8/8; nowy test
+  `nvfp4_bm32_zgadza_sie_z_bm16_i_obiema_polowkami_kafla` (32 kroki greedy na
+  16 realnych promptach p1024) — obie połówki kafla identyczne i zgodne z
+  audytowanym BM16; koherencja serve przy 32 równoległych requestach.
+  RTX 4090, wolne GPU, ten sam checkpoint Bielik NVFP4, ten sam klient
+  (`vllm bench serve`, obraz 0.25.1), `forge serve --max-active 32 --ctx 2048
+  --kv-pages 1536`:
+
+  | Scenariusz | C | FORGE przed | FORGE po | vLLM |
+  |---|--:|--:|--:|--:|
+  | decode-only in32/o256 (tok/s) | 16 | 1 670 | 1 635 | 2 332 |
+  | decode-only in32/o256 (tok/s) | 24 | — | 1 986 | 3 213 |
+  | decode-only in32/o256 (tok/s) | 32 | 533 | **2 493** | 4 139 |
+  | p1024/o128 (tok/s) | 16 | 656 | 659 | 756 |
+  | p1024/o128 (tok/s) | 24 | — | 666 | 813 |
+  | p1024/o128 (tok/s) | 32 | — | 746 | 853 |
+
+  TPOT median B=32 spadł z **58 ms do 12,01 ms** (decode-only), czyli 4,7×.
+  Mediana TTFT p1024 pozostaje mocną stroną FORGE: 208/198/208 ms wobec
+  577/617/633 ms vLLM przy C=16/24/32. Cel „przegonić vLLM we
+  współbieżności" NIE jest osiągnięty: na czystym decode vLLM ma 1,66×
+  (C=32), na p1024 1,14×. Uwaga metodologiczna: wcześniejsze liczby vLLM
+  (906 tok/s p1024 C=16) pochodzą z sesji, w której na GPU rezydowała
+  instancja tentaflow i `--gpu-memory-utilization 0.72`; pomiar z 2026-07-24
+  jest jedynym, w którym oba silniki mierzono tego samego dnia na wolnym GPU.
+  Wykonawczo sprawdzono wyłącznie CUDA/RTX 4090; źródła zachowują przenośny
+  fallback, ale AMD i Metal nie były uruchamiane.
+- ✅ **Deficyt puli wag dla paczek FP8 jest zgłaszany wprost (2026-07-24).**
+  `build_fp8_ffn` i `build_fp8_modular_auto` zwracają `Fp8PackOutcome`
+  (`Built` / `Unsupported` / `PoolShortfall { required, available }`) zamiast
+  `bool`, więc brak wsparcia sprzętu przestał być nieodróżnialny od zbyt małej
+  puli. `serve` loguje `WARN` z polami strukturalnymi i drukuje operatorowi
+  konkretną receptę: `KvPoolProbe` przeszukuje `kv_pool_bytes`, żeby podać
+  liczbę stron KV, których zwolnienie REALNIE pokrywa deficyt (średnia na
+  stronę zaniża wynik, bo slab każdej warstwy jest zaokrąglany osobno).
+  Zmierzone na pułapce z 2026-07-25: `--kv-pages 2048` daje
+  „wymagają 6,53 GiB, pula ma 6,16 GiB (brakuje 0,37 GiB) — zmniejsz
+  --kv-pages o co najmniej 80"; `--kv-pages 1968` buduje paczki za pierwszym
+  razem. Automatyczne przycinanie `--kv-pages` świadomie NIE zostało
+  zrobione: jawna wartość operatora jest wiążąca, a ciche zmniejszenie
+  pojemności KV zamieniłoby jedną niespodziankę na drugą.
 - ✅ **Auto C1 T128 dla hybrydowego NVFP4 (2026-07-22).** Brak
   `FORGE_HYBRID_PREFILL_CHUNK` wybiera chunk 128 wyłącznie dla gęstego qwen35
   z `d_state=128`, FFN NVFP4 GGUF, kompletem artefaktów T128 i NVIDIA warp32.
@@ -166,8 +226,8 @@ Ostatnia aktualizacja: 2026-07-22.
   2048 przy auto-puli wag wypycha paczki FP8 poza preflight (7,0 GB vs 6,6) i
   cicho gasi szybki prefill — C=32 wymaga kv-pages ~1536; (2) decode B=17..32
   spada z kerneli bm16/B16 na generyczny dequant-GEMM: TPOT 58 ms przy B=32
-  (533 tok/s decode-only) — brakujący lever pod C>16: split n>16 na dwa
-  przebiegi bm16 albo prawdziwe kernele BM32 dla RowMajor.
+  (533 tok/s decode-only). Obie pułapki są domknięte wpisami z 2026-07-24:
+  kernele BM32 dla NVFP4-CT oraz jawny raport deficytu puli wag.
 - ✅ **Batchowy sampler top-k: O(k²·V) → dwuprzebiegowy (2026-07-25).**
   Profil perf+nsys serve pod obciążeniem pokazał, że `topk_batched_f32`
   zjadał **10,08 ms na krok** (98,8% czasu GPU przy qwen3-0.6b: k=40 rund ×
