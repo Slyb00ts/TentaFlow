@@ -632,6 +632,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "flows_is_system",
             MigrationStep::Rust(flows_add_is_system_column),
         ),
+        (
+            119,
+            "project_studio_permissions",
+            MigrationStep::Rust(roles_add_project_studio_permissions),
+        ),
     ]
 }
 
@@ -3772,6 +3777,20 @@ fn roles_add_robot_permissions(conn: &Connection) -> Result<()> {
         &["org_admin", "org_operator"],
         &["robot.command", "robot.estop", "robot.telemetry"],
     )
+}
+
+// v119 — Project Studio ("Projekty"). Every org role may enter the module
+// (`project_studio.read` — per-project access is then gated by project
+// membership roles), while `project_studio.admin` (creator grants, viewing
+// projects outside membership, orphaned-project takeover) stays with
+// org_admin. Idempotent via `roles_add_permissions`.
+fn roles_add_project_studio_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator", "org_viewer", "dpo", "supervisor"],
+        &["project_studio.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin"], &["project_studio.admin"])
 }
 
 // F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table

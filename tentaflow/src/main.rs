@@ -290,6 +290,12 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy ML Studio: {}", e);
         return Err(e);
     }
+    // Project Studio ("Projekty") mirrors the same pattern: central registry in
+    // `data/projects.db` + per-project pools with an idle sweeper.
+    if let Err(e) = tentaflow_core::project_studio::init() {
+        error!("Blad inicjalizacji bazy Project Studio: {}", e);
+        return Err(e);
+    }
     match tentaflow_core::db::repository::ensure_default_core_sync_policies(&db) {
         Ok(n) if n > 0 => info!("Sync Ledger zasiał {} domyślnych polityk core", n),
         Err(e) => error!("Sync Ledger nie zasiał domyślnych polityk core: {}", e),
@@ -1094,6 +1100,10 @@ async fn run_server(args: Args) -> Result<()> {
     if let Err(e) = tentaflow_core::ml_studio::db::checkpoint_wal() {
         tracing::warn!("Checkpoint WAL ML Studio nieudany: {}", e);
     }
+    if let Err(e) = tentaflow_core::project_studio::db::checkpoint_wal() {
+        tracing::warn!("Checkpoint WAL Project Studio nieudany: {}", e);
+    }
+    tentaflow_core::project_studio::project_db::checkpoint_all();
 
     info!("Router zamkniety.");
     Ok(())

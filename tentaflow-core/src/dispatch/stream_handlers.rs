@@ -1562,6 +1562,138 @@ inventory::submit! {
 }
 
 // =============================================================================
+// ProjectStudioIngestStream — live progress of a Project Studio ingest job.
+// =============================================================================
+// The frontend subscribes via ApiBinary.subscribe('projectStudioIngestStreamRequest',
+// { projectId, jobId }). log_bus is reused: ingest::start_job emits
+// BusMessage::Line/End under key = job_id; the handler maps them to
+// ProjectStudioBody(IngestStreamChunk/IngestStreamEnd). Polling
+// IngestStatusRequest remains the source of truth for job state.
+
+fn project_studio_ingest_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let (project_id, job_id) = match req {
+        MessageBody::ProjectStudioBody(ProjectStudioPayload::IngestStreamRequest {
+            project_id,
+            job_id,
+        }) => (project_id, job_id),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    // IDOR guard: project_studio.read + project in the subscriber's org +
+    // real membership (or project_studio.admin — inspection outside
+    // membership) + the job MUST belong to this project (job_id is a
+    // process-global log_bus key; without this check any logged-in user who
+    // knows a job_id could watch someone else's ingest).
+    let Some(org) = ctx.org_context.as_ref() else {
+        let _ = push_end(&sub, None);
+        return;
+    };
+    if !org.has("project_studio.read") {
+        let _ = push_end(&sub, None);
+        return;
+    }
+    match crate::project_studio::repository::get_project(&org.org_id, &project_id) {
+        Ok(Some(_)) => {}
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    }
+    let is_member = matches!(
+        crate::project_studio::repository::member_role(&project_id, &org.user_id),
+        Ok(Some(_))
+    );
+    if !is_member && !org.has("project_studio.admin") {
+        let _ = push_end(&sub, None);
+        return;
+    }
+    let job_belongs = crate::project_studio::project_db::open(&project_id)
+        .ok()
+        .and_then(|pool| {
+            crate::project_studio::repository::get_ingest_job(&pool, &job_id)
+                .ok()
+                .flatten()
+        })
+        .is_some();
+    if !job_belongs {
+        let _ = push_end(&sub, None);
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match crate::deploy::log_bus::subscribe(&job_id) {
+            Some(r) => r,
+            None => {
+                // Channel closed — the job already finished. The frontend
+                // reconciles state via IngestStatusRequest.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let chunk = ProjectStudioPayload::IngestStreamChunk {
+                        job_id: line.deploy_id,
+                        kind: line.kind,
+                        phase: line.phase,
+                        line: line.line,
+                        progress_pct: line.progress_pct,
+                        ts_ms: line.ts_ms,
+                    };
+                    if push_chunk(&sub, MessageBody::ProjectStudioBody(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    deploy_id,
+                    final_status,
+                    error_message,
+                    ..
+                }) => {
+                    let error = if error_message.is_empty() {
+                        None
+                    } else {
+                        Some(error_message)
+                    };
+                    let end = ProjectStudioPayload::IngestStreamEnd {
+                        job_id: deploy_id,
+                        status: final_status,
+                        error,
+                    };
+                    let _ = push_end(&sub, Some(MessageBody::ProjectStudioBody(end)));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioIngestStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_ingest_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 

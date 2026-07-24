@@ -40,6 +40,7 @@ pub mod metrics;
 pub mod ml_studio;
 pub mod ml_studio_remote_import;
 pub mod model_metrics;
+pub mod project_studio;
 pub mod recorder;
 pub mod resume_token;
 pub mod robots;
