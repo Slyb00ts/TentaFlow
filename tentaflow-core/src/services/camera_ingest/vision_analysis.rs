@@ -4617,6 +4617,7 @@ mod tests {
             detect_ms_total: 0,
             failed_stages: 0,
             vehicles: Vec::new(),
+            submitted_at: std::time::Instant::now(),
         }
     }
 
