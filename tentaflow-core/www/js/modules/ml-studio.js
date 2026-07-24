@@ -3468,7 +3468,7 @@ async function loadDataPreview(pid) {
 function openRecogImportRecordingsModal(pid) {
   const modal = document.createElement('tf-modal');
   modal.setAttribute('variant', 'modal');
-  modal.setAttribute('size', 'lg');
+  modal.setAttribute('size', 'xl');
   modal.setAttribute('title', 'Import klatek z nagrań TentaVision');
 
   const body = document.createElement('div');
@@ -3571,9 +3571,11 @@ function openRecogImportRecordingsModal(pid) {
     return { chosen: chosen.length, clips, snaps, clipFrames, unknownClips, totalFrames: clipFrames + snaps };
   };
 
-  const checkCell = (on) => on
-    ? `<span class="tf-chip accent" style="padding:2px 6px;display:inline-flex">${sprite('check')}</span>`
-    : '<span style="display:inline-block;width:16px;height:16px;border:1.5px solid var(--border,#ccc);border-radius:4px"></span>';
+  // Visual-only selection indicator rendered as a real tf-* primitive. The
+  // multi-select is owned by `selected` and toggled by the table's row-click
+  // handler below, so the checkbox is pointer-events:none to avoid a double
+  // toggle (row-click bubbling AND a checkbox change) on the same click.
+  const checkCell = (on) => `<tf-checkbox ${on ? 'checked' : ''} style="pointer-events:none"></tf-checkbox>`;
 
   const updatePreflight = () => {
     const pf = preflight();
@@ -3864,7 +3866,7 @@ function openRecogImportRecordingsModal(pid) {
           <span id="ml-studio-rec-selcount" style="font-size:12px;color:var(--text-3,#888)"></span>
         </div>
         ${noRecordings && !state.sourceNodeId ? '<tf-alert tone="info" message="Brak nagrań TentaVision do zaimportowania."></tf-alert>' : ''}
-        <div id="ml-studio-rec-table-host"></div>
+        <div id="ml-studio-rec-table-host" style="overflow-x:auto"></div>
         <div style="display:flex;gap:24px;flex-wrap:wrap">
           <div>
             <div style="font-size:12px;font-weight:600;margin-bottom:4px">Klatki na sekundę (klipy)</div>
