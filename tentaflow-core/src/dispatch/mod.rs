@@ -1029,6 +1029,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "AgentRunEventsSubscribeRequest"
             }
             tentaflow_protocol::AgentsPayload::RunEvent(_) => "AgentRunEvent",
+            tentaflow_protocol::AgentsPayload::RunStartRequest(_) => "AgentRunStartRequest",
+            tentaflow_protocol::AgentsPayload::RunStartResponse(_) => "AgentRunStartResponse",
+            tentaflow_protocol::AgentsPayload::BuilderAssistRequest(_) => {
+                "AgentBuilderAssistRequest"
+            }
+            tentaflow_protocol::AgentsPayload::BuilderAssistResponse(_) => {
+                "AgentBuilderAssistResponse"
+            }
         },
         MessageBody::SyncConflictBody(p) => match p {
             tentaflow_protocol::SyncConflictPayload::ListRequest(_) => "SyncConflictsListRequest",

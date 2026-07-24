@@ -4314,6 +4314,46 @@ export const encode = {
   },
 
   /**
+   * MessageBody::AgentsBody(RunStartRequest) — UserSession. Starts a playground
+   * run for one agent with a free-form prompt. Response:
+   * AgentRunStartResponse { runId }. payload: { agentId, prompt }
+   */
+  agentRunStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentRunStartRequest(
+      String(payload.agentId ?? payload.agent_id ?? ''),
+      String(payload.prompt ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::AgentsBody(BuilderAssistRequest) — Admin. One turn of the
+   * agent-builder assistant. `messages` is the full chat transcript
+   * [{role:'user'|'assistant', content}]. Response: AgentBuilderAssistResponse
+   * { resultJson } where resultJson = {"reply", "proposal"|null}.
+   * payload: { messagesJson } or { messages }
+   */
+  agentBuilderAssistRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const messagesJson = typeof payload.messagesJson === 'string'
+      ? payload.messagesJson
+      : JSON.stringify(payload.messages ?? []);
+    const body = _wasm.encodeAgentBuilderAssistRequest(messagesJson);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::AgentsBody(RunEventsSubscribeRequest) — UserSession. Long-lived
    * stream of AgentRunEvent frames for a scope. payload: { scopeKind:
    * 'session'|'run', scopeId }. Use via ApiBinary.subscribe — the stream stays
@@ -4324,6 +4364,44 @@ export const encode = {
     const body = _wasm.encodeAgentRunEventsSubscribeRequest(
       String(payload.scopeKind ?? payload.scope_kind ?? 'session'),
       String(payload.scopeId ?? payload.scope_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::AgentsBody(RunReplyRequest) — UserSession. Odpowiedź operatora
+   * na pytanie agenta (core.ask_user). payload: { runId, questionId, answer }
+   */
+  agentRunReplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentRunReplyRequest(
+      String(payload.runId ?? payload.run_id ?? ''),
+      String(payload.questionId ?? payload.question_id ?? ''),
+      String(payload.answer ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::AgentsBody(PermissionReplyRequest) — UserSession. Decyzja
+   * operatora o zgodzie na narzędzie. payload: { runId, requestId, decision }
+   */
+  agentPermissionReplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAgentPermissionReplyRequest(
+      String(payload.runId ?? payload.run_id ?? ''),
+      String(payload.requestId ?? payload.request_id ?? ''),
+      String(payload.decision ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

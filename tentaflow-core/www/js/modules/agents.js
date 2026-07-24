@@ -1,12 +1,12 @@
-// ===== File: agents.js — Agents registry admin screen (Harness plan §3.3) =====
+// ===== File: agents.js — Agents module: card list, 3-step wizard, playground =====
 //
-// List + CRUD UI for the `agents` table plus a read-only "Runs" view over the
-// runtime `agent_runs` rows — all over the binary protocol
-// (`MessageBody::AgentsBody` via ApiBinary + stage-D codec helpers, never REST).
-// The editor pickers: a model tf-combobox (dynamic models list), a tool tree
-// (tf-checkbox grouped by addon with an addon.* wildcard row + core.* builtins)
-// from ToolsCatalogRequest, a skill picker by name+tag from SkillsListRequest,
-// numeric limits, and routable/enabled tf-toggles. tf-* components only.
+// Admin/user surface over the `agents` registry — all over the binary protocol
+// (`MessageBody::AgentsBody` via ApiBinary + codec helpers, never REST).
+// Views: card grid (A01) → per-agent playground with a live run panel (A03),
+// a 3-step creation wizard in a tf-window (A02) with an AI builder assistant
+// (A04, BuilderAssistRequest) and team templates (A05) that create a whole
+// set of agents at once. The top-level Runs tab lists agent_runs with a live
+// per-run timeline subscription. tf-* components only.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
@@ -22,6 +22,11 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-tabs.js';
+import '/js/components/tf-menu.js';
+import '/js/components/tf-slider.js';
+import '/js/components/tf-filter-chips.js';
+import '/js/components/tf-chat-bubble.js';
+import '/js/components/tf-chat-composer.js';
 import '/js/components/tf-empty-state.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
 import { activityLabels } from '/js/lib/agent-activity-bridge.js';
@@ -44,12 +49,90 @@ const RUN_STATUS_CHIP = {
   interrupted: 'warn',
 };
 
+const TERMINAL_RUN_STATUSES = ['completed', 'failed', 'cancelled', 'interrupted'];
+
+// Deterministic card avatar icons — a stable icon per agent name keeps the grid
+// scannable without storing an icon column.
+const CARD_ICONS = ['brain', 'search', 'eye', 'file-text', 'code', 'shield', 'star', 'list', 'globe', 'database', 'zap', 'folder'];
+
+// Wizard step-1 personas: a ready skeleton of description + system prompt.
+const PERSONAS = [
+  { id: 'researcher', icon: 'search' },
+  { id: 'writer', icon: 'file-text' },
+  { id: 'critic', icon: 'eye' },
+  { id: 'supervisor', icon: 'star' },
+  { id: 'tester', icon: 'list' },
+  { id: 'custom', icon: 'sparkle' },
+];
+
+// Team templates (A05). Prompts reuse the persona presets where the role
+// matches; the extra roles carry their own prompt keys. Tools stay empty on
+// purpose — installed addons differ per node, so the admin picks them in the
+// editor after the team is created.
+const TEAM_TEMPLATES = [
+  {
+    id: 'docqa',
+    icon: 'file-text',
+    nameKey: 'tpl_docqa_name',
+    descKey: 'tpl_docqa_desc',
+    loop: true,
+    flow: [
+      { icon: 'file-text', labelKey: 'persona_writer_name' },
+      { icon: 'eye', labelKey: 'persona_critic_name' },
+      { icon: 'star', labelKey: 'persona_supervisor_name' },
+    ],
+    agents: [
+      { name: 'dokumentalista', icon: 'file-text', displayKey: 'persona_writer_name', roleKey: 'tpl_agent_writer_role', promptKey: 'persona_writer_prompt' },
+      { name: 'krytyk-wymagan', icon: 'eye', displayKey: 'tpl_agent_critic_name', roleKey: 'tpl_agent_critic_role', promptKey: 'persona_critic_prompt' },
+      { name: 'nadzorca-procesu', icon: 'star', displayKey: 'tpl_agent_supervisor_name', roleKey: 'tpl_agent_supervisor_role', promptKey: 'persona_supervisor_prompt', maxSubagents: 2, maxSpawnDepth: 2 },
+    ],
+  },
+  {
+    id: 'testing',
+    icon: 'list',
+    nameKey: 'tpl_test_name',
+    descKey: 'tpl_test_desc',
+    loop: false,
+    flow: [
+      { icon: 'list', labelKey: 'tpl_agent_generator_name' },
+      { icon: 'code', labelKey: 'tpl_agent_executor_name' },
+      { icon: 'chart-line', labelKey: 'tpl_agent_reporter_name' },
+    ],
+    agents: [
+      { name: 'generator-scenariuszy', icon: 'list', displayKey: 'tpl_agent_generator_name', roleKey: 'tpl_agent_generator_role', promptKey: 'persona_tester_prompt' },
+      { name: 'generator-playwright', icon: 'code', displayKey: 'tpl_agent_executor_name', roleKey: 'tpl_agent_executor_role', promptKey: 'tpl_agent_executor_prompt' },
+      { name: 'raporter-wynikow', icon: 'chart-line', displayKey: 'tpl_agent_reporter_name', roleKey: 'tpl_agent_reporter_role', promptKey: 'tpl_agent_reporter_prompt' },
+    ],
+  },
+  {
+    id: 'research',
+    icon: 'globe',
+    nameKey: 'tpl_research_name',
+    descKey: 'tpl_research_desc',
+    loop: false,
+    flow: [
+      { icon: 'search', labelKey: 'persona_researcher_name' },
+      { icon: 'file-text', labelKey: 'tpl_agent_summarizer_name' },
+    ],
+    agents: [
+      { name: 'researcher-web', icon: 'search', displayKey: 'tpl_agent_researcher_name', roleKey: 'tpl_agent_researcher_role', promptKey: 'persona_researcher_prompt' },
+      { name: 'streszczacz', icon: 'file-text', displayKey: 'tpl_agent_summarizer_name', roleKey: 'tpl_agent_summarizer_role', promptKey: 'tpl_agent_summarizer_prompt' },
+    ],
+  },
+];
+
 const state = {
   agents: [],
   searchQuery: '',
   enabledFilter: 'all',
-  routableFilter: 'all',
-  editor: null,
+  // Mutating flows (upsert/builder-assist) are Admin-only server-side. The role
+  // gates whether the create/edit/duplicate/templates/assistant affordances show
+  // at all — a non-admin still gets read-only list + playground.
+  isAdmin: false,
+  playground: null,
+  wizard: null,
+  assist: null,
+  templatesWin: null,
   // Top-level Runs tab.
   topTab: 'agents',
   runs: [],
@@ -59,62 +142,62 @@ const state = {
   // from RunDetail.run_log on open and appended from the run-events stream.
   runSteps: new Map(),
   runsUnsub: null,
+  // Monotonic token guarding the run-detail subscription against fast switches:
+  // a resolved subscribe handle whose token is stale is torn down immediately.
+  runsSubToken: 0,
 };
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
 }
 
+function t(key, params) {
+  return I18n.t(`agents.${key}`, params);
+}
+
 const AgentsScreen = {
-  get title() { return I18n.t('agents.title'); },
+  get title() { return t('title'); },
 
   render() {
     return `
       <div class="page-header">
         <div>
-          <h1>${sprite('brain')} ${escapeHtml(I18n.t('agents.title'))}</h1>
+          <h1>${sprite('brain')} ${escapeHtml(t('title'))}</h1>
           <div class="sub" id="agents-sub"></div>
         </div>
         <div class="actions">
-          <tf-button variant="ghost" icon="refresh" id="agents-refresh">${escapeHtml(I18n.t('agents.refresh'))}</tf-button>
-          <tf-button variant="primary" icon="plus" id="agents-new">${escapeHtml(I18n.t('agents.new_agent'))}</tf-button>
+          <tf-button variant="ghost" icon="refresh" id="agents-refresh">${escapeHtml(t('refresh'))}</tf-button>
+          <tf-button variant="ghost" icon="users" id="agents-templates">${escapeHtml(t('team_templates'))}</tf-button>
+          <tf-button variant="primary" icon="plus" id="agents-new">${escapeHtml(t('new_agent'))}</tf-button>
         </div>
       </div>
 
       <tf-tabs variant="underline" value="agents" id="agents-top-tabs">
-        <tf-tab id="agents" icon="brain">${escapeHtml(I18n.t('agents.tab_agents'))}</tf-tab>
-        <tf-tab id="runs" icon="clock">${escapeHtml(I18n.t('agents.tab_runs'))}</tf-tab>
+        <tf-tab id="agents" icon="brain">${escapeHtml(t('tab_agents'))}</tf-tab>
+        <tf-tab id="runs" icon="clock">${escapeHtml(t('tab_runs'))}</tf-tab>
       </tf-tabs>
 
       <div class="agents-top-panel" data-top-panel="agents">
-        <section class="card agents-card">
-          <div class="agents-toolbar">
-            <tf-searchbox id="agents-search" placeholder="${escapeAttr(I18n.t('agents.search_placeholder'))}" debounce="200"></tf-searchbox>
-            <tf-select id="agents-filter-enabled" class="agents-filter" value="all">
-              <option value="all">${escapeHtml(I18n.t('agents.filter_enabled_all'))}</option>
-              <option value="enabled">${escapeHtml(I18n.t('agents.filter_enabled_on'))}</option>
-              <option value="disabled">${escapeHtml(I18n.t('agents.filter_enabled_off'))}</option>
-            </tf-select>
-            <tf-select id="agents-filter-routable" class="agents-filter" value="all">
-              <option value="all">${escapeHtml(I18n.t('agents.filter_routable_all'))}</option>
-              <option value="routable">${escapeHtml(I18n.t('agents.filter_routable_on'))}</option>
-              <option value="not_routable">${escapeHtml(I18n.t('agents.filter_routable_off'))}</option>
-            </tf-select>
+        <div id="agents-list-view">
+          <div class="agents-toolbar agents-toolbar-cards">
+            <tf-searchbox id="agents-search" placeholder="${escapeAttr(t('search_placeholder'))}" debounce="200"></tf-searchbox>
+            <tf-filter-chips id="agents-filter-enabled" mode="single"></tf-filter-chips>
           </div>
-          <div id="agents-table-host" class="agents-table-host"></div>
-        </section>
+          <div id="agents-grid-host"></div>
+        </div>
+        <div id="agents-playground-view" hidden></div>
       </div>
 
       <div class="agents-top-panel" data-top-panel="runs" hidden>
         <section class="card agents-card">
           <div class="agents-toolbar">
             <tf-select id="runs-filter-status" class="agents-filter" value="all">
-              <option value="all">${escapeHtml(I18n.t('agents.runs_filter_status_all'))}</option>
-              <option value="active">${escapeHtml(I18n.t('agents.runs_filter_status_active'))}</option>
-              <option value="completed">${escapeHtml(I18n.t('agents.run_status_completed'))}</option>
-              <option value="failed">${escapeHtml(I18n.t('agents.run_status_failed'))}</option>
+              <option value="all">${escapeHtml(t('runs_filter_status_all'))}</option>
+              <option value="active">${escapeHtml(t('runs_filter_status_active'))}</option>
+              <option value="completed">${escapeHtml(t('run_status_completed'))}</option>
+              <option value="failed">${escapeHtml(t('run_status_failed'))}</option>
             </tf-select>
-            <tf-button variant="ghost" icon="refresh" id="runs-refresh">${escapeHtml(I18n.t('agents.refresh'))}</tf-button>
+            <tf-button variant="ghost" icon="refresh" id="runs-refresh">${escapeHtml(t('refresh'))}</tf-button>
           </div>
           <div id="runs-table-host" class="agents-runs-host"></div>
           <div id="runs-detail-host" class="agents-run-detail"></div>
@@ -124,23 +207,37 @@ const AgentsScreen = {
   },
 
   async mount() {
+    // Role gate uses the real authMeRequest (same pattern as apps-home.js);
+    // admin-only actions stay hidden for non-admins instead of failing on save.
+    const me = await ApiBinary.one('authMeRequest').catch(() => null);
+    state.isAdmin = (me?.role ?? 'user').toLowerCase() === 'admin';
+    if (!state.isAdmin) {
+      byId('agents-new')?.setAttribute('hidden', '');
+      byId('agents-templates')?.setAttribute('hidden', '');
+    }
+
     byId('agents-refresh')?.addEventListener('click', () => {
       if (state.topTab === 'runs') loadRunsTab();
       else loadAgents();
     });
-    byId('agents-new')?.addEventListener('click', () => openAgentEditor(null));
+    byId('agents-new')?.addEventListener('click', () => openWizard(null));
+    byId('agents-templates')?.addEventListener('click', () => openTemplates());
     byId('agents-search')?.addEventListener('search', (e) => {
       state.searchQuery = String(e.detail?.value ?? '');
-      renderTable();
+      renderGrid();
     });
-    byId('agents-filter-enabled')?.addEventListener('change', (e) => {
-      state.enabledFilter = e.detail?.value ?? e.target.value ?? 'all';
-      renderTable();
-    });
-    byId('agents-filter-routable')?.addEventListener('change', (e) => {
-      state.routableFilter = e.detail?.value ?? e.target.value ?? 'all';
-      renderTable();
-    });
+    const filterChips = byId('agents-filter-enabled');
+    if (filterChips) {
+      filterChips.filters = [
+        { id: 'all', label: t('filter_all'), active: state.enabledFilter === 'all' },
+        { id: 'enabled', label: t('filter_enabled'), active: state.enabledFilter === 'enabled' },
+        { id: 'disabled', label: t('filter_disabled'), active: state.enabledFilter === 'disabled' },
+      ];
+      filterChips.addEventListener('change', (e) => {
+        state.enabledFilter = e.detail?.id ?? 'all';
+        renderGrid();
+      });
+    }
     byId('agents-top-tabs')?.addEventListener('change', (e) => {
       const id = e.detail?.value;
       if (id) switchTopTab(id);
@@ -150,16 +247,22 @@ const AgentsScreen = {
       state.runsStatusFilter = e.detail?.value ?? e.target.value ?? 'all';
       renderRunsTable();
     });
+    wireGridEvents();
     await loadAgents();
   },
 
   unmount() {
-    state.editor?.cleanup();
+    teardownPlayground();
+    state.wizard?.cleanup();
+    state.assist?.cleanup();
+    state.templatesWin?.cleanup();
+    // Bump the token so an in-flight run-detail subscribe (whose .then has not
+    // resolved yet) closes itself instead of publishing a stale handle.
+    state.runsSubToken += 1;
     if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
     state.agents = [];
     state.searchQuery = '';
     state.enabledFilter = 'all';
-    state.routableFilter = 'all';
     state.topTab = 'agents';
     state.runs = [];
     state.selectedRunId = null;
@@ -179,17 +282,22 @@ async function loadAgents() {
     const rows = JSON.parse(resp.agentsJson ?? resp.agents_json ?? '[]');
     state.agents = Array.isArray(rows) ? rows : [];
     const sub = byId('agents-sub');
-    if (sub) sub.textContent = I18n.t('agents.subtitle', { count: state.agents.length });
-    renderTable();
+    if (sub) {
+      sub.textContent = t('subtitle_stats', {
+        count: state.agents.length,
+        enabled: state.agents.filter((a) => a.is_enabled).length,
+      });
+    }
+    renderGrid();
   } catch (err) {
-    toast(`${I18n.t('agents.load_failed')}: ${err.message}`, 'error');
+    toast(`${t('load_failed')}: ${err.message}`, 'error');
   }
 }
 
 function parseStringArray(json) {
   try {
     const arr = JSON.parse(json || '[]');
-    return Array.isArray(arr) ? arr.filter((t) => typeof t === 'string') : [];
+    return Array.isArray(arr) ? arr.filter((v) => typeof v === 'string') : [];
   } catch {
     return [];
   }
@@ -206,13 +314,20 @@ function parseSkillsSelection(json) {
   }
 }
 
+function safeParseParams(json) {
+  try {
+    const obj = JSON.parse(json || '{}');
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
 function filteredAgents() {
   const query = state.searchQuery.trim().toLowerCase();
   return state.agents.filter((agent) => {
     if (state.enabledFilter === 'enabled' && !agent.is_enabled) return false;
     if (state.enabledFilter === 'disabled' && agent.is_enabled) return false;
-    if (state.routableFilter === 'routable' && !agent.routable) return false;
-    if (state.routableFilter === 'not_routable' && agent.routable) return false;
     if (query) {
       const haystack = [agent.name, agent.display_name || '', agent.description || '', agent.model || '']
         .join(' ')
@@ -223,89 +338,15 @@ function filteredAgents() {
   });
 }
 
-// =============================================================================
-// List rendering
-// =============================================================================
-
-function renderTable() {
-  const host = byId('agents-table-host');
-  if (!host) return;
-  const visible = filteredAgents();
-
-  if (!visible.length) {
-    const noAgentsAtAll = state.agents.length === 0;
-    host.innerHTML = `
-      <tf-empty-state icon="brain"
-        title="${escapeAttr(I18n.t(noAgentsAtAll ? 'agents.empty_list' : 'agents.empty_match'))}"
-        message="${escapeAttr(noAgentsAtAll ? I18n.t('agents.empty_list_hint') : '')}"></tf-empty-state>
-    `;
-    return;
-  }
-
-  host.innerHTML = `
-    <tf-table id="agents-table" sortable>
-      <tf-column key="name" label="${escapeAttr(I18n.t('agents.col_name'))}" sortable></tf-column>
-      <tf-column key="model" label="${escapeAttr(I18n.t('agents.col_model'))}" sortable></tf-column>
-      <tf-column key="tools" label="${escapeAttr(I18n.t('agents.col_tools'))}" renderer="num" sortable></tf-column>
-      <tf-column key="skills" label="${escapeAttr(I18n.t('agents.col_skills'))}" renderer="num" sortable></tf-column>
-      <tf-column key="routable" label="${escapeAttr(I18n.t('agents.col_routable'))}" renderer="chip"></tf-column>
-      <tf-column key="enabled" label="${escapeAttr(I18n.t('agents.col_enabled'))}" renderer="chip"></tf-column>
-    </tf-table>
-  `;
-
-  const table = byId('agents-table');
-  table.rows = visible.map(agentToRow);
-  table.rowActions = buildRowActions;
-  table.addEventListener('row-click', (e) => {
-    const id = e.detail?.row?._id;
-    if (id) openAgentEditor(id);
-  });
-}
-
 function countSkills(agent) {
   const sel = parseSkillsSelection(agent.skills_json);
   return sel.names.length + sel.tags.length;
 }
 
-function agentToRow(agent) {
-  return {
-    _id: agent.id,
-    name: agent.display_name ? `${agent.name} · ${agent.display_name}` : agent.name,
-    model: agent.model || I18n.t('agents.model_inherited'),
-    tools: parseStringArray(agent.tools_json).length,
-    skills: countSkills(agent),
-    routable: {
-      status: agent.routable ? 'ok' : 'info',
-      label: I18n.t(agent.routable ? 'agents.routable_yes' : 'agents.routable_no'),
-    },
-    enabled: {
-      status: agent.is_enabled ? 'ok' : 'warn',
-      label: I18n.t(agent.is_enabled ? 'agents.enabled_yes' : 'agents.enabled_no'),
-    },
-  };
-}
-
-function buildRowActions(row) {
-  const wrap = document.createElement('div');
-  wrap.style.display = 'flex';
-  wrap.style.gap = '4px';
-  wrap.style.justifyContent = 'flex-end';
-
-  const edit = document.createElement('tf-button');
-  edit.setAttribute('variant', 'ghost');
-  edit.setAttribute('size', 'sm');
-  edit.textContent = I18n.t('agents.action_edit');
-  edit.addEventListener('click', () => openAgentEditor(row._id));
-  wrap.appendChild(edit);
-
-  const del = document.createElement('tf-button');
-  del.setAttribute('variant', 'danger');
-  del.setAttribute('size', 'sm');
-  del.textContent = I18n.t('agents.action_delete');
-  del.addEventListener('click', () => deleteAgent(row._id));
-  wrap.appendChild(del);
-
-  return wrap;
+function agentIcon(name) {
+  let hash = 0;
+  for (const ch of String(name || '')) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
+  return CARD_ICONS[hash % CARD_ICONS.length];
 }
 
 function formatTimestamp(value) {
@@ -318,261 +359,626 @@ function formatTimestamp(value) {
 }
 
 // =============================================================================
-// Top-level Runs tab — live run list + shared timeline + cancel (ACL per
-// principal is enforced server-side; the list only returns the caller's runs
-// unless they are an admin).
+// Card grid (A01)
 // =============================================================================
 
-function switchTopTab(tabId) {
-  state.topTab = tabId === 'runs' ? 'runs' : 'agents';
-  document.querySelectorAll('[data-top-panel]').forEach((panel) => {
-    panel.hidden = panel.getAttribute('data-top-panel') !== state.topTab;
-  });
-  if (state.topTab === 'runs') loadRunsTab();
-  else if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
-}
-
-async function loadRunsTab() {
-  const host = byId('runs-table-host');
-  if (host) host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.runs_loading'))}</div>`;
-  try {
-    const resp = await ApiBinary.one('agentRunsListRequest', {});
-    const rows = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
-    state.runs = Array.isArray(rows) ? rows : [];
-  } catch (err) {
-    if (host) host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${I18n.t('agents.runs_failed')}: ${err.message}`)}</div>`;
-    return;
-  }
-  renderRunsTable();
-}
-
-function filteredRuns() {
-  const f = state.runsStatusFilter;
-  return state.runs.filter((r) => {
-    if (f === 'all') return true;
-    if (f === 'active') return !['completed', 'failed', 'cancelled', 'interrupted'].includes(r.status);
-    return r.status === f;
-  });
-}
-
-function renderRunsTable() {
-  const host = byId('runs-table-host');
+function renderGrid() {
+  const host = byId('agents-grid-host');
   if (!host) return;
-  const runs = filteredRuns();
-  if (!runs.length) {
-    host.innerHTML = `<tf-empty-state icon="clock" title="${escapeAttr(I18n.t('agents.runs_empty'))}"></tf-empty-state>`;
+  const visible = filteredAgents();
+
+  if (!visible.length && state.agents.length) {
+    host.innerHTML = `<tf-empty-state icon="brain" title="${escapeAttr(t('empty_match'))}"></tf-empty-state>`;
     return;
   }
-  host.innerHTML = `
-    <tf-table id="runs-tab-table" sortable>
-      <tf-column key="status" label="${escapeAttr(I18n.t('agents.runs_col_status'))}" renderer="chip"></tf-column>
-      <tf-column key="agent" label="${escapeAttr(I18n.t('agents.runs_col_agent'))}" sortable></tf-column>
-      <tf-column key="iterations" label="${escapeAttr(I18n.t('agents.runs_col_iterations'))}" renderer="num" sortable></tf-column>
-      <tf-column key="tokens" label="${escapeAttr(I18n.t('agents.runs_col_tokens'))}" renderer="num" sortable></tf-column>
-      <tf-column key="exit_reason" label="${escapeAttr(I18n.t('agents.runs_col_exit'))}"></tf-column>
-      <tf-column key="created" label="${escapeAttr(I18n.t('agents.runs_col_created'))}" sortable></tf-column>
-    </tf-table>
+
+  const cards = visible.map(agentCardHtml).join('');
+  const addCard = state.isAdmin ? `
+    <div class="agent-card agent-card-add" data-add-card role="button" tabindex="0">
+      <div class="agent-add-ico">${sprite('plus')}</div>
+      <div class="agent-add-name">${escapeHtml(t('new_agent'))}</div>
+      <div class="agent-add-sub">${escapeHtml(t('add_card_sub'))}</div>
+    </div>
+  ` : '';
+  host.innerHTML = `<div class="agents-grid">${cards}${addCard}</div>`;
+}
+
+function agentCardHtml(agent) {
+  const toolsCount = parseStringArray(agent.tools_json).length;
+  const skillsCount = countSkills(agent);
+  const enableItem = agent.is_enabled
+    ? `<tf-menu-item action="disable" icon="ban">${escapeHtml(t('action_disable'))}</tf-menu-item>`
+    : `<tf-menu-item action="enable" icon="check">${escapeHtml(t('action_enable'))}</tf-menu-item>`;
+  // Non-admins get only the read-only "Try out" action; every other item calls
+  // an Admin-only upsert/delete, so the whole menu collapses to the playground.
+  const menu = state.isAdmin
+    ? `<div class="agent-card-menu-wrap">
+        <tf-button variant="ghost" size="sm" icon="chevron-down" data-more title="${escapeAttr(t('action_more'))}"></tf-button>
+        <tf-menu placement="bottom-end" data-card-menu>
+          <tf-menu-item action="edit" icon="edit">${escapeHtml(t('action_edit'))}</tf-menu-item>
+          <tf-menu-item action="duplicate" icon="copy">${escapeHtml(t('action_duplicate'))}</tf-menu-item>
+          <tf-menu-item action="try" icon="play">${escapeHtml(t('action_try'))}</tf-menu-item>
+          ${enableItem}
+          <tf-menu-divider></tf-menu-divider>
+          <tf-menu-item action="delete" icon="trash" danger>${escapeHtml(t('action_delete'))}</tf-menu-item>
+        </tf-menu>
+      </div>`
+    : `<div class="agent-card-menu-wrap">
+        <tf-button variant="ghost" size="sm" icon="play" data-try title="${escapeAttr(t('action_try'))}"></tf-button>
+      </div>`;
+  return `
+    <div class="agent-card ${agent.is_enabled ? '' : 'is-disabled'}" data-agent-id="${escapeAttr(agent.id)}" role="button" tabindex="0">
+      <div class="agent-card-top">
+        <div class="agent-card-av">${sprite(agentIcon(agent.name))}</div>
+        <div class="agent-card-heading">
+          <div class="agent-card-name">${escapeHtml(agent.display_name || agent.name)}</div>
+          <div class="agent-card-role">${escapeHtml(agent.name)} · ${escapeHtml(agent.model || t('model_inherited'))}</div>
+        </div>
+      </div>
+      <div class="agent-card-desc">${escapeHtml(agent.description || '')}</div>
+      <div class="agent-card-meta">
+        <span>${sprite('bolt')}${escapeHtml(t('card_tools_count', { count: toolsCount }))}</span>
+        <span>${sprite('sparkle')}${escapeHtml(t('card_skills_count', { count: skillsCount }))}</span>
+      </div>
+      <div class="agent-card-foot">
+        ${agent.routable ? `<tf-chip status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
+        <tf-chip status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
+        ${menu}
+      </div>
+    </div>
   `;
-  const table = host.querySelector('#runs-tab-table');
-  table.rows = runs.map((r) => ({
-    _id: r.id,
-    _status: r.status,
-    status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
-    agent: r.agent_id || '—',
-    iterations: r.iterations ?? 0,
-    tokens: r.total_tokens ?? 0,
-    exit_reason: r.exit_reason || '—',
-    created: formatTimestamp(r.created_at),
-  }));
-  table.rowActions = buildRunRowActions;
-  table.addEventListener('row-click', (e) => {
-    const id = e.detail?.row?._id;
-    if (id) openRunDetail(id);
+}
+
+// One delegated listener survives every grid re-render; per-card menus stay
+// statically declared (tf-menu requirement) inside the card HTML.
+function wireGridEvents() {
+  const host = byId('agents-grid-host');
+  if (!host) return;
+
+  host.addEventListener('click', (e) => {
+    const more = e.target.closest('[data-more]');
+    if (more) {
+      e.stopPropagation();
+      more.parentElement?.querySelector('[data-card-menu]')?.toggle();
+      return;
+    }
+    const tryBtn = e.target.closest('[data-try]');
+    if (tryBtn) {
+      e.stopPropagation();
+      const tryCard = tryBtn.closest('[data-agent-id]');
+      if (tryCard) openPlayground(tryCard.dataset.agentId);
+      return;
+    }
+    if (e.target.closest('[data-card-menu]')) return;
+    const addCard = e.target.closest('[data-add-card]');
+    if (addCard) {
+      openWizard(null);
+      return;
+    }
+    const card = e.target.closest('[data-agent-id]');
+    if (card) openPlayground(card.dataset.agentId);
+  });
+
+  host.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const addCard = e.target.closest('[data-add-card]');
+    if (addCard) {
+      e.preventDefault();
+      openWizard(null);
+      return;
+    }
+    const card = e.target.closest('[data-agent-id]');
+    if (card && e.target === card) {
+      e.preventDefault();
+      openPlayground(card.dataset.agentId);
+    }
+  });
+
+  host.addEventListener('action', (e) => {
+    const menu = e.target.closest('[data-card-menu]');
+    const card = e.target.closest('[data-agent-id]');
+    if (!menu || !card) return;
+    const agentId = card.dataset.agentId;
+    switch (e.detail?.action) {
+      case 'edit': openWizardForAgent(agentId); break;
+      case 'duplicate': duplicateAgent(agentId); break;
+      case 'try': openPlayground(agentId); break;
+      case 'enable': setAgentEnabled(agentId, true); break;
+      case 'disable': setAgentEnabled(agentId, false); break;
+      case 'delete': deleteAgent(agentId); break;
+      default: break;
+    }
   });
 }
 
-function buildRunRowActions(row) {
-  const active = !['completed', 'failed', 'cancelled', 'interrupted'].includes(row._status);
-  if (!active) return null;
-  const btn = document.createElement('tf-button');
-  btn.setAttribute('variant', 'ghost');
-  btn.setAttribute('size', 'sm');
-  btn.textContent = I18n.t('agents.action_cancel');
-  btn.addEventListener('click', () => cancelRun(row._id));
-  return btn;
+async function fetchAgentDetail(agentId) {
+  const resp = await ApiBinary.one('agentsDetailRequest', { agentId });
+  return JSON.parse(resp.agentJson ?? resp.agent_json ?? 'null');
 }
 
-async function cancelRun(runId) {
-  if (!runId) return;
+// A full upsert payload from a detail row — enable/disable and duplicate flows
+// must round-trip every field, not just the one they change.
+function payloadFromDetail(agent, overrides = {}) {
+  return {
+    id: agent.id,
+    name: agent.name,
+    display_name: agent.display_name || null,
+    description: agent.description || '',
+    system_prompt: agent.system_prompt || null,
+    model: agent.model || null,
+    tools: parseStringArray(agent.tools_json),
+    skills: parseSkillsSelection(agent.skills_json),
+    params: safeParseParams(agent.params_json),
+    max_iterations: agent.max_iterations ?? 25,
+    timeout_secs: agent.timeout_secs ?? 600,
+    max_subagents: agent.max_subagents ?? 0,
+    max_spawn_depth: agent.max_spawn_depth ?? 1,
+    on_child_complete: agent.on_child_complete || 'notify',
+    flow_id: agent.flow_id || null,
+    routable: !!agent.routable,
+    is_enabled: !!agent.is_enabled,
+    ...overrides,
+  };
+}
+
+async function setAgentEnabled(agentId, enabled) {
   try {
-    const resp = await ApiBinary.action('agentRunCancelRequest', { runId });
-    if (resp && (resp.cancelled === true || resp.cancelled === 'true')) {
-      toast(I18n.t('agents.run_cancel_ok'), 'success');
+    const agent = await fetchAgentDetail(agentId);
+    if (!agent) return;
+    await ApiBinary.one('agentsUpsertRequest', {
+      agentJson: JSON.stringify(payloadFromDetail(agent, { is_enabled: enabled })),
+    });
+    toast(t('save_ok'), 'success');
+    await loadAgents();
+    if (state.playground?.agent?.id === agentId) {
+      state.playground.agent.is_enabled = enabled;
+      renderPlaygroundHeader();
     }
-    await loadRunsTab();
   } catch (err) {
-    toast(`${I18n.t('agents.run_cancel_failed')}: ${err.message}`, 'error');
+    toast(`${t('detail_failed')}: ${err.message}`, 'error');
   }
 }
 
-// Live per-step updates land in the open detail timeline via its own run-scope
-// subscription (openRunDetail). The list refreshes on tab open and on each
-// cancel — a list-wide socket would need one broadcast key per run, whereas the
-// drill-in owns a single key matching the widget's level-2 contract.
-async function openRunDetail(runId) {
-  state.selectedRunId = runId;
-  const host = byId('runs-detail-host');
-  if (!host) return;
-  host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.runs_loading'))}</div>`;
-  let run = null;
+function uniqueCopyName(baseName) {
+  const existing = new Set(state.agents.map((a) => a.name));
+  let candidate = `${baseName}-copy`.slice(0, NAME_MAX_CHARS);
+  let n = 2;
+  while (existing.has(candidate)) {
+    const suffix = `-copy-${n}`;
+    candidate = `${baseName.slice(0, NAME_MAX_CHARS - suffix.length)}${suffix}`;
+    n += 1;
+  }
+  return candidate;
+}
+
+async function duplicateAgent(agentId) {
   try {
-    const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
-    run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+    const agent = await fetchAgentDetail(agentId);
+    if (!agent) return;
+    const copy = { ...agent, id: null, name: uniqueCopyName(agent.name) };
+    openWizard(copy, { forceCreate: true });
   } catch (err) {
-    host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${I18n.t('agents.run_detail_failed')}: ${err.message}`)}</div>`;
-    return;
-  }
-  if (!run) return;
-  // Seed the timeline from run_log (durable record), then append live events.
-  state.runSteps.set(runId, runLogToSteps(run));
-  host.innerHTML = renderRunDetail(run);
-
-  // Live updates for this run scope: append each AgentRunEvent as a step.
-  if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
-  if (!['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status)) {
-    ApiBinary.subscribe(
-      'agentRunEventsSubscribeRequest',
-      { scopeKind: 'run', scopeId: runId },
-      {
-        onChunk: (body) => {
-          if (!body || body.variant !== 'AgentRunEvent') return;
-          if (state.selectedRunId !== runId) return;
-          const steps = state.runSteps.get(runId) || [];
-          const step = TfAgentActivity.stepsFromEvents([body], activityLabels())[0];
-          step.ts = new Date().toLocaleTimeString();
-          steps.push(step);
-          state.runSteps.set(runId, steps);
-          const tl = byId('runs-detail-host')?.querySelector('[data-run-timeline]');
-          if (tl) tl.innerHTML = TfAgentActivity.renderTimeline(steps, activityLabels());
-        },
-        onError: () => {},
-        onEnd: () => { state.runsUnsub = null; },
-      },
-    ).then((unsub) => { state.runsUnsub = unsub; }).catch(() => {});
+    toast(`${t('detail_failed')}: ${err.message}`, 'error');
   }
 }
 
-// run_log is a JSON array of harness step objects. Map them onto the shared
-// timeline's step shape so live events and durable history render identically.
-function runLogToSteps(run) {
-  let raw = [];
+async function openWizardForAgent(agentId) {
   try {
-    const parsed = JSON.parse(run.run_log || '[]');
-    if (Array.isArray(parsed)) raw = parsed;
-  } catch {
-    raw = [];
+    const agent = await fetchAgentDetail(agentId);
+    if (agent) openWizard(agent);
+  } catch (err) {
+    toast(`${t('detail_failed')}: ${err.message}`, 'error');
   }
-  return raw.map((s) => ({
-    tone: s.status === 'error' || s.status === 'failed' ? 'err' : s.status === 'ok' ? 'ok' : 'info',
-    kind: String(s.kind || s.type || I18n.t('agents.run_step')),
-    detail: String(s.detail || s.message || s.tool || ''),
-    ts: s.at || s.timestamp ? formatTimestamp(String(s.at || s.timestamp)) : '',
-  }));
 }
-
-function renderRunDetail(run) {
-  const steps = state.runSteps.get(run.id) || [];
-  const meta = `
-    <div class="agents-run-meta">
-      <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}">${escapeHtml(runStatusLabel(run.status))}</tf-chip>
-      <span>${escapeHtml(I18n.t('agents.runs_col_iterations'))}: ${escapeHtml(String(run.iterations ?? 0))}</span>
-      <span>${escapeHtml(I18n.t('agents.runs_col_tokens'))}: ${escapeHtml(String(run.total_tokens ?? 0))}</span>
-      ${run.exit_reason ? `<span>${escapeHtml(I18n.t('agents.runs_col_exit'))}: ${escapeHtml(run.exit_reason)}</span>` : ''}
-    </div>`;
-  const prompt = run.prompt
-    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_prompt'))}</span><pre>${escapeHtml(run.prompt)}</pre></div>`
-    : '';
-  const result = run.result
-    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_result'))}</span><pre>${escapeHtml(run.result)}</pre></div>`
-    : '';
-  const timeline = `<div data-run-timeline>${TfAgentActivity.renderTimeline(steps, activityLabels())}</div>`;
-  return `${meta}${prompt}${result}
-    <div class="agents-run-block"><span class="tf-label">${escapeHtml(I18n.t('agents.run_timeline'))}</span>${timeline}</div>`;
-}
-
-// =============================================================================
-// Delete
-// =============================================================================
 
 async function deleteAgent(agentId) {
   const agent = state.agents.find((a) => a.id === agentId);
   if (!agent) return;
   const ok = await TfWindow.confirm({
-    title: I18n.t('agents.delete_confirm_title'),
-    message: I18n.t('agents.delete_confirm_message', { name: escapeHtml(agent.name) }),
-    confirmLabel: I18n.t('agents.action_delete'),
-    cancelLabel: I18n.t('agents.action_cancel'),
+    title: t('delete_confirm_title'),
+    message: t('delete_confirm_message', { name: escapeHtml(agent.name) }),
+    confirmLabel: t('action_delete'),
+    cancelLabel: t('action_cancel'),
     danger: true,
   });
   if (!ok) return;
   try {
     await ApiBinary.one('agentsDeleteRequest', { agentId });
-    toast(I18n.t('agents.delete_ok'), 'success');
+    toast(t('delete_ok'), 'success');
     await loadAgents();
   } catch (err) {
-    toast(`${I18n.t('agents.delete_failed')}: ${err.message}`, 'error');
+    toast(`${t('delete_failed')}: ${err.message}`, 'error');
   }
 }
 
 // =============================================================================
-// Editor (tf-window with Settings + Runs tabs)
+// Playground (A03) — direct chat with one agent + live run panel
 // =============================================================================
 
-async function openAgentEditor(agentId) {
-  state.editor?.cleanup();
-
+async function openPlayground(agentId) {
   let agent = null;
-  if (agentId) {
+  try {
+    agent = await fetchAgentDetail(agentId);
+  } catch (err) {
+    toast(`${t('detail_failed')}: ${err.message}`, 'error');
+    return;
+  }
+  if (!agent) return;
+
+  teardownPlayground();
+  state.playground = {
+    agent,
+    messages: [{ role: 'assistant', content: t('pg_greeting'), time: nowTime() }],
+    steps: [],
+    widget: null,
+    unsub: null,
+    runId: null,
+    busy: false,
+  };
+
+  const listView = byId('agents-list-view');
+  const pgView = byId('agents-playground-view');
+  if (listView) listView.hidden = true;
+  if (!pgView) return;
+  pgView.hidden = false;
+  pgView.innerHTML = playgroundHtml(agent);
+
+  renderPlaygroundHeader();
+  renderPlaygroundMessages();
+  renderPlaygroundTimeline();
+
+  // The interactive widget owns question/permission cards and per-run cancel;
+  // its CustomEvents are forwarded to the binary protocol exactly like the
+  // chat bridge does (agent-activity-bridge contract).
+  const widget = document.createElement('tf-agent-activity');
+  widget.labels = activityLabels();
+  widget.addEventListener('agent-reply', async (e) => {
+    const { runId, interactionId, answer } = e.detail || {};
     try {
-      const resp = await ApiBinary.one('agentsDetailRequest', { agentId });
-      agent = JSON.parse(resp.agentJson ?? resp.agent_json ?? 'null');
+      await ApiBinary.action('agentRunReplyRequest', { runId, questionId: interactionId, answer });
     } catch (err) {
-      toast(`${I18n.t('agents.detail_failed')}: ${err.message}`, 'error');
+      toast(`${I18n.t('common.error')}: ${err.message ?? err}`, 'error');
+    }
+  });
+  widget.addEventListener('agent-permission', async (e) => {
+    const { runId, interactionId, decision } = e.detail || {};
+    try {
+      await ApiBinary.action('agentPermissionReplyRequest', { runId, requestId: interactionId, decision });
+    } catch (err) {
+      toast(`${I18n.t('common.error')}: ${err.message ?? err}`, 'error');
+    }
+  });
+  widget.addEventListener('agent-cancel', async (e) => {
+    const { runId } = e.detail || {};
+    try {
+      const resp = await ApiBinary.action('agentRunCancelRequest', { runId });
+      if (resp && (resp.cancelled === true || resp.cancelled === 'true')) {
+        widget.setRunStatus(runId, 'cancelled');
+      }
+    } catch (err) {
+      toast(`${I18n.t('common.error')}: ${err.message ?? err}`, 'error');
+    }
+  });
+  pgView.querySelector('[data-pg-widget]')?.appendChild(widget);
+  state.playground.widget = widget;
+
+  pgView.querySelector('[data-pg-back]')?.addEventListener('click', () => closePlayground());
+  pgView.querySelector('[data-pg-edit]')?.addEventListener('click', () => openWizardForAgent(agent.id));
+  pgView.querySelector('[data-pg-toggle-enabled]')?.addEventListener('click', () => {
+    setAgentEnabled(agent.id, !state.playground.agent.is_enabled);
+  });
+  pgView.querySelector('[data-pg-new-session]')?.addEventListener('click', () => resetPlaygroundSession());
+  pgView.querySelector('tf-chat-composer')?.addEventListener('send', (e) => {
+    const text = String(e.detail?.text ?? '').trim();
+    if (text) startPlaygroundRun(text);
+  });
+}
+
+function playgroundHtml(agent) {
+  return `
+    <div class="agents-pg">
+      <div class="agents-pg-header">
+        <tf-button variant="ghost" icon="chevron-left" data-pg-back>${escapeHtml(t('pg_back'))}</tf-button>
+        <div class="agents-pg-av">${sprite(agentIcon(agent.name))}</div>
+        <div class="agents-pg-heading" data-pg-heading></div>
+        <div class="agents-pg-actions">
+          ${state.isAdmin ? `<tf-button variant="ghost" icon="edit" data-pg-edit>${escapeHtml(t('action_edit'))}</tf-button>
+          <tf-button variant="primary" data-pg-toggle-enabled></tf-button>` : ''}
+        </div>
+      </div>
+
+      <div class="agents-pg-banner">
+        ${sprite('info')}
+        <span>${escapeHtml(t('pg_banner'))}</span>
+      </div>
+
+      <div class="agents-pg-cols">
+        <section class="card agents-pg-chat">
+          <div class="agents-pg-panel-head">
+            <span class="agents-pg-panel-title">${sprite('message')} ${escapeHtml(t('pg_chat_title'))}</span>
+            <tf-chip status="accent" dot>${escapeHtml(t('pg_session_chip'))}</tf-chip>
+            <tf-button variant="ghost" size="sm" icon="refresh" data-pg-new-session>${escapeHtml(t('pg_new_session'))}</tf-button>
+          </div>
+          <div class="agents-pg-msgs" data-pg-msgs></div>
+          <tf-chat-composer placeholder="${escapeAttr(t('pg_placeholder'))}"></tf-chat-composer>
+        </section>
+
+        <div class="agents-pg-side">
+          <div data-pg-widget></div>
+          <section class="card agents-pg-run">
+            <div class="agents-pg-panel-head">
+              <span class="agents-pg-panel-title">${sprite('clock')} ${escapeHtml(t('pg_run_title'))}</span>
+            </div>
+            <div class="agents-pg-timeline" data-pg-timeline></div>
+          </section>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderPlaygroundHeader() {
+  const pg = state.playground;
+  const heading = document.querySelector('[data-pg-heading]');
+  if (!pg || !heading) return;
+  const agent = pg.agent;
+  heading.innerHTML = `
+    <div class="agents-pg-name">
+      ${escapeHtml(agent.display_name || agent.name)}
+      <tf-chip status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
+    </div>
+    <div class="agents-pg-sub">${escapeHtml(agent.description || '')}</div>
+    <div class="agents-pg-chips">
+      <tf-chip status="accent">${escapeHtml(t('label_model'))}: ${escapeHtml(agent.model || t('model_inherited'))}</tf-chip>
+      <tf-chip status="info">${escapeHtml(t('card_tools_count', { count: parseStringArray(agent.tools_json).length }))}</tf-chip>
+      ${agent.routable ? `<tf-chip>${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
+    </div>
+  `;
+  const toggleBtn = document.querySelector('[data-pg-toggle-enabled]');
+  if (toggleBtn) {
+    toggleBtn.setAttribute('icon', agent.is_enabled ? 'ban' : 'check');
+    toggleBtn.setAttribute('label', t(agent.is_enabled ? 'disable_agent' : 'enable_agent'));
+  }
+}
+
+function renderPlaygroundMessages() {
+  const pg = state.playground;
+  const host = document.querySelector('[data-pg-msgs]');
+  if (!pg || !host) return;
+  const bubbles = pg.messages.map((m) => `
+    <tf-chat-bubble role="${m.role === 'user' ? 'user' : 'assistant'}"
+      sender="${escapeAttr(m.role === 'user' ? '' : (pg.agent.display_name || pg.agent.name))}"
+      time="${escapeAttr(m.time || '')}">${escapeHtml(m.content)}</tf-chat-bubble>
+  `).join('');
+  const typing = pg.busy
+    ? `<tf-chat-bubble role="assistant" streaming sender="${escapeAttr(pg.agent.display_name || pg.agent.name)}">${escapeHtml(t('pg_running'))}</tf-chat-bubble>`
+    : '';
+  host.innerHTML = bubbles + typing;
+  host.scrollTop = host.scrollHeight;
+  const composer = document.querySelector('#agents-playground-view tf-chat-composer');
+  if (composer) {
+    if (pg.busy) composer.setAttribute('disabled', '');
+    else composer.removeAttribute('disabled');
+  }
+}
+
+function renderPlaygroundTimeline() {
+  const pg = state.playground;
+  const host = document.querySelector('[data-pg-timeline]');
+  if (!pg || !host) return;
+  host.innerHTML = TfAgentActivity.renderTimeline(pg.steps, activityLabels());
+  host.scrollTop = host.scrollHeight;
+}
+
+function nowTime() {
+  return new Date().toLocaleTimeString(I18n.getLanguage(), { hour: '2-digit', minute: '2-digit' });
+}
+
+async function startPlaygroundRun(prompt) {
+  const pg = state.playground;
+  if (!pg || pg.busy) return;
+  pg.messages.push({ role: 'user', content: prompt, time: nowTime() });
+  pg.busy = true;
+  pg.steps = [];
+  renderPlaygroundMessages();
+  renderPlaygroundTimeline();
+
+  let runId = null;
+  try {
+    const resp = await ApiBinary.one('agentRunStartRequest', { agentId: pg.agent.id, prompt });
+    runId = resp.runId ?? resp.run_id ?? null;
+  } catch (err) {
+    pg.busy = false;
+    pg.messages.push({ role: 'assistant', content: `${t('pg_start_failed')}: ${err.message}`, time: nowTime() });
+    renderPlaygroundMessages();
+    return;
+  }
+  if (!runId) {
+    pg.busy = false;
+    pg.messages.push({ role: 'assistant', content: t('pg_start_failed'), time: nowTime() });
+    renderPlaygroundMessages();
+    return;
+  }
+  pg.runId = runId;
+
+  // A slow safety-net poll runs regardless of stream state: broadcasts have no
+  // replay, so a run that finishes before the subscription reaches the server
+  // never delivers `child_finished` and the stream is never `push_end`-ed —
+  // without this the playground would hang on "running…" forever.
+  pollPlaygroundRun(pg, runId);
+
+  // The run publishes ChildFinished to its OWN scope on completion (run_manager
+  // publish_child_finished), so the root run's terminal event arrives here too.
+  try {
+    pg.unsub = await ApiBinary.subscribe(
+      'agentRunEventsSubscribeRequest',
+      { scopeKind: 'run', scopeId: runId },
+      {
+        onChunk: (body) => {
+          if (!body || body.variant !== 'AgentRunEvent') return;
+          if (state.playground !== pg || pg.runId !== runId) return;
+          pg.widget?.applyEvent(body);
+          const step = TfAgentActivity.stepsFromEvents([body], activityLabels())[0];
+          step.ts = new Date().toLocaleTimeString();
+          pg.steps.push(step);
+          renderPlaygroundTimeline();
+          const eventRunId = body.run_id || body.runId;
+          if (body.kind === 'child_finished' && eventRunId === runId) {
+            finishPlaygroundRun(pg, runId);
+          }
+        },
+        onError: () => {},
+        onEnd: () => {
+          if (state.playground === pg && pg.runId === runId && pg.busy) {
+            finishPlaygroundRun(pg, runId);
+          }
+        },
+      },
+    );
+    // Fast-run race: the run may already be terminal by the time the subscribe
+    // handle resolves, and its `child_finished` broadcast was missed. Reconcile
+    // once from the durable row and close the now-useless stream.
+    if (state.playground !== pg || pg.runId !== runId || !pg.busy) {
+      if (pg.unsub) { pg.unsub(); pg.unsub = null; }
       return;
     }
-    if (!agent) return;
+    try {
+      const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
+      const run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+      if (run && TERMINAL_RUN_STATUSES.includes(run.status)) {
+        finishPlaygroundRun(pg, runId);
+      }
+    } catch {
+      // The safety-net poll will retry; a single failed reconcile is harmless.
+    }
+  } catch (err) {
+    // Without a live stream the safety-net poll is the only terminal signal.
+    console.warn('agents: run-events subscribe failed', err);
   }
+}
 
-  // The catalog (pickable tools) and the skill list feed the pickers; both are
-  // best-effort — a missing addon manager or skill table must not block editing.
+// Polls the durable run row until terminal. Runs as a safety net beside the
+// event stream; self-terminates when the run finishes, the session resets, or
+// the playground tears down (all three flip one of the guarded conditions).
+async function pollPlaygroundRun(pg, runId) {
+  while (state.playground === pg && pg.runId === runId && pg.busy) {
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    if (state.playground !== pg || pg.runId !== runId || !pg.busy) return;
+    let run = null;
+    try {
+      const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
+      run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+    } catch {
+      continue;
+    }
+    if (run && TERMINAL_RUN_STATUSES.includes(run.status)) {
+      finishPlaygroundRun(pg, runId);
+      return;
+    }
+  }
+}
+
+async function finishPlaygroundRun(pg, runId) {
+  if (!pg.busy) return;
+  pg.busy = false;
+  if (pg.unsub) { pg.unsub(); pg.unsub = null; }
+  let run = null;
+  try {
+    const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
+    run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+  } catch (err) {
+    pg.messages.push({ role: 'assistant', content: `${t('run_detail_failed')}: ${err.message}`, time: nowTime() });
+    renderPlaygroundMessages();
+    return;
+  }
+  const content = run?.result
+    || (run?.exit_reason ? `${runStatusLabel(run.status)} · ${run.exit_reason}` : t('pg_no_result'));
+  pg.messages.push({ role: 'assistant', content, time: nowTime() });
+  renderPlaygroundMessages();
+}
+
+async function resetPlaygroundSession() {
+  const pg = state.playground;
+  if (!pg) return;
+  if (pg.busy && pg.runId) {
+    try {
+      await ApiBinary.action('agentRunCancelRequest', { runId: pg.runId });
+    } catch {
+      // A cancel race with a finishing run is fine — the session resets anyway.
+    }
+  }
+  if (pg.unsub) { pg.unsub(); pg.unsub = null; }
+  pg.busy = false;
+  pg.runId = null;
+  pg.steps = [];
+  pg.messages = [{ role: 'assistant', content: t('pg_greeting'), time: nowTime() }];
+  renderPlaygroundMessages();
+  renderPlaygroundTimeline();
+}
+
+function closePlayground() {
+  teardownPlayground();
+  const listView = byId('agents-list-view');
+  const pgView = byId('agents-playground-view');
+  if (pgView) { pgView.hidden = true; pgView.innerHTML = ''; }
+  if (listView) listView.hidden = false;
+  loadAgents();
+}
+
+function teardownPlayground() {
+  const pg = state.playground;
+  if (!pg) return;
+  if (pg.unsub) { pg.unsub(); pg.unsub = null; }
+  state.playground = null;
+}
+
+// =============================================================================
+// Wizard (A02) — 3-step create/edit window
+// =============================================================================
+
+async function openWizard(agent, { forceCreate = false } = {}) {
+  state.wizard?.cleanup();
+  state.assist?.cleanup();
+
+  // The catalog (pickable tools), skill list and model list feed the pickers;
+  // all are best-effort — a missing addon manager or skill table must not block
+  // editing.
   const [catalog, skills, models] = await Promise.all([
     loadToolsCatalog(),
     loadSkillList(),
-    loadModels(),
+    loadModelOptions(),
   ]);
 
-  const mode = agent ? 'edit' : 'create';
+  const mode = agent && agent.id && !forceCreate ? 'edit' : 'create';
   const selectedTools = agent ? parseStringArray(agent.tools_json) : [];
   const skillSel = agent ? parseSkillsSelection(agent.skills_json) : { names: [], tags: [] };
 
   const win = document.createElement('tf-window');
-  win.setAttribute('title', I18n.t(mode === 'create' ? 'agents.editor_create_title' : 'agents.editor_edit_title'));
-  if (agent) win.setAttribute('subtitle', agent.name);
+  win.setAttribute('title', t(mode === 'create' ? 'editor_create_title' : 'editor_edit_title'));
+  if (mode === 'edit') win.setAttribute('subtitle', agent.name);
   win.setAttribute('icon', 'brain');
   win.setAttribute('buttons', 'close');
-  win.setAttribute('width', '900');
+  win.setAttribute('width', '880');
   win.setAttribute('draggable', '');
 
   const body = document.createElement('div');
   body.slot = 'body';
-  body.className = 'agents-editor';
-  body.innerHTML = editorBodyHtml(agent, mode, models);
+  body.className = 'agents-wizard';
+  body.innerHTML = wizardBodyHtml(agent, mode, models);
   win.appendChild(body);
 
   const foot = document.createElement('div');
   foot.slot = 'footer';
   foot.className = 'agents-editor-footer';
-  foot.innerHTML = editorFooterHtml(mode);
+  foot.innerHTML = `
+    <div class="agents-footer-left">
+      <tf-button variant="ghost" icon="chevron-left" data-action="back">${escapeHtml(t('wizard_back'))}</tf-button>
+    </div>
+    <div class="agents-footer-right">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
+      <tf-button variant="primary" data-action="next"></tf-button>
+    </div>
+  `;
   win.appendChild(foot);
 
   const backdrop = document.createElement('div');
@@ -580,218 +986,373 @@ async function openAgentEditor(agentId) {
   document.body.append(backdrop, win);
 
   const cleanup = () => {
+    state.assist?.cleanup();
     if (win.isConnected) win.close(true);
     if (backdrop.isConnected) backdrop.remove();
-    if (state.editor?.win === win) state.editor = null;
+    if (state.wizard?.win === win) state.wizard = null;
   };
   win.addEventListener('close-request', () => {
+    state.assist?.cleanup();
     if (backdrop.isConnected) backdrop.remove();
-    if (state.editor?.win === win) state.editor = null;
+    if (state.wizard?.win === win) state.wizard = null;
   });
 
-  state.editor = {
+  state.wizard = {
     mode,
-    agent,
+    agent: mode === 'edit' ? agent : null,
+    sourceParams: agent ? safeParseParams(agent.params_json) : {},
     win,
     body,
+    foot,
+    step: 1,
     catalog,
     skills,
     selectedTools: new Set(selectedTools),
     selectedSkillNames: new Set(skillSel.names),
     selectedSkillTags: new Set(skillSel.tags),
-    runsLoaded: false,
+    appliedPersona: null,
     cleanup,
   };
 
   // Long strings are injected via the value property so they never round-trip
   // through escapeAttr + innerHTML parsing.
-  const description = body.querySelector('#agent-ed-description');
+  const description = body.querySelector('#agent-wz-description');
   if (description) description.value = agent?.description || '';
-  const systemPrompt = body.querySelector('#agent-ed-system-prompt');
+  const systemPrompt = body.querySelector('#agent-wz-system-prompt');
   if (systemPrompt) systemPrompt.value = agent?.system_prompt || '';
 
   renderToolPicker();
   renderSkillPicker();
-  wireEditor(foot);
-  switchEditorTab('settings');
+  wireWizard();
+  setWizardStep(1);
 }
 
-function editorBodyHtml(agent, mode, models) {
+function wizardBodyHtml(agent, mode, models) {
   const modelOptions = [
-    `<option value="">${escapeHtml(I18n.t('agents.model_inherited'))}</option>`,
+    `<option value="">${escapeHtml(t('model_inherited'))}</option>`,
     ...models.map((m) => `<option value="${escapeAttr(m.value)}">${escapeHtml(m.label)}</option>`),
   ].join('');
-  const runsTab = mode === 'edit'
-    ? `<tf-tab id="runs" icon="clock">${escapeHtml(I18n.t('agents.tab_runs'))}</tf-tab>`
-    : '';
+
+  const personaCards = mode === 'create' ? `
+    <div class="agents-field">
+      <span class="tf-label">${escapeHtml(t('persona_label'))}</span>
+      <div class="agents-field-hint">${escapeHtml(t('persona_hint'))}</div>
+      <div class="agents-persona-grid">
+        ${PERSONAS.map((p) => `
+          <div class="agents-persona-card" data-persona="${escapeAttr(p.id)}" role="button" tabindex="0">
+            <div class="agents-persona-ico">${sprite(p.icon)}</div>
+            <div class="agents-persona-name">${escapeHtml(t(`persona_${p.id}_name`))}</div>
+            <div class="agents-persona-desc">${escapeHtml(t(`persona_${p.id}_desc`))}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  ` : '';
+
+  const iterations = Math.min(Math.max(agent?.max_iterations ?? 25, 1), MAX_ITERATIONS_CAP);
 
   return `
-    <tf-tabs variant="underline" value="settings" id="agent-ed-tabs">
-      <tf-tab id="settings" icon="settings">${escapeHtml(I18n.t('agents.tab_settings'))}</tf-tab>
-      ${runsTab}
-    </tf-tabs>
+    <div class="agents-stepper">
+      <div class="agents-step" data-step-pill="1"><span class="agents-step-n">1</span>${escapeHtml(t('wizard_step1'))}</div>
+      <div class="agents-step-line" data-step-line="1"></div>
+      <div class="agents-step" data-step-pill="2"><span class="agents-step-n">2</span>${escapeHtml(t('wizard_step2'))}</div>
+      <div class="agents-step-line" data-step-line="2"></div>
+      <div class="agents-step" data-step-pill="3"><span class="agents-step-n">3</span>${escapeHtml(t('wizard_step3'))}</div>
+    </div>
 
-    <div class="agents-tab-panel" data-panel="settings">
+    <div class="agents-wizard-step" data-step-panel="1">
       <div class="agents-editor-grid">
-        <tf-input id="agent-ed-name" label="${escapeAttr(I18n.t('agents.label_name'))}"
+        <tf-input id="agent-wz-name" label="${escapeAttr(t('label_name'))}"
           value="${escapeAttr(agent?.name || '')}"
-          hint="${escapeAttr(I18n.t('agents.hint_name'))}"
+          hint="${escapeAttr(t('hint_name'))}"
           maxlength="${NAME_MAX_CHARS}"></tf-input>
-        <tf-input id="agent-ed-display-name" label="${escapeAttr(I18n.t('agents.label_display_name'))}"
+        <tf-input id="agent-wz-display-name" label="${escapeAttr(t('label_display_name'))}"
           value="${escapeAttr(agent?.display_name || '')}"></tf-input>
       </div>
 
-      <tf-textarea id="agent-ed-description" label="${escapeAttr(I18n.t('agents.label_description'))}"
-        rows="3" hint="${escapeAttr(I18n.t('agents.hint_description'))}"></tf-textarea>
+      <div class="agents-assist-box">
+        <div class="agents-assist-title">${sprite('sparkle')} ${escapeHtml(t('assist_box_title'))}</div>
+        <div class="agents-assist-text">${escapeHtml(t('assist_box_text'))}</div>
+        <tf-button variant="primary" icon="sparkle" data-open-assist>${escapeHtml(t('assist_box_title'))}</tf-button>
+      </div>
 
-      <tf-textarea id="agent-ed-system-prompt" label="${escapeAttr(I18n.t('agents.label_system_prompt'))}"
-        rows="6"></tf-textarea>
+      ${personaCards}
 
+      <tf-textarea id="agent-wz-description" label="${escapeAttr(t('label_description'))}"
+        rows="3" hint="${escapeAttr(t('hint_description'))}"></tf-textarea>
+
+      <tf-textarea id="agent-wz-system-prompt" label="${escapeAttr(t('label_system_prompt'))}"
+        rows="7" hint="${escapeAttr(t('hint_system_prompt'))}"></tf-textarea>
+    </div>
+
+    <div class="agents-wizard-step" data-step-panel="2" hidden>
+      <div class="agents-field">
+        <span class="tf-label">${escapeHtml(t('tools_section'))}</span>
+        <div class="agents-field-hint">${escapeHtml(t('tools_section_hint'))}</div>
+        <div id="agent-wz-tools" class="agents-tool-groups"></div>
+        <div class="agents-field-hint">${escapeHtml(t('tools_footer_hint'))}</div>
+      </div>
+
+      <div class="agents-field">
+        <span class="tf-label">${escapeHtml(t('skills_section'))}</span>
+        <div class="agents-field-hint">${escapeHtml(t('hint_skills'))}</div>
+        <div id="agent-wz-skills" class="agents-skill-tree"></div>
+      </div>
+    </div>
+
+    <div class="agents-wizard-step" data-step-panel="3" hidden>
       <div class="agents-editor-grid">
-        <tf-select id="agent-ed-model" label="${escapeAttr(I18n.t('agents.label_model'))}"
-          value="${escapeAttr(agent?.model || '')}">${modelOptions}</tf-select>
-        <tf-input id="agent-ed-flow-id" label="${escapeAttr(I18n.t('agents.label_flow_id'))}"
+        <div class="agents-field">
+          <tf-select id="agent-wz-model" label="${escapeAttr(t('label_model'))}"
+            value="${escapeAttr(agent?.model || '')}">${modelOptions}</tf-select>
+          <div class="agents-field-hint">${escapeHtml(t('model_hint'))}</div>
+        </div>
+        <tf-input id="agent-wz-flow-id" label="${escapeAttr(t('label_flow_id'))}"
           value="${escapeAttr(agent?.flow_id || '')}"
-          hint="${escapeAttr(I18n.t('agents.hint_flow_id'))}"></tf-input>
+          hint="${escapeAttr(t('hint_flow_id'))}"></tf-input>
       </div>
 
       <div class="agents-field">
-        <span class="tf-label">${escapeHtml(I18n.t('agents.label_tools'))}</span>
-        <div class="agents-field-hint">${escapeHtml(I18n.t('agents.hint_tools'))}</div>
-        <div id="agent-ed-tools" class="agents-tool-tree"></div>
-      </div>
-
-      <div class="agents-field">
-        <span class="tf-label">${escapeHtml(I18n.t('agents.label_skills'))}</span>
-        <div class="agents-field-hint">${escapeHtml(I18n.t('agents.hint_skills'))}</div>
-        <div id="agent-ed-skills" class="agents-skill-tree"></div>
+        <span class="tf-label">${escapeHtml(t('behavior_section'))}</span>
+        <div class="agents-slider-row">
+          <div>
+            <div class="agents-slider-name">${escapeHtml(t('label_max_iterations'))}</div>
+            <div class="agents-field-hint">${escapeHtml(t('slider_iterations_desc'))}</div>
+          </div>
+          <tf-slider id="agent-wz-max-iterations" min="1" max="${MAX_ITERATIONS_CAP}" step="1"
+            value="${escapeAttr(String(iterations))}"></tf-slider>
+          <div class="agents-slider-val" data-iterations-val>${escapeHtml(String(iterations))}</div>
+        </div>
       </div>
 
       <div class="agents-editor-grid agents-limits">
-        <tf-input id="agent-ed-max-iterations" type="number" label="${escapeAttr(I18n.t('agents.label_max_iterations'))}"
-          value="${escapeAttr(String(agent?.max_iterations ?? 25))}" min="1" max="${MAX_ITERATIONS_CAP}"></tf-input>
-        <tf-input id="agent-ed-timeout-secs" type="number" label="${escapeAttr(I18n.t('agents.label_timeout_secs'))}"
+        <tf-input id="agent-wz-timeout-secs" type="number" label="${escapeAttr(t('label_timeout_secs'))}"
           value="${escapeAttr(String(agent?.timeout_secs ?? 600))}" min="1"></tf-input>
-        <tf-input id="agent-ed-max-subagents" type="number" label="${escapeAttr(I18n.t('agents.label_max_subagents'))}"
+        <tf-input id="agent-wz-max-subagents" type="number" label="${escapeAttr(t('label_max_subagents'))}"
           value="${escapeAttr(String(agent?.max_subagents ?? 0))}" min="0"></tf-input>
-        <tf-input id="agent-ed-max-spawn-depth" type="number" label="${escapeAttr(I18n.t('agents.label_max_spawn_depth'))}"
+        <tf-input id="agent-wz-max-spawn-depth" type="number" label="${escapeAttr(t('label_max_spawn_depth'))}"
           value="${escapeAttr(String(agent?.max_spawn_depth ?? 1))}" min="1"></tf-input>
-        <tf-select id="agent-ed-on-child-complete" label="${escapeAttr(I18n.t('agents.label_on_child_complete'))}"
+        <tf-select id="agent-wz-on-child-complete" label="${escapeAttr(t('label_on_child_complete'))}"
           value="${escapeAttr(agent?.on_child_complete || 'notify')}">
-          <option value="notify">${escapeHtml(I18n.t('agents.on_child_complete_notify'))}</option>
-          <option value="continue">${escapeHtml(I18n.t('agents.on_child_complete_continue'))}</option>
+          <option value="notify">${escapeHtml(t('on_child_complete_notify'))}</option>
+          <option value="continue">${escapeHtml(t('on_child_complete_continue'))}</option>
         </tf-select>
       </div>
 
-      <div class="agents-toggles">
-        <label class="agents-toggle-row">
-          <tf-toggle id="agent-ed-routable" ${agent ? (agent.routable ? 'checked' : '') : 'checked'}></tf-toggle>
-          <span>${escapeHtml(I18n.t('agents.label_routable'))}</span>
-        </label>
-        <label class="agents-toggle-row">
-          <tf-toggle id="agent-ed-enabled" ${agent ? (agent.is_enabled ? 'checked' : '') : 'checked'}></tf-toggle>
-          <span>${escapeHtml(I18n.t('agents.label_enabled'))}</span>
-        </label>
+      <div class="agents-toggle-card">
+        <tf-toggle id="agent-wz-routable" ${agent ? (agent.routable ? 'checked' : '') : 'checked'}></tf-toggle>
+        <div>
+          <div class="agents-toggle-name">${escapeHtml(t('label_routable'))}</div>
+          <div class="agents-field-hint">${escapeHtml(t('routable_desc'))}</div>
+        </div>
       </div>
-
-      <div class="agents-form-error" data-form-error hidden></div>
+      <div class="agents-toggle-card">
+        <tf-toggle id="agent-wz-enabled" ${agent ? (agent.is_enabled ? 'checked' : '') : 'checked'}></tf-toggle>
+        <div>
+          <div class="agents-toggle-name">${escapeHtml(t('label_enabled'))}</div>
+          <div class="agents-field-hint">${escapeHtml(t('enabled_desc'))}</div>
+        </div>
+      </div>
     </div>
 
-    <div class="agents-tab-panel" data-panel="runs" hidden>
-      <div id="agent-ed-runs-host" class="agents-runs-host"></div>
-    </div>
+    <div class="agents-form-error" data-form-error hidden></div>
   `;
 }
 
-function editorFooterHtml(mode) {
-  const saveLabel = I18n.t(mode === 'create' ? 'agents.action_create' : 'agents.action_save');
-  return `
-    <div class="agents-footer-left"></div>
-    <div class="agents-footer-right">
-      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('agents.action_cancel'))}</tf-button>
-      <tf-button variant="primary" data-action="save">${escapeHtml(saveLabel)}</tf-button>
-    </div>
-  `;
-}
+function wireWizard() {
+  const wz = state.wizard;
 
-function switchEditorTab(tabId) {
-  const ed = state.editor;
-  if (!ed) return;
-  ed.body.querySelectorAll('.agents-tab-panel').forEach((panel) => {
-    panel.hidden = panel.dataset.panel !== tabId;
+  wz.foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    if (btn.dataset.action === 'cancel') {
+      wz.cleanup();
+    } else if (btn.dataset.action === 'back') {
+      if (wz.step > 1) setWizardStep(wz.step - 1);
+    } else if (btn.dataset.action === 'next') {
+      const error = validateWizardStep(wz.step);
+      if (error) {
+        showFormError(error);
+        return;
+      }
+      showFormError(null);
+      if (wz.step < 3) setWizardStep(wz.step + 1);
+      else await saveWizard();
+    }
   });
-  // The footer save button only applies to the Settings tab.
-  const foot = ed.win.querySelector('.agents-editor-footer');
-  if (foot) foot.style.visibility = tabId === 'settings' ? 'visible' : 'hidden';
-  if (tabId === 'runs' && !ed.runsLoaded) {
-    ed.runsLoaded = true;
-    loadEditorRuns();
+
+  wz.win.addEventListener('action', (e) => {
+    if (e.detail?.action === 'close') wz.cleanup();
+  });
+
+  wz.body.querySelector('[data-open-assist]')?.addEventListener('click', () => openAssist());
+
+  wz.body.querySelectorAll('[data-persona]').forEach((card) => {
+    card.addEventListener('click', () => applyPersona(card.dataset.persona));
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        applyPersona(card.dataset.persona);
+      }
+    });
+  });
+
+  const slider = wz.body.querySelector('#agent-wz-max-iterations');
+  const sliderVal = wz.body.querySelector('[data-iterations-val]');
+  slider?.addEventListener('input', (e) => {
+    if (sliderVal) sliderVal.textContent = String(e.detail?.value ?? slider.value);
+  });
+}
+
+function setWizardStep(step) {
+  const wz = state.wizard;
+  if (!wz) return;
+  wz.step = step;
+  wz.body.querySelectorAll('[data-step-panel]').forEach((panel) => {
+    panel.hidden = Number(panel.dataset.stepPanel) !== step;
+  });
+  wz.body.querySelectorAll('[data-step-pill]').forEach((pill) => {
+    const n = Number(pill.dataset.stepPill);
+    pill.classList.toggle('is-active', n === step);
+    pill.classList.toggle('is-done', n < step);
+  });
+  wz.body.querySelectorAll('[data-step-line]').forEach((line) => {
+    line.classList.toggle('is-done', Number(line.dataset.stepLine) < step);
+  });
+  const backBtn = wz.foot.querySelector('[data-action="back"]');
+  if (backBtn) backBtn.style.visibility = step > 1 ? 'visible' : 'hidden';
+  const nextBtn = wz.foot.querySelector('[data-action="next"]');
+  if (nextBtn) {
+    if (step < 3) {
+      nextBtn.setAttribute('icon', 'chevron-right');
+      nextBtn.setAttribute('label', t('wizard_next'));
+    } else {
+      nextBtn.setAttribute('icon', wz.mode === 'create' ? 'play' : 'check');
+      nextBtn.setAttribute('label', t(wz.mode === 'create' ? 'wizard_save_try' : 'action_save'));
+    }
+  }
+}
+
+// Persona presets only overwrite text the operator has not customised: an
+// empty field or the text of the previously applied persona.
+function applyPersona(personaId) {
+  const wz = state.wizard;
+  if (!wz) return;
+  wz.body.querySelectorAll('[data-persona]').forEach((card) => {
+    card.classList.toggle('is-selected', card.dataset.persona === personaId);
+  });
+  const description = wz.body.querySelector('#agent-wz-description');
+  const systemPrompt = wz.body.querySelector('#agent-wz-system-prompt');
+  const prev = wz.appliedPersona;
+  if (personaId !== 'custom') {
+    const desc = t(`persona_${personaId}_desc`);
+    const prompt = t(`persona_${personaId}_prompt`);
+    if (description && (!description.value.trim() || description.value === prev?.desc)) {
+      description.value = desc;
+    }
+    if (systemPrompt && (!systemPrompt.value.trim() || systemPrompt.value === prev?.prompt)) {
+      systemPrompt.value = prompt;
+    }
+    wz.appliedPersona = { id: personaId, desc, prompt };
+  } else {
+    wz.appliedPersona = { id: personaId, desc: '', prompt: '' };
   }
 }
 
 // =============================================================================
-// Tool picker (addon groups + addon.* wildcard + core.*)
+// Tool picker (collapsible addon groups with wildcard group toggles + core)
 // =============================================================================
 
 function renderToolPicker() {
-  const ed = state.editor;
-  const host = ed?.body.querySelector('#agent-ed-tools');
+  const wz = state.wizard;
+  const host = wz?.body.querySelector('#agent-wz-tools');
   if (!host) return;
-  const { addons, core } = ed.catalog;
+  const { addons, core } = wz.catalog;
 
   if (!addons.length && !core.length) {
-    host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.tools_empty'))}</div>`;
+    host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(t('tools_empty'))}</div>`;
     return;
   }
 
-  const groupHtml = (group) => {
+  const toolRow = (name, description, disabled) => `
+    <div class="agents-tool-item">
+      <span class="agents-tool-name">${escapeHtml(name)}</span>
+      <span class="agents-tool-desc" title="${escapeAttr(description || '')}">${escapeHtml(description || '')}</span>
+      <tf-toggle data-tool="${escapeAttr(name)}" ${wz.selectedTools.has(name) ? 'checked' : ''} ${disabled ? 'disabled' : ''}></tf-toggle>
+    </div>
+  `;
+
+  const addonGroup = (group) => {
     const wildcard = `${group.addon_id}.*`;
-    const toolRows = group.tools.map((t) => `
-      <label class="agents-tool-row">
-        <tf-checkbox data-tool="${escapeAttr(t.name)}" ${ed.selectedTools.has(t.name) ? 'checked' : ''}></tf-checkbox>
-        <span class="agents-tool-name">${escapeHtml(t.name)}</span>
-        <span class="agents-tool-desc" title="${escapeAttr(t.description)}">${escapeHtml(t.description)}</span>
-      </label>
-    `).join('');
+    const wildcardOn = wz.selectedTools.has(wildcard);
     return `
-      <div class="agents-tool-group">
-        <div class="agents-tool-group-head">
+      <div class="agents-tool-group" data-group="${escapeAttr(group.addon_id)}">
+        <div class="agents-tool-group-head" data-group-head role="button" tabindex="0">
           <tf-chip status="accent">${escapeHtml(group.addon_id)}</tf-chip>
-          <label class="agents-tool-row agents-tool-wildcard">
-            <tf-checkbox data-tool="${escapeAttr(wildcard)}" ${ed.selectedTools.has(wildcard) ? 'checked' : ''}></tf-checkbox>
-            <span class="agents-tool-name">${escapeHtml(wildcard)}</span>
-            <span class="agents-tool-desc">${escapeHtml(I18n.t('agents.tool_wildcard_hint'))}</span>
-          </label>
+          <span class="agents-tool-group-sub">${escapeHtml(t('tool_wildcard_hint'))}</span>
+          <tf-toggle data-group-toggle="${escapeAttr(wildcard)}" ${wildcardOn ? 'checked' : ''}></tf-toggle>
+          <span class="agents-tool-chev">${sprite('chevron-down')}</span>
         </div>
-        ${toolRows}
+        <div class="agents-tool-group-body" hidden>
+          ${group.tools.map((tool) => toolRow(tool.name, tool.description, wildcardOn)).join('')}
+        </div>
       </div>
     `;
   };
 
-  const coreHtml = core.length ? `
-    <div class="agents-tool-group">
-      <div class="agents-tool-group-head">
-        <tf-chip status="info">core</tf-chip>
+  const coreGroup = core.length ? `
+    <div class="agents-tool-group" data-group="core">
+      <div class="agents-tool-group-head" data-group-head role="button" tabindex="0">
+        <tf-chip status="info">${escapeHtml(t('tools_group_core'))}</tf-chip>
+        <span class="agents-tool-group-sub">${escapeHtml(t('tools_core_sub'))}</span>
+        <span class="agents-tool-chev">${sprite('chevron-down')}</span>
       </div>
-      ${core.map((t) => `
-        <label class="agents-tool-row">
-          <tf-checkbox data-tool="${escapeAttr(t.name)}" ${ed.selectedTools.has(t.name) ? 'checked' : ''}></tf-checkbox>
-          <span class="agents-tool-name">${escapeHtml(t.name)}</span>
-          <span class="agents-tool-desc" title="${escapeAttr(t.description)}">${escapeHtml(t.description)}</span>
-        </label>
-      `).join('')}
+      <div class="agents-tool-group-body" hidden>
+        ${core.map((tool) => toolRow(tool.name, tool.description, false)).join('')}
+      </div>
     </div>
   ` : '';
 
-  host.innerHTML = addons.map(groupHtml).join('') + coreHtml;
+  host.innerHTML = addons.map(addonGroup).join('') + coreGroup;
+
+  // Guard: renderToolPicker re-runs after an assistant insert — the delegated
+  // listeners must attach exactly once or a group toggle would fire twice.
+  if (host.dataset.wired) return;
+  host.dataset.wired = '1';
+
+  host.addEventListener('click', (e) => {
+    if (e.target.closest('tf-toggle')) return;
+    const head = e.target.closest('[data-group-head]');
+    if (!head) return;
+    const group = head.closest('.agents-tool-group');
+    const body = group?.querySelector('.agents-tool-group-body');
+    if (body) {
+      body.hidden = !body.hidden;
+      group.classList.toggle('is-open', !body.hidden);
+    }
+  });
 
   host.addEventListener('change', (e) => {
-    const cb = e.target.closest('tf-checkbox[data-tool]');
-    if (!cb) return;
-    const name = cb.dataset.tool;
-    const checked = e.detail?.checked ?? cb.hasAttribute('checked');
-    if (checked) ed.selectedTools.add(name);
-    else ed.selectedTools.delete(name);
+    const groupToggle = e.target.closest('tf-toggle[data-group-toggle]');
+    if (groupToggle) {
+      const wildcard = groupToggle.dataset.groupToggle;
+      const checked = e.detail?.checked ?? groupToggle.hasAttribute('checked');
+      if (checked) wz.selectedTools.add(wildcard);
+      else wz.selectedTools.delete(wildcard);
+      // A wildcard covers the whole addon — individual rows lock while it is on.
+      const group = groupToggle.closest('.agents-tool-group');
+      group?.querySelectorAll('tf-toggle[data-tool]').forEach((tg) => {
+        if (checked) tg.setAttribute('disabled', '');
+        else tg.removeAttribute('disabled');
+      });
+      return;
+    }
+    const toolToggle = e.target.closest('tf-toggle[data-tool]');
+    if (!toolToggle) return;
+    const name = toolToggle.dataset.tool;
+    const checked = e.detail?.checked ?? toolToggle.hasAttribute('checked');
+    if (checked) wz.selectedTools.add(name);
+    else wz.selectedTools.delete(name);
   });
 }
 
@@ -801,35 +1362,35 @@ function renderToolPicker() {
 
 function allSkillTags() {
   const set = new Set();
-  for (const skill of state.editor?.skills ?? []) {
+  for (const skill of state.wizard?.skills ?? []) {
     for (const tag of parseStringArray(skill.tags_json)) set.add(tag);
   }
   return [...set].sort();
 }
 
 function renderSkillPicker() {
-  const ed = state.editor;
-  const host = ed?.body.querySelector('#agent-ed-skills');
+  const wz = state.wizard;
+  const host = wz?.body.querySelector('#agent-wz-skills');
   if (!host) return;
 
   const tags = allSkillTags();
-  const skills = ed.skills;
+  const skills = wz.skills;
 
   if (!skills.length && !tags.length) {
-    host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.skills_empty'))}</div>`;
+    host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(t('skills_empty'))}</div>`;
     return;
   }
 
   const tagRows = tags.map((tag) => `
     <label class="agents-skill-row">
-      <tf-checkbox data-skill-tag="${escapeAttr(tag)}" ${ed.selectedSkillTags.has(tag) ? 'checked' : ''}></tf-checkbox>
+      <tf-checkbox data-skill-tag="${escapeAttr(tag)}" ${wz.selectedSkillTags.has(tag) ? 'checked' : ''}></tf-checkbox>
       <tf-chip status="info">#${escapeHtml(tag)}</tf-chip>
     </label>
   `).join('');
 
   const nameRows = skills.map((s) => `
     <label class="agents-skill-row">
-      <tf-checkbox data-skill-name="${escapeAttr(s.name)}" ${ed.selectedSkillNames.has(s.name) ? 'checked' : ''}></tf-checkbox>
+      <tf-checkbox data-skill-name="${escapeAttr(s.name)}" ${wz.selectedSkillNames.has(s.name) ? 'checked' : ''}></tf-checkbox>
       <span class="agents-skill-name">${escapeHtml(s.name)}</span>
       <span class="agents-skill-desc" title="${escapeAttr(s.description || '')}">${escapeHtml(s.description || '')}</span>
     </label>
@@ -837,11 +1398,11 @@ function renderSkillPicker() {
 
   host.innerHTML = `
     ${tags.length ? `<div class="agents-skill-section">
-      <div class="agents-field-hint">${escapeHtml(I18n.t('agents.skills_by_tag'))}</div>
+      <div class="agents-field-hint">${escapeHtml(t('skills_by_tag'))}</div>
       ${tagRows}
     </div>` : ''}
     ${skills.length ? `<div class="agents-skill-section">
-      <div class="agents-field-hint">${escapeHtml(I18n.t('agents.skills_by_name'))}</div>
+      <div class="agents-field-hint">${escapeHtml(t('skills_by_name'))}</div>
       ${nameRows}
     </div>` : ''}
   `;
@@ -851,83 +1412,13 @@ function renderSkillPicker() {
     if (!cb) return;
     const checked = e.detail?.checked ?? cb.hasAttribute('checked');
     if (cb.dataset.skillName !== undefined) {
-      if (checked) ed.selectedSkillNames.add(cb.dataset.skillName);
-      else ed.selectedSkillNames.delete(cb.dataset.skillName);
+      if (checked) wz.selectedSkillNames.add(cb.dataset.skillName);
+      else wz.selectedSkillNames.delete(cb.dataset.skillName);
     } else if (cb.dataset.skillTag !== undefined) {
-      if (checked) ed.selectedSkillTags.add(cb.dataset.skillTag);
-      else ed.selectedSkillTags.delete(cb.dataset.skillTag);
+      if (checked) wz.selectedSkillTags.add(cb.dataset.skillTag);
+      else wz.selectedSkillTags.delete(cb.dataset.skillTag);
     }
   });
-}
-
-// =============================================================================
-// Runs tab
-// =============================================================================
-
-async function loadEditorRuns() {
-  const ed = state.editor;
-  const host = ed?.body.querySelector('#agent-ed-runs-host');
-  if (!host || !ed.agent) return;
-  host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.runs_loading'))}</div>`;
-  let runs = [];
-  try {
-    const resp = await ApiBinary.one('agentRunsListRequest', { agentId: ed.agent.id });
-    runs = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
-  } catch (err) {
-    host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${I18n.t('agents.runs_failed')}: ${err.message}`)}</div>`;
-    return;
-  }
-  if (!Array.isArray(runs) || !runs.length) {
-    host.innerHTML = `<tf-empty-state icon="clock" title="${escapeAttr(I18n.t('agents.runs_empty'))}"></tf-empty-state>`;
-    return;
-  }
-
-  host.innerHTML = `
-    <tf-table id="agent-runs-table" sortable>
-      <tf-column key="status" label="${escapeAttr(I18n.t('agents.runs_col_status'))}" renderer="chip"></tf-column>
-      <tf-column key="iterations" label="${escapeAttr(I18n.t('agents.runs_col_iterations'))}" renderer="num" sortable></tf-column>
-      <tf-column key="tokens" label="${escapeAttr(I18n.t('agents.runs_col_tokens'))}" renderer="num" sortable></tf-column>
-      <tf-column key="exit_reason" label="${escapeAttr(I18n.t('agents.runs_col_exit'))}"></tf-column>
-      <tf-column key="created" label="${escapeAttr(I18n.t('agents.runs_col_created'))}" sortable></tf-column>
-    </tf-table>
-    <div id="agent-run-detail-host" class="agents-run-detail"></div>
-  `;
-
-  const table = host.querySelector('#agent-runs-table');
-  table.rows = runs.map((r) => ({
-    _id: r.id,
-    status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
-    iterations: r.iterations ?? 0,
-    tokens: r.total_tokens ?? 0,
-    exit_reason: r.exit_reason || '—',
-    created: formatTimestamp(r.created_at),
-  }));
-  table.addEventListener('row-click', (e) => {
-    const id = e.detail?.row?._id;
-    if (id) loadRunDetail(id);
-  });
-}
-
-async function loadRunDetail(runId) {
-  const host = state.editor?.body.querySelector('#agent-run-detail-host');
-  if (!host) return;
-  host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(I18n.t('agents.runs_loading'))}</div>`;
-  let run = null;
-  try {
-    const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
-    run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
-  } catch (err) {
-    host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${I18n.t('agents.run_detail_failed')}: ${err.message}`)}</div>`;
-    return;
-  }
-  if (!run) return;
-  // Same shared renderer as the top-level Runs tab (one renderer, two contexts).
-  state.runSteps.set(run.id, runLogToSteps(run));
-  host.innerHTML = renderRunDetail(run);
-}
-
-function runStatusLabel(status) {
-  return RUN_STATUS_CHIP[status] ? I18n.t(`agents.run_status_${status}`) : status;
 }
 
 // =============================================================================
@@ -957,142 +1448,761 @@ async function loadSkillList() {
   }
 }
 
-async function loadModels() {
-  try {
-    const list = await ApiBinary.list('modelListRequest', { arrayKey: 'models' });
-    return (Array.isArray(list) ? list : []).map((m) => {
+// Models + aliases merged into one option list (same pattern as the Flow
+// Builder model picker): LLM models first, then active aliases whose target is
+// an LLM model, rendered as "↪ alias → target".
+async function loadModelOptions() {
+  const [modelsRaw, aliasesRaw] = await Promise.all([
+    ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+    ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
+  ]);
+  const models = Array.isArray(modelsRaw) ? modelsRaw : [];
+  const aliases = Array.isArray(aliasesRaw) ? aliasesRaw : [];
+  const modelByName = new Map();
+  for (const m of models) {
+    const name = m.model_name || m.modelName;
+    if (name) modelByName.set(name, m);
+  }
+  const opts = models
+    .filter((m) => (m.category || '').toLowerCase() === 'llm')
+    .map((m) => {
       const value = m.model_name || m.modelName || '';
       const display = m.display_name || m.displayName || value;
       const engine = m.engine_id || m.engineId;
       return { value, label: engine ? `${display} (${engine})` : display };
-    }).filter((o) => o.value);
-  } catch {
-    return [];
+    })
+    .filter((o) => o.value);
+  for (const a of aliases) {
+    if (a.is_active === false || a.isActive === false) continue;
+    const target = a.target_model || a.targetModel;
+    const targetModel = target ? modelByName.get(target) : null;
+    if (!targetModel) continue;
+    if ((targetModel.category || '').toLowerCase() !== 'llm') continue;
+    opts.push({ value: a.alias, label: `↪ ${a.alias} → ${target}` });
   }
+  return opts;
 }
 
 // =============================================================================
-// Save / validation
+// Wizard save / validation
 // =============================================================================
-
-function wireEditor(foot) {
-  const ed = state.editor;
-
-  ed.body.querySelector('#agent-ed-tabs')?.addEventListener('change', (e) => {
-    const id = e.detail?.value;
-    if (id) switchEditorTab(id);
-  });
-
-  foot.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-action]');
-    if (!btn) return;
-    if (btn.dataset.action === 'cancel') ed.cleanup();
-    else if (btn.dataset.action === 'save') await saveEditor();
-  });
-
-  ed.win.addEventListener('action', (e) => {
-    if (e.detail?.action === 'close') ed.cleanup();
-  });
-}
 
 function showFormError(message) {
-  const el = state.editor?.body.querySelector('[data-form-error]');
+  const el = state.wizard?.body.querySelector('[data-form-error]');
   if (!el) {
-    toast(message, 'error');
+    if (message) toast(message, 'error');
     return;
   }
-  el.hidden = false;
-  el.textContent = message;
+  el.hidden = !message;
+  el.textContent = message || '';
 }
 
 function intField(sel, fallback) {
-  const raw = state.editor?.body.querySelector(sel)?.value;
+  const raw = state.wizard?.body.querySelector(sel)?.value;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) ? n : fallback;
 }
 
-async function saveEditor() {
-  const ed = state.editor;
-  if (!ed) return;
-  const field = (sel) => ed.body.querySelector(sel);
+function validateWizardStep(step) {
+  const wz = state.wizard;
+  const field = (sel) => wz.body.querySelector(sel);
+  if (step === 1) {
+    const name = (field('#agent-wz-name')?.value || '').trim();
+    if (!KEBAB_REGEX.test(name) || name.length > NAME_MAX_CHARS) {
+      return t('err_name', { max: NAME_MAX_CHARS });
+    }
+    const description = (field('#agent-wz-description')?.value || '').trim();
+    if (!description) return t('err_description');
+    return null;
+  }
+  if (step === 3) {
+    const maxIterations = Number.parseInt(field('#agent-wz-max-iterations')?.value, 10) || 0;
+    if (maxIterations < 1 || maxIterations > MAX_ITERATIONS_CAP) {
+      return t('err_max_iterations', { max: MAX_ITERATIONS_CAP });
+    }
+    if (intField('#agent-wz-timeout-secs', 0) < 1) return t('err_timeout');
+    if (intField('#agent-wz-max-spawn-depth', 0) < 1) return t('err_max_spawn_depth');
+    return null;
+  }
+  return null;
+}
 
-  const name = (field('#agent-ed-name')?.value || '').trim();
-  const displayName = (field('#agent-ed-display-name')?.value || '').trim();
-  const description = (field('#agent-ed-description')?.value || '').trim();
-  const systemPrompt = (field('#agent-ed-system-prompt')?.value || '').trim();
-  const model = (field('#agent-ed-model')?.value || '').trim();
-  const flowId = (field('#agent-ed-flow-id')?.value || '').trim();
-  const maxIterations = intField('#agent-ed-max-iterations', 25);
-  const timeoutSecs = intField('#agent-ed-timeout-secs', 600);
-  const maxSubagents = intField('#agent-ed-max-subagents', 0);
-  const maxSpawnDepth = intField('#agent-ed-max-spawn-depth', 1);
-  const onChildComplete = (field('#agent-ed-on-child-complete')?.value || 'notify').trim();
-  const routable = field('#agent-ed-routable')?.hasAttribute('checked') ?? true;
-  const isEnabled = field('#agent-ed-enabled')?.hasAttribute('checked') ?? true;
+async function saveWizard() {
+  const wz = state.wizard;
+  if (!wz) return;
+  const field = (sel) => wz.body.querySelector(sel);
 
-  const error = validateEditableFields(name, description, maxIterations, timeoutSecs, maxSpawnDepth);
-  if (error) {
-    showFormError(error);
+  const step1Error = validateWizardStep(1);
+  if (step1Error) {
+    setWizardStep(1);
+    showFormError(step1Error);
     return;
   }
 
+  const name = (field('#agent-wz-name')?.value || '').trim();
   const payload = {
     name,
-    display_name: displayName || null,
-    description,
-    system_prompt: systemPrompt || null,
-    model: model || null,
-    tools: [...ed.selectedTools],
+    display_name: (field('#agent-wz-display-name')?.value || '').trim() || null,
+    description: (field('#agent-wz-description')?.value || '').trim(),
+    system_prompt: (field('#agent-wz-system-prompt')?.value || '').trim() || null,
+    model: (field('#agent-wz-model')?.value || '').trim() || null,
+    tools: [...wz.selectedTools],
     skills: {
-      names: [...ed.selectedSkillNames],
-      tags: [...ed.selectedSkillTags],
+      names: [...wz.selectedSkillNames],
+      tags: [...wz.selectedSkillTags],
     },
-    params: ed.agent ? safeParseParams(ed.agent.params_json) : {},
-    max_iterations: maxIterations,
-    timeout_secs: timeoutSecs,
-    max_subagents: maxSubagents,
-    max_spawn_depth: maxSpawnDepth,
-    on_child_complete: onChildComplete,
-    flow_id: flowId || null,
-    routable,
-    is_enabled: isEnabled,
+    params: wz.sourceParams,
+    max_iterations: Number.parseInt(field('#agent-wz-max-iterations')?.value, 10) || 25,
+    timeout_secs: intField('#agent-wz-timeout-secs', 600),
+    max_subagents: intField('#agent-wz-max-subagents', 0),
+    max_spawn_depth: intField('#agent-wz-max-spawn-depth', 1),
+    on_child_complete: (field('#agent-wz-on-child-complete')?.value || 'notify').trim(),
+    flow_id: (field('#agent-wz-flow-id')?.value || '').trim() || null,
+    routable: field('#agent-wz-routable')?.hasAttribute('checked') ?? true,
+    is_enabled: field('#agent-wz-enabled')?.hasAttribute('checked') ?? true,
   };
-  if (ed.mode === 'edit') payload.id = ed.agent.id;
+  if (wz.mode === 'edit') payload.id = wz.agent.id;
 
   try {
     await ApiBinary.one('agentsUpsertRequest', { agentJson: JSON.stringify(payload) });
-    toast(I18n.t(ed.mode === 'create' ? 'agents.create_ok' : 'agents.save_ok'), 'success');
-    ed.cleanup();
+    toast(t(wz.mode === 'create' ? 'create_ok' : 'save_ok'), 'success');
+    const wasCreate = wz.mode === 'create';
+    wz.cleanup();
     await loadAgents();
+    if (wasCreate) {
+      // "Save and try out": jump straight into the new agent's playground.
+      const created = state.agents.find((a) => a.name === name);
+      if (created) openPlayground(created.id);
+    } else if (state.playground?.agent?.id === payload.id) {
+      const fresh = await fetchAgentDetail(payload.id).catch(() => null);
+      if (fresh) {
+        state.playground.agent = fresh;
+        renderPlaygroundHeader();
+      }
+    }
   } catch (err) {
     showFormError(err.message);
   }
 }
 
-function safeParseParams(json) {
+// =============================================================================
+// Builder assistant (A04) — chat window over the wizard
+// =============================================================================
+
+function openAssist() {
+  const wz = state.wizard;
+  if (!wz) return;
+  state.assist?.cleanup();
+
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', t('assist_title'));
+  win.setAttribute('subtitle', t('assist_sub_working'));
+  win.setAttribute('icon', 'sparkle');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', '680');
+  win.setAttribute('draggable', '');
+
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.className = 'agents-assist';
+  body.innerHTML = `
+    <div class="agents-pg-banner">
+      ${sprite('message')}
+      <span>${escapeHtml(t('assist_banner'))}</span>
+    </div>
+    <div class="agents-assist-chat" data-assist-chat></div>
+    <div class="agents-assist-proposal" data-assist-proposal hidden></div>
+    <tf-chat-composer placeholder="${escapeAttr(t('assist_placeholder'))}"></tf-chat-composer>
+  `;
+  win.appendChild(body);
+
+  const foot = document.createElement('div');
+  foot.slot = 'footer';
+  foot.className = 'agents-editor-footer';
+  foot.innerHTML = `
+    <div class="agents-footer-left">
+      <tf-button variant="ghost" data-assist-action="skip">${escapeHtml(t('assist_skip'))}</tf-button>
+    </div>
+    <div class="agents-footer-right">
+      <tf-button variant="ghost" data-assist-action="reject" hidden>${escapeHtml(t('assist_reject'))}</tf-button>
+      <tf-button variant="ghost" icon="refresh" data-assist-action="regenerate" hidden>${escapeHtml(t('assist_regenerate'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-assist-action="insert" disabled>${escapeHtml(t('assist_insert'))}</tf-button>
+    </div>
+  `;
+  win.appendChild(foot);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.append(backdrop, win);
+
+  const cleanup = () => {
+    if (win.isConnected) win.close(true);
+    if (backdrop.isConnected) backdrop.remove();
+    if (state.assist?.win === win) state.assist = null;
+  };
+  win.addEventListener('close-request', () => {
+    if (backdrop.isConnected) backdrop.remove();
+    if (state.assist?.win === win) state.assist = null;
+  });
+  win.addEventListener('action', (e) => {
+    if (e.detail?.action === 'close') cleanup();
+  });
+
+  state.assist = {
+    win,
+    body,
+    foot,
+    // The intro question is part of the transcript so the backend sees the
+    // same conversation the operator sees.
+    messages: [{ role: 'assistant', content: t('assist_intro') }],
+    proposal: null,
+    busy: false,
+    cleanup,
+  };
+
+  body.querySelector('tf-chat-composer')?.addEventListener('send', (e) => {
+    const text = String(e.detail?.text ?? '').trim();
+    if (text) sendAssistMessage(text);
+  });
+
+  foot.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-assist-action]');
+    if (!btn || btn.hasAttribute('disabled')) return;
+    const action = btn.dataset.assistAction;
+    if (action === 'skip') cleanup();
+    else if (action === 'insert') insertAssistProposal();
+    else if (action === 'reject') rejectAssistProposal();
+    else if (action === 'regenerate') regenerateAssistProposal();
+  });
+
+  renderAssist();
+}
+
+function renderAssist() {
+  const as = state.assist;
+  if (!as) return;
+  const chat = as.body.querySelector('[data-assist-chat]');
+  if (chat) {
+    const bubbles = as.messages.map((m) => `
+      <tf-chat-bubble role="${m.role === 'user' ? 'user' : 'assistant'}"
+        sender="${escapeAttr(m.role === 'user' ? '' : t('assist_title'))}">${escapeHtml(m.content)}</tf-chat-bubble>
+    `).join('');
+    const typing = as.busy
+      ? `<tf-chat-bubble role="assistant" streaming sender="${escapeAttr(t('assist_title'))}"></tf-chat-bubble>`
+      : '';
+    chat.innerHTML = bubbles + typing;
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  const proposalHost = as.body.querySelector('[data-assist-proposal]');
+  if (proposalHost) {
+    if (as.proposal) {
+      proposalHost.hidden = false;
+      proposalHost.innerHTML = assistProposalHtml(as.proposal);
+    } else {
+      proposalHost.hidden = true;
+      proposalHost.innerHTML = '';
+    }
+  }
+
+  as.win.setAttribute('subtitle', t(as.proposal ? 'assist_sub_ready' : 'assist_sub_working'));
+
+  const composer = as.body.querySelector('tf-chat-composer');
+  if (composer) {
+    if (as.busy) composer.setAttribute('disabled', '');
+    else composer.removeAttribute('disabled');
+  }
+  const insertBtn = as.foot.querySelector('[data-assist-action="insert"]');
+  if (insertBtn) {
+    if (as.proposal && !as.busy) insertBtn.removeAttribute('disabled');
+    else insertBtn.setAttribute('disabled', '');
+  }
+  const rejectBtn = as.foot.querySelector('[data-assist-action="reject"]');
+  if (rejectBtn) rejectBtn.hidden = !as.proposal;
+  const regenBtn = as.foot.querySelector('[data-assist-action="regenerate"]');
+  if (regenBtn) regenBtn.hidden = !as.proposal;
+}
+
+function assistProposalHtml(proposal) {
+  const tools = Array.isArray(proposal.tools) ? proposal.tools : [];
+  const toolRows = tools.map((name) => `
+    <div class="agents-assist-tool">
+      ${sprite('bolt')}
+      <span class="agents-tool-name">${escapeHtml(name)}</span>
+    </div>
+  `).join('');
+  return `
+    <div class="agents-assist-chips">
+      <tf-chip status="accent">${escapeHtml(t('assist_name_chip'))}: ${escapeHtml(proposal.display_name || proposal.name || '')}</tf-chip>
+      ${proposal.max_iterations ? `<tf-chip>${escapeHtml(t('label_max_iterations'))}: ${escapeHtml(String(proposal.max_iterations))}</tf-chip>` : ''}
+    </div>
+    <div class="agents-field">
+      <span class="tf-label">${escapeHtml(t('assist_prompt_label'))}</span>
+      <div class="agents-assist-prompt">${escapeHtml(proposal.system_prompt || '')}</div>
+    </div>
+    ${tools.length ? `<div class="agents-field">
+      <span class="tf-label">${escapeHtml(t('assist_tools_label'))}</span>
+      ${toolRows}
+    </div>` : ''}
+  `;
+}
+
+async function sendAssistMessage(text) {
+  const as = state.assist;
+  if (!as || as.busy) return;
+  as.messages.push({ role: 'user', content: text });
+  await requestAssistTurn();
+}
+
+// Re-asks the backend with the transcript trimmed back to the last user
+// message, so a regenerate produces a fresh reply for the same context.
+async function regenerateAssistProposal() {
+  const as = state.assist;
+  if (!as || as.busy) return;
+  while (as.messages.length && as.messages[as.messages.length - 1].role === 'assistant') {
+    as.messages.pop();
+  }
+  as.proposal = null;
+  await requestAssistTurn();
+}
+
+function rejectAssistProposal() {
+  const as = state.assist;
+  if (!as) return;
+  as.proposal = null;
+  renderAssist();
+}
+
+async function requestAssistTurn() {
+  const as = state.assist;
+  if (!as) return;
+  as.busy = true;
+  renderAssist();
   try {
-    const obj = JSON.parse(json || '{}');
-    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
-  } catch {
-    return {};
+    const resp = await ApiBinary.one('agentBuilderAssistRequest', {
+      messagesJson: JSON.stringify(as.messages),
+    });
+    const result = JSON.parse(resp.resultJson ?? resp.result_json ?? '{}');
+    if (state.assist !== as) return;
+    if (result.reply) as.messages.push({ role: 'assistant', content: String(result.reply) });
+    as.proposal = result.proposal && typeof result.proposal === 'object' ? result.proposal : null;
+  } catch (err) {
+    if (state.assist !== as) return;
+    toast(`${t('assist_failed')}: ${err.message}`, 'error');
+  } finally {
+    if (state.assist === as) {
+      as.busy = false;
+      renderAssist();
+    }
   }
 }
 
-function validateEditableFields(name, description, maxIterations, timeoutSecs, maxSpawnDepth) {
-  if (!KEBAB_REGEX.test(name) || name.length > NAME_MAX_CHARS) {
-    return I18n.t('agents.err_name', { max: NAME_MAX_CHARS });
+function kebabize(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/ł/g, 'l')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, NAME_MAX_CHARS)
+    .replace(/-+$/g, '');
+}
+
+function insertAssistProposal() {
+  const as = state.assist;
+  const wz = state.wizard;
+  if (!as?.proposal || !wz) return;
+  const p = as.proposal;
+  const field = (sel) => wz.body.querySelector(sel);
+
+  const nameField = field('#agent-wz-name');
+  const proposedName = kebabize(p.name || p.display_name);
+  if (nameField && proposedName && !nameField.value.trim()) nameField.value = proposedName;
+  const displayField = field('#agent-wz-display-name');
+  if (displayField && p.display_name) displayField.value = String(p.display_name);
+  const descField = field('#agent-wz-description');
+  if (descField && p.description) descField.value = String(p.description);
+  const promptField = field('#agent-wz-system-prompt');
+  if (promptField && p.system_prompt) promptField.value = String(p.system_prompt);
+
+  const proposedIterations = Number.parseInt(p.max_iterations, 10);
+  if (Number.isFinite(proposedIterations) && proposedIterations >= 1) {
+    const slider = field('#agent-wz-max-iterations');
+    const capped = Math.min(proposedIterations, MAX_ITERATIONS_CAP);
+    if (slider) slider.value = String(capped);
+    const sliderVal = wz.body.querySelector('[data-iterations-val]');
+    if (sliderVal) sliderVal.textContent = String(capped);
   }
-  if (!description) {
-    return I18n.t('agents.err_description');
+
+  // Only tools that exist in the local catalog (or their addon.* wildcards)
+  // enter the allowlist — the assistant model may hallucinate tool names.
+  if (Array.isArray(p.tools) && p.tools.length) {
+    const known = new Set();
+    for (const group of wz.catalog.addons) {
+      known.add(`${group.addon_id}.*`);
+      for (const tool of group.tools) known.add(tool.name);
+    }
+    for (const tool of wz.catalog.core) known.add(tool.name);
+    for (const name of p.tools) {
+      if (typeof name === 'string' && known.has(name)) wz.selectedTools.add(name);
+    }
+    renderToolPicker();
   }
-  if (maxIterations < 1 || maxIterations > MAX_ITERATIONS_CAP) {
-    return I18n.t('agents.err_max_iterations', { max: MAX_ITERATIONS_CAP });
+
+  toast(t('assist_inserted'), 'success');
+  as.cleanup();
+}
+
+// =============================================================================
+// Team templates (A05)
+// =============================================================================
+
+function openTemplates() {
+  state.templatesWin?.cleanup();
+
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', t('tpl_title'));
+  win.setAttribute('icon', 'users');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', '760');
+  win.setAttribute('draggable', '');
+
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.className = 'agents-templates';
+  body.innerHTML = `
+    <div class="agents-field-hint">${escapeHtml(t('tpl_intro'))}</div>
+    <div class="agents-templates-head">${escapeHtml(t('tpl_ready'))} <tf-chip status="info">${TEAM_TEMPLATES.length}</tf-chip></div>
+    ${TEAM_TEMPLATES.map(templateCardHtml).join('')}
+  `;
+  win.appendChild(body);
+
+  const foot = document.createElement('div');
+  foot.slot = 'footer';
+  foot.className = 'agents-editor-footer';
+  foot.innerHTML = `
+    <div class="agents-footer-left">
+      <tf-button variant="ghost" icon="plus" data-tpl-action="own">${escapeHtml(t('tpl_own_agent'))}</tf-button>
+    </div>
+    <div class="agents-footer-right">
+      <tf-button variant="ghost" data-tpl-action="close">${escapeHtml(t('tpl_close'))}</tf-button>
+    </div>
+  `;
+  win.appendChild(foot);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.append(backdrop, win);
+
+  const cleanup = () => {
+    if (win.isConnected) win.close(true);
+    if (backdrop.isConnected) backdrop.remove();
+    if (state.templatesWin?.win === win) state.templatesWin = null;
+  };
+  win.addEventListener('close-request', () => {
+    if (backdrop.isConnected) backdrop.remove();
+    if (state.templatesWin?.win === win) state.templatesWin = null;
+  });
+  win.addEventListener('action', (e) => {
+    if (e.detail?.action === 'close') cleanup();
+  });
+
+  state.templatesWin = { win, cleanup };
+
+  body.addEventListener('click', (e) => {
+    const createBtn = e.target.closest('[data-tpl-create]');
+    if (createBtn) createTeam(createBtn.dataset.tplCreate, createBtn);
+  });
+  foot.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-tpl-action]');
+    if (!btn) return;
+    if (btn.dataset.tplAction === 'close') cleanup();
+    else if (btn.dataset.tplAction === 'own') {
+      cleanup();
+      openWizard(null);
+    }
+  });
+}
+
+function templateCardHtml(tpl) {
+  const flow = tpl.flow.map((node, i) => `
+    ${i ? `<span class="agents-tpl-arrow">${sprite('chevron-right')}</span>` : ''}
+    <span class="agents-tpl-node">
+      <span class="agents-tpl-node-ico">${sprite(node.icon)}</span>
+      <span class="agents-tpl-node-label">${escapeHtml(t(node.labelKey))}</span>
+    </span>
+  `).join('');
+  const agents = tpl.agents.map((a) => `
+    <div class="agents-tpl-agent">
+      <span class="agents-tpl-agent-ico">${sprite(a.icon)}</span>
+      <span><strong>${escapeHtml(t(a.displayKey))}</strong> — ${escapeHtml(t(a.roleKey))}</span>
+    </div>
+  `).join('');
+  return `
+    <div class="agents-tpl-card">
+      <div class="agents-tpl-ico">${sprite(tpl.icon)}</div>
+      <div class="agents-tpl-main">
+        <div class="agents-tpl-name">${escapeHtml(t(tpl.nameKey))}</div>
+        <div class="agents-tpl-desc">${escapeHtml(t(tpl.descKey))}</div>
+        <div class="agents-tpl-flow">
+          ${flow}
+          ${tpl.loop ? `<tf-chip status="info">${escapeHtml(t('tpl_loop_chip'))}</tf-chip>` : ''}
+        </div>
+        <div class="agents-tpl-agents">${agents}</div>
+        <div class="agents-tpl-foot">
+          <tf-chip status="accent">${escapeHtml(t('tpl_agents_count', { count: tpl.agents.length }))}</tf-chip>
+          <tf-button variant="primary" size="sm" icon="plus" data-tpl-create="${escapeAttr(tpl.id)}">${escapeHtml(t('tpl_create'))}</tf-button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function createTeam(templateId, btn) {
+  const tpl = TEAM_TEMPLATES.find((x) => x.id === templateId);
+  if (!tpl) return;
+
+  const existing = new Set(state.agents.map((a) => a.name));
+  const conflicts = tpl.agents.filter((a) => existing.has(a.name)).map((a) => a.name);
+  if (conflicts.length) {
+    toast(t('tpl_conflict', { names: conflicts.join(', ') }), 'error');
+    return;
   }
-  if (timeoutSecs < 1) {
-    return I18n.t('agents.err_timeout');
+
+  btn?.setAttribute('disabled', '');
+  try {
+    for (const def of tpl.agents) {
+      const payload = {
+        name: def.name,
+        display_name: t(def.displayKey),
+        description: t(def.roleKey),
+        system_prompt: t(def.promptKey),
+        model: null,
+        tools: [],
+        skills: { names: [], tags: [] },
+        params: {},
+        max_iterations: 25,
+        timeout_secs: 600,
+        max_subagents: def.maxSubagents ?? 0,
+        max_spawn_depth: def.maxSpawnDepth ?? 1,
+        on_child_complete: 'notify',
+        flow_id: null,
+        routable: true,
+        is_enabled: true,
+      };
+      await ApiBinary.one('agentsUpsertRequest', { agentJson: JSON.stringify(payload) });
+    }
+    toast(t('tpl_created', { count: tpl.agents.length }), 'success');
+    state.templatesWin?.cleanup();
+    await loadAgents();
+  } catch (err) {
+    toast(`${t('tpl_create_failed')}: ${err.message}`, 'error');
+    btn?.removeAttribute('disabled');
   }
-  if (maxSpawnDepth < 1) {
-    return I18n.t('agents.err_max_spawn_depth');
+}
+
+// =============================================================================
+// Top-level Runs tab — live run list + shared timeline + cancel (ACL per
+// principal is enforced server-side; the list only returns the caller's runs
+// unless they are an admin).
+// =============================================================================
+
+function switchTopTab(tabId) {
+  state.topTab = tabId === 'runs' ? 'runs' : 'agents';
+  document.querySelectorAll('[data-top-panel]').forEach((panel) => {
+    panel.hidden = panel.getAttribute('data-top-panel') !== state.topTab;
+  });
+  if (state.topTab === 'runs') loadRunsTab();
+  else {
+    // Leaving Runs: cancel the detail stream and invalidate any in-flight
+    // subscribe so its resolved handle is discarded rather than published.
+    state.runsSubToken += 1;
+    if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
   }
-  return null;
+}
+
+async function loadRunsTab() {
+  const host = byId('runs-table-host');
+  if (host) host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(t('runs_loading'))}</div>`;
+  try {
+    const resp = await ApiBinary.one('agentRunsListRequest', {});
+    const rows = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
+    state.runs = Array.isArray(rows) ? rows : [];
+  } catch (err) {
+    if (host) host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${t('runs_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  renderRunsTable();
+}
+
+function filteredRuns() {
+  const f = state.runsStatusFilter;
+  return state.runs.filter((r) => {
+    if (f === 'all') return true;
+    if (f === 'active') return !TERMINAL_RUN_STATUSES.includes(r.status);
+    return r.status === f;
+  });
+}
+
+function renderRunsTable() {
+  const host = byId('runs-table-host');
+  if (!host) return;
+  const runs = filteredRuns();
+  if (!runs.length) {
+    host.innerHTML = `<tf-empty-state icon="clock" title="${escapeAttr(t('runs_empty'))}"></tf-empty-state>`;
+    return;
+  }
+  host.innerHTML = `
+    <tf-table id="runs-tab-table" sortable>
+      <tf-column key="status" label="${escapeAttr(t('runs_col_status'))}" renderer="chip"></tf-column>
+      <tf-column key="agent" label="${escapeAttr(t('runs_col_agent'))}" sortable></tf-column>
+      <tf-column key="iterations" label="${escapeAttr(t('runs_col_iterations'))}" renderer="num" sortable></tf-column>
+      <tf-column key="tokens" label="${escapeAttr(t('runs_col_tokens'))}" renderer="num" sortable></tf-column>
+      <tf-column key="exit_reason" label="${escapeAttr(t('runs_col_exit'))}"></tf-column>
+      <tf-column key="created" label="${escapeAttr(t('runs_col_created'))}" sortable></tf-column>
+    </tf-table>
+  `;
+  const table = host.querySelector('#runs-tab-table');
+  table.rows = runs.map((r) => ({
+    _id: r.id,
+    _status: r.status,
+    status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
+    agent: r.agent_id || '—',
+    iterations: r.iterations ?? 0,
+    tokens: r.total_tokens ?? 0,
+    exit_reason: r.exit_reason || '—',
+    created: formatTimestamp(r.created_at),
+  }));
+  table.rowActions = buildRunRowActions;
+  table.addEventListener('row-click', (e) => {
+    const id = e.detail?.row?._id;
+    if (id) openRunDetail(id);
+  });
+}
+
+function buildRunRowActions(row) {
+  const active = !TERMINAL_RUN_STATUSES.includes(row._status);
+  if (!active) return null;
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', 'ghost');
+  btn.setAttribute('size', 'sm');
+  btn.textContent = t('action_cancel');
+  btn.addEventListener('click', () => cancelRun(row._id));
+  return btn;
+}
+
+async function cancelRun(runId) {
+  if (!runId) return;
+  try {
+    const resp = await ApiBinary.action('agentRunCancelRequest', { runId });
+    if (resp && (resp.cancelled === true || resp.cancelled === 'true')) {
+      toast(t('run_cancel_ok'), 'success');
+    }
+    await loadRunsTab();
+  } catch (err) {
+    toast(`${t('run_cancel_failed')}: ${err.message}`, 'error');
+  }
+}
+
+// Live per-step updates land in the open detail timeline via its own run-scope
+// subscription (openRunDetail). The list refreshes on tab open and on each
+// cancel — a list-wide socket would need one broadcast key per run, whereas the
+// drill-in owns a single key matching the widget's level-2 contract.
+async function openRunDetail(runId) {
+  state.selectedRunId = runId;
+  // Tear down the previous run's stream BEFORE opening a new one. A monotonic
+  // token guards the in-flight subscribe: if a newer openRunDetail (or unmount)
+  // bumps the token before the handle resolves, that handle is discarded so the
+  // stale stream cannot leak or overwrite the active handle.
+  if (state.runsUnsub) { state.runsUnsub(); state.runsUnsub = null; }
+  const token = ++state.runsSubToken;
+
+  const host = byId('runs-detail-host');
+  if (!host) return;
+  host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(t('runs_loading'))}</div>`;
+  let run = null;
+  try {
+    const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
+    run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+  } catch (err) {
+    if (state.runsSubToken === token) {
+      host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${t('run_detail_failed')}: ${err.message}`)}</div>`;
+    }
+    return;
+  }
+  if (!run || state.runsSubToken !== token) return;
+  // Seed the timeline from run_log (durable record), then append live events.
+  state.runSteps.set(runId, runLogToSteps(run));
+  host.innerHTML = renderRunDetail(run);
+
+  // Live updates for this run scope: append each AgentRunEvent as a step.
+  if (!TERMINAL_RUN_STATUSES.includes(run.status)) {
+    ApiBinary.subscribe(
+      'agentRunEventsSubscribeRequest',
+      { scopeKind: 'run', scopeId: runId },
+      {
+        onChunk: (body) => {
+          if (!body || body.variant !== 'AgentRunEvent') return;
+          if (state.selectedRunId !== runId || state.runsSubToken !== token) return;
+          const steps = state.runSteps.get(runId) || [];
+          const step = TfAgentActivity.stepsFromEvents([body], activityLabels())[0];
+          step.ts = new Date().toLocaleTimeString();
+          steps.push(step);
+          state.runSteps.set(runId, steps);
+          const tl = byId('runs-detail-host')?.querySelector('[data-run-timeline]');
+          if (tl) tl.innerHTML = TfAgentActivity.renderTimeline(steps, activityLabels());
+        },
+        onError: () => {},
+        onEnd: () => { if (state.runsSubToken === token) state.runsUnsub = null; },
+      },
+    ).then((unsub) => {
+      // A newer request (or unmount) already superseded this one — do not
+      // publish the handle; close the stream immediately.
+      if (state.runsSubToken !== token) { unsub(); return; }
+      state.runsUnsub = unsub;
+    }).catch(() => {});
+  }
+}
+
+// run_log is a JSON array of harness step objects. Map them onto the shared
+// timeline's step shape so live events and durable history render identically.
+function runLogToSteps(run) {
+  let raw = [];
+  try {
+    const parsed = JSON.parse(run.run_log || '[]');
+    if (Array.isArray(parsed)) raw = parsed;
+  } catch {
+    raw = [];
+  }
+  return raw.map((s) => ({
+    tone: s.status === 'error' || s.status === 'failed' ? 'err' : s.status === 'ok' ? 'ok' : 'info',
+    kind: String(s.kind || s.type || t('run_step')),
+    detail: String(s.detail || s.message || s.tool || ''),
+    ts: s.at || s.timestamp ? formatTimestamp(String(s.at || s.timestamp)) : '',
+  }));
+}
+
+function renderRunDetail(run) {
+  const steps = state.runSteps.get(run.id) || [];
+  const meta = `
+    <div class="agents-run-meta">
+      <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}">${escapeHtml(runStatusLabel(run.status))}</tf-chip>
+      <span>${escapeHtml(t('runs_col_iterations'))}: ${escapeHtml(String(run.iterations ?? 0))}</span>
+      <span>${escapeHtml(t('runs_col_tokens'))}: ${escapeHtml(String(run.total_tokens ?? 0))}</span>
+      ${run.exit_reason ? `<span>${escapeHtml(t('runs_col_exit'))}: ${escapeHtml(run.exit_reason)}</span>` : ''}
+    </div>`;
+  const prompt = run.prompt
+    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(t('run_prompt'))}</span><pre>${escapeHtml(run.prompt)}</pre></div>`
+    : '';
+  const result = run.result
+    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(t('run_result'))}</span><pre>${escapeHtml(run.result)}</pre></div>`
+    : '';
+  const timeline = `<div data-run-timeline>${TfAgentActivity.renderTimeline(steps, activityLabels())}</div>`;
+  return `${meta}${prompt}${result}
+    <div class="agents-run-block"><span class="tf-label">${escapeHtml(t('run_timeline'))}</span>${timeline}</div>`;
+}
+
+function runStatusLabel(status) {
+  return RUN_STATUS_CHIP[status] ? t(`run_status_${status}`) : status;
 }

@@ -3459,6 +3459,29 @@ pub fn encode_agent_run_events_subscribe_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeAgentRunStartRequest)]
+pub fn encode_agent_run_start_request(
+    agent_id: String,
+    prompt: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunStartRequest(
+            tentaflow_protocol::AgentRunStartRequest { agent_id, prompt },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentBuilderAssistRequest)]
+pub fn encode_agent_builder_assist_request(messages_json: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::BuilderAssistRequest(
+            tentaflow_protocol::AgentBuilderAssistRequest { messages_json },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 fn parse_sync_conflict_resolution(
     resolution: &str,
 ) -> Result<tentaflow_protocol::SyncConflictResolution, JsError> {
@@ -7005,6 +7028,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "tool_name", ev.tool_name.into());
                 set(&obj, "permission", ev.permission.into());
                 set(&obj, "outcome", ev.outcome.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunStartRequest(req) => {
+                set(&obj, "variant", "AgentRunStartRequest".into());
+                set(&obj, "agentId", req.agent_id.clone().into());
+                set(&obj, "agent_id", req.agent_id.into());
+                set(&obj, "prompt", req.prompt.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunStartResponse(resp) => {
+                set(&obj, "variant", "AgentRunStartResponse".into());
+                set(&obj, "runId", resp.run_id.clone().into());
+                set(&obj, "run_id", resp.run_id.into());
+            }
+            tentaflow_protocol::AgentsPayload::BuilderAssistRequest(req) => {
+                set(&obj, "variant", "AgentBuilderAssistRequest".into());
+                set(&obj, "messagesJson", req.messages_json.clone().into());
+                set(&obj, "messages_json", req.messages_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::BuilderAssistResponse(resp) => {
+                set(&obj, "variant", "AgentBuilderAssistResponse".into());
+                set(&obj, "resultJson", resp.result_json.clone().into());
+                set(&obj, "result_json", resp.result_json.into());
             }
         },
         MessageBody::SyncConflictBody(payload) => match payload {

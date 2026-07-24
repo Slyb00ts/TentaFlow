@@ -3589,6 +3589,36 @@ pub struct AgentRunEvent {
     pub outcome: String,
 }
 
+// ----- Run start + builder assist -----
+//
+// RunStart spawns one attended background run for the calling admin session
+// (the dashboard "run now" button). BuilderAssist is a short LLM-backed
+// conversation that drafts an agent definition; the transcript and the result
+// travel as pre-serialized JSON (`*_json`), matching the rest of this domain.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunStartRequest {
+    pub agent_id: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunStartResponse {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentBuilderAssistRequest {
+    /// JSON array of `{"role":"user"|"assistant","content":"..."}` turns.
+    pub messages_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentBuilderAssistResponse {
+    /// JSON object `{"reply":String,"proposal":null|{...}}`.
+    pub result_json: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AgentsPayload {
     ListRequest(AgentsListRequest),
@@ -3613,6 +3643,12 @@ pub enum AgentsPayload {
     RunCancelResponse(AgentRunCancelResponse),
     RunEventsSubscribeRequest(AgentRunEventsSubscribeRequest),
     RunEvent(AgentRunEvent),
+    // Append-only past this point: ciborium encodes variants by index, so
+    // inserting or reordering above breaks older peers on the wire.
+    RunStartRequest(AgentRunStartRequest),
+    RunStartResponse(AgentRunStartResponse),
+    BuilderAssistRequest(AgentBuilderAssistRequest),
+    BuilderAssistResponse(AgentBuilderAssistResponse),
 }
 
 // =============================================================================
