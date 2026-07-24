@@ -1153,7 +1153,11 @@ fn worker<'t>(
             .map(|(index, active)| (index, active.pending_prompt.len()))
             .collect::<Vec<_>>();
         let mut prefilled_dense = Vec::new();
-        if dense_prefill_batch {
+        // Grouped prefill only while nothing is decoding (cold burst): a
+        // group's prompts all finish at the group's tail, so with live decode
+        // the FIFO serial path below wins median TTFT (182 vs 416 ms at C=8,
+        // p1024), while a cold burst still gets the batched pass's throughput.
+        if dense_prefill_batch && !has_live_decode {
             let dense_quantum = dense_prefill_scheduler_quantum(quantum, dense_pending.len());
             if let Some((indices, chunk, final_chunk)) =
                 dense_prefill_batch_plan(&dense_pending, dense_quantum)

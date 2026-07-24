@@ -154,6 +154,17 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **Batched dense prefill dla głów Q4_K/Q6_K + polityka cold-burst
+  (2026-07-24).** `DensePrefillLogitsKind` dostał warianty Q4K/Q6K (głowa
+  batch prefillu idzie przez istniejący per-lane dp4a sweep w `logits_gemm`),
+  więc Mistral Q4_K_M łapie się na grupowy prefill B4/B8/B16. Pomiar pokazał
+  jednak, że grupowanie przy ŻYWYM decode psuje medianę TTFT (grupa kończy
+  się razem: C=8 med 416 vs 182 ms FIFO) przy +4% out — dlatego grupowy
+  prefill działa teraz TYLKO gdy nic nie dekoduje (zimny burst), a przy żywym
+  decode rządzi FIFO. Wynik (p1024/o128): Bielik C=16 **606 tok/s / TTFT med
+  216 ms** (przed dniem zmian: 121 / 4053; vLLM: 906 / 105), C=8 465 / 209;
+  Mistral C=8 298 / 221. Ostatni duży lever: prawdziwy mixed
+  prefill+decode forward (tokeny decode w GEMM-ach chunka prefillu).
 - ✅ **Scheduler: FIFO serial prefill — jedna sekwencja na iterację
   (2026-07-24).** Pętla schedulera prefillowała KAŻDĄ oczekującą sekwencję
   pełnym kwantem w jednej iteracji, więc burst nowych promptów wstrzymywał

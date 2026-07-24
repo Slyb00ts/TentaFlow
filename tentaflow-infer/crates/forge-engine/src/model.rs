@@ -6709,6 +6709,14 @@ impl Model {
                 rows: *rows,
                 cols: *cols,
             },
+            DevWeight::Q4K { rows, cols, .. } => DensePrefillLogitsKind::Q4K {
+                rows: *rows,
+                cols: *cols,
+            },
+            DevWeight::Q6K { rows, cols, .. } => DensePrefillLogitsKind::Q6K {
+                rows: *rows,
+                cols: *cols,
+            },
             _ => return false,
         };
         let head_dim = self.weights.descriptor.params.head_dim;

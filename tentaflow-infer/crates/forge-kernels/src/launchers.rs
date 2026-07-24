@@ -1138,6 +1138,10 @@ pub enum DensePrefillLogitsKind {
     F16 { rows: usize, cols: usize },
     Q8_0 { rows: usize, cols: usize },
     NvFp4Gguf { rows: usize, cols: usize },
+    /// Q4_K/Q6_K heads run the per-lane dp4a GEMV sweep inside `logits_gemm`
+    /// (no batched GEMM-out-f32 kernel; one weight read per lane).
+    Q4K { rows: usize, cols: usize },
+    Q6K { rows: usize, cols: usize },
 }
 
 fn dense_prefill_backend_capable(
@@ -1201,6 +1205,24 @@ fn dense_prefill_artifacts_capable(
                 _ => return false,
             };
             has(kernel)
+        }
+        DensePrefillLogitsKind::Q4K { rows, cols } => {
+            rows > 0
+                && cols.is_multiple_of(256)
+                && has(if cols <= Kernels::DP4A_MAX_COLS {
+                    "gemv_q4_k_dp4a_out_f32"
+                } else {
+                    "gemv_q4_k_out_f32_v2"
+                })
+        }
+        DensePrefillLogitsKind::Q6K { rows, cols } => {
+            rows > 0
+                && cols.is_multiple_of(256)
+                && has(if cols <= Kernels::DP4A_MAX_COLS {
+                    "gemv_q6_k_dp4a_out_f32"
+                } else {
+                    "gemv_q6_k_out_f32_v2"
+                })
         }
     }
 }
