@@ -1,0 +1,23 @@
+# =============================================================================
+# File: bundle.toml — native Python bundle for the TentaFlow test-runner
+# service (pytest / Playwright / Locust / httpx executor). Core launches
+# server.py; agents' test items arrive via POST /runs.
+# =============================================================================
+
+[bundle]
+engine = "test-runner"
+description = "Sandboxed executor for agent-authored pytest/Playwright/Locust tests"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "playwright==1.60.0"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8093}"]
+internal_port = 8093
+
+[requires]
+gpu_memory_gb = 0
+disk_gb = 4
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
