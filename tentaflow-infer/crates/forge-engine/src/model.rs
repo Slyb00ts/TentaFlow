@@ -16,7 +16,7 @@ use forge_hal::DEVICE_ALLOC_ALIGN;
 use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
 pub use forge_kernels::Nvfp4GgufLayout;
 use forge_kernels::{
-    DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4CtBm16Projection,
+    nvfp4_ct_physical_m, DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4CtProjection,
     Nvfp4CtS0View, Nvfp4GgufQ8Projection, Q8ActPrepared, Q8PreparedProjection,
 };
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result, Vendor};
@@ -41,33 +41,33 @@ const HYBRID_PREFILL_AUTO_CHUNK: usize = 128;
 const HYBRID_PREFILL_ACTIVATION_RESERVE: usize = 64 * 1024 * 1024;
 const HYBRID_LAYER_MAJOR_MAX_TOKENS: usize = 4096;
 const HYBRID_HOST_STAGING_SLOTS: usize = 3;
-const NVFP4_CT_BM16_PHYSICAL_M: usize = 16;
-const NVFP4_CT_BM16_QKV_ROWS: usize = 6144;
-const NVFP4_CT_BM16_GATE_UP_ROWS: usize = 22528;
-const NVFP4_CT_BM16_WORKSPACE_SPLITS: usize = 4;
+const NVFP4_CT_QKV_ROWS: usize = 6144;
+const NVFP4_CT_GATE_UP_ROWS: usize = 22528;
+const NVFP4_CT_WORKSPACE_SPLITS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Nvfp4CtBm16BufferPlan {
+struct Nvfp4CtBufferPlan {
+    physical_m: usize,
     matrix_cap: usize,
     qkv_elems: usize,
     gate_up_elems: usize,
     workspace_elems: usize,
 }
 
-fn nvfp4_ct_bm16_projection_for_shape(
+fn nvfp4_ct_projection_for_shape(
     rows: usize,
     cols: usize,
-) -> Option<Nvfp4CtBm16Projection> {
+) -> Option<Nvfp4CtProjection> {
     match (rows, cols) {
-        (6144, 4096) => Some(Nvfp4CtBm16Projection::Qkv),
-        (4096, 4096) => Some(Nvfp4CtBm16Projection::Output),
-        (22528, 4096) => Some(Nvfp4CtBm16Projection::GateUp),
-        (4096, 11264) => Some(Nvfp4CtBm16Projection::Down),
+        (6144, 4096) => Some(Nvfp4CtProjection::Qkv),
+        (4096, 4096) => Some(Nvfp4CtProjection::Output),
+        (22528, 4096) => Some(Nvfp4CtProjection::GateUp),
+        (4096, 11264) => Some(Nvfp4CtProjection::Down),
         _ => None,
     }
 }
 
-fn nvfp4_ct_bm16_dimensions_capable(
+fn nvfp4_ct_dimensions_capable(
     hidden: usize,
     q_dim: usize,
     kv_dim: usize,
@@ -76,25 +76,33 @@ fn nvfp4_ct_bm16_dimensions_capable(
     hidden == 4096 && q_dim == 4096 && kv_dim == 1024 && inter == 11264
 }
 
-fn nvfp4_ct_bm16_physical_m(logical_m: usize) -> Option<usize> {
-    matches!(logical_m, 4 | 8 | 16).then_some(NVFP4_CT_BM16_PHYSICAL_M)
+/// Największy fizyczny kafel, jaki może wystąpić dla batcha do `cap` sekwencji.
+/// Bufory segmentowane są stałe w instancji modelu, więc muszą pomieścić kafel
+/// M32 zawsze, gdy `cap` w ogóle pozwala trafić w bucket 32.
+fn nvfp4_ct_plan_physical_m(cap: usize) -> usize {
+    if cap >= 24 {
+        32
+    } else {
+        16
+    }
 }
 
-fn nvfp4_ct_bm16_buffer_plan(
+fn nvfp4_ct_buffer_plan(
     cap: usize,
     model_capable: bool,
-) -> Option<Nvfp4CtBm16BufferPlan> {
+) -> Option<Nvfp4CtBufferPlan> {
     if !model_capable {
         return None;
     }
-    Some(Nvfp4CtBm16BufferPlan {
-        matrix_cap: cap.max(NVFP4_CT_BM16_PHYSICAL_M),
-        qkv_elems: NVFP4_CT_BM16_PHYSICAL_M.checked_mul(NVFP4_CT_BM16_QKV_ROWS)?,
-        gate_up_elems: NVFP4_CT_BM16_PHYSICAL_M
-            .checked_mul(NVFP4_CT_BM16_GATE_UP_ROWS)?,
-        workspace_elems: NVFP4_CT_BM16_WORKSPACE_SPLITS
-            .checked_mul(NVFP4_CT_BM16_PHYSICAL_M)?
-            .checked_mul(NVFP4_CT_BM16_QKV_ROWS)?,
+    let physical_m = nvfp4_ct_plan_physical_m(cap);
+    Some(Nvfp4CtBufferPlan {
+        physical_m,
+        matrix_cap: cap.max(physical_m),
+        qkv_elems: physical_m.checked_mul(NVFP4_CT_QKV_ROWS)?,
+        gate_up_elems: physical_m.checked_mul(NVFP4_CT_GATE_UP_ROWS)?,
+        workspace_elems: NVFP4_CT_WORKSPACE_SPLITS
+            .checked_mul(physical_m)?
+            .checked_mul(NVFP4_CT_QKV_ROWS)?,
     })
 }
 
@@ -2229,8 +2237,8 @@ struct BatchBufs {
     pinned_pen_presence: DevBuffer,
     out_ids: DevBuffer,
     pinned_out: DevBuffer,
-    nvfp4_ct_qkv_m16: Option<DevBuffer>,
-    nvfp4_ct_gate_up_m16: Option<DevBuffer>,
+    nvfp4_ct_qkv: Option<DevBuffer>,
+    nvfp4_ct_gate_up: Option<DevBuffer>,
     nvfp4_ct_workspace: Option<DevBuffer>,
 }
 
@@ -4529,17 +4537,17 @@ impl Model {
         self.gemm_rows(y, w, x, n_tokens, 0, w.rows(), stream)
     }
 
-    fn nvfp4_ct_bm16_projection(weight: &DevWeight) -> Option<Nvfp4CtBm16Projection> {
+    fn nvfp4_ct_projection(weight: &DevWeight) -> Option<Nvfp4CtProjection> {
         let DevWeight::NvFp4 {
             storage: NvFp4CtStorage::S0N64K128 { .. },
             rows,
             cols,
             ..
         } = weight else { return None };
-        nvfp4_ct_bm16_projection_for_shape(*rows, *cols)
+        nvfp4_ct_projection_for_shape(*rows, *cols)
     }
 
-    fn nvfp4_ct_bm16_model_capable(&self) -> bool {
+    fn nvfp4_ct_model_capable(&self) -> bool {
         if !matches!(
             std::env::var("FORGE_NVFP4_CT_BM16").ok().as_deref(),
             None | Some("1")
@@ -4552,7 +4560,7 @@ impl Model {
             .checked_mul(params.head_dim)
             .zip(params.n_kv_heads.checked_mul(params.head_dim))
             .is_some_and(|(q_dim, kv_dim)| {
-                nvfp4_ct_bm16_dimensions_capable(
+                nvfp4_ct_dimensions_capable(
                     params.hidden_size,
                     q_dim,
                     kv_dim,
@@ -4572,29 +4580,29 @@ impl Model {
                 let GateUpWeights::Fused(gate_up) = &ffn.gate_up else {
                     return false;
                 };
-                Self::nvfp4_ct_bm16_projection(qkv) == Some(Nvfp4CtBm16Projection::Qkv)
-                    && Self::nvfp4_ct_bm16_projection(&layer.attn().attn_o)
-                        == Some(Nvfp4CtBm16Projection::Output)
-                    && Self::nvfp4_ct_bm16_projection(gate_up)
-                        == Some(Nvfp4CtBm16Projection::GateUp)
-                    && Self::nvfp4_ct_bm16_projection(&ffn.down)
-                        == Some(Nvfp4CtBm16Projection::Down)
+                Self::nvfp4_ct_projection(qkv) == Some(Nvfp4CtProjection::Qkv)
+                    && Self::nvfp4_ct_projection(&layer.attn().attn_o)
+                        == Some(Nvfp4CtProjection::Output)
+                    && Self::nvfp4_ct_projection(gate_up)
+                        == Some(Nvfp4CtProjection::GateUp)
+                    && Self::nvfp4_ct_projection(&ffn.down)
+                        == Some(Nvfp4CtProjection::Down)
             })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gemm_nvfp4_ct_bm16(
+    fn gemm_nvfp4_ct_direct(
         &self,
-        y_m16: &DevBuffer,
+        y_padded: &DevBuffer,
         workspace: &DevBuffer,
         weight: &DevWeight,
-        x_m16: &DevBuffer,
+        x_padded: &DevBuffer,
         logical_m: usize,
-        projection: Nvfp4CtBm16Projection,
+        projection: Nvfp4CtProjection,
         stream: &Stream,
     ) -> Result<bool> {
-        if nvfp4_ct_bm16_physical_m(logical_m).is_none()
-            || Self::nvfp4_ct_bm16_projection(weight) != Some(projection)
+        if nvfp4_ct_physical_m(logical_m).is_none()
+            || Self::nvfp4_ct_projection(weight) != Some(projection)
         {
             return Ok(false);
         }
@@ -4606,15 +4614,15 @@ impl Model {
         let window = weight.nvfp4_ct_row_window(0, *rows)?;
         let view =
             Nvfp4CtS0View::new(window.data(), window.physical_rows(), window.cols())?;
-        self.kernels.gemm_nvfp4_ct_bm16_m16(
-            y_m16,
-            if projection == Nvfp4CtBm16Projection::GateUp {
+        self.kernels.gemm_nvfp4_ct_padded(
+            y_padded,
+            if projection == Nvfp4CtProjection::GateUp {
                 None
             } else {
                 Some(workspace)
             },
             view,
-            x_m16,
+            x_padded,
             logical_m,
             projection,
             *inv_global_scale,
@@ -16146,9 +16154,9 @@ impl Model {
         if self.batch_bufs.as_ref().is_some_and(|b| b.cap >= cap) {
             return Ok(());
         }
-        let nvfp4_ct_bm16_plan =
-            nvfp4_ct_bm16_buffer_plan(cap, self.nvfp4_ct_bm16_model_capable());
-        let matrix_cap = nvfp4_ct_bm16_plan.map_or(cap, |plan| plan.matrix_cap);
+        let nvfp4_ct_plan =
+            nvfp4_ct_buffer_plan(cap, self.nvfp4_ct_model_capable());
+        let matrix_cap = nvfp4_ct_plan.map_or(cap, |plan| plan.matrix_cap);
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
         let q_dim = p.n_heads * p.head_dim;
@@ -16204,13 +16212,13 @@ impl Model {
             pinned_pen_presence: pin(cap * 4)?,
             out_ids: f32b(cap)?,
             pinned_out: pin(cap * 4)?,
-            nvfp4_ct_qkv_m16: nvfp4_ct_bm16_plan
+            nvfp4_ct_qkv: nvfp4_ct_plan
                 .map(|plan| f16(plan.qkv_elems))
                 .transpose()?,
-            nvfp4_ct_gate_up_m16: nvfp4_ct_bm16_plan
+            nvfp4_ct_gate_up: nvfp4_ct_plan
                 .map(|plan| f16(plan.gate_up_elems))
                 .transpose()?,
-            nvfp4_ct_workspace: nvfp4_ct_bm16_plan
+            nvfp4_ct_workspace: nvfp4_ct_plan
                 .map(|plan| f32b(plan.workspace_elems))
                 .transpose()?,
         });
@@ -16430,15 +16438,15 @@ impl Model {
             match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w) => {
                     if let (Some(qkv), Some(workspace)) =
-                        (&bb.nvfp4_ct_qkv_m16, &bb.nvfp4_ct_workspace)
+                        (&bb.nvfp4_ct_qkv, &bb.nvfp4_ct_workspace)
                     {
-                        segmented_qkv = self.gemm_nvfp4_ct_bm16(
+                        segmented_qkv = self.gemm_nvfp4_ct_direct(
                             qkv,
                             workspace,
                             w,
                             &bb.x,
                             n,
-                            Nvfp4CtBm16Projection::Qkv,
+                            Nvfp4CtProjection::Qkv,
                             stream,
                         )?;
                     }
@@ -16462,16 +16470,18 @@ impl Model {
             let (q_input, q_offset, k_input, k_offset, v_input, v_offset) =
                 if segmented_qkv {
                     let qkv = bb
-                        .nvfp4_ct_qkv_m16
+                        .nvfp4_ct_qkv
                         .as_ref()
-                        .expect("segmentowany QKV wymaga bufora M16");
+                        .expect("segmentowany QKV wymaga bufora padded");
+                    let physical_m = nvfp4_ct_physical_m(n)
+                        .expect("segmentowany QKV ma fizyczny kafel");
                     (
                         qkv,
                         0,
                         qkv,
-                        16 * q_dim * 2,
+                        physical_m * q_dim * 2,
                         qkv,
-                        16 * (q_dim + kv_dim) * 2,
+                        physical_m * (q_dim + kv_dim) * 2,
                     )
                 } else {
                     (&bb.q, 0, &bb.k, 0, &bb.v, 0)
@@ -16599,13 +16609,13 @@ impl Model {
             }
             let mut specialized_o = false;
             if let Some(workspace) = &bb.nvfp4_ct_workspace {
-                specialized_o = self.gemm_nvfp4_ct_bm16(
+                specialized_o = self.gemm_nvfp4_ct_direct(
                     &bb.o_out,
                     workspace,
                     &layer.attn().attn_o,
                     &bb.attn_out,
                     n,
-                    Nvfp4CtBm16Projection::Output,
+                    Nvfp4CtProjection::Output,
                     stream,
                 )?;
             }
@@ -16627,15 +16637,15 @@ impl Model {
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
                     if let (Some(gate_up), Some(workspace)) =
-                        (&bb.nvfp4_ct_gate_up_m16, &bb.nvfp4_ct_workspace)
+                        (&bb.nvfp4_ct_gate_up, &bb.nvfp4_ct_workspace)
                     {
-                        segmented_gate_up = self.gemm_nvfp4_ct_bm16(
+                        segmented_gate_up = self.gemm_nvfp4_ct_direct(
                             gate_up,
                             workspace,
                             w,
                             &bb.x,
                             n,
-                            Nvfp4CtBm16Projection::GateUp,
+                            Nvfp4CtProjection::GateUp,
                             stream,
                         )?;
                     }
@@ -16650,13 +16660,15 @@ impl Model {
                 }
             }
             if segmented_gate_up {
+                let physical_m = nvfp4_ct_physical_m(n)
+                    .expect("segmentowany GateUp ma fizyczny kafel");
                 kernels.silu_mul_f16_at(
                     &bb.act,
-                    bb.nvfp4_ct_gate_up_m16
+                    bb.nvfp4_ct_gate_up
                         .as_ref()
-                        .expect("segmentowany GateUp wymaga bufora M16"),
+                        .expect("segmentowany GateUp wymaga bufora padded"),
                     0,
-                    16 * inter * 2,
+                    physical_m * inter * 2,
                     n * inter,
                     stream,
                 )?;
@@ -16666,13 +16678,13 @@ impl Model {
             let down = &layer.dense_ffn()?.down;
             let mut specialized_down = false;
             if let Some(workspace) = &bb.nvfp4_ct_workspace {
-                specialized_down = self.gemm_nvfp4_ct_bm16(
+                specialized_down = self.gemm_nvfp4_ct_direct(
                     &bb.down,
                     workspace,
                     down,
                     &bb.act,
                     n,
-                    Nvfp4CtBm16Projection::Down,
+                    Nvfp4CtProjection::Down,
                     stream,
                 )?;
             }
@@ -17356,15 +17368,14 @@ mod verify_rollback_tests {
         hybrid_verify_attention_parts_bytes, hybrid_verify_dedicated_z_bytes,
         hybrid_verify_delta_scratch_instances, hybrid_verify_scratch_estimate, logical_kv_regions,
         native_mtp_b2_device_embedding, native_mtp_greedy_decision,
-        nvfp4_ct_bm16_buffer_plan, nvfp4_ct_bm16_dimensions_capable,
-        nvfp4_ct_bm16_physical_m,
-        nvfp4_ct_bm16_projection_for_shape,
+        nvfp4_ct_buffer_plan, nvfp4_ct_dimensions_capable,
+        nvfp4_ct_physical_m, nvfp4_ct_plan_physical_m, nvfp4_ct_projection_for_shape,
         parse_hybrid_prefill_chunk_config, resolve_hybrid_prefill_chunk_size, restore_after,
         restore_prefill_seq_snapshots, rollback_mtp_pair, run_dense_prefill_transaction,
         settle_kv_operation, validate_mtp_pair_metadata_commit, validate_mtp_routed_inputs,
         DeltaStateLayout, ForgeError, HybridPrefillChunkConfig, HybridPrefillScratchShape,
         HybridStatePool, KvCache, KvConfig, KvQuant, KvReusePoison, LayerKind, Model,
-        Nvfp4CtBm16Projection, Nvfp4GgufLayout, Result, SeqKv, Vendor,
+        Nvfp4CtProjection, Nvfp4GgufLayout, Result, SeqKv, Vendor,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
@@ -17385,22 +17396,22 @@ mod verify_rollback_tests {
     }
 
     #[test]
-    fn bm16_nvfp4_ct_rozpoznaje_tylko_dokladne_ksztalty_bielika() {
+    fn nvfp4_ct_rozpoznaje_tylko_dokladne_ksztalty_bielika() {
         assert_eq!(
-            nvfp4_ct_bm16_projection_for_shape(6144, 4096),
-            Some(Nvfp4CtBm16Projection::Qkv)
+            nvfp4_ct_projection_for_shape(6144, 4096),
+            Some(Nvfp4CtProjection::Qkv)
         );
         assert_eq!(
-            nvfp4_ct_bm16_projection_for_shape(4096, 4096),
-            Some(Nvfp4CtBm16Projection::Output)
+            nvfp4_ct_projection_for_shape(4096, 4096),
+            Some(Nvfp4CtProjection::Output)
         );
         assert_eq!(
-            nvfp4_ct_bm16_projection_for_shape(22528, 4096),
-            Some(Nvfp4CtBm16Projection::GateUp)
+            nvfp4_ct_projection_for_shape(22528, 4096),
+            Some(Nvfp4CtProjection::GateUp)
         );
         assert_eq!(
-            nvfp4_ct_bm16_projection_for_shape(4096, 11264),
-            Some(Nvfp4CtBm16Projection::Down)
+            nvfp4_ct_projection_for_shape(4096, 11264),
+            Some(Nvfp4CtProjection::Down)
         );
         for shape in [
             (6143, 4096),
@@ -17409,48 +17420,54 @@ mod verify_rollback_tests {
             (11264, 4096),
             (22528, 4095),
         ] {
-            assert_eq!(nvfp4_ct_bm16_projection_for_shape(shape.0, shape.1), None);
+            assert_eq!(nvfp4_ct_projection_for_shape(shape.0, shape.1), None);
         }
     }
 
     #[test]
-    fn bm16_nvfp4_ct_wybiera_fizyczne_m16_tylko_dla_m4_m8_m16() {
-        assert_eq!(nvfp4_ct_bm16_physical_m(4), Some(16));
-        assert_eq!(nvfp4_ct_bm16_physical_m(8), Some(16));
-        assert_eq!(nvfp4_ct_bm16_physical_m(16), Some(16));
-        for logical_m in [0, 1, 2, 3, 5, 15, 17, 32] {
-            assert_eq!(nvfp4_ct_bm16_physical_m(logical_m), None);
+    fn nvfp4_ct_wybiera_kafel_bm16_lub_bm32_tylko_dla_zmierzonych_m() {
+        for logical_m in [4, 8, 16] {
+            assert_eq!(nvfp4_ct_physical_m(logical_m), Some(16));
         }
-        assert_eq!(nvfp4_ct_bm16_physical_m(4).unwrap() - 4, 12);
-        assert_eq!(nvfp4_ct_bm16_physical_m(8).unwrap() - 8, 8);
-        assert_eq!(nvfp4_ct_bm16_physical_m(16).unwrap() - 16, 0);
+        for logical_m in [24, 32] {
+            assert_eq!(nvfp4_ct_physical_m(logical_m), Some(32));
+        }
+        for logical_m in [0, 1, 2, 3, 5, 15, 17, 23, 25, 31, 33, 64] {
+            assert_eq!(nvfp4_ct_physical_m(logical_m), None);
+        }
     }
 
     #[test]
-    fn bm16_nvfp4_ct_wymaga_dokladnego_podzialu_qkv() {
-        assert!(nvfp4_ct_bm16_dimensions_capable(
+    fn nvfp4_ct_wymaga_dokladnego_podzialu_qkv() {
+        assert!(nvfp4_ct_dimensions_capable(
             4096, 4096, 1024, 11264
         ));
-        assert!(!nvfp4_ct_bm16_dimensions_capable(
+        assert!(!nvfp4_ct_dimensions_capable(
             4096, 5120, 512, 11264
         ));
-        assert!(!nvfp4_ct_bm16_dimensions_capable(
+        assert!(!nvfp4_ct_dimensions_capable(
             4096, 4096, 1024, 14336
         ));
     }
 
     #[test]
-    fn bm16_nvfp4_ct_planuje_stale_bufory_m16() {
-        assert_eq!(nvfp4_ct_bm16_buffer_plan(4, false), None);
-        let plan = nvfp4_ct_bm16_buffer_plan(4, true).unwrap();
+    fn nvfp4_ct_planuje_bufory_pod_najwiekszy_osiagalny_kafel() {
+        assert_eq!(nvfp4_ct_buffer_plan(4, false), None);
+        let plan = nvfp4_ct_buffer_plan(4, true).unwrap();
+        assert_eq!(plan.physical_m, 16);
         assert_eq!(plan.matrix_cap, 16);
         assert_eq!(plan.qkv_elems, 16 * 6144);
         assert_eq!(plan.gate_up_elems, 16 * 22528);
         assert_eq!(plan.workspace_elems, 4 * 16 * 6144);
-        assert_eq!(
-            nvfp4_ct_bm16_buffer_plan(32, true).unwrap().matrix_cap,
-            32
-        );
+        // Kafel M32 jest osiągalny dopiero od cap 24; niżej bufory zostają M16.
+        assert_eq!(nvfp4_ct_plan_physical_m(23), 16);
+        assert_eq!(nvfp4_ct_plan_physical_m(24), 32);
+        let wide = nvfp4_ct_buffer_plan(32, true).unwrap();
+        assert_eq!(wide.physical_m, 32);
+        assert_eq!(wide.matrix_cap, 32);
+        assert_eq!(wide.qkv_elems, 32 * 6144);
+        assert_eq!(wide.gate_up_elems, 32 * 22528);
+        assert_eq!(wide.workspace_elems, 4 * 32 * 6144);
     }
 
     #[test]

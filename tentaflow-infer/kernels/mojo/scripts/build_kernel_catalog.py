@@ -61,10 +61,13 @@ def parse_catalog():
             symbol, separator, options = arguments.partition(",")
             if not separator:
                 raise RuntimeError(f"brak opcji compile_function dla {symbol.strip()}")
-            marker = 'dump_asm=Path("'
-            artifact = options.partition(marker)[2].partition('.ptx")')[0]
-            if not artifact:
+            marker = "dump_asm=Path("
+            tail = options.partition(marker)[2].lstrip()
+            if not tail.startswith('"'):
                 raise RuntimeError(f"brak dump_asm dla {symbol.strip()}")
+            artifact = tail[1:].partition('.ptx"')[0]
+            if not artifact:
+                raise RuntimeError(f"pusty dump_asm dla {symbol.strip()}")
             kernels.append((symbol.strip(), artifact))
         elif stripped.startswith('or name == "') or stripped.startswith('name == "'):
             portable_nvfp4.add(stripped.partition('name == "')[2].partition('"')[0])

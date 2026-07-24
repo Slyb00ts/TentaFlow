@@ -105,22 +105,52 @@ impl<'a> Nvfp4CtS0View<'a> {
     }
 }
 
-/// Zmierzona specjalizacja projekcji BM16 modelu 4096/11264.
+/// Zmierzona specjalizacja projekcji BM16/BM32 modelu 4096/11264.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Nvfp4CtBm16Projection {
+pub enum Nvfp4CtProjection {
     Qkv,
     Output,
     GateUp,
     Down,
 }
 
-impl Nvfp4CtBm16Projection {
-    fn shape(self) -> (usize, usize, usize, usize, u32) {
+/// Fizyczny kafel M obsługujący dane logiczne M: 4/8/16 na BM16, 24/32 na BM32.
+/// Inne rozmiary nie mają wyspecjalizowanego kernela i wracają na ścieżkę ogólną.
+#[must_use]
+pub fn nvfp4_ct_physical_m(logical_m: usize) -> Option<usize> {
+    match logical_m {
+        4 | 8 | 16 => Some(16),
+        24 | 32 => Some(32),
+        _ => None,
+    }
+}
+
+impl Nvfp4CtProjection {
+    /// Zwraca (n_rows, n_cols, części split-K) projekcji.
+    fn dims(self) -> (usize, usize, usize) {
         match self {
-            Self::Qkv => (6144, 4096, 3, 128, 256),
-            Self::Output => (4096, 4096, 4, 128, 256),
-            Self::GateUp => (22528, 4096, 1, 128, 256),
-            Self::Down => (4096, 11264, 4, 64, 128),
+            Self::Qkv => (6144, 4096, 3),
+            Self::Output => (4096, 4096, 4),
+            Self::GateUp => (22528, 4096, 1),
+            Self::Down => (4096, 11264, 4),
+        }
+    }
+
+    /// Zwraca (kafel N, wątki bloku) dla danego kafla fizycznego M.
+    fn launch_shape(self, physical_m: usize) -> (usize, u32) {
+        if physical_m == 32 || self == Self::Down {
+            (64, 128)
+        } else {
+            (128, 256)
+        }
+    }
+
+    /// Głębokość potoku cp.async, którą musi pomieścić każda część split-K.
+    fn pipeline_stages(self, physical_m: usize) -> usize {
+        if physical_m == 32 || self == Self::GateUp {
+            3
+        } else {
+            4
         }
     }
 
@@ -129,21 +159,29 @@ impl Nvfp4CtBm16Projection {
             (Self::Qkv, 4) => Some("gemm_nvfp4_ct_bm16_qkv_m4"),
             (Self::Qkv, 8) => Some("gemm_nvfp4_ct_bm16_qkv_m8"),
             (Self::Qkv, 16) => Some("gemm_nvfp4_ct_bm16_qkv_m16"),
+            (Self::Qkv, 24) => Some("gemm_nvfp4_ct_bm32_qkv_m24"),
+            (Self::Qkv, 32) => Some("gemm_nvfp4_ct_bm32_qkv_m32"),
             (Self::Output, 4) => Some("gemm_nvfp4_ct_bm16_o_m4"),
             (Self::Output, 8) => Some("gemm_nvfp4_ct_bm16_o_m8"),
             (Self::Output, 16) => Some("gemm_nvfp4_ct_bm16_o_m16"),
+            (Self::Output, 24) => Some("gemm_nvfp4_ct_bm32_o_m24"),
+            (Self::Output, 32) => Some("gemm_nvfp4_ct_bm32_o_m32"),
             (Self::GateUp, 4) => Some("gemm_nvfp4_ct_bm16_gateup_m4"),
             (Self::GateUp, 8) => Some("gemm_nvfp4_ct_bm16_gateup_m8"),
             (Self::GateUp, 16) => Some("gemm_nvfp4_ct_bm16_gateup_m16"),
+            (Self::GateUp, 24) => Some("gemm_nvfp4_ct_bm32_gateup_m24"),
+            (Self::GateUp, 32) => Some("gemm_nvfp4_ct_bm32_gateup_m32"),
             (Self::Down, 4) => Some("gemm_nvfp4_ct_bm16_down_m4"),
             (Self::Down, 8) => Some("gemm_nvfp4_ct_bm16_down_m8"),
             (Self::Down, 16) => Some("gemm_nvfp4_ct_bm16_down_m16"),
+            (Self::Down, 24) => Some("gemm_nvfp4_ct_bm32_down_m24"),
+            (Self::Down, 32) => Some("gemm_nvfp4_ct_bm32_down_m32"),
             _ => None,
         }
     }
 }
 
-const NVFP4_CT_S0_ARTIFACTS: [&str; 24] = [
+const NVFP4_CT_S0_ARTIFACTS: [&str; 32] = [
     "repack_nvfp4_ct_s0_n64k128_into",
     "gemv_nvfp4_ct_s0_n64k128_f16",
     "gemv_batch_nvfp4_ct_s0_n64k128_f16_b4",
@@ -166,6 +204,14 @@ const NVFP4_CT_S0_ARTIFACTS: [&str; 24] = [
     "gemm_nvfp4_ct_bm16_down_m4",
     "gemm_nvfp4_ct_bm16_down_m8",
     "gemm_nvfp4_ct_bm16_down_m16",
+    "gemm_nvfp4_ct_bm32_qkv_m24",
+    "gemm_nvfp4_ct_bm32_qkv_m32",
+    "gemm_nvfp4_ct_bm32_o_m24",
+    "gemm_nvfp4_ct_bm32_o_m32",
+    "gemm_nvfp4_ct_bm32_gateup_m24",
+    "gemm_nvfp4_ct_bm32_gateup_m32",
+    "gemm_nvfp4_ct_bm32_down_m24",
+    "gemm_nvfp4_ct_bm32_down_m32",
     "reduce_nvfp4_ct_bm16",
     "pack_nvfp4_ct_s0_fp8",
 ];
@@ -4175,15 +4221,17 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
-    /// Uruchamia projekcję logicznego M4/M8/M16 na fizycznych buforach M16.
-    pub fn gemm_nvfp4_ct_bm16_m16(
+    /// Uruchamia projekcję logicznego M na fizycznym kaflu BM16 lub BM32.
+    /// Wiersze aktywacji powyżej logicznego M są zerowane w kernelu, więc
+    /// bufory muszą mieć pełną fizyczną pojemność kafla.
+    pub fn gemm_nvfp4_ct_padded(
         &self,
         y: &DevBuffer,
         workspace: Option<&DevBuffer>,
         weights: Nvfp4CtS0View<'_>,
-        x_padded_m16: &DevBuffer,
+        x_padded: &DevBuffer,
         logical_m: usize,
-        projection: Nvfp4CtBm16Projection,
+        projection: Nvfp4CtProjection,
         inv_global_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
@@ -4193,59 +4241,61 @@ impl Kernels {
             || caps.max_threads_per_block < 256
         {
             return Err(ForgeError::Unsupported(
-                "NVFP4 CT BM16 wymaga NVIDIA warp32 i bloku 256".into(),
+                "NVFP4 CT direct wymaga NVIDIA warp32 i bloku 256".into(),
             ));
         }
         if !inv_global_scale.is_finite() {
             return Err(ForgeError::Kernel(
-                "NVFP4 CT BM16 wymaga skończonej skali".into(),
+                "NVFP4 CT direct wymaga skończonej skali".into(),
             ));
         }
-        let kernel_name = projection.kernel_name(logical_m).ok_or_else(|| {
+        let physical_m = nvfp4_ct_physical_m(logical_m).ok_or_else(|| {
             ForgeError::Kernel(format!(
-                "NVFP4 CT BM16 obsługuje logiczne M4, M8 lub M16; otrzymano M{logical_m}"
+                "NVFP4 CT direct obsługuje logiczne M4/M8/M16/M24/M32; otrzymano M{logical_m}"
             ))
         })?;
-        let (rows, cols, parts, row_tile, block_threads) = projection.shape();
-        let pipeline_stages = if projection == Nvfp4CtBm16Projection::GateUp {
-            3
-        } else {
-            4
-        };
+        let kernel_name = projection.kernel_name(logical_m).ok_or_else(|| {
+            ForgeError::Kernel(format!(
+                "NVFP4 CT direct nie ma kernela dla M{logical_m}"
+            ))
+        })?;
+        let (rows, cols, parts) = projection.dims();
+        let (row_tile, block_threads) = projection.launch_shape(physical_m);
+        let pipeline_stages = projection.pipeline_stages(physical_m);
         if !nvfp4_ct_split_pipeline_supported(cols / 128, parts, pipeline_stages) {
             return Err(ForgeError::Kernel(
-                "NVFP4 CT BM16: split-K jest krótszy od potoku cp.async".into(),
+                "NVFP4 CT direct: split-K jest krótszy od potoku cp.async".into(),
             ));
         }
         if weights.rows != rows || weights.cols != cols {
             return Err(ForgeError::Kernel(format!(
-                "NVFP4 CT BM16: widok {}x{} nie pasuje do projekcji {rows}x{cols}",
+                "NVFP4 CT direct: widok {}x{} nie pasuje do projekcji {rows}x{cols}",
                 weights.rows, weights.cols
             )));
         }
-        let output_bytes = checked_buffer_bytes("NVFP4 CT BM16 output", &[16, rows], 2)?;
-        let input_bytes = checked_buffer_bytes("NVFP4 CT BM16 input", &[16, cols], 2)?;
-        if y.len() < output_bytes || x_padded_m16.len() < input_bytes {
-            return Err(ForgeError::Kernel(
-                "NVFP4 CT BM16 wymaga pełnych buforów wejścia i wyjścia M16".into(),
-            ));
+        let output_bytes = checked_buffer_bytes("NVFP4 CT direct output", &[physical_m, rows], 2)?;
+        let input_bytes = checked_buffer_bytes("NVFP4 CT direct input", &[physical_m, cols], 2)?;
+        if y.len() < output_bytes || x_padded.len() < input_bytes {
+            return Err(ForgeError::Kernel(format!(
+                "NVFP4 CT direct wymaga pełnych buforów wejścia i wyjścia M{physical_m}"
+            )));
         }
         let target = if parts == 1 {
             if workspace.is_some() {
                 return Err(ForgeError::Kernel(
-                    "NVFP4 CT BM16 gate+up nie używa workspace".into(),
+                    "NVFP4 CT direct gate+up nie używa workspace".into(),
                 ));
             }
             y
         } else {
             let workspace = workspace.ok_or_else(|| {
-                ForgeError::Kernel("NVFP4 CT BM16 split-K wymaga workspace FP32".into())
+                ForgeError::Kernel("NVFP4 CT direct split-K wymaga workspace FP32".into())
             })?;
             let workspace_bytes =
-                checked_buffer_bytes("NVFP4 CT BM16 workspace", &[parts, 16, rows], 4)?;
+                checked_buffer_bytes("NVFP4 CT direct workspace", &[parts, physical_m, rows], 4)?;
             if workspace.len() < workspace_bytes {
                 return Err(ForgeError::Kernel(
-                    "NVFP4 CT BM16: workspace split-K jest za mały".into(),
+                    "NVFP4 CT direct: workspace split-K jest za mały".into(),
                 ));
             }
             workspace
@@ -4254,7 +4304,7 @@ impl Kernels {
             .div_ceil(row_tile)
             .checked_mul(parts)
             .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| ForgeError::Kernel("NVFP4 CT BM16: siatka przekracza u32".into()))?;
+            .ok_or_else(|| ForgeError::Kernel("NVFP4 CT direct: siatka przekracza u32".into()))?;
         let kernel = self.artifacts.get(kernel_name)?;
         let config = LaunchConfig {
             grid: (grid_x, 1, 1),
@@ -4264,18 +4314,18 @@ impl Kernels {
         let args = LaunchArgs::new()
             .buf(target)
             .buf(weights.buffer)
-            .buf(x_padded_m16)
+            .buf(x_padded)
             .scalar(inv_global_scale);
         self.device.launch(kernel, &config, &args, stream)?;
         if parts == 1 {
             return Ok(());
         }
         let reduce = self.artifacts.get("reduce_nvfp4_ct_bm16")?;
-        let elements = rows.checked_mul(16).ok_or_else(|| {
-            ForgeError::Kernel("NVFP4 CT BM16: liczba wyników przekracza usize".into())
+        let elements = rows.checked_mul(physical_m).ok_or_else(|| {
+            ForgeError::Kernel("NVFP4 CT direct: liczba wyników przekracza usize".into())
         })?;
         let reduce_grid = u32::try_from(elements.div_ceil(BLOCK as usize))
-            .map_err(|_| ForgeError::Kernel("NVFP4 CT BM16: redukcja przekracza u32".into()))?;
+            .map_err(|_| ForgeError::Kernel("NVFP4 CT direct: redukcja przekracza u32".into()))?;
         let reduce_config = LaunchConfig {
             grid: (reduce_grid, 1, 1),
             block: (BLOCK, 1, 1),
@@ -4285,7 +4335,7 @@ impl Kernels {
             .buf(y)
             .buf(target)
             .scalar(rows as i64)
-            .scalar(16i64)
+            .scalar(physical_m as i64)
             .scalar(parts as i64);
         self.device
             .launch(reduce, &reduce_config, &reduce_args, stream)

@@ -7,7 +7,7 @@
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
 from std.python import Python
-from src.nvfp4_ct_bm16 import (
+from src.nvfp4_ct_direct import (
     gemm_nvfp4_ct_bm16_down_m16,
     gemm_nvfp4_ct_bm16_down_m4,
     gemm_nvfp4_ct_bm16_down_m8,
@@ -35,6 +35,8 @@ def _finish(out_dir: Path, name: StringSlice) raises:
             "scripts/validate_sm80_ptx.py",
             String(temporary),
             String(target),
+            String(name),
+            String(out_dir / "manifest.json"),
         ),
         check=True,
     )

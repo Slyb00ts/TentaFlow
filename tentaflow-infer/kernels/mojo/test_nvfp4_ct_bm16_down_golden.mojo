@@ -13,7 +13,7 @@ from src.nvfp4_batch import (
     gemv_batch_nvfp4_f16_b8,
     gemv_batch_nvfp4_f16_b16,
 )
-from src.nvfp4_ct_bm16 import (
+from src.nvfp4_ct_direct import (
     gemm_nvfp4_ct_bm16_down_m4,
     gemm_nvfp4_ct_bm16_down_m8,
     gemm_nvfp4_ct_bm16_down_m16,

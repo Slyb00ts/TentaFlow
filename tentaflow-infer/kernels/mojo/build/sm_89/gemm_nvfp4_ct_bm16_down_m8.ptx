@@ -6,16 +6,16 @@
 .target sm_80
 .address_size 64
 
-	// .globl	src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3
-// src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_0_$__gpu_shared_mem has been demoted
-// src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_1_$__gpu_shared_mem has been demoted
-// src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_2_$__gpu_shared_mem has been demoted
+	// .globl	src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8
+// src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_0_$__gpu_shared_mem has been demoted
+// src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_1_$__gpu_shared_mem has been demoted
+// src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_2_$__gpu_shared_mem has been demoted
 
-.visible .entry src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3(
-	.param .u64 .ptr .align 1 src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_0,
-	.param .u64 .ptr .align 1 src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_1,
-	.param .u64 .ptr .align 1 src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_2,
-	.param .f32 src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_3
+.visible .entry src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8(
+	.param .u64 .ptr .align 1 src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_0,
+	.param .u64 .ptr .align 1 src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_1,
+	.param .u64 .ptr .align 1 src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_2,
+	.param .f32 src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_3
 )
 {
 	.reg .pred 	%p<11>;
@@ -23,15 +23,15 @@
 	.reg .b32 	%r<746>;
 	.reg .b64 	%rd<92>;
 	// demoted variable
-	.shared .align 2 .b8 src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_0_$__gpu_shared_mem[17408];
+	.shared .align 2 .b8 src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_0_$__gpu_shared_mem[17408];
 	// demoted variable
-	.shared .align 1 .b8 src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_1_$__gpu_shared_mem[16384];
+	.shared .align 1 .b8 src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_1_$__gpu_shared_mem[16384];
 	// demoted variable
-	.shared .align 1 .b8 src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_2_$__gpu_shared_mem[2048];
-	ld.param.b64 	%rd32, [src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_0];
-	ld.param.b64 	%rd33, [src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_2];
+	.shared .align 1 .b8 src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_2_$__gpu_shared_mem[2048];
+	ld.param.b64 	%rd32, [src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_0];
+	ld.param.b64 	%rd33, [src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_2];
 	cvta.to.global.u64 	%rd1, %rd33;
-	ld.param.b64 	%rd34, [src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_1];
+	ld.param.b64 	%rd34, [src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_1];
 	cvta.to.global.u64 	%rd2, %rd34;
 	cvta.to.global.u64 	%rd3, %rd32;
 	mov.u32 	%r35, %tid.x;
@@ -51,7 +51,7 @@
 	shl.b64 	%rd42, %rd38, 1;
 	add.s64 	%rd43, %rd41, %rd42;
 	cvt.u32.u64 	%r36, %rd36;
-	mov.b32 	%r37, src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_0_$__gpu_shared_mem;
+	mov.b32 	%r37, src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_0_$__gpu_shared_mem;
 	mad.lo.s32 	%r38, %r36, 272, %r37;
 	cvt.u32.u64 	%r39, %rd38;
 	shl.b32 	%r40, %r39, 1;
@@ -60,7 +60,7 @@
 	cvt.u32.u64 	%r44, %rd91;
 	and.b32 	%r5, %r44, 2;
 	shl.b32 	%r45, %r5, 9;
-	mov.b32 	%r46, src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_2_$__gpu_shared_mem;
+	mov.b32 	%r46, src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_2_$__gpu_shared_mem;
 	mad.lo.s32 	%r7, %r5, 4352, %r3;
 	add.s32 	%r8, %r7, 128;
 	mul.lo.s64 	%rd17, %rd8, 5632;
@@ -80,7 +80,7 @@ $L__BB0_3:
 	mad.lo.s64 	%rd47, %rd11, 88, %rd91;
 	mad.lo.s64 	%rd19, %rd47, 4608, %rd2;
 	shl.b32 	%r51, %r5, 12;
-	mov.b32 	%r52, src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_45b315e44a2ab1ba_$__global_alloc_1_$__gpu_shared_mem;
+	mov.b32 	%r52, src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_65bd759f523d0c56_$__global_alloc_1_$__gpu_shared_mem;
 	add.s32 	%r9, %r52, %r51;
 	shl.b64 	%rd20, %rd4, 4;
 	cvt.u32.u64 	%r10, %rd20;
@@ -199,7 +199,7 @@ $L__BB0_18:
 	add.s32 	%r76, %r19, %r10;
 	cp.async.cg.shared.global [%r76], [%rd57], 16;
 $L__BB0_20:
-	ld.param.b32 	%r34, [src_nvfp4_ct_bm16_gemm_nvfp4_c6A6A6A6A_ef690e141ebdcdf3_param_3];
+	ld.param.b32 	%r34, [src_nvfp4_ct_direct_gemm_nvfp46A6A6A6A_b0f3869e666388d8_param_3];
 	shl.b64 	%rd6, %rd5, 1;
 	and.b64 	%rd10, %rd9, 34359738304;
 	shl.b64 	%rd15, %rd14, 3;

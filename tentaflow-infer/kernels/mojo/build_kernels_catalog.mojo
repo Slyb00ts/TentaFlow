@@ -519,7 +519,7 @@ from src.nvfp4_ct_prefill import (
     gemm_nvfp4_ct_s0_f16_bm64,
     gemm_nvfp4_ct_s0_f16_bm128,
 )
-from src.nvfp4_ct_bm16 import (
+from src.nvfp4_ct_direct import (
     gemm_nvfp4_ct_bm16_qkv_m4,
     gemm_nvfp4_ct_bm16_qkv_m8,
     gemm_nvfp4_ct_bm16_qkv_m16,
@@ -532,6 +532,14 @@ from src.nvfp4_ct_bm16 import (
     gemm_nvfp4_ct_bm16_down_m4,
     gemm_nvfp4_ct_bm16_down_m8,
     gemm_nvfp4_ct_bm16_down_m16,
+    gemm_nvfp4_ct_bm32_qkv_m24,
+    gemm_nvfp4_ct_bm32_qkv_m32,
+    gemm_nvfp4_ct_bm32_o_m24,
+    gemm_nvfp4_ct_bm32_o_m32,
+    gemm_nvfp4_ct_bm32_gateup_m24,
+    gemm_nvfp4_ct_bm32_gateup_m32,
+    gemm_nvfp4_ct_bm32_down_m24,
+    gemm_nvfp4_ct_bm32_down_m32,
     reduce_nvfp4_direct_down,
 )
 
@@ -613,6 +621,14 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
         or name == "gemm_nvfp4_ct_bm16_down_m4"
         or name == "gemm_nvfp4_ct_bm16_down_m8"
         or name == "gemm_nvfp4_ct_bm16_down_m16"
+        or name == "gemm_nvfp4_ct_bm32_qkv_m24"
+        or name == "gemm_nvfp4_ct_bm32_qkv_m32"
+        or name == "gemm_nvfp4_ct_bm32_o_m24"
+        or name == "gemm_nvfp4_ct_bm32_o_m32"
+        or name == "gemm_nvfp4_ct_bm32_gateup_m24"
+        or name == "gemm_nvfp4_ct_bm32_gateup_m32"
+        or name == "gemm_nvfp4_ct_bm32_down_m24"
+        or name == "gemm_nvfp4_ct_bm32_down_m32"
         or name == "reduce_nvfp4_ct_bm16"
     )
 
@@ -1327,6 +1343,46 @@ def main() raises:
         dump_asm=Path("gemm_nvfp4_ct_bm16_down_m16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_down_m16"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_qkv_m24,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_qkv_m24.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_qkv_m24"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_qkv_m32,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_qkv_m32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_qkv_m32"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_o_m24,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_o_m24.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_o_m24"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_o_m32,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_o_m32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_o_m32"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_gateup_m24,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_gateup_m24.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_gateup_m24"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_gateup_m32,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_gateup_m32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_gateup_m32"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_down_m24,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_down_m24.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_down_m24"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_ct_bm32_down_m32,
+        dump_asm=Path("gemm_nvfp4_ct_bm32_down_m32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_down_m32"))
     _ = ctx.compile_function[
         reduce_nvfp4_direct_down, dump_asm=Path("reduce_nvfp4_ct_bm16.ptx")
     ]()

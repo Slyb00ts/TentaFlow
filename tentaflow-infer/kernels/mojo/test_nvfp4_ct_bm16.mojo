@@ -4,7 +4,7 @@
 # Przykład: mojo build test_nvfp4_ct_bm16.mojo
 # =============================================================================
 
-from src.nvfp4_ct_bm16 import (
+from src.nvfp4_ct_direct import (
     gemm_nvfp4_ct_bm16_down_m16,
     gemm_nvfp4_ct_bm16_down_m4,
     gemm_nvfp4_ct_bm16_down_m8,
