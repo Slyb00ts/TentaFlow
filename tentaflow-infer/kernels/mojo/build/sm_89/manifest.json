@@ -1789,10 +1789,6 @@
       "entry": "src_onnx_ops_sqrt_f32_Pointe6A6A6A6AoA6A6A_4b921393b1627585",
       "file": "sqrt_f32.ptx"
     },
-    "topk_batched_f32": {
-      "entry": "src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b",
-      "file": "topk_batched_f32.ptx"
-    },
     "topk_final_f32": {
       "entry": "src_sampling_topk_final_f326A6A6A6AoA6A6A_d1b1b5166cf186bc",
       "file": "topk_final_f32.ptx"
@@ -1856,6 +1852,14 @@
     "pack_q8_0_fp8": {
       "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_987bef7eb9bb7a52",
       "file": "pack_q8_0_fp8.ptx"
+    },
+    "topk_batched_partial_f32": {
+      "entry": "src_sampling_topk_batched_part6A6A6A6A_7be790abe2373113",
+      "file": "topk_batched_partial_f32.ptx"
+    },
+    "topk_batched_final_f32": {
+      "entry": "src_sampling_topk_batched_fina6A6A6A6A_ffdc8173258581c1",
+      "file": "topk_batched_final_f32.ptx"
     }
   }
 }

@@ -154,6 +154,23 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **Batchowy sampler top-k: O(k²·V) → dwuprzebiegowy (2026-07-25).**
+  Profil perf+nsys serve pod obciążeniem pokazał, że `topk_batched_f32`
+  zjadał **10,08 ms na krok** (98,8% czasu GPU przy qwen3-0.6b: k=40 rund ×
+  skan 152k słownika × O(k) porównań id per element, jeden blok na
+  sekwencję) — to było całe rzekome „10 ms narzutu hosta"; emisja/tokio były
+  bezczynne. Krok 1: maskowanie in-place zamiast porównań id (O(k·V), 10→3,1
+  ms). Krok 2: pełna wymiana na dwuprzebiegową strukturę szybkiej ścieżki
+  single-row — `topk_batched_partial_f32` (grid chunks×seqs, slice w shared,
+  lokalne top-k) + `topk_batched_final_f32` (merge per sekwencja + replay
+  softmax/min-p/top-p/hash z per-seq parametrami); scratch parts grow-only
+  poza grafami. Stary kernel usunięty. Parity `gpu_sampling` 5/5, golden
+  69/69. Serve decode-only (in32/o256): qwen3-0.6b C=8 **560→2 496 tok/s**
+  (TPOT 12,65→2,72 ms), C=16 886→2 248; Bielik-7B C=16 **1 291→1 512**
+  (TPOT 9,83). p1024/o128: qwen C=8 501→**1 577** (TTFT 80 ms), C=16
+  719→**1 453**; Bielik C=8 448→**523**, C=16 612→**656** (vLLM 906 → luka
+  1,38×). Host-side na krytycznej ścieżce zostało ≤0,4 ms — planowany
+  „async pipeline" emisji okazał się zbędny (dane, nie przypuszczenia).
 - ✅ **Mixed prefill+decode forward — WYKONANY (2026-07-24/25).** Tokeny
   decode (B sekwencji GPU-sampled, spec off) jadą jako dodatkowe wiersze w
   forwardzie chunka prefillu: `prefill_forward_lanes` dostał

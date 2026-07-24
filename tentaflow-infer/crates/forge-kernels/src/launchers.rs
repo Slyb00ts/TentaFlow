@@ -1161,7 +1161,8 @@ fn dense_prefill_artifacts_capable(
     if !matches!(batch, 4 | 8 | 16)
         || !has("kv_append_batch_segmented_f16")
         || !has("argmax_batched_f32")
-        || !has("topk_batched_f32")
+        || !has("topk_batched_partial_f32")
+        || !has("topk_batched_final_f32")
         || !has("penalize_batched_f32")
     {
         return false;
@@ -1308,6 +1309,8 @@ pub struct Kernels {
     q4k_native: Mutex<Q4kNativeScratch>,
     /// (`gemm_qk_dp4a_batch_at`): dedicated small-batch decode quant scratch.
     qk_batch: Mutex<QkBatchScratch>,
+    /// (`sample_batched_topk_f32`): two-pass batched top-k parts scratch.
+    sample_parts: Mutex<SamplePartsScratch>,
     /// Backend attention dla prefill F16 hd64/hd128. Domyślnie wybiera kernel
     /// Mojo skompilowany obecnie do PTX; obsługa AMDGPU i Metal wymaga osobnych
     /// backendów HAL i artefaktów. `FORGE_ATTN=fa` wybiera cubin tylko wtedy,
@@ -1506,6 +1509,16 @@ struct QkBatchScratch {
     cap_codes: usize,
     /// Current f32 element capacity of `xd`/`xsm` ((cols/32)·16).
     cap_blocks: usize,
+}
+
+/// Grow-only parts scratch for the two-pass batched top-k sampler
+/// ([n_seqs × SAMPLE_SCRATCH_PAIRS] value/id pairs). Sampling runs outside the
+/// decode graphs, so lazy growth is capture-safe.
+#[derive(Default)]
+struct SamplePartsScratch {
+    vals: Option<DevBuffer>,
+    idx: Option<DevBuffer>,
+    cap: usize,
 }
 
 /// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
@@ -1791,6 +1804,7 @@ impl Kernels {
             fp8_act: Mutex::new(Fp8ActScratch::default()),
             q4k_native: Mutex::new(Q4kNativeScratch::default()),
             qk_batch: Mutex::new(QkBatchScratch::default()),
+            sample_parts: Mutex::new(SamplePartsScratch::default()),
             attn: match std::env::var("FORGE_ATTN").ok().as_deref() {
                 Some("scalar") => AttnBackend::Scalar,
                 Some("fa") | Some("cuda") if cuda_attn_available => AttnBackend::Cuda,
@@ -6273,7 +6287,53 @@ impl Kernels {
                 "sample_batched_topk: vocab {vocab} exceeds {SAMPLE_MAX_VOCAB}"
             )));
         }
-        let k = self.artifacts.get("topk_batched_f32")?;
+        // Two passes mirroring the fast single-row path: per-chunk partial
+        // top-k lists (grid chunks × seqs, slices staged in shared memory),
+        // then a per-sequence merge + sampling replay. The one-block-per-seq
+        // k-rounds-over-vocab kernel this replaces cost ~10 ms at k=40 on a
+        // 152k vocab.
+        let chunk = SAMPLE_CHUNK;
+        let n_blocks = vocab.div_ceil(chunk);
+        if n_blocks > SAMPLE_MAX_VOCAB / SAMPLE_CHUNK {
+            return Err(ForgeError::Unsupported(format!(
+                "sample_batched_topk: vocab {vocab} needs {n_blocks} chunks over the cap"
+            )));
+        }
+        let need_parts = n_seqs * SAMPLE_SCRATCH_PAIRS;
+        let mut sc = self
+            .sample_parts
+            .lock()
+            .map_err(|_| ForgeError::Kernel("sample parts scratch poisoned".into()))?;
+        if sc.cap < need_parts {
+            sc.vals = Some(
+                self.device
+                    .alloc(need_parts * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.idx = Some(
+                self.device
+                    .alloc(need_parts * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap = need_parts;
+        }
+        let part_vals = sc.vals.as_ref().expect("parts allocated");
+        let part_idx = sc.idx.as_ref().expect("parts allocated");
+
+        let partial = self.artifacts.get("topk_batched_partial_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_blocks as u32, n_seqs as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(part_vals)
+            .buf(part_idx)
+            .buf(logits)
+            .scalar(vocab as i64)
+            .scalar(chunk as i64)
+            .buf(k_arr);
+        self.device.launch(partial, &cfg, &args, stream)?;
+
+        let fin = self.artifacts.get("topk_batched_final_f32")?;
         let cfg = LaunchConfig {
             grid: (n_seqs as u32, 1, 1),
             block: (BLOCK, 1, 1),
@@ -6281,7 +6341,9 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(out_ids)
-            .buf(logits)
+            .buf(part_vals)
+            .buf(part_idx)
+            .scalar(n_blocks as i64)
             .scalar(vocab as i64)
             .buf(k_arr)
             .buf(inv_t_arr)
@@ -6289,7 +6351,7 @@ impl Kernels {
             .buf(min_p_arr)
             .buf(seed_arr)
             .buf(step_arr);
-        self.device.launch(k, &cfg, &args, stream)
+        self.device.launch(fin, &cfg, &args, stream)
     }
 
     /// Batchowe kary in-place z histogramów unikalnych tokenów.
