@@ -167,7 +167,7 @@ toml = "1.1.2+spec-1.1.0"
 ciborium = "0.2"
 
 # Database
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
 fjall = "3.1.5"
 # Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
 # zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
@@ -430,7 +430,7 @@ hex = "0.4"
 walkdir = "2"
 
 [dev-dependencies]
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
 wasmtime = "46.0.0"
 tempfile = "3"
 criterion = { version = "0.8.2", features = ["html_reports"] }

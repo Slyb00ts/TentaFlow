@@ -47,6 +47,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -678,8 +679,8 @@ pub fn estimate_export_size(project_id: &str, include_models: bool) -> Result<u6
             for (_, abs) in walk_sorted(dir)? {
                 total = total.saturating_add(std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0));
             }
-        } else if let Some(blob) = ds.raw_blob.as_ref() {
-            total = total.saturating_add(blob.len() as u64);
+        } else if let Some(blob) = ds.blob.as_ref() {
+            total = total.saturating_add(blob.len);
         }
     }
     if include_models {
@@ -800,11 +801,11 @@ fn export_into(
                 row.raw_data_archive_path = prefix;
             }
             RawDataKind::Blob => {
-                let blob = ds.raw_blob.as_ref().context(
+                let blob = ds.blob.as_ref().context(
                     "wewnętrzny błąd eksportu: zbiór rozpoznany jako blob nie ma danych",
                 )?;
                 let arch = format!("datasets/{}/raw.bin", ds.row.dataset_id);
-                let entry = write_bytes(&mut zip, &arch, blob, false)?;
+                let entry = write_stored_blob(&mut zip, &arch, blob.rowid)?;
                 bytes += entry.size;
                 files.push(entry);
                 row.raw_data_kind = RawDataKind::Blob;
@@ -996,6 +997,35 @@ fn write_stored_file(zip: &mut ZipOut, arch_path: &str, src: &Path) -> Result<Fi
     })
 }
 
+/// Streams a `datasets.raw_data` blob straight from SQLite into the archive through
+/// the same fixed buffer as `write_stored_file`, hashing as it goes. The blob is read
+/// in `COPY_BUF` slices via incremental blob I/O, so a multi-GB payload never lands in
+/// RAM. The read-lock is held only for this one blob and released when the function
+/// returns, so the pool is free between datasets.
+fn write_stored_blob(zip: &mut ZipOut, arch_path: &str, rowid: i64) -> Result<FileEntry> {
+    zip.start_file(arch_path.to_string(), stored_options())?;
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let mut blob = conn.blob_open(rusqlite::MAIN_DB, c"datasets", c"raw_data", rowid, true)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; COPY_BUF];
+    let mut size = 0u64;
+    loop {
+        let n = blob.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        zip.write_all(&buf[..n])?;
+        size += n as u64;
+    }
+    Ok(FileEntry {
+        path: arch_path.to_string(),
+        size,
+        sha256: hex(&hasher.finalize()),
+    })
+}
+
 fn write_bytes(
     zip: &mut ZipOut,
     arch_path: &str,
@@ -1021,30 +1051,68 @@ fn write_json<T: Serialize>(zip: &mut ZipOut, arch_path: &str, value: &T) -> Res
     write_bytes(zip, arch_path, &bytes, true)
 }
 
-/// Image count, annotation count and category names of one COCO file.
+/// Counts the elements of a JSON array without retaining a single one: `visit_seq`
+/// drains the sequence through `IgnoredAny`, so a multi-hundred-MB `images` /
+/// `annotations` array is counted in O(1) memory instead of a full `Value` tree.
+struct CountSeq(u64);
+
+impl<'de> Deserialize<'de> for CountSeq {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CountVisitor;
+        impl<'de> Visitor<'de> for CountVisitor {
+            type Value = u64;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON array")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<u64, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut n = 0u64;
+                while seq.next_element::<IgnoredAny>()?.is_some() {
+                    n += 1;
+                }
+                Ok(n)
+            }
+        }
+        deserializer.deserialize_seq(CountVisitor).map(CountSeq)
+    }
+}
+
+/// Only the `name` of a COCO category; every other field is ignored. Categories are
+/// few (one per class) so materializing them carries no memory concern.
+#[derive(Deserialize)]
+struct CatName {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Streaming shape of a COCO file for the export inventory: images/annotations are
+/// counted without buffering, categories (small) are kept for their names.
+#[derive(Deserialize, Default)]
+struct CocoCounts {
+    #[serde(default)]
+    images: Option<CountSeq>,
+    #[serde(default)]
+    annotations: Option<CountSeq>,
+    #[serde(default)]
+    categories: Vec<CatName>,
+}
+
+/// Image count, annotation count and category names of one COCO file, read through a
+/// streaming reader so the (potentially huge) images/annotations arrays never
+/// materialize in RAM.
 fn coco_counts(path: &Path) -> Result<(u64, u64, Vec<String>)> {
-    let buf = std::fs::read(path).with_context(|| format!("odczyt {}", path.display()))?;
-    let coco: Value = serde_json::from_slice(&buf)
+    let file =
+        std::fs::File::open(path).with_context(|| format!("otwarcie {}", path.display()))?;
+    let counts: CocoCounts = serde_json::from_reader(std::io::BufReader::new(file))
         .with_context(|| format!("parsowanie {}", path.display()))?;
-    let images = coco
-        .get("images")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len() as u64)
-        .unwrap_or(0);
-    let anns = coco
-        .get("annotations")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len() as u64)
-        .unwrap_or(0);
-    let cats = coco
-        .get("categories")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let images = counts.images.map(|c| c.0).unwrap_or(0);
+    let anns = counts.annotations.map(|c| c.0).unwrap_or(0);
+    let cats = counts.categories.into_iter().filter_map(|c| c.name).collect();
     Ok((images, anns, cats))
 }
 
@@ -1052,20 +1120,27 @@ fn coco_counts(path: &Path) -> Result<(u64, u64, Vec<String>)> {
 // Export: DB reads
 // ---------------------------------------------------------------------------
 
+/// SQLite location + size of a non-COCO dataset's `raw_data` blob, so the export can
+/// stream it straight from the DB instead of preloading every blob into RAM.
+struct BlobRef {
+    rowid: i64,
+    len: u64,
+}
+
 /// A dataset row plus the payload the export must physically archive.
 struct DatasetSource {
     row: DatasetRow,
     /// Resolved COCO directory for `kind = "coco_path"` when it exists on disk.
     source_dir: Option<PathBuf>,
-    /// Inline payload for every other kind.
-    raw_blob: Option<Vec<u8>>,
+    /// Reference to the DB blob for every other kind; its bytes are never preloaded.
+    blob: Option<BlobRef>,
 }
 
 impl DatasetSource {
     fn kind_of_payload(&self) -> RawDataKind {
         if self.source_dir.is_some() {
             RawDataKind::CocoDir
-        } else if self.raw_blob.as_ref().map(|b| !b.is_empty()).unwrap_or(false) {
+        } else if self.blob.as_ref().map(|b| b.len > 0).unwrap_or(false) {
             RawDataKind::Blob
         } else {
             RawDataKind::None
@@ -1102,13 +1177,19 @@ fn load_project_row(project_id: &str) -> Result<Option<ProjectRow>> {
 fn load_dataset_rows(project_id: &str) -> Result<Vec<DatasetSource>> {
     let pool = super::db::pool()?;
     let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    // The blob bytes are NEVER selected here: for a blob dataset only its rowid + byte
+    // length come back (the export streams the bytes later straight from the DB). Only
+    // a `coco_path` row pulls `raw_data`, and there it holds a small directory path.
     let mut stmt = conn.prepare(
         "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, \
-                created_at, raw_data \
+                created_at, rowid, length(raw_data), \
+                CASE WHEN kind = 'coco_path' THEN raw_data ELSE NULL END \
          FROM datasets WHERE project_id = ?1 ORDER BY dataset_id",
     )?;
     let rows = stmt.query_map(params![project_id], |r| {
-        let raw: Option<Vec<u8>> = r.get(8)?;
+        let rowid: i64 = r.get(8)?;
+        let raw_len: Option<i64> = r.get(9)?;
+        let coco_path: Option<Vec<u8>> = r.get(10)?;
         Ok((
             DatasetRow {
                 dataset_id: r.get(0)?,
@@ -1122,15 +1203,17 @@ fn load_dataset_rows(project_id: &str) -> Result<Vec<DatasetSource>> {
                 raw_data_kind: RawDataKind::None,
                 raw_data_archive_path: String::new(),
             },
-            raw,
+            rowid,
+            raw_len.unwrap_or(0).max(0) as u64,
+            coco_path,
         ))
     })?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (row, raw) = row?;
+        let (row, rowid, raw_len, coco_path) = row?;
         if row.kind == "coco_path" {
-            let path = raw
+            let path = coco_path
                 .as_ref()
                 .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
@@ -1149,13 +1232,21 @@ fn load_dataset_rows(project_id: &str) -> Result<Vec<DatasetSource>> {
             out.push(DatasetSource {
                 row,
                 source_dir,
-                raw_blob: None,
+                blob: None,
             });
         } else {
+            let blob = if raw_len > 0 {
+                Some(BlobRef {
+                    rowid,
+                    len: raw_len,
+                })
+            } else {
+                None
+            };
             out.push(DatasetSource {
                 row,
                 source_dir: None,
-                raw_blob: raw,
+                blob,
             });
         }
     }
@@ -1614,6 +1705,14 @@ fn run_import(
 // Import: new project
 // ---------------------------------------------------------------------------
 
+/// What to write into a new dataset's `raw_data` column. A COCO dataset stores its
+/// small absolute on-disk path; a blob dataset points at its staged file, whose bytes
+/// are streamed into the column with incremental blob I/O — never held in RAM.
+enum DatasetRaw {
+    CocoPath(Vec<u8>),
+    BlobFile(PathBuf),
+}
+
 fn import_as_new_project(
     staging: &Path,
     manifest: &ArchiveManifest,
@@ -1655,8 +1754,10 @@ fn import_as_new_project(
     }
 
     // Move dataset directories into place first. `raw_data` for a COCO dataset is the
-    // ABSOLUTE destination path — the source node's path is meaningless here.
-    let mut dataset_paths: HashMap<String, Vec<u8>> = HashMap::new();
+    // ABSOLUTE destination path — the source node's path is meaningless here. A blob
+    // dataset carries only its staged file path: the bytes are streamed into the DB
+    // column at insert time, never read whole into RAM.
+    let mut dataset_paths: HashMap<String, DatasetRaw> = HashMap::new();
     let mut moved_dirs: Vec<PathBuf> = Vec::new();
     let mut images_imported: u64 = 0;
     let mut annotations_imported: u64 = 0;
@@ -1688,14 +1789,15 @@ fn import_as_new_project(
                     moved_dirs.push(dest.clone());
                     dataset_paths.insert(
                         new_id.clone(),
-                        dest.to_string_lossy().to_string().into_bytes(),
+                        DatasetRaw::CocoPath(dest.to_string_lossy().to_string().into_bytes()),
                     );
                 }
                 RawDataKind::Blob => {
                     let src = staging.join(&d.raw_data_archive_path);
-                    let bytes = std::fs::read(&src)
-                        .with_context(|| format!("odczyt {}", src.display()))?;
-                    dataset_paths.insert(new_id.clone(), bytes);
+                    if !src.is_file() {
+                        bail!("archiwum bez pliku blob {}", d.raw_data_archive_path);
+                    }
+                    dataset_paths.insert(new_id.clone(), DatasetRaw::BlobFile(src));
                 }
                 RawDataKind::None => {}
             }
@@ -1793,7 +1895,7 @@ fn insert_new_project_rows(
     org_id: &str,
     datasets: &[DatasetRow],
     dataset_ids: &HashMap<String, String>,
-    dataset_paths: &HashMap<String, Vec<u8>>,
+    dataset_paths: &HashMap<String, DatasetRaw>,
     schemas: &[SchemaRow],
     dicts: &[LookupDictRow],
     dict_ids: &HashMap<String, String>,
@@ -1828,22 +1930,77 @@ fn insert_new_project_rows(
 
     for d in datasets {
         let new_id = &dataset_ids[&d.dataset_id];
-        let raw: Option<&Vec<u8>> = dataset_paths.get(new_id);
-        tx.execute(
-            "INSERT INTO datasets \
-                 (dataset_id, project_id, name, kind, row_count, column_count, profile_json, raw_data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                new_id,
-                new_project_id,
-                d.name,
-                d.kind,
-                d.row_count,
-                d.column_count,
-                d.profile_json,
-                raw.map(|b| b.as_slice())
-            ],
-        )?;
+        match dataset_paths.get(new_id) {
+            Some(DatasetRaw::CocoPath(bytes)) => {
+                tx.execute(
+                    "INSERT INTO datasets \
+                         (dataset_id, project_id, name, kind, row_count, column_count, profile_json, raw_data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        new_id,
+                        new_project_id,
+                        d.name,
+                        d.kind,
+                        d.row_count,
+                        d.column_count,
+                        d.profile_json,
+                        bytes.as_slice()
+                    ],
+                )?;
+            }
+            Some(DatasetRaw::BlobFile(path)) => {
+                // Allocate the column as a zero-filled blob of the staged file's exact
+                // size, then stream the file into it — the payload never sits in RAM.
+                let len = std::fs::metadata(path)
+                    .with_context(|| format!("odczyt metadanych {}", path.display()))?
+                    .len();
+                tx.execute(
+                    "INSERT INTO datasets \
+                         (dataset_id, project_id, name, kind, row_count, column_count, profile_json, raw_data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, zeroblob(?8))",
+                    params![
+                        new_id,
+                        new_project_id,
+                        d.name,
+                        d.kind,
+                        d.row_count,
+                        d.column_count,
+                        d.profile_json,
+                        len as i64
+                    ],
+                )?;
+                let rowid = tx.last_insert_rowid();
+                let mut blob = tx.blob_open(rusqlite::MAIN_DB, c"datasets", c"raw_data", rowid, false)?;
+                let mut file = std::io::BufReader::new(
+                    std::fs::File::open(path)
+                        .with_context(|| format!("otwarcie {}", path.display()))?,
+                );
+                let mut buf = vec![0u8; COPY_BUF];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    blob.write_all(&buf[..n])?;
+                }
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO datasets \
+                         (dataset_id, project_id, name, kind, row_count, column_count, profile_json, raw_data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                    params![
+                        new_id,
+                        new_project_id,
+                        d.name,
+                        d.kind,
+                        d.row_count,
+                        d.column_count,
+                        d.profile_json
+                    ],
+                )?;
+            }
+        }
     }
 
     for d in dicts {
@@ -1985,6 +2142,214 @@ fn remap_dict_ids(schema_json: &str, dict_ids: &HashMap<String, String>) -> Resu
 // Import: merge into an existing dataset
 // ---------------------------------------------------------------------------
 
+/// Only the `id` of a COCO array element; every other field is skipped without
+/// buffering, so the largest `id` of a huge images/annotations array is found in O(1).
+#[derive(Deserialize)]
+struct IdOnly {
+    #[serde(default)]
+    id: Option<i64>,
+}
+
+/// The largest `id` over a streamed JSON array (0 when empty/absent), computed without
+/// retaining any element.
+struct MaxId(i64);
+
+impl<'de> Deserialize<'de> for MaxId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MaxVisitor;
+        impl<'de> Visitor<'de> for MaxVisitor {
+            type Value = i64;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON array of objects with an id")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<i64, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut max = 0i64;
+                while let Some(e) = seq.next_element::<IdOnly>()? {
+                    if let Some(v) = e.id {
+                        if v > max {
+                            max = v;
+                        }
+                    }
+                }
+                Ok(max)
+            }
+        }
+        deserializer.deserialize_seq(MaxVisitor).map(MaxId)
+    }
+}
+
+/// Streaming shape of the merge TARGET COCO: images/annotations are reduced to their
+/// max id without buffering, while the small top-level keys the merged output must
+/// preserve (categories/info/licenses) are kept.
+#[derive(Deserialize)]
+struct TargetMeta {
+    #[serde(default)]
+    images: Option<MaxId>,
+    #[serde(default)]
+    annotations: Option<MaxId>,
+    #[serde(default)]
+    categories: Option<Value>,
+    #[serde(default)]
+    info: Option<Value>,
+    #[serde(default)]
+    licenses: Option<Value>,
+}
+
+/// One SOURCE category (id + name); other fields ignored. Categories are small.
+#[derive(Deserialize)]
+struct SrcCat {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Streaming shape used to read ONLY a source COCO's categories (images/annotations
+/// are skipped without buffering).
+#[derive(Deserialize)]
+struct SrcCatsDoc {
+    #[serde(default)]
+    categories: Vec<SrcCat>,
+}
+
+/// Writes JSON array elements to an output stream, inserting separating commas. The
+/// caller emits the surrounding `[` / `]`; this only tracks whether a comma is due, so
+/// elements can be streamed straight to disk without collecting them in a `Vec`.
+struct SeqOut<'w, W: Write> {
+    w: &'w mut W,
+    first: bool,
+}
+
+impl<'w, W: Write> SeqOut<'w, W> {
+    fn new(w: &'w mut W) -> Self {
+        SeqOut { w, first: true }
+    }
+    fn elem(&mut self, v: &Value) -> Result<()> {
+        if !self.first {
+            self.w.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut *self.w, v)?;
+        self.first = false;
+        Ok(())
+    }
+}
+
+/// Streams the elements of one top-level array `field` of a COCO object from `reader`,
+/// handing each element to `on_elem` as an owned `Value` one at a time. Every OTHER
+/// field is drained through `IgnoredAny`, so the wanted array is walked in O(one
+/// element) memory regardless of its position or the size of the sibling arrays. A
+/// callback error aborts the parse and is surfaced verbatim.
+fn stream_array_field<R, F>(reader: R, field: &'static str, mut on_elem: F) -> Result<()>
+where
+    R: std::io::Read,
+    F: FnMut(Value) -> Result<()>,
+{
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let mut captured: Option<anyhow::Error> = None;
+    let seed = MapFieldSeed {
+        field,
+        on_elem: &mut on_elem,
+        err: &mut captured,
+    };
+    let res = DeserializeSeed::deserialize(seed, &mut de);
+    if let Some(e) = captured {
+        return Err(e);
+    }
+    res.map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+struct MapFieldSeed<'a, F> {
+    field: &'static str,
+    on_elem: &'a mut F,
+    err: &'a mut Option<anyhow::Error>,
+}
+
+impl<'de, 'a, F> DeserializeSeed<'de> for MapFieldSeed<'a, F>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    type Value = ();
+    fn deserialize<D>(self, d: D) -> std::result::Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de, 'a, F> Visitor<'de> for MapFieldSeed<'a, F>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a COCO object")
+    }
+    fn visit_map<M>(self, mut map: M) -> std::result::Result<(), M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == self.field {
+                map.next_value_seed(ArraySeed {
+                    on_elem: &mut *self.on_elem,
+                    err: &mut *self.err,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct ArraySeed<'a, F> {
+    on_elem: &'a mut F,
+    err: &'a mut Option<anyhow::Error>,
+}
+
+impl<'de, 'a, F> DeserializeSeed<'de> for ArraySeed<'a, F>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    type Value = ();
+    fn deserialize<D>(self, d: D) -> std::result::Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de, 'a, F> Visitor<'de> for ArraySeed<'a, F>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON array")
+    }
+    fn visit_seq<S>(self, mut seq: S) -> std::result::Result<(), S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while let Some(v) = seq.next_element::<Value>()? {
+            if let Err(e) = (self.on_elem)(v) {
+                *self.err = Some(e);
+                return Err(serde::de::Error::custom("stream callback aborted"));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn merge_into_dataset(
     staging: &Path,
     manifest: &ArchiveManifest,
@@ -1998,11 +2363,18 @@ fn merge_into_dataset(
         bail!("dataset docelowy nie ma train/{COCO_FILE}");
     }
 
-    let mut target: Value = serde_json::from_slice(&std::fs::read(&target_coco_path)?)
-        .with_context(|| format!("parsowanie {}", target_coco_path.display()))?;
+    // Pass 1 over the target: images/annotations are streamed for their max id in O(1)
+    // memory, and only the small top-level keys the merged output must preserve
+    // (categories/info/licenses) are kept.
+    let meta: TargetMeta = {
+        let f = std::fs::File::open(&target_coco_path)?;
+        serde_json::from_reader(std::io::BufReader::new(f))
+            .with_context(|| format!("parsowanie {}", target_coco_path.display()))?
+    };
 
-    let target_categories: HashMap<String, i64> = target
-        .get("categories")
+    let target_categories: HashMap<String, i64> = meta
+        .categories
+        .as_ref()
         .and_then(|c| c.as_array())
         .map(|arr| {
             arr.iter()
@@ -2029,15 +2401,6 @@ fn merge_into_dataset(
         existing_names.insert(rel, h);
     }
 
-    let mut next_image_id = max_id(&target, "images") + 1;
-    let mut next_ann_id = max_id(&target, "annotations") + 1;
-
-    let mut new_images: Vec<Value> = Vec::new();
-    let mut new_anns: Vec<Value> = Vec::new();
-    let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut imported: u64 = 0;
-    let mut skipped: u64 = 0;
-
     let datasets_root = staging.join("datasets");
     let mut source_dirs: Vec<PathBuf> = if datasets_root.is_dir() {
         std::fs::read_dir(&datasets_root)?
@@ -2053,133 +2416,211 @@ fn merge_into_dataset(
         bail!("archiwum nie zawiera żadnego datasetu COCO do scalenia");
     }
 
-    for src_dataset in &source_dirs {
-        let src_train = src_dataset.join("train");
-        let src_coco: Value =
-            serde_json::from_slice(&std::fs::read(src_train.join(COCO_FILE))?)
-                .context("parsowanie COCO z archiwum")?;
+    let mut imported: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut annotations_imported: u64 = 0;
 
-        // Categories are matched BY NAME. A class the target does not know cannot be
-        // remapped to any id, and guessing would silently mislabel every box that uses
-        // it — so the merge refuses and names the offenders.
-        let src_categories: Vec<(i64, String)> = src_coco
-            .get("categories")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| {
-                        Some((c.get("id")?.as_i64()?, c.get("name")?.as_str()?.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let unknown: Vec<String> = src_categories
-            .iter()
-            .map(|(_, n)| n.clone())
-            .filter(|n| !target_categories.contains_key(n))
-            .collect();
-        if !unknown.is_empty() {
-            bail!(
-                "dataset docelowy nie ma klas obecnych w archiwum: {}",
-                unknown.join(", ")
-            );
-        }
-        let cat_remap: HashMap<i64, i64> = src_categories
-            .iter()
-            .filter_map(|(id, name)| target_categories.get(name).map(|t| (*id, *t)))
-            .collect();
-
-        let empty = Vec::new();
-        let src_images = src_coco
-            .get("images")
-            .and_then(|v| v.as_array())
-            .unwrap_or(&empty);
-        let src_anns = src_coco
-            .get("annotations")
-            .and_then(|v| v.as_array())
-            .unwrap_or(&empty);
-
-        // Annotations grouped by their source image id, so each image carries its own
-        // boxes through the id remap.
-        let mut by_image: HashMap<i64, Vec<&Value>> = HashMap::new();
-        for a in src_anns {
-            if let Some(iid) = a.get("image_id").and_then(|v| v.as_i64()) {
-                by_image.entry(iid).or_default().push(a);
-            }
-        }
-
-        for im in src_images {
-            let Some(old_id) = im.get("id").and_then(|v| v.as_i64()) else {
-                continue;
-            };
-            let Some(file_name) = im.get("file_name").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let src_file = src_train.join(file_name);
-            if !src_file.is_file() {
-                bail!("archiwum deklaruje obraz {file_name}, którego nie ma w datasecie");
-            }
-            let hash = sha256_file(&src_file)?;
-            if existing_hashes.contains(&hash) {
-                skipped += 1;
-                continue;
-            }
-
-            // Same name, different bytes: the incoming file gets a content-derived
-            // suffix. An existing image is never overwritten.
-            let final_name = if existing_names.contains_key(file_name) {
-                suffixed_name(file_name, &hash)
-            } else {
-                file_name.to_string()
-            };
-
-            let mut image = im.clone();
-            if let Some(obj) = image.as_object_mut() {
-                obj.insert("id".to_string(), json!(next_image_id));
-                obj.insert("file_name".to_string(), json!(final_name));
-            }
-            new_images.push(image);
-            copies.push((src_file, target_train.join(&final_name)));
-            existing_hashes.insert(hash.clone());
-            existing_names.insert(final_name, hash);
-
-            for a in by_image.get(&old_id).into_iter().flatten() {
-                let mut ann = (*a).clone();
-                let Some(obj) = ann.as_object_mut() else {
-                    continue;
-                };
-                let old_cat = obj.get("category_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                let Some(new_cat) = cat_remap.get(&old_cat) else {
-                    bail!("adnotacja wskazuje nieznaną kategorię {old_cat}");
-                };
-                obj.insert("id".to_string(), json!(next_ann_id));
-                obj.insert("image_id".to_string(), json!(next_image_id));
-                obj.insert("category_id".to_string(), json!(*new_cat));
-                next_ann_id += 1;
-                new_anns.push(ann);
-            }
-
-            next_image_id += 1;
-            imported += 1;
-        }
-    }
-
-    // Image bytes land before the COCO file is republished: an interrupted merge then
-    // leaves unreferenced files (harmless, re-merge dedupes them) rather than COCO
-    // records pointing at images that never arrived.
-    for (src, dest) in &copies {
-        std::fs::copy(src, dest)
-            .with_context(|| format!("kopiowanie {} -> {}", src.display(), dest.display()))?;
-    }
-
-    let annotations_imported = new_anns.len() as u64;
-    append_array(&mut target, "images", new_images)?;
-    append_array(&mut target, "annotations", new_anns)?;
-
+    // The merged COCO is written straight to a temp file and atomically renamed over the
+    // target only after every image byte is copied. Nothing is materialized whole: the
+    // target's images/annotations are re-streamed verbatim, and each source element is
+    // parsed one at a time. Any failure removes the temp and leaves the target intact.
     let tmp = target_coco_path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&target)?)?;
-    std::fs::rename(&tmp, &target_coco_path)
-        .with_context(|| format!("publikacja {}", target_coco_path.display()))?;
+    let published = (|| -> Result<()> {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        w.write_all(b"{")?;
+        let mut need_comma = false;
+        for (name, val) in [
+            ("info", meta.info.as_ref()),
+            ("licenses", meta.licenses.as_ref()),
+            ("categories", meta.categories.as_ref()),
+        ] {
+            if let Some(v) = val {
+                if need_comma {
+                    w.write_all(b",")?;
+                }
+                w.write_all(b"\"")?;
+                w.write_all(name.as_bytes())?;
+                w.write_all(b"\":")?;
+                serde_json::to_writer(&mut w, v)?;
+                need_comma = true;
+            }
+        }
+
+        let mut next_image_id = meta.images.as_ref().map(|m| m.0).unwrap_or(0) + 1;
+        let mut next_ann_id = meta.annotations.as_ref().map(|m| m.0).unwrap_or(0) + 1;
+
+        // Per-source remaps built in the images pass and consumed in the annotations
+        // pass: a handful of ints per class / per kept image, never per byte.
+        let mut cat_remaps: Vec<HashMap<i64, i64>> = Vec::with_capacity(source_dirs.len());
+        let mut id_remaps: Vec<HashMap<i64, i64>> = Vec::with_capacity(source_dirs.len());
+        // Image files copied into the target only after the merged COCO is fully written.
+        let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+        // ---- images: target verbatim, then remapped source images ----
+        if need_comma {
+            w.write_all(b",")?;
+        }
+        w.write_all(b"\"images\":[")?;
+        {
+            let mut imgs = SeqOut::new(&mut w);
+            {
+                let f = std::fs::File::open(&target_coco_path)?;
+                stream_array_field(std::io::BufReader::new(f), "images", |v| imgs.elem(&v))?;
+            }
+            for src_dataset in &source_dirs {
+                let src_train = src_dataset.join("train");
+
+                // Categories are matched BY NAME. A class the target does not know cannot
+                // be remapped, and guessing would silently mislabel every box that uses it
+                // — so the merge refuses and names the offenders before any file is copied
+                // or the target touched.
+                let src_cats: SrcCatsDoc = {
+                    let f = std::fs::File::open(src_train.join(COCO_FILE))?;
+                    serde_json::from_reader(std::io::BufReader::new(f))
+                        .context("parsowanie kategorii COCO z archiwum")?
+                };
+                let src_categories: Vec<(i64, String)> = src_cats
+                    .categories
+                    .into_iter()
+                    .filter_map(|c| Some((c.id?, c.name?)))
+                    .collect();
+                let unknown: Vec<String> = src_categories
+                    .iter()
+                    .map(|(_, n)| n.clone())
+                    .filter(|n| !target_categories.contains_key(n))
+                    .collect();
+                if !unknown.is_empty() {
+                    bail!(
+                        "dataset docelowy nie ma klas obecnych w archiwum: {}",
+                        unknown.join(", ")
+                    );
+                }
+                let cat_remap: HashMap<i64, i64> = src_categories
+                    .iter()
+                    .filter_map(|(id, name)| target_categories.get(name).map(|t| (*id, *t)))
+                    .collect();
+                cat_remaps.push(cat_remap);
+
+                let mut id_remap: HashMap<i64, i64> = HashMap::new();
+                {
+                    let f = std::fs::File::open(src_train.join(COCO_FILE))?;
+                    stream_array_field(
+                        std::io::BufReader::new(f),
+                        "images",
+                        |im: Value| -> Result<()> {
+                            let Some(old_id) = im.get("id").and_then(|v| v.as_i64()) else {
+                                return Ok(());
+                            };
+                            let Some(file_name) = im.get("file_name").and_then(|v| v.as_str())
+                            else {
+                                return Ok(());
+                            };
+                            let src_file = src_train.join(file_name);
+                            if !src_file.is_file() {
+                                bail!(
+                                    "archiwum deklaruje obraz {file_name}, którego nie ma w datasecie"
+                                );
+                            }
+                            let hash = sha256_file(&src_file)?;
+                            if existing_hashes.contains(&hash) {
+                                skipped += 1;
+                                return Ok(());
+                            }
+                            // Same name, different bytes: the incoming file gets a
+                            // content-derived suffix; an existing image is never overwritten.
+                            let final_name = if existing_names.contains_key(file_name) {
+                                suffixed_name(file_name, &hash)
+                            } else {
+                                file_name.to_string()
+                            };
+                            let mut image = im;
+                            if let Some(obj) = image.as_object_mut() {
+                                obj.insert("id".to_string(), json!(next_image_id));
+                                obj.insert("file_name".to_string(), json!(final_name));
+                            }
+                            imgs.elem(&image)?;
+                            copies.push((src_file, target_train.join(&final_name)));
+                            existing_hashes.insert(hash.clone());
+                            existing_names.insert(final_name, hash);
+                            id_remap.insert(old_id, next_image_id);
+                            next_image_id += 1;
+                            imported += 1;
+                            Ok(())
+                        },
+                    )?;
+                }
+                id_remaps.push(id_remap);
+            }
+        }
+        w.write_all(b"]")?;
+
+        // ---- annotations: target verbatim, then remapped source annotations ----
+        w.write_all(b",\"annotations\":[")?;
+        {
+            let mut anns = SeqOut::new(&mut w);
+            {
+                let f = std::fs::File::open(&target_coco_path)?;
+                stream_array_field(std::io::BufReader::new(f), "annotations", |v| {
+                    anns.elem(&v)
+                })?;
+            }
+            for (i, src_dataset) in source_dirs.iter().enumerate() {
+                let src_train = src_dataset.join("train");
+                let id_remap = &id_remaps[i];
+                let cat_remap = &cat_remaps[i];
+                let f = std::fs::File::open(src_train.join(COCO_FILE))?;
+                stream_array_field(
+                    std::io::BufReader::new(f),
+                    "annotations",
+                    |a: Value| -> Result<()> {
+                        let Some(old_img) = a.get("image_id").and_then(|v| v.as_i64()) else {
+                            return Ok(());
+                        };
+                        let Some(&new_img) = id_remap.get(&old_img) else {
+                            return Ok(());
+                        };
+                        let mut ann = a;
+                        let Some(obj) = ann.as_object_mut() else {
+                            return Ok(());
+                        };
+                        let old_cat =
+                            obj.get("category_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let Some(&new_cat) = cat_remap.get(&old_cat) else {
+                            bail!("adnotacja wskazuje nieznaną kategorię {old_cat}");
+                        };
+                        obj.insert("id".to_string(), json!(next_ann_id));
+                        obj.insert("image_id".to_string(), json!(new_img));
+                        obj.insert("category_id".to_string(), json!(new_cat));
+                        anns.elem(&ann)?;
+                        next_ann_id += 1;
+                        annotations_imported += 1;
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        w.write_all(b"]}")?;
+        w.flush()?;
+        drop(w);
+
+        // Image bytes land before the COCO file is published: an interrupted merge then
+        // leaves unreferenced files (harmless, re-merge dedupes them) rather than COCO
+        // records pointing at images that never arrived.
+        for (src, dest) in &copies {
+            std::fs::copy(src, dest).with_context(|| {
+                format!("kopiowanie {} -> {}", src.display(), dest.display())
+            })?;
+        }
+
+        std::fs::rename(&tmp, &target_coco_path)
+            .with_context(|| format!("publikacja {}", target_coco_path.display()))?;
+        Ok(())
+    })();
+
+    if let Err(e) = published {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
 
     Ok(ImportSummary {
         project_id: project_id.to_string(),
@@ -2223,28 +2664,6 @@ fn resolve_coco_dataset_dir(project_id: &str, dataset_id: &str) -> Result<PathBu
         bail!("katalog datasetu docelowego nie istnieje: {}", dir.display());
     }
     Ok(dir)
-}
-
-fn max_id(coco: &Value, key: &str) -> i64 {
-    coco.get(key)
-        .and_then(|v| v.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .filter_map(|e| e.get("id").and_then(|v| v.as_i64()))
-                .max()
-        })
-        .unwrap_or(0)
-}
-
-fn append_array(coco: &mut Value, key: &str, mut items: Vec<Value>) -> Result<()> {
-    if let Some(arr) = coco.get_mut(key).and_then(|v| v.as_array_mut()) {
-        arr.append(&mut items);
-        return Ok(());
-    }
-    coco.as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("COCO nie jest obiektem"))?
-        .insert(key.to_string(), Value::Array(items));
-    Ok(())
 }
 
 /// `photo.jpg` + hash -> `photo.a1b2c3d4.jpg`. Keeps the extension so decoders still
