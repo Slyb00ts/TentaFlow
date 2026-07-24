@@ -692,10 +692,13 @@ pub(crate) fn extract_video_frames(
     }
     // Pattern uses %04d → up to 9999 frames per clip; start at 1.
     let pattern = out_dir.join(format!("{}_f%04d.jpg", stem));
-    // Wrapped in OS `timeout` so a corrupt clip can't hang the build.
-    let status = std::process::Command::new("timeout")
+    // Wrapped in OS `timeout` so a corrupt clip can't hang the build. stderr is
+    // captured (loglevel=error) so the real decode failure — e.g. a missing moov
+    // atom — surfaces in the per-recording skip reason instead of the server log.
+    let output = std::process::Command::new("timeout")
         .arg(PER_FILE_TIMEOUT_SECS.to_string())
         .arg("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error"])
         .arg("-y")
         .arg("-i")
         .arg(src)
@@ -704,13 +707,20 @@ pub(crate) fn extract_video_frames(
         .args(["-q:v", "2"])
         .args(["-start_number", "1"])
         .arg(&pattern)
-        .status()
+        .output()
         .with_context(|| "uruchomienie ffmpeg (czy zainstalowany?)")?;
-    if !status.success() {
-        if status.code() == Some(124) {
+    if !output.status.success() {
+        if output.status.code() == Some(124) {
             anyhow::bail!("ffmpeg przekroczył limit czasu dla {}", src.display());
         }
-        anyhow::bail!("ffmpeg zwrócił błąd dla {}", src.display());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .last()
+            .unwrap_or("(brak komunikatu stderr)");
+        anyhow::bail!("ffmpeg: {} [{}]", reason, src.display());
     }
     // Count the frames actually written for this clip's prefix.
     let prefix = format!("{}_f", stem);
