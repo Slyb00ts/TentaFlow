@@ -232,6 +232,10 @@ pub struct DbFlow {
     /// catalog (`/v1/models`, mesh `catalog.list`, GUI). Uniqueness is
     /// enforced in domain logic against aliases and service model names.
     pub published_model_name: Option<String>,
+    /// Platform-seeded flow — user handlers reject edit/delete/status changes.
+    /// Only platform seeding may set this; `FlowParams` deliberately has no
+    /// counterpart so the user create/update paths can never flip it.
+    pub is_system: bool,
     pub created_at: String,
     pub updated_at: String,
 }

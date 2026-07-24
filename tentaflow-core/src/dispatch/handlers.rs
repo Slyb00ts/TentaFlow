@@ -1116,6 +1116,7 @@ pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             enabled: f.status == "active",
             is_default: f.is_default,
             published_model_name: f.published_model_name,
+            is_system: f.is_system,
         })
         .collect();
     Ok(MessageBody::FlowListResponse { flows: summaries })
@@ -1141,6 +1142,7 @@ pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         graph_json: flow.flow_json,
         enabled: flow.status == "active",
         status: flow.status,
+        is_system: flow.is_system,
     }))
 }
 
@@ -1208,11 +1210,14 @@ pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     };
 
     // Existence check przed delete (delete_flow nie raisuje na missing).
-    let exists = repository::get_flow(&ctx.state.db, flow_id)
-        .map_err(db_err)?
-        .is_some();
-    if !exists {
-        return Ok(MessageBody::FlowDeleteResponse { deleted: false });
+    let existing = match repository::get_flow(&ctx.state.db, flow_id).map_err(db_err)? {
+        Some(f) => f,
+        None => return Ok(MessageBody::FlowDeleteResponse { deleted: false }),
+    };
+    if existing.is_system {
+        return Err(ProtocolError::bad_request(
+            "system flow cannot be deleted — it is managed by the platform",
+        ));
     }
     repository::delete_flow(&ctx.state.db, flow_id).map_err(db_err)?;
     // A deleted flow that was published as a model must drop out of the
@@ -1288,6 +1293,12 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     let existing = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+    // Guards edit AND status flips — status rides on the same update payload.
+    if existing.is_system {
+        return Err(ProtocolError::bad_request(
+            "system flow cannot be modified — it is managed by the platform",
+        ));
+    }
 
     // Partial update — pola nie przeslane zachowuja wartosci z `existing`.
     let new_name = payload
@@ -1617,6 +1628,11 @@ pub fn flow_version_restore(
     let existing = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+    if existing.is_system {
+        return Err(ProtocolError::bad_request(
+            "system flow cannot be modified — it is managed by the platform",
+        ));
+    }
     let version = repository::get_flow_version(&ctx.state.db, flow_id, version_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow version not found"))?;

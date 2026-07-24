@@ -305,6 +305,7 @@ fn row_to_flow(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlow> {
         flow_json: row.get(6)?,
         status: row.get(7)?,
         published_model_name: row.get(8)?,
+        is_system: row.get(11)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
@@ -4031,7 +4032,7 @@ pub fn replace_routing_config_from_sync(
 
 // --- Flows ---
 
-const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at";
+const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at, is_system";
 
 pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>> {
     let conn = acquire(pool)?;
@@ -4079,7 +4080,7 @@ pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFl
     // tylko jawny `*` jest wildcardem; reszta wzorca jest literalna. ESCAPE '\'
     // mówi LIKE, że `\` poprzedza znak literalny.
     let mut stmt = conn.prepare_cached(
-        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.published_model_name, f.created_at, f.updated_at \
+        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.published_model_name, f.created_at, f.updated_at, f.is_system \
          FROM flows f INNER JOIN flow_model_bindings b ON f.id = b.flow_id \
          WHERE ?1 LIKE REPLACE(REPLACE(REPLACE(REPLACE(b.model_pattern, '\\', '\\\\'), '%', '\\%'), '_', '\\_'), '*', '%') ESCAPE '\\' \
          AND f.status = 'active' ORDER BY b.priority DESC LIMIT 1",

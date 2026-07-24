@@ -627,6 +627,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_detection_zones",
             MigrationStep::Rust(cameras_add_zones_column),
         ),
+        (
+            118,
+            "flows_is_system",
+            MigrationStep::Rust(flows_add_is_system_column),
+        ),
     ]
 }
 
@@ -1577,6 +1582,16 @@ fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE cameras ADD COLUMN analysis_fps INTEGER NOT NULL DEFAULT 10;",
         )?;
+    }
+    Ok(())
+}
+
+/// Adds `is_system` to `flows`. Marks platform-seeded flows that user-facing
+/// handlers must refuse to edit, delete or change status on — the flag is only
+/// ever set by platform seeding, never through the user create/update paths.
+fn flows_add_is_system_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "flows", "is_system")? {
+        conn.execute_batch("ALTER TABLE flows ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }

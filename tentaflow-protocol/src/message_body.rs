@@ -906,6 +906,10 @@ pub struct FlowSummary {
     /// access-key wizard must grant — the flow's own UUID is not callable.
     #[serde(default)]
     pub published_model_name: Option<String>,
+    /// `flows.is_system` — platform-seeded flow; the server rejects user
+    /// edit/delete/status changes, so the UI can hide those actions.
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -918,6 +922,10 @@ pub struct FlowDetail {
     pub enabled: bool,
     /// Raw flow status column: "active" | "draft" | "decoded" itp.
     pub status: String,
+    /// `flows.is_system` — platform-seeded flow; the server rejects user
+    /// edit/delete/status changes, so the UI can hide those actions.
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
