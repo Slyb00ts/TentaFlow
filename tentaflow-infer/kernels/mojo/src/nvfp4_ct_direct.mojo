@@ -1110,7 +1110,9 @@ def gemm_nvfp4_ct_bm16_down_m8(
 
 comptime BM32 = 32
 comptime XTILE32 = BM32 * LDK
-comptime BM32_STAGES = 3
+# Dwa etapy, nie trzy: 26 624 B shared daje 3 bloki/SM zamiast 2, a zmierzony
+# zysk z occupancy (gate+up 1,32x) przewyższa stratę na płytszym prefetchu.
+comptime BM32_STAGES = 2
 
 
 def gemm_nvfp4_ct_direct_bm32_bn64_bk128[
@@ -1132,7 +1134,7 @@ def gemm_nvfp4_ct_direct_bm32_bn64_bk128[
     comptime assert n_rows % BN == 0, "N musi być wielokrotnością 64"
     comptime assert nvfp4_ct_split_pipeline_supported[
         n_cols // BK, outer_split_k, BM32_STAGES
-    ](), "każda część split-K musi mieć co najmniej trzy etapy"
+    ](), "każda część split-K musi pomieścić pełny potok cp.async"
     tid = Int(thread_idx.x)
     lane = tid % WARP_SIZE
     warp_id = tid // WARP_SIZE
@@ -1523,3 +1525,7 @@ def gemm_nvfp4_ct_bm32_down_m24(
     gemm_nvfp4_ct_direct_bm32_bn64_bk128[
         11264, 4096, 24, 4, OUTPUT_TOKEN_MAJOR
     ](workspace, resident, x, inv_global_scale)
+
+
+
+
