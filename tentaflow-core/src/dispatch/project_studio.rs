@@ -2259,7 +2259,8 @@ fn chat_history_v1(
         .map_err(|e| ProtocolError::internal(format!("core db read: {e}")))?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, role, COALESCE(content, ''), created_at FROM conversation_messages \
+            "SELECT id, role, COALESCE(content, ''), COALESCE(citations_json, ''), created_at \
+             FROM conversation_messages \
              WHERE session_id = ?1 AND role IN ('user','assistant') \
                AND (?2 IS NULL OR id < ?2) \
              ORDER BY id DESC LIMIT ?3",
@@ -2273,8 +2274,8 @@ fn chat_history_v1(
                     message_id: row.get::<_, i64>(0)?.to_string(),
                     role: row.get(1)?,
                     content: row.get(2)?,
-                    citations_json: String::new(),
-                    created_at: row.get(3)?,
+                    citations_json: row.get(3)?,
+                    created_at: row.get(4)?,
                 })
             },
         )

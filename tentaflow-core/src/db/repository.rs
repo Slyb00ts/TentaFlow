@@ -4212,6 +4212,15 @@ fn flow_changed_fields(
         "published_model_name".to_string(),
         field_optional_string(params.published_model_name),
     );
+    // FlowParams deliberately has no is_system and user handlers reject edits
+    // of system flows, so every capture minted here is explicitly non-system.
+    // The column still travels: apply_flow's seed-guard uses it to distinguish
+    // a user edit (is_system=false → rejected on a local system row) from a
+    // seed refresh (is_system=true → accepted).
+    fields.insert(
+        "is_system".to_string(),
+        crate::sync::ledger::FieldValue::Bool(false),
+    );
     fields
 }
 
@@ -23250,6 +23259,35 @@ pub fn recent_conversation_messages(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Appends ONE project-chat (ps-chat) message to a session and returns its row
+/// id — the wire `message_id` of `ChatHistoryResponse`/`ChatStreamEnd`.
+/// Separate from `insert_conversation_messages` because ps-chat needs the id
+/// back and persists `citations_json` (assistant replies), which the generic
+/// turn-batch writer has no business carrying.
+pub fn append_project_chat_message(
+    pool: &DbPool,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    citations_json: Option<&str>,
+) -> Result<i64> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let next_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM conversation_messages WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO conversation_messages (session_id, seq, role, content, citations_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![session_id, next_seq, role, content, citations_json],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
 }
 
 #[cfg(test)]

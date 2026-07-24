@@ -41,13 +41,29 @@ impl ProjectKnowledgeNodeAdapter {
             .unwrap_or_else(|| DEFAULT_ORG_ID.to_string())
     }
 
-    fn pick_project_id(node: &FlowNode) -> Result<String> {
+    /// Node config wins; an empty config falls back to `envelope.meta
+    /// ["project_id"]`. The fallback exists for shared system flows (ps-chat):
+    /// ONE global flow serves every project, so the project identity must ride
+    /// on the envelope seeded by the caller, not be pinned in the graph.
+    fn pick_project_id(node: &FlowNode, envelope: &FlowEnvelope) -> Result<String> {
         node.config
             .get("project_id")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("project_knowledge: missing required 'project_id' in config"))
+            .or_else(|| {
+                envelope
+                    .meta
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "project_knowledge: no project id — config 'project_id' nor envelope.meta['project_id']"
+                )
+            })
     }
 
     fn pick_source_ids(node: &FlowNode) -> Vec<String> {
@@ -129,6 +145,15 @@ impl ProjectKnowledgeNodeAdapter {
             "rag_citations".to_string(),
             knowledge::citations_json(&hits, knowledge::DEFAULT_SNIPPET_CHARS),
         );
+        // A downstream `llm` node ignores a Json payload (build_messages only
+        // appends Text), so the retrieved passages ground the model through
+        // `context.system_prompts` — the same channel the `memory` node uses.
+        if !hits.is_empty() {
+            out.context.system_prompts.push(knowledge::context_block(
+                &hits,
+                knowledge::DEFAULT_SNIPPET_CHARS,
+            ));
+        }
         out.payload = FlowValue::Json(knowledge::hits_to_json(
             &hits,
             knowledge::DEFAULT_SNIPPET_CHARS,
@@ -169,7 +194,7 @@ impl NodeAdapter for ProjectKnowledgeNodeAdapter {
 
         let user_id = Self::user_scope(ctx)?;
         let org = Self::org_scope(ctx);
-        let project_id = Self::pick_project_id(node)?;
+        let project_id = Self::pick_project_id(node, envelope)?;
         // Membership gate BEFORE any operation — a non-member gets the same
         // error as a missing project (no existence leak).
         knowledge::require_member(&org, &project_id, user_id)?;
@@ -458,6 +483,62 @@ mod tests {
         assert_eq!(cites[0]["doc_id"].as_str(), Some("file-1"));
         assert_eq!(cites[0]["chunk_index"].as_i64(), Some(0));
         assert_eq!(cites[0]["text"].as_str(), Some("real project passage"));
+
+        // The passages ground a downstream llm through system_prompts.
+        assert_eq!(out.context.system_prompts.len(), 1);
+        assert!(out.context.system_prompts[0].contains("real project passage"));
+        assert!(out.context.system_prompts[0].contains("[1]"));
+    }
+
+    /// ps-chat: ONE global system flow serves every project, so the node must
+    /// resolve the project from `envelope.meta["project_id"]` when the config
+    /// leaves it empty. Missing both is a hard error.
+    #[tokio::test]
+    async fn project_id_falls_back_to_envelope_meta() {
+        let project_id = seed_project("owner-4", &[]);
+        let pool = project_db::open(&project_id).expect("open project pool");
+        repository::create_source(&pool, "src-m", "document", "Meta docs", "{}", "owner-4")
+            .expect("create source");
+
+        let mut ctx = stub_ctx();
+        ctx.user_id = Some("owner-4".into());
+        ctx.org_id = Some("org-1".into());
+
+        let mut env = FlowEnvelope::empty();
+        env.meta
+            .insert("project_id".into(), json!(project_id.clone()));
+        let out = ProjectKnowledgeNodeAdapter::new()
+            .execute(
+                &node(json!({"project_id": "", "operation": "list_sources"})),
+                &[NodeInput {
+                    from_node_id: "trigger".into(),
+                    from_port: "full".into(),
+                    envelope: Arc::new(env),
+                }],
+                &ctx,
+            )
+            .await
+            .expect("list_sources via meta project_id");
+        match &out.payload {
+            FlowValue::Json(v) => {
+                assert_eq!(v["sources"][0]["source_id"].as_str(), Some("src-m"));
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+
+        // Neither config nor meta → explicit error naming both channels.
+        let err = ProjectKnowledgeNodeAdapter::new()
+            .execute(
+                &node(json!({"operation": "list_sources"})),
+                &[input(FlowValue::Empty)],
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("envelope.meta['project_id']"),
+            "was: {err}"
+        );
     }
 
     #[tokio::test]

@@ -637,6 +637,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "project_studio_permissions",
             MigrationStep::Rust(roles_add_project_studio_permissions),
         ),
+        (
+            120,
+            "conversation_messages_citations",
+            MigrationStep::Rust(conversation_messages_add_citations_column),
+        ),
     ]
 }
 
@@ -1597,6 +1602,18 @@ fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
 fn flows_add_is_system_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "flows", "is_system")? {
         conn.execute_batch("ALTER TABLE flows ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
+}
+
+/// Adds `citations_json` to `conversation_messages`. Project-chat (ps-chat)
+/// assistant replies persist their RAG citations next to the content, so
+/// `ChatHistoryResponse` can rebuild the sources panel after a reload. NULL /
+/// empty = message without citations (every non-ps-chat writer leaves it NULL).
+/// Idempotent — guarded by a column probe.
+fn conversation_messages_add_citations_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "conversation_messages", "citations_json")? {
+        conn.execute_batch("ALTER TABLE conversation_messages ADD COLUMN citations_json TEXT;")?;
     }
     Ok(())
 }

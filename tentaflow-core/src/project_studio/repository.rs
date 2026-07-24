@@ -475,6 +475,19 @@ pub fn rename_chat(project_id: &str, chat_id: &str, user_id: &str, title: &str) 
     Ok(n > 0)
 }
 
+/// Bumps `updated_at` so the chat surfaces at the top of the (updated_at DESC)
+/// conversation list after a new turn. Owner-scoped like every chat query.
+pub fn touch_chat(project_id: &str, chat_id: &str, user_id: &str) -> Result<bool> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(write_err)?;
+    let n = conn.execute(
+        "UPDATE project_chats SET updated_at = datetime('now') \
+         WHERE project_id = ?1 AND chat_id = ?2 AND user_id = ?3",
+        params![project_id, chat_id, user_id],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn delete_chat(project_id: &str, chat_id: &str, user_id: &str) -> Result<bool> {
     let pool = super::db::pool()?;
     let conn = pool.write().map_err(write_err)?;

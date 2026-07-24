@@ -1694,6 +1694,323 @@ inventory::submit! {
 }
 
 // =============================================================================
+// ProjectStudioChatStream — project chat turn over the system ps-chat flow.
+// =============================================================================
+// The frontend subscribes via ApiBinary.subscribe('projectStudioChatStreamRequest',
+// { projectId, chatId, message }). One turn: persist the user message, run the
+// seeded ps-chat flow (trigger -> project_knowledge -> conversation_history ->
+// llm streaming), forward tokens as ChatStreamChunk{kind:"token"}, emit ONE
+// ChatStreamChunk{kind:"citations"} from the final envelope's rag_citations,
+// persist the assistant reply (content + citations_json) and finish with
+// ChatStreamEnd{message_id}. Dropping the subscription cancels the generation
+// (push failure fires the flow's cancel token — same contract as FlowInvoke).
+
+/// Chat model for a project turn: the project's 'chat' agent binding
+/// (`settings['agents']` in project.db) wins; without a binding (or an agent
+/// without a model) returns None and the llm node's hard "no model" error
+/// surfaces through ChatStreamEnd — the platform deliberately has no global
+/// default model (see `build_initial_envelope_inner`).
+fn project_chat_model(project_id: &str) -> Option<String> {
+    let pool = crate::project_studio::project_db::open(project_id).ok()?;
+    let raw = crate::project_studio::repository::get_setting(&pool, "agents").ok()??;
+    let map: std::collections::HashMap<String, String> = serde_json::from_str(&raw).ok()?;
+    let agent_id = map.get("chat").filter(|s| !s.is_empty())?;
+    let (_name, model) = crate::project_studio::repository::resolve_agent_label(agent_id)?;
+    if model.is_empty() {
+        None
+    } else {
+        Some(model)
+    }
+}
+
+fn project_studio_chat_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue};
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let (project_id, chat_id, message) = match req {
+        MessageBody::ProjectStudioBody(ProjectStudioPayload::ChatStreamRequest {
+            project_id,
+            chat_id,
+            message,
+        }) => (project_id, chat_id, message),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    let end_error = |sub: &Arc<Subscription>, chat_id: &str, error: String| {
+        let _ = push_end(
+            sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::ChatStreamEnd {
+                    chat_id: chat_id.to_string(),
+                    status: "error".into(),
+                    error: Some(error),
+                    message_id: String::new(),
+                },
+            )),
+        );
+    };
+
+    // Guards, uniform denial (no existence leak): project_studio.read →
+    // project in the caller's org → REAL membership (chats are personal
+    // content, so no project_studio.admin bypass) → the chat belongs to the
+    // caller (get_chat filters by user_id).
+    let Some(org) = ctx.org_context.as_ref() else {
+        end_error(&sub, &chat_id, "chat not found".into());
+        return;
+    };
+    if !org.has("project_studio.read") {
+        end_error(&sub, &chat_id, "chat not found".into());
+        return;
+    }
+    let project = match crate::project_studio::repository::get_project(&org.org_id, &project_id) {
+        Ok(Some(p)) => p,
+        _ => {
+            end_error(&sub, &chat_id, "chat not found".into());
+            return;
+        }
+    };
+    // Archived projects are read-only — same contract as `require_active` in
+    // the request/response handlers (bad_request "project is archived"), so
+    // the UI shows the actual state instead of a phantom "chat not found".
+    if project.status == "archived" {
+        end_error(&sub, &chat_id, "project is archived".into());
+        return;
+    }
+    if !matches!(
+        crate::project_studio::repository::member_role(&project_id, &org.user_id),
+        Ok(Some(_))
+    ) {
+        end_error(&sub, &chat_id, "chat not found".into());
+        return;
+    }
+    let chat =
+        match crate::project_studio::repository::get_chat(&project_id, &chat_id, &org.user_id) {
+            Ok(Some(c)) => c,
+            _ => {
+                end_error(&sub, &chat_id, "chat not found".into());
+                return;
+            }
+        };
+
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        end_error(&sub, &chat_id, "message is required".into());
+        return;
+    }
+
+    let user_role = match &ctx.session {
+        SessionAuth::UserSession { role, .. } => role.clone(),
+        _ => None,
+    };
+    let caller_id = org.user_id.clone();
+    let org_id = org.org_id.clone();
+    let model = project_chat_model(&project_id);
+    let router = ctx.state.router.clone();
+    let db = ctx.state.db.clone();
+    let correlation_id = ctx.correlation_id;
+
+    tokio::spawn(async move {
+        let Some(fd) = router.flow_dispatcher().cloned() else {
+            end_error(&sub, &chat_id, "flow dispatcher unavailable".into());
+            return;
+        };
+
+        // Persist the user message BEFORE dispatch: conversation_history
+        // replays it as the last user turn (the llm builder deduplicates the
+        // Text payload against it), and the question survives even when the
+        // generation fails mid-stream.
+        let db_persist = db.clone();
+        let session_for_persist = chat.session_id.clone();
+        let user_text = message.clone();
+        let persisted = tokio::task::spawn_blocking(move || {
+            crate::db::repository::append_project_chat_message(
+                &db_persist,
+                &session_for_persist,
+                "user",
+                &user_text,
+                None,
+            )
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(_))) {
+            end_error(&sub, &chat_id, "failed to persist message".into());
+            return;
+        }
+        let _ = crate::project_studio::repository::touch_chat(&project_id, &chat_id, &caller_id);
+
+        let mut envelope = FlowEnvelope::empty();
+        envelope.payload = FlowValue::Text(message);
+        envelope.meta.insert(
+            "project_id".into(),
+            serde_json::Value::String(project_id.clone()),
+        );
+        envelope.meta.insert(
+            "session_id".into(),
+            serde_json::Value::String(chat.session_id.clone()),
+        );
+        if let Some(m) = model {
+            envelope
+                .meta
+                .insert("model".into(), serde_json::Value::String(m));
+        }
+
+        // Cancel bound to the subscription: a dropped/unsubscribed client
+        // aborts the flow (push failure below fires this token).
+        let cancel = CancellationToken::new();
+        let mut meta = FlowRequestMeta::new(format!("ps-chat-{correlation_id}"));
+        meta.session_id = Some(chat.session_id.clone());
+        meta.user_id = Some(caller_id.clone());
+        meta.user_role = user_role;
+        meta.org_id = Some(org_id);
+        meta.cancel_token = cancel.clone();
+
+        let dispatch = fd
+            .dispatch_by_flow_id_streaming(
+                crate::db::seed::PS_CHAT_FLOW_ID.to_string(),
+                envelope,
+                meta,
+            )
+            .await;
+        let exec = match dispatch {
+            Ok(e) => e,
+            Err(e) => {
+                end_error(&sub, &chat_id, format!("dispatch failed: {e}"));
+                return;
+            }
+        };
+
+        let mut stream = exec.stream;
+        let mut full_text = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(EnvelopeDelta::Llm(c)) => {
+                    if c.text_delta.is_empty() {
+                        continue;
+                    }
+                    full_text.push_str(&c.text_delta);
+                    let chunk = ProjectStudioPayload::ChatStreamChunk {
+                        chat_id: chat_id.clone(),
+                        kind: "token".into(),
+                        text: c.text_delta,
+                        citations_json: String::new(),
+                    };
+                    if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                        .await
+                        .is_err()
+                    {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                // ps-chat is text-only; other delta kinds carry no tokens.
+                Ok(_) => {}
+                Err(e) => {
+                    cancel.cancel();
+                    end_error(&sub, &chat_id, format!("stream error: {e}"));
+                    return;
+                }
+            }
+        }
+
+        // The final envelope carries the retrieval citations set by the
+        // project_knowledge node (meta["rag_citations"]).
+        let (citations_json, flow_error) = match exec.outcome.await {
+            Ok(outcome) => {
+                let cites = outcome
+                    .final_envelope
+                    .meta
+                    .get("rag_citations")
+                    .and_then(|v| v.as_array().filter(|a| !a.is_empty()).map(|_| v.clone()))
+                    .map(|v| v.to_string());
+                (cites, outcome.error)
+            }
+            // The outcome channel dropped — the flow died without reporting.
+            // Don't persist the partial full_text as a successful reply.
+            Err(_) => {
+                end_error(&sub, &chat_id, "flow execution failed".into());
+                return;
+            }
+        };
+        if let Some(e) = flow_error {
+            end_error(&sub, &chat_id, e);
+            return;
+        }
+
+        // Persist the assistant reply (content + citations, so
+        // ChatHistoryResponse rebuilds the sources panel) BEFORE pushing the
+        // citations chunk: a failed push must not lose the reply — the
+        // message_id travels in ChatStreamEnd, and even if that push fails
+        // too the reply survives in the history.
+        let db_persist = db.clone();
+        let session_for_persist = chat.session_id.clone();
+        let assistant_text = full_text;
+        let cites_for_persist = citations_json.clone();
+        let message_id = tokio::task::spawn_blocking(move || {
+            crate::db::repository::append_project_chat_message(
+                &db_persist,
+                &session_for_persist,
+                "assistant",
+                &assistant_text,
+                cites_for_persist.as_deref(),
+            )
+        })
+        .await;
+        let message_id = match message_id {
+            Ok(Ok(id)) => id.to_string(),
+            _ => {
+                end_error(&sub, &chat_id, "failed to persist reply".into());
+                return;
+            }
+        };
+        let _ = crate::project_studio::repository::touch_chat(&project_id, &chat_id, &caller_id);
+
+        if let Some(cites) = citations_json.as_deref() {
+            let chunk = ProjectStudioPayload::ChatStreamChunk {
+                chat_id: chat_id.clone(),
+                kind: "citations".into(),
+                text: String::new(),
+                citations_json: cites.to_string(),
+            };
+            if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        let _ = push_end_async(
+            &sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::ChatStreamEnd {
+                    chat_id,
+                    status: "success".into(),
+                    error: None,
+                    message_id,
+                },
+            )),
+        )
+        .await;
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioChatStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_chat_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 

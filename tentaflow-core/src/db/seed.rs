@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::crypto;
 
@@ -53,6 +53,23 @@ const GENERAL_AGENT_ID: &str = "00000000-0000-4000-8000-000000000014";
 /// wiec nie koliduje z routingiem modeli — flow jest wybierany wylacznie przez
 /// jawne przypisanie do kamery.
 const CAMERA_ANALYSIS_FLOW_ID: &str = "00000000-0000-4000-8000-000000000020";
+
+/// Staly UUID systemowego flow czatu projektowego (Project Studio, ps-chat).
+/// Jak inne seedy: id identyczne na kazdym node. Flow jest JEDEN globalnie —
+/// `project_id` NIE jest zaszyty w grafie, tylko podawany w envelope.meta przez
+/// stream handler czatu ("ProjectStudioChatStreamRequest"). `is_system=1`:
+/// handlery userowe odrzucaja edycje/delete, a seed odswieza tresc przy kazdym
+/// starcie (ON CONFLICT ... WHERE is_system = 1, wzorzec promptow).
+pub(crate) const PS_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000040";
+
+/// Graf ps-chat: trigger -> project_knowledge(search, project_id z meta) ->
+/// conversation_history -> llm(stream, BEZ narzedzi) -> output(stream).
+/// LLM jest streamowany i celowo nie dostaje tools (streaming+tools nie dziala
+/// na embedded backendach); model przychodzi w envelope.meta['model'] z
+/// bindingu agenta 'chat' projektu. Pasaze wiedzy trafiaja do LLM przez
+/// context.system_prompts (project_knowledge), a cytowania przez
+/// meta['rag_citations'].
+const PS_CHAT_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"k1","type":"project_knowledge","position":{"x":360,"y":0},"config":{"operation":"search","top_k":6}},{"id":"h1","type":"conversation_history","position":{"x":720,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":1080,"y":0},"config":{"system_prompt":"Jesteś asystentem projektu. Odpowiadaj po polsku, opierając się na dostarczonym kontekście z bazy wiedzy projektu (pasaże ponumerowane [i]). Gdy korzystasz z pasażu, cytuj jego numer. Jeśli kontekst nie zawiera odpowiedzi, powiedz to wprost i odpowiedz najlepiej jak potrafisz."}},{"id":"o1","type":"output","position":{"x":1440,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"k1","from_port":"text","to_port":"in","data_type":"text"},{"from_node":"k1","to_node":"h1","from_port":"full","to_port":"in","data_type":"json"},{"from_node":"h1","to_node":"l1","from_port":"full","to_port":"in","data_type":"any"},{"from_node":"l1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
 
 /// Graf domyslnego flow analizy kamery (patrz `seed_camera_analysis_flow`).
 /// Stala (nie literal w funkcji), zeby test mogl go zwalidowac + skompilowac.
@@ -110,6 +127,7 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_camera_cv_aliases(&tx)?;
     seed_camera_cv_pipeline(&tx)?;
     seed_harness_flows(&tx)?;
+    seed_ps_chat_flow(&tx)?;
     seed_system_agents(&tx)?;
 
     // Seed user_accounts — domyslny admin z hashem argon2
@@ -751,7 +769,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Baza wiedzy modułu Projekty: szuka pasaży w wybranym projekcie (zapytanie z payloadu Text) albo zwraca listę źródeł. Wymaga tożsamości użytkownika-członka projektu; wyniki niosą cytowania.",
             r#"{"project_id":"","operation":"search","top_k":8}"#,
             "book-open",
-            r#"{"properties":{"project_id":{"type":"string","title":"Projekt","description":"Projekt, którego baza wiedzy będzie przeszukiwana (tylko projekty, w których jesteś członkiem)","dynamic_enum":{"source":"projects"}},"operation":{"type":"string","title":"Operacja","enum":[{"value":"search","label":"Szukaj w bazie wiedzy"},{"value":"list_sources","label":"Lista źródeł"}],"default":"search"},"top_k":{"type":"integer","title":"Top K","minimum":1,"maximum":50,"default":8,"description":"Maksymalna liczba pasaży wyniku"},"source_ids":{"type":"array","title":"Źródła (opcjonalnie)","description":"Ogranicz wyszukiwanie do wskazanych źródeł (puste = wszystkie)","items":{"type":"string"}}},"required":["project_id"],"order":["project_id","operation","top_k","source_ids"]}"#,
+            r#"{"properties":{"project_id":{"type":"string","title":"Projekt","description":"Projekt, którego baza wiedzy będzie przeszukiwana (tylko projekty, w których jesteś członkiem). Puste = identyfikator projektu brany z envelope.meta['project_id'] (flow współdzielony, np. systemowy ps-chat)","dynamic_enum":{"source":"projects"}},"operation":{"type":"string","title":"Operacja","enum":[{"value":"search","label":"Szukaj w bazie wiedzy"},{"value":"list_sources","label":"Lista źródeł"}],"default":"search"},"top_k":{"type":"integer","title":"Top K","minimum":1,"maximum":50,"default":8,"description":"Maksymalna liczba pasaży wyniku"},"source_ids":{"type":"array","title":"Źródła (opcjonalnie)","description":"Ogranicz wyszukiwanie do wskazanych źródeł (puste = wszystkie)","items":{"type":"string"}}},"required":[],"order":["project_id","operation","top_k","source_ids"]}"#,
         ),
         (
             "store",
@@ -1408,6 +1426,49 @@ fn seed_harness_flows(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Seeduje systemowy flow czatu projektowego (ps-chat). Inaczej niz Default
+/// Chat / Agent Run: wiersz jest `is_system=1` (user go nie edytuje — guardy
+/// handlerow blokuja), wiec seed moze go ODSWIEZAC przy kazdym starcie
+/// (wzorzec promptow: INSERT ... ON CONFLICT ... WHERE is_system = 1). Dzieki
+/// temu nowa wersja binarki dowozi nowa wersje grafu bez migracji, a wiersz
+/// pozostaje idempotentny per-node (staly id, zero duplikatow).
+fn seed_ps_chat_flow(conn: &Connection) -> Result<()> {
+    const NAME: &str = "Project Chat";
+    const DESCRIPTION: &str = "Systemowy flow czatu projektowego (Projekty): trigger -> project_knowledge -> conversation_history -> llm(stream) -> output. project_id i model przychodza w envelope.meta.";
+    // Reclaim: the fixed id belongs to the seed. A row on this id stripped of
+    // is_system (older binary, manual edit) would dodge the WHERE guard below
+    // forever and leave the node with a stale/foreign graph under the id the
+    // chat handler dispatches — so ownership is restored first.
+    let stray: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM flows WHERE id = ?1 AND is_system = 0",
+        rusqlite::params![PS_CHAT_FLOW_ID],
+        |r| r.get(0),
+    )?;
+    if stray > 0 {
+        warn!("reclaiming ps-chat system flow (row {PS_CHAT_FLOW_ID} lost is_system)");
+        conn.execute(
+            "UPDATE flows SET is_system = 1 WHERE id = ?1",
+            rusqlite::params![PS_CHAT_FLOW_ID],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO flows (id, name, description, service_type, flow_json, status, is_default, is_system) \
+         VALUES (?1, ?2, ?3, NULL, ?4, 'active', 0, 1) \
+         ON CONFLICT(id) DO UPDATE SET \
+             name = excluded.name, \
+             description = excluded.description, \
+             service_type = excluded.service_type, \
+             flow_json = excluded.flow_json, \
+             status = 'active', \
+             is_default = 0, \
+             is_system = 1, \
+             updated_at = datetime('now') \
+         WHERE is_system = 1",
+        rusqlite::params![PS_CHAT_FLOW_ID, NAME, DESCRIPTION, PS_CHAT_FLOW_JSON],
+    )?;
+    Ok(())
+}
+
 /// Seeduje systemowego agenta `general` (§3.8) ze stalym UUID, zeby harness
 /// dzialal out-of-the-box. `routable=1`, `is_enabled=1`, `flow_id=NULL`
 /// (uzywa "Agent Run"). Idempotentny: INSERT tylko gdy brak wiersza po id lub
@@ -1581,7 +1642,9 @@ mod tests {
     }
 
     /// Swieza baza ma dokladnie jeden DOMYSLNY flow ("Default Chat", default=1)
-    /// oraz trzy flow harnessa (§3.8) z is_default=0. Razem 4 wiersze.
+    /// oraz trzy pozostale seedy z is_default=0: "Agent Run" (harness §3.8),
+    /// "Camera Analysis" (ADR PoC) i systemowy "Project Chat" (ps-chat,
+    /// is_system=1). Razem 4 wiersze.
     #[test]
     fn fresh_db_has_expected_default_flows() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
@@ -1591,19 +1654,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            total, 2,
-            "oczekiwane 2 flow (Default Chat + Agent Run), jest {}",
+            total, 4,
+            "oczekiwane 4 flow (Default Chat + Camera Analysis + Agent Run + Project Chat), jest {}",
             total
         );
 
-        // Default Chat pozostaje JEDYNYM is_default=1 — assercja "exactly one
-        // default flow" (§3.8: test seedow do aktualizacji).
-        let default_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM flows WHERE is_default = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(default_count, 1, "dokladnie jeden domyslny flow");
+        // is_default=1 jest unikalne PER service_type (resolver bierze
+        // "default dla service_type"): chat -> Default Chat, camera_analysis ->
+        // Camera Analysis. Wiecej niz jeden default w obrebie jednego
+        // service_type = niedeterministyczny resolver.
+        let default_pairs: Vec<(Option<String>, i64)> = conn
+            .prepare(
+                "SELECT service_type, COUNT(*) FROM flows WHERE is_default = 1 \
+                 GROUP BY service_type ORDER BY service_type",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            default_pairs,
+            vec![
+                (Some("camera_analysis".to_string()), 1),
+                (Some("chat".to_string()), 1),
+            ],
+            "dokladnie jeden domyslny flow per service_type"
+        );
 
         let names: Vec<String> = conn
             .prepare("SELECT name FROM flows ORDER BY name")
@@ -1614,7 +1691,12 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["Agent Run".to_string(), "Default Chat".to_string(),]
+            vec![
+                "Agent Run".to_string(),
+                "Camera Analysis".to_string(),
+                "Default Chat".to_string(),
+                "Project Chat".to_string(),
+            ]
         );
 
         // Sprawdz flow strukturalnie. service_type harnessa jest NULL, wiec
@@ -1661,6 +1743,32 @@ mod tests {
             9,
         );
         assert_eq!(def_run, 0);
+
+        // ps-chat: streaming RAG chat without tools; project_id rides on
+        // envelope.meta, so the graph carries no pinned project.
+        let (st_ps, def_ps) = assert_dag(
+            "Project Chat",
+            &[
+                "trigger",
+                "project_knowledge",
+                "conversation_history",
+                "llm",
+                "output",
+            ],
+            4,
+        );
+        assert_eq!(st_ps, None, "ps-chat jest poza resolverem service_type");
+        assert_eq!(def_ps, 0);
+        let (is_system, flow_json): (i64, String) = conn
+            .query_row(
+                "SELECT is_system, flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![super::PS_CHAT_FLOW_ID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(is_system, 1, "ps-chat musi byc flow systemowym");
+        assert!(!flow_json.contains("\"project_id\""));
+        assert!(!flow_json.contains("harness_tools"));
     }
 
     /// §3.8: systemowy agent `general` jest zaseedowany ze stalym UUID,
@@ -1703,7 +1811,7 @@ mod tests {
         let flow_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(flow_count, 2, "ponowny seed nie duplikuje flow");
+        assert_eq!(flow_count, 4, "ponowny seed nie duplikuje flow");
 
         let agent_count: i64 = conn
             .query_row(
@@ -1734,12 +1842,13 @@ mod tests {
         // Ponowny seed (jak przy kolejnym starcie) — nie moze wybuchnac.
         super::seed_default_flows(&conn).expect("ponowny seed po rename nie moze sie wywrocic");
 
-        // Nadal 2 flow (Default Chat zmieniony + Agent Run z db::init), bez
-        // duplikatu Default Chat: kanoniczny id zachowany, nazwa nie nadpisana.
+        // Nadal 4 flow (Default Chat zmieniony + Camera Analysis + Agent Run +
+        // Project Chat z db::init), bez duplikatu Default Chat: kanoniczny id
+        // zachowany, nazwa nie nadpisana.
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 2, "rename nie moze tworzyc drugiego flow");
+        assert_eq!(total, 4, "rename nie moze tworzyc drugiego flow");
         let name: String = conn
             .query_row(
                 "SELECT name FROM flows WHERE id = ?1",
@@ -1748,6 +1857,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "Moj Czat", "rename musi przetrwac ponowny seed");
+    }
+
+    /// ps-chat: (1) graf kompiluje sie przez realny runtime i JEST streamingowy
+    /// (bez `is_streaming` dispatch owija flow w wrap_blocking_as_stream i klient
+    /// dostaje calosc po EOF zamiast tokenow); (2) seed ODSWIEZA wiersz systemowy
+    /// (is_system=1) przy kazdym starcie; (3) wiersz o STALYM id ps-chat, ktory
+    /// stracil is_system, jest ODZYSKIWANY przez seed (reclaim); (4) flow o innym
+    /// id z is_system=0 pozostaje nietkniety.
+    #[test]
+    fn ps_chat_flow_compiles_streaming_and_seed_refreshes_system_row() {
+        use crate::flow_engine::cache::CompiledFlow;
+        use crate::flow_engine::dispatcher::build_registry_for_test;
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.write().unwrap();
+
+        let flow_json: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![super::PS_CHAT_FLOW_ID],
+                |r| r.get(0),
+            )
+            .expect("ps-chat seeded");
+        let registry = build_registry_for_test();
+        let compiled = CompiledFlow::from_json(super::PS_CHAT_FLOW_ID, &flow_json, &registry)
+            .expect("ps-chat compiles");
+        assert!(compiled.is_streaming, "ps-chat musi byc streamingowy");
+
+        // Seed refresh: a stale system row is overwritten on the next start.
+        conn.execute(
+            "UPDATE flows SET flow_json = '{\"nodes\":[],\"edges\":[]}' WHERE id = ?1",
+            rusqlite::params![super::PS_CHAT_FLOW_ID],
+        )
+        .unwrap();
+        super::seed_ps_chat_flow(&conn).expect("reseed ps-chat");
+        let refreshed: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![super::PS_CHAT_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(refreshed, super::PS_CHAT_FLOW_JSON);
+
+        // Reclaim: the fixed ps-chat id stripped of is_system is taken back
+        // by the seed — ownership restored, content refreshed.
+        conn.execute(
+            "UPDATE flows SET is_system = 0, flow_json = 'custom' WHERE id = ?1",
+            rusqlite::params![super::PS_CHAT_FLOW_ID],
+        )
+        .unwrap();
+        super::seed_ps_chat_flow(&conn).expect("reseed reclaims ps-chat");
+        let (reclaimed_system, reclaimed_json): (i64, String) = conn
+            .query_row(
+                "SELECT is_system, flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![super::PS_CHAT_FLOW_ID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reclaimed_system, 1, "seed musi odzyskac wiersz ps-chat");
+        assert_eq!(reclaimed_json, super::PS_CHAT_FLOW_JSON);
+
+        // A non-system flow on a DIFFERENT id is never touched by the seed.
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status, is_default, is_system) \
+             VALUES ('user-flow-9', 'User Flow', 'user-json', 'active', 0, 0)",
+            [],
+        )
+        .unwrap();
+        super::seed_ps_chat_flow(&conn).expect("reseed with user flow present");
+        let untouched: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = 'user-flow-9'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            untouched, "user-json",
+            "seed nie dotyka flow o innym id bez is_system"
+        );
     }
 
     /// Regresja: po pelnym migrations::run + seed_defaults na swiezej bazie
@@ -2058,7 +2248,9 @@ mod tests {
         );
         assert_eq!(schema["properties"]["top_k"]["minimum"].as_u64(), Some(1));
         assert_eq!(schema["properties"]["top_k"]["maximum"].as_u64(), Some(50));
-        assert_eq!(schema["required"][0].as_str(), Some("project_id"));
+        // project_id is optional: shared system flows (ps-chat) supply it via
+        // envelope.meta, so the schema must not force a pinned project.
+        assert_eq!(schema["required"].as_array().map(|a| a.len()), Some(0));
 
         // Re-seed: still exactly one row, not pruned by the backend-owned
         // palette cleanup.
