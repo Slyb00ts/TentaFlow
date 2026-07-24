@@ -39,6 +39,15 @@ class TfAlert extends HTMLElement {
     const actionsContent = this.querySelector('[slot="actions"]');
     if (actionsContent) actionsContent.removeAttribute('slot');
     this._actionsEl = actionsContent;
+    // Fallback for the common `<tf-alert>text</tf-alert>` form: capture loose child
+    // text (NOT element children like the actions container) before the clear
+    // below drops it. Without this the message is silently lost and the alert
+    // renders as an empty coloured box — `message` attribute still wins when set.
+    this._childText = Array.from(this.childNodes)
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => n.textContent)
+      .join('')
+      .trim();
     this.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'tf-alert';
@@ -51,7 +60,7 @@ class TfAlert extends HTMLElement {
       ? this.getAttribute('tone')
       : 'info';
     const title = this.getAttribute('title') || '';
-    const message = this.getAttribute('message') || '';
+    const message = this.getAttribute('message') || this._childText || '';
     const dismissable = this.hasAttribute('dismissable');
 
     this._root.className = `tf-alert ${tone}`;

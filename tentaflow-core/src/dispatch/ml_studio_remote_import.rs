@@ -137,7 +137,7 @@ async fn fetch_remote_manifest(
     api_key: &str,
 ) -> Result<RemoteManifest> {
     let bearer = api_key.trim();
-    let client = bundle_http_client(manifest_url)?;
+    let client = bundle_http_client(manifest_url, Some(std::time::Duration::from_secs(600)))?;
     let mut request = client.get(manifest_url.clone());
     if !bearer.is_empty() {
         request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"));
@@ -337,10 +337,29 @@ async fn download_archive(
     let mut last_tick: u64 = 0;
     const PROGRESS_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
 
+    // No-progress (stall) timeout, NOT a total-time cap: a slow-but-steady 10 GB
+    // pull must never be killed for being slow (the shared client's 600 s total
+    // timeout did exactly that, dying at ~5 GB). The clock resets on every chunk
+    // and only fires when the peer sends NOTHING for this long — i.e. a genuinely
+    // stalled/broken connection.
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     let mut stream = response.bytes_stream();
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res
-            .map_err(|e| anyhow!("strumień archiwum: {}", redact_query_strings(&e.to_string())))?;
+    loop {
+        let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+            Ok(Some(chunk_res)) => chunk_res.map_err(|e| {
+                anyhow!("strumień archiwum: {}", redact_query_strings(&e.to_string()))
+            })?,
+            Ok(None) => break,
+            Err(_) => {
+                drop(file);
+                let _ = std::fs::remove_file(&partial);
+                return Err(anyhow!(
+                    "pobieranie archiwum przerwane: brak danych z serwera przez {} s po pobraniu {} B (zerwane/zawieszone połączenie)",
+                    STALL_TIMEOUT.as_secs(),
+                    downloaded
+                ));
+            }
+        };
         downloaded += chunk.len() as u64;
         if downloaded > MAX_REMOTE_ARCHIVE_BYTES {
             drop(file);
@@ -575,7 +594,7 @@ async fn run_remote_import(
         .map_err(|e| anyhow!("utworzenie katalogu importu {}: {e}", staging_dir.display()))?;
     let staged: PathBuf = staging_dir.join(format!("mlsimp_{}.zip", uuid::Uuid::new_v4().simple()));
 
-    let client = bundle_http_client(&manifest_url)?;
+    let client = bundle_http_client(&manifest_url, None)?;
     let download = download_archive(
         &client,
         archive_url,

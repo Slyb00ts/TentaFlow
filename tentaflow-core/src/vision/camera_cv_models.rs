@@ -611,7 +611,7 @@ async fn download_from_bundle_manifest(
     // let a compromised serving node bounce the pull (with its Bearer key) to
     // an arbitrary (possibly internal) destination. Matches the addon
     // `http.request` posture.
-    let client = bundle_http_client(&base)?;
+    let client = bundle_http_client(&base, Some(std::time::Duration::from_secs(600)))?;
 
     if let Some(s) = log_sink {
         s.phase("downloading-vision", "Fetching model bundle manifest");
@@ -865,17 +865,27 @@ async fn download_signed_file(
 /// compromised serving node must not be able to bounce the pull (with its
 /// Bearer key) to an arbitrary destination. Pinning the resolved address closes
 /// the DNS-rebind window between the SSRF check and connect.
-pub(crate) fn bundle_http_client(base: &reqwest::Url) -> Result<reqwest::Client> {
+/// `total_timeout` bounds the WHOLE request incl. body — right for small manifests
+/// and model files, but WRONG for multi-GB archives: a slow-but-steady 10 GB pull
+/// legitimately outlasts any fixed cap and would be killed mid-stream. Such callers
+/// pass `None` and enforce a no-progress (stall) timeout on the body instead, so a
+/// download only fails when the peer sends NOTHING for a while, never for being slow.
+pub(crate) fn bundle_http_client(
+    base: &reqwest::Url,
+    total_timeout: Option<std::time::Duration>,
+) -> Result<reqwest::Client> {
     let host = base
         .host_str()
         .ok_or_else(|| anyhow!("bundle URL has no host"))?;
     let addrs = vet_bundle_host(base)?;
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(600))
         .connect_timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
         .resolve_to_addrs(host, &addrs);
+    if let Some(t) = total_timeout {
+        builder = builder.timeout(t);
+    }
     if allow_invalid_bundle_tls() {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -904,7 +914,7 @@ pub async fn fetch_custom_manifest_json(
         return Err(anyhow!("URL manifestu musi używać https"));
     }
     let bearer = api_key.trim();
-    let client = bundle_http_client(&base)?;
+    let client = bundle_http_client(&base, Some(std::time::Duration::from_secs(600)))?;
     let mut request = client.get(base.clone());
     if !bearer.is_empty() {
         request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", bearer));
@@ -1017,7 +1027,7 @@ pub async fn import_custom_model(
 
     let bearer = api_key.trim();
     let bearer_opt = (!bearer.is_empty()).then_some(bearer);
-    let client = bundle_http_client(&base)?;
+    let client = bundle_http_client(&base, Some(std::time::Duration::from_secs(600)))?;
     let dir = vision_models_dir();
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
 
