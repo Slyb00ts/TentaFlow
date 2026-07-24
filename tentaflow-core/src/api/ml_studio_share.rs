@@ -327,16 +327,20 @@ async fn ensure_archive(project_id: &str) -> Result<CachedArchive, ArchiveBuildE
     .await;
     match built {
         Ok(Ok(_summary)) => {}
-        Ok(Err(_)) => {
+        Ok(Err(e)) => {
             // The only recoverable cause is a missing project (deleted between
             // the existence pre-check and the build); anything else is internal.
-            return Err(if project_updated_at_unix(project_id).is_none() {
-                ArchiveBuildError::NotFound
-            } else {
-                ArchiveBuildError::Internal
-            });
+            // Log the real cause: without it the client only sees an opaque 500.
+            if project_updated_at_unix(project_id).is_none() {
+                return Err(ArchiveBuildError::NotFound);
+            }
+            tracing::error!(project_id, error = %e, "share archive build failed");
+            return Err(ArchiveBuildError::Internal);
         }
-        Err(_) => return Err(ArchiveBuildError::Internal),
+        Err(e) => {
+            tracing::error!(project_id, error = %e, "share archive build task panicked");
+            return Err(ArchiveBuildError::Internal);
+        }
     }
 
     let meta = match tokio::fs::metadata(&path).await {
