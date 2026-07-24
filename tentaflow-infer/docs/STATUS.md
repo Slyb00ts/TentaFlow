@@ -12,6 +12,21 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-24.
 
+- ✅ **BM32: dwuetapowy potok cp.async zamiast trzyetapowego (2026-07-24).**
+  Profil pokazał, że projekcje BM32 jadą na 585-661 GB/s przy ~17% occupancy
+  (39 936 B shared → 2 bloki/SM). Zejście do dwóch etapów daje 26 624 B →
+  3 bloki/SM (12 warpów zamiast 8). Zmiana jest BITOWO neutralna — nie rusza
+  kolejności MMA ani redukcji — co bramkuje osobny A/B z kontrolą bit-parity;
+  golden BM32 8/8 i test parytetu BM32↔BM16 przechodzą bez zmian metryk.
+  Izolowany pomiar RTX 4090 (32 tokeny): gate+up 84,8→64,1 us (**1,32x**),
+  qkv 28,7→24,6 (1,17x), o 14,9→13,7 (1,09x), down 34,1→33,3 (1,02x).
+  Serve decode-only in32/o256: C=16 1 635→**1 670** tok/s, C=24 1 986→**2 115**,
+  C=32 2 493→**2 655** (TPOT 12,01→11,23 ms, **+6,5%** przy C=24 i C=32).
+  p1024/o128 bez zmian (658/747 tok/s) — tam limitem jest prefill, nie decode.
+  **Wariant ośmiowarpowy (256 wątków, BN64) ZMIERZONY I ODRZUCONY**: 118
+  rejestrów × 256 wątków ogranicza do 2 bloków/SM, a szersza redukcja epilogu
+  zjada zysk z warpów — gate+up 0,79x, qkv 0,81x, o 0,94x, down 0,96x wobec
+  czterech warpów (przy zachowanej zgodności bitowej).
 - ✅ **Profil kroku decode: Bielik B=32 i Qwen 27B C=8 (2026-07-24).** Pełny
   raport w `docs/PROFILE_DECODE_2026-07-24.md`. GPU jest zajęte 96% (Bielik)
   i 91% (Qwen) okna pomiarowego, więc narzut launchy i luki między kernelami
