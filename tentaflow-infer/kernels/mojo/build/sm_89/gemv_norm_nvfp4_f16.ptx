@@ -269,9 +269,7 @@ $L__BB0_20:
 $L__BB0_23:
 	add.s64 	%rd57, %rd65, %rd68;
 	ld.global.b8 	%rs8, [%rd57];
-	// begin inline asm
 	cvt.rn.f16x2.e4m3x2 %r55, %rs8;
-	// end inline asm
 	cvt.u16.u32 	%rs9, %r55;
 	cvt.f32.f16 	%r56, %rs9;
 	mul.f32 	%r57, %r11, %r56;

@@ -26,7 +26,8 @@ impl Shape {
     /// Element count for shapes already validated by the format layer.
     /// Panics (also in release) if the product overflows.
     pub fn numel(&self) -> usize {
-        self.checked_numel().expect("shape element count overflows usize")
+        self.checked_numel()
+            .expect("shape element count overflows usize")
     }
 
     pub fn dims(&self) -> &[usize] {
@@ -39,7 +40,11 @@ impl std::fmt::Display for Shape {
         write!(
             f,
             "[{}]",
-            self.0.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x")
+            self.0
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("x")
         )
     }
 }

@@ -154,8 +154,18 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
-- ✅ **NATIVE-LAYOUT Mojo int8 Q6_K prefill GEMM (down-proj + attn_v) —
-  ODZYSKANIE REGRESJI PREFILL (2026-07-20).** Po wycofaniu CUDA MMQ (100 % Mojo)
+- ✅ **REWERT native Q6_K int8 prefill GEMM (2026-07-24).** Zgodnie z werdyktem
+  poniżej (revert candidate) routing `gemm_q6_k_f16_at` wraca bezwarunkowo na
+  przenośny f16 `gemm_q6_k_f16`; usunięte: launcher `gemm_q6k_i8_native`,
+  12 wpisów registry + PTX + manifest, `gemm_q6k_i8_multistage.mojo`,
+  `modular_i8/multistage_i8_q6k_native.mojo`, `build_q6k_native.mojo` i golden
+  native. Pomiar po rewercie (RTX 4090, obok rezydentnej instancji ~3,6 GiB
+  VRAM): Mistral Q4_K_M pp4096 **3 927 → 5 061 tok/s (+29%)**, decode 140,3 bez
+  zmian, `forge ppl` 30,0702 (ścieżka f16 bez q8_1 na Q6_K; baseline MMQ 30,31),
+  koherencja „Paris, France" OK, golden 67/67. Dług dalszego domknięcia luki do
+  ~11k MMQ (fuzja rmsnorm→q8_1, szybki Q6_K Mojo, shared activation) pozostaje.
+- 🟡 *(zrewertowane 2026-07-24, patrz wyżej)* **NATIVE-LAYOUT Mojo int8 Q6_K
+  prefill GEMM (down-proj + attn_v) — ODZYSKANIE REGRESJI PREFILL (2026-07-20).** Po wycofaniu CUDA MMQ (100 % Mojo)
   prefill Q4_K spadł ~2× (5742 tok/s = 0.51× dawnego MMQ 11151), bo Q6_K
   down-proj przeszedł na WOLNY f16 `gemm_q6_k_impl` (19 % pp4096 w nsys). Fork
   Q4_K native → `modular_i8/multistage_i8_q6k_native.mojo` + wrapper

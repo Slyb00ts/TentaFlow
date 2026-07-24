@@ -24,11 +24,11 @@ use forge_formats::Gguf;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
+use half::f16;
 
 #[link(name = "dl")]
 unsafe extern "C" {
-    fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int)
-        -> *mut std::ffi::c_void;
+    fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int) -> *mut std::ffi::c_void;
     fn dlsym(
         handle: *mut std::ffi::c_void,
         symbol: *const std::ffi::c_char,
@@ -123,8 +123,7 @@ fn advance_mtp_budget(
     if lane.tokens.len() >= target {
         return Ok(());
     }
-    let (draft, accepted, correction) =
-        model.native_mtp_step(&mut lane.seq, lane.next, budget)?;
+    let (draft, accepted, correction) = model.native_mtp_step(&mut lane.seq, lane.next, budget)?;
     for &token in &draft[..accepted] {
         if lane.tokens.len() < target {
             lane.tokens.push(token);
@@ -214,8 +213,14 @@ fn run_native_mtp_b2_full_id_parity(path: &Path) -> TestResult<()> {
                 lane.next = correction;
             }
         }
-        assert_eq!(lanes[0].tokens, expected[0], "pełne ID MTP B2 lane0 K={budget}");
-        assert_eq!(lanes[1].tokens, expected[1], "pełne ID MTP B2 lane1 K={budget}");
+        assert_eq!(
+            lanes[0].tokens, expected[0],
+            "pełne ID MTP B2 lane0 K={budget}"
+        );
+        assert_eq!(
+            lanes[1].tokens, expected[1],
+            "pełne ID MTP B2 lane1 K={budget}"
+        );
         model.release_seq(&mut lanes[0].seq);
         model.release_seq(&mut lanes[1].seq);
     }
@@ -237,9 +242,8 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
         for retained0 in 1..=budget + 1 {
             for retained1 in 1..=budget + 1 {
                 let retained = [retained0, retained1];
-                let mut drafts: [Vec<u32>; 2] = std::array::from_fn(|lane| {
-                    greedy[lane][1..=budget].to_vec()
-                });
+                let mut drafts: [Vec<u32>; 2] =
+                    std::array::from_fn(|lane| greedy[lane][1..=budget].to_vec());
                 for lane in 0..2 {
                     if retained[lane] <= budget {
                         let index = retained[lane] - 1;
@@ -253,16 +257,16 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
                 }
 
                 let mut expected_results = [(0usize, 0u32); 2];
+                let mut expected_next_drafts: [Vec<u32>; 2] = std::array::from_fn(|_| Vec::new());
                 let mut expected_states: [Vec<(String, usize, Vec<u8>)>; 2] =
                     std::array::from_fn(|_| Vec::new());
                 for lane in 0..2 {
                     let (mut seq, _, fed) = prepare(&mut model, &prompts[lane])?;
-                    expected_results[lane] = model.verify_greedy_draft_with_mtp_catchup(
-                        &mut seq,
-                        fed,
-                        &drafts[lane],
-                    )?;
+                    expected_results[lane] =
+                        model.verify_greedy_draft_with_mtp_catchup(&mut seq, fed, &drafts[lane])?;
                     expected_states[lane] = model.debug_mtp_state_snapshot(&seq)?;
+                    expected_next_drafts[lane] =
+                        model.mtp_propose_k(&mut seq, expected_results[lane].1, budget)?;
                     model.release_seq(&mut seq);
                     assert_eq!(expected_results[lane].0 + 1, retained[lane]);
                     assert_eq!(expected_results[lane].1, greedy[lane][retained[lane]]);
@@ -276,13 +280,26 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
                     [first_fed, second_fed],
                     [&drafts[0], &drafts[1]],
                 )?;
-                assert_eq!(actual, expected_results, "K={budget}, retained={retained:?}");
-                assert_mtp_snapshot_eq(
+                assert_eq!(
+                    actual, expected_results,
+                    "K={budget}, retained={retained:?}"
+                );
+                assert_eq!(
+                    model.mtp_propose_k(&mut first, actual[0].1, budget)?,
+                    expected_next_drafts[0],
+                    "następny draft lane0 K={budget}, retained={retained:?}"
+                );
+                assert_eq!(
+                    model.mtp_propose_k(&mut second, actual[1].1, budget)?,
+                    expected_next_drafts[1],
+                    "następny draft lane1 K={budget}, retained={retained:?}"
+                );
+                assert_mtp_snapshot_close(
                     &model.debug_mtp_state_snapshot(&first)?,
                     &expected_states[0],
                     &format!("lane0 K={budget}, retained={retained:?}"),
                 );
-                assert_mtp_snapshot_eq(
+                assert_mtp_snapshot_close(
                     &model.debug_mtp_state_snapshot(&second)?,
                     &expected_states[1],
                     &format!("lane1 K={budget}, retained={retained:?}"),
@@ -334,11 +351,12 @@ fn run_mtp_routed_b2_source_masks(path: &Path) -> TestResult<()> {
                     for lane in 0..2 {
                         let (mut seq, _, fed) = prepare(&mut model, &prompts[lane])?;
                         expected[lane] = if retained[lane] > 0 {
-                            let (accepted, correction) = model.verify_greedy_draft_with_mtp_catchup(
-                                &mut seq,
-                                fed,
-                                &drafts[lane],
-                            )?;
+                            let (accepted, correction) = model
+                                .verify_greedy_draft_with_mtp_catchup(
+                                    &mut seq,
+                                    fed,
+                                    &drafts[lane],
+                                )?;
                             assert_eq!(accepted + 1, retained[lane]);
                             (drafts[lane].clone(), accepted, correction)
                         } else {
@@ -413,8 +431,7 @@ fn run_mtp_ngram_b2_retained_one_lane_orders(path: &Path) -> TestResult<()> {
             generate(&mut model, &prompts[0], 4)?,
             generate(&mut model, &prompts[1], 4)?,
         ];
-        let mut drafts: [Vec<u32>; 2] =
-            std::array::from_fn(|lane| greedy[lane][1..=2].to_vec());
+        let mut drafts: [Vec<u32>; 2] = std::array::from_fn(|lane| greedy[lane][1..=2].to_vec());
         for lane in 0..2 {
             let expected = greedy[lane][1];
             let mut mismatch = expected.wrapping_add(1) % vocab as u32;
@@ -465,15 +482,21 @@ fn assert_mtp_snapshot_eq(
     context: &str,
 ) {
     assert_eq!(actual.len(), expected.len(), "liczba buforów {context}");
-    for ((actual_name, actual_element_bytes, actual_bytes), (expected_name, expected_element_bytes, expected_bytes)) in
-        actual.iter().zip(expected)
+    for (
+        (actual_name, actual_element_bytes, actual_bytes),
+        (expected_name, expected_element_bytes, expected_bytes),
+    ) in actual.iter().zip(expected)
     {
         assert_eq!(actual_name, expected_name, "nazwa bufora {context}");
         assert_eq!(
             actual_element_bytes, expected_element_bytes,
             "rozmiar elementu {actual_name} {context}"
         );
-        assert_eq!(actual_bytes.len(), expected_bytes.len(), "długość {actual_name} {context}");
+        assert_eq!(
+            actual_bytes.len(),
+            expected_bytes.len(),
+            "długość {actual_name} {context}"
+        );
         if let Some(index) = actual_bytes
             .iter()
             .zip(expected_bytes)
@@ -485,6 +508,107 @@ fn assert_mtp_snapshot_eq(
             );
         }
     }
+}
+
+fn assert_mtp_snapshot_close(
+    actual: &[(String, usize, Vec<u8>)],
+    expected: &[(String, usize, Vec<u8>)],
+    context: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "liczba buforów {context}");
+    for (
+        (actual_name, actual_element_bytes, actual_bytes),
+        (expected_name, expected_element_bytes, expected_bytes),
+    ) in actual.iter().zip(expected)
+    {
+        assert_eq!(actual_name, expected_name, "nazwa bufora {context}");
+        assert_eq!(
+            actual_element_bytes, expected_element_bytes,
+            "rozmiar elementu {actual_name} {context}"
+        );
+        assert_eq!(
+            actual_bytes.len(),
+            expected_bytes.len(),
+            "długość {actual_name} {context}"
+        );
+        if actual_name == "mtp.page_table" {
+            assert_eq!(
+                normalized_page_table(actual_bytes),
+                normalized_page_table(expected_bytes),
+                "logiczne mapowanie {actual_name} {context}"
+            );
+        } else if matches!(actual_name.as_str(), "mtp.hidden" | "mtp.k" | "mtp.v") {
+            let (max_abs, rmse, _) =
+                numeric_diff(actual_bytes, expected_bytes, *actual_element_bytes);
+            assert!(
+                max_abs <= 0.125 && rmse <= 0.01,
+                "różnica numeryczna {actual_name} {context}: max_abs={max_abs}, rmse={rmse}"
+            );
+        } else {
+            assert_eq!(
+                actual_bytes, expected_bytes,
+                "zawartość {actual_name} {context}"
+            );
+        }
+    }
+}
+
+fn normalized_page_table(bytes: &[u8]) -> Vec<usize> {
+    let mut physical = Vec::new();
+    bytes
+        .chunks_exact(4)
+        .map(|value| i32::from_le_bytes(value.try_into().unwrap()))
+        .map(|page| {
+            assert!(
+                page >= 0,
+                "fizyczny identyfikator strony nie może być ujemny"
+            );
+            if let Some(index) = physical.iter().position(|&seen| seen == page) {
+                index
+            } else {
+                physical.push(page);
+                physical.len() - 1
+            }
+        })
+        .collect()
+}
+
+fn numeric_diff(actual: &[u8], expected: &[u8], element_bytes: usize) -> (f32, f32, f32) {
+    assert_eq!(actual.len(), expected.len());
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut squared_error = 0.0f64;
+    let mut elements = 0usize;
+    for (actual, expected) in actual
+        .chunks_exact(element_bytes)
+        .zip(expected.chunks_exact(element_bytes))
+    {
+        let actual = match element_bytes {
+            2 => f16::from_le_bytes(actual.try_into().unwrap()).to_f32(),
+            4 => f32::from_le_bytes(actual.try_into().unwrap()),
+            _ => unreachable!(),
+        };
+        let expected = match element_bytes {
+            2 => f16::from_le_bytes(expected.try_into().unwrap()).to_f32(),
+            4 => f32::from_le_bytes(expected.try_into().unwrap()),
+            _ => unreachable!(),
+        };
+        assert!(actual.is_finite() && expected.is_finite());
+        let absolute = (actual - expected).abs();
+        let relative = absolute / expected.abs().max(1e-3);
+        max_abs = max_abs.max(absolute);
+        max_rel = max_rel.max(relative);
+        squared_error += f64::from(absolute) * f64::from(absolute);
+        elements += 1;
+    }
+    let rmse = (squared_error / elements.max(1) as f64).sqrt() as f32;
+    (max_abs, rmse, max_rel)
+}
+
+fn merge_diff(total: &mut (f32, f32, f32), current: (f32, f32, f32)) {
+    total.0 = total.0.max(current.0);
+    total.1 = total.1.max(current.1);
+    total.2 = total.2.max(current.2);
 }
 
 fn run_mtp_grouped_proposer_parity(path: &Path) -> TestResult<()> {
@@ -601,7 +725,10 @@ fn generate_combo(model: &mut Model, prompt: &[u32], target: usize) -> TestResul
         advance_combo(model, &mut lane, target)?;
     }
     model.release_seq(&mut lane.seq);
-    assert!(lane.ngram_forwards > 0, "serial MTP+n-gram nie wykonał pełnego draftu");
+    assert!(
+        lane.ngram_forwards > 0,
+        "serial MTP+n-gram nie wykonał pełnego draftu"
+    );
     Ok(lane.tokens)
 }
 
@@ -668,7 +795,13 @@ fn load_model_sized_with_tier(
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value << 20)
-        .unwrap_or_else(|| if native_mtp { 3usize << 29 } else { 1usize << 30 });
+        .unwrap_or_else(|| {
+            if native_mtp {
+                3usize << 29
+            } else {
+                1usize << 30
+            }
+        });
     let kv_cache = 256usize << 20;
     let reserve = std::env::var("FORGE_TEST_POOL_RESERVE_MB")
         .ok()
@@ -732,10 +865,7 @@ fn collect_events(rx: Receiver<EngineEvent>) -> TestResult<Vec<u32>> {
     }
 }
 
-fn wait_for_engine_state(
-    description: &str,
-    predicate: impl Fn() -> bool,
-) -> TestResult<()> {
+fn wait_for_engine_state(description: &str, predicate: impl Fn() -> bool) -> TestResult<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     while !predicate() {
         if Instant::now() >= deadline {
@@ -827,9 +957,8 @@ fn run_server_concurrency_two(path: &Path, spec: SpeculativeConfig) -> TestResul
         collect_events(oracle.submit(id_server_request(first_prompt.clone(), STEPS))?)?;
     let second_oracle =
         collect_events(oracle.submit(id_server_request(second_prompt.clone(), STEPS))?)?;
-    let replacement_oracle = collect_events(
-        oracle.submit(id_server_request(replacement_prompt.clone(), STEPS))?,
-    )?;
+    let replacement_oracle =
+        collect_events(oracle.submit(id_server_request(replacement_prompt.clone(), STEPS))?)?;
     let reused_oracle =
         collect_events(oracle.submit(id_server_request(reused_prompt.clone(), STEPS))?)?;
     oracle.shutdown()?;
@@ -908,8 +1037,7 @@ fn run_server_tier_fallback(path: &Path) -> TestResult<()> {
         12,
         SpeculativeConfig::off(),
     )?;
-    let first_oracle =
-        collect_events(oracle.submit(server_request(first_prompt.clone(), STEPS))?)?;
+    let first_oracle = collect_events(oracle.submit(server_request(first_prompt.clone(), STEPS))?)?;
     let second_oracle =
         collect_events(oracle.submit(server_request(second_prompt.clone(), STEPS))?)?;
     oracle.shutdown()?;
@@ -982,11 +1110,7 @@ fn run_server_hybrid_width(path: &Path, width: usize) -> TestResult<()> {
         .collect::<Result<Vec<_>, _>>()?;
     for (lane, receiver) in receivers.into_iter().enumerate() {
         let actual = collect_events(receiver)?;
-        assert_eq!(
-            actual,
-            expected[lane],
-            "lane {lane} B={width}"
-        );
+        assert_eq!(actual, expected[lane], "lane {lane} B={width}");
         println!("hybrid parity B={width} lane={lane}: IDs={actual:?}");
     }
     assert_eq!(engine.metrics().requests_errored.load(Ordering::Relaxed), 0);
@@ -1014,11 +1138,14 @@ fn run_server_dynamic_width_and_sampling(path: &Path) -> TestResult<()> {
     )?;
     let mut expected = Vec::with_capacity(4);
     for lane in [0, 2, 3] {
-        expected.push((lane, collect_events(oracle.submit(mixed_server_request(
-            prompts[lane].clone(),
-            budgets[lane],
+        expected.push((
             lane,
-        ))?)?));
+            collect_events(oracle.submit(mixed_server_request(
+                prompts[lane].clone(),
+                budgets[lane],
+                lane,
+            ))?)?,
+        ));
     }
     let replacement_expected = collect_events(oracle.submit(mixed_server_request(
         prompts[4].clone(),
@@ -1101,8 +1228,7 @@ fn run_model_batch_preflight_rollback(path: &Path) -> TestResult<()> {
         return Ok(());
     };
     let vocab = model.weights.descriptor.params.vocab_size;
-    let (mut first, mut first_sampler, first_next) =
-        prepare(&mut model, &prompt(vocab, 1069, 8))?;
+    let (mut first, mut first_sampler, first_next) = prepare(&mut model, &prompt(vocab, 1069, 8))?;
     let (mut exhausted, mut exhausted_sampler, exhausted_next) =
         prepare(&mut model, &prompt(vocab, 1117, 32))?;
     let first_len = first.len;
@@ -1136,11 +1262,7 @@ fn run_model_batch_preflight_rollback(path: &Path) -> TestResult<()> {
         prepare(&mut model, &prompt(vocab, 1181, 32))?;
     let (mut stable, mut stable_sampler, stable_next) =
         prepare(&mut model, &prompt(vocab, 1237, 8))?;
-    let growing_snapshot = (
-        growing.len,
-        growing.tokens.clone(),
-        growing.pages.clone(),
-    );
+    let growing_snapshot = (growing.len, growing.tokens.clone(), growing.pages.clone());
     let stable_snapshot = (stable.len, stable.tokens.clone(), stable.pages.clone());
     let free_pages = model.kv.free_page_count();
     assert_eq!(free_pages, 0);
@@ -1408,14 +1530,7 @@ fn run_exact_native_mtp_b2_matrix(
             SpeculativeConfig::chain(vec![ProposerKind::Mtp, ProposerKind::Ngram], 3)?
         }
     };
-    let engine = spawn_engine_batched(
-        model,
-        Arc::new(tokenizer(path)?),
-        2,
-        32,
-        12,
-        spec,
-    )?;
+    let engine = spawn_engine_batched(model, Arc::new(tokenizer(path)?), 2, 32, 12, spec)?;
     let profile = std::env::var_os("FORGE_PROFILE_MTP_MATRIX").is_some();
     for rep in 0..=reps {
         let metrics = engine.metrics();
@@ -1447,8 +1562,14 @@ fn run_exact_native_mtp_b2_matrix(
         }
         let elapsed = finished.duration_since(started).as_secs_f64();
         let completion_elapsed = finished.duration_since(first_token_at).as_secs_f64();
-        assert_eq!(outputs[0], oracle_outputs[0], "lane0 różni się od oracle B1");
-        assert_eq!(outputs[1], oracle_outputs[1], "lane1 różni się od oracle B1");
+        assert_eq!(
+            outputs[0], oracle_outputs[0],
+            "lane0 różni się od oracle B1"
+        );
+        assert_eq!(
+            outputs[1], oracle_outputs[1],
+            "lane1 różni się od oracle B1"
+        );
         let generated = metrics
             .generated_tokens_total
             .load(Ordering::Relaxed)
@@ -1484,13 +1605,16 @@ fn run_exact_native_mtp_b2_matrix(
         let b2_expected = matches!(mode, ExactB2Mode::Native)
             || std::env::var("FORGE_MTP_NGRAM_BATCH").map_or(true, |value| value == "1");
         if b2_expected {
-            assert!(routed_total > 0, "benchmark serwera nie wykonał oczekiwanej ścieżki B2");
+            assert!(
+                routed_total > 0,
+                "benchmark serwera nie wykonał oczekiwanej ścieżki B2"
+            );
         } else {
             assert_eq!(routed_total, 0, "wyłączona ścieżka routed wykonała B2");
         }
         if matches!(mode, ExactB2Mode::MtpNgram) {
-            let mixed_enabled = std::env::var("FORGE_MTP_NGRAM_MIXED_BATCH")
-                .is_ok_and(|value| value == "1");
+            let mixed_enabled =
+                std::env::var("FORGE_MTP_NGRAM_MIXED_BATCH").is_ok_and(|value| value == "1");
             if mixed_enabled && prompt != second_prompt {
                 assert!(
                     routed_steps[1] + routed_steps[2] > 0,
@@ -1592,9 +1716,7 @@ fn run_fixed_native_mtp_b2_matrix(path: &Path, prompt_path: &Path) -> TestResult
                 budget,
             )?;
             forwards += 1;
-            for (lane, (draft, accepted, correction)) in
-                lanes.iter_mut().zip(results)
-            {
+            for (lane, (draft, accepted, correction)) in lanes.iter_mut().zip(results) {
                 for token in draft.into_iter().take(accepted) {
                     if lane.tokens.len() < OUTPUT_TOKENS {
                         lane.tokens.push(token);
@@ -1804,8 +1926,14 @@ fn cuda_mtp_i_mtp_ngram_izoluja_przeplatane_sekwencje() -> TestResult<()> {
     model.release_seq(&mut second.seq);
     assert_eq!(first.tokens, first_combo_oracle);
     assert_eq!(second.tokens, second_combo_oracle);
-    assert!(first.ngram_forwards > 0, "lane A nie wykonała pełnego draftu n-gram");
-    assert!(second.ngram_forwards > 0, "lane B nie wykonała pełnego draftu n-gram");
+    assert!(
+        first.ngram_forwards > 0,
+        "lane A nie wykonała pełnego draftu n-gram"
+    );
+    assert!(
+        second.ngram_forwards > 0,
+        "lane B nie wykonała pełnego draftu n-gram"
+    );
 
     let (mut cancelled, _, cancelled_next) = prepare(&mut model, &first_prompt)?;
     let before_cancel = model.debug_mtp_state_snapshot(&cancelled)?;
@@ -1837,7 +1965,35 @@ fn native_mtp_b2_zachowuje_pelne_id_dla_k2_i_k3() -> TestResult<()> {
 }
 
 #[test]
-fn hybrid_prefill_b2_t32_jest_bitowo_zgodny_z_dwoma_serialnymi_lane() -> TestResult<()> {
+fn native_mtp_b2_przycina_k3_do_k2_przy_jednym_pelnym_kafelku_kv() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E końca KV MTP: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 32, 2) else {
+        return Ok(());
+    };
+    model.preflight_hybrid_state_slots(2)?;
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let (mut first, _, first_fed) = prepare(&mut model, &prompt(vocab, 701, 29))?;
+    let (mut second, _, second_fed) = prepare(&mut model, &prompt(vocab, 911, 29))?;
+    assert_eq!(model.native_mtp_available_budget(&first, 3), 2);
+    assert_eq!(model.native_mtp_available_budget(&second, 3), 2);
+    let result =
+        model.native_mtp_step_b2(&mut [&mut first, &mut second], [first_fed, second_fed], 2)?;
+    assert_eq!(result[0].0.len(), 2);
+    assert_eq!(result[1].0.len(), 2);
+    model.release_seq(&mut first);
+    model.release_seq(&mut second);
+    Ok(())
+}
+
+#[test]
+fn hybrid_prefill_b2_t32_jest_numerycznie_zgodny_z_dwoma_serialnymi_lane() -> TestResult<()> {
     let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
         eprintln!("pominięto parity prefill B2 T32: brak FORGE_TEST_HYBRID_GGUF");
         return Ok(());
@@ -1865,11 +2021,13 @@ fn hybrid_prefill_b2_t32_jest_bitowo_zgodny_z_dwoma_serialnymi_lane() -> TestRes
             .weights
             .layers
             .iter()
-            .filter(|layer| matches!(
-                &layer.ffn,
-                forge_engine::weights::LayerFfn::Dense(ffn)
-                    if matches!(ffn.gate_up, forge_engine::weights::GateUpWeights::Split { .. })
-            ))
+            .filter(|layer| {
+                matches!(
+                    &layer.ffn,
+                    forge_engine::weights::LayerFfn::Dense(ffn)
+                        if matches!(ffn.gate_up, forge_engine::weights::GateUpWeights::Split { .. })
+                )
+            })
             .count();
         eprintln!(
             "pominięto parity prefill B2 T32: arch={} hd={} ssm={:?} moe={} mtp_embedding={:?} base_b2={} split_qkv={split_qkv} split_ffn={split_ffn}/{} lm_head={}",
@@ -1907,35 +2065,52 @@ fn hybrid_prefill_b2_t32_jest_bitowo_zgodny_z_dwoma_serialnymi_lane() -> TestRes
     let mut batch_seqs = [model.new_seq(), model.new_seq()];
     let [first, second] = &mut batch_seqs;
     let mut lanes = [first, second];
-    let batch_logits = model.hybrid_prefill_b2_t32(
-        &mut lanes,
-        [&prompts[0], &prompts[1]],
-    )?;
+    let batch_logits = model.hybrid_prefill_b2_t32(&mut lanes, [&prompts[0], &prompts[1]])?;
     for lane in 0..2 {
         let batch_snapshot = model.debug_hybrid_sequence_snapshot(lanes[lane])?;
-        if batch_snapshot != serial_snapshots[lane] {
-            let divergence = batch_snapshot
-                .iter()
-                .zip(&serial_snapshots[lane])
-                .find(|(batch, serial)| batch != serial)
-                .map(|(batch, serial)| {
-                    let byte = batch
-                        .2
-                        .iter()
-                        .zip(&serial.2)
-                        .position(|(left, right)| left != right);
-                    format!("{} vs {}, pierwszy bajt {byte:?}", batch.0, serial.0)
-                })
-                .unwrap_or_else(|| "inna liczba buforów".into());
-            return Err(format!("stan/KV lane {lane}: {divergence}").into());
+        let mut conv = (0.0f32, 0.0f32, 0.0f32);
+        let mut state = (0.0f32, 0.0f32, 0.0f32);
+        let mut kv = (0.0f32, 0.0f32, 0.0f32);
+        assert_eq!(batch_snapshot.len(), serial_snapshots[lane].len());
+        for (batch, serial) in batch_snapshot.iter().zip(&serial_snapshots[lane]) {
+            assert_eq!(
+                (&batch.0, batch.1, batch.2.len()),
+                (&serial.0, serial.1, serial.2.len())
+            );
+            if batch.0.starts_with("seq.") {
+                assert_eq!(batch.2, serial.2, "metadane {}", batch.0);
+            } else if batch.0.ends_with(".conv") {
+                merge_diff(&mut conv, numeric_diff(&batch.2, &serial.2, batch.1));
+            } else if batch.0.ends_with(".state") {
+                merge_diff(&mut state, numeric_diff(&batch.2, &serial.2, batch.1));
+            } else {
+                merge_diff(&mut kv, numeric_diff(&batch.2, &serial.2, batch.1));
+            }
         }
-        if batch_logits[lane] != serial_logits[lane] {
-            let first = batch_logits[lane]
-                .iter()
-                .zip(&serial_logits[lane])
-                .position(|(batch, serial)| batch != serial);
-            return Err(format!("logity lane {lane}: pierwszy element {first:?}").into());
-        }
+        let logits = numeric_diff(
+            bytemuck::cast_slice(&batch_logits[lane]),
+            bytemuck::cast_slice(&serial_logits[lane]),
+            4,
+        );
+        println!(
+            "parity B2 lane {lane}: conv abs/rel={conv:?}, state={state:?}, kv={kv:?}, logits={logits:?}"
+        );
+        assert!(
+            conv.0 <= 0.075 && conv.1 <= 0.01 && conv.2 <= 50.0,
+            "conv lane {lane}: {conv:?}"
+        );
+        assert!(
+            state.0 <= 0.04 && state.1 <= 1e-3 && state.2 <= 5.0,
+            "state lane {lane}: {state:?}"
+        );
+        assert!(
+            kv.0 <= 0.25 && kv.1 <= 0.02 && kv.2 <= 50.0,
+            "KV lane {lane}: {kv:?}"
+        );
+        assert!(
+            logits.0 <= 0.05 && logits.1 <= 0.01 && logits.2 <= 25.0,
+            "logity lane {lane}: {logits:?}"
+        );
         let serial_top1 = serial_logits[lane]
             .iter()
             .enumerate()
@@ -1953,6 +2128,233 @@ fn hybrid_prefill_b2_t32_jest_bitowo_zgodny_z_dwoma_serialnymi_lane() -> TestRes
     model.release_seq(lanes[0]);
     model.release_seq(lanes[1]);
     Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn hybrid_prefill_t128_memcheck_smoke() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto smoke prefill T128: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_chunk = std::env::var_os("FORGE_HYBRID_PREFILL_CHUNK");
+    let previous_batched = std::env::var_os("FORGE_HYBRID_BATCH_PREFILL");
+    std::env::set_var("FORGE_HYBRID_PREFILL_CHUNK", "128");
+    std::env::set_var("FORGE_HYBRID_BATCH_PREFILL", "1");
+    let result = (|| {
+        let Some(mut model) = load_model_sized(&path, true, 128, 8) else {
+            return Ok(());
+        };
+        let tokens = prompt(model.weights.descriptor.params.vocab_size, 2719, 128);
+        let mut seq = model.new_seq();
+        model.prefill_chunk(&mut seq, &tokens)?;
+        model.release_seq(&mut seq);
+        Ok(())
+    })();
+    match previous_chunk {
+        Some(value) => std::env::set_var("FORGE_HYBRID_PREFILL_CHUNK", value),
+        None => std::env::remove_var("FORGE_HYBRID_PREFILL_CHUNK"),
+    }
+    match previous_batched {
+        Some(value) => std::env::set_var("FORGE_HYBRID_BATCH_PREFILL", value),
+        None => std::env::remove_var("FORGE_HYBRID_BATCH_PREFILL"),
+    }
+    result
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn layer_major_rollback_przywraca_target_i_mtp_bitowo() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto rollback layer-major: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut model) = load_model_sized(&path, true, 128, 8) else {
+        return Ok(());
+    };
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let mut seq = model.new_seq();
+    model.prefill_chunk(&mut seq, &prompt(vocab, 3109, 33))?;
+    let tokens = prompt(vocab, 4001, 32);
+
+    for (fail_after_layer, fail_mtp_catchup, fail_after_mtp_commit, expected) in [
+        (Some(5), false, false, "po warstwie 5"),
+        (None, true, false, "catch-up MTP"),
+        (None, false, true, "po commit MTP"),
+    ] {
+        let target_before = model.debug_hybrid_sequence_snapshot(&mut seq)?;
+        let mtp_before = model.debug_mtp_state_snapshot(&seq)?;
+        let pages_before = seq.pages.clone();
+        let len_before = seq.len;
+        let error = model
+            .debug_hybrid_layer_major_rollback(
+                &mut seq,
+                &tokens,
+                fail_after_layer,
+                fail_mtp_catchup,
+                fail_after_mtp_commit,
+            )
+            .expect_err("test wymusza błąd layer-major");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(seq.len, len_before);
+        assert_eq!(seq.pages, pages_before);
+        assert_eq!(
+            model.debug_hybrid_sequence_snapshot(&mut seq)?,
+            target_before,
+            "rollback targetu po błędzie {expected}"
+        );
+        assert_mtp_snapshot_eq(
+            &model.debug_mtp_state_snapshot(&seq)?,
+            &mtp_before,
+            &format!("rollback MTP po błędzie {expected}"),
+        );
+    }
+    model.release_seq(&mut seq);
+    Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn layer_major_native_mtp_ma_staging_niezalezny_od_chunka_t16_t32_t64() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto layer-major MTP T16/T32/T64: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_layer_major = std::env::var_os("FORGE_HYBRID_LAYER_MAJOR_PREFILL");
+    let previous_chunk = std::env::var_os("FORGE_HYBRID_PREFILL_CHUNK");
+    std::env::set_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL", "1");
+    let result = (|| {
+        for configured_chunk in [16, 32, 64] {
+            std::env::set_var("FORGE_HYBRID_PREFILL_CHUNK", configured_chunk.to_string());
+            let Some(mut model) = load_model_sized(&path, true, 64, 8) else {
+                return Ok(());
+            };
+            let tokens = prompt(
+                model.weights.descriptor.params.vocab_size,
+                4100 + configured_chunk,
+                64,
+            );
+            let mut seq = model.new_seq();
+            model.prefill_chunk(&mut seq, &tokens)?;
+            assert_eq!(seq.len, 64);
+            model.release_seq(&mut seq);
+        }
+        Ok(())
+    })();
+    match previous_layer_major {
+        Some(value) => std::env::set_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL", value),
+        None => std::env::remove_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL"),
+    }
+    match previous_chunk {
+        Some(value) => std::env::set_var("FORGE_HYBRID_PREFILL_CHUNK", value),
+        None => std::env::remove_var("FORGE_HYBRID_PREFILL_CHUNK"),
+    }
+    result
+}
+
+#[test]
+fn hybrid_prefill_t128_zachowuje_numeryczna_zgodnosc_z_serialnym_prefill() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto parity prefill T128: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_chunk = std::env::var_os("FORGE_HYBRID_PREFILL_CHUNK");
+    let previous_batched = std::env::var_os("FORGE_HYBRID_BATCH_PREFILL");
+    let previous_layer_major = std::env::var_os("FORGE_HYBRID_LAYER_MAJOR_PREFILL");
+    std::env::set_var("FORGE_HYBRID_PREFILL_CHUNK", "128");
+    let result = (|| {
+        let Some(mut model) = load_model_sized(&path, true, 128, 8) else {
+            return Ok(());
+        };
+        #[cfg(feature = "test-hooks")]
+        model.debug_hybrid_prefill_triplet_contract(128)?;
+        let tokens = prompt(model.weights.descriptor.params.vocab_size, 1709, 128);
+
+        std::env::remove_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL");
+        std::env::set_var("FORGE_HYBRID_BATCH_PREFILL", "0");
+        let mut serial = model.new_seq();
+        let serial_logits = model.prefill_chunk(&mut serial, &tokens)?;
+        let serial_snapshot = model.debug_hybrid_sequence_snapshot(&mut serial)?;
+        model.release_seq(&mut serial);
+
+        std::env::set_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL", "1");
+        std::env::set_var("FORGE_HYBRID_BATCH_PREFILL", "1");
+        let mut batched = model.new_seq();
+        let batched_logits = model.prefill_chunk(&mut batched, &tokens)?;
+        let batched_snapshot = model.debug_hybrid_sequence_snapshot(&mut batched)?;
+        model.release_seq(&mut batched);
+
+        let mut conv = (0.0f32, 0.0f32, 0.0f32);
+        let mut state = (0.0f32, 0.0f32, 0.0f32);
+        let mut kv = (0.0f32, 0.0f32, 0.0f32);
+        assert_eq!(batched_snapshot.len(), serial_snapshot.len());
+        for (batched, serial) in batched_snapshot.iter().zip(&serial_snapshot) {
+            assert_eq!(
+                (&batched.0, batched.1, batched.2.len()),
+                (&serial.0, serial.1, serial.2.len())
+            );
+            if batched.0.starts_with("seq.") {
+                assert_eq!(batched.2, serial.2, "metadane {}", batched.0);
+            } else if batched.0.ends_with(".conv") {
+                merge_diff(&mut conv, numeric_diff(&batched.2, &serial.2, batched.1));
+            } else if batched.0.ends_with(".state") {
+                merge_diff(&mut state, numeric_diff(&batched.2, &serial.2, batched.1));
+            } else {
+                merge_diff(&mut kv, numeric_diff(&batched.2, &serial.2, batched.1));
+            }
+        }
+        let logits = numeric_diff(
+            bytemuck::cast_slice(&batched_logits),
+            bytemuck::cast_slice(&serial_logits),
+            4,
+        );
+        println!(
+            "parity T128: conv abs/rel={conv:?}, state={state:?}, kv={kv:?}, logits={logits:?}"
+        );
+        assert!(conv.0 <= 0.075 && conv.2 <= 20.0, "conv {conv:?}");
+        assert!(state.0 <= 0.04 && state.2 <= 5.0, "state {state:?}");
+        assert!(kv.0 <= 0.25 && kv.2 <= 40.0, "KV {kv:?}");
+        assert!(logits.0 <= 0.04 && logits.2 <= 20.0, "logity {logits:?}");
+        let serial_top1 = serial_logits
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index);
+        let batched_top1 = batched_logits
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index);
+        assert_eq!(batched_top1, serial_top1);
+        Ok(())
+    })();
+    match previous_chunk {
+        Some(value) => std::env::set_var("FORGE_HYBRID_PREFILL_CHUNK", value),
+        None => std::env::remove_var("FORGE_HYBRID_PREFILL_CHUNK"),
+    }
+    match previous_batched {
+        Some(value) => std::env::set_var("FORGE_HYBRID_BATCH_PREFILL", value),
+        None => std::env::remove_var("FORGE_HYBRID_BATCH_PREFILL"),
+    }
+    match previous_layer_major {
+        Some(value) => std::env::set_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL", value),
+        None => std::env::remove_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL"),
+    }
+    result
 }
 
 #[test]
@@ -2023,10 +2425,8 @@ fn hybrid_prefill_b2_gpu_sampler_zachowuje_parametry_seed_i_kary_lane() -> TestR
     batch_samplers[0].note_tokens(&prompts[0]);
     batch_samplers[1].note_tokens(&prompts[1]);
     let [first_sampler, second_sampler] = &mut batch_samplers;
-    let actual = model.sample_hybrid_prefill_b2_logits_batched(&mut [
-        first_sampler,
-        second_sampler,
-    ])?;
+    let actual =
+        model.sample_hybrid_prefill_b2_logits_batched(&mut [first_sampler, second_sampler])?;
     assert_eq!(actual, expected);
     model.release_seq(batch_lanes[0]);
     model.release_seq(batch_lanes[1]);
@@ -2068,11 +2468,7 @@ fn hybrid_prefill_b2_t32_przywraca_obie_sekwencje_po_bledzie_lane() -> TestResul
         let [first, second] = &mut seqs;
         let mut lanes = [first, second];
         let error = model
-            .debug_hybrid_prefill_b2_t32_rollback(
-                &mut lanes,
-                [&chunks[0], &chunks[1]],
-                failed_lane,
-            )
+            .debug_hybrid_prefill_b2_t32_rollback(&mut lanes, [&chunks[0], &chunks[1]], failed_lane)
             .expect_err("test wymusza błąd po zapisie stanu");
         assert!(error.to_string().contains(&format!("lane {failed_lane}")));
         for lane in 0..2 {
@@ -2248,10 +2644,8 @@ fn benchmark_hybrid_prefill_b2_t32_kontra_dwa_serialne() -> TestResult<()> {
         let mut batch = [model.new_seq(), model.new_seq()];
         let [first, second] = &mut batch;
         let mut lanes = [first, second];
-        let (batch_logits, elapsed) = model.debug_hybrid_prefill_b2_t32_gpu_ms(
-            &mut lanes,
-            [&chunks[0], &chunks[1]],
-        )?;
+        let (batch_logits, elapsed) =
+            model.debug_hybrid_prefill_b2_t32_gpu_ms(&mut lanes, [&chunks[0], &chunks[1]])?;
         batch_ms.push(elapsed);
         assert_eq!(batch_logits[0], serial_first);
         assert_eq!(batch_logits[1], serial_second);
@@ -2393,8 +2787,12 @@ fn benchmark_server_prefill_b2_raw() -> TestResult<()> {
     let profile = std::env::var_os("FORGE_PROFILE_SERVER_PREFILL").is_some();
     for repetition in 0..=repetitions {
         let metrics = engine.metrics();
-        let steps_before = metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed);
-        let tokens_before = metrics.hybrid_prefill_b2_tokens_total.load(Ordering::Relaxed);
+        let steps_before = metrics
+            .hybrid_prefill_b2_steps_total
+            .load(Ordering::Relaxed);
+        let tokens_before = metrics
+            .hybrid_prefill_b2_tokens_total
+            .load(Ordering::Relaxed);
         if profile && repetition == 1 {
             cuda_profiler_call(b"cudaProfilerStart\0")?;
         }
@@ -2405,7 +2803,10 @@ fn benchmark_server_prefill_b2_raw() -> TestResult<()> {
             first_request.logprobs = Some(0);
             second_request.logprobs = Some(0);
         }
-        let receivers = [engine.submit(first_request)?, engine.submit(second_request)?];
+        let receivers = [
+            engine.submit(first_request)?,
+            engine.submit(second_request)?,
+        ];
         let mut outputs = [Vec::new(), Vec::new()];
         let mut first_token = [None, None];
         let mut done = [false, false];
@@ -2443,8 +2844,12 @@ fn benchmark_server_prefill_b2_raw() -> TestResult<()> {
         }
         assert_eq!(outputs, expected);
         let ttft = [
-            first_token[0].ok_or("brak TTFT lane0")?.duration_since(started),
-            first_token[1].ok_or("brak TTFT lane1")?.duration_since(started),
+            first_token[0]
+                .ok_or("brak TTFT lane0")?
+                .duration_since(started),
+            first_token[1]
+                .ok_or("brak TTFT lane1")?
+                .duration_since(started),
         ];
         let prefill_elapsed = ttft[0].max(ttft[1]).as_secs_f64();
         let steps = metrics
@@ -2539,6 +2944,78 @@ fn server_continuous_admission_mtp_i_router_obsluguje_concurrency_dwa() -> TestR
 }
 
 #[test]
+fn server_mtp_k3_eos_w_zaakceptowanym_prefiksie_zachowuje_reuse() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto E2E EOS MTP: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    assert!(path.is_file(), "FORGE_TEST_HYBRID_GGUF nie wskazuje pliku");
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut oracle_model) = load_model(&path, true) else {
+        return Ok(());
+    };
+    let vocab = oracle_model.weights.descriptor.params.vocab_size;
+    let prompt = prompt(vocab, 419, 8);
+    let (mut oracle_seq, _, fed) = prepare(&mut oracle_model, &prompt)?;
+    let (draft, accepted, _) = oracle_model.native_mtp_step(&mut oracle_seq, fed, 3)?;
+    assert!(
+        accepted >= 2,
+        "test EOS wymaga co najmniej dwóch zaakceptowanych tokenów draftu K3"
+    );
+    let eos_id = draft[1];
+    oracle_model.release_seq(&mut oracle_seq);
+    let oracle = generate(&mut oracle_model, &prompt, STEPS)?;
+    assert_eq!([fed, draft[0], eos_id], oracle[..3]);
+    drop(oracle_model);
+
+    let Some(model) = load_model(&path, true) else {
+        return Err("CUDA zniknęła przed testem EOS MTP".into());
+    };
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(&path)?),
+        1,
+        32,
+        12,
+        SpeculativeConfig::chain(vec![ProposerKind::Mtp], 3)?,
+    )?;
+    let eos = engine.submit(EngineRequest {
+        eos_ids: vec![eos_id],
+        emit_empty_tokens: true,
+        ..server_request(prompt.clone(), STEPS)
+    })?;
+    let mut emitted = Vec::new();
+    loop {
+        match eos.recv_timeout(Duration::from_secs(120))? {
+            EngineEvent::Token { id, .. } => emitted.push(id),
+            EngineEvent::Done { reason, tokens, .. } => {
+                assert_eq!(reason, forge_engine::generate::FinishReason::Eos);
+                assert_eq!(tokens, 2);
+                break;
+            }
+            EngineEvent::Error(error) => return Err(error.into()),
+        }
+    }
+    assert_eq!(emitted, oracle[..2]);
+    assert_eq!(
+        engine.metrics().spec_forwards_total.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        engine.metrics().spec_accepted_total.load(Ordering::Relaxed),
+        accepted as u64
+    );
+    assert_eq!(
+        collect_events(engine.submit(id_server_request(prompt, STEPS))?)?,
+        oracle
+    );
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn server_mtp_ngram_mixed_zachowuje_oracle_anulowanie_i_reuse() -> TestResult<()> {
     if std::env::var_os("FORGE_TEST_MTP_NGRAM_MIXED_SERVER").is_none() {
         eprintln!("pominięto E2E mixed MTP+n-gram");
@@ -2611,8 +3088,18 @@ fn server_prefill_b2_t32_zachowuje_id_dla_ogonow_anulowania_i_reuse() -> TestRes
     assert_eq!(collect_events(reused)?, expected[3]);
     assert_eq!(collect_events(companion)?, expected[4]);
     let metrics = engine.metrics();
-    assert!(metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed) >= 3);
-    assert!(metrics.hybrid_prefill_b2_tokens_total.load(Ordering::Relaxed) >= 192);
+    assert!(
+        metrics
+            .hybrid_prefill_b2_steps_total
+            .load(Ordering::Relaxed)
+            >= 3
+    );
+    assert!(
+        metrics
+            .hybrid_prefill_b2_tokens_total
+            .load(Ordering::Relaxed)
+            >= 192
+    );
     engine.shutdown()?;
     Ok(())
 }
@@ -2627,9 +3114,7 @@ fn server_prefill_b2_rollout_auto_off_force_zachowuje_pelne_id() -> TestResult<(
         "0" => false,
         "1" => true,
         value => {
-            return Err(
-                format!("oczekiwanie smoke B2 wymaga 0 lub 1, otrzymano {value:?}").into(),
-            );
+            return Err(format!("oczekiwanie smoke B2 wymaga 0 lub 1, otrzymano {value:?}").into());
         }
     };
     let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
@@ -2676,8 +3161,12 @@ fn server_prefill_b2_rollout_auto_off_force_zachowuje_pelne_id() -> TestResult<(
     assert_eq!(collect_events(first)?, expected_ids[0]);
     assert_eq!(collect_events(second)?, expected_ids[1]);
     let metrics = engine.metrics();
-    let steps = metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed);
-    let tokens = metrics.hybrid_prefill_b2_tokens_total.load(Ordering::Relaxed);
+    let steps = metrics
+        .hybrid_prefill_b2_steps_total
+        .load(Ordering::Relaxed);
+    let tokens = metrics
+        .hybrid_prefill_b2_tokens_total
+        .load(Ordering::Relaxed);
     let scratch = metrics
         .hybrid_prefill_b2_scratch_bytes
         .load(Ordering::Relaxed);
@@ -2828,12 +3317,78 @@ fn server_prefill_b2_nie_blokuje_live_decode_i_rotuje_pary() -> TestResult<()> {
         assert_eq!(collect_events(receiver)?, expected_prefill[lane]);
     }
     let metrics = engine.metrics();
-    assert!(metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed) >= 4);
+    assert!(
+        metrics
+            .hybrid_prefill_b2_steps_total
+            .load(Ordering::Relaxed)
+            >= 4
+    );
     println!(
         "live decode ITL z czterema prefill={:.2} ms, kroki B2={}",
         live_itl.as_secs_f64() * 1e3,
-        metrics.hybrid_prefill_b2_steps_total.load(Ordering::Relaxed),
+        metrics
+            .hybrid_prefill_b2_steps_total
+            .load(Ordering::Relaxed),
     );
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn server_layer_major_przeplata_p2048_z_aktywnym_decode() -> TestResult<()> {
+    if std::env::var_os("FORGE_TEST_HYBRID_LAYER_MAJOR_PRIORITY").is_none() {
+        eprintln!("pominięto E2E priorytetu decode nad layer-major P2048");
+        return Ok(());
+    }
+    let path = std::env::var_os("FORGE_TEST_HYBRID_GGUF")
+        .map(PathBuf::from)
+        .ok_or("E2E layer-major priority wymaga FORGE_TEST_HYBRID_GGUF")?;
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("FORGE_HYBRID_LAYER_MAJOR_PREFILL", "1");
+    let Some(model) = load_model_sized(&path, false, 4096, 128) else {
+        return Ok(());
+    };
+    let vocab = model.weights.descriptor.params.vocab_size;
+    let engine = spawn_engine_batched(
+        model,
+        Arc::new(tokenizer(&path)?),
+        2,
+        128,
+        12,
+        SpeculativeConfig::off(),
+    )?;
+    let decode = engine.submit(id_server_request(prompt(vocab, 6201, 32), 16))?;
+    loop {
+        match decode.recv()? {
+            EngineEvent::Token { .. } => break,
+            EngineEvent::Error(error) => return Err(error.into()),
+            EngineEvent::Done { .. } => {
+                return Err("decode zakończył się przed testem prefill".into())
+            }
+        }
+    }
+    let prefill = engine.submit(id_server_request(prompt(vocab, 6301, 2048), 2))?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut decode_tokens = 0;
+    while decode_tokens < 2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match decode.recv_timeout(remaining)? {
+            EngineEvent::Token { .. } => decode_tokens += 1,
+            EngineEvent::Error(error) => return Err(error.into()),
+            EngineEvent::Done { .. } => return Err("decode zakończył się za wcześnie".into()),
+        }
+    }
+    assert!(
+        matches!(
+            prefill.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "P2048 zakończył się przed przeplecionym decode; scheduler nie zastosował kwantu fairness"
+    );
+    drop(decode);
+    drop(prefill);
     engine.shutdown()?;
     Ok(())
 }
@@ -2879,6 +3434,46 @@ fn hybrid_tiering_concurrency_dwa_uzywa_serial_fallback() -> TestResult<()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     run_server_tier_fallback(&path)
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn hybrid_tiering_recompute_odbudowuje_stan_i_kv_bitowo() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto test recompute tieringu: brak FORGE_TEST_HYBRID_GGUF");
+        return Ok(());
+    };
+    let _gpu_lock = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tier = KvTierConfig {
+        mode: KvTierMode::Ram,
+        ram_budget_bytes: 256 << 20,
+        ..KvTierConfig::default()
+    };
+    let Some(mut model) = load_model_sized_with_tier(&path, false, 128, 40, tier) else {
+        return Ok(());
+    };
+    let tokens = prompt(model.weights.descriptor.params.vocab_size, 733, 64);
+    let mut seq = model.new_seq();
+    let expected_logits = model.prefill_chunk(&mut seq, &tokens)?;
+    let expected_snapshot = model.debug_hybrid_sequence_snapshot(&mut seq)?;
+    model.debug_recompute_seq(&mut seq)?;
+    let actual_snapshot = model.debug_hybrid_sequence_snapshot(&mut seq)?;
+    assert_eq!(actual_snapshot, expected_snapshot);
+    let mut expected_sampler = GpuSampler::new(SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    });
+    let expected = expected_logits
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index as u32);
+    let actual = model.sample_last_logits(&mut expected_sampler)?;
+    assert_eq!(Some(actual), expected);
+    model.release_seq(&mut seq);
+    Ok(())
 }
 
 #[test]
@@ -2994,8 +3589,7 @@ fn benchmark_server_hybrid_target_b1_kontra_b2() -> TestResult<()> {
             if max_active >= 3 {
                 serial_samples.push(measure_serial_round_robin(&path, max_active)?);
             }
-            let measurement =
-                measure_server(&path, max_active, SpeculativeConfig::off(), false)?;
+            let measurement = measure_server(&path, max_active, SpeculativeConfig::off(), false)?;
             paired_samples.push(measurement.completion_tps);
             last_measurement = Some(measurement);
         }

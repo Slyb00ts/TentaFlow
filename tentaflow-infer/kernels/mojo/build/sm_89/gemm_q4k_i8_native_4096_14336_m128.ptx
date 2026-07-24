@@ -7,7 +7,7 @@
 .address_size 64
 
 	// .globl	src_gemm_q4k_i8_multistage_gem6A6A6A6A_fff3fc114b36d74c
-.extern .shared .align 16 .b8 extern_ptr_syml_5[];
+.extern .shared .align 16 .b8 extern_ptr_syml_2[];
 
 .visible .entry src_gemm_q4k_i8_multistage_gem6A6A6A6A_fff3fc114b36d74c(
 	.param .u64 .ptr .align 1 src_gemm_q4k_i8_multistage_gem6A6A6A6A_fff3fc114b36d74c_param_0,
@@ -59,7 +59,7 @@
 	shl.b32 	%r91, %r81, 1;
 	and.b32 	%r92, %r91, 48;
 	xor.b32 	%r93, %r90, %r92;
-	mov.b32 	%r94, extern_ptr_syml_5;
+	mov.b32 	%r94, extern_ptr_syml_2;
 	add.s32 	%r75, %r94, %r93;
 	cp.async.cg.shared.global [%r75], [%rd35], 16;
 	add.s64 	%rd36, %rd35, 917504;

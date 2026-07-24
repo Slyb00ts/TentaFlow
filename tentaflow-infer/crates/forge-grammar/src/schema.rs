@@ -100,7 +100,10 @@ impl SchemaConverter {
                 .iter()
                 .map(|v| vec![Item::literal(&serde_json::to_string(v).expect("json"))])
                 .collect();
-            self.rules.push(AstRule { name: name.clone(), alternates });
+            self.rules.push(AstRule {
+                name: name.clone(),
+                alternates,
+            });
             return Ok(name);
         }
 
@@ -111,7 +114,11 @@ impl SchemaConverter {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ForgeError::Grammar("empty `type` array".into()))?,
             None => return Ok("js-value".into()),
-            _ => return Err(ForgeError::Grammar("`type` must be a string or array".into())),
+            _ => {
+                return Err(ForgeError::Grammar(
+                    "`type` must be a string or array".into(),
+                ))
+            }
         };
 
         match ty {
@@ -122,7 +129,9 @@ impl SchemaConverter {
             "null" => Ok("js-null".into()),
             "object" => self.object_rule(obj),
             "array" => self.array_rule(obj),
-            other => Err(ForgeError::Grammar(format!("unsupported schema type `{other}`"))),
+            other => Err(ForgeError::Grammar(format!(
+                "unsupported schema type `{other}`"
+            ))),
         }
     }
 
@@ -233,7 +242,11 @@ impl SchemaConverter {
         // (always preceded by a required member, so this is valid JSON).
         for key in &optional {
             let vr = self.value_rule(&props[key])?;
-            let mut member = vec![Item::Ref("ws".into()), Item::literal(","), Item::Ref("ws".into())];
+            let mut member = vec![
+                Item::Ref("ws".into()),
+                Item::literal(","),
+                Item::Ref("ws".into()),
+            ];
             member.extend(self.member_items(key, &vr));
             seq.push(Item::Repeat {
                 item: Box::new(Item::Group(vec![member])),

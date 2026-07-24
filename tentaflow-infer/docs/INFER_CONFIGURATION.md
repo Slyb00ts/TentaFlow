@@ -279,8 +279,8 @@ Natywne MTP jest dostępne dla obsługiwanego, gęstego hybrydowego GGUF `qwen35
 z `nextn_predict_layers`. Model generuje draft K=2 lub K=3 na GPU, a target
 weryfikuje cały blok jednym batched przebiegiem. Zaakceptowany prefiks zatwierdza
 KV i odtwarza odpowiadający mu stan DeltaNet podczas commit. `mtp` oznacza
-budżet 3 z adaptacyjnym wyborem K=2/K=3; `mtp:2` i `mtp:3` wymuszają maksymalny
-budżet, przy czym K=3 nadal może spaść do K=2 przy końcu dostępnego kontekstu.
+budżet K=3; `mtp:2` jawnie wybiera K=2. K=3 spada do K=2 wyłącznie wtedy, gdy
+pozostały kontekst lub dostępne strony KV nie mieszczą pełnego kroku K=3.
 Wagi i stan NextN są ładowane tylko po jawnym wybraniu trybu MTP; przy
 `--speculative off` nie zwiększają zużycia VRAM ani czasu prefill.
 
@@ -305,7 +305,11 @@ CLI nie udostępnia jeszcze składni łańcuchów neuralnych.
 
 | Flaga | Domyślnie | Opis |
 |---|---|---|
-| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` = natywna głowa modelu, maksymalny K=3 i wybór adaptacyjny. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
+| `--speculative <M>` | `off` | Działające: `off` \| `on` \| `ngram` \| `ngram:<k>` \| `mtp` \| `mtp:2` \| `mtp:3` \| `mtp+ngram` \| `mtp+ngram:2` \| `mtp+ngram:3`. `on`/`ngram` = proposer n-gram z budżetem 16; jego sufiks `:<k>` wymaga 1..=16. `mtp` i `mtp:3` = natywna głowa modelu z K=3, przycinanym do K=2 tylko przez dostępność kontekstu lub KV. `mtp+ngram` = priorytet n-gram K=3 z fallbackiem MTP. |
+| `FORGE_BENCH_NVFP4_TILE` | `0` | Wyłącznie dla `forge bench`: `1` jawnie wybiera eksperymentalny układ `TileN128K64` i wymaga `--speculative off` oraz jednej aktywnej sekwencji; `0` zachowuje `RowMajor36`. Inna wartość jest błędem konfiguracji. `serve`, `run`, `embed` i `ppl` zawsze używają `RowMajor36`. |
+| `FORGE_GEMM` | auto | Brak wartości dla katalogowego checkpointu próbuje zbudować na GPU paczki FP8 Q/O/FFN/lm_head. Preflight wymaga obsługi FP8, zgodnych kształtów, kompletu artefaktów i wystarczającej puli VRAM; niespełnienie warunków zachowuje NVFP4. `fp8mod-ffn` jawnie wybiera próbę tej ścieżki, a inna wartość wyłącza auto. |
+| `FORGE_NVFP4_CT_LAYOUT` | `auto` | Dla compressed-tensors NVFP4 wybiera S0 wyłącznie na zgodnym urządzeniu, dla obsługiwanej geometrii i kompletnego zestawu artefaktów. `row` wymusza układ bazowy, a `s0` wymaga ścieżki S0. |
+| `FORGE_NVFP4_CT_BM16` | auto | Brak wartości lub `1` dopuszcza wyspecjalizowane kernele małych batchy B4/B8/B16 po pełnym sprawdzeniu modelu i układu. `0` oraz niepoprawna wartość zachowują ścieżkę bazową. |
 | `FORGE_MTP_DRAFT_HEAD` | `q8` | Head wyłącznie dla propozycji MTP: `q8` używa wagi targetu, `nvfp4` tworzy podczas ładowania osobną kopię GGUF NVFP4 na GPU. Target verifier zawsze zachowuje oryginalną wagę. |
 | `FORGE_HYBRID_PREFILL_CHUNK` | `auto` | Wewnętrzny chunk C1 hybrydowego prefill, wybierany raz podczas ładowania modelu; `auto` i brak zmiennej są równoważne. Auto wybiera `128` wyłącznie dla zweryfikowanego gęstego qwen35 z `d_state=128`, FFN NVFP4 GGUF, kompletem artefaktów T2..T128, wystarczającym budżetem i NVIDIA warp32. Obowiązkowy scratch hybrydowy jest alokowany przed sprawdzeniem budżetu. Gdy T128 nie przechodzi gate, Auto wybiera największy istniejący wariant zgodny z backendem, artefaktami i budżetem: zweryfikowany NVIDIA zachowuje co najmniej T32, a backend przenośny wybiera do T16. Estymator uwzględnia zwykły prefill, verifier cap=4, wybrany cap oraz rezerwę 64 MiB; po wyborze extended wszystkie bufory i staging powstają podczas startupu. Pozostałe formaty zachowują `32`. Jawna wartość `3..=1024` pozostaje rygorystyczna: jest respektowana albo startup kończy się błędem `Unsupported`, bez automatycznego obniżenia. Nie zmienia osobnego prefill B2, który nadal ma stałe `B=2`, `T=32`. |
 | `FORGE_NATIVE_MTP_B2` | `1` | Ścisły kill-switch wspólnego greedy-exact MTP dla dwóch requestów o tym samym K. `1` włącza parowanie, `0` wymusza seryjne B1; brak zmiennej jest równoważny `1`. Inna wartość jest błędem konfiguracji. |
@@ -837,6 +841,14 @@ onnxruntime (|Δ| ~1e-6, tol 1e-3). Model VAD można wskazać przez
   embeddingowe (pooling z metadanych).
 - head_dim: 64, 128 (specjalizacje attention generacji) i 256 (tylko f16 KV,
   warstwy atencji qwen35moe).
+- Decode f16 dla head_dim 256 dzieli kontekst na osiem niezależnych części:
+  kernel częściowy używa bloku 256 wątków, a drugi kernel scala wyniki jednym
+  warpem na głowę. Bufor częściowy korzysta z istniejącego scratch modelu, więc
+  ścieżka nie zwiększa rezerwacji VRAM. Kontrakt testowy względem referencji to
+  względny błąd L2 nie większy niż `1e-4` i maksymalnie 16 ULP; obejmuje również
+  długości kontekstu niepodzielne przez liczbę części. Split8 jest wybierany
+  tylko na NVIDIA z warpem 32; pozostałe urządzenia używają wariantu generic
+  kompilowanego z natywnym rozmiarem warpa GPU.
 
 ## MoE (Mixture-of-Experts)
 
@@ -927,6 +939,41 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   `rope_neox_partial_f16`. PTX + manifest przebudowane, typowane launchery +
   registry w `forge-kernels` (build + clippy czyste). Test numeryczny vs
   `deltanet.rs` (`test_deltanet.mojo`) przechodzi w tolerancji f16.
+- Krok decode `deltanet_gated_step_f16` zachowuje stan F32 i kolejność redukcji,
+  ale nie zapisuje pośredniej macierzy `S*decay`. Jawne `fma(..., 0)` wymusza
+  takie samo zaokrąglenie przed redukcją, a wygaszony stan jest obliczany
+  ponownie przed końcowym zapisem. Test H48/D128 potwierdza bitową zgodność
+  stanu i canary obu buforów; osobny test z niezerowym wyjściem zachowuje
+  tolerancję referencji F16. Na RTX 4090 kernel skrócił się z 48,734 do
+  26,063 us, a decode P2048/O128 z 3370,363 do 3235,675 ms przy niezmienionym
+  SHA tokenów.
+- Dla `d_state=128` kompletny backend wybiera przy tworzeniu puli fizyczny układ
+  stanu `ValueKey` (`[głowa,value,key]`). Kolumna wartości pozostaje w rejestrach
+  przez cały skan, więc decode ładuje macierz stanu raz i zapisuje ją raz zamiast
+  wielokrotnie przesuwać te same dane. Ten sam układ obsługuje długi prefill,
+  checkpointy verifiera i selektywny recompute po akceptacji MTP; w ścieżce
+  tokenowej nie ma transpozycji ani dodatkowej alokacji. Rozmiar stanu jest
+  identyczny jak dla `KeyValue`. Brak dowolnego z czterech artefaktów, niewłaściwy
+  `d_state` albo nieobsługiwana geometria warpa wybiera `KeyValue` przed
+  zaalokowaniem puli.
+- RTX 4090, ThinkingCap Qwen3.6-27B NVFP4, P2048/O128, warmup+3:
+  prefill ma medianę 819,688 ms (2498,5 tok/s), a decode 3111,602 ms
+  (40,8 tok/s). Względem poprzedniego układu oznacza to odpowiednio -0,57%
+  i -3,83% czasu. Peak VRAM pozostaje 21340 MiB. Testy obejmują zgodność
+  ValueKey z referencją KeyValue, B2 z izolacją obu lane, MTP K2/K3,
+  MTP+n-gram, rollback po błędzie, reuse slotu z generacją oraz bitową odbudowę
+  stanu i KV przez tier recompute. Profil `nsys` obejmujący warmup i pomiar
+  zarejestrował 12192 uruchomienia decode po średnio 6,106 us i 96 uruchomień
+  persistent prefill po średnio 1429,006 us; oba kernele mają zerową pamięć
+  lokalną i współdzieloną.
+
+## Atencja verifiera MTP
+
+`FORGE_VERIFY_ATTN_SPLIT8=0` wyłącza zoptymalizowaną atencję split8 verifiera
+MTP i wymusza dokładną ścieżkę bazową. Domyślnie split8 jest wybierany
+automatycznie wyłącznie dla T3/T4 na NVIDIA warp32 z wystarczającymi zasobami
+i kompletnym zestawem artefaktów. Akceptowane wartości włączające to `auto`
+i `1`; inne wartości bezpiecznie wybierają fallback.
 
 ## Ograniczenia znane (uczciwie)
 

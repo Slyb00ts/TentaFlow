@@ -478,7 +478,11 @@ impl ChatCompletionRequest {
                 ))
             }
         }
-        Ok(if has_tools { ToolMode::Auto } else { ToolMode::None })
+        Ok(if has_tools {
+            ToolMode::Auto
+        } else {
+            ToolMode::None
+        })
     }
 
     fn has_tools(&self) -> Result<bool, ApiError> {
@@ -604,7 +608,11 @@ impl Usage {
         Self::with_cache(prompt_tokens, completion_tokens, 0)
     }
 
-    pub fn with_cache(prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) -> Self {
+    pub fn with_cache(
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_tokens: usize,
+    ) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
@@ -872,7 +880,9 @@ mod tests {
         assert_eq!(r.input.into_items().len(), 2);
         // Single pre-tokenized id array.
         let r = embed_req(serde_json::json!({"model": "m", "input": [1, 2, 3]}));
-        assert!(matches!(r.input.into_items().as_slice(), [EmbItem::Tokens(ids)] if ids == &[1, 2, 3]));
+        assert!(
+            matches!(r.input.into_items().as_slice(), [EmbItem::Tokens(ids)] if ids == &[1, 2, 3])
+        );
         // Batch of id arrays.
         let r = embed_req(serde_json::json!({"model": "m", "input": [[1, 2], [3]]}));
         let items = r.input.into_items();
@@ -884,13 +894,11 @@ mod tests {
     fn encoding_format_defaults_and_rejects() {
         let r = embed_req(serde_json::json!({"model": "m", "input": "x"}));
         assert_eq!(r.encoding().unwrap(), EncodingFormat::Float);
-        let r = embed_req(
-            serde_json::json!({"model": "m", "input": "x", "encoding_format": "base64"}),
-        );
+        let r =
+            embed_req(serde_json::json!({"model": "m", "input": "x", "encoding_format": "base64"}));
         assert_eq!(r.encoding().unwrap(), EncodingFormat::Base64);
-        let r = embed_req(
-            serde_json::json!({"model": "m", "input": "x", "encoding_format": "yaml"}),
-        );
+        let r =
+            embed_req(serde_json::json!({"model": "m", "input": "x", "encoding_format": "yaml"}));
         assert!(r.encoding().is_err());
     }
 

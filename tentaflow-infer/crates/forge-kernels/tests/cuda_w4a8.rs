@@ -35,7 +35,9 @@ fn device() -> Option<Arc<CudaDevice>> {
 }
 
 fn upload(dev: &dyn Device, bytes: &[u8]) -> DevBuffer {
-    let buf = dev.alloc(bytes.len().max(1), MemKind::Device, Pool::Weights).unwrap();
+    let buf = dev
+        .alloc(bytes.len().max(1), MemKind::Device, Pool::Weights)
+        .unwrap();
     dev.write(bytes, &buf, 0).unwrap();
     buf
 }
@@ -113,7 +115,9 @@ fn run_case(m: usize, n: usize, k: usize) -> Result<()> {
     let d_as = upload_f16_bits(dev.as_ref(), &asc_bits);
     let d_y = upload_f16_bits(dev.as_ref(), &vec![0u16; m * n]);
 
-    kernels.w4a8_gemm(&d_y, &d_a, &d_w, &d_z, &d_s2, &d_ws, &d_as, m, n, k, &stream)?;
+    kernels.w4a8_gemm(
+        &d_y, &d_a, &d_w, &d_z, &d_s2, &d_ws, &d_as, m, n, k, &stream,
+    )?;
     dev.synchronize()?;
 
     let got = download_f16(dev.as_ref(), &d_y, m * n);
@@ -136,13 +140,13 @@ fn run_case(m: usize, n: usize, k: usize) -> Result<()> {
 fn w4a8_matches_cpu_golden() {
     // All CTA-config branches + Mistral FFN shapes (N%64==0, K%128==0).
     let shapes = [
-        (256, 128, 256),    // m128 branch
+        (256, 128, 256), // m128 branch
         (256, 256, 512),
-        (129, 256, 512),    // m128 branch (M just over 128)
-        (128, 256, 256),    // m64_ksm (M==128, K<=4096)
-        (128, 256, 8192),   // m64_klg (M==128, K>4096)
-        (64, 256, 512),     // m32 branch (M<128)
-        (256, 4096, 4096),  // Mistral q/o
+        (129, 256, 512),   // m128 branch (M just over 128)
+        (128, 256, 256),   // m64_ksm (M==128, K<=4096)
+        (128, 256, 8192),  // m64_klg (M==128, K>4096)
+        (64, 256, 512),    // m32 branch (M<128)
+        (256, 4096, 4096), // Mistral q/o
         (512, 4096, 4096),
         (192, 14336, 4096), // gate/up
         (192, 4096, 14336), // down
@@ -167,7 +171,11 @@ fn bench_tops(dev: &Arc<CudaDevice>, kernels: &Kernels, m: usize, n: usize, k: u
     let d_as = upload_f16_bits(dev.as_ref(), &asc_bits);
     let d_y = upload_f16_bits(dev.as_ref(), &vec![0u16; m * n]);
     let go = || {
-        kernels.w4a8_gemm(&d_y, &d_a, &d_w, &d_z, &d_s2, &d_ws, &d_as, m, n, k, &stream).unwrap();
+        kernels
+            .w4a8_gemm(
+                &d_y, &d_a, &d_w, &d_z, &d_s2, &d_ws, &d_as, m, n, k, &stream,
+            )
+            .unwrap();
     };
     for _ in 0..30 {
         go();
@@ -193,7 +201,10 @@ fn bench_tops(dev: &Arc<CudaDevice>, kernels: &Kernels, m: usize, n: usize, k: u
 fn bench_w4a8_tops() {
     let Some(dev) = device() else { return };
     let kernels = Kernels::load(dev.clone()).unwrap();
-    for &(name, n, k) in &[("gate", 14336usize, 4096usize), ("down", 4096usize, 14336usize)] {
+    for &(name, n, k) in &[
+        ("gate", 14336usize, 4096usize),
+        ("down", 4096usize, 14336usize),
+    ] {
         for &t in &[512usize, 2048, 4096] {
             let tops = bench_tops(&dev, &kernels, t, n, k);
             println!("w4a8 {name} N={n} K={k} T={t}: {tops:.1} TFLOP-eq");

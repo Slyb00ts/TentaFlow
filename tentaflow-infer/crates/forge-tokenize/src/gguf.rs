@@ -132,15 +132,17 @@ fn pre_spec(pre: &str) -> Result<(&'static [&'static str], bool)> {
         "gpt-2" | "phi-2" | "jina-es" | "jina-de" | "gigachat" | "jina-v2-es" | "jina-v2-de"
         | "a.x-4.0" | "mellum" | "modern-bert" | "mpt" | "olmo" | "jais" | "trillion"
         | "granite-docling" | "exaone4" => Ok((PRE_GPT2, false)),
-        "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2"
-        | "hunyuan" => Ok((PRE_QWEN2, false)),
+        "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2" | "hunyuan" => {
+            Ok((PRE_QWEN2, false))
+        }
         "qwen35" => Ok((PRE_QWEN35, false)),
-        "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
-        | "midm-2.0" | "lfm2" | "jina-v5-nano" => Ok((PRE_LLAMA3, true)),
+        "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral" | "midm-2.0"
+        | "lfm2" | "jina-v5-nano" => Ok((PRE_LLAMA3, true)),
         "dbrx" | "smaug-bpe" | "glm4" | "chatglm-bpe" => Ok((PRE_LLAMA3, false)),
         "falcon" => Ok((PRE_FALCON, false)),
-        "starcoder" | "refact" | "command-r" | "smollm" | "codeshell" | "exaone"
-        | "minerva-7b" => Ok((PRE_STARCODER, false)),
+        "starcoder" | "refact" | "command-r" | "smollm" | "codeshell" | "exaone" | "minerva-7b" => {
+            Ok((PRE_STARCODER, false))
+        }
         "deepseek-llm" => Ok((PRE_DEEPSEEK_LLM, false)),
         "deepseek-coder" => Ok((PRE_DEEPSEEK_CODER, false)),
         "deepseek-v3" => Ok((PRE_DEEPSEEK3, false)),
@@ -369,7 +371,10 @@ fn special_token(vocab: &GgufVocab, id: Option<u32>, which: &str) -> Result<(Str
     Ok((token, id))
 }
 
-fn attach_bos_eos_processor(tokenizer: &mut tokenizers::Tokenizer, vocab: &GgufVocab) -> Result<()> {
+fn attach_bos_eos_processor(
+    tokenizer: &mut tokenizers::Tokenizer,
+    vocab: &GgufVocab,
+) -> Result<()> {
     let bos = if vocab.add_bos {
         Some(special_token(vocab, vocab.bos_id, "bos")?)
     } else {

@@ -3,11 +3,12 @@
 // (ADR-0001). This crate loads those artifacts onto a HAL device and exposes
 // typed launch wrappers so the engine never touches raw entry symbols.
 
-mod registry;
 mod launchers;
+mod registry;
 
 pub use launchers::{
-    Kernels, Nvfp4GgufQ8Projection, Q8ActPrepared, SAMPLE_MAX_TOPK, SAMPLE_MAX_VOCAB,
-    SAMPLE_SCRATCH_PAIRS,
+    DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4CtBm16Projection, Nvfp4CtS0View,
+    Nvfp4GgufLayout, Nvfp4GgufQ8Projection, Q8ActPrepared, Q8PreparedProjection, SAMPLE_MAX_TOPK,
+    SAMPLE_MAX_VOCAB, SAMPLE_SCRATCH_PAIRS,
 };
 pub use registry::{KernelArtifacts, Manifest};

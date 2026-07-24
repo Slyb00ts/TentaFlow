@@ -36,6 +36,41 @@ pub fn f8e4m3_to_f32(b: u8) -> f32 {
     }
 }
 
+/// Kanoniczny S0E5M3 NaN używany przez repacker GPU dla błędnego wejścia.
+pub const NVFP4_CT_S0_NAN: u8 = 0xF9;
+
+/// Koduje legalną dodatnią skalę E4M3 do S0E5M3 z kompensacją x128.
+///
+/// Ujemne skale i NaN nie należą do kontraktu compressed-tensors i są
+/// odrzucane. Repacker GPU zapisuje dla nich `NVFP4_CT_S0_NAN`, aby błąd
+/// pozostał widoczny również bez walidacji hosta.
+pub fn nvfp4_ct_s0_from_e4m3(value: u8) -> Option<u8> {
+    if value & 0x80 != 0 || value == 0x7f {
+        return None;
+    }
+    let exponent = (value >> 3) & 0x0f;
+    let mantissa = value & 0x07;
+    if exponent != 0 {
+        return Some((exponent + 15) << 3 | mantissa);
+    }
+    Some(match mantissa {
+        0 => 0x00,
+        1 => 0x68,
+        2 => 0x70,
+        3 => 0x74,
+        4 => 0x78,
+        5 => 0x7a,
+        6 => 0x7c,
+        7 => 0x7e,
+        _ => unreachable!(),
+    })
+}
+
+/// Dekoduje S0E5M3 tak samo jak `UInt16(value) << 7` w kernelu Mojo.
+pub fn nvfp4_ct_s0_to_f32(value: u8) -> f32 {
+    half::f16::from_bits((value as u16) << 7).to_f32()
+}
+
 /// f32 → FP8 E4M3FN byte, round-to-nearest-even, saturating to ±448 (e4m3fn
 /// has no infinities; the max finite is 448). NaN maps to the canonical NaN
 /// 0x7F. Mirrors the hardware `cvt.rn.satfinite.e4m3` used by the GPU quantizer,
@@ -64,7 +99,7 @@ pub fn f32_to_f8e4m3(v: f32) -> u8 {
     if e < -6 {
         // Subnormal e4m3: value = man/8 * 2^-6, man in 0..=7.
         let scaled = a / (1.0 / 64.0); // a * 2^6 → man/8 domain (× further below)
-        // man = round(a * 2^6 * 8) = round(a * 2^9), ties to even.
+                                       // man = round(a * 2^6 * 8) = round(a * 2^9), ties to even.
         let man = round_ties_even(a * 512.0);
         let man = man.clamp(0.0, 8.0) as u32;
         if man == 8 {
@@ -260,6 +295,36 @@ mod tests {
         assert_eq!(f8e4m3_to_f32(0x01), 1.0 / 512.0); // smallest subnormal
         assert_eq!(f8e4m3_to_f32(0x7E), 448.0); // max finite
         assert!(f8e4m3_to_f32(0x7F).is_nan());
+    }
+
+    #[test]
+    fn nvfp4_ct_s0_sprawdza_wszystkie_kody_e4m3() {
+        for raw in 0u8..=u8::MAX {
+            match nvfp4_ct_s0_from_e4m3(raw) {
+                Some(encoded) => {
+                    assert!(raw <= 0x7e);
+                    assert_eq!(
+                        nvfp4_ct_s0_to_f32(encoded),
+                        f8e4m3_to_f32(raw) * 128.0,
+                        "kod E4M3 0x{raw:02x}"
+                    );
+                }
+                None => assert!(raw >= 0x7f),
+            }
+        }
+        assert_eq!(
+            [
+                nvfp4_ct_s0_from_e4m3(0x01).unwrap(),
+                nvfp4_ct_s0_from_e4m3(0x02).unwrap(),
+                nvfp4_ct_s0_from_e4m3(0x03).unwrap(),
+                nvfp4_ct_s0_from_e4m3(0x04).unwrap(),
+                nvfp4_ct_s0_from_e4m3(0x05).unwrap(),
+                nvfp4_ct_s0_from_e4m3(0x06).unwrap(),
+                nvfp4_ct_s0_from_e4m3(0x07).unwrap(),
+            ],
+            [0x68, 0x70, 0x74, 0x78, 0x7a, 0x7c, 0x7e]
+        );
+        assert!(nvfp4_ct_s0_to_f32(NVFP4_CT_S0_NAN).is_nan());
     }
 
     #[test]

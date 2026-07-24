@@ -227,7 +227,13 @@ pub fn smoothing_scale(act_absmax: &[f32], w_absmax: &[f32], alpha: f32) -> Vec<
 /// requant. The GEMM's activation quantizer applies the reciprocal `1/smooth`
 /// per channel, so `W'·X' == W·X` up to quant noise, but the per-token int8
 /// activation range is no longer dominated by a few outlier channels.
-pub fn w4a8_pack_smoothed(w: &[f32], n: usize, k: usize, group: usize, smooth: &[f32]) -> W4A8Packed {
+pub fn w4a8_pack_smoothed(
+    w: &[f32],
+    n: usize,
+    k: usize,
+    group: usize,
+    smooth: &[f32],
+) -> W4A8Packed {
     assert_eq!(smooth.len(), k, "smoothing vector must have K entries");
     let mut ws = vec![0.0f32; n * k];
     for row in 0..n {
@@ -259,10 +265,10 @@ pub fn w4a8_pack(w: &[f32], n: usize, k: usize, group: usize) -> W4A8Packed {
                     for d5 in 0..2 {
                         for d2 in 0..2 {
                             for d7 in 0..4 {
-                                let flat7 = ((((((d0 * k32 + d4) * 8 + d3) * 4 + d6) * 2 + d5) * 2
-                                    + d2)
-                                    * 4)
-                                    + d7;
+                                let flat7 =
+                                    ((((((d0 * k32 + d4) * 8 + d3) * 4 + d6) * 2 + d5) * 2 + d2)
+                                        * 4)
+                                        + d7;
                                 let mut nibs = [0u8; 2];
                                 for (d1, nib) in nibs.iter_mut().enumerate() {
                                     let oc = d0 * 32 + d1 * 16 + d2 * 8 + d3;
@@ -296,7 +302,15 @@ pub fn w4a8_pack(w: &[f32], n: usize, k: usize, group: usize) -> W4A8Packed {
     }
 
     let s1_scales = s1.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
-    W4A8Packed { qweight, s2_scales, s2_zeros, s1_scales, n, k, group }
+    W4A8Packed {
+        qweight,
+        s2_scales,
+        s2_zeros,
+        s1_scales,
+        n,
+        k,
+        group,
+    }
 }
 
 /// Effective per-element weight the GEMM applies: `s1[row] * int8_wrap(s2*(q4-zero))`.

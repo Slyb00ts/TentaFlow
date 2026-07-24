@@ -218,11 +218,11 @@ fn pack_i_batch_gather_embeddingu_zachowuja_canary_dla_k2_i_k3() {
 }
 
 #[test]
-fn segmentowana_atencja_uzywa_osobnych_tablic_stron_lane() {
+fn segmentowana_atencja_hd128_uzywa_osobnych_tablic_stron_lane() {
     let Some(device) = device() else { return };
     let kernels = Kernels::load(device.clone()).unwrap();
     let stream = device.create_stream().unwrap();
-    let head_dim = 256usize;
+    let head_dim = 128usize;
     let page_size = 2usize;
     let tokens = 2usize;
     let batch = 2usize;
@@ -290,7 +290,7 @@ fn segmentowana_atencja_uzywa_osobnych_tablic_stron_lane() {
         )
         .unwrap();
     kernels
-        .attn_verify_segmented_f16_hd256(
+        .attn_prefill_segmented_f16(
             &output,
             &q,
             &k_cache,
@@ -301,6 +301,7 @@ fn segmentowana_atencja_uzywa_osobnych_tablic_stron_lane() {
             tokens,
             1,
             1,
+            head_dim,
             page_size,
             2,
             1.0,
@@ -351,7 +352,11 @@ fn run_segmented_attention_exact_case(context: usize, tokens: usize, lane_swap: 
         .alloc(total * 4, MemKind::Device, Pool::Activations)
         .unwrap();
     let output = device
-        .alloc((query_elements + guard) * 2, MemKind::Device, Pool::Activations)
+        .alloc(
+            (query_elements + guard) * 2,
+            MemKind::Device,
+            Pool::Activations,
+        )
         .unwrap();
 
     let mut q_values = vec![f16::ZERO; query_elements];
@@ -391,7 +396,9 @@ fn run_segmented_attention_exact_case(context: usize, tokens: usize, lane_swap: 
             visible_values.push((context - tokens + token + 1) as i32);
         }
     }
-    device.write(bytemuck::cast_slice(&q_values), &q, 0).unwrap();
+    device
+        .write(bytemuck::cast_slice(&q_values), &q, 0)
+        .unwrap();
     device
         .write(bytemuck::cast_slice(&k_values), &k_cache, 0)
         .unwrap();
@@ -446,18 +453,14 @@ fn run_segmented_attention_exact_case(context: usize, tokens: usize, lane_swap: 
             .unwrap();
         device
             .write(
-                bytemuck::cast_slice(
-                    &q_values[lane * lane_elements..(lane + 1) * lane_elements],
-                ),
+                bytemuck::cast_slice(&q_values[lane * lane_elements..(lane + 1) * lane_elements]),
                 &q_lane,
                 0,
             )
             .unwrap();
         device
             .write(
-                bytemuck::cast_slice(
-                    &page_values[lane * max_pages..(lane + 1) * max_pages],
-                ),
+                bytemuck::cast_slice(&page_values[lane * max_pages..(lane + 1) * max_pages]),
                 &page_table_lane,
                 0,
             )
@@ -513,7 +516,17 @@ fn run_segmented_attention_exact_case(context: usize, tokens: usize, lane_swap: 
 
 #[test]
 fn segmentowana_atencja_nvidia_jest_bitowo_zgodna_z_serial() {
-    for (context, tokens) in [(1usize, 1usize), (31, 6), (32, 6), (32, 32), (33, 6), (64, 32), (128, 6), (512, 8), (2048, 8)] {
+    for (context, tokens) in [
+        (1usize, 1usize),
+        (31, 6),
+        (32, 6),
+        (32, 32),
+        (33, 6),
+        (64, 32),
+        (128, 6),
+        (512, 8),
+        (2048, 8),
+    ] {
         for lane_swap in [false, true] {
             run_segmented_attention_exact_case(context, tokens, lane_swap);
         }
@@ -534,54 +547,47 @@ fn segmentowana_atencja_odrzuca_zerowe_i_niezgodne_ksztalty() {
     let cache = device
         .alloc(32 * 256 * 2, MemKind::Device, Pool::Activations)
         .unwrap();
-    let page_tables = device
-        .alloc(4, MemKind::Device, Pool::Activations)
-        .unwrap();
-    let visible = device
-        .alloc(4, MemKind::Device, Pool::Activations)
-        .unwrap();
-    let launch = |output, q, k_cache, v_cache, batch, tokens, q_heads, kv_heads, page_size, max_pages| {
-        kernels.attn_verify_segmented_f16_hd256(
-            output,
-            q,
-            k_cache,
-            v_cache,
-            &page_tables,
-            &visible,
-            batch,
-            tokens,
-            q_heads,
-            kv_heads,
-            page_size,
-            max_pages,
-            0.0625,
-            &stream,
-        )
-    };
+    let page_tables = device.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    let visible = device.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    let launch =
+        |output, q, k_cache, v_cache, batch, tokens, q_heads, kv_heads, page_size, max_pages| {
+            kernels.attn_verify_segmented_f16_hd256(
+                output,
+                q,
+                k_cache,
+                v_cache,
+                &page_tables,
+                &visible,
+                batch,
+                tokens,
+                q_heads,
+                kv_heads,
+                page_size,
+                max_pages,
+                0.0625,
+                &stream,
+            )
+        };
     assert!(launch(&output, &q, &cache, &cache, 1, 0, 2, 1, 32, 1).is_err());
     assert!(launch(&output, &q, &cache, &cache, 1, 1, 3, 2, 32, 1).is_err());
-    let short = device
-        .alloc(2, MemKind::Device, Pool::Activations)
-        .unwrap();
+    let short = device.alloc(2, MemKind::Device, Pool::Activations).unwrap();
     assert!(launch(&short, &q, &cache, &cache, 1, 1, 2, 1, 32, 1).is_err());
     let unaligned_cache = device
         .alloc(32 * 256 * 2 + 2, MemKind::Device, Pool::Activations)
         .unwrap();
-    assert!(
-        launch(
-            &output,
-            &q,
-            &unaligned_cache,
-            &unaligned_cache,
-            1,
-            1,
-            2,
-            1,
-            32,
-            1,
-        )
-        .is_err()
-    );
+    assert!(launch(
+        &output,
+        &q,
+        &unaligned_cache,
+        &unaligned_cache,
+        1,
+        1,
+        2,
+        1,
+        32,
+        1,
+    )
+    .is_err());
 }
 
 #[test]
@@ -1025,13 +1031,27 @@ fn prepare_segmented_final_b2_t32_jest_zgodny_z_ostatnim_checkpointem() {
     let beta_raw = alloc(raw_values.len() * 2);
     let dt_bias = alloc(parameter_values.len() * 2);
     let a_scale = alloc(parameter_values.len() * 2);
-    device.write(bytemuck::cast_slice(&input_values), &input, 0).unwrap();
-    device.write(bytemuck::cast_slice(&initial_values), &initial, 0).unwrap();
-    device.write(bytemuck::cast_slice(&weight_values), &weight, 0).unwrap();
-    device.write(bytemuck::cast_slice(&raw_values), &alpha, 0).unwrap();
-    device.write(bytemuck::cast_slice(&raw_values), &beta_raw, 0).unwrap();
-    device.write(bytemuck::cast_slice(&parameter_values), &dt_bias, 0).unwrap();
-    device.write(bytemuck::cast_slice(&parameter_values), &a_scale, 0).unwrap();
+    device
+        .write(bytemuck::cast_slice(&input_values), &input, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&initial_values), &initial, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&weight_values), &weight, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&raw_values), &alpha, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&raw_values), &beta_raw, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&parameter_values), &dt_bias, 0)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice(&parameter_values), &a_scale, 0)
+        .unwrap();
 
     let old_q = alloc(vector_elems * 2);
     let old_k = alloc(vector_elems * 2);
@@ -1047,16 +1067,52 @@ fn prepare_segmented_final_b2_t32_jest_zgodny_z_ostatnim_checkpointem() {
     let final_conv = alloc(batch * conv_elems * 2);
     kernels
         .deltanet_prepare_segmented_f16(
-            &old_q, &old_k, &old_v, &old_g, &old_beta, &checkpoints, &initial, &input,
-            &weight, &alpha, &beta_raw, &dt_bias, &a_scale, batch, steps, n_k_heads,
-            n_v_heads, d_state, d_conv, 1e-6, &stream,
+            &old_q,
+            &old_k,
+            &old_v,
+            &old_g,
+            &old_beta,
+            &checkpoints,
+            &initial,
+            &input,
+            &weight,
+            &alpha,
+            &beta_raw,
+            &dt_bias,
+            &a_scale,
+            batch,
+            steps,
+            n_k_heads,
+            n_v_heads,
+            d_state,
+            d_conv,
+            1e-6,
+            &stream,
         )
         .unwrap();
     kernels
         .deltanet_prepare_segmented_final_f16(
-            &final_q, &final_k, &final_v, &final_g, &final_beta, &final_conv, &initial,
-            &input, &weight, &alpha, &beta_raw, &dt_bias, &a_scale, batch, steps,
-            n_k_heads, n_v_heads, d_state, d_conv, 1e-6, &stream,
+            &final_q,
+            &final_k,
+            &final_v,
+            &final_g,
+            &final_beta,
+            &final_conv,
+            &initial,
+            &input,
+            &weight,
+            &alpha,
+            &beta_raw,
+            &dt_bias,
+            &a_scale,
+            batch,
+            steps,
+            n_k_heads,
+            n_v_heads,
+            d_state,
+            d_conv,
+            1e-6,
+            &stream,
         )
         .unwrap();
     device.synchronize().unwrap();
@@ -1281,94 +1337,110 @@ fn maskowany_append_i_metadane_mtp_obsluguja_macierz_retained_1_do_t() {
                 .unwrap();
             for retained0 in 1..=t {
                 for retained1 in 1..=t {
-                let decisions_host = [retained0 as i32, 101, retained1 as i32, 202];
-                device
-                    .write(bytemuck::cast_slice(&decisions_host), &decisions, 0)
-                    .unwrap();
-                let cache = vec![canary; cache_elements];
-                device
-                    .write(bytemuck::cast_slice(&cache), &k_cache, 0)
-                    .unwrap();
-                device
-                    .write(bytemuck::cast_slice(&cache), &v_cache, 0)
-                    .unwrap();
-                let metadata_canary = vec![0x6bad_cafeu32; batch + 3];
-                device
-                    .write(bytemuck::cast_slice(&metadata_canary), &seq_lens, 0)
-                    .unwrap();
-                device
-                    .write(bytemuck::cast_slice(&metadata_canary), &positions, 0)
-                    .unwrap();
-                kernels
-                    .kv_append_batch_segmented_masked_f16(
-                        &k_cache,
-                        &v_cache,
-                        &input_buffer,
-                        &input_buffer,
-                        &page_tables,
-                        &bases,
-                        &decisions,
-                        batch,
-                        t,
-                        max_pages,
-                        1,
-                        page_size,
-                        head_dim,
-                        &stream,
-                    )
-                    .unwrap();
-                kernels
-                    .mtp_commit_catchup_metadata_segmented(
-                        &seq_lens, &positions, &bases, &decisions, batch, &stream,
-                    )
-                    .unwrap();
-                device.synchronize().unwrap();
-                let mut cache_bytes = vec![0u8; cache_elements * 2];
-                device.read(&k_cache, 0, &mut cache_bytes).unwrap();
-                let actual = bytemuck::cast_slice::<u8, f16>(&cache_bytes);
-                for lane in 0..batch {
-                    let retained = [retained0, retained1][lane];
-                    let enabled = source_mask & (1 << lane) != 0;
-                    for row in 0..t {
-                        let page = lane * max_pages + row / page_size;
-                        let slot = row % page_size;
-                        let offset = (page * page_size + slot) * head_dim;
-                        let expected = if enabled && row < retained {
-                            f16::from_f32((lane * t + row + 1) as f32)
-                        } else {
-                            canary
-                        };
-                        assert!(actual[offset..offset + head_dim]
+                    let decisions_host = [retained0 as i32, 101, retained1 as i32, 202];
+                    device
+                        .write(bytemuck::cast_slice(&decisions_host), &decisions, 0)
+                        .unwrap();
+                    let cache = vec![canary; cache_elements];
+                    device
+                        .write(bytemuck::cast_slice(&cache), &k_cache, 0)
+                        .unwrap();
+                    device
+                        .write(bytemuck::cast_slice(&cache), &v_cache, 0)
+                        .unwrap();
+                    let metadata_canary = vec![0x6bad_cafeu32; batch + 3];
+                    device
+                        .write(bytemuck::cast_slice(&metadata_canary), &seq_lens, 0)
+                        .unwrap();
+                    device
+                        .write(bytemuck::cast_slice(&metadata_canary), &positions, 0)
+                        .unwrap();
+                    kernels
+                        .kv_append_batch_segmented_masked_f16(
+                            &k_cache,
+                            &v_cache,
+                            &input_buffer,
+                            &input_buffer,
+                            &page_tables,
+                            &bases,
+                            &decisions,
+                            batch,
+                            t,
+                            max_pages,
+                            1,
+                            page_size,
+                            head_dim,
+                            &stream,
+                        )
+                        .unwrap();
+                    kernels
+                        .mtp_commit_catchup_metadata_segmented(
+                            &seq_lens, &positions, &bases, &decisions, batch, &stream,
+                        )
+                        .unwrap();
+                    device.synchronize().unwrap();
+                    let mut cache_bytes = vec![0u8; cache_elements * 2];
+                    device.read(&k_cache, 0, &mut cache_bytes).unwrap();
+                    let actual = bytemuck::cast_slice::<u8, f16>(&cache_bytes);
+                    for lane in 0..batch {
+                        let retained = [retained0, retained1][lane];
+                        let enabled = source_mask & (1 << lane) != 0;
+                        for row in 0..t {
+                            let page = lane * max_pages + row / page_size;
+                            let slot = row % page_size;
+                            let offset = (page * page_size + slot) * head_dim;
+                            let expected = if enabled && row < retained {
+                                f16::from_f32((lane * t + row + 1) as f32)
+                            } else {
+                                canary
+                            };
+                            assert!(actual[offset..offset + head_dim]
+                                .iter()
+                                .all(|value| *value == expected));
+                        }
+                    }
+                    for (buffer, expected) in [
+                        (
+                            &seq_lens,
+                            [
+                                if source_mask & 1 != 0 {
+                                    retained0 as i32
+                                } else {
+                                    0x6bad_cafeu32 as i32
+                                },
+                                if source_mask & 2 != 0 {
+                                    retained1 as i32
+                                } else {
+                                    0x6bad_cafeu32 as i32
+                                },
+                            ],
+                        ),
+                        (
+                            &positions,
+                            [
+                                if source_mask & 1 != 0 {
+                                    retained0 as i32 - 1
+                                } else {
+                                    0x6bad_cafeu32 as i32
+                                },
+                                if source_mask & 2 != 0 {
+                                    retained1 as i32 - 1
+                                } else {
+                                    0x6bad_cafeu32 as i32
+                                },
+                            ],
+                        ),
+                    ] {
+                        let mut bytes = vec![0u8; (batch + 3) * 4];
+                        device.read(buffer, 0, &mut bytes).unwrap();
+                        let values = bytemuck::cast_slice::<u8, i32>(&bytes);
+                        assert_eq!(&values[..batch], &expected);
+                        assert!(values[batch..]
                             .iter()
-                            .all(|value| *value == expected));
+                            .all(|value| *value as u32 == 0x6bad_cafe));
                     }
                 }
-                for (buffer, expected) in [
-                    (
-                        &seq_lens,
-                        [
-                            if source_mask & 1 != 0 { retained0 as i32 } else { 0x6bad_cafeu32 as i32 },
-                            if source_mask & 2 != 0 { retained1 as i32 } else { 0x6bad_cafeu32 as i32 },
-                        ],
-                    ),
-                    (
-                        &positions,
-                        [
-                            if source_mask & 1 != 0 { retained0 as i32 - 1 } else { 0x6bad_cafeu32 as i32 },
-                            if source_mask & 2 != 0 { retained1 as i32 - 1 } else { 0x6bad_cafeu32 as i32 },
-                        ],
-                    ),
-                ] {
-                    let mut bytes = vec![0u8; (batch + 3) * 4];
-                    device.read(buffer, 0, &mut bytes).unwrap();
-                    let values = bytemuck::cast_slice::<u8, i32>(&bytes);
-                    assert_eq!(&values[..batch], &expected);
-                    assert!(values[batch..]
-                        .iter()
-                        .all(|value| *value as u32 == 0x6bad_cafe));
-                }
             }
-        }
         }
     }
 }

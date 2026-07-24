@@ -3,9 +3,10 @@
 // (kernels/mojo/src/*.mojo). Mojo `Int` marshals as a 64-bit scalar slot,
 // `Float32` as f32.
 
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
 use forge_hal::{DevBuffer, Device, Event, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_types::{DType, ForgeError, MemKind, Result};
@@ -13,6 +14,49 @@ use forge_types::{DType, ForgeError, MemKind, Result};
 use crate::registry::KernelArtifacts;
 
 const BLOCK: u32 = 256;
+const FP8_MODULAR_BN256_SMEM: usize = 98_304;
+const FP8_MODULAR_BN256_TOKENS: usize = 1024;
+static FP8_MODULAR_BN256_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn fp8_modular_bn256_enabled() -> bool {
+    *FP8_MODULAR_BN256_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FORGE_FP8_BN256").ok().as_deref(),
+            None | Some("auto") | Some("1")
+        )
+    })
+}
+
+fn fp8_modular_bn256_kernel(rows: usize, cols: usize) -> Option<&'static str> {
+    match (rows, cols) {
+        (4096, 4096) => Some("gemm_fp8_mod_4096_4096_bn256"),
+        (11264, 4096) => Some("gemm_fp8_mod_11264_4096_bn256"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fp8_modular_bn256_capable(
+    vendor: forge_types::Vendor,
+    warp_size: u32,
+    max_threads_per_block: u32,
+    max_shared_mem_per_block: usize,
+    rows: usize,
+    cols: usize,
+    n_tokens: usize,
+    mut has: impl FnMut(&str) -> bool,
+) -> bool {
+    let Some(kernel) = fp8_modular_bn256_kernel(rows, cols) else {
+        return false;
+    };
+    fp8_modular_bn256_enabled()
+        && vendor == forge_types::Vendor::Nvidia
+        && warp_size == 32
+        && max_threads_per_block >= 256
+        && max_shared_mem_per_block >= FP8_MODULAR_BN256_SMEM
+        && n_tokens == FP8_MODULAR_BN256_TOKENS
+        && has(kernel)
+}
 
 /// Jedna projekcja surowego GGUF NVFP4 korzystająca ze wspólnej aktywacji Q8_1.
 pub struct Nvfp4GgufQ8Projection<'a> {
@@ -22,11 +66,478 @@ pub struct Nvfp4GgufQ8Projection<'a> {
     pub output_scale: f32,
 }
 
-/// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
-const ATTN_BLOCK: u32 = 128;
+/// Fizyczny układ bajtów macierzy GGUF NVFP4 na urządzeniu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nvfp4GgufLayout {
+    RowMajor36,
+    TileN128K64,
+}
+
+/// Widok pełnej macierzy NVFP4 w naturalnym układzie S0 N64/K128.
+#[derive(Clone, Copy)]
+pub struct Nvfp4CtS0View<'a> {
+    buffer: &'a DevBuffer,
+    rows: usize,
+    cols: usize,
+}
+
+impl<'a> Nvfp4CtS0View<'a> {
+    pub fn new(buffer: &'a DevBuffer, rows: usize, cols: usize) -> Result<Self> {
+        if rows == 0
+            || !rows.is_multiple_of(64)
+            || cols == 0
+            || !cols.is_multiple_of(128)
+        {
+            return Err(ForgeError::Kernel(format!(
+                "NVFP4 S0 N64/K128 wymaga rows % 64 == 0 i cols % 128 == 0; rows={rows}, cols={cols}"
+            )));
+        }
+        let bytes = checked_buffer_bytes("NVFP4 S0 N64/K128", &[rows, cols], 9)?
+            .checked_div(16)
+            .ok_or_else(|| ForgeError::Kernel("NVFP4 S0: niepoprawny rozmiar".into()))?;
+        if buffer.len() != bytes {
+            return Err(ForgeError::Kernel(format!(
+                "NVFP4 S0 N64/K128 wymaga dokładnie {bytes} bajtów, otrzymano {}",
+                buffer.len()
+            )));
+        }
+        Ok(Self { buffer, rows, cols })
+    }
+}
+
+/// Zmierzona specjalizacja projekcji BM16 modelu 4096/11264.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nvfp4CtBm16Projection {
+    Qkv,
+    Output,
+    GateUp,
+    Down,
+}
+
+impl Nvfp4CtBm16Projection {
+    fn shape(self) -> (usize, usize, usize, usize, u32) {
+        match self {
+            Self::Qkv => (6144, 4096, 3, 128, 256),
+            Self::Output => (4096, 4096, 4, 128, 256),
+            Self::GateUp => (22528, 4096, 1, 128, 256),
+            Self::Down => (4096, 11264, 4, 64, 128),
+        }
+    }
+
+    fn kernel_name(self, logical_m: usize) -> Option<&'static str> {
+        match (self, logical_m) {
+            (Self::Qkv, 4) => Some("gemm_nvfp4_ct_bm16_qkv_m4"),
+            (Self::Qkv, 8) => Some("gemm_nvfp4_ct_bm16_qkv_m8"),
+            (Self::Qkv, 16) => Some("gemm_nvfp4_ct_bm16_qkv_m16"),
+            (Self::Output, 4) => Some("gemm_nvfp4_ct_bm16_o_m4"),
+            (Self::Output, 8) => Some("gemm_nvfp4_ct_bm16_o_m8"),
+            (Self::Output, 16) => Some("gemm_nvfp4_ct_bm16_o_m16"),
+            (Self::GateUp, 4) => Some("gemm_nvfp4_ct_bm16_gateup_m4"),
+            (Self::GateUp, 8) => Some("gemm_nvfp4_ct_bm16_gateup_m8"),
+            (Self::GateUp, 16) => Some("gemm_nvfp4_ct_bm16_gateup_m16"),
+            (Self::Down, 4) => Some("gemm_nvfp4_ct_bm16_down_m4"),
+            (Self::Down, 8) => Some("gemm_nvfp4_ct_bm16_down_m8"),
+            (Self::Down, 16) => Some("gemm_nvfp4_ct_bm16_down_m16"),
+            _ => None,
+        }
+    }
+}
+
+const NVFP4_CT_S0_ARTIFACTS: [&str; 24] = [
+    "repack_nvfp4_ct_s0_n64k128_into",
+    "gemv_nvfp4_ct_s0_n64k128_f16",
+    "gemv_batch_nvfp4_ct_s0_n64k128_f16_b4",
+    "gemv_batch_nvfp4_ct_s0_n64k128_f16_b8",
+    "gemv_batch_nvfp4_ct_s0_n64k128_f16_b16",
+    "gemm_nvfp4_ct_s0_f16_bm64",
+    "gemm_nvfp4_ct_s0_f16_bm128",
+    "gemv_norm_nvfp4_ct_s0_f16",
+    "gemv_norm_silu_nvfp4_ct_s0_f16",
+    "gemv_residual_nvfp4_ct_s0_f16",
+    "gemm_nvfp4_ct_bm16_qkv_m4",
+    "gemm_nvfp4_ct_bm16_qkv_m8",
+    "gemm_nvfp4_ct_bm16_qkv_m16",
+    "gemm_nvfp4_ct_bm16_o_m4",
+    "gemm_nvfp4_ct_bm16_o_m8",
+    "gemm_nvfp4_ct_bm16_o_m16",
+    "gemm_nvfp4_ct_bm16_gateup_m4",
+    "gemm_nvfp4_ct_bm16_gateup_m8",
+    "gemm_nvfp4_ct_bm16_gateup_m16",
+    "gemm_nvfp4_ct_bm16_down_m4",
+    "gemm_nvfp4_ct_bm16_down_m8",
+    "gemm_nvfp4_ct_bm16_down_m16",
+    "reduce_nvfp4_ct_bm16",
+    "pack_nvfp4_ct_s0_fp8",
+];
+
+fn nvfp4_ct_split_pipeline_supported(
+    total_stages: usize,
+    parts: usize,
+    pipeline_stages: usize,
+) -> bool {
+    if total_stages == 0 || parts == 0 || pipeline_stages == 0 {
+        return false;
+    }
+    let span = total_stages.div_ceil(parts);
+    let Some(last_start) = (parts - 1).checked_mul(span) else {
+        return false;
+    };
+    last_start < total_stages && total_stages - last_start >= pipeline_stages
+}
+
+fn nvfp4_ct_s0_manual_capable(
+    vendor: forge_types::Vendor,
+    arch: &str,
+    warp_size: u32,
+    max_threads_per_block: u32,
+    mut has: impl FnMut(&str) -> bool,
+) -> bool {
+    let sm = arch
+        .strip_prefix("sm_")
+        .and_then(|value| value.parse::<u32>().ok());
+    vendor == forge_types::Vendor::Nvidia
+        && sm.is_some_and(|value| value >= 80)
+        && warp_size == 32
+        && max_threads_per_block >= 256
+        && NVFP4_CT_S0_ARTIFACTS.iter().all(|name| has(name))
+}
 
 #[allow(clippy::too_many_arguments)]
-fn validate_attn_verify_segmented_f16_hd256(
+fn validate_nvfp4_ct_repack_extents(
+    target_bytes: usize,
+    packed_bytes: usize,
+    scale_bytes: usize,
+    physical_rows: usize,
+    cols: usize,
+    source_rows: usize,
+    target_row_offset: usize,
+) -> Result<u32> {
+    if physical_rows == 0
+        || !physical_rows.is_multiple_of(64)
+        || source_rows == 0
+        || !source_rows.is_multiple_of(64)
+        || !target_row_offset.is_multiple_of(64)
+        || cols == 0
+        || !cols.is_multiple_of(128)
+    {
+        return Err(ForgeError::Kernel(
+            "repack NVFP4 CT wymaga pełnych kafli N64/K128".into(),
+        ));
+    }
+    let target_end = target_row_offset
+        .checked_add(source_rows)
+        .ok_or_else(|| ForgeError::Kernel("repack NVFP4 CT: przepełnienie zakresu".into()))?;
+    if target_end > physical_rows {
+        return Err(ForgeError::Kernel(
+            "repack NVFP4 CT: chunk wykracza poza resident".into(),
+        ));
+    }
+    let required_target =
+        checked_buffer_bytes("repack NVFP4 CT target", &[physical_rows, cols], 9)? / 16;
+    let required_packed =
+        checked_buffer_bytes("repack NVFP4 CT packed", &[source_rows, cols], 1)? / 2;
+    let required_scales =
+        checked_buffer_bytes("repack NVFP4 CT scales", &[source_rows, cols], 1)? / 16;
+    if target_bytes != required_target
+        || packed_bytes < required_packed
+        || scale_bytes < required_scales
+    {
+        return Err(ForgeError::Kernel(
+            "repack NVFP4 CT: niezgodny rozmiar bufora".into(),
+        ));
+    }
+    let stages = (source_rows / 64)
+        .checked_mul(cols / 128)
+        .ok_or_else(|| ForgeError::Kernel("repack NVFP4 CT: przepełnienie siatki".into()))?;
+    u32::try_from(stages)
+        .map_err(|_| ForgeError::Kernel("repack NVFP4 CT: siatka przekracza u32".into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_nvfp4_ct_b1_extents(
+    output_bytes: usize,
+    input_bytes: usize,
+    physical_rows: usize,
+    cols: usize,
+    source_row_offset: usize,
+    rows: usize,
+    inv_global_scale: f32,
+) -> Result<u32> {
+    if rows == 0
+        || !rows.is_multiple_of(64)
+        || !source_row_offset.is_multiple_of(64)
+        || !inv_global_scale.is_finite()
+    {
+        return Err(ForgeError::Kernel(
+            "decode NVFP4 CT wymaga wyrównanego okna N64 i skończonej skali".into(),
+        ));
+    }
+    let source_end = source_row_offset
+        .checked_add(rows)
+        .ok_or_else(|| ForgeError::Kernel("decode NVFP4 CT: przepełnienie zakresu".into()))?;
+    let required_output = checked_buffer_bytes("decode NVFP4 CT output", &[rows], 2)?;
+    let required_input = checked_buffer_bytes("decode NVFP4 CT input", &[cols], 2)?;
+    if source_end > physical_rows
+        || output_bytes < required_output
+        || input_bytes < required_input
+    {
+        return Err(ForgeError::Kernel(
+            "decode NVFP4 CT: okno lub bufor nie pasuje do widoku".into(),
+        ));
+    }
+    u32::try_from(rows.div_ceil(8))
+        .map_err(|_| ForgeError::Kernel("decode NVFP4 CT: siatka przekracza u32".into()))
+}
+
+/// Fizyczny układ macierzy stanu Gated-DeltaNet na urządzeniu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaStateLayout {
+    KeyValue,
+    ValueKey,
+}
+
+fn delta_state_layout_dispatch(
+    d_state: usize,
+    warp_size: u32,
+    max_threads_per_block: u32,
+    complete_artifacts: bool,
+) -> DeltaStateLayout {
+    if d_state == 128
+        && warp_size > 0
+        && 128u32.is_multiple_of(warp_size)
+        && warp_size
+            .checked_mul(4)
+            .is_some_and(|threads| threads <= max_threads_per_block)
+        && complete_artifacts
+    {
+        DeltaStateLayout::ValueKey
+    } else {
+        DeltaStateLayout::KeyValue
+    }
+}
+
+fn has_delta_value_key_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
+    [
+        "deltanet_value_key_scan_inplace_f16",
+        "deltanet_value_key_scan_checkpoints_f16",
+        "deltanet_value_key_commit_recompute_f32",
+        "deltanet_value_key_scan_persistent_f16",
+    ]
+    .into_iter()
+    .all(&mut has)
+}
+
+fn validate_f32_byte_offset(name: &str, byte_offset: usize) -> Result<()> {
+    if !byte_offset.is_multiple_of(std::mem::align_of::<f32>()) {
+        return Err(ForgeError::Kernel(format!(
+            "{name}: offset {byte_offset} nie jest wyrównany do f32"
+        )));
+    }
+    Ok(())
+}
+
+/// Jedna projekcja Q8_0 korzystająca ze wspólnej przygotowanej aktywacji Q8_1.
+pub struct Q8PreparedProjection<'a> {
+    pub output: &'a DevBuffer,
+    pub weights: &'a DevBuffer,
+    pub weight_byte_offset: usize,
+    pub rows: usize,
+}
+
+/// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
+const ATTN_BLOCK: u32 = 128;
+const ATTN_HD256_BLOCK: u32 = 256;
+const ATTN_HD256_SPLITS: usize = 8;
+const ATTN_HD256_PARTIAL_STRIDE: usize = 260;
+
+fn verify_attn_split8_enabled(value: Option<&str>) -> bool {
+    matches!(value, None | Some("auto") | Some("1"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_attn_verify_split8(
+    output_bytes: usize,
+    parts_bytes: usize,
+    q_bytes: usize,
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    page_table_bytes: usize,
+    seq_lens_bytes: usize,
+    n_tokens: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    page_size: usize,
+    max_pages: usize,
+    scale: f32,
+) -> Result<(u32, u32)> {
+    if !matches!(n_tokens, 3 | 4)
+        || n_q_heads == 0
+        || n_kv_heads == 0
+        || !n_q_heads.is_multiple_of(n_kv_heads)
+        || page_size == 0
+        || max_pages == 0
+        || !scale.is_finite()
+    {
+        return Err(ForgeError::Kernel(
+            "niepoprawny kształt split8 verifiera".into(),
+        ));
+    }
+    let checked_bytes = |dims: &[usize], element_bytes: usize| {
+        dims.iter()
+            .try_fold(element_bytes, |value, &dim| value.checked_mul(dim))
+    };
+    let needed_out = checked_bytes(&[n_tokens, n_q_heads, 256], 2);
+    let needed_parts = checked_bytes(&[n_tokens, n_q_heads, 8, 260], 4);
+    let needed_cache = checked_bytes(&[max_pages, n_kv_heads, page_size, 256], 2);
+    let needed_pages = max_pages.checked_mul(4);
+    let needed_lens = n_tokens.checked_mul(4);
+    if needed_out.is_none_or(|v| output_bytes < v || q_bytes < v)
+        || needed_parts.is_none_or(|v| parts_bytes < v)
+        || needed_cache.is_none_or(|v| k_cache_bytes < v || v_cache_bytes < v)
+        || needed_pages.is_none_or(|v| page_table_bytes < v)
+        || needed_lens.is_none_or(|v| seq_lens_bytes < v)
+    {
+        return Err(ForgeError::Kernel(
+            "niepoprawny extent split8 verifiera".into(),
+        ));
+    }
+    let grid_y = u32::try_from(n_q_heads)
+        .map_err(|_| ForgeError::Kernel("liczba głów split8 przekracza u32".into()))?;
+    let combine_grid_y = n_tokens
+        .checked_mul(n_q_heads)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| ForgeError::Kernel("grid combine split8 przekracza u32".into()))?;
+    Ok((grid_y, combine_grid_y))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttnDecodePlan {
+    Generic(&'static str),
+    Split8Hd256,
+}
+
+fn attn_decode_plan(
+    head_dim: usize,
+    vendor: forge_types::Vendor,
+    warp_size: u32,
+    max_threads: u32,
+    split8_available: bool,
+) -> Result<AttnDecodePlan> {
+    match head_dim {
+        64 => Ok(AttnDecodePlan::Generic("attn_decode_f16_hd64")),
+        128 => Ok(AttnDecodePlan::Generic("attn_decode_f16_hd128")),
+        256 if vendor == forge_types::Vendor::Nvidia
+            && warp_size == 32
+            && max_threads >= ATTN_HD256_BLOCK
+            && split8_available =>
+        {
+            Ok(AttnDecodePlan::Split8Hd256)
+        }
+        256 => Ok(AttnDecodePlan::Generic("attn_decode_f16_hd256")),
+        other => Err(ForgeError::Unsupported(format!(
+            "attn_decode: head_dim {other} has no compiled specialization"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_attn_decode_f16(
+    output_bytes: usize,
+    parts_bytes: usize,
+    q_bytes: usize,
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    page_table_bytes: usize,
+    seq_lens_bytes: usize,
+    n_seqs: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+    max_pages: usize,
+    scale: f32,
+    split8: bool,
+) -> Result<(u32, u32)> {
+    if [
+        n_seqs, n_q_heads, n_kv_heads, head_dim, page_size, max_pages,
+    ]
+    .contains(&0)
+        || !scale.is_finite()
+    {
+        return Err(ForgeError::Kernel(
+            "attention decode wymaga niezerowych wymiarów i skończonej skali".into(),
+        ));
+    }
+    if !n_q_heads.is_multiple_of(n_kv_heads) {
+        return Err(ForgeError::Kernel(
+            "liczba głowic Q attention decode musi być wielokrotnością głowic KV".into(),
+        ));
+    }
+    let vectors = checked_buffer_bytes(
+        "attention decode Q/output",
+        &[n_seqs, n_q_heads, head_dim],
+        2,
+    )?;
+    let page_table = checked_buffer_bytes("attention decode page table", &[n_seqs, max_pages], 4)?;
+    let seq_lens = checked_buffer_bytes("attention decode seq_lens", &[n_seqs], 4)?;
+    let cache_page = checked_buffer_bytes(
+        "attention decode strona KV",
+        &[n_kv_heads, page_size, head_dim],
+        2,
+    )?;
+    let _context_capacity = max_pages.checked_mul(page_size).ok_or_else(|| {
+        ForgeError::Kernel("attention decode: przepełnienie pojemności kontekstu".into())
+    })?;
+    if output_bytes < vectors
+        || q_bytes < vectors
+        || page_table_bytes < page_table
+        || seq_lens_bytes < seq_lens
+        || k_cache_bytes < cache_page
+        || v_cache_bytes < cache_page
+        || k_cache_bytes != v_cache_bytes
+        || !k_cache_bytes.is_multiple_of(cache_page)
+    {
+        return Err(ForgeError::Kernel(
+            "attention decode ma za mały lub niezgodny bufor".into(),
+        ));
+    }
+    if split8 {
+        let required_parts = checked_buffer_bytes(
+            "attention decode scratch HD256",
+            &[
+                n_seqs,
+                n_q_heads,
+                ATTN_HD256_SPLITS,
+                ATTN_HD256_PARTIAL_STRIDE,
+            ],
+            4,
+        )?;
+        if parts_bytes < required_parts {
+            return Err(ForgeError::Kernel(format!(
+                "scratch attention HD256 ma {parts_bytes} B, wymagane {required_parts} B"
+            )));
+        }
+    }
+    for (name, value) in [
+        ("liczba sekwencji", n_seqs),
+        ("liczba głowic Q", n_q_heads),
+        ("liczba głowic KV", n_kv_heads),
+        ("head_dim", head_dim),
+        ("rozmiar strony", page_size),
+        ("maksymalna liczba stron", max_pages),
+    ] {
+        i64::try_from(value)
+            .map_err(|_| ForgeError::Kernel(format!("attention decode: {name} przekracza i64")))?;
+    }
+    let grid_x = u32::try_from(n_seqs)
+        .map_err(|_| ForgeError::Kernel("attention decode: grid.x przekracza u32".into()))?;
+    let grid_y = u32::try_from(n_q_heads)
+        .map_err(|_| ForgeError::Kernel("attention decode: grid.y przekracza u32".into()))?;
+    Ok((grid_x, grid_y))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_attn_prefill_segmented_f16(
     output_bytes: usize,
     q_bytes: usize,
     k_cache_bytes: usize,
@@ -37,10 +548,15 @@ fn validate_attn_verify_segmented_f16_hd256(
     n_tokens: usize,
     n_q_heads: usize,
     n_kv_heads: usize,
+    head_dim: usize,
     page_size: usize,
     max_pages: usize,
 ) -> Result<(u32, u32)> {
-    if [batch, n_tokens, n_q_heads, n_kv_heads, page_size, max_pages].contains(&0) {
+    if [
+        batch, n_tokens, n_q_heads, n_kv_heads, head_dim, page_size, max_pages,
+    ]
+    .contains(&0)
+    {
         return Err(ForgeError::Kernel(
             "segmentowana atencja verifiera wymaga niezerowych wymiarów".into(),
         ));
@@ -50,12 +566,17 @@ fn validate_attn_verify_segmented_f16_hd256(
             "liczba głowic Q segmentowanej atencji musi być wielokrotnością głowic KV".into(),
         ));
     }
+    if !matches!(head_dim, 128 | 256) {
+        return Err(ForgeError::Kernel(format!(
+            "segmentowana atencja obsługuje head_dim 128 albo 256, otrzymano {head_dim}"
+        )));
+    }
     let total = batch
         .checked_mul(n_tokens)
         .ok_or_else(|| ForgeError::Kernel("przepełnienie liczby tokenów atencji".into()))?;
     let query_bytes = checked_buffer_bytes(
         "segmentowana atencja query/output",
-        &[total, n_q_heads, 256],
+        &[total, n_q_heads, head_dim],
         2,
     )?;
     let required_page_table_bytes =
@@ -64,7 +585,7 @@ fn validate_attn_verify_segmented_f16_hd256(
         checked_buffer_bytes("segmentowana atencja visible lengths", &[total], 4)?;
     let cache_page_bytes = checked_buffer_bytes(
         "segmentowana atencja strona KV",
-        &[n_kv_heads, page_size, 256],
+        &[n_kv_heads, page_size, head_dim],
         2,
     )?;
     if output_bytes < query_bytes
@@ -97,6 +618,79 @@ fn validate_attn_verify_segmented_f16_hd256(
     Ok((grid_x, grid_y))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_attn_prefill_fa_f16_hd256(
+    output_bytes: usize,
+    q_bytes: usize,
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    page_table_bytes: usize,
+    base_position: usize,
+    n_tokens: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    page_size: usize,
+    scale: f32,
+) -> Result<(u32, u32)> {
+    if [n_tokens, n_q_heads, n_kv_heads, page_size].contains(&0) || !scale.is_finite() {
+        return Err(ForgeError::Kernel(
+            "flash attention prefill wymaga poprawnych niezerowych wymiarów i skali".into(),
+        ));
+    }
+    if !n_q_heads.is_multiple_of(n_kv_heads) {
+        return Err(ForgeError::Kernel(
+            "liczba głowic Q flash attention musi być wielokrotnością głowic KV".into(),
+        ));
+    }
+    let query_bytes = checked_buffer_bytes(
+        "flash attention query/output",
+        &[n_tokens, n_q_heads, 256],
+        2,
+    )?;
+    let cache_page_bytes = checked_buffer_bytes(
+        "flash attention strona KV",
+        &[n_kv_heads, page_size, 256],
+        2,
+    )?;
+    let cache_pages = k_cache_bytes / cache_page_bytes;
+    let page_table_entries = page_table_bytes / 4;
+    let end_position = base_position.checked_add(n_tokens).ok_or_else(|| {
+        ForgeError::Kernel("flash attention prefill: przepełnienie base + T".into())
+    })?;
+    let required_pages = end_position.div_ceil(page_size);
+    if output_bytes < query_bytes
+        || q_bytes < query_bytes
+        || k_cache_bytes < cache_page_bytes
+        || v_cache_bytes < cache_page_bytes
+        || k_cache_bytes != v_cache_bytes
+        || !k_cache_bytes.is_multiple_of(cache_page_bytes)
+        || page_table_bytes < 4
+        || !page_table_bytes.is_multiple_of(4)
+        || required_pages > page_table_entries
+        || required_pages > cache_pages
+    {
+        return Err(ForgeError::Kernel(
+            "flash attention prefill ma za mały lub niezgodny bufor".into(),
+        ));
+    }
+    for (name, value) in [
+        ("T", n_tokens),
+        ("głowice Q", n_q_heads),
+        ("głowice KV", n_kv_heads),
+        ("rozmiar strony", page_size),
+        ("pozycja bazowa", base_position),
+        ("pozycja końcowa", end_position),
+    ] {
+        i64::try_from(value)
+            .map_err(|_| ForgeError::Kernel(format!("{name} flash attention przekracza i64")))?;
+    }
+    let tokens = u32::try_from(n_tokens)
+        .map_err(|_| ForgeError::Kernel("liczba tokenów flash attention przekracza u32".into()))?;
+    let heads = u32::try_from(n_q_heads)
+        .map_err(|_| ForgeError::Kernel("liczba głowic flash attention przekracza u32".into()))?;
+    Ok((tokens.div_ceil(64), heads))
+}
+
 /// Per-block logits slice of the sampling kernels (SAMPLE_CHUNK in
 /// sampling.mojo — staged in shared memory by topk_partial_f32).
 const SAMPLE_CHUNK: usize = 4096;
@@ -121,6 +715,59 @@ fn checked_buffer_bytes(name: &str, dimensions: &[usize], element_bytes: usize) 
 }
 
 #[allow(clippy::too_many_arguments)]
+fn validate_deltanet_gated_step_f16(
+    out_bytes: usize,
+    state_bytes: usize,
+    q_bytes: usize,
+    k_bytes: usize,
+    v_bytes: usize,
+    g_bytes: usize,
+    beta_bytes: usize,
+    n_v_heads: usize,
+    d_state: usize,
+    max_threads_per_block: u32,
+) -> Result<(u32, u32)> {
+    if n_v_heads == 0 || d_state == 0 {
+        return Err(ForgeError::Kernel(
+            "deltanet_gated_step wymaga niezerowych wymiarów".into(),
+        ));
+    }
+    if d_state > 1024 || d_state > max_threads_per_block as usize {
+        return Err(ForgeError::Kernel(format!(
+            "deltanet_gated_step: d_state {d_state} przekracza limit bloku {}",
+            max_threads_per_block.min(1024)
+        )));
+    }
+    let grid_x = u32::try_from(n_v_heads).map_err(|_| {
+        ForgeError::Kernel("deltanet_gated_step: liczba głów przekracza u32".into())
+    })?;
+    let block_x = u32::try_from(d_state).map_err(|_| {
+        ForgeError::Kernel("deltanet_gated_step: rozmiar bloku przekracza u32".into())
+    })?;
+    let vector_bytes =
+        checked_buffer_bytes("deltanet_gated_step vectors", &[n_v_heads, d_state], 2)?;
+    let state_required = checked_buffer_bytes(
+        "deltanet_gated_step state",
+        &[n_v_heads, d_state, d_state],
+        4,
+    )?;
+    let gate_bytes = checked_buffer_bytes("deltanet_gated_step gates", &[n_v_heads], 4)?;
+    if out_bytes < vector_bytes
+        || state_bytes < state_required
+        || q_bytes < vector_bytes
+        || k_bytes < vector_bytes
+        || v_bytes < vector_bytes
+        || g_bytes < gate_bytes
+        || beta_bytes < gate_bytes
+    {
+        return Err(ForgeError::Kernel(
+            "deltanet_gated_step: co najmniej jeden bufor jest za mały".into(),
+        ));
+    }
+    Ok((grid_x, block_x))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_kv_append_batch_segmented_masked_f16(
     k_cache_bytes: usize,
     v_cache_bytes: usize,
@@ -136,9 +783,7 @@ fn validate_kv_append_batch_segmented_masked_f16(
     page_size: usize,
     head_dim: usize,
 ) -> Result<(u32, u32, u32)> {
-    if [batch, n_tokens, max_pages, n_kv_heads, page_size, head_dim]
-        .contains(&0)
-    {
+    if [batch, n_tokens, max_pages, n_kv_heads, page_size, head_dim].contains(&0) {
         return Err(ForgeError::Kernel(
             "maskowany segmentowany append KV wymaga niezerowych wymiarów".into(),
         ));
@@ -166,11 +811,8 @@ fn validate_kv_append_batch_segmented_masked_f16(
         &[batch],
         4,
     )?;
-    let required_decision_bytes = checked_buffer_bytes(
-        "maskowany segmentowany append KV decisions",
-        &[batch, 2],
-        4,
-    )?;
+    let required_decision_bytes =
+        checked_buffer_bytes("maskowany segmentowany append KV decisions", &[batch, 2], 4)?;
     if k_input_bytes < input_bytes
         || v_input_bytes < input_bytes
         || page_table_bytes < required_page_table_bytes
@@ -181,8 +823,7 @@ fn validate_kv_append_batch_segmented_masked_f16(
         || !k_cache_bytes.is_multiple_of(cache_page_bytes)
     {
         return Err(ForgeError::Kernel(
-            "maskowany segmentowany append KV ma bufor mniejszy lub niezgodny z układem F16"
-                .into(),
+            "maskowany segmentowany append KV ma bufor mniejszy lub niezgodny z układem F16".into(),
         ));
     }
     for (name, value) in [
@@ -210,6 +851,84 @@ fn validate_kv_append_batch_segmented_masked_f16(
     Ok((grid_x, grid_y, block))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_kv_append_batch_segmented_f16(
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    k_input_bytes: usize,
+    v_input_bytes: usize,
+    page_table_bytes: usize,
+    base_position_bytes: usize,
+    batch: usize,
+    n_tokens: usize,
+    max_pages: usize,
+    n_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+    max_threads_per_block: u32,
+) -> Result<(u32, u32, u32)> {
+    if [batch, n_tokens, max_pages, n_kv_heads, page_size, head_dim].contains(&0) {
+        return Err(ForgeError::Kernel(
+            "segmentowany append KV wymaga niezerowych wymiarów".into(),
+        ));
+    }
+    let total = batch.checked_mul(n_tokens).ok_or_else(|| {
+        ForgeError::Kernel("przepełnienie liczby tokenów segmentowanego append KV".into())
+    })?;
+    let input_bytes = checked_buffer_bytes(
+        "segmentowany append KV input",
+        &[total, n_kv_heads, head_dim],
+        2,
+    )?;
+    let cache_page_bytes = checked_buffer_bytes(
+        "segmentowany append KV cache page",
+        &[n_kv_heads, page_size, head_dim],
+        2,
+    )?;
+    let required_page_table_bytes =
+        checked_buffer_bytes("segmentowany append KV page table", &[batch, max_pages], 4)?;
+    let required_base_bytes =
+        checked_buffer_bytes("segmentowany append KV base positions", &[batch], 4)?;
+    if k_input_bytes < input_bytes
+        || v_input_bytes < input_bytes
+        || page_table_bytes < required_page_table_bytes
+        || base_position_bytes < required_base_bytes
+        || k_cache_bytes != v_cache_bytes
+        || k_cache_bytes < cache_page_bytes
+        || !k_cache_bytes.is_multiple_of(cache_page_bytes)
+    {
+        return Err(ForgeError::Kernel(
+            "segmentowany append KV ma bufor mniejszy lub niezgodny z układem F16".into(),
+        ));
+    }
+    for (name, value) in [
+        ("T", n_tokens),
+        ("max_pages", max_pages),
+        ("n_kv_heads", n_kv_heads),
+        ("page_size", page_size),
+        ("head_dim", head_dim),
+    ] {
+        i64::try_from(value).map_err(|_| {
+            ForgeError::Kernel(format!("{name} segmentowanego append KV przekracza i64"))
+        })?;
+    }
+    let grid_x = u32::try_from(total).map_err(|_| {
+        ForgeError::Kernel("liczba tokenów segmentowanego append KV przekracza u32".into())
+    })?;
+    let grid_y = u32::try_from(n_kv_heads).map_err(|_| {
+        ForgeError::Kernel("liczba głów segmentowanego append KV przekracza u32".into())
+    })?;
+    let block = u32::try_from(head_dim)
+        .map_err(|_| ForgeError::Kernel("head_dim append KV przekracza u32".into()))?
+        .clamp(32, 256);
+    if block > max_threads_per_block {
+        return Err(ForgeError::Kernel(format!(
+            "blok segmentowanego append KV {block} przekracza limit urządzenia {max_threads_per_block}"
+        )));
+    }
+    Ok((grid_x, grid_y, block))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Nvfp4GgufDispatch {
     kernel: &'static str,
@@ -218,9 +937,14 @@ struct Nvfp4GgufDispatch {
     block_threads: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nvfp4_gguf_dispatch(
     n_tokens: usize,
     n_rows: usize,
+    n_cols: usize,
+    prefetch_available: bool,
+    sync1_available: bool,
+    bn128_available: bool,
     is_nvidia: bool,
     warp_size: u32,
     max_threads: u32,
@@ -260,6 +984,29 @@ fn nvfp4_gguf_dispatch(
         128 if n_rows == 1024 && is_nvidia && warp_size == 32 => {
             ("gemm_nvfp4_gguf_mma_f16_bm128_bn32", 128, 32, Some(128))
         }
+        _ if n_tokens >= 256
+            && n_tokens.is_multiple_of(128)
+            && bn128_available
+            && is_nvidia
+            && warp_size == 32 =>
+        {
+            ("gemm_nvfp4_gguf_mma_f16_bm128_bn128", 128, 128, Some(256))
+        }
+        128 if sync1_available
+            && !(n_rows == 17408 && n_cols == 5120)
+            && is_nvidia
+            && warp_size == 32 =>
+        {
+            (
+                "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1",
+                128,
+                64,
+                Some(256),
+            )
+        }
+        _ if n_tokens.is_multiple_of(128) && prefetch_available && is_nvidia && warp_size == 32 => {
+            ("gemm_nvfp4_gguf_mma_f16_bm128_prefetch", 128, 64, Some(256))
+        }
         _ if is_nvidia && warp_size == 32 => ("gemm_nvfp4_gguf_mma_f16_bm128", 128, 64, Some(256)),
         _ => {
             return Err(ForgeError::Kernel(format!(
@@ -283,8 +1030,78 @@ fn nvfp4_gguf_dispatch(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn nvfp4_gguf_layout_dispatch(
+    layout: Nvfp4GgufLayout,
+    n_tokens: usize,
+    n_rows: usize,
+    n_cols: usize,
+    prefetch_available: bool,
+    sync1_available: bool,
+    bn128_available: bool,
+    tile_bn64_available: bool,
+    tile_bn128_available: bool,
+    is_nvidia: bool,
+    warp_size: u32,
+    max_threads: u32,
+) -> Result<Nvfp4GgufDispatch> {
+    match layout {
+        Nvfp4GgufLayout::RowMajor36 => nvfp4_gguf_dispatch(
+            n_tokens,
+            n_rows,
+            n_cols,
+            prefetch_available,
+            sync1_available,
+            bn128_available,
+            is_nvidia,
+            warp_size,
+            max_threads,
+        ),
+        Nvfp4GgufLayout::TileN128K64 => {
+            if n_tokens < 2 {
+                return Err(ForgeError::Kernel(
+                    "gemm NVFP4 TileN128K64 wymaga co najmniej dwóch tokenów".into(),
+                ));
+            }
+            if !is_nvidia || warp_size != 32 || max_threads < 256 || !tile_bn64_available {
+                return Err(ForgeError::Unsupported(
+                    "układ NVFP4 TileN128K64 wymaga NVIDIA warp32 i kernela BN64".into(),
+                ));
+            }
+            if n_rows == 0 || !n_rows.is_multiple_of(128) || !n_cols.is_multiple_of(64) {
+                return Err(ForgeError::Kernel(format!(
+                    "układ NVFP4 TileN128K64 wymaga rows % 128 == 0 i cols % 64 == 0; rows={n_rows}, cols={n_cols}"
+                )));
+            }
+            let bn128 = n_tokens >= 256 && tile_bn128_available;
+            Ok(Nvfp4GgufDispatch {
+                kernel: if bn128 {
+                    "gemm_nvfp4_tile128_mma_f16_bm128_bn128"
+                } else {
+                    "gemm_nvfp4_tile128_mma_f16_bm128_bn64"
+                },
+                token_tile: 128,
+                row_tile: if bn128 { 128 } else { 64 },
+                block_threads: 256,
+            })
+        }
+    }
+}
+
 fn raw_nvfp4_dp4a_supported(is_nvidia: bool, warp_size: u32) -> bool {
     is_nvidia && warp_size == 32
+}
+
+fn has_nvfp4_gguf_tile_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
+    [
+        "quantize_act_q8_1",
+        "nvfp4_repack_tile128",
+        "gemv_nvfp4_tile128_coop_q8_1_f16",
+        "gemm_nvfp4_tile128_mma_f16_bm128_bn64",
+        "gemm_nvfp4_tile128_mma_f16_bm128_bn128",
+    ]
+    .iter()
+    .all(|name| has(name))
 }
 
 fn q8_nvfp4_pack_launch(warp_size: u32) -> (usize, u32) {
@@ -302,7 +1119,7 @@ const HYBRID_PREFILL_B2_ARTIFACTS: [&str; 4] = [
     "gemm_q8_0_f16_exact_out_f32_b2",
 ];
 
-const HYBRID_PREFILL_T128_ARTIFACTS: [&str; 10] = [
+const HYBRID_PREFILL_T128_ARTIFACTS: [&str; 11] = [
     "deltanet_gated_scan_inplace_shared_d128_f16",
     "deltanet_gated_scan_inplace_dynamic_d128_f16",
     "gemm_nvfp4_gguf_f16_b2",
@@ -313,7 +1130,80 @@ const HYBRID_PREFILL_T128_ARTIFACTS: [&str; 10] = [
     "gemm_nvfp4_gguf_mma_f16_bm32",
     "gemm_nvfp4_gguf_mma_f16_bm128",
     "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
+    "gemm_q8_0_i8mma_triplet_bm64",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DensePrefillLogitsKind {
+    F16 { rows: usize, cols: usize },
+    Q8_0 { rows: usize, cols: usize },
+    NvFp4Gguf { rows: usize, cols: usize },
+}
+
+fn dense_prefill_backend_capable(
+    vendor: forge_types::Vendor,
+    warp_size: u32,
+    max_threads_per_block: u32,
+) -> bool {
+    matches!(vendor, forge_types::Vendor::Nvidia) && warp_size == 32 && max_threads_per_block >= 256
+}
+
+fn dense_prefill_artifacts_capable(
+    head_dim: usize,
+    batch: usize,
+    logits: DensePrefillLogitsKind,
+    mut has: impl FnMut(&str) -> bool,
+) -> bool {
+    if !matches!(batch, 4 | 8 | 16)
+        || !has("kv_append_batch_segmented_f16")
+        || !has("argmax_batched_f32")
+        || !has("topk_batched_f32")
+        || !has("penalize_batched_f32")
+    {
+        return false;
+    }
+    let attention = match head_dim {
+        128 => "attn_prefill_fa_segmented_f16_hd128",
+        256 => "attn_prefill_segmented_f16_hd256",
+        _ => return false,
+    };
+    if !has(attention) {
+        return false;
+    }
+    match logits {
+        DensePrefillLogitsKind::F16 { rows, cols } => {
+            if rows == 0 || cols < 8 || !cols.is_multiple_of(8) {
+                return false;
+            }
+            let kernel = Kernels::f16_out_f32_dispatch(rows, batch, |name| has(name)).0;
+            has(kernel)
+        }
+        DensePrefillLogitsKind::Q8_0 { rows, cols } => {
+            if rows == 0 || !cols.is_multiple_of(32) {
+                return false;
+            }
+            let kernel = match batch {
+                4 => "gemm_q8_0_f16_exact_out_f32_b4",
+                8 => "gemm_q8_0_f16_exact_out_f32_b8",
+                16 => Kernels::q8_0_out_f32_kernel(rows, batch),
+                _ => return false,
+            };
+            has(kernel)
+        }
+        DensePrefillLogitsKind::NvFp4Gguf { rows, cols } => {
+            if rows == 0 || !cols.is_multiple_of(64) {
+                return false;
+            }
+            let kernel = match batch {
+                4 => "gemm_nvfp4_gguf_out_f32_b4",
+                8 => "gemm_nvfp4_gguf_out_f32_b8",
+                16 => "gemm_nvfp4_gguf_out_f32_b16",
+                _ => return false,
+            };
+            has(kernel)
+        }
+    }
+}
 
 fn has_hybrid_prefill_b2_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
     HYBRID_PREFILL_B2_ARTIFACTS.iter().all(|name| has(name))
@@ -355,7 +1245,7 @@ fn hybrid_prefill_nvfp4_artifact_chunk_limit(
     if !nvidia_warp32 {
         return 16;
     }
-    if !has("gemm_nvfp4_gguf_mma_f16_bm32") {
+    if !has("gemm_nvfp4_gguf_mma_f16_bm32") || !has("gemm_q8_0_i8mma_triplet_bm64") {
         return 16;
     }
     if !has("deltanet_gated_scan_inplace_shared_d128_f16")
@@ -616,6 +1506,15 @@ impl IqTables {
 }
 
 impl Kernels {
+    /// Sprawdza pełny zestaw kerneli układu NVFP4 TileN128K64.
+    pub fn supports_nvfp4_gguf_tile_n128_k64(&self) -> bool {
+        let caps = self.device.caps();
+        matches!(caps.vendor, forge_types::Vendor::Nvidia)
+            && caps.warp_size == 32
+            && caps.max_threads_per_block >= 256
+            && has_nvfp4_gguf_tile_artifacts(|name| self.artifacts.has(name))
+    }
+
     /// Sprawdza komplet artefaktów wymaganych przez ciągły prefill B2 T32.
     pub fn hybrid_prefill_b2_artifacts_capable(&self) -> bool {
         has_hybrid_prefill_b2_artifacts(|name| self.artifacts.has(name))
@@ -632,6 +1531,20 @@ impl Kernels {
         let nvidia_warp32 =
             matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
         hybrid_prefill_nvfp4_artifact_chunk_limit(nvidia_warp32, |name| self.artifacts.has(name))
+    }
+
+    /// Sprawdza pełny backend i artefakty równego dense prefill.
+    pub fn dense_prefill_batch_capable(
+        &self,
+        head_dim: usize,
+        batch: usize,
+        logits: DensePrefillLogitsKind,
+    ) -> bool {
+        let caps = self.device.caps();
+        dense_prefill_backend_capable(caps.vendor, caps.warp_size, caps.max_threads_per_block)
+            && dense_prefill_artifacts_capable(head_dim, batch, logits, |name| {
+                self.artifacts.has(name)
+            })
     }
 
     /// Wyznacza długość zaakceptowanego draftu i token korekty na GPU.
@@ -772,6 +1685,18 @@ impl Kernels {
         self.artifacts.has("pack_nvfp4_fp8") && self.artifacts.has("pack_f16_fp8")
     }
 
+    /// Sprawdza komplet ręcznych artefaktów S0 N64/K128 przed aktywacją loadera.
+    pub fn supports_nvfp4_ct_s0_n64k128_manual(&self) -> bool {
+        let caps = self.device.caps();
+        nvfp4_ct_s0_manual_capable(
+            caps.vendor,
+            &caps.arch,
+            caps.warp_size,
+            caps.max_threads_per_block,
+            |name| self.artifacts.has(name),
+        )
+    }
+
     pub fn supports_fp8_logits(&self) -> bool {
         self.artifacts.has("gemv_fp8_out_f32_v2")
     }
@@ -779,6 +1704,34 @@ impl Kernels {
     pub fn supports_attn_decode_gqa4_f16_hd128(&self) -> bool {
         self.artifacts.has("attn_decode_split_gqa4_f16_hd128")
             && self.artifacts.has("attn_decode_combine_gqa2_f16_hd128")
+    }
+
+    pub fn supports_deltanet_gated_scan_persistent_d128_f16(&self) -> bool {
+        let caps = self.device.caps();
+        caps.vendor == forge_types::Vendor::Nvidia
+            && caps.warp_size == 32
+            && caps.max_threads_per_block >= 64
+            && self
+                .artifacts
+                .has("deltanet_gated_scan_persistent_d128_f16")
+    }
+
+    /// Wybiera układ ValueKey tylko wtedy, gdy cały zestaw operacji jest dostępny.
+    pub fn preferred_delta_state_layout(&self, d_state: usize) -> DeltaStateLayout {
+        let caps = self.device.caps();
+        let complete = has_delta_value_key_artifacts(|name| self.artifacts.has(name));
+        delta_state_layout_dispatch(
+            d_state,
+            caps.warp_size,
+            caps.max_threads_per_block,
+            complete,
+        )
+    }
+
+    pub fn supports_deltanet_prepare_tiled_d128_c4_f16(&self) -> bool {
+        let caps = self.device.caps();
+        caps.max_threads_per_block >= 128
+            && self.artifacts.has("deltanet_prepare_tiled_d128_c4_f16")
     }
 
     pub fn load(device: Arc<dyn Device>) -> Result<Self> {
@@ -1162,15 +2115,22 @@ impl Kernels {
         d_state: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if d_state > 1024 {
-            return Err(ForgeError::Kernel(format!(
-                "deltanet_gated_step: d_state {d_state} exceeds shared staging (1024)"
-            )));
-        }
+        let (grid_x, block_x) = validate_deltanet_gated_step_f16(
+            out.len(),
+            state_io.len(),
+            q.len(),
+            k.len(),
+            v.len(),
+            g.len(),
+            beta.len(),
+            n_v_heads,
+            d_state,
+            self.device.caps().max_threads_per_block,
+        )?;
         let k_art = self.artifacts.get("deltanet_gated_step_f16")?;
         let cfg = LaunchConfig {
-            grid: (n_v_heads as u32, 1, 1),
-            block: (d_state as u32, 1, 1),
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -1320,7 +2280,8 @@ impl Kernels {
         } else {
             args
         };
-        let args = args.scalar(n_k_heads)
+        let args = args
+            .scalar(n_k_heads)
             .scalar(n_v_heads)
             .scalar(d_state)
             .scalar(d_conv)
@@ -1438,7 +2399,8 @@ impl Kernels {
             .ok_or_else(|| ForgeError::Kernel("przepełnienie conv state DeltaNet final".into()))?;
         let vector_bytes = checked_buffer_bytes("DeltaNet final vectors", &[total, value_dim], 2)?;
         let gate_f32_bytes = checked_buffer_bytes("DeltaNet final gates", &[total, n_v_heads], 4)?;
-        let gate_f16_bytes = checked_buffer_bytes("DeltaNet final raw gates", &[total, n_v_heads], 2)?;
+        let gate_f16_bytes =
+            checked_buffer_bytes("DeltaNet final raw gates", &[total, n_v_heads], 2)?;
         let conv_bytes = checked_buffer_bytes("DeltaNet final conv", &[batch, conv_elems], 2)?;
         let mixed_bytes = checked_buffer_bytes("DeltaNet final mixed", &[total, conv_dim], 2)?;
         let conv_weight_bytes =
@@ -1500,6 +2462,116 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
+    /// Przygotowuje pojedynczy prefiks DeltaNet D128/C4 w kaflach czasu T32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_prepare_tiled_d128_c4_f16(
+        &self,
+        q_out: &DevBuffer,
+        k_out: &DevBuffer,
+        v_out: &DevBuffer,
+        g_out: &DevBuffer,
+        beta_out: &DevBuffer,
+        conv_final: &DevBuffer,
+        conv_initial: &DevBuffer,
+        qkv_mixed: &DevBuffer,
+        conv_weight: &DevBuffer,
+        alpha_raw: &DevBuffer,
+        beta_raw: &DevBuffer,
+        dt_bias: &DevBuffer,
+        a_scale: &DevBuffer,
+        n_steps: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if [n_steps, n_k_heads, n_v_heads].contains(&0)
+            || !n_v_heads.is_multiple_of(n_k_heads)
+            || !eps.is_finite()
+            || !self.supports_deltanet_prepare_tiled_d128_c4_f16()
+        {
+            return Err(ForgeError::Unsupported(
+                "kafelkowane przygotowanie DeltaNet wymaga D128/C4 i poprawnych wymiarów".into(),
+            ));
+        }
+        let conv_dim = n_k_heads
+            .checked_mul(2)
+            .and_then(|heads| heads.checked_add(n_v_heads))
+            .and_then(|heads| heads.checked_mul(128))
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie conv_dim DeltaNet tiled".into()))?;
+        let value_dim = n_v_heads
+            .checked_mul(128)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie value_dim DeltaNet tiled".into()))?;
+        let vector_bytes =
+            checked_buffer_bytes("DeltaNet tiled vectors", &[n_steps, value_dim], 2)?;
+        let gate_f32_bytes =
+            checked_buffer_bytes("DeltaNet tiled gates", &[n_steps, n_v_heads], 4)?;
+        let gate_f16_bytes =
+            checked_buffer_bytes("DeltaNet tiled raw gates", &[n_steps, n_v_heads], 2)?;
+        let conv_state_bytes =
+            checked_buffer_bytes("DeltaNet tiled conv state", &[conv_dim, 3], 2)?;
+        let mixed_bytes = checked_buffer_bytes("DeltaNet tiled mixed", &[n_steps, conv_dim], 2)?;
+        let conv_weight_bytes =
+            checked_buffer_bytes("DeltaNet tiled conv weight", &[conv_dim, 4], 2)?;
+        let parameter_bytes = checked_buffer_bytes("DeltaNet tiled parameters", &[n_v_heads], 2)?;
+        if q_out.len() < vector_bytes
+            || k_out.len() < vector_bytes
+            || v_out.len() < vector_bytes
+            || g_out.len() < gate_f32_bytes
+            || beta_out.len() < gate_f32_bytes
+            || conv_final.len() < conv_state_bytes
+            || conv_initial.len() < conv_state_bytes
+            || qkv_mixed.len() < mixed_bytes
+            || conv_weight.len() < conv_weight_bytes
+            || alpha_raw.len() < gate_f16_bytes
+            || beta_raw.len() < gate_f16_bytes
+            || dt_bias.len() < parameter_bytes
+            || a_scale.len() < parameter_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "kafelkowane przygotowanie DeltaNet ma za mały bufor".into(),
+            ));
+        }
+        let grid_heads = n_k_heads
+            .checked_add(n_v_heads)
+            .ok_or_else(|| ForgeError::Kernel("DeltaNet tiled grid.x przepełniony".into()))?;
+        let grid_x = u32::try_from(grid_heads)
+            .map_err(|_| ForgeError::Kernel("DeltaNet tiled grid.x przekracza u32".into()))?;
+        let steps = u32::try_from(n_steps)
+            .map_err(|_| ForgeError::Kernel("DeltaNet tiled T przekracza u32".into()))?;
+        for value in [n_steps, n_k_heads, n_v_heads] {
+            i64::try_from(value)
+                .map_err(|_| ForgeError::Kernel("wymiar DeltaNet tiled przekracza i64".into()))?;
+        }
+        let kernel = self.artifacts.get("deltanet_prepare_tiled_d128_c4_f16")?;
+        let config = LaunchConfig {
+            grid: (grid_x, steps.div_ceil(32), 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(q_out)
+            .buf(k_out)
+            .buf(v_out)
+            .buf(g_out)
+            .buf(beta_out)
+            .buf(conv_final)
+            .buf(conv_initial)
+            .buf(qkv_mixed)
+            .buf(conv_weight)
+            .buf(alpha_raw)
+            .buf(beta_raw)
+            .buf(dt_bias)
+            .buf(a_scale)
+            .scalar(i64::try_from(n_steps).expect("T sprawdzone przez validator"))
+            .scalar(i64::try_from(n_k_heads).expect("głowice K sprawdzone przez validator"))
+            .scalar(i64::try_from(n_v_heads).expect("głowice V sprawdzone przez validator"))
+            .scalar(128i64)
+            .scalar(4i64)
+            .scalar(eps);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Skanuje niezależne stany D128 dla segmentów `[B,T]`.
     #[allow(clippy::too_many_arguments)]
     pub fn deltanet_gated_scan_segmented_d128_f16(
@@ -1524,9 +2596,11 @@ impl Kernels {
             ));
         }
         let tile_width = 64usize.min(self.device.caps().max_threads_per_block as usize);
-        let grid_x = n_v_heads.checked_mul(d_state.div_ceil(tile_width)).ok_or_else(|| {
-            ForgeError::Kernel("przepełnienie siatki segmentowanego skanu DeltaNet".into())
-        })?;
+        let grid_x = n_v_heads
+            .checked_mul(d_state.div_ceil(tile_width))
+            .ok_or_else(|| {
+                ForgeError::Kernel("przepełnienie siatki segmentowanego skanu DeltaNet".into())
+            })?;
         let kernel = self
             .artifacts
             .get("deltanet_gated_scan_segmented_d128_f16")?;
@@ -1604,8 +2678,9 @@ impl Kernels {
         let grid_x = n_v_heads.checked_mul(2).ok_or_else(|| {
             ForgeError::Kernel("przepełnienie siatki współdzielonego skanu".into())
         })?;
-        let grid_x = u32::try_from(grid_x)
-            .map_err(|_| ForgeError::Kernel("siatka współdzielonego skanu przekracza u32".into()))?;
+        let grid_x = u32::try_from(grid_x).map_err(|_| {
+            ForgeError::Kernel("siatka współdzielonego skanu przekracza u32".into())
+        })?;
         let grid_y = u32::try_from(batch)
             .map_err(|_| ForgeError::Kernel("batch współdzielonego skanu przekracza u32".into()))?;
         for (name, value) in [("T", n_steps), ("H", n_v_heads), ("D", d_state)] {
@@ -1771,9 +2846,10 @@ impl Kernels {
         d_state: usize,
         stream: &Stream,
     ) -> Result<()> {
+        validate_f32_byte_offset("deltanet_gated_scan", checkpoint_byte_offset)?;
         let caps = self.device.caps();
-        let dynamic_tiled = std::env::var("FORGE_DELTANET_SCAN_TILED")
-            .map_or(true, |value| value != "0");
+        let dynamic_tiled =
+            std::env::var("FORGE_DELTANET_SCAN_TILED").map_or(true, |value| value != "0");
         let tiled = d_state <= 128
             && (matches!(n_steps, 3 | 4) || (n_steps != 2 && dynamic_tiled))
             && caps.warp_size > 0
@@ -1787,7 +2863,11 @@ impl Kernels {
             (4, false) => "deltanet_gated_scan_t4_f16",
             (1 | 5.., true) => "deltanet_gated_scan_dynamic_d128_f16",
             (1.., false) => "deltanet_gated_scan_dynamic_f16",
-            _ => return Err(ForgeError::Kernel("deltanet_gated_scan wymaga T > 0".into())),
+            _ => {
+                return Err(ForgeError::Kernel(
+                    "deltanet_gated_scan wymaga T > 0".into(),
+                ))
+            }
         };
         if n_v_heads == 0 || d_state == 0 || d_state > 1024 {
             return Err(ForgeError::Kernel(format!(
@@ -1867,8 +2947,7 @@ impl Kernels {
         } else {
             args
         };
-        let args = args.scalar(n_v_heads as i64)
-            .scalar(d_state as i64);
+        let args = args.scalar(n_v_heads as i64).scalar(d_state as i64);
         self.device.launch(k_art, &cfg, &args, stream)
     }
 
@@ -1883,6 +2962,28 @@ impl Kernels {
         v: &DevBuffer,
         g: &DevBuffer,
         beta: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.deltanet_gated_scan_inplace_f16_at(
+            out, state_io, q, k, v, g, beta, 0, n_steps, n_v_heads, d_state, stream,
+        )
+    }
+
+    /// Wykonuje fragment skanu na wierszach większych macierzy token-major.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_scan_inplace_f16_at(
+        &self,
+        out: &DevBuffer,
+        state_io: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        token_offset: usize,
         n_steps: usize,
         n_v_heads: usize,
         d_state: usize,
@@ -1906,20 +3007,34 @@ impl Kernels {
             &[n_steps, n_v_heads, d_state],
             2,
         )?;
-        let state_bytes = checked_buffer_bytes(
-            "in-place DeltaNet state",
-            &[n_v_heads, d_state, d_state],
+        let state_bytes =
+            checked_buffer_bytes("in-place DeltaNet state", &[n_v_heads, d_state, d_state], 4)?;
+        let gate_bytes = checked_buffer_bytes("in-place DeltaNet gates", &[n_steps, n_v_heads], 4)?;
+        let vector_byte_offset = checked_buffer_bytes(
+            "in-place DeltaNet vector offset",
+            &[token_offset, n_v_heads, d_state],
+            2,
+        )?;
+        let gate_byte_offset = checked_buffer_bytes(
+            "in-place DeltaNet gate offset",
+            &[token_offset, n_v_heads],
             4,
         )?;
-        let gate_bytes =
-            checked_buffer_bytes("in-place DeltaNet gates", &[n_steps, n_v_heads], 4)?;
-        if out.len() < vector_bytes
+        let vector_end = vector_byte_offset
+            .checked_add(vector_bytes)
+            .ok_or_else(|| {
+                ForgeError::Kernel("in-place DeltaNet: przepełnienie zakresu wektorów".into())
+            })?;
+        let gate_end = gate_byte_offset.checked_add(gate_bytes).ok_or_else(|| {
+            ForgeError::Kernel("in-place DeltaNet: przepełnienie zakresu bramek".into())
+        })?;
+        if out.len() < vector_end
             || state_io.len() < state_bytes
-            || q.len() < vector_bytes
-            || k.len() < vector_bytes
-            || v.len() < vector_bytes
-            || g.len() < gate_bytes
-            || beta.len() < gate_bytes
+            || q.len() < vector_end
+            || k.len() < vector_end
+            || v.len() < vector_end
+            || g.len() < gate_end
+            || beta.len() < gate_end
         {
             return Err(ForgeError::Kernel(
                 "in-place DeltaNet: co najmniej jeden bufor jest za mały".into(),
@@ -1946,6 +3061,159 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
+            .buf_at(out, vector_byte_offset)?
+            .buf(state_io)
+            .buf_at(q, vector_byte_offset)?
+            .buf_at(k, vector_byte_offset)?
+            .buf_at(v, vector_byte_offset)?
+            .buf_at(g, gate_byte_offset)?
+            .buf_at(beta, gate_byte_offset)?
+            .scalar(n_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Skanuje stan ValueKey `[B,H,value,key]`, zapisując wyłącznie stan końcowy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_value_key_scan_inplace_f16(
+        &self,
+        out: &DevBuffer,
+        state_out: &DevBuffer,
+        state_in: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_sequences: usize,
+        n_steps: usize,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let d_state = 128usize;
+        if self.preferred_delta_state_layout(d_state) != DeltaStateLayout::ValueKey
+            || n_sequences == 0
+            || n_steps == 0
+            || n_v_heads == 0
+        {
+            return Err(ForgeError::Unsupported(
+                "skan ValueKey wymaga kompletnego backendu d128 i niezerowych wymiarów".into(),
+            ));
+        }
+        let vector_bytes = checked_buffer_bytes(
+            "ValueKey vectors",
+            &[n_sequences, n_steps, n_v_heads, d_state],
+            2,
+        )?;
+        let state_bytes = checked_buffer_bytes(
+            "ValueKey state",
+            &[n_sequences, n_v_heads, d_state, d_state],
+            4,
+        )?;
+        let gate_bytes =
+            checked_buffer_bytes("ValueKey gates", &[n_sequences, n_steps, n_v_heads], 4)?;
+        if out.len() < vector_bytes
+            || state_out.len() < state_bytes
+            || state_in.len() < state_bytes
+            || q.len() < vector_bytes
+            || k.len() < vector_bytes
+            || v.len() < vector_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "skan ValueKey otrzymał za mały bufor".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        let block = caps.warp_size * 4;
+        let grid = n_v_heads
+            .checked_mul(32)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ForgeError::Kernel("siatka ValueKey przekracza u32".into()))?;
+        let sequences = u32::try_from(n_sequences)
+            .map_err(|_| ForgeError::Kernel("batch ValueKey przekracza u32".into()))?;
+        let kernel = self.artifacts.get("deltanet_value_key_scan_inplace_f16")?;
+        let config = LaunchConfig {
+            grid: (grid, sequences, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(state_out)
+            .buf(state_in)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(n_sequences as i64)
+            .scalar(n_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Skanuje długi prefill ValueKey z dwiema kolumnami przypisanymi do warpa.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_value_key_scan_persistent_f16(
+        &self,
+        out: &DevBuffer,
+        state_io: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let d_state = 128usize;
+        if self.preferred_delta_state_layout(d_state) != DeltaStateLayout::ValueKey
+            || n_steps == 0
+            || n_v_heads == 0
+        {
+            return Err(ForgeError::Unsupported(
+                "persistent ValueKey wymaga kompletnego backendu d128".into(),
+            ));
+        }
+        let vector_bytes =
+            checked_buffer_bytes("persistent ValueKey vectors", &[n_steps, n_v_heads, 128], 2)?;
+        let state_bytes =
+            checked_buffer_bytes("persistent ValueKey state", &[n_v_heads, 128, 128], 4)?;
+        let gate_bytes =
+            checked_buffer_bytes("persistent ValueKey gates", &[n_steps, n_v_heads], 4)?;
+        if out.len() < vector_bytes
+            || state_io.len() < state_bytes
+            || q.len() < vector_bytes
+            || k.len() < vector_bytes
+            || v.len() < vector_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "persistent ValueKey otrzymał za mały bufor".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        let grid = n_v_heads
+            .checked_mul(32)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                ForgeError::Kernel("siatka persistent ValueKey przekracza u32".into())
+            })?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_value_key_scan_persistent_f16")?;
+        let config = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (caps.warp_size * 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
             .buf(out)
             .buf(state_io)
             .buf(q)
@@ -1956,6 +3224,290 @@ impl Kernels {
             .scalar(n_steps as i64)
             .scalar(n_v_heads as i64)
             .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Skanuje stan ValueKey i zapisuje checkpoint po każdym tokenie.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_value_key_scan_checkpoints_f16(
+        &self,
+        out: &DevBuffer,
+        checkpoints: &DevBuffer,
+        state_in: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_sequences: usize,
+        n_steps: usize,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.deltanet_value_key_scan_checkpoints_f16_at(
+            out,
+            checkpoints,
+            0,
+            state_in,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            n_sequences,
+            n_steps,
+            n_v_heads,
+            stream,
+        )
+    }
+
+    /// Zapisuje checkpointy ValueKey od przesunięcia w większym workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_value_key_scan_checkpoints_f16_at(
+        &self,
+        out: &DevBuffer,
+        checkpoints: &DevBuffer,
+        checkpoint_byte_offset: usize,
+        state_in: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_sequences: usize,
+        n_steps: usize,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        validate_f32_byte_offset("checkpointy ValueKey", checkpoint_byte_offset)?;
+        let d_state = 128usize;
+        if self.preferred_delta_state_layout(d_state) != DeltaStateLayout::ValueKey
+            || n_sequences == 0
+            || n_steps == 0
+            || n_v_heads == 0
+        {
+            return Err(ForgeError::Unsupported(
+                "checkpointy ValueKey wymagają kompletnego backendu d128".into(),
+            ));
+        }
+        let state_bytes = checked_buffer_bytes(
+            "ValueKey checkpoint state",
+            &[n_sequences, n_v_heads, d_state, d_state],
+            4,
+        )?;
+        let checkpoint_bytes = state_bytes
+            .checked_mul(n_steps)
+            .ok_or_else(|| ForgeError::Kernel("checkpointy ValueKey przekraczają usize".into()))?;
+        let vector_bytes = checked_buffer_bytes(
+            "ValueKey checkpoint vectors",
+            &[n_sequences, n_steps, n_v_heads, d_state],
+            2,
+        )?;
+        let gate_bytes = checked_buffer_bytes(
+            "ValueKey checkpoint gates",
+            &[n_sequences, n_steps, n_v_heads],
+            4,
+        )?;
+        let checkpoint_end = checkpoint_byte_offset
+            .checked_add(checkpoint_bytes)
+            .ok_or_else(|| {
+                ForgeError::Kernel("offset checkpointów ValueKey przepełnia usize".into())
+            })?;
+        if out.len() < vector_bytes
+            || checkpoints.len() < checkpoint_end
+            || state_in.len() < state_bytes
+            || q.len() < vector_bytes
+            || k.len() < vector_bytes
+            || v.len() < vector_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "skan checkpointów ValueKey otrzymał za mały bufor".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        let grid = n_v_heads
+            .checked_mul(32)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                ForgeError::Kernel("siatka checkpointów ValueKey przekracza u32".into())
+            })?;
+        let sequences = u32::try_from(n_sequences)
+            .map_err(|_| ForgeError::Kernel("batch checkpointów ValueKey przekracza u32".into()))?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_value_key_scan_checkpoints_f16")?;
+        let config = LaunchConfig {
+            grid: (grid, sequences, 1),
+            block: (caps.warp_size * 4, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf_at(checkpoints, checkpoint_byte_offset)?
+            .buf(state_in)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(n_sequences as i64)
+            .scalar(n_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Odtwarza na ValueKey zaakceptowany prefiks każdej sekwencji.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_value_key_commit_recompute_f32(
+        &self,
+        state_out: &DevBuffer,
+        state_in: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        decisions: &DevBuffer,
+        n_sequences: usize,
+        max_steps: usize,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let d_state = 128usize;
+        if self.preferred_delta_state_layout(d_state) != DeltaStateLayout::ValueKey
+            || n_sequences == 0
+            || max_steps == 0
+            || n_v_heads == 0
+        {
+            return Err(ForgeError::Unsupported(
+                "recompute ValueKey wymaga kompletnego backendu d128".into(),
+            ));
+        }
+        let state_bytes = checked_buffer_bytes(
+            "ValueKey recompute state",
+            &[n_sequences, n_v_heads, 128, 128],
+            4,
+        )?;
+        let vector_bytes = checked_buffer_bytes(
+            "ValueKey recompute vectors",
+            &[n_sequences, max_steps, n_v_heads, 128],
+            2,
+        )?;
+        let gate_bytes = checked_buffer_bytes(
+            "ValueKey recompute gates",
+            &[n_sequences, max_steps, n_v_heads],
+            4,
+        )?;
+        let decision_bytes =
+            checked_buffer_bytes("ValueKey recompute decisions", &[n_sequences, 2], 4)?;
+        if state_out.len() < state_bytes
+            || state_in.len() < state_bytes
+            || k.len() < vector_bytes
+            || v.len() < vector_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+            || decisions.len() < decision_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "recompute ValueKey otrzymał za mały bufor".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        let grid = n_v_heads
+            .checked_mul(32)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ForgeError::Kernel("siatka recompute ValueKey przekracza u32".into()))?;
+        let sequences = u32::try_from(n_sequences)
+            .map_err(|_| ForgeError::Kernel("batch recompute ValueKey przekracza u32".into()))?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_value_key_commit_recompute_f32")?;
+        let config = LaunchConfig {
+            grid: (grid, sequences, 1),
+            block: (caps.warp_size * 4, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(state_out)
+            .buf(state_in)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .buf(decisions)
+            .scalar(n_sequences as i64)
+            .scalar(max_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(d_state as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Wykonuje pełny rejestrowy skan DeltaNet d128 jednym uruchomieniem.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_scan_persistent_d128_f16(
+        &self,
+        out: &DevBuffer,
+        state_io: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_steps: usize,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n_steps == 0
+            || n_v_heads == 0
+            || !self.supports_deltanet_gated_scan_persistent_d128_f16()
+        {
+            return Err(ForgeError::Unsupported(
+                "persistent DeltaNet wymaga T>0, heads>0 oraz NVIDIA warp32".into(),
+            ));
+        }
+        let vector_bytes =
+            checked_buffer_bytes("persistent DeltaNet vectors", &[n_steps, n_v_heads, 128], 2)?;
+        let state_bytes =
+            checked_buffer_bytes("persistent DeltaNet state", &[n_v_heads, 128, 128], 4)?;
+        let gate_bytes =
+            checked_buffer_bytes("persistent DeltaNet gates", &[n_steps, n_v_heads], 4)?;
+        if out.len() < vector_bytes
+            || state_io.len() < state_bytes
+            || q.len() < vector_bytes
+            || k.len() < vector_bytes
+            || v.len() < vector_bytes
+            || g.len() < gate_bytes
+            || beta.len() < gate_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "persistent DeltaNet: co najmniej jeden bufor jest za mały".into(),
+            ));
+        }
+        let grid = n_v_heads
+            .checked_mul(32)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ForgeError::Kernel("persistent DeltaNet: grid przekracza u32".into()))?;
+        let kernel = self
+            .artifacts
+            .get("deltanet_gated_scan_persistent_d128_f16")?;
+        let config = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(state_io)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(n_steps as i64)
+            .scalar(n_v_heads as i64)
+            .scalar(128i64);
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -1998,6 +3550,7 @@ impl Kernels {
         d_state: usize,
         stream: &Stream,
     ) -> Result<()> {
+        validate_f32_byte_offset("deltanet_commit_checkpoint", checkpoint_byte_offset)?;
         if n_steps == 0 {
             return Err(ForgeError::Kernel(
                 "deltanet_commit_checkpoint wymaga T > 0".into(),
@@ -2248,6 +3801,439 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Przepakowuje ograniczony chunk row-major do docelowego resident S0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn repack_nvfp4_ct_s0_n64k128_into(
+        &self,
+        target: &DevBuffer,
+        packed: &DevBuffer,
+        scales: &DevBuffer,
+        physical_rows: usize,
+        cols: usize,
+        source_rows: usize,
+        target_row_offset: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let caps = self.device.caps();
+        if !matches!(caps.vendor, forge_types::Vendor::Nvidia)
+            || caps.warp_size != 32
+            || caps.max_threads_per_block < 128
+        {
+            return Err(ForgeError::Unsupported(
+                "repack NVFP4 CT wymaga NVIDIA warp32".into(),
+            ));
+        }
+        let _ = validate_nvfp4_ct_repack_extents(
+            target.len(),
+            packed.len(),
+            scales.len(),
+            physical_rows,
+            cols,
+            source_rows,
+            target_row_offset,
+        )?;
+        if physical_rows == 0
+            || !physical_rows.is_multiple_of(64)
+            || source_rows == 0
+            || !source_rows.is_multiple_of(64)
+            || !target_row_offset.is_multiple_of(64)
+            || cols == 0
+            || !cols.is_multiple_of(128)
+        {
+            return Err(ForgeError::Kernel(
+                "repack NVFP4 CT wymaga pełnych kafli N64/K128".into(),
+            ));
+        }
+        let target_end = target_row_offset.checked_add(source_rows).ok_or_else(|| {
+            ForgeError::Kernel("repack NVFP4 CT: przepełnienie zakresu".into())
+        })?;
+        if target_end > physical_rows {
+            return Err(ForgeError::Kernel(
+                "repack NVFP4 CT: chunk wykracza poza resident".into(),
+            ));
+        }
+        let target_bytes = checked_buffer_bytes(
+            "repack NVFP4 CT target",
+            &[physical_rows, cols],
+            9,
+        )? / 16;
+        let packed_bytes =
+            checked_buffer_bytes("repack NVFP4 CT packed", &[source_rows, cols], 1)? / 2;
+        let scale_bytes =
+            checked_buffer_bytes("repack NVFP4 CT scales", &[source_rows, cols], 1)? / 16;
+        if target.len() != target_bytes
+            || packed.len() < packed_bytes
+            || scales.len() < scale_bytes
+        {
+            return Err(ForgeError::Kernel(
+                "repack NVFP4 CT: niezgodny rozmiar bufora".into(),
+            ));
+        }
+        let stages = source_rows
+            .checked_div(64)
+            .and_then(|tiles| tiles.checked_mul(cols / 128))
+            .ok_or_else(|| ForgeError::Kernel("repack NVFP4 CT: przepełnienie siatki".into()))?;
+        let grid_x = u32::try_from(stages)
+            .map_err(|_| ForgeError::Kernel("repack NVFP4 CT: siatka przekracza u32".into()))?;
+        let kernel = self.artifacts.get("repack_nvfp4_ct_s0_n64k128_into")?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(target)
+            .buf(packed)
+            .buf(scales)
+            .scalar(cols as i64)
+            .scalar(source_rows as i64)
+            .scalar(target_row_offset as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Mnoży wyrównane okno wierszy resident S0 przez pojedynczy wektor F16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_nvfp4_ct_s0_n64k128_f16(
+        &self,
+        y: &DevBuffer,
+        weights: Nvfp4CtS0View<'_>,
+        x: &DevBuffer,
+        source_row_offset: usize,
+        rows: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemv_nvfp4_ct_s0_n64k128_f16_at(
+            y,
+            0,
+            weights,
+            x,
+            0,
+            source_row_offset,
+            rows,
+            inv_global_scale,
+            stream,
+        )
+    }
+
+    /// Mnoży jeden wiersz batch z kontrolowanymi offsetami buforów F16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_nvfp4_ct_s0_n64k128_f16_at(
+        &self,
+        y: &DevBuffer,
+        y_byte_offset: usize,
+        weights: Nvfp4CtS0View<'_>,
+        x: &DevBuffer,
+        x_byte_offset: usize,
+        source_row_offset: usize,
+        rows: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemv_batch_nvfp4_ct_s0_n64k128_f16_at(
+            y,
+            y_byte_offset,
+            weights,
+            x,
+            x_byte_offset,
+            source_row_offset,
+            rows,
+            1,
+            inv_global_scale,
+            stream,
+        )
+    }
+
+    /// Mnoży M1..M16 z kolejnością arytmetyki zgodną z row-major GEMV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_batch_nvfp4_ct_s0_n64k128_f16_at(
+        &self,
+        y: &DevBuffer,
+        y_byte_offset: usize,
+        weights: Nvfp4CtS0View<'_>,
+        x: &DevBuffer,
+        x_byte_offset: usize,
+        source_row_offset: usize,
+        rows: usize,
+        n_tokens: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let caps = self.device.caps();
+        if !matches!(caps.vendor, forge_types::Vendor::Nvidia)
+            || caps.warp_size != 32
+            || caps.max_threads_per_block < 256
+        {
+            return Err(ForgeError::Unsupported(
+                "decode NVFP4 CT wymaga NVIDIA warp32".into(),
+            ));
+        }
+        let (kernel_name, bucket) = match n_tokens {
+            1 => ("gemv_nvfp4_ct_s0_n64k128_f16", 1),
+            2..=4 => ("gemv_batch_nvfp4_ct_s0_n64k128_f16_b4", 4),
+            5..=8 => ("gemv_batch_nvfp4_ct_s0_n64k128_f16_b8", 8),
+            9..=16 => ("gemv_batch_nvfp4_ct_s0_n64k128_f16_b16", 16),
+            _ => {
+                return Err(ForgeError::Unsupported(format!(
+                    "decode NVFP4 CT obsługuje M1..M16, otrzymano M{n_tokens}"
+                )))
+            }
+        };
+        let output_bytes =
+            checked_buffer_bytes("decode NVFP4 CT output", &[n_tokens, rows], 2)?;
+        let input_bytes =
+            checked_buffer_bytes("decode NVFP4 CT input", &[n_tokens, weights.cols], 2)?;
+        let output_end = y_byte_offset.checked_add(output_bytes).ok_or_else(|| {
+            ForgeError::Kernel("decode NVFP4 CT: przepełnienie offsetu wyjścia".into())
+        })?;
+        let input_end = x_byte_offset.checked_add(input_bytes).ok_or_else(|| {
+            ForgeError::Kernel("decode NVFP4 CT: przepełnienie offsetu wejścia".into())
+        })?;
+        if output_end > y.len() || input_end > x.len() {
+            return Err(ForgeError::Kernel(
+                "decode NVFP4 CT: offset wykracza poza bufor".into(),
+            ));
+        }
+        let _ = validate_nvfp4_ct_b1_extents(
+            output_bytes,
+            input_bytes,
+            weights.rows,
+            weights.cols,
+            source_row_offset,
+            rows,
+            inv_global_scale,
+        )?;
+        if rows == 0
+            || !rows.is_multiple_of(64)
+            || !source_row_offset.is_multiple_of(64)
+            || !inv_global_scale.is_finite()
+        {
+            return Err(ForgeError::Kernel(
+                "decode NVFP4 CT wymaga wyrównanego okna N64 i skończonej skali".into(),
+            ));
+        }
+        let source_end = source_row_offset.checked_add(rows).ok_or_else(|| {
+            ForgeError::Kernel("decode NVFP4 CT: przepełnienie zakresu".into())
+        })?;
+        if source_end > weights.rows {
+            return Err(ForgeError::Kernel(
+                "decode NVFP4 CT: okno lub bufor nie pasuje do widoku".into(),
+            ));
+        }
+        let grid_x = u32::try_from(rows.div_ceil(8))
+            .map_err(|_| ForgeError::Kernel("decode NVFP4 CT: siatka przekracza u32".into()))?;
+        let kernel = self.artifacts.get(kernel_name)?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(y, y_byte_offset)?
+            .buf(weights.buffer)
+            .buf_at(x, x_byte_offset)?
+            .scalar(weights.cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64)
+            .scalar(source_row_offset as i64)
+            .scalar(inv_global_scale);
+        debug_assert!(n_tokens <= bucket);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Mnoży prefill F16 bezpośrednio z naturalnego układu S0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_ct_s0_f16_at(
+        &self,
+        y: &DevBuffer,
+        weights: Nvfp4CtS0View<'_>,
+        x: &DevBuffer,
+        source_row_offset: usize,
+        rows: usize,
+        n_tokens: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let caps = self.device.caps();
+        if !matches!(caps.vendor, forge_types::Vendor::Nvidia)
+            || caps.warp_size != 32
+            || caps.max_threads_per_block < 256
+        {
+            return Err(ForgeError::Unsupported(
+                "prefill NVFP4 CT wymaga NVIDIA warp32".into(),
+            ));
+        }
+        if rows == 0
+            || n_tokens == 0
+            || !rows.is_multiple_of(64)
+            || !source_row_offset.is_multiple_of(64)
+            || !weights.cols.is_multiple_of(128)
+            || !inv_global_scale.is_finite()
+        {
+            return Err(ForgeError::Kernel(
+                "prefill NVFP4 CT wymaga okna N64, K128 i skończonej skali".into(),
+            ));
+        }
+        let source_end = source_row_offset.checked_add(rows).ok_or_else(|| {
+            ForgeError::Kernel("prefill NVFP4 CT: przepełnienie zakresu".into())
+        })?;
+        if source_end > weights.rows {
+            return Err(ForgeError::Kernel(
+                "prefill NVFP4 CT: okno wykracza poza widok wag".into(),
+            ));
+        }
+        let output_bytes =
+            checked_buffer_bytes("prefill NVFP4 CT output", &[n_tokens, rows], 2)?;
+        let input_bytes =
+            checked_buffer_bytes("prefill NVFP4 CT input", &[n_tokens, weights.cols], 2)?;
+        if y.len() < output_bytes || x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "prefill NVFP4 CT: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let (kernel_name, block, bm) = if rows >= 8192 && n_tokens <= 256 {
+            ("gemm_nvfp4_ct_s0_f16_bm128", 256, 128)
+        } else {
+            ("gemm_nvfp4_ct_s0_f16_bm64", 128, 64)
+        };
+        let grid_x = u32::try_from(rows.div_ceil(64))
+            .map_err(|_| ForgeError::Kernel("prefill NVFP4 CT: grid.x przekracza u32".into()))?;
+        let grid_y = u32::try_from(n_tokens.div_ceil(bm))
+            .map_err(|_| ForgeError::Kernel("prefill NVFP4 CT: grid.y przekracza u32".into()))?;
+        let kernel = self.artifacts.get(kernel_name)?;
+        let config = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(weights.buffer)
+            .buf(x)
+            .scalar(weights.cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64)
+            .scalar(source_row_offset as i64)
+            .scalar(inv_global_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Uruchamia projekcję logicznego M4/M8/M16 na fizycznych buforach M16.
+    pub fn gemm_nvfp4_ct_bm16_m16(
+        &self,
+        y: &DevBuffer,
+        workspace: Option<&DevBuffer>,
+        weights: Nvfp4CtS0View<'_>,
+        x_padded_m16: &DevBuffer,
+        logical_m: usize,
+        projection: Nvfp4CtBm16Projection,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let caps = self.device.caps();
+        if !matches!(caps.vendor, forge_types::Vendor::Nvidia)
+            || caps.warp_size != 32
+            || caps.max_threads_per_block < 256
+        {
+            return Err(ForgeError::Unsupported(
+                "NVFP4 CT BM16 wymaga NVIDIA warp32 i bloku 256".into(),
+            ));
+        }
+        if !inv_global_scale.is_finite() {
+            return Err(ForgeError::Kernel(
+                "NVFP4 CT BM16 wymaga skończonej skali".into(),
+            ));
+        }
+        let kernel_name = projection.kernel_name(logical_m).ok_or_else(|| {
+            ForgeError::Kernel(format!(
+                "NVFP4 CT BM16 obsługuje logiczne M4, M8 lub M16; otrzymano M{logical_m}"
+            ))
+        })?;
+        let (rows, cols, parts, row_tile, block_threads) = projection.shape();
+        let pipeline_stages = if projection == Nvfp4CtBm16Projection::GateUp {
+            3
+        } else {
+            4
+        };
+        if !nvfp4_ct_split_pipeline_supported(cols / 128, parts, pipeline_stages) {
+            return Err(ForgeError::Kernel(
+                "NVFP4 CT BM16: split-K jest krótszy od potoku cp.async".into(),
+            ));
+        }
+        if weights.rows != rows || weights.cols != cols {
+            return Err(ForgeError::Kernel(format!(
+                "NVFP4 CT BM16: widok {}x{} nie pasuje do projekcji {rows}x{cols}",
+                weights.rows, weights.cols
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("NVFP4 CT BM16 output", &[16, rows], 2)?;
+        let input_bytes = checked_buffer_bytes("NVFP4 CT BM16 input", &[16, cols], 2)?;
+        if y.len() < output_bytes || x_padded_m16.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "NVFP4 CT BM16 wymaga pełnych buforów wejścia i wyjścia M16".into(),
+            ));
+        }
+        let target = if parts == 1 {
+            if workspace.is_some() {
+                return Err(ForgeError::Kernel(
+                    "NVFP4 CT BM16 gate+up nie używa workspace".into(),
+                ));
+            }
+            y
+        } else {
+            let workspace = workspace.ok_or_else(|| {
+                ForgeError::Kernel("NVFP4 CT BM16 split-K wymaga workspace FP32".into())
+            })?;
+            let workspace_bytes =
+                checked_buffer_bytes("NVFP4 CT BM16 workspace", &[parts, 16, rows], 4)?;
+            if workspace.len() < workspace_bytes {
+                return Err(ForgeError::Kernel(
+                    "NVFP4 CT BM16: workspace split-K jest za mały".into(),
+                ));
+            }
+            workspace
+        };
+        let grid_x = rows
+            .div_ceil(row_tile)
+            .checked_mul(parts)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ForgeError::Kernel("NVFP4 CT BM16: siatka przekracza u32".into()))?;
+        let kernel = self.artifacts.get(kernel_name)?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(target)
+            .buf(weights.buffer)
+            .buf(x_padded_m16)
+            .scalar(inv_global_scale);
+        self.device.launch(kernel, &config, &args, stream)?;
+        if parts == 1 {
+            return Ok(());
+        }
+        let reduce = self.artifacts.get("reduce_nvfp4_ct_bm16")?;
+        let elements = rows.checked_mul(16).ok_or_else(|| {
+            ForgeError::Kernel("NVFP4 CT BM16: liczba wyników przekracza usize".into())
+        })?;
+        let reduce_grid = u32::try_from(elements.div_ceil(BLOCK as usize))
+            .map_err(|_| ForgeError::Kernel("NVFP4 CT BM16: redukcja przekracza u32".into()))?;
+        let reduce_config = LaunchConfig {
+            grid: (reduce_grid, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reduce_args = LaunchArgs::new()
+            .buf(y)
+            .buf(target)
+            .scalar(rows as i64)
+            .scalar(16i64)
+            .scalar(parts as i64);
+        self.device
+            .launch(reduce, &reduce_config, &reduce_args, stream)
+    }
+
     /// Mnożenie macierz-wektor bezpośrednio z bloków GGUF NVFP4.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_nvfp4_gguf_f16(
@@ -2384,7 +4370,11 @@ impl Kernels {
             block: (if nvidia { 64 } else { 256 }, 1, 1),
             shared_mem_bytes: 0,
         };
-        let args = LaunchArgs::new().buf(y).buf(weights).buf(x).scalar(cols as i64);
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(weights)
+            .buf(x)
+            .scalar(cols as i64);
         let args = if nvidia {
             args.scalar(rows as i64).scalar(1i64).scalar(output_scale)
         } else {
@@ -2400,6 +4390,24 @@ impl Kernels {
         projections: &[Nvfp4GgufQ8Projection<'_>],
         x: &DevBuffer,
         cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemv_nvfp4_gguf_q8_1_group_layout_f16(
+            projections,
+            x,
+            cols,
+            Nvfp4GgufLayout::RowMajor36,
+            stream,
+        )
+    }
+
+    /// Kwantyzuje aktywację raz i uruchamia decode zgodny z jawnym układem wag.
+    pub fn gemv_nvfp4_gguf_q8_1_group_layout_f16(
+        &self,
+        projections: &[Nvfp4GgufQ8Projection<'_>],
+        x: &DevBuffer,
+        cols: usize,
+        layout: Nvfp4GgufLayout,
         stream: &Stream,
     ) -> Result<()> {
         if projections.is_empty() || cols < 64 || !cols.is_multiple_of(64) {
@@ -2434,10 +4442,32 @@ impl Kernels {
             }
         }
         let caps = self.device.caps();
-        if !raw_nvfp4_dp4a_supported(
-            matches!(caps.vendor, forge_types::Vendor::Nvidia),
-            caps.warp_size,
-        ) {
+        let tile_layout = layout == Nvfp4GgufLayout::TileN128K64;
+        if tile_layout
+            && projections
+                .iter()
+                .any(|projection| !projection.rows.is_multiple_of(128))
+        {
+            return Err(ForgeError::Kernel(
+                "decode NVFP4 TileN128K64 wymaga rows % 128 == 0".into(),
+            ));
+        }
+        if tile_layout
+            && (!raw_nvfp4_dp4a_supported(
+                matches!(caps.vendor, forge_types::Vendor::Nvidia),
+                caps.warp_size,
+            ) || !self.artifacts.has("gemv_nvfp4_tile128_coop_q8_1_f16"))
+        {
+            return Err(ForgeError::Unsupported(
+                "decode NVFP4 TileN128K64 wymaga NVIDIA warp32 i kernela tile128".into(),
+            ));
+        }
+        if !tile_layout
+            && !raw_nvfp4_dp4a_supported(
+                matches!(caps.vendor, forge_types::Vendor::Nvidia),
+                caps.warp_size,
+            )
+        {
             for projection in projections {
                 self.gemv_nvfp4_gguf_f16(
                     projection.output,
@@ -2488,14 +4518,19 @@ impl Kernels {
             .scalar(1i64);
         self.device.launch(quant, &quant_cfg, &quant_args, stream)?;
 
-        let kernel = self.artifacts.get("gemv_nvfp4_gguf_q8_1_f16")?;
+        let kernel_name = match layout {
+            Nvfp4GgufLayout::RowMajor36 => "gemv_nvfp4_gguf_q8_1_f16",
+            Nvfp4GgufLayout::TileN128K64 => "gemv_nvfp4_tile128_coop_q8_1_f16",
+        };
+        let kernel = self.artifacts.get(kernel_name)?;
         for projection in projections {
-            let grid_x = u32::try_from(projection.rows.div_ceil(8)).map_err(|_| {
+            let rows_per_block = if tile_layout { 4 } else { 8 };
+            let grid_x = u32::try_from(projection.rows.div_ceil(rows_per_block)).map_err(|_| {
                 ForgeError::Kernel("gemv_nvfp4_gguf_q8_1: siatka przekracza u32".into())
             })?;
             let config = LaunchConfig {
                 grid: (grid_x, 1, 1),
-                block: (BLOCK, 1, 1),
+                block: (if tile_layout { 128 } else { BLOCK }, 1, 1),
                 shared_mem_bytes: 0,
             };
             let args = LaunchArgs::new()
@@ -2511,6 +4546,58 @@ impl Kernels {
         Ok(())
     }
 
+    /// Przepakowuje pełną macierz GGUF NVFP4 do układu TileN128K64 na GPU.
+    pub fn repack_nvfp4_gguf_tile_n128_k64(
+        &self,
+        target: &DevBuffer,
+        source: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let caps = self.device.caps();
+        if !matches!(caps.vendor, forge_types::Vendor::Nvidia)
+            || caps.warp_size != 32
+            || caps.max_threads_per_block < 256
+        {
+            return Err(ForgeError::Unsupported(
+                "repack NVFP4 TileN128K64 wymaga NVIDIA warp32".into(),
+            ));
+        }
+        if rows == 0 || cols < 64 || !rows.is_multiple_of(128) || !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "repack NVFP4 TileN128K64 wymaga rows % 128 == 0 i cols % 64 == 0; rows={rows}, cols={cols}"
+            )));
+        }
+        let blocks_per_row = cols / 64;
+        let bytes = checked_buffer_bytes("repack NVFP4 TileN128K64", &[rows, blocks_per_row], 36)?;
+        if target.len() < bytes || source.len() < bytes {
+            return Err(ForgeError::Kernel(
+                "repack NVFP4 TileN128K64 ma za mały bufor".into(),
+            ));
+        }
+        let stages = rows
+            .checked_div(128)
+            .and_then(|tiles| tiles.checked_mul(blocks_per_row))
+            .and_then(|blocks| blocks.checked_mul(2))
+            .ok_or_else(|| ForgeError::Kernel("repack NVFP4: przepełnienie siatki".into()))?;
+        let grid_x = u32::try_from(stages)
+            .map_err(|_| ForgeError::Kernel("repack NVFP4: siatka przekracza u32".into()))?;
+        let blocks_per_row = i64::try_from(blocks_per_row)
+            .map_err(|_| ForgeError::Kernel("repack NVFP4: K przekracza i64".into()))?;
+        let kernel = self.artifacts.get("nvfp4_repack_tile128")?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(target)
+            .buf(source)
+            .scalar(blocks_per_row);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Kafelkowane mnożenie wielu tokenów bezpośrednio z bloków GGUF NVFP4.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_nvfp4_gguf_f16(
@@ -2524,15 +4611,55 @@ impl Kernels {
         output_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) || !output_scale.is_finite() {
+        self.gemm_nvfp4_gguf_layout_f16(
+            y,
+            weights,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            output_scale,
+            Nvfp4GgufLayout::RowMajor36,
+            stream,
+        )
+    }
+
+    /// Kafelkowane mnożenie NVFP4 wybierane wyłącznie przez jawny układ wag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_gguf_layout_f16(
+        &self,
+        y: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        output_scale: f32,
+        layout: Nvfp4GgufLayout,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0
+            || n_tokens == 0
+            || cols < 64
+            || !cols.is_multiple_of(64)
+            || !output_scale.is_finite()
+        {
             return Err(ForgeError::Kernel(format!(
                 "gemm_nvfp4_gguf_f16 wymaga rows > 0, cols % 64 == 0 i skończonej skali; otrzymano rows={rows}, cols={cols}, scale={output_scale}"
             )));
         }
         let caps = self.device.caps();
-        let dispatch = nvfp4_gguf_dispatch(
+        let dispatch = nvfp4_gguf_layout_dispatch(
+            layout,
             n_tokens,
             rows,
+            cols,
+            self.artifacts.has("gemm_nvfp4_gguf_mma_f16_bm128_prefetch"),
+            self.artifacts
+                .has("gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1"),
+            self.artifacts.has("gemm_nvfp4_gguf_mma_f16_bm128_bn128"),
+            self.artifacts.has("gemm_nvfp4_tile128_mma_f16_bm128_bn64"),
+            self.artifacts.has("gemm_nvfp4_tile128_mma_f16_bm128_bn128"),
             matches!(caps.vendor, forge_types::Vendor::Nvidia),
             caps.warp_size,
             caps.max_threads_per_block,
@@ -2587,23 +4714,45 @@ impl Kernels {
         output_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
+        self.gemm_nvfp4_gguf_out_f32_batch(y, weights, x, rows, cols, 2, output_scale, stream)
+    }
+
+    /// Liczy B4/B8/B16 wierszy logitów F32 jednym przebiegiem po wagach NVFP4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_gguf_out_f32_batch(
+        &self,
+        y: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
         if rows == 0 || cols < 64 || !cols.is_multiple_of(64) || !output_scale.is_finite() {
             return Err(ForgeError::Kernel(format!(
-                "gemm_nvfp4_gguf_out_f32_b2 wymaga rows > 0, cols % 64 == 0 i skończonej skali; rows={rows}, cols={cols}, scale={output_scale}"
+                "gemm_nvfp4_gguf_out_f32_batch wymaga rows > 0, cols % 64 == 0 i skończonej skali; rows={rows}, cols={cols}, scale={output_scale}"
             )));
         }
-        let output_bytes = checked_buffer_bytes("NVFP4 B2 logits", &[2, rows], 4)?;
-        let weight_bytes = checked_buffer_bytes("NVFP4 B2 logits weights", &[rows, cols / 64], 36)?;
-        let input_bytes = checked_buffer_bytes("NVFP4 B2 logits input", &[2, cols], 2)?;
+        if !matches!(n_tokens, 2 | 4 | 8 | 16) {
+            return Err(ForgeError::Kernel(format!(
+                "batch logits NVFP4 wymaga B=2/4/8/16, otrzymano {n_tokens}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("NVFP4 batch logits", &[n_tokens, rows], 4)?;
+        let weight_bytes =
+            checked_buffer_bytes("NVFP4 batch logits weights", &[rows, cols / 64], 36)?;
+        let input_bytes = checked_buffer_bytes("NVFP4 batch logits input", &[n_tokens, cols], 2)?;
         if y.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
             return Err(ForgeError::Kernel(
-                "gemm_nvfp4_gguf_out_f32_b2: bufor jest za mały".into(),
+                "gemm_nvfp4_gguf_out_f32_batch: bufor jest za mały".into(),
             ));
         }
         let warp_size = self.device.caps().warp_size;
         if warp_size == 0 || warp_size > self.device.caps().max_threads_per_block {
             return Err(ForgeError::Kernel(
-                "gemm_nvfp4_gguf_out_f32_b2: nieprawidłowy rozmiar wave".into(),
+                "gemm_nvfp4_gguf_out_f32_batch: nieprawidłowy rozmiar wave".into(),
             ));
         }
         let grid_x = u32::try_from(rows)
@@ -2612,7 +4761,9 @@ impl Kernels {
             .map_err(|_| ForgeError::Kernel("NVFP4 B2 logits rows przekracza i64".into()))?;
         let cols = i64::try_from(cols)
             .map_err(|_| ForgeError::Kernel("NVFP4 B2 logits cols przekracza i64".into()))?;
-        let kernel = self.artifacts.get("gemm_nvfp4_gguf_out_f32_b2")?;
+        let kernel = self
+            .artifacts
+            .get(&format!("gemm_nvfp4_gguf_out_f32_b{n_tokens}"))?;
         let config = LaunchConfig {
             grid: (grid_x, 1, 1),
             block: (warp_size, 1, 1),
@@ -2624,7 +4775,7 @@ impl Kernels {
             .buf(x)
             .scalar(cols)
             .scalar(rows)
-            .scalar(2i64)
+            .scalar(i64::try_from(n_tokens).expect("B logits NVFP4 jest małe"))
             .scalar(output_scale);
         self.device.launch(kernel, &config, &args, stream)
     }
@@ -2712,7 +4863,8 @@ impl Kernels {
             ));
         }
         let rows = checked_buffer_bytes("mtp shifted rows", &[n_tokens, hidden_size], 2)?;
-        let output_bytes = checked_buffer_bytes("mtp shifted output", &[n_tokens, 2, hidden_size], 2)?;
+        let output_bytes =
+            checked_buffer_bytes("mtp shifted output", &[n_tokens, 2, hidden_size], 2)?;
         let vector = checked_buffer_bytes("mtp shifted vector", &[hidden_size], 2)?;
         if output.len() < output_bytes
             || embeddings.len() < rows
@@ -2727,9 +4879,13 @@ impl Kernels {
         }
         let kernel = self.artifacts.get("mtp_norm_join_shifted_f16")?;
         let config = LaunchConfig {
-            grid: (u32::try_from(n_tokens).map_err(|_| {
-                ForgeError::Kernel("mtp shifted: liczba tokenów przekracza u32".into())
-            })?, 1, 1),
+            grid: (
+                u32::try_from(n_tokens).map_err(|_| {
+                    ForgeError::Kernel("mtp shifted: liczba tokenów przekracza u32".into())
+                })?,
+                1,
+                1,
+            ),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -2828,15 +4984,22 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         let output_bytes = checked_buffer_bytes("mtp project output", &[n_tokens, hidden_size], 2)?;
-        let joined_bytes = checked_buffer_bytes("mtp project joined", &[n_tokens, 2, hidden_size], 2)?;
+        let joined_bytes =
+            checked_buffer_bytes("mtp project joined", &[n_tokens, 2, hidden_size], 2)?;
         let weights_bytes = checked_buffer_bytes(
-            "mtp project weights", &[hidden_size, (2 * hidden_size) / 32], 34,
+            "mtp project weights",
+            &[hidden_size, (2 * hidden_size) / 32],
+            34,
         )?;
-        if n_tokens == 0 || !(2 * hidden_size).is_multiple_of(32)
-            || output.len() < output_bytes || joined.len() < joined_bytes
+        if n_tokens == 0
+            || !(2 * hidden_size).is_multiple_of(32)
+            || output.len() < output_bytes
+            || joined.len() < joined_bytes
             || weights.len() < weights_bytes
         {
-            return Err(ForgeError::Kernel("mtp_project_joined_q8_f16: nieprawidłowy kształt".into()));
+            return Err(ForgeError::Kernel(
+                "mtp_project_joined_q8_f16: nieprawidłowy kształt".into(),
+            ));
         }
         let kernel = self.artifacts.get("mtp_project_joined_q8_f16")?;
         let config = LaunchConfig {
@@ -2845,8 +5008,11 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(output).buf(joined).buf(weights)
-            .scalar(hidden_size as i64).scalar(n_tokens as i64);
+            .buf(output)
+            .buf(joined)
+            .buf(weights)
+            .scalar(hidden_size as i64)
+            .scalar(n_tokens as i64);
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -2873,13 +5039,20 @@ impl Kernels {
                 let byte_end = logical
                     .checked_add(1)
                     .and_then(|entries| entries.checked_mul(4))
-                    .ok_or_else(|| ForgeError::Kernel("mtp_stage_step: przepełnienie indeksu strony".into()))?;
+                    .ok_or_else(|| {
+                        ForgeError::Kernel("mtp_stage_step: przepełnienie indeksu strony".into())
+                    })?;
                 if byte_end > page_table.len() {
                     return Err(ForgeError::Kernel(format!(
                         "mtp_stage_step: strona logiczna {logical} wykracza poza page table"
                     )));
                 }
-                (i64::try_from(logical).map_err(|_| ForgeError::Kernel("mtp_stage_step: indeks strony przekracza i64".into()))?, i64::from(physical))
+                (
+                    i64::try_from(logical).map_err(|_| {
+                        ForgeError::Kernel("mtp_stage_step: indeks strony przekracza i64".into())
+                    })?,
+                    i64::from(physical),
+                )
             }
             (None, None) => (-1, -1),
             _ => {
@@ -3678,6 +5851,34 @@ impl Kernels {
         }
     }
 
+    fn f16_out_f32_dispatch(
+        rows: usize,
+        n_tokens: usize,
+        mut has: impl FnMut(&str) -> bool,
+    ) -> (&'static str, u32, u32) {
+        if (2..=4).contains(&n_tokens) && has("gemv_batch_f16_out_f32_b4") {
+            ("gemv_batch_f16_out_f32_b4", 256, n_tokens as u32)
+        } else if (5..=8).contains(&n_tokens) && has("gemv_batch_f16_out_f32_b8") {
+            ("gemv_batch_f16_out_f32_b8", 256, n_tokens as u32)
+        } else if n_tokens <= 32 && has("gemm_f16_out_f32_bm32") {
+            ("gemm_f16_out_f32_bm32", 64, 32)
+        } else {
+            match Self::gemm_tile(rows, n_tokens) {
+                ("", block, bm) => ("gemm_f16_out_f32", block, bm),
+                ("_bm64", block, bm) => ("gemm_f16_out_f32_bm64", block, bm),
+                _ => unreachable!("gemm_tile zwraca wyłącznie wspierane suffixy"),
+            }
+        }
+    }
+
+    fn q8_0_out_f32_kernel(rows: usize, n_tokens: usize) -> &'static str {
+        match Self::gemm_tile(rows, n_tokens).0 {
+            "" => "gemm_q8_0_out_f32",
+            "_bm64" => "gemm_q8_0_out_f32_bm64",
+            _ => unreachable!("gemm_tile zwraca wyłącznie wspierane suffixy"),
+        }
+    }
+
     /// Kafel dla małego batcha NVFP4. BM32 zachowuje ten sam łańcuch MMA,
     /// ale nie wykonuje pustej drugiej połowy kafla BM64.
     fn gemm_nvfp4_tile(rows: usize, n_tokens: usize) -> (&'static str, u32, u32) {
@@ -3915,27 +6116,9 @@ impl Kernels {
                 "gemm_f16_out_f32 requires rows > 0, cols >= 8, cols % 8 == 0 and n_tokens > 0, got rows={rows}, cols={cols}, n_tokens={n_tokens}"
             )));
         }
-        let (kernel_name, block, bm) = if (2..=4).contains(&n_tokens)
-            && self.artifacts.has("gemv_batch_f16_out_f32_b4")
-        {
-            (
-                "gemv_batch_f16_out_f32_b4".to_string(),
-                256,
-                n_tokens as u32,
-            )
-        } else if (5..=8).contains(&n_tokens) && self.artifacts.has("gemv_batch_f16_out_f32_b8") {
-            (
-                "gemv_batch_f16_out_f32_b8".to_string(),
-                256,
-                n_tokens as u32,
-            )
-        } else if n_tokens <= 32 && self.artifacts.has("gemm_f16_out_f32_bm32") {
-            ("gemm_f16_out_f32_bm32".to_string(), 64, 32)
-        } else {
-            let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
-            (format!("gemm_f16_out_f32{suffix}"), block, bm)
-        };
-        let k = self.artifacts.get(&kernel_name)?;
+        let (kernel_name, block, bm) =
+            Self::f16_out_f32_dispatch(rows, n_tokens, |name| self.artifacts.has(name));
+        let k = self.artifacts.get(kernel_name)?;
         let cfg = LaunchConfig {
             grid: if kernel_name.starts_with("gemv_batch_") {
                 ((rows as u32).div_ceil(8), 1, 1)
@@ -3977,8 +6160,10 @@ impl Kernels {
                 "gemm_q8_0_out_f32 requires cols % 32 == 0, got {cols}"
             )));
         }
-        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
-        let k = self.artifacts.get(&format!("gemm_q8_0_out_f32{suffix}"))?;
+        let (_, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self
+            .artifacts
+            .get(Self::q8_0_out_f32_kernel(rows, n_tokens))?;
         let cfg = LaunchConfig {
             grid: (
                 (rows as u32).div_ceil(64),
@@ -4269,18 +6454,25 @@ impl Kernels {
         head_dim: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if batch == 0 || n_tokens == 0 {
-            return Err(ForgeError::Kernel(
-                "segmentowany append KV wymaga B>0 i T>0".into(),
-            ));
-        }
-        let total = batch
-            .checked_mul(n_tokens)
-            .ok_or_else(|| ForgeError::Kernel("przepełnienie liczby tokenów append KV".into()))?;
+        let (grid_x, grid_y, block) = validate_kv_append_batch_segmented_f16(
+            k_cache.len(),
+            v_cache.len(),
+            k_in.len(),
+            v_in.len(),
+            page_tables.len(),
+            base_positions.len(),
+            batch,
+            n_tokens,
+            max_pages,
+            n_kv_heads,
+            page_size,
+            head_dim,
+            self.device.caps().max_threads_per_block,
+        )?;
         let kernel = self.artifacts.get("kv_append_batch_segmented_f16")?;
         let config = LaunchConfig {
-            grid: (total as u32, n_kv_heads as u32, 1),
-            block: ((head_dim as u32).clamp(32, 256), 1, 1),
+            grid: (grid_x, grid_y, 1),
+            block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -4290,11 +6482,21 @@ impl Kernels {
             .buf(v_in)
             .buf(page_tables)
             .buf(base_positions)
-            .scalar(n_tokens as i64)
-            .scalar(max_pages as i64)
-            .scalar(n_kv_heads as i64)
-            .scalar(page_size as i64)
-            .scalar(head_dim as i64);
+            .scalar(i64::try_from(n_tokens).expect("T append KV sprawdzone przez validator"))
+            .scalar(
+                i64::try_from(max_pages).expect("max_pages append KV sprawdzone przez validator"),
+            )
+            .scalar(
+                i64::try_from(n_kv_heads)
+                    .expect("liczba głów append KV sprawdzona przez validator"),
+            )
+            .scalar(
+                i64::try_from(page_size)
+                    .expect("rozmiar strony append KV sprawdzony przez validator"),
+            )
+            .scalar(
+                i64::try_from(head_dim).expect("head_dim append KV sprawdzone przez validator"),
+            );
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -4390,7 +6592,46 @@ impl Kernels {
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        let (grid_x, grid_y) = validate_attn_verify_segmented_f16_hd256(
+        self.attn_prefill_segmented_f16(
+            output,
+            q,
+            k_cache,
+            v_cache,
+            page_tables,
+            visible_lens,
+            batch,
+            n_tokens,
+            n_q_heads,
+            n_kv_heads,
+            256,
+            page_size,
+            max_pages,
+            scale,
+            stream,
+        )
+    }
+
+    /// Uruchamia causal prefill dla równych segmentów sequence-major `[B,T]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_segmented_f16(
+        &self,
+        output: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_tables: &DevBuffer,
+        visible_lens: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        max_pages: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (grid_x, grid_y) = validate_attn_prefill_segmented_f16(
             output.len(),
             q.len(),
             k_cache.len(),
@@ -4401,16 +6642,18 @@ impl Kernels {
             n_tokens,
             n_q_heads,
             n_kv_heads,
+            head_dim,
             page_size,
             max_pages,
         )?;
         let caps = self.device.caps();
         let warp32 = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
-        let kernel = self.artifacts.get(if warp32 {
-            "attn_verify_segmented_f16_hd256_warp32"
+        let kernel_name = if warp32 {
+            format!("attn_verify_segmented_f16_hd{head_dim}_warp32")
         } else {
-            "attn_verify_segmented_f16_hd256"
-        })?;
+            format!("attn_verify_segmented_f16_hd{head_dim}")
+        };
+        let kernel = self.artifacts.get(&kernel_name)?;
         let config = LaunchConfig {
             grid: (grid_x, grid_y, 1),
             block: (if warp32 { ATTN_BLOCK } else { 256 }, 1, 1),
@@ -4428,6 +6671,190 @@ impl Kernels {
             .scalar(i64::try_from(n_kv_heads).expect("głowice KV sprawdzone przez validator"))
             .scalar(i64::try_from(page_size).expect("rozmiar strony sprawdzony przez validator"))
             .scalar(i64::try_from(max_pages).expect("liczba stron sprawdzona przez validator"))
+            .scalar(scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Kafelkowa causal prefill attention dla równych segmentów `[B,T]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_segmented_tiled_f16(
+        &self,
+        output: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_tables: &DevBuffer,
+        base_positions: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        max_pages: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0
+            || n_tokens == 0
+            || n_q_heads == 0
+            || n_kv_heads == 0
+            || !n_q_heads.is_multiple_of(n_kv_heads)
+            || !matches!(head_dim, 128 | 256)
+            || page_size == 0
+            || max_pages == 0
+        {
+            return Err(ForgeError::Kernel(
+                "kafelkowa segmentowana atencja ma nieprawidłowy kształt".into(),
+            ));
+        }
+        let total = batch
+            .checked_mul(n_tokens)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie segmentowanego prefill".into()))?;
+        let query_bytes = checked_buffer_bytes(
+            "segmentowany tiled prefill query",
+            &[total, n_q_heads, head_dim],
+            2,
+        )?;
+        let page_table_bytes = checked_buffer_bytes(
+            "segmentowany tiled prefill page tables",
+            &[batch, max_pages],
+            4,
+        )?;
+        let base_bytes =
+            checked_buffer_bytes("segmentowany tiled prefill base positions", &[batch], 4)?;
+        let cache_page_bytes = checked_buffer_bytes(
+            "segmentowany tiled prefill cache page",
+            &[n_kv_heads, page_size, head_dim],
+            2,
+        )?;
+        if output.len() < query_bytes
+            || q.len() < query_bytes
+            || page_tables.len() < page_table_bytes
+            || base_positions.len() < base_bytes
+            || k_cache.len() < cache_page_bytes
+            || v_cache.len() < cache_page_bytes
+            || k_cache.len() != v_cache.len()
+            || !k_cache.len().is_multiple_of(cache_page_bytes)
+        {
+            return Err(ForgeError::Kernel(
+                "kafelkowa segmentowana atencja ma za mały lub niezgodny bufor".into(),
+            ));
+        }
+        let tiles_per_sequence = n_tokens.div_ceil(16);
+        let grid_x =
+            u32::try_from(batch.checked_mul(tiles_per_sequence).ok_or_else(|| {
+                ForgeError::Kernel("grid segmentowanego prefill overflow".into())
+            })?)
+            .map_err(|_| ForgeError::Kernel("grid segmentowanego prefill przekracza u32".into()))?;
+        let grid_y = u32::try_from(n_q_heads)
+            .map_err(|_| ForgeError::Kernel("głowice prefill przekraczają u32".into()))?;
+        let kernel = self
+            .artifacts
+            .get(&format!("attn_prefill_segmented_f16_hd{head_dim}"))?;
+        let config = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_tables)
+            .buf(base_positions)
+            .scalar(i64::try_from(n_tokens).expect("T segmentowanego prefill jest małe"))
+            .scalar(i64::try_from(max_pages).expect("max_pages segmentowanego prefill jest małe"))
+            .scalar(i64::try_from(n_q_heads).expect("Q heads segmentowanego prefill są małe"))
+            .scalar(i64::try_from(n_kv_heads).expect("KV heads segmentowanego prefill są małe"))
+            .scalar(i64::try_from(page_size).expect("page_size segmentowanego prefill jest małe"))
+            .scalar(scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Segmentowana FA korzystająca bez zmian z matematyki MMA ścieżki B1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_fa_segmented_f16_hd128(
+        &self,
+        output: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_tables: &DevBuffer,
+        base_positions: &DevBuffer,
+        batch: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        max_pages: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch == 0
+            || n_tokens == 0
+            || n_q_heads == 0
+            || n_kv_heads == 0
+            || !n_q_heads.is_multiple_of(n_kv_heads)
+            || page_size == 0
+            || max_pages == 0
+        {
+            return Err(ForgeError::Kernel(
+                "segmentowana FA HD128 ma nieprawidłowy kształt".into(),
+            ));
+        }
+        let total = batch
+            .checked_mul(n_tokens)
+            .ok_or_else(|| ForgeError::Kernel("przepełnienie segmentowanej FA".into()))?;
+        let query_bytes =
+            checked_buffer_bytes("segmentowana FA query", &[total, n_q_heads, 128], 2)?;
+        let page_table_bytes =
+            checked_buffer_bytes("segmentowana FA page tables", &[batch, max_pages], 4)?;
+        let base_bytes = checked_buffer_bytes("segmentowana FA base positions", &[batch], 4)?;
+        let cache_page_bytes = checked_buffer_bytes(
+            "segmentowana FA cache page",
+            &[n_kv_heads, page_size, 128],
+            2,
+        )?;
+        if output.len() < query_bytes
+            || q.len() < query_bytes
+            || page_tables.len() < page_table_bytes
+            || base_positions.len() < base_bytes
+            || k_cache.len() < cache_page_bytes
+            || v_cache.len() < cache_page_bytes
+            || k_cache.len() != v_cache.len()
+            || !k_cache.len().is_multiple_of(cache_page_bytes)
+        {
+            return Err(ForgeError::Kernel(
+                "segmentowana FA HD128 ma za mały lub niezgodny bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("attn_prefill_fa_segmented_f16_hd128")?;
+        let config = LaunchConfig {
+            grid: (
+                u32::try_from(n_tokens.div_ceil(64))
+                    .map_err(|_| ForgeError::Kernel("grid.x FA przekracza u32".into()))?,
+                u32::try_from(n_q_heads)
+                    .map_err(|_| ForgeError::Kernel("grid.y FA przekracza u32".into()))?,
+                u32::try_from(batch)
+                    .map_err(|_| ForgeError::Kernel("grid.z FA przekracza u32".into()))?,
+            ),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_tables)
+            .buf(base_positions)
+            .scalar(i64::try_from(n_tokens).expect("T segmentowanej FA jest małe"))
+            .scalar(i64::try_from(max_pages).expect("max_pages segmentowanej FA jest małe"))
+            .scalar(i64::try_from(n_q_heads).expect("Q heads segmentowanej FA są małe"))
+            .scalar(i64::try_from(n_kv_heads).expect("KV heads segmentowanej FA są małe"))
+            .scalar(i64::try_from(page_size).expect("page_size segmentowanej FA jest małe"))
             .scalar(scale);
         self.device.launch(kernel, &config, &args, stream)
     }
@@ -4547,6 +6974,74 @@ impl Kernels {
             .scalar(scale)
             .scalar(n_tokens as i64);
         self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Uruchamia Mojo Flash Attention HD256 ze zwalidowaną pozycją bazową.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_fa_mojo_f16_hd256(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        base_position: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (grid_x, grid_y) = validate_attn_prefill_fa_f16_hd256(
+            out.len(),
+            q.len(),
+            k_cache.len(),
+            v_cache.len(),
+            page_table.len(),
+            base_position,
+            n_tokens,
+            n_q_heads,
+            n_kv_heads,
+            page_size,
+            scale,
+        )?;
+        if self.device.caps().max_threads_per_block < 128 {
+            return Err(ForgeError::Unsupported(
+                "flash attention prefill HD256 wymaga bloku 128 wątków".into(),
+            ));
+        }
+        let experimental_bk32 =
+            std::env::var("FORGE_HYBRID_FA_KEY_TILE").is_ok_and(|value| value == "32");
+        let kernel_name =
+            if experimental_bk32 && self.artifacts.has("attn_prefill_fa_mojo_f16_hd256_bk32") {
+                "attn_prefill_fa_mojo_f16_hd256_bk32"
+            } else if self.artifacts.has("attn_prefill_fa_mojo_f16_hd256_vtrans") {
+                "attn_prefill_fa_mojo_f16_hd256_vtrans"
+            } else {
+                "attn_prefill_fa_mojo_f16_hd256"
+            };
+        let kernel = self.artifacts.get(kernel_name)?;
+        let config = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .scalar(
+                i64::try_from(base_position).expect("pozycja bazowa sprawdzona przez validator"),
+            )
+            .scalar(i64::try_from(n_q_heads).expect("głowice Q sprawdzone przez validator"))
+            .scalar(i64::try_from(n_kv_heads).expect("głowice KV sprawdzone przez validator"))
+            .scalar(i64::try_from(page_size).expect("rozmiar strony sprawdzony przez validator"))
+            .scalar(scale)
+            .scalar(i64::try_from(n_tokens).expect("T sprawdzone przez validator"));
+        self.device.launch(kernel, &config, &args, stream)
     }
 
     /// Tensor-core causal flash-attention prefill. Same I/O contract as
@@ -4971,95 +7466,6 @@ impl Kernels {
         Ok(true)
     }
 
-    /// Native-GGUF-layout Mojo int8 Q6_K multistage prefill GEMM. Mirrors
-    /// `gemm_q4k_i8_native`: shares the q8_1 activation quant + `q4k_native`
-    /// scratch (identical int8 codes + block-major da), then runs the native GEMM
-    /// reading the RAW `w_q6k` GGUF bytes (210-byte block_q6_K unpacked in-kernel,
-    /// TRUE 1× VRAM). The kernel honors Q6_K's 16-element scale granularity with a
-    /// double m16n8k32 mma per 32-region, so it is bit-exact vs Q6_K × q8_1. `sa`
-    /// is passed for a shared signature but unused (Q6_K has no min term). Returns
-    /// `false` (caller falls back to the f16 Q6_K kernel) when `(rows,cols)` has no
-    /// committed instance or `n_tokens > 4096`.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_q6k_i8_native(
-        &self,
-        y: &DevBuffer,
-        w_q6k: &DevBuffer,
-        w_byte_off: usize,
-        x: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        n_tokens: usize,
-        stream: &Stream,
-    ) -> Result<bool> {
-        let Some(mpad) = Self::q4k_native_mpad(n_tokens) else {
-            return Ok(false);
-        };
-        let key = format!("gemm_q6k_i8_native_{rows}_{cols}_m{mpad}");
-        let Ok(gk) = self.artifacts.get(&key) else {
-            return Ok(false);
-        };
-        let qk = self.artifacts.get("quantize_act_q8_1")?;
-
-        let need_x = mpad * cols;
-        let need_blocks = mpad * (cols / 32);
-        let mut sc = self.q4k_native.lock().expect("q4k native scratch poisoned");
-        if sc.cap_x < need_x {
-            sc.xpad = Some(
-                self.device
-                    .alloc(need_x * 2, MemKind::Device, Pool::Activations)?,
-            );
-            sc.xq = Some(
-                self.device
-                    .alloc(need_x, MemKind::Device, Pool::Activations)?,
-            );
-            sc.cap_x = need_x;
-        }
-        if sc.cap_blocks < need_blocks {
-            sc.da = Some(
-                self.device
-                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
-            );
-            sc.sa = Some(
-                self.device
-                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
-            );
-            sc.cap_blocks = need_blocks;
-        }
-        let xpad = sc.xpad.as_ref().expect("xpad allocated");
-        let xq = sc.xq.as_ref().expect("xq allocated");
-        let da = sc.da.as_ref().expect("da allocated");
-        let sa = sc.sa.as_ref().expect("sa allocated");
-
-        self.device
-            .copy(x, 0, xpad, 0, n_tokens * cols * 2, stream)?;
-
-        let qcfg = LaunchConfig::linear(need_blocks as u32, BLOCK);
-        let qargs = LaunchArgs::new()
-            .buf(xq)
-            .buf(da)
-            .buf(sa)
-            .buf(xpad)
-            .scalar(cols as i64)
-            .scalar(mpad as i64);
-        self.device.launch(qk, &qcfg, &qargs, stream)?;
-
-        let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(128), (mpad as u32) / 128, 1),
-            block: (256, 1, 1),
-            shared_mem_bytes: 53248,
-        };
-        let args = LaunchArgs::new()
-            .buf(y)
-            .buf(xq)
-            .buf_at(w_q6k, w_byte_off)?
-            .buf(da)
-            .buf(sa)
-            .scalar(n_tokens as i64);
-        self.device.launch(gk, &cfg, &args, stream)?;
-        Ok(true)
-    }
-
     /// Pre-quantize the activation to q8_1 ONCE (`quantize_act_q8_1`) into the
     /// grow-only scratch, then run the int8-MMQ GEMM reading int8 X directly.
     /// This halves X read bandwidth and removes the redundant per-row-block
@@ -5073,10 +7479,21 @@ impl Kernels {
         n_tokens: usize,
         stream: &'a Stream,
     ) -> Result<Q8ActPrepared<'a>> {
-        if !matches!(n_tokens, 6 | 8) || cols == 0 || !cols.is_multiple_of(32) {
+        if !(matches!(n_tokens, 6 | 8) || n_tokens >= 32) || cols == 0 || !cols.is_multiple_of(32) {
             return Err(ForgeError::Kernel(format!(
-                "prepare_q8_1 wymaga T=6/8 i cols > 0 podzielnego przez 32, otrzymano T={n_tokens}, cols={cols}"
+                "prepare_q8_1 wymaga T=6/8 lub T>=32 i cols > 0 podzielnego przez 32, otrzymano T={n_tokens}, cols={cols}"
             )));
+        }
+        if n_tokens >= 32 {
+            let caps = self.device.caps();
+            if caps.vendor != forge_types::Vendor::Nvidia
+                || caps.warp_size != 32
+                || caps.max_threads_per_block < BLOCK
+            {
+                return Err(ForgeError::Unsupported(
+                    "prepared Q8 T>=32 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
+                ));
+            }
         }
         let input_bytes = checked_buffer_bytes("prepare_q8_1 input", &[n_tokens, cols], 2)?;
         if x.len() < input_bytes {
@@ -5169,12 +7586,23 @@ impl Kernels {
         }
         if prepared.cols != cols
             || prepared.n_tokens != n_tokens
-            || !matches!(n_tokens, 6 | 8)
+            || !(matches!(n_tokens, 6 | 8) || n_tokens >= 32)
             || rows == 0
         {
             return Err(ForgeError::Kernel(format!(
-                "prepared Q8_0 wymaga zgodnych wymiarów T=6/8 i rows > 0, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
+                "prepared Q8_0 wymaga zgodnych wymiarów T=6/8 lub T>=32 i rows > 0, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
             )));
+        }
+        if n_tokens >= 32 {
+            let caps = self.device.caps();
+            if caps.vendor != forge_types::Vendor::Nvidia
+                || caps.warp_size != 32
+                || caps.max_threads_per_block < BLOCK
+            {
+                return Err(ForgeError::Unsupported(
+                    "prepared Q8 T>=32 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
+                ));
+            }
         }
         let output_bytes = checked_buffer_bytes("prepared Q8_0 output", &[n_tokens, rows], 2)?;
         let weight_bytes = checked_buffer_bytes("prepared Q8_0 weights", &[rows, cols / 32], 34)?;
@@ -5186,17 +7614,6 @@ impl Kernels {
                 "prepared Q8_0: bufor wyjścia lub wag jest za mały".into(),
             ));
         }
-        let caps = self.device.caps();
-        let rows_per_block = 8u32;
-        let block_threads = caps.warp_size.checked_mul(rows_per_block).ok_or_else(|| {
-            ForgeError::Kernel("prepared Q8_0: przepełnienie rozmiaru bloku".into())
-        })?;
-        if block_threads > caps.max_threads_per_block {
-            return Err(ForgeError::Kernel(format!(
-                "prepared Q8_0: blok {block_threads} przekracza limit urządzenia {}",
-                caps.max_threads_per_block
-            )));
-        }
         let rows_u32 = u32::try_from(rows)
             .map_err(|_| ForgeError::Kernel("prepared Q8_0: rows przekracza u32".into()))?;
         let cols_i64 = i64::try_from(cols)
@@ -5205,19 +7622,189 @@ impl Kernels {
             .map_err(|_| ForgeError::Kernel("prepared Q8_0: rows przekracza i64".into()))?;
         let n_tokens_i64 = i64::try_from(n_tokens)
             .map_err(|_| ForgeError::Kernel("prepared Q8_0: T przekracza i64".into()))?;
-        let kernel = self.artifacts.get("gemm_q8_0_i8mma_b8")?;
+        let (kernel, cfg, args) = if matches!(n_tokens, 6 | 8) {
+            let caps = self.device.caps();
+            let rows_per_block = 8u32;
+            let block_threads = caps.warp_size.checked_mul(rows_per_block).ok_or_else(|| {
+                ForgeError::Kernel("prepared Q8_0: przepełnienie rozmiaru bloku".into())
+            })?;
+            if block_threads > caps.max_threads_per_block {
+                return Err(ForgeError::Kernel(format!(
+                    "prepared Q8_0: blok {block_threads} przekracza limit urządzenia {}",
+                    caps.max_threads_per_block
+                )));
+            }
+            (
+                self.artifacts.get("gemm_q8_0_i8mma_b8")?,
+                LaunchConfig {
+                    grid: (rows_u32.div_ceil(rows_per_block), 1, 1),
+                    block: (block_threads, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                LaunchArgs::new()
+                    .buf(y)
+                    .buf_at(w_q8, w_byte_off)?
+                    .buf(prepared.scratch.xq.as_ref().expect("xq prepared"))
+                    .buf(prepared.scratch.xd.as_ref().expect("xd prepared"))
+                    .scalar(cols_i64)
+                    .scalar(rows_i64)
+                    .scalar(n_tokens_i64),
+            )
+        } else {
+            let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
+            (
+                self.artifacts.get(&format!("gemm_q8_0_i8mma{suffix}"))?,
+                LaunchConfig {
+                    grid: (rows_u32.div_ceil(bn), (n_tokens as u32).div_ceil(bm), 1),
+                    block: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                LaunchArgs::new()
+                    .buf(y)
+                    .buf_at(w_q8, w_byte_off)?
+                    .buf(prepared.scratch.xq.as_ref().expect("xq prepared"))
+                    .buf(prepared.scratch.xd.as_ref().expect("xd prepared"))
+                    .buf(prepared.scratch.xsm.as_ref().expect("xsm prepared"))
+                    .scalar(cols_i64)
+                    .scalar(rows_i64)
+                    .scalar(n_tokens_i64),
+            )
+        };
+        #[cfg(test)]
+        PREPARED_Q8_GEMM_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+        self.device.launch(kernel, &cfg, &args, prepared.stream)?;
+        if let Err(error) =
+            mark_prepared_q8_ready(self.device.as_ref(), &mut prepared.scratch, prepared.stream)
+        {
+            prepared.valid = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Uruchamia trzy projekcje Q8_0 w jednym gridzie na wspólnej aktywacji Q8_1.
+    pub fn gemm_q8_0_i8mma_prepared_triplet(
+        &self,
+        projections: &[Q8PreparedProjection<'_>; 3],
+        prepared: &mut Q8ActPrepared<'_>,
+        cols: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        if !prepared.valid {
+            return Err(ForgeError::Kernel(
+                "prepared Q8 handle jest nieważny po błędzie markera".into(),
+            ));
+        }
+        if prepared.cols != cols || prepared.n_tokens != n_tokens || n_tokens < 32 {
+            return Err(ForgeError::Kernel(format!(
+                "fused prepared Q8 wymaga zgodnych wymiarów T>=32, otrzymano cols={cols}, T={n_tokens}"
+            )));
+        }
+        let caps = self.device.caps();
+        if caps.vendor != forge_types::Vendor::Nvidia
+            || caps.warp_size != 32
+            || caps.max_threads_per_block < BLOCK
+        {
+            return Err(ForgeError::Unsupported(
+                "fused prepared Q8 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
+            ));
+        }
+        for projection in projections {
+            if projection.rows == 0 {
+                return Err(ForgeError::Kernel(
+                    "fused prepared Q8 wymaga rows > 0 dla każdej projekcji".into(),
+                ));
+            }
+            let output_bytes =
+                checked_buffer_bytes("fused prepared Q8 output", &[n_tokens, projection.rows], 2)?;
+            let weight_bytes = checked_buffer_bytes(
+                "fused prepared Q8 weights",
+                &[projection.rows, cols / 32],
+                34,
+            )?;
+            let weight_end = projection
+                .weight_byte_offset
+                .checked_add(weight_bytes)
+                .ok_or_else(|| ForgeError::Kernel("fused prepared Q8: przepełnienie wag".into()))?;
+            if projection.output.len() < output_bytes || projection.weights.len() < weight_end {
+                return Err(ForgeError::Kernel(
+                    "fused prepared Q8: bufor wyjścia lub wag jest za mały".into(),
+                ));
+            }
+        }
+        let cols_i64 = i64::try_from(cols)
+            .map_err(|_| ForgeError::Kernel("fused prepared Q8: cols przekracza i64".into()))?;
+        let n_tokens_i64 = i64::try_from(n_tokens)
+            .map_err(|_| ForgeError::Kernel("fused prepared Q8: T przekracza i64".into()))?;
+        let rows = projections
+            .iter()
+            .map(|projection| {
+                i64::try_from(projection.rows).map_err(|_| {
+                    ForgeError::Kernel("fused prepared Q8: rows przekracza i64".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (kernel_name, bm, bn, block) = if n_tokens >= 1024
+            && caps.max_threads_per_block >= 512
+            && self
+                .artifacts
+                .has("gemm_q8_0_i8mma_triplet_single_big_poststage")
+        {
+            (
+                "gemm_q8_0_i8mma_triplet_single_big_poststage",
+                128,
+                128,
+                512,
+            )
+        } else if n_tokens >= 1024
+            && caps.max_threads_per_block >= 512
+            && self.artifacts.has("gemm_q8_0_i8mma_triplet_single_big")
+        {
+            ("gemm_q8_0_i8mma_triplet_single_big", 128, 128, 512)
+        } else if self.artifacts.has("gemm_q8_0_i8mma_triplet_single_bm64") {
+            ("gemm_q8_0_i8mma_triplet_single_bm64", 64, 64, BLOCK)
+        } else if n_tokens >= 256 {
+            for projection in projections {
+                self.gemm_q8_0_i8mma_prepared_at(
+                    projection.output,
+                    projection.weights,
+                    projection.weight_byte_offset,
+                    prepared,
+                    projection.rows,
+                    cols,
+                    n_tokens,
+                )?;
+            }
+            return Ok(());
+        } else {
+            ("gemm_q8_0_i8mma_triplet_bm64", 64, 64, BLOCK)
+        };
+        let row_blocks = projections.iter().try_fold(0u32, |sum, projection| {
+            let rows = u32::try_from(projection.rows)
+                .map_err(|_| ForgeError::Kernel("fused prepared Q8: rows przekracza u32".into()))?;
+            sum.checked_add(rows.div_ceil(bn))
+                .ok_or_else(|| ForgeError::Kernel("fused prepared Q8: grid przekracza u32".into()))
+        })?;
+        let kernel = self.artifacts.get(kernel_name)?;
         let cfg = LaunchConfig {
-            grid: (rows_u32.div_ceil(rows_per_block), 1, 1),
-            block: (block_threads, 1, 1),
+            grid: (row_blocks, (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(y)
-            .buf_at(w_q8, w_byte_off)?
+            .buf(projections[0].output)
+            .buf_at(projections[0].weights, projections[0].weight_byte_offset)?
+            .scalar(rows[0])
+            .buf(projections[1].output)
+            .buf_at(projections[1].weights, projections[1].weight_byte_offset)?
+            .scalar(rows[1])
+            .buf(projections[2].output)
+            .buf_at(projections[2].weights, projections[2].weight_byte_offset)?
+            .scalar(rows[2])
             .buf(prepared.scratch.xq.as_ref().expect("xq prepared"))
             .buf(prepared.scratch.xd.as_ref().expect("xd prepared"))
+            .buf(prepared.scratch.xsm.as_ref().expect("xsm prepared"))
             .scalar(cols_i64)
-            .scalar(rows_i64)
             .scalar(n_tokens_i64);
         #[cfg(test)]
         PREPARED_Q8_GEMM_LAUNCHES.fetch_add(1, Ordering::SeqCst);
@@ -5709,6 +8296,61 @@ impl Kernels {
         self.device.launch(kernel, &cfg, &args, stream)
     }
 
+    /// Pakuje wyrównane okno resident S0 N64/K128 do E4M3 bez row-major.
+    pub fn pack_nvfp4_ct_s0_fp8(
+        &self,
+        output: &DevBuffer,
+        output_scales: &DevBuffer,
+        weights: Nvfp4CtS0View<'_>,
+        source_row_offset: usize,
+        rows: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0
+            || !rows.is_multiple_of(64)
+            || !source_row_offset.is_multiple_of(64)
+            || !inv_global_scale.is_finite()
+        {
+            return Err(ForgeError::Kernel(
+                "pack NVFP4 CT wymaga wyrównanego okna N64 i skończonej skali".into(),
+            ));
+        }
+        let source_end = source_row_offset.checked_add(rows).ok_or_else(|| {
+            ForgeError::Kernel("pack NVFP4 CT: przepełnienie zakresu wierszy".into())
+        })?;
+        if source_end > weights.rows {
+            return Err(ForgeError::Kernel(
+                "pack NVFP4 CT: okno wykracza poza resident".into(),
+            ));
+        }
+        let output_bytes =
+            checked_buffer_bytes("pack NVFP4 CT output", &[rows, weights.cols], 1)?;
+        let scale_bytes = checked_buffer_bytes("pack NVFP4 CT scales", &[rows], 4)?;
+        if output.len() < output_bytes || output_scales.len() < scale_bytes {
+            return Err(ForgeError::Kernel(
+                "pack NVFP4 CT: bufor wyjściowy jest za mały".into(),
+            ));
+        }
+        let grid_x = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("pack NVFP4 CT: siatka przekracza u32".into()))?;
+        let kernel = self.artifacts.get("pack_nvfp4_ct_s0_fp8")?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(output_scales)
+            .buf(weights.buffer)
+            .scalar(weights.cols as i64)
+            .scalar(source_row_offset as i64)
+            .scalar(rows as i64)
+            .scalar(inv_global_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Przepakowuje rezydentną macierz Q8_0 do bloków GGUF NVFP4 na GPU.
     pub fn pack_q8_0_nvfp4_gguf(
         &self,
@@ -5832,9 +8474,26 @@ impl Kernels {
                 "gemm_fp8_modular requires cols % 64 == 0, got {cols}"
             )));
         }
+        let caps = self.device.caps();
+        let use_bn256 = fp8_modular_bn256_capable(
+            caps.vendor,
+            caps.warp_size,
+            caps.max_threads_per_block,
+            caps.max_shared_mem_per_block,
+            rows,
+            cols,
+            n_tokens,
+            |name| self.artifacts.has(name),
+        );
+        let base_kernel_name = format!("gemm_fp8_mod_{rows}_{cols}");
+        let kernel_name = if use_bn256 {
+            fp8_modular_bn256_kernel(rows, cols).expect("kształt sprawdzony przez capability")
+        } else {
+            base_kernel_name.as_str()
+        };
         let gk = self
             .artifacts
-            .get(&format!("gemm_fp8_mod_{rows}_{cols}"))
+            .get(kernel_name)
             .map_err(|_| {
                 ForgeError::Kernel(format!(
                     "gemm_fp8_modular: no committed Modular fp8 kernel for \
@@ -5879,14 +8538,19 @@ impl Kernels {
 
         // multistage GEMM: y = diag(xs)·(xq·wᵀ)·diag(ws), fused epilogue. Params
         // mirror gemm_fp8_mod(y, a=xq, b=w, xs, ws, m=n_tokens).
+        let (row_tile, block_threads, shared_mem_bytes) = if use_bn256 {
+            (256, 256, FP8_MODULAR_BN256_SMEM as u32)
+        } else {
+            (128, 128, 65_536)
+        };
         let cfg = LaunchConfig {
             grid: (
-                (rows as u32).div_ceil(128),
+                (rows as u32).div_ceil(row_tile),
                 (n_tokens as u32).div_ceil(128),
                 1,
             ),
-            block: (128, 1, 1),
-            shared_mem_bytes: 65536,
+            block: (block_threads, 1, 1),
+            shared_mem_bytes,
         };
         let args = LaunchArgs::new()
             .buf(y)
@@ -6016,9 +8680,26 @@ impl Kernels {
                 "gemm_fp8_modular_prequant requires cols % 64 == 0, got {cols}"
             )));
         }
+        let caps = self.device.caps();
+        let use_bn256 = fp8_modular_bn256_capable(
+            caps.vendor,
+            caps.warp_size,
+            caps.max_threads_per_block,
+            caps.max_shared_mem_per_block,
+            rows,
+            cols,
+            n_tokens,
+            |name| self.artifacts.has(name),
+        );
+        let base_kernel_name = format!("gemm_fp8_mod_{rows}_{cols}");
+        let kernel_name = if use_bn256 {
+            fp8_modular_bn256_kernel(rows, cols).expect("kształt sprawdzony przez capability")
+        } else {
+            base_kernel_name.as_str()
+        };
         let gk = self
             .artifacts
-            .get(&format!("gemm_fp8_mod_{rows}_{cols}"))
+            .get(kernel_name)
             .map_err(|_| {
                 ForgeError::Kernel(format!(
                     "gemm_fp8_modular_prequant: no committed Modular fp8 kernel for \
@@ -6035,14 +8716,19 @@ impl Kernels {
         }
         let xq = sc.xq.as_ref().expect("xq filled by fused norm");
         let xs = sc.xs.as_ref().expect("xs filled by fused norm");
+        let (row_tile, block_threads, shared_mem_bytes) = if use_bn256 {
+            (256, 256, FP8_MODULAR_BN256_SMEM as u32)
+        } else {
+            (128, 128, 65_536)
+        };
         let cfg = LaunchConfig {
             grid: (
-                (rows as u32).div_ceil(128),
+                (rows as u32).div_ceil(row_tile),
                 (n_tokens as u32).div_ceil(128),
                 1,
             ),
-            block: (128, 1, 1),
-            shared_mem_bytes: 65536,
+            block: (block_threads, 1, 1),
+            shared_mem_bytes,
         };
         let args = LaunchArgs::new()
             .buf(y)
@@ -6263,16 +8949,6 @@ impl Kernels {
                 "gemm_q6_k requires cols % 256 == 0, got {cols}"
             )));
         }
-        // Prefer the native-GGUF-layout Mojo int8 Q6_K multistage GEMM (reads the
-        // raw `DevWeight::Q6K.buf` bytes in-kernel, bit-exact vs Q6_K × q8_1 by
-        // construction). Prefill-sized batches whose (rows,cols) has a committed
-        // (N,K,MPAD) instance and T ≤ 4096; anything else falls through to the f16
-        // Q6_K kernel below.
-        if n_tokens >= 64
-            && self.gemm_q6k_i8_native(y, w_q6k, w_byte_off, x, rows, cols, n_tokens, stream)?
-        {
-            return Ok(());
-        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q6_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -6295,10 +8971,13 @@ impl Kernels {
     }
 
     /// Paged flash-decode attention. Layouts documented in attention.mojo.
+    /// Wartości długości sekwencji i fizyczne identyfikatory stron są
+    /// przygotowywane oraz walidowane przez właściciela cache przed wywołaniem.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_f16(
         &self,
         out: &DevBuffer,
+        parts: &DevBuffer,
         q: &DevBuffer,
         k_cache: &DevBuffer,
         v_cache: &DevBuffer,
@@ -6313,19 +8992,76 @@ impl Kernels {
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        let name = match head_dim {
-            64 => "attn_decode_f16_hd64",
-            128 => "attn_decode_f16_hd128",
-            256 => "attn_decode_f16_hd256",
-            other => {
-                return Err(ForgeError::Unsupported(format!(
-                    "attn_decode: head_dim {other} has no compiled specialization"
-                )))
-            }
+        let caps = self.device.caps();
+        let split8_available = self.artifacts.has("attn_decode_split8_f16_hd256")
+            && self.artifacts.has("attn_decode_split8_combine_f16_hd256");
+        let plan = attn_decode_plan(
+            head_dim,
+            caps.vendor,
+            caps.warp_size,
+            caps.max_threads_per_block,
+            split8_available,
+        )?;
+        let (grid_x, grid_y) = validate_attn_decode_f16(
+            out.len(),
+            parts.len(),
+            q.len(),
+            k_cache.len(),
+            v_cache.len(),
+            page_table.len(),
+            seq_lens.len(),
+            n_seqs,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            page_size,
+            max_pages,
+            scale,
+            plan == AttnDecodePlan::Split8Hd256,
+        )?;
+        if plan == AttnDecodePlan::Split8Hd256 {
+            let partial = self.artifacts.get("attn_decode_split8_f16_hd256")?;
+            let partial_config = LaunchConfig {
+                grid: (grid_x, grid_y, ATTN_HD256_SPLITS as u32),
+                block: (ATTN_HD256_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let partial_args = LaunchArgs::new()
+                .buf(parts)
+                .buf(q)
+                .buf(k_cache)
+                .buf(v_cache)
+                .buf(page_table)
+                .buf(seq_lens)
+                .scalar(n_q_heads as i64)
+                .scalar(n_kv_heads as i64)
+                .scalar(page_size as i64)
+                .scalar(max_pages as i64)
+                .scalar(scale);
+            self.device
+                .launch(partial, &partial_config, &partial_args, stream)?;
+
+            let combine = self.artifacts.get("attn_decode_split8_combine_f16_hd256")?;
+            let combine_config = LaunchConfig {
+                grid: (grid_x, grid_y, 1),
+                block: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let combine_args = LaunchArgs::new()
+                .buf(out)
+                .buf(parts)
+                .scalar(n_q_heads as i64);
+            return self
+                .device
+                .launch(combine, &combine_config, &combine_args, stream);
+        }
+        let name = match plan {
+            AttnDecodePlan::Generic(name) => name,
+            AttnDecodePlan::Split8Hd256 => unreachable!("split8 zwraca wynik przed fallbackiem"),
         };
         let k = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
-            grid: (n_seqs as u32, n_q_heads as u32, 1),
+            grid: (grid_x, grid_y, 1),
             block: (ATTN_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -6381,6 +9117,96 @@ impl Kernels {
             .scalar(max_pages as i64)
             .scalar(scale);
         self.device.launch(kernel, &config, &args, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_verify_split8_f16_hd256(
+        &self,
+        out: &DevBuffer,
+        parts: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        seq_lens: &DevBuffer,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        max_pages: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let caps = self.device.caps();
+        if !verify_attn_split8_enabled(std::env::var("FORGE_VERIFY_ATTN_SPLIT8").ok().as_deref())
+            || !matches!(n_tokens, 3 | 4)
+            || caps.vendor != forge_types::Vendor::Nvidia
+            || caps.warp_size != 32
+            || caps.max_threads_per_block < 256
+            || caps.max_shared_mem_per_block < 33_024
+        {
+            return Ok(false);
+        }
+        let partial_name = format!("attn_verify_split8_f16_hd256_t{n_tokens}");
+        let combine_name = "attn_verify_split8_combine_f16_hd256";
+        if !self.artifacts.has(&partial_name) || !self.artifacts.has(combine_name) {
+            return Ok(false);
+        }
+        let (grid_y, combine_grid_y) = validate_attn_verify_split8(
+            out.len(),
+            parts.len(),
+            q.len(),
+            k_cache.len(),
+            v_cache.len(),
+            page_table.len(),
+            seq_lens.len(),
+            n_tokens,
+            n_q_heads,
+            n_kv_heads,
+            page_size,
+            max_pages,
+            scale,
+        )?;
+        let partial = self.artifacts.get(&partial_name)?;
+        let args = LaunchArgs::new()
+            .buf(parts)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .buf(seq_lens)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(max_pages as i64)
+            .scalar(scale);
+        self.device.launch(
+            partial,
+            &LaunchConfig {
+                grid: (1, grid_y, 8),
+                block: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &args,
+            stream,
+        )?;
+        let combine = self.artifacts.get(combine_name)?;
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(parts)
+            .scalar(n_tokens as i64)
+            .scalar(n_q_heads as i64);
+        self.device.launch(
+            combine,
+            &LaunchConfig {
+                grid: (1, combine_grid_y, 1),
+                block: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &args,
+            stream,
+        )?;
+        Ok(true)
     }
 
     /// Rows each warp computes in the norm-recomputing fused decode kernels.
@@ -6475,6 +9301,43 @@ impl Kernels {
             .buf(norm_w)
             .scalar(cols as i64)
             .scalar(rows as i64)
+            .scalar(inv_global_scale)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + NVFP4 GEMV z naturalnego układu S0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_nvfp4_ct_s0_f16(
+        &self,
+        y: &DevBuffer,
+        weights: Nvfp4CtS0View<'_>,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inv_global_scale: f32,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(weights.cols, 128, "gemv_norm_nvfp4_ct_s0")?;
+        let k = self.artifacts.get("gemv_norm_nvfp4_ct_s0_f16")?;
+        let rpw = Self::fused_rows_per_warp(weights.rows);
+        let cfg = LaunchConfig {
+            grid: ((weights.rows as u32).div_ceil(16 * rpw as u32), 1, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(weights.buffer)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(weights.cols as i64)
+            .scalar(weights.rows as i64)
             .scalar(inv_global_scale)
             .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
             .scalar(eps)
@@ -6669,6 +9532,47 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Fused rmsnorm-recompute + gate|up S0 GEMV + SiLU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_nvfp4_ct_s0_f16(
+        &self,
+        act: &DevBuffer,
+        weights: Nvfp4CtS0View<'_>,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        inv_global_scale: f32,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(weights.cols, 128, "gemv_norm_silu_nvfp4_ct_s0")?;
+        if weights.rows != inter * 2 {
+            return Err(ForgeError::Kernel(
+                "gemv_norm_silu NVFP4 CT wymaga pełnego gate|up".into(),
+            ));
+        }
+        let k = self.artifacts.get("gemv_norm_silu_nvfp4_ct_s0_f16")?;
+        let rpw = 3usize;
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(16 * rpw as u32), 1, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(weights.buffer)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(weights.cols as i64)
+            .scalar(inter as i64)
+            .scalar(inv_global_scale)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Fused rmsnorm-recompute + gate|up f16 GEMV + SiLU (decode FFN).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_norm_silu_f16(
@@ -6841,6 +9745,39 @@ impl Kernels {
             .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64)
+            .scalar(inv_global_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// NVFP4 S0 GEMV + residual add.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_nvfp4_ct_s0_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        weights: Nvfp4CtS0View<'_>,
+        x: &DevBuffer,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !weights.cols.is_multiple_of(128) {
+            return Err(ForgeError::Kernel(
+                "gemv_residual NVFP4 CT wymaga K128".into(),
+            ));
+        }
+        let k = self.artifacts.get("gemv_residual_nvfp4_ct_s0_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((weights.rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(weights.buffer)
+            .buf(x)
+            .scalar(weights.cols as i64)
+            .scalar(weights.rows as i64)
             .scalar(inv_global_scale);
         self.device.launch(k, &cfg, &args, stream)
     }
@@ -8190,6 +11127,9 @@ impl Kernels {
         }
         #[cfg(debug_assertions)]
         {
+            // Kopie histogramu mogą oczekiwać na nieblokującym streamie modelu;
+            // synchroniczny odczyt hostowy nie może ich wyprzedzić.
+            self.device.synchronize()?;
             let mut host_ids = vec![0u8; histogram_bytes];
             let mut host_counts = vec![0u8; histogram_bytes];
             self.device.read(ids, 0, &mut host_ids)?;
@@ -12425,21 +15365,587 @@ impl Kernels {
 #[cfg(test)]
 mod nvfp4_gguf_dispatch_tests {
     use super::{
-        ensure_prepared_q8_usable, lock_prepared_q8_scratch, nvfp4_gguf_dispatch,
-        q8_nvfp4_pack_launch, raw_nvfp4_dp4a_supported, resolve_prepared_q8_marker, Kernels,
-        PrequantScratch, PREPARED_Q8_GEMM_LAUNCHES, PREPARED_Q8_RECORD_FAILURES,
-        PREPARED_Q8_SYNC_FAILURES, validate_kv_append_batch_segmented_masked_f16,
-        has_hybrid_prefill_b2_artifacts, HYBRID_PREFILL_B2_ARTIFACTS,
-        has_hybrid_prefill_t128_artifacts, hybrid_prefill_nvfp4_artifact_chunk_limit,
-        HYBRID_PREFILL_T128_ARTIFACTS,
+        attn_decode_plan, delta_state_layout_dispatch, dense_prefill_artifacts_capable,
+        dense_prefill_backend_capable, ensure_prepared_q8_usable, has_delta_value_key_artifacts,
+        has_hybrid_prefill_b2_artifacts, has_hybrid_prefill_t128_artifacts,
+        has_nvfp4_gguf_tile_artifacts, hybrid_prefill_nvfp4_artifact_chunk_limit,
+        lock_prepared_q8_scratch, fp8_modular_bn256_capable,
+        nvfp4_gguf_dispatch as nvfp4_gguf_dispatch_impl,
+        nvfp4_gguf_layout_dispatch, nvfp4_ct_s0_manual_capable,
+        nvfp4_ct_split_pipeline_supported, q8_nvfp4_pack_launch,
+        raw_nvfp4_dp4a_supported, resolve_prepared_q8_marker, validate_attn_decode_f16,
+        validate_attn_prefill_fa_f16_hd256, validate_attn_verify_split8,
+        validate_deltanet_gated_step_f16, validate_f32_byte_offset,
+        validate_kv_append_batch_segmented_f16, validate_kv_append_batch_segmented_masked_f16,
+        validate_nvfp4_ct_b1_extents, validate_nvfp4_ct_repack_extents,
+        verify_attn_split8_enabled, AttnDecodePlan, DeltaStateLayout, DensePrefillLogitsKind,
+        Kernels, Nvfp4GgufLayout, PrequantScratch, Q8PreparedProjection,
+        HYBRID_PREFILL_B2_ARTIFACTS, HYBRID_PREFILL_T128_ARTIFACTS, PREPARED_Q8_GEMM_LAUNCHES,
+        PREPARED_Q8_RECORD_FAILURES, PREPARED_Q8_SYNC_FAILURES, NVFP4_CT_S0_ARTIFACTS,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::cuda::{CudaDevice, PoolSizes};
     use forge_hal::{Device, Pool};
-    use forge_types::{ForgeError, MemKind};
+    use forge_types::{ForgeError, MemKind, Vendor};
     use half::f16;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn fp8_bn256_wymaga_pelnego_m1024_i_zasobow() {
+        assert!(fp8_modular_bn256_capable(
+            Vendor::Nvidia,
+            32,
+            1024,
+            100 * 1024,
+            11264,
+            4096,
+            1024,
+            |_| true,
+        ));
+        for tokens in [128, 256, 512, 640, 768, 896] {
+            assert!(!fp8_modular_bn256_capable(
+                Vendor::Nvidia,
+                32,
+                1024,
+                100 * 1024,
+                11264,
+                4096,
+                tokens,
+                |_| true,
+            ));
+        }
+        assert!(!fp8_modular_bn256_capable(
+            Vendor::Amd,
+            64,
+            1024,
+            128 * 1024,
+            11264,
+            4096,
+            1024,
+            |_| true,
+        ));
+        assert!(!fp8_modular_bn256_capable(
+            Vendor::Nvidia,
+            32,
+            1024,
+            64 * 1024,
+            11264,
+            4096,
+            1024,
+            |_| true,
+        ));
+        assert!(!fp8_modular_bn256_capable(
+            Vendor::Nvidia,
+            32,
+            1024,
+            100 * 1024,
+            4096,
+            11264,
+            1024,
+            |_| true,
+        ));
+        assert!(!fp8_modular_bn256_capable(
+            Vendor::Nvidia,
+            32,
+            1024,
+            100 * 1024,
+            4096,
+            4096,
+            1024,
+            |_| false,
+        ));
+    }
+
+    #[test]
+    fn split8_verifiera_ma_jawny_kill_switch() {
+        assert!(verify_attn_split8_enabled(None));
+        assert!(verify_attn_split8_enabled(Some("auto")));
+        assert!(verify_attn_split8_enabled(Some("1")));
+        assert!(!verify_attn_split8_enabled(Some("0")));
+        assert!(!verify_attn_split8_enabled(Some("false")));
+        assert!(!verify_attn_split8_enabled(Some("")));
+    }
+
+    #[test]
+    fn nvfp4_ct_wymaga_sm80_warp32_i_pelnego_zestawu() {
+        assert!(nvfp4_ct_s0_manual_capable(
+            Vendor::Nvidia,
+            "sm_80",
+            32,
+            256,
+            |_| true,
+        ));
+        for missing in NVFP4_CT_S0_ARTIFACTS {
+            assert!(!nvfp4_ct_s0_manual_capable(
+                Vendor::Nvidia,
+                "sm_89",
+                32,
+                256,
+                |name| name != missing,
+            ));
+        }
+        assert!(!nvfp4_ct_s0_manual_capable(
+            Vendor::Nvidia,
+            "sm_75",
+            32,
+            1024,
+            |_| true,
+        ));
+        assert!(!nvfp4_ct_s0_manual_capable(
+            Vendor::Amd,
+            "gfx942",
+            64,
+            1024,
+            |_| true,
+        ));
+        assert!(!nvfp4_ct_s0_manual_capable(
+            Vendor::Nvidia,
+            "sm_90",
+            64,
+            1024,
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn nvfp4_ct_odrzuca_split_k_krotszy_od_potokowania() {
+        for split_stages in 0..4 {
+            assert!(!nvfp4_ct_split_pipeline_supported(split_stages, 1, 4));
+        }
+        assert!(!nvfp4_ct_split_pipeline_supported(13, 4, 3));
+        assert!(nvfp4_ct_split_pipeline_supported(8, 1, 4));
+        assert!(nvfp4_ct_split_pipeline_supported(32, 3, 4));
+        assert!(nvfp4_ct_split_pipeline_supported(32, 4, 4));
+        assert!(nvfp4_ct_split_pipeline_supported(32, 1, 3));
+        assert!(nvfp4_ct_split_pipeline_supported(88, 4, 4));
+        assert!(!nvfp4_ct_split_pipeline_supported(32, 9, 4));
+    }
+
+    #[test]
+    fn nvfp4_ct_repack_waliduje_extenty_i_overflow() {
+        assert_eq!(
+            validate_nvfp4_ct_repack_extents(9216, 4096, 512, 128, 128, 64, 64)
+                .unwrap(),
+            1
+        );
+        assert!(
+            validate_nvfp4_ct_repack_extents(9216 + 256, 4096, 512, 128, 128, 64, 64)
+                .is_err()
+        );
+        assert!(
+            validate_nvfp4_ct_repack_extents(9216, 4095, 512, 128, 128, 64, 64)
+                .is_err()
+        );
+        assert!(
+            validate_nvfp4_ct_repack_extents(
+                9216,
+                4096,
+                512,
+                usize::MAX - 63,
+                128,
+                64,
+                usize::MAX - 63,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nvfp4_ct_b1_waliduje_okno_i_overflow() {
+        assert_eq!(
+            validate_nvfp4_ct_b1_extents(128 + 256, 256, 128, 128, 64, 64, 1.0)
+                .unwrap(),
+            8
+        );
+        assert!(validate_nvfp4_ct_b1_extents(127, 256, 128, 128, 64, 64, 1.0).is_err());
+        assert!(
+            validate_nvfp4_ct_b1_extents(
+                128,
+                256,
+                usize::MAX,
+                128,
+                usize::MAX - 63,
+                64,
+                1.0,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_nvfp4_ct_b1_extents(128, 256, 128, 128, 64, 64, f32::NAN).is_err()
+        );
+    }
+
+    #[test]
+    fn split8_verifiera_waliduje_wszystkie_extenty_i_overflow() {
+        let valid = [
+            3 * 24 * 256 * 2,
+            3 * 24 * 8 * 260 * 4,
+            3 * 24 * 256 * 2,
+            136 * 4 * 32 * 256 * 2,
+            136 * 4 * 32 * 256 * 2,
+            136 * 4,
+            3 * 4,
+        ];
+        let check = |sizes: [usize; 7], tokens, heads, kv_heads, page, pages, scale| {
+            validate_attn_verify_split8(
+                sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], sizes[5], sizes[6], tokens,
+                heads, kv_heads, page, pages, scale,
+            )
+        };
+        assert_eq!(check(valid, 3, 24, 4, 32, 136, 0.0625).unwrap(), (24, 72));
+        for index in 0..valid.len() {
+            let mut undersized = valid;
+            undersized[index] -= 1;
+            assert!(check(undersized, 3, 24, 4, 32, 136, 0.0625).is_err());
+        }
+        assert!(check(valid, 2, 24, 4, 32, 136, 0.0625).is_err());
+        assert!(check(valid, 3, 0, 4, 32, 136, 0.0625).is_err());
+        assert!(check(valid, 3, 24, 5, 32, 136, 0.0625).is_err());
+        assert!(check(valid, 3, 24, 4, 0, 136, 0.0625).is_err());
+        assert!(check(valid, 3, 24, 4, 32, 0, 0.0625).is_err());
+        assert!(check(valid, 3, 24, 4, 32, 136, f32::NAN).is_err());
+        assert!(check([usize::MAX; 7], 4, usize::MAX, 1, 1, 1, 1.0).is_err());
+    }
+
+    fn nvfp4_gguf_dispatch(
+        n_tokens: usize,
+        n_rows: usize,
+        prefetch_available: bool,
+        is_nvidia: bool,
+        warp_size: u32,
+        max_threads: u32,
+    ) -> forge_types::Result<super::Nvfp4GgufDispatch> {
+        nvfp4_gguf_dispatch_impl(
+            n_tokens,
+            n_rows,
+            5120,
+            prefetch_available,
+            false,
+            false,
+            is_nvidia,
+            warp_size,
+            max_threads,
+        )
+    }
+
+    #[test]
+    fn waliduje_kontrakt_flash_attention_prefill_hd256() {
+        let query = 64 * 8 * 256 * 2;
+        let cache = 2 * 256 * 256 * 2;
+        assert_eq!(
+            validate_attn_prefill_fa_f16_hd256(
+                query, query, cache, cache, 4, 0, 64, 8, 2, 256, 0.0625,
+            )
+            .unwrap(),
+            (1, 8)
+        );
+        assert!(validate_attn_prefill_fa_f16_hd256(
+            query, query, cache, cache, 4, 0, 64, 7, 2, 256, 0.0625,
+        )
+        .is_err());
+        assert!(validate_attn_prefill_fa_f16_hd256(
+            query - 2,
+            query,
+            cache,
+            cache,
+            4,
+            0,
+            64,
+            8,
+            2,
+            256,
+            0.0625,
+        )
+        .is_err());
+        assert!(validate_attn_prefill_fa_f16_hd256(
+            query,
+            query,
+            cache,
+            cache,
+            4,
+            0,
+            64,
+            8,
+            2,
+            256,
+            f32::NAN,
+        )
+        .is_err());
+        assert!(validate_attn_prefill_fa_f16_hd256(
+            query,
+            query,
+            cache,
+            cache,
+            4,
+            usize::MAX,
+            64,
+            8,
+            2,
+            256,
+            0.0625,
+        )
+        .is_err());
+        assert!(validate_attn_prefill_fa_f16_hd256(
+            query, query, cache, cache, 4, 256, 64, 8, 2, 256, 0.0625,
+        )
+        .is_err());
+        assert!(validate_attn_prefill_fa_f16_hd256(
+            query, query, cache, cache, 8, 0, 64, 8, 2, 256, 0.0625,
+        )
+        .is_ok());
+        assert!(validate_attn_prefill_fa_f16_hd256(
+            query,
+            query,
+            cache / 2,
+            cache / 2,
+            8,
+            256,
+            64,
+            8,
+            2,
+            256,
+            0.0625,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn split8_hd256_wymaga_nvidia_warp32_i_kompletu_artefaktow() {
+        assert_eq!(
+            attn_decode_plan(256, forge_types::Vendor::Nvidia, 32, 1024, true).unwrap(),
+            AttnDecodePlan::Split8Hd256
+        );
+        for plan in [
+            attn_decode_plan(256, forge_types::Vendor::Amd, 64, 1024, true).unwrap(),
+            attn_decode_plan(256, forge_types::Vendor::Apple, 32, 1024, true).unwrap(),
+            attn_decode_plan(256, forge_types::Vendor::Nvidia, 64, 1024, true).unwrap(),
+            attn_decode_plan(256, forge_types::Vendor::Nvidia, 32, 128, true).unwrap(),
+            attn_decode_plan(256, forge_types::Vendor::Nvidia, 32, 1024, false).unwrap(),
+        ] {
+            assert_eq!(plan, AttnDecodePlan::Generic("attn_decode_f16_hd256"));
+        }
+    }
+
+    #[test]
+    fn waliduje_pelny_kontrakt_attention_decode() {
+        let vectors = 2 * 4 * 256 * 2;
+        let cache = 2 * 32 * 256 * 2;
+        let parts = 2 * 4 * 8 * 260 * 4;
+        assert_eq!(
+            validate_attn_decode_f16(
+                vectors,
+                parts,
+                vectors,
+                cache,
+                cache,
+                2 * 8 * 4,
+                2 * 4,
+                2,
+                4,
+                2,
+                256,
+                32,
+                8,
+                0.0625,
+                true,
+            )
+            .unwrap(),
+            (2, 4)
+        );
+        assert!(validate_attn_decode_f16(
+            vectors,
+            parts - 4,
+            vectors,
+            cache,
+            cache,
+            2 * 8 * 4,
+            2 * 4,
+            2,
+            4,
+            2,
+            256,
+            32,
+            8,
+            0.0625,
+            true,
+        )
+        .is_err());
+        assert!(validate_attn_decode_f16(
+            vectors,
+            parts,
+            vectors,
+            cache,
+            cache,
+            2 * 8 * 4,
+            2 * 4,
+            2,
+            3,
+            2,
+            256,
+            32,
+            8,
+            0.0625,
+            true,
+        )
+        .is_err());
+        assert!(validate_attn_decode_f16(
+            vectors,
+            parts,
+            vectors,
+            cache,
+            cache,
+            2 * 8 * 4,
+            2 * 4,
+            0,
+            4,
+            2,
+            256,
+            32,
+            8,
+            0.0625,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn waliduje_pelny_kontrakt_kroku_deltanet() {
+        let vectors = 48 * 128 * 2;
+        let state = 48 * 128 * 128 * 4;
+        let gates = 48 * 4;
+        assert_eq!(
+            validate_deltanet_gated_step_f16(
+                vectors, state, vectors, vectors, vectors, gates, gates, 48, 128, 1024,
+            )
+            .unwrap(),
+            (48, 128)
+        );
+        for invalid in [
+            validate_deltanet_gated_step_f16(
+                vectors, state, vectors, vectors, vectors, gates, gates, 0, 128, 1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors, state, vectors, vectors, vectors, gates, gates, 48, 0, 1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors, state, vectors, vectors, vectors, gates, gates, 48, 128, 64,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors, state, vectors, vectors, vectors, gates, gates, 48, 1025, 2048,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors,
+                state,
+                vectors,
+                vectors,
+                vectors,
+                gates,
+                gates,
+                u32::MAX as usize + 1,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors - 1,
+                state,
+                vectors,
+                vectors,
+                vectors,
+                gates,
+                gates,
+                48,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors,
+                state - 1,
+                vectors,
+                vectors,
+                vectors,
+                gates,
+                gates,
+                48,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors,
+                state,
+                vectors - 1,
+                vectors,
+                vectors,
+                gates,
+                gates,
+                48,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors,
+                state,
+                vectors,
+                vectors - 1,
+                vectors,
+                gates,
+                gates,
+                48,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors,
+                state,
+                vectors,
+                vectors,
+                vectors - 1,
+                gates,
+                gates,
+                48,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors,
+                state,
+                vectors,
+                vectors,
+                vectors,
+                gates - 1,
+                gates,
+                48,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                vectors,
+                state,
+                vectors,
+                vectors,
+                vectors,
+                gates,
+                gates - 1,
+                48,
+                128,
+                1024,
+            ),
+            validate_deltanet_gated_step_f16(
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                128,
+                1024,
+            ),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
 
     #[test]
     fn prefill_b2_wymaga_pelnego_zestawu_artefaktow() {
@@ -12455,6 +15961,121 @@ mod nvfp4_gguf_dispatch_tests {
         for missing in HYBRID_PREFILL_T128_ARTIFACTS {
             assert!(!has_hybrid_prefill_t128_artifacts(|name| name != missing));
         }
+    }
+
+    #[test]
+    fn dense_prefill_wymaga_artefaktow_konkretnego_hd_formatu_i_batcha() {
+        assert_eq!(
+            Kernels::f16_out_f32_dispatch(32_000, 4, |_| true).0,
+            "gemv_batch_f16_out_f32_b4"
+        );
+        assert_eq!(
+            Kernels::f16_out_f32_dispatch(32_000, 16, |_| true).0,
+            "gemm_f16_out_f32_bm32"
+        );
+        assert_eq!(
+            Kernels::f16_out_f32_dispatch(32_000, 16, |_| false).0,
+            "gemm_f16_out_f32"
+        );
+        assert!(dense_prefill_backend_capable(
+            forge_types::Vendor::Nvidia,
+            32,
+            1024
+        ));
+        assert!(!dense_prefill_backend_capable(
+            forge_types::Vendor::Amd,
+            64,
+            1024
+        ));
+        assert!(!dense_prefill_backend_capable(
+            forge_types::Vendor::Nvidia,
+            64,
+            1024
+        ));
+        assert!(!dense_prefill_backend_capable(
+            forge_types::Vendor::Nvidia,
+            32,
+            128
+        ));
+        for (head_dim, attention) in [
+            (128, "attn_prefill_fa_segmented_f16_hd128"),
+            (256, "attn_prefill_segmented_f16_hd256"),
+        ] {
+            assert!(dense_prefill_artifacts_capable(
+                head_dim,
+                16,
+                DensePrefillLogitsKind::NvFp4Gguf {
+                    rows: 32_000,
+                    cols: 4096,
+                },
+                |_| true,
+            ));
+            for missing in [
+                "kv_append_batch_segmented_f16",
+                attention,
+                "argmax_batched_f32",
+                "topk_batched_f32",
+                "penalize_batched_f32",
+                "gemm_nvfp4_gguf_out_f32_b16",
+            ] {
+                assert!(
+                    !dense_prefill_artifacts_capable(
+                        head_dim,
+                        16,
+                        DensePrefillLogitsKind::NvFp4Gguf {
+                            rows: 32_000,
+                            cols: 4096,
+                        },
+                        |name| name != missing,
+                    ),
+                    "brak {missing} powinien wyłączyć dense prefill"
+                );
+            }
+        }
+        assert!(dense_prefill_artifacts_capable(
+            128,
+            4,
+            DensePrefillLogitsKind::Q8_0 {
+                rows: 32_000,
+                cols: 4096,
+            },
+            |_| true,
+        ));
+        assert!(!dense_prefill_artifacts_capable(
+            128,
+            4,
+            DensePrefillLogitsKind::Q8_0 {
+                rows: 32_000,
+                cols: 4096,
+            },
+            |name| name != "gemm_q8_0_f16_exact_out_f32_b4",
+        ));
+        for (rows, required) in [
+            (8191, "gemm_q8_0_out_f32_bm64"),
+            (8192, "gemm_q8_0_out_f32"),
+        ] {
+            assert!(dense_prefill_artifacts_capable(
+                128,
+                16,
+                DensePrefillLogitsKind::Q8_0 { rows, cols: 4096 },
+                |_| true,
+            ));
+            assert!(!dense_prefill_artifacts_capable(
+                128,
+                16,
+                DensePrefillLogitsKind::Q8_0 { rows, cols: 4096 },
+                |name| name != required,
+            ));
+        }
+        assert!(!dense_prefill_artifacts_capable(
+            64,
+            4,
+            DensePrefillLogitsKind::F16 {
+                rows: 32_000,
+                cols: 4096,
+            },
+            |_| true,
+        ));
     }
 
     #[test]
@@ -12479,6 +16100,7 @@ mod nvfp4_gguf_dispatch_tests {
             ("gemm_nvfp4_gguf_f16_b8_nvidia", 4),
             ("gemm_nvfp4_gguf_f16_b16", 8),
             ("gemm_nvfp4_gguf_mma_f16_bm32", 16),
+            ("gemm_q8_0_i8mma_triplet_bm64", 16),
             ("deltanet_gated_scan_inplace_shared_d128_f16", 32),
             ("gemm_nvfp4_gguf_mma_f16_bm128", 32),
             ("gemm_nvfp4_gguf_mma_f16_bm128_bn32", 32),
@@ -12535,16 +16157,29 @@ mod nvfp4_gguf_dispatch_tests {
             )
         };
         assert_eq!(validate(valid).unwrap(), (4, 2, 32));
+        assert_eq!(
+            validate_kv_append_batch_segmented_f16(
+                64, 64, 128, 128, 2048, 8, 2, 2, 256, 2, 2, 8, 256,
+            )
+            .unwrap(),
+            (4, 2, 32)
+        );
 
         for dimension in 7..13 {
             let mut values = valid;
             values[dimension] = 0;
-            assert!(validate(values).is_err(), "wymiar {dimension} powinien być odrzucony");
+            assert!(
+                validate(values).is_err(),
+                "wymiar {dimension} powinien być odrzucony"
+            );
         }
         for buffer in 0..7 {
             let mut values = valid;
             values[buffer] = values[buffer].saturating_sub(1);
-            assert!(validate(values).is_err(), "bufor {buffer} powinien być odrzucony");
+            assert!(
+                validate(values).is_err(),
+                "bufor {buffer} powinien być odrzucony"
+            );
         }
         let mut different_cache = valid;
         different_cache[1] += 256;
@@ -12556,6 +16191,295 @@ mod nvfp4_gguf_dispatch_tests {
         let mut overflow = valid;
         overflow[7] = usize::MAX;
         assert!(validate(overflow).is_err());
+    }
+
+    #[test]
+    fn segmentowany_append_kv_odrzuca_extenty_grid_i_limit_urzadzenia() {
+        let valid = [256usize, 256, 128, 128, 16, 8, 2, 2, 2, 2, 2, 8, 256];
+        let validate = |values: [usize; 13]| {
+            validate_kv_append_batch_segmented_f16(
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+                values[6],
+                values[7],
+                values[8],
+                values[9],
+                values[10],
+                values[11],
+                u32::try_from(values[12]).unwrap_or(0),
+            )
+        };
+        assert_eq!(validate(valid).unwrap(), (4, 2, 32));
+
+        for dimension in 6..12 {
+            let mut values = valid;
+            values[dimension] = 0;
+            assert!(
+                validate(values).is_err(),
+                "wymiar {dimension} powinien być odrzucony"
+            );
+        }
+        for buffer in 0..6 {
+            let mut values = valid;
+            values[buffer] = values[buffer].saturating_sub(1);
+            assert!(
+                validate(values).is_err(),
+                "bufor {buffer} powinien być odrzucony"
+            );
+        }
+        let mut different_cache = valid;
+        different_cache[1] += 256;
+        assert!(validate(different_cache).is_err());
+        let mut misaligned_cache = valid;
+        misaligned_cache[0] += 2;
+        misaligned_cache[1] += 2;
+        assert!(validate(misaligned_cache).is_err());
+        let mut grid_overflow = valid;
+        grid_overflow[6] = usize::MAX;
+        assert!(validate(grid_overflow).is_err());
+        let mut block_too_large = valid;
+        block_too_large[11] = 128;
+        block_too_large[12] = 64;
+        assert!(validate(block_too_large).is_err());
+    }
+
+    #[test]
+    fn prepared_q8_t32_t128_jest_zgodny_z_baseline_i_chroni_canary() {
+        let device = match CudaDevice::new(
+            0,
+            PoolSizes {
+                weights: 16 << 20,
+                kv_cache: 4 << 20,
+                activations: 64 << 20,
+                kv_page_size: 256 << 10,
+            },
+        ) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("pominięto parity prepared Q8 T32/T128 bez CUDA: {error}");
+                return;
+            }
+        };
+        let kernels = Kernels::load(device.clone()).unwrap();
+        let stream = device.create_stream().unwrap();
+        let rows = 65usize;
+        let cols = 64usize;
+        let weight_offset = 68usize;
+        let mut host_weights = vec![0xa5; weight_offset];
+        for block_index in 0..rows * (cols / 32) {
+            host_weights.extend(f16::from_f32(0.0078125).to_bits().to_le_bytes());
+            host_weights.extend((0..32).map(|byte| ((block_index * 17 + byte * 13) & 0xff) as u8));
+        }
+        let weights = device
+            .alloc(host_weights.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        device.write(&host_weights, &weights, 0).unwrap();
+
+        for tokens in [32usize, 128] {
+            let host_x = (0..tokens * cols)
+                .map(|index| f16::from_f32((index as f32 % 29.0 - 14.0) / 8.0))
+                .collect::<Vec<_>>();
+            let x = device
+                .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+                .unwrap();
+            device
+                .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+                .unwrap();
+            let output_bytes = tokens * rows * 2;
+            let canary_bytes = 64usize;
+            let baseline = device
+                .alloc(
+                    output_bytes + canary_bytes,
+                    MemKind::Device,
+                    Pool::Activations,
+                )
+                .unwrap();
+            let prepared_output = device
+                .alloc(
+                    output_bytes + canary_bytes,
+                    MemKind::Device,
+                    Pool::Activations,
+                )
+                .unwrap();
+            let initialized = vec![0xa5; output_bytes + canary_bytes];
+            device.write(&initialized, &baseline, 0).unwrap();
+            device.write(&initialized, &prepared_output, 0).unwrap();
+            kernels
+                .gemm_q8_0_i8mma_at(
+                    &baseline,
+                    &weights,
+                    weight_offset,
+                    &x,
+                    rows,
+                    cols,
+                    tokens,
+                    &stream,
+                )
+                .unwrap();
+            let mut prepared = kernels.prepare_q8_1(&x, cols, tokens, &stream).unwrap();
+            kernels
+                .gemm_q8_0_i8mma_prepared_at(
+                    &prepared_output,
+                    &weights,
+                    weight_offset,
+                    &mut prepared,
+                    rows,
+                    cols,
+                    tokens,
+                )
+                .unwrap();
+            drop(prepared);
+            stream.synchronize().unwrap();
+            let mut baseline_bytes = vec![0u8; output_bytes + canary_bytes];
+            let mut prepared_bytes = vec![0u8; output_bytes + canary_bytes];
+            device.read(&baseline, 0, &mut baseline_bytes).unwrap();
+            device
+                .read(&prepared_output, 0, &mut prepared_bytes)
+                .unwrap();
+            assert_eq!(
+                prepared_bytes[..output_bytes],
+                baseline_bytes[..output_bytes]
+            );
+            assert_eq!(prepared_bytes[output_bytes..], vec![0xa5; canary_bytes]);
+            assert_eq!(baseline_bytes[output_bytes..], vec![0xa5; canary_bytes]);
+        }
+    }
+
+    #[test]
+    fn fused_q8_triplet_t32_t128_jest_bitowo_zgodny_i_chroni_canary() {
+        let device = match CudaDevice::new(
+            0,
+            PoolSizes {
+                weights: 16 << 20,
+                kv_cache: 4 << 20,
+                activations: 64 << 20,
+                kv_page_size: 256 << 10,
+            },
+        ) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("pominięto parity fused Q8 triplet bez CUDA: {error}");
+                return;
+            }
+        };
+        let kernels = Kernels::load(device.clone()).unwrap();
+        let stream = device.create_stream().unwrap();
+        let rows = [65usize, 17, 9];
+        let offsets = [68usize, 102, 136];
+        let cols = 64usize;
+        let canary_bytes = 64usize;
+        let mut weights = Vec::new();
+        for projection in 0..3 {
+            let mut host = vec![0xa5; offsets[projection]];
+            for block_index in 0..rows[projection] * (cols / 32) {
+                host.extend(
+                    f16::from_f32(0.00390625 * (projection + 1) as f32)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+                host.extend(
+                    (0..32).map(|byte| {
+                        ((block_index * 17 + byte * 13 + projection * 29) & 0xff) as u8
+                    }),
+                );
+            }
+            let buffer = device
+                .alloc(host.len(), MemKind::Device, Pool::Weights)
+                .unwrap();
+            device.write(&host, &buffer, 0).unwrap();
+            weights.push(buffer);
+        }
+
+        for tokens in [32usize, 128] {
+            let host_x = (0..tokens * cols)
+                .map(|index| f16::from_f32((index as f32 % 31.0 - 15.0) / 8.0))
+                .collect::<Vec<_>>();
+            let x = device
+                .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+                .unwrap();
+            device
+                .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+                .unwrap();
+            let mut baseline_outputs = Vec::new();
+            let mut fused_outputs = Vec::new();
+            for projection_rows in rows {
+                let output_bytes = tokens * projection_rows * 2;
+                let initialized = vec![0xa5; output_bytes + canary_bytes];
+                let baseline = device
+                    .alloc(initialized.len(), MemKind::Device, Pool::Activations)
+                    .unwrap();
+                let fused = device
+                    .alloc(initialized.len(), MemKind::Device, Pool::Activations)
+                    .unwrap();
+                device.write(&initialized, &baseline, 0).unwrap();
+                device.write(&initialized, &fused, 0).unwrap();
+                baseline_outputs.push(baseline);
+                fused_outputs.push(fused);
+            }
+            let mut baseline_prepared = kernels.prepare_q8_1(&x, cols, tokens, &stream).unwrap();
+            for projection in 0..3 {
+                kernels
+                    .gemm_q8_0_i8mma_prepared_at(
+                        &baseline_outputs[projection],
+                        &weights[projection],
+                        offsets[projection],
+                        &mut baseline_prepared,
+                        rows[projection],
+                        cols,
+                        tokens,
+                    )
+                    .unwrap();
+            }
+            drop(baseline_prepared);
+            let mut fused_prepared = kernels.prepare_q8_1(&x, cols, tokens, &stream).unwrap();
+            kernels
+                .gemm_q8_0_i8mma_prepared_triplet(
+                    &[
+                        Q8PreparedProjection {
+                            output: &fused_outputs[0],
+                            weights: &weights[0],
+                            weight_byte_offset: offsets[0],
+                            rows: rows[0],
+                        },
+                        Q8PreparedProjection {
+                            output: &fused_outputs[1],
+                            weights: &weights[1],
+                            weight_byte_offset: offsets[1],
+                            rows: rows[1],
+                        },
+                        Q8PreparedProjection {
+                            output: &fused_outputs[2],
+                            weights: &weights[2],
+                            weight_byte_offset: offsets[2],
+                            rows: rows[2],
+                        },
+                    ],
+                    &mut fused_prepared,
+                    cols,
+                    tokens,
+                )
+                .unwrap();
+            drop(fused_prepared);
+            stream.synchronize().unwrap();
+            for projection in 0..3 {
+                let output_bytes = tokens * rows[projection] * 2;
+                let mut baseline = vec![0u8; output_bytes + canary_bytes];
+                let mut fused = vec![0u8; output_bytes + canary_bytes];
+                device
+                    .read(&baseline_outputs[projection], 0, &mut baseline)
+                    .unwrap();
+                device
+                    .read(&fused_outputs[projection], 0, &mut fused)
+                    .unwrap();
+                assert_eq!(fused[..output_bytes], baseline[..output_bytes]);
+                assert_eq!(baseline[output_bytes..], vec![0xa5; canary_bytes]);
+                assert_eq!(fused[output_bytes..], vec![0xa5; canary_bytes]);
+            }
+        }
     }
 
     #[test]
@@ -12787,24 +16711,30 @@ mod nvfp4_gguf_dispatch_tests {
             (9, "gemm_nvfp4_gguf_f16_b16", 512),
             (16, "gemm_nvfp4_gguf_f16_b16", 512),
         ] {
-            let dispatch = nvfp4_gguf_dispatch(tokens, 5120, true, 32, 1024).unwrap();
+            let dispatch = nvfp4_gguf_dispatch(tokens, 5120, false, true, 32, 1024).unwrap();
             assert_eq!(dispatch.kernel, expected);
             assert_eq!(dispatch.block_threads, block);
         }
         for tokens in 2..=4 {
-            let dispatch = nvfp4_gguf_dispatch(tokens, 5120, false, 64, 1024).unwrap();
+            let dispatch = nvfp4_gguf_dispatch(tokens, 5120, false, false, 64, 1024).unwrap();
             assert_eq!(dispatch.block_threads, 64);
         }
         assert_eq!(
-            nvfp4_gguf_dispatch(3, 5120, false, 64, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(3, 5120, false, false, 64, 1024)
+                .unwrap()
+                .kernel,
             "gemm_nvfp4_gguf_f16_b3"
         );
         assert_eq!(
-            nvfp4_gguf_dispatch(4, 5120, false, 64, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(4, 5120, false, false, 64, 1024)
+                .unwrap()
+                .kernel,
             "gemm_nvfp4_gguf_f16_b4"
         );
         assert_eq!(
-            nvfp4_gguf_dispatch(8, 5120, false, 64, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(8, 5120, false, false, 64, 1024)
+                .unwrap()
+                .kernel,
             "gemm_nvfp4_gguf_f16_b8"
         );
     }
@@ -12812,28 +16742,237 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn wybiera_mma_tylko_dla_nvidia() {
         assert_eq!(
-            nvfp4_gguf_dispatch(17, 5120, true, 32, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(17, 5120, false, true, 32, 1024)
+                .unwrap()
+                .kernel,
             "gemm_nvfp4_gguf_mma_f16_bm32"
         );
         assert_eq!(
-            nvfp4_gguf_dispatch(128, 5120, true, 32, 1024).unwrap().kernel,
+            nvfp4_gguf_dispatch(128, 5120, false, true, 32, 1024)
+                .unwrap()
+                .kernel,
             "gemm_nvfp4_gguf_mma_f16_bm128"
         );
         assert_eq!(
-            nvfp4_gguf_dispatch(128, 1024, true, 32, 1024)
+            nvfp4_gguf_dispatch(128, 1024, true, true, 32, 1024)
                 .unwrap()
                 .kernel,
             "gemm_nvfp4_gguf_mma_f16_bm128_bn32"
         );
-        assert!(nvfp4_gguf_dispatch(17, 5120, false, 64, 1024).is_err());
-        assert!(nvfp4_gguf_dispatch(17, 5120, true, 64, 1024).is_err());
+        for rows in [5120, 10240, 12288, 17408] {
+            assert_eq!(
+                nvfp4_gguf_dispatch(128, rows, true, true, 32, 1024)
+                    .unwrap()
+                    .kernel,
+                "gemm_nvfp4_gguf_mma_f16_bm128_prefetch"
+            );
+        }
+        for tokens in [256, 2048, 4096] {
+            assert_eq!(
+                nvfp4_gguf_dispatch(tokens, 5120, true, true, 32, 1024)
+                    .unwrap()
+                    .kernel,
+                "gemm_nvfp4_gguf_mma_f16_bm128_prefetch"
+            );
+        }
+        assert_eq!(
+            nvfp4_gguf_dispatch(128, 5120, false, true, 32, 1024)
+                .unwrap()
+                .kernel,
+            "gemm_nvfp4_gguf_mma_f16_bm128"
+        );
+        assert!(nvfp4_gguf_dispatch(17, 5120, false, false, 64, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(17, 5120, false, true, 64, 1024).is_err());
+    }
+
+    #[test]
+    fn wybiera_bn128_i_sync1_z_regresyjnym_wyjatkiem() {
+        let large =
+            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, 32, 1024).unwrap();
+        assert_eq!(large.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn128");
+        assert_eq!((large.row_tile, large.block_threads), (128, 256));
+
+        let m128 =
+            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, 32, 1024).unwrap();
+        assert_eq!(m128.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1");
+        assert_eq!((m128.row_tile, m128.block_threads), (64, 256));
+
+        let regression =
+            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, 32, 1024).unwrap();
+        assert_eq!(regression.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_prefetch");
+    }
+
+    #[test]
+    fn wybiera_kafelkowany_nvfp4_tylko_dla_pelnego_kontraktu() {
+        let bn64 = nvfp4_gguf_layout_dispatch(
+            Nvfp4GgufLayout::TileN128K64,
+            128,
+            5120,
+            5120,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            32,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                bn64.kernel,
+                bn64.token_tile,
+                bn64.row_tile,
+                bn64.block_threads
+            ),
+            ("gemm_nvfp4_tile128_mma_f16_bm128_bn64", 128, 64, 256)
+        );
+
+        let bn128 = nvfp4_gguf_layout_dispatch(
+            Nvfp4GgufLayout::TileN128K64,
+            2048,
+            5120,
+            5120,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            32,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            (bn128.kernel, bn128.row_tile),
+            ("gemm_nvfp4_tile128_mma_f16_bm128_bn128", 128)
+        );
+
+        let fallback = nvfp4_gguf_layout_dispatch(
+            Nvfp4GgufLayout::TileN128K64,
+            2048,
+            5120,
+            5120,
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+            32,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            (fallback.kernel, fallback.row_tile),
+            ("gemm_nvfp4_tile128_mma_f16_bm128_bn64", 64)
+        );
+
+        for result in [
+            nvfp4_gguf_layout_dispatch(
+                Nvfp4GgufLayout::TileN128K64,
+                1,
+                5120,
+                5120,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                32,
+                1024,
+            ),
+            nvfp4_gguf_layout_dispatch(
+                Nvfp4GgufLayout::TileN128K64,
+                128,
+                5121,
+                5120,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                32,
+                1024,
+            ),
+            nvfp4_gguf_layout_dispatch(
+                Nvfp4GgufLayout::TileN128K64,
+                128,
+                5120,
+                5120,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                32,
+                1024,
+            ),
+        ] {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn capability_tile_nvfp4_wymaga_kwantyzacji_i_wszystkich_kerneli() {
+        let required = [
+            "quantize_act_q8_1",
+            "nvfp4_repack_tile128",
+            "gemv_nvfp4_tile128_coop_q8_1_f16",
+            "gemm_nvfp4_tile128_mma_f16_bm128_bn64",
+            "gemm_nvfp4_tile128_mma_f16_bm128_bn128",
+        ];
+        assert!(has_nvfp4_gguf_tile_artifacts(|_| true));
+        for missing in required {
+            assert!(!has_nvfp4_gguf_tile_artifacts(|name| name != missing));
+        }
+    }
+
+    #[test]
+    fn layout_value_key_wymaga_pelnego_backendu_i_poprawnej_geometrii() {
+        assert_eq!(
+            delta_state_layout_dispatch(128, 32, 1024, true),
+            DeltaStateLayout::ValueKey
+        );
+        for fallback in [
+            delta_state_layout_dispatch(64, 32, 1024, true),
+            delta_state_layout_dispatch(128, 0, 1024, true),
+            delta_state_layout_dispatch(128, 48, 1024, true),
+            delta_state_layout_dispatch(128, 64, 128, true),
+            delta_state_layout_dispatch(128, 32, 1024, false),
+        ] {
+            assert_eq!(fallback, DeltaStateLayout::KeyValue);
+        }
+        let required = [
+            "deltanet_value_key_scan_inplace_f16",
+            "deltanet_value_key_scan_checkpoints_f16",
+            "deltanet_value_key_commit_recompute_f32",
+            "deltanet_value_key_scan_persistent_f16",
+        ];
+        assert!(has_delta_value_key_artifacts(|_| true));
+        for missing in required {
+            assert!(!has_delta_value_key_artifacts(|name| name != missing));
+        }
+    }
+
+    #[test]
+    fn offset_checkpointow_f32_musi_byc_wyrownany() {
+        assert!(validate_f32_byte_offset("test", 0).is_ok());
+        assert!(validate_f32_byte_offset("test", 4).is_ok());
+        for offset in [1, 2, 3, 5] {
+            assert!(validate_f32_byte_offset("test", offset).is_err());
+        }
     }
 
     #[test]
     fn odrzuca_nieprawidlowy_rozmiar_bloku() {
-        assert!(nvfp4_gguf_dispatch(1, 5120, true, 32, 1024).is_err());
-        assert!(nvfp4_gguf_dispatch(16, 5120, false, 64, 512).is_err());
-        assert!(nvfp4_gguf_dispatch(3, 5120, false, 0, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(1, 5120, false, true, 32, 1024).is_err());
+        assert!(nvfp4_gguf_dispatch(16, 5120, false, false, 64, 512).is_err());
+        assert!(nvfp4_gguf_dispatch(3, 5120, false, false, 0, 1024).is_err());
     }
 
     #[test]

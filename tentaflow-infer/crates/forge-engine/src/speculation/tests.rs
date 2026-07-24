@@ -373,7 +373,10 @@ fn para_pending_ngram_anuluje_obie_lane_i_pozwala_na_reuse() {
         .expect("pending lane1 powinien być poprawny");
     first.cancel_draft();
     second.cancel_draft();
-    assert_eq!(first.draft(3).expect("lane0 powinna pozwolić na reuse"), first_draft);
+    assert_eq!(
+        first.draft(3).expect("lane0 powinna pozwolić na reuse"),
+        first_draft
+    );
     assert_eq!(
         second.draft(3).expect("lane1 powinna pozwolić na reuse"),
         second_draft
@@ -486,11 +489,8 @@ fn coordinator_recognizes_model_owned_native_mtp() {
     assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 1).is_err());
     assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 4).is_err());
     for budget in [2, 3] {
-        let config = SpeculativeConfig::chain(
-            vec![ProposerKind::Mtp, ProposerKind::Ngram],
-            budget,
-        )
-        .expect("router MTP+n-gram powinien obsługiwać budżet 2 lub 3");
+        let config = SpeculativeConfig::chain(vec![ProposerKind::Mtp, ProposerKind::Ngram], budget)
+            .expect("router MTP+n-gram powinien obsługiwać budżet 2 lub 3");
         assert_eq!(config.kind(), SpeculationKind::NativeMtpNgram);
         let coordinator = SpeculationCoordinator::new(config).expect("router powinien działać");
         assert!(coordinator

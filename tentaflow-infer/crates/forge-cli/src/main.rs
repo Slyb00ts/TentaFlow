@@ -11,13 +11,14 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_engine::kv::KvQuant;
-use forge_engine::model::{ModelConfig, MAX_SPEC_DRAFT};
+use forge_engine::model::{ModelConfig, Nvfp4GgufLayout, MAX_SPEC_DRAFT};
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{
     BenchmarkTimings, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
 };
 use forge_engine::speculation::{ProposerKind, SpeculationKind};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
+use forge_engine::weights::NvFp4CtLayoutPolicy;
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
@@ -72,11 +73,14 @@ enum Command {
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         max_active: Option<u16>,
         /// Minimum simultaneously-decoding sequences before the batched forward
-        /// path engages (below it the tuned fused single-seq path is faster).
-        #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u16).range(2..))]
+        /// path engages (the batched pass wins from 2 concurrent sequences up
+        /// on models with small-batch decode kernels).
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(2..))]
         batch_min: u16,
-        /// Prompt tokens one sequence may prefill per scheduler iteration.
-        #[arg(long, default_value_t = 16)]
+        /// Prompt tokens one sequence may prefill per scheduler iteration
+        /// (larger = better TTFT, smaller = better decode ITL of the other
+        /// active sequences during a long prefill).
+        #[arg(long, default_value_t = 512)]
         prefill_chunk: usize,
         /// KV cache pages (32 tokens each) shared by all sequences. Raised to
         /// at least one full `--ctx` window if smaller.
@@ -85,8 +89,9 @@ enum Command {
         /// Max context length per request in tokens (0 = the model's maximum).
         #[arg(long = "ctx", default_value_t = 0)]
         ctx: usize,
-        /// Weights pool size in GiB.
-        #[arg(long, default_value_t = 16.0)]
+        /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM,
+        /// which also leaves room for the auto fp8 prefill packs).
+        #[arg(long, default_value_t = 0.0)]
         weights_pool_gb: f64,
         /// Tool-call output parser: hermes | llama3 | none (default: auto-detect).
         #[arg(long)]
@@ -632,6 +637,38 @@ fn resolve_max_active(
     Ok(max_active)
 }
 
+fn resolve_bench_nvfp4_gguf_layout_from_env(
+    speculation: SpeculationKind,
+    max_active: usize,
+) -> Result<Nvfp4GgufLayout> {
+    let value = match std::env::var("FORGE_BENCH_NVFP4_TILE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "0".into(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("FORGE_BENCH_NVFP4_TILE musi być poprawnym UTF-8 i mieć wartość 0 albo 1")
+        }
+    };
+    resolve_bench_nvfp4_gguf_layout(speculation, max_active, &value)
+}
+
+fn resolve_bench_nvfp4_gguf_layout(
+    speculation: SpeculationKind,
+    max_active: usize,
+    value: &str,
+) -> Result<Nvfp4GgufLayout> {
+    match value {
+        "0" => Ok(Nvfp4GgufLayout::RowMajor36),
+        "1" if speculation != SpeculationKind::Off => {
+            bail!("FORGE_BENCH_NVFP4_TILE=1 wymaga --speculative off")
+        }
+        "1" if max_active != 1 => {
+            bail!("FORGE_BENCH_NVFP4_TILE=1 wymaga dokładnie jednej aktywnej sekwencji")
+        }
+        "1" => Ok(Nvfp4GgufLayout::TileN128K64),
+        _ => bail!("FORGE_BENCH_NVFP4_TILE musi mieć wartość 0 albo 1"),
+    }
+}
+
 fn parse_prefix_cache(s: &str) -> Result<bool> {
     match s {
         "on" => Ok(true),
@@ -820,6 +857,23 @@ fn activation_pool_bytes(_native_mtp: bool, hybrid: bool) -> usize {
     }
 }
 
+fn resolve_nvfp4_ct_layout(value: &str) -> Result<NvFp4CtLayoutPolicy> {
+    match value {
+        "row" => Ok(NvFp4CtLayoutPolicy::RowMajorE4M3),
+        "s0" => Ok(NvFp4CtLayoutPolicy::S0N64K128),
+        "auto" => Ok(NvFp4CtLayoutPolicy::Auto),
+        _ => bail!("FORGE_NVFP4_CT_LAYOUT wymaga row, s0 albo auto"),
+    }
+}
+
+fn resolve_nvfp4_ct_layout_from_env() -> Result<NvFp4CtLayoutPolicy> {
+    resolve_nvfp4_ct_layout(
+        std::env::var("FORGE_NVFP4_CT_LAYOUT")
+            .as_deref()
+            .unwrap_or("auto"),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_for_serve(
     path: &Path,
@@ -831,6 +885,7 @@ fn load_for_serve(
     hot_pages: usize,
     prefix_cache: bool,
     native_mtp: bool,
+    nvfp4_gguf_layout: Nvfp4GgufLayout,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
@@ -863,12 +918,18 @@ fn load_for_serve(
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
     let free = CudaDevice::free_vram(0).context("query free VRAM")?;
     let weights_budget = free.saturating_sub(pool_reserve_bytes(kv_pool, activations)?);
-    let requested_weights = (weights_pool_gb * (1u64 << 30) as f64) as usize;
-    let weights = requested_weights
-        .checked_add(stage)
-        .context("rozmiar puli wag i staging przekracza zakres usize")?
-        .min(weights_budget)
-        .max(1 << 30);
+    let weights = if weights_pool_gb > 0.0 {
+        ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+            .checked_add(stage)
+            .context("rozmiar puli wag i staging przekracza zakres usize")?
+            .min(weights_budget)
+            .max(1 << 30)
+    } else {
+        // 0 = automatic: hand the weights pool everything KV + activations do
+        // not reserve, leaving room for the auto fp8 prefill packs (staging for
+        // KV tiering lives inside the pool, so the budget already covers it).
+        weights_budget.max(1 << 30)
+    };
     let device = CudaDevice::new(
         0,
         PoolSizes {
@@ -888,6 +949,8 @@ fn load_for_serve(
         max_seq_len,
         prefix_cache,
         native_mtp,
+        nvfp4_gguf_layout,
+        nvfp4_ct_layout: resolve_nvfp4_ct_layout_from_env()?,
     };
     let loaded = load_model(dev, path, cfg)?;
     Ok((loaded, kv_pages, max_seq_len))
@@ -923,6 +986,7 @@ fn load_auto(
     hot_pages: usize,
     prefix_cache: bool,
     native_mtp: bool,
+    nvfp4_gguf_layout: Nvfp4GgufLayout,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
@@ -984,6 +1048,8 @@ fn load_auto(
             max_seq_len,
             prefix_cache,
             native_mtp,
+            nvfp4_gguf_layout,
+            nvfp4_ct_layout: resolve_nvfp4_ct_layout_from_env()?,
         },
     )
 }
@@ -1079,6 +1145,7 @@ fn cmd_embed(
         0,
         false,
         false,
+        Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
@@ -1244,6 +1311,8 @@ fn cmd_serve(
     if spec.is_enabled() {
         tracing::info!("speculative decoding enabled; prefix cache disabled");
     }
+    let descriptor = read_descriptor(model_path)?;
+    let max_active = resolve_max_active(max_active, &spec, descriptor.params.ssm.is_some())?;
     let t0 = Instant::now();
     let (mut loaded, kv_pages, max_seq_len) = load_for_serve(
         model_path,
@@ -1258,8 +1327,8 @@ fn cmd_serve(
             spec.kind(),
             SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
         ),
+        Nvfp4GgufLayout::RowMajor36,
     )?;
-    let max_active = resolve_max_active(max_active, &spec, loaded.model.is_hybrid())?;
     let full_context_admission = kv_full_context_admission_capacity(
         kv_pages,
         max_seq_len.div_ceil(ModelConfig::default().kv_page_size),
@@ -1267,7 +1336,7 @@ fn cmd_serve(
         loaded.model.tier_enabled(),
         max_active,
     );
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}, full_context_admission={}",
         model_path.display(),
@@ -1445,10 +1514,14 @@ fn cmd_run(
         kv_pages,
         hot_pages,
         prefix_cache,
-        spec.kind() == SpeculationKind::NativeMtp,
+        matches!(
+            spec.kind(),
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+        ),
+        Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false)?;
 
     let prompt_text = if chat {
         ChatTemplateEngine::new()
@@ -1470,8 +1543,15 @@ fn cmd_run(
     let prompt_tokens = tokenizer
         .encode(&prompt_text, true)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let engine =
-        forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec)?;
+    // Single sequence: full-size prefill chunks, no other decode ITL to protect.
+    let engine = forge_engine::server::spawn_engine_batched(
+        loaded.model,
+        tokenizer,
+        1,
+        forge_engine::model::MAX_PREFILL_CHUNK,
+        12,
+        spec,
+    )?;
 
     let submit_at = Instant::now();
     let (generated, prompt_len, _first, done_at, _) = drain_request(
@@ -1536,9 +1616,10 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         0,
         false,
         false,
+        Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false)?;
 
     let tokens = loaded
         .bundle
@@ -1557,13 +1638,20 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
 /// Build the W4A8 SmoothQuant packs when `FORGE_GEMM=w4a8` is selected. A
 /// one-time calibration over the embedded passage; GGUF sources only (the dense
 /// W4A8 gate model). No-op for any other GEMM backend.
+///
+/// `auto_gguf_fp8` (serve only): with FORGE_GEMM unset, a dense GGUF model on
+/// an fp8-native device whose projection shapes all have committed Modular fp8
+/// instances gets the fp8mod prefill automatically (near-lossless, ~2× the
+/// native int8 prefill); `FORGE_GEMM=mojo` keeps the native path explicitly.
 fn maybe_calibrate_w4a8(
     model: &mut forge_engine::model::Model,
     path: &Path,
     tokenizer: &forge_tokenize::Tokenizer,
+    auto_gguf_fp8: bool,
 ) -> Result<()> {
     let gemm = std::env::var("FORGE_GEMM").ok();
-    if gemm.as_deref() == Some("fp8mod-ffn") {
+    let auto_fp8_ffn = gemm.is_none() && path.is_dir();
+    if gemm.as_deref() == Some("fp8mod-ffn") || auto_fp8_ffn {
         if !path.is_dir() {
             bail!("FORGE_GEMM=fp8mod-ffn wymaga katalogu checkpointu NVFP4");
         }
@@ -1577,6 +1665,19 @@ fn maybe_calibrate_w4a8(
             eprintln!(
                 "fp8mod-ffn niedostępny dla urządzenia, kształtów lub puli VRAM; pozostaje NVFP4"
             );
+        }
+        return Ok(());
+    }
+    if gemm.is_none() && auto_gguf_fp8 && path.extension().and_then(|e| e.to_str()) == Some("gguf")
+    {
+        let t0 = Instant::now();
+        if model.build_fp8_modular_auto(path)? {
+            eprintln!(
+                "auto fp8mod: paczki e4m3 zbudowane w {:.1}s (prefill Modular fp8, decode zostaje na natywnym GGUF)",
+                t0.elapsed().as_secs_f32()
+            );
+        } else {
+            eprintln!("auto fp8mod niedostępny dla urządzenia, kształtów lub puli VRAM; prefill zostaje natywny");
         }
         return Ok(());
     }
@@ -1655,10 +1756,14 @@ fn cmd_bench(
         kv_pages,
         hot_pages,
         prefix_cache,
-        spec.kind() == SpeculationKind::NativeMtp,
+        matches!(
+            spec.kind(),
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+        ),
+        resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false)?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
     let (prompt_ids, prompt_sha256, prompt_source) = if let Some(path) = prompt_token_ids {
@@ -1687,6 +1792,7 @@ fn cmd_bench(
         .is_file()
         .then(|| bench::sha256_file(model_path))
         .transpose()?;
+    let (nvfp4_gguf_layout, nvfp4_repacked_weights) = loaded.model.nvfp4_gguf_layout_summary();
     let bos_id = tokenizer.bos_id();
     eprintln!(
         "{}",
@@ -1712,6 +1818,8 @@ fn cmd_bench(
                 "kv_cache": format!("{kv_quant:?}"),
                 "prefix_cache": prefix_cache,
                 "speculation": format!("{:?}", spec.kind()),
+                "nvfp4_gguf_layout": format!("{nvfp4_gguf_layout:?}"),
+                "nvfp4_repacked_weights": nvfp4_repacked_weights,
                 "warmup_runs": 1,
                 "measured_runs": reps,
             }
@@ -1835,9 +1943,12 @@ fn cmd_bench(
 mod speculation_cli_tests {
     use super::{
         activation_pool_bytes, kv_full_context_admission_capacity, parse_speculative,
-        resolve_kv_pool_layout, resolve_max_active,
+        resolve_bench_nvfp4_gguf_layout, resolve_kv_pool_layout, resolve_max_active,
+        resolve_nvfp4_ct_layout,
     };
     use forge_engine::kv::KvQuant;
+    use forge_engine::model::Nvfp4GgufLayout;
+    use forge_engine::weights::NvFp4CtLayoutPolicy;
     use forge_engine::speculation::{ProposerKind, SpeculationKind};
     use forge_engine::tier::{KvTierConfig, KvTierMode};
     use forge_formats::{HfConfig, LayerKind, ModelDescriptor};
@@ -1957,6 +2068,60 @@ mod speculation_cli_tests {
         let capacity = kv_full_context_admission_capacity(512, 128, 32, false, 8);
 
         assert_eq!(capacity, 4);
+    }
+
+    #[test]
+    fn tile_nvfp4_benchmark_domyslnie_pozostaje_wylaczony() {
+        assert_eq!(
+            resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 1, "0").unwrap(),
+            Nvfp4GgufLayout::RowMajor36
+        );
+    }
+
+    #[test]
+    fn parser_layoutu_nvfp4_ct_obsluguje_wszystkie_tryby() {
+        assert_eq!(
+            resolve_nvfp4_ct_layout("row").unwrap(),
+            NvFp4CtLayoutPolicy::RowMajorE4M3
+        );
+        assert_eq!(
+            resolve_nvfp4_ct_layout("s0").unwrap(),
+            NvFp4CtLayoutPolicy::S0N64K128
+        );
+        assert_eq!(
+            resolve_nvfp4_ct_layout("auto").unwrap(),
+            NvFp4CtLayoutPolicy::Auto
+        );
+        assert!(resolve_nvfp4_ct_layout("1").is_err());
+    }
+
+    #[test]
+    fn tile_nvfp4_benchmark_wymaga_jawnego_opt_in() {
+        assert_eq!(
+            resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 1, "1").unwrap(),
+            Nvfp4GgufLayout::TileN128K64
+        );
+    }
+
+    #[test]
+    fn tile_nvfp4_benchmark_odrzuca_spekulacje_i_batch() {
+        for kind in [
+            SpeculationKind::HostProposer,
+            SpeculationKind::NativeMtp,
+            SpeculationKind::NativeMtpNgram,
+        ] {
+            assert_eq!(
+                resolve_bench_nvfp4_gguf_layout(kind, 1, "0").unwrap(),
+                Nvfp4GgufLayout::RowMajor36
+            );
+            assert!(resolve_bench_nvfp4_gguf_layout(kind, 1, "1").is_err());
+        }
+        assert_eq!(
+            resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 2, "0").unwrap(),
+            Nvfp4GgufLayout::RowMajor36
+        );
+        assert!(resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 2, "1").is_err());
+        assert!(resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 1, "auto").is_err());
     }
 
     #[test]

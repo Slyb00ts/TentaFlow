@@ -174,7 +174,10 @@ fn watermark_spill_and_restore_is_bit_identical() {
         "headroom after release must trigger a full restore"
     );
     model.release_seq(&mut seq);
-    assert_eq!(ids, reference, "restore path diverged from the untiered run");
+    assert_eq!(
+        ids, reference,
+        "restore path diverged from the untiered run"
+    );
 }
 
 /// Tiering on but never under pressure: the fast graphed path must stay in
@@ -296,7 +299,10 @@ fn rot_tier_spill_restore_roundtrip_is_bit_exact() {
     // (the pool has headroom, so the step's transfer path brings every chunk
     // back into fresh pages).
     model.tier_balance(&mut [&mut seq], 200).unwrap();
-    assert!(!seq.spilled.is_empty(), "balance must spill the cold prefix");
+    assert!(
+        !seq.spilled.is_empty(),
+        "balance must spill the cold prefix"
+    );
     let mut sampler = GpuSampler::new(SamplingParams {
         temperature: 0.0,
         ..SamplingParams::default()
@@ -304,7 +310,10 @@ fn rot_tier_spill_restore_roundtrip_is_bit_exact() {
     let next = *prompt.last().unwrap();
     sampler.note_token(next);
     let _ = model.step_and_sample(&mut seq, next, &mut sampler).unwrap();
-    assert!(seq.spilled.is_empty(), "step must restore the spilled chunks");
+    assert!(
+        seq.spilled.is_empty(),
+        "step must restore the spilled chunks"
+    );
     let regions = model.kv.tier_layer_regions(0);
     for (r, buf) in regions.iter().enumerate() {
         let rb = region_bytes[r];
@@ -435,6 +444,12 @@ fn mixed_residency_batched_decode_is_bit_identical() {
         return;
     };
     let out = batched_greedy(&mut model, &[prompt_long, prompt_short], 24);
-    assert_eq!(out[1], reference[1], "resident lane diverged in mixed batch");
-    assert_eq!(out[0], reference[0], "streamed lane diverged in mixed batch");
+    assert_eq!(
+        out[1], reference[1],
+        "resident lane diverged in mixed batch"
+    );
+    assert_eq!(
+        out[0], reference[0],
+        "streamed lane diverged in mixed batch"
+    );
 }

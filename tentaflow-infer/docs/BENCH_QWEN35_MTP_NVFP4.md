@@ -36,8 +36,9 @@ checkpointów wszystkich kroków. Usunęło to około 1,125 GiB scratchu. CPU na
 uruchamia cykl i odczytuje wynik sterujący, natomiast obliczenia modelu i sampling
 greedy pozostają na GPU.
 
-`--speculative mtp` ustawia maksymalny budżet K=3 i adaptacyjnie porównuje tempo
-K=2 oraz K=3. Dostępne są też jawne `mtp:2` i `mtp:3`. Każda próba benchmarku
+`--speculative mtp` oraz `mtp:3` używają budżetu K=3. `mtp:2` jawnie wybiera
+K=2, a K=3 jest przycinane do K=2 tylko wtedy, gdy pozostały kontekst lub
+dostępne strony KV nie mieszczą pełnego kroku K=3. Każda próba benchmarku
 porównuje pełną sekwencję tokenów z sekwencyjnym greedy i przerywa się przy
 różnicy.
 
@@ -53,8 +54,9 @@ B2, `0` wymusza B1, a każda inna wartość zatrzymuje start z błędem.
 
 Pomiary RTX 4090 obejmują dwa identyczne requesty, 128 tokenów wyjścia i pięć
 powtórzeń. Każdy poprawny przebieg zachował pełną zgodność ID obu lane'ów z
-seryjnym greedy. `ON` oznacza adaptacyjne K=2/K=3 po włączeniu warp32 attention;
-`OFF` jest stabilną pięciopomiarową kontrolą B1 z tej samej serii.
+seryjnym greedy. W tej historycznej serii `ON` oznaczało adaptacyjne K=2/K=3 po
+włączeniu warp32 attention; `OFF` jest stabilną pięciopomiarową kontrolą B1 z
+tej samej serii. Aktualna polityka utrzymuje skonfigurowane K.
 
 | Prompt | B2 ON, mediana (zakres) | B2 OFF, mediana (zakres) | Zmiana mediany |
 |---|---:|---:|---:|
@@ -709,3 +711,25 @@ osiąga wyniku llama.cpp. Serwer z `max_active=2` przeszedł preflight przy puli
 weights 20,5 GiB, `ctx=1024` i 40 stronach KV. Automatyczny podział puli na tej
 karcie był zbyt mały już dla źródłowego headu Q8_0, dlatego ten ciasny wariant
 konfiguracji wymaga jawnego `--weights-pool-gb`.
+
+## Stały budżet K3 po atencji split8
+
+Pomiar z 2026-07-23 użył promptu RAG 2048 tokenów, 128 tokenów wyjścia,
+`ctx=4352`, F16 KV, headu draftowego NVFP4 i pięciu powtórzeń w jednym procesie.
+Każdy wariant zachował SHA tokenów
+`c8b83db1c2e87b573c9e8eea2821cf6c68cdf2ff54d8cb6d97b68af816be578f`.
+
+| Tryb | Verify | Zaakceptowane | Prefill p50 | Decode p50 | Przepustowość |
+|---|---:|---:|---:|---:|---:|
+| `mtp:3` | 41 | 89 | 824,749 ms | 1364,347 ms | 93,1 tok/s |
+| `mtp+ngram:3` | 41 | 89 | 825,371 ms | **1352,415 ms** | **93,9 tok/s** |
+| `mtp:2` | 48 | 79 | 824,335 ms | 1478,678 ms | 85,9 tok/s |
+
+Stałe K3 skróciło decode o 114,331 ms, czyli 7,73%, względem kontrolnego K2.
+Poprzedni wybór oparty o EMA przeplatał kontekstowo zależne próbki K2 i K3,
+wybierał K2 i kończył z 46 przebiegami weryfikacji oraz 81 zaakceptowanymi
+tokenami. `llama.cpp` na tym samym modelu i żądaniu osiągnął 1239,282 ms,
+87 zaakceptowanych tokenów na 118 propozycji. FORGE ma więc już porównywalną
+liczbę przebiegów i wyższą akceptację, ale decode pozostaje około 10,1% wolniejszy.
+Pomiar PID co 10 ms wykazał szczyt 21 368 MiB VRAM, bez wzrostu wobec wcześniejszej
+ścieżki MTP.

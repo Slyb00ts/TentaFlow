@@ -225,8 +225,8 @@ hybrydowego GGUF `qwen35`. Natywna ścieżka rozpoznaje
 głowę wyjściową targetu, jeśli GGUF nie dostarcza ich osobnych wersji. Proposer,
 weryfikacja draftu, argmax oraz checkpointy KV i DeltaNet wykonują się na GPU;
 retained checkpointy pozwalają zatwierdzić stan bez ponownego skanu warstw
-DeltaNet. W trybie z budżetem 3 scheduler adaptacyjnie wybiera K=2 lub K=3 na
-podstawie zmierzonego tempa zaakceptowanych tokenów.
+DeltaNet. Budżet 3 pozostaje K=3 i spada do K=2 tylko wtedy, gdy pozostały
+kontekst lub dostępne strony KV nie mieszczą pełnego kroku K=3.
 
 Natywne MTP zachowuje wynik sekwencyjnego greedy i obecnie wymaga
 `temperature=0`, próbkowania GPU i braku repetition penalty. `max_active > 1`

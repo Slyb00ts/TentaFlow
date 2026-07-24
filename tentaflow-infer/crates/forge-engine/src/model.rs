@@ -6,15 +6,20 @@
 // adds the previous sublayer's output and produces the next sublayer's
 // normed input.
 
-use std::collections::{HashMap, VecDeque, HashSet};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
-use forge_formats::{PoolingType, LayerKind};
-use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
-use forge_kernels::{Kernels, Nvfp4GgufQ8Projection, Q8ActPrepared};
-use forge_types::{ForgeError, MemKind, Result, Vendor};
+use forge_formats::{LayerKind, PoolingType};
 use forge_hal::DEVICE_ALLOC_ALIGN;
+use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
+pub use forge_kernels::Nvfp4GgufLayout;
+use forge_kernels::{
+    DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4CtBm16Projection,
+    Nvfp4CtS0View, Nvfp4GgufQ8Projection, Q8ActPrepared, Q8PreparedProjection,
+};
+use forge_types::{DType, ForgeError, MemKind, Result, Vendor};
 use half::f16;
 
 use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
@@ -23,7 +28,7 @@ use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weights::{
     AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Weight, GateUpWeights, LayerFfn,
-    LayerMixer, ModelWeights, MoeFfn, QkvWeights, W4A8Weight,
+    LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy, NvFp4CtStorage, QkvWeights, W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -33,7 +38,77 @@ const HYBRID_PREFILL_PORTABLE_CHUNK: usize = 16;
 const HYBRID_PREFILL_LEGACY_CHUNK: usize = 32;
 const HYBRID_PREFILL_AUTO_CHUNK: usize = 128;
 const HYBRID_PREFILL_ACTIVATION_RESERVE: usize = 64 * 1024 * 1024;
+const HYBRID_LAYER_MAJOR_MAX_TOKENS: usize = 4096;
 const HYBRID_HOST_STAGING_SLOTS: usize = 3;
+const NVFP4_CT_BM16_PHYSICAL_M: usize = 16;
+const NVFP4_CT_BM16_QKV_ROWS: usize = 6144;
+const NVFP4_CT_BM16_GATE_UP_ROWS: usize = 22528;
+const NVFP4_CT_BM16_WORKSPACE_SPLITS: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Nvfp4CtBm16BufferPlan {
+    matrix_cap: usize,
+    qkv_elems: usize,
+    gate_up_elems: usize,
+    workspace_elems: usize,
+}
+
+fn nvfp4_ct_bm16_projection_for_shape(
+    rows: usize,
+    cols: usize,
+) -> Option<Nvfp4CtBm16Projection> {
+    match (rows, cols) {
+        (6144, 4096) => Some(Nvfp4CtBm16Projection::Qkv),
+        (4096, 4096) => Some(Nvfp4CtBm16Projection::Output),
+        (22528, 4096) => Some(Nvfp4CtBm16Projection::GateUp),
+        (4096, 11264) => Some(Nvfp4CtBm16Projection::Down),
+        _ => None,
+    }
+}
+
+fn nvfp4_ct_bm16_dimensions_capable(
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    inter: usize,
+) -> bool {
+    hidden == 4096 && q_dim == 4096 && kv_dim == 1024 && inter == 11264
+}
+
+fn nvfp4_ct_bm16_physical_m(logical_m: usize) -> Option<usize> {
+    matches!(logical_m, 4 | 8 | 16).then_some(NVFP4_CT_BM16_PHYSICAL_M)
+}
+
+fn nvfp4_ct_bm16_buffer_plan(
+    cap: usize,
+    model_capable: bool,
+) -> Option<Nvfp4CtBm16BufferPlan> {
+    if !model_capable {
+        return None;
+    }
+    Some(Nvfp4CtBm16BufferPlan {
+        matrix_cap: cap.max(NVFP4_CT_BM16_PHYSICAL_M),
+        qkv_elems: NVFP4_CT_BM16_PHYSICAL_M.checked_mul(NVFP4_CT_BM16_QKV_ROWS)?,
+        gate_up_elems: NVFP4_CT_BM16_PHYSICAL_M
+            .checked_mul(NVFP4_CT_BM16_GATE_UP_ROWS)?,
+        workspace_elems: NVFP4_CT_BM16_WORKSPACE_SPLITS
+            .checked_mul(NVFP4_CT_BM16_PHYSICAL_M)?
+            .checked_mul(NVFP4_CT_BM16_QKV_ROWS)?,
+    })
+}
+
+fn cleanup_after_error<T, F>(result: Result<T>, cleanup: F) -> Result<T>
+where
+    F: FnOnce(),
+{
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            cleanup();
+            Err(error)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HybridPrefillChunkConfig {
@@ -59,6 +134,49 @@ fn parse_hybrid_prefill_chunk_config(value: Option<&str>) -> Result<HybridPrefil
         )));
     }
     Ok(HybridPrefillChunkConfig::Explicit(chunk))
+}
+
+fn hybrid_layer_major_prefill_requested() -> bool {
+    std::env::var("FORGE_HYBRID_LAYER_MAJOR_PREFILL").map_or(true, |value| value != "0")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HybridLayerMajorAttention {
+    Exact,
+    Prefill,
+    Flash,
+}
+
+fn hybrid_layer_major_attention() -> Result<HybridLayerMajorAttention> {
+    match std::env::var("FORGE_HYBRID_LAYER_MAJOR_ATTN")
+        .ok()
+        .as_deref()
+    {
+        None | Some("fa") => Ok(HybridLayerMajorAttention::Flash),
+        Some("exact") => Ok(HybridLayerMajorAttention::Exact),
+        Some("prefill") => Ok(HybridLayerMajorAttention::Prefill),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_HYBRID_LAYER_MAJOR_ATTN wymaga exact/prefill/fa, otrzymano {value}"
+        ))),
+    }
+}
+
+fn hybrid_layer_major_persistent_scan_requested() -> Result<bool> {
+    match std::env::var("FORGE_HYBRID_LAYER_MAJOR_SCAN")
+        .ok()
+        .as_deref()
+    {
+        None | Some("auto") | Some("persistent") => Ok(true),
+        Some("chunked") => Ok(false),
+        Some(value) => Err(ForgeError::Scheduler(format!(
+            "FORGE_HYBRID_LAYER_MAJOR_SCAN wymaga auto/persistent/chunked, otrzymano {value}"
+        ))),
+    }
+}
+
+fn hybrid_layer_major_tiled_prepare_requested() -> bool {
+    std::env::var("FORGE_HYBRID_LAYER_MAJOR_DELTA_PREPARE")
+        .map_or(true, |value| value != "segmented")
 }
 
 fn hybrid_prefill_chunk_config_for_model(
@@ -157,6 +275,134 @@ fn hybrid_prefill_nvfp4_chunk_limit(
     }
 }
 
+fn grow_prefill_lanes_transactional(
+    kv: &mut KvCache,
+    seqs: &mut [&mut SeqKv],
+    n_tokens: usize,
+) -> Result<()> {
+    let old_lengths = seqs.iter().map(|seq| seq.len).collect::<Vec<_>>();
+    for seq in seqs.iter_mut() {
+        for _ in 0..n_tokens {
+            if let Err(error) = kv.grow(seq) {
+                for (seq, old_len) in seqs.iter_mut().zip(old_lengths) {
+                    kv.rollback(seq, old_len);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct PrefillSeqSnapshot {
+    len: usize,
+    tokens_len: usize,
+    prefilled_len: usize,
+}
+
+#[derive(Default)]
+struct KvReusePoison {
+    reason: Option<String>,
+}
+
+impl KvReusePoison {
+    fn poison(&mut self, reason: String) {
+        if self.reason.is_none() {
+            self.reason = Some(reason);
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.reason.is_some()
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        match self.reason() {
+            Some(reason) => Err(ForgeError::Device(format!(
+                "model zatrzymany po fatalnym błędzie synchronizacji KV: {reason}"
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+fn fatal_kv_synchronize(
+    poison: &mut KvReusePoison,
+    context: &str,
+    synchronize: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    poison.ensure_healthy()?;
+    match synchronize() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            poison.poison(format!("{context}: {error}"));
+            Err(error)
+        }
+    }
+}
+
+fn settle_kv_operation<T>(
+    operation: Result<T>,
+    context: &str,
+    synchronize: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    match synchronize() {
+        Ok(()) => operation,
+        Err(sync_error) => match operation {
+            Ok(_) => Err(sync_error),
+            Err(operation_error) => Err(ForgeError::Device(format!(
+                "{context}: błąd operacji ({operation_error}); błąd synchronizacji ({sync_error})"
+            ))),
+        },
+    }
+}
+
+fn restore_prefill_seq_snapshots(
+    kv: &mut KvCache,
+    seqs: &mut [&mut SeqKv],
+    snapshots: &[PrefillSeqSnapshot],
+) {
+    for (seq, snapshot) in seqs.iter_mut().zip(snapshots) {
+        kv.rollback(seq, snapshot.len);
+        seq.tokens.truncate(snapshot.tokens_len);
+        seq.prefilled_len = snapshot.prefilled_len;
+    }
+}
+
+fn run_dense_prefill_transaction<C, T>(
+    context: &mut C,
+    seqs: &mut [&mut SeqKv],
+    operation: impl FnOnce(&mut C, &mut [&mut SeqKv]) -> Result<T>,
+    synchronize: impl FnOnce(&mut C) -> Result<()>,
+    restore: impl FnOnce(&mut C, &mut [&mut SeqKv], &[PrefillSeqSnapshot]),
+) -> Result<T> {
+    let snapshots = seqs
+        .iter()
+        .map(|seq| PrefillSeqSnapshot {
+            len: seq.len,
+            tokens_len: seq.tokens.len(),
+            prefilled_len: seq.prefilled_len,
+        })
+        .collect::<Vec<_>>();
+    match operation(context, seqs) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Err(sync_error) = synchronize(context) {
+                return Err(ForgeError::Device(format!(
+                    "dense prefill zakończył się błędem ({error}); synchronizacja przed rollbackiem także się nie udała ({sync_error})"
+                )));
+            }
+            restore(context, seqs, &snapshots);
+            Err(error)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HybridPrefillScratchShape {
     hidden: usize,
@@ -196,6 +442,37 @@ fn checked_scratch_sum(name: &str, values: impl IntoIterator<Item = usize>) -> R
     })
 }
 
+fn hybrid_verify_delta_scratch_instances(cap: usize, delta_layers: usize) -> usize {
+    if cap > 4 {
+        usize::from(delta_layers > 0)
+    } else {
+        delta_layers
+    }
+}
+
+fn hybrid_verify_dedicated_z_bytes(shape: HybridPrefillScratchShape, cap: usize) -> Result<usize> {
+    if cap > 4 {
+        checked_scratch_bytes("z", &[cap, shape.value_dim], 2)
+    } else {
+        Ok(0)
+    }
+}
+
+fn hybrid_verify_attention_parts_bytes(
+    cap: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<usize> {
+    let partial_stride = head_dim
+        .checked_add(4)
+        .ok_or_else(|| ForgeError::Scheduler("przepełnienie stride atencji verifiera".into()))?;
+    checked_scratch_bytes(
+        "części atencji verifiera",
+        &[cap.min(4), n_heads, 8, partial_stride],
+        4,
+    )
+}
+
 fn hybrid_verify_scratch_estimate(
     shape: HybridPrefillScratchShape,
     cap: usize,
@@ -222,6 +499,7 @@ fn hybrid_verify_scratch_estimate(
     ];
     if cap > 4 {
         device.extend([
+            hybrid_verify_dedicated_z_bytes(shape, cap)?,
             checked_scratch_bytes("recurrence output", &[cap, shape.value_dim], 2)?,
             4,
         ]);
@@ -241,7 +519,7 @@ fn hybrid_verify_scratch_estimate(
     device.push(checked_scratch_bytes(
         "warstwy DeltaNet",
         &[
-            shape.delta_layers,
+            hybrid_verify_delta_scratch_instances(cap, shape.delta_layers),
             checked_scratch_sum(
                 "warstwy DeltaNet",
                 [
@@ -314,6 +592,51 @@ fn hybrid_prefill_scratch_estimate(
     })
 }
 
+fn hybrid_layer_major_scratch_estimate(
+    shape: HybridPrefillScratchShape,
+    tokens: usize,
+) -> Result<usize> {
+    if tokens == 0 || tokens > HYBRID_LAYER_MAJOR_MAX_TOKENS {
+        return Err(ForgeError::Scheduler(format!(
+            "layer-major prefill wymaga 1..={HYBRID_LAYER_MAJOR_MAX_TOKENS} tokenów"
+        )));
+    }
+    let wide = shape.q_dim.max(shape.value_dim);
+    let shared_projection = shape
+        .q_dim
+        .checked_mul(2)
+        .map(|q| q.max(shape.conv_dim))
+        .ok_or_else(|| ForgeError::Scheduler("przepełnienie projekcji layer-major".into()))?;
+    if shape.inter < shared_projection || wide < shape.hidden || wide < shape.kv_dim {
+        return Err(ForgeError::Unsupported(
+            "kształt layer-major nie pozwala współdzielić buforów fazowych".into(),
+        ));
+    }
+    let conv_elems = shape
+        .conv_dim
+        .checked_mul(shape.d_conv.saturating_sub(1))
+        .ok_or_else(|| ForgeError::Scheduler("przepełnienie okna conv layer-major".into()))?;
+    checked_scratch_sum(
+        "arena layer-major",
+        [
+            checked_scratch_bytes("hidden layer-major", &[2, tokens, shape.hidden], 2)?,
+            checked_scratch_bytes("v layer-major", &[tokens, shape.kv_dim], 2)?,
+            checked_scratch_bytes("szerokie bufory layer-major", &[2, tokens, wide], 2)?,
+            checked_scratch_bytes("z i o layer-major", &[2, tokens, shape.value_dim], 2)?,
+            checked_scratch_bytes("ffn layer-major", &[2, tokens, shape.inter], 2)?,
+            checked_scratch_bytes(
+                "surowe bramki layer-major",
+                &[2, tokens, shape.n_v_heads],
+                2,
+            )?,
+            checked_scratch_bytes("bramki f32 layer-major", &[2, tokens, shape.n_v_heads], 4)?,
+            checked_scratch_bytes("metadata layer-major", &[3, tokens], 4)?,
+            checked_scratch_bytes("okna conv layer-major", &[2, conv_elems], 2)?,
+            4,
+        ],
+    )
+}
+
 fn hybrid_prefill_activation_budget_capable(
     estimate: HybridPrefillScratchEstimate,
     available: Option<usize>,
@@ -364,8 +687,7 @@ fn validate_mtp_routed_inputs(
     external_drafts: [Option<&[u32]>; 2],
 ) -> Result<[i32; 2]> {
     let [fed0, fed1] = fed.map(|token| {
-        i32::try_from(token)
-            .map_err(|_| ForgeError::Format("fed routed MTP przekracza i32".into()))
+        i32::try_from(token).map_err(|_| ForgeError::Format("fed routed MTP przekracza i32".into()))
     });
     let fed_i32 = [fed0?, fed1?];
     if external_drafts
@@ -612,6 +934,10 @@ pub struct ModelConfig {
     pub prefix_cache: bool,
     /// Ładuje i uruchamia opcjonalną głowę MTP/NextN modelu.
     pub native_mtp: bool,
+    /// Żądany układ GGUF NVFP4. Tryby spekulacyjne i batch muszą używać RowMajor36.
+    pub nvfp4_gguf_layout: Nvfp4GgufLayout,
+    /// Polityka resident dla checkpointów compressed-tensors NVFP4.
+    pub nvfp4_ct_layout: NvFp4CtLayoutPolicy,
 }
 
 impl Default for ModelConfig {
@@ -624,6 +950,8 @@ impl Default for ModelConfig {
             kv_tier: KvTierConfig::default(),
             prefix_cache: true,
             native_mtp: false,
+            nvfp4_gguf_layout: Nvfp4GgufLayout::RowMajor36,
+            nvfp4_ct_layout: NvFp4CtLayoutPolicy::RowMajorE4M3,
         }
     }
 }
@@ -645,6 +973,7 @@ pub struct Model {
     pub kernels: Kernels,
     pub weights: ModelWeights,
     pub kv: KvCache,
+    kv_reuse_poison: KvReusePoison,
     stream: Stream,
     /// Device-side page table + seq len for the active sequence (v0: one).
     page_table_dev: DevBuffer,
@@ -667,6 +996,8 @@ pub struct Model {
     hybrid_prefill_bufs: Option<HybridVerifyBufs>,
     /// Dedykowany scratch ciągłego prefill dokładnie B2×T32.
     hybrid_prefill_b2_bufs: Option<HybridPrefillB2Bufs>,
+    /// Leniwa arena pełnego przebiegu layer-major, domyślnie nieaktywna.
+    hybrid_layer_major_bufs: Option<HybridLayerMajorBufs>,
     /// Trwałe grafy stałej części verifiera MTP dla pary slotu i T.
     hybrid_verify_graphs: HashMap<(usize, usize), ExecGraph>,
     /// Nieudana próba przechwycenia wyłącza kolejne próby dla danej pary.
@@ -807,6 +1138,7 @@ struct HybridStateSlot {
 struct HybridStatePool {
     device: Arc<dyn Device>,
     layer_kinds: Vec<LayerKind>,
+    layout: DeltaStateLayout,
     conv_bytes: usize,
     state_bytes: usize,
     zero_conv: DevBuffer,
@@ -825,6 +1157,7 @@ impl HybridStatePool {
     fn new(
         device: Arc<dyn Device>,
         layer_kinds: Vec<LayerKind>,
+        layout: DeltaStateLayout,
         conv_bytes: usize,
         state_bytes: usize,
         mtp_config: Option<(KvConfig, usize, usize)>,
@@ -853,6 +1186,7 @@ impl HybridStatePool {
         let mut pool = Self {
             device,
             layer_kinds,
+            layout,
             conv_bytes,
             state_bytes,
             zero_conv,
@@ -1197,6 +1531,10 @@ impl HybridStatePool {
         &self.slots[active.slot].layers
     }
 
+    fn layout(&self) -> DeltaStateLayout {
+        self.layout
+    }
+
     fn state_buffers(
         &self,
         lease: HybridStateLease,
@@ -1535,6 +1873,7 @@ struct HybridVerifyBufs {
     cap: usize,
     base_pos: DevBuffer,
     visible_lens: DevBuffer,
+    attn_parts: DevBuffer,
     q_full: DevBuffer,
     qc: DevBuffer,
     gatec: DevBuffer,
@@ -1641,6 +1980,62 @@ struct HybridPrefillB2Bufs {
     final_conv: DevBuffer,
     final_states: DevBuffer,
     delta: Vec<Option<HybridPrefillB2DeltaCache>>,
+}
+
+#[derive(Clone)]
+struct HybridLayerMajorBufs {
+    cap: usize,
+    device_bytes: usize,
+    h: DevBuffer,
+    x: DevBuffer,
+    k: DevBuffer,
+    v: DevBuffer,
+    q_full: DevBuffer,
+    qc: DevBuffer,
+    gatec: DevBuffer,
+    gated: DevBuffer,
+    z: DevBuffer,
+    alpha: DevBuffer,
+    beta_raw: DevBuffer,
+    g: DevBuffer,
+    beta: DevBuffer,
+    o: DevBuffer,
+    gate: DevBuffer,
+    up: DevBuffer,
+    mixer_out: DevBuffer,
+    conv_initial: DevBuffer,
+    conv_final: DevBuffer,
+    ids: DevBuffer,
+    positions: DevBuffer,
+    visible_lens: DevBuffer,
+    base_pos: DevBuffer,
+    host_staging: Vec<HybridLayerMajorHostStaging>,
+}
+
+#[derive(Clone)]
+struct HybridLayerMajorHostStaging {
+    embedding: DevBuffer,
+    page_table: DevBuffer,
+    ids: DevBuffer,
+    positions: DevBuffer,
+    visible_lens: DevBuffer,
+    base_pos: DevBuffer,
+    seq_len: DevBuffer,
+    position: DevBuffer,
+    ready: Event,
+}
+
+struct HybridLayerMajorCheckpoint {
+    base: usize,
+    pages: Vec<i32>,
+    tokens_len: usize,
+    prefilled_len: usize,
+    state_workspace: DevBuffer,
+    conv_workspaces: Vec<Option<DevBuffer>>,
+    state_bytes: usize,
+    kv_byte_offset: usize,
+    kv_page_bytes: usize,
+    tail_page: Option<usize>,
 }
 
 type MtpB2Verification = ([(Vec<u32>, usize, u32); 2], [usize; 2]);
@@ -1826,6 +2221,9 @@ struct BatchBufs {
     pinned_pen_presence: DevBuffer,
     out_ids: DevBuffer,
     pinned_out: DevBuffer,
+    nvfp4_ct_qkv_m16: Option<DevBuffer>,
+    nvfp4_ct_gate_up_m16: Option<DevBuffer>,
+    nvfp4_ct_workspace: Option<DevBuffer>,
 }
 
 /// MoE scratch (allocated only for Mixture-of-Experts models). The router
@@ -1856,6 +2254,25 @@ pub(crate) fn hybrid_prefill_b2_backend_capable(vendor: Vendor, warp_size: u32) 
 }
 
 impl Model {
+    fn nvfp4_tile_requested(layout: Nvfp4GgufLayout, capable: bool) -> Result<bool> {
+        match layout {
+            Nvfp4GgufLayout::RowMajor36 => Ok(false),
+            Nvfp4GgufLayout::TileN128K64 if capable => Ok(true),
+            Nvfp4GgufLayout::TileN128K64 => Err(ForgeError::Unsupported(
+                "TileN128K64 wymaga NVIDIA warp32 i pełnego zestawu artefaktów NVFP4".into(),
+            )),
+        }
+    }
+
+    fn validate_nvfp4_tile_repacked(requested: bool, repacked_weights: usize) -> Result<()> {
+        if requested && repacked_weights == 0 {
+            return Err(ForgeError::Unsupported(
+                "TileN128K64 wymaga co najmniej jednej kwalifikującej się wagi GGUF NVFP4".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn target_kv_layer(&self, global_layer: usize) -> usize {
         self.kv
             .layer_index(global_layer)
@@ -1863,8 +2280,18 @@ impl Model {
     }
 
     pub fn load_gguf(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Result<Self> {
-        let weights = ModelWeights::load_gguf(&device, path, cfg.native_mtp)?;
-        Self::finish(device, weights, cfg)
+        let kernels = Kernels::load(device.clone())?;
+        let stream = device.create_stream()?;
+        let target_tile = Self::nvfp4_tile_requested(
+            cfg.nvfp4_gguf_layout,
+            kernels.supports_nvfp4_gguf_tile_n128_k64(),
+        )?;
+        let repacked_weights = Cell::new(0);
+        let tile_context = target_tile.then_some((&kernels, &stream, &repacked_weights));
+        let mut weights = ModelWeights::load_gguf(&device, path, cfg.native_mtp, tile_context)?;
+        Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
+        weights.nvfp4_repacked_weights = repacked_weights.get();
+        Self::finish(device, weights, cfg, kernels, stream)
     }
 
     pub fn load_safetensors_dir(
@@ -1872,12 +2299,45 @@ impl Model {
         dir: &Path,
         cfg: ModelConfig,
     ) -> Result<Self> {
-        let weights = ModelWeights::load_safetensors_dir(&device, dir, cfg.native_mtp)?;
-        Self::finish(device, weights, cfg)
+        let kernels = Kernels::load(device.clone())?;
+        let stream = device.create_stream()?;
+        let target_tile = Self::nvfp4_tile_requested(
+            cfg.nvfp4_gguf_layout,
+            kernels.supports_nvfp4_gguf_tile_n128_k64(),
+        )?;
+        let repacked_weights = Cell::new(0);
+        let tile_context = target_tile.then_some((&kernels, &stream, &repacked_weights));
+        let mut weights =
+            ModelWeights::load_safetensors_dir(
+                &device,
+                dir,
+                cfg.native_mtp,
+                tile_context,
+                (&kernels, &stream, cfg.nvfp4_ct_layout),
+            )?;
+        Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
+        weights.nvfp4_repacked_weights = repacked_weights.get();
+        Self::finish(device, weights, cfg, kernels, stream)
     }
 
-    fn finish(device: Arc<dyn Device>, mut weights: ModelWeights, cfg: ModelConfig) -> Result<Self> {
-        let p = &weights.descriptor.params;
+    pub fn nvfp4_gguf_layout_summary(&self) -> (Nvfp4GgufLayout, usize) {
+        let count = self.weights.nvfp4_repacked_weights;
+        let layout = if count == 0 {
+            Nvfp4GgufLayout::RowMajor36
+        } else {
+            Nvfp4GgufLayout::TileN128K64
+        };
+        (layout, count)
+    }
+
+    fn finish(
+        device: Arc<dyn Device>,
+        mut weights: ModelWeights,
+        cfg: ModelConfig,
+        kernels: Kernels,
+        stream: Stream,
+    ) -> Result<Self> {
+        let p = weights.descriptor.params.clone();
         // head_dim 256 has an f16-only attention specialization (qwen35moe
         // gated attention layers); the hybrid arch always uses the f16 cache.
         if p.head_dim != 64 && p.head_dim != 128 && p.head_dim != 256 {
@@ -1934,7 +2394,6 @@ impl Model {
             }
         }
         let max_pages_per_seq = cfg.max_seq_len.div_ceil(cfg.kv_page_size);
-        let kernels = Kernels::load(device.clone())?;
         if weights.descriptor.layer_kinds.len() != p.block_count {
             return Err(ForgeError::Format(format!(
                 "mapa typów warstw ma {} wpisów, oczekiwano {}",
@@ -1962,7 +2421,6 @@ impl Model {
             },
             kv_layer_map,
         )?;
-        let stream = device.create_stream()?;
         let draft_head_mode = std::env::var("FORGE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "q8".into());
         match draft_head_mode.as_str() {
             "q8" => {}
@@ -1997,13 +2455,17 @@ impl Model {
                 let packed = device.alloc(bytes, MemKind::Device, Pool::Weights)?;
                 kernels.pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)?;
                 device.synchronize()?;
-                weights.mtp.as_mut().expect("sprawdzono head MTP").draft_output =
-                    Some(DevWeight::NvFp4Gguf {
-                        buf: packed,
-                        output_scale: 1.0,
-                        rows,
-                        cols,
-                    });
+                weights
+                    .mtp
+                    .as_mut()
+                    .expect("sprawdzono head MTP")
+                    .draft_output = Some(DevWeight::NvFp4Gguf {
+                    buf: packed,
+                    output_scale: 1.0,
+                    rows,
+                    cols,
+                    layout: Nvfp4GgufLayout::RowMajor36,
+                });
             }
             value => {
                 return Err(ForgeError::Unsupported(format!(
@@ -2127,7 +2589,11 @@ impl Model {
             sample_out: device.alloc(8, MemKind::Device, Pool::Activations)?,
             pinned_sample: device.alloc(8, MemKind::PinnedHost, Pool::Activations)?,
             penalty_ids: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
-            penalty_counts: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
+            penalty_counts: device.alloc(
+                cfg.max_seq_len * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?,
             pinned_penalty: device.alloc(
                 cfg.max_seq_len * 4,
                 MemKind::PinnedHost,
@@ -2187,9 +2653,17 @@ impl Model {
             Some(sp) => {
                 let conv_bytes = sp.conv_dim() * (sp.d_conv - 1) * 2;
                 let state_bytes = sp.n_v_heads() * sp.d_state * sp.d_state * 4;
+                let layout = kernels.preferred_delta_state_layout(sp.d_state);
+                #[cfg(feature = "test-hooks")]
+                let layout = if std::env::var_os("FORGE_TEST_FORCE_DELTA_KEY_VALUE").is_some() {
+                    DeltaStateLayout::KeyValue
+                } else {
+                    layout
+                };
                 Some(HybridStatePool::new(
                     device.clone(),
                     weights.descriptor.layer_kinds.clone(),
+                    layout,
                     conv_bytes,
                     state_bytes,
                     mtp_config,
@@ -2215,6 +2689,7 @@ impl Model {
             kernels,
             weights,
             kv,
+            kv_reuse_poison: KvReusePoison::default(),
             stream,
             page_table_dev,
             seq_len_dev,
@@ -2227,6 +2702,7 @@ impl Model {
             mtp_b2_bufs: None,
             hybrid_prefill_bufs: None,
             hybrid_prefill_b2_bufs: None,
+            hybrid_layer_major_bufs: None,
             hybrid_verify_graphs: HashMap::new(),
             hybrid_verify_graph_disabled: HashSet::new(),
             decode_graph: None,
@@ -2313,11 +2789,29 @@ impl Model {
             ));
         }
         let hybrid = self.is_hybrid();
+        let layer_major_limit = self
+            .hybrid_layer_major_prefill_limit()
+            .filter(|_| prompt_tokens >= 32);
+        if let Some(limit) = layer_major_limit {
+            let arena_tokens = prompt_tokens.min(limit);
+            self.ensure_hybrid_layer_major_bufs(arena_tokens)?;
+            tracing::info!(
+                tokens = arena_tokens,
+                bytes = self
+                    .hybrid_layer_major_bufs
+                    .as_ref()
+                    .expect("arena layer-major została zaalokowana")
+                    .device_bytes,
+                "zaalokowano prototypową arenę layer-major"
+            );
+        }
         let hybrid_batched = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
             .map_or(true, |value| value != "0")
             && prompt_tokens > 1
             && self.validate_hybrid_speculation_target().is_ok();
-        let target_spans = if hybrid_batched {
+        let target_spans = if let Some(limit) = layer_major_limit {
+            prompt_tokens.div_ceil(limit)
+        } else if hybrid_batched {
             hybrid_prefill_profile_spans(prompt_tokens, self.hybrid_prefill_chunk_size)
         } else if hybrid {
             prompt_tokens
@@ -2332,7 +2826,7 @@ impl Model {
                     end: self.device.create_timing_event()?,
                 });
             }
-            let catchup_spans = if hybrid_batched {
+            let catchup_spans = if layer_major_limit.is_some() || hybrid_batched {
                 target_spans
             } else if hybrid {
                 prompt_tokens
@@ -2441,6 +2935,19 @@ impl Model {
         self.kv.new_seq()
     }
 
+    pub fn ensure_kv_reuse_healthy(&self) -> Result<()> {
+        self.kv_reuse_poison.ensure_healthy()
+    }
+
+    pub fn kv_reuse_poison_reason(&self) -> Option<&str> {
+        self.kv_reuse_poison.reason()
+    }
+
+    fn synchronize_kv_fatal(&mut self, context: &str) -> Result<()> {
+        let device = self.device.clone();
+        fatal_kv_synchronize(&mut self.kv_reuse_poison, context, || device.synchronize())
+    }
+
     /// Rezerwuje pamięć stanów targetu i MTP przed dopuszczeniem wielu requestów.
     pub fn preflight_hybrid_state_slots(&mut self, slots: usize) -> Result<()> {
         if slots == 0 {
@@ -2455,6 +2962,18 @@ impl Model {
     }
 
     pub fn release_seq(&mut self, seq: &mut SeqKv) {
+        if self.kv_reuse_poison.is_poisoned() {
+            let reason = self
+                .kv_reuse_poison
+                .reason()
+                .expect("poison ma zapisany powód");
+            tracing::error!(
+                seq_id = seq.id,
+                pages = seq.pages.len(),
+                "sekwencja KV pozostaje w kwarantannie po fatalnym błędzie: {reason}"
+            );
+            return;
+        }
         if let Some(lease) = seq.hybrid_state {
             let release = self
                 .hybrid_states
@@ -2497,6 +3016,13 @@ impl Model {
             .as_ref()
             .expect("model hybrydowy ma pulę stanów")
             .active_layers()
+    }
+
+    fn delta_state_layout(&self) -> DeltaStateLayout {
+        self.hybrid_states
+            .as_ref()
+            .expect("model hybrydowy ma pulę stanów")
+            .layout()
     }
 
     fn take_mtp_runtime(
@@ -2856,7 +3382,7 @@ impl Model {
             if self.is_hybrid() {
                 self.prefill_hybrid(seq, chunk)?;
             } else {
-                self.prefill_forward(seq, chunk)?;
+                self.prefill_forward(seq, chunk, true)?;
             }
         }
         Ok(())
@@ -2943,28 +3469,62 @@ impl Model {
                 self.kernels.gemv_iq1_m_f16(y, buf, x, *rows, *cols, stream)
             }
             DevWeight::NvFp4 {
-                packed,
-                scales,
+                storage,
                 inv_global_scale,
                 rows,
                 cols,
-            } => self.kernels.gemv_nvfp4_f16(
-                y,
-                packed,
-                scales,
-                x,
-                *rows,
-                *cols,
-                *inv_global_scale,
-                stream,
-            ),
+            } => match storage {
+                NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                    self.kernels.gemv_nvfp4_f16(
+                        y,
+                        packed,
+                        scales,
+                        x,
+                        *rows,
+                        *cols,
+                        *inv_global_scale,
+                        stream,
+                    )
+                }
+                NvFp4CtStorage::S0N64K128 { .. } => {
+                    let window = w.nvfp4_ct_row_window(0, *rows)?;
+                    let view = Nvfp4CtS0View::new(
+                        window.data(),
+                        window.physical_rows(),
+                        window.cols(),
+                    )?;
+                    self.kernels.gemv_nvfp4_ct_s0_n64k128_f16(
+                        y,
+                        view,
+                        x,
+                        window.row_offset(),
+                        window.rows(),
+                        *inv_global_scale,
+                        stream,
+                    )
+                }
+            },
             DevWeight::NvFp4Gguf {
                 buf,
                 output_scale,
                 rows,
                 cols,
+                layout,
             } => {
-                if self.device.caps().vendor == Vendor::Nvidia {
+                if *layout == Nvfp4GgufLayout::TileN128K64 {
+                    self.kernels.gemv_nvfp4_gguf_q8_1_group_layout_f16(
+                        &[Nvfp4GgufQ8Projection {
+                            output: y,
+                            weights: buf,
+                            rows: *rows,
+                            output_scale: *output_scale,
+                        }],
+                        x,
+                        *cols,
+                        *layout,
+                        stream,
+                    )
+                } else if self.device.caps().vendor == Vendor::Nvidia {
                     self.kernels.gemv_nvfp4_gguf_b1_f16(
                         y,
                         buf,
@@ -3000,6 +3560,7 @@ impl Model {
         stream: &Stream,
     ) -> Result<bool> {
         let mut cols = None;
+        let mut weight_layout = None;
         let mut group = Vec::with_capacity(projections.len());
         for &(output, weight) in projections {
             let DevWeight::NvFp4Gguf {
@@ -3007,6 +3568,7 @@ impl Model {
                 output_scale,
                 rows,
                 cols: weight_cols,
+                layout,
             } = weight
             else {
                 return Ok(false);
@@ -3016,6 +3578,10 @@ impl Model {
                     "projekcje NVFP4 współdzielące Q8_1 mają różne szerokości".into(),
                 ));
             }
+            if weight_layout.is_some_and(|value| value != *layout) {
+                return Ok(false);
+            }
+            weight_layout = Some(*layout);
             cols = Some(*weight_cols);
             group.push(Nvfp4GgufQ8Projection {
                 output,
@@ -3025,7 +3591,11 @@ impl Model {
             });
         }
         let Some(cols) = cols else { return Ok(false) };
-        if self.device.caps().vendor == Vendor::Nvidia {
+        let layout = weight_layout.unwrap_or(Nvfp4GgufLayout::RowMajor36);
+        if layout == Nvfp4GgufLayout::TileN128K64 {
+            self.kernels
+                .gemv_nvfp4_gguf_q8_1_group_layout_f16(&group, x, cols, layout, stream)?;
+        } else if self.device.caps().vendor == Vendor::Nvidia {
             for projection in group {
                 self.kernels.gemv_nvfp4_gguf_b1_f16(
                     projection.output,
@@ -3050,7 +3620,16 @@ impl Model {
         match w {
             DevWeight::F16 { cols, .. } => cols.is_multiple_of(8),
             DevWeight::Q8_0 { cols, .. } => cols.is_multiple_of(32),
-            DevWeight::NvFp4 { cols, .. } => cols.is_multiple_of(16),
+            DevWeight::NvFp4 {
+                storage: NvFp4CtStorage::RowMajorE4M3 { .. },
+                cols,
+                ..
+            } => cols.is_multiple_of(16),
+            DevWeight::NvFp4 {
+                storage: NvFp4CtStorage::S0N64K128 { .. },
+                cols,
+                ..
+            } => cols.is_multiple_of(128),
             DevWeight::NvFp4Gguf { .. } => false,
             // Q4_K stages per-32-column x sums in shared memory
             // (Q4K_MAX_SEGS in gemv2.mojo bounds cols at 32768).
@@ -3160,25 +3739,25 @@ impl Model {
                 stream,
             ),
             DevWeight::NvFp4 {
-                packed,
-                scales,
+                storage,
                 inv_global_scale,
                 rows,
                 cols,
-            } => self.kernels.gemv_norm_nvfp4_f16(
-                y,
-                packed,
-                scales,
-                &b.h,
-                &b.h32,
-                norm_w,
-                *rows,
-                *cols,
-                *inv_global_scale,
-                ss_from_h16,
-                eps,
-                stream,
-            ),
+            } => match storage {
+                NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                    self.kernels.gemv_norm_nvfp4_f16(
+                        y, packed, scales, &b.h, &b.h32, norm_w, *rows, *cols,
+                        *inv_global_scale, ss_from_h16, eps, stream,
+                    )
+                }
+                NvFp4CtStorage::S0N64K128 { data } => {
+                    let view = Nvfp4CtS0View::new(data, *rows, *cols)?;
+                    self.kernels.gemv_norm_nvfp4_ct_s0_f16(
+                        y, view, &b.h, &b.h32, norm_w, *inv_global_scale,
+                        ss_from_h16, eps, stream,
+                    )
+                }
+            },
             DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_q4_k_dp4a_f16(
                 y,
                 buf,
@@ -3448,24 +4027,25 @@ impl Model {
                 stream,
             ),
             DevWeight::NvFp4 {
-                packed,
-                scales,
+                storage,
                 inv_global_scale,
                 rows,
                 cols,
-            } => self.kernels.gemv_norm_silu_nvfp4_f16(
-                act,
-                packed,
-                scales,
-                &b.h,
-                &b.h32,
-                norm_w,
-                rows / 2,
-                *cols,
-                *inv_global_scale,
-                eps,
-                stream,
-            ),
+            } => match storage {
+                NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                    self.kernels.gemv_norm_silu_nvfp4_f16(
+                        act, packed, scales, &b.h, &b.h32, norm_w, rows / 2, *cols,
+                        *inv_global_scale, eps, stream,
+                    )
+                }
+                NvFp4CtStorage::S0N64K128 { data } => {
+                    let view = Nvfp4CtS0View::new(data, *rows, *cols)?;
+                    self.kernels.gemv_norm_silu_nvfp4_ct_s0_f16(
+                        act, view, &b.h, &b.h32, norm_w, rows / 2,
+                        *inv_global_scale, eps, stream,
+                    )
+                }
+            },
             DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_k_dp4a_f16(
                 act,
                 buf,
@@ -3702,22 +4282,24 @@ impl Model {
                 }
             }
             DevWeight::NvFp4 {
-                packed,
-                scales,
+                storage,
                 inv_global_scale,
                 rows,
                 cols,
-            } => self.kernels.gemv_residual_nvfp4_f16(
-                &b.h,
-                &b.h32,
-                packed,
-                scales,
-                x,
-                *rows,
-                *cols,
-                *inv_global_scale,
-                stream,
-            ),
+            } => match storage {
+                NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                    self.kernels.gemv_residual_nvfp4_f16(
+                        &b.h, &b.h32, packed, scales, x, *rows, *cols,
+                        *inv_global_scale, stream,
+                    )
+                }
+                NvFp4CtStorage::S0N64K128 { data } => {
+                    let view = Nvfp4CtS0View::new(data, *rows, *cols)?;
+                    self.kernels.gemv_residual_nvfp4_ct_s0_f16(
+                        &b.h, &b.h32, view, x, *inv_global_scale, stream,
+                    )
+                }
+            },
             DevWeight::Q4K { buf, rows, cols } => {
                 if *cols <= Kernels::DP4A_MAX_COLS {
                     self.kernels
@@ -3899,8 +4481,15 @@ impl Model {
                 output_scale,
                 rows,
                 cols,
+                layout,
             } => self.kernels.gemv_nvfp4_gguf_out_f32(
-                y_f32,
+                if *layout == Nvfp4GgufLayout::RowMajor36 {
+                    y_f32
+                } else {
+                    return Err(ForgeError::Unsupported(
+                        "głowa logitów nie obsługuje TileN128K64".into(),
+                    ));
+                },
                 buf,
                 x,
                 *rows,
@@ -3921,6 +4510,100 @@ impl Model {
         stream: &Stream,
     ) -> Result<()> {
         self.gemm_rows(y, w, x, n_tokens, 0, w.rows(), stream)
+    }
+
+    fn nvfp4_ct_bm16_projection(weight: &DevWeight) -> Option<Nvfp4CtBm16Projection> {
+        let DevWeight::NvFp4 {
+            storage: NvFp4CtStorage::S0N64K128 { .. },
+            rows,
+            cols,
+            ..
+        } = weight else { return None };
+        nvfp4_ct_bm16_projection_for_shape(*rows, *cols)
+    }
+
+    fn nvfp4_ct_bm16_model_capable(&self) -> bool {
+        if !matches!(
+            std::env::var("FORGE_NVFP4_CT_BM16").ok().as_deref(),
+            None | Some("1")
+        ) {
+            return false;
+        }
+        let params = &self.weights.descriptor.params;
+        let dimensions_capable = params
+            .n_heads
+            .checked_mul(params.head_dim)
+            .zip(params.n_kv_heads.checked_mul(params.head_dim))
+            .is_some_and(|(q_dim, kv_dim)| {
+                nvfp4_ct_bm16_dimensions_capable(
+                    params.hidden_size,
+                    q_dim,
+                    kv_dim,
+                    params.intermediate_size,
+                )
+            });
+        dimensions_capable
+            && !self.is_hybrid()
+            && !self.weights.is_moe()
+            && self.weights.layers.iter().all(|layer| {
+                let QkvWeights::Fused(qkv) = &layer.attn().attn_qkv else {
+                    return false;
+                };
+                let Ok(ffn) = layer.dense_ffn() else {
+                    return false;
+                };
+                let GateUpWeights::Fused(gate_up) = &ffn.gate_up else {
+                    return false;
+                };
+                Self::nvfp4_ct_bm16_projection(qkv) == Some(Nvfp4CtBm16Projection::Qkv)
+                    && Self::nvfp4_ct_bm16_projection(&layer.attn().attn_o)
+                        == Some(Nvfp4CtBm16Projection::Output)
+                    && Self::nvfp4_ct_bm16_projection(gate_up)
+                        == Some(Nvfp4CtBm16Projection::GateUp)
+                    && Self::nvfp4_ct_bm16_projection(&ffn.down)
+                        == Some(Nvfp4CtBm16Projection::Down)
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_nvfp4_ct_bm16(
+        &self,
+        y_m16: &DevBuffer,
+        workspace: &DevBuffer,
+        weight: &DevWeight,
+        x_m16: &DevBuffer,
+        logical_m: usize,
+        projection: Nvfp4CtBm16Projection,
+        stream: &Stream,
+    ) -> Result<bool> {
+        if nvfp4_ct_bm16_physical_m(logical_m).is_none()
+            || Self::nvfp4_ct_bm16_projection(weight) != Some(projection)
+        {
+            return Ok(false);
+        }
+        let DevWeight::NvFp4 {
+            inv_global_scale,
+            rows,
+            ..
+        } = weight else { return Ok(false) };
+        let window = weight.nvfp4_ct_row_window(0, *rows)?;
+        let view =
+            Nvfp4CtS0View::new(window.data(), window.physical_rows(), window.cols())?;
+        self.kernels.gemm_nvfp4_ct_bm16_m16(
+            y_m16,
+            if projection == Nvfp4CtBm16Projection::GateUp {
+                None
+            } else {
+                Some(workspace)
+            },
+            view,
+            x_m16,
+            logical_m,
+            projection,
+            *inv_global_scale,
+            stream,
+        )?;
+        Ok(true)
     }
 
     fn delta_input_q8_cols(delta: &DeltaNetWeights) -> Option<usize> {
@@ -3953,13 +4636,51 @@ impl Model {
                 "przygotowana grupa DeltaNet wymaga wag Q8_0".into(),
             ));
         };
-        self.kernels.gemm_q8_0_i8mma_prepared_at(
-            y,
-            buf,
-            0,
+        self.kernels
+            .gemm_q8_0_i8mma_prepared_at(y, buf, 0, prepared, *rows, *cols, n_tokens)
+    }
+
+    fn gemm_q8_prepared_triplet(
+        &self,
+        outputs: [&DevBuffer; 3],
+        weights: [&DevWeight; 3],
+        prepared: &mut Q8ActPrepared<'_>,
+        n_tokens: usize,
+    ) -> Result<()> {
+        fn projection<'a>(
+            output: &'a DevBuffer,
+            weight: &'a DevWeight,
+        ) -> Result<(Q8PreparedProjection<'a>, usize)> {
+            let DevWeight::Q8_0 {
+                buf, rows, cols, ..
+            } = weight
+            else {
+                return Err(ForgeError::Format(
+                    "fused grupa DeltaNet wymaga wag Q8_0".into(),
+                ));
+            };
+            Ok((
+                Q8PreparedProjection {
+                    output,
+                    weights: buf,
+                    weight_byte_offset: 0,
+                    rows: *rows,
+                },
+                *cols,
+            ))
+        }
+        let (gate, cols) = projection(outputs[0], weights[0])?;
+        let (alpha, alpha_cols) = projection(outputs[1], weights[1])?;
+        let (beta, beta_cols) = projection(outputs[2], weights[2])?;
+        if alpha_cols != cols || beta_cols != cols {
+            return Err(ForgeError::Format(
+                "fused grupa DeltaNet wymaga wspólnego rozmiaru wejścia".into(),
+            ));
+        }
+        self.kernels.gemm_q8_0_i8mma_prepared_triplet(
+            &[gate, alpha, beta],
             prepared,
-            *rows,
-            *cols,
+            cols,
             n_tokens,
         )
     }
@@ -4258,30 +4979,58 @@ impl Model {
                 stream,
             ),
             DevWeight::NvFp4 {
-                packed,
-                scales,
+                storage,
                 inv_global_scale,
                 cols,
                 ..
-            } => self.kernels.gemm_nvfp4_f16_at(
-                y,
-                packed,
-                row_off * (cols / 2),
-                scales,
-                row_off * (cols / 16),
-                x,
-                n_rows,
-                *cols,
-                n_tokens,
-                *inv_global_scale,
-                stream,
-            ),
+            } => match storage {
+                NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                    self.kernels.gemm_nvfp4_f16_at(
+                        y, packed, row_off * (cols / 2), scales,
+                        row_off * (cols / 16), x, n_rows, *cols, n_tokens,
+                        *inv_global_scale, stream,
+                    )
+                }
+                NvFp4CtStorage::S0N64K128 { .. } => {
+                    let window = w.nvfp4_ct_row_window(row_off, n_rows)?;
+                    let view = Nvfp4CtS0View::new(
+                        window.data(),
+                        window.physical_rows(),
+                        window.cols(),
+                    )?;
+                    if n_tokens <= 16 {
+                        return self.kernels.gemv_batch_nvfp4_ct_s0_n64k128_f16_at(
+                            y,
+                            0,
+                            view,
+                            x,
+                            0,
+                            window.row_offset(),
+                            window.rows(),
+                            n_tokens,
+                            *inv_global_scale,
+                            stream,
+                        );
+                    }
+                    self.kernels.gemm_nvfp4_ct_s0_f16_at(
+                        y,
+                        view,
+                        x,
+                        window.row_offset(),
+                        window.rows(),
+                        n_tokens,
+                        *inv_global_scale,
+                        stream,
+                    )
+                }
+            },
             DevWeight::NvFp4Gguf {
                 buf,
                 output_scale,
                 rows,
                 cols,
-            } if row_off == 0 && n_rows == *rows => self.kernels.gemm_nvfp4_gguf_f16(
+                layout,
+            } if row_off == 0 && n_rows == *rows => self.kernels.gemm_nvfp4_gguf_layout_f16(
                 y,
                 buf,
                 x,
@@ -4289,6 +5038,7 @@ impl Model {
                 *cols,
                 n_tokens,
                 *output_scale,
+                *layout,
                 stream,
             ),
             DevWeight::NvFp4Gguf { .. } => Err(ForgeError::Unsupported(
@@ -4460,83 +5210,145 @@ impl Model {
     /// transformer block in one batched pass, appending K/V to `seq`. Leaves
     /// the final-norm hidden states for the chunk's `t` tokens in
     /// `prefill_bufs.x` as a `[t, hidden]` row-major f16 matrix and returns
-    /// `t`. The device is synchronized before returning (the stream is idle),
-    /// so callers may read `x` or launch further work. `prefill_chunk` maps
-    /// the last row through the lm_head for next-token logits; `embed` pools
-    /// the rows into a sentence vector.
-    fn prefill_forward(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<usize> {
+    /// `t`. `wait_for_completion` opróżnia stream przed zwróceniem dla wywołań,
+    /// które odczytują `x` na hoście. Operacje device-only mogą kontynuować na
+    /// tym samym streamie bez pośredniej synchronizacji.
+    fn prefill_forward(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+        wait_for_completion: bool,
+    ) -> Result<usize> {
+        self.prefill_forward_lanes(&mut [seq], &[tokens], wait_for_completion)
+    }
+
+    fn prefill_forward_lanes(
+        &mut self,
+        seqs: &mut [&mut SeqKv],
+        token_lanes: &[&[u32]],
+        wait_for_completion: bool,
+    ) -> Result<usize> {
+        self.ensure_kv_reuse_healthy()?;
         let p = self.weights.descriptor.params.clone();
-        let t = tokens.len();
-        if t == 0 {
+        let batch = seqs.len();
+        if batch == 0 || token_lanes.len() != batch {
+            return Err(ForgeError::Scheduler(
+                "prefill wymaga tej samej liczby sekwencji i lane'ów tokenów".into(),
+            ));
+        }
+        let n_tokens = token_lanes[0].len();
+        if n_tokens == 0 {
             return Err(ForgeError::Scheduler("empty prefill chunk".into()));
         }
+        if token_lanes.iter().any(|tokens| tokens.len() != n_tokens) {
+            return Err(ForgeError::Scheduler(
+                "batch prefill wymaga równej liczby tokenów w każdym lane".into(),
+            ));
+        }
+        let t = batch
+            .checked_mul(n_tokens)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie batch prefill".into()))?;
         if t > MAX_PREFILL_CHUNK {
             return Err(ForgeError::Scheduler(format!(
                 "prefill chunk {t} exceeds MAX_PREFILL_CHUNK {MAX_PREFILL_CHUNK}"
             )));
         }
-        let base_pos = seq.len;
-        if base_pos + t > p.max_position_embeddings {
+        if batch > 1 && !self.dense_prefill_batch_capable(batch, n_tokens) {
+            return Err(ForgeError::Unsupported(
+                "batch prefill nie spełnia pełnego kontraktu backendu, modelu i artefaktów".into(),
+            ));
+        }
+        let base_pos = seqs[0].len;
+        let tier_t0 = self.tier.is_some().then(std::time::Instant::now);
+        let mut total_new_pages = 0usize;
+        for seq in seqs.iter_mut() {
+            let new_len = seq.len.checked_add(n_tokens).ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie długości sekwencji prefill".into())
+            })?;
+            if new_len > p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {} exceeds model context {}",
+                    new_len - 1,
+                    p.max_position_embeddings
+                )));
+            }
+            self.tier_ensure_capacity(seq, n_tokens)?;
+            let required_pages = new_len.div_ceil(self.kv.cfg.page_size);
+            if required_pages > self.kv.cfg.max_pages_per_seq {
+                return Err(ForgeError::Scheduler(format!(
+                    "sequence requires {required_pages} KV pages, limit is {}",
+                    self.kv.cfg.max_pages_per_seq
+                )));
+            }
+            total_new_pages = total_new_pages
+                .checked_add(required_pages.saturating_sub(seq.pages.len()))
+                .ok_or_else(|| {
+                    ForgeError::Scheduler("przepełnienie liczby stron batch prefill".into())
+                })?;
+        }
+        self.ensure_free_pages(total_new_pages);
+        if total_new_pages > self.kv.free_page_count() {
             return Err(ForgeError::Scheduler(format!(
-                "position {} exceeds model context {}",
-                base_pos + t - 1,
-                p.max_position_embeddings
+                "batch prefill wymaga {total_new_pages} stron KV, dostępnych jest {}",
+                self.kv.free_page_count()
             )));
         }
-        self.tier_ensure_capacity(seq, t)?;
-        // Record tokens + prefilled_len for the tier recompute path AND the
-        // prefix cache (which donates prefill-built pages into the radix tree on
-        // completion). Both need the token ids retained and the still-purely-
-        // prefill span tracked; with neither active this stays a no-op and
-        // behavior is bit-for-bit unchanged.
-        if self.tier.is_some() || self.prefix_cache.is_some() {
-            if seq.tokens.len() == seq.prefilled_len {
-                seq.prefilled_len += t;
-            }
-            seq.tokens.extend_from_slice(tokens);
-        }
-        let tier_t0 = self.tier.is_some().then(std::time::Instant::now);
-        // Free pool space for the pages this chunk will grow into by evicting
-        // cached prefixes (no-op unless the prefix cache is active and short).
-        let new_pages = (seq.len + t)
-            .div_ceil(self.kv.cfg.page_size)
-            .saturating_sub(seq.pages.len());
-        self.ensure_free_pages(new_pages);
         self.ensure_prefill_bufs()?;
-        for _ in 0..t {
-            self.kv.grow(seq)?;
+        if batch > 1 {
+            self.ensure_batch(batch)?;
+        }
+        grow_prefill_lanes_transactional(&mut self.kv, seqs, n_tokens)?;
+        if self.tier.is_some() || self.prefix_cache.is_some() {
+            for (seq, tokens) in seqs.iter_mut().zip(token_lanes.iter()) {
+                if seq.tokens.len() == seq.prefilled_len {
+                    seq.prefilled_len += n_tokens;
+                }
+                seq.tokens.extend_from_slice(tokens);
+            }
         }
 
-        // The stream is idle here (every step/prefill ends with a sync), so
-        // plain synchronous writes are safe and prefill is not launch-latency
-        // critical. Upload the full page table: the chunk's attention reads
-        // pages for positions 0..base_pos+T.
-        let mut pt = vec![-1i32; self.max_pages_per_seq];
-        pt[..seq.pages.len()].copy_from_slice(&seq.pages);
-        self.device
-            .write(bytemuck::cast_slice(&pt), &self.page_table_dev, 0)?;
-        self.pt_seq = seq.id;
-        // Spilled sequences run each layer's attention over the staging slabs
-        // (full context streamed in from the tiers); resident sequences read
-        // the paged cache directly. Spilled page-table entries are -1 — only
-        // the append (which touches resident tail pages) may consult them.
-        let streamed = !seq.spilled.is_empty();
+        let streamed = batch == 1 && !seqs[0].spilled.is_empty();
         if streamed {
             self.tier
                 .as_mut()
                 .expect("spilled pages imply tiering")
-                .prepare_streaming(seq)?;
+                .prepare_streaming(seqs[0])?;
         }
+        let mut page_tables = vec![-1i32; batch * self.max_pages_per_seq];
+        let mut base_positions = Vec::with_capacity(batch);
+        let mut ids = Vec::with_capacity(t);
+        let mut positions = Vec::with_capacity(t);
+        for (lane, (seq, tokens)) in seqs.iter().zip(token_lanes.iter()).enumerate() {
+            let table = &mut page_tables
+                [lane * self.max_pages_per_seq..(lane + 1) * self.max_pages_per_seq];
+            table[..seq.pages.len()].copy_from_slice(&seq.pages);
+            base_positions.push(seq.len as i32 - n_tokens as i32);
+            ids.extend(tokens.iter().map(|&id| id as i32));
+            positions.extend((seq.len - n_tokens..seq.len).map(|position| position as i32));
+        }
+        let segmented = if batch == 1 {
+            self.device
+                .write(bytemuck::cast_slice(&page_tables), &self.page_table_dev, 0)?;
+            self.pt_seq = seqs[0].id;
+            None
+        } else {
+            let bb = self.batch_bufs.as_ref().expect("batch prefill ma bufory");
+            self.device
+                .write(bytemuck::cast_slice(&page_tables), &bb.page_table, 0)?;
+            self.device
+                .write(bytemuck::cast_slice(&base_positions), &bb.seq_lens, 0)?;
+            self.pt_seq = 0;
+            Some((bb.page_table.clone(), bb.seq_lens.clone()))
+        };
+        let pb = self.prefill_bufs.as_ref().expect("allocated above");
+        self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
+        self.device
+            .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
+
         // W4A8 SmoothQuant calibration: pull the accumulator out of `self` so
         // the per-layer captures can borrow it mutably alongside the immutable
         // `pb`/`device` borrows. Restored before return; `None` in normal runs.
         let mut calib = self.calib.take();
-        let pb = self.prefill_bufs.as_ref().expect("allocated above");
-        let ids: Vec<i32> = tokens.iter().map(|&id| id as i32).collect();
-        self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
-        let positions: Vec<i32> = (base_pos..base_pos + t).map(|pos| pos as i32).collect();
-        self.device
-            .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
 
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
@@ -4646,14 +5458,30 @@ impl Model {
                 match &layer.attn().attn_qkv {
                     QkvWeights::Fused(w) => {
                         self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
-                        self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
                     }
-                    QkvWeights::FusedQk { qk, v } => {
+                    QkvWeights::FusedQk { qk, .. } => {
                         self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
+                    }
+                    QkvWeights::Split { k, .. } => {
+                        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+                    }
+                }
+                match &layer.attn().attn_qkv {
+                    QkvWeights::Fused(w) => {
+                        self.gemm_rows(
+                            &pb.v,
+                            w,
+                            &pb.x,
+                            t,
+                            q_dim + kv_dim,
+                            kv_dim,
+                            stream,
+                        )?;
+                    }
+                    QkvWeights::FusedQk { v, .. } => {
                         self.gemm(&pb.v, v, &pb.x, t, stream)?;
                     }
-                    QkvWeights::Split { k, v, .. } => {
-                        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+                    QkvWeights::Split { v, .. } => {
                         self.gemm(&pb.v, v, &pb.x, t, stream)?;
                     }
                 }
@@ -4777,7 +5605,7 @@ impl Model {
                         .expect("streamed prefill requires tiering");
                     let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                     let slot = &tb.slots[0];
-                    tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
+                    tier.stage_layer(&self.kv, seqs[0], l, &slot.stage, 0, stream)?;
                     kernels.attn_prefill_rot(
                         &pb.attn_out,
                         &pb.q,
@@ -4820,20 +5648,38 @@ impl Model {
             } else {
                 // Causal attention reads the chunk's own K/V from the cache, so
                 // the batch append must land before the attention launch.
-                kernels.kv_append_batch(
-                    &self.kv.k[self.target_kv_layer(l)],
-                    &self.kv.v[self.target_kv_layer(l)],
-                    &pb.k,
-                    &pb.v,
-                    &self.page_table_dev,
-                    base_pos,
-                    t,
-                    p.n_kv_heads,
-                    self.kv.cfg.page_size,
-                    p.head_dim,
-                    self.kv.cfg.dtype(),
-                    stream,
-                )?;
+                if let Some((page_tables, base_positions)) = &segmented {
+                    kernels.kv_append_batch_segmented_f16(
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
+                        &pb.k,
+                        &pb.v,
+                        page_tables,
+                        base_positions,
+                        batch,
+                        n_tokens,
+                        self.max_pages_per_seq,
+                        p.n_kv_heads,
+                        self.kv.cfg.page_size,
+                        p.head_dim,
+                        stream,
+                    )?;
+                } else {
+                    kernels.kv_append_batch(
+                        &self.kv.k[self.target_kv_layer(l)],
+                        &self.kv.v[self.target_kv_layer(l)],
+                        &pb.k,
+                        &pb.v,
+                        &self.page_table_dev,
+                        base_pos,
+                        t,
+                        p.n_kv_heads,
+                        self.kv.cfg.page_size,
+                        p.head_dim,
+                        self.kv.cfg.dtype(),
+                        stream,
+                    )?;
+                }
                 trace.mark(self.device.as_ref(), "kv_append");
                 if streamed {
                     let tier = self
@@ -4842,7 +5688,7 @@ impl Model {
                         .expect("streamed prefill requires tiering");
                     let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
                     let slot = &tb.slots[0];
-                    tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
+                    tier.stage_layer(&self.kv, seqs[0], l, &slot.stage, 0, stream)?;
                     kernels.attn_prefill(
                         &pb.attn_out,
                         &pb.q,
@@ -4859,6 +5705,43 @@ impl Model {
                         scale,
                         stream,
                     )?;
+                } else if let Some((page_tables, base_positions)) = &segmented {
+                    if p.head_dim == 128 {
+                        kernels.attn_prefill_fa_segmented_f16_hd128(
+                            &pb.attn_out,
+                            &pb.q,
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
+                            page_tables,
+                            base_positions,
+                            batch,
+                            n_tokens,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            scale,
+                            stream,
+                        )?;
+                    } else {
+                        kernels.attn_prefill_segmented_tiled_f16(
+                            &pb.attn_out,
+                            &pb.q,
+                            &self.kv.k[self.target_kv_layer(l)],
+                            &self.kv.v[self.target_kv_layer(l)],
+                            page_tables,
+                            base_positions,
+                            batch,
+                            n_tokens,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            scale,
+                            stream,
+                        )?;
+                    }
                 } else {
                     kernels.attn_prefill(
                         &pb.attn_out,
@@ -5019,9 +5902,9 @@ impl Model {
             trace.mark(self.device.as_ref(), "norm_res2");
         }
 
-        // The stream is drained here so callers can read the hidden states or
-        // launch the logits/pool tail without an additional sync of their own.
-        self.device.synchronize()?;
+        if wait_for_completion || tier_t0.is_some() {
+            self.synchronize_kv_fatal("dense prefill forward")?;
+        }
         if let (Some(tier), Some(t0)) = (&self.tier, tier_t0) {
             // Measured prefill rate feeds the transfer-vs-recompute estimate.
             tier.note_prefill(t, t0.elapsed().as_secs_f64());
@@ -5068,7 +5951,7 @@ impl Model {
             let mut seq = self.new_seq();
             let mut res = Ok(());
             for chunk in calib_tokens.chunks(MAX_PREFILL_CHUNK) {
-                if let Err(e) = self.prefill_forward(&mut seq, chunk) {
+                if let Err(e) = self.prefill_forward(&mut seq, chunk, true) {
                     res = Err(e);
                     break;
                 }
@@ -5119,6 +6002,53 @@ impl Model {
         Ok(())
     }
 
+    /// Auto-enable the Modular fp8 prefill for a dense GGUF model when the
+    /// device has native fp8 tensor cores, every projection shape has a
+    /// committed `gemm_fp8_mod_{rows}_{cols}` instance and the weights pool
+    /// holds the e4m3 packs. Returns `Ok(false)` (prefill stays on the native
+    /// GGUF path) when any gate fails; nothing is allocated before all gates
+    /// pass, so a refusal leaves the model untouched.
+    pub fn build_fp8_modular_auto(&mut self, path: &Path) -> Result<bool> {
+        if self.is_hybrid() || self.weights.is_moe() || !self.device.caps().fp8_native {
+            return Ok(false);
+        }
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let q_rows = p.n_heads * p.head_dim;
+        let kv_rows = p.n_kv_heads * p.head_dim;
+        let inter = p.intermediate_size;
+        // (rows, cols, count) per layer: q, k, v, o, gate, up, down.
+        let shapes = [
+            (q_rows, hidden, 1usize),
+            (kv_rows, hidden, 2),
+            (hidden, q_rows, 1),
+            (inter, hidden, 2),
+            (hidden, inter, 1),
+        ];
+        let arts = self.kernels.artifacts();
+        if shapes
+            .iter()
+            .any(|(rows, cols, _)| !arts.has(&format!("gemm_fp8_mod_{rows}_{cols}")))
+        {
+            return Ok(false);
+        }
+        let per_layer: usize = shapes
+            .iter()
+            .map(|(rows, cols, n)| n * (rows * cols + rows * 4))
+            .sum();
+        let required = per_layer * self.weights.descriptor.params.block_count;
+        let available = self.device.pool_available(Pool::Weights).unwrap_or(0);
+        tracing::info!(required, available, "preflight paczek fp8mod dla GGUF");
+        if required > available {
+            return Ok(false);
+        }
+        self.weights.fp8 = None;
+        let layers = self.weights.rebuild_fp8(self.device.as_ref(), path)?;
+        self.weights.fp8 = Some(layers);
+        self.weights.fp8_modular = true;
+        Ok(true)
+    }
+
     fn pack_nvfp4_rows(
         &self,
         weight: &DevWeight,
@@ -5126,8 +6056,7 @@ impl Model {
         rows: usize,
     ) -> Result<Fp8Weight> {
         let DevWeight::NvFp4 {
-            packed,
-            scales,
+            storage,
             inv_global_scale,
             rows: source_rows,
             cols,
@@ -5162,17 +6091,41 @@ impl Model {
         let output_scales = self
             .device
             .alloc(scale_bytes, MemKind::Device, Pool::Weights)?;
-        self.kernels.pack_nvfp4_fp8(
-            &qweight,
-            &output_scales,
-            packed,
-            scales,
-            *cols,
-            row_offset,
-            rows,
-            *inv_global_scale,
-            &self.stream,
-        )?;
+        let launch_result = match storage {
+            NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                self.kernels.pack_nvfp4_fp8(
+                    &qweight,
+                    &output_scales,
+                    packed,
+                    scales,
+                    *cols,
+                    row_offset,
+                    rows,
+                    *inv_global_scale,
+                    &self.stream,
+                )
+            }
+            NvFp4CtStorage::S0N64K128 { .. } => {
+                let window = weight.nvfp4_ct_row_window(row_offset, rows)?;
+                let view = Nvfp4CtS0View::new(
+                    window.data(),
+                    window.physical_rows(),
+                    window.cols(),
+                )?;
+                self.kernels.pack_nvfp4_ct_s0_fp8(
+                    &qweight,
+                    &output_scales,
+                    view,
+                    window.row_offset(),
+                    window.rows(),
+                    *inv_global_scale,
+                    &self.stream,
+                )
+            }
+        };
+        cleanup_after_error(launch_result, || {
+            let _ = self.stream.synchronize();
+        })?;
         Ok(Fp8Weight {
             qweight,
             scales: output_scales,
@@ -5203,8 +6156,12 @@ impl Model {
         let scales = self
             .device
             .alloc(scale_bytes, MemKind::Device, Pool::Weights)?;
-        self.kernels
-            .pack_f16_fp8(&qweight, &scales, buf, *cols, *rows, &self.stream)?;
+        let launch_result =
+            self.kernels
+                .pack_f16_fp8(&qweight, &scales, buf, *cols, *rows, &self.stream);
+        cleanup_after_error(launch_result, || {
+            let _ = self.stream.synchronize();
+        })?;
         Ok(Fp8Weight {
             qweight,
             scales,
@@ -5229,22 +6186,32 @@ impl Model {
         rows: usize,
     ) -> Option<usize> {
         let DevWeight::NvFp4 {
+            storage,
             rows: source_rows,
             cols,
             ..
-        } = weight
-        else {
-            return None;
-        };
+        } = weight else { return None };
         let row_end = row_offset.checked_add(rows)?;
         if rows == 0
             || row_end > *source_rows
-            || !cols.is_multiple_of(16)
             || !self.kernels.supports_fp8_modular_shape(rows, *cols)
         {
             return None;
         }
+        match storage {
+            NvFp4CtStorage::RowMajorE4M3 { .. } if !cols.is_multiple_of(16) => return None,
+            NvFp4CtStorage::RowMajorE4M3 { .. } => {}
+            NvFp4CtStorage::S0N64K128 { .. } => {
+                weight.nvfp4_ct_row_window(row_offset, rows).ok()?;
+            }
+        }
         Self::fp8_pack_allocation_bytes(rows, *cols)
+    }
+
+    fn fp8_build_step<T>(&self, result: Result<T>) -> Result<T> {
+        cleanup_after_error(result, || {
+            let _ = self.stream.synchronize();
+        })
     }
 
     /// Buduje na GPU opt-in paczki FP8 dla Q/O oraz projekcji FFN checkpointu NVFP4.
@@ -5327,22 +6294,31 @@ impl Model {
         let Some(available) = self.device.pool_available(Pool::Weights) else {
             return Ok(false);
         };
+        tracing::info!(
+            required_bytes,
+            available_bytes = available,
+            "preflight rezydentnych paczek FP8"
+        );
         if required_bytes > available {
             return Ok(false);
         }
 
         self.device.synchronize()?;
-        self.weights.fp8_lm_head = None;
         let mut layers = Vec::with_capacity(self.weights.layers.len());
         for layer in &self.weights.layers {
             let q = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(weight) | QkvWeights::FusedQk { qk: weight, .. } => {
-                    self.pack_nvfp4_rows(weight, 0, q_rows)?
+                    self.fp8_build_step(self.pack_nvfp4_rows(weight, 0, q_rows))?
                 }
-                QkvWeights::Split { q, .. } => self.pack_nvfp4_rows(q, 0, q.rows())?,
+                QkvWeights::Split { q, .. } => {
+                    self.fp8_build_step(self.pack_nvfp4_rows(q, 0, q.rows()))?
+                }
             };
-            let attn_o =
-                self.pack_nvfp4_rows(&layer.attn().attn_o, 0, layer.attn().attn_o.rows())?;
+            let attn_o = self.fp8_build_step(self.pack_nvfp4_rows(
+                &layer.attn().attn_o,
+                0,
+                layer.attn().attn_o.rows(),
+            ))?;
             let LayerFfn::Dense(ffn) = &layer.ffn else {
                 unreachable!("modele MoE zostały odrzucone przed przepakowaniem")
             };
@@ -5350,16 +6326,17 @@ impl Model {
                 GateUpWeights::Fused(weight) => {
                     let rows = weight.rows() / 2;
                     (
-                        self.pack_nvfp4_rows(weight, 0, rows)?,
-                        self.pack_nvfp4_rows(weight, rows, rows)?,
+                        self.fp8_build_step(self.pack_nvfp4_rows(weight, 0, rows))?,
+                        self.fp8_build_step(self.pack_nvfp4_rows(weight, rows, rows))?,
                     )
                 }
                 GateUpWeights::Split { gate, up } => (
-                    self.pack_nvfp4_rows(gate, 0, gate.rows())?,
-                    self.pack_nvfp4_rows(up, 0, up.rows())?,
+                    self.fp8_build_step(self.pack_nvfp4_rows(gate, 0, gate.rows()))?,
+                    self.fp8_build_step(self.pack_nvfp4_rows(up, 0, up.rows()))?,
                 ),
             };
-            let down = self.pack_nvfp4_rows(&ffn.down, 0, ffn.down.rows())?;
+            let down =
+                self.fp8_build_step(self.pack_nvfp4_rows(&ffn.down, 0, ffn.down.rows()))?;
             layers.push(crate::weights::Fp8FfnLayer {
                 q,
                 attn_o,
@@ -5369,10 +6346,21 @@ impl Model {
             });
         }
         let fp8_lm_head = match (&self.weights.lm_head, fp8_head_supported) {
-            (DevWeight::F16 { .. }, true) => Some(self.pack_f16_weight(&self.weights.lm_head)?),
+            (DevWeight::F16 { .. }, true) => Some(
+                self.fp8_build_step(self.pack_f16_weight(&self.weights.lm_head))?,
+            ),
             _ => None,
         };
-        self.stream.synchronize()?;
+        cleanup_after_error(self.stream.synchronize(), || {
+            let _ = self.device.synchronize();
+        })?;
+        tracing::info!(
+            resident_pack_bytes = required_bytes,
+            layer_count = layers.len(),
+            kv_packs = 0,
+            available_after_bytes = self.device.pool_available(Pool::Weights),
+            "paczki FP8 gotowe do publikacji"
+        );
         self.weights.fp8_lm_head = fp8_lm_head;
         self.weights.fp8_ffn = Some(layers);
         self.weights.fp8_modular = crate::weights::fp8_ffn_modular_enabled();
@@ -5406,7 +6394,7 @@ impl Model {
         let mut result = Ok(());
         'outer: for (ci, chunk) in tokens.chunks(MAX_PREFILL_CHUNK).enumerate() {
             let base = ci * MAX_PREFILL_CHUNK;
-            let t = match self.prefill_forward(&mut seq, chunk) {
+            let t = match self.prefill_forward(&mut seq, chunk, true) {
                 Ok(t) => t,
                 Err(e) => {
                     result = Err(e);
@@ -5470,11 +6458,12 @@ impl Model {
     /// Not graph-captured: T varies per call and prefill launches are large
     /// enough that launch overhead is immaterial.
     pub fn prefill_chunk(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.ensure_kv_reuse_healthy()?;
         if self.is_hybrid() {
             return self.prefill_hybrid(seq, tokens);
         }
         self.profile_target_start()?;
-        let t = self.prefill_forward(seq, tokens)?;
+        let t = self.prefill_forward(seq, tokens, true)?;
         let hidden = self.weights.descriptor.params.hidden_size;
         let vocab = self.weights.descriptor.params.vocab_size;
         let pb = self
@@ -5501,7 +6490,7 @@ impl Model {
             vocab * 4,
             &self.stream,
         )?;
-        self.device.synchronize()?;
+        self.synchronize_kv_fatal("odczyt logitów dense prefill")?;
 
         let lp = self
             .bufs
@@ -5510,6 +6499,232 @@ impl Model {
             .expect("pinned buffer has host mapping") as *const f32;
         let logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
         Ok(logits)
+    }
+
+    /// Wykonuje dense prefill i pozostawia logity ostatniego tokenu na urządzeniu.
+    /// GPU sampling dołączony do tego samego streamu zapewnia kolejność bez
+    /// pełnego odczytu słownika i pośredniej synchronizacji hosta.
+    pub fn prefill_chunk_device_logits(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<()> {
+        self.ensure_kv_reuse_healthy()?;
+        if self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "device-only prefill chunk obsługuje wyłącznie model dense".into(),
+            ));
+        }
+        self.profile_target_start()?;
+        let t = self.prefill_forward(seq, tokens, false)?;
+        let hidden = self.weights.descriptor.params.hidden_size;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("prefill_forward allocated");
+        self.device.copy(
+            &pb.x,
+            (t - 1) * hidden * 2,
+            &self.bufs.x,
+            0,
+            hidden * 2,
+            &self.stream,
+        )?;
+        self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        self.profile_target_end()
+    }
+
+    /// Wykonuje pośredni dense prefill bez głowy logits i opróżnia stream przed
+    /// ponownym użyciem współdzielonych buforów przez następny chunk.
+    pub fn prefill_chunk_device_sync(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<()> {
+        self.ensure_kv_reuse_healthy()?;
+        if self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "device-only prefill chunk obsługuje wyłącznie model dense".into(),
+            ));
+        }
+        self.profile_target_start()?;
+        self.prefill_forward(seq, tokens, true)?;
+        self.profile_target_end()
+    }
+
+    /// Sprawdza pełny kontrakt równego dense prefill dla kubełka B4/B8/B16.
+    pub fn dense_prefill_batch_capable(&self, batch: usize, n_tokens: usize) -> bool {
+        let logits = match &self.weights.lm_head {
+            DevWeight::F16 { rows, cols, .. } => DensePrefillLogitsKind::F16 {
+                rows: *rows,
+                cols: *cols,
+            },
+            DevWeight::Q8_0 { rows, cols, .. } => DensePrefillLogitsKind::Q8_0 {
+                rows: *rows,
+                cols: *cols,
+            },
+            DevWeight::NvFp4Gguf {
+                layout: Nvfp4GgufLayout::RowMajor36,
+                rows,
+                cols,
+                ..
+            } => DensePrefillLogitsKind::NvFp4Gguf {
+                rows: *rows,
+                cols: *cols,
+            },
+            _ => return false,
+        };
+        let head_dim = self.weights.descriptor.params.head_dim;
+        matches!(batch, 4 | 8 | 16)
+            && n_tokens > 0
+            && batch
+                .checked_mul(n_tokens)
+                .is_some_and(|total| total <= MAX_PREFILL_CHUNK)
+            && !self.is_hybrid()
+            && !self.weights.is_moe()
+            && self.tier.is_none()
+            && self.kv.cfg.dtype() == DType::F16
+            && self
+                .kernels
+                .dense_prefill_batch_capable(head_dim, batch, logits)
+    }
+
+    /// Sprawdza wszystkie kubełki wymagane przez wymuszony rollout schedulera.
+    pub fn dense_prefill_rollout_capable(&self) -> bool {
+        [4usize, 8, 16]
+            .into_iter()
+            .all(|batch| self.dense_prefill_batch_capable(batch, 1))
+    }
+
+    /// Wykonuje równy dense prefill i pozostawia B wierszy logitów na GPU.
+    pub fn prefill_batch_device_logits(
+        &mut self,
+        seqs: &mut [&mut SeqKv],
+        token_lanes: &[&[u32]],
+    ) -> Result<()> {
+        self.ensure_kv_reuse_healthy()?;
+        let batch = seqs.len();
+        let n_tokens = token_lanes.first().map_or(0, |tokens| tokens.len());
+        if !self.dense_prefill_batch_capable(batch, n_tokens) {
+            return Err(ForgeError::Unsupported(
+                "batch prefill nie spełnia kontraktu B4/B8/B16".into(),
+            ));
+        }
+        run_dense_prefill_transaction(
+            self,
+            seqs,
+            |model, seqs| {
+                model.prefill_forward_lanes(seqs, token_lanes, false)?;
+                let hidden = model.weights.descriptor.params.hidden_size;
+                let row_bytes = hidden * 2;
+                let source = model
+                    .prefill_bufs
+                    .as_ref()
+                    .expect("batch prefill ma bufory")
+                    .x
+                    .clone();
+                let destination = model
+                    .batch_bufs
+                    .as_ref()
+                    .expect("batch prefill ma batch scratch")
+                    .x
+                    .clone();
+                for lane in 0..batch {
+                    model.device.copy(
+                        &source,
+                        (lane * n_tokens + n_tokens - 1) * row_bytes,
+                        &destination,
+                        lane * row_bytes,
+                        row_bytes,
+                        &model.stream,
+                    )?;
+                }
+                let logits = model
+                    .batch_bufs
+                    .as_ref()
+                    .expect("batch prefill ma batch scratch")
+                    .logits
+                    .clone();
+                model.logits_gemm(&logits, &destination, batch, &model.stream)
+            },
+            |model| model.synchronize_kv_fatal("rollback dense prefill"),
+            |model, seqs, snapshots| {
+                restore_prefill_seq_snapshots(&mut model.kv, seqs, snapshots);
+                model.pt_seq = 0;
+            },
+        )
+    }
+
+    /// Wykonuje równy pośredni chunk bez głowy logitów i opróżnia stream.
+    pub fn prefill_batch_device_sync(
+        &mut self,
+        seqs: &mut [&mut SeqKv],
+        token_lanes: &[&[u32]],
+    ) -> Result<()> {
+        self.ensure_kv_reuse_healthy()?;
+        let batch = seqs.len();
+        let n_tokens = token_lanes.first().map_or(0, |tokens| tokens.len());
+        if !self.dense_prefill_batch_capable(batch, n_tokens) {
+            return Err(ForgeError::Unsupported(
+                "batch prefill nie spełnia kontraktu B4/B8/B16".into(),
+            ));
+        }
+        run_dense_prefill_transaction(
+            self,
+            seqs,
+            |model, seqs| {
+                model.prefill_forward_lanes(seqs, token_lanes, true)?;
+                Ok(())
+            },
+            |model| model.synchronize_kv_fatal("rollback dense prefill"),
+            |model, seqs, snapshots| {
+                restore_prefill_seq_snapshots(&mut model.kv, seqs, snapshots);
+                model.pt_seq = 0;
+            },
+        )
+    }
+
+    /// Próbkuje B wierszy dense prefill i odczytuje tylko token ID każdego lane.
+    pub fn sample_prefill_batch_logits(
+        &mut self,
+        samplers: &mut [&mut GpuSampler],
+    ) -> Result<Vec<u32>> {
+        self.ensure_kv_reuse_healthy()?;
+        let operation = (|| {
+            let batch = samplers.len();
+            if !matches!(batch, 4 | 8 | 16) {
+                return Err(ForgeError::Scheduler(
+                    "sampling prefill wymaga B4/B8/B16".into(),
+                ));
+            }
+            let vocab = self.weights.descriptor.params.vocab_size;
+            let params = samplers
+                .iter_mut()
+                .map(|sampler| sampler.batch_params(vocab))
+                .collect::<Vec<_>>();
+            let logits = self
+                .batch_bufs
+                .as_ref()
+                .ok_or_else(|| ForgeError::Scheduler("brak logits batch prefill".into()))?
+                .logits
+                .clone();
+            self.batch_sample_from(&logits, batch, &params)?;
+            let buffers = self.batch_bufs.as_ref().expect("batch sampler ma bufory");
+            let pinned_out = buffers.pinned_out.clone();
+            self.device
+                .copy(&buffers.out_ids, 0, &pinned_out, 0, batch * 4, &self.stream)?;
+            Ok((pinned_out, batch, vocab))
+        })();
+        let (pinned_out, batch, vocab) =
+            settle_kv_operation(operation, "sampling finalnego dense prefill", || {
+                self.synchronize_kv_fatal("sampling finalnego dense prefill")
+            })?;
+        let output = pinned_out.host_ptr().expect("pinned output ma mapowanie") as *const i32;
+        let ids = unsafe { std::slice::from_raw_parts(output, batch) };
+        ids.iter()
+            .enumerate()
+            .map(|(lane, &id)| {
+                if id < 0 || id as usize >= vocab {
+                    Err(ForgeError::Kernel(format!(
+                        "batch sampler prefill zwrócił token {id} poza słownikiem dla lane {lane}"
+                    )))
+                } else {
+                    Ok(id as u32)
+                }
+            })
+            .collect()
     }
 
     /// Pooling declared by this model's metadata, falling back to `Mean` for
@@ -5569,7 +6784,7 @@ impl Model {
         let mut total: usize = 0;
         let mut scratch = vec![0u8; MAX_PREFILL_CHUNK * hidden * 2];
         for chunk in tokens.chunks(MAX_PREFILL_CHUNK) {
-            let t = self.prefill_forward(seq, chunk)?;
+            let t = self.prefill_forward(seq, chunk, true)?;
             let pb = self
                 .prefill_bufs
                 .as_ref()
@@ -5639,6 +6854,7 @@ impl Model {
     /// in the device logits buffer for either the pinned D2H (`step`) or the
     /// on-GPU sampler (`step_and_sample`).
     fn step_launch(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<()> {
+        self.ensure_kv_reuse_healthy()?;
         let p = self.weights.descriptor.params.clone();
         let pos = seq.len;
 
@@ -6370,14 +7586,8 @@ impl Model {
             state.pinned_scalar_ready.synchronize()?;
         }
         write_pinned(&value.to_le_bytes(), &state.pinned_scalar)?;
-        self.device.copy(
-            &state.pinned_scalar,
-            0,
-            dst,
-            dst_offset,
-            4,
-            &self.stream,
-        )?;
+        self.device
+            .copy(&state.pinned_scalar, 0, dst, dst_offset, 4, &self.stream)?;
         self.device
             .record_event(&state.pinned_scalar_ready, &self.stream)?;
         state.pinned_scalar_recorded = true;
@@ -6677,9 +7887,9 @@ impl Model {
             .rollback(&mut mtp_kv, &self.stream)
             .and_then(|_| self.device.synchronize());
         if let Err(rollback) = &result {
-            result = Err(self.poison_mtp_runtime(format!(
-                "rollback stanu MTP nie powiódł się: {rollback}"
-            )));
+            result =
+                Err(self
+                    .poison_mtp_runtime(format!("rollback stanu MTP nie powiódł się: {rollback}")));
         }
         self.finish_mtp_runtime(lease, state, mtp_kv, result)
     }
@@ -6698,38 +7908,45 @@ impl Model {
             return Ok(());
         }
         let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
-        let result = (|| {
-            self.device.copy(
-                &self.bufs.x,
-                0,
-                &state.catchup_hidden,
-                0,
-                state.catchup_hidden.len(),
-                &self.stream,
-            )?;
-            let sample_out = self.bufs.sample_out.clone();
-            self.mtp_upload_scalar(&mut state, token as i32, &sample_out, 0)?;
-            self.mtp_gather_embedding(&mut state, 0)?;
-            state.stage_step(&mut mtp_kv, &self.kernels, &self.stream)?;
-            self.mtp_forward_one(&mut state, &mtp_kv, false)?;
-            self.device.copy(
-                &state.catchup_hidden,
-                0,
-                &state.recurrent_hidden,
-                0,
-                state.recurrent_hidden.len(),
-                &self.stream,
-            )?;
-            self.device.copy(
-                &state.catchup_hidden,
-                0,
-                &self.bufs.x,
-                0,
-                state.catchup_hidden.len(),
-                &self.stream,
-            )
-        })();
+        let result = self.mtp_catchup_token_pending(&mut state, &mut mtp_kv, token);
         self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_catchup_token_pending(
+        &mut self,
+        state: &mut MtpDraftState,
+        mtp_kv: &mut KvCache,
+        token: u32,
+    ) -> Result<()> {
+        self.device.copy(
+            &self.bufs.x,
+            0,
+            &state.catchup_hidden,
+            0,
+            state.catchup_hidden.len(),
+            &self.stream,
+        )?;
+        let sample_out = self.bufs.sample_out.clone();
+        self.mtp_upload_scalar(state, token as i32, &sample_out, 0)?;
+        self.mtp_gather_embedding(state, 0)?;
+        state.stage_step(mtp_kv, &self.kernels, &self.stream)?;
+        self.mtp_forward_one(state, mtp_kv, false)?;
+        self.device.copy(
+            &state.catchup_hidden,
+            0,
+            &state.recurrent_hidden,
+            0,
+            state.recurrent_hidden.len(),
+            &self.stream,
+        )?;
+        self.device.copy(
+            &state.catchup_hidden,
+            0,
+            &self.bufs.x,
+            0,
+            state.catchup_hidden.len(),
+            &self.stream,
+        )
     }
 
     fn mtp_catchup_batch_host(
@@ -6855,16 +8072,38 @@ impl Model {
         self.gemm(&pb.v, v, &pb.x, t, stream)?;
         if let Some(norm) = &attention.k_norm {
             self.kernels.rmsnorm_f16(
-                &pb.k, &pb.k, norm, t * p.n_kv_heads, p.head_dim, p.rms_norm_eps, stream,
+                &pb.k,
+                &pb.k,
+                norm,
+                t * p.n_kv_heads,
+                p.head_dim,
+                p.rms_norm_eps,
+                stream,
             )?;
         }
         let n_rot = self.hybrid_n_rot();
         self.kernels.rope_neox_partial_f16(
-            &pb.k, &pb.positions, t, p.n_kv_heads, p.head_dim, n_rot, p.rope_theta, stream,
+            &pb.k,
+            &pb.positions,
+            t,
+            p.n_kv_heads,
+            p.head_dim,
+            n_rot,
+            p.rope_theta,
+            stream,
         )?;
         self.kernels.kv_append_batch_device_pos_f16(
-            &mtp_kv.k[0], &mtp_kv.v[0], &pb.k, &pb.v, &state.page_table,
-            &hv.base_pos, t, p.n_kv_heads, mtp_kv.cfg.page_size, p.head_dim, stream,
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
+            &pb.k,
+            &pb.v,
+            &state.page_table,
+            &hv.base_pos,
+            t,
+            p.n_kv_heads,
+            mtp_kv.cfg.page_size,
+            p.head_dim,
+            stream,
         )?;
         self.device.copy(
             &state.catchup_hidden,
@@ -6937,13 +8176,7 @@ impl Model {
                 .as_ref()
                 .is_some_and(|mtp| mtp.shares_target_embedding)
         {
-            self.mtp_catchup_batch_host(
-                state,
-                mtp_kv,
-                retained,
-                staging_slot,
-                staging_ready,
-            )?;
+            self.mtp_catchup_batch_host(state, mtp_kv, retained, staging_slot, staging_ready)?;
             return self.device.copy(
                 &state.catchup_hidden,
                 0,
@@ -6987,6 +8220,270 @@ impl Model {
         self.device.copy(
             &pb.x,
             (retained - 1) * hidden_bytes,
+            &self.bufs.x,
+            0,
+            hidden_bytes,
+            &self.stream,
+        )
+    }
+
+    fn mtp_catchup_layer_major_prefix(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+        target_hidden: &DevBuffer,
+        fail_after_pending: bool,
+        fail_after_commit: bool,
+    ) -> Result<()> {
+        if !self.has_native_mtp() {
+            self.profile_catchup_end()?;
+            return self.device.synchronize();
+        }
+        let hidden_bytes = self.weights.descriptor.params.hidden_size * 2;
+        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
+        let mut result = (|| {
+            state.checkpoint(&self.stream)?;
+            let batch_capable = self.weights.mtp.as_ref().is_some_and(|mtp| {
+                mtp.shares_target_embedding
+                    && mtp.layers.first().is_some_and(|layer| {
+                        matches!(layer.eh_proj, DevWeight::Q8_0 { .. })
+                            && matches!(layer.block.attn().attn_qkv, QkvWeights::Split { .. })
+                    })
+            });
+            if batch_capable {
+                self.mtp_catchup_layer_major_batch_pending(
+                    &mut state,
+                    &mut mtp_kv,
+                    tokens,
+                    target_hidden,
+                )?;
+            } else {
+                for (row, &token) in tokens.iter().enumerate() {
+                    self.device.copy(
+                        target_hidden,
+                        row * hidden_bytes,
+                        &self.bufs.x,
+                        0,
+                        hidden_bytes,
+                        &self.stream,
+                    )?;
+                    self.mtp_catchup_token_pending(&mut state, &mut mtp_kv, token)?;
+                }
+            }
+            if fail_after_pending {
+                return Err(ForgeError::Scheduler(
+                    "wymuszony błąd layer-major catch-up MTP".into(),
+                ));
+            }
+            state.validate_commit_catchup(tokens.len())?;
+            self.profile_catchup_end()?;
+            self.device.synchronize()?;
+            if fail_after_commit {
+                return Err(ForgeError::Scheduler(
+                    "wymuszony błąd layer-major po commit MTP".into(),
+                ));
+            }
+            state.apply_commit_catchup();
+            Ok(())
+        })();
+        if result.is_err() && state.checkpoint_len().is_some() {
+            let rollback = state
+                .rollback(&mut mtp_kv, &self.stream)
+                .and_then(|_| self.device.synchronize());
+            if let Err(rollback) = rollback {
+                let execution = result.expect_err("wynik catch-up zawiera błąd");
+                result = Err(self.poison_mtp_runtime(format!(
+                    "błąd layer-major catch-up MTP: {execution}; rollback nie powiódł się: {rollback}"
+                )));
+            }
+        }
+        self.finish_mtp_runtime(lease, state, mtp_kv, result)
+    }
+
+    fn mtp_catchup_layer_major_batch_pending(
+        &self,
+        state: &mut MtpDraftState,
+        mtp_kv: &mut KvCache,
+        tokens: &[u32],
+        target_hidden: &DevBuffer,
+    ) -> Result<()> {
+        let arena = self
+            .hybrid_layer_major_bufs
+            .as_ref()
+            .expect("arena layer-major jest gotowa");
+        let mtp = self.weights.mtp.as_ref().expect("stan MTP ma wagi");
+        let layer = mtp.layers.first().ok_or_else(|| {
+            ForgeError::Unsupported("batchowy catch-up MTP wymaga jednej warstwy".into())
+        })?;
+        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+            return Err(ForgeError::Unsupported(
+                "batchowy catch-up MTP wymaga eh_proj Q8_0".into(),
+            ));
+        };
+        let QkvWeights::Split { q: _, k, v } = &layer.block.attn().attn_qkv else {
+            return Err(ForgeError::Unsupported(
+                "batchowy catch-up MTP wymaga rozdzielonych Q/K/V".into(),
+            ));
+        };
+        let p = &self.weights.descriptor.params;
+        let hidden_bytes = p.hidden_size * 2;
+        let t = tokens.len();
+        let table = self
+            .weights
+            .token_embd_host
+            .as_ref()
+            .expect("współdzielony embedding targetu jest dostępny");
+        let (base, page_table, seq_len, position) = state.stage_batch(mtp_kv, t)?;
+        let mut staging_recorded = [false; HYBRID_HOST_STAGING_SLOTS];
+        for (chunk_index, chunk) in tokens.chunks(128).enumerate() {
+            let offset = chunk_index * 128;
+            let slot = chunk_index % HYBRID_HOST_STAGING_SLOTS;
+            let host = &arena.host_staging[slot];
+            host.ready.synchronize()?;
+            let positions: Vec<i32> = (base + offset..base + offset + chunk.len())
+                .map(|value| value as i32)
+                .collect();
+            write_pinned(bytemuck::cast_slice(&positions), &host.positions)?;
+            let destination = host
+                .embedding
+                .host_ptr()
+                .expect("pinned embedding ma mapowanie hosta");
+            for (row, &token) in chunk.iter().enumerate() {
+                let source =
+                    &table[token as usize * p.hidden_size..(token as usize + 1) * p.hidden_size];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr() as *const u8,
+                        destination.add(row * hidden_bytes),
+                        hidden_bytes,
+                    );
+                }
+            }
+            if chunk_index == 0 {
+                write_pinned(bytemuck::cast_slice(&page_table), &host.page_table)?;
+                write_pinned(&(base as i32).to_le_bytes(), &host.base_pos)?;
+                write_pinned(&seq_len.to_le_bytes(), &host.seq_len)?;
+                write_pinned(&position.to_le_bytes(), &host.position)?;
+                self.device.copy(
+                    &host.page_table,
+                    0,
+                    &state.page_table,
+                    0,
+                    page_table.len() * 4,
+                    &self.stream,
+                )?;
+                self.device
+                    .copy(&host.seq_len, 0, &state.seq_len, 0, 4, &self.stream)?;
+                self.device
+                    .copy(&host.position, 0, &state.position, 0, 4, &self.stream)?;
+                self.device
+                    .copy(&host.base_pos, 0, &arena.base_pos, 0, 4, &self.stream)?;
+            }
+            self.device.copy(
+                &host.embedding,
+                0,
+                &arena.h,
+                offset * hidden_bytes,
+                chunk.len() * hidden_bytes,
+                &self.stream,
+            )?;
+            self.device.copy(
+                &host.positions,
+                0,
+                &arena.positions,
+                offset * 4,
+                chunk.len() * 4,
+                &self.stream,
+            )?;
+            self.device.record_event(&host.ready, &self.stream)?;
+            staging_recorded[slot] = true;
+        }
+        debug_assert!(staging_recorded.into_iter().any(|recorded| recorded));
+        self.kernels.mtp_norm_join_shifted_f16(
+            &arena.q_full,
+            &arena.h,
+            target_hidden,
+            &state.recurrent_hidden,
+            &layer.enorm,
+            &layer.hnorm,
+            t,
+            p.hidden_size,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+        self.device.copy(
+            target_hidden,
+            (t - 1) * hidden_bytes,
+            &state.catchup_hidden,
+            0,
+            hidden_bytes,
+            &self.stream,
+        )?;
+        self.kernels.mtp_project_joined_q8_f16(
+            &arena.h,
+            &arena.q_full,
+            eh_proj,
+            t,
+            p.hidden_size,
+            &self.stream,
+        )?;
+        self.kernels.rmsnorm_f16(
+            &arena.x,
+            &arena.h,
+            &layer.block.attn_norm,
+            t,
+            p.hidden_size,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+        self.gemm(&arena.k, k, &arena.x, t, &self.stream)?;
+        self.gemm(&arena.v, v, &arena.x, t, &self.stream)?;
+        let attention = layer.block.attn();
+        if let Some(norm) = &attention.k_norm {
+            self.kernels.rmsnorm_f16(
+                &arena.k,
+                &arena.k,
+                norm,
+                t * p.n_kv_heads,
+                p.head_dim,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+        }
+        self.kernels.rope_neox_partial_f16(
+            &arena.k,
+            &arena.positions,
+            t,
+            p.n_kv_heads,
+            p.head_dim,
+            self.hybrid_n_rot(),
+            p.rope_theta,
+            &self.stream,
+        )?;
+        self.kernels.kv_append_batch_device_pos_f16(
+            &mtp_kv.k[0],
+            &mtp_kv.v[0],
+            &arena.k,
+            &arena.v,
+            &state.page_table,
+            &arena.base_pos,
+            t,
+            p.n_kv_heads,
+            mtp_kv.cfg.page_size,
+            p.head_dim,
+            &self.stream,
+        )?;
+        self.device.copy(
+            &state.catchup_hidden,
+            0,
+            &state.recurrent_hidden,
+            0,
+            hidden_bytes,
+            &self.stream,
+        )?;
+        self.device.copy(
+            &state.catchup_hidden,
+            0,
             &self.bufs.x,
             0,
             hidden_bytes,
@@ -7090,10 +8587,7 @@ impl Model {
             if external_sources[0] { bases[0] } else { -1 },
             if external_sources[1] { bases[1] } else { -1 },
         ];
-        write_pinned(
-            bytemuck::cast_slice(&masked_bases),
-            &b2.pinned_mtp_metadata,
-        )?;
+        write_pinned(bytemuck::cast_slice(&masked_bases), &b2.pinned_mtp_metadata)?;
         self.device.copy(
             &b2.pinned_mtp_metadata,
             0,
@@ -7246,7 +8740,10 @@ impl Model {
                 &self.stream,
             ),
             MtpEmbedding::Device(DevWeight::NvFp4Gguf {
-                buf, output_scale, ..
+                buf,
+                output_scale,
+                layout: Nvfp4GgufLayout::RowMajor36,
+                ..
             }) => self.kernels.gather_nvfp4_gguf_row_f16(
                 &mtp.token_embedding,
                 buf,
@@ -7434,6 +8931,7 @@ impl Model {
         )?;
         self.kernels.attn_decode_f16(
             &b.attn_out,
+            &b.attn_parts,
             &hb.qc,
             &mtp_kv.k[0],
             &mtp_kv.v[0],
@@ -7563,8 +9061,7 @@ impl Model {
         }
         if self.tier.is_some() || self.prefix_cache.is_some() {
             return Err(ForgeError::Unsupported(
-                "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache"
-                    .into(),
+                "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache".into(),
             ));
         }
         if !matches!(
@@ -7632,6 +9129,11 @@ impl Model {
         };
         let base_pos = a32("mtp base position", &[1])?;
         let visible_lens = a32("mtp visible lengths", &[cap])?;
+        let attn_parts = device.alloc(
+            hybrid_verify_attention_parts_bytes(cap, p.n_heads, p.head_dim)?,
+            MemKind::Device,
+            Pool::Activations,
+        )?;
         let q_full = a16(
             "mtp q full",
             &[cap, hybrid_q_full_cols(q_dim, conv_dim, p.hidden_size)],
@@ -7644,11 +9146,7 @@ impl Model {
         } else {
             a16("mtp mixed qkv", &[cap, conv_dim])?
         };
-        let z = if cap > 4 {
-            q_full.clone()
-        } else {
-            a16("mtp z", &[cap, value_dim])?
-        };
+        let z = a16("mtp z", &[cap, value_dim])?;
         let q32 = if cap > 4 {
             qc.clone()
         } else {
@@ -7720,20 +9218,43 @@ impl Model {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let has_delta = self
+            .weights
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.mixer, LayerMixer::DeltaNet(_)));
+        let shared_delta_base = if cap > 4 && has_delta {
+            Some((
+                a16("mtp współdzielony conv initial", &[conv_elems])?,
+                a16("mtp współdzielone conv checkpoints", &[cap, conv_elems])?,
+                a32("mtp współdzielony state initial", &[1])?,
+            ))
+        } else {
+            None
+        };
         let delta_base = self
             .weights
             .layers
             .iter()
             .map(|layer| match &layer.mixer {
-                LayerMixer::DeltaNet(_) => Ok(Some((
-                    a16("mtp conv initial", &[conv_elems])?,
-                    a16("mtp conv checkpoints", &[cap, conv_elems])?,
-                    if cap > 4 {
-                        a32("mtp state initial", &[1])?
+                LayerMixer::DeltaNet(_) => {
+                    let buffers = if let Some((conv_initial, conv_checkpoints, state_initial)) =
+                        shared_delta_base.as_ref()
+                    {
+                        (
+                            conv_initial.clone(),
+                            conv_checkpoints.clone(),
+                            state_initial.clone(),
+                        )
                     } else {
-                        a32("mtp state initial", &[state_elems])?
-                    },
-                ))),
+                        (
+                            a16("mtp conv initial", &[conv_elems])?,
+                            a16("mtp conv checkpoints", &[cap, conv_elems])?,
+                            a32("mtp state initial", &[state_elems])?,
+                        )
+                    };
+                    Ok(Some(buffers))
+                }
                 LayerMixer::Attention(_) => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -7803,6 +9324,7 @@ impl Model {
             cap,
             base_pos,
             visible_lens,
+            attn_parts,
             q_full,
             qc,
             gatec,
@@ -7958,9 +9480,7 @@ impl Model {
         let elements = |name: &str, dimensions: &[usize]| {
             dimensions.iter().try_fold(1usize, |total, &dimension| {
                 total.checked_mul(dimension).ok_or_else(|| {
-                    ForgeError::Scheduler(format!(
-                        "przepełnienie wymiaru {name}: {dimensions:?}"
-                    ))
+                    ForgeError::Scheduler(format!("przepełnienie wymiaru {name}: {dimensions:?}"))
                 })
             })
         };
@@ -7984,15 +9504,10 @@ impl Model {
             .checked_sub(1)
             .ok_or_else(|| ForgeError::Scheduler("prefill B2 wymaga d_conv > 0".into()))?;
         let conv_elems = elements("prefill B2 conv state", &[conv_dim, conv_history])?;
-        let state_elems = elements(
-            "prefill B2 state",
-            &[n_v, ssm.d_state, ssm.d_state],
-        )?;
+        let state_elems = elements("prefill B2 state", &[n_v, ssm.d_state, ssm.d_state])?;
         let q_full_cols = hybrid_q_full_cols(q_dim, conv_dim, p.hidden_size);
-        let page_table_elems = elements(
-            "prefill B2 page tables",
-            &[BATCH, self.max_pages_per_seq],
-        )?;
+        let page_table_elems =
+            elements("prefill B2 page tables", &[BATCH, self.max_pages_per_seq])?;
         let metadata_elems = elements("prefill B2 metadata rows", &[3, total])?
             .checked_add(BATCH)
             .and_then(|value| value.checked_add(page_table_elems))
@@ -8004,9 +9519,9 @@ impl Model {
                 .max(1)
                 .checked_next_multiple_of(DEVICE_ALLOC_ALIGN)
                 .ok_or_else(|| ForgeError::Scheduler(format!("przepełnienie alokacji {name}")))?;
-            required = required
-                .checked_add(allocation)
-                .ok_or_else(|| ForgeError::Scheduler("przepełnienie preflightu prefill B2".into()))?;
+            required = required.checked_add(allocation).ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie preflightu prefill B2".into())
+            })?;
             Ok(())
         };
         for (name, rows, cols, element_bytes) in [
@@ -8229,15 +9744,25 @@ impl Model {
 
         self.gemm(&hv.qkv_mixed, &delta.in_proj, &pb.x, t, stream)?;
         let mut prepared = Self::delta_input_q8_cols(delta)
-            .filter(|_| matches!(t, 6 | 8))
+            .filter(|_| matches!(t, 6 | 8 | 32 | 128))
             .map(|cols| self.kernels.prepare_q8_1(&pb.x, cols, t, stream))
             .transpose()?;
+        let fused_q8_triplet = prepared.is_some() && matches!(t, 32 | 128);
         if let Some(prepared) = prepared.as_mut() {
-            if !inplace_prefill {
+            if fused_q8_triplet {
+                self.gemm_q8_prepared_triplet(
+                    [&hv.z, &hv.alpha, &hv.beta_raw],
+                    [&delta.gate_proj, &delta.alpha_proj, &delta.beta_proj],
+                    prepared,
+                    t,
+                )?;
+            } else if !inplace_prefill {
                 self.gemm_q8_prepared(&hv.z, &delta.gate_proj, prepared, t)?;
             }
-            self.gemm_q8_prepared(&hv.alpha, &delta.alpha_proj, prepared, t)?;
-            self.gemm_q8_prepared(&hv.beta_raw, &delta.beta_proj, prepared, t)?;
+            if !fused_q8_triplet {
+                self.gemm_q8_prepared(&hv.alpha, &delta.alpha_proj, prepared, t)?;
+                self.gemm_q8_prepared(&hv.beta_raw, &delta.beta_proj, prepared, t)?;
+            }
         } else {
             if !inplace_prefill {
                 self.gemm(&hv.z, &delta.gate_proj, &pb.x, t, stream)?;
@@ -8276,7 +9801,7 @@ impl Model {
             p.rms_norm_eps,
             stream,
         )?;
-        if inplace_prefill {
+        if inplace_prefill && !fused_q8_triplet {
             if let Some(prepared) = prepared.as_mut() {
                 self.gemm_q8_prepared(&hv.z, &delta.gate_proj, prepared, t)?;
             } else {
@@ -8285,19 +9810,35 @@ impl Model {
         }
         drop(prepared);
         if inplace_prefill {
-            kernels.deltanet_gated_scan_inplace_f16(
-                &hv.o,
-                &state.state,
-                &hv.q32,
-                &hv.k32,
-                &hv.vtok,
-                &hv.g,
-                &hv.beta_f,
-                t,
-                n_v,
-                d_state,
-                stream,
-            )?;
+            match self.delta_state_layout() {
+                DeltaStateLayout::ValueKey => kernels.deltanet_value_key_scan_inplace_f16(
+                    &hv.o,
+                    &state.state,
+                    &state.state,
+                    &hv.q32,
+                    &hv.k32,
+                    &hv.vtok,
+                    &hv.g,
+                    &hv.beta_f,
+                    1,
+                    t,
+                    n_v,
+                    stream,
+                )?,
+                DeltaStateLayout::KeyValue => kernels.deltanet_gated_scan_inplace_f16(
+                    &hv.o,
+                    &state.state,
+                    &hv.q32,
+                    &hv.k32,
+                    &hv.vtok,
+                    &hv.g,
+                    &hv.beta_f,
+                    t,
+                    n_v,
+                    d_state,
+                    stream,
+                )?,
+            }
         } else {
             let (state_checkpoints, checkpoint_byte_offset) = match &cache.commit {
                 DeltaVerifyCommit::InPlacePrefill => {
@@ -8315,21 +9856,38 @@ impl Model {
                 ),
                 DeltaVerifyCommit::Recompute { .. } => (&hv.state_checkpoints, 0),
             };
-            kernels.deltanet_gated_scan_f16_at(
-                &hv.o,
-                state_checkpoints,
-                checkpoint_byte_offset,
-                &state.state,
-                &hv.q32,
-                &hv.k32,
-                &hv.vtok,
-                &hv.g,
-                &hv.beta_f,
-                t,
-                n_v,
-                d_state,
-                stream,
-            )?;
+            match self.delta_state_layout() {
+                DeltaStateLayout::ValueKey => kernels.deltanet_value_key_scan_checkpoints_f16_at(
+                    &hv.o,
+                    state_checkpoints,
+                    checkpoint_byte_offset,
+                    &state.state,
+                    &hv.q32,
+                    &hv.k32,
+                    &hv.vtok,
+                    &hv.g,
+                    &hv.beta_f,
+                    1,
+                    t,
+                    n_v,
+                    stream,
+                )?,
+                DeltaStateLayout::KeyValue => kernels.deltanet_gated_scan_f16_at(
+                    &hv.o,
+                    state_checkpoints,
+                    checkpoint_byte_offset,
+                    &state.state,
+                    &hv.q32,
+                    &hv.k32,
+                    &hv.vtok,
+                    &hv.g,
+                    &hv.beta_f,
+                    t,
+                    n_v,
+                    d_state,
+                    stream,
+                )?,
+            }
             if let DeltaVerifyCommit::Recompute { q, k, v, g, beta } = &cache.commit {
                 self.device
                     .copy(&hv.q32, 0, q, 0, t * value_dim * 2, stream)?;
@@ -8446,7 +10004,23 @@ impl Model {
             p.head_dim,
             stream,
         )?;
-        if self.device.caps().vendor == Vendor::Nvidia {
+        if self.kernels.attn_verify_split8_f16_hd256(
+            &pb.attn_out,
+            &hv.attn_parts,
+            &hv.qc,
+            &self.kv.k[self.target_kv_layer(layer_index)],
+            &self.kv.v[self.target_kv_layer(layer_index)],
+            &self.page_table_dev,
+            &hv.visible_lens,
+            t,
+            p.n_heads,
+            p.n_kv_heads,
+            self.kv.cfg.page_size,
+            self.max_pages_per_seq,
+            1.0 / (p.head_dim as f32).sqrt(),
+            stream,
+        )? {
+        } else if self.device.caps().vendor == Vendor::Nvidia {
             kernels.attn_decode_batch_exact_f16_hd256(
                 &pb.attn_out,
                 &hv.qc,
@@ -8548,29 +10122,48 @@ impl Model {
                     &self.stream,
                 )?,
                 DeltaVerifyCommit::Recompute { q, k, v, g, beta } => {
-                    self.kernels.deltanet_gated_scan_f16(
-                        &hv.o,
-                        &hv.state_checkpoints,
-                        &state.state,
-                        q,
-                        k,
-                        v,
-                        g,
-                        beta,
-                        t,
-                        ssm.n_v_heads(),
-                        ssm.d_state,
-                        &self.stream,
-                    )?;
-                    self.kernels.deltanet_commit_checkpoint_f32(
-                        &state.state,
-                        &hv.state_checkpoints,
-                        &hv.accepted,
-                        t,
-                        ssm.n_v_heads(),
-                        ssm.d_state,
-                        &self.stream,
-                    )?;
+                    match self.delta_state_layout() {
+                        DeltaStateLayout::ValueKey => {
+                            self.kernels.deltanet_value_key_commit_recompute_f32(
+                                &state.state,
+                                &state.state,
+                                k,
+                                v,
+                                g,
+                                beta,
+                                &hv.accepted,
+                                1,
+                                t,
+                                ssm.n_v_heads(),
+                                &self.stream,
+                            )?
+                        }
+                        DeltaStateLayout::KeyValue => {
+                            self.kernels.deltanet_gated_scan_f16(
+                                &hv.o,
+                                &hv.state_checkpoints,
+                                &state.state,
+                                q,
+                                k,
+                                v,
+                                g,
+                                beta,
+                                t,
+                                ssm.n_v_heads(),
+                                ssm.d_state,
+                                &self.stream,
+                            )?;
+                            self.kernels.deltanet_commit_checkpoint_f32(
+                                &state.state,
+                                &hv.state_checkpoints,
+                                &hv.accepted,
+                                t,
+                                ssm.n_v_heads(),
+                                ssm.d_state,
+                                &self.stream,
+                            )?;
+                        }
+                    }
                 }
             }
             self.kernels.mtp_select_row_f16(
@@ -8787,9 +10380,7 @@ impl Model {
         let checked_elements = |name: &str, dimensions: &[usize]| {
             dimensions.iter().try_fold(1usize, |elements, &dimension| {
                 elements.checked_mul(dimension).ok_or_else(|| {
-                    ForgeError::Scheduler(format!(
-                        "przepełnienie wymiaru {name}: {dimensions:?}"
-                    ))
+                    ForgeError::Scheduler(format!("przepełnienie wymiaru {name}: {dimensions:?}"))
                 })
             })
         };
@@ -8960,6 +10551,7 @@ impl Model {
                     output_scale,
                     rows,
                     cols,
+                    layout: Nvfp4GgufLayout::RowMajor36,
                 }) => {
                     if *rows != p.vocab_size || *cols != p.hidden_size {
                         return Err(ForgeError::Format(
@@ -9140,17 +10732,13 @@ impl Model {
                             .as_ref()
                             .expect("warstwa DeltaNet ma cache B2");
                         self.gemm(&b2.qkv_mixed, &delta.in_proj, &pb.x, total, &self.stream)?;
-                        if let Some(cols) = Self::delta_input_q8_cols(delta)
-                            .filter(|_| matches!(total, 6 | 8))
+                        if let Some(cols) =
+                            Self::delta_input_q8_cols(delta).filter(|_| matches!(total, 6 | 8))
                         {
                             let mut prepared =
-                                self.kernels.prepare_q8_1(&pb.x, cols, total, &self.stream)?;
-                            self.gemm_q8_prepared(
-                                &b2.z,
-                                &delta.gate_proj,
-                                &mut prepared,
-                                total,
-                            )?;
+                                self.kernels
+                                    .prepare_q8_1(&pb.x, cols, total, &self.stream)?;
+                            self.gemm_q8_prepared(&b2.z, &delta.gate_proj, &mut prepared, total)?;
                             self.gemm_q8_prepared(
                                 &b2.alpha,
                                 &delta.alpha_proj,
@@ -9191,21 +10779,41 @@ impl Model {
                             p.rms_norm_eps,
                             &self.stream,
                         )?;
-                        self.kernels.deltanet_gated_scan_segmented_shared_d128_f16(
-                            &b2.o,
-                            &b2.selected_states,
-                            &cache.state_initial,
-                            &cache.q,
-                            &cache.k,
-                            &cache.v,
-                            &cache.g,
-                            &cache.beta,
-                            2,
-                            t,
-                            ssm.n_v_heads(),
-                            ssm.d_state,
-                            &self.stream,
-                        )?;
+                        match self.delta_state_layout() {
+                            DeltaStateLayout::ValueKey => {
+                                self.kernels.deltanet_value_key_scan_inplace_f16(
+                                    &b2.o,
+                                    &b2.selected_states,
+                                    &cache.state_initial,
+                                    &cache.q,
+                                    &cache.k,
+                                    &cache.v,
+                                    &cache.g,
+                                    &cache.beta,
+                                    2,
+                                    t,
+                                    ssm.n_v_heads(),
+                                    &self.stream,
+                                )?
+                            }
+                            DeltaStateLayout::KeyValue => {
+                                self.kernels.deltanet_gated_scan_segmented_shared_d128_f16(
+                                    &b2.o,
+                                    &b2.selected_states,
+                                    &cache.state_initial,
+                                    &cache.q,
+                                    &cache.k,
+                                    &cache.v,
+                                    &cache.g,
+                                    &cache.beta,
+                                    2,
+                                    t,
+                                    ssm.n_v_heads(),
+                                    ssm.d_state,
+                                    &self.stream,
+                                )?
+                            }
+                        }
                         self.kernels.deltanet_gated_rmsnorm_f16(
                             &b2.normed,
                             &b2.o,
@@ -9288,20 +10896,39 @@ impl Model {
 
             for (layer_index, cache) in b2.delta.iter().enumerate() {
                 let Some(cache) = cache else { continue };
-                self.kernels.deltanet_commit_recompute_segmented_shared_d128_f32(
-                    &b2.selected_states,
-                    &cache.state_initial,
-                    &cache.k,
-                    &cache.v,
-                    &cache.g,
-                    &cache.beta,
-                    &b2.decisions,
-                    2,
-                    t,
-                    ssm.n_v_heads(),
-                    ssm.d_state,
-                    &self.stream,
-                )?;
+                match self.delta_state_layout() {
+                    DeltaStateLayout::ValueKey => {
+                        self.kernels.deltanet_value_key_commit_recompute_f32(
+                            &b2.selected_states,
+                            &cache.state_initial,
+                            &cache.k,
+                            &cache.v,
+                            &cache.g,
+                            &cache.beta,
+                            &b2.decisions,
+                            2,
+                            t,
+                            ssm.n_v_heads(),
+                            &self.stream,
+                        )?
+                    }
+                    DeltaStateLayout::KeyValue => self
+                        .kernels
+                        .deltanet_commit_recompute_segmented_shared_d128_f32(
+                            &b2.selected_states,
+                            &cache.state_initial,
+                            &cache.k,
+                            &cache.v,
+                            &cache.g,
+                            &cache.beta,
+                            &b2.decisions,
+                            2,
+                            t,
+                            ssm.n_v_heads(),
+                            ssm.d_state,
+                            &self.stream,
+                        )?,
+                }
                 self.kernels.mtp_select_row_segmented_f16(
                     &b2.selected_conv,
                     &cache.conv_checkpoints,
@@ -9349,12 +10976,7 @@ impl Model {
                 }
             }
             if external_sources.into_iter().any(|external| external) {
-                self.mtp_catchup_verified_prefix_b2(
-                    mtp_states,
-                    mtp_kv,
-                    t,
-                    external_sources,
-                )?;
+                self.mtp_catchup_verified_prefix_b2(mtp_states, mtp_kv, t, external_sources)?;
             }
             self.device
                 .copy(&b2.decisions, 0, &b2.pinned_decisions, 0, 16, &self.stream)?;
@@ -9554,8 +11176,7 @@ impl Model {
             let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
                 ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
             })?;
-            let staging = hv
-                .host_staging[0]
+            let staging = hv.host_staging[0]
                 .embedding
                 .host_ptr()
                 .expect("pinned embedding ma mapowanie hosta");
@@ -9583,13 +11204,12 @@ impl Model {
                 t * p.hidden_size * 2,
                 &self.stream,
             )?;
-            let graph = if std::env::var("FORGE_HYBRID_VERIFY_GRAPH")
-                .is_ok_and(|value| value == "0")
-            {
-                None
-            } else {
-                self.hybrid_verify_graphs.get(&(hybrid_slot, t)).cloned()
-            };
+            let graph =
+                if std::env::var("FORGE_HYBRID_VERIFY_GRAPH").is_ok_and(|value| value == "0") {
+                    None
+                } else {
+                    self.hybrid_verify_graphs.get(&(hybrid_slot, t)).cloned()
+                };
             if let Some(graph) = graph {
                 self.device.launch_graph(&graph, &self.stream)?;
             } else {
@@ -9782,16 +11402,13 @@ impl Model {
                 "MTP+n-gram B2 wymaga dwóch draftów z tym samym K=2 lub K=3".into(),
             ));
         }
-        self.native_mtp_routed_step_b2(
-            seqs,
-            fed,
-            budget,
-            [Some(drafts[0]), Some(drafts[1])],
-        )
-        .map(|verified| [
-            (verified[0].1, verified[0].2),
-            (verified[1].1, verified[1].2),
-        ])
+        self.native_mtp_routed_step_b2(seqs, fed, budget, [Some(drafts[0]), Some(drafts[1])])
+            .map(|verified| {
+                [
+                    (verified[0].1, verified[0].2),
+                    (verified[1].1, verified[1].2),
+                ]
+            })
     }
 
     /// Weryfikuje draft zewnętrznego proposera i dogania stan natywnego MTP.
@@ -9839,7 +11456,7 @@ impl Model {
         batch.push(fed);
         batch.extend_from_slice(draft);
         let result = (|| {
-            self.prefill_forward(seq, &batch)?;
+            self.prefill_forward(seq, &batch, true)?;
 
             let stream = &self.stream;
             let vb = self.verify_bufs.as_ref().expect("ensured above");
@@ -10088,6 +11705,7 @@ impl Model {
                     AttnSrc::Paged => {
                         kernels.attn_decode_f16(
                             &b.attn_out,
+                            &b.attn_parts,
                             q_buf,
                             &self.kv.k[self.target_kv_layer(l)],
                             &self.kv.v[self.target_kv_layer(l)],
@@ -10116,6 +11734,7 @@ impl Model {
                         tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
                         kernels.attn_decode_f16(
                             &b.attn_out,
+                            &b.attn_parts,
                             q_buf,
                             &slot.stage[0],
                             &slot.stage[1],
@@ -10268,6 +11887,7 @@ impl Model {
             )?;
             kernels.attn_decode_f16(
                 &b.attn_out,
+                &b.attn_parts,
                 &b.q,
                 &self.kv.k[self.target_kv_layer(l)],
                 &self.kv.v[self.target_kv_layer(l)],
@@ -10738,6 +12358,13 @@ impl Model {
             && self.kernels.hybrid_prefill_t128_artifacts_capable()
     }
 
+    fn hybrid_layer_major_route_capable(&self) -> bool {
+        hybrid_layer_major_prefill_requested()
+            && self.hybrid_prefill_t128_structural_capable()
+            && hybrid_layer_major_attention().is_ok()
+            && hybrid_layer_major_persistent_scan_requested().is_ok()
+    }
+
     fn hybrid_prefill_extended_budget_capable(&self, chunk: usize) -> bool {
         let Some(shape) = self.hybrid_prefill_scratch_shape() else {
             return false;
@@ -10796,6 +12423,179 @@ impl Model {
         result
     }
 
+    fn ensure_hybrid_layer_major_bufs(&mut self, cap: usize) -> Result<()> {
+        if self
+            .hybrid_layer_major_bufs
+            .as_ref()
+            .is_some_and(|bufs| bufs.cap >= cap)
+        {
+            return Ok(());
+        }
+        if !self.hybrid_prefill_extended_structural_capable() {
+            return Err(ForgeError::Unsupported(
+                "arena layer-major wymaga zweryfikowanego targetu hybrydowego NVIDIA".into(),
+            ));
+        }
+        let shape = self.hybrid_prefill_scratch_shape().ok_or_else(|| {
+            ForgeError::Unsupported("arena layer-major wymaga parametrów SSM".into())
+        })?;
+        let device_bytes = hybrid_layer_major_scratch_estimate(shape, cap)?;
+        let required = device_bytes
+            .checked_add(HYBRID_PREFILL_ACTIVATION_RESERVE)
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie budżetu layer-major".into()))?;
+        let available = self
+            .device
+            .pool_available(Pool::Activations)
+            .ok_or_else(|| {
+                ForgeError::Unsupported("backend nie raportuje budżetu areny layer-major".into())
+            })?;
+        let reclaimable = self
+            .hybrid_layer_major_bufs
+            .as_ref()
+            .map_or(0, |bufs| bufs.device_bytes);
+        let effective_available = available.checked_add(reclaimable).ok_or_else(|| {
+            ForgeError::Scheduler("przepełnienie dostępnego budżetu layer-major".into())
+        })?;
+        if required > effective_available {
+            return Err(ForgeError::Unsupported(format!(
+                "arena layer-major wymaga {required} bajtów, dostępne {effective_available}"
+            )));
+        }
+        drop(self.hybrid_layer_major_bufs.take());
+
+        let device = self.device.clone();
+        let a16 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 2, MemKind::Device)
+        };
+        let a32 = |name: &str, dims: &[usize]| {
+            alloc_checked(device.as_ref(), name, dims, 4, MemKind::Device)
+        };
+        let pinned = |name: &str, dims: &[usize], element_bytes: usize| {
+            alloc_checked(
+                device.as_ref(),
+                name,
+                dims,
+                element_bytes,
+                MemKind::PinnedHost,
+            )
+        };
+        let shared_projection_cols = shape
+            .q_dim
+            .checked_mul(2)
+            .map(|q| q.max(shape.conv_dim))
+            .ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie projekcji areny layer-major".into())
+            })?;
+        let wide = shape.q_dim.max(shape.value_dim);
+        if shape.inter < shared_projection_cols || wide < shape.hidden || wide < shape.kv_dim {
+            return Err(ForgeError::Unsupported(
+                "kształt areny layer-major nie pozwala współdzielić buforów fazowych".into(),
+            ));
+        }
+        let conv_elems = shape
+            .conv_dim
+            .checked_mul(shape.d_conv - 1)
+            .ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie okna conv areny layer-major".into())
+            })?;
+        let h = a16("layer-major h", &[cap, shape.hidden])?;
+        let x = a16("layer-major x", &[cap, shape.hidden])?;
+        let v = a16("layer-major v", &[cap, shape.kv_dim])?;
+        let gatec = a16("layer-major gatec i mixer", &[cap, wide])?;
+        let gated = a16("layer-major gated i k", &[cap, wide])?;
+        let z = a16("layer-major z", &[cap, shape.value_dim])?;
+        let alpha = a16("layer-major alpha", &[cap, shape.n_v_heads])?;
+        let beta_raw = a16("layer-major beta raw", &[cap, shape.n_v_heads])?;
+        let g = a32("layer-major g", &[cap, shape.n_v_heads])?;
+        let beta = a32("layer-major beta", &[cap, shape.n_v_heads])?;
+        let o = a16("layer-major o i normed", &[cap, shape.value_dim])?;
+        let gate = a16("layer-major q full, gate i act", &[cap, shape.inter])?;
+        let up = a16("layer-major qc i up", &[cap, shape.inter])?;
+        let q_full = gate.clone();
+        let qc = up.clone();
+        let k = gated.clone();
+        let mixer_out = gatec.clone();
+        let conv_initial = a16("layer-major conv initial", &[conv_elems])?;
+        let conv_final = a16("layer-major conv final", &[conv_elems])?;
+        let host_staging = (0..HYBRID_HOST_STAGING_SLOTS)
+            .map(|_| {
+                Ok(HybridLayerMajorHostStaging {
+                    embedding: pinned("layer-major pinned embedding", &[128, shape.hidden], 2)?,
+                    page_table: pinned(
+                        "layer-major pinned page table",
+                        &[shape.max_pages_per_seq],
+                        4,
+                    )?,
+                    ids: pinned("layer-major pinned ids", &[128], 4)?,
+                    positions: pinned("layer-major pinned positions", &[128], 4)?,
+                    visible_lens: pinned("layer-major pinned visible lengths", &[128], 4)?,
+                    base_pos: pinned("layer-major pinned base position", &[1], 4)?,
+                    seq_len: pinned("layer-major pinned sequence length", &[1], 4)?,
+                    position: pinned("layer-major pinned position", &[1], 4)?,
+                    ready: device.create_event()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.hybrid_layer_major_bufs = Some(HybridLayerMajorBufs {
+            cap,
+            device_bytes,
+            h,
+            x,
+            k,
+            v,
+            q_full,
+            qc,
+            gatec,
+            gated,
+            z,
+            alpha,
+            beta_raw,
+            g,
+            beta,
+            o,
+            gate,
+            up,
+            mixer_out,
+            conv_initial,
+            conv_final,
+            ids: a32("layer-major ids", &[cap])?,
+            positions: a32("layer-major positions", &[cap])?,
+            visible_lens: a32("layer-major visible lengths", &[cap])?,
+            base_pos: a32("layer-major base position", &[1])?,
+            host_staging,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn debug_hybrid_layer_major_arena_bytes(&mut self, cap: usize) -> Result<usize> {
+        self.ensure_hybrid_layer_major_bufs(cap)?;
+        Ok(self
+            .hybrid_layer_major_bufs
+            .as_ref()
+            .expect("arena layer-major została zaalokowana")
+            .device_bytes)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn debug_hybrid_layer_major_rollback(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+        fail_after_layer: Option<usize>,
+        fail_mtp_catchup: bool,
+        fail_after_mtp_commit: bool,
+    ) -> Result<Vec<f32>> {
+        self.activate_hybrid_sequence(seq)?;
+        self.prefill_hybrid_layer_major_inner(
+            seq,
+            tokens,
+            fail_after_layer,
+            fail_mtp_catchup,
+            fail_after_mtp_commit,
+        )
+    }
+
     fn hybrid_batch_b2_weights_capable(&self) -> bool {
         fn full_rows(weight: &DevWeight) -> bool {
             matches!(
@@ -10821,7 +12621,10 @@ impl Model {
                     | DevWeight::Iq3Xxs { .. }
                     | DevWeight::Iq1S { .. }
                     | DevWeight::Iq1M { .. }
-                    | DevWeight::NvFp4 { .. }
+                    | DevWeight::NvFp4 {
+                        storage: NvFp4CtStorage::RowMajorE4M3 { .. },
+                        ..
+                    }
                     | DevWeight::NvFp4Gguf { .. }
             )
         }
@@ -10834,9 +12637,7 @@ impl Model {
             && self.tier.is_none()
             && matches!(
                 self.weights.lm_head,
-                DevWeight::F16 { .. }
-                    | DevWeight::Q8_0 { .. }
-                    | DevWeight::NvFp4Gguf { .. }
+                DevWeight::F16 { .. } | DevWeight::Q8_0 { .. } | DevWeight::NvFp4Gguf { .. }
             )
             && self.weights.layers.iter().all(|layer| {
                 let LayerFfn::Dense(ffn) = &layer.ffn else {
@@ -10882,10 +12683,8 @@ impl Model {
             };
             attention_ok && ffn_ok
         });
-        hybrid_prefill_b2_backend_capable(
-            self.device.caps().vendor,
-            self.device.caps().warp_size,
-        ) && self.kernels.hybrid_prefill_b2_artifacts_capable()
+        hybrid_prefill_b2_backend_capable(self.device.caps().vendor, self.device.caps().warp_size)
+            && self.kernels.hybrid_prefill_b2_artifacts_capable()
             && chunk_tokens == 32
             && self.weights.descriptor.params.head_dim == 256
             && ssm.d_state == 128
@@ -10897,6 +12696,30 @@ impl Model {
             && device_embedding
             && split_layout
             && self.hybrid_batch_b2_weights_capable()
+    }
+
+    pub fn hybrid_layer_major_prefill_limit(&self) -> Option<usize> {
+        if !self.hybrid_layer_major_route_capable() {
+            return None;
+        }
+        let shape = self.hybrid_prefill_scratch_shape()?;
+        let available = self.device.pool_available(Pool::Activations)?.checked_add(
+            self.hybrid_layer_major_bufs
+                .as_ref()
+                .map_or(0, |bufs| bufs.device_bytes),
+        )?;
+        let budget_limit = [4096, 2048, 1024, 512, 128, 32]
+            .into_iter()
+            .find(|&tokens| {
+                hybrid_layer_major_scratch_estimate(shape, tokens)
+                    .ok()
+                    .and_then(|bytes| bytes.checked_add(HYBRID_PREFILL_ACTIVATION_RESERVE))
+                    .is_some_and(|required| required <= available)
+            });
+        budget_limit
+            .into_iter()
+            .chain(self.hybrid_layer_major_bufs.as_ref().map(|bufs| bufs.cap))
+            .max()
     }
 
     /// Wykonuje atomowy target-only prefill dwóch segmentów T32 bez catch-up MTP.
@@ -11014,6 +12837,175 @@ impl Model {
                         + cache.beta.len()
                 })
                 .sum::<usize>()
+    }
+
+    /// Sprawdza osobny bufor `z` i potrójną projekcję scratchu prefill.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn debug_hybrid_prefill_triplet_contract(&mut self, cap: usize) -> Result<()> {
+        if !matches!(cap, 32 | 128) {
+            return Err(ForgeError::Scheduler(
+                "test kontraktu triplet wymaga cap 32 lub 128".into(),
+            ));
+        }
+        self.ensure_hybrid_prefill_capacity(cap)?;
+        let (gate_w, gate_rows, alpha_w, alpha_rows, beta_w, beta_rows, cols) = self
+            .weights
+            .layers
+            .iter()
+            .find_map(|layer| {
+                let LayerMixer::DeltaNet(delta) = &layer.mixer else {
+                    return None;
+                };
+                let DevWeight::Q8_0 {
+                    buf: gate,
+                    rows: gate_rows,
+                    cols,
+                } = &delta.gate_proj
+                else {
+                    return None;
+                };
+                let DevWeight::Q8_0 {
+                    buf: alpha,
+                    rows: alpha_rows,
+                    cols: alpha_cols,
+                } = &delta.alpha_proj
+                else {
+                    return None;
+                };
+                let DevWeight::Q8_0 {
+                    buf: beta,
+                    rows: beta_rows,
+                    cols: beta_cols,
+                } = &delta.beta_proj
+                else {
+                    return None;
+                };
+                (*alpha_cols == *cols && *beta_cols == *cols).then(|| {
+                    (
+                        gate.clone(),
+                        *gate_rows,
+                        alpha.clone(),
+                        *alpha_rows,
+                        beta.clone(),
+                        *beta_rows,
+                        *cols,
+                    )
+                })
+            })
+            .ok_or_else(|| ForgeError::Unsupported("brak grupy DeltaNet Q8_0".into()))?;
+        let pb_x = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe")
+            .x
+            .clone();
+        let hv = self
+            .hybrid_prefill_bufs
+            .as_ref()
+            .expect("scratch prefill hybrid jest gotowy");
+        let qkv = hv.qkv_mixed.clone();
+        let z = hv.z.clone();
+        let alpha = hv.alpha.clone();
+        let beta = hv.beta_raw.clone();
+        if qkv.device_ptr() == z.device_ptr() {
+            return Err(ForgeError::Scheduler(
+                "scratch cap>4 aliasuje z z wejściem mixed qkv".into(),
+            ));
+        }
+        let input_bytes = checked_scratch_bytes("test input triplet", &[cap, cols], 2)?;
+        let host_x = (0..input_bytes / 2)
+            .map(|index| f16::from_f32((index as f32 % 31.0 - 15.0) / 8.0))
+            .collect::<Vec<_>>();
+        self.device
+            .write(bytemuck::cast_slice::<f16, u8>(&host_x), &pb_x, 0)?;
+        let qkv_pattern = (0..qkv.len())
+            .map(|index| ((index * 37 + 11) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        self.device.write(&qkv_pattern, &qkv, 0)?;
+        let baseline_z = self.device.alloc(
+            checked_scratch_bytes("test baseline z", &[cap, gate_rows], 2)?,
+            MemKind::Device,
+            Pool::Activations,
+        )?;
+        let baseline_alpha = self.device.alloc(
+            checked_scratch_bytes("test baseline alpha", &[cap, alpha_rows], 2)?,
+            MemKind::Device,
+            Pool::Activations,
+        )?;
+        let baseline_beta = self.device.alloc(
+            checked_scratch_bytes("test baseline beta", &[cap, beta_rows], 2)?,
+            MemKind::Device,
+            Pool::Activations,
+        )?;
+        let mut baseline = self.kernels.prepare_q8_1(&pb_x, cols, cap, &self.stream)?;
+        for (output, weights, rows) in [
+            (&baseline_z, &gate_w, gate_rows),
+            (&baseline_alpha, &alpha_w, alpha_rows),
+            (&baseline_beta, &beta_w, beta_rows),
+        ] {
+            self.kernels.gemm_q8_0_i8mma_prepared_at(
+                output,
+                weights,
+                0,
+                &mut baseline,
+                rows,
+                cols,
+                cap,
+            )?;
+        }
+        drop(baseline);
+        let mut fused = self.kernels.prepare_q8_1(&pb_x, cols, cap, &self.stream)?;
+        self.kernels.gemm_q8_0_i8mma_prepared_triplet(
+            &[
+                Q8PreparedProjection {
+                    output: &z,
+                    weights: &gate_w,
+                    weight_byte_offset: 0,
+                    rows: gate_rows,
+                },
+                Q8PreparedProjection {
+                    output: &alpha,
+                    weights: &alpha_w,
+                    weight_byte_offset: 0,
+                    rows: alpha_rows,
+                },
+                Q8PreparedProjection {
+                    output: &beta,
+                    weights: &beta_w,
+                    weight_byte_offset: 0,
+                    rows: beta_rows,
+                },
+            ],
+            &mut fused,
+            cols,
+            cap,
+        )?;
+        drop(fused);
+        self.device.synchronize()?;
+        let mut qkv_after = vec![0u8; qkv.len()];
+        self.device.read(&qkv, 0, &mut qkv_after)?;
+        if qkv_after != qkv_pattern {
+            return Err(ForgeError::Kernel(
+                "triplet nadpisał wejście mixed qkv przed deltanet_prepare".into(),
+            ));
+        }
+        for (name, actual, expected) in [
+            ("z", &z, &baseline_z),
+            ("alpha", &alpha, &baseline_alpha),
+            ("beta", &beta, &baseline_beta),
+        ] {
+            let mut actual_bytes = vec![0u8; expected.len()];
+            let mut expected_bytes = vec![0u8; expected.len()];
+            self.device.read(actual, 0, &mut actual_bytes)?;
+            self.device.read(expected, 0, &mut expected_bytes)?;
+            if actual_bytes != expected_bytes {
+                return Err(ForgeError::Kernel(format!(
+                    "fused triplet różni się bitowo dla projekcji {name}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Odtwarza stany MTP po target-only prefill B2 macierzowo, lane po lane.
@@ -11266,7 +13258,10 @@ impl Model {
             &self.stream,
         )?;
         self.device.synchronize()?;
-        let output = batch.pinned_out.host_ptr().expect("pinned output ma mapowanie") as *const i32;
+        let output = batch
+            .pinned_out
+            .host_ptr()
+            .expect("pinned output ma mapowanie") as *const i32;
         let ids = unsafe { std::slice::from_raw_parts(output, BATCH) };
         let mut result = [0u32; BATCH];
         for lane in 0..BATCH {
@@ -11394,7 +13389,12 @@ impl Model {
             }
             let page_table_elems = BATCH * self.max_pages_per_seq;
             let mut metadata = Vec::with_capacity(3 * TOTAL + BATCH + page_table_elems + BATCH * 2);
-            metadata.extend(tokens[0].iter().chain(tokens[1].iter()).map(|&token| token as i32));
+            metadata.extend(
+                tokens[0]
+                    .iter()
+                    .chain(tokens[1].iter())
+                    .map(|&token| token as i32),
+            );
             for lane in 0..BATCH {
                 metadata.extend((bases[lane]..ends[lane]).map(|position| position as i32));
             }
@@ -11405,7 +13405,10 @@ impl Model {
             let page_table_offset = metadata.len();
             for seq in seqs.iter() {
                 metadata.extend(seq.pages.iter().copied());
-                metadata.resize(metadata.len() + self.max_pages_per_seq - seq.pages.len(), -1);
+                metadata.resize(
+                    metadata.len() + self.max_pages_per_seq - seq.pages.len(),
+                    -1,
+                );
             }
             metadata.extend([STEPS as i32, 0, STEPS as i32, 0]);
             let b2 = self
@@ -11415,14 +13418,8 @@ impl Model {
             write_pinned(bytemuck::cast_slice(&metadata), &b2.pinned_metadata)?;
             work_enqueued = true;
             let rows_bytes = TOTAL * 4;
-            self.device.copy(
-                &b2.pinned_metadata,
-                0,
-                &b2.ids,
-                0,
-                rows_bytes,
-                &self.stream,
-            )?;
+            self.device
+                .copy(&b2.pinned_metadata, 0, &b2.ids, 0, rows_bytes, &self.stream)?;
             self.device.copy(
                 &b2.pinned_metadata,
                 rows_bytes,
@@ -11507,6 +13504,7 @@ impl Model {
                     output_scale,
                     rows,
                     cols,
+                    layout: Nvfp4GgufLayout::RowMajor36,
                 }) => {
                     if (*rows, *cols) != (p.vocab_size, p.hidden_size) {
                         return Err(ForgeError::Format(
@@ -11696,21 +13694,41 @@ impl Model {
                             p.rms_norm_eps,
                             &self.stream,
                         )?;
-                        self.kernels.deltanet_gated_scan_segmented_shared_d128_f16(
-                            &b2.o,
-                            &b2.final_states,
-                            &cache.state_initial,
-                            &cache.q,
-                            &cache.k,
-                            &cache.v,
-                            &cache.g,
-                            &cache.beta,
-                            BATCH,
-                            STEPS,
-                            ssm.n_v_heads(),
-                            ssm.d_state,
-                            &self.stream,
-                        )?;
+                        match self.delta_state_layout() {
+                            DeltaStateLayout::ValueKey => {
+                                self.kernels.deltanet_value_key_scan_inplace_f16(
+                                    &b2.o,
+                                    &b2.final_states,
+                                    &cache.state_initial,
+                                    &cache.q,
+                                    &cache.k,
+                                    &cache.v,
+                                    &cache.g,
+                                    &cache.beta,
+                                    BATCH,
+                                    STEPS,
+                                    ssm.n_v_heads(),
+                                    &self.stream,
+                                )?
+                            }
+                            DeltaStateLayout::KeyValue => {
+                                self.kernels.deltanet_gated_scan_segmented_shared_d128_f16(
+                                    &b2.o,
+                                    &b2.final_states,
+                                    &cache.state_initial,
+                                    &cache.q,
+                                    &cache.k,
+                                    &cache.v,
+                                    &cache.g,
+                                    &cache.beta,
+                                    BATCH,
+                                    STEPS,
+                                    ssm.n_v_heads(),
+                                    ssm.d_state,
+                                    &self.stream,
+                                )?
+                            }
+                        }
                         for (lane, &lease) in leases.iter().enumerate() {
                             let (conv, state) = self
                                 .hybrid_states
@@ -11771,13 +13789,8 @@ impl Model {
                 };
                 self.gemm(&b2.gate, gate, &b2.x, TOTAL, &self.stream)?;
                 self.gemm(&b2.up, up, &b2.x, TOTAL, &self.stream)?;
-                self.kernels.silu_mul_f16(
-                    &b2.act,
-                    &b2.gate,
-                    &b2.up,
-                    ffn_rows,
-                    &self.stream,
-                )?;
+                self.kernels
+                    .silu_mul_f16(&b2.act, &b2.gate, &b2.up, ffn_rows, &self.stream)?;
                 self.gemm(&b2.down, &ffn.down, &b2.act, TOTAL, &self.stream)?;
                 let next_norm = if layer_index + 1 < self.weights.layers.len() {
                     &self.weights.layers[layer_index + 1].attn_norm
@@ -11820,7 +13833,8 @@ impl Model {
                     .host_ptr()
                     .expect("logity B2 mają mapowanie") as *const f32;
                 Ok(std::array::from_fn(|lane| unsafe {
-                    std::slice::from_raw_parts(logits.add(lane * p.vocab_size), p.vocab_size).to_vec()
+                    std::slice::from_raw_parts(logits.add(lane * p.vocab_size), p.vocab_size)
+                        .to_vec()
                 }))
             } else {
                 Ok(std::array::from_fn(|_| Vec::new()))
@@ -11943,10 +13957,7 @@ impl Model {
                 }
             }
         }
-        let page_bytes = self.kv.cfg.n_kv_heads
-            * self.kv.cfg.page_size
-            * self.kv.cfg.head_dim
-            * 2;
+        let page_bytes = self.kv.cfg.n_kv_heads * self.kv.cfg.page_size * self.kv.cfg.head_dim * 2;
         for layer_index in 0..self.weights.layers.len() {
             let LayerMixer::Attention(_) = self.weights.layers[layer_index].mixer else {
                 continue;
@@ -11970,8 +13981,24 @@ impl Model {
             }
         }
         snapshot.push(("seq.len".into(), 1, seq.len.to_le_bytes().to_vec()));
-        snapshot.push(("seq.tokens".into(), 4, bytemuck::cast_slice(&seq.tokens).to_vec()));
+        snapshot.push((
+            "seq.tokens".into(),
+            4,
+            bytemuck::cast_slice(&seq.tokens).to_vec(),
+        ));
         Ok(snapshot)
+    }
+
+    /// Wymusza produkcyjną odbudowę KV i stanu hybrydowego z historii promptu.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn debug_recompute_seq(&mut self, seq: &mut SeqKv) -> Result<()> {
+        if self.tier.is_none() {
+            return Err(ForgeError::Scheduler(
+                "test recompute wymaga włączonego tieringu".into(),
+            ));
+        }
+        self.recompute_seq(seq)
     }
 
     /// Zrzuca carry oraz aktywny prefiks KV MTP w kolejności logicznych stron.
@@ -11993,8 +14020,7 @@ impl Model {
             .as_ref()
             .ok_or_else(|| ForgeError::Unsupported("cache MTP jest aktualnie używany".into()))?;
         let mut hidden = vec![0u8; state.recurrent_hidden.len()];
-        self.device
-            .read(&state.recurrent_hidden, 0, &mut hidden)?;
+        self.device.read(&state.recurrent_hidden, 0, &mut hidden)?;
         let mut snapshot = vec![("mtp.hidden".into(), 2, hidden)];
         for (name, buffer) in [
             ("mtp.page_table", &state.page_table),
@@ -12266,6 +14292,7 @@ impl Model {
             AttnSrc::Paged => {
                 kernels.attn_decode_f16(
                     &b.attn_out,
+                    &b.attn_parts,
                     &hb.qc,
                     &self.kv.k[self.target_kv_layer(l)],
                     &self.kv.v[self.target_kv_layer(l)],
@@ -12298,6 +14325,7 @@ impl Model {
                 tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
                 kernels.attn_decode_f16(
                     &b.attn_out,
+                    &b.attn_parts,
                     &hb.qc,
                     &slot.stage[0],
                     &slot.stage[1],
@@ -12340,7 +14368,9 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
-        let st = self.active_ssm()[l].as_ref().expect("DeltaNet layer has ssm state");
+        let st = self.active_ssm()[l]
+            .as_ref()
+            .expect("DeltaNet layer has ssm state");
 
         // Input projections: mixed q|k|v conv stream, output gate z, and the
         // per-head decay/write-gate projections.
@@ -12381,10 +14411,8 @@ impl Model {
         // Per-head L2 norm on the key-head q/k (n_k heads over d_state).
         kernels.l2norm_heads_f16(&hb.q16, &hb.q16src, n_k, d_state, eps, stream)?;
         kernels.l2norm_heads_f16(&hb.k16, &hb.k16src, n_k, d_state, eps, stream)?;
-        // Expand key-heads to value-heads. llama.cpp's qwen35moe graph uses
-        // `ggml_repeat` (block-tiled: v-head j uses k-head j % n_k), and this
-        // build runs that non-fused path (fused GDN is disabled for Qwen3.6),
-        // so the key block is tiled `rep` times: [k0..k15, k0..k15].
+        // Format GGUF przestawia tensory strony V do układu kafelkowego, więc
+        // każda głowa V używa głowy K o indeksie `head % n_k`.
         let key_bytes = n_k * d_state * 2;
         for r in 0..rep {
             self.device
@@ -12396,9 +14424,16 @@ impl Model {
         kernels.deltanet_log_decay_f32(&hb.g, &hb.alpha, &d.dt_bias, &d.a, n_v, stream)?;
         kernels.deltanet_beta_sigmoid_f32(&hb.beta_f, &hb.beta_raw, n_v, stream)?;
         // Rank-1 gated-delta recurrence (advances the state matrix in place).
-        kernels.deltanet_gated_step_f16(
-            &hb.o, &st.state, &hb.q32, &hb.k32, &hb.vtok, &hb.g, &hb.beta_f, n_v, d_state, stream,
-        )?;
+        match self.delta_state_layout() {
+            DeltaStateLayout::ValueKey => kernels.deltanet_value_key_scan_inplace_f16(
+                &hb.o, &st.state, &st.state, &hb.q32, &hb.k32, &hb.vtok, &hb.g, &hb.beta_f, 1, 1,
+                n_v, stream,
+            )?,
+            DeltaStateLayout::KeyValue => kernels.deltanet_gated_step_f16(
+                &hb.o, &st.state, &hb.q32, &hb.k32, &hb.vtok, &hb.g, &hb.beta_f, n_v, d_state,
+                stream,
+            )?,
+        }
         // Output gated RMSNorm then the value-dim → hidden out projection.
         kernels.deltanet_gated_rmsnorm_f16(
             &hb.normed,
@@ -12422,9 +14457,13 @@ impl Model {
     /// the resident DeltaNet state advances untouched.
     fn prefill_hybrid(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
         self.activate_hybrid_sequence(seq)?;
-        let batched_enabled = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
-            .map_or(true, |value| value != "0");
-        if batched_enabled && tokens.len() > 1 && self.validate_hybrid_speculation_target().is_ok() {
+        if tokens.len() >= 32 && self.hybrid_layer_major_route_capable() {
+            return self.prefill_hybrid_layer_major(seq, tokens);
+        }
+        let batched_enabled =
+            std::env::var("FORGE_HYBRID_BATCH_PREFILL").map_or(true, |value| value != "0");
+        if batched_enabled && tokens.len() > 1 && self.validate_hybrid_speculation_target().is_ok()
+        {
             return self.prefill_hybrid_batched(seq, tokens);
         }
         self.ensure_hybrid_bufs()?;
@@ -12505,8 +14544,792 @@ impl Model {
         Ok(last_logits)
     }
 
+    fn checkpoint_hybrid_layer_major(&self, seq: &SeqKv) -> Result<HybridLayerMajorCheckpoint> {
+        let verifier = self.hybrid_verify_bufs.as_ref().ok_or_else(|| {
+            ForgeError::Scheduler("layer-major nie ma workspace verifiera do rollbacku".into())
+        })?;
+        let state_workspace = verifier
+            .retained_state_checkpoints
+            .as_ref()
+            .ok_or_else(|| {
+                ForgeError::Scheduler("layer-major nie ma retained checkpointów stanu".into())
+            })?
+            .clone();
+        let conv_workspaces = verifier
+            .delta
+            .iter()
+            .map(|cache| cache.as_ref().map(|cache| cache.conv_initial.clone()))
+            .collect::<Vec<_>>();
+        let state_bytes = self
+            .active_ssm()
+            .iter()
+            .flatten()
+            .next()
+            .ok_or_else(|| ForgeError::Scheduler("layer-major nie ma stanu DeltaNet".into()))?
+            .state
+            .len();
+        let delta_layers = self.active_ssm().iter().flatten().count();
+        let kv_byte_offset = state_bytes.checked_mul(delta_layers).ok_or_else(|| {
+            ForgeError::Scheduler("przepełnienie checkpointu stanów layer-major".into())
+        })?;
+        let kv_page_bytes = checked_scratch_bytes(
+            "checkpoint strony KV layer-major",
+            &[
+                self.kv.cfg.n_kv_heads,
+                self.kv.cfg.page_size,
+                self.kv.cfg.head_dim,
+            ],
+            2,
+        )?;
+        let tail_page = if seq.len > 0 && !seq.len.is_multiple_of(self.kv.cfg.page_size) {
+            let physical = *seq
+                .pages
+                .last()
+                .ok_or_else(|| ForgeError::Scheduler("częściowy ogon KV nie ma strony".into()))?;
+            Some(usize::try_from(physical).map_err(|_| {
+                ForgeError::Unsupported("layer-major nie obsługuje spilled ogona KV".into())
+            })?)
+        } else {
+            None
+        };
+        let kv_checkpoint_bytes = if tail_page.is_some() {
+            checked_scratch_bytes(
+                "checkpoint ogona KV layer-major",
+                &[2, self.kv.k.len(), kv_page_bytes],
+                1,
+            )?
+        } else {
+            0
+        };
+        let required = kv_byte_offset
+            .checked_add(kv_checkpoint_bytes)
+            .ok_or_else(|| {
+                ForgeError::Scheduler("przepełnienie workspace rollbacku layer-major".into())
+            })?;
+        if state_workspace.len() < required {
+            return Err(ForgeError::Scheduler(format!(
+                "retained checkpointy mają {} bajtów, rollback layer-major wymaga {required}",
+                state_workspace.len()
+            )));
+        }
+        let mut delta_index = 0usize;
+        for (layer_index, state) in self.active_ssm().iter().enumerate() {
+            let Some(state) = state else { continue };
+            self.device.copy(
+                &state.state,
+                0,
+                &state_workspace,
+                delta_index * state_bytes,
+                state_bytes,
+                &self.stream,
+            )?;
+            let conv_workspace = conv_workspaces[layer_index].as_ref().ok_or_else(|| {
+                ForgeError::Scheduler("warstwa DeltaNet nie ma checkpointu conv".into())
+            })?;
+            self.device.copy(
+                &state.conv,
+                0,
+                conv_workspace,
+                0,
+                state.conv.len(),
+                &self.stream,
+            )?;
+            delta_index += 1;
+        }
+        if let Some(physical) = tail_page {
+            let source_offset = physical
+                .checked_mul(kv_page_bytes)
+                .ok_or_else(|| ForgeError::Scheduler("przepełnienie offsetu strony KV".into()))?;
+            for layer in 0..self.kv.k.len() {
+                for (kind, slab) in [&self.kv.k[layer], &self.kv.v[layer]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let destination_offset = kv_byte_offset + (2 * layer + kind) * kv_page_bytes;
+                    self.device.copy(
+                        slab,
+                        source_offset,
+                        &state_workspace,
+                        destination_offset,
+                        kv_page_bytes,
+                        &self.stream,
+                    )?;
+                }
+            }
+        }
+        Ok(HybridLayerMajorCheckpoint {
+            base: seq.len,
+            pages: seq.pages.clone(),
+            tokens_len: seq.tokens.len(),
+            prefilled_len: seq.prefilled_len,
+            state_workspace,
+            conv_workspaces,
+            state_bytes,
+            kv_byte_offset,
+            kv_page_bytes,
+            tail_page,
+        })
+    }
+
+    fn rollback_hybrid_layer_major(
+        &mut self,
+        seq: &mut SeqKv,
+        checkpoint: &HybridLayerMajorCheckpoint,
+    ) -> Result<()> {
+        let restore_result = (|| -> Result<()> {
+            let mut delta_index = 0usize;
+            for (layer_index, state) in self.active_ssm().iter().enumerate() {
+                let Some(state) = state else { continue };
+                self.device.copy(
+                    &checkpoint.state_workspace,
+                    delta_index * checkpoint.state_bytes,
+                    &state.state,
+                    0,
+                    checkpoint.state_bytes,
+                    &self.stream,
+                )?;
+                let conv_workspace = checkpoint.conv_workspaces[layer_index]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ForgeError::Scheduler("rollback nie ma checkpointu conv".into())
+                    })?;
+                self.device.copy(
+                    conv_workspace,
+                    0,
+                    &state.conv,
+                    0,
+                    state.conv.len(),
+                    &self.stream,
+                )?;
+                delta_index += 1;
+            }
+            if let Some(physical) = checkpoint.tail_page {
+                let destination_offset = physical
+                    .checked_mul(checkpoint.kv_page_bytes)
+                    .ok_or_else(|| {
+                        ForgeError::Scheduler("przepełnienie offsetu rollbacku KV".into())
+                    })?;
+                for layer in 0..self.kv.k.len() {
+                    for (kind, slab) in [&self.kv.k[layer], &self.kv.v[layer]]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let source_offset = checkpoint.kv_byte_offset
+                            + (2 * layer + kind) * checkpoint.kv_page_bytes;
+                        self.device.copy(
+                            &checkpoint.state_workspace,
+                            source_offset,
+                            slab,
+                            destination_offset,
+                            checkpoint.kv_page_bytes,
+                            &self.stream,
+                        )?;
+                    }
+                }
+            }
+            self.device.synchronize()?;
+            Ok(())
+        })();
+        self.kv.rollback(seq, checkpoint.base);
+        seq.tokens.truncate(checkpoint.tokens_len);
+        seq.prefilled_len = checkpoint.prefilled_len;
+        self.pt_seq = 0;
+        if seq.pages != checkpoint.pages {
+            return Err(ForgeError::Scheduler(
+                "rollback layer-major nie odtworzył mapy stron".into(),
+            ));
+        }
+        restore_result
+    }
+
     /// Wykonuje prefill hybrydowego targetu w macierzowych chunkach i zatwierdza
     /// ostatni checkpoint rekurencji po każdym chunku.
+    fn prefill_hybrid_layer_major(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.prefill_hybrid_layer_major_inner(seq, tokens, None, false, false)
+    }
+
+    fn prefill_hybrid_layer_major_inner(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+        fail_after_layer: Option<usize>,
+        fail_mtp_catchup: bool,
+        fail_after_mtp_commit: bool,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() || tokens.len() > HYBRID_LAYER_MAJOR_MAX_TOKENS {
+            return Err(ForgeError::Scheduler(
+                "layer-major prefill otrzymał nieobsługiwaną długość".into(),
+            ));
+        }
+        if seq.len + tokens.len() > self.weights.descriptor.params.max_position_embeddings {
+            return Err(ForgeError::Scheduler(
+                "layer-major prefill przekracza kontekst".into(),
+            ));
+        }
+        {
+            let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+                ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
+            })?;
+            for &token in tokens {
+                let end = (token as usize + 1)
+                    .checked_mul(self.weights.descriptor.params.hidden_size)
+                    .ok_or_else(|| {
+                        ForgeError::Scheduler("przepełnienie indeksu embeddingu".into())
+                    })?;
+                if end > table.len() {
+                    return Err(ForgeError::Scheduler(format!(
+                        "token id {token} wykracza poza embedding targetu"
+                    )));
+                }
+            }
+        }
+        self.ensure_hybrid_verify_bufs(4)?;
+        self.ensure_hybrid_layer_major_bufs(tokens.len())?;
+        if seq.len == 0 {
+            self.reset_mtp_runtime(seq)?;
+        }
+        let arena = self
+            .hybrid_layer_major_bufs
+            .as_ref()
+            .expect("arena layer-major jest gotowa")
+            .clone();
+        let p = self.weights.descriptor.params.clone();
+        let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
+        let t = tokens.len();
+        let base = seq.len;
+        let attention_backend = hybrid_layer_major_attention()?;
+        let persistent_scan = hybrid_layer_major_persistent_scan_requested()?
+            && t > 128
+            && self
+                .kernels
+                .supports_deltanet_gated_scan_persistent_d128_f16();
+        let checkpoint = self.checkpoint_hybrid_layer_major(seq)?;
+        let result = (|| {
+            let new_pages = (base + t)
+                .div_ceil(self.kv.cfg.page_size)
+                .saturating_sub(seq.pages.len());
+            self.ensure_free_pages(new_pages);
+            for _ in 0..t {
+                self.kv.grow(seq)?;
+            }
+            let mut page_table = vec![-1i32; self.max_pages_per_seq];
+            page_table[..seq.pages.len()].copy_from_slice(&seq.pages);
+            self.pt_seq = seq.id;
+
+            let table = self
+                .weights
+                .token_embd_host
+                .as_ref()
+                .expect("embedding targetu sprawdzono przed mutacją KV");
+            let hidden_bytes = p.hidden_size * 2;
+            let staging = &arena.host_staging;
+            let mut staging_recorded = [false; HYBRID_HOST_STAGING_SLOTS];
+            for (chunk_index, chunk) in tokens.chunks(128).enumerate() {
+                let offset = chunk_index * 128;
+                let slot = chunk_index % HYBRID_HOST_STAGING_SLOTS;
+                let host = &staging[slot];
+                if staging_recorded[slot] {
+                    host.ready.synchronize()?;
+                }
+                let ids: Vec<i32> = chunk.iter().map(|&id| id as i32).collect();
+                let positions: Vec<i32> = (base + offset..base + offset + chunk.len())
+                    .map(|position| position as i32)
+                    .collect();
+                let visible_lens: Vec<i32> = (base + offset + 1..=base + offset + chunk.len())
+                    .map(|len| len as i32)
+                    .collect();
+                write_pinned(bytemuck::cast_slice(&ids), &host.ids)?;
+                write_pinned(bytemuck::cast_slice(&positions), &host.positions)?;
+                write_pinned(bytemuck::cast_slice(&visible_lens), &host.visible_lens)?;
+                let destination = host
+                    .embedding
+                    .host_ptr()
+                    .expect("pinned embedding ma mapowanie hosta");
+                for (row, &token) in chunk.iter().enumerate() {
+                    let source = table
+                        .get(token as usize * p.hidden_size..(token as usize + 1) * p.hidden_size)
+                        .ok_or_else(|| {
+                            ForgeError::Scheduler(format!(
+                                "token id {token} wykracza poza embedding targetu"
+                            ))
+                        })?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            source.as_ptr() as *const u8,
+                            destination.add(row * hidden_bytes),
+                            hidden_bytes,
+                        );
+                    }
+                }
+                if chunk_index == 0 {
+                    write_pinned(bytemuck::cast_slice(&page_table), &host.page_table)?;
+                    write_pinned(&(base as i32).to_le_bytes(), &host.base_pos)?;
+                    self.device.copy(
+                        &host.page_table,
+                        0,
+                        &self.page_table_dev,
+                        0,
+                        page_table.len() * 4,
+                        &self.stream,
+                    )?;
+                    self.device
+                        .copy(&host.base_pos, 0, &arena.base_pos, 0, 4, &self.stream)?;
+                }
+                self.device.copy(
+                    &host.embedding,
+                    0,
+                    &arena.h,
+                    offset * hidden_bytes,
+                    chunk.len() * hidden_bytes,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &host.ids,
+                    0,
+                    &arena.ids,
+                    offset * 4,
+                    chunk.len() * 4,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &host.positions,
+                    0,
+                    &arena.positions,
+                    offset * 4,
+                    chunk.len() * 4,
+                    &self.stream,
+                )?;
+                self.device.copy(
+                    &host.visible_lens,
+                    0,
+                    &arena.visible_lens,
+                    offset * 4,
+                    chunk.len() * 4,
+                    &self.stream,
+                )?;
+                self.device.record_event(&host.ready, &self.stream)?;
+                staging_recorded[slot] = true;
+            }
+
+            self.profile_target_start()?;
+            self.kernels.rmsnorm_f16(
+                &arena.x,
+                &arena.h,
+                &self.weights.layers[0].attn_norm,
+                t,
+                p.hidden_size,
+                p.rms_norm_eps,
+                &self.stream,
+            )?;
+            let q_dim = p.n_heads * p.head_dim;
+            for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+                match &layer.mixer {
+                    LayerMixer::Attention(attention) => {
+                        let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
+                            return Err(ForgeError::Unsupported(
+                                "layer-major wymaga rozdzielonych Q/K/V".into(),
+                            ));
+                        };
+                        self.gemm(&arena.q_full, q, &arena.x, t, &self.stream)?;
+                        self.kernels.deinterleave_gate_f16(
+                            &arena.qc,
+                            &arena.gatec,
+                            &arena.q_full,
+                            p.head_dim,
+                            t * q_dim,
+                            &self.stream,
+                        )?;
+                        if let Some(norm) = &attention.q_norm {
+                            self.kernels.rmsnorm_f16(
+                                &arena.qc,
+                                &arena.qc,
+                                norm,
+                                t * p.n_heads,
+                                p.head_dim,
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        }
+                        self.gemm(&arena.k, k, &arena.x, t, &self.stream)?;
+                        self.gemm(&arena.v, v, &arena.x, t, &self.stream)?;
+                        if let Some(norm) = &attention.k_norm {
+                            self.kernels.rmsnorm_f16(
+                                &arena.k,
+                                &arena.k,
+                                norm,
+                                t * p.n_kv_heads,
+                                p.head_dim,
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        }
+                        let n_rot = self.hybrid_n_rot();
+                        self.kernels.rope_neox_partial_f16(
+                            &arena.qc,
+                            &arena.positions,
+                            t,
+                            p.n_heads,
+                            p.head_dim,
+                            n_rot,
+                            p.rope_theta,
+                            &self.stream,
+                        )?;
+                        self.kernels.rope_neox_partial_f16(
+                            &arena.k,
+                            &arena.positions,
+                            t,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            n_rot,
+                            p.rope_theta,
+                            &self.stream,
+                        )?;
+                        let kv_layer = self.target_kv_layer(layer_index);
+                        self.kernels.kv_append_batch_device_pos_f16(
+                            &self.kv.k[kv_layer],
+                            &self.kv.v[kv_layer],
+                            &arena.k,
+                            &arena.v,
+                            &self.page_table_dev,
+                            &arena.base_pos,
+                            t,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            p.head_dim,
+                            &self.stream,
+                        )?;
+                        match attention_backend {
+                            HybridLayerMajorAttention::Exact => {
+                                self.kernels.attn_decode_batch_exact_f16_hd256(
+                                    &arena.q_full,
+                                    &arena.qc,
+                                    &self.kv.k[kv_layer],
+                                    &self.kv.v[kv_layer],
+                                    &self.page_table_dev,
+                                    &arena.visible_lens,
+                                    t,
+                                    p.n_heads,
+                                    p.n_kv_heads,
+                                    self.kv.cfg.page_size,
+                                    self.max_pages_per_seq,
+                                    1.0 / (p.head_dim as f32).sqrt(),
+                                    &self.stream,
+                                )?;
+                            }
+                            HybridLayerMajorAttention::Prefill => {
+                                self.kernels.attn_prefill_device_pos_f16_hd256(
+                                    &arena.q_full,
+                                    &arena.qc,
+                                    &self.kv.k[kv_layer],
+                                    &self.kv.v[kv_layer],
+                                    &self.page_table_dev,
+                                    &arena.base_pos,
+                                    t,
+                                    p.n_heads,
+                                    p.n_kv_heads,
+                                    self.kv.cfg.page_size,
+                                    1.0 / (p.head_dim as f32).sqrt(),
+                                    &self.stream,
+                                )?;
+                            }
+                            HybridLayerMajorAttention::Flash => {
+                                self.kernels.attn_prefill_fa_mojo_f16_hd256(
+                                    &arena.q_full,
+                                    &arena.qc,
+                                    &self.kv.k[kv_layer],
+                                    &self.kv.v[kv_layer],
+                                    &self.page_table_dev,
+                                    base,
+                                    t,
+                                    p.n_heads,
+                                    p.n_kv_heads,
+                                    self.kv.cfg.page_size,
+                                    1.0 / (p.head_dim as f32).sqrt(),
+                                    &self.stream,
+                                )?;
+                            }
+                        }
+                        self.kernels.sigmoid_mul_f16(
+                            &arena.gated,
+                            &arena.q_full,
+                            &arena.gatec,
+                            t * q_dim,
+                            &self.stream,
+                        )?;
+                        self.gemm(
+                            &arena.mixer_out,
+                            &attention.attn_o,
+                            &arena.gated,
+                            t,
+                            &self.stream,
+                        )?;
+                    }
+                    LayerMixer::DeltaNet(delta) => {
+                        let state = self.active_ssm()[layer_index]
+                            .as_ref()
+                            .expect("warstwa DeltaNet ma stan");
+                        self.gemm(&arena.q_full, &delta.in_proj, &arena.x, t, &self.stream)?;
+                        if let Some(cols) = Self::delta_input_q8_cols(delta) {
+                            let mut prepared =
+                                self.kernels.prepare_q8_1(&arena.x, cols, t, &self.stream)?;
+                            self.gemm_q8_prepared_triplet(
+                                [&arena.z, &arena.alpha, &arena.beta_raw],
+                                [&delta.gate_proj, &delta.alpha_proj, &delta.beta_proj],
+                                &mut prepared,
+                                t,
+                            )?;
+                        } else {
+                            self.gemm(&arena.z, &delta.gate_proj, &arena.x, t, &self.stream)?;
+                            self.gemm(&arena.alpha, &delta.alpha_proj, &arena.x, t, &self.stream)?;
+                            self.gemm(
+                                &arena.beta_raw,
+                                &delta.beta_proj,
+                                &arena.x,
+                                t,
+                                &self.stream,
+                            )?;
+                        }
+                        self.device.copy(
+                            &state.conv,
+                            0,
+                            &arena.conv_initial,
+                            0,
+                            state.conv.len(),
+                            &self.stream,
+                        )?;
+                        if hybrid_layer_major_tiled_prepare_requested()
+                            && ssm.d_state == 128
+                            && ssm.d_conv == 4
+                            && self.kernels.supports_deltanet_prepare_tiled_d128_c4_f16()
+                        {
+                            self.kernels.deltanet_prepare_tiled_d128_c4_f16(
+                                &arena.qc,
+                                &arena.gatec,
+                                &arena.gated,
+                                &arena.g,
+                                &arena.beta,
+                                &arena.conv_final,
+                                &arena.conv_initial,
+                                &arena.q_full,
+                                &delta.conv1d,
+                                &arena.alpha,
+                                &arena.beta_raw,
+                                &delta.dt_bias,
+                                &delta.a,
+                                t,
+                                ssm.n_k_heads(),
+                                ssm.n_v_heads(),
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        } else {
+                            self.kernels.deltanet_prepare_segmented_final_f16(
+                                &arena.qc,
+                                &arena.gatec,
+                                &arena.gated,
+                                &arena.g,
+                                &arena.beta,
+                                &arena.conv_final,
+                                &arena.conv_initial,
+                                &arena.q_full,
+                                &delta.conv1d,
+                                &arena.alpha,
+                                &arena.beta_raw,
+                                &delta.dt_bias,
+                                &delta.a,
+                                1,
+                                t,
+                                ssm.n_k_heads(),
+                                ssm.n_v_heads(),
+                                ssm.d_state,
+                                ssm.d_conv,
+                                p.rms_norm_eps,
+                                &self.stream,
+                            )?;
+                        }
+                        if self.delta_state_layout() == DeltaStateLayout::ValueKey {
+                            self.kernels.deltanet_value_key_scan_persistent_f16(
+                                &arena.o,
+                                &state.state,
+                                &arena.qc,
+                                &arena.gatec,
+                                &arena.gated,
+                                &arena.g,
+                                &arena.beta,
+                                t,
+                                ssm.n_v_heads(),
+                                &self.stream,
+                            )?;
+                        } else if persistent_scan {
+                            self.kernels.deltanet_gated_scan_persistent_d128_f16(
+                                &arena.o,
+                                &state.state,
+                                &arena.qc,
+                                &arena.gatec,
+                                &arena.gated,
+                                &arena.g,
+                                &arena.beta,
+                                t,
+                                ssm.n_v_heads(),
+                                &self.stream,
+                            )?;
+                        } else {
+                            for token_offset in (0..t).step_by(128) {
+                                self.kernels.deltanet_gated_scan_inplace_f16_at(
+                                    &arena.o,
+                                    &state.state,
+                                    &arena.qc,
+                                    &arena.gatec,
+                                    &arena.gated,
+                                    &arena.g,
+                                    &arena.beta,
+                                    token_offset,
+                                    (t - token_offset).min(128),
+                                    ssm.n_v_heads(),
+                                    ssm.d_state,
+                                    &self.stream,
+                                )?;
+                            }
+                        }
+                        self.device.copy(
+                            &arena.conv_final,
+                            0,
+                            &state.conv,
+                            0,
+                            state.conv.len(),
+                            &self.stream,
+                        )?;
+                        self.kernels.deltanet_gated_rmsnorm_f16(
+                            &arena.o,
+                            &arena.o,
+                            &arena.z,
+                            &delta.ssm_norm,
+                            t * ssm.n_v_heads(),
+                            ssm.d_state,
+                            p.rms_norm_eps,
+                            &self.stream,
+                        )?;
+                        self.gemm(&arena.mixer_out, &delta.out_proj, &arena.o, t, &self.stream)?;
+                    }
+                }
+                self.kernels.rmsnorm_residual_f16(
+                    &arena.x,
+                    &arena.h,
+                    &arena.mixer_out,
+                    &layer.ffn_norm,
+                    t,
+                    p.hidden_size,
+                    p.rms_norm_eps,
+                    &self.stream,
+                )?;
+                let LayerFfn::Dense(ffn) = &layer.ffn else {
+                    return Err(ForgeError::Unsupported(
+                        "layer-major nie obsługuje targetu MoE".into(),
+                    ));
+                };
+                match &ffn.gate_up {
+                    GateUpWeights::Fused(weight) => {
+                        self.gemm_rows(
+                            &arena.gate,
+                            weight,
+                            &arena.x,
+                            t,
+                            0,
+                            p.intermediate_size,
+                            &self.stream,
+                        )?;
+                        self.gemm_rows(
+                            &arena.up,
+                            weight,
+                            &arena.x,
+                            t,
+                            p.intermediate_size,
+                            p.intermediate_size,
+                            &self.stream,
+                        )?;
+                    }
+                    GateUpWeights::Split { gate, up } => {
+                        self.gemm(&arena.gate, gate, &arena.x, t, &self.stream)?;
+                        self.gemm(&arena.up, up, &arena.x, t, &self.stream)?;
+                    }
+                }
+                self.kernels.silu_mul_f16(
+                    &arena.gate,
+                    &arena.gate,
+                    &arena.up,
+                    t * p.intermediate_size,
+                    &self.stream,
+                )?;
+                self.gemm(&arena.mixer_out, &ffn.down, &arena.gate, t, &self.stream)?;
+                let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                    &self.weights.layers[layer_index + 1].attn_norm
+                } else {
+                    &self.weights.output_norm
+                };
+                self.kernels.rmsnorm_residual_f16(
+                    &arena.x,
+                    &arena.h,
+                    &arena.mixer_out,
+                    next_norm,
+                    t,
+                    p.hidden_size,
+                    p.rms_norm_eps,
+                    &self.stream,
+                )?;
+                if fail_after_layer == Some(layer_index) {
+                    return Err(ForgeError::Scheduler(format!(
+                        "wymuszony błąd layer-major po warstwie {layer_index}"
+                    )));
+                }
+            }
+            self.device.copy(
+                &arena.x,
+                (t - 1) * hidden_bytes,
+                &self.bufs.x,
+                0,
+                hidden_bytes,
+                &self.stream,
+            )?;
+            self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+            self.device.copy(
+                &self.bufs.logits,
+                0,
+                &self.bufs.pinned_logits,
+                0,
+                p.vocab_size * 4,
+                &self.stream,
+            )?;
+            self.profile_target_end()?;
+            self.profile_catchup_start()?;
+            self.mtp_catchup_layer_major_prefix(
+                seq,
+                tokens,
+                &arena.x,
+                fail_mtp_catchup,
+                fail_after_mtp_commit,
+            )?;
+            let logits =
+                self.bufs
+                    .pinned_logits
+                    .host_ptr()
+                    .expect("pinned logits mają mapowanie hosta") as *const f32;
+            Ok(unsafe { std::slice::from_raw_parts(logits, p.vocab_size) }.to_vec())
+        })();
+        if let Err(error) = result {
+            return match self.rollback_hybrid_layer_major(seq, &checkpoint) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(self
+                    .hybrid_states
+                    .as_mut()
+                    .expect("model hybrydowy ma pulę stanów")
+                    .poison(format!(
+                        "błąd layer-major: {error}; rollback nie powiódł się: {rollback}"
+                    ))),
+            };
+        }
+        result
+    }
+
     fn prefill_hybrid_batched(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(ForgeError::Scheduler("empty prefill chunk".into()));
@@ -12564,16 +15387,17 @@ impl Model {
                 self.pt_seq = seq.id;
 
                 let ids: Vec<i32> = chunk.iter().map(|&id| id as i32).collect();
-                let positions: Vec<i32> = (base..base + t).map(|position| position as i32).collect();
+                let positions: Vec<i32> =
+                    (base..base + t).map(|position| position as i32).collect();
                 let visible_lens: Vec<i32> = (base + 1..=base + t).map(|len| len as i32).collect();
-                let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+                let pb = self
+                    .prefill_bufs
+                    .as_ref()
+                    .expect("bufory prefill są gotowe");
                 let hv = self
                     .hybrid_verify_bufs
                     .as_ref()
                     .expect("bufory hybrydowego prefill są gotowe");
-                let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
-                    ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
-                })?;
                 let staging_slot = chunk_index % HYBRID_HOST_STAGING_SLOTS;
                 let host_staging = &hv.host_staging[staging_slot];
                 let staging_ready = host_staging.ready.clone();
@@ -12589,6 +15413,9 @@ impl Model {
                 )?;
                 write_pinned(&(base as i32).to_le_bytes(), &host_staging.base_pos)?;
                 write_pinned(&(t as i32).to_le_bytes(), &host_staging.accepted)?;
+                let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+                    ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
+                })?;
                 let staging_buffer = &host_staging.embedding;
                 let staging = staging_buffer
                     .host_ptr()
@@ -12646,7 +15473,10 @@ impl Model {
 
                 self.profile_target_start()?;
                 self.run_hybrid_batch_layers(t, true)?;
-                let pb = self.prefill_bufs.as_ref().expect("bufory prefill są gotowe");
+                let pb = self
+                    .prefill_bufs
+                    .as_ref()
+                    .expect("bufory prefill są gotowe");
                 self.device.copy(
                     &pb.x,
                     (t - 1) * hidden_bytes,
@@ -12681,9 +15511,8 @@ impl Model {
                 .pinned_logits
                 .host_ptr()
                 .expect("pinned buffer has host mapping") as *const f32;
-            last_logits.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(logits, p.vocab_size)
-            });
+            last_logits
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(logits, p.vocab_size) });
             Ok(last_logits)
         })();
         if result.is_err() {
@@ -13029,12 +15858,14 @@ impl Model {
                 output_scale,
                 rows,
                 cols,
-            } if n_tokens == 2 => self.kernels.gemm_nvfp4_gguf_out_f32_b2(
+                layout: Nvfp4GgufLayout::RowMajor36,
+            } if matches!(n_tokens, 2 | 4 | 8 | 16) => self.kernels.gemm_nvfp4_gguf_out_f32_batch(
                 y_f32,
                 buf,
                 x,
                 *rows,
                 *cols,
+                n_tokens,
                 *output_scale,
                 stream,
             ),
@@ -13062,6 +15893,9 @@ impl Model {
         if self.batch_bufs.as_ref().is_some_and(|b| b.cap >= cap) {
             return Ok(());
         }
+        let nvfp4_ct_bm16_plan =
+            nvfp4_ct_bm16_buffer_plan(cap, self.nvfp4_ct_bm16_model_capable());
+        let matrix_cap = nvfp4_ct_bm16_plan.map_or(cap, |plan| plan.matrix_cap);
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
         let q_dim = p.n_heads * p.head_dim;
@@ -13076,19 +15910,19 @@ impl Model {
         let pin = |bytes: usize| dev.alloc(bytes, MemKind::PinnedHost, Pool::Activations);
         self.batch_bufs = Some(BatchBufs {
             cap,
-            h: f16(cap * hidden)?,
-            x: f16(cap * hidden)?,
-            q: f16(cap * q_dim)?,
-            k: f16(cap * kv_dim)?,
-            v: f16(cap * kv_dim)?,
-            attn_parts: f32b(cap * p.n_heads * ATTN_DECODE_SPLITS * (p.head_dim + 2))?,
-            attn_out: f16(cap * q_dim)?,
-            o_out: f16(cap * hidden)?,
-            gate: f16(cap * inter)?,
-            up: f16(cap * inter)?,
-            act: f16(cap * inter)?,
-            down: f16(cap * hidden)?,
-            logits: f32b(cap * vocab)?,
+            h: f16(matrix_cap * hidden)?,
+            x: f16(matrix_cap * hidden)?,
+            q: f16(matrix_cap * q_dim)?,
+            k: f16(matrix_cap * kv_dim)?,
+            v: f16(matrix_cap * kv_dim)?,
+            attn_parts: f32b(matrix_cap * p.n_heads * ATTN_DECODE_SPLITS * (p.head_dim + 2))?,
+            attn_out: f16(matrix_cap * q_dim)?,
+            o_out: f16(matrix_cap * hidden)?,
+            gate: f16(matrix_cap * inter)?,
+            up: f16(matrix_cap * inter)?,
+            act: f16(matrix_cap * inter)?,
+            down: f16(matrix_cap * hidden)?,
+            logits: f32b(matrix_cap * vocab)?,
             ids: f32b(cap)?,
             positions: f32b(cap)?,
             seq_lens: f32b(cap)?,
@@ -13117,6 +15951,15 @@ impl Model {
             pinned_pen_presence: pin(cap * 4)?,
             out_ids: f32b(cap)?,
             pinned_out: pin(cap * 4)?,
+            nvfp4_ct_qkv_m16: nvfp4_ct_bm16_plan
+                .map(|plan| f16(plan.qkv_elems))
+                .transpose()?,
+            nvfp4_ct_gate_up_m16: nvfp4_ct_bm16_plan
+                .map(|plan| f16(plan.gate_up_elems))
+                .transpose()?,
+            nvfp4_ct_workspace: nvfp4_ct_bm16_plan
+                .map(|plan| f32b(plan.workspace_elems))
+                .transpose()?,
         });
         // Fresh scratch invalidates any graph captured against the old buffers.
         self.batch_graphs.clear();
@@ -13328,13 +16171,29 @@ impl Model {
 
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
+            let mut segmented_qkv = false;
             // Raw q/k/v projections (no norm/rope here — attn_decode_split folds
             // the q/k-norm + RoPE + paged append into its per-seq prologue).
             match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w) => {
-                    self.gemm_rows(&bb.q, w, &bb.x, n, 0, q_dim, stream)?;
-                    self.gemm_rows(&bb.k, w, &bb.x, n, q_dim, kv_dim, stream)?;
-                    self.gemm_rows(&bb.v, w, &bb.x, n, q_dim + kv_dim, kv_dim, stream)?;
+                    if let (Some(qkv), Some(workspace)) =
+                        (&bb.nvfp4_ct_qkv_m16, &bb.nvfp4_ct_workspace)
+                    {
+                        segmented_qkv = self.gemm_nvfp4_ct_bm16(
+                            qkv,
+                            workspace,
+                            w,
+                            &bb.x,
+                            n,
+                            Nvfp4CtBm16Projection::Qkv,
+                            stream,
+                        )?;
+                    }
+                    if !segmented_qkv {
+                        self.gemm_rows(&bb.q, w, &bb.x, n, 0, q_dim, stream)?;
+                        self.gemm_rows(&bb.k, w, &bb.x, n, q_dim, kv_dim, stream)?;
+                        self.gemm_rows(&bb.v, w, &bb.x, n, q_dim + kv_dim, kv_dim, stream)?;
+                    }
                 }
                 QkvWeights::FusedQk { qk, v } => {
                     self.gemm_rows(&bb.q, qk, &bb.x, n, 0, q_dim, stream)?;
@@ -13347,15 +16206,32 @@ impl Model {
                     self.gemm(&bb.v, v, &bb.x, n, stream)?;
                 }
             }
+            let (q_input, q_offset, k_input, k_offset, v_input, v_offset) =
+                if segmented_qkv {
+                    let qkv = bb
+                        .nvfp4_ct_qkv_m16
+                        .as_ref()
+                        .expect("segmentowany QKV wymaga bufora M16");
+                    (
+                        qkv,
+                        0,
+                        qkv,
+                        16 * q_dim * 2,
+                        qkv,
+                        16 * (q_dim + kv_dim) * 2,
+                    )
+                } else {
+                    (&bb.q, 0, &bb.k, 0, &bb.v, 0)
+                };
             if resident > 0 {
                 kernels.attn_decode_split(
                     &bb.attn_parts,
-                    &bb.q,
-                    0,
-                    &bb.k,
-                    0,
-                    &bb.v,
-                    0,
+                    q_input,
+                    q_offset,
+                    k_input,
+                    k_offset,
+                    v_input,
+                    v_offset,
                     layer.attn().q_norm.as_ref(),
                     layer.attn().k_norm.as_ref(),
                     &self.kv.k[self.target_kv_layer(l)],
@@ -13405,12 +16281,12 @@ impl Model {
                 tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
                 kernels.attn_decode_split(
                     &db.attn_parts,
-                    &bb.q,
-                    lane * q_dim * 2,
-                    &bb.k,
-                    lane * kv_dim * 2,
-                    &bb.v,
-                    lane * kv_dim * 2,
+                    q_input,
+                    q_offset + lane * q_dim * 2,
+                    k_input,
+                    k_offset + lane * kv_dim * 2,
+                    v_input,
+                    v_offset + lane * kv_dim * 2,
                     layer.attn().q_norm.as_ref(),
                     layer.attn().k_norm.as_ref(),
                     &slot.stage[0],
@@ -13468,7 +16344,21 @@ impl Model {
                     stream,
                 )?;
             }
-            self.gemm(&bb.o_out, &layer.attn().attn_o, &bb.attn_out, n, stream)?;
+            let mut specialized_o = false;
+            if let Some(workspace) = &bb.nvfp4_ct_workspace {
+                specialized_o = self.gemm_nvfp4_ct_bm16(
+                    &bb.o_out,
+                    workspace,
+                    &layer.attn().attn_o,
+                    &bb.attn_out,
+                    n,
+                    Nvfp4CtBm16Projection::Output,
+                    stream,
+                )?;
+            }
+            if !specialized_o {
+                self.gemm(&bb.o_out, &layer.attn().attn_o, &bb.attn_out, n, stream)?;
+            }
             kernels.rmsnorm_residual_f16(
                 &bb.x,
                 &bb.h,
@@ -13480,18 +16370,62 @@ impl Model {
                 stream,
             )?;
 
+            let mut segmented_gate_up = false;
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
-                    self.gemm_rows(&bb.gate, w, &bb.x, n, 0, inter, stream)?;
-                    self.gemm_rows(&bb.up, w, &bb.x, n, inter, inter, stream)?;
+                    if let (Some(gate_up), Some(workspace)) =
+                        (&bb.nvfp4_ct_gate_up_m16, &bb.nvfp4_ct_workspace)
+                    {
+                        segmented_gate_up = self.gemm_nvfp4_ct_bm16(
+                            gate_up,
+                            workspace,
+                            w,
+                            &bb.x,
+                            n,
+                            Nvfp4CtBm16Projection::GateUp,
+                            stream,
+                        )?;
+                    }
+                    if !segmented_gate_up {
+                        self.gemm_rows(&bb.gate, w, &bb.x, n, 0, inter, stream)?;
+                        self.gemm_rows(&bb.up, w, &bb.x, n, inter, inter, stream)?;
+                    }
                 }
                 GateUpWeights::Split { gate, up } => {
                     self.gemm(&bb.gate, gate, &bb.x, n, stream)?;
                     self.gemm(&bb.up, up, &bb.x, n, stream)?;
                 }
             }
-            kernels.silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, stream)?;
-            self.gemm(&bb.down, &layer.dense_ffn()?.down, &bb.act, n, stream)?;
+            if segmented_gate_up {
+                kernels.silu_mul_f16_at(
+                    &bb.act,
+                    bb.nvfp4_ct_gate_up_m16
+                        .as_ref()
+                        .expect("segmentowany GateUp wymaga bufora M16"),
+                    0,
+                    16 * inter * 2,
+                    n * inter,
+                    stream,
+                )?;
+            } else {
+                kernels.silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, stream)?;
+            }
+            let down = &layer.dense_ffn()?.down;
+            let mut specialized_down = false;
+            if let Some(workspace) = &bb.nvfp4_ct_workspace {
+                specialized_down = self.gemm_nvfp4_ct_bm16(
+                    &bb.down,
+                    workspace,
+                    down,
+                    &bb.act,
+                    n,
+                    Nvfp4CtBm16Projection::Down,
+                    stream,
+                )?;
+            }
+            if !specialized_down {
+                self.gemm(&bb.down, down, &bb.act, n, stream)?;
+            }
 
             let next_norm = if l + 1 < n_layers {
                 &self.weights.layers[l + 1].attn_norm
@@ -13529,6 +16463,7 @@ impl Model {
         tokens: &[u32],
         params: &[SeqSampleParams],
     ) -> Result<Vec<u32>> {
+        self.ensure_kv_reuse_healthy()?;
         let b = seqs.len();
         if b == 0 {
             return Ok(Vec::new());
@@ -13577,9 +16512,7 @@ impl Model {
                 )));
             }
         }
-        let growth_pages = self
-            .kv
-            .batch_growth_pages(seqs.iter().map(|seq| &**seq))?;
+        let growth_pages = self.kv.batch_growth_pages(seqs.iter().map(|seq| &**seq))?;
         // Batched growth appends pages without refreshing the single-stream
         // page table; invalidate it so the next single-stream step re-uploads.
         self.pt_seq = 0;
@@ -13756,6 +16689,28 @@ impl Model {
         Ok(out)
     }
 
+    /// Odczytuje pełne logity pozostałe po ostatnim dense batch decode.
+    ///
+    /// Metoda służy do audytu numerycznego. Bez tieringu wiersze zachowują
+    /// kolejność lane'ów przekazaną do `batched_decode`.
+    pub fn read_batch_logits(&self, batch: usize) -> Result<Vec<f32>> {
+        let buffers = self
+            .batch_bufs
+            .as_ref()
+            .ok_or_else(|| ForgeError::Scheduler("brak buforów batch decode".into()))?;
+        if batch == 0 || batch > buffers.cap {
+            return Err(ForgeError::Scheduler(format!(
+                "odczyt logitów wymaga batch 1..={}, otrzymano {batch}",
+                buffers.cap
+            )));
+        }
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let mut logits = vec![0.0f32; batch * vocab];
+        self.device
+            .read(&buffers.logits, 0, bytemuck::cast_slice_mut(&mut logits))?;
+        Ok(logits)
+    }
+
     /// GPU sampling over `b` contiguous live rows of device logits.
     fn batch_sample_from(
         &mut self,
@@ -13768,9 +16723,7 @@ impl Model {
         let stream = &self.stream;
 
         // Jedno uruchomienie kernela obsługuje wszystkie aktywne kary batcha.
-        let any_penalty = params
-            .iter()
-            .any(|p| !p.penalty_ids.is_empty());
+        let any_penalty = params.iter().any(|p| !p.penalty_ids.is_empty());
         if any_penalty {
             let mut ids_flat: Vec<i32> = Vec::new();
             let mut counts_flat: Vec<i32> = Vec::new();
@@ -13938,21 +16891,112 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        apply_mtp_pair_metadata_commit, finish_greedy_verification, hybrid_prefill_profile_spans,
-        hybrid_q_full_cols, logical_kv_regions, native_mtp_b2_device_embedding,
-        native_mtp_greedy_decision, restore_after, rollback_mtp_pair,
-        validate_mtp_pair_metadata_commit, validate_mtp_routed_inputs, ForgeError,
-        HybridStatePool, KvCache, KvConfig, KvQuant, LayerKind, Result, SeqKv,
+        apply_mtp_pair_metadata_commit, fatal_kv_synchronize, finish_greedy_verification,
+        cleanup_after_error,
+        grow_prefill_lanes_transactional, hybrid_layer_major_scratch_estimate,
         hybrid_prefill_activation_budget_capable, hybrid_prefill_chunk_config_for_model,
         hybrid_prefill_inner_chunk_count, hybrid_prefill_nvfp4_chunk_limit,
-        hybrid_prefill_scratch_estimate, hybrid_prefill_step_size,
-        hybrid_prefill_t128_backend_capable, parse_hybrid_prefill_chunk_config,
-        resolve_hybrid_prefill_chunk_size, HybridPrefillChunkConfig,
-        HybridPrefillScratchShape, Vendor,
+        hybrid_prefill_profile_spans, hybrid_prefill_scratch_estimate, hybrid_prefill_step_size,
+        hybrid_prefill_t128_backend_capable, hybrid_q_full_cols,
+        hybrid_verify_attention_parts_bytes, hybrid_verify_dedicated_z_bytes,
+        hybrid_verify_delta_scratch_instances, hybrid_verify_scratch_estimate, logical_kv_regions,
+        native_mtp_b2_device_embedding, native_mtp_greedy_decision,
+        nvfp4_ct_bm16_buffer_plan, nvfp4_ct_bm16_dimensions_capable,
+        nvfp4_ct_bm16_physical_m,
+        nvfp4_ct_bm16_projection_for_shape,
+        parse_hybrid_prefill_chunk_config, resolve_hybrid_prefill_chunk_size, restore_after,
+        restore_prefill_seq_snapshots, rollback_mtp_pair, run_dense_prefill_transaction,
+        settle_kv_operation, validate_mtp_pair_metadata_commit, validate_mtp_routed_inputs,
+        DeltaStateLayout, ForgeError, HybridPrefillChunkConfig, HybridPrefillScratchShape,
+        HybridStatePool, KvCache, KvConfig, KvQuant, KvReusePoison, LayerKind, Model,
+        Nvfp4CtBm16Projection, Nvfp4GgufLayout, Result, SeqKv, Vendor,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
     use std::sync::Arc;
+
+    #[test]
+    fn cleanup_buildera_fp8_zachowuje_pierwotny_blad() {
+        let mut cleanup_called = false;
+        let result: Result<()> = cleanup_after_error(
+            Err(ForgeError::Kernel("pierwotny błąd pakowania".into())),
+            || cleanup_called = true,
+        );
+        assert!(cleanup_called);
+        assert!(matches!(
+            result,
+            Err(ForgeError::Kernel(message)) if message == "pierwotny błąd pakowania"
+        ));
+    }
+
+    #[test]
+    fn bm16_nvfp4_ct_rozpoznaje_tylko_dokladne_ksztalty_bielika() {
+        assert_eq!(
+            nvfp4_ct_bm16_projection_for_shape(6144, 4096),
+            Some(Nvfp4CtBm16Projection::Qkv)
+        );
+        assert_eq!(
+            nvfp4_ct_bm16_projection_for_shape(4096, 4096),
+            Some(Nvfp4CtBm16Projection::Output)
+        );
+        assert_eq!(
+            nvfp4_ct_bm16_projection_for_shape(22528, 4096),
+            Some(Nvfp4CtBm16Projection::GateUp)
+        );
+        assert_eq!(
+            nvfp4_ct_bm16_projection_for_shape(4096, 11264),
+            Some(Nvfp4CtBm16Projection::Down)
+        );
+        for shape in [
+            (6143, 4096),
+            (6144, 4095),
+            (4096, 6144),
+            (11264, 4096),
+            (22528, 4095),
+        ] {
+            assert_eq!(nvfp4_ct_bm16_projection_for_shape(shape.0, shape.1), None);
+        }
+    }
+
+    #[test]
+    fn bm16_nvfp4_ct_wybiera_fizyczne_m16_tylko_dla_m4_m8_m16() {
+        assert_eq!(nvfp4_ct_bm16_physical_m(4), Some(16));
+        assert_eq!(nvfp4_ct_bm16_physical_m(8), Some(16));
+        assert_eq!(nvfp4_ct_bm16_physical_m(16), Some(16));
+        for logical_m in [0, 1, 2, 3, 5, 15, 17, 32] {
+            assert_eq!(nvfp4_ct_bm16_physical_m(logical_m), None);
+        }
+        assert_eq!(nvfp4_ct_bm16_physical_m(4).unwrap() - 4, 12);
+        assert_eq!(nvfp4_ct_bm16_physical_m(8).unwrap() - 8, 8);
+        assert_eq!(nvfp4_ct_bm16_physical_m(16).unwrap() - 16, 0);
+    }
+
+    #[test]
+    fn bm16_nvfp4_ct_wymaga_dokladnego_podzialu_qkv() {
+        assert!(nvfp4_ct_bm16_dimensions_capable(
+            4096, 4096, 1024, 11264
+        ));
+        assert!(!nvfp4_ct_bm16_dimensions_capable(
+            4096, 5120, 512, 11264
+        ));
+        assert!(!nvfp4_ct_bm16_dimensions_capable(
+            4096, 4096, 1024, 14336
+        ));
+    }
+
+    #[test]
+    fn bm16_nvfp4_ct_planuje_stale_bufory_m16() {
+        assert_eq!(nvfp4_ct_bm16_buffer_plan(4, false), None);
+        let plan = nvfp4_ct_bm16_buffer_plan(4, true).unwrap();
+        assert_eq!(plan.matrix_cap, 16);
+        assert_eq!(plan.qkv_elems, 16 * 6144);
+        assert_eq!(plan.gate_up_elems, 16 * 22528);
+        assert_eq!(plan.workspace_elems, 4 * 16 * 6144);
+        assert_eq!(
+            nvfp4_ct_bm16_buffer_plan(32, true).unwrap().matrix_cap,
+            32
+        );
+    }
 
     #[test]
     fn fed_routed_mtp_ponad_i32_konczy_sie_przed_mutacja() {
@@ -13962,22 +17006,32 @@ mod verify_rollback_tests {
             pool.acquire().expect("lane0 powinien powstać"),
             pool.acquire().expect("lane1 powinien powstać"),
         ];
-        let (states, kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+        let (states, kv) = pool
+            .take_mtp_pair(leases)
+            .expect("para powinna być dostępna");
         let lengths = [states[0].seq.len, states[1].seq.len];
         let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
         let free_pages = kv.free_page_count();
-        let result = validate_mtp_routed_inputs(
-            usize::MAX,
-            [u32::MAX, 7],
-            2,
-            [None, None],
-        );
+        let result = validate_mtp_routed_inputs(usize::MAX, [u32::MAX, 7], 2, [None, None]);
         assert!(matches!(result, Err(ForgeError::Format(_))));
         assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
-        assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
+        assert_eq!(
+            [states[0].checkpoint_len(), states[1].checkpoint_len()],
+            checkpoints
+        );
         assert_eq!(kv.free_page_count(), free_pages);
         pool.restore_mtp_pair(leases, states, kv)
             .expect("niezmieniona para powinna wrócić do puli");
+    }
+
+    #[test]
+    fn jawny_tile_nvfp4_nie_ma_cichego_fallbacku() {
+        assert!(!Model::nvfp4_tile_requested(Nvfp4GgufLayout::RowMajor36, false).unwrap());
+        assert!(Model::nvfp4_tile_requested(Nvfp4GgufLayout::TileN128K64, true).unwrap());
+        assert!(Model::nvfp4_tile_requested(Nvfp4GgufLayout::TileN128K64, false).is_err());
+        assert!(Model::validate_nvfp4_tile_repacked(true, 0).is_err());
+        assert!(Model::validate_nvfp4_tile_repacked(true, 1).is_ok());
+        assert!(Model::validate_nvfp4_tile_repacked(false, 0).is_ok());
     }
 
     #[test]
@@ -13987,6 +17041,7 @@ mod verify_rollback_tests {
         let mut pool = HybridStatePool::new(
             device.clone(),
             vec![LayerKind::DeltaNet, LayerKind::Attention],
+            DeltaStateLayout::KeyValue,
             8,
             16,
             None,
@@ -14062,6 +17117,7 @@ mod verify_rollback_tests {
         let mut pool = HybridStatePool::new(
             device,
             vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
             8,
             16,
             Some((mtp_config, 4, 8)),
@@ -14140,6 +17196,7 @@ mod verify_rollback_tests {
         HybridStatePool::new(
             device,
             vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
             8,
             16,
             Some((
@@ -14168,9 +17225,13 @@ mod verify_rollback_tests {
             pool.acquire().expect("lane0 powinien powstać"),
             pool.acquire().expect("lane1 powinien powstać"),
         ];
-        let (mut states, mut kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+        let (mut states, mut kv) = pool
+            .take_mtp_pair(leases)
+            .expect("para powinna być dostępna");
         for state in &mut states {
-            state.checkpoint(&stream).expect("checkpoint powinien powstać");
+            state
+                .checkpoint(&stream)
+                .expect("checkpoint powinien powstać");
             state.grow(&mut kv).expect("krok draftu powinien powstać");
         }
         let lengths = [states[0].seq.len, states[1].seq.len];
@@ -14178,10 +17239,16 @@ mod verify_rollback_tests {
 
         assert!(validate_mtp_pair_metadata_commit(&states, [0, 1]).is_err());
         assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
-        assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
+        assert_eq!(
+            [states[0].checkpoint_len(), states[1].checkpoint_len()],
+            checkpoints
+        );
         assert!(validate_mtp_pair_metadata_commit(&states, [1, 0]).is_err());
         assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
-        assert_eq!([states[0].checkpoint_len(), states[1].checkpoint_len()], checkpoints);
+        assert_eq!(
+            [states[0].checkpoint_len(), states[1].checkpoint_len()],
+            checkpoints
+        );
 
         let targets = validate_mtp_pair_metadata_commit(&states, [1, 1])
             .expect("poprawny commit obu lane'ów powinien się udać");
@@ -14198,7 +17265,9 @@ mod verify_rollback_tests {
             pool.acquire().expect("lane0 powinien powstać"),
             pool.acquire().expect("lane1 powinien powstać"),
         ];
-        let (states, kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+        let (states, kv) = pool
+            .take_mtp_pair(leases)
+            .expect("para powinna być dostępna");
 
         assert!(pool
             .restore_mtp_pair([leases[0], leases[0]], states, kv)
@@ -14220,9 +17289,13 @@ mod verify_rollback_tests {
                 pool.acquire().expect("lane0 powinien powstać"),
                 pool.acquire().expect("lane1 powinien powstać"),
             ];
-            let (mut states, mut kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+            let (mut states, mut kv) = pool
+                .take_mtp_pair(leases)
+                .expect("para powinna być dostępna");
             for state in &mut states {
-                state.checkpoint(&stream).expect("checkpoint powinien powstać");
+                state
+                    .checkpoint(&stream)
+                    .expect("checkpoint powinien powstać");
                 state.grow(&mut kv).expect("krok draftu powinien powstać");
             }
             states[failed_lane].inject_rollback_failure();
@@ -14249,7 +17322,9 @@ mod verify_rollback_tests {
                 pool.acquire().expect("lane0 powinien powstać"),
                 pool.acquire().expect("lane1 powinien powstać"),
             ];
-            let (mut states, mut kv) = pool.take_mtp_pair(leases).expect("para powinna być dostępna");
+            let (mut states, mut kv) = pool
+                .take_mtp_pair(leases)
+                .expect("para powinna być dostępna");
             states[failed_lane].inject_checkpoint_failure();
 
             let propose = (|| {
@@ -14275,8 +17350,15 @@ mod verify_rollback_tests {
     fn blad_eventu_z_udanym_sync_nie_powoduje_wzrostu_puli() {
         let device: Arc<dyn Device> = CpuDevice::new();
         let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16, None)
-            .expect("pula powinna powstać");
+        let mut pool = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            None,
+        )
+        .expect("pula powinna powstać");
 
         for _ in 0..64 {
             let lease = pool.acquire().expect("slot powinien wrócić do puli");
@@ -14317,8 +17399,15 @@ mod verify_rollback_tests {
     fn podwojny_blad_zwolnienia_zatruwa_pule_i_blokuje_alokacje() {
         let device: Arc<dyn Device> = CpuDevice::new();
         let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = HybridStatePool::new(device, vec![LayerKind::DeltaNet], 8, 16, None)
-            .expect("pula powinna powstać");
+        let mut pool = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            None,
+        )
+        .expect("pula powinna powstać");
         let lease = pool.acquire().expect("lease powinien powstać");
         pool.activate(lease, &stream)
             .expect("slot powinien się aktywować");
@@ -14389,6 +17478,253 @@ mod verify_rollback_tests {
         assert_eq!(seq.pages.len(), base_pages);
         assert_eq!(kv.free_page_count(), base_free_pages);
         assert_eq!(page_table_seq, 0);
+    }
+
+    #[test]
+    fn batch_prefill_nie_zostawia_czesciowego_kv_po_bledzie_wzrostu() {
+        let device = CpuDevice::new();
+        let mut kv = KvCache::new(
+            device.as_ref(),
+            KvConfig {
+                n_layers: 1,
+                n_kv_heads: 1,
+                head_dim: 8,
+                page_size: 4,
+                n_pages: 1,
+                max_pages_per_seq: 1,
+                quant: KvQuant::F16,
+            },
+        )
+        .expect("cache KV powinien powstać");
+        let mut first = kv.new_seq();
+        let mut second = kv.new_seq();
+        let free_before = kv.free_page_count();
+        let result = grow_prefill_lanes_transactional(&mut kv, &mut [&mut first, &mut second], 1);
+
+        assert!(result.is_err());
+        assert_eq!(first.len, 0);
+        assert_eq!(second.len, 0);
+        assert!(first.pages.is_empty());
+        assert!(second.pages.is_empty());
+        assert_eq!(kv.free_page_count(), free_before);
+    }
+
+    #[test]
+    fn transakcja_publicznego_prefill_przywraca_kv_i_metadane_po_bledzie() {
+        struct TestContext {
+            device: Arc<dyn Device>,
+            kv: KvCache,
+        }
+
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut context = TestContext {
+            kv: KvCache::new(
+                device.as_ref(),
+                KvConfig {
+                    n_layers: 1,
+                    n_kv_heads: 1,
+                    head_dim: 8,
+                    page_size: 1,
+                    n_pages: 4,
+                    max_pages_per_seq: 4,
+                    quant: KvQuant::F16,
+                },
+            )
+            .expect("cache KV powinien powstać"),
+            device,
+        };
+        let mut first = context.kv.new_seq();
+        let mut second = context.kv.new_seq();
+        for (seq, token) in [(&mut first, 11), (&mut second, 22)] {
+            context.kv.grow(seq).expect("bazowy wzrost KV");
+            seq.tokens.push(token);
+            seq.prefilled_len = 1;
+        }
+        let pages_before = [first.pages.clone(), second.pages.clone()];
+        let free_before = context.kv.free_page_count();
+        let result: Result<()> = run_dense_prefill_transaction(
+            &mut context,
+            &mut [&mut first, &mut second],
+            |context, seqs| {
+                grow_prefill_lanes_transactional(&mut context.kv, seqs, 1)?;
+                for (seq, token) in seqs.iter_mut().zip([33, 44]) {
+                    seq.tokens.push(token);
+                    seq.prefilled_len += 1;
+                }
+                Err(ForgeError::Kernel(
+                    "wstrzyknięty błąd po wzroście KV".into(),
+                ))
+            },
+            |context| context.device.synchronize(),
+            |context, seqs, snapshots| {
+                restore_prefill_seq_snapshots(&mut context.kv, seqs, snapshots);
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!([first.len, second.len], [1, 1]);
+        assert_eq!([first.pages.clone(), second.pages.clone()], pages_before);
+        assert_eq!(context.kv.free_page_count(), free_before);
+        assert_eq!(first.tokens, [11]);
+        assert_eq!(second.tokens, [22]);
+        assert_eq!([first.prefilled_len, second.prefilled_len], [1, 1]);
+    }
+
+    #[test]
+    fn transakcja_prefill_nie_zwalnia_stron_po_bledzie_synchronizacji() {
+        struct TestContext {
+            kv: KvCache,
+            restore_called: bool,
+            poison: KvReusePoison,
+        }
+
+        let device = CpuDevice::new();
+        let mut context = TestContext {
+            kv: KvCache::new(
+                device.as_ref(),
+                KvConfig {
+                    n_layers: 1,
+                    n_kv_heads: 1,
+                    head_dim: 8,
+                    page_size: 1,
+                    n_pages: 1,
+                    max_pages_per_seq: 1,
+                    quant: KvQuant::F16,
+                },
+            )
+            .expect("cache KV powinien powstać"),
+            restore_called: false,
+            poison: KvReusePoison::default(),
+        };
+        let mut seq = context.kv.new_seq();
+        let result: Result<()> = run_dense_prefill_transaction(
+            &mut context,
+            &mut [&mut seq],
+            |context, seqs| {
+                context.kv.grow(seqs[0])?;
+                Err(ForgeError::Kernel("pierwotny błąd kernela".into()))
+            },
+            |context| {
+                fatal_kv_synchronize(&mut context.poison, "rollback dense prefill", || {
+                    Err(ForgeError::Device("błąd synchronizacji".into()))
+                })
+            },
+            |context, seqs, snapshots| {
+                context.restore_called = true;
+                restore_prefill_seq_snapshots(&mut context.kv, seqs, snapshots);
+            },
+        );
+
+        let message = result
+            .expect_err("transakcja powinna zwrócić błąd")
+            .to_string();
+        assert!(message.contains("pierwotny błąd kernela"));
+        assert!(message.contains("błąd synchronizacji"));
+        assert!(!context.restore_called);
+        assert!(context.poison.ensure_healthy().is_err());
+        assert_eq!(seq.len, 1);
+        assert_eq!(seq.pages.len(), 1);
+        assert_eq!(context.kv.free_page_count(), 0);
+        if !context.poison.is_poisoned() {
+            context.kv.release(&mut seq);
+        }
+        assert_eq!(seq.pages.len(), 1);
+        assert_eq!(context.kv.free_page_count(), 0);
+    }
+
+    #[test]
+    fn finalny_sampling_prefill_zatruwa_reuse_przed_cleanupem() {
+        let device = CpuDevice::new();
+        let mut kv = KvCache::new(
+            device.as_ref(),
+            KvConfig {
+                n_layers: 1,
+                n_kv_heads: 1,
+                head_dim: 8,
+                page_size: 1,
+                n_pages: 1,
+                max_pages_per_seq: 1,
+                quant: KvQuant::F16,
+            },
+        )
+        .expect("cache KV powinien powstać");
+        let mut seq = kv.new_seq();
+        kv.grow(&mut seq).expect("strona KV powinna powstać");
+        let mut poison = KvReusePoison::default();
+
+        let result: Result<()> = settle_kv_operation(
+            Err(ForgeError::Kernel(
+                "wstrzyknięty błąd launch samplera".into(),
+            )),
+            "sampling finalnego dense prefill",
+            || {
+                fatal_kv_synchronize(&mut poison, "sampling finalnego dense prefill", || {
+                    Err(ForgeError::Device("wstrzyknięty błąd D2H sync".into()))
+                })
+            },
+        );
+
+        let message = result
+            .expect_err("operacja i sync powinny zawieść")
+            .to_string();
+        assert!(message.contains("wstrzyknięty błąd launch samplera"));
+        assert!(message.contains("wstrzyknięty błąd D2H sync"));
+        assert!(poison
+            .reason()
+            .is_some_and(|reason| reason.contains("sampling finalnego dense prefill")));
+        if !poison.is_poisoned() {
+            kv.release(&mut seq);
+        }
+        assert_eq!(seq.pages.len(), 1);
+        assert_eq!(kv.free_page_count(), 0);
+
+        let synchronize_called = std::cell::Cell::new(false);
+        let retry = fatal_kv_synchronize(&mut poison, "kolejny prefill", || {
+            synchronize_called.set(true);
+            Ok(())
+        });
+        assert!(retry.is_err());
+        assert!(!synchronize_called.get());
+    }
+
+    #[test]
+    fn blad_operacji_prefill_po_udanym_settle_pozwala_zwolnic_kv() {
+        let device = CpuDevice::new();
+        let mut kv = KvCache::new(
+            device.as_ref(),
+            KvConfig {
+                n_layers: 1,
+                n_kv_heads: 1,
+                head_dim: 8,
+                page_size: 1,
+                n_pages: 1,
+                max_pages_per_seq: 1,
+                quant: KvQuant::F16,
+            },
+        )
+        .expect("cache KV powinien powstać");
+        let mut seq = kv.new_seq();
+        kv.grow(&mut seq).expect("strona KV powinna powstać");
+        let mut poison = KvReusePoison::default();
+
+        let result: Result<()> = settle_kv_operation(
+            Err(ForgeError::Kernel(
+                "wstrzyknięty błąd launch samplera".into(),
+            )),
+            "sampling finalnego dense prefill",
+            || fatal_kv_synchronize(&mut poison, "sampling finalnego dense prefill", || Ok(())),
+        );
+
+        let message = result
+            .expect_err("błąd operacji powinien zostać zachowany")
+            .to_string();
+        assert!(message.contains("wstrzyknięty błąd launch samplera"));
+        assert!(!poison.is_poisoned());
+        if !poison.is_poisoned() {
+            kv.release(&mut seq);
+        }
+        assert!(seq.pages.is_empty());
+        assert_eq!(kv.free_page_count(), 1);
     }
 
     #[test]
@@ -14691,9 +18027,23 @@ mod verify_rollback_tests {
             n_v_heads: 16,
             d_state: 128,
             d_conv: 4,
-            delta_layers: 12,
+            delta_layers: 48,
             max_pages_per_seq: 256,
         }
+    }
+
+    #[test]
+    fn scratch_atencji_verifiera_nie_rosnie_powyzej_t4() {
+        let expected = 4 * 24 * 8 * 260 * 4;
+        assert_eq!(
+            hybrid_verify_attention_parts_bytes(4, 24, 256).unwrap(),
+            expected
+        );
+        assert_eq!(
+            hybrid_verify_attention_parts_bytes(128, 24, 256).unwrap(),
+            expected
+        );
+        assert!(hybrid_verify_attention_parts_bytes(4, usize::MAX, 256).is_err());
     }
 
     #[test]
@@ -14704,6 +18054,48 @@ mod verify_rollback_tests {
         assert!(t128.pinned_bytes > t16.pinned_bytes);
         assert!(t128.device_bytes > 64 * 1024 * 1024);
         assert!(t128.pinned_bytes > 3 * 128 * 5120 * 2);
+    }
+
+    #[test]
+    fn arena_layer_major_ma_staly_scratch_conv_i_limit_p4096() {
+        let shape = testowy_ksztalt_scratchu();
+        let p2048 = hybrid_layer_major_scratch_estimate(shape, 2048).unwrap();
+        let p4096 = hybrid_layer_major_scratch_estimate(shape, 4096).unwrap();
+        assert!(p2048 > 240 * 1024 * 1024);
+        assert!(p2048 < 300 * 1024 * 1024);
+        assert!(p4096 > 500 * 1024 * 1024);
+        assert!(p4096 < 600 * 1024 * 1024);
+        assert!(p4096 < p2048 * 2);
+        assert!(hybrid_layer_major_scratch_estimate(shape, 0).is_err());
+        assert!(hybrid_layer_major_scratch_estimate(shape, 4097).is_err());
+    }
+
+    #[test]
+    fn cap128_wspoldzieli_scratch_conv_miedzy_warstwami() {
+        assert_eq!(hybrid_verify_delta_scratch_instances(4, 48), 48);
+        assert_eq!(hybrid_verify_delta_scratch_instances(128, 48), 1);
+        assert_eq!(hybrid_verify_delta_scratch_instances(128, 0), 0);
+
+        let estimate = hybrid_verify_scratch_estimate(testowy_ksztalt_scratchu(), 128).unwrap();
+        let total = estimate.device_bytes + estimate.pinned_bytes;
+        assert!(
+            total >= 16 * 1024 * 1024,
+            "scratch cap128 ma {total} bajtów"
+        );
+        assert!(
+            total <= 20 * 1024 * 1024,
+            "scratch cap128 ma {total} bajtów"
+        );
+    }
+
+    #[test]
+    fn cap128_budzetuje_osobny_bufor_z() {
+        let shape = testowy_ksztalt_scratchu();
+        assert_eq!(hybrid_verify_dedicated_z_bytes(shape, 4).unwrap(), 0);
+        assert_eq!(
+            hybrid_verify_dedicated_z_bytes(shape, 128).unwrap(),
+            128 * shape.value_dim * 2
+        );
     }
 
     #[test]

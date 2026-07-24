@@ -38,9 +38,7 @@ impl GrammarVocab {
         if self.eos.contains(&id) {
             return None;
         }
-        self.token_bytes
-            .get(id as usize)
-            .and_then(|o| o.as_deref())
+        self.token_bytes.get(id as usize).and_then(|o| o.as_deref())
     }
 
     pub fn is_eos(&self, id: u32) -> bool {

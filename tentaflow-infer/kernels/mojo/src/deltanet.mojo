@@ -10,7 +10,7 @@ from std.gpu import block_dim, block_idx, thread_idx, grid_dim
 from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
-from std.math import rsqrt, exp, log
+from std.math import rsqrt, exp, log, fma
 from src.reduce import block_reduce_sum
 
 
@@ -133,8 +133,7 @@ def deltanet_gated_step_f16(
     var kv: Float32 = 0.0
     for i in range(d_state):
         idx = sbase + i * d_state + j
-        s = state_io[idx] * decay
-        state_io[idx] = s
+        s = fma(state_io[idx], decay, 0.0)
         kv += sk[i] * s
     dj = beta * (Float32(v_in[hbase + j]) - kv)
 
@@ -142,7 +141,8 @@ def deltanet_gated_step_f16(
     var o: Float32 = 0.0
     for i in range(d_state):
         idx = sbase + i * d_state + j
-        s = state_io[idx] + sk[i] * dj
+        decayed = fma(state_io[idx], decay, 0.0)
+        s = decayed + sk[i] * dj
         state_io[idx] = s
         o += sq[i] * s
     out_ptr[hbase + j] = Float16(o * inv_sqrt)

@@ -6,8 +6,8 @@
 // K/V for every decoder layer are precomputed here so the decode loop only
 // runs per-token work.
 
-use half::f16;
 use forge_types::Result;
+use half::f16;
 
 use crate::WhisperModel;
 
@@ -68,8 +68,7 @@ impl WhisperModel {
         let mut h = vec![f16::ZERO; t_enc * d];
         for c in 0..d {
             for t in 0..t_enc {
-                h[t * d + c] =
-                    f16::from_f32(conv[c * t_enc + t].to_f32() + pos[t * d + c]);
+                h[t * d + c] = f16::from_f32(conv[c * t_enc + t].to_f32() + pos[t * d + c]);
             }
         }
         self.device.write(bytemuck::cast_slice(&h), &s.enc_h, 0)?;
@@ -97,8 +96,8 @@ impl WhisperModel {
                 k.gemv_f16_bias_at(&s.v, off, &a.v_w, &s.enc_x, off, &a.v_b, d, d, stream)?;
             }
             k.attn_full_f16(
-                &s.attn, &s.q, &s.k, &s.v, t_enc, heads, heads, head_dim, t_enc, false, 0,
-                scale, stream,
+                &s.attn, &s.q, &s.k, &s.v, t_enc, heads, heads, head_dim, t_enc, false, 0, scale,
+                stream,
             )?;
             for t in 0..t_enc {
                 let off = t * row;
@@ -170,7 +169,16 @@ impl WhisperModel {
             let ca = &layer.cross_attn;
             for t in 0..t_enc {
                 let off = t * row;
-                k.gemv_f16_at(&s.cross_k[l], off, &ca.k_w, &s.enc_states, off, d, d, stream)?;
+                k.gemv_f16_at(
+                    &s.cross_k[l],
+                    off,
+                    &ca.k_w,
+                    &s.enc_states,
+                    off,
+                    d,
+                    d,
+                    stream,
+                )?;
                 k.gemv_f16_bias_at(
                     &s.cross_v[l],
                     off,

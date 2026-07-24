@@ -1244,10 +1244,7 @@ mod tests {
             }
             if dedicated_mtp_io {
                 tensors.push(tensor("blk.2.nextn.embed_tokens.weight", vec![64, 32]));
-                tensors.push(tensor(
-                    "blk.2.nextn.shared_head_head.weight",
-                    vec![64, 32],
-                ));
+                tensors.push(tensor("blk.2.nextn.shared_head_head.weight", vec![64, 32]));
             }
         }
         write_synthetic_gguf(metadata, tensors)

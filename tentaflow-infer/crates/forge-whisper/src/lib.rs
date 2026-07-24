@@ -104,8 +104,7 @@ impl WhisperModel {
         let ffn = cfg.encoder_ffn_dim.max(cfg.decoder_ffn_dim);
         let n_dec = cfg.decoder_layers;
 
-        let f16buf =
-            |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Weights);
+        let f16buf = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Weights);
         let per_layer = |elems: usize| -> Result<Vec<DevBuffer>> {
             (0..n_dec).map(|_| f16buf(elems)).collect()
         };
@@ -185,7 +184,11 @@ impl WhisperModel {
 
     /// Transcribe 16 kHz mono samples. v0: a single 30 s window — longer
     /// input is truncated by the mel frontend.
-    pub fn transcribe(&mut self, samples_16k_mono: &[f32], language: Option<&str>) -> Result<String> {
+    pub fn transcribe(
+        &mut self,
+        samples_16k_mono: &[f32],
+        language: Option<&str>,
+    ) -> Result<String> {
         if samples_16k_mono.is_empty() {
             return Err(ForgeError::Format("whisper: empty audio".into()));
         }
@@ -198,15 +201,12 @@ impl WhisperModel {
             ],
             None => {
                 if let Some(lang) = language {
-                    tracing::warn!(
-                        "whisper: language {lang:?} ignored — English-only checkpoint"
-                    );
+                    tracing::warn!("whisper: language {lang:?} ignored — English-only checkpoint");
                 }
                 vec![self.sot, self.no_timestamps]
             }
         };
-        let features =
-            mel::log_mel_spectrogram(samples_16k_mono, self.weights.config.num_mel_bins);
+        let features = mel::log_mel_spectrogram(samples_16k_mono, self.weights.config.num_mel_bins);
         self.encode(&features)?;
 
         let tokens = self.greedy_decode(&prompt)?;
@@ -214,4 +214,3 @@ impl WhisperModel {
         Ok(text.trim().to_string())
     }
 }
-

@@ -67,8 +67,12 @@ fn h2d_d2h_roundtrip_async() {
     let stream = dev.create_stream().unwrap();
     let n = 4096usize;
 
-    let staging_in = dev.alloc(n, MemKind::PinnedHost, Pool::Activations).unwrap();
-    let staging_out = dev.alloc(n, MemKind::PinnedHost, Pool::Activations).unwrap();
+    let staging_in = dev
+        .alloc(n, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
+    let staging_out = dev
+        .alloc(n, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
     let device_a = dev.alloc(n, MemKind::Device, Pool::KvCache).unwrap();
     let device_b = dev.alloc(n, MemKind::Device, Pool::KvCache).unwrap();
 
@@ -137,8 +141,13 @@ fn event_ordering_across_streams() {
     // Correct ordering yields 5.0; a race could observe 4.0 (add-then-scale).
     let event = dev.create_event().unwrap();
     let cfg = LaunchConfig::linear(n, 128);
-    dev.launch(&scale2, &cfg, &LaunchArgs::new().buf(&x).scalar(n), &producer)
-        .unwrap();
+    dev.launch(
+        &scale2,
+        &cfg,
+        &LaunchArgs::new().buf(&x).scalar(n),
+        &producer,
+    )
+    .unwrap();
     dev.record_event(&event, &producer).unwrap();
     dev.wait_event(&consumer, &event).unwrap();
     dev.launch(&add3, &cfg, &LaunchArgs::new().buf(&x).scalar(n), &consumer)
@@ -148,7 +157,10 @@ fn event_ordering_across_streams() {
     assert!(event.is_complete().unwrap());
     event.synchronize().unwrap();
     let result = read_f32(&dev, &x, n as usize);
-    assert!(result.iter().all(|&v| v == 5.0), "ordering violated: {result:?}");
+    assert!(
+        result.iter().all(|&v| v == 5.0),
+        "ordering violated: {result:?}"
+    );
 }
 
 #[test]
@@ -277,7 +289,9 @@ fn graph_survives_handle_drop_during_replay() {
     stream.synchronize().unwrap();
 
     let expected = 2.0f32.powi(64);
-    assert!(read_f32(&dev, &x, n as usize).iter().all(|&v| v == expected));
+    assert!(read_f32(&dev, &x, n as usize)
+        .iter()
+        .all(|&v| v == expected));
     // Device-level synchronize prunes the pending-launch retention list.
     dev.synchronize().unwrap();
 }

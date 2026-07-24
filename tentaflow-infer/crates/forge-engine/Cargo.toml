@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-hooks = []
+
 [dependencies]
 forge-types.workspace = true
 forge-hal.workspace = true

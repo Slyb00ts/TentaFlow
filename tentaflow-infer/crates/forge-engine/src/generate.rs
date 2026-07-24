@@ -5,8 +5,8 @@ use forge_types::{ForgeError, Result};
 
 use crate::model::Model;
 use crate::sample::{
-    apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
-    TokenLogprob, apply_penalties,
+    apply_logit_bias, apply_penalties, compute_logprob, suppress_eos, GpuSampler, Sampler,
+    SamplingParams, TokenLogprob,
 };
 
 #[derive(Default)]

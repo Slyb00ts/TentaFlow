@@ -98,15 +98,62 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "attn_decode_f16_hd64",
     "attn_decode_f16_hd128",
     "attn_decode_f16_hd256",
+    "attn_decode_split8_f16_hd256",
+    "attn_decode_split8_combine_f16_hd256",
+    "attn_verify_split8_f16_hd256_t3",
+    "attn_verify_split8_f16_hd256_t4",
+    "attn_verify_split8_combine_f16_hd256",
     "deltanet_conv_silu_f16",
     "l2norm_heads_f16",
     "deltanet_gated_step_f16",
+    "deltanet_value_key_commit_recompute_f32",
+    "deltanet_value_key_scan_checkpoints_f16",
+    "deltanet_value_key_scan_inplace_f16",
+    "deltanet_value_key_scan_persistent_f16",
     "deltanet_prepare_t2_f16",
     "deltanet_prepare_t3_f16",
     "deltanet_prepare_t4_f16",
     "deltanet_prepare_dynamic_f16",
     "deltanet_prepare_segmented_f16",
     "deltanet_prepare_segmented_final_f16",
+    "deltanet_prepare_tiled_d128_c4_f16",
+    "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1",
+    "gemm_nvfp4_gguf_mma_f16_bm128_bn128",
+    "nvfp4_repack_tile128",
+    "gemv_nvfp4_tile128_coop_q8_1_f16",
+    "gemm_nvfp4_tile128_mma_f16_bm128_bn64",
+    "gemm_nvfp4_tile128_mma_f16_bm128_bn128",
+    "repack_nvfp4_ct_s0_n64k128_into",
+    "gemv_nvfp4_ct_s0_n64k128_f16",
+    "gemv_batch_nvfp4_ct_s0_n64k128_f16_b4",
+    "gemv_batch_nvfp4_ct_s0_n64k128_f16_b8",
+    "gemv_batch_nvfp4_ct_s0_n64k128_f16_b16",
+    "gemm_nvfp4_ct_s0_f16_bm64",
+    "gemm_nvfp4_ct_s0_f16_bm128",
+    "gemv_norm_nvfp4_ct_s0_f16",
+    "gemv_norm_silu_nvfp4_ct_s0_f16",
+    "gemv_residual_nvfp4_ct_s0_f16",
+    "pack_nvfp4_ct_s0_fp8",
+    "gemm_nvfp4_ct_bm16_qkv_m4",
+    "gemm_nvfp4_ct_bm16_qkv_m8",
+    "gemm_nvfp4_ct_bm16_qkv_m16",
+    "gemm_nvfp4_ct_bm16_o_m4",
+    "gemm_nvfp4_ct_bm16_o_m8",
+    "gemm_nvfp4_ct_bm16_o_m16",
+    "gemm_nvfp4_ct_bm16_gateup_m4",
+    "gemm_nvfp4_ct_bm16_gateup_m8",
+    "gemm_nvfp4_ct_bm16_gateup_m16",
+    "gemm_nvfp4_ct_bm16_down_m4",
+    "gemm_nvfp4_ct_bm16_down_m8",
+    "gemm_nvfp4_ct_bm16_down_m16",
+    "reduce_nvfp4_ct_bm16",
+    "gemm_q8_0_i8mma_triplet_single_bm64",
+    "gemm_q8_0_i8mma_triplet_single_big",
+    "gemm_q8_0_i8mma_triplet_single_big_poststage",
+    "attn_prefill_fa_mojo_device_pos_f16_hd256_bk32",
+    "attn_prefill_fa_mojo_f16_hd256_bk32",
+    "attn_prefill_fa_mojo_f16_hd256_vtrans",
+    "attn_prefill_fa_mojo_device_pos_f16_hd256_vtrans",
     "deltanet_gated_scan_t2_f16",
     "deltanet_gated_scan_t3_f16",
     "deltanet_gated_scan_t4_f16",
@@ -119,6 +166,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "deltanet_commit_recompute_segmented_shared_d128_f32",
     "deltanet_gated_scan_inplace_dynamic_d128_f16",
     "deltanet_gated_scan_inplace_shared_d128_f16",
+    "deltanet_gated_scan_persistent_d128_f16",
     "deltanet_commit_checkpoint_f32",
     "deltanet_commit_checkpoint_segmented_f32",
     "deltanet_gated_rmsnorm_f16",
@@ -149,6 +197,9 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "mtp_select_row_segmented_f16",
     "gemm_nvfp4_gguf_f16_b2",
     "gemm_nvfp4_gguf_out_f32_b2",
+    "gemm_nvfp4_gguf_out_f32_b4",
+    "gemm_nvfp4_gguf_out_f32_b8",
+    "gemm_nvfp4_gguf_out_f32_b16",
     "gemm_nvfp4_gguf_f16_b3",
     "gemm_nvfp4_gguf_f16_b4",
     "gemm_nvfp4_gguf_f16_b1_nvidia",
@@ -161,6 +212,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_nvfp4_gguf_mma_f16_bm32",
     "gemm_nvfp4_gguf_mma_f16_bm128",
     "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
+    "gemm_nvfp4_gguf_mma_f16_bm128_prefetch",
     "gather_rows_f16",
     "gemv_f16_out_f32",
     "gemv_q8_0_out_f32",
@@ -216,8 +268,15 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "attn_prefill_f16_hd64",
     "attn_prefill_f16_hd128",
     "attn_prefill_f16_hd256",
+    "attn_prefill_segmented_f16_hd128",
+    "attn_prefill_segmented_f16_hd256",
+    "attn_prefill_fa_segmented_f16_hd128",
     "attn_prefill_device_pos_f16_hd256",
+    "attn_prefill_fa_mojo_f16_hd256",
+    "attn_prefill_fa_mojo_device_pos_f16_hd256",
     "attn_decode_batch_exact_f16_hd256",
+    "attn_verify_segmented_f16_hd128",
+    "attn_verify_segmented_f16_hd128_warp32",
     "attn_verify_segmented_f16_hd256",
     "attn_verify_segmented_f16_hd256_warp32",
     "attn_prefill_fp8_hd64",
@@ -233,6 +292,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_q8_0_i8mma",
     "gemm_q8_0_i8mma_bm64",
     "gemm_q8_0_i8mma_big",
+    "gemm_q8_0_i8mma_triplet_bm64",
     "gemm_q4_k_i8mma",
     "gemm_q4_k_i8mma_bm64",
     "gemm_q4_k_i8mma_big",
@@ -260,18 +320,6 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_q4k_i8_native_4096_14336_m1024",
     "gemm_q4k_i8_native_4096_14336_m2048",
     "gemm_q4k_i8_native_4096_14336_m4096",
-    "gemm_q6k_i8_native_4096_14336_m128",
-    "gemm_q6k_i8_native_4096_14336_m256",
-    "gemm_q6k_i8_native_4096_14336_m512",
-    "gemm_q6k_i8_native_4096_14336_m1024",
-    "gemm_q6k_i8_native_4096_14336_m2048",
-    "gemm_q6k_i8_native_4096_14336_m4096",
-    "gemm_q6k_i8_native_1024_4096_m128",
-    "gemm_q6k_i8_native_1024_4096_m256",
-    "gemm_q6k_i8_native_1024_4096_m512",
-    "gemm_q6k_i8_native_1024_4096_m1024",
-    "gemm_q6k_i8_native_1024_4096_m2048",
-    "gemm_q6k_i8_native_1024_4096_m4096",
     "quantize_act_fp8",
     "pack_nvfp4_fp8",
     "pack_f16_fp8",
@@ -284,6 +332,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemm_fp8_mod_4096_14336",
     "gemm_fp8_mod_11264_4096",
     "gemm_fp8_mod_4096_11264",
+    "gemm_fp8_mod_4096_4096_bn256",
+    "gemm_fp8_mod_11264_4096_bn256",
     "attn_decode_split_f16_hd64",
     "attn_decode_split_f16_hd128",
     "attn_decode_split_fp8_hd64",
@@ -499,6 +549,10 @@ fn is_sm89_only(ptx: &[u8]) -> bool {
         .any(|w| w == b".target sm_89")
 }
 
+fn supports_sm89_cubin(arch: &str) -> bool {
+    arch == "sm_89"
+}
+
 fn resolve_artifact_path(arch_dir: &Path, file: &str) -> Result<PathBuf> {
     let relative = Path::new(file);
     if relative.as_os_str().is_empty()
@@ -578,7 +632,7 @@ impl KernelArtifacts {
         }
         // Cubiny zawierają SASS dla sm_89 bez przenośnego PTX, więc wymagają
         // dokładnie tej samej architektury. Kerneli Mojo PTX ten warunek nie dotyczy.
-        if arch == "sm_89" {
+        if supports_sm89_cubin(arch) {
             Self::load_cuda_cubin(
                 device,
                 EMBEDDED_CUDA_CUBIN_W4A8_SM89,
@@ -640,9 +694,9 @@ impl KernelArtifacts {
             let module: Module = device.load_module(&ptx)?;
             handles.insert(name.clone(), module.kernel(&entry.entry)?);
         }
-        // Katalog nadpisujący jest przypisany do konkretnej architektury, więc
-        // umieszczone w nim cubiny mogą być ładowane po walidacji manifestu.
-        if ada {
+        // Cubiny w katalogu nadpisującym zawierają wyłącznie SASS dla sm_89.
+        // Natywne FP8 nie gwarantuje zgodności binarnej z tą architekturą.
+        if supports_sm89_cubin(arch) {
             let w4a8 = std::fs::read(arch_dir.join("w4a8_gemm_cuda.cubin"))
                 .map_err(|e| ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}")))?;
             Self::load_cuda_cubin(device, &w4a8, CUDA_W4A8_ENTRIES, &mut handles)?;
@@ -673,7 +727,7 @@ impl KernelArtifacts {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sm89_only, resolve_artifact_path, EMBEDDED_SM89};
+    use super::{is_sm89_only, resolve_artifact_path, supports_sm89_cubin, EMBEDDED_SM89};
 
     const PORTABLE_RAW_NVFP4: &[&str] = &[
         "gemv_nvfp4_gguf_f16",
@@ -688,6 +742,9 @@ mod tests {
         "gather_nvfp4_gguf_row_f16",
         "gemm_nvfp4_gguf_f16_b2",
         "gemm_nvfp4_gguf_out_f32_b2",
+        "gemm_nvfp4_gguf_out_f32_b4",
+        "gemm_nvfp4_gguf_out_f32_b8",
+        "gemm_nvfp4_gguf_out_f32_b16",
         "gemm_nvfp4_gguf_f16_b3",
         "gemm_nvfp4_gguf_f16_b4",
         "gemm_nvfp4_gguf_f16_b3_nvidia",
@@ -699,6 +756,35 @@ mod tests {
         "gemm_nvfp4_gguf_mma_f16_bm32",
         "gemm_nvfp4_gguf_mma_f16_bm128",
         "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
+        "gemm_nvfp4_gguf_mma_f16_bm128_prefetch",
+        "nvfp4_repack_tile128",
+        "gemv_nvfp4_tile128_coop_q8_1_f16",
+        "gemm_nvfp4_tile128_mma_f16_bm128_bn64",
+        "gemm_nvfp4_tile128_mma_f16_bm128_bn128",
+        "repack_nvfp4_ct_s0_n64k128_into",
+        "gemv_nvfp4_ct_s0_n64k128_f16",
+        "gemv_batch_nvfp4_ct_s0_n64k128_f16_b4",
+        "gemv_batch_nvfp4_ct_s0_n64k128_f16_b8",
+        "gemv_batch_nvfp4_ct_s0_n64k128_f16_b16",
+        "gemm_nvfp4_ct_s0_f16_bm64",
+        "gemm_nvfp4_ct_s0_f16_bm128",
+        "gemv_norm_nvfp4_ct_s0_f16",
+        "gemv_norm_silu_nvfp4_ct_s0_f16",
+        "gemv_residual_nvfp4_ct_s0_f16",
+        "pack_nvfp4_ct_s0_fp8",
+        "gemm_nvfp4_ct_bm16_qkv_m4",
+        "gemm_nvfp4_ct_bm16_qkv_m8",
+        "gemm_nvfp4_ct_bm16_qkv_m16",
+        "gemm_nvfp4_ct_bm16_o_m4",
+        "gemm_nvfp4_ct_bm16_o_m8",
+        "gemm_nvfp4_ct_bm16_o_m16",
+        "gemm_nvfp4_ct_bm16_gateup_m4",
+        "gemm_nvfp4_ct_bm16_gateup_m8",
+        "gemm_nvfp4_ct_bm16_gateup_m16",
+        "gemm_nvfp4_ct_bm16_down_m4",
+        "gemm_nvfp4_ct_bm16_down_m8",
+        "gemm_nvfp4_ct_bm16_down_m16",
+        "reduce_nvfp4_ct_bm16",
     ];
 
     const PORTABLE_Q8_SMALL: &[&str] = &[
@@ -799,6 +885,17 @@ mod tests {
                 .unwrap();
             assert!(!is_sm89_only(artifact.ptx));
         }
+    }
+
+    #[test]
+    fn cubiny_sm89_sa_ladowane_tylko_na_dokladnie_sm89() {
+        assert!(!supports_sm89_cubin("sm_80"));
+        assert!(!supports_sm89_cubin("sm_86"));
+        assert!(supports_sm89_cubin("sm_89"));
+        assert!(!supports_sm89_cubin("sm_90"));
+        assert!(!supports_sm89_cubin("sm_100"));
+        assert!(!supports_sm89_cubin("gfx942"));
+        assert!(!supports_sm89_cubin("apple-m3"));
     }
 
     #[test]

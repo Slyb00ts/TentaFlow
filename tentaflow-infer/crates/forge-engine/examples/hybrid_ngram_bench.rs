@@ -225,7 +225,8 @@ fn mtp_interleaving_audit(
     let (mut first_probe_seq, first_probe_fed_ab) = prepare(model, first_prompt)?;
     let (mut second_probe_seq, second_probe_fed_ab) = prepare(model, second_prompt)?;
     let first_probe_ab = model.mtp_propose_k(&mut first_probe_seq, first_probe_fed_ab, budget)?;
-    let second_probe_ab = model.mtp_propose_k(&mut second_probe_seq, second_probe_fed_ab, budget)?;
+    let second_probe_ab =
+        model.mtp_propose_k(&mut second_probe_seq, second_probe_fed_ab, budget)?;
     model.release_seq(&mut first_probe_seq);
     model.release_seq(&mut second_probe_seq);
     if first_probe_fed != first_probe_fed_ab
@@ -615,11 +616,7 @@ fn diagnose_mtp_catchup_prefixes(
     compare_snapshots(&first_prompt_mtp, &second_prompt_mtp)?;
     let (mut verifier_seq, verifier_fed) = prepare(model, prompt)?;
     let verifier_mtp_before = model.debug_mtp_state_snapshot(&verifier_seq)?;
-    let _ = model.verify_greedy_draft(
-        &mut verifier_seq,
-        verifier_fed,
-        &oracle[1..=budget],
-    )?;
+    let _ = model.verify_greedy_draft(&mut verifier_seq, verifier_fed, &oracle[1..=budget])?;
     let verifier_mtp_after = model.debug_mtp_state_snapshot(&verifier_seq)?;
     compare_snapshots(&verifier_mtp_before, &verifier_mtp_after)?;
     model.release_seq(&mut verifier_seq);
@@ -645,7 +642,10 @@ fn diagnose_mtp_catchup_prefixes(
             .find(|(name, _, _)| name == "mtp.hidden")
             .expect("snapshot MTP ma hidden");
         if serial_x.2 != serial_hidden.2 {
-            return Err(format!("serial recurrent_hidden różni się od target x dla accepted={expected}").into());
+            return Err(format!(
+                "serial recurrent_hidden różni się od target x dla accepted={expected}"
+            )
+            .into());
         }
         model.release_seq(&mut serial_seq);
 
@@ -673,7 +673,10 @@ fn diagnose_mtp_catchup_prefixes(
             .find(|(name, _, _)| name == "mtp.hidden")
             .expect("snapshot MTP ma hidden");
         if batch_x.2 != batch_hidden.2 {
-            return Err(format!("batch recurrent_hidden różni się od target x dla accepted={expected}").into());
+            return Err(format!(
+                "batch recurrent_hidden różni się od target x dla accepted={expected}"
+            )
+            .into());
         }
         model.release_seq(&mut batch_seq);
         compare_snapshots(&batch_target, &serial_target)?;
@@ -769,13 +772,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let warm_oracle = serial_trial(&mut model, &prompt, 8)?;
     ngram_trial(&mut model, &prompt, budget, 8, None, mtp_router)?;
-    oracle_ngram_trial(
-        &mut model,
-        &prompt,
-        &warm_oracle.tokens,
-        budget,
-        mtp_router,
-    )?;
+    oracle_ngram_trial(&mut model, &prompt, &warm_oracle.tokens, budget, mtp_router)?;
     let serial = serial_trial(&mut model, &prompt, target)?;
     let ngram = ngram_trial(
         &mut model,
@@ -799,8 +796,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let oracle_ngram =
-        oracle_ngram_trial(&mut model, &prompt, &serial.tokens, budget, mtp_router)?;
+    let oracle_ngram = oracle_ngram_trial(&mut model, &prompt, &serial.tokens, budget, mtp_router)?;
     if serial.tokens != oracle_ngram.tokens {
         return Err("górna granica n-gram różni się tokenami od sekwencyjnego greedy".into());
     }

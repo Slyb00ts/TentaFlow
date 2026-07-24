@@ -205,10 +205,7 @@ impl WhisperWeights {
         }
 
         let st = ShardedSafeTensors::load_dir(dir)?;
-        let l = Loader {
-            device,
-            st: &st,
-        };
+        let l = Loader { device, st: &st };
         let d = config.d_model;
         let mels = config.num_mel_bins;
 

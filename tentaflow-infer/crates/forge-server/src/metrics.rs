@@ -70,7 +70,9 @@ fn fmt_f64(v: f64) -> String {
 
 /// Escape a label value per the exposition format (backslash, quote, newline).
 fn escape_label(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Build the full exposition body from the engine metrics and HTTP counts.
@@ -281,9 +283,15 @@ mod tests {
             .hybrid_prefill_b2_scratch_bytes
             .store(450_692_688, Ordering::Relaxed);
         engine.mtp_ngram_b2_steps_total.store(7, Ordering::Relaxed);
-        engine.mtp_routed_nn_b2_steps_total.store(3, Ordering::Relaxed);
-        engine.mtp_routed_nm_b2_steps_total.store(2, Ordering::Relaxed);
-        engine.mtp_routed_mm_b2_steps_total.store(1, Ordering::Relaxed);
+        engine
+            .mtp_routed_nn_b2_steps_total
+            .store(3, Ordering::Relaxed);
+        engine
+            .mtp_routed_nm_b2_steps_total
+            .store(2, Ordering::Relaxed);
+        engine
+            .mtp_routed_mm_b2_steps_total
+            .store(1, Ordering::Relaxed);
         let output = render(&engine, &HttpMetrics::default(), "test");
         assert!(output.contains("forge_engine_hybrid_prefill_b2_steps_total 5"));
         assert!(output.contains("forge_engine_hybrid_prefill_b2_tokens_total 320"));

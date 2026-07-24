@@ -270,9 +270,7 @@ impl PrefixCache {
             .iter()
             .enumerate()
             .filter_map(|(id, slot)| slot.as_ref().map(|n| (id, n)))
-            .filter(|(id, n)| {
-                *id != ROOT && n.refcount == 0 && n.children.is_empty()
-            })
+            .filter(|(id, n)| *id != ROOT && n.refcount == 0 && n.children.is_empty())
             .min_by_key(|(_, n)| n.last_access)
             .map(|(id, _)| id)
     }

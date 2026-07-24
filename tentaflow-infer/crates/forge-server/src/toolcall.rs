@@ -403,7 +403,10 @@ mod tests {
         );
         assert!(step.text.is_empty());
         assert_eq!(
-            step.calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            step.calls
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b"]
         );
         assert_eq!(step.calls[1].arguments, "{\"x\":1}");
@@ -425,8 +428,15 @@ mod tests {
         let mut streamed = String::new();
         let mut calls = Vec::new();
         for piece in [
-            "Answer: ", "<to", "ol_c", "all>", "{\"name\":\"f\",", "\"arguments\":{\"q\":\"x\"}}",
-            "</tool", "_call>", " tail",
+            "Answer: ",
+            "<to",
+            "ol_c",
+            "all>",
+            "{\"name\":\"f\",",
+            "\"arguments\":{\"q\":\"x\"}}",
+            "</tool",
+            "_call>",
+            " tail",
         ] {
             let step = p.push(piece);
             streamed.push_str(&step.text);
@@ -463,7 +473,10 @@ mod tests {
         let mut p = OutputParser::new(ToolParserKind::Llama3Json);
         let step = drain(
             &mut p,
-            &["{\"name\": \"get_weather\", ", "\"parameters\": {\"city\": \"Kraków\"}}"],
+            &[
+                "{\"name\": \"get_weather\", ",
+                "\"parameters\": {\"city\": \"Kraków\"}}",
+            ],
         );
         assert!(step.text.is_empty());
         assert_eq!(step.calls.len(), 1);
@@ -560,7 +573,10 @@ mod tests {
             &["<think>maybe <tool_call>{\"name\":\"x\"}</tool_call></think>ok"],
         );
         assert!(step.calls.is_empty());
-        assert_eq!(step.reasoning, "maybe <tool_call>{\"name\":\"x\"}</tool_call>");
+        assert_eq!(
+            step.reasoning,
+            "maybe <tool_call>{\"name\":\"x\"}</tool_call>"
+        );
         assert_eq!(step.text, "ok");
     }
 

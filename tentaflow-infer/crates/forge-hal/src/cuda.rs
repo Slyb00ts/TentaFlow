@@ -100,8 +100,7 @@ impl CudaPool {
         let base = if capacity == 0 {
             0
         } else {
-            unsafe { result::malloc_sync(capacity) }
-                .map_err(|e| cu_err("cuMemAlloc pool", e))?
+            unsafe { result::malloc_sync(capacity) }.map_err(|e| cu_err("cuMemAlloc pool", e))?
         };
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
@@ -404,9 +403,7 @@ impl CudaDevice {
     pub fn new(ordinal: usize, pools: PoolSizes) -> Result<Arc<Self>> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
-        let (free, _total) = ctx
-            .mem_get_info()
-            .map_err(|e| cu_err("cuMemGetInfo", e))?;
+        let (free, _total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
         let requested = pools.total()?;
         if requested > free {
             return Err(ForgeError::OutOfMemory {
@@ -415,7 +412,11 @@ impl CudaDevice {
             });
         }
         let caps = detect_caps(&ctx)?;
-        let weights = CudaPool::new(&ctx, pools.weights, PoolArena::Bump(BumpArena::new(pools.weights)))?;
+        let weights = CudaPool::new(
+            &ctx,
+            pools.weights,
+            PoolArena::Bump(BumpArena::new(pools.weights)),
+        )?;
         let kv_cache = CudaPool::new(
             &ctx,
             pools.kv_cache,
@@ -441,9 +442,7 @@ impl CudaDevice {
     pub fn with_default_pools(ordinal: usize) -> Result<Arc<Self>> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
-        let (free, _total) = ctx
-            .mem_get_info()
-            .map_err(|e| cu_err("cuMemGetInfo", e))?;
+        let (free, _total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
         Self::new(ordinal, PoolSizes::auto_from_free(free))
     }
 
@@ -459,9 +458,7 @@ impl CudaDevice {
     pub fn free_vram(ordinal: usize) -> Result<usize> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
-        let (free, _total) = ctx
-            .mem_get_info()
-            .map_err(|e| cu_err("cuMemGetInfo", e))?;
+        let (free, _total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
         Ok(free)
     }
 
@@ -504,14 +501,13 @@ fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
         ctx.attribute(a)
             .map_err(|e| cu_err("cuDeviceGetAttribute", e))
     };
-    let max_shared_mem_per_block = attr(
-        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-    )? as usize;
+    let max_shared_mem_per_block =
+        attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?
+            as usize;
     let max_threads_per_block =
         attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)? as u32;
     let warp_size = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)? as u32;
-    let sm_count =
-        attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+    let sm_count = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
     let supports_p2p = detect_p2p(ctx)?;
     Ok(DeviceCaps {
         name,
@@ -540,11 +536,9 @@ fn detect_p2p(ctx: &Arc<CudaContext>) -> Result<bool> {
             continue;
         }
         let mut accessible: i32 = 0;
-        unsafe {
-            sys::cuDeviceCanAccessPeer(&mut accessible, ctx.cu_device(), peer as i32)
-        }
-        .result()
-        .map_err(|e| cu_err("cuDeviceCanAccessPeer", e))?;
+        unsafe { sys::cuDeviceCanAccessPeer(&mut accessible, ctx.cu_device(), peer as i32) }
+            .result()
+            .map_err(|e| cu_err("cuDeviceCanAccessPeer", e))?;
         if accessible != 0 {
             return Ok(true);
         }
@@ -831,9 +825,7 @@ impl Device for CudaDevice {
                     cfg.shared_mem_bytes as i32,
                 )
             }
-            .map_err(|e| {
-                cu_err(&format!("cuFuncSetAttribute({})", kernel_impl.name), e)
-            })?;
+            .map_err(|e| cu_err(&format!("cuFuncSetAttribute({})", kernel_impl.name), e))?;
         }
         unsafe {
             result::launch_kernel(
@@ -916,8 +908,7 @@ impl Device for CudaDevice {
         // device launch. Raw sys call because cudarc's enum wrapper cannot
         // express an empty flag set.
         let mut exec = std::ptr::null_mut();
-        let instantiate =
-            unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0) }.result();
+        let instantiate = unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0) }.result();
         if let Err(e) = instantiate {
             let _ = unsafe { result::graph::destroy(graph) };
             return Err(cu_err("cuGraphInstantiateWithFlags", e));

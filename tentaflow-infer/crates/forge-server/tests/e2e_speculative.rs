@@ -81,6 +81,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
             // ownership; the eligible speculative path requires prefix off.
             prefix_cache: false,
             native_mtp: false,
+            nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
         },
     )
     .expect("load model");

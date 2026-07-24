@@ -1,0 +1,6 @@
+    "gemm_fp8_mod_11264_4096": {"file": "gemm_fp8_mod_11264_4096.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_75c4a5d3dd7ab1ce"},
+    "gemm_fp8_mod_4096_11264": {"file": "gemm_fp8_mod_4096_11264.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_72eed39fac4fcb6f"},
+    "gemm_fp8_mod_4096_4096_bn256": {"file": "gemm_fp8_mod_4096_4096_bn256.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_f6909fe8a48d920f"},
+    "gemm_fp8_mod_11264_4096_bn256": {"file": "gemm_fp8_mod_11264_4096_bn256.ptx", "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_cb836b06d30a654a"},
+    "pack_nvfp4_fp8": {"file": "pack_nvfp4_fp8.ptx", "entry": "src_nvfp4_pack_nvfp4_fp8_Poi6A6A6A6AoA6A6A_b14853b36db40564"},
+    "pack_f16_fp8": {"file": "pack_f16_fp8.ptx", "entry": "src_nvfp4_pack_f16_fp8_Point6A6A6A6AoA6A6A_08208024e012ab84"}

@@ -74,7 +74,10 @@ fn embedding_sanity_cosine_ordering() {
         );
         if normalize {
             let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((l2 - 1.0).abs() < 1e-3, "L2 norm {l2} not ~1.0 for '{text}'");
+            assert!(
+                (l2 - 1.0).abs() < 1e-3,
+                "L2 norm {l2} not ~1.0 for '{text}'"
+            );
         }
         v
     };

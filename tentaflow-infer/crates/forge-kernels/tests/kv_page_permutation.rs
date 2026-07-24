@@ -19,6 +19,7 @@ const N_Q_HEADS: usize = 4;
 const N_KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 256;
 const CONTEXTS: [usize; 8] = [31, 32, 33, 64, 128, 161, 192, 256];
+type LayoutResult = (Vec<u16>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn device() -> Option<Arc<CudaDevice>> {
     if std::env::var("FORGE_GPU_TEST").ok().as_deref() != Some("1") {
@@ -104,7 +105,7 @@ fn run_layout(
     kernels: &Kernels,
     context: usize,
     page_table: &[i32; MAX_PAGES],
-) -> (Vec<u16>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+) -> LayoutResult {
     let cache_elements = N_PAGES * N_KV_HEADS * PAGE_SIZE * HEAD_DIM;
     let poison = f16::from_bits(0x7e01);
     let mut k_cache = vec![poison; cache_elements];
@@ -142,6 +143,9 @@ fn run_layout(
         &vec![poison; N_Q_HEADS * HEAD_DIM],
         Pool::Activations,
     );
+    let parts = device
+        .alloc(N_Q_HEADS * 8 * 260 * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
     let page_table_buf = device
         .alloc(MAX_PAGES * 4, MemKind::Device, Pool::Weights)
         .unwrap();
@@ -171,6 +175,7 @@ fn run_layout(
     kernels
         .attn_decode_f16(
             &out,
+            &parts,
             &q,
             &k_cache,
             &v_cache,
@@ -225,7 +230,7 @@ fn run_batch_layout(
     base: usize,
     tokens: usize,
     page_table: &[i32; MAX_PAGES],
-) -> (Vec<u16>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+) -> LayoutResult {
     let cache_elements = N_PAGES * N_KV_HEADS * PAGE_SIZE * HEAD_DIM;
     let poison = f16::from_bits(0x7e01);
     let mut k_cache = vec![poison; cache_elements];

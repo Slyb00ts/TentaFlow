@@ -76,6 +76,7 @@ async fn api_surface_end_to_end() {
                     kv_tier: Default::default(),
                     prefix_cache: true,
                     native_mtp: false,
+                    nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
                 },
             )
             .expect("load model");

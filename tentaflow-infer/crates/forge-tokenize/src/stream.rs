@@ -124,4 +124,3 @@ fn ends_with_incomplete_utf8(mut bytes: &[u8]) -> bool {
         }
     }
 }
-

@@ -23,7 +23,7 @@
 {
 	.reg .pred 	%p<4>;
 	.reg .b16 	%rs<5>;
-	.reg .b32 	%r<31>;
+	.reg .b32 	%r<32>;
 	.reg .b64 	%rd<37>;
 	// demoted variable
 	.shared .align 4 .b8 src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810_$__global_alloc_0_$__gpu_shared_mem[4096];
@@ -64,13 +64,13 @@
 	add.s64 	%rd26, %rd3, %rd25;
 	add.s64 	%rd27, %rd4, %rd25;
 	shl.b32 	%r10, %r9, 2;
-	mov.b32 	%r26, src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810_$__global_alloc_0_$__gpu_shared_mem;
-	add.s32 	%r11, %r26, %r10;
+	mov.b32 	%r27, src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810_$__global_alloc_0_$__gpu_shared_mem;
+	add.s32 	%r11, %r27, %r10;
 	ld.global.b16 	%rs1, [%rd23];
 	cvt.f32.f16 	%r12, %rs1;
 	st.shared.b32 	[%r11], %r12;
-	mov.b32 	%r29, src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810_$__global_alloc_1_$__gpu_shared_mem;
-	add.s32 	%r13, %r29, %r10;
+	mov.b32 	%r30, src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810_$__global_alloc_1_$__gpu_shared_mem;
+	add.s32 	%r13, %r30, %r10;
 	ld.global.b16 	%rs2, [%rd24];
 	cvt.f32.f16 	%r14, %rs2;
 	st.shared.b32 	[%r13], %r14;
@@ -86,41 +86,41 @@
 	add.s64 	%rd32, %rd30, %rd31;
 	add.s64 	%rd35, %rd5, %rd32;
 	shl.b64 	%rd11, %rd12, 2;
-	mov.b32 	%r27, 0f00000000;
+	mov.b32 	%r28, 0f00000000;
 	mov.b64 	%rd33, %rd35;
 	mov.b64 	%rd34, %rd36;
 $L__BB0_2:
 	add.s64 	%rd34, %rd34, -1;
 	ld.global.b32 	%r16, [%rd33];
-	mul.f32 	%r17, %r7, %r16;
-	st.global.b32 	[%rd33], %r17;
-	ld.shared.b32 	%r18, [%r26];
-	fma.rn.f32 	%r27, %r17, %r18, %r27;
+	fma.rn.f32 	%r17, %r16, %r7, 0f00000000;
+	ld.shared.b32 	%r18, [%r27];
+	fma.rn.f32 	%r28, %r18, %r17, %r28;
 	add.s64 	%rd33, %rd33, %rd11;
-	add.s32 	%r26, %r26, 4;
+	add.s32 	%r27, %r27, 4;
 	setp.ne.b64 	%p2, %rd34, 0;
 	@%p2 bra 	$L__BB0_2;
 	ld.global.b16 	%rs3, [%rd10];
 	cvt.f32.f16 	%r19, %rs3;
-	sub.f32 	%r20, %r19, %r27;
+	sub.f32 	%r20, %r19, %r28;
 	mul.f32 	%r3, %r2, %r20;
-	mov.b32 	%r30, 0f00000000;
-	mov.b32 	%r28, src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810_$__global_alloc_0_$__gpu_shared_mem;
+	mov.b32 	%r31, 0f00000000;
+	mov.b32 	%r29, src_deltanet_deltanet_gated_st6A6A6A6A_57fc818d097f8810_$__global_alloc_0_$__gpu_shared_mem;
 $L__BB0_4:
 	add.s64 	%rd36, %rd36, -1;
-	ld.shared.b32 	%r21, [%r28];
-	ld.global.b32 	%r22, [%rd35];
-	fma.rn.f32 	%r23, %r3, %r21, %r22;
-	st.global.b32 	[%rd35], %r23;
-	ld.shared.b32 	%r24, [%r29];
-	fma.rn.f32 	%r30, %r23, %r24, %r30;
+	ld.global.b32 	%r21, [%rd35];
+	fma.rn.f32 	%r22, %r21, %r7, 0f00000000;
+	ld.shared.b32 	%r23, [%r29];
+	fma.rn.f32 	%r24, %r3, %r23, %r22;
+	st.global.b32 	[%rd35], %r24;
+	ld.shared.b32 	%r25, [%r30];
+	fma.rn.f32 	%r31, %r25, %r24, %r31;
 	add.s64 	%rd35, %rd35, %rd11;
+	add.s32 	%r30, %r30, 4;
 	add.s32 	%r29, %r29, 4;
-	add.s32 	%r28, %r28, 4;
 	setp.ne.b64 	%p3, %rd36, 0;
 	@%p3 bra 	$L__BB0_4;
-	mul.f32 	%r25, %r1, %r30;
-	cvt.rn.f16.f32 	%rs4, %r25;
+	mul.f32 	%r26, %r1, %r31;
+	cvt.rn.f16.f32 	%rs4, %r26;
 	st.global.b16 	[%rd9], %rs4;
 $L__BB0_6:
 	ret;

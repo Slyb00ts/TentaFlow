@@ -13,8 +13,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use forge_engine::generate::FinishReason;
 use forge_engine::server::{EngineEvent, EngineRequest};
-use forge_types::ForgeError;
 use forge_tokenize::{ChatMessage, ChatTemplateEngine};
+use forge_types::ForgeError;
 use tokio_stream::wrappers::ReceiverStream;
 
 use std::collections::BTreeMap;
@@ -24,13 +24,13 @@ use crate::api::{
     ChatLogprobs, ChatResponseMessage, CompletionChoice, CompletionLogprobs, CompletionRequest,
     CompletionResponse, EmbItem, EmbeddingData, EmbeddingUsage, EmbeddingVec, EmbeddingsRequest,
     EmbeddingsResponse, EncodingFormat, FunctionCallOut, GenerationSpec, ModelEntry, ModelList,
-    TopLogprobEntry, ToolCallOut, ToolMode, Usage,
+    ToolCallOut, ToolMode, TopLogprobEntry, Usage,
 };
-use forge_engine::sample::TokenLogprob;
-use forge_tokenize::Tokenizer;
 use crate::error::ApiError;
 use crate::toolcall::{OutputParser, ParseStep, ToolParserKind};
 use crate::ServerState;
+use forge_engine::sample::TokenLogprob;
+use forge_tokenize::Tokenizer;
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -79,11 +79,7 @@ pub async fn healthz() -> Json<serde_json::Value> {
 /// API-key gate like /healthz. Renders the engine's live counters/gauges/
 /// histograms plus the per-route HTTP request counts.
 pub async fn metrics_endpoint(State(state): State<Arc<ServerState>>) -> Response {
-    let body = crate::metrics::render(
-        state.engine.metrics(),
-        &state.http_metrics,
-        &state.model_id,
-    );
+    let body = crate::metrics::render(state.engine.metrics(), &state.http_metrics, &state.model_id);
     (
         [(
             header::CONTENT_TYPE,
@@ -730,8 +726,7 @@ pub async fn chat_completions(
     // Streaming a multi-completion response is not supported (the OpenAI stream
     // shape interleaves choices ambiguously); ask for a non-streaming request.
     if req.stream && spec.n > 1 {
-        return ApiError::invalid_request("streaming is not supported with n > 1")
-            .into_response();
+        return ApiError::invalid_request("streaming is not supported with n > 1").into_response();
     }
     let gen = match start_generation(
         &state,
@@ -996,8 +991,7 @@ pub async fn audio_transcriptions(
     // ≤64 MiB upload while transcriptions run one at a time, so excess load
     // is rejected up front instead of buffered.
     let Ok(_permit) = state.stt_slots.try_acquire() else {
-        return ApiError::overloaded("too many concurrent transcription requests")
-            .into_response();
+        return ApiError::overloaded("too many concurrent transcription requests").into_response();
     };
 
     let mut file: Option<Vec<u8>> = None;
@@ -1089,57 +1083,58 @@ pub async fn embeddings(
     };
 
     let model_id = embed.model_id.clone();
-    let joined = tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, usize), ApiError> {
-        // Tokenize (or accept caller ids) and bound each input before any GPU
-        // work, so an over-length item fails fast without partial compute.
-        let mut token_sets: Vec<Vec<u32>> = Vec::with_capacity(items.len());
-        let mut prompt_tokens = 0usize;
-        for item in items {
-            let ids = match item {
-                EmbItem::Text(s) => embed
-                    .tokenizer
-                    .encode(&s, true)
-                    .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?,
-                EmbItem::Tokens(ids) => ids,
-            };
-            if ids.is_empty() {
-                return Err(ApiError::invalid_request(
-                    "an `input` item produced zero tokens",
-                ));
+    let joined =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+            // Tokenize (or accept caller ids) and bound each input before any GPU
+            // work, so an over-length item fails fast without partial compute.
+            let mut token_sets: Vec<Vec<u32>> = Vec::with_capacity(items.len());
+            let mut prompt_tokens = 0usize;
+            for item in items {
+                let ids = match item {
+                    EmbItem::Text(s) => embed
+                        .tokenizer
+                        .encode(&s, true)
+                        .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?,
+                    EmbItem::Tokens(ids) => ids,
+                };
+                if ids.is_empty() {
+                    return Err(ApiError::invalid_request(
+                        "an `input` item produced zero tokens",
+                    ));
+                }
+                if ids.len() > embed.max_context {
+                    return Err(ApiError::context_length_exceeded(format!(
+                        "input has {} tokens, over the embedding model limit of {}",
+                        ids.len(),
+                        embed.max_context
+                    )));
+                }
+                prompt_tokens += ids.len();
+                token_sets.push(ids);
             }
-            if ids.len() > embed.max_context {
-                return Err(ApiError::context_length_exceeded(format!(
-                    "input has {} tokens, over the embedding model limit of {}",
-                    ids.len(),
-                    embed.max_context
-                )));
-            }
-            prompt_tokens += ids.len();
-            token_sets.push(ids);
-        }
 
-        let mut model = embed.model.blocking_lock();
-        let mut vecs = Vec::with_capacity(token_sets.len());
-        for ids in &token_sets {
-            let mut v = model
-                .embed(ids, embed.pooling, embed.normalize)
-                .map_err(|e| ApiError::internal(format!("embedding failed: {e}")))?;
-            // Matryoshka: keep the leading `dimensions` components; the
-            // prefixes of these models are trained to stay meaningful, and a
-            // normalized model needs a renormalize after truncation.
-            if let Some(d) = dimensions {
-                if d < v.len() {
-                    v.truncate(d);
-                    if embed.normalize {
-                        forge_engine::model::l2_normalize(&mut v);
+            let mut model = embed.model.blocking_lock();
+            let mut vecs = Vec::with_capacity(token_sets.len());
+            for ids in &token_sets {
+                let mut v = model
+                    .embed(ids, embed.pooling, embed.normalize)
+                    .map_err(|e| ApiError::internal(format!("embedding failed: {e}")))?;
+                // Matryoshka: keep the leading `dimensions` components; the
+                // prefixes of these models are trained to stay meaningful, and a
+                // normalized model needs a renormalize after truncation.
+                if let Some(d) = dimensions {
+                    if d < v.len() {
+                        v.truncate(d);
+                        if embed.normalize {
+                            forge_engine::model::l2_normalize(&mut v);
+                        }
                     }
                 }
+                vecs.push(v);
             }
-            vecs.push(v);
-        }
-        Ok((vecs, prompt_tokens))
-    })
-    .await;
+            Ok((vecs, prompt_tokens))
+        })
+        .await;
 
     match joined {
         Ok(Ok((vecs, prompt_tokens))) => {
@@ -1204,13 +1199,8 @@ mod tests {
             "function": {"name": "get_weather", "parameters": {"type": "object"}}
         }]);
 
-        let out = render_chat_prompt(
-            template,
-            &serde_json::Map::new(),
-            &messages,
-            Some(&tools),
-        )
-        .unwrap();
+        let out =
+            render_chat_prompt(template, &serde_json::Map::new(), &messages, Some(&tools)).unwrap();
         assert!(out.contains("<tool_call>"), "assistant call missing: {out}");
         assert!(out.contains("get_weather"));
         assert!(out.contains("<tool_response>\n12°C, słonecznie"));

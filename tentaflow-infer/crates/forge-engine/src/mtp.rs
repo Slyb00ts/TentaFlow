@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use forge_formats::{Hyperparams, MtpDescriptor, MtpWeightRole};
-use forge_hal::{DevBuffer, Device, Pool, Stream, Event};
-use forge_kernels::Kernels;
+use forge_hal::{DevBuffer, Device, Event, Pool, Stream};
+use forge_kernels::{Kernels, Nvfp4GgufLayout};
 use forge_types::{ForgeError, MemKind, Result};
 
 use crate::kv::{KvCache, SeqKv};
@@ -76,7 +76,10 @@ impl MtpWeights {
                 MtpEmbedding::HostF16
                     | MtpEmbedding::Device(DevWeight::F16 { .. })
                     | MtpEmbedding::Device(DevWeight::Q8_0 { .. })
-                    | MtpEmbedding::Device(DevWeight::NvFp4Gguf { .. })
+                    | MtpEmbedding::Device(DevWeight::NvFp4Gguf {
+                        layout: Nvfp4GgufLayout::RowMajor36,
+                        ..
+                    })
             )
             && !matches!(
                 &self.output,
@@ -124,11 +127,9 @@ impl MtpWeights {
         let shares_target_embedding = !first_layer.contains_key(&MtpWeightRole::Embedding)
             && descriptor.share_target_embedding;
         let embedding = match first_layer.get(&MtpWeightRole::Embedding) {
-            Some(name) => MtpEmbedding::Device(loader.matrix(
-                name,
-                params.vocab_size,
-                params.hidden_size,
-            )?),
+            Some(name) => {
+                MtpEmbedding::Device(loader.matrix(name, params.vocab_size, params.hidden_size)?)
+            }
             None if descriptor.share_target_embedding => embedding,
             None => {
                 return Err(ForgeError::Format(
@@ -336,14 +337,22 @@ fn share_weight(weight: &DevWeight) -> DevWeight {
             cols: *cols,
         },
         DevWeight::NvFp4 {
-            packed,
-            scales,
+            storage,
             inv_global_scale,
             rows,
             cols,
         } => DevWeight::NvFp4 {
-            packed: packed.clone(),
-            scales: scales.clone(),
+            storage: match storage {
+                crate::weights::NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                    crate::weights::NvFp4CtStorage::RowMajorE4M3 {
+                        packed: packed.clone(),
+                        scales: scales.clone(),
+                    }
+                }
+                crate::weights::NvFp4CtStorage::S0N64K128 { data } => {
+                    crate::weights::NvFp4CtStorage::S0N64K128 { data: data.clone() }
+                }
+            },
             inv_global_scale: *inv_global_scale,
             rows: *rows,
             cols: *cols,
@@ -353,11 +362,13 @@ fn share_weight(weight: &DevWeight) -> DevWeight {
             output_scale,
             rows,
             cols,
+            layout,
         } => DevWeight::NvFp4Gguf {
             buf: buf.clone(),
             output_scale: *output_scale,
             rows: *rows,
             cols: *cols,
+            layout: *layout,
         },
     }
 }
@@ -443,12 +454,17 @@ impl MtpDraftState {
         device.write(&[0u8; 4], &seq_len, 0)?;
         device.write(&[0u8; 4], &position, 0)?;
         let zero_hidden = device.alloc(hidden_bytes, MemKind::PinnedHost, Pool::Activations)?;
-        let empty_page_table =
-            device.alloc(max_pages_per_seq * 4, MemKind::PinnedHost, Pool::Activations)?;
+        let empty_page_table = device.alloc(
+            max_pages_per_seq * 4,
+            MemKind::PinnedHost,
+            Pool::Activations,
+        )?;
         let zero_scalar = device.alloc(4, MemKind::PinnedHost, Pool::Activations)?;
         unsafe {
             std::ptr::write_bytes(
-                zero_hidden.host_ptr().expect("pinned zero hidden ma mapowanie"),
+                zero_hidden
+                    .host_ptr()
+                    .expect("pinned zero hidden ma mapowanie"),
                 0,
                 hidden_bytes,
             );
@@ -460,7 +476,9 @@ impl MtpDraftState {
                 max_pages_per_seq * 4,
             );
             std::ptr::write_bytes(
-                zero_scalar.host_ptr().expect("pinned zero scalar ma mapowanie"),
+                zero_scalar
+                    .host_ptr()
+                    .expect("pinned zero scalar ma mapowanie"),
                 0,
                 4,
             );
@@ -508,9 +526,7 @@ impl MtpDraftState {
     pub fn checkpoint(&mut self, stream: &Stream) -> Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_checkpoint_once) {
-            return Err(ForgeError::Device(
-                "MTP: wymuszony błąd checkpointu".into(),
-            ));
+            return Err(ForgeError::Device("MTP: wymuszony błąd checkpointu".into()));
         }
         if self.checkpoint_len.is_some() {
             return Err(ForgeError::Scheduler(
@@ -533,22 +549,10 @@ impl MtpDraftState {
             self.page_table.len(),
             stream,
         )?;
-        self.device.copy(
-            &self.seq_len,
-            0,
-            &self.checkpoint_seq_len,
-            0,
-            4,
-            stream,
-        )?;
-        self.device.copy(
-            &self.position,
-            0,
-            &self.checkpoint_position,
-            0,
-            4,
-            stream,
-        )?;
+        self.device
+            .copy(&self.seq_len, 0, &self.checkpoint_seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.position, 0, &self.checkpoint_position, 0, 4, stream)?;
         self.checkpoint_len = Some(self.seq.len);
         Ok(())
     }
@@ -659,9 +663,7 @@ impl MtpDraftState {
     pub fn rollback(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_rollback_once) {
-            return Err(ForgeError::Device(
-                "MTP: wymuszony błąd rollbacku".into(),
-            ));
+            return Err(ForgeError::Device("MTP: wymuszony błąd rollbacku".into()));
         }
         let len = self.checkpoint_len.ok_or_else(|| {
             ForgeError::Scheduler("MTP: rollback bez aktywnego checkpointu".into())
@@ -682,22 +684,10 @@ impl MtpDraftState {
             self.page_table.len(),
             stream,
         )?;
-        self.device.copy(
-            &self.checkpoint_seq_len,
-            0,
-            &self.seq_len,
-            0,
-            4,
-            stream,
-        )?;
-        self.device.copy(
-            &self.checkpoint_position,
-            0,
-            &self.position,
-            0,
-            4,
-            stream,
-        )?;
+        self.device
+            .copy(&self.checkpoint_seq_len, 0, &self.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.checkpoint_position, 0, &self.position, 0, 4, stream)?;
         kv.rollback(&mut self.seq, len);
         self.checkpoint_len = None;
         Ok(())
@@ -725,14 +715,13 @@ impl MtpDraftState {
         retained: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let base = self.checkpoint_len.ok_or_else(|| {
-            ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into())
-        })?;
+        let base = self
+            .checkpoint_len
+            .ok_or_else(|| ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into()))?;
         if retained == 0 || retained > 4 || base + retained > self.seq.len {
             return Err(ForgeError::Scheduler(format!(
                 "MTP: niepoprawna długość zatwierdzenia {retained} dla zakresu {}..{}",
-                base,
-                self.seq.len
+                base, self.seq.len
             )));
         }
         self.device.copy(
@@ -749,14 +738,13 @@ impl MtpDraftState {
     }
 
     pub(crate) fn validate_commit_prefix_metadata(&self, retained: usize) -> Result<usize> {
-        let base = self.checkpoint_len.ok_or_else(|| {
-            ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into())
-        })?;
+        let base = self
+            .checkpoint_len
+            .ok_or_else(|| ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into()))?;
         if retained == 0 || retained > 4 || base + retained > self.seq.len {
             return Err(ForgeError::Scheduler(format!(
                 "MTP: niepoprawna długość zatwierdzenia {retained} dla zakresu {}..{}",
-                base,
-                self.seq.len
+                base, self.seq.len
             )));
         }
         Ok(base + retained)
@@ -824,9 +812,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::kv::KvConfig;
     use forge_formats::{MoeParams, PoolingType};
     use forge_hal::cpu::CpuDevice;
-    use crate::kv::KvConfig;
 
     #[test]
     fn mapowanie_stron_powstaje_tylko_na_granicy() {
@@ -1142,9 +1130,7 @@ mod tests {
             state.grow(&mut kv).unwrap();
         }
         state.checkpoint(&stream).unwrap();
-        device
-            .write(&[7u8; 8], &state.recurrent_hidden, 0)
-            .unwrap();
+        device.write(&[7u8; 8], &state.recurrent_hidden, 0).unwrap();
         device.write(&[3u8; 4], &state.seq_len, 0).unwrap();
         device.write(&[2u8; 4], &state.position, 0).unwrap();
         assert_eq!(kv.free_page_count(), 2);
@@ -1229,9 +1215,7 @@ mod tests {
                     state.save_step_hidden(step, &stream).unwrap();
                 }
 
-                state
-                    .commit_prefix(&mut kv, accepted + 1, &stream)
-                    .unwrap();
+                state.commit_prefix(&mut kv, accepted + 1, &stream).unwrap();
                 assert_eq!(state.seq.len, accepted + 1);
                 assert_eq!(state.checkpoint_len(), None);
                 let mut hidden = [0u8; 8];
@@ -1324,9 +1308,7 @@ mod tests {
         state.grow(&mut kv).unwrap();
         let len = state.seq.len;
         let pages = state.seq.pages.clone();
-        state.checkpoint_hidden = device
-            .alloc(1, MemKind::Device, Pool::Activations)
-            .unwrap();
+        state.checkpoint_hidden = device.alloc(1, MemKind::Device, Pool::Activations).unwrap();
 
         assert!(state.rollback(&mut kv, &stream).is_err());
         assert_eq!(state.seq.len, len);

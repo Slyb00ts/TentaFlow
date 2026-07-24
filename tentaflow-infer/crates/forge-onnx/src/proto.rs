@@ -108,7 +108,9 @@ impl<'a> Reader<'a> {
                 self.read_i32()?;
             }
             other => {
-                return Err(ForgeError::Format(format!("onnx: unknown wire type {other}")));
+                return Err(ForgeError::Format(format!(
+                    "onnx: unknown wire type {other}"
+                )));
             }
         }
         Ok(())
@@ -132,7 +134,9 @@ fn read_packed_varints(bytes: &[u8], out: &mut Vec<i64>) -> Result<()> {
 
 fn read_packed_f32(bytes: &[u8], out: &mut Vec<f32>) -> Result<()> {
     if bytes.len() % 4 != 0 {
-        return Err(ForgeError::Format("onnx: packed float length not /4".into()));
+        return Err(ForgeError::Format(
+            "onnx: packed float length not /4".into(),
+        ));
     }
     for chunk in bytes.chunks_exact(4) {
         out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
@@ -142,7 +146,9 @@ fn read_packed_f32(bytes: &[u8], out: &mut Vec<f32>) -> Result<()> {
 
 fn read_packed_f64(bytes: &[u8], out: &mut Vec<f64>) -> Result<()> {
     if bytes.len() % 8 != 0 {
-        return Err(ForgeError::Format("onnx: packed double length not /8".into()));
+        return Err(ForgeError::Format(
+            "onnx: packed double length not /8".into(),
+        ));
     }
     for chunk in bytes.chunks_exact(8) {
         out.push(f64::from_le_bytes(chunk.try_into().unwrap()));

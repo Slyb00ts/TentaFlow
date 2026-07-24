@@ -60,10 +60,10 @@ fn argmax(v: &[f32]) -> u32 {
 /// Deterministic prompt of `n` valid token ids (cycled seed); `salt` picks a
 /// disjoint token set so different prompts never share a prefix by accident.
 fn make_prompt(n: usize, salt: u32) -> Vec<u32> {
-    let seed = [785u32, 6722, 315, 9625, 374, 264, 2244, 3283, 13, 1084, 702, 3840, 9080];
-    (0..n)
-        .map(|i| seed[i % seed.len()] + salt * 100)
-        .collect()
+    let seed = [
+        785u32, 6722, 315, 9625, 374, 264, 2244, 3283, 13, 1084, 702, 3840, 9080,
+    ];
+    (0..n).map(|i| seed[i % seed.len()] + salt * 100).collect()
 }
 
 /// Greedy generation through the Model directly, borrowing the cached prefix
@@ -166,7 +166,10 @@ fn multi_turn_reuses_prior_turn_kv() {
     assert_eq!(cr1, 0, "turn 1 is the first request, no hit");
     // Turn 2 shares turn 1's whole prefill pages (128 tokens = 4 pages).
     let (ids2, cr2, t2) = greedy_run(&mut model, &turn2, GEN);
-    eprintln!("multi-turn: turn-2 cache_read={cr2} tok, prefill {:.2} ms", t2 * 1e3);
+    eprintln!(
+        "multi-turn: turn-2 cache_read={cr2} tok, prefill {:.2} ms",
+        t2 * 1e3
+    );
     assert_eq!(cr2, 128, "turn 2 should reuse turn 1's 4 whole KV pages");
     assert_eq!(ids2, ids_ref, "multi-turn reuse changed the greedy output");
 }

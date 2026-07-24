@@ -169,7 +169,11 @@ pub fn compute_logprob(logits: &[f32], sampled: u32, top_n: usize) -> TokenLogpr
         0.0
     };
     // log-sum-exp; guards the degenerate all -inf case (sum == 0 → lse -inf).
-    let lse = if sum > 0.0 { max + sum.ln() } else { f32::NEG_INFINITY };
+    let lse = if sum > 0.0 {
+        max + sum.ln()
+    } else {
+        f32::NEG_INFINITY
+    };
     let lp = |l: f32| {
         if l.is_finite() && lse.is_finite() {
             l - lse
@@ -211,11 +215,7 @@ pub struct Rng(u64);
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Rng(if seed == 0 {
-            0x9E3779B97F4A7C15
-        } else {
-            seed
-        })
+        Rng(if seed == 0 { 0x9E3779B97F4A7C15 } else { seed })
     }
 
     fn next_f32(&mut self) -> f32 {
@@ -377,8 +377,7 @@ impl GpuSampler {
     /// so an unbounded candidate set has no GPU form).
     pub fn compatible(params: &SamplingParams) -> bool {
         let p = params.clone().sanitized();
-        p.temperature <= 0.0
-            || (p.top_k >= 1 && p.top_k <= forge_kernels::SAMPLE_MAX_TOPK)
+        p.temperature <= 0.0 || (p.top_k >= 1 && p.top_k <= forge_kernels::SAMPLE_MAX_TOPK)
     }
 
     pub fn new(params: SamplingParams) -> Self {
@@ -610,7 +609,10 @@ mod tests {
         let expected_lse = 2.0f32 + (1.0 + (-1.0f32).exp() + (-2.0f32).exp()).ln();
 
         assert_eq!(result.top.len(), 3);
-        assert_eq!(result.top.iter().map(|entry| entry.0).collect::<Vec<_>>(), [0, 2, 4]);
+        assert_eq!(
+            result.top.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
         assert!((result.logprob - (2.0 - expected_lse)).abs() < 1e-6);
         assert!(result.top.iter().all(|entry| entry.1.is_finite()));
     }

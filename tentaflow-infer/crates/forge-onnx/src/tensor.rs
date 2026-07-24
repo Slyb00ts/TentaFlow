@@ -54,7 +54,11 @@ impl Tensor {
         for v in &values {
             data.extend_from_slice(&v.to_le_bytes());
         }
-        Self { dtype: DType::F32, shape, data }
+        Self {
+            dtype: DType::F32,
+            shape,
+            data,
+        }
     }
 
     pub fn from_i64(shape: Vec<usize>, values: Vec<i64>) -> Self {
@@ -62,7 +66,11 @@ impl Tensor {
         for v in &values {
             data.extend_from_slice(&v.to_le_bytes());
         }
-        Self { dtype: DType::I64, shape, data }
+        Self {
+            dtype: DType::I64,
+            shape,
+            data,
+        }
     }
 
     pub fn from_bool(shape: Vec<usize>, values: Vec<bool>) -> Self {
@@ -178,7 +186,11 @@ impl Tensor {
                     raw.len()
                 )));
             }
-            return Ok(Self { dtype, shape, data: raw.clone() });
+            return Ok(Self {
+                dtype,
+                shape,
+                data: raw.clone(),
+            });
         }
 
         let data = match dtype {
@@ -188,9 +200,7 @@ impl Tensor {
             DType::I32 | DType::I16 | DType::I8 => {
                 flatten(&t.int32_data, numel, |v| v.to_le_bytes().to_vec(), &t.name)?
             }
-            DType::Bool | DType::U8 => {
-                flatten(&t.int32_data, numel, |v| vec![v as u8], &t.name)?
-            }
+            DType::Bool | DType::U8 => flatten(&t.int32_data, numel, |v| vec![v as u8], &t.name)?,
             DType::U64 | DType::U32 | DType::U16 => {
                 flatten(&t.uint64_data, numel, |v| v.to_le_bytes().to_vec(), &t.name)?
             }

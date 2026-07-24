@@ -33,7 +33,10 @@ fn greedy_sampler() -> GpuSampler {
     })
 }
 
-fn prepare(model: &mut Model, prompt: &[u32]) -> Result<(forge_engine::kv::SeqKv, u32), Box<dyn std::error::Error>> {
+fn prepare(
+    model: &mut Model,
+    prompt: &[u32],
+) -> Result<(forge_engine::kv::SeqKv, u32), Box<dyn std::error::Error>> {
     let mut seq = model.new_seq();
     model.prefill_chunk(&mut seq, prompt)?;
     let first = model.sample_last_logits(&mut greedy_sampler())?;
@@ -131,14 +134,22 @@ fn adaptive_mtp_trial(
     while tokens.len() < target {
         tokens.push(fed);
         let preferred = if cycles < 4 {
-            if cycles.is_multiple_of(2) { 3 } else { 2 }
+            if cycles.is_multiple_of(2) {
+                3
+            } else {
+                2
+            }
         } else if k3_rate.unwrap_or(0.0) >= k2_rate.unwrap_or(0.0) {
             3
         } else {
             2
         };
         let budget = if cycles >= 4 && cycles.is_multiple_of(16) {
-            if preferred == 3 { 2 } else { 3 }
+            if preferred == 3 {
+                2
+            } else {
+                3
+            }
         } else {
             preferred
         };
@@ -148,7 +159,11 @@ fn adaptive_mtp_trial(
             .map_err(|error| format!("adaptacyjny cykl MTP {cycles}, fed={fed}: {error}"))?;
         let cycle_rate = (accepted + 1) as f64 / cycle_started.elapsed().as_secs_f64();
         if cycles > 0 {
-            let rate = if budget == 2 { &mut k2_rate } else { &mut k3_rate };
+            let rate = if budget == 2 {
+                &mut k2_rate
+            } else {
+                &mut k3_rate
+            };
             *rate = Some(rate.map_or(cycle_rate, |previous| previous * 0.75 + cycle_rate * 0.25));
         }
         for &token in &draft[..accepted] {
@@ -300,7 +315,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|trial| trial.drafted_by_position[position])
                 .sum::<usize>();
-            if drafted == 0 { 0.0 } else { accepted as f64 * 100.0 / drafted as f64 }
+            if drafted == 0 {
+                0.0
+            } else {
+                accepted as f64 * 100.0 / drafted as f64
+            }
         })
         .collect();
     println!(

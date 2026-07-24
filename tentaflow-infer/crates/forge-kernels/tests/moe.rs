@@ -32,7 +32,9 @@ fn device() -> Option<Arc<CudaDevice>> {
 fn upload_f16(dev: &dyn Device, vals: &[f32]) -> DevBuffer {
     let host: Vec<f16> = vals.iter().map(|&v| f16::from_f32(v)).collect();
     let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
-    let buf = dev.alloc(bytes.len(), MemKind::Device, Pool::Weights).unwrap();
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
     dev.write(bytes, &buf, 0).unwrap();
     buf
 }
@@ -108,7 +110,8 @@ fn run_case(n_tokens: usize, hidden: usize, n_expert: usize, top_k: usize, norm_
 
     kernels
         .moe_router_f16(
-            &ids_dev, &wt_dev, &x_dev, &w_dev, n_tokens, hidden, n_expert, top_k, norm_topk, &stream,
+            &ids_dev, &wt_dev, &x_dev, &w_dev, n_tokens, hidden, n_expert, top_k, norm_topk,
+            &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();

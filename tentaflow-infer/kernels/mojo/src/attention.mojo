@@ -5,7 +5,7 @@
 # score matrix is ever materialized. head_dim is a compile-time parameter —
 # specializations are registered in build_kernels.mojo per supported size.
 
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
 from std.gpu.sync import barrier
 from std.gpu.primitives import warp
 from std.gpu.memory import AddressSpace
@@ -14,9 +14,12 @@ from std.math import exp, rsqrt, cos, sin, pow
 from src.reduce import block_reduce_sum
 from src.kv_fp8 import kv_frag_f32
 
-comptime WARP_SIZE = 32
 comptime MAX_WARPS = 8
 comptime NEG_INF: Float32 = -1e30
+comptime HD256 = 256
+comptime HD256_ELEMENTS_PER_LANE = 8
+comptime HD256_SPLITS = 8
+comptime HD256_PARTIAL_STRIDE = 260
 
 
 def attn_decode_f16[head_dim: Int](
@@ -125,10 +128,137 @@ def attn_decode_f16[head_dim: Int](
 
 comptime attn_decode_f16_hd64 = attn_decode_f16[64]
 comptime attn_decode_f16_hd128 = attn_decode_f16[128]
-# qwen35moe full-attention layers use head_dim 256 (n_embd_head_k). RoPE, QK
-# norm and the paged append run as separate launches for this arch, so the
-# plain (non-fused) decode/prefill specializations are the ones wired in.
 comptime attn_decode_f16_hd256 = attn_decode_f16[256]
+
+
+def attn_decode_split8_f16_hd256(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+):
+    seq = Int(block_idx.x)
+    query_head = Int(block_idx.y)
+    partition = Int(block_idx.z)
+    kv_head = query_head // (n_q_heads // n_kv_heads)
+    lane = Int(thread_idx.x) % WARP_SIZE
+    warp_id = Int(thread_idx.x) // WARP_SIZE
+    warps = Int(block_dim.x) // WARP_SIZE
+    context = Int(seq_lens[seq])
+    query_base = (seq * n_q_heads + query_head) * HD256
+    lane_element = lane * HD256_ELEMENTS_PER_LANE
+    query = (q + query_base + lane_element).load[
+        width=HD256_ELEMENTS_PER_LANE, alignment=16
+    ]().cast[DType.float32]()
+
+    var maximum: Float32 = NEG_INF
+    var denominator: Float32 = 0.0
+    var output = SIMD[DType.float32, HD256_ELEMENTS_PER_LANE](0.0)
+    var position = partition + warp_id * HD256_SPLITS
+    while position < context:
+        page = Int(page_table[seq * max_pages + position // page_size])
+        cache_base = (
+            (page * n_kv_heads + kv_head) * page_size + position % page_size
+        ) * HD256 + lane_element
+        key = (k_cache + cache_base).load[
+            width=HD256_ELEMENTS_PER_LANE, alignment=16
+        ]().cast[DType.float32]()
+        value = (v_cache + cache_base).load[
+            width=HD256_ELEMENTS_PER_LANE, alignment=16
+        ]().cast[DType.float32]()
+        score = warp.sum((query * key).reduce_add()) * scale
+        next_maximum = max(maximum, score)
+        correction = exp(maximum - next_maximum)
+        probability = exp(score - next_maximum)
+        denominator = denominator * correction + probability
+        output = output * correction + value * probability
+        maximum = next_maximum
+        position += warps * HD256_SPLITS
+
+    shared_maximum = stack_allocation[
+        MAX_WARPS, Float32, address_space=AddressSpace.SHARED
+    ]()
+    shared_denominator = stack_allocation[
+        MAX_WARPS, Float32, address_space=AddressSpace.SHARED
+    ]()
+    shared_output = stack_allocation[
+        MAX_WARPS * HD256, Float32, address_space=AddressSpace.SHARED
+    ]()
+    if lane == 0:
+        shared_maximum[warp_id] = maximum
+        shared_denominator[warp_id] = denominator
+    (shared_output + warp_id * HD256 + lane_element).store[
+        width=HD256_ELEMENTS_PER_LANE, alignment=16
+    ](output)
+    barrier()
+
+    if warp_id == 0:
+        var block_maximum: Float32 = NEG_INF
+        for index in range(warps):
+            block_maximum = max(block_maximum, shared_maximum[index])
+        var block_denominator: Float32 = 0.0
+        var block_output = SIMD[DType.float32, HD256_ELEMENTS_PER_LANE](0.0)
+        for index in range(warps):
+            factor = exp(shared_maximum[index] - block_maximum)
+            block_denominator += shared_denominator[index] * factor
+            partial = (shared_output + index * HD256 + lane_element).load[
+                width=HD256_ELEMENTS_PER_LANE, alignment=16
+            ]()
+            block_output += partial * factor
+        partial_base = (
+            (seq * n_q_heads + query_head) * HD256_SPLITS + partition
+        ) * HD256_PARTIAL_STRIDE
+        (partial_ptr + partial_base + lane_element).store[
+            width=HD256_ELEMENTS_PER_LANE, alignment=16
+        ](block_output)
+        if lane == 0:
+            partial_ptr[partial_base + HD256] = block_maximum
+            partial_ptr[partial_base + HD256 + 1] = block_denominator
+
+
+def attn_decode_split8_combine_f16_hd256(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    seq = Int(block_idx.x)
+    query_head = Int(block_idx.y)
+    lane = Int(thread_idx.x)
+    lane_element = lane * HD256_ELEMENTS_PER_LANE
+    query_base = (seq * n_q_heads + query_head) * HD256
+    head_base = (
+        (seq * n_q_heads + query_head)
+        * HD256_SPLITS
+        * HD256_PARTIAL_STRIDE
+    )
+    var maximum: Float32 = NEG_INF
+    for partition in range(HD256_SPLITS):
+        maximum = max(
+            maximum,
+            partial_ptr[
+                head_base + partition * HD256_PARTIAL_STRIDE + HD256
+            ],
+        )
+    var denominator: Float32 = 0.0
+    var output = SIMD[DType.float32, HD256_ELEMENTS_PER_LANE](0.0)
+    for partition in range(HD256_SPLITS):
+        partial_base = head_base + partition * HD256_PARTIAL_STRIDE
+        factor = exp(partial_ptr[partial_base + HD256] - maximum)
+        denominator += partial_ptr[partial_base + HD256 + 1] * factor
+        partial = (partial_ptr + partial_base + lane_element).load[
+            width=HD256_ELEMENTS_PER_LANE, alignment=16
+        ]()
+        output += partial * factor
+    (out_ptr + query_base + lane_element).store[
+        width=HD256_ELEMENTS_PER_LANE, alignment=16
+    ]((output / denominator).cast[DType.float16]())
 
 
 def attn_decode_batch_exact_f16[head_dim: Int](
@@ -220,7 +350,7 @@ def attn_decode_batch_exact_f16[head_dim: Int](
 comptime attn_decode_batch_exact_f16_hd256 = attn_decode_batch_exact_f16[256]
 
 
-def attn_verify_segmented_f16_hd256(
+def attn_verify_segmented_f16[head_dim: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
     k_cache: UnsafePointer[Float16, MutAnyOrigin],
@@ -234,8 +364,7 @@ def attn_verify_segmented_f16_hd256(
     max_pages: Int,
     scale: Float32,
 ):
-    """Przenośna atencja verifiera dla segmentów sequence-major `[B,T]`."""
-    comptime head_dim = 256
+    """Przenośna atencja dla segmentów sequence-major `[B,T]`."""
     token = Int(block_idx.x)
     qh = Int(block_idx.y)
     kvh = qh // (n_q_heads // n_kv_heads)
@@ -271,7 +400,7 @@ def attn_verify_segmented_f16_hd256(
     out_ptr[q_base + element] = Float16(output / denominator)
 
 
-def attn_verify_segmented_f16_hd256_warp32(
+def attn_verify_segmented_f16_warp32[head_dim: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
     k_cache: UnsafePointer[Float16, MutAnyOrigin],
@@ -285,8 +414,7 @@ def attn_verify_segmented_f16_hd256_warp32(
     max_pages: Int,
     scale: Float32,
 ):
-    """Dokładna atencja verifiera NVIDIA dla osobnych tablic stron."""
-    comptime head_dim = 256
+    """Dokładna atencja NVIDIA dla osobnych tablic stron."""
     comptime elements_per_lane = head_dim // WARP_SIZE
     token = Int(block_idx.x)
     qh = Int(block_idx.y)
@@ -360,6 +488,12 @@ def attn_verify_segmented_f16_hd256_warp32(
             out_ptr[q_base + element * WARP_SIZE + lane_id] = Float16(
                 merged_output[element] * inverse_denominator
             )
+
+
+comptime attn_verify_segmented_f16_hd128 = attn_verify_segmented_f16[128]
+comptime attn_verify_segmented_f16_hd256 = attn_verify_segmented_f16[256]
+comptime attn_verify_segmented_f16_hd128_warp32 = attn_verify_segmented_f16_warp32[128]
+comptime attn_verify_segmented_f16_hd256_warp32 = attn_verify_segmented_f16_warp32[256]
 
 
 def attn_decode_split[head_dim: Int, kv_dtype: DType](

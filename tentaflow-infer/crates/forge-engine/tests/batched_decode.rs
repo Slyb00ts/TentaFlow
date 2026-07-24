@@ -187,11 +187,15 @@ fn throughput_scaling() {
 }
 
 fn prompt_a() -> Vec<u32> {
-    vec![151644, 872, 198, 105043, 100165, 11319, 151645, 198, 151644, 77091, 198]
+    vec![
+        151644, 872, 198, 105043, 100165, 11319, 151645, 198, 151644, 77091, 198,
+    ]
 }
 
 fn prompt_b() -> Vec<u32> {
-    vec![151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645, 198, 151644, 77091, 198]
+    vec![
+        151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645, 198, 151644, 77091, 198,
+    ]
 }
 
 #[test]
@@ -201,11 +205,18 @@ fn batched_matches_single_seq() {
     // (a) B=1 batched must match the legacy fused single-seq greedy stream.
     let single_a = single_seq_greedy(&mut model, &prompt_a(), STEPS);
     let b1 = batched_greedy(&mut model, &[prompt_a()], STEPS);
-    assert_eq!(single_a, b1[0], "B=1 batched diverged from single-seq greedy");
+    assert_eq!(
+        single_a, b1[0],
+        "B=1 batched diverged from single-seq greedy"
+    );
 
     // (b) N identical prompts must all produce identical streams, equal to the
     // single-sequence result (per-seq isolation + correct paged attention).
-    let same = batched_greedy(&mut model, &[prompt_a(), prompt_a(), prompt_a(), prompt_a()], STEPS);
+    let same = batched_greedy(
+        &mut model,
+        &[prompt_a(), prompt_a(), prompt_a(), prompt_a()],
+        STEPS,
+    );
     for (j, s) in same.iter().enumerate() {
         assert_eq!(*s, single_a, "identical-prompt lane {j} diverged");
     }
@@ -213,7 +224,11 @@ fn batched_matches_single_seq() {
     // (c) Distinct prompts in one batch must each match their own single-seq
     // greedy generation.
     let single_b = single_seq_greedy(&mut model, &prompt_b(), STEPS);
-    let mixed = batched_greedy(&mut model, &[prompt_a(), prompt_b(), prompt_a(), prompt_b()], STEPS);
+    let mixed = batched_greedy(
+        &mut model,
+        &[prompt_a(), prompt_b(), prompt_a(), prompt_b()],
+        STEPS,
+    );
     assert_eq!(mixed[0], single_a, "mixed lane 0 (prompt A) diverged");
     assert_eq!(mixed[1], single_b, "mixed lane 1 (prompt B) diverged");
     assert_eq!(mixed[2], single_a, "mixed lane 2 (prompt A) diverged");

@@ -84,9 +84,7 @@ fn default_dest(repo: &str) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("forge")
-        .join("hub")
-        .join(repo.replace('/', "--"))
+    base.join("forge").join("hub").join(repo.replace('/', "--"))
 }
 
 /// Fetch the recursive repo tree, following `Link: rel="next"` pagination.
@@ -185,21 +183,29 @@ async fn download_file(client: &reqwest::Client, f: &RemoteFile<'_>, dest: &Path
         expected_sha256,
     } = *f;
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let label = dest.file_name().and_then(|s| s.to_str()).unwrap_or(remote_path);
+    let label = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(remote_path);
 
     // A complete destination of the right size (and hash, if known) is kept.
     if let Ok(meta) = std::fs::metadata(dest) {
         if expected_size == 0 || meta.len() == expected_size {
             if let Some(sha) = expected_sha256 {
                 if sha256_file(dest).await? == sha {
-                    eprintln!("{label}: already present ({:.1} MB), skipping", mb(meta.len()));
+                    eprintln!(
+                        "{label}: already present ({:.1} MB), skipping",
+                        mb(meta.len())
+                    );
                     return Ok(());
                 }
             } else {
-                eprintln!("{label}: already present ({:.1} MB), skipping", mb(meta.len()));
+                eprintln!(
+                    "{label}: already present ({:.1} MB), skipping",
+                    mb(meta.len())
+                );
                 return Ok(());
             }
         }
@@ -335,8 +341,8 @@ fn print_progress(label: &str, done: u64, total: u64, start: Instant) {
 async fn sha256_file(path: &Path) -> Result<String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<String> {
-        let mut file = std::fs::File::open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let mut hasher = Sha256::new();
         std::io::copy(&mut file, &mut hasher).context("hash file")?;
         Ok(format!("{:x}", hasher.finalize()))
@@ -372,7 +378,10 @@ fn auto_gguf<'a>(ggufs: &'a [&'a TreeEntry]) -> Result<&'a TreeEntry> {
         .iter()
         .find(|e| e.path.to_ascii_lowercase().contains("q4_k_m"))
     {
-        eprintln!("multiple quants found; selecting default Q4_K_M: {}", e.path);
+        eprintln!(
+            "multiple quants found; selecting default Q4_K_M: {}",
+            e.path
+        );
         return Ok(e);
     }
     let list = ggufs
@@ -380,9 +389,7 @@ fn auto_gguf<'a>(ggufs: &'a [&'a TreeEntry]) -> Result<&'a TreeEntry> {
         .map(|e| format!("  {}  ({:.1} MB)", e.path, mb(e.byte_len())))
         .collect::<Vec<_>>()
         .join("\n");
-    bail!(
-        "repo has multiple GGUF quants and no Q4_K_M default; choose one with --file:\n{list}"
-    )
+    bail!("repo has multiple GGUF quants and no Q4_K_M default; choose one with --file:\n{list}")
 }
 
 /// Entry point for `forge pull`. Returns the final path to hand to `forge run`.
@@ -393,7 +400,9 @@ pub async fn pull(
     token: Option<String>,
     dir: Option<PathBuf>,
 ) -> Result<PathBuf> {
-    let token = token.or_else(|| std::env::var("HF_TOKEN").ok()).filter(|t| !t.is_empty());
+    let token = token
+        .or_else(|| std::env::var("HF_TOKEN").ok())
+        .filter(|t| !t.is_empty());
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .build()
@@ -412,8 +421,7 @@ pub async fn pull(
         .collect();
 
     let dest_dir = dir.unwrap_or_else(|| default_dest(&repo));
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("create {}", dest_dir.display()))?;
+    std::fs::create_dir_all(&dest_dir).with_context(|| format!("create {}", dest_dir.display()))?;
 
     // GGUF repo → download a single quant file. Otherwise a safetensors snapshot.
     if !ggufs.is_empty() {
@@ -424,7 +432,11 @@ pub async fn pull(
         };
         let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
         let dest = dest_dir.join(name);
-        eprintln!("downloading {} ({:.1} MB)", entry.path, mb(entry.byte_len()));
+        eprintln!(
+            "downloading {} ({:.1} MB)",
+            entry.path,
+            mb(entry.byte_len())
+        );
         download_file(
             &client,
             &RemoteFile {
@@ -462,7 +474,11 @@ pub async fn pull(
     eprintln!("downloading snapshot: {} files", wanted.len());
     for entry in &wanted {
         let dest = dest_dir.join(&entry.path);
-        eprintln!("downloading {} ({:.1} MB)", entry.path, mb(entry.byte_len()));
+        eprintln!(
+            "downloading {} ({:.1} MB)",
+            entry.path,
+            mb(entry.byte_len())
+        );
         download_file(
             &client,
             &RemoteFile {

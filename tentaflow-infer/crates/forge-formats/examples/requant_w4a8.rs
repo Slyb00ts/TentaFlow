@@ -6,7 +6,12 @@
 
 use forge_formats::{dequantize_to_f32, Gguf};
 
-fn gsz() -> usize { std::env::var("GRP").ok().and_then(|v| v.parse().ok()).unwrap_or(128) }
+fn gsz() -> usize {
+    std::env::var("GRP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
 
 // Symmetric int4 per group: q in [-8,7], scale = max|w|/7.
 fn requant_sym(row: &[f32], out: &mut [f32]) {

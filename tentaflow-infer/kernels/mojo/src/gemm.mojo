@@ -2899,7 +2899,8 @@ def quantize_act_q8_1(
         xsm[sidx] = d * Float32(sumq)
 
 
-def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
+@always_inline
+def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq_g: UnsafePointer[Int8, MutAnyOrigin],
@@ -2908,6 +2909,8 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     n_cols: Int,
     n_rows: Int,
     n_tokens: Int,
+    row0: Int,
+    t0: Int,
 ):
     # NW-warp block (NW*32 threads). One block owns a BM-token x BN-row output
     # tile. Warps split M_WARPS x N_WARPS; each warp owns MT_PER_WARP=2 token
@@ -2929,9 +2932,6 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     comptime BPR_DIV = 32 if FMT == 0 else 256
 
     tid = Int(thread_idx.x)
-    row0 = Int(block_idx.x) * BN
-    t0 = Int(block_idx.y) * BM
-
     xq = stack_allocation[
         2 * BM * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
     ]()
@@ -3167,6 +3167,84 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
                     y[tok_b * n_rows + r_a] = Float16(d4[2])
                 if r_b < n_rows:
                     y[tok_b * n_rows + r_b] = Float16(d4[3])
+
+
+def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    gemm_i8mma_tile_impl[BM, BN, NW, FMT](
+        y,
+        w,
+        xq_g,
+        xd_g,
+        xsm_g,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(block_idx.y) * BM,
+    )
+
+
+def gemm_q8_0_i8mma_triplet_bm64(
+    y0: UnsafePointer[Float16, MutAnyOrigin],
+    w0: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows0: Int,
+    y1: UnsafePointer[Float16, MutAnyOrigin],
+    w1: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows1: Int,
+    y2: UnsafePointer[Float16, MutAnyOrigin],
+    w2: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows2: Int,
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_tokens: Int,
+):
+    comptime BM = 64
+    comptime BN = 64
+    tile = Int(block_idx.x)
+    blocks0 = (n_rows0 + BN - 1) // BN
+    blocks1 = (n_rows1 + BN - 1) // BN
+    t0 = Int(block_idx.y) * BM
+    if tile < blocks0:
+        gemm_i8mma_tile_impl[BM, BN, 8, 0](
+            y0, w0, xq_g, xd_g, xsm_g, n_cols, n_rows0, n_tokens, tile * BN, t0
+        )
+    elif tile < blocks0 + blocks1:
+        gemm_i8mma_tile_impl[BM, BN, 8, 0](
+            y1,
+            w1,
+            xq_g,
+            xd_g,
+            xsm_g,
+            n_cols,
+            n_rows1,
+            n_tokens,
+            (tile - blocks0) * BN,
+            t0,
+        )
+    else:
+        gemm_i8mma_tile_impl[BM, BN, 8, 0](
+            y2,
+            w2,
+            xq_g,
+            xd_g,
+            xsm_g,
+            n_cols,
+            n_rows2,
+            n_tokens,
+            (tile - blocks0 - blocks1) * BN,
+            t0,
+        )
 
 
 comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 64, 8, 0]

@@ -77,7 +77,15 @@ fn op_histogram_lists_silero_ops() {
     let hist = forge_onnx::op_histogram(&model);
     // The parser must recover the real op set, including the ops inside the
     // sample-rate / state-init If subgraphs (Conv, LSTM, …).
-    for op in ["Conv", "LSTM", "Sigmoid", "Relu", "ReduceMean", "If", "Slice"] {
+    for op in [
+        "Conv",
+        "LSTM",
+        "Sigmoid",
+        "Relu",
+        "ReduceMean",
+        "If",
+        "Slice",
+    ] {
         assert!(hist.contains_key(op), "missing op {op} in {hist:?}");
     }
     eprintln!("silero_vad op histogram: {hist:?}");

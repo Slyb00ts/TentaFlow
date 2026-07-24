@@ -34,7 +34,9 @@ fn write_read_roundtrip() {
 fn copy_between_buffers() {
     let dev = CpuDevice::new();
     let stream = dev.create_stream().unwrap();
-    let src = dev.alloc(256, MemKind::PinnedHost, Pool::Activations).unwrap();
+    let src = dev
+        .alloc(256, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
     let dst = dev.alloc(256, MemKind::Device, Pool::Activations).unwrap();
 
     let payload = vec![0xABu8; 200];

@@ -9,6 +9,10 @@
 set -euo pipefail
 
 REAL_PTXAS="${FORGE_REAL_PTXAS:-/opt/cuda/bin/ptxas}"
+if [[ -n "${FORGE_PTXAS_AUDIT_LOG:-}" ]]; then
+    printf '%q ' "$@" >> "$FORGE_PTXAS_AUDIT_LOG"
+    printf '\n' >> "$FORGE_PTXAS_AUDIT_LOG"
+fi
 
 # Find the .ptx input argument (ptxas is invoked as: ptxas [opts] input.ptx -o out ...).
 patched=()

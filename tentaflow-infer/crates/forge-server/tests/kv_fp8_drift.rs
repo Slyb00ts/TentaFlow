@@ -127,6 +127,7 @@ fn run_pass_ids(
             kv_tier: Default::default(),
             prefix_cache: false,
             native_mtp: false,
+            nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
         },
     )
     .expect("load model");

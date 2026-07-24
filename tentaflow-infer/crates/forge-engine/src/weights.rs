@@ -3,7 +3,8 @@
 // dequant-GEMV kernels read them directly); norms and the embedding table are
 // materialized as f16 because they feed non-quantized kernels.
 
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,9 +13,120 @@ use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
 use forge_formats::w4a8::{col_absmax, smoothing_scale, w4a8_pack_smoothed, W4A8_GROUP};
 use forge_formats::{dequantize_to_f32, Gguf, HfConfig, LayerKind, ModelDescriptor, WeightRole};
+use forge_formats::MtpWeightRole;
 use forge_hal::{DevBuffer, Device, Pool};
+use forge_kernels::{Kernels, Nvfp4GgufLayout};
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
 use half::f16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvFp4CtLayoutPolicy {
+    Auto,
+    RowMajorE4M3,
+    S0N64K128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NvFp4CtLoadPlan {
+    RowMajorE4M3,
+    S0N64K128,
+}
+
+pub enum NvFp4CtStorage {
+    RowMajorE4M3 {
+        packed: DevBuffer,
+        scales: DevBuffer,
+    },
+    S0N64K128 {
+        data: DevBuffer,
+    },
+}
+
+impl NvFp4CtStorage {
+    pub fn row_major(&self) -> Result<(&DevBuffer, &DevBuffer)> {
+        match self {
+            Self::RowMajorE4M3 { packed, scales } => Ok((packed, scales)),
+            Self::S0N64K128 { .. } => Err(ForgeError::Unsupported(
+                "routing S0 N64/K128 nie jest jeszcze aktywny".into(),
+            )),
+        }
+    }
+
+    pub fn s0_data(&self) -> Result<&DevBuffer> {
+        match self {
+            Self::S0N64K128 { data } => Ok(data),
+            Self::RowMajorE4M3 { .. } => Err(ForgeError::Unsupported(
+                "waga NVFP4 nie używa układu S0 N64/K128".into(),
+            )),
+        }
+    }
+}
+
+pub struct NvFp4CtRowWindow<'a> {
+    data: &'a DevBuffer,
+    physical_rows: usize,
+    cols: usize,
+    row_offset: usize,
+    rows: usize,
+}
+
+impl NvFp4CtRowWindow<'_> {
+    fn new(
+        data: &DevBuffer,
+        physical_rows: usize,
+        cols: usize,
+        row_offset: usize,
+        rows: usize,
+    ) -> Result<NvFp4CtRowWindow<'_>> {
+        let expected_bytes = nvfp4_ct_s0_resident_bytes(physical_rows, cols)?;
+        if data.len() != expected_bytes {
+            return Err(ForgeError::Format(format!(
+                "NVFP4 CT resident ma {} bajtów, oczekiwano {expected_bytes}",
+                data.len()
+            )));
+        }
+        let end = row_offset
+            .checked_add(rows)
+            .ok_or_else(|| ForgeError::Format("NVFP4 CT: przepełnienie okna wierszy".into()))?;
+        if rows == 0
+            || !row_offset.is_multiple_of(64)
+            || !rows.is_multiple_of(64)
+            || end > physical_rows
+            || !cols.is_multiple_of(128)
+        {
+            return Err(ForgeError::Format(
+                "NVFP4 CT wymaga niepustego okna wyrównanego do N64".into(),
+            ));
+        }
+        Ok(NvFp4CtRowWindow {
+            data,
+            physical_rows,
+            cols,
+            row_offset,
+            rows,
+        })
+    }
+
+    pub fn data(&self) -> &DevBuffer {
+        self.data
+    }
+
+    pub fn physical_rows(&self) -> usize {
+        self.physical_rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn row_offset(&self) -> usize {
+        self.row_offset
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+}
 
 /// A weight matrix on-device, tagged with how kernels must read it.
 pub enum DevWeight {
@@ -146,8 +258,7 @@ pub enum DevWeight {
     },
     /// NVFP4 packed + FP8 scales (+ inverse global scale) for [rows, cols].
     NvFp4 {
-        packed: DevBuffer,
-        scales: DevBuffer,
+        storage: NvFp4CtStorage,
         inv_global_scale: f32,
         rows: usize,
         cols: usize,
@@ -158,10 +269,31 @@ pub enum DevWeight {
         output_scale: f32,
         rows: usize,
         cols: usize,
+        layout: Nvfp4GgufLayout,
     },
 }
 
 impl DevWeight {
+    pub fn nvfp4_ct_row_window(
+        &self,
+        row_offset: usize,
+        rows: usize,
+    ) -> Result<NvFp4CtRowWindow<'_>> {
+        let DevWeight::NvFp4 {
+            storage,
+            rows: physical_rows,
+            cols,
+            ..
+        } = self
+        else {
+            return Err(ForgeError::Unsupported(
+                "okno S0 wymaga wagi compressed-tensors NVFP4".into(),
+            ));
+        };
+        let data = storage.s0_data()?;
+        NvFp4CtRowWindow::new(data, *physical_rows, *cols, row_offset, rows)
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             DevWeight::F16 { rows, .. }
@@ -285,7 +417,7 @@ pub struct Fp8Layer {
     pub down: Fp8Weight,
 }
 
-/// Paczki FP8 dla Q/O i projekcji FFN hybrydowego prefillu.
+/// Paczki FP8 dla projekcji używanych przez hybrydowy prefill.
 pub struct Fp8FfnLayer {
     pub q: Fp8Weight,
     pub attn_o: Fp8Weight,
@@ -312,7 +444,10 @@ pub fn fp8_modular_enabled() -> bool {
 
 /// Czy wybrano hybrydowy prefill FP8 tylko dla FFN.
 pub fn fp8_ffn_modular_enabled() -> bool {
-    std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod-ffn")
+    matches!(
+        std::env::var("FORGE_GEMM").ok().as_deref(),
+        None | Some("fp8mod-ffn")
+    )
 }
 
 /// Per-input-channel activation abs-max collected during the W4A8 calibration
@@ -504,6 +639,7 @@ pub struct ModelWeights {
     pub fp8_modular: bool,
     /// Opcjonalna natywna warstwa NextN współdzieląca embedding i LM head targetu.
     pub mtp: Option<MtpWeights>,
+    pub nvfp4_repacked_weights: usize,
 }
 
 /// Source-agnostic host-side tensor fetch: (bytes, dtype, quant, dims).
@@ -522,6 +658,7 @@ trait TensorSource {
 struct SourceMtpLoader<'a> {
     device: &'a dyn Device,
     source: &'a dyn TensorSource,
+    nvfp4_ct: Option<&'a NvFp4CtUploadContext<'a>>,
 }
 
 impl MtpTensorLoader for SourceMtpLoader<'_> {
@@ -534,7 +671,7 @@ impl MtpTensorLoader for SourceMtpLoader<'_> {
                 weight.cols()
             )));
         }
-        upload_weight(self.device, weight)
+        upload_weight_with_nvfp4_ct(self.device, weight, self.nvfp4_ct)
     }
 
     fn vector(&mut self, name: &str, len: usize) -> Result<DevBuffer> {
@@ -564,6 +701,485 @@ struct NvFp4Host {
     global_scale: f32,
     rows: usize,
     cols: usize,
+}
+
+const NVFP4_CT_STAGING_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct NvFp4CtUploadIdentity {
+    names: Vec<String>,
+    rows: usize,
+    cols: usize,
+    global_scale_bits: u32,
+}
+
+struct NvFp4CtPreflight {
+    plan: NvFp4CtLoadPlan,
+    max_cols: usize,
+    expected_identities: HashSet<NvFp4CtUploadIdentity>,
+}
+
+struct NvFp4CtUploadContext<'a> {
+    kernels: &'a Kernels,
+    stream: &'a forge_hal::Stream,
+    plan: NvFp4CtLoadPlan,
+    packed_scratch: Option<DevBuffer>,
+    scale_scratch: Option<DevBuffer>,
+    chunk_rows: usize,
+    expected_identities: HashSet<NvFp4CtUploadIdentity>,
+    completed_identities: RefCell<HashSet<NvFp4CtUploadIdentity>>,
+}
+
+fn allocate_nvfp4_ct_scratch<T>(
+    first_bytes: usize,
+    second_bytes: usize,
+    mut allocate: impl FnMut(usize) -> Result<T>,
+    reset: impl FnOnce() -> Result<()>,
+) -> Result<(T, T)> {
+    let first = allocate(first_bytes)?;
+    match allocate(second_bytes) {
+        Ok(second) => Ok((first, second)),
+        Err(error) => {
+            drop(first);
+            let _ = reset();
+            Err(error)
+        }
+    }
+}
+
+fn resolve_nvfp4_ct_plan(
+    policy: NvFp4CtLayoutPolicy,
+    capable: bool,
+    aligned: bool,
+    tensors: usize,
+) -> Result<NvFp4CtLoadPlan> {
+    match policy {
+        NvFp4CtLayoutPolicy::RowMajorE4M3 => Ok(NvFp4CtLoadPlan::RowMajorE4M3),
+        NvFp4CtLayoutPolicy::Auto if capable && aligned && tensors > 0 => {
+            Ok(NvFp4CtLoadPlan::S0N64K128)
+        }
+        NvFp4CtLayoutPolicy::Auto => Ok(NvFp4CtLoadPlan::RowMajorE4M3),
+        NvFp4CtLayoutPolicy::S0N64K128 if !capable => Err(ForgeError::Unsupported(
+            "S0 N64/K128 wymaga NVIDIA sm80 warp32 i pełnych 16 artefaktów".into(),
+        )),
+        NvFp4CtLayoutPolicy::S0N64K128 if !aligned || tensors == 0 => {
+            Err(ForgeError::Unsupported(
+                "S0 N64/K128 wymaga wszystkich kształtów wyrównanych do N64/K128".into(),
+            ))
+        }
+        NvFp4CtLayoutPolicy::S0N64K128 => Ok(NvFp4CtLoadPlan::S0N64K128),
+    }
+}
+
+fn validate_nvfp4_ct_scale_bytes(name: &str, scales: &[u8]) -> Result<()> {
+    if let Some((index, byte)) = scales
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, byte)| nvfp4::nvfp4_ct_s0_from_e4m3(*byte).is_none())
+    {
+        return Err(ForgeError::Format(format!(
+            "{name}: niedozwolona skala E4M3 0x{byte:02x} pod indeksem {index}"
+        )));
+    }
+    Ok(())
+}
+
+fn nvfp4_ct_s0_resident_bytes(rows: usize, cols: usize) -> Result<usize> {
+    if rows == 0 || cols == 0 || !rows.is_multiple_of(64) || !cols.is_multiple_of(128) {
+        return Err(ForgeError::Format(format!(
+            "NVFP4 CT S0 wymaga kształtu N64/K128, otrzymano [{rows}, {cols}]"
+        )));
+    }
+    rows.checked_mul(cols)
+        .and_then(|elements| elements.checked_mul(9))
+        .and_then(|bytes| bytes.checked_div(16))
+        .ok_or_else(|| ForgeError::Format("NVFP4 CT: przepełnienie resident".into()))
+}
+
+fn validate_nvfp4_ct_packed_metadata(
+    name: &str,
+    dtype: DType,
+    shape: &[usize],
+    group_size: usize,
+) -> Result<(usize, usize)> {
+    if dtype != DType::U8 || shape.len() != 2 {
+        return Err(ForgeError::Format(format!(
+            "{name}: oczekiwano macierzy U8 2D"
+        )));
+    }
+    let rows = shape[0];
+    let cols = shape[1]
+        .checked_mul(2)
+        .ok_or_else(|| ForgeError::Format(format!("{name}: przepełnienie liczby kolumn")))?;
+    if rows == 0 || cols == 0 || !cols.is_multiple_of(group_size) {
+        return Err(ForgeError::Format(format!(
+            "{name}: niedozwolony kształt [{rows}, {cols}]"
+        )));
+    }
+    Ok((rows, cols))
+}
+
+fn validate_nvfp4_ct_scale_metadata(
+    name: &str,
+    dtype: DType,
+    shape: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Result<usize> {
+    let expected_shape = [rows, cols / 16];
+    if dtype != DType::F8E4M3 || shape != expected_shape {
+        return Err(ForgeError::Format(format!(
+            "{name}: oczekiwano F8E4M3 o kształcie {expected_shape:?}"
+        )));
+    }
+    rows.checked_mul(cols / 16)
+        .ok_or_else(|| ForgeError::Format(format!("{name}: przepełnienie rozmiaru")))
+}
+
+fn validate_nvfp4_ct_global_scale_metadata(
+    name: &str,
+    dtype: DType,
+    shape: &[usize],
+    bytes: &[u8],
+) -> Result<f32> {
+    if dtype != DType::F32 || shape != [1] || bytes.len() != 4 {
+        return Err(ForgeError::Format(format!(
+            "{name}: oczekiwano F32 o kształcie [1]"
+        )));
+    }
+    let global_scale = f32::from_le_bytes(
+        bytes
+            .try_into()
+            .expect("sprawdzona długość skali globalnej"),
+    );
+    if !global_scale.is_finite() || global_scale <= 0.0 {
+        return Err(ForgeError::Format(format!(
+            "{name}: skala musi być dodatnia i skończona"
+        )));
+    }
+    Ok(global_scale)
+}
+
+fn validate_nvfp4_ct_companions(name: &str, present: [bool; 3]) -> Result<bool> {
+    if present.iter().any(|value| *value) && !present.iter().all(|value| *value) {
+        return Err(ForgeError::Format(format!(
+            "{name}: niepełna trójka packed/scale/global_scale"
+        )));
+    }
+    Ok(present.iter().all(|value| *value))
+}
+
+fn validate_nvfp4_ct_upload_manifest(
+    plan: NvFp4CtLoadPlan,
+    expected: &HashSet<NvFp4CtUploadIdentity>,
+    completed: &HashSet<NvFp4CtUploadIdentity>,
+) -> Result<()> {
+    if plan == NvFp4CtLoadPlan::S0N64K128 && completed != expected {
+        return Err(ForgeError::Format(
+            "NVFP4 CT: wykonany zbiór uploadów różni się od preflight".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn nvfp4_ct_upload_identity(
+    names: Vec<String>,
+    rows: usize,
+    cols: usize,
+    global_scale_bits: u32,
+) -> NvFp4CtUploadIdentity {
+    NvFp4CtUploadIdentity {
+        names,
+        rows,
+        cols,
+        global_scale_bits,
+    }
+}
+
+fn nvfp4_ct_physical_manifest(
+    descriptor: &ModelDescriptor,
+    native_mtp: bool,
+) -> Result<Vec<Vec<String>>> {
+    let mut manifest = Vec::new();
+    for (index, layer) in descriptor.layers.iter().enumerate() {
+        let name = |role: WeightRole| {
+            layer.get(&role).cloned().ok_or_else(|| {
+                ForgeError::Format(format!("warstwa {index}: brak roli {role:?}"))
+            })
+        };
+        manifest.push(vec![
+            name(WeightRole::AttnQ)?,
+            name(WeightRole::AttnK)?,
+            name(WeightRole::AttnV)?,
+        ]);
+        manifest.push(vec![
+            name(WeightRole::FfnGate)?,
+            name(WeightRole::FfnUp)?,
+        ]);
+        manifest.push(vec![name(WeightRole::FfnDown)?]);
+        manifest.push(vec![name(WeightRole::AttnO)?]);
+    }
+    if native_mtp {
+        let mtp = descriptor.mtp.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into())
+        })?;
+        let matrix_roles = [
+            MtpWeightRole::AttnQ,
+            MtpWeightRole::AttnK,
+            MtpWeightRole::AttnV,
+            MtpWeightRole::AttnO,
+            MtpWeightRole::FfnGate,
+            MtpWeightRole::FfnUp,
+            MtpWeightRole::FfnDown,
+            MtpWeightRole::EhProj,
+        ];
+        for (index, layer) in mtp.layers.iter().enumerate() {
+            if index == 0 {
+                for role in [MtpWeightRole::Embedding, MtpWeightRole::SharedHead] {
+                    if let Some(name) = layer.get(&role) {
+                        manifest.push(vec![name.clone()]);
+                    }
+                }
+            }
+            for role in matrix_roles {
+                let name = layer.get(&role).cloned().ok_or_else(|| {
+                    ForgeError::Format(format!("MTP warstwa {index}: brak roli {role:?}"))
+                })?;
+                manifest.push(vec![name]);
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+fn plan_nvfp4_ct_safetensors(
+    st: &ShardedSafeTensors,
+    scheme: Option<&NvFp4Scheme>,
+    descriptor: &ModelDescriptor,
+    native_mtp: bool,
+    policy: NvFp4CtLayoutPolicy,
+    capable: bool,
+) -> Result<NvFp4CtPreflight> {
+    if descriptor.params.moe.is_some() || descriptor.params.ssm.is_some() {
+        let plan = match policy {
+            NvFp4CtLayoutPolicy::S0N64K128 => {
+                return Err(ForgeError::Unsupported(
+                    "S0 N64/K128 nie obsługuje jeszcze loadera MoE ani hybrid".into(),
+                ))
+            }
+            _ => NvFp4CtLoadPlan::RowMajorE4M3,
+        };
+        return Ok(NvFp4CtPreflight {
+            plan,
+            max_cols: 0,
+            expected_identities: HashSet::new(),
+        });
+    }
+    let Some(scheme) = scheme else {
+        if policy == NvFp4CtLayoutPolicy::S0N64K128 {
+            return Err(ForgeError::Unsupported(
+                "wymuszony S0 wymaga checkpointu compressed-tensors NVFP4".into(),
+            ));
+        }
+        return Ok(NvFp4CtPreflight {
+            plan: NvFp4CtLoadPlan::RowMajorE4M3,
+            max_cols: 0,
+            expected_identities: HashSet::new(),
+        });
+    };
+    if scheme.group_size != 16 {
+        return Err(ForgeError::Unsupported(format!(
+            "NVFP4 CT wymaga group_size=16, otrzymano {}",
+            scheme.group_size
+        )));
+    }
+    let manifest = nvfp4_ct_physical_manifest(descriptor, native_mtp)?;
+    let mut eligible = true;
+    let mut max_cols = 0usize;
+    let mut aligned = true;
+    let mut expected_identities = HashSet::new();
+    for group in &manifest {
+        let mut group_rows = 0usize;
+        let mut group_cols = None;
+        let mut group_scale = None;
+        let mut complete = true;
+        for weight_name in group {
+            let names = NvFp4TensorNames::for_weight(weight_name)?;
+            let present = [
+                st.tensor(&names.packed).is_some(),
+                st.tensor(&names.scale).is_some(),
+                st.tensor(&names.global_scale).is_some(),
+            ];
+            if !validate_nvfp4_ct_companions(weight_name, present)? {
+                complete = false;
+                continue;
+            }
+            let packed = st
+                .tensor(&names.packed)
+                .expect("sprawdzona obecność tensora packed");
+            let (rows, cols) = validate_nvfp4_ct_packed_metadata(
+                &names.packed,
+                packed.dtype,
+                &packed.shape,
+                scheme.group_size,
+            )?;
+            let scale_tensor = st
+                .tensor(&names.scale)
+                .expect("sprawdzona obecność tensora scale");
+            let expected_scales = validate_nvfp4_ct_scale_metadata(
+                &names.scale,
+                scale_tensor.dtype,
+                &scale_tensor.shape,
+                rows,
+                cols,
+            )?;
+            let scales = st.data(&names.scale)?;
+            if scales.len() != expected_scales {
+                return Err(ForgeError::Format(format!(
+                    "{}: {} bajtów, oczekiwano {expected_scales}",
+                    names.scale,
+                    scales.len()
+                )));
+            }
+            validate_nvfp4_ct_scale_bytes(&names.scale, scales)?;
+            let global_tensor = st
+                .tensor(&names.global_scale)
+                .expect("sprawdzona obecność tensora global_scale");
+            let global_bytes = st.data(&names.global_scale)?;
+            let global_scale = validate_nvfp4_ct_global_scale_metadata(
+                &names.global_scale,
+                global_tensor.dtype,
+                &global_tensor.shape,
+                global_bytes,
+            )?;
+            group_rows = group_rows.checked_add(rows).ok_or_else(|| {
+                ForgeError::Format(format!("{weight_name}: przepełnienie fused rows"))
+            })?;
+            if group_cols.replace(cols).is_some_and(|previous| previous != cols)
+                || group_scale
+                    .replace(global_scale.to_bits())
+                    .is_some_and(|previous| previous != global_scale.to_bits())
+            {
+                complete = false;
+            }
+        }
+        if complete {
+            let cols = group_cols.expect("pełna grupa ma kolumny");
+            aligned &= group_rows.is_multiple_of(64) && cols.is_multiple_of(128);
+            max_cols = max_cols.max(cols);
+            let identity = nvfp4_ct_upload_identity(
+                group.clone(),
+                group_rows,
+                cols,
+                group_scale.expect("pełna grupa ma skalę globalną"),
+            );
+            if !expected_identities.insert(identity) {
+                return Err(ForgeError::Format(
+                    "NVFP4 CT: zduplikowana tożsamość fizycznej wagi".into(),
+                ));
+            }
+        } else {
+            eligible = false;
+        }
+    }
+    let plan =
+        resolve_nvfp4_ct_plan(
+            policy,
+            capable,
+            aligned && eligible,
+            expected_identities.len(),
+        )?;
+    Ok(NvFp4CtPreflight {
+        plan,
+        max_cols,
+        expected_identities,
+    })
+}
+
+fn create_nvfp4_ct_upload_context<'a>(
+    device: &dyn Device,
+    kernels: &'a Kernels,
+    stream: &'a forge_hal::Stream,
+    preflight: NvFp4CtPreflight,
+) -> Result<NvFp4CtUploadContext<'a>> {
+    if preflight.plan == NvFp4CtLoadPlan::RowMajorE4M3 {
+        return Ok(NvFp4CtUploadContext {
+            kernels,
+            stream,
+            plan: preflight.plan,
+            packed_scratch: None,
+            scale_scratch: None,
+            chunk_rows: 0,
+            expected_identities: HashSet::new(),
+            completed_identities: RefCell::new(HashSet::new()),
+        });
+    }
+    let row_bytes = preflight
+        .max_cols
+        .checked_mul(9)
+        .and_then(|bytes| bytes.checked_div(16))
+        .ok_or_else(|| ForgeError::Format("NVFP4 CT: przepełnienie stagingu".into()))?;
+    if row_bytes == 0 {
+        return Err(ForgeError::Format(
+            "NVFP4 CT: zerowy rozmiar wiersza stagingu".into(),
+        ));
+    }
+    let chunk_rows = (NVFP4_CT_STAGING_BYTES / row_bytes / 64) * 64;
+    if chunk_rows == 0 {
+        return Err(ForgeError::Unsupported(
+            "NVFP4 CT: pojedynczy kafel N64 przekracza limit stagingu".into(),
+        ));
+    }
+    let packed_bytes = chunk_rows
+        .checked_mul(preflight.max_cols / 2)
+        .ok_or_else(|| ForgeError::Format("NVFP4 CT: przepełnienie stagingu packed".into()))?;
+    let scale_bytes = chunk_rows
+        .checked_mul(preflight.max_cols / 16)
+        .ok_or_else(|| ForgeError::Format("NVFP4 CT: przepełnienie stagingu scales".into()))?;
+    if packed_bytes + scale_bytes > NVFP4_CT_STAGING_BYTES {
+        return Err(ForgeError::Format(
+            "NVFP4 CT: staging przekracza ustalony limit".into(),
+        ));
+    }
+    let resident_bytes = preflight
+        .expected_identities
+        .iter()
+        .try_fold(0usize, |total, identity| {
+            total.checked_add(nvfp4_ct_s0_resident_bytes(identity.rows, identity.cols)?)
+                .ok_or_else(|| ForgeError::Format("NVFP4 CT: przepełnienie sumy resident".into()))
+        })?;
+    tracing::info!(
+        expected_uploads = preflight.expected_identities.len(),
+        resident_bytes,
+        staging_peak_bytes = packed_bytes + scale_bytes,
+        chunk_rows,
+        "plan uploadu NVFP4 CT S0"
+    );
+    let (packed_scratch, scale_scratch) = allocate_nvfp4_ct_scratch(
+        packed_bytes,
+        scale_bytes,
+        |bytes| device.alloc(bytes, MemKind::Device, Pool::Activations),
+        || device.reset_activations().map(|_| ()),
+    )?;
+    Ok(NvFp4CtUploadContext {
+        kernels,
+        stream,
+        plan: preflight.plan,
+        packed_scratch: Some(packed_scratch),
+        scale_scratch: Some(scale_scratch),
+        chunk_rows,
+        expected_identities: preflight.expected_identities,
+        completed_identities: RefCell::new(HashSet::new()),
+    })
+}
+
+fn finish_nvfp4_ct_load<T>(load: Result<T>, reset: Result<()>) -> Result<T> {
+    match (load, reset) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 struct GgufSource<'a>(&'a Gguf);
@@ -723,11 +1339,7 @@ fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
     Ok(buf)
 }
 
-fn nvfp4_gguf_output_scale(
-    src: &dyn TensorSource,
-    name: &str,
-    quant: QuantKind,
-) -> Result<f32> {
+fn nvfp4_gguf_output_scale(src: &dyn TensorSource, name: &str, quant: QuantKind) -> Result<f32> {
     if quant != QuantKind::NVFP4Gguf {
         return Ok(1.0);
     }
@@ -890,6 +1502,7 @@ enum HostWeight {
         cols: usize,
     },
     NvFp4 {
+        names: Vec<String>,
         packed: Vec<u8>,
         scales: Vec<u8>,
         global_scale: f32,
@@ -907,9 +1520,7 @@ enum HostWeight {
 impl HostWeight {
     fn mtp_device_bytes(&self) -> Option<usize> {
         match self {
-            HostWeight::Q8_0 { data, .. } | HostWeight::NvFp4Gguf { data, .. } => {
-                Some(data.len())
-            }
+            HostWeight::Q8_0 { data, .. } | HostWeight::NvFp4Gguf { data, .. } => Some(data.len()),
             _ => None,
         }
     }
@@ -1004,6 +1615,7 @@ fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
             16,
         )?;
         return Ok(HostWeight::NvFp4 {
+            names: vec![name.to_string()],
             packed: nv.packed,
             scales: nv.scales,
             global_scale: nv.global_scale,
@@ -1236,14 +1848,17 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
             cols,
         }),
         HostWeight::NvFp4 {
+            names: _,
             packed,
             scales,
             global_scale,
             rows,
             cols,
         } => Ok(DevWeight::NvFp4 {
-            packed: upload(device, &packed)?,
-            scales: upload(device, &scales)?,
+            storage: NvFp4CtStorage::RowMajorE4M3 {
+                packed: upload(device, &packed)?,
+                scales: upload(device, &scales)?,
+            },
             inv_global_scale: 1.0 / global_scale,
             rows,
             cols,
@@ -1258,8 +1873,233 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
             output_scale,
             rows,
             cols,
+            layout: Nvfp4GgufLayout::RowMajor36,
         }),
     }
+}
+
+fn upload_weight_with_nvfp4_ct(
+    device: &dyn Device,
+    weight: HostWeight,
+    context: Option<&NvFp4CtUploadContext<'_>>,
+) -> Result<DevWeight> {
+    let Some(context) = context else {
+        return upload_weight(device, weight);
+    };
+    let HostWeight::NvFp4 {
+        names,
+        packed,
+        scales,
+        global_scale,
+        rows,
+        cols,
+    } = weight
+    else {
+        return upload_weight(device, weight);
+    };
+    if context.plan == NvFp4CtLoadPlan::RowMajorE4M3 {
+        return upload_weight(
+            device,
+            HostWeight::NvFp4 {
+                names,
+                packed,
+                scales,
+                global_scale,
+                rows,
+                cols,
+            },
+        );
+    }
+    if !rows.is_multiple_of(64) || !cols.is_multiple_of(128) {
+        return Err(ForgeError::Unsupported(format!(
+            "S0 N64/K128 nie obsługuje kształtu [{rows}, {cols}]"
+        )));
+    }
+    let upload_identity =
+        nvfp4_ct_upload_identity(names.clone(), rows, cols, global_scale.to_bits());
+    if !context.expected_identities.contains(&upload_identity)
+        || context
+            .completed_identities
+            .borrow()
+            .contains(&upload_identity)
+    {
+        return Err(ForgeError::Format(format!(
+            "NVFP4 CT: upload spoza manifestu: {names:?}"
+        )));
+    }
+    let target_bytes = nvfp4_ct_s0_resident_bytes(rows, cols)?;
+    let target = device.alloc(target_bytes, MemKind::Device, Pool::Weights)?;
+    let packed_scratch = context
+        .packed_scratch
+        .as_ref()
+        .ok_or_else(|| ForgeError::Kernel("NVFP4 CT: brak stagingu packed".into()))?;
+    let scale_scratch = context
+        .scale_scratch
+        .as_ref()
+        .ok_or_else(|| ForgeError::Kernel("NVFP4 CT: brak stagingu scales".into()))?;
+    let mut row_offset = 0usize;
+    while row_offset < rows {
+        let chunk_rows = context.chunk_rows.min(rows - row_offset);
+        let packed_row_bytes = cols / 2;
+        let scale_row_bytes = cols / 16;
+        let packed_start = row_offset * packed_row_bytes;
+        let scale_start = row_offset * scale_row_bytes;
+        let packed_bytes = chunk_rows * packed_row_bytes;
+        let scale_bytes = chunk_rows * scale_row_bytes;
+        device.write(
+            &packed[packed_start..packed_start + packed_bytes],
+            packed_scratch,
+            0,
+        )?;
+        device.write(
+            &scales[scale_start..scale_start + scale_bytes],
+            scale_scratch,
+            0,
+        )?;
+        context.kernels.repack_nvfp4_ct_s0_n64k128_into(
+            &target,
+            packed_scratch,
+            scale_scratch,
+            rows,
+            cols,
+            chunk_rows,
+            row_offset,
+            context.stream,
+        )?;
+        context.stream.synchronize()?;
+        row_offset += chunk_rows;
+    }
+    context
+        .completed_identities
+        .borrow_mut()
+        .insert(upload_identity);
+    Ok(DevWeight::NvFp4 {
+        storage: NvFp4CtStorage::S0N64K128 { data: target },
+        inv_global_scale: 1.0 / global_scale,
+        rows,
+        cols,
+    })
+}
+
+fn upload_target_weight(
+    device: &dyn Device,
+    weight: HostWeight,
+    target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
+    nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
+) -> Result<DevWeight> {
+    if matches!(weight, HostWeight::NvFp4 { .. }) {
+        return upload_weight_with_nvfp4_ct(device, weight, nvfp4_ct);
+    }
+    let Some((kernels, stream, repacked_weights)) = target_tile else {
+        return upload_weight(device, weight);
+    };
+    let HostWeight::NvFp4Gguf {
+        data,
+        output_scale,
+        rows,
+        cols,
+    } = weight
+    else {
+        return upload_weight(device, weight);
+    };
+    if !rows.is_multiple_of(128) || !cols.is_multiple_of(64) {
+        return upload_weight(
+            device,
+            HostWeight::NvFp4Gguf {
+                data,
+                output_scale,
+                rows,
+                cols,
+            },
+        );
+    }
+
+    let source = device.alloc(data.len(), MemKind::Device, Pool::Activations)?;
+    let result = (|| {
+        device.write(&data, &source, 0)?;
+        let target = device.alloc(data.len(), MemKind::Device, Pool::Weights)?;
+        kernels.repack_nvfp4_gguf_tile_n128_k64(&target, &source, rows, cols, stream)?;
+        device.synchronize()?;
+        Ok(target)
+    })();
+    drop(source);
+    let reset = device.reset_activations();
+    let target = match result {
+        Ok(target) => {
+            reset?;
+            target
+        }
+        Err(error) => {
+            let _ = reset;
+            return Err(error);
+        }
+    };
+    repacked_weights.set(repacked_weights.get().saturating_add(1));
+    Ok(DevWeight::NvFp4Gguf {
+        buf: target,
+        output_scale,
+        rows,
+        cols,
+        layout: Nvfp4GgufLayout::TileN128K64,
+    })
+}
+
+fn preflight_target_tile(device: &dyn Device, descriptor: &ModelDescriptor) -> Result<()> {
+    let p = &descriptor.params;
+    let q_dim = p
+        .n_heads
+        .checked_mul(p.head_dim)
+        .ok_or_else(|| ForgeError::Format("wymiar Q przekracza usize".into()))?;
+    let kv_dim = p
+        .n_kv_heads
+        .checked_mul(p.head_dim)
+        .ok_or_else(|| ForgeError::Format("wymiar KV przekracza usize".into()))?;
+    let mut shapes = vec![
+        (
+            q_dim
+                .checked_add(
+                    kv_dim
+                        .checked_mul(2)
+                        .ok_or_else(|| ForgeError::Format("wymiar QKV przekracza usize".into()))?,
+                )
+                .ok_or_else(|| ForgeError::Format("wymiar QKV przekracza usize".into()))?,
+            p.hidden_size,
+        ),
+        (
+            p.intermediate_size
+                .checked_mul(2)
+                .ok_or_else(|| ForgeError::Format("wymiar gate/up przekracza usize".into()))?,
+            p.hidden_size,
+        ),
+        (p.hidden_size, p.intermediate_size),
+        (p.hidden_size, q_dim),
+    ];
+    if let Some(ssm) = &p.ssm {
+        shapes.extend([
+            (ssm.conv_dim(), p.hidden_size),
+            (ssm.value_dim(), p.hidden_size),
+            (ssm.n_v_heads(), p.hidden_size),
+            (p.hidden_size, ssm.value_dim()),
+        ]);
+    }
+    let max_bytes = shapes
+        .into_iter()
+        .filter(|(rows, cols)| rows.is_multiple_of(128) && cols.is_multiple_of(64))
+        .try_fold(0usize, |maximum, (rows, cols)| {
+            rows.checked_mul(cols / 64)
+                .and_then(|blocks| blocks.checked_mul(36))
+                .map(|bytes| maximum.max(bytes))
+                .ok_or_else(|| ForgeError::Format("rozmiar stagingu NVFP4 przekracza usize".into()))
+        })?;
+    if let Some(available) = device.pool_available(Pool::Activations) {
+        if max_bytes > available {
+            return Err(ForgeError::OutOfMemory {
+                requested: max_bytes,
+                available,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Dequantize a 2-D projection tensor to fp32 row-major `[rows, cols]`,
@@ -1455,13 +2295,20 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
                 data.extend_from_slice(&d)
             }
             (
-                HostWeight::NvFp4 { packed, scales, .. },
                 HostWeight::NvFp4 {
+                    names,
+                    packed,
+                    scales,
+                    ..
+                },
+                HostWeight::NvFp4 {
+                    names: names2,
                     packed: p2,
                     scales: s2,
                     ..
                 },
             ) => {
+                names.extend(names2);
                 packed.extend_from_slice(&p2);
                 scales.extend_from_slice(&s2);
             }
@@ -1549,17 +2396,20 @@ impl ModelWeights {
         device: &Arc<dyn Device>,
         path: &Path,
         native_mtp: bool,
+        target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
     ) -> Result<Self> {
         let gguf = Gguf::open(path)?;
         let descriptor = ModelDescriptor::detect(&gguf)?;
         let src = GgufSource(&gguf);
-        Self::load(device.as_ref(), descriptor, &src, native_mtp)
+        Self::load(device.as_ref(), descriptor, &src, native_mtp, target_tile, None)
     }
 
     pub fn load_safetensors_dir(
         device: &Arc<dyn Device>,
         dir: &Path,
         native_mtp: bool,
+        target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
+        nvfp4_ct: (&Kernels, &forge_hal::Stream, NvFp4CtLayoutPolicy),
     ) -> Result<Self> {
         let config: HfConfig = {
             let text = std::fs::read_to_string(dir.join("config.json"))?;
@@ -1577,10 +2427,53 @@ impl ModelWeights {
             == Some("float-quantized");
         let src = StSource {
             st: &st,
-            scheme,
+            scheme: scheme.clone(),
             fp8,
         };
-        Self::load(device.as_ref(), descriptor, &src, native_mtp)
+        let preflight = plan_nvfp4_ct_safetensors(
+            &st,
+            scheme.as_ref(),
+            &descriptor,
+            native_mtp,
+            nvfp4_ct.2,
+            nvfp4_ct.0.supports_nvfp4_ct_s0_n64k128_manual(),
+        )?;
+        let context =
+            create_nvfp4_ct_upload_context(device.as_ref(), nvfp4_ct.0, nvfp4_ct.1, preflight)?;
+        let used_staging = context.plan == NvFp4CtLoadPlan::S0N64K128;
+        let result = Self::load(
+            device.as_ref(),
+            descriptor,
+            &src,
+            native_mtp,
+            target_tile,
+            Some(&context),
+        )
+        .and_then(|weights| {
+            validate_nvfp4_ct_upload_manifest(
+                context.plan,
+                &context.expected_identities,
+                &context.completed_identities.borrow(),
+            )?;
+            Ok(weights)
+        });
+        if result.is_ok() && used_staging {
+            tracing::info!(
+                expected_uploads = context.expected_identities.len(),
+                completed_uploads = context.completed_identities.borrow().len(),
+                "manifest uploadu NVFP4 CT S0 ukończony"
+            );
+        }
+        drop(context);
+        let reset = if used_staging {
+            device.reset_activations().map(|_| ())
+        } else {
+            Ok(())
+        };
+        if used_staging && reset.is_ok() {
+            tracing::info!("staging NVFP4 CT S0 zwolniony z puli aktywacji");
+        }
+        finish_nvfp4_ct_load(result, reset)
     }
 
     fn load(
@@ -1588,7 +2481,12 @@ impl ModelWeights {
         descriptor: ModelDescriptor,
         src: &dyn TensorSource,
         native_mtp: bool,
+        target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
+        nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
     ) -> Result<Self> {
+        if target_tile.is_some() {
+            preflight_target_tile(device, &descriptor)?;
+        }
         // Hybrid attention/DeltaNet arches (qwen35moe) have per-layer weight
         // sets that differ by kind and a gated attention Q projection the
         // generic shape checks would reject; they take a dedicated loader.
@@ -1598,7 +2496,14 @@ impl ModelWeights {
                     "FORGE_GEMM=w4a8 supports dense (non-hybrid) models only".into(),
                 ));
             }
-            return Self::load_hybrid(device, descriptor, src, native_mtp);
+            return Self::load_hybrid(
+                device,
+                descriptor,
+                src,
+                native_mtp,
+                target_tile,
+                nvfp4_ct,
+            );
         }
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
@@ -1625,6 +2530,7 @@ impl ModelWeights {
                 global_scale,
                 rows,
                 cols,
+                ..
             } => {
                 let f32s = nvfp4::dequantize_nvfp4(&packed, &scales, global_scale, rows, cols, 16)?;
                 DevWeight::F16 {
@@ -1700,7 +2606,7 @@ impl ModelWeights {
             let attn_qkv = match fuse_rows(vec![q, k, v]) {
                 Ok(fused) => {
                     fused_qkv_layers += 1;
-                    QkvWeights::Fused(upload_weight(device, fused)?)
+                    QkvWeights::Fused(upload_target_weight(device, fused, target_tile, nvfp4_ct)?)
                 }
                 Err(mut parts) => {
                     let v = parts.pop().expect("three parts");
@@ -1710,17 +2616,17 @@ impl ModelWeights {
                         Ok(qk) => {
                             fused_qk_layers += 1;
                             QkvWeights::FusedQk {
-                                qk: upload_weight(device, qk)?,
-                                v: upload_weight(device, v)?,
+                                qk: upload_target_weight(device, qk, target_tile, nvfp4_ct)?,
+                                v: upload_target_weight(device, v, target_tile, nvfp4_ct)?,
                             }
                         }
                         Err(mut qk_parts) => {
                             let k = qk_parts.pop().expect("two parts");
                             let q = qk_parts.pop().expect("two parts");
                             QkvWeights::Split {
-                                q: upload_weight(device, q)?,
-                                k: upload_weight(device, k)?,
-                                v: upload_weight(device, v)?,
+                                q: upload_target_weight(device, q, target_tile, nvfp4_ct)?,
+                                k: upload_target_weight(device, k, target_tile, nvfp4_ct)?,
+                                v: upload_target_weight(device, v, target_tile, nvfp4_ct)?,
                             }
                         }
                     }
@@ -1739,14 +2645,16 @@ impl ModelWeights {
                     let gate_up = match fuse_rows(vec![gate, up]) {
                         Ok(fused) => {
                             fused_gate_up_layers += 1;
-                            GateUpWeights::Fused(upload_weight(device, fused)?)
+                            GateUpWeights::Fused(upload_target_weight(
+                                device, fused, target_tile, nvfp4_ct,
+                            )?)
                         }
                         Err(mut parts) => {
                             let up = parts.pop().expect("two parts");
                             let gate = parts.pop().expect("two parts");
                             GateUpWeights::Split {
-                                gate: upload_weight(device, gate)?,
-                                up: upload_weight(device, up)?,
+                                gate: upload_target_weight(device, gate, target_tile, nvfp4_ct)?,
+                                up: upload_target_weight(device, up, target_tile, nvfp4_ct)?,
                             }
                         }
                     };
@@ -1754,7 +2662,7 @@ impl ModelWeights {
                     expect(&at("ffn_down"), &down, p.hidden_size, p.intermediate_size)?;
                     LayerFfn::Dense(DenseFfn {
                         gate_up,
-                        down: upload_weight(device, down)?,
+                        down: upload_target_weight(device, down, target_tile, nvfp4_ct)?,
                     })
                 }
                 Some(moe) => {
@@ -1853,16 +2761,20 @@ impl ModelWeights {
                         None => None,
                     },
                     attn_qkv,
-                    attn_o: upload_weight(device, attn_o)?,
+                    attn_o: upload_target_weight(device, attn_o, target_tile, nvfp4_ct)?,
                 })),
                 ffn,
             });
         }
 
-        let mtp = if let Some(mtp_descriptor) = descriptor.mtp.as_ref() {
+        let mtp = if native_mtp {
+            let mtp_descriptor = descriptor.mtp.as_ref().ok_or_else(|| {
+                ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into())
+            })?;
             let mut loader = SourceMtpLoader {
                 device,
                 source: src,
+                nvfp4_ct,
             };
             Some(MtpWeights::load(
                 mtp_descriptor,
@@ -1896,6 +2808,7 @@ impl ModelWeights {
             fp8_ffn: None,
             fp8_modular: false,
             mtp,
+            nvfp4_repacked_weights: 0,
         })
     }
 
@@ -1908,6 +2821,8 @@ impl ModelWeights {
         descriptor: ModelDescriptor,
         src: &dyn TensorSource,
         native_mtp: bool,
+        target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
+        nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
     ) -> Result<Self> {
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
@@ -1932,6 +2847,7 @@ impl ModelWeights {
                 global_scale,
                 rows,
                 cols,
+                ..
             } => {
                 let f32s = nvfp4::dequantize_nvfp4(&packed, &scales, global_scale, rows, cols, 16)?;
                 DevWeight::F16 {
@@ -1962,11 +2878,30 @@ impl ModelWeights {
 
             let mixer = match descriptor.layer_kinds[idx] {
                 LayerKind::Attention => {
-                    let q = upload_weight(device, fetch_matrix(src, name(WeightRole::AttnQ)?)?)?;
-                    let k = upload_weight(device, fetch_matrix(src, name(WeightRole::AttnK)?)?)?;
-                    let v = upload_weight(device, fetch_matrix(src, name(WeightRole::AttnV)?)?)?;
-                    let attn_o =
-                        upload_weight(device, fetch_matrix(src, name(WeightRole::AttnO)?)?)?;
+                    let q = upload_target_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::AttnQ)?)?,
+                        target_tile,
+                        nvfp4_ct,
+                    )?;
+                    let k = upload_target_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::AttnK)?)?,
+                        target_tile,
+                        nvfp4_ct,
+                    )?;
+                    let v = upload_target_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::AttnV)?)?,
+                        target_tile,
+                        nvfp4_ct,
+                    )?;
+                    let attn_o = upload_target_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::AttnO)?)?,
+                        target_tile,
+                        nvfp4_ct,
+                    )?;
                     LayerMixer::Attention(Box::new(AttnWeights {
                         q_norm: Some(upload_norm(device, src, name(WeightRole::AttnQNorm)?)?),
                         k_norm: Some(upload_norm(device, src, name(WeightRole::AttnKNorm)?)?),
@@ -1975,27 +2910,40 @@ impl ModelWeights {
                     }))
                 }
                 LayerKind::DeltaNet => LayerMixer::DeltaNet(Box::new(DeltaNetWeights {
-                    in_proj: upload_weight(
+                    in_proj: upload_target_weight(
                         device,
                         fetch_matrix(src, name(WeightRole::SsmInProj)?)?,
+                        target_tile,
+                        nvfp4_ct,
                     )?,
-                    gate_proj: upload_weight(
+                    gate_proj: upload_target_weight(
                         device,
                         fetch_matrix(src, name(WeightRole::SsmGate)?)?,
+                        target_tile,
+                        nvfp4_ct,
                     )?,
                     conv1d: upload_norm(device, src, name(WeightRole::SsmConv1d)?)?,
                     dt_bias: upload_norm(device, src, name(WeightRole::SsmDt)?)?,
                     a: upload_norm(device, src, name(WeightRole::SsmA)?)?,
-                    beta_proj: upload_weight(
+                    beta_proj: upload_target_weight(
                         device,
                         fetch_matrix(src, name(WeightRole::SsmBeta)?)?,
+                        target_tile,
+                        nvfp4_ct,
                     )?,
-                    alpha_proj: upload_weight(
+                    alpha_proj: upload_target_weight(
                         device,
                         fetch_matrix(src, name(WeightRole::SsmAlpha)?)?,
+                        target_tile,
+                        nvfp4_ct,
                     )?,
                     ssm_norm: upload_norm(device, src, name(WeightRole::SsmNorm)?)?,
-                    out_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmOut)?)?)?,
+                    out_proj: upload_target_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::SsmOut)?)?,
+                        target_tile,
+                        nvfp4_ct,
+                    )?,
                 })),
             };
 
@@ -2040,9 +2988,24 @@ impl ModelWeights {
                     norm_topk: moe.norm_topk_prob,
                 }))
             } else {
-                let gate = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnGate)?)?)?;
-                let up = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnUp)?)?)?;
-                let down = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnDown)?)?)?;
+                let gate = upload_target_weight(
+                    device,
+                    fetch_matrix(src, name(WeightRole::FfnGate)?)?,
+                    target_tile,
+                    nvfp4_ct,
+                )?;
+                let up = upload_target_weight(
+                    device,
+                    fetch_matrix(src, name(WeightRole::FfnUp)?)?,
+                    target_tile,
+                    nvfp4_ct,
+                )?;
+                let down = upload_target_weight(
+                    device,
+                    fetch_matrix(src, name(WeightRole::FfnDown)?)?,
+                    target_tile,
+                    nvfp4_ct,
+                )?;
                 LayerFfn::Dense(DenseFfn {
                     gate_up: GateUpWeights::Split { gate, up },
                     down,
@@ -2062,13 +3025,12 @@ impl ModelWeights {
                 ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into())
             })?;
             let embedding_bytes = host_embedding.mtp_device_bytes().ok_or_else(|| {
-                ForgeError::Unsupported(
-                    "MTP hybrid obsługuje embedding Q8_0 lub GGUF NVFP4".into(),
-                )
+                ForgeError::Unsupported("MTP hybrid obsługuje embedding Q8_0 lub GGUF NVFP4".into())
             })?;
             let mut loader = SourceMtpLoader {
                 device,
                 source: src,
+                nvfp4_ct,
             };
             let mut weights = MtpWeights::load(
                 mtp_descriptor,
@@ -2086,15 +3048,16 @@ impl ModelWeights {
                         requested: embedding_bytes,
                         available: device.pool_available(Pool::Weights).unwrap_or(0),
                     })?;
-                let requested = aligned_bytes.checked_add(64 << 20).ok_or_else(|| {
-                    ForgeError::OutOfMemory {
-                        requested: aligned_bytes,
-                        available: device.pool_available(Pool::Weights).unwrap_or(0),
-                    }
-                })?;
+                let requested =
+                    aligned_bytes
+                        .checked_add(64 << 20)
+                        .ok_or_else(|| ForgeError::OutOfMemory {
+                            requested: aligned_bytes,
+                            available: device.pool_available(Pool::Weights).unwrap_or(0),
+                        })?;
                 let available = device.pool_available(Pool::Weights).unwrap_or(0);
-                let embedding_mode = std::env::var("FORGE_MTP_EMBEDDING")
-                    .unwrap_or_else(|_| "auto".into());
+                let embedding_mode =
+                    std::env::var("FORGE_MTP_EMBEDDING").unwrap_or_else(|_| "auto".into());
                 let use_device = match embedding_mode.as_str() {
                     "auto" => available >= requested,
                     "device" if available >= requested => true,
@@ -2140,6 +3103,7 @@ impl ModelWeights {
             fp8_ffn: None,
             fp8_modular: false,
             mtp,
+            nvfp4_repacked_weights: 0,
         })
     }
 
@@ -2421,5 +3385,310 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn nvfp4_ct_cleanup_zachowuje_pierwotny_blad_ladowania() {
+        let load = Err::<(), _>(ForgeError::Format("load".into()));
+        let reset = Err(ForgeError::Kernel("reset".into()));
+        let error = finish_nvfp4_ct_load(load, reset).unwrap_err();
+        assert!(matches!(error, ForgeError::Format(message) if message == "load"));
+    }
+
+    #[test]
+    fn nvfp4_ct_cleanup_zwraca_blad_reset_po_sukcesie() {
+        let reset = Err(ForgeError::Kernel("reset".into()));
+        let error = finish_nvfp4_ct_load(Ok(()), reset).unwrap_err();
+        assert!(matches!(error, ForgeError::Kernel(message) if message == "reset"));
+    }
+
+    #[test]
+    fn nvfp4_ct_druga_alokacja_scratch_resetuje_generation() {
+        let allocations = Cell::new(0usize);
+        let resets = Cell::new(0usize);
+        let error = allocate_nvfp4_ct_scratch(
+            7,
+            1,
+            |bytes| {
+                allocations.set(allocations.get() + 1);
+                if allocations.get() == 2 {
+                    Err(ForgeError::OutOfMemory {
+                        requested: bytes,
+                        available: 0,
+                    })
+                } else {
+                    Ok(bytes)
+                }
+            },
+            || {
+                resets.set(resets.get() + 1);
+                Err(ForgeError::Kernel("reset".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ForgeError::OutOfMemory {
+                requested: 1,
+                available: 0
+            }
+        ));
+        assert_eq!(resets.get(), 1);
+    }
+
+    #[test]
+    fn nvfp4_ct_policy_jest_fail_closed() {
+        assert_eq!(
+            resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::Auto, false, true, 12).unwrap(),
+            NvFp4CtLoadPlan::RowMajorE4M3
+        );
+        assert!(
+            resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::S0N64K128, false, true, 12).is_err()
+        );
+        assert!(
+            resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::S0N64K128, true, false, 12).is_err()
+        );
+        assert_eq!(
+            resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::Auto, true, true, 12).unwrap(),
+            NvFp4CtLoadPlan::S0N64K128
+        );
+        assert_eq!(
+            crate::model::ModelConfig::default().nvfp4_ct_layout,
+            NvFp4CtLayoutPolicy::RowMajorE4M3
+        );
+    }
+
+    #[test]
+    fn nvfp4_ct_okno_wymaga_pelnych_kafli_n64() {
+        let device = forge_hal::cpu::CpuDevice::new();
+        let data = device
+            .alloc(256 * 128 * 9 / 16, MemKind::Device, Pool::Weights)
+            .unwrap();
+        let weight = DevWeight::NvFp4 {
+            storage: NvFp4CtStorage::S0N64K128 { data },
+            inv_global_scale: 1.0,
+            rows: 256,
+            cols: 128,
+        };
+        let window = weight.nvfp4_ct_row_window(64, 128).unwrap();
+        assert_eq!(window.row_offset(), 64);
+        assert_eq!(window.rows(), 128);
+        assert_eq!(window.physical_rows(), 256);
+        assert_eq!(window.cols(), 128);
+        assert!(weight.nvfp4_ct_row_window(1, 64).is_err());
+        assert!(weight.nvfp4_ct_row_window(64, 63).is_err());
+        assert!(weight.nvfp4_ct_row_window(192, 128).is_err());
+        let row_major = DevWeight::NvFp4 {
+            storage: NvFp4CtStorage::RowMajorE4M3 {
+                packed: device
+                    .alloc(64, MemKind::Device, Pool::Weights)
+                    .unwrap(),
+                scales: device
+                    .alloc(8, MemKind::Device, Pool::Weights)
+                    .unwrap(),
+            },
+            inv_global_scale: 1.0,
+            rows: 64,
+            cols: 128,
+        };
+        assert!(row_major.nvfp4_ct_row_window(0, 64).is_err());
+        for bytes in [256 * 128 * 9 / 16 - 1, 256 * 128 * 9 / 16 + 1] {
+            let malformed = DevWeight::NvFp4 {
+                storage: NvFp4CtStorage::S0N64K128 {
+                    data: device
+                        .alloc(bytes, MemKind::Device, Pool::Weights)
+                        .unwrap(),
+                },
+                inv_global_scale: 1.0,
+                rows: 256,
+                cols: 128,
+            };
+            assert!(malformed.nvfp4_ct_row_window(0, 64).is_err());
+        }
+    }
+
+    #[test]
+    fn nvfp4_ct_resident_sprawdza_wyrownanie_i_przepelnienie() {
+        assert_eq!(nvfp4_ct_s0_resident_bytes(64, 128).unwrap(), 4608);
+        assert!(nvfp4_ct_s0_resident_bytes(0, 128).is_err());
+        assert!(nvfp4_ct_s0_resident_bytes(64, 0).is_err());
+        assert!(nvfp4_ct_s0_resident_bytes(63, 128).is_err());
+        assert!(nvfp4_ct_s0_resident_bytes(64, 127).is_err());
+        let overflowing_rows = (usize::MAX / 64) * 64;
+        assert!(nvfp4_ct_s0_resident_bytes(overflowing_rows, 128).is_err());
+    }
+
+    #[test]
+    fn nvfp4_ct_preflight_odrzuca_zerowe_i_bledne_metadane() {
+        assert_eq!(
+            validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[64, 64], 16).unwrap(),
+            (64, 128)
+        );
+        assert!(validate_nvfp4_ct_packed_metadata("packed", DType::F16, &[64, 64], 16).is_err());
+        assert!(validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[64], 16).is_err());
+        assert!(validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[0, 64], 16).is_err());
+        assert!(validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[64, 0], 16).is_err());
+        assert!(
+            validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[64, usize::MAX], 16)
+                .is_err()
+        );
+
+        assert_eq!(
+            validate_nvfp4_ct_scale_metadata("scale", DType::F8E4M3, &[64, 8], 64, 128)
+                .unwrap(),
+            512
+        );
+        assert!(
+            validate_nvfp4_ct_scale_metadata("scale", DType::U8, &[64, 8], 64, 128).is_err()
+        );
+        assert!(
+            validate_nvfp4_ct_scale_metadata("scale", DType::F8E4M3, &[512], 64, 128).is_err()
+        );
+        assert!(
+            validate_nvfp4_ct_scale_metadata(
+                "scale",
+                DType::F8E4M3,
+                &[usize::MAX, 8],
+                usize::MAX,
+                128,
+            )
+            .is_err()
+        );
+
+        assert!(
+            validate_nvfp4_ct_global_scale_metadata(
+                "global",
+                DType::F32,
+                &[1],
+                &1.0f32.to_le_bytes(),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_nvfp4_ct_global_scale_metadata(
+                "global",
+                DType::F16,
+                &[1],
+                &1.0f32.to_le_bytes(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_nvfp4_ct_global_scale_metadata(
+                "global",
+                DType::F32,
+                &[],
+                &1.0f32.to_le_bytes(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nvfp4_ct_preflight_odrzuca_nan_i_ujemne_skale_e4m3() {
+        assert!(validate_nvfp4_ct_scale_bytes("scale", &[0x00, 0x01, 0x7e]).is_ok());
+        for invalid in [0x7f, 0x80, 0xff] {
+            assert!(validate_nvfp4_ct_scale_bytes("scale", &[invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn nvfp4_ct_preflight_wymaga_pelnej_trojki_w_obie_strony() {
+        assert!(!validate_nvfp4_ct_companions("w", [false; 3]).unwrap());
+        assert!(validate_nvfp4_ct_companions("w", [true; 3]).unwrap());
+        for present in [
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+            [true, true, false],
+            [true, false, true],
+            [false, true, true],
+        ] {
+            assert!(validate_nvfp4_ct_companions("w", present).is_err());
+        }
+    }
+
+    #[test]
+    fn nvfp4_ct_preflight_i_upload_musza_miec_ten_sam_zbior() {
+        let qkv = nvfp4_ct_upload_identity(
+            vec!["q".to_string(), "k".to_string(), "v".to_string()],
+            64,
+            128,
+            1.0f32.to_bits(),
+        );
+        let down =
+            nvfp4_ct_upload_identity(vec!["down".to_string()], 64, 128, 1.0f32.to_bits());
+        let expected = HashSet::from([qkv.clone(), down]);
+        let same_count_wrong = HashSet::from([
+            qkv,
+            nvfp4_ct_upload_identity(
+                vec!["gate".to_string(), "up".to_string()],
+                64,
+                128,
+                1.0f32.to_bits(),
+            ),
+        ]);
+        assert!(validate_nvfp4_ct_upload_manifest(
+            NvFp4CtLoadPlan::S0N64K128,
+            &expected,
+            &expected,
+        )
+        .is_ok());
+        assert!(validate_nvfp4_ct_upload_manifest(
+            NvFp4CtLoadPlan::S0N64K128,
+            &expected,
+            &same_count_wrong,
+        )
+        .is_err());
+        assert!(validate_nvfp4_ct_upload_manifest(
+            NvFp4CtLoadPlan::RowMajorE4M3,
+            &expected,
+            &HashSet::new(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn nvfp4_ct_tozsamosc_jest_strukturalna() {
+        let separator = '\u{1f}';
+        let one_name = nvfp4_ct_upload_identity(
+            vec![format!("q{separator}k")],
+            64,
+            128,
+            1.0f32.to_bits(),
+        );
+        let two_names = nvfp4_ct_upload_identity(
+            vec!["q".to_string(), "k".to_string()],
+            64,
+            128,
+            1.0f32.to_bits(),
+        );
+        let wrong_rows = nvfp4_ct_upload_identity(
+            vec![format!("q{separator}k")],
+            128,
+            128,
+            1.0f32.to_bits(),
+        );
+        let wrong_cols = nvfp4_ct_upload_identity(
+            vec![format!("q{separator}k")],
+            64,
+            256,
+            1.0f32.to_bits(),
+        );
+        let wrong_scale = nvfp4_ct_upload_identity(
+            vec![format!("q{separator}k")],
+            64,
+            128,
+            2.0f32.to_bits(),
+        );
+
+        assert_ne!(one_name, two_names);
+        assert_ne!(one_name, wrong_rows);
+        assert_ne!(one_name, wrong_cols);
+        assert_ne!(one_name, wrong_scale);
+        assert_eq!(
+            HashSet::from([one_name, two_names, wrong_rows, wrong_cols, wrong_scale]).len(),
+            5
+        );
     }
 }

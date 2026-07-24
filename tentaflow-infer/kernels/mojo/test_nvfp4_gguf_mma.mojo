@@ -9,6 +9,7 @@ from src.nvfp4_gguf_mma import (
     gemm_nvfp4_gguf_mma_f16_bm32,
     gemm_nvfp4_gguf_mma_f16_bm128,
     gemm_nvfp4_gguf_mma_f16_bm128_bn32,
+    gemm_nvfp4_gguf_mma_f16_bm128_prefetch,
 )
 
 comptime TOKENS = 129
@@ -16,6 +17,49 @@ comptime ROWS = 67
 comptime COLS = 192
 comptime OUTPUT_SCALE = 0.625
 comptime REPEATS = 10
+
+
+def _prefetch_case[rows: Int, cols: Int, tokens: Int = 128](ctx: DeviceContext) raises:
+    comptime guard = 64
+    comptime output_elements = tokens * rows
+    var weights = ctx.enqueue_create_buffer[DType.uint8](rows * (cols // 64) * 36)
+    var x = ctx.enqueue_create_buffer[DType.float16](tokens * cols)
+    var baseline = ctx.enqueue_create_buffer[DType.float16](output_elements + 2 * guard)
+    var prefetch = ctx.enqueue_create_buffer[DType.float16](output_elements + 2 * guard)
+    with weights.map_to_host() as values:
+        for i in range(len(values)):
+            values[i] = UInt8((i * 29 + 11) & 0xFF)
+        for i in range(0, len(values), 36):
+            values[i] = 0x38
+            values[i + 1] = 0x30
+            values[i + 2] = 0x40
+            values[i + 3] = 0x28
+    with x.map_to_host() as values:
+        for i in range(len(values)):
+            values[i] = Float16(Float32((i * 17 % 31) - 15) * 0.03125)
+    with baseline.map_to_host() as left, prefetch.map_to_host() as right:
+        for i in range(len(left)):
+            left[i] = Float16(19.0)
+            right[i] = Float16(19.0)
+    ctx.enqueue_function[gemm_nvfp4_gguf_mma_f16_bm128](
+        baseline.unsafe_ptr() + guard, weights.unsafe_ptr(), x.unsafe_ptr(), cols,
+        rows, tokens, Float32(OUTPUT_SCALE),
+        grid_dim=(rows // 64, (tokens + 127) // 128), block_dim=256,
+    )
+    ctx.enqueue_function[gemm_nvfp4_gguf_mma_f16_bm128_prefetch](
+        prefetch.unsafe_ptr() + guard, weights.unsafe_ptr(), x.unsafe_ptr(), cols,
+        rows, tokens, Float32(OUTPUT_SCALE),
+        grid_dim=(rows // 64, (tokens + 127) // 128), block_dim=256,
+    )
+    ctx.synchronize()
+    with baseline.map_to_host() as left, prefetch.map_to_host() as right:
+        for i in range(len(left)):
+            if left[i].to_bits() != right[i].to_bits():
+                raise Error(
+                    "prefetch zmienia wynik lub canary dla "
+                    + String(tokens) + "x" + String(rows) + "x" + String(cols)
+                )
+    print("prefetch BM128 bit-exact i canary", tokens, "x", rows, "x", cols, ": PASS")
 
 
 def _repeated[rows: Int, cols: Int, block_m: Int, block_n: Int](ctx: DeviceContext) raises:
@@ -134,3 +178,9 @@ def main() raises:
     _repeated[5120, 17408, 128, 64](ctx)
     _repeated[17408, 5120, 128, 32](ctx)
     _repeated[5120, 17408, 128, 32](ctx)
+    _prefetch_case[17408, 5120](ctx)
+    _prefetch_case[10240, 5120](ctx)
+    _prefetch_case[12288, 5120](ctx)
+    _prefetch_case[5120, 6144](ctx)
+    _prefetch_case[5120, 17408](ctx)
+    _prefetch_case[5120, 6144, 2048](ctx)

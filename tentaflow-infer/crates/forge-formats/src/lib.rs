@@ -23,7 +23,10 @@ pub use arch::{
 pub use dequant::dequantize_to_f32;
 pub use gguf::{Gguf, GgufTensor, MetaValue};
 pub use hf_config::HfConfig;
-pub use nvfp4::{NvFp4Scheme, NvFp4TensorNames};
+pub use nvfp4::{
+    nvfp4_ct_s0_from_e4m3, nvfp4_ct_s0_to_f32, NvFp4Scheme, NvFp4TensorNames,
+    NVFP4_CT_S0_NAN,
+};
 pub use safetensors::{SafeTensors, ShardedSafeTensors, StTensor};
 pub use speculation_manifest::{
     ArtifactRole, ArtifactSpec, CompositionMode, ConfidenceCalibration, ConfidenceMethod,

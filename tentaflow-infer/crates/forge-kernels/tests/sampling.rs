@@ -53,10 +53,18 @@ fn sample_bufs(dev: &dyn Device) -> SampleBufs {
     SampleBufs {
         out: dev.alloc(8, MemKind::Device, Pool::Weights).unwrap(),
         vals: dev
-            .alloc(forge_kernels::SAMPLE_SCRATCH_PAIRS * 4, MemKind::Device, Pool::Weights)
+            .alloc(
+                forge_kernels::SAMPLE_SCRATCH_PAIRS * 4,
+                MemKind::Device,
+                Pool::Weights,
+            )
             .unwrap(),
         idx: dev
-            .alloc(forge_kernels::SAMPLE_SCRATCH_PAIRS * 4, MemKind::Device, Pool::Weights)
+            .alloc(
+                forge_kernels::SAMPLE_SCRATCH_PAIRS * 4,
+                MemKind::Device,
+                Pool::Weights,
+            )
             .unwrap(),
     }
 }
@@ -156,7 +164,11 @@ fn fused_histogram_penalties_match_cpu_for_argmax_and_topk() {
     let mut expected = original.clone();
     for (&token, &count) in ids.iter().zip(&counts) {
         let logit = &mut expected[token as usize];
-        *logit = if *logit > 0.0 { *logit / 2.0 } else { *logit * 2.0 };
+        *logit = if *logit > 0.0 {
+            *logit / 2.0
+        } else {
+            *logit * 2.0
+        };
         *logit -= 0.25 + 0.5 * count as f32;
     }
     let want = cpu_argmax(&expected);
@@ -195,8 +207,7 @@ fn fused_histogram_penalties_match_cpu_for_argmax_and_topk() {
         .unwrap();
     kernels
         .sample_topk_f32(
-            &b.out, &b.vals, &b.idx, &logits, VOCAB, 40, 1.0, 1e-9, 0.0, 17, 3,
-            &stream,
+            &b.out, &b.vals, &b.idx, &logits, VOCAB, 40, 1.0, 1e-9, 0.0, 17, 3, &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();
@@ -209,8 +220,9 @@ fn batched_histogram_penalties_match_cpu_and_ignore_oob() {
     let kernels = Kernels::load(dev.clone()).unwrap();
     let stream = dev.create_stream().unwrap();
     let vocab = 8usize;
-    let original = [1.0f32, 8.0, -2.0, 4.0, 0.0, 0.0, 0.0, 0.0,
-                    3.0, 2.0, 7.0, -1.0, 0.0, 0.0, 0.0, 0.0];
+    let original = [
+        1.0f32, 8.0, -2.0, 4.0, 0.0, 0.0, 0.0, 0.0, 3.0, 2.0, 7.0, -1.0, 0.0, 0.0, 0.0, 0.0,
+    ];
     let logits = upload_f32(dev.as_ref(), &original);
     let ids = [1i32, 2, 99, 2];
     let counts = [2i32, 1, 1, 3];
@@ -218,15 +230,23 @@ fn batched_histogram_penalties_match_cpu_and_ignore_oob() {
     let repetitions = [2.0f32, 1.0];
     let frequencies = [0.5f32, 0.25];
     let presences = [0.25f32, -0.5];
-    let ids_buf = dev.alloc(ids.len() * 4, MemKind::Device, Pool::Weights).unwrap();
-    let counts_buf = dev.alloc(counts.len() * 4, MemKind::Device, Pool::Weights).unwrap();
-    let offsets_buf = dev.alloc(offsets.len() * 4, MemKind::Device, Pool::Weights).unwrap();
+    let ids_buf = dev
+        .alloc(ids.len() * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let counts_buf = dev
+        .alloc(counts.len() * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let offsets_buf = dev
+        .alloc(offsets.len() * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
     let repetitions_buf = upload_f32(dev.as_ref(), &repetitions);
     let frequencies_buf = upload_f32(dev.as_ref(), &frequencies);
     let presences_buf = upload_f32(dev.as_ref(), &presences);
     dev.write(bytemuck::cast_slice(&ids), &ids_buf, 0).unwrap();
-    dev.write(bytemuck::cast_slice(&counts), &counts_buf, 0).unwrap();
-    dev.write(bytemuck::cast_slice(&offsets), &offsets_buf, 0).unwrap();
+    dev.write(bytemuck::cast_slice(&counts), &counts_buf, 0)
+        .unwrap();
+    dev.write(bytemuck::cast_slice(&offsets), &offsets_buf, 0)
+        .unwrap();
 
     kernels
         .sample_batched_penalize_f32(
@@ -286,8 +306,7 @@ fn parallel_topk_handles_only_nan_and_negative_infinity() {
         .unwrap();
     kernels
         .sample_topk_f32(
-            &b.out, &b.vals, &b.idx, &logits, VOCAB, 64, 1.0, 1.0, 0.0, 17, 3,
-            &stream,
+            &b.out, &b.vals, &b.idx, &logits, VOCAB, 64, 1.0, 1.0, 0.0, 17, 3, &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();
@@ -367,8 +386,7 @@ fn topk_draws_stay_in_topk_set_and_replay_deterministically() {
         let seed = 0xC0FF_EE00 + (draw % 4);
         kernels
             .sample_topk_f32(
-                &b.out, &b.vals, &b.idx, &logits, VOCAB, k, inv_t, 0.95, 0.0, seed, draw,
-                &stream,
+                &b.out, &b.vals, &b.idx, &logits, VOCAB, k, inv_t, 0.95, 0.0, seed, draw, &stream,
             )
             .unwrap();
         dev.synchronize().unwrap();
@@ -385,7 +403,17 @@ fn topk_draws_stay_in_topk_set_and_replay_deterministically() {
     // Same (seed, step) must reproduce the same token.
     kernels
         .sample_topk_f32(
-            &b.out, &b.vals, &b.idx, &logits, VOCAB, k, inv_t, 0.95, 0.0, 0xC0FF_EE00, 0,
+            &b.out,
+            &b.vals,
+            &b.idx,
+            &logits,
+            VOCAB,
+            k,
+            inv_t,
+            0.95,
+            0.0,
+            0xC0FF_EE00,
+            0,
             &stream,
         )
         .unwrap();
@@ -410,10 +438,8 @@ fn batched_topk_obsluguje_mieszane_parametry_i_seed() {
     let vocab = 8usize;
     let n_seqs = 4usize;
     let host = [
-        1.0f32, 9.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        8.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
-        0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 1.0,
+        1.0f32, 9.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 1.0,
     ];
     let ks = [1i32, 2, 4, 1];
     let inv_t = [1.0f32; 4];
@@ -424,30 +450,29 @@ fn batched_topk_obsluguje_mieszane_parametry_i_seed() {
     let out = dev
         .alloc(n_seqs * 4, MemKind::Device, Pool::Weights)
         .unwrap();
-    let k_buf = dev.alloc(n_seqs * 4, MemKind::Device, Pool::Weights).unwrap();
+    let k_buf = dev
+        .alloc(n_seqs * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
     let inv_t_buf = upload_f32(dev.as_ref(), &inv_t);
     let top_p_buf = upload_f32(dev.as_ref(), &top_p);
     let min_p_buf = upload_f32(dev.as_ref(), &min_p);
-    let seed_buf = dev.alloc(n_seqs * 8, MemKind::Device, Pool::Weights).unwrap();
-    let step_buf = dev.alloc(n_seqs * 8, MemKind::Device, Pool::Weights).unwrap();
+    let seed_buf = dev
+        .alloc(n_seqs * 8, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let step_buf = dev
+        .alloc(n_seqs * 8, MemKind::Device, Pool::Weights)
+        .unwrap();
     dev.write(bytemuck::cast_slice(&ks), &k_buf, 0).unwrap();
-    dev.write(bytemuck::cast_slice(&seeds), &seed_buf, 0).unwrap();
-    dev.write(bytemuck::cast_slice(&steps), &step_buf, 0).unwrap();
+    dev.write(bytemuck::cast_slice(&seeds), &seed_buf, 0)
+        .unwrap();
+    dev.write(bytemuck::cast_slice(&steps), &step_buf, 0)
+        .unwrap();
 
     let run = |logits: &DevBuffer| {
         kernels
             .sample_batched_topk_f32(
-                &out,
-                logits,
-                n_seqs,
-                vocab,
-                &k_buf,
-                &inv_t_buf,
-                &top_p_buf,
-                &min_p_buf,
-                &seed_buf,
-                &step_buf,
-                &stream,
+                &out, logits, n_seqs, vocab, &k_buf, &inv_t_buf, &top_p_buf, &min_p_buf, &seed_buf,
+                &step_buf, &stream,
             )
             .unwrap();
         dev.synchronize().unwrap();

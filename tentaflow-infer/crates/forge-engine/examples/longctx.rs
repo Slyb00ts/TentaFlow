@@ -29,10 +29,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv_page_size: page_size,
         kv_pages,
         max_seq_len: target + 64,
-        kv_quant: if kv_fp8 { forge_engine::kv::KvQuant::Fp8 } else { forge_engine::kv::KvQuant::F16 },
+        kv_quant: if kv_fp8 {
+            forge_engine::kv::KvQuant::Fp8
+        } else {
+            forge_engine::kv::KvQuant::F16
+        },
         kv_tier: Default::default(),
         prefix_cache: false,
         native_mtp: false,
+        nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+        nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::RowMajorE4M3,
     };
 
     let device = CudaDevice::new(
@@ -137,7 +143,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         logits = model.step(&mut seq, next)?;
     }
 
-    eprintln!("reached depth {} (kv_fp8={kv_fp8}) (coherent if samples above are real words)", seq.len);
+    eprintln!(
+        "reached depth {} (kv_fp8={kv_fp8}) (coherent if samples above are real words)",
+        seq.len
+    );
     model.release_seq(&mut seq);
     Ok(())
 }

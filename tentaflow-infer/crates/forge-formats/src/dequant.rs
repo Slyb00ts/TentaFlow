@@ -440,7 +440,8 @@ fn dq_iq1_m(b: &[u8], y: &mut [f32]) {
     let qs = &b[0..32];
     let qh = &b[32..48];
     let sc: [u16; 4] = core::array::from_fn(|i| u16::from_le_bytes([b[48 + 2 * i], b[49 + 2 * i]]));
-    let d_bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    let d_bits =
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
     let d = f16::from_bits(d_bits).to_f32();
 
     let mut yi = 0usize;
@@ -456,10 +457,26 @@ fn dq_iq1_m(b: &[u8], y: &mut [f32]) {
             q[3] as usize | (((h[1] as usize) << 4) & 0x700),
         ];
         let delta = [
-            if h[0] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
-            if h[0] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
-            if h[1] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
-            if h[1] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+            if h[0] & 0x08 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if h[0] & 0x80 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if h[1] & 0x08 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if h[1] & 0x80 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
         ];
         for l in 0..4 {
             let dl = if l < 2 { dl1 } else { dl2 };
@@ -483,7 +500,12 @@ fn dq_iq2_xxs(b: &[u8], y: &mut [f32]) {
         let db = d * (0.5 + (aux32_1 >> 28) as f32) * 0.25;
         for l in 0..4 {
             let signs = KSIGNS_IQ2XS[((aux32_1 >> (7 * l)) & 127) as usize];
-            signed8(db, grid8(IQ2XXS_GRID[aux8[l] as usize]), signs, &mut y[yi..]);
+            signed8(
+                db,
+                grid8(IQ2XXS_GRID[aux8[l] as usize]),
+                signs,
+                &mut y[yi..],
+            );
             yi += 8;
         }
     }
@@ -528,8 +550,7 @@ fn dq_iq2_s(b: &[u8], y: &mut [f32]) {
             d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
         ];
         for l in 0..4 {
-            let idx =
-                qs[4 * ib32 + l] as usize | (((qh[ib32] as usize) << (8 - 2 * l)) & 0x300);
+            let idx = qs[4 * ib32 + l] as usize | (((qh[ib32] as usize) << (8 - 2 * l)) & 0x300);
             signed8(
                 db[l / 2],
                 grid8(IQ2S_GRID[idx]),
@@ -566,7 +587,11 @@ fn dq_iq3_xxs(b: &[u8], y: &mut [f32]) {
             let g2 = grid4(IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1] as usize]);
             for j in 0..4 {
                 let s1 = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
-                let s2 = if signs & (1 << (j + 4)) != 0 { -1.0 } else { 1.0 };
+                let s2 = if signs & (1 << (j + 4)) != 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
                 y[yi + j] = db * g1[j] as f32 * s1;
                 y[yi + j + 4] = db * g2[j] as f32 * s2;
             }
@@ -596,7 +621,11 @@ fn dq_iq3_s(b: &[u8], y: &mut [f32]) {
                 let g2 = grid4(IQ3S_GRID[q[2 * l + 1] as usize | ((h << (7 - 2 * l)) & 256)]);
                 for j in 0..4 {
                     let s1 = if s[l] & (1 << j) != 0 { -1.0 } else { 1.0 };
-                    let s2 = if s[l] & (1 << (j + 4)) != 0 { -1.0 } else { 1.0 };
+                    let s2 = if s[l] & (1 << (j + 4)) != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[yi + j] = db * g1[j] as f32 * s1;
                     y[yi + j + 4] = db * g2[j] as f32 * s2;
                 }
@@ -926,11 +955,11 @@ mod tests {
         let y = dq(QuantKind::IQ1S, &b);
         // qs[0]=0, idx 0 -> grid all -1; delta +0.125.
         assert_eq!(y[0], -(5.0 * (1.0 - 0.125))); // -4.375
-        // l=1 -> idx 256 -> grid [-1,0,1,0,1,-1,0,-1]
+                                                  // l=1 -> idx 256 -> grid [-1,0,1,0,1,-1,0,-1]
         assert_eq!(y[8], 5.0 * (-1.0 + 0.125));
         assert_eq!(y[9], 5.0 * 0.125);
         assert_eq!(y[10], 5.0 * (1.0 + 0.125)); // 5.625
-        // sub-block 1: sign bit -> delta -0.125, scale bits 0 -> dl = 1.
+                                                // sub-block 1: sign bit -> delta -0.125, scale bits 0 -> dl = 1.
         let mut b2 = b.clone();
         b2[36..38].copy_from_slice(&0x8000u16.to_le_bytes());
         let y = dq(QuantKind::IQ1S, &b2);
@@ -952,7 +981,7 @@ mod tests {
         // idx 0 -> grid all -1, delta +0.125 (qh bits clear).
         assert_eq!(y[0], 3.0 * (-1.0 + 0.125)); // -2.625
         assert_eq!(y[16], 5.0 * (-1.0 + 0.125)); // l=2 uses dl2 -> -4.375
-        // qh[0] bit 3 -> delta[0] flips negative.
+                                                 // qh[0] bit 3 -> delta[0] flips negative.
         b[32] = 0x08;
         let y = dq(QuantKind::IQ1M, &b);
         assert_eq!(y[0], 3.0 * (-1.0 - 0.125)); // -3.375
@@ -967,7 +996,7 @@ mod tests {
         b[6..10].copy_from_slice(&aux32_1.to_le_bytes());
         let y = dq(QuantKind::IQ2XXS, &b);
         let db = (0.5 + 3.0) * 0.25; // 0.875
-        // ksigns[1] = 129: bits 0 and 7 set.
+                                     // ksigns[1] = 129: bits 0 and 7 set.
         assert_eq!(y[0], -(db * 43.0)); // -37.625
         assert_eq!(y[1], db * 8.0);
         assert_eq!(y[7], -(db * 8.0));
@@ -1001,7 +1030,7 @@ mod tests {
         let db = (0.5 + 1.0) * 0.25; // 0.375
         assert_eq!(y[0], -(db * 43.0)); // -16.125
         assert_eq!(y[1], db * 8.0); // 3.0
-        // qh[0] = 1 -> l=0 idx gains 0x100 -> entry 257 = [8,43,25,...].
+                                    // qh[0] = 1 -> l=0 idx gains 0x100 -> entry 257 = [8,43,25,...].
         b[66] = 1;
         let y = dq(QuantKind::IQ2S, &b);
         assert_eq!(y[0], -(db * 8.0)); // -3.0
@@ -1017,7 +1046,7 @@ mod tests {
         b[66..70].copy_from_slice(&aux32.to_le_bytes());
         let y = dq(QuantKind::IQ3XXS, &b);
         let db = (0.5 + 2.0) * 0.5; // 1.25
-        // ksigns[1] = 129: bit 0 (grid1 j=0) and bit 7 (grid2 j=3) set.
+                                    // ksigns[1] = 129: bit 0 (grid1 j=0) and bit 7 (grid2 j=3) set.
         assert_eq!(y[0], -(db * 20.0)); // -25.0
         assert_eq!(y[1], db * 4.0);
         assert_eq!(y[4], db * 4.0); // grid2 entry 0 = [4,4,4,4]
@@ -1034,7 +1063,7 @@ mod tests {
         assert_eq!(y[0], 3.0 * 3.0); // 9.0
         assert_eq!(y[1], 3.0 * 1.0);
         assert_eq!(y[32], 5.0 * 1.0); // second 32-group: grid entry 0 = [1,1,1,1]
-        // qh[0] bit 0 -> l=0 grid1 idx gains 256 -> entry 257 = [5,7,9,5].
+                                      // qh[0] bit 0 -> l=0 grid1 idx gains 256 -> entry 257 = [5,7,9,5].
         b[66] = 1;
         // signs[0] bit 0 -> grid1 j=0 negative.
         b[74] = 0x01;

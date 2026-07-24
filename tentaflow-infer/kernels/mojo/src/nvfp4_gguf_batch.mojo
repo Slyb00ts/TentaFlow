@@ -235,6 +235,55 @@ def gemm_nvfp4_gguf_out_f32_b2(
             y[n_rows + row] = total1 * output_scale
 
 
+def gemm_nvfp4_gguf_out_f32_small_impl[token_tile: Int](
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    output_scale: Float32,
+):
+    """Liczy kilka wierszy logitów F32 jednym odczytem wag na warp."""
+    row = Int(block_idx.x)
+    if row >= n_rows:
+        return
+
+    lane = Int(thread_idx.x)
+    blocks_per_row = n_cols // 64
+    row_base = row * blocks_per_row * 36
+    var acc = InlineArray[Float32, token_tile](fill=0.0)
+    var group = lane
+    while group < blocks_per_row * 4:
+        block = group // 4
+        subblock = group % 4
+        base = row_base + block * 36
+        codes = (weights + base + 4 + subblock * 8).load[
+            width=8, alignment=4
+        ]()
+        low = _e2m1x8(codes & 0x0F)
+        high = _e2m1x8(codes >> 4)
+        scale = _ue4m3_value(weights[base + subblock])
+        column = block * 64 + subblock * 16
+        comptime for token in range(token_tile):
+            if token < n_tokens:
+                x_low = (x + token * n_cols + column).load[
+                    width=8, alignment=16
+                ]().cast[DType.float32]()
+                x_high = (x + token * n_cols + column + 8).load[
+                    width=8, alignment=16
+                ]().cast[DType.float32]()
+                acc[token] += scale * (
+                    (low * x_low).reduce_add() + (high * x_high).reduce_add()
+                )
+        group += WARP_SIZE
+
+    comptime for token in range(token_tile):
+        total = warp.sum(acc[token])
+        if lane == 0 and token < n_tokens:
+            y[token * n_rows + row] = total * output_scale
+
+
 def gemm_nvfp4_gguf_f16_nvidia_impl[token_tile: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
@@ -354,3 +403,6 @@ comptime gemm_nvfp4_gguf_f16_b4_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[4]
 comptime gemm_nvfp4_gguf_f16_b8_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[8]
 comptime gemm_nvfp4_gguf_f16_b8 = gemm_nvfp4_gguf_f16_impl[8]
 comptime gemm_nvfp4_gguf_f16_b16 = gemm_nvfp4_gguf_f16_impl[16]
+comptime gemm_nvfp4_gguf_out_f32_b4 = gemm_nvfp4_gguf_out_f32_small_impl[4]
+comptime gemm_nvfp4_gguf_out_f32_b8 = gemm_nvfp4_gguf_out_f32_small_impl[8]
+comptime gemm_nvfp4_gguf_out_f32_b16 = gemm_nvfp4_gguf_out_f32_small_impl[16]

@@ -398,15 +398,27 @@ coherent Polish on the RTX 4090.
 
 ### Ścieżka NVFP4/FP8
 
-- `FORGE_GEMM=fp8mod-ffn` włącza hybrydowy prefill: kernele Mojo przepakowują
-  projekcje Q/O/gate/up/down NVFP4 oraz pojedynczy `lm_head` F16 do FP8 na GPU.
-  Źródłowe NVFP4 pozostaje rezydentne dla decode; K/V nie są konwertowane.
+- Dla katalogowego checkpointu brak `FORGE_GEMM` automatycznie próbuje włączyć
+  hybrydowy prefill FP8: kernele Mojo przepakowują projekcje Q/O/gate/up/down
+  NVFP4 oraz pojedynczy `lm_head` F16 do FP8 na GPU. `fp8mod-ffn` wymusza tę
+  próbę, a inna jawna wartość wyłącza auto. Źródłowe NVFP4 pozostaje rezydentne
+  dla decode; K/V nie są konwertowane.
+- `FORGE_NVFP4_CT_LAYOUT` domyślnie ma wartość `auto`: wybiera S0 wyłącznie po
+  przejściu kontroli urządzenia, geometrii i artefaktów, a poza tym zachowuje
+  row-major. Mały batch BM16 jest również automatyczny; `FORGE_NVFP4_CT_BM16=0`
+  jest jego jawnym wyłącznikiem.
 - Wyspecjalizowane kernele małych batchy NVFP4 obsługują B4/B8/B16 i BM32.
   Decode GQA 4:1 dla `head_dim=128`, KV F16 i bez Q/K norm współdzieli K/V między
   czterema głowicami Q oraz używa dwugłowicowego `combine2`.
 - Konwersję wolno rozpocząć dopiero po sprawdzeniu możliwości urządzenia,
   obsługiwanych kształtów, kompletu artefaktów i dostępnego VRAM. Niespełnienie
   warunków pozostawia całą warstwę na istniejącej ścieżce NVFP4.
+- `serve`, `run`, `embed` i `ppl` zawsze używają `RowMajor36`, także dla
+  pojedynczej sekwencji bez spekulacji. `TileN128K64` jest wyłącznie jawnym
+  trybem porównawczym `bench` przez `FORGE_BENCH_NVFP4_TILE=1`; wymaga
+  `SpeculationKind::Off` i jednej aktywnej sekwencji. Loader przepakowuje każdą
+  kwalifikującą się wagę targetu na GPU przez pojedynczy bufor z puli aktywacji;
+  MTP, embeddingi, `lm_head`, n-gram i batch pozostają w `RowMajor36`.
 - Zweryfikowany wynik RTX 4090, pp4096/jeden strumień: FORGE 10 302,7 tok/s
   prefill i 143,100 tok/s decode; vLLM 0.25.1 odpowiednio 9 732,9 i 146,372.
   Prefill wygrywa o 5,85%, decode pozostaje 2,24% wolniejszy. Protokół i
@@ -430,8 +442,8 @@ coherent Polish on the RTX 4090.
   DeltaNet/KV na GPU przez kernele Mojo. Serwer obsługuje `--speculative mtp`,
   `mtp:2`, `mtp:3` oraz priorytetowy router `mtp+ngram:2|3`; pełny draft n-gram
   omija proposer MTP, stan MTP jest doganiany po zaakceptowanym prefiksie, a
-  brak pełnego draftu uruchamia natywne MTP. Budżet samodzielnego `mtp` 3 jest
-  adaptacyjnie przełączany między K=2 i K=3.
+  brak pełnego draftu uruchamia natywne MTP. `mtp` i `mtp:3` utrzymują K=3;
+  fallback K=2 występuje tylko przy niewystarczającym kontekście lub puli KV.
   Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
 - Natywne MTP jest obecnie greedy-exact; domyślne `max_active=1` ogranicza pulę,
   a jawne `max_active > 1` przechodzi atomowy startup preflight. Scheduler paruje
@@ -531,10 +543,93 @@ coherent Polish on the RTX 4090.
   wewnętrznego chunka, również gdy prompt przekracza zewnętrzny limit 1024.
 - Hybrydowe modele z natywnym MTP rezerwują 1152 MiB puli aktywacji, aby pomieścić
   jednocześnie bufory prefill, verifiera, stany DeltaNet i batched catch-up.
+- Prefill T32/T128 przygotowuje aktywację Q8_1 raz na warstwę, a pojedynczy
+  kernel Mojo `gemm_q8_0_i8mma_triplet_bm64` zapisuje projekcje gate/alpha/beta
+  do trzech niezależnych przestrzeni bez łączenia wag i wyjść. Scratch `cap>4`
+  ma osobny bufor `z`, aby projekcja gate nie nadpisywała aliasowanego wejścia
+  mixed-QKV przed `deltanet_prepare`; estymator uwzględnia ten koszt, a brak
+  artefaktu ogranicza automatyczny prefill do T16. RTX 4090 warmup+5: P2048
+  851,0 tok/s (+5,9%), P4096 797,5 tok/s (+5,5%), z niezmienionymi ID.
+- Layer-major wykonuje pełne projekcje GEMM raz na warstwę w leniwej arenie do
+  P4096 i jest domyślną ścieżką zgodnych modeli; wartość
+  `FORGE_HYBRID_LAYER_MAJOR_PREFILL=0` wyłącza ją diagnostycznie.
+  `FORGE_HYBRID_LAYER_MAJOR_ATTN` domyślnie wybiera Mojo FA HD256, a wartości
+  `exact` i `prefill` wymuszają starsze warianty. Persistent scan włącza się
+  automatycznie wyłącznie dla zweryfikowanej kombinacji NVIDIA, warp32,
+  d_state=128, T>128 i obecnego artefaktu; `chunked` wymusza bitowy fallback,
+  podobnie jak inne urządzenia i kształty.
+- Layer-major dobiera największą arenę mieszczącą się w aktualnym budżecie
+  aktywacji. Samotny prefill wykorzystuje całą dostępną pojemność, natomiast
+  aktywny decode ogranicza kwant schedulera do T1024 i przeplata kolejne
+  segmenty. Na RTX 4090 P4096 używa dwóch segmentów T2048 bez OOM; realny test
+  ciągłego batchingu potwierdza obsługę decode pomiędzy segmentami.
+- `FORGE_HYBRID_LAYER_MAJOR_DELTA_PREPARE=tiled` włącza kafelkowane przygotowanie
+  DeltaNet D128/C4 z fallbackiem do wariantu segmentowanego. Raw NVFP4 wybiera
+  BN128 dla M>=256 oraz jednobarierowy BN64 dla M128, z zachowaniem starszego
+  kernela dla regresyjnego N17408/K5120 i przy braku artefaktu. Izolowane testy
+  Mojo potwierdzają bitową zgodność oraz nienaruszone canary.
+- Trzy projekcje Q8 DeltaNet współdzielą jedną kwantyzację aktywacji i jeden
+  grid. Dla T>=1024 wariant Mojo używa kafla BM128/BN128 z 16 warpami, a dla
+  krótszych wejść BM64/BN64; przy braku nowych artefaktów T>=256 wraca do trzech
+  przygotowanych projekcji. Flash Attention HD256 domyślnie używa bitowo
+  zgodnego wariantu K16 z transponowanym odczytem V. Niedokładny K32 pozostaje
+  dostępny wyłącznie przez `FORGE_HYBRID_FA_KEY_TILE=32`.
+- Decode F16 HD256 używa ośmiu części kontekstu liczonych blokami po 256 wątków
+  i osobnego scalenia jednym warpem na głowę. Części mieszczą się w istniejącym
+  scratch modelu. Test produkcyjny dla dwóch sekwencji względem referencji
+  obejmuje P1, P31, P33, P128, P2048, P2049, P2174 i P4096 oraz wymaga
+  względnego L2 <= `1e-4` i maksymalnie 16 ULP.
+  Na RTX 4090 P2048/O128 mediana decode spadła z 4021,3 ms do 3370,4 ms
+  (-16,2%), czyli przepustowość wzrosła z 31,6 do 37,7 tok/s.
+- Dla T>=1024 triplet Q8 wybiera wariant `single_big_poststage`, który ładuje
+  surowe dane następnego etapu przed MMA i zapisuje je do pamięci współdzielonej
+  dopiero po MMA. Na RTX 4090 zachowuje bitową zgodność i canary, używa 126
+  rejestrów, 18432 B shared memory i nie spilluje; przyspiesza izolowany T1024
+  1,147x oraz T2048 1,162x. Brak artefaktu zachowuje dotychczasowy `single_big`.
+- Natywny MTP dogania layer-major jednym batchem GPU pod wspólnym checkpointem;
+  modele bez zgodnego shared embeddingu zachowują wariant sekwencyjny. RTX 4090
+  P2048 bez flag optymalizacyjnych, warmup+3: mediana targetu 854,2 ms i
+  2397,6 tok/s; pojedynczy przebieg MTP osiąga
+  850,1 ms targetu i 40,0 ms catch-up zamiast 1172,2 ms. P4096 osiąga 1737,5 ms
+  bez MTP oraz 1736,4 ms targetu i 79,9 ms catch-up z MTP, ze stabilnym SHA
+  tokenów.
+- Prefill layer-major działa jako transakcja obejmująca target i catch-up MTP.
+  Przed mutacją wykonuje checkpoint wszystkich stanów i okien DeltaNet oraz
+  częściowego ogona KV kopiami D2D do istniejących buforów verifiera. Każdy
+  błąd przywraca stan, KV, mapę stron, tokeny i długości sekwencji; testy z
+  wstrzyknięciem błędu po kilku warstwach i podczas catch-up potwierdzają
+  bitową zgodność bez dodatkowej dużej rezerwacji VRAM.
+- Checkpoint MTP pozostaje aktywny przez rejestrację końca profilu i końcową
+  synchronizację GPU. Commit jest walidowany przed tymi operacjami, ale
+  zatwierdzany dopiero jako ostatnia bezbłędna zmiana; fault-test po walidacji
+  commitu przywraca target i MTP bitowo.
+- `build_kernels.mojo` uruchamia strukturalny katalog 417 kerneli w izolowanych
+  jednostkach Mojo i automatycznie dzieli jednostkę po błędzie offload
+  kompilatora. Zestaw PTX, cubinów i manifest powstaje w stagingu na tym samym
+  filesystemie, a cały katalog architektury jest publikowany atomowym
+  `RENAME_EXCHANGE`; późny błąd pozostawia poprzedni komplet bez zmian. Czysty
+  build 417 artefaktów przechodzi bezpośredni `load_dir`.
 - Target KV ma zwartą mapę `global_layer -> kv_layer` i alokuje slaby wyłącznie
   dla warstw `Attention`. Qwen3.6-27B z układem 48 DeltaNet + 16 attention
   zużywa 64 KiB F16 KV na token zamiast 256 KiB; osobny cache MTP zachowuje
   jednowarstwową mapę identity.
+- Decode DeltaNet nie zapisuje pośredniego wygaszonego stanu F32. Kernel
+  ponownie oblicza `S*decay` przed rank-1 update, a jawne `fma(..., 0)` zachowuje
+  bitowe zaokrąglenie i kolejność redukcji. Dla H48/D128 zmniejsza to logiczny
+  ruch stanu z czterech do trzech przejść i skraca krok z 48,734 do 26,063 us.
+- Stan DeltaNet D128 używa układu `ValueKey` wybieranego raz przy tworzeniu puli.
+  Kernele Mojo utrzymują kolumnę wartości w rejestrach przez cały skan i
+  obsługują decode, persistent prefill, checkpointy oraz recompute MTP bez
+  transpozycji w ścieżce tokenowej. Układ zajmuje dokładnie tyle samo bajtów co
+  `KeyValue`; niekompletny zestaw artefaktów albo nieobsługiwana geometria warpa
+  wybiera przenośny `KeyValue` przed alokacją.
+- ThinkingCap Qwen3.6-27B NVFP4 na RTX 4090, P2048/O128, warmup+3:
+  mediana prefill 819,688 ms (2498,5 tok/s), decode 3111,602 ms (40,8 tok/s),
+  czyli -0,57% i -3,83% czasu względem poprzedniego układu. Peak VRAM pozostaje
+  21340 MiB. Gate obejmuje parity KeyValue/ValueKey, B2, MTP K2/K3 i n-gram,
+  rollback, reuse slotów oraz bitowy tier recompute. `nsys` mierzy średnio
+  6,106 us dla decode ValueKey i 1429,006 us dla persistent prefill, bez local
+  memory i shared memory.
 
 ## Histogramowy sampling GPU
 

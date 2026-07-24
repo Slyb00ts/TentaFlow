@@ -45,14 +45,14 @@
 	cvta.to.global.u64 	%rd2, %rd54;
 	cvta.to.global.u64 	%rd3, %rd53;
 	cvta.to.global.u64 	%rd4, %rd51;
-	mov.u32 	%r1, %tid.x;
 	ld.param.b64 	%rd55, [src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_44c2351cfbb72775_param_5];
-	cvt.u64.u32 	%rd56, %r1;
 	mov.u32 	%r21, %ctaid.x;
 	mul.wide.u32 	%rd5, %r21, 64;
 	mov.u32 	%r22, %ctaid.y;
 	shl.b32 	%r23, %r22, 6;
 	cvt.u64.u32 	%rd6, %r23;
+	mov.u32 	%r1, %tid.x;
+	cvt.u64.u32 	%rd56, %r1;
 	add.s64 	%rd57, %rd6, %rd56;
 	add.s64 	%rd58, %rd50, -1;
 	min.s64 	%rd7, %rd57, %rd58;

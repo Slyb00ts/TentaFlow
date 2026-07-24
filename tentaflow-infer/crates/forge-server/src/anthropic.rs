@@ -322,9 +322,7 @@ async fn stream_message(
                 EngineEvent::Token { text, .. } => {
                     output_tokens += 1;
                     let step = parser.push(&text);
-                    if !step.text.is_empty()
-                        && emit_text_delta(&tx, &step.text).await.is_err()
-                    {
+                    if !step.text.is_empty() && emit_text_delta(&tx, &step.text).await.is_err() {
                         return;
                     }
                 }
@@ -333,9 +331,7 @@ async fn stream_message(
                     stop = reason;
                     // Flush any parser-held tail before closing the block.
                     let step = parser.finish();
-                    if !step.text.is_empty()
-                        && emit_text_delta(&tx, &step.text).await.is_err()
-                    {
+                    if !step.text.is_empty() && emit_text_delta(&tx, &step.text).await.is_err() {
                         return;
                     }
                     break;

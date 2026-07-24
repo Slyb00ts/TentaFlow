@@ -75,6 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         prefix_cache: false,
         native_mtp: false,
+        nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+        nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::RowMajorE4M3,
     };
     // The engine's paged KV slabs + (hybrid) SSM state allocate from the
     // WEIGHTS pool, not the HAL kv_cache pool, so keep the latter tiny (a full
@@ -145,8 +147,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (None, false) => {
             let mut ids = tokenizer.encode("", true)?;
-            let filler_ids =
-                tokenizer.encode("Jednym z najważniejszych miast w historii Polski jest Kraków. ", false)?;
+            let filler_ids = tokenizer.encode(
+                "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
+                false,
+            )?;
             while ids.len() + filler_ids.len() <= prompt_tokens.max(filler_ids.len() + 1) {
                 ids.extend_from_slice(&filler_ids);
             }

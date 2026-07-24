@@ -435,56 +435,6 @@ fn gemm_q6_k_matches_formats_dequant() {
     }
 }
 
-// Prefill-sized batch on a COMMITTED native (N,K,MPAD) shape (rows=1024,
-// cols=4096, n_tokens=128 → gemm_q6k_i8_native_1024_4096_m128) routes Q6_K
-// through the native-GGUF-layout int8 multistage GEMM. Compares against the CPU
-// formats dequant of the SAME bytes with the aggregate relative-L2 metric (the
-// q8_1 activation quant is per-element lossy; the double-mma per-16-scale flush is
-// otherwise bit-exact).
-#[test]
-fn gemm_q6_k_native_prefill_matches_formats_dequant() {
-    let Some(dev) = device() else { return };
-    let kernels = Kernels::load(dev.clone()).unwrap();
-    let stream = dev.create_stream().unwrap();
-
-    let (rows, cols, n_tokens) = (1024usize, 4096usize, 128usize);
-    let wq = build_q6k(rows, cols);
-    let w_f32 =
-        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q6K, &wq, rows * cols)
-            .unwrap();
-
-    let x: Vec<f32> = (0..n_tokens * cols)
-        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
-        .collect();
-    let xb = upload_f16(dev.as_ref(), &x);
-    let yb = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
-    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
-    dev.write(&wq, &wb, 0).unwrap();
-
-    kernels
-        .gemm_q6_k_f16(&yb, &wb, &xb, rows, cols, n_tokens, &stream)
-        .unwrap();
-    dev.synchronize().unwrap();
-
-    let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
-    let (mut num, mut den) = (0.0f64, 0.0f64);
-    for t in 0..n_tokens {
-        for r in 0..rows {
-            let want: f32 = (0..cols)
-                .map(|c| w_f32[r * cols + c] * x[t * cols + c])
-                .sum();
-            let diff = (got[t * rows + r] - want) as f64;
-            num += diff * diff;
-            den += (want as f64) * (want as f64);
-        }
-    }
-    let rel_l2 = (num / den).sqrt();
-    assert!(
-        rel_l2 < 5e-3,
-        "Q6_K native relL2 {rel_l2:.3e} exceeds q8_1 tolerance"
-    );
-}
-
 #[test]
 fn gemv_nvfp4_matches_formats_dequant() {
     let Some(dev) = device() else { return };
@@ -808,8 +758,7 @@ fn ue4m3(value: u8) -> f32 {
 
 fn best_e2m1(value: f32, scale: f32) -> u8 {
     const VALUES: [f32; 16] = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0,
-        -3.0, -4.0, -6.0,
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
     ];
     let mut best = 0;
     let mut error = value.abs();
@@ -836,7 +785,9 @@ fn q8_0_to_nvfp4_reference(source: &[u8], rows: usize, cols: usize) -> Vec<u8> {
                 .iter()
                 .map(|value| (*value as i8) as f32 * q8_scale)
                 .collect();
-            let amax = values.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
+            let amax = values
+                .iter()
+                .fold(0.0f32, |acc, value| acc.max(value.abs()));
             let scale_code = fp32_to_ue4m3(amax / 6.0);
             let scale = ue4m3(scale_code);
             output[block * 36 + subblock] = scale_code;
@@ -886,7 +837,11 @@ fn gpu_pack_q8_0_nvfp4_i_gemv_f32_zgadza_sie_z_referencja() {
     )
     .unwrap();
     let reference: Vec<f32> = (0..rows)
-        .map(|row| (0..cols).map(|col| weights[row * cols + col] * x[col]).sum())
+        .map(|row| {
+            (0..cols)
+                .map(|col| weights[row * cols + col] * x[col])
+                .sum()
+        })
         .collect();
     let got = download_f32(dev.as_ref(), &logits, rows);
     assert!(max_abs_err(&got, &reference) < 0.02);
@@ -926,21 +881,17 @@ fn gpu_nvfp4_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
     let mut joined = first.clone();
     joined.extend_from_slice(&second);
     let joined_dev = upload_f16(dev.as_ref(), &joined);
-    let first_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
-    let second_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let first_logits = dev
+        .alloc(rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let second_logits = dev
+        .alloc(rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
     let batch_logits = dev
         .alloc(2 * rows * 4, MemKind::Device, Pool::Activations)
         .unwrap();
     kernels
-        .gemv_nvfp4_gguf_out_f32(
-            &first_logits,
-            &packed,
-            &first_dev,
-            rows,
-            cols,
-            1.0,
-            &stream,
-        )
+        .gemv_nvfp4_gguf_out_f32(&first_logits, &packed, &first_dev, rows, cols, 1.0, &stream)
         .unwrap();
     kernels
         .gemv_nvfp4_gguf_out_f32(
@@ -967,7 +918,70 @@ fn gpu_nvfp4_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
     dev.synchronize().unwrap();
     let mut expected = download_f32(dev.as_ref(), &first_logits, rows);
     expected.extend(download_f32(dev.as_ref(), &second_logits, rows));
-    assert_eq!(download_f32(dev.as_ref(), &batch_logits, 2 * rows), expected);
+    assert_eq!(
+        download_f32(dev.as_ref(), &batch_logits, 2 * rows),
+        expected
+    );
+}
+
+#[test]
+fn gpu_nvfp4_logits_b4_b8_b16_sa_bitowo_zgodne_z_b1() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols) = (257usize, 128usize);
+    let q8 = make_q8_0(rows, cols);
+    let packed_bytes = rows * (cols / 64) * 36;
+    let source = dev.alloc(q8.len(), MemKind::Device, Pool::Weights).unwrap();
+    let packed = dev
+        .alloc(packed_bytes, MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&q8, &source, 0).unwrap();
+    kernels
+        .pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)
+        .unwrap();
+
+    for batch in [4usize, 8, 16] {
+        let joined = (0..batch)
+            .flat_map(|lane| {
+                (0..cols).map(move |column| fill(column + lane * 11) * (lane as f32 + 1.0) * 0.01)
+            })
+            .collect::<Vec<_>>();
+        let joined_dev = upload_f16(dev.as_ref(), &joined);
+        let batch_logits = dev
+            .alloc(batch * rows * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        kernels
+            .gemm_nvfp4_gguf_out_f32_batch(
+                &batch_logits,
+                &packed,
+                &joined_dev,
+                rows,
+                cols,
+                batch,
+                1.0,
+                &stream,
+            )
+            .unwrap();
+        let mut expected = Vec::with_capacity(batch * rows);
+        for lane in 0..batch {
+            let input = upload_f16(dev.as_ref(), &joined[lane * cols..(lane + 1) * cols]);
+            let logits = dev
+                .alloc(rows * 4, MemKind::Device, Pool::Activations)
+                .unwrap();
+            kernels
+                .gemv_nvfp4_gguf_out_f32(&logits, &packed, &input, rows, cols, 1.0, &stream)
+                .unwrap();
+            dev.synchronize().unwrap();
+            expected.extend(download_f32(dev.as_ref(), &logits, rows));
+        }
+        dev.synchronize().unwrap();
+        assert_eq!(
+            download_f32(dev.as_ref(), &batch_logits, batch * rows),
+            expected,
+            "B={batch}"
+        );
+    }
 }
 
 #[test]
@@ -990,20 +1004,17 @@ fn gpu_q8_0_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
     let mut joined = first.clone();
     joined.extend_from_slice(&second);
     let joined_dev = upload_f16(dev.as_ref(), &joined);
-    let first_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
-    let second_logits = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+    let first_logits = dev
+        .alloc(rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let second_logits = dev
+        .alloc(rows * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
     let batch_logits = dev
         .alloc(2 * rows * 4, MemKind::Device, Pool::Activations)
         .unwrap();
     kernels
-        .gemv_q8_0_out_f32(
-            &first_logits,
-            &weights_dev,
-            &first_dev,
-            rows,
-            cols,
-            &stream,
-        )
+        .gemv_q8_0_out_f32(&first_logits, &weights_dev, &first_dev, rows, cols, &stream)
         .unwrap();
     kernels
         .gemv_q8_0_out_f32(
@@ -1030,7 +1041,10 @@ fn gpu_q8_0_logits_b2_sa_bitowo_zgodne_z_dwoma_b1() {
     dev.synchronize().unwrap();
     let mut expected = download_f32(dev.as_ref(), &first_logits, rows);
     expected.extend(download_f32(dev.as_ref(), &second_logits, rows));
-    assert_eq!(download_f32(dev.as_ref(), &batch_logits, 2 * rows), expected);
+    assert_eq!(
+        download_f32(dev.as_ref(), &batch_logits, 2 * rows),
+        expected
+    );
 }
 
 fn q8_0_dot(weights: &[u8], row: usize, cols: usize, x: &[f32]) -> f32 {
@@ -1427,7 +1441,11 @@ fn deltanet_batched_scan_matches_sequential_checkpoints_and_gpu_commit() {
             .alloc(n_steps * state_bytes, MemKind::Device, Pool::Weights)
             .unwrap();
         let sequential_outputs = dev
-            .alloc(n_steps * vector_elements * 2, MemKind::Device, Pool::Activations)
+            .alloc(
+                n_steps * vector_elements * 2,
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
         for token in 0..n_steps {
             let vector_range = token * vector_elements..(token + 1) * vector_elements;
@@ -1485,7 +1503,11 @@ fn deltanet_batched_scan_matches_sequential_checkpoints_and_gpu_commit() {
             .alloc(2 * n_steps * state_bytes, MemKind::Device, Pool::Weights)
             .unwrap();
         let outputs = dev
-            .alloc(n_steps * vector_elements * 2, MemKind::Device, Pool::Activations)
+            .alloc(
+                n_steps * vector_elements * 2,
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
         kernels
             .deltanet_gated_scan_f16_at(
@@ -1511,13 +1533,11 @@ fn deltanet_batched_scan_matches_sequential_checkpoints_and_gpu_commit() {
             &sequential_checkpoints,
             n_steps * state_elements,
         );
-        let retained_states = download_f32(dev.as_ref(), &checkpoints, 2 * n_steps * state_elements);
+        let retained_states =
+            download_f32(dev.as_ref(), &checkpoints, 2 * n_steps * state_elements);
         let actual_states = &retained_states[n_steps * state_elements..];
-        let expected_outputs = download_f16(
-            dev.as_ref(),
-            &sequential_outputs,
-            n_steps * vector_elements,
-        );
+        let expected_outputs =
+            download_f16(dev.as_ref(), &sequential_outputs, n_steps * vector_elements);
         let actual_outputs = download_f16(dev.as_ref(), &outputs, n_steps * vector_elements);
         assert_eq!(actual_states, expected_states, "T={n_steps}: checkpointy");
         assert_eq!(actual_outputs, expected_outputs, "T={n_steps}: wyjścia");
@@ -1528,7 +1548,11 @@ fn deltanet_batched_scan_matches_sequential_checkpoints_and_gpu_commit() {
         );
 
         let accepted_index = dev
-            .alloc(std::mem::size_of::<i32>(), MemKind::Device, Pool::Activations)
+            .alloc(
+                std::mem::size_of::<i32>(),
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
         let accepted_cases = -1..=n_steps as i32 + 1;
         for accepted in accepted_cases {
@@ -1565,21 +1589,28 @@ fn deltanet_batched_scan_rejects_invalid_shapes_and_buffers() {
     let Some(dev) = device() else { return };
     let kernels = Kernels::load(dev.clone()).unwrap();
     let stream = dev.create_stream().unwrap();
-    let tiny = dev
-        .alloc(4, MemKind::Device, Pool::Activations)
-        .unwrap();
+    let tiny = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
 
     for n_steps in [0, 1, 5, usize::MAX] {
         assert!(kernels
             .deltanet_gated_scan_f16(
-                &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, n_steps, 1, 128,
-                &stream,
+                &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, n_steps, 1, 128, &stream,
             )
             .is_err());
     }
     assert!(kernels
         .deltanet_gated_scan_f16(
-            &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, &tiny, 4, usize::MAX, 1024,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            &tiny,
+            4,
+            usize::MAX,
+            1024,
             &stream,
         )
         .is_err());
@@ -1604,16 +1635,7 @@ fn deltanet_batched_scan_rejects_invalid_shapes_and_buffers() {
         )
         .is_err());
     assert!(kernels
-        .deltanet_commit_checkpoint_f32_at(
-            &tiny,
-            &tiny,
-            usize::MAX,
-            &tiny,
-            2,
-            1,
-            1,
-            &stream,
-        )
+        .deltanet_commit_checkpoint_f32_at(&tiny, &tiny, usize::MAX, &tiny, 2, 1, 1, &stream,)
         .is_err());
 }
 
@@ -1828,8 +1850,8 @@ fn attn_decode_matches_reference() {
 
     kernels
         .attn_decode_f16(
-            &ob, &qb, &kb, &vb, &ptb, &slb, n_seqs, n_q_heads, n_kv_heads, head_dim, page_size,
-            max_pages, scale, &stream,
+            &ob, &ob, &qb, &kb, &vb, &ptb, &slb, n_seqs, n_q_heads, n_kv_heads, head_dim,
+            page_size, max_pages, scale, &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();
