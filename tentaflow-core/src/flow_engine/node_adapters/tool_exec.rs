@@ -26,7 +26,9 @@ use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, LlmToolCall, NodeInpu
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
-use crate::project_studio::{ingest as project_ingest, knowledge as project_knowledge};
+use crate::project_studio::{
+    generation as project_generation, ingest as project_ingest, knowledge as project_knowledge,
+};
 use crate::services::org::DEFAULT_ORG_ID;
 
 const NODE_TYPE: &str = "tool_exec";
@@ -184,6 +186,83 @@ impl ToolExecNodeAdapter {
         CoreToolName::from_public_name(name)
             .map(|c| c.is_project_knowledge())
             .unwrap_or(false)
+    }
+
+    /// True for `core.project_case_save` — the generation sink with its own
+    /// arm (it reads the envelope's server-minted binding).
+    fn is_case_save(name: &str) -> bool {
+        CoreToolName::from_public_name(name)
+            .map(|c| c.is_case_save())
+            .unwrap_or(false)
+    }
+
+    /// Runs one `core.project_case_save` call. The binding comes ONLY from
+    /// `envelope.meta["ps_generation"]` (minted by GenerationStart at spawn) —
+    /// a run without it (any non-generation agent) gets a tool error, so the
+    /// model cannot target an arbitrary project. Validation failures are
+    /// per-case `[TOOL_ERROR]`s the model repairs and retries.
+    async fn run_case_save_call(
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        envelope: &FlowEnvelope,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        let args: Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
+        };
+        let Some(user_id) = principal.user_id().map(|s| s.to_string()) else {
+            return error_result(
+                call,
+                format!("tool '{}' requires a user identity", call.name),
+            );
+        };
+        let Some(binding) = project_generation::binding_from_meta(&envelope.meta) else {
+            return error_result(
+                call,
+                "this run is not bound to a test-case generation \
+                 (core.project_case_save works only inside GenerationStart runs)"
+                    .to_string(),
+            );
+        };
+        let org = ctx
+            .org_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ORG_ID.to_string());
+        let agent_id = envelope
+            .meta
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let agent_run_id = envelope
+            .meta
+            .get("agent_run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // Blocking SQLite work off the async worker.
+        let outcome = tokio::task::spawn_blocking(move || {
+            project_generation::save_generated_case(
+                &org,
+                &user_id,
+                &binding,
+                &agent_id,
+                &agent_run_id,
+                &args,
+            )
+        })
+        .await;
+        match outcome {
+            Ok(Ok(output)) => ToolCallResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                content: serde_json::to_string(&output).unwrap_or_default(),
+                success: true,
+            },
+            Ok(Err(message)) => error_result(call, message),
+            Err(e) => error_result(call, format!("case save join failed: {e}")),
+        }
     }
 
     /// Runs one `core.project_search` / `core.project_list_sources` call.
@@ -728,6 +807,8 @@ impl NodeAdapter for ToolExecNodeAdapter {
                 }
             } else if Self::is_project_knowledge(&call.name) {
                 Self::run_project_knowledge_call(ctx, &principal, call).await
+            } else if Self::is_case_save(&call.name) {
+                Self::run_case_save_call(ctx, &principal, envelope, call).await
             } else {
                 Self::run_tool_call(
                     &service,

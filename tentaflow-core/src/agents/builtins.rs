@@ -50,6 +50,12 @@ pub enum CoreToolName {
     /// `core.project_list_sources(project_id)` — the knowledge-source catalog
     /// of a project. Async path (same membership gate as project_search).
     ProjectListSources,
+    /// `core.project_case_save(...)` — saves ONE generated manual test case
+    /// into a Project Studio generation. The target project/generation is NOT
+    /// a parameter: it binds server-side via `envelope.meta["ps_generation"]`
+    /// minted at spawn, so the model can never redirect output to another
+    /// project. Async path (per-call membership + editor re-check).
+    CaseSave,
 }
 
 impl CoreToolName {
@@ -64,6 +70,7 @@ impl CoreToolName {
             CoreToolName::AskUser => "core.ask_user",
             CoreToolName::ProjectSearch => "core.project_search",
             CoreToolName::ProjectListSources => "core.project_list_sources",
+            CoreToolName::CaseSave => "core.project_case_save",
         }
     }
 
@@ -78,6 +85,7 @@ impl CoreToolName {
             CoreToolName::AskUser => "ask_user",
             CoreToolName::ProjectSearch => "project_search",
             CoreToolName::ProjectListSources => "project_list_sources",
+            CoreToolName::CaseSave => "project_case_save",
         }
     }
 
@@ -93,6 +101,7 @@ impl CoreToolName {
             "ask_user" => Some(CoreToolName::AskUser),
             "project_search" => Some(CoreToolName::ProjectSearch),
             "project_list_sources" => Some(CoreToolName::ProjectListSources),
+            "project_case_save" => Some(CoreToolName::CaseSave),
             _ => None,
         }
     }
@@ -121,6 +130,13 @@ impl CoreToolName {
         )
     }
 
+    /// True for `core.project_case_save` — the generation sink routed through
+    /// its own async arm in tool_exec (needs the envelope's server-minted
+    /// `ps_generation` binding, which the other paths never read).
+    pub fn is_case_save(self) -> bool {
+        matches!(self, CoreToolName::CaseSave)
+    }
+
     /// True for the sub-agent control builtins, which are admitted to the tool
     /// catalog only when the running agent may spawn (`max_subagents > 0`, §3.6).
     pub fn is_subagent_control(self) -> bool {
@@ -144,6 +160,7 @@ impl CoreToolName {
             CoreToolName::AskUser,
             CoreToolName::ProjectSearch,
             CoreToolName::ProjectListSources,
+            CoreToolName::CaseSave,
         ]
     }
 
@@ -334,6 +351,68 @@ impl CoreToolName {
                         }
                     },
                     "required": ["project_id"]
+                }),
+            },
+            CoreToolName::CaseSave => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Save ONE generated manual test case into the current \
+                              generation. Call it IMMEDIATELY after designing each case — \
+                              only saved cases count. The target project and generation \
+                              are bound server-side; do not pass any ids. A [TOOL_ERROR] \
+                              rejects only THIS case: fix it per the message and retry."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Concise case title (1..200 characters)."
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "critical"],
+                            "description": "Case priority."
+                        },
+                        "preconditions": {
+                            "type": "string",
+                            "description": "State required before executing the steps."
+                        },
+                        "steps": {
+                            "type": "array",
+                            "description": "1..50 ordered steps.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {"type": "string"},
+                                    "expected": {"type": "string"}
+                                },
+                                "required": ["action", "expected"]
+                            }
+                        },
+                        "test_data": {
+                            "type": "string",
+                            "description": "Input data the tester needs."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Up to 10 tags (created lazily)."
+                        },
+                        "source_refs": {
+                            "type": "array",
+                            "description": "Passages the case is grounded in (source ids \
+                                            from this generation + short verbatim quotes).",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "source_id": {"type": "string"},
+                                    "quote": {"type": "string"}
+                                },
+                                "required": ["source_id"]
+                            }
+                        }
+                    },
+                    "required": ["title", "priority", "steps"]
                 }),
             },
         }

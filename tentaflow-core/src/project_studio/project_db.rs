@@ -262,8 +262,8 @@ fn run_project_migrations(conn: &Connection) -> Result<i64> {
     Ok(latest)
 }
 
-/// Ordered per-project schema migrations (F2 tables land as further entries).
-const MIGRATIONS_PROJECT: &[(i64, &str)] = &[(1, PROJECT_SCHEMA_V1)];
+/// Ordered per-project schema migrations (F3+ tables land as further entries).
+const MIGRATIONS_PROJECT: &[(i64, &str)] = &[(1, PROJECT_SCHEMA_V1), (2, PROJECT_SCHEMA_V2)];
 
 const PROJECT_SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -308,6 +308,162 @@ CREATE TABLE tags (
     tag_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
     created_by TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+";
+
+/// F2: manual test cases + versions + tags, suites, runs with pinned item
+/// snapshots, tasks/defects with comments and agent generation runs. Cases
+/// carry `review_state` — agent output stays 'pending' (hidden everywhere)
+/// until review. Run items snapshot case_version + case_title, steps copy
+/// action/expected from the case content, so later edits never mutate a
+/// running execution.
+const PROJECT_SCHEMA_V2: &str = "
+CREATE TABLE test_cases (
+    case_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'manual' CHECK(kind IN ('manual','ui','api','unit','perf','security')),
+    title TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high','critical')),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','review','approved','deprecated')),
+    status_reason TEXT NOT NULL DEFAULT '',
+    review_state TEXT NOT NULL DEFAULT '' CHECK(review_state IN ('','pending','accepted')),
+    origin TEXT NOT NULL DEFAULT 'user' CHECK(origin IN ('user','agent')),
+    generation_run_id TEXT NOT NULL DEFAULT '',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    linked_sources_json TEXT NOT NULL DEFAULT '[]',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    language TEXT NOT NULL DEFAULT 'pl',
+    current_version INTEGER NOT NULL DEFAULT 1,
+    content_json TEXT NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_test_cases_filter ON test_cases(kind, status, review_state, updated_at DESC);
+CREATE INDEX idx_test_cases_generation ON test_cases(generation_run_id);
+CREATE TABLE test_case_versions (
+    case_id TEXT NOT NULL, version INTEGER NOT NULL,
+    content_json TEXT NOT NULL DEFAULT '{}',
+    change_note TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (case_id, version)
+);
+CREATE TABLE case_tags (
+    case_id TEXT NOT NULL, tag_id TEXT NOT NULL,
+    PRIMARY KEY (case_id, tag_id)
+);
+CREATE INDEX idx_case_tags_tag ON case_tags(tag_id);
+CREATE TABLE test_suites (
+    suite_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    description TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE suite_cases (
+    suite_id TEXT NOT NULL, case_id TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (suite_id, case_id)
+);
+CREATE TABLE test_runs (
+    run_id TEXT PRIMARY KEY,
+    run_no INTEGER NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    suite_id TEXT NOT NULL DEFAULT '',
+    run_type TEXT NOT NULL DEFAULT 'manual',
+    environment_id TEXT NOT NULL DEFAULT '',
+    env_note TEXT NOT NULL DEFAULT '',
+    assignment_mode TEXT NOT NULL CHECK(assignment_mode IN ('single','per_case','pool')),
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','cancelled')),
+    closed_by TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT
+);
+CREATE TABLE test_run_items (
+    item_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    case_title TEXT NOT NULL,
+    case_version INTEGER NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    assigned_to TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','in_progress','passed','failed','blocked','skipped')),
+    result_note TEXT NOT NULL DEFAULT '',
+    tester_config TEXT NOT NULL DEFAULT '',
+    duration_secs INTEGER NOT NULL DEFAULT 0,
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    claimed_at TEXT,
+    finished_at TEXT,
+    UNIQUE(run_id, case_id)
+);
+CREATE INDEX idx_run_items_run ON test_run_items(run_id, position);
+CREATE INDEX idx_run_items_assignee ON test_run_items(assigned_to, status);
+CREATE TABLE test_run_steps (
+    item_id TEXT NOT NULL, step_index INTEGER NOT NULL,
+    action TEXT NOT NULL DEFAULT '',
+    expected TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (item_id, step_index)
+);
+CREATE TABLE tasks (
+    task_id TEXT PRIMARY KEY,
+    task_no INTEGER NOT NULL UNIQUE,
+    task_type TEXT NOT NULL DEFAULT 'task' CHECK(task_type IN ('task','defect')),
+    title TEXT NOT NULL,
+    description_md TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '' CHECK(severity IN ('','low','medium','high','critical')),
+    priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high','critical')),
+    status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','review','done')),
+    assigned_to TEXT NOT NULL DEFAULT '',
+    due_date TEXT NOT NULL DEFAULT '',
+    links_json TEXT NOT NULL DEFAULT '[]',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_tasks_filter ON tasks(task_type, status, updated_at DESC);
+CREATE INDEX idx_tasks_assignee ON tasks(assigned_to, status);
+CREATE TABLE task_comments (
+    comment_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    author_user_id TEXT NOT NULL,
+    body_md TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    edited_at TEXT
+);
+CREATE INDEX idx_task_comments_task ON task_comments(task_id, created_at);
+CREATE TABLE generation_runs (
+    gen_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'manual',
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','review','accepted','rejected','failed','cancelled')),
+    agent_id TEXT NOT NULL,
+    agent_run_id TEXT NOT NULL DEFAULT '',
+    source_ids_json TEXT NOT NULL DEFAULT '[]',
+    instructions TEXT NOT NULL DEFAULT '',
+    requested_count INTEGER NOT NULL DEFAULT 0,
+    max_cases INTEGER NOT NULL DEFAULT 10,
+    cases_generated INTEGER NOT NULL DEFAULT 0,
+    cases_accepted INTEGER NOT NULL DEFAULT 0,
+    cases_rejected INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    started_by TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT
+);
+CREATE INDEX idx_generation_runs_started ON generation_runs(started_at DESC);
+CREATE INDEX idx_generation_runs_agent_run ON generation_runs(agent_run_id);
+CREATE TABLE generation_run_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    gen_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    case_id TEXT NOT NULL DEFAULT '',
+    excerpt TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_generation_run_sources_gen ON generation_run_sources(gen_id);
 ";
 
 #[cfg(test)]

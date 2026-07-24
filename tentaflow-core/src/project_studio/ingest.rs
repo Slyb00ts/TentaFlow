@@ -408,13 +408,19 @@ const ORPHAN_BLOB_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(
 
 /// Best-effort GC of the project `files/` directory, run when a project pool
 /// is freshly opened: stale part files (aborted uploads, restarts) and blobs
-/// no `source_files` row references any more. Never fails the open.
+/// that neither a `source_files` row nor any attachments_json entry (cases,
+/// run items, run steps, tasks — risk F.6) references any more. Never fails
+/// the open.
 pub fn cleanup_files_dir(pool: &DbPool, dir_path: &Path) {
     let files_dir = dir_path.join("files");
     let Ok(entries) = std::fs::read_dir(&files_dir) else {
         return;
     };
     let now = std::time::SystemTime::now();
+    // One pass over the reference tables instead of a per-blob count query.
+    // A read failure disables blob GC for this run — never treat a blob as
+    // orphaned on uncertainty (stale part cleanup still proceeds).
+    let referenced = repository::referenced_blob_sha256s(pool).ok();
     let mut removed = 0u32;
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
@@ -432,7 +438,7 @@ pub fn cleanup_files_dir(pool: &DbPool, dir_path: &Path) {
         let orphan_blob = name.len() == 64
             && name.bytes().all(|b| b.is_ascii_hexdigit())
             && age > ORPHAN_BLOB_MAX_AGE
-            && matches!(repository::sha_ref_count(pool, &name), Ok(0));
+            && referenced.as_ref().is_some_and(|set| !set.contains(&name));
         if (stale_part || orphan_blob) && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }

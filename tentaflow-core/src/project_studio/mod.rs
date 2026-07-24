@@ -9,11 +9,17 @@
 
 pub mod activity;
 pub mod db;
+pub mod generation;
 pub mod ingest;
 pub mod knowledge;
 pub mod models;
+pub mod notifications;
 pub mod project_db;
+pub mod reports;
 pub mod repository;
+pub mod runs;
+pub mod tasks;
+pub mod tests;
 
 use anyhow::Result;
 

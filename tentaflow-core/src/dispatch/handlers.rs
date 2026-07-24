@@ -7961,7 +7961,7 @@ pub async fn agent_run_start(
     let manager = crate::agents::agent_run_manager_global()
         .ok_or_else(|| ProtocolError::internal("agent run manager not initialized"))?;
     let run_id = manager
-        .spawn(&agent.id, &payload.prompt, None, &principal, &[], None)
+        .spawn(&agent.id, &payload.prompt, None, &principal, &[], &[], None)
         .await
         .map_err(|e| ProtocolError::internal(format!("agent run spawn failed: {e}")))?;
 

@@ -366,6 +366,11 @@ impl AgentRunManager {
     /// (`tools(child) ∩ tools(parent)`); it is persisted indirectly via the
     /// agent definition, so the parameter records the intersection the spawn was
     /// authorized under (used to reject an over-broad child before launch).
+    ///
+    /// `extra_meta` entries are merged into the initial envelope meta BEFORE
+    /// the task starts — the atomic path for server-minted bindings (e.g.
+    /// Project Studio `ps_generation`): no post-spawn write, no race with the
+    /// first tool call.
     pub async fn spawn(
         &self,
         agent_id: &str,
@@ -373,6 +378,7 @@ impl AgentRunManager {
         parent_run_id: Option<&str>,
         principal: &AgentPrincipal,
         inherited_tools: &[String],
+        extra_meta: &[(&str, Value)],
         target_session_id: Option<&str>,
     ) -> Result<String> {
         let agent = repository::get_agent(&self.db, agent_id)?
@@ -427,6 +433,9 @@ impl AgentRunManager {
         initial
             .meta
             .insert("agent_run_id".into(), Value::String(run_id.clone()));
+        for (key, value) in extra_meta {
+            initial.meta.insert((*key).to_string(), value.clone());
+        }
 
         let deadline = (agent.timeout_secs > 0)
             .then(|| Instant::now() + Duration::from_secs(agent.timeout_secs as u64));
@@ -536,6 +545,7 @@ impl AgentRunManager {
                     Some(&caller.run_id),
                     &caller.principal,
                     &parent_tools,
+                    &[],
                     caller.session_id.as_deref(),
                 )
                 .await?;
@@ -1350,6 +1360,7 @@ Continue your work using it.",
                 None,
                 &principal,
                 &parent_tools,
+                &[],
                 target_session_id.as_deref(),
             )
             .await
@@ -1670,7 +1681,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[], None)
+            .spawn("a1", "do it", None, &principal, &[], &[], None)
             .await
             .expect("spawn");
 
@@ -1707,7 +1718,7 @@ mod tests {
 
         // A parent run row (created directly — the parent's own flow is elsewhere).
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
 
@@ -1770,7 +1781,7 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[], None)
+            .spawn("a1", "do it", None, &principal, &[], &[], None)
             .await
             .expect("spawn");
 
@@ -1834,7 +1845,7 @@ mod tests {
         let mut callers = Vec::new();
         for i in 0..(cap + 1) {
             let parent_run = mgr
-                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], None)
+                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], &[], None)
                 .await
                 .expect("spawn parent");
             callers.push(CallerRun {
@@ -1898,7 +1909,7 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1929,7 +1940,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1960,7 +1971,7 @@ mod tests {
         // Simulate by giving the child spawn rights and asking it to spawn.
         seed_agent(&pool, "spawner", "midboss", "[]", 2, 1);
         let child_run = mgr
-            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], None)
+            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], &[], None)
             .await
             .expect("spawn mid");
         let mid_caller = CallerRun {
@@ -1985,7 +1996,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2094,7 +2105,7 @@ mod tests {
 
         // First run wins the single permit and parks on the gate.
         let run_a = mgr
-            .spawn("a", "first", None, &principal, &[], None)
+            .spawn("a", "first", None, &principal, &[], &[], None)
             .await
             .expect("spawn a");
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -2158,7 +2169,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2233,7 +2244,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         // Caller carries the originating session — the mailbox target.
@@ -2294,7 +2305,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2360,7 +2371,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {

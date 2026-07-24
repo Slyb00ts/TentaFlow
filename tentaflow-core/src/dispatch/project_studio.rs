@@ -13,17 +13,25 @@ use std::collections::{HashMap, HashSet};
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::project_studio::{
-    ActivityEntry, ChatInfo, ChatMessageWire, CreatorGrantInfo, IngestJobWire, KbHit, MemberInfo,
-    MemberInputWire, OverviewKpis, ProjectAgentBinding, ProjectInfo, ProjectSettings,
-    ProjectStudioPayload, SourceFileInfo, SourceInfo, TagInfo, UserRefWire,
+    ActivityEntry, AttachmentWire, CaseVersionInfo, ChatInfo, ChatMessageWire, CreatorGrantInfo,
+    CsvImportError, GenerationRunInfo, IngestJobWire, KbHit, MemberInfo, MemberInputWire,
+    MyWorkEntry, NotificationWire, OverviewKpis, ProjectAgentBinding, ProjectInfo,
+    ProjectSettings, ProjectStudioPayload, RunAssignmentWire, RunItemWire, RunStepWire,
+    SourceFileInfo, SourceInfo, SuiteCaseRef, SuiteInfo, TagInfo, TaskCommentWire, TaskDetail,
+    TaskInfo, TestCaseDetail, TestCaseInfo, TestRunInfo, UserRefWire,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
 use super::HandlerContext;
 use crate::project_studio::models::{
-    ActivityRecord, IngestJobRecord, ProjectRecord, ProjectRole, SourceListItem,
+    ActivityRecord, CaseListItem, GenerationRunRecord, IngestJobRecord, ProjectRecord,
+    ProjectRole, RunCounts, RunItemRecord, RunRecord, RunStepRecord, SourceListItem,
+    TaskCommentRecord, TaskRecord,
 };
-use crate::project_studio::{activity, ingest, project_db, repository};
+use crate::project_studio::{
+    activity, generation, ingest, notifications, project_db, reports, repository, runs, tasks,
+    tests as ps_tests,
+};
 use crate::services::rbac::OrgContext;
 use crate::services::vector::error::VectorError;
 use tentaflow_sdk_spec::{FieldValue, Filter};
@@ -485,6 +493,293 @@ pub async fn project_studio_dispatch(
         P::IngestStreamRequest { .. } | P::ChatStreamRequest { .. } => Err(
             ProtocolError::bad_request("use streaming subscribe for this variant"),
         ),
+        // ---- F2: manual tests, runs, tasks, generation, notifications ----
+        P::CasesListRequest {
+            project_id,
+            kind,
+            status,
+            priority,
+            tag_id,
+            origin,
+            search,
+            offset,
+            limit,
+        } => cases_list_v1(
+            ctx, project_id, kind, status, priority, tag_id, origin, search, *offset, *limit,
+        ),
+        P::CaseGetRequest {
+            project_id,
+            case_id,
+            include_versions,
+        } => case_get_v1(ctx, project_id, case_id, *include_versions),
+        P::CaseSaveRequest {
+            project_id,
+            case_id,
+            kind,
+            title,
+            priority,
+            content_json,
+            tag_ids,
+            linked_source_ids,
+            attachments_json,
+            expected_version,
+            change_note,
+        } => case_save_v1(
+            ctx,
+            project_id,
+            case_id.as_deref(),
+            kind,
+            title,
+            priority,
+            content_json,
+            tag_ids,
+            linked_source_ids,
+            attachments_json,
+            *expected_version,
+            change_note,
+        ),
+        P::CaseStatusSetRequest {
+            project_id,
+            case_id,
+            status,
+            reason,
+        } => case_status_set_v1(ctx, project_id, case_id, status, reason),
+        P::CasesBulkStatusRequest {
+            project_id,
+            case_ids,
+            status,
+            reason,
+        } => cases_bulk_status_v1(ctx, project_id, case_ids, status, reason),
+        P::CaseDuplicateRequest {
+            project_id,
+            case_id,
+        } => case_duplicate_v1(ctx, project_id, case_id),
+        P::CaseDeleteRequest {
+            project_id,
+            case_id,
+        } => case_delete_v1(ctx, project_id, case_id),
+        P::CaseVersionGetRequest {
+            project_id,
+            case_id,
+            version,
+        } => case_version_get_v1(ctx, project_id, case_id, *version),
+        P::CaseRestoreVersionRequest {
+            project_id,
+            case_id,
+            version,
+            expected_version,
+        } => case_restore_version_v1(ctx, project_id, case_id, *version, *expected_version),
+        P::CasesImportCsvRequest {
+            project_id,
+            csv_text,
+            dry_run,
+        } => cases_import_csv_v1(ctx, project_id, csv_text, *dry_run),
+        P::AttachmentGetRequest {
+            project_id,
+            sha256,
+            max_bytes,
+        } => attachment_get_v1(ctx, project_id, sha256, *max_bytes),
+        P::SuitesListRequest { project_id } => suites_list_v1(ctx, project_id),
+        P::SuiteGetRequest {
+            project_id,
+            suite_id,
+        } => suite_get_v1(ctx, project_id, suite_id),
+        P::SuiteSaveRequest {
+            project_id,
+            suite_id,
+            name,
+            description,
+            case_ids,
+        } => suite_save_v1(ctx, project_id, suite_id.as_deref(), name, description, case_ids),
+        P::SuiteDeleteRequest {
+            project_id,
+            suite_id,
+        } => suite_delete_v1(ctx, project_id, suite_id),
+        P::RunsListRequest {
+            project_id,
+            status,
+            run_type,
+            offset,
+            limit,
+        } => runs_list_v1(ctx, project_id, status, run_type, *offset, *limit),
+        P::RunCreateRequest {
+            project_id,
+            name,
+            suite_id,
+            case_ids,
+            from_failed_run_id,
+            env_note,
+            assignment_mode,
+            single_assignee,
+            assignments,
+        } => run_create_v1(
+            ctx,
+            project_id,
+            name,
+            suite_id,
+            case_ids,
+            from_failed_run_id,
+            env_note,
+            assignment_mode,
+            single_assignee,
+            assignments,
+        ),
+        P::RunGetRequest { project_id, run_id } => run_get_v1(ctx, project_id, run_id),
+        P::RunCloseRequest {
+            project_id,
+            run_id,
+            cancelled,
+        } => run_close_v1(ctx, project_id, run_id, *cancelled),
+        P::RunDeleteRequest { project_id, run_id } => run_delete_v1(ctx, project_id, run_id),
+        P::RunItemClaimRequest {
+            project_id,
+            run_id,
+            item_id,
+        } => run_item_claim_v1(ctx, project_id, run_id, item_id.as_deref()),
+        P::RunItemReleaseRequest {
+            project_id,
+            item_id,
+        } => run_item_release_v1(ctx, project_id, item_id),
+        P::RunItemGetRequest {
+            project_id,
+            item_id,
+        } => run_item_get_v1(ctx, project_id, item_id),
+        P::RunStepSetRequest {
+            project_id,
+            item_id,
+            step_index,
+            status,
+            note,
+            attachments_json,
+        } => run_step_set_v1(ctx, project_id, item_id, *step_index, status, note, attachments_json),
+        P::RunItemFinishRequest {
+            project_id,
+            item_id,
+            status,
+            result_note,
+            tester_config,
+            duration_secs,
+            attachments_json,
+        } => run_item_finish_v1(
+            ctx,
+            project_id,
+            item_id,
+            status,
+            result_note,
+            tester_config,
+            *duration_secs,
+            attachments_json,
+        ),
+        P::MyTestWorkRequest => my_test_work_v1(ctx),
+        P::TasksListRequest {
+            project_id,
+            task_type,
+            status,
+            assigned_to,
+            search,
+            offset,
+            limit,
+        } => tasks_list_v1(
+            ctx, project_id, task_type, status, assigned_to, search, *offset, *limit,
+        ),
+        P::TaskGetRequest {
+            project_id,
+            task_id,
+        } => task_get_v1(ctx, project_id, task_id),
+        P::TaskSaveRequest {
+            project_id,
+            task_id,
+            task_type,
+            title,
+            description_md,
+            severity,
+            priority,
+            status,
+            assigned_to,
+            due_date,
+            links_json,
+            attachments_json,
+        } => task_save_v1(
+            ctx,
+            project_id,
+            task_id.as_deref(),
+            task_type,
+            title,
+            description_md,
+            severity,
+            priority,
+            status,
+            assigned_to,
+            due_date,
+            links_json,
+            attachments_json,
+        ),
+        P::TaskDeleteRequest {
+            project_id,
+            task_id,
+        } => task_delete_v1(ctx, project_id, task_id),
+        P::TaskCommentAddRequest {
+            project_id,
+            task_id,
+            body_md,
+        } => task_comment_add_v1(ctx, project_id, task_id, body_md),
+        P::TaskCommentEditRequest {
+            project_id,
+            comment_id,
+            body_md,
+        } => task_comment_edit_v1(ctx, project_id, comment_id, body_md),
+        P::TaskCommentDeleteRequest {
+            project_id,
+            comment_id,
+        } => task_comment_delete_v1(ctx, project_id, comment_id),
+        P::GenerationStartRequest {
+            project_id,
+            kind,
+            source_ids,
+            requested_count,
+            instructions,
+            agent_id,
+        } => {
+            generation_start_v1(
+                ctx,
+                project_id,
+                kind,
+                source_ids,
+                *requested_count,
+                instructions,
+                agent_id.as_deref(),
+            )
+            .await
+        }
+        P::GenerationsListRequest { project_id } => generations_list_v1(ctx, project_id),
+        P::GenerationGetRequest { project_id, gen_id } => generation_get_v1(ctx, project_id, gen_id),
+        P::GenerationCancelRequest { project_id, gen_id } => {
+            generation_cancel_v1(ctx, project_id, gen_id)
+        }
+        P::GenerationReviewRequest {
+            project_id,
+            gen_id,
+            accept_case_ids,
+            reject_case_ids,
+        } => generation_review_v1(ctx, project_id, gen_id, accept_case_ids, reject_case_ids),
+        P::GenerationDeleteRequest { project_id, gen_id } => {
+            generation_delete_v1(ctx, project_id, gen_id)
+        }
+        P::NotificationsListRequest {
+            only_unread,
+            before_id,
+            limit,
+        } => notifications_list_v1(ctx, *only_unread, before_id.as_deref(), *limit),
+        P::NotificationsMarkReadRequest { notification_ids } => {
+            notifications_mark_read_v1(ctx, notification_ids)
+        }
+        P::ReportQueryRequest {
+            project_id,
+            report,
+            from_date,
+            to_date,
+            suite_id,
+        } => report_query_v1(ctx, project_id, report, from_date, to_date, suite_id),
         P::ProjectsListResponse { .. }
         | P::ProjectCreateResponse { .. }
         | P::ProjectGetResponse { .. }
@@ -525,14 +820,50 @@ pub async fn project_studio_dispatch(
         | P::IngestStreamChunk { .. }
         | P::IngestStreamEnd { .. }
         | P::ChatStreamChunk { .. }
-        | P::ChatStreamEnd { .. } => Err(ProtocolError::bad_request(
+        | P::ChatStreamEnd { .. }
+        | P::CasesListResponse { .. }
+        | P::CaseGetResponse { .. }
+        | P::CaseSaveResponse { .. }
+        | P::CaseStatusSetResult { .. }
+        | P::CasesBulkStatusResponse { .. }
+        | P::CaseDuplicateResponse { .. }
+        | P::CaseDeleteResult { .. }
+        | P::CaseVersionGetResponse { .. }
+        | P::CaseRestoreVersionResponse { .. }
+        | P::CasesImportCsvResponse { .. }
+        | P::AttachmentGetResponse { .. }
+        | P::SuitesListResponse { .. }
+        | P::SuiteGetResponse { .. }
+        | P::SuiteSaveResponse { .. }
+        | P::SuiteDeleteResult { .. }
+        | P::RunsListResponse { .. }
+        | P::RunCreateResponse { .. }
+        | P::RunGetResponse { .. }
+        | P::RunCloseResult { .. }
+        | P::RunDeleteResult { .. }
+        | P::RunItemClaimResponse { .. }
+        | P::RunItemReleaseResult { .. }
+        | P::RunItemGetResponse { .. }
+        | P::RunStepSetResult { .. }
+        | P::RunItemFinishResponse { .. }
+        | P::MyTestWorkResponse { .. }
+        | P::TasksListResponse { .. }
+        | P::TaskGetResponse { .. }
+        | P::TaskSaveResponse { .. }
+        | P::TaskDeleteResult { .. }
+        | P::TaskCommentAddResponse { .. }
+        | P::TaskCommentEditResult { .. }
+        | P::TaskCommentDeleteResult { .. }
+        | P::GenerationStartResponse { .. }
+        | P::GenerationsListResponse { .. }
+        | P::GenerationGetResponse { .. }
+        | P::GenerationCancelResult { .. }
+        | P::GenerationReviewResponse { .. }
+        | P::GenerationDeleteResult { .. }
+        | P::NotificationsListResponse { .. }
+        | P::NotificationsMarkReadResult { .. }
+        | P::ReportQueryResponse { .. } => Err(ProtocolError::bad_request(
             "variant is not a valid project studio request",
-        )),
-        // F2 variants (cases/suites/runs/tasks/generations/notifications/
-        // reports) get real handlers in the F2 backend step; a wildcard keeps
-        // this match compiling until then without listing 84 unhandled arms.
-        _ => Err(ProtocolError::bad_request(
-            "project studio variant not handled yet",
         )),
     }
 }
@@ -699,6 +1030,174 @@ register_project_studio_variant!(
 register_project_studio_variant!(
     "ProjectStudioTagDeleteRequest",
     "tentaflow_ws_handler_ps_tag_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioCasesListRequest",
+    "tentaflow_ws_handler_ps_cases_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioCaseGetRequest",
+    "tentaflow_ws_handler_ps_case_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioCaseSaveRequest",
+    "tentaflow_ws_handler_ps_case_save"
+);
+register_project_studio_variant!(
+    "ProjectStudioCaseStatusSetRequest",
+    "tentaflow_ws_handler_ps_case_status_set"
+);
+register_project_studio_variant!(
+    "ProjectStudioCasesBulkStatusRequest",
+    "tentaflow_ws_handler_ps_cases_bulk_status"
+);
+register_project_studio_variant!(
+    "ProjectStudioCaseDuplicateRequest",
+    "tentaflow_ws_handler_ps_case_duplicate"
+);
+register_project_studio_variant!(
+    "ProjectStudioCaseDeleteRequest",
+    "tentaflow_ws_handler_ps_case_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioCaseVersionGetRequest",
+    "tentaflow_ws_handler_ps_case_version_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioCaseRestoreVersionRequest",
+    "tentaflow_ws_handler_ps_case_restore_version"
+);
+register_project_studio_variant!(
+    "ProjectStudioCasesImportCsvRequest",
+    "tentaflow_ws_handler_ps_cases_import_csv"
+);
+register_project_studio_variant!(
+    "ProjectStudioAttachmentGetRequest",
+    "tentaflow_ws_handler_ps_attachment_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioSuitesListRequest",
+    "tentaflow_ws_handler_ps_suites_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioSuiteGetRequest",
+    "tentaflow_ws_handler_ps_suite_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioSuiteSaveRequest",
+    "tentaflow_ws_handler_ps_suite_save"
+);
+register_project_studio_variant!(
+    "ProjectStudioSuiteDeleteRequest",
+    "tentaflow_ws_handler_ps_suite_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunsListRequest",
+    "tentaflow_ws_handler_ps_runs_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunCreateRequest",
+    "tentaflow_ws_handler_ps_run_create"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunGetRequest",
+    "tentaflow_ws_handler_ps_run_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunCloseRequest",
+    "tentaflow_ws_handler_ps_run_close"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunDeleteRequest",
+    "tentaflow_ws_handler_ps_run_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunItemClaimRequest",
+    "tentaflow_ws_handler_ps_run_item_claim"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunItemReleaseRequest",
+    "tentaflow_ws_handler_ps_run_item_release"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunItemGetRequest",
+    "tentaflow_ws_handler_ps_run_item_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunStepSetRequest",
+    "tentaflow_ws_handler_ps_run_step_set"
+);
+register_project_studio_variant!(
+    "ProjectStudioRunItemFinishRequest",
+    "tentaflow_ws_handler_ps_run_item_finish"
+);
+register_project_studio_variant!(
+    "ProjectStudioMyTestWorkRequest",
+    "tentaflow_ws_handler_ps_my_test_work"
+);
+register_project_studio_variant!(
+    "ProjectStudioTasksListRequest",
+    "tentaflow_ws_handler_ps_tasks_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskGetRequest",
+    "tentaflow_ws_handler_ps_task_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskSaveRequest",
+    "tentaflow_ws_handler_ps_task_save"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskDeleteRequest",
+    "tentaflow_ws_handler_ps_task_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskCommentAddRequest",
+    "tentaflow_ws_handler_ps_task_comment_add"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskCommentEditRequest",
+    "tentaflow_ws_handler_ps_task_comment_edit"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskCommentDeleteRequest",
+    "tentaflow_ws_handler_ps_task_comment_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioGenerationStartRequest",
+    "tentaflow_ws_handler_ps_generation_start"
+);
+register_project_studio_variant!(
+    "ProjectStudioGenerationsListRequest",
+    "tentaflow_ws_handler_ps_generations_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioGenerationGetRequest",
+    "tentaflow_ws_handler_ps_generation_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioGenerationCancelRequest",
+    "tentaflow_ws_handler_ps_generation_cancel"
+);
+register_project_studio_variant!(
+    "ProjectStudioGenerationReviewRequest",
+    "tentaflow_ws_handler_ps_generation_review"
+);
+register_project_studio_variant!(
+    "ProjectStudioGenerationDeleteRequest",
+    "tentaflow_ws_handler_ps_generation_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioNotificationsListRequest",
+    "tentaflow_ws_handler_ps_notifications_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioNotificationsMarkReadRequest",
+    "tentaflow_ws_handler_ps_notifications_mark_read"
+);
+register_project_studio_variant!(
+    "ProjectStudioReportQueryRequest",
+    "tentaflow_ws_handler_ps_report_query"
 );
 
 // =============================================================================
@@ -1365,7 +1864,9 @@ async fn source_upload_chunk_v1(
     bytes: &[u8],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    // Tester tier (not editor): testers upload screenshots as run/step/task
+    // attachments through this same chunked endpoint (section C).
+    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
 
     let org_id = org.org_id.clone();
@@ -1716,8 +2217,8 @@ async fn source_delete_v1(
         if f.sha256.is_empty() {
             continue;
         }
-        let refs = repository::sha_ref_count(&pool, &f.sha256)
-            .map_err(|e| db_error("sha_ref_count", e))?;
+        let refs = repository::blob_ref_count(&pool, &f.sha256)
+            .map_err(|e| db_error("blob_ref_count", e))?;
         if refs == 0 {
             let blob = std::path::Path::new(&record.dir_path)
                 .join("files")
@@ -1881,8 +2382,8 @@ async fn source_file_delete_v1(
     let ok = repository::delete_source_file_row(&pool, file_id)
         .map_err(|e| db_error("file_delete", e))?;
     if ok && !file.sha256.is_empty() {
-        let refs = repository::sha_ref_count(&pool, &file.sha256)
-            .map_err(|e| db_error("sha_ref_count", e))?;
+        let refs = repository::blob_ref_count(&pool, &file.sha256)
+            .map_err(|e| db_error("blob_ref_count", e))?;
         if refs == 0 {
             let blob = std::path::Path::new(&record.dir_path)
                 .join("files")
@@ -2092,6 +2593,7 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
     let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let kpis = repository::project_kpis(&pool).map_err(|e| db_error("kpis", e))?;
+    let f2 = repository::project_f2_kpis(&pool, &org.user_id).map_err(|e| db_error("kpis_f2", e))?;
     let member_count =
         repository::member_count(project_id).map_err(|e| db_error("member_count", e))?;
     let my_chat_count =
@@ -2109,16 +2611,14 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
             member_count,
             open_ingest_jobs: kpis.open_ingest_jobs,
             my_chat_count,
-            // F2 objects (cases/suites/runs/tasks/generations) are not yet
-            // queried here — the F2 backend step computes these for real.
-            cases_total: 0,
-            cases_approved: 0,
-            suites_total: 0,
-            runs_open: 0,
-            my_run_items_pending: 0,
-            tasks_open: 0,
-            defects_open: 0,
-            generations_running: 0,
+            cases_total: f2.cases_total,
+            cases_approved: f2.cases_approved,
+            suites_total: f2.suites_total,
+            runs_open: f2.runs_open,
+            my_run_items_pending: f2.my_run_items_pending,
+            tasks_open: f2.tasks_open,
+            defects_open: f2.defects_open,
+            generations_running: f2.generations_running,
         },
         activity: activity_to_wire(entries, &names),
     }))
@@ -2481,6 +2981,2343 @@ fn tag_delete_v1(
         );
     }
     Ok(ps(ProjectStudioPayload::TagDeleteResult { ok }))
+}
+
+// =============================================================================
+// F2 wire mapping helpers
+// =============================================================================
+
+fn conflict() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::Conflict,
+        "version conflict: case was modified by someone else — reload and retry",
+    )
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn attachments_from_json(raw: &str) -> Vec<AttachmentWire> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Validates and canonicalizes an attachments payload ('' = none). Every
+/// entry must be a content hash of the project blob store.
+fn normalize_attachments(raw: &str) -> Result<String, ProtocolError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok("[]".to_string());
+    }
+    let list: Vec<AttachmentWire> = serde_json::from_str(raw)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid attachments_json: {e}")))?;
+    if list.len() > 20 {
+        return Err(ProtocolError::bad_request("too many attachments (max 20)"));
+    }
+    for entry in &list {
+        if !is_sha256_hex(&entry.sha256) {
+            return Err(ProtocolError::bad_request(
+                "attachment sha256 must be 64 lowercase hex characters",
+            ));
+        }
+    }
+    serde_json::to_string(&list)
+        .map_err(|e| ProtocolError::internal(format!("attachments serialize: {e}")))
+}
+
+/// Validates a links payload ('' = none): a JSON array of
+/// `{kind:'case'|'run'|'run_item'|'step', id, label}` objects.
+fn normalize_links(raw: &str) -> Result<String, ProtocolError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok("[]".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid links_json: {e}")))?;
+    let Some(entries) = value.as_array() else {
+        return Err(ProtocolError::bad_request("links_json must be an array"));
+    };
+    for entry in entries {
+        let kind = entry.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        if !matches!(kind, "case" | "run" | "run_item" | "step") {
+            return Err(ProtocolError::bad_request(format!(
+                "unknown link kind '{kind}'"
+            )));
+        }
+        if entry.get("id").and_then(|i| i.as_str()).unwrap_or("").is_empty() {
+            return Err(ProtocolError::bad_request("link entry requires 'id'"));
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn display_name(names: &HashMap<String, (String, String)>, user_id: &str) -> String {
+    if user_id.is_empty() {
+        return String::new();
+    }
+    names
+        .get(user_id)
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| user_id.to_string())
+}
+
+fn case_to_wire(item: CaseListItem, names: &HashMap<String, (String, String)>) -> TestCaseInfo {
+    let record = item.record;
+    TestCaseInfo {
+        created_by_name: display_name(names, &record.created_by),
+        attachment_count: attachments_from_json(&record.attachments_json).len() as u32,
+        linked_source_ids: serde_json::from_str(&record.linked_sources_json).unwrap_or_default(),
+        case_id: record.case_id,
+        kind: record.kind,
+        title: record.title,
+        priority: record.priority,
+        status: record.status,
+        status_reason: record.status_reason,
+        review_state: record.review_state,
+        origin: record.origin,
+        generation_run_id: record.generation_run_id,
+        language: record.language,
+        current_version: record.current_version,
+        tag_ids: item.tag_ids,
+        last_result: item.last_result,
+        created_by: record.created_by,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn run_to_wire(
+    record: RunRecord,
+    counts: RunCounts,
+    suite_name: String,
+    names: &HashMap<String, (String, String)>,
+) -> TestRunInfo {
+    TestRunInfo {
+        created_by_name: display_name(names, &record.created_by),
+        run_id: record.run_id,
+        run_no: record.run_no,
+        name: record.name,
+        suite_id: record.suite_id,
+        suite_name,
+        run_type: record.run_type,
+        environment_id: record.environment_id,
+        env_note: record.env_note,
+        assignment_mode: record.assignment_mode,
+        status: record.status,
+        total: counts.total,
+        passed: counts.passed,
+        failed: counts.failed,
+        blocked: counts.blocked,
+        skipped: counts.skipped,
+        pending: counts.pending,
+        in_progress: counts.in_progress,
+        created_by: record.created_by,
+        started_at: record.started_at,
+        finished_at: record.finished_at,
+    }
+}
+
+fn item_to_wire(record: RunItemRecord, names: &HashMap<String, (String, String)>) -> RunItemWire {
+    RunItemWire {
+        assigned_to_name: display_name(names, &record.assigned_to),
+        attachments: attachments_from_json(&record.attachments_json),
+        item_id: record.item_id,
+        run_id: record.run_id,
+        case_id: record.case_id,
+        case_title: record.case_title,
+        case_version: record.case_version,
+        position: record.position,
+        assigned_to: record.assigned_to,
+        status: record.status,
+        result_note: record.result_note,
+        tester_config: record.tester_config,
+        duration_secs: record.duration_secs,
+        steps_total: record.steps_total,
+        steps_done: record.steps_done,
+        claimed_at: record.claimed_at,
+        finished_at: record.finished_at,
+    }
+}
+
+fn step_to_wire(record: RunStepRecord) -> RunStepWire {
+    RunStepWire {
+        attachments: attachments_from_json(&record.attachments_json),
+        step_index: record.step_index,
+        action: record.action,
+        expected: record.expected,
+        status: record.status,
+        note: record.note,
+    }
+}
+
+fn task_to_wire(record: TaskRecord, names: &HashMap<String, (String, String)>) -> TaskInfo {
+    TaskInfo {
+        assigned_to_name: display_name(names, &record.assigned_to),
+        created_by_name: display_name(names, &record.created_by),
+        task_id: record.task_id,
+        task_no: record.task_no,
+        task_type: record.task_type,
+        title: record.title,
+        severity: record.severity,
+        priority: record.priority,
+        status: record.status,
+        assigned_to: record.assigned_to,
+        due_date: record.due_date,
+        links_json: record.links_json,
+        comment_count: record.comment_count,
+        created_by: record.created_by,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn comment_to_wire(
+    record: TaskCommentRecord,
+    names: &HashMap<String, (String, String)>,
+) -> TaskCommentWire {
+    TaskCommentWire {
+        author_name: display_name(names, &record.author_user_id),
+        comment_id: record.comment_id,
+        author_user_id: record.author_user_id,
+        body_md: record.body_md,
+        created_at: record.created_at,
+        edited_at: record.edited_at,
+    }
+}
+
+fn generation_to_wire(
+    record: GenerationRunRecord,
+    names: &HashMap<String, (String, String)>,
+) -> GenerationRunInfo {
+    let agent_name = repository::resolve_agent_label(&record.agent_id)
+        .map(|(name, _)| name)
+        .unwrap_or_default();
+    GenerationRunInfo {
+        started_by_name: display_name(names, &record.started_by),
+        agent_name,
+        source_ids: serde_json::from_str(&record.source_ids_json).unwrap_or_default(),
+        gen_id: record.gen_id,
+        kind: record.kind,
+        status: record.status,
+        agent_id: record.agent_id,
+        agent_run_id: record.agent_run_id,
+        instructions: record.instructions,
+        requested_count: record.requested_count,
+        max_cases: record.max_cases,
+        cases_generated: record.cases_generated,
+        cases_accepted: record.cases_accepted,
+        cases_rejected: record.cases_rejected,
+        error: if record.error.is_empty() {
+            None
+        } else {
+            Some(record.error)
+        },
+        started_by: record.started_by,
+        started_at: record.started_at,
+        finished_at: record.finished_at,
+    }
+}
+
+fn cases_to_wire(items: Vec<CaseListItem>) -> Vec<TestCaseInfo> {
+    let ids: Vec<String> = items
+        .iter()
+        .map(|i| i.record.created_by.clone())
+        .collect();
+    let names = repository::resolve_user_refs(&ids);
+    items
+        .into_iter()
+        .map(|item| case_to_wire(item, &names))
+        .collect()
+}
+
+// =============================================================================
+// F2: manual test cases (T01, T02)
+// =============================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn cases_list_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    kind: &str,
+    status: &str,
+    priority: &str,
+    tag_id: &str,
+    origin: &str,
+    search: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let limit = limit.clamp(1, 200);
+    let filters = ps_tests::CaseFilters {
+        kind,
+        status,
+        priority,
+        tag_id,
+        origin,
+        search,
+    };
+    let (items, total) = ps_tests::list_cases(&pool, &filters, offset, limit)
+        .map_err(|e| db_error("cases_list", e))?;
+    Ok(ps(ProjectStudioPayload::CasesListResponse {
+        cases: cases_to_wire(items),
+        total,
+    }))
+}
+
+fn case_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_id: &str,
+    include_versions: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let item = ps_tests::get_case(&pool, case_id)
+        .map_err(|e| db_error("case_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("case not found"))?;
+    let content_json = item.record.content_json.clone();
+    let attachments = attachments_from_json(&item.record.attachments_json);
+    let versions = if include_versions {
+        ps_tests::list_versions(&pool, case_id).map_err(|e| db_error("case_versions", e))?
+    } else {
+        Vec::new()
+    };
+    let mut ids: Vec<String> = versions.iter().map(|v| v.created_by.clone()).collect();
+    ids.push(item.record.created_by.clone());
+    let names = repository::resolve_user_refs(&ids);
+    let versions = versions
+        .into_iter()
+        .map(|v| CaseVersionInfo {
+            created_by_name: display_name(&names, &v.created_by),
+            version: v.version,
+            change_note: v.change_note,
+            created_by: v.created_by,
+            created_at: v.created_at,
+        })
+        .collect();
+    Ok(ps(ProjectStudioPayload::CaseGetResponse {
+        detail: TestCaseDetail {
+            info: case_to_wire(item, &names),
+            content_json,
+            attachments,
+            versions,
+        },
+    }))
+}
+
+/// Shared field validation of a case save (create + edit).
+fn validate_case_fields(
+    kind: &str,
+    title: &str,
+    priority: &str,
+    content_json: &str,
+) -> Result<(), ProtocolError> {
+    if kind != "manual" {
+        return Err(ProtocolError::bad_request(
+            "only kind 'manual' is available in this phase",
+        ));
+    }
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 200 {
+        return Err(ProtocolError::bad_request("title must be 1..200 characters"));
+    }
+    if !ps_tests::CASE_PRIORITIES.contains(&priority) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown priority '{priority}'"
+        )));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(content_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid content_json: {e}")))?;
+    if !parsed.is_object() {
+        return Err(ProtocolError::bad_request("content_json must be an object"));
+    }
+    if content_json.len() > 256 * 1024 {
+        return Err(ProtocolError::bad_request("content_json exceeds 256 KiB"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn case_save_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_id: Option<&str>,
+    kind: &str,
+    title: &str,
+    priority: &str,
+    content_json: &str,
+    tag_ids: &[String],
+    linked_source_ids: &[String],
+    attachments_json: &str,
+    expected_version: Option<u32>,
+    change_note: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    validate_case_fields(kind, title, priority, content_json)?;
+    let attachments_json = normalize_attachments(attachments_json)?;
+    let pool = open_project_pool(project_id)?;
+    let input = ps_tests::CaseContentInput {
+        kind,
+        title: title.trim(),
+        priority,
+        content_json,
+        tag_ids,
+        linked_source_ids,
+        attachments_json: &attachments_json,
+    };
+    match case_id {
+        None => {
+            let case_id = ps_tests::create_case(&pool, &input, None, change_note, &org.user_id)
+                .map_err(|e| db_error("case_create", e))?;
+            activity::record(
+                &pool,
+                &org.user_id,
+                "user",
+                "case.created",
+                "case",
+                &case_id,
+                &serde_json::json!({ "title": title.trim() }).to_string(),
+            );
+            Ok(ps(ProjectStudioPayload::CaseSaveResponse {
+                case_id,
+                version: 1,
+            }))
+        }
+        Some(case_id) => {
+            let expected = expected_version.ok_or_else(|| {
+                ProtocolError::bad_request("expected_version is required when editing")
+            })?;
+            match ps_tests::update_case(&pool, case_id, expected, &input, change_note, &org.user_id)
+                .map_err(|e| db_error("case_update", e))?
+            {
+                ps_tests::CaseUpdateOutcome::Saved(version) => {
+                    activity::record(
+                        &pool,
+                        &org.user_id,
+                        "user",
+                        "case.updated",
+                        "case",
+                        case_id,
+                        &serde_json::json!({ "version": version }).to_string(),
+                    );
+                    Ok(ps(ProjectStudioPayload::CaseSaveResponse {
+                        case_id: case_id.to_string(),
+                        version,
+                    }))
+                }
+                ps_tests::CaseUpdateOutcome::Conflict => Err(conflict()),
+                ps_tests::CaseUpdateOutcome::NotFound => {
+                    Err(ProtocolError::not_found("case not found"))
+                }
+                ps_tests::CaseUpdateOutcome::NotEditable => Err(ProtocolError::bad_request(
+                    "only draft/review cases are editable",
+                )),
+            }
+        }
+    }
+}
+
+/// Applies one status transition with the section-C role matrix. Shared by
+/// the single and bulk handlers; returns Ok(false) when the transition is
+/// disallowed for this case/caller (bulk skips, single errors).
+fn apply_status_transition(
+    pool: &crate::db::DbPool,
+    role: ProjectRole,
+    case_id: &str,
+    target: &str,
+    reason: &str,
+) -> Result<Result<bool, &'static str>, ProtocolError> {
+    let Some(item) = ps_tests::get_case(pool, case_id).map_err(|e| db_error("case_get", e))? else {
+        return Ok(Err("case not found"));
+    };
+    let from = item.record.status.as_str();
+    let Some((min_role, needs_reason)) = ps_tests::transition_requirement(from, target) else {
+        return Ok(Err("transition not allowed"));
+    };
+    if role < min_role {
+        return Ok(Err("requires a higher project role"));
+    }
+    if needs_reason && reason.trim().is_empty() {
+        return Ok(Err("a reason is required for this downgrade"));
+    }
+    let ok = ps_tests::set_case_status(pool, case_id, from, target, reason.trim())
+        .map_err(|e| db_error("case_status", e))?;
+    Ok(Ok(ok))
+}
+
+fn case_status_set_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_id: &str,
+    status: &str,
+    reason: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let role = role.expect("editor gate never yields admin override");
+    if !ps_tests::CASE_STATUSES.contains(&status) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown status '{status}'"
+        )));
+    }
+    let pool = open_project_pool(project_id)?;
+    let ok = match apply_status_transition(&pool, role, case_id, status, reason)? {
+        Ok(ok) => ok,
+        Err("case not found") => return Err(ProtocolError::not_found("case not found")),
+        Err("requires a higher project role") => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "this transition requires a higher project role",
+            ))
+        }
+        Err(message) => return Err(ProtocolError::bad_request(message)),
+    };
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "case.status_changed",
+            "case",
+            case_id,
+            &serde_json::json!({ "status": status, "reason": reason.trim() }).to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::CaseStatusSetResult { ok }))
+}
+
+fn cases_bulk_status_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_ids: &[String],
+    status: &str,
+    reason: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let role = role.expect("editor gate never yields admin override");
+    if !ps_tests::CASE_STATUSES.contains(&status) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown status '{status}'"
+        )));
+    }
+    if case_ids.is_empty() || case_ids.len() > 200 {
+        return Err(ProtocolError::bad_request("case_ids must contain 1..200 ids"));
+    }
+    let pool = open_project_pool(project_id)?;
+    let mut updated = 0u32;
+    for case_id in case_ids {
+        // Bulk semantics: cases the caller may not (or must not) transition
+        // are skipped, the rest proceed — `updated` reports the real count.
+        if let Ok(true) = apply_status_transition(&pool, role, case_id, status, reason)? {
+            updated += 1;
+        }
+    }
+    if updated > 0 {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "case.status_changed",
+            "case",
+            "",
+            &serde_json::json!({ "status": status, "count": updated }).to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::CasesBulkStatusResponse { updated }))
+}
+
+fn case_duplicate_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let new_id = ps_tests::duplicate_case(&pool, case_id, &org.user_id)
+        .map_err(|e| db_error("case_duplicate", e))?
+        .ok_or_else(|| ProtocolError::not_found("case not found"))?;
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "case.duplicated",
+        "case",
+        &new_id,
+        &serde_json::json!({ "source_case_id": case_id }).to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::CaseDuplicateResponse {
+        case_id: new_id,
+    }))
+}
+
+fn case_delete_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let role = role.expect("editor gate never yields admin override");
+    let pool = open_project_pool(project_id)?;
+    let item = ps_tests::get_case(&pool, case_id)
+        .map_err(|e| db_error("case_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("case not found"))?;
+    // Approved cases and cases referenced by run snapshots are never deleted —
+    // deprecate instead (running executions must keep resolving their pins).
+    if item.record.status == "approved" {
+        return Err(ProtocolError::bad_request(
+            "approved cases cannot be deleted — deprecate instead",
+        ));
+    }
+    let refs = ps_tests::case_run_item_refs(&pool, case_id)
+        .map_err(|e| db_error("case_refs", e))?;
+    if refs > 0 {
+        return Err(ProtocolError::bad_request(
+            "case is referenced by test runs — deprecate instead",
+        ));
+    }
+    // Editor: own drafts only. Manager+: draft + review.
+    let allowed = if role >= ProjectRole::Manager {
+        matches!(item.record.status.as_str(), "draft" | "review")
+    } else {
+        item.record.status == "draft" && item.record.created_by == org.user_id
+    };
+    if !allowed {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "editors may delete only their own drafts",
+        ));
+    }
+    let ok = ps_tests::delete_case(&pool, case_id).map_err(|e| db_error("case_delete", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "case.deleted",
+            "case",
+            case_id,
+            &serde_json::json!({ "title": item.record.title }).to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::CaseDeleteResult { ok }))
+}
+
+fn case_version_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_id: &str,
+    version: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    // Visibility gate first: versions of a pending case are as hidden as the
+    // case itself.
+    ps_tests::get_case(&pool, case_id)
+        .map_err(|e| db_error("case_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("case not found"))?;
+    let v = ps_tests::get_version(&pool, case_id, version)
+        .map_err(|e| db_error("case_version", e))?
+        .ok_or_else(|| ProtocolError::not_found("version not found"))?;
+    let names = repository::resolve_user_refs(std::slice::from_ref(&v.created_by));
+    Ok(ps(ProjectStudioPayload::CaseVersionGetResponse {
+        content_json: v.content_json,
+        change_note: v.change_note,
+        created_by_name: display_name(&names, &v.created_by),
+        created_at: v.created_at,
+    }))
+}
+
+fn case_restore_version_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    case_id: &str,
+    version: u32,
+    expected_version: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    match ps_tests::restore_version(&pool, case_id, version, expected_version, &org.user_id)
+        .map_err(|e| db_error("case_restore", e))?
+    {
+        ps_tests::CaseUpdateOutcome::Saved(new_version) => {
+            activity::record(
+                &pool,
+                &org.user_id,
+                "user",
+                "case.restored",
+                "case",
+                case_id,
+                &serde_json::json!({ "from_version": version, "version": new_version })
+                    .to_string(),
+            );
+            Ok(ps(ProjectStudioPayload::CaseRestoreVersionResponse {
+                case_id: case_id.to_string(),
+                version: new_version,
+            }))
+        }
+        ps_tests::CaseUpdateOutcome::Conflict => Err(conflict()),
+        ps_tests::CaseUpdateOutcome::NotFound => Err(ProtocolError::not_found(
+            "case or version not found",
+        )),
+        ps_tests::CaseUpdateOutcome::NotEditable => Err(ProtocolError::bad_request(
+            "only draft/review cases are editable",
+        )),
+    }
+}
+
+fn cases_import_csv_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    csv_text: &str,
+    dry_run: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    if csv_text.len() > ps_tests::CSV_MAX_BYTES {
+        return Err(ProtocolError::bad_request("CSV exceeds the 2 MiB limit"));
+    }
+    let (rows, errors) = ps_tests::parse_csv(csv_text);
+    let errors: Vec<CsvImportError> = errors
+        .into_iter()
+        .map(|(line, message)| CsvImportError { line, message })
+        .collect();
+    // All-or-nothing: any invalid row (or a dry run) writes nothing.
+    if dry_run || !errors.is_empty() {
+        return Ok(ps(ProjectStudioPayload::CasesImportCsvResponse {
+            created: if errors.is_empty() { rows.len() as u32 } else { 0 },
+            errors,
+        }));
+    }
+    let pool = open_project_pool(project_id)?;
+    let created =
+        ps_tests::import_cases(&pool, &rows, &org.user_id).map_err(|e| db_error("csv_import", e))?;
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "cases.imported",
+        "case",
+        "",
+        &serde_json::json!({ "created": created }).to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::CasesImportCsvResponse {
+        created,
+        errors,
+    }))
+}
+
+const ATTACHMENT_MAX_BYTES: u32 = 8 * 1024 * 1024;
+
+fn attachment_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    sha256: &str,
+    max_bytes: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    if !is_sha256_hex(sha256) {
+        return Err(ProtocolError::bad_request(
+            "sha256 must be 64 lowercase hex characters",
+        ));
+    }
+    let cap = max_bytes.clamp(1, ATTACHMENT_MAX_BYTES) as usize;
+    let blob = std::path::Path::new(&record.dir_path)
+        .join("files")
+        .join(sha256);
+    let bytes = std::fs::read(&blob)
+        .map_err(|_| ProtocolError::not_found("attachment not found"))?;
+    let truncated = bytes.len() > cap;
+    let mut bytes = bytes;
+    bytes.truncate(cap);
+    let pool = open_project_pool(project_id)?;
+    let mime = repository::attachment_mime(&pool, sha256)
+        .map_err(|e| db_error("attachment_mime", e))?
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(ps(ProjectStudioPayload::AttachmentGetResponse {
+        bytes,
+        mime,
+        truncated,
+    }))
+}
+
+// =============================================================================
+// F2: test suites (T04)
+// =============================================================================
+
+fn suite_item_to_wire(
+    item: crate::project_studio::tests::SuiteListItem,
+) -> Result<SuiteInfo, ProtocolError> {
+    let last_run = match item.last_run {
+        Some((record, counts)) => {
+            let suite_name = item.record.name.clone();
+            let names =
+                repository::resolve_user_refs(std::slice::from_ref(&record.created_by));
+            Some(run_to_wire(record, counts, suite_name, &names))
+        }
+        None => None,
+    };
+    Ok(SuiteInfo {
+        suite_id: item.record.suite_id,
+        name: item.record.name,
+        description: item.record.description,
+        case_count: item.case_count,
+        has_deprecated: item.has_deprecated,
+        last_run,
+        created_at: item.record.created_at,
+        updated_at: item.record.updated_at,
+    })
+}
+
+fn suites_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let items = ps_tests::list_suites(&pool).map_err(|e| db_error("suites_list", e))?;
+    let _ = &pool;
+    let mut suites = Vec::with_capacity(items.len());
+    for item in items {
+        suites.push(suite_item_to_wire(item)?);
+    }
+    Ok(ps(ProjectStudioPayload::SuitesListResponse { suites }))
+}
+
+fn suite_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    suite_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let item = ps_tests::get_suite(&pool, suite_id)
+        .map_err(|e| db_error("suite_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("suite not found"))?;
+    let cases = ps_tests::suite_case_rows(&pool, suite_id)
+        .map_err(|e| db_error("suite_cases", e))?
+        .into_iter()
+        .map(|c| SuiteCaseRef {
+            case_id: c.case_id,
+            position: c.position,
+            title: c.title,
+            kind: c.kind,
+            status: c.status,
+            priority: c.priority,
+        })
+        .collect();
+    Ok(ps(ProjectStudioPayload::SuiteGetResponse {
+        suite: suite_item_to_wire(item)?,
+        cases,
+    }))
+}
+
+fn suite_save_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    suite_id: Option<&str>,
+    name: &str,
+    description: &str,
+    case_ids: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 200 {
+        return Err(ProtocolError::bad_request("suite name is required"));
+    }
+    if case_ids.len() > 500 {
+        return Err(ProtocolError::bad_request("a suite holds at most 500 cases"));
+    }
+    let pool = open_project_pool(project_id)?;
+    let suite_id = ps_tests::save_suite(
+        &pool,
+        suite_id,
+        name,
+        description.trim(),
+        case_ids,
+        &org.user_id,
+    )
+    .map_err(|e| {
+        if e.to_string().contains("unknown case") || e.to_string().contains("suite not found") {
+            ProtocolError::bad_request(e.to_string())
+        } else {
+            map_unique("suite_save", "a suite with this name already exists", e)
+        }
+    })?;
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "suite.saved",
+        "suite",
+        &suite_id,
+        &serde_json::json!({ "name": name, "cases": case_ids.len() }).to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::SuiteSaveResponse { suite_id }))
+}
+
+fn suite_delete_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    suite_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let ok = ps_tests::delete_suite(&pool, suite_id).map_err(|e| db_error("suite_delete", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "suite.deleted",
+            "suite",
+            suite_id,
+            "{}",
+        );
+    }
+    Ok(ps(ProjectStudioPayload::SuiteDeleteResult { ok }))
+}
+
+// =============================================================================
+// F2: test runs + execution (T06-T09)
+// =============================================================================
+
+fn runs_list_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    status: &str,
+    run_type: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let limit = limit.clamp(1, 200);
+    let (rows, total) = runs::list_runs(&pool, status, run_type, offset, limit)
+        .map_err(|e| db_error("runs_list", e))?;
+    let suite_ids: Vec<String> = rows.iter().map(|(r, _)| r.suite_id.clone()).collect();
+    let suite_names =
+        ps_tests::suite_names(&pool, &suite_ids).map_err(|e| db_error("suite_names", e))?;
+    let ids: Vec<String> = rows.iter().map(|(r, _)| r.created_by.clone()).collect();
+    let names = repository::resolve_user_refs(&ids);
+    let runs_wire = rows
+        .into_iter()
+        .map(|(record, counts)| {
+            let suite_name = suite_names.get(&record.suite_id).cloned().unwrap_or_default();
+            run_to_wire(record, counts, suite_name, &names)
+        })
+        .collect();
+    Ok(ps(ProjectStudioPayload::RunsListResponse {
+        runs: runs_wire,
+        total,
+    }))
+}
+
+/// Fans one bulk `run_item_assigned` notification per assignee (skip self —
+/// risk F.7).
+fn notify_run_assignees(
+    org_id: &str,
+    actor: &str,
+    project_id: &str,
+    run_id: &str,
+    run_no: u32,
+    run_name: &str,
+    per_user: &HashMap<String, u32>,
+) {
+    for (user_id, count) in per_user {
+        if user_id.is_empty() || user_id == actor {
+            continue;
+        }
+        notifications::notify(
+            org_id,
+            user_id,
+            project_id,
+            "run_item_assigned",
+            "Przydzielono Ci testy",
+            &format!("{count} przypadków w przebiegu #{run_no} „{run_name}”"),
+            &serde_json::json!({ "project_id": project_id, "run_id": run_id }).to_string(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_create_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    name: &str,
+    suite_id: &str,
+    case_ids: &[String],
+    from_failed_run_id: &str,
+    env_note: &str,
+    assignment_mode: &str,
+    single_assignee: &str,
+    assignments: &[RunAssignmentWire],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 200 {
+        return Err(ProtocolError::bad_request("run name is required"));
+    }
+    if !matches!(assignment_mode, "single" | "per_case" | "pool") {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown assignment_mode '{assignment_mode}'"
+        )));
+    }
+    // Exactly ONE case source (XOR).
+    let sources = [
+        !suite_id.is_empty(),
+        !case_ids.is_empty(),
+        !from_failed_run_id.is_empty(),
+    ]
+    .iter()
+    .filter(|s| **s)
+    .count();
+    if sources != 1 {
+        return Err(ProtocolError::bad_request(
+            "provide exactly one of suite_id, case_ids or from_failed_run_id",
+        ));
+    }
+    let pool = open_project_pool(project_id)?;
+    let selected_case_ids: Vec<String> = if !suite_id.is_empty() {
+        ps_tests::get_suite(&pool, suite_id)
+            .map_err(|e| db_error("suite_get", e))?
+            .ok_or_else(|| ProtocolError::not_found("suite not found"))?;
+        ps_tests::suite_case_rows(&pool, suite_id)
+            .map_err(|e| db_error("suite_cases", e))?
+            .into_iter()
+            .filter(|c| c.status == "approved")
+            .map(|c| c.case_id)
+            .collect()
+    } else if !case_ids.is_empty() {
+        // Clients may repeat an id; a duplicate would trip the UNIQUE run-item
+        // constraint, so keep the first occurrence only (order preserved).
+        let mut seen = HashSet::new();
+        case_ids
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        runs::get_run(&pool, from_failed_run_id)
+            .map_err(|e| db_error("run_get", e))?
+            .ok_or_else(|| ProtocolError::not_found("source run not found"))?;
+        runs::failed_case_ids(&pool, from_failed_run_id)
+            .map_err(|e| db_error("failed_cases", e))?
+            .into_iter()
+            .filter(|case_id| {
+                // Fresh versions only for cases that are STILL approved.
+                matches!(
+                    ps_tests::get_case(&pool, case_id),
+                    Ok(Some(item)) if item.record.status == "approved"
+                )
+            })
+            .collect()
+    };
+    if selected_case_ids.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "no approved cases matched the selection",
+        ));
+    }
+    if selected_case_ids.len() > 500 {
+        return Err(ProtocolError::bad_request("a run holds at most 500 cases"));
+    }
+    let snapshots = runs::approved_case_snapshots(&pool, &selected_case_ids)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    // Assignment resolution + tester-membership validation.
+    let require_tester_member = |user_id: &str| -> Result<(), ProtocolError> {
+        let target = repository::effective_role(project_id, user_id)
+            .map_err(|e| db_error("member_role", e))?;
+        if !matches!(target, Some(r) if r >= ProjectRole::Tester) {
+            return Err(ProtocolError::bad_request(format!(
+                "user '{user_id}' is not a tester (or higher) of this project"
+            )));
+        }
+        Ok(())
+    };
+    let assignees: Vec<String> = match assignment_mode {
+        "single" => {
+            if single_assignee.is_empty() {
+                return Err(ProtocolError::bad_request(
+                    "single mode requires single_assignee",
+                ));
+            }
+            require_tester_member(single_assignee)?;
+            vec![single_assignee.to_string(); snapshots.len()]
+        }
+        "per_case" => {
+            let map: HashMap<&str, &str> = assignments
+                .iter()
+                .map(|a| (a.case_id.as_str(), a.user_id.as_str()))
+                .collect();
+            let mut out = Vec::with_capacity(snapshots.len());
+            for snapshot in &snapshots {
+                let Some(user_id) = map.get(snapshot.case_id.as_str()).filter(|u| !u.is_empty())
+                else {
+                    return Err(ProtocolError::bad_request(format!(
+                        "per_case mode requires an assignment for case '{}'",
+                        snapshot.case_id
+                    )));
+                };
+                out.push(user_id.to_string());
+            }
+            for user_id in out.iter().collect::<std::collections::HashSet<_>>() {
+                require_tester_member(user_id)?;
+            }
+            out
+        }
+        _ => vec![String::new(); snapshots.len()],
+    };
+
+    let (run_id, run_no) = runs::create_run(
+        &pool,
+        name,
+        suite_id,
+        env_note.trim(),
+        assignment_mode,
+        &snapshots,
+        &assignees,
+        &org.user_id,
+    )
+    .map_err(|e| db_error("run_create", e))?;
+
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "run.created",
+        "run",
+        &run_id,
+        &serde_json::json!({ "name": name, "run_no": run_no, "cases": snapshots.len() })
+            .to_string(),
+    );
+    let mut per_user: HashMap<String, u32> = HashMap::new();
+    for assignee in &assignees {
+        if !assignee.is_empty() {
+            *per_user.entry(assignee.clone()).or_default() += 1;
+        }
+    }
+    notify_run_assignees(
+        &org.org_id,
+        &org.user_id,
+        project_id,
+        &run_id,
+        run_no,
+        name,
+        &per_user,
+    );
+    let _ = repository::touch_project(project_id);
+    Ok(ps(ProjectStudioPayload::RunCreateResponse { run_id, run_no }))
+}
+
+fn load_run_wire(
+    pool: &crate::db::DbPool,
+    record: RunRecord,
+    counts: RunCounts,
+) -> Result<TestRunInfo, ProtocolError> {
+    let suite_names = ps_tests::suite_names(pool, std::slice::from_ref(&record.suite_id))
+        .map_err(|e| db_error("suite_names", e))?;
+    let suite_name = suite_names.get(&record.suite_id).cloned().unwrap_or_default();
+    let names = repository::resolve_user_refs(std::slice::from_ref(&record.created_by));
+    Ok(run_to_wire(record, counts, suite_name, &names))
+}
+
+fn run_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    run_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let (record, counts) = runs::get_run(&pool, run_id)
+        .map_err(|e| db_error("run_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run not found"))?;
+    let items = runs::list_run_items(&pool, run_id).map_err(|e| db_error("run_items", e))?;
+    let ids: Vec<String> = items.iter().map(|i| i.assigned_to.clone()).collect();
+    let names = repository::resolve_user_refs(&ids);
+    let items = items
+        .into_iter()
+        .map(|item| item_to_wire(item, &names))
+        .collect();
+    Ok(ps(ProjectStudioPayload::RunGetResponse {
+        run: load_run_wire(&pool, record, counts)?,
+        items,
+    }))
+}
+
+fn run_close_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    run_id: &str,
+    cancelled: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let (run, _counts) = runs::get_run(&pool, run_id)
+        .map_err(|e| db_error("run_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run not found"))?;
+    // Manager+ OR the run's creator (section C).
+    let is_manager = matches!(role, Some(r) if r >= ProjectRole::Manager);
+    if !is_manager && run.created_by != org.user_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "closing a run requires the manager role or run ownership",
+        ));
+    }
+    let ok = runs::close_run(&pool, run_id, cancelled, &org.user_id)
+        .map_err(|e| db_error("run_close", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "run.closed",
+            "run",
+            run_id,
+            &serde_json::json!({ "cancelled": cancelled }).to_string(),
+        );
+        // One bulk run_closed notification per participating tester.
+        if let Ok(assignees) = runs::run_assignees(&pool, run_id) {
+            for user_id in assignees {
+                if user_id == org.user_id {
+                    continue;
+                }
+                notifications::notify(
+                    &org.org_id,
+                    &user_id,
+                    project_id,
+                    "run_closed",
+                    if cancelled {
+                        "Przebieg testów anulowany"
+                    } else {
+                        "Przebieg testów zamknięty"
+                    },
+                    &format!("#{} „{}”", run.run_no, run.name),
+                    &serde_json::json!({ "project_id": project_id, "run_id": run_id })
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(ps(ProjectStudioPayload::RunCloseResult { ok }))
+}
+
+fn run_delete_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    run_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let (run, _counts) = runs::get_run(&pool, run_id)
+        .map_err(|e| db_error("run_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run not found"))?;
+    if run.status == "running" {
+        return Err(ProtocolError::bad_request(
+            "close or cancel the run before deleting it",
+        ));
+    }
+    let ok = runs::delete_run(&pool, run_id).map_err(|e| db_error("run_delete", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "run.deleted",
+            "run",
+            run_id,
+            "{}",
+        );
+    }
+    Ok(ps(ProjectStudioPayload::RunDeleteResult { ok }))
+}
+
+fn run_item_claim_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    run_id: &str,
+    item_id: Option<&str>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let (run, _counts) = runs::get_run(&pool, run_id)
+        .map_err(|e| db_error("run_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run not found"))?;
+    if run.status != "running" {
+        return Err(ProtocolError::bad_request("run is not running"));
+    }
+    let claimed = runs::claim_item(&pool, run_id, &org.user_id, item_id)
+        .map_err(|e| db_error("item_claim", e))?;
+    let item = match claimed {
+        Some(item) => {
+            activity::record(
+                &pool,
+                &org.user_id,
+                "user",
+                "run_item.claimed",
+                "run_item",
+                &item.item_id,
+                &serde_json::json!({ "case_id": item.case_id }).to_string(),
+            );
+            let names = repository::resolve_user_refs(std::slice::from_ref(&item.assigned_to));
+            Some(item_to_wire(item, &names))
+        }
+        None => None,
+    };
+    Ok(ps(ProjectStudioPayload::RunItemClaimResponse { item }))
+}
+
+/// Loads an item + its run and enforces "own item (tester) or manager".
+fn load_owned_item(
+    org: &OrgContext,
+    role: Option<ProjectRole>,
+    pool: &crate::db::DbPool,
+    item_id: &str,
+) -> Result<(RunItemRecord, RunRecord), ProtocolError> {
+    let item = runs::get_run_item(pool, item_id)
+        .map_err(|e| db_error("item_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run item not found"))?;
+    let (run, _counts) = runs::get_run(pool, &item.run_id)
+        .map_err(|e| db_error("run_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run not found"))?;
+    let is_manager = matches!(role, Some(r) if r >= ProjectRole::Manager);
+    if !is_manager && item.assigned_to != org.user_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "this run item belongs to another tester",
+        ));
+    }
+    Ok((item, run))
+}
+
+fn run_item_release_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    item_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let (item, run) = load_owned_item(org, role, &pool, item_id)?;
+    if item.status != "in_progress" {
+        return Err(ProtocolError::bad_request("item is not in progress"));
+    }
+    let ok = runs::release_item(&pool, item_id, run.assignment_mode == "pool")
+        .map_err(|e| db_error("item_release", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "run_item.released",
+            "run_item",
+            item_id,
+            "{}",
+        );
+    }
+    Ok(ps(ProjectStudioPayload::RunItemReleaseResult { ok }))
+}
+
+fn run_item_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    item_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    // Read view: any member may inspect (viewer read-only, section C).
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let item = runs::get_run_item(&pool, item_id)
+        .map_err(|e| db_error("item_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run item not found"))?;
+    let steps = runs::list_item_steps(&pool, item_id)
+        .map_err(|e| db_error("item_steps", e))?
+        .into_iter()
+        .map(step_to_wire)
+        .collect();
+    let (preconditions, test_data) =
+        runs::item_pinned_content(&pool, &item.case_id, item.case_version)
+            .map_err(|e| db_error("item_content", e))?;
+    let names = repository::resolve_user_refs(std::slice::from_ref(&item.assigned_to));
+    Ok(ps(ProjectStudioPayload::RunItemGetResponse {
+        item: item_to_wire(item, &names),
+        steps,
+        preconditions,
+        test_data,
+    }))
+}
+
+fn run_step_set_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    item_id: &str,
+    step_index: u32,
+    status: &str,
+    note: &str,
+    attachments_json: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    if !matches!(status, "" | "passed" | "failed" | "blocked" | "skipped") {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown step status '{status}'"
+        )));
+    }
+    if matches!(status, "failed" | "blocked") && note.trim().is_empty() {
+        return Err(ProtocolError::bad_request(
+            "failed/blocked steps require a note",
+        ));
+    }
+    let attachments_json = normalize_attachments(attachments_json)?;
+    let pool = open_project_pool(project_id)?;
+    // Step verdicts are strictly the executing tester's (no manager override —
+    // a manager reassigns instead of forging results).
+    let item = runs::get_run_item(&pool, item_id)
+        .map_err(|e| db_error("item_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run item not found"))?;
+    if item.assigned_to != org.user_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "this run item belongs to another tester",
+        ));
+    }
+    if item.status != "in_progress" {
+        return Err(ProtocolError::bad_request("item is not in progress"));
+    }
+    let ok = runs::set_step(&pool, item_id, step_index, status, note.trim(), &attachments_json)
+        .map_err(|e| db_error("step_set", e))?;
+    if !ok {
+        return Err(ProtocolError::not_found("step not found"));
+    }
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "run_step.set",
+        "run_item",
+        item_id,
+        &serde_json::json!({ "step_index": step_index, "status": status }).to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::RunStepSetResult { ok }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_item_finish_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    item_id: &str,
+    status: &str,
+    result_note: &str,
+    tester_config: &str,
+    duration_secs: u32,
+    attachments_json: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let attachments_json = normalize_attachments(attachments_json)?;
+    let pool = open_project_pool(project_id)?;
+    let item = runs::get_run_item(&pool, item_id)
+        .map_err(|e| db_error("item_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("run item not found"))?;
+    if item.assigned_to != org.user_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "this run item belongs to another tester",
+        ));
+    }
+    if item.status != "in_progress" {
+        return Err(ProtocolError::bad_request("item is not in progress"));
+    }
+    let final_status = if status.is_empty() {
+        runs::derive_item_status(&pool, item_id).map_err(|e| db_error("derive_status", e))?
+    } else {
+        if !matches!(status, "passed" | "failed" | "blocked" | "skipped") {
+            return Err(ProtocolError::bad_request(format!(
+                "unknown item status '{status}'"
+            )));
+        }
+        // An explicit override of the derived verdict must be justified.
+        if result_note.trim().is_empty() {
+            return Err(ProtocolError::bad_request(
+                "an explicit status override requires result_note",
+            ));
+        }
+        status.to_string()
+    };
+    let ok = runs::finish_item(
+        &pool,
+        item_id,
+        &final_status,
+        result_note.trim(),
+        tester_config.trim(),
+        duration_secs,
+        &attachments_json,
+    )
+    .map_err(|e| db_error("item_finish", e))?;
+    if !ok {
+        return Err(ProtocolError::bad_request("item is not in progress"));
+    }
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "run_item.finished",
+        "run_item",
+        item_id,
+        &serde_json::json!({ "status": final_status, "duration_secs": duration_secs })
+            .to_string(),
+    );
+    let next_item = runs::next_claimable(&pool, &item.run_id, &org.user_id)
+        .map_err(|e| db_error("next_claimable", e))?
+        .map(|next| {
+            let names = repository::resolve_user_refs(std::slice::from_ref(&next.assigned_to));
+            item_to_wire(next, &names)
+        });
+    Ok(ps(ProjectStudioPayload::RunItemFinishResponse {
+        ok,
+        next_item,
+    }))
+}
+
+fn my_test_work_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let my_roles =
+        repository::member_roles_for_user(&org.user_id).map_err(|e| db_error("member_roles", e))?;
+    let mut entries: Vec<MyWorkEntry> = Vec::new();
+    for (project_id, role) in my_roles {
+        // Claiming needs tester+; viewers have no work queue.
+        if !matches!(ProjectRole::from_slug(&role), Some(r) if r >= ProjectRole::Tester) {
+            continue;
+        }
+        let Some(record) = repository::get_project(&org.org_id, &project_id)
+            .map_err(|e| db_error("get_project", e))?
+        else {
+            continue;
+        };
+        if record.status != "active"
+            || !parse_modules_json(&record.modules_json)
+                .iter()
+                .any(|m| m == "tests")
+        {
+            continue;
+        }
+        let Ok(pool) = project_db::open(&project_id) else {
+            continue;
+        };
+        // One broken project database must not blank the whole cross-project list.
+        let rows = match runs::my_work_rows(&pool, &org.user_id) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "my_test_work: skipping project");
+                continue;
+            }
+        };
+        for (run, items_pending, items_in_progress) in rows {
+            entries.push(MyWorkEntry {
+                project_id: project_id.clone(),
+                project_name: record.name.clone(),
+                run_id: run.run_id,
+                run_no: run.run_no,
+                run_name: run.name,
+                items_pending,
+                items_in_progress,
+            });
+        }
+    }
+    Ok(ps(ProjectStudioPayload::MyTestWorkResponse { entries }))
+}
+
+// =============================================================================
+// F2: tasks + defects (Z01, Z02)
+// =============================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn tasks_list_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_type: &str,
+    status: &str,
+    assigned_to: &str,
+    search: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let limit = limit.clamp(1, 200);
+    // "me" is a UI-level alias, not a stored user id — resolve it to the caller.
+    let assigned_to = if assigned_to == "me" {
+        org.user_id.as_str()
+    } else {
+        assigned_to
+    };
+    let filters = tasks::TaskFilters {
+        task_type,
+        status,
+        assigned_to,
+        search,
+    };
+    let (rows, total) =
+        tasks::list_tasks(&pool, &filters, offset, limit).map_err(|e| db_error("tasks_list", e))?;
+    let mut ids: Vec<String> = rows.iter().map(|t| t.created_by.clone()).collect();
+    ids.extend(rows.iter().map(|t| t.assigned_to.clone()));
+    let names = repository::resolve_user_refs(&ids);
+    let tasks_wire = rows
+        .into_iter()
+        .map(|record| task_to_wire(record, &names))
+        .collect();
+    Ok(ps(ProjectStudioPayload::TasksListResponse {
+        tasks: tasks_wire,
+        total,
+    }))
+}
+
+fn task_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let record = tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    let comments = tasks::list_comments(&pool, task_id).map_err(|e| db_error("comments", e))?;
+    let mut ids: Vec<String> = comments.iter().map(|c| c.author_user_id.clone()).collect();
+    ids.push(record.created_by.clone());
+    ids.push(record.assigned_to.clone());
+    let names = repository::resolve_user_refs(&ids);
+    let description_md = record.description_md.clone();
+    let attachments = attachments_from_json(&record.attachments_json);
+    Ok(ps(ProjectStudioPayload::TaskGetResponse {
+        detail: TaskDetail {
+            info: task_to_wire(record, &names),
+            description_md,
+            attachments,
+            comments: comments
+                .into_iter()
+                .map(|c| comment_to_wire(c, &names))
+                .collect(),
+        },
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn task_save_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: Option<&str>,
+    task_type: &str,
+    title: &str,
+    description_md: &str,
+    severity: &str,
+    priority: &str,
+    status: &str,
+    assigned_to: &str,
+    due_date: &str,
+    links_json: &str,
+    attachments_json: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    // Tester tier: "Zgłoś usterkę" comes straight from the tester desk.
+    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let role = role.expect("tester gate never yields admin override");
+    if !tasks::TASK_TYPES.contains(&task_type) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown task_type '{task_type}'"
+        )));
+    }
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 200 {
+        return Err(ProtocolError::bad_request("title must be 1..200 characters"));
+    }
+    if !tasks::TASK_PRIORITIES.contains(&priority) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown priority '{priority}'"
+        )));
+    }
+    if !tasks::TASK_STATUSES.contains(&status) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown status '{status}'"
+        )));
+    }
+    let severity = severity.trim();
+    if task_type == "defect" {
+        if !tasks::TASK_SEVERITIES.contains(&severity) {
+            return Err(ProtocolError::bad_request(
+                "a defect requires severity (low|medium|high|critical)",
+            ));
+        }
+    } else if !severity.is_empty() {
+        return Err(ProtocolError::bad_request("severity applies only to defects"));
+    }
+    if !assigned_to.is_empty()
+        && repository::effective_role(project_id, assigned_to)
+            .map_err(|e| db_error("member_role", e))?
+            .is_none()
+    {
+        return Err(ProtocolError::bad_request(
+            "assigned_to must be a project member",
+        ));
+    }
+    let links_json = normalize_links(links_json)?;
+    let attachments_json = normalize_attachments(attachments_json)?;
+    let input = tasks::TaskInput {
+        task_type,
+        title,
+        description_md,
+        severity,
+        priority,
+        status,
+        assigned_to,
+        due_date: due_date.trim(),
+        links_json: &links_json,
+        attachments_json: &attachments_json,
+    };
+    let pool = open_project_pool(project_id)?;
+    let (task_id, task_no, assignment_changed) = match task_id {
+        None => {
+            let (id, no) =
+                tasks::create_task(&pool, &input, &org.user_id).map_err(|e| db_error("task_create", e))?;
+            activity::record(
+                &pool,
+                &org.user_id,
+                "user",
+                "task.created",
+                "task",
+                &id,
+                &serde_json::json!({ "title": title, "task_type": task_type }).to_string(),
+            );
+            (id, no, !assigned_to.is_empty())
+        }
+        Some(id) => {
+            let existing = tasks::get_task(&pool, id)
+                .map_err(|e| db_error("task_get", e))?
+                .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+            // Edit: the author, the assigned tester, or any editor+.
+            let allowed = existing.created_by == org.user_id
+                || existing.assigned_to == org.user_id
+                || role >= ProjectRole::Editor;
+            if !allowed {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyDenied,
+                    "only the author, the assignee or an editor may edit this task",
+                ));
+            }
+            let changed = assigned_to != existing.assigned_to && !assigned_to.is_empty();
+            if !tasks::update_task(&pool, id, &input).map_err(|e| db_error("task_update", e))? {
+                return Err(ProtocolError::not_found("task not found"));
+            }
+            activity::record(
+                &pool,
+                &org.user_id,
+                "user",
+                "task.updated",
+                "task",
+                id,
+                &serde_json::json!({ "title": title, "status": status }).to_string(),
+            );
+            (id.to_string(), existing.task_no, changed)
+        }
+    };
+    if assignment_changed && assigned_to != org.user_id {
+        notifications::notify(
+            &org.org_id,
+            assigned_to,
+            project_id,
+            "task_assigned",
+            "Przypisano Ci zadanie",
+            &format!("#{task_no} „{title}”"),
+            &serde_json::json!({ "project_id": project_id, "task_id": task_id }).to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::TaskSaveResponse { task_id, task_no }))
+}
+
+fn task_delete_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let role = role.expect("tester gate never yields admin override");
+    let pool = open_project_pool(project_id)?;
+    let task = tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    // Manager anytime; the author only while nobody commented.
+    let allowed = role >= ProjectRole::Manager
+        || (task.created_by == org.user_id && task.comment_count == 0);
+    if !allowed {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "deleting requires the manager role (or authorship of an uncommented task)",
+        ));
+    }
+    let ok = tasks::delete_task(&pool, task_id).map_err(|e| db_error("task_delete", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "task.deleted",
+            "task",
+            task_id,
+            &serde_json::json!({ "title": task.title }).to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::TaskDeleteResult { ok }))
+}
+
+fn task_comment_add_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+    body_md: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let body = body_md.trim();
+    if body.is_empty() || body.chars().count() > 8000 {
+        return Err(ProtocolError::bad_request("comment must be 1..8000 characters"));
+    }
+    let pool = open_project_pool(project_id)?;
+    tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    let comment =
+        tasks::add_comment(&pool, task_id, &org.user_id, body).map_err(|e| db_error("comment_add", e))?;
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "task_comment.added",
+        "task",
+        task_id,
+        "{}",
+    );
+    let names = repository::resolve_user_refs(std::slice::from_ref(&comment.author_user_id));
+    Ok(ps(ProjectStudioPayload::TaskCommentAddResponse {
+        comment: comment_to_wire(comment, &names),
+    }))
+}
+
+fn task_comment_edit_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    comment_id: &str,
+    body_md: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let body = body_md.trim();
+    if body.is_empty() || body.chars().count() > 8000 {
+        return Err(ProtocolError::bad_request("comment must be 1..8000 characters"));
+    }
+    let pool = open_project_pool(project_id)?;
+    // Author-scoped UPDATE: another user's comment simply does not match.
+    let ok = tasks::edit_comment(&pool, comment_id, &org.user_id, body)
+        .map_err(|e| db_error("comment_edit", e))?;
+    if !ok {
+        return Err(ProtocolError::not_found("comment not found"));
+    }
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "task_comment.edited",
+        "task_comment",
+        comment_id,
+        "{}",
+    );
+    Ok(ps(ProjectStudioPayload::TaskCommentEditResult { ok }))
+}
+
+fn task_comment_delete_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    comment_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let role = role.expect("tester gate never yields admin override");
+    let pool = open_project_pool(project_id)?;
+    let comment = tasks::get_comment(&pool, comment_id)
+        .map_err(|e| db_error("comment_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("comment not found"))?;
+    if comment.author_user_id != org.user_id && role < ProjectRole::Manager {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "only the author or a manager may delete a comment",
+        ));
+    }
+    let ok = tasks::delete_comment(&pool, comment_id).map_err(|e| db_error("comment_delete", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "task_comment.deleted",
+            "task_comment",
+            comment_id,
+            "{}",
+        );
+    }
+    Ok(ps(ProjectStudioPayload::TaskCommentDeleteResult { ok }))
+}
+
+// =============================================================================
+// F2: agent case generation (G01/T05)
+// =============================================================================
+
+async fn generation_start_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    kind: &str,
+    source_ids: &[String],
+    requested_count: u32,
+    instructions: &str,
+    agent_id: Option<&str>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    if kind != "manual" {
+        return Err(ProtocolError::bad_request(
+            "only kind 'manual' is available in this phase",
+        ));
+    }
+    if source_ids.is_empty() {
+        return Err(ProtocolError::bad_request("select at least one source"));
+    }
+    if instructions.chars().count() > generation::MAX_INSTRUCTIONS_CHARS {
+        return Err(ProtocolError::bad_request("instructions exceed 4000 characters"));
+    }
+    let pool = open_project_pool(project_id)?;
+    let mut source_meta: Vec<(String, String, String)> = Vec::with_capacity(source_ids.len());
+    for source_id in source_ids {
+        let source = repository::get_source(&pool, source_id)
+            .map_err(|e| db_error("get_source", e))?
+            .ok_or_else(|| ProtocolError::bad_request(format!("unknown source '{source_id}'")))?;
+        if source.status != "ready" {
+            return Err(ProtocolError::bad_request(format!(
+                "source '{}' is not ready (status '{}')",
+                source.name, source.status
+            )));
+        }
+        source_meta.push((source.source_id, source.name, source.kind));
+    }
+    let requested = if requested_count == 0 {
+        generation::DEFAULT_REQUESTED_COUNT
+    } else {
+        requested_count
+    };
+    let max_cases = requested.clamp(1, generation::MAX_CASES_CAP);
+
+    // Agent resolution: explicit request > project 'generator_manual'
+    // binding > the seeded system agent.
+    let resolved_agent_id = match agent_id.filter(|a| !a.is_empty()) {
+        Some(explicit) => explicit.to_string(),
+        None => {
+            let bound: Option<String> = repository::get_setting(&pool, "agents")
+                .map_err(|e| db_error("settings_get", e))?
+                .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
+                .and_then(|map| map.get("generator_manual").cloned())
+                .filter(|a| !a.is_empty());
+            bound.unwrap_or_else(|| generation::GENERATOR_MANUAL_AGENT_ID.to_string())
+        }
+    };
+    let agent = crate::db::repository::get_agent(&ctx.state.db, &resolved_agent_id)
+        .map_err(|e| db_error("get_agent", e))?
+        .ok_or_else(|| ProtocolError::bad_request("generator agent not found"))?;
+    if !agent.is_enabled {
+        return Err(ProtocolError::bad_request("generator agent is disabled"));
+    }
+    if !crate::agents::tool_in_allowlist(
+        &agent.tools_json,
+        crate::agents::CoreToolName::CaseSave.public_name(),
+    ) {
+        return Err(ProtocolError::bad_request(
+            "the selected agent has no core.project_case_save in its tool allowlist",
+        ));
+    }
+    let manager = crate::agents::agent_run_manager_global()
+        .ok_or_else(|| ProtocolError::internal("agent run manager not initialized"))?;
+
+    let gen_id = uuid::Uuid::new_v4().to_string();
+    generation::insert_generation(
+        &pool,
+        &gen_id,
+        kind,
+        &agent.id,
+        source_ids,
+        instructions.trim(),
+        requested,
+        max_cases,
+        &org.user_id,
+    )
+    .map_err(|e| db_error("generation_insert", e))?;
+
+    let prompt =
+        generation::build_generation_prompt(&record.name, &source_meta, instructions, max_cases);
+    let principal =
+        crate::agents::AgentPrincipal::new(Some(org.user_id.clone()), Some(org.org_id.clone()));
+    let binding_meta = serde_json::json!({ "project_id": project_id, "gen_id": gen_id });
+    let spawned = manager
+        .spawn(
+            &agent.id,
+            &prompt,
+            None,
+            &principal,
+            &[],
+            &[(generation::GENERATION_META_KEY, binding_meta)],
+            None,
+        )
+        .await;
+    let agent_run_id = match spawned {
+        Ok(run_id) => run_id,
+        Err(e) => {
+            // The row must not stay 'running' forever when nothing runs.
+            let _ = finalize_failed_start(&pool, &gen_id);
+            return Err(db_error("generation_spawn", e));
+        }
+    };
+    generation::set_agent_run_id(&pool, &gen_id, &agent_run_id)
+        .map_err(|e| db_error("generation_run_id", e))?;
+    generation::spawn_watcher(
+        ctx.state.db.clone(),
+        org.org_id.clone(),
+        project_id.to_string(),
+        gen_id.clone(),
+        agent_run_id.clone(),
+    );
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "generation.started",
+        "generation",
+        &gen_id,
+        &serde_json::json!({ "agent_id": agent.id, "max_cases": max_cases }).to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::GenerationStartResponse {
+        gen_id,
+        agent_run_id,
+    }))
+}
+
+/// Marks a generation failed when the agent spawn itself failed (no watcher
+/// exists yet for it).
+fn finalize_failed_start(pool: &crate::db::DbPool, gen_id: &str) -> Result<(), ProtocolError> {
+    let conn = pool
+        .write()
+        .map_err(|e| ProtocolError::internal(format!("project db write: {e}")))?;
+    conn.execute(
+        "UPDATE generation_runs SET status = 'failed', error = 'agent spawn failed', \
+            finished_at = datetime('now') WHERE gen_id = ?1 AND status = 'running'",
+        rusqlite::params![gen_id],
+    )
+    .map_err(|e| ProtocolError::internal(format!("generation finalize: {e}")))?;
+    Ok(())
+}
+
+fn generations_list_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    generation::reconcile_running(&ctx.state.db, &pool, &org.org_id, project_id);
+    let rows = generation::list_generations(&pool).map_err(|e| db_error("generations_list", e))?;
+    let ids: Vec<String> = rows.iter().map(|g| g.started_by.clone()).collect();
+    let names = repository::resolve_user_refs(&ids);
+    let generations = rows
+        .into_iter()
+        .map(|record| generation_to_wire(record, &names))
+        .collect();
+    Ok(ps(ProjectStudioPayload::GenerationsListResponse {
+        generations,
+    }))
+}
+
+fn generation_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    gen_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    generation::reconcile_running(&ctx.state.db, &pool, &org.org_id, project_id);
+    let record = generation::get_generation(&pool, gen_id)
+        .map_err(|e| db_error("generation_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("generation not found"))?;
+    let names = repository::resolve_user_refs(std::slice::from_ref(&record.started_by));
+    let pending = generation::pending_cases(&pool, gen_id)
+        .map_err(|e| db_error("pending_cases", e))?;
+    Ok(ps(ProjectStudioPayload::GenerationGetResponse {
+        run: generation_to_wire(record, &names),
+        pending_cases: cases_to_wire(pending),
+    }))
+}
+
+fn generation_cancel_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    gen_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let generation_record = generation::get_generation(&pool, gen_id)
+        .map_err(|e| db_error("generation_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("generation not found"))?;
+    let is_manager = matches!(role, Some(r) if r >= ProjectRole::Manager);
+    if !is_manager && generation_record.started_by != org.user_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "cancelling requires the manager role or generation ownership",
+        ));
+    }
+    if generation_record.status != "running" {
+        return Err(ProtocolError::bad_request("generation is not running"));
+    }
+    // Cancel through the run manager (D.5) — the watcher observes the
+    // terminal state and finalizes. When nothing is live (restart), lazy
+    // reconcile settles the row from the persisted run status.
+    let signalled = crate::agents::agent_run_manager_global()
+        .map(|m| m.cancel(&generation_record.agent_run_id))
+        .unwrap_or(false);
+    if !signalled {
+        generation::reconcile_running(&ctx.state.db, &pool, &org.org_id, project_id);
+    }
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "generation.cancelled",
+        "generation",
+        gen_id,
+        "{}",
+    );
+    Ok(ps(ProjectStudioPayload::GenerationCancelResult { ok: true }))
+}
+
+fn generation_review_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    gen_id: &str,
+    accept_case_ids: &[String],
+    reject_case_ids: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    if accept_case_ids.is_empty() && reject_case_ids.is_empty() {
+        return Err(ProtocolError::bad_request("nothing to review"));
+    }
+    let pool = open_project_pool(project_id)?;
+    let generation_record = generation::get_generation(&pool, gen_id)
+        .map_err(|e| db_error("generation_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("generation not found"))?;
+    if generation_record.status != "review" {
+        return Err(ProtocolError::bad_request(
+            "generation is not awaiting review",
+        ));
+    }
+    let (accepted, rejected, run_status) =
+        generation::review_generation(&pool, gen_id, accept_case_ids, reject_case_ids)
+            .map_err(|e| db_error("generation_review", e))?;
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "generation.reviewed",
+        "generation",
+        gen_id,
+        &serde_json::json!({ "accepted": accepted, "rejected": rejected, "status": run_status })
+            .to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::GenerationReviewResponse {
+        accepted,
+        rejected,
+        run_status,
+    }))
+}
+
+fn generation_delete_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    gen_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let generation_record = generation::get_generation(&pool, gen_id)
+        .map_err(|e| db_error("generation_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("generation not found"))?;
+    if matches!(generation_record.status.as_str(), "running" | "review") {
+        return Err(ProtocolError::bad_request(
+            "only finished generations can be deleted",
+        ));
+    }
+    let ok =
+        generation::delete_generation(&pool, gen_id).map_err(|e| db_error("generation_delete", e))?;
+    if ok {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "generation.deleted",
+            "generation",
+            gen_id,
+            "{}",
+        );
+    }
+    Ok(ps(ProjectStudioPayload::GenerationDeleteResult { ok }))
+}
+
+// =============================================================================
+// F2: notifications (G02) — central DB, always caller-scoped
+// =============================================================================
+
+fn notifications_list_v1(
+    ctx: &HandlerContext,
+    only_unread: bool,
+    before_id: Option<&str>,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let limit = limit.clamp(1, 100);
+    let (rows, unread_count, has_more) =
+        notifications::list(&org.user_id, only_unread, before_id, limit)
+            .map_err(|e| db_error("notifications_list", e))?;
+    let notifications_wire = rows
+        .into_iter()
+        .map(|n| NotificationWire {
+            notification_id: n.notification_id,
+            project_id: n.project_id,
+            project_name: n.project_name,
+            kind: n.kind,
+            title: n.title,
+            body: n.body,
+            link_json: n.link_json,
+            read_at: n.read_at,
+            created_at: n.created_at,
+        })
+        .collect();
+    Ok(ps(ProjectStudioPayload::NotificationsListResponse {
+        notifications: notifications_wire,
+        unread_count,
+        has_more,
+    }))
+}
+
+fn notifications_mark_read_v1(
+    ctx: &HandlerContext,
+    notification_ids: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    if notification_ids.len() > 500 {
+        return Err(ProtocolError::bad_request("too many notification ids"));
+    }
+    notifications::mark_read(&org.user_id, notification_ids)
+        .map_err(|e| db_error("notifications_mark_read", e))?;
+    Ok(ps(ProjectStudioPayload::NotificationsMarkReadResult {
+        ok: true,
+    }))
+}
+
+// =============================================================================
+// F2: reports (T14)
+// =============================================================================
+
+fn report_query_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    report: &str,
+    from_date: &str,
+    to_date: &str,
+    suite_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    if !reports::REPORT_KINDS.contains(&report) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown report '{report}'"
+        )));
+    }
+    let pool = open_project_pool(project_id)?;
+    let mut rows_json = reports::run_report(&pool, report, from_date, to_date, suite_id)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    // tester_stats rows carry raw user ids — enrich with display names here
+    // (the core user directory is not reachable from the per-project SQL).
+    if report == "tester_stats" {
+        if let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(&rows_json) {
+            let ids: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.get("user_id").and_then(|u| u.as_str()))
+                .map(|s| s.to_string())
+                .collect();
+            let names = repository::resolve_user_refs(&ids);
+            for row in &mut rows {
+                let user_id = row
+                    .get("user_id")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                row["display_name"] = serde_json::Value::String(display_name(&names, &user_id));
+            }
+            rows_json = serde_json::Value::Array(rows).to_string();
+        }
+    }
+    Ok(ps(ProjectStudioPayload::ReportQueryResponse { rows_json }))
 }
 
 #[cfg(test)]

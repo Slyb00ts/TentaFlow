@@ -872,16 +872,89 @@ pub fn delete_source_file_row(pool: &DbPool, file_id: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// How many file rows across ALL sources still reference `sha256` — the blob
-/// under `files/<sha256>` may only be removed when this drops to zero.
-pub fn sha_ref_count(pool: &DbPool, sha256: &str) -> Result<u32> {
+/// How many rows still reference the blob `files/<sha256>`: source_files rows
+/// PLUS attachment entries embedded in `attachments_json` of test cases, run
+/// items, run steps and tasks (json_each over the arrays). The blob may only
+/// be removed when this drops to zero — counting source_files alone would let
+/// the GC and the source-delete paths eat tester screenshots (risk F.6).
+pub fn blob_ref_count(pool: &DbPool, sha256: &str) -> Result<u32> {
     let conn = pool.read().map_err(read_err)?;
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM source_files WHERE sha256 = ?1",
+        "SELECT (SELECT COUNT(*) FROM source_files WHERE sha256 = ?1) \
+              + (SELECT COUNT(*) FROM test_cases t, json_each(t.attachments_json) j \
+                 WHERE json_extract(j.value, '$.sha256') = ?1) \
+              + (SELECT COUNT(*) FROM test_run_items t, json_each(t.attachments_json) j \
+                 WHERE json_extract(j.value, '$.sha256') = ?1) \
+              + (SELECT COUNT(*) FROM test_run_steps t, json_each(t.attachments_json) j \
+                 WHERE json_extract(j.value, '$.sha256') = ?1) \
+              + (SELECT COUNT(*) FROM tasks t, json_each(t.attachments_json) j \
+                 WHERE json_extract(j.value, '$.sha256') = ?1)",
         params![sha256],
         |row| row.get(0),
     )?;
     Ok(n as u32)
+}
+
+/// Every sha256 referenced anywhere (source_files + the four attachments_json
+/// tables), for the files-dir GC — one pass over the tables instead of a
+/// per-blob `blob_ref_count` query for each on-disk file.
+pub fn referenced_blob_sha256s(pool: &DbPool) -> Result<std::collections::HashSet<String>> {
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn.prepare(
+        "SELECT sha256 FROM source_files \
+         UNION \
+         SELECT json_extract(j.value, '$.sha256') \
+           FROM test_cases t, json_each(t.attachments_json) j \
+         UNION \
+         SELECT json_extract(j.value, '$.sha256') \
+           FROM test_run_items t, json_each(t.attachments_json) j \
+         UNION \
+         SELECT json_extract(j.value, '$.sha256') \
+           FROM test_run_steps t, json_each(t.attachments_json) j \
+         UNION \
+         SELECT json_extract(j.value, '$.sha256') \
+           FROM tasks t, json_each(t.attachments_json) j",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        if let Some(sha) = row? {
+            set.insert(sha);
+        }
+    }
+    Ok(set)
+}
+
+/// Resolves the MIME type recorded for an attachment blob: the first matching
+/// attachment entry across the four attachment-bearing tables, falling back to
+/// source_files (an attachment may share content with an uploaded source).
+pub fn attachment_mime(pool: &DbPool, sha256: &str) -> Result<Option<String>> {
+    let conn = pool.read().map_err(read_err)?;
+    conn.query_row(
+        "SELECT mime FROM ( \
+            SELECT json_extract(j.value, '$.mime') AS mime \
+              FROM test_cases t, json_each(t.attachments_json) j \
+             WHERE json_extract(j.value, '$.sha256') = ?1 \
+            UNION ALL \
+            SELECT json_extract(j.value, '$.mime') \
+              FROM test_run_items t, json_each(t.attachments_json) j \
+             WHERE json_extract(j.value, '$.sha256') = ?1 \
+            UNION ALL \
+            SELECT json_extract(j.value, '$.mime') \
+              FROM test_run_steps t, json_each(t.attachments_json) j \
+             WHERE json_extract(j.value, '$.sha256') = ?1 \
+            UNION ALL \
+            SELECT json_extract(j.value, '$.mime') \
+              FROM tasks t, json_each(t.attachments_json) j \
+             WHERE json_extract(j.value, '$.sha256') = ?1 \
+            UNION ALL \
+            SELECT mime FROM source_files WHERE sha256 = ?1 \
+         ) WHERE mime IS NOT NULL AND mime <> '' LIMIT 1",
+        params![sha256],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 // =============================================================================
@@ -1144,6 +1217,57 @@ pub fn project_kpis(pool: &DbPool) -> Result<ProjectKpis> {
         files_total: files_total as u32,
         chunks_total: chunks_total as u32,
         open_ingest_jobs: open_jobs as u32,
+    })
+}
+
+/// F2 KPI counters for the overview screen. Pending agent output is excluded
+/// from case counters (same visibility rule as every case query);
+/// `my_run_items_pending` counts items of RUNNING runs assigned to the caller
+/// or claimable from the pool.
+pub fn project_f2_kpis(pool: &DbPool, user_id: &str) -> Result<super::models::ProjectF2Kpis> {
+    let conn = pool.read().map_err(read_err)?;
+    let (cases_total, cases_approved): (i64, i64) = conn.query_row(
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(status = 'approved'), 0) FROM test_cases WHERE {}",
+            super::tests::VISIBLE_CASES_PREDICATE
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let suites_total: i64 =
+        conn.query_row("SELECT COUNT(*) FROM test_suites", [], |row| row.get(0))?;
+    let runs_open: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM test_runs WHERE status = 'running'",
+        [],
+        |row| row.get(0),
+    )?;
+    let my_pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM test_run_items i \
+         JOIN test_runs r ON r.run_id = i.run_id AND r.status = 'running' \
+         WHERE i.status = 'pending' AND (i.assigned_to = ?1 OR i.assigned_to = '')",
+        params![user_id],
+        |row| row.get(0),
+    )?;
+    let (tasks_open, defects_open): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(task_type = 'task'), 0), COALESCE(SUM(task_type = 'defect'), 0) \
+         FROM tasks WHERE status <> 'done'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let generations_running: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM generation_runs WHERE status = 'running'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(super::models::ProjectF2Kpis {
+        cases_total: cases_total as u32,
+        cases_approved: cases_approved as u32,
+        suites_total: suites_total as u32,
+        runs_open: runs_open as u32,
+        my_run_items_pending: my_pending as u32,
+        tasks_open: tasks_open as u32,
+        defects_open: defects_open as u32,
+        generations_running: generations_running as u32,
     })
 }
 
