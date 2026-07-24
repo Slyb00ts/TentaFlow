@@ -3221,13 +3221,20 @@ impl ModelWeights {
     }
 
     /// Whether every dense projection has a small-batch decode kernel family
-    /// (NVFP4 B4/B8/B16/BM32 GEMV), so a batched decode step costs roughly one
-    /// weight sweep instead of a fixed >=64-token GEMM tile. Decides the
-    /// batched-path engagement default: 2 with small-batch kernels, else the
-    /// tile cost only amortizes at ~12 concurrent sequences.
+    /// (NVFP4 B4/B8/B16/BM32 GEMV; Q4_K/Q6_K weight-stationary dp4a batch),
+    /// so a batched decode step costs roughly one weight sweep instead of a
+    /// fixed >=64-token GEMM tile. Decides the batched-path engagement
+    /// default: 2 with small-batch kernels, else the tile cost only amortizes
+    /// at ~12 concurrent sequences.
     pub fn small_batch_decode_capable(&self) -> bool {
         let small = |w: &DevWeight| {
-            matches!(w, DevWeight::NvFp4 { .. } | DevWeight::NvFp4Gguf { .. })
+            matches!(
+                w,
+                DevWeight::NvFp4 { .. }
+                    | DevWeight::NvFp4Gguf { .. }
+                    | DevWeight::Q4K { .. }
+                    | DevWeight::Q6K { .. }
+            )
         };
         self.layers.iter().all(|layer| {
             let mixer_ok = match &layer.mixer {

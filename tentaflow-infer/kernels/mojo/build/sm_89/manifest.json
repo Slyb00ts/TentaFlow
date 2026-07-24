@@ -1808,6 +1808,38 @@
     "gemm_fp8_mod_11264_4096_bn256": {
       "file": "gemm_fp8_mod_11264_4096_bn256.ptx",
       "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_cb836b06d30a654a"
+    },
+    "gemv_q4_k_dp4a_batch_b2": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_e76532f9b3f78482",
+      "file": "gemv_q4_k_dp4a_batch_b2.ptx"
+    },
+    "gemv_q4_k_dp4a_batch_b4": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_85188625ec252af5",
+      "file": "gemv_q4_k_dp4a_batch_b4.ptx"
+    },
+    "gemv_q4_k_dp4a_batch_b8": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_d8c54bc8de246b7a",
+      "file": "gemv_q4_k_dp4a_batch_b8.ptx"
+    },
+    "gemv_q4_k_dp4a_batch_b16": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_64682786e358285d",
+      "file": "gemv_q4_k_dp4a_batch_b16.ptx"
+    },
+    "gemv_q6_k_dp4a_batch_b2": {
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_68d4aa601b8f2373",
+      "file": "gemv_q6_k_dp4a_batch_b2.ptx"
+    },
+    "gemv_q6_k_dp4a_batch_b4": {
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a69d5d7ce99a9359",
+      "file": "gemv_q6_k_dp4a_batch_b4.ptx"
+    },
+    "gemv_q6_k_dp4a_batch_b8": {
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_d80b02466f349d8c",
+      "file": "gemv_q6_k_dp4a_batch_b8.ptx"
+    },
+    "gemv_q6_k_dp4a_batch_b16": {
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_bd8ac77acfa75f02",
+      "file": "gemv_q6_k_dp4a_batch_b16.ptx"
     }
   }
 }

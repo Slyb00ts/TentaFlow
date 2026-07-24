@@ -4797,26 +4797,31 @@ impl Model {
                 n_tokens,
                 stream,
             ),
-            DevWeight::Q4K { buf, cols, .. } => self.kernels.gemm_q4_k_i8mma_at(
-                y,
-                buf,
-                row_off * (cols / 256) * 144,
-                x,
-                n_rows,
-                *cols,
-                n_tokens,
-                stream,
-            ),
-            DevWeight::Q6K { buf, cols, .. } => self.kernels.gemm_q6_k_f16_at(
-                y,
-                buf,
-                row_off * (cols / 256) * 210,
-                x,
-                n_rows,
-                *cols,
-                n_tokens,
-                stream,
-            ),
+            // Small decode batches (T=2/4/8/16) take the weight-stationary
+            // dp4a GEMV: one weight sweep serves every token instead of the
+            // >=64-token tile the GEMM kernels pad to.
+            DevWeight::Q4K { buf, cols, .. } => {
+                let off = row_off * (cols / 256) * 144;
+                if self
+                    .kernels
+                    .gemm_qk_dp4a_batch_at(y, buf, off, x, n_rows, *cols, n_tokens, false, stream)?
+                {
+                    return Ok(());
+                }
+                self.kernels
+                    .gemm_q4_k_i8mma_at(y, buf, off, x, n_rows, *cols, n_tokens, stream)
+            }
+            DevWeight::Q6K { buf, cols, .. } => {
+                let off = row_off * (cols / 256) * 210;
+                if self
+                    .kernels
+                    .gemm_qk_dp4a_batch_at(y, buf, off, x, n_rows, *cols, n_tokens, true, stream)?
+                {
+                    return Ok(());
+                }
+                self.kernels
+                    .gemm_q6_k_f16_at(y, buf, off, x, n_rows, *cols, n_tokens, stream)
+            }
             DevWeight::Q5K { buf, cols, .. } => self.kernels.gemm_q5_k_f16_at(
                 y,
                 buf,

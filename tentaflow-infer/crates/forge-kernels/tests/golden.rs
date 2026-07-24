@@ -2021,6 +2021,63 @@ fn gemv_q4_k_dp4a_matches_formats_dequant() {
     }
 }
 
+// Weight-stationary small-batch dp4a GEMV (T=2/4/8/16): every token's row
+// dot must match the CPU dequant reference within the q8_1 activation
+// tolerance, for both Q4_K (min term) and Q6_K.
+#[test]
+fn gemm_qk_dp4a_batch_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for (quant, q6) in [(QuantKind::Q4K, false), (QuantKind::Q6K, true)] {
+        let (rows, cols) = (33usize, 512usize);
+        let wq = if q6 {
+            build_q6k(rows, cols)
+        } else {
+            build_q4k(rows, cols)
+        };
+        let w_f32 =
+            forge_formats::dequant::dequantize_to_f32(DType::F32, quant, &wq, rows * cols).unwrap();
+        let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+        dev.write(&wq, &wb, 0).unwrap();
+
+        for n_tokens in [2usize, 4, 8, 16] {
+            let x: Vec<f32> = (0..n_tokens * cols)
+                .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+                .collect();
+            let xb = upload_f16(dev.as_ref(), &x);
+            let yb = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+            let routed = kernels
+                .gemm_qk_dp4a_batch_at(&yb, &wb, 0, &xb, rows, cols, n_tokens, q6, &stream)
+                .unwrap();
+            assert!(routed, "batch dp4a kernel missing for T={n_tokens}");
+            dev.synchronize().unwrap();
+
+            // Aggregate relative L2 vs the CPU dequant reference — the same
+            // metric the i8mma/MMQ goldens use; the q8_1 activation quant
+            // (and the quantized-sum min term) is per-element lossy.
+            let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for t in 0..n_tokens {
+                for r in 0..rows {
+                    let want: f32 = (0..cols)
+                        .map(|c| w_f32[r * cols + c] * x[t * cols + c])
+                        .sum();
+                    let diff = (got[t * rows + r] - want) as f64;
+                    num += diff * diff;
+                    den += (want as f64) * (want as f64);
+                }
+            }
+            let rel_l2 = (num / den).sqrt();
+            assert!(
+                rel_l2 < 5e-3,
+                "{quant:?} T={n_tokens}: relL2 {rel_l2:.3e} exceeds q8_1 tolerance"
+            );
+        }
+    }
+}
+
 /// Deterministic quant streams for the extended formats: block headers get
 /// plausible small scales, everything else pseudo-random bytes — every scale
 /// branch / high-bit path gets exercised.

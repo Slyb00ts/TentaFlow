@@ -154,6 +154,24 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **Small-batch dp4a GEMV dla Q4_K/Q6_K batched decode (2026-07-24).**
+  Nowe kernele Mojo `gemv_q{4,6}_k_dp4a_batch_b{2,4,8,16}`
+  (`src/decode_dp4a_batch.mojo`, builder `build_decode_dp4a_batch.mojo`,
+  PTX `.target sm_80`, 0 spill, ≤95 rej.): jeden przebieg wag obsługuje
+  wszystkie tokeny batcha; matematyka per wiersz identyczna z
+  `_dot_q4k_i8`/`_dot_q6k_i8`, aktywacje z `quantize_act_q8_1` ([T,K] int8 +
+  block-major skale/sumy). Launcher `gemm_qk_dp4a_batch_at` ma DEDYKOWANY
+  scratch alokowany od razu na pułap T=16 (stabilne adresy dla przechwyconych
+  grafów decode; wspólny `prepare_q8_1` odpada — jego eventy łamią capture:
+  `CUDA_ERROR_CAPTURED_EVENT`). Routing w `gemm_rows` dla T=2/4/8/16 z
+  fallbackiem na dotychczasowe GEMM; `small_batch_decode_capable` obejmuje
+  teraz Q4_K/Q6_K, więc auto batch-min=2. Golden agregatowe relL2 <5e-3 dla
+  obu formatów i wszystkich T (68/68). Serve Mistral-7B Q4_K_M p1024/o128
+  (GPU bez rezydentnej instancji): C=4 **133→263 tok/s** (TPOT 27,7→12,8 ms),
+  C=8 **136→305** (56,4→22,3), C=16 **212→248** (60,8→50,9 — b16 do
+  strojenia, kandydaci: ROWS_PER_BLOCK=8, podział tokenów na 2 CTA). Wyjścia
+  równoległe bit-stabilne z serialem („Paris"), ppl default 30,0702 i bench
+  single-stream bez zmian.
 - ✅ **Serve: współbieżność i TTFT out-of-box (2026-07-24).** Cztery zmiany
   zmierzone klientem `vllm bench serve` (random p1024/o128, RTX 4090 obok
   rezydentnej instancji ~3,6 GiB):

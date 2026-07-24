@@ -1284,6 +1284,8 @@ pub struct Kernels {
     /// and block-major da/sa scales. Separate layout from `prequant` (padded to
     /// the compile-time token ceiling MPAD, not the real token count).
     q4k_native: Mutex<Q4kNativeScratch>,
+    /// (`gemm_qk_dp4a_batch_at`): dedicated small-batch decode quant scratch.
+    qk_batch: Mutex<QkBatchScratch>,
     /// Backend attention dla prefill F16 hd64/hd128. Domyślnie wybiera kernel
     /// Mojo skompilowany obecnie do PTX; obsługa AMDGPU i Metal wymaga osobnych
     /// backendów HAL i artefaktów. `FORGE_ATTN=fa` wybiera cubin tylko wtedy,
@@ -1463,6 +1465,24 @@ struct Q4kNativeScratch {
     /// Current f16/int8 element capacity of `xpad`/`xq` (MPAD·cols).
     cap_x: usize,
     /// Current f32 element capacity of `da`/`sa` ((cols/32)·MPAD).
+    cap_blocks: usize,
+}
+
+/// Grow-only scratch for the small-batch dp4a GEMV (`gemm_qk_dp4a_batch_at`):
+/// q8_1 codes + block-major scales/sums, always allocated for the full T=16
+/// batch ceiling so buffer addresses stay stable once the decode graphs are
+/// captured (no events — all users share the model stream's ordering).
+#[derive(Default)]
+struct QkBatchScratch {
+    /// int8 q8_1 codes [16, cols].
+    xq: Option<DevBuffer>,
+    /// Block-major per-32 activation scale d [cols/32, 16].
+    xd: Option<DevBuffer>,
+    /// Block-major per-32 activation sum d·Σcodes [cols/32, 16].
+    xsm: Option<DevBuffer>,
+    /// Current int8 code capacity (16·cols).
+    cap_codes: usize,
+    /// Current f32 element capacity of `xd`/`xsm` ((cols/32)·16).
     cap_blocks: usize,
 }
 
@@ -1748,6 +1768,7 @@ impl Kernels {
             w4a8_act: Mutex::new(W4A8ActScratch::default()),
             fp8_act: Mutex::new(Fp8ActScratch::default()),
             q4k_native: Mutex::new(Q4kNativeScratch::default()),
+            qk_batch: Mutex::new(QkBatchScratch::default()),
             attn: match std::env::var("FORGE_ATTN").ok().as_deref() {
                 Some("scalar") => AttnBackend::Scalar,
                 Some("fa") | Some("cuda") if cuda_attn_available => AttnBackend::Cuda,
@@ -10659,6 +10680,115 @@ impl Kernels {
             .scalar(cols as i64)
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Weight-stationary small-batch dp4a GEMV for Q4_K/Q6_K batched decode
+    /// (T = 2/4/8/16): quantizes the activation once (`prepare_q8_1`), then a
+    /// single weight sweep serves every token. Returns `false` (caller keeps
+    /// the token-tile GEMM path) when the shape, batch or device is
+    /// unsupported or the kernels are absent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qk_dp4a_batch_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        q6: bool,
+        stream: &Stream,
+    ) -> Result<bool> {
+        if !matches!(n_tokens, 2 | 4 | 8 | 16)
+            || rows == 0
+            || cols == 0
+            || !cols.is_multiple_of(256)
+        {
+            return Ok(false);
+        }
+        let caps = self.device.caps();
+        if caps.vendor != forge_types::Vendor::Nvidia || caps.warp_size != 32 {
+            return Ok(false);
+        }
+        let name = if q6 {
+            format!("gemv_q6_k_dp4a_batch_b{n_tokens}")
+        } else {
+            format!("gemv_q4_k_dp4a_batch_b{n_tokens}")
+        };
+        let Ok(gk) = self.artifacts.get(&name) else {
+            return Ok(false);
+        };
+        let block_bytes = if q6 { 210 } else { 144 };
+        let weight_bytes = checked_buffer_bytes("dp4a batch weights", &[rows, cols / 256], block_bytes)?;
+        let weight_end = w_byte_off
+            .checked_add(weight_bytes)
+            .ok_or_else(|| ForgeError::Kernel("dp4a batch: przepełnienie wag".into()))?;
+        let output_bytes = checked_buffer_bytes("dp4a batch output", &[n_tokens, rows], 2)?;
+        if y.len() < output_bytes || w.len() < weight_end {
+            return Err(ForgeError::Kernel(
+                "dp4a batch: bufor wyjścia lub wag jest za mały".into(),
+            ));
+        }
+        // Dedicated scratch sized for the T=16 batch ceiling: the first decode
+        // step allocates the final capacity for every projection width, so the
+        // buffer addresses the captured decode graphs record never move.
+        let need_codes = checked_buffer_bytes("dp4a batch codes", &[16, cols], 1)?;
+        let need_blocks = 16 * (cols / 32);
+        let mut sc = self
+            .qk_batch
+            .lock()
+            .map_err(|_| ForgeError::Kernel("dp4a batch scratch poisoned".into()))?;
+        if sc.cap_codes < need_codes {
+            sc.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_codes;
+        }
+        if sc.cap_blocks < need_blocks {
+            sc.xd = Some(
+                self.device
+                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.xsm = Some(
+                self.device
+                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_blocks = need_blocks;
+        }
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let xd = sc.xd.as_ref().expect("xd allocated");
+        let xsm = sc.xsm.as_ref().expect("xsm allocated");
+
+        let qk = self.artifacts.get("quantize_act_q8_1")?;
+        let quant_blocks = u32::try_from(n_tokens * (cols / 32))
+            .map_err(|_| ForgeError::Kernel("dp4a batch: liczba bloków przekracza u32".into()))?;
+        let qcfg = LaunchConfig::linear(quant_blocks, BLOCK);
+        let qargs = LaunchArgs::new()
+            .buf(xq)
+            .buf(xd)
+            .buf(xsm)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(4), 1, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = LaunchArgs::new().buf(y).buf_at(w, w_byte_off)?.buf(xq).buf(xd);
+        if !q6 {
+            args = args.buf(xsm);
+        }
+        let args = args
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(gk, &cfg, &args, stream)?;
+        Ok(true)
     }
 
     /// Fused rmsnorm-recompute + Q8_0 dp4a GEMV (decode).
