@@ -42,6 +42,14 @@ pub enum CoreToolName {
     /// through the interaction registry, never the synchronous core path. Not in
     /// sub-agent allowlists by default — only top-level agents ask directly.
     AskUser,
+    /// `core.project_search(project_id, query, top_k?, source_ids?)` — semantic
+    /// search over a Project Studio knowledge base. Async (query embedding goes
+    /// through the platform executor); membership of the run's user principal
+    /// is enforced per call.
+    ProjectSearch,
+    /// `core.project_list_sources(project_id)` — the knowledge-source catalog
+    /// of a project. Async path (same membership gate as project_search).
+    ProjectListSources,
 }
 
 impl CoreToolName {
@@ -54,6 +62,8 @@ impl CoreToolName {
             CoreToolName::AgentList => "core.agent_list",
             CoreToolName::AgentCancel => "core.agent_cancel",
             CoreToolName::AskUser => "core.ask_user",
+            CoreToolName::ProjectSearch => "core.project_search",
+            CoreToolName::ProjectListSources => "core.project_list_sources",
         }
     }
 
@@ -66,6 +76,8 @@ impl CoreToolName {
             CoreToolName::AgentList => "agent_list",
             CoreToolName::AgentCancel => "agent_cancel",
             CoreToolName::AskUser => "ask_user",
+            CoreToolName::ProjectSearch => "project_search",
+            CoreToolName::ProjectListSources => "project_list_sources",
         }
     }
 
@@ -79,6 +91,8 @@ impl CoreToolName {
             "agent_list" => Some(CoreToolName::AgentList),
             "agent_cancel" => Some(CoreToolName::AgentCancel),
             "ask_user" => Some(CoreToolName::AskUser),
+            "project_search" => Some(CoreToolName::ProjectSearch),
+            "project_list_sources" => Some(CoreToolName::ProjectListSources),
             _ => None,
         }
     }
@@ -95,6 +109,16 @@ impl CoreToolName {
     /// is offered to top-level agents by default, not gated on `max_subagents`.
     pub fn is_ask_user(self) -> bool {
         matches!(self, CoreToolName::AskUser)
+    }
+
+    /// True for the Project Studio knowledge builtins — async in tool_exec
+    /// (query embedding via the flow context's dispatcher), never routed
+    /// through `execute_core_tool`.
+    pub fn is_project_knowledge(self) -> bool {
+        matches!(
+            self,
+            CoreToolName::ProjectSearch | CoreToolName::ProjectListSources
+        )
     }
 
     /// True for the sub-agent control builtins, which are admitted to the tool
@@ -118,6 +142,8 @@ impl CoreToolName {
             CoreToolName::AgentList,
             CoreToolName::AgentCancel,
             CoreToolName::AskUser,
+            CoreToolName::ProjectSearch,
+            CoreToolName::ProjectListSources,
         ]
     }
 
@@ -260,6 +286,54 @@ impl CoreToolName {
                         }
                     },
                     "required": ["question"]
+                }),
+            },
+            CoreToolName::ProjectSearch => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Search the knowledge base of a Project Studio project the \
+                              current user is a member of. Returns the best-matching \
+                              passages with source name, file path, chunk index, score \
+                              and a text snippet."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "Id of the project whose knowledge base to search."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "The natural-language search query."
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Max passages to return (1-50, default 8)."
+                        },
+                        "source_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional: restrict the search to these source ids."
+                        }
+                    },
+                    "required": ["project_id", "query"]
+                }),
+            },
+            CoreToolName::ProjectListSources => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "List the knowledge sources of a Project Studio project the \
+                              current user is a member of (id, name, kind, status, file \
+                              and chunk counts)."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "Id of the project whose sources to list."
+                        }
+                    },
+                    "required": ["project_id"]
                 }),
             },
         }

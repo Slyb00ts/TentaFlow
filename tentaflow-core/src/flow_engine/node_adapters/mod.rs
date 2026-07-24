@@ -44,6 +44,7 @@ pub mod pdf_rasterize;
 pub mod persist_turn;
 pub mod pii_filter;
 pub mod platform_switch;
+pub mod project_knowledge;
 pub mod rag_graphrag;
 pub mod rag_multihop;
 pub mod reranker;
@@ -107,6 +108,7 @@ pub use pdf_rasterize::PdfRasterizeNodeAdapter;
 pub use persist_turn::PersistTurnNodeAdapter;
 pub use pii_filter::PiiFilterNodeAdapter;
 pub use platform_switch::PlatformSwitchNodeAdapter;
+pub use project_knowledge::ProjectKnowledgeNodeAdapter;
 pub use rag_graphrag::{RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter};
 pub use rag_multihop::{
     RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter,

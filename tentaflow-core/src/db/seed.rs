@@ -745,6 +745,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             r#"{"properties":{"model":{"type":"string","title":"Model OCR / alias","description":"Silnik OCR; domyślnie rag-ocr","dynamic_enum":{"source":"models","category":"documents"},"default":"rag-ocr"}},"required":["model"],"order":["model"]}"#,
         ),
         (
+            "project_knowledge",
+            "service",
+            "Projekty / Project knowledge",
+            "Baza wiedzy modułu Projekty: szuka pasaży w wybranym projekcie (zapytanie z payloadu Text) albo zwraca listę źródeł. Wymaga tożsamości użytkownika-członka projektu; wyniki niosą cytowania.",
+            r#"{"project_id":"","operation":"search","top_k":8}"#,
+            "book-open",
+            r#"{"properties":{"project_id":{"type":"string","title":"Projekt","description":"Projekt, którego baza wiedzy będzie przeszukiwana (tylko projekty, w których jesteś członkiem)","dynamic_enum":{"source":"projects"}},"operation":{"type":"string","title":"Operacja","enum":[{"value":"search","label":"Szukaj w bazie wiedzy"},{"value":"list_sources","label":"Lista źródeł"}],"default":"search"},"top_k":{"type":"integer","title":"Top K","minimum":1,"maximum":50,"default":8,"description":"Maksymalna liczba pasaży wyniku"},"source_ids":{"type":"array","title":"Źródła (opcjonalnie)","description":"Ogranicz wyszukiwanie do wskazanych źródeł (puste = wszystkie)","items":{"type":"string"}}},"required":["project_id"],"order":["project_id","operation","top_k","source_ids"]}"#,
+        ),
+        (
             "store",
             "service",
             "Zapis do bazy wektorowej",
@@ -2014,6 +2023,54 @@ mod tests {
             .as_str()
             .map(|s| !s.is_empty())
             .unwrap_or(false));
+    }
+
+    /// The `project_knowledge` palette template is seeded with valid JSON
+    /// (default_config + params_schema), points its project picker at the
+    /// `projects` dynamic_enum source, and a re-seed neither duplicates nor
+    /// prunes the row (node_type is in the kept-templates array).
+    #[test]
+    fn project_knowledge_template_seeded_and_reseed_idempotent() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.write().unwrap();
+
+        let read_row = |conn: &rusqlite::Connection| -> (String, String, String) {
+            conn.query_row(
+                "SELECT category, default_config, params_schema FROM flow_node_templates \
+                 WHERE node_type = 'project_knowledge'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("project_knowledge template seeded")
+        };
+        let (category, default_config, params_schema) = read_row(&conn);
+        assert_eq!(category, "service");
+
+        let cfg: serde_json::Value = serde_json::from_str(&default_config).expect("config parses");
+        assert_eq!(cfg["operation"].as_str(), Some("search"));
+        assert_eq!(cfg["top_k"].as_u64(), Some(8));
+
+        let schema: serde_json::Value =
+            serde_json::from_str(&params_schema).expect("params_schema parses");
+        assert_eq!(
+            schema["properties"]["project_id"]["dynamic_enum"]["source"].as_str(),
+            Some("projects")
+        );
+        assert_eq!(schema["properties"]["top_k"]["minimum"].as_u64(), Some(1));
+        assert_eq!(schema["properties"]["top_k"]["maximum"].as_u64(), Some(50));
+        assert_eq!(schema["required"][0].as_str(), Some("project_id"));
+
+        // Re-seed: still exactly one row, not pruned by the backend-owned
+        // palette cleanup.
+        super::seed_defaults(&conn).expect("reseed");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_node_templates WHERE node_type = 'project_knowledge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// The shipped orchestration example graphs (`docs/examples/*.json`) must stay

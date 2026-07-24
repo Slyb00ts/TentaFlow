@@ -10,6 +10,7 @@
 pub mod activity;
 pub mod db;
 pub mod ingest;
+pub mod knowledge;
 pub mod models;
 pub mod project_db;
 pub mod repository;

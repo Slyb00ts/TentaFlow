@@ -196,6 +196,19 @@ async function loadDynamicEnumOptions(source, category) {
           label: a.display_name || a.displayName || a.name || a.id || '',
         }));
     }
+    if (source === 'projects') {
+      // Project picker (project_knowledge node): active projects only. The
+      // response is already filtered server-side to projects the caller is a
+      // member of (plus admin visibility), so no client-side ACL is applied.
+      const resp = await ApiBinary.one('projectStudioProjectsListRequest', {
+        includeArchived: false,
+      }).catch(() => null);
+      const rows = Array.isArray(resp?.projects) ? resp.projects : [];
+      return rows.map((p) => ({
+        value: p.project_id || p.projectId || '',
+        label: p.name || p.project_id || p.projectId || '',
+      }));
+    }
     return [];
   })();
   _dynamicEnumCache.set(key, promise);
