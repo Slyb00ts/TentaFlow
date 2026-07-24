@@ -154,6 +154,27 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- 🟡 **Mixed prefill+decode forward — zmierzony headroom i plan (2026-07-24).**
+  Pomiar rozstrzygający: czysty decode B=16 Bielika (in32/out256) daje
+  **12,2 ms TPOT / 1253 tok/s** — poziom vLLM; cała pozostała luka przy p1024
+  (628 vs 906 tok/s, TPOT 22,4 vs 12) to interferencja chunków prefillu.
+  Skan chunka przy C=16: 256 → 499 tok/s, 512 → 606, **1024 → 628** (mniejsze
+  chunki wydłużają łączny czas prefillu bardziej niż zyskują na częstszych
+  krokach decode); default serve podbity do 1024.
+  Plan mixed forward (dense, non-hybrid, GPU-sampled): jeden forward nad
+  [B_decode + T_chunk] tokenach — wiersze decode doklejone PRZED wierszami
+  chunka do buforów prefillu; wspólne norm/GEMM/SwiGLU po całym T_total;
+  rope dwoma launchami (pozycje per-seq dla wierszy decode, sekwencyjne dla
+  chunka); attention rozdzielone: `attn_decode_f16` (n_seqs=B) na wierszach
+  0..B i prefill-attention na B..B+T; KV append per-row (decode: po 1 tokenie
+  do własnych sekwencji, chunk: T do swojej); logity B wierszy decode + (final
+  chunk) ostatni wiersz chunka przez `logits_gemm` (per-lane fallback już
+  obsługuje Q4_K/Q6_K); sampling `sample_batched_argmax/topk`. Scheduler:
+  gdy jest żywy decode i pending prefill → `mixed_step` zamiast pary
+  (batch_gpu_decode + advance). Grafy: krok mieszany bez grafu (chunk jest
+  compute-bound, narzut launchy amortyzowany), czysty decode zachowuje
+  dotychczasowe grafy bucketowe. Oczekiwany efekt: TPOT przy prefill w locie
+  ~12-14 ms, out C=16 ~850-900 tok/s.
 - ✅ **Batched dense prefill dla głów Q4_K/Q6_K + polityka cold-burst
   (2026-07-24).** `DensePrefillLogitsKind` dostał warianty Q4K/Q6K (głowa
   batch prefillu idzie przez istniejący per-lane dp4a sweep w `logits_gemm`),

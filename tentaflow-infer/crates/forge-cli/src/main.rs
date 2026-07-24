@@ -79,9 +79,10 @@ enum Command {
         #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
         batch_min: Option<u16>,
         /// Prompt tokens one sequence may prefill per scheduler iteration
-        /// (larger = better TTFT, smaller = better decode ITL of the other
-        /// active sequences during a long prefill).
-        #[arg(long, default_value_t = 512)]
+        /// (larger = better TTFT and throughput, smaller = better decode ITL
+        /// of the other active sequences during a long prefill; measured C=16
+        /// p1024 sweet spot is 1024 — 628 tok/s vs 606 @512 and 499 @256).
+        #[arg(long, default_value_t = 1024)]
         prefill_chunk: usize,
         /// KV cache pages (32 tokens each) shared by all sequences. Raised to
         /// at least one full `--ctx` window if smaller.
