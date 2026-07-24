@@ -12,6 +12,25 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-24.
 
+- ✅ **Profil kroku decode: Bielik B=32 i Qwen 27B C=8 (2026-07-24).** Pełny
+  raport w `docs/PROFILE_DECODE_2026-07-24.md`. GPU jest zajęte 96% (Bielik)
+  i 91% (Qwen) okna pomiarowego, więc narzut launchy i luki między kernelami
+  NIE są problemem — liczy się sama treść kerneli. Pułapka narzędziowa:
+  bez `nsys --cuda-graph-trace=node` kernele z grafu CUDA nie pojawiają się
+  w raporcie i profil wygląda, jakby BM32 w ogóle nie działało.
+  Bielik, 10,0 ms kroku decode: projekcje BM32 6,59 ms (585-661 GB/s),
+  attention 2,06 ms (776 GB/s), rmsnorm 0,59 ms, głowa logitów F16 0,56 ms
+  (465 GB/s, 262 MB na krok — paczka FP8 `lm_head` istnieje, ale używa jej
+  tylko prefill), sampling 0,10 ms. Projekcje są wolniejsze od attention na tym
+  samym GPU, bo kafel BM32 zjada 39 936 B shared → 2 bloki/SM × 128 wątków =
+  ~17% occupancy; podniesienie ich do poziomu attention to ~1,3 ms/krok.
+  Qwen 27B: 519 kroków dało ~1040 tokenów, czyli **2 tokeny na krok mimo ośmiu
+  aktywnych sekwencji** — `record_hybrid_batch_forward` odrzuca każde `n != 2`,
+  więc ścieżka hybrydowa ma architektoniczny sufit B=2. Skalowanie
+  współbieżności praktycznie nie istnieje (~40 tok/s przy C=1 → 51 tok/s przy
+  C=8), a `gemv_q8_0_dp4a` startuje 385 razy na krok (projekcje DeltaNet
+  jednowierszowym GEMV). Strojenie kerneli nie ruszy tego modelu, dopóki
+  sufit B=2 stoi.
 - ✅ **Kernele BM32 NVFP4-CT: batchowy decode 17..32 (2026-07-24).** Batche
   B=17..32 spadały z wyspecjalizowanych kafli na generyczny dequant-GEMM
   (TPOT 58 ms, 533 tok/s decode-only przy B=32). Moduł
