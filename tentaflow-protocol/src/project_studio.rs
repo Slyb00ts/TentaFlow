@@ -172,6 +172,14 @@ pub struct OverviewKpis {
     pub defects_open: u32,
     #[serde(default)]
     pub generations_running: u32,
+    // F3 counters appended with #[serde(default)] for the same reason:
+    // frames produced by F2 peers omit them and must still decode.
+    #[serde(default)]
+    pub environments_approved: u32,
+    #[serde(default)]
+    pub environments_pending: u32,
+    #[serde(default)]
+    pub auto_runs_open: u32,
 }
 
 /// One activity-log entry for the project feed.
@@ -348,9 +356,9 @@ pub struct TestRunInfo {
     pub name: String,
     pub suite_id: String,
     pub suite_name: String,
-    /// 'manual' (automated run types arrive in later phases).
+    /// 'manual' | 'auto' | 'perf'.
     pub run_type: String,
-    /// Reserved for environments (F3+); always '' in F2.
+    /// Environment the run targets ('' for manual runs without one).
     pub environment_id: String,
     pub env_note: String,
     /// 'single' | 'per_case' | 'pool'.
@@ -368,6 +376,20 @@ pub struct TestRunInfo {
     pub created_by_name: String,
     pub started_at: String,
     pub finished_at: Option<String>,
+    // F3 fields appended with #[serde(default)] so frames produced by F2
+    // peers (which omit them) still decode — struct fields are append-only
+    // on the wire, same as enum variants.
+    #[serde(default)]
+    pub environment_name: String,
+    /// Runner service that executed the run ('' for manual runs).
+    #[serde(default)]
+    pub runner_service_id: String,
+    /// Items that ended in an execution error (automated runs only).
+    #[serde(default)]
+    pub errored: u32,
+    /// Aggregated perf summary JSON, present only for finished perf runs.
+    #[serde(default)]
+    pub perf_summary_json: Option<String>,
 }
 
 /// Per-case assignment sent by the client for 'per_case' runs.
@@ -513,6 +535,142 @@ pub struct NotificationWire {
     pub link_json: String,
     pub read_at: Option<String>,
     pub created_at: String,
+}
+
+/// Test environment (F3). `has_secret` only signals that an encrypted secret
+/// is stored — the secret itself NEVER travels on the wire after save (the
+/// save request carries it input-only, reads return this flag instead).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentInfo {
+    pub environment_id: String,
+    pub name: String,
+    /// 'web' | 'api'.
+    pub env_type: String,
+    pub base_url: String,
+    /// 'none' | 'bearer' | 'api_key' | 'basic'.
+    pub auth_type: String,
+    pub has_secret: bool,
+    /// JSON object of extra request headers sent by the runner.
+    pub extra_headers_json: String,
+    /// Extra hosts the sandboxed run may reach besides `base_url`'s host.
+    pub host_allowlist: Vec<String>,
+    /// 'pending' | 'approved' | 'rejected' — private-address environments
+    /// start 'pending' and need an explicit admin decision (reverse of the
+    /// public-web SSRF guard: LAN targets require a human in the loop).
+    pub approval_status: String,
+    pub approval_reason: String,
+    pub is_private_address: bool,
+    pub requested_by: String,
+    pub requested_by_name: String,
+    pub decided_by: String,
+    pub decided_by_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub decided_at: Option<String>,
+}
+
+/// One row of the admin "environments awaiting approval" queue. Cross-project
+/// on purpose: admins decide without opening each project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvApprovalItem {
+    pub project_id: String,
+    pub project_name: String,
+    pub environment: EnvironmentInfo,
+    /// Requester's justification for a private-address environment.
+    pub justification: String,
+}
+
+/// Build/test recipe for a code source (git/zip), one per source. Unit-test
+/// runs execute `install_cmd` + `test_cmd` inside the sandbox.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildProfileWire {
+    pub profile_id: String,
+    pub source_id: String,
+    /// 'python' | 'node' | 'dotnet' | 'jvm' | 'rust' | 'go'.
+    pub toolchain: String,
+    pub base_image: String,
+    pub install_cmd: String,
+    pub test_cmd: String,
+    pub workdir: String,
+    /// '' = user-authored, otherwise the agent that proposed the profile.
+    pub proposed_by: String,
+}
+
+/// One toolchain advertised by a test-runner service (`GET /health`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerToolchain {
+    pub language: String,
+    pub frameworks: Vec<String>,
+    pub version: String,
+}
+
+/// Discovered test-runner service with its advertised capabilities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerInfo {
+    pub service_id: String,
+    pub engine_id: String,
+    pub display_name: String,
+    pub endpoint_url: String,
+    pub status: String,
+    pub toolchains: Vec<RunnerToolchain>,
+}
+
+/// Reference to a stored run artifact; bytes download via
+/// `RunArtifactGetRequest` (dashboard is binary-protocol only, no signed URL).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub artifact_id: String,
+    pub name: String,
+    /// 'log' | 'screenshot' | 'trace' | 'junit' | 'perf_stats' | 'har' | 'other'.
+    pub kind: String,
+    pub size_bytes: u64,
+    pub mime: String,
+    pub download_ref: String,
+}
+
+/// One item of an automated run. Unlike manual `RunItemWire` there is no
+/// assignee/steps snapshot — the runner executes the case content directly
+/// and reports duration, message and produced artifacts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestRunItemAutoWire {
+    pub item_id: String,
+    pub case_id: String,
+    pub case_title: String,
+    pub kind: String,
+    pub language: String,
+    pub position: u32,
+    /// 'pending' | 'running' | 'passed' | 'failed' | 'blocked' | 'skipped' | 'error'.
+    pub status: String,
+    pub duration_ms: u64,
+    pub message: String,
+    pub artifact_refs: Vec<ArtifactRef>,
+    pub steps_total: u32,
+    pub steps_done: u32,
+}
+
+/// Per-endpoint aggregate of a perf run (Locust-style stats table row).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerfStatsWire {
+    pub endpoint: String,
+    pub requests: u64,
+    pub failures: u64,
+    pub rps: f64,
+    pub p50_ms: f64,
+    pub p90_ms: f64,
+    pub p99_ms: f64,
+    pub avg_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+}
+
+/// One sample of the perf-run timeline chart (sampled by the runner).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerfTimelinePoint {
+    pub ts_s: u64,
+    pub rps: f64,
+    pub p90_ms: f64,
+    pub failures: u64,
+    pub users: u32,
 }
 
 /// Project Studio message family (request + response + stream). ciborium
@@ -1370,11 +1528,280 @@ pub enum ProjectStudioPayload {
     ReportQueryResponse {
         rows_json: String,
     },
+    // ---- F3: test environments (T12) ----
+    EnvironmentsListRequest {
+        project_id: String,
+    },
+    EnvironmentsListResponse {
+        environments: Vec<EnvironmentInfo>,
+    },
+    /// `environment_id: None` = create. `secret` is INPUT-ONLY: `None` keeps
+    /// the stored secret, `Some("")` clears it, `Some(v)` replaces it — reads
+    /// only ever expose `has_secret`. A public `base_url` is auto-approved,
+    /// a private/LAN one goes 'pending' until an admin decides; changing the
+    /// address class resets the approval.
+    EnvironmentSaveRequest {
+        project_id: String,
+        #[serde(default)]
+        environment_id: Option<String>,
+        name: String,
+        env_type: String,
+        base_url: String,
+        auth_type: String,
+        #[serde(default)]
+        secret: Option<String>,
+        #[serde(default)]
+        extra_headers_json: String,
+        #[serde(default)]
+        host_allowlist: Vec<String>,
+        #[serde(default)]
+        justification: String,
+    },
+    EnvironmentSaveResponse {
+        environment_id: String,
+        approval_status: String,
+    },
+    EnvironmentDeleteRequest {
+        project_id: String,
+        environment_id: String,
+    },
+    EnvironmentDeleteResult {
+        ok: bool,
+    },
+    /// Admin-only, cross-project: every environment awaiting approval.
+    EnvApprovalsListRequest,
+    EnvApprovalsListResponse {
+        items: Vec<EnvApprovalItem>,
+    },
+    /// Rejection requires a non-empty `reason`.
+    EnvApprovalDecideRequest {
+        project_id: String,
+        environment_id: String,
+        approve: bool,
+        #[serde(default)]
+        reason: String,
+    },
+    EnvApprovalDecideResult {
+        ok: bool,
+    },
+    // ---- F3: build profiles (unit tests over git/zip sources) ----
+    BuildProfileGetRequest {
+        project_id: String,
+        source_id: String,
+    },
+    BuildProfileGetResponse {
+        profile: Option<BuildProfileWire>,
+    },
+    /// Upserts the single profile of a source (source_id is UNIQUE).
+    BuildProfileSaveRequest {
+        project_id: String,
+        source_id: String,
+        toolchain: String,
+        #[serde(default)]
+        base_image: String,
+        #[serde(default)]
+        install_cmd: String,
+        test_cmd: String,
+        #[serde(default)]
+        workdir: String,
+    },
+    BuildProfileSaveResponse {
+        profile_id: String,
+    },
+    // ---- F3: runner discovery ----
+    RunnersListRequest {
+        project_id: String,
+    },
+    RunnersListResponse {
+        runners: Vec<RunnerInfo>,
+    },
+    // ---- F3: automated runs (T10, T11) ----
+    /// Exactly ONE of `suite_id` / `case_ids` / `from_run_id` selects the
+    /// case source (same contract as RunCreateRequest). `environment_id`
+    /// MUST reference an approved environment; empty `runner_service_id`
+    /// lets the server match a runner by toolchain.
+    RunStartAutoRequest {
+        project_id: String,
+        name: String,
+        #[serde(default)]
+        suite_id: String,
+        #[serde(default)]
+        case_ids: Vec<String>,
+        #[serde(default)]
+        from_run_id: String,
+        environment_id: String,
+        #[serde(default)]
+        runner_service_id: String,
+        #[serde(default)]
+        perf_profile_json: String,
+    },
+    RunStartAutoResponse {
+        run_id: String,
+        run_no: u32,
+    },
+    /// Polling this every 2-4 s is the source of truth for automated-run
+    /// progress; RunAutoStream is only a live view.
+    RunAutoGetRequest {
+        project_id: String,
+        run_id: String,
+    },
+    RunAutoGetResponse {
+        run: TestRunInfo,
+        items: Vec<TestRunItemAutoWire>,
+        perf_stats: Vec<PerfStatsWire>,
+        perf_timeline: Vec<PerfTimelinePoint>,
+    },
+    RunAutoCancelRequest {
+        project_id: String,
+        run_id: String,
+    },
+    RunAutoCancelResult {
+        ok: bool,
+    },
+    // ---- F3: try-run (T03 "Uruchom próbnie") ----
+    /// Stream-initiating request (no plain response): the server executes the
+    /// case ephemerally — nothing is persisted as a run — and streams
+    /// TryRunStreamChunk/End back on the same subscription. `try_id` is
+    /// client-minted (like upload_id) so TryRunCancelRequest can address the
+    /// execution without a response round-trip.
+    TryRunStartRequest {
+        project_id: String,
+        try_id: String,
+        case_id: String,
+        environment_id: String,
+        /// Unsaved editor content; '' = run the saved case content.
+        #[serde(default)]
+        content_json_override: String,
+        #[serde(default)]
+        language: String,
+        #[serde(default)]
+        perf_profile_json: String,
+    },
+    TryRunCancelRequest {
+        project_id: String,
+        try_id: String,
+    },
+    TryRunCancelResult {
+        ok: bool,
+    },
+    // ---- F3: git/zip/api_spec source operations (W01, W02) ----
+    /// Git sources only: fetch + delta re-index of changed files.
+    SourceRefreshRequest {
+        project_id: String,
+        source_id: String,
+    },
+    SourceRefreshResponse {
+        job_id: String,
+    },
+    /// Parsed endpoint list of an api_spec source (JSON array).
+    ApiSpecEndpointsRequest {
+        project_id: String,
+        source_id: String,
+    },
+    ApiSpecEndpointsResponse {
+        endpoints_json: String,
+    },
+    /// Sets/clears the access token of a git source. INPUT-ONLY like the
+    /// environment secret: `None` clears, reads never return it.
+    SourceSecretSetRequest {
+        project_id: String,
+        source_id: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    SourceSecretSetResult {
+        ok: bool,
+    },
+    // ---- F3: run artifacts ----
+    /// Artifact download by id (server clamps `max_bytes` to 32 MiB). No
+    /// signed URLs on purpose — the dashboard talks binary protocol only.
+    RunArtifactGetRequest {
+        project_id: String,
+        artifact_id: String,
+        max_bytes: u32,
+    },
+    RunArtifactGetResponse {
+        /// Raw artifact bytes. `serde_bytes` forces a CBOR byte-string
+        /// (length-prefixed) — a bare `Vec<u8>` would encode as an
+        /// array-of-integers (~2x the size), unacceptable for downloads.
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+        mime: String,
+        truncated: bool,
+    },
+    // ---- F3: streaming (dispatch/stream_handlers.rs) ----
+    RunAutoStreamRequest {
+        project_id: String,
+        run_id: String,
+    },
+    RunAutoStreamChunk {
+        run_id: String,
+        /// "log" | "item" | "phase" | "perf" | "artifact".
+        kind: String,
+        #[serde(default)]
+        line: String,
+        #[serde(default)]
+        phase: String,
+        /// Incremental item snapshot (kind "item").
+        #[serde(default)]
+        item: Option<TestRunItemAutoWire>,
+        /// Perf summary/timeline delta as JSON (kind "perf").
+        #[serde(default)]
+        perf_json: String,
+        /// Newly produced artifact (kind "artifact").
+        #[serde(default)]
+        artifact: Option<ArtifactRef>,
+        ts_ms: i64,
+    },
+    RunAutoStreamEnd {
+        run_id: String,
+        status: String,
+        error: Option<String>,
+    },
+    TryRunStreamChunk {
+        try_id: String,
+        /// "log" | "phase" | "status".
+        kind: String,
+        #[serde(default)]
+        line: String,
+        #[serde(default)]
+        phase: String,
+        ts_ms: i64,
+    },
+    TryRunStreamEnd {
+        try_id: String,
+        status: String,
+        error: Option<String>,
+        /// Parsed junit result summary (JSON) when the runner produced one.
+        #[serde(default)]
+        junit_summary_json: String,
+    },
+    // ---- F3: code assist (T03, tf-code-editor) ----
+    /// Stream-initiating request routed through the project's
+    /// `generator_<kind>` agent (AiGateway audit + RAG context) — never a raw
+    /// chat completion. Tokens stream via CodeAssistStreamChunk; the final
+    /// proposal arrives whole in CodeAssistStreamEnd for the diff view.
+    CodeAssistRequest {
+        project_id: String,
+        case_id: String,
+        kind: String,
+        /// Selected editor fragment ('' = whole script).
+        #[serde(default)]
+        selection: String,
+        instruction: String,
+        full_content: String,
+    },
+    CodeAssistStreamChunk {
+        token: String,
+    },
+    CodeAssistStreamEnd {
+        proposal: String,
+        error: Option<String>,
+    },
     // ================================================================
-    // Append-only past this point (F3+: environments, coded cases,
-    // automated runs, schedules). Never insert above: reordering existing
-    // variants breaks the wire contract with older peers, so new variants
-    // go strictly at the end.
+    // Append-only past this point (F4+: schedules, kanban, exports).
+    // Never insert above: reordering existing variants breaks the wire
+    // contract with older peers, so new variants go strictly at the end.
     // ================================================================
 }
 
@@ -1538,6 +1965,70 @@ mod tests {
                 "a17352756e4974656d436c61696d52657175657374a36a70726f6a6563745f69646270316672756e5f6964627231676974656d5f6964f6"
             ),
             "RunItemClaimRequest wire drift"
+        );
+
+        // F3: EnvironmentsListRequest — pins the first appended F3 variant.
+        let envs = ProjectStudioPayload::EnvironmentsListRequest {
+            project_id: "p1".to_string(),
+        };
+        let bytes = crate::cbor::encode(&envs).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes("a177456e7669726f6e6d656e74734c69737452657175657374a16a70726f6a6563745f6964627031"),
+            "EnvironmentsListRequest wire drift"
+        );
+
+        // F3: RunStartAutoRequest — full field set (XOR case selectors with
+        // defaults, environment + optional runner + perf profile).
+        let auto = ProjectStudioPayload::RunStartAutoRequest {
+            project_id: "p1".to_string(),
+            name: "smoke".to_string(),
+            suite_id: "s1".to_string(),
+            case_ids: vec![],
+            from_run_id: String::new(),
+            environment_id: "e1".to_string(),
+            runner_service_id: String::new(),
+            perf_profile_json: String::new(),
+        };
+        let bytes = crate::cbor::encode(&auto).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17352756e53746172744175746f52657175657374a86a70726f6a6563745f6964627031646e616d6565736d6f6b656873756974655f696462733168636173655f696473806b66726f6d5f72756e5f6964606e656e7669726f6e6d656e745f69646265317172756e6e65725f736572766963655f69646071706572665f70726f66696c655f6a736f6e60"
+            ),
+            "RunStartAutoRequest wire drift"
+        );
+
+        // F3: TryRunStreamChunk — pins the try-run live-log chunk shape.
+        let try_chunk = ProjectStudioPayload::TryRunStreamChunk {
+            try_id: "t1".to_string(),
+            kind: "log".to_string(),
+            line: "x".to_string(),
+            phase: String::new(),
+            ts_ms: 0,
+        };
+        let bytes = crate::cbor::encode(&try_chunk).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17154727952756e53747265616d4368756e6ba5667472795f6964627431646b696e64636c6f67646c696e656178657068617365606574735f6d7300"
+            ),
+            "TryRunStreamChunk wire drift"
+        );
+
+        // F3: RunArtifactGetRequest — pins the binary artifact download path.
+        let art = ProjectStudioPayload::RunArtifactGetRequest {
+            project_id: "p1".to_string(),
+            artifact_id: "a1".to_string(),
+            max_bytes: 1024,
+        };
+        let bytes = crate::cbor::encode(&art).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17552756e417274696661637447657452657175657374a36a70726f6a6563745f69646270316b61727469666163745f6964626131696d61785f6279746573190400"
+            ),
+            "RunArtifactGetRequest wire drift"
         );
     }
 

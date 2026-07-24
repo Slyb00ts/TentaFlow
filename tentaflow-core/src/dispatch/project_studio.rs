@@ -865,6 +865,13 @@ pub async fn project_studio_dispatch(
         | P::ReportQueryResponse { .. } => Err(ProtocolError::bad_request(
             "variant is not a valid project studio request",
         )),
+        // Warianty F3 (środowiska, auto-runy, try-run, code assist) są już na
+        // wire, ale ich handlery przychodzą razem z backendem F3 — to
+        // tymczasowe ramię utrzymuje kompilację exhaustive matcha do tego
+        // czasu. Backend F3 usuwa je i wpina realny routing.
+        _ => Err(ProtocolError::bad_request(
+            "project studio variant not handled yet",
+        )),
     }
 }
 
@@ -2619,6 +2626,12 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
             tasks_open: f2.tasks_open,
             defects_open: f2.defects_open,
             generations_running: f2.generations_running,
+            // Liczniki F3 zaczną być zliczane razem z backendem F3
+            // (environments/auto_run_meta jeszcze nie mają repozytorium);
+            // 0 = brak danych, zgodne z serde(default) na wire.
+            environments_approved: 0,
+            environments_pending: 0,
+            auto_runs_open: 0,
         },
         activity: activity_to_wire(entries, &names),
     }))
@@ -3116,6 +3129,12 @@ fn run_to_wire(
         created_by: record.created_by,
         started_at: record.started_at,
         finished_at: record.finished_at,
+        // Pola F3 wypełni backend F3 (auto_run_meta + resolve nazwy
+        // środowiska); do tego czasu wartości puste = run manualny.
+        environment_name: String::new(),
+        runner_service_id: String::new(),
+        errored: 0,
+        perf_summary_json: None,
     }
 }
 

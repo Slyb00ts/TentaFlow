@@ -262,8 +262,12 @@ fn run_project_migrations(conn: &Connection) -> Result<i64> {
     Ok(latest)
 }
 
-/// Ordered per-project schema migrations (F3+ tables land as further entries).
-const MIGRATIONS_PROJECT: &[(i64, &str)] = &[(1, PROJECT_SCHEMA_V1), (2, PROJECT_SCHEMA_V2)];
+/// Ordered per-project schema migrations (F4+ tables land as further entries).
+const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
+    (1, PROJECT_SCHEMA_V1),
+    (2, PROJECT_SCHEMA_V2),
+    (3, PROJECT_SCHEMA_V3),
+];
 
 const PROJECT_SCHEMA_V1: &str = "
 CREATE TABLE sources (
@@ -466,6 +470,131 @@ CREATE TABLE generation_run_sources (
 CREATE INDEX idx_generation_run_sources_gen ON generation_run_sources(gen_id);
 ";
 
+/// F3: test environments (admin-gated for private addresses), build profiles
+/// for unit-test sources, automated-run metadata (runner binding + watchdog +
+/// perf aggregates), run artifacts and the git-source access token.
+///
+/// test_runs / test_run_items are REBUILT (SQLite cannot alter a CHECK
+/// constraint) via the documented 12-step procedure: create the new table
+/// with the extended status CHECK, copy every row with an explicit column
+/// list, drop the old table, rename, recreate the indexes. The v2 schema has
+/// no FOREIGN KEY constraints, so no foreign_keys toggling is needed and the
+/// whole rebuild stays inside the migration transaction. `run_no INTEGER
+/// UNIQUE` and `UNIQUE(run_id, case_id)` are declared again in the new DDL,
+/// so their implicit indexes survive the rebuild too.
+const PROJECT_SCHEMA_V3: &str = "
+CREATE TABLE environments (
+    environment_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    env_type TEXT NOT NULL DEFAULT 'web' CHECK(env_type IN ('web','api')),
+    base_url TEXT NOT NULL,
+    auth_type TEXT NOT NULL DEFAULT 'none' CHECK(auth_type IN ('none','bearer','api_key','basic')),
+    secret_enc TEXT NOT NULL DEFAULT '',
+    extra_headers_json TEXT NOT NULL DEFAULT '{}',
+    host_allowlist_json TEXT NOT NULL DEFAULT '[]',
+    approval_status TEXT NOT NULL DEFAULT 'pending' CHECK(approval_status IN ('pending','approved','rejected')),
+    approval_reason TEXT NOT NULL DEFAULT '',
+    is_private_address INTEGER NOT NULL DEFAULT 0,
+    justification TEXT NOT NULL DEFAULT '',
+    requested_by TEXT NOT NULL,
+    decided_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    decided_at TEXT
+);
+CREATE INDEX idx_environments_status ON environments(approval_status);
+CREATE TABLE build_profiles (
+    profile_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL UNIQUE,
+    toolchain TEXT NOT NULL CHECK(toolchain IN ('python','node','dotnet','jvm','rust','go')),
+    base_image TEXT NOT NULL DEFAULT '',
+    install_cmd TEXT NOT NULL DEFAULT '',
+    test_cmd TEXT NOT NULL DEFAULT '',
+    workdir TEXT NOT NULL DEFAULT '',
+    proposed_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE auto_run_meta (
+    run_id TEXT PRIMARY KEY,
+    environment_id TEXT NOT NULL DEFAULT '',
+    runner_service_id TEXT NOT NULL DEFAULT '',
+    runner_endpoint TEXT NOT NULL DEFAULT '',
+    runner_job_id TEXT NOT NULL DEFAULT '',
+    perf_profile_json TEXT NOT NULL DEFAULT '{}',
+    perf_summary_json TEXT NOT NULL DEFAULT '{}',
+    perf_timeline_json TEXT NOT NULL DEFAULT '[]',
+    last_poll_at TEXT NOT NULL DEFAULT '',
+    failed_polls INTEGER NOT NULL DEFAULT 0,
+    watchdog_deadline_ms INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE run_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    item_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'other' CHECK(kind IN ('log','screenshot','trace','junit','perf_stats','har','other')),
+    rel_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    mime TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_run_artifacts_run ON run_artifacts(run_id);
+CREATE INDEX idx_run_artifacts_item ON run_artifacts(item_id);
+ALTER TABLE sources ADD COLUMN secret_enc TEXT NOT NULL DEFAULT '';
+CREATE TABLE test_runs_v3 (
+    run_id TEXT PRIMARY KEY,
+    run_no INTEGER NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    suite_id TEXT NOT NULL DEFAULT '',
+    run_type TEXT NOT NULL DEFAULT 'manual',
+    environment_id TEXT NOT NULL DEFAULT '',
+    env_note TEXT NOT NULL DEFAULT '',
+    assignment_mode TEXT NOT NULL CHECK(assignment_mode IN ('single','per_case','pool')),
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','cancelled','error')),
+    closed_by TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT
+);
+INSERT INTO test_runs_v3 (run_id, run_no, name, suite_id, run_type, environment_id,
+    env_note, assignment_mode, status, closed_by, created_by, started_at, finished_at)
+SELECT run_id, run_no, name, suite_id, run_type, environment_id,
+    env_note, assignment_mode, status, closed_by, created_by, started_at, finished_at
+FROM test_runs;
+DROP TABLE test_runs;
+ALTER TABLE test_runs_v3 RENAME TO test_runs;
+CREATE TABLE test_run_items_v3 (
+    item_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    case_title TEXT NOT NULL,
+    case_version INTEGER NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    assigned_to TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','in_progress','passed','failed','blocked','skipped','running','error')),
+    result_note TEXT NOT NULL DEFAULT '',
+    tester_config TEXT NOT NULL DEFAULT '',
+    duration_secs INTEGER NOT NULL DEFAULT 0,
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    claimed_at TEXT,
+    finished_at TEXT,
+    UNIQUE(run_id, case_id)
+);
+INSERT INTO test_run_items_v3 (item_id, run_id, case_id, case_title, case_version,
+    position, assigned_to, status, result_note, tester_config, duration_secs,
+    attachments_json, claimed_at, finished_at)
+SELECT item_id, run_id, case_id, case_title, case_version,
+    position, assigned_to, status, result_note, tester_config, duration_secs,
+    attachments_json, claimed_at, finished_at
+FROM test_run_items;
+DROP TABLE test_run_items;
+ALTER TABLE test_run_items_v3 RENAME TO test_run_items;
+CREATE INDEX idx_run_items_run ON test_run_items(run_id, position);
+CREATE INDEX idx_run_items_assignee ON test_run_items(assigned_to, status);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +650,179 @@ mod tests {
             )
             .expect("version row");
         assert_eq!(applied, 1, "migration recorded exactly once");
+    }
+
+    /// Golden round-trip for the v3 12-step rebuild: a genuine v2 database
+    /// with a run + items in every legacy status must migrate to v3 with all
+    /// rows intact, the extended status CHECKs accepting the new
+    /// 'error'/'running' values, the UNIQUE constraints and indexes
+    /// recreated, and the new F3 tables/columns present.
+    #[test]
+    fn migration_v3_rebuilds_run_tables_preserving_data() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&dir).expect("create project dir");
+
+        // Build a real v2 database the same way run_project_migrations does,
+        // stopping after migration 2, then seed data that must survive.
+        {
+            let conn = Connection::open(dir.join("project.db")).expect("open v2");
+            conn.execute_batch(
+                "CREATE TABLE project_schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+            )
+            .expect("version table");
+            for (version, sql) in &MIGRATIONS_PROJECT[..2] {
+                assert!(*version <= 2, "test must seed a v2 database");
+                conn.execute_batch(sql).expect("apply v1/v2");
+                conn.execute(
+                    "INSERT INTO project_schema_version (version) VALUES (?1)",
+                    rusqlite::params![version],
+                )
+                .expect("record version");
+            }
+            conn.execute(
+                "INSERT INTO sources (source_id, kind, name, created_by) \
+                 VALUES ('s1', 'git', 'repo', 'u1')",
+                [],
+            )
+            .expect("insert source");
+            conn.execute(
+                "INSERT INTO test_runs (run_id, run_no, name, suite_id, assignment_mode, \
+                 status, created_by) \
+                 VALUES ('r1', 1, 'regression', 's1', 'pool', 'completed', 'u1')",
+                [],
+            )
+            .expect("insert run");
+            for (id, status) in [
+                ("i1", "pending"),
+                ("i2", "in_progress"),
+                ("i3", "passed"),
+                ("i4", "failed"),
+                ("i5", "blocked"),
+                ("i6", "skipped"),
+            ] {
+                conn.execute(
+                    "INSERT INTO test_run_items (item_id, run_id, case_id, case_title, \
+                     case_version, position, status, result_note) \
+                     VALUES (?1, 'r1', 'c-' || ?1, 'title', 2, 7, ?2, 'note')",
+                    rusqlite::params![id, status],
+                )
+                .expect("insert item");
+            }
+        }
+
+        let (pool, version) = open_pool_at(&dir).expect("migrate to v3");
+        assert_eq!(version, 3);
+        let conn = pool.write().expect("write");
+
+        // Every pre-rebuild row survived with its values intact.
+        let (name, status, run_type): (String, String, String) = conn
+            .query_row(
+                "SELECT name, status, run_type FROM test_runs WHERE run_id = 'r1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("run row");
+        assert_eq!(name, "regression");
+        assert_eq!(status, "completed");
+        assert_eq!(run_type, "manual");
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test_run_items", [], |r| r.get(0))
+            .expect("item count");
+        assert_eq!(items, 6);
+        let (i4_status, i4_note, i4_version): (String, String, i64) = conn
+            .query_row(
+                "SELECT status, result_note, case_version FROM test_run_items \
+                 WHERE item_id = 'i4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("item row");
+        assert_eq!(i4_status, "failed");
+        assert_eq!(i4_note, "note");
+        assert_eq!(i4_version, 2);
+
+        // The extended CHECKs accept the new automated-run statuses…
+        conn.execute(
+            "INSERT INTO test_runs (run_id, run_no, name, assignment_mode, status, created_by) \
+             VALUES ('r2', 2, 'auto', 'pool', 'error', 'u1')",
+            [],
+        )
+        .expect("run status 'error' accepted");
+        for (id, status) in [("a1", "running"), ("a2", "error")] {
+            conn.execute(
+                "INSERT INTO test_run_items (item_id, run_id, case_id, case_title, \
+                 case_version, status) VALUES (?1, 'r2', 'c-' || ?1, 't', 1, ?2)",
+                rusqlite::params![id, status],
+            )
+            .expect("item status accepted");
+        }
+        // …while junk statuses are still rejected.
+        assert!(conn
+            .execute(
+                "INSERT INTO test_runs (run_id, run_no, name, assignment_mode, status, \
+                 created_by) VALUES ('r3', 3, 'x', 'pool', 'bogus', 'u1')",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO test_run_items (item_id, run_id, case_id, case_title, \
+                 case_version, status) VALUES ('a3', 'r2', 'c-a3', 't', 1, 'bogus')",
+                [],
+            )
+            .is_err());
+
+        // UNIQUE constraints survived the rebuild.
+        assert!(conn
+            .execute(
+                "INSERT INTO test_runs (run_id, run_no, name, assignment_mode, created_by) \
+                 VALUES ('r4', 1, 'dup-no', 'pool', 'u1')",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO test_run_items (item_id, run_id, case_id, case_title, \
+                 case_version) VALUES ('a4', 'r1', 'c-i1', 't', 1)",
+                [],
+            )
+            .is_err());
+
+        // Explicit indexes were recreated after the drop+rename.
+        for idx in ["idx_run_items_run", "idx_run_items_assignee"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    rusqlite::params![idx],
+                    |r| r.get(0),
+                )
+                .expect("index lookup");
+            assert_eq!(n, 1, "index {idx} missing after rebuild");
+        }
+
+        // New F3 tables exist and sources gained secret_enc.
+        for table in [
+            "environments",
+            "build_profiles",
+            "auto_run_meta",
+            "run_artifacts",
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("new table queryable");
+            assert_eq!(n, 0);
+        }
+        let secret: String = conn
+            .query_row(
+                "SELECT secret_enc FROM sources WHERE source_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("secret_enc column");
+        assert_eq!(secret, "");
     }
 }
