@@ -84,9 +84,6 @@ Pełna strona, zakładka „Zadania". Przełącznik `.segmented` (Lista/Tablica)
 ## Z02 — z02-zadanie.html — OKNO: Zadanie / usterka
 Bazowy = Z01. OKNO `.window` (szersze). Head „Usterka #DEF-042". Body: typ (task/defect toggle), tytuł, opis MD, severity, priorytet, przypisany (picker), termin, powiązania (chipy: przypadek, przebieg, dokument), załączniki, sekcja komentarzy (lista + dodaj, edycja własnego). Pokaż prefill z pulpitu testera („utworzono z kroku 2 przebiegu #241"). Foot: Usuń / Zapisz.
 
-## X01 — x01-artefakty.html — Artefakty
-Pełna strona, zakładka „Artefakty". `.search-box` + filtr rodzaju (test_set/document/report/export/generated_code). `.tf-table`: nazwa, rodzaj (chip), rozmiar, pochodzenie (ikona user/agent + link do gen_run), data, menu (Pobierz/Zmień nazwę/Usuń). Klik na artefakt z object_ref → info „nawiguje do encji". Jeden generated_code z podglądem ZIP.
-
 ## X02 — x02-polaczenia-ml.html — Połączenia (ML Studio)
 Pełna strona, zakładka „Połączenia". Sekcja „ML Studio": karta podlinkowanego projektu ML (nazwa, typ, status ostatniego treningu z metrykami, modele, „Otwórz w ML Studio") + „Utwórz projekt ML" (otwiera okno) + „Podłącz istniejący". Sekcja „Dostęp programistyczny": id projektu, przykład bloku `project_knowledge` we flow, lista narzędzi `core.project_*`. Druga sekcja `.screen`: OKNO „Utwórz projekt ML" = nazwa, typ modelu, oraz `role_map` (mapowanie ról projekt→ML: owner→editor itd. w tabelce edytowalnej) + toggle „Synchronizuj uprawnienia". Zaznacz `.hint`: dostęp do ML wynika z ról projektu.
 

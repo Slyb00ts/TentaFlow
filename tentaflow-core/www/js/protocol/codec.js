@@ -1357,18 +1357,6 @@ export const encode = {
   // Services
   // -------------------------------------------------------------------------
 
-  /** MessageBody::ServiceListRequest (unit). */
-  serviceListRequest(correlationId, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceListRequest();
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
   /** MessageBody::ServiceFlagsUpdateRequest { serviceId, pinned?, paused? }
    *  pinned/paused: undefined/null = nie zmieniaj, true/false = ustaw. */
   serviceFlagsUpdateRequest(correlationId, { serviceId, pinned, paused }, sequence = 1) {
