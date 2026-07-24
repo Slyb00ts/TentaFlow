@@ -7134,11 +7134,14 @@ impl Kernels {
     }
 
     /// Logit GEMV over Q4_K weights → f32 logits.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q4_k_out_f32(
         &self,
         y_f32: &DevBuffer,
+        y_off: usize,
         w_q4k: &DevBuffer,
         x: &DevBuffer,
+        x_off: usize,
         rows: usize,
         cols: usize,
         stream: &Stream,
@@ -7155,9 +7158,9 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(y_f32)
+            .buf_at(y_f32, y_off)?
             .buf(w_q4k)
-            .buf(x)
+            .buf_at(x, x_off)?
             .scalar(cols as i64)
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
@@ -8886,11 +8889,14 @@ impl Kernels {
     }
 
     /// Logit GEMV over Q6_K weights → f32 logits.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q6_k_out_f32(
         &self,
         y_f32: &DevBuffer,
+        y_off: usize,
         w_q6k: &DevBuffer,
         x: &DevBuffer,
+        x_off: usize,
         rows: usize,
         cols: usize,
         stream: &Stream,
@@ -8907,9 +8913,9 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(y_f32)
+            .buf_at(y_f32, y_off)?
             .buf(w_q6k)
-            .buf(x)
+            .buf_at(x, x_off)?
             .scalar(cols as i64)
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
@@ -10627,11 +10633,14 @@ impl Kernels {
     }
 
     /// Q4_K logit GEMV (f32 out) with dp4a dots.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q4_k_dp4a_out_f32(
         &self,
         y_f32: &DevBuffer,
+        y_off: usize,
         w_q4k: &DevBuffer,
         x: &DevBuffer,
+        x_off: usize,
         rows: usize,
         cols: usize,
         stream: &Stream,
@@ -10644,9 +10653,9 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(y_f32)
+            .buf_at(y_f32, y_off)?
             .buf(w_q4k)
-            .buf(x)
+            .buf_at(x, x_off)?
             .scalar(cols as i64)
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
@@ -10927,11 +10936,14 @@ impl Kernels {
     }
 
     /// Q6_K logit GEMV (f32 out) with dp4a dots.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q6_k_dp4a_out_f32(
         &self,
         y_f32: &DevBuffer,
+        y_off: usize,
         w_q6k: &DevBuffer,
         x: &DevBuffer,
+        x_off: usize,
         rows: usize,
         cols: usize,
         stream: &Stream,
@@ -10944,9 +10956,9 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(y_f32)
+            .buf_at(y_f32, y_off)?
             .buf(w_q6k)
-            .buf(x)
+            .buf_at(x, x_off)?
             .scalar(cols as i64)
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)

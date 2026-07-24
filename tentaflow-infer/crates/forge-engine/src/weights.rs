@@ -3220,6 +3220,41 @@ impl ModelWeights {
         self.descriptor.params.moe.is_some()
     }
 
+    /// Whether every dense projection has a small-batch decode kernel family
+    /// (NVFP4 B4/B8/B16/BM32 GEMV), so a batched decode step costs roughly one
+    /// weight sweep instead of a fixed >=64-token GEMM tile. Decides the
+    /// batched-path engagement default: 2 with small-batch kernels, else the
+    /// tile cost only amortizes at ~12 concurrent sequences.
+    pub fn small_batch_decode_capable(&self) -> bool {
+        let small = |w: &DevWeight| {
+            matches!(w, DevWeight::NvFp4 { .. } | DevWeight::NvFp4Gguf { .. })
+        };
+        self.layers.iter().all(|layer| {
+            let mixer_ok = match &layer.mixer {
+                LayerMixer::Attention(a) => {
+                    let qkv_ok = match &a.attn_qkv {
+                        QkvWeights::Fused(w) => small(w),
+                        QkvWeights::FusedQk { qk, v } => small(qk) && small(v),
+                        QkvWeights::Split { q, k, v } => small(q) && small(k) && small(v),
+                    };
+                    qkv_ok && small(&a.attn_o)
+                }
+                LayerMixer::DeltaNet(_) => false,
+            };
+            let ffn_ok = match &layer.ffn {
+                LayerFfn::Dense(d) => {
+                    let gu_ok = match &d.gate_up {
+                        GateUpWeights::Fused(w) => small(w),
+                        GateUpWeights::Split { gate, up } => small(gate) && small(up),
+                    };
+                    gu_ok && small(&d.down)
+                }
+                LayerFfn::Moe(_) => false,
+            };
+            mixer_ok && ffn_ok
+        })
+    }
+
     /// Weight-role → tensor-name map used for diagnostics.
     pub fn describe(&self) -> HashMap<String, String> {
         let mut m = HashMap::new();

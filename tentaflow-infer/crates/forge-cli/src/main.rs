@@ -73,10 +73,11 @@ enum Command {
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         max_active: Option<u16>,
         /// Minimum simultaneously-decoding sequences before the batched forward
-        /// path engages (the batched pass wins from 2 concurrent sequences up
-        /// on models with small-batch decode kernels).
-        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(2..))]
-        batch_min: u16,
+        /// path engages. Default: automatic — 2 on models with small-batch
+        /// decode kernels (NVFP4), else 12 (token-tile GEMM formats only
+        /// amortize the flat tile cost at that concurrency).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
+        batch_min: Option<u16>,
         /// Prompt tokens one sequence may prefill per scheduler iteration
         /// (larger = better TTFT, smaller = better decode ITL of the other
         /// active sequences during a long prefill).
@@ -1290,7 +1291,7 @@ fn cmd_serve(
     model_id: Option<String>,
     api_key: Option<String>,
     max_active: Option<u16>,
-    batch_min: u16,
+    batch_min: Option<u16>,
     prefill_chunk: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
@@ -1372,7 +1373,7 @@ fn cmd_serve(
         tokenizer.clone(),
         max_active,
         prefill_chunk,
-        batch_min as usize,
+        batch_min.map(usize::from).unwrap_or(0),
         spec,
     )?;
 

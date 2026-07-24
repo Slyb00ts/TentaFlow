@@ -631,28 +631,30 @@ pub fn spawn_engine(
         tokenizer,
         max_active,
         prefill_chunk,
-        default_batch_min(),
+        0,
         SpeculativeConfig::off(),
     )
 }
 
-/// Default minimum decode concurrency before the batched forward path engages
-/// (env override `FORGE_BATCH_MIN`). Below this many simultaneously-decoding
-/// sequences the scheduler serializes the tuned fused single-seq path (faster
-/// at low concurrency); at/above it the batched pass amortizes its flat
-/// per-step cost across the batch.
-fn default_batch_min() -> usize {
-    // Measured on the RTX 4090 (Bielik-7B-NVFP4, serve p1024/o128, isolated
-    // A/B 2026-07-24): serialized fused decode splits the single-stream rate
-    // across sequences (C=4 → 28.5 ms TPOT, C=8 → 58.3 ms), while the batched
-    // pass with the small-batch decode kernels holds 11-14 ms — it wins from
-    // 2 concurrent sequences up. The old crossover of ~12 predates those
-    // kernels.
+/// Minimum decode concurrency before the batched forward path engages
+/// (env override `FORGE_BATCH_MIN`). Measured on the RTX 4090 (serve
+/// p1024/o128, isolated A/B 2026-07-24): with the NVFP4 small-batch decode
+/// kernels the batched pass wins from 2 concurrent sequences (TPOT 11-14 ms
+/// vs 28-58 ms serialized), while token-tile GEMM formats (Q4_K/Q8_0/f16) pay
+/// a flat >=64-token tile per step that only amortizes at ~12 sequences
+/// (Mistral Q4_K C=4: batched 46 ms vs 26 ms serialized).
+fn default_batch_min_for(model: &Model) -> usize {
     std::env::var("FORGE_BATCH_MIN")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v| v >= 2)
-        .unwrap_or(2)
+        .unwrap_or_else(|| {
+            if model.weights.small_batch_decode_capable() {
+                2
+            } else {
+                12
+            }
+        })
 }
 
 /// `spawn_engine` with an explicit batched-path engagement threshold.
@@ -664,6 +666,14 @@ pub fn spawn_engine_batched(
     batch_min: usize,
     spec: SpeculativeConfig,
 ) -> Result<EngineHandle> {
+    // 0 = auto: model-aware default (see `default_batch_min_for`).
+    let batch_min = if batch_min == 0 {
+        let resolved = default_batch_min_for(&model);
+        tracing::info!(batch_min = resolved, "auto batch-min");
+        resolved
+    } else {
+        batch_min
+    };
     let native_mtp_b2 = parse_native_mtp_b2(std::env::var("FORGE_NATIVE_MTP_B2").ok().as_deref())?;
     let mtp_ngram_mode =
         parse_mtp_ngram_batch(std::env::var("FORGE_MTP_NGRAM_BATCH").ok().as_deref())?;

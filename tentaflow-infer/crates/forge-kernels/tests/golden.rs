@@ -216,7 +216,7 @@ fn gemv_q4_k_matches_formats_dequant() {
     // f32-logit variant over the same data.
     let y32 = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
     kernels
-        .gemv_q4_k_out_f32(&y32, &wb, &xb, rows, cols, &stream)
+        .gemv_q4_k_out_f32(&y32, 0, &wb, &xb, 0, rows, cols, &stream)
         .unwrap();
     dev.synchronize().unwrap();
     let mut bytes = vec![0u8; rows * 4];
@@ -326,7 +326,7 @@ fn gemv_q6_k_matches_formats_dequant() {
     // f32-logit variant over the same data.
     let y32 = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
     kernels
-        .gemv_q6_k_out_f32(&y32, &wb, &xb, rows, cols, &stream)
+        .gemv_q6_k_out_f32(&y32, 0, &wb, &xb, 0, rows, cols, &stream)
         .unwrap();
     dev.synchronize().unwrap();
     let mut bytes = vec![0u8; rows * 4];
@@ -2003,7 +2003,7 @@ fn gemv_q4_k_dp4a_matches_formats_dequant() {
     // f32-logit variant over the same data must round to the f16 output.
     let y32 = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
     kernels
-        .gemv_q4_k_dp4a_out_f32(&y32, &wb, &xb, rows, cols, &stream)
+        .gemv_q4_k_dp4a_out_f32(&y32, 0, &wb, &xb, 0, rows, cols, &stream)
         .unwrap();
     dev.synchronize().unwrap();
     let mut bytes = vec![0u8; rows * 4];

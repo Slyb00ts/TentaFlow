@@ -4387,16 +4387,25 @@ impl Model {
                 stream,
             );
         }
-        self.logits_weight_gemv(y_f32, x, &self.weights.lm_head, stream)
+        self.logits_weight_gemv(y_f32, 0, x, 0, &self.weights.lm_head, stream)
     }
 
     fn logits_weight_gemv(
         &self,
         y_f32: &DevBuffer,
+        y_off: usize,
         x: &DevBuffer,
+        x_off: usize,
         weight: &DevWeight,
         stream: &Stream,
     ) -> Result<()> {
+        if (y_off != 0 || x_off != 0)
+            && !matches!(weight, DevWeight::Q4K { .. } | DevWeight::Q6K { .. })
+        {
+            return Err(ForgeError::Unsupported(
+                "gemv głowy logitów z offsetem lane obsługuje tylko Q4_K/Q6_K".into(),
+            ));
+        }
         match weight {
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
@@ -4407,19 +4416,19 @@ impl Model {
             DevWeight::Q4K { buf, rows, cols } => {
                 if *cols <= Kernels::DP4A_MAX_COLS {
                     self.kernels
-                        .gemv_q4_k_dp4a_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                        .gemv_q4_k_dp4a_out_f32(y_f32, y_off, buf, x, x_off, *rows, *cols, stream)
                 } else {
                     self.kernels
-                        .gemv_q4_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                        .gemv_q4_k_out_f32(y_f32, y_off, buf, x, x_off, *rows, *cols, stream)
                 }
             }
             DevWeight::Q6K { buf, rows, cols } => {
                 if *cols <= Kernels::DP4A_MAX_COLS {
                     self.kernels
-                        .gemv_q6_k_dp4a_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                        .gemv_q6_k_dp4a_out_f32(y_f32, y_off, buf, x, x_off, *rows, *cols, stream)
                 } else {
                     self.kernels
-                        .gemv_q6_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                        .gemv_q6_k_out_f32(y_f32, y_off, buf, x, x_off, *rows, *cols, stream)
                 }
             }
             DevWeight::Q5K { buf, rows, cols } => self
@@ -8990,7 +8999,7 @@ impl Model {
         )?;
         if want_logits {
             let output = mtp.draft_output.as_ref().unwrap_or(&mtp.output);
-            self.logits_weight_gemv(&state.logits, &b.x, output, stream)?;
+            self.logits_weight_gemv(&state.logits, 0, &b.x, 0, output, stream)?;
         }
         Ok(())
     }
@@ -15869,6 +15878,23 @@ impl Model {
                 *output_scale,
                 stream,
             ),
+            // Q4_K/Q6_K heads have no batched GEMM-out-f32 kernel; a per-lane
+            // dp4a GEMV sweep keeps the rest of the batched decode step intact
+            // (the head is one weight read per lane, the layer stack stays
+            // amortized across the batch).
+            w @ (DevWeight::Q4K { rows, cols, .. } | DevWeight::Q6K { rows, cols, .. }) => {
+                for lane in 0..n_tokens {
+                    self.logits_weight_gemv(
+                        y_f32,
+                        lane * *rows * 4,
+                        x,
+                        lane * *cols * 2,
+                        w,
+                        stream,
+                    )?;
+                }
+                Ok(())
+            }
             _ => Err(ForgeError::Unsupported(
                 "batchowa głowa logitów nie obsługuje tego formatu ani szerokości".into(),
             )),

@@ -154,6 +154,35 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **Serve: współbieżność i TTFT out-of-box (2026-07-24).** Cztery zmiany
+  zmierzone klientem `vllm bench serve` (random p1024/o128, RTX 4090 obok
+  rezydentnej instancji ~3,6 GiB):
+  (1) `--prefill-chunk` domyślnie 512 (było 16 — TTFT C=1 spadał z 2351 ms do
+  ~130 ms); `forge run` używa pełnego chunka (`MAX_PREFILL_CHUNK`).
+  (2) `--batch-min` domyślnie AUTO per model: 2 gdy wszystkie projekcje mają
+  kernele small-batch decode (`ModelWeights::small_batch_decode_capable`,
+  NVFP4/NvFp4Gguf), inaczej 12 (formaty token-tile GEMM amortyzują płaski kafel
+  dopiero przy ~12 sekwencjach; Mistral Q4_K C=4: batched 46 ms vs 26 ms
+  serialized). Silnik: `spawn_engine_batched(batch_min=0)` = auto,
+  `FORGE_BATCH_MIN` nadal nadpisuje.
+  (3) `--weights-pool-gb` serve domyślnie 0 = auto-split wolnego VRAM
+  (`load_for_serve` wcześniej clampował 0 do 1 GiB); dzięki temu auto-FP8
+  hybrydowy prefill NVFP4 przechodzi preflight bez ręcznej puli.
+  (4) Batchowa głowa logitów: Q4_K/Q6_K `lm_head` przez per-lane dp4a GEMV
+  (gemv_*_out_f32 dostały offsety y/x per lane) — wcześniej batched decode
+  modeli z głową Q6_K (Mistral) ubijał requesty błędem `Unsupported`.
+  Auto fp8mod dla GGUF (serve only): FORGE_GEMM nieustawiony + gęsty GGUF +
+  urządzenie fp8_native + komplet instancji `gemm_fp8_mod_{N}_{K}` + preflight
+  puli → `Model::build_fp8_modular_auto` buduje paczki e4m3 (~117 s dla
+  Mistrala 7B) i prefill idzie przez Modular fp8 (jakość +0,69% PPL wg Finding
+  F/I; decode zostaje natywny). Bench/ppl/run nietknięte (auto tylko w serve).
+  Efekt (Bielik NVFP4, C=1/4/8/16, gołe flagi): TTFT med 142/233/276/937 ms,
+  out 123/270/458/543 tok/s — z 39→543 przy C=16 względem starych defaultów;
+  vLLM 0.25.1 na tym samym checkpoincie: 128/417/672/906 tok/s (luka 1,45-1,67×
+  w decode przy współbieżności — brakujący lever: small-batch GEMV dla Q4_K/Q6_K
+  i CUDA-graphed batched step). Mistral serve C=1: TTFT 132 ms (auto fp8),
+  decode bez zmian. Testy: golden 67/67, koherencja 4×parallel „Paris", ppl
+  default 30,0702 bez zmian.
 - ✅ **REWERT native Q6_K int8 prefill GEMM (2026-07-24).** Zgodnie z werdyktem
   poniżej (revert candidate) routing `gemm_q6_k_f16_at` wraca bezwarunkowo na
   przenośny f16 `gemm_q6_k_f16`; usunięte: launcher `gemm_q6k_i8_native`,
