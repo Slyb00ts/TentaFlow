@@ -154,6 +154,21 @@ Ostatnia aktualizacja: 2026-07-22.
   NVFP4. HAL nadal ma tylko CUDA: brak AMD/ROCm i Metal; natywne FP4 Blackwell
   także nie jest zaimplementowane. Pełny protokół: `docs/BENCH_NVFP4_VLLM.md`.
 
+- ✅ **GPU pack GGUF→e4m3: paczki fp8 w 0,1 s (2026-07-24).** Kernele Mojo
+  `pack_q{4,6}_k_fp8` i `pack_q8_0_fp8` (`src/pack_gguf_fp8.mojo`, builder
+  `build_pack_gguf_fp8.mojo`, 36-40 rej., 0 spill, `.target sm_80`) pakują
+  REZYDENTNE surowe bajty GGUF do e4m3: jeden blok 256 wątków na wiersz,
+  pass 1 absmax po dequancie on-the-fly, pass 2 kody `x*448/absmax`. Dequant i
+  konwersja e4m3 są repliką forge-formats GAŁĄŹ PO GAŁĘZI — golden
+  `pack_gguf_fp8_matches_cpu_pack` wymaga BITOWEJ równości kodów i skal z
+  packiem CPU dla wszystkich trzech formatów (69/69). `Model::build_fp8_gpu`
+  obsługuje fused QKV/QK/gate-up przez okna wierszy (prewalidacja formatów
+  przed jakąkolwiek alokacją); ścieżki auto (serve) i `FORGE_GEMM=fp8/fp8mod`
+  próbują GPU najpierw, CPU rebuild (7 wątków/warstwę) zostaje fallbackiem dla
+  innych formatów. Efekt: budowa paczek Mistrala-7B **117 s → 39,5 s (CPU
+  równoległy) → 0,1 s (GPU)**; serve startuje w 3,5 s. `ppl backend=fp8mod`
+  = **30,5211** — identyczne z dotychczasową ścieżką CPU; koherencja i C=8
+  bez zmian (301 tok/s / TTFT 320 ms).
 - ✅ **Q8_0 small-batch decode + równoległy pack fp8 (2026-07-24).**
   (1) Batched decode Q8_0 routuje T=2/4/8/16 na istniejące weight-stationary
   `gemm_q8_0_i8mma_b*` (nowa instancja b16, 95 rej., 0 spill; launcher

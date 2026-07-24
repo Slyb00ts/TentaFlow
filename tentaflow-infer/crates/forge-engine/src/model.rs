@@ -19,7 +19,7 @@ use forge_kernels::{
     DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4CtBm16Projection,
     Nvfp4CtS0View, Nvfp4GgufQ8Projection, Q8ActPrepared, Q8PreparedProjection,
 };
-use forge_types::{DType, ForgeError, MemKind, Result, Vendor};
+use forge_types::{DType, ForgeError, MemKind, QuantKind, Result, Vendor};
 use half::f16;
 
 use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
@@ -27,8 +27,9 @@ use crate::mtp::{MtpDraftState, MtpEmbedding};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weights::{
-    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Weight, GateUpWeights, LayerFfn,
-    LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy, NvFp4CtStorage, QkvWeights, W4A8Weight,
+    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Layer, Fp8Weight, GateUpWeights,
+    LayerFfn, LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy, NvFp4CtStorage, QkvWeights,
+    W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -6011,10 +6012,136 @@ impl Model {
             ));
         }
         self.weights.fp8 = None;
-        let layers = self.weights.rebuild_fp8(self.device.as_ref(), path)?;
-        self.weights.fp8 = Some(layers);
+        if !self.build_fp8_gpu()? {
+            let layers = self.weights.rebuild_fp8(self.device.as_ref(), path)?;
+            self.weights.fp8 = Some(layers);
+        }
         self.weights.fp8_modular = crate::weights::fp8_modular_enabled();
         Ok(())
+    }
+
+    /// Pack one resident projection (row window) to e4m3 on the GPU.
+    fn pack_fp8_gpu_window(
+        &self,
+        buf: &DevBuffer,
+        quant: QuantKind,
+        row_off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Fp8Weight> {
+        let qweight = self
+            .device
+            .alloc(rows * cols, MemKind::Device, Pool::Weights)?;
+        let scales = self.device.alloc(rows * 4, MemKind::Device, Pool::Weights)?;
+        self.kernels
+            .pack_gguf_fp8(&qweight, &scales, buf, row_off, rows, cols, quant, &self.stream)?;
+        Ok(Fp8Weight {
+            qweight,
+            scales,
+            rows,
+            cols,
+        })
+    }
+
+    /// Build the fp8 packs from the RESIDENT GGUF weights on the GPU (no disk
+    /// re-read, no CPU dequant). Returns `Ok(false)` when any projection is
+    /// not Q4_K/Q6_K/Q8_0 — the caller falls back to the CPU rebuild.
+    pub fn build_fp8_gpu(&mut self) -> Result<bool> {
+        fn packable(w: &DevWeight) -> Option<(&DevBuffer, usize, usize, QuantKind)> {
+            match w {
+                DevWeight::Q4K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q4K)),
+                DevWeight::Q6K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q6K)),
+                DevWeight::Q8_0 { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q8_0)),
+                _ => None,
+            }
+        }
+        let pack_full = |w: &DevWeight| -> Result<Option<Fp8Weight>> {
+            let Some((buf, rows, cols, quant)) = packable(w) else {
+                return Ok(None);
+            };
+            self.pack_fp8_gpu_window(buf, quant, 0, rows, cols).map(Some)
+        };
+        let pack_window = |w: &DevWeight, row_off: usize, rows: usize| -> Result<Option<Fp8Weight>> {
+            let Some((buf, _, cols, quant)) = packable(w) else {
+                return Ok(None);
+            };
+            self.pack_fp8_gpu_window(buf, quant, row_off, rows, cols).map(Some)
+        };
+        // Nothing is allocated before every projection passes the format
+        // check, so a refusal leaves the weights pool untouched.
+        for layer in &self.weights.layers {
+            let LayerMixer::Attention(a) = &layer.mixer else {
+                return Ok(false);
+            };
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return Ok(false);
+            };
+            let mut ws: Vec<&DevWeight> = vec![&a.attn_o, &ffn.down];
+            match &a.attn_qkv {
+                QkvWeights::Split { q, k, v } => ws.extend([q, k, v]),
+                QkvWeights::FusedQk { qk, v } => ws.extend([qk, v]),
+                QkvWeights::Fused(qkv) => ws.push(qkv),
+            }
+            match &ffn.gate_up {
+                GateUpWeights::Split { gate, up } => ws.extend([gate, up]),
+                GateUpWeights::Fused(gu) => ws.push(gu),
+            }
+            if ws.into_iter().any(|w| packable(w).is_none()) {
+                return Ok(false);
+            }
+        }
+        let p = &self.weights.descriptor.params;
+        let q_rows = p.n_heads * p.head_dim;
+        let kv_rows = p.n_kv_heads * p.head_dim;
+        let inter = p.intermediate_size;
+        let mut layers = Vec::with_capacity(self.weights.layers.len());
+        for layer in &self.weights.layers {
+            let LayerMixer::Attention(a) = &layer.mixer else {
+                return Ok(false);
+            };
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return Ok(false);
+            };
+            let (q, k, v) = match &a.attn_qkv {
+                QkvWeights::Split { q, k, v } => (pack_full(q)?, pack_full(k)?, pack_full(v)?),
+                QkvWeights::FusedQk { qk, v } => (
+                    pack_window(qk, 0, q_rows)?,
+                    pack_window(qk, q_rows, kv_rows)?,
+                    pack_full(v)?,
+                ),
+                QkvWeights::Fused(qkv) => (
+                    pack_window(qkv, 0, q_rows)?,
+                    pack_window(qkv, q_rows, kv_rows)?,
+                    pack_window(qkv, q_rows + kv_rows, kv_rows)?,
+                ),
+            };
+            let (gate, up) = match &ffn.gate_up {
+                GateUpWeights::Split { gate, up } => (pack_full(gate)?, pack_full(up)?),
+                GateUpWeights::Fused(gu) => {
+                    (pack_window(gu, 0, inter)?, pack_window(gu, inter, inter)?)
+                }
+            };
+            let attn_o = pack_full(&a.attn_o)?;
+            let down = pack_full(&ffn.down)?;
+            match (q, k, v, attn_o, gate, up, down) {
+                (Some(q), Some(k), Some(v), Some(attn_o), Some(gate), Some(up), Some(down)) => {
+                    layers.push(Fp8Layer {
+                        q,
+                        k,
+                        v,
+                        attn_o,
+                        gate,
+                        up,
+                        down,
+                    });
+                }
+                _ => return Ok(false),
+            }
+        }
+        self.stream.synchronize()?;
+        self.weights.fp8 = Some(layers);
+        self.weights.fp8_modular = true;
+        Ok(true)
     }
 
     /// Auto-enable the Modular fp8 prefill for a dense GGUF model when the
@@ -6058,6 +6185,9 @@ impl Model {
             return Ok(false);
         }
         self.weights.fp8 = None;
+        if self.build_fp8_gpu()? {
+            return Ok(true);
+        }
         let layers = self.weights.rebuild_fp8(self.device.as_ref(), path)?;
         self.weights.fp8 = Some(layers);
         self.weights.fp8_modular = true;

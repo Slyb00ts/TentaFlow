@@ -159,6 +159,21 @@ fn gemv_q8_0_matches_formats_dequant() {
     }
 }
 
+/// Deterministic Q8_0 stream (34-byte blocks: f16 scale + 32 i8 codes).
+fn build_q8_0(rows: usize, cols: usize) -> Vec<u8> {
+    let mut wq = Vec::with_capacity(rows * cols / 32 * 34);
+    for r in 0..rows {
+        for b in 0..cols / 32 {
+            let scale = f16::from_f32(0.01 + ((r + b) % 5) as f32 * 0.01);
+            wq.extend_from_slice(&scale.to_le_bytes());
+            for k in 0..32 {
+                wq.push((((r * 31 + b * 17 + k * 13) % 255) as i32 - 127) as i8 as u8);
+            }
+        }
+    }
+    wq
+}
+
 /// Deterministic Q4_K stream (144-byte superblocks) exercising both
 /// get_scale_min_k4 branches including the high 2 bits of every scale byte.
 fn build_q4k(rows: usize, cols: usize) -> Vec<u8> {
@@ -2075,6 +2090,74 @@ fn gemm_qk_dp4a_batch_matches_formats_dequant() {
                 "{quant:?} T={n_tokens}: relL2 {rel_l2:.3e} exceeds q8_1 tolerance"
             );
         }
+    }
+}
+
+// GPU GGUF→e4m3 pack must be BIT-identical to the CPU reference (row absmax
+// / 448 scale + f32_to_f8e4m3 codes over the same dequantized values).
+#[test]
+fn pack_gguf_fp8_matches_cpu_pack() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for quant in [QuantKind::Q4K, QuantKind::Q6K, QuantKind::Q8_0] {
+        let (rows, cols) = (33usize, 512usize);
+        let wq = match quant {
+            QuantKind::Q4K => build_q4k(rows, cols),
+            QuantKind::Q6K => build_q6k(rows, cols),
+            _ => build_q8_0(rows, cols),
+        };
+        let w_f32 =
+            forge_formats::dequant::dequantize_to_f32(DType::F32, quant, &wq, rows * cols).unwrap();
+        // CPU reference pack.
+        let mut want_codes = vec![0u8; rows * cols];
+        let mut want_scales = vec![0f32; rows];
+        for r in 0..rows {
+            let row = &w_f32[r * cols..(r + 1) * cols];
+            let absmax = row.iter().fold(0f32, |m, &x| m.max(x.abs()));
+            if absmax == 0.0 {
+                continue;
+            }
+            want_scales[r] = absmax / 448.0;
+            let inv = 448.0 / absmax;
+            for (c, &x) in row.iter().enumerate() {
+                want_codes[r * cols + c] = forge_formats::nvfp4::f32_to_f8e4m3(x * inv);
+            }
+        }
+
+        let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+        dev.write(&wq, &wb, 0).unwrap();
+        let codes = dev.alloc(rows * cols, MemKind::Device, Pool::Weights).unwrap();
+        let scales = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+        kernels
+            .pack_gguf_fp8(&codes, &scales, &wb, 0, rows, cols, quant, &stream)
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let mut got_codes = vec![0u8; rows * cols];
+        dev.read(&codes, 0, &mut got_codes).unwrap();
+        let mut sb = vec![0u8; rows * 4];
+        dev.read(&scales, 0, &mut sb).unwrap();
+        let got_scales: Vec<f32> = sb
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for r in 0..rows {
+            assert_eq!(
+                got_scales[r].to_bits(),
+                want_scales[r].to_bits(),
+                "{quant:?} scale row {r}: got {} want {}",
+                got_scales[r],
+                want_scales[r]
+            );
+        }
+        let bad = got_codes
+            .iter()
+            .zip(&want_codes)
+            .filter(|(g, w)| g != w)
+            .count();
+        assert_eq!(bad, 0, "{quant:?}: {bad} e4m3 codes differ from the CPU pack");
     }
 }
 

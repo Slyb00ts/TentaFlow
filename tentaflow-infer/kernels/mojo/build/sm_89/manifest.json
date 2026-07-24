@@ -1844,6 +1844,18 @@
     "gemm_q8_0_i8mma_b16": {
       "entry": "src_q8_0_batch_gemm_q8_0_small6A6A6A6A_78aff41654bc5848",
       "file": "gemm_q8_0_i8mma_b16.ptx"
+    },
+    "pack_q4_k_fp8": {
+      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_f4171dc2883529b5",
+      "file": "pack_q4_k_fp8.ptx"
+    },
+    "pack_q6_k_fp8": {
+      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_3f40765589f0372a",
+      "file": "pack_q6_k_fp8.ptx"
+    },
+    "pack_q8_0_fp8": {
+      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_987bef7eb9bb7a52",
+      "file": "pack_q8_0_fp8.ptx"
     }
   }
 }

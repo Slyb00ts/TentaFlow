@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
 
 use forge_hal::{DevBuffer, Device, Event, LaunchArgs, LaunchConfig, Pool, Stream};
-use forge_types::{DType, ForgeError, MemKind, Result};
+use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
 
 use crate::registry::KernelArtifacts;
 
@@ -10802,6 +10802,67 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(&gk, &cfg, &args, stream)?;
         Ok(true)
+    }
+
+    /// Pack a resident GGUF projection (row window) straight to e4m3 fp8 on
+    /// the GPU: one 256-thread block per output row computes the row absmax
+    /// over on-the-fly dequantized values and encodes `x * 448/absmax`.
+    /// Bit-identical to the CPU `pack_fp8_host` path (golden-gated). `fmt`:
+    /// the GGUF quant of `w` — Q4_K, Q6_K or Q8_0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_gguf_fp8(
+        &self,
+        codes: &DevBuffer,
+        scales: &DevBuffer,
+        w: &DevBuffer,
+        w_row_off: usize,
+        rows: usize,
+        cols: usize,
+        fmt: QuantKind,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (name, blk_elems, blk_bytes) = match fmt {
+            QuantKind::Q4K => ("pack_q4_k_fp8", 256, 144),
+            QuantKind::Q6K => ("pack_q6_k_fp8", 256, 210),
+            QuantKind::Q8_0 => ("pack_q8_0_fp8", 32, 34),
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "pack_gguf_fp8: nieobsługiwany format {other:?}"
+                )))
+            }
+        };
+        if rows == 0 || cols == 0 || !cols.is_multiple_of(blk_elems) {
+            return Err(ForgeError::Kernel(format!(
+                "pack_gguf_fp8 wymaga rows > 0 i cols podzielnego przez {blk_elems}, otrzymano rows={rows}, cols={cols}"
+            )));
+        }
+        let w_byte_off = w_row_off * (cols / blk_elems) * blk_bytes;
+        let weight_bytes =
+            checked_buffer_bytes("pack fp8 weights", &[rows, cols / blk_elems], blk_bytes)?;
+        let weight_end = w_byte_off
+            .checked_add(weight_bytes)
+            .ok_or_else(|| ForgeError::Kernel("pack fp8: przepełnienie wag".into()))?;
+        let code_bytes = checked_buffer_bytes("pack fp8 codes", &[rows], cols)?;
+        if w.len() < weight_end || codes.len() < code_bytes || scales.len() < rows * 4 {
+            return Err(ForgeError::Kernel(
+                "pack fp8: bufor wag, kodów lub skal jest za mały".into(),
+            ));
+        }
+        let gk = self.artifacts.get(name)?;
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("pack fp8: rows przekracza u32".into()))?;
+        let cfg = LaunchConfig {
+            grid: (rows_u32, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(codes)
+            .buf(scales)
+            .buf_at(w, w_byte_off)?
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(gk, &cfg, &args, stream)
     }
 
     /// Weight-stationary small-batch Q8_0 GEMM (T = 2/4/8/16) over the shared
