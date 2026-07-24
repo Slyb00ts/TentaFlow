@@ -17632,14 +17632,24 @@ mod alias_resolve_tests {
         assert_eq!(tts.target_model, "tts-1");
         assert!(tts.is_active);
 
-        let summary = resolve_model_alias(&db, "teams-summary", None).unwrap();
-        assert!(summary.is_some(), "Alias teams-summary powinien istniec");
-        let summary = summary.unwrap();
+        // An unbound alias (empty target) registers PARKED: the row exists so the
+        // admin can bind a model later, but the router must never resolve it.
+        assert!(
+            resolve_model_alias(&db, "teams-summary", None)
+                .unwrap()
+                .is_none(),
+            "Zaparkowany alias teams-summary nie powinien byc rozwiazywany"
+        );
+        let summary = list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == "teams-summary")
+            .expect("Alias teams-summary powinien byc zarejestrowany (zaparkowany)");
         assert_eq!(
             summary.target_model, "",
             "teams-summary ma pusty target — admin uzupelnia recznie"
         );
-        assert!(summary.is_active);
+        assert!(!summary.is_active, "pusty target => alias zaparkowany");
 
         // Act 2 — dezaktywacja (symulacja zatrzymania addonu)
         set_model_alias_active(&db, "teams-stt", false)
@@ -25814,22 +25824,26 @@ mod token_metrics_tests {
 
     #[test]
     fn histogram_bucket_index_maps_edges() {
+        // Bucket i covers (edges[i-1], edges[i]]: a value EQUAL to an edge falls
+        // in the lower bucket. This mirrors `percentile_from_histogram`, which
+        // interpolates inside bucket i using edges[i] as its upper bound.
         // TTFT edges [0,50,100,200,400,800,1600,3200,6400,∞] → 10 buckets 0..=9.
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 0), 0);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 1), 1);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 50), 1);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 51), 2);
-        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 9);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 8);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 999_999), 9);
         // decode_tps edges [0,10,...,320,∞] → 8 buckets 0..=7.
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 0.0), 0);
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5.0), 1);
-        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 7);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 6);
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5000.0), 7);
         // e2e edges → 10 buckets 0..=9.
         assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 0), 0);
-        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 3);
-        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 9);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 2);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 8);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 999_999), 9);
     }
 
     #[test]
