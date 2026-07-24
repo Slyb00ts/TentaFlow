@@ -205,6 +205,53 @@ registries) saved via the binary protocol with `is_secret`; listing returns `<re
 non-empty secrets. The vLLM recommender uses the stored `hf_token` to fetch `config.json`
 from gated repos without persisting the token in the deployment config.
 
+## Projekty (Project Studio)
+
+`tentaflow-core/src/project_studio/` — native core module (NOT a WASM addon). Registry
+(projects, members, creator grants, chats) lives in `<data>/projects.db`; per-project
+content in `<data>/projects/<id>/{project.db, files/<sha256>, vectors/}` behind a bounded
+pool cache (`project_db.rs`: LRU max 16 open pools + idle sweeper, migrations run on every
+open, strict `validate_project_id` path guard, `checkpoint_all` flushes project WALs at
+shutdown). Protocol: single `MessageBody::ProjectStudioBody(ProjectStudioPayload)` —
+append-only sub-enum, 80 variants in F1 — wired through the usual three frontend touch
+points; UI `www/js/modules/project-studio.js`, apps-home tile `projekty` WITHOUT
+`requiresPowerUser`.
+
+Permissions (migration 119): `project_studio.read` (all roles) + `project_studio.admin`
+(org_admin). Creating projects needs a per-user grant (`project_creator_grants`);
+in-project roles: owner/manager/editor/tester/viewer. Non-members get uniform NotFound (no
+existence leak); archived project = read-only (`require_active`).
+
+Knowledge: native ingest (`ingest.rs` — office/text/code via `services/document/extract`,
+PDF text layer via pdfium; scans/images are `skipped` until the vision pipeline is
+callable), chunking via `split_into_chunks`, embeddings through the `rag-embeddings`
+alias, vectors under scope `addon_id="ps-<project_id>"` namespace `passages` created AT
+the project directory (`NamespaceManager::get_or_create_at`) — per-project quotas;
+deliberately does NOT use the flow `store` node. Jobs: cancel registry + `log_bus`
+progress (key = job_id) + panic guard + semaphore of 2 concurrent ingests. Chunked upload:
+4 MiB chunks, 64 MiB per file.
+
+Chat: system flow `ps-chat` (fixed UUID, `is_system=1`, seed reclaims a stripped row) —
+trigger → project_knowledge (search; passages pushed into `context.system_prompts` as
+fenced DATA with `<<<PASSAGE>>>` delimiters, prompt-injection guard) →
+conversation_history → llm STREAMING WITHOUT tools (embedded streaming+tools doesn't
+work). Stream handler: subscription `projectStudioChatStreamRequest`
+(`ProjectStudioPayload::ChatStreamRequest`) in `dispatch/stream_handlers.rs`; citations
+persisted in `conversation_messages.citations_json` (migration 120). Chats are private
+per user — the server hard-filters every chat query by `user_id`, no admin bypass.
+
+Flow Builder node `project_knowledge` (search/list_sources; `project_id` from node config
+or `envelope.meta` — the meta fallback lets ONE shared system flow serve every project;
+`dynamic_enum` source `projects`) + agent builtins `core.project_search` /
+`core.project_list_sources` (membership check per call, results bounded under the 16k
+tool-result truncation).
+
+`flows.is_system` (migration 118): system flows are non-editable/non-deletable via the
+protocol; sync NEVER trusts the wire `is_system` flag (coerced to 0) and rejects every
+remote write targeting a locally-system row — the seed is the per-node source of truth.
+F2 (in progress): manual tests + agent-generated cases (durable sink
+`core.project_case_save`) per the design docs in project memory.
+
 ## Compliance Core
 
 `tentaflow-core/src/compliance/` — shared core layer for GDPR/RODO, AI audit, retention,
