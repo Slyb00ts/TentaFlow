@@ -7909,6 +7909,12 @@ pub enum MessageBody {
     // JEDEN wariant na całą rodzinę (overview + browse + mkdir + migrate) w
     // `StorageAdminPayload`.
     StorageAdminBody(crate::storage::StorageAdminPayload),
+
+    // ----- Project Studio (rejestr projektów, wiedza, ingest, chat, ustawienia) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
+    // rodzinę (request+response+stream) w `ProjectStudioPayload`.
+    ProjectStudioBody(crate::project_studio::ProjectStudioPayload),
 }
 
 // =============================================================================
