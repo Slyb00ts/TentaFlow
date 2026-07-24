@@ -249,17 +249,39 @@ async fn fetch_remote_manifest(
 // Archive download
 // ---------------------------------------------------------------------------
 
-/// Streams the remote archive to `dest`, enforcing a Content-Length ceiling and a
-/// mid-stream byte ceiling, then verifies its sha256. Mirrors
+/// Parses the grand total (`Z`) out of a `Content-Range: bytes X-Y/Z` header on a
+/// 206 response. Returns `None` for the unknown-total `*` form. This is how a resumed
+/// (Range) download learns the full archive size, since its `Content-Length` reports
+/// only the remaining slice.
+fn parse_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let total = raw.rsplit('/').next()?.trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse::<u64>().ok()
+}
+
+/// Streams the remote archive to `dest`, enforcing a size ceiling and a mid-stream
+/// byte ceiling, then verifies its sha256. Mirrors
 /// `camera_cv_models::download_signed_file`: no-redirect (a 3xx is rejected since
 /// `error_for_status` treats it as success), token-bearing query redacted, atomic
-/// `<dest>.partial` → rename. Returns the number of bytes written. Deletes the
-/// partial/dest on any failure.
+/// `<dest>.partial` → rename. Returns the number of bytes written.
+///
+/// RESUMABLE: a multi-GB pull interrupted by a dropped connection, a 5xx, or a stall
+/// is NOT restarted from zero. The `<dest>.partial` file is kept across attempts; each
+/// attempt re-reads its length and asks the source to continue via HTTP `Range:
+/// bytes=<len>-`. The server answers `206` (append) or, if it ignores the range,
+/// `200` (fresh start → the partial is truncated). Only a FATAL condition (redirect,
+/// 4xx, sha256 disagreement, byte-ceiling breach, disk write error) deletes the
+/// partial; a transient failure leaves it for the next attempt, and giving up after
+/// all attempts ALSO leaves it so a later import re-run can resume it.
 ///
 /// Integrity precedence, fail-closed: the expected digest is the MANIFEST sha256 if
-/// present, else the archive endpoint's `X-Archive-Sha256` response header. If a
-/// manifest sha256 AND the header are both present they must agree. If NEITHER is
-/// available the download is rejected — unverified bytes are never imported.
+/// present, else the archive endpoint's `X-Archive-Sha256` response header (the source
+/// emits it on 206 too). Resolved ONCE and pinned; a later header that disagrees is
+/// fatal. If NEITHER is available the download is rejected — unverified bytes are never
+/// imported.
 async fn download_archive(
     client: &reqwest::Client,
     url: reqwest::Url,
@@ -270,132 +292,245 @@ async fn download_archive(
 ) -> Result<u64> {
     use std::io::Write;
 
-    let mut request = client.get(url);
-    if !bearer.is_empty() {
-        request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"));
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| anyhow!("GET archiwum: {}", redact_query_strings(&e.to_string())))?;
-    if response.status().is_redirection() {
-        return Err(anyhow!(
-            "pobieranie archiwum: przekierowanie ({}) — nie jest śledzone",
-            response.status()
-        ));
-    }
-    let response = response.error_for_status().map_err(|e| {
-        anyhow!(
-            "pobieranie archiwum, błąd HTTP: {}",
-            redact_query_strings(&e.to_string())
-        )
-    })?;
-
-    // Whole-archive digest advertised by the source (present even when the manifest
-    // omitted it). Normalized + validated like the manifest value.
-    let header_sha256 = response
-        .headers()
-        .get("X-Archive-Sha256")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
-
-    // Resolve the expected digest BEFORE spending bandwidth: manifest wins, header
-    // is the fallback, disagreement is fatal, and absence of both fails closed.
-    let expected_sha256 = match (manifest_sha256, header_sha256.as_deref()) {
-        (Some(m), Some(h)) if m != h => {
-            return Err(anyhow!(
-                "niezgodna suma sha256 archiwum: manifest ({m}) vs nagłówek ({h}) — odrzucono"
-            ))
-        }
-        (Some(m), _) => m.to_string(),
-        (None, Some(h)) => h.to_string(),
-        (None, None) => {
-            return Err(anyhow!(
-                "brak sumy sha256 archiwum (ani w manifeście, ani w nagłówku X-Archive-Sha256) — nie importuję niezweryfikowanych danych"
-            ))
-        }
-    };
-
-    if response.content_length().unwrap_or(0) > MAX_REMOTE_ARCHIVE_BYTES {
-        return Err(anyhow!(
-            "archiwum przekracza limit {MAX_REMOTE_ARCHIVE_BYTES} B (Content-Length)"
-        ));
-    }
-    let total = response.content_length().unwrap_or(0);
-    set_progress(progress_job, |p| {
-        if total > 0 {
-            p.bytes_total = total;
-        }
-    });
+    // No-progress (stall) timeout, NOT a total-time cap: a slow-but-steady 10 GB pull
+    // must never be killed for being slow (the shared client's 600 s total timeout did
+    // exactly that, dying at ~5 GB). The clock resets on every chunk and only fires
+    // when the peer sends NOTHING for this long — a genuinely stalled connection. A
+    // stall is transient here: it breaks the attempt but keeps the partial for a resume.
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const PROGRESS_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_ATTEMPTS: u32 = 6;
 
     let partial = dest.with_extension("zip.partial");
-    let mut file = std::fs::File::create(&partial)
-        .map_err(|e| anyhow!("utworzenie {}: {e}", partial.display()))?;
 
-    let mut downloaded: u64 = 0;
-    let mut last_tick: u64 = 0;
-    const PROGRESS_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
+    // Expected digest, resolved once and pinned across attempts. Manifest value wins;
+    // otherwise the first response's `X-Archive-Sha256` fills it. A later attempt whose
+    // header disagrees is fatal (a mid-transfer source swap).
+    let mut expected_sha256: Option<String> = manifest_sha256.map(str::to_string);
+    // Grand total of the archive, learned from `Content-Range` (206) or `Content-Length`
+    // (200); 0 = still unknown. Persisted across attempts so a resumed transfer can
+    // detect a short read on a clean stream end.
+    let mut total: u64 = 0;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    // No-progress (stall) timeout, NOT a total-time cap: a slow-but-steady 10 GB
-    // pull must never be killed for being slow (the shared client's 600 s total
-    // timeout did exactly that, dying at ~5 GB). The clock resets on every chunk
-    // and only fires when the peer sends NOTHING for this long — i.e. a genuinely
-    // stalled/broken connection.
-    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let mut stream = response.bytes_stream();
-    loop {
-        let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
-            Ok(Some(chunk_res)) => chunk_res.map_err(|e| {
-                anyhow!("strumień archiwum: {}", redact_query_strings(&e.to_string()))
-            })?,
-            Ok(None) => break,
-            Err(_) => {
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            // Growing backoff between retries; the prior attempt's partial is left on
+            // disk on purpose so this attempt resumes from it.
+            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+            set_progress(progress_job, |p| p.phase = "downloading".to_string());
+        }
+
+        // Resume point is whatever bytes already survived on disk.
+        let resume_from = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+
+        let mut request = client.get(url.clone());
+        if !bearer.is_empty() {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        if resume_from > 0 {
+            request =
+                request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+        }
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Connection/send failure is transient: keep the partial, retry.
+                last_err = Some(anyhow!(
+                    "GET archiwum: {}",
+                    redact_query_strings(&e.to_string())
+                ));
+                continue;
+            }
+        };
+
+        if response.status().is_redirection() {
+            // A 3xx is never followed — a hostile source must not steer the pull.
+            let _ = std::fs::remove_file(&partial);
+            return Err(anyhow!(
+                "pobieranie archiwum: przekierowanie ({}) — nie jest śledzone",
+                response.status()
+            ));
+        }
+
+        let status = response.status();
+        if let Err(e) = response.error_for_status_ref() {
+            let msg = anyhow!(
+                "pobieranie archiwum, błąd HTTP: {}",
+                redact_query_strings(&e.to_string())
+            );
+            // 4xx is fatal (bad/expired key, gone): delete partial, no retry. 5xx may
+            // be transient: keep partial and retry.
+            if status.is_client_error() {
+                let _ = std::fs::remove_file(&partial);
+                return Err(msg);
+            }
+            last_err = Some(msg);
+            continue;
+        }
+
+        // Whole-archive digest advertised by the source (present even when the manifest
+        // omitted it, and on 206 too). Normalized + validated like the manifest value.
+        let header_sha256 = response
+            .headers()
+            .get("X-Archive-Sha256")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_ascii_lowercase)
+            .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+        match (expected_sha256.as_deref(), header_sha256.as_deref()) {
+            (Some(m), Some(h)) if m != h => {
+                let _ = std::fs::remove_file(&partial);
+                return Err(anyhow!(
+                    "niezgodna suma sha256 archiwum: oczekiwano ({m}) vs nagłówek ({h}) — odrzucono"
+                ));
+            }
+            (None, Some(h)) => expected_sha256 = Some(h.to_string()),
+            _ => {}
+        }
+        // Fail closed BEFORE spending bandwidth when no digest is available anywhere.
+        if expected_sha256.is_none() {
+            let _ = std::fs::remove_file(&partial);
+            return Err(anyhow!(
+                "brak sumy sha256 archiwum (ani w manifeście, ani w nagłówku X-Archive-Sha256) — nie importuję niezweryfikowanych danych"
+            ));
+        }
+
+        // A 206 in response to our Range means append; anything else (200, or a 206 we
+        // did not request) is a full body → truncate and start over.
+        let resuming = status == reqwest::StatusCode::PARTIAL_CONTENT && resume_from > 0;
+        if resuming {
+            if let Some(z) = parse_content_range_total(response.headers()) {
+                total = z;
+            }
+        } else if let Some(cl) = response.content_length() {
+            if cl > 0 {
+                total = cl;
+            }
+        }
+        if total > MAX_REMOTE_ARCHIVE_BYTES {
+            let _ = std::fs::remove_file(&partial);
+            return Err(anyhow!(
+                "archiwum przekracza limit {MAX_REMOTE_ARCHIVE_BYTES} B (Content-Length)"
+            ));
+        }
+        set_progress(progress_job, |p| {
+            if total > 0 {
+                p.bytes_total = total;
+            }
+        });
+
+        let mut file = if resuming {
+            match std::fs::OpenOptions::new().append(true).open(&partial) {
+                Ok(f) => f,
+                Err(e) => {
+                    // The partial we planned to append to is unusable: fatal disk error.
+                    let _ = std::fs::remove_file(&partial);
+                    return Err(anyhow!("otwarcie {} do dopisania: {e}", partial.display()));
+                }
+            }
+        } else {
+            match std::fs::File::create(&partial) {
+                Ok(f) => f,
+                Err(e) => return Err(anyhow!("utworzenie {}: {e}", partial.display())),
+            }
+        };
+
+        let mut downloaded: u64 = if resuming { resume_from } else { 0 };
+        let mut last_tick: u64 = downloaded;
+        set_progress(progress_job, |p| p.bytes_done = downloaded);
+
+        let mut stream = response.bytes_stream();
+        let mut transient: Option<anyhow::Error> = None;
+        loop {
+            let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(e))) => {
+                    // Mid-stream transport error: keep the partial, resume next attempt.
+                    transient = Some(anyhow!(
+                        "strumień archiwum: {}",
+                        redact_query_strings(&e.to_string())
+                    ));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    transient = Some(anyhow!(
+                        "pobieranie archiwum przerwane: brak danych z serwera przez {} s po pobraniu {} B (zerwane/zawieszone połączenie)",
+                        STALL_TIMEOUT.as_secs(),
+                        downloaded
+                    ));
+                    break;
+                }
+            };
+            downloaded += chunk.len() as u64;
+            if downloaded > MAX_REMOTE_ARCHIVE_BYTES {
                 drop(file);
                 let _ = std::fs::remove_file(&partial);
                 return Err(anyhow!(
-                    "pobieranie archiwum przerwane: brak danych z serwera przez {} s po pobraniu {} B (zerwane/zawieszone połączenie)",
-                    STALL_TIMEOUT.as_secs(),
-                    downloaded
+                    "archiwum przekroczyło limit {MAX_REMOTE_ARCHIVE_BYTES} B w trakcie pobierania — usunięto"
                 ));
             }
-        };
-        downloaded += chunk.len() as u64;
-        if downloaded > MAX_REMOTE_ARCHIVE_BYTES {
+            if let Err(e) = file.write_all(&chunk) {
+                drop(file);
+                let _ = std::fs::remove_file(&partial);
+                return Err(anyhow!("zapis {}: {e}", partial.display()));
+            }
+            if downloaded - last_tick >= PROGRESS_INTERVAL_BYTES {
+                set_progress(progress_job, |p| p.bytes_done = downloaded);
+                last_tick = downloaded;
+            }
+        }
+
+        if let Some(e) = transient {
+            // Persist what we captured so the next attempt resumes from a larger offset.
+            let _ = file.flush();
+            drop(file);
+            set_progress(progress_job, |p| p.bytes_done = downloaded);
+            last_err = Some(e);
+            continue;
+        }
+
+        if let Err(e) = file.flush() {
             drop(file);
             let _ = std::fs::remove_file(&partial);
+            return Err(anyhow!("flush {}: {e}", partial.display()));
+        }
+        drop(file);
+        set_progress(progress_job, |p| p.bytes_done = downloaded);
+
+        // A clean stream end short of a KNOWN total is an early close by the peer, not a
+        // complete transfer: keep the partial and resume rather than publish a truncated
+        // (and sha-failing) archive.
+        if total > 0 && downloaded != total {
+            last_err = Some(anyhow!(
+                "pobieranie niekompletne: {downloaded} z {total} B — wznowię"
+            ));
+            continue;
+        }
+
+        // Expected digest is guaranteed resolved here (fail-closed check above).
+        let expected = expected_sha256
+            .clone()
+            .expect("expected_sha256 resolved before streaming");
+        std::fs::rename(&partial, dest)
+            .map_err(|e| anyhow!("publikacja {}: {e}", dest.display()))?;
+        set_progress(progress_job, |p| p.bytes_done = downloaded);
+
+        let actual = crate::api::model_bundle::sha256_file_hex(dest)
+            .await
+            .map_err(|e| anyhow!("suma sha256 archiwum: {e}"))?;
+        if actual != expected {
+            let _ = std::fs::remove_file(dest);
             return Err(anyhow!(
-                "archiwum przekroczyło limit {MAX_REMOTE_ARCHIVE_BYTES} B w trakcie pobierania — usunięto"
+                "niezgodna suma sha256 archiwum (oczekiwano {expected}, otrzymano {actual}) — usunięto"
             ));
         }
-        if let Err(e) = file.write_all(&chunk) {
-            drop(file);
-            let _ = std::fs::remove_file(&partial);
-            return Err(anyhow!("zapis {}: {e}", partial.display()));
-        }
-        if downloaded - last_tick >= PROGRESS_INTERVAL_BYTES {
-            set_progress(progress_job, |p| p.bytes_done = downloaded);
-            last_tick = downloaded;
-        }
+        return Ok(downloaded);
     }
-    file.flush()
-        .map_err(|e| anyhow!("flush {}: {e}", partial.display()))?;
-    drop(file);
 
-    std::fs::rename(&partial, dest)
-        .map_err(|e| anyhow!("publikacja {}: {e}", dest.display()))?;
-    set_progress(progress_job, |p| p.bytes_done = downloaded);
-
-    let actual = crate::api::model_bundle::sha256_file_hex(dest)
-        .await
-        .map_err(|e| anyhow!("suma sha256 archiwum: {e}"))?;
-    if actual != expected_sha256 {
-        let _ = std::fs::remove_file(dest);
-        return Err(anyhow!(
-            "niezgodna suma sha256 archiwum (oczekiwano {expected_sha256}, otrzymano {actual}) — usunięto"
-        ));
-    }
-    Ok(downloaded)
+    // Attempts exhausted. Leave the partial on disk so a later import re-run resumes it.
+    Err(last_err.unwrap_or_else(|| anyhow!("pobieranie archiwum nie powiodło się")))
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +727,19 @@ async fn run_remote_import(
     let staging_dir = crate::paths::ml_studio_import_staging_dir();
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| anyhow!("utworzenie katalogu importu {}: {e}", staging_dir.display()))?;
-    let staged: PathBuf = staging_dir.join(format!("mlsimp_{}.zip", uuid::Uuid::new_v4().simple()));
+    // STABLE staged name derived from the archive identity so a re-clicked import
+    // reuses the prior `.partial` and resumes instead of restarting from zero. The
+    // manifest sha256 is the strongest identity; without it, hash the pinned archive
+    // URL. Hex-only → filesystem-safe. (`download_archive` keeps `<staged>.partial`
+    // across attempts and on give-up; only the FINAL `.zip` is cleaned up below.)
+    let stage_key = match manifest.archive_sha256.as_deref() {
+        Some(sha) => sha[..16].to_string(),
+        None => {
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(archive_url.as_str().as_bytes());
+            hex::encode(&digest[..8])
+        }
+    };
+    let staged: PathBuf = staging_dir.join(format!("mlsimp_{stage_key}.zip"));
 
     let client = bundle_http_client(&manifest_url, None)?;
     let download = download_archive(
