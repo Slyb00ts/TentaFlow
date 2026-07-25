@@ -79,6 +79,28 @@ Ostatnia aktualizacja: 2026-07-25.
   ten sam prompt greedy przy C=1 i C=6 daje teraz IDENTYCZNE wyjście (wcześniej
   ścieżki różniły się głową). Bramki: workspace 606/606, `batched_bielik`
   z paczkami FP8 2/2.
+- 🟡 **Katalog kerneli buduje artefakty AMDGCN; inwentarz gfx1030: 312 z 474
+  (2026-07-25).** `build_kernel_catalog.py` rozgałęzia się teraz po TREŚCI zrzutu,
+  nie po rozszerzeniu pliku: obecność `.amdgcn_target` wybiera ścieżkę AMD, która
+  łata identyfikator celu (`...-unknown-gfxNNNN` → bez `unknown`), składa
+  assembler do HSACO przez `clang -x assembler -target amdgcn-amd-amdhsa`
+  i wpisuje `nazwa.hsaco` do manifestu z symbolem z `.globl`. Ścieżka PTX jest
+  nietknięta, a testy katalogu przechodzą 4/4.
+  Dodany tryb `FORGE_KERNEL_BUILD_INVENTORY=1`: pojedynczy kernel, który nie
+  kompiluje się dla danej architektury, jest zapisywany i build IDZIE DALEJ,
+  a publikacja jest wyłączona (zestaw byłby niepełny). Wynik dla gfx1030:
+  **312 z 474 kerneli kompiluje się, 162 nie** — lista w
+  `docs/AMD_KERNEL_INVENTORY_gfx1030.txt`.
+  Rozkład 162 nieobsługiwanych: 49 Q4_K/Q6_K, 39 pozostałych, 22 NVFP4-CT
+  (kafle BM16/BM32, prefill, fp8), 19 Q8_0 (i8mma/triplet), 13 NVFP4 GGUF
+  (mma/tile128), 11 FP8, 9 attention/flash. Powody sprowadzają się do
+  intrinsików NVIDIA w zrzucie LLVM: `llvm.nvvm.ldmatrix.sync.aligned` i
+  `llvm.nvvm.idp4a.s.s` (odpowiednik dp4a), plus 121 przypadków ogólnego
+  „failed to run the pass manager", czyli tego samego po stronie MMA.
+  WNIOSEK: dwie trzecie katalogu przenosi się bez pracy, a cała reszta to
+  dokładnie te rodziny, które trzeba napisać na `v_dot4_i32_i8` — i to jest
+  ta sama lista, która decyduje o prefillu. `idp4a` ma bezpośredni odpowiednik
+  AMD, więc kernele dp4a są najtańszą i najważniejszą pozycją do przeniesienia.
 - ❌ **GigaToken sprawdzony i ODRZUCONY dla ścieżki inferencji (2026-07-25).**
   GigaToken to rustowy tokenizer BPE (nie silnik), reklamowany jako 989x
   szybszy od HuggingFace i 24,53 GB/s, z obietnicą 40% redukcji TTFT.
