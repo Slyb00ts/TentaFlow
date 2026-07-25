@@ -141,6 +141,60 @@ def normalized_ptx(text, artifact, portable_nvfp4):
     return text
 
 
+# --- AMD (AMDGCN) -----------------------------------------------------------
+#
+# Mojo zrzuca dla celu AMD assembler AMDGCN, nie ładowalny obraz. HIP wymaga
+# code objectu, więc doklejamy jeden krok: łatka identyfikatora celu (Mojo pisze
+# `...-unknown-gfxNNNN`, którego asembler nie przyjmuje) i złożenie do HSACO.
+AMD_TARGET_MARKER = ".amdgcn_target "
+
+
+def amdgcn_arch(text, artifact):
+    for line in text.splitlines():
+        if line.strip().startswith(AMD_TARGET_MARKER):
+            target = line.split('"')[1]
+            return target.rsplit("-", 1)[1]
+    raise RuntimeError(f"brak .amdgcn_target w {artifact}.s")
+
+
+def normalized_amdgcn(text):
+    return text.replace("amdgcn-amd-amdhsa-unknown-", "amdgcn-amd-amdhsa--")
+
+
+def entry_from_amdgcn(text, artifact):
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(".globl"):
+            return stripped.split()[1].rstrip(",")
+    raise RuntimeError(f"brak symbolu .globl w {artifact}.s")
+
+
+def assemble_amdgcn(text, arch, artifact, out_path):
+    rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+    clang = rocm / "llvm" / "bin" / "clang"
+    if not clang.is_file():
+        raise RuntimeError(f"brak {clang}; ustaw ROCM_PATH")
+    with tempfile.TemporaryDirectory(prefix="forge-amdgcn-") as work:
+        source = Path(work) / f"{artifact}.s"
+        source.write_text(text)
+        result = subprocess.run(
+            [
+                str(clang),
+                "-x",
+                "assembler",
+                "-target",
+                "amdgcn-amd-amdhsa",
+                f"-mcpu={arch}",
+                str(source),
+                "-o",
+                str(out_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(f"asemblacja {artifact} dla {arch} nie powiodla sie: {result.stderr}")
+
 def requires_sm89_cubins(arch):
     return arch == "sm_89"
 
@@ -174,6 +228,8 @@ def compile_catalog(kernels, portable_nvfp4):
         "MODULAR_NVPTX_COMPILER_PATH", str(ROOT / "scripts" / "ptxas_fp8_shim.sh")
     )
     fail_after = int(os.environ.get("FORGE_KERNEL_BUILD_FAIL_AFTER", "0"))
+    inventory = os.environ.get("FORGE_KERNEL_BUILD_INVENTORY") == "1"
+    unsupported = []
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     manifest = None
     with tempfile.TemporaryDirectory(
@@ -196,53 +252,95 @@ def compile_catalog(kernels, portable_nvfp4):
                         cwd=temporary_path,
                         env=environment,
                         check=True,
+                        capture_output=inventory,
+                        text=inventory,
                     )
-                except subprocess.CalledProcessError:
-                    for ptx_path in temporary_path.glob("*.ptx"):
-                        ptx_path.unlink()
+                except subprocess.CalledProcessError as failure:
+                    for stale in list(temporary_path.glob("*.ptx")) + list(
+                        temporary_path.glob("*.s")
+                    ):
+                        stale.unlink()
                     if len(items) == 1:
+                        # Tryb inwentarza: zamiast przerywać na pierwszym kernelu,
+                        # który nie kompiluje się dla tej architektury, zapisujemy go
+                        # i idziemy dalej. Publikacja jest wtedy WYŁĄCZONA, bo zestaw
+                        # byłby niepełny — to narzędzie do planowania portu.
+                        if inventory:
+                            symbol, artifact = items[0]
+                            unsupported.append(
+                                (artifact, (failure.stderr or "").strip().splitlines()[-1:] or [""])
+                            )
+                            print(f"NIEOBSLUGIWANY: {artifact}")
+                            continue
                         raise
                     middle = len(items) // 2
                     pending.insert(0, (module, items[middle:]))
                     pending.insert(0, (module, items[:middle]))
                     print(f"dziele jednostke {module} ({len(items)} kerneli)")
                     continue
-                dumped = sorted(temporary_path.glob("*.ptx"))
+                dumped = sorted(temporary_path.glob("*.ptx")) + sorted(
+                    temporary_path.glob("*.s")
+                )
                 if len(dumped) != len(items):
                     raise RuntimeError(
-                        f"jednostka {attempt} wygenerowala {len(dumped)} z {len(items)} PTX"
+                        f"jednostka {attempt} wygenerowala {len(dumped)} z {len(items)} artefaktow"
                     )
-                for ptx_path in dumped:
-                    artifact = ptx_path.stem
-                    text = normalized_ptx(ptx_path.read_text(), artifact, portable_nvfp4)
-                    target_line = next(
-                        (line for line in text.splitlines() if line.startswith(".target sm_")),
-                        None,
-                    )
-                    if target_line is None:
-                        raise RuntimeError(f"brak architektury PTX w {ptx_path}")
-                    generated_arch = target_line.split()[1]
-                    if generated_arch == "sm_80":
-                        validate_sm80_text(text)
-                    arch = "sm_89" if generated_arch == "sm_80" else generated_arch
+                for dump_path in dumped:
+                    artifact = dump_path.stem
+                    raw = dump_path.read_text()
+                    if AMD_TARGET_MARKER in raw:
+                        arch = amdgcn_arch(raw, artifact)
+                        text = normalized_amdgcn(raw)
+                        file_name = f"{artifact}.hsaco"
+                        entry = entry_from_amdgcn(text, artifact)
+                        writer = lambda target, text=text, arch=arch, artifact=artifact: (
+                            assemble_amdgcn(text, arch, artifact, target)
+                        )
+                    else:
+                        text = normalized_ptx(raw, artifact, portable_nvfp4)
+                        target_line = next(
+                            (line for line in text.splitlines() if line.startswith(".target sm_")),
+                            None,
+                        )
+                        if target_line is None:
+                            raise RuntimeError(f"brak architektury PTX w {dump_path}")
+                        generated_arch = target_line.split()[1]
+                        if generated_arch == "sm_80":
+                            validate_sm80_text(text)
+                        arch = "sm_89" if generated_arch == "sm_80" else generated_arch
+                        file_name = dump_path.name
+                        entry = entry_from_ptx(text, artifact)
+                        writer = lambda target, text=text: target.write_text(text)
                     if manifest is None:
                         manifest = {"arch": arch, "kernels": {}}
                     elif manifest["arch"] != arch:
                         raise RuntimeError("jednostki Mojo zwrocily rozne architektury")
                     staged_arch = publication_root / arch
                     staged_arch.mkdir(parents=True, exist_ok=True)
-                    target = staged_arch / ptx_path.name
-                    target.write_text(text)
+                    writer(staged_arch / file_name)
                     manifest["kernels"][artifact] = {
-                        "file": ptx_path.name,
-                        "entry": entry_from_ptx(text, artifact),
+                        "file": file_name,
+                        "entry": entry,
                     }
-                    ptx_path.unlink()
+                    dump_path.unlink()
                 compiled_units += 1
                 print(f"skompilowano jednostke {compiled_units}: {module} ({len(items)} kerneli)")
                 if fail_after and compiled_units >= fail_after:
                     raise RuntimeError(f"wymuszony błąd po jednostce {compiled_units}")
 
+        if inventory:
+            report = OUTPUT_ROOT / "inventory-unsupported.txt"
+            report.write_text(
+                "".join(f"{artifact}\t{reason[0]}\n" for artifact, reason in unsupported)
+            )
+            built = len(manifest["kernels"]) if manifest else 0
+            print(
+                f"INWENTARZ: {built} z {len(kernels)} kerneli kompiluje sie dla "
+                f"{manifest['arch'] if manifest else '?'}; {len(unsupported)} nie. "
+                f"Lista: {report}"
+            )
+            print("publikacja pominieta (zestaw niepelny)")
+            return manifest
         if manifest is None or len(manifest["kernels"]) != len(kernels):
             raise RuntimeError("niepelny manifest po kompilacji")
         staged_arch = publication_root / manifest["arch"]
@@ -252,8 +350,12 @@ def compile_catalog(kernels, portable_nvfp4):
                 if not source.is_file():
                     raise RuntimeError(f"brak wymaganego cubina {source}")
                 shutil.copy2(source, staged_arch / cubin)
-        expected = {f"{artifact}.ptx" for _, _, artifact in kernels}
-        actual = {path.name for path in staged_arch.glob("*.ptx")}
+        expected = {manifest["kernels"][artifact]["file"] for _, _, artifact in kernels}
+        actual = {
+            path.name
+            for path in staged_arch.iterdir()
+            if path.suffix in (".ptx", ".hsaco")
+        }
         if actual != expected:
             raise RuntimeError("staging zawiera niepelny lub nadmiarowy zestaw PTX")
         manifest_path = staged_arch / "manifest.json"
