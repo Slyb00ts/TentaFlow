@@ -12,6 +12,33 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Macierz porównawcza FORGE vs vLLM vs llama.cpp (2026-07-25).** Pełny
+  protokół i tabele: `docs/BENCH_MATRIX_2026-07-25.md`. Bielik-7B NVFP4,
+  współbieżność FORGE/vLLM: decode-only 158/165 tok/s przy C=1 (0,96x) i
+  2 746/4 113 przy C=32 (0,67x) — rozjazd rośnie z batchem i widać go wprost
+  w TPOT (vLLM 6,04→7,52 ms od C=1 do C=32, FORGE 6,07→10,93). p1024/o128:
+  771/853 tok/s przy C=32 (0,90x), ale mediana TTFT FORGE trzyma 123-206 ms
+  w całym zakresie, a vLLM skacze do 630 ms przy C=32 (FORGE 3,1x lepiej) i
+  traci przepustowość między C=16 a C=32. Pojedynczy strumień, dokładnie 1024
+  tokeny promptu, FORGE/llama.cpp: qwen3-0,6B prefill 0,95x i decode 1,03x;
+  Mistral-7B Q4_K_M prefill **1,16x** (14 772 wobec 12 704) i decode 0,94x;
+  ThinkingCap-Qwen3.6-27B prefill 0,83x i decode **2,33x** (111,7 wobec 47,9 —
+  zysk pochodzi z natywnego MTP, bez spekulacji jest 42,2 czyli 0,88x).
+  Bielika llama.cpp nie ładuje (compressed-tensors NVFP4).
+  GRANICA METODY: uprząż HTTP `vllm bench serve` liczy własnym tokenizerem
+  zarówno prompty, JAK I wyjście, więc nadaje się tylko gdy tokenizer klienta
+  jest tokenizerem serwera — prompty „1024-tokenowe" z tokenizera Bielika
+  re-tokenizują się do ~2900-3000 pod Mistralem i llama.cpp odrzuciło 223
+  żądania. Rzetelna współbieżność z llama.cpp wymaga tokenizerów HF dla GGUF
+  albo batchowego bencha w FORGE; nie ma dziś ani jednego, ani drugiego.
+- 🟡 **`forge bench` rozjeżdża się z produkcją i z determinizmem (2026-07-25).**
+  Auto-fp8 prefill dla gęstego GGUF włącza się wyłącznie w `serve`, więc `bench`
+  zaniża prefill Mistrala **2,3x** (6 332 wobec 14 772 tok/s z
+  `FORGE_GEMM=fp8mod`) — każdy pomiar prefillu GGUF bez tej zmiennej jest
+  nieporównywalny z produkcją. Osobno: `bench` na Mistralu Q4_K przerywa własną
+  kontrolą `greedy token IDs differ between benchmark repetitions`, a
+  `--prefix-cache off` naprawia powtarzalność. Ten sam request może więc dać
+  inne tokeny w zależności od stanu cache'u prefiksów. Oba punkty otwarte.
 - ✅ **rmsnorm z residuałem: rozwinięcie odczytów w locie (2026-07-25).**
   Profil pokazał `rmsnorm_residual_f16` na ~138 GB/s i 4,6% czasu GPU: batchowy
   decode startuje jeden blok na token, więc krok B=32 zajmuje 32 z 128 SM,
