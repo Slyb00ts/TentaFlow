@@ -97,9 +97,14 @@ fn kv_layer_byte_diff(
     (compare(&model.kv.k[layer]), compare(&model.kv.v[layer]))
 }
 
+/// Oba testy ładują pełnego Bielika z pulą wag 12 GB, więc równolegle nie
+/// mieszczą się w VRAM (`.expect("cuda device")` pada przy tworzeniu drugiego
+/// urządzenia). Mutex serializuje je w obrębie binarki testowej.
+static BIELIK_GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 #[ignore = "requires a CUDA GPU and the local Bielik snapshot"]
 fn batched_reproduces_golden() {
+    let _serialized = BIELIK_GPU.lock().unwrap_or_else(|e| e.into_inner());
     let path = Path::new(BIELIK_DIR);
     if !path.is_dir() {
         eprintln!("skipping: Bielik snapshot missing at {BIELIK_DIR}");
@@ -330,6 +335,7 @@ fn batched_reproduces_golden() {
 #[test]
 #[ignore = "requires a CUDA GPU and the local Bielik snapshot"]
 fn scheduler_prefill_p1024_o256_b1_b4_b8_b16() {
+    let _serialized = BIELIK_GPU.lock().unwrap_or_else(|e| e.into_inner());
     let path = Path::new(BIELIK_DIR);
     if !path.is_dir() {
         eprintln!("skipping: Bielik snapshot missing at {BIELIK_DIR}");

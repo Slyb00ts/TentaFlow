@@ -58,6 +58,35 @@ Ostatnia aktualizacja: 2026-07-25.
   `dense_prefill_artifacts_capable` wymagało już poprawnych
   `topk_batched_{partial,final}_f32`; nieaktualny był wyłącznie test.
   `forge-kernels` przechodzi w całości (42+9+70+1).
+- ❌ **Głowa logitów FP8 w batchowym decode: ZMIERZONA I ODRZUCONA
+  (2026-07-25).** Profil B=32 pokazał głowę F16 jako 5% czasu GPU przy 465 GB/s
+  (262 MB na krok), a paczka `fp8_lm_head` już istnieje — kusząco. Implementacja
+  przeszła: `gemm_fp8_impl` sparametryzowany typem wyjścia, trzy instancje
+  `gemm_fp8_out_f32{,_bm64,_big}`, wspólne ciało `gemm_fp8_family` dla obu
+  rodzin (bez duplikacji kwantyzacji aktywacji) i routing w `logits_gemm`.
+  Zysk: 0,56 → około 0,28 ms z 8,3 ms kroku, czyli 3,4%.
+  POWÓD ODRZUCENIA: `batched_reproduces_golden` przechodzi przed zmianą i
+  failuje po — głowa e4m3 ma 3-bitową mantysę w warstwie, która WPROST wybiera
+  token, więc strumień greedy się przestawia. Jedyną „walidacją" byłoby
+  przepisanie wzorcowych ID pod wersję gorszą numerycznie. Całość wycofana
+  (kernele, rejestracje, routing, manifest wrócił do 474).
+  LEPSZY CEL: głowa F16 czyta 262 MB w 563 us, czyli 465 GB/s — przy attention
+  na 776 GB/s w tym samym kroku jest tam około 0,23 ms do wzięcia BEZ zmiany
+  numeryki, samym strojeniem `gemm_f16_out_f32`.
+  ZNALEZISKO PRZY OKAZJI: `logits_gemv` (ścieżka jednostrumieniowa) PREFERUJE
+  `fp8_lm_head`, gdy paczki są zbudowane, a ścieżka batchowa używa F16 — czyli
+  na Bieliku z auto-fp8 pojedynczy strumień ma logity e4m3, a batch nie.
+  Wzorcowe ID w `batched_bielik` kodują zachowanie batchowe (F16). To realna
+  niespójność: jakość zależy od współbieżności, tylko odwrotnie niż zakładałem.
+  Do rozstrzygnięcia osobno — kandydatem jest odebranie FP8 głowie także w
+  ścieżce jednostrumieniowej.
+- ✅ **Dwa testy Bielika nie mogły lecieć równolegle (2026-07-25).**
+  `batched_reproduces_golden` i `scheduler_prefill_p1024_o256_b1_b4_b8_b16`
+  ładują pełnego Bielika z pulą wag 12 GB każdy, więc drugi
+  `.expect("cuda device")` padał na VRAM. Osobno przechodziły, razem nie —
+  serializuje je teraz mutex `BIELIK_GPU`, tak jak `PREPARED_Q8_SCRATCH`
+  w `forge-kernels`. `cargo test -p forge-server --test batched_bielik --
+  --ignored` daje 2/2.
 - ✅ **Batchowane projekcje DeltaNet: Qwen3.6-27B 71 → 109 tok/s (2026-07-25).**
   Profil `nsys` przy B=8 pokazał, że `gemv_q8_0_dp4a` to **37,9% czasu GPU i
   1526 launchy na krok** — dokładnie 8 lane'ów x 64 warstwy x 3 projekcje
