@@ -187,7 +187,10 @@ pub trait EventImpl: Send + Sync {
 }
 
 pub trait ModuleImpl: Send + Sync {
-    fn kernel(&self, name: &str) -> Result<KernelHandle>;
+    /// Odbiornikiem jest `Arc<Self>`, żeby uchwyt kernela mógł ZATRZYMAĆ moduł.
+    /// Bez tego backend, który odładowuje moduł w `Drop` (HIP), zwalnia kod
+    /// zaraz po pobraniu uchwytu — rejestr kerneli trzyma bowiem tylko uchwyty.
+    fn kernel(self: Arc<Self>, name: &str) -> Result<KernelHandle>;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -314,7 +317,7 @@ impl Event {
 impl Module {
     /// Resolve a kernel entry point by its exported (extern "C") name.
     pub fn kernel(&self, name: &str) -> Result<KernelHandle> {
-        self.0.kernel(name)
+        Arc::clone(&self.0).kernel(name)
     }
 }
 

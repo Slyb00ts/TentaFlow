@@ -460,7 +460,7 @@ impl Drop for HipModule {
 }
 
 impl ModuleImpl for HipModule {
-    fn kernel(&self, name: &str) -> Result<KernelHandle> {
+    fn kernel(self: Arc<Self>, name: &str) -> Result<KernelHandle> {
         let symbol = CString::new(name)
             .map_err(|_| ForgeError::Device(format!("nazwa kernela {name} zawiera zero")))?;
         let mut func: HipFunctionRaw = std::ptr::null_mut();
@@ -471,6 +471,7 @@ impl ModuleImpl for HipModule {
         Ok(KernelHandle::from_impl(Arc::new(HipKernel {
             func,
             name: name.to_string(),
+            _module: self,
         })))
     }
     fn as_any(&self) -> &dyn Any {
@@ -481,6 +482,9 @@ impl ModuleImpl for HipModule {
 struct HipKernel {
     func: HipFunctionRaw,
     name: String,
+    /// Trzyma moduł żywym: `func` jest wskaźnikiem w jego obrazie kodu, a
+    /// `hipModuleUnload` w `Drop` modułu unieważniłby go.
+    _module: Arc<HipModule>,
 }
 
 unsafe impl Send for HipKernel {}
@@ -728,6 +732,9 @@ impl Device for HipDevice {
     ) -> Result<()> {
         let kernel = kernel.downcast::<HipKernel>()?;
         let stream = stream.downcast::<HipStream>()?;
+        // Wybór urządzenia w HIP jest STANEM WĄTKU, a silnik uruchamia kernele
+        // z wątku roboczego, który nigdy nie wołał `hipSetDevice`.
+        self.bind()?;
         // Parametry to wskaźniki na 8-bajtowe sloty zebrane przez builder;
         // `&args` gwarantuje stabilność adresów na czas uruchomienia.
         let mut params: Vec<*mut c_void> = args

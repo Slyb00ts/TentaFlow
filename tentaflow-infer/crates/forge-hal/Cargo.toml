@@ -18,4 +18,5 @@ tracing.workspace = true
 cudarc = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json.workspace = true
 forge-types.workspace = true

@@ -264,7 +264,7 @@ struct CudaModuleImpl {
 }
 
 impl ModuleImpl for CudaModuleImpl {
-    fn kernel(&self, name: &str) -> Result<KernelHandle> {
+    fn kernel(self: Arc<Self>, name: &str) -> Result<KernelHandle> {
         self.raw
             .ctx
             .bind_to_thread()

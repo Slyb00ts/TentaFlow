@@ -286,3 +286,89 @@ extern "C" __global__ void scale_add(float* out, const float* in, float k, int n
     let image = std::fs::read(&obj).unwrap();
     Some((dev.load_module(&image).unwrap(), dir))
 }
+
+/// Uruchamia kernel z artefaktu ZBUDOWANEGO PRZEZ MOJO, a nie przez `hipcc`.
+///
+/// Rozróżnienie nie jest akademickie: te dwa code objecty mają inne metadane
+/// argumentów (Mojo nie emituje ukrytych argumentów HIP), a `hipModuleLaunchKernel`
+/// pakuje kernarg właśnie po metadanych. Ten test jest kontraktem między
+/// generatorem artefaktów a backendem — jeśli pęknie, silnik przestaje ruszać na
+/// AMD, choć test z `hipcc` przechodzi.
+#[test]
+fn mojo_artifact_launches() {
+    let Some(dev) = device() else { return };
+    let arch = dev.caps().arch.clone();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/mojo/build")
+        .join(&arch);
+    let manifest_path = dir.join("manifest.json");
+    if !manifest_path.is_file() {
+        eprintln!("pominięto: brak katalogu kerneli dla {arch}");
+        return;
+    }
+    // `gather_rows_f16(out, table, ids, n_rows, n_cols)` — pierwszy kernel, jaki
+    // uruchamia silnik, i zarazem najprostszy do sprawdzenia bez matematyki.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let entry = &manifest["kernels"]["gather_rows_f16"];
+    if entry.is_null() {
+        eprintln!("pominięto: katalog {arch} nie ma gather_rows_f16");
+        return;
+    }
+    let image = std::fs::read(dir.join(entry["file"].as_str().unwrap())).unwrap();
+    // Uchwyt MUSI przeżyć porzucenie `Module` — dokładnie tak robi rejestr
+    // kerneli, który trzyma tylko uchwyty.
+    let kernel = {
+        let module = dev.load_module(&image).unwrap();
+        module.kernel(entry["entry"].as_str().unwrap()).unwrap()
+    };
+
+    let cols = 8usize;
+    let rows = 4usize;
+    let table = dev
+        .alloc(rows * cols * 2, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let ids = dev.alloc(2 * 4, MemKind::Device, Pool::Weights).unwrap();
+    let out = dev
+        .alloc(2 * cols * 2, MemKind::Device, Pool::Weights)
+        .unwrap();
+    // Wiersz 2 tabeli wypełniony wartością 1.0 w f16 (0x3C00), reszta zerami.
+    let mut host = vec![0u8; rows * cols * 2];
+    for i in 0..cols {
+        host[(2 * cols + i) * 2] = 0x00;
+        host[(2 * cols + i) * 2 + 1] = 0x3C;
+    }
+    dev.write(&host, &table, 0).unwrap();
+    dev.write(&2u32.to_le_bytes(), &ids, 0).unwrap();
+    dev.write(&2u32.to_le_bytes(), &ids, 4).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let cfg = LaunchConfig {
+        grid: (2, 1, 1),
+        block: (cols as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let args = LaunchArgs::new()
+        .buf(&out)
+        .buf(&table)
+        .buf(&ids)
+        .scalar(rows as i64)
+        .scalar(cols as i64);
+    // Silnik uruchamia kernele z wątku roboczego, a wybór urządzenia w HIP jest
+    // stanem wątku — dlatego launch idzie tu z osobnego wątku, nie z głównego.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            dev.launch(&kernel, &cfg, &args, &stream).unwrap();
+            dev.synchronize().unwrap();
+        });
+    });
+
+    let mut got = vec![0u8; 2 * cols * 2];
+    dev.read(&out, 0, &mut got).unwrap();
+    for token in 0..2 {
+        for i in 0..cols {
+            let bits = u16::from_le_bytes([got[(token * cols + i) * 2], got[(token * cols + i) * 2 + 1]]);
+            assert_eq!(bits, 0x3C00, "token {token}, element {i}: {bits:#06x}");
+        }
+    }
+}
