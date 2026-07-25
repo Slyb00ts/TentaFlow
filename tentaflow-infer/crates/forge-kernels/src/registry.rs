@@ -623,6 +623,15 @@ impl KernelArtifacts {
     }
 
     fn load_embedded(device: &dyn Device, arch: &str) -> Result<Self> {
+        // Wkompilowany zestaw to PTX i cubiny NVIDII. Inna architektura ma
+        // własne artefakty (AMD: HSACO), których nie wkompilowujemy — bez tego
+        // komunikatu sterownik zgłasza tylko nieczytelny błąd ładowania modułu.
+        if device.caps().vendor != forge_types::Vendor::Nvidia {
+            return Err(ForgeError::Kernel(format!(
+                "wkompilowane artefakty są tylko dla NVIDII, a urządzenie zgłasza {arch}; \
+                 zbuduj katalog kerneli dla tej architektury i wskaż go w FORGE_KERNEL_DIR"
+            )));
+        }
         // Przenośny PTX Mojo ma `.target sm_80`, a sterownik JIT kompiluje go
         // dla bieżącej karty. Moduły z `.target sm_89` wymagają Ada lub nowszej
         // architektury, natomiast cubiny SASS są ładowane tylko na dokładnym sm_89.

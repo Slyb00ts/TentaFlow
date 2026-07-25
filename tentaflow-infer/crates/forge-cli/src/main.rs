@@ -20,7 +20,7 @@ use forge_engine::speculation::{ProposerKind, SpeculationKind};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::weights::NvFp4CtLayoutPolicy;
 use forge_formats::PoolingType;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{gpu, PoolSizes};
 use forge_hal::Device;
 use forge_engine::model::Fp8PackOutcome;
 use forge_server::source::{
@@ -922,7 +922,7 @@ fn load_for_serve(
     let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
-    let free = CudaDevice::free_vram(0).context("query free VRAM")?;
+    let free = gpu::free_vram(0).context("query free VRAM")?;
     let weights_budget = free.saturating_sub(pool_reserve_bytes(kv_pool, activations)?);
     let weights = if weights_pool_gb > 0.0 {
         ((weights_pool_gb * (1u64 << 30) as f64) as usize)
@@ -936,7 +936,7 @@ fn load_for_serve(
         // KV tiering lives inside the pool, so the budget already covers it).
         weights_budget.max(1 << 30)
     };
-    let device = CudaDevice::new(
+    let dev: Arc<dyn Device> = gpu::open(
         0,
         PoolSizes {
             weights,
@@ -945,8 +945,7 @@ fn load_for_serve(
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
     )
-    .context("create CUDA device")?;
-    let dev: Arc<dyn Device> = device;
+    .context("open GPU device")?;
     let cfg = ModelConfig {
         kv_page_size,
         kv_pages,
@@ -1028,11 +1027,11 @@ fn load_auto(
             .checked_add(stage)
             .context("rozmiar puli wag i staging przekracza zakres usize")?
     } else {
-        let free = CudaDevice::free_vram(0).context("query free VRAM")?;
+        let free = gpu::free_vram(0).context("query free VRAM")?;
         free.saturating_sub(pool_reserve_bytes(hal_kv, activations)?)
             .max(1 << 30)
     };
-    let device = CudaDevice::new(
+    let dev: Arc<dyn Device> = gpu::open(
         0,
         PoolSizes {
             weights,
@@ -1041,8 +1040,7 @@ fn load_auto(
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
     )
-    .context("create CUDA device")?;
-    let dev: Arc<dyn Device> = device;
+    .context("open GPU device")?;
     load_model(
         dev,
         path,
@@ -1060,7 +1058,7 @@ fn load_auto(
     )
 }
 
-/// Load a Whisper model on its own CudaDevice with pools sized from the
+/// Load a Whisper model on its own GPU device with pools sized from the
 /// snapshot: safetensors bytes bound the f16 upload (most tensors are f32,
 /// halved on upload) and 1 GiB covers the persistent activation scratch.
 /// A separate device instance keeps Whisper's weights-pool allocations away
@@ -1076,7 +1074,7 @@ fn load_whisper(dir: &Path) -> Result<forge_server::SharedWhisper> {
     if tensor_bytes == 0 {
         bail!("no .safetensors files in {}", dir.display());
     }
-    let device = CudaDevice::new(
+    let dev: Arc<dyn Device> = gpu::open(
         0,
         PoolSizes {
             weights: tensor_bytes as usize + (1 << 30),
@@ -1085,8 +1083,7 @@ fn load_whisper(dir: &Path) -> Result<forge_server::SharedWhisper> {
             kv_page_size: 256 << 10,
         },
     )
-    .context("create CUDA device for whisper")?;
-    let dev: Arc<dyn Device> = device;
+    .context("open GPU device for whisper")?;
     let model = forge_whisper::WhisperModel::load(dev, dir)
         .with_context(|| format!("load whisper model from {}", dir.display()))?;
     Ok(Arc::new(tokio::sync::Mutex::new(model)))
@@ -1101,14 +1098,13 @@ fn parse_pooling(s: &str) -> Result<PoolingType> {
     }
 }
 
-/// Load an embedding model on its own CudaDevice (like Whisper), resolving its
+/// Load an embedding model on its own GPU device (like Whisper), resolving its
 /// pooling and normalization from metadata. A `None` pooling degrades to mean.
 /// Pools auto-size from free VRAM (the model loads after the chat engine has
 /// already taken its own device pool).
 fn load_embed(path: &Path, model_id: String) -> Result<SharedEmbed> {
-    let device =
-        CudaDevice::with_default_pools(0).context("create CUDA device for embedding model")?;
-    let dev: Arc<dyn Device> = device;
+    let dev: Arc<dyn Device> =
+        gpu::open_default_pools(0).context("open GPU device for embedding model")?;
     let loaded = load_model(dev, path, ModelConfig::default())
         .with_context(|| format!("load embedding model from {}", path.display()))?;
     let params = &loaded.model.weights.descriptor.params;
@@ -1249,7 +1245,7 @@ fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Res
         })
         .collect();
 
-    let device = CudaDevice::new(
+    let dev: Arc<dyn Device> = gpu::open(
         0,
         PoolSizes {
             weights: 64 << 20,
@@ -1258,8 +1254,7 @@ fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Res
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
     )
-    .context("create CUDA device")?;
-    let dev: Arc<dyn Device> = device;
+    .context("open GPU device")?;
     let session = forge_onnx::load_session(dev, model_path)?;
 
     let mut named = std::collections::HashMap::new();

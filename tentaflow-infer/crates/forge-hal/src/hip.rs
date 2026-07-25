@@ -1,9 +1,8 @@
 // ===== File: hip.rs — forge-hal: HIP/ROCm backend (device, memory, module load, launch) =====
-// Pierwszy pionowy przekrój backendu AMD: wykrycie urządzenia, pamięć, streamy,
-// eventy, ładowanie code objectu (HSACO) i uruchomienie kernela. Areny pul i
-// grafy CUDA-graph nie są jeszcze wpięte — `DeviceCaps::supports_graph_capture`
-// raportuje `false`, a `alloc` przydziela wprost przez `hipMalloc`, więc żadna
-// warstwa wyżej nie zakłada semantyki, której backend nie ma.
+// Pełny odpowiednik backendu CUDA dla AMD: wykrycie urządzenia, trzy pule VRAM
+// na tych samych arenach (bump/slab/ring), streamy, eventy z pomiarem czasu,
+// ładowanie code objectu (HSACO), uruchamianie kerneli oraz przechwytywanie
+// i odtwarzanie grafów.
 
 use std::any::Any;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
@@ -43,6 +42,7 @@ extern "C" {
     fn hipGetDeviceCount(count: *mut c_int) -> c_int;
     fn hipSetDevice(device: c_int) -> c_int;
     fn hipDeviceSynchronize() -> c_int;
+    fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
     fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     fn hipFree(ptr: *mut c_void) -> c_int;
     fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
@@ -200,6 +200,14 @@ impl HipDevice {
             supports_p2p: false,
             supports_graph_capture: true,
         };
+        let requested = pools.total()?;
+        let free = mem_get_info()?.0;
+        if requested > free {
+            return Err(ForgeError::OutOfMemory {
+                requested,
+                available: free,
+            });
+        }
         let kv_page = if pools.kv_page_size == 0 {
             PoolSizes::DEFAULT_KV_PAGE
         } else {
@@ -223,6 +231,31 @@ impl HipDevice {
         }))
     }
 
+    /// Otwiera urządzenie z domyślnym budżetem: 90% wolnego VRAM w chwili
+    /// tworzenia (patrz `PoolSizes::auto_from_free`).
+    pub fn with_default_pools(ordinal: usize) -> Result<Arc<Self>> {
+        let free = Self::free_vram(ordinal)?;
+        Self::new(ordinal, PoolSizes::auto_from_free(free))
+    }
+
+    /// `(wolne, całkowite)` w bajtach dla już otwartego urządzenia.
+    pub fn mem_info(&self) -> Result<(usize, usize)> {
+        self.bind()?;
+        mem_get_info()
+    }
+
+    /// Wolny VRAM w bajtach bez trzymania urządzenia — do wymiarowania pul,
+    /// które zajmują cały swój budżet od razu przy tworzeniu.
+    pub fn free_vram(ordinal: usize) -> Result<usize> {
+        let ordinal = c_int::try_from(ordinal)
+            .map_err(|_| ForgeError::Device("numer urządzenia HIP poza zakresem".into()))?;
+        unsafe {
+            check(hipInit(0), "hipInit")?;
+            check(hipSetDevice(ordinal), "hipSetDevice")?;
+        }
+        Ok(mem_get_info()?.0)
+    }
+
     fn pool(&self, pool: Pool) -> &Arc<HipPool> {
         match pool {
             Pool::Weights => &self.weights,
@@ -234,6 +267,17 @@ impl HipDevice {
     fn bind(&self) -> Result<()> {
         check(unsafe { hipSetDevice(self.ordinal) }, "hipSetDevice")
     }
+}
+
+/// `(wolne, całkowite)` dla urządzenia aktualnie ustawionego w tym wątku.
+fn mem_get_info() -> Result<(usize, usize)> {
+    let mut free = 0usize;
+    let mut total = 0usize;
+    check(
+        unsafe { hipMemGetInfo(&mut free, &mut total) },
+        "hipMemGetInfo",
+    )?;
+    Ok((free, total))
 }
 
 enum PoolArena {

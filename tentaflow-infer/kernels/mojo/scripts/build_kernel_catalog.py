@@ -228,7 +228,7 @@ def compile_catalog(kernels, portable_nvfp4):
         "MODULAR_NVPTX_COMPILER_PATH", str(ROOT / "scripts" / "ptxas_fp8_shim.sh")
     )
     fail_after = int(os.environ.get("FORGE_KERNEL_BUILD_FAIL_AFTER", "0"))
-    inventory = os.environ.get("FORGE_KERNEL_BUILD_INVENTORY") == "1"
+    partial = os.environ.get("FORGE_KERNEL_BUILD_PARTIAL") == "1"
     unsupported = []
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     manifest = None
@@ -252,8 +252,8 @@ def compile_catalog(kernels, portable_nvfp4):
                         cwd=temporary_path,
                         env=environment,
                         check=True,
-                        capture_output=inventory,
-                        text=inventory,
+                        capture_output=partial,
+                        text=partial,
                     )
                 except subprocess.CalledProcessError as failure:
                     for stale in list(temporary_path.glob("*.ptx")) + list(
@@ -261,11 +261,13 @@ def compile_catalog(kernels, portable_nvfp4):
                     ):
                         stale.unlink()
                     if len(items) == 1:
-                        # Tryb inwentarza: zamiast przerywać na pierwszym kernelu,
-                        # który nie kompiluje się dla tej architektury, zapisujemy go
-                        # i idziemy dalej. Publikacja jest wtedy WYŁĄCZONA, bo zestaw
-                        # byłby niepełny — to narzędzie do planowania portu.
-                        if inventory:
+                        # Tryb czastkowy (port na nowa architekture): kernel,
+                        # ktory sie nie kompiluje, jest zapisywany na liste i
+                        # pomijany. Publikowany katalog jest wtedy niepelny, a
+                        # brakujacy kernel zglasza sie dopiero przy uruchomieniu
+                        # ('kernel not loaded') — to jedyny tryb, w ktorym to
+                        # dopuszczamy, bo architektura jest w trakcie portu.
+                        if partial:
                             symbol, artifact = items[0]
                             unsupported.append(
                                 (artifact, (failure.stderr or "").strip().splitlines()[-1:] or [""])
@@ -328,20 +330,9 @@ def compile_catalog(kernels, portable_nvfp4):
                 if fail_after and compiled_units >= fail_after:
                     raise RuntimeError(f"wymuszony błąd po jednostce {compiled_units}")
 
-        if inventory:
-            report = OUTPUT_ROOT / "inventory-unsupported.txt"
-            report.write_text(
-                "".join(f"{artifact}\t{reason[0]}\n" for artifact, reason in unsupported)
-            )
-            built = len(manifest["kernels"]) if manifest else 0
-            print(
-                f"INWENTARZ: {built} z {len(kernels)} kerneli kompiluje sie dla "
-                f"{manifest['arch'] if manifest else '?'}; {len(unsupported)} nie. "
-                f"Lista: {report}"
-            )
-            print("publikacja pominieta (zestaw niepelny)")
-            return manifest
-        if manifest is None or len(manifest["kernels"]) != len(kernels):
+        if manifest is None:
+            raise RuntimeError("zaden kernel sie nie skompilowal")
+        if not partial and len(manifest["kernels"]) != len(kernels):
             raise RuntimeError("niepelny manifest po kompilacji")
         staged_arch = publication_root / manifest["arch"]
         if requires_sm89_cubins(manifest["arch"]):
@@ -350,19 +341,29 @@ def compile_catalog(kernels, portable_nvfp4):
                 if not source.is_file():
                     raise RuntimeError(f"brak wymaganego cubina {source}")
                 shutil.copy2(source, staged_arch / cubin)
-        expected = {manifest["kernels"][artifact]["file"] for _, _, artifact in kernels}
+        expected = set(manifest["kernels"][artifact]["file"] for artifact in manifest["kernels"])
         actual = {
             path.name
             for path in staged_arch.iterdir()
             if path.suffix in (".ptx", ".hsaco")
         }
         if actual != expected:
-            raise RuntimeError("staging zawiera niepelny lub nadmiarowy zestaw PTX")
+            raise RuntimeError("staging zawiera niepelny lub nadmiarowy zestaw artefaktow")
         manifest_path = staged_arch / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         destination = OUTPUT_ROOT / manifest["arch"]
         publish_arch(staged_arch, destination)
-        print(f"zapisano {len(kernels)} kerneli: {destination / 'manifest.json'}")
+        if partial:
+            report = destination / "unsupported.txt"
+            report.write_text(
+                "".join(f"{artifact}\t{reason[0]}\n" for artifact, reason in unsupported)
+            )
+            print(
+                f"zapisano {len(manifest['kernels'])} z {len(kernels)} kerneli dla "
+                f"{manifest['arch']}; {len(unsupported)} sie nie kompiluje. Lista: {report}"
+            )
+        else:
+            print(f"zapisano {len(kernels)} kerneli: {destination / 'manifest.json'}")
 
 
 def main():

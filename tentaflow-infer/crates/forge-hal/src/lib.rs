@@ -8,13 +8,15 @@
 
 // Offset arenas are consumed by GPU backends only; the CPU backend allocates
 // per-buffer from the host allocator.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip"))]
 pub(crate) mod arena;
 pub mod cpu;
 #[cfg(feature = "hip")]
 pub mod hip;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(any(feature = "cuda", feature = "hip"))]
+pub mod gpu;
 
 use std::any::Any;
 use std::sync::Arc;

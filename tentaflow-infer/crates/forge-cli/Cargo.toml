@@ -9,6 +9,11 @@ license.workspace = true
 name = "forge"
 path = "src/main.rs"
 
+[features]
+# Backend AMD obok wkompilowanej na stałe CUDA (cudarc ładuje sterownik
+# dynamicznie, więc jedna binarka obsługuje obie karty; wybór w forge-hal::gpu).
+hip = ["forge-hal/hip"]
+
 [dependencies]
 forge-hal.workspace = true
 forge-types.workspace = true
