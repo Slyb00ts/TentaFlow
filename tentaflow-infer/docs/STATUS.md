@@ -243,12 +243,16 @@ Ostatnia aktualizacja: 2026-07-25.
   jeszcze je zwalniał, a sterownik GPU był już w trakcie własnej rozbiórki
   (`double free or corruption` z wnętrza `libamdhip64`, SIGABRT w wątku
   `forge-engine-worker`). `EngineHandle::shutdown` istniał i był wołany WYŁĄCZNIE
-  z testów. Teraz oba polecenia go wołają i wychodzą z kodem 0.
+  z testów. Pierwsza poprawka dodała go do `bench` i `run`, ale to za mało:
+  wyjście przez `?` (np. brakujący kernel) omija wywołanie i objaw wracał.
+  Trwała wersja zatrzymuje wątek w `Drop` uchwytu — `tx` jest w `Option`, żeby
+  `Drop` mógł rozłączyć kanał PRZED dołączeniem wątku (inaczej join czekałby na
+  wątek widzący żywego nadawcę). Teraz KAŻDA ścieżka wyjścia jest czysta, także
+  `serve` i wyjścia błędne.
   Diagnoza była myląca, bo objaw wyglądał na błąd backendu HIP: ślad miał tylko
   ramki ROCm i pojawiał się także wtedy, gdy przebieg kończył się wcześniej
   błędem. Rozstrzygnęło to, że abort leciał w wątku roboczym PO wypisaniu
   wyników. Na CUDA ta sama luka jest tylko niewidoczna, nie nieszkodliwa.
-  ZOSTAJE: `forge serve` też nie zatrzymuje silnika przy wyjściu.
 - ✅ **DWA BŁĘDY CZASU ŻYCIA W BACKENDZIE HIP — obie ścieżki były SIGSEGV
   (2026-07-25).** Silnik wywracał się na PIERWSZYM uruchomieniu kernela, w
   środku `hipModuleLaunchKernel`. Przyczyna: `KernelHandle` nie trzymał modułu,

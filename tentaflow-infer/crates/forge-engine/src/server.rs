@@ -93,9 +93,12 @@ struct Submission {
 }
 
 /// Cheap cloneable handle; the worker thread ends when all handles drop.
+///
+/// `tx` jest w `Option`, żeby `Drop` mógł ROZŁĄCZYĆ kanał przed dołączeniem
+/// wątku — inaczej join czekałby na wątek, który nadal widzi żywego nadawcę.
 #[derive(Clone)]
 pub struct EngineHandle {
-    tx: mpsc::Sender<Submission>,
+    tx: Option<mpsc::Sender<Submission>>,
     metrics: Arc<EngineMetrics>,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -105,6 +108,8 @@ impl EngineHandle {
     pub fn submit(&self, req: EngineRequest) -> Result<mpsc::Receiver<EngineEvent>> {
         let (etx, erx) = mpsc::channel();
         self.tx
+            .as_ref()
+            .ok_or_else(|| ForgeError::Scheduler("engine worker stopped".into()))?
             .send(Submission {
                 req,
                 events: etx,
@@ -122,26 +127,43 @@ impl EngineHandle {
     }
 
     /// Zamyka ostatni handle i czeka na zwolnienie modelu przez worker.
-    pub fn shutdown(self) -> Result<()> {
-        let Self {
-            tx,
-            metrics: _,
-            worker,
-        } = self;
-        if Arc::strong_count(&worker) != 1 {
+    pub fn shutdown(mut self) -> Result<()> {
+        if Arc::strong_count(&self.worker) != 1 {
             return Err(ForgeError::Scheduler(
                 "shutdown wymaga ostatniego klonu EngineHandle".into(),
             ));
         }
-        drop(tx);
-        let handle = worker
-            .lock()
-            .map_err(|_| ForgeError::Scheduler("blokada workera jest zatruta".into()))?
-            .take()
-            .ok_or_else(|| ForgeError::Scheduler("worker został już zatrzymany".into()))?;
-        handle
-            .join()
-            .map_err(|_| ForgeError::Scheduler("worker zakończył się panic".into()))
+        match self.stop() {
+            Some(Ok(())) => Ok(()),
+            Some(Err(_)) => Err(ForgeError::Scheduler(
+                "worker zakończył się panic".into(),
+            )),
+            None => Err(ForgeError::Scheduler(
+                "worker został już zatrzymany".into(),
+            )),
+        }
+    }
+
+    /// Rozłącza kanał i dołącza wątek roboczy, gdy to ostatni klon uchwytu.
+    /// `None` oznacza, że nie było czego zatrzymywać (inny klon jeszcze żyje
+    /// albo worker już stanął).
+    fn stop(&mut self) -> Option<std::thread::Result<()>> {
+        if Arc::strong_count(&self.worker) != 1 {
+            return None;
+        }
+        self.tx = None;
+        let handle = self.worker.lock().ok()?.take()?;
+        Some(handle.join())
+    }
+}
+
+impl Drop for EngineHandle {
+    /// Wątek roboczy trzyma model i zasoby urządzenia, więc musi stanąć ZANIM
+    /// proces zacznie je zwalniać. Bez tego wyjście przez błąd (albo dowolną
+    /// inną ścieżkę, która pomija `shutdown`) zostawia go w trakcie pracy, a
+    /// sterownik AMD wywraca wtedy stertę hosta przy rozbiórce procesu.
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -795,7 +817,7 @@ pub fn spawn_engine_batched(
         })
         .map_err(ForgeError::Io)?;
     Ok(EngineHandle {
-        tx,
+        tx: Some(tx),
         metrics,
         worker: Arc::new(Mutex::new(Some(worker))),
     })
