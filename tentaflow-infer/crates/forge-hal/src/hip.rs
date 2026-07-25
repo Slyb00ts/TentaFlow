@@ -545,6 +545,14 @@ impl Device for HipDevice {
     fn alloc(&self, bytes: usize, kind: MemKind, pool: Pool) -> Result<DevBuffer> {
         self.bind()?;
         let bytes = bytes.max(1);
+        if matches!(kind, MemKind::Managed) {
+            // Pamięć zarządzana nie jest zaimplementowana; bez tego warunku
+            // żądanie dostałoby zwykły bufor urządzenia i milcząco zgubiło
+            // dostęp z hosta.
+            return Err(ForgeError::Unsupported(
+                "backend HIP nie obsługuje pamięci zarządzanej".into(),
+            ));
+        }
         if matches!(kind, MemKind::PinnedHost) {
             let mut ptr: *mut c_void = std::ptr::null_mut();
             check(unsafe { hipHostMalloc(&mut ptr, bytes, 0) }, "hipHostMalloc")?;
