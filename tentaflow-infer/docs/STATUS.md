@@ -12,6 +12,33 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Pełny build katalogu przechodzi i cały workspace jest zielony poza jedną
+  znaną rozbieżnością (2026-07-25).** Build katalogu: 80 jednostek, 6
+  podzielonych automatycznie po błędzie offload kompilatora, **zapisano 474
+  kernele** — i odtworzył PTX oraz manifest BAJT W BAJT względem repo, czyli
+  artefakty w drzewie są dokładnie tym, co produkuje katalog. Wcześniejsza
+  „awaria" builda była moją pomyłką w monitorowaniu: `pgrep -f build_kernels.mojo`
+  dopasowywał własną linię poleceń bash, a proces zginął razem z pętlą
+  monitorującą po timeoucie; same błędy offloadu brały się z kontencji o GPU
+  (na karcie stał wtedy 27B).
+  Naprawione przy tym cztery rzeczy, wszystkie moje z wcześniejszych sesji:
+  (1) siedem plików testowych `forge-server` nie kompilowało się od dodania pola
+  `ModelConfig::nvfp4_ct_layout` — uzupełnione o `NvFp4CtLayoutPolicy::Auto`;
+  (2) `gemm_nvfp4_gguf_out_f32_{b4,b8,b16}` i nowy `gemm_nvfp4_gguf_f16_b16_nvidia`
+  były zadeklarowane jako przenośne w `PORTABLE_RAW_NVFP4`, ale katalog
+  kompilował je jako sm_89-only — na sm_80/sm_86 batchowa głowa logitów NVFP4 by
+  się nie wczytała; dopisane do predykatu przenośności i przebudowane do
+  `.target sm_80` z walidacją `ptxas -arch=sm_80`;
+  (3) wyczerpanie puli VRAM zwracało `ForgeError::Device(String)` zamiast
+  typowanego `OutOfMemory` — `map_err` w `CudaDevice::alloc` spłaszczał każdy
+  błąd areny, więc admission i tiering widziały zwykły błąd urządzenia; nowy
+  `pool_alloc_error` zachowuje wariant i loguje nazwę puli;
+  (4) sześć testów `forge-kernels` dzieli grow-only scratch `prepare_q8_1` i
+  nadpisywało sobie skwantyzowane aktywacje przy równoległym przebiegu (40/42
+  równolegle, 42/42 przy `--test-threads=1`) — serializuje je teraz jawny mutex
+  `PREPARED_Q8_SCRATCH`.
+  Stan końcowy: **605 testów przechodzi, 1 nie** — `batched_matches_single_seq`,
+  czyli udokumentowana wyżej rozbieżność precyzji ścieżek decode.
 - ✅ **Katalog kerneli uzgodniony z manifestem (2026-07-25).** Pełny build
   katalogu USUNĄŁBY 14 żywych kerneli i przywrócił zrewertowane — bo kolejne
   sesje dodawały kernele wyłącznie izolowanymi builderami, a `gemm_q6k_i8_native_*`
