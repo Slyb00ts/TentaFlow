@@ -207,17 +207,19 @@ Ostatnia aktualizacja: 2026-07-25.
   go w katalogu; domyślny wybór sprawdza teraz artefakt i schodzi na przenośny
   kernel skalarny (`AttnBackend::Scalar`), który jest zarazem bitową referencją.
   To był ostatni brakujący element, żeby prefill przeszedł end-to-end.
-- 🐞 **OTWARTY DEFEKT: sterta hosta psuje się przy rozbiórce procesu na ścieżce
-  AMD (2026-07-25).** Po WYPISANIU wyników `forge bench` proces kończy się
-  `double free or corruption` z wnętrza `libamdhip64` (SIGABRT w wątku
-  roboczym). Co wiem: (a) wyniki przed tym są stabilne przez 5 powtórzeń i
-  tekst jest spójny, więc nie wygląda na psucie żywych danych; (b) izolowany
-  test `whole_catalog_loads_and_unloads` ładuje i zwalnia wszystkie 347 modułów
-  BEZ błędu; (c) występuje też wtedy, gdy przebieg kończy się wcześnie błędem,
-  czyli nie wymaga grafów ani decode; (d) ślad ma wyłącznie ramki ROCm.
-  Nie jest to jeszcze zdiagnozowane i NIE WOLNO tego traktować jako kosmetyki,
-  dopóki nie zostanie znalezione — brak valgrinda na tej maszynie utrudnia
-  namiar; następny krok to build z ASan albo bisekcja w teście HIP.
+- ✅ **CLI nie zatrzymywało wątku roboczego silnika — na ROCm kończyło się to
+  uszkodzeniem sterty (2026-07-25).** `forge bench` i `forge run` po wypisaniu
+  wyników po prostu wychodziły, porzucając `EngineHandle`. Wątek roboczy trzyma
+  model i zasoby urządzenia, więc proces kończył się w chwili, gdy ten wątek
+  jeszcze je zwalniał, a sterownik GPU był już w trakcie własnej rozbiórki
+  (`double free or corruption` z wnętrza `libamdhip64`, SIGABRT w wątku
+  `forge-engine-worker`). `EngineHandle::shutdown` istniał i był wołany WYŁĄCZNIE
+  z testów. Teraz oba polecenia go wołają i wychodzą z kodem 0.
+  Diagnoza była myląca, bo objaw wyglądał na błąd backendu HIP: ślad miał tylko
+  ramki ROCm i pojawiał się także wtedy, gdy przebieg kończył się wcześniej
+  błędem. Rozstrzygnęło to, że abort leciał w wątku roboczym PO wypisaniu
+  wyników. Na CUDA ta sama luka jest tylko niewidoczna, nie nieszkodliwa.
+  ZOSTAJE: `forge serve` też nie zatrzymuje silnika przy wyjściu.
 - ✅ **DWA BŁĘDY CZASU ŻYCIA W BACKENDZIE HIP — obie ścieżki były SIGSEGV
   (2026-07-25).** Silnik wywracał się na PIERWSZYM uruchomieniu kernela, w
   środku `hipModuleLaunchKernel`. Przyczyna: `KernelHandle` nie trzymał modułu,

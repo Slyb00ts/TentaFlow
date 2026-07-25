@@ -1625,7 +1625,17 @@ fn cmd_run(
         outcome.generated,
         (outcome.prompt_tokens + outcome.generated) as f32 / dt
     );
+    shutdown_engine(engine)?;
     Ok(())
+}
+
+/// Zatrzymuje wątek roboczy silnika przed wyjściem z procesu.
+///
+/// Wątek trzyma model i zasoby urządzenia. Bez dołączenia go proces wychodzi w
+/// chwili, gdy on jeszcze je zwalnia, a sterownik GPU jest już w trakcie własnej
+/// rozbiórki — na ROCm kończy się to uszkodzeniem sterty hosta.
+fn shutdown_engine(engine: EngineHandle) -> Result<()> {
+    engine.shutdown().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Held-out passage for the perplexity gate — deliberately DISTINCT from the
@@ -2059,6 +2069,7 @@ fn cmd_bench(
         decode.p90 * 1000.0,
         last_generated.saturating_sub(1) as f64 / decode.median.max(1e-9)
     );
+    shutdown_engine(engine)?;
     Ok(())
 }
 
