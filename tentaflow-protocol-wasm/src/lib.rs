@@ -18753,3 +18753,303 @@ pub fn encode_project_studio_code_assist_request(
     ))
     .map_err(|e| JsError::new(&e))
 }
+
+// ----- Project Studio F4: run schedules, ML Studio links, kanban status,
+// project export/import -----
+// Same convention as F2/F3: multi-field mutating requests (ScheduleSave,
+// MlProjectCreateFromProject, MlLinkAttach, MlLinkUpdate, ProjectExportStart,
+// ProjectImportApply) take ONE snake_case JSON string parsed by serde; simple
+// requests keep explicit parameters. Every F4 response decodes through the
+// generic ProjectStudio path — none of them carries raw bytes (the export
+// archive is fetched over a signed URL, not the binary protocol).
+
+/// MessageBody::ProjectStudioBody(SchedulesListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSchedulesListRequest)]
+pub fn encode_project_studio_schedules_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SchedulesListRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleSaveRequest). `request_json` is the
+/// COMPLETE definition (schedule_id null = create); every omitted field is a
+/// real clear, so list-row toggles must use ScheduleSetEnabledRequest instead.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleSaveRequest)]
+pub fn encode_project_studio_schedule_save_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ScheduleSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleDeleteRequest)]
+pub fn encode_project_studio_schedule_delete_request(
+    project_id: String,
+    schedule_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleDeleteRequest {
+            project_id,
+            schedule_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleSetEnabledRequest) — enable/disable
+/// toggle that leaves the rest of the definition untouched.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleSetEnabledRequest)]
+pub fn encode_project_studio_schedule_set_enabled_request(
+    project_id: String,
+    schedule_id: String,
+    enabled: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleSetEnabledRequest {
+            project_id,
+            schedule_id,
+            enabled,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleRunNowRequest) — fires through the
+/// same gate chain as the loop and never moves `next_run_at`.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleRunNowRequest)]
+pub fn encode_project_studio_schedule_run_now_request(
+    project_id: String,
+    schedule_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleRunNowRequest {
+            project_id,
+            schedule_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleRunsListRequest) — trigger history
+/// of one schedule.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleRunsListRequest)]
+pub fn encode_project_studio_schedule_runs_list_request(
+    project_id: String,
+    schedule_id: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleRunsListRequest {
+            project_id,
+            schedule_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlLinksListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinksListRequest)]
+pub fn encode_project_studio_ml_links_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlLinksListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlProjectCreateFromProjectRequest).
+/// `request_json` carries the role_map array, so it goes through serde like
+/// the other multi-field mutations.
+#[wasm_bindgen(js_name = encodeProjectStudioMlProjectCreateFromProjectRequest)]
+pub fn encode_project_studio_ml_project_create_from_project_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("MlProjectCreateFromProjectRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MlProjectCandidatesRequest) — ML projects the
+/// caller OWNS and that are not linked yet.
+#[wasm_bindgen(js_name = encodeProjectStudioMlProjectCandidatesRequest)]
+pub fn encode_project_studio_ml_project_candidates_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlProjectCandidatesRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkAttachRequest). `request_json` carries
+/// the role_map array.
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkAttachRequest)]
+pub fn encode_project_studio_ml_link_attach_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("MlLinkAttachRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkUpdateRequest). `request_json` carries
+/// the role_map array.
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkUpdateRequest)]
+pub fn encode_project_studio_ml_link_update_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("MlLinkUpdateRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkDetachRequest) — `revoke_members` also
+/// removes the ML memberships this link granted; the ML project survives.
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkDetachRequest)]
+pub fn encode_project_studio_ml_link_detach_request(
+    project_id: String,
+    link_id: String,
+    revoke_members: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlLinkDetachRequest {
+            project_id,
+            link_id,
+            revoke_members,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkSyncNowRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkSyncNowRequest)]
+pub fn encode_project_studio_ml_link_sync_now_request(
+    project_id: String,
+    link_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlLinkSyncNowRequest {
+            project_id,
+            link_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskStatusSetRequest) — status-only kanban
+/// move; TaskSaveRequest would clear description_md and attachments.
+#[wasm_bindgen(js_name = encodeProjectStudioTaskStatusSetRequest)]
+pub fn encode_project_studio_task_status_set_request(
+    project_id: String,
+    task_id: String,
+    status: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskStatusSetRequest {
+            project_id,
+            task_id,
+            status,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectExportStartRequest). `request_json`
+/// carries the include_* switches; `include_user_names` copies display names
+/// into the archive (personal data — audited).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectExportStartRequest)]
+pub fn encode_project_studio_project_export_start_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectExportStartRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ProjectExportStatusRequest) — polling this is
+/// the source of truth; ArchiveStream is only a live view.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectExportStatusRequest)]
+pub fn encode_project_studio_project_export_status_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectExportStatusRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportUploadChunkRequest) — one raw
+/// chunk of an uploaded archive (`bytes` is a Uint8Array on the JS side);
+/// `upload_id` is client-minted and there is no project_id yet.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportUploadChunkRequest)]
+pub fn encode_project_studio_project_import_upload_chunk_request(
+    upload_id: String,
+    filename: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectImportUploadChunkRequest {
+            upload_id,
+            filename,
+            seq,
+            total_chunks,
+            bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportPreviewRequest) — reads ONLY the
+/// archive manifest; nothing is unpacked before the user confirms.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportPreviewRequest)]
+pub fn encode_project_studio_project_import_preview_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectImportPreviewRequest {
+            upload_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportApplyRequest). `request_json`
+/// carries the upload_id plus the name override and import switches.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportApplyRequest)]
+pub fn encode_project_studio_project_import_apply_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectImportApplyRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportStatusRequest) — addressed by
+/// job_id alone: the project row does not exist until the import succeeds.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportStatusRequest)]
+pub fn encode_project_studio_project_import_status_request(
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectImportStatusRequest {
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ArchiveStreamRequest) — STREAM-INITIATING (no
+/// plain response): chunks = ArchiveStreamChunk, end = ArchiveStreamEnd. Live
+/// progress of an export or import job, job owner only.
+#[wasm_bindgen(js_name = encodeProjectStudioArchiveStreamRequest)]
+pub fn encode_project_studio_archive_stream_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ArchiveStreamRequest { job_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}

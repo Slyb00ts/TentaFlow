@@ -6575,6 +6575,260 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  // --- Project Studio F4: run schedules, ML Studio links, kanban status,
+  // project export/import. Multi-field mutating requests (ScheduleSave,
+  // MlProjectCreateFromProject, MlLinkAttach, MlLinkUpdate, ProjectExportStart,
+  // ProjectImportApply) serialize the whole snake_case field set as ONE JSON
+  // string parsed by serde in WASM; simple requests keep explicit parameters
+  // like the F1/F2/F3 sections above. ---
+
+  /** MessageBody::ProjectStudioBody(SchedulesListRequest). payload: { projectId } — response also carries the node's serverTimezone. */
+  projectStudioSchedulesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioSchedulesListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ScheduleSaveRequest). payload: { projectId, scheduleId?, name, runType, suiteId?, caseIds?:[], environmentId?, runnerServiceId?, perfProfileJson?, assignmentMode?, assignees?:[], scheduleKind, scheduleExpr, timezone?, enabled } — scheduleId null = create; this is the COMPLETE definition, every omitted field is a real clear (use projectStudioScheduleSetEnabledRequest for the row toggle). */
+  projectStudioScheduleSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const scheduleId = payload.scheduleId ?? payload.schedule_id;
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      schedule_id: scheduleId == null || scheduleId === '' ? null : String(scheduleId),
+      name: String(payload.name ?? ''),
+      run_type: String(payload.runType ?? payload.run_type ?? ''),
+      suite_id: String(payload.suiteId ?? payload.suite_id ?? ''),
+      case_ids: (Array.isArray(payload.caseIds ?? payload.case_ids) ? (payload.caseIds ?? payload.case_ids) : []).map(String),
+      environment_id: String(payload.environmentId ?? payload.environment_id ?? ''),
+      runner_service_id: String(payload.runnerServiceId ?? payload.runner_service_id ?? ''),
+      perf_profile_json: String(payload.perfProfileJson ?? payload.perf_profile_json ?? ''),
+      assignment_mode: String(payload.assignmentMode ?? payload.assignment_mode ?? ''),
+      assignees: (Array.isArray(payload.assignees) ? payload.assignees : []).map(String),
+      schedule_kind: String(payload.scheduleKind ?? payload.schedule_kind ?? ''),
+      schedule_expr: String(payload.scheduleExpr ?? payload.schedule_expr ?? ''),
+      timezone: String(payload.timezone ?? ''),
+      enabled: !!(payload.enabled ?? false),
+    };
+    const body = _wasm.encodeProjectStudioScheduleSaveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ScheduleDeleteRequest). payload: { projectId, scheduleId }. */
+  projectStudioScheduleDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioScheduleDeleteRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.scheduleId ?? payload.schedule_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ScheduleSetEnabledRequest). payload: { projectId, scheduleId, enabled } — row toggle; re-enabling recomputes nextRunAt and clears the breaker. */
+  projectStudioScheduleSetEnabledRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioScheduleSetEnabledRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.scheduleId ?? payload.schedule_id ?? ''),
+      !!(payload.enabled ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ScheduleRunNowRequest). payload: { projectId, scheduleId } — fires through the same gate chain as the loop, never moves nextRunAt. */
+  projectStudioScheduleRunNowRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioScheduleRunNowRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.scheduleId ?? payload.schedule_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ScheduleRunsListRequest). payload: { projectId, scheduleId, limit? } — trigger history of one schedule. */
+  projectStudioScheduleRunsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioScheduleRunsListRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.scheduleId ?? payload.schedule_id ?? ''),
+      Number(payload.limit ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(MlLinksListRequest). payload: { projectId } — response carries canManage for the create/attach/detach actions. */
+  projectStudioMlLinksListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioMlLinksListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(MlProjectCreateFromProjectRequest). payload: { projectId, mlName, projectType, roleMap:[{projectRole, mlRole}], syncPermissions, label? }. */
+  projectStudioMlProjectCreateFromProjectRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const roleMap = payload.roleMap ?? payload.role_map;
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      ml_name: String(payload.mlName ?? payload.ml_name ?? ''),
+      project_type: String(payload.projectType ?? payload.project_type ?? ''),
+      role_map: (Array.isArray(roleMap) ? roleMap : []).map((r) => ({
+        project_role: String(r.projectRole ?? r.project_role ?? ''),
+        ml_role: String(r.mlRole ?? r.ml_role ?? ''),
+      })),
+      sync_permissions: !!(payload.syncPermissions ?? payload.sync_permissions ?? false),
+      label: String(payload.label ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioMlProjectCreateFromProjectRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(MlProjectCandidatesRequest). payload: { projectId } — ML projects the caller OWNS and that are not linked yet. */
+  projectStudioMlProjectCandidatesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioMlProjectCandidatesRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(MlLinkAttachRequest). payload: { projectId, mlProjectId, label?, syncPermissions, roleMap?:[{projectRole, mlRole}] }. */
+  projectStudioMlLinkAttachRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const roleMap = payload.roleMap ?? payload.role_map;
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      ml_project_id: String(payload.mlProjectId ?? payload.ml_project_id ?? ''),
+      label: String(payload.label ?? ''),
+      sync_permissions: !!(payload.syncPermissions ?? payload.sync_permissions ?? false),
+      role_map: (Array.isArray(roleMap) ? roleMap : []).map((r) => ({
+        project_role: String(r.projectRole ?? r.project_role ?? ''),
+        ml_role: String(r.mlRole ?? r.ml_role ?? ''),
+      })),
+    };
+    const body = _wasm.encodeProjectStudioMlLinkAttachRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(MlLinkUpdateRequest). payload: { projectId, linkId, label?, syncPermissions, roleMap?:[{projectRole, mlRole}] }. */
+  projectStudioMlLinkUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const roleMap = payload.roleMap ?? payload.role_map;
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      link_id: String(payload.linkId ?? payload.link_id ?? ''),
+      label: String(payload.label ?? ''),
+      sync_permissions: !!(payload.syncPermissions ?? payload.sync_permissions ?? false),
+      role_map: (Array.isArray(roleMap) ? roleMap : []).map((r) => ({
+        project_role: String(r.projectRole ?? r.project_role ?? ''),
+        ml_role: String(r.mlRole ?? r.ml_role ?? ''),
+      })),
+    };
+    const body = _wasm.encodeProjectStudioMlLinkUpdateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(MlLinkDetachRequest). payload: { projectId, linkId, revokeMembers } — revokeMembers also drops the ML memberships this link granted; the ML project is never deleted. */
+  projectStudioMlLinkDetachRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioMlLinkDetachRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.linkId ?? payload.link_id ?? ''),
+      !!(payload.revokeMembers ?? payload.revoke_members ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(MlLinkSyncNowRequest). payload: { projectId, linkId }. */
+  projectStudioMlLinkSyncNowRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioMlLinkSyncNowRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.linkId ?? payload.link_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(TaskStatusSetRequest). payload: { projectId, taskId, status } — status-only kanban move; TaskSave would clear descriptionMd and attachments. */
+  projectStudioTaskStatusSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioTaskStatusSetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.taskId ?? payload.task_id ?? ''),
+      String(payload.status ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ProjectExportStartRequest). payload: { projectId, includeRuns, includeVectors, includeUserNames } — includeUserNames copies display names into the archive (personal data, audited). */
+  projectStudioProjectExportStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      include_runs: !!(payload.includeRuns ?? payload.include_runs ?? false),
+      include_vectors: !!(payload.includeVectors ?? payload.include_vectors ?? false),
+      include_user_names: !!(payload.includeUserNames ?? payload.include_user_names ?? false),
+    };
+    const body = _wasm.encodeProjectStudioProjectExportStartRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ProjectExportStatusRequest). payload: { projectId, jobId } — polling is the source of truth; the finished archive is downloaded over the returned signedUrl, not the binary protocol. */
+  projectStudioProjectExportStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioProjectExportStatusRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.jobId ?? payload.job_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ProjectImportUploadChunkRequest). payload: { uploadId (client-minted), filename, seq, totalChunks, bytes:Uint8Array } — no projectId: the project does not exist yet. */
+  projectStudioProjectImportUploadChunkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const raw = payload.bytes;
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
+    const body = _wasm.encodeProjectStudioProjectImportUploadChunkRequest(
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+      String(payload.filename ?? ''),
+      Number(payload.seq ?? 0),
+      Number(payload.totalChunks ?? payload.total_chunks ?? 0),
+      bytes,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ProjectImportPreviewRequest). payload: { uploadId } — reads ONLY the archive manifest, nothing is unpacked before confirmation. */
+  projectStudioProjectImportPreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioProjectImportPreviewRequest(String(payload.uploadId ?? payload.upload_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ProjectImportApplyRequest). payload: { uploadId, nameOverride?, importVectors, importRuns }. */
+  projectStudioProjectImportApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      upload_id: String(payload.uploadId ?? payload.upload_id ?? ''),
+      name_override: String(payload.nameOverride ?? payload.name_override ?? ''),
+      import_vectors: !!(payload.importVectors ?? payload.import_vectors ?? false),
+      import_runs: !!(payload.importRuns ?? payload.import_runs ?? false),
+    };
+    const body = _wasm.encodeProjectStudioProjectImportApplyRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ProjectImportStatusRequest). payload: { jobId } — addressed by jobId alone: the project row exists only once the import succeeds. */
+  projectStudioProjectImportStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioProjectImportStatusRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ArchiveStreamRequest) — STREAM-INITIATING (no plain response): chunks = ArchiveStreamChunk, end = ArchiveStreamEnd. payload: { jobId } — live progress of an export or import job, job owner only. */
+  projectStudioArchiveStreamRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioArchiveStreamRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
