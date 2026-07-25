@@ -2484,6 +2484,393 @@
   gap: 6px;
 }
 
+/* ---- F3 shared: warning banner, mono text, code blocks ---------------------- */
+
+.ps-banner-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.08);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+
+.ps-banner-warn .icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--warning);
+  margin-top: 1px;
+}
+
+.ps-mono {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-2);
+  word-break: break-all;
+}
+
+.ps-code-block {
+  margin: 6px 0 10px;
+  padding: 8px 10px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+/* ---- T12: environments + admin approval queue ------------------------------- */
+
+.ps-approval-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.ps-approval-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ps-approval-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ps-approval-url {
+  margin-top: 2px;
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11.5px;
+  color: var(--accent-2);
+  word-break: break-all;
+}
+
+.ps-approval-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ps-approval-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.ps-approval-justification {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent-1);
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+}
+
+.ps-approval-justification p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.ps-approval-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.ps-approval-actions tf-input {
+  flex: 1;
+  min-width: 220px;
+}
+
+/* ---- T10/T11: automated + perf run ------------------------------------------ */
+
+.ps-auto-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.ps-auto-progress tf-progress-bar {
+  flex: 1;
+}
+
+.ps-auto-progress-label {
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.ps-live-log {
+  max-height: 320px;
+  min-height: 120px;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ps-perf-kpis {
+  margin-bottom: 14px;
+}
+
+.ps-perf-chart {
+  min-height: 220px;
+}
+
+.ps-perf-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 720px) {
+  .ps-perf-form {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-artifact-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* ---- T03: code case editor + AI assist -------------------------------------- */
+
+.ps-new-case-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.ps-code-toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.ps-code-toolbar tf-select {
+  min-width: 220px;
+}
+
+.ps-code-editor-host {
+  height: 460px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.ps-code-editor-host tf-code-editor {
+  display: block;
+  height: 100%;
+}
+
+.ps-code-config {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.ps-toggle-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.ps-toggle-field .ps-field-label {
+  margin: 0;
+}
+
+.ps-ai-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.ps-ai-chips tf-chip {
+  cursor: pointer;
+}
+
+.ps-ai-ask {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ps-ai-ask tf-input {
+  flex: 1;
+  min-width: 240px;
+}
+
+.ps-ai-scope {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.ps-ai-stream {
+  margin-top: 10px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: var(--bg-3);
+  border: 1px dashed var(--accent-1);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ps-ai-proposal {
+  margin-top: 12px;
+}
+
+.ps-diff-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ps-diff-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ps-diff-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  max-height: 380px;
+  overflow: auto;
+}
+
+@media (max-width: 860px) {
+  .ps-diff-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-diff-col {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.ps-diff-col-head {
+  padding: 6px 10px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2);
+  position: sticky;
+  top: 0;
+}
+
+.ps-diff-line {
+  padding: 1px 10px;
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 18px;
+}
+
+.ps-diff-line.is-add {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--success);
+}
+
+.ps-diff-line.is-del {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--danger);
+}
+
+.ps-diff-line.is-empty {
+  background: repeating-linear-gradient(
+    135deg,
+    transparent,
+    transparent 5px,
+    rgba(255, 255, 255, 0.03) 5px,
+    rgba(255, 255, 255, 0.03) 10px
+  );
+}
+
+.ps-diff-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* ---- W02: git / ZIP / OpenAPI source forms ---------------------------------- */
+
+.ps-git-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+@media (max-width: 720px) {
+  .ps-git-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-token-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
 /* ---- print: report sections come out as a clean, light document -------------- */
 
 @media print {

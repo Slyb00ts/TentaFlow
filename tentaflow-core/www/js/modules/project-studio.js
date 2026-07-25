@@ -9,7 +9,11 @@
 // plus Phase-2: manual test cases with versioned editor and CSV import
 // (T01/T02), agent generation wizard + live review (T04/T05), suites (T06),
 // manual runs (T07/T08), the tester execution desk (T09), run results (T11),
-// reports (T14), tasks/defects (Z01/Z02) and the notification bell (G02).
+// reports (T14), tasks/defects (Z01/Z02) and the notification bell (G02),
+// plus Phase-3: test environments with the admin approval queue (T12), live
+// automated/perf runs with artifacts (T10/T11), the code-case editor with AI
+// assist and try-run (T03), git/ZIP/OpenAPI knowledge sources (W01/W02/W04)
+// and code-kind generation with per-kind agents (T04/X04).
 // tf-* components only; every visible string comes from i18n project_studio.*.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -45,6 +49,9 @@ import '/js/components/tf-tag-input.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-bar-chart.js';
 import '/js/components/tf-pie-chart.js';
+import '/js/components/tf-sparkline.js';
+import '/js/components/tf-status-pill.js';
+import '/js/components/tf-code-editor.js';
 
 // Project roles ordered by capability; assignable set excludes 'owner'
 // (ownership moves only via the explicit transfer action).
@@ -68,14 +75,12 @@ const MODULE_DEFS = [
   { id: 'tasks', icon: 'check' },
 ];
 
-// F1 source kinds: document + url are functional, the rest is announced but
-// disabled (backend rejects them with BadRequest until F3).
 const SOURCE_KINDS = [
-  { id: 'document', icon: 'file-text', enabled: true },
-  { id: 'url', icon: 'globe', enabled: true },
-  { id: 'git', icon: 'branch', enabled: false },
-  { id: 'zip', icon: 'folder', enabled: false },
-  { id: 'api_spec', icon: 'code', enabled: false },
+  { id: 'document', icon: 'file-text' },
+  { id: 'url', icon: 'globe' },
+  { id: 'git', icon: 'branch' },
+  { id: 'zip', icon: 'folder' },
+  { id: 'api_spec', icon: 'code' },
 ];
 
 const SOURCE_KIND_ICON = { document: 'file-text', url: 'globe', git: 'branch', zip: 'folder', api_spec: 'code' };
@@ -86,6 +91,47 @@ const UPLOAD_CHUNK_BYTES = 1024 * 1024;
 const FILES_PAGE_SIZE = 50;
 const INGEST_POLL_MS = 3000;
 const INGEST_LOG_CAP = 200;
+
+// ---- F3 constants ----------------------------------------------------------
+
+const ENV_TYPES = ['web', 'api'];
+const ENV_AUTH_TYPES = ['none', 'bearer', 'api_key', 'basic'];
+const ENV_STATUS_CHIP = { pending: 'warn', approved: 'ok', rejected: 'err' };
+// Client-side pre-check only: the server classifies the address authoritatively
+// (it resolves the host), the UI just shows the approval banner up front.
+const PRIVATE_HOST_RE = /^(localhost|.*\.local|.*\.internal|.*\.lan|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|\[?::1\]?|\[?fc|\[?fd)/i;
+
+// Languages the runner contract knows. Only 'python' is executable today
+// (generation::CODE_LANGUAGES) — the rest is listed so the missing toolchain is
+// visible instead of silently absent, exactly like the T03 mockup.
+const CODE_LANGUAGES = [
+  { id: 'python', executable: true },
+  { id: 'javascript', executable: false },
+  { id: 'typescript', executable: false },
+];
+const CODE_KINDS = ['ui', 'api', 'unit', 'perf', 'security'];
+// Case kind -> project agent binding (mirrors generation::agent_function_for_kind).
+const KIND_AGENT_FUNCTION = {
+  ui: 'generator_ui',
+  api: 'generator_api',
+  unit: 'generator_unit',
+  perf: 'generator_perf',
+  security: 'security',
+};
+// Agent bindings the settings screen manages; 'chat' drives the project chat,
+// the rest drives generation + code assist per case kind.
+const AGENT_FUNCTIONS = ['chat', 'generator_ui', 'generator_api', 'generator_unit', 'generator_perf', 'security'];
+
+const AUTO_RUN_POLL_MS = 3000;
+const AUTO_LOG_CAP = 500;
+const TRY_LOG_CAP = 300;
+const ARTIFACT_MAX_BYTES = 32 * 1024 * 1024;
+const PERF_DEFAULT_PROFILE = { users: 50, spawn_rate: 5, duration_secs: 60 };
+const PERF_LIMITS = { users: [1, 2000], spawnRate: [0.1, 2000], duration: [5, 3600] };
+const ARTIFACT_ICON = {
+  log: 'file-text', screenshot: 'image', trace: 'branch', junit: 'list',
+  perf_stats: 'chart-line', har: 'network', other: 'paperclip',
+};
 
 const state = {
   me: null,
@@ -163,6 +209,14 @@ function freshF2State() {
     genWidget: null,
     genSteps: [],
     reports: { from: '', to: '', suiteId: '', loaded: false, data: {} },
+    // F3 — environments (T12), runner discovery and the live automated run
+    // (T10/T11). `autoRun` owns its own stream + poll, torn down by
+    // stopTestsLive() like every other live artifact of the tests tab.
+    envs: { rows: [], loaded: false, type: '', status: '' },
+    envApprovals: { items: [], loaded: false },
+    envPending: 0,
+    runners: null,
+    autoRun: null,
   };
 }
 
@@ -1021,7 +1075,7 @@ async function openProject(projectId, deep = null) {
   }
   renderProjectShell();
   await switchTab(state.tab);
-  if (deep?.runId && state.tab === 'tests') await openRunDetail(deep.runId);
+  if (deep?.runId && state.tab === 'tests') await openRunByType(deep.runId, deep.runType);
   else if (deep?.genId && state.tab === 'tests') await openGenDetail(deep.genId);
   else if (deep?.taskId && state.tab === 'tasks') await openTaskWindow({ taskId: deep.taskId });
 }
@@ -1205,8 +1259,10 @@ async function renderOverview() {
       <tf-stat-card icon="list" label="${escapeAttr(t('kpi_cases'))}" value="${kv('cases_approved', 'casesApproved')}" suffix="/ ${kv('cases_total', 'casesTotal')}"
         delta="${escapeAttr(t('kpi_suites', { count: kv('suites_total', 'suitesTotal') }))}" delta-type="neutral"></tf-stat-card>
       <tf-stat-card icon="play" label="${escapeAttr(t('kpi_runs_open'))}" value="${kv('runs_open', 'runsOpen')}"
-        ${gensRunning > 0 ? `delta="${escapeAttr(t('kpi_generations_running', { count: gensRunning }))}" delta-type="warn"` : ''}></tf-stat-card>
+        ${kv('auto_runs_open', 'autoRunsOpen') > 0 ? `delta="${escapeAttr(t('kpi_auto_runs_open', { count: kv('auto_runs_open', 'autoRunsOpen') }))}" delta-type="warn"` : (gensRunning > 0 ? `delta="${escapeAttr(t('kpi_generations_running', { count: gensRunning }))}" delta-type="warn"` : '')}></tf-stat-card>
       <tf-stat-card icon="user" label="${escapeAttr(t('kpi_my_items'))}" value="${kv('my_run_items_pending', 'myRunItemsPending')}"></tf-stat-card>
+      <tf-stat-card icon="globe" label="${escapeAttr(t('kpi_environments'))}" value="${kv('environments_approved', 'environmentsApproved')}"
+        ${kv('environments_pending', 'environmentsPending') > 0 ? `delta="${escapeAttr(t('kpi_environments_pending', { count: kv('environments_pending', 'environmentsPending') }))}" delta-type="warn"` : ''}></tf-stat-card>
   ` : '';
   const tasksKpis = modules.includes('tasks') ? `
       <tf-stat-card icon="check" label="${escapeAttr(t('kpi_tasks_open'))}" value="${kv('tasks_open', 'tasksOpen')}"
@@ -1370,8 +1426,11 @@ function sourceRowHtml(source) {
   const chunkCount = source.chunk_count ?? source.chunkCount ?? 0;
   const mutable = canEdit();
 
+  let config = {};
+  try { config = JSON.parse(source.config_json ?? source.configJson ?? '{}') || {}; } catch { config = {}; }
   const meta = [
     t(`kind_${source.kind}`),
+    source.kind === 'git' && config.branch ? t('source_git_branch_meta', { branch: config.branch }) : '',
     t('source_files_count', { count: fileCount }),
     t('source_chunks_count', { count: chunkCount }),
     `${t('source_added')} ${formatTimestamp(source.created_at ?? source.createdAt)}`,
@@ -1395,11 +1454,22 @@ function sourceRowHtml(source) {
 
   const actions = [];
   if (mutable) {
-    actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-reingest="${escapeAttr(sourceId)}" title="${escapeAttr(t('action_reingest'))}"></tf-button>`);
+    // Git sources fetch + delta re-index ("Odśwież"); everything else re-runs
+    // the full ingest.
+    if (source.kind === 'git') {
+      actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-refresh="${escapeAttr(sourceId)}">${escapeHtml(t('source_refresh'))}</tf-button>`);
+    } else {
+      actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-reingest="${escapeAttr(sourceId)}" title="${escapeAttr(t('action_reingest'))}"></tf-button>`);
+    }
+    if (source.kind === 'api_spec') {
+      actions.push(`<tf-button variant="ghost" size="sm" icon="code" data-endpoints="${escapeAttr(sourceId)}" title="${escapeAttr(t('source_endpoints'))}"></tf-button>`);
+    }
     actions.push(`
       <tf-button variant="ghost" size="sm" icon="chevron-down" data-source-more title="${escapeAttr(t('action_more'))}"></tf-button>
       <tf-menu placement="bottom-end" data-source-menu>
         <tf-menu-item action="edit" icon="edit">${escapeHtml(t('action_edit'))}</tf-menu-item>
+        ${source.kind === 'git' ? `<tf-menu-item action="refresh" icon="refresh">${escapeHtml(t('source_refresh'))}</tf-menu-item>` : ''}
+        ${source.kind === 'api_spec' ? `<tf-menu-item action="endpoints" icon="code">${escapeHtml(t('source_endpoints'))}</tf-menu-item>` : ''}
         <tf-menu-item action="reingest" icon="refresh">${escapeHtml(t('action_reingest'))}</tf-menu-item>
         <tf-menu-item action="files" icon="file-text">${escapeHtml(t('action_show_files'))}</tf-menu-item>
         <tf-menu-divider></tf-menu-divider>
@@ -1407,6 +1477,9 @@ function sourceRowHtml(source) {
       </tf-menu>
     `);
   } else {
+    if (source.kind === 'api_spec') {
+      actions.push(`<tf-button variant="ghost" size="sm" icon="code" data-endpoints="${escapeAttr(sourceId)}" title="${escapeAttr(t('source_endpoints'))}"></tf-button>`);
+    }
     actions.push(`<tf-button variant="ghost" size="sm" icon="file-text" data-source-files="${escapeAttr(sourceId)}" title="${escapeAttr(t('action_show_files'))}"></tf-button>`);
   }
 
@@ -1469,6 +1542,10 @@ async function renderSources() {
     if (cancel) { cancelIngest(cancel.dataset.cancelJob); return; }
     const reingest = e.target.closest('[data-reingest]');
     if (reingest) { reingestSource(reingest.dataset.reingest); return; }
+    const refresh = e.target.closest('[data-refresh]');
+    if (refresh) { refreshGitSource(refresh.dataset.refresh); return; }
+    const endpoints = e.target.closest('[data-endpoints]');
+    if (endpoints) { openApiSpecEndpoints(endpoints.dataset.endpoints); return; }
     const filesBtn = e.target.closest('[data-source-files]');
     if (filesBtn) { showFilesFor(filesBtn.dataset.sourceFiles); }
   });
@@ -1481,6 +1558,8 @@ async function renderSources() {
     switch (e.detail?.action) {
       case 'edit': openSourceEditWindow(source); break;
       case 'reingest': reingestSource(sourceId); break;
+      case 'refresh': refreshGitSource(sourceId); break;
+      case 'endpoints': openApiSpecEndpoints(sourceId); break;
       case 'files': showFilesFor(sourceId); break;
       case 'delete': confirmDeleteSource(source); break;
       default: break;
@@ -1513,6 +1592,82 @@ async function reingestSource(sourceId) {
   } catch (err) {
     toast(`${t('reingest_failed')}: ${err.message}`, 'error');
   }
+}
+
+// W01 "Odśwież" — git fetch + delta re-index; the returned job is tracked like
+// any other ingest job.
+async function refreshGitSource(sourceId) {
+  try {
+    const resp = await ApiBinary.one('projectStudioSourceRefreshRequest', { projectId: projectId(), sourceId });
+    toast(t('source_refresh_started'), 'success');
+    const jobId = fv(resp, 'job_id');
+    await renderSources();
+    if (jobId) trackIngestJob(jobId);
+  } catch (err) {
+    toast(`${t('source_refresh_failed')}: ${err.message}`, 'error');
+  }
+}
+
+// W02 — endpoint list parsed out of an OpenAPI/Swagger source.
+async function openApiSpecEndpoints(sourceId) {
+  const source = state.sources.find((s) => fv(s, 'source_id') === sourceId);
+  let endpoints = [];
+  try {
+    const resp = await ApiBinary.one('projectStudioApiSpecEndpointsRequest', { projectId: projectId(), sourceId });
+    const parsed = JSON.parse(fv(resp, 'endpoints_json') || '[]');
+    endpoints = Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    toast(`${t('source_endpoints_failed')}: ${err.message}`, 'error');
+    return;
+  }
+  const { body, foot, cleanup } = openWindow({
+    title: t('source_endpoints_title'),
+    subtitle: source?.name || '',
+    icon: 'code',
+    width: 900,
+  });
+  body.innerHTML = endpoints.length
+    ? `<div id="ps-endpoints-host"></div>`
+    : `<tf-empty-state icon="code" title="${escapeAttr(t('source_endpoints_empty'))}"></tf-empty-state>`;
+  foot.innerHTML = `
+    <div class="ps-footer-left"><span class="ps-field-hint">${escapeHtml(t('source_endpoints_count', { count: endpoints.length }))}</span></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" icon="download" data-action="export">${escapeHtml(t('reports_export_csv'))}</tf-button>
+      <tf-button variant="ghost" data-action="close-endpoints">${escapeHtml(t('action_close'))}</tf-button>
+    </div>
+  `;
+  if (endpoints.length) {
+    const hostEl = body.querySelector('#ps-endpoints-host');
+    hostEl.innerHTML = `
+      <tf-table id="ps-endpoints-table">
+        <tf-column key="method" label="${escapeAttr(t('endpoints_col_method'))}"></tf-column>
+        <tf-column key="path" label="${escapeAttr(t('endpoints_col_path'))}"></tf-column>
+        <tf-column key="summary" label="${escapeAttr(t('endpoints_col_summary'))}"></tf-column>
+        <tf-column key="tags" label="${escapeAttr(t('endpoints_col_tags'))}"></tf-column>
+      </tf-table>
+    `;
+    hostEl.querySelector('#ps-endpoints-table').rows = endpoints.map((ep) => ({
+      method: String(ep.method || ''),
+      path: String(ep.path || ''),
+      summary: String(ep.summary || ''),
+      tags: (Array.isArray(ep.tags) ? ep.tags : []).join(', '),
+    }));
+  }
+  foot.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    if (btn.dataset.action === 'export') {
+      downloadTextFile('endpoints.csv', toCsv(endpoints.map((ep) => ({
+        method: ep.method,
+        path: ep.path,
+        summary: ep.summary,
+        operation_id: fv(ep, 'operation_id') || '',
+        tags: (Array.isArray(ep.tags) ? ep.tags : []).join(' '),
+      }))));
+      return;
+    }
+    cleanup();
+  });
 }
 
 async function cancelIngest(jobId) {
@@ -1666,11 +1821,11 @@ function openSourceWindow() {
   };
 
   const kindsHtml = SOURCE_KINDS.map((k) => `
-    <div class="ps-choice-card ${sw.kind === k.id ? 'is-selected' : ''} ${k.enabled ? '' : 'is-disabled'}"
-         data-kind="${escapeAttr(k.id)}" role="button" tabindex="${k.enabled ? '0' : '-1'}">
+    <div class="ps-choice-card ${sw.kind === k.id ? 'is-selected' : ''}"
+         data-kind="${escapeAttr(k.id)}" role="button" tabindex="0">
       <div class="ps-cc-ico">${sprite(k.icon)}</div>
       <div>
-        <div class="ps-cc-name">${escapeHtml(t(`kind_${k.id}`))}${k.enabled ? '' : ` <tf-chip status="info">${escapeHtml(t('kind_soon'))}</tf-chip>`}</div>
+        <div class="ps-cc-name">${escapeHtml(t(`kind_${k.id}`))}</div>
         <div class="ps-cc-desc">${escapeHtml(t(`kind_${k.id}_desc`))}</div>
       </div>
     </div>
@@ -1694,6 +1849,35 @@ function openSourceWindow() {
     <div data-kind-form="url" hidden>
       <tf-input id="ps-src-url" label="${escapeAttr(t('source_url_label'))}" placeholder="https://…"
         hint="${escapeAttr(t('source_url_hint'))}"></tf-input>
+    </div>
+    <div data-kind-form="git" hidden>
+      <tf-input id="ps-src-git-url" label="${escapeAttr(t('source_git_url_label'))}" placeholder="https://github.com/org/repo.git"
+        hint="${escapeAttr(t('source_git_url_hint'))}"></tf-input>
+      <div class="ps-git-grid">
+        <tf-input id="ps-src-git-branch" label="${escapeAttr(t('source_git_branch_label'))}" value="main"
+          hint="${escapeAttr(t('source_git_branch_hint'))}"></tf-input>
+        <tf-input id="ps-src-git-subdir" label="${escapeAttr(t('source_git_subdir_label'))}" placeholder="src/"
+          hint="${escapeAttr(t('source_git_subdir_hint'))}"></tf-input>
+      </div>
+      <tf-input id="ps-src-git-token" type="password" label="${escapeAttr(t('source_git_token_label'))}"
+        hint="${escapeAttr(t('source_git_token_hint'))}"></tf-input>
+      <div class="ps-field-hint">${escapeHtml(t('source_git_limits_hint'))}</div>
+    </div>
+    <div data-kind-form="zip" hidden>
+      <div class="ps-field">
+        <span class="ps-field-label">${escapeHtml(t('source_zip_label'))}</span>
+        <tf-file-input id="ps-src-zip" accept=".zip" label="${escapeAttr(t('source_zip_dropzone'))}"></tf-file-input>
+        <div class="ps-field-hint">${escapeHtml(t('source_zip_hint'))}</div>
+      </div>
+      <div data-zip-file></div>
+    </div>
+    <div data-kind-form="api_spec" hidden>
+      <div class="ps-field">
+        <span class="ps-field-label">${escapeHtml(t('source_spec_label'))}</span>
+        <tf-file-input id="ps-src-spec" accept=".yaml,.yml,.json" label="${escapeAttr(t('source_spec_dropzone'))}"></tf-file-input>
+        <div class="ps-field-hint">${escapeHtml(t('source_spec_hint'))}</div>
+      </div>
+      <div data-spec-file></div>
     </div>
     <div class="ps-field-hint">${escapeHtml(t('source_queue_hint'))}</div>
     <div class="ps-form-error" data-form-error hidden></div>
@@ -1733,8 +1917,14 @@ function openSourceWindow() {
 
   body.querySelector('[data-kind-grid]')?.addEventListener('click', (e) => {
     const card = e.target.closest('[data-kind]');
-    if (!card || card.classList.contains('is-disabled') || sw.busy) return;
+    if (!card || sw.busy) return;
     sw.kind = card.dataset.kind;
+    // Every kind owns its own upload slot, so the queue never leaks across a
+    // switch (a document queue must not become the ZIP archive).
+    sw.files = [];
+    body.querySelectorAll('[data-file-list], [data-zip-file], [data-spec-file]').forEach((slot) => {
+      slot.innerHTML = '';
+    });
     body.querySelectorAll('[data-kind]').forEach((c) => {
       c.classList.toggle('is-selected', c.dataset.kind === sw.kind);
     });
@@ -1752,6 +1942,29 @@ function openSourceWindow() {
       if (!dup) sw.files.push({ file, progress: null, ref: null });
     }
     renderFileList();
+  });
+
+  // ZIP archives and OpenAPI specs are single-file sources: the newest pick
+  // replaces the previous one instead of queueing.
+  const singleFilePicked = (selector, file) => {
+    sw.files = file ? [{ file, progress: null, ref: null }] : [];
+    const slot = body.querySelector(selector);
+    if (!slot) return;
+    slot.innerHTML = file ? `
+      <div class="ps-added-file">
+        <span class="ps-af-ico">${sprite('folder')}</span>
+        <div class="ps-af-main">
+          <div class="ps-af-name">${escapeHtml(file.name)}</div>
+          <div class="ps-af-size">${escapeHtml(formatBytes(file.size))}</div>
+        </div>
+      </div>
+    ` : '';
+  };
+  body.querySelector('#ps-src-zip')?.addEventListener('change', (e) => {
+    singleFilePicked('[data-zip-file]', e.detail?.files?.[0] ?? null);
+  });
+  body.querySelector('#ps-src-spec')?.addEventListener('change', (e) => {
+    singleFilePicked('[data-spec-file]', e.detail?.files?.[0] ?? null);
   });
 
   body.addEventListener('click', (e) => {
@@ -1803,6 +2016,19 @@ function openSourceWindow() {
       const url = String(body.querySelector('#ps-src-url')?.value ?? '').trim();
       if (!/^https:\/\/.+/.test(url)) { showError(t('err_source_url')); return; }
       configJson = JSON.stringify({ url });
+    } else if (sw.kind === 'git') {
+      const repoUrl = String(body.querySelector('#ps-src-git-url')?.value ?? '').trim();
+      if (!/^https?:\/\/.+/.test(repoUrl)) { showError(t('err_source_git_url')); return; }
+      const branch = String(body.querySelector('#ps-src-git-branch')?.value ?? '').trim() || 'main';
+      const subdir = String(body.querySelector('#ps-src-git-subdir')?.value ?? '').trim();
+      const token = String(body.querySelector('#ps-src-git-token')?.value ?? '');
+      // The token is stripped server-side into the encrypted column; it never
+      // stays in config_json (which every source listing reads back).
+      configJson = JSON.stringify({ repo_url: repoUrl, branch, subdir, ...(token ? { token } : {}) });
+    } else if (sw.kind === 'zip') {
+      if (!sw.files.length) { showError(t('err_source_zip')); return; }
+    } else if (sw.kind === 'api_spec') {
+      if (!sw.files.length) { showError(t('err_source_spec')); return; }
     }
 
     showError(null);
@@ -1810,10 +2036,10 @@ function openSourceWindow() {
     btn.setAttribute('disabled', '');
     try {
       const fileRefs = [];
-      if (sw.kind === 'document') {
+      if (sw.kind === 'document' || sw.kind === 'zip' || sw.kind === 'api_spec') {
         for (let i = 0; i < sw.files.length; i += 1) {
           sw.files[i].progress = 0;
-          renderFileList();
+          if (sw.kind === 'document') renderFileList();
           fileRefs.push(await uploadFile(sw.files[i], i));
         }
       }
@@ -1857,6 +2083,20 @@ function openSourceEditWindow(source) {
       <tf-input id="ps-src-edit-url" label="${escapeAttr(t('source_url_label'))}" value="${escapeAttr(config.url || '')}"
         hint="${escapeAttr(t('source_url_hint'))}"></tf-input>
     ` : ''}
+    ${source.kind === 'git' ? `
+      <tf-input id="ps-src-edit-git-url" label="${escapeAttr(t('source_git_url_label'))}" value="${escapeAttr(config.repo_url || '')}"
+        hint="${escapeAttr(t('source_git_url_hint'))}"></tf-input>
+      <div class="ps-git-grid">
+        <tf-input id="ps-src-edit-branch" label="${escapeAttr(t('source_git_branch_label'))}" value="${escapeAttr(config.branch || 'main')}"></tf-input>
+        <tf-input id="ps-src-edit-subdir" label="${escapeAttr(t('source_git_subdir_label'))}" value="${escapeAttr(config.subdir || '')}"></tf-input>
+      </div>
+      <tf-input id="ps-src-edit-token" type="password" label="${escapeAttr(t('source_git_token_label'))}"
+        hint="${escapeAttr(t('source_token_update_hint'))}"></tf-input>
+      <div class="ps-token-actions">
+        <tf-button variant="ghost" size="sm" icon="key" id="ps-src-token-save">${escapeHtml(t('source_token_save'))}</tf-button>
+        <tf-button variant="ghost" size="sm" icon="trash" id="ps-src-token-clear">${escapeHtml(t('source_token_clear'))}</tf-button>
+      </div>
+    ` : ''}
     <div class="ps-form-error" data-form-error hidden></div>
   `;
   foot.innerHTML = `
@@ -1866,6 +2106,25 @@ function openSourceEditWindow(source) {
       <tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>
     </div>
   `;
+
+  // The git token is set/cleared through its own input-only request; it never
+  // travels back in config_json.
+  const setGitToken = async (token) => {
+    try {
+      await ApiBinary.one('projectStudioSourceSecretSetRequest', { projectId: projectId(), sourceId, token });
+      toast(t('source_token_saved'), 'success');
+      const input = body.querySelector('#ps-src-edit-token');
+      if (input) input.value = '';
+    } catch (err) {
+      toast(`${t('source_token_failed')}: ${err.message}`, 'error');
+    }
+  };
+  body.querySelector('#ps-src-token-save')?.addEventListener('click', () => {
+    const token = String(body.querySelector('#ps-src-edit-token')?.value ?? '');
+    if (!token) { toast(t('source_token_empty'), 'error'); return; }
+    setGitToken(token);
+  });
+  body.querySelector('#ps-src-token-clear')?.addEventListener('click', () => setGitToken(null));
 
   foot.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-action]');
@@ -1885,6 +2144,19 @@ function openSourceEditWindow(source) {
         return;
       }
       configJson = JSON.stringify({ ...config, url });
+    }
+    if (source.kind === 'git') {
+      const repoUrl = String(body.querySelector('#ps-src-edit-git-url')?.value ?? '').trim();
+      if (!/^https?:\/\/.+/.test(repoUrl)) {
+        if (errEl) { errEl.hidden = false; errEl.textContent = t('err_source_git_url'); }
+        return;
+      }
+      configJson = JSON.stringify({
+        ...config,
+        repo_url: repoUrl,
+        branch: String(body.querySelector('#ps-src-edit-branch')?.value ?? '').trim() || 'main',
+        subdir: String(body.querySelector('#ps-src-edit-subdir')?.value ?? '').trim(),
+      });
     }
     try {
       const resp = await ApiBinary.one('projectStudioSourceUpdateRequest', {
@@ -2924,18 +3196,38 @@ async function renderSettings() {
   const settings = state.settings || {};
   const archived = state.project?.status === 'archived';
   const agents = Array.isArray(settings.agents) ? settings.agents : [];
-  const chatBinding = agents.find((a) => a.function === 'chat') || { function: 'chat', agent_id: '', agent_name: '', model_label: '' };
-  const chatAgentId = chatBinding.agent_id ?? chatBinding.agentId ?? '';
   const tags = Array.isArray(settings.tags) ? settings.tags : [];
 
-  const agentOptions = [
-    `<option value="" ${!chatAgentId ? 'selected' : ''}>${escapeHtml(t('agents_default_option'))}</option>`,
-    ...state.agentOptions.map((a) => `<option value="${escapeAttr(a.id)}" ${a.id === chatAgentId ? 'selected' : ''}>${escapeHtml(a.name)}</option>`),
-  ];
-  // Keep an unknown current binding visible even when the agent list failed.
-  if (chatAgentId && !state.agentOptions.some((a) => a.id === chatAgentId)) {
-    agentOptions.push(`<option value="${escapeAttr(chatAgentId)}" selected>${escapeHtml(chatBinding.agent_name ?? chatBinding.agentName ?? chatAgentId)}</option>`);
-  }
+  const bindingOf = (fn) => agents.find((a) => a.function === fn)
+    || { function: fn, agent_id: '', agent_name: '', model_label: '' };
+  const agentOptionsFor = (binding) => {
+    const agentId = fv(binding, 'agent_id') || '';
+    const options = [
+      `<option value="" ${!agentId ? 'selected' : ''}>${escapeHtml(t('agents_default_option'))}</option>`,
+      ...state.agentOptions.map((a) => `<option value="${escapeAttr(a.id)}" ${a.id === agentId ? 'selected' : ''}>${escapeHtml(a.name)}</option>`),
+    ];
+    // Keep an unknown current binding visible even when the agent list failed.
+    if (agentId && !state.agentOptions.some((a) => a.id === agentId)) {
+      options.push(`<option value="${escapeAttr(agentId)}" selected>${escapeHtml(fv(binding, 'agent_name') || agentId)}</option>`);
+    }
+    return options.join('');
+  };
+  const agentRowHtml = (fn) => {
+    const binding = bindingOf(fn);
+    const modelLabel = fv(binding, 'model_label') || '';
+    return `
+      <div class="ps-setting-row">
+        <div class="ps-sr-main">
+          <div class="ps-sr-label">${escapeHtml(t(`agents_fn_${fn}`))}</div>
+          <div class="ps-sr-desc">${escapeHtml(t(`agents_fn_${fn}_desc`))}</div>
+        </div>
+        <div class="ps-fn-controls">
+          <tf-select data-agent-fn="${escapeAttr(fn)}" value="${escapeAttr(fv(binding, 'agent_id') || '')}">${agentOptionsFor(binding)}</tf-select>
+          <span class="ps-fn-model" data-agent-model="${escapeAttr(fn)}">${escapeHtml(modelLabel ? `${t('agents_model_prefix')}: ${modelLabel}` : '')}</span>
+        </div>
+      </div>
+    `;
+  };
 
   panel.innerHTML = `
     <tf-section-card title="${escapeAttr(t('settings_basics_title'))}" icon="settings">
@@ -2952,16 +3244,10 @@ async function renderSettings() {
 
     <tf-section-card title="${escapeAttr(t('agents_title'))}" icon="brain">
       <span slot="subtitle">${escapeHtml(t('agents_sub'))}</span>
-      <div class="ps-setting-row">
-        <div class="ps-sr-main">
-          <div class="ps-sr-label">${escapeHtml(t('agents_chat_label'))}</div>
-          <div class="ps-sr-desc">${escapeHtml(t('agents_chat_desc'))}</div>
-        </div>
-        <div class="ps-fn-controls">
-          <tf-select id="ps-agent-chat" value="${escapeAttr(chatAgentId)}">${agentOptions.join('')}</tf-select>
-          <span class="ps-fn-model" id="ps-agent-chat-model">${escapeHtml((chatBinding.model_label ?? chatBinding.modelLabel) ? `${t('agents_model_prefix')}: ${chatBinding.model_label ?? chatBinding.modelLabel}` : '')}</span>
-        </div>
+      <div id="ps-agent-rows">
+        ${AGENT_FUNCTIONS.map(agentRowHtml).join('')}
       </div>
+      <div class="ps-field-hint">${escapeHtml(t('agents_generators_hint'))}</div>
     </tf-section-card>
 
     <tf-section-card title="${escapeAttr(t('tags_title'))}" icon="filter">
@@ -3022,20 +3308,31 @@ async function renderSettings() {
     }
   });
 
-  byId('ps-agent-chat')?.addEventListener('change', async (e) => {
-    const agentId = e.detail?.value ?? e.target.value ?? '';
+  // agents_json REPLACES the whole binding map server-side, so every change
+  // resubmits the full set read from the current selects.
+  byId('ps-agent-rows')?.addEventListener('change', async (e) => {
+    const select = e.target.closest('[data-agent-fn]');
+    if (!select) return;
+    const bindings = AGENT_FUNCTIONS.map((fn) => ({
+      function: fn,
+      agent_id: String(byId('ps-agent-rows')?.querySelector(`[data-agent-fn="${CSS.escape(fn)}"]`)?.value ?? ''),
+    }));
     try {
       await ApiBinary.one('projectStudioSettingsSaveRequest', {
         projectId: projectId(),
-        agentsJson: JSON.stringify([{ function: 'chat', agent_id: agentId }]),
+        agentsJson: JSON.stringify(bindings),
       });
       toast(t('agents_saved'), 'success');
-      // Re-fetch so the resolved model label next to the select stays honest.
+      // Re-fetch so the resolved model labels next to the selects stay honest.
       const resp = await ApiBinary.one('projectStudioSettingsGetRequest', { projectId: projectId() });
-      const binding = (resp.settings?.agents ?? []).find((a) => a.function === 'chat');
-      const modelEl = byId('ps-agent-chat-model');
-      const modelLabel = binding ? (binding.model_label ?? binding.modelLabel ?? '') : '';
-      if (modelEl) modelEl.textContent = modelLabel ? `${t('agents_model_prefix')}: ${modelLabel}` : '';
+      state.settings = resp.settings;
+      const fresh = Array.isArray(resp.settings?.agents) ? resp.settings.agents : [];
+      for (const fn of AGENT_FUNCTIONS) {
+        const binding = fresh.find((a) => a.function === fn);
+        const modelEl = byId('ps-agent-rows')?.querySelector(`[data-agent-model="${CSS.escape(fn)}"]`);
+        const modelLabel = binding ? (fv(binding, 'model_label') || '') : '';
+        if (modelEl) modelEl.textContent = modelLabel ? `${t('agents_model_prefix')}: ${modelLabel}` : '';
+      }
     } catch (err) {
       toast(`${t('agents_save_failed')}: ${err.message}`, 'error');
     }
@@ -3113,8 +3410,11 @@ const ATTACHMENT_MAX_PREVIEW = 8 * 1024 * 1024;
 
 const CASE_STATUS_CHIP = { draft: 'info', review: 'warn', approved: 'ok', deprecated: 'err' };
 const PRIORITY_CHIP = { low: 'info', medium: 'accent', high: 'warn', critical: 'err' };
-const RUN_STATUS_CHIP = { running: 'accent', completed: 'ok', cancelled: 'warn' };
-const ITEM_STATUS_CHIP = { pending: 'info', in_progress: 'accent', passed: 'ok', failed: 'err', blocked: 'warn', skipped: 'info' };
+const RUN_STATUS_CHIP = { running: 'accent', completed: 'ok', cancelled: 'warn', error: 'err' };
+const ITEM_STATUS_CHIP = {
+  pending: 'info', in_progress: 'accent', running: 'accent', passed: 'ok',
+  failed: 'err', blocked: 'warn', skipped: 'info', error: 'err',
+};
 const GEN_STATUS_CHIP = { running: 'accent', review: 'warn', accepted: 'ok', rejected: 'err', failed: 'err', cancelled: 'info' };
 const TASK_STATUS_CHIP = { todo: 'info', in_progress: 'accent', review: 'warn', done: 'ok' };
 const CASE_KINDS = ['manual', 'ui', 'api', 'unit', 'perf', 'security'];
@@ -3125,6 +3425,8 @@ const NOTIF_KIND_ICON = {
   run_closed: 'check',
   generation_finished: 'sparkle',
   task_assigned: 'edit',
+  environment_pending: 'shield',
+  environment_decided: 'globe',
 };
 
 // Wire structs decode with snake_case field names; some decode layers expose
@@ -3320,15 +3622,16 @@ function attachmentRowHtml(att, index, { removable = false } = {}) {
 // F2 — tests tab shell (sub-nav: cases / suites / runs / generations / reports)
 // =============================================================================
 
-const TESTS_SEGMENTS = ['cases', 'suites', 'runs', 'generations', 'reports'];
+const TESTS_SEGMENTS = ['cases', 'suites', 'runs', 'generations', 'environments', 'reports'];
 
 // Drill-in views highlight their parent segment in the sub-nav.
 function testsSegValue() {
   const view = f2().view;
   if (view === 'case-editor') return 'cases';
   if (view === 'suite-editor') return 'suites';
-  if (view === 'run-detail' || view === 'exec') return 'runs';
+  if (view === 'run-detail' || view === 'exec' || view === 'auto-run') return 'runs';
   if (view === 'gen-detail') return 'generations';
+  if (view === 'env-approvals') return 'environments';
   return TESTS_SEGMENTS.includes(view) ? view : 'cases';
 }
 
@@ -3370,16 +3673,20 @@ async function renderTestsView() {
     case 'suite-editor': await renderSuiteEditor(); break;
     case 'runs': await renderRunsView(); break;
     case 'run-detail': await renderRunDetailView(); break;
+    case 'auto-run': await renderAutoRunView(); break;
     case 'exec': await renderExecView(); break;
     case 'generations': await renderGenerationsView(); break;
     case 'gen-detail': await renderGenDetailView(); break;
+    case 'environments': await renderEnvironmentsView(); break;
+    case 'env-approvals': await renderEnvApprovalsView(); break;
     case 'reports': await renderReportsView(); break;
     default: f2().view = 'cases'; await renderCasesView(); break;
   }
 }
 
 // Tears down every live artifact of the tests tab: the generation event
-// stream, the generation poll and the execution duration ticker.
+// stream, the generation poll, the execution duration ticker and the F3 live
+// streams (automated run, try run, code assist).
 function stopTestsLive() {
   const s = state.f2;
   if (!s) return;
@@ -3388,6 +3695,8 @@ function stopTestsLive() {
   s.genWidget = null;
   s.genSteps = [];
   if (s.exec?.timerId) { clearInterval(s.exec.timerId); s.exec.timerId = null; }
+  stopAutoRunLive();
+  stopCodeEditorLive();
 }
 
 // =============================================================================
@@ -3457,7 +3766,12 @@ async function renderCasesView() {
       ${canEdit() ? `
         <tf-button variant="ghost" icon="download" id="ps-cases-import">${escapeHtml(t('cases_import_csv'))}</tf-button>
         <tf-button variant="ghost" icon="sparkle" id="ps-cases-generate">${escapeHtml(t('cases_generate'))}</tf-button>
-        <tf-button variant="primary" icon="plus" id="ps-cases-new">${escapeHtml(t('cases_new'))}</tf-button>
+        <span class="ps-new-case-wrap">
+          <tf-button variant="primary" icon="plus" id="ps-cases-new">${escapeHtml(t('cases_new'))}</tf-button>
+          <tf-menu placement="bottom-end" id="ps-cases-new-menu">
+            ${CASE_KINDS.map((k) => `<tf-menu-item action="${k}" icon="${k === 'manual' ? 'list' : 'code'}">${escapeHtml(t(`case_kind_${k}`))}</tf-menu-item>`).join('')}
+          </tf-menu>
+        </span>
       ` : ''}
     </div>
     <div class="ps-bulk-bar" id="ps-cases-bulk" hidden>
@@ -3483,7 +3797,16 @@ async function renderCasesView() {
   bindFilter('ps-cases-f-origin', 'origin');
   byId('ps-cases-import')?.addEventListener('click', () => openCsvImportWindow());
   byId('ps-cases-generate')?.addEventListener('click', () => openGenerationWindow());
-  byId('ps-cases-new')?.addEventListener('click', () => openCaseEditor(null));
+  // The kind is fixed at creation (the server refuses to change it later), so
+  // "new case" opens the kind menu instead of assuming 'manual'.
+  byId('ps-cases-new')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    byId('ps-cases-new-menu')?.toggle();
+  });
+  byId('ps-cases-new-menu')?.addEventListener('action', (e) => {
+    const kind = e.detail?.action;
+    if (kind && CASE_KINDS.includes(kind)) openCaseEditor(null, kind);
+  });
   byId('ps-cases-bulk')?.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-bulk]');
     if (btn) handleCasesBulk(btn.dataset.bulk);
@@ -3779,9 +4102,13 @@ function openCsvImportWindow() {
 // T02 — manual case editor (steps, versions, attachments, optimistic locking)
 // =============================================================================
 
-function openCaseEditor(caseId) {
+// `kind` only matters for a NEW case: an existing one carries its own kind,
+// and the server refuses to change it on save.
+function openCaseEditor(caseId, kind = 'manual') {
+  stopCodeEditorLive();
   f2().editor = {
     caseId: caseId || null,
+    kind,
     loaded: !caseId,
     info: null,
     title: '',
@@ -3789,6 +4116,15 @@ function openCaseEditor(caseId) {
     preconditions: '',
     testData: '',
     steps: caseId ? [] : [{ action: '', expected: '' }],
+    // Code kinds (T03): script + per-kind configuration.
+    script: '',
+    language: 'python',
+    config: {},
+    checklist: [],
+    buildProfileRef: '',
+    envId: '',
+    tryRun: null,
+    assist: null,
     tagNames: [],
     linkedSourceIds: new Set(),
     attachments: [],
@@ -3811,6 +4147,42 @@ function parseCaseContent(contentJson) {
     preconditions: String(content.preconditions ?? ''),
     testData: String(content.test_data ?? content.testData ?? ''),
     steps: steps.length ? steps : [{ action: '', expected: '' }],
+    script: String(content.script ?? ''),
+    language: String(content.language ?? '') || 'python',
+    config: content.config && typeof content.config === 'object' ? content.config : {},
+    profile: content.profile && typeof content.profile === 'object' ? content.profile : {},
+    checklist: Array.isArray(content.checklist) ? content.checklist.map(String) : [],
+    buildProfileRef: String(content.build_profile_ref ?? content.buildProfileRef ?? ''),
+  };
+}
+
+function isCodeKind(kind) {
+  return CODE_KINDS.includes(kind);
+}
+
+// tf-code-editor highlights by language id; the runner language maps 1:1 for
+// the executable set and degrades to plain text for anything else.
+function editorLanguageOf(language) {
+  const lang = String(language || '').toLowerCase();
+  return ['python', 'javascript', 'typescript', 'json', 'yaml', 'markdown', 'gherkin'].includes(lang) ? lang : 'plain';
+}
+
+function codeEditorLabels() {
+  return {
+    editor: t('ce_editor'),
+    find: t('ce_find'),
+    replace: t('ce_replace'),
+    match_case: t('ce_match_case'),
+    regex: t('ce_regex'),
+    prev: t('ce_prev'),
+    next: t('ce_next'),
+    replace_one: t('ce_replace_one'),
+    replace_all: t('ce_replace_all'),
+    close: t('action_close'),
+    matches: t('ce_matches'),
+    no_matches: t('ce_no_matches'),
+    bad_regex: t('ce_bad_regex'),
+    folded_lines: t('ce_folded_lines'),
   };
 }
 
@@ -3822,11 +4194,17 @@ async function loadCaseIntoEditor(ed) {
   const info = detail.info || {};
   const content = parseCaseContent(fv(detail, 'content_json'));
   ed.info = info;
+  ed.kind = info.kind || ed.kind;
   ed.title = info.title || '';
   ed.priority = info.priority || 'medium';
   ed.preconditions = content.preconditions;
   ed.testData = content.testData;
   ed.steps = content.steps;
+  ed.script = content.script;
+  ed.language = (info.language && isCodeKind(ed.kind)) ? info.language : content.language;
+  ed.config = ed.kind === 'perf' ? content.profile : content.config;
+  ed.checklist = content.checklist;
+  ed.buildProfileRef = content.buildProfileRef;
   ed.tagNames = (fv(info, 'tag_ids') || []).map(tagNameById).filter(Boolean);
   ed.linkedSourceIds = new Set(fv(info, 'linked_source_ids') || []);
   ed.attachments = Array.isArray(detail.attachments) ? detail.attachments.slice() : [];
@@ -3853,6 +4231,16 @@ async function renderCaseEditor() {
   }
   if (state.tab !== 'tests' || f2().view !== 'case-editor') return;
 
+  const codeCase = isCodeKind(ed.kind);
+  if (codeCase) {
+    // The code editor needs the runner toolchains (language availability) and
+    // the approved environments (try-run target).
+    await loadRunners();
+    try { await loadEnvironments(); } catch { /* the try-run guard reports it */ }
+    if (state.tab !== 'tests' || f2().view !== 'case-editor') return;
+    const approved = approvedEnvironments();
+    if (!ed.envId && approved.length === 1) ed.envId = fv(approved[0], 'environment_id');
+  }
   const info = ed.info;
   const status = info?.status || 'draft';
   const editable = canEdit() && (!info || status === 'draft' || status === 'review');
@@ -3882,6 +4270,7 @@ async function renderCaseEditor() {
         ${info ? caseStatusChipHtml(status) : `<tf-chip status="info" dot>${escapeHtml(t('case_new_chip'))}</tf-chip>`}
         ${info && fv(info, 'review_state') === 'pending' ? `<tf-chip status="warn">${escapeHtml(t('case_pending_chip'))}</tf-chip>` : ''}
         ${info ? `<tf-chip status="info">v${Number(fv(info, 'current_version') ?? 1)}</tf-chip>` : ''}
+        <tf-chip status="${codeCase ? 'accent' : 'info'}">${escapeHtml(t(`case_kind_${ed.kind}`))}</tf-chip>
         ${info?.origin === 'agent' ? `<tf-chip status="accent">${sprite('sparkle')} ${escapeHtml(t('origin_agent'))}</tf-chip>` : ''}
       </div>
       <div class="ps-editor-actions">
@@ -3918,19 +4307,21 @@ async function renderCaseEditor() {
           </div>
         </tf-section-card>
 
-        <tf-section-card title="${escapeAttr(t('case_preconditions_title'))}" icon="info">
-          <tf-textarea id="ps-case-preconditions" rows="3" placeholder="${escapeAttr(t('case_preconditions_placeholder'))}" ${editable ? '' : 'readonly'}></tf-textarea>
-        </tf-section-card>
+        ${codeCase ? codeCaseSectionsHtml(ed, editable) : `
+          <tf-section-card title="${escapeAttr(t('case_preconditions_title'))}" icon="info">
+            <tf-textarea id="ps-case-preconditions" rows="3" placeholder="${escapeAttr(t('case_preconditions_placeholder'))}" ${editable ? '' : 'readonly'}></tf-textarea>
+          </tf-section-card>
 
-        <tf-section-card title="${escapeAttr(t('case_steps_title'))}" icon="list">
-          <span slot="subtitle">${escapeHtml(t('case_steps_sub'))}</span>
-          <div id="ps-case-steps"></div>
-          ${editable ? `<tf-button variant="ghost" icon="plus" id="ps-case-add-step">${escapeHtml(t('case_add_step'))}</tf-button>` : ''}
-        </tf-section-card>
+          <tf-section-card title="${escapeAttr(t('case_steps_title'))}" icon="list">
+            <span slot="subtitle">${escapeHtml(t('case_steps_sub'))}</span>
+            <div id="ps-case-steps"></div>
+            ${editable ? `<tf-button variant="ghost" icon="plus" id="ps-case-add-step">${escapeHtml(t('case_add_step'))}</tf-button>` : ''}
+          </tf-section-card>
 
-        <tf-section-card title="${escapeAttr(t('case_test_data_title'))}" icon="database">
-          <tf-textarea id="ps-case-test-data" rows="3" placeholder="${escapeAttr(t('case_test_data_placeholder'))}" ${editable ? '' : 'readonly'}></tf-textarea>
-        </tf-section-card>
+          <tf-section-card title="${escapeAttr(t('case_test_data_title'))}" icon="database">
+            <tf-textarea id="ps-case-test-data" rows="3" placeholder="${escapeAttr(t('case_test_data_placeholder'))}" ${editable ? '' : 'readonly'}></tf-textarea>
+          </tf-section-card>
+        `}
 
         <tf-section-card title="${escapeAttr(t('case_attachments_title'))}" icon="paperclip">
           <div id="ps-case-attachments"></div>
@@ -3992,7 +4383,12 @@ async function renderCaseEditor() {
   byId('ps-case-title')?.addEventListener('input', (e) => { ed.title = String(e.target.value ?? ''); });
   byId('ps-case-priority')?.addEventListener('change', (e) => { ed.priority = e.detail?.value ?? e.target.value ?? ed.priority; });
   byId('ps-case-change-note')?.addEventListener('input', (e) => { ed.changeNote = String(e.target.value ?? ''); });
-  byId('ps-case-back')?.addEventListener('click', () => { f2().editor = null; f2().view = 'cases'; renderTestsView(); });
+  byId('ps-case-back')?.addEventListener('click', () => {
+    stopCodeEditorLive();
+    f2().editor = null;
+    f2().view = 'cases';
+    renderTestsView();
+  });
   byId('ps-case-save')?.addEventListener('click', () => saveCaseFromEditor());
   byId('ps-case-save2')?.addEventListener('click', () => saveCaseFromEditor());
   byId('ps-case-delete')?.addEventListener('click', () => {
@@ -4039,7 +4435,8 @@ async function renderCaseEditor() {
     }
   });
 
-  renderCaseSteps(editable);
+  if (codeCase) wireCodeCaseEditor(ed, editable);
+  else renderCaseSteps(editable);
   renderCaseAttachments(editable);
 }
 
@@ -4113,6 +4510,521 @@ function renderCaseAttachments(editable) {
   });
 }
 
+// =============================================================================
+// T03 — code case editor (tf-code-editor + AI assist + try run)
+// =============================================================================
+
+// Per-kind configuration block of a code case; the field set mirrors the
+// content_json contract validated by generation::validate_case_content.
+function codeConfigHtml(ed, editable) {
+  const cfg = ed.config || {};
+  const ro = editable ? '' : 'readonly';
+  const viewport = cfg.viewport && typeof cfg.viewport === 'object' ? cfg.viewport : {};
+  if (ed.kind === 'ui') {
+    return `
+      <div class="ps-code-config">
+        <tf-input id="ps-code-vw" type="number" min="120" max="8000" label="${escapeAttr(t('code_cfg_viewport_w'))}" value="${escapeAttr(String(viewport.width ?? 1280))}" ${ro}></tf-input>
+        <tf-input id="ps-code-vh" type="number" min="120" max="8000" label="${escapeAttr(t('code_cfg_viewport_h'))}" value="${escapeAttr(String(viewport.height ?? 720))}" ${ro}></tf-input>
+        <tf-input id="ps-code-timeout" type="number" min="100" max="600000" label="${escapeAttr(t('code_cfg_timeout'))}" value="${escapeAttr(String(cfg.timeout_ms ?? 30000))}" ${ro}></tf-input>
+        <label class="ps-toggle-field">
+          <span class="ps-field-label">${escapeHtml(t('code_cfg_headed'))}</span>
+          <tf-toggle id="ps-code-headed" ${cfg.headed ? 'checked' : ''} ${editable ? '' : 'disabled'}></tf-toggle>
+        </label>
+      </div>
+    `;
+  }
+  if (ed.kind === 'api') {
+    return `
+      <div class="ps-code-config">
+        <tf-input id="ps-code-timeout" type="number" min="100" max="600000" label="${escapeAttr(t('code_cfg_timeout'))}" value="${escapeAttr(String(cfg.timeout_ms ?? 30000))}" ${ro}></tf-input>
+      </div>
+    `;
+  }
+  if (ed.kind === 'perf') {
+    return `
+      <div class="ps-code-config">
+        <tf-input id="ps-code-users" type="number" min="${PERF_LIMITS.users[0]}" max="${PERF_LIMITS.users[1]}" label="${escapeAttr(t('code_cfg_users'))}" value="${escapeAttr(String(cfg.users ?? PERF_DEFAULT_PROFILE.users))}" ${ro}></tf-input>
+        <tf-input id="ps-code-spawn" type="number" min="${PERF_LIMITS.spawnRate[0]}" max="${PERF_LIMITS.spawnRate[1]}" label="${escapeAttr(t('code_cfg_spawn'))}" value="${escapeAttr(String(cfg.spawn_rate ?? PERF_DEFAULT_PROFILE.spawn_rate))}" ${ro}></tf-input>
+        <tf-input id="ps-code-duration" type="number" min="${PERF_LIMITS.duration[0]}" max="${PERF_LIMITS.duration[1]}" label="${escapeAttr(t('code_cfg_duration'))}" value="${escapeAttr(String(cfg.duration_secs ?? PERF_DEFAULT_PROFILE.duration_secs))}" ${ro}></tf-input>
+      </div>
+    `;
+  }
+  if (ed.kind === 'unit') {
+    return `
+      <div class="ps-code-config">
+        <tf-input id="ps-code-build-ref" label="${escapeAttr(t('code_cfg_build_profile'))}" value="${escapeAttr(ed.buildProfileRef)}"
+          hint="${escapeAttr(t('code_cfg_build_profile_hint'))}" ${ro}></tf-input>
+      </div>
+    `;
+  }
+  return `
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('code_cfg_checklist'))}</span>
+      <tf-tag-input id="ps-code-checklist" dedupe placeholder="${escapeAttr(t('code_cfg_checklist_placeholder'))}" ${editable ? '' : 'disabled'}></tf-tag-input>
+      <div class="ps-field-hint">${escapeHtml(t('code_cfg_checklist_hint'))}</div>
+    </div>
+  `;
+}
+
+function codeCaseSectionsHtml(ed, editable) {
+  const advertised = runnerLanguages();
+  const approved = approvedEnvironments();
+  const quickActions = ['generate', 'fix', 'explain', 'assertions'];
+  return `
+    <tf-section-card title="${escapeAttr(t('code_script_title'))}" icon="code">
+      <span slot="subtitle">${escapeHtml(t('code_script_sub'))}</span>
+      <div class="ps-code-toolbar">
+        <tf-select id="ps-code-language" label="${escapeAttr(t('code_language_label'))}" value="${escapeAttr(ed.language)}" ${editable ? '' : 'disabled'}>
+          ${CODE_LANGUAGES.map((lang) => {
+            const ready = lang.executable && advertised.has(lang.id);
+            const suffix = lang.executable
+              ? (ready ? t('code_language_ready') : t('code_language_no_runner'))
+              : t('code_language_unavailable');
+            return `<option value="${lang.id}" ${lang.id === ed.language ? 'selected' : ''} ${lang.executable ? '' : 'disabled'}>${escapeHtml(`${lang.id} — ${suffix}`)}</option>`;
+          }).join('')}
+        </tf-select>
+        <tf-select id="ps-code-env" label="${escapeAttr(t('code_env_label'))}" value="${escapeAttr(ed.envId)}">
+          <option value="">${escapeHtml(approved.length ? t('assign_choose') : t('code_env_missing'))}</option>
+          ${approved.map((env) => `<option value="${escapeAttr(fv(env, 'environment_id'))}" ${fv(env, 'environment_id') === ed.envId ? 'selected' : ''}>${escapeHtml(`${env.name} — ${fv(env, 'base_url')}`)}</option>`).join('')}
+        </tf-select>
+        <span class="ps-toolbar-spacer"></span>
+        ${canEdit() ? `
+          <tf-button variant="ghost" icon="play" id="ps-code-try">${escapeHtml(t('code_try_run'))}</tf-button>
+          <tf-button variant="ghost" icon="stop" id="ps-code-try-stop" hidden>${escapeHtml(t('code_try_stop'))}</tf-button>
+        ` : ''}
+      </div>
+      <div class="ps-code-editor-host" id="ps-code-editor-host"></div>
+      <div class="ps-field-hint">${escapeHtml(t('code_editor_hint'))}</div>
+    </tf-section-card>
+
+    <tf-section-card title="${escapeAttr(t('code_config_title'))}" icon="settings">
+      ${codeConfigHtml(ed, editable)}
+    </tf-section-card>
+
+    ${canEdit() ? `
+      <tf-section-card class="ps-ai-panel" title="${escapeAttr(t('ai_panel_title'))}" icon="sparkle">
+        <span slot="subtitle">${escapeHtml(t('ai_panel_sub'))}</span>
+        <div class="ps-ai-chips" id="ps-ai-chips">
+          ${quickActions.map((id) => `<tf-chip status="accent" data-ai-quick="${id}" role="button" tabindex="0">${escapeHtml(t(`ai_quick_${id}`))}</tf-chip>`).join('')}
+        </div>
+        <div class="ps-ai-ask">
+          <tf-input id="ps-ai-instruction" label="${escapeAttr(t('ai_instruction_label'))}" placeholder="${escapeAttr(t('ai_instruction_placeholder'))}"></tf-input>
+          <tf-button variant="primary" icon="sparkle" id="ps-ai-ask">${escapeHtml(t('ai_ask'))}</tf-button>
+          <tf-button variant="ghost" icon="stop" id="ps-ai-stop" hidden>${escapeHtml(t('ai_stop'))}</tf-button>
+        </div>
+        <div class="ps-ai-scope" id="ps-ai-scope">${escapeHtml(t('ai_scope_whole'))}</div>
+        <div class="ps-ai-stream" id="ps-ai-stream" hidden></div>
+        <div class="ps-ai-proposal" id="ps-ai-proposal" hidden></div>
+      </tf-section-card>
+    ` : ''}
+
+    <tf-section-card title="${escapeAttr(t('code_try_title'))}" icon="prompt">
+      <span slot="subtitle">${escapeHtml(t('code_try_hint'))}</span>
+      <div class="ps-live-log" id="ps-code-console">${escapeHtml(t('code_console_empty'))}</div>
+    </tf-section-card>
+  `;
+}
+
+function wireCodeCaseEditor(ed, editable) {
+  const hostEl = byId('ps-code-editor-host');
+  if (!hostEl) return;
+  const editor = document.createElement('tf-code-editor');
+  editor.setAttribute('language', editorLanguageOf(ed.language));
+  editor.setAttribute('aria-label', t('ce_editor'));
+  if (!editable) editor.setAttribute('readonly', '');
+  editor.labels = codeEditorLabels();
+  editor.value = ed.script;
+  hostEl.replaceChildren(editor);
+  ed.editorEl = editor;
+
+  editor.addEventListener('change', (e) => { ed.script = String(e.detail?.value ?? editor.value ?? ''); });
+  editor.addEventListener('save', () => { if (editable) saveCaseFromEditor(); });
+  editor.addEventListener('selection-change', (e) => {
+    const scope = byId('ps-ai-scope');
+    if (!scope) return;
+    const text = String(e.detail?.text ?? '');
+    scope.textContent = text.trim()
+      ? t('ai_scope_selection', { chars: text.length })
+      : t('ai_scope_whole');
+  });
+
+  byId('ps-code-language')?.addEventListener('change', (e) => {
+    ed.language = e.detail?.value ?? e.target.value ?? ed.language;
+    editor.setAttribute('language', editorLanguageOf(ed.language));
+  });
+  byId('ps-code-env')?.addEventListener('change', (e) => {
+    ed.envId = e.detail?.value ?? e.target.value ?? '';
+  });
+
+  const checklistInput = byId('ps-code-checklist');
+  if (checklistInput) {
+    checklistInput.tags = (ed.checklist || []).slice();
+    checklistInput.addEventListener('change', (e) => {
+      ed.checklist = Array.isArray(e.detail?.tags) ? e.detail.tags : checklistInput.tags;
+    });
+  }
+
+  byId('ps-code-try')?.addEventListener('click', () => startTryRun(ed));
+  byId('ps-code-try-stop')?.addEventListener('click', () => cancelTryRun(ed));
+  byId('ps-ai-ask')?.addEventListener('click', () => startCodeAssist(ed));
+  byId('ps-ai-stop')?.addEventListener('click', () => stopCodeAssist());
+  byId('ps-ai-chips')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-ai-quick]');
+    if (!chip) return;
+    const input = byId('ps-ai-instruction');
+    if (input) input.value = t(`ai_quick_${chip.dataset.aiQuick}_prompt`);
+    startCodeAssist(ed);
+  });
+
+  // A restored console keeps the last try-run output visible after a re-render.
+  const consoleEl = byId('ps-code-console');
+  if (consoleEl && ed.tryRun?.log?.length) consoleEl.textContent = ed.tryRun.log.join('\n');
+}
+
+// Reads the per-kind config back out of the DOM into the editor state so both
+// save and try-run see the same content.
+function collectCodeConfig(ed) {
+  const num = (id, dflt) => {
+    const raw = byId(id)?.value;
+    const value = Number(raw);
+    return Number.isFinite(value) && String(raw ?? '').trim() !== '' ? value : dflt;
+  };
+  if (ed.kind === 'ui') {
+    ed.config = {
+      viewport: { width: num('ps-code-vw', 1280), height: num('ps-code-vh', 720) },
+      timeout_ms: num('ps-code-timeout', 30000),
+      headed: !!byId('ps-code-headed')?.checked,
+    };
+  } else if (ed.kind === 'api') {
+    ed.config = { timeout_ms: num('ps-code-timeout', 30000) };
+  } else if (ed.kind === 'perf') {
+    ed.config = {
+      users: num('ps-code-users', PERF_DEFAULT_PROFILE.users),
+      spawn_rate: num('ps-code-spawn', PERF_DEFAULT_PROFILE.spawn_rate),
+      duration_secs: num('ps-code-duration', PERF_DEFAULT_PROFILE.duration_secs),
+    };
+  } else if (ed.kind === 'unit') {
+    ed.buildProfileRef = String(byId('ps-code-build-ref')?.value ?? '').trim();
+  } else if (ed.kind === 'security') {
+    const checklist = byId('ps-code-checklist');
+    if (Array.isArray(checklist?.tags)) ed.checklist = checklist.tags;
+  }
+  if (ed.editorEl) ed.script = String(ed.editorEl.value ?? ed.script);
+}
+
+// content_json of a code case, per the kind contract.
+function codeContentJson(ed) {
+  const content = { script: ed.script, language: ed.language };
+  if (ed.kind === 'ui' || ed.kind === 'api') content.config = ed.config;
+  else if (ed.kind === 'perf') content.profile = ed.config;
+  else if (ed.kind === 'unit') { if (ed.buildProfileRef) content.build_profile_ref = ed.buildProfileRef; }
+  else if (ed.kind === 'security') content.checklist = ed.checklist || [];
+  return JSON.stringify(content);
+}
+
+function appendTryLog(ed, line) {
+  if (!ed.tryRun) return;
+  ed.tryRun.log.push(line);
+  if (ed.tryRun.log.length > TRY_LOG_CAP) ed.tryRun.log.splice(0, ed.tryRun.log.length - TRY_LOG_CAP);
+  const el = byId('ps-code-console');
+  if (el) {
+    el.textContent = ed.tryRun.log.join('\n');
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function setTryRunButtons(running) {
+  const start = byId('ps-code-try');
+  const stop = byId('ps-code-try-stop');
+  if (start) start.hidden = running;
+  if (stop) stop.hidden = !running;
+}
+
+// T03 "Uruchom próbnie": ephemeral execution of the UNSAVED editor content
+// against an approved environment. Nothing is persisted as a run.
+async function startTryRun(ed) {
+  if (ed.tryRun?.running) return;
+  collectCodeConfig(ed);
+  if (!ed.caseId) { toast(t('code_try_needs_save'), 'error'); return; }
+  if (!ed.script.trim()) { toast(t('err_case_script'), 'error'); return; }
+  if (!ed.envId) { toast(t('code_try_needs_env'), 'error'); return; }
+
+  const tryId = crypto.randomUUID();
+  ed.tryRun = { id: tryId, running: true, log: [], unsub: null };
+  setTryRunButtons(true);
+  appendTryLog(ed, t('code_try_started'));
+
+  const perfProfileJson = ed.kind === 'perf' ? JSON.stringify(ed.config) : '';
+  try {
+    const unsub = await ApiBinary.subscribe(
+      'projectStudioTryRunStartRequest',
+      {
+        projectId: projectId(),
+        tryId,
+        caseId: ed.caseId,
+        environmentId: ed.envId,
+        contentJsonOverride: codeContentJson(ed),
+        language: ed.language,
+        perfProfileJson,
+      },
+      {
+        onChunk: (body) => {
+          if (body?.variant !== 'ProjectStudioTryRunStreamChunk') return;
+          if (f2().editor !== ed) return;
+          appendTryLog(ed, body.phase ? `[${body.phase}] ${body.line}` : String(body.line || ''));
+        },
+        onEnd: (body) => {
+          if (f2().editor !== ed) return;
+          const status = body?.status || 'completed';
+          const error = body?.error;
+          appendTryLog(ed, error ? `${t('code_try_failed')}: ${error}` : t('code_try_done', { status }));
+          const summary = fv(body ?? {}, 'junit_summary_json');
+          if (summary && summary !== '{}') appendTryLog(ed, summary);
+          ed.tryRun.running = false;
+          setTryRunButtons(false);
+        },
+        onError: (body) => {
+          if (f2().editor !== ed) return;
+          appendTryLog(ed, `${t('code_try_failed')}: ${body?.message ?? ''}`);
+          ed.tryRun.running = false;
+          setTryRunButtons(false);
+        },
+      },
+    );
+    if (f2().editor !== ed || !ed.tryRun.running) { unsub(); return; }
+    ed.tryRun.unsub = unsub;
+  } catch (err) {
+    ed.tryRun.running = false;
+    setTryRunButtons(false);
+    appendTryLog(ed, `${t('code_try_failed')}: ${err.message}`);
+  }
+}
+
+async function cancelTryRun(ed) {
+  const run = ed.tryRun;
+  if (!run?.running) return;
+  try {
+    await ApiBinary.one('projectStudioTryRunCancelRequest', { projectId: projectId(), tryId: run.id });
+    appendTryLog(ed, t('code_try_cancelled'));
+  } catch (err) {
+    appendTryLog(ed, `${t('code_try_failed')}: ${err.message}`);
+  }
+  run.running = false;
+  if (run.unsub) { try { run.unsub(); } catch { /* stream already gone */ } run.unsub = null; }
+  setTryRunButtons(false);
+}
+
+// T03 AI assist: streams a proposal through the project's generator agent and
+// shows it as a two-column diff before anything touches the editor buffer.
+async function startCodeAssist(ed) {
+  const assist = ed.assist;
+  if (assist?.busy) return;
+  collectCodeConfig(ed);
+  const instruction = String(byId('ps-ai-instruction')?.value ?? '').trim();
+  if (!instruction) { toast(t('ai_empty_instruction'), 'error'); return; }
+  const selection = ed.editorEl?.getSelection?.()?.text ?? '';
+
+  ed.assist = { busy: true, unsub: null, stream: '', selection, instruction };
+  const streamEl = byId('ps-ai-stream');
+  const proposalEl = byId('ps-ai-proposal');
+  if (proposalEl) { proposalEl.hidden = true; proposalEl.innerHTML = ''; }
+  if (streamEl) {
+    streamEl.hidden = false;
+    streamEl.textContent = t('ai_streaming');
+  }
+  byId('ps-ai-ask')?.setAttribute('disabled', '');
+  const stopBtn = byId('ps-ai-stop');
+  if (stopBtn) stopBtn.hidden = false;
+
+  const finish = () => {
+    ed.assist.busy = false;
+    byId('ps-ai-ask')?.removeAttribute('disabled');
+    const stop = byId('ps-ai-stop');
+    if (stop) stop.hidden = true;
+  };
+
+  try {
+    const unsub = await ApiBinary.subscribe(
+      'projectStudioCodeAssistRequest',
+      {
+        projectId: projectId(),
+        caseId: ed.caseId || '',
+        kind: ed.kind,
+        selection,
+        instruction,
+        fullContent: ed.script,
+      },
+      {
+        onChunk: (body) => {
+          if (body?.variant !== 'ProjectStudioCodeAssistStreamChunk') return;
+          if (f2().editor !== ed) return;
+          ed.assist.stream += String(body.token || '');
+          const el = byId('ps-ai-stream');
+          if (el) {
+            el.textContent = ed.assist.stream;
+            el.scrollTop = el.scrollHeight;
+          }
+        },
+        onEnd: (body) => {
+          if (f2().editor !== ed) return;
+          finish();
+          const el = byId('ps-ai-stream');
+          if (el) el.hidden = true;
+          if (body?.error) {
+            toast(`${t('ai_failed')}: ${body.error}`, 'error');
+            return;
+          }
+          renderAssistProposal(ed, String(body?.proposal ?? ed.assist.stream));
+        },
+        onError: (body) => {
+          if (f2().editor !== ed) return;
+          finish();
+          toast(`${t('ai_failed')}: ${body?.message ?? ''}`, 'error');
+        },
+      },
+    );
+    if (f2().editor !== ed || !ed.assist.busy) { unsub(); return; }
+    ed.assist.unsub = unsub;
+  } catch (err) {
+    finish();
+    toast(`${t('ai_failed')}: ${err.message}`, 'error');
+  }
+}
+
+function stopCodeAssist() {
+  const ed = state.f2?.editor;
+  if (!ed?.assist) return;
+  if (ed.assist.unsub) { try { ed.assist.unsub(); } catch { /* stream already gone */ } ed.assist.unsub = null; }
+  ed.assist.busy = false;
+  byId('ps-ai-ask')?.removeAttribute('disabled');
+  const stop = byId('ps-ai-stop');
+  if (stop) stop.hidden = true;
+  const el = byId('ps-ai-stream');
+  if (el) el.hidden = true;
+}
+
+// Two-column "current / proposed" view. The comparison base is the selection
+// when there was one (the agent then returns only that fragment), otherwise the
+// whole script — the same contract the server prompt states.
+function renderAssistProposal(ed, proposal) {
+  const hostEl = byId('ps-ai-proposal');
+  if (!hostEl) return;
+  const clean = String(proposal || '').trim();
+  if (!clean) {
+    toast(t('ai_empty_proposal'), 'error');
+    return;
+  }
+  ed.assist.proposal = clean;
+  const scoped = !!ed.assist.selection.trim();
+  const current = scoped ? ed.assist.selection : ed.script;
+  const rows = diffLines(current, clean);
+
+  hostEl.hidden = false;
+  hostEl.innerHTML = `
+    <div class="ps-diff-head">
+      <span class="ps-diff-title">${escapeHtml(t('ai_proposal_title'))}</span>
+      <tf-chip status="info">${escapeHtml(scoped ? t('ai_scope_selection', { chars: current.length }) : t('ai_scope_whole'))}</tf-chip>
+    </div>
+    <div class="ps-diff-cols">
+      <div class="ps-diff-col">
+        <div class="ps-diff-col-head">${escapeHtml(t('ai_diff_current'))}</div>
+        ${rows.map((row) => `<div class="ps-diff-line ${row.left == null ? 'is-empty' : ''} ${row.type === 'del' || row.type === 'mod' ? 'is-del' : ''}">${escapeHtml(row.left ?? '')}</div>`).join('')}
+      </div>
+      <div class="ps-diff-col">
+        <div class="ps-diff-col-head">${escapeHtml(t('ai_diff_proposed'))}</div>
+        ${rows.map((row) => `<div class="ps-diff-line ${row.right == null ? 'is-empty' : ''} ${row.type === 'add' || row.type === 'mod' ? 'is-add' : ''}">${escapeHtml(row.right ?? '')}</div>`).join('')}
+      </div>
+    </div>
+    <div class="ps-diff-actions">
+      <tf-button variant="ghost" icon="copy" data-diff-action="copy">${escapeHtml(t('ai_copy'))}</tf-button>
+      <tf-button variant="ghost" icon="x" data-diff-action="reject">${escapeHtml(t('ai_reject'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-diff-action="apply">${escapeHtml(t('ai_apply'))}</tf-button>
+    </div>
+  `;
+  hostEl.querySelectorAll('[data-diff-action]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const action = btn.dataset.diffAction;
+      if (action === 'reject') {
+        hostEl.hidden = true;
+        hostEl.innerHTML = '';
+        return;
+      }
+      if (action === 'copy') {
+        navigator.clipboard?.writeText(clean).then(
+          () => toast(t('ai_copied'), 'success'),
+          () => toast(t('ai_copy_failed'), 'error'),
+        );
+        return;
+      }
+      applyAssistProposal(ed, clean, scoped);
+      hostEl.hidden = true;
+      hostEl.innerHTML = '';
+    });
+  });
+}
+
+function applyAssistProposal(ed, proposal, scoped) {
+  if (!ed.editorEl) return;
+  if (scoped) ed.editorEl.replaceSelection(proposal);
+  else ed.editorEl.value = proposal;
+  ed.script = String(ed.editorEl.value ?? proposal);
+  toast(t('ai_applied'), 'success');
+}
+
+// Minimal LCS line diff for the proposal view. Both sides are bounded by the
+// assist limits, and the quadratic table is skipped for large inputs (the view
+// then degrades to a plain side-by-side listing, still readable).
+function diffLines(currentText, proposedText) {
+  const left = String(currentText).split('\n');
+  const right = String(proposedText).split('\n');
+  const MAX_LCS_LINES = 600;
+  if (left.length > MAX_LCS_LINES || right.length > MAX_LCS_LINES) {
+    const rows = [];
+    for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+      const l = i < left.length ? left[i] : null;
+      const r = i < right.length ? right[i] : null;
+      rows.push({ left: l, right: r, type: l === r ? 'same' : 'mod' });
+    }
+    return rows;
+  }
+  const table = Array.from({ length: left.length + 1 }, () => new Uint32Array(right.length + 1));
+  for (let i = left.length - 1; i >= 0; i -= 1) {
+    for (let j = right.length - 1; j >= 0; j -= 1) {
+      table[i][j] = left[i] === right[j]
+        ? table[i + 1][j + 1] + 1
+        : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+  const rows = [];
+  let i = 0;
+  let j = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) {
+      rows.push({ left: left[i], right: right[j], type: 'same' });
+      i += 1;
+      j += 1;
+    } else if (table[i + 1][j] >= table[i][j + 1]) {
+      rows.push({ left: left[i], right: null, type: 'del' });
+      i += 1;
+    } else {
+      rows.push({ left: null, right: right[j], type: 'add' });
+      j += 1;
+    }
+  }
+  while (i < left.length) { rows.push({ left: left[i], right: null, type: 'del' }); i += 1; }
+  while (j < right.length) { rows.push({ left: null, right: right[j], type: 'add' }); j += 1; }
+  return rows;
+}
+
+function stopCodeEditorLive() {
+  const ed = state.f2?.editor;
+  if (!ed) return;
+  if (ed.tryRun?.unsub) { try { ed.tryRun.unsub(); } catch { /* stream already gone */ } ed.tryRun.unsub = null; }
+  if (ed.tryRun) ed.tryRun.running = false;
+  if (ed.assist?.unsub) { try { ed.assist.unsub(); } catch { /* stream already gone */ } ed.assist.unsub = null; }
+  if (ed.assist) ed.assist.busy = false;
+}
+
 // Maps user-visible tag names back onto project tag ids; unknown names abort
 // the save so the operator adds them in Settings first (tags are a managed
 // project-level catalog, cases only reference them).
@@ -4135,28 +5047,39 @@ async function saveCaseFromEditor() {
     toast(t('err_case_title'), 'error');
     return;
   }
-  const steps = ed.steps
-    .map((s) => ({ action: s.action.trim(), expected: s.expected.trim() }))
-    .filter((s) => s.action || s.expected);
-  if (!steps.length) {
-    toast(t('err_case_steps'), 'error');
-    return;
+  const codeCase = isCodeKind(ed.kind);
+  let contentJson;
+  if (codeCase) {
+    collectCodeConfig(ed);
+    if (!ed.script.trim()) {
+      toast(t('err_case_script'), 'error');
+      return;
+    }
+    contentJson = codeContentJson(ed);
+  } else {
+    const steps = ed.steps
+      .map((s) => ({ action: s.action.trim(), expected: s.expected.trim() }))
+      .filter((s) => s.action || s.expected);
+    if (!steps.length) {
+      toast(t('err_case_steps'), 'error');
+      return;
+    }
+    contentJson = JSON.stringify({
+      preconditions: ed.preconditions,
+      steps,
+      test_data: ed.testData,
+    });
   }
   const { ids: tagIds, unknown } = resolveTagIds(ed.tagNames);
   if (unknown.length) {
     toast(t('err_case_unknown_tags', { tags: unknown.join(', ') }), 'error');
     return;
   }
-  const contentJson = JSON.stringify({
-    preconditions: ed.preconditions,
-    steps,
-    test_data: ed.testData,
-  });
   try {
     const resp = await ApiBinary.one('projectStudioCaseSaveRequest', {
       projectId: projectId(),
       caseId: ed.caseId,
-      kind: 'manual',
+      kind: ed.kind,
       title,
       priority: ed.priority,
       contentJson,
@@ -4322,12 +5245,14 @@ function openGenerationWindow() {
     <div data-step-panel="1">
       <div class="ps-field">
         <span class="ps-field-label">${escapeHtml(t('gen_kind_label'))}</span>
+        <div class="ps-field-hint">${escapeHtml(t('gen_kind_hint'))}</div>
         <div class="ps-choice-grid" data-gen-kinds>
           ${CASE_KINDS.map((k) => `
-            <div class="ps-choice-card ${k === 'manual' ? 'is-selected' : 'is-disabled'}" data-gen-kind="${k}" role="button" tabindex="${k === 'manual' ? '0' : '-1'}">
+            <div class="ps-choice-card ${k === 'manual' ? 'is-selected' : ''}" data-gen-kind="${k}" role="button" tabindex="0">
               <div class="ps-cc-ico">${sprite(k === 'manual' ? 'list' : 'code')}</div>
               <div>
-                <div class="ps-cc-name">${escapeHtml(t(`case_kind_${k}`))}${k === 'manual' ? '' : ` <tf-chip status="info">${escapeHtml(t('kind_soon'))}</tf-chip>`}</div>
+                <div class="ps-cc-name">${escapeHtml(t(`case_kind_${k}`))}</div>
+                <div class="ps-cc-desc">${escapeHtml(t(`case_kind_${k}_desc`))}</div>
               </div>
             </div>
           `).join('')}
@@ -4349,6 +5274,7 @@ function openGenerationWindow() {
     </div>
 
     <div data-step-panel="3" hidden>
+      <div class="ps-banner-info" data-gen-bound-agent hidden>${sprite('brain')}<span data-gen-bound-agent-text></span></div>
       <div class="ps-field" style="margin-bottom:12px;">
         <tf-select id="ps-gen-agent" label="${escapeAttr(t('gen_agent_label'))}" value=""></tf-select>
         <div class="ps-field-hint">${escapeHtml(t('gen_agent_hint'))}</div>
@@ -4417,6 +5343,25 @@ function openGenerationWindow() {
     sel.addEventListener('change', (e) => { gw.agentId = e.detail?.value ?? sel.value ?? ''; });
   };
 
+  // The kind decides which project agent binding runs the generation
+  // (generation::agent_function_for_kind); the select below only overrides it.
+  const renderBoundAgent = () => {
+    const banner = body.querySelector('[data-gen-bound-agent]');
+    const text = body.querySelector('[data-gen-bound-agent-text]');
+    if (!banner || !text) return;
+    const fn = KIND_AGENT_FUNCTION[gw.kind];
+    if (!fn) { banner.hidden = true; return; }
+    const bindings = Array.isArray(state.settings?.agents) ? state.settings.agents : [];
+    const binding = bindings.find((a) => a.function === fn);
+    const agentId = binding ? (fv(binding, 'agent_id') || '') : '';
+    const known = state.agentOptions.find((a) => a.id === agentId);
+    const name = known?.name || (binding ? fv(binding, 'agent_name') : '') || '';
+    banner.hidden = false;
+    text.textContent = name
+      ? t('gen_agent_kind_bound', { fn: t(`agents_fn_${fn}`), agent: name })
+      : t('gen_agent_kind_default', { fn: t(`agents_fn_${fn}`) });
+  };
+
   const renderSummary = () => {
     const hostEl = body.querySelector('[data-gen-summary]');
     if (!hostEl) return;
@@ -4450,9 +5395,19 @@ function openGenerationWindow() {
       nextBtn.setAttribute('icon', step < 3 ? 'chevron-right' : 'sparkle');
       nextBtn.setAttribute('label', step < 3 ? t('wizard_next') : t('gen_start'));
     }
-    if (step === 3) renderSummary();
+    if (step === 3) { renderSummary(); renderBoundAgent(); }
     showError(null);
   };
+
+  body.querySelector('[data-gen-kinds]')?.addEventListener('click', (e) => {
+    const card = e.target.closest('[data-gen-kind]');
+    if (!card || gw.busy) return;
+    gw.kind = card.dataset.genKind;
+    body.querySelectorAll('[data-gen-kind]').forEach((c) => {
+      c.classList.toggle('is-selected', c.dataset.genKind === gw.kind);
+    });
+    showError(null);
+  });
 
   const start = async () => {
     if (gw.busy) return;
@@ -4511,6 +5466,13 @@ function openGenerationWindow() {
       } catch { /* select keeps only the default option */ }
     }
     renderAgentSelect();
+    if (!state.settings) {
+      try {
+        const resp = await ApiBinary.one('projectStudioSettingsGetRequest', { projectId: projectId() });
+        state.settings = resp.settings;
+      } catch { /* the per-kind banner falls back to the seeded agent */ }
+    }
+    if (gw.step === 3) renderBoundAgent();
   })();
 
   setStep(1);
@@ -4850,6 +5812,451 @@ function startGenLive(run, initiator) {
 }
 
 // =============================================================================
+// T12 — test environments (list, editor window, admin approval queue)
+// =============================================================================
+
+function envAuthLabel(env) {
+  const auth = fv(env, 'auth_type') || 'none';
+  const label = t(`env_auth_${auth}`);
+  return fv(env, 'has_secret') ? `${label} · ${t('env_secret_stored')}` : label;
+}
+
+// Mirrors environments::classify_base_url closely enough to warn BEFORE the
+// save round-trip; the server decision (which resolves DNS) always wins.
+function looksPrivateUrl(raw) {
+  let host = '';
+  try {
+    host = new URL(String(raw)).hostname;
+  } catch {
+    return false;
+  }
+  if (!host) return false;
+  // A single-label host (no dot) never resolves publicly.
+  if (!host.includes('.') && !host.includes(':')) return true;
+  return PRIVATE_HOST_RE.test(host);
+}
+
+async function loadEnvironments(force = false) {
+  const s = f2();
+  if (s.envs.loaded && !force) return s.envs.rows;
+  const resp = await ApiBinary.one('projectStudioEnvironmentsListRequest', { projectId: projectId() });
+  s.envs.rows = Array.isArray(resp.environments) ? resp.environments : [];
+  s.envs.loaded = true;
+  s.envPending = s.envs.rows.filter((e) => fv(e, 'approval_status') === 'pending').length;
+  return s.envs.rows;
+}
+
+function approvedEnvironments() {
+  return (f2().envs.rows || []).filter((e) => fv(e, 'approval_status') === 'approved');
+}
+
+async function renderEnvironmentsView() {
+  const host = byId('ps-tests-host');
+  if (!host) return;
+  const s = f2();
+  try {
+    await loadEnvironments(true);
+  } catch (err) {
+    host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('envs_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  if (state.tab !== 'tests' || s.view !== 'environments') return;
+
+  const rows = s.envs.rows.filter((env) => {
+    if (s.envs.type && fv(env, 'env_type') !== s.envs.type) return false;
+    if (s.envs.status && fv(env, 'approval_status') !== s.envs.status) return false;
+    return true;
+  });
+  const selectOpt = (value, current, label) =>
+    `<option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+
+  host.innerHTML = `
+    <div class="ps-tests-toolbar">
+      <tf-select id="ps-envs-f-type" value="${escapeAttr(s.envs.type)}">
+        ${selectOpt('', s.envs.type, t('env_filter_type_all'))}
+        ${ENV_TYPES.map((x) => selectOpt(x, s.envs.type, t(`env_type_${x}`))).join('')}
+      </tf-select>
+      <tf-select id="ps-envs-f-status" value="${escapeAttr(s.envs.status)}">
+        ${selectOpt('', s.envs.status, t('env_filter_status_all'))}
+        ${['approved', 'pending', 'rejected'].map((x) => selectOpt(x, s.envs.status, t(`env_status_${x}`))).join('')}
+      </tf-select>
+      <span class="ps-toolbar-spacer"></span>
+      ${state.isAdmin ? `
+        <tf-button variant="ghost" icon="shield" id="ps-envs-approvals">
+          ${escapeHtml(t('envs_approvals_btn'))}${s.envPending > 0 ? ` (${s.envPending})` : ''}
+        </tf-button>
+      ` : ''}
+      ${canManage() ? `<tf-button variant="primary" icon="plus" id="ps-envs-new">${escapeHtml(t('envs_new'))}</tf-button>` : ''}
+    </div>
+    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('envs_intro'))}</span></div>
+    <div id="ps-envs-table-host">
+      ${rows.length ? '' : `<tf-empty-state icon="globe" title="${escapeAttr(t('envs_empty'))}"></tf-empty-state>`}
+    </div>
+  `;
+
+  byId('ps-envs-f-type')?.addEventListener('change', (e) => {
+    s.envs.type = e.detail?.value ?? e.target.value ?? '';
+    renderEnvironmentsView();
+  });
+  byId('ps-envs-f-status')?.addEventListener('change', (e) => {
+    s.envs.status = e.detail?.value ?? e.target.value ?? '';
+    renderEnvironmentsView();
+  });
+  byId('ps-envs-new')?.addEventListener('click', () => openEnvironmentWindow(null));
+  byId('ps-envs-approvals')?.addEventListener('click', () => {
+    s.view = 'env-approvals';
+    renderTestsView();
+  });
+  if (!rows.length) return;
+
+  byId('ps-envs-table-host').innerHTML = `
+    <tf-table id="ps-envs-table">
+      <tf-column key="name" label="${escapeAttr(t('envs_col_name'))}"></tf-column>
+      <tf-column key="type" label="${escapeAttr(t('envs_col_type'))}"></tf-column>
+      <tf-column key="url" label="${escapeAttr(t('envs_col_url'))}" renderer="html"></tf-column>
+      <tf-column key="auth" label="${escapeAttr(t('envs_col_auth'))}"></tf-column>
+      <tf-column key="status" label="${escapeAttr(t('envs_col_status'))}" renderer="chip"></tf-column>
+      <tf-column key="updated" label="${escapeAttr(t('envs_col_updated'))}"></tf-column>
+    </tf-table>
+  `;
+  const table = byId('ps-envs-table');
+  table.rows = rows.map((env) => ({
+    _id: fv(env, 'environment_id'),
+    _row: env,
+    name: env.name,
+    type: t(`env_type_${fv(env, 'env_type')}`),
+    url: `<span class="ps-mono">${escapeHtml(fv(env, 'base_url') || '')}</span>`,
+    auth: envAuthLabel(env),
+    status: chipCell(ENV_STATUS_CHIP[fv(env, 'approval_status')], t(`env_status_${fv(env, 'approval_status')}`)),
+    updated: formatTimestamp(fv(env, 'updated_at')),
+  }));
+  table.rowActions = (row) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'ps-file-actions';
+    if (!canManage()) return wrap;
+    const edit = document.createElement('tf-button');
+    edit.setAttribute('variant', 'ghost');
+    edit.setAttribute('size', 'sm');
+    edit.setAttribute('icon', 'edit');
+    edit.setAttribute('title', t('action_edit'));
+    edit.addEventListener('click', (e) => { e.stopPropagation(); openEnvironmentWindow(row._row); });
+    wrap.appendChild(edit);
+    const del = document.createElement('tf-button');
+    del.setAttribute('variant', 'ghost');
+    del.setAttribute('size', 'sm');
+    del.setAttribute('icon', 'trash');
+    del.setAttribute('title', t('action_delete'));
+    del.addEventListener('click', (e) => { e.stopPropagation(); confirmDeleteEnvironment(row._row); });
+    wrap.appendChild(del);
+    return wrap;
+  };
+  table.expandable = true;
+  table.rowKey = '_id';
+  table.expandRenderer = (row) => buildEnvExpansion(row._row);
+}
+
+// Expansion carries the details that would crowd the table: rejection reason,
+// requester, extra headers and the sandbox host allowlist.
+function buildEnvExpansion(env) {
+  const wrap = document.createElement('div');
+  wrap.className = 'ps-item-expansion';
+  const allowlist = Array.isArray(fv(env, 'host_allowlist')) ? fv(env, 'host_allowlist') : [];
+  const headers = fv(env, 'extra_headers_json') || '';
+  const reason = fv(env, 'approval_reason') || '';
+  wrap.innerHTML = `
+    ${fv(env, 'is_private_address') ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('env_private_address'))}</span></div>` : ''}
+    ${reason ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('env_reason_prefix', { reason }))}</span></div>` : ''}
+    <div class="ps-case-info-list">
+      <div><span>${escapeHtml(t('env_requested_by'))}</span><b>${escapeHtml(fv(env, 'requested_by_name') || '—')}</b></div>
+      <div><span>${escapeHtml(t('env_decided_by'))}</span><b>${escapeHtml(fv(env, 'decided_by_name') || '—')}</b></div>
+      <div><span>${escapeHtml(t('env_decided_at'))}</span><b>${escapeHtml(fv(env, 'decided_at') ? formatTimestamp(fv(env, 'decided_at')) : '—')}</b></div>
+      <div><span>${escapeHtml(t('env_allowlist_label'))}</span><b>${escapeHtml(allowlist.join(', ') || '—')}</b></div>
+    </div>
+    ${headers && headers !== '{}' ? `<div class="ps-code-block">${escapeHtml(headers)}</div>` : ''}
+  `;
+  return wrap;
+}
+
+// T12 window — create/edit. `secret` is input-only: left untouched it keeps the
+// stored value (the wire sends null), emptied explicitly it clears it.
+function openEnvironmentWindow(env) {
+  const editing = !!env;
+  const { body, foot, cleanup } = openWindow({
+    title: t(editing ? 'env_win_edit_title' : 'env_win_new_title'),
+    subtitle: editing ? env.name : t('env_win_sub'),
+    icon: 'globe',
+    width: 640,
+  });
+
+  const ew = {
+    type: editing ? (fv(env, 'env_type') || 'web') : 'web',
+    auth: editing ? (fv(env, 'auth_type') || 'none') : 'none',
+    secretTouched: false,
+    busy: false,
+  };
+  const allowlist = editing && Array.isArray(fv(env, 'host_allowlist')) ? fv(env, 'host_allowlist') : [];
+  const headersJson = editing ? (fv(env, 'extra_headers_json') || '') : '';
+
+  body.innerHTML = `
+    <tf-input id="ps-env-name" label="${escapeAttr(t('env_name_label'))}" value="${escapeAttr(editing ? env.name : '')}"
+      hint="${escapeAttr(t('env_name_hint'))}"></tf-input>
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('env_type_label'))}</span>
+      <tf-segmented id="ps-env-type" value="${escapeAttr(ew.type)}">
+        ${ENV_TYPES.map((x) => `<option value="${x}">${escapeHtml(t(`env_type_${x}`))}</option>`).join('')}
+      </tf-segmented>
+      <div class="ps-field-hint">${escapeHtml(t('env_type_hint'))}</div>
+    </div>
+    <tf-input id="ps-env-url" label="${escapeAttr(t('env_url_label'))}" placeholder="https://staging.example.com"
+      value="${escapeAttr(editing ? (fv(env, 'base_url') || '') : '')}" hint="${escapeAttr(t('env_url_hint'))}"></tf-input>
+    <div class="ps-banner-warn" data-env-private hidden>${sprite('alert')}<span>${escapeHtml(t('env_private_banner'))}</span></div>
+    <div class="ps-field" data-env-justification hidden>
+      <tf-textarea id="ps-env-justification" rows="3" label="${escapeAttr(t('env_justification_label'))}"
+        hint="${escapeAttr(t('env_justification_hint'))}"></tf-textarea>
+    </div>
+    <div class="ps-field">
+      <tf-select id="ps-env-auth" label="${escapeAttr(t('env_auth_label'))}" value="${escapeAttr(ew.auth)}">
+        ${ENV_AUTH_TYPES.map((x) => `<option value="${x}" ${x === ew.auth ? 'selected' : ''}>${escapeHtml(t(`env_auth_${x}`))}</option>`).join('')}
+      </tf-select>
+      <div class="ps-field-hint">${escapeHtml(t('env_auth_hint'))}</div>
+    </div>
+    <div class="ps-field" data-env-secret ${ew.auth === 'none' ? 'hidden' : ''}>
+      <tf-input id="ps-env-secret" type="password" label="${escapeAttr(t('env_secret_label'))}"
+        placeholder="${escapeAttr(editing && fv(env, 'has_secret') ? t('env_secret_keep_hint') : '')}"
+        hint="${escapeAttr(t('env_secret_hint'))}"></tf-input>
+    </div>
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('env_allowlist_label'))}</span>
+      <tf-tag-input id="ps-env-allowlist" dedupe placeholder="${escapeAttr(t('env_allowlist_placeholder'))}"></tf-tag-input>
+      <div class="ps-field-hint">${escapeHtml(t('env_allowlist_hint'))}</div>
+    </div>
+    <div class="ps-field">
+      <tf-textarea id="ps-env-headers" rows="3" label="${escapeAttr(t('env_headers_label'))}"
+        placeholder='{"X-Tenant": "portal-b2b"}' hint="${escapeAttr(t('env_headers_hint'))}"></tf-textarea>
+    </div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t(editing ? 'action_save' : 'env_submit'))}</tf-button>
+    </div>
+  `;
+
+  const tagInput = body.querySelector('#ps-env-allowlist');
+  if (tagInput) tagInput.tags = allowlist.slice();
+  const headersEl = body.querySelector('#ps-env-headers');
+  if (headersEl && headersJson && headersJson !== '{}') headersEl.value = headersJson;
+  const justificationEl = body.querySelector('#ps-env-justification');
+  if (justificationEl && editing) justificationEl.value = fv(env, 'justification') || '';
+
+  const showError = (msg) => {
+    const el = body.querySelector('[data-form-error]');
+    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  };
+  const syncPrivate = () => {
+    const url = String(body.querySelector('#ps-env-url')?.value ?? '').trim();
+    const priv = looksPrivateUrl(url);
+    const banner = body.querySelector('[data-env-private]');
+    const justification = body.querySelector('[data-env-justification]');
+    if (banner) banner.hidden = !priv;
+    if (justification) justification.hidden = !priv;
+    return priv;
+  };
+
+  body.querySelector('#ps-env-type')?.addEventListener('change', (e) => {
+    ew.type = e.detail?.value ?? ew.type;
+  });
+  body.querySelector('#ps-env-url')?.addEventListener('input', () => syncPrivate());
+  body.querySelector('#ps-env-auth')?.addEventListener('change', (e) => {
+    ew.auth = e.detail?.value ?? e.target.value ?? 'none';
+    const secretField = body.querySelector('[data-env-secret]');
+    if (secretField) secretField.hidden = ew.auth === 'none';
+  });
+  body.querySelector('#ps-env-secret')?.addEventListener('input', () => { ew.secretTouched = true; });
+  syncPrivate();
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn || ew.busy) return;
+    if (btn.dataset.action === 'cancel') { cleanup(); return; }
+
+    const name = String(body.querySelector('#ps-env-name')?.value ?? '').trim();
+    const baseUrl = String(body.querySelector('#ps-env-url')?.value ?? '').trim();
+    const justification = String(justificationEl?.value ?? '').trim();
+    const headersRaw = String(headersEl?.value ?? '').trim();
+    if (name.length < 2) { showError(t('err_env_name')); return; }
+    if (!/^https?:\/\/.+/.test(baseUrl)) { showError(t('err_env_url')); return; }
+    if (headersRaw) {
+      try {
+        const parsed = JSON.parse(headersRaw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('shape');
+      } catch {
+        showError(t('err_env_headers'));
+        return;
+      }
+    }
+    if (syncPrivate() && !justification) { showError(t('err_env_justification')); return; }
+
+    // null = keep the stored secret, '' = clear it, value = replace it.
+    let secret = null;
+    if (ew.auth === 'none') secret = '';
+    else if (ew.secretTouched) secret = String(body.querySelector('#ps-env-secret')?.value ?? '');
+    else if (!editing) secret = String(body.querySelector('#ps-env-secret')?.value ?? '');
+
+    showError(null);
+    ew.busy = true;
+    btn.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('projectStudioEnvironmentSaveRequest', {
+        projectId: projectId(),
+        environmentId: editing ? fv(env, 'environment_id') : null,
+        name,
+        envType: ew.type,
+        baseUrl,
+        authType: ew.auth,
+        secret,
+        extraHeadersJson: headersRaw,
+        hostAllowlist: tagInput?.tags ?? [],
+        justification,
+      });
+      const status = fv(resp, 'approval_status') || 'approved';
+      toast(status === 'pending' ? t('env_save_pending') : t('env_saved'), 'success');
+      cleanup();
+      f2().envs.loaded = false;
+      if (state.tab === 'tests' && f2().view === 'environments') await renderTestsView();
+    } catch (err) {
+      ew.busy = false;
+      btn.removeAttribute('disabled');
+      showError(`${t('env_save_failed')}: ${err.message}`);
+    }
+  });
+}
+
+function confirmDeleteEnvironment(env) {
+  openDeleteWindow({
+    title: t('env_delete_title'),
+    targetName: env.name,
+    targetSub: fv(env, 'base_url'),
+    targetIcon: 'globe',
+    warning: t('env_delete_warning'),
+    confirmLabel: t('delete_forever'),
+    onConfirm: async () => {
+      await ApiBinary.one('projectStudioEnvironmentDeleteRequest', {
+        projectId: projectId(),
+        environmentId: fv(env, 'environment_id'),
+      });
+      toast(t('env_delete_ok'), 'success');
+      f2().envs.loaded = false;
+      await renderTestsView();
+    },
+  });
+}
+
+// Admin-only cross-project queue. Rendered as cards (not a table): each
+// decision needs the requester's justification and a rejection reason field.
+async function renderEnvApprovalsView() {
+  const host = byId('ps-tests-host');
+  if (!host) return;
+  const s = f2();
+  if (!state.isAdmin) {
+    s.view = 'environments';
+    return renderEnvironmentsView();
+  }
+  try {
+    const resp = await ApiBinary.one('projectStudioEnvApprovalsListRequest', {});
+    s.envApprovals.items = Array.isArray(resp.items) ? resp.items : [];
+    s.envApprovals.loaded = true;
+  } catch (err) {
+    host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('envs_approvals_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  if (state.tab !== 'tests' || s.view !== 'env-approvals') return;
+
+  const items = s.envApprovals.items;
+  host.innerHTML = `
+    <div class="ps-editor-head">
+      <tf-button variant="ghost" icon="chevron-left" id="ps-envs-back">${escapeHtml(t('envs_back'))}</tf-button>
+      <div class="ps-editor-title-static">
+        <div class="ps-detail-name">${escapeHtml(t('envs_approvals_title'))}</div>
+        <div class="ps-detail-sub">${escapeHtml(t('envs_approvals_sub', { count: items.length }))}</div>
+      </div>
+    </div>
+    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('envs_approvals_hint'))}</span></div>
+    <div id="ps-env-approvals-list">
+      ${items.length ? items.map((item) => {
+        const env = item.environment || {};
+        const envId = fv(env, 'environment_id');
+        return `
+          <div class="ps-approval-card" data-approval="${escapeAttr(envId)}" data-project="${escapeAttr(fv(item, 'project_id'))}">
+            <div class="ps-approval-head">
+              <div>
+                <div class="ps-approval-name">${escapeHtml(env.name || '')}</div>
+                <div class="ps-approval-url">${escapeHtml(fv(env, 'base_url') || '')}</div>
+              </div>
+              <div class="ps-approval-badges">
+                <tf-chip status="info">${escapeHtml(t(`env_type_${fv(env, 'env_type')}`))}</tf-chip>
+                <tf-status-pill status="warn" label="${escapeAttr(t('env_status_pending'))}"></tf-status-pill>
+                ${fv(env, 'is_private_address') ? `<tf-chip status="warn">${escapeHtml(t('env_private_address'))}</tf-chip>` : ''}
+              </div>
+            </div>
+            <div class="ps-approval-meta">
+              <span>${escapeHtml(t('envs_approval_project'))}: <b>${escapeHtml(fv(item, 'project_name') || '')}</b></span>
+              <span>${escapeHtml(t('env_requested_by'))}: <b>${escapeHtml(fv(env, 'requested_by_name') || '')}</b></span>
+              <span>${escapeHtml(formatTimestamp(fv(env, 'created_at')))}</span>
+              <span>${escapeHtml(t('env_auth_label'))}: <b>${escapeHtml(envAuthLabel(env))}</b></span>
+            </div>
+            <div class="ps-approval-justification">
+              <span class="ps-field-label">${escapeHtml(t('env_justification_label'))}</span>
+              <p>${escapeHtml(fv(item, 'justification') || '—')}</p>
+            </div>
+            <div class="ps-approval-actions">
+              <tf-input data-reject-reason label="${escapeAttr(t('env_reject_reason_label'))}"
+                placeholder="${escapeAttr(t('env_reject_reason_placeholder'))}"></tf-input>
+              <tf-button variant="danger-solid" icon="ban" data-decide="reject">${escapeHtml(t('env_reject'))}</tf-button>
+              <tf-button variant="primary" icon="check" data-decide="approve">${escapeHtml(t('env_approve'))}</tf-button>
+            </div>
+          </div>
+        `;
+      }).join('') : `<tf-empty-state icon="check" title="${escapeAttr(t('envs_approvals_empty'))}"></tf-empty-state>`}
+    </div>
+  `;
+
+  byId('ps-envs-back')?.addEventListener('click', () => {
+    s.view = 'environments';
+    renderTestsView();
+  });
+  byId('ps-env-approvals-list')?.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-decide]');
+    if (!btn) return;
+    const card = btn.closest('[data-approval]');
+    if (!card) return;
+    const approve = btn.dataset.decide === 'approve';
+    const reason = String(card.querySelector('[data-reject-reason]')?.value ?? '').trim();
+    if (!approve && !reason) {
+      toast(t('env_reject_reason_required'), 'error');
+      return;
+    }
+    btn.setAttribute('disabled', '');
+    try {
+      await ApiBinary.one('projectStudioEnvApprovalDecideRequest', {
+        projectId: card.dataset.project,
+        environmentId: card.dataset.approval,
+        approve,
+        reason,
+      });
+      toast(t('env_decided_ok'), 'success');
+      f2().envs.loaded = false;
+      await renderTestsView();
+    } catch (err) {
+      btn.removeAttribute('disabled');
+      toast(`${t('env_decide_failed')}: ${err.message}`, 'error');
+    }
+  });
+}
+
+// =============================================================================
 // T06 — suites (list + two-pane editor with explicit ordering)
 // =============================================================================
 
@@ -5157,7 +6564,7 @@ async function renderRunsView() {
     <div class="ps-tests-toolbar">
       <tf-select id="ps-runs-f-status" value="${escapeAttr(s.runs.status)}">
         <option value="" ${s.runs.status === '' ? 'selected' : ''}>${escapeHtml(t('runs_filter_all'))}</option>
-        ${['running', 'completed', 'cancelled'].map((x) => `<option value="${x}" ${x === s.runs.status ? 'selected' : ''}>${escapeHtml(t(`run_status_${x}`))}</option>`).join('')}
+        ${['running', 'completed', 'cancelled', 'error'].map((x) => `<option value="${x}" ${x === s.runs.status ? 'selected' : ''}>${escapeHtml(t(`run_status_${x}`))}</option>`).join('')}
       </tf-select>
       <span class="ps-toolbar-spacer"></span>
       ${canEdit() ? `<tf-button variant="primary" icon="plus" id="ps-runs-new">${escapeHtml(t('runs_new'))}</tf-button>` : ''}
@@ -5179,9 +6586,10 @@ async function renderRunsView() {
       <tf-column key="no" label="#"></tf-column>
       <tf-column key="name" label="${escapeAttr(t('runs_col_name'))}"></tf-column>
       <tf-column key="suite" label="${escapeAttr(t('runs_col_suite'))}"></tf-column>
+      <tf-column key="type" label="${escapeAttr(t('runs_col_type'))}"></tf-column>
+      <tf-column key="environment" label="${escapeAttr(t('runs_col_env'))}"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('runs_col_status'))}" renderer="chip"></tf-column>
       <tf-column key="result" label="${escapeAttr(t('runs_col_result'))}"></tf-column>
-      <tf-column key="assignMode" label="${escapeAttr(t('runs_col_assign'))}"></tf-column>
       <tf-column key="createdBy" label="${escapeAttr(t('runs_col_created_by'))}"></tf-column>
       <tf-column key="startedAt" label="${escapeAttr(t('runs_col_started'))}"></tf-column>
     </tf-table>
@@ -5189,16 +6597,18 @@ async function renderRunsView() {
   const table = byId('ps-runs-table');
   const assignRows = () => {
     table.rows = s.runs.rows.map((run) => {
-      const done = Number(run.passed ?? 0) + Number(run.failed ?? 0) + Number(run.blocked ?? 0) + Number(run.skipped ?? 0);
+      const done = Number(run.passed ?? 0) + Number(run.failed ?? 0) + Number(run.blocked ?? 0)
+        + Number(run.skipped ?? 0) + Number(run.errored ?? 0);
       return {
         _id: fv(run, 'run_id'),
         _row: run,
         no: `#${fv(run, 'run_no')}`,
         name: run.name,
         suite: fv(run, 'suite_name') || t('runs_adhoc'),
+        type: t(`run_type_${fv(run, 'run_type') || 'manual'}`),
+        environment: fv(run, 'environment_name') || t(`assign_${fv(run, 'assignment_mode') || 'pool'}`),
         status: chipCell(RUN_STATUS_CHIP[run.status], t(`run_status_${run.status}`)),
         result: t('runs_result', { done, total: Number(run.total ?? 0), passed: Number(run.passed ?? 0), failed: Number(run.failed ?? 0) }),
-        assignMode: t(`assign_${fv(run, 'assignment_mode') || 'pool'}`),
         createdBy: fv(run, 'created_by_name') || '',
         startedAt: formatTimestamp(fv(run, 'started_at')),
       };
@@ -5213,7 +6623,7 @@ async function renderRunsView() {
     open.setAttribute('size', 'sm');
     open.setAttribute('icon', 'external-link');
     open.setAttribute('title', t('runs_open'));
-    open.addEventListener('click', (e) => { e.stopPropagation(); openRunDetail(row._id); });
+    open.addEventListener('click', (e) => { e.stopPropagation(); openRunByType(row._id, fv(row._row, 'run_type')); });
     wrap.appendChild(open);
     if (canManage() && row._row.status !== 'running') {
       const del = document.createElement('tf-button');
@@ -5227,8 +6637,8 @@ async function renderRunsView() {
     return wrap;
   };
   table.addEventListener('row-click', (e) => {
-    const runId = e.detail?.row?._id;
-    if (runId) openRunDetail(runId);
+    const row = e.detail?.row;
+    if (row?._id) openRunByType(row._id, fv(row._row, 'run_type'));
   });
   table.addEventListener('page-change', async (e) => {
     s.runs.page = Number(e.detail?.page ?? 1);
@@ -5272,12 +6682,19 @@ async function openRunWindow(prefill = {}) {
   });
 
   const rw = {
-    name: '',
+    name: prefill.name || '',
+    // 'manual' keeps the F2 tester flow; 'auto'/'perf' submit to the test
+    // runner (RunStartAuto) — the server derives the final run_type from the
+    // selected case kinds, the choice here drives the form.
+    runType: prefill.runType || 'manual',
     source: prefill.fromFailedRunId ? 'failed' : 'suite',
     suiteId: prefill.suiteId || '',
     caseIds: new Set(),
     fromFailedRunId: prefill.fromFailedRunId || '',
     envNote: '',
+    environmentId: '',
+    runnerServiceId: '',
+    perf: { ...PERF_DEFAULT_PROFILE },
     mode: 'pool',
     singleAssignee: '',
     // caseId -> userId for per_case mode.
@@ -5292,8 +6709,18 @@ async function openRunWindow(prefill = {}) {
 
   body.innerHTML = `
     <div class="ps-field" style="margin-bottom:12px;">
-      <tf-input id="ps-run-name" label="${escapeAttr(t('run_name_label'))}" placeholder="${escapeAttr(t('run_name_placeholder'))}"></tf-input>
+      <tf-input id="ps-run-name" label="${escapeAttr(t('run_name_label'))}" placeholder="${escapeAttr(t('run_name_placeholder'))}" value="${escapeAttr(rw.name)}"></tf-input>
     </div>
+    <div class="ps-field" style="margin-bottom:12px;">
+      <span class="ps-field-label">${escapeHtml(t('run_type_label'))}</span>
+      <tf-segmented id="ps-run-type" value="${escapeAttr(rw.runType)}">
+        <option value="manual">${escapeHtml(t('run_type_manual'))}</option>
+        <option value="auto">${escapeHtml(t('run_type_auto'))}</option>
+        <option value="perf">${escapeHtml(t('run_type_perf'))}</option>
+      </tf-segmented>
+      <div class="ps-field-hint" data-run-type-hint>${escapeHtml(t('run_type_manual_hint'))}</div>
+    </div>
+    <div class="ps-banner-warn" data-runner-missing hidden>${sprite('alert')}<span>${escapeHtml(t('run_runner_missing'))}</span></div>
     <div class="ps-field" style="margin-bottom:12px;">
       <span class="ps-field-label">${escapeHtml(t('run_source_label'))}</span>
       <tf-segmented id="ps-run-source" value="${escapeAttr(rw.source)}">
@@ -5316,10 +6743,32 @@ async function openRunWindow(prefill = {}) {
       <tf-select id="ps-run-failed" label="${escapeAttr(t('run_failed_label'))}" value="${escapeAttr(rw.fromFailedRunId)}"></tf-select>
       <div class="ps-field-hint">${escapeHtml(t('run_failed_hint'))}</div>
     </div>
-    <div class="ps-field" style="margin:12px 0;">
+    <div class="ps-field" style="margin:12px 0;" data-run-mode-form="manual">
       <tf-input id="ps-run-env" label="${escapeAttr(t('run_env_label'))}" placeholder="${escapeAttr(t('run_env_placeholder'))}"></tf-input>
     </div>
-    <div class="ps-field" style="margin-bottom:12px;">
+    <div data-run-mode-form="automated" hidden>
+      <div class="ps-field" style="margin:12px 0;">
+        <tf-select id="ps-run-environment" label="${escapeAttr(t('run_env_select_label'))}" value=""></tf-select>
+        <div class="ps-field-hint">${escapeHtml(t('run_env_select_hint'))}</div>
+      </div>
+      <div class="ps-field" style="margin-bottom:12px;">
+        <tf-select id="ps-run-runner" label="${escapeAttr(t('run_runner_label'))}" value=""></tf-select>
+        <div class="ps-field-hint" data-runner-hint>${escapeHtml(t('run_runner_hint'))}</div>
+      </div>
+      <div class="ps-field" data-perf-form hidden>
+        <span class="ps-field-label">${escapeHtml(t('run_perf_label'))}</span>
+        <div class="ps-perf-form">
+          <tf-input id="ps-run-perf-users" type="number" min="${PERF_LIMITS.users[0]}" max="${PERF_LIMITS.users[1]}"
+            label="${escapeAttr(t('run_perf_users_label'))}" value="${rw.perf.users}"></tf-input>
+          <tf-input id="ps-run-perf-spawn" type="number" min="${PERF_LIMITS.spawnRate[0]}" max="${PERF_LIMITS.spawnRate[1]}"
+            label="${escapeAttr(t('run_perf_spawn_label'))}" value="${rw.perf.spawn_rate}"></tf-input>
+          <tf-input id="ps-run-perf-duration" type="number" min="${PERF_LIMITS.duration[0]}" max="${PERF_LIMITS.duration[1]}"
+            label="${escapeAttr(t('run_perf_duration_label'))}" value="${rw.perf.duration_secs}"></tf-input>
+        </div>
+        <div class="ps-field-hint">${escapeHtml(t('run_perf_hint'))}</div>
+      </div>
+    </div>
+    <div class="ps-field" style="margin-bottom:12px;" data-run-mode-form="manual">
       <span class="ps-field-label">${escapeHtml(t('run_assign_label'))}</span>
       <tf-segmented id="ps-run-mode" value="${escapeAttr(rw.mode)}">
         <option value="single">${escapeHtml(t('assign_single'))}</option>
@@ -5349,6 +6798,24 @@ async function openRunWindow(prefill = {}) {
     if (el) { el.hidden = !msg; el.textContent = msg || ''; }
   };
   const assignHints = { single: t('assign_single_hint'), per_case: t('assign_per_case_hint'), pool: t('assign_pool_hint') };
+  const isAutomated = () => rw.runType !== 'manual';
+
+  const syncRunType = () => {
+    const automated = isAutomated();
+    body.querySelectorAll('[data-run-mode-form]').forEach((form) => {
+      const wantsAutomated = form.dataset.runModeForm === 'automated';
+      form.hidden = wantsAutomated !== automated;
+    });
+    const perfForm = body.querySelector('[data-perf-form]');
+    if (perfForm) perfForm.hidden = rw.runType !== 'perf';
+    const hint = body.querySelector('[data-run-type-hint]');
+    if (hint) hint.textContent = t(`run_type_${rw.runType}_hint`);
+    const runnerBanner = body.querySelector('[data-runner-missing]');
+    if (runnerBanner) runnerBanner.hidden = !automated || !!(f2().runners || []).length;
+    const createBtn = foot.querySelector('[data-action="create"]');
+    if (createBtn) createBtn.setAttribute('label', t(automated ? 'run_start_auto' : 'run_create'));
+    syncAssignForms();
+  };
 
   const syncSourceForms = () => {
     body.querySelectorAll('[data-run-source-form]').forEach((form) => {
@@ -5364,7 +6831,7 @@ async function openRunWindow(prefill = {}) {
   };
   const syncAssignForms = () => {
     body.querySelectorAll('[data-run-assign-form]').forEach((form) => {
-      form.hidden = form.dataset.runAssignForm !== rw.mode;
+      form.hidden = isAutomated() || form.dataset.runAssignForm !== rw.mode;
     });
     const hint = body.querySelector('[data-assign-hint]');
     if (hint) hint.textContent = assignHints[rw.mode] || '';
@@ -5435,6 +6902,20 @@ async function openRunWindow(prefill = {}) {
     });
   };
 
+  body.querySelector('#ps-run-type')?.addEventListener('change', (e) => {
+    rw.runType = e.detail?.value ?? rw.runType;
+    showError(null);
+    syncRunType();
+  });
+  body.querySelector('#ps-run-environment')?.addEventListener('change', (e) => {
+    rw.environmentId = e.detail?.value ?? '';
+  });
+  body.querySelector('#ps-run-runner')?.addEventListener('change', (e) => {
+    rw.runnerServiceId = e.detail?.value ?? '';
+    const runner = (f2().runners || []).find((r) => fv(r, 'service_id') === rw.runnerServiceId);
+    const hint = body.querySelector('[data-runner-hint]');
+    if (hint) hint.textContent = runner ? runnerToolchainLabel(runner) : t('run_runner_hint');
+  });
   body.querySelector('#ps-run-source')?.addEventListener('change', (e) => {
     rw.source = e.detail?.value ?? rw.source;
     syncSourceForms();
@@ -5479,6 +6960,48 @@ async function openRunWindow(prefill = {}) {
     if (rw.source === 'suite' && !rw.suiteId) { showError(t('err_run_suite')); return; }
     if (rw.source === 'cases' && !rw.caseIds.size) { showError(t('err_run_cases')); return; }
     if (rw.source === 'failed' && !rw.fromFailedRunId) { showError(t('err_run_failed')); return; }
+
+    if (isAutomated()) {
+      if (!rw.environmentId) { showError(t('err_run_env')); return; }
+      let perfProfileJson = '';
+      if (rw.runType === 'perf') {
+        const users = Number(body.querySelector('#ps-run-perf-users')?.value ?? 0);
+        const spawnRate = Number(body.querySelector('#ps-run-perf-spawn')?.value ?? 0);
+        const duration = Number(body.querySelector('#ps-run-perf-duration')?.value ?? 0);
+        const inRange = (value, [min, max]) => Number.isFinite(value) && value >= min && value <= max;
+        if (!inRange(users, PERF_LIMITS.users) || !inRange(spawnRate, PERF_LIMITS.spawnRate)
+          || !inRange(duration, PERF_LIMITS.duration)) {
+          showError(t('err_run_perf'));
+          return;
+        }
+        perfProfileJson = JSON.stringify({ users, spawn_rate: spawnRate, duration_secs: duration });
+      }
+      showError(null);
+      rw.busy = true;
+      btn.setAttribute('disabled', '');
+      try {
+        const resp = await ApiBinary.one('projectStudioRunStartAutoRequest', {
+          projectId: projectId(),
+          name: rw.name,
+          suiteId: rw.source === 'suite' ? rw.suiteId : '',
+          caseIds: rw.source === 'cases' ? [...rw.caseIds] : [],
+          fromRunId: rw.source === 'failed' ? rw.fromFailedRunId : '',
+          environmentId: rw.environmentId,
+          runnerServiceId: rw.runnerServiceId,
+          perfProfileJson,
+        });
+        toast(t('run_auto_started', { no: Number(fv(resp, 'run_no') ?? 0) }), 'success');
+        cleanup();
+        const runId = fv(resp, 'run_id');
+        if (runId) await openAutoRun(runId);
+      } catch (err) {
+        rw.busy = false;
+        btn.removeAttribute('disabled');
+        showError(`${t('run_auto_start_failed')}: ${err.message}`);
+      }
+      return;
+    }
+
     if (rw.mode === 'single' && !rw.singleAssignee) { showError(t('err_run_assignee')); return; }
     let assignments = [];
     if (rw.mode === 'per_case') {
@@ -5511,6 +7034,8 @@ async function openRunWindow(prefill = {}) {
       showError(`${t('run_create_failed')}: ${err.message}`);
     }
   });
+
+  syncRunType();
 
   // Suites / approved cases / completed runs / members load lazily.
   (async () => {
@@ -5559,7 +7084,29 @@ async function openRunWindow(prefill = {}) {
         label: `#${fv(r, 'run_no')} ${r.name} (${Number(r.failed ?? 0)}+${Number(r.blocked ?? 0)})`,
       })),
     ], rw.fromFailedRunId || '');
+
+    // Automated runs need an APPROVED environment and (optionally) an explicit
+    // runner; an empty runner lets the server match one by toolchain.
+    try {
+      await loadEnvironments();
+    } catch { /* the select stays empty and the guard below blocks the start */ }
+    const approved = approvedEnvironments();
+    rw.environmentId = approved.length === 1 ? fv(approved[0], 'environment_id') : '';
+    body.querySelector('#ps-run-environment')?.setOptions([
+      { value: '', label: approved.length ? t('assign_choose') : t('run_env_none') },
+      ...approved.map((env) => ({ value: fv(env, 'environment_id'), label: `${env.name} — ${fv(env, 'base_url')}` })),
+    ], rw.environmentId);
+    await loadRunners();
+    body.querySelector('#ps-run-runner')?.setOptions([
+      { value: '', label: t('run_runner_auto') },
+      ...(f2().runners || []).map((r) => ({
+        value: fv(r, 'service_id'),
+        label: `${fv(r, 'display_name') || fv(r, 'engine_id')} — ${runnerToolchainLabel(r)}`,
+      })),
+    ], '');
+
     syncSourceForms();
+    syncRunType();
   })();
 }
 
@@ -5572,6 +7119,23 @@ async function openRunDetail(runId) {
   f2().runDetail = { runId, run: null, items: [] };
   f2().view = 'run-detail';
   await renderTestsView();
+}
+
+// Manual runs open the tester-facing detail (T11 manual), automated/perf runs
+// open the live/results view (T10/T11 auto). An unknown type (deep link from a
+// notification) is resolved with one RunGet before the branch.
+async function openRunByType(runId, runType) {
+  let type = runType;
+  if (!type) {
+    try {
+      const resp = await ApiBinary.one('projectStudioRunGetRequest', { projectId: projectId(), runId });
+      type = fv(resp.run ?? {}, 'run_type') || 'manual';
+    } catch {
+      type = 'manual';
+    }
+  }
+  if (type === 'auto' || type === 'perf') return openAutoRun(runId);
+  return openRunDetail(runId);
 }
 
 async function renderRunDetailView() {
@@ -5834,6 +7398,541 @@ function exportRunCsv(rd) {
     finished_at: fv(it, 'finished_at') || '',
   }));
   downloadTextFile(`run-${fv(rd.run, 'run_no')}.csv`, toCsv(rows));
+}
+
+// =============================================================================
+// T10/T11 — automated + perf runs (live view, artifacts, perf metrics)
+// =============================================================================
+
+// Test-runner discovery is shared by the run window and the code editor; the
+// list is small and changes rarely, so one fetch per opened project is enough.
+async function loadRunners(force = false) {
+  const s = f2();
+  if (s.runners && !force) return s.runners;
+  try {
+    const resp = await ApiBinary.one('projectStudioRunnersListRequest', { projectId: projectId() });
+    s.runners = Array.isArray(resp.runners) ? resp.runners : [];
+  } catch {
+    s.runners = [];
+  }
+  return s.runners;
+}
+
+function runnerLanguages() {
+  return new Set((f2().runners || []).flatMap((r) => (Array.isArray(r.toolchains) ? r.toolchains : []))
+    .map((tc) => String(tc.language || '').toLowerCase()));
+}
+
+function runnerToolchainLabel(runner) {
+  const chains = Array.isArray(runner.toolchains) ? runner.toolchains : [];
+  if (!chains.length) return t('runner_no_toolchains');
+  return chains
+    .map((tc) => `${tc.language}${Array.isArray(tc.frameworks) && tc.frameworks.length ? ` (${tc.frameworks.join(', ')})` : ''}`)
+    .join(' · ');
+}
+
+function openAutoRun(runId) {
+  stopTestsLive();
+  f2().autoRun = {
+    runId,
+    run: null,
+    items: [],
+    perfStats: [],
+    perfTimeline: [],
+    log: [],
+    watchdog: '',
+    unsub: null,
+    pollTimer: null,
+    autoScroll: true,
+  };
+  f2().view = 'auto-run';
+  return renderTestsView();
+}
+
+function stopAutoRunLive() {
+  const ar = state.f2?.autoRun;
+  if (!ar) return;
+  if (ar.unsub) { try { ar.unsub(); } catch { /* stream already gone */ } ar.unsub = null; }
+  if (ar.pollTimer) { clearInterval(ar.pollTimer); ar.pollTimer = null; }
+}
+
+async function loadAutoRun(ar) {
+  const resp = await ApiBinary.one('projectStudioRunAutoGetRequest', {
+    projectId: projectId(), runId: ar.runId,
+  });
+  ar.run = resp.run || null;
+  ar.items = Array.isArray(resp.items) ? resp.items : [];
+  ar.perfStats = Array.isArray(fv(resp, 'perf_stats')) ? fv(resp, 'perf_stats') : [];
+  ar.perfTimeline = Array.isArray(fv(resp, 'perf_timeline')) ? fv(resp, 'perf_timeline') : [];
+}
+
+async function renderAutoRunView() {
+  const host = byId('ps-tests-host');
+  const s = f2();
+  const ar = s.autoRun;
+  if (!host || !ar) { s.view = 'runs'; return renderRunsView(); }
+  try {
+    await loadAutoRun(ar);
+  } catch (err) {
+    host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('auto_load_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  if (state.tab !== 'tests' || s.view !== 'auto-run') return;
+  const run = ar.run;
+  if (!run) { s.view = 'runs'; return renderRunsView(); }
+
+  const running = run.status === 'running';
+  const isPerf = fv(run, 'run_type') === 'perf';
+  const total = Math.max(1, Number(run.total ?? ar.items.length ?? 1));
+  const done = Number(run.passed ?? 0) + Number(run.failed ?? 0) + Number(run.blocked ?? 0)
+    + Number(run.skipped ?? 0) + Number(run.errored ?? 0);
+  const pct = Math.min(100, Math.round((done / total) * 100));
+  const creator = isMe(fv(run, 'created_by'));
+  const canCancel = running && (canManage() || creator);
+
+  host.innerHTML = `
+    <div class="ps-editor-head">
+      <tf-button variant="ghost" icon="chevron-left" id="ps-auto-back">${escapeHtml(t('back_to_runs'))}</tf-button>
+      <div class="ps-editor-title-static">
+        <div class="ps-detail-name">#${fv(run, 'run_no')} ${escapeHtml(run.name)}</div>
+        <div class="ps-detail-sub">
+          ${escapeHtml(fv(run, 'suite_name') || t('runs_adhoc'))} ·
+          ${escapeHtml(t('auto_env_prefix'))}: ${escapeHtml(fv(run, 'environment_name') || '—')} ·
+          ${escapeHtml(fv(run, 'created_by_name') || '')} · ${escapeHtml(formatTimestamp(fv(run, 'started_at')))}
+        </div>
+      </div>
+      <div class="ps-editor-badges">
+        <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}" dot>${escapeHtml(t(`run_status_${run.status}`))}</tf-chip>
+        <tf-chip status="info">${escapeHtml(t(`run_type_${fv(run, 'run_type') || 'auto'}`))}</tf-chip>
+      </div>
+      <div class="ps-editor-actions">
+        <tf-button variant="ghost" icon="refresh" id="ps-auto-refresh">${escapeHtml(t('refresh'))}</tf-button>
+        <tf-button variant="ghost" icon="download" id="ps-auto-export">${escapeHtml(t('run_export_csv'))}</tf-button>
+        ${canEdit() && !running ? `<tf-button variant="ghost" icon="rotate" id="ps-auto-again">${escapeHtml(t('auto_run_again'))}</tf-button>` : ''}
+        ${canCancel ? `<tf-button variant="danger-solid" icon="stop" id="ps-auto-stop">${escapeHtml(t('auto_stop'))}</tf-button>` : ''}
+      </div>
+    </div>
+
+    <div class="ps-banner-warn" id="ps-auto-watchdog" ${ar.watchdog ? '' : 'hidden'}>
+      ${sprite('alert')}<span id="ps-auto-watchdog-text">${escapeHtml(ar.watchdog ? t('auto_watchdog_banner', { detail: ar.watchdog }) : '')}</span>
+    </div>
+
+    <div class="ps-auto-progress">
+      <tf-progress-bar id="ps-auto-progressbar" value="${pct}"></tf-progress-bar>
+      <span class="ps-auto-progress-label" id="ps-auto-progress-label">${escapeHtml(t('auto_progress', { done, total: Number(run.total ?? ar.items.length ?? 0), pct }))}</span>
+    </div>
+
+    <div class="ps-kpi-grid ps-run-kpis">
+      <tf-stat-card size="sm" icon="check" accent="success" label="${escapeAttr(t('item_status_passed'))}" value="${Number(run.passed ?? 0)}"></tf-stat-card>
+      <tf-stat-card size="sm" icon="x" accent="danger" label="${escapeAttr(t('item_status_failed'))}" value="${Number(run.failed ?? 0)}"></tf-stat-card>
+      <tf-stat-card size="sm" icon="alert" accent="danger" label="${escapeAttr(t('item_status_error'))}" value="${Number(run.errored ?? 0)}"></tf-stat-card>
+      <tf-stat-card size="sm" icon="chevron-right" label="${escapeAttr(t('item_status_skipped'))}" value="${Number(run.skipped ?? 0)}"></tf-stat-card>
+      <tf-stat-card size="sm" icon="clock" label="${escapeAttr(t('run_kpi_open'))}" value="${Number(run.pending ?? 0) + Number(fv(run, 'in_progress') ?? 0)}"></tf-stat-card>
+    </div>
+
+    ${isPerf ? `
+      <div id="ps-perf-host"></div>
+    ` : ''}
+
+    <tf-section-card title="${escapeAttr(t('auto_items_title'))}" icon="list">
+      <span slot="subtitle">${escapeHtml(t('run_items_sub', { count: ar.items.length }))}</span>
+      <div id="ps-auto-items-host"></div>
+    </tf-section-card>
+
+    <tf-section-card title="${escapeAttr(t('auto_log_title'))}" icon="prompt">
+      <span slot="actions">
+        <label class="ps-toggle-field">
+          <span class="ps-field-label">${escapeHtml(t('auto_log_autoscroll'))}</span>
+          <tf-toggle id="ps-auto-autoscroll" ${ar.autoScroll ? 'checked' : ''}></tf-toggle>
+        </label>
+        <tf-button variant="ghost" size="sm" icon="download" id="ps-auto-log-download">${escapeHtml(t('auto_log_download'))}</tf-button>
+      </span>
+      <div class="ps-live-log" id="ps-auto-log">${escapeHtml(ar.log.join('\n'))}</div>
+    </tf-section-card>
+  `;
+
+  byId('ps-auto-back')?.addEventListener('click', () => {
+    stopAutoRunLive();
+    s.autoRun = null;
+    s.view = 'runs';
+    renderTestsView();
+  });
+  byId('ps-auto-refresh')?.addEventListener('click', () => renderTestsView());
+  byId('ps-auto-export')?.addEventListener('click', () => exportAutoRunCsv(ar));
+  byId('ps-auto-again')?.addEventListener('click', () => openRunWindow({
+    runType: isPerf ? 'perf' : 'auto',
+    suiteId: fv(run, 'suite_id') || '',
+    name: run.name,
+  }));
+  byId('ps-auto-stop')?.addEventListener('click', () => cancelAutoRun(ar.runId));
+  byId('ps-auto-autoscroll')?.addEventListener('change', (e) => {
+    ar.autoScroll = !!(e.detail?.checked ?? e.target.checked);
+  });
+  byId('ps-auto-log-download')?.addEventListener('click', () => {
+    downloadTextFile(`run-${fv(run, 'run_no')}.log`, ar.log.join('\n'), 'text/plain');
+  });
+
+  renderAutoItemsTable(ar);
+  if (isPerf) renderPerfSection(ar);
+  const logEl = byId('ps-auto-log');
+  if (logEl && ar.autoScroll) logEl.scrollTop = logEl.scrollHeight;
+
+  if (running) startAutoRunLive(ar);
+}
+
+function renderAutoItemsTable(ar) {
+  const hostEl = byId('ps-auto-items-host');
+  if (!hostEl) return;
+  if (!ar.items.length) {
+    hostEl.innerHTML = `<tf-empty-state icon="list" title="${escapeAttr(t('auto_no_items'))}"></tf-empty-state>`;
+    return;
+  }
+  hostEl.innerHTML = `
+    <tf-table id="ps-auto-items-table">
+      <tf-column key="pos" label="#" renderer="num"></tf-column>
+      <tf-column key="title" label="${escapeAttr(t('auto_items_col_case'))}"></tf-column>
+      <tf-column key="kind" label="${escapeAttr(t('auto_items_col_kind'))}"></tf-column>
+      <tf-column key="status" label="${escapeAttr(t('auto_items_col_status'))}" renderer="chip"></tf-column>
+      <tf-column key="duration" label="${escapeAttr(t('auto_items_col_duration'))}"></tf-column>
+      <tf-column key="message" label="${escapeAttr(t('auto_items_col_message'))}"></tf-column>
+      <tf-column key="artifacts" label="${escapeAttr(t('auto_items_col_artifacts'))}" renderer="num"></tf-column>
+    </tf-table>
+  `;
+  const table = byId('ps-auto-items-table');
+  table.rowKey = '_id';
+  table.expandable = true;
+  table.expandRenderer = (row) => buildAutoItemExpansion(row._row);
+  assignAutoItemRows(table, ar);
+}
+
+function assignAutoItemRows(table, ar) {
+  table.rows = ar.items.map((it) => ({
+    _id: fv(it, 'item_id'),
+    _row: it,
+    pos: Number(it.position ?? 0) + 1,
+    title: fv(it, 'case_title'),
+    kind: t(`case_kind_${it.kind}`),
+    status: chipCell(ITEM_STATUS_CHIP[it.status], t(`item_status_${it.status}`)),
+    duration: formatMillis(Number(fv(it, 'duration_ms') ?? 0)),
+    message: String(it.message || '').slice(0, 160),
+    artifacts: Array.isArray(fv(it, 'artifact_refs')) ? fv(it, 'artifact_refs').length : 0,
+  }));
+}
+
+// T11 expansion: full failure message + artifact buttons (images preview
+// inline, everything else downloads through the binary protocol).
+function buildAutoItemExpansion(item) {
+  const wrap = document.createElement('div');
+  wrap.className = 'ps-item-expansion';
+  const artifacts = Array.isArray(fv(item, 'artifact_refs')) ? fv(item, 'artifact_refs') : [];
+  wrap.innerHTML = `
+    ${item.message ? `<div class="ps-code-block">${escapeHtml(item.message)}</div>` : `<div class="ps-field-hint">${escapeHtml(t('auto_item_no_message'))}</div>`}
+    <div class="ps-artifact-row">
+      ${!canTest() ? `<span class="ps-field-hint">${escapeHtml(t('artifact_needs_tester'))}</span>`
+        : artifacts.length ? artifacts.map((art, i) => `
+        <tf-button variant="ghost" size="sm" icon="${ARTIFACT_ICON[fv(art, 'kind')] || 'paperclip'}" data-artifact="${i}">
+          ${escapeHtml(fv(art, 'name') || t(`artifact_kind_${fv(art, 'kind')}`))} · ${escapeHtml(formatBytes(Number(fv(art, 'size_bytes') ?? 0)))}
+        </tf-button>
+      `).join('') : `<span class="ps-field-hint">${escapeHtml(t('auto_item_no_artifacts'))}</span>`}
+    </div>
+  `;
+  wrap.querySelectorAll('[data-artifact]').forEach((btn) => {
+    btn.addEventListener('click', () => openArtifact(artifacts[Number(btn.dataset.artifact)]));
+  });
+  return wrap;
+}
+
+// Artifacts travel as CBOR bytes (no signed URL on the dashboard tier): images
+// open in a preview window, everything else downloads from an object URL.
+async function openArtifact(artifact) {
+  if (!artifact) return;
+  let resp = null;
+  try {
+    resp = await ApiBinary.one('projectStudioRunArtifactGetRequest', {
+      projectId: projectId(),
+      artifactId: fv(artifact, 'artifact_id'),
+      maxBytes: ARTIFACT_MAX_BYTES,
+    });
+  } catch (err) {
+    toast(`${t('artifact_download_failed')}: ${err.message}`, 'error');
+    return;
+  }
+  const bytes = resp.bytes instanceof Uint8Array ? resp.bytes : new Uint8Array(resp.bytes || []);
+  const mime = resp.mime || fv(artifact, 'mime') || 'application/octet-stream';
+  const name = fv(artifact, 'name') || 'artifact';
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  if (resp.truncated) toast(t('artifact_truncated'), 'info');
+  if (mime.startsWith('image/')) {
+    const { body, foot, cleanup } = openWindow({ title: name, subtitle: mime, icon: 'image', width: 900 });
+    body.innerHTML = `<div class="ps-att-preview"><img alt="${escapeAttr(name)}"></div>`;
+    body.querySelector('img').src = url;
+    foot.innerHTML = `
+      <div class="ps-footer-left"></div>
+      <div class="ps-footer-right">
+        <tf-button variant="ghost" icon="download" data-action="download">${escapeHtml(t('attachment_download'))}</tf-button>
+        <tf-button variant="ghost" data-action="close-artifact">${escapeHtml(t('action_close'))}</tf-button>
+      </div>
+    `;
+    foot.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-action]');
+      if (!btn) return;
+      if (btn.dataset.action === 'download') downloadUrl(url, name);
+      else { cleanup(); URL.revokeObjectURL(url); }
+    });
+    return;
+  }
+  downloadUrl(url, name);
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+// T10 perf metrics + T11 perf results: the same section serves both, the live
+// timeline simply grows while the run is running.
+function renderPerfSection(ar) {
+  const hostEl = byId('ps-perf-host');
+  if (!hostEl) return;
+  const timeline = ar.perfTimeline;
+  const stats = ar.perfStats;
+  const last = timeline[timeline.length - 1] || {};
+  const totals = stats.reduce((acc, row) => {
+    acc.requests += Number(row.requests ?? 0);
+    acc.failures += Number(row.failures ?? 0);
+    acc.rps += Number(row.rps ?? 0);
+    acc.p90 = Math.max(acc.p90, Number(fv(row, 'p90_ms') ?? 0));
+    acc.p99 = Math.max(acc.p99, Number(fv(row, 'p99_ms') ?? 0));
+    return acc;
+  }, { requests: 0, failures: 0, rps: 0, p90: 0, p99: 0 });
+  const rps = Number(last.rps ?? totals.rps ?? 0);
+  const p90 = Number(fv(last, 'p90_ms') ?? totals.p90 ?? 0);
+  const errPct = totals.requests > 0 ? (totals.failures / totals.requests) * 100 : 0;
+
+  if (!timeline.length && !stats.length) {
+    hostEl.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('perf_empty'))}</div>`;
+    return;
+  }
+
+  hostEl.innerHTML = `
+    <div class="ps-kpi-grid ps-perf-kpis">
+      <tf-stat-card size="sm" icon="bolt" label="${escapeAttr(t('perf_kpi_rps'))}" value="${formatNum(rps)}" suffix="req/s"></tf-stat-card>
+      <tf-stat-card size="sm" icon="clock" label="${escapeAttr(t('perf_kpi_p90'))}" value="${formatNum(p90)}" suffix="ms"></tf-stat-card>
+      <tf-stat-card size="sm" icon="clock" label="${escapeAttr(t('perf_kpi_p99'))}" value="${formatNum(totals.p99)}" suffix="ms"></tf-stat-card>
+      <tf-stat-card size="sm" icon="alert" accent="${errPct > 1 ? 'danger' : 'info'}" label="${escapeAttr(t('perf_kpi_errors'))}" value="${formatNum(errPct)}" suffix="%"></tf-stat-card>
+    </div>
+    <tf-section-card title="${escapeAttr(t('perf_timeline_title'))}" icon="chart-line">
+      <div id="ps-perf-chart" class="ps-perf-chart"></div>
+    </tf-section-card>
+    <tf-section-card title="${escapeAttr(t('perf_endpoints_title'))}" icon="network">
+      <span slot="actions">
+        <tf-button variant="ghost" size="sm" icon="download" id="ps-perf-export">${escapeHtml(t('perf_export_csv'))}</tf-button>
+      </span>
+      <div id="ps-perf-table-host"></div>
+    </tf-section-card>
+  `;
+
+  const chartHost = byId('ps-perf-chart');
+  if (chartHost && timeline.length) {
+    const chart = document.createElement('tf-line-chart');
+    chart.height = 220;
+    chart.xAxis = { scale: 'category', min: null, max: null, ticks: null, format: null };
+    chart.yAxis = { scale: 'linear', min: 0, max: null, ticks: 5, format: null };
+    chart.series = [
+      {
+        id: 'rps',
+        name: t('perf_series_rps'),
+        tone: 'info',
+        style: 'solid',
+        showInLegend: true,
+        points: timeline.map((p) => ({ x: formatElapsed(Number(fv(p, 'ts_s') ?? 0)), y: Number(p.rps ?? 0) })),
+      },
+      {
+        id: 'p90',
+        name: t('perf_series_p90'),
+        tone: 'warning',
+        style: 'dashed',
+        showInLegend: true,
+        points: timeline.map((p) => ({ x: formatElapsed(Number(fv(p, 'ts_s') ?? 0)), y: Number(fv(p, 'p90_ms') ?? 0) })),
+      },
+    ];
+    chartHost.replaceChildren(chart);
+  } else if (chartHost) {
+    chartHost.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('perf_empty'))}</div>`;
+  }
+
+  const tableHost = byId('ps-perf-table-host');
+  if (tableHost) {
+    if (!stats.length) {
+      tableHost.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('perf_empty'))}</div>`;
+    } else {
+      tableHost.innerHTML = `
+        <tf-table id="ps-perf-table">
+          <tf-column key="endpoint" label="${escapeAttr(t('perf_col_endpoint'))}"></tf-column>
+          <tf-column key="requests" label="${escapeAttr(t('perf_col_requests'))}" renderer="num"></tf-column>
+          <tf-column key="rps" label="${escapeAttr(t('perf_col_rps'))}" renderer="num"></tf-column>
+          <tf-column key="p50" label="${escapeAttr(t('perf_col_p50'))}" renderer="num"></tf-column>
+          <tf-column key="p90" label="${escapeAttr(t('perf_col_p90'))}" renderer="num"></tf-column>
+          <tf-column key="p99" label="${escapeAttr(t('perf_col_p99'))}" renderer="num"></tf-column>
+          <tf-column key="failures" label="${escapeAttr(t('perf_col_failures'))}" renderer="num"></tf-column>
+        </tf-table>
+      `;
+      byId('ps-perf-table').rows = stats.map((row) => ({
+        endpoint: row.endpoint,
+        requests: Number(row.requests ?? 0),
+        rps: formatNum(Number(row.rps ?? 0)),
+        p50: formatNum(Number(fv(row, 'p50_ms') ?? 0)),
+        p90: formatNum(Number(fv(row, 'p90_ms') ?? 0)),
+        p99: formatNum(Number(fv(row, 'p99_ms') ?? 0)),
+        failures: Number(row.failures ?? 0),
+      }));
+    }
+    byId('ps-perf-export')?.addEventListener('click', () => {
+      if (!stats.length) { toast(t('reports_no_data'), 'info'); return; }
+      downloadTextFile(`perf-${fv(ar.run, 'run_no')}.csv`, toCsv(stats.map((row) => ({
+        endpoint: row.endpoint,
+        requests: Number(row.requests ?? 0),
+        failures: Number(row.failures ?? 0),
+        rps: Number(row.rps ?? 0),
+        p50_ms: Number(fv(row, 'p50_ms') ?? 0),
+        p90_ms: Number(fv(row, 'p90_ms') ?? 0),
+        p99_ms: Number(fv(row, 'p99_ms') ?? 0),
+        avg_ms: Number(fv(row, 'avg_ms') ?? 0),
+      }))));
+    });
+  }
+}
+
+// Live view: the stream feeds the log/items incrementally, the 3 s
+// RunAutoGet poll stays the source of truth (same contract as ingest).
+function startAutoRunLive(ar) {
+  const s = f2();
+  stopAutoRunLive();
+
+  const appendLog = (line) => {
+    ar.log.push(line);
+    if (ar.log.length > AUTO_LOG_CAP) ar.log.splice(0, ar.log.length - AUTO_LOG_CAP);
+    const el = byId('ps-auto-log');
+    if (el) {
+      el.textContent = ar.log.join('\n');
+      if (ar.autoScroll) el.scrollTop = el.scrollHeight;
+    }
+  };
+
+  ApiBinary.subscribe(
+    'projectStudioRunAutoStreamRequest',
+    { projectId: projectId(), runId: ar.runId },
+    {
+      onChunk: (body) => {
+        if (body?.variant !== 'ProjectStudioRunAutoStreamChunk') return;
+        if (s.autoRun !== ar || s.view !== 'auto-run') return;
+        const kind = body.kind;
+        if (kind === 'log' || kind === 'phase') {
+          appendLog(body.phase ? `[${body.phase}] ${body.line}` : String(body.line || ''));
+          if (body.phase === 'watchdog') showAutoWatchdog(ar, String(body.line || ''));
+        } else if (kind === 'item' && body.item) {
+          const incoming = body.item;
+          const idx = ar.items.findIndex((it) => fv(it, 'item_id') === fv(incoming, 'item_id'));
+          if (idx >= 0) ar.items[idx] = incoming;
+          else ar.items.push(incoming);
+          const table = byId('ps-auto-items-table');
+          if (table) assignAutoItemRows(table, ar);
+          appendLog(`${fv(incoming, 'case_title')} — ${t(`item_status_${incoming.status}`)}`);
+        } else if (kind === 'artifact' && body.artifact) {
+          appendLog(`${t('auto_artifact_ready')}: ${fv(body.artifact, 'name')}`);
+        }
+      },
+      onError: () => { /* the poll below is the source of truth */ },
+      onEnd: () => { /* terminal state is confirmed by the poll */ },
+    },
+  ).then((unsub) => {
+    if (s.autoRun !== ar || s.view !== 'auto-run') { unsub(); return; }
+    ar.unsub = unsub;
+  }).catch(() => { /* stream is optional; polling still tracks the run */ });
+
+  ar.pollTimer = setInterval(async () => {
+    if (s.autoRun !== ar || s.view !== 'auto-run' || state.tab !== 'tests') {
+      stopAutoRunLive();
+      return;
+    }
+    try {
+      await loadAutoRun(ar);
+    } catch {
+      return;
+    }
+    const run = ar.run;
+    if (!run) return;
+    const total = Math.max(1, Number(run.total ?? 1));
+    const done = Number(run.passed ?? 0) + Number(run.failed ?? 0) + Number(run.blocked ?? 0)
+      + Number(run.skipped ?? 0) + Number(run.errored ?? 0);
+    const pct = Math.min(100, Math.round((done / total) * 100));
+    byId('ps-auto-progressbar')?.setAttribute('value', String(pct));
+    const label = byId('ps-auto-progress-label');
+    if (label) label.textContent = t('auto_progress', { done, total: Number(run.total ?? 0), pct });
+    const table = byId('ps-auto-items-table');
+    if (table) assignAutoItemRows(table, ar);
+    if (fv(run, 'run_type') === 'perf') renderPerfSection(ar);
+    if (run.status !== 'running') {
+      stopAutoRunLive();
+      await renderTestsView();
+    }
+  }, AUTO_RUN_POLL_MS);
+}
+
+function showAutoWatchdog(ar, line) {
+  ar.watchdog = line || t('auto_watchdog_banner');
+  const banner = byId('ps-auto-watchdog');
+  const text = byId('ps-auto-watchdog-text');
+  if (text) text.textContent = t('auto_watchdog_banner', { detail: ar.watchdog });
+  if (banner) banner.hidden = false;
+}
+
+async function cancelAutoRun(runId) {
+  const ok = await TfWindow.confirm({
+    title: t('auto_cancel_title'),
+    message: t('auto_cancel_message'),
+    confirmLabel: t('auto_stop'),
+    cancelLabel: t('action_cancel'),
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await ApiBinary.one('projectStudioRunAutoCancelRequest', { projectId: projectId(), runId });
+    toast(t('auto_cancelled_ok'), 'success');
+    await renderTestsView();
+  } catch (err) {
+    toast(`${t('auto_cancel_failed')}: ${err.message}`, 'error');
+  }
+}
+
+function exportAutoRunCsv(ar) {
+  const rows = ar.items.map((it) => ({
+    position: Number(it.position ?? 0) + 1,
+    case_title: fv(it, 'case_title'),
+    kind: it.kind,
+    language: it.language,
+    status: it.status,
+    duration_ms: Number(fv(it, 'duration_ms') ?? 0),
+    message: it.message || '',
+    artifacts: (Array.isArray(fv(it, 'artifact_refs')) ? fv(it, 'artifact_refs') : []).map((a) => fv(a, 'name')).join(' '),
+  }));
+  downloadTextFile(`run-${fv(ar.run, 'run_no')}.csv`, toCsv(rows));
+}
+
+function formatMillis(ms) {
+  const n = Number(ms) || 0;
+  if (n <= 0) return '—';
+  if (n < 1000) return `${Math.round(n)} ms`;
+  const secs = n / 1000;
+  if (secs < 60) return `${secs.toFixed(2)} s`;
+  return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
+}
+
+function formatNum(value) {
+  const n = Number(value) || 0;
+  return n >= 100 ? String(Math.round(n)) : String(Math.round(n * 10) / 10);
+}
+
+// mm:ss label for the perf timeline axis (offset from the run start).
+function formatElapsed(secs) {
+  const n = Math.max(0, Math.round(Number(secs) || 0));
+  return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}`;
 }
 
 // =============================================================================
@@ -7085,10 +9184,28 @@ async function openNotifWindow() {
     const runId = link && (link.run_id || (link.kind === 'run' ? link.id : null));
     const genId = link && link.gen_id;
     const taskId = link && link.task_id;
+    const environmentId = link && link.environment_id;
     const pid = fv(n, 'project_id');
-    if (!pid || !(runId || genId || taskId)) return;
+    if (!pid || !(runId || genId || taskId || environmentId)) return;
     cleanup();
     const sameProject = state.project && projectId() === pid;
+    // An environment notification lands on the T12 list (admins can jump on to
+    // the approval queue from there).
+    if (environmentId) {
+      if (sameProject) {
+        if (state.tab !== 'tests') {
+          state.tab = 'tests';
+          renderTabsValue();
+          await switchTab('tests');
+        }
+        f2().view = n.kind === 'environment_pending' && state.isAdmin ? 'env-approvals' : 'environments';
+        f2().envs.loaded = false;
+        await renderTestsView();
+      } else {
+        await openProject(pid, { tab: 'tests', sub: 'environments' });
+      }
+      return;
+    }
     if (runId) {
       if (sameProject) await openRunDetailFromNotif(runId);
       else await openProject(pid, { tab: 'tests', runId });
@@ -7132,7 +9249,7 @@ async function openRunDetailFromNotif(runId) {
     renderTabsValue();
     await switchTab('tests');
   }
-  await openRunDetail(runId);
+  await openRunByType(runId);
 }
 
 async function openGenDetailFromNotif(genId) {
