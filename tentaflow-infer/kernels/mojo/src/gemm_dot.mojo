@@ -37,7 +37,7 @@ from std.gpu import block_idx, thread_idx
 from std.gpu.sync import barrier
 from std.memory import stack_allocation
 from std.gpu.memory import AddressSpace
-from src.arch_dot import dot2_f16, dot4_i8
+from src.arch_dot import dot2_f16, dot4_i8, f8e4m3_to_f32, nvfp4_codes8
 from src.gemv2 import _q4k_scale_min
 
 comptime BK = 32  # kolumny na etap
@@ -756,3 +756,176 @@ def gemm_q6_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
 
 comptime gemm_q6_k_dot4_64x64 = gemm_q6_k_dot4_impl[64, 64, 4, 4, 4]
 comptime gemm_q6_k_dot4_128x64 = gemm_q6_k_dot4_impl[128, 64, 8, 4, 2]
+
+
+def gemm_nvfp4_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    packed: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[UInt8, MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    inv_global_scale: Float32,
+):
+    """NVFP4 GEMM na `v_dot4_i32_i8`: Y[t, r] = dot(w[r], x[t]).
+
+    Wagi to spakowane e2m1 (dwie kolumny na bajt, młodszy półbajt to kolumna
+    parzysta) plus jedna skala `float8_e4m3` na 16 kolumn i wspólna skala
+    tensora. Kody rozpakowujemy PODWOJONE (patrz `nvfp4_codes8`), przez co
+    iloczyn skalarny jest dokładny w int32, a czynnik 2 pochłania skala grupy.
+
+    Blok kwantyzacji aktywacji ma 32 kolumny, a grupa wag 16, więc 32-kolumnowy
+    podblok akumuluje DWIE niezależne sumy int32 — tak samo jak Q6_K.
+    `n_cols % 32 == 0`.
+    """
+    comptime NT = (BM // TM) * (BN // TN)
+    comptime ROWS_TX = BN // TN
+    comptime X_PASSES = (BM + (NT // 4) - 1) // (NT // 4)
+    comptime W_PASSES = (BN + (NT // 4) - 1) // (NT // 4)
+    comptime XPLANE = BM * 32
+    comptime WPLANE = BN * 32
+
+    tid = Int(thread_idx.x)
+    row0 = Int(block_idx.x) * BN
+    t0 = Int(block_idx.y) * BM
+    total_sub = n_cols // 32
+    groups_per_row = n_cols // 16
+
+    xs = stack_allocation[
+        KB * XPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    ws = stack_allocation[
+        KB * WPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        KB * BM, Float32, address_space = AddressSpace.SHARED
+    ]()
+    wlo = stack_allocation[
+        KB * BN, Float32, address_space = AddressSpace.SHARED
+    ]()
+    whi = stack_allocation[
+        KB * BN, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    lrow = tid // 4
+    kc = (tid % 4) * 8
+    tx = tid % ROWS_TX
+    ty = tid // ROWS_TX
+
+    var acc = InlineArray[Float32, TM * TN](fill=0.0)
+
+    var base_sub = 0
+    while base_sub < total_sub:
+        comptime for kb in range(KB):
+            js = base_sub + kb
+            live = js < total_sub
+
+            comptime for p in range(X_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BM:
+                    var token = t0 + local
+                    if token > n_tokens - 1:
+                        token = n_tokens - 1
+                    var bytes8 = SIMD[DType.int8, 8](0)
+                    if live:
+                        bytes8 = (xq + token * n_cols + js * 32 + kc).load[
+                            width=8
+                        ]()
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            xs + kb * XPLANE + kq * (BM * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            bytes8.slice[4, offset = q * 4]()
+                        )
+
+            comptime for p in range(W_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BN:
+                    var row = row0 + local
+                    if row > n_rows - 1:
+                        row = n_rows - 1
+                    var codes = SIMD[DType.int8, 8](0)
+                    var scale: Float32 = 0.0
+                    if live:
+                        nibbles = (
+                            packed + row * (n_cols // 2) + js * 16 + kc // 2
+                        ).load[width=4, alignment=4]()
+                        codes = nvfp4_codes8(nibbles)
+                        # 0,5 kompensuje podwojenie kodów w `nvfp4_codes8`.
+                        scale = (
+                            f8e4m3_to_f32(
+                                scales[
+                                    row * groups_per_row + js * 2 + kc // 16
+                                ]
+                            )
+                            * inv_global_scale
+                            * 0.5
+                        )
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            ws + kb * WPLANE + kq * (BN * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            codes.slice[4, offset = q * 4]()
+                        )
+                    if kc == 0:
+                        wlo[kb * BN + local] = scale
+                    elif kc == 16:
+                        whi[kb * BN + local] = scale
+
+            if tid < BM:
+                var token = t0 + tid
+                if token > n_tokens - 1:
+                    token = n_tokens - 1
+                xds[kb * BM + tid] = xd[js * n_tokens + token] if live else 0.0
+        barrier()
+
+        comptime for kb in range(KB):
+            xbase = xs + kb * XPLANE + ty * TM * 4
+            wbase = ws + kb * WPLANE + tx * TN * 4
+            var slo = InlineArray[Int32, TM * TN](fill=0)
+            var shi = InlineArray[Int32, TM * TN](fill=0)
+
+            comptime for kq in range(8):
+                av = (xbase + kq * (BM * 4)).bitcast[Int32]().load[
+                    width=TM, alignment=16
+                ]()
+                bv = (wbase + kq * (BN * 4)).bitcast[Int32]().load[
+                    width=TN, alignment=16
+                ]()
+
+                comptime for m in range(TM):
+                    comptime for r in range(TN):
+                        comptime if kq < 4:
+                            slo[m * TN + r] = dot4_i8(
+                                av[m], bv[r], slo[m * TN + r]
+                            )
+                        else:
+                            shi[m * TN + r] = dot4_i8(
+                                av[m], bv[r], shi[m * TN + r]
+                            )
+
+            comptime for m in range(TM):
+                dx = xds[kb * BM + ty * TM + m]
+                comptime for r in range(TN):
+                    acc[m * TN + r] += dx * (
+                        wlo[kb * BN + tx * TN + r] * Float32(slo[m * TN + r])
+                        + whi[kb * BN + tx * TN + r] * Float32(shi[m * TN + r])
+                    )
+        barrier()
+        base_sub += KB
+
+    comptime for m in range(TM):
+        t = t0 + ty * TM + m
+        if t < n_tokens:
+            comptime for r in range(TN):
+                row = row0 + tx * TN + r
+                if row < n_rows:
+                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+
+
+comptime gemm_nvfp4_dot4_64x64 = gemm_nvfp4_dot4_impl[64, 64, 4, 4, 4]
+comptime gemm_nvfp4_dot4_128x64 = gemm_nvfp4_dot4_impl[128, 64, 8, 4, 2]

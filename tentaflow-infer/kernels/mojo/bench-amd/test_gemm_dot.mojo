@@ -13,6 +13,7 @@ from src.gemm_dot import (
     gemm_q8_0_dot4_impl,
     gemm_q4_k_dot4_impl,
     gemm_q6_k_dot4_impl,
+    gemm_nvfp4_dot4_impl,
 )
 
 comptime ITERS = 10
@@ -425,6 +426,127 @@ def check_q6k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
         raise Error("gemm_q6_k_dot4 poza tolerancja f16")
 
 
+def bench_nvfp4[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    label: String, ctx: DeviceContext, tokens: Int, rows: Int, cols: Int
+) raises:
+    nb = cols // 32
+    ngroups = cols // 16
+    var wd = ctx.enqueue_create_buffer[DType.uint8](rows * (cols // 2))
+    var sd8 = ctx.enqueue_create_buffer[DType.uint8](rows * ngroups)
+    var xdb = ctx.enqueue_create_buffer[DType.int8](tokens * cols)
+    var ddb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var yd = ctx.enqueue_create_buffer[DType.float16](tokens * rows)
+    ctx.synchronize()
+    grid = ((rows + BN - 1) // BN, (tokens + BM - 1) // BM)
+    blk = (BM // TM) * (BN // TN)
+    for _ in range(3):
+        ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB]](
+            yd.unsafe_ptr(), wd.unsafe_ptr(), sd8.unsafe_ptr(),
+            xdb.unsafe_ptr(), ddb.unsafe_ptr(), cols, rows, tokens,
+            Float32(1.0), grid_dim=grid, block_dim=blk,
+        )
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB]](
+            yd.unsafe_ptr(), wd.unsafe_ptr(), sd8.unsafe_ptr(),
+            xdb.unsafe_ptr(), ddb.unsafe_ptr(), cols, rows, tokens,
+            Float32(1.0), grid_dim=grid, block_dim=blk,
+        )
+    ctx.synchronize()
+    dt = Float64(perf_counter_ns() - t0) / 1e9 / ITERS
+    ops = 2.0 * Float64(tokens) * Float64(rows) * Float64(cols)
+    print(
+        label, "T=", tokens, "rows=", rows, "cols=", cols,
+        Int(ops / dt / 1e12), "TOPS", Int(dt * 1e6), "us",
+    )
+
+
+def check_nvfp4[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    ctx: DeviceContext, tokens: Int, rows: Int, cols: Int
+) raises:
+    """Referencja hosta dekoduje e2m1 i e4m3 niezaleznie od kodu kernela."""
+    nb = cols // 32
+    ngroups = cols // 16
+    var wh = ctx.enqueue_create_host_buffer[DType.uint8](rows * (cols // 2))
+    var sh8 = ctx.enqueue_create_host_buffer[DType.uint8](rows * ngroups)
+    var xh = ctx.enqueue_create_host_buffer[DType.int8](tokens * cols)
+    var dh = ctx.enqueue_create_host_buffer[DType.float32](nb * tokens)
+    ctx.synchronize()
+    for r in range(rows):
+        for i in range(cols // 2):
+            wh[r * (cols // 2) + i] = UInt8((r * 13 + i * 7) % 256)
+        for g in range(ngroups):
+            # Wykladniki 3..12 (bez subnormalnych i bez NaN), rozne mantysy.
+            wh_exp = 3 + (r + g) % 10
+            wh_man = (r * 3 + g) % 8
+            sh8[r * ngroups + g] = UInt8((wh_exp << 3) | wh_man)
+    for t in range(tokens):
+        for k in range(cols):
+            xh[t * cols + k] = Int8(((t * 7 + k * 5) % 255) - 127)
+    for b in range(nb):
+        for t in range(tokens):
+            dh[b * tokens + t] = 0.0078125 * Float32(1 + (b + t) % 5)
+
+    var wd = ctx.enqueue_create_buffer[DType.uint8](rows * (cols // 2))
+    var sd8 = ctx.enqueue_create_buffer[DType.uint8](rows * ngroups)
+    var xdb = ctx.enqueue_create_buffer[DType.int8](tokens * cols)
+    var ddb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var yd = ctx.enqueue_create_buffer[DType.float16](tokens * rows)
+    ctx.enqueue_copy(wd, wh)
+    ctx.enqueue_copy(sd8, sh8)
+    ctx.enqueue_copy(xdb, xh)
+    ctx.enqueue_copy(ddb, dh)
+    ctx.synchronize()
+    inv_global = Float32(0.75)
+    ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB]](
+        yd.unsafe_ptr(), wd.unsafe_ptr(), sd8.unsafe_ptr(), xdb.unsafe_ptr(),
+        ddb.unsafe_ptr(), cols, rows, tokens, inv_global,
+        grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),
+        block_dim=(BM // TM) * (BN // TN),
+    )
+    ctx.synchronize()
+    mags = SIMD[DType.float32, 8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+    var worst: Float32 = 0.0
+    with yd.map_to_host() as got:
+        for t in range(tokens):
+            for r in range(rows):
+                var expect: Float32 = 0.0
+                for c in range(cols):
+                    byte = wh[r * (cols // 2) + c // 2]
+                    nib = (
+                        Int32(byte & 0x0F) if c % 2
+                        == 0 else Int32(byte >> 4)
+                    )
+                    value = mags[Int(nib & 0x07)]
+                    if nib >= 8:
+                        value = -value
+                    sbyte = sh8[r * ngroups + c // 16]
+                    exponent = Int32((sbyte >> 3) & 0x0F)
+                    mantissa = Int32(sbyte & 0x07)
+                    var power: Float32 = 1.0
+                    for _ in range(abs(Int(exponent) - 7)):
+                        power = power * 2.0
+                    if Int(exponent) - 7 < 0:
+                        power = 1.0 / power
+                    gscale = (1.0 + Float32(mantissa) / 8.0) * power
+                    expect += (
+                        value
+                        * gscale
+                        * inv_global
+                        * dh[(c // 32) * tokens + t]
+                        * Float32(xh[t * cols + c])
+                    )
+                have = Float32(got[t * rows + r])
+                denom = abs(expect) if abs(expect) > 1.0 else 1.0
+                err = abs(have - expect) / denom
+                if err > worst:
+                    worst = err
+    print("NVFP4 T=", tokens, "rows=", rows, "cols=", cols, "blad max:", worst)
+    if worst > 0.003:
+        raise Error("gemm_nvfp4_dot4 poza tolerancja f16")
+
+
 def main() raises:
     var ctx = DeviceContext()
     print("arch:", ctx.arch_name())
@@ -449,6 +571,8 @@ def main() raises:
     check_q4k[128, 128, 8, 4, 2](ctx, 300, 300, 1024)
     check_q6k[64, 64, 4, 4, 4](ctx, 64, 64, 256)
     check_q6k[128, 64, 8, 4, 2](ctx, 200, 130, 512)
+    check_nvfp4[64, 64, 4, 4, 4](ctx, 64, 64, 64)
+    check_nvfp4[128, 64, 8, 4, 2](ctx, 200, 130, 512)
     print("--- kafle na kształtach warstw ---")
     # qwen0.6B: 1024/3072. 7B: 4096/14336.
     bench[64, 64, 4, 4]("64x64  ", ctx, 1024, 4096, 4096)
@@ -472,6 +596,9 @@ def main() raises:
     bench_q4k[128, 64, 8, 4, 2]("q4k 128x64 ", ctx, 1024, 4096, 4096)
     bench_q4k[128, 128, 8, 4, 2]("q4k 128x128", ctx, 1024, 4096, 4096)
     bench_q4k[128, 128, 8, 4, 2]("q4k 128x128", ctx, 1024, 14336, 4096)
+    print("--- NVFP4 int8 dot4 ---")
+    bench_nvfp4[128, 64, 8, 4, 2]("nvfp4 128x64", ctx, 1024, 4096, 4096)
+    bench_nvfp4[128, 64, 8, 4, 2]("nvfp4 128x64", ctx, 1024, 11264, 4096)
     bench_q8[128, 128, 8, 4, 4]("q8 128x128", ctx, 1024, 14336, 4096)
     bench_q8[128, 128, 8, 4, 4]("q8 128x128", ctx, 512, 3072, 1024)
     print("--- najlepszy kafel na pozostalych kształtach ---")

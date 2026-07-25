@@ -6213,6 +6213,26 @@ impl Kernels {
                 "gemm_nvfp4 requires rows > 0, cols >= 16, cols % 16 == 0 and n_tokens > 0, got rows={rows}, cols={cols}, n_tokens={n_tokens}"
             )));
         }
+        // Karty bez jednostki macierzowej: kafel int8 na `v_dot4_i32_i8`.
+        // Wartości e2m1 są wielokrotnościami 0,5, więc podwojone są całkowite i
+        // iloczyn wychodzi dokładnie — patrz `nvfp4_codes8`.
+        if let Some(tile) = self.gemm_nvfp4_dot4_tile(rows, n_tokens) {
+            let (xq, xd, _) = self.prequant_q8_1(x, cols, n_tokens, stream)?;
+            let k = self.artifacts.get(tile.name)?;
+            let args = LaunchArgs::new()
+                .buf(y)
+                .buf_at(packed, packed_byte_off)?
+                .buf_at(scales, scales_byte_off)?
+                .buf(&xq)
+                .buf(&xd)
+                .scalar(cols as i64)
+                .scalar(rows as i64)
+                .scalar(n_tokens as i64)
+                .scalar(inv_global_scale);
+            return self
+                .device
+                .launch(k, &tile.config(rows, n_tokens), &args, stream);
+        }
         let (kernel_name, block, bm) = if (2..=4).contains(&n_tokens)
             && self.artifacts.has("gemv_batch_nvfp4_f16_b4")
         {
@@ -8130,47 +8150,12 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let qk = self.artifacts.get("quantize_act_q8_1")?;
         // Portable Mojo int8 tensor-core tiles (`.target sm_80`, JIT to any
         // sm_80+ part). This is the default Q4_K/Q6_K prefill GEMM on pre-Ada
         // GPUs and the Q8_0 prefill GEMM everywhere; on Ada the vendored MMQ
         // cubin intercepts Q4_K/Q6_K upstream (`gemm_q4_k_i8mma_at`).
-        let need_codes = n_tokens * cols;
-        let need_blocks = n_tokens * (cols / 32);
-
-        let mut sc = self.prequant.lock().expect("prequant scratch poisoned");
-        if sc.cap_codes < need_codes {
-            sc.xq = Some(
-                self.device
-                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
-            );
-            sc.cap_codes = need_codes;
-        }
-        if sc.cap_blocks < need_blocks {
-            sc.xd = Some(
-                self.device
-                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
-            );
-            sc.xsm = Some(self.device.alloc(
-                need_blocks * 4,
-                MemKind::Device,
-                Pool::Activations,
-            )?);
-            sc.cap_blocks = need_blocks;
-        }
-        let xq = sc.xq.as_ref().expect("xq allocated");
-        let xd = sc.xd.as_ref().expect("xd allocated");
-        let xsm = sc.xsm.as_ref().expect("xsm allocated");
-
-        let qcfg = LaunchConfig::linear(need_blocks as u32, BLOCK);
-        let qargs = LaunchArgs::new()
-            .buf(xq)
-            .buf(xd)
-            .buf(xsm)
-            .buf(x)
-            .scalar(cols as i64)
-            .scalar(n_tokens as i64);
-        self.device.launch(qk, &qcfg, &qargs, stream)?;
+        let (xq, xd, xsm) = self.prequant_q8_1(x, cols, n_tokens, stream)?;
+        let (xq, xd, xsm) = (&xq, &xd, &xsm);
 
         if kernel_base == "gemm_q8_0_i8mma"
             && (2..=8).contains(&n_tokens)
@@ -8308,6 +8293,81 @@ impl Kernels {
             DotTile::new("gemm_q8_0_dot4_128x64", 128, 64, 8, 4)
         } else {
             DotTile::new("gemm_q8_0_dot4_128x128", 128, 128, 8, 4)
+        })
+    }
+
+    /// Kwantyzuje aktywację `x[T, cols]` do q8_1 w wewnętrznym scratchu i
+    /// zwraca `(kody int8, skale, skale*suma)`. Skale są blok-major `[K/32, T]`.
+    ///
+    /// Wspólne dla wszystkich kafli int8: rodziny i8mma oraz kafli dot na
+    /// kartach bez jednostki macierzowej. Bufory rosną tylko w górę i żyją
+    /// między wywołaniami, więc kolejne warstwy nie alokują.
+    fn prequant_q8_1(
+        &self,
+        x: &DevBuffer,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<(DevBuffer, DevBuffer, DevBuffer)> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "prequant_q8_1 wymaga cols % 32 == 0, otrzymano {cols}"
+            )));
+        }
+        let qk = self.artifacts.get("quantize_act_q8_1")?;
+        let need_codes = n_tokens * cols;
+        let need_blocks = n_tokens * (cols / 32);
+
+        let mut sc = self.prequant.lock().expect("prequant scratch poisoned");
+        if sc.cap_codes < need_codes {
+            sc.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_codes;
+        }
+        if sc.cap_blocks < need_blocks {
+            sc.xd = Some(
+                self.device
+                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.xsm = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            sc.cap_blocks = need_blocks;
+        }
+        let xq = sc.xq.as_ref().expect("xq allocated").clone();
+        let xd = sc.xd.as_ref().expect("xd allocated").clone();
+        let xsm = sc.xsm.as_ref().expect("xsm allocated").clone();
+
+        let qcfg = LaunchConfig::linear(need_blocks as u32, BLOCK);
+        let qargs = LaunchArgs::new()
+            .buf(&xq)
+            .buf(&xd)
+            .buf(&xsm)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+        Ok((xq, xd, xsm))
+    }
+
+    /// Kafel `gemm_nvfp4_dot4`, albo `None` na NVIDII i dla kształtów, które
+    /// obsługują wyspecjalizowane gemv batchowe (do 16 tokenów) — tam kafel
+    /// prefillowy liczyłby w większości odrzucane wiersze.
+    fn gemm_nvfp4_dot4_tile(&self, rows: usize, n_tokens: usize) -> Option<DotTile> {
+        if self.device.caps().vendor == forge_types::Vendor::Nvidia {
+            return None;
+        }
+        if n_tokens <= 16 {
+            return None;
+        }
+        Some(if n_tokens <= 64 || rows < 128 {
+            DotTile::new("gemm_nvfp4_dot4_64x64", 64, 64, 4, 4)
+        } else {
+            DotTile::new("gemm_nvfp4_dot4_128x64", 128, 64, 8, 4)
         })
     }
 
