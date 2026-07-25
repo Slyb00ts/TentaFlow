@@ -186,6 +186,18 @@ Ostatnia aktualizacja: 2026-07-25.
   | `gemm_f16_dot2` | 128x128 / 256 wątków | 23 TFLOPS | 49 TFLOPS |
   | `gemm_q8_0_dot4` | 128x128 / KB=2 | 35 TOPS | 97 TOPS |
   | `gemm_q4_k_dot4` | 128x64 / KB=2 | 32 TOPS | 97 TOPS |
+  | `gemm_q6_k_dot4` | 128x64 / KB=2 | — | 97 TOPS |
+
+  Formaty kwantyzowane różnią się TYLKO rozpakowaniem wag i członem korekty:
+  Q8_0 jest symetryczne (czysty iloczyn int32), Q4_K asymetryczne
+  (`w = d*sc*q - dmin*m`, więc drugi człon bierze `xsm` z `quantize_act_q8_1`),
+  a Q6_K ma stałe przesunięcie -32, które stosujemy JUŻ PRZY ZAPISIE do LDS —
+  dzięki temu iloczyn skalarny nie potrzebuje członu z sumą aktywacji. Q6_K ma
+  też jedną skalę na 16 kolumn wobec 32-kolumnowego bloku aktywacji, więc
+  akumuluje dwie niezależne sumy int32 na podblok.
+  Q6_K jest konieczny, a nie opcjonalny: `Q4_K_M` (i każdy inny wariant K)
+  trzyma część tensorów w Q6_K, więc bez niego prefill takiego modelu na AMD
+  przerywa się na `kernel not loaded: gemm_q6_k_f16_bm64`.
 
   Pułapka, którą złapałem na sobie: kafel 192x128 przy 768 wątkach wychodził
   „najszybszy" (26 TFLOPS), bo `W_PASSES = BN/(NT/4)` dawało ZERO i kernel wcale
