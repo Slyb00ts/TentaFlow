@@ -6244,6 +6244,28 @@ impl Kernels {
                 "gemm_f16 requires cols % 8 == 0, got {cols}"
             )));
         }
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        // Karty bez jednostki macierzowej nie mają rodziny `gemm_f16` (opartej
+        // na mma/ldmatrix) i idą kaflem na `v_dot2_f32_f16`.
+        if let Some((name, bm, bn, block)) = self.gemm_dot2_tile(rows, n_tokens) {
+            let k = self.artifacts.get(name)?;
+            let cfg = LaunchConfig {
+                grid: (
+                    (rows as u32).div_ceil(bn),
+                    (n_tokens as u32).div_ceil(bm),
+                    1,
+                ),
+                block: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return self.device.launch(k, &cfg, &args, stream);
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -6255,14 +6277,34 @@ impl Kernels {
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        let args = LaunchArgs::new()
-            .buf(y)
-            .buf_at(w, w_byte_off)?
-            .buf(x)
-            .scalar(cols as i64)
-            .scalar(rows as i64)
-            .scalar(n_tokens as i64);
         self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Kafel `gemm_f16_dot2` dla kart bez jednostki macierzowej, albo `None` na
+    /// NVIDII (tam właściwa jest rodzina mma; ten kernel jest tam zbudowany,
+    /// ale degraduje do dwóch FMA i służy tylko do porównań).
+    ///
+    /// Wybór kafla wynika ze zmierzonych na gfx1030 przepustowości (patrz
+    /// `docs/STATUS.md`): 192x128 wygrywa dla dużych kształtów, a przy małej
+    /// liczbie tokenów pełny kafel po M byłby w większości odrzuconym
+    /// obliczeniem, więc schodzimy na węższy.
+    fn gemm_dot2_tile(
+        &self,
+        rows: usize,
+        n_tokens: usize,
+    ) -> Option<(&'static str, u32, u32, u32)> {
+        if self.device.caps().vendor == forge_types::Vendor::Nvidia {
+            return None;
+        }
+        Some(if n_tokens <= 64 || rows < 128 {
+            ("gemm_f16_dot2_64x64", 64, 64, 256)
+        } else if n_tokens <= 128 {
+            ("gemm_f16_dot2_128x64", 128, 64, 512)
+        } else if n_tokens < 192 {
+            ("gemm_f16_dot2_128x128_t512", 128, 128, 512)
+        } else {
+            ("gemm_f16_dot2_192x128_t768", 192, 128, 768)
+        })
     }
 
     /// f16 GEMM emitting f32 outputs over a row window of `w` (batched logit
