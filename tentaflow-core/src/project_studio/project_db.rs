@@ -522,7 +522,7 @@ CREATE TABLE auto_run_meta (
     runner_endpoint TEXT NOT NULL DEFAULT '',
     runner_job_id TEXT NOT NULL DEFAULT '',
     perf_profile_json TEXT NOT NULL DEFAULT '{}',
-    perf_summary_json TEXT NOT NULL DEFAULT '{}',
+    perf_summary_json TEXT NOT NULL DEFAULT '[]',
     perf_timeline_json TEXT NOT NULL DEFAULT '[]',
     last_poll_at TEXT NOT NULL DEFAULT '',
     failed_polls INTEGER NOT NULL DEFAULT 0,

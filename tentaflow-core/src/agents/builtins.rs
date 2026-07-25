@@ -355,11 +355,14 @@ impl CoreToolName {
             },
             CoreToolName::CaseSave => LlmToolSpec {
                 name: self.public_name().to_string(),
-                description: "Save ONE generated manual test case into the current \
-                              generation. Call it IMMEDIATELY after designing each case — \
-                              only saved cases count. The target project and generation \
-                              are bound server-side; do not pass any ids. A [TOOL_ERROR] \
-                              rejects only THIS case: fix it per the message and retry."
+                description: "Save ONE generated test case into the current generation. Call \
+                              it IMMEDIATELY after designing each case — only saved cases \
+                              count. The target project, generation and case KIND are bound \
+                              server-side; do not pass any ids or a kind. Manual generations \
+                              expect `steps`; code generations (ui/api/unit/perf/security) \
+                              expect `script` plus the extras of their kind — the other \
+                              fields are ignored. A [TOOL_ERROR] rejects only THIS case: fix \
+                              it per the message and retry."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -375,11 +378,11 @@ impl CoreToolName {
                         },
                         "preconditions": {
                             "type": "string",
-                            "description": "State required before executing the steps."
+                            "description": "Manual kind: state required before the steps."
                         },
                         "steps": {
                             "type": "array",
-                            "description": "1..50 ordered steps.",
+                            "description": "Manual kind: 1..50 ordered steps.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -391,7 +394,55 @@ impl CoreToolName {
                         },
                         "test_data": {
                             "type": "string",
-                            "description": "Input data the tester needs."
+                            "description": "Manual kind: input data the tester needs."
+                        },
+                        "script": {
+                            "type": "string",
+                            "description": "Code kinds: the runnable script (max 64000 \
+                                            characters) honouring the execution contract of \
+                                            the kind stated in your task."
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Code kinds: programming language of the script \
+                                            (default and currently the only supported value: \
+                                            python)."
+                        },
+                        "config": {
+                            "type": "object",
+                            "description": "Kind ui: {viewport:{width,height}, timeout_ms, \
+                                            headed}. Kind api: {timeout_ms}.",
+                            "properties": {
+                                "timeout_ms": {"type": "integer"},
+                                "headed": {"type": "boolean"},
+                                "viewport": {
+                                    "type": "object",
+                                    "properties": {
+                                        "width": {"type": "integer"},
+                                        "height": {"type": "integer"}
+                                    }
+                                }
+                            }
+                        },
+                        "profile": {
+                            "type": "object",
+                            "description": "Kind perf: load profile of the Locust run.",
+                            "properties": {
+                                "users": {"type": "integer"},
+                                "spawn_rate": {"type": "number"},
+                                "duration_secs": {"type": "integer"}
+                            }
+                        },
+                        "checklist": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Kind security: up to 50 short statements of what \
+                                            the script verifies."
+                        },
+                        "build_profile_ref": {
+                            "type": "string",
+                            "description": "Kind unit: id of the code source whose build \
+                                            profile this case runs against."
                         },
                         "tags": {
                             "type": "array",
@@ -412,7 +463,7 @@ impl CoreToolName {
                             }
                         }
                     },
-                    "required": ["title", "priority", "steps"]
+                    "required": ["title", "priority"]
                 }),
             },
         }

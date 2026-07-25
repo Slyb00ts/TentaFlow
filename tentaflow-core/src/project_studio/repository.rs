@@ -1271,6 +1271,143 @@ pub fn project_f2_kpis(pool: &DbPool, user_id: &str) -> Result<super::models::Pr
     })
 }
 
+/// F3 KPI counters (environments + open automated runs) for the overview.
+pub fn project_f3_kpis(pool: &DbPool) -> Result<super::models::ProjectF3Kpis> {
+    let conn = pool.read().map_err(read_err)?;
+    let (approved, pending): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(approval_status = 'approved'), 0), \
+                COALESCE(SUM(approval_status = 'pending'), 0) FROM environments",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let auto_runs_open: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM test_runs WHERE status = 'running' \
+         AND run_id IN (SELECT run_id FROM auto_run_meta)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(super::models::ProjectF3Kpis {
+        environments_approved: approved as u32,
+        environments_pending: pending as u32,
+        auto_runs_open: auto_runs_open as u32,
+    })
+}
+
+/// Stores the encrypted access token of a git source (input-only on the wire).
+pub fn set_source_secret(pool: &DbPool, source_id: &str, secret_enc: &str) -> Result<bool> {
+    let conn = pool.write().map_err(write_err)?;
+    let n = conn.execute(
+        "UPDATE sources SET secret_enc = ?1, updated_at = datetime('now') WHERE source_id = ?2",
+        params![secret_enc, source_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Encrypted access token of a source; `""` when none is stored.
+pub fn get_source_secret_enc(pool: &DbPool, source_id: &str) -> Result<String> {
+    let conn = pool.read().map_err(read_err)?;
+    Ok(conn
+        .query_row(
+            "SELECT secret_enc FROM sources WHERE source_id = ?1",
+            params![source_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
+/// Sets the language of a case. Separate statement on purpose: F2's
+/// `CaseContentInput` predates code cases and carries no language field, and
+/// widening it would churn every manual-test call site.
+pub fn set_case_language(pool: &DbPool, case_id: &str, language: &str) -> Result<()> {
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        "UPDATE test_cases SET language = ?1 WHERE case_id = ?2",
+        params![language, case_id],
+    )?;
+    Ok(())
+}
+
+/// Replaces the file rows of a code source with the freshly collected tree and
+/// returns the ids of the files that need (re-)embedding plus the ids of the
+/// rows that were dropped (their vectors are deleted by the caller). ONE
+/// transaction, so a crash never leaves the file list half-rewritten.
+pub fn sync_tree_files(
+    pool: &DbPool,
+    source_id: &str,
+    files: &[super::ingest::CollectedFile],
+    delta: &super::ingest::TreeDelta,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let conn = pool.write().map_err(write_err)?;
+    let tx = conn.unchecked_transaction()?;
+    let mut removed_ids = Vec::with_capacity(delta.removed.len());
+    for path in &delta.removed {
+        let file_id: Option<String> = tx
+            .query_row(
+                "SELECT file_id FROM source_files WHERE source_id = ?1 AND path = ?2",
+                params![source_id, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(file_id) = file_id {
+            tx.execute(
+                "DELETE FROM source_files WHERE file_id = ?1",
+                params![file_id],
+            )?;
+            removed_ids.push(file_id);
+        }
+    }
+    let touched: std::collections::HashSet<&str> = delta
+        .added
+        .iter()
+        .chain(delta.changed.iter())
+        .map(|p| p.as_str())
+        .collect();
+    let mut work_ids = Vec::with_capacity(touched.len());
+    for file in files {
+        if !touched.contains(file.rel_path.as_str()) {
+            continue;
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT file_id FROM source_files WHERE source_id = ?1 AND path = ?2",
+                params![source_id, file.rel_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let file_id = match existing {
+            Some(file_id) => {
+                tx.execute(
+                    "UPDATE source_files SET sha256 = ?1, size_bytes = ?2, mime = ?3, \
+                     status = 'pending', error = '', updated_at = datetime('now') \
+                     WHERE file_id = ?4",
+                    params![file.sha256, file.size_bytes as i64, file.mime, file_id],
+                )?;
+                file_id
+            }
+            None => {
+                let file_id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO source_files (file_id, source_id, path, sha256, size_bytes, mime) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        file_id,
+                        source_id,
+                        file.rel_path,
+                        file.sha256,
+                        file.size_bytes as i64,
+                        file.mime
+                    ],
+                )?;
+                file_id
+            }
+        };
+        work_ids.push(file_id);
+    }
+    tx.commit()?;
+    Ok((work_ids, removed_ids))
+}
+
 /// Read-only source/file counters for the project LIST screen. Opens the
 /// project.db file directly (read-only, no pool) so listing many projects
 /// does not churn the LRU pool cache; a missing/unreadable file counts as
@@ -1299,4 +1436,84 @@ pub fn effective_role(project_id: &str, user_id: &str) -> Result<Option<ProjectR
     Ok(member_role(project_id, user_id)?
         .as_deref()
         .and_then(ProjectRole::from_slug))
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    fn pool() -> DbPool {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (pool, _) = super::super::project_db::open_pool_at(&dir).expect("open");
+        std::mem::forget(tmp);
+        pool
+    }
+
+    fn file(path: &str, sha: &str) -> super::super::ingest::CollectedFile {
+        super::super::ingest::CollectedFile {
+            rel_path: path.to_string(),
+            sha256: sha.to_string(),
+            size_bytes: 10,
+            mime: "text/plain".to_string(),
+        }
+    }
+
+    /// (c) A git refresh re-embeds ONLY the delta: an unchanged file keeps its
+    /// row (and its file_id, so its vectors are reused), a changed one is
+    /// returned for re-ingest, a new one is inserted and a vanished one is
+    /// deleted with its id handed back for vector cleanup.
+    #[test]
+    fn sync_tree_files_returns_only_the_delta() {
+        let pool = pool();
+        create_source(&pool, "s1", "git", "repo", "{}", "u1").expect("source");
+
+        let initial = vec![file("a.rs", "aaa"), file("b.rs", "bbb")];
+        let full = super::super::ingest::TreeDelta {
+            added: vec!["a.rs".to_string(), "b.rs".to_string()],
+            ..Default::default()
+        };
+        let (work, removed) = sync_tree_files(&pool, "s1", &initial, &full).expect("initial sync");
+        assert_eq!(work.len(), 2);
+        assert!(removed.is_empty());
+        let stored = super::super::git_source::stored_file_hashes(&pool, "s1").expect("hashes");
+        assert_eq!(stored.get("a.rs").map(String::as_str), Some("aaa"));
+
+        // b.rs changed, c.rs is new, a.rs is untouched.
+        let current = vec![file("a.rs", "aaa"), file("b.rs", "BBB2"), file("c.rs", "ccc")];
+        let delta = super::super::ingest::diff_tree(&stored, &current);
+        assert_eq!(delta.added, vec!["c.rs".to_string()]);
+        assert_eq!(delta.changed, vec!["b.rs".to_string()]);
+        assert!(delta.removed.is_empty());
+
+        let unchanged_id = {
+            let conn = pool.read().expect("read");
+            conn.query_row(
+                "SELECT file_id FROM source_files WHERE source_id = 's1' AND path = 'a.rs'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("a.rs id")
+        };
+        let (work, removed) = sync_tree_files(&pool, "s1", &current, &delta).expect("delta sync");
+        assert_eq!(work.len(), 2, "only the changed + added files are re-ingested");
+        assert!(removed.is_empty());
+        assert!(
+            !work.contains(&unchanged_id),
+            "an unchanged file must not be re-embedded"
+        );
+
+        // Now b.rs disappears from the tree.
+        let stored = super::super::git_source::stored_file_hashes(&pool, "s1").expect("hashes");
+        let current = vec![file("a.rs", "aaa"), file("c.rs", "ccc")];
+        let delta = super::super::ingest::diff_tree(&stored, &current);
+        assert_eq!(delta.removed, vec!["b.rs".to_string()]);
+        let (work, removed) = sync_tree_files(&pool, "s1", &current, &delta).expect("removal sync");
+        assert!(work.is_empty(), "nothing changed, so nothing is re-embedded");
+        assert_eq!(removed.len(), 1, "the vanished file id feeds vector cleanup");
+        let stored = super::super::git_source::stored_file_hashes(&pool, "s1").expect("hashes");
+        assert_eq!(stored.len(), 2);
+        assert!(!stored.contains_key("b.rs"));
+    }
 }

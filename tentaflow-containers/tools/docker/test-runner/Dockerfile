@@ -17,10 +17,16 @@ COPY tentaflow-containers/tools/docker/test-runner/executor /app/executor
 
 # TEST_RUNNER_ISOLATED=1 marks this deployment as the sandboxed variant:
 # /health reports isolated:true and build_profile items are allowed.
+# HOME/XDG_CACHE_HOME point at /tmp because Core runs this image with a
+# read-only rootfs: the only writable paths are the tmpfs on /tmp and the work
+# tree under /var/lib/tentaflow, and Chromium refuses to start when it cannot
+# write its profile/cache directory.
 ENV PORT=8093 \
     TEST_RUNNER_ISOLATED=1 \
     TEST_RUNNER_SKIP_BROWSER_INSTALL=1 \
-    TEST_RUNNER_WORK_DIR=/var/lib/tentaflow/test-runner/runs
+    TEST_RUNNER_WORK_DIR=/var/lib/tentaflow/test-runner/runs \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp
 
 RUN mkdir -p /var/lib/tentaflow/test-runner/runs \
     && chown -R pwuser:pwuser /app /var/lib/tentaflow

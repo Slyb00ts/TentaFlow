@@ -338,6 +338,11 @@ which = "8.0.4"
 # python-build-standalone dystrybuuje archiwa .tar.zst (domyslnie) — zstd dekoder
 zstd = "0.13.3"
 zip = "8.6.0"
+# Parser YAML dla opisow API (OpenAPI/Swagger) w zrodlach wiedzy `api_spec`.
+# `serde_yaml` jest archiwalny; `serde_yaml_ng` to utrzymywany fork o tym samym
+# API. Deserializujemy prosto do `serde_json::Value`, wiec JSON i YAML dziela
+# jedna sciezke ekstrakcji endpointow (patrz project_studio/api_spec.rs).
+serde_yaml_ng = "0.10.0"
 # Parser XML dla ekstrakcji DOCX (word/document.xml) i PPTX (ppt/slides/slideN.xml)
 # w node-adapterach flow-ingestu RAG. default-features=false wyłącza `encoding`,
 # co odsłania `unescape_value`/`config_mut` (API używane przez ekstraktor; zgodne

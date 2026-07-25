@@ -881,6 +881,7 @@ mod backend {
         labels: &HashMap<String, String>,
         gpu: GpuSelection,
         distributed: Option<DistributedDockerOpts>,
+        sandbox: Option<crate::deploy::docker::SandboxLimits>,
     ) -> DeployResult<String> {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         let mut exposed: Vec<String> = Vec::new();
@@ -966,6 +967,11 @@ mod backend {
                 hard: Some(-1),
             }]);
             host_config.shm_size = Some(opts.shm_size_bytes);
+        }
+        // Untrusted-code engines (the Project Studio test runner) get hard
+        // resource + capability limits on top of the normal config.
+        if let Some(limits) = &sandbox {
+            crate::deploy::docker::apply_sandbox_limits(&mut host_config, limits);
         }
         // Distributed: BYPASS the base entrypoint — run the ray+vllm command
         // directly as `bash -c <cmd>`. `cmd`/`engine_args` are ignored (the full
@@ -1737,6 +1743,11 @@ impl DeployStrategy for DockerDeploy {
             }
             None => None,
         };
+        // The test runner executes agent-authored scripts: the container is the
+        // security boundary, so it runs with a read-only rootfs, dropped
+        // capabilities and hard memory/CPU/PID caps.
+        let sandbox = (self.manifest.engine.id == crate::project_studio::auto_runs::RUNNER_ENGINE_ID)
+            .then(crate::deploy::docker::SandboxLimits::test_runner);
         let id = backend::run(
             &docker,
             &image_tag,
@@ -1748,6 +1759,7 @@ impl DeployStrategy for DockerDeploy {
             &labels,
             gpu,
             distributed_opts,
+            sandbox,
         )
         .await?;
 

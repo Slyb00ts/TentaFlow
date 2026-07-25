@@ -824,6 +824,202 @@ pub fn is_text_preview(path: &str, mime: &str, bytes: &[u8]) -> bool {
     code_ext(path).is_some() || classify_source(mime, bytes) == SourceKind::Text
 }
 
+// =============================================================================
+// Code-tree ingestion (git / zip sources)
+// =============================================================================
+
+/// Per-file size cap of a code source. Bigger files are generated artifacts,
+/// minified bundles or binaries — never useful knowledge chunks (risk R8).
+pub const MAX_TREE_FILE_BYTES: u64 = 512 * 1024;
+/// Entry cap of one code tree.
+pub const MAX_TREE_FILES: usize = 5_000;
+/// Total ingested-bytes budget of one code tree.
+pub const MAX_TREE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Directories never walked: VCS metadata plus dependency/build output that
+/// would blow the entry budget without carrying project knowledge.
+const SKIPPED_TREE_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "bin",
+    "obj",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".gradle",
+    ".next",
+    ".nuxt",
+    ".idea",
+    ".vscode",
+    "vendor",
+    "coverage",
+];
+
+/// One file of a code tree, already content-addressed into the project's blob
+/// store so the regular ingest pipeline can process it unchanged.
+#[derive(Debug, Clone)]
+pub struct CollectedFile {
+    pub rel_path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub mime: String,
+}
+
+fn tree_mime(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "md" | "markdown" => "text/markdown",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "html" | "htm" => "text/html",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        _ => "text/plain",
+    }
+}
+
+/// Walks an extracted/cloned source tree, keeps the text and source-code files
+/// within the budgets and writes each one into `<dir_path>/files/<sha256>`.
+/// Returns the collected files in stable path order. Blocking IO — call from
+/// `spawn_blocking`.
+pub fn collect_tree_files(root: &Path, dir_path: &Path) -> Result<Vec<CollectedFile>> {
+    let files_dir = dir_path.join("files");
+    std::fs::create_dir_all(&files_dir)?;
+    let mut out: Vec<CollectedFile> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            // symlink_metadata: a symlink is never followed — a repo may point
+            // one at /etc and the walk must not read through it.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if !SKIPPED_TREE_DIRS.contains(&name.as_str()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !meta.is_file() || meta.len() > MAX_TREE_FILE_BYTES {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel_path = rel.to_string_lossy().replace('\\', "/");
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if !is_text_preview(&rel_path, "", &bytes) {
+                continue;
+            }
+            if out.len() >= MAX_TREE_FILES {
+                return Err(anyhow!(
+                    "source tree exceeds {MAX_TREE_FILES} indexable files"
+                ));
+            }
+            total_bytes += bytes.len() as u64;
+            if total_bytes > MAX_TREE_TOTAL_BYTES {
+                return Err(anyhow!(
+                    "source tree exceeds the {MAX_TREE_TOTAL_BYTES} byte budget"
+                ));
+            }
+            let sha256 = hex::encode(Sha256::digest(&bytes));
+            let blob_path = files_dir.join(&sha256);
+            if !blob_path.exists() {
+                std::fs::write(&blob_path, &bytes)?;
+            }
+            out.push(CollectedFile {
+                mime: tree_mime(&rel_path).to_string(),
+                size_bytes: bytes.len() as u64,
+                sha256,
+                rel_path,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(out)
+}
+
+/// Writes one generated text document (e.g. the api_spec endpoint digest) into
+/// the project's blob store and returns its collected-file descriptor.
+pub fn store_generated_text(dir_path: &Path, rel_path: &str, content: &str) -> Result<CollectedFile> {
+    let files_dir = dir_path.join("files");
+    std::fs::create_dir_all(&files_dir)?;
+    let bytes = content.as_bytes();
+    let sha256 = hex::encode(Sha256::digest(bytes));
+    let blob_path = files_dir.join(&sha256);
+    if !blob_path.exists() {
+        std::fs::write(&blob_path, bytes)?;
+    }
+    Ok(CollectedFile {
+        rel_path: rel_path.to_string(),
+        sha256,
+        size_bytes: bytes.len() as u64,
+        mime: tree_mime(rel_path).to_string(),
+    })
+}
+
+/// Difference between the file set recorded in `source_files` and the current
+/// tree, used by the git refresh: only these paths are re-embedded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TreeDelta {
+    /// Paths present only in the new tree.
+    pub added: Vec<String>,
+    /// Paths whose content hash changed.
+    pub changed: Vec<String>,
+    /// Paths that vanished from the tree (their rows + vectors are dropped).
+    pub removed: Vec<String>,
+}
+
+impl TreeDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Computes the delta between the stored `(path, sha256)` pairs and the freshly
+/// collected tree.
+pub fn diff_tree(stored: &HashMap<String, String>, current: &[CollectedFile]) -> TreeDelta {
+    let mut delta = TreeDelta::default();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for file in current {
+        seen.insert(file.rel_path.as_str());
+        match stored.get(&file.rel_path) {
+            None => delta.added.push(file.rel_path.clone()),
+            Some(sha) if *sha != file.sha256 => delta.changed.push(file.rel_path.clone()),
+            Some(_) => {}
+        }
+    }
+    for path in stored.keys() {
+        if !seen.contains(path.as_str()) {
+            delta.removed.push(path.clone());
+        }
+    }
+    delta.added.sort();
+    delta.changed.sort();
+    delta.removed.sort();
+    delta
+}
+
 /// Line-based chunker for code files: each chunk is prefixed with a
 /// `// <path>:<start>-<end>` header line and reports its line range as the
 /// human-readable location ("l. 10–42").

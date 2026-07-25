@@ -344,6 +344,102 @@ pub struct GenerationRunRecord {
     pub finished_at: Option<String>,
 }
 
+// =============================================================================
+// F3 rows: environments, build profiles, automated runs, artifacts (project.db)
+// =============================================================================
+
+/// Test environment. `secret_enc` holds the SettingsCipher ciphertext and never
+/// leaves this layer — the wire only ever carries `has_secret`.
+#[derive(Debug, Clone)]
+pub struct EnvironmentRecord {
+    pub environment_id: String,
+    pub name: String,
+    pub env_type: String,
+    pub base_url: String,
+    pub auth_type: String,
+    pub secret_enc: String,
+    pub extra_headers_json: String,
+    pub host_allowlist_json: String,
+    pub approval_status: String,
+    pub approval_reason: String,
+    pub is_private_address: bool,
+    pub justification: String,
+    pub requested_by: String,
+    pub decided_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub decided_at: Option<String>,
+}
+
+/// Build/test recipe of one code source (git/zip), at most one per source.
+#[derive(Debug, Clone)]
+pub struct BuildProfileRecord {
+    pub profile_id: String,
+    pub source_id: String,
+    pub toolchain: String,
+    pub base_image: String,
+    pub install_cmd: String,
+    pub test_cmd: String,
+    pub workdir: String,
+    pub proposed_by: String,
+}
+
+/// Runner binding + watchdog state + perf aggregates of an automated run.
+#[derive(Debug, Clone)]
+pub struct AutoRunMetaRecord {
+    pub run_id: String,
+    pub environment_id: String,
+    pub runner_service_id: String,
+    pub runner_endpoint: String,
+    pub runner_job_id: String,
+    pub perf_profile_json: String,
+    pub perf_summary_json: String,
+    pub perf_timeline_json: String,
+    pub last_poll_at: String,
+    pub failed_polls: u32,
+    pub watchdog_deadline_ms: i64,
+}
+
+/// One artifact produced by a runner, stored under
+/// `<dir_path>/runs/<run_id>/<rel_path>`.
+#[derive(Debug, Clone)]
+pub struct RunArtifactRecord {
+    pub artifact_id: String,
+    pub run_id: String,
+    pub item_id: String,
+    pub name: String,
+    pub kind: String,
+    pub rel_path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub mime: String,
+}
+
+/// One item of an automated run: the shared `test_run_items` row joined with
+/// the case's kind/language and its artifact list.
+#[derive(Debug, Clone)]
+pub struct AutoRunItemRecord {
+    pub item_id: String,
+    pub case_id: String,
+    pub case_title: String,
+    pub kind: String,
+    pub language: String,
+    pub position: u32,
+    pub status: String,
+    pub duration_ms: u64,
+    pub message: String,
+    pub steps_total: u32,
+    pub steps_done: u32,
+}
+
+/// F3 KPI counters (environments + automated runs) for the overview screen.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectF3Kpis {
+    pub environments_approved: u32,
+    pub environments_pending: u32,
+    pub auto_runs_open: u32,
+}
+
 /// Personal notification row from the CENTRAL registry (projects.db) —
 /// always queried WHERE user_id = caller.
 #[derive(Debug, Clone)]

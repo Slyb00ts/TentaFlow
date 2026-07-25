@@ -8,8 +8,14 @@
 // never via SQL foreign keys into `tentaflow.db`.
 
 pub mod activity;
+pub mod api_spec;
+pub mod auto_runs;
+pub mod build_profiles;
+pub mod code_assist;
 pub mod db;
+pub mod environments;
 pub mod generation;
+pub mod git_source;
 pub mod ingest;
 pub mod knowledge;
 pub mod models;
@@ -20,6 +26,7 @@ pub mod repository;
 pub mod runs;
 pub mod tasks;
 pub mod tests;
+pub mod zip_source;
 
 use anyhow::Result;
 
