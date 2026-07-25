@@ -3196,8 +3196,13 @@ impl Model {
         seq.prefix_node = node;
         seq.len = shared;
         // Keep `tokens` page-aligned with `pages` so the completion-time
-        // donation indexes shared + private pages uniformly. The borrowed prefix
-        // is prefill-built (bit-identical), so it counts toward `prefilled_len`.
+        // donation indexes shared + private pages uniformly. The borrowed pages
+        // ARE the pages a prefill wrote, so the reused KV is bit-identical and
+        // counts toward `prefilled_len`. The final logits are not: the divergent
+        // tail is prefilled at a different token count than a cold run would
+        // use, and the GEMM tile depends on that count. Greedy output can
+        // therefore flip on near-tied logits depending on cache state — that is
+        // why `forge bench` refuses to measure with the cache enabled.
         seq.tokens = prompt[..shared].to_vec();
         seq.prefilled_len = shared;
         // The single-stream decode path re-uploads the page table when a

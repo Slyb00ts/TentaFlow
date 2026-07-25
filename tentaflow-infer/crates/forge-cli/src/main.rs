@@ -321,8 +321,11 @@ enum Command {
         /// set explicitly.
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
-        /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
-        #[arg(long = "prefix-cache", default_value = "on")]
+        /// Radix-tree prefix caching (SPEC §5.2): on | off. Domyślnie OFF,
+        /// inaczej niż w `serve`: kolejne powtórzenia trafiałyby w cache i
+        /// przeliczały tylko rozbieżny ogon promptu, więc raportowany prefill
+        /// byłby zawyżony. Trafienie w cache kończy benchmark błędem.
+        #[arg(long = "prefix-cache", default_value = "off")]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
         /// Włączenie wymusza `--prefix-cache off`.
@@ -1482,11 +1485,24 @@ fn cmd_serve(
 /// emits `Token` for non-empty decoded pieces, so UTF-8/stop-holdback in the
 /// stream decoder can shift it a decode step or two past the true first
 /// sampled token.
+/// Wynik jednego przebiegu żądania. `cache_read_tokens` jest tu celowo
+/// widoczny: benchmark musi wiedzieć, ile tokenów promptu NIE zostało
+/// policzonych, bo inaczej raportuje przepustowość prefillu za prompt, którego
+/// nigdy nie przeliczył.
+struct DrainOutcome {
+    generated: usize,
+    prompt_tokens: usize,
+    cache_read_tokens: usize,
+    first_token_at: Instant,
+    done_at: Instant,
+    benchmark: Option<BenchmarkTimings>,
+}
+
 fn drain_request(
     engine: &EngineHandle,
     req: EngineRequest,
     mut on_token: impl FnMut(u32, &str),
-) -> Result<(usize, usize, Instant, Instant, Option<BenchmarkTimings>)> {
+) -> Result<DrainOutcome> {
     let rx = engine.submit(req).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut first_token_at = None;
     loop {
@@ -1498,17 +1514,19 @@ fn drain_request(
             EngineEvent::Done {
                 tokens,
                 prompt_tokens,
+                cache_read_tokens,
                 benchmark,
                 ..
             } => {
                 let done_at = Instant::now();
-                return Ok((
-                    tokens,
+                return Ok(DrainOutcome {
+                    generated: tokens,
                     prompt_tokens,
-                    first_token_at.unwrap_or(done_at),
+                    cache_read_tokens,
+                    first_token_at: first_token_at.unwrap_or(done_at),
                     done_at,
                     benchmark,
-                ));
+                });
             }
             EngineEvent::Error(msg) => bail!("engine error: {msg}"),
         }
@@ -1551,7 +1569,7 @@ fn cmd_run(
         Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false, None)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true, None)?;
 
     let prompt_text = if chat {
         ChatTemplateEngine::new()
@@ -1584,7 +1602,7 @@ fn cmd_run(
     )?;
 
     let submit_at = Instant::now();
-    let (generated, prompt_len, _first, done_at, _) = drain_request(
+    let outcome = drain_request(
         &engine,
         EngineRequest {
             prompt_tokens,
@@ -1605,10 +1623,12 @@ fn cmd_run(
         },
     )?;
     println!();
-    let dt = done_at.duration_since(submit_at).as_secs_f32();
+    let dt = outcome.done_at.duration_since(submit_at).as_secs_f32();
     eprintln!(
-        "{prompt_len} prompt + {generated} generated in {dt:.2}s ({:.1} tok/s overall)",
-        (prompt_len + generated) as f32 / dt
+        "{} prompt + {} generated in {dt:.2}s ({:.1} tok/s overall)",
+        outcome.prompt_tokens,
+        outcome.generated,
+        (outcome.prompt_tokens + outcome.generated) as f32 / dt
     );
     Ok(())
 }
@@ -1719,7 +1739,9 @@ fn report_fp8_pool_shortfall(
     );
 }
 
-/// `auto_gguf_fp8` (serve only): with FORGE_GEMM unset, a dense GGUF model on
+/// `auto_gguf_fp8` (serve, run, bench — everything except `ppl`, which is a
+/// quality gate documented to run exactly the GEMM `FORGE_GEMM` names): with
+/// FORGE_GEMM unset, a dense GGUF model on
 /// an fp8-native device whose projection shapes all have committed Modular fp8
 /// instances gets the fp8mod prefill automatically (near-lossless, ~2× the
 /// native int8 prefill); `FORGE_GEMM=mojo` keeps the native path explicitly.
@@ -1852,7 +1874,7 @@ fn cmd_bench(
         resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false, None)?;
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true, None)?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
     let (prompt_ids, prompt_sha256, prompt_source) = if let Some(path) = prompt_token_ids {
@@ -1939,7 +1961,7 @@ fn cmd_bench(
         let submit_at = Instant::now();
         let mut generated_ids = Vec::with_capacity(tokens);
         // No EOS ids: the benchmark must decode exactly `tokens` tokens.
-        let (generated, prompt_len, first_at, done_at, profile) = drain_request(
+        let outcome = drain_request(
             &engine,
             EngineRequest {
                 prompt_tokens: prompt_ids.clone(),
@@ -1955,6 +1977,23 @@ fn cmd_bench(
             },
             |id, _| generated_ids.push(id),
         )?;
+        let DrainOutcome {
+            generated,
+            prompt_tokens: prompt_len,
+            cache_read_tokens,
+            first_token_at: first_at,
+            done_at,
+            benchmark: profile,
+        } = outcome;
+        // Prefill mierzy się po PEŁNYM promptcie. Trafienie w cache prefiksów
+        // przelicza tylko rozbieżny ogon, a czas nadal dzielilibyśmy przez całą
+        // długość promptu — stąd zawyżone tok/s (zmierzone 44 537 zamiast 14 775
+        // na Mistralu-7B Q4_K_M). Dlatego to błąd, nie ostrzeżenie.
+        if cache_read_tokens != 0 {
+            bail!(
+                "cache prefiksów obsłużył {cache_read_tokens} z {prompt_len} tokenów promptu w powtórzeniu {rep}; przepustowość prefillu byłaby zawyżona — uruchom benchmark z --prefix-cache off"
+            );
+        }
         let run_sha256 = bench::sha256_ids(&generated_ids);
         if let Some(expected) = &generated_sha256 {
             if expected != &run_sha256 {
