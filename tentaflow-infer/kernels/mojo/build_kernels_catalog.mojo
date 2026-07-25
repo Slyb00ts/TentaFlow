@@ -133,8 +133,11 @@ from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
 from src.gemm_dot import (
     gemm_f16_dot2_64x64,
     gemm_f16_dot2_128x64,
-    gemm_f16_dot2_128x128_t512,
-    gemm_f16_dot2_192x128_t768,
+    gemm_f16_dot2_128x128,
+    gemm_f16_dot2_256x64,
+    gemm_q8_0_dot4_64x64,
+    gemm_q8_0_dot4_128x64,
+    gemm_q8_0_dot4_128x128,
 )
 from src.q8_0_batch import (
     gemm_q8_0_i8mma_b2,
@@ -1689,15 +1692,25 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemm_f16_dot2_128x64"))
     _ = ctx.compile_function[
-        gemm_f16_dot2_128x128_t512,
-        dump_asm=Path("gemm_f16_dot2_128x128_t512.ptx"),
+        gemm_f16_dot2_128x128, dump_asm=Path("gemm_f16_dot2_128x128.ptx")
     ]()
-    entries.append(_finalize(out_dir, "gemm_f16_dot2_128x128_t512"))
+    entries.append(_finalize(out_dir, "gemm_f16_dot2_128x128"))
     _ = ctx.compile_function[
-        gemm_f16_dot2_192x128_t768,
-        dump_asm=Path("gemm_f16_dot2_192x128_t768.ptx"),
+        gemm_f16_dot2_256x64, dump_asm=Path("gemm_f16_dot2_256x64.ptx")
     ]()
-    entries.append(_finalize(out_dir, "gemm_f16_dot2_192x128_t768"))
+    entries.append(_finalize(out_dir, "gemm_f16_dot2_256x64"))
+    _ = ctx.compile_function[
+        gemm_q8_0_dot4_64x64, dump_asm=Path("gemm_q8_0_dot4_64x64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_dot4_64x64"))
+    _ = ctx.compile_function[
+        gemm_q8_0_dot4_128x64, dump_asm=Path("gemm_q8_0_dot4_128x64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_dot4_128x64"))
+    _ = ctx.compile_function[
+        gemm_q8_0_dot4_128x128, dump_asm=Path("gemm_q8_0_dot4_128x128.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_dot4_128x128"))
 
     _ = ctx.compile_function[
         gemm_q8_0_f16_bm64, dump_asm=Path("gemm_q8_0_f16_bm64.ptx")

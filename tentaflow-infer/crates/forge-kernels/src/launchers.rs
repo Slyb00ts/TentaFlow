@@ -6285,9 +6285,8 @@ impl Kernels {
     /// ale degraduje do dwóch FMA i służy tylko do porównań).
     ///
     /// Wybór kafla wynika ze zmierzonych na gfx1030 przepustowości (patrz
-    /// `docs/STATUS.md`): 192x128 wygrywa dla dużych kształtów, a przy małej
-    /// liczbie tokenów pełny kafel po M byłby w większości odrzuconym
-    /// obliczeniem, więc schodzimy na węższy.
+    /// `docs/STATUS.md`), a przy małej liczbie tokenów schodzimy na węższy kafel,
+    /// bo pełny byłby w większości odrzuconym obliczeniem.
     fn gemm_dot2_tile(
         &self,
         rows: usize,
@@ -6300,10 +6299,10 @@ impl Kernels {
             ("gemm_f16_dot2_64x64", 64, 64, 256)
         } else if n_tokens <= 128 {
             ("gemm_f16_dot2_128x64", 128, 64, 512)
-        } else if n_tokens < 192 {
-            ("gemm_f16_dot2_128x128_t512", 128, 128, 512)
+        } else if n_tokens >= 256 && rows >= 2048 {
+            ("gemm_f16_dot2_256x64", 256, 64, 256)
         } else {
-            ("gemm_f16_dot2_192x128_t768", 192, 128, 768)
+            ("gemm_f16_dot2_128x128", 128, 128, 256)
         })
     }
 
@@ -8185,6 +8184,32 @@ impl Kernels {
             return self.device.launch(kernel, &cfg, &args, stream);
         }
 
+        // Karty bez jednostki macierzowej: kafel int8 na `v_dot4_i32_i8`.
+        if let Some((name, bm, bn, threads)) =
+            self.gemm_dot4_tile(kernel_base, output_f32, rows, n_tokens)
+        {
+            let gk = self.artifacts.get(name)?;
+            let cfg = LaunchConfig {
+                grid: (
+                    (rows as u32).div_ceil(bn),
+                    (n_tokens as u32).div_ceil(bm),
+                    1,
+                ),
+                block: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let args = LaunchArgs::new()
+                .buf(y)
+                .buf_at(w, w_byte_off)?
+                .buf(xq)
+                .buf(xd)
+                .buf(xsm)
+                .scalar(cols as i64)
+                .scalar(rows as i64)
+                .scalar(n_tokens as i64);
+            return self.device.launch(gk, &cfg, &args, stream);
+        }
+
         let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
         let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
         let cfg = LaunchConfig {
@@ -8206,6 +8231,35 @@ impl Kernels {
             .scalar(rows as i64)
             .scalar(n_tokens as i64);
         self.device.launch(gk, &cfg, &args, stream)
+    }
+
+    /// Kafel `gemm_*_dot4` dla kart bez jednostki macierzowej, albo `None` na
+    /// NVIDII i dla formatów, których kafel int8 jeszcze nie obsługuje — wtedy
+    /// wołający zgłosi brak kernela rodziny i8mma, co jest właściwym błędem.
+    ///
+    /// Kafel dobrany pomiarem na gfx1030 (4096x4096, T=1024): 128x128 daje
+    /// 35 TOPS, 128x64 32, a 64x64 29 i jest potrzebny tylko dla wąskich
+    /// kształtów, gdzie większy kafel liczy głównie odrzucane wiersze.
+    fn gemm_dot4_tile(
+        &self,
+        kernel_base: &str,
+        output_f32: bool,
+        rows: usize,
+        n_tokens: usize,
+    ) -> Option<(&'static str, u32, u32, u32)> {
+        if self.device.caps().vendor == forge_types::Vendor::Nvidia {
+            return None;
+        }
+        if output_f32 || kernel_base != "gemm_q8_0_i8mma" {
+            return None;
+        }
+        Some(if n_tokens <= 64 || rows < 128 {
+            ("gemm_q8_0_dot4_64x64", 64, 64, 256)
+        } else if n_tokens <= 128 {
+            ("gemm_q8_0_dot4_128x64", 128, 64, 512)
+        } else {
+            ("gemm_q8_0_dot4_128x128", 128, 128, 512)
+        })
     }
 
     /// Tile selection for the i8mma GEMM: `(suffix, BM, BN, block_threads)`.

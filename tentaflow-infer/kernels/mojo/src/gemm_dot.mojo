@@ -37,7 +37,7 @@ from std.gpu import block_idx, thread_idx
 from std.gpu.sync import barrier
 from std.memory import stack_allocation
 from std.gpu.memory import AddressSpace
-from src.arch_dot import dot2_f16
+from src.arch_dot import dot2_f16, dot4_i8
 
 comptime BK = 32  # kolumny na etap
 comptime KSTEP = 8  # połówki wczytywane z pamięci globalnej jednym odczytem
@@ -54,7 +54,10 @@ def _load_tile[
     row_limit: Int,
     lrow: Int,
     kc: Int,
-    mut regs: InlineArray[SIMD[DType.float16, KSTEP], ROWS // (NT // 4)],
+    mut regs: InlineArray[
+        SIMD[DType.float16, KSTEP],
+        (ROWS + (NT // 4) - 1) // (NT // 4),
+    ],
 ):
     """Wczytuje kafel ROWS x BK z pamięci globalnej do rejestrów (4 wątki/wiersz).
 
@@ -64,18 +67,21 @@ def _load_tile[
     zapisywane.
     """
     comptime ROWS_PER_PASS = NT // 4
-    comptime PASSES = ROWS // ROWS_PER_PASS
+    comptime PASSES = (ROWS + ROWS_PER_PASS - 1) // ROWS_PER_PASS
 
     comptime for pass_id in range(PASSES):
-        var global_row = base_row + lrow + pass_id * ROWS_PER_PASS
-        if global_row > row_limit - 1:
-            global_row = row_limit - 1
-        if k0 + kc + KSTEP <= n_cols:
-            regs[pass_id] = (src + global_row * n_cols + k0 + kc).load[
-                width=KSTEP
-            ]()
-        else:
-            regs[pass_id] = SIMD[DType.float16, KSTEP](0.0)
+        # Gdy kafel jest węższy niż jedno przejście (np. BN=128 przy 768
+        # wątkach), część wątków nie ma czego wnosić i tylko pomija zapis.
+        if lrow + pass_id * ROWS_PER_PASS < ROWS:
+            var global_row = base_row + lrow + pass_id * ROWS_PER_PASS
+            if global_row > row_limit - 1:
+                global_row = row_limit - 1
+            if k0 + kc + KSTEP <= n_cols:
+                regs[pass_id] = (src + global_row * n_cols + k0 + kc).load[
+                    width=KSTEP
+                ]()
+            else:
+                regs[pass_id] = SIMD[DType.float16, KSTEP](0.0)
 
 
 @always_inline
@@ -87,7 +93,10 @@ def _store_tile[
     ],
     lrow: Int,
     kc: Int,
-    regs: InlineArray[SIMD[DType.float16, KSTEP], ROWS // (NT // 4)],
+    regs: InlineArray[
+        SIMD[DType.float16, KSTEP],
+        (ROWS + (NT // 4) - 1) // (NT // 4),
+    ],
 ):
     """Rozkłada wczytany kafel do LDS w układzie `tile[k/2][row][k%2]`.
 
@@ -97,15 +106,16 @@ def _store_tile[
     która czyta z LDS kilkadziesiąt razy więcej.
     """
     comptime ROWS_PER_PASS = NT // 4
-    comptime PASSES = ROWS // ROWS_PER_PASS
+    comptime PASSES = (ROWS + ROWS_PER_PASS - 1) // ROWS_PER_PASS
 
     comptime for pass_id in range(PASSES):
         row = lrow + pass_id * ROWS_PER_PASS
-        comptime for pair in range(KSTEP // 2):
-            kp = kc // 2 + pair
-            (dst + kp * (ROWS * 2) + row * 2).store[width=2, alignment=4](
-                regs[pass_id].slice[2, offset = pair * 2]()
-            )
+        if row < ROWS:
+            comptime for pair in range(KSTEP // 2):
+                kp = kc // 2 + pair
+                (dst + kp * (ROWS * 2) + row * 2).store[width=2, alignment=4](
+                    regs[pass_id].slice[2, offset = pair * 2]()
+                )
 
 
 def gemm_f16_dot2_impl[BM: Int, BN: Int, TM: Int, TN: Int](
@@ -127,8 +137,8 @@ def gemm_f16_dot2_impl[BM: Int, BN: Int, TM: Int, TN: Int](
     comptime TILE = BM * BK
     comptime WTILE = BN * BK
     comptime ROWS_TX = BN // TN
-    comptime X_PASSES = BM // (NT // 4)
-    comptime W_PASSES = BN // (NT // 4)
+    comptime X_PASSES = (BM + (NT // 4) - 1) // (NT // 4)
+    comptime W_PASSES = (BN + (NT // 4) - 1) // (NT // 4)
 
     tid = Int(thread_idx.x)
     row0 = Int(block_idx.x) * BN
@@ -199,8 +209,183 @@ def gemm_f16_dot2_impl[BM: Int, BN: Int, TM: Int, TN: Int](
                     y[t * n_rows + row] = Float16(acc[m * TN + r])
 
 
+# Instancje wybrane pomiarem na gfx1030 (4096x4096, T=1024): 256x64 i 128x128
+# dają 23 TFLOPS, 128x64 22, a 64x64 16 — ten ostatni jest jednak potrzebny dla
+# małych kształtów, gdzie duży kafel to w większości odrzucone obliczenia.
 comptime gemm_f16_dot2_64x64 = gemm_f16_dot2_impl[64, 64, 4, 4]
 comptime gemm_f16_dot2_128x64 = gemm_f16_dot2_impl[128, 64, 8, 4]
 comptime gemm_f16_dot2_128x128 = gemm_f16_dot2_impl[128, 128, 8, 8]
-comptime gemm_f16_dot2_128x128_t512 = gemm_f16_dot2_impl[128, 128, 8, 4]
-comptime gemm_f16_dot2_192x128_t768 = gemm_f16_dot2_impl[192, 128, 8, 4]
+comptime gemm_f16_dot2_256x64 = gemm_f16_dot2_impl[256, 64, 8, 8]
+
+
+@always_inline
+def _q8_0_row_block(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    blocks_per_row: Int,
+    blk: Int,
+) -> UnsafePointer[UInt8, MutAnyOrigin]:
+    """Adres bloku `block_q8_0` (34 B: skala f16 + 32 kody int8) danego wiersza."""
+    return w + (row * blocks_per_row + blk) * 34
+
+
+def gemm_q8_0_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Q8_0 GEMM na `v_dot4_i32_i8`: Y[t, r] = dot(w[r], x[t]).
+
+    Aktywacja jest wcześniej skwantowana przez `quantize_act_q8_1` (kody int8
+    `xq` w układzie [T, K], skale `xd` w układzie blok-major [K/32, T]); `xsm`
+    jest w sygnaturze dla zgodności z rodziną i8mma i nie jest tu potrzebne, bo
+    Q8_0 jest symetryczne. Wagi czytamy WPROST z bajtów GGUF, bez przepakowania.
+
+    Iloczyny sumują się w int32 w obrębie 32-kolumnowego bloku kwantyzacji i
+    dopiero potem są skalowane do f32 — dokładnie jak w MMQ. `KB` mówi, ile
+    bloków wchodzi do LDS na jeden etap: bariera przypada raz na KB*32 kolumn,
+    więc większe KB rozcieńcza koszt synchronizacji.
+
+    Siatka (ceil(rows/BN), ceil(T/BM)), blok (BM/TM)*(BN/TN) wątków,
+    `n_cols % 32 == 0` (niezmiennik formatu Q8_0).
+    """
+    comptime NT = (BM // TM) * (BN // TN)
+    comptime ROWS_TX = BN // TN
+    comptime X_PASSES = (BM + (NT // 4) - 1) // (NT // 4)
+    comptime W_PASSES = (BN + (NT // 4) - 1) // (NT // 4)
+    comptime XPLANE = BM * 32  # bajty jednego bloku: 8 czwórek k x BM x 4
+    comptime WPLANE = BN * 32
+
+    tid = Int(thread_idx.x)
+    row0 = Int(block_idx.x) * BN
+    t0 = Int(block_idx.y) * BM
+    blocks_per_row = n_cols // 32
+
+    xs = stack_allocation[
+        KB * XPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    ws = stack_allocation[
+        KB * WPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        KB * BM, Float32, address_space = AddressSpace.SHARED
+    ]()
+    wds = stack_allocation[
+        KB * BN, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    lrow = tid // 4
+    kc = (tid % 4) * 8  # osiem kodów na wątek
+    tx = tid % ROWS_TX
+    ty = tid // ROWS_TX
+
+    var acc = InlineArray[Float32, TM * TN](fill=0.0)
+
+    var base_blk = 0
+    while base_blk < blocks_per_row:
+        comptime for kb in range(KB):
+            blk = base_blk + kb
+            live = blk < blocks_per_row
+
+            comptime for p in range(X_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BM:
+                    var token = t0 + local
+                    if token > n_tokens - 1:
+                        token = n_tokens - 1
+                    var bytes8 = SIMD[DType.int8, 8](0)
+                    if live:
+                        bytes8 = (
+                            xq + token * n_cols + blk * 32 + kc
+                        ).load[width=8]()
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            xs + kb * XPLANE + kq * (BM * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            bytes8.slice[4, offset = q * 4]()
+                        )
+
+            comptime for p in range(W_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BN:
+                    var row = row0 + local
+                    if row > n_rows - 1:
+                        row = n_rows - 1
+                    var codes = SIMD[DType.int8, 8](0)
+                    var scale: Float32 = 0.0
+                    if live:
+                        block_ptr = _q8_0_row_block(
+                            w, row, blocks_per_row, blk
+                        )
+                        codes = (block_ptr + 2 + kc).bitcast[Int8]().load[
+                            width=8
+                        ]()
+                        scale = Float32(block_ptr.bitcast[Float16]().load())
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            ws + kb * WPLANE + kq * (BN * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            codes.slice[4, offset = q * 4]()
+                        )
+                    if tid % 4 == 0:
+                        wds[kb * BN + local] = scale
+
+            if tid < BM:
+                var token = t0 + tid
+                if token > n_tokens - 1:
+                    token = n_tokens - 1
+                xds[kb * BM + tid] = xd[blk * n_tokens + token] if live else 0.0
+        barrier()
+
+        comptime for kb in range(KB):
+            xbase = xs + kb * XPLANE + ty * TM * 4
+            wbase = ws + kb * WPLANE + tx * TN * 4
+            var isum = InlineArray[Int32, TM * TN](fill=0)
+
+            comptime for kq in range(8):
+                av = (xbase + kq * (BM * 4)).bitcast[Int32]().load[
+                    width=TM, alignment=16
+                ]()
+                bv = (wbase + kq * (BN * 4)).bitcast[Int32]().load[
+                    width=TN, alignment=16
+                ]()
+
+                comptime for m in range(TM):
+                    comptime for r in range(TN):
+                        isum[m * TN + r] = dot4_i8(
+                            av[m], bv[r], isum[m * TN + r]
+                        )
+
+            comptime for m in range(TM):
+                dx = xds[kb * BM + ty * TM + m]
+                comptime for r in range(TN):
+                    acc[m * TN + r] += (
+                        dx
+                        * wds[kb * BN + tx * TN + r]
+                        * Float32(isum[m * TN + r])
+                    )
+        barrier()
+        base_blk += KB
+
+    comptime for m in range(TM):
+        t = t0 + ty * TM + m
+        if t < n_tokens:
+            comptime for r in range(TN):
+                row = row0 + tx * TN + r
+                if row < n_rows:
+                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+
+
+# KB dobrane pomiarem: dla kafla 128x128 dwa bloki na etap dają 35 TOPS wobec
+# 33 przy jednym, a cztery spadają do 14, bo LDS przestaje mieścić dwa
+# workgroupy na WGP. Mały kafel 64x64 ma zapas LDS i znosi KB=4.
+comptime gemm_q8_0_dot4_64x64 = gemm_q8_0_dot4_impl[64, 64, 4, 4, 4]
+comptime gemm_q8_0_dot4_128x64 = gemm_q8_0_dot4_impl[128, 64, 8, 4, 2]
+comptime gemm_q8_0_dot4_128x128 = gemm_q8_0_dot4_impl[128, 128, 8, 4, 2]
