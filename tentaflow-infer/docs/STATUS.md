@@ -145,6 +145,92 @@ Ostatnia aktualizacja: 2026-07-25.
   ML Studio w głównym repo) — 1 GB tekstu to u nas ~2,8 min jednowątkowo. Ale
   nawet tam przewaga jest mniejsza niż reklamowana, bo nasze 6 MB/s to jeden
   wątek, a maszyna ma 16 rdzeni. Dla FORGE: bez wartości.
+- ✅ **FORGE LICZY NA RADEONIE RX 6900 XT i bije llama.cpp w prefillu
+  (2026-07-25).** Pierwsza realna inferencja na tej karcie: qwen3-0.6B Q8_0
+  generuje spójny polski tekst, a prefill jest szybszy od llama.cpp na ROCm w
+  całym zakresie długości promptu, przy czym przewaga ROŚNIE z długością:
+
+  | prompt | FORGE prefill | llama.cpp | FORGE/llama.cpp |
+  |--:|--:|--:|--:|
+  | 512 | 14 929,7 tok/s | 11 090,0 | **1,35x** |
+  | 1024 | 14 913,7 tok/s | 7 827,3 | **1,91x** |
+  | 2048 | 11 144,2 tok/s | 5 687,9 | **1,96x** |
+
+  Decode: FORGE 302,3 / 277,5 / 250,9 tok/s (po promptach 512/1024/2048) wobec
+  llama.cpp 240,7. UWAGA METODOLOGICZNA: `llama-bench tg128` dekoduje z pustym
+  kontekstem, a FORGE po prompcie, więc porównanie decode jest przechylone NA
+  KORZYŚĆ llama.cpp — i FORGE i tak wychodzi 1,04-1,26x lepiej.
+  Prefill 14 914 tok/s to 17,8 TOPS efektywnie, czyli 18% zmierzonego pułapu
+  int8 karty; llama.cpp jest tam na 9,3 TOPS. Zapas do pułapu zostaje duży,
+  bo model 0,6B ma małe GEMM-y i dominuje narzut warstw poza GEMM.
+- ✅ **Kafel GEMM bez jednostki macierzowej — `src/gemm_dot.mojo` (2026-07-25).**
+  Rodzina `gemm_*` w `gemm.mojo` stoi na kontrakcie fragmentów `mma.m16n8k16` +
+  `ldmatrix`. Tego NIE DA SIĘ sensownie emulować: rozkład fragmentów rozrzuca
+  A i B po lane'ach tak, że wątek nie ma danych na własny wynik, więc emulacja
+  wymagałaby instrukcji cross-lane droższych niż zysk. Zamiast tego zmieniona
+  jest DEKOMPOZYCJA: wątek trzyma własny kafel wyjścia TM x TN w rejestrach i
+  czyta swoje wiersze z LDS. Trzy rzeczy zdecydowały o wydajności:
+  1. **Układ LDS parami/czwórkami k, wiersze ciągłe** (`tile[k/2][row][k%2]`).
+     Przy układzie wiersz-major lane czytał 16 B ze skokiem 320 B, czyli fala
+     trafiała w 8 z 32 banków. Po zmianie fala czyta jeden ciągły blok:
+     **14 -> 24 TFLOPS** na tej samej matematyce. To był największy pojedynczy
+     zysk w całej pracy nad tym kernelem.
+  2. **>= 8 niezależnych akumulatorów** (wymóg z rooflinu, patrz niżej).
+  3. **Ręczne podwójne buforowanie** — RDNA2 nie ma `cp.async`, więc kafel
+     następnego etapu jedzie najpierw do rejestrów.
+  Zmierzone (gfx1030, 4096x4096, T=1024, wszystkie warianty przechodzą kontrolę
+  poprawności wobec referencji hosta):
+
+  | kernel | najlepszy kafel | wynik | pułap karty |
+  |---|---|--:|--:|
+  | `gemm_f16_dot2` | 128x128 / 256 wątków | 23 TFLOPS | 49 TFLOPS |
+  | `gemm_q8_0_dot4` | 128x128 / KB=2 | 35 TOPS | 97 TOPS |
+  | `gemm_q4_k_dot4` | 128x64 / KB=2 | 32 TOPS | 97 TOPS |
+
+  Pułapka, którą złapałem na sobie: kafel 192x128 przy 768 wątkach wychodził
+  „najszybszy" (26 TFLOPS), bo `W_PASSES = BN/(NT/4)` dawało ZERO i kernel wcale
+  nie wnosił wag. Staging jest teraz uogólniony na kafle węższe niż jedno
+  przejście, a każdy mierzony wariant ma kontrolę poprawności — bez tego
+  benchmark mierzy nieprawidłowy kernel i nikt tego nie widzi.
+- ✅ **Wybór backendu GPU w czasie działania (2026-07-25).** `forge_hal::gpu`
+  jest jedynym miejscem, które wie, czy pod spodem jest CUDA czy HIP: pyta
+  sterowniki o urządzenie i zwraca `Arc<dyn Device>`; `FORGE_DEVICE=cuda|hip`
+  przypina wybór. CLI nie konstruuje już `CudaDevice` w sześciu miejscach.
+  Jedna binarka obsługuje obie karty, bo cudarc ładuje sterownik dynamicznie.
+- ✅ **Katalog kerneli publikuje częściowy zestaw dla architektury w porcie
+  (2026-07-25).** `FORGE_KERNEL_BUILD_PARTIAL=1` zapisuje to, co się kompiluje,
+  plus listę `unsupported.txt`. Brakujący kernel zgłasza się przy uruchomieniu
+  (`kernel not loaded: <nazwa>`), więc niepełny zestaw jest widoczny, a nie
+  cichy. Dla gfx1030: **347 z 481 kerneli**.
+- ✅ **Attention prefill wybiera ścieżkę po DOSTĘPNOŚCI, nie po producencie
+  (2026-07-25).** Flash-attention w Mojo stoi na `mma`, więc na gfx1030 nie ma
+  go w katalogu; domyślny wybór sprawdza teraz artefakt i schodzi na przenośny
+  kernel skalarny (`AttnBackend::Scalar`), który jest zarazem bitową referencją.
+  To był ostatni brakujący element, żeby prefill przeszedł end-to-end.
+- 🐞 **OTWARTY DEFEKT: sterta hosta psuje się przy rozbiórce procesu na ścieżce
+  AMD (2026-07-25).** Po WYPISANIU wyników `forge bench` proces kończy się
+  `double free or corruption` z wnętrza `libamdhip64` (SIGABRT w wątku
+  roboczym). Co wiem: (a) wyniki przed tym są stabilne przez 5 powtórzeń i
+  tekst jest spójny, więc nie wygląda na psucie żywych danych; (b) izolowany
+  test `whole_catalog_loads_and_unloads` ładuje i zwalnia wszystkie 347 modułów
+  BEZ błędu; (c) występuje też wtedy, gdy przebieg kończy się wcześnie błędem,
+  czyli nie wymaga grafów ani decode; (d) ślad ma wyłącznie ramki ROCm.
+  Nie jest to jeszcze zdiagnozowane i NIE WOLNO tego traktować jako kosmetyki,
+  dopóki nie zostanie znalezione — brak valgrinda na tej maszynie utrudnia
+  namiar; następny krok to build z ASan albo bisekcja w teście HIP.
+- ✅ **DWA BŁĘDY CZASU ŻYCIA W BACKENDZIE HIP — obie ścieżki były SIGSEGV
+  (2026-07-25).** Silnik wywracał się na PIERWSZYM uruchomieniu kernela, w
+  środku `hipModuleLaunchKernel`. Przyczyna: `KernelHandle` nie trzymał modułu,
+  a rejestr kerneli przechowuje TYLKO uchwyty — `Drop` modułu robił
+  `hipModuleUnload` natychmiast po pobraniu uchwytu, więc każdy launch szedł po
+  wskaźniku do zwolnionego kodu. Na CUDA problemu nie było, bo cudarc trzyma
+  moduł wewnątrz uchwytu funkcji. Naprawa: `ModuleImpl::kernel` przyjmuje
+  `self: Arc<Self>`, a `HipKernel` zatrzymuje `Arc<HipModule>`. Drugi, pokrewny:
+  moduł trzyma teraz WŁASNĄ kopię obrazu code objectu, bo `hipModuleLoadData`
+  nie gwarantuje skopiowania bufora wołającego. Test `mojo_artifact_launches`
+  pilnuje obu (uruchamia kernel z artefaktu Mojo po porzuceniu `Module`, z wątku
+  roboczego) — kontrakt generator artefaktów <-> backend ma własny test, bo
+  wcześniejszy test z `hipcc` przechodził i niczego nie wyłapał.
 - ✅ **Roofline gfx1030 zmierzony w Mojo; ILP okazało się warunkiem pomiaru
   (2026-07-25).** Pierwsze mikrobenchmarki miały po cztery niezależne łańcuchy
   akumulacji i pokazywały DOKŁADNIE POŁOWĘ pułapu karty — VALU RDNA2 ma
