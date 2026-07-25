@@ -97,11 +97,13 @@ międzykartowe: RTX 4090 robi na nim 13 367 tok/s prefillu i 158,4 tok/s decode,
 czyli 6900 XT jest 10,7x i 4,8x wolniejszy. Prefill 1 246 tok/s to 18,1 TOPS
 efektywnie wobec 25,1 TOPS Mistrala na tej samej karcie — różnica idzie z
 rozpakowywania e2m1 (kafel NVFP4 mierzy 24 TOPS w izolacji, Q4_K 32).
-DECODE JEST NIEDOMIARem: 32,7 tok/s przy modelu 4,1 GB to 134 GB/s, czyli 35%
-pasma, gdy Mistral o tym samym rozmiarze osiąga 71%. Ścieżka gemv NVFP4 czyta
-wartości przez LUT w LDS (jedno odczytanie na element), a szybka ścieżka
-CT-S0 N64/K128 jest na tej karcie wyłączona, bo brakuje jej kafli. To jest
-najbliższy do zamknięcia zapas na AMD.
+DECODE: 32,7 tok/s przy 4,2 GB wag to 137 GB/s wobec 226 GB/s pasma
+strumieniowego karty (Mistral osiąga tam 288 GB/s, bo część jego ruchu trafia
+w 128 MB Infinity Cache). Zmierzone rozbicie: same gemv-y projekcji kosztują
+20 z 28,7 ms i chodzą po 192 GB/s, czyli 97% tego, co osiąga czysty odczyt tych
+samych bajtów — kernel NVFP4 jest ograniczony pamięcią, nie dekodowaniem, i jest
+tylko ~10% wolniejszy od Q4_K. Zapas leży w pozostałych ~30% kroku, poza
+gemv-ami, i bez profilera (brak rocprof na tej maszynie) nie da się go przypisać.
 
 Prefill: **1,90x** i **1,33x**. Decode: 1,16x i 0,85x. Przewaga w prefillu rośnie
 z długością promptu (qwen: 1,35x przy p512, 1,90x przy p1024, 1,96x przy p2048)

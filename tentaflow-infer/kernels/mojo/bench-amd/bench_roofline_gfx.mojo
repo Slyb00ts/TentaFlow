@@ -7,7 +7,11 @@ from std.gpu.host import DeviceContext
 from std.gpu import block_idx, thread_idx, block_dim
 from std.time import perf_counter_ns
 
-comptime N = 1 << 26          # 64M f32 = 256 MiB
+# PUŁAPKA: 256 MiB to dokładnie granica 128 MB Infinity Cache tej karty, więc
+# pomiar na takim buforze mieszał cache z DRAM i dawał niestabilne 386-395 GB/s.
+# Realny stream mierzymy na 1 GiB, a pojemność cache raportujemy osobno.
+comptime N = 1 << 28          # 256M f32 = 1 GiB
+comptime N_CACHE = 1 << 24    # 16M f32 = 64 MiB, mieści się w Infinity Cache
 comptime ITERS = 20
 
 def stream_read(dst: UnsafePointer[Float32, MutAnyOrigin], src: UnsafePointer[Float32, MutAnyOrigin], n: Int):
@@ -54,7 +58,18 @@ def main() raises:
         ctx.enqueue_function[stream_read](dst.unsafe_ptr(), src.unsafe_ptr(), N, grid_dim=(grid,), block_dim=BLK)
     ctx.synchronize()
     dt = Float64(perf_counter_ns() - t0) / 1e9 / ITERS
-    print("odczyt HBM:", Int(Float64(N * 4) / dt / 1e9), "GB/s")
+    print("odczyt DRAM (1 GiB):", Int(Float64(N * 4) / dt / 1e9), "GB/s")
+
+    cgrid = (N_CACHE // 4) // BLK
+    for _ in range(3):
+        ctx.enqueue_function[stream_read](dst.unsafe_ptr(), src.unsafe_ptr(), N_CACHE, grid_dim=(cgrid,), block_dim=BLK)
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[stream_read](dst.unsafe_ptr(), src.unsafe_ptr(), N_CACHE, grid_dim=(cgrid,), block_dim=BLK)
+    ctx.synchronize()
+    dt = Float64(perf_counter_ns() - t0) / 1e9 / ITERS
+    print("odczyt z Infinity Cache (64 MiB):", Int(Float64(N_CACHE * 4) / dt / 1e9), "GB/s")
 
     threads = 80 * 32 * 256
     fgrid = threads // BLK

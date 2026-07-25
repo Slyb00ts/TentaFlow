@@ -352,7 +352,8 @@ Ostatnia aktualizacja: 2026-07-25.
 
   | pomiar | 4 łańcuchy | **8 łańcuchów** | teoretyczny szczyt |
   |---|--:|--:|--:|
-  | odczyt HBM | — | **226 GB/s** (patrz niżej) | ~512 GB/s |
+  | odczyt DRAM (1 GiB) | — | **221 GB/s** | ~512 GB/s |
+  | odczyt z Infinity Cache (64 MiB) | — | **1 596 GB/s** | — |
   | FP32 FMA | 18 TFLOPS | **25 TFLOPS** | ~23 TFLOPS |
   | f16 `v_dot2_f32_f16` | 25 TFLOPS | **49 TFLOPS** | ~46 TFLOPS |
   | int8 `v_dot4_i32_i8` | 50 TOPS | **97 TOPS** | ~92 TOPS |
