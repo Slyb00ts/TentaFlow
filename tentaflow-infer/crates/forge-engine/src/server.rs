@@ -2076,17 +2076,17 @@ fn mixed_gpu_group(
     }
 }
 
-/// Szerokość jednej hybrydowej grupy decode. Batchowe GEMM-y NVFP4 GGUF mają
-/// wyspecjalizowane kernele wyłącznie dla potęg dwójki, a szerokość 16 jest
-/// wśród nich niestrojona. Zmierzone na ThinkingCap-Qwen3.6-27B (RTX 4090,
-/// prompt 85, out 128): grupa 8 daje 70,8 tok/s, grupa 10 spada na generyczny
-/// dequant-GEMM i daje 37,5, a pełna grupa 16 — 39,5. Dlatego grupujemy po
-/// największej potędze dwójki nie większej niż osiem, a resztę bierzemy
-/// kolejnymi grupami.
+/// Szerokość jednej hybrydowej grupy decode. Każda szerokość 2..=16 trafia w
+/// strojony kernel NVFP4 GGUF (b2/b3/b4 dokładnie, 5..8 przez b8, 9..16 przez
+/// b16 — ten ostatni dopiero od dodania wariantu `_nvidia`; wcześniej szerokości
+/// 9..16 spadały na przenośny kernel i grupa 10 dawała 37,5 tok/s wobec 67,8 po
+/// naprawie). Powyżej 16 dispatch przechodzi na kafel MMA bm32, którego ta
+/// ścieżka nie ma zmierzonego, więc tam jest granica grupy.
+/// Zmierzone na ThinkingCap-Qwen3.6-27B (RTX 4090, prompt 85, out 128):
+/// C=6 69,1 · C=10 67,8 · C=12 68,9 · C=16 71,3 tok/s.
 fn hybrid_group_size(pending: usize) -> usize {
-    const MAX_GROUP: usize = 8;
-    let capped = pending.min(MAX_GROUP);
-    1usize << (usize::BITS - 1 - capped.leading_zeros())
+    const MAX_GROUP: usize = 16;
+    pending.min(MAX_GROUP)
 }
 
 fn decode_gpu_group(model: &mut Model, active: &mut [ActiveSeq<'_>], feed_idx: &[usize]) {

@@ -401,6 +401,7 @@ comptime gemm_nvfp4_gguf_out_f32_b1_nvidia = gemv_nvfp4_gguf_out_f32_nvidia
 comptime gemm_nvfp4_gguf_f16_b3_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[3]
 comptime gemm_nvfp4_gguf_f16_b4_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[4]
 comptime gemm_nvfp4_gguf_f16_b8_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[8]
+comptime gemm_nvfp4_gguf_f16_b16_nvidia = gemm_nvfp4_gguf_f16_nvidia_impl[16]
 comptime gemm_nvfp4_gguf_f16_b8 = gemm_nvfp4_gguf_f16_impl[8]
 comptime gemm_nvfp4_gguf_f16_b16 = gemm_nvfp4_gguf_f16_impl[16]
 comptime gemm_nvfp4_gguf_out_f32_b4 = gemm_nvfp4_gguf_out_f32_small_impl[4]

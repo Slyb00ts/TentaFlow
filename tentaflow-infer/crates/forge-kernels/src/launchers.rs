@@ -1023,6 +1023,12 @@ fn nvfp4_gguf_dispatch(
             warp_size.checked_mul(2),
         ),
         5..=8 => ("gemm_nvfp4_gguf_f16_b8", 8, 1, warp_size.checked_mul(8)),
+        9..=16 if is_nvidia && warp_size == 32 => (
+            "gemm_nvfp4_gguf_f16_b16_nvidia",
+            16,
+            2,
+            warp_size.checked_mul(2),
+        ),
         9..=16 => ("gemm_nvfp4_gguf_f16_b16", 16, 1, warp_size.checked_mul(16)),
         17..=32 if is_nvidia && warp_size == 32 => {
             ("gemm_nvfp4_gguf_mma_f16_bm32", 32, 64, Some(64))
@@ -1308,7 +1314,10 @@ fn hybrid_prefill_nvfp4_artifact_chunk_limit(
     )) {
         return 4;
     }
-    if !has("gemm_nvfp4_gguf_f16_b16") {
+    if !has(variant(
+        "gemm_nvfp4_gguf_f16_b16",
+        "gemm_nvfp4_gguf_f16_b16_nvidia",
+    )) {
         return 8;
     }
     if !nvidia_warp32 {
@@ -16505,7 +16514,7 @@ mod nvfp4_gguf_dispatch_tests {
         for (missing, expected) in [
             ("gemm_nvfp4_gguf_f16_b4_nvidia", 3),
             ("gemm_nvfp4_gguf_f16_b8_nvidia", 4),
-            ("gemm_nvfp4_gguf_f16_b16", 8),
+            ("gemm_nvfp4_gguf_f16_b16_nvidia", 8),
             ("gemm_nvfp4_gguf_mma_f16_bm32", 16),
             ("gemm_q8_0_i8mma_triplet_bm64", 16),
             ("deltanet_gated_scan_inplace_shared_d128_f16", 32),
@@ -17115,8 +17124,8 @@ mod nvfp4_gguf_dispatch_tests {
             (4, "gemm_nvfp4_gguf_f16_b4_nvidia", 64),
             (5, "gemm_nvfp4_gguf_f16_b8_nvidia", 64),
             (8, "gemm_nvfp4_gguf_f16_b8_nvidia", 64),
-            (9, "gemm_nvfp4_gguf_f16_b16", 512),
-            (16, "gemm_nvfp4_gguf_f16_b16", 512),
+            (9, "gemm_nvfp4_gguf_f16_b16_nvidia", 64),
+            (16, "gemm_nvfp4_gguf_f16_b16_nvidia", 64),
         ] {
             let dispatch = nvfp4_gguf_dispatch(tokens, 5120, false, true, 32, 1024).unwrap();
             assert_eq!(dispatch.kernel, expected);

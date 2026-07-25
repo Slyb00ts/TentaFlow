@@ -633,6 +633,10 @@
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_025e59e559bb9ddd",
       "file": "gemm_nvfp4_gguf_f16_b16.ptx"
     },
+    "gemm_nvfp4_gguf_f16_b16_nvidia": {
+      "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_896d5a4944a6df84",
+      "file": "gemm_nvfp4_gguf_f16_b16_nvidia.ptx"
+    },
     "gemm_nvfp4_gguf_f16_b1_nvidia": {
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_f1a19e6f26ea9df8",
       "file": "gemm_nvfp4_gguf_f16_b1_nvidia.ptx"

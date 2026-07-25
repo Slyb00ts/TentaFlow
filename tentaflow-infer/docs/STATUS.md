@@ -23,18 +23,26 @@ Ostatnia aktualizacja: 2026-07-25.
   `hybrid_batch_capable` (dawniej `..._b2_capable`), `ensure_batch(max_active)`
   zamiast `ensure_batch(2)`, a grupy dobiera `hybrid_group_size`.
   KLUCZOWE: szerokość grupy musi trafiać w kernel. Batchowe GEMM-y NVFP4 GGUF
-  mają wyspecjalizowane kernele tylko dla potęg dwójki, a szerokość 16 jest
-  niestrojona — zmierzone na RTX 4090 (prompt 85, out 128): grupa 8 daje
-  **70,8 tok/s**, grupa 10 spada na generyczny dequant-GEMM i daje **37,5**,
-  pełna grupa 16 — **39,5**. Dlatego `MAX_GROUP = 8`, a resztę kolejki biorą
-  kolejne grupy.
+  miały strojony wariant `_nvidia` dla b3/b4/b8, ale NIE dla b16 — więc każda
+  grupa 9..16 spadała na kernel przenośny. Zmierzone na RTX 4090 (prompt 85,
+  out 128): grupa 8 dawała **70,8 tok/s**, a grupa 10 albo 16 — **37,5** i
+  **39,5**. Brakująca instancja to jedna linia (`gemm_nvfp4_gguf_f16_b16_nvidia
+  = gemm_nvfp4_gguf_f16_nvidia_impl[16]` — szablon był już generyczny po
+  batchu), 64 rejestry, zero spilli. Po jej dodaniu klif zniknął: grupa 10 daje
+  **67,8**, grupa 16 — **71,3**, więc `hybrid_group_size` to po prostu
+  `pending.min(16)` bez zaokrąglania do potęgi dwójki. Powyżej 16 dispatch
+  przechodzi na kafel MMA bm32, niezmierzony dla tej ścieżki — tam jest granica.
+  Wariant `_nvidia` b16 zyskuje też każda inna ścieżka trafiająca w bucket
+  9..16 (weryfikator MTP, chunki prefillu hybrydy).
   A/B tym samym klientem (tokeny liczone z `usage` serwera, nie tokenizerem
   klienta): C=1 40,3→40,4 (bez regresji), C=4 50,9→**66,0** (1,30x),
-  C=8 50,8→**70,1** (1,38x), C=16 50,8→**70,0** (1,38x). Przepustowość jest
-  teraz płaska w C=8..16 zamiast przyklejonej do 51. Mediana opóźnienia przy
-  C=16 spadła z 51,8 s do 29,2 s. Bramki: `hybrid_state_pool_gpu` 32/32,
-  `forge-engine` 140/140, koherencja i self-konsystencja przy 8 równoległych
-  requestach. SUFIT: mixery są nadal serialne per lane i po tej zmianie
+  C=8 50,8→**70,1** (1,38x), C=16 50,8→**71,3** (1,40x). Pełna krzywa po
+  naprawie: C=6 69,1 · C=8 70,1 · C=10 67,8 · C=12 68,9 · C=16 71,3 — płaska,
+  zamiast przyklejonej do 51. Mediana opóźnienia przy C=16 spadła z 51,8 s do
+  28,7 s. Bramki: `hybrid_state_pool_gpu` 32/32, `forge-engine` 140/140,
+  `forge-kernels` golden 70/70, testy dispatchu zaktualizowane do nowego
+  routingu, koherencja i self-konsystencja przy 16 równoległych requestach
+  (cztery grupy po cztery identyczne prompty dały po jednym unikalnym wyjściu). SUFIT: mixery są nadal serialne per lane i po tej zmianie
   dominują krok — ich batchowanie to następny lever.
 - ✅ **`forge bench` mierzy pełny prefill i produkcyjną ścieżkę GEMM
   (2026-07-25).** Dwa niezależne defekty, oba zawyżały wynik. (1) Auto-fp8
