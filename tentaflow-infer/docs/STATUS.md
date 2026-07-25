@@ -167,7 +167,7 @@ Ostatnia aktualizacja: 2026-07-25.
   Prefill 14 914 tok/s to 17,8 TOPS efektywnie, czyli 18% zmierzonego pułapu
   int8 karty; llama.cpp jest tam na 9,3 TOPS. Zapas do pułapu zostaje duży,
   bo model 0,6B ma małe GEMM-y i dominuje narzut warstw poza GEMM.
-- 📊 **Kafle int8 sa w lokalnym optimum — siedem prob poprawy, wszystkie
+- 📊 **Kafle int8 sa w praktycznym optimum — trzynascie prob, wszystkie
   negatywne (2026-07-25).** Kafel `gemm_q8_0_dot4` (BM=BN=128, TM=8, TN=4, KB=2)
   daje 35-36 TOPS przy pulapie 97. Miks instrukcji na etap: 512 `v_dot4_i32_i8`,
   192 instrukcje epilogu skalowania, 144 `v_mov`, 48 `ds_read_b128` — czyli dot4
@@ -189,13 +189,35 @@ Ostatnia aktualizacja: 2026-07-25.
   | 256x128 TM8 TN8 KB2 | 14 |
   | 128x256 TM8 TN8 KB2 | 14 |
 
-  Hipoteza, ktora to napedzala — „wieksze TN zmniejsza bajty LDS na dot4” — jest
-  BLEDNA: wszystkie warianty TN=8 wypadaja 2,5x gorzej mimo mniejszego ruchu LDS.
-  Zrzut assemblera pokazuje 96 wobec 128 VGPR i ZERO spillow w obu, wiec to tez
-  nie presja rejestrow. Rzeczywisty mechanizm nie jest ustalony.
-  WNIOSEK: dalsze dostrajanie ksztaltu kafla nie da juz nic. Realna droga do
-  wyzszego wykorzystania to INNA DEKOMPOZYCJA (weight-stationary: wagi rezydentne
-  w rejestrach, strumien aktywacji), czyli osobny kernel, a nie modyfikacja tego.
+  Rozszerzony przeglad geometrii (ten sam ksztalt zadania):
+
+  | kafel | watki | wynik |
+  |---|--:|--:|
+  | 128x128 TM8 TN4 KB2 (obecny) | 512 | **36 TOPS** |
+  | 128x64 TM8 TN4 KB2 | 256 | 35 |
+  | 64x128 TM8 TN4 KB2 | 256 | 34 |
+  | 256x64 TM8 TN4 KB2 | 512 | 33 |
+  | 192x128 TM8 TN4 KB2 | 768 | 26 |
+  | 256x128 TM8 TN4 KB2 | 1024 | 24 |
+  | dowolny ksztalt z KB=4 | — | 13-14 |
+
+  Wynik trzyma sie 34-36 TOPS w szerokim pasmie geometrii i zalamuje dopiero
+  poza nim — to sygnatura zasobu, ktory sie wysyca niezaleznie od strojenia,
+  a nie zle dobranego kafla. Dwa ograniczenia dzialaja jednoczesnie:
+  - **Miks instrukcji**: dot4 to 56% wydawanych instrukcji, wiec sufit przy tym
+    rozkladzie to ~54 TOPS, nie 97.
+  - **Pamiec globalna**: przy BM=128 macierz wag jest czytana 8 razy (142 MB na
+    GEMM 4096x4096 przy T=1024), czyli 149 GB/s z ~220 GB/s pulapu DRAM.
+    Aktywacje (4 MB) mieszcza sie w Infinity Cache i nie licza sie do DRAM.
+  Wieksze BM zmniejsza ruch wag, ale blok 1024-watkowy zajmuje tyle slotow fal,
+  ze na WGP miesci sie tylko JEDEN i nic nie przykrywa bariery — netto gorzej.
+  ODRZUCONE DODATKOWO: programowe potokowanie odczytow LDS (podwojny bufor
+  rejestrowy, kolejny krok k ladowany przed policzeniem biezacego) — **34 wobec
+  35 TOPS**, bo latencja LDS jest juz ukryta zajetoscia; assembler potwierdza
+  wzorzec 3x ds_read -> s_waitcnt -> 32x dot4, ale ten stall nic nie kosztuje.
+  WNIOSEK: kafel jest w praktycznym optimum dla RDNA2. Dalszy zysk wymaga INNEJ
+  DEKOMPOZYCJI (mniej powtorzonych odczytow wag bez wzrostu bloku), a nie
+  kolejnego strojenia tego kernela.
 - 🔴 **KOREKTA: „386 GB/s pasma" było ZAWYŻONE — realny stream to ~226 GB/s
   (2026-07-25).** Benchmark rooflinu czytał bufor 256 MiB, czyli DOKŁADNIE na
   granicy 128 MB Infinity Cache, więc mierzył mieszankę cache i DRAM i dawał
