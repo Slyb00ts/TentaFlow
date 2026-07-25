@@ -79,6 +79,41 @@ Ostatnia aktualizacja: 2026-07-25.
   ten sam prompt greedy przy C=1 i C=6 daje teraz IDENTYCZNE wyjście (wcześniej
   ścieżki różniły się głową). Bramki: workspace 606/606, `batched_bielik`
   z paczkami FP8 2/2.
+- ✅ **Pule VRAM i grafy w backendzie HIP (2026-07-25).** `HipDevice::new`
+  przyjmuje `PoolSizes` i zajmuje z góry trzy pule z tą samą polityką co CUDA:
+  bump dla wag, slab dla KV, pierścień dla aktywacji. `PoolSizes` przeniesione
+  z `cuda.rs` do `lib.rs` z re-eksportem, więc 38 istniejących ścieżek
+  `forge_hal::cuda::PoolSizes` działa bez zmian. Wyczerpanie puli zwraca
+  typowany `OutOfMemory` (ta sama poprawka co w CUDA, żeby admission i tiering
+  go rozpoznały). Grafy działają przez `hipStreamBeginCapture` /
+  `hipStreamEndCapture` / `hipGraphInstantiate` / `hipGraphLaunch`, więc
+  `supports_graph_capture` raportuje już `true`. Test `hip_backend` **5/5**:
+  capability, roundtrip pamięci, ładowanie code objectu z uruchomieniem,
+  semantyka trzech aren (bump nie oddaje, pierścień oddaje po
+  `reset_activations`, slab zgłasza typowany OOM) oraz przechwycenie i dwa
+  odtworzenia grafu z kontrolą wyniku.
+- ✅ **llama.cpp na ROCm jako punkt odniesienia dla RDNA2 (2026-07-25).**
+  Zbudowany z `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1030`. PUŁAPKA: bez
+  `HIP_VISIBLE_DEVICES=0` llama.cpp widzi DWA urządzenia ROCm — dGPU i iGPU
+  Raphael (gfx1036) — próbuje rozłożyć model na oba i **zrzuca pamięć**.
+  Zmierzone (6900 XT, pp512/tg64, `-ngl 99`):
+
+  | model | prefill | decode |
+  |---|--:|--:|
+  | qwen3-0.6B Q8_0 | 10 974 tok/s | 241,0 tok/s |
+  | Mistral-7B Q4_K_M | 1 406 tok/s | 79,2 tok/s |
+
+  Porównanie z RTX 4090 (pp1024/tg128, więc orientacyjne): prefill jest **5,6x
+  gorszy** na qwen0.6B i **9,0x** na Mistralu, a decode tylko **2,7x** i
+  **2,3x**. To dokładnie profil karty bez jednostek macierzowych: decode jest
+  ograniczony pasmem (512 wobec 1008 GB/s, czyli ~2x), a prefill traci na braku
+  MMA. WNIOSEK DLA CELU: realny target FORGE na RDNA2 to parytet decode z
+  llama.cpp (79 tok/s Mistral, 241 qwen0.6B), a prefill będzie trudną częścią.
+- ❌ **vLLM nie wchodzi na tę kartę (2026-07-25).** Lokalny obraz
+  `vllm/vllm-openai:latest` to build CUDA (`torch 2.11.0+cu130`, `torch.version.hip`
+  = None), więc na ROCm nie uruchomi się w ogóle. Wariant `rocm/vllm` celuje w
+  CDNA (gfx90a/gfx942); RDNA2 nie jest wspierana. Do porównań na tej karcie
+  zostaje llama.cpp.
 - 🟡 **Backend HIP/ROCm — pierwszy pionowy przekrój działa (2026-07-25).**
   Maszyna zmieniła kartę na **Radeon RX 6900 XT (gfx1030, RDNA2)**, więc FORGE
   przestał startować (`CudaContext::new(0): CUDA_ERROR_NO_DEVICE`). Zweryfikowane
