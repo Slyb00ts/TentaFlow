@@ -6,25 +6,28 @@
 from std.gpu.host import DeviceContext
 from std.gpu import block_idx, thread_idx, block_dim
 from std.time import perf_counter_ns
-from std.gpu.intrinsics import inlined_assembly
+from src.arch_dot import dot4_i8
 
 comptime ITERS = 20
+# Osiem niezaleznych lancuchow akumulacji — ponizej tego progu pomiar jest
+# ograniczony latencja VALU, nie przepustowoscia (przy 4 wychodzi dokladnie
+# polowa pulapu).
+comptime CHAINS = 8
+
 
 def dot4_throughput(sink: UnsafePointer[Int32, MutAnyOrigin], n: Int):
-    var acc0: Int32 = 0
-    var acc1: Int32 = 0
-    var acc2: Int32 = 0
-    var acc3: Int32 = 0
+    var acc = InlineArray[Int32, CHAINS](fill=0)
     a: Int32 = 0x01020304
     b: Int32 = 0x04030201
     for _ in range(1024):
-        acc0 = inlined_assembly["v_dot4_i32_i8 $0, $1, $2, $0", Int32, constraints="=v,v,v,0"](a, b, acc0)
-        acc1 = inlined_assembly["v_dot4_i32_i8 $0, $1, $2, $0", Int32, constraints="=v,v,v,0"](a, b, acc1)
-        acc2 = inlined_assembly["v_dot4_i32_i8 $0, $1, $2, $0", Int32, constraints="=v,v,v,0"](a, b, acc2)
-        acc3 = inlined_assembly["v_dot4_i32_i8 $0, $1, $2, $0", Int32, constraints="=v,v,v,0"](a, b, acc3)
+        comptime for j in range(CHAINS):
+            acc[j] = dot4_i8(a, b, acc[j])
     i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var s: Int32 = 0
+    comptime for j in range(CHAINS):
+        s += acc[j]
     if i < n:
-        sink[i] = acc0 + acc1 + acc2 + acc3
+        sink[i] = s
 
 def main() raises:
     var ctx = DeviceContext()
@@ -41,5 +44,5 @@ def main() raises:
         ctx.enqueue_function[dot4_throughput](sink.unsafe_ptr(), threads, grid_dim=(grid,), block_dim=BLK)
     ctx.synchronize()
     dt = Float64(perf_counter_ns() - t0) / 1e9 / ITERS
-    ops = Float64(threads) * 1024.0 * 4.0 * 8.0
+    ops = Float64(threads) * 1024.0 * Float64(CHAINS) * 4.0 * 2.0
     print("int8 dot4:", Int(ops / dt / 1e12), "TOPS")

@@ -101,7 +101,7 @@ Ostatnia aktualizacja: 2026-07-25.
   które trzeba raz napisać na `v_dot4_i32_i8` z akumulacją w rejestrach
   (odpowiednik `mma.m16n8k32.s8` bez jednostki macierzowej), po czym rodziny
   Q8_0, Q4_K/Q6_K i NVFP4 przeniosą się tak samo jak dp4a. To jest ta sama praca,
-  która decyduje o celu prefillu (2,5x wobec llama.cpp).
+  która decyduje o celu prefillu (~5x zapasu wobec llama.cpp).
 - 🟡 **Katalog kerneli buduje artefakty AMDGCN; inwentarz gfx1030: 312 z 474
   (2026-07-25).** `build_kernel_catalog.py` rozgałęzia się teraz po TREŚCI zrzutu,
   nie po rozszerzeniu pliku: obecność `.amdgcn_target` wybiera ścieżkę AMD, która
@@ -145,30 +145,37 @@ Ostatnia aktualizacja: 2026-07-25.
   ML Studio w głównym repo) — 1 GB tekstu to u nas ~2,8 min jednowątkowo. Ale
   nawet tam przewaga jest mniejsza niż reklamowana, bo nasze 6 MB/s to jeden
   wątek, a maszyna ma 16 rdzeni. Dla FORGE: bez wartości.
-- ✅ **Roofline gfx1030 zmierzony w Mojo — cel portu jest prefill (2026-07-25).**
-  Zamiast zgadywać, zmierzyłem, co ta karta potrafi, uruchamiając mikrobenchmarki
-  przez ścieżkę Mojo→AMDGPU:
+- ✅ **Roofline gfx1030 zmierzony w Mojo; ILP okazało się warunkiem pomiaru
+  (2026-07-25).** Pierwsze mikrobenchmarki miały po cztery niezależne łańcuchy
+  akumulacji i pokazywały DOKŁADNIE POŁOWĘ pułapu karty — VALU RDNA2 ma
+  kilkutaktową latencję wyniku, więc przy czterech łańcuchach pomiar jest
+  latency-bound. Po podniesieniu do ośmiu (sweep 2/4/8/16 potwierdził wypłaszczenie
+  na ośmiu) liczby są następujące:
 
-  | pomiar | wynik | teoretyczny szczyt |
-  |---|--:|--:|
-  | odczyt HBM | **395 GB/s** | ~512 GB/s |
-  | FP32 FMA | **18 TFLOPS** | ~23 TFLOPS |
-  | int8 `v_dot4_i32_i8` (inline asm) | **50 TOPS** | ~92 TOPS |
+  | pomiar | 4 łańcuchy | **8 łańcuchów** | teoretyczny szczyt |
+  |---|--:|--:|--:|
+  | odczyt HBM | — | **386 GB/s** | ~512 GB/s |
+  | FP32 FMA | 18 TFLOPS | **25 TFLOPS** | ~23 TFLOPS |
+  | f16 `v_dot2_f32_f16` | 25 TFLOPS | **49 TFLOPS** | ~46 TFLOPS |
+  | int8 `v_dot4_i32_i8` | 50 TOPS | **97 TOPS** | ~92 TOPS |
 
-  Wynik int8 jest DOLNYM ograniczeniem: pętla ma tylko cztery niezależne
-  akumulatory, więc jest raczej latency-bound niż throughput-bound.
+  To jest jednocześnie WYMAGANIE PROJEKTOWE dla każdego kernela na tej karcie:
+  mniej niż osiem akumulatorów na wątek to najwyżej połowa maszyny, niezależnie
+  od jakości kafla. Obie jednostki dot (`v_dot2_f32_f16` dla f16 i
+  `v_dot4_i32_i8` dla int8) dają f32/i32 akumulację przy podwójnej przepustowości
+  odpowiedniego FMA i są jedyną drogą do pułapu bez jednostki macierzowej.
   ROZBICIE CELU wobec llama.cpp na ROCm (Mistral-7B Q4_K, 7,25e9 parametrów):
-  - **decode 79,2 tok/s = 346 GB/s = 88% zmierzonego pasma.** llama.cpp jest tam
-    praktycznie na rooflinie; zapasu jest może 12% i nie tam jest gra.
-  - **prefill 1 406 tok/s = 20,4 TOPS efektywnie = 41% zmierzonego pułapu int8.**
-    Przy pełnym wykorzystaniu `v_dot4_i32_i8` daje to **2,5x zapasu**, a więcej,
-    jeśli przebijemy mój latency-bound pomiar 50 TOPS.
+  - **decode 79,2 tok/s = 346 GB/s = 90% zmierzonego pasma.** llama.cpp jest tam
+    praktycznie na rooflinie; zapasu jest może 10% i nie tam jest gra.
+  - **prefill 1 406 tok/s = 20,4 TOPS efektywnie = 21% zmierzonego pułapu int8.**
+    To jest **~5x zapasu**, nie 2,5x jak wynikało z latency-bound pomiaru.
 
   WNIOSEK: cała okazja na RDNA2 leży w PREFILLU, a dźwignią jest int8 dot4, nie
-  fp16 — llama.cpp zostawia tę jednostkę częściowo niewykorzystaną. Prefillowy
+  fp16 — llama.cpp zostawia tę jednostkę w większości niewykorzystaną. Prefillowy
   GEMM budujemy więc wokół `v_dot4_i32_i8` (dequant Q4_K/Q8_0 do int8 plus
-  kwantyzacja aktywacji do int8), a nie wokół dekwantyzacji do fp16. Ta sama
-  matematyka jest przenośna na RDNA3/RDNA4, gdzie dodatkowo dochodzi WMMA.
+  kwantyzacja aktywacji do int8), a nie wokół dekwantyzacji do fp16; dla modeli
+  f16 bez kwantyzacji analogiczną rolę pełni `v_dot2_f32_f16`. Ta sama matematyka
+  jest przenośna na RDNA3/RDNA4, gdzie dodatkowo dochodzi WMMA.
   Decode zostaje przy kernelach bandwidth-bound i tam wystarczy nie zepsuć.
 - ✅ **Pule VRAM i grafy w backendzie HIP (2026-07-25).** `HipDevice::new`
   przyjmuje `PoolSizes` i zajmuje z góry trzy pule z tą samą polityką co CUDA:

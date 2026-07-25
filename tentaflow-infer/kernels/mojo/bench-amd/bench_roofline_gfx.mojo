@@ -18,16 +18,24 @@ def stream_read(dst: UnsafePointer[Float32, MutAnyOrigin], src: UnsafePointer[Fl
         if s == 1.2345e30:
             dst[0] = s
 
+# Osiem niezaleznych lancuchow: VALU RDNA2 ma kilkutaktowa latencje wyniku, wiec
+# ponizej ~8 lancuchow na watek pomiar pokazuje polowe pulapu karty, a nie pulap.
+comptime CHAINS = 8
+
+
 def fma_throughput(sink: UnsafePointer[Float32, MutAnyOrigin], n: Int):
     var a = SIMD[DType.float32, 4](1.0001, 1.0002, 1.0003, 1.0004)
     var b = SIMD[DType.float32, 4](0.9999, 0.9998, 0.9997, 0.9996)
-    var acc = SIMD[DType.float32, 4](0.0)
+    var acc = InlineArray[SIMD[DType.float32, 4], CHAINS](fill=SIMD[DType.float32, 4](0.0))
     for _ in range(1024):
-        acc = acc * a + b
-        acc = acc * b + a
+        comptime for j in range(CHAINS):
+            acc[j] = acc[j] * a + b
     i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var s = SIMD[DType.float32, 4](0.0)
+    comptime for j in range(CHAINS):
+        s += acc[j]
     if i < n:
-        sink[i] = acc[0] + acc[1] + acc[2] + acc[3]
+        sink[i] = s[0] + s[1] + s[2] + s[3]
 
 def main() raises:
     var ctx = DeviceContext()
@@ -58,5 +66,5 @@ def main() raises:
         ctx.enqueue_function[fma_throughput](dst.unsafe_ptr(), threads, grid_dim=(fgrid,), block_dim=BLK)
     ctx.synchronize()
     dt = Float64(perf_counter_ns() - t0) / 1e9 / ITERS
-    flops = Float64(threads) * 1024.0 * 2.0 * 4.0 * 2.0
+    flops = Float64(threads) * 1024.0 * Float64(CHAINS) * 4.0 * 2.0
     print("FP32 FMA:", Int(flops / dt / 1e12), "TFLOPS")

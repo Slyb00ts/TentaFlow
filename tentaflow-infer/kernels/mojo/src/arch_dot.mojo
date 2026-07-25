@@ -32,3 +32,23 @@ def dot4_i8(a: Int32, b: Int32, c: Int32) -> Int32:
         ](a, b, c)
     else:
         return llvm_intrinsic["llvm.nvvm.idp4a.s.s", Int32](a, b, c)
+
+
+@always_inline
+def dot2_f16(a: SIMD[DType.float16, 2], b: SIMD[DType.float16, 2], c: Float32) -> Float32:
+    """c + a[0]*b[0] + a[1]*b[1] z akumulacją w f32.
+
+    Na RDNA2+ to jedna instrukcja `v_dot2_f32_f16` — dwa MAC-i f16 na takt na
+    linię wektorową, czyli dwukrotność `v_fma_f32`. To odpowiednik `dot4_i8` dla
+    f16 i jedyny sposób, żeby GEMM f16 bez jednostki macierzowej trafił w pułap
+    karty zamiast w połowę. Na NVIDII (gdzie f16 idzie przez tensor core) helper
+    degraduje do dwóch FMA i służy tylko do porównań referencyjnych.
+    """
+    comptime if _accelerator_arch().startswith("amdgpu"):
+        return inlined_assembly[
+            "v_dot2_f32_f16 $0, $1, $2, $0",
+            Float32,
+            constraints="=v,v,v,0",
+        ](a, b, c)
+    else:
+        return c + Float32(a[0]) * Float32(b[0]) + Float32(a[1]) * Float32(b[1])
