@@ -21,6 +21,9 @@ CATALOG = ROOT / "build_kernels_catalog.mojo"
 OUTPUT_ROOT = Path(os.environ.get("FORGE_KERNEL_BUILD_DIR", ROOT / "build")).resolve()
 CHUNK_SIZE = 12
 AT_FDCWD = -100
+# Diagnostyka kompilatora, ktora NIE przerywa builda, a oznacza cicho
+# pominieta instrukcje inline asm (patrz kontrola w compile_catalog).
+SILENT_ASM_MARKER = "unknown asm constraint"
 RENAME_EXCHANGE = 2
 
 
@@ -247,7 +250,7 @@ def compile_catalog(kernels, portable_nvfp4):
                 attempt += 1
                 builder.write_text(builder_source(module, items))
                 try:
-                    subprocess.run(
+                    result = subprocess.run(
                         [mojo, "run", "-I", str(ROOT), str(builder)],
                         cwd=temporary_path,
                         env=environment,
@@ -280,6 +283,17 @@ def compile_catalog(kernels, portable_nvfp4):
                     pending.insert(0, (module, items[:middle]))
                     print(f"dziele jednostke {module} ({len(items)} kerneli)")
                     continue
+                # PUŁAPKA: `inlined_assembly` z treścią PTX na architekturze
+                # innej niż NVIDIA NIE przerywa builda — kompilator zgłasza
+                # tylko `unknown asm constraint`, a kernel powstaje z CICHO
+                # pominiętą instrukcją i liczy śmieci. Traktujemy ten komunikat
+                # jak błąd, bo inaczej wychodzi dopiero na wyniku modelu.
+                if partial and SILENT_ASM_MARKER in (result.stderr or ""):
+                    raise RuntimeError(
+                        f"jednostka {module} zawiera inline asm niezgodny z "
+                        f"architekturą (\"{SILENT_ASM_MARKER}\") — kernel "
+                        "powstalby z pominieta instrukcja"
+                    )
                 dumped = sorted(temporary_path.glob("*.ptx")) + sorted(
                     temporary_path.glob("*.s")
                 )

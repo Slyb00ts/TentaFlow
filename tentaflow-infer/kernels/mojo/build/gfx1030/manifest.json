@@ -350,20 +350,32 @@
       "file": "gelu_f16.hsaco"
     },
     "gemm_f16_dot2_128x128": {
-      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_87ceaf1fa736837e",
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_048aa54ec568f750",
       "file": "gemm_f16_dot2_128x128.hsaco"
     },
     "gemm_f16_dot2_128x64": {
-      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_bbd4a01bacc1f5c4",
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_673634029c2c7158",
       "file": "gemm_f16_dot2_128x64.hsaco"
     },
     "gemm_f16_dot2_256x64": {
-      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_19fc26f15b9e70b2",
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_630feb9cf7abfb34",
       "file": "gemm_f16_dot2_256x64.hsaco"
     },
     "gemm_f16_dot2_64x64": {
-      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_6b918349dbb8bd1a",
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_3127fc629aef763f",
       "file": "gemm_f16_dot2_64x64.hsaco"
+    },
+    "gemm_f16_dot2_out_f32_64x64": {
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_ec6e09ded87b6b92",
+      "file": "gemm_f16_dot2_out_f32_64x64.hsaco"
+    },
+    "gemm_nvfp4_dot4_128x64": {
+      "entry": "src_gemm_dot_gemm_nvfp4_dot4_i6A6A6A6A_b237ce206692f75c",
+      "file": "gemm_nvfp4_dot4_128x64.hsaco"
+    },
+    "gemm_nvfp4_dot4_64x64": {
+      "entry": "src_gemm_dot_gemm_nvfp4_dot4_i6A6A6A6A_432ef16d6bdeec6e",
+      "file": "gemm_nvfp4_dot4_64x64.hsaco"
     },
     "gemm_nvfp4_gguf_f16_b16": {
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_025e59e559bb9ddd",
@@ -426,36 +438,48 @@
       "file": "gemm_nvfp4_gguf_out_f32_b8.hsaco"
     },
     "gemm_q4_k_dot4_128x128": {
-      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_001ebc439a87afec",
+      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_62a1a8428b04ff79",
       "file": "gemm_q4_k_dot4_128x128.hsaco"
     },
     "gemm_q4_k_dot4_128x64": {
-      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_abfb65c81a1e64a2",
+      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_507ab3386142f2c4",
       "file": "gemm_q4_k_dot4_128x64.hsaco"
     },
     "gemm_q4_k_dot4_64x64": {
-      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_b529930b9a1fbedb",
+      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_22056b29112d8356",
       "file": "gemm_q4_k_dot4_64x64.hsaco"
     },
+    "gemm_q4_k_dot4_out_f32_64x64": {
+      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_3bc4497d970ac7f4",
+      "file": "gemm_q4_k_dot4_out_f32_64x64.hsaco"
+    },
     "gemm_q6_k_dot4_128x64": {
-      "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_86fb8f57abfbe59c",
+      "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_688a2591e2b7b919",
       "file": "gemm_q6_k_dot4_128x64.hsaco"
     },
     "gemm_q6_k_dot4_64x64": {
-      "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_a3d44d0a99211aa3",
+      "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_a1e658a4d4b2d2c6",
       "file": "gemm_q6_k_dot4_64x64.hsaco"
     },
+    "gemm_q6_k_dot4_out_f32_64x64": {
+      "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_f57c01f037882756",
+      "file": "gemm_q6_k_dot4_out_f32_64x64.hsaco"
+    },
     "gemm_q8_0_dot4_128x128": {
-      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_c33b8dfbade5b9a9",
+      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_2373e5e906402c3b",
       "file": "gemm_q8_0_dot4_128x128.hsaco"
     },
     "gemm_q8_0_dot4_128x64": {
-      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_046d66f1bd31984d",
+      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_3511af88f182a4e0",
       "file": "gemm_q8_0_dot4_128x64.hsaco"
     },
     "gemm_q8_0_dot4_64x64": {
-      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_0cbbaa356a2b87d8",
+      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_1dc5b814f9b03761",
       "file": "gemm_q8_0_dot4_64x64.hsaco"
+    },
+    "gemm_q8_0_dot4_out_f32_64x64": {
+      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_96721bd204930495",
+      "file": "gemm_q8_0_dot4_out_f32_64x64.hsaco"
     },
     "gemm_q8_0_dp4a_b3_nvidia": {
       "entry": "src_q8_0_batch_gemm_q8_0_small6A6A6A6A_4c7bbc1d9aab1f8c",

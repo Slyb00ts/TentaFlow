@@ -11,7 +11,6 @@ from std.sys.info import _accelerator_arch
 from std.sys.intrinsics import llvm_intrinsic
 from std.gpu.intrinsics import inlined_assembly
 from std.memory import bitcast
-from src.kv_fp8 import _e4m3x2_to_f16x2
 
 
 @always_inline
@@ -68,7 +67,9 @@ def f8e4m3_to_f32(b: UInt8) -> Float32:
     tu odwzorowywane — dekodują się jako skończona liczba, tak samo jak w
     dotychczasowej ścieżce.
     """
-    comptime if _accelerator_arch().startswith("amdgpu"):
+    comptime if not _accelerator_arch().startswith("amdgpu"):
+        return Float32(f8e4m3x2_to_f16x2(b, 0)[0])
+    else:
         exponent = Int32((b >> 3) & 0x0F)
         mantissa = Int32(b & 0x07)
         bits = ((exponent + 120) << 23) | (mantissa << 20)
@@ -76,8 +77,31 @@ def f8e4m3_to_f32(b: UInt8) -> Float32:
         subnormal = Float32(mantissa) * (1.0 / 512.0)
         magnitude = subnormal if exponent == 0 else normal
         return -magnitude if (b >> 7) != 0 else magnitude
+
+
+@always_inline
+def f8e4m3x2_to_f16x2(lo: UInt8, hi: UInt8) -> SIMD[DType.float16, 2]:
+    """Dwa bajty `float8_e4m3fn` do pary f16.
+
+    NVIDIA robi to jedną instrukcją. NA POZOSTAŁYCH ARCHITEKTURACH TA
+    INSTRUKCJA MILCZY: `inlined_assembly` z treścią PTX przechodzi przez build
+    (kompilator zgłasza tylko `unknown asm constraint`), a kernel dostaje
+    ŚMIECI — zamiast 1,5 wychodziło 1,1e-44. Dlatego wariant przenośny jest
+    tu obowiązkowy, a nie opcjonalny.
+    """
+    comptime if _accelerator_arch().startswith("amdgpu"):
+        return SIMD[DType.float16, 2](
+            f8e4m3_to_f32(lo).cast[DType.float16](),
+            f8e4m3_to_f32(hi).cast[DType.float16](),
+        )
     else:
-        return Float32(_e4m3x2_to_f16x2(b, 0)[0])
+        pair = inlined_assembly[
+            "cvt.rn.f16x2.e4m3x2 $0, $1;",
+            UInt32,
+            constraints="=r,h",
+            has_side_effect=False,
+        ](UInt16(UInt32(lo) | (UInt32(hi) << 8)))
+        return bitcast[DType.float16, 2](pair)
 
 
 @always_inline

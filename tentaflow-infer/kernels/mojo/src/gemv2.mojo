@@ -10,7 +10,7 @@ from std.gpu.primitives import warp
 from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
-from src.kv_fp8 import _e4m3x2_to_f16x2
+from src.arch_dot import f8e4m3_to_f32, f8e4m3x2_to_f16x2
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
@@ -98,11 +98,7 @@ def _e2m1x8(codes: SIMD[DType.uint8, 8]) -> SIMD[DType.float32, 8]:
     return mag4.cast[DType.float32]() * 0.25 * sign
 
 
-def _f8e4m3s(b: UInt8) -> Float32:
-    # e4m3 -> f16 is exact; the sm_89 hardware cvt is a single instruction vs
-    # the ~15-op generic float8 emulation. NaN codes 0x7F/0xFF widen to NaN
-    # (real NVFP4 block scales are never NaN).
-    return Float32(_e4m3x2_to_f16x2(b, 0)[0])
+comptime _f8e4m3s = f8e4m3_to_f32
 
 
 def gemv_nvfp4_f16_v2(
@@ -537,7 +533,7 @@ def gemv_fp8_out_f32_v2(
         var pairs = SIMD[DType.uint32, 4](0)
         comptime for j in range(4):
             pairs[j] = bitcast[DType.uint32, 1](
-                _e4m3x2_to_f16x2(UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8))
+                f8e4m3x2_to_f16x2(UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8))
             )[0]
         wv = bitcast[DType.float16, 8](pairs).cast[DType.float32]()
         xv = (x + i).load[width=8, alignment=16]().cast[DType.float32]()
