@@ -425,6 +425,18 @@
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_fb926ec38df7e9c4",
       "file": "gemm_nvfp4_gguf_out_f32_b8.hsaco"
     },
+    "gemm_q4_k_dot4_128x128": {
+      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_001ebc439a87afec",
+      "file": "gemm_q4_k_dot4_128x128.hsaco"
+    },
+    "gemm_q4_k_dot4_128x64": {
+      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_abfb65c81a1e64a2",
+      "file": "gemm_q4_k_dot4_128x64.hsaco"
+    },
+    "gemm_q4_k_dot4_64x64": {
+      "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_b529930b9a1fbedb",
+      "file": "gemm_q4_k_dot4_64x64.hsaco"
+    },
     "gemm_q8_0_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_c33b8dfbade5b9a9",
       "file": "gemm_q8_0_dot4_128x128.hsaco"

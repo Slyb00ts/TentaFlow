@@ -141,6 +141,8 @@ from src.gemm_dot import (
     gemm_q4_k_dot4_64x64,
     gemm_q4_k_dot4_128x64,
     gemm_q4_k_dot4_128x128,
+    gemm_q6_k_dot4_64x64,
+    gemm_q6_k_dot4_128x64,
 )
 from src.q8_0_batch import (
     gemm_q8_0_i8mma_b2,
@@ -1726,6 +1728,14 @@ def main() raises:
         gemm_q4_k_dot4_128x128, dump_asm=Path("gemm_q4_k_dot4_128x128.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_k_dot4_128x128"))
+    _ = ctx.compile_function[
+        gemm_q6_k_dot4_64x64, dump_asm=Path("gemm_q6_k_dot4_64x64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q6_k_dot4_64x64"))
+    _ = ctx.compile_function[
+        gemm_q6_k_dot4_128x64, dump_asm=Path("gemm_q6_k_dot4_128x64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q6_k_dot4_128x64"))
 
     _ = ctx.compile_function[
         gemm_q8_0_f16_bm64, dump_asm=Path("gemm_q8_0_f16_bm64.ptx")
