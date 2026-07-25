@@ -58,6 +58,27 @@ Ostatnia aktualizacja: 2026-07-25.
   `dense_prefill_artifacts_capable` wymagało już poprawnych
   `topk_batched_{partial,final}_f32`; nieaktualny był wyłącznie test.
   `forge-kernels` przechodzi w całości (42+9+70+1).
+- ❌ **Strojenie głowy F16 przez większy kafel: ZMIERZONE I ODRZUCONE
+  (2026-07-25).** Głowa liczy 262 MB w 563 us (465 GB/s), gdy attention w tym
+  samym kroku wyciąga 776 GB/s, więc dla 32 tokenów wygląda na ograniczoną
+  równoległością pamięci: kafel `gemm_f16_out_f32_bm32` ma tylko 64 wątki na
+  blok wobec 256 w kaflu BM128. Hipoteza: skoro głowa jest ograniczona odczytem
+  wag, dopełnienie 32 tokenów do kafla BM128 jest darmowe, a wątków jest 4x
+  więcej. Zmierzone odwrotnie: decode-only C=32 dało **2 550/2 556 tok/s wobec
+  2 683-2 746** na kaflu BM32, czyli około 6% GORZEJ — dodatkowa praca tensor
+  cores na dopełnionych tokenach przewyższa zysk z równoległości. Wycofane;
+  465 GB/s zostaje niewyjaśnione, ale łatwa dźwignia jest wyczerpana.
+- ✅ **Głowa logitów ujednolicona na F16 w obu ścieżkach (2026-07-25).**
+  `logits_gemv` preferował paczkę `fp8_lm_head`, a ścieżka batchowa liczyła
+  głowę w F16 — więc na Bieliku z auto-fp8 pojedynczy strumień miał logity
+  e4m3, a batch nie, czyli **jakość wyjścia zależała od współbieżności**. To ta
+  sama wada, za którą odrzuciłem głowę FP8 w batchu, tylko z drugiej strony.
+  Preferencja usunięta; paczka zostaje dla prefillu, gdzie liczą się aktywacje,
+  a nie wybór tokena. Koszt: single-stream decode 158,3 → **155,0 tok/s
+  (-2,1%)**, prefill bez zmian (13 364 wobec 13 346 tok/s). Weryfikacja celu:
+  ten sam prompt greedy przy C=1 i C=6 daje teraz IDENTYCZNE wyjście (wcześniej
+  ścieżki różniły się głową). Bramki: workspace 606/606, `batched_bielik`
+  z paczkami FP8 2/2.
 - ✅ **Kopie D2D w mixerze DeltaNet usunięte: Qwen 27B do 112,3 tok/s
   (2026-07-25).** Batchowane projekcje zostawiały cztery kopie D2D na lane na
   warstwę (1536 na krok przy B=8) do jednotokenowego scratchu. Konsumenci

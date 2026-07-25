@@ -4417,17 +4417,12 @@ impl Model {
     }
 
     fn logits_gemv(&self, y_f32: &DevBuffer, x: &DevBuffer, stream: &Stream) -> Result<()> {
-        if let Some(weight) = &self.weights.fp8_lm_head {
-            return self.kernels.gemv_fp8_out_f32(
-                y_f32,
-                &weight.qweight,
-                &weight.scales,
-                x,
-                weight.rows,
-                weight.cols,
-                stream,
-            );
-        }
+        // Głowa NIE korzysta z paczki `fp8_lm_head`, choć ta jest budowana razem
+        // z paczkami FFN. e4m3 ma 3-bitową mantysę w warstwie, która wprost
+        // wybiera token: użycie jej TYLKO tutaj dawało inny strumień greedy w
+        // pojedynczym strumieniu niż w batchu (który liczy głowę w F16), czyli
+        // jakość zależną od współbieżności. Paczka zostaje dla prefillu, gdzie
+        // liczą się aktywacje, a nie wybór tokena.
         self.logits_weight_gemv(y_f32, 0, x, 0, &self.weights.lm_head, stream)
     }
 
