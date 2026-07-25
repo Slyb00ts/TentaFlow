@@ -39,7 +39,7 @@ def check[BM: Int, BN: Int, TM: Int, TN: Int](ctx: DeviceContext, tokens: Int, r
 
     grid_x = (rows + BN - 1) // BN
     grid_y = (tokens + BM - 1) // BM
-    ctx.enqueue_function[gemm_f16_dot2_impl[BM, BN, TM, TN]](
+    ctx.enqueue_function[gemm_f16_dot2_impl[BM, BN, TM, TN, DType.float16]](
         yd.unsafe_ptr(),
         wd.unsafe_ptr(),
         xd.unsafe_ptr(),
@@ -78,14 +78,14 @@ def bench[BM: Int, BN: Int, TM: Int, TN: Int](label: String, ctx: DeviceContext,
     grid_x = (rows + BN - 1) // BN
     grid_y = (tokens + BM - 1) // BM
     for _ in range(3):
-        ctx.enqueue_function[gemm_f16_dot2_impl[BM, BN, TM, TN]](
+        ctx.enqueue_function[gemm_f16_dot2_impl[BM, BN, TM, TN, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), xd.unsafe_ptr(), cols, rows, tokens,
             grid_dim=(grid_x, grid_y), block_dim=(BM // TM) * (BN // TN),
         )
     ctx.synchronize()
     t0 = perf_counter_ns()
     for _ in range(ITERS):
-        ctx.enqueue_function[gemm_f16_dot2_impl[BM, BN, TM, TN]](
+        ctx.enqueue_function[gemm_f16_dot2_impl[BM, BN, TM, TN, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), xd.unsafe_ptr(), cols, rows, tokens,
             grid_dim=(grid_x, grid_y), block_dim=(BM // TM) * (BN // TN),
         )
@@ -132,7 +132,7 @@ def check_q8[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     ctx.enqueue_copy(xd, xh)
     ctx.enqueue_copy(dd, dh)
     ctx.synchronize()
-    ctx.enqueue_function[gemm_q8_0_dot4_impl[BM, BN, TM, TN, KB]](
+    ctx.enqueue_function[gemm_q8_0_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
         yd.unsafe_ptr(), wd.unsafe_ptr(), xd.unsafe_ptr(), dd.unsafe_ptr(),
         sd.unsafe_ptr(), cols, rows, tokens,
         grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),
@@ -176,14 +176,14 @@ def bench_q8[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     grid = ((rows + BN - 1) // BN, (tokens + BM - 1) // BM)
     blk = (BM // TM) * (BN // TN)
     for _ in range(3):
-        ctx.enqueue_function[gemm_q8_0_dot4_impl[BM, BN, TM, TN, KB]](
+        ctx.enqueue_function[gemm_q8_0_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), xd.unsafe_ptr(), dd.unsafe_ptr(),
             sd.unsafe_ptr(), cols, rows, tokens, grid_dim=grid, block_dim=blk,
         )
     ctx.synchronize()
     t0 = perf_counter_ns()
     for _ in range(ITERS):
-        ctx.enqueue_function[gemm_q8_0_dot4_impl[BM, BN, TM, TN, KB]](
+        ctx.enqueue_function[gemm_q8_0_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), xd.unsafe_ptr(), dd.unsafe_ptr(),
             sd.unsafe_ptr(), cols, rows, tokens, grid_dim=grid, block_dim=blk,
         )
@@ -243,7 +243,7 @@ def check_q4k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     ctx.enqueue_copy(ddb, dh)
     ctx.enqueue_copy(sdb, sh)
     ctx.synchronize()
-    ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB]](
+    ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
         yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(), ddb.unsafe_ptr(),
         sdb.unsafe_ptr(), cols, rows, tokens,
         grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),
@@ -312,7 +312,7 @@ def bench_q4k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     grid = ((rows + BN - 1) // BN, (tokens + BM - 1) // BM)
     blk = (BM // TM) * (BN // TN)
     for _ in range(3):
-        ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB]](
+        ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(),
             ddb.unsafe_ptr(), sdb.unsafe_ptr(), cols, rows, tokens,
             grid_dim=grid, block_dim=blk,
@@ -320,7 +320,7 @@ def bench_q4k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     ctx.synchronize()
     t0 = perf_counter_ns()
     for _ in range(ITERS):
-        ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB]](
+        ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(),
             ddb.unsafe_ptr(), sdb.unsafe_ptr(), cols, rows, tokens,
             grid_dim=grid, block_dim=blk,
@@ -377,7 +377,7 @@ def check_q6k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     ctx.enqueue_copy(ddb, dh)
     ctx.enqueue_copy(sdb, sh)
     ctx.synchronize()
-    ctx.enqueue_function[gemm_q6_k_dot4_impl[BM, BN, TM, TN, KB]](
+    ctx.enqueue_function[gemm_q6_k_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
         yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(), ddb.unsafe_ptr(),
         sdb.unsafe_ptr(), cols, rows, tokens,
         grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),
@@ -440,7 +440,7 @@ def bench_nvfp4[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     grid = ((rows + BN - 1) // BN, (tokens + BM - 1) // BM)
     blk = (BM // TM) * (BN // TN)
     for _ in range(3):
-        ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB]](
+        ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), sd8.unsafe_ptr(),
             xdb.unsafe_ptr(), ddb.unsafe_ptr(), cols, rows, tokens,
             Float32(1.0), grid_dim=grid, block_dim=blk,
@@ -448,7 +448,7 @@ def bench_nvfp4[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     ctx.synchronize()
     t0 = perf_counter_ns()
     for _ in range(ITERS):
-        ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB]](
+        ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
             yd.unsafe_ptr(), wd.unsafe_ptr(), sd8.unsafe_ptr(),
             xdb.unsafe_ptr(), ddb.unsafe_ptr(), cols, rows, tokens,
             Float32(1.0), grid_dim=grid, block_dim=blk,
@@ -499,7 +499,7 @@ def check_nvfp4[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     ctx.enqueue_copy(ddb, dh)
     ctx.synchronize()
     inv_global = Float32(0.75)
-    ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB]](
+    ctx.enqueue_function[gemm_nvfp4_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
         yd.unsafe_ptr(), wd.unsafe_ptr(), sd8.unsafe_ptr(), xdb.unsafe_ptr(),
         ddb.unsafe_ptr(), cols, rows, tokens, inv_global,
         grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),

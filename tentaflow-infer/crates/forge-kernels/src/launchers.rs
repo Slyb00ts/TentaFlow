@@ -6383,6 +6383,26 @@ impl Kernels {
                 "gemm_f16_out_f32 requires rows > 0, cols >= 8, cols % 8 == 0 and n_tokens > 0, got rows={rows}, cols={cols}, n_tokens={n_tokens}"
             )));
         }
+        // Karty bez jednostki macierzowej: kafel f16 na `v_dot2_f32_f16` z
+        // zapisem f32. Wyspecjalizowane gemv batchowe (do 8 tokenów) mają
+        // pierwszeństwo, bo nie liczą odrzucanych wierszy.
+        if self.device.caps().vendor != forge_types::Vendor::Nvidia
+            && n_tokens > 8
+            && self.artifacts.has("gemm_f16_dot2_out_f32_64x64")
+        {
+            let tile = DotTile::new("gemm_f16_dot2_out_f32_64x64", 64, 64, 4, 4);
+            let k = self.artifacts.get(tile.name)?;
+            let args = LaunchArgs::new()
+                .buf(y_f32)
+                .buf_at(w, w_byte_off)?
+                .buf(x)
+                .scalar(cols as i64)
+                .scalar(rows as i64)
+                .scalar(n_tokens as i64);
+            return self
+                .device
+                .launch(k, &tile.config(rows, n_tokens), &args, stream);
+        }
         let (kernel_name, block, bm) =
             Self::f16_out_f32_dispatch(rows, n_tokens, |name| self.artifacts.has(name));
         let k = self.artifacts.get(kernel_name)?;
@@ -8261,16 +8281,27 @@ impl Kernels {
         if self.device.caps().vendor == forge_types::Vendor::Nvidia {
             return None;
         }
-        // Wariant `out_f32` (głowa logitów w batchu) nie ma jeszcze kafla int8.
-        if output_f32 {
-            return None;
-        }
         let family = match kernel_base {
             "gemm_q8_0_i8mma" => "q8_0",
             "gemm_q4_k_i8mma" => "q4_k",
             "gemm_q6_k_i8mma" => "q6_k",
             _ => return None,
         };
+        // Batchowa głowa logitów zapisuje f32 i pracuje na rozmiarze batcha
+        // decode, więc ma tylko najmniejszy kafel.
+        if output_f32 {
+            return Some(DotTile::new(
+                match family {
+                    "q8_0" => "gemm_q8_0_dot4_out_f32_64x64",
+                    "q4_k" => "gemm_q4_k_dot4_out_f32_64x64",
+                    _ => "gemm_q6_k_dot4_out_f32_64x64",
+                },
+                64,
+                64,
+                4,
+                4,
+            ));
+        }
         Some(if n_tokens <= 64 || rows < 128 {
             DotTile::new(
                 match family {

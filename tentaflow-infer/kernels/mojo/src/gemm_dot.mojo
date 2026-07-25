@@ -119,8 +119,8 @@ def _store_tile[
                 )
 
 
-def gemm_f16_dot2_impl[BM: Int, BN: Int, TM: Int, TN: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemm_f16_dot2_impl[BM: Int, BN: Int, TM: Int, TN: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     w: UnsafePointer[Float16, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
@@ -207,16 +207,24 @@ def gemm_f16_dot2_impl[BM: Int, BN: Int, TM: Int, TN: Int](
             comptime for r in range(TN):
                 row = row0 + tx * TN + r
                 if row < n_rows:
-                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+                    y[t * n_rows + row] = acc[m * TN + r].cast[OUT]()
 
 
 # Instancje wybrane pomiarem na gfx1030 (4096x4096, T=1024): 256x64 i 128x128
 # dają 23 TFLOPS, 128x64 22, a 64x64 16 — ten ostatni jest jednak potrzebny dla
 # małych kształtów, gdzie duży kafel to w większości odrzucone obliczenia.
-comptime gemm_f16_dot2_64x64 = gemm_f16_dot2_impl[64, 64, 4, 4]
-comptime gemm_f16_dot2_128x64 = gemm_f16_dot2_impl[128, 64, 8, 4]
-comptime gemm_f16_dot2_128x128 = gemm_f16_dot2_impl[128, 128, 8, 8]
-comptime gemm_f16_dot2_256x64 = gemm_f16_dot2_impl[256, 64, 8, 8]
+comptime gemm_f16_dot2_64x64 = gemm_f16_dot2_impl[64, 64, 4, 4, DType.float16]
+comptime gemm_f16_dot2_128x64 = gemm_f16_dot2_impl[128, 64, 8, 4, DType.float16]
+comptime gemm_f16_dot2_128x128 = gemm_f16_dot2_impl[
+    128, 128, 8, 8, DType.float16
+]
+comptime gemm_f16_dot2_256x64 = gemm_f16_dot2_impl[256, 64, 8, 8, DType.float16]
+# Batchowa głowa logitów zapisuje f32, żeby nie tracić dokładności akumulatora
+# przed samplingiem — tak samo jak rodzina `gemm_*_out_f32` na NVIDII. Liczba
+# tokenów to tam rozmiar batcha decode (<= 64), więc wystarczy najmniejszy kafel.
+comptime gemm_f16_dot2_out_f32_64x64 = gemm_f16_dot2_impl[
+    64, 64, 4, 4, DType.float32
+]
 
 
 @always_inline
@@ -230,8 +238,8 @@ def _q8_0_row_block(
     return w + (row * blocks_per_row + blk) * 34
 
 
-def gemm_q8_0_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemm_q8_0_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq: UnsafePointer[Int8, MutAnyOrigin],
     xd: UnsafePointer[Float32, MutAnyOrigin],
@@ -381,19 +389,28 @@ def gemm_q8_0_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
             comptime for r in range(TN):
                 row = row0 + tx * TN + r
                 if row < n_rows:
-                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+                    y[t * n_rows + row] = acc[m * TN + r].cast[OUT]()
 
 
 # KB dobrane pomiarem: dla kafla 128x128 dwa bloki na etap dają 35 TOPS wobec
 # 33 przy jednym, a cztery spadają do 14, bo LDS przestaje mieścić dwa
 # workgroupy na WGP. Mały kafel 64x64 ma zapas LDS i znosi KB=4.
-comptime gemm_q8_0_dot4_64x64 = gemm_q8_0_dot4_impl[64, 64, 4, 4, 4]
-comptime gemm_q8_0_dot4_128x64 = gemm_q8_0_dot4_impl[128, 64, 8, 4, 2]
-comptime gemm_q8_0_dot4_128x128 = gemm_q8_0_dot4_impl[128, 128, 8, 4, 2]
+comptime gemm_q8_0_dot4_64x64 = gemm_q8_0_dot4_impl[
+    64, 64, 4, 4, 4, DType.float16
+]
+comptime gemm_q8_0_dot4_128x64 = gemm_q8_0_dot4_impl[
+    128, 64, 8, 4, 2, DType.float16
+]
+comptime gemm_q8_0_dot4_128x128 = gemm_q8_0_dot4_impl[
+    128, 128, 8, 4, 2, DType.float16
+]
+comptime gemm_q8_0_dot4_out_f32_64x64 = gemm_q8_0_dot4_impl[
+    64, 64, 4, 4, 4, DType.float32
+]
 
 
-def gemm_q4_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemm_q4_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq: UnsafePointer[Int8, MutAnyOrigin],
     xd: UnsafePointer[Float32, MutAnyOrigin],
@@ -567,16 +584,25 @@ def gemm_q4_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
             comptime for r in range(TN):
                 row = row0 + tx * TN + r
                 if row < n_rows:
-                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+                    y[t * n_rows + row] = acc[m * TN + r].cast[OUT]()
 
 
-comptime gemm_q4_k_dot4_64x64 = gemm_q4_k_dot4_impl[64, 64, 4, 4, 4]
-comptime gemm_q4_k_dot4_128x64 = gemm_q4_k_dot4_impl[128, 64, 8, 4, 2]
-comptime gemm_q4_k_dot4_128x128 = gemm_q4_k_dot4_impl[128, 128, 8, 4, 2]
+comptime gemm_q4_k_dot4_64x64 = gemm_q4_k_dot4_impl[
+    64, 64, 4, 4, 4, DType.float16
+]
+comptime gemm_q4_k_dot4_128x64 = gemm_q4_k_dot4_impl[
+    128, 64, 8, 4, 2, DType.float16
+]
+comptime gemm_q4_k_dot4_128x128 = gemm_q4_k_dot4_impl[
+    128, 128, 8, 4, 2, DType.float16
+]
+comptime gemm_q4_k_dot4_out_f32_64x64 = gemm_q4_k_dot4_impl[
+    64, 64, 4, 4, 4, DType.float32
+]
 
 
-def gemm_q6_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemm_q6_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq: UnsafePointer[Int8, MutAnyOrigin],
     xd: UnsafePointer[Float32, MutAnyOrigin],
@@ -751,15 +777,22 @@ def gemm_q6_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
             comptime for r in range(TN):
                 row = row0 + tx * TN + r
                 if row < n_rows:
-                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+                    y[t * n_rows + row] = acc[m * TN + r].cast[OUT]()
 
 
-comptime gemm_q6_k_dot4_64x64 = gemm_q6_k_dot4_impl[64, 64, 4, 4, 4]
-comptime gemm_q6_k_dot4_128x64 = gemm_q6_k_dot4_impl[128, 64, 8, 4, 2]
+comptime gemm_q6_k_dot4_64x64 = gemm_q6_k_dot4_impl[
+    64, 64, 4, 4, 4, DType.float16
+]
+comptime gemm_q6_k_dot4_128x64 = gemm_q6_k_dot4_impl[
+    128, 64, 8, 4, 2, DType.float16
+]
+comptime gemm_q6_k_dot4_out_f32_64x64 = gemm_q6_k_dot4_impl[
+    64, 64, 4, 4, 4, DType.float32
+]
 
 
-def gemm_nvfp4_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemm_nvfp4_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     packed: UnsafePointer[UInt8, MutAnyOrigin],
     scales: UnsafePointer[UInt8, MutAnyOrigin],
     xq: UnsafePointer[Int8, MutAnyOrigin],
@@ -924,8 +957,12 @@ def gemm_nvfp4_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
             comptime for r in range(TN):
                 row = row0 + tx * TN + r
                 if row < n_rows:
-                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+                    y[t * n_rows + row] = acc[m * TN + r].cast[OUT]()
 
 
-comptime gemm_nvfp4_dot4_64x64 = gemm_nvfp4_dot4_impl[64, 64, 4, 4, 4]
-comptime gemm_nvfp4_dot4_128x64 = gemm_nvfp4_dot4_impl[128, 64, 8, 4, 2]
+comptime gemm_nvfp4_dot4_64x64 = gemm_nvfp4_dot4_impl[
+    64, 64, 4, 4, 4, DType.float16
+]
+comptime gemm_nvfp4_dot4_128x64 = gemm_nvfp4_dot4_impl[
+    128, 64, 8, 4, 2, DType.float16
+]
