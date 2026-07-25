@@ -3725,6 +3725,36 @@ impl Kernels {
     /// Output gated RMSNorm per value-head: out = rmsnorm(o, weight)·silu(z).
     /// One block per head, block covers `d_state`.
     #[allow(clippy::too_many_arguments)]
+    /// `deltanet_gated_rmsnorm_f16` czytający bramkę `z` z przesunięcia lane'a.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_rmsnorm_f16_at(
+        &self,
+        out: &DevBuffer,
+        o_in: &DevBuffer,
+        z_in: &DevBuffer,
+        z_byte_off: usize,
+        weight: &DevBuffer,
+        n_v_heads: usize,
+        d_state: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_gated_rmsnorm_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_v_heads as u32, 1, 1),
+            block: ((d_state as u32).clamp(32, 1024), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(o_in)
+            .buf_at(z_in, z_byte_off)?
+            .buf(weight)
+            .scalar(d_state as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     pub fn deltanet_gated_rmsnorm_f16(
         &self,
         out: &DevBuffer,
@@ -3807,6 +3837,30 @@ impl Kernels {
     }
 
     /// Per-head DeltaNet write gate beta = sigmoid(beta_proj) (f32 out).
+    /// `deltanet_beta_sigmoid_f32` czytający wiersz `beta_byte_off` wejścia.
+    /// Pozwala batchowemu decode wziąć swój lane wprost z projekcji policzonej
+    /// dla całego batcha, bez kopii do jednotokenowego scratchu.
+    pub fn deltanet_beta_sigmoid_f32_at(
+        &self,
+        beta_out: &DevBuffer,
+        beta_in: &DevBuffer,
+        beta_byte_off: usize,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_beta_sigmoid_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((n_v_heads as u32).div_ceil(256), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(beta_out)
+            .buf_at(beta_in, beta_byte_off)?
+            .scalar(n_v_heads as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     pub fn deltanet_beta_sigmoid_f32(
         &self,
         beta_out: &DevBuffer,

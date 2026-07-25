@@ -1741,10 +1741,6 @@ struct HybridBufs {
     gatec: DevBuffer,
     /// Gated attention output `[n_heads*head_dim]` f16 (attn ⊙ sigmoid(gate)).
     gated: DevBuffer,
-    /// DeltaNet in-projection conv stream `[conv_dim]` f16.
-    qkv_mixed: DevBuffer,
-    /// DeltaNet output gate `z` `[value_dim]` f16.
-    z: DevBuffer,
     /// Conv + SiLU output `[conv_dim]` f16.
     conv_out: DevBuffer,
     /// Per-head-split conv q/k `[key_dim]` and their repeat to `[value_dim]`.
@@ -1756,9 +1752,6 @@ struct HybridBufs {
     k32: DevBuffer,
     /// Conv value heads `[value_dim]` f16.
     vtok: DevBuffer,
-    /// Raw alpha / beta projections `[n_v_heads]` f16.
-    alpha: DevBuffer,
-    beta_raw: DevBuffer,
     /// Per-head log-decay `g` and write-gate `beta` `[n_v_heads]` f32.
     g: DevBuffer,
     beta_f: DevBuffer,
@@ -14388,8 +14381,6 @@ impl Model {
             qc: a16(q_dim)?,
             gatec: a16(q_dim)?,
             gated: a16(q_dim)?,
-            qkv_mixed: a16(conv_dim)?,
-            z: a16(value_dim)?,
             conv_out: a16(conv_dim)?,
             q16: a16(key_dim)?,
             k16: a16(key_dim)?,
@@ -14398,8 +14389,6 @@ impl Model {
             q32: a16(value_dim)?,
             k32: a16(value_dim)?,
             vtok: a16(value_dim)?,
-            alpha: a16(nv)?,
-            beta_raw: a16(nv)?,
             g: a32(nv)?,
             beta_f: a32(nv)?,
             o: a16(value_dim)?,
@@ -14722,24 +14711,19 @@ impl Model {
             .expect("DeltaNet layer has ssm state");
 
         // Projekcje wejściowe policzył `hybrid_delta_projections` dla wszystkich
-        // lane'ów naraz; tutaj zostaje tylko przeniesienie własnego wiersza do
-        // jednotokenowego scratchu, z którego czytają kernele stanowe.
-        let n_v_alpha = n_v;
-        for (dst, src, elems) in [
-            (&hb.qkv_mixed, &hb.batched_qkv_mixed, conv_dim),
-            (&hb.z, &hb.batched_z, value_dim),
-            (&hb.alpha, &hb.batched_alpha, n_v_alpha),
-            (&hb.beta_raw, &hb.batched_beta_raw, n_v_alpha),
-        ] {
-            self.device
-                .copy(src, lane * elems * 2, dst, 0, elems * 2, stream)?;
-        }
+        // lane'ów naraz. Konsumenci czytają swój wiersz przez przesunięcie
+        // bajtowe, więc nie ma kopii do jednotokenowego scratchu.
+        let qkv_off = lane * conv_dim * 2;
+        let z_off = lane * value_dim * 2;
+        let head_off = lane * n_v * 2;
 
         // Causal depthwise conv + SiLU (advances the conv window in place).
-        kernels.deltanet_conv_silu_f16(
+        kernels.deltanet_conv_silu_f16_at(
             &hb.conv_out,
+            0,
             &st.conv,
-            &hb.qkv_mixed,
+            &hb.batched_qkv_mixed,
+            qkv_off,
             &d.conv1d,
             conv_dim,
             d_conv,
@@ -14777,8 +14761,23 @@ impl Model {
                 .copy(&hb.k16, 0, &hb.k32, r * key_bytes, key_bytes, stream)?;
         }
         // Per-head log-decay g = softplus(alpha + dt_bias)·a and beta gate.
-        kernels.deltanet_log_decay_f32(&hb.g, &hb.alpha, &d.dt_bias, &d.a, n_v, stream)?;
-        kernels.deltanet_beta_sigmoid_f32(&hb.beta_f, &hb.beta_raw, n_v, stream)?;
+        kernels.deltanet_log_decay_f32_at(
+            &hb.g,
+            0,
+            &hb.batched_alpha,
+            head_off,
+            &d.dt_bias,
+            &d.a,
+            n_v,
+            stream,
+        )?;
+        kernels.deltanet_beta_sigmoid_f32_at(
+            &hb.beta_f,
+            &hb.batched_beta_raw,
+            head_off,
+            n_v,
+            stream,
+        )?;
         // Rank-1 gated-delta recurrence (advances the state matrix in place).
         match self.delta_state_layout() {
             DeltaStateLayout::ValueKey => kernels.deltanet_value_key_scan_inplace_f16(
@@ -14791,10 +14790,11 @@ impl Model {
             )?,
         }
         // Output gated RMSNorm then the value-dim → hidden out projection.
-        kernels.deltanet_gated_rmsnorm_f16(
+        kernels.deltanet_gated_rmsnorm_f16_at(
             &hb.normed,
             &hb.o,
-            &hb.z,
+            &hb.batched_z,
+            z_off,
             &d.ssm_norm,
             n_v,
             d_state,

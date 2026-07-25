@@ -58,6 +58,18 @@ Ostatnia aktualizacja: 2026-07-25.
   `dense_prefill_artifacts_capable` wymagało już poprawnych
   `topk_batched_{partial,final}_f32`; nieaktualny był wyłącznie test.
   `forge-kernels` przechodzi w całości (42+9+70+1).
+- ✅ **Kopie D2D w mixerze DeltaNet usunięte: Qwen 27B do 112,3 tok/s
+  (2026-07-25).** Batchowane projekcje zostawiały cztery kopie D2D na lane na
+  warstwę (1536 na krok przy B=8) do jednotokenowego scratchu. Konsumenci
+  czytają teraz swój wiersz przez przesunięcie bajtowe: `conv_silu` i
+  `log_decay` miały już warianty `_at`, doszły `deltanet_beta_sigmoid_f32_at`
+  i `deltanet_gated_rmsnorm_f16_at`. Cztery jednotokenowe bufory
+  (`qkv_mixed`, `z`, `alpha`, `beta_raw`) w `HybridBufs` straciły użycia i
+  zostały usunięte wraz z alokacjami. Pomiar: C=8 105,2 → **108,8** (+3,4%),
+  C=16 109,0 → **112,3** (+3,0%), C=1 40,0 → 40,5 bez regresji.
+  Narastająco od parowania B=2: **50,8 → 112,3 tok/s przy C=16, czyli 2,21x**.
+  Bramki: workspace 606/606, `hybrid_state_pool_gpu` 32/32, koherencja i
+  self-konsystencja przy ośmiu równoległych requestach.
 - 🟡 **Mixed prefill+decode: hipoteza „nie włącza się dla Bielika" BŁĘDNA;
   polityka kwantu poprawiona, regresja p1024 otwarta (2026-07-25).** Czytałem
   25,9% czasu GPU w kernelach prefillu (profil decode-only C=32) jako niewtopiony
