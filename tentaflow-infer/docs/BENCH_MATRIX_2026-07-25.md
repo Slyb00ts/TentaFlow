@@ -78,7 +78,29 @@ forward). llama-bench nie ma trybu spekulatywnego, więc 47,9 tok/s to liczba
 llama.cpp bez spekulacji — dla uczciwości podano też nasze 42,2 tok/s bez niej,
 czyli 0,88x. Przewaga jest funkcją MTP, nie samych kerneli.
 
-## 3. Znaleziska metodyczne
+## 3. Radeon RX 6900 XT (gfx1030, RDNA2) — FORGE vs llama.cpp
+
+Osobne stanowisko: karta bez jednostki macierzowej. vLLM na niej nie startuje
+(lokalny obraz to build CUDA, a `rocm/vllm` celuje w CDNA), więc jedynym
+punktem odniesienia jest llama.cpp na ROCm (build `112c7815`, `-ngl 99`,
+`HIP_VISIBLE_DEVICES=0`). Wszystkie pomiary p1024/tg128, ten sam kształt w obu
+silnikach.
+
+| model | FORGE prefill | llama.cpp prefill | FORGE decode | llama.cpp decode |
+|---|---:|---:|---:|---:|
+| qwen3-0.6B Q8_0 | **14 900** tok/s | 7 827 | **277,5** tok/s | 239,8 |
+| Mistral-7B Q4_K_M | **1 734** tok/s | 1 301 | 67,0 tok/s | **79,0** |
+
+Prefill: **1,90x** i **1,33x**. Decode: 1,16x i 0,85x. Przewaga w prefillu rośnie
+z długością promptu (qwen: 1,35x przy p512, 1,90x przy p1024, 1,96x przy p2048)
+— llama.cpp spada tam z 11 090 na 5 688 tok/s, a FORGE z 14 930 na 11 144.
+
+UWAGA: `llama-bench tg128` dekoduje z PUSTYM kontekstem, a FORGE po prompcie,
+więc porównanie decode jest przechylone na korzyść llama.cpp. Mimo to na Q4_K
+llama.cpp wygrywa decode i to jest realna luka w naszych kernelach gemv, a nie
+artefakt metody.
+
+## 4. Znaleziska metodyczne
 
 - **`forge bench` nie odzwierciedla domyślnych ustawień `serve`.** Auto-fp8
   prefill dla gęstego GGUF włącza się tylko w `serve`, więc `bench` zaniża
