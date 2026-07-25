@@ -79,6 +79,27 @@ Ostatnia aktualizacja: 2026-07-25.
   ten sam prompt greedy przy C=1 i C=6 daje teraz IDENTYCZNE wyjście (wcześniej
   ścieżki różniły się głową). Bramki: workspace 606/606, `batched_bielik`
   z paczkami FP8 2/2.
+- ❌ **GigaToken sprawdzony i ODRZUCONY dla ścieżki inferencji (2026-07-25).**
+  GigaToken to rustowy tokenizer BPE (nie silnik), reklamowany jako 989x
+  szybszy od HuggingFace i 24,53 GB/s, z obietnicą 40% redukcji TTFT.
+  Ta obietnica jest liczona wobec pythonowego HuggingFace — a nasza ścieżka to
+  już natywny Rust (`forge-tokenize` nad crate'em `tokenizers`, `encode_fast`).
+  Zmierzone naszym nowym testem `forge-tokenize --test throughput`:
+  **6,0 MB/s i 1,49 M tok/s** jednowątkowo (217 089 tokenów z 872 448 bajtów
+  w 145,8 ms). Wobec prefillu:
+
+  | ścieżka | prefill | tokenizacja szybsza | udział w TTFT |
+  |---|--:|--:|--:|
+  | 4090, Bielik NVFP4 | 13 364 tok/s | 111x | **0,90%** |
+  | 6900 XT, llama.cpp Mistral | 1 406 tok/s | 1 060x | **0,09%** |
+
+  Udział jest niezależny od długości promptu (oba skalują się liniowo), więc
+  nawet nieskończenie szybki tokenizer urywa najwyżej 0,9% TTFT na NVIDII i
+  0,09% na AMD. Profil nsys to potwierdza: host na krytycznej ścieżce to <=0,4 ms.
+  GDZIE BY SIĘ PRZYDAŁ: masowa tokenizacja korpusów (pipeline'y treningowe
+  ML Studio w głównym repo) — 1 GB tekstu to u nas ~2,8 min jednowątkowo. Ale
+  nawet tam przewaga jest mniejsza niż reklamowana, bo nasze 6 MB/s to jeden
+  wątek, a maszyna ma 16 rdzeni. Dla FORGE: bez wartości.
 - ✅ **Roofline gfx1030 zmierzony w Mojo — cel portu jest prefill (2026-07-25).**
   Zamiast zgadywać, zmierzyłem, co ta karta potrafi, uruchamiając mikrobenchmarki
   przez ścieżkę Mojo→AMDGPU:
