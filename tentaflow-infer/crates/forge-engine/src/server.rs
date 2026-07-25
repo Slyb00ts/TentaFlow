@@ -1978,13 +1978,19 @@ fn mixed_gpu_group(
     quantum: usize,
 ) -> bool {
     let b = feed_idx.len();
-    // The decode rows count against the quantum: rows = take + b stays on the
-    // configured chunk's GEMM tile boundary (1024 + 16 rows would spill into
-    // an extra 128-row tile and cost ~12% more than the rows are worth).
-    let take = quantum
-        .saturating_sub(b)
-        .min(MAX_PREFILL_CHUNK.saturating_sub(b))
-        .min(active[pidx].pending_prompt.len());
+    let pending = active[pidx].pending_prompt.len();
+    let cap = quantum.min(MAX_PREFILL_CHUNK);
+    // Wiersze decode liczą się do kwantu, ale skracanie go ma sens TYLKO wtedy,
+    // gdy prompt i tak nie zmieści się w jednym chunku — wtedy nie dokłada
+    // granicy. Jeśli resztka promptu mieści się w kwancie, skrócenie wymusza
+    // DODATKOWY chunk, czyli kolejne pełne przejście po wagach (~11 ms na
+    // Bieliku) zamiast jednego kafla GEMM więcej (~6% jednego przejścia).
+    // Zmierzone: polityka skracająca dawała 780 tok/s przy p1024, bez niej 824.
+    let take = if pending + b <= cap {
+        pending
+    } else {
+        cap.saturating_sub(b).min(pending)
+    };
     if take == 0 {
         return false;
     }

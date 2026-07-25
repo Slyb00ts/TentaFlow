@@ -58,6 +58,25 @@ Ostatnia aktualizacja: 2026-07-25.
   `dense_prefill_artifacts_capable` wymagało już poprawnych
   `topk_batched_{partial,final}_f32`; nieaktualny był wyłącznie test.
   `forge-kernels` przechodzi w całości (42+9+70+1).
+- 🟡 **Mixed prefill+decode: hipoteza „nie włącza się dla Bielika" BŁĘDNA;
+  polityka kwantu poprawiona, regresja p1024 otwarta (2026-07-25).** Czytałem
+  25,9% czasu GPU w kernelach prefillu (profil decode-only C=32) jako niewtopiony
+  prefill. To był błąd: `mixed_step_capable` przepuszcza Bielika (głowa F16,
+  gęsty, bez tieru), a te kernele TO są kroki mieszane, które jednocześnie
+  posuwają decode. A/B `FORGE_MIXED_STEP`: in32/o256 **2 683 wobec 2 537 tok/s**
+  (mixed pomaga 5,7%, TTFT 95,7 wobec 106,5 ms), ale p1024/o128 **780 wobec 824**
+  (mixed SZKODZI 5,4%, TTFT 218,5 wobec 228,3 ms).
+  Poprawione po drodze: `mixed_gpu_group` skracał kwant o wiersze decode ZAWSZE
+  (`take = quantum - b`), więc prompt o długości 993..1024 dostawał chunk 992 i
+  wymagał drugiego, prawie pustego przejścia po wagach (~11 ms) zamiast jednego
+  kafla GEMM więcej (~6% jednego przejścia). Teraz kwant skraca się tylko wtedy,
+  gdy prompt i tak nie zmieści się w jednym chunku. Zakres poprawki jest wąski
+  (stara ścieżka i tak brała całość przez `.min(pending)`), więc w pomiarze
+  z promptami ~1030 tokenów jest neutralna — 2 720/775 wobec 2 683/780.
+  NIEWYJAŚNIONE: skąd 5,4% straty przy p1024. Do czasu diagnozy jest to jawny
+  lever: workloady zdominowane długimi promptami zyskują ~5% na
+  `FORGE_MIXED_STEP=0`, kosztem 4% TTFT. NIE dodawałem heurystyki wyłączającej
+  mixed po długości promptu — to byłoby strojenie bez zrozumienia przyczyny.
 - ❌ **Głowa logitów FP8 w batchowym decode: ZMIERZONA I ODRZUCONA
   (2026-07-25).** Profil B=32 pokazał głowę F16 jako 5% czasu GPU przy 465 GB/s
   (262 MB na krok), a paczka `fp8_lm_head` już istnieje — kusząco. Implementacja
