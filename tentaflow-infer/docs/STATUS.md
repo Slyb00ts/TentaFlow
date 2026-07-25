@@ -167,6 +167,42 @@ Ostatnia aktualizacja: 2026-07-25.
   Prefill 14 914 tok/s to 17,8 TOPS efektywnie, czyli 18% zmierzonego pułapu
   int8 karty; llama.cpp jest tam na 9,3 TOPS. Zapas do pułapu zostaje duży,
   bo model 0,6B ma małe GEMM-y i dominuje narzut warstw poza GEMM.
+- ✅ **BIELIK NVFP4 DZIAŁA NA RADEONIE (2026-07-25).** Model generuje poprawną,
+  merytoryczną polszczyznę (Warszawa/Kraków/Łódź z trafnymi opisami), a cztery
+  równoległe żądania przez `serve` też. Prefill 1 246 tok/s, decode 32,7 tok/s.
+  Trzy rzeczy trzeba było dołożyć:
+  1. **Kafel `gemm_nvfp4_dot4`.** Wartości e2m1 to same wielokrotności 0,5, więc
+     PODWOJONE są całkowite (0..12, mieszczą się w int8) — NVFP4 wchodzi na
+     `v_dot4_i32_i8` BEZ straty dokładności, a czynnik 2 pochłania skala grupy.
+     Grupa wag ma 16 kolumn, a blok kwantyzacji aktywacji 32, więc podblok
+     akumuluje dwie niezależne sumy int32 (tak samo jak Q6_K). 24 TOPS.
+  2. **Wariant `out_f32` kafli.** `lm_head` Bielika jest nieskwantowany
+     (`ignore: ["lm_head"]`), a batchowa głowa logitów zapisuje f32. Typ wyjścia
+     jest teraz parametrem wszystkich pięciu rodzin. Dotyczyło to nie tylko
+     Bielika — Mistral przy współbieżności >= 12 trafiłby w to samo.
+  3. Naprawa dekodowania float8 (osobny wpis niżej — to była PRZYCZYNA pustego
+     wyjścia mimo poprawnego prefillu).
+  ZOSTAJE: decode 32,7 tok/s to 134 GB/s, czyli 35% pasma karty, gdy Mistral o
+  tym samym rozmiarze osiąga 71%. Ścieżka gemv NVFP4 czyta wartości przez LUT w
+  LDS, a szybka CT-S0 N64/K128 jest wyłączona (brak jej kafli na tej karcie).
+- 🔴 **NVIDIA-owy inline asm KOMPILOWAŁ SIĘ CICHO NA AMD I LICZYŁ ŚMIECI
+  (2026-07-25).** `_e4m3x2_to_f16x2` (dekodowanie skal `float8_e4m3`) to
+  `inlined_assembly` z treścią PTX. Na gfx1030 kompilator zgłasza tylko
+  `unknown asm constraint 'h'` i **buduje kernel dalej**, z pominiętą
+  instrukcją: zamiast 1,5 wychodziło 1,1e-44. Zmierzone na karcie na ośmiu
+  kodach. Skutek: WSZYSTKIE kernele gemv NVFP4 i ścieżka KV fp8 liczyły na tej
+  karcie śmieci — Bielik generował pustkę mimo poprawnego prefillu.
+  Dlaczego to nie wyszło wcześniej: kernele z `mma` uczciwie NIE kompilują się
+  (błąd doboru instrukcji), więc cały czas zakładałem, że niezgodny inline asm
+  po prostu wypada z katalogu. Konwersja zachowuje się inaczej niż mma.
+  Naprawa: `f8e4m3_to_f32` i `f8e4m3x2_to_f16x2` w `arch_dot` jako JEDYNE
+  źródło, używane przez `gemv2` i `kv_fp8`. Wariant przenośny składa wzorzec
+  bitowy f32 (bias 7 -> 127, mantysa << 20) z osobną gałęzią dla subnormalnych.
+  ZABEZPIECZENIE: builder katalogu traktuje teraz `unknown asm constraint` jak
+  BŁĄD, bo inaczej ta klasa usterki wychodzi dopiero na wyniku modelu.
+  Audyt pozostałych `inlined_assembly`: `mma.sync` w `gemm.mojo`,
+  `gemm_fp8.mojo` i `tensor_core_i8.mojo` — wszystkie w kernelach, których na
+  gfx1030 NIE MA w katalogu, więc nie przeciekły.
 - ✅ **Liczba wątków bloku wynika teraz z wymiarów kafla (2026-07-25).**
   Trzy wpisy „128x64" w dyspozytorze Rusta przekazywały 512 wątków, a kernele są
   zbudowane na 256 ((BM/TM)*(BN/TN)). Nadmiarowe wątki adresowały poza kafel w
