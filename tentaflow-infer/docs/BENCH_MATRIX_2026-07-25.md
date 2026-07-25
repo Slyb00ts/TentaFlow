@@ -90,6 +90,18 @@ silnikach.
 |---|---:|---:|---:|---:|
 | qwen3-0.6B Q8_0 | **14 900** tok/s | 7 827 | **277,5** tok/s | 239,8 |
 | Mistral-7B Q4_K_M | **1 734** tok/s | 1 301 | 67,0 tok/s | **79,0** |
+| Bielik-7B NVFP4 | 1 246 tok/s | nie ładuje | 32,7 tok/s | nie ładuje |
+
+Bielika llama.cpp nie wczytuje (compressed-tensors NVFP4), więc porównanie jest
+międzykartowe: RTX 4090 robi na nim 13 367 tok/s prefillu i 158,4 tok/s decode,
+czyli 6900 XT jest 10,7x i 4,8x wolniejszy. Prefill 1 246 tok/s to 18,1 TOPS
+efektywnie wobec 25,1 TOPS Mistrala na tej samej karcie — różnica idzie z
+rozpakowywania e2m1 (kafel NVFP4 mierzy 24 TOPS w izolacji, Q4_K 32).
+DECODE JEST NIEDOMIARem: 32,7 tok/s przy modelu 4,1 GB to 134 GB/s, czyli 35%
+pasma, gdy Mistral o tym samym rozmiarze osiąga 71%. Ścieżka gemv NVFP4 czyta
+wartości przez LUT w LDS (jedno odczytanie na element), a szybka ścieżka
+CT-S0 N64/K128 jest na tej karcie wyłączona, bo brakuje jej kafli. To jest
+najbliższy do zamknięcia zapas na AMD.
 
 Prefill: **1,90x** i **1,33x**. Decode: 1,16x i 0,85x. Przewaga w prefillu rośnie
 z długością promptu (qwen: 1,35x przy p512, 1,90x przy p1024, 1,96x przy p2048)
