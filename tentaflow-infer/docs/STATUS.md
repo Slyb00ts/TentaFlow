@@ -79,6 +79,31 @@ Ostatnia aktualizacja: 2026-07-25.
   ten sam prompt greedy przy C=1 i C=6 daje teraz IDENTYCZNE wyjście (wcześniej
   ścieżki różniły się głową). Bramki: workspace 606/606, `batched_bielik`
   z paczkami FP8 2/2.
+- ✅ **Roofline gfx1030 zmierzony w Mojo — cel portu jest prefill (2026-07-25).**
+  Zamiast zgadywać, zmierzyłem, co ta karta potrafi, uruchamiając mikrobenchmarki
+  przez ścieżkę Mojo→AMDGPU:
+
+  | pomiar | wynik | teoretyczny szczyt |
+  |---|--:|--:|
+  | odczyt HBM | **395 GB/s** | ~512 GB/s |
+  | FP32 FMA | **18 TFLOPS** | ~23 TFLOPS |
+  | int8 `v_dot4_i32_i8` (inline asm) | **50 TOPS** | ~92 TOPS |
+
+  Wynik int8 jest DOLNYM ograniczeniem: pętla ma tylko cztery niezależne
+  akumulatory, więc jest raczej latency-bound niż throughput-bound.
+  ROZBICIE CELU wobec llama.cpp na ROCm (Mistral-7B Q4_K, 7,25e9 parametrów):
+  - **decode 79,2 tok/s = 346 GB/s = 88% zmierzonego pasma.** llama.cpp jest tam
+    praktycznie na rooflinie; zapasu jest może 12% i nie tam jest gra.
+  - **prefill 1 406 tok/s = 20,4 TOPS efektywnie = 41% zmierzonego pułapu int8.**
+    Przy pełnym wykorzystaniu `v_dot4_i32_i8` daje to **2,5x zapasu**, a więcej,
+    jeśli przebijemy mój latency-bound pomiar 50 TOPS.
+
+  WNIOSEK: cała okazja na RDNA2 leży w PREFILLU, a dźwignią jest int8 dot4, nie
+  fp16 — llama.cpp zostawia tę jednostkę częściowo niewykorzystaną. Prefillowy
+  GEMM budujemy więc wokół `v_dot4_i32_i8` (dequant Q4_K/Q8_0 do int8 plus
+  kwantyzacja aktywacji do int8), a nie wokół dekwantyzacji do fp16. Ta sama
+  matematyka jest przenośna na RDNA3/RDNA4, gdzie dodatkowo dochodzi WMMA.
+  Decode zostaje przy kernelach bandwidth-bound i tam wystarczy nie zepsuć.
 - ✅ **Pule VRAM i grafy w backendzie HIP (2026-07-25).** `HipDevice::new`
   przyjmuje `PoolSizes` i zajmuje z góry trzy pule z tą samą polityką co CUDA:
   bump dla wag, slab dla KV, pierścień dla aktywacji. `PoolSizes` przeniesione
