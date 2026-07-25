@@ -1723,6 +1723,16 @@ impl HybridStatePool {
 /// Buffers that exceed the standard decode scratch widths (the gated Q
 /// projection is `2*n_heads*head_dim`, the conv stream `conv_dim`) live here.
 struct HybridBufs {
+    /// Liczba wierszy, na jaką starczy `batched_*`. Rośnie razem z batch cap.
+    projection_rows: usize,
+    /// Projekcje wejściowe DeltaNet policzone RAZ dla wszystkich lane'ów.
+    /// Są bezstanowe, więc wiersze mogą pochodzić z różnych sekwencji, a jeden
+    /// przebieg po wagach zastępuje jeden przebieg na lane (gate_proj to około
+    /// 21 MB na warstwę — przy ośmiu lane'ach to była największa pozycja kroku).
+    batched_qkv_mixed: DevBuffer,
+    batched_z: DevBuffer,
+    batched_alpha: DevBuffer,
+    batched_beta_raw: DevBuffer,
     /// Gated Q projection output `[2*n_heads*head_dim]` f16.
     q_full: DevBuffer,
     /// De-interleaved query `[n_heads*head_dim]` f16.
@@ -14349,7 +14359,12 @@ impl Model {
     /// Allocate the hybrid single-token scratch (gated-attention de-interleave +
     /// DeltaNet conv/recurrence buffers) on first use.
     fn ensure_hybrid_bufs(&mut self) -> Result<()> {
-        if self.hybrid_bufs.is_some() {
+        let rows = self.batch_cap.max(1);
+        if self
+            .hybrid_bufs
+            .as_ref()
+            .is_some_and(|bufs| bufs.projection_rows >= rows)
+        {
             return Ok(());
         }
         let p = &self.weights.descriptor.params;
@@ -14364,6 +14379,11 @@ impl Model {
         let a16 = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
         let a32 = |elems: usize| device.alloc(elems * 4, MemKind::Device, Pool::Activations);
         self.hybrid_bufs = Some(HybridBufs {
+            projection_rows: rows,
+            batched_qkv_mixed: a16(rows * conv_dim)?,
+            batched_z: a16(rows * value_dim)?,
+            batched_alpha: a16(rows * nv)?,
+            batched_beta_raw: a16(rows * nv)?,
             q_full: a16(q_full)?,
             qc: a16(q_dim)?,
             gatec: a16(q_dim)?,
@@ -14446,7 +14466,10 @@ impl Model {
             let layer = &self.weights.layers[l];
             match &layer.mixer {
                 LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, &src)?,
-                LayerMixer::DeltaNet(d) => self.hybrid_delta_mixer(l, d)?,
+                LayerMixer::DeltaNet(d) => {
+                    self.hybrid_delta_projections(d, &b.x, 1)?;
+                    self.hybrid_delta_mixer(l, d, 0)?;
+                }
             }
             // Residual add (mixer output) + post-attention norm for the FFN.
             kernels.rmsnorm_residual_f16(
@@ -14633,7 +14656,52 @@ impl Model {
     /// Gated-DeltaNet linear-attention mixer for one hybrid layer. `b.x` is the
     /// pre-attention normed input; the mixer output lands in `b.o_out`. Advances
     /// this layer's resident conv window + recurrent state by one token.
-    fn hybrid_delta_mixer(&self, l: usize, d: &DeltaNetWeights) -> Result<()> {
+    /// Liczy cztery projekcje wejściowe DeltaNet dla `n_rows` wierszy `x` naraz.
+    /// Są bezstanowe, więc wiersze mogą należeć do różnych sekwencji; jeden
+    /// przebieg po wagach zastępuje `n_rows` przebiegów per lane. Trafia w tę
+    /// samą rodzinę weight-stationary dp4a (`gemm_q8_0_i8mma_b*`) co ścieżka
+    /// jednolane'owa, więc numeryka się nie zmienia.
+    fn hybrid_delta_projections(
+        &self,
+        d: &DeltaNetWeights,
+        x: &DevBuffer,
+        n_rows: usize,
+    ) -> Result<()> {
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+        if n_rows > hb.projection_rows {
+            return Err(ForgeError::Scheduler(format!(
+                "projekcje DeltaNet: {n_rows} wierszy przekracza pojemność {}",
+                hb.projection_rows
+            )));
+        }
+        for (y, w) in [
+            (&hb.batched_qkv_mixed, &d.in_proj),
+            (&hb.batched_z, &d.gate_proj),
+            (&hb.batched_alpha, &d.alpha_proj),
+            (&hb.batched_beta_raw, &d.beta_proj),
+        ] {
+            self.hybrid_project(y, w, x, n_rows)?;
+        }
+        Ok(())
+    }
+
+    /// Jedna projekcja hybrydy: `gemv` dla pojedynczego wiersza, batchowy `gemm`
+    /// dla wielu. Rozgałęzienie jest konieczne, bo ścieżka GEMM dla wag NVFP4
+    /// GGUF odrzuca jeden token (`gemm_nvfp4_gguf_f16 wymaga co najmniej dwóch`).
+    fn hybrid_project(
+        &self,
+        y: &DevBuffer,
+        w: &DevWeight,
+        x: &DevBuffer,
+        n_rows: usize,
+    ) -> Result<()> {
+        if n_rows == 1 {
+            return self.gemv(y, w, x, &self.stream);
+        }
+        self.gemm(y, w, x, n_rows, &self.stream)
+    }
+
+    fn hybrid_delta_mixer(&self, l: usize, d: &DeltaNetWeights, lane: usize) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let ssm = p.ssm.as_ref().expect("hybrid has ssm params");
         let eps = p.rms_norm_eps;
@@ -14653,12 +14721,19 @@ impl Model {
             .as_ref()
             .expect("DeltaNet layer has ssm state");
 
-        // Input projections: mixed q|k|v conv stream, output gate z, and the
-        // per-head decay/write-gate projections.
-        self.gemv(&hb.qkv_mixed, &d.in_proj, &b.x, stream)?;
-        self.gemv(&hb.z, &d.gate_proj, &b.x, stream)?;
-        self.gemv(&hb.alpha, &d.alpha_proj, &b.x, stream)?;
-        self.gemv(&hb.beta_raw, &d.beta_proj, &b.x, stream)?;
+        // Projekcje wejściowe policzył `hybrid_delta_projections` dla wszystkich
+        // lane'ów naraz; tutaj zostaje tylko przeniesienie własnego wiersza do
+        // jednotokenowego scratchu, z którego czytają kernele stanowe.
+        let n_v_alpha = n_v;
+        for (dst, src, elems) in [
+            (&hb.qkv_mixed, &hb.batched_qkv_mixed, conv_dim),
+            (&hb.z, &hb.batched_z, value_dim),
+            (&hb.alpha, &hb.batched_alpha, n_v_alpha),
+            (&hb.beta_raw, &hb.batched_beta_raw, n_v_alpha),
+        ] {
+            self.device
+                .copy(src, lane * elems * 2, dst, 0, elems * 2, stream)?;
+        }
 
         // Causal depthwise conv + SiLU (advances the conv window in place).
         kernels.deltanet_conv_silu_f16(
@@ -16330,6 +16405,12 @@ impl Model {
         )?;
 
         for layer_index in 0..self.weights.layers.len() {
+            // Projekcje DeltaNet są bezstanowe, więc lecą raz dla całego batcha
+            // z `bb.x` — jeden przebieg po wagach zamiast jednego na lane.
+            if let LayerMixer::DeltaNet(delta) = &self.weights.layers[layer_index].mixer {
+                let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                self.hybrid_delta_projections(delta, &bb.x, n)?;
+            }
             for (lane, seq) in seqs.iter_mut().enumerate() {
                 self.activate_hybrid_sequence(seq)?;
                 let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
@@ -16370,7 +16451,7 @@ impl Model {
                         self.hybrid_attn_mixer(layer_index, attention, &AttnSrc::Paged)?;
                     }
                     LayerMixer::DeltaNet(delta) => {
-                        self.hybrid_delta_mixer(layer_index, delta)?;
+                        self.hybrid_delta_mixer(layer_index, delta, lane)?;
                     }
                 }
                 let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");

@@ -58,37 +58,33 @@ Ostatnia aktualizacja: 2026-07-25.
   `dense_prefill_artifacts_capable` wymagało już poprawnych
   `topk_batched_{partial,final}_f32`; nieaktualny był wyłącznie test.
   `forge-kernels` przechodzi w całości (42+9+70+1).
-- 🟡 **Batchowanie projekcji DeltaNet: zmierzony rozkład i gotowy przepis
-  (2026-07-25).** Profil `nsys` przy B=8 po naprawach z tego dnia (ThinkingCap
-  Qwen3.6-27B, RTX 4090, 179 kroków w oknie 20 s, krok ~90 ms na 8 tokenów):
-
-  | pozycja | %GPU | launchy/krok | ms/krok |
-  |---|--:|--:|--:|
-  | `gemv_q8_0_dp4a` — projekcje DeltaNet PER LANE | **37,9** | **1526** | **37,45** |
-  | `gemm_nvfp4_gguf_batch` duży — FFN, batchowany | 23,9 | 192 | 23,63 |
-  | `gemm_nvfp4_gguf_batch` mały | 21,5 | 890 | 21,27 |
-  | `gemm_nvfp4_gguf_mma_bm32` | 5,2 | 12 | 5,10 |
-  | `deltanet value_key` scan | 2,4 | 381 | 2,36 |
-  | głowa logitów Q8_0 | 2,2 | 1 | 2,13 |
-
-  1526 launchy to dokładnie 8 lane'ów x 64 warstwy x 3 projekcje (gate/alpha/beta).
-  Dominuje `gate_proj` — `[value_dim=4096, hidden=5120]` Q8_0, około 21 MB na
-  warstwę, czytane OSOBNO dla każdego lane'a; przy 857 GB/s to praktycznie
-  roofline, czyli problemem jest liczba przejść po wagach, nie kernel.
-  PRZEPIS: projekcje są BEZSTANOWE, więc wiersze mogą pochodzić z różnych
-  sekwencji — `bb.x` już trzyma n wierszy obok siebie. Docelowy kernel ISTNIEJE:
-  `gemm_rows` z n wierszy trafia w `gemm_q8_0_small_batch_at` →
-  `gemm_q8_0_i8mma_b8`, czyli tę samą rodzinę weight-stationary dp4a co
-  jednolane'owy GEMV, więc parytet zachowany z konstrukcji (dowodzi go część (b)
-  testu `batched_matches_single_seq`, która porównuje batch 4 z serialem).
-  Zakres zmiany: wyciągnąć cztery projekcje wejściowe z `hybrid_delta_mixer`
-  do osobnego kroku liczonego raz na warstwę dla n wierszy, rozszerzyć
-  `HybridBufs.{qkv_mixed,z,alpha,beta_raw}` do `cap` wierszy i dodać offset lane
-  do konsumentów (`deltanet_conv_silu`, `log_decay`, `beta_sigmoid`,
-  `gated_rms`, `sigmoid_mul`) — cztery do pięciu wariantów `_at` launchera.
-  Ścieżka jednostrumieniowa staje się przypadkiem n=1 tego samego kodu, bez
-  drugiej implementacji. Szacunek z profilu: 37,45 → około 5 ms/krok, czyli
-  krok ~90 → ~58 ms i C=8 z 70 do ~110 tok/s.
+- ✅ **Batchowane projekcje DeltaNet: Qwen3.6-27B 71 → 109 tok/s (2026-07-25).**
+  Profil `nsys` przy B=8 pokazał, że `gemv_q8_0_dp4a` to **37,9% czasu GPU i
+  1526 launchy na krok** — dokładnie 8 lane'ów x 64 warstwy x 3 projekcje
+  (gate/alpha/beta), z dominującym `gate_proj` `[4096, 5120]` (~21 MB na warstwę
+  czytane OSOBNO dla każdego lane'a, przy 857 GB/s czyli na rooflinie). Problemem
+  była liczba przejść po wagach, nie kernel.
+  Projekcje są bezstanowe, więc wiersze mogą pochodzić z różnych sekwencji:
+  nowy `hybrid_delta_projections` liczy wszystkie cztery RAZ na warstwę dla n
+  wierszy z `bb.x`, a `hybrid_delta_mixer(l, d, lane)` przenosi swój wycinek do
+  jednotokenowego scratchu, z którego czytają kernele stanowe (conv, skan).
+  `HybridBufs` ma teraz `batched_{qkv_mixed,z,alpha,beta_raw}` na `cap` wierszy
+  i realokuje się, gdy batch cap wzrośnie. Ścieżka jednostrumieniowa to ten sam
+  kod z n=1, bez drugiej implementacji.
+  PUŁAPKA: `self.gemm(..., 1, ...)` NIE działa dla tych wag — ścieżka GEMM dla
+  NVFP4 GGUF odrzuca jeden token (`gemm_nvfp4_gguf_f16 wymaga co najmniej dwóch
+  tokenów`), co objawiło się HTTP 500 na każdym żądaniu. Dlatego `hybrid_project`
+  rozgałęzia: `gemv` dla jednego wiersza, batchowy `gemm` dla wielu.
+  Pomiar (RTX 4090, prompt 85, out 128, tokeny z `usage` serwera):
+  C=1 40,4 → **40,0** (bez regresji), C=4 66,0 → **89,4** (1,35x),
+  C=8 70,1 → **105,2** (1,50x), C=16 71,3 → **109,0** (1,53x).
+  Narastająco od parowania B=2: **50,8 → 109,0 tok/s przy C=16, czyli 2,15x**.
+  Single-stream z MTP bez zmian (111,7 tok/s, prefill 2 277). Bramki: cały
+  workspace **606/606**, koherencja i self-konsystencja przy 8 równoległych
+  requestach (cztery grupy identycznych promptów po jednym unikalnym wyjściu).
+  Zostaje: kopie D2D wycinka per lane (4 na warstwę na lane) da się później
+  usunąć, dodając offset lane do konsumentów (`deltanet_conv_silu`, `log_decay`,
+  `beta_sigmoid`, `gated_rms`, `sigmoid_mul`).
 - ✅ **Rozbieżność ścieżek decode naprawiona — dotyczyła WYŁĄCZNIE B=1
   (2026-07-25).** `batched_matches_single_seq` failował od dawna bez wyjaśnienia.
   Nowy `Model::read_single_logits` (symetryczny do `read_batch_logits`) i
