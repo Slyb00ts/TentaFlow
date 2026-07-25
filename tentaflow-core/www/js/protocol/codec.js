@@ -6331,15 +6331,17 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ProjectStudioBody(ReportQueryRequest). payload: { projectId, report, fromDate?, toDate?, suiteId? } — rows_json schema is per report. */
+  /** MessageBody::ProjectStudioBody(ReportQueryRequest). payload: { projectId, report, fromDate?, toDate?, suiteId?, runIds?:[] } — rows_json schema is per report; 'perf_compare' takes exactly two runIds. */
   projectStudioReportQueryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
+    const runIds = payload.runIds ?? payload.run_ids;
     const request = {
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       report: String(payload.report ?? ''),
       from_date: String(payload.fromDate ?? payload.from_date ?? ''),
       to_date: String(payload.toDate ?? payload.to_date ?? ''),
       suite_id: String(payload.suiteId ?? payload.suite_id ?? ''),
+      run_ids: (Array.isArray(runIds) ? runIds : []).map(String),
     };
     const body = _wasm.encodeProjectStudioReportQueryRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);

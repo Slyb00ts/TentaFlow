@@ -13,12 +13,16 @@
 // plus Phase-3: test environments with the admin approval queue (T12), live
 // automated/perf runs with artifacts (T10/T11), the code-case editor with AI
 // assist and try-run (T03), git/ZIP/OpenAPI knowledge sources (W01/W02/W04)
-// and code-kind generation with per-kind agents (T04/X04).
+// and code-kind generation with per-kind agents (T04/X04),
+// plus Phase-4: run schedules (T13), ML Studio links (X02), the kanban task
+// board (Z01), the performance / tester-activity reports (T14) and project
+// export / import archives.
 // tf-* components only; every visible string comes from i18n project_studio.*.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { Router } from '/js/router.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
 import { activityLabels } from '/js/lib/agent-activity-bridge.js';
@@ -52,6 +56,8 @@ import '/js/components/tf-pie-chart.js';
 import '/js/components/tf-sparkline.js';
 import '/js/components/tf-status-pill.js';
 import '/js/components/tf-code-editor.js';
+import '/js/components/tf-kanban.js';
+import '/js/components/tf-combobox.js';
 
 // Project roles ordered by capability; assignable set excludes 'owner'
 // (ownership moves only via the explicit transfer action).
@@ -133,6 +139,48 @@ const ARTIFACT_ICON = {
   perf_stats: 'chart-line', har: 'network', other: 'paperclip',
 };
 
+// ---- F4 constants ----------------------------------------------------------
+
+// 'interval' = every N m/h/d, 'cron' = daily "minute hour * * *", 'once' =
+// a single RFC3339 instant. next_run_at / next_runs_preview are ALWAYS taken
+// from the server: recomputing them here would disagree with the firing loop
+// around DST transitions.
+const SCHEDULE_KINDS = ['interval', 'cron', 'once'];
+const SCHEDULE_RUN_TYPES = ['manual', 'auto', 'perf'];
+const SCHEDULE_OUTCOME_CHIP = { started: 'ok', skipped: 'info', blocked: 'warn', error: 'err' };
+const SCHEDULE_LAST_CHIP = {
+  running: 'accent', completed: 'ok', cancelled: 'warn', error: 'err',
+  started: 'accent', skipped: 'info', blocked: 'warn',
+};
+const INTERVAL_RE = /^\d+[mhd]$/;
+const DAILY_CRON_RE = /^([0-5]?\d)\s+([01]?\d|2[0-3])\s+\*\s+\*\s+\*$/;
+const SCHEDULE_RUNS_LIMIT = 50;
+
+// ML Studio only knows 'editor' and 'viewer', so the five project roles
+// collapse onto two. The default map mirrors the server-side seed.
+const PROJECT_ROLES = ['owner', 'manager', 'editor', 'tester', 'viewer'];
+const ML_ROLES = ['editor', 'viewer'];
+const ML_DEFAULT_ROLE_MAP = {
+  owner: 'editor', manager: 'editor', editor: 'editor', tester: 'viewer', viewer: 'viewer',
+};
+
+// Board columns map 1:1 onto tasks.status; card order is NOT persisted in F4
+// (sorted by priority then updated_at), so a drag only ever writes the column.
+const TASK_BOARD_COLUMNS = [
+  { id: 'todo', accent: 'info' },
+  { id: 'in_progress', accent: 'accent' },
+  { id: 'review', accent: 'warning' },
+  { id: 'done', accent: 'success' },
+];
+const BOARD_PAGE_SIZE = 200;
+const TASKS_VIEW_KEY = 'ps.tasks.view';
+
+// Archive uploads use 4 MiB chunks (the server caps a single import chunk
+// there); progress is polled because the stream is only a live log view.
+const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024;
+const ARCHIVE_POLL_MS = 2000;
+const ARCHIVE_LOG_CAP = 200;
+
 const state = {
   me: null,
   isAdmin: false,
@@ -181,6 +229,10 @@ const state = {
   tasksView: null,
   // G02 — unread badge count (source of truth: NotificationsListRequest).
   notifUnread: 0,
+  // F4 — X02 links tab ({ links, canManage, loaded }).
+  connections: null,
+  // F4 — live export/import job: { jobId, kind, unsub, pollTimer, log }.
+  archiveJob: null,
 };
 
 // Fresh F2 state for every opened project — drill-in views, pollers and
@@ -208,7 +260,11 @@ function freshF2State() {
     genPollTimer: null,
     genWidget: null,
     genSteps: [],
-    reports: { from: '', to: '', suiteId: '', loaded: false, data: {} },
+    // `perfSuiteId` / `perfEndpoint` scope the F4 performance card only; the
+    // toolbar suite filter still drives every other report.
+    reports: { from: '', to: '', suiteId: '', perfSuiteId: '', perfEndpoint: '', loaded: false, data: {} },
+    // T13 — schedules; `serverTimezone` is the node zone the loop fires in.
+    schedules: { rows: [], loaded: false, serverTimezone: '', kind: '', status: '', search: '' },
     // F3 — environments (T12), runner discovery and the live automated run
     // (T10/T11). `autoRun` owns its own stream + poll, torn down by
     // stopTestsLive() like every other live artifact of the tests tab.
@@ -224,7 +280,30 @@ function freshTasksState() {
   return {
     rows: [], total: 0, page: 1,
     filters: { type: '', status: '', mine: false, search: '' },
+    // 'list' | 'board' — remembered per project in localStorage.
+    mode: 'list',
+    // Board rows are a separate, unpaginated fetch: a kanban with a page cut
+    // in the middle of a column would silently hide cards.
+    boardRows: [],
   };
+}
+
+// localStorage is best-effort (private mode / disabled storage throws).
+function readTasksViewMode(id) {
+  try {
+    const mode = window.localStorage.getItem(`${TASKS_VIEW_KEY}.${id}`);
+    return mode === 'board' ? 'board' : 'list';
+  } catch {
+    return 'list';
+  }
+}
+
+function writeTasksViewMode(id, mode) {
+  try {
+    window.localStorage.setItem(`${TASKS_VIEW_KEY}.${id}`, mode);
+  } catch {
+    /* storage unavailable — the mode simply does not survive a reload */
+  }
 }
 
 function sprite(id) {
@@ -309,6 +388,7 @@ const ProjectStudioScreen = {
             <tf-searchbox id="ps-search" placeholder="${escapeAttr(t('search_placeholder'))}" debounce="200"></tf-searchbox>
             <tf-button variant="ghost" icon="refresh" id="ps-refresh">${escapeHtml(t('refresh'))}</tf-button>
             ${bellHtml()}
+            <tf-button variant="ghost" icon="cloud" id="ps-import" hidden>${escapeHtml(t('import_btn'))}</tf-button>
             <tf-button variant="primary" icon="plus" id="ps-new" hidden>${escapeHtml(t('new_project'))}</tf-button>
           </div>
         </div>
@@ -329,6 +409,7 @@ const ProjectStudioScreen = {
 
     byId('ps-refresh')?.addEventListener('click', () => loadProjects());
     byId('ps-new')?.addEventListener('click', () => openWizard());
+    byId('ps-import')?.addEventListener('click', () => openImportWindow());
     byId('ps-search')?.addEventListener('search', (e) => {
       state.searchQuery = String(e.detail?.value ?? '');
       renderProjectGrid();
@@ -357,6 +438,7 @@ const ProjectStudioScreen = {
     stopAllJobTracking();
     stopChatStream();
     stopTestsLive();
+    stopArchiveJob();
     state.projects = [];
     state.project = null;
     state.tab = 'overview';
@@ -375,6 +457,7 @@ const ProjectStudioScreen = {
     state.listFilter = 'active';
     state.f2 = null;
     state.tasksView = null;
+    state.connections = null;
   },
 };
 
@@ -461,8 +544,10 @@ function openPromptWindow({ title, label, value = '', icon = 'edit' }) {
 }
 
 // G01 — reusable danger confirmation window. `requireName` forces the operator
-// to retype the exact name before the destructive button unlocks.
-function openDeleteWindow({ title, targetName, targetSub, targetIcon = 'folder', warning, items = [], requireName = null, confirmLabel, onConfirm }) {
+// to retype the exact name before the destructive button unlocks. `extraHtml`
+// adds one decision to the same window (e.g. "also revoke ML access"); the
+// confirmation body is handed to `onConfirm` so it can read those controls.
+function openDeleteWindow({ title, targetName, targetSub, targetIcon = 'folder', warning, items = [], requireName = null, extraHtml = '', confirmLabel, onConfirm }) {
   const { body, foot, cleanup } = openWindow({ title, icon: 'alert', width: 540 });
 
   const itemsHtml = items.map((item) => `
@@ -485,6 +570,7 @@ function openDeleteWindow({ title, targetName, targetSub, targetIcon = 'folder',
     </div>
     <div class="ps-del-banner">${sprite('alert')}<span>${escapeHtml(warning)}</span></div>
     ${items.length ? `<div class="ps-del-label">${escapeHtml(t('delete_will_remove'))}</div><div class="ps-del-list">${itemsHtml}</div>` : ''}
+    ${extraHtml}
     ${requireName ? `
       <div class="ps-field">
         <tf-input id="ps-del-confirm" label="${escapeAttr(t('delete_retype_label'))}" placeholder="${escapeAttr(requireName)}"></tf-input>
@@ -515,7 +601,7 @@ function openDeleteWindow({ title, targetName, targetSub, targetIcon = 'folder',
     if (btn.dataset.action === 'cancel') { cleanup(); return; }
     btn.setAttribute('disabled', '');
     try {
-      await onConfirm();
+      await onConfirm(body);
       cleanup();
     } catch (err) {
       btn.removeAttribute('disabled');
@@ -541,6 +627,9 @@ async function loadProjects() {
   }
   const newBtn = byId('ps-new');
   if (newBtn) newBtn.hidden = !state.canCreate;
+  // Importing writes a brand-new project, so it needs the same creation grant.
+  const importBtn = byId('ps-import');
+  if (importBtn) importBtn.hidden = !state.canCreate;
   const hint = byId('ps-create-hint');
   if (hint) hint.hidden = !state.canCreate;
   const sub = byId('ps-list-sub');
@@ -1059,6 +1148,8 @@ async function openProject(projectId, deep = null) {
   state.chatMessages = [];
   state.f2 = freshF2State();
   state.tasksView = freshTasksState();
+  state.tasksView.mode = readTasksViewMode(projectId);
+  state.connections = null;
 
   const listView = byId('ps-list-view');
   const projectView = byId('ps-project-view');
@@ -1067,7 +1158,7 @@ async function openProject(projectId, deep = null) {
   projectView.hidden = false;
 
   const modules = Array.isArray(project.modules) ? project.modules : [];
-  if (deep?.tab && (deep.tab === 'overview' || modules.includes(deep.tab) || deep.tab === 'members')) {
+  if (deep?.tab && (deep.tab === 'overview' || modules.includes(deep.tab) || deep.tab === 'members' || deep.tab === 'connections')) {
     state.tab = deep.tab;
   }
   if (deep?.sub && state.tab === 'tests' && TESTS_SEGMENTS.includes(deep.sub)) {
@@ -1083,7 +1174,9 @@ async function openProject(projectId, deep = null) {
 function closeProject() {
   stopAllJobTracking();
   stopChatStream();
+  stopArchiveJob();
   state.project = null;
+  state.connections = null;
   const listView = byId('ps-list-view');
   const projectView = byId('ps-project-view');
   if (projectView) { projectView.hidden = true; projectView.innerHTML = ''; }
@@ -1114,6 +1207,9 @@ function enabledTabs() {
   if (modules.includes('tests')) tabs.push({ id: 'tests', icon: 'list' });
   if (modules.includes('tasks')) tabs.push({ id: 'tasks', icon: 'check' });
   if (modules.includes('chat')) tabs.push({ id: 'chat', icon: 'message' });
+  // Connections are not a project module: every project can be linked to ML
+  // Studio, and the link list is readable by every member.
+  tabs.push({ id: 'connections', icon: 'brain' });
   tabs.push({ id: 'members', icon: 'users' });
   if (canManage()) tabs.push({ id: 'settings', icon: 'settings' });
   return tabs;
@@ -1145,6 +1241,7 @@ function renderProjectShell() {
       <span slot="actions">
         <tf-button variant="ghost" icon="chevron-left" data-back-list>${escapeHtml(t('back_to_list'))}</tf-button>
         ${bellHtml()}
+        ${canManage() ? `<tf-button variant="ghost" icon="download" data-export>${escapeHtml(t('export_btn'))}</tf-button>` : ''}
         <tf-button variant="ghost" icon="users" data-goto-members>${escapeHtml(t('tab_members'))}</tf-button>
         ${canManage() ? `<tf-button variant="ghost" icon="settings" data-goto-settings>${escapeHtml(t('tab_settings'))}</tf-button>` : ''}
       </span>
@@ -1166,6 +1263,7 @@ function renderProjectShell() {
     closeProject();
   });
   host.querySelector('[data-back-list]')?.addEventListener('click', () => closeProject());
+  host.querySelector('[data-export]')?.addEventListener('click', () => openExportWindow());
   host.querySelector('[data-goto-members]')?.addEventListener('click', () => selectTab('members'));
   host.querySelector('[data-goto-settings]')?.addEventListener('click', () => selectTab('settings'));
   wireBellEvents(host);
@@ -1200,6 +1298,7 @@ async function switchTab(tab) {
     case 'knowledge': await renderKnowledge(); break;
     case 'tests': await renderTests(); break;
     case 'tasks': await renderTasksTab(); break;
+    case 'connections': await renderConnections(); break;
     case 'chat': await renderChat(); break;
     case 'members': await renderMembers(); break;
     case 'settings': await renderSettings(); break;
@@ -1268,6 +1367,16 @@ async function renderOverview() {
       <tf-stat-card icon="check" label="${escapeAttr(t('kpi_tasks_open'))}" value="${kv('tasks_open', 'tasksOpen')}"
         ${kv('defects_open', 'defectsOpen') > 0 ? `delta="${escapeAttr(t('kpi_defects_open', { count: kv('defects_open', 'defectsOpen') }))}" delta-type="warn"` : ''}></tf-stat-card>
   ` : '';
+  // A blocked schedule keeps its "enabled" flag but stops producing runs, so it
+  // is surfaced next to the count instead of being folded into it.
+  const schedulesBlocked = kv('schedules_blocked', 'schedulesBlocked');
+  const schedulesKpi = modules.includes('tests') ? `
+      <tf-stat-card icon="clock" label="${escapeAttr(t('kpi_schedules'))}" value="${kv('schedules_enabled', 'schedulesEnabled')}"
+        ${schedulesBlocked > 0 ? `delta="${escapeAttr(t('kpi_schedules_blocked', { count: schedulesBlocked }))}" delta-type="warn"` : ''}></tf-stat-card>
+  ` : '';
+  const mlKpi = `
+      <tf-stat-card icon="brain" label="${escapeAttr(t('kpi_ml_links'))}" value="${kv('ml_links', 'mlLinks')}"></tf-stat-card>
+  `;
 
   panel.innerHTML = `
     <div class="ps-kpi-grid">
@@ -1279,6 +1388,8 @@ async function renderOverview() {
         delta="${escapeAttr(t('kpi_my_chats', { count: kpis?.my_chat_count ?? kpis?.myChatCount ?? 0 }))}" delta-type="neutral"></tf-stat-card>
       ${testsKpis}
       ${tasksKpis}
+      ${schedulesKpi}
+      ${mlKpi}
     </div>
 
     <div class="ps-overview-cols">
@@ -3622,7 +3733,7 @@ function attachmentRowHtml(att, index, { removable = false } = {}) {
 // F2 — tests tab shell (sub-nav: cases / suites / runs / generations / reports)
 // =============================================================================
 
-const TESTS_SEGMENTS = ['cases', 'suites', 'runs', 'generations', 'environments', 'reports'];
+const TESTS_SEGMENTS = ['cases', 'suites', 'runs', 'generations', 'environments', 'schedules', 'reports'];
 
 // Drill-in views highlight their parent segment in the sub-nav.
 function testsSegValue() {
@@ -3679,6 +3790,7 @@ async function renderTestsView() {
     case 'gen-detail': await renderGenDetailView(); break;
     case 'environments': await renderEnvironmentsView(); break;
     case 'env-approvals': await renderEnvApprovalsView(); break;
+    case 'schedules': await renderSchedulesView(); break;
     case 'reports': await renderReportsView(); break;
     default: f2().view = 'cases'; await renderCasesView(); break;
   }
@@ -8307,7 +8419,10 @@ async function finishExecItem() {
 // T14 — reports (5 report kinds over the generic ReportQuery; CSV client-side)
 // =============================================================================
 
-const REPORT_KINDS = ['runs_over_time', 'suite_pass_rate', 'tester_stats', 'source_coverage', 'defects'];
+const REPORT_KINDS = [
+  'runs_over_time', 'suite_pass_rate', 'tester_stats', 'source_coverage', 'defects',
+  'perf_trend', 'tester_activity',
+];
 
 // rows_json schema is per report and owned by the backend; the UI reads the
 // first matching key from a candidate list so field naming stays flexible.
@@ -8370,7 +8485,9 @@ async function loadReports() {
     report: kind,
     fromDate: rep.from,
     toDate: rep.to,
-    suiteId: rep.suiteId,
+    // The performance card carries its own suite picker; every other report
+    // follows the toolbar filter.
+    suiteId: kind === 'perf_trend' ? (rep.perfSuiteId || rep.suiteId) : rep.suiteId,
   })));
   rep.data = {};
   results.forEach((res, i) => {
@@ -8390,10 +8507,11 @@ async function loadReports() {
   if (state.tab === 'tests' && s.view === 'reports') renderReportSections();
 }
 
-function reportSectionShell(kind, icon, chartId) {
+function reportSectionShell(kind, icon, chartId, extraActions = '') {
   return `
     <tf-section-card class="ps-report-card" title="${escapeAttr(t(`report_${kind}_title`))}" icon="${icon}">
       <span slot="actions">
+        ${extraActions}
         <tf-button variant="ghost" size="sm" icon="download" data-report-csv="${kind}" title="${escapeAttr(t('reports_export_csv'))}"></tf-button>
       </span>
       <div id="${chartId}" class="ps-report-body"></div>
@@ -8402,7 +8520,6 @@ function reportSectionShell(kind, icon, chartId) {
 }
 
 function renderReportSections() {
-  const rep = f2().reports;
   const grid = byId('ps-reports-grid');
   if (!grid) return;
   grid.innerHTML = `
@@ -8411,12 +8528,20 @@ function renderReportSections() {
     ${reportSectionShell('tester_stats', 'users', 'ps-rep-testers')}
     ${reportSectionShell('source_coverage', 'database', 'ps-rep-coverage')}
     ${reportSectionShell('defects', 'alert', 'ps-rep-defects')}
+    ${reportSectionShell('perf_trend', 'chart-line', 'ps-rep-perf', `
+      <tf-button variant="ghost" size="sm" icon="grid-2x2" data-perf-compare>${escapeHtml(t('report_perf_compare'))}</tf-button>
+    `)}
+    ${reportSectionShell('tester_activity', 'users', 'ps-rep-activity')}
   `;
   // renderReportSections may run twice on the same grid element (initial view
   // + after "Generate") — wire the CSV delegate only once.
   if (!grid.dataset.csvWired) {
     grid.dataset.csvWired = '1';
     grid.addEventListener('click', (e) => {
+      if (e.target.closest('[data-perf-compare]')) {
+        openPerfCompareWindow();
+        return;
+      }
       const btn = e.target.closest('[data-report-csv]');
       if (!btn) return;
       const kind = btn.dataset.reportCsv;
@@ -8429,22 +8554,9 @@ function renderReportSections() {
     });
   }
 
-  const emptyOrError = (kind, hostEl) => {
-    const data = rep.data[kind] || { rows: [], error: null };
-    if (data.error) {
-      hostEl.innerHTML = `<div class="ps-form-error">${escapeHtml(data.error)}</div>`;
-      return null;
-    }
-    if (!data.rows.length) {
-      hostEl.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('reports_no_data'))}</div>`;
-      return null;
-    }
-    return data.rows;
-  };
-
   // 1) Trend — pass-rate line over time.
   const trendHost = byId('ps-rep-trend');
-  const trendRows = emptyOrError('runs_over_time', trendHost);
+  const trendRows = reportRows('runs_over_time', trendHost);
   if (trendRows) {
     const points = trendRows.map((row) => {
       const x = String(rowVal(row, ['date', 'day', 'bucket', 'label'], ''));
@@ -8467,7 +8579,7 @@ function renderReportSections() {
 
   // 2) Results — stacked bar per suite/run bucket.
   const resultsHost = byId('ps-rep-results');
-  const resultRows = emptyOrError('suite_pass_rate', resultsHost);
+  const resultRows = reportRows('suite_pass_rate', resultsHost);
   if (resultRows) {
     const statuses = [
       { key: 'passed', tone: 'success' },
@@ -8494,7 +8606,7 @@ function renderReportSections() {
 
   // 3) Tester stats table.
   const testersHost = byId('ps-rep-testers');
-  const testerRows = emptyOrError('tester_stats', testersHost);
+  const testerRows = reportRows('tester_stats', testersHost);
   if (testerRows) {
     testersHost.innerHTML = `
       <tf-table>
@@ -8519,7 +8631,7 @@ function renderReportSections() {
 
   // 4) Source coverage — custom rows so uncovered sources can be highlighted.
   const coverageHost = byId('ps-rep-coverage');
-  const coverageRows = emptyOrError('source_coverage', coverageHost);
+  const coverageRows = reportRows('source_coverage', coverageHost);
   if (coverageRows) {
     coverageHost.innerHTML = `
       <div class="ps-coverage-head">
@@ -8543,7 +8655,7 @@ function renderReportSections() {
 
   // 5) Defects — pie by severity.
   const defectsHost = byId('ps-rep-defects');
-  const defectRows = emptyOrError('defects', defectsHost);
+  const defectRows = reportRows('defects', defectsHost);
   if (defectRows) {
     const tones = { low: 'info', medium: 'primary', high: 'warning', critical: 'critical' };
     // Backend emits one row per (severity, status) pair — fold counts into a
@@ -8573,6 +8685,361 @@ function renderReportSections() {
       defectsHost.replaceChildren(chart);
     }
   }
+
+  // 6) Performance trend (F4) and 7) tester activity (F4).
+  renderPerfReport();
+  renderTesterActivityReport();
+}
+
+// Writes the "no data" / error placeholder into `hostEl` and returns null, or
+// hands back the rows when the report has content.
+function reportRows(kind, hostEl) {
+  const data = f2().reports.data[kind] || { rows: [], error: null };
+  if (data.error) {
+    hostEl.innerHTML = `<div class="ps-form-error">${escapeHtml(data.error)}</div>`;
+    return null;
+  }
+  if (!data.rows.length) {
+    hostEl.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('reports_no_data'))}</div>`;
+    return null;
+  }
+  return data.rows;
+}
+
+// =============================================================================
+// T14 (F4) — report 7: performance trend + run comparison
+// =============================================================================
+
+// perf_trend rows are one per (run, endpoint): {run_id, run_no, started_at,
+// endpoint, p50_ms, p90_ms, p99_ms, rps, failures, requests, users}.
+function perfRuns(rows) {
+  const byRun = new Map();
+  for (const row of rows) {
+    const runId = String(rowVal(row, ['run_id'], ''));
+    if (!runId || byRun.has(runId)) continue;
+    byRun.set(runId, {
+      runId,
+      runNo: Number(rowVal(row, ['run_no'], 0)),
+      startedAt: String(rowVal(row, ['started_at'], '')),
+    });
+  }
+  return [...byRun.values()].sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
+}
+
+function perfEndpoints(rows) {
+  return [...new Set(rows.map((row) => String(rowVal(row, ['endpoint'], ''))).filter(Boolean))];
+}
+
+function renderPerfReport() {
+  const s = f2();
+  const rep = s.reports;
+  const host = byId('ps-rep-perf');
+  if (!host) return;
+  const rows = reportRows('perf_trend', host);
+  if (!rows) return;
+
+  const runs = perfRuns(rows);
+  const endpoints = perfEndpoints(rows);
+  if (!endpoints.includes(rep.perfEndpoint)) rep.perfEndpoint = endpoints[0] || '';
+  const latest = runs[runs.length - 1] || null;
+  const latestRows = latest ? rows.filter((row) => String(rowVal(row, ['run_id'], '')) === latest.runId) : [];
+
+  host.innerHTML = `
+    <div class="ps-perf-report-bar">
+      <tf-select id="ps-rep-perf-suite" label="${escapeAttr(t('reports_suite'))}" value="${escapeAttr(rep.perfSuiteId)}">
+        <option value="" ${rep.perfSuiteId ? '' : 'selected'}>${escapeHtml(t('reports_suite_all'))}</option>
+        ${s.suites.map((su) => {
+          const sid = fv(su, 'suite_id');
+          return `<option value="${escapeAttr(sid)}" ${sid === rep.perfSuiteId ? 'selected' : ''}>${escapeHtml(su.name)}</option>`;
+        }).join('')}
+      </tf-select>
+      <tf-select id="ps-rep-perf-endpoint" label="${escapeAttr(t('report_perf_endpoint'))}" value="${escapeAttr(rep.perfEndpoint)}">
+        ${endpoints.map((ep) => `<option value="${escapeAttr(ep)}" ${ep === rep.perfEndpoint ? 'selected' : ''}>${escapeHtml(ep)}</option>`).join('')}
+      </tf-select>
+    </div>
+    <div id="ps-rep-perf-chart"></div>
+    <div class="ps-report-subtitle">${escapeHtml(latest
+      ? t('report_perf_latest', { no: latest.runNo, at: formatTimestamp(latest.startedAt) })
+      : t('reports_no_data'))}</div>
+    <div id="ps-rep-perf-table"></div>
+  `;
+
+  byId('ps-rep-perf-suite')?.addEventListener('change', async (e) => {
+    rep.perfSuiteId = e.detail?.value ?? e.target.value ?? '';
+    await reloadPerfTrend();
+  });
+  byId('ps-rep-perf-endpoint')?.addEventListener('change', (e) => {
+    rep.perfEndpoint = e.detail?.value ?? e.target.value ?? '';
+    renderPerfReport();
+  });
+
+  const series = [
+    { key: 'p50_ms', tone: 'success' },
+    { key: 'p90_ms', tone: 'warning' },
+    { key: 'p99_ms', tone: 'critical' },
+  ];
+  const chart = document.createElement('tf-line-chart');
+  chart.height = 220;
+  chart.xAxis = { scale: 'category', min: null, max: null, ticks: null, format: null };
+  chart.yAxis = { scale: 'linear', min: 0, max: null, ticks: 5, format: (v) => `${Math.round(v)}` };
+  chart.series = series.map((sr) => ({
+    id: sr.key,
+    name: t(`report_perf_${sr.key}`),
+    tone: sr.tone,
+    style: 'solid',
+    showInLegend: true,
+    points: runs.map((run) => {
+      const row = rows.find((r) => String(rowVal(r, ['run_id'], '')) === run.runId
+        && String(rowVal(r, ['endpoint'], '')) === rep.perfEndpoint);
+      return { x: `#${run.runNo}`, y: Number(rowVal(row || {}, [sr.key], 0)) };
+    }),
+  }));
+  byId('ps-rep-perf-chart')?.replaceChildren(chart);
+
+  const tableHost = byId('ps-rep-perf-table');
+  if (!tableHost || !latestRows.length) return;
+  tableHost.innerHTML = `
+    <tf-table>
+      <tf-column key="endpoint" label="${escapeAttr(t('report_perf_endpoint'))}"></tf-column>
+      <tf-column key="p50" label="${escapeAttr(t('report_perf_p50_ms'))}" renderer="num"></tf-column>
+      <tf-column key="p90" label="${escapeAttr(t('report_perf_p90_ms'))}" renderer="num"></tf-column>
+      <tf-column key="p99" label="${escapeAttr(t('report_perf_p99_ms'))}" renderer="num"></tf-column>
+      <tf-column key="rps" label="${escapeAttr(t('report_perf_rps'))}" renderer="num"></tf-column>
+      <tf-column key="failures" label="${escapeAttr(t('report_perf_failures'))}" renderer="num"></tf-column>
+    </tf-table>
+  `;
+  tableHost.querySelector('tf-table').rows = latestRows.map((row) => ({
+    endpoint: String(rowVal(row, ['endpoint'], '—')),
+    p50: formatNum(rowVal(row, ['p50_ms'], 0)),
+    p90: formatNum(rowVal(row, ['p90_ms'], 0)),
+    p99: formatNum(rowVal(row, ['p99_ms'], 0)),
+    rps: formatNum(rowVal(row, ['rps'], 0)),
+    failures: Number(rowVal(row, ['failures'], 0)),
+  }));
+}
+
+// Re-queries only perf_trend: the other six reports keep the toolbar filters.
+async function reloadPerfTrend() {
+  const s = f2();
+  const rep = s.reports;
+  try {
+    const resp = await ApiBinary.one('projectStudioReportQueryRequest', {
+      projectId: projectId(),
+      report: 'perf_trend',
+      fromDate: rep.from,
+      toDate: rep.to,
+      suiteId: rep.perfSuiteId || rep.suiteId,
+    });
+    const parsed = JSON.parse(fv(resp, 'rows_json') || '[]');
+    rep.data.perf_trend = { rows: Array.isArray(parsed) ? parsed : [], error: null };
+  } catch (err) {
+    rep.data.perf_trend = { rows: [], error: err.message };
+  }
+  rep.perfEndpoint = '';
+  if (state.tab === 'tests' && s.view === 'reports') renderPerfReport();
+}
+
+// Compare window: two perf runs -> per-endpoint deltas. `status` marks an
+// endpoint that exists in only one of the two runs.
+function openPerfCompareWindow() {
+  const rep = f2().reports;
+  const runs = perfRuns(rep.data.perf_trend?.rows || []);
+  if (runs.length < 2) {
+    toast(t('report_perf_compare_need_two'), 'info');
+    return;
+  }
+  const { body, foot, cleanup } = openWindow({
+    title: t('report_perf_compare_title'),
+    subtitle: t('report_perf_compare_sub'),
+    icon: 'grid-2x2',
+    width: 820,
+  });
+  const label = (run) => `#${run.runNo} · ${formatTimestamp(run.startedAt)}`;
+  const optionsFor = (selected) => runs
+    .map((run) => `<option value="${escapeAttr(run.runId)}" ${run.runId === selected ? 'selected' : ''}>${escapeHtml(label(run))}</option>`)
+    .join('');
+  const initialA = runs[runs.length - 2].runId;
+  const initialB = runs[runs.length - 1].runId;
+
+  body.innerHTML = `
+    <div class="ps-perf-compare-bar">
+      <tf-select id="ps-perf-a" label="${escapeAttr(t('report_perf_run_a'))}" value="${escapeAttr(initialA)}">${optionsFor(initialA)}</tf-select>
+      <tf-select id="ps-perf-b" label="${escapeAttr(t('report_perf_run_b'))}" value="${escapeAttr(initialB)}">${optionsFor(initialB)}</tf-select>
+      <tf-button variant="primary" icon="chart-line" data-action="compare">${escapeHtml(t('report_perf_compare_run'))}</tf-button>
+    </div>
+    <div id="ps-perf-compare-host"><div class="ps-field-hint">${escapeHtml(t('report_perf_compare_hint'))}</div></div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="close-compare">${escapeHtml(t('action_close'))}</tf-button>
+    </div>
+  `;
+  foot.addEventListener('click', (e) => {
+    if (e.target.closest('[data-action="close-compare"]')) cleanup();
+  });
+
+  const showError = (msg) => {
+    const el = body.querySelector('[data-form-error]');
+    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  };
+
+  body.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action="compare"]');
+    if (!btn) return;
+    const runA = String(body.querySelector('#ps-perf-a')?.value ?? '');
+    const runB = String(body.querySelector('#ps-perf-b')?.value ?? '');
+    if (!runA || !runB || runA === runB) { showError(t('report_perf_compare_same')); return; }
+    showError(null);
+    const host = body.querySelector('#ps-perf-compare-host');
+    host.innerHTML = `<div class="ps-loading"><tf-spinner size="sm"></tf-spinner> ${escapeHtml(t('reports_loading'))}</div>`;
+    let rows = [];
+    try {
+      const resp = await ApiBinary.one('projectStudioReportQueryRequest', {
+        projectId: projectId(),
+        report: 'perf_compare',
+        runIds: [runA, runB],
+      });
+      const parsed = JSON.parse(fv(resp, 'rows_json') || '[]');
+      rows = Array.isArray(parsed) ? parsed : [];
+    } catch (err) {
+      host.innerHTML = `<div class="ps-form-error">${escapeHtml(err.message)}</div>`;
+      return;
+    }
+    if (!rows.length) {
+      host.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('reports_no_data'))}</div>`;
+      return;
+    }
+    renderPerfCompareTable(host, rows);
+  });
+}
+
+function renderPerfCompareTable(host, rows) {
+  const metric = (side, key) => (side && side[key] != null ? formatNum(side[key]) : '—');
+  // A negative delta is faster, so "down" is the good direction here.
+  const deltaCell = (delta, key) => {
+    const value = delta && delta[key] != null ? Number(delta[key]) : null;
+    if (value === null || !Number.isFinite(value)) return '<span>—</span>';
+    const tone = value > 1 ? 'ps-delta-worse' : (value < -1 ? 'ps-delta-better' : 'ps-delta-flat');
+    const sign = value > 0 ? '+' : '';
+    return `<span class="${tone}">${escapeHtml(`${sign}${formatNum(value)}%`)}</span>`;
+  };
+  host.innerHTML = `
+    <table class="ps-compare-table">
+      <thead>
+        <tr>
+          <th>${escapeHtml(t('report_perf_endpoint'))}</th>
+          <th>${escapeHtml(t('report_perf_p50_ms'))}</th>
+          <th>${escapeHtml(t('report_perf_p90_ms'))}</th>
+          <th>${escapeHtml(t('report_perf_p99_ms'))}</th>
+          <th>${escapeHtml(t('report_perf_rps'))}</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map((row) => {
+          const status = String(rowVal(row, ['status'], '') || '');
+          const a = row.a || {};
+          const b = row.b || {};
+          const delta = row.delta_pct || row.deltaPct || {};
+          const badge = status
+            ? `<tf-chip status="${status === 'added' ? 'ok' : 'warn'}">${escapeHtml(t(`report_perf_status_${status}`))}</tf-chip>`
+            : '';
+          const cell = (key) => `
+            <td>
+              <div class="ps-compare-values"><b>${escapeHtml(metric(a, key))}</b> → <b>${escapeHtml(metric(b, key))}</b></div>
+              <div class="ps-compare-delta">${deltaCell(delta, key)}</div>
+            </td>
+          `;
+          return `
+            <tr class="${status ? `is-${escapeAttr(status)}` : ''}">
+              <td><div class="ps-compare-endpoint">${escapeHtml(String(rowVal(row, ['endpoint'], '—')))}</div>${badge}</td>
+              ${cell('p50_ms')}${cell('p90_ms')}${cell('p99_ms')}${cell('rps')}
+            </tr>
+          `;
+        }).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+// =============================================================================
+// T14 (F4) — report 8: tester activity
+// =============================================================================
+
+function renderTesterActivityReport() {
+  const host = byId('ps-rep-activity');
+  if (!host) return;
+  const rows = reportRows('tester_activity', host);
+  if (!rows) return;
+
+  // Rows are per (tester, day); the table shows the tester totals and the bar
+  // chart the executions per day across the whole team.
+  const byTester = new Map();
+  const byDay = new Map();
+  for (const row of rows) {
+    const userId = String(rowVal(row, ['user_id'], '')) || String(rowVal(row, ['display_name'], ''));
+    const executed = Number(rowVal(row, ['executed'], 0));
+    const entry = byTester.get(userId) || {
+      name: String(rowVal(row, ['display_name'], '') || '—'),
+      executed: 0, passed: 0, failed: 0, blocked: 0, skipped: 0, approvals: 0, durationSum: 0, durationDays: 0,
+    };
+    entry.executed += executed;
+    entry.passed += Number(rowVal(row, ['passed'], 0));
+    entry.failed += Number(rowVal(row, ['failed'], 0));
+    entry.blocked += Number(rowVal(row, ['blocked'], 0));
+    entry.skipped += Number(rowVal(row, ['skipped'], 0));
+    entry.approvals += Number(rowVal(row, ['approvals'], 0));
+    const avg = Number(rowVal(row, ['avg_duration_secs'], 0));
+    if (avg > 0 && executed > 0) { entry.durationSum += avg * executed; entry.durationDays += executed; }
+    byTester.set(userId, entry);
+
+    const day = String(rowVal(row, ['day'], ''));
+    if (day) byDay.set(day, (byDay.get(day) || 0) + executed);
+  }
+
+  host.innerHTML = '<div id="ps-rep-activity-chart"></div><div id="ps-rep-activity-table"></div>';
+
+  const days = [...byDay.keys()].sort();
+  if (days.length) {
+    const chart = document.createElement('tf-bar-chart');
+    chart.height = 200;
+    chart.xAxis = { scale: 'category', min: null, max: null, ticks: null, format: null };
+    chart.yAxis = { scale: 'linear', min: 0, max: null, ticks: 4, format: null };
+    chart.series = [{
+      id: 'executed',
+      name: t('report_activity_executed'),
+      tone: 'accent',
+      style: 'solid',
+      showInLegend: true,
+      points: days.map((day) => ({ x: day, y: byDay.get(day) })),
+    }];
+    byId('ps-rep-activity-chart')?.replaceChildren(chart);
+  }
+
+  const tableHost = byId('ps-rep-activity-table');
+  if (!tableHost) return;
+  tableHost.innerHTML = `
+    <tf-table>
+      <tf-column key="tester" label="${escapeAttr(t('report_col_tester'))}"></tf-column>
+      <tf-column key="executed" label="${escapeAttr(t('report_activity_executed'))}" renderer="num"></tf-column>
+      <tf-column key="avg" label="${escapeAttr(t('report_col_avg_time'))}"></tf-column>
+      <tf-column key="approvals" label="${escapeAttr(t('report_activity_approvals'))}" renderer="num"></tf-column>
+      <tf-column key="passRate" label="${escapeAttr(t('report_activity_pass_rate'))}"></tf-column>
+    </tf-table>
+  `;
+  tableHost.querySelector('tf-table').rows = [...byTester.values()]
+    .sort((a, b) => b.executed - a.executed)
+    .map((entry) => {
+      const graded = entry.passed + entry.failed + entry.blocked + entry.skipped;
+      return {
+        tester: entry.name,
+        executed: entry.executed,
+        avg: formatDuration(entry.durationDays > 0 ? Math.round(entry.durationSum / entry.durationDays) : 0),
+        approvals: entry.approvals,
+        passRate: graded > 0 ? `${Math.round((entry.passed / graded) * 1000) / 10}%` : '—',
+      };
+    });
 }
 
 // =============================================================================
@@ -8598,13 +9065,32 @@ async function loadTasksPage() {
   tv.total = Number(resp.total ?? tv.rows.length);
 }
 
+// Board mode loads the whole (filtered) task set: a paginated kanban would cut
+// a column in half and silently hide cards.
+async function loadTasksBoard() {
+  const tv = state.tasksView || (state.tasksView = freshTasksState());
+  const resp = await ApiBinary.one('projectStudioTasksListRequest', {
+    projectId: projectId(),
+    taskType: tv.filters.type,
+    status: '',
+    assignedTo: tv.filters.mine ? 'me' : '',
+    search: tv.filters.search,
+    offset: 0,
+    limit: BOARD_PAGE_SIZE,
+  });
+  tv.boardRows = Array.isArray(resp.tasks) ? resp.tasks : [];
+  tv.total = Number(resp.total ?? tv.boardRows.length);
+}
+
 async function renderTasksTab() {
   const panel = byId('ps-tab-panel');
   if (!panel) return;
   const tv = state.tasksView || (state.tasksView = freshTasksState());
+  const board = tv.mode === 'board';
   await ensureF2Members();
   try {
-    await loadTasksPage();
+    if (board) await loadTasksBoard();
+    else await loadTasksPage();
   } catch (err) {
     panel.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('tasks_failed')}: ${err.message}`)}</div>`;
     return;
@@ -8613,16 +9099,22 @@ async function renderTasksTab() {
 
   panel.innerHTML = `
     <div class="ps-tests-toolbar">
+      <tf-segmented id="ps-tasks-mode" value="${escapeAttr(tv.mode)}">
+        <option value="list">${escapeHtml(t('tasks_view_list'))}</option>
+        <option value="board">${escapeHtml(t('tasks_view_board'))}</option>
+      </tf-segmented>
       <tf-searchbox id="ps-tasks-search" placeholder="${escapeAttr(t('tasks_search_placeholder'))}" debounce="300" value="${escapeAttr(tv.filters.search)}"></tf-searchbox>
       <tf-segmented id="ps-tasks-f-type" value="${escapeAttr(tv.filters.type || 'all')}">
         <option value="all">${escapeHtml(t('tasks_filter_all'))}</option>
         <option value="task">${escapeHtml(t('task_type_task'))}</option>
         <option value="defect">${escapeHtml(t('task_type_defect'))}</option>
       </tf-segmented>
-      <tf-select id="ps-tasks-f-status" value="${escapeAttr(tv.filters.status)}">
-        <option value="" ${tv.filters.status === '' ? 'selected' : ''}>${escapeHtml(t('tasks_filter_status_all'))}</option>
-        ${TASK_STATUSES.map((x) => `<option value="${x}" ${x === tv.filters.status ? 'selected' : ''}>${escapeHtml(t(`task_status_${x}`))}</option>`).join('')}
-      </tf-select>
+      ${board ? '' : `
+        <tf-select id="ps-tasks-f-status" value="${escapeAttr(tv.filters.status)}">
+          <option value="" ${tv.filters.status === '' ? 'selected' : ''}>${escapeHtml(t('tasks_filter_status_all'))}</option>
+          ${TASK_STATUSES.map((x) => `<option value="${x}" ${x === tv.filters.status ? 'selected' : ''}>${escapeHtml(t(`task_status_${x}`))}</option>`).join('')}
+        </tf-select>
+      `}
       <div class="ps-toggle-inline">
         <tf-toggle id="ps-tasks-f-mine" ${tv.filters.mine ? 'checked' : ''}></tf-toggle>
         <span>${escapeHtml(t('tasks_filter_mine'))}</span>
@@ -8631,11 +9123,18 @@ async function renderTasksTab() {
       ${canTest() ? `<tf-button variant="primary" icon="plus" id="ps-tasks-new">${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
     </div>
     <div id="ps-tasks-table-host">
-      ${tv.rows.length ? '' : `<tf-empty-state icon="check" title="${escapeAttr(t('tasks_empty'))}"></tf-empty-state>`}
+      ${(board ? tv.boardRows : tv.rows).length ? '' : `<tf-empty-state icon="check" title="${escapeAttr(t('tasks_empty'))}"></tf-empty-state>`}
     </div>
   `;
 
   const reload = () => { tv.page = 1; renderTasksTab(); };
+  byId('ps-tasks-mode')?.addEventListener('change', (e) => {
+    const mode = e.detail?.value === 'board' ? 'board' : 'list';
+    if (mode === tv.mode) return;
+    tv.mode = mode;
+    writeTasksViewMode(projectId(), mode);
+    reload();
+  });
   byId('ps-tasks-search')?.addEventListener('search', (e) => { tv.filters.search = String(e.detail?.value ?? ''); reload(); });
   byId('ps-tasks-f-type')?.addEventListener('change', (e) => {
     const v = e.detail?.value ?? 'all';
@@ -8646,6 +9145,10 @@ async function renderTasksTab() {
   byId('ps-tasks-f-mine')?.addEventListener('change', (e) => { tv.filters.mine = !!(e.detail?.checked ?? e.target.checked); reload(); });
   byId('ps-tasks-new')?.addEventListener('click', () => openTaskWindow({}));
 
+  if (board) {
+    if (tv.boardRows.length) renderTaskBoard();
+    return;
+  }
   if (!tv.rows.length) return;
   byId('ps-tasks-table-host').innerHTML = `
     <tf-table id="ps-tasks-table" page-size="${F2_PAGE_SIZE}" total="${tv.total}" page="${tv.page}">
@@ -8704,8 +9207,8 @@ async function renderTasksTab() {
 // =============================================================================
 
 // opts: { taskId } opens an existing task; without taskId the window is a
-// creation form ({ taskType?, links?, titlePrefill? } — the tester desk
-// prefills defect links).
+// creation form ({ taskType?, links?, titlePrefill?, status? } — the tester
+// desk prefills defect links, the kanban prefills the column).
 async function openTaskWindow(opts = {}) {
   const tw = {
     taskId: opts.taskId || null,
@@ -8714,7 +9217,8 @@ async function openTaskWindow(opts = {}) {
     descriptionMd: '',
     severity: '',
     priority: 'medium',
-    status: 'todo',
+    // The board "add card" button prefills the column it was pressed in.
+    status: TASK_STATUSES.includes(opts.status) ? opts.status : 'todo',
     assignedTo: '',
     dueDate: '',
     links: Array.isArray(opts.links) ? opts.links.slice() : [],
@@ -9323,5 +9827,1955 @@ async function openMyWorkWindow() {
     const runId = fv(entry, 'run_id');
     if (state.project && projectId() === pid) await openRunDetailFromNotif(runId);
     else await openProject(pid, { tab: 'tests', runId });
+  });
+}
+
+// =============================================================================
+// T13 — run schedules (list, editor window, trigger history)
+// =============================================================================
+
+async function loadSchedules(force = false) {
+  const s = f2();
+  if (s.schedules.loaded && !force) return s.schedules.rows;
+  const resp = await ApiBinary.one('projectStudioSchedulesListRequest', { projectId: projectId() });
+  s.schedules.rows = Array.isArray(resp.schedules) ? resp.schedules : [];
+  s.schedules.serverTimezone = fv(resp, 'server_timezone') || '';
+  s.schedules.loaded = true;
+  return s.schedules.rows;
+}
+
+// A schedule bound to an environment that is not approved never fires, even
+// though its "enabled" switch is on — that state is the one worth shouting
+// about, so it drives both the row accent and the result pill.
+function scheduleBlocked(row) {
+  const runType = fv(row, 'run_type');
+  if (runType !== 'auto' && runType !== 'perf') return false;
+  return fv(row, 'environment_status') !== 'approved';
+}
+
+function scheduleModeLabel(row) {
+  const kind = fv(row, 'schedule_kind');
+  const expr = fv(row, 'schedule_expr') || '';
+  if (kind === 'cron') {
+    const match = DAILY_CRON_RE.exec(expr.trim());
+    const time = match ? `${String(match[2]).padStart(2, '0')}:${String(match[1]).padStart(2, '0')}` : expr;
+    return t('sch_mode_cron_at', { time });
+  }
+  if (kind === 'once') return t('sch_mode_once_at', { at: formatTimestamp(expr) });
+  return t('sch_mode_interval_every', { expr });
+}
+
+function scheduleLastChip(row) {
+  if (scheduleBlocked(row)) return chipCell('warn', t('sch_last_blocked'));
+  if (fv(row, 'auto_disabled')) return chipCell('err', t('sch_last_auto_disabled'));
+  if (!row.enabled) return chipCell('info', t('sch_last_off'));
+  const status = fv(row, 'last_status') || '';
+  if (!status) return chipCell('info', t('sch_last_never'));
+  // last_status is either a run status or a trigger outcome, depending on
+  // whether the last attempt actually started a run.
+  const runLabel = I18n.t(`project_studio.run_status_${status}`);
+  if (runLabel !== `project_studio.run_status_${status}`) {
+    return chipCell(SCHEDULE_LAST_CHIP[status] || 'info', runLabel);
+  }
+  const outcomeLabel = I18n.t(`project_studio.sch_outcome_${status}`);
+  const known = outcomeLabel !== `project_studio.sch_outcome_${status}`;
+  return chipCell(SCHEDULE_LAST_CHIP[status] || 'info', known ? outcomeLabel : status);
+}
+
+function scheduleNextCell(row) {
+  if (!row.enabled) return `<span style="color:var(--text-3)">${escapeHtml(t('sch_next_disabled'))}</span>`;
+  if (fv(row, 'auto_disabled')) return `<span style="color:var(--danger)">${escapeHtml(t('sch_next_auto_disabled'))}</span>`;
+  if (scheduleBlocked(row)) return `<span style="color:var(--warning)">${escapeHtml(t('sch_next_blocked'))}</span>`;
+  const next = fv(row, 'next_run_at');
+  if (!next) return `<span style="color:var(--text-3)">—</span>`;
+  return `<span>${escapeHtml(formatTimestamp(next))}</span>`;
+}
+
+function visibleSchedules() {
+  const flt = f2().schedules;
+  const query = flt.search.trim().toLowerCase();
+  return f2().schedules.rows.filter((row) => {
+    if (flt.kind && fv(row, 'schedule_kind') !== flt.kind) return false;
+    if (flt.status === 'enabled' && !row.enabled) return false;
+    if (flt.status === 'disabled' && row.enabled) return false;
+    if (flt.status === 'blocked' && !scheduleBlocked(row) && !fv(row, 'auto_disabled')) return false;
+    if (query) {
+      const haystack = `${row.name} ${fv(row, 'suite_name') || ''} ${fv(row, 'environment_name') || ''}`.toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  });
+}
+
+// `reload` is false when only a client-side filter changed — the list is small
+// and already in memory, so a refetch per keystroke would be pure noise.
+async function renderSchedulesView(reload = true) {
+  const host = byId('ps-tests-host');
+  if (!host) return;
+  const s = f2();
+  try {
+    await loadSchedules(reload);
+  } catch (err) {
+    host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('sch_load_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  if (state.tab !== 'tests' || s.view !== 'schedules') return;
+
+  const rows = visibleSchedules();
+  const blocked = s.schedules.rows.filter((row) => scheduleBlocked(row) || fv(row, 'auto_disabled')).length;
+  const active = s.schedules.rows.filter((row) => row.enabled && !fv(row, 'auto_disabled')).length;
+  const selectOpt = (value, current, label) =>
+    `<option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+
+  host.innerHTML = `
+    <div class="ps-tests-toolbar ps-sch-toolbar">
+      <tf-searchbox id="ps-sch-search" placeholder="${escapeAttr(t('sch_search_placeholder'))}" debounce="250" value="${escapeAttr(s.schedules.search)}"></tf-searchbox>
+      <tf-select id="ps-sch-f-kind" value="${escapeAttr(s.schedules.kind)}">
+        ${selectOpt('', s.schedules.kind, t('sch_filter_kind_all'))}
+        ${SCHEDULE_KINDS.map((k) => selectOpt(k, s.schedules.kind, t(`sch_kind_${k}`))).join('')}
+      </tf-select>
+      <tf-select id="ps-sch-f-status" value="${escapeAttr(s.schedules.status)}">
+        ${selectOpt('', s.schedules.status, t('sch_filter_status_all'))}
+        ${selectOpt('enabled', s.schedules.status, t('sch_filter_status_enabled'))}
+        ${selectOpt('disabled', s.schedules.status, t('sch_filter_status_disabled'))}
+        ${selectOpt('blocked', s.schedules.status, t('sch_filter_status_blocked'))}
+      </tf-select>
+      <span class="ps-toolbar-spacer"></span>
+      ${s.schedules.serverTimezone ? `<tf-chip status="info">${escapeHtml(t('sch_timezone_chip', { zone: s.schedules.serverTimezone }))}</tf-chip>` : ''}
+      <tf-button variant="ghost" icon="refresh" id="ps-sch-refresh">${escapeHtml(t('refresh'))}</tf-button>
+      ${canManage() ? `<tf-button variant="primary" icon="plus" id="ps-sch-new">${escapeHtml(t('sch_new'))}</tf-button>` : ''}
+    </div>
+    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('sch_intro'))}</span></div>
+    <div id="ps-sch-table-host">
+      ${rows.length ? '' : `<tf-empty-state icon="clock" title="${escapeAttr(t('sch_empty'))}"></tf-empty-state>`}
+    </div>
+    ${rows.length ? `<div class="ps-sch-foot">${escapeHtml(t('sch_foot', { shown: rows.length, total: s.schedules.rows.length, active, blocked }))}</div>` : ''}
+  `;
+
+  byId('ps-sch-search')?.addEventListener('search', (e) => {
+    s.schedules.search = String(e.detail?.value ?? '');
+    renderSchedulesView(false);
+  });
+  byId('ps-sch-f-kind')?.addEventListener('change', (e) => {
+    s.schedules.kind = e.detail?.value ?? e.target.value ?? '';
+    renderSchedulesView(false);
+  });
+  byId('ps-sch-f-status')?.addEventListener('change', (e) => {
+    s.schedules.status = e.detail?.value ?? e.target.value ?? '';
+    renderSchedulesView(false);
+  });
+  byId('ps-sch-refresh')?.addEventListener('click', () => renderSchedulesView());
+  byId('ps-sch-new')?.addEventListener('click', () => openScheduleWindow(null));
+  if (!rows.length) return;
+
+  byId('ps-sch-table-host').innerHTML = `
+    <tf-table id="ps-sch-table">
+      <tf-column key="name" label="${escapeAttr(t('sch_col_name'))}" renderer="html"></tf-column>
+      <tf-column key="mode" label="${escapeAttr(t('sch_col_mode'))}"></tf-column>
+      <tf-column key="next" label="${escapeAttr(t('sch_col_next'))}" renderer="html"></tf-column>
+      <tf-column key="last" label="${escapeAttr(t('sch_col_last'))}" renderer="chip"></tf-column>
+    </tf-table>
+  `;
+  const table = byId('ps-sch-table');
+  // tf-table renders its rows in shadow DOM, so the row state is carried by
+  // inline styles on the html cells instead of a page-level row class.
+  table.rows = rows.map((row) => {
+    const isBlocked = scheduleBlocked(row);
+    const dim = row.enabled ? '' : 'opacity:.62;';
+    const accent = isBlocked ? 'border-left:3px solid var(--warning); padding-left:8px;' : '';
+    const sub = [
+      fv(row, 'suite_name') ? t('sch_sub_suite', { suite: fv(row, 'suite_name'), count: Number(fv(row, 'cases_count') ?? 0) })
+        : t('sch_sub_cases', { count: Number(fv(row, 'cases_count') ?? 0) }),
+      fv(row, 'environment_name') || t('sch_sub_no_env'),
+      t(`run_type_${fv(row, 'run_type')}`),
+    ].join(' · ');
+    return {
+      _id: fv(row, 'schedule_id'),
+      _row: row,
+      name: `
+        <div style="display:flex; flex-direction:column; gap:3px; ${dim} ${accent}">
+          <span style="font-weight:700">${escapeHtml(row.name)}</span>
+          <span style="font-size:11px; color:var(--text-3)">${escapeHtml(sub)}</span>
+          ${fv(row, 'auto_disabled') ? `<span style="font-size:11px; color:var(--danger)">${escapeHtml(t('sch_auto_disabled_badge', { count: Number(fv(row, 'consecutive_failures') ?? 0) }))}</span>` : ''}
+        </div>
+      `,
+      mode: scheduleModeLabel(row),
+      next: scheduleNextCell(row),
+      last: scheduleLastChip(row),
+    };
+  });
+  table.rowActions = (row) => buildScheduleRowActions(row._row);
+  table.expandable = true;
+  table.rowKey = '_id';
+  table.expandRenderer = (row) => buildScheduleExpansion(row._row);
+}
+
+// tf-table renders this cell inside its shadow root, where page-level CSS does
+// not reach — hence the inline layout and plain icon buttons instead of a
+// kebab tf-menu, whose absolute popup would have no positioned ancestor here.
+function buildScheduleRowActions(row) {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex; align-items:center; gap:4px; justify-content:flex-end;';
+  const scheduleId = fv(row, 'schedule_id');
+
+  if (canManage()) {
+    const toggle = document.createElement('tf-toggle');
+    if (row.enabled) toggle.setAttribute('checked', '');
+    toggle.setAttribute('title', t(row.enabled ? 'sch_toggle_on' : 'sch_toggle_off'));
+    toggle.addEventListener('change', async (e) => {
+      e.stopPropagation();
+      const enabled = !!(e.detail?.checked ?? toggle.hasAttribute('checked'));
+      try {
+        await ApiBinary.one('projectStudioScheduleSetEnabledRequest', {
+          projectId: projectId(), scheduleId, enabled,
+        });
+        toast(t(enabled ? 'sch_enabled_ok' : 'sch_disabled_ok'), 'success');
+      } catch (err) {
+        toast(`${t('sch_toggle_failed')}: ${err.message}`, 'error');
+      }
+      await renderSchedulesView();
+    });
+    wrap.appendChild(toggle);
+  }
+
+  const action = (icon, title, variant, handler) => {
+    const btn = document.createElement('tf-button');
+    btn.setAttribute('variant', variant);
+    btn.setAttribute('size', 'sm');
+    btn.setAttribute('icon', icon);
+    btn.setAttribute('title', title);
+    btn.addEventListener('click', (e) => { e.stopPropagation(); handler(); });
+    wrap.appendChild(btn);
+  };
+
+  if (canEdit()) action('play', t('sch_run_now'), 'ghost', () => runScheduleNow(row));
+  action('clock', t('sch_history'), 'ghost', () => openScheduleRunsWindow(row));
+  if (canManage()) {
+    action('edit', t('action_edit'), 'ghost', () => openScheduleWindow(row));
+    action('trash', t('action_delete'), 'ghost', () => confirmDeleteSchedule(row));
+  }
+  return wrap;
+}
+
+// The expansion carries the server-computed fire preview: the UI never derives
+// those instants itself, otherwise the preview and the loop would disagree
+// across a DST boundary.
+function buildScheduleExpansion(row) {
+  const wrap = document.createElement('div');
+  wrap.className = 'ps-item-expansion';
+  const preview = Array.isArray(fv(row, 'next_runs_preview')) ? fv(row, 'next_runs_preview') : [];
+  const reason = fv(row, 'last_reason') || '';
+  wrap.innerHTML = `
+    ${scheduleBlocked(row) ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('sch_blocked_banner'))}</span></div>` : ''}
+    ${fv(row, 'auto_disabled') ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('sch_breaker_banner'))}</span></div>` : ''}
+    ${reason ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('sch_reason_prefix', { reason }))}</span></div>` : ''}
+    <div class="ps-field-label">${escapeHtml(t('sch_preview_label'))}</div>
+    <div class="ps-sch-preview">
+      ${preview.length
+        ? preview.map((at) => `<tf-chip status="info">${sprite('clock')} ${escapeHtml(formatTimestamp(at))}</tf-chip>`).join('')
+        : `<span class="ps-field-hint">${escapeHtml(t('sch_preview_empty'))}</span>`}
+    </div>
+    <div class="ps-case-info-list">
+      <div><span>${escapeHtml(t('sch_info_timezone'))}</span><b>${escapeHtml(fv(row, 'timezone') || f2().schedules.serverTimezone || '—')}</b></div>
+      <div><span>${escapeHtml(t('sch_info_runner'))}</span><b>${escapeHtml(fv(row, 'runner_display_name') || t('run_runner_auto'))}</b></div>
+      <div><span>${escapeHtml(t('sch_info_last_trigger'))}</span><b>${escapeHtml(fv(row, 'last_trigger_at') ? formatTimestamp(fv(row, 'last_trigger_at')) : '—')}</b></div>
+      <div><span>${escapeHtml(t('sch_info_created_by'))}</span><b>${escapeHtml(fv(row, 'created_by_name') || '—')}</b></div>
+    </div>
+  `;
+  return wrap;
+}
+
+async function runScheduleNow(row) {
+  const scheduleId = fv(row, 'schedule_id');
+  try {
+    const resp = await ApiBinary.one('projectStudioScheduleRunNowRequest', { projectId: projectId(), scheduleId });
+    const outcome = String(resp.outcome || '');
+    const reason = String(resp.reason || '');
+    const runNo = Number(fv(resp, 'run_no') ?? 0);
+    if (outcome === 'started') {
+      toast(t('sch_run_started', { no: runNo }), 'success');
+      const runId = fv(resp, 'run_id');
+      if (runId) await openRunByType(runId, fv(row, 'run_type'));
+      return;
+    }
+    toast(t('sch_run_refused', { outcome: t(`sch_outcome_${outcome}`), reason: reason || '—' }), outcome === 'error' ? 'error' : 'info');
+  } catch (err) {
+    toast(`${t('sch_run_failed')}: ${err.message}`, 'error');
+    return;
+  }
+  await renderSchedulesView();
+}
+
+function confirmDeleteSchedule(row) {
+  openDeleteWindow({
+    title: t('sch_delete_title'),
+    targetName: row.name,
+    targetSub: scheduleModeLabel(row),
+    targetIcon: 'clock',
+    warning: t('sch_delete_warning'),
+    confirmLabel: t('delete_forever'),
+    onConfirm: async () => {
+      await ApiBinary.one('projectStudioScheduleDeleteRequest', {
+        projectId: projectId(),
+        scheduleId: fv(row, 'schedule_id'),
+      });
+      toast(t('sch_deleted_ok'), 'success');
+      await renderSchedulesView();
+    },
+  });
+}
+
+async function openScheduleRunsWindow(row) {
+  const { body } = openWindow({
+    title: t('sch_history_title'),
+    subtitle: row.name,
+    icon: 'clock',
+    width: 820,
+  });
+  body.innerHTML = `<div class="ps-loading">${escapeHtml(t('loading'))}</div>`;
+  let runs = [];
+  try {
+    const resp = await ApiBinary.one('projectStudioScheduleRunsListRequest', {
+      projectId: projectId(),
+      scheduleId: fv(row, 'schedule_id'),
+      limit: SCHEDULE_RUNS_LIMIT,
+    });
+    runs = Array.isArray(resp.runs) ? resp.runs : [];
+  } catch (err) {
+    body.innerHTML = `<div class="ps-form-error">${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  if (!runs.length) {
+    body.innerHTML = `<tf-empty-state icon="clock" title="${escapeAttr(t('sch_history_empty'))}"></tf-empty-state>`;
+    return;
+  }
+  body.innerHTML = `
+    <tf-table id="ps-sch-runs-table">
+      <tf-column key="fired" label="${escapeAttr(t('sch_hist_col_fired'))}"></tf-column>
+      <tf-column key="scheduled" label="${escapeAttr(t('sch_hist_col_scheduled'))}"></tf-column>
+      <tf-column key="outcome" label="${escapeAttr(t('sch_hist_col_outcome'))}" renderer="chip"></tf-column>
+      <tf-column key="reason" label="${escapeAttr(t('sch_hist_col_reason'))}"></tf-column>
+      <tf-column key="run" label="${escapeAttr(t('sch_hist_col_run'))}"></tf-column>
+      <tf-column key="actor" label="${escapeAttr(t('sch_hist_col_actor'))}"></tf-column>
+    </tf-table>
+  `;
+  const table = body.querySelector('#ps-sch-runs-table');
+  table.rows = runs.map((entry) => ({
+    _runId: fv(entry, 'run_id'),
+    fired: formatTimestamp(fv(entry, 'fired_at')),
+    scheduled: formatTimestamp(fv(entry, 'scheduled_for')),
+    outcome: chipCell(SCHEDULE_OUTCOME_CHIP[entry.outcome] || 'info', t(`sch_outcome_${entry.outcome}`)),
+    reason: entry.reason || '—',
+    run: Number(fv(entry, 'run_no') ?? 0) > 0 ? `#${fv(entry, 'run_no')}` : '—',
+    actor: fv(entry, 'actor_name') || t('sch_actor_loop'),
+  }));
+  table.addEventListener('row-click', async (e) => {
+    const runId = e.detail?.row?._runId;
+    if (!runId) return;
+    closeAllWindows();
+    await openRunByType(runId, fv(row, 'run_type'));
+  });
+}
+
+// The IANA catalogue comes from the browser; the server zone and the local zone
+// are always offered so the picker is never empty on older engines.
+function timezoneOptions(serverZone) {
+  let zones = [];
+  try {
+    if (typeof Intl.supportedValuesOf === 'function') zones = Intl.supportedValuesOf('timeZone');
+  } catch {
+    zones = [];
+  }
+  let local = '';
+  try {
+    local = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  } catch {
+    local = '';
+  }
+  return [...new Set([serverZone, local, 'UTC', ...zones].filter(Boolean))];
+}
+
+// 'cron' is stored as a daily "minute hour * * *" expression but typed as HH:MM
+// (the T13 mockup) — these two helpers are the only place that conversion lives.
+function cronToTime(expr) {
+  const match = DAILY_CRON_RE.exec(String(expr || '').trim());
+  if (!match) return '';
+  return `${String(match[2]).padStart(2, '0')}:${String(match[1]).padStart(2, '0')}`;
+}
+
+function timeToCron(value) {
+  const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(value || '').trim());
+  if (!match) return '';
+  return `${Number(match[2])} ${Number(match[1])} * * *`;
+}
+
+// datetime-local wants "YYYY-MM-DDTHH:MM" in local time; the wire carries an
+// RFC3339 instant.
+function isoToLocalInput(iso) {
+  if (!iso) return '';
+  const date = new Date(String(iso));
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function intervalMinutes(expr) {
+  const match = /^(\d+)([mhd])$/.exec(String(expr || '').trim());
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return value * ({ m: 1, h: 60, d: 1440 })[match[2]];
+}
+
+// T13 window — create / edit. The whole definition travels in one ScheduleSave,
+// so every field on the form is written, including the cleared ones.
+function openScheduleWindow(schedule) {
+  const editing = !!schedule;
+  const { body, foot, cleanup } = openWindow({
+    title: t(editing ? 'sch_win_edit_title' : 'sch_win_new_title'),
+    subtitle: editing ? schedule.name : t('sch_win_sub'),
+    icon: 'clock',
+    width: 760,
+  });
+
+  const s = f2();
+  const serverZone = s.schedules.serverTimezone || '';
+  const kind = editing ? (fv(schedule, 'schedule_kind') || 'interval') : 'interval';
+  const sw = {
+    runType: editing ? (fv(schedule, 'run_type') || 'auto') : 'auto',
+    source: editing && !fv(schedule, 'suite_id') ? 'cases' : 'suite',
+    suiteId: editing ? (fv(schedule, 'suite_id') || '') : '',
+    caseIds: new Set(editing && Array.isArray(fv(schedule, 'case_ids')) ? fv(schedule, 'case_ids') : []),
+    environmentId: editing ? (fv(schedule, 'environment_id') || '') : '',
+    runnerServiceId: editing ? (fv(schedule, 'runner_service_id') || '') : '',
+    mode: editing ? (fv(schedule, 'assignment_mode') || 'pool') : 'pool',
+    assignees: new Set(editing && Array.isArray(fv(schedule, 'assignees')) ? fv(schedule, 'assignees') : []),
+    kind,
+    timezone: editing ? (fv(schedule, 'timezone') || serverZone) : serverZone,
+    pool: [],
+    busy: false,
+  };
+  const perf = (() => {
+    try {
+      const parsed = JSON.parse(fv(schedule, 'perf_profile_json') || '{}');
+      return { ...PERF_DEFAULT_PROFILE, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+    } catch {
+      return { ...PERF_DEFAULT_PROFILE };
+    }
+  })();
+  const exprValue = {
+    interval: kind === 'interval' ? (fv(schedule, 'schedule_expr') || '') : '',
+    cron: kind === 'cron' ? cronToTime(fv(schedule, 'schedule_expr')) : '',
+    once: kind === 'once' ? isoToLocalInput(fv(schedule, 'schedule_expr')) : '',
+  };
+  const preview = editing && Array.isArray(fv(schedule, 'next_runs_preview')) ? fv(schedule, 'next_runs_preview') : [];
+
+  body.innerHTML = `
+    <tf-input id="ps-sch-name" label="${escapeAttr(t('sch_name_label'))}" placeholder="${escapeAttr(t('sch_name_placeholder'))}"
+      value="${escapeAttr(editing ? schedule.name : '')}" hint="${escapeAttr(t('sch_name_hint'))}"></tf-input>
+
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('run_type_label'))}</span>
+      <tf-segmented id="ps-sch-runtype" value="${escapeAttr(sw.runType)}">
+        ${SCHEDULE_RUN_TYPES.map((x) => `<option value="${x}">${escapeHtml(t(`run_type_${x}`))}</option>`).join('')}
+      </tf-segmented>
+      <div class="ps-field-hint" data-sch-runtype-hint></div>
+    </div>
+
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('sch_source_label'))}</span>
+      <tf-segmented id="ps-sch-source" value="${escapeAttr(sw.source)}">
+        <option value="suite">${escapeHtml(t('run_source_suite'))}</option>
+        <option value="cases">${escapeHtml(t('run_source_cases'))}</option>
+      </tf-segmented>
+      <div class="ps-field-hint">${escapeHtml(t('sch_source_hint'))}</div>
+    </div>
+    <div data-sch-source="suite" hidden>
+      <tf-select id="ps-sch-suite" label="${escapeAttr(t('run_suite_label'))}" value="${escapeAttr(sw.suiteId)}"></tf-select>
+    </div>
+    <div data-sch-source="cases" hidden>
+      <div class="ps-field">
+        <span class="ps-field-label">${escapeHtml(t('run_cases_label'))}</span>
+        <div class="ps-pane-list ps-run-case-pool" data-sch-case-pool></div>
+      </div>
+    </div>
+
+    <div data-sch-auto hidden>
+      <div class="ps-field">
+        <tf-select id="ps-sch-env" label="${escapeAttr(t('run_env_select_label'))}" value="${escapeAttr(sw.environmentId)}"></tf-select>
+        <div class="ps-field-hint">${escapeHtml(t('sch_env_hint'))}</div>
+      </div>
+      <div class="ps-banner-warn" data-sch-env-warn hidden>${sprite('alert')}<span>${escapeHtml(t('sch_env_warn'))}</span></div>
+      <div class="ps-field">
+        <tf-select id="ps-sch-runner" label="${escapeAttr(t('run_runner_label'))}" value="${escapeAttr(sw.runnerServiceId)}"></tf-select>
+        <div class="ps-field-hint">${escapeHtml(t('run_runner_hint'))}</div>
+      </div>
+      <div class="ps-field" data-sch-perf hidden>
+        <span class="ps-field-label">${escapeHtml(t('run_perf_label'))}</span>
+        <div class="ps-perf-form">
+          <tf-input id="ps-sch-perf-users" type="number" min="${PERF_LIMITS.users[0]}" max="${PERF_LIMITS.users[1]}"
+            label="${escapeAttr(t('run_perf_users_label'))}" value="${Number(perf.users)}"></tf-input>
+          <tf-input id="ps-sch-perf-spawn" type="number" min="${PERF_LIMITS.spawnRate[0]}" max="${PERF_LIMITS.spawnRate[1]}"
+            label="${escapeAttr(t('run_perf_spawn_label'))}" value="${Number(perf.spawn_rate)}"></tf-input>
+          <tf-input id="ps-sch-perf-duration" type="number" min="${PERF_LIMITS.duration[0]}" max="${PERF_LIMITS.duration[1]}"
+            label="${escapeAttr(t('run_perf_duration_label'))}" value="${Number(perf.duration_secs)}"></tf-input>
+        </div>
+        <div class="ps-field-hint">${escapeHtml(t('run_perf_hint'))}</div>
+      </div>
+    </div>
+
+    <div data-sch-manual hidden>
+      <div class="ps-field">
+        <span class="ps-field-label">${escapeHtml(t('run_assign_label'))}</span>
+        <tf-segmented id="ps-sch-mode" value="${escapeAttr(sw.mode === 'single' ? 'single' : 'pool')}">
+          <option value="single">${escapeHtml(t('assign_single'))}</option>
+          <option value="pool">${escapeHtml(t('assign_pool'))}</option>
+        </tf-segmented>
+        <div class="ps-field-hint">${escapeHtml(t('sch_assign_hint'))}</div>
+      </div>
+      <div class="ps-field">
+        <span class="ps-field-label">${escapeHtml(t('sch_assignees_label'))}</span>
+        <div class="ps-pane-list" data-sch-assignees></div>
+      </div>
+    </div>
+
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('sch_kind_label'))}</span>
+      <tf-segmented id="ps-sch-kind" value="${escapeAttr(sw.kind)}">
+        ${SCHEDULE_KINDS.map((k) => `<option value="${k}">${escapeHtml(t(`sch_kind_${k}`))}</option>`).join('')}
+      </tf-segmented>
+      <div class="ps-field-hint">${escapeHtml(t('sch_kind_hint'))}</div>
+    </div>
+    <div data-sch-expr="interval" hidden>
+      <tf-input id="ps-sch-expr-interval" label="${escapeAttr(t('sch_expr_interval_label'))}" placeholder="6h"
+        value="${escapeAttr(exprValue.interval)}"></tf-input>
+    </div>
+    <div data-sch-expr="cron" hidden>
+      <tf-input id="ps-sch-expr-cron" type="time" label="${escapeAttr(t('sch_expr_cron_label'))}"
+        value="${escapeAttr(exprValue.cron)}"></tf-input>
+    </div>
+    <div data-sch-expr="once" hidden>
+      <tf-input id="ps-sch-expr-once" type="datetime-local" label="${escapeAttr(t('sch_expr_once_label'))}"
+        value="${escapeAttr(exprValue.once)}"></tf-input>
+    </div>
+    <div class="ps-sch-validation" data-sch-validation></div>
+
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('sch_timezone_label'))}</span>
+      <tf-combobox id="ps-sch-tz" placeholder="${escapeAttr(t('sch_timezone_placeholder'))}" value="${escapeAttr(sw.timezone)}"></tf-combobox>
+      <div class="ps-field-hint">${escapeHtml(t('sch_timezone_hint', { zone: serverZone || 'UTC' }))}</div>
+    </div>
+
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('sch_preview_label'))}</span>
+      <div class="ps-sch-preview" data-sch-preview>
+        ${preview.length
+          ? preview.map((at) => `<tf-chip status="info">${sprite('clock')} ${escapeHtml(formatTimestamp(at))}</tf-chip>`).join('')
+          : `<span class="ps-field-hint">${escapeHtml(t('sch_preview_hint'))}</span>`}
+      </div>
+    </div>
+
+    <div class="ps-toggle-inline">
+      <tf-toggle id="ps-sch-enabled" ${!editing || schedule.enabled ? 'checked' : ''}></tf-toggle>
+      <span>${escapeHtml(t('sch_enabled_label'))}</span>
+    </div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t(editing ? 'action_save' : 'sch_create'))}</tf-button>
+    </div>
+  `;
+
+  const tzBox = body.querySelector('#ps-sch-tz');
+  if (tzBox) {
+    tzBox.options = timezoneOptions(serverZone).map((zone) => ({ value: zone, label: zone }));
+    tzBox.addEventListener('change', (e) => { sw.timezone = e.detail?.value || ''; });
+  }
+
+  const showError = (msg) => {
+    const el = body.querySelector('[data-form-error]');
+    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  };
+  const isAutomated = () => sw.runType !== 'manual';
+
+  // Live syntax check only: the fire instants themselves stay server-side.
+  const validateExpr = () => {
+    const box = body.querySelector('[data-sch-validation]');
+    let ok = true;
+    let message = '';
+    if (sw.kind === 'interval') {
+      const raw = String(body.querySelector('#ps-sch-expr-interval')?.value ?? '').trim();
+      const minutes = INTERVAL_RE.test(raw) ? intervalMinutes(raw) : null;
+      if (minutes === null) { ok = false; message = t('sch_err_interval_format'); }
+      else if (minutes < 5) { ok = false; message = t('sch_err_interval_min'); }
+      else if (minutes > 365 * 1440) { ok = false; message = t('sch_err_interval_max'); }
+      else message = t('sch_ok_interval', { expr: raw });
+    } else if (sw.kind === 'cron') {
+      const raw = String(body.querySelector('#ps-sch-expr-cron')?.value ?? '').trim();
+      if (!timeToCron(raw)) { ok = false; message = t('sch_err_cron_format'); }
+      else message = t('sch_ok_cron', { time: raw, zone: sw.timezone || serverZone || 'UTC' });
+    } else {
+      const raw = String(body.querySelector('#ps-sch-expr-once')?.value ?? '').trim();
+      const date = raw ? new Date(raw) : null;
+      if (!date || Number.isNaN(date.getTime())) { ok = false; message = t('sch_err_once_format'); }
+      else if (date.getTime() <= Date.now()) { ok = false; message = t('sch_err_once_past'); }
+      else message = t('sch_ok_once', { at: date.toLocaleString(I18n.getLanguage()) });
+    }
+    if (box) {
+      box.className = `ps-sch-validation ${ok ? 'is-ok' : 'is-err'}`;
+      box.textContent = message;
+    }
+    return ok;
+  };
+
+  const syncKind = () => {
+    body.querySelectorAll('[data-sch-expr]').forEach((el) => { el.hidden = el.dataset.schExpr !== sw.kind; });
+    validateExpr();
+  };
+
+  const syncRunType = () => {
+    const automated = isAutomated();
+    const autoBox = body.querySelector('[data-sch-auto]');
+    const manualBox = body.querySelector('[data-sch-manual]');
+    if (autoBox) autoBox.hidden = !automated;
+    if (manualBox) manualBox.hidden = automated;
+    const perfBox = body.querySelector('[data-sch-perf]');
+    if (perfBox) perfBox.hidden = sw.runType !== 'perf';
+    const hint = body.querySelector('[data-sch-runtype-hint]');
+    if (hint) hint.textContent = t(`run_type_${sw.runType}_hint`);
+    syncEnvWarning();
+  };
+
+  const syncEnvWarning = () => {
+    const warn = body.querySelector('[data-sch-env-warn]');
+    if (!warn) return;
+    const env = (f2().envs.rows || []).find((e) => fv(e, 'environment_id') === sw.environmentId);
+    warn.hidden = !isAutomated() || !sw.environmentId || fv(env, 'approval_status') === 'approved';
+  };
+
+  const renderCasePool = () => {
+    const hostEl = body.querySelector('[data-sch-case-pool]');
+    if (!hostEl) return;
+    if (!sw.pool.length) {
+      hostEl.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('run_cases_empty'))}</div>`;
+      return;
+    }
+    hostEl.innerHTML = sw.pool.map((c) => {
+      const caseId = fv(c, 'case_id');
+      return `
+        <div class="ps-pane-row">
+          <tf-checkbox data-sch-case="${escapeAttr(caseId)}" ${sw.caseIds.has(caseId) ? 'checked' : ''}></tf-checkbox>
+          <div class="ps-pane-row-main">
+            <div class="ps-pane-row-title">${escapeHtml(c.title)}</div>
+            <tf-chip status="${PRIORITY_CHIP[c.priority] || 'info'}">${escapeHtml(t(`prio_${c.priority}`))}</tf-chip>
+          </div>
+        </div>
+      `;
+    }).join('');
+    hostEl.querySelectorAll('[data-sch-case]').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const id = cb.dataset.schCase;
+        if (cb.checked) sw.caseIds.add(id);
+        else sw.caseIds.delete(id);
+      });
+    });
+  };
+
+  const renderAssignees = () => {
+    const hostEl = body.querySelector('[data-sch-assignees]');
+    if (!hostEl) return;
+    const testers = testerMembers();
+    if (!testers.length) {
+      hostEl.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('sch_assignees_empty'))}</div>`;
+      return;
+    }
+    hostEl.innerHTML = testers.map((m) => {
+      const userId = fv(m, 'user_id');
+      return `
+        <div class="ps-pane-row">
+          <tf-checkbox data-sch-assignee="${escapeAttr(userId)}" ${sw.assignees.has(userId) ? 'checked' : ''}></tf-checkbox>
+          <div class="ps-pane-row-main">
+            <div class="ps-pane-row-title">${escapeHtml(fv(m, 'display_name') || '')}</div>
+            <tf-chip status="info">${escapeHtml(roleLabel(m.role))}</tf-chip>
+          </div>
+        </div>
+      `;
+    }).join('');
+    hostEl.querySelectorAll('[data-sch-assignee]').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const id = cb.dataset.schAssignee;
+        if (cb.checked) {
+          // "single" is exactly one tester, so a new pick replaces the old one.
+          if (sw.mode === 'single') { sw.assignees.clear(); renderAssignees(); }
+          sw.assignees.add(id);
+        } else {
+          sw.assignees.delete(id);
+        }
+      });
+    });
+  };
+
+  const syncSource = () => {
+    body.querySelectorAll('[data-sch-source]').forEach((el) => { el.hidden = el.dataset.schSource !== sw.source; });
+  };
+
+  body.querySelector('#ps-sch-runtype')?.addEventListener('change', (e) => {
+    sw.runType = e.detail?.value ?? sw.runType;
+    syncRunType();
+  });
+  body.querySelector('#ps-sch-source')?.addEventListener('change', (e) => {
+    sw.source = e.detail?.value ?? sw.source;
+    syncSource();
+  });
+  body.querySelector('#ps-sch-kind')?.addEventListener('change', (e) => {
+    sw.kind = e.detail?.value ?? sw.kind;
+    syncKind();
+  });
+  body.querySelector('#ps-sch-mode')?.addEventListener('change', (e) => {
+    sw.mode = e.detail?.value ?? sw.mode;
+    if (sw.mode === 'single' && sw.assignees.size > 1) {
+      const first = [...sw.assignees][0];
+      sw.assignees = new Set([first]);
+    }
+    renderAssignees();
+  });
+  body.querySelector('#ps-sch-env')?.addEventListener('change', (e) => {
+    sw.environmentId = e.detail?.value ?? '';
+    syncEnvWarning();
+  });
+  body.querySelector('#ps-sch-runner')?.addEventListener('change', (e) => {
+    sw.runnerServiceId = e.detail?.value ?? '';
+  });
+  body.querySelector('#ps-sch-suite')?.addEventListener('change', (e) => { sw.suiteId = e.detail?.value ?? ''; });
+  ['#ps-sch-expr-interval', '#ps-sch-expr-cron', '#ps-sch-expr-once'].forEach((sel) => {
+    body.querySelector(sel)?.addEventListener('input', () => validateExpr());
+    body.querySelector(sel)?.addEventListener('change', () => validateExpr());
+  });
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn || sw.busy) return;
+    if (btn.dataset.action === 'cancel') { cleanup(); return; }
+
+    const name = String(body.querySelector('#ps-sch-name')?.value ?? '').trim();
+    if (name.length < 3) { showError(t('sch_err_name')); return; }
+    if (sw.source === 'suite' && !sw.suiteId) { showError(t('err_run_suite')); return; }
+    if (sw.source === 'cases' && !sw.caseIds.size) { showError(t('err_run_cases')); return; }
+    if (!validateExpr()) { showError(t('sch_err_expression')); return; }
+    if (isAutomated() && !sw.environmentId) { showError(t('err_run_env')); return; }
+    if (!isAutomated() && sw.mode === 'single' && sw.assignees.size !== 1) { showError(t('sch_err_single_assignee')); return; }
+
+    let scheduleExpr = '';
+    if (sw.kind === 'interval') scheduleExpr = String(body.querySelector('#ps-sch-expr-interval')?.value ?? '').trim();
+    else if (sw.kind === 'cron') scheduleExpr = timeToCron(body.querySelector('#ps-sch-expr-cron')?.value);
+    else scheduleExpr = new Date(String(body.querySelector('#ps-sch-expr-once')?.value ?? '')).toISOString();
+
+    let perfProfileJson = '';
+    if (sw.runType === 'perf') {
+      const users = Number(body.querySelector('#ps-sch-perf-users')?.value ?? 0);
+      const spawnRate = Number(body.querySelector('#ps-sch-perf-spawn')?.value ?? 0);
+      const duration = Number(body.querySelector('#ps-sch-perf-duration')?.value ?? 0);
+      const inRange = (value, [min, max]) => Number.isFinite(value) && value >= min && value <= max;
+      if (!inRange(users, PERF_LIMITS.users) || !inRange(spawnRate, PERF_LIMITS.spawnRate)
+        || !inRange(duration, PERF_LIMITS.duration)) {
+        showError(t('err_run_perf'));
+        return;
+      }
+      perfProfileJson = JSON.stringify({ users, spawn_rate: spawnRate, duration_secs: duration });
+    }
+
+    showError(null);
+    sw.busy = true;
+    btn.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('projectStudioScheduleSaveRequest', {
+        projectId: projectId(),
+        scheduleId: editing ? fv(schedule, 'schedule_id') : null,
+        name,
+        runType: sw.runType,
+        suiteId: sw.source === 'suite' ? sw.suiteId : '',
+        caseIds: sw.source === 'cases' ? [...sw.caseIds] : [],
+        environmentId: isAutomated() ? sw.environmentId : '',
+        runnerServiceId: isAutomated() ? sw.runnerServiceId : '',
+        perfProfileJson,
+        assignmentMode: isAutomated() ? '' : sw.mode,
+        assignees: isAutomated() ? [] : [...sw.assignees],
+        scheduleKind: sw.kind,
+        scheduleExpr,
+        timezone: sw.timezone || serverZone,
+        enabled: !!body.querySelector('#ps-sch-enabled')?.checked,
+      });
+      const nextAt = fv(resp, 'next_run_at');
+      toast(nextAt ? t('sch_saved_next', { at: formatTimestamp(nextAt) }) : t('sch_saved'), 'success');
+      cleanup();
+      f2().schedules.loaded = false;
+      if (state.tab === 'tests' && f2().view === 'schedules') await renderTestsView();
+    } catch (err) {
+      sw.busy = false;
+      btn.removeAttribute('disabled');
+      showError(`${t('sch_save_failed')}: ${err.message}`);
+    }
+  });
+
+  syncSource();
+  syncRunType();
+  syncKind();
+
+  // Suites / approved cases / environments / runners / members load lazily.
+  (async () => {
+    await ensureF2Members();
+    renderAssignees();
+    let suites = s.suites;
+    if (!suites.length) {
+      try {
+        const resp = await ApiBinary.one('projectStudioSuitesListRequest', { projectId: projectId() });
+        suites = Array.isArray(resp.suites) ? resp.suites : [];
+        s.suites = suites;
+      } catch {
+        suites = [];
+      }
+    }
+    body.querySelector('#ps-sch-suite')?.setOptions([
+      { value: '', label: t('assign_choose') },
+      ...suites.map((su) => ({ value: fv(su, 'suite_id'), label: `${su.name} (${Number(fv(su, 'case_count') ?? 0)})` })),
+    ], sw.suiteId);
+    try {
+      const resp = await ApiBinary.one('projectStudioCasesListRequest', {
+        projectId: projectId(), status: 'approved', offset: 0, limit: 200,
+      });
+      sw.pool = Array.isArray(resp.cases) ? resp.cases : [];
+    } catch {
+      sw.pool = [];
+    }
+    renderCasePool();
+    try {
+      await loadEnvironments();
+    } catch {
+      /* the select stays empty and the save guard blocks an automated schedule */
+    }
+    const approved = approvedEnvironments();
+    body.querySelector('#ps-sch-env')?.setOptions([
+      { value: '', label: approved.length ? t('assign_choose') : t('run_env_none') },
+      ...approved.map((env) => ({ value: fv(env, 'environment_id'), label: `${env.name} — ${fv(env, 'base_url')}` })),
+    ], sw.environmentId);
+    syncEnvWarning();
+    await loadRunners();
+    body.querySelector('#ps-sch-runner')?.setOptions([
+      { value: '', label: t('run_runner_auto') },
+      ...(f2().runners || []).map((r) => ({
+        value: fv(r, 'service_id'),
+        label: `${fv(r, 'display_name') || fv(r, 'engine_id')} — ${runnerToolchainLabel(r)}`,
+      })),
+    ], sw.runnerServiceId);
+  })();
+}
+
+// =============================================================================
+// X02 — ML Studio connections
+// =============================================================================
+
+function connections() {
+  if (!state.connections) state.connections = { links: [], canManage: false, loaded: false };
+  return state.connections;
+}
+
+async function loadMlLinks() {
+  const conn = connections();
+  const resp = await ApiBinary.one('projectStudioMlLinksListRequest', { projectId: projectId() });
+  conn.links = Array.isArray(resp.links) ? resp.links : [];
+  conn.canManage = !!(fv(resp, 'can_manage'));
+  conn.loaded = true;
+  return conn.links;
+}
+
+// The wire deep link is a dashboard route ("ml-studio?projectId=..."); anything
+// unparseable still lands on the ML Studio project route.
+function openMlStudio(link) {
+  const mlProjectId = fv(link, 'ml_project_id');
+  let view = 'ml-studio';
+  const params = { projectId: mlProjectId };
+  const raw = String(fv(link.summary || {}, 'deep_link') || '').trim().replace(/^#?\/?/, '');
+  if (raw) {
+    const [path, query] = raw.split('?');
+    if (/^[a-z0-9-]+$/.test(path)) view = path;
+    if (query) {
+      for (const [key, value] of new URLSearchParams(query)) params[key] = value;
+    }
+  }
+  Router.navigate(view, params);
+}
+
+// last_training_metrics_json is model-specific, so the card renders whatever
+// numeric metrics the training run reported instead of a fixed set.
+function mlMetricChips(summary) {
+  let metrics = null;
+  try {
+    metrics = JSON.parse(fv(summary, 'last_training_metrics_json') || '{}');
+  } catch {
+    metrics = null;
+  }
+  if (!metrics || typeof metrics !== 'object') return [];
+  return Object.entries(metrics)
+    .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+    .slice(0, 4)
+    .map(([key, value]) => ({ key, value: Math.round(value * 10000) / 10000 }));
+}
+
+function mlCardHtml(link) {
+  const summary = link.summary || null;
+  const linkId = fv(link, 'link_id');
+  const canOpen = !!fv(link, 'can_open');
+  const training = summary ? !!fv(summary, 'training_in_progress') : false;
+  const lastStatus = summary ? String(fv(summary, 'last_training_status') || '') : '';
+  const statusChip = !summary
+    ? `<tf-chip status="err" dot>${escapeHtml(t('ml_summary_unavailable'))}</tf-chip>`
+    : (training
+      ? `<tf-chip status="accent" dot>${escapeHtml(t('ml_training_running'))}</tf-chip>`
+      : `<tf-chip status="${lastStatus === 'completed' ? 'ok' : (lastStatus ? 'warn' : 'info')}" dot>${escapeHtml(lastStatus ? t('ml_training_last', { status: lastStatus }) : t('ml_training_none'))}</tf-chip>`);
+  const models = summary && Array.isArray(fv(summary, 'models')) ? fv(summary, 'models') : [];
+  const metrics = summary ? mlMetricChips(summary) : [];
+  const syncChip = fv(link, 'sync_permissions')
+    ? `<tf-chip status="accent">${sprite('refresh')} ${escapeHtml(t('ml_sync_on'))}</tf-chip>`
+    : `<tf-chip status="info">${escapeHtml(t('ml_sync_off'))}</tf-chip>`;
+  const lastSyncResult = fv(link, 'last_sync_result') || '';
+
+  const menuItems = [
+    `<tf-menu-item action="open" icon="external-link" ${canOpen ? '' : 'disabled'}>${escapeHtml(t('ml_open'))}</tf-menu-item>`,
+  ];
+  if (connections().canManage) {
+    menuItems.push(`<tf-menu-item action="settings" icon="settings">${escapeHtml(t('ml_link_settings'))}</tf-menu-item>`);
+    menuItems.push(`<tf-menu-item action="sync" icon="refresh">${escapeHtml(t('ml_sync_now'))}</tf-menu-item>`);
+    menuItems.push('<tf-menu-divider></tf-menu-divider>');
+    menuItems.push(`<tf-menu-item action="detach" icon="trash" danger>${escapeHtml(t('ml_detach'))}</tf-menu-item>`);
+  }
+
+  return `
+    <div class="ps-ml-card" data-ml-link="${escapeAttr(linkId)}">
+      <div class="ps-ml-top">
+        <div class="ps-card-ico">${sprite('brain')}</div>
+        <div class="ps-ml-heading">
+          <div class="ps-ml-name">${escapeHtml(fv(link, 'label') || (summary ? summary.name : fv(link, 'ml_project_id')))}${statusChip}</div>
+          <div class="ps-ml-desc">${escapeHtml(summary
+            ? t('ml_card_desc', { type: fv(summary, 'project_type_label') || fv(summary, 'project_type') || '—' })
+            : t('ml_card_desc_unavailable'))}</div>
+        </div>
+        <div class="ps-card-menu-wrap">
+          <tf-button variant="ghost" size="sm" icon="chevron-down" data-ml-more title="${escapeAttr(t('action_more'))}"></tf-button>
+          <tf-menu placement="bottom-end" data-ml-menu>${menuItems.join('')}</tf-menu>
+        </div>
+      </div>
+      ${models.length ? `<div class="ps-ml-models">${models.map((m) => `<tf-chip status="info">${escapeHtml(m)}</tf-chip>`).join('')}</div>` : ''}
+      ${training ? `
+        <div class="ps-ml-progress">
+          <div class="ps-ml-progress-track"><span></span></div>
+          <div class="ps-ml-progress-text"><tf-spinner size="sm"></tf-spinner>${escapeHtml(t('ml_training_progress', { started: formatTimestamp(fv(summary, 'last_training_started_at')) }))}</div>
+        </div>
+      ` : ''}
+      ${summary ? `
+        <div class="ps-ml-stats">
+          ${metrics.map((m) => `<span class="ps-ml-stat">${escapeHtml(m.key)} <b>${escapeHtml(String(m.value))}</b></span>`).join('')}
+          <span class="ps-ml-stat">${escapeHtml(t('ml_stat_datasets'))} <b>${Number(fv(summary, 'dataset_count') ?? 0)}</b></span>
+          <span class="ps-ml-stat">${escapeHtml(t('ml_stat_models'))} <b>${Number(fv(summary, 'model_count') ?? 0)}</b></span>
+          ${fv(summary, 'last_training_finished_at') ? `<span class="ps-ml-stat">${escapeHtml(t('ml_stat_trained'))} <b>${escapeHtml(formatTimestamp(fv(summary, 'last_training_finished_at')))}</b></span>` : ''}
+        </div>
+      ` : ''}
+      <div class="ps-ml-foot">
+        <tf-button variant="primary" size="sm" icon="external-link" data-ml-open ${canOpen ? '' : 'disabled'}
+          title="${escapeAttr(canOpen ? t('ml_open') : t('ml_open_denied'))}">${escapeHtml(t('ml_open'))}</tf-button>
+        ${syncChip}
+        ${lastSyncResult ? `<tf-chip status="${lastSyncResult === 'ok' ? 'ok' : 'warn'}">${escapeHtml(t('ml_last_sync', { result: lastSyncResult }))}</tf-chip>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+async function renderConnections() {
+  const panel = byId('ps-tab-panel');
+  if (!panel) return;
+  const conn = connections();
+  try {
+    await loadMlLinks();
+  } catch (err) {
+    panel.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('ml_load_failed')}: ${err.message}`)}</div>`;
+    return;
+  }
+  if (state.tab !== 'connections') return;
+
+  panel.innerHTML = `
+    <tf-section-card title="${escapeAttr(t('ml_section_title'))}" icon="brain">
+      <span slot="actions">
+        ${conn.canManage ? `
+          <tf-button variant="ghost" size="sm" icon="share" id="ps-ml-attach">${escapeHtml(t('ml_attach_existing'))}</tf-button>
+          <tf-button variant="primary" size="sm" icon="plus" id="ps-ml-create">${escapeHtml(t('ml_create'))}</tf-button>
+        ` : ''}
+      </span>
+      <div class="ps-section-sub">${escapeHtml(t('ml_section_sub'))}</div>
+      <div id="ps-ml-grid" class="ps-ml-grid">
+        ${conn.links.length ? conn.links.map(mlCardHtml).join('')
+          : `<tf-empty-state style="grid-column: 1 / -1;" icon="brain" title="${escapeAttr(t('ml_empty'))}"></tf-empty-state>`}
+      </div>
+    </tf-section-card>
+  `;
+
+  byId('ps-ml-create')?.addEventListener('click', () => openMlCreateWindow());
+  byId('ps-ml-attach')?.addEventListener('click', () => openMlAttachWindow());
+
+  const grid = byId('ps-ml-grid');
+  grid?.addEventListener('click', (e) => {
+    const more = e.target.closest('[data-ml-more]');
+    if (more) {
+      e.stopPropagation();
+      more.parentElement?.querySelector('[data-ml-menu]')?.toggle();
+      return;
+    }
+    const openBtn = e.target.closest('[data-ml-open]');
+    if (openBtn && !openBtn.hasAttribute('disabled')) {
+      const card = openBtn.closest('[data-ml-link]');
+      const link = conn.links.find((l) => fv(l, 'link_id') === card?.dataset.mlLink);
+      if (link) openMlStudio(link);
+    }
+  });
+  grid?.addEventListener('action', async (e) => {
+    const card = e.target.closest('[data-ml-link]');
+    if (!card || !e.target.closest('[data-ml-menu]')) return;
+    const link = conn.links.find((l) => fv(l, 'link_id') === card.dataset.mlLink);
+    if (!link) return;
+    switch (e.detail?.action) {
+      case 'open': if (fv(link, 'can_open')) openMlStudio(link); break;
+      case 'settings': openMlSettingsWindow(link); break;
+      case 'sync': await syncMlLink(link); break;
+      case 'detach': confirmDetachMlLink(link); break;
+      default: break;
+    }
+  });
+}
+
+async function syncMlLink(link) {
+  try {
+    const resp = await ApiBinary.one('projectStudioMlLinkSyncNowRequest', {
+      projectId: projectId(),
+      linkId: fv(link, 'link_id'),
+    });
+    const outcome = resp.outcome || {};
+    const errors = Array.isArray(outcome.errors) ? outcome.errors : [];
+    const summary = t('ml_sync_result', {
+      added: Number(fv(outcome, 'applied_add') ?? 0),
+      updated: Number(fv(outcome, 'applied_update') ?? 0),
+      removed: Number(fv(outcome, 'applied_remove') ?? 0),
+      skipped: Number(outcome.skipped ?? 0),
+    });
+    toast(errors.length ? `${summary} — ${errors.join('; ')}` : summary, errors.length ? 'error' : 'success');
+  } catch (err) {
+    toast(`${t('ml_sync_failed')}: ${err.message}`, 'error');
+  }
+  await renderConnections();
+}
+
+function confirmDetachMlLink(link) {
+  const name = fv(link, 'label') || (link.summary ? link.summary.name : fv(link, 'ml_project_id'));
+  openDeleteWindow({
+    title: t('ml_detach_title'),
+    targetName: name,
+    targetSub: t('ml_detach_sub'),
+    targetIcon: 'brain',
+    warning: t('ml_detach_warning'),
+    extraHtml: `
+      <div class="ps-toggle-inline" style="margin-top:10px;">
+        <tf-checkbox id="ps-ml-revoke"></tf-checkbox>
+        <span>${escapeHtml(t('ml_detach_revoke'))}</span>
+      </div>
+      <div class="ps-field-hint">${escapeHtml(t('ml_detach_revoke_hint'))}</div>
+    `,
+    confirmLabel: t('ml_detach_confirm'),
+    onConfirm: async (dialogBody) => {
+      const resp = await ApiBinary.one('projectStudioMlLinkDetachRequest', {
+        projectId: projectId(),
+        linkId: fv(link, 'link_id'),
+        revokeMembers: !!dialogBody.querySelector('#ps-ml-revoke')?.checked,
+      });
+      toast(t('ml_detached_ok', { count: Number(fv(resp, 'members_removed') ?? 0) }), 'success');
+      await renderConnections();
+    },
+  });
+}
+
+// Role-map editor shared by the create / attach / settings windows: the five
+// project roles collapse onto ML Studio's two.
+function roleMapHtml(roleMap) {
+  return `
+    <div class="ps-role-map">
+      <div class="ps-role-map-head">
+        <span>${escapeHtml(t('ml_role_project'))}</span>
+        <span>${escapeHtml(t('ml_role_ml'))}</span>
+      </div>
+      ${PROJECT_ROLES.map((role) => `
+        <div class="ps-role-map-row">
+          <span><tf-chip status="${role === 'owner' ? 'accent' : 'info'}">${escapeHtml(roleLabel(role))}</tf-chip></span>
+          <tf-select data-role-map="${escapeAttr(role)}" value="${escapeAttr(roleMap[role])}">
+            ${ML_ROLES.map((mlRole) => `<option value="${mlRole}" ${mlRole === roleMap[role] ? 'selected' : ''}>${escapeHtml(t(`ml_role_${mlRole}`))}</option>`).join('')}
+          </tf-select>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function wireRoleMap(body, roleMap) {
+  body.querySelectorAll('[data-role-map]').forEach((sel) => {
+    sel.addEventListener('change', (e) => {
+      const value = e.detail?.value ?? sel.value ?? 'viewer';
+      roleMap[sel.dataset.roleMap] = ML_ROLES.includes(value) ? value : 'viewer';
+    });
+  });
+}
+
+function roleMapEntries(roleMap) {
+  return PROJECT_ROLES.map((role) => ({ projectRole: role, mlRole: roleMap[role] }));
+}
+
+function readRoleMap(link) {
+  const map = { ...ML_DEFAULT_ROLE_MAP };
+  const wire = Array.isArray(fv(link, 'role_map')) ? fv(link, 'role_map') : [];
+  for (const entry of wire) {
+    const role = fv(entry, 'project_role');
+    const mlRole = fv(entry, 'ml_role');
+    if (PROJECT_ROLES.includes(role) && ML_ROLES.includes(mlRole)) map[role] = mlRole;
+  }
+  return map;
+}
+
+function openMlCreateWindow() {
+  const { body, foot, cleanup } = openWindow({
+    title: t('ml_create_title'),
+    subtitle: t('ml_create_sub'),
+    icon: 'brain',
+    width: 720,
+  });
+  const cw = { roleMap: { ...ML_DEFAULT_ROLE_MAP }, types: [], busy: false };
+
+  body.innerHTML = `
+    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('ml_create_banner'))}</span></div>
+    <div class="ps-ml-form-grid">
+      <tf-input id="ps-ml-name" label="${escapeAttr(t('ml_name_label'))}"
+        value="${escapeAttr(state.project?.name ? t('ml_name_default', { name: state.project.name }) : '')}"
+        hint="${escapeAttr(t('ml_name_hint'))}"></tf-input>
+      <div class="ps-field">
+        <tf-select id="ps-ml-type" label="${escapeAttr(t('ml_type_label'))}" value=""></tf-select>
+        <div class="ps-field-hint">${escapeHtml(t('ml_type_hint'))}</div>
+      </div>
+    </div>
+    <div class="ps-banner-warn" data-ml-types-error hidden>${sprite('alert')}<span>${escapeHtml(t('ml_types_failed'))}</span></div>
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('ml_role_map_title'))}</span>
+      ${roleMapHtml(cw.roleMap)}
+    </div>
+    <div class="ps-toggle-inline">
+      <tf-toggle id="ps-ml-sync" checked></tf-toggle>
+      <span>${escapeHtml(t('ml_sync_label'))}</span>
+    </div>
+    <div class="ps-field-hint">${escapeHtml(t('ml_sync_hint'))}</div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-action="create" disabled>${escapeHtml(t('ml_create'))}</tf-button>
+    </div>
+  `;
+  wireRoleMap(body, cw.roleMap);
+
+  const showError = (msg) => {
+    const el = body.querySelector('[data-form-error]');
+    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  };
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn || cw.busy || btn.hasAttribute('disabled')) return;
+    if (btn.dataset.action === 'cancel') { cleanup(); return; }
+    const mlName = String(body.querySelector('#ps-ml-name')?.value ?? '').trim();
+    const projectType = String(body.querySelector('#ps-ml-type')?.value ?? '');
+    if (mlName.length < 3) { showError(t('ml_err_name')); return; }
+    if (!projectType) { showError(t('ml_err_type')); return; }
+    showError(null);
+    cw.busy = true;
+    btn.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('projectStudioMlProjectCreateFromProjectRequest', {
+        projectId: projectId(),
+        mlName,
+        projectType,
+        roleMap: roleMapEntries(cw.roleMap),
+        syncPermissions: !!body.querySelector('#ps-ml-sync')?.checked,
+        label: mlName,
+      });
+      toast(t('ml_created_ok', {
+        mapped: Number(fv(resp, 'members_mapped') ?? 0),
+        skipped: Number(fv(resp, 'members_skipped') ?? 0),
+      }), 'success');
+      cleanup();
+      await renderConnections();
+    } catch (err) {
+      cw.busy = false;
+      btn.removeAttribute('disabled');
+      showError(`${t('ml_create_failed')}: ${err.message}`);
+    }
+  });
+
+  // The ML type catalogue is owned by ML Studio; without it there is nothing
+  // valid to send, so creation stays locked instead of guessing a slug.
+  (async () => {
+    try {
+      const resp = await ApiBinary.one('mlStudioProjectTypesListRequest');
+      cw.types = Array.isArray(resp.types) ? resp.types : [];
+    } catch {
+      cw.types = [];
+    }
+    const banner = body.querySelector('[data-ml-types-error]');
+    if (!cw.types.length) {
+      if (banner) banner.hidden = false;
+      return;
+    }
+    body.querySelector('#ps-ml-type')?.setOptions(
+      cw.types.map((type) => ({ value: type.slug ?? type.id ?? '', label: type.label ?? type.name ?? type.slug ?? '' })),
+      cw.types[0].slug ?? '',
+    );
+    foot.querySelector('[data-action="create"]')?.removeAttribute('disabled');
+  })();
+}
+
+function openMlAttachWindow() {
+  const { body, foot, cleanup } = openWindow({
+    title: t('ml_attach_title'),
+    subtitle: t('ml_attach_sub'),
+    icon: 'share',
+    width: 720,
+  });
+  // sync_permissions defaults OFF for an existing ML project: its member list
+  // predates the link and must not be rewritten without an explicit decision.
+  const aw = { roleMap: { ...ML_DEFAULT_ROLE_MAP }, candidates: [], mlProjectId: '', busy: false };
+
+  body.innerHTML = `
+    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('ml_attach_banner'))}</span></div>
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('ml_attach_pick_label'))}</span>
+      <tf-combobox id="ps-ml-candidate" placeholder="${escapeAttr(t('ml_attach_pick_placeholder'))}"></tf-combobox>
+      <div class="ps-field-hint">${escapeHtml(t('ml_attach_pick_hint'))}</div>
+    </div>
+    <tf-input id="ps-ml-label" label="${escapeAttr(t('ml_label_label'))}" hint="${escapeAttr(t('ml_label_hint'))}"></tf-input>
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('ml_role_map_title'))}</span>
+      ${roleMapHtml(aw.roleMap)}
+    </div>
+    <div class="ps-toggle-inline">
+      <tf-toggle id="ps-ml-attach-sync"></tf-toggle>
+      <span>${escapeHtml(t('ml_sync_label'))}</span>
+    </div>
+    <div class="ps-field-hint">${escapeHtml(t('ml_attach_sync_hint'))}</div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-action="attach">${escapeHtml(t('ml_attach_confirm'))}</tf-button>
+    </div>
+  `;
+  wireRoleMap(body, aw.roleMap);
+
+  const showError = (msg) => {
+    const el = body.querySelector('[data-form-error]');
+    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  };
+  body.querySelector('#ps-ml-candidate')?.addEventListener('change', (e) => {
+    aw.mlProjectId = e.detail?.value || '';
+  });
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn || aw.busy) return;
+    if (btn.dataset.action === 'cancel') { cleanup(); return; }
+    if (!aw.mlProjectId) { showError(t('ml_err_candidate')); return; }
+    showError(null);
+    aw.busy = true;
+    btn.setAttribute('disabled', '');
+    try {
+      await ApiBinary.one('projectStudioMlLinkAttachRequest', {
+        projectId: projectId(),
+        mlProjectId: aw.mlProjectId,
+        label: String(body.querySelector('#ps-ml-label')?.value ?? '').trim(),
+        syncPermissions: !!body.querySelector('#ps-ml-attach-sync')?.checked,
+        roleMap: roleMapEntries(aw.roleMap),
+      });
+      toast(t('ml_attached_ok'), 'success');
+      cleanup();
+      await renderConnections();
+    } catch (err) {
+      aw.busy = false;
+      btn.removeAttribute('disabled');
+      showError(`${t('ml_attach_failed')}: ${err.message}`);
+    }
+  });
+
+  (async () => {
+    let candidates = [];
+    try {
+      const resp = await ApiBinary.one('projectStudioMlProjectCandidatesRequest', { projectId: projectId() });
+      candidates = Array.isArray(resp.candidates) ? resp.candidates : [];
+    } catch (err) {
+      showError(`${t('ml_candidates_failed')}: ${err.message}`);
+    }
+    aw.candidates = candidates;
+    const box = body.querySelector('#ps-ml-candidate');
+    if (!box) return;
+    box.options = candidates.map((c) => ({
+      value: fv(c, 'ml_project_id'),
+      label: c.name,
+      description: fv(c, 'project_type_label') || fv(c, 'project_type') || '',
+    }));
+    if (!candidates.length) showError(t('ml_candidates_empty'));
+  })();
+}
+
+function openMlSettingsWindow(link) {
+  const { body, foot, cleanup } = openWindow({
+    title: t('ml_settings_title'),
+    subtitle: fv(link, 'label') || (link.summary ? link.summary.name : fv(link, 'ml_project_id')),
+    icon: 'settings',
+    width: 680,
+  });
+  const uw = { roleMap: readRoleMap(link), busy: false };
+
+  body.innerHTML = `
+    <tf-input id="ps-ml-set-label" label="${escapeAttr(t('ml_label_label'))}" value="${escapeAttr(fv(link, 'label') || '')}"
+      hint="${escapeAttr(t('ml_label_hint'))}"></tf-input>
+    <div class="ps-case-info-list">
+      <div><span>${escapeHtml(t('ml_info_origin'))}</span><b>${escapeHtml(t(`ml_origin_${fv(link, 'origin')}`))}</b></div>
+      <div><span>${escapeHtml(t('ml_info_created_by'))}</span><b>${escapeHtml(fv(link, 'created_by_name') || '—')}</b></div>
+      <div><span>${escapeHtml(t('ml_info_last_sync'))}</span><b>${escapeHtml(fv(link, 'last_sync_at') ? formatTimestamp(fv(link, 'last_sync_at')) : '—')}</b></div>
+      <div><span>${escapeHtml(t('ml_info_last_sync_result'))}</span><b>${escapeHtml(fv(link, 'last_sync_result') || '—')}</b></div>
+    </div>
+    <div class="ps-field">
+      <span class="ps-field-label">${escapeHtml(t('ml_role_map_title'))}</span>
+      ${roleMapHtml(uw.roleMap)}
+    </div>
+    <div class="ps-toggle-inline">
+      <tf-toggle id="ps-ml-set-sync" ${fv(link, 'sync_permissions') ? 'checked' : ''}></tf-toggle>
+      <span>${escapeHtml(t('ml_sync_label'))}</span>
+    </div>
+    <div class="ps-field-hint">${escapeHtml(t('ml_sync_hint'))}</div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>
+    </div>
+  `;
+  wireRoleMap(body, uw.roleMap);
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn || uw.busy) return;
+    if (btn.dataset.action === 'cancel') { cleanup(); return; }
+    uw.busy = true;
+    btn.setAttribute('disabled', '');
+    try {
+      await ApiBinary.one('projectStudioMlLinkUpdateRequest', {
+        projectId: projectId(),
+        linkId: fv(link, 'link_id'),
+        label: String(body.querySelector('#ps-ml-set-label')?.value ?? '').trim(),
+        syncPermissions: !!body.querySelector('#ps-ml-set-sync')?.checked,
+        roleMap: roleMapEntries(uw.roleMap),
+      });
+      toast(t('ml_settings_saved'), 'success');
+      cleanup();
+      await renderConnections();
+    } catch (err) {
+      uw.busy = false;
+      btn.removeAttribute('disabled');
+      const el = body.querySelector('[data-form-error]');
+      if (el) { el.hidden = false; el.textContent = `${t('ml_settings_failed')}: ${err.message}`; }
+    }
+  });
+}
+
+// =============================================================================
+// Z01 (F4) — kanban task board
+// =============================================================================
+
+// Mirrors the TaskSave rule enforced server-side: the author, the assignee and
+// anyone from editor upwards may move a card; everyone else sees it read-only.
+function canMoveTask(task) {
+  if (canEdit()) return true;
+  return isMe(fv(task, 'created_by')) || isMe(fv(task, 'assigned_to'));
+}
+
+// Card order is NOT persisted in F4 — the board sorts by priority and then by
+// last change, so a reload always produces the same, explainable order.
+function boardSortedTasks(rows) {
+  const rank = { critical: 0, high: 1, medium: 2, low: 3 };
+  return rows.slice().sort((a, b) => {
+    const byPriority = (rank[a.priority] ?? 9) - (rank[b.priority] ?? 9);
+    if (byPriority !== 0) return byPriority;
+    return String(fv(b, 'updated_at') || '').localeCompare(String(fv(a, 'updated_at') || ''));
+  });
+}
+
+function taskCardModel(task) {
+  const type = fv(task, 'task_type');
+  const severity = task.severity || '';
+  const dueDate = fv(task, 'due_date') || '';
+  const assignee = fv(task, 'assigned_to_name') || '';
+  const links = (() => {
+    try {
+      const parsed = JSON.parse(fv(task, 'links_json') || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })();
+  const meta = [];
+  if (severity) {
+    meta.push({
+      text: t(`sev_${severity}`),
+      tone: { critical: 'danger', high: 'warning', medium: 'accent', low: 'info' }[severity] || 'neutral',
+    });
+  }
+  meta.push({ text: t(`prio_${task.priority}`), icon: 'trend' });
+  if (links.length) meta.push({ text: t('board_links', { count: links.length }), icon: 'branch' });
+  if (Number(fv(task, 'comment_count') ?? 0) > 0) {
+    meta.push({ text: String(fv(task, 'comment_count')), icon: 'message' });
+  }
+
+  const menu = [{ id: 'open', label: t('action_open'), icon: 'external-link' }];
+  if (canManage() || isMe(fv(task, 'created_by'))) {
+    menu.push({ id: 'delete', label: t('action_delete'), icon: 'trash', danger: true });
+  }
+
+  return {
+    id: fv(task, 'task_id'),
+    column: task.status,
+    title: task.title,
+    badge: taskNoLabel(task),
+    badgeKind: type === 'defect' ? 'danger' : 'info',
+    badgeIcon: type === 'defect' ? 'alert' : 'check',
+    accent: severity === 'critical' ? 'danger' : null,
+    disabled: !canMoveTask(task),
+    meta,
+    footer: {
+      left: dueDate ? { icon: 'clock', text: dueDate } : null,
+      right: assignee
+        ? { avatar: true, text: initials(assignee), title: assignee }
+        : { avatar: true, text: '?', title: t('board_unassigned') },
+    },
+    menu,
+  };
+}
+
+function renderTaskBoard() {
+  const tv = state.tasksView;
+  const host = byId('ps-tasks-table-host');
+  if (!host || !tv) return;
+
+  const board = document.createElement('tf-kanban');
+  board.setAttribute('empty-text', t('board_column_empty'));
+  board.labels = {
+    empty: t('board_column_empty'),
+    dragHint: t('board_drag_hint'),
+    countLabel: '{n}',
+    limitLabel: '{n}/{limit}',
+    cardsLabel: t('board_cards_label'),
+    limitExceeded: t('board_limit_exceeded'),
+    addCard: t('board_add_card'),
+    cardMenu: t('action_more'),
+    grabbed: t('board_a11y_grabbed'),
+    moved: t('board_a11y_moved'),
+    dropped: t('board_a11y_dropped'),
+    cancelled: t('board_a11y_cancelled'),
+  };
+  board.columns = TASK_BOARD_COLUMNS.map((col) => ({
+    id: col.id,
+    label: t(`task_status_${col.id}`),
+    accent: col.accent,
+  }));
+  board.readOnly = !canTest();
+  board.cards = boardSortedTasks(tv.boardRows).map(taskCardModel);
+
+  board.addEventListener('card-open', (e) => {
+    const taskId = e.detail?.cardId;
+    if (taskId) openTaskWindow({ taskId });
+  });
+  board.addEventListener('column-add', (e) => {
+    if (!canTest()) return;
+    openTaskWindow({ status: e.detail?.columnId });
+  });
+  board.addEventListener('card-menu', async (e) => {
+    const taskId = e.detail?.cardId;
+    const task = tv.boardRows.find((row) => fv(row, 'task_id') === taskId);
+    if (!task) return;
+    if (e.detail?.actionId === 'open') { openTaskWindow({ taskId }); return; }
+    if (e.detail?.actionId === 'delete') confirmDeleteBoardTask(task);
+  });
+  // The board already shows the new position when this fires; a rejected write
+  // is undone with revertMove so the UI never drifts from the server.
+  board.addEventListener('card-move', async (e) => {
+    const { cardId, to } = e.detail || {};
+    const task = tv.boardRows.find((row) => fv(row, 'task_id') === cardId);
+    if (!task || !to || task.status === to) return;
+    const previous = task.status;
+    task.status = to;
+    try {
+      await ApiBinary.one('projectStudioTaskStatusSetRequest', {
+        projectId: projectId(),
+        taskId: cardId,
+        status: to,
+      });
+    } catch (err) {
+      task.status = previous;
+      board.revertMove(cardId);
+      toast(`${t('board_move_failed')}: ${err.message}`, 'error');
+    }
+  });
+
+  host.replaceChildren(board);
+}
+
+function confirmDeleteBoardTask(task) {
+  openDeleteWindow({
+    title: t('task_delete_title'),
+    targetName: `${taskNoLabel(task)} ${task.title}`,
+    targetSub: t(`task_type_${fv(task, 'task_type')}`),
+    targetIcon: 'check',
+    warning: t('task_delete_message', { title: task.title }),
+    confirmLabel: t('delete_forever'),
+    onConfirm: async () => {
+      await ApiBinary.one('projectStudioTaskDeleteRequest', {
+        projectId: projectId(),
+        taskId: fv(task, 'task_id'),
+      });
+      toast(t('task_deleted'), 'success');
+      await renderTasksTab();
+    },
+  });
+}
+
+// =============================================================================
+// Project export / import archives
+// =============================================================================
+
+function stopArchiveJob() {
+  const job = state.archiveJob;
+  if (!job) return;
+  if (job.unsub) { try { job.unsub(); } catch { /* stream already gone */ } }
+  if (job.pollTimer) clearInterval(job.pollTimer);
+  state.archiveJob = null;
+}
+
+// One live archive job at a time. The stream only feeds the log; the status
+// poll stays the source of truth for progress and the terminal outcome.
+function trackArchiveJob(jobId, kind, { onStatus, onLog }) {
+  stopArchiveJob();
+  const job = { jobId, kind, unsub: null, pollTimer: null, log: [] };
+  state.archiveJob = job;
+
+  ApiBinary.subscribe(
+    'projectStudioArchiveStreamRequest',
+    { jobId },
+    {
+      onChunk: (body) => {
+        if (body?.variant !== 'ProjectStudioArchiveStreamChunk') return;
+        if (state.archiveJob !== job) return;
+        const line = body.phase ? `[${body.phase}] ${body.line}` : String(body.line || '');
+        job.log.push(line);
+        if (job.log.length > ARCHIVE_LOG_CAP) job.log.splice(0, job.log.length - ARCHIVE_LOG_CAP);
+        onLog(job.log);
+      },
+      onError: () => { /* the poll below is the source of truth */ },
+      onEnd: () => { /* terminal state is confirmed by the poll */ },
+    },
+  ).then((unsub) => {
+    if (state.archiveJob !== job) { unsub(); return; }
+    job.unsub = unsub;
+  }).catch(() => { /* the stream is optional, polling still tracks the job */ });
+
+  const poll = async () => {
+    if (state.archiveJob !== job) return;
+    let status = null;
+    try {
+      status = kind === 'export'
+        ? await ApiBinary.one('projectStudioProjectExportStatusRequest', { projectId: projectId(), jobId })
+        : await ApiBinary.one('projectStudioProjectImportStatusRequest', { jobId });
+    } catch {
+      return;
+    }
+    if (state.archiveJob !== job) return;
+    onStatus(status);
+    if (String(status.status || '') !== 'running') stopArchiveJob();
+  };
+  job.pollTimer = setInterval(poll, ARCHIVE_POLL_MS);
+  poll();
+}
+
+function inventoryHtml(inventory, totalBytes) {
+  if (!inventory) return '';
+  const cell = (labelKey, value) => `
+    <div class="ps-inv-cell"><span>${escapeHtml(t(labelKey))}</span><b>${escapeHtml(String(value))}</b></div>
+  `;
+  return `
+    <div class="ps-inventory">
+      ${cell('inv_cases', Number(inventory.cases ?? 0))}
+      ${cell('inv_suites', Number(inventory.suites ?? 0))}
+      ${cell('inv_runs', Number(inventory.runs ?? 0))}
+      ${cell('inv_tasks', Number(inventory.tasks ?? 0))}
+      ${cell('inv_documents', Number(inventory.documents ?? 0))}
+      ${cell('inv_sources', Number(inventory.sources ?? 0))}
+      ${cell('inv_files', `${Number(inventory.files ?? 0)} · ${formatBytes(Number(fv(inventory, 'bytes_files') ?? 0))}`)}
+      ${cell('inv_run_artifacts', formatBytes(Number(fv(inventory, 'bytes_runs') ?? 0)))}
+      ${cell('inv_vectors', `${Number(inventory.vectors ?? 0)} · ${Number(fv(inventory, 'vector_dim') ?? 0)}d`)}
+      ${cell('inv_embedding', fv(inventory, 'embedding_model') || fv(inventory, 'embedding_alias') || '—')}
+      ${totalBytes != null ? cell('inv_total_bytes', formatBytes(Number(totalBytes))) : ''}
+    </div>
+  `;
+}
+
+function openExportWindow() {
+  const { body, foot, cleanup } = openWindow({
+    title: t('export_title'),
+    subtitle: state.project?.name || '',
+    icon: 'download',
+    width: 680,
+  });
+  const ew = { jobId: null, signedUrl: '', busy: false };
+
+  body.innerHTML = `
+    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('export_intro'))}</span></div>
+    <div class="ps-export-options">
+      <div class="ps-toggle-inline">
+        <tf-checkbox id="ps-exp-runs" checked></tf-checkbox>
+        <span>${escapeHtml(t('export_include_runs'))}</span>
+      </div>
+      <div class="ps-field-hint">${escapeHtml(t('export_include_runs_hint'))}</div>
+      <div class="ps-toggle-inline">
+        <tf-checkbox id="ps-exp-vectors" checked></tf-checkbox>
+        <span>${escapeHtml(t('export_include_vectors'))}</span>
+      </div>
+      <div class="ps-field-hint">${escapeHtml(t('export_include_vectors_hint'))}</div>
+      <div class="ps-toggle-inline">
+        <tf-checkbox id="ps-exp-names"></tf-checkbox>
+        <span>${escapeHtml(t('export_include_names'))}</span>
+      </div>
+      <div class="ps-field-hint">${escapeHtml(t('export_include_names_hint'))}</div>
+    </div>
+    <div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('export_secrets_note'))}</span></div>
+    <div data-export-progress hidden>
+      <tf-progress-bar id="ps-exp-bar" value="0" label="${escapeAttr(t('export_phase_start'))}"></tf-progress-bar>
+      <div class="ps-archive-phase" data-export-phase></div>
+      <pre class="ps-archive-log" data-export-log></pre>
+    </div>
+    <div data-export-result hidden></div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="close-export">${escapeHtml(t('action_close'))}</tf-button>
+      <tf-button variant="primary" icon="download" data-action="start">${escapeHtml(t('export_start'))}</tf-button>
+    </div>
+  `;
+
+  const showError = (msg) => {
+    const el = body.querySelector('[data-form-error]');
+    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  };
+
+  const onStatus = (status) => {
+    const pct = Number(fv(status, 'progress_pct') ?? 0);
+    body.querySelector('#ps-exp-bar')?.setAttribute('value', String(pct));
+    const phase = body.querySelector('[data-export-phase]');
+    if (phase) phase.textContent = t('export_phase', { phase: status.phase || '—', pct });
+    const state_ = String(status.status || '');
+    if (state_ === 'running') return;
+    const result = body.querySelector('[data-export-result]');
+    if (!result) return;
+    result.hidden = false;
+    if (state_ !== 'success') {
+      result.innerHTML = `<div class="ps-form-error">${escapeHtml(status.error || t('export_failed'))}</div>`;
+      foot.querySelector('[data-action="start"]')?.removeAttribute('disabled');
+      ew.busy = false;
+      return;
+    }
+    ew.signedUrl = fv(status, 'signed_url') || '';
+    result.innerHTML = `
+      <div class="ps-banner-info">${sprite('check')}<span>${escapeHtml(t('export_done', { size: formatBytes(Number(fv(status, 'archive_bytes') ?? 0)) }))}</span></div>
+      ${inventoryHtml(status.inventory, null)}
+      <div class="ps-export-download">
+        <tf-button variant="primary" icon="download" data-action="download">${escapeHtml(t('export_download'))}</tf-button>
+      </div>
+    `;
+    foot.querySelector('[data-action="start"]')?.setAttribute('hidden', '');
+  };
+
+  body.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-action="download"]')) return;
+    if (!ew.signedUrl) { showError(t('export_no_url')); return; }
+    // The archive is downloaded over its signed HTTPS URL, not the binary
+    // protocol: it can reach tens of gigabytes.
+    downloadUrl(ew.signedUrl, `${state.project?.name || 'project'}.tfproj.zip`);
+  });
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    if (btn.dataset.action === 'close-export') { stopArchiveJob(); cleanup(); return; }
+    if (btn.dataset.action !== 'start' || ew.busy) return;
+    showError(null);
+    ew.busy = true;
+    btn.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('projectStudioProjectExportStartRequest', {
+        projectId: projectId(),
+        includeRuns: !!body.querySelector('#ps-exp-runs')?.checked,
+        includeVectors: !!body.querySelector('#ps-exp-vectors')?.checked,
+        includeUserNames: !!body.querySelector('#ps-exp-names')?.checked,
+      });
+      ew.jobId = fv(resp, 'job_id');
+      body.querySelector('[data-export-progress]').hidden = false;
+      trackArchiveJob(ew.jobId, 'export', {
+        onStatus,
+        onLog: (lines) => {
+          const log = body.querySelector('[data-export-log]');
+          if (log) { log.textContent = lines.join('\n'); log.scrollTop = log.scrollHeight; }
+        },
+      });
+    } catch (err) {
+      ew.busy = false;
+      btn.removeAttribute('disabled');
+      showError(`${t('export_start_failed')}: ${err.message}`);
+    }
+  });
+}
+
+function openImportWindow() {
+  const { body, foot, cleanup } = openWindow({
+    title: t('import_title'),
+    subtitle: t('import_sub'),
+    icon: 'cloud',
+    width: 760,
+  });
+  // controls.css forces display:block on tf-progress-bar, which beats the
+  // [hidden] UA rule — the upload bar is toggled through its wrapper div.
+  const iw = { file: null, uploadId: '', preview: null, jobId: null, busy: false };
+
+  const showError = (msg) => {
+    const el = body.querySelector('[data-form-error]');
+    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  };
+  const setStep = (step) => {
+    body.querySelectorAll('[data-import-step]').forEach((el) => {
+      el.hidden = el.dataset.importStep !== step;
+    });
+    foot.querySelectorAll('[data-step-action]').forEach((el) => {
+      el.hidden = el.dataset.stepAction !== step;
+    });
+  };
+
+  body.innerHTML = `
+    <div data-import-step="pick">
+      <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('import_intro'))}</span></div>
+      <tf-file-input id="ps-imp-file" accept=".zip" label="${escapeAttr(t('import_dropzone'))}"></tf-file-input>
+      <div data-import-file></div>
+      <div data-import-upload hidden>
+        <tf-progress-bar id="ps-imp-upload-bar" value="0" label="${escapeAttr(t('import_uploading'))}"></tf-progress-bar>
+      </div>
+    </div>
+    <div data-import-step="preview" hidden></div>
+    <div data-import-step="apply" hidden>
+      <tf-progress-bar id="ps-imp-bar" value="0" label="${escapeAttr(t('import_phase_start'))}"></tf-progress-bar>
+      <div class="ps-archive-phase" data-import-phase></div>
+      <pre class="ps-archive-log" data-import-log></pre>
+      <div data-import-result></div>
+    </div>
+    <div class="ps-form-error" data-form-error hidden></div>
+  `;
+  foot.innerHTML = `
+    <div class="ps-footer-left"></div>
+    <div class="ps-footer-right">
+      <tf-button variant="ghost" data-action="close-import">${escapeHtml(t('action_close'))}</tf-button>
+      <tf-button variant="primary" icon="arrow" data-action="upload" data-step-action="pick" disabled>${escapeHtml(t('import_analyze'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-action="apply" data-step-action="preview" hidden>${escapeHtml(t('import_apply'))}</tf-button>
+    </div>
+  `;
+  setStep('pick');
+
+  body.querySelector('#ps-imp-file')?.addEventListener('change', (e) => {
+    const file = e.detail?.files?.[0] ?? null;
+    iw.file = file;
+    const slot = body.querySelector('[data-import-file]');
+    if (slot) {
+      slot.innerHTML = file ? `
+        <div class="ps-added-file">
+          <span class="ps-af-ico">${sprite('folder')}</span>
+          <div class="ps-af-main">
+            <div class="ps-af-name">${escapeHtml(file.name)}</div>
+            <div class="ps-af-size">${escapeHtml(formatBytes(file.size))}</div>
+          </div>
+        </div>
+      ` : '';
+    }
+    const btn = foot.querySelector('[data-action="upload"]');
+    if (file) btn?.removeAttribute('disabled');
+    else btn?.setAttribute('disabled', '');
+  });
+
+  const uploadArchive = async () => {
+    const uploadId = crypto.randomUUID();
+    const totalChunks = Math.max(1, Math.ceil(iw.file.size / IMPORT_CHUNK_BYTES));
+    const bar = body.querySelector('#ps-imp-upload-bar');
+    const barWrap = body.querySelector('[data-import-upload]');
+    if (barWrap) barWrap.hidden = false;
+    // Archives run to gigabytes, so each slice is materialised on its own: reading
+    // the whole File into one buffer would put the entire archive in the tab's heap.
+    for (let seq = 0; seq < totalChunks; seq += 1) {
+      const start = seq * IMPORT_CHUNK_BYTES;
+      const slice = iw.file.slice(start, Math.min(start + IMPORT_CHUNK_BYTES, iw.file.size));
+      const chunk = new Uint8Array(await slice.arrayBuffer());
+      await ApiBinary.one('projectStudioProjectImportUploadChunkRequest', {
+        uploadId,
+        filename: iw.file.name,
+        seq,
+        totalChunks,
+        bytes: chunk,
+      });
+      bar?.setAttribute('value', String(Math.round(((seq + 1) / totalChunks) * 100)));
+    }
+    return uploadId;
+  };
+
+  const renderPreview = (preview) => {
+    const host = body.querySelector('[data-import-step="preview"]');
+    if (!host) return;
+    const modules = Array.isArray(preview.modules) ? preview.modules : [];
+    const reusable = !!fv(preview, 'vectors_reusable');
+    host.innerHTML = `
+      <div class="ps-preview-head">
+        <div class="ps-preview-name">${escapeHtml(fv(preview, 'project_name') || '')}</div>
+        <div class="ps-preview-sub">${escapeHtml(t('import_preview_sub', {
+          exported: formatTimestamp(fv(preview, 'exported_at')),
+          version: Number(fv(preview, 'archive_version') ?? 0),
+        }))}</div>
+        <div class="ps-preview-chips">
+          <tf-chip status="info">${escapeHtml(t(`tpl_${fv(preview, 'template') || 'custom'}_name`))}</tf-chip>
+          ${modules.map((m) => `<tf-chip>${escapeHtml(t(`module_${m}`))}</tf-chip>`).join('')}
+        </div>
+      </div>
+      ${inventoryHtml(preview.inventory, fv(preview, 'total_uncompressed_bytes'))}
+      <div class="ps-banner-${reusable ? 'info' : 'warn'}">
+        ${sprite(reusable ? 'info' : 'alert')}
+        <span>${escapeHtml(reusable
+          ? t('import_vectors_reusable')
+          : t('import_vectors_reindex', { reason: fv(preview, 'vectors_reason') || '—' }))}</span>
+      </div>
+      <div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('import_env_warning'))}</span></div>
+      <div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('import_sources_warning'))}</span></div>
+      <tf-input id="ps-imp-name" label="${escapeAttr(t('import_name_label'))}" value="${escapeAttr(fv(preview, 'project_name') || '')}"
+        hint="${escapeAttr(t('import_name_hint'))}"></tf-input>
+      <div class="ps-toggle-inline">
+        <tf-checkbox id="ps-imp-vectors" ${reusable ? 'checked' : ''}></tf-checkbox>
+        <span>${escapeHtml(t('import_take_vectors'))}</span>
+      </div>
+      <div class="ps-toggle-inline">
+        <tf-checkbox id="ps-imp-runs" ${fv(preview, 'has_runs') ? 'checked' : ''} ${fv(preview, 'has_runs') ? '' : 'disabled'}></tf-checkbox>
+        <span>${escapeHtml(t('import_take_runs'))}</span>
+      </div>
+    `;
+  };
+
+  const onStatus = (status) => {
+    const pct = Number(fv(status, 'progress_pct') ?? 0);
+    body.querySelector('#ps-imp-bar')?.setAttribute('value', String(pct));
+    const phase = body.querySelector('[data-import-phase]');
+    if (phase) phase.textContent = t('import_phase', { phase: status.phase || '—', pct });
+    const state_ = String(status.status || '');
+    if (state_ === 'running') return;
+    const result = body.querySelector('[data-import-result]');
+    if (!result) return;
+    if (state_ !== 'success') {
+      result.innerHTML = `<div class="ps-form-error">${escapeHtml(status.error || t('import_failed'))}</div>`;
+      return;
+    }
+    const newProjectId = fv(status, 'project_id');
+    const reindexJobs = Array.isArray(fv(status, 'reindex_job_ids')) ? fv(status, 'reindex_job_ids') : [];
+    result.innerHTML = `
+      <div class="ps-banner-info">${sprite('check')}<span>${escapeHtml(fv(status, 'vectors_imported')
+        ? t('import_done_vectors')
+        : t('import_done_reindex', { count: reindexJobs.length }))}</span></div>
+      <div class="ps-export-download">
+        <tf-button variant="primary" icon="external-link" data-action="open-imported">${escapeHtml(t('import_open_project'))}</tf-button>
+      </div>
+    `;
+    result.querySelector('[data-action="open-imported"]')?.addEventListener('click', async () => {
+      stopArchiveJob();
+      cleanup();
+      await loadProjects();
+      if (newProjectId) await openProject(newProjectId);
+    });
+  };
+
+  foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn || iw.busy) return;
+    if (btn.dataset.action === 'close-import') { stopArchiveJob(); cleanup(); return; }
+
+    if (btn.dataset.action === 'upload') {
+      if (!iw.file) { showError(t('import_err_file')); return; }
+      showError(null);
+      iw.busy = true;
+      btn.setAttribute('disabled', '');
+      try {
+        iw.uploadId = await uploadArchive();
+        // The preview reads ONLY the manifest — nothing is unpacked before the
+        // operator confirms.
+        iw.preview = await ApiBinary.one('projectStudioProjectImportPreviewRequest', { uploadId: iw.uploadId });
+        renderPreview(iw.preview);
+        setStep('preview');
+      } catch (err) {
+        showError(`${t('import_preview_failed')}: ${err.message}`);
+      }
+      iw.busy = false;
+      btn.removeAttribute('disabled');
+      return;
+    }
+
+    if (btn.dataset.action !== 'apply') return;
+    showError(null);
+    iw.busy = true;
+    btn.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('projectStudioProjectImportApplyRequest', {
+        uploadId: iw.uploadId,
+        nameOverride: String(body.querySelector('#ps-imp-name')?.value ?? '').trim(),
+        importVectors: !!body.querySelector('#ps-imp-vectors')?.checked,
+        importRuns: !!body.querySelector('#ps-imp-runs')?.checked,
+      });
+      iw.jobId = fv(resp, 'job_id');
+      setStep('apply');
+      trackArchiveJob(iw.jobId, 'import', {
+        onStatus,
+        onLog: (lines) => {
+          const log = body.querySelector('[data-import-log]');
+          if (log) { log.textContent = lines.join('\n'); log.scrollTop = log.scrollHeight; }
+        },
+      });
+    } catch (err) {
+      iw.busy = false;
+      btn.removeAttribute('disabled');
+      showError(`${t('import_apply_failed')}: ${err.message}`);
+    }
   });
 }

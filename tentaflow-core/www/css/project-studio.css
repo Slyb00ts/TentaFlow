@@ -2871,6 +2871,392 @@
   margin-top: 8px;
 }
 
+/* ---- T13: run schedules ------------------------------------------------------ */
+
+/* tf-select is display:block/width:100% by default, which would take a whole
+   flex row each — the filters stay side by side. */
+.ps-sch-toolbar tf-select {
+  width: auto;
+  min-width: 150px;
+}
+
+.ps-sch-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 2px 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.ps-sch-preview {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+/* Live syntax feedback under the frequency field. The next fire instants are
+   NEVER derived here — only the expression shape is checked. */
+.ps-sch-validation {
+  min-height: 16px;
+  margin: -4px 0 12px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.ps-sch-validation.is-ok {
+  color: var(--success);
+}
+
+.ps-sch-validation.is-err {
+  color: var(--danger);
+}
+
+/* ---- X02: ML Studio connections ---------------------------------------------- */
+
+.ps-section-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-bottom: 12px;
+}
+
+.ps-ml-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  align-items: start;
+}
+
+@media (max-width: 1000px) {
+  .ps-ml-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-ml-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ps-ml-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.ps-ml-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.ps-ml-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ps-ml-desc {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 3px;
+}
+
+.ps-ml-models {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ps-ml-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Indeterminate strip: the wire reports "training in progress" without a
+   percentage, so the bar animates instead of claiming a value. */
+.ps-ml-progress-track {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.ps-ml-progress-track span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  border-radius: 3px;
+  background: var(--accent-1);
+  animation: ps-ml-progress-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes ps-ml-progress-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ps-ml-progress-track span {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
+.ps-ml-progress-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.ps-ml-stats {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.ps-ml-stat b {
+  color: var(--text);
+}
+
+.ps-ml-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ps-ml-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+@media (max-width: 720px) {
+  .ps-ml-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ps-role-map {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  padding: 10px 12px;
+}
+
+.ps-role-map-head,
+.ps-role-map-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 160px;
+  gap: 10px;
+  align-items: center;
+}
+
+.ps-role-map-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-3);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-role-map-row {
+  padding: 6px 0;
+}
+
+/* ---- T14 (F4): performance + tester activity reports ------------------------- */
+
+.ps-perf-report-bar,
+.ps-perf-compare-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.ps-perf-report-bar tf-select,
+.ps-perf-compare-bar tf-select {
+  width: auto;
+  min-width: 180px;
+  flex: 1 1 180px;
+}
+
+.ps-report-subtitle {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin: 8px 0 6px;
+}
+
+.ps-compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.ps-compare-table th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-3);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-compare-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  vertical-align: top;
+}
+
+.ps-compare-table tr.is-added td {
+  background: color-mix(in srgb, var(--success) 8%, transparent);
+}
+
+.ps-compare-table tr.is-removed td {
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
+.ps-compare-endpoint {
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.ps-compare-values b {
+  color: var(--text);
+}
+
+.ps-compare-delta {
+  margin-top: 3px;
+  font-size: 11.5px;
+}
+
+/* Latency deltas: lower is better, so a drop is the "good" colour. */
+.ps-delta-better {
+  color: var(--success);
+}
+
+.ps-delta-worse {
+  color: var(--danger);
+}
+
+.ps-delta-flat {
+  color: var(--text-3);
+}
+
+/* ---- project export / import archives ---------------------------------------- */
+
+.ps-export-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 12px 0;
+}
+
+.ps-export-download {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.ps-archive-phase {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin: 6px 0;
+}
+
+.ps-archive-log {
+  max-height: 180px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-2);
+  white-space: pre-wrap;
+}
+
+.ps-inventory {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.ps-inv-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ps-inv-cell b {
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.ps-preview-head {
+  margin-bottom: 12px;
+}
+
+.ps-preview-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ps-preview-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.ps-preview-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
 /* ---- print: report sections come out as a clean, light document -------------- */
 
 @media print {
@@ -2903,12 +3289,21 @@
   .ps-report-card,
   .ps-report-body,
   .ps-coverage-row,
-  .ps-coverage-head {
+  .ps-coverage-head,
+  .ps-compare-table,
+  .ps-compare-table td,
+  .ps-compare-table th,
+  .ps-report-subtitle {
     color: #000 !important;
     background: #fff !important;
   }
 
   .ps-coverage-row.is-uncovered {
     background: #ffe4e4 !important;
+  }
+
+  /* Report pickers are interactive controls — the printed page keeps the data. */
+  .ps-perf-report-bar {
+    display: none !important;
   }
 }
