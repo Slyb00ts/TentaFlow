@@ -10728,6 +10728,38 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `gemv_q8_0_dp4a_f16` nad oknem wierszy `w_q8` (`w_byte_off` wskazuje
+    /// pierwszy wiersz okna). Pozwala batchowej ścieżce dla JEDNEGO tokena
+    /// uruchomić ten sam kernel co dekod jednosekwencyjny — kafel GEMM dopełniany
+    /// do >=64 tokenów kwantyzuje aktywacje inaczej, co dawało trwałą różnicę
+    /// logitów między ścieżkami.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_dp4a_f16_at(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 32, "gemv_q8_0_dp4a")?;
+        let k = self.artifacts.get("gemv_q8_0_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q8, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// `gemv_q4_k_dp4a_f16` over a row window of `w_q4k` (`w_byte_off` addresses
     /// the window's first row). Used for the routed MoE gate/up projections so a
     /// single-token expert GEMV launches per-row blocks instead of a starved

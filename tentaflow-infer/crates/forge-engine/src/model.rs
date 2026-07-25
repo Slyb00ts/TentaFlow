@@ -4827,6 +4827,15 @@ impl Model {
             // inlined_assembly + _RegisterPackType (see kernels/mojo/MOJO_NOTES.md).
             DevWeight::Q8_0 { buf, cols, .. } => {
                 let off = row_off * (cols / 32) * 34;
+                // Jeden token bierze ten sam dp4a GEMV co dekod jednosekwencyjny.
+                // Kafel i8mma dopełnia do >=64 tokenów i kwantyzuje aktywacje
+                // inaczej, więc ścieżka batchowa dla B=1 dawała trwale inne
+                // logity niż serialna przy zerowym zysku wydajności.
+                if n_tokens == 1 {
+                    return self.kernels.gemv_q8_0_dp4a_f16_at(
+                        y, buf, off, x, n_rows, *cols, stream,
+                    );
+                }
                 if self
                     .kernels
                     .gemm_q8_0_small_batch_at(y, buf, off, x, n_rows, *cols, n_tokens, stream)?

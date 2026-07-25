@@ -58,26 +58,27 @@ Ostatnia aktualizacja: 2026-07-25.
   `dense_prefill_artifacts_capable` wymagało już poprawnych
   `topk_batched_{partial,final}_f32`; nieaktualny był wyłącznie test.
   `forge-kernels` przechodzi w całości (42+9+70+1).
-- 🟡 **Rozbieżność ścieżek decode: znaleziona przyczyna, ścieżka B=1 do
-  naprawy (2026-07-25).** `batched_matches_single_seq` failował od dawna bez
-  wyjaśnienia. Nowy `Model::read_single_logits` (symetryczny do
-  `read_batch_logits`) i przeplatany porównywacz w teście dały liczby:
-  rozbieżność tokenu w kroku 19 to SKUTEK, nie przyczyna — logity obu ścieżek
-  różnią się o **rel_l2 1,1e-2 do 3,5e-2 od PIERWSZEGO kroku**, a token
-  przewraca się dopiero gdy margines top-2 (0,0298) spadnie poniżej szumu
-  (max|delta| 0,33). Dwa rzędy wielkości za dużo na zaokrąglenia f16 (kernele
-  BM32 mają 1,8e-5). Przyczyna: obie ścieżki kwantyzują aktywacje do int8, ale
-  RÓŻNYMI kernelami — serialna bierze `gemv_q8_0_dp4a_f16`, a batchowa
-  `gemm_q8_0_small_batch_at` dla T=2/4/8/16 albo, dla **B=1**, dopełniany do
-  ≥64 tokenów `gemm_q8_0_i8mma_at`. B=1 przez kafel 64-tokenowy jest przy tym
-  marnotrawstwem, więc przekierowanie B=1 na ten sam GEMV co ścieżka serialna
-  usuwa rozbieżność ZA DARMO (a prawdopodobnie i przyspiesza). Wymaga wariantu
-  launchera GEMV z offsetem wiersza (`gemm_rows` operuje na oknie wierszy,
-  obecny `gemv_q8_0_dp4a_f16` nie przyjmuje offsetu) — dlatego nie jest
-  zrobione w tej sesji. Dla B>1 różnica zostaje realnym kompromisem
-  jakość/przepustowość: jakość wyjścia zależy od obciążenia serwera. Test
-  celowo pozostaje czerwony — niesie teraz pełną diagnostykę zamiast samego
-  „diverged".
+- ✅ **Rozbieżność ścieżek decode naprawiona — dotyczyła WYŁĄCZNIE B=1
+  (2026-07-25).** `batched_matches_single_seq` failował od dawna bez wyjaśnienia.
+  Nowy `Model::read_single_logits` (symetryczny do `read_batch_logits`) i
+  przeplatany porównywacz w teście pokazały, że rozbieżność tokenu w kroku 19 to
+  SKUTEK: logity obu ścieżek różniły się o **rel_l2 1,1e-2 do 3,5e-2 od
+  PIERWSZEGO kroku**, a token przewracał się dopiero gdy margines top-2 (0,0298)
+  spadł poniżej szumu (max|delta| 0,33). Dwa rzędy za dużo na zaokrąglenia f16.
+  Przyczyna: `gemm_rows` dla Q8_0 kierował **jeden token** na kafel
+  `gemm_q8_0_i8mma_at` dopełniany do >=64 tokenów, który kwantyzuje aktywacje
+  inaczej niż dp4a GEMV ścieżki serialnej. Nowy `gemv_q8_0_dp4a_f16_at`
+  (odpowiednik istniejącego `gemv_q4_k_dp4a_f16_at`) daje okno wierszy, więc
+  `n_tokens == 1` używa teraz DOKŁADNIE tego samego kernela co dekod
+  jednosekwencyjny. Test przechodzi, a cały workspace jest zielony: **606/606**.
+  KOREKTA wcześniejszego wpisu: twierdziłem, że dla B>1 zostaje kompromis
+  jakość/przepustowość — to było błędne. Szerokości 2/4/8/16 już wcześniej
+  szły na weight-stationary `gemm_q8_0_i8mma_b*`, czyli tę samą kwantyzację
+  aktywacji co ścieżka serialna; różnił się tylko B=1, i to przy zerowym zysku
+  wydajności (kafel 64-tokenowy dla jednego tokena). Jakość wyjścia NIE zależy
+  od obciążenia serwera. Bez regresji: Bielik decode-only 158/1720/2701 tok/s
+  przy C=1/16/32 (przed: 158/1687/2746), single-stream Mistral 14 781 prefill /
+  171,1 decode i qwen3-0,6B 58 390 / 671,8 bez zmian.
 - ✅ **Hybrydowy decode: grupy zamiast par, +38% na Qwen3.6-27B (2026-07-25).**
   Scheduler dzielił kolejkę hybrydową na `chunks_exact(2)` i wykonywał krok B=2
   na parę, więc osiem aktywnych sekwencji dawało dwa tokeny na krok i
