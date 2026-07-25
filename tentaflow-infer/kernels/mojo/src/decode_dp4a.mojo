@@ -27,6 +27,7 @@ from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
 from std.math import exp, rsqrt
 from std.sys.intrinsics import llvm_intrinsic
+from src.arch_dot import dot4_i8
 from src.reduce import block_reduce_sum
 
 comptime WARP = 32
@@ -39,10 +40,10 @@ comptime XDS_MAX = X_MAX // 32 * 2
 comptime XDS_HID = MAX_HIDDEN // 32 * 2
 
 
-def _dp4a(a: Int32, b: Int32, c: Int32) -> Int32:
-    """c + dot(4 signed int8 lanes of a, 4 signed int8 lanes of b) — one
-    dp4a.s32.s32 instruction on sm_61+."""
-    return llvm_intrinsic["llvm.nvvm.idp4a.s.s", Int32](a, b, c)
+# Iloczyn int8 ma jedną implementację w `src/arch_dot.mojo` (dp4a na NVIDII,
+# v_dot4_i32_i8 na AMD). Alias utrzymuje dotychczasową nazwę w 31 miejscach
+# wywołań tej rodziny kerneli.
+comptime _dp4a = dot4_i8
 
 
 def _prefetch_l2(p: UnsafePointer[UInt8, MutAnyOrigin]):
