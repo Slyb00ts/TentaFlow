@@ -9723,9 +9723,10 @@ fn decode_storage_admin_payload(
 /// both snake_case and camelCase keys. Future append-only variants decode
 /// without touching this crate. `bytes` of the upload request would arrive as
 /// a number array, but request variants never legitimately decode in the
-/// response path. AttachmentGetResponse is special-cased BEFORE the generic
-/// path: its serde_bytes payload (up to 8 MiB) must reach JS as a Uint8Array,
-/// not a per-byte number array built through serde_json.
+/// response path. AttachmentGetResponse and RunArtifactGetResponse are
+/// special-cased BEFORE the generic path: their serde_bytes payloads (up to
+/// 8 MiB / 32 MiB) must reach JS as a Uint8Array, not a per-byte number
+/// array built through serde_json.
 fn decode_project_studio_payload(
     obj: &js_sys::Object,
     payload: tentaflow_protocol::project_studio::ProjectStudioPayload,
@@ -9737,6 +9738,22 @@ fn decode_project_studio_payload(
     } = payload
     {
         set(obj, "variant", "ProjectStudioAttachmentGetResponse".into());
+        set(
+            obj,
+            "bytes",
+            js_sys::Uint8Array::from(bytes.as_slice()).into(),
+        );
+        set(obj, "mime", mime.into());
+        set(obj, "truncated", truncated.into());
+        return;
+    }
+    if let tentaflow_protocol::project_studio::ProjectStudioPayload::RunArtifactGetResponse {
+        bytes,
+        mime,
+        truncated,
+    } = payload
+    {
+        set(obj, "variant", "ProjectStudioRunArtifactGetResponse".into());
         set(
             obj,
             "bytes",
@@ -18444,4 +18461,295 @@ pub fn encode_project_studio_report_query_request(
     request_json: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_project_studio_json_request("ReportQueryRequest", &request_json)
+}
+
+// ----- Project Studio F3: test environments, build profiles, runners,
+// automated runs, try-run, git/zip/api_spec sources, artifacts, code assist -----
+// Same convention as F2: multi-field mutating requests (EnvironmentSave,
+// BuildProfileSave, RunStartAuto, TryRunStart) take ONE snake_case JSON string
+// parsed by serde; simple requests keep explicit parameters.
+
+/// MessageBody::ProjectStudioBody(EnvironmentsListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioEnvironmentsListRequest)]
+pub fn encode_project_studio_environments_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvironmentsListRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(EnvironmentSaveRequest). `request_json` is
+/// the full snake_case field set (environment_id null = create; secret null =
+/// keep stored, "" = clear, value = replace).
+#[wasm_bindgen(js_name = encodeProjectStudioEnvironmentSaveRequest)]
+pub fn encode_project_studio_environment_save_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("EnvironmentSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(EnvironmentDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioEnvironmentDeleteRequest)]
+pub fn encode_project_studio_environment_delete_request(
+    project_id: String,
+    environment_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvironmentDeleteRequest {
+            project_id,
+            environment_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(EnvApprovalsListRequest) — admin only,
+/// cross-project pending environment approvals.
+#[wasm_bindgen(js_name = encodeProjectStudioEnvApprovalsListRequest)]
+pub fn encode_project_studio_env_approvals_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvApprovalsListRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(EnvApprovalDecideRequest) — admin only,
+/// rejection requires a non-empty `reason`.
+#[wasm_bindgen(js_name = encodeProjectStudioEnvApprovalDecideRequest)]
+pub fn encode_project_studio_env_approval_decide_request(
+    project_id: String,
+    environment_id: String,
+    approve: bool,
+    reason: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvApprovalDecideRequest {
+            project_id,
+            environment_id,
+            approve,
+            reason,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(BuildProfileGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioBuildProfileGetRequest)]
+pub fn encode_project_studio_build_profile_get_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::BuildProfileGetRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(BuildProfileSaveRequest). `request_json` is
+/// the full snake_case field set — upserts the single profile of a source.
+#[wasm_bindgen(js_name = encodeProjectStudioBuildProfileSaveRequest)]
+pub fn encode_project_studio_build_profile_save_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("BuildProfileSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunnersListRequest) — test-runner discovery.
+#[wasm_bindgen(js_name = encodeProjectStudioRunnersListRequest)]
+pub fn encode_project_studio_runners_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunnersListRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunStartAutoRequest). `request_json` carries
+/// the XOR case selectors (suite_id / case_ids / from_run_id), environment_id,
+/// optional runner_service_id and perf_profile_json.
+#[wasm_bindgen(js_name = encodeProjectStudioRunStartAutoRequest)]
+pub fn encode_project_studio_run_start_auto_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunStartAutoRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunAutoGetRequest) — polling snapshot, the
+/// source of truth for automated-run progress.
+#[wasm_bindgen(js_name = encodeProjectStudioRunAutoGetRequest)]
+pub fn encode_project_studio_run_auto_get_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunAutoGetRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunAutoCancelRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunAutoCancelRequest)]
+pub fn encode_project_studio_run_auto_cancel_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunAutoCancelRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TryRunStartRequest) — STREAM-INITIATING (no
+/// plain response): chunks = TryRunStreamChunk, end = TryRunStreamEnd on the
+/// same subscription. `request_json` carries the client-minted try_id plus
+/// case/environment/override fields.
+#[wasm_bindgen(js_name = encodeProjectStudioTryRunStartRequest)]
+pub fn encode_project_studio_try_run_start_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TryRunStartRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(TryRunCancelRequest) — addresses the
+/// ephemeral execution by the client-minted try_id.
+#[wasm_bindgen(js_name = encodeProjectStudioTryRunCancelRequest)]
+pub fn encode_project_studio_try_run_cancel_request(
+    project_id: String,
+    try_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TryRunCancelRequest {
+            project_id,
+            try_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceRefreshRequest) — git sources only:
+/// fetch + delta re-index of changed files.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceRefreshRequest)]
+pub fn encode_project_studio_source_refresh_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceRefreshRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ApiSpecEndpointsRequest) — parsed endpoint
+/// list of an api_spec source.
+#[wasm_bindgen(js_name = encodeProjectStudioApiSpecEndpointsRequest)]
+pub fn encode_project_studio_api_spec_endpoints_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ApiSpecEndpointsRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceSecretSetRequest) — sets/clears the
+/// access token of a git source; `token` None clears (input-only, reads never
+/// return it).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceSecretSetRequest)]
+pub fn encode_project_studio_source_secret_set_request(
+    project_id: String,
+    source_id: String,
+    token: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceSecretSetRequest {
+            project_id,
+            source_id,
+            token,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunArtifactGetRequest) — artifact download
+/// by id; the server clamps `max_bytes` to 32 MiB, response.bytes arrives as
+/// a Uint8Array.
+#[wasm_bindgen(js_name = encodeProjectStudioRunArtifactGetRequest)]
+pub fn encode_project_studio_run_artifact_get_request(
+    project_id: String,
+    artifact_id: String,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunArtifactGetRequest {
+            project_id,
+            artifact_id,
+            max_bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunAutoStreamRequest) — subscribe to the
+/// live view of an automated run (chunks = RunAutoStreamChunk, end =
+/// RunAutoStreamEnd).
+#[wasm_bindgen(js_name = encodeProjectStudioRunAutoStreamRequest)]
+pub fn encode_project_studio_run_auto_stream_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunAutoStreamRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CodeAssistRequest) — STREAM-INITIATING:
+/// tokens stream via CodeAssistStreamChunk, the final proposal arrives whole
+/// in CodeAssistStreamEnd.
+#[wasm_bindgen(js_name = encodeProjectStudioCodeAssistRequest)]
+pub fn encode_project_studio_code_assist_request(
+    project_id: String,
+    case_id: String,
+    kind: String,
+    selection: String,
+    instruction: String,
+    full_content: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CodeAssistRequest {
+            project_id,
+            case_id,
+            kind,
+            selection,
+            instruction,
+            full_content,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
 }

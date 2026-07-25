@@ -5786,6 +5786,27 @@ export function encodeProjectStudioActivityListRequest(project_id, before_id, li
 }
 
 /**
+ * MessageBody::ProjectStudioBody(ApiSpecEndpointsRequest) — parsed endpoint
+ * list of an api_spec source.
+ * @param {string} project_id
+ * @param {string} source_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioApiSpecEndpointsRequest(project_id, source_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioApiSpecEndpointsRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * MessageBody::ProjectStudioBody(AttachmentGetRequest) — download by content
  * hash; the server clamps `max_bytes` to 8 MiB.
  * @param {string} project_id
@@ -5805,6 +5826,44 @@ export function encodeProjectStudioAttachmentGetRequest(project_id, sha256, max_
     var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v3;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(BuildProfileGetRequest).
+ * @param {string} project_id
+ * @param {string} source_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioBuildProfileGetRequest(project_id, source_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioBuildProfileGetRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(BuildProfileSaveRequest). `request_json` is
+ * the full snake_case field set — upserts the single profile of a source.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioBuildProfileSaveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioBuildProfileSaveRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**
@@ -6163,6 +6222,40 @@ export function encodeProjectStudioChatsListRequest(project_id) {
 }
 
 /**
+ * MessageBody::ProjectStudioBody(CodeAssistRequest) — STREAM-INITIATING:
+ * tokens stream via CodeAssistStreamChunk, the final proposal arrives whole
+ * in CodeAssistStreamEnd.
+ * @param {string} project_id
+ * @param {string} case_id
+ * @param {string} kind
+ * @param {string} selection
+ * @param {string} instruction
+ * @param {string} full_content
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioCodeAssistRequest(project_id, case_id, kind, selection, instruction, full_content) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(case_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(selection, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(instruction, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passStringToWasm0(full_content, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioCodeAssistRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
  * MessageBody::ProjectStudioBody(CreatorGrantSetRequest) — admin only.
  * @param {string} user_id
  * @param {boolean} granted
@@ -6192,6 +6285,102 @@ export function encodeProjectStudioCreatorGrantsListRequest() {
     var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(EnvApprovalDecideRequest) — admin only,
+ * rejection requires a non-empty `reason`.
+ * @param {string} project_id
+ * @param {string} environment_id
+ * @param {boolean} approve
+ * @param {string} reason
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioEnvApprovalDecideRequest(project_id, environment_id, approve, reason) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(environment_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(reason, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioEnvApprovalDecideRequest(ptr0, len0, ptr1, len1, approve, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(EnvApprovalsListRequest) — admin only,
+ * cross-project pending environment approvals.
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioEnvApprovalsListRequest() {
+    const ret = wasm.encodeProjectStudioEnvApprovalsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(EnvironmentDeleteRequest).
+ * @param {string} project_id
+ * @param {string} environment_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioEnvironmentDeleteRequest(project_id, environment_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(environment_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioEnvironmentDeleteRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(EnvironmentSaveRequest). `request_json` is
+ * the full snake_case field set (environment_id null = create; secret null =
+ * keep stored, "" = clear, value = replace).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioEnvironmentSaveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioEnvironmentSaveRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(EnvironmentsListRequest).
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioEnvironmentsListRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioEnvironmentsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**
@@ -6730,6 +6919,92 @@ export function encodeProjectStudioReportQueryRequest(request_json) {
 }
 
 /**
+ * MessageBody::ProjectStudioBody(RunArtifactGetRequest) — artifact download
+ * by id; the server clamps `max_bytes` to 32 MiB, response.bytes arrives as
+ * a Uint8Array.
+ * @param {string} project_id
+ * @param {string} artifact_id
+ * @param {number} max_bytes
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioRunArtifactGetRequest(project_id, artifact_id, max_bytes) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(artifact_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioRunArtifactGetRequest(ptr0, len0, ptr1, len1, max_bytes);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(RunAutoCancelRequest).
+ * @param {string} project_id
+ * @param {string} run_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioRunAutoCancelRequest(project_id, run_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioRunAutoCancelRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(RunAutoGetRequest) — polling snapshot, the
+ * source of truth for automated-run progress.
+ * @param {string} project_id
+ * @param {string} run_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioRunAutoGetRequest(project_id, run_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioRunAutoGetRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(RunAutoStreamRequest) — subscribe to the
+ * live view of an automated run (chunks = RunAutoStreamChunk, end =
+ * RunAutoStreamEnd).
+ * @param {string} project_id
+ * @param {string} run_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioRunAutoStreamRequest(project_id, run_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioRunAutoStreamRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * MessageBody::ProjectStudioBody(RunCloseRequest) — `cancelled` = abort
  * instead of complete.
  * @param {string} project_id
@@ -6893,6 +7168,25 @@ export function encodeProjectStudioRunItemReleaseRequest(project_id, item_id) {
 }
 
 /**
+ * MessageBody::ProjectStudioBody(RunStartAutoRequest). `request_json` carries
+ * the XOR case selectors (suite_id / case_ids / from_run_id), environment_id,
+ * optional runner_service_id and perf_profile_json.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioRunStartAutoRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioRunStartAutoRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::ProjectStudioBody(RunStepSetRequest). `request_json` carries
  * {project_id, item_id, step_index, status, note, attachments_json}.
  * @param {string} request_json
@@ -6902,6 +7196,23 @@ export function encodeProjectStudioRunStepSetRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeProjectStudioRunStepSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(RunnersListRequest) — test-runner discovery.
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioRunnersListRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioRunnersListRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -7099,6 +7410,27 @@ export function encodeProjectStudioSourceFilesListRequest(project_id, source_id,
 }
 
 /**
+ * MessageBody::ProjectStudioBody(SourceRefreshRequest) — git sources only:
+ * fetch + delta re-index of changed files.
+ * @param {string} project_id
+ * @param {string} source_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioSourceRefreshRequest(project_id, source_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioSourceRefreshRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * MessageBody::ProjectStudioBody(SourceReingestRequest). `file_id: Some` =
  * re-ingest a single file, `None` = the whole source.
  * @param {string} project_id
@@ -7114,6 +7446,31 @@ export function encodeProjectStudioSourceReingestRequest(project_id, source_id, 
     var ptr2 = isLikeNone(file_id) ? 0 : passStringToWasm0(file_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len2 = WASM_VECTOR_LEN;
     const ret = wasm.encodeProjectStudioSourceReingestRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(SourceSecretSetRequest) — sets/clears the
+ * access token of a git source; `token` None clears (input-only, reads never
+ * return it).
+ * @param {string} project_id
+ * @param {string} source_id
+ * @param {string | null} [token]
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioSourceSecretSetRequest(project_id, source_id, token) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(source_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    var ptr2 = isLikeNone(token) ? 0 : passStringToWasm0(token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioSourceSecretSetRequest(ptr0, len0, ptr1, len1, ptr2, len2);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -7471,6 +7828,47 @@ export function encodeProjectStudioTasksListRequest(project_id, task_type, statu
     var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v6;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(TryRunCancelRequest) — addresses the
+ * ephemeral execution by the client-minted try_id.
+ * @param {string} project_id
+ * @param {string} try_id
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioTryRunCancelRequest(project_id, try_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(try_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioTryRunCancelRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::ProjectStudioBody(TryRunStartRequest) — STREAM-INITIATING (no
+ * plain response): chunks = TryRunStreamChunk, end = TryRunStreamEnd on the
+ * same subscription. `request_json` carries the client-minted try_id plus
+ * case/environment/override fields.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeProjectStudioTryRunStartRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioTryRunStartRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**

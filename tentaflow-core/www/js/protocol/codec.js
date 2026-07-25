@@ -6345,6 +6345,236 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  // --- Project Studio F3: test environments, build profiles, runners,
+  // automated runs, try-run, git/zip/api_spec sources, artifacts, code assist.
+  // Multi-field mutating requests (EnvironmentSave, BuildProfileSave,
+  // RunStartAuto, TryRunStart) serialize the whole snake_case field set as ONE
+  // JSON string parsed by serde in WASM; simple requests keep explicit
+  // parameters like the F1/F2 sections above. ---
+
+  /** MessageBody::ProjectStudioBody(EnvironmentsListRequest). payload: { projectId }. */
+  projectStudioEnvironmentsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioEnvironmentsListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(EnvironmentSaveRequest). payload: { projectId, environmentId?, name, envType, baseUrl, authType, secret?, extraHeadersJson?, hostAllowlist:[], justification? } — environmentId null = create; secret null/undefined = keep stored, '' = clear, value = replace. */
+  projectStudioEnvironmentSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const environmentId = payload.environmentId ?? payload.environment_id;
+    const secret = payload.secret;
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      environment_id: environmentId == null || environmentId === '' ? null : String(environmentId),
+      name: String(payload.name ?? ''),
+      env_type: String(payload.envType ?? payload.env_type ?? ''),
+      base_url: String(payload.baseUrl ?? payload.base_url ?? ''),
+      auth_type: String(payload.authType ?? payload.auth_type ?? ''),
+      secret: secret == null ? null : String(secret),
+      extra_headers_json: String(payload.extraHeadersJson ?? payload.extra_headers_json ?? ''),
+      host_allowlist: (Array.isArray(payload.hostAllowlist ?? payload.host_allowlist)
+        ? (payload.hostAllowlist ?? payload.host_allowlist)
+        : []
+      ).map(String),
+      justification: String(payload.justification ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioEnvironmentSaveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(EnvironmentDeleteRequest). payload: { projectId, environmentId }. */
+  projectStudioEnvironmentDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioEnvironmentDeleteRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.environmentId ?? payload.environment_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(EnvApprovalsListRequest) — admin only, cross-project pending approvals; no payload. */
+  projectStudioEnvApprovalsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioEnvApprovalsListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(EnvApprovalDecideRequest). payload: { projectId, environmentId, approve, reason? } — rejection requires non-empty reason. */
+  projectStudioEnvApprovalDecideRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioEnvApprovalDecideRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.environmentId ?? payload.environment_id ?? ''),
+      !!(payload.approve ?? false),
+      String(payload.reason ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(BuildProfileGetRequest). payload: { projectId, sourceId }. */
+  projectStudioBuildProfileGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioBuildProfileGetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.sourceId ?? payload.source_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(BuildProfileSaveRequest). payload: { projectId, sourceId, toolchain, baseImage?, installCmd?, testCmd, workdir? } — upserts the single profile of a source. */
+  projectStudioBuildProfileSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      source_id: String(payload.sourceId ?? payload.source_id ?? ''),
+      toolchain: String(payload.toolchain ?? ''),
+      base_image: String(payload.baseImage ?? payload.base_image ?? ''),
+      install_cmd: String(payload.installCmd ?? payload.install_cmd ?? ''),
+      test_cmd: String(payload.testCmd ?? payload.test_cmd ?? ''),
+      workdir: String(payload.workdir ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioBuildProfileSaveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(RunnersListRequest). payload: { projectId } — test-runner discovery. */
+  projectStudioRunnersListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioRunnersListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(RunStartAutoRequest). payload: { projectId, name, suiteId? XOR caseIds? XOR fromRunId?, environmentId, runnerServiceId?, perfProfileJson? } — environment must be approved; empty runnerServiceId lets the server match by toolchain. */
+  projectStudioRunStartAutoRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      name: String(payload.name ?? ''),
+      suite_id: String(payload.suiteId ?? payload.suite_id ?? ''),
+      case_ids: (Array.isArray(payload.caseIds ?? payload.case_ids) ? (payload.caseIds ?? payload.case_ids) : []).map(String),
+      from_run_id: String(payload.fromRunId ?? payload.from_run_id ?? ''),
+      environment_id: String(payload.environmentId ?? payload.environment_id ?? ''),
+      runner_service_id: String(payload.runnerServiceId ?? payload.runner_service_id ?? ''),
+      perf_profile_json: String(payload.perfProfileJson ?? payload.perf_profile_json ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioRunStartAutoRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(RunAutoGetRequest). payload: { projectId, runId } — polling snapshot, source of truth for automated-run progress. */
+  projectStudioRunAutoGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioRunAutoGetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(RunAutoCancelRequest). payload: { projectId, runId }. */
+  projectStudioRunAutoCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioRunAutoCancelRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(TryRunStartRequest) — STREAM-INITIATING (no plain response): chunks = TryRunStreamChunk, end = TryRunStreamEnd. payload: { projectId, tryId (client-minted), caseId, environmentId, contentJsonOverride?, language?, perfProfileJson? } — '' override = run the saved case content. */
+  projectStudioTryRunStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      try_id: String(payload.tryId ?? payload.try_id ?? ''),
+      case_id: String(payload.caseId ?? payload.case_id ?? ''),
+      environment_id: String(payload.environmentId ?? payload.environment_id ?? ''),
+      content_json_override: String(payload.contentJsonOverride ?? payload.content_json_override ?? ''),
+      language: String(payload.language ?? ''),
+      perf_profile_json: String(payload.perfProfileJson ?? payload.perf_profile_json ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioTryRunStartRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(TryRunCancelRequest). payload: { projectId, tryId } — addresses the ephemeral execution by the client-minted tryId. */
+  projectStudioTryRunCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioTryRunCancelRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.tryId ?? payload.try_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(SourceRefreshRequest). payload: { projectId, sourceId } — git sources only: fetch + delta re-index. */
+  projectStudioSourceRefreshRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioSourceRefreshRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.sourceId ?? payload.source_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(ApiSpecEndpointsRequest). payload: { projectId, sourceId } — parsed endpoint list of an api_spec source. */
+  projectStudioApiSpecEndpointsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioApiSpecEndpointsRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.sourceId ?? payload.source_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(SourceSecretSetRequest). payload: { projectId, sourceId, token? } — token null/'' = clear the stored git token (input-only, reads never return it). */
+  projectStudioSourceSecretSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const token = payload.token;
+    const body = _wasm.encodeProjectStudioSourceSecretSetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.sourceId ?? payload.source_id ?? ''),
+      token == null || token === '' ? undefined : String(token),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(RunArtifactGetRequest). payload: { projectId, artifactId, maxBytes? } — server clamps to 32 MiB, response.bytes arrives as Uint8Array. */
+  projectStudioRunArtifactGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioRunArtifactGetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.artifactId ?? payload.artifact_id ?? ''),
+      Number(payload.maxBytes ?? payload.max_bytes ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(RunAutoStreamRequest). payload: { projectId, runId } — subscribe to the live view of an automated run (chunks = RunAutoStreamChunk, end = RunAutoStreamEnd). */
+  projectStudioRunAutoStreamRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioRunAutoStreamRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ProjectStudioBody(CodeAssistRequest) — STREAM-INITIATING: tokens via CodeAssistStreamChunk, final proposal in CodeAssistStreamEnd. payload: { projectId, caseId, kind, selection?, instruction, fullContent } — '' selection = whole script. */
+  projectStudioCodeAssistRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioCodeAssistRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.caseId ?? payload.case_id ?? ''),
+      String(payload.kind ?? ''),
+      String(payload.selection ?? ''),
+      String(payload.instruction ?? ''),
+      String(payload.fullContent ?? payload.full_content ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
