@@ -761,9 +761,9 @@ pub fn spawn_engine_batched(
     }
     if model.is_hybrid() {
         model.preflight_hybrid_state_slots(max_active)?;
-        if max_active >= 2 && spec.kind() == SpeculationKind::Off && model.hybrid_batch_b2_capable()
+        if max_active >= 2 && spec.kind() == SpeculationKind::Off && model.hybrid_batch_capable()
         {
-            model.ensure_batch(2)?;
+            model.ensure_batch(max_active)?;
         }
     }
     let (tx, rx) = mpsc::channel::<Submission>();
@@ -1756,9 +1756,10 @@ fn batch_gpu_decode(
         return false;
     }
 
-    let hybrid_b2 = model.hybrid_batch_b2_capable() && feed_idx.len() >= 2;
-    let serial_only =
-        model.weights.is_moe() || model.kv.cfg.quant.is_rot() || (model.is_hybrid() && !hybrid_b2);
+    let hybrid_batch = model.hybrid_batch_capable() && feed_idx.len() >= 2;
+    let serial_only = model.weights.is_moe()
+        || model.kv.cfg.quant.is_rot()
+        || (model.is_hybrid() && !hybrid_batch);
     // Mixed step: fold this decode step into the oldest pending sequence's
     // prefill chunk — the decode rows ride the chunk's GEMMs, so a long
     // prompt costs the decoding sequences (almost) no ITL. Falls back to the
@@ -1781,19 +1782,24 @@ fn batch_gpu_decode(
     // path engages once the flat cost amortizes across enough sequences.
     // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
     // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
-    if (!hybrid_b2 && feed_idx.len() < batch_min.max(2)) || serial_only {
+    if (!hybrid_batch && feed_idx.len() < batch_min.max(2)) || serial_only {
         for &i in &feed_idx {
             serial_step(model, &mut active[i]);
         }
         return false;
     }
 
-    if hybrid_b2 {
-        let mut pairs = feed_idx.chunks_exact(2);
-        for pair in &mut pairs {
-            decode_gpu_group(model, active, pair);
+    if hybrid_batch {
+        // Grupy zamiast par: mixery i tak są serialne per lane, ale norm, FFN i
+        // głowa logitów płacą wtedy raz za odczyt wag zamiast raz na parę.
+        // Szerokość grupy musi trafiać w kernel — patrz `hybrid_group_size`.
+        let mut rest = feed_idx.as_slice();
+        while rest.len() >= 2 {
+            let take = hybrid_group_size(rest.len());
+            decode_gpu_group(model, active, &rest[..take]);
+            rest = &rest[take..];
         }
-        if let Some(&tail) = pairs.remainder().first() {
+        if let Some(&tail) = rest.first() {
             serial_step(model, &mut active[tail]);
         }
         return false;
@@ -2068,6 +2074,19 @@ fn mixed_gpu_group(
             true
         }
     }
+}
+
+/// Szerokość jednej hybrydowej grupy decode. Batchowe GEMM-y NVFP4 GGUF mają
+/// wyspecjalizowane kernele wyłącznie dla potęg dwójki, a szerokość 16 jest
+/// wśród nich niestrojona. Zmierzone na ThinkingCap-Qwen3.6-27B (RTX 4090,
+/// prompt 85, out 128): grupa 8 daje 70,8 tok/s, grupa 10 spada na generyczny
+/// dequant-GEMM i daje 37,5, a pełna grupa 16 — 39,5. Dlatego grupujemy po
+/// największej potędze dwójki nie większej niż osiem, a resztę bierzemy
+/// kolejnymi grupami.
+fn hybrid_group_size(pending: usize) -> usize {
+    const MAX_GROUP: usize = 8;
+    let capped = pending.min(MAX_GROUP);
+    1usize << (usize::BITS - 1 - capped.leading_zeros())
 }
 
 fn decode_gpu_group(model: &mut Model, active: &mut [ActiveSeq<'_>], feed_idx: &[usize]) {

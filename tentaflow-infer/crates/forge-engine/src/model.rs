@@ -7829,7 +7829,7 @@ impl Model {
     /// Sprawdza strukturalny kontrakt wspólnego target verifiera N/N B2.
     pub fn mtp_ngram_b2_model_capable(&self) -> bool {
         self.validate_native_mtp_target().is_ok()
-            && self.hybrid_batch_b2_weights_capable()
+            && self.hybrid_batch_weights_capable()
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
             && self.prefix_cache.is_none()
@@ -12868,7 +12868,7 @@ impl Model {
         )
     }
 
-    fn hybrid_batch_b2_weights_capable(&self) -> bool {
+    fn hybrid_batch_weights_capable(&self) -> bool {
         fn full_rows(weight: &DevWeight) -> bool {
             matches!(
                 weight,
@@ -12923,9 +12923,9 @@ impl Model {
             })
     }
 
-    /// Sprawdza pełny, niemutujący kontrakt targetu hybrydowego B2.
-    pub fn hybrid_batch_b2_capable(&self) -> bool {
-        self.weights.token_embd_host.is_some() && self.hybrid_batch_b2_weights_capable()
+    /// Sprawdza pełny, niemutujący kontrakt batchowanego targetu hybrydowego.
+    pub fn hybrid_batch_capable(&self) -> bool {
+        self.weights.token_embd_host.is_some() && self.hybrid_batch_weights_capable()
     }
 
     /// Sprawdza semantyczny kontrakt kerneli eksperymentalnego prefill B2 T32.
@@ -12967,7 +12967,7 @@ impl Model {
             && self.prefix_cache.is_none()
             && device_embedding
             && split_layout
-            && self.hybrid_batch_b2_weights_capable()
+            && self.hybrid_batch_weights_capable()
     }
 
     pub fn hybrid_layer_major_prefill_limit(&self) -> Option<usize> {
@@ -16256,18 +16256,27 @@ impl Model {
         Ok(())
     }
 
-    /// Wykonuje B2 targetu hybrydowego ze wspólnymi GEMM FFN i głowy logits.
-    /// Mixery zachowują osobny stan slotu i są porządkowane na jednym streamie.
+    /// Wykonuje batch targetu hybrydowego ze wspólnymi GEMM FFN i głowy logits.
+    /// Mixery (attention i DeltaNet) idą lane po lane, bo pula stanów aktywuje
+    /// jeden lease naraz, a ich scratch jest jednotokenowy; batchują się norm,
+    /// FFN i głowa logitów, czyli cała część ważona wagami. Stan każdego lane'a
+    /// jest osobny i porządkowany na jednym streamie.
     fn record_hybrid_batch_forward(
         &mut self,
         seqs: &mut [&mut SeqKv],
         tokens: &[u32],
     ) -> Result<()> {
         let n = seqs.len();
-        if n != 2 || tokens.len() != n {
+        if n == 0 || tokens.len() != n {
             return Err(ForgeError::Unsupported(
-                "hybrydowy batch targetu obsługuje obecnie dokładnie B=2".into(),
+                "hybrydowy batch targetu wymaga niepustego batcha i tokenu na lane".into(),
             ));
+        }
+        if n > self.batch_cap {
+            return Err(ForgeError::Scheduler(format!(
+                "hybrydowy batch {n} przekracza zarezerwowaną pojemność {}",
+                self.batch_cap
+            )));
         }
         self.ensure_hybrid_bufs()?;
         let p = self.weights.descriptor.params.clone();
@@ -16766,9 +16775,9 @@ impl Model {
                 "batched_decode: seqs/tokens/params length mismatch".into(),
             ));
         }
-        if self.is_hybrid() && (b != 2 || !self.hybrid_batch_b2_capable()) {
+        if self.is_hybrid() && !self.hybrid_batch_capable() {
             return Err(ForgeError::Unsupported(
-                "hybrydowy batch B2 nie spełnia kontraktu modelu lub pamięci KV".into(),
+                "hybrydowy batch nie spełnia kontraktu modelu lub pamięci KV".into(),
             ));
         }
         // Rot modes commit each appended token into the packed low-bit store on

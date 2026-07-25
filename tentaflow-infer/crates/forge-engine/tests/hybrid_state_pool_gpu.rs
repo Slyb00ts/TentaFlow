@@ -1051,7 +1051,7 @@ fn run_server_tier_fallback(path: &Path) -> TestResult<()> {
     let Some(model) = load_model_sized_with_tier(path, true, 32, 40, tier) else {
         return Err("CUDA zniknęła przed testem fallbacku tieringu".into());
     };
-    assert!(!model.hybrid_batch_b2_capable());
+    assert!(!model.hybrid_batch_capable());
     let engine = spawn_engine_batched(
         model,
         Arc::new(tokenizer(path)?),
@@ -2036,7 +2036,7 @@ fn hybrid_prefill_b2_t32_jest_numerycznie_zgodny_z_dwoma_serialnymi_lane() -> Te
             p.ssm.as_ref().map(|ssm| (ssm.d_state, ssm.d_conv)),
             model.weights.is_moe(),
             model.mtp_embedding_mode(),
-            model.hybrid_batch_b2_capable(),
+            model.hybrid_batch_capable(),
             model.weights.layers.len(),
             match model.weights.lm_head {
                 forge_engine::weights::DevWeight::F16 { .. } => "f16",

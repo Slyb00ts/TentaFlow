@@ -12,6 +12,55 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Hybrydowy decode: grupy zamiast par, +38% na Qwen3.6-27B (2026-07-25).**
+  Scheduler dzielił kolejkę hybrydową na `chunks_exact(2)` i wykonywał krok B=2
+  na parę, więc osiem aktywnych sekwencji dawało dwa tokeny na krok i
+  przepustowość stała ~51 tok/s niezależnie od współbieżności. Samo
+  `record_hybrid_batch_forward` było już generyczne po `n` (mixery serialne per
+  lane, bo pula stanów aktywuje jeden lease naraz i ich scratch jest
+  jednotokenowy; norm, FFN i głowa logitów batchowane) — blokadą był wyłącznie
+  jawny warunek `n != 2` plus parowanie w schedulerze. Oba zniesione:
+  `hybrid_batch_capable` (dawniej `..._b2_capable`), `ensure_batch(max_active)`
+  zamiast `ensure_batch(2)`, a grupy dobiera `hybrid_group_size`.
+  KLUCZOWE: szerokość grupy musi trafiać w kernel. Batchowe GEMM-y NVFP4 GGUF
+  mają wyspecjalizowane kernele tylko dla potęg dwójki, a szerokość 16 jest
+  niestrojona — zmierzone na RTX 4090 (prompt 85, out 128): grupa 8 daje
+  **70,8 tok/s**, grupa 10 spada na generyczny dequant-GEMM i daje **37,5**,
+  pełna grupa 16 — **39,5**. Dlatego `MAX_GROUP = 8`, a resztę kolejki biorą
+  kolejne grupy.
+  A/B tym samym klientem (tokeny liczone z `usage` serwera, nie tokenizerem
+  klienta): C=1 40,3→40,4 (bez regresji), C=4 50,9→**66,0** (1,30x),
+  C=8 50,8→**70,1** (1,38x), C=16 50,8→**70,0** (1,38x). Przepustowość jest
+  teraz płaska w C=8..16 zamiast przyklejonej do 51. Mediana opóźnienia przy
+  C=16 spadła z 51,8 s do 29,2 s. Bramki: `hybrid_state_pool_gpu` 32/32,
+  `forge-engine` 140/140, koherencja i self-konsystencja przy 8 równoległych
+  requestach. SUFIT: mixery są nadal serialne per lane i po tej zmianie
+  dominują krok — ich batchowanie to następny lever.
+- ✅ **`forge bench` mierzy pełny prefill i produkcyjną ścieżkę GEMM
+  (2026-07-25).** Dwa niezależne defekty, oba zawyżały wynik. (1) Auto-fp8
+  prefill dla gęstego GGUF włączał się tylko w `serve`; `bench` i `run`
+  dostają go teraz też (`ppl` świadomie nie — jest bramką jakości uruchamiającą
+  dokładnie ten GEMM, który nazywa `FORGE_GEMM`). Mistral-7B Q4_K_M: 6 332 →
+  **14 783 tok/s**. (2) `--prefix-cache` domyślnie `on` powodował, że
+  powtórzenia trafiały w cache i przeliczały tylko rozbieżny ogon promptu, a
+  czas nadal dzielono przez pełną długość — raportowane 44 537 tok/s wobec
+  realnych 14 783. `DrainOutcome` przenosi teraz `cache_read_tokens` do
+  benchmarku, trafienie kończy przebieg błędem z dokładną liczbą
+  (`cache prefiksów obsłużył 992 z 1024 tokenów promptu`), a domyślną wartością
+  w `bench` jest `off`.
+- ✅ **Cache prefiksów zweryfikowany — jest poprawny (2026-07-25).**
+  Podejrzenie padło na niego, bo `bench` przerywał kontrolą
+  `greedy token IDs differ between benchmark repetitions`. Weryfikacja na
+  realnym serwerze: to samo żądanie powtórzone 4x na promptcie 1178 tokenów
+  daje identyczne wyjście, a prompt dzielący z zapełnionym cache'em tylko
+  połowę prefiksu daje identyczny wynik na zimnym i ciepłym serwerze (dwa
+  osobne procesy) — radix nie podaje niepasującego prefiksu i nie zanieczyszcza
+  KV. Przerwanie w benchu miało inną przyczynę: przebieg zimny prefillował 1024
+  tokeny, ciepły tylko 32-tokenowy ogon, a kafel GEMM zależy od liczby tokenów,
+  więc logity ostatniego tokena różnią się na ostatnich bitach i przy niemal
+  równych logitach z losowego promptu greedy się przewraca. Komentarz w
+  `acquire_prefix` twierdził, że pożyczony prefiks jest „bit-identical" — jest
+  nim KV, ale nie logity; komentarz poprawiony.
 - ✅ **Macierz porównawcza FORGE vs vLLM vs llama.cpp (2026-07-25).** Pełny
   protokół i tabele: `docs/BENCH_MATRIX_2026-07-25.md`. Bielik-7B NVFP4,
   współbieżność FORGE/vLLM: decode-only 158/165 tok/s przy C=1 (0,96x) i
@@ -37,8 +86,8 @@ Ostatnia aktualizacja: 2026-07-25.
   `FORGE_GEMM=fp8mod`) — każdy pomiar prefillu GGUF bez tej zmiennej jest
   nieporównywalny z produkcją. Osobno: `bench` na Mistralu Q4_K przerywa własną
   kontrolą `greedy token IDs differ between benchmark repetitions`, a
-  `--prefix-cache off` naprawia powtarzalność. Ten sam request może więc dać
-  inne tokeny w zależności od stanu cache'u prefiksów. Oba punkty otwarte.
+  `--prefix-cache off` naprawia powtarzalność. Oba punkty domknięte wpisami
+  z 2026-07-25 powyżej.
 - ✅ **rmsnorm z residuałem: rozwinięcie odczytów w locie (2026-07-25).**
   Profil pokazał `rmsnorm_residual_f16` na ~138 GB/s i 4,6% czasu GPU: batchowy
   decode startuje jeden blok na token, więc krok B=32 zajmuje 32 z 128 SM,
