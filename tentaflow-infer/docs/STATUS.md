@@ -167,6 +167,35 @@ Ostatnia aktualizacja: 2026-07-25.
   Prefill 14 914 tok/s to 17,8 TOPS efektywnie, czyli 18% zmierzonego pułapu
   int8 karty; llama.cpp jest tam na 9,3 TOPS. Zapas do pułapu zostaje duży,
   bo model 0,6B ma małe GEMM-y i dominuje narzut warstw poza GEMM.
+- 📊 **Kafle int8 sa w lokalnym optimum — siedem prob poprawy, wszystkie
+  negatywne (2026-07-25).** Kafel `gemm_q8_0_dot4` (BM=BN=128, TM=8, TN=4, KB=2)
+  daje 35-36 TOPS przy pulapie 97. Miks instrukcji na etap: 512 `v_dot4_i32_i8`,
+  192 instrukcje epilogu skalowania, 144 `v_mov`, 48 `ds_read_b128` — czyli dot4
+  to 60% wydawanych instrukcji.
+  ZMIERZONE, CO ILE KOSZTUJE:
+  - Epilog (cvt int32->f32 plus mnozenie przez skale aktywacji i wagi): **15%**
+    (36 -> 42 TOPS po jego usunieciu). Jest strukturalnie minimalny — trzy
+    operacje na akumulator na blok kwantyzacji i nie da sie ich sfaktoryzowac,
+    bo skala aktywacji zmienia sie co 32 kolumny.
+  - Nawet BEZ epilogu jest 42 z 97 TOPS, wiec glowny limiter jest gdzie indziej.
+  ODRZUCONE PO POMIARZE (ksztalt kafla, wszystko na 4096x4096, T=1024):
+
+  | kafel | wynik |
+  |---|--:|
+  | 128x128 TM8 TN4 KB2 (obecny) | **35 TOPS** |
+  | 128x128 TM8 TN8 KB2 | 14 |
+  | 128x128 TM8 TN8 KB1 | 18 |
+  | 128x128 TM4 TN8 KB2 | 26 |
+  | 256x128 TM8 TN8 KB2 | 14 |
+  | 128x256 TM8 TN8 KB2 | 14 |
+
+  Hipoteza, ktora to napedzala — „wieksze TN zmniejsza bajty LDS na dot4” — jest
+  BLEDNA: wszystkie warianty TN=8 wypadaja 2,5x gorzej mimo mniejszego ruchu LDS.
+  Zrzut assemblera pokazuje 96 wobec 128 VGPR i ZERO spillow w obu, wiec to tez
+  nie presja rejestrow. Rzeczywisty mechanizm nie jest ustalony.
+  WNIOSEK: dalsze dostrajanie ksztaltu kafla nie da juz nic. Realna droga do
+  wyzszego wykorzystania to INNA DEKOMPOZYCJA (weight-stationary: wagi rezydentne
+  w rejestrach, strumien aktywacji), czyli osobny kernel, a nie modyfikacja tego.
 - 🔴 **KOREKTA: „386 GB/s pasma" było ZAWYŻONE — realny stream to ~226 GB/s
   (2026-07-25).** Benchmark rooflinu czytał bufor 256 MiB, czyli DOKŁADNIE na
   granicy 128 MB Infinity Cache, więc mierzył mieszankę cache i DRAM i dawał
