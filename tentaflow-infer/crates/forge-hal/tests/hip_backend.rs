@@ -8,11 +8,18 @@ use std::process::Command;
 use std::sync::Arc;
 
 use forge_hal::hip::HipDevice;
-use forge_hal::{Device, LaunchArgs, LaunchConfig, Pool};
+use forge_hal::{Device, LaunchArgs, LaunchConfig, Pool, PoolSizes};
 use forge_types::MemKind;
 
+const TEST_POOLS: PoolSizes = PoolSizes {
+    weights: 64 * 1024 * 1024,
+    kv_cache: 32 * 1024 * 1024,
+    kv_page_size: 256 * 1024,
+    activations: 32 * 1024 * 1024,
+};
+
 fn device() -> Option<Arc<HipDevice>> {
-    match HipDevice::new(0) {
+    match HipDevice::new(0, TEST_POOLS) {
         Ok(dev) => Some(dev),
         Err(err) => {
             eprintln!("pominięto: brak urządzenia HIP ({err})");
@@ -44,7 +51,8 @@ fn hip_reports_device_caps() {
     assert!(caps.max_threads_per_block >= 256);
     // RDNA nie ma potoku FP8/FP4, a grafy nie są jeszcze wpięte — bramki wyżej
     // opierają się na tych polach, więc muszą mówić prawdę.
-    assert!(!caps.fp8_native && !caps.fp4_native && !caps.supports_graph_capture);
+    assert!(!caps.fp8_native && !caps.fp4_native);
+    assert!(caps.supports_graph_capture, "grafy HIP są wpięte");
     eprintln!(
         "HIP: {} / {} / {} CU / wavefront {} / {} MiB",
         caps.name,
@@ -163,4 +171,118 @@ extern "C" __global__ void scale_add(float* out, const float* in, float k, int n
 fn bytemuck_cast(values: &[f32]) -> &[u8] {
     // SAFETY: f32 nie ma wypełnień, a długość jest przeliczana wprost.
     unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) }
+}
+
+#[test]
+fn hip_pools_report_budgets_and_recycle_activations() {
+    let Some(dev) = device() else { return };
+    let weights_before = dev.pool_available(Pool::Weights).unwrap();
+    let acts_before = dev.pool_available(Pool::Activations).unwrap();
+    assert!(weights_before >= 60 * 1024 * 1024 && acts_before >= 30 * 1024 * 1024);
+
+    // Bump: pula wag nie oddaje pamięci po zwolnieniu bufora.
+    let w = dev.alloc(1 << 20, MemKind::Device, Pool::Weights).unwrap();
+    let after_alloc = dev.pool_available(Pool::Weights).unwrap();
+    assert!(after_alloc < weights_before);
+    drop(w);
+    assert_eq!(dev.pool_available(Pool::Weights).unwrap(), after_alloc);
+
+    // Pierścień: aktywacje wracają dopiero po `reset_activations`.
+    let a = dev.alloc(1 << 20, MemKind::Device, Pool::Activations).unwrap();
+    assert!(dev.pool_available(Pool::Activations).unwrap() < acts_before);
+    drop(a);
+    dev.reset_activations().unwrap();
+    assert_eq!(dev.pool_available(Pool::Activations).unwrap(), acts_before);
+
+    // Wyczerpanie puli musi być typowanym OutOfMemory, nie ogólnym błędem.
+    let err = dev
+        .alloc(TEST_POOLS.kv_cache + 1, MemKind::Device, Pool::KvCache)
+        .unwrap_err();
+    assert!(
+        matches!(err, forge_types::ForgeError::OutOfMemory { .. }),
+        "otrzymano {err:?}"
+    );
+}
+
+#[test]
+fn hip_captures_and_replays_a_graph() {
+    let Some(dev) = device() else { return };
+    let Some((module, _dir)) = build_test_module(&dev) else { return };
+    let kernel = module.kernel("scale_add").unwrap();
+
+    const N: usize = 256;
+    let input: Vec<f32> = (0..N).map(|i| i as f32).collect();
+    let stream = dev.create_stream().unwrap();
+    let din = dev.alloc(N * 4, MemKind::Device, Pool::Activations).unwrap();
+    let dout = dev.alloc(N * 4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(bytemuck_cast(&input), &din, 0).unwrap();
+
+    let cfg = LaunchConfig {
+        grid: ((N as u32).div_ceil(64), 1, 1),
+        block: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    dev.begin_capture(&stream).unwrap();
+    dev.launch(
+        &kernel,
+        &cfg,
+        &LaunchArgs::new()
+            .buf(&dout)
+            .buf(&din)
+            .scalar(2.0f32)
+            .scalar(N as i64),
+        &stream,
+    )
+    .unwrap();
+    let graph = dev.end_capture(&stream).unwrap();
+
+    // Dwa odtworzenia z tego samego grafu muszą dać ten sam wynik.
+    for _ in 0..2 {
+        dev.launch_graph(&graph, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let mut raw = vec![0u8; N * 4];
+        dev.read(&dout, 0, &mut raw).unwrap();
+        let got: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for (i, (value, source)) in got.iter().zip(&input).enumerate() {
+            let want = source * 2.0 + 1.0;
+            assert!((value - want).abs() < 1e-5, "element {i}: {value} != {want}");
+        }
+    }
+}
+
+/// Buduje moduł testowy przez `hipcc --genco`; `None` = brak ROCm.
+fn build_test_module(dev: &Arc<HipDevice>) -> Option<(forge_hal::Module, std::path::PathBuf)> {
+    let hipcc = format!("{}/bin/hipcc", rocm_path());
+    if !std::path::Path::new(&hipcc).is_file() {
+        eprintln!("pominięto: brak {hipcc}");
+        return None;
+    }
+    let arch = dev.caps().arch.clone();
+    let dir = std::env::temp_dir().join(format!("forge-hip-graph-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("k.hip");
+    let obj = dir.join("k.hsaco");
+    std::fs::write(
+        &src,
+        br#"#include <hip/hip_runtime.h>
+extern "C" __global__ void scale_add(float* out, const float* in, float k, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = in[i] * k + 1.0f;
+}
+"#,
+    )
+    .unwrap();
+    let build = Command::new(&hipcc)
+        .args(["--genco", &format!("--offload-arch={arch}")])
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("uruchomienie hipcc");
+    assert!(build.status.success(), "{}", String::from_utf8_lossy(&build.stderr));
+    let image = std::fs::read(&obj).unwrap();
+    Some((dev.load_module(&image).unwrap(), dir))
 }

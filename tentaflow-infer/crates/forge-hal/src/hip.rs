@@ -7,13 +7,14 @@
 
 use std::any::Any;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use forge_types::{DeviceCaps, ForgeError, MemKind, Result, Vendor};
 
+use crate::arena::{BumpArena, RingArena, SlabArena};
 use crate::{
-    BufferImpl, DevBuffer, Device, Event, EventImpl, ExecGraph, KernelHandle, KernelImpl,
-    LaunchArgs, LaunchConfig, Module, ModuleImpl, Pool, Stream, StreamImpl,
+    BufferImpl, DevBuffer, Device, Event, EventImpl, ExecGraph, GraphImpl, KernelHandle,
+    KernelImpl, LaunchArgs, LaunchConfig, Module, ModuleImpl, Pool, PoolSizes, Stream, StreamImpl,
 };
 
 #[repr(C)]
@@ -32,6 +33,8 @@ type HipStreamRaw = *mut c_void;
 type HipEventRaw = *mut c_void;
 type HipModuleRaw = *mut c_void;
 type HipFunctionRaw = *mut c_void;
+type HipGraphRaw = *mut c_void;
+type HipGraphExecRaw = *mut c_void;
 
 extern "C" {
     fn forge_hip_props(device: c_int, out: *mut ForgeHipProps) -> c_int;
@@ -84,12 +87,26 @@ extern "C" {
         kernel_params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> c_int;
+    fn hipStreamBeginCapture(stream: HipStreamRaw, mode: c_uint) -> c_int;
+    fn hipStreamEndCapture(stream: HipStreamRaw, graph: *mut HipGraphRaw) -> c_int;
+    fn hipGraphInstantiate(
+        exec: *mut HipGraphExecRaw,
+        graph: HipGraphRaw,
+        error_node: *mut c_void,
+        log: *mut c_char,
+        log_size: usize,
+    ) -> c_int;
+    fn hipGraphLaunch(exec: HipGraphExecRaw, stream: HipStreamRaw) -> c_int;
+    fn hipGraphDestroy(graph: HipGraphRaw) -> c_int;
+    fn hipGraphExecDestroy(exec: HipGraphExecRaw) -> c_int;
     fn hipGetErrorString(status: c_int) -> *const c_char;
 }
 
 const HIP_SUCCESS: c_int = 0;
 const HIP_ERROR_NOT_READY: c_int = 34;
 const HIP_EVENT_DISABLE_TIMING: c_uint = 2;
+/// `hipStreamCaptureModeGlobal` — ta sama semantyka co przechwytywanie CUDA.
+const HIP_CAPTURE_MODE_GLOBAL: c_uint = 0;
 
 /// Zamienia kod HIP na `ForgeError` z komunikatem ze sterownika.
 fn check(status: c_int, what: &str) -> Result<()> {
@@ -116,11 +133,15 @@ fn cstr_field(bytes: &[c_char]) -> String {
 pub struct HipDevice {
     caps: DeviceCaps,
     ordinal: c_int,
+    weights: Arc<HipPool>,
+    kv_cache: Arc<HipPool>,
+    activations: Arc<HipPool>,
 }
 
 impl HipDevice {
-    /// Otwiera urządzenie HIP o podanym numerze i odczytuje jego capability.
-    pub fn new(ordinal: usize) -> Result<Arc<Self>> {
+    /// Otwiera urządzenie HIP i zajmuje z góry trzy pule VRAM o podanych
+    /// budżetach — ten sam układ, co backend CUDA.
+    pub fn new(ordinal: usize, pools: PoolSizes) -> Result<Arc<Self>> {
         let ordinal = c_int::try_from(ordinal)
             .map_err(|_| ForgeError::Device("numer urządzenia HIP poza zakresem".into()))?;
         unsafe {
@@ -177,9 +198,37 @@ impl HipDevice {
             fp4_native: false,
             bf16_native: false,
             supports_p2p: false,
-            supports_graph_capture: false,
+            supports_graph_capture: true,
         };
-        Ok(Arc::new(Self { caps, ordinal }))
+        let kv_page = if pools.kv_page_size == 0 {
+            PoolSizes::DEFAULT_KV_PAGE
+        } else {
+            pools.kv_page_size
+        };
+        let weights = HipPool::new(pools.weights, PoolArena::Bump(BumpArena::new(pools.weights)))?;
+        let kv_cache = HipPool::new(
+            pools.kv_cache,
+            PoolArena::Slab(SlabArena::new(pools.kv_cache, kv_page)?),
+        )?;
+        let activations = HipPool::new(
+            pools.activations,
+            PoolArena::Ring(RingArena::new(pools.activations)),
+        )?;
+        Ok(Arc::new(Self {
+            caps,
+            ordinal,
+            weights,
+            kv_cache,
+            activations,
+        }))
+    }
+
+    fn pool(&self, pool: Pool) -> &Arc<HipPool> {
+        match pool {
+            Pool::Weights => &self.weights,
+            Pool::KvCache => &self.kv_cache,
+            Pool::Activations => &self.activations,
+        }
     }
 
     fn bind(&self) -> Result<()> {
@@ -187,7 +236,66 @@ impl HipDevice {
     }
 }
 
+enum PoolArena {
+    Bump(BumpArena),
+    Slab(SlabArena),
+    Ring(RingArena),
+}
+
+/// Jeden zajęty z góry obszar VRAM plus polityka podpodziału. Bufory trzymają
+/// `Arc<HipPool>`, więc baza przeżywa każdą podalokację.
+struct HipPool {
+    base: *mut c_void,
+    arena: Mutex<PoolArena>,
+}
+
+// `base` jest adresem urządzenia, nie wskaźnikiem hosta; mutacje idą przez Mutex.
+unsafe impl Send for HipPool {}
+unsafe impl Sync for HipPool {}
+
+impl HipPool {
+    fn new(capacity: usize, arena: PoolArena) -> Result<Arc<Self>> {
+        // Pula zerowa jest poprawna (np. silnik bez KV) — nie zajmuje VRAM,
+        // a każda alokacja z niej zgłasza OutOfMemory.
+        let base = if capacity == 0 {
+            std::ptr::null_mut()
+        } else {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            check(unsafe { hipMalloc(&mut ptr, capacity) }, "hipMalloc puli")?;
+            ptr
+        };
+        Ok(Arc::new(Self {
+            base,
+            arena: Mutex::new(arena),
+        }))
+    }
+
+}
+
+impl Drop for HipPool {
+    fn drop(&mut self) {
+        if !self.base.is_null() {
+            unsafe {
+                let _ = hipFree(self.base);
+            }
+        }
+    }
+}
+
+enum Backing {
+    Pooled {
+        pool: Arc<HipPool>,
+        offset: usize,
+        reserved: usize,
+        generation: Option<u64>,
+    },
+    Pinned {
+        ptr: *mut c_void,
+    },
+}
+
 struct HipBuffer {
+    backing: Backing,
     ptr: *mut c_void,
     len: usize,
     kind: MemKind,
@@ -198,11 +306,28 @@ unsafe impl Sync for HipBuffer {}
 
 impl Drop for HipBuffer {
     fn drop(&mut self) {
-        unsafe {
-            let _ = match self.kind {
-                MemKind::PinnedHost => hipHostFree(self.ptr),
-                _ => hipFree(self.ptr),
-            };
+        match &self.backing {
+            Backing::Pooled {
+                pool,
+                offset,
+                reserved,
+                generation,
+            } => {
+                let mut arena = pool.arena.lock().expect("arena puli zatruta");
+                match (&mut *arena, generation) {
+                    (PoolArena::Slab(slab), _) => slab.free(*offset, *reserved),
+                    (PoolArena::Ring(ring), Some(generation)) => ring.on_drop(*generation),
+                    // Wagi nie są zwalniane pojedynczo — pula oddaje całość przy
+                    // rozbiórce modelu.
+                    (PoolArena::Bump(_), _) => {}
+                    (PoolArena::Ring(_), None) => {
+                        unreachable!("pierścień bez numeru generacji")
+                    }
+                }
+            }
+            Backing::Pinned { ptr } => unsafe {
+                let _ = hipHostFree(*ptr);
+            },
         }
     }
 }
@@ -326,27 +451,102 @@ impl KernelImpl for HipKernel {
     }
 }
 
+struct HipGraph(HipGraphExecRaw);
+unsafe impl Send for HipGraph {}
+unsafe impl Sync for HipGraph {}
+
+impl Drop for HipGraph {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = hipGraphExecDestroy(self.0);
+        }
+    }
+}
+
+impl GraphImpl for HipGraph {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Zachowuje typowany `OutOfMemory` z areny i dokłada nazwę puli do logu —
+/// tak samo jak backend CUDA, bo admission i tiering rozpoznają ten wariant.
+fn pool_alloc_error(pool: Pool, error: ForgeError) -> ForgeError {
+    if let ForgeError::OutOfMemory {
+        requested,
+        available,
+    } = &error
+    {
+        tracing::debug!(?pool, requested, available, "pula HIP wyczerpana");
+        return error;
+    }
+    ForgeError::Device(format!("pula {pool:?}: {error}"))
+}
+
 impl Device for HipDevice {
     fn caps(&self) -> &DeviceCaps {
         &self.caps
     }
 
-    fn alloc(&self, bytes: usize, kind: MemKind, _pool: Pool) -> Result<DevBuffer> {
+    fn alloc(&self, bytes: usize, kind: MemKind, pool: Pool) -> Result<DevBuffer> {
         self.bind()?;
         let bytes = bytes.max(1);
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        match kind {
-            MemKind::PinnedHost => check(
-                unsafe { hipHostMalloc(&mut ptr, bytes, 0) },
-                "hipHostMalloc",
-            )?,
-            _ => check(unsafe { hipMalloc(&mut ptr, bytes) }, "hipMalloc")?,
+        if matches!(kind, MemKind::PinnedHost) {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            check(unsafe { hipHostMalloc(&mut ptr, bytes, 0) }, "hipHostMalloc")?;
+            return Ok(DevBuffer::from_impl(Arc::new(HipBuffer {
+                backing: Backing::Pinned { ptr },
+                ptr,
+                len: bytes,
+                kind,
+            })));
         }
+        let pool_kind = pool;
+        let pool = self.pool(pool_kind).clone();
+        let (offset, reserved, generation) = {
+            let mut arena = pool.arena.lock().expect("arena puli zatruta");
+            match &mut *arena {
+                PoolArena::Bump(bump) => {
+                    let offset = bump
+                        .alloc(bytes)
+                        .map_err(|error| pool_alloc_error(pool_kind, error))?;
+                    (offset, 0, None)
+                }
+                PoolArena::Slab(slab) => {
+                    let (offset, reserved) = slab
+                        .alloc(bytes)
+                        .map_err(|error| pool_alloc_error(pool_kind, error))?;
+                    (offset, reserved, None)
+                }
+                PoolArena::Ring(ring) => {
+                    let (offset, generation) = ring
+                        .alloc(bytes)
+                        .map_err(|error| pool_alloc_error(pool_kind, error))?;
+                    (offset, 0, Some(generation))
+                }
+            }
+        };
+        let ptr = unsafe { pool.base.add(offset) };
         Ok(DevBuffer::from_impl(Arc::new(HipBuffer {
+            backing: Backing::Pooled {
+                pool,
+                offset,
+                reserved,
+                generation,
+            },
             ptr,
             len: bytes,
             kind,
         })))
+    }
+
+    fn pool_available(&self, pool: Pool) -> Option<usize> {
+        let arena = self.pool(pool).arena.lock().expect("arena puli zatruta");
+        match &*arena {
+            PoolArena::Bump(bump) => Some(bump.available()),
+            PoolArena::Ring(ring) => Some(ring.available()),
+            PoolArena::Slab(_) => None,
+        }
     }
 
     fn create_stream(&self) -> Result<Stream> {
@@ -516,27 +716,51 @@ impl Device for HipDevice {
         check(unsafe { hipDeviceSynchronize() }, "hipDeviceSynchronize")
     }
 
-    fn begin_capture(&self, _stream: &Stream) -> Result<()> {
-        Err(ForgeError::Unsupported(
-            "backend HIP nie wpina jeszcze przechwytywania grafów".into(),
-        ))
+    fn begin_capture(&self, stream: &Stream) -> Result<()> {
+        let stream = stream.downcast::<HipStream>()?;
+        check(
+            unsafe { hipStreamBeginCapture(stream.0, HIP_CAPTURE_MODE_GLOBAL) },
+            "hipStreamBeginCapture",
+        )
     }
 
-    fn end_capture(&self, _stream: &Stream) -> Result<ExecGraph> {
-        Err(ForgeError::Unsupported(
-            "backend HIP nie wpina jeszcze przechwytywania grafów".into(),
-        ))
+    fn end_capture(&self, stream: &Stream) -> Result<ExecGraph> {
+        let stream = stream.downcast::<HipStream>()?;
+        let mut graph: HipGraphRaw = std::ptr::null_mut();
+        check(
+            unsafe { hipStreamEndCapture(stream.0, &mut graph) },
+            "hipStreamEndCapture",
+        )?;
+        let mut exec: HipGraphExecRaw = std::ptr::null_mut();
+        let status = unsafe {
+            hipGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        // Sam graf nie jest już potrzebny po instancjacji; egzemplarz wykonawczy
+        // trzyma własną kopię.
+        unsafe {
+            let _ = hipGraphDestroy(graph);
+        }
+        check(status, "hipGraphInstantiate")?;
+        Ok(ExecGraph::from_impl(Arc::new(HipGraph(exec))))
     }
 
-    fn launch_graph(&self, _graph: &ExecGraph, _stream: &Stream) -> Result<()> {
-        Err(ForgeError::Unsupported(
-            "backend HIP nie wpina jeszcze przechwytywania grafów".into(),
-        ))
+    fn launch_graph(&self, graph: &ExecGraph, stream: &Stream) -> Result<()> {
+        let exec = graph.downcast::<HipGraph>()?;
+        let stream = stream.downcast::<HipStream>()?;
+        check(unsafe { hipGraphLaunch(exec.0, stream.0) }, "hipGraphLaunch")
     }
 
     fn reset_activations(&self) -> Result<u64> {
-        Err(ForgeError::Unsupported(
-            "backend HIP nie ma jeszcze aren pul; bufory są zwalniane przez RAII".into(),
-        ))
+        let mut arena = self.activations.arena.lock().expect("arena puli zatruta");
+        match &mut *arena {
+            PoolArena::Ring(ring) => ring.reset(),
+            _ => unreachable!("pula aktywacji jest zawsze pierścieniem"),
+        }
     }
 }

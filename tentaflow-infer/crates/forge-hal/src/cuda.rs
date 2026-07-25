@@ -16,7 +16,7 @@ use cudarc::driver::safe::{CudaContext, CudaEvent, CudaStream};
 use cudarc::driver::{result, sys, DriverError};
 use forge_types::{DeviceCaps, ForgeError, MemKind, Result, Vendor};
 
-use crate::arena::{BumpArena, RingArena, SlabArena, ALLOC_ALIGN};
+use crate::arena::{BumpArena, RingArena, SlabArena};
 use crate::{
     BufferImpl, DevBuffer, Device, Event, EventImpl, ExecGraph, GraphImpl, KernelHandle,
     KernelImpl, LaunchArgs, LaunchConfig, Module, ModuleImpl, Pool, Stream, StreamImpl,
@@ -25,49 +25,10 @@ use crate::{
 fn cu_err(context: &str, err: DriverError) -> ForgeError {
     ForgeError::Device(format!("{context}: {err}"))
 }
+// `PoolSizes` żyje w lib.rs, żeby dzielili je oba backendy GPU; re-eksport
+// utrzymuje istniejące ścieżki `forge_hal::cuda::PoolSizes`.
+pub use crate::PoolSizes;
 
-/// Explicit byte budgets for the three VRAM pools. Constructing a
-/// `CudaDevice` claims exactly these amounts up front.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PoolSizes {
-    pub weights: usize,
-    pub kv_cache: usize,
-    /// Slab granularity of the KV pool; KV allocations round up to pages.
-    pub kv_page_size: usize,
-    pub activations: usize,
-}
-
-impl PoolSizes {
-    /// Default KV page: 256 KiB holds a 16-token page of a 7B-class layer's
-    /// K+V in fp16 with headroom, while keeping free-list churn negligible.
-    pub const DEFAULT_KV_PAGE: usize = 256 * 1024;
-
-    /// Opt-in sizing from currently free VRAM: claims 90% of `free_bytes`,
-    /// split 60/30/10 between weights, KV cache and activations.
-    pub fn auto_from_free(free_bytes: usize) -> Self {
-        let budget = free_bytes / 10 * 9;
-        let weights = align_down(budget / 10 * 6);
-        let kv_cache = align_down(budget / 10 * 3);
-        let activations = align_down(budget - weights - kv_cache);
-        Self {
-            weights,
-            kv_cache,
-            kv_page_size: Self::DEFAULT_KV_PAGE,
-            activations,
-        }
-    }
-
-    fn total(&self) -> Result<usize> {
-        self.weights
-            .checked_add(self.kv_cache)
-            .and_then(|value| value.checked_add(self.activations))
-            .ok_or_else(|| ForgeError::Device("suma rozmiarów pul CUDA przekracza usize".into()))
-    }
-}
-
-fn align_down(bytes: usize) -> usize {
-    bytes / ALLOC_ALIGN * ALLOC_ALIGN
-}
 
 // --- Pools ----------------------------------------------------------------------
 

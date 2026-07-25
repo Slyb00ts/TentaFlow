@@ -330,6 +330,50 @@ impl KernelHandle {
 /// Asynchrony contract: `copy` and `launch` are stream-ordered and return
 /// before completion; `write`/`read` are synchronous staging helpers and must
 /// not be called while a stream on this device is capturing a graph.
+
+/// Explicit byte budgets for the three VRAM pools. Constructing a
+/// `CudaDevice` claims exactly these amounts up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSizes {
+    pub weights: usize,
+    pub kv_cache: usize,
+    /// Slab granularity of the KV pool; KV allocations round up to pages.
+    pub kv_page_size: usize,
+    pub activations: usize,
+}
+
+impl PoolSizes {
+    /// Default KV page: 256 KiB holds a 16-token page of a 7B-class layer's
+    /// K+V in fp16 with headroom, while keeping free-list churn negligible.
+    pub const DEFAULT_KV_PAGE: usize = 256 * 1024;
+
+    /// Opt-in sizing from currently free VRAM: claims 90% of `free_bytes`,
+    /// split 60/30/10 between weights, KV cache and activations.
+    pub fn auto_from_free(free_bytes: usize) -> Self {
+        let budget = free_bytes / 10 * 9;
+        let weights = align_down(budget / 10 * 6);
+        let kv_cache = align_down(budget / 10 * 3);
+        let activations = align_down(budget - weights - kv_cache);
+        Self {
+            weights,
+            kv_cache,
+            kv_page_size: Self::DEFAULT_KV_PAGE,
+            activations,
+        }
+    }
+
+    fn total(&self) -> Result<usize> {
+        self.weights
+            .checked_add(self.kv_cache)
+            .and_then(|value| value.checked_add(self.activations))
+            .ok_or_else(|| ForgeError::Device("suma rozmiarów pul CUDA przekracza usize".into()))
+    }
+}
+
+fn align_down(bytes: usize) -> usize {
+    bytes / crate::arena::ALLOC_ALIGN * crate::arena::ALLOC_ALIGN
+}
+
 pub trait Device: Send + Sync {
     fn caps(&self) -> &DeviceCaps;
 
