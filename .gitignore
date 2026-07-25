@@ -241,3 +241,7 @@ target_concurrency/
 target_prefill_finish/
 target_fixedk3/
 target_clippy_fixed/
+
+# Katalogi robocze buildu kerneli (publikacja podmienia je atomowo; gdy build
+# zostanie przerwany, zostaja na dysku i nie moga trafic do repo).
+tentaflow-infer/kernels/mojo/build/.kernel-build-*/
