@@ -8,7 +8,11 @@ from std.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from std.math import isclose
 from std.memory import bitcast
-from src.gemm_dot import gemm_f16_dot2_impl, gemm_q8_0_dot4_impl
+from src.gemm_dot import (
+    gemm_f16_dot2_impl,
+    gemm_q8_0_dot4_impl,
+    gemm_q4_k_dot4_impl,
+)
 
 comptime ITERS = 10
 
@@ -190,6 +194,144 @@ def bench_q8[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
     )
 
 
+def check_q4k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    ctx: DeviceContext, tokens: Int, rows: Int, cols: Int
+) raises:
+    """Referencja liczona na hoście dokładnie tym samym wzorem co kernel."""
+    nsuper = cols // 256
+    nb = cols // 32
+    var wh = ctx.enqueue_create_host_buffer[DType.uint8](rows * nsuper * 144)
+    var xh = ctx.enqueue_create_host_buffer[DType.int8](tokens * cols)
+    var dh = ctx.enqueue_create_host_buffer[DType.float32](nb * tokens)
+    var sh = ctx.enqueue_create_host_buffer[DType.float32](nb * tokens)
+    ctx.synchronize()
+    for r in range(rows):
+        for sb in range(nsuper):
+            base = (r * nsuper + sb) * 144
+            d = Float32(0.00390625 * Float32(1 + (r + sb) % 5)).cast[DType.float16]()
+            dmin = Float32(0.001953125 * Float32(1 + (r + sb) % 3)).cast[DType.float16]()
+            db = bitcast[DType.uint16](d)
+            mb = bitcast[DType.uint16](dmin)
+            wh[base] = UInt8(db & 0xFF)
+            wh[base + 1] = UInt8(db >> 8)
+            wh[base + 2] = UInt8(mb & 0xFF)
+            wh[base + 3] = UInt8(mb >> 8)
+            for i in range(12):
+                wh[base + 4 + i] = UInt8((r * 7 + sb * 3 + i * 5) % 256)
+            for i in range(128):
+                wh[base + 16 + i] = UInt8((r * 11 + sb * 13 + i * 3) % 256)
+    for t in range(tokens):
+        for k in range(cols):
+            xh[t * cols + k] = Int8(((t * 5 + k * 7) % 255) - 127)
+    for b in range(nb):
+        for t in range(tokens):
+            dh[b * tokens + t] = 0.0078125 * Float32(1 + (b + t) % 5)
+            var isum: Int32 = 0
+            for i in range(32):
+                isum += Int32(xh[t * cols + b * 32 + i])
+            sh[b * tokens + t] = dh[b * tokens + t] * Float32(isum)
+
+    var wd = ctx.enqueue_create_buffer[DType.uint8](rows * nsuper * 144)
+    var xdb = ctx.enqueue_create_buffer[DType.int8](tokens * cols)
+    var ddb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var sdb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var yd = ctx.enqueue_create_buffer[DType.float16](tokens * rows)
+    ctx.enqueue_copy(wd, wh)
+    ctx.enqueue_copy(xdb, xh)
+    ctx.enqueue_copy(ddb, dh)
+    ctx.enqueue_copy(sdb, sh)
+    ctx.synchronize()
+    ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB]](
+        yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(), ddb.unsafe_ptr(),
+        sdb.unsafe_ptr(), cols, rows, tokens,
+        grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),
+        block_dim=(BM // TM) * (BN // TN),
+    )
+    ctx.synchronize()
+    var worst: Float32 = 0.0
+    with yd.map_to_host() as got:
+        for t in range(tokens):
+            for r in range(rows):
+                var expect: Float32 = 0.0
+                for b in range(nb):
+                    sb = b // 8
+                    j = b % 8
+                    base = (r * nsuper + sb) * 144
+                    db2 = UInt16(wh[base]) | (UInt16(wh[base + 1]) << 8)
+                    mb2 = UInt16(wh[base + 2]) | (UInt16(wh[base + 3]) << 8)
+                    dv = bitcast[DType.float16](db2).cast[DType.float32]()
+                    dmv = bitcast[DType.float16](mb2).cast[DType.float32]()
+                    var sc: Int
+                    var mn: Int
+                    if j < 4:
+                        sc = Int(wh[base + 4 + j] & 63)
+                        mn = Int(wh[base + 8 + j] & 63)
+                    else:
+                        sc = Int(
+                            (wh[base + 8 + j] & 0x0F)
+                            | ((wh[base + j] >> 6) << 4)
+                        )
+                        mn = Int(
+                            (wh[base + 8 + j] >> 4)
+                            | ((wh[base + 4 + j] >> 6) << 4)
+                        )
+                    var isum: Int32 = 0
+                    for i in range(32):
+                        packed = wh[base + 16 + 32 * (j // 2) + i]
+                        q = Int32(
+                            packed & 0x0F
+                        ) if j % 2 == 0 else Int32(packed >> 4)
+                        isum += q * Int32(xh[t * cols + b * 32 + i])
+                    expect += (
+                        dh[b * tokens + t] * dv * Float32(sc) * Float32(isum)
+                        - dmv * Float32(mn) * sh[b * tokens + t]
+                    )
+                have = Float32(got[t * rows + r])
+                denom = abs(expect) if abs(expect) > 1.0 else 1.0
+                err = abs(have - expect) / denom
+                if err > worst:
+                    worst = err
+    print("Q4K T=", tokens, "rows=", rows, "cols=", cols, "blad max:", worst)
+    if worst > 0.003:
+        raise Error("gemm_q4_k_dot4 poza tolerancja f16")
+
+
+def bench_q4k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    label: String, ctx: DeviceContext, tokens: Int, rows: Int, cols: Int
+) raises:
+    nsuper = cols // 256
+    nb = cols // 32
+    var wd = ctx.enqueue_create_buffer[DType.uint8](rows * nsuper * 144)
+    var xdb = ctx.enqueue_create_buffer[DType.int8](tokens * cols)
+    var ddb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var sdb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var yd = ctx.enqueue_create_buffer[DType.float16](tokens * rows)
+    ctx.synchronize()
+    grid = ((rows + BN - 1) // BN, (tokens + BM - 1) // BM)
+    blk = (BM // TM) * (BN // TN)
+    for _ in range(3):
+        ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB]](
+            yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(),
+            ddb.unsafe_ptr(), sdb.unsafe_ptr(), cols, rows, tokens,
+            grid_dim=grid, block_dim=blk,
+        )
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemm_q4_k_dot4_impl[BM, BN, TM, TN, KB]](
+            yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(),
+            ddb.unsafe_ptr(), sdb.unsafe_ptr(), cols, rows, tokens,
+            grid_dim=grid, block_dim=blk,
+        )
+    ctx.synchronize()
+    dt = Float64(perf_counter_ns() - t0) / 1e9 / ITERS
+    ops = 2.0 * Float64(tokens) * Float64(rows) * Float64(cols)
+    print(
+        label, "T=", tokens, "rows=", rows, "cols=", cols,
+        Int(ops / dt / 1e12), "TOPS", Int(dt * 1e6), "us",
+    )
+
+
 def main() raises:
     var ctx = DeviceContext()
     print("arch:", ctx.arch_name())
@@ -209,6 +351,9 @@ def main() raises:
     check_q8[128, 64, 8, 4, 4](ctx, 200, 130, 1024)
     check_q8[128, 128, 8, 4, 4](ctx, 300, 300, 1024)
     check_q8[192, 128, 8, 4, 4](ctx, 300, 300, 1024)
+    check_q4k[64, 64, 4, 4, 4](ctx, 64, 64, 256)
+    check_q4k[128, 64, 8, 4, 2](ctx, 200, 130, 512)
+    check_q4k[128, 128, 8, 4, 2](ctx, 300, 300, 1024)
     print("--- kafle na kształtach warstw ---")
     # qwen0.6B: 1024/3072. 7B: 4096/14336.
     bench[64, 64, 4, 4]("64x64  ", ctx, 1024, 4096, 4096)
@@ -228,7 +373,10 @@ def main() raises:
     bench_q8[128, 128, 8, 4, 4]("q8 128x128", ctx, 1024, 4096, 4096)
     bench_q8[128, 128, 8, 4, 1]("q8 128x128 KB1", ctx, 1024, 4096, 4096)
     bench_q8[128, 128, 8, 4, 2]("q8 128x128 KB2", ctx, 1024, 4096, 4096)
-    bench_q8[128, 128, 8, 4, 8]("q8 128x128 KB8", ctx, 1024, 4096, 4096)
+    print("--- Q4_K int8 dot4 ---")
+    bench_q4k[128, 64, 8, 4, 2]("q4k 128x64 ", ctx, 1024, 4096, 4096)
+    bench_q4k[128, 128, 8, 4, 2]("q4k 128x128", ctx, 1024, 4096, 4096)
+    bench_q4k[128, 128, 8, 4, 2]("q4k 128x128", ctx, 1024, 14336, 4096)
     bench_q8[128, 128, 8, 4, 4]("q8 128x128", ctx, 1024, 14336, 4096)
     bench_q8[128, 128, 8, 4, 4]("q8 128x128", ctx, 512, 3072, 1024)
     print("--- najlepszy kafel na pozostalych kształtach ---")

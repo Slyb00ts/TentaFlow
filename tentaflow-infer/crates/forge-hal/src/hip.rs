@@ -447,14 +447,20 @@ impl EventImpl for HipEvent {
     }
 }
 
-struct HipModule(HipModuleRaw);
+struct HipModule {
+    raw: HipModuleRaw,
+    /// Własna kopia obrazu code objectu. `hipModuleLoadData` nie gwarantuje, że
+    /// skopiuje bufor wołającego (leniwe ładowanie code objectów v5 potrafi go
+    /// trzymać), a rejestr kerneli zwalnia swój bufor od razu po załadowaniu.
+    _image: Vec<u8>,
+}
 unsafe impl Send for HipModule {}
 unsafe impl Sync for HipModule {}
 
 impl Drop for HipModule {
     fn drop(&mut self) {
         unsafe {
-            let _ = hipModuleUnload(self.0);
+            let _ = hipModuleUnload(self.raw);
         }
     }
 }
@@ -465,7 +471,7 @@ impl ModuleImpl for HipModule {
             .map_err(|_| ForgeError::Device(format!("nazwa kernela {name} zawiera zero")))?;
         let mut func: HipFunctionRaw = std::ptr::null_mut();
         check(
-            unsafe { hipModuleGetFunction(&mut func, self.0, symbol.as_ptr()) },
+            unsafe { hipModuleGetFunction(&mut func, self.raw, symbol.as_ptr()) },
             &format!("hipModuleGetFunction({name})"),
         )?;
         Ok(KernelHandle::from_impl(Arc::new(HipKernel {
@@ -715,12 +721,16 @@ impl Device for HipDevice {
 
     fn load_module(&self, image: &[u8]) -> Result<Module> {
         self.bind()?;
+        let owned = image.to_vec();
         let mut raw: HipModuleRaw = std::ptr::null_mut();
         check(
-            unsafe { hipModuleLoadData(&mut raw, image.as_ptr() as *const c_void) },
+            unsafe { hipModuleLoadData(&mut raw, owned.as_ptr() as *const c_void) },
             "hipModuleLoadData",
         )?;
-        Ok(Module::from_impl(Arc::new(HipModule(raw))))
+        Ok(Module::from_impl(Arc::new(HipModule {
+            raw,
+            _image: owned,
+        })))
     }
 
     fn launch(

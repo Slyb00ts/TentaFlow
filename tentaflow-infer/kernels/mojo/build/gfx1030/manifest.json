@@ -349,6 +349,22 @@
       "entry": "src_conv_gelu_f16_Pointer6A6A6A6AoA6A6AcB6A6A_809de0ef169c12fa",
       "file": "gelu_f16.hsaco"
     },
+    "gemm_f16_dot2_128x128": {
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_87ceaf1fa736837e",
+      "file": "gemm_f16_dot2_128x128.hsaco"
+    },
+    "gemm_f16_dot2_128x64": {
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_bbd4a01bacc1f5c4",
+      "file": "gemm_f16_dot2_128x64.hsaco"
+    },
+    "gemm_f16_dot2_256x64": {
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_19fc26f15b9e70b2",
+      "file": "gemm_f16_dot2_256x64.hsaco"
+    },
+    "gemm_f16_dot2_64x64": {
+      "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_6b918349dbb8bd1a",
+      "file": "gemm_f16_dot2_64x64.hsaco"
+    },
     "gemm_nvfp4_gguf_f16_b16": {
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_025e59e559bb9ddd",
       "file": "gemm_nvfp4_gguf_f16_b16.hsaco"
@@ -408,6 +424,18 @@
     "gemm_nvfp4_gguf_out_f32_b8": {
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_fb926ec38df7e9c4",
       "file": "gemm_nvfp4_gguf_out_f32_b8.hsaco"
+    },
+    "gemm_q8_0_dot4_128x128": {
+      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_c33b8dfbade5b9a9",
+      "file": "gemm_q8_0_dot4_128x128.hsaco"
+    },
+    "gemm_q8_0_dot4_128x64": {
+      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_046d66f1bd31984d",
+      "file": "gemm_q8_0_dot4_128x64.hsaco"
+    },
+    "gemm_q8_0_dot4_64x64": {
+      "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_0cbbaa356a2b87d8",
+      "file": "gemm_q8_0_dot4_64x64.hsaco"
     },
     "gemm_q8_0_dp4a_b3_nvidia": {
       "entry": "src_q8_0_batch_gemm_q8_0_small6A6A6A6A_4c7bbc1d9aab1f8c",

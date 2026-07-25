@@ -372,3 +372,37 @@ fn mojo_artifact_launches() {
         }
     }
 }
+
+/// Ładuje CAŁY katalog kerneli i zwalnia go — silnik robi dokładnie to przy
+/// starcie i rozbiórce modelu. Test istnieje, bo `hipModuleUnload` powtórzone
+/// kilkaset razy potrafi rozjechać stertę hosta, a objaw pojawia się dopiero
+/// przy wychodzeniu z procesu i wygląda wtedy na błąd zupełnie innej warstwy.
+#[test]
+fn whole_catalog_loads_and_unloads() {
+    let Some(dev) = device() else { return };
+    let arch = dev.caps().arch.clone();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/mojo/build")
+        .join(&arch);
+    let manifest_path = dir.join("manifest.json");
+    if !manifest_path.is_file() {
+        eprintln!("pominięto: brak katalogu kerneli dla {arch}");
+        return;
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let kernels = manifest["kernels"].as_object().unwrap();
+    let mut handles = Vec::with_capacity(kernels.len());
+    for (name, entry) in kernels {
+        let image = std::fs::read(dir.join(entry["file"].as_str().unwrap())).unwrap();
+        let module = dev.load_module(&image).unwrap();
+        handles.push(
+            module
+                .kernel(entry["entry"].as_str().unwrap())
+                .unwrap_or_else(|e| panic!("{name}: {e}")),
+        );
+    }
+    eprintln!("załadowano {} kerneli dla {arch}", handles.len());
+    drop(handles);
+    dev.synchronize().unwrap();
+}

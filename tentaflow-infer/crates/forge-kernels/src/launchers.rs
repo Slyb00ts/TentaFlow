@@ -1849,6 +1849,12 @@ impl Kernels {
         let iq_tables = IqTables::upload(device.as_ref())?;
         let cuda_attn_available =
             artifacts.has("attn_prefill_fa_f16_hd64") && artifacts.has("attn_prefill_fa_f16_hd128");
+        // Flash-attention w Mojo stoi na `mma`, więc na architekturze bez
+        // jednostki macierzowej nie ma go w katalogu. Domyślny wybór pyta o
+        // artefakt, a nie o producenta — brak kernela oznacza ścieżkę skalarną,
+        // która jest przenośna i bitowo referencyjna.
+        let mojo_attn_available = artifacts.has("attn_prefill_fa_mojo_f16_hd64")
+            && artifacts.has("attn_prefill_fa_mojo_f16_hd128");
         Ok(Self {
             device,
             artifacts,
@@ -1863,7 +1869,8 @@ impl Kernels {
             attn: match std::env::var("FORGE_ATTN").ok().as_deref() {
                 Some("scalar") => AttnBackend::Scalar,
                 Some("fa") | Some("cuda") if cuda_attn_available => AttnBackend::Cuda,
-                _ => AttnBackend::Mojo,
+                _ if mojo_attn_available => AttnBackend::Mojo,
+                _ => AttnBackend::Scalar,
             },
         })
     }
@@ -8250,11 +8257,30 @@ impl Kernels {
         if self.device.caps().vendor == forge_types::Vendor::Nvidia {
             return None;
         }
-        if output_f32 || kernel_base != "gemm_q8_0_i8mma" {
+        // Wariant `out_f32` (głowa logitów w batchu) nie ma jeszcze kafla int8.
+        if output_f32 {
             return None;
         }
+        let family = match kernel_base {
+            "gemm_q8_0_i8mma" => "q8_0",
+            "gemm_q4_k_i8mma" => "q4_k",
+            _ => return None,
+        };
         Some(if n_tokens <= 64 || rows < 128 {
-            ("gemm_q8_0_dot4_64x64", 64, 64, 256)
+            (
+                if family == "q8_0" {
+                    "gemm_q8_0_dot4_64x64"
+                } else {
+                    "gemm_q4_k_dot4_64x64"
+                },
+                64,
+                64,
+                256,
+            )
+        } else if family == "q4_k" {
+            // Q4_K rozpakowuje nibble w LDS, więc płaci więcej za etap; kafel
+            // 128x64 wyszedł szybszy (32 wobec 29 TOPS) niż 128x128.
+            ("gemm_q4_k_dot4_128x64", 128, 64, 512)
         } else if n_tokens <= 128 {
             ("gemm_q8_0_dot4_128x64", 128, 64, 512)
         } else {

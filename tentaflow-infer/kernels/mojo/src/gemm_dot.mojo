@@ -38,6 +38,7 @@ from std.gpu.sync import barrier
 from std.memory import stack_allocation
 from std.gpu.memory import AddressSpace
 from src.arch_dot import dot2_f16, dot4_i8
+from src.gemv2 import _q4k_scale_min
 
 comptime BK = 32  # kolumny na etap
 comptime KSTEP = 8  # połówki wczytywane z pamięci globalnej jednym odczytem
@@ -389,3 +390,186 @@ def gemm_q8_0_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
 comptime gemm_q8_0_dot4_64x64 = gemm_q8_0_dot4_impl[64, 64, 4, 4, 4]
 comptime gemm_q8_0_dot4_128x64 = gemm_q8_0_dot4_impl[128, 64, 8, 4, 2]
 comptime gemm_q8_0_dot4_128x128 = gemm_q8_0_dot4_impl[128, 128, 8, 4, 2]
+
+
+def gemm_q4_k_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Q4_K GEMM na `v_dot4_i32_i8`: Y[t, r] = dot(w[r], x[t]).
+
+    Wagi czytamy wprost z 144-bajtowych superbloków GGUF (16 B nagłówka: d, dmin
+    i dwanaście 6-bitowych par skal, potem 128 B nibbli na 256 kolumn). Q4_K jest
+    ASYMETRYCZNE: `w = d*sc*q - dmin*m`, więc wkład 32-kolumnowego podbloku to
+    `xd*d*sc*<q, xq> - dmin*m*xsm`, gdzie `xsm` (z `quantize_act_q8_1`) już niesie
+    `xd * suma(xq)`. Ta druga składowa jest jedyną różnicą wobec ścieżki Q8_0.
+
+    `n_cols % 256 == 0` (niezmiennik formatu), siatka i blok jak w Q8_0.
+    """
+    comptime NT = (BM // TM) * (BN // TN)
+    comptime ROWS_TX = BN // TN
+    comptime X_PASSES = (BM + (NT // 4) - 1) // (NT // 4)
+    comptime W_PASSES = (BN + (NT // 4) - 1) // (NT // 4)
+    comptime XPLANE = BM * 32
+    comptime WPLANE = BN * 32
+
+    tid = Int(thread_idx.x)
+    row0 = Int(block_idx.x) * BN
+    t0 = Int(block_idx.y) * BM
+    supers_per_row = n_cols // 256
+    total_sub = n_cols // 32
+
+    xs = stack_allocation[
+        KB * XPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    ws = stack_allocation[
+        KB * WPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        KB * BM, Float32, address_space = AddressSpace.SHARED
+    ]()
+    xsms = stack_allocation[
+        KB * BM, Float32, address_space = AddressSpace.SHARED
+    ]()
+    wds = stack_allocation[
+        KB * BN, Float32, address_space = AddressSpace.SHARED
+    ]()
+    wdm = stack_allocation[
+        KB * BN, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    lrow = tid // 4
+    kc = (tid % 4) * 8
+    tx = tid % ROWS_TX
+    ty = tid // ROWS_TX
+
+    var acc = InlineArray[Float32, TM * TN](fill=0.0)
+
+    var base_sub = 0
+    while base_sub < total_sub:
+        comptime for kb in range(KB):
+            js = base_sub + kb
+            live = js < total_sub
+
+            comptime for p in range(X_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BM:
+                    var token = t0 + local
+                    if token > n_tokens - 1:
+                        token = n_tokens - 1
+                    var bytes8 = SIMD[DType.int8, 8](0)
+                    if live:
+                        bytes8 = (xq + token * n_cols + js * 32 + kc).load[
+                            width=8
+                        ]()
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            xs + kb * XPLANE + kq * (BM * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            bytes8.slice[4, offset = q * 4]()
+                        )
+
+            comptime for p in range(W_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BN:
+                    var row = row0 + local
+                    if row > n_rows - 1:
+                        row = n_rows - 1
+                    var codes = SIMD[DType.int8, 8](0)
+                    var dsc: Float32 = 0.0
+                    var dmm: Float32 = 0.0
+                    if live:
+                        sb = js // 8
+                        j = js % 8
+                        block_ptr = w + (row * supers_per_row + sb) * 144
+                        header = block_ptr.load[width=16, alignment=4]()
+                        d = Float32(
+                            block_ptr.bitcast[Float16]().load[width=1]()
+                        )
+                        dmin = Float32(
+                            (block_ptr + 2).bitcast[Float16]().load[width=1]()
+                        )
+                        sc, mn = _q4k_scale_min(header, j)
+                        dsc = d * sc
+                        dmm = dmin * mn
+                        # Nibble niski to podblok parzysty, wysoki to nieparzysty;
+                        # oba dzielą te same 32 bajty `qs`.
+                        packed = (block_ptr + 16 + 32 * (j // 2) + kc).load[
+                            width=8
+                        ]()
+                        if j % 2 == 0:
+                            codes = (packed & 0x0F).cast[DType.int8]()
+                        else:
+                            codes = (packed >> 4).cast[DType.int8]()
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            ws + kb * WPLANE + kq * (BN * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            codes.slice[4, offset = q * 4]()
+                        )
+                    if tid % 4 == 0:
+                        wds[kb * BN + local] = dsc
+                        wdm[kb * BN + local] = dmm
+
+            if tid < BM:
+                var token = t0 + tid
+                if token > n_tokens - 1:
+                    token = n_tokens - 1
+                xds[kb * BM + tid] = xd[js * n_tokens + token] if live else 0.0
+                xsms[kb * BM + tid] = xsm[
+                    js * n_tokens + token
+                ] if live else 0.0
+        barrier()
+
+        comptime for kb in range(KB):
+            xbase = xs + kb * XPLANE + ty * TM * 4
+            wbase = ws + kb * WPLANE + tx * TN * 4
+            var isum = InlineArray[Int32, TM * TN](fill=0)
+
+            comptime for kq in range(8):
+                av = (xbase + kq * (BM * 4)).bitcast[Int32]().load[
+                    width=TM, alignment=16
+                ]()
+                bv = (wbase + kq * (BN * 4)).bitcast[Int32]().load[
+                    width=TN, alignment=16
+                ]()
+
+                comptime for m in range(TM):
+                    comptime for r in range(TN):
+                        isum[m * TN + r] = dot4_i8(
+                            av[m], bv[r], isum[m * TN + r]
+                        )
+
+            comptime for m in range(TM):
+                dx = xds[kb * BM + ty * TM + m]
+                sx = xsms[kb * BM + ty * TM + m]
+                comptime for r in range(TN):
+                    acc[m * TN + r] += (
+                        dx * wds[kb * BN + tx * TN + r] * Float32(
+                            isum[m * TN + r]
+                        )
+                        - sx * wdm[kb * BN + tx * TN + r]
+                    )
+        barrier()
+        base_sub += KB
+
+    comptime for m in range(TM):
+        t = t0 + ty * TM + m
+        if t < n_tokens:
+            comptime for r in range(TN):
+                row = row0 + tx * TN + r
+                if row < n_rows:
+                    y[t * n_rows + row] = Float16(acc[m * TN + r])
+
+
+comptime gemm_q4_k_dot4_64x64 = gemm_q4_k_dot4_impl[64, 64, 4, 4, 4]
+comptime gemm_q4_k_dot4_128x64 = gemm_q4_k_dot4_impl[128, 64, 8, 4, 2]
+comptime gemm_q4_k_dot4_128x128 = gemm_q4_k_dot4_impl[128, 128, 8, 4, 2]
