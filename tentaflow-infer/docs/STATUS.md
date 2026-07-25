@@ -79,6 +79,42 @@ Ostatnia aktualizacja: 2026-07-25.
   ten sam prompt greedy przy C=1 i C=6 daje teraz IDENTYCZNE wyjście (wcześniej
   ścieżki różniły się głową). Bramki: workspace 606/606, `batched_bielik`
   z paczkami FP8 2/2.
+- 🟡 **Backend HIP/ROCm — pierwszy pionowy przekrój działa (2026-07-25).**
+  Maszyna zmieniła kartę na **Radeon RX 6900 XT (gfx1030, RDNA2)**, więc FORGE
+  przestał startować (`CudaContext::new(0): CUDA_ERROR_NO_DEVICE`). Zweryfikowane
+  o sprzęcie i toolchainie: 80 CU, wavefront **32**, **16,0 GB VRAM**, ROCm 7.2.4,
+  brak sterownika NVIDIA. **Mojo działa na tej karcie** (`gpu_smoke` policzył
+  kernel), `arch_name()` zwraca `gfx1030`, a `dump_asm` daje assembler AMDGCN
+  z TYM SAMYM zmangowanym symbolem co build PTX — czyli format manifestu i
+  `out_dir = build/<arch>` przenoszą się bez zmian. Łańcuch artefaktu
+  potwierdzony do końca: `.s` → `clang -x assembler -target amdgcn-amd-amdhsa
+  -mcpu=gfx1030` → HSACO (ELF DYN, EM_AMDGPU) z symbolem jądra i `.kd`.
+  Pułapka: Mojo emituje `.amdgcn_target "...-unknown-gfx1030"`, a clang wymaga
+  wariantu bez `unknown` — jeden `sed`, ta sama klasa łatki co obecne podbicie
+  `.version 8.1 → 8.4` dla FP8.
+  ROZSTRZYGNIĘCIE O SPRZĘCIE: gfx1030 **nie ma jednostek macierzowych**
+  (`__builtin_amdgcn_wmma_*` → „needs target feature gfx11-insts"; gfx1100 jako
+  kontrola kompiluje się). Ma natomiast int8 dot (`v_dot4_i32_i8`). Więc wszystkie
+  kernele oparte na `mma`/`ld_matrix` wymagają wariantów dot/VALU, a ścieżki FP8
+  są na RDNA2 niemożliwe. WMMA wraca na RDNA3, FP8 na RDNA4.
+  ZROBIONE: `forge-hal` ma cechę `hip` i backend `src/hip.rs` — wykrycie
+  urządzenia z capability, pamięć (device + pinned host), streamy, eventy
+  (także z pomiarem czasu), kopie D2D, `hipModuleLoadData` i
+  `hipModuleLaunchKernel`. Właściwości czyta shim w C kompilowany przez
+  `build.rs` clangiem z ROCm, żeby układ `hipDeviceProp_t` i numeracja enumów
+  były rozstrzygane przez kompilator, nie zgadywane w Ruście. Test
+  `hip_backend` 3/3: capability, roundtrip pamięci z kopią D2D i kontrolą
+  zakresu, oraz ładowanie code objectu zbudowanego w locie przez
+  `hipcc --genco` z uruchomieniem kernela i porównaniem wyniku.
+  Cecha jest opt-in, więc build CUDA-only jest nietknięty (workspace kompiluje
+  się bez ROCm).
+  ŚWIADOMIE JESZCZE NIE: areny pul (alloc idzie wprost przez `hipMalloc`,
+  `reset_activations` zwraca `Unsupported`) i grafy (`supports_graph_capture`
+  raportuje `false`, więc warstwy wyżej ich nie użyją). To następny krok —
+  bez pul silnik nie wystartuje na AMD.
+  NIESPODZIANKA DO ZAPAMIĘTANIA: na RDNA `multiProcessorCount` liczy **WGP**,
+  nie CU — 6900 XT zgłasza 40, a `rocminfo` 80. Heurystyki „bloki na SM"
+  trzeba czytać przez ten pryzmat.
 - ✅ **Kopie D2D w mixerze DeltaNet usunięte: Qwen 27B do 112,3 tok/s
   (2026-07-25).** Batchowane projekcje zostawiały cztery kopie D2D na lane na
   warstwę (1536 na krok przy B=8) do jednotokenowego scratchu. Konsumenci

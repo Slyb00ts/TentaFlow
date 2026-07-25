@@ -11,6 +11,8 @@
 #[cfg(feature = "cuda")]
 pub(crate) mod arena;
 pub mod cpu;
+#[cfg(feature = "hip")]
+pub mod hip;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
