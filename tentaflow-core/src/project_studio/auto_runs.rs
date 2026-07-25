@@ -729,6 +729,214 @@ pub fn create_auto_run(
     Ok((run_id, run_no as u32, item_ids))
 }
 
+/// Resolves the cases of an automated run from the XOR selector, preserving the
+/// requested order. `require_all_approved` decides what happens to a case that
+/// is no longer approved: a user-initiated run refuses loudly (the tester picked
+/// it), a scheduled one drops it silently — a nightly job must not stop firing
+/// because a single case went back to draft.
+pub fn resolve_cases(
+    pool: &DbPool,
+    suite_id: &str,
+    case_ids: &[String],
+    from_run_id: &str,
+    max_cases: usize,
+    require_all_approved: bool,
+) -> Result<Vec<AutoCase>> {
+    let selectors = [
+        !suite_id.is_empty(),
+        !case_ids.is_empty(),
+        !from_run_id.is_empty(),
+    ];
+    if selectors.iter().filter(|s| **s).count() != 1 {
+        bail!("provide exactly one of suite_id / case_ids / from_run_id");
+    }
+    let ids: Vec<String> = if !suite_id.is_empty() {
+        super::tests::suite_case_rows(pool, suite_id)?
+            .into_iter()
+            .map(|c| c.case_id)
+            .collect()
+    } else if !case_ids.is_empty() {
+        case_ids.to_vec()
+    } else {
+        super::runs::failed_case_ids(pool, from_run_id)?
+    };
+    if ids.is_empty() {
+        bail!("the selection has no cases");
+    }
+    if ids.len() > max_cases {
+        bail!("a run accepts at most {max_cases} cases");
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for case_id in &ids {
+        let item = super::tests::get_case(pool, case_id)?;
+        let Some(item) = item else {
+            if require_all_approved {
+                bail!("case '{case_id}' is not available");
+            }
+            continue;
+        };
+        if item.record.status != "approved" {
+            if require_all_approved {
+                bail!("case '{}' is not approved", item.record.title);
+            }
+            continue;
+        }
+        out.push(AutoCase {
+            case_id: item.record.case_id,
+            case_title: item.record.title,
+            case_version: item.record.current_version,
+            kind: item.record.kind,
+            language: item.record.language,
+            content_json: item.record.content_json,
+        });
+    }
+    Ok(out)
+}
+
+/// A created run plus the items that may actually be submitted to the runner.
+/// `submit_items` is empty when nothing in the selection is executable there —
+/// the caller finishes the run instead of submitting it.
+pub struct PreparedRun {
+    pub run_id: String,
+    pub run_no: u32,
+    pub submit_items: Vec<SubmitItem>,
+    /// Items marked non-executable up front (wrong kind/language for this
+    /// runner, or a build profile that needs a sandbox Core cannot build yet).
+    pub skipped: usize,
+}
+
+/// Creates the run and decides, per case, whether the chosen runner can execute
+/// it: cases of a kind/language the runner does not advertise are marked
+/// 'skipped', unit cases bound to a build profile 'blocked'. The run-level perf
+/// profile overrides the one stored on the case, so the MERGED content is what
+/// gets validated — validating the case alone would leave the override's
+/// users/spawn_rate/duration unbounded.
+#[allow(clippy::too_many_arguments)]
+pub fn create_and_prepare_run(
+    pool: &DbPool,
+    name: &str,
+    suite_id: &str,
+    run_type: &str,
+    environment_id: &str,
+    cases: &[AutoCase],
+    runner: &DiscoveredRunner,
+    perf_profile_json: &str,
+    created_by: &str,
+) -> Result<PreparedRun> {
+    let advertised: HashSet<String> = runner
+        .health
+        .as_ref()
+        .map(|h| {
+            h.toolchains
+                .iter()
+                .map(|t| t.language.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let (run_id, run_no, item_ids) = create_auto_run(
+        pool,
+        name,
+        suite_id,
+        run_type,
+        environment_id,
+        cases,
+        &runner.service_id,
+        &runner.endpoint_url,
+        perf_profile_json,
+        created_by,
+    )?;
+
+    let mut submit_items = Vec::with_capacity(cases.len());
+    let mut skipped = Vec::new();
+    let mut blocked = Vec::new();
+    for (case, item_id) in cases.iter().zip(item_ids.iter()) {
+        let executable = super::generation::is_code_kind(&case.kind)
+            && advertised.contains(&case.language.to_ascii_lowercase());
+        if !executable {
+            skipped.push((
+                item_id.clone(),
+                format!(
+                    "kind '{}' / language '{}' is not executable by this runner",
+                    case.kind, case.language
+                ),
+            ));
+            continue;
+        }
+        let content: serde_json::Value =
+            serde_json::from_str(&case.content_json).unwrap_or_else(|_| serde_json::json!({}));
+        // A unit case bound to a build profile needs the repository checked out
+        // and the profile's install/test commands run inside a per-run sandbox.
+        // The runner only understands an inline `build_profile` object with an
+        // absolute, mounted workdir, which Core cannot produce yet — submitting
+        // the reference anyway would silently degrade to plain pytest in an
+        // empty directory and report a green run that executed nothing.
+        if case.kind == "unit"
+            && content
+                .get("build_profile_ref")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.trim().is_empty())
+        {
+            blocked.push((
+                item_id.clone(),
+                "running a build profile requires a per-run sandbox (planned) — the case \
+                 was not executed"
+                    .to_string(),
+            ));
+            continue;
+        }
+        let mut content = content;
+        if case.kind == "perf" && !perf_profile_json.trim().is_empty() {
+            if let Ok(profile) = serde_json::from_str::<serde_json::Value>(perf_profile_json) {
+                if let Some(map) = content.as_object_mut() {
+                    map.insert("profile".to_string(), profile);
+                }
+            }
+            if let Err(message) = super::generation::validate_case_content(
+                &case.kind,
+                &case.language,
+                &content.to_string(),
+            ) {
+                let _ = finish_run(pool, &run_id, "error", &message);
+                bail!("{message}");
+            }
+        }
+        submit_items.push(SubmitItem {
+            item_id: item_id.clone(),
+            kind: case.kind.clone(),
+            language: case.language.clone(),
+            config: content
+                .get("config")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            content,
+        });
+    }
+    if !skipped.is_empty() || !blocked.is_empty() {
+        if let Ok(conn) = pool.write() {
+            for (item_id, reason) in &skipped {
+                let _ = conn.execute(
+                    "UPDATE test_run_items SET status = 'skipped', result_note = ?1, \
+                        finished_at = datetime('now') WHERE item_id = ?2",
+                    params![reason, item_id],
+                );
+            }
+            for (item_id, reason) in &blocked {
+                let _ = conn.execute(
+                    "UPDATE test_run_items SET status = 'blocked', result_note = ?1, \
+                        finished_at = datetime('now') WHERE item_id = ?2",
+                    params![reason, item_id],
+                );
+            }
+        }
+    }
+    Ok(PreparedRun {
+        run_id,
+        run_no,
+        submit_items,
+        skipped: skipped.len() + blocked.len(),
+    })
+}
+
 fn set_runner_job_id(pool: &DbPool, run_id: &str, job_id: &str) -> Result<()> {
     let conn = pool.write().map_err(write_err)?;
     conn.execute(
@@ -740,33 +948,39 @@ fn set_runner_job_id(pool: &DbPool, run_id: &str, job_id: &str) -> Result<()> {
 
 /// Ends a run terminally: header status plus every non-terminal item. Guarded
 /// on `status = 'running'`, so the watcher and a concurrent reconcile settle it
-/// exactly once.
+/// exactly once. This is also the ONE place a scheduled run reports back, so
+/// the watchdog, cancel and reconcile paths all settle a schedule identically.
 pub fn finish_run(pool: &DbPool, run_id: &str, status: &str, message: &str) -> Result<bool> {
-    let conn = pool.write().map_err(write_err)?;
-    let tx = conn.unchecked_transaction()?;
-    let updated = tx.execute(
-        "UPDATE test_runs SET status = ?1, finished_at = datetime('now') \
-         WHERE run_id = ?2 AND status = 'running'",
-        params![status, run_id],
-    )?;
-    if updated == 0 {
+    // The write lock is released before `settle` runs: the writer is a plain
+    // (non-reentrant) mutex, so taking it twice on this thread would deadlock.
+    let closed = {
+        let conn = pool.write().map_err(write_err)?;
+        let tx = conn.unchecked_transaction()?;
+        let updated = tx.execute(
+            "UPDATE test_runs SET status = ?1, finished_at = datetime('now') \
+             WHERE run_id = ?2 AND status = 'running'",
+            params![status, run_id],
+        )?;
+        if updated > 0 && status != "completed" {
+            let item_status = if status == "cancelled" {
+                "skipped"
+            } else {
+                "error"
+            };
+            tx.execute(
+                "UPDATE test_run_items SET status = ?1, result_note = ?2, \
+                    finished_at = datetime('now') \
+                 WHERE run_id = ?3 AND status IN ('pending', 'running', 'in_progress')",
+                params![item_status, message, run_id],
+            )?;
+        }
         tx.commit()?;
+        updated > 0
+    };
+    if !closed {
         return Ok(false);
     }
-    if status != "completed" {
-        let item_status = if status == "cancelled" {
-            "skipped"
-        } else {
-            "error"
-        };
-        tx.execute(
-            "UPDATE test_run_items SET status = ?1, result_note = ?2, \
-                finished_at = datetime('now') \
-             WHERE run_id = ?3 AND status IN ('pending', 'running', 'in_progress')",
-            params![item_status, message, run_id],
-        )?;
-    }
-    tx.commit()?;
+    super::schedules::settle(pool, run_id, status);
     Ok(true)
 }
 

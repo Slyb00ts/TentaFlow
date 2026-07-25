@@ -1922,6 +1922,142 @@ pub async fn handle_request(
         }
     }
 
+    // GET /project-studio/exports/<ref>?token=&exp=&ref= — signed URL for a
+    // Project Studio export archive (zip). HMAC-only auth, exactly like
+    // /ml-studio/exports/. The ref IS the archive identity — there is no
+    // catalogue table — so existence + containment are decided on the filesystem.
+    if method == Method::GET
+        && path.starts_with("/project-studio/exports/")
+        && path.len() > "/project-studio/exports/".len()
+    {
+        use crate::api::project_studio_export::{
+            export_download_filename, handle_project_studio_export_url, parse_query, read_export_file,
+            ExportFileOutcome, ExportOutcome, RequestContext,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/project-studio/exports")
+        {
+            return Ok(resp);
+        }
+        // Capture Range BEFORE `req` is released — the streamed response below
+        // needs it, and `size` (required to resolve the range) is only known
+        // after the file is opened.
+        let range_header = req
+            .headers()
+            .get(hyper::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        drop(req);
+        let path_ref = path.strip_prefix("/project-studio/exports/").unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::project_studio_export_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_project_studio_export_url(path_ref, &q, issuer, &db, ctx);
+        let auth_status = outcome.http_status();
+        match outcome {
+            ExportOutcome::Ok => {
+                let file_outcome = read_export_file(&db, path_ref, ctx).await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    ExportFileOutcome::Ok { mut file, size } => {
+                        // STREAMED, never slurped: an export can be gigabytes.
+                        // A paused download resumes via Range → 206 + Content-Range.
+                        let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
+                            Some((s, e)) => (206u16, s, e - s + 1),
+                            None => (200u16, 0, size),
+                        };
+                        if start > 0 {
+                            use tokio::io::AsyncSeekExt;
+                            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                                return Ok(Response::builder()
+                                    .status(500)
+                                    .header("Content-Type", "application/json")
+                                    .body(Either::Left(Full::new(Bytes::from_static(
+                                        b"{\"error\":\"export_unavailable\"}",
+                                    ))))
+                                    .unwrap());
+                            }
+                        }
+                        let stream: SseStream = Box::pin(ranged_file_stream(file, length));
+                        let mut builder = Response::builder()
+                            .status(code)
+                            .header("Content-Type", "application/zip")
+                            .header("Accept-Ranges", "bytes")
+                            .header("Content-Length", length.to_string())
+                            .header(
+                                "Content-Disposition",
+                                format!(
+                                    "attachment; filename=\"{}\"",
+                                    export_download_filename(path_ref)
+                                ),
+                            );
+                        if code == 206 {
+                            builder = builder.header(
+                                "Content-Range",
+                                format!("bytes {}-{}/{}", start, start + length - 1, size),
+                            );
+                        }
+                        Ok(apply_signed_url_security_headers(builder)
+                            .body(Either::Right(StreamBody::new(stream)))
+                            .unwrap())
+                    }
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"export_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
+            }
+            ExportOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            ExportOutcome::Denied(_) => {
+                // Token verification FAILED (forged / expired / scope mismatch).
+                // Charge the strict invalid-token bucket: exhausted → 429 instead
+                // of 403. `handle_project_studio_export_url` already emitted the
+                // "denied" audit above.
+                if let Some(resp) = charge_invalid_signed_token(
+                    &db,
+                    &client_ip,
+                    user_agent.as_deref(),
+                    "/project-studio/exports",
+                ) {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"export_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
     // GET /models/manifest/<bundle_ref> — vision model-bundle manifest for
     // instance-to-instance distribution. Auth: signed query (?token=&exp=&ref=,
     // same shape as /recordings) OR `Authorization: Bearer <api-key>` with an

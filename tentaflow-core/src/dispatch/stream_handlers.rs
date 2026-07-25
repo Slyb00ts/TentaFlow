@@ -1694,6 +1694,104 @@ inventory::submit! {
 }
 
 // =============================================================================
+// ProjectStudioArchiveStream — live progress of a project export or import.
+// =============================================================================
+// The frontend subscribes via ApiBinary.subscribe('projectStudioArchiveStreamRequest',
+// { jobId }). Authorization is the job's OWNER, not a project role: an import
+// has no project yet (the row appears only once the content is in place), so a
+// project-scoped gate could not exist for the whole run. Polling
+// ProjectExportStatus / ProjectImportStatus stays the source of truth.
+
+fn project_studio_archive_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let MessageBody::ProjectStudioBody(ProjectStudioPayload::ArchiveStreamRequest { job_id }) = req
+    else {
+        let _ = push_end(&sub, None);
+        return;
+    };
+    let Some(org) = ctx.org_context.as_ref() else {
+        let _ = push_end(&sub, None);
+        return;
+    };
+    if !org.has("project_studio.read") {
+        let _ = push_end(&sub, None);
+        return;
+    }
+    // A bare job id must never expose progress to an unrelated user.
+    let owned = crate::project_studio::archive::job(&job_id)
+        .is_some_and(|job| job.owner_user_id == org.user_id);
+    if !owned {
+        let _ = push_end(&sub, None);
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match crate::deploy::log_bus::subscribe(&job_id) {
+            Some(rx) => rx,
+            None => {
+                // Channel closed — the job already finished; the frontend
+                // reconciles through the status request.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let chunk = ProjectStudioPayload::ArchiveStreamChunk {
+                        job_id: line.deploy_id,
+                        phase: line.phase,
+                        line: line.line,
+                        progress_pct: line.progress_pct,
+                        ts_ms: line.ts_ms,
+                    };
+                    if push_chunk(&sub, MessageBody::ProjectStudioBody(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    deploy_id,
+                    final_status,
+                    error_message,
+                    ..
+                }) => {
+                    let end = ProjectStudioPayload::ArchiveStreamEnd {
+                        job_id: deploy_id,
+                        status: final_status,
+                        error: if error_message.is_empty() {
+                            None
+                        } else {
+                            Some(error_message)
+                        },
+                    };
+                    let _ = push_end(&sub, Some(MessageBody::ProjectStudioBody(end)));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioArchiveStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_archive_stream_handler,
+    }
+}
+
+// =============================================================================
 // ProjectStudioChatStream — project chat turn over the system ps-chat flow.
 // =============================================================================
 // The frontend subscribes via ApiBinary.subscribe('projectStudioChatStreamRequest',

@@ -222,6 +222,13 @@ pub fn start_unified_server_with_permissions(
     // OAuth pending-state TTL purge: run once at startup, then hourly.
     crate::addon::oauth_cleanup::start_oauth_cleanup_task(db.clone());
     crate::scheduler::start(db.clone(), addon_manager.clone());
+    // Project Studio run schedules. Separate loop from the admin scheduler: it
+    // fires per-project runs out of `projects.db` hints, not addon actions.
+    crate::project_studio::schedules::start(
+        db.clone(),
+        settings_cipher.clone(),
+        local_node_id.clone(),
+    );
 
     info!("Inicjalizacja unified HTTPS server na {}...", bind_addr);
 

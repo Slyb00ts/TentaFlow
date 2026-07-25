@@ -361,14 +361,23 @@ pub fn create_run(
 
 /// Closes a run ('completed' or 'cancelled'). Only a running run closes.
 pub fn close_run(pool: &DbPool, run_id: &str, cancelled: bool, closed_by: &str) -> Result<bool> {
-    let conn = pool.write().map_err(write_err)?;
     let status = if cancelled { "cancelled" } else { "completed" };
-    let n = conn.execute(
-        "UPDATE test_runs SET status = ?1, closed_by = ?2, finished_at = datetime('now') \
-         WHERE run_id = ?3 AND status = 'running'",
-        params![status, closed_by, run_id],
-    )?;
-    Ok(n > 0)
+    // The write lock is released before `settle` runs: the writer is a plain
+    // (non-reentrant) mutex, so taking it twice on this thread would deadlock.
+    let closed = {
+        let conn = pool.write().map_err(write_err)?;
+        conn.execute(
+            "UPDATE test_runs SET status = ?1, closed_by = ?2, finished_at = datetime('now') \
+             WHERE run_id = ?3 AND status = 'running'",
+            params![status, closed_by, run_id],
+        )? > 0
+    };
+    if closed {
+        // A manual run started by a schedule would otherwise stay 'started'
+        // forever, keeping gate 1 closed on every following trigger.
+        super::schedules::settle(pool, run_id, status);
+    }
+    Ok(closed)
 }
 
 /// Deletes a non-running run with its items and steps.

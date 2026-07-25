@@ -13,14 +13,15 @@ use std::collections::{HashMap, HashSet};
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::project_studio::{
-    ActivityEntry, ArtifactRef, AttachmentWire, BuildProfileWire, CaseVersionInfo, ChatInfo,
-    ChatMessageWire, CreatorGrantInfo, CsvImportError, EnvApprovalItem, EnvironmentInfo,
-    GenerationRunInfo, IngestJobWire, KbHit, MemberInfo, MemberInputWire, MyWorkEntry,
+    ActivityEntry, ArchiveInventoryWire, ArtifactRef, AttachmentWire, BuildProfileWire,
+    CaseVersionInfo, ChatInfo, ChatMessageWire, CreatorGrantInfo, CsvImportError, EnvApprovalItem,
+    EnvironmentInfo, GenerationRunInfo, IngestJobWire, KbHit, MemberInfo, MemberInputWire,
+    MlLinkInfo, MlProjectSummaryWire, MlRoleMapEntry, MlSyncOutcomeWire, MyWorkEntry,
     NotificationWire, OverviewKpis, PerfStatsWire, PerfTimelinePoint, ProjectAgentBinding,
     ProjectInfo, ProjectSettings, ProjectStudioPayload, RunAssignmentWire, RunItemWire,
-    RunStepWire, RunnerInfo, RunnerToolchain, SourceFileInfo, SourceInfo, SuiteCaseRef, SuiteInfo,
-    TagInfo, TaskCommentWire, TaskDetail, TaskInfo, TestCaseDetail, TestCaseInfo,
-    TestRunItemAutoWire, TestRunInfo, UserRefWire,
+    RunStepWire, RunnerInfo, RunnerToolchain, ScheduleInfo, ScheduleRunWire, SourceFileInfo,
+    SourceInfo, SuiteCaseRef, SuiteInfo, TagInfo, TaskCommentWire, TaskDetail, TaskInfo,
+    TestCaseDetail, TestCaseInfo, TestRunItemAutoWire, TestRunInfo, UserRefWire,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -31,8 +32,9 @@ use crate::project_studio::models::{
     SourceListItem, TaskCommentRecord, TaskRecord,
 };
 use crate::project_studio::{
-    activity, api_spec, auto_runs, build_profiles, environments, generation, git_source, ingest,
-    notifications, project_db, reports, repository, runs, tasks, tests as ps_tests, zip_source,
+    activity, api_spec, archive, auto_runs, build_profiles, environments, generation, git_source,
+    ingest, ml_link, notifications, project_db, reports, repository, runs, schedules, tasks,
+    tests as ps_tests, zip_source,
 };
 use crate::services::rbac::OrgContext;
 use crate::services::vector::error::VectorError;
@@ -41,8 +43,7 @@ use tentaflow_sdk_spec::{FieldValue, Filter};
 const PERM_READ: &str = "project_studio.read";
 const PERM_ADMIN: &str = "project_studio.admin";
 
-const VALID_TEMPLATES: &[&str] = &["tests", "docs", "tests_docs", "custom"];
-const VALID_MODULES: &[&str] = &["knowledge", "tests", "docs", "chat", "tasks"];
+use crate::project_studio::{VALID_MODULES, VALID_TEMPLATES};
 /// Roles grantable through the wire (owner exists only via create/transfer).
 const GRANTABLE_ROLES: &[&str] = &["manager", "editor", "tester", "viewer"];
 /// Agent functions accepted in settings (F1 UI exposes only 'chat').
@@ -783,9 +784,8 @@ pub async fn project_studio_dispatch(
             suite_id,
             // Consumed by the F4 report kinds (perf_compare, tester_activity);
             // bound explicitly so a further field addition still fails to compile.
-            run_ids: _,
-            case_kind: _,
-        } => report_query_v1(ctx, project_id, report, from_date, to_date, suite_id),
+            run_ids,
+        } => report_query_v1(ctx, project_id, report, from_date, to_date, suite_id, run_ids),
         // ---- F3: environments, build profiles, automated runs, code sources ----
         P::EnvironmentsListRequest { project_id } => environments_list_v1(ctx, project_id),
         P::EnvironmentSaveRequest {
@@ -890,9 +890,162 @@ pub async fn project_studio_dispatch(
             artifact_id,
             max_bytes,
         } => run_artifact_get_v1(ctx, project_id, artifact_id, *max_bytes),
-        // F3 stream-initiating requests are served by dedicated stream handlers.
+        // ---- F4: schedules, ML Studio links, kanban, export/import ----
+        P::SchedulesListRequest { project_id } => schedules_list_v1(ctx, project_id),
+        P::ScheduleSaveRequest {
+            project_id,
+            schedule_id,
+            name,
+            run_type,
+            suite_id,
+            case_ids,
+            environment_id,
+            runner_service_id,
+            perf_profile_json,
+            assignment_mode,
+            assignees,
+            schedule_kind,
+            schedule_expr,
+            timezone,
+            enabled,
+        } => schedule_save_v1(
+            ctx,
+            project_id,
+            schedule_id.as_deref(),
+            &ScheduleWire {
+                name,
+                run_type,
+                suite_id,
+                case_ids,
+                environment_id,
+                runner_service_id,
+                perf_profile_json,
+                assignment_mode,
+                assignees,
+                schedule_kind,
+                schedule_expr,
+                timezone,
+                enabled: *enabled,
+            },
+        ),
+        P::ScheduleDeleteRequest {
+            project_id,
+            schedule_id,
+        } => schedule_delete_v1(ctx, project_id, schedule_id),
+        P::ScheduleSetEnabledRequest {
+            project_id,
+            schedule_id,
+            enabled,
+        } => schedule_set_enabled_v1(ctx, project_id, schedule_id, *enabled),
+        P::ScheduleRunNowRequest {
+            project_id,
+            schedule_id,
+        } => schedule_run_now_v1(ctx, project_id, schedule_id).await,
+        P::ScheduleRunsListRequest {
+            project_id,
+            schedule_id,
+            limit,
+        } => schedule_runs_list_v1(ctx, project_id, schedule_id, *limit),
+        P::MlLinksListRequest { project_id } => ml_links_list_v1(ctx, project_id),
+        P::MlProjectCreateFromProjectRequest {
+            project_id,
+            ml_name,
+            project_type,
+            role_map,
+            sync_permissions,
+            label,
+        } => ml_project_create_from_project_v1(
+            ctx,
+            project_id,
+            ml_name,
+            project_type,
+            role_map,
+            *sync_permissions,
+            label,
+        ),
+        P::MlProjectCandidatesRequest { project_id } => ml_project_candidates_v1(ctx, project_id),
+        P::MlLinkAttachRequest {
+            project_id,
+            ml_project_id,
+            label,
+            sync_permissions,
+            role_map,
+        } => ml_link_attach_v1(
+            ctx,
+            project_id,
+            ml_project_id,
+            label,
+            *sync_permissions,
+            role_map,
+        ),
+        P::MlLinkUpdateRequest {
+            project_id,
+            link_id,
+            label,
+            sync_permissions,
+            role_map,
+        } => ml_link_update_v1(ctx, project_id, link_id, label, *sync_permissions, role_map),
+        P::MlLinkDetachRequest {
+            project_id,
+            link_id,
+            revoke_members,
+        } => ml_link_detach_v1(ctx, project_id, link_id, *revoke_members),
+        P::MlLinkSyncNowRequest {
+            project_id,
+            link_id,
+        } => ml_link_sync_now_v1(ctx, project_id, link_id),
+        P::TaskStatusSetRequest {
+            project_id,
+            task_id,
+            status,
+        } => task_status_set_v1(ctx, project_id, task_id, status),
+        P::ProjectExportStartRequest {
+            project_id,
+            include_runs,
+            include_vectors,
+            include_user_names,
+        } => project_export_start_v1(
+            ctx,
+            project_id,
+            *include_runs,
+            *include_vectors,
+            *include_user_names,
+        ),
+        P::ProjectExportStatusRequest { project_id, job_id } => {
+            project_export_status_v1(ctx, project_id, job_id)
+        }
+        P::ProjectImportUploadChunkRequest {
+            upload_id,
+            filename,
+            seq,
+            total_chunks,
+            bytes,
+        } => project_import_upload_chunk_v1(
+            ctx,
+            upload_id,
+            filename,
+            *seq,
+            *total_chunks,
+            bytes,
+        ),
+        P::ProjectImportPreviewRequest { upload_id } => project_import_preview_v1(ctx, upload_id),
+        P::ProjectImportApplyRequest {
+            upload_id,
+            name_override,
+            import_vectors,
+            import_runs,
+        } => project_import_apply_v1(
+            ctx,
+            upload_id,
+            name_override,
+            *import_vectors,
+            *import_runs,
+        ),
+        P::ProjectImportStatusRequest { job_id } => project_import_status_v1(ctx, job_id),
+        // F3/F4 stream-initiating requests are served by dedicated stream handlers.
         P::TryRunStartRequest { .. }
         | P::RunAutoStreamRequest { .. }
+        | P::ArchiveStreamRequest { .. }
         | P::CodeAssistRequest { .. } => Err(ProtocolError::bad_request(
             "use streaming subscribe for this variant",
         )),
@@ -1000,14 +1153,30 @@ pub async fn project_studio_dispatch(
         | P::TryRunStreamChunk { .. }
         | P::TryRunStreamEnd { .. }
         | P::CodeAssistStreamChunk { .. }
-        | P::CodeAssistStreamEnd { .. } => Err(ProtocolError::bad_request(
+        | P::CodeAssistStreamEnd { .. }
+        | P::SchedulesListResponse { .. }
+        | P::ScheduleSaveResponse { .. }
+        | P::ScheduleDeleteResult { .. }
+        | P::ScheduleSetEnabledResult { .. }
+        | P::ScheduleRunNowResponse { .. }
+        | P::ScheduleRunsListResponse { .. }
+        | P::MlLinksListResponse { .. }
+        | P::MlProjectCreateFromProjectResponse { .. }
+        | P::MlProjectCandidatesResponse { .. }
+        | P::MlLinkAttachResponse { .. }
+        | P::MlLinkUpdateResult { .. }
+        | P::MlLinkDetachResult { .. }
+        | P::MlLinkSyncNowResponse { .. }
+        | P::TaskStatusSetResult { .. }
+        | P::ProjectExportStartResponse { .. }
+        | P::ProjectExportStatusResponse { .. }
+        | P::ProjectImportUploadChunkResponse { .. }
+        | P::ProjectImportPreviewResponse { .. }
+        | P::ProjectImportApplyResponse { .. }
+        | P::ProjectImportStatusResponse { .. }
+        | P::ArchiveStreamChunk { .. }
+        | P::ArchiveStreamEnd { .. } => Err(ProtocolError::bad_request(
             "variant is not a valid project studio request",
-        )),
-        // F4 wave 1 ships the wire contract and the schema only. The F4
-        // backend waves replace this arm with the real handler routing, at
-        // which point the match becomes exhaustive again.
-        _ => Err(ProtocolError::bad_request(
-            "project studio variant not handled yet",
         )),
     }
 }
@@ -1407,6 +1576,86 @@ register_project_studio_variant!(
     "ProjectStudioRunArtifactGetRequest",
     "tentaflow_ws_handler_ps_run_artifact_get"
 );
+register_project_studio_variant!(
+    "ProjectStudioSchedulesListRequest",
+    "tentaflow_ws_handler_ps_schedules_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioScheduleSaveRequest",
+    "tentaflow_ws_handler_ps_schedule_save"
+);
+register_project_studio_variant!(
+    "ProjectStudioScheduleDeleteRequest",
+    "tentaflow_ws_handler_ps_schedule_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioScheduleSetEnabledRequest",
+    "tentaflow_ws_handler_ps_schedule_set_enabled"
+);
+register_project_studio_variant!(
+    "ProjectStudioScheduleRunNowRequest",
+    "tentaflow_ws_handler_ps_schedule_run_now"
+);
+register_project_studio_variant!(
+    "ProjectStudioScheduleRunsListRequest",
+    "tentaflow_ws_handler_ps_schedule_runs_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioMlLinksListRequest",
+    "tentaflow_ws_handler_ps_ml_links_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioMlProjectCreateFromProjectRequest",
+    "tentaflow_ws_handler_ps_ml_project_create_from_project"
+);
+register_project_studio_variant!(
+    "ProjectStudioMlProjectCandidatesRequest",
+    "tentaflow_ws_handler_ps_ml_project_candidates"
+);
+register_project_studio_variant!(
+    "ProjectStudioMlLinkAttachRequest",
+    "tentaflow_ws_handler_ps_ml_link_attach"
+);
+register_project_studio_variant!(
+    "ProjectStudioMlLinkUpdateRequest",
+    "tentaflow_ws_handler_ps_ml_link_update"
+);
+register_project_studio_variant!(
+    "ProjectStudioMlLinkDetachRequest",
+    "tentaflow_ws_handler_ps_ml_link_detach"
+);
+register_project_studio_variant!(
+    "ProjectStudioMlLinkSyncNowRequest",
+    "tentaflow_ws_handler_ps_ml_link_sync_now"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskStatusSetRequest",
+    "tentaflow_ws_handler_ps_task_status_set"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectExportStartRequest",
+    "tentaflow_ws_handler_ps_project_export_start"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectExportStatusRequest",
+    "tentaflow_ws_handler_ps_project_export_status"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectImportUploadChunkRequest",
+    "tentaflow_ws_handler_ps_project_import_upload_chunk"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectImportPreviewRequest",
+    "tentaflow_ws_handler_ps_project_import_preview"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectImportApplyRequest",
+    "tentaflow_ws_handler_ps_project_import_apply"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectImportStatusRequest",
+    "tentaflow_ws_handler_ps_project_import_status"
+);
 
 // =============================================================================
 // Registry: list / create / get / update / archive / delete
@@ -1672,6 +1921,9 @@ async fn project_delete_v1(
     // 5. Central registry rows last — a crash above leaves the project
     //    visible (and the delete retryable) instead of orphaning data.
     repository::delete_project_rows(project_id).map_err(|e| db_error("project_delete", e))?;
+    // The schedule loop reads the hint table, not `projects` — a leftover row
+    // would keep pointing at a project that no longer exists.
+    schedules::delete_hint(project_id);
 
     activity::record_org_security(
         &ctx.state.db,
@@ -1829,6 +2081,7 @@ fn members_add_v1(
             project_id,
             &format!("{added} member(s)"),
         );
+        spawn_ml_permission_sync(project_id);
     }
     Ok(ps(ProjectStudioPayload::MembersAddResponse { added }))
 }
@@ -1889,6 +2142,7 @@ fn member_role_set_v1(
             project_id,
             &format!("{user_id} -> {}", new_role.slug()),
         );
+        spawn_ml_permission_sync(project_id);
     }
     Ok(ps(ProjectStudioPayload::MemberRoleSetResult { ok }))
 }
@@ -1938,6 +2192,8 @@ fn member_remove_v1(
             project_id,
             user_id,
         );
+        // Losing project membership revokes the mirrored ML access immediately.
+        spawn_ml_permission_sync(project_id);
     }
     Ok(ps(ProjectStudioPayload::MemberRemoveResult { ok }))
 }
@@ -1979,6 +2235,7 @@ fn ownership_transfer_v1(
         project_id,
         new_owner_user_id,
     );
+    spawn_ml_permission_sync(project_id);
     Ok(ps(ProjectStudioPayload::OwnershipTransferResult {
         ok: true,
     }))
@@ -2850,6 +3107,7 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
     let kpis = repository::project_kpis(&pool).map_err(|e| db_error("kpis", e))?;
     let f2 = repository::project_f2_kpis(&pool, &org.user_id).map_err(|e| db_error("kpis_f2", e))?;
     let f3 = repository::project_f3_kpis(&pool).map_err(|e| db_error("kpis_f3", e))?;
+    let f4 = schedules::project_f4_kpis(&pool).map_err(|e| db_error("kpis_f4", e))?;
     let member_count =
         repository::member_count(project_id).map_err(|e| db_error("member_count", e))?;
     let my_chat_count =
@@ -2878,11 +3136,9 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
             environments_approved: f3.environments_approved,
             environments_pending: f3.environments_pending,
             auto_runs_open: f3.auto_runs_open,
-            // Zero until the F4 backend wave adds the schedule/ML-link
-            // counters — the tables exist but nothing writes them yet.
-            schedules_enabled: 0,
-            schedules_blocked: 0,
-            ml_links: 0,
+            schedules_enabled: f4.schedules_enabled,
+            schedules_blocked: f4.schedules_blocked,
+            ml_links: f4.ml_links,
         },
         activity: activity_to_wire(entries, &names),
     }))
@@ -5716,6 +5972,7 @@ fn report_query_v1(
     from_date: &str,
     to_date: &str,
     suite_id: &str,
+    run_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
@@ -5725,11 +5982,11 @@ fn report_query_v1(
         )));
     }
     let pool = open_project_pool(project_id)?;
-    let mut rows_json = reports::run_report(&pool, report, from_date, to_date, suite_id)
+    let mut rows_json = reports::run_report(&pool, report, from_date, to_date, suite_id, run_ids)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    // tester_stats rows carry raw user ids — enrich with display names here
-    // (the core user directory is not reachable from the per-project SQL).
-    if report == "tester_stats" {
+    // These rows carry raw user ids — enrich with display names here (the core
+    // user directory is not reachable from the per-project SQL).
+    if report == "tester_stats" || report == "tester_activity" {
         if let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(&rows_json) {
             let ids: Vec<String> = rows
                 .iter()
@@ -5745,7 +6002,9 @@ fn report_query_v1(
                     .to_string();
                 row["display_name"] = serde_json::Value::String(display_name(&names, &user_id));
             }
-            rows_json = serde_json::Value::Array(rows).to_string();
+            // Display names are added AFTER the report clamped itself, so the
+            // bound is re-applied to the enriched payload.
+            rows_json = reports::bounded_rows_json(rows);
         }
     }
     Ok(ps(ProjectStudioPayload::ReportQueryResponse { rows_json }))
@@ -6720,63 +6979,8 @@ async fn recheck_environment_address(
     Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, reason))
 }
 
-/// Resolves the cases of an automated run from the XOR selector, preserving the
-/// requested order. Only approved, visible cases are runnable.
-fn resolve_auto_cases(
-    pool: &crate::db::DbPool,
-    suite_id: &str,
-    case_ids: &[String],
-    from_run_id: &str,
-) -> Result<Vec<auto_runs::AutoCase>, ProtocolError> {
-    let selectors = [!suite_id.is_empty(), !case_ids.is_empty(), !from_run_id.is_empty()];
-    if selectors.iter().filter(|s| **s).count() != 1 {
-        return Err(ProtocolError::bad_request(
-            "provide exactly one of suite_id / case_ids / from_run_id",
-        ));
-    }
-    let ids: Vec<String> = if !suite_id.is_empty() {
-        ps_tests::suite_case_rows(pool, suite_id)
-            .map_err(|e| db_error("suite_cases", e))?
-            .into_iter()
-            .map(|c| c.case_id)
-            .collect()
-    } else if !case_ids.is_empty() {
-        case_ids.to_vec()
-    } else {
-        runs::failed_case_ids(pool, from_run_id).map_err(|e| db_error("failed_cases", e))?
-    };
-    if ids.is_empty() {
-        return Err(ProtocolError::bad_request("the selection has no cases"));
-    }
-    if ids.len() > 200 {
-        return Err(ProtocolError::bad_request(
-            "an automated run accepts at most 200 cases",
-        ));
-    }
-    let mut out = Vec::with_capacity(ids.len());
-    for case_id in &ids {
-        let item = ps_tests::get_case(pool, case_id)
-            .map_err(|e| db_error("case_get", e))?
-            .ok_or_else(|| {
-                ProtocolError::bad_request(format!("case '{case_id}' is not available"))
-            })?;
-        if item.record.status != "approved" {
-            return Err(ProtocolError::bad_request(format!(
-                "case '{}' is not approved",
-                item.record.title
-            )));
-        }
-        out.push(auto_runs::AutoCase {
-            case_id: item.record.case_id,
-            case_title: item.record.title,
-            case_version: item.record.current_version,
-            kind: item.record.kind,
-            language: item.record.language,
-            content_json: item.record.content_json,
-        });
-    }
-    Ok(out)
-}
+/// Upper bound of cases in one automated run.
+const MAX_AUTO_RUN_CASES: usize = 200;
 
 #[allow(clippy::too_many_arguments)]
 async fn run_start_auto_v1(
@@ -6801,7 +7005,15 @@ async fn run_start_auto_v1(
 
     let environment = require_approved_environment(&pool, environment_id)?;
 
-    let cases = resolve_auto_cases(&pool, suite_id, case_ids, from_run_id)?;
+    let cases = auto_runs::resolve_cases(
+        &pool,
+        suite_id,
+        case_ids,
+        from_run_id,
+        MAX_AUTO_RUN_CASES,
+        true,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     // Manual cases carry no script — they stay in the run as skipped items so
     // a mixed suite still produces one complete report.
     let runnable_language = cases
@@ -6823,11 +7035,6 @@ async fn run_start_auto_v1(
         return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, reason));
     }
 
-    let advertised: HashSet<String> = runner
-        .health
-        .as_ref()
-        .map(|h| h.toolchains.iter().map(|t| t.language.to_ascii_lowercase()).collect())
-        .unwrap_or_default();
     let run_type = if cases
         .iter()
         .filter(|c| generation::is_code_kind(&c.kind))
@@ -6837,105 +7044,24 @@ async fn run_start_auto_v1(
     } else {
         "auto"
     };
-    let (run_id, run_no, item_ids) = auto_runs::create_auto_run(
+    let prepared = auto_runs::create_and_prepare_run(
         &pool,
         name,
         suite_id,
         run_type,
         environment_id,
         &cases,
-        &runner.service_id,
-        &runner.endpoint_url,
+        &runner,
         perf_profile_json,
         &org.user_id,
     )
-    .map_err(|e| db_error("create_auto_run", e))?;
-
-    let mut submit_items = Vec::with_capacity(cases.len());
-    let mut skipped = Vec::new();
-    let mut blocked = Vec::new();
-    for (case, item_id) in cases.iter().zip(item_ids.iter()) {
-        let executable = generation::is_code_kind(&case.kind)
-            && advertised.contains(&case.language.to_ascii_lowercase());
-        if !executable {
-            skipped.push((
-                item_id.clone(),
-                format!(
-                    "kind '{}' / language '{}' is not executable by this runner",
-                    case.kind, case.language
-                ),
-            ));
-            continue;
-        }
-        let content: serde_json::Value =
-            serde_json::from_str(&case.content_json).unwrap_or_else(|_| serde_json::json!({}));
-        // A unit case bound to a build profile needs the repository checked out
-        // and the profile's install/test commands run inside a per-run sandbox.
-        // The runner only understands an inline `build_profile` object with an
-        // absolute, mounted workdir, which Core cannot produce yet — submitting
-        // the reference anyway would silently degrade to plain pytest in an
-        // empty directory and report a green run that executed nothing.
-        if case.kind == "unit"
-            && content
-                .get("build_profile_ref")
-                .and_then(|v| v.as_str())
-                .is_some_and(|v| !v.trim().is_empty())
-        {
-            blocked.push((
-                item_id.clone(),
-                "running a build profile requires a per-run sandbox (planned) — the case \
-                 was not executed"
-                    .to_string(),
-            ));
-            continue;
-        }
-        // The perf profile of the run overrides the one stored on the case, so
-        // one script can be replayed under different loads. The MERGED content
-        // is what runs, so it is also what gets validated — validating the case
-        // alone would leave the override's users/spawn_rate/duration unbounded.
-        let mut content = content;
-        if case.kind == "perf" && !perf_profile_json.trim().is_empty() {
-            if let Ok(profile) = serde_json::from_str::<serde_json::Value>(perf_profile_json) {
-                if let Some(map) = content.as_object_mut() {
-                    map.insert("profile".to_string(), profile);
-                }
-            }
-            if let Err(message) =
-                generation::validate_case_content(&case.kind, &case.language, &content.to_string())
-            {
-                let _ = auto_runs::finish_run(&pool, &run_id, "error", &message);
-                return Err(ProtocolError::bad_request(message));
-            }
-        }
-        submit_items.push(auto_runs::SubmitItem {
-            item_id: item_id.clone(),
-            kind: case.kind.clone(),
-            language: case.language.clone(),
-            config: content
-                .get("config")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-            content,
-        });
-    }
-    if !skipped.is_empty() || !blocked.is_empty() {
-        if let Ok(conn) = pool.write() {
-            for (item_id, reason) in &skipped {
-                let _ = conn.execute(
-                    "UPDATE test_run_items SET status = 'skipped', result_note = ?1, \
-                        finished_at = datetime('now') WHERE item_id = ?2",
-                    rusqlite::params![reason, item_id],
-                );
-            }
-            for (item_id, reason) in &blocked {
-                let _ = conn.execute(
-                    "UPDATE test_run_items SET status = 'blocked', result_note = ?1, \
-                        finished_at = datetime('now') WHERE item_id = ?2",
-                    rusqlite::params![reason, item_id],
-                );
-            }
-        }
-    }
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let auto_runs::PreparedRun {
+        run_id,
+        run_no,
+        submit_items,
+        skipped,
+    } = prepared;
     if submit_items.is_empty() {
         let _ = auto_runs::finish_run(
             &pool,
@@ -6991,7 +7117,7 @@ async fn run_start_auto_v1(
             "environment_id": environment_id,
             "runner_service_id": runner.service_id,
             "items": cases.len(),
-            "skipped": skipped.len(),
+            "skipped": skipped,
         })
         .to_string(),
     );
@@ -7188,6 +7314,1376 @@ fn run_artifact_get_v1(
 
 /// Server clamp on an artifact download (32 MiB, per the protocol contract).
 const ARTIFACT_MAX_BYTES: u32 = 32 * 1024 * 1024;
+
+// =============================================================================
+// F4: run schedules (T13)
+// =============================================================================
+
+/// Wire-shaped schedule definition, grouped so the save handler stays inside
+/// the argument budget.
+struct ScheduleWire<'a> {
+    name: &'a str,
+    run_type: &'a str,
+    suite_id: &'a str,
+    case_ids: &'a [String],
+    environment_id: &'a str,
+    runner_service_id: &'a str,
+    perf_profile_json: &'a str,
+    assignment_mode: &'a str,
+    assignees: &'a [String],
+    schedule_kind: &'a str,
+    schedule_expr: &'a str,
+    timezone: &'a str,
+    enabled: bool,
+}
+
+fn schedule_to_wire(
+    record: &crate::project_studio::models::ScheduleRecord,
+    suite_names: &HashMap<String, String>,
+    environments: &HashMap<String, (String, String)>,
+    runners: &HashMap<String, String>,
+    names: &HashMap<String, (String, String)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ScheduleInfo {
+    let case_ids: Vec<String> =
+        serde_json::from_str(&record.case_ids_json).unwrap_or_default();
+    let assignees: Vec<String> =
+        serde_json::from_str(&record.assignees_json).unwrap_or_default();
+    let (environment_name, environment_status) = environments
+        .get(&record.environment_id)
+        .cloned()
+        .unwrap_or_default();
+    ScheduleInfo {
+        schedule_id: record.schedule_id.clone(),
+        name: record.name.clone(),
+        enabled: record.enabled,
+        auto_disabled: record.auto_disabled,
+        run_type: record.run_type.clone(),
+        suite_name: suite_names
+            .get(&record.suite_id)
+            .cloned()
+            .unwrap_or_default(),
+        suite_id: record.suite_id.clone(),
+        cases_count: case_ids.len() as u32,
+        case_ids,
+        environment_id: record.environment_id.clone(),
+        environment_name,
+        environment_status,
+        runner_display_name: runners
+            .get(&record.runner_service_id)
+            .cloned()
+            .unwrap_or_default(),
+        runner_service_id: record.runner_service_id.clone(),
+        perf_profile_json: record.perf_profile_json.clone(),
+        assignment_mode: record.assignment_mode.clone(),
+        assignees,
+        schedule_kind: record.schedule_kind.clone(),
+        schedule_expr: record.schedule_expr.clone(),
+        timezone: record.timezone.clone(),
+        next_run_at: record.next_run_at.clone().unwrap_or_default(),
+        // Computed SERVER-side from the same arithmetic the loop uses: a
+        // preview the UI derived itself would disagree around a DST switch.
+        next_runs_preview: if record.enabled && !record.auto_disabled {
+            schedules::next_runs_preview(
+                &record.schedule_kind,
+                &record.schedule_expr,
+                &record.timezone,
+                now,
+                3,
+            )
+        } else {
+            Vec::new()
+        },
+        last_trigger_at: record.last_trigger_at.clone(),
+        last_run_id: record.last_run_id.clone(),
+        last_run_no: 0,
+        last_status: record.last_status.clone(),
+        last_reason: record.last_reason.clone(),
+        consecutive_failures: record.consecutive_failures,
+        created_by_name: display_name(names, &record.created_by),
+        created_by: record.created_by.clone(),
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+    }
+}
+
+/// Environment id → (name, approval status), for the list decoration and the
+/// "blocked" highlight.
+fn environment_index(pool: &crate::db::DbPool) -> HashMap<String, (String, String)> {
+    environments::list(pool)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.environment_id, (e.name, e.approval_status)))
+        .collect()
+}
+
+fn schedules_list_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let records = schedules::list(&pool).map_err(|e| db_error("schedules_list", e))?;
+    let suite_ids: Vec<String> = records.iter().map(|r| r.suite_id.clone()).collect();
+    let suite_names =
+        ps_tests::suite_names(&pool, &suite_ids).map_err(|e| db_error("suite_names", e))?;
+    let environments = environment_index(&pool);
+    let creator_ids: Vec<String> = records.iter().map(|r| r.created_by.clone()).collect();
+    let names = repository::resolve_user_refs(&creator_ids);
+    let runners: HashMap<String, String> = auto_runs::list_runners(&ctx.state.db)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.service_id, r.display_name))
+        .collect();
+    let run_ids: Vec<String> = records.iter().map(|r| r.last_run_id.clone()).collect();
+    let run_numbers = schedules::run_numbers(&pool, &run_ids).unwrap_or_default();
+    let now = chrono::Utc::now();
+    let schedules_wire = records
+        .iter()
+        .map(|record| {
+            let mut wire =
+                schedule_to_wire(record, &suite_names, &environments, &runners, &names, now);
+            wire.last_run_no = run_numbers.get(&record.last_run_id).copied().unwrap_or(0);
+            wire
+        })
+        .collect();
+    Ok(ps(ProjectStudioPayload::SchedulesListResponse {
+        schedules: schedules_wire,
+        // The node's own zone: the UI renders "next run" next to it so a user in
+        // another zone reads the same instant the loop will use.
+        server_timezone: schedules::server_timezone(),
+    }))
+}
+
+/// Validates a wire definition and returns the storable input. Every rule that
+/// depends on CURRENT state (the environment approval, the case set) is checked
+/// here, at save time — a schedule saved against an unapproved environment
+/// would only fail hours later, in the middle of the night.
+fn validate_schedule(
+    pool: &crate::db::DbPool,
+    wire: &ScheduleWire<'_>,
+) -> Result<(String, String, String), ProtocolError> {
+    let name = wire.name.trim();
+    if name.is_empty() || name.chars().count() > 200 {
+        return Err(ProtocolError::bad_request("schedule name is required"));
+    }
+    if !schedules::RUN_TYPES.contains(&wire.run_type) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown run_type '{}'",
+            wire.run_type
+        )));
+    }
+    let selectors = [!wire.suite_id.is_empty(), !wire.case_ids.is_empty()];
+    if selectors.iter().filter(|s| **s).count() != 1 {
+        return Err(ProtocolError::bad_request(
+            "provide exactly one of suite_id / case_ids",
+        ));
+    }
+    if !wire.suite_id.is_empty()
+        && ps_tests::get_suite(pool, wire.suite_id)
+            .map_err(|e| db_error("suite_get", e))?
+            .is_none()
+    {
+        return Err(ProtocolError::not_found("suite not found"));
+    }
+    if wire.case_ids.len() > 200 {
+        return Err(ProtocolError::bad_request(
+            "a schedule accepts at most 200 cases",
+        ));
+    }
+    let automated = wire.run_type == "auto" || wire.run_type == "perf";
+    if automated {
+        if wire.environment_id.is_empty() {
+            return Err(ProtocolError::bad_request(
+                "an automated schedule requires an environment",
+            ));
+        }
+        // The approval must hold AT SAVE TIME; the loop re-checks it before
+        // every trigger and blocks the run if it was withdrawn since.
+        require_approved_environment(pool, wire.environment_id)?;
+    } else if !wire.environment_id.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "a manual schedule must not bind an environment",
+        ));
+    }
+
+    let assignment_mode = if automated {
+        // Automated runs are pool runs — `create_auto_run` writes 'pool'.
+        "pool".to_string()
+    } else {
+        let mode = if wire.assignment_mode.is_empty() {
+            "pool"
+        } else {
+            wire.assignment_mode
+        };
+        if !matches!(mode, "single" | "per_case" | "pool") {
+            return Err(ProtocolError::bad_request(format!(
+                "unknown assignment_mode '{mode}'"
+            )));
+        }
+        mode.to_string()
+    };
+    if !schedules::SCHEDULE_KINDS.contains(&wire.schedule_kind) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown schedule_kind '{}'",
+            wire.schedule_kind
+        )));
+    }
+    schedules::parse_timezone(wire.timezone)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let now = chrono::Utc::now();
+    let next = schedules::compute_next_run(
+        wire.schedule_kind,
+        wire.schedule_expr,
+        wire.timezone,
+        now,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if wire.schedule_kind == "once" && next.is_none() {
+        return Err(ProtocolError::bad_request(
+            "the one-shot instant is already in the past",
+        ));
+    }
+    let case_ids_json = serde_json::to_string(wire.case_ids).unwrap_or_else(|_| "[]".to_string());
+    let assignees_json = serde_json::to_string(wire.assignees).unwrap_or_else(|_| "[]".to_string());
+    Ok((assignment_mode, case_ids_json, assignees_json))
+}
+
+fn schedule_save_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    schedule_id: Option<&str>,
+    wire: &ScheduleWire<'_>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let (assignment_mode, case_ids_json, assignees_json) = validate_schedule(&pool, wire)?;
+
+    for user_id in wire.assignees {
+        if repository::effective_role(project_id, user_id)
+            .map_err(|e| db_error("member_role", e))?
+            .is_none()
+        {
+            return Err(ProtocolError::bad_request(format!(
+                "user '{user_id}' is not a project member"
+            )));
+        }
+    }
+
+    let now = chrono::Utc::now();
+    let next = if wire.enabled {
+        schedules::compute_next_run(wire.schedule_kind, wire.schedule_expr, wire.timezone, now)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?
+            .map(|dt| dt.to_rfc3339())
+    } else {
+        None
+    };
+    let perf_profile_json = if wire.perf_profile_json.trim().is_empty() {
+        "{}"
+    } else {
+        wire.perf_profile_json
+    };
+    let input = schedules::ScheduleInput {
+        name: wire.name.trim(),
+        run_type: wire.run_type,
+        suite_id: wire.suite_id,
+        case_ids_json: &case_ids_json,
+        environment_id: wire.environment_id,
+        runner_service_id: wire.runner_service_id,
+        perf_profile_json,
+        assignment_mode: &assignment_mode,
+        assignees_json: &assignees_json,
+        schedule_kind: wire.schedule_kind,
+        schedule_expr: wire.schedule_expr.trim(),
+        timezone: if wire.timezone.trim().is_empty() {
+            "UTC"
+        } else {
+            wire.timezone.trim()
+        },
+        enabled: wire.enabled,
+    };
+
+    let schedule_id = match schedule_id {
+        Some(id) => {
+            if schedules::get(&pool, id)
+                .map_err(|e| db_error("schedule_get", e))?
+                .is_none()
+            {
+                return Err(ProtocolError::not_found("schedule not found"));
+            }
+            schedules::update(&pool, id, &input, next.as_deref())
+                .map_err(|e| db_error("schedule_update", e))?;
+            id.to_string()
+        }
+        None => {
+            if schedules::count(&pool).map_err(|e| db_error("schedules_count", e))?
+                >= schedules::MAX_SCHEDULES_PER_PROJECT
+            {
+                return Err(ProtocolError::bad_request(format!(
+                    "a project holds at most {} schedules",
+                    schedules::MAX_SCHEDULES_PER_PROJECT
+                )));
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            schedules::insert(&pool, &id, &input, next.as_deref(), &org.user_id)
+                .map_err(|e| db_error("schedule_insert", e))?;
+            id
+        }
+    };
+    // The registry hint is what the loop reads; without this refresh the new
+    // schedule would not be selected until something else touched the project.
+    let _ = schedules::refresh_hint(project_id, &org.org_id);
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "schedule.saved",
+        "schedule",
+        &schedule_id,
+        &serde_json::json!({
+            "name": wire.name.trim(),
+            "kind": wire.schedule_kind,
+            "enabled": wire.enabled,
+        })
+        .to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::ScheduleSaveResponse {
+        schedule_id,
+        next_run_at: next.clone().unwrap_or_default(),
+        next_runs_preview: if wire.enabled {
+            schedules::next_runs_preview(
+                wire.schedule_kind,
+                wire.schedule_expr,
+                wire.timezone,
+                now,
+                3,
+            )
+        } else {
+            Vec::new()
+        },
+    }))
+}
+
+fn schedule_delete_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    schedule_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let ok = schedules::delete(&pool, schedule_id).map_err(|e| db_error("schedule_delete", e))?;
+    if ok {
+        let _ = schedules::refresh_hint(project_id, &org.org_id);
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "schedule.deleted",
+            "schedule",
+            schedule_id,
+            "{}",
+        );
+    }
+    Ok(ps(ProjectStudioPayload::ScheduleDeleteResult { ok }))
+}
+
+fn schedule_set_enabled_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    schedule_id: &str,
+    enabled: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let schedule = schedules::get(&pool, schedule_id)
+        .map_err(|e| db_error("schedule_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("schedule not found"))?;
+    let next = if enabled {
+        schedules::compute_next_run(
+            &schedule.schedule_kind,
+            &schedule.schedule_expr,
+            &schedule.timezone,
+            chrono::Utc::now(),
+        )
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?
+        .map(|dt| dt.to_rfc3339())
+    } else {
+        None
+    };
+    if enabled && next.is_none() {
+        return Err(ProtocolError::bad_request(
+            "this schedule has no future fire instant — edit it first",
+        ));
+    }
+    let ok = schedules::set_enabled(&pool, schedule_id, enabled, next.as_deref())
+        .map_err(|e| db_error("schedule_set_enabled", e))?;
+    if ok {
+        let _ = schedules::refresh_hint(project_id, &org.org_id);
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "schedule.toggled",
+            "schedule",
+            schedule_id,
+            &serde_json::json!({ "enabled": enabled }).to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::ScheduleSetEnabledResult {
+        ok,
+        next_run_at: next.unwrap_or_default(),
+        auto_disabled: false,
+    }))
+}
+
+async fn schedule_run_now_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    schedule_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let schedule = schedules::get(&pool, schedule_id)
+        .map_err(|e| db_error("schedule_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("schedule not found"))?;
+    let trigger_ctx = schedules::TriggerCtx {
+        core_db: ctx.state.db.clone(),
+        settings_cipher: ctx.state.settings_cipher.clone(),
+        node_id: ctx.state.local_node_id.clone(),
+    };
+    // Same gate chain as the loop; `next_run_at` is deliberately NOT advanced —
+    // a manual trigger is extra, not a replacement for the scheduled one.
+    let outcome = schedules::trigger_once(
+        &trigger_ctx,
+        &record,
+        &pool,
+        &schedule,
+        &chrono::Utc::now().to_rfc3339(),
+        &org.user_id,
+    )
+    .await;
+    Ok(ps(ProjectStudioPayload::ScheduleRunNowResponse {
+        outcome: outcome.outcome,
+        reason: outcome.reason,
+        run_id: outcome.run_id,
+        run_no: outcome.run_no,
+    }))
+}
+
+fn schedule_runs_list_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    schedule_id: &str,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let limit = if limit == 0 { 50 } else { limit.clamp(1, 200) };
+    let records = schedules::list_triggers(&pool, schedule_id, limit)
+        .map_err(|e| db_error("schedule_runs", e))?;
+    let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
+    let run_numbers = schedules::run_numbers(&pool, &run_ids).unwrap_or_default();
+    let actor_ids: Vec<String> = records.iter().map(|r| r.actor.clone()).collect();
+    let names = repository::resolve_user_refs(&actor_ids);
+    let runs = records
+        .into_iter()
+        .map(|r| ScheduleRunWire {
+            trigger_id: r.trigger_id,
+            scheduled_for: r.scheduled_for,
+            fired_at: r.fired_at,
+            outcome: r.outcome,
+            reason: r.reason,
+            run_no: run_numbers.get(&r.run_id).copied().unwrap_or(0),
+            run_id: r.run_id,
+            run_status: r.run_status,
+            actor_name: if r.actor.is_empty() {
+                String::new()
+            } else {
+                display_name(&names, &r.actor)
+            },
+            actor: r.actor,
+        })
+        .collect();
+    Ok(ps(ProjectStudioPayload::ScheduleRunsListResponse { runs }))
+}
+
+// =============================================================================
+// F4: ML Studio links (X02)
+// =============================================================================
+
+fn ml_summary_to_wire(
+    summary: crate::project_studio::ml_link::MlProjectSummary,
+) -> MlProjectSummaryWire {
+    MlProjectSummaryWire {
+        deep_link: format!("/ml-studio/projects/{}", summary.ml_project_id),
+        ml_project_id: summary.ml_project_id,
+        name: summary.name,
+        project_type: summary.project_type,
+        project_type_label: summary.project_type_label,
+        status: summary.status,
+        dataset_count: summary.dataset_count,
+        model_count: summary.model_count,
+        models: summary.models,
+        last_training_run_id: summary.last_training_run_id,
+        last_training_status: summary.last_training_status,
+        last_training_started_at: summary.last_training_started_at,
+        last_training_finished_at: summary.last_training_finished_at,
+        last_training_metrics_json: summary.last_training_metrics_json,
+        training_in_progress: summary.training_in_progress,
+    }
+}
+
+fn role_map_to_wire(map: &[(String, String)]) -> Vec<MlRoleMapEntry> {
+    map.iter()
+        .map(|(project_role, ml_role)| MlRoleMapEntry {
+            project_role: project_role.clone(),
+            ml_role: ml_role.clone(),
+        })
+        .collect()
+}
+
+fn role_map_from_wire(entries: &[MlRoleMapEntry]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .map(|e| (e.project_role.clone(), e.ml_role.clone()))
+        .collect()
+}
+
+fn ml_links_list_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let pool = open_project_pool(project_id)?;
+    let records = ml_link::list(&pool).map_err(|e| db_error("ml_links_list", e))?;
+    let creator_ids: Vec<String> = records.iter().map(|r| r.created_by.clone()).collect();
+    let names = repository::resolve_user_refs(&creator_ids);
+    let links = records
+        .into_iter()
+        .map(|record| {
+            let summary = ml_link::summary(&record.ml_project_id)
+                .ok()
+                .flatten()
+                .map(ml_summary_to_wire);
+            MlLinkInfo {
+                link_id: record.link_id,
+                // The deep link is only useful to someone ML Studio will let in.
+                can_open: ml_link::ml_member_role(&record.ml_project_id, &org.user_id).is_some(),
+                ml_project_id: record.ml_project_id,
+                label: record.label,
+                origin: record.origin,
+                sync_permissions: record.sync_permissions,
+                role_map: role_map_to_wire(&ml_link::role_map_from_json(&record.role_map_json)),
+                last_sync_at: record.last_sync_at,
+                last_sync_result: record.last_sync_result,
+                created_by_name: display_name(&names, &record.created_by),
+                created_by: record.created_by,
+                created_at: record.created_at,
+                summary,
+            }
+        })
+        .collect();
+    Ok(ps(ProjectStudioPayload::MlLinksListResponse {
+        links,
+        can_manage: matches!(role, Some(r) if r >= ProjectRole::Manager),
+    }))
+}
+
+fn ml_project_create_from_project_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    ml_name: &str,
+    project_type: &str,
+    role_map: &[MlRoleMapEntry],
+    sync_permissions: bool,
+    label: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let map = if role_map.is_empty() {
+        ml_link::default_role_map()
+    } else {
+        role_map_from_wire(role_map)
+    };
+    let (link_id, ml_project_id, members_mapped, members_skipped) = ml_link::create_from_project(
+        &pool,
+        project_id,
+        &org.org_id,
+        &org.user_id,
+        ml_name.trim(),
+        project_type,
+        label.trim(),
+        sync_permissions,
+        &map,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "ml_link.created",
+        "ml_link",
+        &link_id,
+        &serde_json::json!({
+            "ml_project_id": ml_project_id,
+            "members_mapped": members_mapped,
+        })
+        .to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::MlProjectCreateFromProjectResponse {
+        link_id,
+        ml_project_id,
+        members_mapped,
+        members_skipped,
+    }))
+}
+
+fn ml_project_candidates_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let pool = open_project_pool(project_id)?;
+    let candidates = ml_link::owned_candidates(&pool, &org.user_id)
+        .map_err(|e| db_error("ml_candidates", e))?
+        .into_iter()
+        .map(ml_summary_to_wire)
+        .collect();
+    Ok(ps(ProjectStudioPayload::MlProjectCandidatesResponse {
+        candidates,
+    }))
+}
+
+fn ml_link_attach_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    ml_project_id: &str,
+    label: &str,
+    sync_permissions: bool,
+    role_map: &[MlRoleMapEntry],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    // Attaching requires OWNERSHIP of the ML project: every membership write the
+    // sync performs goes through owner-only repository calls, so a link created
+    // by a non-owner could never apply anything.
+    if ml_link::ml_member_role(ml_project_id, &org.user_id).as_deref() != Some("owner") {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "only the owner of the ML project may link it",
+        ));
+    }
+    let map = if role_map.is_empty() {
+        ml_link::default_role_map()
+    } else {
+        role_map_from_wire(role_map)
+    };
+    ml_link::validate_role_map(&map).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let pool = open_project_pool(project_id)?;
+    if ml_link::count(&pool).map_err(|e| db_error("ml_links_count", e))?
+        >= ml_link::MAX_LINKS_PER_PROJECT
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "a project holds at most {} ML Studio links",
+            ml_link::MAX_LINKS_PER_PROJECT
+        )));
+    }
+    let link_id = uuid::Uuid::new_v4().to_string();
+    ml_link::insert(
+        &pool,
+        &link_id,
+        ml_project_id,
+        label.trim(),
+        "linked_existing",
+        sync_permissions,
+        &ml_link::role_map_to_json(&map),
+        &org.user_id,
+    )
+    .map_err(|e| map_unique("ml_link_attach", "this ML project is already linked", e))?;
+
+    if sync_permissions {
+        let project = project_id.to_string();
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || ml_link::sync_project_memberships(project)).await
+        });
+    }
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "ml_link.attached",
+        "ml_link",
+        &link_id,
+        &serde_json::json!({ "ml_project_id": ml_project_id }).to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::MlLinkAttachResponse { link_id }))
+}
+
+fn ml_link_update_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    link_id: &str,
+    label: &str,
+    sync_permissions: bool,
+    role_map: &[MlRoleMapEntry],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    if ml_link::get(&pool, link_id)
+        .map_err(|e| db_error("ml_link_get", e))?
+        .is_none()
+    {
+        return Err(ProtocolError::not_found("link not found"));
+    }
+    let map = if role_map.is_empty() {
+        ml_link::default_role_map()
+    } else {
+        role_map_from_wire(role_map)
+    };
+    ml_link::validate_role_map(&map).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let ok = ml_link::update(
+        &pool,
+        link_id,
+        label.trim(),
+        sync_permissions,
+        &ml_link::role_map_to_json(&map),
+    )
+    .map_err(|e| db_error("ml_link_update", e))?;
+    if ok && sync_permissions {
+        let project = project_id.to_string();
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || ml_link::sync_project_memberships(project)).await
+        });
+    }
+    Ok(ps(ProjectStudioPayload::MlLinkUpdateResult { ok }))
+}
+
+fn ml_link_detach_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    link_id: &str,
+    revoke_members: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let link = ml_link::get(&pool, link_id)
+        .map_err(|e| db_error("ml_link_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("link not found"))?;
+    let members_removed = ml_link::detach(&pool, &link, revoke_members)
+        .map_err(|e| db_error("ml_link_detach", e))?;
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "ml_link.detached",
+        "ml_link",
+        link_id,
+        &serde_json::json!({
+            "ml_project_id": link.ml_project_id,
+            "members_removed": members_removed,
+        })
+        .to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::MlLinkDetachResult {
+        ok: true,
+        members_removed,
+    }))
+}
+
+fn ml_link_sync_now_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    link_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let link = ml_link::get(&pool, link_id)
+        .map_err(|e| db_error("ml_link_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("link not found"))?;
+    let outcome = ml_link::sync_link(project_id, &pool, &link);
+    let refreshed = ml_link::get(&pool, link_id)
+        .map_err(|e| db_error("ml_link_get", e))?
+        .unwrap_or(link);
+    Ok(ps(ProjectStudioPayload::MlLinkSyncNowResponse {
+        outcome: MlSyncOutcomeWire {
+            applied_add: outcome.applied_add,
+            applied_update: outcome.applied_update,
+            applied_remove: outcome.applied_remove,
+            skipped: outcome.skipped,
+            errors: outcome.errors,
+        },
+        last_sync_at: refreshed.last_sync_at,
+        last_sync_result: refreshed.last_sync_result,
+    }))
+}
+
+/// Fires the one-way project → ML Studio permission sync after a membership
+/// mutation. Spawned and never awaited: an ML Studio failure must not roll back
+/// (or even delay) the membership change that already succeeded.
+fn spawn_ml_permission_sync(project_id: &str) {
+    let project = project_id.to_string();
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || ml_link::sync_project_memberships(project))
+            .await;
+    });
+}
+
+// =============================================================================
+// F4: kanban board (Z01)
+// =============================================================================
+
+fn task_status_set_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+    status: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    require_active(&record)?;
+    let role = role.expect("tester gate never yields admin override");
+    if !tasks::TASK_STATUSES.contains(&status) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown status '{status}'"
+        )));
+    }
+    let pool = open_project_pool(project_id)?;
+    let existing = tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    // Same rule as TaskSave: the author, the assignee, or any editor+.
+    let allowed = existing.created_by == org.user_id
+        || existing.assigned_to == org.user_id
+        || role >= ProjectRole::Editor;
+    if !allowed {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "only the author, the assignee or an editor may move this task",
+        ));
+    }
+    // Status-only write: TaskInfo (what the board renders) carries neither
+    // `description_md` nor `attachments`, so routing a card move through
+    // TaskSave would write both back empty.
+    let updated_at = tasks::set_task_status(&pool, task_id, status)
+        .map_err(|e| db_error("task_status_set", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    activity::record(
+        &pool,
+        &org.user_id,
+        "user",
+        "task.status_changed",
+        "task",
+        task_id,
+        &serde_json::json!({ "status": status }).to_string(),
+    );
+    Ok(ps(ProjectStudioPayload::TaskStatusSetResult {
+        ok: true,
+        updated_at,
+    }))
+}
+
+
+// =============================================================================
+// F4: project export / import
+// =============================================================================
+
+/// Signed-URL lifetime for a finished archive. Matches the retention window so
+/// a link never outlives the file it points at.
+const PS_EXPORT_URL_TTL_SECS: u64 = 7 * 24 * 3600;
+
+// Upload staging caps for a streamed-to-disk import archive. No chunk bytes are
+// ever held in RAM — each one is appended straight to the staging file.
+const MAX_PS_UPLOAD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_PS_UPLOAD_CHUNKS: u32 = 200_000;
+const PS_UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+const PS_CONSUMED_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const MAX_PS_UPLOADS_PER_USER: usize = 2;
+
+/// One in-flight (or recently consumed) import upload. Holds NO payload bytes.
+struct PsArchiveUpload {
+    owner_user_id: String,
+    path: std::path::PathBuf,
+    total_chunks: u32,
+    next_seq: u32,
+    received_bytes: u64,
+    last_chunk_len: usize,
+    consumed: bool,
+    last_touch: std::time::Instant,
+}
+
+fn ps_uploads() -> &'static std::sync::Mutex<HashMap<String, PsArchiveUpload>> {
+    static UPLOADS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PsArchiveUpload>>> =
+        std::sync::OnceLock::new();
+    UPLOADS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+// job_id → export_ref, so the status handler can mint the signed URL for a
+// finished export (the job record carries progress, not the archive path).
+fn ps_export_refs() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static REFS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    REFS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Drops refs whose archive is gone — reaped by retention, deleted by hand, or
+/// never produced because the export failed. The map is in-memory and lives as
+/// long as the process, so without this it only ever grows.
+fn prune_export_refs() {
+    if let Ok(mut refs) = ps_export_refs().lock() {
+        refs.retain(|_, export_ref| {
+            crate::api::project_studio_export::export_archive_path(export_ref).is_file()
+        });
+    }
+}
+
+fn append_upload_chunk(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProtocolError> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| ProtocolError::internal(format!("open staging file: {e}")))?;
+    f.write_all(bytes)
+        .map_err(|e| ProtocolError::internal(format!("append chunk: {e}")))?;
+    Ok(())
+}
+
+/// Evicts stale uploads (deleting their temp files) and sweeps the staging dir
+/// for files orphaned by a restart — the map is in-memory only.
+fn reap_ps_uploads(map: &mut HashMap<String, PsArchiveUpload>) {
+    let now = std::time::Instant::now();
+    let stale: Vec<String> = map
+        .iter()
+        .filter(|(_, e)| {
+            let ttl = if e.consumed {
+                PS_CONSUMED_TTL
+            } else {
+                PS_UPLOAD_TTL
+            };
+            now.duration_since(e.last_touch) >= ttl
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in stale {
+        if let Some(entry) = map.remove(&id) {
+            let _ = std::fs::remove_file(&entry.path);
+        }
+    }
+    let referenced: HashSet<std::path::PathBuf> = map.values().map(|e| e.path.clone()).collect();
+    if let Ok(entries) = std::fs::read_dir(crate::paths::project_studio_import_staging_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ours = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("psimp_"))
+                .unwrap_or(false);
+            if ours && !referenced.contains(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+fn inventory_to_wire(inventory: &archive::Inventory) -> ArchiveInventoryWire {
+    ArchiveInventoryWire {
+        cases: inventory.cases,
+        suites: inventory.suites,
+        runs: inventory.runs,
+        tasks: inventory.tasks,
+        documents: inventory.documents,
+        sources: inventory.sources,
+        files: inventory.files,
+        bytes_files: inventory.bytes_files,
+        bytes_runs: inventory.bytes_runs,
+        vectors: inventory.vectors,
+        vector_dim: inventory.vector_dim,
+        embedding_alias: inventory.embedding_alias.clone(),
+        embedding_model: inventory.embedding_model.clone(),
+    }
+}
+
+fn project_export_start_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    include_runs: bool,
+    include_vectors: bool,
+    include_user_names: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    // An ARCHIVED project may still be exported — that is often exactly why it
+    // was archived — so `require_active` deliberately does not apply here.
+    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    archive::reap_export_archives();
+    prune_export_refs();
+
+    let export_ref = format!("psexp_{}", uuid::Uuid::new_v4());
+    let dest = crate::api::project_studio_export::export_archive_path(&export_ref);
+    let job_id = archive::spawn_export(archive::ExportTask {
+        core_db: ctx.state.db.clone(),
+        org_id: org.org_id.clone(),
+        user_id: org.user_id.clone(),
+        node_id: ctx.state.local_node_id.to_string(),
+        project_id: project_id.to_string(),
+        dir_path: std::path::PathBuf::from(&record.dir_path),
+        project: archive::ProjectMeta {
+            project_id: project_id.to_string(),
+            name: record.name.clone(),
+            description: record.description.clone(),
+            template: record.template.clone(),
+            modules: parse_modules_json(&record.modules_json),
+            owner_user_id: record.owner_user_id.clone(),
+            org_id: record.org_id.clone(),
+        },
+        options: archive::ExportOptions {
+            include_runs,
+            include_vectors,
+            include_user_names,
+        },
+        export_ref: export_ref.clone(),
+        dest_zip: dest,
+    })
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    ps_export_refs()
+        .lock()
+        .map_err(|_| ProtocolError::internal("export ref registry poisoned"))?
+        .insert(job_id.clone(), export_ref);
+
+    if include_user_names {
+        // Display names are personal data; who asked for them and when is worth
+        // an audit row of its own.
+        activity::record_org_security(
+            &ctx.state.db,
+            &ctx.state.local_node_id,
+            &org.user_id,
+            "project_studio.project.exported_with_user_names",
+            project_id,
+            &record.name,
+        );
+    }
+    if let Ok(pool) = project_db::open(project_id) {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "project.export_started",
+            "project",
+            project_id,
+            &serde_json::json!({
+                "include_runs": include_runs,
+                "include_vectors": include_vectors,
+                "include_user_names": include_user_names,
+            })
+            .to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::ProjectExportStartResponse { job_id }))
+}
+
+fn project_export_status_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    job_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    // Authorize on the job's stored owner — never on the bare job id.
+    let job = archive::job(job_id)
+        .filter(|j| j.owner_user_id == org.user_id && j.project_id == project_id)
+        .ok_or_else(|| ProtocolError::not_found("export job not found"))?;
+
+    let mut signed_url = String::new();
+    let mut export_ref = String::new();
+    if job.status == "success" {
+        if let Some(ref_id) = ps_export_refs()
+            .lock()
+            .ok()
+            .and_then(|map| map.get(job_id).cloned())
+        {
+            if crate::api::project_studio_export::export_archive_path(&ref_id).is_file() {
+                let issuer = crate::services::project_studio_export_url_issuer();
+                match issuer.issue(ref_id.clone(), PS_EXPORT_URL_TTL_SECS) {
+                    Ok(signed) => {
+                        signed_url = format!(
+                            "/project-studio/exports/{}?{}",
+                            ref_id,
+                            signed.query_string()
+                        );
+                    }
+                    Err(e) => tracing::warn!("project studio export signed url failed: {e}"),
+                }
+                export_ref = ref_id;
+            }
+        }
+    } else if job.status == "failed" {
+        // No archive will ever exist for this job.
+        if let Ok(mut refs) = ps_export_refs().lock() {
+            refs.remove(job_id);
+        }
+    }
+    Ok(ps(ProjectStudioPayload::ProjectExportStatusResponse {
+        job_id: job_id.to_string(),
+        status: job.status,
+        progress_pct: job.progress_pct,
+        phase: job.phase,
+        error: job.error,
+        export_ref,
+        signed_url,
+        archive_bytes: job.archive_bytes,
+        inventory: job.inventory.as_ref().map(inventory_to_wire),
+    }))
+}
+
+/// Importing creates a NEW project, so it needs the creator grant — exactly like
+/// the create wizard. Membership in the archived project means nothing here: it
+/// came from another node.
+fn require_import_grant(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+    let org = require_read(ctx)?;
+    let can_create = is_admin(org)
+        || repository::has_creator_grant(&org.user_id, &org.org_id)
+            .map_err(|e| db_error("creator_grant", e))?;
+    if !can_create {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "importing a project requires a creator grant",
+        ));
+    }
+    Ok(org)
+}
+
+fn project_import_upload_chunk_v1(
+    ctx: &HandlerContext,
+    upload_id: &str,
+    _filename: &str,
+    seq: u32,
+    total_chunks: u32,
+    bytes: &[u8],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_import_grant(ctx)?;
+    if upload_id.trim().is_empty() || upload_id.len() > 128 {
+        return Err(ProtocolError::bad_request("invalid upload_id"));
+    }
+    if total_chunks == 0 || total_chunks > MAX_PS_UPLOAD_CHUNKS {
+        return Err(ProtocolError::bad_request("invalid total_chunks"));
+    }
+    if seq >= total_chunks {
+        return Err(ProtocolError::bad_request("chunk seq out of range"));
+    }
+
+    let mut map = ps_uploads()
+        .lock()
+        .map_err(|_| ProtocolError::internal("upload registry poisoned"))?;
+    reap_ps_uploads(&mut map);
+    let chunk_len = bytes.len();
+    let complete = match map.get_mut(upload_id) {
+        Some(entry) => {
+            // A foreign-owned id must look exactly like an unknown one.
+            if entry.owner_user_id != org.user_id {
+                return Err(ProtocolError::not_found("upload not found"));
+            }
+            if entry.consumed {
+                return Err(ProtocolError::bad_request("upload already consumed"));
+            }
+            if entry.total_chunks != total_chunks {
+                return Err(ProtocolError::bad_request("total_chunks mismatch"));
+            }
+            if seq == entry.next_seq {
+                if entry.received_bytes + chunk_len as u64 > MAX_PS_UPLOAD_BYTES {
+                    return Err(ProtocolError::bad_request("upload exceeds size limit"));
+                }
+                append_upload_chunk(&entry.path, bytes)?;
+                entry.next_seq += 1;
+                entry.received_bytes += chunk_len as u64;
+                entry.last_chunk_len = chunk_len;
+                entry.last_touch = std::time::Instant::now();
+            } else if entry.next_seq > 0 && seq == entry.next_seq - 1 {
+                // Idempotent re-send of the previous chunk: length-checked,
+                // never appended a second time.
+                if chunk_len != entry.last_chunk_len {
+                    return Err(ProtocolError::bad_request("resend length mismatch"));
+                }
+                entry.last_touch = std::time::Instant::now();
+            } else {
+                return Err(ProtocolError::bad_request("out-of-order chunk (hole)"));
+            }
+            entry.next_seq == entry.total_chunks
+        }
+        None => {
+            if seq != 0 {
+                return Err(ProtocolError::not_found("upload not found"));
+            }
+            let live = map
+                .values()
+                .filter(|e| e.owner_user_id == org.user_id && !e.consumed)
+                .count();
+            if live >= MAX_PS_UPLOADS_PER_USER {
+                return Err(ProtocolError::bad_request(
+                    "too many concurrent import uploads — finish or cancel one first",
+                ));
+            }
+            if chunk_len as u64 > MAX_PS_UPLOAD_BYTES {
+                return Err(ProtocolError::bad_request("upload exceeds size limit"));
+            }
+            let staging = crate::paths::project_studio_import_staging_dir();
+            std::fs::create_dir_all(&staging)
+                .map_err(|e| ProtocolError::internal(format!("staging dir: {e}")))?;
+            // The on-disk name is always server-generated: a client filename
+            // never reaches the filesystem.
+            let path = staging.join(format!("psimp_{}", uuid::Uuid::new_v4()));
+            std::fs::File::create(&path)
+                .map_err(|e| ProtocolError::internal(format!("create staging file: {e}")))?;
+            append_upload_chunk(&path, bytes)?;
+            let entry = PsArchiveUpload {
+                owner_user_id: org.user_id.clone(),
+                path,
+                total_chunks,
+                next_seq: 1,
+                received_bytes: chunk_len as u64,
+                last_chunk_len: chunk_len,
+                consumed: false,
+                last_touch: std::time::Instant::now(),
+            };
+            let complete = entry.next_seq == entry.total_chunks;
+            map.insert(upload_id.to_string(), entry);
+            complete
+        }
+    };
+    Ok(ps(ProjectStudioPayload::ProjectImportUploadChunkResponse {
+        complete,
+    }))
+}
+
+/// Path of an uploaded archive owned by the caller.
+fn staged_archive_path(
+    org: &OrgContext,
+    upload_id: &str,
+    require_unconsumed: bool,
+) -> Result<std::path::PathBuf, ProtocolError> {
+    let map = ps_uploads()
+        .lock()
+        .map_err(|_| ProtocolError::internal("upload registry poisoned"))?;
+    match map.get(upload_id) {
+        Some(entry) if entry.owner_user_id == org.user_id => {
+            if require_unconsumed && entry.consumed {
+                return Err(ProtocolError::bad_request("upload already consumed"));
+            }
+            Ok(entry.path.clone())
+        }
+        _ => Err(ProtocolError::not_found("upload not found")),
+    }
+}
+
+fn project_import_preview_v1(
+    ctx: &HandlerContext,
+    upload_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_import_grant(ctx)?;
+    let path = staged_archive_path(org, upload_id, false)?;
+    // Reads the manifest ONLY: nothing is unpacked before the user confirms,
+    // and an archive from a newer schema is refused right here.
+    let manifest = archive::read_manifest(&path)
+        .map_err(|e| ProtocolError::bad_request(format!("nie mozna odczytac archiwum: {e:#}")))?;
+    let (vectors_reusable, vectors_reason) =
+        archive::vectors_reusable(&ctx.state.db, &org.org_id, &manifest);
+    Ok(ps(ProjectStudioPayload::ProjectImportPreviewResponse {
+        archive_version: manifest.version,
+        exported_at: manifest.exported_at,
+        source_node_id: manifest.source_node_id,
+        project_name: manifest.project.name,
+        template: manifest.project.template,
+        modules: manifest.project.modules,
+        total_uncompressed_bytes: manifest.files.iter().map(|f| f.size).sum(),
+        has_runs: manifest.options.include_runs && manifest.inventory.runs > 0,
+        inventory: inventory_to_wire(&manifest.inventory),
+        vectors_reusable,
+        vectors_reason,
+    }))
+}
+
+fn project_import_apply_v1(
+    ctx: &HandlerContext,
+    upload_id: &str,
+    name_override: &str,
+    import_vectors: bool,
+    import_runs: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_import_grant(ctx)?;
+    let path = staged_archive_path(org, upload_id, true)?;
+    let manifest = archive::read_manifest(&path)
+        .map_err(|e| ProtocolError::bad_request(format!("nie mozna odczytac archiwum: {e:#}")))?;
+    let job_id = archive::spawn_import(archive::ImportTask {
+        core_db: ctx.state.db.clone(),
+        router: ctx.state.router.clone(),
+        // The org is the caller's session org — NEVER the one in the archive.
+        org_id: org.org_id.clone(),
+        user_id: org.user_id.clone(),
+        archive_path: path,
+        manifest,
+        name_override: name_override.trim().to_string(),
+        import_vectors,
+        import_runs,
+    })
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    // Consumed: the file survives for the running import, can no longer be
+    // reused, and is reaped after the consumed TTL.
+    if let Ok(mut map) = ps_uploads().lock() {
+        if let Some(entry) = map.get_mut(upload_id) {
+            entry.consumed = true;
+            entry.last_touch = std::time::Instant::now();
+        }
+    }
+    activity::record_org_security(
+        &ctx.state.db,
+        &ctx.state.local_node_id,
+        &org.user_id,
+        "project_studio.project.import_started",
+        &job_id,
+        upload_id,
+    );
+    Ok(ps(ProjectStudioPayload::ProjectImportApplyResponse { job_id }))
+}
+
+fn project_import_status_v1(
+    ctx: &HandlerContext,
+    job_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let job = archive::job(job_id)
+        .filter(|j| j.owner_user_id == org.user_id)
+        .ok_or_else(|| ProtocolError::not_found("import job not found"))?;
+    Ok(ps(ProjectStudioPayload::ProjectImportStatusResponse {
+        job_id: job_id.to_string(),
+        status: job.status,
+        progress_pct: job.progress_pct,
+        phase: job.phase,
+        error: job.error,
+        project_id: job.project_id,
+        reindex_job_ids: job.reindex_job_ids,
+        vectors_imported: job.vectors_imported,
+    }))
+}
 
 #[cfg(test)]
 mod tests {
@@ -7555,4 +9051,159 @@ mod tests {
             .expect("row");
         assert!(!stored.config_json.contains("ghp_topsecret"));
     }
+
+    /// The schedule loop reads `project_schedule_hints`, NOT the per-project
+    /// databases: with a 16-pool cache, a tick that opened every project would
+    /// thrash the LRU. So every save / toggle / delete has to leave the hint in
+    /// sync, otherwise a schedule either never fires or keeps the project on the
+    /// due list forever.
+    #[test]
+    fn schedule_writes_keep_the_registry_hint_in_sync() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
+
+        let project_id = format!("hint-{}", uuid::Uuid::new_v4());
+        let dir = tmp.path().join(&project_id);
+        std::fs::create_dir_all(dir.join("files")).expect("dir");
+        project_db::open_pool_at(&dir).expect("project db");
+        repository::create_project(
+            &project_id,
+            "org-h",
+            &format!("Projekt {project_id}"),
+            "",
+            "tests",
+            "[\"tests\"]",
+            "owner-h",
+            &dir.to_string_lossy(),
+            &[],
+        )
+        .expect("create project");
+
+        let ctx = HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [9u8; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: crate::dispatch::state::AppState::for_test(),
+            org_context: Some(OrgContext {
+                user_id: "owner-h".to_string(),
+                org_id: "org-h".to_string(),
+                role_id: "role-x".to_string(),
+                permissions: [PERM_READ.to_string()].into_iter().collect(),
+            }),
+        };
+
+        let hint = || -> Option<(Option<String>, i64)> {
+            let pool = crate::project_studio::db::pool().expect("registry");
+            let conn = pool.read().expect("read");
+            conn.query_row(
+                "SELECT next_run_at, enabled_count FROM project_schedule_hints \
+                 WHERE project_id = ?1",
+                rusqlite::params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()
+        };
+        assert!(hint().is_none(), "no schedules, no hint yet");
+
+        let wire = ScheduleWire {
+            name: "Nocny smoke",
+            run_type: "manual",
+            suite_id: "",
+            case_ids: &["c-nieistotne".to_string()],
+            environment_id: "",
+            runner_service_id: "",
+            perf_profile_json: "",
+            assignment_mode: "pool",
+            assignees: &[],
+            schedule_kind: "interval",
+            schedule_expr: "1h",
+            timezone: "Europe/Warsaw",
+            enabled: true,
+        };
+        let saved = schedule_save_v1(&ctx, &project_id, None, &wire).expect("save");
+        let MessageBody::ProjectStudioBody(ProjectStudioPayload::ScheduleSaveResponse {
+            schedule_id,
+            next_run_at,
+            next_runs_preview,
+        }) = saved
+        else {
+            panic!("unexpected save response");
+        };
+        assert!(!next_run_at.is_empty());
+        assert_eq!(next_runs_preview.len(), 3, "the server renders the preview");
+        let (hint_next, enabled_count) = hint().expect("hint written on save");
+        assert_eq!(enabled_count, 1);
+        assert_eq!(
+            hint_next.as_deref(),
+            Some(next_run_at.as_str()),
+            "the hint carries the same instant the loop will compare against"
+        );
+
+        // Toggling off must clear the due instant, or the loop keeps opening the
+        // project for a schedule that can no longer fire.
+        schedule_set_enabled_v1(&ctx, &project_id, &schedule_id, false).expect("disable");
+        let (hint_next, enabled_count) = hint().expect("hint after disable");
+        assert!(hint_next.is_none());
+        assert_eq!(enabled_count, 0);
+
+        // Re-enabling recomputes it.
+        schedule_set_enabled_v1(&ctx, &project_id, &schedule_id, true).expect("enable");
+        let (hint_next, enabled_count) = hint().expect("hint after enable");
+        assert!(hint_next.is_some());
+        assert_eq!(enabled_count, 1);
+
+        schedule_delete_v1(&ctx, &project_id, &schedule_id).expect("delete");
+        let (hint_next, enabled_count) = hint().expect("hint after delete");
+        assert!(hint_next.is_none(), "a deleted schedule leaves no due instant");
+        assert_eq!(enabled_count, 0);
+
+        // A manual schedule must not bind an environment, and an automated one
+        // requires an APPROVED environment at save time.
+        let bad = ScheduleWire {
+            environment_id: "e-nieznane",
+            ..wire
+        };
+        assert_eq!(
+            schedule_save_v1(&ctx, &project_id, None, &bad)
+                .expect_err("manual schedule with an environment")
+                .code,
+            ProtocolErrorCode::BadRequest
+        );
+        let auto = ScheduleWire {
+            run_type: "auto",
+            environment_id: "e-nieznane",
+            ..wire
+        };
+        assert_eq!(
+            schedule_save_v1(&ctx, &project_id, None, &auto)
+                .expect_err("unknown environment")
+                .code,
+            ProtocolErrorCode::BadRequest
+        );
+        // Firing-rule bounds are refused before anything is written.
+        for (kind, expr) in [("interval", "1m"), ("interval", "400d"), ("cron", "* * * * *")] {
+            let invalid = ScheduleWire {
+                schedule_kind: kind,
+                schedule_expr: expr,
+                ..wire
+            };
+            assert!(
+                schedule_save_v1(&ctx, &project_id, None, &invalid).is_err(),
+                "{kind} '{expr}' must be refused"
+            );
+        }
+        // An unknown timezone would make the cron drift silently.
+        let bad_zone = ScheduleWire {
+            schedule_kind: "cron",
+            schedule_expr: "30 2 * * *",
+            timezone: "Mars/Olympus",
+            ..wire
+        };
+        assert!(schedule_save_v1(&ctx, &project_id, None, &bad_zone).is_err());
+    }
+
 }

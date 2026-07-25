@@ -440,6 +440,82 @@ pub struct ProjectF3Kpis {
     pub auto_runs_open: u32,
 }
 
+// =============================================================================
+// F4 rows: run schedules, trigger history, ML Studio links (project.db)
+// =============================================================================
+
+/// One run schedule. `next_run_at` is `None` for a schedule that will never
+/// fire again (finished one-shot, disabled, breaker tripped) — the due query
+/// compares on it, and an empty string would sort before every timestamp.
+#[derive(Debug, Clone)]
+pub struct ScheduleRecord {
+    pub schedule_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub auto_disabled: bool,
+    pub run_type: String,
+    pub suite_id: String,
+    pub case_ids_json: String,
+    pub environment_id: String,
+    pub runner_service_id: String,
+    pub perf_profile_json: String,
+    pub assignment_mode: String,
+    pub assignees_json: String,
+    pub schedule_kind: String,
+    pub schedule_expr: String,
+    pub timezone: String,
+    pub next_run_at: Option<String>,
+    pub last_trigger_at: String,
+    pub last_run_id: String,
+    pub last_status: String,
+    pub last_reason: String,
+    pub consecutive_failures: u32,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One trigger attempt. Attempts that started nothing are recorded too, so an
+/// admin can tell "never fired" from "fired and refused".
+#[derive(Debug, Clone)]
+pub struct ScheduleRunRecord {
+    pub trigger_id: String,
+    pub schedule_id: String,
+    pub scheduled_for: String,
+    pub fired_at: String,
+    pub outcome: String,
+    pub reason: String,
+    pub run_id: String,
+    pub run_status: String,
+    pub actor: String,
+}
+
+/// Link between this project and an ML Studio project.
+#[derive(Debug, Clone)]
+pub struct MlLinkRecord {
+    pub link_id: String,
+    pub ml_project_id: String,
+    pub label: String,
+    pub origin: String,
+    pub sync_permissions: bool,
+    pub role_map_json: String,
+    pub last_sync_at: String,
+    pub last_sync_result: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// F4 KPI counters (schedules + ML links) for the overview screen.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectF4Kpis {
+    pub schedules_enabled: u32,
+    /// Enabled schedules that cannot fire: the breaker tripped, or the bound
+    /// environment is not approved.
+    pub schedules_blocked: u32,
+    pub ml_links: u32,
+}
+
 /// Personal notification row from the CENTRAL registry (projects.db) —
 /// always queried WHERE user_id = caller.
 #[derive(Debug, Clone)]

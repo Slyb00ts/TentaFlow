@@ -149,6 +149,17 @@ pub(crate) fn open_pool_at(dir: &Path) -> Result<(DbPool, i64)> {
     Ok((Arc::new(crate::db::Db::from_connection(conn)), version))
 }
 
+/// Project id of a pool handed out by [`open`]. A `DbPool` carries no path, so
+/// pointer identity against this cache is the only way back from a handle to
+/// its project — the terminal-run path (`schedules::settle`) has nothing else
+/// to resolve a notification target from.
+pub fn project_id_of(pool: &DbPool) -> Option<String> {
+    registry()
+        .iter()
+        .find(|entry| Arc::ptr_eq(&entry.value().pool, pool))
+        .map(|entry| entry.key().clone())
+}
+
 /// Checkpoints and drops the cached pool for `project_id`. The SQLite file is
 /// NOT removed. Safe to call for projects that were never opened.
 pub fn close(project_id: &str) {
@@ -261,6 +272,10 @@ fn run_project_migrations(conn: &Connection) -> Result<i64> {
     }
     Ok(latest)
 }
+
+/// Highest per-project schema version this binary knows. An archive produced by
+/// a NEWER node is refused on import rather than migrated blindly.
+pub const LATEST_SCHEMA_VERSION: i64 = 4;
 
 /// Ordered per-project schema migrations (F4+ tables land as further entries).
 const MIGRATIONS_PROJECT: &[(i64, &str)] = &[

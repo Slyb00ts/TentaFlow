@@ -9,6 +9,7 @@
 
 pub mod activity;
 pub mod api_spec;
+pub mod archive;
 pub mod auto_runs;
 pub mod build_profiles;
 pub mod code_assist;
@@ -18,12 +19,14 @@ pub mod generation;
 pub mod git_source;
 pub mod ingest;
 pub mod knowledge;
+pub mod ml_link;
 pub mod models;
 pub mod notifications;
 pub mod project_db;
 pub mod reports;
 pub mod repository;
 pub mod runs;
+pub mod schedules;
 pub mod tasks;
 pub mod tests;
 pub mod zip_source;
@@ -31,6 +34,11 @@ pub mod zip_source;
 use anyhow::Result;
 
 use crate::db::DbPool;
+
+/// Project templates and content modules accepted anywhere a registry row is
+/// written — the wire (`project_create`) and an import manifest alike.
+pub const VALID_TEMPLATES: &[&str] = &["tests", "docs", "tests_docs", "custom"];
+pub const VALID_MODULES: &[&str] = &["knowledge", "tests", "docs", "chat", "tasks"];
 
 /// Initialises Project Studio: opens `<data>/projects.db`, runs its
 /// migrations, repairs `dir_path` rows left stale by a data-directory

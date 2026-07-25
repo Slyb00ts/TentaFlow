@@ -200,6 +200,28 @@ pub fn update_task(pool: &DbPool, task_id: &str, input: &TaskInput<'_>) -> Resul
     Ok(n > 0)
 }
 
+/// Moves a task between board columns WITHOUT touching any other field, and
+/// returns the new `updated_at`. The kanban card carries neither
+/// `description_md` nor `attachments`, so a move routed through `update_task`
+/// would write both back empty.
+pub fn set_task_status(pool: &DbPool, task_id: &str, status: &str) -> Result<Option<String>> {
+    let conn = pool.write().map_err(write_err)?;
+    let n = conn.execute(
+        "UPDATE tasks SET status = ?1, updated_at = datetime('now') WHERE task_id = ?2",
+        params![status, task_id],
+    )?;
+    if n == 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT updated_at FROM tasks WHERE task_id = ?1",
+        params![task_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Deletes a task with its comments.
 pub fn delete_task(pool: &DbPool, task_id: &str) -> Result<bool> {
     let conn = pool.write().map_err(write_err)?;

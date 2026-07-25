@@ -1694,9 +1694,6 @@ pub enum ProjectStudioPayload {
         /// F4: explicit run selection ('perf_compare' takes exactly two).
         #[serde(default)]
         run_ids: Vec<String>,
-        /// F4: restricts the report to one case kind ('' = all kinds).
-        #[serde(default)]
-        case_kind: String,
     },
     ReportQueryResponse {
         rows_json: String,

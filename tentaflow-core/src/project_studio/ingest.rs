@@ -535,7 +535,7 @@ fn ref_id_for(doc_id: &str, chunk_index: u64) -> u64 {
 
 /// Metadata schema of the `passages` namespace. The same names feed `KbHit`
 /// mapping in the dispatcher.
-fn passage_field_specs() -> Vec<FieldSpec> {
+pub fn passage_field_specs() -> Vec<FieldSpec> {
     vec![
         FieldSpec {
             name: "doc_id".to_string(),
