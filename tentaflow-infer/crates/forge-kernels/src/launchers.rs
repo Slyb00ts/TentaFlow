@@ -983,6 +983,46 @@ struct Nvfp4GgufDispatch {
     block_threads: u32,
 }
 
+/// Kafel GEMM na instrukcjach dot (karty bez jednostki macierzowej).
+///
+/// Liczba wątków bloku NIE jest tu podawana ręcznie, tylko wyliczana z wymiarów
+/// kafla — kernel dzieli kafel BM x BN na wątki po TM x TN wyników, więc każda
+/// inna wartość wysyła nadmiarowe wątki poza kafel w LDS. Wpisywana ręcznie
+/// rozjechała się z instancją kernela i dawała niedeterministyczne wyniki, które
+/// wyszły dopiero na bramce powtarzalności tokenów w `forge bench`.
+#[derive(Clone, Copy)]
+struct DotTile {
+    name: &'static str,
+    bm: u32,
+    bn: u32,
+    tm: u32,
+    tn: u32,
+}
+
+impl DotTile {
+    const fn new(name: &'static str, bm: u32, bn: u32, tm: u32, tn: u32) -> Self {
+        Self {
+            name,
+            bm,
+            bn,
+            tm,
+            tn,
+        }
+    }
+
+    fn config(&self, rows: usize, n_tokens: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid: (
+                (rows as u32).div_ceil(self.bn),
+                (n_tokens as u32).div_ceil(self.bm),
+                1,
+            ),
+            block: ((self.bm / self.tm) * (self.bn / self.tn), 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn nvfp4_gguf_dispatch(
     n_tokens: usize,
@@ -6260,18 +6300,11 @@ impl Kernels {
             .scalar(n_tokens as i64);
         // Karty bez jednostki macierzowej nie mają rodziny `gemm_f16` (opartej
         // na mma/ldmatrix) i idą kaflem na `v_dot2_f32_f16`.
-        if let Some((name, bm, bn, block)) = self.gemm_dot2_tile(rows, n_tokens) {
-            let k = self.artifacts.get(name)?;
-            let cfg = LaunchConfig {
-                grid: (
-                    (rows as u32).div_ceil(bn),
-                    (n_tokens as u32).div_ceil(bm),
-                    1,
-                ),
-                block: (block, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            return self.device.launch(k, &cfg, &args, stream);
+        if let Some(tile) = self.gemm_dot2_tile(rows, n_tokens) {
+            let k = self.artifacts.get(tile.name)?;
+            return self
+                .device
+                .launch(k, &tile.config(rows, n_tokens), &args, stream);
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_f16{suffix}"))?;
@@ -6294,22 +6327,18 @@ impl Kernels {
     /// Wybór kafla wynika ze zmierzonych na gfx1030 przepustowości (patrz
     /// `docs/STATUS.md`), a przy małej liczbie tokenów schodzimy na węższy kafel,
     /// bo pełny byłby w większości odrzuconym obliczeniem.
-    fn gemm_dot2_tile(
-        &self,
-        rows: usize,
-        n_tokens: usize,
-    ) -> Option<(&'static str, u32, u32, u32)> {
+    fn gemm_dot2_tile(&self, rows: usize, n_tokens: usize) -> Option<DotTile> {
         if self.device.caps().vendor == forge_types::Vendor::Nvidia {
             return None;
         }
         Some(if n_tokens <= 64 || rows < 128 {
-            ("gemm_f16_dot2_64x64", 64, 64, 256)
+            DotTile::new("gemm_f16_dot2_64x64", 64, 64, 4, 4)
         } else if n_tokens <= 128 {
-            ("gemm_f16_dot2_128x64", 128, 64, 512)
+            DotTile::new("gemm_f16_dot2_128x64", 128, 64, 8, 4)
         } else if n_tokens >= 256 && rows >= 2048 {
-            ("gemm_f16_dot2_256x64", 256, 64, 256)
+            DotTile::new("gemm_f16_dot2_256x64", 256, 64, 8, 8)
         } else {
-            ("gemm_f16_dot2_128x128", 128, 128, 256)
+            DotTile::new("gemm_f16_dot2_128x128", 128, 128, 8, 8)
         })
     }
 
@@ -8192,19 +8221,9 @@ impl Kernels {
         }
 
         // Karty bez jednostki macierzowej: kafel int8 na `v_dot4_i32_i8`.
-        if let Some((name, bm, bn, threads)) =
-            self.gemm_dot4_tile(kernel_base, output_f32, rows, n_tokens)
-        {
-            let gk = self.artifacts.get(name)?;
-            let cfg = LaunchConfig {
-                grid: (
-                    (rows as u32).div_ceil(bn),
-                    (n_tokens as u32).div_ceil(bm),
-                    1,
-                ),
-                block: (threads, 1, 1),
-                shared_mem_bytes: 0,
-            };
+        if let Some(tile) = self.gemm_dot4_tile(kernel_base, output_f32, rows, n_tokens) {
+            let gk = self.artifacts.get(tile.name)?;
+            let cfg = tile.config(rows, n_tokens);
             let args = LaunchArgs::new()
                 .buf(y)
                 .buf_at(w, w_byte_off)?
@@ -8253,7 +8272,7 @@ impl Kernels {
         output_f32: bool,
         rows: usize,
         n_tokens: usize,
-    ) -> Option<(&'static str, u32, u32, u32)> {
+    ) -> Option<DotTile> {
         if self.device.caps().vendor == forge_types::Vendor::Nvidia {
             return None;
         }
@@ -8268,7 +8287,7 @@ impl Kernels {
             _ => return None,
         };
         Some(if n_tokens <= 64 || rows < 128 {
-            (
+            DotTile::new(
                 match family {
                     "q8_0" => "gemm_q8_0_dot4_64x64",
                     "q4_k" => "gemm_q4_k_dot4_64x64",
@@ -8276,18 +8295,19 @@ impl Kernels {
                 },
                 64,
                 64,
-                256,
+                4,
+                4,
             )
         } else if family == "q4_k" {
             // Formaty K rozpakowują wagi w LDS, więc płacą więcej za etap;
             // kafel 128x64 wyszedł szybszy (32 wobec 29 TOPS) niż 128x128.
-            ("gemm_q4_k_dot4_128x64", 128, 64, 512)
+            DotTile::new("gemm_q4_k_dot4_128x64", 128, 64, 8, 4)
         } else if family == "q6_k" {
-            ("gemm_q6_k_dot4_128x64", 128, 64, 512)
+            DotTile::new("gemm_q6_k_dot4_128x64", 128, 64, 8, 4)
         } else if n_tokens <= 128 {
-            ("gemm_q8_0_dot4_128x64", 128, 64, 512)
+            DotTile::new("gemm_q8_0_dot4_128x64", 128, 64, 8, 4)
         } else {
-            ("gemm_q8_0_dot4_128x128", 128, 128, 512)
+            DotTile::new("gemm_q8_0_dot4_128x128", 128, 128, 8, 4)
         })
     }
 

@@ -216,6 +216,8 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "gemm_q4_k_dot4_128x128",
     "gemm_q4_k_dot4_128x64",
     "gemm_q4_k_dot4_64x64",
+    "gemm_q6_k_dot4_128x64",
+    "gemm_q6_k_dot4_64x64",
     "gemm_q8_0_dot4_128x128",
     "gemm_q8_0_dot4_128x64",
     "gemm_q8_0_dot4_64x64",

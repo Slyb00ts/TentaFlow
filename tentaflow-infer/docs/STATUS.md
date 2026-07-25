@@ -150,19 +150,36 @@ Ostatnia aktualizacja: 2026-07-25.
   generuje spójny polski tekst, a prefill jest szybszy od llama.cpp na ROCm w
   całym zakresie długości promptu, przy czym przewaga ROŚNIE z długością:
 
-  | prompt | FORGE prefill | llama.cpp | FORGE/llama.cpp |
-  |--:|--:|--:|--:|
-  | 512 | 14 929,7 tok/s | 11 090,0 | **1,35x** |
-  | 1024 | 14 913,7 tok/s | 7 827,3 | **1,91x** |
-  | 2048 | 11 144,2 tok/s | 5 687,9 | **1,96x** |
+  | model / prompt | FORGE prefill | llama.cpp | FORGE/llama.cpp |
+  |---|--:|--:|--:|
+  | qwen3-0.6B Q8_0, p512 | 14 929,7 tok/s | 11 090,0 | **1,35x** |
+  | qwen3-0.6B Q8_0, p1024 | 14 900,2 tok/s | 7 827,3 | **1,90x** |
+  | qwen3-0.6B Q8_0, p2048 | 11 144,2 tok/s | 5 687,9 | **1,96x** |
+  | Mistral-7B Q4_K_M, p1024 | 1 733,8 tok/s | 1 300,6 | **1,33x** |
 
-  Decode: FORGE 302,3 / 277,5 / 250,9 tok/s (po promptach 512/1024/2048) wobec
-  llama.cpp 240,7. UWAGA METODOLOGICZNA: `llama-bench tg128` dekoduje z pustym
-  kontekstem, a FORGE po prompcie, więc porównanie decode jest przechylone NA
-  KORZYŚĆ llama.cpp — i FORGE i tak wychodzi 1,04-1,26x lepiej.
+  Decode (tg128): qwen 277,5 wobec 239,8 (**1,16x**), Mistral **67,0 wobec 79,0
+  (0,85x — tu llama.cpp wygrywa)**. Decode jest ograniczony pasmem i idzie u nas
+  kernelami gemv dp4a; na Q4_K llama.cpp ma tam lepszą ścieżkę i to jest realna
+  luka do zamknięcia, a nie szum pomiarowy.
+
+  UWAGA METODOLOGICZNA: `llama-bench tg128` dekoduje z pustym kontekstem, a FORGE
+  po prompcie, więc porównanie decode jest przechylone NA KORZYŚĆ llama.cpp.
   Prefill 14 914 tok/s to 17,8 TOPS efektywnie, czyli 18% zmierzonego pułapu
   int8 karty; llama.cpp jest tam na 9,3 TOPS. Zapas do pułapu zostaje duży,
   bo model 0,6B ma małe GEMM-y i dominuje narzut warstw poza GEMM.
+- ✅ **Liczba wątków bloku wynika teraz z wymiarów kafla (2026-07-25).**
+  Trzy wpisy „128x64" w dyspozytorze Rusta przekazywały 512 wątków, a kernele są
+  zbudowane na 256 ((BM/TM)*(BN/TN)). Nadmiarowe wątki adresowały poza kafel w
+  LDS, więc Mistral-7B Q4_K dawał INNE tokeny w kolejnych powtórzeniach.
+  Wyłapała to bramka powtarzalności w `forge bench` (`greedy token IDs differ
+  between benchmark repetitions`) — nie test jednostkowy kernela, bo tam
+  `block_dim` liczyłem z tych samych parametrów co instancję, więc niezgodność
+  nie mogła wystąpić. Wniosek: to nie jest błąd do naprawienia jednorazowo, tylko
+  klasa błędu do wyeliminowania — `DotTile` trzyma BM/BN/TM/TN i sam wylicza
+  siatkę oraz blok, więc ręczna wartość nie ma już gdzie się rozjechać.
+  Zasięg: q4_k i q6_k trafiały tam ZAWSZE (stąd objaw), q8_0 i f16 tylko dla
+  65-128 tokenów, czyli poza mierzonymi kształtami — dlatego wcześniejsze wyniki
+  qwen zostają ważne i po naprawie nie zmieniły się (14 900 wobec 14 914).
 - ✅ **Kafel GEMM bez jednostki macierzowej — `src/gemm_dot.mojo` (2026-07-25).**
   Rodzina `gemm_*` w `gemm.mojo` stoi na kontrakcie fragmentów `mma.m16n8k16` +
   `ldmatrix`. Tego NIE DA SIĘ sensownie emulować: rozkład fragmentów rozrzuca
