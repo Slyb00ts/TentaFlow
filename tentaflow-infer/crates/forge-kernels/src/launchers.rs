@@ -6216,7 +6216,7 @@ impl Kernels {
         // Karty bez jednostki macierzowej: kafel int8 na `v_dot4_i32_i8`.
         // Wartości e2m1 są wielokrotnościami 0,5, więc podwojone są całkowite i
         // iloczyn wychodzi dokładnie — patrz `nvfp4_codes8`.
-        if let Some(tile) = self.gemm_nvfp4_dot4_tile(rows, n_tokens) {
+        if let Some(tile) = self.gemm_nvfp4_dot4_tile(rows, cols, n_tokens) {
             let (xq, xd, _) = self.prequant_q8_1(x, cols, n_tokens, stream)?;
             let k = self.artifacts.get(tile.name)?;
             let args = LaunchArgs::new()
@@ -8388,11 +8388,19 @@ impl Kernels {
     /// Kafel `gemm_nvfp4_dot4`, albo `None` na NVIDII i dla kształtów, które
     /// obsługują wyspecjalizowane gemv batchowe (do 16 tokenów) — tam kafel
     /// prefillowy liczyłby w większości odrzucane wiersze.
-    fn gemm_nvfp4_dot4_tile(&self, rows: usize, n_tokens: usize) -> Option<DotTile> {
+    fn gemm_nvfp4_dot4_tile(
+        &self,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+    ) -> Option<DotTile> {
         if self.device.caps().vendor == forge_types::Vendor::Nvidia {
             return None;
         }
-        if n_tokens <= 16 {
+        // Kafel wnosi kolumny 32-blokami (tyle ma blok kwantyzacji aktywacji),
+        // więc kształt niepodzielny przez 32 nie jest jego przypadkiem; taki
+        // zgłosi brak kernela rodziny mma zamiast policzyć źle.
+        if n_tokens <= 16 || !cols.is_multiple_of(32) {
             return None;
         }
         Some(if n_tokens <= 64 || rows < 128 {
