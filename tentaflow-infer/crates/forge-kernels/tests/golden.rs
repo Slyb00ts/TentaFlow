@@ -1332,6 +1332,58 @@ fn mtp_gather_guards_device_token_out_of_range() {
     }
 }
 
+/// Rozwinięcie pętli w `rmsnorm_residual_f16` zachowuje kolejność akumulacji,
+/// więc test sprawdza i wynik normy, i zaktualizowany strumień residuału —
+/// obie ścieżki (rozwinięta i resztkowa) na kolumnach niepodzielnych przez
+/// 256 * NORM_UNROLL.
+#[test]
+fn rmsnorm_residual_matches_reference() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for (rows, cols) in [(4usize, 4096usize), (3, 2048), (1, 2568), (2, 300)] {
+        let residual: Vec<f32> = (0..rows * cols)
+            .map(|i| f16::from_f32(fill(i)).to_f32())
+            .collect();
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| f16::from_f32(fill(i + 7) * 0.5).to_f32())
+            .collect();
+        let w: Vec<f32> = (0..cols)
+            .map(|i| f16::from_f32(1.0 + (i % 5) as f32 * 0.1).to_f32())
+            .collect();
+
+        let rb = upload_f16(dev.as_ref(), &residual);
+        let xb = upload_f16(dev.as_ref(), &x);
+        let wb = upload_f16(dev.as_ref(), &w);
+        let yb = upload_f16(dev.as_ref(), &vec![0.0; rows * cols]);
+        kernels
+            .rmsnorm_residual_f16(&yb, &rb, &xb, &wb, rows, cols, EPS, &stream)
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let got = download_f16(dev.as_ref(), &yb, rows * cols);
+        let got_residual = download_f16(dev.as_ref(), &rb, rows * cols);
+        let mut want = vec![0.0f32; rows * cols];
+        let mut want_residual = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let sum: Vec<f32> = (0..cols)
+                .map(|c| f16::from_f32(residual[r * cols + c] + x[r * cols + c]).to_f32())
+                .collect();
+            want_residual[r * cols..(r + 1) * cols].copy_from_slice(&sum);
+            want[r * cols..(r + 1) * cols].copy_from_slice(&rmsnorm_reference(&sum, &w));
+        }
+        assert_eq!(
+            got_residual, want_residual,
+            "strumień residuału musi być dokładny dla {rows}x{cols}"
+        );
+        assert!(
+            max_abs_err(&got, &want) < 0.01,
+            "norma rozjechała się dla {rows}x{cols}"
+        );
+    }
+}
+
 fn rmsnorm_reference(values: &[f32], weight: &[f32]) -> Vec<f32> {
     let mean_sq = values.iter().map(|value| value * value).sum::<f32>() / values.len() as f32;
     let inv = 1.0 / (mean_sq + EPS).sqrt();

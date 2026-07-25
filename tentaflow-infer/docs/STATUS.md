@@ -10,8 +10,31 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-24.
+Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **rmsnorm z residuałem: rozwinięcie odczytów w locie (2026-07-25).**
+  Profil pokazał `rmsnorm_residual_f16` na ~138 GB/s i 4,6% czasu GPU: batchowy
+  decode startuje jeden blok na token, więc krok B=32 zajmuje 32 z 128 SM,
+  a jedynym źródłem równoległości pamięci zostaje liczba odczytów w locie na
+  wątek — przy skalarnej pętli f16 były to dwa. Oba przebiegi wykonują teraz
+  `NORM_UNROLL = 8` odczytów grid-stride przed konsumpcją; krok w pętli zostaje
+  `block_dim.x`, więc wątek odwiedza te same kolumny w tej samej kolejności,
+  a strumień residuału jest DOKŁADNY (nowy golden `rmsnorm_residual_matches_reference`
+  porównuje go przez `assert_eq!`, pokrywa ścieżkę rozwiniętą i resztkową na
+  4096/2048/2568/300 kolumnach; golden 70/70).
+  Suma f32 NIE jest bitowo identyczna ze wersją skalarną — rozwinięcie pozwala
+  kompilatorowi inaczej kontraktować akumulację. Audyt pełnych logitów wobec
+  zapisanej referencji B1 (16 promptów p1024 × 256 kroków) pokazuje dryf
+  wewnątrz szumu f16 i lekko na korzyść: zgodność top-1 0,99927 → 0,99951,
+  max_abs 1,667 → 1,371, `mean_rel_l2` 0,002533 → 0,002549, kosinus bez zmian
+  na sześciu miejscach; sekcja prefill jest bit-w-bit identyczna, a **strumień
+  tokenów greedy się nie zmienia** (`free_generation_ids` identyczne, liczba
+  divergencji wobec referencji nadal 2). Kolejność sumowania jest więc świadomie
+  zostawiona kompilatorowi, a nie przypinana.
+  Serve decode-only in32/o256: C=16 1 670→**1 682** tok/s (TPOT 9,02→8,71 ms),
+  C=32 2 655→**2 722** (TPOT 11,23→11,00 ms, **+2,5%**).
+  Narastająco z kaflem BM32 i dwuetapowym potokiem: C=32 **533 → 2 722 tok/s**,
+  TPOT **58 → 11,00 ms**.
 - ✅ **BM32: dwuetapowy potok cp.async zamiast trzyetapowego (2026-07-24).**
   Profil pokazał, że projekcje BM32 jadą na 585-661 GB/s przy ~17% occupancy
   (39 936 B shared → 2 bloki/SM). Zejście do dwóch etapów daje 26 624 B →
