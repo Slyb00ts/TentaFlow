@@ -12,6 +12,45 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Katalog kerneli uzgodniony z manifestem (2026-07-25).** Pełny build
+  katalogu USUNĄŁBY 14 żywych kerneli i przywrócił zrewertowane — bo kolejne
+  sesje dodawały kernele wyłącznie izolowanymi builderami, a `gemm_q6k_i8_native_*`
+  zostały w katalogu po rewercie. Usunięte jako martwe (żaden Rust ich nie
+  używa, PTX nie istnieje): 12 instancji `gemm_q6k_i8_native_*` i stary sampler
+  `topk_batched_f32`. Dorejestrowane: `topk_batched_{partial,final}_f32`,
+  `gemv_q{4,6}_k_dp4a_batch_b{2,4,8,16}`, `pack_q{4_k,6_k,8_0}_fp8`,
+  `gemm_q8_0_i8mma_b16` i `gemm_nvfp4_gguf_f16_b16_nvidia`.
+  `test_catalog_matches_committed_manifest` przechodzi, czyli katalog i manifest
+  opisują ten sam zestaw 474 kerneli. Nowe kernele publikuje się izolowanym
+  builderem w wariancie z manifestem I rejestruje w katalogu — jedno bez
+  drugiego odtworzy dryf.
+- ✅ **Bramka dense prefill przestała wymagać usuniętego kernela (2026-07-25).**
+  Test `dense_prefill_wymaga_artefaktow_konkretnego_hd_formatu_i_batcha`
+  sprawdzał, że brak `topk_batched_f32` wyłącza dense prefill — a ten kernel
+  zniknął przy wymianie samplera na dwuprzebiegowy. Produkcyjne
+  `dense_prefill_artifacts_capable` wymagało już poprawnych
+  `topk_batched_{partial,final}_f32`; nieaktualny był wyłącznie test.
+  `forge-kernels` przechodzi w całości (42+9+70+1).
+- 🟡 **Rozbieżność ścieżek decode: znaleziona przyczyna, ścieżka B=1 do
+  naprawy (2026-07-25).** `batched_matches_single_seq` failował od dawna bez
+  wyjaśnienia. Nowy `Model::read_single_logits` (symetryczny do
+  `read_batch_logits`) i przeplatany porównywacz w teście dały liczby:
+  rozbieżność tokenu w kroku 19 to SKUTEK, nie przyczyna — logity obu ścieżek
+  różnią się o **rel_l2 1,1e-2 do 3,5e-2 od PIERWSZEGO kroku**, a token
+  przewraca się dopiero gdy margines top-2 (0,0298) spadnie poniżej szumu
+  (max|delta| 0,33). Dwa rzędy wielkości za dużo na zaokrąglenia f16 (kernele
+  BM32 mają 1,8e-5). Przyczyna: obie ścieżki kwantyzują aktywacje do int8, ale
+  RÓŻNYMI kernelami — serialna bierze `gemv_q8_0_dp4a_f16`, a batchowa
+  `gemm_q8_0_small_batch_at` dla T=2/4/8/16 albo, dla **B=1**, dopełniany do
+  ≥64 tokenów `gemm_q8_0_i8mma_at`. B=1 przez kafel 64-tokenowy jest przy tym
+  marnotrawstwem, więc przekierowanie B=1 na ten sam GEMV co ścieżka serialna
+  usuwa rozbieżność ZA DARMO (a prawdopodobnie i przyspiesza). Wymaga wariantu
+  launchera GEMV z offsetem wiersza (`gemm_rows` operuje na oknie wierszy,
+  obecny `gemv_q8_0_dp4a_f16` nie przyjmuje offsetu) — dlatego nie jest
+  zrobione w tej sesji. Dla B>1 różnica zostaje realnym kompromisem
+  jakość/przepustowość: jakość wyjścia zależy od obciążenia serwera. Test
+  celowo pozostaje czerwony — niesie teraz pełną diagnostykę zamiast samego
+  „diverged".
 - ✅ **Hybrydowy decode: grupy zamiast par, +38% na Qwen3.6-27B (2026-07-25).**
   Scheduler dzielił kolejkę hybrydową na `chunks_exact(2)` i wykonywał krok B=2
   na parę, więc osiem aktywnych sekwencji dawało dwa tokeny na krok i

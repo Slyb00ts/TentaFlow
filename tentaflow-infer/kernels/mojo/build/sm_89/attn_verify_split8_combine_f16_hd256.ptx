@@ -6,23 +6,23 @@
 .target sm_80
 .address_size 64
 
-	// .globl	src_attention_verify_split8_pro6A6A_73448ddde01ba99c
+	// .globl	src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a
 
-.visible .entry src_attention_verify_split8_pro6A6A_73448ddde01ba99c(
-	.param .u64 .ptr .align 1 src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_0,
-	.param .u64 .ptr .align 1 src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_1,
-	.param .u64 src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_2,
-	.param .u64 src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_3
+.visible .entry src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a(
+	.param .u64 .ptr .align 1 src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_0,
+	.param .u64 .ptr .align 1 src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_1,
+	.param .u64 src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_2,
+	.param .u64 src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_3
 )
 {
 	.reg .pred 	%p<7>;
 	.reg .b32 	%r<43>;
 	.reg .b64 	%rd<41>;
 
-	ld.param.b64 	%rd13, [src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_3];
-	ld.param.b64 	%rd12, [src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_2];
-	ld.param.b64 	%rd14, [src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_0];
-	ld.param.b64 	%rd15, [src_attention_verify_split8_pro6A6A_73448ddde01ba99c_param_1];
+	ld.param.b64 	%rd13, [src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_3];
+	ld.param.b64 	%rd12, [src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_2];
+	ld.param.b64 	%rd14, [src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_0];
+	ld.param.b64 	%rd15, [src_attention_verify_split8_at6A6A6A6A_bc9c4057431a9d3a_param_1];
 	cvta.to.global.u64 	%rd1, %rd15;
 	cvta.to.global.u64 	%rd2, %rd14;
 	mov.u32 	%r1, %ctaid.x;

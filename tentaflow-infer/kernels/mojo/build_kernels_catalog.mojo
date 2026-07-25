@@ -134,6 +134,7 @@ from src.q8_0_batch import (
     gemm_q8_0_i8mma_b2,
     gemm_q8_0_i8mma_b3,
     gemm_q8_0_i8mma_b4,
+    gemm_q8_0_i8mma_b16,
 )
 from src.q8_0_batch import (
     gemm_q8_0_i8mma_out_f32_b3,
@@ -214,18 +215,6 @@ from src.gemm_q4k_i8_multistage import (
     gemm_q4k_i8_native_4096_14336_m4096,
 )
 from src.gemm_q6k_i8_multistage import (
-    gemm_q6k_i8_native_4096_14336_m128,
-    gemm_q6k_i8_native_4096_14336_m256,
-    gemm_q6k_i8_native_4096_14336_m512,
-    gemm_q6k_i8_native_4096_14336_m1024,
-    gemm_q6k_i8_native_4096_14336_m2048,
-    gemm_q6k_i8_native_4096_14336_m4096,
-    gemm_q6k_i8_native_1024_4096_m128,
-    gemm_q6k_i8_native_1024_4096_m256,
-    gemm_q6k_i8_native_1024_4096_m512,
-    gemm_q6k_i8_native_1024_4096_m1024,
-    gemm_q6k_i8_native_1024_4096_m2048,
-    gemm_q6k_i8_native_1024_4096_m4096,
 )
 from src.prefill import (
     kv_append_batch_f16,
@@ -456,7 +445,8 @@ from src.sampling import topk_partial_f32, topk_final_f32
 from src.sampling import (
     penalize_batched_f32,
     argmax_batched_f32,
-    topk_batched_f32,
+    topk_batched_partial_f32,
+    topk_batched_final_f32,
 )
 from src.sampling import penalize_histogram_f32, penalized_argmax_f32
 from src.moe import (
@@ -490,6 +480,7 @@ from src.nvfp4_gguf_batch import (
     gemm_nvfp4_gguf_f16_b8_nvidia,
     gemm_nvfp4_gguf_f16_b8,
     gemm_nvfp4_gguf_f16_b16,
+    gemm_nvfp4_gguf_f16_b16_nvidia,
 )
 from src.nvfp4_gguf_mma import (
     gemm_nvfp4_gguf_mma_f16_bm32,
@@ -518,6 +509,21 @@ from src.nvfp4_ct_fp8 import pack_nvfp4_ct_s0_fp8
 from src.nvfp4_ct_prefill import (
     gemm_nvfp4_ct_s0_f16_bm64,
     gemm_nvfp4_ct_s0_f16_bm128,
+)
+from src.decode_dp4a_batch import (
+    gemv_q4_k_dp4a_batch_b2,
+    gemv_q4_k_dp4a_batch_b4,
+    gemv_q4_k_dp4a_batch_b8,
+    gemv_q4_k_dp4a_batch_b16,
+    gemv_q6_k_dp4a_batch_b2,
+    gemv_q6_k_dp4a_batch_b4,
+    gemv_q6_k_dp4a_batch_b8,
+    gemv_q6_k_dp4a_batch_b16,
+)
+from src.pack_gguf_fp8 import (
+    pack_q4_k_fp8,
+    pack_q6_k_fp8,
+    pack_q8_0_fp8,
 )
 from src.nvfp4_ct_direct import (
     gemm_nvfp4_ct_bm16_qkv_m4,
@@ -1384,6 +1390,81 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_down_m32"))
     _ = ctx.compile_function[
+        topk_batched_partial_f32,
+        dump_asm=Path("topk_batched_partial_f32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "topk_batched_partial_f32"))
+    _ = ctx.compile_function[
+        topk_batched_final_f32,
+        dump_asm=Path("topk_batched_final_f32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "topk_batched_final_f32"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_b2,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_b2.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_b2"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_b4,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_b4.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_b4"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_b8,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_b8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_b8"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_b16,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_b16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_b16"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_batch_b2,
+        dump_asm=Path("gemv_q6_k_dp4a_batch_b2.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_b2"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_batch_b4,
+        dump_asm=Path("gemv_q6_k_dp4a_batch_b4.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_b4"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_batch_b8,
+        dump_asm=Path("gemv_q6_k_dp4a_batch_b8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_b8"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_batch_b16,
+        dump_asm=Path("gemv_q6_k_dp4a_batch_b16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_b16"))
+    _ = ctx.compile_function[
+        pack_q4_k_fp8,
+        dump_asm=Path("pack_q4_k_fp8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "pack_q4_k_fp8"))
+    _ = ctx.compile_function[
+        pack_q6_k_fp8,
+        dump_asm=Path("pack_q6_k_fp8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "pack_q6_k_fp8"))
+    _ = ctx.compile_function[
+        pack_q8_0_fp8,
+        dump_asm=Path("pack_q8_0_fp8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "pack_q8_0_fp8"))
+    _ = ctx.compile_function[
+        gemm_q8_0_i8mma_b16,
+        dump_asm=Path("gemm_q8_0_i8mma_b16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_b16"))
+    _ = ctx.compile_function[
+        gemm_nvfp4_gguf_f16_b16_nvidia,
+        dump_asm=Path("gemm_nvfp4_gguf_f16_b16_nvidia.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b16_nvidia"))
+    _ = ctx.compile_function[
         reduce_nvfp4_direct_down, dump_asm=Path("reduce_nvfp4_ct_bm16.ptx")
     ]()
     entries.append(_finalize(out_dir, "reduce_nvfp4_ct_bm16"))
@@ -2214,10 +2295,6 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "argmax_batched_f32"))
 
-    _ = ctx.compile_function[
-        topk_batched_f32, dump_asm=Path("topk_batched_f32.ptx")
-    ]()
-    entries.append(_finalize(out_dir, "topk_batched_f32"))
 
     _ = ctx.compile_function[
         moe_router_f16, dump_asm=Path("moe_router_f16.ptx")
@@ -3071,66 +3148,6 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_14336_m4096"))
 
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_4096_14336_m128,
-        dump_asm=Path("gemm_q6k_i8_native_4096_14336_m128.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_4096_14336_m128"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_4096_14336_m256,
-        dump_asm=Path("gemm_q6k_i8_native_4096_14336_m256.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_4096_14336_m256"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_4096_14336_m512,
-        dump_asm=Path("gemm_q6k_i8_native_4096_14336_m512.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_4096_14336_m512"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_4096_14336_m1024,
-        dump_asm=Path("gemm_q6k_i8_native_4096_14336_m1024.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_4096_14336_m1024"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_4096_14336_m2048,
-        dump_asm=Path("gemm_q6k_i8_native_4096_14336_m2048.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_4096_14336_m2048"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_4096_14336_m4096,
-        dump_asm=Path("gemm_q6k_i8_native_4096_14336_m4096.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_4096_14336_m4096"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_1024_4096_m128,
-        dump_asm=Path("gemm_q6k_i8_native_1024_4096_m128.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_1024_4096_m128"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_1024_4096_m256,
-        dump_asm=Path("gemm_q6k_i8_native_1024_4096_m256.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_1024_4096_m256"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_1024_4096_m512,
-        dump_asm=Path("gemm_q6k_i8_native_1024_4096_m512.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_1024_4096_m512"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_1024_4096_m1024,
-        dump_asm=Path("gemm_q6k_i8_native_1024_4096_m1024.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_1024_4096_m1024"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_1024_4096_m2048,
-        dump_asm=Path("gemm_q6k_i8_native_1024_4096_m2048.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_1024_4096_m2048"))
-    _ = ctx.compile_function[
-        gemm_q6k_i8_native_1024_4096_m4096,
-        dump_asm=Path("gemm_q6k_i8_native_1024_4096_m4096.ptx"),
-    ]()
-    entries.append(_finalize(out_dir, "gemm_q6k_i8_native_1024_4096_m4096"))
 
     var manifest = (
         String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')

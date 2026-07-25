@@ -17193,6 +17193,18 @@ impl Model {
         Ok((out, final_id))
     }
 
+    /// Odczytuje pełne logity pozostałe po ostatnim kroku ścieżki
+    /// jednosekwencyjnej (`prefill_chunk` / `step_and_sample`). Symetryczne do
+    /// `read_batch_logits` i służy temu samemu celowi: porównaniu numerycznemu
+    /// obu ścieżek decode, które używają różnych kerneli.
+    pub fn read_single_logits(&self) -> Result<Vec<f32>> {
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        self.device
+            .read(&self.bufs.logits, 0, bytemuck::cast_slice_mut(&mut logits))?;
+        Ok(logits)
+    }
+
     /// Odczytuje pełne logity pozostałe po ostatnim dense batch decode.
     ///
     /// Metoda służy do audytu numerycznego. Bez tieringu wiersze zachowują

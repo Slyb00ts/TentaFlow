@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_80
+.target sm_89
 .address_size 64
 
 	// .globl	src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_3f40765589f0372a

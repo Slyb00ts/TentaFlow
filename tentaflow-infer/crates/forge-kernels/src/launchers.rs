@@ -16430,7 +16430,8 @@ mod nvfp4_gguf_dispatch_tests {
                 "kv_append_batch_segmented_f16",
                 attention,
                 "argmax_batched_f32",
-                "topk_batched_f32",
+                "topk_batched_partial_f32",
+                "topk_batched_final_f32",
                 "penalize_batched_f32",
                 "gemm_nvfp4_gguf_out_f32_b16",
             ] {
