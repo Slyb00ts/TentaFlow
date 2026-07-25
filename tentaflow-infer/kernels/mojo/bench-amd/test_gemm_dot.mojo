@@ -547,6 +547,53 @@ def check_nvfp4[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
         raise Error("gemm_nvfp4_dot4 poza tolerancja f16")
 
 
+def check_out_f32[BM: Int, BN: Int, TM: Int, TN: Int](
+    ctx: DeviceContext, tokens: Int, rows: Int, cols: Int
+) raises:
+    """Wariant z zapisem f32 (batchowa głowa logitów) wobec tej samej referencji."""
+    var xh = ctx.enqueue_create_host_buffer[DType.float16](tokens * cols)
+    var wh = ctx.enqueue_create_host_buffer[DType.float16](rows * cols)
+    ctx.synchronize()
+    for t in range(tokens):
+        for k in range(cols):
+            xh[t * cols + k] = Float32(
+                Float32((t * 7 + k * 3) % 17) * 0.0625 - 0.5
+            ).cast[DType.float16]()
+    for r in range(rows):
+        for k in range(cols):
+            wh[r * cols + k] = Float32(
+                Float32((r * 5 + k * 11) % 13) * 0.0625 - 0.375
+            ).cast[DType.float16]()
+    var xd2 = ctx.enqueue_create_buffer[DType.float16](tokens * cols)
+    var wd2 = ctx.enqueue_create_buffer[DType.float16](rows * cols)
+    var yd = ctx.enqueue_create_buffer[DType.float32](tokens * rows)
+    ctx.enqueue_copy(xd2, xh)
+    ctx.enqueue_copy(wd2, wh)
+    ctx.synchronize()
+    ctx.enqueue_function[
+        gemm_f16_dot2_impl[BM, BN, TM, TN, DType.float32]
+    ](
+        yd.unsafe_ptr(), wd2.unsafe_ptr(), xd2.unsafe_ptr(), cols, rows, tokens,
+        grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),
+        block_dim=(BM // TM) * (BN // TN),
+    )
+    ctx.synchronize()
+    var worst: Float32 = 0.0
+    with yd.map_to_host() as got:
+        for t in range(tokens):
+            for r in range(rows):
+                var expect: Float32 = 0.0
+                for k in range(cols):
+                    expect += Float32(xh[t * cols + k]) * Float32(wh[r * cols + k])
+                denom = abs(expect) if abs(expect) > 1.0 else 1.0
+                err = abs(got[t * rows + r] - expect) / denom
+                if err > worst:
+                    worst = err
+    print("OUT_F32 T=", tokens, "rows=", rows, "cols=", cols, "blad max:", worst)
+    if worst > 1e-5:
+        raise Error("gemm_f16_dot2 out_f32 poza tolerancja f32")
+
+
 def main() raises:
     var ctx = DeviceContext()
     print("arch:", ctx.arch_name())
@@ -571,6 +618,7 @@ def main() raises:
     check_q4k[128, 128, 8, 4, 2](ctx, 300, 300, 1024)
     check_q6k[64, 64, 4, 4, 4](ctx, 64, 64, 256)
     check_q6k[128, 64, 8, 4, 2](ctx, 200, 130, 512)
+    check_out_f32[64, 64, 4, 4](ctx, 40, 96, 256)
     check_nvfp4[64, 64, 4, 4, 4](ctx, 64, 64, 64)
     check_nvfp4[128, 64, 8, 4, 2](ctx, 200, 130, 512)
     print("--- kafle na kształtach warstw ---")
