@@ -194,12 +194,21 @@ Ostatnia aktualizacja: 2026-07-25.
   Zbudowany z `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1030`. PUŁAPKA: bez
   `HIP_VISIBLE_DEVICES=0` llama.cpp widzi DWA urządzenia ROCm — dGPU i iGPU
   Raphael (gfx1036) — próbuje rozłożyć model na oba i **zrzuca pamięć**.
-  Zmierzone (6900 XT, pp512/tg64, `-ngl 99`):
+  Zmierzone (6900 XT, `-ngl 99`, build `112c7815`). Pierwszy pomiar był na
+  pp512/tg64, ale `forge bench` generuje prompt 1024-tokenowy, więc punkt
+  odniesienia powtórzyłem na pp1024/tg128 — krótszy prompt zawyża prefill
+  (10 974 wobec 7 827 na tym samym modelu), a porównywać wolno tylko ten sam
+  kształt:
 
-  | model | prefill | decode |
-  |---|--:|--:|
-  | qwen3-0.6B Q8_0 | 10 974 tok/s | 241,0 tok/s |
-  | Mistral-7B Q4_K_M | 1 406 tok/s | 79,2 tok/s |
+  | model | prefill pp1024 | decode tg128 | prefill efektywnie |
+  |---|--:|--:|--:|
+  | qwen3-0.6B Q8_0 | 7 827,3 tok/s | 239,8 tok/s | 9,3 TOPS |
+  | qwen3-0.6B Q5_K_M | 7 040,9 tok/s | 260,7 tok/s | 8,4 TOPS |
+  | Mistral-7B Q4_K_M | 1 300,6 tok/s | 79,0 tok/s | 18,9 TOPS |
+
+  Uwaga do celu: mały model jest DALEJ od pułapu karty (9,3 z 97 TOPS) niż duży
+  (18,9), bo jego GEMM-y są małe i dominuje narzut. Łatwiej więc pobić llama.cpp
+  w TOPS-ach na qwen0.6B, ale trudniej wycisnąć z karty procent pułapu.
 
   Porównanie z RTX 4090 (pp1024/tg128, więc orientacyjne): prefill jest **5,6x
   gorszy** na qwen0.6B i **9,0x** na Mistralu, a decode tylko **2,7x** i
