@@ -167,6 +167,47 @@ Ostatnia aktualizacja: 2026-07-25.
   Prefill 14 914 tok/s to 17,8 TOPS efektywnie, czyli 18% zmierzonego pułapu
   int8 karty; llama.cpp jest tam na 9,3 TOPS. Zapas do pułapu zostaje duży,
   bo model 0,6B ma małe GEMM-y i dominuje narzut warstw poza GEMM.
+- 🔴 **KOREKTA: „386 GB/s pasma" było ZAWYŻONE — realny stream to ~226 GB/s
+  (2026-07-25).** Benchmark rooflinu czytał bufor 256 MiB, czyli DOKŁADNIE na
+  granicy 128 MB Infinity Cache, więc mierzył mieszankę cache i DRAM i dawał
+  niestabilne 386-395. Zmierzone na buforze zapisanym wcześniej, po rozmiarach:
+
+  | rozmiar bufora | przepustowość |
+  |---|--:|
+  | 64 MiB | 1 199 GB/s |
+  | 128 MiB | 1 486 GB/s |
+  | 256 MiB | 225 GB/s |
+  | 512 MiB | 226 GB/s |
+  | 1 GiB | 220 GB/s |
+
+  Powyżej Infinity Cache karta daje **~226 GB/s** i jest to niezależne od wzorca:
+  odczyty 8/16/32 B na wątek oraz pętla grid-stride mieszczą się w 219-226.
+  KONSEKWENCJA: wszystkie wcześniejsze wnioski typu „jesteśmy na X% pasma" liczone
+  wobec 386 były zaniżone. To także wyjaśnia, czemu pojedyncze kernele mierzone na
+  małych macierzach pokazywały 900-960 GB/s — mieściły się w cache.
+- 📊 **Gdzie naprawdę idzie decode Bielika (2026-07-25).** Rozbicie zmierzone,
+  nie oszacowane:
+  - Sama rodzina gemv NVFP4 na kształtach warstw i PEŁNYCH 4 GB wag (bez pomocy
+    cache): **20 ms na token, 192 GB/s** — czyli 48 tok/s, gdyby nie było nic
+    więcej. Realny decode to 28,7 ms (34,8 tok/s).
+  - Ten sam pomiar dla Q4_K (Mistral): 18 ms, 212 GB/s. Czyli kernel NVFP4 jest
+    tylko ~10% wolniejszy od Q4_K, a NIE dwukrotnie — wcześniejsze podejrzenie o
+    słabą ścieżkę NVFP4 było błędne.
+  - Kernel NVFP4 w streamingu: 218 GB/s wobec 226 pułapu, czyli **97%**. Sam
+    odczyt wag bez jakiejkolwiek matematyki daje 219 GB/s, więc kernel jest
+    ograniczony pamięcią, a nie dekodowaniem.
+  ODRZUCONE PO POMIARZE (żadne nie pomogło): unroll 2/4 niezależnych ładowań
+  (219-222), ładowania 16 B zamiast 8 B (213-219), aktywacja wniesiona do LDS
+  (218), arytmetyczne rozpakowanie e2m1 zamiast LUT w LDS (bez różnicy),
+  ciągły przedział grup na lane zamiast lane-stride (**208 — gorzej**, bo liczy
+  się koalescencja w obrębie jednej instrukcji, a nie ciągłość per wątek).
+  Jedyny zmierzony zapas w kernelu: strumień skal kosztuje 13% (bez niego 246
+  GB/s), ale każda próba przebudowy dostępu do skal wyszła gorzej.
+  ZOSTAJE DO ZBADANIA: ~30% kroku decode Bielika leży POZA gemv-ami projekcji, a
+  Mistral tego narzutu nie ma. Grafy są przechwytywane w obu przypadkach
+  (sprawdzone licznikiem instancjacji), więc to nie narzut wywołań. Bez profilera
+  (na tej maszynie nie ma rocprof) nie da się tego przypisać, a zgadywanie
+  kosztowałoby czas GPU bez gwarancji.
 - ✅ **BIELIK NVFP4 DZIAŁA NA RADEONIE (2026-07-25).** Model generuje poprawną,
   merytoryczną polszczyznę (Warszawa/Kraków/Łódź z trafnymi opisami), a cztery
   równoległe żądania przez `serve` też. Prefill 1 246 tok/s, decode 32,7 tok/s.
@@ -311,7 +352,7 @@ Ostatnia aktualizacja: 2026-07-25.
 
   | pomiar | 4 łańcuchy | **8 łańcuchów** | teoretyczny szczyt |
   |---|--:|--:|--:|
-  | odczyt HBM | — | **386 GB/s** | ~512 GB/s |
+  | odczyt HBM | — | **226 GB/s** (patrz niżej) | ~512 GB/s |
   | FP32 FMA | 18 TFLOPS | **25 TFLOPS** | ~23 TFLOPS |
   | f16 `v_dot2_f32_f16` | 25 TFLOPS | **49 TFLOPS** | ~46 TFLOPS |
   | int8 `v_dot4_i32_i8` | 50 TOPS | **97 TOPS** | ~92 TOPS |
@@ -322,8 +363,10 @@ Ostatnia aktualizacja: 2026-07-25.
   `v_dot4_i32_i8` dla int8) dają f32/i32 akumulację przy podwójnej przepustowości
   odpowiedniego FMA i są jedyną drogą do pułapu bez jednostki macierzowej.
   ROZBICIE CELU wobec llama.cpp na ROCm (Mistral-7B Q4_K, 7,25e9 parametrów):
-  - **decode 79,2 tok/s = 346 GB/s = 90% zmierzonego pasma.** llama.cpp jest tam
-    praktycznie na rooflinie; zapasu jest może 10% i nie tam jest gra.
+  - **decode 79,2 tok/s = 346 GB/s.** To WIĘCEJ niż zmierzone pasmo strumieniowe
+    (226 GB/s) — patrz wpis o Infinity Cache niżej; oznacza to, że przy 4 GB wag
+    część ruchu i tak trafia w cache, a syntetyczny pomiar strumienia jest dolnym
+    oszacowaniem. Tak czy inaczej llama.cpp jest w decode blisko sprzętu.
   - **prefill 1 406 tok/s = 20,4 TOPS efektywnie = 21% zmierzonego pułapu int8.**
     To jest **~5x zapasu**, nie 2,5x jak wynikało z latency-bound pomiaru.
 
