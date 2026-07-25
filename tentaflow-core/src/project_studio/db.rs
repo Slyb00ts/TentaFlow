@@ -116,7 +116,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 /// Ordered central-registry schema migrations. Identity columns are TEXT
 /// references to core identity (app-level, no SQL FK — different DB file).
-const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA)];
+const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA), (2, CENTRAL_SCHEMA_V2)];
 
 const INITIAL_SCHEMA: &str = "
 CREATE TABLE projects (
@@ -164,3 +164,121 @@ CREATE TABLE notifications (
 );
 CREATE INDEX idx_notifications_user ON notifications(user_id, read_at, created_at DESC);
 ";
+
+/// F4: denormalised "when does this project fire next" hint for the schedule
+/// loop. It duplicates state that lives in each `project.db`, and it has to:
+/// the pool cache holds at most 16 open per-project databases, so a loop that
+/// opened every project once per tick would thrash the LRU and starve the rest
+/// of the module. With the hint the tick is ONE query here, and only projects
+/// that are actually due get opened. Rows are refreshed on every schedule
+/// save/delete/toggle/trigger; a NULL `next_run_at` means "nothing pending"
+/// and never matches the due comparison.
+const CENTRAL_SCHEMA_V2: &str = "
+CREATE TABLE project_schedule_hints (
+    project_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    next_run_at TEXT,
+    enabled_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_schedule_hints_due ON project_schedule_hints(next_run_at);
+";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1 → v2 on a REAL registry database: the seeded rows survive, the hint
+    /// table is queryable with its index, a NULL `next_run_at` stays out of
+    /// the due query (an empty string would sort before every timestamp) and
+    /// re-running the migrations is a no-op.
+    #[test]
+    fn migration_v2_adds_schedule_hints() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = Connection::open(tmp.path().join("projects.db")).expect("open registry");
+
+        // Seed a genuine v1 registry the same way run_migrations would.
+        conn.execute_batch(
+            "CREATE TABLE project_studio_schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .expect("version table");
+        conn.execute_batch(INITIAL_SCHEMA).expect("apply v1");
+        conn.execute(
+            "INSERT INTO project_studio_schema_version (version) VALUES (1)",
+            [],
+        )
+        .expect("record version");
+        conn.execute(
+            "INSERT INTO projects (project_id, org_id, name, owner_user_id, dir_path) \
+             VALUES ('p1', 'o1', 'Projekt QA', 'u1', '/tmp/p1')",
+            [],
+        )
+        .expect("insert project");
+
+        run_migrations(&conn).expect("migrate to v2");
+
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM projects WHERE project_id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("project row");
+        assert_eq!(name, "Projekt QA");
+
+        conn.execute(
+            "INSERT INTO project_schedule_hints (project_id, org_id, next_run_at, enabled_count) \
+             VALUES ('p1', 'o1', '2026-08-01T00:30:00Z', 2)",
+            [],
+        )
+        .expect("insert hint");
+        conn.execute(
+            "INSERT INTO project_schedule_hints (project_id, org_id, next_run_at, enabled_count) \
+             VALUES ('p2', 'o1', NULL, 0)",
+            [],
+        )
+        .expect("insert idle hint");
+
+        let due: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_schedule_hints h \
+                 JOIN projects p ON p.project_id = h.project_id \
+                 WHERE p.status = 'active' AND h.enabled_count > 0 \
+                 AND h.next_run_at <= '2027-01-01T00:00:00Z'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("due query");
+        assert_eq!(due, 1, "only the project with a pending schedule is due");
+
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_schedule_hints_due'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("index lookup");
+        assert_eq!(idx, 1);
+
+        // Idempotent: a second pass applies nothing and records nothing twice.
+        run_migrations(&conn).expect("re-run migrations");
+        let versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_studio_schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .expect("version count");
+        assert_eq!(versions, 2);
+        let hints: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project_schedule_hints", [], |r| {
+                r.get(0)
+            })
+            .expect("hint count");
+        assert_eq!(hints, 2, "re-running migrations must not drop data");
+    }
+}

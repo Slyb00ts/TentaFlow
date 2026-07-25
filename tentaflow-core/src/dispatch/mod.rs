@@ -1900,6 +1900,67 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Ps::CodeAssistRequest { .. } => "ProjectStudioCodeAssistRequest",
                 Ps::CodeAssistStreamChunk { .. } => "ProjectStudioCodeAssistStreamChunk",
                 Ps::CodeAssistStreamEnd { .. } => "ProjectStudioCodeAssistStreamEnd",
+                Ps::SchedulesListRequest { .. } => "ProjectStudioSchedulesListRequest",
+                Ps::SchedulesListResponse { .. } => "ProjectStudioSchedulesListResponse",
+                Ps::ScheduleSaveRequest { .. } => "ProjectStudioScheduleSaveRequest",
+                Ps::ScheduleSaveResponse { .. } => "ProjectStudioScheduleSaveResponse",
+                Ps::ScheduleDeleteRequest { .. } => "ProjectStudioScheduleDeleteRequest",
+                Ps::ScheduleDeleteResult { .. } => "ProjectStudioScheduleDeleteResult",
+                Ps::ScheduleSetEnabledRequest { .. } => "ProjectStudioScheduleSetEnabledRequest",
+                Ps::ScheduleSetEnabledResult { .. } => "ProjectStudioScheduleSetEnabledResult",
+                Ps::ScheduleRunNowRequest { .. } => "ProjectStudioScheduleRunNowRequest",
+                Ps::ScheduleRunNowResponse { .. } => "ProjectStudioScheduleRunNowResponse",
+                Ps::ScheduleRunsListRequest { .. } => "ProjectStudioScheduleRunsListRequest",
+                Ps::ScheduleRunsListResponse { .. } => "ProjectStudioScheduleRunsListResponse",
+                Ps::MlLinksListRequest { .. } => "ProjectStudioMlLinksListRequest",
+                Ps::MlLinksListResponse { .. } => "ProjectStudioMlLinksListResponse",
+                Ps::MlProjectCreateFromProjectRequest { .. } => {
+                    "ProjectStudioMlProjectCreateFromProjectRequest"
+                }
+                Ps::MlProjectCreateFromProjectResponse { .. } => {
+                    "ProjectStudioMlProjectCreateFromProjectResponse"
+                }
+                Ps::MlProjectCandidatesRequest { .. } => "ProjectStudioMlProjectCandidatesRequest",
+                Ps::MlProjectCandidatesResponse { .. } => {
+                    "ProjectStudioMlProjectCandidatesResponse"
+                }
+                Ps::MlLinkAttachRequest { .. } => "ProjectStudioMlLinkAttachRequest",
+                Ps::MlLinkAttachResponse { .. } => "ProjectStudioMlLinkAttachResponse",
+                Ps::MlLinkUpdateRequest { .. } => "ProjectStudioMlLinkUpdateRequest",
+                Ps::MlLinkUpdateResult { .. } => "ProjectStudioMlLinkUpdateResult",
+                Ps::MlLinkDetachRequest { .. } => "ProjectStudioMlLinkDetachRequest",
+                Ps::MlLinkDetachResult { .. } => "ProjectStudioMlLinkDetachResult",
+                Ps::MlLinkSyncNowRequest { .. } => "ProjectStudioMlLinkSyncNowRequest",
+                Ps::MlLinkSyncNowResponse { .. } => "ProjectStudioMlLinkSyncNowResponse",
+                Ps::TaskStatusSetRequest { .. } => "ProjectStudioTaskStatusSetRequest",
+                Ps::TaskStatusSetResult { .. } => "ProjectStudioTaskStatusSetResult",
+                Ps::ProjectExportStartRequest { .. } => "ProjectStudioProjectExportStartRequest",
+                Ps::ProjectExportStartResponse { .. } => "ProjectStudioProjectExportStartResponse",
+                Ps::ProjectExportStatusRequest { .. } => "ProjectStudioProjectExportStatusRequest",
+                Ps::ProjectExportStatusResponse { .. } => {
+                    "ProjectStudioProjectExportStatusResponse"
+                }
+                Ps::ProjectImportUploadChunkRequest { .. } => {
+                    "ProjectStudioProjectImportUploadChunkRequest"
+                }
+                Ps::ProjectImportUploadChunkResponse { .. } => {
+                    "ProjectStudioProjectImportUploadChunkResponse"
+                }
+                Ps::ProjectImportPreviewRequest { .. } => {
+                    "ProjectStudioProjectImportPreviewRequest"
+                }
+                Ps::ProjectImportPreviewResponse { .. } => {
+                    "ProjectStudioProjectImportPreviewResponse"
+                }
+                Ps::ProjectImportApplyRequest { .. } => "ProjectStudioProjectImportApplyRequest",
+                Ps::ProjectImportApplyResponse { .. } => "ProjectStudioProjectImportApplyResponse",
+                Ps::ProjectImportStatusRequest { .. } => "ProjectStudioProjectImportStatusRequest",
+                Ps::ProjectImportStatusResponse { .. } => {
+                    "ProjectStudioProjectImportStatusResponse"
+                }
+                Ps::ArchiveStreamRequest { .. } => "ProjectStudioArchiveStreamRequest",
+                Ps::ArchiveStreamChunk { .. } => "ProjectStudioArchiveStreamChunk",
+                Ps::ArchiveStreamEnd { .. } => "ProjectStudioArchiveStreamEnd",
             }
         }
     }

@@ -781,6 +781,10 @@ pub async fn project_studio_dispatch(
             from_date,
             to_date,
             suite_id,
+            // Consumed by the F4 report kinds (perf_compare, tester_activity);
+            // bound explicitly so a further field addition still fails to compile.
+            run_ids: _,
+            case_kind: _,
         } => report_query_v1(ctx, project_id, report, from_date, to_date, suite_id),
         // ---- F3: environments, build profiles, automated runs, code sources ----
         P::EnvironmentsListRequest { project_id } => environments_list_v1(ctx, project_id),
@@ -998,6 +1002,12 @@ pub async fn project_studio_dispatch(
         | P::CodeAssistStreamChunk { .. }
         | P::CodeAssistStreamEnd { .. } => Err(ProtocolError::bad_request(
             "variant is not a valid project studio request",
+        )),
+        // F4 wave 1 ships the wire contract and the schema only. The F4
+        // backend waves replace this arm with the real handler routing, at
+        // which point the match becomes exhaustive again.
+        _ => Err(ProtocolError::bad_request(
+            "project studio variant not handled yet",
         )),
     }
 }
@@ -2868,6 +2878,11 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
             environments_approved: f3.environments_approved,
             environments_pending: f3.environments_pending,
             auto_runs_open: f3.auto_runs_open,
+            // Zero until the F4 backend wave adds the schedule/ML-link
+            // counters — the tables exist but nothing writes them yet.
+            schedules_enabled: 0,
+            schedules_blocked: 0,
+            ml_links: 0,
         },
         activity: activity_to_wire(entries, &names),
     }))

@@ -267,6 +267,7 @@ const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
     (1, PROJECT_SCHEMA_V1),
     (2, PROJECT_SCHEMA_V2),
     (3, PROJECT_SCHEMA_V3),
+    (4, PROJECT_SCHEMA_V4),
 ];
 
 const PROJECT_SCHEMA_V1: &str = "
@@ -595,6 +596,74 @@ CREATE INDEX idx_run_items_run ON test_run_items(run_id, position);
 CREATE INDEX idx_run_items_assignee ON test_run_items(assigned_to, status);
 ";
 
+/// F4: run schedules with their trigger history and ML Studio links.
+///
+/// Pure additive migration — no table is rebuilt, because no existing CHECK
+/// changes: `test_runs.run_type` has never been constrained (so the new 'perf'
+/// schedules write it freely) and `tasks.status` already allows exactly the
+/// four kanban columns.
+///
+/// `next_run_at` is NULLABLE on purpose: the loop selects `next_run_at <= now`
+/// and an empty string would sort BEFORE every timestamp, making a finished
+/// one-shot schedule permanently "due". NULL never satisfies the comparison.
+///
+/// `assignment_mode` keeps the run-level CHECK; automated and perf schedules
+/// store 'pool' (what `create_auto_run` writes), manual ones the tester's choice.
+const PROJECT_SCHEMA_V4: &str = "
+CREATE TABLE schedules (
+    schedule_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    auto_disabled INTEGER NOT NULL DEFAULT 0,
+    run_type TEXT NOT NULL DEFAULT 'manual' CHECK(run_type IN ('manual','auto','perf')),
+    suite_id TEXT NOT NULL DEFAULT '',
+    case_ids_json TEXT NOT NULL DEFAULT '[]',
+    environment_id TEXT NOT NULL DEFAULT '',
+    runner_service_id TEXT NOT NULL DEFAULT '',
+    perf_profile_json TEXT NOT NULL DEFAULT '{}',
+    assignment_mode TEXT NOT NULL DEFAULT 'pool' CHECK(assignment_mode IN ('single','per_case','pool')),
+    assignees_json TEXT NOT NULL DEFAULT '[]',
+    schedule_kind TEXT NOT NULL CHECK(schedule_kind IN ('once','interval','cron')),
+    schedule_expr TEXT NOT NULL,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    next_run_at TEXT,
+    last_trigger_at TEXT NOT NULL DEFAULT '',
+    last_run_id TEXT NOT NULL DEFAULT '',
+    last_status TEXT NOT NULL DEFAULT '',
+    last_reason TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at);
+CREATE TABLE schedule_runs (
+    trigger_id TEXT PRIMARY KEY,
+    schedule_id TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL DEFAULT '',
+    fired_at TEXT NOT NULL DEFAULT (datetime('now')),
+    outcome TEXT NOT NULL CHECK(outcome IN ('started','skipped','blocked','error')),
+    reason TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
+    run_status TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_schedule_runs_schedule ON schedule_runs(schedule_id, fired_at DESC);
+CREATE TABLE ml_links (
+    link_id TEXT PRIMARY KEY,
+    ml_project_id TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL CHECK(origin IN ('created_from_project','linked_existing')),
+    sync_permissions INTEGER NOT NULL DEFAULT 0,
+    role_map_json TEXT NOT NULL DEFAULT '[]',
+    last_sync_at TEXT NOT NULL DEFAULT '',
+    last_sync_result TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,7 +784,7 @@ mod tests {
         }
 
         let (pool, version) = open_pool_at(&dir).expect("migrate to v3");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4, "a seeded v2 database reaches the latest schema");
         let conn = pool.write().expect("write");
 
         // Every pre-rebuild row survived with its values intact.
@@ -824,5 +893,207 @@ mod tests {
             )
             .expect("secret_enc column");
         assert_eq!(secret, "");
+    }
+
+    /// v3 → v4 on a REAL v3 database: existing rows survive, the three new
+    /// tables are queryable with their CHECKs and UNIQUE in force, and the
+    /// tables F4 writes through (`test_runs.run_type = 'perf'`, the four
+    /// kanban `tasks.status` values) still accept their values WITHOUT a
+    /// rebuild — that is the whole reason this migration is purely additive.
+    #[test]
+    fn migration_v4_adds_schedule_and_ml_tables() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&dir).expect("create project dir");
+
+        // Seed a genuine v3 database, then put rows in it that must survive.
+        {
+            let conn = Connection::open(dir.join("project.db")).expect("open v3");
+            conn.execute_batch(
+                "CREATE TABLE project_schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+            )
+            .expect("version table");
+            for (version, sql) in &MIGRATIONS_PROJECT[..3] {
+                assert!(*version <= 3, "test must seed a v3 database");
+                conn.execute_batch(sql).expect("apply v1..v3");
+                conn.execute(
+                    "INSERT INTO project_schema_version (version) VALUES (?1)",
+                    rusqlite::params![version],
+                )
+                .expect("record version");
+            }
+            conn.execute(
+                "INSERT INTO test_cases (case_id, title, created_by) \
+                 VALUES ('c1', 'logowanie', 'u1')",
+                [],
+            )
+            .expect("insert case");
+            conn.execute(
+                "INSERT INTO tasks (task_id, task_no, title, status, created_by) \
+                 VALUES ('t1', 1, 'poprawka', 'review', 'u1')",
+                [],
+            )
+            .expect("insert task");
+            conn.execute(
+                "INSERT INTO environments (environment_id, name, base_url, requested_by) \
+                 VALUES ('e1', 'staging', 'https://example.test', 'u1')",
+                [],
+            )
+            .expect("insert environment");
+        }
+
+        let (pool, version) = open_pool_at(&dir).expect("migrate to v4");
+        assert_eq!(version, 4);
+        let conn = pool.write().expect("write");
+
+        // Pre-migration rows are untouched.
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM test_cases WHERE case_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("case row");
+        assert_eq!(title, "logowanie");
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE task_id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .expect("task row");
+        assert_eq!(status, "review");
+        let env_name: String = conn
+            .query_row(
+                "SELECT name FROM environments WHERE environment_id = 'e1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("environment row");
+        assert_eq!(env_name, "staging");
+
+        // The new tables exist and are queryable.
+        for table in ["schedules", "schedule_runs", "ml_links"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("new table queryable");
+            assert_eq!(n, 0);
+        }
+
+        conn.execute(
+            "INSERT INTO schedules (schedule_id, name, run_type, schedule_kind, \
+             schedule_expr, timezone, next_run_at, created_by) \
+             VALUES ('sc1', 'nocny', 'perf', 'cron', '30 2 * * *', 'Europe/Warsaw', \
+             '2026-08-01T00:30:00Z', 'u1')",
+            [],
+        )
+        .expect("insert schedule");
+        // A finished one-shot keeps next_run_at NULL, so the due query never
+        // picks it up again (an empty string would sort before every date).
+        conn.execute(
+            "INSERT INTO schedules (schedule_id, name, run_type, schedule_kind, \
+             schedule_expr, enabled, next_run_at, created_by) \
+             VALUES ('sc2', 'jednorazowy', 'auto', 'once', '2026-01-01T00:00:00Z', 0, \
+             NULL, 'u1')",
+            [],
+        )
+        .expect("insert one-shot schedule");
+        let due: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schedules WHERE enabled = 1 AND auto_disabled = 0 \
+                 AND next_run_at <= '2027-01-01T00:00:00Z'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("due query");
+        assert_eq!(due, 1, "only the enabled schedule with a date is due");
+
+        // CHECK constraints reject junk in every constrained column.
+        for sql in [
+            "INSERT INTO schedules (schedule_id, name, run_type, schedule_kind, \
+             schedule_expr, created_by) VALUES ('x1', 'n', 'bogus', 'cron', '* * * * *', 'u1')",
+            "INSERT INTO schedules (schedule_id, name, schedule_kind, schedule_expr, \
+             created_by) VALUES ('x2', 'n', 'weekly', '* * * * *', 'u1')",
+            "INSERT INTO schedules (schedule_id, name, assignment_mode, schedule_kind, \
+             schedule_expr, created_by) VALUES ('x3', 'n', 'nobody', 'cron', '* * * * *', 'u1')",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "CHECK accepted junk: {sql}");
+        }
+
+        conn.execute(
+            "INSERT INTO schedule_runs (trigger_id, schedule_id, scheduled_for, outcome, \
+             reason) VALUES ('tr1', 'sc1', '2026-08-01T00:30:00Z', 'blocked', \
+             'srodowisko niezatwierdzone')",
+            [],
+        )
+        .expect("insert trigger");
+        assert!(
+            conn.execute(
+                "INSERT INTO schedule_runs (trigger_id, schedule_id, outcome) \
+                 VALUES ('tr2', 'sc1', 'exploded')",
+                [],
+            )
+            .is_err(),
+            "schedule_runs.outcome CHECK accepted junk"
+        );
+
+        conn.execute(
+            "INSERT INTO ml_links (link_id, ml_project_id, origin, created_by) \
+             VALUES ('l1', 'ml1', 'linked_existing', 'u1')",
+            [],
+        )
+        .expect("insert ml link");
+        assert!(
+            conn.execute(
+                "INSERT INTO ml_links (link_id, ml_project_id, origin, created_by) \
+                 VALUES ('l2', 'ml1', 'created_from_project', 'u1')",
+                [],
+            )
+            .is_err(),
+            "ml_links.ml_project_id UNIQUE not enforced"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO ml_links (link_id, ml_project_id, origin, created_by) \
+                 VALUES ('l3', 'ml2', 'stolen', 'u1')",
+                [],
+            )
+            .is_err(),
+            "ml_links.origin CHECK accepted junk"
+        );
+
+        for idx in ["idx_schedules_due", "idx_schedule_runs_schedule"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    rusqlite::params![idx],
+                    |r| r.get(0),
+                )
+                .expect("index lookup");
+            assert_eq!(n, 1, "index {idx} missing");
+        }
+
+        // No rebuild was needed: the tables F4 writes through already accept
+        // every value it produces.
+        conn.execute(
+            "INSERT INTO test_runs (run_id, run_no, name, run_type, assignment_mode, \
+             created_by) VALUES ('r1', 1, 'perf nocny', 'perf', 'pool', 'u1')",
+            [],
+        )
+        .expect("test_runs.run_type accepts 'perf' without a rebuild");
+        for (id, no, status) in [
+            ("k1", 2, "todo"),
+            ("k2", 3, "in_progress"),
+            ("k3", 4, "review"),
+            ("k4", 5, "done"),
+        ] {
+            conn.execute(
+                "INSERT INTO tasks (task_id, task_no, title, status, created_by) \
+                 VALUES (?1, ?2, 'karta', ?3, 'u1')",
+                rusqlite::params![id, no, status],
+            )
+            .expect("tasks.status accepts every kanban column without a rebuild");
+        }
     }
 }

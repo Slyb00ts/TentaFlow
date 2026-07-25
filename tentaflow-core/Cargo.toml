@@ -247,6 +247,10 @@ rustc-hash = "2.1.2"
 # Utils
 uuid = { version = "1.23.3", features = ["v4", "v5", "v7"] }
 chrono = { version = "0.4.45", features = ["serde"] }
+# IANA timezone database for chrono. Project Studio run schedules evaluate a
+# daily cron expression in the user's zone, so DST transitions must resolve
+# against real tz rules instead of a fixed UTC offset.
+chrono-tz = "0.10.4"
 rand = "0.10.1"
 rand_core = "0.10"
 getrandom = "0.4.3"

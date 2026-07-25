@@ -180,6 +180,17 @@ pub struct OverviewKpis {
     pub environments_pending: u32,
     #[serde(default)]
     pub auto_runs_open: u32,
+    // F4 counters appended with #[serde(default)] for the same reason:
+    // frames produced by F3 peers omit them and must still decode.
+    #[serde(default)]
+    pub schedules_enabled: u32,
+    /// Enabled schedules that cannot fire (environment not approved or the
+    /// failure breaker tripped) — the overview flags them before they silently
+    /// stop producing runs.
+    #[serde(default)]
+    pub schedules_blocked: u32,
+    #[serde(default)]
+    pub ml_links: u32,
 }
 
 /// One activity-log entry for the project feed.
@@ -671,6 +682,162 @@ pub struct PerfTimelinePoint {
     pub p90_ms: f64,
     pub failures: u64,
     pub users: u32,
+}
+
+/// Scheduled run definition (F4). `next_run_at` and `next_runs_preview` are
+/// computed SERVER-side from `schedule_kind`/`schedule_expr`/`timezone` — the
+/// UI must never recompute them, otherwise the preview and the loop that
+/// actually fires would disagree around DST transitions. `auto_disabled`
+/// marks a schedule stopped by the failure breaker (resume is manual only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleInfo {
+    pub schedule_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub auto_disabled: bool,
+    /// 'manual' | 'auto' | 'perf'.
+    pub run_type: String,
+    pub suite_id: String,
+    pub suite_name: String,
+    pub case_ids: Vec<String>,
+    pub cases_count: u32,
+    pub environment_id: String,
+    pub environment_name: String,
+    /// Approval state of the bound environment ('' when none is bound). A
+    /// schedule whose environment is not 'approved' is blocked at fire time.
+    pub environment_status: String,
+    pub runner_service_id: String,
+    pub runner_display_name: String,
+    pub perf_profile_json: String,
+    /// 'single' | 'per_case' | 'pool' (manual runs only).
+    pub assignment_mode: String,
+    pub assignees: Vec<String>,
+    /// 'once' | 'interval' | 'cron'.
+    pub schedule_kind: String,
+    /// RFC3339 instant ('once'), duration like '30m'/'1h'/'1d' ('interval')
+    /// or a daily 'minute hour * * *' expression ('cron').
+    pub schedule_expr: String,
+    /// IANA timezone name the cron expression is evaluated in.
+    pub timezone: String,
+    pub next_run_at: String,
+    /// Next three fire instants, already rendered by the server.
+    pub next_runs_preview: Vec<String>,
+    pub last_trigger_at: String,
+    pub last_run_id: String,
+    pub last_run_no: u32,
+    /// Last run status, or the trigger outcome when nothing started.
+    pub last_status: String,
+    pub last_reason: String,
+    pub consecutive_failures: u32,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One trigger attempt of a schedule. Attempts that did NOT start a run are
+/// recorded too ('skipped' / 'blocked' / 'error' with a reason), so an admin
+/// can tell "never fired" from "fired and refused".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleRunWire {
+    pub trigger_id: String,
+    pub scheduled_for: String,
+    pub fired_at: String,
+    /// 'started' | 'skipped' | 'blocked' | 'error'.
+    pub outcome: String,
+    pub reason: String,
+    pub run_id: String,
+    pub run_no: u32,
+    pub run_status: String,
+    /// '' for loop-fired triggers, the user id for "run now".
+    pub actor: String,
+    pub actor_name: String,
+}
+
+/// One row of the project-role → ML-Studio-role mapping. ML Studio only knows
+/// 'editor' and 'viewer', so the five project roles collapse onto two.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MlRoleMapEntry {
+    /// 'owner' | 'manager' | 'editor' | 'tester' | 'viewer'.
+    pub project_role: String,
+    /// 'editor' | 'viewer'.
+    pub ml_role: String,
+}
+
+/// Read-only ML Studio project snapshot rendered on the project card. Training
+/// details are flattened (no nested struct) because the card shows them as
+/// plain fields and a nested optional would only add a wire level.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MlProjectSummaryWire {
+    pub ml_project_id: String,
+    pub name: String,
+    pub project_type: String,
+    pub project_type_label: String,
+    pub status: String,
+    pub dataset_count: u32,
+    pub model_count: u32,
+    /// Model display names, capped server-side for the chip row.
+    pub models: Vec<String>,
+    pub last_training_run_id: String,
+    pub last_training_status: String,
+    pub last_training_started_at: String,
+    pub last_training_finished_at: String,
+    pub last_training_metrics_json: String,
+    pub training_in_progress: bool,
+    /// Dashboard route opening this project in ML Studio.
+    pub deep_link: String,
+}
+
+/// Link between a Project Studio project and an ML Studio project.
+/// `summary` is `None` when the ML project is gone or unreadable;
+/// `can_open` reflects the caller's ML membership, NOT the project role.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MlLinkInfo {
+    pub link_id: String,
+    pub ml_project_id: String,
+    pub label: String,
+    /// 'created_from_project' | 'linked_existing'.
+    pub origin: String,
+    pub sync_permissions: bool,
+    pub role_map: Vec<MlRoleMapEntry>,
+    pub last_sync_at: String,
+    pub last_sync_result: String,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub created_at: String,
+    pub summary: Option<MlProjectSummaryWire>,
+    pub can_open: bool,
+}
+
+/// Result of one permission-sync pass over a link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MlSyncOutcomeWire {
+    pub applied_add: u32,
+    pub applied_update: u32,
+    pub applied_remove: u32,
+    pub skipped: u32,
+    pub errors: Vec<String>,
+}
+
+/// Content census of an export archive. Shown before an import so the user
+/// decides with the real sizes in hand; `vector_dim`/`embedding_*` carry the
+/// fingerprint that decides whether the vector file can be reused verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveInventoryWire {
+    pub cases: u32,
+    pub suites: u32,
+    pub runs: u32,
+    pub tasks: u32,
+    pub documents: u32,
+    pub sources: u32,
+    pub files: u32,
+    pub bytes_files: u64,
+    pub bytes_runs: u64,
+    pub vectors: u64,
+    pub vector_dim: u32,
+    pub embedding_alias: String,
+    /// Model the alias resolved to when the archive was written.
+    pub embedding_model: String,
 }
 
 /// Project Studio message family (request + response + stream). ciborium
@@ -1524,6 +1691,12 @@ pub enum ProjectStudioPayload {
         to_date: String,
         #[serde(default)]
         suite_id: String,
+        /// F4: explicit run selection ('perf_compare' takes exactly two).
+        #[serde(default)]
+        run_ids: Vec<String>,
+        /// F4: restricts the report to one case kind ('' = all kinds).
+        #[serde(default)]
+        case_kind: String,
     },
     ReportQueryResponse {
         rows_json: String,
@@ -1798,8 +1971,298 @@ pub enum ProjectStudioPayload {
         proposal: String,
         error: Option<String>,
     },
+    // ---- F4: run schedules (T13) ----
+    SchedulesListRequest {
+        project_id: String,
+    },
+    /// `server_timezone` is the node's IANA zone: the UI renders "next run"
+    /// hints next to it so a user in another zone reads the same instant the
+    /// scheduling loop will use.
+    SchedulesListResponse {
+        schedules: Vec<ScheduleInfo>,
+        server_timezone: String,
+    },
+    /// `schedule_id: None` = create. Carries the COMPLETE definition — every
+    /// omitted field is a real clear, so the toggle in the list row must not
+    /// reuse this variant (see ScheduleSetEnabledRequest).
+    ScheduleSaveRequest {
+        project_id: String,
+        #[serde(default)]
+        schedule_id: Option<String>,
+        name: String,
+        run_type: String,
+        #[serde(default)]
+        suite_id: String,
+        #[serde(default)]
+        case_ids: Vec<String>,
+        #[serde(default)]
+        environment_id: String,
+        #[serde(default)]
+        runner_service_id: String,
+        #[serde(default)]
+        perf_profile_json: String,
+        #[serde(default)]
+        assignment_mode: String,
+        #[serde(default)]
+        assignees: Vec<String>,
+        schedule_kind: String,
+        schedule_expr: String,
+        #[serde(default)]
+        timezone: String,
+        enabled: bool,
+    },
+    ScheduleSaveResponse {
+        schedule_id: String,
+        next_run_at: String,
+        next_runs_preview: Vec<String>,
+    },
+    ScheduleDeleteRequest {
+        project_id: String,
+        schedule_id: String,
+    },
+    ScheduleDeleteResult {
+        ok: bool,
+    },
+    /// Enable/disable toggle from the list row. Separate from ScheduleSave on
+    /// purpose: the row does not hold the full definition, so saving through
+    /// ScheduleSaveRequest would clear cases, assignees and the perf profile.
+    ScheduleSetEnabledRequest {
+        project_id: String,
+        schedule_id: String,
+        enabled: bool,
+    },
+    /// Re-enabling recomputes the next fire instant and clears the breaker,
+    /// so the server returns the fresh schedule state instead of a bare ok.
+    ScheduleSetEnabledResult {
+        ok: bool,
+        next_run_at: String,
+        auto_disabled: bool,
+    },
+    /// Fires a schedule immediately through the same gate chain as the loop;
+    /// it never moves `next_run_at`.
+    ScheduleRunNowRequest {
+        project_id: String,
+        schedule_id: String,
+    },
+    ScheduleRunNowResponse {
+        /// 'started' | 'skipped' | 'blocked' | 'error'.
+        outcome: String,
+        reason: String,
+        run_id: String,
+        run_no: u32,
+    },
+    ScheduleRunsListRequest {
+        project_id: String,
+        schedule_id: String,
+        #[serde(default)]
+        limit: u32,
+    },
+    ScheduleRunsListResponse {
+        runs: Vec<ScheduleRunWire>,
+    },
+    // ---- F4: ML Studio links (X02) ----
+    MlLinksListRequest {
+        project_id: String,
+    },
+    /// Summaries are returned to every project viewer; `can_manage` gates the
+    /// create/attach/detach actions, `MlLinkInfo::can_open` gates the deep link.
+    MlLinksListResponse {
+        links: Vec<MlLinkInfo>,
+        can_manage: bool,
+    },
+    MlProjectCreateFromProjectRequest {
+        project_id: String,
+        ml_name: String,
+        project_type: String,
+        role_map: Vec<MlRoleMapEntry>,
+        sync_permissions: bool,
+        #[serde(default)]
+        label: String,
+    },
+    MlProjectCreateFromProjectResponse {
+        link_id: String,
+        ml_project_id: String,
+        members_mapped: u32,
+        members_skipped: u32,
+    },
+    /// ML projects the caller OWNS and that are not linked yet — attaching
+    /// requires ownership, since the sync writes through owner-only calls.
+    MlProjectCandidatesRequest {
+        project_id: String,
+    },
+    MlProjectCandidatesResponse {
+        candidates: Vec<MlProjectSummaryWire>,
+    },
+    MlLinkAttachRequest {
+        project_id: String,
+        ml_project_id: String,
+        #[serde(default)]
+        label: String,
+        sync_permissions: bool,
+        #[serde(default)]
+        role_map: Vec<MlRoleMapEntry>,
+    },
+    MlLinkAttachResponse {
+        link_id: String,
+    },
+    MlLinkUpdateRequest {
+        project_id: String,
+        link_id: String,
+        #[serde(default)]
+        label: String,
+        sync_permissions: bool,
+        #[serde(default)]
+        role_map: Vec<MlRoleMapEntry>,
+    },
+    MlLinkUpdateResult {
+        ok: bool,
+    },
+    /// `revoke_members` also removes the ML memberships this link granted
+    /// (never the ML owner). The ML project itself is never deleted.
+    MlLinkDetachRequest {
+        project_id: String,
+        link_id: String,
+        revoke_members: bool,
+    },
+    MlLinkDetachResult {
+        ok: bool,
+        members_removed: u32,
+    },
+    MlLinkSyncNowRequest {
+        project_id: String,
+        link_id: String,
+    },
+    MlLinkSyncNowResponse {
+        outcome: MlSyncOutcomeWire,
+        last_sync_at: String,
+        last_sync_result: String,
+    },
+    // ---- F4: kanban board (Z01) ----
+    /// Status-only task move. TaskInfo (what the board renders) does NOT carry
+    /// `description_md` or `attachments`, so dragging a card through
+    /// TaskSaveRequest would write those back as empty and destroy them.
+    TaskStatusSetRequest {
+        project_id: String,
+        task_id: String,
+        /// 'todo' | 'in_progress' | 'review' | 'done'.
+        status: String,
+    },
+    TaskStatusSetResult {
+        ok: bool,
+        updated_at: String,
+    },
+    // ---- F4: project export / import ----
+    ProjectExportStartRequest {
+        project_id: String,
+        include_runs: bool,
+        include_vectors: bool,
+        /// Copies display names into the archive so historical authorship
+        /// stays readable on the target node (personal data — audited).
+        include_user_names: bool,
+    },
+    ProjectExportStartResponse {
+        job_id: String,
+    },
+    ProjectExportStatusRequest {
+        project_id: String,
+        job_id: String,
+    },
+    /// Polling this is the source of truth; ArchiveStream is only a live view.
+    /// `signed_url` is populated once the archive is complete — the archive is
+    /// downloaded over HTTP (signed URL) rather than the binary protocol
+    /// because it can reach tens of gigabytes.
+    ProjectExportStatusResponse {
+        job_id: String,
+        /// 'running' | 'success' | 'failed' | 'cancelled'.
+        status: String,
+        progress_pct: u32,
+        phase: String,
+        error: String,
+        export_ref: String,
+        signed_url: String,
+        archive_bytes: u64,
+        inventory: Option<ArchiveInventoryWire>,
+    },
+    /// Chunked archive upload straight to disk (`upload_id` is client-minted).
+    ProjectImportUploadChunkRequest {
+        upload_id: String,
+        filename: String,
+        seq: u32,
+        total_chunks: u32,
+        /// Raw chunk bytes. `serde_bytes` forces a CBOR byte-string; a bare
+        /// `Vec<u8>` would encode as an array of integers (~2x the size).
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    ProjectImportUploadChunkResponse {
+        complete: bool,
+    },
+    /// Reads ONLY the manifest of an uploaded archive — nothing is unpacked
+    /// before the user confirms.
+    ProjectImportPreviewRequest {
+        upload_id: String,
+    },
+    ProjectImportPreviewResponse {
+        archive_version: u32,
+        exported_at: String,
+        source_node_id: String,
+        project_name: String,
+        template: String,
+        modules: Vec<String>,
+        inventory: ArchiveInventoryWire,
+        total_uncompressed_bytes: u64,
+        /// True when the embedding fingerprint matches this node, so the
+        /// vector file can be moved verbatim instead of re-indexed.
+        vectors_reusable: bool,
+        vectors_reason: String,
+        has_runs: bool,
+    },
+    ProjectImportApplyRequest {
+        upload_id: String,
+        #[serde(default)]
+        name_override: String,
+        import_vectors: bool,
+        import_runs: bool,
+    },
+    ProjectImportApplyResponse {
+        job_id: String,
+    },
+    ProjectImportStatusRequest {
+        job_id: String,
+    },
+    ProjectImportStatusResponse {
+        job_id: String,
+        /// 'running' | 'success' | 'failed' | 'cancelled'.
+        status: String,
+        progress_pct: u32,
+        phase: String,
+        error: String,
+        /// Set once the project row exists (import is all-or-nothing).
+        project_id: String,
+        reindex_job_ids: Vec<String>,
+        vectors_imported: bool,
+    },
+    /// Live progress of an export or import job (job owner only). Stream
+    /// initiating request — no plain response.
+    ArchiveStreamRequest {
+        job_id: String,
+    },
+    ArchiveStreamChunk {
+        job_id: String,
+        phase: String,
+        line: String,
+        progress_pct: u32,
+        ts_ms: i64,
+    },
+    ArchiveStreamEnd {
+        job_id: String,
+        status: String,
+        error: Option<String>,
+    },
     // ================================================================
-    // Append-only past this point (F4+: schedules, kanban, exports).
+    // Append-only past this point. F5+ additions (REST/MCP facades,
+    // mesh sync) go into a NEW sub-enum instead: this one is nearing
+    // the 256-variant budget of the frame format.
     // Never insert above: reordering existing variants breaks the wire
     // contract with older peers, so new variants go strictly at the end.
     // ================================================================
@@ -2029,6 +2492,112 @@ mod tests {
                 "a17552756e417274696661637447657452657175657374a36a70726f6a6563745f69646270316b61727469666163745f6964626131696d61785f6279746573190400"
             ),
             "RunArtifactGetRequest wire drift"
+        );
+
+        // F4: ScheduleSaveRequest — pins the first appended F4 variant with
+        // its complete field set (the toggle path must NOT reuse it).
+        let sched = ProjectStudioPayload::ScheduleSaveRequest {
+            project_id: "p1".to_string(),
+            schedule_id: None,
+            name: "nocny".to_string(),
+            run_type: "auto".to_string(),
+            suite_id: "s1".to_string(),
+            case_ids: vec![],
+            environment_id: "e1".to_string(),
+            runner_service_id: String::new(),
+            perf_profile_json: String::new(),
+            assignment_mode: String::new(),
+            assignees: vec![],
+            schedule_kind: "cron".to_string(),
+            schedule_expr: "30 2 * * *".to_string(),
+            timezone: "Europe/Warsaw".to_string(),
+            enabled: true,
+        };
+        let bytes = crate::cbor::encode(&sched).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a1735363686564756c655361766552657175657374af6a70726f6a6563745f69646270316b7363686564756c655f6964f6646e616d65656e6f636e796872756e5f74797065646175746f6873756974655f696462733168636173655f696473806e656e7669726f6e6d656e745f69646265317172756e6e65725f736572766963655f69646071706572665f70726f66696c655f6a736f6e606f61737369676e6d656e745f6d6f6465606961737369676e656573806d7363686564756c655f6b696e646463726f6e6d7363686564756c655f657870726a33302032202a202a202a6874696d657a6f6e656d4575726f70652f57617273617767656e61626c6564f5"
+            ),
+            "ScheduleSaveRequest wire drift"
+        );
+
+        // F4: MlLinksListResponse with a full MlLinkInfo (nested role map and
+        // Some(summary)) — pins the ML link payload end to end.
+        let links = ProjectStudioPayload::MlLinksListResponse {
+            links: vec![MlLinkInfo {
+                link_id: "l1".to_string(),
+                ml_project_id: "m1".to_string(),
+                label: "wizja".to_string(),
+                origin: "linked_existing".to_string(),
+                sync_permissions: true,
+                role_map: vec![MlRoleMapEntry {
+                    project_role: "tester".to_string(),
+                    ml_role: "viewer".to_string(),
+                }],
+                last_sync_at: "t".to_string(),
+                last_sync_result: "ok".to_string(),
+                created_by: "u1".to_string(),
+                created_by_name: "U".to_string(),
+                created_at: "t".to_string(),
+                summary: Some(MlProjectSummaryWire {
+                    ml_project_id: "m1".to_string(),
+                    name: "Wizja".to_string(),
+                    project_type: "detection".to_string(),
+                    project_type_label: "Detekcja".to_string(),
+                    status: "active".to_string(),
+                    dataset_count: 2,
+                    model_count: 1,
+                    models: vec!["yolo".to_string()],
+                    last_training_run_id: "tr1".to_string(),
+                    last_training_status: "completed".to_string(),
+                    last_training_started_at: "t".to_string(),
+                    last_training_finished_at: "t".to_string(),
+                    last_training_metrics_json: "{}".to_string(),
+                    training_in_progress: false,
+                    deep_link: "/ml/m1".to_string(),
+                }),
+                can_open: true,
+            }],
+            can_manage: true,
+        };
+        let bytes = crate::cbor::encode(&links).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a1734d6c4c696e6b734c697374526573706f6e7365a2656c696e6b7381ad676c696e6b5f6964626c316d6d6c5f70726f6a6563745f6964626d31656c6162656c6577697a6a61666f726967696e6f6c696e6b65645f6578697374696e677073796e635f7065726d697373696f6e73f568726f6c655f6d617081a26c70726f6a6563745f726f6c6566746573746572676d6c5f726f6c65667669657765726c6c6173745f73796e635f61746174706c6173745f73796e635f726573756c74626f6b6a637265617465645f62796275316f637265617465645f62795f6e616d6561556a637265617465645f617461746773756d6d617279af6d6d6c5f70726f6a6563745f6964626d31646e616d656557697a6a616c70726f6a6563745f7479706569646574656374696f6e7270726f6a6563745f747970655f6c6162656c68446574656b636a6166737461747573666163746976656d646174617365745f636f756e74026b6d6f64656c5f636f756e7401666d6f64656c738164796f6c6f746c6173745f747261696e696e675f72756e5f696463747231746c6173745f747261696e696e675f73746174757369636f6d706c6574656478186c6173745f747261696e696e675f737461727465645f6174617478196c6173745f747261696e696e675f66696e69736865645f61746174781a6c6173745f747261696e696e675f6d6574726963735f6a736f6e627b7d74747261696e696e675f696e5f70726f6772657373f469646565705f6c696e6b662f6d6c2f6d316863616e5f6f70656ef56a63616e5f6d616e616765f5"
+            ),
+            "MlLinksListResponse wire drift"
+        );
+
+        // F4: TaskStatusSetRequest — the kanban move must stay a three-field
+        // status-only write.
+        let move_task = ProjectStudioPayload::TaskStatusSetRequest {
+            project_id: "p1".to_string(),
+            task_id: "t1".to_string(),
+            status: "in_progress".to_string(),
+        };
+        let bytes = crate::cbor::encode(&move_task).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes("a1745461736b53746174757353657452657175657374a36a70726f6a6563745f6964627031677461736b5f6964627431667374617475736b696e5f70726f6772657373"),
+            "TaskStatusSetRequest wire drift"
+        );
+
+        // F4: ProjectImportUploadChunkRequest — `bytes` MUST land as a CBOR
+        // byte string (0x43 = 3-byte string), never an integer array.
+        let chunk = ProjectStudioPayload::ProjectImportUploadChunkRequest {
+            upload_id: "up1".to_string(),
+            filename: "projekt.zip".to_string(),
+            seq: 0,
+            total_chunks: 2,
+            bytes: vec![0x00, 0xff, 0x10],
+        };
+        let bytes = crate::cbor::encode(&chunk).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes("a1781f50726f6a656374496d706f727455706c6f61644368756e6b52657175657374a56975706c6f61645f6964637570316866696c656e616d656b70726f6a656b742e7a697063736571006c746f74616c5f6368756e6b73026562797465734300ff10"),
+            "ProjectImportUploadChunkRequest wire drift"
         );
     }
 
