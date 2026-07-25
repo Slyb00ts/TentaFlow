@@ -79,6 +79,29 @@ Ostatnia aktualizacja: 2026-07-25.
   ten sam prompt greedy przy C=1 i C=6 daje teraz IDENTYCZNE wyjście (wcześniej
   ścieżki różniły się głową). Bramki: workspace 606/606, `batched_bielik`
   z paczkami FP8 2/2.
+- ✅ **Jedno źródło iloczynu int8 dla NVIDII i AMD: 312 → 340 kerneli
+  (2026-07-25).** Nowy `src/arch_dot.mojo` z `dot4_i8(a, b, c)` rozgałęzia się
+  w `comptime` po `_accelerator_arch()`: `llvm.nvvm.idp4a.s.s` na NVIDII,
+  instrukcja `v_dot4_i32_i8` przez `inlined_assembly` na AMD. `decode_dp4a.mojo`
+  ma teraz alias `comptime _dp4a = dot4_i8`, więc **31 wywołań w pięciu plikach
+  nie było ruszanych**, a implementacja jest jedna.
+  Poprawność: cztery przypadki brzegowe sprawdzone na karcie — (1,2,3,4)·(4,3,2,1)
+  z akumulatorem 100 daje 120, wektor ujemny 92, zero 100, maksimum
+  4·127·127+100 = 64 616. Wszystkie dokładnie. Wygenerowany assembler
+  `gemv_q8_0_dp4a_f16` zawiera **8 instrukcji `v_dot4_i32_i8`**, czyli kompilator
+  wziął jednostkę sprzętową, a nie fallback skalarny.
+  Efekt na inwentarzu: **340 z 474 kerneli kompiluje się dla gfx1030** (było 312),
+  czyli jedna linia helpera odblokowała 28 kerneli — całą rodzinę dp4a.
+  ZOSTAJE 134, wszystkie z powodu `mma`/`ldmatrix` albo FP8:
+  46 pozostałych, 24 Q4_K/Q6_K i8 multistage, 22 NVFP4-CT (kafle BM16/BM32
+  i prefill), 11 Q8_0 i8mma/triplet, 11 NVFP4 GGUF mma/tile128, 11 FP8
+  (niemożliwe przed RDNA4), 9 attention/flash. Lista:
+  `docs/AMD_KERNEL_INVENTORY_gfx1030.txt`.
+  KIERUNEK: te 134 to nie 134 osobne zadania — to kilka kształtów kafli MMA,
+  które trzeba raz napisać na `v_dot4_i32_i8` z akumulacją w rejestrach
+  (odpowiednik `mma.m16n8k32.s8` bez jednostki macierzowej), po czym rodziny
+  Q8_0, Q4_K/Q6_K i NVFP4 przeniosą się tak samo jak dp4a. To jest ta sama praca,
+  która decyduje o celu prefillu (2,5x wobec llama.cpp).
 - 🟡 **Katalog kerneli buduje artefakty AMDGCN; inwentarz gfx1030: 312 z 474
   (2026-07-25).** `build_kernel_catalog.py` rozgałęzia się teraz po TREŚCI zrzutu,
   nie po rozszerzeniu pliku: obecność `.amdgcn_target` wybiera ścieżkę AMD, która
