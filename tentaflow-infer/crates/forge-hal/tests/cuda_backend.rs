@@ -220,7 +220,10 @@ fn pool_exhaustion_reports_oom() {
     let err = dev
         .alloc(TEST_POOLS.kv_cache + 1, MemKind::Device, Pool::KvCache)
         .unwrap_err();
-    assert!(matches!(err, ForgeError::OutOfMemory { .. }));
+    assert!(
+        matches!(err, ForgeError::OutOfMemory { .. }),
+        "wyczerpanie puli musi zgłaszać OutOfMemory, otrzymano {err:?}"
+    );
 }
 
 #[test]

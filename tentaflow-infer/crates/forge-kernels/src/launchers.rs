@@ -16610,6 +16610,12 @@ mod nvfp4_gguf_dispatch_tests {
         assert!(validate(overflow).is_err());
     }
 
+    /// Scratch `prepare_q8_1` jest współdzielony i grow-only, więc testy, które
+    /// przez niego przechodzą, nie mogą lecieć równolegle — bez tej serializacji
+    /// nadpisywały sobie skwantyzowane aktywacje i wywracały kontrolę canary
+    /// (reprodukowalne: równolegle 40/42, z `--test-threads=1` 42/42).
+    static PREPARED_Q8_SCRATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn segmentowany_append_kv_odrzuca_extenty_grid_i_limit_urzadzenia() {
         let valid = [256usize, 256, 128, 128, 16, 8, 2, 2, 2, 2, 2, 8, 256];
@@ -16666,6 +16672,7 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn prepared_q8_t32_t128_jest_zgodny_z_baseline_i_chroni_canary() {
+        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         let device = match CudaDevice::new(
             0,
             PoolSizes {
@@ -16768,6 +16775,7 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn fused_q8_triplet_t32_t128_jest_bitowo_zgodny_i_chroni_canary() {
+        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         let device = match CudaDevice::new(
             0,
             PoolSizes {
@@ -16901,6 +16909,7 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn publiczny_flow_uniewaznia_handle_po_bledzie_record() {
+        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         let device = match CudaDevice::new(
             0,
             PoolSizes {
@@ -17057,6 +17066,7 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn blad_record_z_udanym_sync_resetuje_marker_bez_zatrucia() {
+        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         let device: Arc<dyn Device> = CpuDevice::new();
         let mut scratch = PrequantScratch {
             ready: Some(device.create_event().unwrap()),
@@ -17078,6 +17088,7 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn blad_record_i_sync_zatruwa_scratch_i_blokuje_nastepne_prepare() {
+        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         let device: Arc<dyn Device> = CpuDevice::new();
         let mut scratch = PrequantScratch {
             ready: Some(device.create_event().unwrap()),
@@ -17100,6 +17111,7 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn zatruty_mutex_zwraca_blad_bez_odzyskania_scratch() {
+        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = Arc::new(Mutex::new(PrequantScratch::default()));
         let panicking = scratch.clone();
         assert!(std::thread::spawn(move || {

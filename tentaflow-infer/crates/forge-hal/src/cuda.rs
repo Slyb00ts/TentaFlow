@@ -560,6 +560,21 @@ fn bounds_check(buf: &DevBuffer, offset: usize, bytes: usize) -> Result<()> {
     }
 }
 
+/// Zachowuje typowany `OutOfMemory` z areny i dokłada nazwę puli do logu.
+/// Zawijanie wyczerpania puli w `Device(String)` gubiło wariant, na którym
+/// opierają się admission i tiering — rozpoznawały wtedy zwykły błąd urządzenia.
+fn pool_alloc_error(pool: Pool, error: ForgeError) -> ForgeError {
+    if let ForgeError::OutOfMemory {
+        requested,
+        available,
+    } = &error
+    {
+        tracing::debug!(?pool, requested, available, "pula wyczerpana");
+        return error;
+    }
+    ForgeError::Device(format!("pula {pool:?}: {error}"))
+}
+
 impl Device for CudaDevice {
     fn caps(&self) -> &DeviceCaps {
         &self.caps
@@ -575,21 +590,21 @@ impl Device for CudaDevice {
                     let mut arena = pool.arena.lock().expect("pool arena poisoned");
                     match &mut *arena {
                         PoolArena::Bump(bump) => {
-                            let offset = bump.alloc(bytes).map_err(|error| {
-                                ForgeError::Device(format!("pula {pool_kind:?}: {error}"))
-                            })?;
+                            let offset = bump
+                                .alloc(bytes)
+                                .map_err(|error| pool_alloc_error(pool_kind, error))?;
                             (offset, 0, None)
                         }
                         PoolArena::Slab(slab) => {
-                            let (offset, reserved) = slab.alloc(bytes).map_err(|error| {
-                                ForgeError::Device(format!("pula {pool_kind:?}: {error}"))
-                            })?;
+                            let (offset, reserved) = slab
+                                .alloc(bytes)
+                                .map_err(|error| pool_alloc_error(pool_kind, error))?;
                             (offset, reserved, None)
                         }
                         PoolArena::Ring(ring) => {
-                            let (offset, generation) = ring.alloc(bytes).map_err(|error| {
-                                ForgeError::Device(format!("pula {pool_kind:?}: {error}"))
-                            })?;
+                            let (offset, generation) = ring
+                                .alloc(bytes)
+                                .map_err(|error| pool_alloc_error(pool_kind, error))?;
                             (offset, 0, Some(generation))
                         }
                     }

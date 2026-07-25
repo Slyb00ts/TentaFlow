@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_fb926ec38df7e9c4

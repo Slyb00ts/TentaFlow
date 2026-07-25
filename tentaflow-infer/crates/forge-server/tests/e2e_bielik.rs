@@ -58,6 +58,7 @@ async fn chat_completions_end_to_end() {
                 prefix_cache: false,
                 native_mtp: false,
                 nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+                nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,
             },
         )
         .expect("load model");
