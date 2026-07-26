@@ -884,6 +884,8 @@ mod tests {
             ffn_activation: forge_formats::FfnActivation::SiLU,
             alt_attn: None,
             final_logit_softcap: 0.0,
+            attn_logit_scale: None,
+            embd_scale: None,
         }
     }
 

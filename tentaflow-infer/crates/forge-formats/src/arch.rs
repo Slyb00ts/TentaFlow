@@ -123,6 +123,14 @@ impl Hyperparams {
         }
     }
 
+    /// Skala logitów uwagi dla warstwy `layer`.
+    pub fn attn_scale_at(&self, layer: usize) -> f32 {
+        match self.attn_logit_scale {
+            Some(scale) => scale,
+            None => 1.0 / (self.head_dim_at(layer) as f32).sqrt(),
+        }
+    }
+
     /// Największy `head_dim` w modelu — do wymiarowania buforów aktywacji,
     /// które muszą pomieścić każdą warstwę.
     pub fn max_head_dim(&self) -> usize {
@@ -399,6 +407,13 @@ pub struct Hyperparams {
     /// Ograniczenie logitów `softcap * tanh(x / softcap)` przed samplingiem
     /// (Gemma). 0 = wyłączone.
     pub final_logit_softcap: f32,
+    /// Jawna skala logitów uwagi. `None` = domyślne `1/sqrt(head_dim)`.
+    /// Gemma 4 używa 1,0 (w referencji `f_attention_scale = 1.0f`), więc bez
+    /// tego pola model liczyłby uwagę na skali mniejszej ~22x.
+    pub attn_logit_scale: Option<f32>,
+    /// Mnożnik embeddingu wejściowego. `None` = brak. Rodzina Gemma mnoży przez
+    /// `sqrt(hidden_size)` (tylko dla wejścia tokenowego).
+    pub embd_scale: Option<f32>,
 }
 
 /// Rola tensora należącego do jednej warstwy NextN.
@@ -723,6 +738,14 @@ impl ModelDescriptor {
         } else {
             FfnActivation::SiLU
         };
+        // Rodzina Gemma: uwaga bez dzielenia przez sqrt(head_dim) i embedding
+        // przemnożony przez sqrt(hidden). Oba potwierdzone w implementacji
+        // wzorcowej i oba są niewidoczne w metadanych GGUF.
+        let (attn_logit_scale, embd_scale) = if spec.gguf_arch.starts_with("gemma") {
+            (Some(1.0f32), Some((hidden_size as f32).sqrt()))
+        } else {
+            (None, None)
+        };
         let intermediate_size = req_u("feed_forward_length")?;
         let max_position_embeddings = req_u("context_length")?;
         let rope_theta = gguf.get_f32(&key("rope.freq_base")).unwrap_or(10_000.0);
@@ -851,6 +874,8 @@ impl ModelDescriptor {
             ffn_activation,
             alt_attn,
             final_logit_softcap,
+            attn_logit_scale,
+            embd_scale,
             },
             globals,
             layers,
@@ -923,6 +948,8 @@ impl ModelDescriptor {
             ffn_activation: FfnActivation::SiLU,
             alt_attn: None,
             final_logit_softcap: 0.0,
+            attn_logit_scale: None,
+            embd_scale: None,
             },
             globals,
             layers,
@@ -1242,6 +1269,8 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             ffn_activation: FfnActivation::SiLU,
             alt_attn: None,
             final_logit_softcap: 0.0,
+            attn_logit_scale: None,
+            embd_scale: None,
         },
         globals,
         layers,

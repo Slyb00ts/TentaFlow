@@ -2007,16 +2007,21 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// out = silu(gate) * up over n f16 elements.
-    pub fn silu_mul_f16(
+    /// out = act(gate) * up nad n elementami f16 (bramkowany FFN).
+    ///
+    /// Nieliniowość jest parametrem, bo rodziny modeli różnią się nią przy
+    /// identycznym kształcie warstwy: SwiGLU (`silu`) w llamie i qwenie, GeGLU
+    /// z przybliżeniem tanh w rodzinie Gemma.
+    pub fn glu_mul_f16(
         &self,
+        act: forge_formats::FfnActivation,
         out: &DevBuffer,
         gate: &DevBuffer,
         up: &DevBuffer,
         n: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("silu_mul_f16")?;
+        let k = self.artifacts.get(Self::glu_kernel(act))?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
         let args = LaunchArgs::new()
             .buf(out)
@@ -2026,11 +2031,20 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// `silu_mul_f16` where gate and up are sections of one fused gate|up
+    /// Nazwa kernela nieliniowości bramkowanego FFN.
+    fn glu_kernel(act: forge_formats::FfnActivation) -> &'static str {
+        match act {
+            forge_formats::FfnActivation::SiLU => "silu_mul_f16",
+            forge_formats::FfnActivation::GeLUTanh => "gelu_mul_f16",
+        }
+    }
+
+    /// `glu_mul_f16` where gate and up are sections of one fused gate|up
     /// buffer, addressed by byte offsets.
     #[allow(clippy::too_many_arguments)]
-    pub fn silu_mul_f16_at(
+    pub fn glu_mul_f16_at(
         &self,
+        act: forge_formats::FfnActivation,
         out: &DevBuffer,
         gate_up: &DevBuffer,
         gate_byte_off: usize,
@@ -2038,7 +2052,7 @@ impl Kernels {
         n: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("silu_mul_f16")?;
+        let k = self.artifacts.get(Self::glu_kernel(act))?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
         let args = LaunchArgs::new()
             .buf(out)

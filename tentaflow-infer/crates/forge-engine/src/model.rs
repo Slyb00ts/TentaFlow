@@ -2309,6 +2309,11 @@ impl Model {
         Ok(())
     }
 
+    /// Nieliniowość bramkowanego FFN tego modelu.
+    fn ffn_act(&self) -> forge_formats::FfnActivation {
+        self.weights.descriptor.params.ffn_activation
+    }
+
     /// Okno przesuwne uwagi dla warstwy `layer`; 0 = pełna uwaga przyczynowa.
     ///
     /// Architektury z naprzemienną geometrią (Gemma 4) mają okno tylko na
@@ -5513,7 +5518,7 @@ impl Model {
             // projekcji i offsety sekcji scalonego q|k|v różnią się między
             // warstwami, więc muszą być liczone tutaj, a nie raz na model.
             let head_dim = p.head_dim_at(l);
-            let scale = 1.0 / (head_dim as f32).sqrt();
+            let scale = p.attn_scale_at(l);
             let q_dim = p.n_heads * head_dim;
             let kv_dim = p.n_kv_heads_at(l) * head_dim;
             let layer = &self.weights.layers[l];
@@ -6011,7 +6016,7 @@ impl Model {
                         }
                     }
                     trace.mark(self.device.as_ref(), "gemm_gateup");
-                    kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, rows * inter, stream)?;
+                    kernels.glu_mul_f16(self.ffn_act(), &pb.act, &pb.gate, &pb.up, rows * inter, stream)?;
                     trace.mark(self.device.as_ref(), "silu");
                     // Calibration capture 4/4: down_proj input (SwiGLU output).
                     if let Some(cal) = calib.as_mut() {
@@ -7387,7 +7392,7 @@ impl Model {
         let kernels = &self.kernels;
         let stream = &self.stream;
         let b = &self.bufs;
-        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let scale = p.attn_scale_at(0);
         // Bufory muszą pomieścić najszerszą warstwę modelu — przy
         // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
         let q_dim = p.max_q_dim();
@@ -7668,12 +7673,12 @@ impl Model {
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
                     self.gemv(&b.gate_up, w, &b.x, stream)?;
-                    kernels.silu_mul_f16_at(&b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
+                    kernels.glu_mul_f16_at(self.ffn_act(), &b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
                 }
                 GateUpWeights::Split { gate, up } => {
                     self.gemv(&b.gate, gate, &b.x, stream)?;
                     self.gemv(&b.up, up, &b.x, stream)?;
-                    kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                    kernels.glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
                 }
             }
             self.gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
@@ -9274,7 +9279,7 @@ impl Model {
         self.gemv(&b.gate, gate, &b.x, stream)?;
         self.gemv(&b.up, up, &b.x, stream)?;
         self.kernels
-            .silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+            .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
         self.gemv(&b.down, &ffn.down, &b.act, stream)?;
         self.kernels.rmsnorm_residual_f16(
             &b.x,
@@ -10578,7 +10583,7 @@ impl Model {
                     self.gemm(&pb.up, up, &pb.x, t, &self.stream)?;
                 }
             }
-            self.kernels.silu_mul_f16(
+            self.kernels.glu_mul_f16(self.ffn_act(), 
                 &pb.act,
                 &pb.gate,
                 &pb.up,
@@ -11156,7 +11161,7 @@ impl Model {
                 self.gemm(&pb.gate, gate, &pb.x, total, &self.stream)?;
                 self.gemm(&pb.up, up, &pb.x, total, &self.stream)?;
                 self.kernels
-                    .silu_mul_f16(&pb.act, &pb.gate, &pb.up, ffn_rows, &self.stream)?;
+                    .glu_mul_f16(self.ffn_act(), &pb.act, &pb.gate, &pb.up, ffn_rows, &self.stream)?;
                 self.gemm(&pb.down, &ffn.down, &pb.act, total, &self.stream)?;
                 let next_norm = if layer_index + 1 < self.weights.layers.len() {
                     &self.weights.layers[layer_index + 1].attn_norm
@@ -11888,7 +11893,7 @@ impl Model {
                 // offsety sekcji scalonego q|k|v muszą być liczone W PĘTLI —
                 // policzone raz dla całego modelu wskazywały poza bufor warstwy.
                 let head_dim = p.head_dim_at(l);
-                let scale = 1.0 / (head_dim as f32).sqrt();
+                let scale = p.attn_scale_at(l);
                 let q_dim = p.n_heads * head_dim;
                 let kv_dim = p.n_kv_heads_at(l) * head_dim;
                 // Byte offsets of the K and V sections inside the fused q|k|v
@@ -12081,12 +12086,12 @@ impl Model {
                 match &layer.dense_ffn()?.gate_up {
                     GateUpWeights::Fused(w) => {
                         self.gemv(&b.gate_up, w, &b.x, stream)?;
-                        kernels.silu_mul_f16_at(&b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
+                        kernels.glu_mul_f16_at(self.ffn_act(), &b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
                     }
                     GateUpWeights::Split { gate, up } => {
                         self.gemv(&b.gate, gate, &b.x, stream)?;
                         self.gemv(&b.up, up, &b.x, stream)?;
-                        kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                        kernels.glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
                     }
                 }
                 self.gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
@@ -12117,7 +12122,7 @@ impl Model {
         let kernels = &self.kernels;
         let stream = &self.stream;
         let b = &self.bufs;
-        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let scale = p.attn_scale_at(0);
         // Bufory muszą pomieścić najszerszą warstwę modelu — przy
         // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
         let q_dim = p.max_q_dim();
@@ -12395,7 +12400,7 @@ impl Model {
             )?;
             self.gemv_rows_gidx(&b.up, &moe.up_exps, x_in, &mb.ids, j, inter, inter, stream)?;
             self.kernels
-                .silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
             self.gemv_rows_gidx(
                 &mb.tmp,
                 &moe.down_exps,
@@ -12431,7 +12436,7 @@ impl Model {
                 }
             }
             self.kernels
-                .silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
+                .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, sh_inter, stream)?;
             self.gemv_rows(&mb.tmp, &sh.down, &b.act, 0, sh.down.rows(), stream)?;
             // mb.shared_scale holds this layer's device sigmoid gate scale when
             // the arch has a shared gate; for a gate-less shared expert it stays
@@ -12486,7 +12491,7 @@ impl Model {
             self.gemv_rows(&b.gate, &moe.gate_exps, x_in, e * inter, inter, stream)?;
             self.gemv_rows(&b.up, &moe.up_exps, x_in, e * inter, inter, stream)?;
             self.kernels
-                .silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
             self.gemv_rows(&mb.tmp, &moe.down_exps, &b.act, e * hidden, hidden, stream)?;
             self.kernels
                 .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, wt, j == 0, stream)?;
@@ -12508,7 +12513,7 @@ impl Model {
                 }
             }
             self.kernels
-                .silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
+                .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, sh_inter, stream)?;
             self.gemv_rows(&mb.tmp, &sh.down, &b.act, 0, sh.down.rows(), stream)?;
             self.kernels.moe_scale_add_f16(
                 out,
@@ -14107,7 +14112,7 @@ impl Model {
                 self.gemm(&b2.gate, gate, &b2.x, TOTAL, &self.stream)?;
                 self.gemm(&b2.up, up, &b2.x, TOTAL, &self.stream)?;
                 self.kernels
-                    .silu_mul_f16(&b2.act, &b2.gate, &b2.up, ffn_rows, &self.stream)?;
+                    .glu_mul_f16(self.ffn_act(), &b2.act, &b2.gate, &b2.up, ffn_rows, &self.stream)?;
                 self.gemm(&b2.down, &ffn.down, &b2.act, TOTAL, &self.stream)?;
                 let next_norm = if layer_index + 1 < self.weights.layers.len() {
                     &self.weights.layers[layer_index + 1].attn_norm
@@ -14510,7 +14515,7 @@ impl Model {
                     match &ffn.gate_up {
                         GateUpWeights::Fused(weight) => {
                             self.gemv(&b.gate_up, weight, &b.x, stream)?;
-                            kernels.silu_mul_f16_at(
+                            kernels.glu_mul_f16_at(self.ffn_act(), 
                                 &b.act,
                                 &b.gate_up,
                                 0,
@@ -14522,7 +14527,7 @@ impl Model {
                         GateUpWeights::Split { gate, up } => {
                             self.gemv(&b.gate, gate, &b.x, stream)?;
                             self.gemv(&b.up, up, &b.x, stream)?;
-                            kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                            kernels.glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
                         }
                     }
                     self.gemv(&b.down, &ffn.down, &b.act, stream)?;
@@ -14570,7 +14575,7 @@ impl Model {
         let eps = p.rms_norm_eps;
         let theta = p.rope_theta;
         let n_rot = self.hybrid_n_rot();
-        let scale = 1.0 / (head_dim as f32).sqrt();
+        let scale = p.attn_scale_at(l);
         let kernels = &self.kernels;
         let stream = &self.stream;
         let b = &self.bufs;
@@ -15644,7 +15649,7 @@ impl Model {
                         self.gemm(&arena.up, up, &arena.x, t, &self.stream)?;
                     }
                 }
-                self.kernels.silu_mul_f16(
+                self.kernels.glu_mul_f16(self.ffn_act(), 
                     &arena.gate,
                     &arena.gate,
                     &arena.up,
@@ -15940,7 +15945,7 @@ impl Model {
         let kernels = &self.kernels;
         let stream = &self.stream;
         let b = &self.bufs;
-        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let scale = p.attn_scale_at(0);
         // Bufory muszą pomieścić najszerszą warstwę modelu — przy
         // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
         let q_dim = p.max_q_dim();
@@ -16209,7 +16214,7 @@ impl Model {
                     // stored as f16 before silu_mul reads them.
                     self.gemv_norm(&b.gate, gate, &layer.ffn_norm, false, eps, stream)?;
                     self.gemv_norm(&b.up, up, &layer.ffn_norm, false, eps, stream)?;
-                    kernels.silu_mul_f16(&b.act, &b.gate, &b.up, p.intermediate_size, stream)?;
+                    kernels.glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, p.intermediate_size, stream)?;
                 }
             }
             self.gemv_residual(&layer.dense_ffn()?.down, &b.act, stream)?;
@@ -16528,7 +16533,7 @@ impl Model {
                 }
             }
             self.kernels
-                .silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, &self.stream)?;
+                .glu_mul_f16(self.ffn_act(), &bb.act, &bb.gate, &bb.up, n * inter, &self.stream)?;
             self.gemm(&bb.down, &ffn.down, &bb.act, n, &self.stream)?;
             let next_norm = if layer_index + 1 < self.weights.layers.len() {
                 &self.weights.layers[layer_index + 1].attn_norm
@@ -16574,7 +16579,7 @@ impl Model {
         let q_dim = p.max_q_dim();
         let kv_dim = p.max_kv_dim();
         let eps = p.rms_norm_eps;
-        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let scale = p.attn_scale_at(0);
         let kernels = &self.kernels;
         let stream = &self.stream;
         let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
@@ -16830,7 +16835,7 @@ impl Model {
             if segmented_gate_up {
                 let physical_m = nvfp4_ct_physical_m(n)
                     .expect("segmentowany GateUp ma fizyczny kafel");
-                kernels.silu_mul_f16_at(
+                kernels.glu_mul_f16_at(self.ffn_act(), 
                     &bb.act,
                     bb.nvfp4_ct_gate_up
                         .as_ref()
@@ -16841,7 +16846,7 @@ impl Model {
                     stream,
                 )?;
             } else {
-                kernels.silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, stream)?;
+                kernels.glu_mul_f16(self.ffn_act(), &bb.act, &bb.gate, &bb.up, n * inter, stream)?;
             }
             let down = &layer.dense_ffn()?.down;
             let mut specialized_down = false;
