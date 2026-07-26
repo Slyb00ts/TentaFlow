@@ -670,7 +670,7 @@ pub fn query_note_vectors(vector: &[f32], k: u32) -> Result<Vec<(String, f64)>, 
             None => best.push((note_id, similarity)),
         }
     }
-    best.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    best.sort_by(|a, b| b.1.total_cmp(&a.1));
     Ok(best)
 }
 
@@ -1137,7 +1137,7 @@ fn similar_notes(note_id: &str, chunk_vectors: &[Vec<f32>]) -> Result<Vec<(Strin
             }
         }
     }
-    best.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    best.sort_by(|a, b| b.1.total_cmp(&a.1));
     best.truncate(MAX_LINKS_PER_NOTE);
 
     // Drop targets that are deleted (their vectors may linger until cleanup).
