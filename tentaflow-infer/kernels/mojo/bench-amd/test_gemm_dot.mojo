@@ -14,6 +14,7 @@ from src.gemm_dot import (
     gemm_q4_k_dot4_impl,
     gemm_q6_k_dot4_impl,
     gemm_nvfp4_dot4_impl,
+    gemm_q4_0_dot4_impl,
 )
 
 comptime ITERS = 10
@@ -594,6 +595,76 @@ def check_out_f32[BM: Int, BN: Int, TM: Int, TN: Int](
         raise Error("gemm_f16_dot2 out_f32 poza tolerancja f32")
 
 
+def check_q40[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
+    ctx: DeviceContext, tokens: Int, rows: Int, cols: Int
+) raises:
+    """Referencja hosta rozpakowuje polbajty niezaleznie od kodu kernela."""
+    nb = cols // 32
+    var wh = ctx.enqueue_create_host_buffer[DType.uint8](rows * nb * 18)
+    var xh = ctx.enqueue_create_host_buffer[DType.int8](tokens * cols)
+    var dh = ctx.enqueue_create_host_buffer[DType.float32](nb * tokens)
+    ctx.synchronize()
+    for r in range(rows):
+        for b in range(nb):
+            base = (r * nb + b) * 18
+            dv = Float32(0.00390625 * Float32(1 + (r + b) % 6)).cast[
+                DType.float16
+            ]()
+            bits = bitcast[DType.uint16](dv)
+            wh[base] = UInt8(bits & 0xFF)
+            wh[base + 1] = UInt8(bits >> 8)
+            for i in range(16):
+                wh[base + 2 + i] = UInt8((r * 17 + b * 5 + i * 11) % 256)
+    for t in range(tokens):
+        for k in range(cols):
+            xh[t * cols + k] = Int8(((t * 9 + k * 7) % 255) - 127)
+    for b in range(nb):
+        for t in range(tokens):
+            dh[b * tokens + t] = 0.0078125 * Float32(1 + (b + t) % 5)
+
+    var wd = ctx.enqueue_create_buffer[DType.uint8](rows * nb * 18)
+    var xdb = ctx.enqueue_create_buffer[DType.int8](tokens * cols)
+    var ddb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var sdb = ctx.enqueue_create_buffer[DType.float32](nb * tokens)
+    var yd = ctx.enqueue_create_buffer[DType.float16](tokens * rows)
+    ctx.enqueue_copy(wd, wh)
+    ctx.enqueue_copy(xdb, xh)
+    ctx.enqueue_copy(ddb, dh)
+    ctx.synchronize()
+    ctx.enqueue_function[gemm_q4_0_dot4_impl[BM, BN, TM, TN, KB, DType.float16]](
+        yd.unsafe_ptr(), wd.unsafe_ptr(), xdb.unsafe_ptr(), ddb.unsafe_ptr(),
+        sdb.unsafe_ptr(), cols, rows, tokens,
+        grid_dim=((rows + BN - 1) // BN, (tokens + BM - 1) // BM),
+        block_dim=(BM // TM) * (BN // TN),
+    )
+    ctx.synchronize()
+    var worst: Float32 = 0.0
+    with yd.map_to_host() as got:
+        for t in range(tokens):
+            for r in range(rows):
+                var expect: Float32 = 0.0
+                for b in range(nb):
+                    base = (r * nb + b) * 18
+                    bits2 = UInt16(wh[base]) | (UInt16(wh[base + 1]) << 8)
+                    dv2 = bitcast[DType.float16](bits2).cast[DType.float32]()
+                    var isum: Int32 = 0
+                    for i in range(32):
+                        byte = wh[base + 2 + i % 16]
+                        q = (
+                            (Int32(byte) >> 4) if i >= 16 else (Int32(byte) & 0x0F)
+                        ) - 8
+                        isum += q * Int32(xh[t * cols + b * 32 + i])
+                    expect += dh[b * tokens + t] * dv2 * Float32(isum)
+                have = Float32(got[t * rows + r])
+                denom = abs(expect) if abs(expect) > 1.0 else 1.0
+                err = abs(have - expect) / denom
+                if err > worst:
+                    worst = err
+    print("Q4_0 T=", tokens, "rows=", rows, "cols=", cols, "blad max:", worst)
+    if worst > 0.003:
+        raise Error("gemm_q4_0_dot4 poza tolerancja f16")
+
+
 def main() raises:
     var ctx = DeviceContext()
     print("arch:", ctx.arch_name())
@@ -618,6 +689,9 @@ def main() raises:
     check_q4k[128, 128, 8, 4, 2](ctx, 300, 300, 1024)
     check_q6k[64, 64, 4, 4, 4](ctx, 64, 64, 256)
     check_q6k[128, 64, 8, 4, 2](ctx, 200, 130, 512)
+    check_q40[64, 64, 4, 4, 4](ctx, 64, 64, 64)
+    check_q40[128, 64, 8, 4, 2](ctx, 200, 130, 1024)
+    check_q40[128, 128, 8, 4, 2](ctx, 300, 300, 1024)
     check_out_f32[64, 64, 4, 4](ctx, 40, 96, 256)
     check_nvfp4[64, 64, 4, 4, 4](ctx, 64, 64, 64)
     check_nvfp4[128, 64, 8, 4, 2](ctx, 200, 130, 512)

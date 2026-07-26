@@ -17,7 +17,7 @@ from src.norm import (
     rmsnorm_fp8,
     rmsnorm_residual_fp8,
 )
-from src.activation import silu_mul_f16, sigmoid_mul_f16, deinterleave_gate_f16
+from src.activation import silu_mul_f16, gelu_mul_f16, sigmoid_mul_f16, deinterleave_gate_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import (
@@ -149,6 +149,10 @@ from src.gemm_dot import (
     gemm_q8_0_dot4_out_f32_64x64,
     gemm_q4_k_dot4_out_f32_64x64,
     gemm_q6_k_dot4_out_f32_64x64,
+    gemm_q4_0_dot4_64x64,
+    gemm_q4_0_dot4_128x64,
+    gemm_q4_0_dot4_128x128,
+    gemm_q4_0_dot4_out_f32_64x64,
 )
 from src.q8_0_batch import (
     gemm_q8_0_i8mma_b2,
@@ -754,6 +758,8 @@ def main() raises:
 
     _ = ctx.compile_function[silu_mul_f16, dump_asm=Path("silu_mul_f16.ptx")]()
     entries.append(_finalize(out_dir, "silu_mul_f16"))
+    _ = ctx.compile_function[gelu_mul_f16, dump_asm=Path("gelu_mul_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gelu_mul_f16"))
 
     _ = ctx.compile_function[
         sigmoid_mul_f16, dump_asm=Path("sigmoid_mul_f16.ptx")
@@ -1770,6 +1776,23 @@ def main() raises:
         dump_asm=Path("gemm_q6_k_dot4_out_f32_64x64.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q6_k_dot4_out_f32_64x64"))
+    _ = ctx.compile_function[
+        gemm_q4_0_dot4_64x64, dump_asm=Path("gemm_q4_0_dot4_64x64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q4_0_dot4_64x64"))
+    _ = ctx.compile_function[
+        gemm_q4_0_dot4_128x64, dump_asm=Path("gemm_q4_0_dot4_128x64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q4_0_dot4_128x64"))
+    _ = ctx.compile_function[
+        gemm_q4_0_dot4_128x128, dump_asm=Path("gemm_q4_0_dot4_128x128.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q4_0_dot4_128x128"))
+    _ = ctx.compile_function[
+        gemm_q4_0_dot4_out_f32_64x64,
+        dump_asm=Path("gemm_q4_0_dot4_out_f32_64x64.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q4_0_dot4_out_f32_64x64"))
 
     _ = ctx.compile_function[
         gemm_q8_0_f16_bm64, dump_asm=Path("gemm_q8_0_f16_bm64.ptx")

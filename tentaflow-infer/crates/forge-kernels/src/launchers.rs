@@ -8294,6 +8294,7 @@ impl Kernels {
             "gemm_q8_0_i8mma" => "q8_0",
             "gemm_q4_k_i8mma" => "q4_k",
             "gemm_q6_k_i8mma" => "q6_k",
+            "gemm_q4_0_i8mma" => "q4_0",
             _ => return None,
         };
         // Batchowa głowa logitów zapisuje f32 i pracuje na rozmiarze batcha
@@ -8303,6 +8304,7 @@ impl Kernels {
                 match family {
                     "q8_0" => "gemm_q8_0_dot4_out_f32_64x64",
                     "q4_k" => "gemm_q4_k_dot4_out_f32_64x64",
+                    "q4_0" => "gemm_q4_0_dot4_out_f32_64x64",
                     _ => "gemm_q6_k_dot4_out_f32_64x64",
                 },
                 64,
@@ -8316,6 +8318,7 @@ impl Kernels {
                 match family {
                     "q8_0" => "gemm_q8_0_dot4_64x64",
                     "q4_k" => "gemm_q4_k_dot4_64x64",
+                    "q4_0" => "gemm_q4_0_dot4_64x64",
                     _ => "gemm_q6_k_dot4_64x64",
                 },
                 64,
@@ -8323,6 +8326,8 @@ impl Kernels {
                 4,
                 4,
             )
+        } else if family == "q4_0" {
+            DotTile::new("gemm_q4_0_dot4_128x128", 128, 128, 8, 4)
         } else if family == "q4_k" {
             // Formaty K rozpakowują wagi w LDS, więc płacą więcej za etap;
             // kafel 128x64 wyszedł szybszy (32 wobec 29 TOPS) niż 128x128.
@@ -12795,6 +12800,26 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q4_0 requires cols % 32 == 0, got {cols}"
             )));
+        }
+        // Karty bez jednostki macierzowej: kafel int8 na `v_dot4_i32_i8`.
+        // Rodzina `gemm_q4_0_f16` dekwantyzuje do f16 i mnozy na mma, wiec tam
+        // jej nie ma. `gemm_i8mma_run` dokłada kwantyzację aktywacji.
+        if self
+            .gemm_dot4_tile("gemm_q4_0_i8mma", false, rows, n_tokens)
+            .is_some()
+        {
+            return self.gemm_i8mma_run(
+                "gemm_q4_0_i8mma",
+                false,
+                y,
+                w,
+                w_byte_off,
+                x,
+                rows,
+                cols,
+                n_tokens,
+                stream,
+            );
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q4_0_f16{suffix}"))?;

@@ -966,3 +966,170 @@ comptime gemm_nvfp4_dot4_64x64 = gemm_nvfp4_dot4_impl[
 comptime gemm_nvfp4_dot4_128x64 = gemm_nvfp4_dot4_impl[
     128, 64, 8, 4, 2, DType.float16
 ]
+
+
+def gemm_q4_0_dot4_impl[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Q4_0 GEMM na `v_dot4_i32_i8`: Y[t, r] = dot(w[r], x[t]).
+
+    Blok GGUF ma 18 B na 32 wartości: skala f16 i 16 bajtów półbajtów, przy czym
+    bajt `j` niesie wartość `j` w młodszym półbajcie i `j+16` w starszym (podział
+    na połowy, nie przeplot). Wartość to `d * (q - 8)`, więc przesunięcie -8
+    stosujemy PRZY ZAPISIE do LDS — zakres -8..7 mieści się w int8, a iloczyn
+    skalarny nie potrzebuje członu z sumą aktywacji.
+
+    Blok kwantyzacji wagi i aktywacji ma tu ten sam rozmiar 32 kolumn, więc na
+    podblok wystarcza JEDNA suma int32 — inaczej niż w Q4_K i Q6_K. `xsm` jest w
+    sygnaturze dla zgodności z rodziną i8mma i nie jest używane.
+    """
+    comptime NT = (BM // TM) * (BN // TN)
+    comptime ROWS_TX = BN // TN
+    comptime X_PASSES = (BM + (NT // 4) - 1) // (NT // 4)
+    comptime W_PASSES = (BN + (NT // 4) - 1) // (NT // 4)
+    comptime XPLANE = BM * 32
+    comptime WPLANE = BN * 32
+
+    tid = Int(thread_idx.x)
+    row0 = Int(block_idx.x) * BN
+    t0 = Int(block_idx.y) * BM
+    blocks_per_row = n_cols // 32
+
+    xs = stack_allocation[
+        KB * XPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    ws = stack_allocation[
+        KB * WPLANE, Int8, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        KB * BM, Float32, address_space = AddressSpace.SHARED
+    ]()
+    wds = stack_allocation[
+        KB * BN, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    lrow = tid // 4
+    kc = (tid % 4) * 8
+    tx = tid % ROWS_TX
+    ty = tid // ROWS_TX
+
+    var acc = InlineArray[Float32, TM * TN](fill=0.0)
+
+    var base_blk = 0
+    while base_blk < blocks_per_row:
+        comptime for kb in range(KB):
+            blk = base_blk + kb
+            live = blk < blocks_per_row
+
+            comptime for p in range(X_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BM:
+                    var token = t0 + local
+                    if token > n_tokens - 1:
+                        token = n_tokens - 1
+                    var bytes8 = SIMD[DType.int8, 8](0)
+                    if live:
+                        bytes8 = (xq + token * n_cols + blk * 32 + kc).load[
+                            width=8
+                        ]()
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            xs + kb * XPLANE + kq * (BM * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            bytes8.slice[4, offset = q * 4]()
+                        )
+
+            comptime for p in range(W_PASSES):
+                local = lrow + p * (NT // 4)
+                if local < BN:
+                    var row = row0 + local
+                    if row > n_rows - 1:
+                        row = n_rows - 1
+                    var codes = SIMD[DType.int8, 8](0)
+                    var scale: Float32 = 0.0
+                    if live:
+                        block_ptr = w + (row * blocks_per_row + blk) * 18
+                        scale = Float32(
+                            block_ptr.bitcast[Float16]().load[width=1]()
+                        )
+                        packed = (block_ptr + 2 + kc % 16).load[width=8]()
+                        nib = (
+                            packed >> 4
+                        ) if kc >= 16 else (packed & 0x0F)
+                        codes = nib.cast[DType.int8]() - 8
+                    comptime for q in range(2):
+                        kq = kc // 4 + q
+                        (
+                            ws + kb * WPLANE + kq * (BN * 4) + local * 4
+                        ).store[width=4, alignment=4](
+                            codes.slice[4, offset = q * 4]()
+                        )
+                    if tid % 4 == 0:
+                        wds[kb * BN + local] = scale
+
+            if tid < BM:
+                var token = t0 + tid
+                if token > n_tokens - 1:
+                    token = n_tokens - 1
+                xds[kb * BM + tid] = xd[blk * n_tokens + token] if live else 0.0
+        barrier()
+
+        comptime for kb in range(KB):
+            xbase = xs + kb * XPLANE + ty * TM * 4
+            wbase = ws + kb * WPLANE + tx * TN * 4
+            var isum = InlineArray[Int32, TM * TN](fill=0)
+
+            comptime for kq in range(8):
+                av = (xbase + kq * (BM * 4)).bitcast[Int32]().load[
+                    width=TM, alignment=16
+                ]()
+                bv = (wbase + kq * (BN * 4)).bitcast[Int32]().load[
+                    width=TN, alignment=16
+                ]()
+
+                comptime for m in range(TM):
+                    comptime for r in range(TN):
+                        isum[m * TN + r] = dot4_i8(
+                            av[m], bv[r], isum[m * TN + r]
+                        )
+
+            comptime for m in range(TM):
+                dx = xds[kb * BM + ty * TM + m]
+                comptime for r in range(TN):
+                    acc[m * TN + r] += (
+                        dx * wds[kb * BN + tx * TN + r] * Float32(
+                            isum[m * TN + r]
+                        )
+                    )
+        barrier()
+        base_blk += KB
+
+    comptime for m in range(TM):
+        t = t0 + ty * TM + m
+        if t < n_tokens:
+            comptime for r in range(TN):
+                row = row0 + tx * TN + r
+                if row < n_rows:
+                    y[t * n_rows + row] = acc[m * TN + r].cast[OUT]()
+
+
+comptime gemm_q4_0_dot4_64x64 = gemm_q4_0_dot4_impl[
+    64, 64, 4, 4, 4, DType.float16
+]
+comptime gemm_q4_0_dot4_128x64 = gemm_q4_0_dot4_impl[
+    128, 64, 8, 4, 2, DType.float16
+]
+comptime gemm_q4_0_dot4_128x128 = gemm_q4_0_dot4_impl[
+    128, 128, 8, 4, 2, DType.float16
+]
+comptime gemm_q4_0_dot4_out_f32_64x64 = gemm_q4_0_dot4_impl[
+    64, 64, 4, 4, 4, DType.float32
+]

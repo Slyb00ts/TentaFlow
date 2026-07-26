@@ -18,6 +18,26 @@ def silu_mul_f16(
         out_ptr[i] = Float16(s * Float32(up[i]))
 
 
+def gelu_mul_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    gate: UnsafePointer[Float16, MutAnyOrigin],
+    up: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+):
+    """out = gelu(gate) * up nad n kolejnymi elementami (GeGLU, rodzina Gemma).
+
+    Wariant tanh (`gelu_pytorch_tanh`), bo to on jest w referencji Gemmy — nie
+    dokladny erf. Rozjazd miedzy nimi jest rzedu 1e-3 i widoczny w logitach.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        g = Float32(gate[i])
+        inner = 0.7978845608028654 * (g + 0.044715 * g * g * g)
+        e = exp(2.0 * inner)
+        tanh_inner = (e - 1.0) / (e + 1.0)
+        out_ptr[i] = Float16(0.5 * g * (1.0 + tanh_inner) * Float32(up[i]))
+
+
 def sigmoid_mul_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     a: UnsafePointer[Float16, MutAnyOrigin],
