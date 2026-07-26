@@ -349,12 +349,10 @@ def check_q6k[BM: Int, BN: Int, TM: Int, TN: Int, KB: Int](
         for sb in range(nsuper):
             base = (r * nsuper + sb) * 210
             for i in range(192):
-                wh[base + i] = UInt8((r * 11 + sb * 7 + i * 5) % 256)
+                wh[base + i] = UInt8((r * 37 + sb * 23 + i * 11 + 5) % 256)
             for i in range(16):
-                wh[base + 192 + i] = bitcast[DType.uint8](
-                    Int8(((r * 3 + sb + i * 9) % 127) - 63)
-                )
-            dv = Float32(0.001953125 * Float32(1 + (r + sb) % 4)).cast[
+                wh[base + 192 + i] = UInt8((r * 37 + sb * 23 + (192 + i) * 11 + 5) % 256)
+            dv = Float32(0.006 + Float32((r + sb) % 7) * 0.003).cast[
                 DType.float16
             ]()
             db = bitcast[DType.uint16](dv)
@@ -689,6 +687,7 @@ def main() raises:
     check_q4k[128, 128, 8, 4, 2](ctx, 300, 300, 1024)
     check_q6k[64, 64, 4, 4, 4](ctx, 64, 64, 256)
     check_q6k[128, 64, 8, 4, 2](ctx, 200, 130, 512)
+    check_q6k[128, 64, 8, 4, 2](ctx, 40, 24, 512)
     check_q40[64, 64, 4, 4, 4](ctx, 64, 64, 64)
     check_q40[128, 64, 8, 4, 2](ctx, 200, 130, 1024)
     check_q40[128, 128, 8, 4, 2](ctx, 300, 300, 1024)

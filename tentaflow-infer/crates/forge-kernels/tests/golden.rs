@@ -481,17 +481,20 @@ fn gemm_q6_k_matches_formats_dequant() {
     }
     dev.synchronize().unwrap();
 
+    let xref = if kernels.int8_batch_activations() {
+        quantize_act_q8_1_host(&x, cols)
+    } else {
+        x.clone()
+    };
     let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
     for t in 0..n_tokens {
         for r in 0..rows {
             let want: f32 = (0..cols)
-                .map(|c| w_f32[r * cols + c] * x[t * cols + c])
+                .map(|c| w_f32[r * cols + c] * xref[t * cols + c])
                 .sum();
             let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
-            // Jak w `gemm_case`: batch bez jednostki macierzowej kwantyzuje
-            // aktywację do int8, więc próg jest luźniejszy niż dla GEMV.
             assert!(
-                rel < 0.05,
+                rel < 0.02,
                 "t {t} row {r}: got {} want {want}",
                 got[t * rows + r]
             );
@@ -2428,6 +2431,26 @@ fn gemv_case(quant: QuantKind, gemv: GemvFn, out32: GemvFn) {
     }
 }
 
+/// Odtwarza kwantyzacje aktywacji q8_1 (skala na 32 kolumny), ktora ścieżka
+/// int8 wykonuje przed batchowym GEMM na kartach bez jednostki macierzowej.
+fn quantize_act_q8_1_host(x: &[f32], cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; x.len()];
+    for (t, row) in x.chunks_exact(cols).enumerate() {
+        for b in 0..cols / 32 {
+            let blk = &row[b * 32..(b + 1) * 32];
+            let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            if amax == 0.0 {
+                continue;
+            }
+            let d = amax / 127.0;
+            for (i, v) in blk.iter().enumerate() {
+                out[t * cols + b * 32 + i] = (v / d).round().clamp(-127.0, 127.0) * d;
+            }
+        }
+    }
+    out
+}
+
 fn gemm_case(quant: QuantKind, gemm: GemmFn) {
     let Some(dev) = device() else { return };
     let kernels = Kernels::load(dev.clone()).unwrap();
@@ -2453,6 +2476,11 @@ fn gemm_case(quant: QuantKind, gemm: GemmFn) {
         }
         panic!("gemm: {e}");
     }
+    let xref = if kernels.int8_batch_activations() {
+        quantize_act_q8_1_host(&x, cols)
+    } else {
+        x.clone()
+    };
     dev.synchronize().unwrap();
 
     let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);

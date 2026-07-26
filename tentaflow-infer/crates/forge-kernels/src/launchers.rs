@@ -8357,6 +8357,14 @@ impl Kernels {
     /// Kafel dobrany pomiarem na gfx1030 (4096x4096, T=1024): 128x128 daje
     /// 35 TOPS, 128x64 32, a 64x64 29 i jest potrzebny tylko dla wąskich
     /// kształtów, gdzie większy kafel liczy głównie odrzucane wiersze.
+    /// Czy batchowe GEMM-y kwantyzuja aktywacje do int8 przed mnozeniem.
+    /// Karty bez jednostki macierzowej licza kaflem `v_dot4_i32_i8`, wiec
+    /// wynik zawiera blad kwantyzacji aktywacji — referencje testow musza go
+    /// odtwarzac, inaczej mierza kwantyzacje, nie kernel.
+    pub fn int8_batch_activations(&self) -> bool {
+        self.device.caps().vendor != forge_types::Vendor::Nvidia
+    }
+
     fn gemm_dot4_tile(
         &self,
         kernel_base: &str,

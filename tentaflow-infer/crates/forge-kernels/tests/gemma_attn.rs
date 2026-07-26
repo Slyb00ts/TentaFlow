@@ -214,3 +214,103 @@ fn gemm_q4_0_matches_cpu_for_gemma_projections() {
         }
     }
 }
+
+
+/// Odtwarza kwantyzacje aktywacji q8_1 (skala na 32 kolumny, `d = amax/127`),
+/// ktora ścieżka int8 wykonuje przed GEMM. Referencja MUSI ja uwzgledniac —
+/// inaczej test mierzy blad kwantyzacji, nie kernela, a przy wagach o duzej
+/// amplitudzie i kasowaniu skladnikow potrafi to dac dziesiatki procent.
+fn quantize_act_q8_1_host(x: &[f32], cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; x.len()];
+    for row in x.chunks_exact(cols).enumerate() {
+        let (t, row) = row;
+        for b in 0..cols / 32 {
+            let blk = &row[b * 32..(b + 1) * 32];
+            let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            if amax == 0.0 {
+                continue;
+            }
+            let d = amax / 127.0;
+            for (i, v) in blk.iter().enumerate() {
+                let q = (v / d).round().clamp(-127.0, 127.0);
+                out[t * cols + b * 32 + i] = q * d;
+            }
+        }
+    }
+    out
+}
+
+/// Buduje wage Q6_K [rows, cols]: superbloki 256 wartosci (ql[128], qh[64],
+/// 16 skal int8, d f16) i kanoniczna dekwantyzacja jak w `forge-formats`.
+fn build_q6k_ref(rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
+    let sb = cols / 256;
+    let mut raw = Vec::with_capacity(rows * sb * 210);
+    for r in 0..rows {
+        for b in 0..sb {
+            for i in 0..208 {
+                raw.push(((r * 37 + b * 23 + i * 11 + 5) % 256) as u8);
+            }
+            let d = f16::from_f32(0.006 + ((r + b) % 7) as f32 * 0.003);
+            raw.extend_from_slice(&d.to_le_bytes());
+        }
+    }
+    let deq = forge_formats::dequant::dequantize_to_f32(
+        forge_types::DType::F32,
+        forge_types::QuantKind::Q6K,
+        &raw,
+        rows * cols,
+    )
+    .unwrap();
+    (raw, deq)
+}
+
+/// Q6_K przez launcher (na AMD trafia w kafel int8 `v_dot4_i32_i8`).
+#[test]
+fn gemm_q6_k_matches_canonical_dequant_shapes() {
+    let dev = device();
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for &(rows, cols, n_tokens) in &[
+        (64usize, 256usize, 1usize),
+        (64, 256, 40),
+        (24, 512, 40),
+        (128, 512, 128),
+        (256, 1024, 64),
+    ] {
+        let (raw, deq) = build_q6k_ref(rows, cols);
+        let x: Vec<f32> = (0..n_tokens * cols)
+            .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+            .collect();
+        let xq = quantize_act_q8_1_host(&x, cols);
+        let wb = dev.alloc(raw.len(), MemKind::Device, Pool::Weights).unwrap();
+        dev.write(&raw, &wb, 0).unwrap();
+        let xb = upload(dev.as_ref(), &x);
+        let yb = upload(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+
+        kernels
+            .gemm_q6_k_f16(&yb, &wb, &xb, rows, cols, n_tokens, &stream)
+            .unwrap();
+        dev.synchronize().unwrap();
+        let got = download(dev.as_ref(), &yb, n_tokens * rows);
+
+        let mut worst = 0.0f32;
+        let mut worst_at = (0usize, 0usize);
+        for t in 0..n_tokens {
+            for r in 0..rows {
+                let want: f32 = (0..cols)
+                    .map(|c| deq[r * cols + c] * xq[t * cols + c])
+                    .sum();
+                let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
+                if rel > worst {
+                    worst = rel;
+                    worst_at = (t, r);
+                }
+            }
+        }
+        eprintln!(
+            "q6_k rows={rows} cols={cols} T={n_tokens}: worst rel {worst:.4} at {worst_at:?}"
+        );
+        assert!(worst < 0.02, "rows={rows} cols={cols} T={n_tokens} rel={worst}");
+    }
+}

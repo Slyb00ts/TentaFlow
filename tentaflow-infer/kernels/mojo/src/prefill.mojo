@@ -8,6 +8,7 @@ from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
 from std.gpu.compute.mma import mma, ld_matrix
+from src.arch_dot import dot2_f16
 from src.kv_fp8 import kv_row8_f16
 
 comptime WARP_SIZE = 32
@@ -276,18 +277,28 @@ def attn_prefill[head_dim: Int, kv_dtype: DType, PT: Int](
                 # czytają LDS poza `ks` (maskowanie samego score jest za późno).
                 var score = NEG_INF
                 if lane < h and pos0 + lane >= lo:
-                    var dotv = SIMD[DType.float32, 8](0.0)
+                    # Iloczyn Q·K przez `v_dot2_f32_f16`: dwa MAC-i f16 na
+                    # instrukcje zamiast mnozenia i dodawania w f32 po rozszerzeniu
+                    # (dwukrotnie mniej operacji wektorowych na te sama matematyke).
+                    # Cztery lancuchy akumulacji na chunk daja ILP, ktorego pojedyncza
+                    # suma nie ma.
+                    var dotv = SIMD[DType.float32, 4](0.0)
 
                     comptime for c in range(row_chunks):
                         kv8 = (
                             ks
                             + lane * head_dim
                             + ((c ^ (lane % row_chunks)) * 8)
-                        ).load[width=8, alignment=16]().cast[DType.float32]()
+                        ).load[width=8, alignment=16]()
                         qv8 = (
                             qs + (wid * QPW + i) * head_dim + c * 8
-                        ).load[width=8, alignment=16]().cast[DType.float32]()
-                        dotv += qv8 * kv8
+                        ).load[width=8, alignment=16]()
+                        comptime for j in range(4):
+                            dotv[j] = dot2_f16(
+                                qv8.slice[2, offset = j * 2](),
+                                kv8.slice[2, offset = j * 2](),
+                                dotv[j],
+                            )
                     score = dotv.reduce_add() * scale
                 mtile = warp.max(score)
                 if mtile > m[i]:
