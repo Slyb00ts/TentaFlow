@@ -4138,7 +4138,7 @@ function renderCasesTable() {
       <tf-column key="priority" label="${escapeAttr(t('cases_col_priority'))}" renderer="chip"></tf-column>
       <tf-column key="tags" label="${escapeAttr(t('cases_col_tags'))}"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('cases_col_status'))}" renderer="chip"></tf-column>
-      <tf-column key="origin" label="${escapeAttr(t('cases_col_origin'))}" renderer="html"></tf-column>
+      <tf-column key="origin" label="${escapeAttr(t('cases_col_origin'))}" renderer="chip"></tf-column>
       <tf-column key="lastResult" label="${escapeAttr(t('cases_col_last_result'))}" renderer="chip"></tf-column>
       <tf-column key="updated" label="${escapeAttr(t('cases_col_updated'))}" sortable></tf-column>
     </tf-table>

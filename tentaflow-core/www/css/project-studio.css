@@ -1,5 +1,14 @@
 /* ===== File: project-studio.css — Project Studio module: list, wizard, knowledge, chat, members, settings ===== */
 
+/* Per the HTML spec `hidden` means "not rendered", but any display:flex/grid rule
+   in this file silently outranks it — that is how the bulk-action bar stayed on
+   screen with nothing selected. Scoped to the module so other screens keep their
+   own behaviour. */
+#ps-list-view [hidden],
+#ps-project-view [hidden] {
+  display: none !important;
+}
+
 /* ---------------------------------------------------------------------------
  * P01 — project list
  * ------------------------------------------------------------------------- */
@@ -1658,6 +1667,10 @@
 .ps-reports-toolbar tf-input {
   min-width: 130px;
 }
+
+/* display:flex beats the hidden attribute, so the bar stayed on screen with
+   "Zaznaczono: 0" until this override was added. */
+.ps-bulk-bar[hidden] { display: none; }
 
 .ps-bulk-bar {
   display: flex;
