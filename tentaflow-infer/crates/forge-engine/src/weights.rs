@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::expert_spill::ExpertSpill;
 use crate::moe_residency::{ExpertStack, ExpertUsage};
 use crate::mtp::{MtpEmbedding, MtpTensorLoader, MtpWeights};
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
@@ -1807,31 +1808,29 @@ fn fetch_expert_stack(src: &dyn TensorSource, name: &str) -> Result<HostWeight> 
     quant_host_weight(name, data, dtype, quant, n_expert * a, b, 1.0)
 }
 
-/// Wgrywa sklejony stos ekspertów jako `n_experts` osobnych wag — po jednej na
-/// eksperta. Każda dostaje własną alokację, więc urządzenie warstwowe może
-/// umieścić część w VRAM, a część w przypiętej pamięci hosta, i każdy ekspert
-/// może później wędrować niezależnie od pozostałych.
+/// Wgrywa sklejony stos ekspertów jako osobne bloki — po jednym na eksperta.
+///
+/// Bloki są alokowane po kolei, więc urządzenie warstwowe rozkłada je samo:
+/// najpierw VRAM, potem przypięta pamięć hosta. Gdy skończy się jedno i drugie,
+/// reszta idzie do pliku zrzutu i będzie stronicowana na żądanie. Bez pliku
+/// zrzutu brak pamięci pozostaje twardym błędem — po cichu obciąć modelu nie
+/// wolno.
 fn upload_expert_stack(
     device: &dyn Device,
     stack: HostWeight,
     n_experts: usize,
+    spill: Option<&ExpertSpill>,
 ) -> Result<ExpertStack> {
-    macro_rules! split_stack {
+    type Rewrap = fn(DevBuffer, usize, usize) -> DevWeight;
+    macro_rules! stack_parts {
         ($stack:expr, $($variant:ident),+ $(,)?) => {
             match $stack {
-                $(HostWeight::$variant { data, rows, cols } => {
-                    let (rows_per_expert, bytes_per_expert) =
-                        expert_slice_shape(rows, data.len(), n_experts)?;
-                    let mut experts = Vec::with_capacity(n_experts);
-                    for e in 0..n_experts {
-                        experts.push(DevWeight::$variant {
-                            buf: upload(device, &data[e * bytes_per_expert..(e + 1) * bytes_per_expert])?,
-                            rows: rows_per_expert,
-                            cols,
-                        });
-                    }
-                    (experts, rows_per_expert, cols)
-                })+
+                $(HostWeight::$variant { data, rows, cols } => (
+                    data,
+                    rows,
+                    cols,
+                    (|buf, rows, cols| DevWeight::$variant { buf, rows, cols }) as Rewrap,
+                ),)+
                 other => {
                     return Err(ForgeError::Unsupported(format!(
                         "routed MoE experts in {:?} are not splittable per expert",
@@ -1841,13 +1840,37 @@ fn upload_expert_stack(
             }
         };
     }
-    let (experts, rows_per_expert, cols) = split_stack!(
+    let (data, rows, cols, rewrap) = stack_parts!(
         stack, F16, Q8_0, Q4K, Q6K, Q5K, Q3K, Q2K, Q4_0, Q4_1, Q5_0, Q5_1, Iq4Nl, Iq4Xs, Mxfp4,
         Iq2Xs, Iq2S, Iq3S, Iq2Xxs, Iq3Xxs, Iq1S, Iq1M,
     );
-    let resident = (0..experts.len()).collect();
-    let spilled = vec![None; experts.len()];
-    ExpertStack::new(device, experts, resident, spilled, rows_per_expert, cols)
+    let (rows_per_expert, bytes_per_expert) = expert_slice_shape(rows, data.len(), n_experts)?;
+
+    let mut slots = Vec::with_capacity(n_experts);
+    let mut resident = Vec::with_capacity(n_experts);
+    let mut spilled = vec![None; n_experts];
+    for expert in 0..n_experts {
+        let bytes = &data[expert * bytes_per_expert..(expert + 1) * bytes_per_expert];
+        match upload(device, bytes) {
+            Ok(buf) => {
+                slots.push(rewrap(buf, rows_per_expert, cols));
+                resident.push(expert);
+            }
+            Err(out_of_memory) => {
+                let Some(spill) = spill else {
+                    return Err(out_of_memory);
+                };
+                spilled[expert] = Some(spill.append(bytes)?);
+            }
+        }
+    }
+    if slots.is_empty() {
+        return Err(ForgeError::OutOfMemory {
+            requested: bytes_per_expert,
+            available: 0,
+        });
+    }
+    ExpertStack::new(device, slots, resident, spilled, rows_per_expert, cols)
 }
 
 /// Wiersze i bajty przypadające na jednego eksperta; obie wielkości muszą
@@ -2509,11 +2532,20 @@ impl ModelWeights {
         path: &Path,
         native_mtp: bool,
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
+        spill: Option<&ExpertSpill>,
     ) -> Result<Self> {
         let gguf = Gguf::open(path)?;
         let descriptor = ModelDescriptor::detect(&gguf)?;
         let src = GgufSource(&gguf);
-        Self::load(device.as_ref(), descriptor, &src, native_mtp, target_tile, None)
+        Self::load(
+            device.as_ref(),
+            descriptor,
+            &src,
+            native_mtp,
+            target_tile,
+            None,
+            spill,
+        )
     }
 
     pub fn load_safetensors_dir(
@@ -2522,6 +2554,7 @@ impl ModelWeights {
         native_mtp: bool,
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         nvfp4_ct: (&Kernels, &forge_hal::Stream, NvFp4CtLayoutPolicy),
+        spill: Option<&ExpertSpill>,
     ) -> Result<Self> {
         let config: HfConfig = {
             let text = std::fs::read_to_string(dir.join("config.json"))?;
@@ -2560,6 +2593,7 @@ impl ModelWeights {
             native_mtp,
             target_tile,
             Some(&context),
+            spill,
         )
         .and_then(|weights| {
             validate_nvfp4_ct_upload_manifest(
@@ -2595,6 +2629,7 @@ impl ModelWeights {
         native_mtp: bool,
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
+        spill: Option<&ExpertSpill>,
     ) -> Result<Self> {
         if target_tile.is_some() {
             preflight_target_tile(device, &descriptor)?;
@@ -2615,6 +2650,7 @@ impl ModelWeights {
                 native_mtp,
                 target_tile,
                 nvfp4_ct,
+                spill,
             );
         }
         let global = |role: WeightRole| -> Result<&String> {
@@ -2881,9 +2917,9 @@ impl ModelWeights {
                     };
                     LayerFfn::Moe(Box::new(MoeFfn {
                         router,
-                        gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts)?,
-                        up_exps: upload_expert_stack(device, up_exps, moe.n_experts)?,
-                        down_exps: upload_expert_stack(device, down_exps, moe.n_experts)?,
+                        gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill)?,
+                        up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill)?,
+                        down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill)?,
                         shared,
                         shared_gate: None,
                         n_experts: moe.n_experts,
@@ -2992,6 +3028,7 @@ impl ModelWeights {
         native_mtp: bool,
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
+        spill: Option<&ExpertSpill>,
     ) -> Result<Self> {
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
@@ -3150,9 +3187,9 @@ impl ModelWeights {
 
                 LayerFfn::Moe(Box::new(MoeFfn {
                     router,
-                    gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts)?,
-                    up_exps: upload_expert_stack(device, up_exps, moe.n_experts)?,
-                    down_exps: upload_expert_stack(device, down_exps, moe.n_experts)?,
+                    gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill)?,
+                    up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill)?,
+                    down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill)?,
                     shared: Some(DenseFfn {
                         gate_up: GateUpWeights::Split {
                             gate: sh_gate,

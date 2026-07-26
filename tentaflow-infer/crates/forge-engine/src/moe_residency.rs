@@ -375,14 +375,25 @@ impl ExpertStack {
                     }
                 };
                 let evicted = placement.owner_of[slot];
-                placement.slot_of[evicted] = None;
-                placement.slot_of[expert] = Some(slot);
-                placement.owner_of[slot] = expert;
                 let host_ptr = slot_buffer(&self.slots[slot])?.host_ptr().ok_or_else(|| {
                     ForgeError::Kernel(
                         "slot warstwy hosta nie ma adresu widocznego dla hosta".into(),
                     )
                 })?;
+                // Ofiara, która nigdy nie była na dysku, musi tam trafić TERAZ —
+                // inaczej jej bajty znikną razem z nadpisaniem slotu. Zapis
+                // zdarza się raz na eksperta przez całe życie modelu, więc
+                // amortyzuje się natychmiast; kopia jest wieczna, bo wagi są
+                // tylko do odczytu.
+                if placement.spilled[evicted].is_none() {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(host_ptr, self.bytes_per_expert)
+                    };
+                    placement.spilled[evicted] = Some(spill.append(bytes)?);
+                }
+                placement.slot_of[evicted] = None;
+                placement.slot_of[expert] = Some(slot);
+                placement.owner_of[slot] = expert;
                 targets.push(SpillTarget { region, host_ptr });
             }
         }

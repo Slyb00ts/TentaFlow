@@ -23,6 +23,7 @@ use forge_types::{DType, ForgeError, MemKind, QuantKind, Result, Vendor};
 use half::f16;
 
 use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
+use crate::expert_spill::ExpertSpill;
 use crate::moe_residency::{
     ExpertStack, Migration, MoeLayerView, MoeResidencyState, Projection, ProjectionId,
     MOE_RESIDENCY_INTERVAL,
@@ -958,6 +959,9 @@ pub struct ModelConfig {
     /// uruchomić kosztem pasma. 0 wyłącza strumieniowanie: brak miejsca w VRAM
     /// jest wtedy błędem, jak przed wprowadzeniem tieringu.
     pub weight_host_budget: usize,
+    /// Katalog na plik zrzutu wag ekspertów MoE. `None` wyłącza warstwę NVMe:
+    /// model, który nie mieści się w VRAM i RAM, po prostu się nie załaduje.
+    pub weight_spill_dir: Option<std::path::PathBuf>,
     pub kv_page_size: usize,
     pub kv_pages: usize,
     pub max_seq_len: usize,
@@ -987,6 +991,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             weight_host_budget: 0,
+            weight_spill_dir: None,
             kv_page_size: 32,
             kv_pages: 512,
             max_seq_len: 8192,
@@ -1077,6 +1082,8 @@ pub struct Model {
     moe_bufs: Option<MoeBufs>,
     /// Rezydencja ekspertów; `Some` tylko dla modeli MoE.
     moe_residency: Option<MoeResidencyState>,
+    /// Plik zrzutu wag ekspertów; `Some`, gdy skonfigurowano warstwę NVMe.
+    expert_spill: Option<ExpertSpill>,
     /// Pula izolowanych stanów Gated-DeltaNet przypisanych do sekwencji.
     hybrid_states: Option<HybridStatePool>,
     /// Gated-attention + DeltaNet single-token scratch; allocated lazily for a
@@ -2464,11 +2471,13 @@ impl Model {
         let sink: Arc<TieredWeightDevice> =
             Arc::new(TieredWeightDevice::new(device.clone(), cfg.weight_host_budget));
         let sink_dev: Arc<dyn Device> = sink.clone();
-        let mut weights = ModelWeights::load_gguf(&sink_dev, path, cfg.native_mtp, tile_context)?;
+        let spill = Self::open_spill(&cfg, "gguf")?;
+        let mut weights =
+            ModelWeights::load_gguf(&sink_dev, path, cfg.native_mtp, tile_context, spill.as_ref())?;
         Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
         weights.nvfp4_repacked_weights = repacked_weights.get();
-        Self::finish(sink_dev, weights, cfg, kernels, stream)
+        Self::finish(sink_dev, weights, cfg, kernels, stream, spill)
     }
 
     pub fn load_safetensors_dir(
@@ -2487,6 +2496,7 @@ impl Model {
         let sink: Arc<TieredWeightDevice> =
             Arc::new(TieredWeightDevice::new(device.clone(), cfg.weight_host_budget));
         let sink_dev: Arc<dyn Device> = sink.clone();
+        let spill = Self::open_spill(&cfg, "safetensors")?;
         let mut weights =
             ModelWeights::load_safetensors_dir(
                 &sink_dev,
@@ -2494,11 +2504,20 @@ impl Model {
                 cfg.native_mtp,
                 tile_context,
                 (&kernels, &stream, cfg.nvfp4_ct_layout),
+                spill.as_ref(),
             )?;
         Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
         weights.nvfp4_repacked_weights = repacked_weights.get();
-        Self::finish(sink_dev, weights, cfg, kernels, stream)
+        Self::finish(sink_dev, weights, cfg, kernels, stream, spill)
+    }
+
+    /// Otwiera plik zrzutu wag, gdy konfiguracja wskazała katalog.
+    fn open_spill(cfg: &ModelConfig, tag: &str) -> Result<Option<ExpertSpill>> {
+        cfg.weight_spill_dir
+            .as_ref()
+            .map(|dir| ExpertSpill::create(dir, tag))
+            .transpose()
     }
 
     pub fn nvfp4_gguf_layout_summary(&self) -> (Nvfp4GgufLayout, usize) {
@@ -2517,6 +2536,7 @@ impl Model {
         cfg: ModelConfig,
         kernels: Kernels,
         stream: Stream,
+        spill: Option<ExpertSpill>,
     ) -> Result<Self> {
         let p = weights.descriptor.params.clone();
         // head_dim 256 has an f16-only attention specialization (qwen35moe
@@ -2921,6 +2941,7 @@ impl Model {
             pt_seq: 0,
             moe_bufs,
             moe_residency,
+            expert_spill: spill,
             hybrid_states,
             hybrid_bufs: None,
             hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
@@ -5373,10 +5394,13 @@ impl Model {
 
     /// True when every routed-expert projection of `moe` supports the
     /// device-indexed dispatch (so the whole layer runs with zero host readback).
+    /// Warstwa ze stronicowanym ekspertem NIE kwalifikuje się: kernel `_gidx`
+    /// nie ma jak zaadresować bloku, który leży na dysku, a stwierdzić tego
+    /// przed uruchomieniem można tylko po odczycie wyboru routera na hoście.
     fn moe_gidx_capable(moe: &MoeFfn) -> bool {
-        Self::expert_stack_gidx(&moe.gate_exps)
-            && Self::expert_stack_gidx(&moe.up_exps)
-            && Self::expert_stack_gidx(&moe.down_exps)
+        [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
+            .into_iter()
+            .all(|stack| Self::expert_stack_gidx(stack) && stack.fully_resident())
     }
 
     /// Single-token GEMV over the expert selected on-device by `ids[sel]`: the
@@ -6286,7 +6310,7 @@ impl Model {
                 }
                 LayerFfn::Moe(moe) => {
                     // Per-token routed experts written into pb.down [t, hidden].
-                    self.moe_prefill_ffn(moe, t, hidden, stream)?;
+                    self.moe_prefill_ffn(moe, l, t, hidden, stream)?;
                     trace.mark(self.device.as_ref(), "moe_ffn");
                 }
             }
@@ -12703,7 +12727,7 @@ impl Model {
             )?;
 
             match &layer.ffn {
-                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, hidden, stream)?,
+                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream)?,
                 LayerFfn::Dense(_) => {
                     return Err(ForgeError::Unsupported(
                         "dense layer inside a MoE forward pass".into(),
@@ -12738,7 +12762,13 @@ impl Model {
     /// input, `b.down` receives the weighted sum of the selected experts'
     /// SwiGLU outputs (plus the shared expert if present). The top-k experts
     /// are read back to the host to index the stacked expert weights.
-    fn moe_decode_ffn(&self, moe: &MoeFfn, hidden: usize, stream: &Stream) -> Result<()> {
+    fn moe_decode_ffn(
+        &self,
+        moe: &MoeFfn,
+        layer: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         let b = &self.bufs;
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
         let inter = moe.moe_inter;
@@ -12829,6 +12859,7 @@ impl Model {
         } else {
             1.0
         };
+        self.fault_in_experts(moe, layer, ids)?;
         self.moe_experts_accumulate(
             moe,
             &b.x,
@@ -12923,6 +12954,34 @@ impl Model {
     /// quant GEMV machinery indexed by expert row-offset; the shared expert (if
     /// any) is folded in last. Scratch (`b.gate/up/act`, `mb.tmp`) is
     /// single-token sized, so this serves both the decode and prefill loops.
+    /// Ściąga z dysku każdego wybranego eksperta, który nie jest rezydentny.
+    ///
+    /// Cały komplet warstwy idzie jednym zgłoszeniem: chybienia trzech
+    /// projekcji są znane naraz, a NVMe oddaje pełną przepustowość dopiero przy
+    /// głębokiej kolejce — po kolei płaciłoby się sumę opóźnień zamiast
+    /// najdłuższego z nich.
+    fn fault_in_experts(&self, moe: &MoeFfn, layer: usize, ids: &[i32]) -> Result<()> {
+        let Some(spill) = self.expert_spill.as_ref() else {
+            return Ok(());
+        };
+        let wanted: Vec<usize> = ids.iter().map(|&e| e as usize).collect();
+        // Bez zebranych liczników popularność jest zerowa i ofiarą pada
+        // dowolny slot — to poprawne, tylko nieoptymalne przez pierwszą rundę.
+        let empty = Vec::new();
+        let popularity = self
+            .moe_residency
+            .as_ref()
+            .map(|state| state.policy.popularity(layer))
+            .unwrap_or(&empty);
+        for stack in [&moe.gate_exps, &moe.up_exps, &moe.down_exps] {
+            if stack.fully_resident() {
+                continue;
+            }
+            stack.fault_in(self.device.as_ref(), spill, &wanted, popularity)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn moe_experts_accumulate(
         &self,
@@ -12997,6 +13056,7 @@ impl Model {
     fn moe_prefill_ffn(
         &self,
         moe: &MoeFfn,
+        layer: usize,
         t: usize,
         hidden: usize,
         stream: &Stream,
@@ -13046,6 +13106,7 @@ impl Model {
             // the single-token expert GEMVs read from offset 0.
             self.device
                 .copy(&pb.x, ti * hidden * 2, &mb.xrow, 0, hidden * 2, stream)?;
+            self.fault_in_experts(moe, layer, &ids[ti * k..(ti + 1) * k])?;
             self.moe_experts_accumulate(
                 moe,
                 &mb.xrow,
@@ -14972,7 +15033,7 @@ impl Model {
                 stream,
             )?;
             match &layer.ffn {
-                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, hidden, stream)?,
+                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream)?,
                 LayerFfn::Dense(ffn) => {
                     match &ffn.gate_up {
                         GateUpWeights::Fused(weight) => {

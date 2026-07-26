@@ -101,6 +101,11 @@ enum Command {
         /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
         #[arg(long = "weight-host-gb", default_value_t = 0.0)]
         weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
         /// Tool-call output parser: hermes | llama3 | none (default: auto-detect).
         #[arg(long)]
         tool_call_parser: Option<String>,
@@ -181,6 +186,11 @@ enum Command {
         /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
         #[arg(long = "weight-host-gb", default_value_t = 0.0)]
         weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
     },
     /// One-shot generation streamed to stdout.
     Run {
@@ -203,6 +213,11 @@ enum Command {
         /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
         #[arg(long = "weight-host-gb", default_value_t = 0.0)]
         weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -301,6 +316,11 @@ enum Command {
         /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
         #[arg(long = "weight-host-gb", default_value_t = 0.0)]
         weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -393,6 +413,7 @@ fn main() -> Result<()> {
             kv_pages,
             weights_pool_gb,
             weight_host_gb,
+            weight_spill_dir,
             tool_call_parser,
             whisper_model,
             embed_model,
@@ -428,6 +449,7 @@ fn main() -> Result<()> {
                 kv_pages,
                 weights_pool_gb,
                 weight_host_gb,
+                weight_spill_dir.clone(),
                 tool_call_parser,
                 whisper_model.as_deref(),
                 embed_model.as_deref(),
@@ -446,6 +468,7 @@ fn main() -> Result<()> {
             dimensions,
             weights_pool_gb,
             weight_host_gb,
+            weight_spill_dir,
         } => cmd_embed(
             &model_path,
             &text,
@@ -453,6 +476,7 @@ fn main() -> Result<()> {
             dimensions,
             weights_pool_gb,
             weight_host_gb,
+            weight_spill_dir,
         ),
         Command::Run {
             model_path,
@@ -462,6 +486,7 @@ fn main() -> Result<()> {
             chat,
             weights_pool_gb,
             weight_host_gb,
+            weight_spill_dir,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -492,6 +517,7 @@ fn main() -> Result<()> {
                 chat,
                 weights_pool_gb,
                 weight_host_gb,
+                weight_spill_dir.clone(),
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -519,6 +545,7 @@ fn main() -> Result<()> {
             prompt_token_ids,
             weights_pool_gb,
             weight_host_gb,
+            weight_spill_dir,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -549,6 +576,7 @@ fn main() -> Result<()> {
                 prompt_token_ids.as_deref(),
                 weights_pool_gb,
                 weight_host_gb,
+                weight_spill_dir.clone(),
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -914,6 +942,7 @@ fn load_for_serve(
     kv_pages: usize,
     weights_pool_gb: f64,
     weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -977,6 +1006,7 @@ fn load_for_serve(
     .context("open GPU device")?;
     let cfg = ModelConfig {
         weight_host_budget: (weight_host_gb * (1u64 << 30) as f64) as usize,
+        weight_spill_dir,
         kv_page_size,
         kv_pages,
         kv_quant,
@@ -1015,6 +1045,7 @@ fn load_auto(
     path: &Path,
     weights_pool_gb: f64,
     weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1077,6 +1108,7 @@ fn load_auto(
         path,
         ModelConfig {
         weight_host_budget: (weight_host_gb * (1u64 << 30) as f64) as usize,
+        weight_spill_dir,
             kv_quant,
             kv_tier,
             kv_page_size: page_size,
@@ -1168,12 +1200,14 @@ fn cmd_embed(
     dimensions: Option<usize>,
     weights_pool_gb: f64,
     weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let loaded = load_auto(
         model_path,
         weights_pool_gb,
         weight_host_gb,
+        weight_spill_dir,
         KvQuant::F16,
         KvTierConfig::default(),
         8192,
@@ -1330,6 +1364,7 @@ fn cmd_serve(
     kv_pages: usize,
     weights_pool_gb: f64,
     weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     tool_call_parser: Option<String>,
     whisper_model: Option<&Path>,
     embed_model: Option<&Path>,
@@ -1355,6 +1390,7 @@ fn cmd_serve(
         kv_pages,
         weights_pool_gb,
         weight_host_gb,
+        weight_spill_dir,
         kv_quant,
         kv_tier,
         ctx,
@@ -1573,6 +1609,7 @@ fn cmd_run(
     chat: bool,
     weights_pool_gb: f64,
     weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1589,6 +1626,7 @@ fn cmd_run(
         model_path,
         weights_pool_gb,
         weight_host_gb,
+        weight_spill_dir,
         kv_quant,
         kv_tier,
         ctx,
@@ -1703,6 +1741,7 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         model_path,
         0.0,
         0.0,
+        None,
         KvQuant::F16,
         KvTierConfig::default(),
         ctx,
@@ -1883,6 +1922,7 @@ fn cmd_bench(
     prompt_token_ids: Option<&Path>,
     weights_pool_gb: f64,
     weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1907,6 +1947,7 @@ fn cmd_bench(
         model_path,
         weights_pool_gb,
         weight_host_gb,
+        weight_spill_dir,
         kv_quant,
         kv_tier,
         ctx,
