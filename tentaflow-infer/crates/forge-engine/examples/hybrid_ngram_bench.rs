@@ -736,6 +736,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device,
         &path,
         ModelConfig {
+            weight_host_budget: 0,
+weight_spill_dir: None,
             kv_page_size: 32,
             kv_pages: max_seq_len.div_ceil(32) + 2,
             max_seq_len,

@@ -42,6 +42,8 @@ fn load() -> Option<Model> {
     };
     let dev: Arc<dyn Device> = device;
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+weight_spill_dir: None,
         kv_pages: 256,
         ..ModelConfig::default()
     };

@@ -55,6 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev,
         &path,
         ModelConfig {
+            weight_host_budget: 0,
+weight_spill_dir: None,
             kv_page_size: 32,
             kv_pages: 4,
             max_seq_len: 128,

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::expert_spill::ExpertSpill;
-use crate::moe_residency::{ExpertStack, ExpertUsage};
+use crate::moe_residency::{ExpertBudget, ExpertStack, ExpertUsage};
 use crate::mtp::{MtpEmbedding, MtpTensorLoader, MtpWeights};
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
@@ -702,6 +702,9 @@ trait TensorSource {
     /// compressed-tensors FP8 ("float-quantized"): f8e4m3 weight + sibling
     /// `<base>.weight_scale` (per-channel or per-tensor). None when absent.
     fn fetch_fp8(&self, name: &str) -> Result<Option<Fp8Host>>;
+    /// Rozmiar tensora na dysku, bez jego wczytywania. `None`, gdy źródło nie
+    /// potrafi go podać — wtedy budżet rezydencji ekspertów jest nieznany.
+    fn byte_len(&self, name: &str) -> Option<usize>;
 }
 
 struct SourceMtpLoader<'a> {
@@ -1234,6 +1237,11 @@ fn finish_nvfp4_ct_load<T>(load: Result<T>, reset: Result<()>) -> Result<T> {
 struct GgufSource<'a>(&'a Gguf);
 
 impl TensorSource for GgufSource<'_> {
+    fn byte_len(&self, name: &str) -> Option<usize> {
+        self.0.tensor(name).map(|t| t.size_bytes)
+    }
+
+
     fn fetch(&self, name: &str) -> Result<TensorFetch> {
         let t = self
             .0
@@ -1270,6 +1278,11 @@ struct StSource<'a> {
 }
 
 impl TensorSource for StSource<'_> {
+    fn byte_len(&self, _name: &str) -> Option<usize> {
+        None
+    }
+
+
     fn fetch(&self, name: &str) -> Result<TensorFetch> {
         let t = self
             .st
@@ -1380,6 +1393,15 @@ fn f32s_to_f16_bytes(vals: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&f16::from_f32(v).to_le_bytes());
     }
     out
+}
+
+/// Wgrywa bajty do wskazanej warstwy pamięci. Rezydencja ekspertów wybiera
+/// warstwę sama, więc nie może polegać na automatycznym zsuwaniu do hosta —
+/// to ono rozdzielało pamięć w kolejności ładowania.
+fn upload_as(device: &dyn Device, bytes: &[u8], kind: MemKind) -> Result<DevBuffer> {
+    let buf = device.alloc(bytes.len(), kind, Pool::Weights)?;
+    device.write(bytes, &buf, 0)?;
+    Ok(buf)
 }
 
 fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
@@ -1808,6 +1830,69 @@ fn fetch_expert_stack(src: &dyn TensorSource, name: &str) -> Result<HostWeight> 
     quant_host_weight(name, data, dtype, quant, n_expert * a, b, 1.0)
 }
 
+/// Ile bajtów ekspertów wolno zostawić w pamięci przy tym modelu.
+///
+/// Pojemność to wolne miejsce, jakie zgłasza warstwowe urządzenie (VRAM plus
+/// budżet przypiętej pamięci hosta), minus wszystko, czego zrzucić na dysk się
+/// nie da. `None`, gdy źródło nie potrafi podać rozmiarów albo urządzenie
+/// pojemności — wtedy zostaje dotychczasowe zachowanie sterowane brakiem
+/// pamięci.
+fn expert_residency_budget(
+    device: &dyn Device,
+    descriptor: &ModelDescriptor,
+    src: &dyn TensorSource,
+    host_budget: usize,
+) -> Option<ExpertBudget> {
+    // Liczone PO wgraniu wag globalnych: embedding i głowa logitów bywają przy
+    // ładowaniu przewalutowane (kwantyzacja z dysku -> f16), więc ich rozmiar w
+    // pliku nie mówi nic o zajętej pamięci. Wolne miejsce zgłoszone teraz już
+    // ten koszt uwzględnia, a pozostałe wagi warstw idą do pamięci takie, jakie
+    // są na dysku — dla nich rachunek z pliku jest dokładny.
+    let capacity = device.pool_available(Pool::Weights)?;
+    let mut expert_bytes = 0usize;
+    let mut layer_bytes = 0usize;
+    for layer in &descriptor.layers {
+        for (role, name) in layer {
+            let bytes = src.byte_len(name)?;
+            match role {
+                WeightRole::FfnGateExps | WeightRole::FfnUpExps | WeightRole::FfnDownExps => {
+                    expert_bytes += bytes
+                }
+                _ => layer_bytes += bytes,
+            }
+        }
+    }
+    if expert_bytes == 0 {
+        return None;
+    }
+    // Zapas na wyrównanie areny i drobne bufory rezydencji (tablice wskaźników,
+    // liczniki popularności), których nie ma w pliku modelu.
+    const SLACK: usize = 64 << 20;
+    // Wagi warstw inne niż eksperci nie mają dokąd się wynieść, więc miejsce na
+    // nie jest odejmowane od VRAM zanim eksperci cokolwiek zajmą.
+    let vram_capacity = capacity.saturating_sub(host_budget);
+    let vram_for_experts = vram_capacity.saturating_sub(layer_bytes + SLACK);
+    // Każdy stos musi pomieścić naraz komplet wybrany przez router, z zapasem
+    // na to, że kolejny token wybierze inny — inaczej eksperci wypieraliby się
+    // nawzajem w obrębie jednej warstwy.
+    let min_slots = descriptor
+        .params
+        .moe
+        .as_ref()
+        .map(|moe| moe.n_experts_used * 2)
+        .unwrap_or(1);
+    let budget = ExpertBudget::new(vram_for_experts, host_budget, expert_bytes, min_slots);
+    tracing::info!(
+        vram_for_experts_mib = vram_for_experts >> 20,
+        host_mib = host_budget >> 20,
+        expert_mib = expert_bytes >> 20,
+        layer_other_mib = layer_bytes >> 20,
+        resident_pct = format!("{:.1}", budget.resident_fraction() * 100.0),
+        "budżet rezydencji ekspertów"
+    );
+    Some(budget)
+}
+
 /// Wgrywa sklejony stos ekspertów jako osobne bloki — po jednym na eksperta.
 ///
 /// Bloki są alokowane po kolei, więc urządzenie warstwowe rozkłada je samo:
@@ -1820,6 +1905,7 @@ fn upload_expert_stack(
     stack: HostWeight,
     n_experts: usize,
     spill: Option<&ExpertSpill>,
+    budget: Option<&ExpertBudget>,
 ) -> Result<ExpertStack> {
     type Rewrap = fn(DevBuffer, usize, usize) -> DevWeight;
     macro_rules! stack_parts {
@@ -1846,12 +1932,34 @@ fn upload_expert_stack(
     );
     let (rows_per_expert, bytes_per_expert) = expert_slice_shape(rows, data.len(), n_experts)?;
 
-    let mut slots = Vec::with_capacity(n_experts);
-    let mut resident = Vec::with_capacity(n_experts);
+    // Plan zapada PRZED alokacją i jest ten sam dla każdego stosu, więc żadna
+    // warstwa nie zostaje bez rezydentnych ekspertów tylko dlatego, że ładuje
+    // się jako ostatnia.
+    let (vram_slots, host_slots) = match budget {
+        Some(budget) => budget.plan(n_experts),
+        None => (n_experts, 0),
+    };
+    let mut slots = Vec::with_capacity(vram_slots + host_slots);
+    let mut resident = Vec::with_capacity(vram_slots + host_slots);
     let mut spilled = vec![None; n_experts];
     for expert in 0..n_experts {
         let bytes = &data[expert * bytes_per_expert..(expert + 1) * bytes_per_expert];
-        match upload(device, bytes) {
+        let kind = if expert < vram_slots {
+            MemKind::Device
+        } else if expert < vram_slots + host_slots {
+            MemKind::PinnedHost
+        } else {
+            match spill {
+                Some(spill) => {
+                    spilled[expert] = Some(spill.append(bytes)?);
+                    continue;
+                }
+                // Bez pliku zrzutu nie ma trzeciej warstwy — próbujemy zwykłej
+                // ścieżki i pozwalamy brakowi pamięci być błędem.
+                None => MemKind::Device,
+            }
+        };
+        match upload_as(device, bytes, kind) {
             Ok(buf) => {
                 slots.push(rewrap(buf, rows_per_expert, cols));
                 resident.push(expert);
@@ -1863,6 +1971,14 @@ fn upload_expert_stack(
                 spilled[expert] = Some(spill.append(bytes)?);
             }
         }
+    }
+    let on_disk = spilled.iter().filter(|r| r.is_some()).count();
+    if on_disk > 0 {
+        tracing::debug!(
+            slots = slots.len(),
+            on_disk,
+            "stos ekspertów częściowo zrzucony na dysk"
+        );
     }
     if slots.is_empty() {
         return Err(ForgeError::OutOfMemory {
@@ -2533,6 +2649,7 @@ impl ModelWeights {
         native_mtp: bool,
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         spill: Option<&ExpertSpill>,
+        host_budget: usize,
     ) -> Result<Self> {
         let gguf = Gguf::open(path)?;
         let descriptor = ModelDescriptor::detect(&gguf)?;
@@ -2545,6 +2662,7 @@ impl ModelWeights {
             target_tile,
             None,
             spill,
+            host_budget,
         )
     }
 
@@ -2555,6 +2673,7 @@ impl ModelWeights {
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         nvfp4_ct: (&Kernels, &forge_hal::Stream, NvFp4CtLayoutPolicy),
         spill: Option<&ExpertSpill>,
+        host_budget: usize,
     ) -> Result<Self> {
         let config: HfConfig = {
             let text = std::fs::read_to_string(dir.join("config.json"))?;
@@ -2594,6 +2713,7 @@ impl ModelWeights {
             target_tile,
             Some(&context),
             spill,
+            host_budget,
         )
         .and_then(|weights| {
             validate_nvfp4_ct_upload_manifest(
@@ -2630,6 +2750,7 @@ impl ModelWeights {
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
         spill: Option<&ExpertSpill>,
+        host_budget: usize,
     ) -> Result<Self> {
         if target_tile.is_some() {
             preflight_target_tile(device, &descriptor)?;
@@ -2651,6 +2772,7 @@ impl ModelWeights {
                 target_tile,
                 nvfp4_ct,
                 spill,
+                host_budget,
             );
         }
         let global = |role: WeightRole| -> Result<&String> {
@@ -2744,6 +2866,7 @@ impl ModelWeights {
             ));
         }
 
+        let budget = expert_residency_budget(device, &descriptor, src, host_budget);
         let mut layers = Vec::with_capacity(descriptor.params.block_count);
         let mut fused_qkv_layers = 0usize;
         let mut fused_qk_layers = 0usize;
@@ -2917,9 +3040,9 @@ impl ModelWeights {
                     };
                     LayerFfn::Moe(Box::new(MoeFfn {
                         router,
-                        gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill)?,
-                        up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill)?,
-                        down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill)?,
+                        gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill, budget.as_ref())?,
+                        up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill, budget.as_ref())?,
+                        down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill, budget.as_ref())?,
                         shared,
                         shared_gate: None,
                         n_experts: moe.n_experts,
@@ -3029,7 +3152,9 @@ impl ModelWeights {
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
         spill: Option<&ExpertSpill>,
+        host_budget: usize,
     ) -> Result<Self> {
+        let budget = expert_residency_budget(device, &descriptor, src, host_budget);
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
                 .globals
@@ -3187,9 +3312,9 @@ impl ModelWeights {
 
                 LayerFfn::Moe(Box::new(MoeFfn {
                     router,
-                    gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill)?,
-                    up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill)?,
-                    down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill)?,
+                    gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill, budget.as_ref())?,
+                    up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill, budget.as_ref())?,
+                    down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill, budget.as_ref())?,
                     shared: Some(DenseFfn {
                         gate_up: GateUpWeights::Split {
                             gate: sh_gate,
@@ -3571,6 +3696,10 @@ mod tests {
     }
 
     impl TensorSource for Nvfp4EmbeddingSource {
+        fn byte_len(&self, _name: &str) -> Option<usize> {
+            None
+        }
+
         fn fetch(&self, name: &str) -> Result<TensorFetch> {
             match name {
                 "token_embd.weight" => {

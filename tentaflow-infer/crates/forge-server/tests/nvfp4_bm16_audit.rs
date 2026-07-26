@@ -226,6 +226,7 @@ fn load_bielik(batch: usize, layout: NvFp4CtLayoutPolicy) -> Model {
         device,
         path,
         ModelConfig {
+            weight_spill_dir: None,
             weight_host_budget: 0,
             kv_page_size,
             kv_pages,

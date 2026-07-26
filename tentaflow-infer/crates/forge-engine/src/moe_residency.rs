@@ -448,6 +448,59 @@ fn slot_buffer(weight: &DevWeight) -> Result<&DevBuffer> {
     })
 }
 
+/// Plan rezydencji ekspertów: ilu z każdego stosu zostaje w VRAM, ilu w pamięci
+/// hosta, a ilu ląduje na dysku.
+///
+/// Podział jest PROPORCJONALNY, nie „kto pierwszy". Rozdzielanie pamięci w
+/// kolejności ładowania daje najgorszy możliwy wynik: pierwsze warstwy są w
+/// całości rezydentne, a ostatnie w całości na dysku, więc każdy token trafia
+/// gwarantowanym chybieniem w każdą z nich. Równy udział daje każdej warstwie
+/// ten sam współczynnik trafień.
+///
+/// Każdy stos zachowuje przy tym minimum slotów w pamięci hosta — bez nich
+/// warstwa nie miałaby dokąd ściągnąć wybranych ekspertów i model byłby nie do
+/// uruchomienia, a nie tylko wolny.
+pub struct ExpertBudget {
+    resident_fraction: f64,
+    vram_fraction: f64,
+    min_slots: usize,
+}
+
+impl ExpertBudget {
+    pub fn new(vram_bytes: usize, host_bytes: usize, expert_bytes: usize, min_slots: usize) -> Self {
+        let resident = (vram_bytes + host_bytes) as f64;
+        let resident_fraction = if expert_bytes == 0 {
+            1.0
+        } else {
+            (resident / expert_bytes as f64).min(1.0)
+        };
+        let vram_fraction = if resident > 0.0 {
+            vram_bytes as f64 / resident
+        } else {
+            0.0
+        };
+        Self {
+            resident_fraction,
+            vram_fraction,
+            min_slots,
+        }
+    }
+
+    /// Ile slotów jednego stosu trafia do VRAM, a ile do pamięci hosta.
+    /// Reszta ekspertów idzie na dysk.
+    pub fn plan(&self, n_experts: usize) -> (usize, usize) {
+        let resident = ((n_experts as f64 * self.resident_fraction).round() as usize)
+            .max(self.min_slots.min(n_experts))
+            .min(n_experts);
+        let vram = ((resident as f64 * self.vram_fraction).round() as usize).min(resident);
+        (vram, resident - vram)
+    }
+
+    pub fn resident_fraction(&self) -> f64 {
+        self.resident_fraction
+    }
+}
+
 /// Liczniki wyboru ekspertów jednej warstwy MoE, zapisywane przez kernel
 /// routera. Tylko one wiedzą, którzy eksperci są gorący.
 pub struct ExpertUsage {

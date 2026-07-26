@@ -120,6 +120,7 @@ fn run_pass_ids(
         dev,
         path,
         ModelConfig {
+            weight_spill_dir: None,
             weight_host_budget: 0,
             kv_page_size,
             kv_pages,

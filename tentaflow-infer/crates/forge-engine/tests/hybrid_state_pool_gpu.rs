@@ -832,6 +832,8 @@ fn load_model_sized_with_tier(
             device,
             path,
             ModelConfig {
+                weight_host_budget: 0,
+weight_spill_dir: None,
                 kv_page_size: 32,
                 kv_pages,
                 max_seq_len,

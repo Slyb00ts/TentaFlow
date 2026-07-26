@@ -46,6 +46,8 @@ fn load(kv_pages: usize, tier: KvTierConfig, quant: KvQuant) -> Option<Model> {
     };
     let dev: Arc<dyn Device> = device;
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+weight_spill_dir: None,
         kv_pages,
         kv_tier: tier,
         kv_quant: quant,

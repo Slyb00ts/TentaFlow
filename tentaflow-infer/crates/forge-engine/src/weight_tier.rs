@@ -124,7 +124,17 @@ impl Device for TieredWeightDevice {
         self.inner.caps()
     }
     fn pool_available(&self, pool: Pool) -> Option<usize> {
-        self.inner.pool_available(pool)
+        let inner = self.inner.pool_available(pool)?;
+        if !matches!(pool, Pool::Weights) {
+            return Some(inner);
+        }
+        // Dla puli wag pojemnością jest VRAM PLUS to, co zostało z budżetu
+        // pamięci hosta — to tam trafiają wagi, które nie zmieściły się w VRAM,
+        // więc planowanie rezydencji musi widzieć obie warstwy naraz.
+        let host_left = self
+            .host_budget
+            .saturating_sub(self.host.load(Ordering::Relaxed));
+        Some(inner + host_left)
     }
     fn create_stream(&self) -> Result<Stream> {
         self.inner.create_stream()

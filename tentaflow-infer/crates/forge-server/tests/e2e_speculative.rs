@@ -72,6 +72,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
         dev,
         &path,
         ModelConfig {
+            weight_spill_dir: None,
             weight_host_budget: 0,
             kv_page_size,
             kv_pages,

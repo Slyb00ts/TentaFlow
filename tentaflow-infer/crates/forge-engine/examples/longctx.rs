@@ -26,6 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page_size = 32usize;
     let kv_pages = (target / page_size) + 8;
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+weight_spill_dir: None,
         kv_page_size: page_size,
         kv_pages,
         max_seq_len: target + 64,

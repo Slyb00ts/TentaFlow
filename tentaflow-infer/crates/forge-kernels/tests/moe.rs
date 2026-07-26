@@ -5,14 +5,16 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::cuda::PoolSizes;
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;
 use half::f16;
 
-fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
+/// Test musi biec na realnym urzadzeniu dowolnego backendu — wczesniejsze
+/// wiazanie z CUDA cicho pomijalo caly plik na AMD.
+fn device() -> Option<Arc<dyn Device>> {
+    match forge_hal::gpu::open(
         0,
         PoolSizes {
             weights: 256 << 20,
@@ -23,7 +25,7 @@ fn device() -> Option<Arc<CudaDevice>> {
     ) {
         Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("skipping CUDA MoE tests: {e}");
+            eprintln!("brak urzadzenia GPU dla testow MoE: {e}");
             None
         }
     }
@@ -104,13 +106,28 @@ fn run_case(n_tokens: usize, hidden: usize, n_expert: usize, top_k: usize, norm_
     let ids_dev = dev
         .alloc(n_tokens * top_k * 4, MemKind::Device, Pool::Activations)
         .unwrap();
+    // Kernel routera zlicza wybory ekspertow; licznik musi istniec, choc test
+    // sprawdza tylko wybor i wagi.
+    let counts_dev = dev
+        .alloc(n_expert * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    dev.write(&vec![0u8; n_expert * 4], &counts_dev, 0).unwrap();
     let wt_dev = dev
         .alloc(n_tokens * top_k * 4, MemKind::Device, Pool::Activations)
         .unwrap();
 
     kernels
         .moe_router_f16(
-            &ids_dev, &wt_dev, &x_dev, &w_dev, n_tokens, hidden, n_expert, top_k, norm_topk,
+            &ids_dev,
+            &wt_dev,
+            &x_dev,
+            &w_dev,
+            &counts_dev,
+            n_tokens,
+            hidden,
+            n_expert,
+            top_k,
+            norm_topk,
             &stream,
         )
         .unwrap();

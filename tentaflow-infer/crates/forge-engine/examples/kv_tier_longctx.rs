@@ -63,6 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx_pages = ctx.div_ceil(page_size);
     let kv_pages = if kv_pages == 0 { ctx_pages } else { kv_pages };
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+weight_spill_dir: None,
         kv_page_size: page_size,
         kv_pages,
         max_seq_len: ctx,

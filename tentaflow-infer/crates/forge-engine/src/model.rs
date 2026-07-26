@@ -2473,7 +2473,14 @@ impl Model {
         let sink_dev: Arc<dyn Device> = sink.clone();
         let spill = Self::open_spill(&cfg, "gguf")?;
         let mut weights =
-            ModelWeights::load_gguf(&sink_dev, path, cfg.native_mtp, tile_context, spill.as_ref())?;
+            ModelWeights::load_gguf(
+                &sink_dev,
+                path,
+                cfg.native_mtp,
+                tile_context,
+                spill.as_ref(),
+                cfg.weight_host_budget,
+            )?;
         Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
         weights.nvfp4_repacked_weights = repacked_weights.get();
@@ -2505,6 +2512,7 @@ impl Model {
                 tile_context,
                 (&kernels, &stream, cfg.nvfp4_ct_layout),
                 spill.as_ref(),
+                cfg.weight_host_budget,
             )?;
         Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
@@ -2514,10 +2522,15 @@ impl Model {
 
     /// Otwiera plik zrzutu wag, gdy konfiguracja wskazała katalog.
     fn open_spill(cfg: &ModelConfig, tag: &str) -> Result<Option<ExpertSpill>> {
-        cfg.weight_spill_dir
+        let spill = cfg
+            .weight_spill_dir
             .as_ref()
             .map(|dir| ExpertSpill::create(dir, tag))
-            .transpose()
+            .transpose()?;
+        if let Some(spill) = spill.as_ref() {
+            tracing::info!(path = ?spill.path(), "otwarto plik zrzutu wag ekspertów");
+        }
+        Ok(spill)
     }
 
     pub fn nvfp4_gguf_layout_summary(&self) -> (Nvfp4GgufLayout, usize) {
@@ -12235,6 +12248,10 @@ impl Model {
         // The captured decode graph reads expert bases from the device-resident
         // pointer table, so a migration needs no re-capture — the table update
         // is picked up by the next replay.
+        tracing::debug!(
+            migrations = planned.len(),
+            "runda rezydencji ekspertów: przenoszę do VRAM"
+        );
         for migration in planned {
             let scratch = self
                 .moe_residency

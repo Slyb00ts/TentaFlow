@@ -41,6 +41,8 @@ fn load() -> Option<Model> {
     let dev: Arc<dyn Device> = device;
     // 64 KV pages (2048 tokens) keep the cache within the test pool.
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+weight_spill_dir: None,
         kv_pages: 64,
         ..ModelConfig::default()
     };

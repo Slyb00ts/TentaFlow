@@ -76,6 +76,7 @@ async fn constrained_decoding_end_to_end() {
                 dev,
                 &load_path,
                 ModelConfig {
+                    weight_spill_dir: None,
                     weight_host_budget: 0,
                     kv_page_size,
                     kv_pages,

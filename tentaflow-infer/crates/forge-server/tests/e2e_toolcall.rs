@@ -87,6 +87,7 @@ async fn qwen3_tool_calls_end_to_end() {
                 dev,
                 &load_dir,
                 ModelConfig {
+                    weight_spill_dir: None,
                     weight_host_budget: 0,
                     kv_page_size,
                     kv_pages,
