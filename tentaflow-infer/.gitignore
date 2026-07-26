@@ -8,3 +8,4 @@ test-models/
 # Throwaway experiment/benchmark working dirs (Modular clones, PTX probes, engine builds)
 scratch/
 kernels/mojo/scratch/
+target-amd/
