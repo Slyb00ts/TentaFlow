@@ -49,6 +49,10 @@
       "entry": "src_attention_attn_decode_f166A6A6A6AcB_eb77d2de47816e45",
       "file": "attn_decode_f16_hd256.hsaco"
     },
+    "attn_decode_f16_hd512": {
+      "entry": "src_attention_attn_decode_f166A6A6A6AcB_700ce7e042a270cf",
+      "file": "attn_decode_f16_hd512.hsaco"
+    },
     "attn_decode_f16_hd64": {
       "entry": "src_attention_attn_decode_f166A6A6A6AcB_15ddec5a64904745",
       "file": "attn_decode_f16_hd64.hsaco"
@@ -110,23 +114,27 @@
       "file": "attn_prefill_device_pos_f16_hd256.hsaco"
     },
     "attn_prefill_f16_hd128": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_1ef42ff79b5b6865",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_e8fb11777a0f1f40",
       "file": "attn_prefill_f16_hd128.hsaco"
     },
     "attn_prefill_f16_hd256": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_d28993514d741d85",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_14915fe6e9868e4e",
       "file": "attn_prefill_f16_hd256.hsaco"
     },
+    "attn_prefill_f16_hd512": {
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_49f3d13ef39aae97",
+      "file": "attn_prefill_f16_hd512.hsaco"
+    },
     "attn_prefill_f16_hd64": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_6bbcb2f35b9b9e14",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_91deb869decbf0fd",
       "file": "attn_prefill_f16_hd64.hsaco"
     },
     "attn_prefill_fp8_hd128": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_c92011a5197fbdca",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_34f99087d2de6329",
       "file": "attn_prefill_fp8_hd128.hsaco"
     },
     "attn_prefill_fp8_hd64": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_1b4b060b68c4314a",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_8d34a8eca0907bc2",
       "file": "attn_prefill_fp8_hd64.hsaco"
     },
     "attn_prefill_rot_hd128_b3": {
@@ -144,14 +152,6 @@
     "attn_prefill_rot_hd64_b4": {
       "entry": "src_rotkv_attn_prefill_rot_S6A6A6A6AcB6A6A_d8ee629d597883af",
       "file": "attn_prefill_rot_hd64_b4.hsaco"
-    },
-    "attn_prefill_segmented_f16_hd128": {
-      "entry": "src_prefill_attn_prefill_segme6A6A6A6A_a279740eae303b23",
-      "file": "attn_prefill_segmented_f16_hd128.hsaco"
-    },
-    "attn_prefill_segmented_f16_hd256": {
-      "entry": "src_prefill_attn_prefill_segme6A6A6A6A_2e3ca2e573214e85",
-      "file": "attn_prefill_segmented_f16_hd256.hsaco"
     },
     "attn_verify_segmented_f16_hd128": {
       "entry": "src_attention_attn_verify_segm6A6A6A6A_5d6ea2bd9b705a84",

@@ -7224,6 +7224,8 @@ impl Kernels {
         page_size: usize,
         kv_dtype: DType,
         scale: f32,
+        // Okno przesuwne w tokenach; 0 = pełna uwaga przyczynowa.
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         // Tensor-core flash-attention paths. Only the f16 cache with head_dim
@@ -7281,7 +7283,8 @@ impl Kernels {
             .scalar(n_kv_heads as i64)
             .scalar(page_size as i64)
             .scalar(scale)
-            .scalar(n_tokens as i64);
+            .scalar(n_tokens as i64)
+            .scalar(window as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -9499,10 +9502,15 @@ impl Kernels {
         page_size: usize,
         max_pages: usize,
         scale: f32,
+        // Okno przesuwne w tokenach; 0 = pełny kontekst.
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         let caps = self.device.caps();
-        let split8_available = self.artifacts.has("attn_decode_split8_f16_hd256")
+        // Wariant split8 nie ma jeszcze maskowania okna, więc przy oknie
+        // schodzimy na ścieżkę generyczną, która je obsługuje.
+        let split8_available = window == 0
+            && self.artifacts.has("attn_decode_split8_f16_hd256")
             && self.artifacts.has("attn_decode_split8_combine_f16_hd256");
         let plan = attn_decode_plan(
             head_dim,
@@ -9585,7 +9593,8 @@ impl Kernels {
             .scalar(n_kv_heads as i64)
             .scalar(page_size as i64)
             .scalar(max_pages as i64)
-            .scalar(scale);
+            .scalar(scale)
+            .scalar(window as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 

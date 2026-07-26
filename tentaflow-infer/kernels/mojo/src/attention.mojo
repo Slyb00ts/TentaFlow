@@ -34,8 +34,14 @@ def attn_decode_f16[head_dim: Int](
     page_size: Int,
     max_pages: Int,
     scale: Float32,
+    window: Int,
 ):
     """out[seq, qh] = softmax(q[seq, qh] · K^T * scale) · V.
+
+    `window` > 0 włącza okno przesuwne. W decode zapytanie siedzi na ostatniej
+    pozycji, więc okno sprowadza się do PRZESUNIĘCIA STARTU skanu — pozycje
+    starsze niż `ctx_len - window` są pomijane, a nie maskowane, więc kernel
+    robi wtedy mniej pracy, nie więcej.
 
     Layouts:
       q/out:            [n_seqs, n_q_heads, head_dim]
@@ -65,7 +71,10 @@ def attn_decode_f16[head_dim: Int](
     var l: Float32 = 0.0
     var acc = SIMD[DType.float32, epl](0.0)
 
-    var pos = wid
+    var first = 0
+    if window > 0 and ctx_len > window:
+        first = ctx_len - window
+    var pos = first + wid
     while pos < ctx_len:
         page = Int(page_table[seq * max_pages + pos // page_size])
         kv_base = ((page * n_kv_heads + kvh) * page_size + (pos % page_size)) * head_dim

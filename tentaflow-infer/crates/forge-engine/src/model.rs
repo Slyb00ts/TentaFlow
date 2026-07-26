@@ -2309,6 +2309,18 @@ impl Model {
         Ok(())
     }
 
+    /// Okno przesuwne uwagi dla warstwy `layer`; 0 = pełna uwaga przyczynowa.
+    ///
+    /// Architektury z naprzemienną geometrią (Gemma 4) mają okno tylko na
+    /// części warstw; wzorzec jest już rozwinięty na wszystkie warstwy przez
+    /// parser metadanych, więc tu wystarczy odczyt.
+    fn attn_window(&self, layer: usize) -> usize {
+        match &self.weights.descriptor.params.alt_attn {
+            Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.window,
+            _ => 0,
+        }
+    }
+
     fn target_kv_layer(&self, global_layer: usize) -> usize {
         self.kv
             .layer_index(global_layer)
@@ -5787,6 +5799,7 @@ impl Model {
                         self.kv.cfg.page_size,
                         self.kv.cfg.dtype(),
                         scale,
+                        self.attn_window(l),
                         stream,
                     )?;
                 } else if let Some((page_tables, base_positions)) = &segmented {
@@ -5841,6 +5854,7 @@ impl Model {
                         self.kv.cfg.page_size,
                         self.kv.cfg.dtype(),
                         scale,
+                        self.attn_window(l),
                         stream,
                     )?;
                 }
@@ -11998,6 +12012,7 @@ impl Model {
                             self.kv.cfg.page_size,
                             self.max_pages_per_seq,
                             scale,
+                            self.attn_window(l),
                             stream,
                         )?;
                     }
@@ -12027,6 +12042,7 @@ impl Model {
                             self.kv.cfg.page_size,
                             self.max_pages_per_seq,
                             scale,
+                            self.attn_window(l),
                             stream,
                         )?;
                     }
@@ -12180,6 +12196,7 @@ impl Model {
                 self.kv.cfg.page_size,
                 self.max_pages_per_seq,
                 scale,
+                self.attn_window(l),
                 stream,
             )?;
 
@@ -14594,6 +14611,7 @@ impl Model {
                     self.kv.cfg.page_size,
                     self.max_pages_per_seq,
                     scale,
+                    self.attn_window(l),
                     stream,
                 )?;
             }
@@ -14627,6 +14645,7 @@ impl Model {
                     self.kv.cfg.page_size,
                     self.max_pages_per_seq,
                     scale,
+                    self.attn_window(l),
                     stream,
                 )?;
             }

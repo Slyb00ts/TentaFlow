@@ -149,8 +149,12 @@ def attn_prefill[head_dim: Int, kv_dtype: DType, PT: Int](
     page_size: Int,
     scale: Float32,
     n_tokens: Int,
+    window: Int,
 ):
     """Causal attention for a prefill chunk over the paged cache.
+
+    `window` > 0 włącza okno przesuwne: zapytanie na pozycji `aq` widzi tylko
+    pozycje z przedziału `[aq - window + 1, aq]`. 0 wyłącza okno.
 
     q/out: [T, n_q_heads, head_dim]; query token tok attends positions
     0..base_pos+tok (its K/V must already be in the cache).
@@ -252,13 +256,26 @@ def attn_prefill[head_dim: Int, kv_dtype: DType, PT: Int](
                 h = 0
             if h > n_valid:
                 h = n_valid
+            # Dolna granica okna dla tego zapytania. UWAGA: przy oknie kafel
+            # może mieć h > 0, a mimo to być CAŁY poza oknem. Taki kafel trzeba
+            # pominąć, bo inaczej wszystkie lane'y mają score = NEG_INF, maksimum
+            # nie rośnie ponad startowe NEG_INF i `exp(score - m)` daje 1.0
+            # zamiast 0 — czyli softmax dostaje masę z pozycji, których nie ma.
+            var lo = 0
+            if window > 0:
+                aq = base_pos + tq
+                if aq + 1 > window:
+                    lo = aq + 1 - window
+            if pos0 + h <= lo:
+                h = 0
+
             if h > 0:
                 # Lane `lane` scores position pos0+lane against query i. Przy
                 # PT < WARP_SIZE kafel ma mniej wierszy niż fala ma lane'ów, więc
                 # odczyt musi być pod warunkiem — inaczej nadmiarowe lane'y
                 # czytają LDS poza `ks` (maskowanie samego score jest za późno).
                 var score = NEG_INF
-                if lane < h:
+                if lane < h and pos0 + lane >= lo:
                     var dotv = SIMD[DType.float32, 8](0.0)
 
                     comptime for c in range(row_chunks):
@@ -302,7 +319,7 @@ def attn_prefill[head_dim: Int, kv_dtype: DType, PT: Int](
             )
 
 
-def attn_prefill_segmented_f16[head_dim: Int](
+def attn_prefill_segmented_f16[head_dim: Int, PT: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
     k_cache: UnsafePointer[Float16, MutAnyOrigin],
@@ -458,8 +475,12 @@ comptime attn_prefill_f16_hd256 = attn_prefill[256, DType.float16, WARP_SIZE]
 # 64 KiB LDS, czyli caly limit. Polowa kafla pozycji mieści się w 48 KiB i
 # zostawia zapas na kafel zapytań.
 comptime attn_prefill_f16_hd512 = attn_prefill[512, DType.float16, WARP_SIZE // 2]
-comptime attn_prefill_segmented_f16_hd128 = attn_prefill_segmented_f16[128]
-comptime attn_prefill_segmented_f16_hd256 = attn_prefill_segmented_f16[256]
+comptime attn_prefill_segmented_f16_hd128 = attn_prefill_segmented_f16[
+    128, WARP_SIZE
+]
+comptime attn_prefill_segmented_f16_hd256 = attn_prefill_segmented_f16[
+    256, WARP_SIZE
+]
 comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn, WARP_SIZE]
 comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn, WARP_SIZE]
 
@@ -480,7 +501,7 @@ def attn_prefill_device_pos_f16_hd256(
     """Wariant HD256 odczytujący bazową pozycję z bufora urządzenia."""
     attn_prefill[256, DType.float16, WARP_SIZE](
         out_ptr, q, k_cache, v_cache, page_table, Int(base_pos[0]),
-        n_q_heads, n_kv_heads, page_size, scale, n_tokens,
+        n_q_heads, n_kv_heads, page_size, scale, n_tokens, 0,
     )
 
 
