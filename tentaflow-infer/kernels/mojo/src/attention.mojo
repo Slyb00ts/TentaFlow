@@ -797,6 +797,8 @@ def attn_decode_split[head_dim: Int, kv_dtype: DType](
 
 comptime attn_decode_split_f16_hd64 = attn_decode_split[64, DType.float16]
 comptime attn_decode_split_f16_hd128 = attn_decode_split[128, DType.float16]
+# head_dim 512 — warstwy globalne Gemmy 4 na ścieżce decode w batchu mieszanym.
+comptime attn_decode_split_f16_hd512 = attn_decode_split[512, DType.float16]
 comptime attn_decode_split_fp8_hd64 = attn_decode_split[64, DType.float8_e4m3fn]
 comptime attn_decode_split_fp8_hd128 = attn_decode_split[128, DType.float8_e4m3fn]
 

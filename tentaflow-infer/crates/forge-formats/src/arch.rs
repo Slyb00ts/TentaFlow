@@ -123,6 +123,31 @@ impl Hyperparams {
         }
     }
 
+    /// Największy `head_dim` w modelu — do wymiarowania buforów aktywacji,
+    /// które muszą pomieścić każdą warstwę.
+    pub fn max_head_dim(&self) -> usize {
+        match &self.alt_attn {
+            Some(alt) => self.head_dim.max(alt.head_dim_swa),
+            None => self.head_dim,
+        }
+    }
+
+    /// Największa szerokość projekcji Q w modelu.
+    pub fn max_q_dim(&self) -> usize {
+        self.n_heads * self.max_head_dim()
+    }
+
+    /// Największa szerokość projekcji K (lub V) w modelu. Liczona per warstwa,
+    /// bo największa liczba głowic i największy `head_dim` mogą być w RÓŻNYCH
+    /// warstwach — iloczyn maksimów zawyżyłby bufor.
+    pub fn max_kv_dim(&self) -> usize {
+        let global = self.n_kv_heads * self.head_dim;
+        match &self.alt_attn {
+            Some(alt) => global.max(alt.n_kv_heads_swa * alt.head_dim_swa),
+            None => global,
+        }
+    }
+
     /// Czy warstwa `layer` w ogóle ma projekcję V. Warstwy globalne Gemmy 4 jej
     /// nie mają i używają wtedy K jako V (potwierdzone w llama.cpp).
     pub fn has_v_proj(&self, layer: usize) -> bool {

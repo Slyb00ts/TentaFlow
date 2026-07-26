@@ -5231,8 +5231,10 @@ impl Model {
     fn ensure_prefill_bufs(&mut self) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
+        let q_dim = p.max_q_dim();
+        let kv_dim = p.max_kv_dim();
         let inter = p.intermediate_size;
         let t_max = if self.is_hybrid() {
             self.hybrid_prefill_chunk_size.max(4)
@@ -5448,10 +5450,9 @@ impl Model {
 
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
         let eps = p.rms_norm_eps;
-        let scale = 1.0 / (p.head_dim as f32).sqrt();
         let kernels = &self.kernels;
         let stream = &self.stream;
 
@@ -5508,6 +5509,13 @@ impl Model {
 
         let n_layers = self.weights.layers.len();
         for l in 0..n_layers {
+            // Geometria per warstwa: przy naprzemiennej uwadze szerokości
+            // projekcji i offsety sekcji scalonego q|k|v różnią się między
+            // warstwami, więc muszą być liczone tutaj, a nie raz na model.
+            let head_dim = p.head_dim_at(l);
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let q_dim = p.n_heads * head_dim;
+            let kv_dim = p.n_kv_heads_at(l) * head_dim;
             let layer = &self.weights.layers[l];
 
             // W4A8 prefill (non-default): each projection is its own logical
@@ -6084,7 +6092,7 @@ impl Model {
         }
         let p = &self.weights.descriptor.params;
         let n_layers = self.weights.layers.len();
-        let (hidden, q_dim, inter) = (p.hidden_size, p.n_heads * p.head_dim, p.intermediate_size);
+        let (hidden, q_dim, inter) = (p.hidden_size, p.max_q_dim(), p.intermediate_size);
         // Default is the identity requant (no SmoothQuant): measured best on the
         // Q4_K→W4A8 path, where the two-level requant error dominates and
         // migrating activation outliers only inflates the weights (see
@@ -7380,8 +7388,10 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let scale = 1.0 / (p.head_dim as f32).sqrt();
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
+        let q_dim = p.max_q_dim();
+        let kv_dim = p.max_kv_dim();
         let k_byte_off = q_dim * 2;
         let v_byte_off = (q_dim + kv_dim) * 2;
         let bits = self.kv.cfg.quant.bits().expect("rot mode has bits");
@@ -10216,8 +10226,10 @@ impl Model {
         t: usize,
     ) -> Result<()> {
         let p = &self.weights.descriptor.params;
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
+        let q_dim = p.max_q_dim();
+        let kv_dim = p.max_kv_dim();
         let stream = &self.stream;
         let kernels = &self.kernels;
         let pb = self
@@ -11869,16 +11881,20 @@ impl Model {
                 stream,
             )?;
 
-            let scale = 1.0 / (p.head_dim as f32).sqrt();
-            // Byte offsets of the K and V sections inside the fused q|k|v
-            // decode buffer (q occupies rows 0..q_dim, so its offset is 0).
-            let q_dim = p.n_heads * p.head_dim;
-            let kv_dim = p.n_kv_heads * p.head_dim;
-            let k_byte_off = q_dim * 2;
-            let v_byte_off = (q_dim + kv_dim) * 2;
             let n_layers = self.weights.layers.len();
             for l in 0..n_layers {
                 let layer = &self.weights.layers[l];
+                // Geometria bywa różna per warstwa (Gemma 4), więc szerokości i
+                // offsety sekcji scalonego q|k|v muszą być liczone W PĘTLI —
+                // policzone raz dla całego modelu wskazywały poza bufor warstwy.
+                let head_dim = p.head_dim_at(l);
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let q_dim = p.n_heads * head_dim;
+                let kv_dim = p.n_kv_heads_at(l) * head_dim;
+                // Byte offsets of the K and V sections inside the fused q|k|v
+                // decode buffer (q occupies rows 0..q_dim, so its offset is 0).
+                let k_byte_off = q_dim * 2;
+                let v_byte_off = (q_dim + kv_dim) * 2;
 
                 // Fused layers project q|k|v with ONE GEMV into one buffer,
                 // then qkv_post fuses the whole q/k-norm + RoPE + kv-append
@@ -12102,8 +12118,10 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let scale = 1.0 / (p.head_dim as f32).sqrt();
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
+        let q_dim = p.max_q_dim();
+        let kv_dim = p.max_kv_dim();
 
         kernels.gather_rows_f16(
             &b.h,
@@ -15923,8 +15941,10 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let scale = 1.0 / (p.head_dim as f32).sqrt();
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
+        let q_dim = p.max_q_dim();
+        let kv_dim = p.max_kv_dim();
         let k_byte_off = q_dim * 2;
         let v_byte_off = (q_dim + kv_dim) * 2;
 
@@ -16288,8 +16308,10 @@ impl Model {
         let matrix_cap = nvfp4_ct_plan.map_or(cap, |plan| plan.matrix_cap);
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
+        let q_dim = p.max_q_dim();
+        let kv_dim = p.max_kv_dim();
         let inter = p.intermediate_size;
         let vocab = p.vocab_size;
         let mpp = self.max_pages_per_seq;
@@ -16547,8 +16569,10 @@ impl Model {
         let p = self.weights.descriptor.params.clone();
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Bufory muszą pomieścić najszerszą warstwę modelu — przy
+        // naprzemiennej geometrii warstwy różnią się szerokością projekcji.
+        let q_dim = p.max_q_dim();
+        let kv_dim = p.max_kv_dim();
         let eps = p.rms_norm_eps;
         let scale = 1.0 / (p.head_dim as f32).sqrt();
         let kernels = &self.kernels;

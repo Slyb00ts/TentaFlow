@@ -10475,6 +10475,8 @@ impl Kernels {
         let name = match head_dim {
             64 => format!("attn_decode_split_{suffix}_hd64"),
             128 => format!("attn_decode_split_{suffix}_hd128"),
+            // 512: warstwy globalne Gemmy 4.
+            512 => format!("attn_decode_split_{suffix}_hd512"),
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_decode_split: head_dim {other} has no compiled specialization"

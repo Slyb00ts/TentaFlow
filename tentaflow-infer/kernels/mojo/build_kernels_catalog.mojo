@@ -275,6 +275,7 @@ from src.qkv_post import qkv_post_f16
 from src.attention import (
     attn_decode_split_f16_hd64,
     attn_decode_split_f16_hd128,
+    attn_decode_split_f16_hd512,
 )
 from src.attention import (
     attn_decode_split_fp8_hd64,
@@ -2069,6 +2070,11 @@ def main() raises:
         dump_asm=Path("attn_decode_split_f16_hd128.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_decode_split_f16_hd128"))
+    _ = ctx.compile_function[
+        attn_decode_split_f16_hd512,
+        dump_asm=Path("attn_decode_split_f16_hd512.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_split_f16_hd512"))
 
     _ = ctx.compile_function[
         attn_decode_split_fp8_hd64,
