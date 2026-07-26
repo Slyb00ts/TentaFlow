@@ -17,6 +17,15 @@
 // wyczerpie, ta sama waga ląduje w pamięci hosta. Kolejność ładowania (warstwy
 // rosnąco) decyduje więc, że w VRAM zostaje początek modelu, a ogon jest
 // strumieniowany.
+//
+// ZNANE OGRANICZENIE — prefill. Odczyt wprost jest optymalny dla dekodowania,
+// gdzie każda waga jest czytana RAZ na token. Prefill liczy GEMM kaflami tokenów
+// i czyta wagę raz na kafel, więc przez PCIe płaci tyle razy, ile jest kafli.
+// Zmierzone na ThinkingCap-27B (1,32 GiB w hoście): prefill 128 tokenów 5889 ms,
+// 512 tokenów 23727 ms — dokładnie 4x, przepustowość stoi na 21,7 tok/s zamiast
+// rosnąć z długością promptu. Lekarstwem jest zestagowanie warstwy do VRAM raz
+// na prefill i policzenie z niej wszystkich kafli; dla dekodowania staging jest
+// natomiast wolniejszy od odczytu wprost (zmierzone 4538 vs 4005 us).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
