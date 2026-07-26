@@ -18261,6 +18261,7 @@ pub fn encode_project_studio_tasks_list_request(
     search: String,
     offset: u32,
     limit: u32,
+    severity: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::TasksListRequest {
@@ -18271,6 +18272,7 @@ pub fn encode_project_studio_tasks_list_request(
             search,
             offset,
             limit,
+            severity: severity.unwrap_or_default(),
         },
     ))
     .map_err(|e| JsError::new(&e))

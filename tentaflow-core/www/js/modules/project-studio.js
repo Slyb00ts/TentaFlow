@@ -285,7 +285,7 @@ function freshF2State() {
 function freshTasksState() {
   return {
     rows: [], total: 0, page: 1,
-    filters: { type: '', status: '', mine: false, search: '' },
+    filters: { type: '', status: '', severity: '', mine: false, search: '' },
     // 'list' | 'board' — remembered per project in localStorage.
     mode: 'list',
     // Board rows are a separate, unpaginated fetch: a kanban with a page cut
@@ -1471,18 +1471,19 @@ async function renderOverview() {
 
   const casesCard = hasTests ? `
       <tf-stat-card icon="list" label="${escapeAttr(t('kpi_cases'))}" value="${casesTotal}"
-        suffix="/ ${escapeAttr(t('kpi_cases_approved_suffix', { count: casesApproved }))}"
-        delta="${escapeAttr(t('kpi_suites', { count: suitesTotal }))}" delta-type="neutral"></tf-stat-card>` : '';
+        delta="${escapeAttr(`${t('kpi_cases_approved_suffix', { count: casesApproved })} · ${t('kpi_suites', { count: suitesTotal })}`)}"
+        delta-type="neutral"></tf-stat-card>` : '';
   const passCard = hasTests ? `
       <tf-stat-card id="ps-kpi-pass" icon="check" label="${escapeAttr(t('kpi_pass_rate'))}" value="—"></tf-stat-card>` : '';
   const defectsCard = modules.includes('tasks') ? `
       <tf-stat-card id="ps-kpi-defects" icon="alert" label="${escapeAttr(t('kpi_defects'))}" value="${defectsOpen}"
-        suffix="${defectsOpen > 0 ? '' : escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}"
-        ${defectsOpen > 0 ? `delta="${escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}" delta-type="neutral"` : ''}></tf-stat-card>` : '';
+        accent="${defectsOpen > 0 ? 'danger' : 'success'}"
+        delta="${escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}"
+        delta-type="${defectsOpen > 0 ? 'warn' : 'neutral'}"></tf-stat-card>` : '';
   const knowledgeCard = `
-      <tf-stat-card icon="database" label="${escapeAttr(t('kpi_sources'))}" value="${sourcesReady}"
-        suffix="/ ${escapeAttr(t('kpi_sources_ready_suffix', { count: sourcesTotal }))}"
-        ${openJobs > 0 ? `delta="${escapeAttr(t('kpi_open_jobs', { count: openJobs }))}" delta-type="warn"` : ''}></tf-stat-card>`;
+      <tf-stat-card icon="database" label="${escapeAttr(t('kpi_sources'))}" value="${sourcesReady}/${sourcesTotal}"
+        delta="${escapeAttr(openJobs > 0 ? t('kpi_open_jobs', { count: openJobs }) : t('kpi_sources_ready_suffix', { count: sourcesReady }))}"
+        delta-type="${openJobs > 0 ? 'warn' : 'neutral'}"></tf-stat-card>`;
 
   // Charts only make sense for a project that runs tests.
   const chartsRow = hasTests ? `
@@ -4465,6 +4466,18 @@ function renderCasesTable() {
   });
   syncCasesFooter();
   updateCasesBulkBar();
+}
+
+// Task links are stored as a JSON array of {kind, id, label}; the list view
+// shows their labels so a defect's origin is visible without opening it.
+function taskLinkLabels(task) {
+  try {
+    const parsed = JSON.parse(fv(task, 'links_json') || '[]');
+    if (!Array.isArray(parsed) || !parsed.length) return '—';
+    return parsed.map((l) => l.label || l.id || '').filter(Boolean).join(', ') || '—';
+  } catch {
+    return '—';
+  }
 }
 
 function syncCasesFooter() {
@@ -8248,12 +8261,20 @@ function buildRunItemExpansion(item) {
   return wrap;
 }
 
+// SQLite timestamps carry no zone marker but are UTC, so they must be parsed
+// the same way formatTimestamp does — otherwise a fresh run looks hours long.
+function parseTimestamp(value) {
+  if (!value) return NaN;
+  const raw = String(value);
+  return Date.parse(raw.includes('T') ? raw : `${raw.replace(' ', 'T')}Z`);
+}
+
 // Wall-clock length of a run; a still-running run measures against "now".
 function runElapsed(run) {
-  const started = Date.parse(fv(run, 'started_at') || '');
+  const started = parseTimestamp(fv(run, 'started_at'));
   if (!Number.isFinite(started)) return '—';
   const finishedRaw = fv(run, 'finished_at');
-  const end = finishedRaw ? Date.parse(finishedRaw) : Date.now();
+  const end = finishedRaw ? parseTimestamp(finishedRaw) : Date.now();
   if (!Number.isFinite(end) || end < started) return '—';
   return formatDuration(Math.round((end - started) / 1000));
 }
@@ -8860,6 +8881,26 @@ async function openExecItem(itemId) {
   await renderTestsView();
 }
 
+// The tester's queue inside a run: items assigned to them plus unclaimed pool
+// items, in execution order. Drives the "case i of n" counter and prev/next.
+function buildExecQueue(ex, item) {
+  const items = Array.isArray(ex.runItems) ? ex.runItems : [];
+  const mine = items
+    .filter((it) => {
+      if (fv(it, 'item_id') === fv(item, 'item_id')) return true;
+      const assignee = fv(it, 'assigned_to');
+      return isMe(assignee) || assignee === '';
+    })
+    .sort((a, b) => Number(fv(a, 'position') ?? 0) - Number(fv(b, 'position') ?? 0));
+  const index = Math.max(0, mine.findIndex((it) => fv(it, 'item_id') === fv(item, 'item_id')));
+  return {
+    total: mine.length,
+    index,
+    prev: mine[index - 1] ? fv(mine[index - 1], 'item_id') : null,
+    next: mine[index + 1] ? fv(mine[index + 1], 'item_id') : null,
+  };
+}
+
 async function renderExecView() {
   const host = byId('ps-tests-host');
   const s = f2();
@@ -8879,6 +8920,14 @@ async function renderExecView() {
     }));
     ex.preconditions = resp.preconditions || '';
     ex.testData = fv(resp, 'test_data') || '';
+    // Run context (mockup T09): which run this belongs to and where the case
+    // sits in the tester's queue.
+    const runId = fv(ex.item, 'run_id');
+    if (runId) {
+      const runResp = await ApiBinary.one('projectStudioRunGetRequest', { projectId: projectId(), runId });
+      ex.run = runResp.run || null;
+      ex.runItems = Array.isArray(runResp.items) ? runResp.items : [];
+    }
   } catch (err) {
     host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('exec_load_failed')}: ${err.message}`)}</div>`;
     return;
@@ -8894,19 +8943,32 @@ async function renderExecView() {
   ex.resultNote = fv(item, 'result_note') || '';
   ex.testerConfig = fv(item, 'tester_config') || '';
   ex.attachments = Array.isArray(item.attachments) ? item.attachments.slice() : [];
+  const execQueue = buildExecQueue(ex, item);
 
   host.innerHTML = `
     <div class="ps-editor-head">
       <tf-button variant="ghost" icon="chevron-left" id="ps-exec-back">${escapeHtml(t('exec_back'))}</tf-button>
       <div class="ps-editor-title-static">
         <div class="ps-detail-name">${escapeHtml(fv(item, 'case_title'))}</div>
-        <div class="ps-detail-sub">${escapeHtml(t('exec_sub', { version: Number(fv(item, 'case_version') ?? 1) }))}</div>
+        <div class="ps-detail-sub">
+          ${escapeHtml(t('exec_sub', { version: Number(fv(item, 'case_version') ?? 1) }))}
+          ${ex.run ? ` · ${escapeHtml(t('exec_run_context', {
+            no: fv(ex.run, 'run_no'),
+            suite: fv(ex.run, 'suite_name') || t('runs_adhoc'),
+            by: fv(ex.run, 'created_by_name') || '',
+          }))}` : ''}
+          ${execQueue.total > 1 ? ` · ${escapeHtml(t('exec_position', { index: execQueue.index + 1, total: execQueue.total }))}` : ''}
+        </div>
       </div>
       <div class="ps-editor-badges">
         <tf-chip status="${ITEM_STATUS_CHIP[item.status] || 'info'}" dot>${escapeHtml(t(`item_status_${item.status}`))}</tf-chip>
         <tf-chip status="info">${sprite('clock')} <span id="ps-exec-clock">0:00</span></tf-chip>
       </div>
       <div class="ps-editor-actions">
+        ${execQueue.total > 1 ? `
+          <tf-button variant="ghost" icon="chevron-left" id="ps-exec-prev" ${execQueue.prev ? '' : 'disabled'}>${escapeHtml(t('exec_prev'))}</tf-button>
+          <tf-button variant="ghost" icon="chevron-right" id="ps-exec-next" ${execQueue.next ? '' : 'disabled'}>${escapeHtml(t('exec_next'))}</tf-button>
+        ` : ''}
         <tf-button variant="ghost" icon="alert" id="ps-exec-defect">${escapeHtml(t('exec_report_defect'))}</tf-button>
         <tf-button variant="ghost" icon="rotate" id="ps-exec-release">${escapeHtml(t('exec_release'))}</tf-button>
         <tf-button variant="primary" icon="check" id="ps-exec-finish">${escapeHtml(t('exec_finish'))}</tf-button>
@@ -8955,6 +9017,8 @@ async function renderExecView() {
   byId('ps-exec-config')?.addEventListener('input', (e) => { ex.testerConfig = String(e.target.value ?? ''); });
   byId('ps-exec-override')?.addEventListener('change', (e) => { ex.override = e.detail?.value ?? ''; });
   byId('ps-exec-back')?.addEventListener('click', () => backToRunFromExec());
+  byId('ps-exec-prev')?.addEventListener('click', () => { if (execQueue.prev) openExecItem(execQueue.prev); });
+  byId('ps-exec-next')?.addEventListener('click', () => { if (execQueue.next) openExecItem(execQueue.next); });
   byId('ps-exec-release')?.addEventListener('click', () => releaseExecItem());
   byId('ps-exec-finish')?.addEventListener('click', () => finishExecItem());
   byId('ps-exec-defect')?.addEventListener('click', () => {
@@ -9892,6 +9956,7 @@ async function loadTasksPage() {
     status: tv.filters.status,
     assignedTo: tv.filters.mine ? 'me' : '',
     search: tv.filters.search,
+    severity: tv.filters.severity,
     offset: (tv.page - 1) * F2_PAGE_SIZE,
     limit: F2_PAGE_SIZE,
   });
@@ -9909,6 +9974,7 @@ async function loadTasksBoard() {
     status: '',
     assignedTo: tv.filters.mine ? 'me' : '',
     search: tv.filters.search,
+    severity: tv.filters.severity,
     offset: 0,
     limit: BOARD_PAGE_SIZE,
   });
@@ -9949,6 +10015,10 @@ async function renderTasksTab() {
           ${TASK_STATUSES.map((x) => `<option value="${x}" ${x === tv.filters.status ? 'selected' : ''}>${escapeHtml(t(`task_status_${x}`))}</option>`).join('')}
         </tf-select>
       `}
+      <tf-select id="ps-tasks-f-severity" value="${escapeAttr(tv.filters.severity || '')}">
+        <option value="">${escapeHtml(t('tasks_filter_severity_all'))}</option>
+        ${PRIORITIES.slice().reverse().map((x) => `<option value="${x}" ${x === tv.filters.severity ? 'selected' : ''}>${escapeHtml(t(`sev_${x}`))}</option>`).join('')}
+      </tf-select>
       <div class="ps-toggle-inline">
         <tf-toggle id="ps-tasks-f-mine" ${tv.filters.mine ? 'checked' : ''}></tf-toggle>
         <span>${escapeHtml(t('tasks_filter_mine'))}</span>
@@ -9977,6 +10047,7 @@ async function renderTasksTab() {
   });
   byId('ps-tasks-f-status')?.addEventListener('change', (e) => { tv.filters.status = e.detail?.value ?? e.target.value ?? ''; reload(); });
   byId('ps-tasks-f-mine')?.addEventListener('change', (e) => { tv.filters.mine = !!(e.detail?.checked ?? e.target.checked); reload(); });
+  byId('ps-tasks-f-severity')?.addEventListener('change', (e) => { tv.filters.severity = e.detail?.value ?? ''; reload(); });
   byId('ps-tasks-new')?.addEventListener('click', () => openTaskWindow({}));
 
   if (board) {
@@ -9994,6 +10065,7 @@ async function renderTasksTab() {
       <tf-column key="status" label="${escapeAttr(t('tasks_col_status'))}" renderer="chip"></tf-column>
       <tf-column key="assignee" label="${escapeAttr(t('tasks_col_assignee'))}"></tf-column>
       <tf-column key="due" label="${escapeAttr(t('tasks_col_due'))}"></tf-column>
+      <tf-column key="links" label="${escapeAttr(t('tasks_col_links'))}"></tf-column>
       <tf-column key="comments" label="${escapeAttr(t('tasks_col_comments'))}" renderer="num"></tf-column>
     </tf-table>
   `;
@@ -10013,6 +10085,7 @@ async function renderTasksTab() {
         status: chipCell(TASK_STATUS_CHIP[task.status], t(`task_status_${task.status}`)),
         assignee: fv(task, 'assigned_to_name') || '—',
         due: fv(task, 'due_date') || '—',
+        links: taskLinkLabels(task),
         comments: Number(fv(task, 'comment_count') ?? 0),
       };
     });
@@ -10033,7 +10106,22 @@ async function renderTasksTab() {
     table.setAttribute('page', String(tv.page));
     table.setAttribute('total', String(tv.total));
     assignRows();
+    syncTasksFooter();
   });
+  syncTasksFooter();
+}
+
+function syncTasksFooter() {
+  const tv = state.tasksView;
+  const host = byId('ps-tasks-table-host');
+  if (!host || !tv) return;
+  let footer = host.querySelector('.ps-table-footer');
+  if (!footer) {
+    footer = document.createElement('div');
+    footer.className = 'ps-table-footer';
+    host.appendChild(footer);
+  }
+  footer.textContent = t('tasks_footer', { shown: tv.rows.length, total: tv.total });
 }
 
 // =============================================================================

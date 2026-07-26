@@ -8229,9 +8229,10 @@ export function encodeProjectStudioTaskStatusSetRequest(project_id, task_id, sta
  * @param {string} search
  * @param {number} offset
  * @param {number} limit
+ * @param {string | null} [severity]
  * @returns {Uint8Array}
  */
-export function encodeProjectStudioTasksListRequest(project_id, task_type, status, assigned_to, search, offset, limit) {
+export function encodeProjectStudioTasksListRequest(project_id, task_type, status, assigned_to, search, offset, limit, severity) {
     const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(task_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -8242,13 +8243,15 @@ export function encodeProjectStudioTasksListRequest(project_id, task_type, statu
     const len3 = WASM_VECTOR_LEN;
     const ptr4 = passStringToWasm0(search, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len4 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeProjectStudioTasksListRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, offset, limit);
+    var ptr5 = isLikeNone(severity) ? 0 : passStringToWasm0(severity, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioTasksListRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, offset, limit, ptr5, len5);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v6;
+    return v7;
 }
 
 /**

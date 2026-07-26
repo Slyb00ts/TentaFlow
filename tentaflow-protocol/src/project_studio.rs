@@ -1533,6 +1533,10 @@ pub enum ProjectStudioPayload {
         search: String,
         offset: u32,
         limit: u32,
+        /// Defect severity filter ('' = any). Appended after F4, so older
+        /// peers that omit it still decode.
+        #[serde(default)]
+        severity: String,
     },
     TasksListResponse {
         tasks: Vec<TaskInfo>,

@@ -6158,6 +6158,7 @@ export const encode = {
       String(payload.search ?? ''),
       Number(payload.offset ?? 0),
       Number(payload.limit ?? 50),
+      payload.severity == null || payload.severity === '' ? undefined : String(payload.severity),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

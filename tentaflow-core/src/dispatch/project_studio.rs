@@ -706,8 +706,9 @@ pub async fn project_studio_dispatch(
             search,
             offset,
             limit,
+            severity,
         } => tasks_list_v1(
-            ctx, project_id, task_type, status, assigned_to, search, *offset, *limit,
+            ctx, project_id, task_type, status, assigned_to, search, *offset, *limit, severity,
         ),
         P::TaskGetRequest {
             project_id,
@@ -3907,6 +3908,7 @@ fn cases_list_v1(
     search: &str,
     offset: u32,
     limit: u32,
+    severity: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
@@ -5291,6 +5293,7 @@ fn tasks_list_v1(
         status,
         assigned_to,
         search,
+        severity,
     };
     let (rows, total) =
         tasks::list_tasks(&pool, &filters, offset, limit).map_err(|e| db_error("tasks_list", e))?;

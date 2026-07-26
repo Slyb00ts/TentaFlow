@@ -64,6 +64,7 @@ pub struct TaskFilters<'a> {
     pub status: &'a str,
     pub assigned_to: &'a str,
     pub search: &'a str,
+    pub severity: &'a str,
 }
 
 pub fn list_tasks(
@@ -79,6 +80,7 @@ pub fn list_tasks(
         ("t.task_type", filters.task_type),
         ("t.status", filters.status),
         ("t.assigned_to", filters.assigned_to),
+        ("t.severity", filters.severity),
     ] {
         if !value.is_empty() {
             clauses.push(format!("{column} = ?{}", args.len() + 1));
