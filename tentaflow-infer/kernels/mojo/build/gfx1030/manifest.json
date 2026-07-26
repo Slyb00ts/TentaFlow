@@ -349,6 +349,10 @@
       "entry": "src_conv_gelu_f16_Pointer6A6A6A6AoA6A6AcB6A6A_809de0ef169c12fa",
       "file": "gelu_f16.hsaco"
     },
+    "gelu_mul_f16": {
+      "entry": "src_activation_gelu_mul_f166A6A6A6AoA6A6A_eded81ed343b012a",
+      "file": "gelu_mul_f16.hsaco"
+    },
     "gemm_f16_dot2_128x128": {
       "entry": "src_gemm_dot_gemm_f16_dot2_imp6A6A6A6A_048aa54ec568f750",
       "file": "gemm_f16_dot2_128x128.hsaco"
@@ -436,6 +440,22 @@
     "gemm_nvfp4_gguf_out_f32_b8": {
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_fb926ec38df7e9c4",
       "file": "gemm_nvfp4_gguf_out_f32_b8.hsaco"
+    },
+    "gemm_q4_0_dot4_128x128": {
+      "entry": "src_gemm_dot_gemm_q4_0_dot4_im6A6A6A6A_8cd8233be13cc619",
+      "file": "gemm_q4_0_dot4_128x128.hsaco"
+    },
+    "gemm_q4_0_dot4_128x64": {
+      "entry": "src_gemm_dot_gemm_q4_0_dot4_im6A6A6A6A_3e1d26d5c79b0c56",
+      "file": "gemm_q4_0_dot4_128x64.hsaco"
+    },
+    "gemm_q4_0_dot4_64x64": {
+      "entry": "src_gemm_dot_gemm_q4_0_dot4_im6A6A6A6A_b5c2113a920626a5",
+      "file": "gemm_q4_0_dot4_64x64.hsaco"
+    },
+    "gemm_q4_0_dot4_out_f32_64x64": {
+      "entry": "src_gemm_dot_gemm_q4_0_dot4_im6A6A6A6A_8c12ce75c2ca5978",
+      "file": "gemm_q4_0_dot4_out_f32_64x64.hsaco"
     },
     "gemm_q4_k_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_62a1a8428b04ff79",
