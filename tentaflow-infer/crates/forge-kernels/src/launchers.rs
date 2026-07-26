@@ -394,7 +394,6 @@ pub struct Q8PreparedProjection<'a> {
 const ATTN_BLOCK: u32 = 128;
 const ATTN_HD256_BLOCK: u32 = 256;
 const ATTN_HD256_SPLITS: usize = 8;
-const ATTN_HD256_PARTIAL_STRIDE: usize = 260;
 
 fn verify_attn_split8_enabled(value: Option<&str>) -> bool {
     matches!(value, None | Some("auto") | Some("1"))
@@ -465,7 +464,6 @@ enum AttnDecodePlan {
 
 fn attn_decode_plan(
     head_dim: usize,
-    vendor: forge_types::Vendor,
     warp_size: u32,
     max_threads: u32,
     split8_available: bool,
@@ -1979,6 +1977,81 @@ impl Kernels {
 
     /// residual += x; out = rmsnorm(residual) * weight (fused, f16).
     #[allow(clippy::too_many_arguments)]
+    /// Norma delty + rezyduum + skala warstwy + norma wyjściowa w jednym
+    /// uruchomieniu (rodzina Gemma). Rozbite na trzy kernele kosztowały 144
+    /// uruchomienia na token przy 48 warstwach, a każdy z nich czyta zaledwie
+    /// kilka kB — to sam narzut wywołania. `layer_scale` równe 1.0 wyłącza
+    /// skalowanie.
+    #[allow(clippy::too_many_arguments)]
+    /// Normy Q, K i V jednym uruchomieniem (rodzina Gemma normalizuje wszystkie
+    /// trzy, V wektorem jedynek). Osobno kosztowały 144 wywołania na token przy
+    /// 48 warstwach, a każde czyta ledwie kilka kB.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_qkv_f16(
+        &self,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        wq: &DevBuffer,
+        wk: &DevBuffer,
+        wv: &DevBuffer,
+        q_rows: usize,
+        kv_rows: usize,
+        head_dim: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k_fn = self.artifacts.get("rmsnorm_qkv_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((q_rows + 2 * kv_rows) as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(wq)
+            .buf(wk)
+            .buf(wv)
+            .scalar(q_rows as i64)
+            .scalar(kv_rows as i64)
+            .scalar(head_dim as i64)
+            .scalar(eps);
+        self.device.launch(k_fn, &cfg, &args, stream)
+    }
+
+    pub fn rmsnorm_delta_residual_f16(
+        &self,
+        out: &DevBuffer,
+        residual_io: &DevBuffer,
+        delta: &DevBuffer,
+        delta_weight: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        layer_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_delta_residual_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(residual_io)
+            .buf(delta)
+            .buf(delta_weight)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(eps)
+            .scalar(layer_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     pub fn rmsnorm_residual_f16(
         &self,
         out: &DevBuffer,
@@ -9595,7 +9668,6 @@ impl Kernels {
                 .has(&format!("attn_decode_split8_combine_f16_{split_suffix}"));
         let plan = attn_decode_plan(
             head_dim,
-            caps.vendor,
             caps.warp_size,
             caps.max_threads_per_block,
             split8_available,
@@ -16620,20 +16692,37 @@ mod nvfp4_gguf_dispatch_tests {
         .is_err());
     }
 
+    /// Wariant dzielony obowiązuje na KAŻDEJ karcie z falą 32 — przy jednej
+    /// sekwencji tylko on wysyca pamięć (siatka generycznego to
+    /// `sekwencje * głowice`, czyli 16 grup roboczych). Odpada przy fali 64,
+    /// za małym bloku i braku artefaktów.
     #[test]
-    fn split8_hd256_wymaga_nvidia_warp32_i_kompletu_artefaktow() {
-        assert_eq!(
-            attn_decode_plan(256, forge_types::Vendor::Nvidia, 32, 1024, true).unwrap(),
-            AttnDecodePlan::Split8Hd256
-        );
-        for plan in [
-            attn_decode_plan(256, forge_types::Vendor::Amd, 64, 1024, true).unwrap(),
-            attn_decode_plan(256, forge_types::Vendor::Apple, 32, 1024, true).unwrap(),
-            attn_decode_plan(256, forge_types::Vendor::Nvidia, 64, 1024, true).unwrap(),
-            attn_decode_plan(256, forge_types::Vendor::Nvidia, 32, 128, true).unwrap(),
-            attn_decode_plan(256, forge_types::Vendor::Nvidia, 32, 1024, false).unwrap(),
+    fn wariant_dzielony_wymaga_fali_32_i_kompletu_artefaktow() {
+        for vendor in [
+            forge_types::Vendor::Nvidia,
+            forge_types::Vendor::Amd,
+            forge_types::Vendor::Apple,
         ] {
-            assert_eq!(plan, AttnDecodePlan::Generic("attn_decode_f16_hd256"));
+            assert_eq!(
+                attn_decode_plan(256, 32, 1024, true).unwrap(),
+                AttnDecodePlan::Split8Hd256
+            );
+            assert_eq!(
+                attn_decode_plan(512, 32, 1024, true).unwrap(),
+                AttnDecodePlan::Split8Hd512
+            );
+        }
+        for (head_dim, generic) in [
+            (256usize, "attn_decode_f16_hd256"),
+            (512, "attn_decode_f16_hd512"),
+        ] {
+            for plan in [
+                attn_decode_plan(head_dim, 64, 1024, true).unwrap(),
+                attn_decode_plan(head_dim, 32, 128, true).unwrap(),
+                attn_decode_plan(head_dim, 32, 1024, false).unwrap(),
+            ] {
+                assert_eq!(plan, AttnDecodePlan::Generic(generic));
+            }
         }
     }
 

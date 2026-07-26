@@ -1417,6 +1417,10 @@
       "entry": "src_nvfp4_ct_layout_repack_nvf6A6A6A6A_80e13ab8481a82b0",
       "file": "repack_nvfp4_ct_s0_n64k128_into.hsaco"
     },
+    "rmsnorm_delta_residual_f16": {
+      "entry": "src_norm_rmsnorm_delta_residua6A6A6A6A_49acb628d9441fca",
+      "file": "rmsnorm_delta_residual_f16.hsaco"
+    },
     "rmsnorm_f16": {
       "entry": "src_norm_rmsnorm_f16_Pointer6A6A6A6AoA6A6A_5569fdb15c9ef2c8",
       "file": "rmsnorm_f16.hsaco"
@@ -1428,6 +1432,10 @@
     "rmsnorm_h32_f16": {
       "entry": "src_decode_fused_rmsnorm_h32_f6A6A6A6A_afeaf2c4402b7adf",
       "file": "rmsnorm_h32_f16.hsaco"
+    },
+    "rmsnorm_qkv_f16": {
+      "entry": "src_norm_rmsnorm_qkv_f16_Poi6A6A6A6AoA6A6A_531bb45ec3382a85",
+      "file": "rmsnorm_qkv_f16.hsaco"
     },
     "rmsnorm_residual_f16": {
       "entry": "src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69",

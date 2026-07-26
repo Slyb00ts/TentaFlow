@@ -12,6 +12,8 @@ import std.os as os
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
 from src.norm import (
+    rmsnorm_delta_residual_f16,
+    rmsnorm_qkv_f16,
     rmsnorm_f16,
     rmsnorm_residual_f16,
     rmsnorm_fp8,
@@ -753,6 +755,15 @@ def main() raises:
         rmsnorm_residual_f16, dump_asm=Path("rmsnorm_residual_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "rmsnorm_residual_f16"))
+    _ = ctx.compile_function[
+        rmsnorm_delta_residual_f16,
+        dump_asm=Path("rmsnorm_delta_residual_f16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "rmsnorm_delta_residual_f16"))
+    _ = ctx.compile_function[
+        rmsnorm_qkv_f16, dump_asm=Path("rmsnorm_qkv_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "rmsnorm_qkv_f16"))
 
     _ = ctx.compile_function[rmsnorm_fp8, dump_asm=Path("rmsnorm_fp8.ptx")]()
     entries.append(_finalize(out_dir, "rmsnorm_fp8"))

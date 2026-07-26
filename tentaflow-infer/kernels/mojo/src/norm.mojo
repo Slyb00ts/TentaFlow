@@ -111,6 +111,158 @@ def rmsnorm_residual_f16(
         i += stride
 
 
+def rmsnorm_qkv_f16(
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k: UnsafePointer[Float16, MutAnyOrigin],
+    v: UnsafePointer[Float16, MutAnyOrigin],
+    wq: UnsafePointer[Float16, MutAnyOrigin],
+    wk: UnsafePointer[Float16, MutAnyOrigin],
+    wv: UnsafePointer[Float16, MutAnyOrigin],
+    q_rows: Int,
+    kv_rows: Int,
+    head_dim: Int,
+    eps: Float32,
+):
+    """Normy Q, K i V w JEDNYM uruchomieniu, po jednym bloku na glowice.
+
+    Rodzina Gemma normalizuje osobno Q, K i V (V wektorem jedynek), co dawalo
+    trzy uruchomienia na warstwe, czyli 144 na token przy 48 warstwach. Kazdy z
+    nich czyta kilka kB, wiec dominowal koszt samego wywolania. Blok wybiera
+    tensor po swoim indeksie: `[0, q_rows)` to Q, dalej K, dalej V. Matematyka
+    jest ta sama co w `rmsnorm_f16` w miejscu.
+    """
+    row = Int(block_idx.x)
+    stride = Int(block_dim.x)
+
+    var buf = q
+    var weight = wq
+    var local = row
+    if row >= q_rows + kv_rows:
+        buf = v
+        weight = wv
+        local = row - q_rows - kv_rows
+    elif row >= q_rows:
+        buf = k
+        weight = wk
+        local = row - q_rows
+
+    base = local * head_dim
+
+    var ss: Float32 = 0.0
+    var i = Int(thread_idx.x)
+    while i < head_dim:
+        val = Float32(buf[base + i])
+        ss += val * val
+        i += stride
+    inv = rsqrt(block_reduce_sum(ss) / Float32(head_dim) + eps)
+
+    i = Int(thread_idx.x)
+    while i < head_dim:
+        buf[base + i] = Float16(Float32(buf[base + i]) * inv * Float32(weight[i]))
+        i += stride
+
+
+def rmsnorm_delta_residual_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    residual_io: UnsafePointer[Float16, MutAnyOrigin],
+    delta: UnsafePointer[Float16, MutAnyOrigin],
+    delta_weight: UnsafePointer[Float16, MutAnyOrigin],
+    weight: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    eps: Float32,
+    layer_scale: Float32,
+):
+    """Norma „sandwich" + rezyduum + skala warstwy + norma wyjsciowa w JEDNYM
+    uruchomieniu.
+
+    Rodzina Gemma normalizuje wyjscie bloku PRZED dodaniem do rezyduum, a potem
+    mnozy caly strumien przez skalar warstwy. Rozbite na osobne kernele daja trzy
+    uruchomienia na blok, czyli szesc na warstwe i 144 na token przy 48
+    warstwach. Profiler pokazal, ze pojedynczy rmsnorm nad 3840 wartosciami
+    zajmuje 3,98 us, choc czyta 7,7 kB — to sam koszt uruchomienia. Tutaj jest to
+    jeden przebieg:
+
+        d = rmsnorm(delta) * delta_weight
+        h = (h + d) * layer_scale
+        out = rmsnorm(h) * weight
+
+    `layer_scale` rowne 1.0 wylacza skalowanie. Kolejnosc dziala tak samo jak
+    wersja rozbita: skala trafia w `h` przed policzeniem `out`, a norma RMS jest
+    niezmiennicza na skale, wiec `out` sie nie zmienia poza zaokragleniem f16
+    samego mnozenia.
+    """
+    row = Int(block_idx.x)
+    base = row * n_cols
+    stride = Int(block_dim.x)
+
+    # Kazdy przebieg wystawia NORM_UNROLL dostepow przed konsumpcja — przy 3840
+    # kolumnach i 256 watkach pojedynczy dostep na obieg zostawia kernel na
+    # latencji, a nie na pasmie (to samo rozwiazanie ma `rmsnorm_residual_f16`).
+
+    # 1) RMS samej delty.
+    var ds: Float32 = 0.0
+    var i = Int(thread_idx.x)
+    while i + (NORM_UNROLL - 1) * stride < n_cols:
+        var dv = InlineArray[Float32, NORM_UNROLL](fill=0.0)
+        comptime for u in range(NORM_UNROLL):
+            dv[u] = Float32(delta[base + i + u * stride])
+        comptime for u in range(NORM_UNROLL):
+            ds += dv[u] * dv[u]
+        i += NORM_UNROLL * stride
+    while i < n_cols:
+        dv1 = Float32(delta[base + i])
+        ds += dv1 * dv1
+        i += stride
+    d_inv = rsqrt(block_reduce_sum(ds) / Float32(n_cols) + eps)
+
+    # 2) h = (h + norm(delta) * delta_weight) * layer_scale, przy okazji RMS h.
+    var ss: Float32 = 0.0
+    i = Int(thread_idx.x)
+    while i + (NORM_UNROLL - 1) * stride < n_cols:
+        var hv = InlineArray[Float32, NORM_UNROLL](fill=0.0)
+        comptime for u in range(NORM_UNROLL):
+            dn = (
+                Float32(delta[base + i + u * stride])
+                * d_inv
+                * Float32(delta_weight[i + u * stride])
+            )
+            hv[u] = (Float32(residual_io[base + i + u * stride]) + dn) * layer_scale
+        comptime for u in range(NORM_UNROLL):
+            vh = Float16(hv[u])
+            residual_io[base + i + u * stride] = vh
+            f = Float32(vh)
+            ss += f * f
+        i += NORM_UNROLL * stride
+    while i < n_cols:
+        dn1 = Float32(delta[base + i]) * d_inv * Float32(delta_weight[i])
+        v = (Float32(residual_io[base + i]) + dn1) * layer_scale
+        vh1 = Float16(v)
+        residual_io[base + i] = vh1
+        f1 = Float32(vh1)
+        ss += f1 * f1
+        i += stride
+    inv = rsqrt(block_reduce_sum(ss) / Float32(n_cols) + eps)
+
+    # 3) out = rmsnorm(h) * weight.
+    i = Int(thread_idx.x)
+    while i + (NORM_UNROLL - 1) * stride < n_cols:
+        var ov = InlineArray[Float32, NORM_UNROLL](fill=0.0)
+        comptime for u in range(NORM_UNROLL):
+            ov[u] = (
+                Float32(residual_io[base + i + u * stride])
+                * inv
+                * Float32(weight[i + u * stride])
+            )
+        comptime for u in range(NORM_UNROLL):
+            out_ptr[base + i + u * stride] = Float16(ov[u])
+        i += NORM_UNROLL * stride
+    while i < n_cols:
+        out_ptr[base + i] = Float16(
+            Float32(residual_io[base + i]) * inv * Float32(weight[i])
+        )
+        i += stride
+
+
 def _rmsnorm_fp8_emit(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     xq: UnsafePointer[Int8, MutAnyOrigin],

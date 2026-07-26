@@ -2294,6 +2294,45 @@ pub(crate) fn hybrid_prefill_b2_backend_capable(vendor: Vendor, warp_size: u32) 
 /// wykonują tu żadnego kernela.
 
 
+/// Domyka blok: normuje deltę „sandwich", dodaje ją do rezyduum, skaluje
+/// strumień skalarem warstwy i liczy normę wejściową następnego bloku. Gdy model
+/// nie ma norm sandwich, schodzi na samą fuzję rezyduum + norma, a skalę (jeśli
+/// jest) nakłada osobno — tak działają architektury bez tych tensorów.
+#[allow(clippy::too_many_arguments)]
+fn close_block(
+    kernels: &Kernels,
+    delta_norm: Option<&DevBuffer>,
+    layer_scale: Option<f32>,
+    x_out: &DevBuffer,
+    h: &DevBuffer,
+    delta: &DevBuffer,
+    next_norm: &DevBuffer,
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+    stream: &Stream,
+) -> Result<()> {
+    match delta_norm {
+        Some(dn) => kernels.rmsnorm_delta_residual_f16(
+            x_out,
+            h,
+            delta,
+            dn,
+            next_norm,
+            rows,
+            hidden,
+            eps,
+            layer_scale.unwrap_or(1.0),
+            stream,
+        ),
+        None => {
+            kernels
+                .rmsnorm_residual_f16(x_out, h, delta, next_norm, rows, hidden, eps, stream)?;
+            layer_output_scale(kernels, layer_scale, h, rows * hidden, stream)
+        }
+    }
+}
+
 fn pre_residual_norm(
     kernels: &Kernels,
     norm: Option<&DevBuffer>,
@@ -5704,38 +5743,65 @@ impl Model {
             // once per token (rows = t), Qwen3 normalizes per head (rows =
             // t*n_heads). Dense non-OLMoE arches keep the per-head form
             // bit-for-bit (qk_norm_over_hidden == false).
-            if let Some(qn) = &layer.attn().q_norm {
-                if p.qk_norm_over_hidden {
-                    kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t, q_dim, eps, stream)?;
-                } else {
-                    kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, head_dim, eps, stream)?;
-                }
-            }
-            if let Some(kn) = &layer.attn().k_norm {
-                if p.qk_norm_over_hidden {
-                    kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t, kv_dim, eps, stream)?;
-                } else {
-                    kernels.rmsnorm_f16(
+            let attn_w = layer.attn();
+            match (
+                attn_w.q_norm.as_ref(),
+                attn_w.k_norm.as_ref(),
+                attn_w.v_norm.as_ref(),
+            ) {
+                // Wszystkie trzy normy per głowica: jedno uruchomienie zamiast
+                // trzech (rodzina Gemma).
+                (Some(qn), Some(kn), Some(vn)) if !p.qk_norm_over_hidden => {
+                    kernels.rmsnorm_qkv_f16(
+                        &pb.q,
                         &pb.k,
-                        &pb.k,
+                        &pb.v,
+                        qn,
                         kn,
+                        vn,
+                        t * p.n_heads,
                         t * n_kv_heads,
                         head_dim,
                         eps,
                         stream,
                     )?;
                 }
-            }
-            if let Some(vn) = &layer.attn().v_norm {
-                kernels.rmsnorm_f16(
-                    &pb.v,
-                    &pb.v,
-                    vn,
-                    t * n_kv_heads,
-                    head_dim,
-                    eps,
-                    stream,
-                )?;
+                _ => {
+                    if let Some(qn) = attn_w.q_norm.as_ref() {
+                        if p.qk_norm_over_hidden {
+                            kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t, q_dim, eps, stream)?;
+                        } else {
+                            kernels
+                                .rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, head_dim, eps, stream)?;
+                        }
+                    }
+                    if let Some(kn) = attn_w.k_norm.as_ref() {
+                        if p.qk_norm_over_hidden {
+                            kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t, kv_dim, eps, stream)?;
+                        } else {
+                            kernels.rmsnorm_f16(
+                                &pb.k,
+                                &pb.k,
+                                kn,
+                                t * n_kv_heads,
+                                head_dim,
+                                eps,
+                                stream,
+                            )?;
+                        }
+                    }
+                    if let Some(vn) = attn_w.v_norm.as_ref() {
+                        kernels.rmsnorm_f16(
+                            &pb.v,
+                            &pb.v,
+                            vn,
+                            t * n_kv_heads,
+                            head_dim,
+                            eps,
+                            stream,
+                        )?;
+                    }
+                }
             }
 
             kernels.rope_neox_f16(
@@ -6038,15 +6104,6 @@ impl Model {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, rows, stream)?;
             }
             trace.mark(self.device.as_ref(), "gemm_o");
-            pre_residual_norm(
-                kernels,
-                layer.post_attn_norm.as_ref(),
-                &pb.o_out,
-                rows,
-                hidden,
-                eps,
-                stream,
-            )?;
             let fp8mod_fuse_gateup =
                 (fp8mod_fuse || fp8mod_ffn_fuse) && matches!(layer.ffn, LayerFfn::Dense(_));
             if fp8mod_fuse_gateup {
@@ -6061,7 +6118,10 @@ impl Model {
                     stream,
                 )?;
             } else {
-                kernels.rmsnorm_residual_f16(
+                close_block(
+                    kernels,
+                    layer.post_attn_norm.as_ref(),
+                    None,
                     &pb.x,
                     &pb.h,
                     &pb.o_out,
@@ -6153,31 +6213,41 @@ impl Model {
             };
             // This norm feeds the NEXT layer's q/k/v (or, for the last layer, the
             // logit head — never fused, keeps the f16 hidden state).
-            pre_residual_norm(
-                kernels,
-                layer.post_ffw_norm.as_ref(),
-                &pb.down,
-                rows,
-                hidden,
-                eps,
-                stream,
-            )?;
             if l + 1 < n_layers && fp8mod_fuse {
+                pre_residual_norm(
+                    kernels,
+                    layer.post_ffw_norm.as_ref(),
+                    &pb.down,
+                    rows,
+                    hidden,
+                    eps,
+                    stream,
+                )?;
                 kernels.rmsnorm_residual_fp8_shared(
                     &pb.x, &pb.h, &pb.down, next_norm, rows, hidden, eps, stream,
                 )?;
+                layer_output_scale(
+                    kernels,
+                    layer.layer_output_scale,
+                    &pb.h,
+                    rows * hidden,
+                    stream,
+                )?;
             } else {
-                kernels.rmsnorm_residual_f16(
-                    &pb.x, &pb.h, &pb.down, next_norm, rows, hidden, eps, stream,
+                close_block(
+                    kernels,
+                    layer.post_ffw_norm.as_ref(),
+                    layer.layer_output_scale,
+                    &pb.x,
+                    &pb.h,
+                    &pb.down,
+                    next_norm,
+                    rows,
+                    hidden,
+                    eps,
+                    stream,
                 )?;
             }
-            layer_output_scale(
-                kernels,
-                layer.layer_output_scale,
-                &pb.h,
-                rows * hidden,
-                stream,
-            )?;
             trace.mark(self.device.as_ref(), "norm_res2");
         }
 
@@ -7786,16 +7856,10 @@ impl Model {
             )?;
 
             self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
-            pre_residual_norm(
+            close_block(
                 kernels,
                 layer.post_attn_norm.as_ref(),
-                &b.o_out,
-                1,
-                hidden,
-                eps,
-                stream,
-            )?;
-            kernels.rmsnorm_residual_f16(
+                None,
                 &b.x,
                 &b.h,
                 &b.o_out,
@@ -7824,17 +7888,19 @@ impl Model {
             } else {
                 &self.weights.output_norm
             };
-            pre_residual_norm(
+            close_block(
                 kernels,
                 layer.post_ffw_norm.as_ref(),
+                layer.layer_output_scale,
+                &b.x,
+                &b.h,
                 &b.down,
+                next_norm,
                 1,
                 hidden,
                 eps,
                 stream,
             )?;
-            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
-            layer_output_scale(kernels, layer.layer_output_scale, &b.h, hidden, stream)?;
         }
 
         self.logits_gemv(&b.logits, &b.x, stream)
@@ -12120,31 +12186,40 @@ impl Model {
                         self.gemv(&b.q, q, &b.x, stream)?;
                         self.gemv(&b.k, k, &b.x, stream)?;
                         self.gemv(&b.v, v, &b.x, stream)?;
-                        if let Some(qn) = &layer.attn().q_norm {
-                            kernels
-                                .rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, head_dim, eps, stream)?;
-                        }
-                        if let Some(kn) = &layer.attn().k_norm {
-                            kernels.rmsnorm_f16(
-                                &b.k,
-                                &b.k,
-                                kn,
-                                p.n_kv_heads_at(l),
-                                head_dim,
-                                eps,
-                                stream,
-                            )?;
-                        }
-                        if let Some(vn) = &layer.attn().v_norm {
-                            kernels.rmsnorm_f16(
-                                &b.v,
-                                &b.v,
-                                vn,
-                                p.n_kv_heads_at(l),
-                                head_dim,
-                                eps,
-                                stream,
-                            )?;
+                        let aw = layer.attn();
+                        match (aw.q_norm.as_ref(), aw.k_norm.as_ref(), aw.v_norm.as_ref()) {
+                            (Some(qn), Some(kn), Some(vn)) => {
+                                kernels.rmsnorm_qkv_f16(
+                                    &b.q,
+                                    &b.k,
+                                    &b.v,
+                                    qn,
+                                    kn,
+                                    vn,
+                                    p.n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    eps,
+                                    stream,
+                                )?;
+                            }
+                            _ => {
+                                if let Some(qn) = aw.q_norm.as_ref() {
+                                    kernels.rmsnorm_f16(
+                                        &b.q, &b.q, qn, p.n_heads, head_dim, eps, stream,
+                                    )?;
+                                }
+                                if let Some(kn) = aw.k_norm.as_ref() {
+                                    kernels.rmsnorm_f16(
+                                        &b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream,
+                                    )?;
+                                }
+                                if let Some(vn) = aw.v_norm.as_ref() {
+                                    kernels.rmsnorm_f16(
+                                        &b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream,
+                                    )?;
+                                }
+                            }
                         }
                         kernels.rope_neox_f16(
                             &b.q,
@@ -12236,16 +12311,10 @@ impl Model {
                 }
 
                 self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
-                pre_residual_norm(
+                close_block(
                     kernels,
                     layer.post_attn_norm.as_ref(),
-                    &b.o_out,
-                    1,
-                    hidden,
-                    eps,
-                    stream,
-                )?;
-                kernels.rmsnorm_residual_f16(
+                    None,
                     &b.x,
                     &b.h,
                     &b.o_out,
@@ -12274,18 +12343,19 @@ impl Model {
                 } else {
                     &self.weights.output_norm
                 };
-                pre_residual_norm(
+                close_block(
                     kernels,
                     layer.post_ffw_norm.as_ref(),
+                    layer.layer_output_scale,
+                    &b.x,
+                    &b.h,
                     &b.down,
+                    next_norm,
                     1,
                     hidden,
                     eps,
                     stream,
                 )?;
-                kernels
-                    .rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
-                layer_output_scale(kernels, layer.layer_output_scale, &b.h, hidden, stream)?;
             }
 
             self.logits_gemv(&b.logits, &b.x, stream)
@@ -12419,16 +12489,10 @@ impl Model {
             )?;
 
             self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
-            pre_residual_norm(
+            close_block(
                 kernels,
                 layer.post_attn_norm.as_ref(),
-                &b.o_out,
-                1,
-                hidden,
-                eps,
-                stream,
-            )?;
-            kernels.rmsnorm_residual_f16(
+                None,
                 &b.x,
                 &b.h,
                 &b.o_out,
@@ -12453,17 +12517,19 @@ impl Model {
             } else {
                 &self.weights.output_norm
             };
-            pre_residual_norm(
+            close_block(
                 kernels,
                 layer.post_ffw_norm.as_ref(),
+                layer.layer_output_scale,
+                &b.x,
+                &b.h,
                 &b.down,
+                next_norm,
                 1,
                 hidden,
                 eps,
                 stream,
             )?;
-            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
-            layer_output_scale(kernels, layer.layer_output_scale, &b.h, hidden, stream)?;
         }
 
         self.logits_gemv(&b.logits, &b.x, stream)
