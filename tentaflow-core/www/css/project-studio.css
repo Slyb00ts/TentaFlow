@@ -1631,6 +1631,9 @@
    onto the next one — a five-row stack over a two-row table. Here they size to
    content, the search box takes the slack, and actions ride to the right. */
 .ps-tests-toolbar tf-searchbox,
+.ps-members-toolbar tf-searchbox,
+.ps-files-toolbar tf-searchbox,
+.ps-code-toolbar tf-searchbox,
 .ps-filters-row tf-searchbox {
   flex: 1 1 240px;
   min-width: 190px;
@@ -1640,6 +1643,11 @@
 .ps-tests-toolbar tf-select,
 .ps-tests-toolbar tf-input,
 .ps-tests-toolbar tf-combobox,
+.ps-members-toolbar tf-select,
+.ps-members-toolbar tf-input,
+.ps-files-toolbar tf-select,
+.ps-files-toolbar tf-input,
+.ps-code-toolbar tf-select,
 .ps-filters-row tf-select,
 .ps-filters-row tf-input {
   display: inline-block;
@@ -1652,12 +1660,19 @@
 .ps-tests-toolbar tf-filter-chips,
 .ps-tests-toolbar .ps-toggle-inline,
 .ps-tests-toolbar tf-button,
+.ps-members-toolbar tf-segmented,
+.ps-members-toolbar tf-button,
+.ps-files-toolbar tf-button,
+.ps-code-toolbar tf-button,
 .ps-filters-row tf-segmented,
 .ps-filters-row tf-button {
   flex: 0 0 auto;
 }
 
 .ps-tests-toolbar .ps-toolbar-spacer,
+.ps-members-toolbar .ps-toolbar-spacer,
+.ps-files-toolbar .ps-toolbar-spacer,
+.ps-code-toolbar .ps-toolbar-spacer,
 .ps-filters-row .ps-toolbar-spacer {
   flex: 1 1 0;
   min-width: 0;
