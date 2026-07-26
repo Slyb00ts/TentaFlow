@@ -12,6 +12,7 @@ from std.gpu.primitives import warp
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
+from std.atomic import Atomic
 
 # One block per token stages that token's hidden vector in shared f32; caps the
 # supported hidden size and expert count (every current MoE model fits).
@@ -25,6 +26,7 @@ def moe_router_f16(
     weights_ptr: UnsafePointer[Float32, MutAnyOrigin],
     x_ptr: UnsafePointer[Float16, MutAnyOrigin],
     w_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    counts_ptr: UnsafePointer[Int32, MutAnyOrigin],
     hidden: Int,
     n_expert: Int,
     top_k: Int,
@@ -35,6 +37,11 @@ def moe_router_f16(
     grid=(n_tokens,1,1), block=256. Writes ids[token, k] (Int32) and the
     softmax routing weights[token, k] (Float32). `norm_topk` renormalizes the
     selected weights to sum 1.
+
+    `counts_ptr[e]` accumulates how often expert `e` was selected. That tally is
+    what drives weight residency: the hot experts belong in VRAM and the cold
+    ones in host memory, and nothing else on the device knows the routing. The
+    add is atomic because a prefill launches one block per token.
     """
     token = Int(block_idx.x)
     tid = Int(thread_idx.x)
@@ -103,6 +110,7 @@ def moe_router_f16(
                     best_i = n
                 n += 1
             ids_ptr[token * top_k + kk] = Int32(best_i)
+            _ = Atomic.fetch_add(counts_ptr + best_i, Int32(1))
             weights_ptr[token * top_k + kk] = best_v
             wsum += best_v
             logits[best_i] = NEG_BIG

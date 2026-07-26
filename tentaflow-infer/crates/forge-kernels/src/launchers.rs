@@ -9489,21 +9489,21 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Routed-MoE Q6_K expert GEMV whose expert row window is read ON DEVICE
-    /// from `ids[sel]` (no host readback). Writes the per-expert `[rows]` output
-    /// at `y[0..]`; global weight row = `ids[sel] * rows_per_expert + local_row`,
-    /// bit-identical to `gemv_q6_k_f16_at` at that expert's byte offset.
+    /// Routed-MoE Q6_K expert GEMV whose expert is selected ON DEVICE from
+    /// `ids[sel]` (no host readback). `w_table` is a device array of per-expert
+    /// weight base pointers, so experts may sit in different memory tiers and
+    /// move independently. Bit-identical to `gemv_q6_k_f16_at` launched against
+    /// that expert's own block.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q6_k_f16_gidx(
         &self,
         y: &DevBuffer,
-        w_q6k: &DevBuffer,
+        w_table: &DevBuffer,
         x: &DevBuffer,
         rows: usize,
         cols: usize,
         ids: &DevBuffer,
         sel: usize,
-        rows_per_expert: usize,
         stream: &Stream,
     ) -> Result<()> {
         if !cols.is_multiple_of(256) {
@@ -9519,13 +9519,12 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf(w_q6k)
+            .buf(w_table)
             .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .buf(ids)
-            .scalar(sel as i64)
-            .scalar(rows_per_expert as i64);
+            .scalar(sel as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -11313,22 +11312,22 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Routed-MoE Q4_K expert GEMV whose expert row window is read ON DEVICE
-    /// from `ids[sel]` (no host readback of the router selection). Writes the
-    /// per-expert `[rows]` output at `y[0..]`; the global weight row is
-    /// `ids[sel] * rows_per_expert + local_row`, so the result is bit-identical
-    /// to `gemv_q4_k_dp4a_f16_at` at byte offset `ids[sel]*rows_per_expert`.
+    /// Routed-MoE Q4_K expert GEMV whose expert is selected ON DEVICE from
+    /// `ids[sel]` (no host readback of the router selection). `w_table` is a
+    /// device array of per-expert weight base pointers, so experts may sit in
+    /// different memory tiers and move independently. Writes the per-expert
+    /// `[rows]` output at `y[0..]`, bit-identical to `gemv_q4_k_dp4a_f16_at`
+    /// launched against that expert's own block.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q4_k_dp4a_f16_gidx(
         &self,
         y: &DevBuffer,
-        w_q4k: &DevBuffer,
+        w_table: &DevBuffer,
         x: &DevBuffer,
         rows: usize,
         cols: usize,
         ids: &DevBuffer,
         sel: usize,
-        rows_per_expert: usize,
         stream: &Stream,
     ) -> Result<()> {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_f16_gidx")?;
@@ -11340,13 +11339,12 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf(w_q4k)
+            .buf(w_table)
             .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .buf(ids)
-            .scalar(sel as i64)
-            .scalar(rows_per_expert as i64);
+            .scalar(sel as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -16058,6 +16056,7 @@ impl Kernels {
         weights: &DevBuffer,
         x: &DevBuffer,
         gate_inp: &DevBuffer,
+        counts: &DevBuffer,
         n_tokens: usize,
         hidden: usize,
         n_expert: usize,
@@ -16087,6 +16086,7 @@ impl Kernels {
             .buf(weights)
             .buf(x)
             .buf(gate_inp)
+            .buf(counts)
             .scalar(hidden as i64)
             .scalar(n_expert as i64)
             .scalar(top_k as i64)

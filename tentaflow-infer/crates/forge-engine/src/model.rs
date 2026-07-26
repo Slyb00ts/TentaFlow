@@ -23,6 +23,10 @@ use forge_types::{DType, ForgeError, MemKind, QuantKind, Result, Vendor};
 use half::f16;
 
 use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
+use crate::moe_residency::{
+    ExpertStack, Migration, MoeLayerView, MoeResidencyState, Projection, ProjectionId,
+    MOE_RESIDENCY_INTERVAL,
+};
 use crate::mtp::{MtpDraftState, MtpEmbedding};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
@@ -1071,6 +1075,8 @@ pub struct Model {
     pt_seq: u64,
     /// MoE scratch; `Some` only for Mixture-of-Experts models.
     moe_bufs: Option<MoeBufs>,
+    /// Rezydencja ekspertów; `Some` tylko dla modeli MoE.
+    moe_residency: Option<MoeResidencyState>,
     /// Pula izolowanych stanów Gated-DeltaNet przypisanych do sekwencji.
     hybrid_states: Option<HybridStatePool>,
     /// Gated-attention + DeltaNet single-token scratch; allocated lazily for a
@@ -2430,6 +2436,21 @@ impl Model {
         );
     }
 
+    /// Rozkład ekspertów po warstwach pamięci, logowany po załadowaniu modelu.
+    fn report_expert_residency(&self) {
+        let Some((vram, host)) = self.moe_expert_residency() else {
+            return;
+        };
+        if host == 0 {
+            return;
+        }
+        tracing::info!(
+            experts_vram = vram,
+            experts_host = host,
+            "eksperci MoE rozłożeni między VRAM a pamięć hosta; rezydencja będzie przestawiana wg popularności"
+        );
+    }
+
     pub fn load_gguf(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Result<Self> {
         let kernels = Kernels::load(device.clone())?;
         let stream = device.create_stream()?;
@@ -2797,6 +2818,25 @@ impl Model {
             }
             None => None,
         };
+
+        // Rezydencja ma sens tylko wtedy, gdy jakikolwiek ekspert wylądował
+        // poza VRAM — inaczej nie ma czego przenosić i każda runda byłaby
+        // czystym kosztem.
+        let moe_residency = {
+            let views: Vec<MoeLayerView<'_>> = weights
+                .layers
+                .iter()
+                .filter_map(|layer| match &layer.ffn {
+                    LayerFfn::Moe(moe) => Some(MoeLayerView {
+                        gate: &moe.gate_exps,
+                        up: &moe.up_exps,
+                        down: &moe.down_exps,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            MoeResidencyState::new(device.as_ref(), weights.layers.len(), &views)?
+        };
         let mtp_config = weights.mtp.as_ref().map(|_| {
             (
                 KvConfig {
@@ -2879,6 +2919,7 @@ impl Model {
             tier_bufs,
             pt_seq: 0,
             moe_bufs,
+            moe_residency,
             hybrid_states,
             hybrid_bufs: None,
             hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
@@ -2886,6 +2927,7 @@ impl Model {
             calib: None,
             prefill_profiles: VecDeque::new(),
         };
+        model.report_expert_residency();
         let configured = model
             .is_hybrid()
             .then(|| std::env::var("FORGE_HYBRID_PREFILL_CHUNK").ok())
@@ -5316,15 +5358,16 @@ impl Model {
         }
     }
 
-    /// Whether `w` is a routed-expert stack the device-side grouped dispatch can
-    /// index without a host readback: the dp4a Q4_K path (cols within the dp4a
-    /// bound) and the warp-per-row Q6_K path have `_gidx` kernels that read the
-    /// expert row offset on-device. Other quants keep the host-readback loop.
-    fn expert_stack_gidx(w: &DevWeight) -> bool {
-        matches!(
-            w,
-            DevWeight::Q4K { cols, .. } if *cols <= Kernels::DP4A_MAX_COLS
-        ) || matches!(w, DevWeight::Q6K { .. })
+    /// Whether `stack` is a routed-expert stack the device-side grouped dispatch
+    /// can index without a host readback: the dp4a Q4_K path (cols within the
+    /// dp4a bound) and the warp-per-row Q6_K path have `_gidx` kernels that read
+    /// the expert selection on-device. Other quants keep the host-readback loop.
+    fn expert_stack_gidx(stack: &ExpertStack) -> bool {
+        match stack.representative() {
+            DevWeight::Q4K { cols, .. } => *cols <= Kernels::DP4A_MAX_COLS,
+            DevWeight::Q6K { .. } => true,
+            _ => false,
+        }
     }
 
     /// True when every routed-expert projection of `moe` supports the
@@ -5336,45 +5379,42 @@ impl Model {
     }
 
     /// Single-token GEMV over the expert selected on-device by `ids[sel]`: the
-    /// device analog of `gemv_rows`, reading the expert row offset
-    /// (`ids[sel] * rows_per_expert`) inside the kernel. Bit-identical to
-    /// `gemv_rows(y, w, x, ids[sel]*rows_per_expert, n_rows, ..)`. Only the
-    /// quants `expert_stack_gidx` accepts reach here.
+    /// device analog of `gemv_rows`, resolving that expert's weight base from
+    /// the stack's device-resident pointer table inside the kernel.
+    /// Bit-identical to `gemv_rows(y, stack.expert(ids[sel]), x, 0, n_rows, ..)`.
+    /// Only the quants `expert_stack_gidx` accepts reach here.
     #[allow(clippy::too_many_arguments)]
     fn gemv_rows_gidx(
         &self,
         y: &DevBuffer,
-        w: &DevWeight,
+        stack: &ExpertStack,
         x: &DevBuffer,
         ids: &DevBuffer,
         sel: usize,
-        rows_per_expert: usize,
         n_rows: usize,
         stream: &Stream,
     ) -> Result<()> {
-        match w {
-            DevWeight::Q4K { buf, cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => {
+        match stack.representative() {
+            DevWeight::Q4K { cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => {
                 self.kernels.gemv_q4_k_dp4a_f16_gidx(
                     y,
-                    buf,
+                    stack.table(),
                     x,
                     n_rows,
                     *cols,
                     ids,
                     sel,
-                    rows_per_expert,
                     stream,
                 )
             }
-            DevWeight::Q6K { buf, cols, .. } => self.kernels.gemv_q6_k_f16_gidx(
+            DevWeight::Q6K { cols, .. } => self.kernels.gemv_q6_k_f16_gidx(
                 y,
-                buf,
+                stack.table(),
                 x,
                 n_rows,
                 *cols,
                 ids,
                 sel,
-                rows_per_expert,
                 stream,
             ),
             _ => Err(ForgeError::Unsupported(
@@ -7391,6 +7431,7 @@ impl Model {
     /// on-GPU sampler (`step_and_sample`).
     fn step_launch(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<()> {
         self.ensure_kv_reuse_healthy()?;
+        self.tick_moe_residency()?;
         let p = self.weights.descriptor.params.clone();
         let pos = seq.len;
 
@@ -12082,6 +12123,117 @@ impl Model {
         }
     }
 
+    /// One decode step's worth of expert-residency upkeep.
+    ///
+    /// The router already tallies expert selections on-device for free, so the
+    /// only cost here is the periodic round: read the tallies, refresh the
+    /// popularity estimate, and move a bounded number of experts between VRAM
+    /// and host memory. Rounds are rare and capped because the migration itself
+    /// moves whole expert blocks — spending more on shuffling than the better
+    /// placement returns would defeat the point.
+    ///
+    /// A model whose experts all fit in VRAM never has a host-resident expert,
+    /// so `plan` returns nothing and this degenerates to a counter read.
+    fn tick_moe_residency(&mut self) -> Result<()> {
+        let Some(policy) = self.moe_residency.as_mut() else {
+            return Ok(());
+        };
+        policy.tokens_since_round += 1;
+        if policy.tokens_since_round < MOE_RESIDENCY_INTERVAL {
+            return Ok(());
+        }
+        policy.tokens_since_round = 0;
+        self.rebalance_moe_residency()
+    }
+
+    /// Ilu ekspertów siedzi w VRAM, a ilu w pamięci hosta, w całym modelu.
+    /// `None` dla modeli bez routowanych ekspertów.
+    pub fn moe_expert_residency(&self) -> Option<(usize, usize)> {
+        let mut vram = 0usize;
+        let mut host = 0usize;
+        let mut any = false;
+        for layer in &self.weights.layers {
+            let LayerFfn::Moe(moe) = &layer.ffn else {
+                continue;
+            };
+            any = true;
+            for stack in [&moe.gate_exps, &moe.up_exps, &moe.down_exps] {
+                let (v, h) = stack.tier_counts();
+                vram += v;
+                host += h;
+            }
+        }
+        any.then_some((vram, host))
+    }
+
+    fn rebalance_moe_residency(&mut self) -> Result<()> {
+        // Tallies are written by kernels still queued on the model stream.
+        self.stream.synchronize()?;
+        let mut planned: Vec<Migration> = Vec::new();
+        {
+            let state = self
+                .moe_residency
+                .as_mut()
+                .expect("residency state present for MoE models");
+            for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+                let LayerFfn::Moe(moe) = &layer.ffn else {
+                    continue;
+                };
+                let counts = moe.usage.take(self.device.as_ref())?;
+                state.policy.observe(layer_index, &counts);
+                for (projection, stack) in [
+                    (Projection::Gate, &moe.gate_exps),
+                    (Projection::Up, &moe.up_exps),
+                    (Projection::Down, &moe.down_exps),
+                ] {
+                    planned.extend(state.policy.candidates(
+                        ProjectionId {
+                            layer: layer_index,
+                            projection,
+                        },
+                        stack,
+                    ));
+                }
+            }
+        }
+        let planned = self
+            .moe_residency
+            .as_ref()
+            .expect("residency state present")
+            .policy
+            .select_round(planned);
+        if planned.is_empty() {
+            return Ok(());
+        }
+        // The captured decode graph reads expert bases from the device-resident
+        // pointer table, so a migration needs no re-capture — the table update
+        // is picked up by the next replay.
+        for migration in planned {
+            let scratch = self
+                .moe_residency
+                .as_ref()
+                .expect("residency state present")
+                .scratch
+                .clone();
+            let LayerFfn::Moe(moe) = &mut self.weights.layers[migration.target.layer].ffn else {
+                continue;
+            };
+            let stack = match migration.target.projection {
+                Projection::Gate => &mut moe.gate_exps,
+                Projection::Up => &mut moe.up_exps,
+                Projection::Down => &mut moe.down_exps,
+            };
+            stack.swap_tiers(
+                self.device.as_ref(),
+                migration.demote,
+                migration.promote,
+                &scratch,
+                &self.stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Whether every routed-MoE layer supports the device-side grouped dispatch
     /// (no host readback anywhere in the forward), so `run_step_moe` records
     /// cleanly into a replayable graph. False if any layer has a fallback quant
@@ -12611,6 +12763,7 @@ impl Model {
                 &mb.weights,
                 &b.x,
                 router_buf,
+                moe.usage.counts(),
                 1,
                 hidden,
                 moe.n_experts,
@@ -12638,6 +12791,7 @@ impl Model {
             &mb.weights,
             &b.x,
             router_buf,
+            moe.usage.counts(),
             1,
             hidden,
             moe.n_experts,
@@ -12710,29 +12864,11 @@ impl Model {
         let b = &self.bufs;
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
         for j in 0..k {
-            self.gemv_rows_gidx(
-                &b.gate,
-                &moe.gate_exps,
-                x_in,
-                &mb.ids,
-                j,
-                inter,
-                inter,
-                stream,
-            )?;
-            self.gemv_rows_gidx(&b.up, &moe.up_exps, x_in, &mb.ids, j, inter, inter, stream)?;
+            self.gemv_rows_gidx(&b.gate, &moe.gate_exps, x_in, &mb.ids, j, inter, stream)?;
+            self.gemv_rows_gidx(&b.up, &moe.up_exps, x_in, &mb.ids, j, inter, stream)?;
             self.kernels
                 .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
-            self.gemv_rows_gidx(
-                &mb.tmp,
-                &moe.down_exps,
-                &b.act,
-                &mb.ids,
-                j,
-                hidden,
-                hidden,
-                stream,
-            )?;
+            self.gemv_rows_gidx(&mb.tmp, &moe.down_exps, &b.act, &mb.ids, j, hidden, stream)?;
             self.kernels.moe_scale_add_gidx_f16(
                 out,
                 out_off,
@@ -12810,11 +12946,11 @@ impl Model {
                     "router selected out-of-range expert {e}"
                 )));
             }
-            self.gemv_rows(&b.gate, &moe.gate_exps, x_in, e * inter, inter, stream)?;
-            self.gemv_rows(&b.up, &moe.up_exps, x_in, e * inter, inter, stream)?;
+            self.gemv_rows(&b.gate, moe.gate_exps.expert(e)?, x_in, 0, inter, stream)?;
+            self.gemv_rows(&b.up, moe.up_exps.expert(e)?, x_in, 0, inter, stream)?;
             self.kernels
                 .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
-            self.gemv_rows(&mb.tmp, &moe.down_exps, &b.act, e * hidden, hidden, stream)?;
+            self.gemv_rows(&mb.tmp, moe.down_exps.expert(e)?, &b.act, 0, hidden, stream)?;
             self.kernels
                 .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, wt, j == 0, stream)?;
         }
@@ -12877,6 +13013,7 @@ impl Model {
             &mb.weights,
             &pb.x,
             router_buf,
+            moe.usage.counts(),
             t,
             hidden,
             moe.n_experts,

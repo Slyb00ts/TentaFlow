@@ -137,6 +137,7 @@ fn batched_reproduces_golden() {
         dev,
         path,
         ModelConfig {
+            weight_host_budget: 0,
             kv_page_size,
             kv_pages,
             max_seq_len: 4096,
@@ -367,6 +368,7 @@ fn scheduler_prefill_p1024_o256_b1_b4_b8_b16() {
         dev,
         path,
         ModelConfig {
+            weight_host_budget: 0,
             kv_page_size,
             kv_pages,
             max_seq_len: 4096,

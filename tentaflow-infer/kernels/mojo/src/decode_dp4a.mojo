@@ -618,20 +618,23 @@ def gemv_q4_k_dp4a_f16(
 
 def gemv_q4_k_dp4a_f16_gidx(
     y: UnsafePointer[Float16, MutAnyOrigin],
-    w: UnsafePointer[UInt8, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
     ids: UnsafePointer[Int32, MutAnyOrigin],
     sel: Int,
-    rows_per_expert: Int,
 ):
     """Routed-MoE Q4_K expert GEMV: identical dp4a math to gemv_q4_k_dp4a_f16,
-    but the expert row window is read ON DEVICE from `ids[sel]` (no host
-    readback of the router selection). The global weight row is
-    `ids[sel] * rows_per_expert + local_row`; `y[local_row]` is written, so the
-    result is bit-identical to launching gemv_q4_k_dp4a_f16 against the same
-    expert's byte-offset row window."""
+    but the expert is chosen ON DEVICE from `ids[sel]` (no host readback of the
+    router selection).
+
+    `wtab[e]` is expert `e`'s own weight base pointer, so experts need not be
+    contiguous: each may live in VRAM or in pinned host memory, and the
+    residency manager can move one without touching the others. The load is
+    uniform across the block, so the indirection costs a single dependent
+    fetch. Bit-identical to gemv_q4_k_dp4a_f16 launched against that expert's
+    block."""
     tid = Int(thread_idx.x)
     xq = stack_allocation[
         X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
@@ -645,8 +648,8 @@ def gemv_q4_k_dp4a_f16_gidx(
     lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
     if lrow >= n_rows:
         return
-    grow = Int(ids[sel]) * rows_per_expert + lrow
-    total = _dot_q4k_i8(w, grow, xq, xds, n_cols, lane)
+    w = wtab[Int(ids[sel])]
+    total = _dot_q4k_i8(w, lrow, xq, xds, n_cols, lane)
     if lane == 0:
         y[lrow] = Float16(total)
 

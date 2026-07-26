@@ -408,26 +408,26 @@ def gemv_q6_k_f16_v2(
 
 def gemv_q6_k_f16_gidx(
     y: UnsafePointer[Float16, MutAnyOrigin],
-    w: UnsafePointer[UInt8, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
     ids: UnsafePointer[Int32, MutAnyOrigin],
     sel: Int,
-    rows_per_expert: Int,
 ):
     """Routed-MoE Q6_K expert GEMV: identical math to gemv_q6_k_f16_v2 but the
-    expert row window is read ON DEVICE from `ids[sel]` (no host readback). The
-    global weight row is `ids[sel] * rows_per_expert + local_row`; `y[local_row]`
-    is written, so the result is bit-identical to launching gemv_q6_k_f16_v2 at
-    the same expert's byte offset."""
+    expert is chosen ON DEVICE from `ids[sel]` (no host readback).
+
+    `wtab[e]` is expert `e`'s own weight base pointer, so experts need not be
+    contiguous and each may sit in VRAM or pinned host memory independently.
+    Bit-identical to gemv_q6_k_f16_v2 launched against that expert's block."""
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP
     lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
     if lrow >= n_rows:
         return
-    grow = Int(ids[sel]) * rows_per_expert + lrow
-    total = warp.sum(_gemv_q6_k_row_acc(w, x, n_cols, grow, lane))
+    w = wtab[Int(ids[sel])]
+    total = warp.sum(_gemv_q6_k_row_acc(w, x, n_cols, lrow, lane))
     if lane == 0:
         y[lrow] = Float16(total)
 

@@ -529,6 +529,10 @@ mod tests {
             self.inner.alloc(bytes, kind, pool)
         }
 
+        fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer> {
+            self.inner.sub_buffer(parent, offset, len)
+        }
+
         fn pool_available(&self, pool: Pool) -> Option<usize> {
             self.inner.pool_available(pool)
         }

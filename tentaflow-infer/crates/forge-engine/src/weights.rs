@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::moe_residency::{ExpertStack, ExpertUsage};
 use crate::mtp::{MtpEmbedding, MtpTensorLoader, MtpWeights};
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
@@ -294,6 +295,37 @@ impl DevWeight {
         NvFp4CtRowWindow::new(data, *physical_rows, *cols, row_offset, rows)
     }
 
+    /// Jedyny bufor bajtów wagi. `None` dla formatów trzymających kilka
+    /// buforów (compressed-tensors NVFP4 ma osobne pakiety i skale), które nie
+    /// dają się opisać jednym wskaźnikiem bazowym.
+    pub fn buffer(&self) -> Option<&DevBuffer> {
+        match self {
+            DevWeight::F16 { buf, .. }
+            | DevWeight::Q8_0 { buf, .. }
+            | DevWeight::Q4K { buf, .. }
+            | DevWeight::Q6K { buf, .. }
+            | DevWeight::Q5K { buf, .. }
+            | DevWeight::Q3K { buf, .. }
+            | DevWeight::Q2K { buf, .. }
+            | DevWeight::Q4_0 { buf, .. }
+            | DevWeight::Q4_1 { buf, .. }
+            | DevWeight::Q5_0 { buf, .. }
+            | DevWeight::Q5_1 { buf, .. }
+            | DevWeight::Iq4Nl { buf, .. }
+            | DevWeight::Iq4Xs { buf, .. }
+            | DevWeight::Mxfp4 { buf, .. }
+            | DevWeight::Iq2Xs { buf, .. }
+            | DevWeight::Iq2S { buf, .. }
+            | DevWeight::Iq3S { buf, .. }
+            | DevWeight::Iq2Xxs { buf, .. }
+            | DevWeight::Iq3Xxs { buf, .. }
+            | DevWeight::Iq1S { buf, .. }
+            | DevWeight::Iq1M { buf, .. }
+            | DevWeight::NvFp4Gguf { buf, .. } => Some(buf),
+            DevWeight::NvFp4 { .. } => None,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             DevWeight::F16 { rows, .. }
@@ -505,10 +537,10 @@ pub struct MoeFfn {
     /// logits fed to the top-k softmax.
     pub router: DevWeight,
     /// Stacked expert gate/up projections, [n_experts*moe_inter, hidden].
-    pub gate_exps: DevWeight,
-    pub up_exps: DevWeight,
+    pub gate_exps: ExpertStack,
+    pub up_exps: ExpertStack,
     /// Stacked expert down projection, [n_experts*hidden, moe_inter].
-    pub down_exps: DevWeight,
+    pub down_exps: ExpertStack,
     /// Shared always-on expert (Qwen-MoE / DeepSeek), added to every token.
     pub shared: Option<DenseFfn>,
     /// Per-token sigmoid gate on the shared expert (qwen35moe
@@ -520,6 +552,8 @@ pub struct MoeFfn {
     pub moe_inter: usize,
     /// Renormalize the top-k routing weights to sum 1.
     pub norm_topk: bool,
+    /// Liczniki wyboru ekspertów tej warstwy — źródło danych dla rezydencji.
+    pub usage: ExpertUsage,
 }
 
 /// Gated-DeltaNet (linear-attention) layer weights (qwen35moe hybrid stack).
@@ -1773,6 +1807,58 @@ fn fetch_expert_stack(src: &dyn TensorSource, name: &str) -> Result<HostWeight> 
     quant_host_weight(name, data, dtype, quant, n_expert * a, b, 1.0)
 }
 
+/// Wgrywa sklejony stos ekspertów jako `n_experts` osobnych wag — po jednej na
+/// eksperta. Każda dostaje własną alokację, więc urządzenie warstwowe może
+/// umieścić część w VRAM, a część w przypiętej pamięci hosta, i każdy ekspert
+/// może później wędrować niezależnie od pozostałych.
+fn upload_expert_stack(
+    device: &dyn Device,
+    stack: HostWeight,
+    n_experts: usize,
+) -> Result<ExpertStack> {
+    macro_rules! split_stack {
+        ($stack:expr, $($variant:ident),+ $(,)?) => {
+            match $stack {
+                $(HostWeight::$variant { data, rows, cols } => {
+                    let (rows_per_expert, bytes_per_expert) =
+                        expert_slice_shape(rows, data.len(), n_experts)?;
+                    let mut experts = Vec::with_capacity(n_experts);
+                    for e in 0..n_experts {
+                        experts.push(DevWeight::$variant {
+                            buf: upload(device, &data[e * bytes_per_expert..(e + 1) * bytes_per_expert])?,
+                            rows: rows_per_expert,
+                            cols,
+                        });
+                    }
+                    (experts, rows_per_expert, cols)
+                })+
+                other => {
+                    return Err(ForgeError::Unsupported(format!(
+                        "routed MoE experts in {:?} are not splittable per expert",
+                        std::mem::discriminant(&other)
+                    )))
+                }
+            }
+        };
+    }
+    let (experts, rows_per_expert, cols) = split_stack!(
+        stack, F16, Q8_0, Q4K, Q6K, Q5K, Q3K, Q2K, Q4_0, Q4_1, Q5_0, Q5_1, Iq4Nl, Iq4Xs, Mxfp4,
+        Iq2Xs, Iq2S, Iq3S, Iq2Xxs, Iq3Xxs, Iq1S, Iq1M,
+    );
+    ExpertStack::upload(device, experts, rows_per_expert, cols)
+}
+
+/// Wiersze i bajty przypadające na jednego eksperta; obie wielkości muszą
+/// dzielić się bez reszty, inaczej stos nie jest jednorodny.
+fn expert_slice_shape(rows: usize, bytes: usize, n_experts: usize) -> Result<(usize, usize)> {
+    if n_experts == 0 || !rows.is_multiple_of(n_experts) || !bytes.is_multiple_of(n_experts) {
+        return Err(ForgeError::Format(format!(
+            "expert stack of {rows} rows / {bytes} B does not split into {n_experts} experts"
+        )));
+    }
+    Ok((rows / n_experts, bytes / n_experts))
+}
+
 /// Upload a host matrix as-is.
 fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
     match w {
@@ -2793,15 +2879,16 @@ impl ModelWeights {
                     };
                     LayerFfn::Moe(Box::new(MoeFfn {
                         router,
-                        gate_exps: upload_weight(device, gate_exps)?,
-                        up_exps: upload_weight(device, up_exps)?,
-                        down_exps: upload_weight(device, down_exps)?,
+                        gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts)?,
+                        up_exps: upload_expert_stack(device, up_exps, moe.n_experts)?,
+                        down_exps: upload_expert_stack(device, down_exps, moe.n_experts)?,
                         shared,
                         shared_gate: None,
                         n_experts: moe.n_experts,
                         n_experts_used: moe.n_experts_used,
                         moe_inter: moe.moe_intermediate_size,
                         norm_topk: moe.norm_topk_prob,
+                        usage: ExpertUsage::new(device, moe.n_experts)?,
                     }))
                 }
             };
@@ -3061,9 +3148,9 @@ impl ModelWeights {
 
                 LayerFfn::Moe(Box::new(MoeFfn {
                     router,
-                    gate_exps: upload_weight(device, gate_exps)?,
-                    up_exps: upload_weight(device, up_exps)?,
-                    down_exps: upload_weight(device, down_exps)?,
+                    gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts)?,
+                    up_exps: upload_expert_stack(device, up_exps, moe.n_experts)?,
+                    down_exps: upload_expert_stack(device, down_exps, moe.n_experts)?,
                     shared: Some(DenseFfn {
                         gate_up: GateUpWeights::Split {
                             gate: sh_gate,
@@ -3076,6 +3163,7 @@ impl ModelWeights {
                     n_experts_used: moe.n_experts_used,
                     moe_inter: moe.moe_intermediate_size,
                     norm_topk: moe.norm_topk_prob,
+                    usage: ExpertUsage::new(device, moe.n_experts)?,
                 }))
             } else {
                 let gate = upload_target_weight(

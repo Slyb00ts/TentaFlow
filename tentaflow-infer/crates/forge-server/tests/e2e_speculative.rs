@@ -72,6 +72,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
         dev,
         &path,
         ModelConfig {
+            weight_host_budget: 0,
             kv_page_size,
             kv_pages,
             max_seq_len: 4096,

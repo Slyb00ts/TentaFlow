@@ -69,6 +69,7 @@ async fn api_surface_end_to_end() {
                 dev,
                 &load_path,
                 ModelConfig {
+                    weight_host_budget: 0,
                     kv_page_size,
                     kv_pages,
                     max_seq_len: 4096,

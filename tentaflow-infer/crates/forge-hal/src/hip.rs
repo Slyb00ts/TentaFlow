@@ -49,10 +49,13 @@ extern "C" {
     fn hipHostFree(ptr: *mut c_void) -> c_int;
     fn hipMemcpyHtoD(dst: *mut c_void, src: *const c_void, size: usize) -> c_int;
     fn hipMemcpyDtoH(dst: *mut c_void, src: *const c_void, size: usize) -> c_int;
-    fn hipMemcpyDtoDAsync(
+    /// Kierunek rozpoznawany z adresow (UVA) — jedyny wariant poprawny, gdy
+    /// jednym z buforow jest przypieta pamiec hosta.
+    fn hipMemcpyAsync(
         dst: *mut c_void,
         src: *const c_void,
         size: usize,
+        kind: c_int,
         stream: HipStreamRaw,
     ) -> c_int;
     fn hipStreamCreate(stream: *mut HipStreamRaw) -> c_int;
@@ -107,6 +110,8 @@ const HIP_ERROR_NOT_READY: c_int = 34;
 const HIP_EVENT_DISABLE_TIMING: c_uint = 2;
 /// `hipStreamCaptureModeGlobal` — ta sama semantyka co przechwytywanie CUDA.
 const HIP_CAPTURE_MODE_GLOBAL: c_uint = 0;
+/// `hipMemcpyDefault` — kierunek wyprowadzany z adresow.
+const HIP_MEMCPY_DEFAULT: c_int = 4;
 
 /// Zamienia kod HIP na `ForgeError` z komunikatem ze sterownika.
 fn check(status: c_int, what: &str) -> Result<()> {
@@ -702,14 +707,15 @@ impl Device for HipDevice {
         }
         check(
             unsafe {
-                hipMemcpyDtoDAsync(
+                hipMemcpyAsync(
                     target.ptr.add(dst_offset),
                     source.ptr.add(src_offset) as *const c_void,
                     bytes,
+                    HIP_MEMCPY_DEFAULT,
                     stream.0,
                 )
             },
-            "hipMemcpyDtoDAsync",
+            "hipMemcpyAsync",
         )
     }
 
