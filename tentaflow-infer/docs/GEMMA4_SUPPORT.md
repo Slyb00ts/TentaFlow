@@ -115,28 +115,79 @@ przy 176 (referencja liczy w f32 na CPU).
    wysokie logity tokenom `<image|>`/`<audio|>` i bez maski greedy wybierał je
    jako pierwszy token (llama.cpp wstawia tę maskę jako wejście grafu).
 
-### Wydajność (RTX brak, RX 6900 XT, pp1024/tg128)
+### Wydajność (RX 6900 XT, gfx1030)
 
-| silnik | prefill tok/s | decode tok/s |
+| pomiar | llama.cpp ff067f76 (ROCm) | FORGE | luka |
+|---|---:|---:|---:|
+| prefill pp1024 | 1449,1 tok/s | 1287,9 tok/s | -11,1% |
+| decode tg128 (ctx 1024) | 52,4 tok/s | 38,5 tok/s | -26,5% |
+
+Cel „prefill znacznie powyżej llama.cpp, decode co najmniej na równi" NIE jest
+osiągnięty. Poniżej jest zmierzone rozliczenie czasu i to, co realnie stoi na
+drodze — bez tego dalsza optymalizacja jest zgadywaniem.
+
+#### Gdzie idzie prefill (T=1024, `FORGE_PREFILL_TRACE=1`)
+
+| faza | ms | udział |
 |---|---:|---:|
-| llama.cpp (ff067f76, ROCm) | 1449,1 | 52,4 |
-| FORGE | 1278,4 | 38,5 |
+| gate/up | 309,3 | 39,2% |
+| down | 182,2 | 23,1% |
+| uwaga | 110,7 | 14,0% |
+| qkv | 105,9 | 13,4% |
+| projekcja o | 52,2 | 6,6% |
+| pozostałe (normy, rope, kv_append) | 29,3 | 3,7% |
 
-FORGE jest 11,8% za llama.cpp na prefillu i 27% na dekodowaniu. Optymalizacja tej
-architektury nie została jeszcze zrobiona: profil nie był robiony, a scalanie QKV
-jest dla niej wyłączone (fused `qkv_post` zapieka jedną geometrię i jedną podstawę
-rope). Osobny pomiar pokazał, że sam brak scalania QKV to ułamek procenta czasu
-prefillu, więc luka leży w kernelach GEMM/uwagi.
+#### Dlaczego GEMM stoi na 41 TOPS z 92 TOPS `v_dot4_i32_i8`
+
+Zliczenie ISA (`llvm-objdump` na `gemm_q4_0_dot4_128x128.hsaco`): **512
+`v_dot4_i32_i8` na 1133 instrukcje wektorowe**, czyli 45% szczeliny wydania —
+dokładnie tyle, ile wychodzi z pomiaru. Rozkład reszty: 192 operacje epilogu
+(`cvt` + `mul` + `fma` na wyjście na każdy 32-kolumnowy blok skali Q4_0), 48
+`ds_read_b128`, około 150 na adresowanie, `v_mov` i maski `exec`.
+
+Epilog jest **strukturalny**: Q4_0 ma jedną skalę na 32 wartości, a skala wagi i
+aktywacji różnią się per blok, więc trzeba go zastosować co 8 `dot4` na wyjście.
+To daje 3/8 = 37,5% narzutu niezależnie od rozmiaru kafla, czyli sufit ~63 TOPS.
+llama.cpp osiąga na tym samym pułapie około 46 TOPS (73% sufitu), my 41 (65%).
+
+#### Co sprawdzone i odrzucone pomiarem
+
+| hipoteza | wynik |
+|---|---|
+| potokowanie odczytów przez rejestry (podwójny bufor LDS) | +7-18% na wąskim N, -2% na gate/up; razem ~1,6% prefillu — usunięte, nie warte drugiej implementacji |
+| większe kafle rejestrowe (128x128 TN8, 256x128, 128x256) | 2,2-2,7x gorsze (spadek zajętości) |
+| usunięcie warunków zakresu w czasie kompilacji | bez zmian |
+| `v_dot2_f32_f16` w iloczynie Q·K uwagi | +1,1% prefillu; uwaga 112,4 -> 110,7 ms, czyli QK jest ograniczony LDS, nie operacjami wektorowymi |
+| rozwinięcie pętli pozycji w uwadze decode (4 pozycje) | 0% przy ctx 1024 i **-6,8% przy ctx 2048** (64 dodatkowe VGPR-y zabijają zajętość) — cofnięte |
+
+Zmiana `dot2` została zachowana (jedyna z dodatnim wynikiem), reszta cofnięta.
+
+#### Rozliczenie decode
+
+Skalowanie z długością kontekstu (prompt 128/1024/2048): 49,7 / 38,5 / 36,9 tok/s.
+Z różnicy między ctx 128 i 1024 wychodzi koszt brzegowy 5,9 ms na token za około
+309 MB dodatkowych odczytów KV, czyli **52 GB/s**. Same wagi idą przy tym z
+**362 GB/s** (6,96 GB w 19,2 ms), co jest blisko 358 GB/s liczonych dla
+llama.cpp. Wniosek: ścieżka GEMV wag jest w porządku, a cały dystans na decode
+siedzi w odczytach cache KV przy jednej sekwencji. Rozwinięcie pętli tego nie
+naprawiło, więc przyczyna nie jest samą latencją; następny krok wymaga
+profilera (`rocprofiler` nie jest zainstalowany, potrzebny root).
 
 ### Znane braki poza ścieżką Gemmy
 
-`gemm_q6_k_f16` daje na gfx1030 błąd do 46% na części wierszy (test
-`golden::gemm_q6_k_matches_formats_dequant` jest czerwony). Gemma go nie używa
-(głowa logitów idzie przez GEMV), ale modele z wagami Q6_K w prefillu będą na
-AMD liczyć źle. 22 testy golden GEMM okazały się wcześniej po cichu pomijane na
-AMD (otwierały wprost urządzenie CUDA); teraz `golden.rs` używa wspólnego
-selektora backendu, a kernele nieskompilowane dla danej architektury są jawnie
-raportowane jako pominięte.
+`gemm_q6_k_f16` na gfx1030 NIE jest zepsuty — sprawdzone. Wcześniejszy błąd do
+46% brał się z referencji testu: ścieżka AMD kwantyzuje aktywacje do int8 (q8_1,
+skala na 32 kolumny), a referencja mnożyła wagi przez aktywacje f32. Przy
+syntetycznych wagach Q6_K o dużej amplitudzie (`sc` do ±127) i kasowaniu
+składników daje to dziesiątki procent. Z referencją świadomą tej kwantyzacji
+kernel ma błąd 5e-4 na wszystkich sprawdzonych kształtach, a `Kernels`
+udostępnia `int8_batch_activations()`, żeby testy wybierały właściwy kontrakt.
+
+22 testy golden GEMM okazały się wcześniej po cichu pomijane na AMD (otwierały
+wprost urządzenie CUDA i raportowały „ok" bez pokrycia). Teraz `golden.rs` używa
+wspólnego selektora backendu, kernele nieskompilowane dla danej architektury są
+jawnie raportowane jako pominięte, a cały zestaw kerneli to **161 testów, 0
+błędów** na gfx1030 przy progu 2%.
 
 ## Poprzednie notatki
 
