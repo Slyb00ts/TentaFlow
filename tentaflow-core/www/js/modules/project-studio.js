@@ -209,7 +209,7 @@ const state = {
   kbHits: null,
   kbSearching: false,
   kbError: '',
-  files: { sourceId: null, offset: 0, filter: '', rows: [], total: 0 },
+  files: { sourceId: null, offset: 0, filter: '', rows: [], total: 0, mode: 'tree' },
   // Chat
   chats: [],
   chatId: null,
@@ -2668,6 +2668,12 @@ async function renderFilesView() {
 
   host.innerHTML = `
     <tf-section-card title="${escapeAttr(t('files_title'))}" icon="file-text">
+      <span slot="actions">
+        <tf-segmented id="ps-files-mode" value="${escapeAttr(state.files.mode)}">
+          <option value="tree" icon="folder">${escapeHtml(t('files_mode_tree'))}</option>
+          <option value="table" icon="list">${escapeHtml(t('files_mode_table'))}</option>
+        </tf-segmented>
+      </span>
       <div class="ps-files-toolbar">
         <tf-select id="ps-files-source" value="${escapeAttr(state.files.sourceId || '')}">
           ${state.sources.map((s) => {
@@ -2685,6 +2691,11 @@ async function renderFilesView() {
       </div>
     </tf-section-card>
   `;
+
+  byId('ps-files-mode')?.addEventListener('change', (e) => {
+    state.files.mode = e.detail?.value === 'table' ? 'table' : 'tree';
+    renderFilesTable();
+  });
 
   byId('ps-files-source')?.addEventListener('change', (e) => {
     state.files.sourceId = e.detail?.value ?? e.target.value;
@@ -2732,6 +2743,115 @@ async function loadFilesPage() {
   renderFilesTable();
 }
 
+// Files arrive as a flat list of paths; the tree view (mockup W04) folds them
+// into directories so a repository source is navigable.
+function buildFileTree(rows) {
+  const root = { children: new Map(), files: [] };
+  for (const f of rows) {
+    const parts = String(f.path || '').split('/').filter(Boolean);
+    const name = parts.pop() || String(f.path || '');
+    let node = root;
+    for (const dir of parts) {
+      if (!node.children.has(dir)) node.children.set(dir, { children: new Map(), files: [] });
+      node = node.children.get(dir);
+    }
+    node.files.push({ name, file: f });
+  }
+  const toNodes = (node, prefix) => {
+    const dirs = [...node.children.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([name, child]) => ({
+        id: `dir:${prefix}${name}`,
+        label: name,
+        icon: 'folder',
+        children: toNodes(child, `${prefix}${name}/`),
+      }));
+    const files = node.files
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(({ name, file }) => ({
+        id: `file:${file.file_id ?? file.fileId}`,
+        label: name,
+        icon: 'file-text',
+      }));
+    return [...dirs, ...files];
+  };
+  return toNodes(root, '');
+}
+
+function renderFilesTree(host) {
+  host.innerHTML = `
+    <div class="ps-files-split">
+      <div class="ps-files-tree"><tf-tree id="ps-files-tree" selectable></tf-tree></div>
+      <div class="ps-files-preview" id="ps-files-preview">
+        <div class="ps-field-hint">${escapeHtml(t('files_pick_hint'))}</div>
+      </div>
+    </div>
+  `;
+  const tree = byId('ps-files-tree');
+  tree.nodes = buildFileTree(state.files.rows);
+  tree.addEventListener('select', (e) => {
+    const id = String(e.detail?.id || '');
+    if (!id.startsWith('file:')) return;
+    renderFilePreviewPane(id.slice(5));
+  });
+}
+
+async function renderFilePreviewPane(fileId) {
+  const pane = byId('ps-files-preview');
+  if (!pane) return;
+  const file = state.files.rows.find((f) => (f.file_id ?? f.fileId) === fileId);
+  if (!file) return;
+  pane.innerHTML = `<div class="ps-loading"><tf-spinner size="sm"></tf-spinner> ${escapeHtml(t('loading'))}</div>`;
+  let content = '';
+  let truncated = false;
+  try {
+    const resp = await ApiBinary.one('projectStudioSourceFilePreviewRequest', {
+      projectId: projectId(), fileId, maxBytes: 256 * 1024,
+    });
+    content = String(resp.content ?? '');
+    truncated = !!resp.truncated;
+  } catch (err) {
+    pane.innerHTML = `<div class="ps-form-error">${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  if (byId('ps-files-preview') !== pane) return;
+
+  pane.innerHTML = `
+    <div class="ps-files-preview-head">
+      <div>
+        <div class="ps-files-preview-path">${escapeHtml(file.path)}</div>
+        <div class="ps-files-preview-meta">
+          ${escapeHtml(t('files_chunk_count', { count: file.chunk_count ?? file.chunkCount ?? 0 }))}
+          · ${escapeHtml(formatBytes(Number(file.size_bytes ?? file.sizeBytes ?? 0)))}
+          · ${escapeHtml(formatTimestamp(file.updated_at ?? file.updatedAt))}
+        </div>
+      </div>
+      <tf-chip status="${FILE_STATUS_CHIP[file.status] || 'info'}">${escapeHtml(t(`file_status_${file.status}`))}</tf-chip>
+      <span class="ps-toolbar-spacer"></span>
+      <tf-button variant="ghost" size="sm" icon="copy" id="ps-files-copy-path">${escapeHtml(t('files_copy_path'))}</tf-button>
+      ${canEdit() ? `<tf-button variant="ghost" size="sm" icon="trash" id="ps-files-remove">${escapeHtml(t('files_remove_from_index'))}</tf-button>` : ''}
+    </div>
+    ${truncated ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('preview_truncated'))}</span></div>` : ''}
+    <tf-code-editor id="ps-files-code" language="${escapeAttr(codeLanguageFor(file.path))}" readonly></tf-code-editor>
+  `;
+  const editor = byId('ps-files-code');
+  if (editor) editor.value = content;
+  byId('ps-files-copy-path')?.addEventListener('click', () => {
+    navigator.clipboard?.writeText(file.path);
+    toast(t('files_path_copied'), 'success');
+  });
+  byId('ps-files-remove')?.addEventListener('click', () => confirmDeleteFile({ _id: fileId, path: file.path }));
+}
+
+function codeLanguageFor(path) {
+  const ext = String(path || '').split('.').pop().toLowerCase();
+  return {
+    js: 'javascript', mjs: 'javascript', ts: 'typescript', tsx: 'typescript',
+    py: 'python', rs: 'rust', json: 'json', yaml: 'yaml', yml: 'yaml',
+    md: 'markdown', html: 'html', css: 'css', sql: 'sql', sh: 'bash',
+  }[ext] || 'text';
+}
+
 function renderFilesTable() {
   const tableHost = byId('ps-files-table-host');
   if (!tableHost) return;
@@ -2739,6 +2859,11 @@ function renderFilesTable() {
     tableHost.innerHTML = `<tf-empty-state icon="file-text" title="${escapeAttr(t('files_empty'))}"></tf-empty-state>`;
     const emptyPager = byId('ps-files-pager');
     if (emptyPager) emptyPager.hidden = true;
+    return;
+  }
+  if (state.files.mode === 'tree') {
+    renderFilesTree(tableHost);
+    updateFilesPager();
     return;
   }
   tableHost.innerHTML = `
@@ -2789,14 +2914,17 @@ function renderFilesTable() {
     if (id) openFilePreview(id);
   });
 
+  updateFilesPager();
+}
+
+function updateFilesPager() {
   const pager = byId('ps-files-pager');
-  if (pager) {
-    pager.hidden = state.files.total <= FILES_PAGE_SIZE;
-    const from = state.files.offset + 1;
-    const to = Math.min(state.files.offset + state.files.rows.length, state.files.total);
-    const range = byId('ps-files-range');
-    if (range) range.textContent = t('files_range', { from, to, total: state.files.total });
-  }
+  if (!pager) return;
+  pager.hidden = state.files.total <= FILES_PAGE_SIZE;
+  const from = state.files.offset + 1;
+  const to = Math.min(state.files.offset + state.files.rows.length, state.files.total);
+  const range = byId('ps-files-range');
+  if (range) range.textContent = t('files_range', { from, to, total: state.files.total });
 }
 
 function confirmDeleteFile(row) {
@@ -4183,8 +4311,9 @@ async function renderCasesView() {
         ${selectOpt('user', flt.origin, t('origin_user'))}
         ${selectOpt('agent', flt.origin, t('origin_agent'))}
       </tf-select>
-      <span class="ps-toolbar-spacer"></span>
-      ${canEdit() ? `
+    </div>
+    ${canEdit() ? `
+      <div class="ps-tests-toolbar ps-cases-actions">
         <tf-button variant="ghost" icon="download" id="ps-cases-import">${escapeHtml(t('cases_import_csv'))}</tf-button>
         <tf-button variant="ghost" icon="sparkle" id="ps-cases-generate">${escapeHtml(t('cases_generate'))}</tf-button>
         <span class="ps-new-case-wrap">
@@ -4193,8 +4322,8 @@ async function renderCasesView() {
             ${CASE_KINDS.map((k) => `<tf-menu-item action="${k}" icon="${k === 'manual' ? 'list' : 'code'}">${escapeHtml(t(`case_kind_${k}`))}</tf-menu-item>`).join('')}
           </tf-menu>
         </span>
-      ` : ''}
-    </div>
+      </div>
+    ` : ''}
     <div class="ps-bulk-bar" id="ps-cases-bulk" hidden>
       <span class="ps-bulk-count" id="ps-cases-bulk-count"></span>
       ${canEdit() ? `<tf-button variant="ghost" size="sm" icon="send" data-bulk="review">${escapeHtml(t('bulk_to_review'))}</tf-button>` : ''}
@@ -4248,11 +4377,12 @@ function renderCasesTable() {
   tableHost.innerHTML = `
     <tf-table id="ps-cases-table" selectable="multi" sortable page-size="${F2_PAGE_SIZE}" total="${s.cases.total}" page="${s.cases.page}">
       <tf-column key="sel" label=""></tf-column>
-      <tf-column key="title" label="${escapeAttr(t('cases_col_title'))}" sortable></tf-column>
+      <tf-column key="title" label="${escapeAttr(t('cases_col_title'))}" renderer="html" sortable></tf-column>
       <tf-column key="kind" label="${escapeAttr(t('cases_col_kind'))}" renderer="chip"></tf-column>
       <tf-column key="priority" label="${escapeAttr(t('cases_col_priority'))}" renderer="chip"></tf-column>
       <tf-column key="tags" label="${escapeAttr(t('cases_col_tags'))}"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('cases_col_status'))}" renderer="chip"></tf-column>
+      <tf-column key="author" label="${escapeAttr(t('cases_col_author'))}"></tf-column>
       <tf-column key="origin" label="${escapeAttr(t('cases_col_origin'))}" renderer="chip"></tf-column>
       <tf-column key="lastResult" label="${escapeAttr(t('cases_col_last_result'))}" renderer="chip"></tf-column>
       <tf-column key="updated" label="${escapeAttr(t('cases_col_updated'))}" sortable></tf-column>
@@ -4267,13 +4397,15 @@ function renderCasesTable() {
         _id: caseId,
         _row: c,
         sel: s.cases.selected.has(caseId) ? '✓' : '',
-        title: c.title,
+        title: `<div class="tf-table__cell-title">${escapeHtml(c.title)}</div>`
+          + `<div class="tf-table__cell-sub">${escapeHtml(shortId(caseId))}</div>`,
         kind: chipCell('info', t(`case_kind_${c.kind}`)),
         priority: chipCell(PRIORITY_CHIP[c.priority], t(`prio_${c.priority}`)),
         tags: (fv(c, 'tag_ids') || []).map(tagNameById).filter(Boolean).join(', ') || '—',
         status: chipCell(CASE_STATUS_CHIP[c.status], t(`case_status_${c.status}`)),
         // A <use> reference cannot resolve document symbols from inside the
         // table's shadow root, so this column carries a label, not an icon.
+        author: fv(c, 'created_by_name') || '—',
         origin: c.origin === 'agent'
           ? chipCell('accent', t('origin_agent'))
           : chipCell('info', t('origin_user')),
@@ -4329,8 +4461,27 @@ function renderCasesTable() {
     table.setAttribute('page', String(s.cases.page));
     table.setAttribute('total', String(s.cases.total));
     assignRows();
+    syncCasesFooter();
   });
+  syncCasesFooter();
   updateCasesBulkBar();
+}
+
+function syncCasesFooter() {
+  const s = f2();
+  const host = byId('ps-cases-table-host');
+  if (!host) return;
+  let footer = host.querySelector('.ps-table-footer');
+  if (!footer) {
+    footer = document.createElement('div');
+    footer.className = 'ps-table-footer';
+    host.appendChild(footer);
+  }
+  footer.textContent = t('cases_footer', {
+    shown: s.cases.rows.length,
+    total: s.cases.total,
+    selected: s.cases.selected.size,
+  });
 }
 
 function updateCasesBulkBar() {
