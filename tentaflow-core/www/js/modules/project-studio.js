@@ -206,6 +206,7 @@ const state = {
   kbSelectedSources: new Set(),
   kbHits: null,
   kbSearching: false,
+  kbError: '',
   files: { sourceId: null, offset: 0, filter: '', rows: [], total: 0 },
   // Chat
   chats: [],
@@ -251,7 +252,7 @@ function freshF2State() {
     editor: null,
     suites: [],
     suiteEditor: null,
-    runs: { rows: [], total: 0, page: 1, status: '' },
+    runs: { rows: [], total: 0, page: 1, status: '', type: '', filter: '' },
     runDetail: null,
     exec: null,
     gens: [],
@@ -1644,9 +1645,9 @@ async function renderKnowledge() {
   panel.innerHTML = `
     <div class="ps-subnav">
       <tf-segmented id="ps-kb-view" value="${escapeAttr(state.kbView)}">
-        <option value="sources">${escapeHtml(t('kb_view_sources'))}</option>
-        <option value="search">${escapeHtml(t('kb_view_search'))}</option>
-        <option value="files">${escapeHtml(t('kb_view_files'))}</option>
+        <option value="sources" icon="catalog">${escapeHtml(t('kb_view_sources'))}</option>
+        <option value="search" icon="search">${escapeHtml(t('kb_view_search'))}</option>
+        <option value="files" icon="file-text">${escapeHtml(t('kb_view_files'))}</option>
       </tf-segmented>
       <span class="ps-subnav-hint">${escapeHtml(t('kb_subnav_hint'))}</span>
     </div>
@@ -2475,11 +2476,12 @@ function renderKbSearch() {
   }
 
   byId('ps-kb-run')?.addEventListener('click', () => runKbSearch());
+  // tf-searchbox swallows Enter and emits its own "search" event, so the keydown
+  // handler alone never fired the query — pressing Enter looked like nothing
+  // happened at all.
   byId('ps-kb-query')?.addEventListener('search', (e) => {
     state.kbQuery = String(e.detail?.value ?? '');
-  });
-  byId('ps-kb-query')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') runKbSearch();
+    runKbSearch();
   });
 
   renderKbResults();
@@ -2505,6 +2507,7 @@ async function runKbSearch() {
   if (!query) return;
   state.kbQuery = query;
   state.kbSearching = true;
+  state.kbError = '';
   renderKbResults();
   try {
     const resp = await ApiBinary.one('projectStudioKbSearchRequest', {
@@ -2516,6 +2519,7 @@ async function runKbSearch() {
     state.kbHits = Array.isArray(resp.hits) ? resp.hits : [];
   } catch (err) {
     state.kbHits = null;
+    state.kbError = err.message;
     toast(`${t('kb_search_failed')}: ${err.message}`, 'error');
   } finally {
     state.kbSearching = false;
@@ -2549,6 +2553,10 @@ function renderKbResults() {
   if (!host) return;
   if (state.kbSearching) {
     host.innerHTML = `<div class="ps-loading"><tf-spinner size="sm"></tf-spinner> ${escapeHtml(t('kb_searching'))}</div>`;
+    return;
+  }
+  if (state.kbError) {
+    host.innerHTML = `<tf-empty-state icon="warning" title="${escapeAttr(t('kb_search_failed'))}" message="${escapeAttr(state.kbError)}"></tf-empty-state>`;
     return;
   }
   if (state.kbHits === null) {
@@ -3509,7 +3517,7 @@ async function renderSettings() {
       <tf-button variant="primary" icon="check" id="ps-set-save">${escapeHtml(t('settings_save'))}</tf-button>
     </tf-section-card>
 
-    <tf-section-card title="${escapeAttr(t('settings_modules_title'))}" icon="grid-2x2">
+    <tf-section-card title="${escapeAttr(t('settings_modules_title'))}" icon="grid-rows">
       <span slot="subtitle">${escapeHtml(t('settings_modules_hint'))}</span>
       <div id="ps-set-modules">
         ${MODULE_DEFS.map((mod) => `
@@ -3723,6 +3731,7 @@ const ITEM_STATUS_CHIP = {
 const GEN_STATUS_CHIP = { running: 'accent', review: 'warn', accepted: 'ok', rejected: 'err', failed: 'err', cancelled: 'info' };
 const TASK_STATUS_CHIP = { todo: 'info', in_progress: 'accent', review: 'warn', done: 'ok' };
 const CASE_KINDS = ['manual', 'ui', 'api', 'unit', 'perf', 'security'];
+const CASE_KIND_CHIP = { manual: 'neutral', ui: 'info', api: 'accent', unit: 'ok', perf: 'warn', security: 'err' };
 const PRIORITIES = ['low', 'medium', 'high', 'critical'];
 const TASK_STATUSES = ['todo', 'in_progress', 'review', 'done'];
 const NOTIF_KIND_ICON = {
@@ -3746,6 +3755,13 @@ function fv(obj, key) {
 
 function chipCell(status, label) {
   return { status: status || 'info', label };
+}
+
+// UUIDs are unreadable in dense lists; the first segment is enough to tell
+// two rows apart and matches how the mockups label cases (TC-118).
+function shortId(id) {
+  const s = String(id || '');
+  return s.length > 8 ? s.slice(0, 8) : s;
 }
 
 function caseStatusChipHtml(status) {
@@ -3929,6 +3945,16 @@ function attachmentRowHtml(att, index, { removable = false } = {}) {
 
 const TESTS_SEGMENTS = ['cases', 'suites', 'runs', 'generations', 'environments', 'schedules', 'reports'];
 
+const TESTS_SEG_ICON = {
+  cases: 'list',
+  suites: 'grid-rows',
+  runs: 'play',
+  generations: 'sparkle',
+  environments: 'host',
+  schedules: 'clock',
+  reports: 'bar-chart',
+};
+
 // Drill-in views highlight their parent segment in the sub-nav.
 function testsSegValue() {
   const view = f2().view;
@@ -3946,9 +3972,8 @@ async function renderTests() {
   panel.innerHTML = `
     <div class="ps-subnav">
       <tf-segmented id="ps-tests-seg" value="${escapeAttr(testsSegValue())}">
-        ${TESTS_SEGMENTS.map((seg) => `<option value="${seg}">${escapeHtml(t(`tests_seg_${seg}`))}</option>`).join('')}
+        ${TESTS_SEGMENTS.map((seg) => `<option value="${seg}" icon="${TESTS_SEG_ICON[seg]}">${escapeHtml(t(`tests_seg_${seg}`))}</option>`).join('')}
       </tf-segmented>
-      <span class="ps-subnav-hint">${escapeHtml(t('tests_subnav_hint'))}</span>
     </div>
     <div id="ps-tests-host"></div>
   `;
@@ -6583,19 +6608,54 @@ async function renderSuitesView() {
 
   host.innerHTML = `
     <div class="ps-tests-toolbar">
+      <tf-searchbox id="ps-suites-search" placeholder="${escapeAttr(t('suites_search_placeholder'))}" value="${escapeAttr(s.suitesFilter || '')}"></tf-searchbox>
+      <tf-select id="ps-suites-health" value="${escapeAttr(s.suitesHealth || 'all')}">
+        <option value="all">${escapeHtml(t('suites_health_all'))}</option>
+        <option value="ok">${escapeHtml(t('suites_health_ok'))}</option>
+        <option value="deprecated">${escapeHtml(t('suites_health_deprecated'))}</option>
+      </tf-select>
       <span class="ps-toolbar-spacer"></span>
       ${canEdit() ? `<tf-button variant="primary" icon="plus" id="ps-suites-new">${escapeHtml(t('suites_new'))}</tf-button>` : ''}
     </div>
-    <div id="ps-suites-table-host">
-      ${s.suites.length ? '' : `<tf-empty-state icon="grid-2x2" title="${escapeAttr(t('suites_empty'))}"></tf-empty-state>`}
-    </div>
+    <div id="ps-suites-table-host"></div>
   `;
   byId('ps-suites-new')?.addEventListener('click', () => openSuiteEditor(null));
-  if (!s.suites.length) return;
+  byId('ps-suites-search')?.addEventListener('input', (e) => {
+    s.suitesFilter = String(e.detail?.value ?? e.target.value ?? '');
+    renderSuitesTable();
+  });
+  byId('ps-suites-health')?.addEventListener('change', (e) => {
+    s.suitesHealth = e.detail?.value || 'all';
+    renderSuitesTable();
+  });
+  renderSuitesTable();
+}
 
-  byId('ps-suites-table-host').innerHTML = `
+function visibleSuites() {
+  const s = f2();
+  const needle = (s.suitesFilter || '').trim().toLowerCase();
+  const health = s.suitesHealth || 'all';
+  return s.suites.filter((suite) => {
+    if (needle && !`${suite.name} ${fv(suite, 'suite_id') || ''}`.toLowerCase().includes(needle)) return false;
+    if (health === 'ok' && fv(suite, 'has_deprecated')) return false;
+    if (health === 'deprecated' && !fv(suite, 'has_deprecated')) return false;
+    return true;
+  });
+}
+
+function renderSuitesTable() {
+  const s = f2();
+  const rows = visibleSuites();
+  const tableHost = byId('ps-suites-table-host');
+  if (!tableHost) return;
+  if (!rows.length) {
+    tableHost.innerHTML = `<tf-empty-state icon="grid-rows" title="${escapeAttr(s.suites.length ? t('suites_no_match') : t('suites_empty'))}"></tf-empty-state>`;
+    return;
+  }
+
+  tableHost.innerHTML = `
     <tf-table id="ps-suites-table">
-      <tf-column key="name" label="${escapeAttr(t('suites_col_name'))}"></tf-column>
+      <tf-column key="name" label="${escapeAttr(t('suites_col_name'))}" renderer="html"></tf-column>
       <tf-column key="cases" label="${escapeAttr(t('suites_col_cases'))}" renderer="num"></tf-column>
       <tf-column key="deprecated" label="${escapeAttr(t('suites_col_health'))}" renderer="chip"></tf-column>
       <tf-column key="lastRun" label="${escapeAttr(t('suites_col_last_run'))}"></tf-column>
@@ -6603,12 +6663,13 @@ async function renderSuitesView() {
     </tf-table>
   `;
   const table = byId('ps-suites-table');
-  table.rows = s.suites.map((suite) => {
+  table.rows = rows.map((suite) => {
     const lastRun = fv(suite, 'last_run');
     return {
       _id: fv(suite, 'suite_id'),
       _row: suite,
-      name: suite.name,
+      name: `<div class="tf-table__cell-title">${escapeHtml(suite.name)}</div>`
+        + `<div class="tf-table__cell-sub">${escapeHtml(shortId(fv(suite, 'suite_id')))}${suite.description ? ` · ${escapeHtml(suite.description)}` : ''}</div>`,
       cases: Number(fv(suite, 'case_count') ?? 0),
       deprecated: fv(suite, 'has_deprecated')
         ? chipCell('warn', t('suites_has_deprecated'))
@@ -6644,6 +6705,12 @@ async function renderSuitesView() {
     const suiteId = e.detail?.row?._id;
     if (suiteId) openSuiteEditor(suiteId);
   });
+
+  const assignments = rows.reduce((sum, suite) => sum + Number(fv(suite, 'case_count') ?? 0), 0);
+  const footer = document.createElement('div');
+  footer.className = 'ps-table-footer';
+  footer.textContent = t('suites_footer', { shown: rows.length, total: s.suites.length, assignments });
+  tableHost.appendChild(footer);
 }
 
 function deleteSuite(suite) {
@@ -6672,6 +6739,9 @@ async function openSuiteEditor(suiteId) {
     cases: [],
     pool: [],
     poolFilter: '',
+    poolKind: 'all',
+    poolSelected: new Set(),
+    memberFilter: '',
   };
   f2().view = 'suite-editor';
   await renderTestsView();
@@ -6707,26 +6777,41 @@ async function renderSuiteEditor() {
   const editable = canEdit();
 
   host.innerHTML = `
-    <div class="ps-editor-head">
-      <tf-button variant="ghost" icon="chevron-left" id="ps-suite-back">${escapeHtml(t('back_to_suites'))}</tf-button>
-      <div class="ps-editor-title">
-        <tf-input id="ps-suite-name" label="${escapeAttr(t('suite_name_label'))}" value="${escapeAttr(se.name)}" ${editable ? '' : 'readonly'}></tf-input>
+    <div class="ps-suite-head">
+      <div class="ps-suite-head-row">
+        <tf-button variant="ghost" icon="chevron-left" id="ps-suite-back">${escapeHtml(t('back_to_suites'))}</tf-button>
+        <div class="ps-suite-head-fields">
+          <tf-input id="ps-suite-name" label="${escapeAttr(t('suite_name_label'))}" value="${escapeAttr(se.name)}" ${editable ? '' : 'readonly'}></tf-input>
+          <tf-input id="ps-suite-desc" label="${escapeAttr(t('suite_desc_label'))}" value="${escapeAttr(se.description)}" ${editable ? '' : 'readonly'}></tf-input>
+        </div>
+        ${editable ? `
+          <div class="ps-suite-head-actions">
+            <tf-button variant="ghost" icon="play" id="ps-suite-save-run">${escapeHtml(t('suite_save_and_run'))}</tf-button>
+            <tf-button variant="primary" icon="check" id="ps-suite-save">${escapeHtml(t('suite_save'))}</tf-button>
+          </div>
+        ` : ''}
       </div>
-      <div class="ps-editor-actions">
-        ${editable ? `<tf-button variant="primary" icon="check" id="ps-suite-save">${escapeHtml(t('action_save'))}</tf-button>` : ''}
-      </div>
-    </div>
-    <div class="ps-field" style="margin-bottom:12px;">
-      <tf-input id="ps-suite-desc" label="${escapeAttr(t('suite_desc_label'))}" value="${escapeAttr(se.description)}" ${editable ? '' : 'readonly'}></tf-input>
+      <div class="ps-suite-summary" id="ps-suite-summary"></div>
     </div>
     <div class="ps-two-pane">
       <tf-section-card title="${escapeAttr(t('suite_pool_title'))}" icon="list">
         <span slot="subtitle">${escapeHtml(t('suite_pool_sub'))}</span>
-        <tf-searchbox id="ps-suite-pool-filter" placeholder="${escapeAttr(t('suite_pool_filter'))}" debounce="200" value="${escapeAttr(se.poolFilter)}"></tf-searchbox>
+        ${editable ? `<tf-button slot="actions" variant="ghost" size="sm" icon="plus" id="ps-suite-add-selected" disabled>${escapeHtml(t('suite_add_selected', { count: 0 }))}</tf-button>` : ''}
+        <div class="ps-pane-toolbar">
+          <tf-searchbox id="ps-suite-pool-filter" placeholder="${escapeAttr(t('suite_pool_filter'))}" debounce="200" value="${escapeAttr(se.poolFilter)}"></tf-searchbox>
+          <tf-select id="ps-suite-pool-kind" value="${escapeAttr(se.poolKind)}">
+            <option value="all">${escapeHtml(t('suite_kind_all'))}</option>
+            ${CASE_KINDS.map((k) => `<option value="${k}">${escapeHtml(t(`case_kind_${k}`))}</option>`).join('')}
+          </tf-select>
+        </div>
         <div class="ps-pane-list" id="ps-suite-pool"></div>
       </tf-section-card>
-      <tf-section-card title="${escapeAttr(t('suite_members_title'))}" icon="grid-2x2">
+      <tf-section-card title="${escapeAttr(t('suite_members_title'))}" icon="grid-rows">
         <span slot="subtitle">${escapeHtml(t('suite_members_sub', { count: se.cases.length }))}</span>
+        ${editable ? `<tf-button slot="actions" variant="ghost" size="sm" icon="x" id="ps-suite-clear">${escapeHtml(t('suite_clear'))}</tf-button>` : ''}
+        <div class="ps-pane-toolbar">
+          <tf-searchbox id="ps-suite-member-filter" placeholder="${escapeAttr(t('suite_member_filter'))}" debounce="200" value="${escapeAttr(se.memberFilter)}"></tf-searchbox>
+        </div>
         <div class="ps-pane-list" id="ps-suite-members"></div>
       </tf-section-card>
     </div>
@@ -6739,21 +6824,65 @@ async function renderSuiteEditor() {
     se.poolFilter = String(e.detail?.value ?? '');
     renderSuitePool(editable);
   });
-  byId('ps-suite-save')?.addEventListener('click', async () => {
+  byId('ps-suite-pool-filter')?.addEventListener('input', (e) => {
+    se.poolFilter = String(e.detail?.value ?? e.target.value ?? '');
+    renderSuitePool(editable);
+  });
+  byId('ps-suite-pool-kind')?.addEventListener('change', (e) => {
+    se.poolKind = e.detail?.value || 'all';
+    renderSuitePool(editable);
+  });
+  byId('ps-suite-member-filter')?.addEventListener('input', (e) => {
+    se.memberFilter = String(e.detail?.value ?? e.target.value ?? '');
+    renderSuiteMembers(editable);
+  });
+  byId('ps-suite-add-selected')?.addEventListener('click', () => {
+    for (const c of se.pool) {
+      const id = fv(c, 'case_id');
+      if (!se.poolSelected.has(id)) continue;
+      se.cases.push({ caseId: id, title: c.title, priority: c.priority, status: c.status, kind: c.kind });
+    }
+    se.poolSelected.clear();
+    renderSuitePool(editable);
+    renderSuiteMembers(editable);
+  });
+  byId('ps-suite-clear')?.addEventListener('click', () => {
+    se.cases = [];
+    renderSuitePool(editable);
+    renderSuiteMembers(editable);
+  });
+
+  const save = async () => {
     const name = se.name.trim();
-    if (name.length < 2) { toast(t('err_suite_name'), 'error'); return; }
+    if (name.length < 2) { toast(t('err_suite_name'), 'error'); return null; }
+    const resp = await ApiBinary.one('projectStudioSuiteSaveRequest', {
+      projectId: projectId(),
+      suiteId: se.suiteId,
+      name,
+      description: se.description.trim(),
+      caseIds: se.cases.map((c) => c.caseId),
+    });
+    toast(t('suite_saved'), 'success');
+    return fv(resp, 'suite_id') || se.suiteId;
+  };
+  byId('ps-suite-save')?.addEventListener('click', async () => {
     try {
-      await ApiBinary.one('projectStudioSuiteSaveRequest', {
-        projectId: projectId(),
-        suiteId: se.suiteId,
-        name,
-        description: se.description.trim(),
-        caseIds: se.cases.map((c) => c.caseId),
-      });
-      toast(t('suite_saved'), 'success');
+      if (!(await save())) return;
       f2().suiteEditor = null;
       f2().view = 'suites';
       await renderTestsView();
+    } catch (err) {
+      toast(`${t('suite_save_failed')}: ${err.message}`, 'error');
+    }
+  });
+  byId('ps-suite-save-run')?.addEventListener('click', async () => {
+    try {
+      const suiteId = await save();
+      if (!suiteId) return;
+      f2().suiteEditor = null;
+      f2().view = 'suites';
+      await renderTestsView();
+      openRunWindow({ suiteId });
     } catch (err) {
       toast(`${t('suite_save_failed')}: ${err.message}`, 'error');
     }
@@ -6763,6 +6892,31 @@ async function renderSuiteEditor() {
   renderSuiteMembers(editable);
 }
 
+// Header chips mirror the mockup summary line: size, per-kind breakdown and
+// whether the suite still drags deprecated cases along.
+function renderSuiteSummary() {
+  const se = f2().suiteEditor;
+  const host = byId('ps-suite-summary');
+  if (!host || !se) return;
+  const counts = new Map();
+  let deprecated = 0;
+  for (const c of se.cases) {
+    const kind = c.kind || 'manual';
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+    if (c.status === 'deprecated') deprecated += 1;
+  }
+  const kindChips = [...counts.entries()]
+    .map(([kind, n]) => `<tf-chip status="${CASE_KIND_CHIP[kind] || 'info'}">${n} ${escapeHtml(t(`case_kind_${kind}`))}</tf-chip>`)
+    .join('');
+  host.innerHTML = `
+    <tf-chip status="accent">${escapeHtml(t('suite_cases_chip', { count: se.cases.length }))}</tf-chip>
+    ${kindChips}
+    ${deprecated
+      ? `<tf-chip status="warn">${escapeHtml(t('suite_deprecated_chip', { count: deprecated }))}</tf-chip>`
+      : `<tf-chip status="ok">${escapeHtml(t('suite_all_approved'))}</tf-chip>`}
+  `;
+}
+
 function renderSuitePool(editable) {
   const se = f2().suiteEditor;
   const host = byId('ps-suite-pool');
@@ -6770,48 +6924,101 @@ function renderSuitePool(editable) {
   const chosen = new Set(se.cases.map((c) => c.caseId));
   const query = se.poolFilter.trim().toLowerCase();
   const rows = se.pool.filter((c) => {
-    if (chosen.has(fv(c, 'case_id'))) return false;
-    if (query && !String(c.title).toLowerCase().includes(query)) return false;
+    const id = fv(c, 'case_id');
+    if (chosen.has(id)) return false;
+    if (se.poolKind !== 'all' && (c.kind || 'manual') !== se.poolKind) return false;
+    if (query && !`${c.title} ${id}`.toLowerCase().includes(query)) return false;
     return true;
   });
+  // Selections of now-hidden rows would silently add invisible cases on
+  // "add selected", so drop them whenever the filter changes.
+  const visible = new Set(rows.map((c) => fv(c, 'case_id')));
+  for (const id of [...se.poolSelected]) if (!visible.has(id)) se.poolSelected.delete(id);
+  syncSuiteAddSelected();
+
+  const counter = byId('ps-suite-pool-count');
+  if (counter) counter.textContent = String(rows.length);
+
   if (!rows.length) {
-    host.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('suite_pool_empty'))}</div>`;
+    host.innerHTML = `<tf-empty-state icon="list" title="${escapeAttr(t('suite_pool_empty'))}"></tf-empty-state>`;
     return;
   }
-  host.innerHTML = rows.map((c) => `
+  host.innerHTML = rows.map((c) => {
+    const id = fv(c, 'case_id');
+    return `
     <div class="ps-pane-row">
+      ${editable ? `<tf-checkbox data-pool-pick="${escapeAttr(id)}" ${se.poolSelected.has(id) ? 'checked' : ''}></tf-checkbox>` : ''}
       <div class="ps-pane-row-main">
         <div class="ps-pane-row-title">${escapeHtml(c.title)}</div>
-        <tf-chip status="${PRIORITY_CHIP[c.priority] || 'info'}">${escapeHtml(t(`prio_${c.priority}`))}</tf-chip>
+        <div class="ps-pane-row-meta">
+          <span class="ps-pane-row-id">${escapeHtml(shortId(id))}</span>
+          <tf-chip status="${CASE_KIND_CHIP[c.kind] || 'info'}">${escapeHtml(t(`case_kind_${c.kind || 'manual'}`))}</tf-chip>
+          <tf-chip status="${PRIORITY_CHIP[c.priority] || 'info'}">${escapeHtml(t(`prio_${c.priority}`))}</tf-chip>
+        </div>
       </div>
-      ${editable ? `<tf-button variant="ghost" size="sm" icon="plus" data-pool-add="${escapeAttr(fv(c, 'case_id'))}" title="${escapeAttr(t('suite_add_case'))}"></tf-button>` : ''}
+      ${editable ? `<tf-button variant="ghost" size="sm" icon="plus" data-pool-add="${escapeAttr(id)}" title="${escapeAttr(t('suite_add_case'))}"></tf-button>` : ''}
     </div>
-  `).join('');
+  `;
+  }).join('');
+  host.querySelectorAll('[data-pool-pick]').forEach((box) => {
+    box.addEventListener('change', (e) => {
+      const id = box.dataset.poolPick;
+      if (e.detail?.checked ?? box.checked) se.poolSelected.add(id);
+      else se.poolSelected.delete(id);
+      syncSuiteAddSelected();
+    });
+  });
   host.querySelectorAll('[data-pool-add]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const c = se.pool.find((x) => fv(x, 'case_id') === btn.dataset.poolAdd);
       if (!c) return;
-      se.cases.push({ caseId: fv(c, 'case_id'), title: c.title, priority: c.priority, status: c.status });
+      se.cases.push({ caseId: fv(c, 'case_id'), title: c.title, priority: c.priority, status: c.status, kind: c.kind });
+      se.poolSelected.delete(btn.dataset.poolAdd);
       renderSuitePool(editable);
       renderSuiteMembers(editable);
     });
   });
 }
 
+function syncSuiteAddSelected() {
+  const se = f2().suiteEditor;
+  const btn = byId('ps-suite-add-selected');
+  if (!btn || !se) return;
+  const n = se.poolSelected.size;
+  btn.textContent = t('suite_add_selected', { count: n });
+  if (n) btn.removeAttribute('disabled');
+  else btn.setAttribute('disabled', '');
+}
+
 function renderSuiteMembers(editable) {
   const se = f2().suiteEditor;
   const host = byId('ps-suite-members');
   if (!host || !se) return;
+  renderSuiteSummary();
+  const sub = byId('ps-suite-members')?.closest('tf-section-card')?.querySelector('[slot="subtitle"]');
+  if (sub) sub.textContent = t('suite_members_sub', { count: se.cases.length });
   if (!se.cases.length) {
-    host.innerHTML = `<div class="ps-field-hint">${escapeHtml(t('suite_members_empty'))}</div>`;
+    host.innerHTML = `<tf-empty-state icon="grid-rows" title="${escapeAttr(t('suite_members_empty'))}"></tf-empty-state>`;
     return;
   }
-  host.innerHTML = se.cases.map((c, i) => `
+  const query = (se.memberFilter || '').trim().toLowerCase();
+  const shown = se.cases
+    .map((c, i) => ({ c, i }))
+    .filter(({ c }) => !query || `${c.title} ${c.caseId}`.toLowerCase().includes(query));
+  if (!shown.length) {
+    host.innerHTML = `<tf-empty-state icon="search" title="${escapeAttr(t('suite_members_no_match'))}"></tf-empty-state>`;
+    return;
+  }
+  host.innerHTML = shown.map(({ c, i }) => `
     <div class="ps-pane-row">
       <div class="ps-step-num">${i + 1}</div>
       <div class="ps-pane-row-main">
         <div class="ps-pane-row-title">${escapeHtml(c.title)}</div>
-        ${c.status === 'deprecated' ? `<tf-chip status="warn">${escapeHtml(t('case_status_deprecated'))}</tf-chip>` : ''}
+        <div class="ps-pane-row-meta">
+          <span class="ps-pane-row-id">${escapeHtml(shortId(c.caseId))}</span>
+          <tf-chip status="${CASE_KIND_CHIP[c.kind] || 'info'}">${escapeHtml(t(`case_kind_${c.kind || 'manual'}`))}</tf-chip>
+          ${c.status === 'deprecated' ? `<tf-chip status="warn">${escapeHtml(t('case_status_deprecated'))}</tf-chip>` : ''}
+        </div>
       </div>
       ${editable ? `
         <tf-button variant="ghost" size="sm" icon="chevron-down" class="ps-rotate-180" data-member-up="${i}" ${i === 0 ? 'disabled' : ''} title="${escapeAttr(t('case_step_up'))}"></tf-button>
@@ -6870,33 +7077,67 @@ async function renderRunsView() {
 
   host.innerHTML = `
     <div class="ps-tests-toolbar">
+      <tf-searchbox id="ps-runs-search" placeholder="${escapeAttr(t('runs_search_placeholder'))}" value="${escapeAttr(s.runs.filter || '')}"></tf-searchbox>
+      <tf-select id="ps-runs-f-type" value="${escapeAttr(s.runs.type || '')}">
+        <option value="">${escapeHtml(t('runs_type_all'))}</option>
+        ${['manual', 'auto', 'perf'].map((x) => `<option value="${x}" ${x === s.runs.type ? 'selected' : ''}>${escapeHtml(t(`run_type_${x}`))}</option>`).join('')}
+      </tf-select>
       <tf-select id="ps-runs-f-status" value="${escapeAttr(s.runs.status)}">
         <option value="" ${s.runs.status === '' ? 'selected' : ''}>${escapeHtml(t('runs_filter_all'))}</option>
         ${['running', 'completed', 'cancelled', 'error'].map((x) => `<option value="${x}" ${x === s.runs.status ? 'selected' : ''}>${escapeHtml(t(`run_status_${x}`))}</option>`).join('')}
       </tf-select>
       <span class="ps-toolbar-spacer"></span>
+      <tf-button variant="ghost" icon="refresh" id="ps-runs-refresh">${escapeHtml(t('action_refresh'))}</tf-button>
       ${canEdit() ? `<tf-button variant="primary" icon="plus" id="ps-runs-new">${escapeHtml(t('runs_new'))}</tf-button>` : ''}
     </div>
-    <div id="ps-runs-table-host">
-      ${s.runs.rows.length ? '' : `<tf-empty-state icon="play" title="${escapeAttr(t('runs_empty'))}"></tf-empty-state>`}
-    </div>
+    <div id="ps-runs-table-host"></div>
   `;
+  byId('ps-runs-search')?.addEventListener('input', (e) => {
+    s.runs.filter = String(e.detail?.value ?? e.target.value ?? '');
+    renderRunsTable();
+  });
+  byId('ps-runs-f-type')?.addEventListener('change', (e) => {
+    s.runs.type = e.detail?.value ?? '';
+    renderRunsTable();
+  });
   byId('ps-runs-f-status')?.addEventListener('change', (e) => {
     s.runs.status = e.detail?.value ?? e.target.value ?? '';
     s.runs.page = 1;
     renderRunsView();
   });
+  byId('ps-runs-refresh')?.addEventListener('click', () => renderRunsView());
   byId('ps-runs-new')?.addEventListener('click', () => openRunWindow({}));
-  if (!s.runs.rows.length) return;
+  renderRunsTable();
+}
 
-  byId('ps-runs-table-host').innerHTML = `
+function visibleRuns() {
+  const s = f2();
+  const needle = (s.runs.filter || '').trim().toLowerCase();
+  return s.runs.rows.filter((run) => {
+    if (s.runs.type && (fv(run, 'run_type') || 'manual') !== s.runs.type) return false;
+    if (!needle) return true;
+    return `${run.name} ${fv(run, 'suite_name') || ''} #${fv(run, 'run_no')}`.toLowerCase().includes(needle);
+  });
+}
+
+function renderRunsTable() {
+  const s = f2();
+  const tableHost = byId('ps-runs-table-host');
+  if (!tableHost) return;
+  const rows = visibleRuns();
+  if (!rows.length) {
+    tableHost.innerHTML = `<tf-empty-state icon="play" title="${escapeAttr(s.runs.rows.length ? t('runs_no_match') : t('runs_empty'))}"></tf-empty-state>`;
+    return;
+  }
+
+  tableHost.innerHTML = `
     <tf-table id="ps-runs-table" page-size="${F2_PAGE_SIZE}" total="${s.runs.total}" page="${s.runs.page}">
-      <tf-column key="no" label="#"></tf-column>
-      <tf-column key="name" label="${escapeAttr(t('runs_col_name'))}"></tf-column>
+      <tf-column key="name" label="${escapeAttr(t('runs_col_name'))}" renderer="html"></tf-column>
       <tf-column key="suite" label="${escapeAttr(t('runs_col_suite'))}"></tf-column>
-      <tf-column key="type" label="${escapeAttr(t('runs_col_type'))}"></tf-column>
+      <tf-column key="type" label="${escapeAttr(t('runs_col_type'))}" renderer="chip"></tf-column>
       <tf-column key="environment" label="${escapeAttr(t('runs_col_env'))}"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('runs_col_status'))}" renderer="chip"></tf-column>
+      <tf-column key="progress" label="${escapeAttr(t('runs_col_progress'))}" renderer="html"></tf-column>
       <tf-column key="result" label="${escapeAttr(t('runs_col_result'))}"></tf-column>
       <tf-column key="createdBy" label="${escapeAttr(t('runs_col_created_by'))}"></tf-column>
       <tf-column key="startedAt" label="${escapeAttr(t('runs_col_started'))}"></tf-column>
@@ -6904,19 +7145,24 @@ async function renderRunsView() {
   `;
   const table = byId('ps-runs-table');
   const assignRows = () => {
-    table.rows = s.runs.rows.map((run) => {
+    table.rows = visibleRuns().map((run) => {
+      const total = Number(run.total ?? 0);
       const done = Number(run.passed ?? 0) + Number(run.failed ?? 0) + Number(run.blocked ?? 0)
         + Number(run.skipped ?? 0) + Number(run.errored ?? 0);
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      const tone = { completed: 'success', cancelled: 'warning', error: 'danger' }[run.status] || 'accent';
       return {
         _id: fv(run, 'run_id'),
         _row: run,
-        no: `#${fv(run, 'run_no')}`,
-        name: run.name,
+        name: `<div class="tf-table__cell-title">${escapeHtml(run.name)}</div><div class="tf-table__cell-sub">#${fv(run, 'run_no')}</div>`,
         suite: fv(run, 'suite_name') || t('runs_adhoc'),
-        type: t(`run_type_${fv(run, 'run_type') || 'manual'}`),
+        type: chipCell(fv(run, 'run_type') === 'manual' ? 'neutral' : 'accent', t(`run_type_${fv(run, 'run_type') || 'manual'}`)),
         environment: fv(run, 'environment_name') || t(`assign_${fv(run, 'assignment_mode') || 'pool'}`),
         status: chipCell(RUN_STATUS_CHIP[run.status], t(`run_status_${run.status}`)),
-        result: t('runs_result', { done, total: Number(run.total ?? 0), passed: Number(run.passed ?? 0), failed: Number(run.failed ?? 0) }),
+        progress: '<div style="display:flex;align-items:center;gap:8px;min-width:120px;">'
+          + `<tf-progress-bar value="${pct}" tone="${tone}" size="sm" style="flex:1 1 80px;"></tf-progress-bar>`
+          + `<span style="font-size:11px;opacity:0.7;">${pct}%</span></div>`,
+        result: t('runs_result', { done, total, passed: Number(run.passed ?? 0), failed: Number(run.failed ?? 0) }),
         createdBy: fv(run, 'created_by_name') || '',
         startedAt: formatTimestamp(fv(run, 'started_at')),
       };
@@ -6960,6 +7206,12 @@ async function renderRunsView() {
     table.setAttribute('total', String(s.runs.total));
     assignRows();
   });
+
+  const running = s.runs.rows.filter((r) => r.status === 'running').length;
+  const footer = document.createElement('div');
+  footer.className = 'ps-table-footer';
+  footer.textContent = t('runs_footer', { shown: rows.length, total: s.runs.total, running });
+  tableHost.appendChild(footer);
 }
 
 function deleteRun(run) {
@@ -8725,7 +8977,7 @@ function renderReportSections() {
     ${reportSectionShell('source_coverage', 'database', 'ps-rep-coverage')}
     ${reportSectionShell('defects', 'alert', 'ps-rep-defects')}
     ${reportSectionShell('perf_trend', 'chart-line', 'ps-rep-perf', `
-      <tf-button variant="ghost" size="sm" icon="grid-2x2" data-perf-compare>${escapeHtml(t('report_perf_compare'))}</tf-button>
+      <tf-button variant="ghost" size="sm" icon="grid-rows" data-perf-compare>${escapeHtml(t('report_perf_compare'))}</tf-button>
     `)}
     ${reportSectionShell('tester_activity', 'users', 'ps-rep-activity')}
   `;
@@ -9745,7 +9997,7 @@ let notifListenerInstalled = false;
 function bellHtml() {
   return `
     <span class="ps-bell-wrap" data-bell-wrap>
-      <tf-button variant="ghost" icon="mail" data-bell title="${escapeAttr(t('notif_title'))}"></tf-button>
+      <tf-button variant="ghost" icon="bell" data-bell title="${escapeAttr(t('notif_title'))}"></tf-button>
       <span class="ps-bell-badge" data-bell-badge hidden></span>
     </span>
   `;
@@ -9815,7 +10067,7 @@ async function openNotifWindow() {
 
   const renderList = () => {
     if (!nw.items.length) {
-      listEl.innerHTML = `<tf-empty-state icon="mail" title="${escapeAttr(t('notif_empty'))}"></tf-empty-state>`;
+      listEl.innerHTML = `<tf-empty-state icon="bell" title="${escapeAttr(t('notif_empty'))}"></tf-empty-state>`;
       return;
     }
     listEl.innerHTML = `
