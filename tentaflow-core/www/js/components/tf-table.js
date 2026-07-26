@@ -173,6 +173,13 @@ class TfTable extends HTMLElement {
     wrap.className = 'tf-table-wrap';
     const table = document.createElement('table');
     table.className = 'tf-table';
+    // Handlery byly zbindowane w konstruktorze, ale nigdy nie podlaczone:
+    // sortowanie naglowka, row-click/row-dblclick, rozwijanie wierszy i akcje
+    // wiersza nie reagowaly w ZADNEJ tabeli dashboardu. "change" dodatkowo nie
+    // jest composed, wiec nasluch musi siedziec tutaj, w shadow root.
+    table.addEventListener('click', this._onClick);
+    table.addEventListener('dblclick', this._onDblClick);
+    table.addEventListener('change', this._onChange);
     const thead = document.createElement('thead');
     const tbody = document.createElement('tbody');
     table.appendChild(thead);
@@ -643,10 +650,16 @@ class TfTable extends HTMLElement {
   }
 
   // Select-all checkbox (tf-checkbox emituje natywny "change" z .checked).
+  // tf-checkbox trzyma swój <input> w LIGHT DOM, wiec e.target to ten input, a
+  // klasa marker siedzi na hoscie — bez wejscia w przodkow warunek nigdy nie
+  // przechodzi i "select-all" nie jest emitowane (akcje zbiorcze byly martwe).
   _onChange(e) {
     const target = e.target;
-    if (!target || !target.classList || !target.classList.contains('tf-table__select-all')) return;
-    const checked = !!target.checked;
+    if (!target || !target.closest) return;
+    const box = target.closest('.tf-table__select-all');
+    if (!box) return;
+    // Host odzwierciedla stan atrybutem; input niesie go wprost.
+    const checked = typeof target.checked === 'boolean' ? target.checked : !!box.checked;
     this.dispatchEvent(new CustomEvent('select-all', {
       bubbles: true,
       detail: { selected: checked },

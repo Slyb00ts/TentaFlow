@@ -2347,13 +2347,18 @@ tf-contrib-tag {
    tf-stat-card
    ============================================================================= */
 
-tf-stat-card { display: block; }
+/* A grid or flex row stretches the HOST, but the frame lives on the inner
+   .tf-stat-card — without height:100% each card shrinks to its own content and
+   a row of cards ends up ragged whenever only some of them carry a delta line. */
+tf-stat-card { display: block; height: 100%; }
 
 .tf-stat-card {
   background: var(--tf-bg-card);
   border: 1px solid var(--tf-border);
   border-radius: var(--tf-radius);
   padding: 18px 20px;
+  height: 100%;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -2404,6 +2409,10 @@ tf-stat-card { display: block; }
 .tf-stat-card-delta {
   font-size: 12px;
   font-weight: 600;
+  /* Pinned to the bottom so the values stay on one baseline across a row even
+     when only some cards have a delta. */
+  margin-top: auto;
+  padding-top: 2px;
 }
 .tf-stat-card-delta.up      { color: var(--tf-success); }
 .tf-stat-card-delta.down    { color: var(--tf-danger); }
