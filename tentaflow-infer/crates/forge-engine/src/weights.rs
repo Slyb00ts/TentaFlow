@@ -626,6 +626,8 @@ pub struct ModelWeights {
     pub output_norm: DevBuffer,
     /// Dzielniki częstotliwości rope dla warstw globalnych (`rope_freqs`, f32).
     pub rope_freqs: Option<DevBuffer>,
+    /// Jednoelementowy bufor f32 `-inf` — źródło maski tokenów zabronionych.
+    pub neg_inf: Option<DevBuffer>,
     /// LM head. For tied embeddings this is a separate f16 view built from the
     /// same host data (kept simple; dedup is a later optimization).
     pub lm_head: DevWeight,
@@ -2541,6 +2543,11 @@ impl ModelWeights {
             Some(n) => Some(upload_f32(device, src, n)?),
             None => None,
         };
+        let neg_inf = if descriptor.params.suppress_tokens.is_empty() {
+            None
+        } else {
+            Some(upload(device, &f32::NEG_INFINITY.to_le_bytes())?)
+        };
 
         let lm_head_name = descriptor
             .globals
@@ -2869,6 +2876,7 @@ impl ModelWeights {
             token_embd_host: None,
             output_norm,
             rope_freqs,
+            neg_inf,
             lm_head,
             fp8_lm_head: None,
             layers,
@@ -2911,6 +2919,11 @@ impl ModelWeights {
         let rope_freqs = match descriptor.globals.get(&WeightRole::RopeFreqs) {
             Some(n) => Some(upload_f32(device, src, n)?),
             None => None,
+        };
+        let neg_inf = if descriptor.params.suppress_tokens.is_empty() {
+            None
+        } else {
+            Some(upload(device, &f32::NEG_INFINITY.to_le_bytes())?)
         };
         let lm_head_name = descriptor
             .globals
@@ -3182,6 +3195,7 @@ impl ModelWeights {
             token_embd_host: Some(host_embed),
             output_norm,
             rope_freqs,
+            neg_inf,
             lm_head,
             fp8_lm_head: None,
             layers,

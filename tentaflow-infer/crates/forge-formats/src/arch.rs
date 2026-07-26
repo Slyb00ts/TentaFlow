@@ -418,6 +418,11 @@ pub struct Hyperparams {
     /// per token rather than per-head over `head_dim`. OLMoE normalizes the full
     /// query/key vector; Qwen3 normalizes each head. `false` when no QK-norm.
     pub qk_norm_over_hidden: bool,
+    /// Tokeny, których logity model MUSI maskować do -inf. Checkpointy Gemmy 4
+    /// przypisują wysokie logity tokenom `<image|>`/`<audio|>`, więc bez maski
+    /// greedy wybiera je i generacja się rozjeżdża (referencja llama.cpp wstawia
+    /// tę maskę jako wejście grafu).
+    pub suppress_tokens: Vec<u32>,
     /// V przechodzi CZYSTĄ normalizację RMS (bez wagi) przed zapisem do cache —
     /// rodzina Gemma. Realizowane wektorem jedynek, żeby nie mnożyć kerneli.
     pub v_rms_norm: bool,
@@ -913,6 +918,10 @@ impl ModelDescriptor {
                 moe,
                 qk_norm_over_hidden,
                 v_rms_norm: spec.gguf_arch.starts_with("gemma"),
+                suppress_tokens: gguf
+                    .get_array("tokenizer.ggml.suppress_tokens")
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+                    .unwrap_or_default(),
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
@@ -988,6 +997,7 @@ impl ModelDescriptor {
                 moe: None,
                 qk_norm_over_hidden: false,
                 v_rms_norm: false,
+                suppress_tokens: Vec::new(),
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
@@ -1310,6 +1320,10 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             // qwen35moe attention normalizes each head over head_dim.
             qk_norm_over_hidden: false,
             v_rms_norm: false,
+            suppress_tokens: gguf
+                .get_array("tokenizer.ggml.suppress_tokens")
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+                .unwrap_or_default(),
             ssm: Some(ssm),
             rope_sections,
             full_attention_interval,

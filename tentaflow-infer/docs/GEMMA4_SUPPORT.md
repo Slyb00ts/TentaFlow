@@ -81,6 +81,65 @@ Rzeczy, których NIE DA SIĘ odgadnąć z samych metadanych, a każda zmienia wy
 9. Cache KV jest **przeplatany** (`build_attn_inp_kv_iswa`) — osobny dla warstw z
    oknem i osobny dla globalnych.
 
+## Stan: działa, zweryfikowane względem llama.cpp
+
+`google/gemma-4-12B-it-qat-q4_0-gguf` generuje spójny polski tekst na Radeonie
+RX 6900 XT (gfx1030). Poprawność sprawdzono zrzutem tensorów z
+`llama-eval-callback` (CPU, f32) i porównaniem sum oraz pojedynczych wartości na
+każdym etapie: `attn_norm`, projekcje Q/K/V, normy Q/K/V, rope (obie podstawy i
+`rope_freqs`), wyjście uwagi, projekcja wyjścia, normy sandwich, GeGLU, `down`,
+strumień rezydualny po każdej z 48 warstw oraz logity. Rozjazd rośnie z długością
+kontekstu i mieści się w szumie f16: 0,85% sumy logitów przy 11 tokenach i 2,4%
+przy 176 (referencja liczy w f32 na CPU).
+
+### Znalezione i naprawione błędy
+
+1. `qk_norm_over_hidden` porównywało długość `attn_q_norm` z GLOBALNYM
+   `head_dim`. Przy naprzemiennej geometrii warstwa 0 ma 256, a model raportuje
+   512, więc norma leciała po całej projekcji 4096 wagą 256-elementową i czytała
+   poza bufor. Porównanie używa teraz `head_dim` warstwy 0.
+2. Prefill i dekodowanie wołały uwagę z globalnymi `head_dim`/`n_kv_heads` dla
+   wszystkich warstw, co psuło mapowanie głowic GQA i offsety scalonego QKV.
+   Obie pętle liczą wymiary per warstwa.
+3. `gelu_mul_f16` liczyło `tanh` jako `(e-1)/(e+1)` z `e = exp(2x)`. Przy
+   bramkach rzędu 30 (realnych w FFN) `exp` przelewało się do `inf`, dając
+   `inf/inf = NaN`; ścieżka kwantyzacji aktywacji do int8 zamieniała te NaN w
+   ciche śmieci, więc błąd nie propagował się jako NaN. Postać
+   `1 - 2/(exp(2x)+1)` nasyca się poprawnie.
+4. Ścieżka rozdzielna dekodowania nie nakładała norm sandwich ani
+   `layer_output_scale` — stan rezydualny rozjeżdżał się od drugiej warstwy.
+5. Cache KV był rozmiarowany jedną geometrią (512 elementów na token), a warstwy
+   okienne potrzebują 2048. Rozmiar liczy teraz najszersza warstwa
+   (`kv_cache_heads`/`kv_cache_head_dim`, jedno źródło prawdy dla puli i cache).
+6. Brakowało maski `tokenizer.ggml.suppress_tokens`. Checkpoint przypisuje
+   wysokie logity tokenom `<image|>`/`<audio|>` i bez maski greedy wybierał je
+   jako pierwszy token (llama.cpp wstawia tę maskę jako wejście grafu).
+
+### Wydajność (RTX brak, RX 6900 XT, pp1024/tg128)
+
+| silnik | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| llama.cpp (ff067f76, ROCm) | 1449,1 | 52,4 |
+| FORGE | 1278,4 | 38,5 |
+
+FORGE jest 11,8% za llama.cpp na prefillu i 27% na dekodowaniu. Optymalizacja tej
+architektury nie została jeszcze zrobiona: profil nie był robiony, a scalanie QKV
+jest dla niej wyłączone (fused `qkv_post` zapieka jedną geometrię i jedną podstawę
+rope). Osobny pomiar pokazał, że sam brak scalania QKV to ułamek procenta czasu
+prefillu, więc luka leży w kernelach GEMM/uwagi.
+
+### Znane braki poza ścieżką Gemmy
+
+`gemm_q6_k_f16` daje na gfx1030 błąd do 46% na części wierszy (test
+`golden::gemm_q6_k_matches_formats_dequant` jest czerwony). Gemma go nie używa
+(głowa logitów idzie przez GEMV), ale modele z wagami Q6_K w prefillu będą na
+AMD liczyć źle. 22 testy golden GEMM okazały się wcześniej po cichu pomijane na
+AMD (otwierały wprost urządzenie CUDA); teraz `golden.rs` używa wspólnego
+selektora backendu, a kernele nieskompilowane dla danej architektury są jawnie
+raportowane jako pominięte.
+
+## Poprzednie notatki
+
 ## Co jest już zrobione
 
 - **Kafel `gemm_q4_0_dot4`** (int8 na `v_dot4_i32_i8`, warianty 64x64/128x64/128x128

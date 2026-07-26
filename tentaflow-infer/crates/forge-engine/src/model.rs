@@ -2293,6 +2293,7 @@ pub(crate) fn hybrid_prefill_b2_backend_capable(vendor: Vendor, warp_size: u32) 
 /// normalizowana PRZED dodaniem do rezyduum. Architektury bez tych tensorów nie
 /// wykonują tu żadnego kernela.
 
+
 fn pre_residual_norm(
     kernels: &Kernels,
     norm: Option<&DevBuffer>,
@@ -4615,6 +4616,16 @@ impl Model {
         if cap > 0.0 {
             self.kernels
                 .softcap_f32(y_f32, y_off, weight.rows(), cap, stream)?;
+        }
+        // Maska tokenów zabronionych: kopie stream-ordered z jednoelementowego
+        // bufora -inf, więc mieszczą się w przechwytywanym grafie decode.
+        if let Some(neg_inf) = &self.weights.neg_inf {
+            for &id in &self.weights.descriptor.params.suppress_tokens {
+                let slot = y_off + id as usize;
+                if slot < y_off + weight.rows() {
+                    self.device.copy(neg_inf, 0, y_f32, slot * 4, 4, stream)?;
+                }
+            }
         }
         Ok(())
     }

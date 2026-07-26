@@ -882,6 +882,8 @@ mod tests {
             pooling_type: PoolingType::None,
             moe: None::<MoeParams>,
             qk_norm_over_hidden: false,
+            v_rms_norm: false,
+            suppress_tokens: Vec::new(),
             ssm: None,
             rope_sections: None,
             full_attention_interval: 0,
