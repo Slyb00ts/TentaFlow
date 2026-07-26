@@ -702,6 +702,11 @@ trait TensorSource {
     /// compressed-tensors FP8 ("float-quantized"): f8e4m3 weight + sibling
     /// `<base>.weight_scale` (per-channel or per-tensor). None when absent.
     fn fetch_fp8(&self, name: &str) -> Result<Option<Fp8Host>>;
+    /// Wagi w układach swoistych dla DeepSeeka V4. `None` dla pozostałych
+    /// źródeł i tensorów.
+    fn fetch_deepseek(&self, _name: &str) -> Result<Option<HostWeight>> {
+        Ok(None)
+    }
     /// Rozmiar tensora na dysku, bez jego wczytywania. `None`, gdy źródło nie
     /// potrafi go podać — wtedy budżet rezydencji ekspertów jest nieznany.
     fn byte_len(&self, name: &str) -> Option<usize>;
@@ -1275,9 +1280,91 @@ struct StSource<'a> {
     scheme: Option<NvFp4Scheme>,
     /// compressed-tensors "float-quantized" (FP8 weights + scale siblings).
     fp8: bool,
+    /// Checkpoint DeepSeeka V4: eksperci NVFP4 pod nazwą `weight` ze skalą
+    /// globalną `weight_scale_2` (MNOŻĄCĄ), a pozostałe wagi FP8 ze skalą
+    /// kafelkową w siostrzanym `.scale`. Oba układy różnią się od
+    /// compressed-tensors na tyle, że wspólna ścieżka dałaby ciche śmieci.
+    deepseek_v4: bool,
+}
+
+/// Wczytuje wagę DeepSeeka V4 w postaci, którą kernel przyjmie wprost.
+/// `None`, gdy tensor nie pasuje do żadnego z dwóch układów tego checkpointu.
+fn fetch_deepseek_weight(st: &ShardedSafeTensors, name: &str) -> Result<Option<HostWeight>> {
+    let Some(info) = st.tensor(name) else {
+        return Ok(None);
+    };
+    if info.shape.len() != 2 {
+        return Ok(None);
+    }
+    let base = name.strip_suffix(".weight").unwrap_or(name);
+
+    // Ekspert NVFP4: pakiet U8 plus skale co 16 elementów i skala globalna.
+    if info.dtype == DType::U8 {
+        let names = nvfp4::DeepseekNvFp4Names::for_weight(name)?;
+        let scales = st.data(&names.scale)?;
+        let global_bytes = st.data(&names.global_scale)?;
+        if global_bytes.len() != 4 {
+            return Err(ForgeError::Format(format!(
+                "{}: oczekiwano skalarnej skali f32",
+                names.global_scale
+            )));
+        }
+        let global = f32::from_le_bytes([
+            global_bytes[0],
+            global_bytes[1],
+            global_bytes[2],
+            global_bytes[3],
+        ]);
+        let packed = st.data(&names.packed)?;
+        let repacked = nvfp4::deepseek_expert_to_gguf(packed, &info.shape, scales, global)?;
+        return Ok(Some(HostWeight::NvFp4Gguf {
+            data: repacked.blocks,
+            output_scale: repacked.output_scale,
+            rows: repacked.rows,
+            cols: repacked.cols,
+        }));
+    }
+
+    // Waga FP8 z kafelkową skalą E8M0.
+    if info.dtype == DType::F8E4M3 {
+        let scale_name = format!("{base}.scale");
+        let Some(scale_info) = st.tensor(&scale_name) else {
+            return Ok(None);
+        };
+        let (rows, cols) = (info.shape[0], info.shape[1]);
+        if scale_info.shape.len() != 2 || scale_info.shape[1] == 0 {
+            return Err(ForgeError::Format(format!(
+                "{scale_name}: oczekiwano dwuwymiarowej skali kafelkowej"
+            )));
+        }
+        let tile = cols / scale_info.shape[1];
+        if rows.div_ceil(tile) != scale_info.shape[0] {
+            return Err(ForgeError::Format(format!(
+                "{scale_name}: kafel {tile} nie zgadza się z kształtem {:?}",
+                scale_info.shape
+            )));
+        }
+        let data = nvfp4::deepseek_fp8_to_q8_0(
+            st.data(name)?,
+            st.data(&scale_name)?,
+            rows,
+            cols,
+            tile,
+        )?;
+        return Ok(Some(HostWeight::Q8_0 { data, rows, cols }));
+    }
+
+    Ok(None)
 }
 
 impl TensorSource for StSource<'_> {
+    fn fetch_deepseek(&self, name: &str) -> Result<Option<HostWeight>> {
+        if !self.deepseek_v4 {
+            return Ok(None);
+        }
+        fetch_deepseek_weight(self.st, name)
+    }
+
     fn byte_len(&self, _name: &str) -> Option<usize> {
         None
     }
@@ -1675,6 +1762,9 @@ impl HostWeight {
 
 /// Fetch a weight matrix in the most direct form a kernel can consume.
 fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
+    if let Some(weight) = src.fetch_deepseek(name)? {
+        return Ok(weight);
+    }
     if let Some(fp8) = src.fetch_fp8(name)? {
         // v0 materializes FP8 as f16 (2 bytes/elem) — a fused f8 GEMV kernel
         // halves that later without touching this loader contract.
@@ -2680,8 +2770,11 @@ impl ModelWeights {
             serde_json::from_str::<HfConfig>(&text)
                 .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?
         };
-        let descriptor = ModelDescriptor::from_hf(&config)?;
+        let mut descriptor = ModelDescriptor::from_hf(&config)?;
         let st = ShardedSafeTensors::load_dir(dir)?;
+        // Opis z `config.json` deklaruje role opcjonalne dla wszystkich warstw;
+        // dopiero tabela tensorów mówi, które z nich naprawdę istnieją.
+        descriptor.prune_absent_optional(|name| st.tensor(name).is_some());
         let scheme = NvFp4Scheme::detect(&config);
         let fp8 = config
             .quantization_config
@@ -2693,6 +2786,7 @@ impl ModelWeights {
             st: &st,
             scheme: scheme.clone(),
             fp8,
+            deepseek_v4: descriptor.arch == "deepseek_v4",
         };
         let preflight = plan_nvfp4_ct_safetensors(
             &st,
