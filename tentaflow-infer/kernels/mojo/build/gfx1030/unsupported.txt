@@ -12,12 +12,12 @@ gemm_q8_0_out_f32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo
 gemm_q8_0_out_f32_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_q4_k_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_q4_k_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
-gemm_q8_0_i8mma	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
-gemm_q8_0_i8mma_bm64	[546555:546556:20260726,103342.105185:ERROR http_transport_libcurl.cc:483] HTTP status 413
-gemm_q8_0_i8mma_big	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
-gemm_q8_0_i8mma_triplet_bm64	[548854:548855:20260726,103352.097284:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/647e3983-799f-48f1-a10f-1a9a023150cd: No such file or directory (2)
-gemm_q4_k_i8mma	[548998:548999:20260726,103358.743718:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/2e21f619-e522-4235-910d-e60200ce767f: No such file or directory (2)
-gemm_q4_k_i8mma_bm64	[549051:549052:20260726,103401.974685:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/b7cb726e-a8bd-4cbc-b20b-c4e36ed8205a: No such file or directory (2)
+gemm_q8_0_i8mma	[626001:626002:20260726,114655.461874:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/4db9b2ee-4840-458a-ba27-3e8f113201fb: No such file or directory (2)
+gemm_q8_0_i8mma_bm64	[626115:626116:20260726,114701.145075:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/e7a2fbdb-b166-46ce-b564-e28a0f5a3281: No such file or directory (2)
+gemm_q8_0_i8mma_big	[626168:626169:20260726,114704.171945:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/373922b9-7a09-4dc5-ba6c-25bb76a0ceac: No such file or directory (2)
+gemm_q8_0_i8mma_triplet_bm64	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
+gemm_q4_k_i8mma	[626429:626430:20260726,114726.908796:ERROR http_transport_libcurl.cc:483] HTTP status 413
+gemm_q4_k_i8mma_bm64	[626484:626485:20260726,114728.589021:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/b5393d9a-3271-42c3-9313-10d55951eed6: No such file or directory (2)
 gemm_q4_k_i8mma_big	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
 gemm_q6_k_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_q6_k_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
@@ -55,9 +55,9 @@ gemm_iq1_s_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.p
 gemm_iq1_s_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_iq1_m_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_iq1_m_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
-gemm_fp8_f16	[552866:552867:20260726,103610.548212:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/1752cdad-0d9e-417c-b7ff-bd67976b764d: No such file or directory (2)
-gemm_fp8_f16_bm64	[552975:552976:20260726,103617.052426:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/0dd811e6-535c-4a3b-8f7e-5e9b4c812b65: No such file or directory (2)
-gemm_fp8_f16_big	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
+gemm_fp8_f16	[630305:630306:20260726,114937.572473:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/e8309d65-1bde-4b91-acf8-8c7c58484bbf: No such file or directory (2)
+gemm_fp8_f16_bm64	[630413:630414:20260726,114943.242738:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/c8975183-c3e4-439f-8d0c-24d5dffdd371: No such file or directory (2)
+gemm_fp8_f16_big	[630466:630467:20260726,114946.123723:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/94434e28-a745-44d8-a5fb-11e1a6242368: No such file or directory (2)
 gemm_fp8_mod_4096_4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_fp8_mod_1024_4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_fp8_mod_14336_4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
@@ -90,8 +90,8 @@ gemm_q4k_i8_native_4096_14336_m512	/home/critix/repos/rust/TentaFlow/tentaflow-i
 gemm_q4k_i8_native_4096_14336_m1024	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_q4k_i8_native_4096_14336_m2048	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_q4k_i8_native_4096_14336_m4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
-gemm_q8_0_i8mma_triplet_single_bm64	[555983:555984:20260726,103912.115304:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/c4b3609b-8dd4-4700-a0d7-ef67235df7f9: No such file or directory (2)
-gemm_q8_0_i8mma_triplet_single_big	[556036:556037:20260726,103915.377482:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/e23b9414-cce1-4ef5-ad21-f92cf47c7362: No such file or directory (2)
+gemm_q8_0_i8mma_triplet_single_bm64	[633273:633274:20260726,115238.688522:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/25e13bd5-4565-4e61-af04-8ae3dfe805cc: No such file or directory (2)
+gemm_q8_0_i8mma_triplet_single_big	[633329:633330:20260726,115241.566890:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/63f18c58-28c7-4aa2-abd4-bfd038c202c0: No such file or directory (2)
 gemm_nvfp4_ct_bm16_qkv_m4	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_nvfp4_ct_bm16_qkv_m8	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 gemm_nvfp4_ct_bm16_qkv_m16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
@@ -131,4 +131,4 @@ attn_prefill_fa_mojo_device_pos_f16_hd256_bk32	/home/critix/repos/rust/TentaFlow
 attn_prefill_fa_mojo_f16_hd256_bk32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 attn_prefill_fa_mojo_f16_hd256_vtrans	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
 attn_prefill_fa_mojo_device_pos_f16_hd256_vtrans	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
-gemm_q8_0_i8mma_triplet_single_big_poststage	[564128:564129:20260726,104158.318522:ERROR http_transport_libcurl.cc:483] HTTP status 413
+gemm_q8_0_i8mma_triplet_single_big_poststage	[641215:641216:20260726,115514.631106:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/17ff9926-00e1-47cc-963b-8c94bf2e19eb: No such file or directory (2)

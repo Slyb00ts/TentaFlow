@@ -847,3 +847,4 @@ def attn_decode_combine_f16[head_dim: Int](
 
 comptime attn_decode_combine_f16_hd64 = attn_decode_combine_f16[64]
 comptime attn_decode_combine_f16_hd128 = attn_decode_combine_f16[128]
+comptime attn_decode_combine_f16_hd512 = attn_decode_combine_f16[512]

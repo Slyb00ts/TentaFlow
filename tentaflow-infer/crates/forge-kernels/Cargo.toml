@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Backend AMD dla testów kerneli (kompilowane razem z CUDA, wybór w forge-hal::gpu).
+hip = ["forge-hal/hip"]
+
 [dependencies]
 forge-types.workspace = true
 forge-hal.workspace = true

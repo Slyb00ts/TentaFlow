@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::cuda::PoolSizes;
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::{Kernels, Nvfp4GgufQ8Projection};
 use forge_types::MemKind;
@@ -14,8 +14,11 @@ use half::f16;
 
 const EPS: f32 = 1e-6;
 
-fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
+/// Otwarcie urządzenia przez wspólny selektor backendu — te testy muszą
+/// działać także na AMD (wcześniej wołały wprost CUDA i na innym sprzęcie
+/// pomijały się w ciszy, raportując „ok" bez żadnego pokrycia).
+fn device() -> Option<Arc<dyn Device>> {
+    match forge_hal::gpu::open(
         0,
         PoolSizes {
             weights: 256 << 20,
@@ -26,7 +29,7 @@ fn device() -> Option<Arc<CudaDevice>> {
     ) {
         Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("skipping CUDA golden tests: {e}");
+            eprintln!("brak urządzenia GPU dla golden tests: {e}");
             None
         }
     }
@@ -112,6 +115,44 @@ fn rmsnorm_matches_reference() {
         }
     }
     assert!(max_abs_err(&got, &want) < 0.01);
+}
+
+/// Silnik woła rmsnorm W MIEJSCU (normy Q/K/V pracują na buforze projekcji),
+/// przy cols równym rozmiarowi bloku — Gemma 4 ma head_dim 256 i 512.
+#[test]
+fn rmsnorm_in_place_matches_reference() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    for (rows, cols) in [(32usize, 256usize), (16, 512), (8, 128)] {
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| f16::from_f32(fill(i)).to_f32())
+            .collect();
+        let w: Vec<f32> = (0..cols)
+            .map(|i| f16::from_f32(1.0 + (i % 5) as f32 * 0.1).to_f32())
+            .collect();
+
+        let xb = upload_f16(dev.as_ref(), &x);
+        let wb = upload_f16(dev.as_ref(), &w);
+        kernels
+            .rmsnorm_f16(&xb, &xb, &wb, rows, cols, EPS, &stream)
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let got = download_f16(dev.as_ref(), &xb, rows * cols);
+        let mut want = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let row = &x[r * cols..(r + 1) * cols];
+            let ss: f32 = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+            let inv = 1.0 / (ss + EPS).sqrt();
+            for c in 0..cols {
+                want[r * cols + c] = row[c] * inv * w[c];
+            }
+        }
+        let err = max_abs_err(&got, &want);
+        assert!(err < 0.01, "rows={rows} cols={cols} max_err={err}");
+    }
 }
 
 #[test]
@@ -1918,7 +1959,7 @@ fn attn_decode_matches_reference() {
     kernels
         .attn_decode_f16(
             &ob, &ob, &qb, &kb, &vb, &ptb, &slb, n_seqs, n_q_heads, n_kv_heads, head_dim,
-            page_size, max_pages, scale, &stream,
+            page_size, max_pages, scale, 0, &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();

@@ -10745,6 +10745,7 @@ impl Kernels {
         let name = match head_dim {
             64 => "attn_decode_combine_f16_hd64",
             128 => "attn_decode_combine_f16_hd128",
+            512 => "attn_decode_combine_f16_hd512",
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_decode_combine: head_dim {other} has no compiled specialization"

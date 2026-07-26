@@ -857,13 +857,21 @@ impl ModelDescriptor {
         // QK-norm granularity: OLMoE normalizes the whole q/k projection, so its
         // attn_q_norm vector spans n_heads*head_dim; Qwen3 normalizes per head,
         // so its vector spans head_dim. Read the resolved tensor's element count.
+        // Porównanie musi używać head_dim WARSTWY 0 — przy naprzemiennej
+        // geometrii (Gemma 4) warstwy okienne mają węższe głowice niż globalne,
+        // a pomyłka tutaj normalizuje całą projekcję wagą długości jednej
+        // głowicy i czyta poza bufor.
+        let head_dim_layer0 = match &alt_attn {
+            Some(alt) if alt.sliding.first().copied().unwrap_or(false) => alt.head_dim_swa,
+            _ => head_dim,
+        };
         let qk_norm_over_hidden = layers
             .first()
             .and_then(|m| m.get(&WeightRole::AttnQNorm))
             .and_then(|n| gguf.tensor(n))
             .map(|t| {
                 let numel: usize = t.dims.iter().map(|&d| d as usize).product();
-                numel != head_dim
+                numel != head_dim_layer0
             })
             .unwrap_or(false);
 

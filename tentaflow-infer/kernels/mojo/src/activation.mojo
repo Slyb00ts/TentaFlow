@@ -33,8 +33,11 @@ def gelu_mul_f16(
     if i < n:
         g = Float32(gate[i])
         inner = 0.7978845608028654 * (g + 0.044715 * g * g * g)
-        e = exp(2.0 * inner)
-        tanh_inner = (e - 1.0) / (e + 1.0)
+        # tanh liczone jako 1 - 2/(exp(2x)+1): przy dużych bramkach (|g| ~ 30,
+        # realne w FFN) exp(2x) przelewa się do inf, a ta postać nasyca się wtedy
+        # do +-1. Wariant (e-1)/(e+1) dawał inf/inf = NaN, co ścieżka int8
+        # kwantyzacji aktywacji zamieniała w ciche śmieci.
+        tanh_inner = 1.0 - 2.0 / (exp(2.0 * inner) + 1.0)
         out_ptr[i] = Float16(0.5 * g * (1.0 + tanh_inner) * Float32(up[i]))
 
 

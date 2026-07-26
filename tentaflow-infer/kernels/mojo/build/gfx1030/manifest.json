@@ -25,6 +25,10 @@
       "entry": "src_attention_attn_decode_comb6A6A6A6A_06bc92fa08f34cc1",
       "file": "attn_decode_combine_f16_hd128.hsaco"
     },
+    "attn_decode_combine_f16_hd512": {
+      "entry": "src_attention_attn_decode_comb6A6A6A6A_7bf9bd1eeec8b92d",
+      "file": "attn_decode_combine_f16_hd512.hsaco"
+    },
     "attn_decode_combine_f16_hd64": {
       "entry": "src_attention_attn_decode_comb6A6A6A6A_3d1ae64984dc1d10",
       "file": "attn_decode_combine_f16_hd64.hsaco"
@@ -1429,13 +1433,13 @@
       "entry": "src_rope_rope_neox_f16_Point6A6A6A6AoA6A6A_8a932abd69147e53",
       "file": "rope_neox_f16.hsaco"
     },
+    "rope_neox_ff_f16": {
+      "entry": "src_rope_rope_neox_ff_f16_Po6A6A6A6AoA6A6A_b4999ebc05a6b39f",
+      "file": "rope_neox_ff_f16.hsaco"
+    },
     "rope_neox_partial_f16": {
       "entry": "src_rope_rope_neox_partial_f166A6A6A6A_9826f64eca47f6e1",
       "file": "rope_neox_partial_f16.hsaco"
-    },
-    "scale_dev_f16": {
-      "entry": "src_activation_scale_dev_f166A6A6A6AoA6A_f688e75ca263d206",
-      "file": "scale_dev_f16.hsaco"
     },
     "scale_f16": {
       "entry": "src_activation_scale_f16_Poi6A6A6A6AoA6A6A_47ddc170ace423e5",

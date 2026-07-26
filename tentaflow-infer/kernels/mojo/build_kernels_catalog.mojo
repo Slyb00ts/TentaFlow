@@ -284,6 +284,7 @@ from src.attention import (
 from src.attention import (
     attn_decode_combine_f16_hd64,
     attn_decode_combine_f16_hd128,
+    attn_decode_combine_f16_hd512,
 )
 from src.attention_gqa import attn_decode_split_gqa4_f16_hd128
 from src.attention_gqa_combine import attn_decode_combine_gqa2_f16_hd128
@@ -2107,6 +2108,11 @@ def main() raises:
         dump_asm=Path("attn_decode_combine_f16_hd128.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_decode_combine_f16_hd128"))
+    _ = ctx.compile_function[
+        attn_decode_combine_f16_hd512,
+        dump_asm=Path("attn_decode_combine_f16_hd512.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_combine_f16_hd512"))
 
     _ = ctx.compile_function[
         attn_decode_split_gqa4_f16_hd128,
