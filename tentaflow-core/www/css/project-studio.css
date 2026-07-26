@@ -1611,14 +1611,52 @@
 
 .ps-tests-toolbar {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 8px;
   flex-wrap: wrap;
   margin-bottom: 12px;
 }
 
-.ps-tests-toolbar tf-searchbox {
-  min-width: 220px;
+/* tf-select and tf-searchbox are block/100% by default (correct inside forms).
+   In a toolbar that makes every control claim a full line and pushes the rest
+   onto the next one — a five-row stack over a two-row table. Here they size to
+   content, the search box takes the slack, and actions ride to the right. */
+.ps-tests-toolbar tf-searchbox,
+.ps-filters-row tf-searchbox {
+  flex: 1 1 240px;
+  min-width: 190px;
+  max-width: 460px;
+}
+
+.ps-tests-toolbar tf-select,
+.ps-tests-toolbar tf-input,
+.ps-tests-toolbar tf-combobox,
+.ps-filters-row tf-select,
+.ps-filters-row tf-input {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 140px;
+}
+
+.ps-tests-toolbar tf-segmented,
+.ps-tests-toolbar tf-filter-chips,
+.ps-tests-toolbar .ps-toggle-inline,
+.ps-tests-toolbar tf-button,
+.ps-filters-row tf-segmented,
+.ps-filters-row tf-button {
+  flex: 0 0 auto;
+}
+
+.ps-tests-toolbar .ps-toolbar-spacer,
+.ps-filters-row .ps-toolbar-spacer {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* Date range inputs in the reports toolbar stay compact. */
+.ps-reports-toolbar tf-input {
+  min-width: 130px;
 }
 
 .ps-bulk-bar {
