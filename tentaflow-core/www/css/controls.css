@@ -1216,6 +1216,13 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
 }
 .tf-table__expanded-region { padding: var(--tf-space-sm) var(--tf-space-md); }
 .tf-table__select-all { margin-right: var(--tf-space-xs); vertical-align: middle; }
+/* Per-row checkbox shares the first data cell with its content. */
+td:has(> .tf-table__row-select) {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+}
+.tf-table__row-select { flex: 0 0 auto; }
 /* Two-line cell: primary label plus a muted identifier/description below. */
 .tf-table__cell-title { color: var(--tf-text); }
 .tf-table__cell-sub {

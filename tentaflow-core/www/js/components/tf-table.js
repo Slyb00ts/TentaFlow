@@ -446,6 +446,7 @@ class TfTable extends HTMLElement {
   _buildRow(cols, row, idx) {
     const rtr = document.createElement('tr');
     rtr.dataset.idx = String(idx);
+    if (row && row._selected) rtr.classList.add('selected');
     const stickySet = this._stickyColumnIndices(cols);
     this._appendLeadingCells(rtr, row, idx);
     cols.forEach((col, i) => {
@@ -453,7 +454,16 @@ class TfTable extends HTMLElement {
       td.dataset.label = col.label;
       if (col.renderer === 'num' || col.align === 'num') td.classList.add('num');
       if (stickySet.has(i)) this._applySticky(td, i);
-      this._writeCell(td, col, row[col.key]);
+      // The select-all box lives in the first header cell, so the per-row box
+      // belongs in the matching first data cell — no extra column.
+      if (i === 0 && this._isMultiSelect()) {
+        const cb = document.createElement('tf-checkbox');
+        cb.className = 'tf-table__row-select';
+        cb.setAttribute('aria-label', 'Zaznacz wiersz');
+        if (row && row._selected) cb.setAttribute('checked', '');
+        td.appendChild(cb);
+      }
+      this._writeCell(td, col, row[col.key], i === 0 && this._isMultiSelect());
       rtr.appendChild(td);
     });
     if (this._rowActions) {
@@ -496,7 +506,13 @@ class TfTable extends HTMLElement {
     else td.replaceChildren();
   }
 
-  _writeCell(td, col, value) {
+  _writeCell(td, col, value, keepExisting = false) {
+    if (keepExisting) {
+      const holder = document.createElement('span');
+      this._writeCell(holder, col, value);
+      td.appendChild(holder);
+      return;
+    }
     if (col.renderer === 'chip') {
       const chip = typeof value === 'object' && value
         ? value
@@ -624,9 +640,9 @@ class TfTable extends HTMLElement {
     // Wiersz ekspansji nie jest wierszem danych — ignoruj.
     if (!tr || tr.classList.contains('tf-table__expansion-row')) return;
     const idx = parseInt(tr.dataset.idx, 10);
-    if (this.hasAttribute('selectable')) {
-      tr.classList.toggle('selected');
-    }
+    // Selection is checkbox-driven; a row click stays a plain open action so a
+    // table can both select rows and drill into them.
+    if (e.target.closest('.tf-table__row-select')) return;
     const row = this._sortedRows()[idx];
     this.dispatchEvent(new CustomEvent('row-click', {
       bubbles: true,
@@ -656,6 +672,19 @@ class TfTable extends HTMLElement {
   _onChange(e) {
     const target = e.target;
     if (!target || !target.closest) return;
+    const rowBox = target.closest('.tf-table__row-select');
+    if (rowBox) {
+      const tr = rowBox.closest('tbody tr');
+      const idx = tr ? parseInt(tr.dataset.idx, 10) : NaN;
+      if (!Number.isInteger(idx)) return;
+      const checked = typeof target.checked === 'boolean' ? target.checked : !!rowBox.checked;
+      tr.classList.toggle('selected', checked);
+      this.dispatchEvent(new CustomEvent('row-select', {
+        bubbles: true,
+        detail: { row: this._sortedRows()[idx], index: idx, selected: checked },
+      }));
+      return;
+    }
     const box = target.closest('.tf-table__select-all');
     if (!box) return;
     // Host odzwierciedla stan atrybutem; input niesie go wprost.

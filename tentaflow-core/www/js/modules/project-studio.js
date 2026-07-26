@@ -4377,7 +4377,6 @@ function renderCasesTable() {
   }
   tableHost.innerHTML = `
     <tf-table id="ps-cases-table" selectable="multi" sortable page-size="${F2_PAGE_SIZE}" total="${s.cases.total}" page="${s.cases.page}">
-      <tf-column key="sel" label=""></tf-column>
       <tf-column key="title" label="${escapeAttr(t('cases_col_title'))}" renderer="html" sortable></tf-column>
       <tf-column key="kind" label="${escapeAttr(t('cases_col_kind'))}" renderer="chip"></tf-column>
       <tf-column key="priority" label="${escapeAttr(t('cases_col_priority'))}" renderer="chip"></tf-column>
@@ -4397,7 +4396,7 @@ function renderCasesTable() {
       return {
         _id: caseId,
         _row: c,
-        sel: s.cases.selected.has(caseId) ? '✓' : '',
+        _selected: s.cases.selected.has(caseId),
         title: `<div class="tf-table__cell-title">${escapeHtml(c.title)}</div>`
           + `<div class="tf-table__cell-sub">${escapeHtml(shortId(caseId))}</div>`,
         kind: chipCell('info', t(`case_kind_${c.kind}`)),
@@ -4439,17 +4438,22 @@ function renderCasesTable() {
   };
   table.addEventListener('row-click', (e) => {
     const caseId = e.detail?.row?._id;
+    if (caseId) openCaseEditor(caseId);
+  });
+  table.addEventListener('row-select', (e) => {
+    const caseId = e.detail?.row?._id;
     if (!caseId) return;
-    if (s.cases.selected.has(caseId)) s.cases.selected.delete(caseId);
-    else s.cases.selected.add(caseId);
-    assignRows();
+    if (e.detail.selected) s.cases.selected.add(caseId);
+    else s.cases.selected.delete(caseId);
     updateCasesBulkBar();
+    syncCasesFooter();
   });
   table.addEventListener('select-all', (e) => {
     if (e.detail?.selected) s.cases.rows.forEach((c) => s.cases.selected.add(fv(c, 'case_id')));
     else s.cases.selected = new Set();
     assignRows();
     updateCasesBulkBar();
+    syncCasesFooter();
   });
   table.addEventListener('page-change', async (e) => {
     s.cases.page = Number(e.detail?.page ?? 1);
