@@ -159,6 +159,19 @@ impl Hyperparams {
         }
     }
 
+    /// Geometria, na którą rozmiarowany jest cache KV: musi pomieścić
+    /// NAJSZERSZĄ warstwę modelu. Przy naprzemiennej uwadze (Gemma 4) warstwy
+    /// różnią się liczbą głowic KV i szerokością głowicy, a każda adresuje swój
+    /// slab własnymi wymiarami — mieści się wtedy w tym zakresie. Dla modeli
+    /// jednorodnych zwraca dokładnie `n_kv_heads` i `head_dim`.
+    pub fn kv_cache_head_dim(&self) -> usize {
+        self.max_head_dim()
+    }
+
+    pub fn kv_cache_heads(&self) -> usize {
+        self.max_kv_dim().div_ceil(self.max_head_dim())
+    }
+
     /// Podstawa rope warstwy `layer`. Gemma 4 ma dwie: 1e4 dla warstw okiennych
     /// i 1e6 dla globalnych.
     pub fn rope_theta_at(&self, layer: usize) -> f32 {

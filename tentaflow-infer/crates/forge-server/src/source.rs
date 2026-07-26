@@ -228,7 +228,7 @@ pub fn kv_pool_bytes(
     let p = &desc.params;
     let overflow = || anyhow::anyhow!("rozmiar puli KV przekracza zakres usize");
     let slots = p
-        .n_kv_heads
+        .kv_cache_heads()
         .checked_mul(kv_page_size)
         .and_then(|value| value.checked_mul(kv_pages))
         .ok_or_else(overflow)?;
@@ -237,12 +237,12 @@ pub fn kv_pool_bytes(
         let pages = b / granularity + usize::from(!b.is_multiple_of(granularity));
         pages.checked_mul(granularity).ok_or_else(overflow)
     };
-    let per_layer_pair = if let Some(pb) = quant.packed_bytes(p.head_dim)? {
+    let per_layer_pair = if let Some(pb) = quant.packed_bytes(p.kv_cache_head_dim())? {
         // Rot przechowuje residual ring F16, kody niskobitowe i skale F16.
         let ring_slots = quant.ring_slots().unwrap_or(1);
         let ring = ring_slots
-            .checked_mul(p.n_kv_heads)
-            .and_then(|value| value.checked_mul(p.head_dim))
+            .checked_mul(p.kv_cache_heads())
+            .and_then(|value| value.checked_mul(p.kv_cache_head_dim()))
             .and_then(|value| value.checked_mul(quant.slab_dtype().size()))
             .ok_or_else(overflow)?;
         let packed = slots.checked_mul(pb).ok_or_else(overflow)?;
@@ -256,7 +256,7 @@ pub fn kv_pool_bytes(
             .ok_or_else(overflow)?
     } else {
         let slab = slots
-            .checked_mul(p.head_dim)
+            .checked_mul(p.kv_cache_head_dim())
             .and_then(|value| value.checked_mul(quant.slab_dtype().size()))
             .ok_or_else(overflow)?;
         2usize.checked_mul(round(slab)?).ok_or_else(overflow)?

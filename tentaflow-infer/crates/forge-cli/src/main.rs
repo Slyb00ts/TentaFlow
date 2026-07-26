@@ -767,9 +767,9 @@ fn tier_stage_bytes(
 ) -> Result<usize> {
     2usize
         .checked_mul(ctx_pages)
-        .and_then(|value| value.checked_mul(desc.params.n_kv_heads))
+        .and_then(|value| value.checked_mul(desc.params.kv_cache_heads()))
         .and_then(|value| value.checked_mul(kv_page_size))
-        .and_then(|value| value.checked_mul(desc.params.head_dim))
+        .and_then(|value| value.checked_mul(desc.params.kv_cache_head_dim()))
         .and_then(|value| value.checked_mul(quant.slab_dtype().size()))
         .context("rozmiar bufora staging KV przekracza zakres usize")
 }

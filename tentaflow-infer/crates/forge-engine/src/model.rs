@@ -2293,109 +2293,6 @@ pub(crate) fn hybrid_prefill_b2_backend_capable(vendor: Vendor, warp_size: u32) 
 /// normalizowana PRZED dodaniem do rezyduum. Architektury bez tych tensorów nie
 /// wykonują tu żadnego kernela.
 
-/// TYMCZASOWA sonda diagnostyczna: czyta bufor f16 i raportuje pierwsze NaN/inf.
-fn probe_nan(device: &dyn Device, buf: &DevBuffer, n: usize, tag: &str) {
-    if std::env::var("FORGE_NAN_PROBE").is_err() {
-        return;
-    }
-    let _ = device.synchronize();
-    let mut bytes = vec![0u8; n * 2];
-    if device.read(buf, 0, &mut bytes).is_err() {
-        eprintln!("probe {tag}: odczyt nieudany");
-        return;
-    }
-    let mut bad = 0usize;
-    let mut first = 0usize;
-    let mut sample = 0.0f32;
-    for i in 0..n {
-        let v = f16::from_bits(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])).to_f32();
-        if !v.is_finite() {
-            if bad == 0 {
-                first = i;
-                sample = v;
-            }
-            bad += 1;
-        } else if i == 0 {
-            sample = v;
-        }
-    }
-    let mut idx = Vec::new();
-    for i in 0..n {
-        let v = f16::from_bits(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])).to_f32();
-        if !v.is_finite() && idx.len() < 24 {
-            idx.push(i);
-        }
-    }
-    let mut amax = 0.0f32;
-    let mut asum = 0.0f32;
-    for i in 0..n {
-        let v = f16::from_bits(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])).to_f32();
-        if v.is_finite() {
-            amax = amax.max(v.abs());
-            asum += v.abs();
-        }
-    }
-    let mut plain = 0.0f32;
-    for i in 0..n {
-        let v = f16::from_bits(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])).to_f32();
-        if v.is_finite() {
-            plain += v;
-        }
-    }
-    eprintln!("sum {tag}: n={n} bad={bad} amax={amax:.4} sum={plain:.4}");
-    let _ = asum;
-    let at = |i: usize| -> f32 {
-        if i * 2 + 1 < bytes.len() {
-            f16::from_bits(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])).to_f32()
-        } else {
-            0.0
-        }
-    };
-    let _ = (first, sample, idx);
-    eprintln!(
-        "val {tag}: h0=[{:.4}, {:.4}, {:.4}] h1=[{:.4}, {:.4}, {:.4}] h8=[{:.4}, {:.4}, {:.4}]",
-        at(0), at(1), at(2),
-        at(256), at(257), at(258),
-        at(2048), at(2049), at(2050)
-    );
-    if n > 3 {
-        eprintln!(
-            "tail {tag}: [{:.4}, {:.4}, {:.4}]",
-            at(n - 3),
-            at(n - 2),
-            at(n - 1)
-        );
-    }
-}
-
-
-/// TYMCZASOWA sonda: top-5 logitów f32.
-fn probe_logits(device: &dyn Device, buf: &DevBuffer, n: usize, tag: &str) {
-    if std::env::var("FORGE_NAN_PROBE").is_err() {
-        return;
-    }
-    let _ = device.synchronize();
-    let mut bytes = vec![0u8; n * 4];
-    if device.read(buf, 0, &mut bytes).is_err() {
-        return;
-    }
-    let vals: Vec<f32> = (0..n)
-        .map(|i| {
-            f32::from_le_bytes([
-                bytes[4 * i],
-                bytes[4 * i + 1],
-                bytes[4 * i + 2],
-                bytes[4 * i + 3],
-            ])
-        })
-        .collect();
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| vals[b].partial_cmp(&vals[a]).unwrap_or(std::cmp::Ordering::Equal));
-    let top: Vec<(usize, f32)> = idx.iter().take(5).map(|&i| (i, vals[i])).collect();
-    let bad = vals.iter().filter(|v| !v.is_finite()).count();
-    eprintln!("logits {tag}: n={n} bad={bad} top={top:?}");
-}
-
 fn pre_residual_norm(
     kernels: &Kernels,
     norm: Option<&DevBuffer>,
@@ -2604,8 +2501,13 @@ impl Model {
             device.as_ref(),
             KvConfig {
                 n_layers: kv_layer_map.kv_layers(),
-                n_kv_heads: p.n_kv_heads,
-                head_dim: p.head_dim,
+                // Cache mieści NAJSZERSZĄ warstwę: przy naprzemiennej geometrii
+                // (Gemma 4: 8x256 okienne, 1x512 globalne) każda warstwa adresuje
+                // swój slab własnymi wymiarami i mieści się w tym zakresie, a
+                // warstwy węższe używają początku każdej strony. Dla modeli
+                // jednorodnych ta faktoryzacja daje dokładnie n_kv_heads.
+                n_kv_heads: p.kv_cache_heads(),
+                head_dim: p.kv_cache_head_dim(),
                 page_size: cfg.kv_page_size,
                 n_pages: cfg.kv_pages,
                 max_pages_per_seq,
@@ -3865,6 +3767,14 @@ impl Model {
         if p.hidden_size > 8192 {
             return false;
         }
+        // Naprzemienna geometria uwagi (Gemma 4: warstwy okienne 256/8 głowic i
+        // globalne 512/1, dwie podstawy rope) nie da się wyrazić w fused
+        // `qkv_post`, który zapieka jedną geometrię i jedną podstawę rope na całe
+        // wywołanie. Takie modele idą ścieżką rozdzielną, liczącą wymiary per
+        // warstwa.
+        if p.alt_attn.is_some() {
+            return false;
+        }
         weights.layers.iter().all(|l| {
             // Routed MoE FFN has no fused single-GEMV decode kernel; MoE models
             // take the dedicated routed path (never this fused chain).
@@ -4702,12 +4612,10 @@ impl Model {
         // Ograniczenie logitów (Gemma): cap * tanh(x / cap). Nakładane tutaj, bo
         // to jedyne wyjście głowy — sampling i logprob widzą już wartości po capie.
         let cap = self.weights.descriptor.params.final_logit_softcap;
-        probe_logits(self.device.as_ref(), y_f32, weight.rows(), "pre_cap");
         if cap > 0.0 {
             self.kernels
                 .softcap_f32(y_f32, y_off, weight.rows(), cap, stream)?;
         }
-        probe_logits(self.device.as_ref(), y_f32, weight.rows(), "post_cap");
         Ok(())
     }
 
@@ -5781,21 +5689,6 @@ impl Model {
             }
             trace.mark(self.device.as_ref(), "gemm_qkv");
 
-            if std::env::var("FORGE_NAN_PROBE").is_ok() {
-                eprintln!(
-                    "dims l={l} t={t} q_dim={q_dim} kv_dim={kv_dim} head_dim={head_dim} | q={:#x}+{} k={:#x}+{} v={:#x}+{} attn={:#x}+{} x={:#x}+{} h={:#x}+{}",
-                    pb.q.device_ptr(), pb.q.len(),
-                    pb.k.device_ptr(), pb.k.len(),
-                    pb.v.device_ptr(), pb.v.len(),
-                    pb.attn_out.device_ptr(), pb.attn_out.len(),
-                    pb.x.device_ptr(), pb.x.len(),
-                    pb.h.device_ptr(), pb.h.len(),
-                );
-            }
-            probe_nan(self.device.as_ref(), &pb.x, rows * hidden, &format!("l{l}.x"));
-            probe_nan(self.device.as_ref(), &pb.q, rows * q_dim, &format!("l{l}.q_gemm"));
-            probe_nan(self.device.as_ref(), &pb.k, rows * kv_dim, &format!("l{l}.k_gemm"));
-            probe_nan(self.device.as_ref(), &pb.v, rows * kv_dim, &format!("l{l}.v_gemm"));
             // QK-norm granularity: OLMoE normalizes the whole q/k projection
             // once per token (rows = t), Qwen3 normalizes per head (rows =
             // t*n_heads). Dense non-OLMoE arches keep the per-head form
@@ -5834,13 +5727,6 @@ impl Model {
                 )?;
             }
 
-            if let Some(qn) = &layer.attn().q_norm {
-                probe_nan(self.device.as_ref(), qn, head_dim, &format!("l{l}.qn_w"));
-            }
-            probe_nan(self.device.as_ref(), &pb.q, rows * q_dim, &format!("l{l}.q_rows16"));
-            probe_nan(self.device.as_ref(), &pb.k, rows * kv_dim, &format!("l{l}.k_norm"));
-            probe_nan(self.device.as_ref(), &pb.q, rows * q_dim, &format!("l{l}.q_normed"));
-            probe_nan(self.device.as_ref(), &pb.v, rows * kv_dim, &format!("l{l}.v_normed"));
             kernels.rope_neox_f16(
                 &pb.q,
                 &pb.positions,
@@ -6141,23 +6027,6 @@ impl Model {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, rows, stream)?;
             }
             trace.mark(self.device.as_ref(), "gemm_o");
-            probe_nan(self.device.as_ref(), &pb.q, rows * q_dim, &format!("l{l}.q"));
-            probe_nan(self.device.as_ref(), &pb.k, rows * kv_dim, &format!("l{l}.k"));
-            probe_nan(self.device.as_ref(), &pb.v, rows * kv_dim, &format!("l{l}.v"));
-            probe_nan(
-                self.device.as_ref(),
-                &pb.attn_out,
-                rows * q_dim,
-                &format!("l{l}.attn"),
-            );
-            probe_nan(
-                self.device.as_ref(),
-                &pb.o_out,
-                rows * hidden,
-                &format!("l{l}.o"),
-            );
-            probe_nan(self.device.as_ref(), &pb.attn_out, rows * q_dim, &format!("l{l}.kqv"));
-            probe_nan(self.device.as_ref(), &pb.o_out, rows * hidden, &format!("l{l}.o_proj"));
             pre_residual_norm(
                 kernels,
                 layer.post_attn_norm.as_ref(),
@@ -6167,7 +6036,6 @@ impl Model {
                 eps,
                 stream,
             )?;
-            probe_nan(self.device.as_ref(), &pb.o_out, rows * hidden, &format!("l{l}.attn_post"));
             let fp8mod_fuse_gateup =
                 (fp8mod_fuse || fp8mod_ffn_fuse) && matches!(layer.ffn, LayerFfn::Dense(_));
             if fp8mod_fuse_gateup {
@@ -6274,9 +6142,6 @@ impl Model {
             };
             // This norm feeds the NEXT layer's q/k/v (or, for the last layer, the
             // logit head — never fused, keeps the f16 hidden state).
-            probe_nan(self.device.as_ref(), &pb.gate, rows * inter, &format!("l{l}.ffn_gate"));
-            probe_nan(self.device.as_ref(), &pb.act, rows * inter, &format!("l{l}.ffn_geglu"));
-            probe_nan(self.device.as_ref(), &pb.down, rows * hidden, &format!("l{l}.ffn_out"));
             pre_residual_norm(
                 kernels,
                 layer.post_ffw_norm.as_ref(),
@@ -6303,12 +6168,6 @@ impl Model {
                 stream,
             )?;
             trace.mark(self.device.as_ref(), "norm_res2");
-            probe_nan(
-                self.device.as_ref(),
-                &pb.h,
-                rows * hidden,
-                &format!("l{l}.h"),
-            );
         }
 
         if wait_for_completion || tier_t0.is_some() {
@@ -12173,6 +12032,7 @@ impl Model {
                 // offsety sekcji scalonego q|k|v muszą być liczone W PĘTLI —
                 // policzone raz dla całego modelu wskazywały poza bufor warstwy.
                 let head_dim = p.head_dim_at(l);
+                let n_kv_heads = p.n_kv_heads_at(l);
                 let scale = p.attn_scale_at(l);
                 let q_dim = p.n_heads * head_dim;
                 let kv_dim = p.n_kv_heads_at(l) * head_dim;
@@ -12205,8 +12065,8 @@ impl Model {
                             &self.page_table_dev,
                             &self.seq_len_dev,
                             p.n_heads,
-                            p.n_kv_heads,
-                            p.head_dim,
+                            n_kv_heads,
+                            head_dim,
                             self.kv.cfg.page_size,
                             eps,
                             p.rope_theta_at(l),
@@ -12236,8 +12096,8 @@ impl Model {
                             &self.page_table_dev,
                             &self.seq_len_dev,
                             p.n_heads,
-                            p.n_kv_heads,
-                            p.head_dim,
+                            n_kv_heads,
+                            head_dim,
                             self.kv.cfg.page_size,
                             eps,
                             p.rope_theta_at(l),
@@ -12302,9 +12162,9 @@ impl Model {
                             &b.v,
                             &self.page_table_dev,
                             &self.seq_len_dev,
-                            p.n_kv_heads,
+                            n_kv_heads,
                             self.kv.cfg.page_size,
-                            p.head_dim,
+                            head_dim,
                             stream,
                         )?;
                         &b.q
@@ -12323,8 +12183,8 @@ impl Model {
                             &self.seq_len_dev,
                             1,
                             p.n_heads,
-                            p.n_kv_heads,
-                            p.head_dim,
+                            n_kv_heads,
+                            head_dim,
                             self.kv.cfg.page_size,
                             self.max_pages_per_seq,
                             scale,
@@ -12353,8 +12213,8 @@ impl Model {
                             &self.seq_len_dev,
                             1,
                             p.n_heads,
-                            p.n_kv_heads,
-                            p.head_dim,
+                            n_kv_heads,
+                            head_dim,
                             self.kv.cfg.page_size,
                             self.max_pages_per_seq,
                             scale,
@@ -12365,6 +12225,15 @@ impl Model {
                 }
 
                 self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
+                pre_residual_norm(
+                    kernels,
+                    layer.post_attn_norm.as_ref(),
+                    &b.o_out,
+                    1,
+                    hidden,
+                    eps,
+                    stream,
+                )?;
                 kernels.rmsnorm_residual_f16(
                     &b.x,
                     &b.h,
@@ -12394,8 +12263,18 @@ impl Model {
                 } else {
                     &self.weights.output_norm
                 };
+                pre_residual_norm(
+                    kernels,
+                    layer.post_ffw_norm.as_ref(),
+                    &b.down,
+                    1,
+                    hidden,
+                    eps,
+                    stream,
+                )?;
                 kernels
                     .rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
+                layer_output_scale(kernels, layer.layer_output_scale, &b.h, hidden, stream)?;
             }
 
             self.logits_gemv(&b.logits, &b.x, stream)

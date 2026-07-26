@@ -2642,7 +2642,15 @@ impl ModelWeights {
             } else {
                 fetch_matrix(src, name(WeightRole::AttnK)?)?
             };
-            let attn_qkv = match fuse_rows(vec![q, k, v]) {
+            // Modele z naprzemienną geometrią uwagi (Gemma 4) nie scalają q|k|v:
+            // dekodowanie musi liczyć normy i rope per warstwa (dwie podstawy
+            // rope, head_dim 256/512), czego fused `qkv_post` nie wyraża.
+            let fused_qkv_allowed = p.alt_attn.is_none();
+            let attn_qkv = match if fused_qkv_allowed {
+                fuse_rows(vec![q, k, v])
+            } else {
+                Err(vec![q, k, v])
+            } {
                 Ok(fused) => {
                     fused_qkv_layers += 1;
                     QkvWeights::Fused(upload_target_weight(device, fused, target_tile, nvfp4_ct)?)
@@ -2651,7 +2659,11 @@ impl ModelWeights {
                     let v = parts.pop().expect("three parts");
                     let k = parts.pop().expect("three parts");
                     let q = parts.pop().expect("three parts");
-                    match fuse_rows(vec![q, k]) {
+                    match if fused_qkv_allowed {
+                        fuse_rows(vec![q, k])
+                    } else {
+                        Err(vec![q, k])
+                    } {
                         Ok(qk) => {
                             fused_qk_layers += 1;
                             QkvWeights::FusedQk {
