@@ -27,6 +27,7 @@
 // która nie zwalnia pojedynczych bloków, więc realokacja i tak nie byłaby
 // możliwa.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use forge_hal::{DevBuffer, Device, Pool, Stream};
@@ -67,6 +68,10 @@ pub struct ExpertStack {
     slot_tier: Vec<ExpertTier>,
     table: DevBuffer,
     placement: Mutex<Placement>,
+    /// Kopia `slot_of.iter().all(is_some)` poza mutexem. Krok dekodowania pyta
+    /// o to dla każdej projekcji każdej warstwy, a to pytanie nie może
+    /// kosztować blokady.
+    all_resident: AtomicBool,
     n_experts: usize,
     rows_per_expert: usize,
     cols: usize,
@@ -141,10 +146,12 @@ impl ExpertStack {
         }
 
         let table = device.alloc(n_experts * 8, MemKind::Device, Pool::Weights)?;
+        let all_resident = AtomicBool::new(slot_of.iter().all(Option::is_some));
         let stack = Self {
             slots,
             slot_tier,
             table,
+            all_resident,
             placement: Mutex::new(Placement {
                 slot_of,
                 owner_of: resident,
@@ -173,6 +180,25 @@ impl ExpertStack {
         device.write(bytemuck::cast_slice(&addrs), &self.table, 0)
     }
 
+    /// Aktualizuje pojedyncze wpisy tablicy. Migracja i stronicowanie ruszają
+    /// kilka ekspertów, a nie cały stos — przepisywanie całości oznaczałoby
+    /// synchroniczny transfer na każde chybienie.
+    fn patch_table(&self, device: &dyn Device, experts: &[usize]) -> Result<()> {
+        let placement = self.placement.lock().expect("rozmieszczenie zatrute");
+        for &expert in experts {
+            let addr = match placement.slot_of[expert] {
+                Some(slot) => slot_buffer(&self.slots[slot])?.device_ptr(),
+                None => 0,
+            };
+            device.write(&addr.to_le_bytes(), &self.table, expert * 8)?;
+        }
+        self.all_resident.store(
+            placement.slot_of.iter().all(Option::is_some),
+            Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
     pub fn n_experts(&self) -> usize {
         self.n_experts
     }
@@ -192,12 +218,7 @@ impl ExpertStack {
     /// Czy każdy ekspert ma swój slot. Tylko wtedy wolno użyć ścieżki `_gidx`,
     /// bo tylko wtedy każdy możliwy wybór routera jest adresowalny.
     pub fn fully_resident(&self) -> bool {
-        self.placement
-            .lock()
-            .expect("rozmieszczenie zatrute")
-            .slot_of
-            .iter()
-            .all(Option::is_some)
+        self.all_resident.load(Ordering::Relaxed)
     }
 
     /// Waga eksperta — dla ścieżek, które znają wybór na hoście (prefill i
@@ -313,7 +334,7 @@ impl ExpertStack {
             placement.slot_of[promote] = Some(vram_slot);
             placement.slot_of[demote] = Some(host_slot);
         }
-        self.rewrite_table(device)
+        self.patch_table(device, &[promote, demote])
     }
 
     /// Ściąga z dysku wszystkie żądane eksperty, które nie są rezydentne, jednym
@@ -333,6 +354,7 @@ impl ExpertStack {
         popularity: &[f32],
     ) -> Result<usize> {
         let mut targets = Vec::new();
+        let mut touched = Vec::new();
         {
             let mut placement = self.placement.lock().expect("rozmieszczenie zatrute");
             let mut protected = vec![false; self.n_experts];
@@ -394,6 +416,8 @@ impl ExpertStack {
                 placement.slot_of[evicted] = None;
                 placement.slot_of[expert] = Some(slot);
                 placement.owner_of[slot] = expert;
+                touched.push(evicted);
+                touched.push(expert);
                 targets.push(SpillTarget { region, host_ptr });
             }
         }
@@ -402,7 +426,7 @@ impl ExpertStack {
         }
         let fetched = targets.len();
         spill.read_batch(&targets)?;
-        self.rewrite_table(device)?;
+        self.patch_table(device, &touched)?;
         Ok(fetched)
     }
 }
