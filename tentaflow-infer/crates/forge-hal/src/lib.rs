@@ -293,6 +293,11 @@ impl DevBuffer {
     pub fn host_ptr(&self) -> Option<*mut u8> {
         self.0.host_ptr()
     }
+
+    /// Uchwyt na implementację, żeby backend mógł zatrzymać rodzica pod-bufora.
+    pub(crate) fn impl_arc(&self) -> Arc<dyn BufferImpl> {
+        Arc::clone(&self.0)
+    }
 }
 
 impl Stream {
@@ -379,6 +384,16 @@ fn align_down(bytes: usize) -> usize {
     bytes / crate::arena::ALLOC_ALIGN * crate::arena::ALLOC_ALIGN
 }
 
+/// Wspólna kontrola zakresu pod-bufora dla wszystkich backendów.
+pub(crate) fn check_sub_range(parent_len: usize, offset: usize, len: usize) -> Result<()> {
+    if offset.checked_add(len).is_none_or(|end| end > parent_len) {
+        return Err(ForgeError::Device(format!(
+            "pod-bufor [{offset}, +{len}) wykracza poza rodzica o {parent_len} bajtach"
+        )));
+    }
+    Ok(())
+}
+
 pub trait Device: Send + Sync {
     fn caps(&self) -> &DeviceCaps;
 
@@ -386,6 +401,16 @@ pub trait Device: Send + Sync {
     /// `MemKind::Device`; host kinds allocate directly from the driver/OS.
     /// Freeing is RAII via `DevBuffer` drop.
     fn alloc(&self, bytes: usize, kind: MemKind, pool: Pool) -> Result<DevBuffer>;
+
+    /// Uchwyt na `len` bajtów wewnątrz `parent`, licząc od `offset`. Pamięć
+    /// pozostaje własnością rodzica — pod-bufor tylko go zatrzymuje, więc
+    /// zwolnienie następuje dopiero po zniknięciu ostatniego uchwytu.
+    ///
+    /// Istnieje dla rezydencji ekspertów MoE: pojedynczy ekspert musi być
+    /// osobnym uchwytem (własny wskaźnik urządzenia, własne miejsce w tablicy
+    /// wskaźników), ale alokowanie każdego z osobna oznaczałoby dziesiątki
+    /// tysięcy alokacji, a przy pamięci przypiętej — tyleż blokad stron.
+    fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer>;
 
     /// Liczba wolnych bajtów w puli urządzenia, gdy backend potrafi ją raportować.
     fn pool_available(&self, _pool: Pool) -> Option<usize> {

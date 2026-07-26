@@ -98,6 +98,15 @@ enum Backing {
         ctx: Arc<CudaContext>,
         dptr: sys::CUdeviceptr,
     },
+    /// Okno wewnątrz innej alokacji; zatrzymuje ją, ale niczego nie zwalnia.
+    Borrowed {
+        ctx: Arc<CudaContext>,
+        /// Trzymany wyłącznie po to, żeby rodzic przeżył pod-bufor.
+        #[allow(dead_code)]
+        parent: Arc<dyn BufferImpl>,
+        dptr: u64,
+        hptr: Option<*mut u8>,
+    },
 }
 
 struct CudaBuffer {
@@ -112,6 +121,7 @@ impl CudaBuffer {
             Backing::Pooled { pool, .. } => &pool.ctx,
             Backing::Pinned { ctx, .. } => ctx,
             Backing::Managed { ctx, .. } => ctx,
+            Backing::Borrowed { ctx, .. } => ctx,
         }
     }
 }
@@ -137,6 +147,7 @@ impl BufferImpl for CudaBuffer {
             // the device-visible address on every 64-bit CUDA platform.
             Backing::Pinned { ptr, .. } => *ptr as u64,
             Backing::Managed { dptr, .. } => *dptr,
+            Backing::Borrowed { dptr, .. } => *dptr,
         }
     }
 
@@ -145,6 +156,7 @@ impl BufferImpl for CudaBuffer {
             Backing::Pooled { .. } => None,
             Backing::Pinned { ptr, .. } => Some(*ptr as *mut u8),
             Backing::Managed { dptr, .. } => Some(*dptr as *mut u8),
+            Backing::Borrowed { hptr, .. } => *hptr,
         }
     }
 
@@ -180,6 +192,7 @@ impl Drop for CudaBuffer {
                 let _ = ctx.bind_to_thread();
                 let _ = unsafe { result::memory_free(*dptr) };
             }
+            Backing::Borrowed { .. } => {}
         }
     }
 }
@@ -603,6 +616,25 @@ impl Device for CudaDevice {
             bytes,
             kind,
             backing,
+        })))
+    }
+
+    fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer> {
+        let base = parent.downcast::<CudaBuffer>()?;
+        crate::check_sub_range(base.bytes, offset, len)?;
+        let ctx = base.ctx().clone();
+        let kind = base.kind;
+        let dptr = base.device_ptr() + offset as u64;
+        let hptr = base.host_ptr().map(|p| unsafe { p.add(offset) });
+        Ok(DevBuffer::from_impl(Arc::new(CudaBuffer {
+            bytes: len,
+            kind,
+            backing: Backing::Borrowed {
+                ctx,
+                parent: parent.impl_arc(),
+                dptr,
+                hptr,
+            },
         })))
     }
 

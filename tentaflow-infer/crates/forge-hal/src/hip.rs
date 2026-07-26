@@ -336,6 +336,12 @@ enum Backing {
     Pinned {
         ptr: *mut c_void,
     },
+    /// Okno wewnątrz innej alokacji; zatrzymuje ją, ale niczego nie zwalnia.
+    Borrowed {
+        /// Trzymany wyłącznie po to, żeby rodzic przeżył pod-bufor.
+        #[allow(dead_code)]
+        parent: Arc<dyn BufferImpl>,
+    },
 }
 
 struct HipBuffer {
@@ -372,6 +378,7 @@ impl Drop for HipBuffer {
             Backing::Pinned { ptr } => unsafe {
                 let _ = hipHostFree(*ptr);
             },
+            Backing::Borrowed { .. } => {}
         }
     }
 }
@@ -598,6 +605,21 @@ impl Device for HipDevice {
             },
             ptr,
             len: bytes,
+            kind,
+        })))
+    }
+
+    fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer> {
+        let base = parent.downcast::<HipBuffer>()?;
+        crate::check_sub_range(base.len, offset, len)?;
+        let ptr = unsafe { (base.ptr as *mut u8).add(offset) as *mut c_void };
+        let kind = base.kind;
+        Ok(DevBuffer::from_impl(Arc::new(HipBuffer {
+            backing: Backing::Borrowed {
+                parent: parent.impl_arc(),
+            },
+            ptr,
+            len,
             kind,
         })))
     }

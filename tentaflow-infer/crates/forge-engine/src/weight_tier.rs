@@ -116,6 +116,10 @@ impl Device for TieredWeightDevice {
         }
     }
 
+    fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer> {
+        self.inner.sub_buffer(parent, offset, len)
+    }
+
     fn caps(&self) -> &DeviceCaps {
         self.inner.caps()
     }
