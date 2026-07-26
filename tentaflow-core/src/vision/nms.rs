@@ -99,6 +99,23 @@ mod tests {
         assert!((r[0].score - 0.9).abs() < 1e-6);
     }
 
+    // A NaN score used to make the comparator inconsistent, and the standard
+    // sort aborts the process on that ("does not implement a total order").
+    #[test]
+    fn nms_znosi_nan_w_score_bez_paniki() {
+        let r = nms(
+            vec![
+                d(0.0, 0.0, 10.0, 10.0, f32::NAN),
+                d(20.0, 20.0, 30.0, 30.0, 0.8),
+                d(40.0, 40.0, 50.0, 50.0, 0.5),
+                d(60.0, 60.0, 70.0, 70.0, f32::NAN),
+                d(80.0, 80.0, 90.0, 90.0, 0.7),
+            ],
+            0.5,
+        );
+        assert_eq!(r.len(), 5);
+    }
+
     #[test]
     fn nms_zostawia_disjoint_boxes() {
         let r = nms(
