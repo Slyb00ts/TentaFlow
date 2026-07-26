@@ -171,9 +171,11 @@ impl Tokenizer {
         let mut inner = match vocab.model.as_str() {
             "gpt2" => build_gpt2(vocab)?,
             "llama" => build_spm(vocab)?,
+            "gemma4" => build_gemma4(vocab)?,
             other => {
                 return Err(ForgeError::Tokenizer(format!(
-                    "unsupported GGUF tokenizer model {other:?} (expected \"gpt2\" or \"llama\")"
+                    "unsupported GGUF tokenizer model {other:?} \
+                     (expected \"gpt2\", \"llama\" or \"gemma4\")"
                 )))
             }
         };
@@ -264,6 +266,63 @@ fn splits_then_byte_level(patterns: &[&str]) -> Result<PreTokenizerWrapper> {
 /// merges the same way transformers' GGUFLlamaConverter does: for every piece,
 /// every two-way split whose halves are both vocab entries becomes a merge
 /// candidate ranked by the piece score (higher score = earlier merge).
+/// Tokenizer rodziny Gemma 4: BPE z JAWNĄ tablicą merge'ów, ale w kształcie SPM.
+///
+/// Trzy rzeczy różnią go od `gpt2` i każda zmienia wynik tokenizacji:
+///  * spacje zamienia normalizator na `▁` (merge'e w pliku są zapisane właśnie
+///    w tej postaci), a NIE kodowanie bajtowe GPT-2 — dlatego bez `ByteLevel`;
+///  * pre-tokenizacja dzieli wyłącznie po nowych liniach (`[^\n]+|[\n]+`), bo
+///    merge'e biegną po całym tekście, a nie po słowach;
+///  * `add_space_prefix` jest w tym modelu wyłączone, więc nie doklejamy `▁`
+///    na początku (inaczej niż w ścieżce SPM).
+fn build_gemma4(vocab: &GgufVocab) -> Result<tokenizers::Tokenizer> {
+    if vocab.merges.is_empty() {
+        return Err(ForgeError::Tokenizer(
+            "GGUF gemma4 vocab wymaga tablicy merges".into(),
+        ));
+    }
+    let vocab_map = id_to_vocab_map(vocab);
+    let merges = vocab
+        .merges
+        .iter()
+        .map(|m| {
+            m.split_once(' ')
+                .map(|(l, r)| (l.to_string(), r.to_string()))
+                .ok_or_else(|| ForgeError::Tokenizer(format!("malformed GGUF merge entry {m:?}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let model = BPE::builder()
+        .vocab_and_merges(vocab_map, merges)
+        .ignore_merges(false)
+        .byte_fallback(false)
+        .fuse_unk(false)
+        .build()
+        .map_err(|e| ForgeError::Tokenizer(format!("failed to build gemma4 BPE model: {e}")))?;
+
+    let mut tokenizer = tokenizers::Tokenizer::new(model);
+    let replace: NormalizerWrapper = Replace::new(" ", "▁")
+        .map_err(|e| ForgeError::Tokenizer(format!("failed to build normalizer: {e}")))?
+        .into();
+    tokenizer
+        .with_normalizer(Some(replace))
+        .map_err(|e| ForgeError::Tokenizer(format!("failed to set normalizer: {e}")))?;
+
+    let split = Split::new(
+        SplitPattern::Regex("[^\n]+|[\n]+".to_string()),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    )
+    .map_err(|e| ForgeError::Tokenizer(format!("failed to build pre-tokenizer: {e}")))?;
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::from(split)));
+
+    tokenizer.with_decoder(Some(tokenizers::decoders::DecoderWrapper::from(
+        Replace::new("▁", " ")
+            .map_err(|e| ForgeError::Tokenizer(format!("failed to build decoder: {e}")))?,
+    )));
+    Ok(tokenizer)
+}
+
 fn build_spm(vocab: &GgufVocab) -> Result<tokenizers::Tokenizer> {
     if vocab.scores.len() != vocab.tokens.len() {
         return Err(ForgeError::Tokenizer(format!(

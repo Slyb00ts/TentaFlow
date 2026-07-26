@@ -42,19 +42,19 @@
       "file": "attn_decode_combine_rot_hd64.hsaco"
     },
     "attn_decode_f16_hd128": {
-      "entry": "src_attention_attn_decode_f166A6A6A6AcB_b07585d6fbd868f3",
+      "entry": "src_attention_attn_decode_f166A6A6A6AcB_bc40eb2ec50116dc",
       "file": "attn_decode_f16_hd128.hsaco"
     },
     "attn_decode_f16_hd256": {
-      "entry": "src_attention_attn_decode_f166A6A6A6AcB_eb77d2de47816e45",
+      "entry": "src_attention_attn_decode_f166A6A6A6AcB_5a885f55cc368488",
       "file": "attn_decode_f16_hd256.hsaco"
     },
     "attn_decode_f16_hd512": {
-      "entry": "src_attention_attn_decode_f166A6A6A6AcB_700ce7e042a270cf",
+      "entry": "src_attention_attn_decode_f166A6A6A6AcB_daedc854fa74e469",
       "file": "attn_decode_f16_hd512.hsaco"
     },
     "attn_decode_f16_hd64": {
-      "entry": "src_attention_attn_decode_f166A6A6A6AcB_15ddec5a64904745",
+      "entry": "src_attention_attn_decode_f166A6A6A6AcB_0e93f7ffeb5791a1",
       "file": "attn_decode_f16_hd64.hsaco"
     },
     "attn_decode_rot_hd128_b3": {
@@ -114,27 +114,27 @@
       "file": "attn_prefill_device_pos_f16_hd256.hsaco"
     },
     "attn_prefill_f16_hd128": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_e8fb11777a0f1f40",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_d86fc531dd856c39",
       "file": "attn_prefill_f16_hd128.hsaco"
     },
     "attn_prefill_f16_hd256": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_14915fe6e9868e4e",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_6602b51287014af8",
       "file": "attn_prefill_f16_hd256.hsaco"
     },
     "attn_prefill_f16_hd512": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_49f3d13ef39aae97",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_afcb3e22751fe940",
       "file": "attn_prefill_f16_hd512.hsaco"
     },
     "attn_prefill_f16_hd64": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_91deb869decbf0fd",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_0d568cff1332fa89",
       "file": "attn_prefill_f16_hd64.hsaco"
     },
     "attn_prefill_fp8_hd128": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_34f99087d2de6329",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_fcfdab28d69e6b77",
       "file": "attn_prefill_fp8_hd128.hsaco"
     },
     "attn_prefill_fp8_hd64": {
-      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_8d34a8eca0907bc2",
+      "entry": "src_prefill_attn_prefill_SIM6A6A6A6AcB6A6A_efb647c42c847944",
       "file": "attn_prefill_fp8_hd64.hsaco"
     },
     "attn_prefill_rot_hd128_b3": {
@@ -152,6 +152,14 @@
     "attn_prefill_rot_hd64_b4": {
       "entry": "src_rotkv_attn_prefill_rot_S6A6A6A6AcB6A6A_d8ee629d597883af",
       "file": "attn_prefill_rot_hd64_b4.hsaco"
+    },
+    "attn_prefill_segmented_f16_hd128": {
+      "entry": "src_prefill_attn_prefill_segme6A6A6A6A_13375cb5f5bd2993",
+      "file": "attn_prefill_segmented_f16_hd128.hsaco"
+    },
+    "attn_prefill_segmented_f16_hd256": {
+      "entry": "src_prefill_attn_prefill_segme6A6A6A6A_7ceccffb4ca01298",
+      "file": "attn_prefill_segmented_f16_hd256.hsaco"
     },
     "attn_verify_segmented_f16_hd128": {
       "entry": "src_attention_attn_verify_segm6A6A6A6A_5d6ea2bd9b705a84",

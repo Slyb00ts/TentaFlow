@@ -9238,6 +9238,8 @@ impl Model {
             mtp_kv.cfg.page_size,
             mtp_kv.cfg.max_pages_per_seq,
             1.0 / (head_dim as f32).sqrt(),
+            // Głowa MTP pracuje na pełnym kontekście swojej sekwencji.
+            0,
             stream,
         )?;
         self.kernels
