@@ -2347,6 +2347,25 @@ tf-contrib-tag {
    tf-stat-card
    ============================================================================= */
 
+/* =============================================================================
+   .icon inside shadow roots
+   -----------------------------------------------------------------------------
+   The base rule lives in style.css, which only reaches the light DOM. Components
+   adopt controls.css into their shadow root, so an .icon rendered inside a table
+   cell or any other shadow-rendered markup had NO size and expanded to the SVG
+   default (300x150) — single table rows grew to ~180px tall.
+   ============================================================================= */
+.icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  flex-shrink: 0;
+}
+
 /* A grid or flex row stretches the HOST, but the frame lives on the inner
    .tf-stat-card — without height:100% each card shrinks to its own content and
    a row of cards ends up ragged whenever only some of them carry a delta line. */

@@ -4157,9 +4157,11 @@ function renderCasesTable() {
         priority: chipCell(PRIORITY_CHIP[c.priority], t(`prio_${c.priority}`)),
         tags: (fv(c, 'tag_ids') || []).map(tagNameById).filter(Boolean).join(', ') || '—',
         status: chipCell(CASE_STATUS_CHIP[c.status], t(`case_status_${c.status}`)),
+        // A <use> reference cannot resolve document symbols from inside the
+        // table's shadow root, so this column carries a label, not an icon.
         origin: c.origin === 'agent'
-          ? `<span class="ps-origin-agent" title="${escapeAttr(t('origin_agent_tooltip'))}">${sprite('sparkle')}</span>`
-          : `<span class="ps-origin-user">${sprite('user')}</span>`,
+          ? chipCell('accent', t('origin_agent'))
+          : chipCell('info', t('origin_user')),
         lastResult: lastResult
           ? chipCell(ITEM_STATUS_CHIP[lastResult], t(`item_status_${lastResult}`))
           : chipCell('info', '—'),
