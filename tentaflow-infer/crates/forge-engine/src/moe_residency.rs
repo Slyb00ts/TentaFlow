@@ -617,3 +617,166 @@ impl<'a> MoeLayerView<'a> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_hal::cpu::CpuDevice;
+
+    /// Bajty eksperta `e` — wzorzec zależny od indeksu, żeby pomylenie slotów
+    /// nie mogło przejść niezauważone.
+    fn expert_bytes(expert: usize, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((expert * 37 + i * 11 + 3) % 251) as u8)
+            .collect()
+    }
+
+    /// Buduje stos: `n_vram` + `n_host` slotów, reszta ekspertów na dysku.
+    fn build(
+        device: &dyn Device,
+        spill: &ExpertSpill,
+        n_experts: usize,
+        n_vram: usize,
+        n_host: usize,
+        bytes: usize,
+    ) -> ExpertStack {
+        let mut slots = Vec::new();
+        let mut resident = Vec::new();
+        let mut spilled = vec![None; n_experts];
+        for slot in 0..(n_vram + n_host) {
+            let kind = if slot < n_vram {
+                MemKind::Device
+            } else {
+                MemKind::PinnedHost
+            };
+            let buf = device.alloc(bytes, kind, Pool::Weights).unwrap();
+            device.write(&expert_bytes(slot, bytes), &buf, 0).unwrap();
+            slots.push(DevWeight::Q4K {
+                buf,
+                rows: 8,
+                cols: 256,
+            });
+            resident.push(slot);
+        }
+        for expert in (n_vram + n_host)..n_experts {
+            spilled[expert] = Some(spill.append(&expert_bytes(expert, bytes)).unwrap());
+        }
+        ExpertStack::new(device, slots, resident, spilled, 8, 256).unwrap()
+    }
+
+    fn slot_contents(stack: &ExpertStack, expert: usize, bytes: usize) -> Vec<u8> {
+        let weight = stack.expert(expert).unwrap();
+        let ptr = weight.buffer().unwrap().host_ptr().unwrap();
+        unsafe { std::slice::from_raw_parts(ptr, bytes) }.to_vec()
+    }
+
+    /// Ekspert z dysku wchodzi do slotu hosta, a jego bajty muszą być jego
+    /// własne — nie ofiary, którą zastąpił.
+    #[test]
+    fn fault_in_loads_the_requested_expert() {
+        let device = CpuDevice::new();
+        let dir = std::env::temp_dir().join("forge-residency-test");
+        let spill = ExpertSpill::create(&dir, "fault").unwrap();
+        let bytes = 1152;
+        let stack = build(device.as_ref(), &spill, 8, 2, 2, bytes);
+        assert_eq!(stack.tier_counts(), (2, 2, 4));
+        assert!(!stack.fully_resident());
+
+        // Ekspert 3 jest najmniej popularny, więc to on ma zwolnić slot.
+        let mut popularity = vec![0.0f32; 8];
+        popularity[2] = 10.0;
+        let fetched = stack
+            .fault_in(device.as_ref(), &spill, &[6], &popularity)
+            .unwrap();
+        assert_eq!(fetched, 1);
+        assert_eq!(stack.tier(6), ExpertTier::Host);
+        assert_eq!(stack.tier(3), ExpertTier::Nvme);
+        assert_eq!(stack.tier(2), ExpertTier::Host);
+        assert_eq!(
+            slot_contents(&stack, 6, bytes),
+            expert_bytes(6, bytes),
+            "slot dostał bajty innego eksperta"
+        );
+        assert_eq!(stack.tier_counts(), (2, 2, 4));
+    }
+
+    /// Ofiara bez kopii na dysku musi zostać tam zapisana, zanim jej slot
+    /// zostanie nadpisany — inaczej jej wagi przepadłyby bezpowrotnie.
+    #[test]
+    fn evicted_expert_can_be_faulted_back() {
+        let device = CpuDevice::new();
+        let dir = std::env::temp_dir().join("forge-residency-test");
+        let spill = ExpertSpill::create(&dir, "evict").unwrap();
+        let bytes = 1152;
+        let stack = build(device.as_ref(), &spill, 6, 1, 2, bytes);
+        let flat = vec![0.0f32; 6];
+
+        stack
+            .fault_in(device.as_ref(), &spill, &[4], &flat)
+            .unwrap();
+        let evicted = (1..3).find(|e| stack.tier(*e) == ExpertTier::Nvme).unwrap();
+        stack
+            .fault_in(device.as_ref(), &spill, &[evicted], &flat)
+            .unwrap();
+        assert_eq!(
+            slot_contents(&stack, evicted, bytes),
+            expert_bytes(evicted, bytes),
+            "wyparty ekspert wrócił z dysku zniekształcony"
+        );
+    }
+
+    /// Ekspert żądany w tej samej warstwie nie może paść ofiarą własnego
+    /// zgłoszenia — inaczej dwa chybienia w jednej warstwie zjadłyby się nawzajem.
+    #[test]
+    fn requested_experts_are_never_evicted() {
+        let device = CpuDevice::new();
+        let dir = std::env::temp_dir().join("forge-residency-test");
+        let spill = ExpertSpill::create(&dir, "protect").unwrap();
+        let bytes = 1152;
+        let stack = build(device.as_ref(), &spill, 8, 1, 3, bytes);
+        let flat = vec![0.0f32; 8];
+
+        // Ekspert 2 jest rezydentny; żądamy go razem z dwoma z dysku.
+        assert_eq!(stack.tier(2), ExpertTier::Host);
+        stack
+            .fault_in(device.as_ref(), &spill, &[2, 5, 6], &flat)
+            .unwrap();
+        for expert in [2usize, 5, 6] {
+            assert_eq!(
+                slot_contents(&stack, expert, bytes),
+                expert_bytes(expert, bytes),
+                "ekspert {expert} nie jest rezydentny albo ma cudze bajty"
+            );
+        }
+    }
+
+    /// Awans zamienia zawartość slotów: obaj eksperci muszą zachować swoje
+    /// bajty, tylko w innych warstwach pamięci.
+    #[test]
+    fn promotion_swaps_tiers_without_losing_bytes() {
+        let device = CpuDevice::new();
+        let dir = std::env::temp_dir().join("forge-residency-test");
+        let spill = ExpertSpill::create(&dir, "promote").unwrap();
+        let bytes = 1152;
+        let stack = build(device.as_ref(), &spill, 4, 2, 2, bytes);
+        let stream = device.create_stream().unwrap();
+        let scratch = device
+            .alloc(bytes, MemKind::PinnedHost, Pool::Weights)
+            .unwrap();
+
+        assert_eq!(stack.tier(2), ExpertTier::Host);
+        assert_eq!(stack.tier(0), ExpertTier::Vram);
+        stack
+            .promote_to_vram(device.as_ref(), 2, 0, &scratch, &stream)
+            .unwrap();
+        assert_eq!(stack.tier(2), ExpertTier::Vram);
+        assert_eq!(stack.tier(0), ExpertTier::Host);
+        for expert in 0..4 {
+            assert_eq!(
+                slot_contents(&stack, expert, bytes),
+                expert_bytes(expert, bytes),
+                "ekspert {expert} zgubił swoje bajty przy awansie"
+            );
+        }
+    }
+}
