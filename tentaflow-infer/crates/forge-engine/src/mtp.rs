@@ -892,6 +892,7 @@ mod tests {
             alt_attn: None,
             final_logit_softcap: 0.0,
             attn_logit_scale: None,
+            deepseek_v4: None,
             embd_scale: None,
         }
     }
