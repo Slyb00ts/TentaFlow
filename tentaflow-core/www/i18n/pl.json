@@ -65,7 +65,7 @@
     "delete_forever": "Usuń trwale",
     "delete_failed": "Usuwanie nie powiodło się",
     "delete_project_title": "Usuń projekt?",
-    "delete_project_sub": "{members} członków · Twoja rola: {role}",
+    "delete_project_sub": "{members} {members|członek|członkowie|członków} · Twoja rola: {role}",
     "delete_project_warning": "Operacja jest nieodwracalna. Usuwasz cały projekt wraz z danymi wszystkich modułów — nie da się tego cofnąć ani odzyskać.",
     "delete_item_kb": "Baza wiedzy",
     "delete_item_kb_sub": "{count} {count|źródło|źródła|źródeł} · pliki, fragmenty i indeksy wektorowe",

@@ -3908,7 +3908,6 @@ fn cases_list_v1(
     search: &str,
     offset: u32,
     limit: u32,
-    severity: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
@@ -5277,6 +5276,7 @@ fn tasks_list_v1(
     search: &str,
     offset: u32,
     limit: u32,
+    severity: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;

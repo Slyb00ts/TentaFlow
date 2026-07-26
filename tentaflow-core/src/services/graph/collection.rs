@@ -821,7 +821,7 @@ impl GraphManager {
 
         // Krok 3: cap PO przeważeniu — sort po wadze finalnej, utnij do max_seeds.
         // Cap dotyczy WYŁĄCZNIE znanych kotwic, więc nieznane nie zajmują slotów.
-        weighted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        weighted.sort_by(|a, b| b.1.total_cmp(&a.1));
         weighted.truncate(max_seeds);
 
         let seed_indices = weighted;

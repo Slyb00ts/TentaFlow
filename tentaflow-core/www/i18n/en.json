@@ -65,7 +65,7 @@
     "delete_forever": "Delete permanently",
     "delete_failed": "Deletion failed",
     "delete_project_title": "Delete project?",
-    "delete_project_sub": "{members} members · Your role: {role}",
+    "delete_project_sub": "{members} {members|member|members} · Your role: {role}",
     "delete_project_warning": "This operation is irreversible. You are deleting the entire project with all module data — it cannot be undone or recovered.",
     "delete_item_kb": "Knowledge base",
     "delete_item_kb_sub": "{count} {count|source|sources} · files, chunks and vector indexes",

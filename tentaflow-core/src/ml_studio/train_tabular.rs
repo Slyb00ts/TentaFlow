@@ -602,15 +602,13 @@ fn train_classification(
         tracing::warn!("smartcore classifiers skipped: empty training matrix");
     }
 
+    // total_cmp on a concrete f64 key: a partial comparator over Option<f64>
+    // with a NaN metric is not a total order and the sort panics.
+    let best_first = |v: Option<f64>| v.unwrap_or(f64::NEG_INFINITY);
     leaderboard.sort_by(|a, b| {
-        b.accuracy
-            .partial_cmp(&a.accuracy)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                b.f1_macro
-                    .partial_cmp(&a.f1_macro)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+        best_first(b.accuracy)
+            .total_cmp(&best_first(a.accuracy))
+            .then(best_first(b.f1_macro).total_cmp(&best_first(a.f1_macro)))
     });
     let best_model_name = leaderboard[0].model_name.clone();
     let best_loss_curve = if best_model_name == "Regresja logistyczna" {
@@ -825,11 +823,12 @@ fn train_regression(
     }
 
     // Lower RMSE is better; tie-break on higher R^2.
+    let worst_last = |v: Option<f64>| v.unwrap_or(f64::INFINITY);
+    let best_first = |v: Option<f64>| v.unwrap_or(f64::NEG_INFINITY);
     leaderboard.sort_by(|a, b| {
-        a.rmse
-            .partial_cmp(&b.rmse)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.r2.partial_cmp(&a.r2).unwrap_or(std::cmp::Ordering::Equal))
+        worst_last(a.rmse)
+            .total_cmp(&worst_last(b.rmse))
+            .then(best_first(b.r2).total_cmp(&best_first(a.r2)))
     });
     let best_model_name = leaderboard[0].model_name.clone();
     let best_loss_curve = if best_model_name == "Regresja liniowa" {
