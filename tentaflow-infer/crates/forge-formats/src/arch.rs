@@ -60,6 +60,12 @@ pub enum WeightRole {
     FfnNorm,
     OutputNorm,
     LmHead,
+    /// Norma PO bloku uwagi, przed rezydualem (rodzina Gemma — „sandwich norm”).
+    PostAttnNorm,
+    /// Norma PO bloku FFN, przed rezydualem (rodzina Gemma).
+    PostFfwNorm,
+    /// Skalar mnożący wyjście warstwy (`layer_output_scale`, Gemma 4).
+    LayerOutputScale,
     /// MoE router (`ffn_gate_inp`): logits over experts, [n_expert, hidden].
     FfnGateInp,
     /// MoE stacked expert projections ([n_expert, inter, hidden] resp.
@@ -184,6 +190,7 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/qwen3moe.ron"),
     include_str!("../arch/qwen35moe.ron"),
     include_str!("../arch/qwen35.ron"),
+    include_str!("../arch/gemma4.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -195,6 +202,82 @@ pub fn registry() -> &'static [ArchSpec] {
             .iter()
             .map(|src| ron::from_str(src).expect("embedded arch spec must parse"))
             .collect()
+    })
+}
+
+/// Nieliniowość bramki FFN. SwiGLU (`silu`) jest domyślne; rodzina Gemma używa
+/// GeGLU z przybliżeniem tanh, a różnica jest widoczna w logitach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfnActivation {
+    #[default]
+    SiLU,
+    GeLUTanh,
+}
+
+/// Naprzemienna geometria uwagi: część warstw ma okno przesuwne i WŁASNY
+/// `head_dim` oraz liczbę głowic KV, część jest globalna. Gemma 4 powtarza
+/// wzorzec [lokalna x5, globalna x1], przy czym warstwy lokalne mają
+/// head_dim 256 i 8 głowic KV, a globalne head_dim 512 i jedną głowicę.
+///
+/// Wartości spoza wzorca (`head_dim`, `n_kv_heads` w `Hyperparams`) opisują
+/// warstwy GLOBALNE, żeby modele bez tego pola czytały się bez zmian.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AltAttnParams {
+    /// `true` = warstwa z oknem przesuwnym; długość równa liczbie warstw.
+    pub sliding: Vec<bool>,
+    /// Rozmiar okna w tokenach.
+    pub window: usize,
+    pub head_dim_swa: usize,
+    pub n_kv_heads_swa: usize,
+    pub rope_theta_swa: f32,
+}
+
+/// Czyta naprzemienną geometrię uwagi z metadanych GGUF; `None`, gdy model jej
+/// nie deklaruje (wtedy wszystkie warstwy mają jedną geometrię).
+///
+/// Wzorce w GGUF są KRÓTKIE i powtarzalne: Gemma 4 ma 48 warstw, ale
+/// `sliding_window_pattern` liczy 6 pozycji, a `head_count_kv` też 6 — trzeba je
+/// rozwinąć modulo długość, inaczej wychodzi zła geometria od siódmej warstwy.
+fn parse_alt_attn(
+    gguf: &Gguf,
+    arch: &str,
+    block_count: usize,
+) -> Option<AltAttnParams> {
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    let pattern = gguf.get_array(&key("attention.sliding_window_pattern"))?;
+    if pattern.is_empty() {
+        return None;
+    }
+    let flags: Vec<bool> = pattern.iter().filter_map(|v| v.as_bool()).collect();
+    if flags.len() != pattern.len() {
+        return None;
+    }
+    let sliding: Vec<bool> = (0..block_count)
+        .map(|layer| flags[layer % flags.len()])
+        .collect();
+    let window = gguf.get_u64(&key("attention.sliding_window"))? as usize;
+    let head_dim_swa = gguf.get_u64(&key("attention.key_length_swa"))? as usize;
+    // Liczba głowic KV jest tablicą o tej samej długości co wzorzec: pozycje
+    // lokalne i globalne mają różne wartości (u Gemmy 8 wobec 1).
+    let kv = gguf.get_array(&key("attention.head_count_kv"))?;
+    let kv: Vec<usize> = kv.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect();
+    if kv.len() != flags.len() {
+        return None;
+    }
+    let n_kv_heads_swa = flags
+        .iter()
+        .zip(&kv)
+        .find(|(local, _)| **local)
+        .map(|(_, heads)| *heads)?;
+    let rope_theta_swa = gguf
+        .get_f32(&key("rope.freq_base_swa"))
+        .unwrap_or_else(|| gguf.get_f32(&key("rope.freq_base")).unwrap_or(10000.0));
+    Some(AltAttnParams {
+        sliding,
+        window,
+        head_dim_swa,
+        n_kv_heads_swa,
+        rope_theta_swa,
     })
 }
 
@@ -253,6 +336,14 @@ pub struct Hyperparams {
     /// (qwen35moe): `wq` has width `head_dim * n_heads * 2` and the second half
     /// gates the attention output. `false` for ungated attention.
     pub attn_gated: bool,
+    /// Nieliniowość bramki FFN (SwiGLU domyślnie, GeGLU w rodzinie Gemma).
+    pub ffn_activation: FfnActivation,
+    /// Naprzemienna geometria uwagi (okno przesuwne + własny head_dim/KV);
+    /// `None`, gdy wszystkie warstwy mają tę samą geometrię.
+    pub alt_attn: Option<AltAttnParams>,
+    /// Ograniczenie logitów `softcap * tanh(x / softcap)` przed samplingiem
+    /// (Gemma). 0 = wyłączone.
+    pub final_logit_softcap: f32,
 }
 
 /// Rola tensora należącego do jednej warstwy NextN.
@@ -541,14 +632,42 @@ impl ModelDescriptor {
         let mtp = build_dense_mtp(gguf, spec, block_count, nextn)?;
         let hidden_size = req_u("embedding_length")?;
         let n_heads = req_u("attention.head_count")?;
-        let n_kv_heads = gguf
-            .get_u64(&key("attention.head_count_kv"))
-            .map(|v| v as usize)
-            .unwrap_or(n_heads);
+        let alt_attn = parse_alt_attn(gguf, &spec.gguf_arch, block_count);
+        // Przy naprzemiennej geometrii `head_count_kv` jest TABLICĄ; skalary
+        // `Hyperparams` opisują wtedy warstwy globalne (patrz `AltAttnParams`).
+        let n_kv_heads = match (&alt_attn, gguf.get_array(&key("attention.head_count_kv"))) {
+            (Some(alt), Some(values)) => {
+                let heads: Vec<usize> = values
+                    .iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .collect();
+                alt.sliding
+                    .iter()
+                    .zip(heads.iter().cycle())
+                    .find(|(local, _)| !**local)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(n_heads)
+            }
+            _ => gguf
+                .get_u64(&key("attention.head_count_kv"))
+                .map(|v| v as usize)
+                .unwrap_or(n_heads),
+        };
         let head_dim = gguf
             .get_u64(&key("attention.key_length"))
             .map(|v| v as usize)
             .unwrap_or(hidden_size / n_heads.max(1));
+        let final_logit_softcap = gguf
+            .get_f32(&key("final_logit_softcapping"))
+            .unwrap_or(0.0);
+        // GGUF nie nosi typu aktywacji; rodzina Gemma ma GeGLU z tanh, reszta
+        // obsługiwanych architektur SwiGLU.
+        let ffn_activation = if spec.gguf_arch.starts_with("gemma") {
+            FfnActivation::GeLUTanh
+        } else {
+            FfnActivation::SiLU
+        };
         let intermediate_size = req_u("feed_forward_length")?;
         let max_position_embeddings = req_u("context_length")?;
         let rope_theta = gguf.get_f32(&key("rope.freq_base")).unwrap_or(10_000.0);
@@ -674,6 +793,9 @@ impl ModelDescriptor {
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
+            ffn_activation,
+            alt_attn,
+            final_logit_softcap,
             },
             globals,
             layers,
@@ -743,6 +865,9 @@ impl ModelDescriptor {
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
+            ffn_activation: FfnActivation::SiLU,
+            alt_attn: None,
+            final_logit_softcap: 0.0,
             },
             globals,
             layers,
@@ -1059,6 +1184,9 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             rope_sections,
             full_attention_interval,
             attn_gated: true,
+            ffn_activation: FfnActivation::SiLU,
+            alt_attn: None,
+            final_logit_softcap: 0.0,
         },
         globals,
         layers,
@@ -1253,7 +1381,7 @@ mod tests {
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 7);
+        assert_eq!(specs.len(), 8);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
@@ -1261,6 +1389,7 @@ mod tests {
         assert_eq!(specs[4].name, "qwen3moe");
         assert_eq!(specs[5].name, "qwen35moe");
         assert_eq!(specs[6].name, "qwen35");
+        assert_eq!(specs[7].name, "gemma4");
         // The MoE specs carry the router + stacked-expert roles.
         assert!(specs[3]
             .roles

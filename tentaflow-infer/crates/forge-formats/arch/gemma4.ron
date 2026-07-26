@@ -1,0 +1,35 @@
+// ===== File: gemma4.ron — Gemma 4 tensor-role map (GGUF + HF naming) =====
+//
+// Rodzina Gemma dokłada do bloku dwie normy „sandwich” (po uwadze i po FFN,
+// przed rezydualem) oraz skalar mnożący wyjście warstwy. Nie ma osobnego
+// `output.weight` — głowa logitów jest wiązana z tablicą embeddingów.
+(
+    name: "gemma4",
+    gguf_arch: "gemma4",
+    hf_architectures: ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"],
+    hf_model_types: ["gemma4", "gemma4_text"],
+    roles: [
+        (role: TokenEmbd, gguf: "token_embd.weight", hf: "model.embed_tokens.weight", per_layer: false, required: true),
+        (role: OutputNorm, gguf: "output_norm.weight", hf: "model.norm.weight", per_layer: false, required: true),
+        (role: LmHead, gguf: "output.weight", hf: "lm_head.weight", per_layer: false, required: false),
+        (role: AttnNorm, gguf: "blk.{layer}.attn_norm.weight", hf: "model.layers.{layer}.input_layernorm.weight", per_layer: true, required: true),
+        (role: AttnQ, gguf: "blk.{layer}.attn_q.weight", hf: "model.layers.{layer}.self_attn.q_proj.weight", per_layer: true, required: true),
+        (role: AttnK, gguf: "blk.{layer}.attn_k.weight", hf: "model.layers.{layer}.self_attn.k_proj.weight", per_layer: true, required: true),
+        // Warstwy GLOBALNE (co 6., indeks % 6 == 5) NIE MAJĄ projekcji V —
+        // sprawdzone na `google/gemma-4-12B-it-qat-q4_0-gguf`: brak jej w
+        // warstwach 5, 11, 17, 23, 29, 35, 41, 47, a `attn_q` jest tam szerokie
+        // 8192 (16 głowic x 512) przy `attn_k` 512 (jedna głowica). Dlatego rola
+        // jest opcjonalna, a nie wymagana.
+        (role: AttnV, gguf: "blk.{layer}.attn_v.weight", hf: "model.layers.{layer}.self_attn.v_proj.weight", per_layer: true, required: false),
+        (role: AttnO, gguf: "blk.{layer}.attn_output.weight", hf: "model.layers.{layer}.self_attn.o_proj.weight", per_layer: true, required: true),
+        (role: AttnQNorm, gguf: "blk.{layer}.attn_q_norm.weight", hf: "model.layers.{layer}.self_attn.q_norm.weight", per_layer: true, required: true),
+        (role: AttnKNorm, gguf: "blk.{layer}.attn_k_norm.weight", hf: "model.layers.{layer}.self_attn.k_norm.weight", per_layer: true, required: true),
+        (role: PostAttnNorm, gguf: "blk.{layer}.post_attention_norm.weight", hf: "model.layers.{layer}.post_attention_layernorm.weight", per_layer: true, required: true),
+        (role: FfnNorm, gguf: "blk.{layer}.ffn_norm.weight", hf: "model.layers.{layer}.pre_feedforward_layernorm.weight", per_layer: true, required: true),
+        (role: FfnGate, gguf: "blk.{layer}.ffn_gate.weight", hf: "model.layers.{layer}.mlp.gate_proj.weight", per_layer: true, required: true),
+        (role: FfnUp, gguf: "blk.{layer}.ffn_up.weight", hf: "model.layers.{layer}.mlp.up_proj.weight", per_layer: true, required: true),
+        (role: FfnDown, gguf: "blk.{layer}.ffn_down.weight", hf: "model.layers.{layer}.mlp.down_proj.weight", per_layer: true, required: true),
+        (role: PostFfwNorm, gguf: "blk.{layer}.post_ffw_norm.weight", hf: "model.layers.{layer}.post_feedforward_layernorm.weight", per_layer: true, required: true),
+        (role: LayerOutputScale, gguf: "blk.{layer}.layer_output_scale.weight", hf: "model.layers.{layer}.layer_output_scale", per_layer: true, required: false),
+    ],
+)
