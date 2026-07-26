@@ -217,8 +217,61 @@
 .ps-kpi-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  /* Every KPI tile gets the height of the tallest one — cards differ by an
+     optional delta line, and a ragged grid reads as broken. */
+  grid-auto-rows: 1fr;
   gap: 12px;
   margin-bottom: 16px;
+}
+
+/* Two charts side by side, exactly like the overview mockup. */
+.ps-overview-charts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.ps-chart-host {
+  min-height: 150px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ps-chart-host > * { width: 100%; }
+
+.ps-chart-empty {
+  font-size: 12px;
+  color: var(--tf-text-3);
+  text-align: center;
+  padding: 40px 0;
+}
+
+.ps-qa-banner {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  background: color-mix(in srgb, var(--tf-accent-2) 8%, transparent);
+}
+.ps-qa-banner-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+.ps-qa-banner-head svg { width: 14px; height: 14px; color: var(--tf-accent-2); }
+.ps-qa-banner-body {
+  font-size: 12px;
+  color: var(--tf-text-2);
+  margin-top: 5px;
+  line-height: 1.5;
+}
+.ps-qa-banner-body a { color: var(--tf-accent-2); font-weight: 600; }
+
+@media (max-width: 980px) {
+  .ps-overview-charts { grid-template-columns: 1fr; }
 }
 
 .ps-overview-cols {

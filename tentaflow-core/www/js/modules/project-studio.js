@@ -1353,44 +1353,53 @@ async function renderOverview() {
   quickActions.push({ id: 'members', icon: 'users', name: t('qa_members'), sub: t('qa_members_sub') });
 
   const kv = (snake, camel) => Number(kpis?.[snake] ?? kpis?.[camel] ?? 0);
-  const gensRunning = kv('generations_running', 'generationsRunning');
-  const testsKpis = modules.includes('tests') ? `
-      <tf-stat-card icon="list" label="${escapeAttr(t('kpi_cases'))}" value="${kv('cases_approved', 'casesApproved')}" suffix="/ ${kv('cases_total', 'casesTotal')}"
-        delta="${escapeAttr(t('kpi_suites', { count: kv('suites_total', 'suitesTotal') }))}" delta-type="neutral"></tf-stat-card>
-      <tf-stat-card icon="play" label="${escapeAttr(t('kpi_runs_open'))}" value="${kv('runs_open', 'runsOpen')}"
-        ${kv('auto_runs_open', 'autoRunsOpen') > 0 ? `delta="${escapeAttr(t('kpi_auto_runs_open', { count: kv('auto_runs_open', 'autoRunsOpen') }))}" delta-type="warn"` : (gensRunning > 0 ? `delta="${escapeAttr(t('kpi_generations_running', { count: gensRunning }))}" delta-type="warn"` : '')}></tf-stat-card>
-      <tf-stat-card icon="user" label="${escapeAttr(t('kpi_my_items'))}" value="${kv('my_run_items_pending', 'myRunItemsPending')}"></tf-stat-card>
-      <tf-stat-card icon="globe" label="${escapeAttr(t('kpi_environments'))}" value="${kv('environments_approved', 'environmentsApproved')}"
-        ${kv('environments_pending', 'environmentsPending') > 0 ? `delta="${escapeAttr(t('kpi_environments_pending', { count: kv('environments_pending', 'environmentsPending') }))}" delta-type="warn"` : ''}></tf-stat-card>
-  ` : '';
-  const tasksKpis = modules.includes('tasks') ? `
-      <tf-stat-card icon="check" label="${escapeAttr(t('kpi_tasks_open'))}" value="${kv('tasks_open', 'tasksOpen')}"
-        ${kv('defects_open', 'defectsOpen') > 0 ? `delta="${escapeAttr(t('kpi_defects_open', { count: kv('defects_open', 'defectsOpen') }))}" delta-type="warn"` : ''}></tf-stat-card>
-  ` : '';
-  // A blocked schedule keeps its "enabled" flag but stops producing runs, so it
-  // is surfaced next to the count instead of being folded into it.
-  const schedulesBlocked = kv('schedules_blocked', 'schedulesBlocked');
-  const schedulesKpi = modules.includes('tests') ? `
-      <tf-stat-card icon="clock" label="${escapeAttr(t('kpi_schedules'))}" value="${kv('schedules_enabled', 'schedulesEnabled')}"
-        ${schedulesBlocked > 0 ? `delta="${escapeAttr(t('kpi_schedules_blocked', { count: schedulesBlocked }))}" delta-type="warn"` : ''}></tf-stat-card>
-  ` : '';
-  const mlKpi = `
-      <tf-stat-card icon="brain" label="${escapeAttr(t('kpi_ml_links'))}" value="${kv('ml_links', 'mlLinks')}"></tf-stat-card>
-  `;
+  const hasTests = modules.includes('tests');
+
+  // The dashboard answers four questions — what do we have, how good is it,
+  // what is broken, is the knowledge ready. Every other counter lives next to
+  // its own tab or section; a wall of raw numbers here reads as noise.
+  const casesTotal = kv('cases_total', 'casesTotal');
+  const casesApproved = kv('cases_approved', 'casesApproved');
+  const suitesTotal = kv('suites_total', 'suitesTotal');
+  const tasksOpen = kv('tasks_open', 'tasksOpen');
+  const defectsOpen = kv('defects_open', 'defectsOpen');
+
+  const casesCard = hasTests ? `
+      <tf-stat-card icon="clipboard" label="${escapeAttr(t('kpi_cases'))}" value="${casesTotal}"
+        suffix="/ ${escapeAttr(t('kpi_cases_approved_suffix', { count: casesApproved }))}"
+        delta="${escapeAttr(t('kpi_suites', { count: suitesTotal }))}" delta-type="neutral"></tf-stat-card>` : '';
+  const passCard = hasTests ? `
+      <tf-stat-card id="ps-kpi-pass" icon="check-square" label="${escapeAttr(t('kpi_pass_rate'))}" value="—"></tf-stat-card>` : '';
+  const defectsCard = modules.includes('tasks') ? `
+      <tf-stat-card id="ps-kpi-defects" icon="bug" label="${escapeAttr(t('kpi_defects'))}" value="${defectsOpen}"
+        suffix="${defectsOpen > 0 ? '' : escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}"
+        ${defectsOpen > 0 ? `delta="${escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}" delta-type="neutral"` : ''}></tf-stat-card>` : '';
+  const knowledgeCard = `
+      <tf-stat-card icon="book" label="${escapeAttr(t('kpi_sources'))}" value="${sourcesReady}"
+        suffix="/ ${escapeAttr(t('kpi_sources_ready_suffix', { count: sourcesTotal }))}"
+        ${openJobs > 0 ? `delta="${escapeAttr(t('kpi_open_jobs', { count: openJobs }))}" delta-type="warn"` : ''}></tf-stat-card>`;
+
+  // Charts only make sense for a project that runs tests.
+  const chartsRow = hasTests ? `
+    <div class="ps-overview-charts">
+      <tf-section-card title="${escapeAttr(t('chart_pass_trend'))}" icon="target">
+        <div id="ps-chart-trend" class="ps-chart-host"></div>
+      </tf-section-card>
+      <tf-section-card title="${escapeAttr(t('chart_last_runs'))}" icon="activity">
+        <span slot="subtitle">${escapeHtml(t('chart_last_runs_legend'))}</span>
+        <div id="ps-chart-runs" class="ps-chart-host"></div>
+      </tf-section-card>
+    </div>` : '';
 
   panel.innerHTML = `
-    <div class="ps-kpi-grid">
-      <tf-stat-card icon="database" label="${escapeAttr(t('kpi_sources'))}" value="${sourcesReady}" suffix="/ ${sourcesTotal}"
-        ${openJobs > 0 ? `delta="${escapeAttr(t('kpi_open_jobs', { count: openJobs }))}" delta-type="warn"` : ''}></tf-stat-card>
-      <tf-stat-card icon="file-text" label="${escapeAttr(t('kpi_files'))}" value="${kpis?.files_total ?? kpis?.filesTotal ?? 0}"></tf-stat-card>
-      <tf-stat-card icon="grid-2x2" label="${escapeAttr(t('kpi_chunks'))}" value="${kpis?.chunks_total ?? kpis?.chunksTotal ?? 0}"></tf-stat-card>
-      <tf-stat-card icon="users" label="${escapeAttr(t('kpi_members'))}" value="${kpis?.member_count ?? kpis?.memberCount ?? 0}"
-        delta="${escapeAttr(t('kpi_my_chats', { count: kpis?.my_chat_count ?? kpis?.myChatCount ?? 0 }))}" delta-type="neutral"></tf-stat-card>
-      ${testsKpis}
-      ${tasksKpis}
-      ${schedulesKpi}
-      ${mlKpi}
+    <div class="ps-kpi-grid ps-kpi-overview">
+      ${casesCard}
+      ${passCard}
+      ${defectsCard}
+      ${knowledgeCard}
     </div>
+
+    ${chartsRow}
 
     <div class="ps-overview-cols">
       <tf-section-card title="${escapeAttr(t('activity_title'))}" icon="clock">
@@ -1411,10 +1420,18 @@ async function renderOverview() {
             </div>
           `).join('')}
         </div>
+        ${sourcesReady > 0 && hasTests && canEdit() ? `
+          <div class="ps-qa-banner" id="ps-qa-generate">
+            <div class="ps-qa-banner-head">${sprite('sparkle')}<span>${escapeHtml(t('qa_generate_title'))}</span></div>
+            <div class="ps-qa-banner-body">${escapeHtml(t('qa_generate_body'))}
+              <a href="#" data-qa-generate>${escapeHtml(t('qa_generate_link'))}</a>
+            </div>
+          </div>` : ''}
       </tf-section-card>
     </div>
   `;
 
+  if (hasTests) loadOverviewCharts();
   renderActivityFeed();
   byId('ps-activity-more-btn')?.addEventListener('click', () => loadMoreActivity());
   panel.querySelectorAll('[data-qa]').forEach((el) => {
@@ -1428,6 +1445,108 @@ async function renderOverview() {
       else if (id === 'members') selectTab('members');
     });
   });
+  panel.querySelector('[data-qa-generate]')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    f2().view = 'generations';
+    selectTab('tests');
+    setTimeout(() => openGenerationWindow(), 0);
+  });
+}
+
+// Pass-rate and the two charts are derived from finished runs rather than from
+// OverviewKpis: the counters carry totals, while the dashboard needs the trend
+// and the last-run comparison. Failures here leave the cards in their empty
+// state — an overview must still render when reports are unavailable.
+async function loadOverviewCharts() {
+  const pid = projectId();
+  const decided = (r) => Number(r.passed ?? 0) + Number(r.failed ?? 0) + Number(r.blocked ?? 0);
+  const rate = (r) => (decided(r) ? (Number(r.passed ?? 0) / decided(r)) * 100 : null);
+
+  let runs = [];
+  try {
+    const resp = await ApiBinary.one('projectStudioRunsListRequest', {
+      projectId: pid, status: 'completed', runType: '', offset: 0, limit: 8,
+    });
+    runs = (Array.isArray(resp.runs) ? resp.runs : []).slice().reverse();
+  } catch { /* keep the empty state */ }
+  if (state.tab !== 'overview' || projectId() !== pid) return;
+
+  // KPI: last finished run + delta against the previous one.
+  const card = byId('ps-kpi-pass');
+  if (card && runs.length) {
+    const last = runs[runs.length - 1];
+    const prev = runs.length > 1 ? runs[runs.length - 2] : null;
+    const lastRate = rate(last);
+    if (lastRate !== null) {
+      card.setAttribute('value', lastRate.toFixed(1).replace('.', ','));
+      card.setAttribute('suffix', '%');
+      const prevRate = prev ? rate(prev) : null;
+      if (prevRate !== null) {
+        const diff = lastRate - prevRate;
+        card.setAttribute('delta', t('kpi_pass_delta', { pts: `${diff >= 0 ? '+' : '−'}${Math.abs(diff).toFixed(1).replace('.', ',')}` }));
+        card.setAttribute('delta-type', diff >= 0 ? 'up' : 'down');
+      } else {
+        card.setAttribute('delta', t('kpi_pass_first'));
+        card.setAttribute('delta-type', 'neutral');
+      }
+    }
+  }
+
+  // Bar chart: the last 8 finished runs, passed/failed/blocked stacked.
+  const runsHost = byId('ps-chart-runs');
+  if (runsHost) {
+    if (!runs.length) runsHost.innerHTML = `<div class="ps-chart-empty">${escapeHtml(t('chart_no_runs'))}</div>`;
+    else {
+      runsHost.innerHTML = '<tf-bar-chart></tf-bar-chart>';
+      const chart = runsHost.firstElementChild;
+      const xs = runs.map((r) => `#${r.run_no ?? r.runNo ?? ''}`);
+      const serie = (id, key, tone, name) => ({
+        id, name, tone, showInLegend: true,
+        points: runs.map((r, i) => ({ x: xs[i], y: Number(r[key] ?? 0) })),
+      });
+      chart.height = 150;
+      chart.stacking = 'stacked';
+      chart.legend = { position: 'none' };
+      chart.series = [
+        serie('passed', 'passed', 'success', t('run_passed')),
+        serie('failed', 'failed', 'critical', t('run_failed')),
+        serie('blocked', 'blocked', 'warning', t('run_blocked')),
+      ];
+    }
+  }
+
+  // Line chart: 30-day pass-rate trend from the reports engine.
+  const trendHost = byId('ps-chart-trend');
+  if (!trendHost) return;
+  const to = new Date();
+  const from = new Date(to.getTime() - 29 * 86400000);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  let rows = [];
+  try {
+    const resp = await ApiBinary.one('projectStudioReportQueryRequest', {
+      projectId: pid, report: 'runs_over_time', fromDate: iso(from), toDate: iso(to), suiteId: '', runIds: [],
+    });
+    rows = JSON.parse(resp.rows_json ?? resp.rowsJson ?? '[]');
+  } catch { /* keep the empty state */ }
+  if (state.tab !== 'overview' || projectId() !== pid) return;
+  if (!Array.isArray(rows) || !rows.length) {
+    trendHost.innerHTML = `<div class="ps-chart-empty">${escapeHtml(t('chart_no_trend'))}</div>`;
+    return;
+  }
+  const pts = rows.map((r) => {
+    const total = ['passed', 'failed', 'blocked', 'skipped'].reduce((a, k) => a + Number(rowVal(r, [k], 0)), 0);
+    const passed = Number(rowVal(r, ['passed'], 0));
+    return { x: String(rowVal(r, ['date'], '')).slice(5), y: total ? (passed / total) * 100 : 0 };
+  });
+  trendHost.innerHTML = '<tf-line-chart></tf-line-chart>';
+  const line = trendHost.firstElementChild;
+  line.height = 150;
+  line.legend = { position: 'none' };
+  line.yAxis = { scale: 'linear', min: 0, max: 100, ticks: 4, format: (v) => `${v}%` };
+  line.series = [{
+    id: 'pass', name: t('chart_pass_trend_series'), tone: 'success', style: 'solid', showInLegend: true,
+    points: pts.map((p) => ({ x: p.x, y: Number(p.y.toFixed(1)) })),
+  }];
 }
 
 function activityEntryHtml(entry) {
@@ -3308,6 +3427,9 @@ async function renderSettings() {
   const archived = state.project?.status === 'archived';
   const agents = Array.isArray(settings.agents) ? settings.agents : [];
   const tags = Array.isArray(settings.tags) ? settings.tags : [];
+  const enabledModules = new Set(
+    Array.isArray(settings.modules) ? settings.modules : (Array.isArray(state.project?.modules) ? state.project.modules : []),
+  );
 
   const bindingOf = (fn) => agents.find((a) => a.function === fn)
     || { function: fn, agent_id: '', agent_name: '', model_label: '' };
@@ -3351,6 +3473,26 @@ async function renderSettings() {
           hint="${escapeAttr(t('settings_desc_hint'))}"></tf-textarea>
       </div>
       <tf-button variant="primary" icon="check" id="ps-set-save">${escapeHtml(t('settings_save'))}</tf-button>
+    </tf-section-card>
+
+    <tf-section-card title="${escapeAttr(t('settings_modules_title'))}" icon="grid-2x2">
+      <span slot="subtitle">${escapeHtml(t('settings_modules_hint'))}</span>
+      <div id="ps-set-modules">
+        ${MODULE_DEFS.map((mod) => `
+          <div class="ps-module-row">
+            <div class="ps-source-ico">${sprite(mod.icon)}</div>
+            <div class="ps-module-main">
+              <div class="ps-module-name">
+                ${escapeHtml(t(`module_${mod.id}`))}
+                ${mod.locked ? `<tf-chip status="accent">${escapeHtml(t('module_required'))}</tf-chip>` : ''}
+              </div>
+              <div class="ps-module-desc">${escapeHtml(t(`module_${mod.id}_desc`))}</div>
+            </div>
+            <tf-toggle data-module="${escapeAttr(mod.id)}" ${mod.locked || enabledModules.has(mod.id) ? 'checked' : ''} ${mod.locked ? 'disabled' : ''}></tf-toggle>
+          </div>
+        `).join('')}
+      </div>
+      <tf-button variant="primary" icon="check" id="ps-set-modules-save">${escapeHtml(t('settings_save'))}</tf-button>
     </tf-section-card>
 
     <tf-section-card title="${escapeAttr(t('agents_title'))}" icon="brain">
@@ -3413,6 +3555,24 @@ async function renderSettings() {
     try {
       await ApiBinary.one('projectStudioSettingsSaveRequest', { projectId: projectId(), name, description });
       toast(t('settings_saved'), 'success');
+      await refreshProjectHeader();
+    } catch (err) {
+      toast(`${t('settings_save_failed')}: ${err.message}`, 'error');
+    }
+  });
+
+  // `modules` REPLACES the enabled set server-side, so the full list is read
+  // off the toggles; `knowledge` is locked on and always submitted.
+  byId('ps-set-modules-save')?.addEventListener('click', async () => {
+    const host = byId('ps-set-modules');
+    const modules = MODULE_DEFS
+      .filter((mod) => mod.locked || host?.querySelector(`tf-toggle[data-module="${CSS.escape(mod.id)}"]`)?.hasAttribute('checked'))
+      .map((mod) => mod.id);
+    try {
+      await ApiBinary.one('projectStudioSettingsSaveRequest', { projectId: projectId(), modules });
+      toast(t('settings_modules_saved'), 'success');
+      // Modules drive the tab strip, so the shell must be rebuilt from the
+      // freshly read project row rather than the stale one in state.
       await refreshProjectHeader();
     } catch (err) {
       toast(`${t('settings_save_failed')}: ${err.message}`, 'error');
