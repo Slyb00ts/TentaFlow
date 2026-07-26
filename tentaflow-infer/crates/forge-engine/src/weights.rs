@@ -2549,8 +2549,12 @@ impl ModelWeights {
         // so any weight disagreeing with it would launch out-of-bounds GEMVs.
         // Validated host-side, before fusion hides the per-projection shapes.
         let p = &descriptor.params;
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
+        // Geometria bywa różna per warstwa (Gemma 4), więc wymiary liczymy dla
+        // konkretnej warstwy, a nie raz dla całego modelu.
+        let q_dim_at = |layer: usize| p.n_heads * p.head_dim_at(layer);
+        let kv_dim_at = |layer: usize| p.n_kv_heads_at(layer) * p.head_dim_at(layer);
+        let q_dim = q_dim_at(0);
+        let kv_dim = kv_dim_at(0);
         let expect = |what: &str, w: &HostWeight, rows: usize, cols: usize| -> Result<()> {
             if w.rows() != rows || w.cols() != cols {
                 return Err(ForgeError::Format(format!(
@@ -2587,12 +2591,23 @@ impl ModelWeights {
             };
             let at = |what: &str| format!("layer {idx} {what}");
 
+            // Wymiary tej konkretnej warstwy — przy naprzemiennej geometrii
+            // różnią się między warstwami z oknem a globalnymi.
+            let q_dim = q_dim_at(idx);
+            let kv_dim = kv_dim_at(idx);
             let q = fetch_matrix(src, name(WeightRole::AttnQ)?)?;
             let k = fetch_matrix(src, name(WeightRole::AttnK)?)?;
-            let v = fetch_matrix(src, name(WeightRole::AttnV)?)?;
             expect(&at("attn_q"), &q, q_dim, p.hidden_size)?;
             expect(&at("attn_k"), &k, kv_dim, p.hidden_size)?;
-            expect(&at("attn_v"), &v, kv_dim, p.hidden_size)?;
+            // Brak projekcji V oznacza wariant, w którym V = K (warstwy
+            // globalne Gemmy 4); wtedy fuzja bierze K drugi raz.
+            let v = if p.has_v_proj(idx) {
+                let v = fetch_matrix(src, name(WeightRole::AttnV)?)?;
+                expect(&at("attn_v"), &v, kv_dim, p.hidden_size)?;
+                v
+            } else {
+                fetch_matrix(src, name(WeightRole::AttnK)?)?
+            };
             let attn_qkv = match fuse_rows(vec![q, k, v]) {
                 Ok(fused) => {
                     fused_qkv_layers += 1;

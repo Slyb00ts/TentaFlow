@@ -119,6 +119,22 @@ Rzeczy, których NIE DA SIĘ odgadnąć z samych metadanych, a każda zmienia wy
   Wariant `split8` nie ma jeszcze maskowania, więc przy oknie schodzimy na
   ścieżkę generyczną.
 
+- ✅ **Tokenizer `gemma4`.** To BPE z JAWNĄ tablicą merge'ów (514 906 pozycji),
+  ale w kształcie SPM: spacje zamienia normalizator na `▁`, pre-tokenizacja
+  dzieli WYŁĄCZNIE po nowych liniach (`[^\n]+|[\n]+`), a tekst jest surowym
+  UTF-8 — BEZ kodowania bajtowego GPT-2. `add_space_prefix` jest w tym modelu
+  wyłączone, więc nie doklejamy `▁` na początku. Wszystkie cztery rzeczy różnią
+  go od ścieżki `gpt2` i każda zmienia identyfikatory tokenów.
+- ✅ **Walidacja wag per warstwa** plus wariant `V = K`. `Hyperparams` ma teraz
+  `head_dim_at(layer)`, `n_kv_heads_at(layer)` i `has_v_proj(layer)`; pola
+  skalarne opisują warstwy globalne, więc pytanie o konkretną warstwę zawsze
+  idzie przez akcesor.
+
+Model przechodzi dziś **ładowanie, walidację kształtów i budowę tokenizera**, a
+zatrzymuje się dopiero w przebiegu forward:
+`kernel arg offset 18800640 exceeds buffer size 17694720` — czyli offsety w
+grafie liczone są nadal z jednolitej geometrii.
+
 ## Zakres cache'u KV — po rozpoznaniu mniejszy, niż zakładałem
 
 `KvCache` trzyma `k: Vec<DevBuffer>` i `v: Vec<DevBuffer>` — **osobny slab na

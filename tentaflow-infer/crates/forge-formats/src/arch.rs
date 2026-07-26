@@ -103,6 +103,36 @@ pub enum WeightRole {
     SsmOut,
 }
 
+impl Hyperparams {
+    /// `head_dim` warstwy `layer`. Architektury z naprzemienną geometrią
+    /// (Gemma 4) mają inny wymiar głowicy w warstwach z oknem niż w globalnych;
+    /// pola skalarne opisują warstwy globalne, więc to jedyny poprawny sposób
+    /// pytania o wymiar konkretnej warstwy.
+    pub fn head_dim_at(&self, layer: usize) -> usize {
+        match &self.alt_attn {
+            Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.head_dim_swa,
+            _ => self.head_dim,
+        }
+    }
+
+    /// Liczba głowic KV warstwy `layer` — jak wyżej.
+    pub fn n_kv_heads_at(&self, layer: usize) -> usize {
+        match &self.alt_attn {
+            Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.n_kv_heads_swa,
+            _ => self.n_kv_heads,
+        }
+    }
+
+    /// Czy warstwa `layer` w ogóle ma projekcję V. Warstwy globalne Gemmy 4 jej
+    /// nie mają i używają wtedy K jako V (potwierdzone w llama.cpp).
+    pub fn has_v_proj(&self, layer: usize) -> bool {
+        match &self.alt_attn {
+            Some(alt) => alt.sliding.get(layer).copied().unwrap_or(true),
+            None => true,
+        }
+    }
+}
+
 /// Per-layer computation kind in a hybrid (attention + linear-attention) stack.
 /// Non-hybrid architectures are all-`Attention`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
