@@ -151,20 +151,38 @@ Po tych zmianach praca pamięciowa decode jest wyczerpana: GEMV wag osiąga
 około 2 ms na token narzutu drobnych kerneli — dalsze zyski wymagają zmniejszenia
 liczby czytanych bajtów, czyli zmiany kwantyzacji.
 
-#### Prefill: dlaczego stoi
+#### Prefill: rozbity na składniki
 
-Zliczenie ISA `gemm_q4_0_dot4_128x128.hsaco`: **512 `v_dot4_i32_i8` na 1133
-instrukcje wektorowe** (45% szczeliny wydania — dokładnie tyle, ile daje pomiar
-41 z 92 TOPS). Z reszty 192 to epilog: Q4_0 ma jedną skalę na 32 wartości, a
-skale wagi i aktywacji różnią się per blok, więc `cvt + mul + fma` musi wejść co
-8 `dot4` na wyjście. To 37,5% narzutu niezależnie od rozmiaru kafla, czyli sufit
-około 63 TOPS. llama.cpp jest tam na ~46 TOPS (73% sufitu), my na 41 (65%).
+Zmierzone przez porównanie pełnego kernela z wariantami pomiarowymi
+(`bench-amd/pmc_gemm.mojo`; T=1024, N=15360, K=3840, RX 6900 XT):
+
+| wariant | czas | TOPS | wniosek |
+|---|---:|---:|---|
+| pełny GEMM Q4_0 | 2921 µs | 41,3 | stan obecny |
+| bez epilogu (wynik błędny) | 2075 µs | 58,1 | **epilog = 28,8% czasu** |
+| bez stagingu (wynik błędny) | 2406 µs | 50,1 | **staging = 17,7% czasu** |
+| rdzeń (MAC + odczyty LDS) | ~1560 µs | ~77 | 84% pułapu karty |
+
+Epilog jest **strukturalny**: Q4_0 ma jedną skalę na 32 wartości, a skale wagi i
+aktywacji różnią się per blok, więc `cvt + mul + fma` musi wejść co 8 `dot4` na
+wyjście — 3/8 = 37,5% narzutu niezależnie od rozmiaru kafla. Zbicie go wymaga
+grubszej granulacji skali aktywacji, czyli zmiany jakości kwantyzacji.
+
+Staging (17,7%) to zapisy do LDS i rozpakowanie półbajtów, nie odczyty globalne
+— szerszy staging (16 B na wątek zamiast 8, waga czytana raz zamiast dwa razy)
+wyszedł **wolniejszy** (2948 µs). Układ LDS jest k-parami, bo to on dał
+swojego czasu największy pojedynczy zysk (14→24 TFLOPS), a szersze zapisy
+wymagałyby układu wierszowego, który psuje odczyty w pętli MAC.
 
 Sprawdzone i odrzucone pomiarem: potokowanie odczytów przez rejestry (~1,6%
-prefillu, usunięte), większe kafle rejestrowe (2,2–2,7× gorsze), usuwanie
-warunków zakresu w czasie kompilacji (0%), `v_dot2_f32_f16` w Q·K uwagi (+1,1%,
-zachowane), rozwinięcie pętli pozycji w uwadze decode (0% przy ctx 1024 i −6,8%
-przy ctx 2048 — cofnięte).
+prefillu, usunięte), większe kafle rejestrowe (2,2–2,7× gorsze), `KB=1` dla
+mniejszego LDS (3252 µs wobec 2921), usuwanie warunków zakresu w czasie
+kompilacji (0%), szerszy staging (−1%), `v_dot2_f32_f16` w Q·K uwagi (+1,1%,
+zachowane).
+
+Wniosek: przy tej formule GEMM 41,3 TOPS to praktyczny pułap, a llama.cpp na
+tych samych ograniczeniach osiąga ~46 — różnica siedzi w ręcznym szeregowaniu
+instrukcji, do którego Mojo nie daje dostępu.
 
 #### Backend Vulkan — nie zmierzony
 
