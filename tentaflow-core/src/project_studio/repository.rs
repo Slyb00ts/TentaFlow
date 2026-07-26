@@ -156,6 +156,20 @@ pub fn update_project_name_desc(
     Ok(n > 0)
 }
 
+/// Replaces the enabled-module set. Modules only gate which tabs/handlers a
+/// project exposes, so switching one off keeps every row it produced — the data
+/// reappears untouched once the module is switched back on.
+pub fn update_project_modules(org_id: &str, project_id: &str, modules_json: &str) -> Result<bool> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(write_err)?;
+    let n = conn.execute(
+        "UPDATE projects SET modules_json = ?1, updated_at = datetime('now') \
+         WHERE org_id = ?2 AND project_id = ?3",
+        params![modules_json, org_id, project_id],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn set_project_archived(org_id: &str, project_id: &str, archived: bool) -> Result<bool> {
     let pool = super::db::pool()?;
     let conn = pool.write().map_err(write_err)?;

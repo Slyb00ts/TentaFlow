@@ -1147,6 +1147,11 @@ pub enum ProjectStudioPayload {
         description: Option<String>,
         #[serde(default)]
         agents_json: Option<String>,
+        /// Full replacement list of enabled modules. `None` leaves the current
+        /// set untouched, `Some` REPLACES it — a partial diff would make the
+        /// "turn a module off" case impossible to express.
+        #[serde(default)]
+        modules: Option<Vec<String>>,
     },
     SettingsSaveResult {
         ok: bool,

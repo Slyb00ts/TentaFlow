@@ -17749,20 +17749,34 @@ pub fn encode_project_studio_settings_get_request(
 
 /// MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save; `None`
 /// fields are left untouched. `agents_json` is a JSON array of
-/// ProjectAgentBinding objects.
+/// ProjectAgentBinding objects; `modules_json` is a JSON array of module names
+/// that REPLACES the enabled set (absent, empty or `null` = leave untouched).
 #[wasm_bindgen(js_name = encodeProjectStudioSettingsSaveRequest)]
 pub fn encode_project_studio_settings_save_request(
     project_id: String,
     name: Option<String>,
     description: Option<String>,
     agents_json: Option<String>,
+    modules_json: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
+    let modules: Option<Vec<String>> = match modules_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty() && *raw != "null")
+    {
+        Some(raw) => Some(
+            serde_json::from_str(raw)
+                .map_err(|e| JsError::new(&format!("invalid modules_json: {e}")))?,
+        ),
+        None => None,
+    };
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::SettingsSaveRequest {
             project_id,
             name,
             description,
             agents_json,
+            modules,
         },
     ))
     .map_err(|e| JsError::new(&e))

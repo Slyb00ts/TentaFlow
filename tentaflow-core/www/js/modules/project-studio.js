@@ -188,6 +188,8 @@ const state = {
   canCreate: false,
   projects: [],
   listFilter: 'active',
+  roleFilter: 'all',
+  listView: 'cards',
   searchQuery: '',
   // Open project context
   project: null,
@@ -398,6 +400,15 @@ const ProjectStudioScreen = {
         </div>
         <div class="ps-filters-row">
           <tf-filter-chips id="ps-filter" mode="single"></tf-filter-chips>
+          <tf-select id="ps-role-filter" value="${escapeAttr(state.roleFilter)}">
+            <option value="all">${escapeHtml(t('filter_role_any'))}</option>
+            ${['owner', ...ASSIGNABLE_ROLES].map((r) => `<option value="${r}">${escapeHtml(roleLabel(r))}</option>`).join('')}
+          </tf-select>
+          <tf-segmented id="ps-view-mode" value="${escapeAttr(state.listView)}">
+            <option value="cards" icon="apps">${escapeHtml(t('view_cards'))}</option>
+            <option value="table" icon="list">${escapeHtml(t('view_table'))}</option>
+          </tf-segmented>
+          <span class="ps-toolbar-spacer"></span>
           <span class="ps-create-hint" id="ps-create-hint" hidden>${sprite('check')}${escapeHtml(t('can_create_hint'))}</span>
         </div>
         <div id="ps-grid-host"><div class="ps-loading">${escapeHtml(t('loading'))}</div></div>
@@ -420,16 +431,20 @@ const ProjectStudioScreen = {
     });
     const filter = byId('ps-filter');
     if (filter) {
-      filter.filters = [
-        { id: 'active', label: t('filter_active'), active: state.listFilter === 'active' },
-        { id: 'archived', label: t('filter_archived'), active: state.listFilter === 'archived' },
-        { id: 'all', label: t('filter_all'), active: state.listFilter === 'all' },
-      ];
+      syncListFilterChips();
       filter.addEventListener('change', (e) => {
         state.listFilter = e.detail?.id ?? 'active';
         loadProjects();
       });
     }
+    byId('ps-role-filter')?.addEventListener('change', (e) => {
+      state.roleFilter = e.detail?.value ?? 'all';
+      renderProjectGrid();
+    });
+    byId('ps-view-mode')?.addEventListener('change', (e) => {
+      state.listView = e.detail?.value === 'table' ? 'table' : 'cards';
+      renderProjectGrid();
+    });
     wireGridEvents();
     wireBellEvents(byId('ps-list-view'));
     installNotifListener();
@@ -642,7 +657,22 @@ async function loadProjects() {
     const archived = state.projects.filter((p) => p.status === 'archived').length;
     sub.textContent = t('subtitle_stats', { count: state.projects.length, active, archived });
   }
+  syncListFilterChips();
   renderProjectGrid();
+}
+
+// Chips carry live counts (mockup P01) so the operator sees the split without
+// switching filters.
+function syncListFilterChips() {
+  const filter = byId('ps-filter');
+  if (!filter) return;
+  const active = state.projects.filter((p) => p.status === 'active').length;
+  const archived = state.projects.filter((p) => p.status === 'archived').length;
+  filter.filters = [
+    { id: 'active', label: `${t('filter_active')} ${active}`, active: state.listFilter === 'active' },
+    { id: 'archived', label: `${t('filter_archived')} ${archived}`, active: state.listFilter === 'archived' },
+    { id: 'all', label: `${t('filter_all')} ${state.projects.length}`, active: state.listFilter === 'all' },
+  ];
 }
 
 function visibleProjects() {
@@ -650,6 +680,7 @@ function visibleProjects() {
   return state.projects.filter((p) => {
     if (state.listFilter === 'active' && p.status !== 'active') return false;
     if (state.listFilter === 'archived' && p.status !== 'archived') return false;
+    if (state.roleFilter !== 'all' && (p.my_role ?? p.myRole) !== state.roleFilter) return false;
     if (query) {
       const haystack = `${p.name} ${p.description || ''}`.toLowerCase();
       if (!haystack.includes(query)) return false;
@@ -721,7 +752,46 @@ function renderProjectGrid() {
       </div>
     </div>
   ` : '';
+  if (state.listView === 'table') {
+    renderProjectTable(host, visible);
+    return;
+  }
   host.innerHTML = `<div class="ps-grid">${visible.map(projectCardHtml).join('')}${addCard}</div>`;
+}
+
+function renderProjectTable(host, visible) {
+  host.innerHTML = `
+    <tf-table id="ps-projects-table">
+      <tf-column key="name" label="${escapeAttr(t('table_col_project'))}" renderer="html"></tf-column>
+      <tf-column key="status" label="${escapeAttr(t('table_col_status'))}" renderer="chip"></tf-column>
+      <tf-column key="role" label="${escapeAttr(t('table_col_role'))}" renderer="chip"></tf-column>
+      <tf-column key="modules" label="${escapeAttr(t('table_col_modules'))}"></tf-column>
+      <tf-column key="members" label="${escapeAttr(t('stat_members'))}" renderer="num"></tf-column>
+      <tf-column key="sources" label="${escapeAttr(t('stat_sources'))}"></tf-column>
+      <tf-column key="updated" label="${escapeAttr(t('table_col_updated'))}"></tf-column>
+    </tf-table>
+  `;
+  const table = byId('ps-projects-table');
+  table.rows = visible.map((p) => {
+    const archived = p.status === 'archived';
+    const role = p.my_role ?? p.myRole;
+    const modules = Array.isArray(p.modules) ? p.modules : [];
+    return {
+      _id: p.project_id ?? p.projectId,
+      name: `<div class="tf-table__cell-title">${escapeHtml(p.name)}</div>`
+        + `<div class="tf-table__cell-sub">${escapeHtml(p.description || '')}</div>`,
+      status: chipCell(archived ? 'warn' : 'ok', t(archived ? 'status_archived' : 'status_active')),
+      role: chipCell(role === 'owner' ? 'accent' : 'info', role ? roleLabel(role) : '—'),
+      modules: modules.map((m) => t(`module_${m}`)).join(', ') || '—',
+      members: Number(p.member_count ?? p.memberCount ?? 0),
+      sources: `${p.sources_ready ?? p.sourcesReady ?? 0}/${p.source_count ?? p.sourceCount ?? 0}`,
+      updated: formatTimestamp(p.updated_at ?? p.updatedAt),
+    };
+  });
+  table.addEventListener('row-click', (e) => {
+    const id = e.detail?.row?._id;
+    if (id) openProject(id);
+  });
 }
 
 // One delegated listener survives every grid re-render (tf-menu requires the

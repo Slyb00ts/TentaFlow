@@ -214,6 +214,28 @@ fn parse_modules_json(modules_json: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(modules_json).unwrap_or_default()
 }
 
+/// Validates a client-supplied module list into the canonical registry form.
+/// `knowledge` is re-added when the client omits it: every other module reads
+/// project knowledge (chat context, generation, agents), and the wizard also
+/// keeps it locked on, so a project without it would be unusable.
+fn normalize_modules(modules: &[String]) -> Result<Vec<String>, ProtocolError> {
+    let mut out: Vec<String> = Vec::with_capacity(modules.len() + 1);
+    for module in modules {
+        if !VALID_MODULES.contains(&module.as_str()) {
+            return Err(ProtocolError::bad_request(format!(
+                "unknown module '{module}'"
+            )));
+        }
+        if !out.iter().any(|m| m == module) {
+            out.push(module.clone());
+        }
+    }
+    if !out.iter().any(|m| m == "knowledge") {
+        out.insert(0, "knowledge".to_string());
+    }
+    Ok(out)
+}
+
 fn job_to_wire(job: &IngestJobRecord) -> IngestJobWire {
     IngestJobWire {
         job_id: job.job_id.clone(),
@@ -478,12 +500,14 @@ pub async fn project_studio_dispatch(
             name,
             description,
             agents_json,
+            modules,
         } => settings_save_v1(
             ctx,
             project_id,
             name.as_deref(),
             description.as_deref(),
             agents_json.as_deref(),
+            modules.as_deref(),
         ),
         P::TagSaveRequest {
             project_id,
@@ -3385,6 +3409,7 @@ fn settings_save_v1(
     name: Option<&str>,
     description: Option<&str>,
     agents_json: Option<&str>,
+    modules: Option<&[String]>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
@@ -3439,15 +3464,35 @@ fn settings_save_v1(
         repository::set_setting(&pool, "agents", &canonical)
             .map_err(|e| db_error("settings_save", e))?;
     }
-    activity::record(
-        &pool,
-        &org.user_id,
-        "user",
-        "settings.saved",
-        "settings",
-        "",
-        "{}",
-    );
+    if let Some(requested) = modules {
+        let normalized = normalize_modules(requested)?;
+        // Disabling a module only hides its tab and handlers: the cases, runs,
+        // tasks and chats it produced stay in `project.db`, so the toggle is
+        // reversible and never destroys work. No cascade delete here.
+        let modules_json = serde_json::to_string(&normalized)
+            .map_err(|e| ProtocolError::internal(format!("modules serialize: {e}")))?;
+        repository::update_project_modules(&org.org_id, project_id, &modules_json)
+            .map_err(|e| db_error("settings_save", e))?;
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "settings.modules_changed",
+            "settings",
+            "",
+            &serde_json::json!({ "modules": normalized }).to_string(),
+        );
+    } else {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "settings.saved",
+            "settings",
+            "",
+            "{}",
+        );
+    }
     Ok(ps(ProjectStudioPayload::SettingsSaveResult { ok: true }))
 }
 
