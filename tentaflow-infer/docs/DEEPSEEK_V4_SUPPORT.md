@@ -25,6 +25,32 @@ GGUF — nie widział tabeli tensorów. Dla architektury, w której 2 z 43 warst
 mają kompresora, a 22 nie mają indeksera, oznaczało to obietnicę 183 tensorów,
 których nie ma. Doszło `ModelDescriptor::prune_absent_optional`.
 
+Warstwa kwantyzacji, zmierzona na prawdziwych tensorach
+(`crates/forge-formats/tests/deepseek_v4_experts.rs`):
+
+- **Eksperci NVFP4 → jednobuforowy układ GGUF, bitowo dokładnie.** To zdejmuje
+  blokadę rezydencji: ekspert jest teraz samodzielnym blokiem bajtów, więc może
+  leżeć w VRAM, w RAM-ie albo na dysku niezależnie od sąsiadów. Sprawdzone dla
+  wszystkich 126 kodów skali razy 16 kodów wartości oraz na czterech prawdziwych
+  ekspertach o różnych kształtach.
+- **Wagi nieekspertowe FP8 → Q8_0, względne L2 = 5,5e-3.** Materializacja do f16
+  — czyli dotychczasowa ścieżka FP8 — urosłaby te wagi z 8,2 do 13,7 GiB przy
+  karcie mającej 16 GiB i 148 GiB ekspertów do zmieszczenia obok. Q8_0 zajmuje
+  1,06 bajta na wagę i wchodzi we wszystkie istniejące kernele bez pisania
+  nowych. Maksymalny błąd względny sięga 1,0 na pojedynczych wartościach
+  wielokrotnie mniejszych od maksimum swojej grupy — int8 z jedną skalą je
+  zeruje; ich wkład do L2 jest znikomy, ale to jest realne obcięcie, nie
+  zaokrąglenie. Natywny kernel FP8 z kafelkową skalą zdejmie ten koszt później.
+
+Dwie konwencje ustalone POMIAREM, bo obie mylą się bezgłośnie:
+
+- `weight_scale_2` DeepSeeka **mnoży** wynik, podczas gdy
+  `weight_global_scale` compressed-tensors przez wynik **dzieli**. Podstawienie
+  jednego pod drugie daje wagi rzędu 10^6 zamiast 10^-2 — bez błędu, bez
+  ostrzeżenia, po prostu śmieci na wyjściu.
+- Kod skali `0x7F` (NaN w E4M3) układ GGUF mapuje na zero, co wyzerowałoby całą
+  szesnastkę wag. Jest odrzucany zamiast przepuszczany.
+
 ## Architektura — co trzeba odtworzyć
 
 Siedem niezależnych mechanizmów, z których FORGE nie ma żadnego.
@@ -99,16 +125,13 @@ Aktywacje kwantyzowane dynamicznie do FP8 przed każdym GEMM-em.
 
 ## Czego brakuje, w kolejności
 
-1. **Eksperci NVFP4 per blok w rezydencji.** Rezydencja wymaga wagi o jednym
-   buforze bajtów, a tu pakiety i skale są osobno. To blokuje wczytanie
-   ekspertów niezależnie od reszty.
-2. **FP8 blokowy DeepSeeka** — układ skal inny niż to, co FORGE ma dziś.
-3. **Mikser: uwaga latentna** z LoRA, rope odwrotnym na wyjściu i kotwicą.
-4. **Podwójny strumień KV** — okno plus kompresor, ze stanem dekodowania.
-5. **Indekser i rzadka uwaga** po zebranych indeksach.
-6. **Bramka MoE** z biasem, `sqrtsoftplus` i routingiem haszowanym.
-7. **Hash-conditioning** z Sinkhornem.
-8. **MTP.**
+1. **Mikser: uwaga latentna** z LoRA, rope odwrotnym na wyjściu i kotwicą.
+2. **Podwójny strumień KV** — okno plus kompresor, ze stanem dekodowania.
+3. **Indekser i rzadka uwaga** po zebranych indeksach.
+4. **Bramka MoE** z biasem, `sqrtsoftplus` i routingiem haszowanym.
+5. **Hash-conditioning** z Sinkhornem.
+6. **MTP.**
+7. **Natywny FP8 z kafelkową skalą** — zdejmuje przekwantyzowanie do Q8_0.
 
 Każdy z tych punktów da się zwalidować numerycznie przeciwko `inference/model.py`
 osobno, i tak trzeba je robić — model, który nie mieści się w VRAM i nie ma

@@ -112,3 +112,70 @@ fn rejects_degenerate_global_scale() {
         );
     }
 }
+
+/// Wagi nieekspertowe idą z FP8 na Q8_0, żeby zmieścić się na karcie: f16
+/// urósłby je z 8,2 do 13,7 GiB. To przekwantyzowanie, więc test MIERZY jego
+/// koszt zamiast go zakładać — i pilnuje, żeby nie urósł niepostrzeżenie.
+#[test]
+fn fp8_to_q8_0_error_stays_bounded_on_real_weights() {
+    let Some(st) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu DeepSeek V4 (FORGE_DEEPSEEK_V4_DIR)");
+        return;
+    };
+    // Cztery różne kształty i role: zejście i wyjście LoRA Q, wspólne KV,
+    // bramka eksperta dzielonego.
+    for name in [
+        "layers.2.attn.wq_a.weight",
+        "layers.2.attn.wq_b.weight",
+        "layers.2.attn.wkv.weight",
+        "layers.2.ffn.shared_experts.w1.weight",
+    ] {
+        let info = st.tensor(name).expect(name);
+        let (rows, cols) = (info.shape[0], info.shape[1]);
+        let weight = st.data(name).unwrap();
+        let scale_name = format!("{}.scale", name.strip_suffix(".weight").unwrap());
+        let scale_info = st.tensor(&scale_name).expect(&scale_name);
+        let scales = st.data(&scale_name).unwrap();
+        let tile = cols / scale_info.shape[1];
+        assert_eq!(
+            rows / scale_info.shape[0],
+            tile,
+            "{name}: kafel skali nie jest kwadratowy"
+        );
+
+        let q8 = forge_formats::nvfp4::deepseek_fp8_to_q8_0(weight, scales, rows, cols, tile)
+            .expect(name);
+        let decoded = forge_formats::dequant::dequantize_to_f32(
+            DType::U8,
+            QuantKind::Q8_0,
+            &q8,
+            rows * cols,
+        )
+        .unwrap();
+
+        let scale_cols = scale_info.shape[1];
+        let mut sum_sq_err = 0f64;
+        let mut sum_sq_ref = 0f64;
+        let mut max_rel = 0f32;
+        for row in 0..rows {
+            for col in 0..cols {
+                let scale =
+                    forge_formats::nvfp4::f8e8m0_to_f32(scales[(row / tile) * scale_cols + col / tile])
+                        .unwrap();
+                let want = f8e4m3_to_f32(weight[row * cols + col]) * scale;
+                let got = decoded[row * cols + col];
+                sum_sq_err += ((got - want) as f64).powi(2);
+                sum_sq_ref += (want as f64).powi(2);
+                if want != 0.0 {
+                    max_rel = max_rel.max(((got - want) / want).abs());
+                }
+            }
+        }
+        let rel_l2 = (sum_sq_err / sum_sq_ref.max(f64::MIN_POSITIVE)).sqrt();
+        eprintln!("{name}: względne L2 = {rel_l2:.3e}, maks. względny = {max_rel:.3e}");
+        assert!(
+            rel_l2 < 1e-2,
+            "{name}: przekwantyzowanie FP8 -> Q8_0 zgubiło za dużo (L2 {rel_l2:.3e})"
+        );
+    }
+}

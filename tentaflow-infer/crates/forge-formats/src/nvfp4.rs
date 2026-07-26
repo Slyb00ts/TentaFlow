@@ -372,6 +372,103 @@ pub fn nvfp4_ct_to_gguf_blocks(
     Ok(out)
 }
 
+/// Dekoduje skalę FP8 E8M0 — sam wykładnik, bez mantysy i bez znaku.
+/// `0xFF` to NaN, `0x00` to `2^-127`.
+pub fn f8e8m0_to_f32(byte: u8) -> Option<f32> {
+    if byte == 0xFF {
+        return None;
+    }
+    Some(2f32.powi(byte as i32 - 127))
+}
+
+/// Przelicza wagę FP8 DeepSeeka (E4M3 z kafelkowaną skalą E8M0) na Q8_0.
+///
+/// Powód jest pojemnościowy, nie estetyczny: materializacja tych wag do f16 —
+/// czyli to, co robi dotychczasowa ścieżka FP8 — urosłaby dla tego modelu z
+/// 8,2 GiB do 13,7 GiB, przy karcie mającej 16 GiB i 148 GiB ekspertów do
+/// zmieszczenia obok. Q8_0 zajmuje 1,0625 bajta na wagę i wchodzi we WSZYSTKIE
+/// istniejące kernele bez pisania choćby jednego nowego.
+///
+/// To jest przekwantyzowanie, więc kosztuje dokładność — ile dokładnie, mierzy
+/// test na prawdziwych tensorach. Natywny kernel FP8 z kafelkową skalą zdejmie
+/// ten koszt później, nie zmieniając niczego powyżej.
+///
+/// `scales` ma kształt `[rows/tile, cols/tile]`; grupa Q8_0 (32 elementy) mieści
+/// się w całości wewnątrz kafla, więc skala w obrębie grupy jest stała.
+pub fn deepseek_fp8_to_q8_0(
+    weight: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+    tile: usize,
+) -> Result<Vec<u8>> {
+    const GROUP: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+
+    if tile == 0 || !tile.is_multiple_of(GROUP) {
+        return Err(fmt_err(format!(
+            "fp8: kafel skali {tile} musi być wielokrotnością {GROUP}"
+        )));
+    }
+    if !cols.is_multiple_of(GROUP) {
+        return Err(fmt_err(format!(
+            "fp8: cols {cols} nie dzieli się na grupy Q8_0 po {GROUP}"
+        )));
+    }
+    if weight.len() != rows * cols {
+        return Err(fmt_err(format!(
+            "fp8: waga ma {} bajtów, oczekiwano {} dla [{rows}, {cols}]",
+            weight.len(),
+            rows * cols
+        )));
+    }
+    let scale_rows = rows.div_ceil(tile);
+    let scale_cols = cols.div_ceil(tile);
+    if scales.len() != scale_rows * scale_cols {
+        return Err(fmt_err(format!(
+            "fp8: skale mają {} bajtów, oczekiwano {scale_rows}x{scale_cols} dla kafla {tile}",
+            scales.len()
+        )));
+    }
+
+    let groups_per_row = cols / GROUP;
+    let mut out = vec![0u8; rows * groups_per_row * BLOCK_BYTES];
+    let mut values = [0f32; GROUP];
+    for row in 0..rows {
+        for group in 0..groups_per_row {
+            let col0 = group * GROUP;
+            let scale_byte = scales[(row / tile) * scale_cols + col0 / tile];
+            let scale = f8e8m0_to_f32(scale_byte).ok_or_else(|| {
+                fmt_err(format!(
+                    "fp8: skala kafla [{}, {}] jest NaN",
+                    row / tile,
+                    col0 / tile
+                ))
+            })?;
+            let mut amax = 0f32;
+            for (i, slot) in values.iter_mut().enumerate() {
+                let v = f8e4m3_to_f32(weight[row * cols + col0 + i]) * scale;
+                if !v.is_finite() {
+                    return Err(fmt_err(format!(
+                        "fp8: waga [{row}, {}] nie jest skończona",
+                        col0 + i
+                    )));
+                }
+                *slot = v;
+                amax = amax.max(v.abs());
+            }
+            let d = amax / 127.0;
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let block = &mut out[(row * groups_per_row + group) * BLOCK_BYTES..][..BLOCK_BYTES];
+            block[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+            for (i, &v) in values.iter().enumerate() {
+                block[2 + i] = ((v * inv).round().clamp(-127.0, 127.0) as i8) as u8;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Nazwy trójki tensorów jednego eksperta NVFP4 w checkpoincie DeepSeek V4.
 ///
 /// Układ różni się od compressed-tensors dwiema rzeczami, z których druga jest
