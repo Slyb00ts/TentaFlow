@@ -1979,9 +1979,18 @@ fn attn_decode_matches_reference() {
     let slb = dev.alloc(8, MemKind::Device, Pool::Weights).unwrap();
     dev.write(bytemuck::cast_slice(&seq_lens), &slb, 0).unwrap();
 
+    // Ścieżka dzielona zapisuje częściowe wyniki do własnego bufora
+    // (8 partycji po head_dim + 4 f32 na głowicę), więc test musi go dać.
+    let parts = dev
+        .alloc(
+            n_seqs * n_q_heads * 8 * (head_dim + 4) * 4,
+            MemKind::Device,
+            Pool::Weights,
+        )
+        .unwrap();
     kernels
         .attn_decode_f16(
-            &ob, &ob, &qb, &kb, &vb, &ptb, &slb, n_seqs, n_q_heads, n_kv_heads, head_dim,
+            &ob, &parts, &qb, &kb, &vb, &ptb, &slb, n_seqs, n_q_heads, n_kv_heads, head_dim,
             page_size, max_pages, scale, 0, &stream,
         )
         .unwrap();

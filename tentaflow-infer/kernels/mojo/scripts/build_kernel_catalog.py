@@ -301,8 +301,23 @@ def compile_catalog(kernels, portable_nvfp4):
                     raise RuntimeError(
                         f"jednostka {attempt} wygenerowala {len(dumped)} z {len(items)} artefaktow"
                     )
+                # Mangling Mojo nie koduje parametrow comptime, wiec dwie
+                # specjalizacje tej samej funkcji potrafia dostac ten sam symbol.
+                # Kompilator deduplikuje je wtedy w obrebie jednostki i DWA
+                # artefakty dostaja TO SAMO cialo — kernel liczy wtedy cicho co
+                # innego, niz nazwa obiecuje. Tego nie wolno przepuscic.
+                seen_bodies = {}
                 for dump_path in dumped:
                     artifact = dump_path.stem
+                    body = dump_path.read_text()
+                    twin = seen_bodies.get(body)
+                    if twin is not None:
+                        raise RuntimeError(
+                            f"artefakty {twin} i {artifact} maja identyczne cialo — "
+                            "kolizja symboli manglingu; nadaj specjalizacjom osobne "
+                            "definicje zamiast aliasow comptime"
+                        )
+                    seen_bodies[body] = artifact
                     raw = dump_path.read_text()
                     if AMD_TARGET_MARKER in raw:
                         arch = amdgcn_arch(raw, artifact)

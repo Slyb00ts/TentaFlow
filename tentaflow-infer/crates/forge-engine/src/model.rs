@@ -2503,7 +2503,7 @@ impl Model {
                 // The non-fused decode chain (qkv_post + attn_decode) has no
                 // fp8 cache kernels; fp8 decode goes through attn_decode_split
                 // exclusively.
-                if !Self::fused_decode_supported(&weights) {
+                if !Self::fused_decode_available(&weights, device.caps().vendor) {
                     return Err(ForgeError::Unsupported(
                         "kv_dtype fp8 requires the fused decode path; this model's weight \
                          formats fall back to the separate decode kernels"
@@ -3802,8 +3802,21 @@ impl Model {
     /// up): each projection then runs its own gemv_norm launch — same
     /// per-row math, only the norm recompute is repeated (gate/up adds an
     /// elementwise silu_mul). Anything else records the separate chain.
-    fn fused_decode_supported(weights: &ModelWeights) -> bool {
+    fn fused_decode_supported(&self) -> bool {
+        Self::fused_decode_available(&self.weights, self.device.caps().vendor)
+    }
+
+    fn fused_decode_available(weights: &ModelWeights, vendor: forge_types::Vendor) -> bool {
         let p = &weights.descriptor.params;
+        // Kernele `gemv_norm_*` przeliczaja norme w KAZDEJ grupie roboczej i sa
+        // strojone pod NVIDIA. Na gfx1030 profiler pokazal 182,95 us na wywolanie
+        // dla projekcji FFN Mistrala (33 MB, czyli 181 GB/s), podczas gdy zwykly
+        // GEMV na tej samej karcie robi 466 GB/s. Rozdzielenie normy i GEMV dalo
+        // tam 67,2 -> 78,6 tok/s, a na Qwen3 286,6 -> 315,2. Dlatego poza NVIDIA
+        // idzie sciezka rozdzielna.
+        if vendor != forge_types::Vendor::Nvidia {
+            return false;
+        }
         if p.hidden_size > 8192 {
             return false;
         }
@@ -7532,7 +7545,7 @@ impl Model {
             // per-layer staging picks it up like the separate f16 chain.
             self.upload_page_table(seq)?;
             self.run_step_rot(AttnSrc::Staged(seq))
-        } else if Self::fused_decode_supported(&self.weights) {
+        } else if self.fused_decode_supported() {
             self.run_step_fused(AttnSrc::Staged(seq))
         } else {
             // The separate chain's qkv_post / kv_append write the new token
@@ -12023,7 +12036,7 @@ impl Model {
     /// capture are irrelevant — only addresses and launch geometry matter.
     fn capture_step(&self) -> Result<ExecGraph> {
         self.device.begin_capture(&self.stream)?;
-        let recorded = if Self::fused_decode_supported(&self.weights) {
+        let recorded = if self.fused_decode_supported() {
             self.run_step_fused(AttnSrc::Paged)
         } else {
             self.run_step_separate(AttnSrc::Paged)

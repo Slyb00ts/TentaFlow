@@ -23,14 +23,18 @@ from src.activation import silu_mul_f16, gelu_mul_f16, scale_f16, softcap_f32, s
 from src.rope import rope_neox_f16, rope_neox_ff_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import (
-    attn_decode_f16_hd64,
     attn_decode_f16_hd128,
     attn_decode_f16_hd256,
     attn_decode_f16_hd512,
-    attn_decode_split8_combine_f16_hd256,
-    attn_decode_split8_combine_f16_hd512,
-    attn_decode_split8_f16_hd256,
-    attn_decode_split8_f16_hd512,
+    attn_decode_f16_hd64,
+    hd128_attn_split8,
+    hd128_attn_split8_combine,
+    hd256_attn_split8,
+    hd256_attn_split8_combine,
+    hd512_attn_split8,
+    hd512_attn_split8_combine,
+    hd64_attn_split8,
+    hd64_attn_split8_combine,
 )
 from src.attention import (
     attn_decode_batch_exact_f16_hd256,
@@ -829,25 +833,46 @@ def main() raises:
     entries.append(_finalize(out_dir, "attn_decode_f16_hd512"))
 
     _ = ctx.compile_function[
-        attn_decode_split8_f16_hd256,
+        hd256_attn_split8,
         dump_asm=Path("attn_decode_split8_f16_hd256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_decode_split8_f16_hd256"))
     _ = ctx.compile_function[
-        attn_decode_split8_combine_f16_hd256,
+        hd256_attn_split8_combine,
         dump_asm=Path("attn_decode_split8_combine_f16_hd256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_decode_split8_combine_f16_hd256"))
     _ = ctx.compile_function[
-        attn_decode_split8_f16_hd512,
+        hd512_attn_split8,
         dump_asm=Path("attn_decode_split8_f16_hd512.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_decode_split8_f16_hd512"))
     _ = ctx.compile_function[
-        attn_decode_split8_combine_f16_hd512,
+        hd512_attn_split8_combine,
         dump_asm=Path("attn_decode_split8_combine_f16_hd512.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_decode_split8_combine_f16_hd512"))
+    _ = ctx.compile_function[
+        hd64_attn_split8,
+        dump_asm=Path("attn_decode_split8_f16_hd64.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_split8_f16_hd64"))
+    _ = ctx.compile_function[
+        hd64_attn_split8_combine,
+        dump_asm=Path("attn_decode_split8_combine_f16_hd64.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_split8_combine_f16_hd64"))
+    _ = ctx.compile_function[
+        hd128_attn_split8,
+        dump_asm=Path("attn_decode_split8_f16_hd128.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_split8_f16_hd128"))
+    _ = ctx.compile_function[
+        hd128_attn_split8_combine,
+        dump_asm=Path("attn_decode_split8_combine_f16_hd128.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_split8_combine_f16_hd128"))
+
 
     _ = ctx.compile_function[
         attn_decode_batch_exact_f16_hd256,

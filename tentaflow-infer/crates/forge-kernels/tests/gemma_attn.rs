@@ -415,6 +415,24 @@ fn attn_decode_split_matches_generic() {
                 .zip(&want)
                 .map(|(g, w)| (g - w).abs())
                 .fold(0.0f32, f32::max);
+            if err >= 0.02 {
+                let bad = (0..n_q * head_dim)
+                    .max_by(|&a, &b| {
+                        (got[a] - want[a])
+                            .abs()
+                            .partial_cmp(&(got[b] - want[b]).abs())
+                            .unwrap()
+                    })
+                    .unwrap();
+                eprintln!(
+                    "hd={head_dim} ctx={ctx} window={window} err={err} at idx={bad} (head {}) got={} want={} | got[0..3]={:?} want[0..3]={:?}",
+                    bad / head_dim,
+                    got[bad],
+                    want[bad],
+                    &got[0..3],
+                    &want[0..3]
+                );
+            }
             assert!(
                 err < 0.02,
                 "hd={head_dim} ctx={ctx} window={window} max_err={err}"

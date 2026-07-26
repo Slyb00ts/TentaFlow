@@ -458,6 +458,8 @@ fn validate_attn_verify_split8(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttnDecodePlan {
     Generic(&'static str),
+    Split8Hd64,
+    Split8Hd128,
     Split8Hd256,
     Split8Hd512,
 }
@@ -469,7 +471,13 @@ fn attn_decode_plan(
     split8_available: bool,
 ) -> Result<AttnDecodePlan> {
     match head_dim {
+        64 if warp_size == 32 && max_threads >= ATTN_HD256_BLOCK && split8_available => {
+            Ok(AttnDecodePlan::Split8Hd64)
+        }
         64 => Ok(AttnDecodePlan::Generic("attn_decode_f16_hd64")),
+        128 if warp_size == 32 && max_threads >= ATTN_HD256_BLOCK && split8_available => {
+            Ok(AttnDecodePlan::Split8Hd128)
+        }
         128 => Ok(AttnDecodePlan::Generic("attn_decode_f16_hd128")),
         // Podział kontekstu jest jedynym sposobem, żeby dekodowanie JEDNEJ
         // sekwencji wysyciło pamięć: wariant generyczny ma siatkę
@@ -9659,7 +9667,12 @@ impl Kernels {
         // schodzimy na ścieżkę generyczną, która je obsługuje.
         // Wariant dzielony maskuje już okno przesuwne, więc obowiązuje także
         // dla warstw okiennych (40 z 48 warstw Gemmy 4).
-        let split_suffix = if head_dim == 512 { "hd512" } else { "hd256" };
+        let split_suffix = match head_dim {
+            64 => "hd64",
+            128 => "hd128",
+            512 => "hd512",
+            _ => "hd256",
+        };
         let split8_available = self
             .artifacts
             .has(&format!("attn_decode_split8_f16_{split_suffix}"))
@@ -9687,12 +9700,9 @@ impl Kernels {
             page_size,
             max_pages,
             scale,
-            matches!(plan, AttnDecodePlan::Split8Hd256 | AttnDecodePlan::Split8Hd512),
+            !matches!(plan, AttnDecodePlan::Generic(_)),
         )?;
-        if matches!(
-            plan,
-            AttnDecodePlan::Split8Hd256 | AttnDecodePlan::Split8Hd512
-        ) {
+        if !matches!(plan, AttnDecodePlan::Generic(_)) {
             let partial =
                 self.artifacts
                     .get(&format!("attn_decode_split8_f16_{split_suffix}"))?;
@@ -9735,9 +9745,7 @@ impl Kernels {
         }
         let name = match plan {
             AttnDecodePlan::Generic(name) => name,
-            AttnDecodePlan::Split8Hd256 | AttnDecodePlan::Split8Hd512 => {
-                unreachable!("wariant dzielony zwraca wynik przed fallbackiem")
-            }
+            _ => unreachable!("wariant dzielony zwraca wynik przed fallbackiem"),
         };
         let k = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
@@ -16698,22 +16706,18 @@ mod nvfp4_gguf_dispatch_tests {
     /// za małym bloku i braku artefaktów.
     #[test]
     fn wariant_dzielony_wymaga_fali_32_i_kompletu_artefaktow() {
-        for vendor in [
-            forge_types::Vendor::Nvidia,
-            forge_types::Vendor::Amd,
-            forge_types::Vendor::Apple,
+        for (head_dim, expected) in [
+            (64usize, AttnDecodePlan::Split8Hd64),
+            (128, AttnDecodePlan::Split8Hd128),
+            (256, AttnDecodePlan::Split8Hd256),
+            (512, AttnDecodePlan::Split8Hd512),
         ] {
-            assert_eq!(
-                attn_decode_plan(256, 32, 1024, true).unwrap(),
-                AttnDecodePlan::Split8Hd256
-            );
-            assert_eq!(
-                attn_decode_plan(512, 32, 1024, true).unwrap(),
-                AttnDecodePlan::Split8Hd512
-            );
+            assert_eq!(attn_decode_plan(head_dim, 32, 1024, true).unwrap(), expected);
         }
         for (head_dim, generic) in [
-            (256usize, "attn_decode_f16_hd256"),
+            (64usize, "attn_decode_f16_hd64"),
+            (128, "attn_decode_f16_hd128"),
+            (256, "attn_decode_f16_hd256"),
             (512, "attn_decode_f16_hd512"),
         ] {
             for plan in [

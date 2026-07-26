@@ -283,10 +283,118 @@ def attn_decode_split8_combine_f16[head_dim: Int](
     ]((output / denominator).cast[DType.float16]())
 
 
-comptime attn_decode_split8_f16_hd256 = attn_decode_split8_f16[256]
-comptime attn_decode_split8_f16_hd512 = attn_decode_split8_f16[512]
-comptime attn_decode_split8_combine_f16_hd256 = attn_decode_split8_combine_f16[256]
-comptime attn_decode_split8_combine_f16_hd512 = attn_decode_split8_combine_f16[512]
+# Specjalizacje dekodowania z podzialem kontekstu, po jednej na obslugiwane
+# `head_dim`. Osobne definicje (zamiast aliasow `comptime`) trzymaja nazwe
+# kernela blisko jego geometrii w zrzutach i manifescie.
+
+
+def hd64_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[64](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd64_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[64](out_ptr, partial_ptr, n_q_heads)
+
+def hd128_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[128](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd128_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[128](out_ptr, partial_ptr, n_q_heads)
+
+def hd256_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[256](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd256_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[256](out_ptr, partial_ptr, n_q_heads)
+
+def hd512_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[512](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd512_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[512](out_ptr, partial_ptr, n_q_heads)
 
 
 def attn_decode_batch_exact_f16[head_dim: Int](
