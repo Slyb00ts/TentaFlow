@@ -24,6 +24,7 @@ from src.attention import (
     attn_decode_f16_hd64,
     attn_decode_f16_hd128,
     attn_decode_f16_hd256,
+    attn_decode_f16_hd512,
     attn_decode_split8_combine_f16_hd256,
     attn_decode_split8_f16_hd256,
 )
@@ -245,6 +246,7 @@ from src.prefill import (
     attn_prefill_f16_hd64,
     attn_prefill_f16_hd128,
     attn_prefill_f16_hd256,
+    attn_prefill_f16_hd512,
 )
 from src.prefill import (
     kv_append_batch_fp8,
@@ -798,6 +800,10 @@ def main() raises:
         attn_decode_f16_hd256, dump_asm=Path("attn_decode_f16_hd256.ptx")
     ]()
     entries.append(_finalize(out_dir, "attn_decode_f16_hd256"))
+    _ = ctx.compile_function[
+        attn_decode_f16_hd512, dump_asm=Path("attn_decode_f16_hd512.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_f16_hd512"))
 
     _ = ctx.compile_function[
         attn_decode_split8_f16_hd256,
@@ -1874,6 +1880,10 @@ def main() raises:
         attn_prefill_f16_hd256, dump_asm=Path("attn_prefill_f16_hd256.ptx")
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_f16_hd256"))
+    _ = ctx.compile_function[
+        attn_prefill_f16_hd512, dump_asm=Path("attn_prefill_f16_hd512.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "attn_prefill_f16_hd512"))
     _ = ctx.compile_function[
         attn_prefill_segmented_f16_hd128,
         dump_asm=Path("attn_prefill_segmented_f16_hd128.ptx"),

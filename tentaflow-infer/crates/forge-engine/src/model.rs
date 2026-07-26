@@ -2376,7 +2376,8 @@ impl Model {
         let p = weights.descriptor.params.clone();
         // head_dim 256 has an f16-only attention specialization (qwen35moe
         // gated attention layers); the hybrid arch always uses the f16 cache.
-        if p.head_dim != 64 && p.head_dim != 128 && p.head_dim != 256 {
+        // 512 to warstwy globalne rodziny Gemma 4 (16 głowic Q na jedną KV).
+        if p.head_dim != 64 && p.head_dim != 128 && p.head_dim != 256 && p.head_dim != 512 {
             return Err(ForgeError::Unsupported(format!(
                 "head_dim {} has no attention specialization",
                 p.head_dim

@@ -129,6 +129,8 @@ def attn_decode_f16[head_dim: Int](
 comptime attn_decode_f16_hd64 = attn_decode_f16[64]
 comptime attn_decode_f16_hd128 = attn_decode_f16[128]
 comptime attn_decode_f16_hd256 = attn_decode_f16[256]
+# head_dim 512 — warstwy globalne Gemmy 4 (16 głowic Q na jedną głowicę KV).
+comptime attn_decode_f16_hd512 = attn_decode_f16[512]
 
 
 def attn_decode_split8_f16_hd256(

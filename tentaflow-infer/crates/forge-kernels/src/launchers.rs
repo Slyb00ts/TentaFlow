@@ -480,6 +480,9 @@ fn attn_decode_plan(
             Ok(AttnDecodePlan::Split8Hd256)
         }
         256 => Ok(AttnDecodePlan::Generic("attn_decode_f16_hd256")),
+        // 512: warstwy globalne Gemmy 4. Wariant split8 istnieje tylko dla 256,
+        // więc tu idzie ścieżka generyczna.
+        512 => Ok(AttnDecodePlan::Generic("attn_decode_f16_hd512")),
         other => Err(ForgeError::Unsupported(format!(
             "attn_decode: head_dim {other} has no compiled specialization"
         ))),
@@ -7250,6 +7253,9 @@ impl Kernels {
             // Only the f16 cache has an hd256 specialization (qwen35moe
             // attention layers); fp8/rot hd256 is not compiled.
             (256, DType::F16) => format!("attn_prefill_{suffix}_hd256"),
+            // 512: warstwy globalne Gemmy 4. Kafel pozycji jest tam o połowę
+            // mniejszy (LDS), ale kontrakt uruchomienia jest ten sam.
+            (512, DType::F16) => format!("attn_prefill_{suffix}_hd512"),
             (other, _) => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_prefill: head_dim {other} has no compiled specialization"

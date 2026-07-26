@@ -881,6 +881,9 @@ mod tests {
             rope_sections: None,
             full_attention_interval: 0,
             attn_gated: true,
+            ffn_activation: forge_formats::FfnActivation::SiLU,
+            alt_attn: None,
+            final_logit_softcap: 0.0,
         }
     }
 

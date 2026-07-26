@@ -134,11 +134,10 @@ def kv_append_batch_segmented_masked_f16(
 
 
 comptime QT = 16  # query tokens per block
-comptime PT = WARP_SIZE  # cached positions per smem tile (one lane per position)
 comptime QPW = QT // MAX_WARPS  # queries owned by one warp
 
 
-def attn_prefill[head_dim: Int, kv_dtype: DType](
+def attn_prefill[head_dim: Int, kv_dtype: DType, PT: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
     k_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
@@ -254,22 +253,25 @@ def attn_prefill[head_dim: Int, kv_dtype: DType](
             if h > n_valid:
                 h = n_valid
             if h > 0:
-                # Lane `lane` scores position pos0+lane against query i.
-                var dotv = SIMD[DType.float32, 8](0.0)
+                # Lane `lane` scores position pos0+lane against query i. Przy
+                # PT < WARP_SIZE kafel ma mniej wierszy niż fala ma lane'ów, więc
+                # odczyt musi być pod warunkiem — inaczej nadmiarowe lane'y
+                # czytają LDS poza `ks` (maskowanie samego score jest za późno).
+                var score = NEG_INF
+                if lane < h:
+                    var dotv = SIMD[DType.float32, 8](0.0)
 
-                comptime for c in range(row_chunks):
-                    kv8 = (
-                        ks
-                        + lane * head_dim
-                        + ((c ^ (lane % row_chunks)) * 8)
-                    ).load[width=8, alignment=16]().cast[DType.float32]()
-                    qv8 = (
-                        qs + (wid * QPW + i) * head_dim + c * 8
-                    ).load[width=8, alignment=16]().cast[DType.float32]()
-                    dotv += qv8 * kv8
-                var score = dotv.reduce_add() * scale
-                if lane >= h:
-                    score = NEG_INF
+                    comptime for c in range(row_chunks):
+                        kv8 = (
+                            ks
+                            + lane * head_dim
+                            + ((c ^ (lane % row_chunks)) * 8)
+                        ).load[width=8, alignment=16]().cast[DType.float32]()
+                        qv8 = (
+                            qs + (wid * QPW + i) * head_dim + c * 8
+                        ).load[width=8, alignment=16]().cast[DType.float32]()
+                        dotv += qv8 * kv8
+                    score = dotv.reduce_add() * scale
                 mtile = warp.max(score)
                 if mtile > m[i]:
                     rescale = exp(m[i] - mtile)
@@ -449,13 +451,17 @@ def attn_prefill_segmented_f16[head_dim: Int](
             )
 
 
-comptime attn_prefill_f16_hd64 = attn_prefill[64, DType.float16]
-comptime attn_prefill_f16_hd128 = attn_prefill[128, DType.float16]
-comptime attn_prefill_f16_hd256 = attn_prefill[256, DType.float16]
+comptime attn_prefill_f16_hd64 = attn_prefill[64, DType.float16, WARP_SIZE]
+comptime attn_prefill_f16_hd128 = attn_prefill[128, DType.float16, WARP_SIZE]
+comptime attn_prefill_f16_hd256 = attn_prefill[256, DType.float16, WARP_SIZE]
+# head_dim 512 (warstwy globalne Gemmy 4): kafle K i V przy PT=32 zajęłyby same
+# 64 KiB LDS, czyli caly limit. Polowa kafla pozycji mieści się w 48 KiB i
+# zostawia zapas na kafel zapytań.
+comptime attn_prefill_f16_hd512 = attn_prefill[512, DType.float16, WARP_SIZE // 2]
 comptime attn_prefill_segmented_f16_hd128 = attn_prefill_segmented_f16[128]
 comptime attn_prefill_segmented_f16_hd256 = attn_prefill_segmented_f16[256]
-comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn]
-comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn]
+comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn, WARP_SIZE]
+comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn, WARP_SIZE]
 
 
 def attn_prefill_device_pos_f16_hd256(
@@ -472,7 +478,7 @@ def attn_prefill_device_pos_f16_hd256(
     n_tokens: Int,
 ):
     """Wariant HD256 odczytujący bazową pozycję z bufora urządzenia."""
-    attn_prefill[256, DType.float16](
+    attn_prefill[256, DType.float16, WARP_SIZE](
         out_ptr, q, k_cache, v_cache, page_table, Int(base_pos[0]),
         n_q_heads, n_kv_heads, page_size, scale, n_tokens,
     )
