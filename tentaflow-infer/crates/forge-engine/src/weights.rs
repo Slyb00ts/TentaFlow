@@ -574,6 +574,13 @@ pub enum LayerMixer {
 pub struct LayerWeights {
     pub attn_norm: DevBuffer,
     pub ffn_norm: DevBuffer,
+    /// Normy "sandwich" nakładane na wyjście bloku PRZED dodaniem rezyduum
+    /// (rodzina Gemma). Modele bez nich zostawiają te pola puste.
+    pub post_attn_norm: Option<DevBuffer>,
+    pub post_ffw_norm: Option<DevBuffer>,
+    /// Skalar mnożący wyjście warstwy. Wczytywany raz, więc trzymamy go na
+    /// hoście — nie ma powodu na dodatkowy odczyt z urządzenia w każdym kroku.
+    pub layer_output_scale: Option<f32>,
     pub mixer: LayerMixer,
     pub ffn: LayerFfn,
 }
@@ -1368,6 +1375,18 @@ fn nvfp4_gguf_output_scale(src: &dyn TensorSource, name: &str, quant: QuantKind)
 }
 
 /// Upload a norm-style vector as f16 (dequantizing if needed).
+/// Odczytuje jednoelementowy tensor jako skalar hosta (np. `layer_output_scale`).
+fn load_scalar_f32(src: &dyn TensorSource, name: &str) -> Result<f32> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    let numel: usize = dims.iter().product();
+    if numel != 1 {
+        return Err(ForgeError::Unsupported(format!(
+            "tensor {name} miał mieć 1 element, ma {numel}"
+        )));
+    }
+    Ok(dequantize_to_f32(dtype, quant, &data, numel)?[0])
+}
+
 fn upload_norm(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Result<DevBuffer> {
     let (data, dtype, quant, dims) = src.fetch(name)?;
     let numel = dims.iter().product();
@@ -2553,8 +2572,6 @@ impl ModelWeights {
         // konkretnej warstwy, a nie raz dla całego modelu.
         let q_dim_at = |layer: usize| p.n_heads * p.head_dim_at(layer);
         let kv_dim_at = |layer: usize| p.n_kv_heads_at(layer) * p.head_dim_at(layer);
-        let q_dim = q_dim_at(0);
-        let kv_dim = kv_dim_at(0);
         let expect = |what: &str, w: &HostWeight, rows: usize, cols: usize| -> Result<()> {
             if w.rows() != rows || w.cols() != cols {
                 return Err(ForgeError::Format(format!(
@@ -2756,6 +2773,18 @@ impl ModelWeights {
             layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
+                post_attn_norm: match layer_map.get(&WeightRole::PostAttnNorm) {
+                    Some(n) => Some(upload_norm(device, src, n)?),
+                    None => None,
+                },
+                post_ffw_norm: match layer_map.get(&WeightRole::PostFfwNorm) {
+                    Some(n) => Some(upload_norm(device, src, n)?),
+                    None => None,
+                },
+                layer_output_scale: match layer_map.get(&WeightRole::LayerOutputScale) {
+                    Some(n) => Some(load_scalar_f32(src, n)?),
+                    None => None,
+                },
                 mixer: LayerMixer::Attention(Box::new(AttnWeights {
                     q_norm: match layer_map.get(&WeightRole::AttnQNorm) {
                         Some(n) => Some(upload_norm(device, src, n)?),
@@ -3020,6 +3049,18 @@ impl ModelWeights {
             layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
+                post_attn_norm: match layer_map.get(&WeightRole::PostAttnNorm) {
+                    Some(n) => Some(upload_norm(device, src, n)?),
+                    None => None,
+                },
+                post_ffw_norm: match layer_map.get(&WeightRole::PostFfwNorm) {
+                    Some(n) => Some(upload_norm(device, src, n)?),
+                    None => None,
+                },
+                layer_output_scale: match layer_map.get(&WeightRole::LayerOutputScale) {
+                    Some(n) => Some(load_scalar_f32(src, n)?),
+                    None => None,
+                },
                 mixer,
                 ffn,
             });

@@ -2076,32 +2076,23 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// buf *= factor[0], gdzie mnożnik leży na urządzeniu
-    /// (`layer_output_scale` jest tensorem modelu, nie stałą hosta).
-    pub fn scale_dev_f16(
-        &self,
-        buf: &DevBuffer,
-        n: usize,
-        factor: &DevBuffer,
-        stream: &Stream,
-    ) -> Result<()> {
-        let k = self.artifacts.get("scale_dev_f16")?;
-        let cfg = LaunchConfig::linear(n as u32, BLOCK);
-        let args = LaunchArgs::new().buf(buf).scalar(n as i64).buf(factor);
-        self.device.launch(k, &cfg, &args, stream)
-    }
-
     /// logits = cap * tanh(logits / cap) w miejscu (ograniczenie logitów Gemmy).
+    /// `offset` liczony w elementach f32 — głowa batcha zapisuje kolejne lane'y
+    /// do jednego bufora.
     pub fn softcap_f32(
         &self,
         logits: &DevBuffer,
+        offset: usize,
         n: usize,
         cap: f32,
         stream: &Stream,
     ) -> Result<()> {
         let k = self.artifacts.get("softcap_f32")?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
-        let args = LaunchArgs::new().buf(logits).scalar(n as i64).scalar(cap);
+        let args = LaunchArgs::new()
+            .buf_at(logits, offset * std::mem::size_of::<f32>())?
+            .scalar(n as i64)
+            .scalar(cap);
         self.device.launch(k, &cfg, &args, stream)
     }
 

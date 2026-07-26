@@ -88,21 +88,6 @@ def scale_f16(
         buf[i] = Float16(Float32(buf[i]) * factor)
 
 
-def scale_dev_f16(
-    buf: UnsafePointer[Float16, MutAnyOrigin],
-    n: Int,
-    factor: UnsafePointer[Float32, MutAnyOrigin],
-):
-    """buf *= factor[0], gdzie mnożnik leży na urządzeniu.
-
-    `layer_output_scale` w Gemmie 4 jest tensorem [1] wczytanym z modelu, więc
-    nie da się go podać jako stałej hosta bez odczytu z powrotem.
-    """
-    i = Int(global_idx.x)
-    if i < n:
-        buf[i] = Float16(Float32(buf[i]) * factor[0])
-
-
 def softcap_f32(
     logits: UnsafePointer[Float32, MutAnyOrigin],
     n: Int,

@@ -188,6 +188,10 @@ impl MtpWeights {
                 .map(|tensor| loader.vector(tensor, params.head_dim))
                 .transpose()?;
             let block = LayerWeights {
+                // Głowa MTP nie ma norm sandwich ani skali warstwy.
+                post_attn_norm: None,
+                post_ffw_norm: None,
+                layer_output_scale: None,
                 attn_norm: loader.vector(name(MtpWeightRole::AttnNorm)?, hidden)?,
                 ffn_norm: loader.vector(name(MtpWeightRole::FfnNorm)?, hidden)?,
                 mixer: LayerMixer::Attention(Box::new(AttnWeights {
