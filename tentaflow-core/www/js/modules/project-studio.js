@@ -1248,7 +1248,10 @@ function renderProjectShell() {
     </tf-detail-header>
 
     <tf-tabs variant="underline" value="${escapeAttr(state.tab)}" id="ps-project-tabs" class="ps-project-tabs">
-      ${tabs.map((tab) => `<tf-tab id="${tab.id}" icon="${tab.icon}">${escapeHtml(t(`tab_${tab.id}`))}</tf-tab>`).join('')}
+      ${tabs.map((tab) => {
+        const c = tabCount(tab.id);
+        return `<tf-tab id="${tab.id}" icon="${tab.icon}"${c ? ` count="${escapeAttr(String(c))}"` : ''}>${escapeHtml(t(`tab_${tab.id}`))}</tf-tab>`;
+      }).join('')}
     </tf-tabs>
 
     <div id="ps-tab-panel"></div>
@@ -1314,6 +1317,32 @@ function projectId() {
 // P03 — overview (KPI + activity + quick actions)
 // =============================================================================
 
+// Tab counters mirror the mockup ("Wiedza 4", "Testy 128"). Sources and members
+// come with the project row; the rest arrives with the overview KPIs, so the
+// counters are refreshed once those load.
+function tabCount(tabId) {
+  const k = state.kpis || {};
+  const num = (snake, camel) => Number(k[snake] ?? k[camel] ?? 0);
+  switch (tabId) {
+    case 'knowledge': return Number(state.project?.source_count ?? state.project?.sourceCount ?? 0);
+    case 'tests': return num('cases_total', 'casesTotal');
+    case 'tasks': return num('tasks_open', 'tasksOpen');
+    case 'connections': return num('ml_links', 'mlLinks');
+    case 'members': return Number(state.project?.member_count ?? state.project?.memberCount ?? 0);
+    default: return 0;
+  }
+}
+
+function updateTabCounts() {
+  const host = byId('ps-project-tabs');
+  if (!host) return;
+  host.querySelectorAll('tf-tab').forEach((el) => {
+    const c = tabCount(el.id);
+    if (c) el.setAttribute('count', String(c));
+    else el.removeAttribute('count');
+  });
+}
+
 async function renderOverview() {
   const panel = byId('ps-tab-panel');
   if (!panel) return;
@@ -1321,6 +1350,8 @@ async function renderOverview() {
   try {
     const resp = await ApiBinary.one('projectStudioOverviewRequest', { projectId: projectId() });
     kpis = resp.kpis;
+    state.kpis = kpis;
+    updateTabCounts();
     state.activity = Array.isArray(resp.activity) ? resp.activity : [];
     state.activityHasMore = state.activity.length >= 20;
   } catch (err) {
@@ -1365,27 +1396,27 @@ async function renderOverview() {
   const defectsOpen = kv('defects_open', 'defectsOpen');
 
   const casesCard = hasTests ? `
-      <tf-stat-card icon="clipboard" label="${escapeAttr(t('kpi_cases'))}" value="${casesTotal}"
+      <tf-stat-card icon="list" label="${escapeAttr(t('kpi_cases'))}" value="${casesTotal}"
         suffix="/ ${escapeAttr(t('kpi_cases_approved_suffix', { count: casesApproved }))}"
         delta="${escapeAttr(t('kpi_suites', { count: suitesTotal }))}" delta-type="neutral"></tf-stat-card>` : '';
   const passCard = hasTests ? `
-      <tf-stat-card id="ps-kpi-pass" icon="check-square" label="${escapeAttr(t('kpi_pass_rate'))}" value="—"></tf-stat-card>` : '';
+      <tf-stat-card id="ps-kpi-pass" icon="check" label="${escapeAttr(t('kpi_pass_rate'))}" value="—"></tf-stat-card>` : '';
   const defectsCard = modules.includes('tasks') ? `
-      <tf-stat-card id="ps-kpi-defects" icon="bug" label="${escapeAttr(t('kpi_defects'))}" value="${defectsOpen}"
+      <tf-stat-card id="ps-kpi-defects" icon="alert" label="${escapeAttr(t('kpi_defects'))}" value="${defectsOpen}"
         suffix="${defectsOpen > 0 ? '' : escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}"
         ${defectsOpen > 0 ? `delta="${escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}" delta-type="neutral"` : ''}></tf-stat-card>` : '';
   const knowledgeCard = `
-      <tf-stat-card icon="book" label="${escapeAttr(t('kpi_sources'))}" value="${sourcesReady}"
+      <tf-stat-card icon="database" label="${escapeAttr(t('kpi_sources'))}" value="${sourcesReady}"
         suffix="/ ${escapeAttr(t('kpi_sources_ready_suffix', { count: sourcesTotal }))}"
         ${openJobs > 0 ? `delta="${escapeAttr(t('kpi_open_jobs', { count: openJobs }))}" delta-type="warn"` : ''}></tf-stat-card>`;
 
   // Charts only make sense for a project that runs tests.
   const chartsRow = hasTests ? `
     <div class="ps-overview-charts">
-      <tf-section-card title="${escapeAttr(t('chart_pass_trend'))}" icon="target">
+      <tf-section-card title="${escapeAttr(t('chart_pass_trend'))}" icon="trend">
         <div id="ps-chart-trend" class="ps-chart-host"></div>
       </tf-section-card>
-      <tf-section-card title="${escapeAttr(t('chart_last_runs'))}" icon="activity">
+      <tf-section-card title="${escapeAttr(t('chart_last_runs'))}" icon="bar-chart">
         <span slot="subtitle">${escapeHtml(t('chart_last_runs_legend'))}</span>
         <div id="ps-chart-runs" class="ps-chart-host"></div>
       </tf-section-card>
@@ -1542,6 +1573,9 @@ async function loadOverviewCharts() {
   const line = trendHost.firstElementChild;
   line.height = 150;
   line.legend = { position: 'none' };
+  // Dates are labels, not numbers — without a category scale the axis renders a
+  // 0..1 numeric range and the points land off-chart.
+  line.xAxis = { scale: 'category', min: null, max: null, ticks: null, format: null };
   line.yAxis = { scale: 'linear', min: 0, max: 100, ticks: 4, format: (v) => `${v}%` };
   line.series = [{
     id: 'pass', name: t('chart_pass_trend_series'), tone: 'success', style: 'solid', showInLegend: true,

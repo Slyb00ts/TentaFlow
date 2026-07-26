@@ -24,6 +24,7 @@ import {
 } from './tf-line-chart.js';
 
 const BAR_GROUP_PADDING_FRACTION = 0.2;  // 20% padding between category groups
+const MAX_BAR_GROUP_WIDTH = 56;          // px — keeps sparse charts readable
 
 /// Scales a value along the value axis (linear/log) to pixels — used in
 /// horizontal layout where X carries the value.
@@ -133,8 +134,11 @@ class TfBarChart extends TfCartesianChart {
       const groupWidth = (x1 - x0) / Math.max(1, categories.length);
       for (let ci = 0; ci < categories.length; ci++) {
         const cat = categories[ci];
-        const groupX = x0 + ci * groupWidth + groupWidth * BAR_GROUP_PADDING_FRACTION / 2;
-        const innerW = groupWidth * (1 - BAR_GROUP_PADDING_FRACTION);
+        // Cap the bar width and centre it in its band: with one or two
+        // categories an uncapped bar stretches across half the chart and stops
+        // reading as a bar.
+        const innerW = Math.min(groupWidth * (1 - BAR_GROUP_PADDING_FRACTION), MAX_BAR_GROUP_WIDTH);
+        const groupX = x0 + ci * groupWidth + (groupWidth - innerW) / 2;
         if (this._stacking === 'none') {
           // Grouped: per-series sub-bar inside the category group.
           const barW = innerW / Math.max(1, visible.length);

@@ -7659,14 +7659,16 @@ export function encodeProjectStudioSettingsGetRequest(project_id) {
 /**
  * MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save; `None`
  * fields are left untouched. `agents_json` is a JSON array of
- * ProjectAgentBinding objects.
+ * ProjectAgentBinding objects; `modules_json` is a JSON array of module names
+ * that REPLACES the enabled set (absent, empty or `null` = leave untouched).
  * @param {string} project_id
  * @param {string | null} [name]
  * @param {string | null} [description]
  * @param {string | null} [agents_json]
+ * @param {string | null} [modules_json]
  * @returns {Uint8Array}
  */
-export function encodeProjectStudioSettingsSaveRequest(project_id, name, description, agents_json) {
+export function encodeProjectStudioSettingsSaveRequest(project_id, name, description, agents_json, modules_json) {
     const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     var ptr1 = isLikeNone(name) ? 0 : passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -7675,13 +7677,15 @@ export function encodeProjectStudioSettingsSaveRequest(project_id, name, descrip
     var len2 = WASM_VECTOR_LEN;
     var ptr3 = isLikeNone(agents_json) ? 0 : passStringToWasm0(agents_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len3 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeProjectStudioSettingsSaveRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    var ptr4 = isLikeNone(modules_json) ? 0 : passStringToWasm0(modules_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeProjectStudioSettingsSaveRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v5;
+    return v6;
 }
 
 /**

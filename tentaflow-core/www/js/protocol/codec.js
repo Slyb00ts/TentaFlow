@@ -5754,7 +5754,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save, absent fields untouched. payload: { projectId, name?, description?, agents?|agentsJson? }. */
+  /** MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save, absent fields untouched. payload: { projectId, name?, description?, agents?|agentsJson?, modules? }. `modules` replaces the enabled module set. */
   projectStudioSettingsSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     let agentsJson;
@@ -5765,11 +5765,13 @@ export const encode = {
     } else if (Array.isArray(payload.agents)) {
       agentsJson = JSON.stringify(payload.agents);
     }
+    const modulesJson = Array.isArray(payload.modules) ? JSON.stringify(payload.modules.map(String)) : undefined;
     const body = _wasm.encodeProjectStudioSettingsSaveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       payload.name == null ? undefined : String(payload.name),
       payload.description == null ? undefined : String(payload.description),
       agentsJson,
+      modulesJson,
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
