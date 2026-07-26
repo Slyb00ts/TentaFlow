@@ -188,6 +188,7 @@ fn run_layout(
             PAGE_SIZE,
             MAX_PAGES,
             1.0 / (HEAD_DIM as f32).sqrt(),
+            0,
             &stream,
         )
         .unwrap();
