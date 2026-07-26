@@ -28,6 +28,11 @@ pub const GENERATOR_API_AGENT_ID: &str = "00000000-0000-4000-8000-000000000017";
 pub const GENERATOR_PERF_AGENT_ID: &str = "00000000-0000-4000-8000-000000000018";
 pub const GENERATOR_UNIT_AGENT_ID: &str = "00000000-0000-4000-8000-000000000019";
 pub const GENERATOR_SECURITY_AGENT_ID: &str = "00000000-0000-4000-8000-00000000001a";
+/// Reviewer of coverage and consistency ("Krytyk wymagań" in the mockups) —
+/// read-only: it reports gaps instead of writing cases.
+pub const CRITIC_AGENT_ID: &str = "00000000-0000-4000-8000-00000000001b";
+/// Writes and refreshes project documentation from the knowledge base.
+pub const DOCUMENTALIST_AGENT_ID: &str = "00000000-0000-4000-8000-00000000001c";
 
 /// Case kinds a generation may target.
 pub const GENERATION_KINDS: &[&str] = &["manual", "ui", "api", "unit", "perf", "security"];

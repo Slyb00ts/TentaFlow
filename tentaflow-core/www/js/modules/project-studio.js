@@ -126,7 +126,7 @@ const KIND_AGENT_FUNCTION = {
 };
 // Agent bindings the settings screen manages; 'chat' drives the project chat,
 // the rest drives generation + code assist per case kind.
-const AGENT_FUNCTIONS = ['chat', 'generator_ui', 'generator_api', 'generator_unit', 'generator_perf', 'security'];
+const AGENT_FUNCTIONS = ['chat', 'generator_ui', 'generator_api', 'generator_unit', 'generator_perf', 'security', 'critic', 'documentalist'];
 
 const AUTO_RUN_POLL_MS = 3000;
 const AUTO_LOG_CAP = 500;
@@ -1289,6 +1289,19 @@ function enabledTabs() {
   return tabs;
 }
 
+// Header subtitle carries the project context the mockup shows: what the
+// operator is looking at plus the creation/last-change stamps.
+function projectHeaderSubtitle(project) {
+  const parts = [];
+  const desc = (project.description || '').trim();
+  if (desc) parts.push(desc);
+  const created = fv(project, 'created_at');
+  if (created) parts.push(t('head_created', { date: formatDate(created) }));
+  const updated = fv(project, 'updated_at');
+  if (updated) parts.push(t('head_updated', { date: formatDate(updated) }));
+  return parts.join(' · ');
+}
+
 function renderProjectShell() {
   const host = byId('ps-project-view');
   const project = state.project;
@@ -1301,23 +1314,25 @@ function renderProjectShell() {
   host.innerHTML = `
     <tf-breadcrumb class="ps-project-crumbs" id="ps-crumbs">
       <tf-breadcrumb-item href="#">${escapeHtml(t('title'))}</tf-breadcrumb-item>
-      <tf-breadcrumb-item current>${escapeHtml(project.name)}</tf-breadcrumb-item>
+      <tf-breadcrumb-item href="#project">${escapeHtml(project.name)}</tf-breadcrumb-item>
+      <tf-breadcrumb-item current>${escapeHtml(t(`tab_${state.tab}`))}</tf-breadcrumb-item>
     </tf-breadcrumb>
 
-    <tf-detail-header title="${escapeAttr(project.name)}" subtitle="${escapeAttr(project.description || '')}" icon="folder">
-      <span slot="badges">
+    <tf-detail-header title="${escapeAttr(project.name)}" subtitle="${escapeAttr(projectHeaderSubtitle(project))}" icon="folder">
+      <span slot="status">
         <tf-chip status="${archived ? 'warn' : 'ok'}" dot>${escapeHtml(t(archived ? 'status_archived' : 'status_active'))}</tf-chip>
-        <tf-chip status="accent">${sprite('users')} ${memberCount} ${escapeHtml(t('stat_members'))}</tf-chip>
-        <tf-chip>${escapeHtml(t('your_role'))}: ${escapeHtml(roleLabel(myRole()))}</tf-chip>
-        <tf-chip status="info">${escapeHtml(t('modules_chip'))}: ${escapeHtml(orientationLabel(project))}</tf-chip>
-        <tf-chip status="info">${sprite('database')} ${sourceCount} ${escapeHtml(t('stat_sources'))}</tf-chip>
+      </span>
+      <span slot="badges" class="ps-head-badges">
+        <tf-chip status="accent">${sprite('users')} ${escapeHtml(t('head_members', { count: memberCount }))}</tf-chip>
+        <tf-chip>${escapeHtml(t('your_role'))}: <b>${escapeHtml(roleLabel(myRole()))}</b></tf-chip>
+        <tf-chip status="info">${sprite('database')} ${escapeHtml(t('head_sources', { count: sourceCount }))}</tf-chip>
+        <tf-chip status="info">${sprite('grid-rows')} ${escapeHtml(t('modules_chip'))}: ${escapeHtml(orientationLabel(project))}</tf-chip>
       </span>
       <span slot="actions">
-        <tf-button variant="ghost" icon="chevron-left" data-back-list>${escapeHtml(t('back_to_list'))}</tf-button>
         ${bellHtml()}
         ${canManage() ? `<tf-button variant="ghost" icon="download" data-export>${escapeHtml(t('export_btn'))}</tf-button>` : ''}
-        <tf-button variant="ghost" icon="users" data-goto-members>${escapeHtml(t('tab_members'))}</tf-button>
-        ${canManage() ? `<tf-button variant="ghost" icon="settings" data-goto-settings>${escapeHtml(t('tab_settings'))}</tf-button>` : ''}
+        <tf-button variant="ghost" icon="users" data-goto-members ${state.tab === 'members' ? 'aria-current="page"' : ''}>${escapeHtml(t('tab_members'))}</tf-button>
+        ${canManage() ? `<tf-button variant="ghost" icon="settings" data-goto-settings ${state.tab === 'settings' ? 'aria-current="page"' : ''}>${escapeHtml(t('tab_settings'))}</tf-button>` : ''}
       </span>
     </tf-detail-header>
 
@@ -1337,9 +1352,9 @@ function renderProjectShell() {
     const link = e.target.closest('a.tf-breadcrumb-item');
     if (!link) return;
     e.preventDefault();
-    closeProject();
+    if (link.getAttribute('href') === '#project') selectTab('overview');
+    else closeProject();
   });
-  host.querySelector('[data-back-list]')?.addEventListener('click', () => closeProject());
   host.querySelector('[data-export]')?.addEventListener('click', () => openExportWindow());
   host.querySelector('[data-goto-members]')?.addEventListener('click', () => selectTab('members'));
   host.querySelector('[data-goto-settings]')?.addEventListener('click', () => selectTab('settings'));
@@ -1355,6 +1370,16 @@ function renderTabsValue() {
   byId('ps-project-tabs')?.setAttribute('value', state.tab);
 }
 
+// The last crumb mirrors the open tab, so the trail stays truthful after a
+// tab switch (the shell itself is not re-rendered).
+function syncBreadcrumbTab() {
+  const crumbs = byId('ps-crumbs');
+  if (!crumbs) return;
+  const items = crumbs.querySelectorAll('tf-breadcrumb-item, .tf-breadcrumb-item');
+  const last = items[items.length - 1];
+  if (last) last.textContent = t(`tab_${state.tab}`);
+}
+
 function selectTab(tab) {
   if (state.tab === tab) return;
   switchTab(tab);
@@ -1363,6 +1388,7 @@ function selectTab(tab) {
 
 async function switchTab(tab) {
   state.tab = tab;
+  syncBreadcrumbTab();
   // Leaving the chat tab must not leak the active stream subscription.
   if (tab !== 'chat') stopChatStream();
   if (tab !== 'knowledge') stopAllJobTracking();
@@ -3025,6 +3051,8 @@ async function renderChat() {
     </div>
   `;
 
+  sizeChatLayout();
+
   byId('ps-chat-new')?.addEventListener('click', () => {
     stopChatStream();
     state.chatId = null;
@@ -3974,6 +4002,28 @@ function fv(obj, key) {
 
 function chipCell(status, label) {
   return { status: status || 'info', label };
+}
+
+// The chat is a full-height workspace: the layout takes whatever vertical space
+// is left under the header/tabs, so only the message list scrolls and the
+// composer stays pinned to the bottom of the screen.
+function sizeChatLayout() {
+  const layout = document.querySelector('.ps-chat-layout');
+  if (!layout) return;
+  const top = layout.getBoundingClientRect().top;
+  layout.style.height = `${Math.max(420, window.innerHeight - top - 24)}px`;
+}
+
+// One listener for the whole module — it no-ops whenever the chat is not open.
+window.addEventListener('resize', () => sizeChatLayout());
+
+// Date only (no clock) for header stamps.
+function formatDate(value) {
+  if (!value) return '';
+  const raw = String(value);
+  const date = new Date(raw.includes('T') ? raw : `${raw.replace(' ', 'T')}Z`);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleDateString(I18n.getLanguage());
 }
 
 // UUIDs are unreadable in dense lists; the first segment is enough to tell
