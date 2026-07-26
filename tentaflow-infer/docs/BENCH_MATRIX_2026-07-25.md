@@ -80,6 +80,13 @@ czyli 0,88x. Przewaga jest funkcją MTP, nie samych kerneli.
 
 ## 3. Radeon RX 6900 XT (gfx1030, RDNA2) — FORGE vs llama.cpp
 
+> UWAGA (2026-07-26): liczby decode w tej sekcji pochodza z przebiegow, w ktorych
+> zegar pamieci karty byl na PELNYM poziomie (1000 MHz). Karta potrafi utknac na
+> 456 MHz i wtedy te same pomiary spadaja o ~40% (qwen 182 zamiast 277, Mistral
+> 40 zamiast 67) bez zadnej zmiany w kodzie. Przed porownaniem czegokolwiek
+> sprawdz `cat /sys/class/drm/card1/device/pp_dpm_mclk`. Prefill jest na to
+> odporny, bo ogranicza go `sclk`.
+
 Osobne stanowisko: karta bez jednostki macierzowej. vLLM na niej nie startuje
 (lokalny obraz to build CUDA, a `rocm/vllm` celuje w CDNA), więc jedynym
 punktem odniesienia jest llama.cpp na ROCm (build `112c7815`, `-ngl 99`,

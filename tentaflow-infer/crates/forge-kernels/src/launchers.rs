@@ -6321,6 +6321,9 @@ impl Kernels {
         // Karty bez jednostki macierzowej nie mają rodziny `gemm_f16` (opartej
         // na mma/ldmatrix) i idą kaflem na `v_dot2_f32_f16`.
         if let Some(tile) = self.gemm_dot2_tile(rows, n_tokens) {
+            if std::env::var("FORGE_TRACE_ROUTE").is_ok() {
+                eprintln!("ROUTE dot2 {} rows={rows} cols={cols} T={n_tokens}", tile.name);
+            }
             let k = self.artifacts.get(tile.name)?;
             return self
                 .device
@@ -6391,6 +6394,9 @@ impl Kernels {
             && self.artifacts.has("gemm_f16_dot2_out_f32_64x64")
         {
             let tile = DotTile::new("gemm_f16_dot2_out_f32_64x64", 64, 64, 4, 4);
+            if std::env::var("FORGE_TRACE_ROUTE").is_ok() {
+                eprintln!("ROUTE dot2_f32 rows={rows} cols={cols} T={n_tokens}");
+            }
             let k = self.artifacts.get(tile.name)?;
             let args = LaunchArgs::new()
                 .buf(y_f32)
@@ -8227,6 +8233,9 @@ impl Kernels {
 
         // Karty bez jednostki macierzowej: kafel int8 na `v_dot4_i32_i8`.
         if let Some(tile) = self.gemm_dot4_tile(kernel_base, output_f32, rows, n_tokens) {
+            if std::env::var("FORGE_TRACE_ROUTE").is_ok() {
+                eprintln!("ROUTE dot4 {} rows={rows} cols={cols} T={n_tokens}", tile.name);
+            }
             let gk = self.artifacts.get(tile.name)?;
             let cfg = tile.config(rows, n_tokens);
             let args = LaunchArgs::new()

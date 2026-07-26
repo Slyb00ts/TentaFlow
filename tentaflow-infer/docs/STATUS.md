@@ -218,6 +218,37 @@ Ostatnia aktualizacja: 2026-07-25.
   WNIOSEK: kafel jest w praktycznym optimum dla RDNA2. Dalszy zysk wymaga INNEJ
   DEKOMPOZYCJI (mniej powtorzonych odczytow wag bez wzrostu bloku), a nie
   kolejnego strojenia tego kernela.
+- 🔴 **KOREKTA KOREKTY: zegar pamieci karty stoi na 456 z 1000 MHz, a nie
+  Infinity Cache (2026-07-26).** Wczesniej „poprawilem” pomiar 386 GB/s na 226,
+  obwiniajac granice Infinity Cache. To bylo BLEDNE wyjasnienie. Prawdziwa
+  przyczyna: pod obciazeniem karta trzyma rdzen na pelnym boostcie 2545 MHz, ale
+  PAMIEC na poziomie DPM 1 z 4 — 456 MHz z dostepnych 1000 (`pp_dpm_mclk`,
+  probkowane z potwierdzeniem, ze proces zyje; pobor 173 W).
+
+  | mclk | teoretycznie | zmierzone | sprawnosc |
+  |---|--:|--:|--:|
+  | 456 MHz (stan obecny) | 233 GB/s | 220-226 | 96% |
+  | 1000 MHz (pelny) | 512 GB/s | 386-395 | 76% |
+
+  Oba pomiary byly wiec POPRAWNE, tylko przy roznych stanach zegara. Skutki:
+  - **Wyniki decode z tej sesji sa mieszanka dwoch stanow i nieporownywalne.**
+    Ten sam kod, ten sam model: qwen Q8_0 277,5 -> 182,1 tok/s, Mistral Q4_K
+    67,0 -> 40,0 tok/s. To NIE regresja kodu — to spadek zegara pamieci.
+  - Prefill jest prawie nietkniety (Mistral 1734 -> 1695, qwen ~14 900 -> 14 561),
+    bo jest ograniczony obliczeniami, a `sclk` boostuje normalnie. To wlasnie ta
+    asymetria zdradzila przyczyne.
+  - Wniosek „kafle int8 sa w praktycznym optimum” byl wyprowadzany m.in. z tego,
+    ze GEMM zjada 149 z 220 GB/s. Przy pelnym zegarze ten udzial spada do 39%,
+    wiec czesc plateau moze byc artefaktem polowy pasma. Analize trzeba powtorzyc
+    po przywroceniu zegara, ZANIM uzna sie ja za zamknieta.
+  CO Z TYM ZROBIC: `pp_dpm_*` i `power_dpm_force_performance_level` sa tylko do
+  zapisu dla roota, wiec wymuszenie nalezy do operatora:
+  `echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level`
+  (card1 = 0x73bf = Navi 21; card0 to iGPU Raphael). Podejrzenie co do przyczyny
+  zatrzasniecia: liczne bledy GPU z tej sesji (SIGSEGV w sterowniku, uszkodzenie
+  sterty przy rozbiorce) mogly zostawic memory DPM w stanie zdegradowanym.
+  ZASADA NA PRZYSZLOSC: kazdy pomiar pasma i decode musi zapisywac stan
+  `pp_dpm_mclk`, inaczej liczby nie sa porownywalne miedzy przebiegami.
 - 🔴 **KOREKTA: „386 GB/s pasma" było ZAWYŻONE — realny stream to ~226 GB/s
   (2026-07-25).** Benchmark rooflinu czytał bufor 256 MiB, czyli DOKŁADNIE na
   granicy 128 MB Infinity Cache, więc mierzył mieszankę cache i DRAM i dawał
