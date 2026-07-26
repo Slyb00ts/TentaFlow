@@ -721,7 +721,9 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  align-self: start;
+  align-self: stretch;
+  max-height: 640px;
+  overflow-y: auto;
 }
 
 .ps-chat-private-hint {
@@ -3587,4 +3589,12 @@
 .ps-files-preview tf-code-editor {
   display: block;
   height: 420px;
+}
+
+.ps-reports-kpis:empty {
+  display: none;
+}
+
+.ps-reports-kpis {
+  margin-bottom: 14px;
 }

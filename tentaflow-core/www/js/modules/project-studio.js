@@ -8018,6 +8018,11 @@ async function renderRunDetailView() {
   const run = rd.run;
   if (!run) { s.view = 'runs'; return renderRunsView(); }
   const running = run.status === 'running';
+  const runTotal = Number(run.total ?? 0);
+  const runPassRate = runTotal ? Math.round((Number(run.passed ?? 0) / runTotal) * 1000) / 10 : 0;
+  const runShare = (n) => (runTotal ? Math.round((Number(n ?? 0) / runTotal) * 100) : 0);
+  const openItems = Number(run.pending ?? 0) + Number(fv(run, 'in_progress') ?? 0);
+  const runDuration = runElapsed(run);
   const creator = isMe(fv(run, 'created_by'));
   const canClose = running && (canManage() || creator);
   const failedCount = Number(run.failed ?? 0) + Number(run.blocked ?? 0);
@@ -8052,11 +8057,21 @@ async function renderRunDetailView() {
     </div>
 
     <div class="ps-kpi-grid ps-run-kpis">
-      <tf-stat-card size="sm" icon="check" accent="success" label="${escapeAttr(t('item_status_passed'))}" value="${Number(run.passed ?? 0)}"></tf-stat-card>
-      <tf-stat-card size="sm" icon="x" accent="danger" label="${escapeAttr(t('item_status_failed'))}" value="${Number(run.failed ?? 0)}"></tf-stat-card>
-      <tf-stat-card size="sm" icon="ban" accent="warning" label="${escapeAttr(t('item_status_blocked'))}" value="${Number(run.blocked ?? 0)}"></tf-stat-card>
-      <tf-stat-card size="sm" icon="chevron-right" label="${escapeAttr(t('item_status_skipped'))}" value="${Number(run.skipped ?? 0)}"></tf-stat-card>
-      <tf-stat-card size="sm" icon="clock" label="${escapeAttr(t('run_kpi_open'))}" value="${Number(run.pending ?? 0) + Number(run.in_progress ?? fv(run, 'in_progress') ?? 0)}"></tf-stat-card>
+      <tf-stat-card icon="check" accent="success" label="${escapeAttr(t('item_status_passed'))}"
+        value="${Number(run.passed ?? 0)}" suffix="/${runTotal}"
+        delta="${escapeAttr(t('run_kpi_pass_rate', { rate: runPassRate }))}" delta-type="neutral"></tf-stat-card>
+      <tf-stat-card icon="x" accent="${Number(run.failed ?? 0) ? 'danger' : 'success'}" label="${escapeAttr(t('item_status_failed'))}"
+        value="${Number(run.failed ?? 0)}"
+        delta="${escapeAttr(t('run_kpi_share', { pct: runShare(run.failed) }))}" delta-type="${Number(run.failed ?? 0) ? 'warn' : 'neutral'}"></tf-stat-card>
+      <tf-stat-card icon="ban" accent="warning" label="${escapeAttr(t('item_status_blocked'))}"
+        value="${Number(run.blocked ?? 0)}"
+        delta="${escapeAttr(t('run_kpi_share', { pct: runShare(run.blocked) }))}" delta-type="neutral"></tf-stat-card>
+      <tf-stat-card icon="chevron-right" label="${escapeAttr(t('item_status_skipped'))}"
+        value="${Number(run.skipped ?? 0)}"
+        delta="${escapeAttr(t('run_kpi_share', { pct: runShare(run.skipped) }))}" delta-type="neutral"></tf-stat-card>
+      <tf-stat-card icon="clock" accent="info" label="${escapeAttr(t('run_kpi_duration'))}"
+        value="${escapeAttr(runDuration)}"
+        delta="${escapeAttr(t('run_kpi_open_delta', { count: openItems }))}" delta-type="neutral"></tf-stat-card>
     </div>
     <div class="ps-run-progressbar" id="ps-run-stacked"></div>
 
@@ -8083,9 +8098,20 @@ async function renderRunDetailView() {
 
     <tf-section-card title="${escapeAttr(t('run_items_title'))}" icon="list">
       <span slot="subtitle">${escapeHtml(t('run_items_sub', { count: rd.items.length }))}</span>
+      <span slot="actions">
+        <tf-select id="ps-run-items-filter" value="${escapeAttr(rd.itemFilter || '')}">
+          <option value="">${escapeHtml(t('run_items_filter_all'))}</option>
+          ${['passed', 'failed', 'blocked', 'skipped', 'pending', 'in_progress'].map((x) => `<option value="${x}">${escapeHtml(t(`item_status_${x}`))}</option>`).join('')}
+        </tf-select>
+      </span>
       <div id="ps-run-items-host"></div>
     </tf-section-card>
   `;
+
+  byId('ps-run-items-filter')?.addEventListener('change', (e) => {
+    rd.itemFilter = e.detail?.value ?? '';
+    renderRunItemsTable(rd);
+  });
 
   const stacked = byId('ps-run-stacked');
   if (stacked && Number(run.total ?? 0) > 0) {
@@ -8128,8 +8154,9 @@ async function renderRunDetailView() {
 function renderRunItemsTable(rd) {
   const hostEl = byId('ps-run-items-host');
   if (!hostEl) return;
-  if (!rd.items.length) {
-    hostEl.innerHTML = `<tf-empty-state icon="list" title="${escapeAttr(t('run_items_empty'))}"></tf-empty-state>`;
+  const rows = rd.itemFilter ? rd.items.filter((it) => it.status === rd.itemFilter) : rd.items;
+  if (!rows.length) {
+    hostEl.innerHTML = `<tf-empty-state icon="list" title="${escapeAttr(rd.items.length ? t('run_items_no_match') : t('run_items_empty'))}"></tf-empty-state>`;
     return;
   }
   hostEl.innerHTML = `
@@ -8147,7 +8174,7 @@ function renderRunItemsTable(rd) {
   table.rowKey = '_id';
   table.expandable = true;
   table.expandRenderer = (row) => buildRunItemExpansion(row._row);
-  table.rows = rd.items.map((it) => ({
+  table.rows = rows.map((it) => ({
     _id: fv(it, 'item_id'),
     _row: it,
     pos: Number(it.position ?? 0) + 1,
@@ -8219,6 +8246,16 @@ function buildRunItemExpansion(item) {
     }
   })();
   return wrap;
+}
+
+// Wall-clock length of a run; a still-running run measures against "now".
+function runElapsed(run) {
+  const started = Date.parse(fv(run, 'started_at') || '');
+  if (!Number.isFinite(started)) return '—';
+  const finishedRaw = fv(run, 'finished_at');
+  const end = finishedRaw ? Date.parse(finishedRaw) : Date.now();
+  if (!Number.isFinite(end) || end < started) return '—';
+  return formatDuration(Math.round((end - started) / 1000));
 }
 
 function formatDuration(secs) {
@@ -9212,7 +9249,7 @@ async function renderReportsView() {
       <span class="ps-toolbar-spacer"></span>
       <tf-button variant="ghost" icon="file-text" id="ps-rep-print">${escapeHtml(t('reports_print'))}</tf-button>
     </div>
-    <div id="ps-reports-kpis" class="ps-overview-kpis"></div>
+    <div id="ps-reports-kpis" class="ps-kpi-grid ps-reports-kpis"></div>
     <div id="ps-reports-grid" class="ps-reports-grid">
       ${rep.loaded ? '' : `<div class="ps-field-hint">${escapeHtml(t('reports_intro'))}</div>`}
     </div>
