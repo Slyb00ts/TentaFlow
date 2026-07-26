@@ -96,14 +96,48 @@ Rzeczy, których NIE DA SIĘ odgadnąć z samych metadanych, a każda zmienia wy
   powtarzalne, więc parser rozwija je modulo długość — bez tego geometria od
   siódmej warstwy byłaby zła.
 
+## Postęp
+
+- ✅ **Kernele uwagi head_dim 512.** `head_dim` był już parametrem kompilacji, więc
+  decode skompilował się od razu. Prefill nie: kafle K i V przy `PT = WARP_SIZE`
+  zajmowały **81 920 B LDS wobec limitu 65 536**. `PT` (pozycje na kafel) jest
+  teraz parametrem i hd512 używa połowy fali — LDS 49 152 B, 122 VGPR, bez
+  spillów. PUŁAPKA: przy `PT` mniejszym od fali lane'y powyżej `PT` czytały LDS
+  poza `ks`; maskowanie samego wyniku było za późno, odczyt musi być warunkowy.
+- ✅ **Okno przesuwne** w prefillu (maskowanie) i decode (przesunięcie startu
+  skanu, więc mniej pracy zamiast więcej). PUŁAPKA: przy oknie kafel może mieć
+  `h > 0` i być CAŁY poza oknem — wtedy wszystkie lane'y mają `NEG_INF`,
+  maksimum nie rośnie ponad wartość startową i `exp(score - m)` daje 1,0
+  zamiast 0, czyli softmax dostaje masę z nieistniejących pozycji. Taki kafel
+  jest jawnie pomijany.
+  Zweryfikowane wobec referencji hosta (softmax w f32, przyczynowy, stronicowany
+  cache): hd256 bez okna 4,5e-5, hd512 5,8e-5 i 3,4e-5, z oknem 8/20/33 —
+  wszystkie 3,4e-5..4,5e-5. Pierwszy wynik potwierdza brak regresji na
+  hd64/128/256, które dzielą ten kod.
+- ✅ Okno przeprowadzone przez launchery i 7 miejsc wywołania w silniku
+  (`Model::attn_window(layer)` czyta rozwinięty wzorzec z `AltAttnParams`).
+  Wariant `split8` nie ma jeszcze maskowania, więc przy oknie schodzimy na
+  ścieżkę generyczną.
+
+## Zakres cache'u KV — po rozpoznaniu mniejszy, niż zakładałem
+
+`KvCache` trzyma `k: Vec<DevBuffer>` i `v: Vec<DevBuffer>` — **osobny slab na
+warstwę**, a pula stron współdzieli tylko IDENTYFIKATORY stron. Ten sam
+identyfikator może więc wskazywać w każdej warstwie na obszar o innym rozmiarze,
+o ile indeksowanie używa stride'u tej warstwy. Założenie jednolitej geometrii
+siedzi tylko w 13 miejscach: 7 w `kv.rs` (liczenie rozmiaru slabu) i 6 w
+`model.rs` (arytmetyka bajtów przy tieringu, MTP, jedno uruchomienie).
+Zmiana sprowadza się do `KvConfig` z geometrią per warstwa i akcesorów
+`n_kv_heads(layer)` / `head_dim(layer)` — to godziny, nie tygodnie.
+
 ## Co zostaje, w kolejności
 
 1. ~~Referencja dla warstw bez V.~~ **ZROBIONE** — V = K, patrz wyżej.
-2. **Kernele uwagi head_dim 512.** Obecne specjalizacje to hd64/hd128/hd256, a
+2. ~~Kernele uwagi head_dim 512.~~ **ZROBIONE**, patrz wyżej. Dawniej: Obecne specjalizacje to hd64/hd128/hd256, a
    silnik odrzuca inne wprost (`head_dim {} has no attention specialization`).
    Potrzebne decode i prefill, prawdopodobnie w wariancie split (hd512 z f16 KV
    to 2 KB na token na głowicę).
-3. **Okno przesuwne** — maskowanie w kernelach uwagi plus polityka w cache KV
+3. ~~Okno przesuwne~~ **ZROBIONE** (maskowanie; polityka cache'u zostaje). Dawniej: maskowanie w kernelach uwagi plus polityka w cache KV
    (warstwy lokalne trzymają najwyżej 1024 tokeny).
 4. **Cache KV o geometrii per warstwa.** To najgłębsza zmiana: dziś układ zakłada
    jednolitą liczbę bajtów na token na warstwę, a tu jest 8 x 256 wobec 1 x 512.
