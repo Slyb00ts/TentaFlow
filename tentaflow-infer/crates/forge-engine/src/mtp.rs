@@ -195,6 +195,7 @@ impl MtpWeights {
                 attn_norm: loader.vector(name(MtpWeightRole::AttnNorm)?, hidden)?,
                 ffn_norm: loader.vector(name(MtpWeightRole::FfnNorm)?, hidden)?,
                 mixer: LayerMixer::Attention(Box::new(AttnWeights {
+                    v_norm: None,
                     q_norm,
                     k_norm,
                     attn_qkv: QkvWeights::Split {

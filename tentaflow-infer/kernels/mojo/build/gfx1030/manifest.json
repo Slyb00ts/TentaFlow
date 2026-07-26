@@ -85,6 +85,10 @@
       "entry": "src_attention_attn_decode_spli6A6A6A6A_cc47e1de4bebc6e9",
       "file": "attn_decode_split_f16_hd128.hsaco"
     },
+    "attn_decode_split_f16_hd512": {
+      "entry": "src_attention_attn_decode_spli6A6A6A6A_ffa3ab91bcfeecce",
+      "file": "attn_decode_split_f16_hd512.hsaco"
+    },
     "attn_decode_split_f16_hd64": {
       "entry": "src_attention_attn_decode_spli6A6A6A6A_fdac5edfc99c35da",
       "file": "attn_decode_split_f16_hd64.hsaco"
@@ -1429,6 +1433,14 @@
       "entry": "src_rope_rope_neox_partial_f166A6A6A6A_9826f64eca47f6e1",
       "file": "rope_neox_partial_f16.hsaco"
     },
+    "scale_dev_f16": {
+      "entry": "src_activation_scale_dev_f166A6A6A6AoA6A_f688e75ca263d206",
+      "file": "scale_dev_f16.hsaco"
+    },
+    "scale_f16": {
+      "entry": "src_activation_scale_f16_Poi6A6A6A6AoA6A6A_47ddc170ace423e5",
+      "file": "scale_f16.hsaco"
+    },
     "sigmoid_f32": {
       "entry": "src_onnx_ops_sigmoid_f32_Poi6A6A6A6AoA6A6A_e59f3e802948401e",
       "file": "sigmoid_f32.hsaco"
@@ -1440,6 +1452,10 @@
     "silu_mul_f16": {
       "entry": "src_activation_silu_mul_f166A6A6A6AoA6A6A_8f3bfdaf2463f415",
       "file": "silu_mul_f16.hsaco"
+    },
+    "softcap_f32": {
+      "entry": "src_activation_softcap_f32_P6A6A6A6AoA6A6A_ecd3261bab952d31",
+      "file": "softcap_f32.hsaco"
     },
     "sqrt_f32": {
       "entry": "src_onnx_ops_sqrt_f32_Pointe6A6A6A6AoA6A6A_4b921393b1627585",

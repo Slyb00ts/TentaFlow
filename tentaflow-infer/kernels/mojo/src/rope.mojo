@@ -70,3 +70,37 @@ def rope_neox_partial_f16(
         x_io[base + j] = Float16(a * c - b * s)
         x_io[base + half + j] = Float16(a * s + b * c)
         j += Int(block_dim.x)
+
+
+def rope_neox_ff_f16(
+    x_io: UnsafePointer[Float16, MutAnyOrigin],
+    positions: UnsafePointer[Int32, MutAnyOrigin],
+    freq_factors: UnsafePointer[Float32, MutAnyOrigin],
+    n_heads: Int,
+    head_dim: Int,
+    theta_base: Float32,
+):
+    """rope_neox_f16 z dzielnikiem częstotliwości na wymiar.
+
+    Warstwy globalne Gemmy 4 stosują rope proporcjonalne: częstotliwość każdej
+    pary jest dzielona przez `freq_factors[j]` (tensor `rope_freqs` o długości
+    head_dim/2). Bez tego pozycje w warstwach globalnych rozjeżdżają się z
+    warstwami okiennymi, które ropują zwyczajnie.
+    """
+    token = Int(block_idx.x)
+    head = Int(block_idx.y)
+    half = head_dim // 2
+    base = (token * n_heads + head) * head_dim
+    pos = Float32(positions[token])
+
+    var j = Int(thread_idx.x)
+    while j < half:
+        freq = pow(theta_base, Float32(-2 * j) / Float32(head_dim)) / freq_factors[j]
+        angle = pos * freq
+        c = cos(angle)
+        s = sin(angle)
+        a = Float32(x_io[base + j])
+        b = Float32(x_io[base + half + j])
+        x_io[base + j] = Float16(a * c - b * s)
+        x_io[base + half + j] = Float16(a * s + b * c)
+        j += Int(block_dim.x)

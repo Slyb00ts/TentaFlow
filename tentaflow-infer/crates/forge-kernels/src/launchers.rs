@@ -2143,17 +2143,27 @@ impl Kernels {
         n_heads: usize,
         head_dim: usize,
         theta_base: f32,
+        freq_factors: Option<&DevBuffer>,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("rope_neox_f16")?;
+        let k = self.artifacts.get(match freq_factors {
+            // Rope proporcjonalne (warstwy globalne Gemmy) dzieli częstotliwość
+            // każdej pary przez współczynnik z tensora `rope_freqs`.
+            Some(_) => "rope_neox_ff_f16",
+            None => "rope_neox_f16",
+        })?;
         let cfg = LaunchConfig {
             grid: (n_tokens as u32, n_heads as u32, 1),
             block: ((head_dim as u32 / 2).clamp(32, 256), 1, 1),
             shared_mem_bytes: 0,
         };
-        let args = LaunchArgs::new()
+        let mut args = LaunchArgs::new()
             .buf(x_io)
-            .buf(positions)
+            .buf(positions);
+        if let Some(ff) = freq_factors {
+            args = args.buf(ff);
+        }
+        let args = args
             .scalar(n_heads as i64)
             .scalar(head_dim as i64)
             .scalar(theta_base);
@@ -2173,17 +2183,27 @@ impl Kernels {
         n_heads: usize,
         head_dim: usize,
         theta_base: f32,
+        freq_factors: Option<&DevBuffer>,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("rope_neox_f16")?;
+        let k = self.artifacts.get(match freq_factors {
+            // Rope proporcjonalne (warstwy globalne Gemmy) dzieli częstotliwość
+            // każdej pary przez współczynnik z tensora `rope_freqs`.
+            Some(_) => "rope_neox_ff_f16",
+            None => "rope_neox_f16",
+        })?;
         let cfg = LaunchConfig {
             grid: (n_tokens as u32, n_heads as u32, 1),
             block: ((head_dim as u32 / 2).clamp(32, 256), 1, 1),
             shared_mem_bytes: 0,
         };
-        let args = LaunchArgs::new()
+        let mut args = LaunchArgs::new()
             .buf_at(x_io, byte_off)?
-            .buf(positions)
+            .buf(positions);
+        if let Some(ff) = freq_factors {
+            args = args.buf(ff);
+        }
+        let args = args
             .scalar(n_heads as i64)
             .scalar(head_dim as i64)
             .scalar(theta_base);

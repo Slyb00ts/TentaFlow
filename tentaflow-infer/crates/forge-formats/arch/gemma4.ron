@@ -12,6 +12,9 @@
         (role: TokenEmbd, gguf: "token_embd.weight", hf: "model.embed_tokens.weight", per_layer: false, required: true),
         (role: OutputNorm, gguf: "output_norm.weight", hf: "model.norm.weight", per_layer: false, required: true),
         (role: LmHead, gguf: "output.weight", hf: "lm_head.weight", per_layer: false, required: false),
+        // Jeden wspólny tensor na cały model: warstwy globalne używają go jako
+        // dzielników częstotliwości rope, okienne ropują zwyczajnie.
+        (role: RopeFreqs, gguf: "rope_freqs.weight", hf: "", per_layer: false, required: false),
         (role: AttnNorm, gguf: "blk.{layer}.attn_norm.weight", hf: "model.layers.{layer}.input_layernorm.weight", per_layer: true, required: true),
         (role: AttnQ, gguf: "blk.{layer}.attn_q.weight", hf: "model.layers.{layer}.self_attn.q_proj.weight", per_layer: true, required: true),
         (role: AttnK, gguf: "blk.{layer}.attn_k.weight", hf: "model.layers.{layer}.self_attn.k_proj.weight", per_layer: true, required: true),

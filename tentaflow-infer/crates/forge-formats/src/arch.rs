@@ -60,6 +60,9 @@ pub enum WeightRole {
     FfnNorm,
     OutputNorm,
     LmHead,
+    /// Dzielniki częstotliwości rope (`rope_freqs`) używane przez warstwy
+    /// globalne Gemmy 4 — rope proporcjonalne. Tensor f32 o długości head_dim/2.
+    RopeFreqs,
     /// Norma PO bloku uwagi, przed rezydualem (rodzina Gemma — „sandwich norm”).
     PostAttnNorm,
     /// Norma PO bloku FFN, przed rezydualem (rodzina Gemma).
@@ -153,6 +156,24 @@ impl Hyperparams {
         match &self.alt_attn {
             Some(alt) => global.max(alt.n_kv_heads_swa * alt.head_dim_swa),
             None => global,
+        }
+    }
+
+    /// Podstawa rope warstwy `layer`. Gemma 4 ma dwie: 1e4 dla warstw okiennych
+    /// i 1e6 dla globalnych.
+    pub fn rope_theta_at(&self, layer: usize) -> f32 {
+        match &self.alt_attn {
+            Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.rope_theta_swa,
+            _ => self.rope_theta,
+        }
+    }
+
+    /// Czy warstwa `layer` używa rope proporcjonalnego (tensor `rope_freqs`).
+    /// Dotyczy wyłącznie warstw globalnych architektur z naprzemienną uwagą.
+    pub fn rope_proportional_at(&self, layer: usize) -> bool {
+        match &self.alt_attn {
+            Some(alt) => !alt.sliding.get(layer).copied().unwrap_or(false),
+            None => false,
         }
     }
 
@@ -384,6 +405,9 @@ pub struct Hyperparams {
     /// per token rather than per-head over `head_dim`. OLMoE normalizes the full
     /// query/key vector; Qwen3 normalizes each head. `false` when no QK-norm.
     pub qk_norm_over_hidden: bool,
+    /// V przechodzi CZYSTĄ normalizację RMS (bez wagi) przed zapisem do cache —
+    /// rodzina Gemma. Realizowane wektorem jedynek, żeby nie mnożyć kerneli.
+    pub v_rms_norm: bool,
     /// Gated-DeltaNet / SSM parameters for hybrid architectures (`qwen35moe`);
     /// `None` for pure-attention models.
     pub ssm: Option<SsmParams>,
@@ -867,6 +891,7 @@ impl ModelDescriptor {
                 pooling_type,
                 moe,
                 qk_norm_over_hidden,
+                v_rms_norm: spec.gguf_arch.starts_with("gemma"),
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
@@ -941,6 +966,7 @@ impl ModelDescriptor {
                 // supported entry for Mixture-of-Experts models.
                 moe: None,
                 qk_norm_over_hidden: false,
+                v_rms_norm: false,
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
@@ -1262,6 +1288,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             moe,
             // qwen35moe attention normalizes each head over head_dim.
             qk_norm_over_hidden: false,
+            v_rms_norm: false,
             ssm: Some(ssm),
             rope_sections,
             full_attention_interval,

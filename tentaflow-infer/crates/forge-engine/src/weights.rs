@@ -558,6 +558,9 @@ pub struct AttnWeights {
     /// Optional per-head QK norms (qwen3); f16 vectors of head_dim.
     pub q_norm: Option<DevBuffer>,
     pub k_norm: Option<DevBuffer>,
+    /// Gemma normalizuje V czystą normą RMS, bez wyuczonej wagi. Trzymamy tu
+    /// wektor jedynek zamiast osobnego kernela bez wagi — wynik jest ten sam.
+    pub v_norm: Option<DevBuffer>,
     pub attn_qkv: QkvWeights,
     pub attn_o: DevWeight,
 }
@@ -621,6 +624,8 @@ pub struct ModelWeights {
     /// placeholder). `None` for models that gather on-device.
     pub token_embd_host: Option<Vec<f16>>,
     pub output_norm: DevBuffer,
+    /// Dzielniki częstotliwości rope dla warstw globalnych (`rope_freqs`, f32).
+    pub rope_freqs: Option<DevBuffer>,
     /// LM head. For tied embeddings this is a separate f16 view built from the
     /// same host data (kept simple; dedup is a later optimization).
     pub lm_head: DevWeight,
@@ -1385,6 +1390,14 @@ fn load_scalar_f32(src: &dyn TensorSource, name: &str) -> Result<f32> {
         )));
     }
     Ok(dequantize_to_f32(dtype, quant, &data, numel)?[0])
+}
+
+/// Wczytuje tensor jako f32 na urządzenie (dzielniki rope są f32, nie f16).
+fn upload_f32(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Result<DevBuffer> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    let numel = dims.iter().product();
+    let f32s = dequantize_to_f32(dtype, quant, &data, numel)?;
+    upload(device, bytemuck::cast_slice(&f32s))
 }
 
 fn upload_norm(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Result<DevBuffer> {
@@ -2524,6 +2537,10 @@ impl ModelWeights {
         let embd_name = global(WeightRole::TokenEmbd)?;
         let (token_embd_f16, vocab, hidden) = upload_embedding(device, src, embd_name)?;
         let output_norm = upload_norm(device, src, global(WeightRole::OutputNorm)?)?;
+        let rope_freqs = match descriptor.globals.get(&WeightRole::RopeFreqs) {
+            Some(n) => Some(upload_f32(device, src, n)?),
+            None => None,
+        };
 
         let lm_head_name = descriptor
             .globals
@@ -2794,6 +2811,14 @@ impl ModelWeights {
                         Some(n) => Some(upload_norm(device, src, n)?),
                         None => None,
                     },
+                    v_norm: if descriptor.params.v_rms_norm {
+                        Some(upload(
+                            device,
+                            &f32s_to_f16_bytes(&vec![1.0f32; descriptor.params.max_head_dim()]),
+                        )?)
+                    } else {
+                        None
+                    },
                     attn_qkv,
                     attn_o: upload_target_weight(device, attn_o, target_tile, nvfp4_ct)?,
                 })),
@@ -2831,6 +2856,7 @@ impl ModelWeights {
             token_embd_f16,
             token_embd_host: None,
             output_norm,
+            rope_freqs,
             lm_head,
             fp8_lm_head: None,
             layers,
@@ -2870,6 +2896,10 @@ impl ModelWeights {
         let (host_embed, host_embedding, vocab, hidden) = fetch_embedding_host(src, embd_name)?;
         let token_embd_f16 = upload(device, &vec![0u8; hidden * 2])?;
         let output_norm = upload_norm(device, src, global(WeightRole::OutputNorm)?)?;
+        let rope_freqs = match descriptor.globals.get(&WeightRole::RopeFreqs) {
+            Some(n) => Some(upload_f32(device, src, n)?),
+            None => None,
+        };
         let lm_head_name = descriptor
             .globals
             .get(&WeightRole::LmHead)
@@ -2939,6 +2969,7 @@ impl ModelWeights {
                     LayerMixer::Attention(Box::new(AttnWeights {
                         q_norm: Some(upload_norm(device, src, name(WeightRole::AttnQNorm)?)?),
                         k_norm: Some(upload_norm(device, src, name(WeightRole::AttnKNorm)?)?),
+                        v_norm: None,
                         attn_qkv: QkvWeights::Split { q, k, v },
                         attn_o,
                     }))
@@ -3138,6 +3169,7 @@ impl ModelWeights {
             token_embd_f16,
             token_embd_host: Some(host_embed),
             output_norm,
+            rope_freqs,
             lm_head,
             fp8_lm_head: None,
             layers,
