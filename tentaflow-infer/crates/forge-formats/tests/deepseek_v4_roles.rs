@@ -129,6 +129,55 @@ fn every_checkpoint_tensor_has_a_role() {
     );
 }
 
+/// Parametry architektury muszą trafić do opisu tak, jak stoją w konfiguracji —
+/// to z nich wynika geometria uwagi, kompresji i routingu.
+#[test]
+fn architecture_params_match_the_config() {
+    let Some(dir) = checkpoint_dir() else {
+        eprintln!("pomijam: brak checkpointu DeepSeek V4 (FORGE_DEEPSEEK_V4_DIR)");
+        return;
+    };
+    let desc = descriptor(&dir);
+    let p = &desc.params;
+    let ds = p
+        .deepseek_v4
+        .as_ref()
+        .expect("opis DeepSeeka V4 niesie własny blok parametrów");
+
+    assert_eq!(p.block_count, 43);
+    assert_eq!(p.hidden_size, 4096);
+    assert_eq!(p.n_heads, 64);
+    assert_eq!(p.n_kv_heads, 1, "KV jest pojedyncze (MQA), nie grupowe");
+    assert_eq!(p.head_dim, 512);
+    assert_eq!(p.vocab_size, 129280);
+
+    assert_eq!(ds.q_lora_rank, 1024);
+    assert_eq!(ds.o_lora_rank, 1024);
+    assert_eq!(ds.o_groups, 8);
+    assert_eq!(ds.rope_head_dim, 64);
+    assert_eq!(ds.window_size, 128);
+    assert_eq!(ds.index_n_heads, 64);
+    assert_eq!(ds.index_head_dim, 128);
+    assert_eq!(ds.index_topk, 512);
+    assert_eq!(ds.n_hash_layers, 3);
+    assert_eq!(ds.scoring_func, "sqrtsoftplus");
+
+    let moe = p.moe.as_ref().expect("model MoE");
+    assert_eq!(moe.n_experts, 256);
+    assert_eq!(moe.n_experts_used, 6);
+    assert_eq!(moe.moe_intermediate_size, 2048);
+    assert!(moe.norm_topk_prob);
+    assert_eq!(moe.shared_intermediate_size, 2048, "jeden ekspert dzielony");
+
+    // Predykaty geometrii muszą zgadzać się z tym, co widzi test tensorów.
+    assert!(!ds.has_compressor(0));
+    assert!(!ds.has_compressor(1));
+    assert!(ds.has_compressor(2));
+    assert!(ds.has_indexer(2), "ratio 4 oznacza indekser");
+    assert!(ds.has_compressor(3));
+    assert!(!ds.has_indexer(3), "ratio 128 oznacza brak indeksera");
+}
+
 /// Kompresor i indekser są opcjonalne i ich rozkład po warstwach wynika z
 /// `compress_ratios` — ten test pilnuje, że opis zgadza się z konfiguracją, a
 /// nie tylko z tym, co akurat leży na dysku.

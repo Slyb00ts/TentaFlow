@@ -462,6 +462,53 @@ pub struct MoeParams {
     pub shared_intermediate_size: usize,
 }
 
+/// Parametry swoiste dla DeepSeeka V4: uwaga latentna z projekcjami LoRA,
+/// dwustrumieniowy KV z kompresorem, indekser rzadkiej uwagi i modulacja
+/// warunkowana haszem. Wszystkie są bez odpowiednika w pozostałych
+/// architekturach, więc siedzą w osobnym bloku zamiast rozlewać się po
+/// `Hyperparams`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeepseekV4Params {
+    /// Ranga zejścia LoRA dla Q.
+    pub q_lora_rank: usize,
+    /// Ranga LoRA wyjścia uwagi (na grupę).
+    pub o_lora_rank: usize,
+    /// Na ile grup dzielone jest wyjście uwagi przed projekcją.
+    pub o_groups: usize,
+    /// Ile wymiarów głowicy obejmuje rope; reszta zostaje bez pozycji.
+    pub rope_head_dim: usize,
+    /// Szerokość okna przesuwnego uwagi.
+    pub window_size: usize,
+    /// Stopień kompresji KV per warstwa; 0 = warstwa bez kompresora.
+    pub compress_ratios: Vec<usize>,
+    /// Baza rope skompresowanego strumienia KV.
+    pub compress_rope_theta: f32,
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    /// Ile warstw routuje przez tablicę token->ekspert zamiast wyuczonej bramki.
+    pub n_hash_layers: usize,
+    /// Funkcja punktująca bramki routera (`sqrtsoftplus` w tym checkpoincie).
+    pub scoring_func: String,
+    /// Mnożnik wag routingu po wyborze top-k.
+    pub routed_scaling_factor: f32,
+    /// Górne ograniczenie bramki SwiGLU (0 = brak).
+    pub swiglu_limit: f32,
+}
+
+impl DeepseekV4Params {
+    /// Czy warstwa ma kompresor strumienia KV.
+    pub fn has_compressor(&self, layer: usize) -> bool {
+        self.compress_ratios.get(layer).is_some_and(|r| *r != 0)
+    }
+
+    /// Indekser istnieje tylko przy najgęstszej kompresji (ratio 4); warstwy o
+    /// ratio 128 czytają skompresowany strumień w całości.
+    pub fn has_indexer(&self, layer: usize) -> bool {
+        self.compress_ratios.get(layer) == Some(&4)
+    }
+}
+
 /// Unified model hyperparameters sourced from GGUF metadata or HF config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hyperparams {
@@ -521,6 +568,8 @@ pub struct Hyperparams {
     /// Gemma 4 używa 1,0 (w referencji `f_attention_scale = 1.0f`), więc bez
     /// tego pola model liczyłby uwagę na skali mniejszej ~22x.
     pub attn_logit_scale: Option<f32>,
+    /// `Some` tylko dla DeepSeeka V4.
+    pub deepseek_v4: Option<DeepseekV4Params>,
     /// Mnożnik embeddingu wejściowego. `None` = brak. Rodzina Gemma mnoży przez
     /// `sqrt(hidden_size)` (tylko dla wejścia tokenowego).
     pub embd_scale: Option<f32>,
@@ -1009,6 +1058,7 @@ impl ModelDescriptor {
             final_logit_softcap,
             attn_logit_scale,
             embd_scale,
+            deepseek_v4: None,
             },
             globals,
             layers,
@@ -1109,6 +1159,25 @@ impl ModelDescriptor {
                 // HF config.json carries no pooling; sentence-transformers keeps
                 // it in a `1_Pooling/config.json` sidecar the loader overrides.
                 pooling_type: PoolingType::None,
+                deepseek_v4: (spec.name == "deepseek_v4").then(|| DeepseekV4Params {
+                    q_lora_rank: config.q_lora_rank.unwrap_or(0),
+                    o_lora_rank: config.o_lora_rank.unwrap_or(0),
+                    o_groups: config.o_groups.unwrap_or(1),
+                    rope_head_dim: config.qk_rope_head_dim.unwrap_or(0),
+                    window_size: config.sliding_window.unwrap_or(0),
+                    compress_ratios: config.compress_ratios.clone(),
+                    compress_rope_theta: config.compress_rope_theta.unwrap_or(config.rope_theta),
+                    index_n_heads: config.index_n_heads.unwrap_or(0),
+                    index_head_dim: config.index_head_dim.unwrap_or(0),
+                    index_topk: config.index_topk.unwrap_or(0),
+                    n_hash_layers: config.num_hash_layers,
+                    scoring_func: config
+                        .scoring_func
+                        .clone()
+                        .unwrap_or_else(|| "softmax".to_string()),
+                    routed_scaling_factor: config.routed_scaling_factor.unwrap_or(1.0),
+                    swiglu_limit: config.swiglu_limit.unwrap_or(0.0),
+                }),
                 moe: config.n_routed_experts.map(|n_experts| MoeParams {
                     n_experts,
                     n_experts_used: config.num_experts_per_tok.unwrap_or(1),
@@ -1456,6 +1525,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             alt_attn: None,
             final_logit_softcap: 0.0,
             attn_logit_scale: None,
+            deepseek_v4: None,
             embd_scale: None,
         },
         globals,
