@@ -16,7 +16,6 @@
 // by go odciął.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

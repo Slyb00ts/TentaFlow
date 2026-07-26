@@ -2438,15 +2438,16 @@ impl Model {
 
     /// Rozkład ekspertów po warstwach pamięci, logowany po załadowaniu modelu.
     fn report_expert_residency(&self) {
-        let Some((vram, host)) = self.moe_expert_residency() else {
+        let Some((vram, host, nvme)) = self.moe_expert_residency() else {
             return;
         };
-        if host == 0 {
+        if host == 0 && nvme == 0 {
             return;
         }
         tracing::info!(
             experts_vram = vram,
             experts_host = host,
+            experts_nvme = nvme,
             "eksperci MoE rozłożeni między VRAM a pamięć hosta; rezydencja będzie przestawiana wg popularności"
         );
     }
@@ -12148,9 +12149,10 @@ impl Model {
 
     /// Ilu ekspertów siedzi w VRAM, a ilu w pamięci hosta, w całym modelu.
     /// `None` dla modeli bez routowanych ekspertów.
-    pub fn moe_expert_residency(&self) -> Option<(usize, usize)> {
+    pub fn moe_expert_residency(&self) -> Option<(usize, usize, usize)> {
         let mut vram = 0usize;
         let mut host = 0usize;
+        let mut nvme = 0usize;
         let mut any = false;
         for layer in &self.weights.layers {
             let LayerFfn::Moe(moe) = &layer.ffn else {
@@ -12158,12 +12160,13 @@ impl Model {
             };
             any = true;
             for stack in [&moe.gate_exps, &moe.up_exps, &moe.down_exps] {
-                let (v, h) = stack.tier_counts();
+                let (v, h, n) = stack.tier_counts();
                 vram += v;
                 host += h;
+                nvme += n;
             }
         }
-        any.then_some((vram, host))
+        any.then_some((vram, host, nvme))
     }
 
     fn rebalance_moe_residency(&mut self) -> Result<()> {
@@ -12215,18 +12218,18 @@ impl Model {
                 .expect("residency state present")
                 .scratch
                 .clone();
-            let LayerFfn::Moe(moe) = &mut self.weights.layers[migration.target.layer].ffn else {
+            let LayerFfn::Moe(moe) = &self.weights.layers[migration.target.layer].ffn else {
                 continue;
             };
             let stack = match migration.target.projection {
-                Projection::Gate => &mut moe.gate_exps,
-                Projection::Up => &mut moe.up_exps,
-                Projection::Down => &mut moe.down_exps,
+                Projection::Gate => &moe.gate_exps,
+                Projection::Up => &moe.up_exps,
+                Projection::Down => &moe.down_exps,
             };
-            stack.swap_tiers(
+            stack.promote_to_vram(
                 self.device.as_ref(),
-                migration.demote,
                 migration.promote,
+                migration.demote,
                 &scratch,
                 &self.stream,
             )?;

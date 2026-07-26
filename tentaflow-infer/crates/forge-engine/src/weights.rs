@@ -1845,7 +1845,9 @@ fn upload_expert_stack(
         stack, F16, Q8_0, Q4K, Q6K, Q5K, Q3K, Q2K, Q4_0, Q4_1, Q5_0, Q5_1, Iq4Nl, Iq4Xs, Mxfp4,
         Iq2Xs, Iq2S, Iq3S, Iq2Xxs, Iq3Xxs, Iq1S, Iq1M,
     );
-    ExpertStack::upload(device, experts, rows_per_expert, cols)
+    let resident = (0..experts.len()).collect();
+    let spilled = vec![None; experts.len()];
+    ExpertStack::new(device, experts, resident, spilled, rows_per_expert, cols)
 }
 
 /// Wiersze i bajty przypadające na jednego eksperta; obie wielkości muszą
