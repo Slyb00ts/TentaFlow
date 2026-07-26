@@ -949,12 +949,23 @@
   margin-left: auto;
 }
 
+.ps-member-head,
 .ps-member-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 32px minmax(160px, 2fr) minmax(140px, 1fr) minmax(120px, 1fr) 150px 84px;
   align-items: center;
   gap: 12px;
   padding: 10px 4px;
   border-bottom: 1px solid var(--border);
+}
+
+.ps-member-head {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding-bottom: 6px;
 }
 
 .ps-member-row:last-child {
@@ -998,7 +1009,7 @@
 .ps-member-invited {
   font-size: 11px;
   color: var(--text-3);
-  min-width: 150px;
+  min-width: 0;
 }
 
 .ps-member-role {

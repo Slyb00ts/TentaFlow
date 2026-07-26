@@ -256,6 +256,9 @@ function freshF2State() {
     runDetail: null,
     exec: null,
     gens: [],
+    gensFilter: '',
+    gensStatus: '',
+    gensKind: '',
     genDetail: null,
     genUnsub: null,
     genPollTimer: null,
@@ -269,7 +272,7 @@ function freshF2State() {
     // F3 — environments (T12), runner discovery and the live automated run
     // (T10/T11). `autoRun` owns its own stream + poll, torn down by
     // stopTestsLive() like every other live artifact of the tests tab.
-    envs: { rows: [], loaded: false, type: '', status: '' },
+    envs: { rows: [], loaded: false, type: '', status: '', filter: '' },
     envApprovals: { items: [], loaded: false },
     envPending: 0,
     runners: null,
@@ -3208,7 +3211,18 @@ function renderMembersList() {
     return;
   }
 
-  host.innerHTML = visible.map((m) => {
+  const head = `
+    <div class="ps-member-head">
+      <span></span>
+      <span>${escapeHtml(t('members_col_user'))}</span>
+      <span>${escapeHtml(t('members_col_invited_by'))}</span>
+      <span>${escapeHtml(t('members_col_joined'))}</span>
+      <span>${escapeHtml(t('members_col_role'))}</span>
+      <span>${escapeHtml(t('members_col_actions'))}</span>
+    </div>
+  `;
+
+  host.innerHTML = head + visible.map((m) => {
     const userId = m.user_id ?? m.userId;
     const displayName = m.display_name ?? m.displayName ?? '';
     const self = isMe(userId);
@@ -3233,10 +3247,8 @@ function renderMembersList() {
           <div class="ps-member-name">${escapeHtml(displayName)} ${self ? `<tf-chip status="accent">${escapeHtml(t('you_chip'))}</tf-chip>` : ''}</div>
           <div class="ps-member-mail">${escapeHtml(m.email || '')}</div>
         </div>
-        <div class="ps-member-invited">
-          ${escapeHtml(m.invited_by_name ?? m.invitedByName ?? '')}<br>
-          <span>${escapeHtml(formatTimestamp(m.created_at ?? m.createdAt))}</span>
-        </div>
+        <div class="ps-member-invited">${escapeHtml(m.invited_by_name ?? m.invitedByName ?? '—')}</div>
+        <div class="ps-member-invited">${escapeHtml(formatTimestamp(m.created_at ?? m.createdAt))}</div>
         ${roleCell}
         <div class="ps-member-actions">
           ${canTransfer ? `<tf-button variant="ghost" size="sm" icon="key" data-transfer="${escapeAttr(userId)}" title="${escapeAttr(t('members_transfer'))}"></tf-button>` : ''}
@@ -3244,7 +3256,15 @@ function renderMembersList() {
         </div>
       </div>
     `;
-  }).join('');
+  }).join('') + `
+    <div class="ps-table-footer">${escapeHtml(t('members_footer', {
+      shown: visible.length,
+      total: state.members.length,
+      owners: state.members.filter((m) => m.role === 'owner').length,
+      managers: state.members.filter((m) => m.role === 'manager').length,
+      testers: state.members.filter((m) => m.role === 'tester').length,
+    }))}</div>
+  `;
 
   host.querySelectorAll('[data-role-user]').forEach((sel) => {
     sel.addEventListener('change', async (e) => {
@@ -5830,19 +5850,57 @@ async function renderGenerationsView() {
 
   host.innerHTML = `
     <div class="ps-tests-toolbar">
+      <tf-searchbox id="ps-gens-search" placeholder="${escapeAttr(t('gens_search_placeholder'))}" value="${escapeAttr(s.gensFilter || '')}"></tf-searchbox>
+      <tf-select id="ps-gens-f-status" value="${escapeAttr(s.gensStatus || '')}">
+        <option value="">${escapeHtml(t('gens_status_all'))}</option>
+        ${['running', 'review', 'accepted', 'rejected', 'failed', 'cancelled'].map((x) => `<option value="${x}" ${x === s.gensStatus ? 'selected' : ''}>${escapeHtml(t(`gen_status_${x}`))}</option>`).join('')}
+      </tf-select>
+      <tf-select id="ps-gens-f-kind" value="${escapeAttr(s.gensKind || '')}">
+        <option value="">${escapeHtml(t('gens_kind_all'))}</option>
+        ${CASE_KINDS.map((k) => `<option value="${k}" ${k === s.gensKind ? 'selected' : ''}>${escapeHtml(t(`case_kind_${k}`))}</option>`).join('')}
+      </tf-select>
       <span class="ps-toolbar-spacer"></span>
+      <tf-button variant="ghost" icon="refresh" id="ps-gens-refresh">${escapeHtml(t('action_refresh'))}</tf-button>
       ${canEdit() ? `<tf-button variant="primary" icon="sparkle" id="ps-gens-new">${escapeHtml(t('cases_generate'))}</tf-button>` : ''}
     </div>
-    <div id="ps-gens-table-host">
-      ${s.gens.length ? '' : `<tf-empty-state icon="sparkle" title="${escapeAttr(t('gens_empty'))}"></tf-empty-state>`}
-    </div>
+    <div id="ps-gens-table-host"></div>
   `;
   byId('ps-gens-new')?.addEventListener('click', () => openGenerationWindow());
-  if (!s.gens.length) return;
+  byId('ps-gens-refresh')?.addEventListener('click', () => renderGenerationsView());
+  byId('ps-gens-search')?.addEventListener('input', (e) => {
+    s.gensFilter = String(e.detail?.value ?? e.target.value ?? '');
+    renderGenerationsTable();
+  });
+  byId('ps-gens-f-status')?.addEventListener('change', (e) => {
+    s.gensStatus = e.detail?.value ?? '';
+    renderGenerationsTable();
+  });
+  byId('ps-gens-f-kind')?.addEventListener('change', (e) => {
+    s.gensKind = e.detail?.value ?? '';
+    renderGenerationsTable();
+  });
+  renderGenerationsTable();
+}
 
+function renderGenerationsTable() {
+  const s = f2();
   const tableHost = byId('ps-gens-table-host');
+  if (!tableHost) return;
+  const needle = (s.gensFilter || '').trim().toLowerCase();
+  const rows = s.gens.filter((g) => {
+    if (s.gensStatus && g.status !== s.gensStatus) return false;
+    if (s.gensKind && g.kind !== s.gensKind) return false;
+    if (!needle) return true;
+    return `${fv(g, 'agent_name') || ''} ${g.instructions || ''} ${fv(g, 'gen_id')}`.toLowerCase().includes(needle);
+  });
+  if (!rows.length) {
+    tableHost.innerHTML = `<tf-empty-state icon="sparkle" title="${escapeAttr(s.gens.length ? t('gens_no_match') : t('gens_empty'))}"></tf-empty-state>`;
+    return;
+  }
+
   tableHost.innerHTML = `
     <tf-table id="ps-gens-table">
+      <tf-column key="name" label="${escapeAttr(t('gens_col_name'))}" renderer="html"></tf-column>
       <tf-column key="kind" label="${escapeAttr(t('gens_col_kind'))}" renderer="chip"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('gens_col_status'))}" renderer="chip"></tf-column>
       <tf-column key="agent" label="${escapeAttr(t('gens_col_agent'))}"></tf-column>
@@ -5852,10 +5910,12 @@ async function renderGenerationsView() {
     </tf-table>
   `;
   const table = byId('ps-gens-table');
-  table.rows = s.gens.map((g) => ({
+  table.rows = rows.map((g) => ({
     _id: fv(g, 'gen_id'),
     _row: g,
-    kind: chipCell('info', t(`case_kind_${g.kind}`)),
+    name: `<div class="tf-table__cell-title">${escapeHtml((g.instructions || t('gens_untitled')).slice(0, 70))}</div>`
+      + `<div class="tf-table__cell-sub">${escapeHtml(shortId(fv(g, 'gen_id')))}</div>`,
+    kind: chipCell(CASE_KIND_CHIP[g.kind] || 'info', t(`case_kind_${g.kind}`)),
     status: chipCell(GEN_STATUS_CHIP[g.status], t(`gen_status_${g.status}`)),
     agent: fv(g, 'agent_name') || '—',
     progress: t('gens_progress', {
@@ -5892,6 +5952,13 @@ async function renderGenerationsView() {
     const genId = e.detail?.row?._id;
     if (genId) openGenDetail(genId);
   });
+
+  const running = s.gens.filter((g) => g.status === 'running').length;
+  const review = s.gens.filter((g) => g.status === 'review').length;
+  const footer = document.createElement('div');
+  footer.className = 'ps-table-footer';
+  footer.textContent = t('gens_footer', { shown: rows.length, total: s.gens.length, running, review });
+  tableHost.appendChild(footer);
 }
 
 async function deleteGeneration(genId) {
@@ -6195,16 +6262,12 @@ async function renderEnvironmentsView() {
   }
   if (state.tab !== 'tests' || s.view !== 'environments') return;
 
-  const rows = s.envs.rows.filter((env) => {
-    if (s.envs.type && fv(env, 'env_type') !== s.envs.type) return false;
-    if (s.envs.status && fv(env, 'approval_status') !== s.envs.status) return false;
-    return true;
-  });
   const selectOpt = (value, current, label) =>
     `<option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>`;
 
   host.innerHTML = `
     <div class="ps-tests-toolbar">
+      <tf-searchbox id="ps-envs-search" placeholder="${escapeAttr(t('envs_search_placeholder'))}" value="${escapeAttr(s.envs.filter || '')}"></tf-searchbox>
       <tf-select id="ps-envs-f-type" value="${escapeAttr(s.envs.type)}">
         ${selectOpt('', s.envs.type, t('env_filter_type_all'))}
         ${ENV_TYPES.map((x) => selectOpt(x, s.envs.type, t(`env_type_${x}`))).join('')}
@@ -6222,27 +6285,46 @@ async function renderEnvironmentsView() {
       ${canManage() ? `<tf-button variant="primary" icon="plus" id="ps-envs-new">${escapeHtml(t('envs_new'))}</tf-button>` : ''}
     </div>
     <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('envs_intro'))}</span></div>
-    <div id="ps-envs-table-host">
-      ${rows.length ? '' : `<tf-empty-state icon="globe" title="${escapeAttr(t('envs_empty'))}"></tf-empty-state>`}
-    </div>
+    <div id="ps-envs-table-host"></div>
   `;
 
+  byId('ps-envs-search')?.addEventListener('input', (e) => {
+    s.envs.filter = String(e.detail?.value ?? e.target.value ?? '');
+    renderEnvironmentsTable();
+  });
   byId('ps-envs-f-type')?.addEventListener('change', (e) => {
     s.envs.type = e.detail?.value ?? e.target.value ?? '';
-    renderEnvironmentsView();
+    renderEnvironmentsTable();
   });
   byId('ps-envs-f-status')?.addEventListener('change', (e) => {
     s.envs.status = e.detail?.value ?? e.target.value ?? '';
-    renderEnvironmentsView();
+    renderEnvironmentsTable();
   });
   byId('ps-envs-new')?.addEventListener('click', () => openEnvironmentWindow(null));
   byId('ps-envs-approvals')?.addEventListener('click', () => {
     s.view = 'env-approvals';
     renderTestsView();
   });
-  if (!rows.length) return;
+  renderEnvironmentsTable();
+}
 
-  byId('ps-envs-table-host').innerHTML = `
+function renderEnvironmentsTable() {
+  const s = f2();
+  const tableHost = byId('ps-envs-table-host');
+  if (!tableHost) return;
+  const needle = (s.envs.filter || '').trim().toLowerCase();
+  const rows = s.envs.rows.filter((env) => {
+    if (s.envs.type && fv(env, 'env_type') !== s.envs.type) return false;
+    if (s.envs.status && fv(env, 'approval_status') !== s.envs.status) return false;
+    if (needle && !`${env.name} ${fv(env, 'base_url') || ''}`.toLowerCase().includes(needle)) return false;
+    return true;
+  });
+  if (!rows.length) {
+    tableHost.innerHTML = `<tf-empty-state icon="globe" title="${escapeAttr(s.envs.rows.length ? t('envs_no_match') : t('envs_empty'))}"></tf-empty-state>`;
+    return;
+  }
+
+  tableHost.innerHTML = `
     <tf-table id="ps-envs-table">
       <tf-column key="name" label="${escapeAttr(t('envs_col_name'))}"></tf-column>
       <tf-column key="type" label="${escapeAttr(t('envs_col_type'))}"></tf-column>
@@ -8909,6 +8991,7 @@ async function renderReportsView() {
       <span class="ps-toolbar-spacer"></span>
       <tf-button variant="ghost" icon="file-text" id="ps-rep-print">${escapeHtml(t('reports_print'))}</tf-button>
     </div>
+    <div id="ps-reports-kpis" class="ps-overview-kpis"></div>
     <div id="ps-reports-grid" class="ps-reports-grid">
       ${rep.loaded ? '' : `<div class="ps-field-hint">${escapeHtml(t('reports_intro'))}</div>`}
     </div>
@@ -8967,7 +9050,52 @@ function reportSectionShell(kind, icon, chartId, extraActions = '') {
   `;
 }
 
+// The four headline numbers of the reports dashboard, derived from the report
+// rows already fetched — no extra round trip.
+function renderReportKpis() {
+  const host = byId('ps-reports-kpis');
+  const rep = f2().reports;
+  if (!host) return;
+  if (!rep.loaded) { host.innerHTML = ''; return; }
+
+  const overTime = rep.data.runs_over_time?.rows || [];
+  const totals = overTime.reduce((acc, r) => {
+    acc.runs += Number(r.runs ?? 0);
+    acc.passed += Number(r.passed ?? 0);
+    acc.executed += Number(r.passed ?? 0) + Number(r.failed ?? 0) + Number(r.blocked ?? 0) + Number(r.skipped ?? 0);
+    return acc;
+  }, { runs: 0, passed: 0, executed: 0 });
+  const passRate = totals.executed ? Math.round((totals.passed / totals.executed) * 1000) / 10 : 0;
+
+  const testers = rep.data.tester_stats?.rows || [];
+  const avgSeconds = testers.length
+    ? testers.reduce((sum, r) => sum + Number(r.avg_duration_secs ?? 0), 0) / testers.length
+    : 0;
+
+  // The defects report is grouped by (severity, status); "open" is everything
+  // that is not done.
+  const defects = (rep.data.defects?.rows || []).filter((r) => String(r.status || '') !== 'done');
+  const openDefects = defects.reduce((sum, r) => sum + Number(r.count ?? 0), 0);
+  const criticalDefects = defects
+    .filter((r) => String(r.severity || '').toLowerCase() === 'critical')
+    .reduce((sum, r) => sum + Number(r.count ?? 0), 0);
+
+  host.innerHTML = `
+    <tf-stat-card icon="check" label="${escapeAttr(t('report_kpi_pass_rate'))}" value="${passRate}" suffix="%"
+      accent="${passRate >= 90 ? 'success' : passRate >= 70 ? 'warning' : 'danger'}"
+      delta="${escapeAttr(t('report_kpi_pass_rate_delta', { executed: totals.executed }))}" delta-type="neutral"></tf-stat-card>
+    <tf-stat-card icon="play" label="${escapeAttr(t('report_kpi_runs'))}" value="${totals.runs}" accent="info"
+      delta="${escapeAttr(t('report_kpi_runs_delta', { days: overTime.length }))}" delta-type="neutral"></tf-stat-card>
+    <tf-stat-card icon="clock" label="${escapeAttr(t('report_kpi_avg_time'))}" value="${formatDuration(Math.round(avgSeconds))}"
+      delta="${escapeAttr(t('report_kpi_avg_time_delta'))}" delta-type="neutral"></tf-stat-card>
+    <tf-stat-card icon="alert" label="${escapeAttr(t('report_kpi_defects'))}" value="${openDefects}"
+      accent="${openDefects ? 'danger' : 'success'}"
+      delta="${escapeAttr(t('report_kpi_defects_delta', { count: criticalDefects }))}" delta-type="${criticalDefects ? 'warn' : 'neutral'}"></tf-stat-card>
+  `;
+}
+
 function renderReportSections() {
+  renderReportKpis();
   const grid = byId('ps-reports-grid');
   if (!grid) return;
   grid.innerHTML = `
