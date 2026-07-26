@@ -26,7 +26,9 @@ from src.attention import (
     attn_decode_f16_hd256,
     attn_decode_f16_hd512,
     attn_decode_split8_combine_f16_hd256,
+    attn_decode_split8_combine_f16_hd512,
     attn_decode_split8_f16_hd256,
+    attn_decode_split8_f16_hd512,
 )
 from src.attention import (
     attn_decode_batch_exact_f16_hd256,
@@ -825,6 +827,16 @@ def main() raises:
         dump_asm=Path("attn_decode_split8_combine_f16_hd256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_decode_split8_combine_f16_hd256"))
+    _ = ctx.compile_function[
+        attn_decode_split8_f16_hd512,
+        dump_asm=Path("attn_decode_split8_f16_hd512.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_split8_f16_hd512"))
+    _ = ctx.compile_function[
+        attn_decode_split8_combine_f16_hd512,
+        dump_asm=Path("attn_decode_split8_combine_f16_hd512.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_decode_split8_combine_f16_hd512"))
 
     _ = ctx.compile_function[
         attn_decode_batch_exact_f16_hd256,

@@ -142,7 +142,7 @@ comptime attn_decode_f16_hd256 = attn_decode_f16[256]
 comptime attn_decode_f16_hd512 = attn_decode_f16[512]
 
 
-def attn_decode_split8_f16_hd256(
+def attn_decode_split8_f16[head_dim: Int](
     partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
     k_cache: UnsafePointer[Float16, MutAnyOrigin],
@@ -154,7 +154,19 @@ def attn_decode_split8_f16_hd256(
     page_size: Int,
     max_pages: Int,
     scale: Float32,
+    window: Int,
 ):
+    """Dekodowanie z podzialem kontekstu na HD256_SPLITS partycji.
+
+    Wariant generyczny ma siatke (sekwencje, glowice), czyli przy JEDNEJ
+    sekwencji 16 grup roboczych na 80 CU — profiler pokazal 50 GB/s na
+    odczytach KV, gdy GEMV wag wyciaga 397 GB/s. Podzial kontekstu mnozy
+    liczbe grup przez HD256_SPLITS i dopiero to wysyca pamiec.
+
+    `window` > 0 ogranicza widoczne pozycje do `[ctx - window, ctx)` (warstwy
+    okienne Gemmy 4). 0 oznacza pelny kontekst.
+    """
+    comptime epl = head_dim // WARP_SIZE
     seq = Int(block_idx.x)
     query_head = Int(block_idx.y)
     partition = Int(block_idx.z)
@@ -163,26 +175,29 @@ def attn_decode_split8_f16_hd256(
     warp_id = Int(thread_idx.x) // WARP_SIZE
     warps = Int(block_dim.x) // WARP_SIZE
     context = Int(seq_lens[seq])
-    query_base = (seq * n_q_heads + query_head) * HD256
-    lane_element = lane * HD256_ELEMENTS_PER_LANE
+    var first = 0
+    if window > 0 and context > window:
+        first = context - window
+    query_base = (seq * n_q_heads + query_head) * head_dim
+    lane_element = lane * epl
     query = (q + query_base + lane_element).load[
-        width=HD256_ELEMENTS_PER_LANE, alignment=16
+        width=epl, alignment=16
     ]().cast[DType.float32]()
 
     var maximum: Float32 = NEG_INF
     var denominator: Float32 = 0.0
-    var output = SIMD[DType.float32, HD256_ELEMENTS_PER_LANE](0.0)
-    var position = partition + warp_id * HD256_SPLITS
+    var output = SIMD[DType.float32, epl](0.0)
+    var position = first + partition + warp_id * HD256_SPLITS
     while position < context:
         page = Int(page_table[seq * max_pages + position // page_size])
         cache_base = (
             (page * n_kv_heads + kv_head) * page_size + position % page_size
-        ) * HD256 + lane_element
+        ) * head_dim + lane_element
         key = (k_cache + cache_base).load[
-            width=HD256_ELEMENTS_PER_LANE, alignment=16
+            width=epl, alignment=16
         ]().cast[DType.float32]()
         value = (v_cache + cache_base).load[
-            width=HD256_ELEMENTS_PER_LANE, alignment=16
+            width=epl, alignment=16
         ]().cast[DType.float32]()
         score = warp.sum((query * key).reduce_add()) * scale
         next_maximum = max(maximum, score)
@@ -200,13 +215,13 @@ def attn_decode_split8_f16_hd256(
         MAX_WARPS, Float32, address_space=AddressSpace.SHARED
     ]()
     shared_output = stack_allocation[
-        MAX_WARPS * HD256, Float32, address_space=AddressSpace.SHARED
+        MAX_WARPS * head_dim, Float32, address_space=AddressSpace.SHARED
     ]()
     if lane == 0:
         shared_maximum[warp_id] = maximum
         shared_denominator[warp_id] = denominator
-    (shared_output + warp_id * HD256 + lane_element).store[
-        width=HD256_ELEMENTS_PER_LANE, alignment=16
+    (shared_output + warp_id * head_dim + lane_element).store[
+        width=epl, alignment=16
     ](output)
     barrier()
 
@@ -215,61 +230,63 @@ def attn_decode_split8_f16_hd256(
         for index in range(warps):
             block_maximum = max(block_maximum, shared_maximum[index])
         var block_denominator: Float32 = 0.0
-        var block_output = SIMD[DType.float32, HD256_ELEMENTS_PER_LANE](0.0)
+        var block_output = SIMD[DType.float32, epl](0.0)
         for index in range(warps):
             factor = exp(shared_maximum[index] - block_maximum)
             block_denominator += shared_denominator[index] * factor
-            partial = (shared_output + index * HD256 + lane_element).load[
-                width=HD256_ELEMENTS_PER_LANE, alignment=16
+            partial = (shared_output + index * head_dim + lane_element).load[
+                width=epl, alignment=16
             ]()
             block_output += partial * factor
         partial_base = (
             (seq * n_q_heads + query_head) * HD256_SPLITS + partition
-        ) * HD256_PARTIAL_STRIDE
+        ) * (head_dim + 4)
         (partial_ptr + partial_base + lane_element).store[
-            width=HD256_ELEMENTS_PER_LANE, alignment=16
+            width=epl, alignment=16
         ](block_output)
         if lane == 0:
-            partial_ptr[partial_base + HD256] = block_maximum
-            partial_ptr[partial_base + HD256 + 1] = block_denominator
+            partial_ptr[partial_base + head_dim] = block_maximum
+            partial_ptr[partial_base + head_dim + 1] = block_denominator
 
 
-def attn_decode_split8_combine_f16_hd256(
+def attn_decode_split8_combine_f16[head_dim: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
     n_q_heads: Int,
 ):
+    comptime epl = head_dim // WARP_SIZE
+    comptime stride = head_dim + 4
     seq = Int(block_idx.x)
     query_head = Int(block_idx.y)
     lane = Int(thread_idx.x)
-    lane_element = lane * HD256_ELEMENTS_PER_LANE
-    query_base = (seq * n_q_heads + query_head) * HD256
-    head_base = (
-        (seq * n_q_heads + query_head)
-        * HD256_SPLITS
-        * HD256_PARTIAL_STRIDE
-    )
+    lane_element = lane * epl
+    query_base = (seq * n_q_heads + query_head) * head_dim
+    head_base = (seq * n_q_heads + query_head) * HD256_SPLITS * stride
     var maximum: Float32 = NEG_INF
     for partition in range(HD256_SPLITS):
         maximum = max(
             maximum,
-            partial_ptr[
-                head_base + partition * HD256_PARTIAL_STRIDE + HD256
-            ],
+            partial_ptr[head_base + partition * stride + head_dim],
         )
     var denominator: Float32 = 0.0
-    var output = SIMD[DType.float32, HD256_ELEMENTS_PER_LANE](0.0)
+    var output = SIMD[DType.float32, epl](0.0)
     for partition in range(HD256_SPLITS):
-        partial_base = head_base + partition * HD256_PARTIAL_STRIDE
-        factor = exp(partial_ptr[partial_base + HD256] - maximum)
-        denominator += partial_ptr[partial_base + HD256 + 1] * factor
+        partial_base = head_base + partition * stride
+        factor = exp(partial_ptr[partial_base + head_dim] - maximum)
+        denominator += partial_ptr[partial_base + head_dim + 1] * factor
         partial = (partial_ptr + partial_base + lane_element).load[
-            width=HD256_ELEMENTS_PER_LANE, alignment=16
+            width=epl, alignment=16
         ]()
         output += partial * factor
     (out_ptr + query_base + lane_element).store[
-        width=HD256_ELEMENTS_PER_LANE, alignment=16
+        width=epl, alignment=16
     ]((output / denominator).cast[DType.float16]())
+
+
+comptime attn_decode_split8_f16_hd256 = attn_decode_split8_f16[256]
+comptime attn_decode_split8_f16_hd512 = attn_decode_split8_f16[512]
+comptime attn_decode_split8_combine_f16_hd256 = attn_decode_split8_combine_f16[256]
+comptime attn_decode_split8_combine_f16_hd512 = attn_decode_split8_combine_f16[512]
 
 
 def attn_decode_batch_exact_f16[head_dim: Int](

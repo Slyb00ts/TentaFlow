@@ -1813,7 +1813,7 @@ struct DecodeBufs {
     k: DevBuffer,
     v: DevBuffer,
     attn_out: DevBuffer,
-    /// Split-attention partials: [n_heads, ATTN_DECODE_SPLITS, head_dim + 2]
+    /// Split-attention partials: [n_heads, ATTN_DECODE_SPLITS, max_head_dim + 4]
     /// f32 (unnormalized acc + running max + running sum per split).
     attn_parts: DevBuffer,
     o_out: DevBuffer,
@@ -16544,7 +16544,7 @@ impl Model {
             q: f16(matrix_cap * q_dim)?,
             k: f16(matrix_cap * kv_dim)?,
             v: f16(matrix_cap * kv_dim)?,
-            attn_parts: f32b(matrix_cap * p.n_heads * ATTN_DECODE_SPLITS * (p.head_dim + 2))?,
+            attn_parts: f32b(matrix_cap * p.n_heads * ATTN_DECODE_SPLITS * (p.max_head_dim() + 4))?,
             attn_out: f16(matrix_cap * q_dim)?,
             o_out: f16(matrix_cap * hidden)?,
             gate: f16(matrix_cap * inter)?,

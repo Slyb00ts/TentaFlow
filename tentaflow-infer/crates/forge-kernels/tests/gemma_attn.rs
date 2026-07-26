@@ -325,3 +325,100 @@ fn gemm_q6_k_matches_canonical_dequant_shapes() {
         assert!(worst < 0.02, "rows={rows} cols={cols} T={n_tokens} rel={worst}");
     }
 }
+
+/// Wariant dzielony musi dawać ten sam wynik co generyczny — także z oknem
+/// przesuwnym (40 z 48 warstw Gemmy 4 ma okno 1024). Porównanie idzie przez
+/// jeden launcher, więc test sprawdza dokładnie tę ścieżkę, którą bierze silnik.
+#[test]
+fn attn_decode_split_matches_generic() {
+    let dev = device();
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let page_size = 32usize;
+
+    for &(head_dim, n_q, n_kv) in &[(256usize, 16usize, 8usize), (512, 16, 1)] {
+        for &(ctx, window) in &[(200usize, 0usize), (200, 64), (1024, 1024), (1500, 1024)] {
+            let pages = ctx.div_ceil(page_size);
+            let slots = pages * page_size;
+            let q: Vec<f32> = (0..n_q * head_dim).map(fill).collect();
+            let k: Vec<f32> = (0..slots * n_kv * head_dim).map(|i| fill(i + 3)).collect();
+            let v: Vec<f32> = (0..slots * n_kv * head_dim).map(|i| fill(i + 9)).collect();
+
+            let qb = upload(dev.as_ref(), &q);
+            let kb = upload(dev.as_ref(), &k);
+            let vb = upload(dev.as_ref(), &v);
+            let ob = upload(dev.as_ref(), &vec![0.0; n_q * head_dim]);
+            let parts = dev
+                .alloc(
+                    n_q * 8 * (head_dim + 4) * 4,
+                    MemKind::Device,
+                    Pool::Activations,
+                )
+                .unwrap();
+            let pt = {
+                let bytes: Vec<u8> = (0..pages as i32).flat_map(|p| p.to_le_bytes()).collect();
+                let buf = dev
+                    .alloc(bytes.len(), MemKind::Device, Pool::Activations)
+                    .unwrap();
+                dev.write(&bytes, &buf, 0).unwrap();
+                buf
+            };
+            let lens = {
+                let bytes = (ctx as i32).to_le_bytes().to_vec();
+                let buf = dev
+                    .alloc(bytes.len(), MemKind::Device, Pool::Activations)
+                    .unwrap();
+                dev.write(&bytes, &buf, 0).unwrap();
+                buf
+            };
+
+            kernels
+                .attn_decode_f16(
+                    &ob, &parts, &qb, &kb, &vb, &pt, &lens, 1, n_q, n_kv, head_dim,
+                    page_size, pages, 1.0, window, &stream,
+                )
+                .unwrap();
+            dev.synchronize().unwrap();
+            let got = download(dev.as_ref(), &ob, n_q * head_dim);
+
+            // Referencja: pełna uwaga po widocznym oknie, liczona na hoście.
+            let first = if window > 0 && ctx > window { ctx - window } else { 0 };
+            let per_kv = n_q / n_kv;
+            let mut want = vec![0.0f32; n_q * head_dim];
+            for h in 0..n_q {
+                let kvh = h / per_kv;
+                let mut scores = Vec::new();
+                for pos in first..ctx {
+                    let base = ((pos / page_size * n_kv + kvh) * page_size + pos % page_size)
+                        * head_dim;
+                    let dot: f32 = (0..head_dim)
+                        .map(|d| q[h * head_dim + d] * k[base + d])
+                        .sum();
+                    scores.push(dot);
+                }
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (i, pos) in (first..ctx).enumerate() {
+                        let base = ((pos / page_size * n_kv + kvh) * page_size
+                            + pos % page_size)
+                            * head_dim;
+                        acc += exps[i] * v[base + d];
+                    }
+                    want[h * head_dim + d] = acc / sum;
+                }
+            }
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                err < 0.02,
+                "hd={head_dim} ctx={ctx} window={window} max_err={err}"
+            );
+        }
+    }
+}
