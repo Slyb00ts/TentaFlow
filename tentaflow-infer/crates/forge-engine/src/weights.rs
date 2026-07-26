@@ -1325,35 +1325,13 @@ fn fetch_deepseek_weight(st: &ShardedSafeTensors, name: &str) -> Result<Option<H
         }));
     }
 
-    // Waga FP8 z kafelkową skalą E8M0.
-    if info.dtype == DType::F8E4M3 {
-        let scale_name = format!("{base}.scale");
-        let Some(scale_info) = st.tensor(&scale_name) else {
-            return Ok(None);
-        };
-        let (rows, cols) = (info.shape[0], info.shape[1]);
-        if scale_info.shape.len() != 2 || scale_info.shape[1] == 0 {
-            return Err(ForgeError::Format(format!(
-                "{scale_name}: oczekiwano dwuwymiarowej skali kafelkowej"
-            )));
-        }
-        let tile = cols / scale_info.shape[1];
-        if rows.div_ceil(tile) != scale_info.shape[0] {
-            return Err(ForgeError::Format(format!(
-                "{scale_name}: kafel {tile} nie zgadza się z kształtem {:?}",
-                scale_info.shape
-            )));
-        }
-        let data = nvfp4::deepseek_fp8_to_q8_0(
-            st.data(name)?,
-            st.data(&scale_name)?,
-            rows,
-            cols,
-            tile,
-        )?;
-        return Ok(Some(HostWeight::Q8_0 { data, rows, cols }));
-    }
-
+    // Wagi FP8 z kafelkową skalą czekają na mikser DeepSeeka: mają iść ścieżką
+    // `deepseek_fp8_to_row_scaled`, która przenosi skalę na wiersz wtapiając
+    // różnicę wykładników w bajty E4M3. Zmierzony błąd wyjścia projekcji to
+    // 4,7e-7 przy jednym bajcie na wagę — wobec 5,4e-3 dla przekwantyzowania
+    // na Q8_0 i 13,7 GiB dla materializacji do f16. Brakuje tylko typu wagi z
+    // osobnym buforem skal wierszowych, który powstanie razem z mikserem.
+    let _ = base;
     Ok(None)
 }
 

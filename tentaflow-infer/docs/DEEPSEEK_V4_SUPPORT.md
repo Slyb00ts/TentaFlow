@@ -33,14 +33,24 @@ Warstwa kwantyzacji, zmierzona na prawdziwych tensorach
   leżeć w VRAM, w RAM-ie albo na dysku niezależnie od sąsiadów. Sprawdzone dla
   wszystkich 126 kodów skali razy 16 kodów wartości oraz na czterech prawdziwych
   ekspertach o różnych kształtach.
-- **Wagi nieekspertowe FP8 → Q8_0, względne L2 = 5,5e-3.** Materializacja do f16
-  — czyli dotychczasowa ścieżka FP8 — urosłaby te wagi z 8,2 do 13,7 GiB przy
-  karcie mającej 16 GiB i 148 GiB ekspertów do zmieszczenia obok. Q8_0 zajmuje
-  1,06 bajta na wagę i wchodzi we wszystkie istniejące kernele bez pisania
-  nowych. Maksymalny błąd względny sięga 1,0 na pojedynczych wartościach
-  wielokrotnie mniejszych od maksimum swojej grupy — int8 z jedną skalą je
-  zeruje; ich wkład do L2 jest znikomy, ale to jest realne obcięcie, nie
-  zaokrąglenie. Natywny kernel FP8 z kafelkową skalą zdejmie ten koszt później.
+- **Wagi nieekspertowe FP8: kafelkowa skala E8M0 → skala na wiersz, błąd wyjścia
+  projekcji 4-12e-7.** FORGE ma kernel FP8 tylko ze skalą na wiersz. Skala E8M0
+  jest czystą potęgą dwójki, więc różnicę wykładników można wtopić w same bajty
+  E4M3 — zmierzony rozrzut skal w obrębie wiersza to najwyżej JEDNA potęga
+  dwójki, więc przesunięcie dotyka jednego bitu wykładnika, a jedyną stratą są
+  najmniejsze wartości schodzące do zakresu subnormalnego. Zostaje jeden bajt na
+  wagę i istniejący kernel.
+
+  **Odrzucone po pomiarze: przekwantyzowanie na Q8_0.** Kosztowało 5,4e-3 na
+  wyjściu projekcji — 11 000 razy więcej, przy tym samym bajcie na wagę. Warto
+  zapamiętać dlaczego: założenie, że iloczyn skalarny uśredni błędy po tysiącach
+  wag, jest FAŁSZYWE. Błąd Q8_0 jest systematyczny (int8 z jedną skalą na 32
+  elementy zeruje wartości dużo mniejsze od maksimum grupy), więc błąd wyjścia
+  wychodzi równy błędowi wag, nie mniejszy. Przy 43 warstwach to by się
+  kumulowało.
+
+  **Odrzucone: materializacja do f16.** Bez straty dokładności, ale urosłaby te
+  wagi z 8,2 do 13,7 GiB przy karcie mającej 16 GiB i 148 GiB ekspertów obok.
 
 Dwie konwencje ustalone POMIAREM, bo obie mylą się bezgłośnie:
 
@@ -131,7 +141,9 @@ Aktywacje kwantyzowane dynamicznie do FP8 przed każdym GEMM-em.
 4. **Bramka MoE** z biasem, `sqrtsoftplus` i routingiem haszowanym.
 5. **Hash-conditioning** z Sinkhornem.
 6. **MTP.**
-7. **Natywny FP8 z kafelkową skalą** — zdejmuje przekwantyzowanie do Q8_0.
+7. **Typ wagi FP8 ze skalą wierszową** — konwersja jest gotowa i zmierzona,
+   brakuje wariantu `DevWeight` z osobnym buforem skal i wpięcia go w dyspozytor
+   GEMV. Powstanie razem z mikserem, który jako pierwszy tych wag potrzebuje.
 
 Każdy z tych punktów da się zwalidować numerycznie przeciwko `inference/model.py`
 osobno, i tak trzeba je robić — model, który nie mieści się w VRAM i nie ma

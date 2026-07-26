@@ -113,17 +113,21 @@ fn rejects_degenerate_global_scale() {
     }
 }
 
-/// Wagi nieekspertowe idą z FP8 na Q8_0, żeby zmieścić się na karcie: f16
-/// urósłby je z 8,2 do 13,7 GiB. To przekwantyzowanie, więc test MIERZY jego
-/// koszt zamiast go zakładać — i pilnuje, żeby nie urósł niepostrzeżenie.
+/// Wagi nieekspertowe przechodzą z kafelkowej skali E8M0 na skalę na wiersz,
+/// bo FORGE ma kernel FP8 tylko w tym drugim wariancie. Test mierzy, ile ta
+/// zmiana kosztuje na wyjściu projekcji — czyli na tym, co widzi model.
+///
+/// Mierzona jest też odrzucona alternatywa: przekwantyzowanie na Q8_0 mieściło
+/// się w tym samym bajcie na wagę, ale kosztowało 5,4e-3, bo int8 z jedną skalą
+/// na 32 elementy zeruje wartości dużo mniejsze od maksimum grupy. Materializacja
+/// do f16 nie kosztuje dokładności, ale urosłaby te wagi z 8,2 do 13,7 GiB przy
+/// karcie mającej 16 GiB.
 #[test]
-fn fp8_to_q8_0_error_stays_bounded_on_real_weights() {
+fn fp8_row_scaling_barely_changes_the_projection() {
     let Some(st) = checkpoint() else {
         eprintln!("pomijam: brak checkpointu DeepSeek V4 (FORGE_DEEPSEEK_V4_DIR)");
         return;
     };
-    // Cztery różne kształty i role: zejście i wyjście LoRA Q, wspólne KV,
-    // bramka eksperta dzielonego.
     for name in [
         "layers.2.attn.wq_a.weight",
         "layers.2.attn.wq_b.weight",
@@ -137,45 +141,53 @@ fn fp8_to_q8_0_error_stays_bounded_on_real_weights() {
         let scale_info = st.tensor(&scale_name).expect(&scale_name);
         let scales = st.data(&scale_name).unwrap();
         let tile = cols / scale_info.shape[1];
-        assert_eq!(
-            rows / scale_info.shape[0],
-            tile,
-            "{name}: kafel skali nie jest kwadratowy"
-        );
-
-        let q8 = forge_formats::nvfp4::deepseek_fp8_to_q8_0(weight, scales, rows, cols, tile)
-            .expect(name);
-        let decoded = forge_formats::dequant::dequantize_to_f32(
-            DType::U8,
-            QuantKind::Q8_0,
-            &q8,
-            rows * cols,
-        )
-        .unwrap();
-
         let scale_cols = scale_info.shape[1];
-        let mut sum_sq_err = 0f64;
-        let mut sum_sq_ref = 0f64;
-        let mut max_rel = 0f32;
+        assert_eq!(rows / scale_info.shape[0], tile, "{name}: kafel nie jest kwadratowy");
+
+        let (bytes, row_scales) =
+            forge_formats::nvfp4::deepseek_fp8_to_row_scaled(weight, scales, rows, cols, tile)
+                .expect(name);
+        assert_eq!(bytes.len(), rows * cols, "{name}: nadal jeden bajt na wagę");
+        assert_eq!(row_scales.len(), rows);
+
+        // Aktywacja o rozkładzie zbliżonym do wyjścia normy RMS: zerowa średnia,
+        // jednostkowa skala, deterministyczna.
+        let x: Vec<f32> = (0..cols)
+            .map(|i| (((i * 2654435761usize) % 2003) as f32 / 1001.5) - 1.0)
+            .collect();
+
+        let mut num = 0f64;
+        let mut den = 0f64;
         for row in 0..rows {
+            let mut exact = 0f64;
+            let mut got = 0f64;
             for col in 0..cols {
-                let scale =
-                    forge_formats::nvfp4::f8e8m0_to_f32(scales[(row / tile) * scale_cols + col / tile])
-                        .unwrap();
-                let want = f8e4m3_to_f32(weight[row * cols + col]) * scale;
-                let got = decoded[row * cols + col];
-                sum_sq_err += ((got - want) as f64).powi(2);
-                sum_sq_ref += (want as f64).powi(2);
-                if want != 0.0 {
-                    max_rel = max_rel.max(((got - want) / want).abs());
-                }
+                let scale = forge_formats::nvfp4::f8e8m0_to_f32(
+                    scales[(row / tile) * scale_cols + col / tile],
+                )
+                .unwrap();
+                exact += (f8e4m3_to_f32(weight[row * cols + col]) * scale * x[col]) as f64;
+                got += (f8e4m3_to_f32(bytes[row * cols + col]) * row_scales[row] * x[col]) as f64;
             }
+            num += (got - exact).powi(2);
+            den += exact.powi(2);
         }
-        let rel_l2 = (sum_sq_err / sum_sq_ref.max(f64::MIN_POSITIVE)).sqrt();
-        eprintln!("{name}: względne L2 = {rel_l2:.3e}, maks. względny = {max_rel:.3e}");
+        let rel = (num / den.max(f64::MIN_POSITIVE)).sqrt();
+        eprintln!("{name}: wzgledny blad wyjscia projekcji = {rel:.3e}");
         assert!(
-            rel_l2 < 1e-2,
-            "{name}: przekwantyzowanie FP8 -> Q8_0 zgubiło za dużo (L2 {rel_l2:.3e})"
+            rel < 1e-5,
+            "{name}: przeniesienie skali na wiersz zmienia wyjscie o {rel:.3e}"
         );
     }
+}
+
+/// Skala kafla równa NaN oznacza uszkodzony checkpoint.
+#[test]
+fn row_scaling_rejects_nan_tile_scale() {
+    let weight = vec![0x38u8; 64];
+    let mut scales = vec![127u8; 2];
+    scales[1] = 0xFF;
+    assert!(
+        forge_formats::nvfp4::deepseek_fp8_to_row_scaled(&weight, &scales, 1, 64, 32).is_err()
+    );
 }

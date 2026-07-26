@@ -381,39 +381,30 @@ pub fn f8e8m0_to_f32(byte: u8) -> Option<f32> {
     Some(2f32.powi(byte as i32 - 127))
 }
 
-/// Przelicza wagę FP8 DeepSeeka (E4M3 z kafelkowaną skalą E8M0) na Q8_0.
+/// Przenosi wagę FP8 DeepSeeka z kafelkowej skali E8M0 na skalę NA WIERSZ,
+/// wtapiając różnicę wykładników w same bajty E4M3.
 ///
-/// Powód jest pojemnościowy, nie estetyczny: materializacja tych wag do f16 —
-/// czyli to, co robi dotychczasowa ścieżka FP8 — urosłaby dla tego modelu z
-/// 8,2 GiB do 13,7 GiB, przy karcie mającej 16 GiB i 148 GiB ekspertów do
-/// zmieszczenia obok. Q8_0 zajmuje 1,0625 bajta na wagę i wchodzi we WSZYSTKIE
-/// istniejące kernele bez pisania choćby jednego nowego.
+/// Motyw: FORGE ma kernel FP8 ze skalą na wiersz, a nie ma z kafelkową. Skala
+/// E8M0 jest czystą potęgą dwójki, więc przesunięcie wagi o `2^-k` zmienia
+/// wyłącznie pole wykładnika — bez straty, dopóki nie zejdzie poniżej zakresu
+/// normalnego. Normalizujemy do MAKSIMUM wiersza, więc przesunięcia idą zawsze
+/// w dół i nic nie przepełnia się w górę.
 ///
-/// To jest przekwantyzowanie, więc kosztuje dokładność — ile dokładnie, mierzy
-/// test na prawdziwych tensorach. Natywny kernel FP8 z kafelkową skalą zdejmie
-/// ten koszt później, nie zmieniając niczego powyżej.
+/// Zmierzone na tym checkpoincie: rozrzut skal w obrębie wiersza wynosi
+/// najwyżej jedną potęgę dwójki, więc przesunięcie dotyka najwyżej jednego bitu
+/// wykładnika. Wartości najmniejsze schodzą przy tym do zakresu subnormalnego i
+/// tracą bit mantysy — to jedyna strata tej ścieżki i jest mierzona w teście.
 ///
-/// `scales` ma kształt `[rows/tile, cols/tile]`; grupa Q8_0 (32 elementy) mieści
-/// się w całości wewnątrz kafla, więc skala w obrębie grupy jest stała.
-pub fn deepseek_fp8_to_q8_0(
+/// Zwraca bajty E4M3 wiersz-major oraz jedną skalę f32 na wiersz.
+pub fn deepseek_fp8_to_row_scaled(
     weight: &[u8],
     scales: &[u8],
     rows: usize,
     cols: usize,
     tile: usize,
-) -> Result<Vec<u8>> {
-    const GROUP: usize = 32;
-    const BLOCK_BYTES: usize = 34;
-
-    if tile == 0 || !tile.is_multiple_of(GROUP) {
-        return Err(fmt_err(format!(
-            "fp8: kafel skali {tile} musi być wielokrotnością {GROUP}"
-        )));
-    }
-    if !cols.is_multiple_of(GROUP) {
-        return Err(fmt_err(format!(
-            "fp8: cols {cols} nie dzieli się na grupy Q8_0 po {GROUP}"
-        )));
+) -> Result<(Vec<u8>, Vec<f32>)> {
+    if tile == 0 {
+        return Err(fmt_err("fp8: kafel skali nie może być zerowy"));
     }
     if weight.len() != rows * cols {
         return Err(fmt_err(format!(
@@ -426,47 +417,60 @@ pub fn deepseek_fp8_to_q8_0(
     let scale_cols = cols.div_ceil(tile);
     if scales.len() != scale_rows * scale_cols {
         return Err(fmt_err(format!(
-            "fp8: skale mają {} bajtów, oczekiwano {scale_rows}x{scale_cols} dla kafla {tile}",
+            "fp8: skale mają {} bajtów, oczekiwano {scale_rows}x{scale_cols}",
             scales.len()
         )));
     }
 
-    let groups_per_row = cols / GROUP;
-    let mut out = vec![0u8; rows * groups_per_row * BLOCK_BYTES];
-    let mut values = [0f32; GROUP];
+    let mut out = vec![0u8; rows * cols];
+    let mut row_scales = vec![0f32; rows];
     for row in 0..rows {
-        for group in 0..groups_per_row {
-            let col0 = group * GROUP;
-            let scale_byte = scales[(row / tile) * scale_cols + col0 / tile];
-            let scale = f8e8m0_to_f32(scale_byte).ok_or_else(|| {
-                fmt_err(format!(
-                    "fp8: skala kafla [{}, {}] jest NaN",
-                    row / tile,
-                    col0 / tile
-                ))
-            })?;
-            let mut amax = 0f32;
-            for (i, slot) in values.iter_mut().enumerate() {
-                let v = f8e4m3_to_f32(weight[row * cols + col0 + i]) * scale;
-                if !v.is_finite() {
-                    return Err(fmt_err(format!(
-                        "fp8: waga [{row}, {}] nie jest skończona",
-                        col0 + i
-                    )));
-                }
-                *slot = v;
-                amax = amax.max(v.abs());
+        let tile_row = &scales[(row / tile) * scale_cols..(row / tile + 1) * scale_cols];
+        let mut max_code = 0u8;
+        for &code in tile_row {
+            if code == 0xFF {
+                return Err(fmt_err(format!("fp8: skala kafla w wierszu {row} jest NaN")));
             }
-            let d = amax / 127.0;
-            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
-            let block = &mut out[(row * groups_per_row + group) * BLOCK_BYTES..][..BLOCK_BYTES];
-            block[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
-            for (i, &v) in values.iter().enumerate() {
-                block[2 + i] = ((v * inv).round().clamp(-127.0, 127.0) as i8) as u8;
-            }
+            max_code = max_code.max(code);
+        }
+        row_scales[row] = 2f32.powi(max_code as i32 - 127);
+        for col in 0..cols {
+            let shift = max_code - tile_row[col / tile];
+            out[row * cols + col] = e4m3_shift_down(weight[row * cols + col], shift)?;
         }
     }
-    Ok(out)
+    Ok((out, row_scales))
+}
+
+/// Dzieli wartość E4M3 przez `2^shift`, z zaokrągleniem do najbliższej parzystej
+/// przy zejściu w zakres subnormalny.
+fn e4m3_shift_down(byte: u8, shift: u8) -> Result<u8> {
+    if shift == 0 {
+        return Ok(byte);
+    }
+    let sign = byte & 0x80;
+    let exponent = ((byte >> 3) & 0x0F) as i32;
+    let mantissa = (byte & 0x07) as i32;
+    if exponent == 0x0F && mantissa == 0x07 {
+        return Err(fmt_err("fp8: waga jest NaN"));
+    }
+    if exponent == 0 && mantissa == 0 {
+        return Ok(sign);
+    }
+    let shifted = exponent - shift as i32;
+    if shifted >= 1 {
+        return Ok(sign | ((shifted as u8) << 3) | mantissa as u8);
+    }
+    // Zejście poniżej zakresu normalnego: mantysa dostaje wiodącą jedynkę i
+    // jest przesuwana, z zaokrągleniem do najbliższej parzystej.
+    let significand = if exponent == 0 { mantissa } else { mantissa + 8 };
+    let drop = 1 - shifted;
+    if drop > 4 {
+        return Ok(sign);
+    }
+    let half = 1 << (drop - 1);
+    let rounded = (significand + half - i32::from(significand & (2 * half - 1) == half)) >> drop;
+    Ok(sign | rounded.min(7) as u8)
 }
 
 /// Nazwy trójki tensorów jednego eksperta NVFP4 w checkpoincie DeepSeek V4.
