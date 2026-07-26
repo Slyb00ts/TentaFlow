@@ -70,3 +70,51 @@ def deinterleave_gate_f16(
         base = h * 2 * head_dim + d
         qc[i] = q_full[base]
         gatec[i] = q_full[base + head_dim]
+
+
+def scale_f16(
+    buf: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+    factor: Float32,
+):
+    """buf *= factor w miejscu, nad n elementami f16.
+
+    Potrzebne rodzinie Gemma, która mnoży embedding wejściowy przez
+    `sqrt(hidden)`. Sama norma RMS tego nie widzi (jest niezmiennicza na skalę),
+    ale strumień rezydualny już tak — dlatego to nie jest operacja pusta.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        buf[i] = Float16(Float32(buf[i]) * factor)
+
+
+def scale_dev_f16(
+    buf: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+    factor: UnsafePointer[Float32, MutAnyOrigin],
+):
+    """buf *= factor[0], gdzie mnożnik leży na urządzeniu.
+
+    `layer_output_scale` w Gemmie 4 jest tensorem [1] wczytanym z modelu, więc
+    nie da się go podać jako stałej hosta bez odczytu z powrotem.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        buf[i] = Float16(Float32(buf[i]) * factor[0])
+
+
+def softcap_f32(
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+    cap: Float32,
+):
+    """logits = cap * tanh(logits / cap) w miejscu.
+
+    Ograniczenie logitów rodziny Gemma, stosowane po `output_norm`, a przed
+    samplingiem.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        x = Float32(logits[i]) / cap
+        e = exp(2.0 * x)
+        logits[i] = cap * ((e - 1.0) / (e + 1.0))

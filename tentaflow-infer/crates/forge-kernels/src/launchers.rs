@@ -2062,6 +2062,49 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// buf *= factor w miejscu (skalowanie embeddingu w rodzinie Gemma).
+    pub fn scale_f16(
+        &self,
+        buf: &DevBuffer,
+        n: usize,
+        factor: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("scale_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(buf).scalar(n as i64).scalar(factor);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// buf *= factor[0], gdzie mnożnik leży na urządzeniu
+    /// (`layer_output_scale` jest tensorem modelu, nie stałą hosta).
+    pub fn scale_dev_f16(
+        &self,
+        buf: &DevBuffer,
+        n: usize,
+        factor: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("scale_dev_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(buf).scalar(n as i64).buf(factor);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// logits = cap * tanh(logits / cap) w miejscu (ograniczenie logitów Gemmy).
+    pub fn softcap_f32(
+        &self,
+        logits: &DevBuffer,
+        n: usize,
+        cap: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("softcap_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(logits).scalar(n as i64).scalar(cap);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// out = a * sigmoid(gate) over n f16 elements (attention output gate).
     pub fn sigmoid_mul_f16(
         &self,

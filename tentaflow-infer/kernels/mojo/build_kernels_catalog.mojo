@@ -17,7 +17,7 @@ from src.norm import (
     rmsnorm_fp8,
     rmsnorm_residual_fp8,
 )
-from src.activation import silu_mul_f16, gelu_mul_f16, sigmoid_mul_f16, deinterleave_gate_f16
+from src.activation import silu_mul_f16, gelu_mul_f16, scale_f16, scale_dev_f16, softcap_f32, sigmoid_mul_f16, deinterleave_gate_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import (
@@ -763,6 +763,12 @@ def main() raises:
     entries.append(_finalize(out_dir, "silu_mul_f16"))
     _ = ctx.compile_function[gelu_mul_f16, dump_asm=Path("gelu_mul_f16.ptx")]()
     entries.append(_finalize(out_dir, "gelu_mul_f16"))
+    _ = ctx.compile_function[scale_f16, dump_asm=Path("scale_f16.ptx")]()
+    entries.append(_finalize(out_dir, "scale_f16"))
+    _ = ctx.compile_function[scale_dev_f16, dump_asm=Path("scale_dev_f16.ptx")]()
+    entries.append(_finalize(out_dir, "scale_dev_f16"))
+    _ = ctx.compile_function[softcap_f32, dump_asm=Path("softcap_f32.ptx")]()
+    entries.append(_finalize(out_dir, "softcap_f32"))
 
     _ = ctx.compile_function[
         sigmoid_mul_f16, dump_asm=Path("sigmoid_mul_f16.ptx")

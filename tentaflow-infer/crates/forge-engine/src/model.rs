@@ -5488,6 +5488,12 @@ impl Model {
             hidden,
             stream,
         )?;
+        // Rodzina Gemma mnoży embedding przez sqrt(hidden). Norma RMS jest na
+        // to niewrażliwa, ale strumień rezydualny już nie — bez tego wyjście
+        // jest ciche.
+        if let Some(factor) = p.embd_scale {
+            kernels.scale_f16(&pb.h, rows * hidden, factor, stream)?;
+        }
         // Layer 0's attn-norm feeds the q/k/v projections.
         if fp8mod_fuse {
             kernels.rmsnorm_fp8_shared(
@@ -11876,6 +11882,10 @@ impl Model {
                 hidden,
                 stream,
             )?;
+            // Skalowanie embeddingu (rodzina Gemma) — jak w prefillu.
+            if let Some(factor) = p.embd_scale {
+                kernels.scale_f16(&b.h, hidden, factor, stream)?;
+            }
             kernels.rmsnorm_f16(
                 &b.x,
                 &b.h,
