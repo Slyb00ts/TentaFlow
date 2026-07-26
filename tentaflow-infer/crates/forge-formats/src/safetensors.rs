@@ -23,6 +23,7 @@ fn dtype_from_st(s: &str) -> Result<DType> {
         "BF16" => DType::BF16,
         "F8_E4M3" => DType::F8E4M3,
         "F8_E5M2" => DType::F8E5M2,
+        "F8_E8M0" => DType::F8E8M0,
         "I8" => DType::I8,
         "U8" => DType::U8,
         "I32" => DType::I32,

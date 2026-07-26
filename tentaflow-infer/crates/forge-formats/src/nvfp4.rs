@@ -142,7 +142,7 @@ fn round_ties_even(x: f32) -> f32 {
     }
 }
 
-fn e2m1_to_f32(nibble: u8) -> f32 {
+pub fn e2m1_to_f32(nibble: u8) -> f32 {
     let mag = E2M1_LUT[(nibble & 0x07) as usize];
     if nibble & 0x08 != 0 {
         -mag
@@ -282,9 +282,284 @@ pub fn dequantize_nvfp4(
     Ok(out)
 }
 
+/// Przepakowuje NVFP4 compressed-tensors do jednobuforowego układu GGUF
+/// (36 bajtów na 64 elementy: cztery skale UE4M3, potem 32 bajty par E2M1).
+///
+/// Sens jest jeden: rezydencja ekspertów wymaga wagi o JEDNYM buforze bajtów,
+/// a układ źródłowy trzyma pakiety i skale osobno. Po przepakowaniu ekspert
+/// jest samodzielnym blokiem, który da się położyć w VRAM, w pamięci hosta albo
+/// na dysku niezależnie od sąsiadów — i przy okazji wchodzi we wszystkie
+/// istniejące kernele NVFP4 bez zmian.
+///
+/// Operacja jest czystym przestawieniem bajtów: te same skale E4M3 i te same
+/// nibble E2M1, tylko w innej kolejności. Zmienia się wyłącznie parowanie
+/// nibbli — źródło trzyma elementy `2i` i `2i+1` w jednym bajcie, układ GGUF
+/// elementy `i` oraz `i+8` w obrębie szesnastki.
+///
+/// Skala globalna NIE jest tu zaszywana: wędruje osobno jako `output_scale`,
+/// przez który kernel mnoży wynik.
+///
+/// * `packed`: `rows * cols/2` bajtów, niski nibble = element parzysty
+/// * `scales`: `rows * cols/16` bajtów E4M3, po jednej skali na 16 elementów
+pub fn nvfp4_ct_to_gguf_blocks(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u8>> {
+    const GROUP: usize = 16;
+    const BLOCK_ELEMS: usize = 64;
+    const BLOCK_BYTES: usize = 36;
+
+    if !cols.is_multiple_of(BLOCK_ELEMS) {
+        return Err(fmt_err(format!(
+            "nvfp4: przepakowanie do GGUF wymaga cols wielokrotności {BLOCK_ELEMS}, jest {cols}"
+        )));
+    }
+    let row_bytes = cols / 2;
+    let row_groups = cols / GROUP;
+    let expect_packed = rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| fmt_err("nvfp4: przepełnienie rozmiaru"))?;
+    let expect_scales = rows
+        .checked_mul(row_groups)
+        .ok_or_else(|| fmt_err("nvfp4: przepełnienie rozmiaru"))?;
+    if packed.len() != expect_packed {
+        return Err(fmt_err(format!(
+            "nvfp4: pakiet ma {} bajtów, oczekiwano {expect_packed} dla [{rows}, {cols}]",
+            packed.len()
+        )));
+    }
+    if scales.len() != expect_scales {
+        return Err(fmt_err(format!(
+            "nvfp4: skale mają {} bajtów, oczekiwano {expect_scales} dla [{rows}, {cols}]",
+            scales.len()
+        )));
+    }
+    // Dwa kody skali, których układ GGUF nie oddaje wiernie, a które przeszłyby
+    // cicho: bit znaku (skale są tam bez znaku, więc szesnastka wag zmieniłaby
+    // znak) oraz 0x7F, czyli NaN w E4M3, mapowany tam na zero — co wyzerowałoby
+    // całą szesnastkę zamiast zasygnalizować uszkodzony checkpoint.
+    if let Some(bad) = scales
+        .iter()
+        .position(|scale| scale & 0x80 != 0 || *scale == 0x7F)
+    {
+        return Err(fmt_err(format!(
+            "nvfp4: skala bloku {bad} (0x{:02X}) nie ma wiernego odpowiednika w układzie GGUF",
+            scales[bad]
+        )));
+    }
+
+    let blocks_per_row = cols / BLOCK_ELEMS;
+    let mut out = vec![0u8; rows * blocks_per_row * BLOCK_BYTES];
+    for row in 0..rows {
+        let src_packed = &packed[row * row_bytes..(row + 1) * row_bytes];
+        let src_scales = &scales[row * row_groups..(row + 1) * row_groups];
+        for block in 0..blocks_per_row {
+            let dst = &mut out[(row * blocks_per_row + block) * BLOCK_BYTES..][..BLOCK_BYTES];
+            for sub in 0..4 {
+                dst[sub] = src_scales[block * 4 + sub];
+                for i in 0..8 {
+                    // Element o indeksie lokalnym `i` i `i + 8` w szesnastce.
+                    let base = block * BLOCK_ELEMS + sub * GROUP;
+                    let lo = nibble(src_packed, base + i);
+                    let hi = nibble(src_packed, base + i + 8);
+                    dst[4 + sub * 8 + i] = lo | (hi << 4);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Nazwy trójki tensorów jednego eksperta NVFP4 w checkpoincie DeepSeek V4.
+///
+/// Układ różni się od compressed-tensors dwiema rzeczami, z których druga jest
+/// pułapką: waga nazywa się `weight` (nie `weight_packed`), a skala globalna
+/// `weight_scale_2` MNOŻY wynik, podczas gdy `weight_global_scale`
+/// compressed-tensors przez wynik DZIELI. Podstawienie jednego pod drugie nie
+/// wywala się — daje wagi rzędu 10^6 zamiast 10^-2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepseekNvFp4Names {
+    pub packed: String,
+    pub scale: String,
+    pub global_scale: String,
+}
+
+impl DeepseekNvFp4Names {
+    pub fn for_weight(weight_name: &str) -> Result<Self> {
+        let base = weight_name.strip_suffix(".weight").ok_or_else(|| {
+            fmt_err(format!(
+                "nvfp4: '{weight_name}' nie jest nazwą tensora '.weight'"
+            ))
+        })?;
+        Ok(Self {
+            packed: weight_name.to_string(),
+            scale: format!("{base}.weight_scale"),
+            global_scale: format!("{base}.weight_scale_2"),
+        })
+    }
+}
+
+/// Jeden ekspert NVFP4 DeepSeeka przepakowany do jednobuforowego układu GGUF.
+///
+/// `output_scale` to `weight_scale_2` przeniesione bez zmian — kernele NVFP4
+/// mnożą przez nie wynik GEMV, więc konwencja się zgadza.
+pub struct DeepseekNvFp4Weight {
+    pub blocks: Vec<u8>,
+    pub output_scale: f32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Przepakowuje eksperta DeepSeeka: `[rows, cols/2]` bajtów pakietu, skale
+/// E4M3 co 16 elementów i skalarną skalę globalną.
+pub fn deepseek_expert_to_gguf(
+    packed: &[u8],
+    packed_shape: &[usize],
+    scales: &[u8],
+    global_scale: f32,
+) -> Result<DeepseekNvFp4Weight> {
+    if packed_shape.len() != 2 {
+        return Err(fmt_err(format!(
+            "nvfp4: ekspert DeepSeeka ma kształt {packed_shape:?}, oczekiwano dwóch wymiarów"
+        )));
+    }
+    if !global_scale.is_finite() || global_scale <= 0.0 {
+        return Err(fmt_err(format!(
+            "nvfp4: weight_scale_2 = {global_scale} nie jest dodatnią liczbą skończoną"
+        )));
+    }
+    let rows = packed_shape[0];
+    let cols = packed_shape[1] * 2;
+    let blocks = nvfp4_ct_to_gguf_blocks(packed, scales, rows, cols)?;
+    Ok(DeepseekNvFp4Weight {
+        blocks,
+        output_scale: global_scale,
+        rows,
+        cols,
+    })
+}
+
+/// Nibble elementu `index` w wierszu spakowanym po dwa na bajt.
+fn nibble(packed_row: &[u8], index: usize) -> u8 {
+    let byte = packed_row[index / 2];
+    if index % 2 == 0 {
+        byte & 0x0F
+    } else {
+        byte >> 4
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Przepakowanie musi być przestawieniem bajtów, nie przybliżeniem: te same
+    /// wartości, tylko w układzie jednobuforowym. Porównanie idzie przez
+    /// dekwantyzację obu układów i wymaga zgodności CO DO BITU.
+    #[test]
+    fn gguf_repack_dequantizes_identically() {
+        let (rows, cols) = (5usize, 128usize);
+        let packed: Vec<u8> = (0..rows * cols / 2)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
+        // Skale dodatnie E4M3 (bit znaku zerowany).
+        // Kody skali bez znaku i bez NaN (0x7F).
+        let scales: Vec<u8> = (0..rows * cols / 16)
+            .map(|i| (((i * 53 + 7) % 127) as u8).max(1))
+            .collect();
+
+        let repacked = nvfp4_ct_to_gguf_blocks(&packed, &scales, rows, cols).unwrap();
+        assert_eq!(repacked.len(), rows * (cols / 64) * 36);
+        let from_gguf = crate::dequant::dequantize_to_f32(
+            forge_types::DType::U8,
+            forge_types::QuantKind::NVFP4Gguf,
+            &repacked,
+            rows * cols,
+        )
+        .unwrap();
+
+        // Referencja układu źródłowego: skala bloku razy wartość E2M1, bez
+        // skali globalnej (ta wędruje osobno).
+        let mut reference = vec![0f32; rows * cols];
+        for row in 0..rows {
+            for col in 0..cols {
+                let byte = packed[row * cols / 2 + col / 2];
+                let code = if col % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                let scale = f8e4m3_to_f32(scales[row * cols / 16 + col / 16]);
+                reference[row * cols + col] = e2m1_to_f32(code) * scale;
+            }
+        }
+        assert_eq!(from_gguf, reference, "przepakowanie zmieniło wartości");
+    }
+
+    /// Skala ujemna i NaN nie mają wiernej reprezentacji w układzie GGUF —
+    /// muszą być błędem, a nie cicho obciętym bitem znaku ani cichym zerem.
+    #[test]
+    fn gguf_repack_rejects_unrepresentable_scales() {
+        let (rows, cols) = (1usize, 64usize);
+        let packed = vec![0u8; cols / 2];
+        for bad in [0x80 | 0x30, 0x7F] {
+            let mut scales = vec![1u8; cols / 16];
+            scales[2] = bad;
+            assert!(
+                nvfp4_ct_to_gguf_blocks(&packed, &scales, rows, cols).is_err(),
+                "skala 0x{bad:02X} powinna zostać odrzucona"
+            );
+        }
+    }
+
+    /// Dowód, że przepakowanie zachowuje WARTOŚCI, a nie tylko układ bajtów:
+    /// oba dekodery muszą dać to samo dla każdej pary (kod skali, kod E2M1).
+    /// Układy różnią się wewnętrznie — GGUF trzyma skalę jako UE4M3 połówkowe —
+    /// więc zgodność wyniku jest własnością złożenia, nie oczywistością.
+    #[test]
+    fn gguf_repack_preserves_every_scale_and_value_code() {
+        for scale_code in 1u8..0x7F {
+            let cols = 64usize;
+            // Jeden wiersz, wszystkie 16 kodów E2M1 po kolei.
+            let packed: Vec<u8> = (0..cols / 2)
+                .map(|i| {
+                    let lo = (2 * i % 16) as u8;
+                    let hi = ((2 * i + 1) % 16) as u8;
+                    lo | (hi << 4)
+                })
+                .collect();
+            let scales = vec![scale_code; cols / 16];
+            let repacked = nvfp4_ct_to_gguf_blocks(&packed, &scales, 1, cols).unwrap();
+            let got = forge_types_dequant(&repacked, cols);
+            for col in 0..cols {
+                let code = if col % 2 == 0 {
+                    packed[col / 2] & 0x0F
+                } else {
+                    packed[col / 2] >> 4
+                };
+                let want = e2m1_to_f32(code) * f8e4m3_to_f32(scale_code);
+                assert_eq!(
+                    got[col], want,
+                    "kod skali 0x{scale_code:02X}, element {col}, kod E2M1 {code}"
+                );
+            }
+        }
+    }
+
+    fn forge_types_dequant(blocks: &[u8], numel: usize) -> Vec<f32> {
+        crate::dequant::dequantize_to_f32(
+            forge_types::DType::U8,
+            forge_types::QuantKind::NVFP4Gguf,
+            blocks,
+            numel,
+        )
+        .unwrap()
+    }
+
+    /// Układ GGUF ma bloki po 64 elementy; wiersz niebędący ich wielokrotnością
+    /// nie da się zapisać bez dopełnienia zmieniającego kształt.
+    #[test]
+    fn gguf_repack_requires_full_blocks() {
+        assert!(nvfp4_ct_to_gguf_blocks(&vec![0u8; 24], &vec![1u8; 3], 1, 48).is_err());
+    }
 
     #[test]
     fn fp8_e4m3_decode() {
