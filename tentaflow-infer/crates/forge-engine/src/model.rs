@@ -26,6 +26,7 @@ use crate::kv::{HybridStateLease, KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv}
 use crate::mtp::{MtpDraftState, MtpEmbedding};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
+use crate::weight_tier::{TieredWeightDevice, WeightResidency};
 use crate::weights::{
     AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Layer, Fp8Weight, GateUpWeights,
     LayerFfn, LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy, NvFp4CtStorage, QkvWeights,
@@ -948,6 +949,11 @@ impl PrefillTrace {
 }
 
 pub struct ModelConfig {
+    /// Budżet pamięci hosta (bajty) na wagi, które nie zmieszczą się w VRAM.
+    /// GPU czyta je wprost przez PCIe, więc model większy od karty daje się
+    /// uruchomić kosztem pasma. 0 wyłącza strumieniowanie: brak miejsca w VRAM
+    /// jest wtedy błędem, jak przed wprowadzeniem tieringu.
+    pub weight_host_budget: usize,
     pub kv_page_size: usize,
     pub kv_pages: usize,
     pub max_seq_len: usize,
@@ -976,6 +982,7 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            weight_host_budget: 0,
             kv_page_size: 32,
             kv_pages: 512,
             max_seq_len: 8192,
@@ -2407,6 +2414,22 @@ impl Model {
             .expect("cache KV jest dostępny wyłącznie dla warstwy attention")
     }
 
+    /// Wypisuje, ile wag zostało w VRAM, a ile jest czytane z pamięci hosta
+    /// przez PCIe — bez tego łatwo nie zauważyć, że model cicho zszedł na
+    /// wolniejszą ścieżkę.
+    fn report_residency(res: WeightResidency) {
+        if res.host_bytes == 0 {
+            return;
+        }
+        let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        tracing::warn!(
+            vram_gib = format!("{:.2}", gib(res.vram_bytes)),
+            host_gib = format!("{:.2}", gib(res.host_bytes)),
+            host_pct = format!("{:.1}", res.host_fraction() * 100.0),
+            "część wag nie zmieściła się w VRAM i jest czytana z pamięci hosta przez PCIe"
+        );
+    }
+
     pub fn load_gguf(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Result<Self> {
         let kernels = Kernels::load(device.clone())?;
         let stream = device.create_stream()?;
@@ -2416,10 +2439,14 @@ impl Model {
         )?;
         let repacked_weights = Cell::new(0);
         let tile_context = target_tile.then_some((&kernels, &stream, &repacked_weights));
-        let mut weights = ModelWeights::load_gguf(&device, path, cfg.native_mtp, tile_context)?;
+        let sink: Arc<TieredWeightDevice> =
+            Arc::new(TieredWeightDevice::new(device.clone(), cfg.weight_host_budget));
+        let sink_dev: Arc<dyn Device> = sink.clone();
+        let mut weights = ModelWeights::load_gguf(&sink_dev, path, cfg.native_mtp, tile_context)?;
+        Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
         weights.nvfp4_repacked_weights = repacked_weights.get();
-        Self::finish(device, weights, cfg, kernels, stream)
+        Self::finish(sink_dev, weights, cfg, kernels, stream)
     }
 
     pub fn load_safetensors_dir(
@@ -2435,17 +2462,21 @@ impl Model {
         )?;
         let repacked_weights = Cell::new(0);
         let tile_context = target_tile.then_some((&kernels, &stream, &repacked_weights));
+        let sink: Arc<TieredWeightDevice> =
+            Arc::new(TieredWeightDevice::new(device.clone(), cfg.weight_host_budget));
+        let sink_dev: Arc<dyn Device> = sink.clone();
         let mut weights =
             ModelWeights::load_safetensors_dir(
-                &device,
+                &sink_dev,
                 dir,
                 cfg.native_mtp,
                 tile_context,
                 (&kernels, &stream, cfg.nvfp4_ct_layout),
             )?;
+        Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
         weights.nvfp4_repacked_weights = repacked_weights.get();
-        Self::finish(device, weights, cfg, kernels, stream)
+        Self::finish(sink_dev, weights, cfg, kernels, stream)
     }
 
     pub fn nvfp4_gguf_layout_summary(&self) -> (Nvfp4GgufLayout, usize) {

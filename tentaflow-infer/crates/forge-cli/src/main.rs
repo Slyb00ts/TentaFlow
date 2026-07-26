@@ -96,6 +96,11 @@ enum Command {
         /// which also leaves room for the auto fp8 prefill packs).
         #[arg(long, default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
         /// Tool-call output parser: hermes | llama3 | none (default: auto-detect).
         #[arg(long)]
         tool_call_parser: Option<String>,
@@ -171,6 +176,11 @@ enum Command {
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
     },
     /// One-shot generation streamed to stdout.
     Run {
@@ -188,6 +198,11 @@ enum Command {
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -281,6 +296,11 @@ enum Command {
         /// Rozmiar puli wag w GiB; 0 dobiera pulę z aktualnie wolnego VRAM.
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -372,6 +392,7 @@ fn main() -> Result<()> {
             prefill_chunk,
             kv_pages,
             weights_pool_gb,
+            weight_host_gb,
             tool_call_parser,
             whisper_model,
             embed_model,
@@ -406,6 +427,7 @@ fn main() -> Result<()> {
                 prefill_chunk,
                 kv_pages,
                 weights_pool_gb,
+                weight_host_gb,
                 tool_call_parser,
                 whisper_model.as_deref(),
                 embed_model.as_deref(),
@@ -423,12 +445,14 @@ fn main() -> Result<()> {
             pooling,
             dimensions,
             weights_pool_gb,
+            weight_host_gb,
         } => cmd_embed(
             &model_path,
             &text,
             pooling.as_deref(),
             dimensions,
             weights_pool_gb,
+            weight_host_gb,
         ),
         Command::Run {
             model_path,
@@ -437,6 +461,7 @@ fn main() -> Result<()> {
             temperature,
             chat,
             weights_pool_gb,
+            weight_host_gb,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -466,6 +491,7 @@ fn main() -> Result<()> {
                 temperature,
                 chat,
                 weights_pool_gb,
+                weight_host_gb,
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -492,6 +518,7 @@ fn main() -> Result<()> {
             prompt_tokens,
             prompt_token_ids,
             weights_pool_gb,
+            weight_host_gb,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -521,6 +548,7 @@ fn main() -> Result<()> {
                 prompt_tokens,
                 prompt_token_ids.as_deref(),
                 weights_pool_gb,
+                weight_host_gb,
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -885,6 +913,7 @@ fn load_for_serve(
     path: &Path,
     kv_pages: usize,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -947,6 +976,7 @@ fn load_for_serve(
     )
     .context("open GPU device")?;
     let cfg = ModelConfig {
+        weight_host_budget: (weight_host_gb * (1u64 << 30) as f64) as usize,
         kv_page_size,
         kv_pages,
         kv_quant,
@@ -984,6 +1014,7 @@ fn resolve_ctx(
 fn load_auto(
     path: &Path,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1045,6 +1076,7 @@ fn load_auto(
         dev,
         path,
         ModelConfig {
+        weight_host_budget: (weight_host_gb * (1u64 << 30) as f64) as usize,
             kv_quant,
             kv_tier,
             kv_page_size: page_size,
@@ -1135,11 +1167,13 @@ fn cmd_embed(
     pooling_override: Option<&str>,
     dimensions: Option<usize>,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
 ) -> Result<()> {
     let t0 = Instant::now();
     let loaded = load_auto(
         model_path,
         weights_pool_gb,
+        weight_host_gb,
         KvQuant::F16,
         KvTierConfig::default(),
         8192,
@@ -1295,6 +1329,7 @@ fn cmd_serve(
     prefill_chunk: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
     tool_call_parser: Option<String>,
     whisper_model: Option<&Path>,
     embed_model: Option<&Path>,
@@ -1319,6 +1354,7 @@ fn cmd_serve(
         model_path,
         kv_pages,
         weights_pool_gb,
+        weight_host_gb,
         kv_quant,
         kv_tier,
         ctx,
@@ -1536,6 +1572,7 @@ fn cmd_run(
     temperature: f32,
     chat: bool,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1551,6 +1588,7 @@ fn cmd_run(
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
+        weight_host_gb,
         kv_quant,
         kv_tier,
         ctx,
@@ -1663,6 +1701,7 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
     let t0 = Instant::now();
     let mut loaded = load_auto(
         model_path,
+        0.0,
         0.0,
         KvQuant::F16,
         KvTierConfig::default(),
@@ -1843,6 +1882,7 @@ fn cmd_bench(
     prompt_tokens: usize,
     prompt_token_ids: Option<&Path>,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1866,6 +1906,7 @@ fn cmd_bench(
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
+        weight_host_gb,
         kv_quant,
         kv_tier,
         ctx,
