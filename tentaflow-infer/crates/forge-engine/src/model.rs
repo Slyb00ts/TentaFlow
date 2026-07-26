@@ -13132,6 +13132,10 @@ impl Model {
             self.device
                 .copy(&pb.x, ti * hidden * 2, &mb.xrow, 0, hidden * 2, stream)?;
             if !union_fits {
+                // Stronicowanie nadpisuje przypiętą pamięć slotu z hosta, a
+                // eksperci poprzednich tokenów mogą być jeszcze czytani przez
+                // kernele w locie — bez tej bariery byłby to wyścig o wagi.
+                stream.synchronize()?;
                 self.fault_in_experts(moe, layer, &ids[ti * k..(ti + 1) * k])?;
             }
             self.moe_experts_accumulate(
