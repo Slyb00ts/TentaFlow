@@ -80,10 +80,10 @@ async function loadTts(host) {
   // czytanym przez TTS zamieniane jest na `replacement`. Tekst odpowiedzi
   // (bąbel) NIE jest zmieniany — czyszczenie dotyczy wylacznie galezi TTS.
   const form = `
-    <div style="display:flex; gap: var(--space-2); flex-wrap: wrap; align-items: flex-end; padding: var(--space-4); border-bottom: 1px solid var(--border);">
+    <div class="tf-toolbar rules-add-row">
       <tf-input id="tts-pattern" label="${escapeHtml(I18n.t('rules.col_pattern'))}" placeholder="WWW"></tf-input>
       <tf-input id="tts-replacement" label="${escapeHtml(I18n.t('rules.col_replacement'))}" placeholder="w u w u"></tf-input>
-      <tf-input id="tts-priority" type="number" label="${escapeHtml(I18n.t('rules.col_priority'))}" value="100" style="max-width:120px;"></tf-input>
+      <tf-input id="tts-priority" type="number" label="${escapeHtml(I18n.t('rules.col_priority'))}" value="100" class="rules-priority"></tf-input>
       <tf-button id="tts-play" variant="secondary" icon="play" title="${escapeHtml(I18n.t('rules.play_title'))}"></tf-button>
       <tf-button id="tts-add" variant="primary" icon="plus">${escapeHtml(I18n.t('rules.add'))}</tf-button>
     </div>`;

@@ -1215,6 +1215,41 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
   background: var(--tf-bg-subtle);
 }
 .tf-table__expanded-region { padding: var(--tf-space-sm) var(--tf-space-md); }
+/* =============================================================================
+   .tf-toolbar — one-row filter/action bar shared by feature screens.
+   tf-select/tf-input default to width:100%, so without this every control
+   claims its own row ("everything stacked") — the bar pins them to content
+   width and lets only the searchbox grow.
+   ============================================================================= */
+.tf-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--tf-space-sm);
+}
+.tf-toolbar > tf-select,
+.tf-toolbar > tf-input,
+.tf-toolbar > tf-combobox,
+.tf-toolbar > tf-datepicker {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 160px;
+  /* auto width follows the longest option, and one long model name would push
+     the rest of the bar onto a second row. */
+  max-width: 230px;
+}
+.tf-toolbar > tf-searchbox {
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 340px;
+}
+.tf-toolbar > tf-button,
+.tf-toolbar > tf-segmented,
+.tf-toolbar > tf-toggle {
+  flex: 0 0 auto;
+}
+.tf-toolbar-spacer { flex: 1 1 auto; }
+
 .tf-table__select-all { margin-right: var(--tf-space-xs); vertical-align: middle; }
 /* Per-row checkbox shares the first data cell with its content. */
 td:has(> .tf-table__row-select) {

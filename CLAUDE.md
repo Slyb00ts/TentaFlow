@@ -827,7 +827,9 @@ specific rule for a specific task.
    sheet adopted into shadow roots, so markup injected into a `tf-table` cell can never use a
    feature stylesheet's classes. `tf-table selectable="multi"` renders a checkbox in the first
    cell of every row and emits `row-select`; a plain row click stays `row-click` (open), and
-   `tf-segmented` options take an `icon` attribute.
+   `tf-segmented` options take an `icon` attribute. Filter/action bars use the shared
+   `.tf-toolbar` class (+ `.tf-toolbar-spacer` to push actions right): `tf-select`/`tf-input`
+   default to `width:100%`, so a bar without it stacks every control on its own row.
 8. **Plural forms go through i18n, never string concatenation.** `{count|forma1|forma2|forma3}`
    in a translation picks the right form (Polish needs all three, other languages two), so
    "1 przypadków" cannot happen. Every `project_studio` key exists in all five locales — the
