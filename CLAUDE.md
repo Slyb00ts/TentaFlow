@@ -345,7 +345,15 @@ perf_trend/perf_compare/tester_activity.
 `ProjectStudioPayload` is at 248 variants, strictly append-only (ciborium tags by variant
 NAME — never rename or reorder; golden test `project_studio_wire_golden`) and close to the
 256-variant budget of the frame format, so F5+ additions belong in a NEW sub-enum. Core
-migrations still end at 118/119/120 — F2–F4 added none.
+migrations still end at 118/119/120 — F2–F4 added none. Struct FIELDS are append-only the
+same way: `TasksListRequest.severity` and `SettingsSaveRequest.modules` were added with
+`#[serde(default)]` so peers that omit them still decode.
+
+UI conventions that the mockups (`mockups/projekty-20260723/`) pin down and the screens
+follow: one toolbar row (searchbox + selects, primary action right-aligned via
+`.ps-toolbar-spacer`), a `.ps-table-footer` summary line under every list, two-line table
+cells (`tf-table__cell-title` + `tf-table__cell-sub` carrying the short id), and KPI rows
+built from full `tf-stat-card`s in `.ps-kpi-grid`.
 
 ## Compliance Core
 
@@ -815,7 +823,15 @@ specific rule for a specific task.
    every primitive — zero raw `<button>`/`<input>`/`<select>`, hand-rolled modals, tab strips.
    Missing a feature → **extend the component**, don't fork. A pattern repeated in 2+ feature
    modules → add a new `tf-*` component. (There IS a `tf-file-input` — use it instead of raw
-   `<input type="file">`.)
+   `<input type="file">`.) Component styling lives in `css/controls.css` — it is the ONLY
+   sheet adopted into shadow roots, so markup injected into a `tf-table` cell can never use a
+   feature stylesheet's classes. `tf-table selectable="multi"` renders a checkbox in the first
+   cell of every row and emits `row-select`; a plain row click stays `row-click` (open), and
+   `tf-segmented` options take an `icon` attribute.
+8. **Plural forms go through i18n, never string concatenation.** `{count|forma1|forma2|forma3}`
+   in a translation picks the right form (Polish needs all three, other languages two), so
+   "1 przypadków" cannot happen. Every `project_studio` key exists in all five locales — the
+   parity check is a plain key-count comparison across `www/i18n/*.json`.
 
 ## gstack & skill routing
 
