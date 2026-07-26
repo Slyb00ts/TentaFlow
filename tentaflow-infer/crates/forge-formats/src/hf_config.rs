@@ -23,6 +23,8 @@ pub struct HfConfig {
     /// Absent means hidden_size / num_attention_heads.
     #[serde(default)]
     pub head_dim: Option<usize>,
+    /// Modele czysto-MoE (DeepSeek V4) nie deklarują gęstego FFN.
+    #[serde(default)]
     pub intermediate_size: usize,
     pub vocab_size: usize,
     #[serde(default = "default_rope_theta")]
@@ -37,6 +39,58 @@ pub struct HfConfig {
     pub torch_dtype: Option<String>,
     #[serde(default)]
     pub quantization_config: Option<serde_json::Value>,
+
+    // --- Mixture-of-Experts (nazewnictwo DeepSeek) ---
+    #[serde(default)]
+    pub n_routed_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub n_shared_experts: Option<usize>,
+    #[serde(default)]
+    pub norm_topk_prob: bool,
+
+    // --- DeepSeek V4: uwaga latentna, kompresja KV, indekser, hash-conditioning ---
+    /// Ranga projekcji LoRA dla Q.
+    #[serde(default)]
+    pub q_lora_rank: Option<usize>,
+    /// Ranga projekcji LoRA dla wyjścia uwagi.
+    #[serde(default)]
+    pub o_lora_rank: Option<usize>,
+    /// Na ile grup dzielone jest wyjście uwagi przed projekcją LoRA.
+    #[serde(default)]
+    pub o_groups: Option<usize>,
+    /// Ile wymiarów głowicy obejmuje rope (reszta zostaje bez pozycji).
+    #[serde(default)]
+    pub qk_rope_head_dim: Option<usize>,
+    /// Stopień kompresji KV per warstwa; 0 oznacza warstwę bez kompresora.
+    #[serde(default)]
+    pub compress_ratios: Vec<usize>,
+    /// Baza rope dla skompresowanego strumienia KV.
+    #[serde(default)]
+    pub compress_rope_theta: Option<f32>,
+    /// Szerokość okna przesuwnego uwagi.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub index_n_heads: Option<usize>,
+    #[serde(default)]
+    pub index_head_dim: Option<usize>,
+    #[serde(default)]
+    pub index_topk: Option<usize>,
+    /// Ile warstw ma routing z tablicą token->ekspert zamiast wyuczonej bramki.
+    #[serde(default)]
+    pub num_hash_layers: usize,
+    #[serde(default)]
+    pub num_nextn_predict_layers: usize,
+    #[serde(default)]
+    pub scoring_func: Option<String>,
+    #[serde(default)]
+    pub routed_scaling_factor: Option<f32>,
+    #[serde(default)]
+    pub swiglu_limit: Option<f32>,
 }
 
 fn default_rope_theta() -> f32 {

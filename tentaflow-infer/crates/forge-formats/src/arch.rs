@@ -104,6 +104,59 @@ pub enum WeightRole {
     SsmNorm,
     /// DeltaNet output projection (`ssm_out`, [value_dim, hidden]).
     SsmOut,
+
+    // --- DeepSeek V4: uwaga latentna z projekcjami LoRA ---
+    /// Zejście LoRA dla Q: [hidden, q_lora_rank].
+    AttnQA,
+    /// Wyjście LoRA dla Q: [q_lora_rank, n_heads*head_dim].
+    AttnQB,
+    /// Wspólna projekcja KV jednej głowicy: [hidden, head_dim].
+    AttnKV,
+    /// Norma RMS na skompresowanym KV.
+    AttnKvNorm,
+    /// Zejście LoRA wyjścia uwagi, grupowane: [n_heads*head_dim/o_groups,
+    /// o_groups*o_lora_rank].
+    AttnOA,
+    /// Wyjście LoRA uwagi: [o_groups*o_lora_rank, hidden].
+    AttnOB,
+    /// Logit „kotwicy" uwagi, jeden na głowicę (attention sink).
+    AttnSink,
+
+    // --- DeepSeek V4: kompresor strumienia KV ---
+    /// Kodowanie pozycji wewnątrz okna kompresji.
+    CompressorApe,
+    CompressorNorm,
+    /// Projekcja bramki wyznaczającej wagi poolingu.
+    CompressorWGate,
+    /// Projekcja kompresowanego KV.
+    CompressorWkv,
+
+    // --- DeepSeek V4: indekser rzadkiej uwagi (własny kompresor) ---
+    IndexerCompressorApe,
+    IndexerCompressorNorm,
+    IndexerCompressorWGate,
+    IndexerCompressorWkv,
+    /// Waga na głowicę przy sumowaniu wyników indeksera.
+    IndexerWeightsProj,
+    /// Wyjście LoRA dla zapytań indeksera.
+    IndexerWqB,
+
+    // --- DeepSeek V4: routing ---
+    /// Bias dodawany do logitów routera przed wyborem top-k.
+    FfnGateBias,
+    /// Tablica token -> ekspert dla warstw z routingiem haszowanym.
+    FfnGateTid2Eid,
+
+    // --- DeepSeek V4: modulacja warunkowana haszem ---
+    HcAttnBase,
+    HcAttnFn,
+    HcAttnScale,
+    HcFfnBase,
+    HcFfnFn,
+    HcFfnScale,
+    HcHeadBase,
+    HcHeadFn,
+    HcHeadScale,
 }
 
 impl Hyperparams {
@@ -258,10 +311,17 @@ impl SsmParams {
 pub struct RoleSpec {
     pub role: WeightRole,
     /// GGUF tensor-name template; `{layer}` expands to the layer index.
-    pub gguf: String,
+    /// `None` dla ról, które istnieją wyłącznie w checkpointach HF.
+    #[serde(default)]
+    pub gguf: Option<String>,
     /// HF safetensors tensor-name template.
     pub hf: String,
     pub per_layer: bool,
+    /// Rola rozwijana na każdego eksperta: nazwa zachowuje `{expert}`, a
+    /// konkretny indeks podstawia loader. Bez tego 43 warstwy po 256 ekspertów
+    /// oznaczałyby 132 tysiące nazw w opisie modelu.
+    #[serde(default)]
+    pub per_expert: bool,
     /// Required roles must resolve to existing tensors on GGUF detect;
     /// optional ones (lm_head with tied embeddings, arch-specific norms) may
     /// be absent.
@@ -288,6 +348,7 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/qwen35moe.ron"),
     include_str!("../arch/qwen35.ron"),
     include_str!("../arch/gemma4.ron"),
+    include_str!("../arch/deepseek_v4.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -297,7 +358,14 @@ pub fn registry() -> &'static [ArchSpec] {
     REGISTRY.get_or_init(|| {
         ARCH_SOURCES
             .iter()
-            .map(|src| ron::from_str(src).expect("embedded arch spec must parse"))
+            .map(|src| {
+                // IMPLICIT_SOME pozwala pisać `gguf: "nazwa"` zamiast
+                // `gguf: Some("nazwa")` w każdej z kilkudziesięciu ról.
+                ron::Options::default()
+                    .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+                    .from_str(src)
+                    .expect("embedded arch spec must parse")
+            })
             .collect()
     })
 }
@@ -608,7 +676,13 @@ fn build_dense_mtp(
                         spec.name
                     ))
                 })?;
-            required_mtp_tensor(gguf, &mut weights, mtp_role, expand(&template.gguf, block))?;
+            let gguf_template = template.gguf.as_deref().ok_or_else(|| {
+                fmt_err(format!(
+                    "{} spec role {weight_role:?} has no GGUF name",
+                    spec.name
+                ))
+            })?;
+            required_mtp_tensor(gguf, &mut weights, mtp_role, expand(gguf_template, block))?;
         }
         for (role, suffix) in [
             (MtpWeightRole::EhProj, "eh_proj.weight"),
@@ -810,9 +884,13 @@ impl ModelDescriptor {
         let mut globals = HashMap::new();
         let mut layers: Vec<HashMap<WeightRole, String>> = vec![HashMap::new(); block_count];
         for role in &spec.roles {
+            // Rola bez nazwy GGUF istnieje wyłącznie w checkpointach HF.
+            let Some(template) = role.gguf.as_deref() else {
+                continue;
+            };
             if role.per_layer {
                 for (layer, map) in layers.iter_mut().enumerate() {
-                    let name = expand(&role.gguf, layer);
+                    let name = expand(template, layer);
                     if gguf.tensor(&name).is_some() {
                         map.insert(role.role, name);
                     } else if role.required {
@@ -822,12 +900,12 @@ impl ModelDescriptor {
                         )));
                     }
                 }
-            } else if gguf.tensor(&role.gguf).is_some() {
-                globals.insert(role.role, role.gguf.clone());
+            } else if gguf.tensor(template).is_some() {
+                globals.insert(role.role, template.to_string());
             } else if role.required {
                 return Err(fmt_err(format!(
-                    "gguf: arch '{}' requires tensor '{}' which is missing",
-                    spec.name, role.gguf
+                    "gguf: arch '{}' requires tensor '{template}' which is missing",
+                    spec.name
                 )));
             }
         }
@@ -940,6 +1018,42 @@ impl ModelDescriptor {
     }
 
     /// Build a descriptor from an HF config.json (safetensors-side naming).
+    /// Usuwa role opcjonalne, których tensorów nie ma w checkpoincie.
+    ///
+    /// Ścieżka GGUF sprawdza obecność przy budowie opisu, bo ma tabelę
+    /// tensorów pod ręką; ścieżka HF widzi tylko `config.json`, więc deklaruje
+    /// wszystkie role każdej warstwy. Dla architektur, w których część warstw
+    /// nie ma kompresora, indeksera czy tablicy routingu, opis obiecywałby
+    /// wtedy tensory, po które loader sięgnąłby na darmo.
+    pub fn prune_absent_optional(&mut self, exists: impl Fn(&str) -> bool) {
+        let Some(spec) = registry().iter().find(|s| s.name == self.arch) else {
+            return;
+        };
+        let optional: HashMap<WeightRole, bool> = spec
+            .roles
+            .iter()
+            .map(|role| (role.role, role.per_expert))
+            .filter(|(role, _)| {
+                spec.roles
+                    .iter()
+                    .any(|entry| entry.role == *role && !entry.required)
+            })
+            .collect();
+        for layer in &mut self.layers {
+            layer.retain(|role, template| match optional.get(role) {
+                // Rola per ekspert jest szablonem — obecność sprawdzamy na
+                // eksperice zero, bo albo warstwa ma komplet, albo żadnego.
+                Some(true) => exists(&template.replace("{expert}", "0")),
+                Some(false) => exists(template),
+                None => true,
+            });
+        }
+        self.globals.retain(|role, name| match optional.get(role) {
+            Some(_) => exists(name),
+            None => true,
+        });
+    }
+
     pub fn from_hf(config: &HfConfig) -> Result<Self> {
         let spec = registry()
             .iter()
@@ -966,6 +1080,9 @@ impl ModelDescriptor {
         for role in &spec.roles {
             if role.per_layer {
                 for (layer, map) in layers.iter_mut().enumerate() {
+                    // Rola per ekspert zostaje szablonem z `{expert}`: loader
+                    // podstawia indeks sam, bo inaczej opis modelu trzymałby
+                    // sto tysięcy nazw.
                     map.insert(role.role, expand(&role.hf, layer));
                 }
             } else if role.role == WeightRole::LmHead && config.tie_word_embeddings {
@@ -992,9 +1109,16 @@ impl ModelDescriptor {
                 // HF config.json carries no pooling; sentence-transformers keeps
                 // it in a `1_Pooling/config.json` sidecar the loader overrides.
                 pooling_type: PoolingType::None,
-                // Safetensors MoE loading is not wired yet; the GGUF path is the
-                // supported entry for Mixture-of-Experts models.
-                moe: None,
+                moe: config.n_routed_experts.map(|n_experts| MoeParams {
+                    n_experts,
+                    n_experts_used: config.num_experts_per_tok.unwrap_or(1),
+                    moe_intermediate_size: config.moe_intermediate_size.unwrap_or(0),
+                    norm_topk_prob: config.norm_topk_prob,
+                    shared_intermediate_size: config
+                        .n_shared_experts
+                        .map(|shared| shared * config.moe_intermediate_size.unwrap_or(0))
+                        .unwrap_or(0),
+                }),
                 qk_norm_over_hidden: false,
                 v_rms_norm: false,
                 suppress_tokens: Vec::new(),
@@ -1125,7 +1249,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             .roles
             .iter()
             .find(|r| r.role == role)
-            .map(|r| r.gguf.clone())
+            .and_then(|r| r.gguf.clone())
             .ok_or_else(|| fmt_err(format!("qwen35moe spec missing global role {role:?}")))?;
         if gguf.tensor(&name).is_none() {
             return Err(fmt_err(format!(
@@ -1138,7 +1262,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
     // Untied LM head: present as output.weight, else tie to the embedding.
     let tie_word_embeddings = gguf.tensor("output.weight").is_none();
     if !tie_word_embeddings {
-        globals.insert(WeightRole::LmHead, "output.weight".into());
+        globals.insert(WeightRole::LmHead, "output.weight".to_string());
     }
 
     // Common per-layer roles shared by both attention and DeltaNet layers.
@@ -1527,7 +1651,7 @@ mod tests {
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 8);
+        assert_eq!(specs.len(), 9);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
@@ -1536,6 +1660,7 @@ mod tests {
         assert_eq!(specs[5].name, "qwen35moe");
         assert_eq!(specs[6].name, "qwen35");
         assert_eq!(specs[7].name, "gemma4");
+        assert_eq!(specs[8].name, "deepseek_v4");
         // The MoE specs carry the router + stacked-expert roles.
         assert!(specs[3]
             .roles
