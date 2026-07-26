@@ -13,8 +13,19 @@ use std::sync::Arc;
 
 /// Test MUSI działać na realnym urządzeniu — brak GPU to błąd, nie pominięcie
 /// (ciche `return` w starszych testach maskowało brak pokrycia na AMD).
+/// Pule są jawne i małe: testy w pliku biegną równolegle, a domyślne pule
+/// zabierają większość VRAM i drugie otwarcie urządzenia nie ma z czego wziąć.
 fn device() -> Arc<dyn Device> {
-    forge_hal::gpu::open_default_pools(0).expect("GPU wymagane")
+    forge_hal::gpu::open(
+        0,
+        forge_hal::cuda::PoolSizes {
+            weights: 512 << 20,
+            kv_cache: 64 << 20,
+            activations: 256 << 20,
+            kv_page_size: 256 << 10,
+        },
+    )
+    .expect("GPU wymagane")
 }
 
 fn upload(dev: &dyn Device, v: &[f32]) -> DevBuffer {
