@@ -115,63 +115,71 @@ przy 176 (referencja liczy w f32 na CPU).
    wysokie logity tokenom `<image|>`/`<audio|>` i bez maski greedy wybierał je
    jako pierwszy token (llama.cpp wstawia tę maskę jako wejście grafu).
 
-### Wydajność (RX 6900 XT, gfx1030)
+### Wydajność (RX 6900 XT, gfx1030), kontekst 1024
 
-| pomiar | llama.cpp ff067f76 (ROCm) | FORGE | luka |
-|---|---:|---:|---:|
-| prefill pp1024 | 1449,1 tok/s | 1287,9 tok/s | -11,1% |
-| decode tg128 (ctx 1024) | 52,4 tok/s | 38,5 tok/s | -26,5% |
+Decode llama.cpp policzony z `-pg 1024,128` minus czas prefillu, żeby oba silniki
+mierzyć przy TYM SAMYM kontekście (`tg128` z llama-bench startuje od pustego).
 
-Cel „prefill znacznie powyżej llama.cpp, decode co najmniej na równi" NIE jest
-osiągnięty. Poniżej jest zmierzone rozliczenie czasu i to, co realnie stoi na
-drodze — bez tego dalsza optymalizacja jest zgadywaniem.
+| model | pp1024 llama.cpp | pp1024 FORGE | Δ | decode llama.cpp | decode FORGE | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| gemma-4-12b Q4_0 | 1449,1 | 1287,9 | −11,1% | 49,5 | **51,3** | **+3,6%** |
+| mistral-7b Q4_K | 1661,9 | **1741,1** | **+4,8%** | 85,4 | 78,5 | −8,1% |
+| qwen3-0.6b Q8_0 | 17883,3 | 15530,6 | −13,2% | 276,0 | **315,4** | **+14,3%** |
 
-#### Gdzie idzie prefill (T=1024, `FORGE_PREFILL_TRACE=1`)
+Decode Gemmy w tej sesji: 38,5 → 51,3 tok/s (+33%), przy czym zależność od
+długości kontekstu praktycznie zniknęła (48,5 tok/s przy ctx 4000).
 
-| faza | ms | udział |
-|---|---:|---:|
-| gate/up | 309,3 | 39,2% |
-| down | 182,2 | 23,1% |
-| uwaga | 110,7 | 14,0% |
-| qkv | 105,9 | 13,4% |
-| projekcja o | 52,2 | 6,6% |
-| pozostałe (normy, rope, kv_append) | 29,3 | 3,7% |
+#### Co dało przyspieszenie decode
 
-#### Dlaczego GEMM stoi na 41 TOPS z 92 TOPS `v_dot4_i32_i8`
+1. **Podział kontekstu w uwadze decode.** Wariant generyczny ma siatkę
+   `sekwencje × głowice`, czyli przy jednej sekwencji 16 grup roboczych na 80 CU.
+   Profiler pokazał 52 GB/s na odczytach KV, gdy GEMV wag wyciągał 397 GB/s.
+   Wariant dzielony (8 partycji kontekstu) był wcześniej zagated na NVIDIA i nie
+   obsługiwał okna przesuwnego, czyli 40 z 48 warstw Gemmy odpadało. Teraz
+   maskuje okno i działa dla head_dim 64/128/256/512 na każdej karcie z falą 32.
+2. **Norma „sandwich" + rezyduum + skala warstwy + norma wyjściowa w jednym
+   kernelu**, oraz **normy Q/K/V w jednym**. To 240 z ~900 uruchomień na token;
+   każde czytało kilka kB, więc dominował koszt samego wywołania.
+3. **Rozdzielenie normy i GEMV poza NVIDIA.** Kernele `gemv_norm_*` przeliczają
+   normę w każdej grupie roboczej; na gfx1030 profiler dał 182,95 µs na projekcję
+   FFN Mistrala (33 MB → 181 GB/s), gdy zwykły GEMV robi 466 GB/s.
 
-Zliczenie ISA (`llvm-objdump` na `gemm_q4_0_dot4_128x128.hsaco`): **512
-`v_dot4_i32_i8` na 1133 instrukcje wektorowe**, czyli 45% szczeliny wydania —
-dokładnie tyle, ile wychodzi z pomiaru. Rozkład reszty: 192 operacje epilogu
-(`cvt` + `mul` + `fma` na wyjście na każdy 32-kolumnowy blok skali Q4_0), 48
-`ds_read_b128`, około 150 na adresowanie, `v_mov` i maski `exec`.
+#### Gdzie jest sufit
 
-Epilog jest **strukturalny**: Q4_0 ma jedną skalę na 32 wartości, a skala wagi i
-aktywacji różnią się per blok, więc trzeba go zastosować co 8 `dot4` na wyjście.
-To daje 3/8 = 37,5% narzutu niezależnie od rozmiaru kafla, czyli sufit ~63 TOPS.
-llama.cpp osiąga na tym samym pułapie około 46 TOPS (73% sufitu), my 41 (65%).
+Po tych zmianach praca pamięciowa decode jest wyczerpana: GEMV wag osiąga
+**466 GB/s**, a głowa logitów **496 GB/s** przy pułapie GDDR6 512 GB/s. Zostaje
+około 2 ms na token narzutu drobnych kerneli — dalsze zyski wymagają zmniejszenia
+liczby czytanych bajtów, czyli zmiany kwantyzacji.
 
-#### Co sprawdzone i odrzucone pomiarem
+#### Prefill: dlaczego stoi
 
-| hipoteza | wynik |
-|---|---|
-| potokowanie odczytów przez rejestry (podwójny bufor LDS) | +7-18% na wąskim N, -2% na gate/up; razem ~1,6% prefillu — usunięte, nie warte drugiej implementacji |
-| większe kafle rejestrowe (128x128 TN8, 256x128, 128x256) | 2,2-2,7x gorsze (spadek zajętości) |
-| usunięcie warunków zakresu w czasie kompilacji | bez zmian |
-| `v_dot2_f32_f16` w iloczynie Q·K uwagi | +1,1% prefillu; uwaga 112,4 -> 110,7 ms, czyli QK jest ograniczony LDS, nie operacjami wektorowymi |
-| rozwinięcie pętli pozycji w uwadze decode (4 pozycje) | 0% przy ctx 1024 i **-6,8% przy ctx 2048** (64 dodatkowe VGPR-y zabijają zajętość) — cofnięte |
+Zliczenie ISA `gemm_q4_0_dot4_128x128.hsaco`: **512 `v_dot4_i32_i8` na 1133
+instrukcje wektorowe** (45% szczeliny wydania — dokładnie tyle, ile daje pomiar
+41 z 92 TOPS). Z reszty 192 to epilog: Q4_0 ma jedną skalę na 32 wartości, a
+skale wagi i aktywacji różnią się per blok, więc `cvt + mul + fma` musi wejść co
+8 `dot4` na wyjście. To 37,5% narzutu niezależnie od rozmiaru kafla, czyli sufit
+około 63 TOPS. llama.cpp jest tam na ~46 TOPS (73% sufitu), my na 41 (65%).
 
-Zmiana `dot2` została zachowana (jedyna z dodatnim wynikiem), reszta cofnięta.
+Sprawdzone i odrzucone pomiarem: potokowanie odczytów przez rejestry (~1,6%
+prefillu, usunięte), większe kafle rejestrowe (2,2–2,7× gorsze), usuwanie
+warunków zakresu w czasie kompilacji (0%), `v_dot2_f32_f16` w Q·K uwagi (+1,1%,
+zachowane), rozwinięcie pętli pozycji w uwadze decode (0% przy ctx 1024 i −6,8%
+przy ctx 2048 — cofnięte).
 
-#### Rozliczenie decode
+#### Backend Vulkan — nie zmierzony
 
-Skalowanie z długością kontekstu (prompt 128/1024/2048): 49,7 / 38,5 / 36,9 tok/s.
-Z różnicy między ctx 128 i 1024 wychodzi koszt brzegowy 5,9 ms na token za około
-309 MB dodatkowych odczytów KV, czyli **52 GB/s**. Same wagi idą przy tym z
-**362 GB/s** (6,96 GB w 19,2 ms), co jest blisko 358 GB/s liczonych dla
-llama.cpp. Wniosek: ścieżka GEMV wag jest w porządku, a cały dystans na decode
-siedzi w odczytach cache KV przy jednej sekwencji. Rozwinięcie pętli tego nie
-naprawiło, więc przyczyna nie jest samą latencją; następny krok wymaga
-profilera (`rocprofiler` nie jest zainstalowany, potrzebny root).
+llama.cpp z `GGML_VULKAN=ON` buduje się, ale w systemie nie ma sterownika Vulkan
+dla AMD: jedyny zarejestrowany ICD to `nvidia_icd.json` po poprzedniej karcie i
+wskazuje na nieistniejącą bibliotekę, więc `llama-bench` schodzi na CPU (pp1024
+63,2 tok/s). Do porównania potrzeba `vulkan-radeon` (mesa RADV) i usunięcia
+martwego wpisu NVIDII.
+
+#### Pułapka buildera złapana po drodze
+
+Zepsuta rejestracja kernela (dwie nazwy w jednym `compile_function`) sprawiła, że
+artefakt `hd256` powstał z ciała `hd128` — pliki były bajtowo identyczne, a Gemma
+liczyła śmieci bez żadnego błędu. Builder odrzuca teraz artefakty o identycznej
+treści z jasnym komunikatem.
 
 ### Znane braki poza ścieżką Gemmy
 
