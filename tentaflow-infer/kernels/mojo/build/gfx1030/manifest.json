@@ -1022,7 +1022,7 @@
       "file": "gemv_q4_k_dp4a_f16.hsaco"
     },
     "gemv_q4_k_dp4a_f16_gidx": {
-      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_73e6592222fa7a41",
+      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_30c98f506bf2dcc3",
       "file": "gemv_q4_k_dp4a_f16_gidx.hsaco"
     },
     "gemv_q4_k_dp4a_out_f32": {
@@ -1082,7 +1082,7 @@
       "file": "gemv_q6_k_dp4a_out_f32.hsaco"
     },
     "gemv_q6_k_f16_gidx": {
-      "entry": "src_gemv2_gemv_q6_k_f16_gidx6A6A6A6AoA6A_368507d831c0adca",
+      "entry": "src_gemv2_gemv_q6_k_f16_gidx6A6A6A6AoA6A_c81c8e14165e5679",
       "file": "gemv_q6_k_f16_gidx.hsaco"
     },
     "gemv_q6_k_f16_v2": {
@@ -1290,7 +1290,7 @@
       "file": "lstm_f32.hsaco"
     },
     "moe_router_f16": {
-      "entry": "src_moe_moe_router_f16_Point6A6A6A6AoA6A6A_3a6f89b08b39ed3c",
+      "entry": "src_moe_moe_router_f16_Point6A6A6A6AoA6A6A_2adba788b5761b18",
       "file": "moe_router_f16.hsaco"
     },
     "moe_scale_add_f16": {

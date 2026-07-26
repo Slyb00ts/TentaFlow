@@ -3,6 +3,7 @@
 // safetensors (incl. NVFP4), run decode-path forward on one GPU, greedy /
 // top-k/top-p sampling on CPU, streaming generation with stop handling.
 
+pub mod expert_spill;
 pub mod generate;
 pub mod gguf_vocab;
 pub mod kv;

@@ -79,7 +79,7 @@ impl ExpertStack {
             addrs.push(buf.device_ptr());
         }
         let table = device.alloc(addrs.len() * 8, MemKind::Device, Pool::Weights)?;
-        device.write(bytemuck_u64(&addrs), &table, 0)?;
+        device.write(bytemuck::cast_slice(&addrs), &table, 0)?;
         Ok(Self {
             experts,
             tiers,
@@ -394,9 +394,3 @@ impl<'a> MoeLayerView<'a> {
     }
 }
 
-/// Widok bajtowy na tablicę adresów bez dodatkowej zależności.
-fn bytemuck_u64(addrs: &[u64]) -> &[u8] {
-    // Bezpieczne: u64 nie ma niezainicjowanych bitów ani wymagań wyrównania
-    // ostrzejszych niż źródłowy wycinek, a długość liczona jest z rozmiaru.
-    unsafe { std::slice::from_raw_parts(addrs.as_ptr() as *const u8, std::mem::size_of_val(addrs)) }
-}
