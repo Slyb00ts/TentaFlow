@@ -215,6 +215,15 @@ impl ExpertStack {
         self.bytes_per_expert
     }
 
+    /// Liczba slotów w pamięci hosta — górna granica kompletu, jaki jedno
+    /// zgłoszenie stronicowania może utrzymać naraz.
+    pub fn host_slots(&self) -> usize {
+        self.slot_tier
+            .iter()
+            .filter(|tier| **tier == ExpertTier::Host)
+            .count()
+    }
+
     /// Czy każdy ekspert ma swój slot. Tylko wtedy wolno użyć ścieżki `_gidx`,
     /// bo tylko wtedy każdy możliwy wybór routera jest adresowalny.
     pub fn fully_resident(&self) -> bool {

@@ -12960,6 +12960,22 @@ impl Model {
     /// projekcji są znane naraz, a NVMe oddaje pełną przepustowość dopiero przy
     /// głębokiej kolejce — po kolei płaciłoby się sumę opóźnień zamiast
     /// najdłuższego z nich.
+    /// Zbiór różnych ekspertów wybranych w całym kawałku prefillu.
+    fn chunk_expert_union(&self, ids: &[i32]) -> Vec<i32> {
+        let mut union: Vec<i32> = ids.to_vec();
+        union.sort_unstable();
+        union.dedup();
+        union
+    }
+
+    /// Czy komplet `count` ekspertów zmieści się naraz w slotach hosta każdej
+    /// projekcji warstwy.
+    fn expert_union_fits(&self, moe: &MoeFfn, count: usize) -> bool {
+        [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
+            .into_iter()
+            .all(|stack| stack.fully_resident() || stack.host_slots() >= count)
+    }
+
     fn fault_in_experts(&self, moe: &MoeFfn, layer: usize, ids: &[i32]) -> Result<()> {
         let Some(spill) = self.expert_spill.as_ref() else {
             return Ok(());
@@ -13101,12 +13117,23 @@ impl Model {
                 t * k,
             )
         };
+        // Prefill dotyka wielu tokenów, a te trafiają w mocno zachodzące zbiory
+        // ekspertów. Ściągnięcie sumy całego kawałka jednym zgłoszeniem zamienia
+        // `t` rund odczytu na jedną; gdy suma nie mieści się w slotach, zostaje
+        // stronicowanie per token — wtedy i tak trzeba by ich wypierać nawzajem.
+        let chunk_union = self.chunk_expert_union(ids);
+        let union_fits = self.expert_union_fits(moe, chunk_union.len());
+        if union_fits {
+            self.fault_in_experts(moe, layer, &chunk_union)?;
+        }
         for ti in 0..t {
             // Copy this token's normed hidden into a contiguous scratch row so
             // the single-token expert GEMVs read from offset 0.
             self.device
                 .copy(&pb.x, ti * hidden * 2, &mb.xrow, 0, hidden * 2, stream)?;
-            self.fault_in_experts(moe, layer, &ids[ti * k..(ti + 1) * k])?;
+            if !union_fits {
+                self.fault_in_experts(moe, layer, &ids[ti * k..(ti + 1) * k])?;
+            }
             self.moe_experts_accumulate(
                 moe,
                 &mb.xrow,
