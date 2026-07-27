@@ -1421,10 +1421,16 @@ const EMBEDDED_SETS: &[EmbeddedSet] = &[
     },
 ];
 
-/// Numer pokolenia NVIDII (`sm_89` → 89). AMD celowo NIE ma odpowiednika: patrz
-/// `select_embedded_set`.
-fn nvidia_capability(arch: &str) -> Option<u32> {
-    arch.strip_prefix("sm_")?.parse().ok()
+/// Pokolenie NVIDII i to, czy nazwa opisuje wariant ZAWĘŻONY do architektury.
+///
+/// `sm_89` → (89, false), `sm_121a` → (121, true). Litera oznacza zestaw
+/// instrukcji dostępny wyłącznie na tej generacji — Mojo nazywa tak artefakty
+/// na GB10 — więc taki zestaw NIE jest przenośny w górę, w odróżnieniu od
+/// zwykłego PTX. AMD celowo nie ma odpowiednika: patrz `select_embedded_set`.
+fn nvidia_capability(arch: &str) -> Option<(u32, bool)> {
+    let rest = arch.strip_prefix("sm_")?;
+    let digits = rest.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    Some((digits.parse().ok()?, digits.len() != rest.len()))
 }
 
 /// Wybiera zestaw artefaktów dla karty.
@@ -1443,13 +1449,17 @@ fn select_embedded_set(arch: &str, vendor: forge_types::Vendor) -> Option<&'stat
     if vendor != forge_types::Vendor::Nvidia {
         return None;
     }
-    let device_capability = nvidia_capability(arch)?;
+    let (device_capability, _) = nvidia_capability(arch)?;
     EMBEDDED_SETS
         .iter()
-        .filter(|set| {
-            nvidia_capability(set.arch).is_some_and(|built| built <= device_capability)
+        .filter(|set| match nvidia_capability(set.arch) {
+            // Zestaw zawężony do architektury pasuje WYŁĄCZNIE do swojego
+            // pokolenia; zwykły PTX dociera na każdą nowszą kartę.
+            Some((built, true)) => built == device_capability,
+            Some((built, false)) => built <= device_capability,
+            None => false,
         })
-        .max_by_key(|set| nvidia_capability(set.arch).unwrap_or(0))
+        .max_by_key(|set| nvidia_capability(set.arch).map(|(built, _)| built).unwrap_or(0))
 }
 
 fn resolve_artifact_path(arch_dir: &Path, file: &str) -> Result<PathBuf> {
@@ -1665,6 +1675,42 @@ mod tests {
         // Karta STARSZA od jedynego zbudowanego zestawu nie dostaje niczego —
         // sm_89 PTX z instrukcjami Ady nie uruchomi się na sm_80.
         assert!(select_embedded_set("sm_80", Vendor::Nvidia).is_none());
+    }
+
+    /// Mojo nazywa artefakty na GB10 `sm_121a` — to wariant z instrukcjami
+    /// zawężonymi do tej generacji, więc NIE wolno go podać karcie nowszej.
+    #[test]
+    fn zestaw_zawezony_do_architektury_nie_wedruje_w_gore() {
+        assert_eq!(super::nvidia_capability("sm_121a"), Some((121, true)));
+        assert_eq!(super::nvidia_capability("sm_89"), Some((89, false)));
+        let sets = [
+            super::EmbeddedSet {
+                arch: "sm_89",
+                manifest: "",
+                artifacts: &[],
+                name: "A",
+            },
+            super::EmbeddedSet {
+                arch: "sm_121a",
+                manifest: "",
+                artifacts: &[],
+                name: "B",
+            },
+        ];
+        let pick = |arch: &str| {
+            sets.iter()
+                .filter(|set| match super::nvidia_capability(set.arch) {
+                    Some((built, true)) => built == super::nvidia_capability(arch).unwrap().0,
+                    Some((built, false)) => built <= super::nvidia_capability(arch).unwrap().0,
+                    None => false,
+                })
+                .max_by_key(|set| super::nvidia_capability(set.arch).unwrap().0)
+                .map(|set| set.arch)
+        };
+        // GB10 zgłasza się jako sm_121 i ma dostać swój zestaw, nie sm_89.
+        assert_eq!(pick("sm_121"), Some("sm_121a"));
+        // Hipotetyczna nowsza karta bierze przenośny sm_89, a NIE sm_121a.
+        assert_eq!(pick("sm_130"), Some("sm_89"));
     }
 
     /// HSACO jest związany z konkretnym ISA, więc dla AMD jedynym poprawnym
