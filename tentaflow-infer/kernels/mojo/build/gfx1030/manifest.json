@@ -1,6 +1,14 @@
 {
   "arch": "gfx1030",
   "kernels": {
+    "act_quant_fp4_f16": {
+      "entry": "src_deepseek_act_quant_fp4_f166A6A6A6A_4102fbdb10246fb4",
+      "file": "act_quant_fp4_f16.hsaco"
+    },
+    "act_quant_fp8_f16": {
+      "entry": "src_deepseek_act_quant_fp8_f166A6A6A6A_dfc0da5a9f0a475f",
+      "file": "act_quant_fp8_f16.hsaco"
+    },
     "add_f32": {
       "entry": "src_onnx_ops_add_f32_Pointer6A6A6A6AoA6A6A_255674d20f814f4e",
       "file": "add_f32.hsaco"
@@ -1221,6 +1229,10 @@
       "entry": "src_decode_fused_gemv_residual6A6A6A6A_f84aadaa72b6a31c",
       "file": "gemv_residual_q8_0_f16.hsaco"
     },
+    "hadamard_bf16_f16": {
+      "entry": "src_deepseek_hadamard_bf16_f166A6A6A6A_b70dfc00074ae163",
+      "file": "hadamard_bf16_f16.hsaco"
+    },
     "kv_append_batch_device_pos_f16": {
       "entry": "src_prefill_kv_append_batch_de6A6A6A6A_284e8c71ecc1427d",
       "file": "kv_append_batch_device_pos_f16.hsaco"
@@ -1453,6 +1465,10 @@
       "entry": "src_decode_fused_rmsnorm_h32_f6A6A6A6A_afeaf2c4402b7adf",
       "file": "rmsnorm_h32_f16.hsaco"
     },
+    "rmsnorm_head_f16": {
+      "entry": "src_deepseek_rmsnorm_head_f166A6A6A6AoA_3a59a014b39e0db9",
+      "file": "rmsnorm_head_f16.hsaco"
+    },
     "rmsnorm_qkv_f16": {
       "entry": "src_norm_rmsnorm_qkv_f16_Poi6A6A6A6AoA6A6A_531bb45ec3382a85",
       "file": "rmsnorm_qkv_f16.hsaco"
@@ -1464,6 +1480,10 @@
     "rmsnorm_residual_fp8": {
       "entry": "src_norm_rmsnorm_residual_fp86A6A6A6AoA_419ae6be042e80ff",
       "file": "rmsnorm_residual_fp8.hsaco"
+    },
+    "rope_interleaved_f16": {
+      "entry": "src_deepseek_rope_interleaved_6A6A6A6A_1ed013938272c38a",
+      "file": "rope_interleaved_f16.hsaco"
     },
     "rope_neox_f16": {
       "entry": "src_rope_rope_neox_f16_Point6A6A6A6AoA6A6A_8a932abd69147e53",

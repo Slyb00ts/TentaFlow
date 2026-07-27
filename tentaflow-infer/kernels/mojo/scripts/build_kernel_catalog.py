@@ -233,6 +233,7 @@ def compile_catalog(kernels, portable_nvfp4):
     fail_after = int(os.environ.get("FORGE_KERNEL_BUILD_FAIL_AFTER", "0"))
     partial = os.environ.get("FORGE_KERNEL_BUILD_PARTIAL") == "1"
     unsupported = []
+    incremental = 0
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     manifest = None
     with tempfile.TemporaryDirectory(
@@ -364,6 +365,31 @@ def compile_catalog(kernels, portable_nvfp4):
         if not partial and len(manifest["kernels"]) != len(kernels):
             raise RuntimeError("niepelny manifest po kompilacji")
         staged_arch = publication_root / manifest["arch"]
+        # Tryb przyrostowy: dobudowane kernele wchodza do JUZ opublikowanego
+        # katalogu. Pelny przebieg to ~55 minut na 512 kerneli, wiec dodanie
+        # jednego nie moze kosztowac tyle samo. Reszte artefaktow kopiujemy do
+        # stagingu, zeby publikacja pozostala atomowa — katalog nigdy nie jest
+        # w stanie posrednim.
+        if os.environ.get("FORGE_KERNEL_BUILD_ONLY", "").strip():
+            previous = OUTPUT_ROOT / manifest["arch"]
+            previous_manifest = previous / "manifest.json"
+            if not previous_manifest.is_file():
+                raise RuntimeError(
+                    f"tryb przyrostowy wymaga zbudowanego katalogu {previous}"
+                )
+            base = json.loads(previous_manifest.read_text())
+            if base["arch"] != manifest["arch"]:
+                raise RuntimeError("architektura katalogu nie zgadza sie z buildem")
+            rebuilt = set(manifest["kernels"])
+            for artifact, entry in base["kernels"].items():
+                if artifact in rebuilt:
+                    continue
+                shutil.copy2(previous / entry["file"], staged_arch / entry["file"])
+                manifest["kernels"][artifact] = entry
+            for extra in previous.iterdir():
+                if extra.suffix == ".cubin" or extra.name == "unsupported.txt":
+                    shutil.copy2(extra, staged_arch / extra.name)
+            incremental = len(rebuilt)
         if requires_sm89_cubins(manifest["arch"]):
             for cubin in ("w4a8_gemm_cuda.cubin", "fattn_prefill_cuda.cubin"):
                 source = ROOT / "build" / manifest["arch"] / cubin
@@ -382,7 +408,12 @@ def compile_catalog(kernels, portable_nvfp4):
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         destination = OUTPUT_ROOT / manifest["arch"]
         publish_arch(staged_arch, destination)
-        if partial:
+        if incremental:
+            print(
+                f"dobudowano {incremental} kerneli; katalog {destination} ma "
+                f"{len(manifest['kernels'])}"
+            )
+        elif partial:
             report = destination / "unsupported.txt"
             report.write_text(
                 "".join(f"{artifact}\t{reason[0]}\n" for artifact, reason in unsupported)
@@ -397,6 +428,15 @@ def compile_catalog(kernels, portable_nvfp4):
 
 def main():
     kernels, portable_nvfp4 = parse_catalog()
+    only = os.environ.get("FORGE_KERNEL_BUILD_ONLY", "").strip()
+    if only:
+        wanted = {name.strip() for name in only.split(",") if name.strip()}
+        selected = [item for item in kernels if item[1] in wanted]
+        missing = wanted - {item[1] for item in selected}
+        if missing:
+            raise RuntimeError(f"katalog nie zna kerneli: {sorted(missing)}")
+        print(f"tryb przyrostowy: {len(selected)} z {len(kernels)} kerneli")
+        kernels = selected
     compile_catalog(kernels, portable_nvfp4)
 
 

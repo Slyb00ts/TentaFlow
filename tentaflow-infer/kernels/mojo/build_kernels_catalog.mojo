@@ -129,6 +129,13 @@ from src.conv import gelu_f16, conv1d_k3_f16
 from src.attn_full import attn_full_f16_hd64, attn_full_f16_hd128
 from src.gemv import gemv_f16_bias
 from src.kv_append import kv_append_f16
+from src.deepseek import (
+    rmsnorm_head_f16,
+    rope_interleaved_f16,
+    hadamard_bf16_f16,
+    act_quant_fp8_f16,
+    act_quant_fp4_f16,
+)
 from src.gemv2 import (
     gemv_q8_0_f16_v2,
     gemv_q8_0_out_f32_v2,
@@ -2303,6 +2310,31 @@ def main() raises:
         gemv_fp8_row_f16_v2, dump_asm=Path("gemv_fp8_row_f16_v2.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_fp8_row_f16_v2"))
+
+    _ = ctx.compile_function[
+        rmsnorm_head_f16, dump_asm=Path("rmsnorm_head_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "rmsnorm_head_f16"))
+
+    _ = ctx.compile_function[
+        rope_interleaved_f16, dump_asm=Path("rope_interleaved_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "rope_interleaved_f16"))
+
+    _ = ctx.compile_function[
+        hadamard_bf16_f16, dump_asm=Path("hadamard_bf16_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "hadamard_bf16_f16"))
+
+    _ = ctx.compile_function[
+        act_quant_fp8_f16, dump_asm=Path("act_quant_fp8_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "act_quant_fp8_f16"))
+
+    _ = ctx.compile_function[
+        act_quant_fp4_f16, dump_asm=Path("act_quant_fp4_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "act_quant_fp4_f16"))
 
     _ = ctx.compile_function[
         gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")

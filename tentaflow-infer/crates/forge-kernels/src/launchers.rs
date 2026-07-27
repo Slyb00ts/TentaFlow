@@ -5845,6 +5845,166 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Normalizacja RMS osobno dla każdej głowicy, BEZ wagi — druga norma Q
+    /// rodziny DeepSeek V4, nakładana już po projekcji `wq_b`.
+    pub fn rmsnorm_head_f16(
+        &self,
+        buf: &DevBuffer,
+        head_dim: usize,
+        n_heads: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_head_f16")?;
+        // Redukcja idzie przez pamięć współdzieloną o stałym rozmiarze 1024,
+        // więc liczba wątków musi być potęgą dwójki w tym zakresie.
+        let threads = head_dim.next_power_of_two().clamp(64, 1024) as u32;
+        let cfg = LaunchConfig {
+            grid: (n_heads as u32, 1, 1),
+            block: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(buf)
+            .scalar(head_dim as i64)
+            .scalar(n_heads as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Rope obracające pary sąsiadujące `(2i, 2i+1)` na wycinku każdego wiersza.
+    /// `inverse` sprzęga obrót — tak rope wchodzi na wyjście uwagi.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_interleaved_f16(
+        &self,
+        buf: &DevBuffer,
+        freqs: &DevBuffer,
+        row_stride: usize,
+        offset: usize,
+        rope_dim: usize,
+        n_rows: usize,
+        pos_base: usize,
+        pos_stride: usize,
+        inverse: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !rope_dim.is_multiple_of(2) {
+            return Err(ForgeError::Kernel(format!(
+                "rope_interleaved wymaga parzystego rope_dim, otrzymano {rope_dim}"
+            )));
+        }
+        let k = self.artifacts.get("rope_interleaved_f16")?;
+        let total = n_rows * (rope_dim / 2);
+        let cfg = LaunchConfig {
+            grid: ((total as u32).div_ceil(BLOCK), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(buf)
+            .buf(freqs)
+            .scalar(row_stride as i64)
+            .scalar(offset as i64)
+            .scalar(rope_dim as i64)
+            .scalar(n_rows as i64)
+            .scalar(pos_base as i64)
+            .scalar(pos_stride as i64)
+            .scalar(i64::from(inverse));
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Transformata Hadamarda po wierszu z wynikiem zaokrąglonym do bf16.
+    pub fn hadamard_bf16_f16(
+        &self,
+        buf: &DevBuffer,
+        width: usize,
+        n_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !width.is_power_of_two() {
+            return Err(ForgeError::Kernel(format!(
+                "hadamard wymaga szerokości będącej potęgą dwójki, otrzymano {width}"
+            )));
+        }
+        let k = self.artifacts.get("hadamard_bf16_f16")?;
+        let threads = (width / 2).next_power_of_two().clamp(32, 512) as u32;
+        let cfg = LaunchConfig {
+            grid: (n_rows as u32, 1, 1),
+            block: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(buf)
+            .scalar(width as i64)
+            .scalar(n_rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Symulacja kwantyzacji aktywacji do FP8 (QAT), w miejscu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn act_quant_fp8_f16(
+        &self,
+        buf: &DevBuffer,
+        row_stride: usize,
+        offset: usize,
+        span: usize,
+        block: usize,
+        n_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if block == 0 || !span.is_multiple_of(block) {
+            return Err(ForgeError::Kernel(format!(
+                "act_quant_fp8: {span} nie dzieli się na grupy po {block}"
+            )));
+        }
+        let k = self.artifacts.get("act_quant_fp8_f16")?;
+        let total = n_rows * (span / block);
+        let cfg = LaunchConfig {
+            grid: ((total as u32).div_ceil(BLOCK), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(buf)
+            .scalar(row_stride as i64)
+            .scalar(offset as i64)
+            .scalar(span as i64)
+            .scalar(block as i64)
+            .scalar(n_rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Symulacja kwantyzacji aktywacji do FP4 (QAT indeksera), w miejscu.
+    pub fn act_quant_fp4_f16(
+        &self,
+        buf: &DevBuffer,
+        row_stride: usize,
+        span: usize,
+        block: usize,
+        n_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if block == 0 || !span.is_multiple_of(block) {
+            return Err(ForgeError::Kernel(format!(
+                "act_quant_fp4: {span} nie dzieli się na grupy po {block}"
+            )));
+        }
+        let k = self.artifacts.get("act_quant_fp4_f16")?;
+        let total = n_rows * (span / block);
+        let cfg = LaunchConfig {
+            grid: ((total as u32).div_ceil(BLOCK), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(buf)
+            .scalar(row_stride as i64)
+            .scalar(span as i64)
+            .scalar(block as i64)
+            .scalar(n_rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// GEMV na wagach E4M3 z jedną skalą FP32 na wiersz, wynik w f16.
     ///
     /// Wariant f32 (`gemv_fp8_out_f32`) służy głowie logitów; ten karmi kolejne

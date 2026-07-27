@@ -107,6 +107,8 @@ const CUDA_FATTN_ENTRIES: &[(&str, &str)] = &[
 ];
 
 const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
+    "act_quant_fp4_f16",
+    "act_quant_fp8_f16",
     "add_f32",
     "argmax_batched_f32",
     "argmax_final_f32",
@@ -412,6 +414,7 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "gemv_residual_q6_k_f16",
     "gemv_residual_q8_0_dp4a_f16",
     "gemv_residual_q8_0_f16",
+    "hadamard_bf16_f16",
     "kv_append_batch_device_pos_f16",
     "kv_append_batch_f16",
     "kv_append_batch_fp8",
@@ -470,9 +473,11 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "rmsnorm_f16",
     "rmsnorm_fp8",
     "rmsnorm_h32_f16",
+    "rmsnorm_head_f16",
     "rmsnorm_qkv_f16",
     "rmsnorm_residual_f16",
     "rmsnorm_residual_fp8",
+    "rope_interleaved_f16",
     "rope_neox_f16",
     "rope_neox_ff_f16",
     "rope_neox_partial_f16",
