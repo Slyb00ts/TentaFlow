@@ -142,6 +142,7 @@ from src.deepseek import (
     hc_expand_f16,
     index_score_f16,
     compressor_add_ape_f32,
+    moe_gate_sqrtsoftplus_f16,
 )
 from src.gemv2 import (
     gemv_q8_0_f16_v2,
@@ -2371,6 +2372,11 @@ def main() raises:
         compressor_add_ape_f32, dump_asm=Path("compressor_add_ape_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "compressor_add_ape_f32"))
+
+    _ = ctx.compile_function[
+        moe_gate_sqrtsoftplus_f16, dump_asm=Path("moe_gate_sqrtsoftplus_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "moe_gate_sqrtsoftplus_f16"))
 
     _ = ctx.compile_function[
         gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")

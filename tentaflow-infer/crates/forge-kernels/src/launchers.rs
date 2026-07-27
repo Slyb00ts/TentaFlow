@@ -6054,6 +6054,48 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Bramka MoE DeepSeeka V4. Bias wchodzi WYŁĄCZNIE do rankingu top-k; wagi
+    /// biorą się z wyniku bez niego, są normalizowane do sumy 1 i mnożone przez
+    /// `route_scale`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gate_sqrtsoftplus_f16(
+        &self,
+        ids: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        gate_w: &DevBuffer,
+        bias: &DevBuffer,
+        n_tokens: usize,
+        hidden: usize,
+        n_expert: usize,
+        top_k: usize,
+        route_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n_expert > 256 {
+            return Err(ForgeError::Kernel(format!(
+                "moe_gate: {n_expert} ekspertów przekracza limit kernela 256"
+            )));
+        }
+        let k = self.artifacts.get("moe_gate_sqrtsoftplus_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(ids)
+            .buf(weights)
+            .buf(x)
+            .buf(gate_w)
+            .buf(bias)
+            .scalar(hidden as i64)
+            .scalar(n_expert as i64)
+            .scalar(top_k as i64)
+            .scalar(route_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Punktowanie pozycji przez indekser rzadkiej uwagi.
     #[allow(clippy::too_many_arguments)]
     pub fn index_score_f16(

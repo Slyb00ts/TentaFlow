@@ -1329,6 +1329,10 @@
       "entry": "src_onnx_ops_lstm_f32_Pointe6A6A6A6AoA6A6A_6fd07fbec67c7fd4",
       "file": "lstm_f32.hsaco"
     },
+    "moe_gate_sqrtsoftplus_f16": {
+      "entry": "src_deepseek_moe_gate_sqrtsoft6A6A6A6A_dcb64654c896b5f4",
+      "file": "moe_gate_sqrtsoftplus_f16.hsaco"
+    },
     "moe_router_f16": {
       "entry": "src_moe_moe_router_f16_Point6A6A6A6AoA6A6A_2adba788b5761b18",
       "file": "moe_router_f16.hsaco"

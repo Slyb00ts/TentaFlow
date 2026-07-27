@@ -439,6 +439,7 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "layernorm_f16",
     "layernorm_residual_f16",
     "lstm_f32",
+    "moe_gate_sqrtsoftplus_f16",
     "moe_router_f16",
     "moe_scale_add_f16",
     "moe_scale_add_gidx_f16",

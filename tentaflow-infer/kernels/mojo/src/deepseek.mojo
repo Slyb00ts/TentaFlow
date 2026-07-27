@@ -13,12 +13,13 @@ from std.gpu import block_dim, block_idx, thread_idx, global_idx
 from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
-from std.math import exp, cos, sin, rsqrt
+from std.math import exp, cos, sin, rsqrt, log, sqrt
 from std.memory import bitcast
 
 comptime DS_MAX_HEAD = 512
 comptime FP8_MAX: Float32 = 448.0
 comptime FP4_MAX: Float32 = 6.0
+comptime MOE_MAX_EXPERTS_DS = 256
 
 
 def rmsnorm_head_f16(
@@ -697,3 +698,80 @@ def compressor_add_ape_f32(
     i = Int(global_idx.x)
     if i < n:
         acc[i] = acc[i] + src[i]
+
+
+def moe_gate_sqrtsoftplus_f16(
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    weights_out: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    gate_w: UnsafePointer[Float16, MutAnyOrigin],
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    hidden: Int,
+    n_expert: Int,
+    top_k: Int,
+    route_scale: Float32,
+):
+    """Bramka MoE DeepSeeka V4: `sqrt(softplus(logit))`, wybór top-k po wyniku
+    Z BIASEM, wagi z wyniku BEZ biasu, znormalizowane i przeskalowane.
+
+    Rozdzielenie biasu jest tu istotne: wchodzi wyłącznie do rankingu. Dodanie
+    go również do wag nie zmienia wyboru ekspertów, więc model dalej generuje
+    tekst — tylko gorszy, i nic tego nie zgłasza.
+
+    Jeden blok na token; wybór na jednym wątku, bo `n_expert` to 256, a
+    równoległa redukcja zmieniłaby rozstrzyganie remisów.
+    """
+    token = Int(block_idx.x)
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+
+    scores = stack_allocation[
+        MOE_MAX_EXPERTS_DS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    ranked = stack_allocation[
+        MOE_MAX_EXPERTS_DS, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    var e = tid
+    while e < n_expert:
+        var acc: Float32 = 0.0
+        var j = 0
+        while j < hidden:
+            acc += Float32(x[token * hidden + j]) * Float32(gate_w[e * hidden + j])
+            j += 1
+        # softplus stabilne numerycznie: dla dużych logitów zbiega do samego
+        # logitu, a `exp` przelałoby się do nieskończoności.
+        var sp: Float32 = acc
+        if acc <= 20.0:
+            sp = log(1.0 + exp(acc))
+        s = sqrt(sp)
+        scores[e] = s
+        ranked[e] = s + bias[e]
+        e += nthreads
+    barrier()
+
+    if tid != 0:
+        return
+    var sum: Float32 = 0.0
+    var k = 0
+    while k < top_k:
+        var best = 0
+        var best_v: Float32 = -3.0e38
+        var n = 0
+        while n < n_expert:
+            if ranked[n] > best_v:
+                best_v = ranked[n]
+                best = n
+            n += 1
+        ids[token * top_k + k] = Int32(best)
+        # Waga bierze się z wyniku BEZ biasu.
+        w = scores[best]
+        weights_out[token * top_k + k] = w
+        sum += w
+        ranked[best] = -3.0e38
+        k += 1
+    inv = route_scale / sum
+    k = 0
+    while k < top_k:
+        weights_out[token * top_k + k] = weights_out[token * top_k + k] * inv
+        k += 1
