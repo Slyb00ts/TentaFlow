@@ -2076,6 +2076,200 @@ fn load_deepseek_attention(
     })
 }
 
+/// Wczytuje komplet warstw DeepSeeka V4.
+///
+/// Wywoływane zamiast wspólnej pętli warstw, bo ta architektura ma inny mikser,
+/// hyper-connections zamiast rezyduum i eksperty zapisane pojedynczo. Kompresor,
+/// indekser, bias routera i tablica routingu są opcjonalne — opis modelu został
+/// wcześniej przycięty do tego, co jest w checkpoincie, więc brak roli oznacza
+/// warstwę bez tego elementu.
+fn load_deepseek_layers(
+    device: &dyn Device,
+    descriptor: &ModelDescriptor,
+    src: &dyn TensorSource,
+    spill: Option<&ExpertSpill>,
+    budget: Option<&ExpertBudget>,
+) -> Result<Vec<LayerWeights>> {
+    let moe = descriptor
+        .params
+        .moe
+        .as_ref()
+        .ok_or_else(|| ForgeError::Format("DeepSeek V4 jest modelem MoE".into()))?;
+    let mut layers = Vec::with_capacity(descriptor.params.block_count);
+    for (index, layer_map) in descriptor.layers.iter().enumerate() {
+        let name = |role: WeightRole| -> Result<&String> {
+            layer_map.get(&role).ok_or_else(|| {
+                ForgeError::Format(format!("warstwa {index}: brak roli {role:?}"))
+            })
+        };
+        let attn = load_deepseek_attention(device, src, index)?;
+        let router = match fetch_matrix(src, name(WeightRole::FfnGateInp)?)? {
+            weight @ HostWeight::F16 { .. } => upload_weight(device, weight)?,
+            _ => {
+                return Err(ForgeError::Unsupported(format!(
+                    "warstwa {index}: router MoE musi dać się zmaterializować jako f16"
+                )))
+            }
+        };
+        let shared = DenseFfn {
+            gate_up: GateUpWeights::Split {
+                gate: upload_weight(device, fetch_matrix(src, name(WeightRole::FfnGateShExp)?)?)?,
+                up: upload_weight(device, fetch_matrix(src, name(WeightRole::FfnUpShExp)?)?)?,
+            },
+            down: upload_weight(device, fetch_matrix(src, name(WeightRole::FfnDownShExp)?)?)?,
+        };
+        let ffn = LayerFfn::Moe(Box::new(MoeFfn {
+            router,
+            gate_exps: upload_per_expert_stack(
+                device,
+                src,
+                name(WeightRole::FfnGateExps)?,
+                moe.n_experts,
+                spill,
+                budget,
+            )?,
+            up_exps: upload_per_expert_stack(
+                device,
+                src,
+                name(WeightRole::FfnUpExps)?,
+                moe.n_experts,
+                spill,
+                budget,
+            )?,
+            down_exps: upload_per_expert_stack(
+                device,
+                src,
+                name(WeightRole::FfnDownExps)?,
+                moe.n_experts,
+                spill,
+                budget,
+            )?,
+            shared: Some(shared),
+            shared_gate: None,
+            n_experts: moe.n_experts,
+            n_experts_used: moe.n_experts_used,
+            moe_inter: moe.moe_intermediate_size,
+            norm_topk: moe.norm_topk_prob,
+            gate_bias: match layer_map.get(&WeightRole::FfnGateBias) {
+                Some(bias) => Some(upload_f32(device, src, bias)?),
+                None => None,
+            },
+            tid2eid: match layer_map.get(&WeightRole::FfnGateTid2Eid) {
+                Some(table) => Some(upload_raw(device, src, table)?),
+                None => None,
+            },
+            usage: ExpertUsage::new(device, moe.n_experts)?,
+        }));
+        layers.push(LayerWeights {
+            attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
+            ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
+            post_attn_norm: None,
+            post_ffw_norm: None,
+            layer_output_scale: None,
+            mixer: LayerMixer::DeepseekAttention(Box::new(attn)),
+            ffn,
+            hc_attn: Some(HyperConnectionWeights {
+                mix_fn: upload_f32(device, src, name(WeightRole::HcAttnFn)?)?,
+                base: upload_f32(device, src, name(WeightRole::HcAttnBase)?)?,
+                scale: upload_f32(device, src, name(WeightRole::HcAttnScale)?)?,
+            }),
+            hc_ffn: Some(HyperConnectionWeights {
+                mix_fn: upload_f32(device, src, name(WeightRole::HcFfnFn)?)?,
+                base: upload_f32(device, src, name(WeightRole::HcFfnBase)?)?,
+                scale: upload_f32(device, src, name(WeightRole::HcFfnScale)?)?,
+            }),
+        });
+    }
+    Ok(layers)
+}
+
+/// Wgrywa tensor bajt w bajt, bez interpretacji — tablica routingu haszowanego
+/// jest indeksowana na hoście, więc jej format jest wewnętrzną sprawą loadera.
+fn upload_raw(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Result<DevBuffer> {
+    let (data, _, _, _) = src.fetch(name)?;
+    upload(device, &data)
+}
+
+/// Wgrywa eksperty warstwy MoE zapisane POJEDYNCZO (`ffn.experts.{e}.w1`), a nie
+/// jako jeden sklejony tensor.
+///
+/// Ten układ pasuje do rezydencji per ekspert bez żadnej pracy dodatkowej: każdy
+/// blok jest już osobną alokacją, więc może leżeć w VRAM, w pamięci hosta albo
+/// na dysku niezależnie od sąsiadów.
+fn upload_per_expert_stack(
+    device: &dyn Device,
+    src: &dyn TensorSource,
+    template: &str,
+    n_experts: usize,
+    spill: Option<&ExpertSpill>,
+    budget: Option<&ExpertBudget>,
+) -> Result<ExpertStack> {
+    let (vram_slots, host_slots) = match budget {
+        Some(budget) => budget.plan(n_experts),
+        None => (n_experts, 0),
+    };
+    let mut slots = Vec::with_capacity(vram_slots + host_slots);
+    let mut resident = Vec::with_capacity(vram_slots + host_slots);
+    let mut spilled = vec![None; n_experts];
+    let mut rows_per_expert = 0usize;
+    let mut cols = 0usize;
+    for expert in 0..n_experts {
+        let name = template.replace("{expert}", &expert.to_string());
+        let weight = fetch_matrix(src, &name)?;
+        rows_per_expert = weight.rows();
+        cols = weight.cols();
+        let HostWeight::NvFp4Gguf {
+            data,
+            output_scale,
+            rows,
+            cols: weight_cols,
+        } = weight
+        else {
+            return Err(ForgeError::Unsupported(format!(
+                "{name}: eksperci DeepSeeka muszą być NVFP4"
+            )));
+        };
+        let kind = if expert < vram_slots {
+            MemKind::Device
+        } else if expert < vram_slots + host_slots {
+            MemKind::PinnedHost
+        } else {
+            match spill {
+                Some(spill) => {
+                    spilled[expert] = Some(spill.append(&data)?);
+                    continue;
+                }
+                None => MemKind::Device,
+            }
+        };
+        match upload_as(device, &data, kind) {
+            Ok(buf) => {
+                slots.push(DevWeight::NvFp4Gguf {
+                    buf,
+                    output_scale,
+                    rows,
+                    cols: weight_cols,
+                    layout: Nvfp4GgufLayout::RowMajor36,
+                });
+                resident.push(expert);
+            }
+            Err(out_of_memory) => {
+                let Some(spill) = spill else {
+                    return Err(out_of_memory);
+                };
+                spilled[expert] = Some(spill.append(&data)?);
+            }
+        }
+    }
+    if slots.is_empty() {
+        return Err(ForgeError::OutOfMemory {
+            requested: rows_per_expert * cols,
+            available: 0,
+        });
+    }
+    ExpertStack::new(device, slots, resident, spilled, rows_per_expert, cols)
+}
+
 /// Wczytuje samą warstwę uwagi DeepSeeka V4 z katalogu safetensors.
 ///
 /// Istnieje dla testów: pełny model ma 157 GB, a geometrię i przejście przez

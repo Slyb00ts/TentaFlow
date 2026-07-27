@@ -1083,3 +1083,155 @@ pub fn hc_leave(
         stream,
     )
 }
+
+/// Wagi jednego bloku DeepSeeka V4 zebrane w jedno miejsce.
+pub struct DeepseekBlockWeights<'a> {
+    pub attn: &'a DeepseekAttnWeights,
+    pub attn_norm: &'a DevBuffer,
+    pub ffn_norm: &'a DevBuffer,
+    pub moe: &'a MoeFfn,
+    pub hc_attn: &'a HyperConnectionWeights,
+    pub hc_ffn: &'a HyperConnectionWeights,
+}
+
+/// Bufory jednego bloku.
+pub struct DeepseekBlockBufs {
+    pub attn: DeepseekAttnBufs,
+    pub ffn: DeepseekFfnBufs,
+    pub hc_attn: HyperConnectionBufs,
+    pub hc_ffn: HyperConnectionBufs,
+    sub_out: DevBuffer,
+    state: DevBuffer,
+}
+
+impl DeepseekBlockBufs {
+    pub fn new(
+        device: &dyn Device,
+        attn_shape: &DeepseekAttnShape,
+        ffn_shape: &DeepseekFfnShape,
+        hc: usize,
+        max_tokens: usize,
+        freqs: &[f32],
+    ) -> Result<Self> {
+        Ok(Self {
+            attn: DeepseekAttnBufs::new(device, attn_shape, max_tokens, freqs)?,
+            ffn: DeepseekFfnBufs::new(device, ffn_shape, max_tokens)?,
+            hc_attn: HyperConnectionBufs::new(device, attn_shape.hidden, hc, max_tokens)?,
+            hc_ffn: HyperConnectionBufs::new(device, attn_shape.hidden, hc, max_tokens)?,
+            sub_out: device.alloc(
+                max_tokens * attn_shape.hidden * 2,
+                MemKind::Device,
+                Pool::Activations,
+            )?,
+            state: device.alloc(
+                max_tokens * hc * attn_shape.hidden * 2,
+                MemKind::Device,
+                Pool::Activations,
+            )?,
+        })
+    }
+}
+
+/// Stałe hyper-connections wspólne dla całego modelu.
+#[derive(Clone, Copy, Debug)]
+pub struct HyperConnectionConfig {
+    pub hc: usize,
+    pub sinkhorn_iters: usize,
+    pub eps: f32,
+    pub hc_eps: f32,
+}
+
+/// Prefill jednego bloku: `state` w wejściu i wyjściu trzyma `hc` kopii
+/// strumienia rezydualnego, a nie pojedynczy stan.
+///
+/// Kolejność jest tu treścią: obie połówki wchodzą przez własną redukcję kopii
+/// i wychodzą przez własne rozprowadzenie, a druga połówka widzi już stan
+/// zaktualizowany przez pierwszą.
+#[allow(clippy::too_many_arguments)]
+pub fn block_prefill(
+    kernels: &Kernels,
+    device: &dyn Device,
+    weights: &DeepseekBlockWeights<'_>,
+    attn_shape: &DeepseekAttnShape,
+    ffn_shape: &DeepseekFfnShape,
+    hc_cfg: &HyperConnectionConfig,
+    bufs: &DeepseekBlockBufs,
+    state: &DevBuffer,
+    out: &DevBuffer,
+    tokens: usize,
+    token_ids: Option<&[u32]>,
+    stream: &Stream,
+) -> Result<()> {
+    let hidden = attn_shape.hidden;
+
+    hc_enter(
+        kernels,
+        weights.hc_attn,
+        weights.attn_norm,
+        &bufs.hc_attn,
+        state,
+        hidden,
+        tokens,
+        hc_cfg.sinkhorn_iters,
+        hc_cfg.eps,
+        hc_cfg.hc_eps,
+        stream,
+    )?;
+    attention_prefill(
+        kernels,
+        device,
+        weights.attn,
+        attn_shape,
+        &bufs.attn,
+        bufs.hc_attn.normed(),
+        &bufs.sub_out,
+        tokens,
+        stream,
+    )?;
+    hc_leave(
+        kernels,
+        &bufs.hc_attn,
+        &bufs.sub_out,
+        state,
+        &bufs.state,
+        hidden,
+        tokens,
+        stream,
+    )?;
+
+    hc_enter(
+        kernels,
+        weights.hc_ffn,
+        weights.ffn_norm,
+        &bufs.hc_ffn,
+        &bufs.state,
+        hidden,
+        tokens,
+        hc_cfg.sinkhorn_iters,
+        hc_cfg.eps,
+        hc_cfg.hc_eps,
+        stream,
+    )?;
+    ffn_prefill(
+        kernels,
+        device,
+        weights.moe,
+        ffn_shape,
+        &bufs.ffn,
+        bufs.hc_ffn.normed(),
+        &bufs.sub_out,
+        tokens,
+        token_ids,
+        stream,
+    )?;
+    hc_leave(
+        kernels,
+        &bufs.hc_ffn,
+        &bufs.sub_out,
+        &bufs.state,
+        out,
+        hidden,
+        tokens,
+        stream,
+    )
+}
