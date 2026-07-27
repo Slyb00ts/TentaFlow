@@ -20,6 +20,7 @@ use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 use half::f16;
 
+use crate::expert_spill::ExpertSpill;
 use crate::moe_residency::ExpertStack;
 use crate::weights::{
     CompressorWeights, DeepseekAttnWeights, DevWeight, HyperConnectionWeights, LayerFfn,
@@ -485,7 +486,10 @@ pub fn attention_prefill(
     kernels.act_quant_fp8_f16(&bufs.kv_all, shape.head_dim, 0, shape.nope(), 64, tokens, stream)?;
 
     // --- strumień skompresowany ---
-    if let Some(compressor) = weights.compressor.as_ref() {
+    // Przy stopniu kompresji 128 i krótkim prompcie żadne okno się nie domyka,
+    // więc strumień skompresowany jest pusty — uruchomienie kernela z zerową
+    // siatką jest błędem sterownika, a nie operacją pustą.
+    if let (Some(compressor), true) = (weights.compressor.as_ref(), blocks > 0) {
         let wide = if shape.overlap() {
             2 * shape.head_dim
         } else {
@@ -526,7 +530,7 @@ pub fn attention_prefill(
     }
 
     // --- wybór pozycji ---
-    let selected = match weights.indexer.as_ref() {
+    let selected = match weights.indexer.as_ref().filter(|_| blocks > 0) {
         Some(indexer) => Some(index_topk(
             kernels, device, indexer, shape, bufs, x, tokens, blocks, stream,
         )?),
@@ -855,6 +859,7 @@ pub fn ffn_prefill(
     out: &DevBuffer,
     tokens: usize,
     token_ids: Option<&[u32]>,
+    spill: Option<&ExpertSpill>,
     stream: &Stream,
 ) -> Result<()> {
     if tokens > bufs.max_tokens {
@@ -908,9 +913,28 @@ pub fn ffn_prefill(
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
+    let popularity = vec![0f32; moe.n_experts];
     for token in 0..tokens {
         let x_off = token * shape.hidden * 2;
         let out_off = token * shape.hidden * 2;
+        // Ściągnięcie musi nastąpić TUŻ przed użyciem: liczba slotów w pamięci
+        // jest ograniczona, więc komplet dla kolejnego tokenu wypiera komplet
+        // poprzedniego. Ściąganie z wyprzedzeniem dla wszystkich tokenów
+        // kończy się tym, że pierwszego z nich już nie ma, gdy przychodzi jego
+        // kolej. Cały komplet jednego tokenu idzie jednym zgłoszeniem, bo NVMe
+        // oddaje pełną przepustowość dopiero przy głębokiej kolejce.
+        if let Some(spill) = spill {
+            let wanted: Vec<usize> = ids[token * top_k..(token + 1) * top_k]
+                .iter()
+                .map(|e| *e as usize)
+                .collect();
+            for stack in [&moe.gate_exps, &moe.up_exps, &moe.down_exps] {
+                if stack.fully_resident() {
+                    continue;
+                }
+                stack.fault_in(device, spill, &wanted, &popularity)?;
+            }
+        }
         for slot in 0..top_k {
             let expert = ids[token * top_k + slot] as usize;
             run_expert(
@@ -1169,6 +1193,7 @@ pub fn block_prefill(
     out: &DevBuffer,
     tokens: usize,
     token_ids: Option<&[u32]>,
+    spill: Option<&ExpertSpill>,
     stream: &Stream,
 ) -> Result<()> {
     let hidden = attn_shape.hidden;
@@ -1231,6 +1256,7 @@ pub fn block_prefill(
         &bufs.sub_out,
         tokens,
         token_ids,
+        spill,
         stream,
     )?;
     hc_leave(
@@ -1324,6 +1350,7 @@ pub fn model_prefill(
     shape: &DeepseekModelShape,
     bufs: &mut DeepseekModelBufs,
     token_ids: &[u32],
+    spill: Option<&ExpertSpill>,
     stream: &Stream,
 ) -> Result<()> {
     let tokens = token_ids.len();
@@ -1399,6 +1426,7 @@ pub fn model_prefill(
             &bufs.next_state,
             tokens,
             Some(token_ids),
+            spill,
             stream,
         )?;
         std::mem::swap(&mut bufs.state, &mut bufs.next_state);

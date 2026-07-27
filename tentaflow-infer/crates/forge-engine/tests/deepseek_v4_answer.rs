@@ -23,7 +23,19 @@ use forge_hal::Device;
 use forge_kernels::Kernels;
 use forge_tokenize::Tokenizer;
 
-const LAYERS: usize = 2;
+/// Ile warstw wczytać. Pełny model ma 43, ale 157 GB nie mieści się w budżecie
+/// testu; zmienna pozwala podnieść to bez rekompilacji przy ręcznym przebiegu.
+fn layers() -> usize {
+    std::env::var("FORGE_DEEPSEEK_V4_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
+/// Katalog na plik zrzutu wag ekspertów; bez niego brak pamięci jest błędem.
+fn spill_dir() -> Option<PathBuf> {
+    std::env::var("FORGE_DEEPSEEK_V4_SPILL").ok().map(PathBuf::from)
+}
 
 fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
@@ -135,9 +147,25 @@ fn prompt_runs_end_to_end_and_predicts_a_decodable_token() {
         "tokenizer zwrócił identyfikator spoza słownika modelu"
     );
 
-    let weights = load_deepseek_prefix_for_test(dev.as_ref(), &dir, LAYERS, 4 << 30, None)
-        .expect("wczytanie obciętego modelu");
-    let shape = model_shape(&config, LAYERS);
+    let spill = spill_dir()
+        .map(|dir| forge_engine::expert_spill::ExpertSpill::create(&dir, "answer"))
+        .transpose()
+        .expect("plik zrzutu");
+    let host_budget: usize = std::env::var("FORGE_DEEPSEEK_V4_HOST_GB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        << 30;
+    let n_layers = layers();
+    let started = std::time::Instant::now();
+    let weights =
+        load_deepseek_prefix_for_test(dev.clone(), &dir, n_layers, host_budget, spill.as_ref())
+            .expect("wczytanie modelu");
+    eprintln!(
+        "wczytano {n_layers} warstw w {:.1} s",
+        started.elapsed().as_secs_f32()
+    );
+    let shape = model_shape(&config, n_layers);
     let mut bufs = DeepseekModelBufs::new(dev.as_ref(), &shape, tokens.len()).unwrap();
 
     model_prefill(
@@ -147,6 +175,7 @@ fn prompt_runs_end_to_end_and_predicts_a_decodable_token() {
         &shape,
         &mut bufs,
         &tokens,
+        spill.as_ref(),
         &stream,
     )
     .expect("prefill modelu");

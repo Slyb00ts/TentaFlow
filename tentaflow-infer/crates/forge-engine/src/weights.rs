@@ -1441,15 +1441,16 @@ fn fetch_deepseek_weight(st: &ShardedSafeTensors, name: &str) -> Result<Option<H
 }
 
 impl TensorSource for StSource<'_> {
+    fn byte_len(&self, name: &str) -> Option<usize> {
+        let info = self.st.tensor(name)?;
+        Some(info.numel() * info.dtype.size())
+    }
+
     fn fetch_deepseek(&self, name: &str) -> Result<Option<HostWeight>> {
         if !self.deepseek_v4 {
             return Ok(None);
         }
         fetch_deepseek_weight(self.st, name)
-    }
-
-    fn byte_len(&self, _name: &str) -> Option<usize> {
-        None
     }
 
 
@@ -2280,7 +2281,7 @@ fn upload_per_expert_stack(
 /// na prawdziwych wagach, nie na syntetyku. Obcięty model jest poprawnym
 /// modelem o mniejszej liczbie warstw, więc ścieżka wykonania jest ta sama.
 pub fn load_deepseek_prefix_for_test(
-    device: &dyn Device,
+    device: Arc<dyn Device>,
     dir: &Path,
     layers: usize,
     host_budget: usize,
@@ -2299,7 +2300,13 @@ pub fn load_deepseek_prefix_for_test(
         fp8: false,
         deepseek_v4: true,
     };
-    ModelWeights::load_deepseek_v4(device, descriptor, &src, spill, host_budget)
+    // Bez tej nakładki wagi, które nie zmieszczą się w VRAM, nie mają dokąd
+    // pójść — a budżet rezydencji liczy pojemność jako VRAM PLUS pamięć hosta.
+    let sink: Arc<dyn Device> = Arc::new(crate::weight_tier::TieredWeightDevice::new(
+        device,
+        host_budget,
+    ));
+    ModelWeights::load_deepseek_v4(sink.as_ref(), descriptor, &src, spill, host_budget)
 }
 
 /// Wczytuje samą warstwę uwagi DeepSeeka V4 z katalogu safetensors.
@@ -2343,16 +2350,20 @@ fn expert_residency_budget(
     // ten koszt uwzględnia, a pozostałe wagi warstw idą do pamięci takie, jakie
     // są na dysku — dla nich rachunek z pliku jest dokładny.
     let capacity = device.pool_available(Pool::Weights)?;
+    let n_experts = descriptor.params.moe.as_ref().map(|moe| moe.n_experts);
     let mut expert_bytes = 0usize;
     let mut layer_bytes = 0usize;
     for layer in &descriptor.layers {
         for (role, name) in layer {
-            let bytes = src.byte_len(name)?;
             match role {
                 WeightRole::FfnGateExps | WeightRole::FfnUpExps | WeightRole::FfnDownExps => {
-                    expert_bytes += bytes
+                    // Rola per ekspert jest SZABLONEM — rozmiar bierzemy z
+                    // eksperta zerowego i mnożymy, bo wszyscy są równi.
+                    let n = n_experts?;
+                    let first = name.replace("{expert}", "0");
+                    expert_bytes += src.byte_len(&first)? * n;
                 }
-                _ => layer_bytes += bytes,
+                _ => layer_bytes += src.byte_len(name)?,
             }
         }
     }

@@ -125,7 +125,7 @@ fn model_prefill_produces_finite_logits() {
     let kernels = Kernels::load(dev.clone()).unwrap();
     let stream = dev.create_stream().unwrap();
 
-    let weights = load_deepseek_prefix_for_test(dev.as_ref(), &dir, LAYERS, 4 << 30, None)
+    let weights = load_deepseek_prefix_for_test(dev.clone(), &dir, LAYERS, 4 << 30, None)
         .expect("wczytanie obciętego modelu");
     let shape = model_shape(&config, LAYERS);
     let tokens: Vec<u32> = vec![0, 17, 342, 9001, 5, 88, 1234, 7];
@@ -138,6 +138,7 @@ fn model_prefill_produces_finite_logits() {
         &shape,
         &mut bufs,
         &tokens,
+        None,
         &stream,
     )
     .expect("prefill modelu");
