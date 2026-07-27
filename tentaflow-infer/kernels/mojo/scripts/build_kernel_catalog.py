@@ -172,11 +172,26 @@ def entry_from_amdgcn(text, artifact):
     raise RuntimeError(f"brak symbolu .globl w {artifact}.s")
 
 
-def assemble_amdgcn(text, arch, artifact, out_path):
-    rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
-    clang = rocm / "llvm" / "bin" / "clang"
-    if not clang.is_file():
-        raise RuntimeError(f"brak {clang}; ustaw ROCM_PATH")
+# PUŁAPKA gfx11+: LLVM w Mojo zapisuje `.amdhsa_inst_pref_size` jako WYRAŻENIE
+# `instprefsize(.Lfunc_end - kernel)`, którego parser asemblera w ROCm jeszcze nie
+# zna — zrzut nie przechodzi przez własny asembler AMD. Wartość liczymy sami, bo
+# to zwykłe pole deskryptora: rozmiar kodu w liniach I-cache, przycięty do
+# szerokości pola. Formuła i stałe za `AMDGPUMCExpr::evaluateInstPrefSize` oraz
+# `getInstCacheLineSize` (gfx11/gfx12 = 128 B, pole 6-bitowe).
+INST_PREF_DIRECTIVE = ".amdhsa_inst_pref_size"
+INST_PREF_MARKER = "instprefsize("
+INST_CACHE_LINE = {"gfx11": 128, "gfx12": 128}
+INST_PREF_MAX = 63
+
+
+def inst_cache_line(arch):
+    for prefix, size in INST_CACHE_LINE.items():
+        if arch.startswith(prefix):
+            return size
+    return 64
+
+
+def run_amdgcn_assembler(clang, text, arch, artifact, out_path):
     with tempfile.TemporaryDirectory(prefix="forge-amdgcn-") as work:
         source = Path(work) / f"{artifact}.s"
         source.write_text(text)
@@ -197,6 +212,49 @@ def assemble_amdgcn(text, arch, artifact, out_path):
         )
     if result.returncode != 0:
         raise RuntimeError(f"asemblacja {artifact} dla {arch} nie powiodla sie: {result.stderr}")
+
+
+def rewrite_inst_pref_size(text, value):
+    lines = []
+    for line in text.splitlines():
+        if line.strip().startswith(INST_PREF_DIRECTIVE):
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.append(f"{indent}{INST_PREF_DIRECTIVE} {value}")
+        else:
+            lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def kernel_code_size(rocm, object_path, artifact, entry):
+    readelf = rocm / "llvm" / "bin" / "llvm-readelf"
+    result = subprocess.run(
+        [str(readelf), "-sW", str(object_path)], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"odczyt symboli {artifact}: {result.stderr}")
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and fields[3] == "FUNC" and fields[-1] == entry:
+            return int(fields[2], 16)
+    raise RuntimeError(f"{artifact}: brak symbolu kernela {entry} w obiekcie")
+
+
+def assemble_amdgcn(text, arch, artifact, out_path):
+    rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+    clang = rocm / "llvm" / "bin" / "clang"
+    if not clang.is_file():
+        raise RuntimeError(f"brak {clang}; ustaw ROCM_PATH")
+    if INST_PREF_MARKER not in text:
+        run_amdgcn_assembler(clang, text, arch, artifact, out_path)
+        return
+    # Rozmiar kodu znamy dopiero po asemblacji, więc pierwszy przebieg idzie z
+    # wyzerowanym polem wyłącznie po to, żeby go zmierzyć.
+    run_amdgcn_assembler(clang, rewrite_inst_pref_size(text, 0), arch, artifact, out_path)
+    entry = entry_from_amdgcn(text, artifact)
+    lines = -(-kernel_code_size(rocm, out_path, artifact, entry) // inst_cache_line(arch))
+    run_amdgcn_assembler(
+        clang, rewrite_inst_pref_size(text, min(lines, INST_PREF_MAX)), arch, artifact, out_path
+    )
 
 def requires_sm89_cubins(arch):
     return arch == "sm_89"

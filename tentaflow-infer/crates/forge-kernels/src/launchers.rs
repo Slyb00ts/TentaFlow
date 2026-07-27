@@ -1673,6 +1673,19 @@ impl Kernels {
             && has_nvfp4_gguf_tile_artifacts(|name| self.artifacts.has(name))
     }
 
+    /// Czy backend uciągnie kaflowe Q8_0 i8mma dla T>=32.
+    ///
+    /// Warianty batchowe (`_b2`..`_b16`) są przenośne, ale kafle dla T>=32 stoją
+    /// na `ldmatrix`/`mma` NVIDII i na AMD ich po prostu nie ma. To jest jedno
+    /// źródło tej odpowiedzi — pyta o nią i launcher, i dobór chunka prefillu,
+    /// żeby silnik nie wybierał ścieżki, której backend nie uruchomi.
+    pub fn prepared_q8_tiled_capable(&self) -> bool {
+        let caps = self.device.caps();
+        matches!(caps.vendor, forge_types::Vendor::Nvidia)
+            && caps.warp_size == 32
+            && caps.max_threads_per_block >= BLOCK
+    }
+
     /// Sprawdza komplet artefaktów wymaganych przez ciągły prefill B2 T32.
     pub fn hybrid_prefill_b2_artifacts_capable(&self) -> bool {
         has_hybrid_prefill_b2_artifacts(|name| self.artifacts.has(name))
@@ -8649,16 +8662,10 @@ impl Kernels {
                 "prepare_q8_1 wymaga T=6/8 lub T>=32 i cols > 0 podzielnego przez 32, otrzymano T={n_tokens}, cols={cols}"
             )));
         }
-        if n_tokens >= 32 {
-            let caps = self.device.caps();
-            if caps.vendor != forge_types::Vendor::Nvidia
-                || caps.warp_size != 32
-                || caps.max_threads_per_block < BLOCK
-            {
-                return Err(ForgeError::Unsupported(
-                    "prepared Q8 T>=32 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
-                ));
-            }
+        if n_tokens >= 32 && !self.prepared_q8_tiled_capable() {
+            return Err(ForgeError::Unsupported(
+                "prepared Q8 T>=32 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
+            ));
         }
         let input_bytes = checked_buffer_bytes("prepare_q8_1 input", &[n_tokens, cols], 2)?;
         if x.len() < input_bytes {
@@ -8758,16 +8765,10 @@ impl Kernels {
                 "prepared Q8_0 wymaga zgodnych wymiarów T=6/8 lub T>=32 i rows > 0, otrzymano rows={rows}, cols={cols}, T={n_tokens}"
             )));
         }
-        if n_tokens >= 32 {
-            let caps = self.device.caps();
-            if caps.vendor != forge_types::Vendor::Nvidia
-                || caps.warp_size != 32
-                || caps.max_threads_per_block < BLOCK
-            {
-                return Err(ForgeError::Unsupported(
-                    "prepared Q8 T>=32 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
-                ));
-            }
+        if n_tokens >= 32 && !self.prepared_q8_tiled_capable() {
+            return Err(ForgeError::Unsupported(
+                "prepared Q8 T>=32 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
+            ));
         }
         let output_bytes = checked_buffer_bytes("prepared Q8_0 output", &[n_tokens, rows], 2)?;
         let weight_bytes = checked_buffer_bytes("prepared Q8_0 weights", &[rows, cols / 32], 34)?;

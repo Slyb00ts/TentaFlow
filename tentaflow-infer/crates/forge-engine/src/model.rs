@@ -229,6 +229,7 @@ fn resolve_hybrid_prefill_chunk_size(
     contains_nvfp4: bool,
     auto_chunk_limit: usize,
     nvfp4_chunk_limit: usize,
+    prepared_q8_tiled_capable: bool,
 ) -> Result<usize> {
     if contains_nvfp4 && nvfp4_chunk_limit < 3 {
         return Err(ForgeError::Unsupported(
@@ -246,10 +247,22 @@ fn resolve_hybrid_prefill_chunk_size(
                 "FORGE_HYBRID_PREFILL_CHUNK={chunk} przekracza limit NVFP4 backendu lub artefaktów {nvfp4_chunk_limit}"
             )));
         }
+        if !contains_nvfp4 && chunk >= 32 && !prepared_q8_tiled_capable {
+            return Err(ForgeError::Unsupported(format!(
+                "FORGE_HYBRID_PREFILL_CHUNK={chunk} wymaga kaflowego Q8 i8mma, którego backend nie ma"
+            )));
+        }
         return Ok(chunk);
     }
     if !contains_nvfp4 {
-        return Ok(HYBRID_PREFILL_LEGACY_CHUNK);
+        // Kwantyzacja aktywacji dla T>=32 wchodzi na kafle i8mma, których poza
+        // NVIDIĄ nie ma — bez tego warunku Auto wybierało chunk, który zaraz
+        // wywracał prefill na nieobsługiwanym kernelu.
+        return Ok(if prepared_q8_tiled_capable {
+            HYBRID_PREFILL_LEGACY_CHUNK
+        } else {
+            HYBRID_PREFILL_PORTABLE_CHUNK
+        });
     }
     let policy_limit = if auto_extended_capable {
         auto_chunk_limit.min(if auto_t128_capable {
@@ -13356,6 +13369,7 @@ impl Model {
             self.hybrid_prefill_contains_nvfp4(),
             auto_chunk_limit,
             executable_chunk_limit,
+            self.kernels.prepared_q8_tiled_capable(),
         )
     }
 
@@ -19066,6 +19080,7 @@ mod verify_rollback_tests {
                 true,
                 128,
                 1024,
+                true,
             )
             .unwrap(),
             128
@@ -19082,6 +19097,7 @@ mod verify_rollback_tests {
                 true,
                 32,
                 1024,
+                true,
             )
             .unwrap(),
             32
@@ -19098,6 +19114,7 @@ mod verify_rollback_tests {
                 true,
                 16,
                 16,
+                true,
             )
             .unwrap(),
             16
@@ -19114,6 +19131,7 @@ mod verify_rollback_tests {
                 true,
                 32,
                 1024,
+                true,
             )
             .unwrap(),
             32
@@ -19126,6 +19144,7 @@ mod verify_rollback_tests {
                 true,
                 16,
                 1024,
+                true,
             )
             .unwrap(),
             16
@@ -19139,6 +19158,7 @@ mod verify_rollback_tests {
                     true,
                     chunk,
                     1024,
+                    true,
                 )
                 .unwrap(),
                 chunk
@@ -19151,6 +19171,7 @@ mod verify_rollback_tests {
             true,
             2,
             1024,
+            true,
         )
         .is_err());
         assert_eq!(
@@ -19161,6 +19182,7 @@ mod verify_rollback_tests {
                 false,
                 0,
                 0,
+                true,
             )
             .unwrap(),
             32
@@ -19181,6 +19203,51 @@ mod verify_rollback_tests {
         assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Cpu, 32, 1), 0);
     }
 
+    /// Hybryda BEZ NVFP4 dostawała chunk 32 niezależnie od backendu, a
+    /// kwantyzacja aktywacji dla T>=32 wchodzi na kafle i8mma, których poza
+    /// NVIDIĄ nie ma — prefill wywracał się dopiero przy pierwszym żądaniu.
+    #[test]
+    fn auto_prefill_bez_nvfp4_schodzi_do_t16_gdy_backend_nie_ma_kafli_q8() {
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Auto,
+                false,
+                false,
+                false,
+                0,
+                0,
+                false,
+            )
+            .unwrap(),
+            crate::model::HYBRID_PREFILL_PORTABLE_CHUNK
+        );
+        // Jawne żądanie T>=32 na takim backendzie ma paść na starcie, a nie po
+        // wczytaniu modelu.
+        assert!(resolve_hybrid_prefill_chunk_size(
+            HybridPrefillChunkConfig::Explicit(32),
+            false,
+            false,
+            false,
+            0,
+            0,
+            false,
+        )
+        .is_err());
+        assert_eq!(
+            resolve_hybrid_prefill_chunk_size(
+                HybridPrefillChunkConfig::Explicit(16),
+                false,
+                false,
+                false,
+                0,
+                0,
+                false,
+            )
+            .unwrap(),
+            16
+        );
+    }
+
     #[test]
     fn jawny_chunk_prefill_zachowuje_wartosc_lub_konczy_startup_bledem() {
         for chunk in [3, 16, 64, 128, 1024] {
@@ -19192,6 +19259,7 @@ mod verify_rollback_tests {
                     true,
                     0,
                     1024,
+                    true,
                 )
                 .unwrap(),
                 chunk
@@ -19203,7 +19271,8 @@ mod verify_rollback_tests {
             false,
             true,
             0,
-            16
+            16,
+            true,
         )
         .is_err());
         assert_eq!(
@@ -19213,7 +19282,8 @@ mod verify_rollback_tests {
                 false,
                 true,
                 0,
-                16
+                16,
+                true,
             )
             .unwrap(),
             16
@@ -19225,6 +19295,7 @@ mod verify_rollback_tests {
             true,
             0,
             3,
+            true,
         )
         .is_err());
         assert!(resolve_hybrid_prefill_chunk_size(
@@ -19234,6 +19305,7 @@ mod verify_rollback_tests {
             true,
             0,
             2,
+            true,
         )
         .is_err());
         assert!(resolve_hybrid_prefill_chunk_size(
@@ -19243,6 +19315,7 @@ mod verify_rollback_tests {
             true,
             0,
             3,
+            true,
         )
         .is_err());
         assert!(resolve_hybrid_prefill_chunk_size(
@@ -19251,7 +19324,8 @@ mod verify_rollback_tests {
             false,
             true,
             0,
-            0
+            0,
+            true,
         )
         .is_err());
         assert_eq!(

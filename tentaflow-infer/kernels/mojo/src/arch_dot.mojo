@@ -17,17 +17,30 @@ from std.memory import bitcast
 def dot4_i8(a: Int32, b: Int32, c: Int32) -> Int32:
     """c + suma iloczynów czterech par bajtów ze znakiem z `a` i `b`.
 
-    Jedna instrukcja sprzętowa na obu rodzinach: `dp4a.s32.s32` na sm_61+
-    i `v_dot4_i32_i8` na gfx1030+. Kolejność akumulacji jest identyczna, więc
-    wynik jest bitowo ten sam — instrukcje liczą int32 dokładnie.
+    Jedna instrukcja sprzętowa na każdej rodzinie: `dp4a.s32.s32` na sm_61+,
+    `v_dot4_i32_i8` na RDNA2 i `v_dot4_i32_iu8` z `neg_lo` na RDNA3+. Kolejność
+    akumulacji jest identyczna, więc wynik jest bitowo ten sam — instrukcje
+    liczą int32 dokładnie.
+
+    PUŁAPKA RDNA3: asembler PRZYJMUJE `v_dot4_i32_i8` na gfx11, ale wykonuje ją
+    jako `v_dot4_i32_iu8` z domyślnie wyzerowanymi `neg_lo`, czyli traktuje oba
+    argumenty jako BEZ ZNAKU. Kernel się kompiluje, uruchamia i liczy śmieci na
+    każdym ujemnym bajcie — zmierzone na karcie: (-1,-2,-3,-4)·(4,3,2,1) dawało
+    2540 zamiast -20. Bity `neg_lo:[1,1]` przywracają interpretację ze znakiem.
     """
     # `_accelerator_arch()` opisuje akcelerator, dla którego kernel jest właśnie
     # kompilowany (np. "amdgpu:gfx1030", "nvidia:sm_89"). Nasz builder zawsze
     # kompiluje pod lokalne urządzenie, więc to jest właściwy dyskryminator;
     # przy kompilacji skrośnej trzeba go zastąpić parametrem celu.
-    comptime if _accelerator_arch().startswith("amdgpu"):
+    comptime if _accelerator_arch().startswith("amdgpu:gfx10"):
         return inlined_assembly[
             "v_dot4_i32_i8 $0, $1, $2, $0",
+            Int32,
+            constraints="=v,v,v,0",
+        ](a, b, c)
+    elif _accelerator_arch().startswith("amdgpu"):
+        return inlined_assembly[
+            "v_dot4_i32_iu8 $0, $1, $2, $0 neg_lo:[1,1]",
             Int32,
             constraints="=v,v,v,0",
         ](a, b, c)
