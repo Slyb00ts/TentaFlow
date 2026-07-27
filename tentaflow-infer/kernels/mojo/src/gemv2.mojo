@@ -98,6 +98,33 @@ def _e2m1x8(codes: SIMD[DType.uint8, 8]) -> SIMD[DType.float32, 8]:
     return mag4.cast[DType.float32]() * 0.25 * sign
 
 
+@always_inline
+def _e2m1x8_f16(codes: SIMD[DType.uint8, 8]) -> SIMD[DType.float16, 8]:
+    """Osiem kodow e2m1 wprost na wzorzec bitowy f16, bez konwersji int->float.
+
+    e2m1 to znak, dwubitowy wykladnik z biasem 1 i jednobitowa mantysa, wiec f16
+    (bias 15) powstaje przesunieciem pol: `exp16 = E + 14`, `mant16 = M << 9`.
+    DWA wyjatki: zero (maskujemy calosc) oraz jedyna wartosc subnormalna 0.5
+    (E=0, M=1), ktora w f16 jest normalna `0x3800`, czyli MA ZEROWA mantyse —
+    dlatego bit mantysy przepuszczamy tylko dla E > 0.
+
+    Wersja arytmetyczna (`_e2m1x8`) liczy magnitude maskami na int32 i konczy
+    konwersja na float — okolo dwa razy wiecej operacji wektorowych na wartosc.
+    W GEMV NVFP4 to wlasnie dekwantyzacja, a nie pamiec, byla scianka.
+    """
+    m = (codes & 0x07).cast[DType.uint16]()
+    exponent = m >> 1
+    # `(exponent + 3) >> 2` to arytmetyczny wskaznik „E > 0" (0 dla E=0, 1 dalej).
+    mantissa = (m & 1) & ((exponent + 3) >> 2)
+    bits = ((exponent + 14) << 10) | (mantissa << 9)
+    # Porownania SIMD zapadaja sie w tym toolchainie do skalarnego Bool, wiec
+    # maska „m != 0" musi byc arytmetyczna: (m + 7) >> 3 daje 0 dla zera i 1 dla
+    # kazdego innego kodu, a odjecie od zera rozciaga to na pelne 0xFFFF.
+    nonzero = SIMD[DType.uint16, 8](0) - ((m + 7) >> 3)
+    sign = ((codes >> 3) & 1).cast[DType.uint16]() << 15
+    return bitcast[DType.float16, 8]((bits & nonzero) | sign)
+
+
 comptime _f8e4m3s = f8e4m3_to_f32
 
 

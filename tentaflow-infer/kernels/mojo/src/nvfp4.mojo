@@ -9,6 +9,8 @@ from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
 from src.reduce import block_reduce_sum
+from src.gemv2 import _e2m1x8, _e2m1x8_f16
+from src.nvfp4_gguf_batch import _ue4m3_value
 from src.kv_fp8 import _e4m3x2_to_f16x2
 from std.gpu.primitives import warp
 
@@ -228,6 +230,68 @@ def gemv_nvfp4_gguf_f16(
 
     total = block_reduce_sum(acc)
     if Int(thread_idx.x) == 0:
+        y[row] = Float16(total * output_scale)
+
+
+comptime GEMV_WAVE_ROWS = 8  # wierszy na blok: osiem fal po 32 linie
+
+
+def gemv_nvfp4_gguf_f16_wave(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    output_scale: Float32,
+):
+    """`y[row] = dot(W[row], x)` z bloków GGUF NVFP4, JEDNA FALA NA WIERSZ.
+
+    Wariant blokowy (`gemv_nvfp4_gguf_f16`) dawał jeden workgroup 256 wątków na
+    wiersz, a wiersz to zaledwie kilka kilobajtów — na każdy wątek wypadało
+    kilkanaście bajtów, po czym redukcja przez CAŁY blok kosztowała tyle, co
+    samo liczenie. Do tego wagi i aktywacje czytał BAJT PO BAJCIE.
+
+    Tutaj wiersz obsługuje jedna fala: redukcja jest wewnątrz fali (bez LDS i
+    bez bariery), a odczyty są ośmioelementowe. Fala czyta w jednej iteracji
+    osiem sąsiadujących bloków, czyli 288 ciągłych bajtów.
+    """
+    var lane = Int(thread_idx.x) % WARP_SIZE
+    var wave = Int(thread_idx.x) // WARP_SIZE
+    var row = Int(block_idx.x) * GEMV_WAVE_ROWS + wave
+    if row >= n_rows:
+        return
+
+    # Para podblokow lezy w bloku obok siebie (bajty 4..19 i 20..35), wiec
+    # jednym 16-bajtowym odczytem bierzemy dwa naraz. Dwa akumulatory trzymaja
+    # oba lancuchy niezalezne — VALU RDNA ma kilkutaktowa latencje wyniku.
+    var pairs = n_cols // (2 * GROUP)
+    var row_base = row * (n_cols // 64) * 36
+    var acc0: Float32 = 0.0
+    var acc1: Float32 = 0.0
+    var pair = lane
+    while pair < pairs:
+        block_base = row_base + (pair // 2) * 36
+        half = (pair % 2) * 2
+        codes = (weights + block_base + 4 + half * 8).load[width=16, alignment=1]()
+        column = pair * 2 * GROUP
+        lo = codes.slice[8]()
+        hi = codes.slice[8, offset=8]()
+        x0 = (x + column).load[width=8, alignment=2]()
+        x1 = (x + column + 8).load[width=8, alignment=2]()
+        x2 = (x + column + 16).load[width=8, alignment=2]()
+        x3 = (x + column + 24).load[width=8, alignment=2]()
+        acc0 += _ue4m3_value(weights[block_base + half]) * (
+            (_e2m1x8_f16(lo & 0x0F) * x0).cast[DType.float32]().reduce_add()
+            + (_e2m1x8_f16(lo >> 4) * x1).cast[DType.float32]().reduce_add()
+        )
+        acc1 += _ue4m3_value(weights[block_base + half + 1]) * (
+            (_e2m1x8_f16(hi & 0x0F) * x2).cast[DType.float32]().reduce_add()
+            + (_e2m1x8_f16(hi >> 4) * x3).cast[DType.float32]().reduce_add()
+        )
+        pair += WARP_SIZE
+
+    total = warp.sum(acc0 + acc1)
+    if lane == 0:
         y[row] = Float16(total * output_scale)
 
 

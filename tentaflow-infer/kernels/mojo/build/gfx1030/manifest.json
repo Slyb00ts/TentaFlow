@@ -977,6 +977,10 @@
       "entry": "src_nvfp4_gemv_nvfp4_gguf_f166A6A6A6AoA_752dc9ccbf2b37e0",
       "file": "gemv_nvfp4_gguf_f16.hsaco"
     },
+    "gemv_nvfp4_gguf_f16_wave": {
+      "entry": "src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_e71fc82a096529c3",
+      "file": "gemv_nvfp4_gguf_f16_wave.hsaco"
+    },
     "gemv_nvfp4_gguf_out_f32": {
       "entry": "src_nvfp4_gemv_nvfp4_gguf_out_6A6A6A6A_f86ea6d141753a07",
       "file": "gemv_nvfp4_gguf_out_f32.hsaco"

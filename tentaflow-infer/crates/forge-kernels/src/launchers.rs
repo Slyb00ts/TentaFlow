@@ -14,6 +14,10 @@ use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
 use crate::registry::KernelArtifacts;
 
 const BLOCK: u32 = 256;
+
+/// GEMV NVFP4 z jedną falą na wiersz; `GEMV_WAVE_ROWS` w `src/nvfp4.mojo`.
+const GEMV_NVFP4_WAVE: &str = "gemv_nvfp4_gguf_f16_wave";
+const GEMV_NVFP4_WAVE_ROWS: u32 = 8;
 const FP8_MODULAR_BN256_SMEM: usize = 98_304;
 const FP8_MODULAR_BN256_TOKENS: usize = 1024;
 static FP8_MODULAR_BN256_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -4705,6 +4709,26 @@ impl Kernels {
             return Err(ForgeError::Kernel(
                 "gemv_nvfp4_gguf_f16: bufor jest mniejszy od wymaganego kształtu".into(),
             ));
+        }
+        // Wariant „fala na wiersz" zmierzył 493 GB/s wobec 133 GB/s wariantu
+        // blokowego na kształcie 17408x5120 — wiersz ma kilka kilobajtów, więc
+        // workgroup 256 wątków na wiersz płacił za redukcję przez cały blok
+        // więcej, niż kosztowało samo liczenie.
+        if self.artifacts.has(GEMV_NVFP4_WAVE) {
+            let k = self.artifacts.get(GEMV_NVFP4_WAVE)?;
+            let cfg = LaunchConfig {
+                grid: (grid_x.div_ceil(GEMV_NVFP4_WAVE_ROWS), 1, 1),
+                block: (GEMV_NVFP4_WAVE_ROWS * 32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let args = LaunchArgs::new()
+                .buf(y)
+                .buf(weights)
+                .buf(x)
+                .scalar(cols as i64)
+                .scalar(rows as i64)
+                .scalar(output_scale);
+            return self.device.launch(k, &cfg, &args, stream);
         }
         let k = self.artifacts.get("gemv_nvfp4_gguf_f16")?;
         let cfg = LaunchConfig {

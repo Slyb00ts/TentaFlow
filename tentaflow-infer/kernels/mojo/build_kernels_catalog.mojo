@@ -88,6 +88,7 @@ from src.deltanet_verify import (
 from src.deltanet_scan_persistent import deltanet_gated_scan_persistent_d128_f16
 from src.deltanet_prepare_tiled import deltanet_prepare_tiled_d128_c4_f16
 from src.nvfp4 import (
+    gemv_nvfp4_gguf_f16_wave,
     gemv_nvfp4_f16,
     pack_f16_fp8,
     pack_nvfp4_fp8,
@@ -1147,6 +1148,10 @@ def main() raises:
         gemv_nvfp4_gguf_f16, dump_asm=Path("gemv_nvfp4_gguf_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_f16"))
+    _ = ctx.compile_function[
+        gemv_nvfp4_gguf_f16_wave, dump_asm=Path("gemv_nvfp4_gguf_f16_wave.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_f16_wave"))
     _ = ctx.compile_function[
         gemv_nvfp4_gguf_out_f32, dump_asm=Path("gemv_nvfp4_gguf_out_f32.ptx")
     ]()
