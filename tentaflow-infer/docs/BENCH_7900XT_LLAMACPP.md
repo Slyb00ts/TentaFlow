@@ -17,10 +17,10 @@ stronicowania przez PCIe. Na 6900 XT ten model NIE WCHODZI (16 GiB).
 | | FORGE (stan wyjściowy) | **FORGE (teraz)** | llama.cpp | |
 |---|--:|--:|--:|---|
 | prefill p1024 | 27,3 tok/s | **843,9** tok/s | 716,3 tok/s | **FORGE 1,18x** |
-| decode tg128, bez spekulacji | 9,5 tok/s | **26,4** tok/s | **33,0** tok/s | llama.cpp 1,25x |
-| decode tg128, MTP po obu stronach | 47,1 tok/s | **51,4** tok/s | **73,4** tok/s | llama.cpp 1,43x |
+| decode tg128, bez spekulacji | 9,5 tok/s | **30,8** tok/s | **33,0** tok/s | llama.cpp 1,07x |
+| decode tg128, MTP po obu stronach | 47,1 tok/s | **51,7** tok/s | **73,4** tok/s | llama.cpp 1,42x |
 
-**Prefill urósł 30,9x i wyprzedził llama.cpp**, decode 2,8x. Wyjście jest przez
+**Prefill urósł 30,9x i wyprzedził llama.cpp**, decode 3,2x i jest 7% od niego. Wyjście jest przez
 całą tę drogę BITOWO IDENTYCZNE — ta sama suma SHA 128 tokenów co przed
 pierwszą zmianą (`0bf2b86b…`).
 
@@ -94,13 +94,37 @@ ZMIERZONE I ODRZUCONE (wszystkie brzmiały sensownie):
 - tania dekwantyzacja bitowa w GEMM-ie WMMA — 503 → 439 tok/s; to, co pomaga
   kernelowi ograniczonemu pamięcią, szkodzi ograniczonemu jednostką macierzową.
 
+**Decode, dodatkowe 1,17x: ścieżka int8 była zabramkowana na NVIDII.**
+`raw_nvfp4_dp4a_supported` wymagało `is_nvidia`, więc AMD schodziło na wariant
+f16 — a izolowany pomiar dał **993 GB/s dla int8 wobec 486 GB/s dla f16**.
+Iloczyn dp4a ma instrukcję sprzętową na obu rodzinach (`dot4_i8`), więc warunkiem
+jest teraz FALA 32 i obecność artefaktów, nie producent. Kody e2m1 skalują się
+przez dwa do dokładnych int8, więc to nie jest przybliżenie.
+
+### Dlaczego „llama.cpp jest na roofline" było błędem
+
+Twierdziłem to na podstawie naszego benchu roofline (674 GB/s). Osobny pomiar
+SAMEGO WZORCA DOSTĘPU pokazał co innego:
+
+| zbiór roboczy | wzorzec GGUF (krok 36 B) | ciągły, wyrównany do 16 B |
+|---|--:|--:|
+| 14,7 MB (mieści się w Infinity Cache) | 1624 GB/s | 1548 GB/s |
+| 188 MB (poza cache) | 649 GB/s | **735 GB/s** |
+
+Czyli: (1) realny sufit DRAM to **735 GB/s**, nie 674; (2) niewyrównany krok 36 B
+kosztuje **13%** poza cache; (3) przy zbiorach mieszczących się w cache czysty
+odczyt idzie 1,6 TB/s, więc GEMV trzymające tam 247 GB/s NIE było ograniczone
+pamięcią — ograniczały je konwersje f16->f32 w pętli. To ten pomiar wskazał
+ścieżkę int8.
+
 ZOSTAJE, w kolejności wartości:
-1. **decode** — 1,25x luki; NVFP4 GEMV chodzi po 542 z 674 GB/s, czyli jest już
-   blisko roofline, a reszta różnicy to narzut **1193 uruchomień kerneli na
-   token** (w tym 427 kopii D2D),
-2. wąskie projekcje w GEMV trzymają 247-259 GB/s wobec 542 na szerokich —
-   ograniczenie latencji przy krótkiej pętli,
-3. `gemm_q4_k_dot4_*` (OLMoE i pozostałe GGUF K-quant) wciąż na instrukcjach dot.
+1. **~8 ms z 32 ms na token idzie w ~900 małych kerneli** (rmsnorm, DeltaNet,
+   427 kopii D2D). To fuzja kerneli, nie strojenie pojedynczego.
+2. Niewyrównany krok 36 B: przepakowanie wag na płaszczyzny (skale osobno, kody
+   osobno) dałoby 16-bajtowe odczyty wyrównane i do 13% na ścieżce DRAM.
+3. `quantize_act_q8_1` startuje 266 razy na token przy 294 GEMV — projekcje
+   dzielące tę samą aktywację (gate+up, qkv) idą pojedynczo zamiast grupami.
+4. `gemm_q4_k_dot4_*` (OLMoE i pozostałe GGUF K-quant) wciąż na instrukcjach dot.
 
 ## Zastrzeżenia metodyczne
 
