@@ -139,6 +139,41 @@ liczby wyglądające sensownie:
   nadal liczy się z wyniku bramki. Pominięcie tego rozróżnienia daje poprawne
   wagi przy błędnych ekspertach.
 
+## Warstwa wykonawcza
+
+Kernele (`kernels/mojo/src/deepseek.mojo`), każdy z testem złotym na GPU
+przeciwko referencji CPU: `rmsnorm_head_f16`, `rope_interleaved_f16` (z
+wariantem odwrotnym), `hadamard_bf16_f16`, `act_quant_fp8_f16`,
+`act_quant_fp4_f16`, `compressor_pool_f16`, `compressor_add_ape_f32`,
+`sparse_attn_f16`, `index_score_f16`, `hc_sinkhorn_f32`, `hc_reduce_f16`,
+`hc_expand_f16`, `moe_gate_sqrtsoftplus_f16`, plus `gemv_fp8_row_f16_v2` dla
+wag ze skalą wierszową.
+
+**Ścieżka uwagi liczy się na GPU** od wejścia warstwy po jej wyjście, zgodna z
+referencją na 2,3e-2 (`crates/forge-engine/tests/deepseek_v4_attention_gpu.rs`).
+Wagi warstwy wczytują się na urządzenie z prawdziwego checkpointu, przez
+produkcyjne konwersje kwantyzacji.
+
+Test złożenia zarobił na siebie od razu — złapał trzy błędy niewidoczne dla
+testów pojedynczych kerneli:
+
+- krok tablicy slotów kompresora liczony przez `head_dim` UWAGI, podczas gdy
+  indekser ma własny, mniejszy — krok wychodził zerowy,
+- kompresor liczony w f16: wyniki bramki wychodzą poza zakres, dają `inf`, a
+  softmax z `inf - inf` daje NaN. Referencja mówi o tym jednym zdaniem
+  („compression need fp32") i nie jest to kwestia dokładności, tylko poprawności,
+- kodowanie pozycji `ape` czytane jako f16, gdy w checkpoincie jest f32.
+
+Diagnoza szła po objawie: pierwsze TRZY tokeny zgadzały się z referencją, a NaN
+zaczynał się od czwartego — czyli dokładnie tam, gdzie do uwagi wchodzi pierwszy
+wpis skompresowany.
+
+Budowanie kerneli ma tryb przyrostowy (`FORGE_KERNEL_BUILD_ONLY=nazwa,...`):
+pełny przebieg to ~55 minut na 518 kerneli, dobudowa pojedynczego — 2 sekundy.
+Publikacja pozostaje atomowa. Tryb NIE usuwa artefaktów spoza katalogu:
+część kerneli budują osobne skrypty `build_*.mojo`, których parser katalogu nie
+zna, więc automatyczne czyszczenie kasowało działające pliki.
+
 ## Architektura — co trzeba odtworzyć
 
 Siedem niezależnych mechanizmów, z których FORGE nie ma żadnego.
@@ -219,9 +254,13 @@ blok MTP.
 
 Zostaje warstwa wykonawcza:
 
-1. **Kernele GPU** dla uwagi latentnej, obu kompresorów, indeksera, rzadkiej
-   uwagi po zebranych indeksach i hyper-connections.
-2. **MTP.**
+1. **Ścieżka FFN** — eksperty i ekspert dzielony spięte z bramką, oraz routing
+   haszowany przez `tid2eid`.
+2. **Blok** — hyper-connections spięte wokół uwagi i FFN.
+3. **Model** — 43 warstwy, głowa wyjściowa, dekodowanie ze stanem okna.
+4. **MTP.**
+5. **Wybór top-k indeksera na GPU** — dziś liczony na hoście, co kosztuje jedną
+   synchronizację na warstwę.
 
 Każdy z tych punktów da się zwalidować numerycznie przeciwko `inference/model.py`
 osobno, i tak trzeba je robić — model, który nie mieści się w VRAM i nie ma
