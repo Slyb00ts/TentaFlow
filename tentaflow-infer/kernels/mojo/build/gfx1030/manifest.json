@@ -1237,6 +1237,18 @@
       "entry": "src_deepseek_hadamard_bf16_f166A6A6A6A_b70dfc00074ae163",
       "file": "hadamard_bf16_f16.hsaco"
     },
+    "hc_expand_f16": {
+      "entry": "src_deepseek_hc_expand_f16_P6A6A6A6AoA6A6A_348b2a0f575f426a",
+      "file": "hc_expand_f16.hsaco"
+    },
+    "hc_reduce_f16": {
+      "entry": "src_deepseek_hc_reduce_f16_P6A6A6A6AoA6A6A_9ff85a7887c0cc28",
+      "file": "hc_reduce_f16.hsaco"
+    },
+    "hc_sinkhorn_f32": {
+      "entry": "src_deepseek_hc_sinkhorn_f326A6A6A6AoA6A_02a2963a752aa574",
+      "file": "hc_sinkhorn_f32.hsaco"
+    },
     "kv_append_batch_device_pos_f16": {
       "entry": "src_prefill_kv_append_batch_de6A6A6A6A_284e8c71ecc1427d",
       "file": "kv_append_batch_device_pos_f16.hsaco"

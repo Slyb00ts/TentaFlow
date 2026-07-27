@@ -447,3 +447,187 @@ fn sparse_attention_matches_the_cpu_reference() {
         }
     }
 }
+
+fn download_f32(dev: &dyn Device, buf: &DevBuffer, n: usize) -> Vec<f32> {
+    let mut bytes = vec![0u8; n * 4];
+    dev.read(buf, 0, &mut bytes).unwrap();
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Sinkhorn. Test sprawdza nie tylko zgodność z referencją, ale i własność, dla
+/// której ta procedura w ogóle istnieje: macierz ma być podwójnie stochastyczna.
+#[test]
+fn hc_sinkhorn_matches_the_cpu_reference() {
+    let dev = device();
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (hc, iters, eps, n_tokens) = (4usize, 20usize, 1e-6f32, 5usize);
+    let mix_hc = (2 + hc) * hc;
+
+    let mixes = pattern(n_tokens * mix_hc, 59);
+    let scale = vec![0.7f32, 1.3, 0.9];
+    let base = pattern(mix_hc, 23);
+
+    let mixes_buf = upload_f32(dev.as_ref(), &mixes);
+    let scale_buf = upload_f32(dev.as_ref(), &scale);
+    let base_buf = upload_f32(dev.as_ref(), &base);
+    let pre = dev
+        .alloc(n_tokens * hc * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let post = dev
+        .alloc(n_tokens * hc * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let comb = dev
+        .alloc(n_tokens * hc * hc * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+
+    kernels
+        .hc_sinkhorn_f32(
+            &pre, &post, &comb, &mixes_buf, &scale_buf, &base_buf, hc, iters, eps, n_tokens,
+            &stream,
+        )
+        .unwrap();
+    stream.synchronize().unwrap();
+    let got_pre = download_f32(dev.as_ref(), &pre, n_tokens * hc);
+    let got_post = download_f32(dev.as_ref(), &post, n_tokens * hc);
+    let got_comb = download_f32(dev.as_ref(), &comb, n_tokens * hc * hc);
+
+    let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+    for token in 0..n_tokens {
+        let m = &mixes[token * mix_hc..(token + 1) * mix_hc];
+        for j in 0..hc {
+            let want_pre = sigmoid(m[j] * scale[0] + base[j]) + eps;
+            let want_post = 2.0 * sigmoid(m[j + hc] * scale[1] + base[j + hc]);
+            assert!((got_pre[token * hc + j] - want_pre).abs() < 1e-5);
+            assert!((got_post[token * hc + j] - want_post).abs() < 1e-5);
+        }
+
+        let mut want = vec![0f32; hc * hc];
+        for j in 0..hc {
+            for k in 0..hc {
+                let at = j * hc + k + 2 * hc;
+                want[j * hc + k] = m[at] * scale[2] + base[at];
+            }
+        }
+        for j in 0..hc {
+            let row = &mut want[j * hc..(j + 1) * hc];
+            let max = row.iter().fold(f32::NEG_INFINITY, |a, v| a.max(*v));
+            let mut sum = 0f32;
+            row.iter_mut().for_each(|v| {
+                *v = (*v - max).exp();
+                sum += *v;
+            });
+            row.iter_mut().for_each(|v| *v = *v / sum + eps);
+        }
+        let norm_cols = |w: &mut Vec<f32>| {
+            for k in 0..hc {
+                let sum: f32 = (0..hc).map(|j| w[j * hc + k]).sum();
+                for j in 0..hc {
+                    w[j * hc + k] /= sum + eps;
+                }
+            }
+        };
+        norm_cols(&mut want);
+        for _ in 0..iters - 1 {
+            for j in 0..hc {
+                let sum: f32 = want[j * hc..(j + 1) * hc].iter().sum();
+                want[j * hc..(j + 1) * hc].iter_mut().for_each(|v| *v /= sum + eps);
+            }
+            norm_cols(&mut want);
+        }
+        for i in 0..hc * hc {
+            let g = got_comb[token * hc * hc + i];
+            assert!(
+                (g - want[i]).abs() < 1e-5,
+                "token {token}, element {i}: {g} zamiast {}",
+                want[i]
+            );
+        }
+
+        // Własność docelowa: sumy wierszy i kolumn bliskie jedności.
+        for j in 0..hc {
+            let row: f32 = (0..hc).map(|k| got_comb[token * hc * hc + j * hc + k]).sum();
+            let col: f32 = (0..hc).map(|k| got_comb[token * hc * hc + k * hc + j]).sum();
+            assert!(
+                (row - 1.0).abs() < 1e-2 && (col - 1.0).abs() < 1e-2,
+                "macierz nie jest podwójnie stochastyczna: wiersz {row}, kolumna {col}"
+            );
+        }
+    }
+}
+
+/// Redukcja i rozprowadzenie kopii HC. Rozprowadzenie sprawdza też kierunek
+/// indeksowania macierzy mieszającej — transpozycja daje poprawny kształt.
+#[test]
+fn hc_reduce_and_expand_match_the_cpu_reference() {
+    let dev = device();
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (dim, hc, n_tokens) = (96usize, 4usize, 3usize);
+
+    let x = pattern(n_tokens * hc * dim, 61);
+    let block_out = pattern(n_tokens * dim, 73);
+    let pre = pattern(n_tokens * hc, 17).iter().map(|v| v.abs() + 0.1).collect::<Vec<f32>>();
+    let post = pattern(n_tokens * hc, 19).iter().map(|v| v.abs() + 0.1).collect::<Vec<f32>>();
+    // Macierz niesymetryczna, żeby transpozycja była wykrywalna.
+    let comb: Vec<f32> = (0..n_tokens * hc * hc)
+        .map(|i| ((i * 13 % 7) as f32 + 1.0) * 0.11)
+        .collect();
+
+    let x_buf = upload_f16(dev.as_ref(), &x);
+    let blk_buf = upload_f16(dev.as_ref(), &block_out);
+    let pre_buf = upload_f32(dev.as_ref(), &pre);
+    let post_buf = upload_f32(dev.as_ref(), &post);
+    let comb_buf = upload_f32(dev.as_ref(), &comb);
+
+    let reduced = dev
+        .alloc(n_tokens * dim * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    kernels
+        .hc_reduce_f16(&reduced, &x_buf, &pre_buf, dim, hc, n_tokens, &stream)
+        .unwrap();
+    stream.synchronize().unwrap();
+    let got_reduced = download_f16(dev.as_ref(), &reduced, n_tokens * dim);
+
+    let r = |v: f32| f16::from_f32(v).to_f32();
+    let mut want_reduced = Vec::with_capacity(n_tokens * dim);
+    for token in 0..n_tokens {
+        for d in 0..dim {
+            let mut acc = 0f32;
+            for copy in 0..hc {
+                acc += pre[token * hc + copy] * r(x[(token * hc + copy) * dim + d]);
+            }
+            want_reduced.push(acc);
+        }
+    }
+    assert_close(&got_reduced, &want_reduced, 5e-3, "redukcja HC");
+
+    let expanded = dev
+        .alloc(n_tokens * hc * dim * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    kernels
+        .hc_expand_f16(
+            &expanded, &blk_buf, &x_buf, &post_buf, &comb_buf, dim, hc, n_tokens, &stream,
+        )
+        .unwrap();
+    stream.synchronize().unwrap();
+    let got_expanded = download_f16(dev.as_ref(), &expanded, n_tokens * hc * dim);
+
+    let mut want_expanded = vec![0f32; n_tokens * hc * dim];
+    for token in 0..n_tokens {
+        for out_copy in 0..hc {
+            for d in 0..dim {
+                let mut acc = post[token * hc + out_copy] * r(block_out[token * dim + d]);
+                for in_copy in 0..hc {
+                    acc += comb[token * hc * hc + in_copy * hc + out_copy]
+                        * r(x[(token * hc + in_copy) * dim + d]);
+                }
+                want_expanded[(token * hc + out_copy) * dim + d] = acc;
+            }
+        }
+    }
+    assert_close(&got_expanded, &want_expanded, 5e-3, "rozprowadzenie HC");
+}

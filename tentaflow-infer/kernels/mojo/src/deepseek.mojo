@@ -468,3 +468,172 @@ def sparse_attn_f16(
             kk += 1
         out_ptr[qbase + d] = Float16(acc / denom)
         d += nthreads
+
+
+def hc_sinkhorn_f32(
+    pre: UnsafePointer[Float32, MutAnyOrigin],
+    post: UnsafePointer[Float32, MutAnyOrigin],
+    comb: UnsafePointer[Float32, MutAnyOrigin],
+    mixes: UnsafePointer[Float32, MutAnyOrigin],
+    scale: UnsafePointer[Float32, MutAnyOrigin],
+    base: UnsafePointer[Float32, MutAnyOrigin],
+    hc: Int,
+    iters: Int,
+    eps: Float32,
+    n_tokens: Int,
+):
+    """Wagi hyper-connections: rozdziela `mixes` na wagi redukcji, rozprowadzenia
+    i macierz mieszającą, tę ostatnią doprowadzając Sinkhornem do postaci
+    podwójnie stochastycznej.
+
+    Kolejność normalizacji jest nieoczywista i przesądza o wyniku: po softmaksie
+    po wierszach idzie NAJPIERW normalizacja po kolumnach, a dopiero potem
+    `iters - 1` pełnych par wiersz+kolumna. Rozpoczęcie od wierszy daje inną
+    macierz.
+
+    Jeden wątek na token — `hc` wynosi 4, więc macierz ma 16 elementów i
+    zrównoleglanie wewnątrz tokenu nic by nie dało.
+    """
+    token = Int(global_idx.x)
+    if token >= n_tokens:
+        return
+    mix_hc = (2 + hc) * hc
+    mbase = token * mix_hc
+
+    var m = 0
+    while m < hc:
+        v = mixes[mbase + m] * scale[0] + base[m]
+        pre[token * hc + m] = 1.0 / (1.0 + exp(-v)) + eps
+        w = mixes[mbase + m + hc] * scale[1] + base[m + hc]
+        post[token * hc + m] = 2.0 / (1.0 + exp(-w))
+        m += 1
+
+    cbase = token * hc * hc
+    var j = 0
+    while j < hc:
+        var k = 0
+        while k < hc:
+            at = j * hc + k + 2 * hc
+            comb[cbase + j * hc + k] = mixes[mbase + at] * scale[2] + base[at]
+            k += 1
+        j += 1
+
+    # Softmax po wierszach, z przesunięciem o maksimum wiersza.
+    j = 0
+    while j < hc:
+        var mx: Float32 = -3.0e38
+        var k = 0
+        while k < hc:
+            v = comb[cbase + j * hc + k]
+            if v > mx:
+                mx = v
+            k += 1
+        var total: Float32 = 0.0
+        k = 0
+        while k < hc:
+            e = exp(comb[cbase + j * hc + k] - mx)
+            comb[cbase + j * hc + k] = e
+            total += e
+            k += 1
+        k = 0
+        while k < hc:
+            comb[cbase + j * hc + k] = comb[cbase + j * hc + k] / total + eps
+            k += 1
+        j += 1
+
+    # Najpierw kolumny — dopiero potem pary wiersz+kolumna.
+    var k = 0
+    while k < hc:
+        var total: Float32 = 0.0
+        j = 0
+        while j < hc:
+            total += comb[cbase + j * hc + k]
+            j += 1
+        j = 0
+        while j < hc:
+            comb[cbase + j * hc + k] = comb[cbase + j * hc + k] / (total + eps)
+            j += 1
+        k += 1
+
+    var it = 1
+    while it < iters:
+        j = 0
+        while j < hc:
+            var total: Float32 = 0.0
+            k = 0
+            while k < hc:
+                total += comb[cbase + j * hc + k]
+                k += 1
+            k = 0
+            while k < hc:
+                comb[cbase + j * hc + k] = comb[cbase + j * hc + k] / (total + eps)
+                k += 1
+            j += 1
+        k = 0
+        while k < hc:
+            var total: Float32 = 0.0
+            j = 0
+            while j < hc:
+                total += comb[cbase + j * hc + k]
+                j += 1
+            j = 0
+            while j < hc:
+                comb[cbase + j * hc + k] = comb[cbase + j * hc + k] / (total + eps)
+                j += 1
+            k += 1
+        it += 1
+
+
+def hc_reduce_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    pre: UnsafePointer[Float32, MutAnyOrigin],
+    dim: Int,
+    hc: Int,
+    n_tokens: Int,
+):
+    """Redukcja `hc` kopii strumienia rezydualnego do jednej, ważona `pre`."""
+    idx = Int(global_idx.x)
+    if idx >= n_tokens * dim:
+        return
+    token = idx // dim
+    d = idx % dim
+    var acc: Float32 = 0.0
+    var copy = 0
+    while copy < hc:
+        acc += pre[token * hc + copy] * Float32(x[(token * hc + copy) * dim + d])
+        copy += 1
+    out_ptr[idx] = Float16(acc)
+
+
+def hc_expand_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    block_out: UnsafePointer[Float16, MutAnyOrigin],
+    residual: UnsafePointer[Float16, MutAnyOrigin],
+    post: UnsafePointer[Float32, MutAnyOrigin],
+    comb: UnsafePointer[Float32, MutAnyOrigin],
+    dim: Int,
+    hc: Int,
+    n_tokens: Int,
+):
+    """Rozprowadzenie wyjścia bloku z powrotem na `hc` kopii, z domieszką
+    poprzedniego strumienia przez macierz `comb`.
+
+    Uwaga na kierunek indeksowania `comb`: mnożnik kopii wejściowej `i` przy
+    kopii wyjściowej `o` to `comb[i * hc + o]`, a nie odwrotnie — transpozycja
+    daje poprawny kształt i inny model.
+    """
+    idx = Int(global_idx.x)
+    if idx >= n_tokens * hc * dim:
+        return
+    d = idx % dim
+    out_copy = (idx // dim) % hc
+    token = idx // (dim * hc)
+
+    var acc = post[token * hc + out_copy] * Float32(block_out[token * dim + d])
+    var in_copy = 0
+    while in_copy < hc:
+        w = comb[token * hc * hc + in_copy * hc + out_copy]
+        acc += w * Float32(residual[(token * hc + in_copy) * dim + d])
+        in_copy += 1
+    out_ptr[idx] = Float16(acc)

@@ -137,6 +137,9 @@ from src.deepseek import (
     act_quant_fp4_f16,
     compressor_pool_f16,
     sparse_attn_f16,
+    hc_sinkhorn_f32,
+    hc_reduce_f16,
+    hc_expand_f16,
 )
 from src.gemv2 import (
     gemv_q8_0_f16_v2,
@@ -2347,6 +2350,17 @@ def main() raises:
         sparse_attn_f16, dump_asm=Path("sparse_attn_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "sparse_attn_f16"))
+
+    _ = ctx.compile_function[
+        hc_sinkhorn_f32, dump_asm=Path("hc_sinkhorn_f32.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "hc_sinkhorn_f32"))
+
+    _ = ctx.compile_function[hc_reduce_f16, dump_asm=Path("hc_reduce_f16.ptx")]()
+    entries.append(_finalize(out_dir, "hc_reduce_f16"))
+
+    _ = ctx.compile_function[hc_expand_f16, dump_asm=Path("hc_expand_f16.ptx")]()
+    entries.append(_finalize(out_dir, "hc_expand_f16"))
 
     _ = ctx.compile_function[
         gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")
