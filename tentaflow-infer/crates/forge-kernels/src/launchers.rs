@@ -1049,6 +1049,7 @@ fn nvfp4_gguf_dispatch(
     bn128_available: bool,
     is_nvidia: bool,
     wmma_available: bool,
+    int8_batch_available: bool,
     warp_size: u32,
     max_threads: u32,
 ) -> Result<Nvfp4GgufDispatch> {
@@ -1058,6 +1059,14 @@ fn nvfp4_gguf_dispatch(
         ));
     }
     let (kernel, token_tile, row_tile, block_threads) = match n_tokens {
+        // Weryfikacja MTP liczy 2-4 tokeny naraz. Rodzina `b*` ma właściwą
+        // strukturę (fala na wiersz), ale idzie ścieżką f16 — przy T=4 mierzyła
+        // 152 us wobec 63 us GEMV-a int8 na tym samym kształcie, mimo że czyta
+        // TE SAME wagi. Wariant int8 dekoduje wagę raz na falę i używa jej dla
+        // wszystkich tokenów.
+        2 if int8_batch_available => ("gemv_nvfp4_gguf_q8_1_b2_f16", 2, 8, Some(BLOCK)),
+        3..=4 if int8_batch_available => ("gemv_nvfp4_gguf_q8_1_b4_f16", 4, 8, Some(BLOCK)),
+        5..=8 if int8_batch_available => ("gemv_nvfp4_gguf_q8_1_b8_f16", 8, 8, Some(BLOCK)),
         2 => ("gemm_nvfp4_gguf_f16_b2", 2, 1, Some(warp_size)),
         3 if is_nvidia && warp_size == 32 => (
             "gemm_nvfp4_gguf_f16_b3_nvidia",
@@ -1158,6 +1167,7 @@ fn nvfp4_gguf_layout_dispatch(
     tile_bn128_available: bool,
     is_nvidia: bool,
     wmma_available: bool,
+    int8_batch_available: bool,
     warp_size: u32,
     max_threads: u32,
 ) -> Result<Nvfp4GgufDispatch> {
@@ -1171,6 +1181,7 @@ fn nvfp4_gguf_layout_dispatch(
             bn128_available,
             is_nvidia,
             wmma_available,
+            int8_batch_available,
             warp_size,
             max_threads,
         ),
@@ -5219,6 +5230,8 @@ impl Kernels {
             matches!(caps.vendor, forge_types::Vendor::Nvidia),
             self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm256")
                 && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm32"),
+            raw_nvfp4_dp4a_supported(caps.warp_size)
+                && self.artifacts.has("gemv_nvfp4_gguf_q8_1_b4_f16"),
             caps.warp_size,
             caps.max_threads_per_block,
         )?;
@@ -5249,6 +5262,21 @@ impl Kernels {
             block: (dispatch.block_threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        // Warianty int8 biorą aktywację JUŻ SKWANTOWANĄ (kody + skale
+        // blok-major), a nie f16 — kwantujemy ją tu, w tym samym strumieniu.
+        if dispatch.kernel.starts_with("gemv_nvfp4_gguf_q8_1_b") {
+            let (xq, xd, _) = self.prequant_q8_1(x, cols as usize, n_tokens as usize, stream)?;
+            let args = LaunchArgs::new()
+                .buf(y)
+                .buf(weights)
+                .buf(&xq)
+                .buf(&xd)
+                .scalar(cols)
+                .scalar(rows)
+                .scalar(n_tokens)
+                .scalar(output_scale);
+            return self.device.launch(kernel, &config, &args, stream);
+        }
         let args = LaunchArgs::new()
             .buf(y)
             .buf(weights)
@@ -17516,6 +17544,7 @@ mod nvfp4_gguf_dispatch_tests {
             false,
             is_nvidia,
             false,
+            false,
             warp_size,
             max_threads,
         )
@@ -18760,17 +18789,17 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn wybiera_bn128_i_sync1_z_regresyjnym_wyjatkiem() {
         let large =
-            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, false, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, false, false, 32, 1024).unwrap();
         assert_eq!(large.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn128");
         assert_eq!((large.row_tile, large.block_threads), (128, 256));
 
         let m128 =
-            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, false, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, false, false, 32, 1024).unwrap();
         assert_eq!(m128.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1");
         assert_eq!((m128.row_tile, m128.block_threads), (64, 256));
 
         let regression =
-            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, false, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, false, false, 32, 1024).unwrap();
         assert_eq!(regression.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_prefetch");
     }
 
@@ -18787,6 +18816,7 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             true,
             true,
+            false,
             false,
             32,
             1024,
@@ -18814,6 +18844,7 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             true,
             false,
+            false,
             32,
             1024,
         )
@@ -18834,6 +18865,7 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             false,
             true,
+            false,
             false,
             32,
             1024,
@@ -18857,6 +18889,7 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 false,
+                false,
                 32,
                 1024,
             ),
@@ -18872,6 +18905,7 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 false,
+                false,
                 32,
                 1024,
             ),
@@ -18885,6 +18919,7 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 true,
+                false,
                 false,
                 false,
                 32,

@@ -1013,6 +1013,18 @@
       "entry": "src_nvfp4_gemv_nvfp4_gguf_out_6A6A6A6A_f86ea6d141753a07",
       "file": "gemv_nvfp4_gguf_out_f32.hsaco"
     },
+    "gemv_nvfp4_gguf_q8_1_b2_f16": {
+      "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_b242342975ebe570",
+      "file": "gemv_nvfp4_gguf_q8_1_b2_f16.hsaco"
+    },
+    "gemv_nvfp4_gguf_q8_1_b4_f16": {
+      "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_950e022c49f5c799",
+      "file": "gemv_nvfp4_gguf_q8_1_b4_f16.hsaco"
+    },
+    "gemv_nvfp4_gguf_q8_1_b8_f16": {
+      "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_d8855212561144a0",
+      "file": "gemv_nvfp4_gguf_q8_1_b8_f16.hsaco"
+    },
     "gemv_nvfp4_gguf_q8_1_f16": {
       "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_fc8b310057cef5b3",
       "file": "gemv_nvfp4_gguf_q8_1_f16.hsaco"
