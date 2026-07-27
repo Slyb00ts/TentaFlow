@@ -12,54 +12,74 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
-- 🟡 **FORGE liczy na RX 7900 XT (gfx1100); prefill czeka na wpięcie WMMA
-  (2026-07-27).** Druga karta AMD w tej maszynie. Katalog kerneli buduje się dla
-  gfx1100 (**395 z 529**, lista nieobsługiwanych IDENTYCZNA jak gfx1030 — RDNA3
-  nie odblokowuje sama z siebie niczego, co stoi na `mma`/`ldmatrix` NVIDII).
-  Zmierzone (p1024/tg128, oba układy pod pełnymi zegarami: 6900 XT 2540/1000 MHz,
-  7900 XT 2585/1249 MHz):
+- ✅ **Zasięg architektury w katalogu kerneli: kernel pod jedną kartę nie
+  wywraca reszty (2026-07-27).** Do tej pory jedynym sposobem wyrażenia „ten
+  kernel jest tylko dla NVIDII" było „nie kompiluje się", co MIESZA projekt z
+  usterką i wywracało build NVIDII przy każdym kernelu AMD-only. Teraz zasięg
+  stoi przy rejestracji w `build_kernels_catalog.mojo`:
+  `# arch: amd:gfx11+`, `# arch: nvidia:sm_89+`, `# arch: nvidia`; brak
+  komentarza znaczy PRZENOŚNY i taki kernel musi zbudować się wszędzie.
+  Architektura jest wykrywana PRZED kompilacją (`ctx.arch_name()`), więc odsiew
+  następuje zanim cokolwiek padnie. AMD porównuje się po POKOLENIU
+  (gfx1030 i gfx1036 to RDNA2, gfx1100 to RDNA3), NVIDIA liniowo; nazwy CDNA
+  (`gfx90a`, `gfx942`) są odrzucane głośno, bo mają inny schemat numeracji i nie
+  ma tu na czym tego sprawdzić.
+  EFEKT: **builda AMD nie trzeba już uruchamiać w trybie częściowym** — 134
+  kernele, które „nie kompilowały się" na Radeonach, to w całości rodziny
+  `mma`/`ldmatrix`/FP8 NVIDII (zweryfikowane po ŹRÓDLE, nie po liście błędów).
+  gfx1030 i gfx1100 budują się w trybie ścisłym i `unsupported.txt` zniknął —
+  backlog portu jest pusty. Liczby w zasięgu: sm_89/sm_121 **529**,
+  gfx1030 **395**, gfx1100/gfx1201 **399**.
+  Wybór artefaktów w runtime jest tabelaryczny (`EMBEDDED_SETS`), a dołożenie
+  karty to jeden wiersz — procedura w `docs/NOWA_KARTA.md`. Dołożona przy tym
+  ASYMETRIA, której wcześniej nie było: PTX NVIDII jest przenośny w górę (JIT),
+  więc zestaw `sm_89` obsługuje każdą nowszą kartę, natomiast HSACO AMD jest
+  związany z ISA i wymaga DOKŁADNEGO dopasowania. Warianty zawężone do
+  architektury (`sm_121a`) nie wędrują w górę.
+- ✅ **FORGE liczy na Blackwellu: katalog sm_121a zbudowany na DGX Spark
+  (2026-07-27).** 529 z 529 kerneli w zasięgu, czyli pełny build NVIDII
+  przechodzi z deklaracjami zasięgu, a cztery kernele AMD-only są z niego
+  poprawnie wykluczone — to była jedyna rzecz, której nie dało się sprawdzić
+  lokalnie. Trzy usterki przenośności po drodze: (1) `pixi.toml` deklarował
+  wyłącznie `linux-64`, a Spark to aarch64; (2) shim ptxas miał zaszyte
+  `/opt/cuda/bin/ptxas` (Arch) i nie znajdował go na `/usr/local/cuda` (DGX) —
+  teraz szuka w PATH, `CUDA_HOME` i obu lokalizacjach; (3) Mojo nazywa tam
+  artefakty **`sm_121a`**, a HAL zgłasza `sm_121`, więc bez obsługi wariantu z
+  literą Spark ignorowałby własny zestaw i brał sm_89.
+  UWAGA: **katalog sm_89 jest W TYLE** za katalogiem źródeł (474 z 529) — brakuje
+  kerneli dodanych po ostatnim buildzie na Adzie (DeepSeek, rodzina GEMM na
+  instrukcjach dot). Mojo kompiluje WYŁĄCZNIE dla lokalnego GPU
+  (`MOJO_TARGET_ACCELERATOR` nie działa), więc wymaga to przebudowania na RTX
+  4090. Dług jest jawny w `KNOWN_STALE` w teście katalogu, a nie przemilczany.
+- ✅ **FORGE liczy na RX 7900 XT (gfx1100); prefill Q8_0 przeniesiony na WMMA
+  (2026-07-27).** Zmierzone p1024/tg128, oba układy pod pełnymi zegarami
+  (6900 XT 2540/1000 MHz, 7900 XT 2585/1249 MHz), identyczne sumy SHA
+  wygenerowanych tokenów na obu kartach:
 
   | model | 6900 prefill | 7900 prefill | 6900 decode | 7900 decode |
   |---|--:|--:|--:|--:|
-  | qwen-guard Q8_0 (hybryda) | 1 504 tok/s | **1 679** (+12%) | 251,4 tok/s | **317,6** (+26%) |
-  | OLMoE-1B-7B Q4_K_M (MoE) | 280,7 tok/s | 269,6 (**-4%**) | 88,4 tok/s | **113,4** (+28%) |
-  | Bielik-7B NVFP4 | 1 326,9 tok/s | **1 642,5** (+24%) | 65,1 tok/s | **115,4** (+77%) |
+  | qwen-guard Q8_0 (hybryda) | 1 506,4 tok/s | **2 647,6** (+75,8%) | 251,3 tok/s | **317,3** (+26,3%) |
+  | OLMoE-1B-7B Q4_K_M (MoE) | 280,5 tok/s | 273,1 (-2,6%) | 88,5 tok/s | **112,6** (+27,2%) |
+  | Bielik-7B NVFP4 | 1 311,1 tok/s | **1 521,8** (+16,1%) | 65,1 tok/s | **114,2** (+75,4%) |
 
-  Decode rośnie z pasmem (221 → 674 GB/s zmierzone). Prefill NIE rośnie, bo
-  RDNA3 zdegradowała instrukcje pakowanego iloczynu: int8 `dot4` **97 → 43 TOPS**,
-  f16 `dot2` 48 → 31 TFLOPS. Nowsza karta jest ponad 2x wolniejsza w instrukcji,
-  na której stoi cały nasz prefill — stąd regresja na MoE.
+  Prefill Q8_0 rośnie 1,76x wobec RDNA2 i **+57,7% wobec tej samej karty na
+  kaflu dot4** (1 679 → 2 647,6), bo RDNA3 zdegradowała instrukcje pakowanego
+  iloczynu: int8 `dot4` **97 → 43 TOPS**, f16 `dot2` 48 → 31 TFLOPS, podczas gdy
+  WMMA daje **98 TOPS int8** i **102 TFLOPS f16**. Bez WMMA nowsza karta była w
+  prefillu WOLNIEJSZA od starszej. Q4_K i NVFP4 nadal idą kaflem dot4 — to
+  następne rodziny do przeniesienia.
   TRZY USTERKI ZNALEZIONE PRZY URUCHOMIENIU (szczegóły w `kernels/mojo/MOJO_NOTES.md`):
   (1) `v_dot4_i32_i8` na gfx11 liczy BEZ ZNAKU — asembler przyjmuje mnemonik
   RDNA2 i wykonuje go jako `iu8` z wyzerowanym `neg_lo`; `(-1,-2,-3,-4)·(4,3,2,1)`
   dawało 2540 zamiast -20, testy `gemm_q4_0`/`gemm_q6_k` miały błąd względny 635,
-  a te same prompty dawały RÓŻNE tokeny na obu kartach. Po poprawce
-  (`neg_lo:[1,1]`) suma SHA 128 tokenów jest IDENTYCZNA na 6900 XT i 7900 XT.
+  a te same prompty dawały RÓŻNE tokeny na obu kartach. Poprawna forma
+  (`neg_lo:[1,1]`) KOSZTUJE: 55 → 43 TOPS w izolacji i -7% prefillu Bielika,
+  więc wcześniejsze 1 642 tok/s było wynikiem kernela liczącego śmieci.
   (2) `bench_dot4_i8` mierzył tylko przepustowość na dodatnich danych, więc
   przechodził mimo złej instrukcji — dopisane przypadki ze znakiem.
   (3) Dobór chunka hybrydowego prefillu zwracał 32 dla modeli bez NVFP4 nie
   pytając backendu, a T>=32 wchodzi na kafle `i8mma`, których poza NVIDIĄ nie ma
-  — `qwen-guard` wywracał się na OBU Radeonach. Jedno źródło odpowiedzi
-  (`prepared_q8_tiled_capable`) używane przez launcher i przez dobór chunka.
-  ZROBIONE DALEJ: `src/arch_wmma.mojo` (prymityw 16x16x16 int8 i f16 wprost przez
-  `llvm_intrinsic`, układ fragmentów zmierzony wyczerpująco na 256 polach) oraz
-  `src/gemm_wmma.mojo` — prefillowy GEMM Q8_0 na WMMA w dwóch kaflach, z testem
-  złotym wobec referencji CPU na kształtach z ogonami. A/B wobec
-  `gemm_q8_0_dot4_128x128` na 7900 XT (4096x4096):
-
-  | T | wmma 64x128 | wmma 16x64 | dot4 128x128 | najlepszy WMMA / dot4 |
-  |--:|--:|--:|--:|--:|
-  | 128 | 19 TOPS | **30** | 20 | **1,51x** |
-  | 512 | **42** | 30 | 27 | **1,54x** |
-  | 1024 | **42** | 24 | 33 | **1,27x** |
-  | 2048 | **37** | 26 | 34 | **1,09x** |
-
-  ZOSTAJE: wpięcie tych kerneli w silnik. Katalog nie ma dziś pojęcia kernela
-  ZAWĘŻONEGO DO ARCHITEKTURY — `build_kernels_catalog.mojo` kompiluje wszystko
-  wszędzie, a sm_89 buduje się w trybie NIE-częściowym, więc dopisanie kernela
-  AMD-only wywróciłoby build NVIDII i `test_catalog_matches_committed_manifest`.
-  Ten mechanizm trzeba zaprojektować, a jego zmiany NIE DA SIĘ zweryfikować na
-  tej maszynie (nie ma tu karty NVIDIA), więc nie robię tego po cichu.
+  — `qwen-guard` wywracał się na OBU Radeonach.
 
 - ✅ **Pełny build katalogu przechodzi i cały workspace jest zielony poza jedną
   znaną rozbieżnością (2026-07-25).** Build katalogu: 80 jednostek, 6

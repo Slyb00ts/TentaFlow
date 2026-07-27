@@ -9127,6 +9127,25 @@ impl Kernels {
             "gemm_q4_0_i8mma" => "q4_0",
             _ => return None,
         };
+        // Karty z jednostką macierzową liczą Q8_0 na WMMA — na RDNA3 instrukcje
+        // dot idą o połowę wolniej niż na RDNA2 (43 wobec 97 TOPS), a WMMA daje
+        // 98, więc kafel dot byłby tam regresją względem STARSZEJ karty.
+        // Obecność artefaktów jest jednocześnie testem architektury: zasięg
+        // `amd:gfx11+` wpuszcza je wyłącznie do katalogów RDNA3 i nowszych.
+        if family == "q8_0" && self.artifacts.has("gemm_q8_0_wmma_64x128") {
+            // Kafel 16x64 (BM=16, BN=64, 128 wątków) wobec 64x128 (BM=64,
+            // BN=128, 128 wątków). Próg z pomiaru A/B na 7900 XT: duży kafel ma
+            // lepsze reużycie danych, ale przy krótkim prompcie albo wąskiej
+            // projekcji nie ma czym wypełnić fal i przegrywa z małym.
+            if output_f32 {
+                return Some(DotTile::new("gemm_q8_0_wmma_out_f32_16x64", 16, 64, 1, 8));
+            }
+            return Some(if n_tokens >= 512 && rows >= 2048 {
+                DotTile::new("gemm_q8_0_wmma_64x128", 64, 128, 8, 8)
+            } else {
+                DotTile::new("gemm_q8_0_wmma_16x64", 16, 64, 1, 8)
+            });
+        }
         // Batchowa głowa logitów zapisuje f32 i pracuje na rozmiarze batcha
         // decode, więc ma tylko najmniejszy kafel.
         if output_f32 {
