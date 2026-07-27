@@ -14,17 +14,15 @@ Starszy build `112c7815` NIE wczytuje checkpointu 27B: `missing tensor
 Model w całości rezydentny: 20 067 z 20 464 MiB VRAM, GPU 100% — żadnego
 stronicowania przez PCIe. Na 6900 XT ten model NIE WCHODZI (16 GiB).
 
-| | FORGE (T16) | FORGE (layer-major WMMA) | llama.cpp | |
+| | FORGE (stan wyjściowy) | **FORGE (teraz)** | llama.cpp | |
 |---|--:|--:|--:|---|
-| prefill p1024 | 27,3 tok/s | **501,8** tok/s | **716,3** tok/s | llama.cpp **1,43x** |
-| decode tg128, bez spekulacji | 9,5 tok/s | 9,5 tok/s | **33,0** tok/s | llama.cpp **3,5x** |
-| decode tg128, MTP po obu stronach | 47,1 tok/s | 48,4 tok/s | **73,4** tok/s | llama.cpp **1,52x** |
+| prefill p1024 | 27,3 tok/s | **843,9** tok/s | 716,3 tok/s | **FORGE 1,18x** |
+| decode tg128, bez spekulacji | 9,5 tok/s | **26,4** tok/s | **33,0** tok/s | llama.cpp 1,25x |
+| decode tg128, MTP po obu stronach | 47,1 tok/s | **51,4** tok/s | **73,4** tok/s | llama.cpp 1,43x |
 
-Kolumna „T16" to stan sprzed przeniesienia ścieżki layer-major na WMMA:
-**prefill urósł 18,4x**, a stosunek do llama.cpp spadł z 26,2x do 1,43x. Wyjście
-jest bitowo identyczne — ta sama suma SHA 32 tokenów na obu ścieżkach.
-Decode pozostaje nietknięty, bo dotyczy go inna ścieżka, i to on jest teraz
-największą luką.
+**Prefill urósł 30,9x i wyprzedził llama.cpp**, decode 2,8x. Wyjście jest przez
+całą tę drogę BITOWO IDENTYCZNE — ta sama suma SHA 128 tokenów co przed
+pierwszą zmianą (`0bf2b86b…`).
 
 llama.cpp z `--spec-type draft-mtp`: 73,3 / 73,4 / 73,5 tok/s w trzech
 przebiegach; bez MTP 33,2 tok/s, co zgadza się z `llama-bench tg128` (32,93).
@@ -72,11 +70,36 @@ Zejście z flash-attention: `auto` wybierało Mojo FA HD256, która stoi na `mma
 teraz przy braku artefaktu schodzi na `Exact`, ale JAWNE `...ATTN=fa` nadal jest
 błędem — prośba o konkretny wariant nie ma schodzić po cichu.
 
+### Optymalizacja po profilu (rocprofv3)
+
+**Decode, 2,8x.** Profil pokazał, że 82% czasu GPU to JEDEN kernel:
+`gemv_nvfp4_gguf_f16` przy 133 GB/s z dostępnych 674. Trzy wady naraz: workgroup
+256 wątków na wiersz, choć wiersz ma ~3 kB (redukcja przez cały blok kosztowała
+tyle co liczenie), wagi i aktywacje czytane BAJT PO BAJCIE, i droga
+dekwantyzacja. Przepisany na falę na wiersz z 16-bajtowymi odczytami i
+dekwantyzacją przez konstrukcję bitów: **542 GB/s, 4,8x**. Pułapka e2m1: jedyna
+wartość subnormalna (0,5) jest w f16 NORMALNA z zerową mantysą, więc bit mantysy
+wolno przepuścić tylko dla E>0 — pierwsza wersja dawała 0,75 zamiast 0,5.
+
+**Prefill, dodatkowe 1,68x (503 → 844).** Podmiana wagi na stałą w kernelu
+pokazała, że sama dekwantyzacja to POŁOWA czasu GEMM-u (25 wobec 48 TFLOPS), a
+każda z fal wzdłuż tokenów rozpakowywała DOKŁADNIE TE SAME kolumny. Wagi idą
+teraz raz na blok do LDS (8 KiB na kafel BN x 64), a sweep kafli wybrał
+BM256/BN64 na ośmiu falach: **52 TFLOPS wobec 25**.
+
+ZMIERZONE I ODRZUCONE (wszystkie brzmiały sensownie):
+- aktywacja w LDS w GEMV — 493 → 326 GB/s; 32 KiB LDS zabija zajętość, a x i tak
+  siedzi w cache,
+- dwa wiersze na falę w GEMV — płasko lub gorzej,
+- tania dekwantyzacja bitowa w GEMM-ie WMMA — 503 → 439 tok/s; to, co pomaga
+  kernelowi ograniczonemu pamięcią, szkodzi ograniczonemu jednostką macierzową.
+
 ZOSTAJE, w kolejności wartości:
-1. **decode** — 3,5x luki bez spekulacji i 1,52x z MTP; to teraz największa
-   pojedyncza różnica i nie dotyczy jej nic z powyższego,
-2. warianty strojone kafla NVFP4 (`sync1`, `prefetch`, `bn128`) nie mają
-   odpowiedników WMMA — dispatch AMD używa jednego kafla na zakres,
+1. **decode** — 1,25x luki; NVFP4 GEMV chodzi po 542 z 674 GB/s, czyli jest już
+   blisko roofline, a reszta różnicy to narzut **1193 uruchomień kerneli na
+   token** (w tym 427 kopii D2D),
+2. wąskie projekcje w GEMV trzymają 247-259 GB/s wobec 542 na szerokich —
+   ograniczenie latencji przy krótkiej pętli,
 3. `gemm_q4_k_dot4_*` (OLMoE i pozostałe GGUF K-quant) wciąż na instrukcjach dot.
 
 ## Zastrzeżenia metodyczne
