@@ -229,6 +229,10 @@
       "entry": "src_attention_verify_split8_at6A6A6A6A_accfd7cac81a6e28",
       "file": "attn_verify_split8_f16_hd256_t4.hsaco"
     },
+    "compressor_pool_f16": {
+      "entry": "src_deepseek_compressor_pool_f6A6A6A6A_b0e787198fe323fc",
+      "file": "compressor_pool_f16.hsaco"
+    },
     "conv1d_f32": {
       "entry": "src_onnx_ops_conv1d_f32_Poin6A6A6A6AoA6A6A_6a7a801c0ca73288",
       "file": "conv1d_f32.hsaco"
@@ -1516,6 +1520,10 @@
     "softcap_f32": {
       "entry": "src_activation_softcap_f32_P6A6A6A6AoA6A6A_ecd3261bab952d31",
       "file": "softcap_f32.hsaco"
+    },
+    "sparse_attn_f16": {
+      "entry": "src_deepseek_sparse_attn_f166A6A6A6AoA6A_8fdf6a59a1ac8af6",
+      "file": "sparse_attn_f16.hsaco"
     },
     "sqrt_f32": {
       "entry": "src_onnx_ops_sqrt_f32_Pointe6A6A6A6AoA6A6A_4b921393b1627585",

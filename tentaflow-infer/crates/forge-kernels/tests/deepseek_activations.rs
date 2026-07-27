@@ -287,3 +287,163 @@ fn round_e4m3(x: f32) -> f32 {
     let q = (v / step).round() * step;
     sign * q.min(448.0)
 }
+
+fn upload_i32(dev: &dyn Device, values: &[i32]) -> DevBuffer {
+    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Activations)
+        .unwrap();
+    dev.write(bytes, &buf, 0).unwrap();
+    buf
+}
+
+fn upload_f32(dev: &dyn Device, values: &[f32]) -> DevBuffer {
+    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Activations)
+        .unwrap();
+    dev.write(bytes, &buf, 0).unwrap();
+    buf
+}
+
+/// Pooling kompresora. Tablica slotów niesie logikę okien z zakładką, więc test
+/// używa układu, w którym pierwszy blok ma pozycje puste (`-1`) — dokładnie jak
+/// blok zerowy przy stopniu kompresji 4, który nie ma poprzednika.
+#[test]
+fn compressor_pool_matches_the_cpu_reference() {
+    let dev = device();
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (head_dim, ratio, n_blocks) = (64usize, 4usize, 3usize);
+    let window = 2 * ratio;
+    let n_rows = n_blocks * ratio;
+
+    let kv = pattern(n_rows * head_dim, 43);
+    let score = pattern(n_rows * head_dim, 67);
+    // Blok 0 nie ma poprzednika: pierwsze `ratio` pozycji jest puste.
+    let mut slots = vec![-1i32; n_blocks * window];
+    for block in 0..n_blocks {
+        for w in 0..window {
+            slots[block * window + w] = if w < ratio {
+                if block == 0 {
+                    -1
+                } else {
+                    ((block - 1) * ratio + w) as i32
+                }
+            } else {
+                (block * ratio + w - ratio) as i32
+            };
+        }
+    }
+
+    let kv_buf = upload_f16(dev.as_ref(), &kv);
+    let sc_buf = upload_f16(dev.as_ref(), &score);
+    let slot_buf = upload_i32(dev.as_ref(), &slots);
+    let out = dev
+        .alloc(n_blocks * head_dim * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+
+    kernels
+        .compressor_pool_f16(&out, &kv_buf, &sc_buf, &slot_buf, head_dim, window, n_blocks, &stream)
+        .unwrap();
+    stream.synchronize().unwrap();
+    let got = download_f16(dev.as_ref(), &out, n_blocks * head_dim);
+
+    let r = |v: f32| f16::from_f32(v).to_f32();
+    let mut want = Vec::with_capacity(n_blocks * head_dim);
+    for block in 0..n_blocks {
+        for dim in 0..head_dim {
+            let mut max = f32::NEG_INFINITY;
+            for w in 0..window {
+                let row = slots[block * window + w];
+                if row >= 0 {
+                    max = max.max(r(score[row as usize * head_dim + dim]));
+                }
+            }
+            let mut denom = 0f32;
+            let mut acc = 0f32;
+            for w in 0..window {
+                let row = slots[block * window + w];
+                if row >= 0 {
+                    let e = (r(score[row as usize * head_dim + dim]) - max).exp();
+                    denom += e;
+                    acc += e * r(kv[row as usize * head_dim + dim]);
+                }
+            }
+            want.push(acc / denom);
+        }
+    }
+    assert_close(&got, &want, 5e-3, "pooling kompresora");
+}
+
+/// Rzadka uwaga. Test sprawdza też, że kotwica wchodzi WYŁĄCZNIE do mianownika:
+/// drugi przebieg z bardzo dużą kotwicą musi wygasić wyjście, a nie je przesunąć.
+#[test]
+fn sparse_attention_matches_the_cpu_reference() {
+    let dev = device();
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (head_dim, n_heads, n_kv, n_idx) = (128usize, 4usize, 16usize, 10usize);
+
+    let q = pattern(n_heads * head_dim, 31);
+    let kv = pattern(n_kv * head_dim, 47);
+    // Część indeksów zamaskowana — muszą zostać pominięte, a nie odczytane.
+    let idxs: Vec<i32> = (0..n_idx)
+        .map(|i| if i % 4 == 3 { -1 } else { ((i * 3) % n_kv) as i32 })
+        .collect();
+
+    let q_buf = upload_f16(dev.as_ref(), &q);
+    let kv_buf = upload_f16(dev.as_ref(), &kv);
+    let idx_buf = upload_i32(dev.as_ref(), &idxs);
+    let scale = (head_dim as f32).sqrt().recip();
+
+    for sink_value in [0.5f32, 40.0] {
+        let sink: Vec<f32> = (0..n_heads).map(|h| sink_value + h as f32 * 0.1).collect();
+        let sink_buf = upload_f32(dev.as_ref(), &sink);
+        let out = dev
+            .alloc(n_heads * head_dim * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        kernels
+            .sparse_attn_f16(
+                &out, &q_buf, &kv_buf, &sink_buf, &idx_buf, head_dim, n_heads, n_idx, scale,
+                &stream,
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+        let got = download_f16(dev.as_ref(), &out, n_heads * head_dim);
+
+        let r = |v: f32| f16::from_f32(v).to_f32();
+        let mut want = vec![0f32; n_heads * head_dim];
+        for head in 0..n_heads {
+            let valid: Vec<usize> = idxs.iter().filter(|i| **i >= 0).map(|i| *i as usize).collect();
+            let scores: Vec<f32> = valid
+                .iter()
+                .map(|k| {
+                    (0..head_dim)
+                        .map(|d| r(q[head * head_dim + d]) * r(kv[k * head_dim + d]))
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect();
+            let max = scores.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let denom: f32 = exps.iter().sum::<f32>() + (sink[head] - max).exp();
+            for (w, k) in exps.iter().zip(&valid) {
+                for d in 0..head_dim {
+                    want[head * head_dim + d] += w * r(kv[k * head_dim + d]);
+                }
+            }
+            for d in 0..head_dim {
+                want[head * head_dim + d] /= denom;
+            }
+        }
+        if sink_value < 1.0 {
+            assert_close(&got, &want, 1e-2, "rzadka uwaga");
+        } else {
+            // Kotwica dominuje mianownik, więc wyjście musi zdążyć do zera —
+            // gdyby wchodziła też do licznika, zostałoby duże.
+            let peak = got.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak < 1e-2, "kotwica nie wygasiła wyjścia (szczyt {peak:.3e})");
+        }
+    }
+}

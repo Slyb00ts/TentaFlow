@@ -315,3 +315,156 @@ def _round_e2m1(x: Float32) -> Float32:
     elif v < 5.0:
         q = 4.0
     return sign * q
+
+
+def compressor_pool_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    kv: UnsafePointer[Float16, MutAnyOrigin],
+    score: UnsafePointer[Float16, MutAnyOrigin],
+    slots: UnsafePointer[Int32, MutAnyOrigin],
+    head_dim: Int,
+    window: Int,
+    n_blocks: Int,
+):
+    """Bramkowany pooling kompresora KV: softmax po oknie, osobno dla każdego
+    wymiaru, i ważona suma wartości.
+
+    `slots[block * window + w]` wskazuje wiersz źródłowy w `kv`/`score` dla
+    pozycji `w` okna bloku `block`; wartość ujemna oznacza pozycję pustą, która
+    ma dostać wagę zero. To przez tę tablicę przechodzi cała logika okien Z
+    ZAKŁADKĄ (stopień 4) — kernel nie musi o niej nic wiedzieć, a wariant bez
+    zakładki jest tym samym kernelem z inną tablicą.
+
+    Jeden blok na wymiar-blok; redukcja po oknie jest szeregowa, bo okno ma
+    najwyżej `2 * ratio` pozycji.
+    """
+    idx = Int(global_idx.x)
+    if idx >= n_blocks * head_dim:
+        return
+    block = idx // head_dim
+    dim = idx % head_dim
+
+    var mx: Float32 = -3.0e38
+    var w = 0
+    while w < window:
+        row = Int(slots[block * window + w])
+        if row >= 0:
+            v = Float32(score[row * head_dim + dim])
+            if v > mx:
+                mx = v
+        w += 1
+
+    var denom: Float32 = 0.0
+    var acc: Float32 = 0.0
+    w = 0
+    while w < window:
+        row = Int(slots[block * window + w])
+        if row >= 0:
+            e = exp(Float32(score[row * head_dim + dim]) - mx)
+            denom += e
+            acc += e * Float32(kv[row * head_dim + dim])
+        w += 1
+    out_ptr[block * head_dim + dim] = Float16(acc / denom)
+
+
+def sparse_attn_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    kv: UnsafePointer[Float16, MutAnyOrigin],
+    sink: UnsafePointer[Float32, MutAnyOrigin],
+    idxs: UnsafePointer[Int32, MutAnyOrigin],
+    head_dim: Int,
+    n_heads: Int,
+    n_idx: Int,
+    scale: Float32,
+):
+    """Uwaga liczona WYŁĄCZNIE po zebranych indeksach, z kotwicą.
+
+    Dwa szczegóły przesądzają o poprawności. Indeks `-1` oznacza pozycję
+    zamaskowaną: jej wynik to minus nieskończoność, a wektor wartości zero —
+    potraktowanie go jak zwykłego indeksu czyta cudzy wiersz. Kotwica
+    (`sink[head]`) wchodzi WYŁĄCZNIE do mianownika softmaxu, jako dodatkowy
+    logit o zerowym wektorze wartości.
+
+    Jeden blok na głowicę jednego tokenu; `idxs` jest wspólne dla wszystkich
+    głowic tego tokenu.
+    """
+    head = Int(block_idx.x)
+    if head >= n_heads:
+        return
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+    qbase = head * head_dim
+
+    shared = stack_allocation[
+        1024, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    # Maksimum wyników — potrzebne przed wykładnikami, żeby softmax był stabilny.
+    var local_max: Float32 = -3.0e38
+    var k = tid
+    while k < n_idx:
+        row = Int(idxs[k])
+        if row >= 0:
+            var dot: Float32 = 0.0
+            var d = 0
+            while d < head_dim:
+                dot += Float32(q[qbase + d]) * Float32(kv[row * head_dim + d])
+                d += 1
+            s = dot * scale
+            if s > local_max:
+                local_max = s
+        k += nthreads
+    shared[tid] = local_max
+    barrier()
+    var stride = nthreads // 2
+    while stride > 0:
+        if tid < stride:
+            if shared[tid + stride] > shared[tid]:
+                shared[tid] = shared[tid + stride]
+        barrier()
+        stride //= 2
+    mx = shared[0]
+    barrier()
+
+    # Mianownik: suma wykładników plus kotwica.
+    var local_sum: Float32 = 0.0
+    k = tid
+    while k < n_idx:
+        row = Int(idxs[k])
+        if row >= 0:
+            var dot: Float32 = 0.0
+            var d = 0
+            while d < head_dim:
+                dot += Float32(q[qbase + d]) * Float32(kv[row * head_dim + d])
+                d += 1
+            local_sum += exp(dot * scale - mx)
+        k += nthreads
+    shared[tid] = local_sum
+    barrier()
+    stride = nthreads // 2
+    while stride > 0:
+        if tid < stride:
+            shared[tid] += shared[tid + stride]
+        barrier()
+        stride //= 2
+    denom = shared[0] + exp(sink[head] - mx)
+    barrier()
+
+    # Licznik: kotwica NIE wnosi tu nic.
+    var d = tid
+    while d < head_dim:
+        var acc: Float32 = 0.0
+        var kk = 0
+        while kk < n_idx:
+            row = Int(idxs[kk])
+            if row >= 0:
+                var dot: Float32 = 0.0
+                var dd = 0
+                while dd < head_dim:
+                    dot += Float32(q[qbase + dd]) * Float32(kv[row * head_dim + dd])
+                    dd += 1
+                acc += exp(dot * scale - mx) * Float32(kv[row * head_dim + d])
+            kk += 1
+        out_ptr[qbase + d] = Float16(acc / denom)
+        d += nthreads

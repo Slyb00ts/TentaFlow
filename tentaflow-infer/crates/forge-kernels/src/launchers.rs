@@ -6005,6 +6005,76 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Bramkowany pooling kompresora KV. `slots` mapuje pozycję okna na wiersz
+    /// źródłowy (`-1` = pozycja pusta), więc logika okien z zakładką siedzi w
+    /// tablicy, a nie w kernelu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_pool_f16(
+        &self,
+        out: &DevBuffer,
+        kv: &DevBuffer,
+        score: &DevBuffer,
+        slots: &DevBuffer,
+        head_dim: usize,
+        window: usize,
+        n_blocks: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("compressor_pool_f16")?;
+        let total = n_blocks * head_dim;
+        let cfg = LaunchConfig {
+            grid: ((total as u32).div_ceil(BLOCK), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(kv)
+            .buf(score)
+            .buf(slots)
+            .scalar(head_dim as i64)
+            .scalar(window as i64)
+            .scalar(n_blocks as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Uwaga po zebranych indeksach, z kotwicą w mianowniku softmaxu.
+    /// Indeks `-1` oznacza pozycję zamaskowaną.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sparse_attn_f16(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        kv: &DevBuffer,
+        sink: &DevBuffer,
+        idxs: &DevBuffer,
+        head_dim: usize,
+        n_heads: usize,
+        n_idx: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("sparse_attn_f16")?;
+        // Redukcje idą przez pamięć współdzieloną o stałym rozmiarze 1024.
+        let threads = head_dim.next_power_of_two().clamp(64, 1024) as u32;
+        let cfg = LaunchConfig {
+            grid: (n_heads as u32, 1, 1),
+            block: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(kv)
+            .buf(sink)
+            .buf(idxs)
+            .scalar(head_dim as i64)
+            .scalar(n_heads as i64)
+            .scalar(n_idx as i64)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// GEMV na wagach E4M3 z jedną skalą FP32 na wiersz, wynik w f16.
     ///
     /// Wariant f32 (`gemv_fp8_out_f32`) służy głowie logitów; ten karmi kolejne

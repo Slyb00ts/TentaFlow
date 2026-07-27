@@ -135,6 +135,8 @@ from src.deepseek import (
     hadamard_bf16_f16,
     act_quant_fp8_f16,
     act_quant_fp4_f16,
+    compressor_pool_f16,
+    sparse_attn_f16,
 )
 from src.gemv2 import (
     gemv_q8_0_f16_v2,
@@ -2335,6 +2337,16 @@ def main() raises:
         act_quant_fp4_f16, dump_asm=Path("act_quant_fp4_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "act_quant_fp4_f16"))
+
+    _ = ctx.compile_function[
+        compressor_pool_f16, dump_asm=Path("compressor_pool_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "compressor_pool_f16"))
+
+    _ = ctx.compile_function[
+        sparse_attn_f16, dump_asm=Path("sparse_attn_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "sparse_attn_f16"))
 
     _ = ctx.compile_function[
         gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")
