@@ -82,12 +82,16 @@ struct Oracle {
     attn_out: Vec<f32>,
     ratio: usize,
     compressed: Vec<f32>,
+    index_n_heads: usize,
+    index_head_dim: usize,
+    index_kv: Vec<f32>,
+    index_score: Vec<f32>,
 }
 
 fn load_oracle() -> Option<Oracle> {
     let path = std::env::var("FORGE_DEEPSEEK_V4_ORACLE").ok()?;
     let bytes = std::fs::read(path).ok()?;
-    let head: Vec<i32> = bytes[..44]
+    let head: Vec<i32> = bytes[..52]
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -101,9 +105,10 @@ fn load_oracle() -> Option<Oracle> {
     let (gate_layer, topk, n_experts) = (head[5] as usize, head[6] as usize, head[7] as usize);
     let (o_groups, o_lora_rank) = (head[8] as usize, head[9] as usize);
     let ratio = head[10] as usize;
+    let (index_n_heads, index_head_dim) = (head[11] as usize, head[12] as usize);
     let mut cursor = Cursor {
         bytes: &bytes,
-        offset: 44,
+        offset: 52,
     };
     let x = cursor.floats(seqlen * dim);
     let qr = cursor.floats(seqlen * 1024);
@@ -116,6 +121,8 @@ fn load_oracle() -> Option<Oracle> {
     let attn_in = cursor.floats(seqlen * n_heads * head_dim);
     let attn_out = cursor.floats(seqlen * dim);
     let compressed = cursor.floats(seqlen / ratio * head_dim);
+    let index_kv = cursor.floats(seqlen / ratio * index_head_dim);
+    let index_score = cursor.floats(seqlen * (seqlen / ratio));
     Some(Oracle {
         seqlen,
         dim,
@@ -139,6 +146,10 @@ fn load_oracle() -> Option<Oracle> {
         attn_out,
         ratio,
         compressed,
+        index_n_heads,
+        index_head_dim,
+        index_kv,
+        index_score,
     })
 }
 
@@ -645,4 +656,173 @@ fn kv_compressor_matches_the_reference_implementation() {
     let err = relative_l2(&got, &oracle.compressed);
     eprintln!("kompresor KV: względne L2 = {err:.3e}");
     assert!(err < 1e-4, "kompresor rozjeżdża się o {err:.3e}");
+}
+
+/// Transformata Walsha-Hadamarda po ostatnim wymiarze, znormalizowana `1/sqrt(n)`.
+fn hadamard(values: &mut [f32]) {
+    let n = values.len();
+    assert!(n.is_power_of_two());
+    let mut step = 1;
+    while step < n {
+        for base in (0..n).step_by(2 * step) {
+            for i in 0..step {
+                let (a, b) = (values[base + i], values[base + step + i]);
+                values[base + i] = a + b;
+                values[base + step + i] = a - b;
+            }
+        }
+        step *= 2;
+    }
+    // Rotacja liczy się w f32, ale wynik wraca do bf16 — referencja trzyma ten
+    // tensor w bf16, a zaokrąglenie potrafi przesunąć maksimum grupy przez
+    // granicę potęgi dwójki i zmienić skalę całej grupy przy kwantyzacji FP4.
+    let scale = (n as f32).sqrt().recip();
+    values.iter_mut().for_each(|v| *v = to_bf16(*v * scale));
+}
+
+/// Kwantyzacja aktywacji do FP4 (E2M1) ze skalą zaokrągloną do potęgi dwójki.
+fn fp4_act_quant_inplace(values: &mut [f32], block: usize) {
+    const CODEBOOK: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    for group in values.chunks_mut(block) {
+        let amax = group
+            .iter()
+            .fold(0f32, |m, v| m.max(v.abs()))
+            .max(6.0 * (2f32).powi(-126));
+        let scale = (amax / 6.0).log2().ceil().exp2();
+        for v in group.iter_mut() {
+            let scaled = (*v / scale).clamp(-6.0, 6.0);
+            let sign = if scaled < 0.0 { -1.0 } else { 1.0 };
+            let mag = scaled.abs();
+            let nearest = CODEBOOK
+                .iter()
+                .copied()
+                .min_by(|a, b| (a - mag).abs().total_cmp(&(b - mag).abs()))
+                .unwrap();
+            *v = sign * nearest * scale;
+        }
+    }
+}
+
+fn to_bf16(v: f32) -> f32 {
+    let bits = v.to_bits();
+    let round = ((bits >> 16) & 1) + 0x7FFF;
+    f32::from_bits((bits + round) & 0xFFFF_0000)
+}
+
+/// Indekser rzadkiej uwagi. Ma własny kompresor — z rotacją Hadamarda i
+/// kwantyzacją FP4 zamiast FP8 — a wynik punktowania to `relu(q·k)` ważone per
+/// głowica i zsumowane. Pominięcie rotacji albo kwantyzacji daje wartości tego
+/// samego rzędu, ale inny wybór pozycji.
+#[test]
+fn sparse_indexer_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let ix = format!("layers.{LAYER}.attn.indexer");
+    let (wq_b, q_out, q_in) = load_row_scaled(&st, &format!("{ix}.wq_b.weight"));
+    let wproj = load_vector(&st, &format!("{ix}.weights_proj.weight"));
+    let wkv = load_vector(&st, &format!("{ix}.compressor.wkv.weight"));
+    let wgate = load_vector(&st, &format!("{ix}.compressor.wgate.weight"));
+    let ape = load_vector(&st, &format!("{ix}.compressor.ape"));
+    let norm_w = load_vector(&st, &format!("{ix}.compressor.norm.weight"));
+    let eps = 1e-6f32;
+
+    let ratio = oracle.ratio;
+    let d = oracle.index_head_dim;
+    let wide = 2 * d;
+    let blocks = oracle.seqlen / ratio;
+    let freqs = rope_freqs(oracle.rope_head_dim, 160_000.0, 65_536, 16.0, 32.0, 1.0);
+    let nope = d - oracle.rope_head_dim;
+
+    // Kompresor indeksera.
+    let mut kv = vec![0f32; oracle.seqlen * wide];
+    let mut score = vec![0f32; oracle.seqlen * wide];
+    for t in 0..oracle.seqlen {
+        let x = &oracle.x[t * oracle.dim..(t + 1) * oracle.dim];
+        kv[t * wide..(t + 1) * wide].copy_from_slice(&project(&wkv, x, wide, oracle.dim));
+        let mut s = project(&wgate, x, wide, oracle.dim);
+        for (i, v) in s.iter_mut().enumerate() {
+            *v += ape[(t % ratio) * wide + i];
+        }
+        score[t * wide..(t + 1) * wide].copy_from_slice(&s);
+    }
+    let mut index_kv = Vec::with_capacity(blocks * d);
+    for block in 0..blocks {
+        let window = 2 * ratio;
+        let mut win_kv = vec![0f32; window * d];
+        let mut win_sc = vec![f32::NEG_INFINITY; window * d];
+        for slot in 0..window {
+            let (token, half) = if slot < ratio {
+                if block == 0 {
+                    continue;
+                }
+                ((block - 1) * ratio + slot, 0)
+            } else {
+                (block * ratio + slot - ratio, 1)
+            };
+            let src = token * wide + half * d;
+            win_kv[slot * d..(slot + 1) * d].copy_from_slice(&kv[src..src + d]);
+            win_sc[slot * d..(slot + 1) * d].copy_from_slice(&score[src..src + d]);
+        }
+        let mut pooled = vec![0f32; d];
+        for dim_i in 0..d {
+            let mut max = f32::NEG_INFINITY;
+            for slot in 0..window {
+                max = max.max(win_sc[slot * d + dim_i]);
+            }
+            let mut denom = 0f32;
+            let mut acc = 0f32;
+            for slot in 0..window {
+                let w = (win_sc[slot * d + dim_i] - max).exp();
+                denom += w;
+                acc += w * win_kv[slot * d + dim_i];
+            }
+            pooled[dim_i] = acc / denom;
+        }
+        let mut normed = rms_norm(&pooled, &norm_w, eps);
+        apply_rope(&mut normed[nope..], &freqs, block * ratio);
+        normed.iter_mut().for_each(|v| *v = to_bf16(*v));
+        hadamard(&mut normed);
+        fp4_act_quant_inplace(&mut normed, 32);
+        index_kv.extend_from_slice(&normed);
+    }
+    let kv_err = relative_l2(&index_kv, &oracle.index_kv);
+    eprintln!("kompresor indeksera: względne L2 = {kv_err:.3e}");
+    assert!(kv_err < 1e-3, "kompresor indeksera rozjeżdża się o {kv_err:.3e}");
+
+    // Zapytania indeksera i punktowanie pozycji.
+    let softmax_scale = (d as f32).sqrt().recip();
+    let head_weight_scale = softmax_scale * (oracle.index_n_heads as f32).sqrt().recip();
+    let mut got_score = Vec::with_capacity(oracle.seqlen * blocks);
+    for t in 0..oracle.seqlen {
+        let qr = &oracle.qr[t * q_in..(t + 1) * q_in];
+        let mut q = project(&wq_b, qr, q_out, q_in);
+        for head in 0..oracle.index_n_heads {
+            let slot = &mut q[head * d..(head + 1) * d];
+            apply_rope(&mut slot[nope..], &freqs, t);
+            slot.iter_mut().for_each(|v| *v = to_bf16(*v));
+            hadamard(slot);
+            fp4_act_quant_inplace(slot, 32);
+        }
+        let x = &oracle.x[t * oracle.dim..(t + 1) * oracle.dim];
+        let head_w = project(&wproj, x, oracle.index_n_heads, oracle.dim);
+        for block in 0..blocks {
+            let key = &index_kv[block * d..(block + 1) * d];
+            let mut acc = 0f32;
+            for head in 0..oracle.index_n_heads {
+                let dot: f32 = q[head * d..(head + 1) * d]
+                    .iter()
+                    .zip(key)
+                    .map(|(a, b)| a * b)
+                    .sum();
+                acc += dot.max(0.0) * (head_w[head] * head_weight_scale);
+            }
+            got_score.push(acc);
+        }
+    }
+    let err = relative_l2(&got_score, &oracle.index_score);
+    eprintln!("punktowanie indeksera: względne L2 = {err:.3e}");
+    assert!(err < 1e-3, "indekser rozjeżdża się o {err:.3e}");
 }

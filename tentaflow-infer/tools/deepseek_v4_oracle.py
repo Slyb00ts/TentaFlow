@@ -203,6 +203,91 @@ c_norm = torch.from_numpy(load_vector(f"{comp}.norm.weight").copy()).float()
 comp_out = compressor_prefill(x, ratio, c_wkv, c_wgate, c_ape, c_norm,
                               freqs_cis, head_dim, rope_head_dim, eps)
 
+# --- indekser rzadkiej uwagi -------------------------------------------------
+
+E2M1_VALUES = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])
+
+
+def fp4_act_quant_inplace(x, block=32):
+    """Symulacja kwantyzacji aktywacji do FP4 (E2M1) ze skala zaokraglona do
+    potegi dwojki — odpowiednik fp4_act_quant(..., inplace=True)."""
+    shape = x.shape
+    xg = x.reshape(-1, shape[-1] // block, block).float()
+    amax = xg.abs().amax(-1, keepdim=True).clamp_min(6 * 2.0**-126)
+    s = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+    scaled = (xg / s).clamp(-6.0, 6.0)
+    sign = torch.sign(scaled)
+    mag = scaled.abs()
+    idx = (mag.unsqueeze(-1) - E2M1_VALUES).abs().argmin(dim=-1)
+    q = sign * E2M1_VALUES[idx]
+    return (q * s).reshape(shape).to(x.dtype)
+
+
+def hadamard(x):
+    """Szybka transformata Walsha-Hadamarda po ostatnim wymiarze, znormalizowana
+    przez 1/sqrt(n) — odpowiednik rotate_activation."""
+    n = x.size(-1)
+    assert n & (n - 1) == 0, n
+    y = x.clone().float()
+    step = 1
+    while step < n:
+        y = y.reshape(*y.shape[:-1], n // (2 * step), 2, step)
+        a = y[..., 0, :].clone()
+        b = y[..., 1, :].clone()
+        y[..., 0, :] = a + b
+        y[..., 1, :] = a - b
+        y = y.reshape(*y.shape[:-3], n)
+        step *= 2
+    return (y * n**-0.5).to(x.dtype)
+
+
+def indexer_compressor_prefill(x, ratio, wkv_c, wgate_c, ape, norm_w, freqs_cis,
+                               head_dim, rope_dim, eps):
+    """Kompresor indeksera: ta sama matematyka co zwykly, ale wyjscie przechodzi
+    przez rotacje Hadamarda i kwantyzacje FP4 zamiast FP8."""
+    overlap = ratio == 4
+    d = head_dim
+    xf = x.float()
+    kv = (xf @ wkv_c.float().T).unflatten(1, (-1, ratio))
+    score = (xf @ wgate_c.float().T).unflatten(1, (-1, ratio)) + ape
+    if overlap:
+        b, n = kv.size(0), kv.size(1)
+        kv2 = kv.new_zeros((b, n, 2 * ratio, d))
+        kv2[:, :, ratio:] = kv[:, :, :, d:]
+        kv2[:, 1:, :ratio] = kv[:, :-1, :, :d]
+        sc2 = score.new_full((b, n, 2 * ratio, d), float("-inf"))
+        sc2[:, :, ratio:] = score[:, :, :, d:]
+        sc2[:, 1:, :ratio] = score[:, :-1, :, :d]
+        kv, score = kv2, sc2
+    kv = (kv * score.softmax(dim=2)).sum(dim=2)
+    kv = rms_norm(kv, norm_w, eps)
+    apply_rotary_emb(kv[..., -rope_dim:], freqs_cis[::ratio][:kv.size(1)])
+    kv = hadamard(kv.bfloat16()).float()
+    return fp4_act_quant_inplace(kv, 32)
+
+
+index_n_heads = cfg["index_n_heads"]
+index_head_dim = cfg["index_head_dim"]
+index_topk = cfg["index_topk"]
+ix = f"{p}.indexer"
+i_wq_b = torch.from_numpy(load_matrix(f"{ix}.wq_b.weight").copy())
+i_wproj = torch.from_numpy(load_matrix(f"{ix}.weights_proj.weight").copy())
+i_wkv = torch.from_numpy(load_matrix(f"{ix}.compressor.wkv.weight").copy())
+i_wgate = torch.from_numpy(load_matrix(f"{ix}.compressor.wgate.weight").copy())
+i_ape = torch.from_numpy(load_vector(f"{ix}.compressor.ape").copy()).float()
+i_norm = torch.from_numpy(load_vector(f"{ix}.compressor.norm.weight").copy()).float()
+
+iq = (qr @ i_wq_b.T).unflatten(-1, (index_n_heads, index_head_dim))
+apply_rotary_emb(iq[..., -rope_head_dim:], freqs_cis)
+iq = hadamard(iq.bfloat16()).float()
+iq = fp4_act_quant_inplace(iq, 32)
+index_kv = indexer_compressor_prefill(x, ratio, i_wkv, i_wgate, i_ape, i_norm,
+                                      freqs_cis, index_head_dim, rope_head_dim, eps)
+softmax_scale = index_head_dim ** -0.5
+iw = (x.float() @ i_wproj.float().T) * (softmax_scale * index_n_heads ** -0.5)
+index_score = torch.einsum("bshd,btd->bsht", iq, index_kv)
+index_score = (index_score.relu() * iw.unsqueeze(-1)).sum(dim=2)
+
 # --- bramka MoE i pojedynczy ekspert (warstwa bez routingu haszowanego) -----
 
 GATE_LAYER = 3          # warstwy 0-2 routuja przez tid2eid, nie przez wynik
@@ -278,8 +363,9 @@ attn_out = o.flatten(2) @ wo_b.float().T
 
 out = sys.argv[1]
 with open(out, "wb") as f:
-    f.write(struct.pack("<11i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
-                        GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank, ratio))
+    f.write(struct.pack("<13i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
+                        GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank, ratio,
+                        index_n_heads, index_head_dim))
     for t in (x, qr, q, kv):
         f.write(t.detach().float().contiguous().numpy().tobytes())
     f.write(gx_t.contiguous().numpy().tobytes())
@@ -289,6 +375,9 @@ with open(out, "wb") as f:
     f.write(attn_in.float().contiguous().numpy().tobytes())
     f.write(attn_out.float().contiguous().numpy().tobytes())
     f.write(comp_out.float().contiguous().numpy().tobytes())
+    f.write(index_kv.float().contiguous().numpy().tobytes())
+    f.write(index_score.float().contiguous().numpy().tobytes())
+print("indekser: score", tuple(index_score.shape), "abs mean", index_score.abs().mean().item())
 print("kompresor: wpisow", comp_out.size(1), "abs mean", comp_out.abs().mean().item())
 print("bramka: pierwsze indeksy", indices[0].tolist(), "wagi", [round(v,4) for v in weights[0].tolist()])
 print(f"zapisano {out}: seq={SEQLEN} dim={dim} heads={n_heads} hd={head_dim} rope={rope_head_dim} ratio={ratio}")
