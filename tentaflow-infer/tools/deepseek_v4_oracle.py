@@ -340,6 +340,37 @@ up_act = torch.clamp(up_act, min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
 gate_act = torch.clamp(gate_act, max=SWIGLU_LIMIT)
 expert_out = (torch.nn.functional.silu(gate_act) * up_act) @ w2.T
 
+# --- rzadka uwaga po zebranych indeksach ------------------------------------
+
+window_size = cfg["sliding_window"]
+attn_sink = torch.from_numpy(load_vector(f"{p}.attn_sink").copy()).float()
+
+# Indeksy okna przesuwnego (prefill): przyczynowe, wzgledem bufora KV tokenow.
+base = torch.arange(SEQLEN).unsqueeze(1)
+win_idx = (base - window_size + 1).clamp(0) + torch.arange(min(SEQLEN, window_size))
+win_idx = torch.where(win_idx > base, -1, win_idx)
+
+# Indeksy skompresowane: wpis `n` widoczny dopiero gdy (t+1)//ratio > n.
+offset = SEQLEN
+cmp_idx = torch.arange(SEQLEN // ratio).repeat(SEQLEN, 1)
+cmp_mask = cmp_idx >= torch.arange(1, SEQLEN + 1).unsqueeze(1) // ratio
+cmp_idx = torch.where(cmp_mask, -1, cmp_idx + offset)
+topk_idxs = torch.cat([win_idx, cmp_idx], dim=-1)
+
+kv_full = torch.cat([kv.squeeze(0), comp_out.squeeze(0)], dim=0)
+softmax_scale_attn = head_dim ** -0.5
+qh = q.squeeze(0)                       # [S, heads, head_dim]
+sparse_out = torch.zeros_like(qh)
+for t in range(SEQLEN):
+    idxs = topk_idxs[t]
+    valid = idxs[idxs >= 0]
+    keys = kv_full[valid]               # [K, head_dim]
+    scores = torch.einsum("hd,kd->hk", qh[t].float(), keys.float()) * softmax_scale_attn
+    mx = scores.amax(dim=-1)
+    exp = torch.exp(scores - mx.unsqueeze(-1))
+    denom = exp.sum(dim=-1) + torch.exp(attn_sink - mx)
+    sparse_out[t] = (exp @ keys.float()) / denom.unsqueeze(-1)
+
 # --- sciezka wyjscia uwagi: rope ODWROTNE + grupowana LoRA ------------------
 
 o_groups = cfg["o_groups"]
@@ -363,9 +394,10 @@ attn_out = o.flatten(2) @ wo_b.float().T
 
 out = sys.argv[1]
 with open(out, "wb") as f:
-    f.write(struct.pack("<13i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
+    f.write(struct.pack("<15i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
                         GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank, ratio,
-                        index_n_heads, index_head_dim))
+                        index_n_heads, index_head_dim, window_size,
+                        topk_idxs.size(-1)))
     for t in (x, qr, q, kv):
         f.write(t.detach().float().contiguous().numpy().tobytes())
     f.write(gx_t.contiguous().numpy().tobytes())
@@ -377,6 +409,9 @@ with open(out, "wb") as f:
     f.write(comp_out.float().contiguous().numpy().tobytes())
     f.write(index_kv.float().contiguous().numpy().tobytes())
     f.write(index_score.float().contiguous().numpy().tobytes())
+    f.write(topk_idxs.to(torch.int32).contiguous().numpy().tobytes())
+    f.write(sparse_out.float().contiguous().numpy().tobytes())
+print("rzadka uwaga: abs mean", sparse_out.abs().mean().item(), "indeksow", topk_idxs.size(-1))
 print("indekser: score", tuple(index_score.shape), "abs mean", index_score.abs().mean().item())
 print("kompresor: wpisow", comp_out.size(1), "abs mean", comp_out.abs().mean().item())
 print("bramka: pierwsze indeksy", indices[0].tolist(), "wagi", [round(v,4) for v in weights[0].tolist()])

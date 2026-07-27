@@ -86,12 +86,15 @@ struct Oracle {
     index_head_dim: usize,
     index_kv: Vec<f32>,
     index_score: Vec<f32>,
+    n_topk: usize,
+    topk_idxs: Vec<i32>,
+    sparse_out: Vec<f32>,
 }
 
 fn load_oracle() -> Option<Oracle> {
     let path = std::env::var("FORGE_DEEPSEEK_V4_ORACLE").ok()?;
     let bytes = std::fs::read(path).ok()?;
-    let head: Vec<i32> = bytes[..52]
+    let head: Vec<i32> = bytes[..60]
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -106,9 +109,10 @@ fn load_oracle() -> Option<Oracle> {
     let (o_groups, o_lora_rank) = (head[8] as usize, head[9] as usize);
     let ratio = head[10] as usize;
     let (index_n_heads, index_head_dim) = (head[11] as usize, head[12] as usize);
+    let n_topk = head[14] as usize;
     let mut cursor = Cursor {
         bytes: &bytes,
-        offset: 52,
+        offset: 60,
     };
     let x = cursor.floats(seqlen * dim);
     let qr = cursor.floats(seqlen * 1024);
@@ -123,6 +127,8 @@ fn load_oracle() -> Option<Oracle> {
     let compressed = cursor.floats(seqlen / ratio * head_dim);
     let index_kv = cursor.floats(seqlen / ratio * index_head_dim);
     let index_score = cursor.floats(seqlen * (seqlen / ratio));
+    let topk_idxs = cursor.ints(seqlen * n_topk);
+    let sparse_out = cursor.floats(seqlen * n_heads * head_dim);
     Some(Oracle {
         seqlen,
         dim,
@@ -150,6 +156,9 @@ fn load_oracle() -> Option<Oracle> {
         index_head_dim,
         index_kv,
         index_score,
+        n_topk,
+        topk_idxs,
+        sparse_out,
     })
 }
 
@@ -825,4 +834,92 @@ fn sparse_indexer_matches_the_reference_implementation() {
     let err = relative_l2(&got_score, &oracle.index_score);
     eprintln!("punktowanie indeksera: względne L2 = {err:.3e}");
     assert!(err < 1e-3, "indekser rozjeżdża się o {err:.3e}");
+}
+
+/// Rzadka uwaga po zebranych indeksach. Dwa szczegóły, które przy pomyłce dają
+/// wynik wyglądający poprawnie:
+///
+///  1. indeks `-1` oznacza pozycję zamaskowaną — jej wynik to `-inf`, a wektor
+///     wartości zero; potraktowanie go jako zwykłego indeksu czyta cudzy wiersz,
+///  2. kotwica (`attn_sink`) wchodzi WYŁĄCZNIE do mianownika softmaxu, jako
+///     dodatkowy logit o zerowym wektorze wartości — nie do licznika.
+#[test]
+fn sparse_attention_matches_the_reference_implementation() {
+    let Some(oracle) = load_oracle() else {
+        eprintln!("pomijam: brak zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let Some(dir) = checkpoint_dir() else { return };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let sink = load_vector(&st, &format!("layers.{LAYER}.attn.attn_sink"));
+
+    let d = oracle.head_dim;
+    let scale = (d as f32).sqrt().recip();
+    // Bufor KV prefillu: najpierw KV tokenów okna, potem wpisy skompresowane.
+    let mut kv_full = oracle.kv.clone();
+    kv_full.extend_from_slice(&oracle.compressed);
+
+    let mut got = vec![0f32; oracle.sparse_out.len()];
+    for t in 0..oracle.seqlen {
+        let idxs = &oracle.topk_idxs[t * oracle.n_topk..(t + 1) * oracle.n_topk];
+        let valid: Vec<usize> = idxs.iter().filter(|i| **i >= 0).map(|i| *i as usize).collect();
+        for head in 0..oracle.n_heads {
+            let q = &oracle.q[(t * oracle.n_heads + head) * d..][..d];
+            let scores: Vec<f32> = valid
+                .iter()
+                .map(|k| {
+                    let key = &kv_full[k * d..(k + 1) * d];
+                    q.iter().zip(key).map(|(a, b)| a * b).sum::<f32>() * scale
+                })
+                .collect();
+            let max = scores.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            // Kotwica: dodatkowy logit w mianowniku, bez wkładu do licznika.
+            let denom: f32 = exps.iter().sum::<f32>() + (sink[head] - max).exp();
+            let out = &mut got[(t * oracle.n_heads + head) * d..][..d];
+            for (w, k) in exps.iter().zip(&valid) {
+                let key = &kv_full[k * d..(k + 1) * d];
+                for (o, v) in out.iter_mut().zip(key) {
+                    *o += w * v;
+                }
+            }
+            out.iter_mut().for_each(|v| *v /= denom);
+        }
+    }
+
+    let err = relative_l2(&got, &oracle.sparse_out);
+    eprintln!("rzadka uwaga: względne L2 = {err:.3e}");
+    assert!(err < 1e-5, "rzadka uwaga rozjeżdża się o {err:.3e}");
+}
+
+/// Konstrukcja indeksów prefillu: okno przesuwne jest przyczynowe, a wpis
+/// skompresowany `n` staje się widoczny dopiero dla tokenów od `(n+1)*ratio`.
+/// Pozycje niedostępne są oznaczane `-1`, nie pomijane.
+#[test]
+fn prefill_index_construction_matches_the_reference() {
+    let Some(oracle) = load_oracle() else {
+        eprintln!("pomijam: brak zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let window = oracle.seqlen.min(128);
+    let blocks = oracle.seqlen / oracle.ratio;
+    for t in 0..oracle.seqlen {
+        let row = &oracle.topk_idxs[t * oracle.n_topk..(t + 1) * oracle.n_topk];
+        for (slot, want) in row.iter().enumerate().take(window) {
+            let first = t.saturating_sub(127);
+            let idx = first + slot;
+            let expected = if idx > t { -1 } else { idx as i32 };
+            assert_eq!(*want, expected, "token {t}, okno {slot}");
+        }
+        for block in 0..blocks {
+            let want = row[window + block];
+            let visible = block < (t + 1) / oracle.ratio;
+            let expected = if visible {
+                (oracle.seqlen + block) as i32
+            } else {
+                -1
+            };
+            assert_eq!(want, expected, "token {t}, blok skompresowany {block}");
+        }
+    }
 }
