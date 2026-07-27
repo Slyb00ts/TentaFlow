@@ -18,7 +18,8 @@ stronicowania przez PCIe. Na 6900 XT ten model NIE WCHODZI (16 GiB).
 |---|--:|--:|--:|---|
 | prefill p1024 | 27,3 tok/s | **843,9** tok/s | 716,3 tok/s | **FORGE 1,18x** |
 | decode tg128, bez spekulacji | 9,5 tok/s | **31,7** tok/s | **33,0** tok/s | llama.cpp 1,04x |
-| decode tg128, MTP po obu stronach | 47,1 tok/s | **51,8** tok/s | **73,4** tok/s | llama.cpp 1,42x |
+| decode tg128, MTP po obu stronach | 47,1 tok/s | **68,7** tok/s | 73,4 tok/s | llama.cpp 1,07x |
+| decode tg128, MTP + n-gram (patrz zastrzeżenie) | — | **82,4** tok/s | 73,4 tok/s | **FORGE 1,12x** |
 
 **Prefill urósł 30,9x i wyprzedził llama.cpp**, decode 3,3x i jest 4% od niego. Wyjście jest przez
 całą tę drogę BITOWO IDENTYCZNE — ta sama suma SHA 128 tokenów co przed
@@ -143,6 +144,19 @@ Grupowanie idzie więc PER FORMAT. Zysk skaluje się odwrotnie do rozmiaru model
 qwen-guard +5,8% (7900 XT) i +5,2% (6900 XT), 27B +0,6% — bo tam decode jest już
 ograniczony pasmem, a nie liczbą uruchomień.
 
+**Weryfikacja MTP przez GEMV int8: +33% (51,8 -> 68,7 tok/s).** MTP dawało
+3,91 tokena na przebieg weryfikacji, ale tylko 1,63x przepustowości — czyli
+przebieg 4-tokenowy kosztował 2,4x więcej niż 1-tokenowy, mimo że czyta TE SAME
+wagi. Profil wskazał winnego: rodzina `gemm_nvfp4_gguf_f16_b*` ma właściwą
+strukturę (fala na wiersz), ale idzie ścieżką f16 — 152 us wobec 63 us GEMV-a
+int8 na tym samym kształcie. Nowe `gemv_nvfp4_gguf_q8_1_b{2,4,8}_f16` dekodują
+wagę RAZ na falę i używają jej dla wszystkich tokenów, z iloczynem `dp4a`.
+
+PRÓBA ODRZUCONA PO DRODZE: skierowanie T=2..16 na kafel WMMA `bm32`. Dopełnienie
+czterech tokenów do 32 wywróciło decode z 51,8 na 27,6 tok/s — kafel WMMA NIE
+jest czysto pamięciowy (52 z 102 TFLOPS), więc ośmiokrotnie nadmiarowa praca
+macierzowa kosztuje realnie.
+
 ZOSTAJE, w kolejności wartości:
 1. **~8 ms z 32 ms na token idzie w ~900 małych kerneli** (rmsnorm, DeltaNet,
    427 kopii D2D). To fuzja kerneli, nie strojenie pojedynczego.
@@ -157,6 +171,9 @@ ZOSTAJE, w kolejności wartości:
 - `llama-bench tg128` dekoduje z PUSTYM kontekstem, a `forge bench` po prompcie,
   więc porównanie decode jest przechylone NA KORZYŚĆ llama.cpp. Przy 26x i 3,5x
   różnicy nie zmienia to wniosku, ale przy 1,29x na 0,8B — może.
+- **Wiersz z n-gramem jest zawyżony**: `forge bench` powtarza ten sam prompt, więc
+  cache n-gramów ma akceptację 1,00 — na nowym tekście będzie znacznie niżej.
+  Uczciwym porównaniem z llama.cpp jest wiersz „MTP po obu stronach".
 - Porównanie MTP-do-MTP zestawia `llama-cli --spec-type draft-mtp` (prompt ~10
   tokenów) z `forge bench --speculative mtp` (prompt 128). Oba są zdominowane
   przez decode, ale nie jest to ten sam kształt.
