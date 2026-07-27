@@ -392,12 +392,55 @@ wo_a_g = wo_a.view(o_groups, o_lora_rank, -1)
 o = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a_g.float())
 attn_out = o.flatten(2) @ wo_b.float().T
 
+# --- hyper-connections: hc_pre / sinkhorn / hc_post -------------------------
+
+HC = cfg["hc_mult"]
+HC_ITERS = cfg["hc_sinkhorn_iters"]
+HC_EPS = cfg["hc_eps"]
+MIX_HC = (2 + HC) * HC
+
+hc_fn = torch.from_numpy(load_vector(f"layers.{LAYER}.hc_attn_fn").copy()).float()
+hc_base = torch.from_numpy(load_vector(f"layers.{LAYER}.hc_attn_base").copy()).float()
+hc_scale = torch.from_numpy(load_vector(f"layers.{LAYER}.hc_attn_scale").copy()).float()
+
+
+def hc_split_sinkhorn(mixes, scale, base, hc, iters, eps):
+    pre = torch.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + eps
+    post = 2 * torch.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
+    comb = mixes[..., 2 * hc:] * scale[2] + base[2 * hc:]
+    comb = comb.unflatten(-1, (hc, hc))
+    comb = comb.softmax(dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    return pre, post, comb
+
+
+# Strumien rezydualny to HC kopii stanu ukrytego.
+hi = np.arange(SEQLEN * HC * dim, dtype=np.int64)
+hc_x = ((hi * 69069 % 1993).astype(np.float32) / 996.5 - 1.0).reshape(1, SEQLEN, HC, dim)
+hc_in = torch.from_numpy(hc_x.copy())
+
+flat = hc_in.flatten(2).float()
+rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+mixes = (flat @ hc_fn.T) * rsqrt
+hc_pre_w, hc_post_w, hc_comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC, HC_ITERS, HC_EPS)
+hc_reduced = torch.sum(hc_pre_w.unsqueeze(-1) * hc_in, dim=2)
+
+# Wyjscie bloku (syntetyczne) rozprowadzone z powrotem na HC kopii.
+bi = np.arange(SEQLEN * dim, dtype=np.int64)
+blk = torch.from_numpy((((bi * 2246822519) % 1987).astype(np.float32) / 993.5 - 1.0)
+                       .reshape(1, SEQLEN, dim).copy())
+hc_expanded = hc_post_w.unsqueeze(-1) * blk.unsqueeze(-2) + torch.sum(
+    hc_comb.unsqueeze(-1) * hc_in.unsqueeze(-2), dim=2)
+
 out = sys.argv[1]
 with open(out, "wb") as f:
-    f.write(struct.pack("<15i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
+    f.write(struct.pack("<16i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
                         GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank, ratio,
                         index_n_heads, index_head_dim, window_size,
-                        topk_idxs.size(-1)))
+                        topk_idxs.size(-1), HC))
     for t in (x, qr, q, kv):
         f.write(t.detach().float().contiguous().numpy().tobytes())
     f.write(gx_t.contiguous().numpy().tobytes())
@@ -411,6 +454,10 @@ with open(out, "wb") as f:
     f.write(index_score.float().contiguous().numpy().tobytes())
     f.write(topk_idxs.to(torch.int32).contiguous().numpy().tobytes())
     f.write(sparse_out.float().contiguous().numpy().tobytes())
+    f.write(hc_in.float().contiguous().numpy().tobytes())
+    f.write(blk.float().contiguous().numpy().tobytes())
+    f.write(hc_reduced.float().contiguous().numpy().tobytes())
+    f.write(hc_expanded.float().contiguous().numpy().tobytes())
 print("rzadka uwaga: abs mean", sparse_out.abs().mean().item(), "indeksow", topk_idxs.size(-1))
 print("indekser: score", tuple(index_score.shape), "abs mean", index_score.abs().mean().item())
 print("kompresor: wpisow", comp_out.size(1), "abs mean", comp_out.abs().mean().item())

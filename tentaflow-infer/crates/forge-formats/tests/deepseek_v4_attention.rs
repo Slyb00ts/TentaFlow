@@ -89,12 +89,17 @@ struct Oracle {
     n_topk: usize,
     topk_idxs: Vec<i32>,
     sparse_out: Vec<f32>,
+    hc: usize,
+    hc_in: Vec<f32>,
+    hc_block: Vec<f32>,
+    hc_reduced: Vec<f32>,
+    hc_expanded: Vec<f32>,
 }
 
 fn load_oracle() -> Option<Oracle> {
     let path = std::env::var("FORGE_DEEPSEEK_V4_ORACLE").ok()?;
     let bytes = std::fs::read(path).ok()?;
-    let head: Vec<i32> = bytes[..60]
+    let head: Vec<i32> = bytes[..64]
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -110,9 +115,10 @@ fn load_oracle() -> Option<Oracle> {
     let ratio = head[10] as usize;
     let (index_n_heads, index_head_dim) = (head[11] as usize, head[12] as usize);
     let n_topk = head[14] as usize;
+    let hc = head[15] as usize;
     let mut cursor = Cursor {
         bytes: &bytes,
-        offset: 60,
+        offset: 64,
     };
     let x = cursor.floats(seqlen * dim);
     let qr = cursor.floats(seqlen * 1024);
@@ -129,6 +135,10 @@ fn load_oracle() -> Option<Oracle> {
     let index_score = cursor.floats(seqlen * (seqlen / ratio));
     let topk_idxs = cursor.ints(seqlen * n_topk);
     let sparse_out = cursor.floats(seqlen * n_heads * head_dim);
+    let hc_in = cursor.floats(seqlen * hc * dim);
+    let hc_block = cursor.floats(seqlen * dim);
+    let hc_reduced = cursor.floats(seqlen * dim);
+    let hc_expanded = cursor.floats(seqlen * hc * dim);
     Some(Oracle {
         seqlen,
         dim,
@@ -159,6 +169,11 @@ fn load_oracle() -> Option<Oracle> {
         n_topk,
         topk_idxs,
         sparse_out,
+        hc,
+        hc_in,
+        hc_block,
+        hc_reduced,
+        hc_expanded,
     })
 }
 
@@ -922,4 +937,115 @@ fn prefill_index_construction_matches_the_reference() {
             assert_eq!(want, expected, "token {t}, blok skompresowany {block}");
         }
     }
+}
+
+/// Hyper-connections: strumień rezydualny to `hc_mult` kopii stanu, a nie jedna.
+/// Blok najpierw redukuje je do jednej ważoną sumą, a po policzeniu uwagi/FFN
+/// rozprowadza wynik z powrotem, mieszając kopie macierzą po Sinkhornie.
+///
+/// Sinkhorn ma tu nieoczywistą kolejność: po softmaksie po wierszach idzie
+/// najpierw normalizacja po KOLUMNACH, i dopiero potem `iters - 1` pełnych par
+/// wiersz+kolumna. Rozpoczęcie od wierszy daje inną macierz.
+#[test]
+fn hyper_connections_match_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let hc_fn = load_vector(&st, &format!("layers.{LAYER}.hc_attn_fn"));
+    let hc_base = load_vector(&st, &format!("layers.{LAYER}.hc_attn_base"));
+    let hc_scale = load_vector(&st, &format!("layers.{LAYER}.hc_attn_scale"));
+    let (hc, dim, eps, hc_eps) = (oracle.hc, oracle.dim, 1e-6f32, 1e-6f32);
+    let mix_hc = (2 + hc) * hc;
+    let wide = hc * dim;
+
+    let mut reduced = Vec::with_capacity(oracle.hc_reduced.len());
+    let mut expanded = vec![0f32; oracle.hc_expanded.len()];
+    for t in 0..oracle.seqlen {
+        let x = &oracle.hc_in[t * wide..(t + 1) * wide];
+        let mean = x.iter().map(|v| v * v).sum::<f32>() / wide as f32;
+        let rsqrt = (mean + eps).sqrt().recip();
+        let mixes: Vec<f32> = (0..mix_hc)
+            .map(|m| {
+                (0..wide).map(|c| hc_fn[m * wide + c] * x[c]).sum::<f32>() * rsqrt
+            })
+            .collect();
+
+        let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+        let pre: Vec<f32> = (0..hc)
+            .map(|j| sigmoid(mixes[j] * hc_scale[0] + hc_base[j]) + hc_eps)
+            .collect();
+        let post: Vec<f32> = (0..hc)
+            .map(|j| 2.0 * sigmoid(mixes[j + hc] * hc_scale[1] + hc_base[j + hc]))
+            .collect();
+        let mut comb = vec![0f32; hc * hc];
+        for j in 0..hc {
+            for k in 0..hc {
+                let idx = j * hc + k + 2 * hc;
+                comb[j * hc + k] = mixes[idx] * hc_scale[2] + hc_base[idx];
+            }
+        }
+        // Softmax po wierszach, potem NAJPIERW kolumny, dopiero potem pary.
+        for j in 0..hc {
+            let row = &mut comb[j * hc..(j + 1) * hc];
+            let max = row.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
+            let mut sum = 0f32;
+            row.iter_mut().for_each(|v| {
+                *v = (*v - max).exp();
+                sum += *v;
+            });
+            row.iter_mut().for_each(|v| *v = *v / sum + hc_eps);
+        }
+        let normalize_cols = |comb: &mut Vec<f32>| {
+            for k in 0..hc {
+                let sum: f32 = (0..hc).map(|j| comb[j * hc + k]).sum();
+                for j in 0..hc {
+                    comb[j * hc + k] /= sum + hc_eps;
+                }
+            }
+        };
+        normalize_cols(&mut comb);
+        for _ in 0..19 {
+            for j in 0..hc {
+                let sum: f32 = comb[j * hc..(j + 1) * hc].iter().sum();
+                comb[j * hc..(j + 1) * hc]
+                    .iter_mut()
+                    .for_each(|v| *v /= sum + hc_eps);
+            }
+            normalize_cols(&mut comb);
+        }
+
+        // Redukcja HC kopii do jednej.
+        let mut y = vec![0f32; dim];
+        for copy in 0..hc {
+            let src = &x[copy * dim..(copy + 1) * dim];
+            for (o, v) in y.iter_mut().zip(src) {
+                *o += pre[copy] * v;
+            }
+        }
+        reduced.extend_from_slice(&y);
+
+        // Rozprowadzenie wyjścia bloku z powrotem na HC kopii.
+        let blk = &oracle.hc_block[t * dim..(t + 1) * dim];
+        for out_copy in 0..hc {
+            let dst = &mut expanded[(t * hc + out_copy) * dim..][..dim];
+            for (o, v) in dst.iter_mut().zip(blk) {
+                *o = post[out_copy] * v;
+            }
+            for in_copy in 0..hc {
+                let src = &x[in_copy * dim..(in_copy + 1) * dim];
+                let w = comb[in_copy * hc + out_copy];
+                for (o, v) in dst.iter_mut().zip(src) {
+                    *o += w * v;
+                }
+            }
+        }
+    }
+
+    let pre_err = relative_l2(&reduced, &oracle.hc_reduced);
+    let post_err = relative_l2(&expanded, &oracle.hc_expanded);
+    eprintln!("hc_pre {pre_err:.3e}, hc_post {post_err:.3e}");
+    assert!(pre_err < 1e-5, "redukcja HC rozjeżdża się o {pre_err:.3e}");
+    assert!(post_err < 1e-5, "rozprowadzenie HC rozjeżdża się o {post_err:.3e}");
 }
