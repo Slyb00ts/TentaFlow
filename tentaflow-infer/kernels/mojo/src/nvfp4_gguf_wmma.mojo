@@ -21,7 +21,7 @@ from std.gpu import block_idx, thread_idx
 
 from src.arch_wmma import wmma_f16_16x16x16
 from src.gemv2 import _e2m1x8
-from src.nvfp4_gguf_batch import _ue4m3_value
+from src.nvfp4_gguf_batch import _ue4m3_branchless
 
 comptime TILE = 16
 comptime BLOCK_VALUES = 64  # wartości opisane jednym blokiem GGUF
@@ -39,7 +39,7 @@ def _weight_frag(
     starszym — stąd fragment składa się z dwóch połówek, a nie z przeplotu.
     """
     codes = (weights + base + 4 + subblock * 8).load[width=8, alignment=1]()
-    scale = _ue4m3_value(weights[base + subblock])
+    scale = _ue4m3_branchless(weights[base + subblock])
     low = (_e2m1x8(codes & 0x0F) * scale).cast[DType.float16]()
     high = (_e2m1x8(codes >> 4) * scale).cast[DType.float16]()
     return low.join(high)

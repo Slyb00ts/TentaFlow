@@ -1513,6 +1513,10 @@
       "entry": "src_nvfp4_gemv_nvfp4_gguf_f166A6A6A6AoA_19122571c246add7",
       "file": "gemv_nvfp4_gguf_f16.ptx"
     },
+    "gemv_nvfp4_gguf_f16_wave": {
+      "entry": "src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b",
+      "file": "gemv_nvfp4_gguf_f16_wave.ptx"
+    },
     "gemv_nvfp4_gguf_out_f32": {
       "entry": "src_nvfp4_gemv_nvfp4_gguf_out_6A6A6A6A_02571c71ee08c8f2",
       "file": "gemv_nvfp4_gguf_out_f32.ptx"

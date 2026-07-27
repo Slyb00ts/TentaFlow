@@ -48,6 +48,30 @@ def _ue4m3_value(code: UInt8) -> Float32:
     return bitcast[DType.float32, 1](SIMD[DType.uint32, 1](bits))[0]
 
 
+@always_inline
+def _ue4m3_branchless(code: UInt8) -> Float32:
+    """Skala UE4M3 bez galezi.
+
+    `_ue4m3_value` rozgalezia sie na zerze, na 0x7F i na wartosci subnormalnej,
+    a w tym kernelu kazda linia dekoduje INNY bajt skali, wiec kazda galaz
+    serializuje cala fale. Wartosci sa te same co w wersji rozgalezionej.
+    """
+    exponent = Int32((code >> 3) & 0x0F)
+    mantissa = Int32(code & 0x07)
+    normal = bitcast[DType.float32](
+        (((exponent + 120) << 23) | (mantissa << 20)).cast[DType.uint32]()
+    )
+    subnormal = Float32(mantissa) * (1.0 / 512.0)
+    # `(exponent + 15) >> 4` to 0 dla E=0 i 1 dla kazdego innego wykladnika.
+    is_normal = Float32((exponent + 15) >> 4)
+    value = is_normal * normal + (1.0 - is_normal) * subnormal
+    # Kod 0x7F to NaN skali; format go nie dopuszcza, ale wersja rozgaleziona
+    # zwracala tam zero i zachowujemy to zachowanie. Skalarny wybor kompiluje
+    # sie do `cndmask`, nie do skoku.
+    return 0.0 if code == 0x7F else value
+
+
+
 def gemm_nvfp4_gguf_f16_impl[token_tile: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],

@@ -10,7 +10,7 @@ from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
 from src.reduce import block_reduce_sum
 from src.gemv2 import _e2m1x8, _e2m1x8_f16
-from src.nvfp4_gguf_batch import _ue4m3_value
+from src.nvfp4_gguf_batch import _ue4m3_branchless
 from src.kv_fp8 import _e4m3x2_to_f16x2
 from std.gpu.primitives import warp
 
@@ -280,11 +280,11 @@ def gemv_nvfp4_gguf_f16_wave(
         x1 = (x + column + 8).load[width=8, alignment=2]()
         x2 = (x + column + 16).load[width=8, alignment=2]()
         x3 = (x + column + 24).load[width=8, alignment=2]()
-        acc0 += _ue4m3_value(weights[block_base + half]) * (
+        acc0 += _ue4m3_branchless(weights[block_base + half]) * (
             (_e2m1x8_f16(lo & 0x0F) * x0).cast[DType.float32]().reduce_add()
             + (_e2m1x8_f16(lo >> 4) * x1).cast[DType.float32]().reduce_add()
         )
-        acc1 += _ue4m3_value(weights[block_base + half + 1]) * (
+        acc1 += _ue4m3_branchless(weights[block_base + half + 1]) * (
             (_e2m1x8_f16(hi & 0x0F) * x2).cast[DType.float32]().reduce_add()
             + (_e2m1x8_f16(hi >> 4) * x3).cast[DType.float32]().reduce_add()
         )
