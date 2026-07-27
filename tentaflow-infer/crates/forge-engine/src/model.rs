@@ -9920,6 +9920,9 @@ impl Model {
             .layers
             .iter()
             .map(|layer| match &layer.mixer {
+                LayerMixer::DeepseekAttention(_) => {
+                    unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                }
                 LayerMixer::DeltaNet(_) => {
                     let buffers = if let Some((conv_initial, conv_checkpoints, state_initial)) =
                         shared_delta_base.as_ref()
@@ -10089,6 +10092,9 @@ impl Model {
             .layers
             .iter()
             .map(|layer| match layer.mixer {
+                LayerMixer::DeepseekAttention(_) => {
+                    unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                }
                 LayerMixer::Attention(_) => Ok(None),
                 LayerMixer::DeltaNet(_) => Ok(Some(MtpB2DeltaCache {
                     conv_initial: a16("mtp b2 conv initial", &[BATCH, conv_elems])?,
@@ -10294,6 +10300,9 @@ impl Model {
             .layers
             .iter()
             .map(|layer| match layer.mixer {
+                LayerMixer::DeepseekAttention(_) => {
+                    unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                }
                 LayerMixer::Attention(_) => Ok(None),
                 LayerMixer::DeltaNet(_) => Ok(Some(HybridPrefillB2DeltaCache {
                     conv_initial: a16("prefill B2 conv initial", &[BATCH, conv_elems])?,
@@ -10904,6 +10913,9 @@ impl Model {
 
         for (layer_index, layer) in self.weights.layers.iter().enumerate() {
             match &layer.mixer {
+                LayerMixer::DeepseekAttention(_) => {
+                    unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                }
                 LayerMixer::Attention(attention) => {
                     self.hybrid_verify_attention_layer(layer_index, attention, t)?
                 }
@@ -11311,6 +11323,9 @@ impl Model {
             )?;
             for (layer_index, layer) in self.weights.layers.iter().enumerate() {
                 match &layer.mixer {
+                    LayerMixer::DeepseekAttention(_) => {
+                        unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                    }
                     LayerMixer::Attention(attention) => {
                         let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
                             return Err(ForgeError::Unsupported(
@@ -13602,6 +13617,8 @@ impl Model {
         });
         let split_layout = self.weights.layers.iter().all(|layer| {
             let attention_ok = match &layer.mixer {
+                // DeepSeek V4 ma własną ścieżkę; hybrydowe zdolności go nie dotyczą.
+                LayerMixer::DeepseekAttention(_) => false,
                 LayerMixer::Attention(attention) => {
                     matches!(attention.attn_qkv, QkvWeights::Split { .. })
                 }
@@ -14494,6 +14511,9 @@ impl Model {
             )?;
             for (layer_index, layer) in self.weights.layers.iter().enumerate() {
                 match &layer.mixer {
+                    LayerMixer::DeepseekAttention(_) => {
+                        unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                    }
                     LayerMixer::Attention(attention) => {
                         let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
                             unreachable!("capability wymaga rozdzielonych Q/K/V")
@@ -15100,6 +15120,9 @@ impl Model {
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
             match &layer.mixer {
+                LayerMixer::DeepseekAttention(_) => {
+                    unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                }
                 LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, &src)?,
                 LayerMixer::DeltaNet(d) => {
                     self.hybrid_delta_projections(d, &b.x, 1)?;
@@ -15928,6 +15951,9 @@ impl Model {
             let q_dim = p.n_heads * p.head_dim;
             for (layer_index, layer) in self.weights.layers.iter().enumerate() {
                 match &layer.mixer {
+                    LayerMixer::DeepseekAttention(_) => {
+                        unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                    }
                     LayerMixer::Attention(attention) => {
                         let QkvWeights::Split { q, k, v } = &attention.attn_qkv else {
                             return Err(ForgeError::Unsupported(
@@ -17075,6 +17101,9 @@ impl Model {
                     &self.stream,
                 )?;
                 match &self.weights.layers[layer_index].mixer {
+                    LayerMixer::DeepseekAttention(_) => {
+                        unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+                    }
                     LayerMixer::Attention(attention) => {
                         self.device.copy(
                             &bb.positions,

@@ -564,6 +564,12 @@ pub struct MoeFfn {
     pub moe_inter: usize,
     /// Renormalize the top-k routing weights to sum 1.
     pub norm_topk: bool,
+    /// Bias routera dodawany PRZED wyborem top-k, ale nie wchodzący do wag
+    /// (DeepSeek V4, `noaux_tc`).
+    pub gate_bias: Option<DevBuffer>,
+    /// Tablica `token -> eksperci` dla warstw z routingiem haszowanym; gdy jest,
+    /// zastępuje wybór po wyniku bramki, ale nie wagi.
+    pub tid2eid: Option<DevBuffer>,
     /// Liczniki wyboru ekspertów tej warstwy — źródło danych dla rezydencji.
     pub usage: ExpertUsage,
 }
@@ -614,9 +620,57 @@ pub struct AttnWeights {
 /// The token-mixing sublayer of a transformer block: standard softmax
 /// attention, or (qwen35moe hybrid) Gated-DeltaNet linear attention. Non-hybrid
 /// architectures are all `Attention`.
+/// Kompresor strumienia KV: uczony pooling bramkowany po oknie `compress_ratio`
+/// tokenów. Przy stopniu 4 projekcje są DWA RAZY szersze — pierwsza połowa
+/// wymiarów opisuje okno przesunięte o blok wstecz.
+pub struct CompressorWeights {
+    pub wkv: DevWeight,
+    pub wgate: DevWeight,
+    /// Kodowanie pozycji wewnątrz okna, `[ratio, szerokość projekcji]`.
+    pub ape: DevBuffer,
+    pub norm: DevBuffer,
+}
+
+/// Indekser rzadkiej uwagi: własny kompresor (z rotacją Hadamarda i
+/// kwantyzacją FP4) plus projekcje zapytań i wag na głowicę.
+pub struct IndexerWeights {
+    pub wq_b: DevWeight,
+    pub weights_proj: DevWeight,
+    pub compressor: CompressorWeights,
+}
+
+/// Uwaga latentna DeepSeeka V4: Q i wyjście przez projekcje LoRA, pojedyncza
+/// głowica KV, kotwica na głowicę, oraz — zależnie od warstwy — kompresor
+/// strumienia KV i indekser rzadkiej uwagi.
+pub struct DeepseekAttnWeights {
+    pub wq_a: DevWeight,
+    pub q_norm: DevBuffer,
+    pub wq_b: DevWeight,
+    pub wkv: DevWeight,
+    pub kv_norm: DevBuffer,
+    /// Zejście LoRA wyjścia, grupowane po `o_groups` blokach.
+    pub wo_a: DevWeight,
+    pub wo_b: DevWeight,
+    /// Logit kotwicy, jeden na głowicę; wchodzi tylko do mianownika softmaxu.
+    pub attn_sink: DevBuffer,
+    pub compressor: Option<CompressorWeights>,
+    pub indexer: Option<IndexerWeights>,
+}
+
+/// Wagi hyper-connections jednego miejsca wpięcia (uwaga albo FFN).
+pub struct HyperConnectionWeights {
+    /// `[mix_hc, hc * hidden]` — z niej powstają wagi redukcji, rozprowadzenia
+    /// i macierz mieszająca.
+    pub mix_fn: DevBuffer,
+    pub base: DevBuffer,
+    /// Trzy skale: dla redukcji, rozprowadzenia i macierzy.
+    pub scale: DevBuffer,
+}
+
 pub enum LayerMixer {
     Attention(Box<AttnWeights>),
     DeltaNet(Box<DeltaNetWeights>),
+    DeepseekAttention(Box<DeepseekAttnWeights>),
 }
 
 /// Per-layer weight set (roles resolved by the arch registry).
@@ -632,6 +686,10 @@ pub struct LayerWeights {
     pub layer_output_scale: Option<f32>,
     pub mixer: LayerMixer,
     pub ffn: LayerFfn,
+    /// Hyper-connections: strumień rezydualny ma `hc_mult` kopii, a nie jedną.
+    /// `Some` tylko dla architektur, które ich używają.
+    pub hc_attn: Option<HyperConnectionWeights>,
+    pub hc_ffn: Option<HyperConnectionWeights>,
 }
 
 impl LayerWeights {
@@ -643,6 +701,9 @@ impl LayerWeights {
             LayerMixer::Attention(a) => a,
             LayerMixer::DeltaNet(_) => {
                 unreachable!("attention path reached a DeltaNet layer")
+            }
+            LayerMixer::DeepseekAttention(_) => {
+                unreachable!("ścieżka uwagi trafiła na warstwę DeepSeeka V4")
             }
         }
     }
@@ -1950,6 +2011,105 @@ fn fetch_expert_stack(src: &dyn TensorSource, name: &str) -> Result<HostWeight> 
     quant_host_weight(name, data, dtype, quant, n_expert * a, b, 1.0)
 }
 
+/// Wczytuje wagi kompresora strumienia KV, gdy warstwa go ma.
+fn load_compressor(
+    device: &dyn Device,
+    src: &dyn TensorSource,
+    prefix: &str,
+) -> Result<Option<CompressorWeights>> {
+    if src.fetch_optional(&format!("{prefix}.wkv.weight"))?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(CompressorWeights {
+        wkv: upload_weight(device, fetch_matrix(src, &format!("{prefix}.wkv.weight"))?)?,
+        wgate: upload_weight(device, fetch_matrix(src, &format!("{prefix}.wgate.weight"))?)?,
+        ape: upload_f32(device, src, &format!("{prefix}.ape"))?,
+        norm: upload_norm(device, src, &format!("{prefix}.norm.weight"))?,
+    }))
+}
+
+/// Wczytuje jedną warstwę uwagi DeepSeeka V4.
+///
+/// Kompresor i indekser są opcjonalne i ich obecność wynika z `compress_ratios`:
+/// warstwy o stopniu 0 nie mają żadnego, o stopniu 4 mają oba, a o stopniu 128
+/// tylko kompresor. Opis modelu został wcześniej przycięty do tego, co jest w
+/// checkpoincie, więc brakująca rola oznacza tu warstwę bez tego elementu, a nie
+/// uszkodzony plik.
+fn load_deepseek_attention(
+    device: &dyn Device,
+    src: &dyn TensorSource,
+    layer: usize,
+) -> Result<DeepseekAttnWeights> {
+    let p = format!("layers.{layer}.attn");
+    let indexer = if src
+        .fetch_optional(&format!("{p}.indexer.weights_proj.weight"))?
+        .is_some()
+    {
+        let compressor = load_compressor(device, src, &format!("{p}.indexer.compressor"))?
+            .ok_or_else(|| {
+                ForgeError::Format(format!(
+                    "warstwa {layer}: indekser bez własnego kompresora"
+                ))
+            })?;
+        Some(IndexerWeights {
+            wq_b: upload_weight(device, fetch_matrix(src, &format!("{p}.indexer.wq_b.weight"))?)?,
+            weights_proj: upload_weight(
+                device,
+                fetch_matrix(src, &format!("{p}.indexer.weights_proj.weight"))?,
+            )?,
+            compressor,
+        })
+    } else {
+        None
+    };
+    Ok(DeepseekAttnWeights {
+        wq_a: upload_weight(device, fetch_matrix(src, &format!("{p}.wq_a.weight"))?)?,
+        q_norm: upload_norm(device, src, &format!("{p}.q_norm.weight"))?,
+        wq_b: upload_weight(device, fetch_matrix(src, &format!("{p}.wq_b.weight"))?)?,
+        wkv: upload_weight(device, fetch_matrix(src, &format!("{p}.wkv.weight"))?)?,
+        kv_norm: upload_norm(device, src, &format!("{p}.kv_norm.weight"))?,
+        wo_a: upload_weight(device, fetch_matrix(src, &format!("{p}.wo_a.weight"))?)?,
+        wo_b: upload_weight(device, fetch_matrix(src, &format!("{p}.wo_b.weight"))?)?,
+        attn_sink: upload_f32(device, src, &format!("{p}.attn_sink"))?,
+        compressor: load_compressor(device, src, &format!("{p}.compressor"))?,
+        indexer,
+    })
+}
+
+/// Wczytuje samą warstwę uwagi DeepSeeka V4 z katalogu safetensors.
+///
+/// Istnieje dla testów: pełny model ma 157 GB, a geometrię i przejście przez
+/// konwersje kwantyzacji trzeba sprawdzić na PRAWDZIWYCH wagach, nie na
+/// syntetyku. Ładuje jedną warstwę, czyli około 200 MB.
+pub fn load_deepseek_layer_for_test(
+    device: &dyn Device,
+    dir: &Path,
+    layer: usize,
+) -> Result<DeepseekAttnWeights> {
+    let config: HfConfig = HfConfig::load(dir.join("config.json"))?;
+    let st = ShardedSafeTensors::load_dir(dir)?;
+    let src = StSource {
+        st: &st,
+        scheme: NvFp4Scheme::detect(&config),
+        fp8: false,
+        deepseek_v4: true,
+    };
+    load_deepseek_attention(device, &src, layer)
+}
+
+/// Wagi hyper-connections jednego miejsca wpięcia.
+fn load_hyper_connection(
+    device: &dyn Device,
+    src: &dyn TensorSource,
+    prefix: &str,
+) -> Result<HyperConnectionWeights> {
+    Ok(HyperConnectionWeights {
+        mix_fn: upload_f32(device, src, &format!("{prefix}_fn"))?,
+        base: upload_f32(device, src, &format!("{prefix}_base"))?,
+        scale: upload_f32(device, src, &format!("{prefix}_scale"))?,
+    })
+}
+
 /// Ile bajtów ekspertów wolno zostawić w pamięci przy tym modelu.
 ///
 /// Pojemność to wolne miejsce, jakie zgłasza warstwowe urządzenie (VRAM plus
@@ -3185,12 +3345,16 @@ impl ModelWeights {
                         n_experts_used: moe.n_experts_used,
                         moe_inter: moe.moe_intermediate_size,
                         norm_topk: moe.norm_topk_prob,
+                        gate_bias: None,
+                        tid2eid: None,
                         usage: ExpertUsage::new(device, moe.n_experts)?,
                     }))
                 }
             };
 
             layers.push(LayerWeights {
+                hc_attn: None,
+                hc_ffn: None,
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
                 post_attn_norm: match layer_map.get(&WeightRole::PostAttnNorm) {
@@ -3463,6 +3627,8 @@ impl ModelWeights {
                     n_experts_used: moe.n_experts_used,
                     moe_inter: moe.moe_intermediate_size,
                     norm_topk: moe.norm_topk_prob,
+                    gate_bias: None,
+                    tid2eid: None,
                     usage: ExpertUsage::new(device, moe.n_experts)?,
                 }))
             } else {
@@ -3507,6 +3673,8 @@ impl ModelWeights {
                 },
                 mixer,
                 ffn,
+                hc_attn: None,
+                hc_ffn: None,
             });
         }
 
@@ -3772,6 +3940,8 @@ impl ModelWeights {
         };
         self.layers.iter().all(|layer| {
             let mixer_ok = match &layer.mixer {
+                // DeepSeek V4 nie przechodzi przepakowaniem docelowego kafla.
+                LayerMixer::DeepseekAttention(_) => false,
                 LayerMixer::Attention(a) => {
                     let qkv_ok = match &a.attn_qkv {
                         QkvWeights::Fused(w) => small(w),

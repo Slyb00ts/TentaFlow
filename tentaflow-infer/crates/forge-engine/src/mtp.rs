@@ -188,6 +188,8 @@ impl MtpWeights {
                 .map(|tensor| loader.vector(tensor, params.head_dim))
                 .transpose()?;
             let block = LayerWeights {
+                hc_attn: None,
+                hc_ffn: None,
                 // Głowa MTP nie ma norm sandwich ani skali warstwy.
                 post_attn_norm: None,
                 post_ffw_norm: None,
