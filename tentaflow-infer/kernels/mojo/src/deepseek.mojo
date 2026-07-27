@@ -856,3 +856,76 @@ def rmsnorm_mix_f32(
             j += 1
         out_ptr[token * mix_hc + m] = dot * inv
         m += nthreads
+
+
+def hc_head_reduce_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    mix_fn: UnsafePointer[Float32, MutAnyOrigin],
+    base: UnsafePointer[Float32, MutAnyOrigin],
+    scale: UnsafePointer[Float32, MutAnyOrigin],
+    dim: Int,
+    hc: Int,
+    n_tokens: Int,
+    eps: Float32,
+    hc_eps: Float32,
+):
+    """Redukcja kopii strumienia w GŁOWIE wyjściowej.
+
+    Jest PROSTSZA niż w bloku: sama sigmoida na `hc` mieszankach, bez Sinkhorna
+    i bez macierzy mieszającej. Skala jest przy tym POJEDYNCZA dla wszystkich
+    kopii, podczas gdy blok ma trzy osobne — indeksowanie jej per kopia wychodzi
+    poza tablicę.
+
+    Jeden blok na token.
+    """
+    token = Int(block_idx.x)
+    if token >= n_tokens:
+        return
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+    width = hc * dim
+
+    partial = stack_allocation[
+        1024, Float32, address_space = AddressSpace.SHARED
+    ]()
+    pre = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+
+    var acc: Float32 = 0.0
+    var i = tid
+    while i < width:
+        v = Float32(x[token * width + i])
+        acc += v * v
+        i += nthreads
+    partial[tid] = acc
+    barrier()
+    var stride = nthreads // 2
+    while stride > 0:
+        if tid < stride:
+            partial[tid] += partial[tid + stride]
+        barrier()
+        stride //= 2
+    inv = rsqrt(partial[0] / Float32(width) + eps)
+    barrier()
+
+    var copy = tid
+    while copy < hc:
+        var dot: Float32 = 0.0
+        var j = 0
+        while j < width:
+            dot += mix_fn[copy * width + j] * Float32(x[token * width + j])
+            j += 1
+        v = dot * inv * scale[0] + base[copy]
+        pre[copy] = 1.0 / (1.0 + exp(-v)) + hc_eps
+        copy += nthreads
+    barrier()
+
+    var d = tid
+    while d < dim:
+        var total: Float32 = 0.0
+        var c = 0
+        while c < hc:
+            total += pre[c] * Float32(x[(token * hc + c) * dim + d])
+            c += 1
+        out_ptr[token * dim + d] = Float16(total)
+        d += nthreads

@@ -22,7 +22,8 @@ use half::f16;
 
 use crate::moe_residency::ExpertStack;
 use crate::weights::{
-    CompressorWeights, DeepseekAttnWeights, DevWeight, HyperConnectionWeights, MoeFfn,
+    CompressorWeights, DeepseekAttnWeights, DevWeight, HyperConnectionWeights, LayerFfn,
+    LayerMixer, ModelWeights, MoeFfn,
 };
 
 /// Geometria warstwy potrzebna przebiegowi. W tej architekturze różni się
@@ -1234,4 +1235,218 @@ pub fn block_prefill(
         tokens,
         stream,
     )
+}
+
+/// Wszystko, co przebieg modelu musi wiedzieć poza wagami.
+#[derive(Clone, Debug)]
+pub struct DeepseekModelShape {
+    pub hidden: usize,
+    pub vocab: usize,
+    pub hc: HyperConnectionConfig,
+    pub ffn: DeepseekFfnShape,
+    /// Kształt uwagi per warstwa — stopień kompresji i obecność indeksera
+    /// różnią się między nimi.
+    pub attn: Vec<DeepseekAttnShape>,
+    /// Częstotliwości rope per warstwa: warstwy z kompresją używają YaRN i bazy
+    /// `compress_rope_theta`, pozostałe czystego rope.
+    pub rope: Vec<Vec<f32>>,
+}
+
+/// Bufory całego przebiegu.
+pub struct DeepseekModelBufs {
+    blocks: Vec<DeepseekBlockBufs>,
+    state: DevBuffer,
+    next_state: DevBuffer,
+    reduced: DevBuffer,
+    normed: DevBuffer,
+    ids: DevBuffer,
+    logits: DevBuffer,
+    max_tokens: usize,
+}
+
+impl DeepseekModelBufs {
+    pub fn new(
+        device: &dyn Device,
+        shape: &DeepseekModelShape,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let hc = shape.hc.hc;
+        let mut blocks = Vec::with_capacity(shape.attn.len());
+        for (layer, attn) in shape.attn.iter().enumerate() {
+            blocks.push(DeepseekBlockBufs::new(
+                device,
+                attn,
+                &shape.ffn,
+                hc,
+                max_tokens,
+                &shape.rope[layer],
+            )?);
+        }
+        let f16b = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        Ok(Self {
+            blocks,
+            state: f16b(max_tokens * hc * shape.hidden)?,
+            next_state: f16b(max_tokens * hc * shape.hidden)?,
+            reduced: f16b(max_tokens * shape.hidden)?,
+            normed: f16b(max_tokens * shape.hidden)?,
+            ids: device.alloc(max_tokens * 4, MemKind::Device, Pool::Activations)?,
+            logits: device.alloc(shape.vocab * 4, MemKind::Device, Pool::Activations)?,
+            max_tokens,
+        })
+    }
+
+    /// Logity ostatniej pozycji, f32 — wyjście przebiegu.
+    pub fn logits(&self) -> &DevBuffer {
+        &self.logits
+    }
+}
+
+/// Prefill całego modelu: od identyfikatorów tokenów po logity ostatniej
+/// pozycji.
+///
+/// Strumień rezydualny startuje jako `hc` KOPII embeddingu — każdy blok czyta
+/// wszystkie i wszystkie aktualizuje. Logity liczone są tylko dla ostatniej
+/// pozycji, bo tylko ona przewiduje następny token.
+pub fn model_prefill(
+    kernels: &Kernels,
+    device: &dyn Device,
+    weights: &ModelWeights,
+    shape: &DeepseekModelShape,
+    bufs: &mut DeepseekModelBufs,
+    token_ids: &[u32],
+    stream: &Stream,
+) -> Result<()> {
+    let tokens = token_ids.len();
+    if tokens == 0 || tokens > bufs.max_tokens {
+        return Err(ForgeError::Kernel(format!(
+            "prefill {tokens} tokenów przy pojemności {}",
+            bufs.max_tokens
+        )));
+    }
+    let hidden = shape.hidden;
+    let hc = shape.hc.hc;
+
+    device.write(bytemuck::cast_slice(token_ids), &bufs.ids, 0)?;
+    kernels.gather_rows_f16(
+        &bufs.reduced,
+        &weights.token_embd_f16,
+        &bufs.ids,
+        tokens,
+        hidden,
+        stream,
+    )?;
+    // Wszystkie kopie startują od tego samego embeddingu.
+    for token in 0..tokens {
+        for copy in 0..hc {
+            device.copy(
+                &bufs.reduced,
+                token * hidden * 2,
+                &bufs.state,
+                (token * hc + copy) * hidden * 2,
+                hidden * 2,
+                stream,
+            )?;
+        }
+    }
+
+    for (layer, block_bufs) in bufs.blocks.iter().enumerate() {
+        let weights_layer = &weights.layers[layer];
+        let LayerMixer::DeepseekAttention(attn) = &weights_layer.mixer else {
+            return Err(ForgeError::Unsupported(format!(
+                "warstwa {layer} nie jest warstwą DeepSeeka V4"
+            )));
+        };
+        let LayerFfn::Moe(moe) = &weights_layer.ffn else {
+            return Err(ForgeError::Unsupported(format!(
+                "warstwa {layer} nie jest warstwą MoE"
+            )));
+        };
+        let (hc_attn, hc_ffn) = match (&weights_layer.hc_attn, &weights_layer.hc_ffn) {
+            (Some(a), Some(f)) => (a, f),
+            _ => {
+                return Err(ForgeError::Unsupported(format!(
+                    "warstwa {layer} nie ma wag hyper-connections"
+                )))
+            }
+        };
+        let block = DeepseekBlockWeights {
+            attn,
+            attn_norm: &weights_layer.attn_norm,
+            ffn_norm: &weights_layer.ffn_norm,
+            moe,
+            hc_attn,
+            hc_ffn,
+        };
+        block_prefill(
+            kernels,
+            device,
+            &block,
+            &shape.attn[layer],
+            &shape.ffn,
+            &shape.hc,
+            block_bufs,
+            &bufs.state,
+            &bufs.next_state,
+            tokens,
+            Some(token_ids),
+            stream,
+        )?;
+        std::mem::swap(&mut bufs.state, &mut bufs.next_state);
+    }
+
+    // Głowa: redukcja kopii bez Sinkhorna, norma, potem logity ostatniej pozycji.
+    let head = weights.hc_head.as_ref().ok_or_else(|| {
+        ForgeError::Unsupported("model bez wag redukcji w głowie wyjściowej".into())
+    })?;
+    kernels.hc_head_reduce_f16(
+        &bufs.reduced,
+        &bufs.state,
+        &head.mix_fn,
+        &head.base,
+        &head.scale,
+        hidden,
+        hc,
+        tokens,
+        shape.hc.eps,
+        shape.hc.hc_eps,
+        stream,
+    )?;
+    kernels.rmsnorm_f16(
+        &bufs.normed,
+        &bufs.reduced,
+        &weights.output_norm,
+        tokens,
+        hidden,
+        shape.hc.eps,
+        stream,
+    )?;
+    logits_last(kernels, weights, bufs, hidden, tokens, stream)
+}
+
+/// Logity liczone wyłącznie dla ostatniej pozycji.
+fn logits_last(
+    kernels: &Kernels,
+    weights: &ModelWeights,
+    bufs: &DeepseekModelBufs,
+    hidden: usize,
+    tokens: usize,
+    stream: &Stream,
+) -> Result<()> {
+    let offset = (tokens - 1) * hidden * 2;
+    match &weights.lm_head {
+        DevWeight::F16 { buf, rows, cols } => kernels.gemv_f16_out_f32_at(
+            &bufs.logits,
+            0,
+            buf,
+            &bufs.normed,
+            offset,
+            *rows,
+            *cols,
+            stream,
+        ),
+        other => Err(ForgeError::Unsupported(format!(
+            "głowa logitów DeepSeeka nie obsługuje {:?}",
+            std::mem::discriminant(other)
+        ))),
+    }
 }

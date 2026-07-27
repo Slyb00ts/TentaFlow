@@ -418,6 +418,7 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "gemv_residual_q8_0_f16",
     "hadamard_bf16_f16",
     "hc_expand_f16",
+    "hc_head_reduce_f16",
     "hc_reduce_f16",
     "hc_sinkhorn_f32",
     "index_score_f16",

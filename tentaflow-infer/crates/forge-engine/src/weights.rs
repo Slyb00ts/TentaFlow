@@ -758,6 +758,9 @@ pub struct ModelWeights {
     /// When `fp8` packs are resident, route the prefill GEMM to Modular's
     /// multistage kernel (`FORGE_GEMM=fp8mod`) instead of the hand kernel.
     pub fp8_modular: bool,
+    /// Redukcja kopii strumienia w głowie wyjściowej (DeepSeek V4). Prostsza niż
+    /// w bloku: sama sigmoida, bez Sinkhorna.
+    pub hc_head: Option<HyperConnectionWeights>,
     /// Opcjonalna natywna warstwa NextN współdzieląca embedding i LM head targetu.
     pub mtp: Option<MtpWeights>,
     pub nvfp4_repacked_weights: usize,
@@ -3620,6 +3623,7 @@ impl ModelWeights {
             fp8: None,
             fp8_ffn: None,
             fp8_modular: false,
+            hc_head: None,
             mtp,
             nvfp4_repacked_weights: 0,
         })
@@ -3667,6 +3671,16 @@ impl ModelWeights {
         };
         let output_norm = upload_norm(device, src, &norm_name)?;
         let lm_head = upload_weight(device, fetch_matrix(src, &head_name)?)?;
+        let head_role = |role: WeightRole| -> Result<String> {
+            descriptor
+                .globals
+                .get(&role)
+                .cloned()
+                .ok_or_else(|| ForgeError::Format(format!("DeepSeek V4: brak roli {role:?}")))
+        };
+        let head_fn = head_role(WeightRole::HcHeadFn)?;
+        let head_base = head_role(WeightRole::HcHeadBase)?;
+        let head_scale = head_role(WeightRole::HcHeadScale)?;
         let budget = expert_residency_budget(device, &descriptor, src, host_budget);
         let layers = load_deepseek_layers(device, &descriptor, src, spill, budget.as_ref())?;
         Ok(ModelWeights {
@@ -3686,6 +3700,11 @@ impl ModelWeights {
             fp8: None,
             fp8_ffn: None,
             fp8_modular: false,
+            hc_head: Some(HyperConnectionWeights {
+                mix_fn: upload_f32(device, src, &head_fn)?,
+                base: upload_f32(device, src, &head_base)?,
+                scale: upload_f32(device, src, &head_scale)?,
+            }),
             mtp: None,
             nvfp4_repacked_weights: 0,
         })
@@ -4009,6 +4028,7 @@ impl ModelWeights {
             fp8: None,
             fp8_ffn: None,
             fp8_modular: false,
+            hc_head: None,
             mtp,
             nvfp4_repacked_weights: 0,
         })

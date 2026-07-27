@@ -6091,6 +6091,48 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Redukcja kopii strumienia w głowie wyjściowej: sama sigmoida, bez
+    /// Sinkhorna, z POJEDYNCZĄ skalą dla wszystkich kopii.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_head_reduce_f16(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        mix_fn: &DevBuffer,
+        base: &DevBuffer,
+        scale: &DevBuffer,
+        dim: usize,
+        hc: usize,
+        n_tokens: usize,
+        eps: f32,
+        hc_eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if hc > 16 {
+            return Err(ForgeError::Kernel(format!(
+                "hc_head_reduce: {hc} kopii przekracza limit kernela 16"
+            )));
+        }
+        let k = self.artifacts.get("hc_head_reduce_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .buf(mix_fn)
+            .buf(base)
+            .buf(scale)
+            .scalar(dim as i64)
+            .scalar(hc as i64)
+            .scalar(n_tokens as i64)
+            .scalar(eps)
+            .scalar(hc_eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// `mixes = (mix_fn @ x) * rsqrt(mean(x^2))` — wejście Sinkhorna
     /// hyper-connections. Normalizacja obejmuje złączone kopie strumienia.
     #[allow(clippy::too_many_arguments)]

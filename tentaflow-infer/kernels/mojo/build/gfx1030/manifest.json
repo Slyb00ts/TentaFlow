@@ -1245,6 +1245,10 @@
       "entry": "src_deepseek_hc_expand_f16_P6A6A6A6AoA6A6A_348b2a0f575f426a",
       "file": "hc_expand_f16.hsaco"
     },
+    "hc_head_reduce_f16": {
+      "entry": "src_deepseek_hc_head_reduce_f16A6A6A6A_f7c89485235e7467",
+      "file": "hc_head_reduce_f16.hsaco"
+    },
     "hc_reduce_f16": {
       "entry": "src_deepseek_hc_reduce_f16_P6A6A6A6AoA6A6A_9ff85a7887c0cc28",
       "file": "hc_reduce_f16.hsaco"
