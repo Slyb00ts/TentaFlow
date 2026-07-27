@@ -2291,18 +2291,6 @@ pub fn load_deepseek_layer_for_test(
     load_deepseek_attention(device, &src, layer)
 }
 
-/// Wagi hyper-connections jednego miejsca wpięcia.
-fn load_hyper_connection(
-    device: &dyn Device,
-    src: &dyn TensorSource,
-    prefix: &str,
-) -> Result<HyperConnectionWeights> {
-    Ok(HyperConnectionWeights {
-        mix_fn: upload_f32(device, src, &format!("{prefix}_fn"))?,
-        base: upload_f32(device, src, &format!("{prefix}_base"))?,
-        scale: upload_f32(device, src, &format!("{prefix}_scale"))?,
-    })
-}
 
 /// Ile bajtów ekspertów wolno zostawić w pamięci przy tym modelu.
 ///
@@ -3248,6 +3236,9 @@ impl ModelWeights {
         // Hybrid attention/DeltaNet arches (qwen35moe) have per-layer weight
         // sets that differ by kind and a gated attention Q projection the
         // generic shape checks would reject; they take a dedicated loader.
+        if descriptor.arch == "deepseek_v4" {
+            return Self::load_deepseek_v4(device, descriptor, src, spill, host_budget);
+        }
         if descriptor.params.ssm.is_some() {
             if w4a8_enabled() {
                 return Err(ForgeError::Unsupported(
@@ -3638,6 +3629,68 @@ impl ModelWeights {
     /// Gated-DeltaNet layers, each with a routed + gated-shared MoE FFN. The
     /// attention Q projection is gated (width `2*n_heads*head_dim`) so it is
     /// stored split (no q/k/v fusion); DeltaNet layers carry the SSM weight set.
+    /// Składa model DeepSeeka V4. Osobna ścieżka, bo ta architektura ma inny
+    /// mikser, hyper-connections zamiast rezyduum, eksperty zapisane pojedynczo
+    /// i głowę wyjściową z własną redukcją kopii strumienia.
+    fn load_deepseek_v4(
+        device: &dyn Device,
+        descriptor: ModelDescriptor,
+        src: &dyn TensorSource,
+        spill: Option<&ExpertSpill>,
+        host_budget: usize,
+    ) -> Result<Self> {
+        let embd_name = descriptor
+            .globals
+            .get(&WeightRole::TokenEmbd)
+            .ok_or_else(|| ForgeError::Format("DeepSeek V4: brak embeddingu".into()))?
+            .clone();
+        let norm_name = descriptor
+            .globals
+            .get(&WeightRole::OutputNorm)
+            .ok_or_else(|| ForgeError::Format("DeepSeek V4: brak normy wyjściowej".into()))?
+            .clone();
+        let head_name = descriptor
+            .globals
+            .get(&WeightRole::LmHead)
+            .ok_or_else(|| ForgeError::Format("DeepSeek V4: brak głowy logitów".into()))?
+            .clone();
+
+        let embedding = upload_weight(device, fetch_matrix(src, &embd_name)?)?;
+        let DevWeight::F16 {
+            buf: token_embd_f16,
+            ..
+        } = embedding
+        else {
+            return Err(ForgeError::Unsupported(
+                "embedding DeepSeeka musi dać się zmaterializować jako f16".into(),
+            ));
+        };
+        let output_norm = upload_norm(device, src, &norm_name)?;
+        let lm_head = upload_weight(device, fetch_matrix(src, &head_name)?)?;
+        let budget = expert_residency_budget(device, &descriptor, src, host_budget);
+        let layers = load_deepseek_layers(device, &descriptor, src, spill, budget.as_ref())?;
+        Ok(ModelWeights {
+            descriptor,
+            token_embd_f16,
+            token_embd_host: None,
+            output_norm,
+            rope_freqs: None,
+            neg_inf: None,
+            lm_head,
+            fp8_lm_head: None,
+            layers,
+            fused_qkv_layers: 0,
+            fused_qk_layers: 0,
+            fused_gate_up_layers: 0,
+            w4a8: None,
+            fp8: None,
+            fp8_ffn: None,
+            fp8_modular: false,
+            mtp: None,
+            nvfp4_repacked_weights: 0,
+        })
+    }
+
     fn load_hybrid(
         device: &dyn Device,
         descriptor: ModelDescriptor,
