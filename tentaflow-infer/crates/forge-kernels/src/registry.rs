@@ -270,6 +270,7 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "gemv_f16_out_f32",
     "gemv_f16_out_f32_v2",
     "gemv_fp8_out_f32_v2",
+    "gemv_fp8_row_f16_v2",
     "gemv_iq1_m_f16_v2",
     "gemv_iq1_m_out_f32_v2",
     "gemv_iq1_s_f16_v2",

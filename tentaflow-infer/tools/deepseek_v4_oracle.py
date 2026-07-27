@@ -340,6 +340,61 @@ up_act = torch.clamp(up_act, min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
 gate_act = torch.clamp(gate_act, max=SWIGLU_LIMIT)
 expert_out = (torch.nn.functional.silu(gate_act) * up_act) @ w2.T
 
+# --- kompresor: sciezka DEKODOWANIA (stan okna miedzy tokenami) -------------
+
+DECODE_STEPS = 4
+
+
+def compressor_decode(xs, ratio, wkv_c, wgate_c, ape, norm_w, freqs_cis,
+                      head_dim, rope_dim, eps, kv_state, score_state, start_pos):
+    """Krok po kroku, tak jak robi to referencja przy dekodowaniu. Wpis
+    skompresowany powstaje dopiero gdy (start_pos + 1) % ratio == 0; wczesniej
+    token tylko odklada sie w stanie okna."""
+    d = head_dim
+    produced = []
+    for step, xt in enumerate(xs):
+        pos = start_pos + step
+        kv = (xt.float() @ wkv_c.float().T).squeeze(0)
+        score = (xt.float() @ wgate_c.float().T).squeeze(0) + ape[pos % ratio]
+        slot = ratio + pos % ratio
+        kv_state[slot] = kv
+        score_state[slot] = score
+        if (pos + 1) % ratio != 0:
+            continue
+        # Okno z zakladka: pierwsza polowa wymiarow poprzedniego okna plus
+        # druga polowa biezacego.
+        kv_win = torch.cat([kv_state[:ratio, :d], kv_state[ratio:, d:]], dim=0)
+        sc_win = torch.cat([score_state[:ratio, :d], score_state[ratio:, d:]], dim=0)
+        pooled = (kv_win * sc_win.softmax(dim=0)).sum(dim=0, keepdim=True)
+        kv_state[:ratio] = kv_state[ratio:].clone()
+        score_state[:ratio] = score_state[ratio:].clone()
+        out = rms_norm(pooled.unsqueeze(0), norm_w, eps)
+        apply_rotary_emb(out[..., -rope_dim:], freqs_cis[pos + 1 - ratio].unsqueeze(0))
+        out[..., :-rope_dim] = act_quant_inplace(out[..., :-rope_dim], 64)
+        produced.append(out.squeeze(0).squeeze(0))
+    return produced
+
+
+# Stan po prefillu: sloty [0, ratio) to poprzednie okno (pierwsza polowa wymiarow).
+kv_pref = (x.float() @ c_wkv.float().T).squeeze(0)
+sc_pref = (x.float() @ c_wgate.float().T).squeeze(0)
+kv_state0 = torch.zeros(2 * ratio, 2 * head_dim)
+sc_state0 = torch.full((2 * ratio, 2 * head_dim), float("-inf"))
+kv_state0[:ratio] = kv_pref[SEQLEN - ratio:SEQLEN]
+sc_state0[:ratio] = sc_pref[SEQLEN - ratio:SEQLEN] + c_ape
+
+di = np.arange(DECODE_STEPS * dim, dtype=np.int64)
+dec_x = ((di * 1103515245 % 1991).astype(np.float32) / 995.5 - 1.0).reshape(DECODE_STEPS, 1, 1, dim)
+dec_tokens = [torch.from_numpy(dec_x[i].copy()) for i in range(DECODE_STEPS)]
+freqs_long = precompute_freqs_cis(rope_head_dim, SEQLEN + DECODE_STEPS + 1,
+                                  original_seq_len, rope_theta, 16, 32, 1)
+dec_out = compressor_decode([t.squeeze(0) for t in dec_tokens], ratio, c_wkv, c_wgate,
+                            c_ape, c_norm, freqs_long, head_dim, rope_head_dim, eps,
+                            kv_state0, sc_state0, SEQLEN)
+assert len(dec_out) == 1, len(dec_out)
+dec_compressed = dec_out[0]
+dec_input = torch.cat([t.reshape(1, dim) for t in dec_tokens], dim=0)
+
 # --- rzadka uwaga po zebranych indeksach ------------------------------------
 
 window_size = cfg["sliding_window"]
@@ -435,12 +490,43 @@ blk = torch.from_numpy((((bi * 2246822519) % 1987).astype(np.float32) / 993.5 - 
 hc_expanded = hc_post_w.unsqueeze(-1) * blk.unsqueeze(-2) + torch.sum(
     hc_comb.unsqueeze(-1) * hc_in.unsqueeze(-2), dim=2)
 
+# --- routing haszowany (warstwy 0..n_hash_layers-1) --------------------------
+
+HASH_LAYER = 2          # warstwa z tid2eid zamiast wyboru po wyniku
+hg = f"layers.{HASH_LAYER}.ffn.gate"
+hash_w = torch.from_numpy(load_matrix(f"{hg}.weight").copy())
+_, t2e_shape, t2e_raw = raw(f"{hg}.tid2eid")
+tid2eid = torch.from_numpy(np.frombuffer(t2e_raw, dtype=np.int64).reshape(t2e_shape).copy())
+
+# Identyfikatory tokenow deterministyczne, w zakresie slownika.
+token_ids = torch.tensor([(i * 7919) % cfg["vocab_size"] for i in range(SEQLEN)])
+hash_scores = torch.nn.functional.softplus(gx_t.float() @ hash_w.float().T).sqrt()
+hash_indices = tid2eid[token_ids]
+hash_weights = hash_scores.gather(1, hash_indices)
+hash_weights = hash_weights / hash_weights.sum(dim=-1, keepdim=True) * ROUTE_SCALE
+
+# --- glowa wyjsciowa: redukcja HC bez Sinkhorna + norma + logity -------------
+
+head_fn = torch.from_numpy(load_vector("hc_head_fn").copy()).float()
+head_base = torch.from_numpy(load_vector("hc_head_base").copy()).float()
+head_scale = torch.from_numpy(load_vector("hc_head_scale").copy()).float()
+out_norm_w = torch.from_numpy(load_vector("norm.weight").copy()).float()
+lm_head = torch.from_numpy(load_matrix("head.weight").copy())
+
+hflat = hc_in.flatten(2).float()
+hrsqrt = torch.rsqrt(hflat.square().mean(-1, keepdim=True) + eps)
+hmixes = (hflat @ head_fn.T) * hrsqrt
+hpre = torch.sigmoid(hmixes * head_scale + head_base) + HC_EPS
+head_reduced = torch.sum(hpre.unsqueeze(-1) * hc_in, dim=2)
+# Logity liczone tylko dla ostatniej pozycji, jak w referencji.
+logits = rms_norm(head_reduced, out_norm_w, eps)[:, -1].float() @ lm_head.float().T
+
 out = sys.argv[1]
 with open(out, "wb") as f:
-    f.write(struct.pack("<16i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
+    f.write(struct.pack("<18i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
                         GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank, ratio,
                         index_n_heads, index_head_dim, window_size,
-                        topk_idxs.size(-1), HC))
+                        topk_idxs.size(-1), HC, DECODE_STEPS, cfg["vocab_size"]))
     for t in (x, qr, q, kv):
         f.write(t.detach().float().contiguous().numpy().tobytes())
     f.write(gx_t.contiguous().numpy().tobytes())
@@ -458,6 +544,13 @@ with open(out, "wb") as f:
     f.write(blk.float().contiguous().numpy().tobytes())
     f.write(hc_reduced.float().contiguous().numpy().tobytes())
     f.write(hc_expanded.float().contiguous().numpy().tobytes())
+    f.write(dec_input.float().contiguous().numpy().tobytes())
+    f.write(dec_compressed.float().contiguous().numpy().tobytes())
+    f.write(head_reduced.float().contiguous().numpy().tobytes())
+    f.write(logits.float().contiguous().numpy().tobytes())
+    f.write(token_ids.to(torch.int32).contiguous().numpy().tobytes())
+    f.write(hash_indices.to(torch.int32).contiguous().numpy().tobytes())
+    f.write(hash_weights.float().contiguous().numpy().tobytes())
 print("rzadka uwaga: abs mean", sparse_out.abs().mean().item(), "indeksow", topk_idxs.size(-1))
 print("indekser: score", tuple(index_score.shape), "abs mean", index_score.abs().mean().item())
 print("kompresor: wpisow", comp_out.size(1), "abs mean", comp_out.abs().mean().item())

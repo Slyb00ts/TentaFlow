@@ -137,7 +137,7 @@ from src.gemv2 import (
     gemv_fp8_out_f32_v2,
 )
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
-from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx
+from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx, gemv_fp8_row_f16_v2
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
 from src.gemm_dot import (
     gemm_f16_dot2_64x64,
@@ -2298,6 +2298,11 @@ def main() raises:
         gemv_q6_k_f16_gidx, dump_asm=Path("gemv_q6_k_f16_gidx.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_q6_k_f16_gidx"))
+
+    _ = ctx.compile_function[
+        gemv_fp8_row_f16_v2, dump_asm=Path("gemv_fp8_row_f16_v2.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemv_fp8_row_f16_v2"))
 
     _ = ctx.compile_function[
         gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")

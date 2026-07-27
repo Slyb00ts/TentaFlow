@@ -653,6 +653,10 @@
       "entry": "src_gemv2_gemv_fp8_out_f32_v26A6A6A6AoA_74a7fdc1a12005a1",
       "file": "gemv_fp8_out_f32_v2.hsaco"
     },
+    "gemv_fp8_row_f16_v2": {
+      "entry": "src_gemv2_gemv_fp8_row_f16_v26A6A6A6AoA_d6dd1323fd8a5a45",
+      "file": "gemv_fp8_row_f16_v2.hsaco"
+    },
     "gemv_iq1_m_f16_v2": {
       "entry": "src_gemv2_gemv_iq1_m_f16_v26A6A6A6AoA6A6A_e9dd46b020b23425",
       "file": "gemv_iq1_m_f16_v2.hsaco"

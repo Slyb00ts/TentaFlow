@@ -83,15 +83,19 @@ Przypięte i zgodne z referencją (`crates/forge-formats/tests/deepseek_v4_atten
 | pełna ścieżka Q (per-głowicowa norma + rope) | 1,4e-6 |
 | ścieżka KV | 1,3e-6 |
 | wyjście uwagi (rope odwrotne + grupowana LoRA) | 2,1e-6 |
-| kompresor strumienia KV (okna z zakładką + QAT FP8) | 3,7e-7 |
+| kompresor KV, prefill (okna z zakładką + QAT FP8) | 3,7e-7 |
+| kompresor KV, dekodowanie (stan okna między tokenami) | 4,7e-7 |
 | kompresor indeksera (Hadamard + QAT FP4) | dokładnie |
 | punktowanie indeksera | 1,8e-4 |
 | rzadka uwaga po zebranych indeksach (z kotwicą) | 3,0e-7 |
 | konstrukcja indeksów prefillu | dokładnie |
 | SwiGLU eksperta NVFP4 | 1,8e-6 |
 | bramka MoE (wybór i wagi) | dokładnie |
+| routing haszowany przez `tid2eid` | dokładnie |
 | hyper-connections: redukcja HC | 2,2e-7 |
 | hyper-connections: rozprowadzenie po Sinkhornie | 9,6e-8 |
+| głowa wyjściowa: redukcja HC | 1,4e-7 |
+| głowa wyjściowa: logity | 1,3e-6 |
 
 To jest zarazem walidacja obu konwersji kwantyzacji od końca do końca: projekcje
 liczone są na wagach przepuszczonych przez produkcyjne przepakowanie NVFP4 i
@@ -126,6 +130,14 @@ liczby wyglądające sensownie:
   WYŁĄCZNIE do mianownika softmaxu, jako logit o zerowym wektorze wartości.
 - Sinkhorn po softmaksie po wierszach robi NAJPIERW normalizację po kolumnach, a
   dopiero potem `iters - 1` pełnych par wiersz+kolumna.
+- Redukcja HC w GŁOWIE jest prostsza niż w bloku: sama sigmoida, bez Sinkhorna i
+  bez macierzy mieszającej, a skala jest jedna dla wszystkich kopii (w bloku są
+  trzy osobne).
+- Przy dekodowaniu kompresora rope bierze pozycję POCZĄTKU okna, nie tokenu,
+  który je domknął.
+- W warstwach haszowanych z tablicy pochodzi WYŁĄCZNIE wybór ekspertów; wagi
+  nadal liczy się z wyniku bramki. Pominięcie tego rozróżnienia daje poprawne
+  wagi przy błędnych ekspertach.
 
 ## Architektura — co trzeba odtworzyć
 
@@ -201,20 +213,15 @@ Aktywacje kwantyzowane dynamicznie do FP8 przed każdym GEMM-em.
 
 ## Czego brakuje, w kolejności
 
-Matematyka całej warstwy jest przypięta testami wobec referencji — poza dwoma
-elementami, których oracle nie obejmuje, bo wymagają stanu przez wiele wywołań:
-ścieżki DEKODOWANIA kompresora (bufory `kv_state`/`score_state` i okno kołowe
-cache'u KV) oraz głowy MTP.
+Matematyka modelu — od wejścia bloku po logity, w prefillu i w dekodowaniu —
+jest przypięta testami wobec referencji. Poza zasięgiem oracle'a został tylko
+blok MTP.
 
 Zostaje warstwa wykonawcza:
 
-1. **Typ wagi FP8 ze skalą wierszową** — konwersja gotowa i zmierzona, brakuje
-   wariantu `DevWeight` z osobnym buforem skal i wpięcia w dyspozytor GEMV.
-2. **Kernele GPU** dla uwagi latentnej, obu kompresorów, indeksera, rzadkiej
+1. **Kernele GPU** dla uwagi latentnej, obu kompresorów, indeksera, rzadkiej
    uwagi po zebranych indeksach i hyper-connections.
-3. **Ścieżka dekodowania kompresora** — stan okna między tokenami.
-4. **Routing haszowany** przez `tid2eid` dla trzech pierwszych warstw.
-5. **MTP.**
+2. **MTP.**
 
 Każdy z tych punktów da się zwalidować numerycznie przeciwko `inference/model.py`
 osobno, i tak trzeba je robić — model, który nie mieści się w VRAM i nie ma

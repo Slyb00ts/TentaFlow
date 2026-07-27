@@ -94,12 +94,21 @@ struct Oracle {
     hc_block: Vec<f32>,
     hc_reduced: Vec<f32>,
     hc_expanded: Vec<f32>,
+    decode_steps: usize,
+    decode_x: Vec<f32>,
+    decode_compressed: Vec<f32>,
+    vocab: usize,
+    head_reduced: Vec<f32>,
+    logits: Vec<f32>,
+    token_ids: Vec<i32>,
+    hash_indices: Vec<i32>,
+    hash_weights: Vec<f32>,
 }
 
 fn load_oracle() -> Option<Oracle> {
     let path = std::env::var("FORGE_DEEPSEEK_V4_ORACLE").ok()?;
     let bytes = std::fs::read(path).ok()?;
-    let head: Vec<i32> = bytes[..64]
+    let head: Vec<i32> = bytes[..72]
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -116,9 +125,11 @@ fn load_oracle() -> Option<Oracle> {
     let (index_n_heads, index_head_dim) = (head[11] as usize, head[12] as usize);
     let n_topk = head[14] as usize;
     let hc = head[15] as usize;
+    let decode_steps = head[16] as usize;
+    let vocab = head[17] as usize;
     let mut cursor = Cursor {
         bytes: &bytes,
-        offset: 64,
+        offset: 72,
     };
     let x = cursor.floats(seqlen * dim);
     let qr = cursor.floats(seqlen * 1024);
@@ -139,6 +150,13 @@ fn load_oracle() -> Option<Oracle> {
     let hc_block = cursor.floats(seqlen * dim);
     let hc_reduced = cursor.floats(seqlen * dim);
     let hc_expanded = cursor.floats(seqlen * hc * dim);
+    let decode_x = cursor.floats(decode_steps * dim);
+    let decode_compressed = cursor.floats(head_dim);
+    let head_reduced = cursor.floats(seqlen * dim);
+    let logits = cursor.floats(vocab);
+    let token_ids = cursor.ints(seqlen);
+    let hash_indices = cursor.ints(seqlen * topk);
+    let hash_weights = cursor.floats(seqlen * topk);
     Some(Oracle {
         seqlen,
         dim,
@@ -174,6 +192,15 @@ fn load_oracle() -> Option<Oracle> {
         hc_block,
         hc_reduced,
         hc_expanded,
+        decode_steps,
+        decode_x,
+        decode_compressed,
+        vocab,
+        head_reduced,
+        logits,
+        token_ids,
+        hash_indices,
+        hash_weights,
     })
 }
 
@@ -1048,4 +1075,205 @@ fn hyper_connections_match_the_reference_implementation() {
     eprintln!("hc_pre {pre_err:.3e}, hc_post {post_err:.3e}");
     assert!(pre_err < 1e-5, "redukcja HC rozjeżdża się o {pre_err:.3e}");
     assert!(post_err < 1e-5, "rozprowadzenie HC rozjeżdża się o {post_err:.3e}");
+}
+
+/// Ścieżka DEKODOWANIA kompresora: token po tokenie, ze stanem okna między
+/// krokami. Wpis skompresowany powstaje dopiero co `ratio` tokenów, a przy
+/// zakładce stan przesuwa się o okno — sloty `[0, ratio)` trzymają poprzednie
+/// okno, `[ratio, 2*ratio)` bieżące. Rope bierze pozycję POCZĄTKU okna, nie
+/// tokenu, który je domknął.
+#[test]
+fn kv_compressor_decode_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let c = format!("layers.{LAYER}.attn.compressor");
+    let wkv = load_vector(&st, &format!("{c}.wkv.weight"));
+    let wgate = load_vector(&st, &format!("{c}.wgate.weight"));
+    let ape = load_vector(&st, &format!("{c}.ape"));
+    let norm_w = load_vector(&st, &format!("{c}.norm.weight"));
+    let eps = 1e-6f32;
+
+    let ratio = oracle.ratio;
+    let d = oracle.head_dim;
+    let wide = 2 * d;
+    let freqs = rope_freqs(oracle.rope_head_dim, 160_000.0, 65_536, 16.0, 32.0, 1.0);
+    let nope = d - oracle.rope_head_dim;
+
+    // Stan po prefillu: sloty [0, ratio) to ostatnie okno promptu.
+    let mut kv_state = vec![0f32; 2 * ratio * wide];
+    let mut sc_state = vec![f32::NEG_INFINITY; 2 * ratio * wide];
+    for slot in 0..ratio {
+        let token = oracle.seqlen - ratio + slot;
+        let x = &oracle.x[token * oracle.dim..(token + 1) * oracle.dim];
+        kv_state[slot * wide..(slot + 1) * wide]
+            .copy_from_slice(&project(&wkv, x, wide, oracle.dim));
+        let mut s = project(&wgate, x, wide, oracle.dim);
+        for (i, v) in s.iter_mut().enumerate() {
+            *v += ape[slot * wide + i];
+        }
+        sc_state[slot * wide..(slot + 1) * wide].copy_from_slice(&s);
+    }
+
+    let mut produced: Option<Vec<f32>> = None;
+    for step in 0..oracle.decode_steps {
+        let pos = oracle.seqlen + step;
+        let x = &oracle.decode_x[step * oracle.dim..(step + 1) * oracle.dim];
+        let slot = ratio + pos % ratio;
+        kv_state[slot * wide..(slot + 1) * wide]
+            .copy_from_slice(&project(&wkv, x, wide, oracle.dim));
+        let mut s = project(&wgate, x, wide, oracle.dim);
+        for (i, v) in s.iter_mut().enumerate() {
+            *v += ape[(pos % ratio) * wide + i];
+        }
+        sc_state[slot * wide..(slot + 1) * wide].copy_from_slice(&s);
+        if (pos + 1) % ratio != 0 {
+            continue;
+        }
+
+        // Okno: pierwsza połowa wymiarów poprzedniego okna, druga bieżącego.
+        let window = 2 * ratio;
+        let mut win_kv = vec![0f32; window * d];
+        let mut win_sc = vec![f32::NEG_INFINITY; window * d];
+        for w in 0..window {
+            let (src_slot, half) = if w < ratio { (w, 0) } else { (w, 1) };
+            let src = src_slot * wide + half * d;
+            win_kv[w * d..(w + 1) * d].copy_from_slice(&kv_state[src..src + d]);
+            win_sc[w * d..(w + 1) * d].copy_from_slice(&sc_state[src..src + d]);
+        }
+        let mut pooled = vec![0f32; d];
+        for dim_i in 0..d {
+            let mut max = f32::NEG_INFINITY;
+            for w in 0..window {
+                max = max.max(win_sc[w * d + dim_i]);
+            }
+            let mut denom = 0f32;
+            let mut acc = 0f32;
+            for w in 0..window {
+                let weight = (win_sc[w * d + dim_i] - max).exp();
+                denom += weight;
+                acc += weight * win_kv[w * d + dim_i];
+            }
+            pooled[dim_i] = acc / denom;
+        }
+        // Stan przesuwa się o okno.
+        kv_state.copy_within(ratio * wide..2 * ratio * wide, 0);
+        sc_state.copy_within(ratio * wide..2 * ratio * wide, 0);
+
+        let mut normed = rms_norm(&pooled, &norm_w, eps);
+        apply_rope(&mut normed[nope..], &freqs, pos + 1 - ratio);
+        act_quant_inplace(&mut normed[..nope], 64);
+        produced = Some(normed);
+    }
+
+    let got = produced.expect("cztery kroki przy ratio 4 domykają jedno okno");
+    let err = relative_l2(&got, &oracle.decode_compressed);
+    eprintln!("kompresor (dekodowanie): względne L2 = {err:.3e}");
+    assert!(err < 1e-4, "dekodowanie kompresora rozjeżdża się o {err:.3e}");
+}
+
+/// Głowa wyjściowa. Redukcja kopii HC jest tu PROSTSZA niż w bloku — sama
+/// sigmoida, bez Sinkhorna i bez macierzy mieszającej. Logity liczone są tylko
+/// dla ostatniej pozycji.
+#[test]
+fn output_head_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let hc_fn = load_vector(&st, "hc_head_fn");
+    let hc_base = load_vector(&st, "hc_head_base");
+    let hc_scale = load_vector(&st, "hc_head_scale");
+    let norm_w = load_vector(&st, "norm.weight");
+    let lm_head = load_vector(&st, "head.weight");
+    let (hc, dim, eps, hc_eps) = (oracle.hc, oracle.dim, 1e-6f32, 1e-6f32);
+    let wide = hc * dim;
+
+    let mut reduced = Vec::with_capacity(oracle.head_reduced.len());
+    for t in 0..oracle.seqlen {
+        let x = &oracle.hc_in[t * wide..(t + 1) * wide];
+        let mean = x.iter().map(|v| v * v).sum::<f32>() / wide as f32;
+        let rsqrt = (mean + eps).sqrt().recip();
+        let mut y = vec![0f32; dim];
+        for copy in 0..hc {
+            let mix: f32 = (0..wide).map(|c| hc_fn[copy * wide + c] * x[c]).sum::<f32>() * rsqrt;
+            // W głowie skala jest jedna dla wszystkich kopii (w bloku są trzy
+            // osobne), a przesunięcie zostaje per kopia.
+            let pre = 1.0 / (1.0 + (-(mix * hc_scale[0] + hc_base[copy])).exp()) + hc_eps;
+            let src = &x[copy * dim..(copy + 1) * dim];
+            for (o, v) in y.iter_mut().zip(src) {
+                *o += pre * v;
+            }
+        }
+        reduced.extend_from_slice(&y);
+    }
+    let reduce_err = relative_l2(&reduced, &oracle.head_reduced);
+    eprintln!("głowa: redukcja HC = {reduce_err:.3e}");
+    assert!(reduce_err < 1e-5, "redukcja HC głowy rozjeżdża się o {reduce_err:.3e}");
+
+    // Logity tylko dla ostatniej pozycji.
+    let last = &reduced[(oracle.seqlen - 1) * dim..];
+    let normed = rms_norm(last, &norm_w, eps);
+    let got = project(&lm_head, &normed, oracle.vocab, dim);
+    let err = relative_l2(&got, &oracle.logits);
+    eprintln!("głowa: logity = {err:.3e}");
+    assert!(err < 1e-5, "logity rozjeżdżają się o {err:.3e}");
+}
+
+/// Trzy pierwsze warstwy routują przez tablicę `token -> eksperci`, a nie przez
+/// wynik bramki. Wynik nadal jest liczony — bierze się z niego WAGI dla
+/// wybranych ekspertów, tylko wybór pochodzi z tablicy. Pominięcie tego
+/// rozróżnienia daje poprawne wagi przy błędnych ekspertach.
+#[test]
+fn hash_routing_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let g = format!("layers.{LAYER}.ffn.gate");
+    let weight = load_vector(&st, &format!("{g}.weight"));
+    let table_info = st.tensor(&format!("{g}.tid2eid")).expect("warstwa haszowana");
+    let table_bytes = st.data(&format!("{g}.tid2eid")).unwrap();
+    let per_token = table_info.shape[1];
+    assert_eq!(per_token, oracle.topk, "tablica ma inną liczbę ekspertów niż top-k");
+    let route_scale = 1.5f32;
+
+    for t in 0..oracle.seqlen {
+        let token = oracle.token_ids[t] as usize;
+        // Wybór: prosto z tablicy, indeksowanej identyfikatorem tokenu.
+        let want_idx = &oracle.hash_indices[t * per_token..(t + 1) * per_token];
+        for (j, want) in want_idx.iter().enumerate() {
+            let at = (token * per_token + j) * 8;
+            let got = i64::from_le_bytes(table_bytes[at..at + 8].try_into().unwrap());
+            assert_eq!(got as i32, *want, "token {token}, pozycja {j}");
+        }
+
+        // Wagi: nadal z wyniku bramki, znormalizowane i przeskalowane.
+        let x = &oracle.gate_x[t * oracle.dim..(t + 1) * oracle.dim];
+        let raw: Vec<f32> = want_idx
+            .iter()
+            .map(|e| {
+                let e = *e as usize;
+                let logit: f32 = (0..oracle.dim)
+                    .map(|c| weight[e * oracle.dim + c] * x[c])
+                    .sum();
+                let softplus = if logit > 20.0 { logit } else { logit.exp().ln_1p() };
+                softplus.sqrt()
+            })
+            .collect();
+        let sum: f32 = raw.iter().sum();
+        let want_w = &oracle.hash_weights[t * per_token..(t + 1) * per_token];
+        for (j, r) in raw.iter().enumerate() {
+            let got = r / sum * route_scale;
+            assert!(
+                (got - want_w[j]).abs() < 1e-4,
+                "token {t}, pozycja {j}: waga {got} zamiast {}",
+                want_w[j]
+            );
+        }
+    }
 }

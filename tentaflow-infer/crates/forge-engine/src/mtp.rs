@@ -236,6 +236,17 @@ impl MtpWeights {
 
 fn share_weight(weight: &DevWeight) -> DevWeight {
     match weight {
+        DevWeight::Fp8Row {
+            buf,
+            scales,
+            rows,
+            cols,
+        } => DevWeight::Fp8Row {
+            buf: buf.clone(),
+            scales: scales.clone(),
+            rows: *rows,
+            cols: *cols,
+        },
         DevWeight::F16 { buf, rows, cols } => DevWeight::F16 {
             buf: buf.clone(),
             rows: *rows,

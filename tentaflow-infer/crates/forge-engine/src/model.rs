@@ -3641,6 +3641,14 @@ impl Model {
         // bandwidth-bound and the dp4a variant's extra shared usage costs
         // occupancy (measured slower at the down-projection shape).
         match w {
+            DevWeight::Fp8Row {
+                buf,
+                scales,
+                rows,
+                cols,
+            } => self
+                .kernels
+                .gemv_fp8_row_f16(y, buf, scales, x, *rows, *cols, stream),
             DevWeight::F16 { buf, rows, cols } => {
                 self.kernels.gemv_f16(y, buf, x, *rows, *cols, stream)
             }
@@ -3864,6 +3872,7 @@ impl Model {
     /// (gemv_norm / gemv_norm_silu / gemv_residual format + column coverage).
     fn fused_decode_weight_ok(w: &DevWeight) -> bool {
         match w {
+            DevWeight::Fp8Row { .. } => false,
             DevWeight::F16 { cols, .. } => cols.is_multiple_of(8),
             DevWeight::Q8_0 { cols, .. } => cols.is_multiple_of(32),
             DevWeight::NvFp4 {
@@ -3981,6 +3990,11 @@ impl Model {
     ) -> Result<()> {
         let b = &self.bufs;
         match w {
+            // Wagi FP8 ze skalą wierszową mają na razie tylko prostą ścieżkę
+            // GEMV; pozostałe warianty powstaną razem z mikserem DeepSeeka.
+            DevWeight::Fp8Row { .. } => Err(ForgeError::Unsupported(
+                "wagi FP8 ze skalą wierszową nie mają tej ścieżki".into(),
+            )),
             DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_f16(
                 y,
                 buf,
@@ -4271,6 +4285,11 @@ impl Model {
     ) -> Result<()> {
         let b = &self.bufs;
         match w {
+            // Wagi FP8 ze skalą wierszową mają na razie tylko prostą ścieżkę
+            // GEMV; pozostałe warianty powstaną razem z mikserem DeepSeeka.
+            DevWeight::Fp8Row { .. } => Err(ForgeError::Unsupported(
+                "wagi FP8 ze skalą wierszową nie mają tej ścieżki".into(),
+            )),
             DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_silu_f16(
                 act,
                 buf,
@@ -4536,6 +4555,11 @@ impl Model {
         // occupancy at the wide down-projection).
         let b = &self.bufs;
         match w {
+            // Wagi FP8 ze skalą wierszową mają na razie tylko prostą ścieżkę
+            // GEMV; pozostałe warianty powstaną razem z mikserem DeepSeeka.
+            DevWeight::Fp8Row { .. } => Err(ForgeError::Unsupported(
+                "wagi FP8 ze skalą wierszową nie mają tej ścieżki".into(),
+            )),
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
                 .gemv_residual_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
@@ -4669,6 +4693,14 @@ impl Model {
             ));
         }
         let out = match weight {
+            // Wagi FP8 ze skalą wierszową mają wariant GEMV z wyjściem f16;
+            // głowa logitów potrzebuje f32, więc dostanie własną ścieżkę razem
+            // z mikserem DeepSeeka.
+            DevWeight::Fp8Row { .. } => {
+                return Err(ForgeError::Unsupported(
+                    "głowa logitów nie obsługuje jeszcze wag FP8 ze skalą wierszową".into(),
+                ))
+            }
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
                 .gemv_f16_out_f32(y_f32, buf, x, *rows, *cols, stream),
@@ -5051,6 +5083,11 @@ impl Model {
         stream: &Stream,
     ) -> Result<()> {
         match w {
+            // Wagi FP8 ze skalą wierszową mają na razie tylko prostą ścieżkę
+            // GEMV; pozostałe warianty powstaną razem z mikserem DeepSeeka.
+            DevWeight::Fp8Row { .. } => Err(ForgeError::Unsupported(
+                "wagi FP8 ze skalą wierszową nie mają tej ścieżki".into(),
+            )),
             DevWeight::F16 { buf, cols, .. } => self.kernels.gemm_f16_at(
                 y,
                 buf,

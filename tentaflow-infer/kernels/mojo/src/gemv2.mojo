@@ -545,6 +545,47 @@ def gemv_fp8_out_f32_v2(
         y[row] = total
 
 
+def gemv_fp8_row_f16_v2(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Ta sama matematyka co gemv_fp8_out_f32_v2, ale wynik zapisywany w f16.
+
+    Istnieje dla wag DeepSeeka V4, gdzie projekcje FP8 karmią kolejne warstwy
+    aktywacji trzymane w f16 — wariant f32 wymuszałby dodatkowe przejście po
+    całym wyjściu tylko po to, żeby je zawęzić.
+    """
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+
+    base = row * n_cols
+    var acc: Float32 = 0.0
+    var i = lane * 8
+    stride = WARP * 8
+    while i + 8 <= n_cols:
+        raw = (w + base + i).bitcast[UInt16]().load[width=4, alignment=8]()
+        var pairs = SIMD[DType.uint32, 4](0)
+        comptime for j in range(4):
+            pairs[j] = bitcast[DType.uint32, 1](
+                f8e4m3x2_to_f16x2(UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8))
+            )[0]
+        wv = bitcast[DType.float16, 8](pairs).cast[DType.float32]()
+        xv = (x + i).load[width=8, alignment=16]().cast[DType.float32]()
+        acc += (wv * xv).reduce_add()
+        i += stride
+
+    total = warp.sum(acc) * scales[row]
+    if lane == 0:
+        y[row] = Float16(total)
+
+
 def _gemv_q5_k_row_acc(
     w: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],

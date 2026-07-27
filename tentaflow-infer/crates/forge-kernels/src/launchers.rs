@@ -5845,6 +5845,42 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// GEMV na wagach E4M3 z jedną skalą FP32 na wiersz, wynik w f16.
+    ///
+    /// Wariant f32 (`gemv_fp8_out_f32`) służy głowie logitów; ten karmi kolejne
+    /// warstwy, których aktywacje są f16, więc zawężenie dzieje się w kernelu
+    /// zamiast osobnym przejściem po całym wyjściu.
+    pub fn gemv_fp8_row_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        scales: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_fp8_row_f16 wymaga cols % 256 == 0, otrzymano {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_fp8_row_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(scales)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Logity FP32 z wag E4M3 oraz jednej skali FP32 na wiersz.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_fp8_out_f32(

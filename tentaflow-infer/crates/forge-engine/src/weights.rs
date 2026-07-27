@@ -265,6 +265,13 @@ pub enum DevWeight {
         rows: usize,
         cols: usize,
     },
+    /// Wagi FP8 E4M3 z jedną skalą f32 na wiersz.
+    Fp8Row {
+        buf: DevBuffer,
+        scales: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
     /// Surowy strumień bloków GGUF NVFP4 (36 bajtów / 64 elementy).
     NvFp4Gguf {
         buf: DevBuffer,
@@ -323,7 +330,9 @@ impl DevWeight {
             | DevWeight::Iq1S { buf, .. }
             | DevWeight::Iq1M { buf, .. }
             | DevWeight::NvFp4Gguf { buf, .. } => Some(buf),
-            DevWeight::NvFp4 { .. } => None,
+            // Skale wierszowe są osobnym buforem, więc waga nie ma jednego
+            // wskaźnika bazowego i nie wchodzi w rezydencję ekspertów.
+            DevWeight::Fp8Row { .. } | DevWeight::NvFp4 { .. } => None,
         }
     }
 
@@ -351,7 +360,8 @@ impl DevWeight {
             | DevWeight::Iq1S { rows, .. }
             | DevWeight::Iq1M { rows, .. }
             | DevWeight::NvFp4 { rows, .. }
-            | DevWeight::NvFp4Gguf { rows, .. } => *rows,
+            | DevWeight::NvFp4Gguf { rows, .. }
+            | DevWeight::Fp8Row { rows, .. } => *rows,
         }
     }
 
@@ -379,7 +389,8 @@ impl DevWeight {
             | DevWeight::Iq1S { cols, .. }
             | DevWeight::Iq1M { cols, .. }
             | DevWeight::NvFp4 { cols, .. }
-            | DevWeight::NvFp4Gguf { cols, .. } => *cols,
+            | DevWeight::NvFp4Gguf { cols, .. }
+            | DevWeight::Fp8Row { cols, .. } => *cols,
         }
     }
 }
@@ -1325,13 +1336,43 @@ fn fetch_deepseek_weight(st: &ShardedSafeTensors, name: &str) -> Result<Option<H
         }));
     }
 
-    // Wagi FP8 z kafelkową skalą czekają na mikser DeepSeeka: mają iść ścieżką
-    // `deepseek_fp8_to_row_scaled`, która przenosi skalę na wiersz wtapiając
-    // różnicę wykładników w bajty E4M3. Zmierzony błąd wyjścia projekcji to
-    // 4,7e-7 przy jednym bajcie na wagę — wobec 5,4e-3 dla przekwantyzowania
-    // na Q8_0 i 13,7 GiB dla materializacji do f16. Brakuje tylko typu wagi z
-    // osobnym buforem skal wierszowych, który powstanie razem z mikserem.
-    let _ = base;
+    // Waga FP8 z kafelkową skalą E8M0: skala idzie na wiersze, a różnica
+    // wykładników wtapia się w bajty E4M3. Zmierzony błąd wyjścia projekcji to
+    // 4,7e-7 przy jednym bajcie na wagę — wobec 5,4e-3 dla przekwantyzowania na
+    // Q8_0 i 13,7 GiB dla materializacji do f16.
+    if info.dtype == DType::F8E4M3 {
+        let scale_name = format!("{base}.scale");
+        let Some(scale_info) = st.tensor(&scale_name) else {
+            return Ok(None);
+        };
+        let (rows, cols) = (info.shape[0], info.shape[1]);
+        if scale_info.shape.len() != 2 || scale_info.shape[1] == 0 {
+            return Err(ForgeError::Format(format!(
+                "{scale_name}: oczekiwano dwuwymiarowej skali kafelkowej"
+            )));
+        }
+        let tile = cols / scale_info.shape[1];
+        if tile == 0 || rows.div_ceil(tile) != scale_info.shape[0] {
+            return Err(ForgeError::Format(format!(
+                "{scale_name}: kafel {tile} nie zgadza się z kształtem {:?}",
+                scale_info.shape
+            )));
+        }
+        let (data, scales) = nvfp4::deepseek_fp8_to_row_scaled(
+            st.data(name)?,
+            st.data(&scale_name)?,
+            rows,
+            cols,
+            tile,
+        )?;
+        return Ok(Some(HostWeight::Fp8Row {
+            data,
+            scales,
+            rows,
+            cols,
+        }));
+    }
+
     Ok(None)
 }
 
@@ -1671,6 +1712,15 @@ enum HostWeight {
         rows: usize,
         cols: usize,
     },
+    /// Wagi FP8 E4M3 z jedną skalą na wiersz. DeepSeek V4 trzyma na dysku skalę
+    /// kafelkową; loader przenosi ją na wiersze, wtapiając różnicę wykładników
+    /// w same bajty (patrz `nvfp4::deepseek_fp8_to_row_scaled`).
+    Fp8Row {
+        data: Vec<u8>,
+        scales: Vec<f32>,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 impl HostWeight {
@@ -1705,7 +1755,8 @@ impl HostWeight {
             | HostWeight::Iq1S { rows, .. }
             | HostWeight::Iq1M { rows, .. }
             | HostWeight::NvFp4 { rows, .. }
-            | HostWeight::NvFp4Gguf { rows, .. } => *rows,
+            | HostWeight::NvFp4Gguf { rows, .. }
+            | HostWeight::Fp8Row { rows, .. } => *rows,
         }
     }
 
@@ -1733,7 +1784,8 @@ impl HostWeight {
             | HostWeight::Iq1S { cols, .. }
             | HostWeight::Iq1M { cols, .. }
             | HostWeight::NvFp4 { cols, .. }
-            | HostWeight::NvFp4Gguf { cols, .. } => *cols,
+            | HostWeight::NvFp4Gguf { cols, .. }
+            | HostWeight::Fp8Row { cols, .. } => *cols,
         }
     }
 }
@@ -2071,6 +2123,17 @@ fn expert_slice_shape(rows: usize, bytes: usize, n_experts: usize) -> Result<(us
 /// Upload a host matrix as-is.
 fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
     match w {
+        HostWeight::Fp8Row {
+            data,
+            scales,
+            rows,
+            cols,
+        } => Ok(DevWeight::Fp8Row {
+            buf: upload(device, &data)?,
+            scales: upload(device, bytemuck::cast_slice(&scales))?,
+            rows,
+            cols,
+        }),
         HostWeight::F16 { data, rows, cols } => Ok(DevWeight::F16 {
             buf: upload(device, &data)?,
             rows,
@@ -2635,7 +2698,8 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         }
     }
     match &mut fused {
-        HostWeight::F16 { rows: r, .. }
+        HostWeight::Fp8Row { rows: r, .. }
+        | HostWeight::F16 { rows: r, .. }
         | HostWeight::Q8_0 { rows: r, .. }
         | HostWeight::Q4K { rows: r, .. }
         | HostWeight::Q6K { rows: r, .. }
