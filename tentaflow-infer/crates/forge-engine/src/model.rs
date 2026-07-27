@@ -1076,6 +1076,10 @@ pub struct Model {
     hybrid_verify_graph_disabled: HashSet<(usize, usize)>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
+    /// Przechwycony krok dekodowania modelu hybrydowego (qwen35/DeltaNet).
+    /// Wstawienie embeddingu zostaje poza grafem, bo jako jedyne zależy od
+    /// `token_id`; reszta czyta pozycję i długość z buforów urządzenia.
+    decode_hybrid_graph: Option<ExecGraph>,
     /// Captured non-hybrid MoE decode step (fully device-side grouped expert
     /// dispatch — no host readback), replayed per token like `decode_graph`.
     decode_moe_graph: Option<ExecGraph>,
@@ -2967,6 +2971,7 @@ impl Model {
             hybrid_verify_graphs: HashMap::new(),
             hybrid_verify_graph_disabled: HashSet::new(),
             decode_graph: None,
+            decode_hybrid_graph: None,
             decode_moe_graph: None,
             decode_rot_graph: None,
             batch_bufs: None,
@@ -7031,6 +7036,7 @@ impl Model {
         self.weights.fp8_ffn = Some(layers);
         self.weights.fp8_modular = crate::weights::fp8_ffn_modular_enabled();
         self.decode_graph = None;
+        self.decode_hybrid_graph = None;
         self.decode_moe_graph = None;
         self.decode_rot_graph = None;
         self.batch_graphs.clear();
@@ -7574,11 +7580,25 @@ impl Model {
             self.upload_page_table(seq)?;
         }
 
-        // Hybrid attention/DeltaNet decode: per-token recurrent scan with a
-        // resident SSM state, not graph-capturable (host readbacks per layer).
+        // Dekodowanie hybrydowe (uwaga + DeltaNet): rekurencyjny skan po
+        // rezydentnym stanie SSM. Wstawienie embeddingu zależy od `token_id` i
+        // zostaje poza grafem; reszta kroku czyta pozycję i długość sekwencji z
+        // buforów urządzenia, więc jest przechwytywalna i odtwarzana bez
+        // uruchamiania ~1200 kerneli po kolei — profil pokazał, że te przerwy
+        // między uruchomieniami to 15,8% czasu fazy liczenia.
         if self.is_hybrid() {
             self.ensure_hybrid_bufs()?;
-            return self.hybrid_forward_token(token_id, true, AttnSrc::Paged);
+            self.stage_hybrid_embedding(token_id)?;
+            if self.decode_hybrid_graph.is_none() {
+                let graph = self.capture_hybrid_step()?;
+                self.decode_hybrid_graph = Some(graph);
+            }
+            let graph = self
+                .decode_hybrid_graph
+                .as_ref()
+                .expect("captured above")
+                .clone();
+            return self.device.launch_graph(&graph, &self.stream);
         }
 
         // Routed MoE decode: the device-side grouped expert dispatch keeps the
@@ -12219,6 +12239,18 @@ impl Model {
     /// Record every launch of one decode step into a replayable graph.
     /// Stream capture does not execute the work, so buffer contents during
     /// capture are irrelevant — only addresses and launch geometry matter.
+    fn capture_hybrid_step(&self) -> Result<ExecGraph> {
+        self.device.begin_capture(&self.stream)?;
+        match self.hybrid_forward_staged(true, AttnSrc::Paged) {
+            Ok(()) => self.device.end_capture(&self.stream),
+            Err(e) => {
+                // Przerywamy przechwytywanie, żeby strumień był dalej zdatny.
+                let _ = self.device.end_capture(&self.stream);
+                Err(e)
+            }
+        }
+    }
+
     fn capture_step(&self) -> Result<ExecGraph> {
         self.device.begin_capture(&self.stream)?;
         let recorded = if self.fused_decode_supported() {
@@ -15116,21 +15148,19 @@ impl Model {
     /// token mixer by layer kind and folding in the gated shared expert. Inputs
     /// (`b.ids`/`b.pos`/`seq_len_dev`/page table) must be uploaded by the
     /// caller; the next-token logits land in `b.logits` when `want_logits`.
-    fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
-        let p = self.weights.descriptor.params.clone();
-        let hidden = p.hidden_size;
-        let inter = p.intermediate_size;
-        let eps = p.rms_norm_eps;
-        let kernels = &self.kernels;
-        let stream = &self.stream;
-        let b = &self.bufs;
-        let n_layers = self.weights.layers.len();
-
-        // Host-side embedding gather: stage this token's f16 row in pinned host
-        // memory and push it to the device residual buffer with an async H2D on
-        // the compute stream (the table lives in host RAM to keep VRAM for
-        // weights). Stream ordering serializes this after the previous token's
-        // tail, so no blocking sync is needed to avoid a race on `b.h`.
+    /// Wstawia wiersz embeddingu tego tokena do bufora rezydualnego.
+    ///
+    /// Tablica embeddingu mieszka w RAM hosta (VRAM zostaje na wagi), więc
+    /// wiersz idzie przez pamięć przypiętą i asynchroniczne H2D na strumieniu
+    /// obliczeniowym. Kolejność strumienia serializuje to za ogonem poprzedniego
+    /// tokena, więc nie trzeba blokującej synchronizacji.
+    ///
+    /// WYDZIELONE Z `hybrid_forward_token`, bo to JEDYNY krok kroku dekodowania
+    /// zależny od `token_id` po stronie hosta — reszta czyta pozycję i długość
+    /// sekwencji z buforów urządzenia. Dzięki temu reszta daje się przechwycić
+    /// w graf i odtwarzać bez kosztu uruchamiania kerneli po kolei.
+    fn stage_hybrid_embedding(&self, token_id: u32) -> Result<()> {
+        let hidden = self.weights.descriptor.params.hidden_size;
         let host = self
             .weights
             .token_embd_host
@@ -15149,7 +15179,25 @@ impl Model {
             std::ptr::copy_nonoverlapping(row.as_ptr() as *const u8, dst, hidden * 2);
         }
         self.device
-            .copy(&hb.pinned_embed, 0, &b.h, 0, hidden * 2, stream)?;
+            .copy(&hb.pinned_embed, 0, &self.bufs.h, 0, hidden * 2, &self.stream)
+    }
+
+    fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
+        self.stage_hybrid_embedding(token_id)?;
+        self.hybrid_forward_staged(want_logits, src)
+    }
+
+    /// Krok hybrydowy OD wstawionego embeddingu — bez niczego zależnego od
+    /// `token_id`, więc nadaje się do przechwycenia w graf.
+    fn hybrid_forward_staged(&self, want_logits: bool, src: AttnSrc) -> Result<()> {
+        let p = self.weights.descriptor.params.clone();
+        let hidden = p.hidden_size;
+        let inter = p.intermediate_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let n_layers = self.weights.layers.len();
         kernels.rmsnorm_f16(
             &b.x,
             &b.h,
