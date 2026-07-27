@@ -380,6 +380,11 @@ def compile_catalog(kernels, portable_nvfp4):
             base = json.loads(previous_manifest.read_text())
             if base["arch"] != manifest["arch"]:
                 raise RuntimeError("architektura katalogu nie zgadza sie z buildem")
+            # Poprzedni zestaw przechodzi w calosci. Katalog NIE jest jedynym
+            # zrodlem artefaktow — czesc buduja osobne skrypty (`build_*.mojo`),
+            # wiec usuwanie tego, czego ten parser nie zna, skasowaloby dzialajace
+            # kernele. Zmiana nazwy albo usuniecie kernela to swiadoma operacja
+            # recznaa, nie efekt uboczny dobudowy.
             rebuilt = set(manifest["kernels"])
             for artifact, entry in base["kernels"].items():
                 if artifact in rebuilt:

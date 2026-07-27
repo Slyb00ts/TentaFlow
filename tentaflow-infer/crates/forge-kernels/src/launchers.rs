@@ -6005,6 +6005,126 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `gemv_f16_out_f32` na wierszach wskazanych przesunięciami bajtowymi.
+    /// Kompresor liczy projekcje w f32, bo w f16 wyniki bramki się przelewają.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_f16_out_f32_at(
+        &self,
+        y: &DevBuffer,
+        y_off: usize,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        x_off: usize,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gemv_f16_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(y, y_off)?
+            .buf(w)
+            .buf_at(x, x_off)?
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// `acc += src` w f32 — kodowanie pozycji kompresora jest w checkpoincie
+    /// zapisane w tej precyzji.
+    pub fn compressor_add_ape_f32(
+        &self,
+        acc: &DevBuffer,
+        acc_off: usize,
+        src: &DevBuffer,
+        src_off: usize,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("compressor_add_ape_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf_at(acc, acc_off)?
+            .buf_at(src, src_off)?
+            .scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Punktowanie pozycji przez indekser rzadkiej uwagi.
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_score_f16(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        kv: &DevBuffer,
+        head_w: &DevBuffer,
+        head_dim: usize,
+        n_heads: usize,
+        n_blocks: usize,
+        n_tokens: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("index_score_f16")?;
+        let total = n_tokens * n_blocks;
+        let cfg = LaunchConfig {
+            grid: ((total as u32).div_ceil(BLOCK), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(kv)
+            .buf(head_w)
+            .scalar(head_dim as i64)
+            .scalar(n_heads as i64)
+            .scalar(n_blocks as i64)
+            .scalar(n_tokens as i64)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// `gemv_fp8_row_f16` na wierszu wskazanym przesunięciem bajtowym — ścieżka
+    /// DeepSeeka liczy projekcje token po tokenie wewnątrz większych buforów.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_fp8_row_f16_at(
+        &self,
+        y: &DevBuffer,
+        y_off: usize,
+        w: &DevBuffer,
+        scales: &DevBuffer,
+        x: &DevBuffer,
+        x_off: usize,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_fp8_row_f16 wymaga cols % 256 == 0, otrzymano {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_fp8_row_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(y, y_off)?
+            .buf(w)
+            .buf(scales)
+            .buf_at(x, x_off)?
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Wagi hyper-connections: redukcja, rozprowadzenie i macierz mieszająca po
     /// Sinkhornie. Jeden wątek na token — macierz ma `hc * hc` elementów.
     #[allow(clippy::too_many_arguments)]
@@ -6116,7 +6236,7 @@ impl Kernels {
     pub fn compressor_pool_f16(
         &self,
         out: &DevBuffer,
-        kv: &DevBuffer,
+        kv_f32: &DevBuffer,
         score: &DevBuffer,
         slots: &DevBuffer,
         head_dim: usize,
@@ -6133,7 +6253,7 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(out)
-            .buf(kv)
+            .buf(kv_f32)
             .buf(score)
             .buf(slots)
             .scalar(head_dim as i64)

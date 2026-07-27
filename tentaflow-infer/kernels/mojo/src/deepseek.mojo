@@ -319,8 +319,8 @@ def _round_e2m1(x: Float32) -> Float32:
 
 def compressor_pool_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
-    kv: UnsafePointer[Float16, MutAnyOrigin],
-    score: UnsafePointer[Float16, MutAnyOrigin],
+    kv: UnsafePointer[Float32, MutAnyOrigin],
+    score: UnsafePointer[Float32, MutAnyOrigin],
     slots: UnsafePointer[Int32, MutAnyOrigin],
     head_dim: Int,
     window: Int,
@@ -328,6 +328,10 @@ def compressor_pool_f16(
 ):
     """Bramkowany pooling kompresora KV: softmax po oknie, osobno dla każdego
     wymiaru, i ważona suma wartości.
+
+    Wejścia są w f32, bo referencja liczy kompresję w tej precyzji jawnie:
+    wyniki bramki potrafią wyjść poza zakres f16, a wtedy softmax daje NaN
+    zamiast rozkładu.
 
     `slots[block * window + w]` wskazuje wiersz źródłowy w `kv`/`score` dla
     pozycji `w` okna bloku `block`; wartość ujemna oznacza pozycję pustą, która
@@ -349,7 +353,7 @@ def compressor_pool_f16(
     while w < window:
         row = Int(slots[block * window + w])
         if row >= 0:
-            v = Float32(score[row * head_dim + dim])
+            v = score[row * head_dim + dim]
             if v > mx:
                 mx = v
         w += 1
@@ -360,9 +364,9 @@ def compressor_pool_f16(
     while w < window:
         row = Int(slots[block * window + w])
         if row >= 0:
-            e = exp(Float32(score[row * head_dim + dim]) - mx)
+            e = exp(score[row * head_dim + dim] - mx)
             denom += e
-            acc += e * Float32(kv[row * head_dim + dim])
+            acc += e * kv[row * head_dim + dim]
         w += 1
     out_ptr[block * head_dim + dim] = Float16(acc / denom)
 
@@ -637,3 +641,59 @@ def hc_expand_f16(
         acc += w * Float32(residual[(token * hc + in_copy) * dim + d])
         in_copy += 1
     out_ptr[idx] = Float16(acc)
+
+
+def index_score_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    kv: UnsafePointer[Float16, MutAnyOrigin],
+    head_w: UnsafePointer[Float16, MutAnyOrigin],
+    head_dim: Int,
+    n_heads: Int,
+    n_blocks: Int,
+    n_tokens: Int,
+    scale: Float32,
+):
+    """Punktowanie pozycji przez indekser: `relu(q·k)` ważone per głowica i
+    zsumowane po głowicach.
+
+    Prostownik przed ważeniem jest istotny — bez niego ujemne dopasowania
+    odejmowałyby się od wyniku i zmieniały ranking pozycji.
+
+    Jeden wątek na parę (token, blok); pętla po głowicach jest szeregowa, bo
+    wynik i tak jest sumą po nich.
+    """
+    idx = Int(global_idx.x)
+    if idx >= n_tokens * n_blocks:
+        return
+    token = idx // n_blocks
+    block = idx % n_blocks
+
+    var acc: Float32 = 0.0
+    var head = 0
+    while head < n_heads:
+        qbase = (token * n_heads + head) * head_dim
+        kbase = block * head_dim
+        var dot: Float32 = 0.0
+        var d = 0
+        while d < head_dim:
+            dot += Float32(q[qbase + d]) * Float32(kv[kbase + d])
+            d += 1
+        if dot < 0.0:
+            dot = 0.0
+        acc += dot * Float32(head_w[token * n_heads + head]) * scale
+        head += 1
+    out_ptr[idx] = Float16(acc)
+
+
+def compressor_add_ape_f32(
+    acc: UnsafePointer[Float32, MutAnyOrigin],
+    src: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """`acc += src` nad `n` elementami w f32 — kodowanie pozycji kompresora
+    (zapisane w checkpoincie jako f32) wchodzi do wyników bramki liczonych w tej
+    samej precyzji."""
+    i = Int(global_idx.x)
+    if i < n:
+        acc[i] = acc[i] + src[i]

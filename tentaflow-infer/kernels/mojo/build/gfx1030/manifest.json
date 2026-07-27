@@ -229,8 +229,12 @@
       "entry": "src_attention_verify_split8_at6A6A6A6A_accfd7cac81a6e28",
       "file": "attn_verify_split8_f16_hd256_t4.hsaco"
     },
+    "compressor_add_ape_f32": {
+      "entry": "src_deepseek_compressor_add_ap6A6A6A6A_95fdb01d8c10ac9c",
+      "file": "compressor_add_ape_f32.hsaco"
+    },
     "compressor_pool_f16": {
-      "entry": "src_deepseek_compressor_pool_f6A6A6A6A_b0e787198fe323fc",
+      "entry": "src_deepseek_compressor_pool_f6A6A6A6A_90f51d9fb77b7573",
       "file": "compressor_pool_f16.hsaco"
     },
     "conv1d_f32": {
@@ -1248,6 +1252,10 @@
     "hc_sinkhorn_f32": {
       "entry": "src_deepseek_hc_sinkhorn_f326A6A6A6AoA6A_02a2963a752aa574",
       "file": "hc_sinkhorn_f32.hsaco"
+    },
+    "index_score_f16": {
+      "entry": "src_deepseek_index_score_f166A6A6A6AoA6A_422149155379ccb6",
+      "file": "index_score_f16.hsaco"
     },
     "kv_append_batch_device_pos_f16": {
       "entry": "src_prefill_kv_append_batch_de6A6A6A6A_284e8c71ecc1427d",

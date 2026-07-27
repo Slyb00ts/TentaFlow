@@ -521,6 +521,14 @@ head_reduced = torch.sum(hpre.unsqueeze(-1) * hc_in, dim=2)
 # Logity liczone tylko dla ostatniej pozycji, jak w referencji.
 logits = rms_norm(head_reduced, out_norm_w, eps)[:, -1].float() @ lm_head.float().T
 
+# --- pelne wyjscie uwagi: sparse_attn przepuszczone przez sciezke wyjsciowa --
+
+full = sparse_out.unsqueeze(0).clone()
+apply_rotary_emb(full[..., -rope_head_dim:], freqs_cis, True)
+full = full.view(1, SEQLEN, o_groups, -1)
+full = torch.einsum("bsgd,grd->bsgr", full.float(), wo_a_g.float())
+attn_full = full.flatten(2) @ wo_b.float().T
+
 out = sys.argv[1]
 with open(out, "wb") as f:
     f.write(struct.pack("<18i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
@@ -551,6 +559,7 @@ with open(out, "wb") as f:
     f.write(token_ids.to(torch.int32).contiguous().numpy().tobytes())
     f.write(hash_indices.to(torch.int32).contiguous().numpy().tobytes())
     f.write(hash_weights.float().contiguous().numpy().tobytes())
+    f.write(attn_full.float().contiguous().numpy().tobytes())
 print("rzadka uwaga: abs mean", sparse_out.abs().mean().item(), "indeksow", topk_idxs.size(-1))
 print("indekser: score", tuple(index_score.shape), "abs mean", index_score.abs().mean().item())
 print("kompresor: wpisow", comp_out.size(1), "abs mean", comp_out.abs().mean().item())

@@ -336,8 +336,9 @@ fn compressor_pool_matches_the_cpu_reference() {
         }
     }
 
-    let kv_buf = upload_f16(dev.as_ref(), &kv);
-    let sc_buf = upload_f16(dev.as_ref(), &score);
+    // Kompresor liczy w f32 — w f16 wyniki bramki się przelewają.
+    let kv_buf = upload_f32(dev.as_ref(), &kv);
+    let sc_buf = upload_f32(dev.as_ref(), &score);
     let slot_buf = upload_i32(dev.as_ref(), &slots);
     let out = dev
         .alloc(n_blocks * head_dim * 2, MemKind::Device, Pool::Activations)
@@ -349,7 +350,6 @@ fn compressor_pool_matches_the_cpu_reference() {
     stream.synchronize().unwrap();
     let got = download_f16(dev.as_ref(), &out, n_blocks * head_dim);
 
-    let r = |v: f32| f16::from_f32(v).to_f32();
     let mut want = Vec::with_capacity(n_blocks * head_dim);
     for block in 0..n_blocks {
         for dim in 0..head_dim {
@@ -357,7 +357,7 @@ fn compressor_pool_matches_the_cpu_reference() {
             for w in 0..window {
                 let row = slots[block * window + w];
                 if row >= 0 {
-                    max = max.max(r(score[row as usize * head_dim + dim]));
+                    max = max.max(score[row as usize * head_dim + dim]);
                 }
             }
             let mut denom = 0f32;
@@ -365,9 +365,9 @@ fn compressor_pool_matches_the_cpu_reference() {
             for w in 0..window {
                 let row = slots[block * window + w];
                 if row >= 0 {
-                    let e = (r(score[row as usize * head_dim + dim]) - max).exp();
+                    let e = (score[row as usize * head_dim + dim] - max).exp();
                     denom += e;
-                    acc += e * r(kv[row as usize * head_dim + dim]);
+                    acc += e * kv[row as usize * head_dim + dim];
                 }
             }
             want.push(acc / denom);
