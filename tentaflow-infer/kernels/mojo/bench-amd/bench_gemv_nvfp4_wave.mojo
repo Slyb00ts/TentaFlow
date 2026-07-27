@@ -10,6 +10,7 @@ from std.random import random_si64, seed
 from std.time import perf_counter_ns
 
 from src.nvfp4 import gemv_nvfp4_gguf_f16, gemv_nvfp4_gguf_f16_wave, GEMV_WAVE_ROWS
+from src.nvfp4_gguf_dp4a import gemv_nvfp4_gguf_q8_1_f16
 
 comptime WARMUP = 3
 comptime ITERS = 20
@@ -59,6 +60,25 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int) raises:
     ctx.synchronize()
     wave_s = Float64(perf_counter_ns() - t1) / 1e9 / Float64(ITERS)
 
+    # Wariant int8: aktywacja jest juz skwantowana (jedna skala na 32 kolumny),
+    # wiec iloczyn idzie przez dp4a zamiast przez konwersje f16->f32.
+    var xq = ctx.enqueue_create_buffer[DType.int8](n_cols)
+    var xs = ctx.enqueue_create_buffer[DType.float32](n_cols // 32)
+    var y2 = ctx.enqueue_create_buffer[DType.float16](n_rows)
+    ctx.synchronize()
+    var t2: Int = 0
+    for i in range(WARMUP + ITERS):
+        if i == WARMUP:
+            ctx.synchronize()
+            t2 = perf_counter_ns()
+        ctx.enqueue_function[gemv_nvfp4_gguf_q8_1_f16](
+            y2.unsafe_ptr(), wd.unsafe_ptr(), xq.unsafe_ptr(), xs.unsafe_ptr(),
+            n_cols, n_rows, scale,
+            grid_dim=((n_rows + 7) // 8,), block_dim=256,
+        )
+    ctx.synchronize()
+    int8_s = Float64(perf_counter_ns() - t2) / 1e9 / Float64(ITERS)
+
     var h0 = ctx.enqueue_create_host_buffer[DType.float16](n_rows)
     var h1 = ctx.enqueue_create_host_buffer[DType.float16](n_rows)
     ctx.enqueue_copy(h0, y0)
@@ -82,7 +102,8 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int) raises:
         "rows=", n_rows, "cols=", n_cols,
         "| blok/wiersz", Int(block_s * 1e6), "us =", Int(bytes / block_s / 1e9), "GB/s",
         "| fala/wiersz", Int(wave_s * 1e6), "us =", Int(bytes / wave_s / 1e9), "GB/s",
-        "| przyspieszenie", Int(block_s / wave_s * 100.0), "%",
+        "| int8 dp4a", Int(bytes / int8_s / 1e9), "GB/s",
+        "| int8/f16", Int(wave_s / int8_s * 100.0), "%",
     )
 
 

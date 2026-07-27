@@ -1201,8 +1201,15 @@ fn nvfp4_gguf_layout_dispatch(
     }
 }
 
-fn raw_nvfp4_dp4a_supported(is_nvidia: bool, warp_size: u32) -> bool {
-    is_nvidia && warp_size == 32
+/// Czy backend uciągnie decode NVFP4 przez całkowitoliczbowy iloczyn dp4a.
+///
+/// Warunkiem jest fala 32 i instrukcja iloczynu czterech bajtów — `dp4a` na
+/// NVIDII, `v_dot4_i32_i8` na RDNA2 i `v_dot4_i32_iu8` na RDNA3+, wszystkie
+/// pod jednym helperem `dot4_i8`. Stał tu warunek `is_nvidia`, przez co AMD
+/// schodziło na wariant f16, który w izolacji mierzy 486 GB/s wobec 993 GB/s
+/// ścieżki int8 — konwersje f16->f32 w pętli, a nie pamięć, były wąskim gardłem.
+fn raw_nvfp4_dp4a_supported(warp_size: u32) -> bool {
+    warp_size == 32
 }
 
 fn has_nvfp4_gguf_tile_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
@@ -4952,20 +4959,17 @@ impl Kernels {
             ));
         }
         if tile_layout
-            && (!raw_nvfp4_dp4a_supported(
-                matches!(caps.vendor, forge_types::Vendor::Nvidia),
-                caps.warp_size,
-            ) || !self.artifacts.has("gemv_nvfp4_tile128_coop_q8_1_f16"))
+            && (!raw_nvfp4_dp4a_supported(caps.warp_size)
+                || !self.artifacts.has("gemv_nvfp4_tile128_coop_q8_1_f16"))
         {
             return Err(ForgeError::Unsupported(
                 "decode NVFP4 TileN128K64 wymaga NVIDIA warp32 i kernela tile128".into(),
             ));
         }
         if !tile_layout
-            && !raw_nvfp4_dp4a_supported(
-                matches!(caps.vendor, forge_types::Vendor::Nvidia),
-                caps.warp_size,
-            )
+            && !(raw_nvfp4_dp4a_supported(caps.warp_size)
+                && self.artifacts.has("gemv_nvfp4_gguf_q8_1_f16")
+                && self.artifacts.has("quantize_act_q8_1"))
         {
             for projection in projections {
                 self.gemv_nvfp4_gguf_f16(
@@ -18842,10 +18846,10 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn dp4a_wymaga_nvidia_i_warp32() {
-        assert!(raw_nvfp4_dp4a_supported(true, 32));
-        assert!(!raw_nvfp4_dp4a_supported(true, 64));
-        assert!(!raw_nvfp4_dp4a_supported(false, 32));
-        assert!(!raw_nvfp4_dp4a_supported(false, 64));
+        // Decyduje FALA, nie producent: `dot4_i8` ma instrukcje sprzetowa na
+        // obu rodzinach, a fala 64 (CDNA, stare GCN) nie pasuje do kafla.
+        assert!(raw_nvfp4_dp4a_supported(32));
+        assert!(!raw_nvfp4_dp4a_supported(64));
     }
 
     #[test]
