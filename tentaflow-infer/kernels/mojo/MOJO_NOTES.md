@@ -75,6 +75,44 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
   (ISETP/BSSY per load) starve the tensor pipe; clamp out-of-range
   tokens/rows instead of branching and zero-fill only the W k-tail.
 
+## Matrix units on RDNA3 / gfx1100 (verified on RX 7900 XT)
+
+- **WMMA is reachable straight from Mojo** — no HIP, no `inlined_assembly`:
+  `llvm_intrinsic["llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32", ...]`
+  (`i1 signA, <4 x i32> a, i1 signB, <4 x i32> b, <8 x i32> c, i1 clamp`) and
+  `llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16`. Wrapped in `src/arch_wmma.mojo`.
+- **Wave32 fragment layout** (probed exhaustively over all 256 output positions,
+  `bench-amd/bench_wmma_gfx11.mojo` guards it):
+  - A: lane L carries the WHOLE row `m = L % 16`, 16 bytes of k. Lanes 16-31
+    duplicate rows 0-15 (the instruction needs 2x redundancy in wave32).
+  - B: lane L carries the whole column `n = L % 16`, 16 bytes of k.
+  - C/D: element `(m, n)` lives in lane `16*(m % 2) + n` at index `m // 2`.
+  Because a lane wants 16 CONSECUTIVE bytes of its own row, A and B can be read
+  straight from global memory when the source is row-major — no LDS staging.
+- **Measured ceilings, 7900 XT vs 6900 XT** — RDNA3 demoted the packed-dot
+  instructions in favour of WMMA, so the newer card is SLOWER on the old path:
+
+  | primitive | 6900 XT (gfx1030) | 7900 XT (gfx1100) |
+  |---|--:|--:|
+  | `v_dot4_i32_i8` int8 | **97 TOPS** | **43 TOPS** |
+  | `v_dot2_f32_f16` f16 | 48 TFLOPS | 31 TFLOPS |
+  | WMMA int8 16x16x16 | brak jednostki | **98 TOPS** |
+  | WMMA f16 16x16x16 | brak jednostki | **102 TFLOPS** |
+  | DRAM read | 221 GB/s | 674 GB/s |
+
+- **TRAP — `v_dot4_i32_i8` silently computes UNSIGNED on gfx11.** The assembler
+  accepts the RDNA2 mnemonic, executes it as `v_dot4_i32_iu8` with `neg_lo`
+  cleared, and returns garbage for any negative byte: measured on the card,
+  `(-1,-2,-3,-4)·(4,3,2,1)` gave **2540 instead of -20**. Nothing warns. The
+  signed form is `v_dot4_i32_iu8 ... neg_lo:[1,1]` (see `src/arch_dot.mojo`);
+  `__builtin_amdgcn_sdot4` is NOT available on gfx11 (`needs target feature
+  dot1-insts`). Every int8 microbenchmark must include a NEGATIVE case — a
+  throughput-only benchmark passed happily while the instruction was wrong.
+- **`v_dot2_f32_f16` is 1 ULP inexact on gfx11** where RDNA2 is exact
+  (`(-2,0.5)·(8,-16)` → -24.0000019 instead of -24). `v_fma_mix_f32` gives the
+  exact result but costs two instructions. Reproduced in plain HIP, so it is the
+  hardware, not Mojo.
+
 ## Tensor-core flash-attention prefill IS competitive in Mojo (unlike int8-GEMM)
 - **The FA counter-example to the int8-GEMM codegen wall.** `attn_prefill_fa_mma`
   (`src/prefill.mojo`, `FORGE_ATTN=fa_mojo`) is a straight Mojo port of the CUDA
