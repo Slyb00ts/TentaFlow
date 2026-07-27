@@ -1023,3 +1023,75 @@ def gemv_residual_q6_k_dp4a_f16(
         v = Float32(h_io[row]) + Float32(Float16(total))
         h_io[row] = Float16(v)
         h32[row] = v
+
+def gemv_q8_0_dp4a_group4_f16(
+    y0: UnsafePointer[Float16, MutAnyOrigin],
+    w0: UnsafePointer[UInt8, MutAnyOrigin],
+    rows0: Int,
+    y1: UnsafePointer[Float16, MutAnyOrigin],
+    w1: UnsafePointer[UInt8, MutAnyOrigin],
+    rows1: Int,
+    y2: UnsafePointer[Float16, MutAnyOrigin],
+    w2: UnsafePointer[UInt8, MutAnyOrigin],
+    rows2: Int,
+    y3: UnsafePointer[Float16, MutAnyOrigin],
+    w3: UnsafePointer[UInt8, MutAnyOrigin],
+    rows3: Int,
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+):
+    """Do czterech projekcji Q8_0 na WSPOLNEJ aktywacji, jednym uruchomieniem.
+
+    DeltaNet liczy cztery projekcje wejsciowe (in/gate/alpha/beta) z tego samego
+    znormalizowanego `x`. Osobno kazda ma za mala siatke, zeby wypelnic karte;
+    zlozone razem daja siatke o sumie wierszy. Kwantyzacja aktywacji do LDS jest
+    i tak per blok, wiec zlozenie jej nie powiela.
+
+    Nieuzyte sloty przekazuje sie z `rows = 0`. Siatka to suma `ceil(rows_i / 8)`.
+    """
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+
+    var tile = Int(block_idx.x)
+    blocks0 = (rows0 + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK
+    blocks1 = (rows1 + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK
+    blocks2 = (rows2 + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK
+
+    if tile < blocks0:
+        row0 = tile * ROWS_PER_BLOCK + wid
+        if row0 < rows0:
+            total0 = _dot_q8_0_i8(w0, row0, xq, xds, n_cols, lane)
+            if lane == 0:
+                y0[row0] = Float16(total0)
+        return
+    tile -= blocks0
+    if tile < blocks1:
+        row1 = tile * ROWS_PER_BLOCK + wid
+        if row1 < rows1:
+            total1 = _dot_q8_0_i8(w1, row1, xq, xds, n_cols, lane)
+            if lane == 0:
+                y1[row1] = Float16(total1)
+        return
+    tile -= blocks1
+    if tile < blocks2:
+        row2 = tile * ROWS_PER_BLOCK + wid
+        if row2 < rows2:
+            total2 = _dot_q8_0_i8(w2, row2, xq, xds, n_cols, lane)
+            if lane == 0:
+                y2[row2] = Float16(total2)
+        return
+    tile -= blocks2
+    row3 = tile * ROWS_PER_BLOCK + wid
+    if row3 < rows3:
+        total3 = _dot_q8_0_i8(w3, row3, xq, xds, n_cols, lane)
+        if lane == 0:
+            y3[row3] = Float16(total3)
+

@@ -17,6 +17,10 @@ const BLOCK: u32 = 256;
 
 /// GEMV NVFP4 z jedną falą na wiersz; `GEMV_WAVE_ROWS` w `src/nvfp4.mojo`.
 const GEMV_NVFP4_WAVE: &str = "gemv_nvfp4_gguf_f16_wave";
+/// Zlozone do czterech projekcji NVFP4 na wspolnej aktywacji Q8_1.
+const GEMV_NVFP4_GROUP4: &str = "gemv_nvfp4_gguf_q8_1_group4_f16";
+/// Złożone do czterech projekcji Q8_0 na wspólnej aktywacji.
+const GEMV_Q8_GROUP4: &str = "gemv_q8_0_dp4a_group4_f16";
 const GEMV_NVFP4_WAVE_ROWS: u32 = 8;
 const FP8_MODULAR_BN256_SMEM: usize = 98_304;
 const FP8_MODULAR_BN256_TOKENS: usize = 1024;
@@ -5025,6 +5029,55 @@ impl Kernels {
             Nvfp4GgufLayout::RowMajor36 => "gemv_nvfp4_gguf_q8_1_f16",
             Nvfp4GgufLayout::TileN128K64 => "gemv_nvfp4_tile128_coop_q8_1_f16",
         };
+        // Zlozenie do czterech projekcji w JEDNO uruchomienie: poza narzutem
+        // uruchomienia liczy sie siatka — waska projekcja mierzy 425 GB/s wobec
+        // 960 GB/s szerokiej, bo nie ma czym wypelnic karty. Razem daja siatke
+        // o sumie wierszy.
+        if !tile_layout
+            && projections.len() > 1
+            && projections.len() <= 4
+            && self.artifacts.has(GEMV_NVFP4_GROUP4)
+        {
+            let kernel = self.artifacts.get(GEMV_NVFP4_GROUP4)?;
+            let mut grid_x = 0u32;
+            for projection in projections {
+                grid_x = grid_x
+                    .checked_add(u32::try_from(projection.rows.div_ceil(8)).map_err(|_| {
+                        ForgeError::Kernel("gemv NVFP4 group4: siatka przekracza u32".into())
+                    })?)
+                    .ok_or_else(|| {
+                        ForgeError::Kernel("gemv NVFP4 group4: siatka przekracza u32".into())
+                    })?;
+            }
+            let mut args = LaunchArgs::new();
+            for slot in 0..4 {
+                match projections.get(slot) {
+                    Some(projection) => {
+                        args = args
+                            .buf(projection.output)
+                            .buf(projection.weights)
+                            .scalar(projection.rows as i64)
+                            .scalar(projection.output_scale);
+                    }
+                    // Nieuzyty slot: zerowa liczba wierszy nie tworzy zadnego
+                    // bloku, wiec wskazniki nie sa dotykane.
+                    None => {
+                        args = args
+                            .buf(projections[0].output)
+                            .buf(projections[0].weights)
+                            .scalar(0i64)
+                            .scalar(0.0f32);
+                    }
+                }
+            }
+            let args = args.buf(xq).buf(xd).scalar(cols as i64);
+            let config = LaunchConfig {
+                grid: (grid_x, 1, 1),
+                block: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return self.device.launch(kernel, &config, &args, stream);
+        }
         let kernel = self.artifacts.get(kernel_name)?;
         for projection in projections {
             let rows_per_block = if tile_layout { 4 } else { 8 };
@@ -12012,6 +12065,62 @@ impl Kernels {
             .scalar(cols as i64)
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Do czterech projekcji Q8_0 na WSPÓLNEJ aktywacji, jednym uruchomieniem.
+    ///
+    /// Zwraca `false`, gdy artefaktu nie ma albo grupa jest poza zakresem 2..4 —
+    /// wywołujący wraca wtedy do pojedynczych uruchomień.
+    pub fn gemv_q8_0_dp4a_group_f16(
+        &self,
+        projections: &[(&DevBuffer, &DevBuffer, usize)],
+        x: &DevBuffer,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        if !(2..=4).contains(&projections.len()) || !self.artifacts.has(GEMV_Q8_GROUP4) {
+            return Ok(false);
+        }
+        Self::check_dp4a_cols(cols, 32, "gemv_q8_0_dp4a_group")?;
+        let mut grid_x = 0u32;
+        for &(_, _, rows) in projections {
+            grid_x = grid_x
+                .checked_add(u32::try_from(rows.div_ceil(8)).map_err(|_| {
+                    ForgeError::Kernel("gemv Q8_0 group: siatka przekracza u32".into())
+                })?)
+                .ok_or_else(|| {
+                    ForgeError::Kernel("gemv Q8_0 group: siatka przekracza u32".into())
+                })?;
+        }
+        let mut args = LaunchArgs::new();
+        for slot in 0..4 {
+            match projections.get(slot) {
+                Some(&(y, w, rows)) => {
+                    args = args.buf(y).buf(w).scalar(rows as i64);
+                }
+                // Nieużyty slot: zero wierszy nie tworzy bloku, więc wskaźniki
+                // nie są dotykane.
+                None => {
+                    args = args
+                        .buf(projections[0].0)
+                        .buf(projections[0].1)
+                        .scalar(0i64);
+                }
+            }
+        }
+        let args = args.buf(x).scalar(cols as i64);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.device.launch(
+            self.artifacts.get(GEMV_Q8_GROUP4)?,
+            &cfg,
+            &args,
+            stream,
+        )?;
+        Ok(true)
     }
 
     /// Q4_K GEMV with int8-quantized activations (q8_1) and dp4a dots.

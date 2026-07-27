@@ -3835,6 +3835,32 @@ impl Model {
 
     /// Wykonuje kilka pełnych projekcji GGUF NVFP4 ze wspólną kwantyzacją
     /// aktywacji Q8_1. Zwraca `false`, gdy choć jedna waga ma inny format.
+    /// Wykonuje kilka projekcji Q8_0 jednym uruchomieniem. Zwraca `false`, gdy
+    /// choć jedna waga ma inny format albo szerokości się różnią.
+    fn gemv_q8_0_group(
+        &self,
+        projections: &[(&DevBuffer, &DevWeight)],
+        x: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let mut cols = None;
+        let mut group = Vec::with_capacity(projections.len());
+        for &(output, weight) in projections {
+            let DevWeight::Q8_0 { buf, rows, cols: weight_cols } = weight else {
+                return Ok(false);
+            };
+            if cols.is_some_and(|value| value != *weight_cols) {
+                return Ok(false);
+            }
+            cols = Some(*weight_cols);
+            group.push((output, buf, *rows));
+        }
+        let Some(cols) = cols else {
+            return Ok(false);
+        };
+        self.kernels.gemv_q8_0_dp4a_group_f16(&group, x, cols, stream)
+    }
+
     fn gemv_nvfp4_gguf_group(
         &self,
         projections: &[(&DevBuffer, &DevWeight)],
@@ -15425,12 +15451,51 @@ impl Model {
                 hb.projection_rows
             )));
         }
-        for (y, w) in [
+        let projections = [
             (&hb.batched_qkv_mixed, &d.in_proj),
             (&hb.batched_z, &d.gate_proj),
             (&hb.batched_alpha, &d.alpha_proj),
             (&hb.batched_beta_raw, &d.beta_proj),
-        ] {
+        ];
+        // Cztery projekcje czytają TEN SAM znormalizowany `x`, ale NIE MAJĄ tego
+        // samego formatu: `in_proj` jest NVFP4, a bramka, alfa i beta Q8_0.
+        // Dlatego grupujemy PER FORMAT — jednorodna próba na całej czwórce
+        // odpadała i wszystkie cztery szły osobno. Osobno każda ma za małą
+        // siatkę, żeby wypełnić kartę.
+        if n_rows == 1 {
+            let mut nvfp4: Vec<(&DevBuffer, &DevWeight)> = Vec::new();
+            let mut q8: Vec<(&DevBuffer, &DevWeight)> = Vec::new();
+            for &(y, w) in &projections {
+                match w {
+                    DevWeight::NvFp4Gguf { .. } => nvfp4.push((y, w)),
+                    DevWeight::Q8_0 { .. } => q8.push((y, w)),
+                    _ => {
+                        nvfp4.clear();
+                        q8.clear();
+                        break;
+                    }
+                }
+            }
+            if nvfp4.len() + q8.len() == projections.len() {
+                for (subset, is_nvfp4) in [(&nvfp4, true), (&q8, false)] {
+                    if subset.is_empty() {
+                        continue;
+                    }
+                    let fused = if is_nvfp4 {
+                        self.gemv_nvfp4_gguf_group(subset, x, &self.stream)?
+                    } else {
+                        self.gemv_q8_0_group(subset, x, &self.stream)?
+                    };
+                    if !fused {
+                        for &(y, w) in subset.iter() {
+                            self.hybrid_project(y, w, x, 1)?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        for (y, w) in projections {
             self.hybrid_project(y, w, x, n_rows)?;
         }
         Ok(())
