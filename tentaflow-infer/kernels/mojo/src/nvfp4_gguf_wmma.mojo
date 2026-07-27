@@ -17,7 +17,10 @@
 # z tego, że linia niesie CAŁY swój wiersz po K, więc zarówno 16 f16 aktywacji,
 # jak i 8 bajtów kodów wagi są odczytem ciągłym.
 
-from std.gpu import block_idx, thread_idx
+from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu.sync import barrier
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
 
 from src.arch_wmma import wmma_f16_16x16x16
 from src.gemv2 import _e2m1x8
@@ -92,22 +95,50 @@ def gemm_nvfp4_gguf_wmma_impl[
         fill=SIMD[DType.float32, 8](0.0)
     )
 
+    # Wagi rozpakowujemy RAZ NA BLOK do LDS. Bez tego kazda z WAVES_M fal wzdluz
+    # tokenow dekwantyzowala DOKLADNIE TE SAME kolumny — a pomiar z podmieniona
+    # na stala waga pokazal, ze sama dekwantyzacja to polowa czasu kernela
+    # (25 wobec 48 TFLOPS). Kafel BN x 64 wartosci to 8 KiB dla BN=64.
+    comptime WEIGHT_TILE = BN * BLOCK_VALUES
+    ws = stack_allocation[
+        WEIGHT_TILE, Float16, address_space = AddressSpace.SHARED
+    ]()
+    var threads = Int(block_dim.x)
+    var tid = Int(thread_idx.x)
+
     for block in range(blocks_per_row):
-        for subblock in range(SUBBLOCKS):
-            var column = block * BLOCK_VALUES + subblock * TILE
+        # Kazdy watek bierze kolejne podbloki (wiersz, podblok) az wyczerpie kafel.
+        var slot = tid
+        while slot < BN * SUBBLOCKS:
+            local_row = slot // SUBBLOCKS
+            subblock = slot % SUBBLOCKS
+            var source_row = Int(block_idx.x) * BN + local_row
+            if source_row > n_rows - 1:
+                source_row = n_rows - 1
+            frag = _weight_frag(
+                weights,
+                source_row * blocks_per_row * BLOCK_BYTES + block * BLOCK_BYTES,
+                subblock,
+            )
+            (ws + local_row * BLOCK_VALUES + subblock * TILE).store(frag)
+            slot += threads
+        barrier()
+
+        comptime for sub in range(SUBBLOCKS):
+            var column = block * BLOCK_VALUES + sub * TILE
             var a = InlineArray[SIMD[DType.float16, 16], MTILE](
                 fill=SIMD[DType.float16, 16](0.0)
             )
             comptime for mt in range(MTILE):
                 a[mt] = (x + x_base[mt] + column).load[width=16, alignment=2]()
             comptime for nt in range(NTILE):
-                var b = _weight_frag(
-                    weights, w_base[nt] + block * BLOCK_BYTES, subblock
-                )
+                local_n = (wave % WAVES_N) * NTILE * TILE + nt * TILE + lane % 16
+                b = (ws + local_n * BLOCK_VALUES + sub * TILE).load[width=16]()
                 comptime for mt in range(MTILE):
                     acc[mt * NTILE + nt] = wmma_f16_16x16x16(
                         a[mt], b, acc[mt * NTILE + nt]
                     )
+        barrier()
 
     comptime for mt in range(MTILE):
         comptime for nt in range(NTILE):
@@ -121,7 +152,11 @@ def gemm_nvfp4_gguf_wmma_impl[
                     )
 
 
-# Kafle odwzorowujące rodzinę mma NVIDII: BM32/BN64, BM128/BN64, BM128/BN32.
+# Dwa kafle, oba wybrane pomiarem na 7900 XT (sweep w
+# `bench-amd/bench_gemm_nvfp4_wmma_tiles.mojo`, ksztalty projekcji 27B):
+#  - BM256/BN64 na osmiu falach: 52/50/45 TFLOPS, najlepszy w kazdym ksztalcie,
+#  - BM32/BN64 dla krotkich chunkow, gdzie duzy kafel nie ma czym wypelnic fal.
+# Wariant BN32 z rodziny `mma` NIE ma tu odpowiednika: powstal ze strojenia pod
+# NVIDIE i nic go na tej karcie nie uzasadnia.
 comptime gemm_nvfp4_gguf_wmma_f16_bm32 = gemm_nvfp4_gguf_wmma_impl[2, 2, 1, 2]
-comptime gemm_nvfp4_gguf_wmma_f16_bm128 = gemm_nvfp4_gguf_wmma_impl[2, 2, 4, 2]
-comptime gemm_nvfp4_gguf_wmma_f16_bm128_bn32 = gemm_nvfp4_gguf_wmma_impl[2, 2, 4, 1]
+comptime gemm_nvfp4_gguf_wmma_f16_bm256 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 2]

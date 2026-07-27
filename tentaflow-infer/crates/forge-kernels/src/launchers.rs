@@ -1118,10 +1118,7 @@ fn nvfp4_gguf_dispatch(
         // istnieją tylko w rodzinie `mma`, a ich odpowiedniki trzeba osobno
         // zmierzyć, zanim zaczną cokolwiek wybierać.
         17..=32 if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm32", 32, 64, Some(128)),
-        128 if n_rows == 1024 && wmma_available => {
-            ("gemm_nvfp4_gguf_wmma_f16_bm128_bn32", 128, 32, Some(128))
-        }
-        _ if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm128", 128, 64, Some(128)),
+        _ if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm256", 256, 64, Some(256)),
         _ => {
             return Err(ForgeError::Kernel(format!(
                 "gemm_nvfp4_gguf_f16: backend bez jednostki macierzowej nie obsługuje T={n_tokens} > 16"
@@ -1255,13 +1252,12 @@ const HYBRID_PREFILL_T128_MATRIX_NVIDIA: [&str; 6] = [
     "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
 ];
 
-const HYBRID_PREFILL_T128_MATRIX_AMD: [&str; 6] = [
+const HYBRID_PREFILL_T128_MATRIX_AMD: [&str; 5] = [
     "gemm_nvfp4_gguf_f16_b3",
     "gemm_nvfp4_gguf_f16_b4",
     "gemm_nvfp4_gguf_f16_b8",
     "gemm_nvfp4_gguf_wmma_f16_bm32",
-    "gemm_nvfp4_gguf_wmma_f16_bm128",
-    "gemm_nvfp4_gguf_wmma_f16_bm128_bn32",
+    "gemm_nvfp4_gguf_wmma_f16_bm256",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1429,13 +1425,10 @@ fn hybrid_prefill_nvfp4_artifact_chunk_limit(
     }
     if !has("deltanet_gated_scan_inplace_shared_d128_f16")
         || !has(variant(
-            "gemm_nvfp4_gguf_wmma_f16_bm128",
+            "gemm_nvfp4_gguf_wmma_f16_bm256",
             "gemm_nvfp4_gguf_mma_f16_bm128",
         ))
-        || !has(variant(
-            "gemm_nvfp4_gguf_wmma_f16_bm128_bn32",
-            "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
-        ))
+        || (nvidia_warp32 && !has("gemm_nvfp4_gguf_mma_f16_bm128_bn32"))
     {
         return 32;
     }
@@ -5167,9 +5160,8 @@ impl Kernels {
             self.artifacts.has("gemm_nvfp4_tile128_mma_f16_bm128_bn64"),
             self.artifacts.has("gemm_nvfp4_tile128_mma_f16_bm128_bn128"),
             matches!(caps.vendor, forge_types::Vendor::Nvidia),
-            self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm128")
-                && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm32")
-                && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm128_bn32"),
+            self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm256")
+                && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm32"),
             caps.warp_size,
             caps.max_threads_per_block,
         )?;
@@ -17987,8 +17979,7 @@ mod nvfp4_gguf_dispatch_tests {
         for (missing, expected) in [
             ("gemm_nvfp4_gguf_wmma_f16_bm32", 16),
             ("gemm_q8_0_wmma_triplet_bm64", 16),
-            ("gemm_nvfp4_gguf_wmma_f16_bm128", 32),
-            ("gemm_nvfp4_gguf_wmma_f16_bm128_bn32", 32),
+            ("gemm_nvfp4_gguf_wmma_f16_bm256", 32),
         ] {
             assert_eq!(
                 hybrid_prefill_nvfp4_artifact_chunk_limit(false, |name| name != missing),
