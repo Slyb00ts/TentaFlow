@@ -32,9 +32,9 @@ przebiegach; bez MTP 33,2 tok/s, co zgadza się z `llama-bench tg128` (32,93).
 | | FORGE (stan wyjściowy) | **FORGE (teraz)** | llama.cpp | |
 |---|--:|--:|--:|---|
 | prefill p1024 | 1 679 tok/s | **4 578** tok/s | **18 481** tok/s | llama.cpp 4,0x |
-| decode tg128 | 246 tok/s | **347,1** tok/s | 246,4 tok/s | **FORGE 1,41x** |
+| decode tg128 | 246 tok/s | **367,1** tok/s | 246,4 tok/s | **FORGE 1,49x** |
 
-Ten sam graf podniósł decode także na RDNA2: 6900 XT 251,5 -> **272,3** tok/s.
+Graf i fuzja projekcji podniosły decode także na RDNA2: 6900 XT 251,5 -> **287,1** tok/s.
 
 ## Diagnoza: prefill hybrydowy na AMD liczy się jak decode
 
@@ -128,6 +128,20 @@ przeszkodą był gather embeddingu z RAM hosta, zależny od `token_id`; wydzielo
 przed graf, reszta kroku czyta pozycję i długość sekwencji z buforów urządzenia.
 Zysk rośnie, im mniejszy model (mniej liczenia na uruchomienie): 27B +3%,
 qwen-guard +9% na obu kartach.
+
+**Fuzja projekcji dzielących aktywację.** DeltaNet liczy cztery projekcje
+wejściowe z tego samego znormalizowanego `x`, FFN dwie — każda szła osobnym
+uruchomieniem. Poza narzutem bolał rozmiar siatki: wąska projekcja mierzy
+425 GB/s wobec 960 GB/s szerokiej, bo nie ma czym wypełnić karty. Nowe
+`gemv_{nvfp4_gguf_q8_1,q8_0_dp4a}_group4_f16` liczą do czterech projekcji jednym
+uruchomieniem, wybierając macierz po skumulowanym indeksie bloku.
+
+PUŁAPKA, przez którą pierwsza wersja nic nie dała: te cztery projekcje NIE MAJĄ
+wspólnego formatu — `in_proj` jest NVFP4, a bramka, alfa i beta Q8_0. Jednorodna
+próba na całej czwórce odpadała i wszystko wracało do pojedynczych uruchomień.
+Grupowanie idzie więc PER FORMAT. Zysk skaluje się odwrotnie do rozmiaru modelu:
+qwen-guard +5,8% (7900 XT) i +5,2% (6900 XT), 27B +0,6% — bo tam decode jest już
+ograniczony pasmem, a nie liczbą uruchomień.
 
 ZOSTAJE, w kolejności wartości:
 1. **~8 ms z 32 ms na token idzie w ~900 małych kerneli** (rmsnorm, DeltaNet,
