@@ -83,8 +83,15 @@ Przypięte i zgodne z referencją (`crates/forge-formats/tests/deepseek_v4_atten
 | pełna ścieżka Q (per-głowicowa norma + rope) | 1,4e-6 |
 | ścieżka KV | 1,3e-6 |
 | wyjście uwagi (rope odwrotne + grupowana LoRA) | 2,1e-6 |
+| kompresor strumienia KV (okna z zakładką + QAT FP8) | 3,7e-7 |
+| kompresor indeksera (Hadamard + QAT FP4) | dokładnie |
+| punktowanie indeksera | 1,8e-4 |
+| rzadka uwaga po zebranych indeksach (z kotwicą) | 3,0e-7 |
+| konstrukcja indeksów prefillu | dokładnie |
 | SwiGLU eksperta NVFP4 | 1,8e-6 |
 | bramka MoE (wybór i wagi) | dokładnie |
+| hyper-connections: redukcja HC | 2,2e-7 |
+| hyper-connections: rozprowadzenie po Sinkhornie | 9,6e-8 |
 
 To jest zarazem walidacja obu konwersji kwantyzacji od końca do końca: projekcje
 liczone są na wagach przepuszczonych przez produkcyjne przepakowanie NVFP4 i
@@ -106,6 +113,19 @@ liczby wyglądające sensownie:
   niego, normalizuje do sumy 1 i dopiero mnoży przez `route_scale` 1,5.
 - SwiGLU obcina bramkę tylko od góry, a wejście obustronnie — obie operacje
   przed mnożeniem.
+- Kompresor o stopniu 4 pracuje na oknach Z ZAKŁADKĄ: projekcja daje dwa razy
+  szerszy wektor, którego pierwsza połowa opisuje okno przesunięte o blok wstecz.
+- Wyjścia obu kompresorów przechodzą symulację kwantyzacji, którą model przeszedł
+  w treningu (QAT): zwykły do FP8 blokami po 64, indeksera do FP4 blokami po 32,
+  oba ze skalą zaokrągloną do potęgi dwójki.
+- Wynik rotacji Hadamarda wraca do bf16. Pominięcie tego zaokrąglenia przesuwa
+  maksimum grupy przez granicę potęgi dwójki i zmienia skalę całej grupy przy
+  kwantyzacji FP4 — kosztowało 2,9e-2 na punktowaniu indeksera, zanim zostało
+  znalezione.
+- Indeks `-1` w liście pozycji oznacza maskę, a nie pozycję; kotwica uwagi wchodzi
+  WYŁĄCZNIE do mianownika softmaxu, jako logit o zerowym wektorze wartości.
+- Sinkhorn po softmaksie po wierszach robi NAJPIERW normalizację po kolumnach, a
+  dopiero potem `iters - 1` pełnych par wiersz+kolumna.
 
 ## Architektura — co trzeba odtworzyć
 
@@ -181,16 +201,20 @@ Aktywacje kwantyzowane dynamicznie do FP8 przed każdym GEMM-em.
 
 ## Czego brakuje, w kolejności
 
-1. **Mikser: uwaga latentna** — matematyka jest przypięta testami (patrz wyżej),
-   brakuje kerneli GPU i typu `DevWeight` ze skalami wierszowymi.
-2. **Podwójny strumień KV** — okno plus kompresor, ze stanem dekodowania.
-3. **Indekser i rzadka uwaga** po zebranych indeksach.
-4. **Bramka MoE** z biasem, `sqrtsoftplus` i routingiem haszowanym.
-5. **Hash-conditioning** z Sinkhornem.
-6. **MTP.**
-7. **Typ wagi FP8 ze skalą wierszową** — konwersja jest gotowa i zmierzona,
-   brakuje wariantu `DevWeight` z osobnym buforem skal i wpięcia go w dyspozytor
-   GEMV. Powstanie razem z mikserem, który jako pierwszy tych wag potrzebuje.
+Matematyka całej warstwy jest przypięta testami wobec referencji — poza dwoma
+elementami, których oracle nie obejmuje, bo wymagają stanu przez wiele wywołań:
+ścieżki DEKODOWANIA kompresora (bufory `kv_state`/`score_state` i okno kołowe
+cache'u KV) oraz głowy MTP.
+
+Zostaje warstwa wykonawcza:
+
+1. **Typ wagi FP8 ze skalą wierszową** — konwersja gotowa i zmierzona, brakuje
+   wariantu `DevWeight` z osobnym buforem skal i wpięcia w dyspozytor GEMV.
+2. **Kernele GPU** dla uwagi latentnej, obu kompresorów, indeksera, rzadkiej
+   uwagi po zebranych indeksach i hyper-connections.
+3. **Ścieżka dekodowania kompresora** — stan okna między tokenami.
+4. **Routing haszowany** przez `tid2eid` dla trzech pierwszych warstw.
+5. **MTP.**
 
 Każdy z tych punktów da się zwalidować numerycznie przeciwko `inference/model.py`
 osobno, i tak trzeba je robić — model, który nie mieści się w VRAM i nie ma
