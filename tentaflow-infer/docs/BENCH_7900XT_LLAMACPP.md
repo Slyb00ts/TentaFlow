@@ -17,10 +17,10 @@ stronicowania przez PCIe. Na 6900 XT ten model NIE WCHODZI (16 GiB).
 | | FORGE (stan wyjściowy) | **FORGE (teraz)** | llama.cpp | |
 |---|--:|--:|--:|---|
 | prefill p1024 | 27,3 tok/s | **843,9** tok/s | 716,3 tok/s | **FORGE 1,18x** |
-| decode tg128, bez spekulacji | 9,5 tok/s | **30,8** tok/s | **33,0** tok/s | llama.cpp 1,07x |
-| decode tg128, MTP po obu stronach | 47,1 tok/s | **51,7** tok/s | **73,4** tok/s | llama.cpp 1,42x |
+| decode tg128, bez spekulacji | 9,5 tok/s | **31,7** tok/s | **33,0** tok/s | llama.cpp 1,04x |
+| decode tg128, MTP po obu stronach | 47,1 tok/s | **51,8** tok/s | **73,4** tok/s | llama.cpp 1,42x |
 
-**Prefill urósł 30,9x i wyprzedził llama.cpp**, decode 3,2x i jest 7% od niego. Wyjście jest przez
+**Prefill urósł 30,9x i wyprzedził llama.cpp**, decode 3,3x i jest 4% od niego. Wyjście jest przez
 całą tę drogę BITOWO IDENTYCZNE — ta sama suma SHA 128 tokenów co przed
 pierwszą zmianą (`0bf2b86b…`).
 
@@ -29,10 +29,12 @@ przebiegach; bez MTP 33,2 tok/s, co zgadza się z `llama-bench tg128` (32,93).
 
 ## qwen-guard 0,8B Q8_0 (ta sama architektura `qwen35`)
 
-| | FORGE (dot4) | FORGE (WMMA + layer-major) | llama.cpp | |
+| | FORGE (stan wyjściowy) | **FORGE (teraz)** | llama.cpp | |
 |---|--:|--:|--:|---|
-| prefill p1024 | 1 679 tok/s | **4 607,2** tok/s | **18 480,9** tok/s | llama.cpp **4,0x** |
-| decode tg128 | | **317,2** tok/s | 246,4 tok/s | FORGE **1,29x** |
+| prefill p1024 | 1 679 tok/s | **4 578** tok/s | **18 481** tok/s | llama.cpp 4,0x |
+| decode tg128 | 246 tok/s | **347,1** tok/s | 246,4 tok/s | **FORGE 1,41x** |
+
+Ten sam graf podniósł decode także na RDNA2: 6900 XT 251,5 -> **272,3** tok/s.
 
 ## Diagnoza: prefill hybrydowy na AMD liczy się jak decode
 
@@ -116,6 +118,16 @@ kosztuje **13%** poza cache; (3) przy zbiorach mieszczących się w cache czysty
 odczyt idzie 1,6 TB/s, więc GEMV trzymające tam 247 GB/s NIE było ograniczone
 pamięcią — ograniczały je konwersje f16->f32 w pętli. To ten pomiar wskazał
 ścieżkę int8.
+
+**Decode, dodatkowe 1,03-1,09x: hybrydowy krok wrzucony w graf.** Profil pokazał,
+że w fazie liczenia GPU STOI 15,8% czasu, mediana przerwy między kernelami
+3,2 us przy ~1200 uruchomieniach na token. Ścieżka hybrydowa jako jedyna nie
+była grafowana — komentarz w kodzie tłumaczył to „odczytami na host per
+warstwa", ale jedyny taki odczyt siedział pod flagą debugowania. Realną
+przeszkodą był gather embeddingu z RAM hosta, zależny od `token_id`; wydzielony
+przed graf, reszta kroku czyta pozycję i długość sekwencji z buforów urządzenia.
+Zysk rośnie, im mniejszy model (mniej liczenia na uruchomienie): 27B +3%,
+qwen-guard +9% na obu kartach.
 
 ZOSTAJE, w kolejności wartości:
 1. **~8 ms z 32 ms na token idzie w ~900 małych kerneli** (rmsnorm, DeltaNet,
