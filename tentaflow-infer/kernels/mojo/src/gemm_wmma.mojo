@@ -27,7 +27,7 @@
 # skalowana i dodawana do akumulatora f32. Identycznie jak w MMQ i w wariancie
 # dot4, więc wyniki obu ścieżek są porównywalne co do zaokrągleń.
 
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import block_idx, thread_idx
 from std.memory import bitcast
 
 from src.arch_wmma import wmma_i8_16x16x16
@@ -50,47 +50,26 @@ def _row_frag_i8(
     return bitcast[DType.int32, 4](raw)
 
 
-def gemm_q8_0_wmma_impl[WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, OUT: DType](
+@always_inline
+def _wmma_q8_tile[
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, OUT: DType
+](
     y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq: UnsafePointer[Int8, MutAnyOrigin],
     xd: UnsafePointer[Float32, MutAnyOrigin],
-    xsm: UnsafePointer[Float32, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
     n_tokens: Int,
+    row0: Int,
+    token0: Int,
 ):
-    """Q8_0 GEMM na WMMA: Y[t, r] = dot(w[r], x[t]).
-
-    Aktywacja jest wcześniej skwantowana przez `quantize_act_q8_1` (kody int8
-    `xq` w układzie [T, K], skale `xd` blok-major [K/32, T]); `xsm` jest w
-    sygnaturze dla zgodności z rodziną i8mma i nie jest tu potrzebne, bo Q8_0
-    jest symetryczne. Wagi czytamy WPROST z bajtów GGUF, bez przepakowania.
-
-    Fala liczy MTILE x NTILE kafli 16x16, więc jeden odczyt fragmentu A służy
-    NTILE kaflom, a jeden fragment B — MTILE kaflom. To jest jedyna dźwignia na
-    ruch globalny w tym kernelu: kafel 16x64 zmierzył się GORZEJ od kafla dot4
-    128x128 przy dużym T właśnie dlatego, że jego FLOP/bajt (25,6) był 2,5x
-    niższy. Kafel bloku (WAVES_M*MTILE*16) x (WAVES_N*NTILE*16) podnosi to
-    z powrotem ponad wariant dot4.
-
-    Siatka (ceil(rows/BN), ceil(T/BM)), blok WAVES_M*WAVES_N*32 wątków,
-    `n_cols % 32 == 0` (niezmiennik formatu Q8_0).
-
-    Dwa kafle produkcyjne, bo ich zakresy się nie pokrywają (zmierzone A/B wobec
-    `gemm_q8_0_dot4_128x128` na 7900 XT, 4096x4096): przy krótkim prompcie duży
-    kafel nie ma czym wypełnić fal i przegrywa (T=128: 10 wobec 19 TOPS), przy
-    długim wygrywa reużyciem danych (T=1024: 43 wobec 32 TOPS).
-    """
-    comptime BM = WAVES_M * MTILE * TILE
-    comptime BN = WAVES_N * NTILE * TILE
-
+    """Kafel bloku o początku (token0, row0). Wydzielony, bo ten sam kafel liczy
+    zarówno pojedynczy GEMM, jak i trójkę projekcji DeltaNet w jednym gridzie."""
     var lane = Int(thread_idx.x) % 32
     var wave = Int(thread_idx.x) // 32
-    var wave_m = wave // WAVES_N
-    var wave_n = wave % WAVES_N
-    var base_m = Int(block_idx.y) * BM + wave_m * MTILE * TILE
-    var base_n = Int(block_idx.x) * BN + wave_n * NTILE * TILE
+    var base_m = token0 + (wave // WAVES_N) * MTILE * TILE
+    var base_n = row0 + (wave % WAVES_N) * NTILE * TILE
 
     var blocks = n_cols // QK
     var wq = w.bitcast[Int8]()
@@ -149,6 +128,90 @@ def gemm_q8_0_wmma_impl[WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, OUT:
                 var n = base_n + nt * TILE + lane % 16
                 if m < n_tokens and n < n_rows:
                     y[m * n_rows + n] = acc[mt * NTILE + nt][i].cast[OUT]()
+
+
+def gemm_q8_0_wmma_impl[WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Q8_0 GEMM na WMMA: Y[t, r] = dot(w[r], x[t]).
+
+    Aktywacja jest wcześniej skwantowana przez `quantize_act_q8_1` (kody int8
+    `xq` w układzie [T, K], skale `xd` blok-major [K/32, T]); `xsm` jest w
+    sygnaturze dla zgodności z rodziną i8mma i nie jest tu potrzebne, bo Q8_0
+    jest symetryczne. Wagi czytamy WPROST z bajtów GGUF, bez przepakowania.
+
+    Fala liczy MTILE x NTILE kafli 16x16, więc jeden odczyt fragmentu A służy
+    NTILE kaflom, a jeden fragment B — MTILE kaflom. To jest jedyna dźwignia na
+    ruch globalny w tym kernelu: kafel 16x64 zmierzył się GORZEJ od kafla dot4
+    128x128 przy dużym T właśnie dlatego, że jego FLOP/bajt (25,6) był 2,5x
+    niższy. Kafel bloku (WAVES_M*MTILE*16) x (WAVES_N*NTILE*16) podnosi to
+    z powrotem ponad wariant dot4.
+
+    Siatka (ceil(rows/BN), ceil(T/BM)), blok WAVES_M*WAVES_N*32 wątków,
+    `n_cols % 32 == 0` (niezmiennik formatu Q8_0).
+
+    Dwa kafle produkcyjne, bo ich zakresy się nie pokrywają (zmierzone A/B wobec
+    `gemm_q8_0_dot4_128x128` na 7900 XT, 4096x4096): przy krótkim prompcie duży
+    kafel nie ma czym wypełnić fal i przegrywa (T=128: 10 wobec 19 TOPS), przy
+    długim wygrywa reużyciem danych (T=1024: 43 wobec 32 TOPS).
+    """
+    comptime BM = WAVES_M * MTILE * TILE
+    comptime BN = WAVES_N * NTILE * TILE
+    _wmma_q8_tile[WAVES_M, WAVES_N, MTILE, NTILE, OUT](
+        y, w, xq, xd, n_cols, n_rows, n_tokens,
+        Int(block_idx.x) * BN, Int(block_idx.y) * BM,
+    )
+
+
+def gemm_q8_0_wmma_triplet_bm64(
+    y0: UnsafePointer[Float16, MutAnyOrigin],
+    w0: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows0: Int,
+    y1: UnsafePointer[Float16, MutAnyOrigin],
+    w1: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows1: Int,
+    y2: UnsafePointer[Float16, MutAnyOrigin],
+    w2: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows2: Int,
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_tokens: Int,
+):
+    """Trzy projekcje DeltaNet w JEDNYM gridzie na wspólnej aktywacji Q8_1.
+
+    Odpowiednik `gemm_q8_0_i8mma_triplet_bm64` na WMMA: `block_idx.x` wybiera,
+    która z trzech macierzy wag jest liczona, więc wagi i wyjścia zostają
+    rozdzielone, a aktywacja jest kwantowana raz na warstwę.
+    """
+    comptime BM = 64
+    comptime BN = 64
+    tile = Int(block_idx.x)
+    blocks0 = (n_rows0 + BN - 1) // BN
+    blocks1 = (n_rows1 + BN - 1) // BN
+    t0 = Int(block_idx.y) * BM
+    if tile < blocks0:
+        _wmma_q8_tile[2, 2, 2, 2, DType.float16](
+            y0, w0, xq_g, xd_g, n_cols, n_rows0, n_tokens, tile * BN, t0
+        )
+    elif tile < blocks0 + blocks1:
+        _wmma_q8_tile[2, 2, 2, 2, DType.float16](
+            y1, w1, xq_g, xd_g, n_cols, n_rows1, n_tokens,
+            (tile - blocks0) * BN, t0,
+        )
+    else:
+        _wmma_q8_tile[2, 2, 2, 2, DType.float16](
+            y2, w2, xq_g, xd_g, n_cols, n_rows2, n_tokens,
+            (tile - blocks0 - blocks1) * BN, t0,
+        )
 
 
 comptime gemm_q8_0_wmma_64x128 = gemm_q8_0_wmma_impl[2, 2, 2, 4, DType.float16]

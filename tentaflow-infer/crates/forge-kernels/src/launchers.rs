@@ -1040,6 +1040,7 @@ fn nvfp4_gguf_dispatch(
     sync1_available: bool,
     bn128_available: bool,
     is_nvidia: bool,
+    wmma_available: bool,
     warp_size: u32,
     max_threads: u32,
 ) -> Result<Nvfp4GgufDispatch> {
@@ -1108,9 +1109,18 @@ fn nvfp4_gguf_dispatch(
             ("gemm_nvfp4_gguf_mma_f16_bm128_prefetch", 128, 64, Some(256))
         }
         _ if is_nvidia && warp_size == 32 => ("gemm_nvfp4_gguf_mma_f16_bm128", 128, 64, Some(256)),
+        // Kafle WMMA (RDNA3+) liczą tę samą matematykę co kafle `mma`. Nie
+        // powielamy tu strojenia NVIDII (sync1/prefetch/bn128) — te warianty
+        // istnieją tylko w rodzinie `mma`, a ich odpowiedniki trzeba osobno
+        // zmierzyć, zanim zaczną cokolwiek wybierać.
+        17..=32 if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm32", 32, 64, Some(128)),
+        128 if n_rows == 1024 && wmma_available => {
+            ("gemm_nvfp4_gguf_wmma_f16_bm128_bn32", 128, 32, Some(128))
+        }
+        _ if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm128", 128, 64, Some(128)),
         _ => {
             return Err(ForgeError::Kernel(format!(
-                "gemm_nvfp4_gguf_f16: backend bez NVIDIA MMA nie obsługuje T={n_tokens} > 16"
+                "gemm_nvfp4_gguf_f16: backend bez jednostki macierzowej nie obsługuje T={n_tokens} > 16"
             )));
         }
     };
@@ -1142,6 +1152,7 @@ fn nvfp4_gguf_layout_dispatch(
     tile_bn64_available: bool,
     tile_bn128_available: bool,
     is_nvidia: bool,
+    wmma_available: bool,
     warp_size: u32,
     max_threads: u32,
 ) -> Result<Nvfp4GgufDispatch> {
@@ -1154,6 +1165,7 @@ fn nvfp4_gguf_layout_dispatch(
             sync1_available,
             bn128_available,
             is_nvidia,
+            wmma_available,
             warp_size,
             max_threads,
         ),
@@ -1219,18 +1231,33 @@ const HYBRID_PREFILL_B2_ARTIFACTS: [&str; 4] = [
     "gemm_q8_0_f16_exact_out_f32_b2",
 ];
 
-const HYBRID_PREFILL_T128_ARTIFACTS: [&str; 11] = [
+/// Rdzeń wspólny obu rodzinom: skany DeltaNet i batchowe GEMM-y NVFP4.
+const HYBRID_PREFILL_T128_SHARED: [&str; 4] = [
     "deltanet_gated_scan_inplace_shared_d128_f16",
     "deltanet_gated_scan_inplace_dynamic_d128_f16",
     "gemm_nvfp4_gguf_f16_b2",
+    "gemm_nvfp4_gguf_f16_b16",
+];
+
+/// Kafle na jednostce macierzowej. Ta sama matematyka, dwie rodziny instrukcji:
+/// `mma`/`ldmatrix` na NVIDII i WMMA na RDNA3+. Rozdzielone, bo to JEDYNA
+/// różnica między backendami w tej ścieżce — reszta kontraktu jest identyczna.
+const HYBRID_PREFILL_T128_MATRIX_NVIDIA: [&str; 6] = [
     "gemm_nvfp4_gguf_f16_b3_nvidia",
     "gemm_nvfp4_gguf_f16_b4_nvidia",
     "gemm_nvfp4_gguf_f16_b8_nvidia",
-    "gemm_nvfp4_gguf_f16_b16",
     "gemm_nvfp4_gguf_mma_f16_bm32",
     "gemm_nvfp4_gguf_mma_f16_bm128",
     "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
-    "gemm_q8_0_i8mma_triplet_bm64",
+];
+
+const HYBRID_PREFILL_T128_MATRIX_AMD: [&str; 6] = [
+    "gemm_nvfp4_gguf_f16_b3",
+    "gemm_nvfp4_gguf_f16_b4",
+    "gemm_nvfp4_gguf_f16_b8",
+    "gemm_nvfp4_gguf_wmma_f16_bm32",
+    "gemm_nvfp4_gguf_wmma_f16_bm128",
+    "gemm_nvfp4_gguf_wmma_f16_bm128_bn32",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1332,8 +1359,25 @@ fn has_hybrid_prefill_b2_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
     HYBRID_PREFILL_B2_ARTIFACTS.iter().all(|name| has(name))
 }
 
-fn has_hybrid_prefill_t128_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
-    HYBRID_PREFILL_T128_ARTIFACTS.iter().all(|name| has(name))
+fn has_hybrid_prefill_t128_artifacts(
+    nvidia: bool,
+    mut has: impl FnMut(&str) -> bool,
+) -> bool {
+    let matrix: &[&str] = if nvidia {
+        &HYBRID_PREFILL_T128_MATRIX_NVIDIA
+    } else {
+        &HYBRID_PREFILL_T128_MATRIX_AMD
+    };
+    let triplet = if nvidia {
+        "gemm_q8_0_i8mma_triplet_bm64"
+    } else {
+        "gemm_q8_0_wmma_triplet_bm64"
+    };
+    HYBRID_PREFILL_T128_SHARED
+        .iter()
+        .chain(matrix.iter())
+        .all(|name| has(name))
+        && has(triplet)
 }
 
 fn hybrid_prefill_nvfp4_artifact_chunk_limit(
@@ -1368,15 +1412,26 @@ fn hybrid_prefill_nvfp4_artifact_chunk_limit(
     )) {
         return 8;
     }
-    if !nvidia_warp32 {
-        return 16;
-    }
-    if !has("gemm_nvfp4_gguf_mma_f16_bm32") || !has("gemm_q8_0_i8mma_triplet_bm64") {
+    let matrix_bm32 = variant(
+        "gemm_nvfp4_gguf_wmma_f16_bm32",
+        "gemm_nvfp4_gguf_mma_f16_bm32",
+    );
+    let triplet = variant(
+        "gemm_q8_0_wmma_triplet_bm64",
+        "gemm_q8_0_i8mma_triplet_bm64",
+    );
+    if !has(matrix_bm32) || !has(triplet) {
         return 16;
     }
     if !has("deltanet_gated_scan_inplace_shared_d128_f16")
-        || !has("gemm_nvfp4_gguf_mma_f16_bm128")
-        || !has("gemm_nvfp4_gguf_mma_f16_bm128_bn32")
+        || !has(variant(
+            "gemm_nvfp4_gguf_wmma_f16_bm128",
+            "gemm_nvfp4_gguf_mma_f16_bm128",
+        ))
+        || !has(variant(
+            "gemm_nvfp4_gguf_wmma_f16_bm128_bn32",
+            "gemm_nvfp4_gguf_mma_f16_bm128_bn32",
+        ))
     {
         return 32;
     }
@@ -1673,6 +1728,12 @@ impl Kernels {
             && has_nvfp4_gguf_tile_artifacts(|name| self.artifacts.has(name))
     }
 
+    /// Czy dany artefakt jest załadowany. Silnik pyta o to, gdy musi wybrać
+    /// wariant ścieżki zależny od rodziny kart.
+    pub fn has_artifact(&self, name: &str) -> bool {
+        self.artifacts.has(name)
+    }
+
     /// Czy backend uciągnie kaflowe Q8_0 i8mma dla T>=32.
     ///
     /// Warianty batchowe (`_b2`..`_b16`) są przenośne, ale kafle dla T>=32 stoją
@@ -1681,9 +1742,11 @@ impl Kernels {
     /// żeby silnik nie wybierał ścieżki, której backend nie uruchomi.
     pub fn prepared_q8_tiled_capable(&self) -> bool {
         let caps = self.device.caps();
+        if caps.warp_size != 32 || caps.max_threads_per_block < BLOCK {
+            return false;
+        }
         matches!(caps.vendor, forge_types::Vendor::Nvidia)
-            && caps.warp_size == 32
-            && caps.max_threads_per_block >= BLOCK
+            || self.artifacts.has("gemm_q8_0_wmma_64x128")
     }
 
     /// Sprawdza komplet artefaktów wymaganych przez ciągły prefill B2 T32.
@@ -1693,7 +1756,8 @@ impl Kernels {
 
     /// Sprawdza artefakty specjalizowanej ścieżki C1 T128 NVFP4.
     pub fn hybrid_prefill_t128_artifacts_capable(&self) -> bool {
-        has_hybrid_prefill_t128_artifacts(|name| self.artifacts.has(name))
+        let nvidia = matches!(self.device.caps().vendor, forge_types::Vendor::Nvidia);
+        has_hybrid_prefill_t128_artifacts(nvidia, |name| self.artifacts.has(name))
     }
 
     /// Zwraca największy chunk NVFP4 obsługiwany przez załadowane artefakty.
@@ -5079,6 +5143,9 @@ impl Kernels {
             self.artifacts.has("gemm_nvfp4_tile128_mma_f16_bm128_bn64"),
             self.artifacts.has("gemm_nvfp4_tile128_mma_f16_bm128_bn128"),
             matches!(caps.vendor, forge_types::Vendor::Nvidia),
+            self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm128")
+                && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm32")
+                && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm128_bn32"),
             caps.warp_size,
             caps.max_threads_per_block,
         )?;
@@ -8816,6 +8883,26 @@ impl Kernels {
                     .scalar(rows_i64)
                     .scalar(n_tokens_i64),
             )
+        } else if !matches!(self.device.caps().vendor, forge_types::Vendor::Nvidia) {
+            // RDNA3+: ten sam kafel co w pojedynczym GEMM Q8_0, tylko karmiony
+            // wcześniej przygotowaną aktywacją.
+            (
+                self.artifacts.get("gemm_q8_0_wmma_64x128")?,
+                LaunchConfig {
+                    grid: (rows_u32.div_ceil(128), (n_tokens as u32).div_ceil(64), 1),
+                    block: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                LaunchArgs::new()
+                    .buf(y)
+                    .buf_at(w_q8, w_byte_off)?
+                    .buf(prepared.scratch.xq.as_ref().expect("xq prepared"))
+                    .buf(prepared.scratch.xd.as_ref().expect("xd prepared"))
+                    .buf(prepared.scratch.xsm.as_ref().expect("xsm prepared"))
+                    .scalar(cols_i64)
+                    .scalar(rows_i64)
+                    .scalar(n_tokens_i64),
+            )
         } else {
             let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
             (
@@ -8867,12 +8954,9 @@ impl Kernels {
             )));
         }
         let caps = self.device.caps();
-        if caps.vendor != forge_types::Vendor::Nvidia
-            || caps.warp_size != 32
-            || caps.max_threads_per_block < BLOCK
-        {
+        if !self.prepared_q8_tiled_capable() {
             return Err(ForgeError::Unsupported(
-                "fused prepared Q8 wymaga NVIDIA warp32 i bloku 256 wątków".into(),
+                "fused prepared Q8 wymaga jednostki macierzowej, fali 32 i bloku 256 wątków".into(),
             ));
         }
         for projection in projections {
@@ -8927,6 +9011,9 @@ impl Kernels {
             && self.artifacts.has("gemm_q8_0_i8mma_triplet_single_big")
         {
             ("gemm_q8_0_i8mma_triplet_single_big", 128, 128, 512)
+        } else if self.artifacts.has("gemm_q8_0_wmma_triplet_bm64") {
+            // RDNA3+: jeden kafel triplety, bez wariantów strojonych pod NVIDIĘ.
+            ("gemm_q8_0_wmma_triplet_bm64", 64, 64, 128)
         } else if self.artifacts.has("gemm_q8_0_i8mma_triplet_single_bm64") {
             ("gemm_q8_0_i8mma_triplet_single_bm64", 64, 64, BLOCK)
         } else if n_tokens >= 256 {
@@ -17054,7 +17141,8 @@ mod nvfp4_gguf_dispatch_tests {
         validate_nvfp4_ct_b1_extents, validate_nvfp4_ct_repack_extents,
         verify_attn_split8_enabled, AttnDecodePlan, DeltaStateLayout, DensePrefillLogitsKind,
         Kernels, Nvfp4GgufLayout, PrequantScratch, Q8PreparedProjection,
-        HYBRID_PREFILL_B2_ARTIFACTS, HYBRID_PREFILL_T128_ARTIFACTS, PREPARED_Q8_GEMM_LAUNCHES,
+        HYBRID_PREFILL_B2_ARTIFACTS, HYBRID_PREFILL_T128_MATRIX_AMD,
+        HYBRID_PREFILL_T128_MATRIX_NVIDIA, HYBRID_PREFILL_T128_SHARED, PREPARED_Q8_GEMM_LAUNCHES,
         PREPARED_Q8_RECORD_FAILURES, PREPARED_Q8_SYNC_FAILURES, NVFP4_CT_S0_ARTIFACTS,
     };
     use forge_hal::cpu::CpuDevice;
@@ -17298,6 +17386,7 @@ mod nvfp4_gguf_dispatch_tests {
             false,
             false,
             is_nvidia,
+            false,
             warp_size,
             max_threads,
         )
@@ -17642,12 +17731,43 @@ mod nvfp4_gguf_dispatch_tests {
         }
     }
 
+    /// Obie rodziny mają PEŁNY, ale RÓŻNY zestaw kafli macierzowych: NVIDIA na
+    /// `mma`/`ldmatrix`, AMD na WMMA. Test pilnuje jednego i drugiego, a przy
+    /// okazji tego, że zestawy się nie mieszają — kernel NVIDII nie może
+    /// wystarczyć AMD ani odwrotnie.
     #[test]
-    fn prefill_t128_wymaga_pelnego_zestawu_artefaktow() {
-        assert!(has_hybrid_prefill_t128_artifacts(|_| true));
-        for missing in HYBRID_PREFILL_T128_ARTIFACTS {
-            assert!(!has_hybrid_prefill_t128_artifacts(|name| name != missing));
+    fn prefill_t128_wymaga_pelnego_zestawu_artefaktow_swojej_rodziny() {
+        for nvidia in [true, false] {
+            assert!(has_hybrid_prefill_t128_artifacts(nvidia, |_| true), "{nvidia}");
+            let matrix: &[&str] = if nvidia {
+                &HYBRID_PREFILL_T128_MATRIX_NVIDIA
+            } else {
+                &HYBRID_PREFILL_T128_MATRIX_AMD
+            };
+            let triplet = if nvidia {
+                "gemm_q8_0_i8mma_triplet_bm64"
+            } else {
+                "gemm_q8_0_wmma_triplet_bm64"
+            };
+            for missing in HYBRID_PREFILL_T128_SHARED
+                .iter()
+                .chain(matrix.iter())
+                .chain(std::iter::once(&triplet))
+            {
+                assert!(
+                    !has_hybrid_prefill_t128_artifacts(nvidia, |name| name != *missing),
+                    "{nvidia} {missing}"
+                );
+            }
         }
+        // Sam zestaw NVIDII nie wystarcza AMD i odwrotnie.
+        let nvidia_only = |name: &str| {
+            HYBRID_PREFILL_T128_SHARED.contains(&name)
+                || HYBRID_PREFILL_T128_MATRIX_NVIDIA.contains(&name)
+                || name == "gemm_q8_0_i8mma_triplet_bm64"
+        };
+        assert!(has_hybrid_prefill_t128_artifacts(true, nvidia_only));
+        assert!(!has_hybrid_prefill_t128_artifacts(false, nvidia_only));
     }
 
     #[test]
@@ -17803,9 +17923,12 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn limit_artefaktow_prefill_przenosny_uzywa_wariantow_generic() {
+        // Z kompletem kafli WMMA backend przenośny sięga tego samego T128 co
+        // NVIDIA — wcześniej był tu twardy sufit 16, bo kafle macierzowe
+        // istniały wyłącznie w wariancie `mma`.
         assert_eq!(
             hybrid_prefill_nvfp4_artifact_chunk_limit(false, |_| true),
-            16
+            128
         );
         for missing in [
             "deltanet_gated_scan_inplace_dynamic_d128_f16",
@@ -17827,10 +17950,31 @@ mod nvfp4_gguf_dispatch_tests {
                 expected
             );
         }
+        // Wariant `_nvidia` nie jest dla tego backendu — jego brak niczego nie
+        // zmienia.
         assert_eq!(
             hybrid_prefill_nvfp4_artifact_chunk_limit(false, |name| {
                 name != "gemm_nvfp4_gguf_f16_b3_nvidia"
             }),
+            128
+        );
+        // Brak kafli WMMA cofa backend przenośny dokładnie tak, jak brak kafli
+        // `mma` cofa NVIDIĘ.
+        for (missing, expected) in [
+            ("gemm_nvfp4_gguf_wmma_f16_bm32", 16),
+            ("gemm_q8_0_wmma_triplet_bm64", 16),
+            ("gemm_nvfp4_gguf_wmma_f16_bm128", 32),
+            ("gemm_nvfp4_gguf_wmma_f16_bm128_bn32", 32),
+        ] {
+            assert_eq!(
+                hybrid_prefill_nvfp4_artifact_chunk_limit(false, |name| name != missing),
+                expected,
+                "{missing}"
+            );
+        }
+        // Kafle `mma` NVIDII nie zastępują WMMA.
+        assert_eq!(
+            hybrid_prefill_nvfp4_artifact_chunk_limit(false, |name| !name.contains("wmma")),
             16
         );
     }
@@ -18488,17 +18632,17 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn wybiera_bn128_i_sync1_z_regresyjnym_wyjatkiem() {
         let large =
-            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, false, 32, 1024).unwrap();
         assert_eq!(large.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn128");
         assert_eq!((large.row_tile, large.block_threads), (128, 256));
 
         let m128 =
-            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, false, 32, 1024).unwrap();
         assert_eq!(m128.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1");
         assert_eq!((m128.row_tile, m128.block_threads), (64, 256));
 
         let regression =
-            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, false, 32, 1024).unwrap();
         assert_eq!(regression.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_prefetch");
     }
 
@@ -18515,6 +18659,7 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             true,
             true,
+            false,
             32,
             1024,
         )
@@ -18540,6 +18685,7 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             true,
             true,
+            false,
             32,
             1024,
         )
@@ -18560,6 +18706,7 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             false,
             true,
+            false,
             32,
             1024,
         )
@@ -18581,6 +18728,7 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 true,
+                false,
                 32,
                 1024,
             ),
@@ -18595,6 +18743,7 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 true,
+                false,
                 32,
                 1024,
             ),
@@ -18608,6 +18757,7 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 true,
+                false,
                 false,
                 32,
                 1024,

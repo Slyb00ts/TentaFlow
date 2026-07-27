@@ -284,8 +284,15 @@ fn resolve_hybrid_prefill_chunk_size(
         })
 }
 
+/// Czy backend uciągnie rozszerzone chunki hybrydowego prefillu (T32/T128).
+///
+/// Warunkiem jest JEDNOSTKA MACIERZOWA i wave/warp 32 — ścieżka layer-major
+/// stoi na kaflach 16x16x16, które na NVIDII daje `mma`, a na RDNA3+ WMMA.
+/// Wcześniej stał tu warunek `vendor == Nvidia`, przez co każdy model qwen35 na
+/// Radeonie liczył prefill chunkami po 16 tokenów, czyli czytał komplet wag
+/// 64 razy na 1024-tokenowy prompt.
 fn hybrid_prefill_t128_backend_capable(vendor: Vendor, warp_size: u32) -> bool {
-    vendor == Vendor::Nvidia && warp_size == 32
+    matches!(vendor, Vendor::Nvidia | Vendor::Amd) && warp_size == 32
 }
 
 fn hybrid_prefill_nvfp4_chunk_limit(
@@ -296,7 +303,10 @@ fn hybrid_prefill_nvfp4_chunk_limit(
     if warp_size == 0 || warp_size > max_threads_per_block {
         return 0;
     }
-    if vendor == Vendor::Nvidia && warp_size == 32 {
+    // Karty z jednostką macierzową i falą 32 dzielą tę samą politykę: sufit
+    // wynika z rozmiaru bloku, a nie z producenta. Czy kafle T32/T128 REALNIE
+    // istnieją, rozstrzyga osobno limit artefaktów.
+    if matches!(vendor, Vendor::Nvidia | Vendor::Amd) && warp_size == 32 {
         return if max_threads_per_block >= 512 {
             MAX_PREFILL_CHUNK
         } else if max_threads_per_block >= 64 {
@@ -13316,10 +13326,29 @@ impl Model {
             && self.kernels.hybrid_prefill_t128_artifacts_capable()
     }
 
+    /// Wariant uwagi dla layer-major, z zejściem na `Exact` gdy backend nie ma
+    /// flash-attention.
+    ///
+    /// Domyślne `auto` wybiera Mojo FA HD256, ale ta rodzina stoi na `mma` i
+    /// istnieje wyłącznie na NVIDII. Bez tego zejścia cała ścieżka layer-major
+    /// przewracała się na `kernel not loaded` dopiero przy pierwszym żądaniu.
+    /// Jawne `FORGE_HYBRID_LAYER_MAJOR_ATTN=fa` nadal jest błędem, jeśli
+    /// artefaktu nie ma — prośba o konkretny wariant ma nie schodzić po cichu.
+    fn hybrid_layer_major_attention_backend(&self) -> Result<HybridLayerMajorAttention> {
+        let requested = hybrid_layer_major_attention()?;
+        if requested == HybridLayerMajorAttention::Flash
+            && std::env::var("FORGE_HYBRID_LAYER_MAJOR_ATTN").is_err()
+            && !self.kernels.has_artifact("attn_prefill_fa_mojo_f16_hd256")
+        {
+            return Ok(HybridLayerMajorAttention::Exact);
+        }
+        Ok(requested)
+    }
+
     fn hybrid_layer_major_route_capable(&self) -> bool {
         hybrid_layer_major_prefill_requested()
             && self.hybrid_prefill_t128_structural_capable()
-            && hybrid_layer_major_attention().is_ok()
+            && self.hybrid_layer_major_attention_backend().is_ok()
             && hybrid_layer_major_persistent_scan_requested().is_ok()
     }
 
@@ -15838,7 +15867,7 @@ impl Model {
         let ssm = p.ssm.as_ref().expect("hybrydowy target ma parametry SSM");
         let t = tokens.len();
         let base = seq.len;
-        let attention_backend = hybrid_layer_major_attention()?;
+        let attention_backend = self.hybrid_layer_major_attention_backend()?;
         let persistent_scan = hybrid_layer_major_persistent_scan_requested()?
             && t > 128
             && self
@@ -19189,7 +19218,10 @@ mod verify_rollback_tests {
         );
         assert!(hybrid_prefill_t128_backend_capable(Vendor::Nvidia, 32));
         assert!(!hybrid_prefill_t128_backend_capable(Vendor::Nvidia, 64));
-        assert!(!hybrid_prefill_t128_backend_capable(Vendor::Amd, 32));
+        // RDNA3 ma WMMA, więc AMD z falą 32 jest tu zdolne tak samo jak NVIDIA;
+        // fala 64 (CDNA, stare GCN) nie — kafel zakłada 32 linie.
+        assert!(hybrid_prefill_t128_backend_capable(Vendor::Amd, 32));
+        assert!(!hybrid_prefill_t128_backend_capable(Vendor::Amd, 64));
         assert!(!hybrid_prefill_t128_backend_capable(Vendor::Apple, 32));
         assert!(!hybrid_prefill_t128_backend_capable(Vendor::Cpu, 32));
         assert_eq!(
@@ -19198,6 +19230,12 @@ mod verify_rollback_tests {
         );
         assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Nvidia, 32, 256), 8);
         assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Amd, 64, 1024), 16);
+        // AMD z falą 32 dostaje tę samą politykę co NVIDIA — o realnej
+        // dostępności kafli rozstrzyga limit artefaktów, nie producent.
+        assert_eq!(
+            hybrid_prefill_nvfp4_chunk_limit(Vendor::Amd, 32, 1024),
+            crate::model::MAX_PREFILL_CHUNK
+        );
         assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Apple, 32, 256), 8);
         assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Cpu, 1, 1), 4);
         assert_eq!(hybrid_prefill_nvfp4_chunk_limit(Vendor::Cpu, 32, 1), 0);

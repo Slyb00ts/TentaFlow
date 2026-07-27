@@ -157,7 +157,13 @@ from src.gemv2 import (
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
 from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx, gemv_fp8_row_f16_v2
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
+from src.nvfp4_gguf_wmma import (
+    gemm_nvfp4_gguf_wmma_f16_bm32,
+    gemm_nvfp4_gguf_wmma_f16_bm128,
+    gemm_nvfp4_gguf_wmma_f16_bm128_bn32,
+)
 from src.gemm_wmma import (
+    gemm_q8_0_wmma_triplet_bm64,
     gemm_q8_0_wmma_64x128,
     gemm_q8_0_wmma_out_f32_64x128,
     gemm_q8_0_wmma_16x64,
@@ -1871,6 +1877,26 @@ def main() raises:
         dump_asm=Path("gemm_q8_0_wmma_out_f32_16x64.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_wmma_out_f32_16x64"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_q8_0_wmma_triplet_bm64, dump_asm=Path("gemm_q8_0_wmma_triplet_bm64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_wmma_triplet_bm64"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_nvfp4_gguf_wmma_f16_bm32, dump_asm=Path("gemm_nvfp4_gguf_wmma_f16_bm32.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_wmma_f16_bm32"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_nvfp4_gguf_wmma_f16_bm128, dump_asm=Path("gemm_nvfp4_gguf_wmma_f16_bm128.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_wmma_f16_bm128"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_nvfp4_gguf_wmma_f16_bm128_bn32, dump_asm=Path("gemm_nvfp4_gguf_wmma_f16_bm128_bn32.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_wmma_f16_bm128_bn32"))
     _ = ctx.compile_function[
         gemm_q4_k_dot4_64x64, dump_asm=Path("gemm_q4_k_dot4_64x64.ptx")
     ]()
