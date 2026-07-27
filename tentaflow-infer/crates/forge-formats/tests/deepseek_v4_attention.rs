@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use forge_formats::nvfp4::{deepseek_fp8_to_row_scaled, f8e4m3_to_f32, f8e8m0_to_f32};
+use forge_formats::nvfp4::{deepseek_expert_to_gguf, deepseek_fp8_to_row_scaled, f8e4m3_to_f32};
 use forge_formats::safetensors::ShardedSafeTensors;
 use forge_types::DType;
 
@@ -32,7 +32,33 @@ fn checkpoint_dir() -> Option<PathBuf> {
     dir.join("model.safetensors.index.json").is_file().then_some(dir)
 }
 
-/// Zrzut aktywacji referencyjnych: nagłówek z pięcioma i32, potem x, qr, q, kv.
+/// Kursor po zrzucie: pola idą po sobie w kolejności zapisu.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl Cursor<'_> {
+    fn floats(&mut self, n: usize) -> Vec<f32> {
+        let out = self.bytes[self.offset..self.offset + n * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        self.offset += n * 4;
+        out
+    }
+
+    fn ints(&mut self, n: usize) -> Vec<i32> {
+        let out = self.bytes[self.offset..self.offset + n * 4]
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        self.offset += n * 4;
+        out
+    }
+}
+
+/// Zrzut aktywacji referencyjnych: nagłówek, potem ścieżka uwagi i ścieżka MoE.
 struct Oracle {
     seqlen: usize,
     dim: usize,
@@ -43,12 +69,19 @@ struct Oracle {
     qr: Vec<f32>,
     q: Vec<f32>,
     kv: Vec<f32>,
+    gate_layer: usize,
+    topk: usize,
+    n_experts: usize,
+    gate_x: Vec<f32>,
+    indices: Vec<i32>,
+    gate_weights: Vec<f32>,
+    expert_out: Vec<f32>,
 }
 
 fn load_oracle() -> Option<Oracle> {
     let path = std::env::var("FORGE_DEEPSEEK_V4_ORACLE").ok()?;
     let bytes = std::fs::read(path).ok()?;
-    let head: Vec<i32> = bytes[..20]
+    let head: Vec<i32> = bytes[..32]
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -59,19 +92,19 @@ fn load_oracle() -> Option<Oracle> {
         head[3] as usize,
         head[4] as usize,
     );
-    let mut offset = 20;
-    let mut take = |n: usize| {
-        let slice: Vec<f32> = bytes[offset..offset + n * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        offset += n * 4;
-        slice
+    let (gate_layer, topk, n_experts) = (head[5] as usize, head[6] as usize, head[7] as usize);
+    let mut cursor = Cursor {
+        bytes: &bytes,
+        offset: 32,
     };
-    let x = take(seqlen * dim);
-    let qr = take(seqlen * 1024);
-    let q = take(seqlen * n_heads * head_dim);
-    let kv = take(seqlen * head_dim);
+    let x = cursor.floats(seqlen * dim);
+    let qr = cursor.floats(seqlen * 1024);
+    let q = cursor.floats(seqlen * n_heads * head_dim);
+    let kv = cursor.floats(seqlen * head_dim);
+    let gate_x = cursor.floats(seqlen * dim);
+    let indices = cursor.ints(seqlen * topk);
+    let gate_weights = cursor.floats(seqlen * topk);
+    let expert_out = cursor.floats(seqlen * dim);
     Some(Oracle {
         seqlen,
         dim,
@@ -82,6 +115,13 @@ fn load_oracle() -> Option<Oracle> {
         qr,
         q,
         kv,
+        gate_layer,
+        topk,
+        n_experts,
+        gate_x,
+        indices,
+        gate_weights,
+        expert_out,
     })
 }
 
@@ -279,4 +319,129 @@ fn neox_rope_layout_would_be_caught() {
         relative_l2(&neox, &paired) > 1e-2,
         "oba układy rope dają ten sam wynik — test nie odróżniłby pomyłki"
     );
+}
+
+/// Ekspert NVFP4 rozwinięty przez PRODUKCYJNE przepakowanie do układu
+/// jednobuforowego, tak jak zobaczy go kernel.
+fn load_expert(st: &ShardedSafeTensors, base: &str) -> (Vec<f32>, usize, usize) {
+    let names = forge_formats::nvfp4::DeepseekNvFp4Names::for_weight(&format!("{base}.weight"))
+        .unwrap();
+    let info = st.tensor(&names.packed).expect(&names.packed);
+    let gs = st.data(&names.global_scale).unwrap();
+    let global = f32::from_le_bytes([gs[0], gs[1], gs[2], gs[3]]);
+    let repacked = deepseek_expert_to_gguf(
+        st.data(&names.packed).unwrap(),
+        &info.shape,
+        st.data(&names.scale).unwrap(),
+        global,
+    )
+    .unwrap();
+    let decoded = forge_formats::dequant::dequantize_to_f32(
+        DType::U8,
+        forge_types::QuantKind::NVFP4Gguf,
+        &repacked.blocks,
+        repacked.rows * repacked.cols,
+    )
+    .unwrap();
+    let scaled: Vec<f32> = decoded.iter().map(|v| v * repacked.output_scale).collect();
+    (scaled, repacked.rows, repacked.cols)
+}
+
+/// Bramka MoE ma trzy szczegóły, które przy pomyłce nie krzyczą, tylko zmieniają
+/// wybór ekspertów albo ich wagi:
+///
+///  1. bias wchodzi WYŁĄCZNIE do wyboru top-k; wagi bierze się z wyników BEZ niego,
+///  2. wynik to `sqrt(softplus(logit))`, nie softmax ani sigmoid,
+///  3. wagi są normalizowane do sumy 1, a dopiero potem mnożone przez `route_scale`.
+#[test]
+fn moe_gate_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let g = format!("layers.{}.ffn.gate", oracle.gate_layer);
+    let weight = load_vector(&st, &format!("{g}.weight"));
+    let bias = load_vector(&st, &format!("{g}.bias"));
+    let route_scale = 1.5f32;
+
+    for token in 0..oracle.seqlen {
+        let x = &oracle.gate_x[token * oracle.dim..(token + 1) * oracle.dim];
+        let scores: Vec<f32> = (0..oracle.n_experts)
+            .map(|e| {
+                let logit: f32 = (0..oracle.dim)
+                    .map(|c| weight[e * oracle.dim + c] * x[c])
+                    .sum();
+                // softplus stabilne numerycznie, potem pierwiastek.
+                let softplus = if logit > 20.0 {
+                    logit
+                } else {
+                    logit.exp().ln_1p()
+                };
+                softplus.sqrt()
+            })
+            .collect();
+
+        // Wybór po wynikach Z biasem, wagi z wyników BEZ biasu.
+        let mut ranked: Vec<usize> = (0..oracle.n_experts).collect();
+        ranked.sort_by(|a, b| (scores[*b] + bias[*b]).total_cmp(&(scores[*a] + bias[*a])));
+        let chosen = &ranked[..oracle.topk];
+        let want_idx = &oracle.indices[token * oracle.topk..(token + 1) * oracle.topk];
+        let mut got: Vec<i32> = chosen.iter().map(|e| *e as i32).collect();
+        let mut want = want_idx.to_vec();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "token {token}: inny zestaw ekspertów");
+
+        // Wagi liczone w kolejności, w jakiej wybrał je oracle.
+        let raw: Vec<f32> = want_idx.iter().map(|e| scores[*e as usize]).collect();
+        let sum: f32 = raw.iter().sum();
+        let want_w = &oracle.gate_weights[token * oracle.topk..(token + 1) * oracle.topk];
+        for (j, r) in raw.iter().enumerate() {
+            let got_w = r / sum * route_scale;
+            assert!(
+                (got_w - want_w[j]).abs() < 1e-4,
+                "token {token}, pozycja {j}: waga {got_w} zamiast {}",
+                want_w[j]
+            );
+        }
+    }
+}
+
+/// SwiGLU eksperta obcina bramkę TYLKO od góry, a wejście obustronnie — i robi
+/// to PRZED mnożeniem. Test liczy jednego prawdziwego eksperta NVFP4 od wagi po
+/// wyjście, więc waliduje też przepakowanie.
+#[test]
+fn expert_swiglu_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let base = format!("layers.{}.ffn.experts.0", oracle.gate_layer);
+    let (w1, inter, dim) = load_expert(&st, &format!("{base}.w1"));
+    let (w3, _, _) = load_expert(&st, &format!("{base}.w3"));
+    let (w2, out_dim, _) = load_expert(&st, &format!("{base}.w2"));
+    let limit = 10.0f32;
+
+    let mut got = Vec::with_capacity(oracle.expert_out.len());
+    for token in 0..oracle.seqlen {
+        let x = &oracle.gate_x[token * dim..(token + 1) * dim];
+        let gate = project(&w1, x, inter, dim);
+        let up = project(&w3, x, inter, dim);
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| {
+                let g = g.min(limit);
+                let u = u.clamp(-limit, limit);
+                (g / (1.0 + (-g).exp())) * u
+            })
+            .collect();
+        got.extend_from_slice(&project(&w2, &act, out_dim, inter));
+    }
+
+    let err = relative_l2(&got, &oracle.expert_out);
+    eprintln!("ekspert SwiGLU: względne L2 = {err:.3e}");
+    assert!(err < 1e-4, "ekspert rozjeżdża się o {err:.3e}");
 }

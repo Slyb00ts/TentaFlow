@@ -150,10 +150,68 @@ apply_rotary_emb(q[..., -rope_head_dim:], freqs_cis)
 kv = rms_norm(x @ wkv.T, kv_norm_w, eps)
 apply_rotary_emb(kv[..., -rope_head_dim:], freqs_cis)
 
+# --- bramka MoE i pojedynczy ekspert (warstwa bez routingu haszowanego) -----
+
+GATE_LAYER = 3          # warstwy 0-2 routuja przez tid2eid, nie przez wynik
+TOPK = cfg["num_experts_per_tok"]
+N_EXPERTS = cfg["n_routed_experts"]
+ROUTE_SCALE = cfg["routed_scaling_factor"]
+SWIGLU_LIMIT = cfg["swiglu_limit"]
+
+g = f"layers.{GATE_LAYER}.ffn.gate"
+gate_w = torch.from_numpy(load_matrix(f"{g}.weight").copy())
+gate_b = torch.from_numpy(load_vector(f"{g}.bias").copy()).float()
+
+# Wejscie bramki: strumien rezydualny po normie FFN — inny wzorzec niz x.
+gi = np.arange(SEQLEN * dim, dtype=np.int64)
+gx = ((gi * 40503 % 1999).astype(np.float32) / 999.5 - 1.0).reshape(SEQLEN, dim)
+gx_t = torch.from_numpy(gx)
+
+scores = (gx_t.float() @ gate_w.float().T)
+scores = torch.nn.functional.softplus(scores).sqrt()
+original = scores
+biased = scores + gate_b
+indices = biased.topk(TOPK, dim=-1)[1]
+weights = original.gather(1, indices)
+weights = weights / weights.sum(dim=-1, keepdim=True)
+weights = weights * ROUTE_SCALE
+
+def dequant_nvfp4(name):
+    _, shp, packed = raw(f"{name}.weight")
+    _, sshp, sraw = raw(f"{name}.weight_scale")
+    _, _, graw = raw(f"{name}.weight_scale_2")
+    p8 = np.frombuffer(packed, dtype=np.uint8).reshape(shp)
+    E2M1 = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
+    lo = E2M1[p8 & 0xF]
+    hi = E2M1[p8 >> 4]
+    vals = np.empty((shp[0], shp[1] * 2), dtype=np.float32)
+    vals[:, 0::2] = lo
+    vals[:, 1::2] = hi
+    sc = e4m3(np.frombuffer(sraw, dtype=np.uint8)).reshape(sshp)
+    gs = np.frombuffer(graw, dtype=np.float32)[0]
+    return vals * np.repeat(sc, 16, axis=1) * gs
+
+# Ekspert 0: SwiGLU z obcieciem, waga routingu wchodzi PRZED projekcja wyjsciowa.
+e = f"layers.{GATE_LAYER}.ffn.experts.0"
+w1 = torch.from_numpy(dequant_nvfp4(f"{e}.w1").copy())
+w2 = torch.from_numpy(dequant_nvfp4(f"{e}.w2").copy())
+w3 = torch.from_numpy(dequant_nvfp4(f"{e}.w3").copy())
+gate_act = (gx_t @ w1.T).float()
+up_act = (gx_t @ w3.T).float()
+up_act = torch.clamp(up_act, min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
+gate_act = torch.clamp(gate_act, max=SWIGLU_LIMIT)
+expert_out = (torch.nn.functional.silu(gate_act) * up_act) @ w2.T
+
 out = sys.argv[1]
 with open(out, "wb") as f:
-    f.write(struct.pack("<5i", SEQLEN, dim, n_heads, head_dim, rope_head_dim))
+    f.write(struct.pack("<8i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
+                        GATE_LAYER, TOPK, N_EXPERTS))
     for t in (x, qr, q, kv):
         f.write(t.detach().float().contiguous().numpy().tobytes())
+    f.write(gx_t.contiguous().numpy().tobytes())
+    f.write(indices.to(torch.int32).contiguous().numpy().tobytes())
+    f.write(weights.float().contiguous().numpy().tobytes())
+    f.write(expert_out.float().contiguous().numpy().tobytes())
+print("bramka: pierwsze indeksy", indices[0].tolist(), "wagi", [round(v,4) for v in weights[0].tolist()])
 print(f"zapisano {out}: seq={SEQLEN} dim={dim} heads={n_heads} hd={head_dim} rope={rope_head_dim} ratio={ratio}")
 print("q  abs mean", q.abs().mean().item(), "kv abs mean", kv.abs().mean().item())
