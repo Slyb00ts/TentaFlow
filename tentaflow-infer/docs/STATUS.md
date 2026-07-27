@@ -12,6 +12,33 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ❌ **llama.cpp bije nas na Radeonie w prefillu hybrydowym: 7x na 0,8B i 26x
+  na 27B (2026-07-27).** Pierwsze porównanie na RX 7900 XT z llama.cpp
+  zbudowanym pod ROCm/gfx1100 (`ff067f76`). Qwen3.6-27B NVFP4 MTP, model w
+  całości w VRAM (20 067 z 20 464 MiB, GPU 100%):
+
+  | | FORGE | llama.cpp | |
+  |---|--:|--:|---|
+  | prefill p1024 | 27,3 tok/s | **716,3** | llama.cpp **26,2x** |
+  | decode, bez spekulacji | 9,5 tok/s | **33,0** | llama.cpp **3,5x** |
+  | decode, MTP po OBU stronach | 47,1 tok/s | **73,4** | llama.cpp **1,56x** |
+
+  qwen-guard 0,8B Q8_0 (ta sama architektura): prefill 2 647,6 wobec **18 480,9**
+  (llama.cpp 7,0x), decode **317,3** wobec 246,4 (FORGE 1,29x — jedyna wygrana).
+  PRZYCZYNA JEST JEDNA I STRUKTURALNA: prefill FORGE jest PŁASKI względem
+  długości promptu (27,3 przy p128, 27,5 przy p512, 27,3 przy p1024), czyli nie
+  amortyzuje odczytu wag — hybrydowy prefill layer-major stoi na `mma`/`ldmatrix`
+  i jest zabramkowany na `Vendor::Nvidia`, więc na AMD zostaje chunk T=16 i 1024
+  tokeny to 64 przebiegi po całych wagach. Ta sama bramka tłumaczy obie luki.
+  Potwierdzenie od drugiej strony: MTP daje w FORGE 4,96x (9,5 → 47,1), a
+  spekulacja mnoży przepustowość liniowo tylko przy dominującym STAŁYM narzucie
+  na krok. Model GĘSTY problemu nie ma (Bielik-7B NVFP4: 1 521 tok/s prefillu).
+  KIERUNEK: największą dźwignią na AMD nie są kolejne kernele WMMA, tylko zdjęcie
+  bramki `Vendor::Nvidia` z hybrydowego prefillu i przeniesienie ścieżki
+  layer-major na WMMA. Pomiary, metoda i zastrzeżenia:
+  `docs/BENCH_7900XT_LLAMACPP.md`.
+  UWAGA: to koryguje wcześniejszy przekaz „WMMA dało +58% prefillu" — to była
+  poprawa wobec NASZEGO kafla dot4, a nie dojście do konkurencji.
 - ✅ **Zasięg architektury w katalogu kerneli: kernel pod jedną kartę nie
   wywraca reszty (2026-07-27).** Do tej pory jedynym sposobem wyrażenia „ten
   kernel jest tylko dla NVIDII" było „nie kompiluje się", co MIESZA projekt z
