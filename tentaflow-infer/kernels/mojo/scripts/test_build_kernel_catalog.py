@@ -34,16 +34,31 @@ class KernelCatalogTest(unittest.TestCase):
             self.assertEqual((staged / "old.ptx").read_text(), "old")
 
     def test_catalog_matches_committed_manifest(self):
+        """KAZDY zbudowany katalog musi rownac sie zasiegowi swojej architektury.
+
+        Wczesniej sprawdzany byl tylko sm_89 i tylko przeciw CALEMU katalogowi;
+        odkad kernel moze byc zawezony do rodziny kart, kontraktem jest zbior
+        W ZASIEGU danej architektury, a sprawdzamy wszystkie zbudowane.
+        """
         kernels, _ = build_kernel_catalog.parse_catalog()
-        catalog_names = {artifact for _, _, artifact in kernels}
-        manifest_path = build_kernel_catalog.ROOT / "build" / "sm_89" / "manifest.json"
-        manifest_names = set(json.loads(manifest_path.read_text())["kernels"])
-        self.assertEqual(len(kernels), len(manifest_names))
-        self.assertEqual(catalog_names, manifest_names)
+        build_root = build_kernel_catalog.ROOT / "build"
+        checked = 0
+        for manifest_path in sorted(build_root.glob("*/manifest.json")):
+            manifest = json.loads(manifest_path.read_text())
+            arch = manifest["arch"]
+            self.assertEqual(arch, manifest_path.parent.name)
+            expected = {
+                artifact
+                for _, _, artifact, scope in kernels
+                if build_kernel_catalog.scope_allows(scope, arch)
+            }
+            self.assertEqual(expected, set(manifest["kernels"]), arch)
+            checked += 1
+        self.assertGreater(checked, 0, "brak zbudowanego katalogu do sprawdzenia")
 
     def test_optimized_artifacts_are_registered(self):
         kernels, _ = build_kernel_catalog.parse_catalog()
-        catalog_names = {artifact for _, _, artifact in kernels}
+        catalog_names = {artifact for _, _, artifact, _ in kernels}
         expected = {
             "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1",
             "gemm_nvfp4_gguf_mma_f16_bm128_bn128",
@@ -86,6 +101,88 @@ class KernelCatalogTest(unittest.TestCase):
             "deltanet_gated_scan_persistent_d128_f16",
         }
         self.assertTrue(expected <= catalog_names)
+
+
+class ArchScopeTest(unittest.TestCase):
+    """Zasieg architektury: co ma sie zbudowac na ktorej karcie.
+
+    To jest jedyne miejsce, w ktorym „kernel nie dla tej karty" jest odrozniane
+    od „kernel sie nie kompiluje", wiec regula musi byc przypieta testem.
+    """
+
+    def test_brak_deklaracji_znaczy_przenosny(self):
+        for arch in ("sm_89", "sm_121", "gfx1030", "gfx1100", "gfx1201"):
+            self.assertTrue(build_kernel_catalog.scope_allows(None, arch))
+
+    def test_producent_bez_wersji_obejmuje_cala_rodzine(self):
+        scope = ("nvidia",)
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_89"))
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_121"))
+        self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1100"))
+
+    def test_amd_porownuje_pokolenia_a_nie_pelne_numery(self):
+        # gfx1030 i gfx1036 to jedno pokolenie (RDNA2), gfx1100 to nastepne.
+        scope = ("amd:gfx11+",)
+        self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1030"))
+        self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1036"))
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1100"))
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1201"))
+
+    def test_zasieg_bez_plusa_jest_dokladny(self):
+        scope = ("amd:gfx11",)
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1100"))
+        self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1201"))
+
+    def test_nvidia_z_dolnym_progiem(self):
+        scope = ("nvidia:sm_89+",)
+        self.assertFalse(build_kernel_catalog.scope_allows(scope, "sm_80"))
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_89"))
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_121"))
+
+    def test_zasieg_moze_wymieniac_obie_rodziny(self):
+        scope = ("nvidia:sm_89+", "amd:gfx12+")
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_121"))
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1201"))
+        self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1100"))
+
+    def test_warianty_blackwella_z_litera_to_to_samo_pokolenie(self):
+        # `sm_121a` to sm_121 z instrukcjami zawezonymi do architektury —
+        # nadzbior, wiec w porzadkowaniu pokolen litera nic nie zmienia.
+        self.assertEqual(build_kernel_catalog.parse_arch("sm_121a"), ("nvidia", 121))
+        self.assertEqual(build_kernel_catalog.parse_arch("sm_120a"), ("nvidia", 120))
+        scope = ("nvidia:sm_89+",)
+        self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_121a"))
+
+    def test_nieznane_nazwy_architektur_sa_odrzucane_glosno(self):
+        # CDNA ma inny schemat numeracji; zgadnieta regula ustawilaby karty w
+        # zlej kolejnosci i zrobilaby to cicho.
+        for arch in ("gfx90a", "gfx942", "rdna3", "sm_", "gfx"):
+            with self.assertRaises(RuntimeError):
+                build_kernel_catalog.parse_arch(arch)
+
+    def test_zla_deklaracja_w_katalogu_konczy_parsowanie_bledem(self):
+        for text in (" ", " intel", " nvidia:gfx1100"):
+            with self.assertRaises(RuntimeError):
+                scope = build_kernel_catalog.parse_scope(text)
+                build_kernel_catalog.scope_allows(scope, "sm_89")
+
+    def test_katalog_daje_kazdej_karcie_wlasny_podzbior(self):
+        kernels, _ = build_kernel_catalog.parse_catalog()
+        counts = {
+            arch: sum(
+                1 for item in kernels if build_kernel_catalog.scope_allows(item[3], arch)
+            )
+            for arch in ("sm_89", "gfx1030", "gfx1100")
+        }
+        for arch, count in counts.items():
+            self.assertGreater(count, 0, arch)
+            # Gdyby ktoras karta dostawala CALY katalog, deklaracje przestalyby
+            # cokolwiek odsiewac i regresja bylaby niewidoczna.
+            self.assertLess(count, len(kernels), arch)
+        # WMMA jest wylacznie dla gfx11+, wiec RDNA2 ma go NIE dostac.
+        self.assertLess(counts["gfx1030"], counts["gfx1100"])
+        # Rodzina mma/FP8 jest wylacznie dla NVIDII.
+        self.assertGreater(counts["sm_89"], counts["gfx1100"])
 
 
 if __name__ == "__main__":

@@ -157,6 +157,12 @@ from src.gemv2 import (
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
 from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx, gemv_fp8_row_f16_v2
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
+from src.gemm_wmma import (
+    gemm_q8_0_wmma_64x128,
+    gemm_q8_0_wmma_out_f32_64x128,
+    gemm_q8_0_wmma_16x64,
+    gemm_q8_0_wmma_out_f32_16x64,
+)
 from src.gemm_dot import (
     gemm_f16_dot2_64x64,
     gemm_f16_dot2_128x64,
@@ -1299,26 +1305,31 @@ def main() raises:
         gemm_nvfp4_gguf_f16_b16, dump_asm=Path("gemm_nvfp4_gguf_f16_b16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_f16_b16"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_mma_f16_bm32,
         dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm32.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm32"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_mma_f16_bm128,
         dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_mma_f16_bm128_bn32,
         dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128_bn32.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128_bn32"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_mma_f16_bm128_prefetch,
         dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128_prefetch.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128_prefetch"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1,
         dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1.ptx"),
@@ -1326,6 +1337,7 @@ def main() raises:
     entries.append(
         _finalize(out_dir, "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1")
     )
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_gguf_mma_f16_bm128_bn128,
         dump_asm=Path("gemm_nvfp4_gguf_mma_f16_bm128_bn128.ptx"),
@@ -1340,11 +1352,13 @@ def main() raises:
         dump_asm=Path("gemv_nvfp4_tile128_coop_q8_1_f16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_tile128_coop_q8_1_f16"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_tile128_mma_f16_bm128_bn64,
         dump_asm=Path("gemm_nvfp4_tile128_mma_f16_bm128_bn64.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_tile128_mma_f16_bm128_bn64"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_tile128_mma_f16_bm128_bn128,
         dump_asm=Path("gemm_nvfp4_tile128_mma_f16_bm128_bn128.ptx"),
@@ -1375,11 +1389,13 @@ def main() raises:
         dump_asm=Path("gemv_batch_nvfp4_ct_s0_n64k128_f16_b16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemv_batch_nvfp4_ct_s0_n64k128_f16_b16"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_s0_f16_bm64,
         dump_asm=Path("gemm_nvfp4_ct_s0_f16_bm64.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_s0_f16_bm64"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_s0_f16_bm128,
         dump_asm=Path("gemm_nvfp4_ct_s0_f16_bm128.ptx"),
@@ -1404,98 +1420,118 @@ def main() raises:
         pack_nvfp4_ct_s0_fp8, dump_asm=Path("pack_nvfp4_ct_s0_fp8.ptx")
     ]()
     entries.append(_finalize(out_dir, "pack_nvfp4_ct_s0_fp8"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_qkv_m4,
         dump_asm=Path("gemm_nvfp4_ct_bm16_qkv_m4.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_qkv_m4"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_qkv_m8,
         dump_asm=Path("gemm_nvfp4_ct_bm16_qkv_m8.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_qkv_m8"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_qkv_m16,
         dump_asm=Path("gemm_nvfp4_ct_bm16_qkv_m16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_qkv_m16"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_o_m4, dump_asm=Path("gemm_nvfp4_ct_bm16_o_m4.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_o_m4"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_o_m8, dump_asm=Path("gemm_nvfp4_ct_bm16_o_m8.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_o_m8"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_o_m16, dump_asm=Path("gemm_nvfp4_ct_bm16_o_m16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_o_m16"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_gateup_m4,
         dump_asm=Path("gemm_nvfp4_ct_bm16_gateup_m4.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_gateup_m4"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_gateup_m8,
         dump_asm=Path("gemm_nvfp4_ct_bm16_gateup_m8.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_gateup_m8"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_gateup_m16,
         dump_asm=Path("gemm_nvfp4_ct_bm16_gateup_m16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_gateup_m16"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_down_m4,
         dump_asm=Path("gemm_nvfp4_ct_bm16_down_m4.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_down_m4"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_down_m8,
         dump_asm=Path("gemm_nvfp4_ct_bm16_down_m8.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_down_m8"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm16_down_m16,
         dump_asm=Path("gemm_nvfp4_ct_bm16_down_m16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm16_down_m16"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_qkv_m24,
         dump_asm=Path("gemm_nvfp4_ct_bm32_qkv_m24.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_qkv_m24"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_qkv_m32,
         dump_asm=Path("gemm_nvfp4_ct_bm32_qkv_m32.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_qkv_m32"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_o_m24,
         dump_asm=Path("gemm_nvfp4_ct_bm32_o_m24.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_o_m24"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_o_m32,
         dump_asm=Path("gemm_nvfp4_ct_bm32_o_m32.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_o_m32"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_gateup_m24,
         dump_asm=Path("gemm_nvfp4_ct_bm32_gateup_m24.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_gateup_m24"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_gateup_m32,
         dump_asm=Path("gemm_nvfp4_ct_bm32_gateup_m32.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_gateup_m32"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_down_m24,
         dump_asm=Path("gemm_nvfp4_ct_bm32_down_m24.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_ct_bm32_down_m24"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_ct_bm32_down_m32,
         dump_asm=Path("gemm_nvfp4_ct_bm32_down_m32.ptx"),
@@ -1692,6 +1728,7 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_fp8_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_f16, dump_asm=Path("gemm_q8_0_f16.ptx")
     ]()
@@ -1775,11 +1812,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_f16_exact_out_f32_b4"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_f16, dump_asm=Path("gemm_nvfp4_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[gemm_f16, dump_asm=Path("gemm_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemm_f16"))
     _ = ctx.compile_function[
@@ -1810,6 +1849,28 @@ def main() raises:
         gemm_q8_0_dot4_128x128, dump_asm=Path("gemm_q8_0_dot4_128x128.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_dot4_128x128"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_q8_0_wmma_64x128, dump_asm=Path("gemm_q8_0_wmma_64x128.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_wmma_64x128"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_q8_0_wmma_out_f32_64x128,
+        dump_asm=Path("gemm_q8_0_wmma_out_f32_64x128.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_wmma_out_f32_64x128"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_q8_0_wmma_16x64, dump_asm=Path("gemm_q8_0_wmma_16x64.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_wmma_16x64"))
+    # arch: amd:gfx11+
+    _ = ctx.compile_function[
+        gemm_q8_0_wmma_out_f32_16x64,
+        dump_asm=Path("gemm_q8_0_wmma_out_f32_16x64.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_wmma_out_f32_16x64"))
     _ = ctx.compile_function[
         gemm_q4_k_dot4_64x64, dump_asm=Path("gemm_q4_k_dot4_64x64.ptx")
     ]()
@@ -1876,46 +1937,55 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_0_dot4_out_f32_64x64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_f16_bm64, dump_asm=Path("gemm_q8_0_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_f16_bm64, dump_asm=Path("gemm_nvfp4_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_nvfp4_f16_bm32, dump_asm=Path("gemm_nvfp4_f16_bm32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_f16_bm32"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_f16_bm64, dump_asm=Path("gemm_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_f16_out_f32, dump_asm=Path("gemm_f16_out_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_f16_out_f32"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_f16_out_f32_bm64, dump_asm=Path("gemm_f16_out_f32_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_f16_out_f32_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_f16_out_f32_bm32, dump_asm=Path("gemm_f16_out_f32_bm32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_f16_out_f32_bm32"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_out_f32, dump_asm=Path("gemm_q8_0_out_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_out_f32"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_out_f32_bm64, dump_asm=Path("gemm_q8_0_out_f32_bm64.ptx")
     ]()
@@ -1970,6 +2040,7 @@ def main() raises:
         dump_asm=Path("attn_prefill_segmented_f16_hd256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_segmented_f16_hd256"))
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_segmented_f16_hd128,
         dump_asm=Path("attn_prefill_fa_segmented_f16_hd128.ptx"),
@@ -1982,12 +2053,14 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_device_pos_f16_hd256"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_mojo_f16_hd256,
         dump_asm=Path("attn_prefill_fa_mojo_f16_hd256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_fa_mojo_f16_hd256"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_mojo_device_pos_f16_hd256,
         dump_asm=Path("attn_prefill_fa_mojo_device_pos_f16_hd256.ptx"),
@@ -1996,6 +2069,7 @@ def main() raises:
         _finalize(out_dir, "attn_prefill_fa_mojo_device_pos_f16_hd256")
     )
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_mojo_device_pos_f16_hd256_bk32,
         dump_asm=Path("attn_prefill_fa_mojo_device_pos_f16_hd256_bk32.ptx"),
@@ -2004,18 +2078,21 @@ def main() raises:
         _finalize(out_dir, "attn_prefill_fa_mojo_device_pos_f16_hd256_bk32")
     )
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_mojo_f16_hd256_bk32,
         dump_asm=Path("attn_prefill_fa_mojo_f16_hd256_bk32.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_fa_mojo_f16_hd256_bk32"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_mojo_f16_hd256_vtrans,
         dump_asm=Path("attn_prefill_fa_mojo_f16_hd256_vtrans.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_fa_mojo_f16_hd256_vtrans"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_mojo_device_pos_f16_hd256_vtrans,
         dump_asm=Path("attn_prefill_fa_mojo_device_pos_f16_hd256_vtrans.ptx"),
@@ -2039,12 +2116,14 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_fp8_hd128"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_f16_hd64,
         dump_asm=Path("attn_prefill_fa_mojo_f16_hd64.ptx"),
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_fa_mojo_f16_hd64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         attn_prefill_fa_f16_hd128,
         dump_asm=Path("attn_prefill_fa_mojo_f16_hd128.ptx"),
@@ -2064,11 +2143,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_q4_k_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_k_f16, dump_asm=Path("gemm_q4_k_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_k_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_k_f16_bm64, dump_asm=Path("gemm_q4_k_f16_bm64.ptx")
     ]()
@@ -2079,38 +2160,45 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "quantize_act_q8_1"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_i8mma, dump_asm=Path("gemm_q8_0_i8mma.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_bm64, dump_asm=Path("gemm_q8_0_i8mma_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_big, dump_asm=Path("gemm_q8_0_i8mma_big.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_big"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_triplet_bm64,
         dump_asm=Path("gemm_q8_0_i8mma_triplet_bm64.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_triplet_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_triplet_single_bm64,
         dump_asm=Path("gemm_q8_0_i8mma_triplet_single_bm64.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_triplet_single_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_triplet_single_big,
         dump_asm=Path("gemm_q8_0_i8mma_triplet_single_big.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_triplet_single_big"))
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_triplet_single_big_poststage,
         dump_asm=Path("gemm_q8_0_i8mma_triplet_single_big_poststage.ptx"),
@@ -2119,16 +2207,19 @@ def main() raises:
         _finalize(out_dir, "gemm_q8_0_i8mma_triplet_single_big_poststage")
     )
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_k_i8mma, dump_asm=Path("gemm_q4_k_i8mma.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_k_i8mma"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_k_i8mma_bm64, dump_asm=Path("gemm_q4_k_i8mma_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_k_i8mma_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_k_i8mma_big, dump_asm=Path("gemm_q4_k_i8mma_big.ptx")
     ]()
@@ -2252,11 +2343,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_q6_k_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q6_k_f16, dump_asm=Path("gemm_q6_k_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q6_k_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q6_k_f16_bm64, dump_asm=Path("gemm_q6_k_f16_bm64.ptx")
     ]()
@@ -2678,71 +2771,85 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_q5_1_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q5_k_f16, dump_asm=Path("gemm_q5_k_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q5_k_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q5_k_f16_bm64, dump_asm=Path("gemm_q5_k_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q5_k_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q3_k_f16, dump_asm=Path("gemm_q3_k_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q3_k_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q3_k_f16_bm64, dump_asm=Path("gemm_q3_k_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q3_k_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q2_k_f16, dump_asm=Path("gemm_q2_k_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q2_k_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q2_k_f16_bm64, dump_asm=Path("gemm_q2_k_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q2_k_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_0_f16, dump_asm=Path("gemm_q4_0_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_0_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_0_f16_bm64, dump_asm=Path("gemm_q4_0_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_0_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_1_f16, dump_asm=Path("gemm_q4_1_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_1_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4_1_f16_bm64, dump_asm=Path("gemm_q4_1_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_1_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q5_0_f16, dump_asm=Path("gemm_q5_0_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q5_0_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q5_0_f16_bm64, dump_asm=Path("gemm_q5_0_f16_bm64.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q5_0_f16_bm64"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q5_1_f16, dump_asm=Path("gemm_q5_1_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q5_1_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q5_1_f16_bm64, dump_asm=Path("gemm_q5_1_f16_bm64.ptx")
     ]()
@@ -2863,11 +2970,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq4_nl_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq4_nl_f16, dump_asm=Path("gemm_iq4_nl_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq4_nl_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq4_nl_f16_bm64, dump_asm=Path("gemm_iq4_nl_f16_bm64.ptx")
     ]()
@@ -2899,11 +3008,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq4_xs_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq4_xs_f16, dump_asm=Path("gemm_iq4_xs_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq4_xs_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq4_xs_f16_bm64, dump_asm=Path("gemm_iq4_xs_f16_bm64.ptx")
     ]()
@@ -2935,11 +3046,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_mxfp4_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_mxfp4_gguf_f16, dump_asm=Path("gemm_mxfp4_gguf_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_mxfp4_gguf_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_mxfp4_gguf_f16_bm64, dump_asm=Path("gemm_mxfp4_gguf_f16_bm64.ptx")
     ]()
@@ -2970,11 +3083,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq2_xs_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq2_xs_f16, dump_asm=Path("gemm_iq2_xs_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq2_xs_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq2_xs_f16_bm64, dump_asm=Path("gemm_iq2_xs_f16_bm64.ptx")
     ]()
@@ -3006,11 +3121,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq2_s_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq2_s_f16, dump_asm=Path("gemm_iq2_s_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq2_s_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq2_s_f16_bm64, dump_asm=Path("gemm_iq2_s_f16_bm64.ptx")
     ]()
@@ -3041,11 +3158,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq3_s_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq3_s_f16, dump_asm=Path("gemm_iq3_s_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq3_s_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq3_s_f16_bm64, dump_asm=Path("gemm_iq3_s_f16_bm64.ptx")
     ]()
@@ -3076,11 +3195,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq2_xxs_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq2_xxs_f16, dump_asm=Path("gemm_iq2_xxs_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq2_xxs_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq2_xxs_f16_bm64, dump_asm=Path("gemm_iq2_xxs_f16_bm64.ptx")
     ]()
@@ -3113,11 +3234,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq3_xxs_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq3_xxs_f16, dump_asm=Path("gemm_iq3_xxs_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq3_xxs_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq3_xxs_f16_bm64, dump_asm=Path("gemm_iq3_xxs_f16_bm64.ptx")
     ]()
@@ -3150,11 +3273,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq1_s_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq1_s_f16, dump_asm=Path("gemm_iq1_s_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq1_s_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq1_s_f16_bm64, dump_asm=Path("gemm_iq1_s_f16_bm64.ptx")
     ]()
@@ -3185,11 +3310,13 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_iq1_m_out_f32_v2"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq1_m_f16, dump_asm=Path("gemm_iq1_m_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_iq1_m_f16"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_iq1_m_f16_bm64, dump_asm=Path("gemm_iq1_m_f16_bm64.ptx")
     ]()
@@ -3241,199 +3368,234 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "quantize_act_fp8"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[gemm_fp8_f16, dump_asm=Path("gemm_fp8_f16.ptx")]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_f16"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_f16_bm64, dump_asm=Path("gemm_fp8_f16_bm64.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_f16_bm64"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_f16_big, dump_asm=Path("gemm_fp8_f16_big.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_f16_big"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_4096_4096, dump_asm=Path("gemm_fp8_mod_4096_4096.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_4096"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_1024_4096, dump_asm=Path("gemm_fp8_mod_1024_4096.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_1024_4096"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_14336_4096, dump_asm=Path("gemm_fp8_mod_14336_4096.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_14336_4096"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_4096_14336, dump_asm=Path("gemm_fp8_mod_4096_14336.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_14336"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_11264_4096, dump_asm=Path("gemm_fp8_mod_11264_4096.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_11264_4096"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_4096_11264, dump_asm=Path("gemm_fp8_mod_4096_11264.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_11264"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_4096_4096_bn256,
         dump_asm=Path("gemm_fp8_mod_4096_4096_bn256.ptx"),
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_4096_bn256"))
 
+    # arch: nvidia:sm_89+
     _ = ctx.compile_function[
         gemm_fp8_mod_11264_4096_bn256,
         dump_asm=Path("gemm_fp8_mod_11264_4096_bn256.ptx"),
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_11264_4096_bn256"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_4096_m128,
         dump_asm=Path("gemm_q4k_i8_native_4096_4096_m128.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_4096_m128"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_4096_m256,
         dump_asm=Path("gemm_q4k_i8_native_4096_4096_m256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_4096_m256"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_4096_m512,
         dump_asm=Path("gemm_q4k_i8_native_4096_4096_m512.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_4096_m512"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_4096_m1024,
         dump_asm=Path("gemm_q4k_i8_native_4096_4096_m1024.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_4096_m1024"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_4096_m2048,
         dump_asm=Path("gemm_q4k_i8_native_4096_4096_m2048.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_4096_m2048"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_4096_m4096,
         dump_asm=Path("gemm_q4k_i8_native_4096_4096_m4096.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_4096_m4096"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_1024_4096_m128,
         dump_asm=Path("gemm_q4k_i8_native_1024_4096_m128.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_1024_4096_m128"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_1024_4096_m256,
         dump_asm=Path("gemm_q4k_i8_native_1024_4096_m256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_1024_4096_m256"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_1024_4096_m512,
         dump_asm=Path("gemm_q4k_i8_native_1024_4096_m512.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_1024_4096_m512"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_1024_4096_m1024,
         dump_asm=Path("gemm_q4k_i8_native_1024_4096_m1024.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_1024_4096_m1024"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_1024_4096_m2048,
         dump_asm=Path("gemm_q4k_i8_native_1024_4096_m2048.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_1024_4096_m2048"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_1024_4096_m4096,
         dump_asm=Path("gemm_q4k_i8_native_1024_4096_m4096.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_1024_4096_m4096"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_14336_4096_m128,
         dump_asm=Path("gemm_q4k_i8_native_14336_4096_m128.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_14336_4096_m128"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_14336_4096_m256,
         dump_asm=Path("gemm_q4k_i8_native_14336_4096_m256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_14336_4096_m256"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_14336_4096_m512,
         dump_asm=Path("gemm_q4k_i8_native_14336_4096_m512.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_14336_4096_m512"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_14336_4096_m1024,
         dump_asm=Path("gemm_q4k_i8_native_14336_4096_m1024.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_14336_4096_m1024"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_14336_4096_m2048,
         dump_asm=Path("gemm_q4k_i8_native_14336_4096_m2048.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_14336_4096_m2048"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_14336_4096_m4096,
         dump_asm=Path("gemm_q4k_i8_native_14336_4096_m4096.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_14336_4096_m4096"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_14336_m128,
         dump_asm=Path("gemm_q4k_i8_native_4096_14336_m128.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_14336_m128"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_14336_m256,
         dump_asm=Path("gemm_q4k_i8_native_4096_14336_m256.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_14336_m256"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_14336_m512,
         dump_asm=Path("gemm_q4k_i8_native_4096_14336_m512.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_14336_m512"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_14336_m1024,
         dump_asm=Path("gemm_q4k_i8_native_4096_14336_m1024.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_14336_m1024"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_14336_m2048,
         dump_asm=Path("gemm_q4k_i8_native_4096_14336_m2048.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemm_q4k_i8_native_4096_14336_m2048"))
 
+    # arch: nvidia
     _ = ctx.compile_function[
         gemm_q4k_i8_native_4096_14336_m4096,
         dump_asm=Path("gemm_q4k_i8_native_4096_14336_m4096.ptx"),

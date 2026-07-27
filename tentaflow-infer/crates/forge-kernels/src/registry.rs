@@ -651,6 +651,10 @@ const EMBEDDED_GFX1100: &[EmbeddedArtifact] = embedded_arch!["gfx1100", ".hsaco"
     "gemm_q8_0_i8mma_b8",
     "gemm_q8_0_i8mma_out_f32_b3",
     "gemm_q8_0_i8mma_out_f32_b4",
+    "gemm_q8_0_wmma_16x64",
+    "gemm_q8_0_wmma_64x128",
+    "gemm_q8_0_wmma_out_f32_16x64",
+    "gemm_q8_0_wmma_out_f32_64x128",
     "gemv_batch_f16_out_f32_b4",
     "gemv_batch_f16_out_f32_b8",
     "gemv_batch_nvfp4_ct_s0_n64k128_f16_b16",
@@ -1386,6 +1390,68 @@ fn supports_sm89_cubin(arch: &str) -> bool {
     arch == "sm_89"
 }
 
+/// Jeden zbudowany katalog. Dołożenie karty to JEDEN wiersz w `EMBEDDED_SETS`
+/// plus lista artefaktów z `sync_embedded_arch.py`.
+struct EmbeddedSet {
+    arch: &'static str,
+    manifest: &'static str,
+    artifacts: &'static [EmbeddedArtifact],
+    /// Nazwa stałej w komunikacie o rozjeździe z manifestem.
+    name: &'static str,
+}
+
+const EMBEDDED_SETS: &[EmbeddedSet] = &[
+    EmbeddedSet {
+        arch: "gfx1030",
+        manifest: EMBEDDED_MANIFEST_GFX1030,
+        artifacts: EMBEDDED_GFX1030,
+        name: "EMBEDDED_GFX1030",
+    },
+    EmbeddedSet {
+        arch: "gfx1100",
+        manifest: EMBEDDED_MANIFEST_GFX1100,
+        artifacts: EMBEDDED_GFX1100,
+        name: "EMBEDDED_GFX1100",
+    },
+    EmbeddedSet {
+        arch: "sm_89",
+        manifest: EMBEDDED_MANIFEST,
+        artifacts: EMBEDDED_SM89,
+        name: "EMBEDDED_SM89",
+    },
+];
+
+/// Numer pokolenia NVIDII (`sm_89` → 89). AMD celowo NIE ma odpowiednika: patrz
+/// `select_embedded_set`.
+fn nvidia_capability(arch: &str) -> Option<u32> {
+    arch.strip_prefix("sm_")?.parse().ok()
+}
+
+/// Wybiera zestaw artefaktów dla karty.
+///
+/// Rodziny różnią się TYM, czym są artefakty, więc muszą różnić się regułą:
+/// NVIDIA dostaje przenośny PTX, który sterownik kompiluje JIT dla bieżącej
+/// karty, więc zestaw zbudowany dla STARSZEJ architektury działa na nowszej —
+/// bez tego GB10 (sm_121) nie wczytałby niczego, mając komplet gotowych
+/// artefaktów sm_89. AMD dostaje gotowe code objecty (HSACO) związane z
+/// konkretnym ISA, więc tu jedynym poprawnym dopasowaniem jest DOKŁADNE; „prawie
+/// pasujący" zestaw nie wczytałby się albo, gorzej, policzył co innego.
+fn select_embedded_set(arch: &str, vendor: forge_types::Vendor) -> Option<&'static EmbeddedSet> {
+    if let Some(exact) = EMBEDDED_SETS.iter().find(|set| set.arch == arch) {
+        return Some(exact);
+    }
+    if vendor != forge_types::Vendor::Nvidia {
+        return None;
+    }
+    let device_capability = nvidia_capability(arch)?;
+    EMBEDDED_SETS
+        .iter()
+        .filter(|set| {
+            nvidia_capability(set.arch).is_some_and(|built| built <= device_capability)
+        })
+        .max_by_key(|set| nvidia_capability(set.arch).unwrap_or(0))
+}
+
 fn resolve_artifact_path(arch_dir: &Path, file: &str) -> Result<PathBuf> {
     let relative = Path::new(file);
     if relative.as_os_str().is_empty()
@@ -1437,37 +1503,26 @@ impl KernelArtifacts {
         // Każda architektura ma własny wkompilowany zestaw. Brak zestawu jest
         // błędem z instrukcją, a nie nieczytelnym błędem ładowania modułu ze
         // sterownika.
-        let (manifest_src, set, set_name) = match arch {
-            "gfx1030" => (
-                EMBEDDED_MANIFEST_GFX1030,
-                EMBEDDED_GFX1030,
-                "EMBEDDED_GFX1030",
-            ),
-            "gfx1100" => (
-                EMBEDDED_MANIFEST_GFX1100,
-                EMBEDDED_GFX1100,
-                "EMBEDDED_GFX1100",
-            ),
-            _ if device.caps().vendor == forge_types::Vendor::Nvidia => {
-                (EMBEDDED_MANIFEST, EMBEDDED_SM89, "EMBEDDED_SM89")
-            }
-            _ => {
-                return Err(ForgeError::Kernel(format!(
-                    "brak wkompilowanych artefaktów dla {arch}; zbuduj katalog \
-                     kerneli dla tej architektury i wskaż go w FORGE_KERNEL_DIR"
-                )))
-            }
-        };
+        let selected = select_embedded_set(arch, device.caps().vendor).ok_or_else(|| {
+            ForgeError::Kernel(format!(
+                "brak wkompilowanych artefaktów dla {arch}; zbuduj katalog \
+                 kerneli dla tej architektury (scripts/build_kernel_catalog.py), \
+                 wpisz listę przez scripts/sync_embedded_arch.py i dopisz wiersz \
+                 do EMBEDDED_SETS — albo wskaż gotowy katalog w FORGE_KERNEL_DIR"
+            ))
+        })?;
+        let (manifest_src, set, set_name) =
+            (selected.manifest, selected.artifacts, selected.name);
         // Przenośny PTX Mojo ma `.target sm_80`, a sterownik JIT kompiluje go
         // dla bieżącej karty. Moduły z `.target sm_89` wymagają Ada lub nowszej
         // architektury, natomiast cubiny SASS są ładowane tylko na dokładnym sm_89.
         let ada = device.caps().fp8_native;
         let manifest: Manifest = serde_json::from_str(manifest_src)
             .map_err(|e| ForgeError::Kernel(format!("embedded manifest parse: {e}")))?;
-        if manifest.arch != arch {
+        if manifest.arch != selected.arch {
             return Err(ForgeError::Kernel(format!(
-                "wkompilowany manifest opisuje {}, a urządzenie zgłasza {arch}",
-                manifest.arch
+                "wkompilowany manifest opisuje {}, a zestaw {set_name} deklaruje {}",
+                manifest.arch, selected.arch
             )));
         }
         let mut handles = HashMap::new();
@@ -1590,7 +1645,62 @@ impl KernelArtifacts {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sm89_only, resolve_artifact_path, supports_sm89_cubin, EMBEDDED_SM89};
+    use super::{
+        is_sm89_only, resolve_artifact_path, select_embedded_set, supports_sm89_cubin,
+        EMBEDDED_SETS, EMBEDDED_SM89,
+    };
+    use forge_types::Vendor;
+
+    /// PTX jest przenośny w górę, więc karta NVIDII nowsza od zbudowanego
+    /// zestawu ma go dostać. Bez tego GB10 (sm_121) nie wczytywał NICZEGO, mimo
+    /// kompletu gotowych artefaktów sm_89 — sam warunek równości architektur
+    /// odrzucał je na wejściu.
+    #[test]
+    fn nvidia_dostaje_najwyzszy_zestaw_nie_nowszy_od_karty() {
+        for arch in ["sm_89", "sm_90", "sm_120", "sm_121"] {
+            let set = select_embedded_set(arch, Vendor::Nvidia)
+                .unwrap_or_else(|| panic!("brak zestawu dla {arch}"));
+            assert_eq!(set.arch, "sm_89", "{arch}");
+        }
+        // Karta STARSZA od jedynego zbudowanego zestawu nie dostaje niczego —
+        // sm_89 PTX z instrukcjami Ady nie uruchomi się na sm_80.
+        assert!(select_embedded_set("sm_80", Vendor::Nvidia).is_none());
+    }
+
+    /// HSACO jest związany z konkretnym ISA, więc dla AMD jedynym poprawnym
+    /// dopasowaniem jest dokładne — „prawie pasujący" zestaw albo się nie
+    /// wczyta, albo policzy co innego.
+    #[test]
+    fn amd_wymaga_dokladnej_architektury() {
+        assert_eq!(
+            select_embedded_set("gfx1030", Vendor::Amd).map(|set| set.arch),
+            Some("gfx1030")
+        );
+        assert_eq!(
+            select_embedded_set("gfx1100", Vendor::Amd).map(|set| set.arch),
+            Some("gfx1100")
+        );
+        // RDNA4 dostanie własny zestaw dopiero po zbudowaniu katalogu na tej
+        // karcie; do tego czasu ma być czytelny błąd, a nie cudzy code object.
+        assert!(select_embedded_set("gfx1201", Vendor::Amd).is_none());
+        assert!(select_embedded_set("gfx90a", Vendor::Amd).is_none());
+    }
+
+    #[test]
+    fn kazdy_zestaw_ma_manifest_swojej_architektury() {
+        assert!(!EMBEDDED_SETS.is_empty());
+        for set in EMBEDDED_SETS {
+            let manifest: super::Manifest = serde_json::from_str(set.manifest)
+                .unwrap_or_else(|e| panic!("manifest {}: {e}", set.arch));
+            assert_eq!(manifest.arch, set.arch, "{}", set.name);
+            let embedded: std::collections::HashSet<&str> =
+                set.artifacts.iter().map(|a| a.name).collect();
+            let declared: std::collections::HashSet<&str> =
+                manifest.kernels.keys().map(String::as_str).collect();
+            assert_eq!(embedded, declared, "{} rozjechal sie z manifestem", set.name);
+        }
+    }
+
 
     const PORTABLE_RAW_NVFP4: &[&str] = &[
         "gemv_nvfp4_gguf_f16",

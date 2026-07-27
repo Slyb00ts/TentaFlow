@@ -27,15 +27,98 @@ SILENT_ASM_MARKER = "unknown asm constraint"
 RENAME_EXCHANGE = 2
 
 
+# --- Zasięg architektury -----------------------------------------------------
+#
+# Część kerneli istnieje TYLKO na jednej rodzinie kart: `mma`/`ldmatrix` to
+# NVIDIA, WMMA to RDNA3+, FP8 to Ada+ i RDNA4+. Bez jawnej deklaracji jedynym
+# sposobem wyrażenia tego było „nie kompiluje się", co miesza dwie zupełnie
+# różne rzeczy — kernel NIE DLA TEJ KARTY z kernelem, który powinien działać, a
+# nie działa. Pierwsze jest projektem, drugie usterką.
+#
+# Deklaracja stoi przy rejestracji kernela w katalogu:
+#
+#     # arch: amd:gfx11+
+#     _ = ctx.compile_function[
+#         gemm_q8_0_wmma_64x128, dump_asm=Path("gemm_q8_0_wmma_64x128.ptx"),
+#     ]()
+#
+# Gramatyka: lista rozdzielona przecinkami, człon to `vendor` albo
+# `vendor:arch` z opcjonalnym `+` (ta architektura i nowsze). Brak komentarza
+# znaczy PRZENOŚNY — kernel musi się zbudować wszędzie.
+SCOPE_MARKER = "# arch:"
+
+
+def parse_arch(arch):
+    """Nazwa architektury na porównywalną parę (producent, pokolenie).
+
+    NVIDIA numeruje liniowo (`sm_89` < `sm_121`), więc pokoleniem jest po prostu
+    liczba. AMD nazywa karty `gfx<pokolenie><wariant>`, gdzie wariant to dwie
+    ostatnie cyfry: gfx1030 i gfx1036 to to samo RDNA2, a gfx1100 to RDNA3.
+    Skrócona forma `gfx11` NAZYWA POKOLENIE i tak jest tu przyjmowana.
+
+    Świadomie NIE obsługujemy tu nazw CDNA (`gfx90a`, `gfx942`) — mają inny
+    schemat numeracji, nie ma na czym tego sprawdzić, a zgadnięta reguła
+    porządkowałaby karty źle i cicho.
+    """
+    if arch.startswith("sm_"):
+        # Blackwell nazywa warianty z instrukcjami zawężonymi do architektury
+        # `sm_120a`/`sm_121a`. To NADZBIÓR odpowiedniego `sm_NNN`, więc do
+        # porządkowania pokoleń litera jest bez znaczenia.
+        digits = arch[3:].rstrip("abcdef")
+        if digits.isdigit():
+            return "nvidia", int(digits)
+    if arch.startswith("gfx") and arch[3:].isdigit():
+        digits = arch[3:]
+        if len(digits) == 2:
+            return "amd", int(digits)
+        if len(digits) == 4:
+            return "amd", int(digits[:2])
+    raise RuntimeError(f"nieobslugiwana nazwa architektury: {arch}")
+
+
+def scope_allows(scope, arch):
+    """Czy kernel o tym zasięgu należy zbudować dla `arch`."""
+    if scope is None:
+        return True
+    vendor, generation = parse_arch(arch)
+    for term in scope:
+        term_vendor, _, bound = term.partition(":")
+        if term_vendor != vendor:
+            continue
+        if not bound:
+            return True
+        newer_too = bound.endswith("+")
+        bound_vendor, bound_generation = parse_arch(bound.rstrip("+"))
+        if bound_vendor != vendor:
+            raise RuntimeError(f"zasieg {term} miesza rodziny kart")
+        if generation == bound_generation or (newer_too and generation > bound_generation):
+            return True
+    return False
+
+
+def parse_scope(text):
+    terms = [term.strip() for term in text.split(",") if term.strip()]
+    if not terms:
+        raise RuntimeError("pusta deklaracja zasiegu architektury")
+    for term in terms:
+        vendor = term.partition(":")[0]
+        if vendor not in ("nvidia", "amd"):
+            raise RuntimeError(f"nieznany producent w zasiegu: {term}")
+    return tuple(terms)
+
+
 def parse_catalog():
     lines = CATALOG.read_text().splitlines()
     imports = {}
     kernels = []
     portable_nvfp4 = set()
+    pending_scope = None
     index = 0
     while index < len(lines):
         stripped = lines[index].strip()
-        if stripped.startswith("from src."):
+        if stripped.startswith(SCOPE_MARKER):
+            pending_scope = parse_scope(stripped[len(SCOPE_MARKER) :])
+        elif stripped.startswith("from src."):
             module, separator, imported = stripped.partition(" import ")
             if not separator:
                 raise RuntimeError(f"niepoprawny import w linii {index + 1}")
@@ -71,27 +154,28 @@ def parse_catalog():
             artifact = tail[1:].partition('.ptx"')[0]
             if not artifact:
                 raise RuntimeError(f"pusty dump_asm dla {symbol.strip()}")
-            kernels.append((symbol.strip(), artifact))
+            kernels.append((symbol.strip(), artifact, pending_scope))
+            pending_scope = None
         elif stripped.startswith('or name == "') or stripped.startswith('name == "'):
             portable_nvfp4.add(stripped.partition('name == "')[2].partition('"')[0])
         index += 1
 
     resolved_kernels = []
-    for symbol, artifact in kernels:
+    for symbol, artifact, scope in kernels:
         module = imports.get(symbol)
         if module is None:
             raise RuntimeError(f"brak importu dla {symbol}")
-        resolved_kernels.append((module, symbol, artifact))
+        resolved_kernels.append((module, symbol, artifact, scope))
     if not resolved_kernels:
         raise RuntimeError("katalog nie zawiera kerneli")
-    if len({artifact for _, _, artifact in resolved_kernels}) != len(resolved_kernels):
+    if len({artifact for _, _, artifact, _ in resolved_kernels}) != len(resolved_kernels):
         raise RuntimeError("katalog zawiera powtorzone nazwy artefaktow")
     return resolved_kernels, portable_nvfp4
 
 
 def chunk_kernels(kernels):
     grouped = defaultdict(list)
-    for module, symbol, artifact in kernels:
+    for module, symbol, artifact, _ in kernels:
         grouped[module].append((symbol, artifact))
     for module in sorted(grouped):
         items = grouped[module]
@@ -280,7 +364,7 @@ def publish_arch(staged_arch, destination):
         raise OSError(error, os.strerror(error), destination)
 
 
-def compile_catalog(kernels, portable_nvfp4):
+def compile_catalog(kernels, portable_nvfp4, expected_arch):
     mojo = shutil.which("mojo")
     if mojo is None:
         raise RuntimeError("brak kompilatora mojo w PATH")
@@ -401,6 +485,15 @@ def compile_catalog(kernels, portable_nvfp4):
                         file_name = dump_path.name
                         entry = entry_from_ptx(text, artifact)
                         writer = lambda target, text=text: target.write_text(text)
+                    # Zasięg odsiał kernele na podstawie architektury WYKRYTEJ
+                    # przed kompilacją. Gdyby kompilator celował gdzie indziej,
+                    # zbudowałby się zestaw dla innej karty niż deklarowany —
+                    # cicho i z poprawnym manifestem.
+                    if arch != expected_arch:
+                        raise RuntimeError(
+                            f"wykryto architekture {expected_arch}, a kompilator "
+                            f"zbudowal {arch} ({artifact})"
+                        )
                     if manifest is None:
                         manifest = {"arch": arch, "kernels": {}}
                     elif manifest["arch"] != arch:
@@ -489,18 +582,59 @@ def compile_catalog(kernels, portable_nvfp4):
             print(f"zapisano {len(kernels)} kerneli: {destination / 'manifest.json'}")
 
 
+ARCH_PROBE = """from std.gpu.host import DeviceContext
+
+
+def main() raises:
+    var ctx = DeviceContext()
+    print(ctx.arch_name())
+"""
+
+
+def detect_arch():
+    """Nazwa architektury lokalnego akceleratora, ZANIM cokolwiek się zbuduje.
+
+    Zasięg musi odsiać kernele przed kompilacją, a nie po niej — inaczej
+    „nie dla tej karty" byłoby nie do odróżnienia od błędu kompilacji, czyli
+    wróciłby dokładnie ten problem, który zasięg rozwiązuje.
+    """
+    override = os.environ.get("FORGE_KERNEL_BUILD_ARCH", "").strip()
+    if override:
+        return override
+    mojo = shutil.which("mojo")
+    if mojo is None:
+        raise RuntimeError("brak kompilatora mojo w PATH")
+    with tempfile.TemporaryDirectory(prefix="forge-arch-") as work:
+        probe = Path(work) / "arch_probe.mojo"
+        probe.write_text(ARCH_PROBE)
+        result = subprocess.run(
+            [mojo, "run", str(probe)], capture_output=True, text=True, cwd=work
+        )
+    if result.returncode != 0:
+        raise RuntimeError(f"wykrycie architektury nie powiodlo sie: {result.stderr}")
+    arch = result.stdout.strip().splitlines()[-1].strip()
+    parse_arch(arch)
+    return arch
+
+
 def main():
     kernels, portable_nvfp4 = parse_catalog()
+    arch = detect_arch()
+    in_scope = [item for item in kernels if scope_allows(item[3], arch)]
+    skipped = len(kernels) - len(in_scope)
+    if skipped:
+        print(f"{arch}: pomijam {skipped} kerneli spoza zasiegu architektury")
+    kernels = in_scope
     only = os.environ.get("FORGE_KERNEL_BUILD_ONLY", "").strip()
     if only:
         wanted = {name.strip() for name in only.split(",") if name.strip()}
-        selected = [item for item in kernels if item[1] in wanted]
-        missing = wanted - {item[1] for item in selected}
+        selected = [item for item in kernels if item[2] in wanted]
+        missing = wanted - {item[2] for item in selected}
         if missing:
             raise RuntimeError(f"katalog nie zna kerneli: {sorted(missing)}")
         print(f"tryb przyrostowy: {len(selected)} z {len(kernels)} kerneli")
         kernels = selected
-    compile_catalog(kernels, portable_nvfp4)
+    compile_catalog(kernels, portable_nvfp4, arch)
 
 
 if __name__ == "__main__":
