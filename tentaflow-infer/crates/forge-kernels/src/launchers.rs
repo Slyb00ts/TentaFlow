@@ -4644,6 +4644,43 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `gemv_nvfp4_gguf_f16` na wierszach wskazanych przesunięciami bajtowymi —
+    /// ścieżka MoE liczy projekcje token po tokenie wewnątrz większych buforów.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_nvfp4_gguf_f16_at(
+        &self,
+        y: &DevBuffer,
+        y_off: usize,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        x_off: usize,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) || !output_scale.is_finite() {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_nvfp4_gguf_f16_at wymaga rows > 0, cols % 64 == 0 i skończonej skali; rows={rows}, cols={cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_nvfp4_gguf_f16")?;
+        let cfg = LaunchConfig {
+            grid: (u32::try_from(rows).map_err(|_| {
+                ForgeError::Kernel("gemv_nvfp4_gguf_f16_at: za dużo wierszy".into())
+            })?, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(y, y_off)?
+            .buf(weights)
+            .buf_at(x, x_off)?
+            .scalar(cols as i64)
+            .scalar(output_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Wykonuje pojedynczą projekcję F16 tą samą matematyką co NVIDIA B3/B4.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_nvfp4_gguf_b1_f16(
@@ -6051,6 +6088,28 @@ impl Kernels {
             .buf_at(acc, acc_off)?
             .buf_at(src, src_off)?
             .scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// SwiGLU z niesymetrycznym obcięciem: bramka ograniczana tylko od góry,
+    /// wejście obustronnie, oba przed mnożeniem.
+    pub fn swiglu_limit_f16(
+        &self,
+        out: &DevBuffer,
+        gate: &DevBuffer,
+        up: &DevBuffer,
+        n: usize,
+        limit: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("swiglu_limit_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(gate)
+            .buf(up)
+            .scalar(n as i64)
+            .scalar(limit);
         self.device.launch(k, &cfg, &args, stream)
     }
 

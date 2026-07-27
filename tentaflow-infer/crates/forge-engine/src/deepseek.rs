@@ -20,7 +20,8 @@ use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 use half::f16;
 
-use crate::weights::{CompressorWeights, DeepseekAttnWeights, DevWeight};
+use crate::moe_residency::ExpertStack;
+use crate::weights::{CompressorWeights, DeepseekAttnWeights, DevWeight, MoeFfn};
 
 /// Geometria warstwy potrzebna przebiegowi. W tej architekturze różni się
 /// między warstwami: stopień kompresji i obecność indeksera zależą od numeru.
@@ -165,6 +166,23 @@ fn gemv_row(
         DevWeight::F16 { buf, rows, cols } => {
             kernels.gemv_f16_at(y, y_off, buf, x, x_off, *rows, *cols, stream)
         }
+        DevWeight::NvFp4Gguf {
+            buf,
+            output_scale,
+            rows,
+            cols,
+            ..
+        } => kernels.gemv_nvfp4_gguf_f16_at(
+            y,
+            y_off,
+            buf,
+            x,
+            x_off,
+            *rows,
+            *cols,
+            *output_scale,
+            stream,
+        ),
         other => Err(ForgeError::Unsupported(format!(
             "ścieżka DeepSeeka nie obsługuje wagi {:?}",
             std::mem::discriminant(other)
@@ -721,4 +739,224 @@ fn index_topk(
             order
         })
         .collect())
+}
+
+/// Geometria warstwy FFN.
+#[derive(Clone, Copy, Debug)]
+pub struct DeepseekFfnShape {
+    pub hidden: usize,
+    pub moe_inter: usize,
+    pub n_experts_used: usize,
+    pub route_scale: f32,
+    /// Górne (a dla wejścia obustronne) obcięcie SwiGLU. Ta architektura zawsze
+    /// je deklaruje, więc brak wartości dodatniej oznacza błędną konfigurację.
+    pub swiglu_limit: f32,
+}
+
+/// Bufory ścieżki FFN.
+pub struct DeepseekFfnBufs {
+    ids: DevBuffer,
+    weights: DevBuffer,
+    gate: DevBuffer,
+    up: DevBuffer,
+    act: DevBuffer,
+    expert_out: DevBuffer,
+    max_tokens: usize,
+}
+
+impl DeepseekFfnBufs {
+    pub fn new(
+        device: &dyn Device,
+        shape: &DeepseekFfnShape,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let f16b = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        let f32b = |elems: usize| device.alloc(elems * 4, MemKind::Device, Pool::Activations);
+        Ok(Self {
+            ids: f32b(max_tokens * shape.n_experts_used)?,
+            weights: f32b(max_tokens * shape.n_experts_used)?,
+            gate: f16b(shape.moe_inter)?,
+            up: f16b(shape.moe_inter)?,
+            act: f16b(shape.moe_inter)?,
+            expert_out: f16b(shape.hidden)?,
+            max_tokens,
+        })
+    }
+}
+
+/// Jeden ekspert SwiGLU na jednym tokenie, dodany do akumulatora z wagą routingu.
+#[allow(clippy::too_many_arguments)]
+fn run_expert(
+    kernels: &Kernels,
+    gate_w: &DevWeight,
+    up_w: &DevWeight,
+    down_w: &DevWeight,
+    shape: &DeepseekFfnShape,
+    bufs: &DeepseekFfnBufs,
+    x: &DevBuffer,
+    x_off: usize,
+    out: &DevBuffer,
+    out_off: usize,
+    weight: f32,
+    init: bool,
+    stream: &Stream,
+) -> Result<()> {
+    gemv_row(kernels, &bufs.gate, 0, gate_w, x, x_off, stream)?;
+    gemv_row(kernels, &bufs.up, 0, up_w, x, x_off, stream)?;
+    kernels.swiglu_limit_f16(
+        &bufs.act,
+        &bufs.gate,
+        &bufs.up,
+        shape.moe_inter,
+        shape.swiglu_limit,
+        stream,
+    )?;
+    gemv_row(kernels, &bufs.expert_out, 0, down_w, &bufs.act, 0, stream)?;
+    // Waga routingu wchodzi PRZED zsumowaniem z pozostałymi ekspertami.
+    kernels.moe_scale_add_f16(
+        out,
+        out_off,
+        &bufs.expert_out,
+        0,
+        shape.hidden,
+        weight,
+        init,
+        stream,
+    )
+}
+
+/// Prefill FFN jednej warstwy: routowani eksperci plus zawsze aktywny ekspert
+/// dzielony.
+///
+/// Wybór ekspertów wraca na hosta, bo dla każdego tokenu uruchamiamy inne wagi.
+/// Ścieżka bez odczytu wstecznego (jak w innych modelach MoE tego silnika)
+/// wymaga wszystkich ekspertów rezydentnych i adresowalnych tablicą wskaźników;
+/// przy 256 ekspertach na warstwę i 148 GiB wag jest to inna klasa problemu i
+/// wejdzie razem z rezydencją.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_prefill(
+    kernels: &Kernels,
+    device: &dyn Device,
+    moe: &MoeFfn,
+    shape: &DeepseekFfnShape,
+    bufs: &DeepseekFfnBufs,
+    x: &DevBuffer,
+    out: &DevBuffer,
+    tokens: usize,
+    token_ids: Option<&[u32]>,
+    stream: &Stream,
+) -> Result<()> {
+    if tokens > bufs.max_tokens {
+        return Err(ForgeError::Kernel(format!(
+            "FFN {tokens} tokenów przekracza pojemność buforów {}",
+            bufs.max_tokens
+        )));
+    }
+    if !(shape.swiglu_limit > 0.0) {
+        return Err(ForgeError::Format(format!(
+            "swiglu_limit = {} — DeepSeek V4 zawsze deklaruje dodatnie obcięcie",
+            shape.swiglu_limit
+        )));
+    }
+    let DevWeight::F16 { buf: gate_w, .. } = &moe.router else {
+        return Err(ForgeError::Unsupported("router MoE musi być f16".into()));
+    };
+    let top_k = shape.n_experts_used;
+
+    // Wagi routingu liczy bramka nawet w warstwach haszowanych — z tablicy
+    // pochodzi WYŁĄCZNIE wybór ekspertów.
+    let bias = moe.gate_bias.as_ref().ok_or_else(|| {
+        ForgeError::Unsupported("bramka DeepSeeka wymaga biasu routera".into())
+    })?;
+    kernels.moe_gate_sqrtsoftplus_f16(
+        &bufs.ids,
+        &bufs.weights,
+        x,
+        gate_w,
+        bias,
+        tokens,
+        shape.hidden,
+        moe.n_experts,
+        top_k,
+        shape.route_scale,
+        stream,
+    )?;
+    stream.synchronize()?;
+
+    let mut id_bytes = vec![0u8; tokens * top_k * 4];
+    device.read(&bufs.ids, 0, &mut id_bytes)?;
+    let mut ids: Vec<i32> = id_bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if let (Some(table), Some(tokens_ids)) = (moe.tid2eid.as_ref(), token_ids) {
+        ids = hash_route(device, table, tokens_ids, top_k)?;
+    }
+    let mut weight_bytes = vec![0u8; tokens * top_k * 4];
+    device.read(&bufs.weights, 0, &mut weight_bytes)?;
+    let route_w: Vec<f32> = weight_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    for token in 0..tokens {
+        let x_off = token * shape.hidden * 2;
+        let out_off = token * shape.hidden * 2;
+        for slot in 0..top_k {
+            let expert = ids[token * top_k + slot] as usize;
+            run_expert(
+                kernels,
+                expert_weight(&moe.gate_exps, expert)?,
+                expert_weight(&moe.up_exps, expert)?,
+                expert_weight(&moe.down_exps, expert)?,
+                shape,
+                bufs,
+                x,
+                x_off,
+                out,
+                out_off,
+                route_w[token * top_k + slot],
+                slot == 0,
+                stream,
+            )?;
+        }
+        // Ekspert dzielony jest zawsze aktywny i wchodzi bez wagi routingu.
+        if let Some(shared) = moe.shared.as_ref() {
+            let (gate_w, up_w) = match &shared.gate_up {
+                crate::weights::GateUpWeights::Split { gate, up } => (gate, up),
+                crate::weights::GateUpWeights::Fused(_) => {
+                    return Err(ForgeError::Unsupported(
+                        "ekspert dzielony DeepSeeka ma rozdzielone gate/up".into(),
+                    ))
+                }
+            };
+            run_expert(
+                kernels, gate_w, up_w, &shared.down, shape, bufs, x, x_off, out, out_off, 1.0,
+                false, stream,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Wybór ekspertów z tablicy `token -> eksperci` warstw haszowanych.
+fn hash_route(
+    device: &dyn Device,
+    table: &DevBuffer,
+    token_ids: &[u32],
+    top_k: usize,
+) -> Result<Vec<i32>> {
+    let mut out = Vec::with_capacity(token_ids.len() * top_k);
+    let mut row = vec![0u8; top_k * 8];
+    for id in token_ids {
+        device.read(table, *id as usize * top_k * 8, &mut row)?;
+        for entry in row.chunks_exact(8) {
+            out.push(i64::from_le_bytes(entry.try_into().expect("osiem bajtów")) as i32);
+        }
+    }
+    Ok(out)
+}
+
+fn expert_weight(stack: &ExpertStack, expert: usize) -> Result<&DevWeight> {
+    stack.expert(expert)
 }

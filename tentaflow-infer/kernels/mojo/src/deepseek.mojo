@@ -775,3 +775,30 @@ def moe_gate_sqrtsoftplus_f16(
     while k < top_k:
         weights_out[token * top_k + k] = weights_out[token * top_k + k] * inv
         k += 1
+
+
+def swiglu_limit_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    gate: UnsafePointer[Float16, MutAnyOrigin],
+    up: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+    limit: Float32,
+):
+    """`silu(clamp_max(gate)) * clamp(up)` — SwiGLU DeepSeeka V4.
+
+    Obcięcia są NIESYMETRYCZNE i to nie jest przeoczenie autorów: bramka jest
+    ograniczana tylko od góry, a wejście obustronnie. Oba przed mnożeniem.
+    """
+    i = Int(global_idx.x)
+    if i >= n:
+        return
+    var g = Float32(gate[i])
+    if g > limit:
+        g = limit
+    var u = Float32(up[i])
+    if u > limit:
+        u = limit
+    if u < -limit:
+        u = -limit
+    s = g / (1.0 + exp(-g))
+    out_ptr[i] = Float16(s * u)

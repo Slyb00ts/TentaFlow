@@ -1553,6 +1553,10 @@
       "entry": "src_onnx_ops_sqrt_f32_Pointe6A6A6A6AoA6A6A_4b921393b1627585",
       "file": "sqrt_f32.hsaco"
     },
+    "swiglu_limit_f16": {
+      "entry": "src_deepseek_swiglu_limit_f166A6A6A6AoA_acee2f85e915ec77",
+      "file": "swiglu_limit_f16.hsaco"
+    },
     "topk_batched_final_f32": {
       "entry": "src_sampling_topk_batched_fina6A6A6A6A_ffdc8173258581c1",
       "file": "topk_batched_final_f32.hsaco"

@@ -495,6 +495,7 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "softcap_f32",
     "sparse_attn_f16",
     "sqrt_f32",
+    "swiglu_limit_f16",
     "topk_batched_final_f32",
     "topk_batched_partial_f32",
     "topk_final_f32",
