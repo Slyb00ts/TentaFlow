@@ -150,6 +150,59 @@ apply_rotary_emb(q[..., -rope_head_dim:], freqs_cis)
 kv = rms_norm(x @ wkv.T, kv_norm_w, eps)
 apply_rotary_emb(kv[..., -rope_head_dim:], freqs_cis)
 
+# --- kompresor strumienia KV -------------------------------------------------
+
+def act_quant_inplace(x, block=64):
+    """Symulacja kwantyzacji aktywacji do FP8 (QAT), skala zaokraglana do potegi
+    dwojki jak przy scale_fmt='ue8m0'. Odpowiednik act_quant(..., inplace=True)."""
+    shape = x.shape
+    xg = x.reshape(-1, shape[-1] // block, block).float()
+    amax = xg.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+    s = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    q = (xg / s).to(torch.float8_e4m3fn).float() * s
+    return q.reshape(shape).to(x.dtype)
+
+
+def compressor_prefill(x, ratio, wkv_c, wgate_c, ape, norm_w, freqs_cis, head_dim, rope_dim, eps):
+    """Sciezka prefill kompresora: bramkowany pooling po oknach `ratio` tokenow.
+    Dla ratio 4 okna sa Z ZAKLADKA — projekcje daja dwa razy szerszy wektor,
+    ktorego pierwsza polowa opisuje okno przesuniete o jeden blok wstecz."""
+    overlap = ratio == 4
+    seqlen = x.size(1)
+    d = head_dim
+    xf = x.float()
+    kv = xf @ wkv_c.float().T
+    score = xf @ wgate_c.float().T
+    cutoff = seqlen - seqlen % ratio
+    assert cutoff == seqlen, "oracle liczy przypadek bez reszty"
+
+    kv = kv.unflatten(1, (-1, ratio))
+    score = score.unflatten(1, (-1, ratio)) + ape
+    if overlap:
+        b, n = kv.size(0), kv.size(1)
+        kv2 = kv.new_zeros((b, n, 2 * ratio, d))
+        kv2[:, :, ratio:] = kv[:, :, :, d:]
+        kv2[:, 1:, :ratio] = kv[:, :-1, :, :d]
+        sc2 = score.new_full((b, n, 2 * ratio, d), float("-inf"))
+        sc2[:, :, ratio:] = score[:, :, :, d:]
+        sc2[:, 1:, :ratio] = score[:, :-1, :, :d]
+        kv, score = kv2, sc2
+    kv = (kv * score.softmax(dim=2)).sum(dim=2)
+
+    kv = rms_norm(kv, norm_w, eps)
+    apply_rotary_emb(kv[..., -rope_dim:], freqs_cis[:cutoff:ratio])
+    kv[..., :-rope_dim] = act_quant_inplace(kv[..., :-rope_dim], 64)
+    return kv
+
+
+comp = f"{p}.compressor"
+c_wkv = torch.from_numpy(load_matrix(f"{comp}.wkv.weight").copy())
+c_wgate = torch.from_numpy(load_matrix(f"{comp}.wgate.weight").copy())
+c_ape = torch.from_numpy(load_vector(f"{comp}.ape").copy()).float()
+c_norm = torch.from_numpy(load_vector(f"{comp}.norm.weight").copy()).float()
+comp_out = compressor_prefill(x, ratio, c_wkv, c_wgate, c_ape, c_norm,
+                              freqs_cis, head_dim, rope_head_dim, eps)
+
 # --- bramka MoE i pojedynczy ekspert (warstwa bez routingu haszowanego) -----
 
 GATE_LAYER = 3          # warstwy 0-2 routuja przez tid2eid, nie przez wynik
@@ -225,8 +278,8 @@ attn_out = o.flatten(2) @ wo_b.float().T
 
 out = sys.argv[1]
 with open(out, "wb") as f:
-    f.write(struct.pack("<10i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
-                        GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank))
+    f.write(struct.pack("<11i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
+                        GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank, ratio))
     for t in (x, qr, q, kv):
         f.write(t.detach().float().contiguous().numpy().tobytes())
     f.write(gx_t.contiguous().numpy().tobytes())
@@ -235,6 +288,8 @@ with open(out, "wb") as f:
     f.write(expert_out.float().contiguous().numpy().tobytes())
     f.write(attn_in.float().contiguous().numpy().tobytes())
     f.write(attn_out.float().contiguous().numpy().tobytes())
+    f.write(comp_out.float().contiguous().numpy().tobytes())
+print("kompresor: wpisow", comp_out.size(1), "abs mean", comp_out.abs().mean().item())
 print("bramka: pierwsze indeksy", indices[0].tolist(), "wagi", [round(v,4) for v in weights[0].tolist()])
 print(f"zapisano {out}: seq={SEQLEN} dim={dim} heads={n_heads} hd={head_dim} rope={rope_head_dim} ratio={ratio}")
 print("q  abs mean", q.abs().mean().item(), "kv abs mean", kv.abs().mean().item())

@@ -80,12 +80,14 @@ struct Oracle {
     o_lora_rank: usize,
     attn_in: Vec<f32>,
     attn_out: Vec<f32>,
+    ratio: usize,
+    compressed: Vec<f32>,
 }
 
 fn load_oracle() -> Option<Oracle> {
     let path = std::env::var("FORGE_DEEPSEEK_V4_ORACLE").ok()?;
     let bytes = std::fs::read(path).ok()?;
-    let head: Vec<i32> = bytes[..40]
+    let head: Vec<i32> = bytes[..44]
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -98,9 +100,10 @@ fn load_oracle() -> Option<Oracle> {
     );
     let (gate_layer, topk, n_experts) = (head[5] as usize, head[6] as usize, head[7] as usize);
     let (o_groups, o_lora_rank) = (head[8] as usize, head[9] as usize);
+    let ratio = head[10] as usize;
     let mut cursor = Cursor {
         bytes: &bytes,
-        offset: 40,
+        offset: 44,
     };
     let x = cursor.floats(seqlen * dim);
     let qr = cursor.floats(seqlen * 1024);
@@ -112,6 +115,7 @@ fn load_oracle() -> Option<Oracle> {
     let expert_out = cursor.floats(seqlen * dim);
     let attn_in = cursor.floats(seqlen * n_heads * head_dim);
     let attn_out = cursor.floats(seqlen * dim);
+    let compressed = cursor.floats(seqlen / ratio * head_dim);
     Some(Oracle {
         seqlen,
         dim,
@@ -133,6 +137,8 @@ fn load_oracle() -> Option<Oracle> {
         o_lora_rank,
         attn_in,
         attn_out,
+        ratio,
+        compressed,
     })
 }
 
@@ -512,4 +518,131 @@ fn apply_inverse_rope(slice: &mut [f32], freqs: &[f32], pos: usize) {
         slice[2 * i] = a * cos + b * sin;
         slice[2 * i + 1] = -a * sin + b * cos;
     }
+}
+
+/// Symulacja kwantyzacji aktywacji do FP8 z zaokrągleniem skali do potęgi
+/// dwójki — model był tak trenowany (QAT), więc pominięcie tego kroku zmienia
+/// wartości wchodzące do cache'u KV.
+fn act_quant_inplace(values: &mut [f32], block: usize) {
+    for group in values.chunks_mut(block) {
+        let amax = group.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-4);
+        let scale = (amax / 448.0).log2().ceil().exp2();
+        for v in group.iter_mut() {
+            *v = f8e4m3_round(*v / scale) * scale;
+        }
+    }
+}
+
+/// Zaokrągla do najbliższej wartości E4M3 (do najbliższej parzystej przy remisie).
+fn f8e4m3_round(v: f32) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    let clamped = v.clamp(-448.0, 448.0);
+    let mut best = 0f32;
+    let mut best_err = f32::INFINITY;
+    for code in 0u16..256 {
+        let candidate = f8e4m3_to_f32(code as u8);
+        if !candidate.is_finite() {
+            continue;
+        }
+        let err = (candidate - clamped).abs();
+        if err < best_err || (err == best_err && candidate.to_bits() % 2 == 0) {
+            best_err = err;
+            best = candidate;
+        }
+    }
+    best
+}
+
+/// Kompresor strumienia KV. Dla `ratio == 4` okna są Z ZAKŁADKĄ: projekcje dają
+/// dwa razy szerszy wektor, którego pierwsza połowa opisuje okno przesunięte o
+/// jeden blok wstecz. Potraktowanie go jako zwykłego poolingu daje poprawny
+/// kształt i błędne wartości.
+#[test]
+fn kv_compressor_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let c = format!("layers.{LAYER}.attn.compressor");
+    let wkv = load_vector(&st, &format!("{c}.wkv.weight"));
+    let wgate = load_vector(&st, &format!("{c}.wgate.weight"));
+    let ape = load_vector(&st, &format!("{c}.ape"));
+    let norm_w = load_vector(&st, &format!("{c}.norm.weight"));
+    let eps = 1e-6f32;
+
+    let ratio = oracle.ratio;
+    let overlap = ratio == 4;
+    let d = oracle.head_dim;
+    let wide = if overlap { 2 * d } else { d };
+    let blocks = oracle.seqlen / ratio;
+    let freqs = rope_freqs(oracle.rope_head_dim, 160_000.0, 65_536, 16.0, 32.0, 1.0);
+    let nope = d - oracle.rope_head_dim;
+
+    // Projekcje per token: wartości i wyniki bramki, plus kodowanie pozycji
+    // wewnątrz okna.
+    let mut kv = vec![0f32; oracle.seqlen * wide];
+    let mut score = vec![0f32; oracle.seqlen * wide];
+    for t in 0..oracle.seqlen {
+        let x = &oracle.x[t * oracle.dim..(t + 1) * oracle.dim];
+        kv[t * wide..(t + 1) * wide].copy_from_slice(&project(&wkv, x, wide, oracle.dim));
+        let mut s = project(&wgate, x, wide, oracle.dim);
+        let slot = t % ratio;
+        for (i, v) in s.iter_mut().enumerate() {
+            *v += ape[slot * wide + i];
+        }
+        score[t * wide..(t + 1) * wide].copy_from_slice(&s);
+    }
+
+    let mut got = Vec::with_capacity(blocks * d);
+    for block in 0..blocks {
+        // Okno: przy zakładce pierwsze `ratio` pozycji bierze DRUGĄ połowę
+        // wymiarów poprzedniego bloku, a dalsze — pierwszą połowę bieżącego.
+        let window = if overlap { 2 * ratio } else { ratio };
+        let mut win_kv = vec![0f32; window * d];
+        let mut win_sc = vec![f32::NEG_INFINITY; window * d];
+        for slot in 0..window {
+            let (token, half) = if !overlap {
+                (block * ratio + slot, 0)
+            } else if slot < ratio {
+                if block == 0 {
+                    continue;
+                }
+                ((block - 1) * ratio + slot, 0)
+            } else {
+                (block * ratio + slot - ratio, 1)
+            };
+            let src = token * wide + half * d;
+            win_kv[slot * d..(slot + 1) * d].copy_from_slice(&kv[src..src + d]);
+            win_sc[slot * d..(slot + 1) * d].copy_from_slice(&score[src..src + d]);
+        }
+        // Softmax po oknie, osobno dla każdego wymiaru.
+        let mut pooled = vec![0f32; d];
+        for dim_i in 0..d {
+            let mut max = f32::NEG_INFINITY;
+            for slot in 0..window {
+                max = max.max(win_sc[slot * d + dim_i]);
+            }
+            let mut denom = 0f32;
+            for slot in 0..window {
+                denom += (win_sc[slot * d + dim_i] - max).exp();
+            }
+            let mut acc = 0f32;
+            for slot in 0..window {
+                let w = (win_sc[slot * d + dim_i] - max).exp() / denom;
+                acc += w * win_kv[slot * d + dim_i];
+            }
+            pooled[dim_i] = acc;
+        }
+        let mut normed = rms_norm(&pooled, &norm_w, eps);
+        apply_rope(&mut normed[nope..], &freqs, block * ratio);
+        act_quant_inplace(&mut normed[..nope], 64);
+        got.extend_from_slice(&normed);
+    }
+
+    let err = relative_l2(&got, &oracle.compressed);
+    eprintln!("kompresor KV: względne L2 = {err:.3e}");
+    assert!(err < 1e-4, "kompresor rozjeżdża się o {err:.3e}");
 }
