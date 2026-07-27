@@ -2273,6 +2273,35 @@ fn upload_per_expert_stack(
     ExpertStack::new(device, slots, resident, spilled, rows_per_expert, cols)
 }
 
+/// Wczytuje model DeepSeeka V4 obcięty do `layers` pierwszych warstw.
+///
+/// Istnieje dla testów: pełny model ma 157 GB i 43 warstwy po 256 ekspertów, a
+/// poprawność ZŁOŻENIA przebiegu — embedding, bloki, głowa — trzeba sprawdzić
+/// na prawdziwych wagach, nie na syntetyku. Obcięty model jest poprawnym
+/// modelem o mniejszej liczbie warstw, więc ścieżka wykonania jest ta sama.
+pub fn load_deepseek_prefix_for_test(
+    device: &dyn Device,
+    dir: &Path,
+    layers: usize,
+    host_budget: usize,
+    spill: Option<&ExpertSpill>,
+) -> Result<ModelWeights> {
+    let config: HfConfig = HfConfig::load(dir.join("config.json"))?;
+    let st = ShardedSafeTensors::load_dir(dir)?;
+    let mut descriptor = ModelDescriptor::from_hf(&config)?;
+    descriptor.prune_absent_optional(|name| st.tensor(name).is_some());
+    descriptor.layers.truncate(layers);
+    descriptor.layer_kinds.truncate(layers);
+    descriptor.params.block_count = layers;
+    let src = StSource {
+        st: &st,
+        scheme: NvFp4Scheme::detect(&config),
+        fp8: false,
+        deepseek_v4: true,
+    };
+    ModelWeights::load_deepseek_v4(device, descriptor, &src, spill, host_budget)
+}
+
 /// Wczytuje samą warstwę uwagi DeepSeeka V4 z katalogu safetensors.
 ///
 /// Istnieje dla testów: pełny model ma 157 GB, a geometrię i przejście przez

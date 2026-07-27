@@ -760,6 +760,10 @@ pub struct DeepseekFfnShape {
 pub struct DeepseekFfnBufs {
     ids: DevBuffer,
     weights: DevBuffer,
+    /// Zerowy bias dla warstw z routingiem haszowanym: te nie mają własnego, bo
+    /// wybór ekspertów bierze się z tablicy, a nie z rankingu. Wagi nadal liczy
+    /// bramka, więc kernel musi dostać jakiś bias — zerowy nie zmienia wyniku.
+    zero_bias: DevBuffer,
     gate: DevBuffer,
     up: DevBuffer,
     act: DevBuffer,
@@ -771,13 +775,17 @@ impl DeepseekFfnBufs {
     pub fn new(
         device: &dyn Device,
         shape: &DeepseekFfnShape,
+        n_experts: usize,
         max_tokens: usize,
     ) -> Result<Self> {
         let f16b = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
         let f32b = |elems: usize| device.alloc(elems * 4, MemKind::Device, Pool::Activations);
+        let zero_bias = f32b(n_experts)?;
+        device.write(&vec![0u8; n_experts * 4], &zero_bias, 0)?;
         Ok(Self {
             ids: f32b(max_tokens * shape.n_experts_used)?,
             weights: f32b(max_tokens * shape.n_experts_used)?,
+            zero_bias,
             gate: f16b(shape.moe_inter)?,
             up: f16b(shape.moe_inter)?,
             act: f16b(shape.moe_inter)?,
@@ -867,10 +875,8 @@ pub fn ffn_prefill(
     let top_k = shape.n_experts_used;
 
     // Wagi routingu liczy bramka nawet w warstwach haszowanych — z tablicy
-    // pochodzi WYŁĄCZNIE wybór ekspertów.
-    let bias = moe.gate_bias.as_ref().ok_or_else(|| {
-        ForgeError::Unsupported("bramka DeepSeeka wymaga biasu routera".into())
-    })?;
+    // pochodzi WYŁĄCZNIE wybór ekspertów, a te warstwy nie mają własnego biasu.
+    let bias = moe.gate_bias.as_ref().unwrap_or(&bufs.zero_bias);
     kernels.moe_gate_sqrtsoftplus_f16(
         &bufs.ids,
         &bufs.weights,
@@ -1106,17 +1112,19 @@ pub struct DeepseekBlockBufs {
 }
 
 impl DeepseekBlockBufs {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &dyn Device,
         attn_shape: &DeepseekAttnShape,
         ffn_shape: &DeepseekFfnShape,
+        n_experts: usize,
         hc: usize,
         max_tokens: usize,
         freqs: &[f32],
     ) -> Result<Self> {
         Ok(Self {
             attn: DeepseekAttnBufs::new(device, attn_shape, max_tokens, freqs)?,
-            ffn: DeepseekFfnBufs::new(device, ffn_shape, max_tokens)?,
+            ffn: DeepseekFfnBufs::new(device, ffn_shape, n_experts, max_tokens)?,
             hc_attn: HyperConnectionBufs::new(device, attn_shape.hidden, hc, max_tokens)?,
             hc_ffn: HyperConnectionBufs::new(device, attn_shape.hidden, hc, max_tokens)?,
             sub_out: device.alloc(
@@ -1242,6 +1250,7 @@ pub fn block_prefill(
 pub struct DeepseekModelShape {
     pub hidden: usize,
     pub vocab: usize,
+    pub n_experts: usize,
     pub hc: HyperConnectionConfig,
     pub ffn: DeepseekFfnShape,
     /// Kształt uwagi per warstwa — stopień kompresji i obecność indeksera
@@ -1277,6 +1286,7 @@ impl DeepseekModelBufs {
                 device,
                 attn,
                 &shape.ffn,
+                shape.n_experts,
                 hc,
                 max_tokens,
                 &shape.rope[layer],

@@ -91,6 +91,13 @@ pub struct HfConfig {
     pub routed_scaling_factor: Option<f32>,
     #[serde(default)]
     pub swiglu_limit: Option<f32>,
+    /// Ile kopii stanu utrzymuje strumień rezydualny (hyper-connections).
+    #[serde(default)]
+    pub hc_mult: Option<usize>,
+    #[serde(default)]
+    pub hc_sinkhorn_iters: Option<usize>,
+    #[serde(default)]
+    pub hc_eps: Option<f32>,
 }
 
 fn default_rope_theta() -> f32 {
