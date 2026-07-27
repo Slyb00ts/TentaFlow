@@ -802,3 +802,57 @@ def swiglu_limit_f16(
         u = -limit
     s = g / (1.0 + exp(-g))
     out_ptr[i] = Float16(s * u)
+
+
+def rmsnorm_mix_f32(
+    out_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    mix_fn: UnsafePointer[Float32, MutAnyOrigin],
+    width: Int,
+    mix_hc: Int,
+    n_tokens: Int,
+    eps: Float32,
+):
+    """`mixes = (mix_fn @ x) * rsqrt(mean(x^2) + eps)` dla hyper-connections.
+
+    Normalizacja obejmuje ZŁĄCZONE kopie strumienia rezydualnego, a nie każdą
+    osobno — stąd jeden `rsqrt` na token dla całej szerokości `hc * hidden`.
+    Wynik jest w f32, bo wchodzi wprost do Sinkhorna.
+
+    Jeden blok na token; wątki dzielą się wierszami `mix_fn`.
+    """
+    token = Int(block_idx.x)
+    if token >= n_tokens:
+        return
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+
+    partial = stack_allocation[
+        1024, Float32, address_space = AddressSpace.SHARED
+    ]()
+    var acc: Float32 = 0.0
+    var i = tid
+    while i < width:
+        v = Float32(x[token * width + i])
+        acc += v * v
+        i += nthreads
+    partial[tid] = acc
+    barrier()
+    var stride = nthreads // 2
+    while stride > 0:
+        if tid < stride:
+            partial[tid] += partial[tid + stride]
+        barrier()
+        stride //= 2
+    inv = rsqrt(partial[0] / Float32(width) + eps)
+    barrier()
+
+    var m = tid
+    while m < mix_hc:
+        var dot: Float32 = 0.0
+        var j = 0
+        while j < width:
+            dot += mix_fn[m * width + j] * Float32(x[token * width + j])
+            j += 1
+        out_ptr[token * mix_hc + m] = dot * inv
+        m += nthreads

@@ -6091,6 +6091,37 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `mixes = (mix_fn @ x) * rsqrt(mean(x^2))` — wejście Sinkhorna
+    /// hyper-connections. Normalizacja obejmuje złączone kopie strumienia.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_mix_f32(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        mix_fn: &DevBuffer,
+        width: usize,
+        mix_hc: usize,
+        n_tokens: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_mix_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .buf(mix_fn)
+            .scalar(width as i64)
+            .scalar(mix_hc as i64)
+            .scalar(n_tokens as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// SwiGLU z niesymetrycznym obcięciem: bramka ograniczana tylko od góry,
     /// wejście obustronnie, oba przed mnożeniem.
     pub fn swiglu_limit_f16(

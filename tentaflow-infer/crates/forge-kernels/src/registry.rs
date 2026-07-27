@@ -481,6 +481,7 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_gfx1030![
     "rmsnorm_fp8",
     "rmsnorm_h32_f16",
     "rmsnorm_head_f16",
+    "rmsnorm_mix_f32",
     "rmsnorm_qkv_f16",
     "rmsnorm_residual_f16",
     "rmsnorm_residual_fp8",

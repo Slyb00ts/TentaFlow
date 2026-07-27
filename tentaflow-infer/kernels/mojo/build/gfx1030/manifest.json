@@ -1497,6 +1497,10 @@
       "entry": "src_deepseek_rmsnorm_head_f166A6A6A6AoA_3a59a014b39e0db9",
       "file": "rmsnorm_head_f16.hsaco"
     },
+    "rmsnorm_mix_f32": {
+      "entry": "src_deepseek_rmsnorm_mix_f326A6A6A6AoA6A_a152e856cbc4853e",
+      "file": "rmsnorm_mix_f32.hsaco"
+    },
     "rmsnorm_qkv_f16": {
       "entry": "src_norm_rmsnorm_qkv_f16_Poi6A6A6A6AoA6A6A_531bb45ec3382a85",
       "file": "rmsnorm_qkv_f16.hsaco"

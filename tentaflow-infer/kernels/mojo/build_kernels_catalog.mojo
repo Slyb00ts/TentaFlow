@@ -144,6 +144,7 @@ from src.deepseek import (
     compressor_add_ape_f32,
     moe_gate_sqrtsoftplus_f16,
     swiglu_limit_f16,
+    rmsnorm_mix_f32,
 )
 from src.gemv2 import (
     gemv_q8_0_f16_v2,
@@ -2381,6 +2382,9 @@ def main() raises:
 
     _ = ctx.compile_function[swiglu_limit_f16, dump_asm=Path("swiglu_limit_f16.ptx")]()
     entries.append(_finalize(out_dir, "swiglu_limit_f16"))
+
+    _ = ctx.compile_function[rmsnorm_mix_f32, dump_asm=Path("rmsnorm_mix_f32.ptx")]()
+    entries.append(_finalize(out_dir, "rmsnorm_mix_f32"))
 
     _ = ctx.compile_function[
         gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")

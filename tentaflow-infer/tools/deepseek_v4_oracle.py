@@ -529,6 +529,45 @@ full = full.view(1, SEQLEN, o_groups, -1)
 full = torch.einsum("bsgd,grd->bsgr", full.float(), wo_a_g.float())
 attn_full = full.flatten(2) @ wo_b.float().T
 
+# --- pelny blok warstwy 2: hyper-connections wokol uwagi i FFN --------------
+
+blk_hc_attn_fn = hc_fn
+blk_hc_attn_base = hc_base
+blk_hc_attn_scale = hc_scale
+blk_hc_ffn_fn = torch.from_numpy(load_vector(f"layers.{LAYER}.hc_ffn_fn").copy()).float()
+blk_hc_ffn_base = torch.from_numpy(load_vector(f"layers.{LAYER}.hc_ffn_base").copy()).float()
+blk_hc_ffn_scale = torch.from_numpy(load_vector(f"layers.{LAYER}.hc_ffn_scale").copy()).float()
+attn_norm_w = torch.from_numpy(load_vector(f"layers.{LAYER}.attn_norm.weight").copy()).float()
+ffn_norm_w = torch.from_numpy(load_vector(f"layers.{LAYER}.ffn_norm.weight").copy()).float()
+
+
+def hc_pre(xc, fn, scale_v, base_v):
+    flat = xc.flatten(2).float()
+    r = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+    mix = (flat @ fn.T) * r
+    pre, post, comb = hc_split_sinkhorn(mix, scale_v, base_v, HC, HC_ITERS, HC_EPS)
+    return torch.sum(pre.unsqueeze(-1) * xc, dim=2), post, comb
+
+
+def hc_post(y, residual, post, comb):
+    return post.unsqueeze(-1) * y.unsqueeze(-2) + torch.sum(
+        comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+
+
+# Wejscie bloku: HC kopii strumienia rezydualnego.
+blk_in = hc_in.clone()
+res = blk_in
+red, post_a, comb_a = hc_pre(blk_in, blk_hc_attn_fn, blk_hc_attn_scale, blk_hc_attn_base)
+# Sciezka uwagi liczona jest na juz zwalidowanym wyjsciu: `attn_full` powstaje z
+# `x`, wiec dla bloku uzywamy tej samej funkcji na znormalizowanym wejsciu.
+normed_attn = rms_norm(red, attn_norm_w, eps)
+blk_after_attn_pre = normed_attn
+blk_state = hc_post(attn_full, res, post_a, comb_a)
+
+res2 = blk_state
+red2, post_f, comb_f = hc_pre(blk_state, blk_hc_ffn_fn, blk_hc_ffn_scale, blk_hc_ffn_base)
+normed_ffn = rms_norm(red2, ffn_norm_w, eps)
+
 out = sys.argv[1]
 with open(out, "wb") as f:
     f.write(struct.pack("<18i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
@@ -560,6 +599,9 @@ with open(out, "wb") as f:
     f.write(hash_indices.to(torch.int32).contiguous().numpy().tobytes())
     f.write(hash_weights.float().contiguous().numpy().tobytes())
     f.write(attn_full.float().contiguous().numpy().tobytes())
+    f.write(blk_after_attn_pre.float().contiguous().numpy().tobytes())
+    f.write(blk_state.float().contiguous().numpy().tobytes())
+    f.write(normed_ffn.float().contiguous().numpy().tobytes())
 print("rzadka uwaga: abs mean", sparse_out.abs().mean().item(), "indeksow", topk_idxs.size(-1))
 print("indekser: score", tuple(index_score.shape), "abs mean", index_score.abs().mean().item())
 print("kompresor: wpisow", comp_out.size(1), "abs mean", comp_out.abs().mean().item())

@@ -21,7 +21,9 @@ use forge_types::{ForgeError, MemKind, Result};
 use half::f16;
 
 use crate::moe_residency::ExpertStack;
-use crate::weights::{CompressorWeights, DeepseekAttnWeights, DevWeight, MoeFfn};
+use crate::weights::{
+    CompressorWeights, DeepseekAttnWeights, DevWeight, HyperConnectionWeights, MoeFfn,
+};
 
 /// Geometria warstwy potrzebna przebiegowi. W tej architekturze różni się
 /// między warstwami: stopień kompresji i obecność indeksera zależą od numeru.
@@ -959,4 +961,125 @@ fn hash_route(
 
 fn expert_weight(stack: &ExpertStack, expert: usize) -> Result<&DevWeight> {
     stack.expert(expert)
+}
+
+/// Bufory hyper-connections jednego bloku.
+pub struct HyperConnectionBufs {
+    mixes: DevBuffer,
+    pre: DevBuffer,
+    post: DevBuffer,
+    comb: DevBuffer,
+    reduced: DevBuffer,
+    normed: DevBuffer,
+    max_tokens: usize,
+    hc: usize,
+}
+
+impl HyperConnectionBufs {
+    pub fn new(
+        device: &dyn Device,
+        hidden: usize,
+        hc: usize,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let mix_hc = (2 + hc) * hc;
+        let f16b = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        let f32b = |elems: usize| device.alloc(elems * 4, MemKind::Device, Pool::Activations);
+        Ok(Self {
+            mixes: f32b(max_tokens * mix_hc)?,
+            pre: f32b(max_tokens * hc)?,
+            post: f32b(max_tokens * hc)?,
+            comb: f32b(max_tokens * hc * hc)?,
+            reduced: f16b(max_tokens * hidden)?,
+            normed: f16b(max_tokens * hidden)?,
+            max_tokens,
+            hc,
+        })
+    }
+
+    /// Znormalizowane wejście podbloku — to ono idzie do uwagi albo FFN.
+    pub fn normed(&self) -> &DevBuffer {
+        &self.normed
+    }
+}
+
+/// Redukcja kopii strumienia rezydualnego do jednej i norma wejściowa podbloku.
+///
+/// Wagi mieszania zostają w buforach, bo `hc_expand` po policzeniu podbloku
+/// używa TYCH SAMYCH `post` i `comb` — policzenie ich drugi raz na zmienionym
+/// stanie dałoby inny model.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_enter(
+    kernels: &Kernels,
+    weights: &HyperConnectionWeights,
+    norm: &DevBuffer,
+    bufs: &HyperConnectionBufs,
+    residual: &DevBuffer,
+    hidden: usize,
+    tokens: usize,
+    iters: usize,
+    eps: f32,
+    hc_eps: f32,
+    stream: &Stream,
+) -> Result<()> {
+    if tokens > bufs.max_tokens {
+        return Err(ForgeError::Kernel(format!(
+            "hyper-connections: {tokens} tokenów przekracza pojemność {}",
+            bufs.max_tokens
+        )));
+    }
+    let hc = bufs.hc;
+    let mix_hc = (2 + hc) * hc;
+    // `mixes` powstaje z ZŁĄCZONYCH kopii, znormalizowanych wspólnie — a nie z
+    // każdej kopii osobno.
+    kernels.rmsnorm_mix_f32(
+        &bufs.mixes,
+        residual,
+        &weights.mix_fn,
+        hidden * hc,
+        mix_hc,
+        tokens,
+        eps,
+        stream,
+    )?;
+    kernels.hc_sinkhorn_f32(
+        &bufs.pre,
+        &bufs.post,
+        &bufs.comb,
+        &bufs.mixes,
+        &weights.scale,
+        &weights.base,
+        hc,
+        iters,
+        hc_eps,
+        tokens,
+        stream,
+    )?;
+    kernels.hc_reduce_f16(&bufs.reduced, residual, &bufs.pre, hidden, hc, tokens, stream)?;
+    kernels.rmsnorm_f16(&bufs.normed, &bufs.reduced, norm, tokens, hidden, eps, stream)
+}
+
+/// Rozprowadzenie wyjścia podbloku z powrotem na kopie strumienia.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_leave(
+    kernels: &Kernels,
+    bufs: &HyperConnectionBufs,
+    block_out: &DevBuffer,
+    residual: &DevBuffer,
+    out: &DevBuffer,
+    hidden: usize,
+    tokens: usize,
+    stream: &Stream,
+) -> Result<()> {
+    kernels.hc_expand_f16(
+        out,
+        block_out,
+        residual,
+        &bufs.post,
+        &bufs.comb,
+        hidden,
+        bufs.hc,
+        tokens,
+        stream,
+    )
 }
