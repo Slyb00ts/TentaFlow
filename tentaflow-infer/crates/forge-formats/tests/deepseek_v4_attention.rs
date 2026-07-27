@@ -76,12 +76,16 @@ struct Oracle {
     indices: Vec<i32>,
     gate_weights: Vec<f32>,
     expert_out: Vec<f32>,
+    o_groups: usize,
+    o_lora_rank: usize,
+    attn_in: Vec<f32>,
+    attn_out: Vec<f32>,
 }
 
 fn load_oracle() -> Option<Oracle> {
     let path = std::env::var("FORGE_DEEPSEEK_V4_ORACLE").ok()?;
     let bytes = std::fs::read(path).ok()?;
-    let head: Vec<i32> = bytes[..32]
+    let head: Vec<i32> = bytes[..40]
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -93,9 +97,10 @@ fn load_oracle() -> Option<Oracle> {
         head[4] as usize,
     );
     let (gate_layer, topk, n_experts) = (head[5] as usize, head[6] as usize, head[7] as usize);
+    let (o_groups, o_lora_rank) = (head[8] as usize, head[9] as usize);
     let mut cursor = Cursor {
         bytes: &bytes,
-        offset: 32,
+        offset: 40,
     };
     let x = cursor.floats(seqlen * dim);
     let qr = cursor.floats(seqlen * 1024);
@@ -105,6 +110,8 @@ fn load_oracle() -> Option<Oracle> {
     let indices = cursor.ints(seqlen * topk);
     let gate_weights = cursor.floats(seqlen * topk);
     let expert_out = cursor.floats(seqlen * dim);
+    let attn_in = cursor.floats(seqlen * n_heads * head_dim);
+    let attn_out = cursor.floats(seqlen * dim);
     Some(Oracle {
         seqlen,
         dim,
@@ -122,6 +129,10 @@ fn load_oracle() -> Option<Oracle> {
         indices,
         gate_weights,
         expert_out,
+        o_groups,
+        o_lora_rank,
+        attn_in,
+        attn_out,
     })
 }
 
@@ -444,4 +455,61 @@ fn expert_swiglu_matches_the_reference_implementation() {
     let err = relative_l2(&got, &oracle.expert_out);
     eprintln!("ekspert SwiGLU: względne L2 = {err:.3e}");
     assert!(err < 1e-4, "ekspert rozjeżdża się o {err:.3e}");
+}
+
+/// Ścieżka wyjścia uwagi. Dwie rzeczy odróżniają ją od zwykłej projekcji O:
+///
+///  1. na ostatnich 64 wymiarach głowicy nakładane jest rope ODWROTNE (sprzężenie
+///     tego samego obrotu) — pomyłka w znaku daje wynik wyglądający sensownie,
+///  2. wyjście jest dzielone na 8 grup, każda mnożona przez WŁASNY blok `wo_a`,
+///     a dopiero złączenie wchodzi w `wo_b`. Potraktowanie `wo_a` jako jednej
+///     macierzy daje poprawny kształt i błędne liczby.
+#[test]
+fn attention_output_path_matches_the_reference_implementation() {
+    let (Some(dir), Some(oracle)) = (checkpoint_dir(), load_oracle()) else {
+        eprintln!("pomijam: brak checkpointu lub zrzutu (FORGE_DEEPSEEK_V4_ORACLE)");
+        return;
+    };
+    let st = ShardedSafeTensors::load_dir(&dir).unwrap();
+    let p = format!("layers.{LAYER}.attn");
+    let (wo_a, _, _) = load_row_scaled(&st, &format!("{p}.wo_a.weight"));
+    let (wo_b, out_rows, out_cols) = load_row_scaled(&st, &format!("{p}.wo_b.weight"));
+    let freqs = rope_freqs(oracle.rope_head_dim, 160_000.0, 65_536, 16.0, 32.0, 1.0);
+    let nope = oracle.head_dim - oracle.rope_head_dim;
+    let per_group = oracle.n_heads * oracle.head_dim / oracle.o_groups;
+
+    let mut got = Vec::with_capacity(oracle.attn_out.len());
+    for pos in 0..oracle.seqlen {
+        let span = oracle.n_heads * oracle.head_dim;
+        let mut o = oracle.attn_in[pos * span..(pos + 1) * span].to_vec();
+        for head in 0..oracle.n_heads {
+            let slot = &mut o[head * oracle.head_dim..(head + 1) * oracle.head_dim];
+            apply_inverse_rope(&mut slot[nope..], &freqs, pos);
+        }
+        // Każda grupa ma własny blok wo_a o kształcie [o_lora_rank, per_group].
+        let mut lora = vec![0f32; oracle.o_groups * oracle.o_lora_rank];
+        for group in 0..oracle.o_groups {
+            let block = &wo_a[group * oracle.o_lora_rank * per_group..][..oracle.o_lora_rank * per_group];
+            let chunk = &o[group * per_group..(group + 1) * per_group];
+            let out = project(block, chunk, oracle.o_lora_rank, per_group);
+            lora[group * oracle.o_lora_rank..(group + 1) * oracle.o_lora_rank]
+                .copy_from_slice(&out);
+        }
+        got.extend_from_slice(&project(&wo_b, &lora, out_rows, out_cols));
+    }
+
+    let err = relative_l2(&got, &oracle.attn_out);
+    eprintln!("wyjście uwagi: względne L2 = {err:.3e}");
+    assert!(err < 1e-5, "ścieżka wyjścia rozjeżdża się o {err:.3e}");
+}
+
+/// Rope odwrotne to sprzężenie obrotu: ten sam kąt, przeciwny znak sinusa.
+fn apply_inverse_rope(slice: &mut [f32], freqs: &[f32], pos: usize) {
+    for (i, freq) in freqs.iter().enumerate() {
+        let angle = pos as f32 * freq;
+        let (sin, cos) = angle.sin_cos();
+        let (a, b) = (slice[2 * i], slice[2 * i + 1]);
+        slice[2 * i] = a * cos + b * sin;
+        slice[2 * i + 1] = -a * sin + b * cos;
+    }
 }

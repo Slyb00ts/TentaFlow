@@ -61,6 +61,52 @@ Dwie konwencje ustalone POMIAREM, bo obie mylą się bezgłośnie:
 - Kod skali `0x7F` (NaN w E4M3) układ GGUF mapuje na zero, co wyzerowałoby całą
   szesnastkę wag. Jest odrzucany zamiast przepuszczany.
 
+## Oracle numeryczny
+
+`tools/deepseek_v4_oracle.py` liczy referencyjne aktywacje na PRAWDZIWYCH wagach
+i zrzuca je do pliku; testy Rusta odtwarzają tę samą matematykę i porównują.
+`RMSNorm`, `precompute_freqs_cis` i `apply_rotary_emb` są w nim skopiowane
+DOSŁOWNIE z `inference/model.py` — to ma być oracle, a nie druga interpretacja
+tego samego kodu.
+
+```
+python tools/deepseek_v4_oracle.py /tmp/ds_ref.bin
+FORGE_DEEPSEEK_V4_ORACLE=/tmp/ds_ref.bin \
+  cargo test -p forge-formats --test deepseek_v4_attention
+```
+
+Przypięte i zgodne z referencją (`crates/forge-formats/tests/deepseek_v4_attention.rs`):
+
+| Fragment warstwy | Względne L2 |
+|---|---|
+| zejście LoRA Q (`wq_a` + `q_norm`) | 1,3e-6 |
+| pełna ścieżka Q (per-głowicowa norma + rope) | 1,4e-6 |
+| ścieżka KV | 1,3e-6 |
+| wyjście uwagi (rope odwrotne + grupowana LoRA) | 2,1e-6 |
+| SwiGLU eksperta NVFP4 | 1,8e-6 |
+| bramka MoE (wybór i wagi) | dokładnie |
+
+To jest zarazem walidacja obu konwersji kwantyzacji od końca do końca: projekcje
+liczone są na wagach przepuszczonych przez produkcyjne przepakowanie NVFP4 i
+przeniesienie FP8 na skalę wierszową.
+
+Wychwycone przy okazji szczegóły, które przy pomyłce nie krzyczą, tylko dają
+liczby wyglądające sensownie:
+
+- rope obraca pary SĄSIADUJĄCE `(2i, 2i+1)`, a nie połówki wektora — reszta
+  FORGE używa układu NeoX. Osobny test kontrolny potwierdza, że próg
+  porównania faktycznie odróżnia oba układy.
+- rope obejmuje tylko ostatnie 64 wymiary głowicy z 512, a na wyjściu uwagi jest
+  nakładane ODWROTNIE (sprzężenie tego samego obrotu).
+- Q dostaje drugą normalizację RMS — per głowica i BEZ wagi — już po projekcji.
+- Warstwy z kompresją KV używają YaRN i bazy 160000, pozostałe czystego rope 10000.
+- Wyjście uwagi dzieli się na 8 grup, każda z własnym blokiem `wo_a`;
+  potraktowanie `wo_a` jako jednej macierzy daje poprawny kształt i złe liczby.
+- Bias bramki wpływa WYŁĄCZNIE na wybór top-k; wagi bierze się z wyników bez
+  niego, normalizuje do sumy 1 i dopiero mnoży przez `route_scale` 1,5.
+- SwiGLU obcina bramkę tylko od góry, a wejście obustronnie — obie operacje
+  przed mnożeniem.
+
 ## Architektura — co trzeba odtworzyć
 
 Siedem niezależnych mechanizmów, z których FORGE nie ma żadnego.
@@ -135,7 +181,8 @@ Aktywacje kwantyzowane dynamicznie do FP8 przed każdym GEMM-em.
 
 ## Czego brakuje, w kolejności
 
-1. **Mikser: uwaga latentna** z LoRA, rope odwrotnym na wyjściu i kotwicą.
+1. **Mikser: uwaga latentna** — matematyka jest przypięta testami (patrz wyżej),
+   brakuje kerneli GPU i typu `DevWeight` ze skalami wierszowymi.
 2. **Podwójny strumień KV** — okno plus kompresor, ze stanem dekodowania.
 3. **Indekser i rzadka uwaga** po zebranych indeksach.
 4. **Bramka MoE** z biasem, `sqrtsoftplus` i routingiem haszowanym.

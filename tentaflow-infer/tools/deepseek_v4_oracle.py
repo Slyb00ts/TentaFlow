@@ -202,16 +202,39 @@ up_act = torch.clamp(up_act, min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
 gate_act = torch.clamp(gate_act, max=SWIGLU_LIMIT)
 expert_out = (torch.nn.functional.silu(gate_act) * up_act) @ w2.T
 
+# --- sciezka wyjscia uwagi: rope ODWROTNE + grupowana LoRA ------------------
+
+o_groups = cfg["o_groups"]
+o_lora_rank = cfg["o_lora_rank"]
+wo_a = torch.from_numpy(load_matrix(f"{p}.wo_a.weight").copy())
+wo_b = torch.from_numpy(load_matrix(f"{p}.wo_b.weight").copy())
+
+# Wejscie: syntetyczne wyjscie uwagi [1, S, heads, head_dim]. Sciezka wyjsciowa
+# jest funkcja czysta, wiec nie wymaga policzenia samej uwagi.
+oi = np.arange(SEQLEN * n_heads * head_dim, dtype=np.int64)
+attn_np = ((oi * 22695477 % 1997).astype(np.float32) / 998.5 - 1.0).reshape(
+    1, SEQLEN, n_heads, head_dim)
+attn_in = torch.from_numpy(attn_np.copy())
+
+o = attn_in.clone()
+apply_rotary_emb(o[..., -rope_head_dim:], freqs_cis, True)
+o = o.view(1, SEQLEN, o_groups, -1)
+wo_a_g = wo_a.view(o_groups, o_lora_rank, -1)
+o = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a_g.float())
+attn_out = o.flatten(2) @ wo_b.float().T
+
 out = sys.argv[1]
 with open(out, "wb") as f:
-    f.write(struct.pack("<8i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
-                        GATE_LAYER, TOPK, N_EXPERTS))
+    f.write(struct.pack("<10i", SEQLEN, dim, n_heads, head_dim, rope_head_dim,
+                        GATE_LAYER, TOPK, N_EXPERTS, o_groups, o_lora_rank))
     for t in (x, qr, q, kv):
         f.write(t.detach().float().contiguous().numpy().tobytes())
     f.write(gx_t.contiguous().numpy().tobytes())
     f.write(indices.to(torch.int32).contiguous().numpy().tobytes())
     f.write(weights.float().contiguous().numpy().tobytes())
     f.write(expert_out.float().contiguous().numpy().tobytes())
+    f.write(attn_in.float().contiguous().numpy().tobytes())
+    f.write(attn_out.float().contiguous().numpy().tobytes())
 print("bramka: pierwsze indeksy", indices[0].tolist(), "wagi", [round(v,4) for v in weights[0].tolist()])
 print(f"zapisano {out}: seq={SEQLEN} dim={dim} heads={n_heads} hd={head_dim} rope={rope_head_dim} ratio={ratio}")
 print("q  abs mean", q.abs().mean().item(), "kv abs mean", kv.abs().mean().item())
