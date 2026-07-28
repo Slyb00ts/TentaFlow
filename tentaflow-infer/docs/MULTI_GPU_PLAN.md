@@ -102,8 +102,8 @@ mieści się z zapasem.
 
 | krok | zawartość | dlaczego w tej kolejności |
 |---|---|---|
-| **M1** | HAL wielourządzeniowy: otwarcie N kart, włączenie P2P, kopia między urządzeniami, zdarzenia międzystrumieniowe | bez tego nie da się zrobić niczego |
-| **M2** | `DeviceCapability` + planer podziału + kalibracja + pętla korekty, z testami | to jest odpowiedź na „nie jak najwolniejsza" |
+| **M1** ✅ częściowo | otwarcie N kart w jednym procesie **zweryfikowane**, kalibracja per karta działa. ZOSTAJE: kopia między urządzeniami i zdarzenia międzystrumieniowe w HAL | bez tego nie da się zrobić niczego |
+| **M2** ✅ | `DeviceCapability` + planer + kalibracja + pętla korekty, 10 testów | to jest odpowiedź na „nie jak najwolniejsza" |
 | **M3** | TP dla dekodowania: podział kolumnowy qkv/gate/up, wierszowy o/down, redukcja na zdarzeniach | pierwszy realny zysk przy jednym strumieniu |
 | **M4** | TP dla prefillu z WŁASNYM podziałem (inny stosunek mocy!) | prefill ma odwrotny stosunek kart |
 | **M5** | PP dla modeli ponad 20 GB + mikrobatching | pojemność i przepustowość |
@@ -125,3 +125,26 @@ mieści się z zapasem.
   innej kolejności niż dziś da inne ostatnie bity. Trzeba świadomie wybrać
   deterministyczną kolejność (zawsze urządzenie 0, potem 1) i udokumentować, że
   wynik TP nie musi być bitowo równy jednokartowemu.
+
+## 6. Stan wykonania
+
+**Zrobione i sprawdzone na sprzęcie:**
+
+- **Dwie architektury w jednym procesie działają.** `gfx1030` i `gfx1100`
+  otwarte równocześnie, każda z własnym zestawem artefaktów — to było główne
+  ryzyko techniczne i jest zdjęte.
+- **Planer podziału** (`crates/forge-engine/src/multi_gpu.rs`) z 10 testami:
+  podział proporcjonalny, ODWRÓCENIE stosunku dla pracy ograniczonej liczeniem,
+  limit VRAM, dokładna suma udziałów przy niewygodnych liczbach, próg
+  opłacalności, zbieżność pętli korekty i jej odporność na pojedynczy zakłócony
+  pomiar.
+- **Kalibracja na realnych kartach**: zmierzone 188 i 534 GB/s (kopia D2D, więc
+  odczyt+zapis), stosunek 1 : 2,8 — zgodny co do kierunku z pomiarem czystego
+  odczytu 336 / 735 GB/s. Planer dzieli dekodowanie 26 / 74%.
+
+**Nie zrobione — i to jest większość pracy:**
+
+M3-M6, czyli same techniki równoległości. Fundament stoi, ale żadna z nich nie
+liczy jeszcze ani jednego tokena na dwóch kartach naraz. Do TP brakuje w HAL
+kopii między urządzeniami i synchronizacji na zdarzeniach (bez niej, na
+synchronizacji hosta, narzut zjada 30% zysku — patrz sekcja 2).

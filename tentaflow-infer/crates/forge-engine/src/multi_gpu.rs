@@ -259,6 +259,54 @@ pub fn update_capability(
     Ok(())
 }
 
+/// Mierzy możliwości KAŻDEJ karty tym samym testem, zamiast wpisywać liczby.
+///
+/// Pasmo mierzymy kopią D2D w obrębie karty: to jedyny test niewymagający
+/// kerneli, więc działa identycznie na architekturze bez WMMA i z WMMA — a
+/// właśnie porównywalność między różnymi kartami jest tu celem. Kopia czyta i
+/// zapisuje, stąd czynnik 2.
+///
+/// `free_bytes` bierzemy z urządzenia, bo to on ogranicza udział w podziale.
+pub fn calibrate(devices: &[std::sync::Arc<dyn forge_hal::Device>]) -> Result<Vec<DeviceCapability>> {
+    const PROBE_BYTES: usize = 128 << 20;
+    const WARMUP: usize = 2;
+    const ITERS: usize = 8;
+    let mut caps = Vec::with_capacity(devices.len());
+    for device in devices {
+        let stream = device.create_stream()?;
+        let source = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
+        let target = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
+        for _ in 0..WARMUP {
+            device.copy(&source, 0, &target, 0, PROBE_BYTES, &stream)?;
+        }
+        stream.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..ITERS {
+            device.copy(&source, 0, &target, 0, PROBE_BYTES, &stream)?;
+        }
+        stream.synchronize()?;
+        let seconds = started.elapsed().as_secs_f64();
+        let bytes_per_s = if seconds > 0.0 {
+            2.0 * (PROBE_BYTES * ITERS) as f64 / seconds
+        } else {
+            0.0
+        };
+        let free_bytes = device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
+        caps.push(DeviceCapability {
+            stream_bytes_per_s: bytes_per_s,
+            // Kopia D2D nie mierzy mnożenia macierzy, a na tych kartach
+            // stosunek mocy w LICZENIU bywa ODWROTNY niż w pamięci (6900 XT ma
+            // 97 TOPS na `dot4`, 7900 XT 43). Skopiowanie tu wagi pamięciowej
+            // dałoby więc start zły w złą stronę. Startujemy RÓWNO i pozwalamy
+            // pętli korekty dojść do prawdy z obserwacji — równy start jest
+            // najgorzej o 2x od optimum, a skopiowany bywa 4x.
+            matmul_ops_per_s: 1.0,
+            free_bytes,
+        });
+    }
+    Ok(caps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
