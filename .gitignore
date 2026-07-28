@@ -11,6 +11,7 @@ target-service-context-test/*
 # Wczesniej trzymane w target/debug/ — `cargo clean` je wywalal. Teraz
 # osobny katalog `.runtime/` poza target/.
 /.runtime/
+/.runtime-B/
 obj/
 bin/
 *.o
