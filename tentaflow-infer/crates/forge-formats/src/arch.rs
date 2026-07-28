@@ -837,6 +837,20 @@ fn build_moe_mtp(
 }
 
 impl ModelDescriptor {
+    /// Czy model używa RoPE PRZEPLATANEGO (pary `(2i, 2i+1)`) zamiast NeoX
+    /// (pary `(i, i + d/2)`).
+    ///
+    /// Rodzina Llama zapisuje w GGUF wagi w układzie, dla którego llama.cpp
+    /// stosuje rotację przeplataną; Qwen, Gemma i DeepSeek używają NeoX.
+    /// Pomylenie tych dwóch definicji nie psuje pozycji zerowej (kąt = 0), więc
+    /// model odpowiada poprawnie na prompt jednotokenowy i rozjeżdża się dopiero
+    /// od drugiego tokenu — dokładnie tak objawiał się błąd znaleziony
+    /// 2026-07-28 przez porównanie z `llama-eval-callback`.
+    pub fn rope_interleaved(&self) -> bool {
+        matches!(self.arch.as_str(), "llama" | "mistral")
+    }
+
+
     /// Detect the architecture of a parsed GGUF file and resolve its weight map.
     pub fn detect(gguf: &Gguf) -> Result<Self> {
         let arch = gguf

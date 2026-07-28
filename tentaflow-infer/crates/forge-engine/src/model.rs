@@ -5856,8 +5856,8 @@ impl Model {
                 stream,
             )?;
         }
-        self.trace_f16("embd", &pb.h, 0, rows * hidden);
-        self.trace_f16("attn_norm-0", &pb.x, 0, rows * hidden);
+        self.trace_f16("embd", &pb.h, (rows - 1) * hidden * 2, hidden);
+        self.trace_f16("attn_norm-0", &pb.x, (rows - 1) * hidden * 2, hidden);
         trace.mark(self.device.as_ref(), "embed");
 
         let n_layers = self.weights.layers.len();
@@ -5963,8 +5963,8 @@ impl Model {
                 }
             }
             if l == 0 {
-                self.trace_f16("Qcur-0", &pb.q, 0, rows * q_dim);
-                self.trace_f16("Kcur-0", &pb.k, 0, rows * kv_dim);
+                self.trace_f16("Qcur-0", &pb.q, (rows - 1) * q_dim * 2, q_dim);
+                self.trace_f16("Kcur-0", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
             }
             trace.mark(self.device.as_ref(), "gemm_qkv");
 
@@ -6053,6 +6053,10 @@ impl Model {
                 self.rope_freqs_at(&p, l),
                 stream,
             )?;
+            if l == 0 {
+                self.trace_f16("Qrope-0", &pb.q, (rows - 1) * q_dim * 2, q_dim);
+                self.trace_f16("Krope-0", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
+            }
             trace.mark(self.device.as_ref(), "norm_rope");
 
             if let KvQuant::Rot { bits, .. } = self.kv.cfg.quant {
@@ -6333,8 +6337,8 @@ impl Model {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, rows, stream)?;
             }
             if l == 0 {
-                self.trace_f16("attn_out-0", &pb.attn_out, 0, rows * q_dim);
-                self.trace_f16("kqv_out-0", &pb.o_out, 0, rows * hidden);
+                self.trace_f16("attn_out-0", &pb.attn_out, (rows - 1) * q_dim * 2, q_dim);
+                self.trace_f16("kqv_out-0", &pb.o_out, (rows - 1) * hidden * 2, hidden);
             }
             trace.mark(self.device.as_ref(), "gemm_o");
             let fp8mod_fuse_gateup =
@@ -6482,7 +6486,7 @@ impl Model {
                 )?;
             }
             trace.mark(self.device.as_ref(), "norm_res2");
-            self.trace_f16(&format!("l_out-{l}"), &pb.h, 0, rows * hidden);
+            self.trace_f16(&format!("l_out-{l}"), &pb.h, (rows - 1) * hidden * 2, hidden);
         }
 
         if wait_for_completion || tier_t0.is_some() {

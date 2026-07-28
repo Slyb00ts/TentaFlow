@@ -1855,6 +1855,84 @@ impl HostWeight {
     }
 }
 
+
+/// Przestawia wiersze Q/K tak, żeby kernel RoPE w stylu NeoX policzył rotację
+/// PRZEPLATANĄ, której wymaga rodzina Llama.
+///
+/// NeoX obraca pary `(j, j + d/2)`, styl przeplatany pary `(2i, 2i+1)`. Po
+/// przestawieniu wierszy w kolejność `[0, 2, 4, …, 1, 3, 5, …]` obie definicje
+/// dają ten sam wynik przy tej samej częstotliwości `i`. Iloczyn skalarny Q·K
+/// jest niewrażliwy na permutację wymiarów zastosowaną do OBU macierzy, a V i
+/// projekcja wyjściowa nie są ruszane — więc uwaga wychodzi bitowo ta sama, co
+/// przy natywnym kernelu przeplatanym.
+///
+/// Wiersze są niezależne w każdym formacie blokowym (bloki idą wzdłuż kolumn),
+/// więc permutacja działa bez dekwantyzacji.
+fn permute_rope_pairs(weight: &mut HostWeight, head_dim: usize) -> Result<()> {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(ForgeError::Format(format!(
+            "RoPE przeplatany wymaga parzystego head_dim, jest {head_dim}"
+        )));
+    }
+    let (data, rows) = match weight {
+            HostWeight::F16 { data, rows, .. } => (data, *rows),
+            HostWeight::Q8_0 { data, rows, .. } => (data, *rows),
+            HostWeight::Q4K { data, rows, .. } => (data, *rows),
+            HostWeight::Q6K { data, rows, .. } => (data, *rows),
+            HostWeight::Q5K { data, rows, .. } => (data, *rows),
+            HostWeight::Q3K { data, rows, .. } => (data, *rows),
+            HostWeight::Q2K { data, rows, .. } => (data, *rows),
+            HostWeight::Q4_0 { data, rows, .. } => (data, *rows),
+            HostWeight::Q4_1 { data, rows, .. } => (data, *rows),
+            HostWeight::Q5_0 { data, rows, .. } => (data, *rows),
+            HostWeight::Q5_1 { data, rows, .. } => (data, *rows),
+            HostWeight::Iq4Nl { data, rows, .. } => (data, *rows),
+            HostWeight::Iq4Xs { data, rows, .. } => (data, *rows),
+            HostWeight::Mxfp4 { data, rows, .. } => (data, *rows),
+            HostWeight::Iq2Xs { data, rows, .. } => (data, *rows),
+            HostWeight::Iq2S { data, rows, .. } => (data, *rows),
+            HostWeight::Iq3S { data, rows, .. } => (data, *rows),
+            HostWeight::Iq2Xxs { data, rows, .. } => (data, *rows),
+            HostWeight::Iq3Xxs { data, rows, .. } => (data, *rows),
+            HostWeight::Iq1S { data, rows, .. } => (data, *rows),
+            HostWeight::Iq1M { data, rows, .. } => (data, *rows),
+            HostWeight::NvFp4Gguf { data, rows, .. } => (data, *rows),
+            _ => {
+                return Err(ForgeError::Unsupported(
+                    "RoPE przeplatany nie obsługuje tego formatu wag".into(),
+                ));
+            }
+    };
+    if rows == 0 || !rows.is_multiple_of(head_dim) {
+        return Err(ForgeError::Format(format!(
+            "liczba wierszy {rows} nie jest wielokrotnością head_dim {head_dim}"
+        )));
+    }
+    if !data.len().is_multiple_of(rows) {
+        return Err(ForgeError::Format(
+            "rozmiar macierzy nie dzieli się na równe wiersze".into(),
+        ));
+    }
+    let row_bytes = data.len() / rows;
+    let half = head_dim / 2;
+    let mut out = vec![0u8; data.len()];
+    for head in 0..rows / head_dim {
+        let base = head * head_dim;
+        for i in 0..half {
+            let src_even = (base + 2 * i) * row_bytes;
+            let src_odd = (base + 2 * i + 1) * row_bytes;
+            let dst_lo = (base + i) * row_bytes;
+            let dst_hi = (base + half + i) * row_bytes;
+            out[dst_lo..dst_lo + row_bytes]
+                .copy_from_slice(&data[src_even..src_even + row_bytes]);
+            out[dst_hi..dst_hi + row_bytes]
+                .copy_from_slice(&data[src_odd..src_odd + row_bytes]);
+        }
+    }
+    *data = out;
+    Ok(())
+}
+
 /// Fetch a weight matrix in the most direct form a kernel can consume.
 fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
     if let Some(weight) = src.fetch_deepseek(name)? {
@@ -3407,10 +3485,20 @@ impl ModelWeights {
             // różnią się między warstwami z oknem a globalnymi.
             let q_dim = q_dim_at(idx);
             let kv_dim = kv_dim_at(idx);
-            let q = fetch_matrix(src, name(WeightRole::AttnQ)?)?;
-            let k = fetch_matrix(src, name(WeightRole::AttnK)?)?;
+            let mut q = fetch_matrix(src, name(WeightRole::AttnQ)?)?;
+            let mut k = fetch_matrix(src, name(WeightRole::AttnK)?)?;
             expect(&at("attn_q"), &q, q_dim, p.hidden_size)?;
             expect(&at("attn_k"), &k, kv_dim, p.hidden_size)?;
+            // Rodzina Llama wymaga rotacji przeplatanej, a wszystkie kernele
+            // RoPE w silniku liczą wariant NeoX. Przestawienie wierszy Q i K raz
+            // przy ładowaniu sprowadza jedno do drugiego bez kosztu w czasie
+            // wykonania — patrz `permute_rope_pairs`.
+            if descriptor.rope_interleaved() {
+                let head_dim = p.head_dim_at(idx);
+                permute_rope_pairs(&mut q, head_dim)?;
+                permute_rope_pairs(&mut k, head_dim)?;
+            }
+            let (q, k) = (q, k);
             // Brak projekcji V oznacza wariant, w którym V = K (warstwy
             // globalne Gemmy 4); wtedy fuzja bierze K drugi raz.
             let v = if p.has_v_proj(idx) {
