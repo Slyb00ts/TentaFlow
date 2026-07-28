@@ -93,6 +93,8 @@ static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceL
 static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static MODEL_BUNDLE_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static ML_STUDIO_EXPORT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+static PROJECT_STUDIO_EXPORT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> =
+    OnceLock::new();
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
 #[cfg(feature = "graph")]
 static GRAPH_MANAGER: OnceLock<Arc<graph::GraphManager>> = OnceLock::new();
@@ -310,6 +312,34 @@ pub fn ml_studio_export_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssue
                     }
                     trigger_mesh_broadcast_on_rotate(
                         signed_urls::UrlScope::MlStudioExport.key_name(),
+                    );
+                },
+            );
+        }
+        issuer
+    })
+}
+
+/// Process-wide signing key for `/project-studio/exports/<ref>` archive
+/// download URLs. Same disk-backed rotation contract as the other issuers.
+pub fn project_studio_export_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    PROJECT_STUDIO_EXPORT_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::ProjectStudioExport,
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::ProjectStudioExport.key_name())
+        {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::ProjectStudioExport.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::ProjectStudioExport.key_name(),
                     );
                 },
             );

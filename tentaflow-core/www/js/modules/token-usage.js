@@ -199,7 +199,7 @@ function renderUsagePanel() {
   const isMonthly = usageFilters.period === 'monthly';
   panel.innerHTML = `
     <section class="card">
-      <div class="tu-filters">
+      <div class="tu-filters tf-toolbar">
         <tf-select id="tu-period" label="${escapeAttr(T('period'))}" value="${escapeAttr(usageFilters.period)}">
           <option value="daily">${escapeHtml(T('period_daily'))}</option>
           <option value="monthly">${escapeHtml(T('period_monthly'))}</option>

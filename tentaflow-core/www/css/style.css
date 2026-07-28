@@ -5925,3 +5925,22 @@ tf-screen {
 .baseline-report-table td { padding: 8px; border-bottom: 1px solid var(--border); }
 .baseline-report-label { color: var(--text-2); }
 .baseline-report-value { color: var(--text); font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Rules: the "add substitution" row is a toolbar, not a stacked form. */
+.rules-add-row {
+  align-items: flex-end;
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.rules-add-row tf-input {
+  flex: 1 1 200px;
+  min-width: 160px;
+  max-width: 320px;
+}
+
+.rules-add-row tf-input.rules-priority {
+  flex: 0 0 auto;
+  min-width: 110px;
+  max-width: 120px;
+}

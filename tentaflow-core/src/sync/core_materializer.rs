@@ -966,16 +966,44 @@ fn apply_sync_user_org_profile(
 
 fn apply_flow(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> LedgerResult<usize> {
     let id = &operation.body.resource_id;
+
+    // Seed-guard for system flows (ps-chat & co.). System flows are seeded
+    // per-node with a fixed id and refreshed by the LOCAL seed, so the mesh is
+    // never their source of truth: EVERY remote write (Insert/Update/Delete)
+    // reaching a row locally marked is_system=1 is rejected — a synced write
+    // would desync one node's copy of a platform resource and break the module
+    // that depends on it (project chat dispatches ps-chat by this fixed id).
+    // The wire is_system flag is never trusted either: no node legitimately
+    // produces an is_system=true op (flow captures always send false, the seed
+    // writes raw SQL without capture), so Insert/Update below coerce it to 0.
+    let local_is_system: Option<bool> = tx
+        .query_row(
+            "SELECT is_system FROM flows WHERE id = ?1",
+            rusqlite::params![id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if local_is_system == Some(true) {
+        tracing::warn!(
+            flow_id = %id,
+            action = ?operation.body.action,
+            "sync: rejected remote write to a local system flow (seed-owned)"
+        );
+        return Ok(0);
+    }
+
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
                 "INSERT INTO flows \
-                 (id, name, description, is_default, service_type, flow_json, status, published_model_name) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (id, name, description, is_default, service_type, flow_json, status, published_model_name, is_system) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, description = excluded.description, is_default = excluded.is_default, \
                  service_type = excluded.service_type, flow_json = excluded.flow_json, \
                  status = excluded.status, published_model_name = excluded.published_model_name, \
+                 is_system = excluded.is_system, \
                  updated_at = datetime('now')",
                 rusqlite::params![
                     id,
@@ -986,6 +1014,7 @@ fn apply_flow(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Ledg
                     field_string(operation, "flow_json")?,
                     field_string_or(operation, "status", "draft")?,
                     field_optional_string(operation, "published_model_name")?,
+                    false,
                 ],
             )
             .map_err(sql_error),
@@ -998,6 +1027,7 @@ fn apply_flow(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Ledg
                  service_type = CASE WHEN ?6 THEN ?7 ELSE service_type END, \
                  flow_json = COALESCE(?8, flow_json), status = COALESCE(?9, status), \
                  published_model_name = CASE WHEN ?10 THEN ?11 ELSE published_model_name END, \
+                 is_system = COALESCE(?12, is_system), \
                  version = version + 1, updated_at = datetime('now') \
                  WHERE id = ?1",
                 rusqlite::params![
@@ -1012,6 +1042,7 @@ fn apply_flow(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Ledg
                     optional_present_string(operation, "status")?,
                     nullable_update_string(operation, "published_model_name")?.0,
                     nullable_update_string(operation, "published_model_name")?.1,
+                    false,
                 ],
             )
             .map_err(sql_error)

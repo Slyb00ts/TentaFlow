@@ -906,6 +906,10 @@ pub struct FlowSummary {
     /// access-key wizard must grant — the flow's own UUID is not callable.
     #[serde(default)]
     pub published_model_name: Option<String>,
+    /// `flows.is_system` — platform-seeded flow; the server rejects user
+    /// edit/delete/status changes, so the UI can hide those actions.
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -918,6 +922,10 @@ pub struct FlowDetail {
     pub enabled: bool,
     /// Raw flow status column: "active" | "draft" | "decoded" itp.
     pub status: String,
+    /// `flows.is_system` — platform-seeded flow; the server rejects user
+    /// edit/delete/status changes, so the UI can hide those actions.
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6588,6 +6596,21 @@ pub enum SystemEventPayload {
         status: String,
         message: String,
     },
+    /// Personal notification push (Project Studio). Variant appended at the
+    /// END — SystemEventPayload is append-only on the wire like every other
+    /// enum. Unlike the broadcast variants above, this one is PRIVATE:
+    /// ws_binary forwards it only to connections authenticated as `user_id`.
+    /// The badge/list source of truth stays NotificationsListRequest; this
+    /// event only triggers a toast + badge refresh.
+    UserNotification {
+        user_id: String,
+        notification_id: String,
+        project_id: String,
+        kind: String,
+        title: String,
+        body: String,
+        link_json: String,
+    },
 }
 
 /// Zbiorczy payload deployment (req + res + stream chunks). Jeden wariant
@@ -7901,6 +7924,12 @@ pub enum MessageBody {
     // JEDEN wariant na całą rodzinę (overview + browse + mkdir + migrate) w
     // `StorageAdminPayload`.
     StorageAdminBody(crate::storage::StorageAdminPayload),
+
+    // ----- Project Studio (rejestr projektów, wiedza, ingest, chat, ustawienia) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
+    // rodzinę (request+response+stream) w `ProjectStudioPayload`.
+    ProjectStudioBody(crate::project_studio::ProjectStudioPayload),
 }
 
 // =============================================================================
@@ -7978,6 +8007,20 @@ mod tests {
                 },
             },
         ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn system_event_user_notification_round_trip() {
+        let body = MessageBody::SystemEventBody(SystemEventPayload::UserNotification {
+            user_id: "u1".to_string(),
+            notification_id: "n1".to_string(),
+            project_id: "p1".to_string(),
+            kind: "run_item_assigned".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            link_json: "{}".to_string(),
+        });
         assert_eq!(round_trip(body.clone()), body);
     }
 

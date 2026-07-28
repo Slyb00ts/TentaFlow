@@ -305,6 +305,7 @@ fn row_to_flow(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlow> {
         flow_json: row.get(6)?,
         status: row.get(7)?,
         published_model_name: row.get(8)?,
+        is_system: row.get(11)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
@@ -4031,7 +4032,7 @@ pub fn replace_routing_config_from_sync(
 
 // --- Flows ---
 
-const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at";
+const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at, is_system";
 
 pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>> {
     let conn = acquire(pool)?;
@@ -4079,7 +4080,7 @@ pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFl
     // tylko jawny `*` jest wildcardem; reszta wzorca jest literalna. ESCAPE '\'
     // mówi LIKE, że `\` poprzedza znak literalny.
     let mut stmt = conn.prepare_cached(
-        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.published_model_name, f.created_at, f.updated_at \
+        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.published_model_name, f.created_at, f.updated_at, f.is_system \
          FROM flows f INNER JOIN flow_model_bindings b ON f.id = b.flow_id \
          WHERE ?1 LIKE REPLACE(REPLACE(REPLACE(REPLACE(b.model_pattern, '\\', '\\\\'), '%', '\\%'), '_', '\\_'), '*', '%') ESCAPE '\\' \
          AND f.status = 'active' ORDER BY b.priority DESC LIMIT 1",
@@ -4210,6 +4211,15 @@ fn flow_changed_fields(
     fields.insert(
         "published_model_name".to_string(),
         field_optional_string(params.published_model_name),
+    );
+    // FlowParams deliberately has no is_system and user handlers reject edits
+    // of system flows, so every capture minted here is explicitly non-system.
+    // The column still travels: apply_flow's seed-guard uses it to distinguish
+    // a user edit (is_system=false → rejected on a local system row) from a
+    // seed refresh (is_system=true → accepted).
+    fields.insert(
+        "is_system".to_string(),
+        crate::sync::ledger::FieldValue::Bool(false),
     );
     fields
 }
@@ -17622,14 +17632,24 @@ mod alias_resolve_tests {
         assert_eq!(tts.target_model, "tts-1");
         assert!(tts.is_active);
 
-        let summary = resolve_model_alias(&db, "teams-summary", None).unwrap();
-        assert!(summary.is_some(), "Alias teams-summary powinien istniec");
-        let summary = summary.unwrap();
+        // An unbound alias (empty target) registers PARKED: the row exists so the
+        // admin can bind a model later, but the router must never resolve it.
+        assert!(
+            resolve_model_alias(&db, "teams-summary", None)
+                .unwrap()
+                .is_none(),
+            "Zaparkowany alias teams-summary nie powinien byc rozwiazywany"
+        );
+        let summary = list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == "teams-summary")
+            .expect("Alias teams-summary powinien byc zarejestrowany (zaparkowany)");
         assert_eq!(
             summary.target_model, "",
             "teams-summary ma pusty target — admin uzupelnia recznie"
         );
-        assert!(summary.is_active);
+        assert!(!summary.is_active, "pusty target => alias zaparkowany");
 
         // Act 2 — dezaktywacja (symulacja zatrzymania addonu)
         set_model_alias_active(&db, "teams-stt", false)
@@ -23251,6 +23271,35 @@ pub fn recent_conversation_messages(
     Ok(rows)
 }
 
+/// Appends ONE project-chat (ps-chat) message to a session and returns its row
+/// id — the wire `message_id` of `ChatHistoryResponse`/`ChatStreamEnd`.
+/// Separate from `insert_conversation_messages` because ps-chat needs the id
+/// back and persists `citations_json` (assistant replies), which the generic
+/// turn-batch writer has no business carrying.
+pub fn append_project_chat_message(
+    pool: &DbPool,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    citations_json: Option<&str>,
+) -> Result<i64> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let next_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM conversation_messages WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO conversation_messages (session_id, seq, role, content, citations_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![session_id, next_seq, role, content, citations_json],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
+}
+
 #[cfg(test)]
 mod shared_setting_allowlist_tests {
     use super::*;
@@ -25775,22 +25824,26 @@ mod token_metrics_tests {
 
     #[test]
     fn histogram_bucket_index_maps_edges() {
+        // Bucket i covers (edges[i-1], edges[i]]: a value EQUAL to an edge falls
+        // in the lower bucket. This mirrors `percentile_from_histogram`, which
+        // interpolates inside bucket i using edges[i] as its upper bound.
         // TTFT edges [0,50,100,200,400,800,1600,3200,6400,∞] → 10 buckets 0..=9.
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 0), 0);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 1), 1);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 50), 1);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 51), 2);
-        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 9);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 8);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 999_999), 9);
         // decode_tps edges [0,10,...,320,∞] → 8 buckets 0..=7.
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 0.0), 0);
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5.0), 1);
-        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 7);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 6);
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5000.0), 7);
         // e2e edges → 10 buckets 0..=9.
         assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 0), 0);
-        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 3);
-        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 9);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 2);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 8);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 999_999), 9);
     }
 
     #[test]

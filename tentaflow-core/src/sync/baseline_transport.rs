@@ -306,20 +306,30 @@ pub async fn run_donor_session<S: FrameStream>(
     }
 
     // Content-aware role decision. The node that HOLDS MORE content is the donor;
-    // ties break on the lower node_id. We compare our own ledger op count against
-    // the count the requester advertised in `BaselineElect`, so the empty node
-    // adopts from the data-holder, never the reverse. If this makes the REQUESTER
-    // the rightful donor (it holds more), we refuse: the requester's own
-    // reciprocal pull (where it is the donor) is the one that must serve. Both
-    // sides feed the identical two `(node_id, op_count)` pairs into the pure
-    // decision, so they agree on a single donor without extra negotiation.
+    // we compare our own ledger op count against the count the requester
+    // advertised in `BaselineElect`, so the empty node adopts from the
+    // data-holder, never the reverse. If this makes the REQUESTER the rightful
+    // donor (it holds more), we refuse: the requester's own reciprocal pull
+    // (where it is the donor) is the one that must serve. On EQUAL content the
+    // joiner's explicit mandate (`proposed_donor` from pairing confirm,
+    // epoch-reconcile or an admin op) settles the tie instead of the blind
+    // node_id comparison — a mandated donor with the higher node_id must still
+    // serve, otherwise the joiner (which validates its mandate pre-flight)
+    // aborts on every attempt and the mesh never converges. Content still
+    // outranks the mandate when the counts differ, so an emptier node never
+    // donates over a fuller peer.
     let local_op_count = crate::sync::runtime::local_op_count() as u64;
-    let (donor, joiner) = decide_roles_by_content(
-        local_node_id,
-        local_op_count,
-        remote_node_id,
-        elect.sender_op_count,
-    );
+    let (donor, joiner) = if local_op_count == elect.sender_op_count {
+        let proposed = (!elect.proposed_donor.is_empty()).then_some(elect.proposed_donor.as_str());
+        decide_roles(local_node_id, remote_node_id, proposed)
+    } else {
+        decide_roles_by_content(
+            local_node_id,
+            local_op_count,
+            remote_node_id,
+            elect.sender_op_count,
+        )
+    };
     if donor != local_node_id {
         let nack = BaselineAck {
             accepted: false,

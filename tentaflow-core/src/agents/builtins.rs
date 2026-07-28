@@ -42,6 +42,20 @@ pub enum CoreToolName {
     /// through the interaction registry, never the synchronous core path. Not in
     /// sub-agent allowlists by default — only top-level agents ask directly.
     AskUser,
+    /// `core.project_search(project_id, query, top_k?, source_ids?)` — semantic
+    /// search over a Project Studio knowledge base. Async (query embedding goes
+    /// through the platform executor); membership of the run's user principal
+    /// is enforced per call.
+    ProjectSearch,
+    /// `core.project_list_sources(project_id)` — the knowledge-source catalog
+    /// of a project. Async path (same membership gate as project_search).
+    ProjectListSources,
+    /// `core.project_case_save(...)` — saves ONE generated manual test case
+    /// into a Project Studio generation. The target project/generation is NOT
+    /// a parameter: it binds server-side via `envelope.meta["ps_generation"]`
+    /// minted at spawn, so the model can never redirect output to another
+    /// project. Async path (per-call membership + editor re-check).
+    CaseSave,
 }
 
 impl CoreToolName {
@@ -54,6 +68,9 @@ impl CoreToolName {
             CoreToolName::AgentList => "core.agent_list",
             CoreToolName::AgentCancel => "core.agent_cancel",
             CoreToolName::AskUser => "core.ask_user",
+            CoreToolName::ProjectSearch => "core.project_search",
+            CoreToolName::ProjectListSources => "core.project_list_sources",
+            CoreToolName::CaseSave => "core.project_case_save",
         }
     }
 
@@ -66,6 +83,9 @@ impl CoreToolName {
             CoreToolName::AgentList => "agent_list",
             CoreToolName::AgentCancel => "agent_cancel",
             CoreToolName::AskUser => "ask_user",
+            CoreToolName::ProjectSearch => "project_search",
+            CoreToolName::ProjectListSources => "project_list_sources",
+            CoreToolName::CaseSave => "project_case_save",
         }
     }
 
@@ -79,6 +99,9 @@ impl CoreToolName {
             "agent_list" => Some(CoreToolName::AgentList),
             "agent_cancel" => Some(CoreToolName::AgentCancel),
             "ask_user" => Some(CoreToolName::AskUser),
+            "project_search" => Some(CoreToolName::ProjectSearch),
+            "project_list_sources" => Some(CoreToolName::ProjectListSources),
+            "project_case_save" => Some(CoreToolName::CaseSave),
             _ => None,
         }
     }
@@ -95,6 +118,23 @@ impl CoreToolName {
     /// is offered to top-level agents by default, not gated on `max_subagents`.
     pub fn is_ask_user(self) -> bool {
         matches!(self, CoreToolName::AskUser)
+    }
+
+    /// True for the Project Studio knowledge builtins — async in tool_exec
+    /// (query embedding via the flow context's dispatcher), never routed
+    /// through `execute_core_tool`.
+    pub fn is_project_knowledge(self) -> bool {
+        matches!(
+            self,
+            CoreToolName::ProjectSearch | CoreToolName::ProjectListSources
+        )
+    }
+
+    /// True for `core.project_case_save` — the generation sink routed through
+    /// its own async arm in tool_exec (needs the envelope's server-minted
+    /// `ps_generation` binding, which the other paths never read).
+    pub fn is_case_save(self) -> bool {
+        matches!(self, CoreToolName::CaseSave)
     }
 
     /// True for the sub-agent control builtins, which are admitted to the tool
@@ -118,6 +158,9 @@ impl CoreToolName {
             CoreToolName::AgentList,
             CoreToolName::AgentCancel,
             CoreToolName::AskUser,
+            CoreToolName::ProjectSearch,
+            CoreToolName::ProjectListSources,
+            CoreToolName::CaseSave,
         ]
     }
 
@@ -260,6 +303,167 @@ impl CoreToolName {
                         }
                     },
                     "required": ["question"]
+                }),
+            },
+            CoreToolName::ProjectSearch => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Search the knowledge base of a Project Studio project the \
+                              current user is a member of. Returns the best-matching \
+                              passages with source name, file path, chunk index, score \
+                              and a text snippet."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "Id of the project whose knowledge base to search."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "The natural-language search query."
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Max passages to return (1-50, default 8)."
+                        },
+                        "source_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional: restrict the search to these source ids."
+                        }
+                    },
+                    "required": ["project_id", "query"]
+                }),
+            },
+            CoreToolName::ProjectListSources => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "List the knowledge sources of a Project Studio project the \
+                              current user is a member of (id, name, kind, status, file \
+                              and chunk counts)."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "Id of the project whose sources to list."
+                        }
+                    },
+                    "required": ["project_id"]
+                }),
+            },
+            CoreToolName::CaseSave => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Save ONE generated test case into the current generation. Call \
+                              it IMMEDIATELY after designing each case — only saved cases \
+                              count. The target project, generation and case KIND are bound \
+                              server-side; do not pass any ids or a kind. Manual generations \
+                              expect `steps`; code generations (ui/api/unit/perf/security) \
+                              expect `script` plus the extras of their kind — the other \
+                              fields are ignored. A [TOOL_ERROR] rejects only THIS case: fix \
+                              it per the message and retry."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Concise case title (1..200 characters)."
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "critical"],
+                            "description": "Case priority."
+                        },
+                        "preconditions": {
+                            "type": "string",
+                            "description": "Manual kind: state required before the steps."
+                        },
+                        "steps": {
+                            "type": "array",
+                            "description": "Manual kind: 1..50 ordered steps.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {"type": "string"},
+                                    "expected": {"type": "string"}
+                                },
+                                "required": ["action", "expected"]
+                            }
+                        },
+                        "test_data": {
+                            "type": "string",
+                            "description": "Manual kind: input data the tester needs."
+                        },
+                        "script": {
+                            "type": "string",
+                            "description": "Code kinds: the runnable script (max 64000 \
+                                            characters) honouring the execution contract of \
+                                            the kind stated in your task."
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Code kinds: programming language of the script \
+                                            (default and currently the only supported value: \
+                                            python)."
+                        },
+                        "config": {
+                            "type": "object",
+                            "description": "Kind ui: {viewport:{width,height}, timeout_ms, \
+                                            headed}. Kind api: {timeout_ms}.",
+                            "properties": {
+                                "timeout_ms": {"type": "integer"},
+                                "headed": {"type": "boolean"},
+                                "viewport": {
+                                    "type": "object",
+                                    "properties": {
+                                        "width": {"type": "integer"},
+                                        "height": {"type": "integer"}
+                                    }
+                                }
+                            }
+                        },
+                        "profile": {
+                            "type": "object",
+                            "description": "Kind perf: load profile of the Locust run.",
+                            "properties": {
+                                "users": {"type": "integer"},
+                                "spawn_rate": {"type": "number"},
+                                "duration_secs": {"type": "integer"}
+                            }
+                        },
+                        "checklist": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Kind security: up to 50 short statements of what \
+                                            the script verifies."
+                        },
+                        "build_profile_ref": {
+                            "type": "string",
+                            "description": "Kind unit: id of the code source whose build \
+                                            profile this case runs against."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Up to 10 tags (created lazily)."
+                        },
+                        "source_refs": {
+                            "type": "array",
+                            "description": "Passages the case is grounded in (source ids \
+                                            from this generation + short verbatim quotes).",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "source_id": {"type": "string"},
+                                    "quote": {"type": "string"}
+                                },
+                                "required": ["source_id"]
+                            }
+                        }
+                    },
+                    "required": ["title", "priority"]
                 }),
             },
         }

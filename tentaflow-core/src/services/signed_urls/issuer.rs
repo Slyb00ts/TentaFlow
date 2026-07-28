@@ -36,6 +36,8 @@ pub enum UrlScope {
     ModelBundle,
     /// ML Studio project export archives — `/ml-studio/exports/<ref>`.
     MlStudioExport,
+    /// Project Studio project export archives — `/project-studio/exports/<ref>`.
+    ProjectStudioExport,
 }
 
 impl UrlScope {
@@ -46,6 +48,7 @@ impl UrlScope {
             Self::LegalUrl => "legal",
             Self::ModelBundle => "model_bundle",
             Self::MlStudioExport => "ml_studio_export",
+            Self::ProjectStudioExport => "project_studio_export",
         }
     }
 
@@ -59,6 +62,7 @@ impl UrlScope {
             Self::LegalUrl => 60,
             Self::ModelBundle => 300,
             Self::MlStudioExport => 300,
+            Self::ProjectStudioExport => 300,
         }
     }
 
@@ -75,6 +79,9 @@ impl UrlScope {
             // arbitrary WAN links; a week-long ceiling lets a paused download
             // resume via Range across an overnight window.
             Self::MlStudioExport => 7 * 24 * 3600,
+            // Same reasoning, and it matches the archive retention window, so a
+            // link never outlives the file it points at.
+            Self::ProjectStudioExport => 7 * 24 * 3600,
         }
     }
 
@@ -88,6 +95,7 @@ impl UrlScope {
             Self::LegalUrl => "legal_url",
             Self::ModelBundle => "model_bundle_url",
             Self::MlStudioExport => "ml_studio_export_url",
+            Self::ProjectStudioExport => "project_studio_export_url",
         }
     }
 }
@@ -312,17 +320,25 @@ impl SignedUrlIssuer {
         // F1b P3.B — fold in HMAC keys mirrored from trust-paired peers so a
         // URL signed on node A still verifies on node B. Constant-time compare
         // is run against every candidate (no early-exit timing leak).
+        // A scope without a mesh counterpart accepts LOCAL signatures only:
+        // Project Studio archives are fetched from the node that built them, so
+        // there is nothing to mirror and no reason to widen the verifier set.
         let scope = match self.scope {
-            UrlScope::FrameUrl => crate::services::mesh_keys::KeyScope::FrameUrl,
-            UrlScope::Recording => crate::services::mesh_keys::KeyScope::RecordingUrl,
-            UrlScope::LegalUrl => crate::services::mesh_keys::KeyScope::LegalUrl,
-            UrlScope::ModelBundle => crate::services::mesh_keys::KeyScope::ModelBundleUrl,
-            UrlScope::MlStudioExport => crate::services::mesh_keys::KeyScope::MlStudioExportUrl,
+            UrlScope::FrameUrl => Some(crate::services::mesh_keys::KeyScope::FrameUrl),
+            UrlScope::Recording => Some(crate::services::mesh_keys::KeyScope::RecordingUrl),
+            UrlScope::LegalUrl => Some(crate::services::mesh_keys::KeyScope::LegalUrl),
+            UrlScope::ModelBundle => Some(crate::services::mesh_keys::KeyScope::ModelBundleUrl),
+            UrlScope::MlStudioExport => {
+                Some(crate::services::mesh_keys::KeyScope::MlStudioExportUrl)
+            }
+            UrlScope::ProjectStudioExport => None,
         };
-        for peer_key in crate::services::mesh_keys::mesh_key_pool().verify_keys_for(scope) {
-            let expected = hmac_sign(&peer_key, payload.as_bytes());
-            if provided.len() == expected.len() && bool::from(provided.ct_eq(&expected)) {
-                matched = true;
+        if let Some(scope) = scope {
+            for peer_key in crate::services::mesh_keys::mesh_key_pool().verify_keys_for(scope) {
+                let expected = hmac_sign(&peer_key, payload.as_bytes());
+                if provided.len() == expected.len() && bool::from(provided.ct_eq(&expected)) {
+                    matched = true;
+                }
             }
         }
         if !matched {

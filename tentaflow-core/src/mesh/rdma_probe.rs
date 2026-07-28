@@ -958,7 +958,7 @@ mod linux_rdma {
                 }
 
                 // Mediana
-                samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                samples.sort_by(|a, b| a.total_cmp(b));
                 let median = samples[samples.len() / 2];
 
                 // SEND latency = one-way (nie RTT, bo to jest post_send -> completion)

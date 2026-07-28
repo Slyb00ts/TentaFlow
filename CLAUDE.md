@@ -205,6 +205,156 @@ registries) saved via the binary protocol with `is_secret`; listing returns `<re
 non-empty secrets. The vLLM recommender uses the stored `hf_token` to fetch `config.json`
 from gated repos without persisting the token in the deployment config.
 
+## Projekty (Project Studio)
+
+`tentaflow-core/src/project_studio/` — native core module (NOT a WASM addon). Registry
+(projects, members, creator grants, chats) lives in `<data>/projects.db`; per-project
+content in `<data>/projects/<id>/{project.db, files/<sha256>, vectors/}` behind a bounded
+pool cache (`project_db.rs`: LRU max 16 open pools + idle sweeper, migrations run on every
+open, strict `validate_project_id` path guard, `checkpoint_all` flushes project WALs at
+shutdown). Protocol: single `MessageBody::ProjectStudioBody(ProjectStudioPayload)` —
+append-only sub-enum, 80 variants in F1 — wired through the usual three frontend touch
+points; UI `www/js/modules/project-studio.js`, apps-home tile `projekty` WITHOUT
+`requiresPowerUser`.
+
+Permissions (migration 119): `project_studio.read` (all roles) + `project_studio.admin`
+(org_admin). Creating projects needs a per-user grant (`project_creator_grants`);
+in-project roles: owner/manager/editor/tester/viewer. Non-members get uniform NotFound (no
+existence leak); archived project = read-only (`require_active`).
+
+Knowledge: native ingest (`ingest.rs` — office/text/code via `services/document/extract`,
+PDF text layer via pdfium; scans/images are `skipped` until the vision pipeline is
+callable), chunking via `split_into_chunks`, embeddings through the `rag-embeddings`
+alias, vectors under scope `addon_id="ps-<project_id>"` namespace `passages` created AT
+the project directory (`NamespaceManager::get_or_create_at`) — per-project quotas;
+deliberately does NOT use the flow `store` node. Jobs: cancel registry + `log_bus`
+progress (key = job_id) + panic guard + semaphore of 2 concurrent ingests. Chunked upload:
+4 MiB chunks, 64 MiB per file.
+
+Chat: system flow `ps-chat` (fixed UUID, `is_system=1`, seed reclaims a stripped row) —
+trigger → project_knowledge (search; passages pushed into `context.system_prompts` as
+fenced DATA with `<<<PASSAGE>>>` delimiters, prompt-injection guard) →
+conversation_history → llm STREAMING WITHOUT tools (embedded streaming+tools doesn't
+work). Stream handler: subscription `projectStudioChatStreamRequest`
+(`ProjectStudioPayload::ChatStreamRequest`) in `dispatch/stream_handlers.rs`; citations
+persisted in `conversation_messages.citations_json` (migration 120). Chats are private
+per user — the server hard-filters every chat query by `user_id`, no admin bypass.
+
+Flow Builder node `project_knowledge` (search/list_sources; `project_id` from node config
+or `envelope.meta` — the meta fallback lets ONE shared system flow serve every project;
+`dynamic_enum` source `projects`) + agent builtins `core.project_search` /
+`core.project_list_sources` (membership check per call, results bounded under the 16k
+tool-result truncation).
+
+`flows.is_system` (migration 118): system flows are non-editable/non-deletable via the
+protocol; sync NEVER trusts the wire `is_system` flag (coerced to 0) and rejects every
+remote write targeting a locally-system row — the seed is the per-node source of truth.
+
+F2 — manual testing (project.db v2). Cases are versioned (`test_case_versions`, append-only)
+under optimistic locking: ONE conditional `UPDATE … WHERE current_version = expected`, so a
+stale editor loses instead of overwriting. Status walk draft→review→approved→deprecated
+(a downgrade needs a reason), tags, attachments, CSV import in one all-or-nothing
+transaction. A manual run SNAPSHOTS the case (`case_version`, title, steps) into
+`test_run_items`/`test_run_steps`, so a later case edit never rewrites history; a pool item
+is claimed by a single atomic `UPDATE … RETURNING` (no SELECT to race) and closing a run
+fences claim/set_step/finish. Plus tester dashboard (`MyWork*`), tasks/defects + comments,
+5 reports (`REPORT_KINDS`) with CSV export.
+
+Agent generation (`generation.rs`) does NOT parse a "return JSON" answer — the agent writes
+through a DURABLE SINK, builtin `core.project_case_save`. The target project/generation is
+not a tool parameter: it is a server-minted binding in `envelope.meta["ps_generation"]`
+injected atomically via `AgentRunManager::spawn` extra_meta, so the model can never redirect
+output to another project. Each case is validated per kind at save; a rejection is a
+`[TOOL_ERROR]` scoped to THAT case and the model repairs it. Terminal watcher via `await_run`
+(30 min budget), lazy reconciliation after a restart, retrieved passages fed to compliance as
+`AiSourceKind::Vector`. Notifications: registry table `notifications` + live
+`SystemEventPayload::UserNotification`, which `api/dashboard/ws_binary.rs` filters per user
+(the system-event channel is a broadcast).
+
+F3 — automated testing (project.db v3, which REBUILDS test_runs/test_run_items: SQLite cannot
+alter a CHECK). Service `test-runner`
+(`tentaflow-containers/tools/{_services,docker,python}/test-runner`, FastAPI, port 8093,
+pytest/Playwright/Locust/httpx in killable subprocesses). The per-run host allowlist is
+enforced INSIDE PYTHON — `executor/sandbox_net.py` wraps `socket.getaddrinfo` plus
+connect/sendto before untrusted code is imported, Playwright routing aborts the rest; the
+container itself runs `network_mode=bridge`. The environment secret is memory-only there.
+Core hardens the container with `SandboxLimits::test_runner` → bollard `HostConfig`
+(read-only rootfs, two tmpfs, 4 GiB / 2 CPU / 512 PID, `cap_drop: ALL`, `no-new-privileges`),
+applied only when `engine.id == "test-runner"`. A PER-RUN sandbox is DEFERRED, hence two
+consequences: a unit case carrying `build_profile_ref` becomes an item 'blocked' (submitting
+it would silently degrade to pytest in an empty tree and report a green run), and a runner
+reporting `isolated: false` (native deploy) is refused unless an admin flips
+`project_studio_allow_unisolated_runner`.
+
+Environments (`environments.rs`) invert the `web_research` SSRF rule: a PUBLIC target is
+auto-approved, a private/LAN/loopback one queues for an admin. The class is computed over
+EVERY resolved address of EVERY allowlist host (one LAN entry makes the whole environment
+private; an unresolvable name counts as private) and is RE-CHECKED at submit
+(`recheck_private`) — DNS may move to 127.0.0.1 long after the decision. The secret is
+SettingsCipher-encrypted, decrypted at exactly one place (the submission body, never logged)
+and scrubbed out of stored artifacts; `RunArtifactGetRequest` requires the Tester role, not
+viewer. Runs: submit → 2 s poll mirroring the runner snapshot into items/steps/artifacts in
+ONE transaction per poll, watchdog (15 failed polls / 4 h wall clock), artifact budgets
+(64 MiB per file, 500 files, 512 MiB per run), cancel registry, lazy reconcile of runs
+orphaned by a restart. Code cases (ui/api/perf/unit/security) are edited in `tf-code-editor`;
+CodeAssist runs through the project's `generator_<kind>` binding (same model/prompt/compliance
+trail as batch generation) and fences the edited script as DATA. Sources: git clone via the
+system binary (a `repo_url` reaching a private address is a HARD refusal — a code source has
+no approval queue), ZIP (`enclosed_name`, symlink refusal, entry/byte budgets enforced while
+writing) and OpenAPI/Swagger parsed by our own generic `paths` walk (NOT `openapiv3`, which
+rejects a whole document over one non-conformant field), whose markdown endpoint digest is
+ingested as a normal knowledge file. 5 seeded per-kind code generators next to the F2 manual
+one.
+
+F4 — schedules, ML Studio, kanban, export/import (project.db v4, registry v2). A schedule
+('once' RFC3339 / 'interval' / daily cron in an IANA zone via chrono-tz, DST ambiguity
+resolved explicitly) fires from its own 30 s loop. That loop never opens a project
+speculatively: the registry holds `project_schedule_hints` (`next_run_at` per project, NULL =
+nothing pending) so ONE query picks the due projects — opening every project each tick would
+thrash the 16-pool LRU. A due schedule is claimed BEFORE firing by a conditional
+`UPDATE … WHERE next_run_at IS <stale value>`, and the tick also runs
+`auto_runs::reconcile_running` (a run left 'running' by a restart would block gate 1 forever
+on an unattended node). Gate-chain outcomes are not interchangeable: 'blocked' (missing or
+unapproved environment — an admin decision) and 'skipped' (previous run open, archived
+project, no executable cases, no runner) never advance the failure breaker; 5 consecutive
+'error' outcomes set `auto_disabled` and clear `next_run_at` (resume is manual only).
+
+ML Studio link (`ml_link.rs`): `ml_links` + create-from-project, with a ONE-WAY project→ML
+permission mirror mapping the 5 project roles onto editor/viewer. It acts as the ML project
+OWNER and records what IT granted in a project setting (`ml_link_granted:<link_id>`), so it
+never revokes a membership someone else made. The Power-User wire gate is NOT waived — the
+link calls `ml_studio::repository` directly; separately, the 10 READ handlers in
+`dispatch/ml_studio.rs` were lowered to `#[policy(UserSession)]` because each carries its own
+membership check (every MUTATING ML handler stays `PowerUser`), otherwise a tester mirrored as
+an ML viewer would hold a membership they could never use. The kanban board is `tf-kanban`
+(pointer events + `setPointerCapture`, NOT HTML5 drag-and-drop).
+
+Export/import (`archive.rs`): the db snapshot is `VACUUM INTO` after a TRUNCATE checkpoint (a
+plain file copy would archive a file missing its own `-wal` commits); the snapshot blanks both
+`secret_enc` columns (per-node key), resets every environment to 'pending' and DISABLES every
+schedule (its `next_run_at` is already in the past and its environment/runner ids belong to
+the exporting node). Manifest carries per-file sha256, verified after extraction; import
+enforces `enclosed_name`, refuses symlink entries, whitelists entry prefixes and caps
+entries/bytes. Vectors are moved verbatim ONLY when the `rag-embeddings` alias resolves to the
+SAME target model and metric/dim/field fingerprint match — otherwise the import re-indexes
+from the archived blobs (no network needed). The archive is the module's only REST path:
+`GET /project-studio/exports/<ref>` under signed-URL scope `ProjectStudioExport` (an archive
+can reach tens of GiB); the protocol carries progress only. Reports gain
+perf_trend/perf_compare/tester_activity.
+
+`ProjectStudioPayload` is at 248 variants, strictly append-only (ciborium tags by variant
+NAME — never rename or reorder; golden test `project_studio_wire_golden`) and close to the
+256-variant budget of the frame format, so F5+ additions belong in a NEW sub-enum. Core
+migrations still end at 118/119/120 — F2–F4 added none. Struct FIELDS are append-only the
+same way: `TasksListRequest.severity` and `SettingsSaveRequest.modules` were added with
+`#[serde(default)]` so peers that omit them still decode.
+
+UI conventions that the mockups (`mockups/projekty-20260723/`) pin down and the screens
+follow: one toolbar row (searchbox + selects, primary action right-aligned via
+`.ps-toolbar-spacer`), a `.ps-table-footer` summary line under every list, two-line table
+cells (`tf-table__cell-title` + `tf-table__cell-sub` carrying the short id), and KPI rows
+built from full `tf-stat-card`s in `.ps-kpi-grid`.
+
 ## Compliance Core
 
 `tentaflow-core/src/compliance/` — shared core layer for GDPR/RODO, AI audit, retention,
@@ -673,7 +823,17 @@ specific rule for a specific task.
    every primitive — zero raw `<button>`/`<input>`/`<select>`, hand-rolled modals, tab strips.
    Missing a feature → **extend the component**, don't fork. A pattern repeated in 2+ feature
    modules → add a new `tf-*` component. (There IS a `tf-file-input` — use it instead of raw
-   `<input type="file">`.)
+   `<input type="file">`.) Component styling lives in `css/controls.css` — it is the ONLY
+   sheet adopted into shadow roots, so markup injected into a `tf-table` cell can never use a
+   feature stylesheet's classes. `tf-table selectable="multi"` renders a checkbox in the first
+   cell of every row and emits `row-select`; a plain row click stays `row-click` (open), and
+   `tf-segmented` options take an `icon` attribute. Filter/action bars use the shared
+   `.tf-toolbar` class (+ `.tf-toolbar-spacer` to push actions right): `tf-select`/`tf-input`
+   default to `width:100%`, so a bar without it stacks every control on its own row.
+8. **Plural forms go through i18n, never string concatenation.** `{count|forma1|forma2|forma3}`
+   in a translation picks the right form (Polish needs all three, other languages two), so
+   "1 przypadków" cannot happen. Every `project_studio` key exists in all five locales — the
+   parity check is a plain key-count comparison across `www/i18n/*.json`.
 
 ## gstack & skill routing
 

@@ -627,6 +627,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_detection_zones",
             MigrationStep::Rust(cameras_add_zones_column),
         ),
+        (
+            118,
+            "flows_is_system",
+            MigrationStep::Rust(flows_add_is_system_column),
+        ),
+        (
+            119,
+            "project_studio_permissions",
+            MigrationStep::Rust(roles_add_project_studio_permissions),
+        ),
+        (
+            120,
+            "conversation_messages_citations",
+            MigrationStep::Rust(conversation_messages_add_citations_column),
+        ),
     ]
 }
 
@@ -1577,6 +1592,28 @@ fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE cameras ADD COLUMN analysis_fps INTEGER NOT NULL DEFAULT 10;",
         )?;
+    }
+    Ok(())
+}
+
+/// Adds `is_system` to `flows`. Marks platform-seeded flows that user-facing
+/// handlers must refuse to edit, delete or change status on — the flag is only
+/// ever set by platform seeding, never through the user create/update paths.
+fn flows_add_is_system_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "flows", "is_system")? {
+        conn.execute_batch("ALTER TABLE flows ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
+}
+
+/// Adds `citations_json` to `conversation_messages`. Project-chat (ps-chat)
+/// assistant replies persist their RAG citations next to the content, so
+/// `ChatHistoryResponse` can rebuild the sources panel after a reload. NULL /
+/// empty = message without citations (every non-ps-chat writer leaves it NULL).
+/// Idempotent — guarded by a column probe.
+fn conversation_messages_add_citations_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "conversation_messages", "citations_json")? {
+        conn.execute_batch("ALTER TABLE conversation_messages ADD COLUMN citations_json TEXT;")?;
     }
     Ok(())
 }
@@ -3757,6 +3794,20 @@ fn roles_add_robot_permissions(conn: &Connection) -> Result<()> {
         &["org_admin", "org_operator"],
         &["robot.command", "robot.estop", "robot.telemetry"],
     )
+}
+
+// v119 — Project Studio ("Projekty"). Every org role may enter the module
+// (`project_studio.read` — per-project access is then gated by project
+// membership roles), while `project_studio.admin` (creator grants, viewing
+// projects outside membership, orphaned-project takeover) stays with
+// org_admin. Idempotent via `roles_add_permissions`.
+fn roles_add_project_studio_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator", "org_viewer", "dpo", "supervisor"],
+        &["project_studio.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin"], &["project_studio.admin"])
 }
 
 // F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table

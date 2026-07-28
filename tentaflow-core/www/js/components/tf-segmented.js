@@ -49,6 +49,7 @@ class TfSegmented extends HTMLElement {
     this._options = optEls.map((o) => ({
       value: o.getAttribute('value') || '',
       variant: (o.getAttribute('variant') || 'neutral').toLowerCase(),
+      icon: (o.getAttribute('icon') || '').trim(),
       label: o.textContent || '',
     }));
     optEls.forEach((o) => o.remove());
@@ -68,7 +69,23 @@ class TfSegmented extends HTMLElement {
       btn.dataset.variant = opt.variant;
       btn.setAttribute('role', 'radio');
       btn.setAttribute('aria-checked', 'false');
-      btn.textContent = opt.label;
+      if (opt.icon) {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('class', 'tf-seg-icon');
+        svg.setAttribute('width', '14');
+        svg.setAttribute('height', '14');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', 'currentColor');
+        svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        svg.setAttribute('aria-hidden', 'true');
+        const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+        use.setAttribute('href', `/img/icons.svg#icon-${opt.icon}`);
+        svg.appendChild(use);
+        btn.appendChild(svg);
+      }
+      btn.appendChild(document.createTextNode(opt.label));
       wrap.appendChild(btn);
     }
     wrap.addEventListener('click', this._onClick);

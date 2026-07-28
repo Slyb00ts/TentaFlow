@@ -3,6 +3,14 @@
 // Projects slice: list/create/detail plus the fixed project-type catalogue.
 // Identity (owner/org) comes from the request `HandlerContext` (UserSession +
 // org context); ML Studio data lives in its own `ml_studio.db`.
+//
+// Wire policy split: a project role mapped into ML Studio by a Project Studio
+// link is worthless if the wire gate still demands Power User — a tester
+// mirrored as an ML viewer would hold a membership they could never use. READ
+// handlers therefore run at `UserSession` and carry their own membership check
+// (`require_project_member`, or a repository call that joins `project_members`);
+// every MUTATING handler stays at `PowerUser`. Each read handler documents the
+// check it relies on.
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
@@ -120,7 +128,9 @@ fn action_err(e: anyhow::Error) -> ProtocolError {
 }
 
 #[handler(variant = "MlStudioProjectsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only and scoped to the caller's own memberships (`list_projects`
+/// joins `project_members`).
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_projects_list(
     req: &MessageBody,
@@ -177,7 +187,9 @@ pub fn ml_studio_project_create(
 }
 
 #[handler(variant = "MlStudioProjectDetailRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; `get_project` joins `project_members`, so a non-member gets
+/// NotFound.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_detail(
     req: &MessageBody,
@@ -203,7 +215,10 @@ pub fn ml_studio_project_detail(
 }
 
 #[handler(variant = "MlStudioProjectTypesListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only static catalog with no project data. It has to be reachable
+/// below Power User because the Project Studio "create ML project" window is a
+/// project-manager action and needs the type list to render at all.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_types_list(
     req: &MessageBody,
@@ -275,7 +290,8 @@ fn require_project_member(user_id: &str, project_id: &str) -> Result<(), Protoco
 }
 
 #[handler(variant = "MlStudioProjectMembersListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; the `get_project` lookup above enforces membership.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_members_list(
     req: &MessageBody,
@@ -1408,7 +1424,8 @@ pub fn ml_studio_recog_build_status(
 }
 
 #[handler(variant = "MlStudioDatasetsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; `list_datasets` enforces membership in the repository.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_datasets_list(
     req: &MessageBody,
@@ -1941,7 +1958,8 @@ fn to_model(m: ModelSummary) -> tentaflow_protocol::MlStudioModelSummary {
 }
 
 #[handler(variant = "MlStudioTrainingRunsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; guarded by `require_project_member`.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_training_runs_list(
     req: &MessageBody,
@@ -2118,7 +2136,8 @@ fn reconcile_local_inference_status(
 }
 
 #[handler(variant = "MlStudioModelsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; guarded by `require_project_member`.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_models_list(
     req: &MessageBody,
@@ -2504,7 +2523,14 @@ pub async fn ml_studio_distill_generate_status(
 }
 
 #[handler(variant = "MlStudioFtTrainStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Guarded by `require_project_member` on the run's project. Not read-only: the
+/// poll is also the reconcile point of the training run, so it mirrors the
+/// TRAINER's state into the row (mesh sync phase, a remote node that stopped
+/// answering, metrics of a remote run). Every written value is derived from the
+/// trainer, never from the request — the payload only names a run — so a viewer
+/// polling it cannot steer the outcome, and running the reconcile only on the
+/// run owner's poll would freeze the status of every other member's view.
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_ft_train_status(
     req: &MessageBody,
@@ -2947,7 +2973,14 @@ pub async fn ml_studio_recog_train_start(
 }
 
 #[handler(variant = "MlStudioRecogTrainStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Guarded by `require_project_member` on the run's project. Not read-only: the
+/// poll is also the reconcile point of the training run, so it mirrors the
+/// TRAINER's state into the row (mesh sync phase, a remote node that stopped
+/// answering, metrics of a remote run). Every written value is derived from the
+/// trainer, never from the request — the payload only names a run — so a viewer
+/// polling it cannot steer the outcome, and running the reconcile only on the
+/// run owner's poll would freeze the status of every other member's view.
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_recog_train_status(
     req: &MessageBody,
@@ -3336,7 +3369,14 @@ pub async fn ml_studio_classifier_train_start(
 }
 
 #[handler(variant = "MlStudioGenericTrainStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Guarded by `require_project_member` on the run's project. Not read-only: the
+/// poll is also the reconcile point of the training run, so it mirrors the
+/// TRAINER's state into the row (mesh sync phase, a remote node that stopped
+/// answering, metrics of a remote run). Every written value is derived from the
+/// trainer, never from the request — the payload only names a run — so a viewer
+/// polling it cannot steer the outcome, and running the reconcile only on the
+/// run owner's poll would freeze the status of every other member's view.
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_generic_train_status(
     req: &MessageBody,
@@ -6300,4 +6340,65 @@ pub fn ml_studio_recog_import_recordings_status(
             },
         ),
     ))
+}
+
+#[cfg(test)]
+mod policy_tests {
+    /// Regression guard for the F4 downgrade (project role → ML Studio role).
+    ///
+    /// Mapping a project tester onto an ML viewer is pointless if the wire gate
+    /// still demands Power User: the membership exists but every call bounces.
+    /// The READ handlers therefore run at UserSession — each one enforces its own
+    /// membership check — while every MUTATING handler stays at PowerUser, so a
+    /// mirrored viewer can look at a project and still cannot start a training
+    /// run or upload a dataset.
+    #[test]
+    fn ml_read_handlers_run_below_power_user_and_mutations_do_not() {
+        use crate::dispatch::SessionAuthKind;
+
+        for variant in [
+            "MlStudioProjectsListRequest",
+            "MlStudioProjectDetailRequest",
+            "MlStudioProjectTypesListRequest",
+            "MlStudioProjectMembersListRequest",
+            "MlStudioDatasetsListRequest",
+            "MlStudioTrainingRunsListRequest",
+            "MlStudioModelsListRequest",
+            "MlStudioFtTrainStatusRequest",
+            "MlStudioRecogTrainStatusRequest",
+            "MlStudioGenericTrainStatusRequest",
+        ] {
+            let handler = crate::dispatch::find(variant).expect("handler registered");
+            assert_eq!(
+                handler.required_auth,
+                SessionAuthKind::UserSession,
+                "{variant} must be reachable for a mapped non-power-user member"
+            );
+        }
+
+        for variant in [
+            "MlStudioProjectCreateRequest",
+            "MlStudioProjectInviteRequest",
+            "MlStudioProjectMemberRemoveRequest",
+            "MlStudioProjectMemberRoleSetRequest",
+            "MlStudioDatasetUploadRequest",
+            "MlStudioDatasetUploadChunkRequest",
+            "MlStudioDatasetRowsSaveRequest",
+            "MlStudioFtTrainStartRequest",
+            "MlStudioRecogTrainStartRequest",
+            "MlStudioClassifierTrainStartRequest",
+            "MlStudioTabularTrainRequest",
+            "MlStudioRecogSaveAnnotationsRequest",
+            "MlStudioVisionModelDeleteRequest",
+            "MlStudioProjectExportStartRequest",
+            "MlStudioProjectImportApplyRequest",
+        ] {
+            let handler = crate::dispatch::find(variant).expect("handler registered");
+            assert_eq!(
+                handler.required_auth,
+                SessionAuthKind::PowerUser,
+                "{variant} mutates ML Studio and must stay behind the Power User gate"
+            );
+        }
+    }
 }

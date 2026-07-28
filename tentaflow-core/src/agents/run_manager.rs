@@ -29,7 +29,7 @@ use tokio::sync::{broadcast, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::db::models::{AgentRunStatusUpdate, NewAgentRun};
+use crate::db::models::{AgentRunStatusUpdate, DbAgentRun, NewAgentRun};
 use crate::db::{repository, DbPool};
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
@@ -108,6 +108,28 @@ impl RunStatus {
                 | RunStatus::Interrupted
         )
     }
+}
+
+/// Terminal check on a persisted status string — the DB mirror of
+/// `RunStatus::is_terminal` for rows read back from `agent_runs`.
+fn db_status_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+}
+
+/// Outcome of watching one run's live status channel until it settles — the
+/// shared core of `wait_one` (agent_wait JSON path) and `await_run` (Rust
+/// caller path).
+enum WatchOutcome {
+    /// The run reached a terminal status while subscribed.
+    Terminal(RunStatus),
+    /// The sender dropped mid-wait (the task finished and evicted its handle);
+    /// the persisted row is authoritative.
+    Evicted,
+    /// The deadline passed with the run still live in the carried state.
+    TimedOut(RunStatus),
+    /// No registry handle — the run either settled already or never ran in
+    /// this process; the caller decides what the DB row means.
+    NotInRegistry,
 }
 
 /// Runs the agent harness flow that backs one background run. Abstracted so the
@@ -344,6 +366,11 @@ impl AgentRunManager {
     /// (`tools(child) ∩ tools(parent)`); it is persisted indirectly via the
     /// agent definition, so the parameter records the intersection the spawn was
     /// authorized under (used to reject an over-broad child before launch).
+    ///
+    /// `extra_meta` entries are merged into the initial envelope meta BEFORE
+    /// the task starts — the atomic path for server-minted bindings (e.g.
+    /// Project Studio `ps_generation`): no post-spawn write, no race with the
+    /// first tool call.
     pub async fn spawn(
         &self,
         agent_id: &str,
@@ -351,6 +378,7 @@ impl AgentRunManager {
         parent_run_id: Option<&str>,
         principal: &AgentPrincipal,
         inherited_tools: &[String],
+        extra_meta: &[(&str, Value)],
         target_session_id: Option<&str>,
     ) -> Result<String> {
         let agent = repository::get_agent(&self.db, agent_id)?
@@ -405,6 +433,9 @@ impl AgentRunManager {
         initial
             .meta
             .insert("agent_run_id".into(), Value::String(run_id.clone()));
+        for (key, value) in extra_meta {
+            initial.meta.insert((*key).to_string(), value.clone());
+        }
 
         let deadline = (agent.timeout_secs > 0)
             .then(|| Instant::now() + Duration::from_secs(agent.timeout_secs as u64));
@@ -514,6 +545,7 @@ impl AgentRunManager {
                     Some(&caller.run_id),
                     &caller.principal,
                     &parent_tools,
+                    &[],
                     caller.session_id.as_deref(),
                 )
                 .await?;
@@ -622,40 +654,106 @@ impl AgentRunManager {
         Ok(Value::Object(results))
     }
 
+    /// Watches run `id`'s live status channel until it turns terminal, the
+    /// handle is evicted, or `deadline` passes. Subscribes BEFORE reading the
+    /// current value so no transition is missed between the registry lookup
+    /// and the first borrow.
+    async fn watch_until_terminal(&self, id: &str, deadline: Instant) -> WatchOutcome {
+        let Some(mut rx) = self.runs.get(id).map(|h| h.status.subscribe()) else {
+            return WatchOutcome::NotInRegistry;
+        };
+        loop {
+            let current = *rx.borrow();
+            if current.is_terminal() {
+                return WatchOutcome::Terminal(current);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return WatchOutcome::TimedOut(current);
+            }
+            match tokio::time::timeout(remaining, rx.changed()).await {
+                // Channel changed — re-read the loop head for the new value.
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => return WatchOutcome::Evicted,
+                // Wait budget elapsed.
+                Err(_) => return WatchOutcome::TimedOut(*rx.borrow()),
+            }
+        }
+    }
+
     /// Blocks until run `id` settles or `deadline` passes. Reads the live
     /// `watch` channel when the run is in-registry, else falls back to the DB
     /// (a run that finished before this wait subscribed). Returns
     /// `{status, result?}`.
     async fn wait_one(&self, id: &str, deadline: Instant) -> Value {
-        // Subscribe first so we never miss a transition between the DB read and
-        // the channel borrow.
-        let rx = self.runs.get(id).map(|h| h.status.subscribe());
-        if let Some(mut rx) = rx {
-            loop {
-                let current = *rx.borrow();
-                if current.is_terminal() {
-                    return self.terminal_result(id, current);
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return json!({ "status": current.as_str(), "timed_out": true });
-                }
-                match tokio::time::timeout(remaining, rx.changed()).await {
-                    // Channel changed — re-read the loop head for the new value.
-                    Ok(Ok(())) => continue,
-                    // Sender dropped (the task finished and evicted its handle):
-                    // the terminal row is authoritative.
-                    Ok(Err(_)) => return self.db_result(id),
-                    // Wait budget elapsed.
-                    Err(_) => {
-                        let now = *rx.borrow();
-                        return json!({ "status": now.as_str(), "timed_out": true });
-                    }
-                }
+        match self.watch_until_terminal(id, deadline).await {
+            WatchOutcome::Terminal(status) => self.terminal_result(id, status),
+            // Sender dropped (the task finished and evicted its handle) or the
+            // run was never in the registry: the persisted row is authoritative.
+            WatchOutcome::Evicted | WatchOutcome::NotInRegistry => self.db_result(id),
+            WatchOutcome::TimedOut(status) => {
+                json!({ "status": status.as_str(), "timed_out": true })
             }
         }
-        // Not in registry — read the persisted row directly.
-        self.db_result(id)
+    }
+
+    /// Blocks until run `run_id` reaches a terminal state and returns its
+    /// persisted row — the server-side counterpart of `core.agent_wait` for
+    /// Rust callers (e.g. a module that spawns a generator agent and needs the
+    /// result without a frontend), so it is NOT gated to children of a calling
+    /// run and holds no concurrency permit to release. On timeout the run
+    /// KEEPS executing — this method never cancels it.
+    pub async fn await_run(&self, run_id: &str, timeout: Duration) -> Result<DbAgentRun> {
+        let deadline = Instant::now() + timeout;
+        match self.watch_until_terminal(run_id, deadline).await {
+            WatchOutcome::Terminal(_) | WatchOutcome::Evicted => {
+                self.read_terminal_row(run_id).await
+            }
+            WatchOutcome::TimedOut(status) => Err(anyhow!(
+                "await_run: run '{run_id}' still '{}' after {timeout:?} (run keeps executing)",
+                status.as_str()
+            )),
+            WatchOutcome::NotInRegistry => {
+                let run = repository::get_agent_run(&self.db, run_id)?
+                    .ok_or_else(|| anyhow!("await_run: run '{run_id}' not found"))?;
+                if db_status_is_terminal(&run.status) {
+                    return Ok(run);
+                }
+                // A non-terminal row with no live handle is an orphan (its
+                // owning process died mid-run). This read path must not write
+                // the `interrupted` transition itself — that stays owned by
+                // `reap_interrupted_on_startup` — so surface the inconsistency
+                // instead of parking on a run nothing is executing.
+                Err(anyhow!(
+                    "await_run: run '{run_id}' is '{}' but has no live task in this process \
+                     (orphaned row; a restart reaps it to 'interrupted')",
+                    run.status
+                ))
+            }
+        }
+    }
+
+    /// Reads the settled row after a terminal watch signal. `run_task` commits
+    /// the terminal row BEFORE sending on the watch channel, but `cancel()`
+    /// sends first and writes after — so a waiter can wake a beat before the
+    /// terminal columns land. A short bounded re-read closes that gap instead
+    /// of handing back a stale in-flight row.
+    async fn read_terminal_row(&self, run_id: &str) -> Result<DbAgentRun> {
+        let mut last = None;
+        for attempt in 0..20u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            match repository::get_agent_run(&self.db, run_id)? {
+                Some(run) if db_status_is_terminal(&run.status) => return Ok(run),
+                other => last = other,
+            }
+        }
+        // The terminal row update is a synchronous write issued around the
+        // watch send; not seeing it inside the retry budget means that write
+        // failed (it is fire-and-forget on the cancel path). Hand back the
+        // freshest row rather than nothing — its status tells the caller.
+        last.ok_or_else(|| anyhow!("await_run: run '{run_id}' row missing after completion"))
     }
 
     /// `mode=any` wait: returns as soon as the FIRST of `run_ids` reaches a
@@ -1262,6 +1360,7 @@ Continue your work using it.",
                 None,
                 &principal,
                 &parent_tools,
+                &[],
                 target_session_id.as_deref(),
             )
             .await
@@ -1582,7 +1681,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[], None)
+            .spawn("a1", "do it", None, &principal, &[], &[], None)
             .await
             .expect("spawn");
 
@@ -1619,7 +1718,7 @@ mod tests {
 
         // A parent run row (created directly — the parent's own flow is elsewhere).
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
 
@@ -1663,6 +1762,61 @@ mod tests {
         );
     }
 
+    /// `await_run` — the Rust-caller wait: a timeout errors WITHOUT cancelling
+    /// the run; a live run resolves off its watch channel with the fresh
+    /// terminal row; a run already gone from the registry resolves straight
+    /// from the persisted row.
+    #[tokio::test]
+    async fn await_run_times_out_then_returns_terminal_row() {
+        let pool = db();
+        seed_agent(&pool, "a1", "worker", "[]", 0, 1);
+        let gate = Gate::new();
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: gate.clone(),
+                honor_cancel: false,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::user("u1");
+        let run_id = mgr
+            .spawn("a1", "do it", None, &principal, &[], &[], None)
+            .await
+            .expect("spawn");
+
+        // Timeout path: the gate is closed, so the run cannot settle.
+        let err = mgr
+            .await_run(&run_id, Duration::from_millis(50))
+            .await
+            .expect_err("closed gate must time out");
+        assert!(err.to_string().contains(&run_id), "got {err}");
+        // The timed-out wait must NOT have cancelled the run.
+        let row = repository::get_agent_run(&pool, &run_id)
+            .expect("get")
+            .expect("row");
+        assert!(matches!(row.status.as_str(), "queued" | "running"));
+
+        // Blocking path: park a waiter on the live run, then release the gate.
+        let mgr2 = mgr.clone();
+        let id2 = run_id.clone();
+        let waiter =
+            tokio::spawn(async move { mgr2.await_run(&id2, Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.open();
+        let run = waiter.await.expect("join").expect("await_run");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.result.as_deref(), Some(&*format!("result-of-{run_id}")));
+
+        // Already-settled path: the terminal row alone resolves the wait.
+        wait_until_status(&pool, &run_id, "completed").await;
+        let again = mgr
+            .await_run(&run_id, Duration::from_secs(1))
+            .await
+            .expect("settled run resolves from the row");
+        assert_eq!(again.status, "completed");
+    }
+
     #[tokio::test]
     async fn waiting_parent_releases_permit_preventing_pool_deadlock() {
         // cap permits, cap+1 parents that each spawn a gated child then agent_wait
@@ -1691,7 +1845,7 @@ mod tests {
         let mut callers = Vec::new();
         for i in 0..(cap + 1) {
             let parent_run = mgr
-                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], None)
+                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], &[], None)
                 .await
                 .expect("spawn parent");
             callers.push(CallerRun {
@@ -1755,7 +1909,7 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1786,7 +1940,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1817,7 +1971,7 @@ mod tests {
         // Simulate by giving the child spawn rights and asking it to spawn.
         seed_agent(&pool, "spawner", "midboss", "[]", 2, 1);
         let child_run = mgr
-            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], None)
+            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], &[], None)
             .await
             .expect("spawn mid");
         let mid_caller = CallerRun {
@@ -1842,7 +1996,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1951,7 +2105,7 @@ mod tests {
 
         // First run wins the single permit and parks on the gate.
         let run_a = mgr
-            .spawn("a", "first", None, &principal, &[], None)
+            .spawn("a", "first", None, &principal, &[], &[], None)
             .await
             .expect("spawn a");
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -2015,7 +2169,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2090,7 +2244,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         // Caller carries the originating session — the mailbox target.
@@ -2151,7 +2305,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2217,7 +2371,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {

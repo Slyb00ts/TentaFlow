@@ -344,15 +344,24 @@ impl OnnxOcrEngine {
         if boxes.is_empty() {
             return Ok(Vec::new());
         }
-        // Sortuj linie top->bottom, a w obrebie podobnej wysokosci left->right.
-        boxes.sort_by(|a, b| {
-            let dy = a.y1 - b.y1;
-            if dy.abs() > (a.y2 - a.y1).max(b.y2 - b.y1) * 0.5 {
-                a.y1.partial_cmp(&b.y1).unwrap_or(std::cmp::Ordering::Equal)
+        // Sortuj linie top->bottom, a w obrebie jednej linii left->right.
+        // Kluczem jest numer pasma wyliczony PRZED sortowaniem: porownywanie
+        // "raz po y, raz po x" zaleznie od pary nie jest porzadkiem totalnym
+        // (A<B po x, B<C po y, a C<A) i sortowanie panikuje.
+        let band_height = boxes
+            .iter()
+            .map(|b| (b.y2 - b.y1).abs())
+            .fold(0.0_f32, f32::max)
+            .max(1.0);
+        let band_of = |b: &TextBox| -> i64 {
+            let band = b.y1 / (band_height * 0.5);
+            if band.is_finite() {
+                band.floor() as i64
             } else {
-                a.x1.partial_cmp(&b.x1).unwrap_or(std::cmp::Ordering::Equal)
+                i64::MAX
             }
-        });
+        };
+        boxes.sort_by(|a, b| band_of(a).cmp(&band_of(b)).then_with(|| a.x1.total_cmp(&b.x1)));
 
         let mut lines: Vec<String> = Vec::with_capacity(boxes.len());
         for b in &boxes {

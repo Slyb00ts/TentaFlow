@@ -24,6 +24,7 @@ pub mod mesh;
 pub mod metrics;
 pub mod ml_studio;
 pub mod net;
+pub mod project_studio;
 pub mod prompt_registry;
 pub mod routing;
 pub mod scheduler;

@@ -212,7 +212,7 @@ impl OcrRunner for AppleOcrEngine {
         // Vision zwraca boxy z origin dolny-lewy, wiec wieksze `y` = wyzej na
         // obrazie. Sortujemy malejaco po `y`, zeby linie szly top->bottom.
         let mut lines = parsed.lines;
-        lines.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+        lines.sort_by(|a, b| b.y.total_cmp(&a.y));
         Ok(lines
             .into_iter()
             .filter_map(|l| {

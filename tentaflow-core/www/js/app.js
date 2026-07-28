@@ -63,6 +63,7 @@ import RobotsScreen from '/js/modules/robots.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
 import SkillsScreen from '/js/modules/skills.js';
 import AgentsScreen from '/js/modules/agents.js';
+import ProjectStudioScreen from '/js/modules/project-studio.js';
 
 // Adapter: profile-report eksponuje statyczne `render(container, params)`,
 // podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
@@ -517,6 +518,7 @@ async function renderApp() {
   Router.register('robots', RobotsScreen);
   Router.register('skills', SkillsScreen);
   Router.register('agents', AgentsScreen);
+  Router.register('projekty', ProjectStudioScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
   Router.register('users', UsersScreen);

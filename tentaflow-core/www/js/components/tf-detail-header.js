@@ -39,6 +39,7 @@ class TfDetailHeader extends HTMLElement {
     const badgesSlot = this.querySelector(':scope > [slot="badges"]');
     const actionsSlot = this.querySelector(':scope > [slot="actions"]');
     const iconSlot = this.querySelector(':scope > [slot="icon"]');
+    const statusSlot = this.querySelector(':scope > [slot="status"]');
     this.innerHTML = '';
 
     const root = document.createElement('div');
@@ -73,6 +74,12 @@ class TfDetailHeader extends HTMLElement {
 
     topRow.appendChild(titleEl);
     topRow.appendChild(versionEl);
+    // slot="status" sits next to the title (entity state), while slot="badges"
+    // stays the metadata row underneath.
+    if (statusSlot) {
+      statusSlot.removeAttribute('slot');
+      topRow.appendChild(statusSlot);
+    }
 
     const subtitleEl = document.createElement('div');
     subtitleEl.className = 'tf-detail-subtitle';

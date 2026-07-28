@@ -51,6 +51,7 @@ use crate::flow_engine::node_adapters::{
     OnSubagentCompleteNodeAdapter, OutputNodeAdapter, PageDetectNodeAdapter,
     PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
     PiiFilterNodeAdapter, PlatformSwitchNodeAdapter, PptxExtractNodeAdapter,
+    ProjectKnowledgeNodeAdapter,
     RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter,
     RagGraphSeedNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter, RerankerNodeAdapter,
     SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter, StoreNodeAdapter,
@@ -1091,6 +1092,9 @@ fn build_registry(
         Arc::new(RagGraphFactsNodeAdapter::new()),
         // RAG E1.0 — węzeł retrievalu scoped do (org, addon_instance, namespace).
         Arc::new(VectorNodeAdapter::new()),
+        // Project Studio knowledge base as a flow block: per-member ACL search
+        // over a project's `passages` namespace + source catalog listing.
+        Arc::new(ProjectKnowledgeNodeAdapter::new()),
         // PARTIA 1 (flow-ingest RAG) — czysto-rustowe węzły ingestu bez modeli:
         // klasyfikacja+routing pliku, rasteryzacja PDF, ekstrakcja office,
         // chunking, scalanie stron i zapis chunków do przestrzeni wektorowej.

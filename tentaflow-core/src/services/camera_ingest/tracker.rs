@@ -236,7 +236,7 @@ pub fn update(camera_id: &str, dets: &mut [Detection], pts_ns: Option<u64>) {
             pairs.push((di, ti, score));
         }
     }
-    pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.sort_by(|a, b| b.2.total_cmp(&a.2));
 
     // Greedy: bierz najlepsze pary, pomijajac juz zajete detekcje/tracki.
     for (di, ti, _score) in pairs {

@@ -1562,6 +1562,1338 @@ inventory::submit! {
 }
 
 // =============================================================================
+// ProjectStudioIngestStream — live progress of a Project Studio ingest job.
+// =============================================================================
+// The frontend subscribes via ApiBinary.subscribe('projectStudioIngestStreamRequest',
+// { projectId, jobId }). log_bus is reused: ingest::start_job emits
+// BusMessage::Line/End under key = job_id; the handler maps them to
+// ProjectStudioBody(IngestStreamChunk/IngestStreamEnd). Polling
+// IngestStatusRequest remains the source of truth for job state.
+
+fn project_studio_ingest_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let (project_id, job_id) = match req {
+        MessageBody::ProjectStudioBody(ProjectStudioPayload::IngestStreamRequest {
+            project_id,
+            job_id,
+        }) => (project_id, job_id),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    // IDOR guard: project_studio.read + project in the subscriber's org +
+    // real membership (or project_studio.admin — inspection outside
+    // membership) + the job MUST belong to this project (job_id is a
+    // process-global log_bus key; without this check any logged-in user who
+    // knows a job_id could watch someone else's ingest).
+    let Some(org) = ctx.org_context.as_ref() else {
+        let _ = push_end(&sub, None);
+        return;
+    };
+    if !org.has("project_studio.read") {
+        let _ = push_end(&sub, None);
+        return;
+    }
+    match crate::project_studio::repository::get_project(&org.org_id, &project_id) {
+        Ok(Some(_)) => {}
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    }
+    let is_member = matches!(
+        crate::project_studio::repository::member_role(&project_id, &org.user_id),
+        Ok(Some(_))
+    );
+    if !is_member && !org.has("project_studio.admin") {
+        let _ = push_end(&sub, None);
+        return;
+    }
+    let job_belongs = crate::project_studio::project_db::open(&project_id)
+        .ok()
+        .and_then(|pool| {
+            crate::project_studio::repository::get_ingest_job(&pool, &job_id)
+                .ok()
+                .flatten()
+        })
+        .is_some();
+    if !job_belongs {
+        let _ = push_end(&sub, None);
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match crate::deploy::log_bus::subscribe(&job_id) {
+            Some(r) => r,
+            None => {
+                // Channel closed — the job already finished. The frontend
+                // reconciles state via IngestStatusRequest.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let chunk = ProjectStudioPayload::IngestStreamChunk {
+                        job_id: line.deploy_id,
+                        kind: line.kind,
+                        phase: line.phase,
+                        line: line.line,
+                        progress_pct: line.progress_pct,
+                        ts_ms: line.ts_ms,
+                    };
+                    if push_chunk(&sub, MessageBody::ProjectStudioBody(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    deploy_id,
+                    final_status,
+                    error_message,
+                    ..
+                }) => {
+                    let error = if error_message.is_empty() {
+                        None
+                    } else {
+                        Some(error_message)
+                    };
+                    let end = ProjectStudioPayload::IngestStreamEnd {
+                        job_id: deploy_id,
+                        status: final_status,
+                        error,
+                    };
+                    let _ = push_end(&sub, Some(MessageBody::ProjectStudioBody(end)));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioIngestStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_ingest_stream_handler,
+    }
+}
+
+// =============================================================================
+// ProjectStudioArchiveStream — live progress of a project export or import.
+// =============================================================================
+// The frontend subscribes via ApiBinary.subscribe('projectStudioArchiveStreamRequest',
+// { jobId }). Authorization is the job's OWNER, not a project role: an import
+// has no project yet (the row appears only once the content is in place), so a
+// project-scoped gate could not exist for the whole run. Polling
+// ProjectExportStatus / ProjectImportStatus stays the source of truth.
+
+fn project_studio_archive_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let MessageBody::ProjectStudioBody(ProjectStudioPayload::ArchiveStreamRequest { job_id }) = req
+    else {
+        let _ = push_end(&sub, None);
+        return;
+    };
+    let Some(org) = ctx.org_context.as_ref() else {
+        let _ = push_end(&sub, None);
+        return;
+    };
+    if !org.has("project_studio.read") {
+        let _ = push_end(&sub, None);
+        return;
+    }
+    // A bare job id must never expose progress to an unrelated user.
+    let owned = crate::project_studio::archive::job(&job_id)
+        .is_some_and(|job| job.owner_user_id == org.user_id);
+    if !owned {
+        let _ = push_end(&sub, None);
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match crate::deploy::log_bus::subscribe(&job_id) {
+            Some(rx) => rx,
+            None => {
+                // Channel closed — the job already finished; the frontend
+                // reconciles through the status request.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let chunk = ProjectStudioPayload::ArchiveStreamChunk {
+                        job_id: line.deploy_id,
+                        phase: line.phase,
+                        line: line.line,
+                        progress_pct: line.progress_pct,
+                        ts_ms: line.ts_ms,
+                    };
+                    if push_chunk(&sub, MessageBody::ProjectStudioBody(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    deploy_id,
+                    final_status,
+                    error_message,
+                    ..
+                }) => {
+                    let end = ProjectStudioPayload::ArchiveStreamEnd {
+                        job_id: deploy_id,
+                        status: final_status,
+                        error: if error_message.is_empty() {
+                            None
+                        } else {
+                            Some(error_message)
+                        },
+                    };
+                    let _ = push_end(&sub, Some(MessageBody::ProjectStudioBody(end)));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioArchiveStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_archive_stream_handler,
+    }
+}
+
+// =============================================================================
+// ProjectStudioChatStream — project chat turn over the system ps-chat flow.
+// =============================================================================
+// The frontend subscribes via ApiBinary.subscribe('projectStudioChatStreamRequest',
+// { projectId, chatId, message }). One turn: persist the user message, run the
+// seeded ps-chat flow (trigger -> project_knowledge -> conversation_history ->
+// llm streaming), forward tokens as ChatStreamChunk{kind:"token"}, emit ONE
+// ChatStreamChunk{kind:"citations"} from the final envelope's rag_citations,
+// persist the assistant reply (content + citations_json) and finish with
+// ChatStreamEnd{message_id}. Dropping the subscription cancels the generation
+// (push failure fires the flow's cancel token — same contract as FlowInvoke).
+
+/// Chat model for a project turn: the project's 'chat' agent binding
+/// (`settings['agents']` in project.db) wins; without a binding (or an agent
+/// without a model) returns None and the llm node's hard "no model" error
+/// surfaces through ChatStreamEnd — the platform deliberately has no global
+/// default model (see `build_initial_envelope_inner`).
+fn project_chat_model(project_id: &str) -> Option<String> {
+    let pool = crate::project_studio::project_db::open(project_id).ok()?;
+    let raw = crate::project_studio::repository::get_setting(&pool, "agents").ok()??;
+    let map: std::collections::HashMap<String, String> = serde_json::from_str(&raw).ok()?;
+    let agent_id = map.get("chat").filter(|s| !s.is_empty())?;
+    let (_name, model) = crate::project_studio::repository::resolve_agent_label(agent_id)?;
+    if model.is_empty() {
+        None
+    } else {
+        Some(model)
+    }
+}
+
+fn project_studio_chat_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue};
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let (project_id, chat_id, message) = match req {
+        MessageBody::ProjectStudioBody(ProjectStudioPayload::ChatStreamRequest {
+            project_id,
+            chat_id,
+            message,
+        }) => (project_id, chat_id, message),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    let end_error = |sub: &Arc<Subscription>, chat_id: &str, error: String| {
+        let _ = push_end(
+            sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::ChatStreamEnd {
+                    chat_id: chat_id.to_string(),
+                    status: "error".into(),
+                    error: Some(error),
+                    message_id: String::new(),
+                },
+            )),
+        );
+    };
+
+    // Guards, uniform denial (no existence leak): project_studio.read →
+    // project in the caller's org → REAL membership (chats are personal
+    // content, so no project_studio.admin bypass) → the chat belongs to the
+    // caller (get_chat filters by user_id).
+    let Some(org) = ctx.org_context.as_ref() else {
+        end_error(&sub, &chat_id, "chat not found".into());
+        return;
+    };
+    if !org.has("project_studio.read") {
+        end_error(&sub, &chat_id, "chat not found".into());
+        return;
+    }
+    let project = match crate::project_studio::repository::get_project(&org.org_id, &project_id) {
+        Ok(Some(p)) => p,
+        _ => {
+            end_error(&sub, &chat_id, "chat not found".into());
+            return;
+        }
+    };
+    // Archived projects are read-only — same contract as `require_active` in
+    // the request/response handlers (bad_request "project is archived"), so
+    // the UI shows the actual state instead of a phantom "chat not found".
+    if project.status == "archived" {
+        end_error(&sub, &chat_id, "project is archived".into());
+        return;
+    }
+    if !matches!(
+        crate::project_studio::repository::member_role(&project_id, &org.user_id),
+        Ok(Some(_))
+    ) {
+        end_error(&sub, &chat_id, "chat not found".into());
+        return;
+    }
+    let chat =
+        match crate::project_studio::repository::get_chat(&project_id, &chat_id, &org.user_id) {
+            Ok(Some(c)) => c,
+            _ => {
+                end_error(&sub, &chat_id, "chat not found".into());
+                return;
+            }
+        };
+
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        end_error(&sub, &chat_id, "message is required".into());
+        return;
+    }
+
+    let user_role = match &ctx.session {
+        SessionAuth::UserSession { role, .. } => role.clone(),
+        _ => None,
+    };
+    let caller_id = org.user_id.clone();
+    let org_id = org.org_id.clone();
+    let model = project_chat_model(&project_id);
+    let router = ctx.state.router.clone();
+    let db = ctx.state.db.clone();
+    let correlation_id = ctx.correlation_id;
+
+    tokio::spawn(async move {
+        let Some(fd) = router.flow_dispatcher().cloned() else {
+            end_error(&sub, &chat_id, "flow dispatcher unavailable".into());
+            return;
+        };
+
+        // Persist the user message BEFORE dispatch: conversation_history
+        // replays it as the last user turn (the llm builder deduplicates the
+        // Text payload against it), and the question survives even when the
+        // generation fails mid-stream.
+        let db_persist = db.clone();
+        let session_for_persist = chat.session_id.clone();
+        let user_text = message.clone();
+        let persisted = tokio::task::spawn_blocking(move || {
+            crate::db::repository::append_project_chat_message(
+                &db_persist,
+                &session_for_persist,
+                "user",
+                &user_text,
+                None,
+            )
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(_))) {
+            end_error(&sub, &chat_id, "failed to persist message".into());
+            return;
+        }
+        let _ = crate::project_studio::repository::touch_chat(&project_id, &chat_id, &caller_id);
+
+        let mut envelope = FlowEnvelope::empty();
+        envelope.payload = FlowValue::Text(message);
+        envelope.meta.insert(
+            "project_id".into(),
+            serde_json::Value::String(project_id.clone()),
+        );
+        envelope.meta.insert(
+            "session_id".into(),
+            serde_json::Value::String(chat.session_id.clone()),
+        );
+        if let Some(m) = model {
+            envelope
+                .meta
+                .insert("model".into(), serde_json::Value::String(m));
+        }
+
+        // Cancel bound to the subscription: a dropped/unsubscribed client
+        // aborts the flow (push failure below fires this token).
+        let cancel = CancellationToken::new();
+        let mut meta = FlowRequestMeta::new(format!("ps-chat-{correlation_id}"));
+        meta.session_id = Some(chat.session_id.clone());
+        meta.user_id = Some(caller_id.clone());
+        meta.user_role = user_role;
+        meta.org_id = Some(org_id);
+        meta.cancel_token = cancel.clone();
+
+        let dispatch = fd
+            .dispatch_by_flow_id_streaming(
+                crate::db::seed::PS_CHAT_FLOW_ID.to_string(),
+                envelope,
+                meta,
+            )
+            .await;
+        let exec = match dispatch {
+            Ok(e) => e,
+            Err(e) => {
+                end_error(&sub, &chat_id, format!("dispatch failed: {e}"));
+                return;
+            }
+        };
+
+        let mut stream = exec.stream;
+        let mut full_text = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(EnvelopeDelta::Llm(c)) => {
+                    if c.text_delta.is_empty() {
+                        continue;
+                    }
+                    full_text.push_str(&c.text_delta);
+                    let chunk = ProjectStudioPayload::ChatStreamChunk {
+                        chat_id: chat_id.clone(),
+                        kind: "token".into(),
+                        text: c.text_delta,
+                        citations_json: String::new(),
+                    };
+                    if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                        .await
+                        .is_err()
+                    {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                // ps-chat is text-only; other delta kinds carry no tokens.
+                Ok(_) => {}
+                Err(e) => {
+                    cancel.cancel();
+                    end_error(&sub, &chat_id, format!("stream error: {e}"));
+                    return;
+                }
+            }
+        }
+
+        // The final envelope carries the retrieval citations set by the
+        // project_knowledge node (meta["rag_citations"]).
+        let (citations_json, flow_error) = match exec.outcome.await {
+            Ok(outcome) => {
+                let cites = outcome
+                    .final_envelope
+                    .meta
+                    .get("rag_citations")
+                    .and_then(|v| v.as_array().filter(|a| !a.is_empty()).map(|_| v.clone()))
+                    .map(|v| v.to_string());
+                (cites, outcome.error)
+            }
+            // The outcome channel dropped — the flow died without reporting.
+            // Don't persist the partial full_text as a successful reply.
+            Err(_) => {
+                end_error(&sub, &chat_id, "flow execution failed".into());
+                return;
+            }
+        };
+        if let Some(e) = flow_error {
+            end_error(&sub, &chat_id, e);
+            return;
+        }
+
+        // Persist the assistant reply (content + citations, so
+        // ChatHistoryResponse rebuilds the sources panel) BEFORE pushing the
+        // citations chunk: a failed push must not lose the reply — the
+        // message_id travels in ChatStreamEnd, and even if that push fails
+        // too the reply survives in the history.
+        let db_persist = db.clone();
+        let session_for_persist = chat.session_id.clone();
+        let assistant_text = full_text;
+        let cites_for_persist = citations_json.clone();
+        let message_id = tokio::task::spawn_blocking(move || {
+            crate::db::repository::append_project_chat_message(
+                &db_persist,
+                &session_for_persist,
+                "assistant",
+                &assistant_text,
+                cites_for_persist.as_deref(),
+            )
+        })
+        .await;
+        let message_id = match message_id {
+            Ok(Ok(id)) => id.to_string(),
+            _ => {
+                end_error(&sub, &chat_id, "failed to persist reply".into());
+                return;
+            }
+        };
+        let _ = crate::project_studio::repository::touch_chat(&project_id, &chat_id, &caller_id);
+
+        if let Some(cites) = citations_json.as_deref() {
+            let chunk = ProjectStudioPayload::ChatStreamChunk {
+                chat_id: chat_id.clone(),
+                kind: "citations".into(),
+                text: String::new(),
+                citations_json: cites.to_string(),
+            };
+            if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        let _ = push_end_async(
+            &sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::ChatStreamEnd {
+                    chat_id,
+                    status: "success".into(),
+                    error: None,
+                    message_id,
+                },
+            )),
+        )
+        .await;
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioChatStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_chat_stream_handler,
+    }
+}
+
+// =============================================================================
+// ProjectStudioRunAutoStream — live view of an automated run (F3, T10).
+// =============================================================================
+// `auto_runs` emits one log_bus line per poll delta under key = run_id; this
+// handler turns those markers into wire chunks by re-reading the row the marker
+// names. Polling RunAutoGetRequest stays the source of truth — a subscriber
+// that joins late simply starts from the next delta.
+
+/// Shared IDOR guard of the Project Studio stream handlers: read permission,
+/// project inside the caller's org and real membership (or
+/// `project_studio.admin` for the inspection tier). Returns the project record.
+fn project_studio_stream_guard(
+    ctx: &HandlerContext,
+    project_id: &str,
+) -> Option<crate::project_studio::models::ProjectRecord> {
+    let org = ctx.org_context.as_ref()?;
+    if !org.has("project_studio.read") {
+        return None;
+    }
+    let project = crate::project_studio::repository::get_project(&org.org_id, project_id).ok()??;
+    let is_member = matches!(
+        crate::project_studio::repository::member_role(project_id, &org.user_id),
+        Ok(Some(_))
+    );
+    if !is_member && !org.has("project_studio.admin") {
+        return None;
+    }
+    Some(project)
+}
+
+/// Builds the wire item for one automated run item (used by the "item" marker).
+fn auto_item_chunk(
+    pool: &crate::db::DbPool,
+    run_id: &str,
+    item_id: &str,
+) -> Option<tentaflow_protocol::project_studio::TestRunItemAutoWire> {
+    use tentaflow_protocol::project_studio::ArtifactRef;
+    let item = crate::project_studio::auto_runs::list_auto_items(pool, run_id)
+        .ok()?
+        .into_iter()
+        .find(|i| i.item_id == item_id)?;
+    let artifact_refs: Vec<ArtifactRef> =
+        crate::project_studio::auto_runs::list_artifacts(pool, run_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.item_id == item_id)
+            .map(|a| ArtifactRef {
+                artifact_id: a.artifact_id.clone(),
+                name: a.name,
+                kind: a.kind,
+                size_bytes: a.size_bytes,
+                mime: a.mime,
+                download_ref: a.artifact_id,
+            })
+            .collect();
+    Some(tentaflow_protocol::project_studio::TestRunItemAutoWire {
+        artifact_refs,
+        item_id: item.item_id,
+        case_id: item.case_id,
+        case_title: item.case_title,
+        kind: item.kind,
+        language: item.language,
+        position: item.position,
+        status: item.status,
+        duration_ms: item.duration_ms,
+        message: item.message,
+        steps_total: item.steps_total,
+        steps_done: item.steps_done,
+    })
+}
+
+fn project_studio_run_auto_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use tentaflow_protocol::project_studio::{ArtifactRef, ProjectStudioPayload};
+
+    let (project_id, run_id) = match req {
+        MessageBody::ProjectStudioBody(ProjectStudioPayload::RunAutoStreamRequest {
+            project_id,
+            run_id,
+        }) => (project_id, run_id),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+    if project_studio_stream_guard(&ctx, &project_id).is_none() {
+        let _ = push_end(&sub, None);
+        return;
+    }
+    // The run MUST belong to this project: run_id is a process-global log_bus
+    // key, so without this check any member of any project could watch it.
+    let Ok(pool) = crate::project_studio::project_db::open(&project_id) else {
+        let _ = push_end(&sub, None);
+        return;
+    };
+    if !matches!(
+        crate::project_studio::runs::get_run(&pool, &run_id),
+        Ok(Some(_))
+    ) {
+        let _ = push_end(&sub, None);
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match crate::deploy::log_bus::subscribe(&run_id) {
+            Some(rx) => rx,
+            None => {
+                // No live watcher — the run already settled. The frontend
+                // reconciles via RunAutoGetRequest.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let mut chunk = ProjectStudioPayload::RunAutoStreamChunk {
+                        run_id: run_id.clone(),
+                        kind: line.kind.clone(),
+                        line: String::new(),
+                        phase: line.phase.clone(),
+                        item: None,
+                        perf_json: String::new(),
+                        artifact: None,
+                        ts_ms: line.ts_ms,
+                    };
+                    // The marker payload rides in `line`; resolve it to the row
+                    // it names so the client gets a full snapshot, not an id.
+                    if let ProjectStudioPayload::RunAutoStreamChunk {
+                        line: out_line,
+                        item,
+                        artifact,
+                        perf_json,
+                        ..
+                    } = &mut chunk
+                    {
+                        match line.kind.as_str() {
+                            "item" => *item = auto_item_chunk(&pool, &run_id, &line.line),
+                            "artifact" => {
+                                *artifact = crate::project_studio::auto_runs::get_artifact(
+                                    &pool, &line.line,
+                                )
+                                .ok()
+                                .flatten()
+                                .map(|a| ArtifactRef {
+                                    artifact_id: a.artifact_id.clone(),
+                                    name: a.name,
+                                    kind: a.kind,
+                                    size_bytes: a.size_bytes,
+                                    mime: a.mime,
+                                    download_ref: a.artifact_id,
+                                })
+                            }
+                            "perf" => {
+                                if let Ok(Some(meta)) =
+                                    crate::project_studio::auto_runs::get_meta(&pool, &run_id)
+                                {
+                                    *perf_json = serde_json::json!({
+                                        "summary": serde_json::from_str::<serde_json::Value>(
+                                            &meta.perf_summary_json
+                                        )
+                                        .unwrap_or_else(|_| serde_json::json!([])),
+                                        "timeline": serde_json::from_str::<serde_json::Value>(
+                                            &meta.perf_timeline_json
+                                        )
+                                        .unwrap_or_else(|_| serde_json::json!([])),
+                                    })
+                                    .to_string();
+                                }
+                            }
+                            _ => *out_line = line.line.clone(),
+                        }
+                    }
+                    if push_chunk(&sub, MessageBody::ProjectStudioBody(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    final_status,
+                    error_message,
+                    ..
+                }) => {
+                    let end = ProjectStudioPayload::RunAutoStreamEnd {
+                        run_id: run_id.clone(),
+                        status: final_status,
+                        error: (!error_message.is_empty()).then_some(error_message),
+                    };
+                    let _ = push_end(&sub, Some(MessageBody::ProjectStudioBody(end)));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioRunAutoStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_run_auto_stream_handler,
+    }
+}
+
+// =============================================================================
+// ProjectStudioTryRunStream — ephemeral single-case execution (F3, T03).
+// =============================================================================
+// Nothing is persisted: no run row, no items, no artifacts. The execution lives
+// in the try-run registry (client-minted `try_id`, owner-scoped cancel, 5 min
+// TTL) and its output goes straight to this subscription.
+
+fn project_studio_try_run_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use crate::project_studio::{auto_runs, environments, generation};
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let (project_id, try_id, case_id, environment_id, content_override, language, perf_profile_json) =
+        match req {
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::TryRunStartRequest {
+                project_id,
+                try_id,
+                case_id,
+                environment_id,
+                content_json_override,
+                language,
+                perf_profile_json,
+            }) => (
+                project_id,
+                try_id,
+                case_id,
+                environment_id,
+                content_json_override,
+                language,
+                perf_profile_json,
+            ),
+            _ => {
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+
+    let end_error = |sub: &Arc<Subscription>, try_id: &str, error: String| {
+        let _ = push_end(
+            sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::TryRunStreamEnd {
+                    try_id: try_id.to_string(),
+                    status: "error".into(),
+                    error: Some(error),
+                    junit_summary_json: String::new(),
+                },
+            )),
+        );
+    };
+
+    // `try_id` is client-minted and becomes a registry key — bound the charset
+    // like `upload_id` so it can never be abused as a path or a wildcard.
+    if try_id.is_empty()
+        || try_id.len() > 128
+        || !try_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        end_error(&sub, &try_id, "invalid try_id".into());
+        return;
+    }
+    let Some(org) = ctx.org_context.as_ref() else {
+        end_error(&sub, &try_id, "case not found".into());
+        return;
+    };
+    let Some(project) = project_studio_stream_guard(&ctx, &project_id) else {
+        end_error(&sub, &try_id, "case not found".into());
+        return;
+    };
+    if project.status == "archived" {
+        end_error(&sub, &try_id, "project is archived".into());
+        return;
+    }
+    // A try run executes untrusted code — the editor tier, not the read tier.
+    if !matches!(
+        crate::project_studio::repository::effective_role(&project_id, &org.user_id),
+        Ok(Some(role)) if role >= crate::project_studio::models::ProjectRole::Editor
+    ) {
+        end_error(&sub, &try_id, "requires the editor project role".into());
+        return;
+    }
+
+    let user_id = org.user_id.clone();
+    let core_db = ctx.state.db.clone();
+    let cipher = ctx.state.settings_cipher.clone();
+    let node_id = ctx.state.local_node_id.clone();
+
+    tokio::spawn(async move {
+        let Ok(pool) = crate::project_studio::project_db::open(&project_id) else {
+            end_error(&sub, &try_id, "project storage unavailable".into());
+            return;
+        };
+        let environment = match environments::get(&pool, &environment_id) {
+            Ok(Some(env)) => env,
+            _ => {
+                end_error(&sub, &try_id, "unknown environment".into());
+                return;
+            }
+        };
+        if environment.approval_status != "approved" {
+            end_error(
+                &sub,
+                &try_id,
+                format!(
+                    "environment '{}' is not approved (status '{}')",
+                    environment.name, environment.approval_status
+                ),
+            );
+            return;
+        }
+        // The approval was taken on a DNS answer that may have moved since: a
+        // host approved as public can point at loopback or the metadata address
+        // by now, so the class is re-derived right before the runner connects.
+        let probe = environment.clone();
+        let now_private = tokio::task::spawn_blocking(move || environments::recheck_private(&probe))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(true);
+        if now_private && !environment.is_private_address {
+            crate::project_studio::activity::record_org_security(
+                &core_db,
+                &node_id,
+                &user_id,
+                "project_studio.environment_address_rebinding_denied",
+                &format!(
+                    "project:{project_id}/environment:{}",
+                    environment.environment_id
+                ),
+                &serde_json::json!({ "base_url": environment.base_url }).to_string(),
+            );
+            end_error(
+                &sub,
+                &try_id,
+                format!(
+                    "environment '{}' now resolves to a private address — it was approved as \
+                     a public target, so the try run was refused",
+                    environment.name
+                ),
+            );
+            return;
+        }
+        let case = match crate::project_studio::tests::get_case(&pool, &case_id) {
+            Ok(Some(case)) => case,
+            _ => {
+                end_error(&sub, &try_id, "case not found".into());
+                return;
+            }
+        };
+        if !generation::is_code_kind(&case.record.kind) {
+            end_error(&sub, &try_id, "only code cases can be try-run".into());
+            return;
+        }
+        let language = if language.trim().is_empty() {
+            case.record.language.clone()
+        } else {
+            language.trim().to_ascii_lowercase()
+        };
+        let content_json = if content_override.trim().is_empty() {
+            case.record.content_json.clone()
+        } else {
+            content_override
+        };
+        let mut content: serde_json::Value =
+            serde_json::from_str(&content_json).unwrap_or_else(|_| serde_json::json!({}));
+        if case.record.kind == "perf" && !perf_profile_json.trim().is_empty() {
+            if let Ok(profile) = serde_json::from_str::<serde_json::Value>(&perf_profile_json) {
+                if let Some(map) = content.as_object_mut() {
+                    map.insert("profile".to_string(), profile);
+                }
+            }
+        }
+        // Validated AFTER the merge: the override is what actually runs, so
+        // validating the stored case first would leave the requested
+        // users/spawn_rate/duration unbounded.
+        if let Err(message) =
+            generation::validate_case_content(&case.record.kind, &language, &content.to_string())
+        {
+            end_error(&sub, &try_id, message);
+            return;
+        }
+        // A unit case bound to a build profile cannot be executed: the runner
+        // needs an inline profile with an absolute mounted workdir, which
+        // requires the per-run sandbox. Submitting it would degrade to plain
+        // pytest in an empty directory and report a green run.
+        if case.record.kind == "unit"
+            && content
+                .get("build_profile_ref")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.trim().is_empty())
+        {
+            end_error(
+                &sub,
+                &try_id,
+                "running a build profile requires a per-run sandbox (planned) — the case \
+                 was not executed"
+                    .into(),
+            );
+            return;
+        }
+
+        let discovery_db = core_db.clone();
+        let runners = match tokio::task::spawn_blocking(move || {
+            auto_runs::list_runners(&discovery_db)
+        })
+        .await
+        {
+            Ok(Ok(runners)) => runners,
+            _ => {
+                end_error(&sub, &try_id, "runner discovery failed".into());
+                return;
+            }
+        };
+        let runner = match auto_runs::select_runner(runners, "", &language) {
+            Ok(runner) => runner,
+            Err(e) => {
+                end_error(&sub, &try_id, e.to_string());
+                return;
+            }
+        };
+        if let Some(reason) = auto_runs::isolation_refusal(&core_db, &runner) {
+            end_error(&sub, &try_id, reason);
+            return;
+        }
+
+        let Some(cancel) = auto_runs::register_try_run(&try_id, &user_id) else {
+            end_error(&sub, &try_id, "this try_id is already running".into());
+            return;
+        };
+        // No auth type = nothing to authenticate with; a stored leftover secret
+        // must not reach the runner (and from there the test script).
+        let secret = if environment.auth_type == "none" {
+            String::new()
+        } else {
+            match environments::decrypt_secret(&cipher, &environment) {
+                Ok(secret) => secret,
+                Err(_) => {
+                    auto_runs::unregister_try_run(&try_id);
+                    end_error(&sub, &try_id, "environment secret unavailable".into());
+                    return;
+                }
+            }
+        };
+        let submit_env = auto_runs::SubmitEnvironment {
+            base_url: environment.base_url.clone(),
+            auth_type: environment.auth_type.clone(),
+            secret,
+            extra_headers: serde_json::from_str(&environment.extra_headers_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            host_allowlist: environments::host_allowlist_of(&environment),
+        };
+        let item = auto_runs::SubmitItem {
+            item_id: format!("try-{}", &try_id[..try_id.len().min(64)]),
+            kind: case.record.kind.clone(),
+            language: language.clone(),
+            config: content
+                .get("config")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            content,
+        };
+
+        // A try run occupies a runner slot and executes untrusted code; without
+        // a gate one user's editor could keep every slot busy. The permit is
+        // held for the whole execution and released when this task ends.
+        let _permit = match auto_runs::try_run_semaphore().acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                auto_runs::unregister_try_run(&try_id);
+                end_error(&sub, &try_id, "try run queue unavailable".into());
+                return;
+            }
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let endpoint = runner.endpoint_url.clone();
+        let try_for_task = try_id.clone();
+        let cancel_for_task = cancel.clone();
+        let deadline_ms = crate::deploy::log_bus::now_ms()
+            + auto_runs::TRY_RUN_TTL.as_millis() as i64;
+        let execution = tokio::task::spawn_blocking(move || {
+            auto_runs::run_try_item(
+                &endpoint,
+                &try_for_task,
+                &item,
+                &submit_env,
+                &cancel_for_task,
+                deadline_ms,
+                |kind, line| {
+                    let _ = event_tx.send((kind.to_string(), line.to_string()));
+                },
+            )
+        });
+
+        while let Some((kind, line)) = event_rx.recv().await {
+            let (kind, phase, line) = if kind == "phase" {
+                ("phase".to_string(), line, String::new())
+            } else {
+                (kind, String::new(), line)
+            };
+            let chunk = ProjectStudioPayload::TryRunStreamChunk {
+                try_id: try_id.clone(),
+                kind,
+                line,
+                phase,
+                ts_ms: crate::deploy::log_bus::now_ms(),
+            };
+            if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                .await
+                .is_err()
+            {
+                // The client is gone — stop the execution instead of paying for
+                // a run nobody will read.
+                auto_runs::cancel_try_run(&try_id, &user_id);
+                break;
+            }
+        }
+
+        let outcome = execution.await;
+        auto_runs::unregister_try_run(&try_id);
+        let (status, error, summary) = match outcome {
+            Ok(Ok(summary)) => {
+                let status = summary
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("error")
+                    .to_string();
+                (status, None, summary.to_string())
+            }
+            Ok(Err(e)) => ("error".to_string(), Some(e.to_string()), String::new()),
+            Err(_) => (
+                "error".to_string(),
+                Some("try run task panicked".to_string()),
+                String::new(),
+            ),
+        };
+        let _ = push_end_async(
+            &sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::TryRunStreamEnd {
+                    try_id,
+                    status,
+                    error,
+                    junit_summary_json: summary,
+                },
+            )),
+        )
+        .await;
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioTryRunStartRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_try_run_stream_handler,
+    }
+}
+
+// =============================================================================
+// ProjectStudioCodeAssistStream — AI assist for the code editor (F3, T03).
+// =============================================================================
+// Routed through the project's `generator_<kind>` agent (its model + system
+// prompt) over the platform flow gateway, so the turn lands in the compliance
+// AI-event trail exactly like the batch generator — never a raw chat
+// completion.
+//
+// The dispatch resolves the USER-DEFINED flow for `{model}:chat`, so whatever
+// blocks that flow carries (tools, memory, RAG) run for this turn too — this is
+// not a tool-free path. Only the final text is used (the proposal), so a tool
+// call cannot change what the editor inserts, but a flow with side-effecting
+// tools would execute them. A dedicated system flow (the `ps-chat` pattern)
+// would close that off; it needs its own seed + streaming contract, so it is
+// deliberately NOT bolted on here.
+
+fn project_studio_code_assist_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue};
+    use crate::project_studio::code_assist;
+    use tentaflow_protocol::project_studio::ProjectStudioPayload;
+
+    let (project_id, case_id, kind, selection, instruction, full_content) = match req {
+        MessageBody::ProjectStudioBody(ProjectStudioPayload::CodeAssistRequest {
+            project_id,
+            case_id,
+            kind,
+            selection,
+            instruction,
+            full_content,
+        }) => (
+            project_id,
+            case_id,
+            kind,
+            selection,
+            instruction,
+            full_content,
+        ),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    let end_error = |sub: &Arc<Subscription>, error: String| {
+        let _ = push_end(
+            sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::CodeAssistStreamEnd {
+                    proposal: String::new(),
+                    error: Some(error),
+                },
+            )),
+        );
+    };
+
+    let Some(org) = ctx.org_context.as_ref() else {
+        end_error(&sub, "case not found".into());
+        return;
+    };
+    let Some(project) = project_studio_stream_guard(&ctx, &project_id) else {
+        end_error(&sub, "case not found".into());
+        return;
+    };
+    if project.status == "archived" {
+        end_error(&sub, "project is archived".into());
+        return;
+    }
+    if !matches!(
+        crate::project_studio::repository::effective_role(&project_id, &org.user_id),
+        Ok(Some(role)) if role >= crate::project_studio::models::ProjectRole::Editor
+    ) {
+        end_error(&sub, "requires the editor project role".into());
+        return;
+    }
+
+    let Ok(pool) = crate::project_studio::project_db::open(&project_id) else {
+        end_error(&sub, "project storage unavailable".into());
+        return;
+    };
+    // The kind of the SAVED case wins over the wire value when the case exists,
+    // so a client cannot pick a different agent for an existing case.
+    let (kind, language) = match crate::project_studio::tests::get_case(&pool, &case_id) {
+        Ok(Some(case)) => (case.record.kind, case.record.language),
+        _ => (kind, "python".to_string()),
+    };
+    let request = code_assist::AssistRequest {
+        kind: &kind,
+        language: &language,
+        selection: &selection,
+        instruction: &instruction,
+        full_content: &full_content,
+    };
+    if let Err(e) = code_assist::validate(&request) {
+        end_error(&sub, e.to_string());
+        return;
+    }
+    let agent = match code_assist::resolve_agent(&ctx.state.db, &pool, &kind) {
+        Ok(agent) => agent,
+        Err(e) => {
+            end_error(&sub, e.to_string());
+            return;
+        }
+    };
+    let system = code_assist::system_prompt(&agent, &kind, &language);
+    let user_turn = code_assist::user_prompt(&request);
+
+    let user_role = match &ctx.session {
+        SessionAuth::UserSession { role, .. } => role.clone(),
+        _ => None,
+    };
+    let caller_id = org.user_id.clone();
+    let org_id = org.org_id.clone();
+    let router = ctx.state.router.clone();
+    let correlation_id = ctx.correlation_id;
+
+    tokio::spawn(async move {
+        let Some(fd) = router.flow_dispatcher().cloned() else {
+            end_error(&sub, "flow dispatcher unavailable".into());
+            return;
+        };
+        let mut envelope = FlowEnvelope::empty();
+        envelope.payload = FlowValue::Text(user_turn);
+        envelope.context.system_prompts.push(system);
+        envelope.meta.insert(
+            "project_id".into(),
+            serde_json::Value::String(project_id.clone()),
+        );
+        // The audit event carries the agent this assist acted as.
+        envelope
+            .meta
+            .insert("agent_id".into(), serde_json::Value::String(agent.agent_id));
+
+        let cancel = CancellationToken::new();
+        let mut meta = FlowRequestMeta::new(format!("ps-assist-{correlation_id}"));
+        meta.user_id = Some(caller_id);
+        meta.user_role = user_role;
+        meta.org_id = Some(org_id);
+        meta.cancel_token = cancel.clone();
+
+        let exec = match fd
+            .try_dispatch_streaming(&agent.model, "chat", envelope, meta)
+            .await
+        {
+            Ok(exec) => exec,
+            Err(e) => {
+                end_error(&sub, format!("dispatch failed: {e}"));
+                return;
+            }
+        };
+
+        let mut stream = exec.stream;
+        let mut full_text = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(EnvelopeDelta::Llm(c)) => {
+                    if c.text_delta.is_empty() {
+                        continue;
+                    }
+                    full_text.push_str(&c.text_delta);
+                    let chunk = ProjectStudioPayload::CodeAssistStreamChunk {
+                        token: c.text_delta,
+                    };
+                    if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                        .await
+                        .is_err()
+                    {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    cancel.cancel();
+                    end_error(&sub, format!("stream error: {e}"));
+                    return;
+                }
+            }
+        }
+        if let Ok(outcome) = exec.outcome.await {
+            if let Some(e) = outcome.error {
+                end_error(&sub, e);
+                return;
+            }
+        }
+        let _ = push_end_async(
+            &sub,
+            Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::CodeAssistStreamEnd {
+                    proposal: code_assist::clean_proposal(&full_text),
+                    error: None,
+                },
+            )),
+        )
+        .await;
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ProjectStudioCodeAssistRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: project_studio_code_assist_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 

@@ -295,6 +295,7 @@ mod tests {
                 None,
                 &AgentPrincipal::user("u1"),
                 &[],
+                &[],
                 None,
             )
             .await
@@ -361,6 +362,7 @@ mod tests {
                 "lead",
                 None,
                 &AgentPrincipal::user("u1"),
+                &[],
                 &[],
                 None,
             )

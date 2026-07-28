@@ -18,6 +18,7 @@ import '/js/components/tf-select.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-textarea.js';
+import '/js/components/tf-code-editor.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-checkbox.js';
@@ -97,8 +98,9 @@ const SkillsScreen = {
           <div class="skills-toolbar">
             <tf-searchbox id="hub-search" placeholder="${escapeAttr(I18n.t('skills.hub.search_placeholder'))}" debounce="0"></tf-searchbox>
             <tf-input id="hub-source" placeholder="${escapeAttr(I18n.t('skills.hub.source_placeholder'))}"></tf-input>
-            <tf-button variant="primary" icon="search" id="hub-search-btn">${escapeHtml(I18n.t('skills.hub.search_action'))}</tf-button>
+            <span class="skills-toolbar-spacer"></span>
             <tf-button variant="ghost" icon="download" id="hub-import-direct">${escapeHtml(I18n.t('skills.hub.import_direct'))}</tf-button>
+            <tf-button variant="primary" icon="search" id="hub-search-btn">${escapeHtml(I18n.t('skills.hub.search_action'))}</tf-button>
           </div>
           <div class="skills-hub-hint">${escapeHtml(I18n.t('skills.hub.hint'))}</div>
           <div id="hub-results-host" class="skills-table-host"></div>
@@ -108,8 +110,9 @@ const SkillsScreen = {
       <div class="skills-top-panel" data-top-panel="curator" hidden>
         <section class="card skills-card">
           <div class="skills-toolbar">
-            <tf-button variant="primary" icon="cluster" id="curator-run">${escapeHtml(I18n.t('skills.curator.run_action'))}</tf-button>
+            <span class="skills-toolbar-spacer"></span>
             <tf-button variant="ghost" icon="rotate" id="curator-rollback" disabled>${escapeHtml(I18n.t('skills.curator.rollback_action'))}</tf-button>
+            <tf-button variant="primary" icon="cluster" id="curator-run">${escapeHtml(I18n.t('skills.curator.run_action'))}</tf-button>
           </div>
           <div class="skills-hub-hint">${escapeHtml(I18n.t('skills.curator.hint'))}</div>
           <div id="curator-host" class="skills-table-host"></div>
@@ -499,8 +502,11 @@ function editorBodyHtml(skill, files, isAddon) {
         <tf-button variant="secondary" size="sm" id="skill-ed-tag-add">${escapeHtml(I18n.t('skills.tag_add'))}</tf-button>
       </div>
     </div>
-    <tf-textarea id="skill-ed-content" class="skills-content"
-      label="${escapeAttr(I18n.t('skills.label_content'))}" rows="14" ${lockAttr}></tf-textarea>
+    <div class="skills-field">
+      <span class="tf-label">${escapeHtml(I18n.t('skills.label_content'))}</span>
+      <tf-code-editor id="skill-ed-content" class="skills-content"
+        language="markdown" ${isAddon ? 'readonly' : ''}></tf-code-editor>
+    </div>
     ${filesBlock}
     <div class="skills-form-error" data-form-error hidden></div>
   `;
