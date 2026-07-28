@@ -913,6 +913,16 @@ pub struct MixedDecodeRows {
 }
 const ATTN_DECODE_GQA_SPLITS: usize = 32;
 
+
+/// Zrzut sumy i skrajnych wartości bufora f16, włączany `FORGE_LAYER_TRACE=1`.
+/// Służy do porównania warstwa po warstwie z `llama-eval-callback`, który podaje
+/// te same sumy po stronie llama.cpp. Każdy zrzut synchronizuje kartę, więc jest
+/// bezużyteczny w pomiarach wydajności i domyślnie wyłączony.
+fn layer_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FORGE_LAYER_TRACE").is_ok_and(|v| v == "1"))
+}
+
 /// Coarse per-phase wall-clock attribution for `prefill_chunk`, enabled by
 /// FORGE_PREFILL_TRACE=1. Every probe synchronizes the device, so absolute
 /// numbers are pessimistic (no inter-kernel overlap) — use the ratios.
@@ -5846,6 +5856,8 @@ impl Model {
                 stream,
             )?;
         }
+        self.trace_f16("embd", &pb.h, 0, rows * hidden);
+        self.trace_f16("attn_norm-0", &pb.x, 0, rows * hidden);
         trace.mark(self.device.as_ref(), "embed");
 
         let n_layers = self.weights.layers.len();
@@ -5949,6 +5961,10 @@ impl Model {
                         self.gemm(&pb.v, v, &pb.x, rows, stream)?;
                     }
                 }
+            }
+            if l == 0 {
+                self.trace_f16("Qcur-0", &pb.q, 0, rows * q_dim);
+                self.trace_f16("Kcur-0", &pb.k, 0, rows * kv_dim);
             }
             trace.mark(self.device.as_ref(), "gemm_qkv");
 
@@ -6316,6 +6332,10 @@ impl Model {
             } else {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, rows, stream)?;
             }
+            if l == 0 {
+                self.trace_f16("attn_out-0", &pb.attn_out, 0, rows * q_dim);
+                self.trace_f16("kqv_out-0", &pb.o_out, 0, rows * hidden);
+            }
             trace.mark(self.device.as_ref(), "gemm_o");
             let fp8mod_fuse_gateup =
                 (fp8mod_fuse || fp8mod_ffn_fuse) && matches!(layer.ffn, LayerFfn::Dense(_));
@@ -6462,6 +6482,7 @@ impl Model {
                 )?;
             }
             trace.mark(self.device.as_ref(), "norm_res2");
+            self.trace_f16(&format!("l_out-{l}"), &pb.h, 0, rows * hidden);
         }
 
         if wait_for_completion || tier_t0.is_some() {
@@ -7178,7 +7199,9 @@ impl Model {
             hidden * 2,
             &self.stream,
         )?;
+        self.trace_f16("result_norm", &self.bufs.x, 0, hidden);
         self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        self.trace_f32("result_output", &self.bufs.logits, vocab);
         self.profile_target_end()?;
         self.device.copy(
             &self.bufs.logits,
@@ -7224,7 +7247,13 @@ impl Model {
             hidden * 2,
             &self.stream,
         )?;
+        self.trace_f16("result_norm", &self.bufs.x, 0, hidden);
         self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        self.trace_f32(
+            "result_output",
+            &self.bufs.logits,
+            self.weights.descriptor.params.vocab_size,
+        );
         self.profile_target_end()
     }
 
@@ -16737,6 +16766,64 @@ impl Model {
     /// sequence's full context per layer (streamed path, never captured). On
     /// the staged path attn_decode_split appends the new token INTO staging
     /// and the tail page is mirrored back to the canonical paged slab.
+    fn trace_f32(&self, label: &str, buf: &DevBuffer, len: usize) {
+        if !layer_trace_enabled() {
+            return;
+        }
+        let _ = self.stream.synchronize();
+        let mut bytes = vec![0u8; len * 4];
+        if self.device.read(buf, 0, &mut bytes).is_err() {
+            return;
+        }
+        let values: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let sum: f64 = values.iter().map(|v| *v as f64).sum();
+        let (best, top) = values
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |acc, (i, v)| {
+                if *v > acc.1 { (i, *v) } else { acc }
+            });
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by(|a, b| values[*b].total_cmp(&values[*a]));
+        let head: Vec<String> = order
+            .iter()
+            .take(5)
+            .map(|i| format!("{i}={:.4}", values[*i]))
+            .collect();
+        eprintln!(
+            "TRACE {label}: suma {sum:.6} max id {best} = {top:.4} | top5 {} | id19887={:.4} id415={:.4}",
+            head.join(" "),
+            values.get(19887).copied().unwrap_or(f32::NAN),
+            values.get(415).copied().unwrap_or(f32::NAN)
+        );
+    }
+
+    fn trace_f16(&self, label: &str, buf: &DevBuffer, byte_offset: usize, len: usize) {
+        if !layer_trace_enabled() {
+            return;
+        }
+        let _ = self.stream.synchronize();
+        let mut bytes = vec![0u8; len * 2];
+        if self.device.read(buf, byte_offset, &mut bytes).is_err() {
+            return;
+        }
+        let values: Vec<f32> = bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        let sum: f32 = values.iter().sum();
+        eprintln!(
+            "TRACE {label}: [{:.4}, {:.4}, {:.4} ... {:.4}] suma {sum:.6}",
+            values[0],
+            values[1],
+            values[2],
+            values[len - 1]
+        );
+    }
+
     fn run_step_fused(&self, src: AttnSrc) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
@@ -16760,6 +16847,8 @@ impl Model {
             hidden,
             stream,
         )?;
+
+        self.trace_f16("embd", &b.h, 0, hidden);
 
         let n_layers = self.weights.layers.len();
         if let AttnSrc::Staged(seq) = &src {
@@ -16789,6 +16878,9 @@ impl Model {
             let (q_buf, q_off, k_buf, k_off, v_buf, v_off) = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w_qkv) => {
                     self.gemv_norm(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
+                    if l == 0 {
+                        self.trace_f16("Qcur-0", &b.qkv, 0, q_dim);
+                    }
                     (&b.qkv, 0usize, &b.qkv, k_byte_off, &b.qkv, v_byte_off)
                 }
                 QkvWeights::FusedQk { qk, v } => {
