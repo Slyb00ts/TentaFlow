@@ -11,7 +11,7 @@ from std.gpu.primitives import warp
 from std.gpu.sync import barrier
 from std.memory import bitcast, stack_allocation
 from src.decode_dp4a import _dp4a
-from src.nvfp4_gguf_batch import _ue4m3_value
+from src.nvfp4_gguf_batch import _ue4m3_branchless
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
@@ -98,7 +98,7 @@ def _row_dot_store(
                     packed_high[part], activation_high[part], integer_dot
                 )
             activation_scale = xd[column // 32]
-            weight_scale = _ue4m3_value(weights[weight_base + group])
+            weight_scale = _ue4m3_branchless(weights[weight_base + group])
             acc += (
                 Float32(integer_dot)
                 * activation_scale
@@ -239,7 +239,10 @@ def gemv_nvfp4_gguf_q8_1_batch_impl[TOKENS: Int](
             packed_low = bitcast[DType.int32, 2](low)
             packed_high = bitcast[DType.int32, 2](high)
             column = block * 64 + group * 16
-            weight_scale = _ue4m3_value(weights[weight_base + group])
+            # Bezgaleziowe dekodowanie skali i polowka wyniesiona PRZED petle
+            # tokenow: to jedyna praca, ktora przy T>1 mnozy sie przez liczbe
+            # tokenow, choc zalezy tylko od grupy.
+            weight_scale = _ue4m3_branchless(weights[weight_base + group]) * 0.5
             comptime for token in range(TOKENS):
                 base = token * n_cols + column
                 activation_low = (xq + base).bitcast[Int32]().load[
@@ -260,7 +263,6 @@ def gemv_nvfp4_gguf_q8_1_batch_impl[TOKENS: Int](
                     Float32(integer_dot)
                     * xd[(column // 32) * n_tokens + token]
                     * weight_scale
-                    * 0.5
                 )
         block += WARP
 
