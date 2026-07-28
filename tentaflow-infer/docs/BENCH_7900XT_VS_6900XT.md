@@ -1,12 +1,10 @@
 # Dwie karty AMD, dwa modele, dwa silniki — pomiar
 
-> **OSTRZEŻENIE DO TABEL PONIŻEJ.** Sprawdzenie wyjścia PO pomiarze wykazało, że
-> FORGE generuje BEŁKOT dla obu tych modeli, na OBU kartach, podczas gdy
-> llama.cpp z tych samych plików daje poprawny tekst. Liczby FORGE dla Gemmy i
-> Bielika mierzą więc szybkość błędnego liczenia i NIE SĄ porównywalne z
-> llama.cpp. Zostawiam je, bo opisują ścieżki kerneli, ale każdy wniosek o
-> „wydajności FORGE wobec llama.cpp" na tych modelach jest nieważny do czasu
-> naprawy. Szczegóły w sekcji „Poprawność".
+> **UWAGA HISTORYCZNA.** Liczby FORGE w tabelach niżej powstały PRZED naprawą
+> RoPE (commit `e7c4d7c7`) i opisują silnik, który dla rodziny Llama liczył złą
+> rotację pozycyjną. Wydajność się przez to nie zmieniła (poprawka działa raz
+> przy ładowaniu wag), ale wyniki modeli owszem. Aktualne pomiary Bielika są w
+> sekcji „Po naprawie RoPE".
 
 Data: 2026-07-28. Karty: RX 6900 XT (gfx1030) i RX 7900 XT (gfx1100) w jednej
 maszynie. llama.cpp `ff067f76` zbudowany na OBIE architektury
@@ -127,23 +125,41 @@ Q4_K ścieżkę WMMA na 7900 XT, czyli zamyka lukę prefillu z punktu 2.
 - llama.cpp `pp512`/`tg128` to jego własny protokół pomiaru; liczby FORGE to
   mediana z 5 powtórzeń po rozgrzewce. Zgodność protokołów nie była wymuszana.
 
-## Poprawność — sprawdzona po pomiarach
+## Poprawność — znaleziony i naprawiony błąd RoPE
 
-Pomiar przepustowości nie mówi nic o tym, czy wynik jest prawidłowy. Sprawdzenie
-wygenerowanego tekstu dało:
+Sprawdzenie wyjścia po pomiarach pokazało, że FORGE odpowiada inaczej niż
+llama.cpp. Porównanie warstwa po warstwie z `llama-eval-callback` (ślad
+`FORGE_LAYER_TRACE=1`) wskazało dokładne miejsce: embedding, norma i projekcja Q
+zgadzały się co do elementu, ale wartości PO RoPE już nie.
 
-| model | format | llama.cpp | FORGE 6900 XT | FORGE 7900 XT |
-|---|---|---|---|---|
-| Bielik Minitron 7B | Q4_K | poprawna polszczyzna | **bełkot** | **bełkot** |
-| Gemma 4 12B QAT | Q4_0 | — | **bełkot** | **bełkot** |
-| Mistral 7B | Q4_K | — | poprawny | poprawny |
-| Qwen3 0.6B | Q8_0 | — | poprawny | poprawny |
+Przyczyna: silnik wszędzie stosował RoPE w stylu NeoX (pary `(i, i + d/2)`),
+podczas gdy rodzina Llama wymaga rotacji przeplatanej (pary `(2i, 2i+1)`).
+Policzona ręcznie rotacja przeplatana z wartości sprzed RoPE dała dokładnie
+liczbę z llama.cpp. Błąd nie ruszał pozycji zerowej (kąt = 0), więc model
+odpowiadał poprawnie na prompt jednotokenowy i rozjeżdżał się od drugiego —
+i dlatego długo wyglądał jak problem konkretnego modelu.
 
-Wniosek: **to nie jest problem kwantyzacji ani architektury karty.** Q4_K działa
-poprawnie na Mistralu na obu kartach, Q8_0 też. Bełkot jest specyficzny dla
-Bielika (llama, po Minitronie) i Gemmy 4 — czyli leży w obsłudze tych modeli, nie
-w ścieżce liczenia. Błąd jest WCZEŚNIEJSZY niż zmiany z tej sesji: występuje na
-6900 XT, która nie dotyka nowego kernela WMMA.
+Poprawka przestawia raz przy ładowaniu wiersze Q i K w kolejność
+`[0, 2, 4, …, 1, 3, 5, …]`; istniejący kernel NeoX liczy wtedy rotację
+przeplataną, a `Q·K` jest niewrażliwe na wspólną permutację wymiarów.
+
+| model | perplexity przed | po |
+|---|--:|--:|
+| Bielik Minitron 7B | 169,96 | **5,98** |
+| Mistral 7B | 30,13 | **4,96** |
+
+Dotyczyło to KAŻDEGO modelu rodziny Llama i Mistral, na NVIDII tak samo jak na
+AMD. Qwen, Gemma i DeepSeek używają NeoX i były poprawne.
+
+## Po naprawie RoPE — Bielik Q4_K, prefill 512 / decode 128
+
+| | 6900 XT | 7900 XT |
+|---|--:|--:|
+| prefill | 1648,8 tok/s | **2408,9 tok/s** |
+| decode | 75,6 tok/s | 92,1 tok/s |
+
+Wydajność względem pomiarów sprzed poprawki jest niezmieniona — permutacja
+wykonuje się raz przy ładowaniu wag.
 
 ## Kernel WMMA dla Q4_K — dodany i zweryfikowany
 
