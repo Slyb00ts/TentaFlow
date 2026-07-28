@@ -37,6 +37,53 @@ przebiegach; bez MTP 33,2 tok/s, co zgadza się z `llama-bench tg128` (32,93).
 
 Graf i fuzja projekcji podniosły decode także na RDNA2: 6900 XT 251,5 -> **287,1** tok/s.
 
+## Pomiar na REALNYM prompcie: liczby syntetyczne są zawyżone
+
+`forge bench` karmi model tokenami z ziarna tokenizera, a wcześniejszy pomiar
+llama.cpp szedł na powtarzanym akapicie. Oba dają model, który sam siebie
+przewiduje, więc **akceptacja draftu MTP wychodzi 96% zamiast realnych ~52%**.
+Ten sam prompt (pytanie po polsku, 200 tokenów, temp 0) na obu silnikach:
+
+| decode, realny prompt | FORGE | llama.cpp | |
+|---|--:|--:|---|
+| bez spekulacji | **35,7 tok/s** | 33,1 tok/s | **FORGE 1,08x** |
+| MTP K=3 | 53,5 tok/s | **58,6 tok/s** | llama.cpp 1,10x |
+| zysk z MTP | **1,50x** | **1,77x** | |
+
+Wniosek jest inny niż z benchmarku syntetycznego: **bazowy decode mamy szybszy**,
+a przegrywamy dopiero na maszynerii spekulacji — llama.cpp wyciąga z MTP 1,77x,
+my 1,50x. To luka w spekulacji, nie w kernelach dekodowania.
+
+Akceptacja per krok (realny prompt): K=2 → 1,16 z 2, K=3 → 1,55 z 3.
+
+## K=3 nie jest wyborem, tylko sufitem implementacji
+
+`--speculative mtp:<k>` przyjmuje WYŁĄCZNIE 2 albo 3, bo kernele weryfikacji
+istnieją tylko dla T=3 i T=4 (`deltanet_prepare_t{2,3,4}_f16`,
+`attn_verify_split8_f16_hd256_t{3,4}`), a K=3 to już T=4.
+
+Czy warto podnieść? Przy zmierzonej akceptacji ~52% na token każdy kolejny krok
+draftu kosztuje PEŁNY odczyt głowy (1351 MB, czyli +5,7% ruchu na cykl), a
+dokłada mniej więcej `p^4 ~ 0,2` tokena na przebieg (+8%). Czyli mniej więcej
+wychodzi na zero — konwencja „3 tokeny" broni się tu liczbami, a nie zwyczajem.
+Sens miałaby dopiero razem z tańszym draftem (głowa w niższej precyzji), na co
+w tej karcie nie ma VRAM-u.
+
+## Prefill: MTP kosztuje nas 2,2% TTFT, llama.cpp nic
+
+| prefill p1024 | bez MTP | z MTP | |
+|---|--:|--:|---|
+| FORGE, sam target | 844,5 tok/s | 845,2 tok/s | bez zmian |
+| FORGE, doganianie bloku MTP | 0,004 ms | **27,2 ms** | dopłata |
+| FORGE, efektywnie z doganianiem | **844,5 tok/s** | 826,6 tok/s | **-2,1%** |
+| llama.cpp (`llama-cli`, ten sam plik) | 650,7 tok/s | 650,7 tok/s | **0%** |
+
+Sam prefill targetu jest identyczny w obu trybach; różnicę robi doprowadzenie
+stanu bloku MTP do końca promptu. llama.cpp nie płaci tu nic, więc to nasza
+realna, choć mała, strata. (Wiersz llama.cpp mierzony `llama-cli`, który raportuje
+niżej niż `llama-bench` — 650,7 wobec 716,3 — dlatego porównywalny jest tylko
+Z SAMYM SOBĄ w kolumnach „bez/z MTP".)
+
 ## Diagnoza: prefill hybrydowy na AMD liczy się jak decode
 
 Prefill FORGE dla 27B jest PŁASKI względem długości promptu — 27,3 tok/s przy
