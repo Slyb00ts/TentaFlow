@@ -114,6 +114,58 @@ pub fn free_vram(ordinal: usize) -> Result<usize> {
 }
 
 /// Otwiera urządzenie `ordinal` z podanymi budżetami pul.
+
+/// Adres karty w systemie: backend PLUS numer w obrębie tego backendu.
+///
+/// Sam numer nie wystarcza, gdy w maszynie są karty RÓŻNYCH producentów —
+/// „urządzenie 0" istnieje wtedy osobno w CUDA i osobno w HIP, a praca
+/// wielokartowa musi móc zaadresować oba naraz (np. RTX 4090 razem z RX 7900 XT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceId {
+    pub backend: Backend,
+    pub ordinal: usize,
+}
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.backend.as_str(), self.ordinal)
+    }
+}
+
+/// Wszystkie widoczne karty ze WSZYSTKICH wkompilowanych backendów.
+///
+/// Kolejność jest ustalona (backendy w `PROBE_ORDER`, w każdym rosnąco po
+/// numerze), więc ten sam host zawsze daje tę samą listę — indeks z tej listy
+/// nadaje się na stabilny identyfikator w konfiguracji.
+pub fn enumerate() -> Vec<DeviceId> {
+    let mut found = Vec::new();
+    for &backend in PROBE_ORDER {
+        let mut ordinal = 0;
+        // Backend nie udostępnia liczby urządzeń jednolicie, więc pytamy o
+        // kolejne numery aż do pierwszego, którego nie widzi.
+        while free_vram_on(backend, ordinal).is_ok() {
+            found.push(DeviceId { backend, ordinal });
+            ordinal += 1;
+        }
+    }
+    found
+}
+
+/// Otwiera KONKRETNĄ kartę, bez autodetekcji backendu.
+pub fn open_id(id: DeviceId, pools: PoolSizes) -> Result<Arc<dyn Device>> {
+    match id.backend {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => Ok(crate::cuda::CudaDevice::new(id.ordinal, pools)?),
+        #[cfg(feature = "hip")]
+        Backend::Hip => Ok(crate::hip::HipDevice::new(id.ordinal, pools)?),
+        #[allow(unreachable_patterns)]
+        other => Err(ForgeError::Device(format!(
+            "backend {} nie jest wkompilowany",
+            other.as_str()
+        ))),
+    }
+}
+
 pub fn open(ordinal: usize, pools: PoolSizes) -> Result<Arc<dyn Device>> {
     match backend(ordinal)? {
         #[cfg(feature = "cuda")]

@@ -267,12 +267,20 @@ pub fn update_capability(
 /// zapisuje, stąd czynnik 2.
 ///
 /// `free_bytes` bierzemy z urządzenia, bo to on ogranicza udział w podziale.
-pub fn calibrate(devices: &[std::sync::Arc<dyn forge_hal::Device>]) -> Result<Vec<DeviceCapability>> {
+pub fn calibrate(
+    devices: &[std::sync::Arc<dyn forge_hal::Device>],
+    kernels: &[forge_kernels::Kernels],
+) -> Result<Vec<DeviceCapability>> {
+    if devices.len() != kernels.len() {
+        return Err(ForgeError::Scheduler(
+            "kalibracja: liczba urządzeń i zestawów kerneli musi być równa".into(),
+        ));
+    }
     const PROBE_BYTES: usize = 128 << 20;
     const WARMUP: usize = 2;
     const ITERS: usize = 8;
     let mut caps = Vec::with_capacity(devices.len());
-    for device in devices {
+    for (index, device) in devices.iter().enumerate() {
         let stream = device.create_stream()?;
         let source = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
         let target = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
@@ -294,17 +302,79 @@ pub fn calibrate(devices: &[std::sync::Arc<dyn forge_hal::Device>]) -> Result<Ve
         let free_bytes = device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
         caps.push(DeviceCapability {
             stream_bytes_per_s: bytes_per_s,
-            // Kopia D2D nie mierzy mnożenia macierzy, a na tych kartach
-            // stosunek mocy w LICZENIU bywa ODWROTNY niż w pamięci (6900 XT ma
-            // 97 TOPS na `dot4`, 7900 XT 43). Skopiowanie tu wagi pamięciowej
-            // dałoby więc start zły w złą stronę. Startujemy RÓWNO i pozwalamy
-            // pętli korekty dojść do prawdy z obserwacji — równy start jest
-            // najgorzej o 2x od optimum, a skopiowany bywa 4x.
-            matmul_ops_per_s: 1.0,
+            matmul_ops_per_s: measure_matmul(device.as_ref(), &kernels[index])?,
             free_bytes,
         });
     }
     Ok(caps)
+}
+
+/// Mierzy przepustowość mnożenia macierzy TYM, CZYM DANA KARTA REALNIE LICZY.
+///
+/// Idzie przez produkcyjny `gemm_nvfp4_gguf_f16` — jedyne wejście z pełnym
+/// rozgałęzieniem na wszystkie obsługiwane architektury: `mma` na NVIDII, WMMA
+/// na RDNA3, warianty przenośne tam, gdzie jednostki macierzowej nie ma. Dzięki
+/// temu KAŻDA karta jest oceniana swoją najlepszą dostępną ścieżką.
+///
+/// To jest warunek, żeby stosunek mocy wychodził automatycznie dla DOWOLNEJ
+/// pary kart, także różnych producentów. Mierzenie wszystkich wspólnym
+/// mianownikiem (np. `dot4`, który ma każdy) zaniżyłoby kartę z lepszą
+/// jednostką — a właśnie po to ta kalibracja istnieje.
+fn measure_matmul(device: &dyn forge_hal::Device, kernels: &forge_kernels::Kernels) -> Result<f64> {
+    use forge_hal::Pool;
+    use forge_types::MemKind;
+    const ROWS: usize = 4096;
+    const COLS: usize = 4096;
+    // Karty różnią się MAKSYMALNYM wsadem, jaki obsłuży ich ścieżka: bez
+    // jednostki macierzowej NVFP4 kończy się na T=16. Schodzimy więc do
+    // pierwszego wsadu, który dana karta uciągnie, i to jest jej realna
+    // przepustowość prefillu — nie artefakt pomiaru, tylko właściwość karty
+    // razem z kernelami, które na niej działają.
+    const TOKEN_CANDIDATES: [usize; 3] = [128, 32, 16];
+    const WARMUP: usize = 2;
+    const ITERS: usize = 5;
+    // Blok GGUF NVFP4: 36 bajtów na 64 wartości.
+    let weight_bytes = ROWS * (COLS / 64) * 36;
+    let max_tokens = TOKEN_CANDIDATES[0];
+    let weights = device.alloc(weight_bytes, MemKind::Device, Pool::Weights)?;
+    let activations = device.alloc(max_tokens * COLS * 2, MemKind::Device, Pool::Weights)?;
+    let output = device.alloc(max_tokens * ROWS * 2, MemKind::Device, Pool::Weights)?;
+    let stream = device.create_stream()?;
+    for tokens in TOKEN_CANDIDATES {
+        let run = || {
+            kernels.gemm_nvfp4_gguf_f16(
+                &output,
+                &weights,
+                &activations,
+                ROWS,
+                COLS,
+                tokens,
+                1.0,
+                &stream,
+            )
+        };
+        if run().is_err() {
+            continue;
+        }
+        for _ in 1..WARMUP {
+            run()?;
+        }
+        stream.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..ITERS {
+            run()?;
+        }
+        stream.synchronize()?;
+        let seconds = started.elapsed().as_secs_f64();
+        if !(seconds > 0.0) {
+            continue;
+        }
+        let ops = 2.0 * ROWS as f64 * COLS as f64 * tokens as f64 * ITERS as f64;
+        return Ok(ops / seconds);
+    }
+    Err(ForgeError::Unsupported(
+        "kalibracja liczenia: żaden wsad nie przeszedł na tym backendzie".into(),
+    ))
 }
 
 #[cfg(test)]

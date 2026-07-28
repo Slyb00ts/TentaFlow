@@ -3,6 +3,7 @@
 // liczeniem). To jest sprawdzian, ze podzial bierze sie z POMIARU.
 use forge_engine::multi_gpu::{calibrate, plan_split, WorkKind};
 use forge_hal::PoolSizes;
+use forge_kernels::Kernels;
 
 fn main() {
     let pools = PoolSizes {
@@ -15,12 +16,14 @@ fn main() {
     for ordinal in 0..2 {
         devices.push(forge_hal::gpu::open(ordinal, pools).expect("otwarcie karty"));
     }
-    let caps = calibrate(&devices).expect("kalibracja");
+    let kernels: Vec<Kernels> = devices.iter().map(|d| Kernels::load(d.clone()).expect("artefakty")).collect();
+    let caps = calibrate(&devices, &kernels).expect("kalibracja");
     for (index, cap) in caps.iter().enumerate() {
         println!(
-            "dev{index} {:<22} pasmo {:>6.0} GB/s  wolne {:>5} MiB",
+            "dev{index} {:<22} pasmo {:>6.0} GB/s  liczenie {:>6.1} TOPS  wolne {:>5} MiB",
             devices[index].caps().name,
             cap.stream_bytes_per_s / 1e9,
+            cap.matmul_ops_per_s / 1e12,
             cap.free_bytes >> 20
         );
     }
@@ -34,7 +37,6 @@ fn main() {
             .iter()
             .map(|r| format!("{:.1}%", 100.0 * *r as f64 / 17408.0))
             .collect();
-        let note = if kind == WorkKind::ComputeBound { "  (start rowny; korekta z obserwacji dojdzie do prawdy)" } else { "" };
-        println!("{label:12}: {:?} wierszy = {}{note}", plan.rows, shares.join(" / "));
+        println!("{label:12}: {:?} wierszy = {}", plan.rows, shares.join(" / "));
     }
 }

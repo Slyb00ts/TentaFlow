@@ -24,13 +24,27 @@ Połączenie (zmierzone `hipMemcpyPeer`, obie strony):
 
 ### Wniosek, który przesądza o architekturze
 
-**Stosunek mocy tych kart ZALEŻY OD RODZAJU PRACY i raz jest odwrotny.**
-W dekodowaniu (ograniczonym pamięcią) 7900 XT jest 2,19x szybsza. W prefillu
-liczonym na instrukcjach dot 6900 XT jest **2,26x szybsza** — RDNA3 zdegradowała
-`dot4`. Dopiero WMMA odwraca to z powrotem na korzyść 7900 XT.
+**Stosunek mocy tych kart ZALEŻY OD RODZAJU PRACY i nie da się go wyliczyć
+z parametrów.** Pokazuje to zestawienie tego, co dawałoby rozumowanie, z tym, co
+wychodzi z pomiaru ścieżki produkcyjnej:
 
-Dlatego **jeden statyczny podział jest z definicji zły**. Podział musi być
-osobny dla prefillu i dla dekodowania, wyliczany z POMIARU, nie z nazwy karty.
+| miara | 6900 XT | 7900 XT | stosunek |
+|---|--:|--:|--:|
+| odczyt DRAM | 336 GB/s | 735 GB/s | 1 : 2,19 |
+| sama instrukcja `dot4` | 97 TOPS | 43 TOPS | **2,26 : 1** (odwrotnie!) |
+| **zmierzony GEMM NVFP4 (ścieżka produkcyjna)** | **1,1 TOPS** | **9,7 TOPS** | **1 : 8,8** |
+
+Trzeci wiersz jest tu najważniejszy i przeczy drugiemu. Z samej instrukcji `dot4`
+wynikałoby, że w prefillu wygrywa 6900 XT. W rzeczywistości przegrywa go
+ośmiokrotnie, bo 7900 XT liczy tę warstwę na WMMA, a 6900 XT bez jednostki
+macierzowej kończy się na wsadzie T=16 i musi robić osiem razy więcej przebiegów
+po wagach.
+
+**To jest dowód, że stosunku mocy nie wolno wyprowadzać z parametrów kart —
+trzeba go zmierzyć tym, czym karta REALNIE liczy.** Dlatego kalibracja idzie
+przez produkcyjne wejście `gemm_nvfp4_gguf_f16`, które rozgałęzia się na `mma`
+(NVIDIA), WMMA (RDNA3) i warianty przenośne, i mierzy każdą kartę jej NAJLEPSZĄ
+dostępną ścieżką przy NAJWIĘKSZYM wsadzie, jaki ta karta obsłuży.
 
 ## 2. Co która technika daje i czego nie daje
 
@@ -138,9 +152,15 @@ mieści się z zapasem.
   limit VRAM, dokładna suma udziałów przy niewygodnych liczbach, próg
   opłacalności, zbieżność pętli korekty i jej odporność na pojedynczy zakłócony
   pomiar.
-- **Kalibracja na realnych kartach**: zmierzone 188 i 534 GB/s (kopia D2D, więc
-  odczyt+zapis), stosunek 1 : 2,8 — zgodny co do kierunku z pomiarem czystego
-  odczytu 336 / 735 GB/s. Planer dzieli dekodowanie 26 / 74%.
+- **Kalibracja na realnych kartach, OBIE osie**: pasmo 208 / 505 GB/s (kopia D2D)
+  oraz liczenie 1,1 / 9,7 TOPS przez produkcyjne wejście GEMM. Planer dzieli
+  dekodowanie **29 / 71%**, a prefill **10 / 90%** — dwa różne podziały z dwóch
+  różnych pomiarów, dokładnie tak, jak wymaga tego sprzęt.
+- **Adresowanie kart niezależne od producenta**: `DeviceId { backend, ordinal }`
+  plus `gpu::enumerate()` listujące karty ze WSZYSTKICH wkompilowanych backendów.
+  Dotąd karta była adresowana samym numerem, a backend wybierany pierwszym
+  trafieniem — czyli RTX 4090 i RX 7900 XT w jednej maszynie były NIE DO
+  zaadresowania równocześnie. To był cichy blokier dla par mieszanych.
 
 **Nie zrobione — i to jest większość pracy:**
 
