@@ -9,6 +9,7 @@ pub mod generate;
 pub mod gguf_vocab;
 pub mod kv;
 pub mod metrics;
+pub mod multi_gpu;
 pub mod model;
 pub mod moe_residency;
 pub mod mtp;
