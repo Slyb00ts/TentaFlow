@@ -15273,8 +15273,17 @@ impl Model {
                             )?;
                         }
                         GateUpWeights::Split { gate, up } => {
-                            self.gemv(&b.gate, gate, &b.x, stream)?;
-                            self.gemv(&b.up, up, &b.x, stream)?;
+                            // Obie projekcje czytają TĘ SAMĄ znormalizowaną
+                            // aktywację, więc idą jednym uruchomieniem ze
+                            // wspólną kwantyzacją zamiast dwoma.
+                            if !self.gemv_nvfp4_gguf_group(
+                                &[(&b.gate, gate), (&b.up, up)],
+                                &b.x,
+                                stream,
+                            )? {
+                                self.gemv(&b.gate, gate, &b.x, stream)?;
+                                self.gemv(&b.up, up, &b.x, stream)?;
+                            }
                             kernels.glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
                         }
                     }
