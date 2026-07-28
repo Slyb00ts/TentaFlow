@@ -1,7 +1,7 @@
 // Kalibruje obie karty tym samym testem i pokazuje, jak planer podzieli pracę
 // dla dekodowania (ograniczonego pamiecia) i dla prefillu (ograniczonego
 // liczeniem). To jest sprawdzian, ze podzial bierze sie z POMIARU.
-use forge_engine::multi_gpu::{calibrate, plan_split, WorkKind};
+use forge_engine::multi_gpu::{MIN_USEFUL_ROWS, calibrate, plan_split, WorkKind};
 use forge_hal::PoolSizes;
 use forge_kernels::Kernels;
 
@@ -31,7 +31,7 @@ fn main() {
         (WorkKind::MemoryBound, "dekodowanie"),
         (WorkKind::ComputeBound, "prefill"),
     ] {
-        let plan = plan_split(&caps, 17408, kind, 0).expect("podzial");
+        let plan = plan_split(&caps, 17408, kind, 0, MIN_USEFUL_ROWS).expect("podzial");
         let shares: Vec<String> = plan
             .rows
             .iter()

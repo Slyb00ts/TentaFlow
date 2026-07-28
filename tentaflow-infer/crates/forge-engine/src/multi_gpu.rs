@@ -62,12 +62,17 @@ impl SplitPlan {
     }
 }
 
-/// Minimalny udział, poniżej którego nie warto angażować karty: koszt wymiany
-/// aktywacji (zmierzone 6,45 us na 10 KiB) przestaje się zwracać.
-const MIN_USEFUL_ROWS: usize = 64;
+/// Minimalny udział wierszy macierzy, poniżej którego nie warto angażować
+/// karty: koszt wymiany aktywacji (zmierzone 6,45 us na 10 KiB) przestaje się
+/// zwracać. Przy dzieleniu innych jednostek (np. warstw modelu w pipelinie)
+/// próg jest INNY, dlatego `plan_split` przyjmuje go jako argument.
+pub const MIN_USEFUL_ROWS: usize = 64;
 
 /// Dzieli `rows` wierszy proporcjonalnie do zmierzonej mocy, respektując wolny
 /// VRAM każdej karty.
+///
+/// `min_useful` to najmniejszy udział, jaki ma sens przydzielić — poniżej niego
+/// praca wraca do najszybszej karty, bo wymiana kosztowałaby więcej niż zysk.
 ///
 /// `bytes_per_row` służy wyłącznie do sprawdzenia, czy przydział się zmieści —
 /// urządzenie, któremu zabrakłoby pamięci, dostaje tyle, ile utrzyma, a resztę
@@ -77,11 +82,12 @@ pub fn plan_split(
     rows: usize,
     kind: WorkKind,
     bytes_per_row: usize,
+    min_useful: usize,
 ) -> Result<SplitPlan> {
     if caps.is_empty() {
         return Err(ForgeError::Scheduler("podział bez urządzeń".into()));
     }
-    if caps.len() == 1 || rows < 2 * MIN_USEFUL_ROWS {
+    if caps.len() == 1 || rows < 2 * min_useful {
         // Jedna karta albo praca zbyt mała, żeby dzielenie się zwróciło.
         let mut plan = vec![0; caps.len()];
         plan[fastest(caps, kind)] = rows;
@@ -162,7 +168,7 @@ pub fn plan_split(
     // Udział mniejszy niż próg opłacalności oddajemy najszybszej karcie, która
     // go przyjmie — inaczej płacilibyśmy za wymianę aktywacji bez zysku.
     for index in 0..assigned.len() {
-        if assigned[index] == 0 || assigned[index] >= MIN_USEFUL_ROWS {
+        if assigned[index] == 0 || assigned[index] >= min_useful {
             continue;
         }
         let orphan = assigned[index];
@@ -399,7 +405,7 @@ mod tests {
 
     #[test]
     fn podzial_idzie_za_pasmem_w_dekodowaniu() {
-        let plan = plan_split(&measured_pair(), 17408, WorkKind::MemoryBound, 0).unwrap();
+        let plan = plan_split(&measured_pair(), 17408, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
         assert_eq!(plan.total(), 17408);
         // 336 / (336+735) = 31,4%
         let share = plan.rows[0] as f64 / 17408.0;
@@ -414,8 +420,8 @@ mod tests {
     #[test]
     fn podzial_odwraca_sie_dla_pracy_ograniczonej_liczeniem() {
         let caps = measured_pair();
-        let decode = plan_split(&caps, 17408, WorkKind::MemoryBound, 0).unwrap();
-        let prefill = plan_split(&caps, 17408, WorkKind::ComputeBound, 0).unwrap();
+        let decode = plan_split(&caps, 17408, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
+        let prefill = plan_split(&caps, 17408, WorkKind::ComputeBound, 0, MIN_USEFUL_ROWS).unwrap();
         assert!(
             decode.rows[0] < decode.rows[1],
             "w dekodowaniu więcej ma dostać 7900 XT"
@@ -432,7 +438,7 @@ mod tests {
     #[test]
     fn suma_udzialow_jest_dokladna_takze_przy_brzydkich_liczbach() {
         for rows in [129, 1000, 4097, 17408, 248320] {
-            let plan = plan_split(&measured_pair(), rows, WorkKind::MemoryBound, 0).unwrap();
+            let plan = plan_split(&measured_pair(), rows, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
             assert_eq!(plan.total(), rows, "rows={rows}");
             assert_eq!(plan.offset(0), 0);
             assert_eq!(plan.offset(1), plan.rows[0]);
@@ -444,7 +450,7 @@ mod tests {
         let mut caps = measured_pair();
         // Szybsza karta ma miejsce tylko na 1000 wierszy.
         caps[1].free_bytes = 1000 * 4096;
-        let plan = plan_split(&caps, 8000, WorkKind::MemoryBound, 4096).unwrap();
+        let plan = plan_split(&caps, 8000, WorkKind::MemoryBound, 4096, MIN_USEFUL_ROWS).unwrap();
         assert_eq!(plan.total(), 8000);
         assert!(plan.rows[1] <= 1000, "przydział ponad pojemność: {:?}", plan.rows);
         assert_eq!(plan.rows[0], 8000 - plan.rows[1]);
@@ -455,7 +461,7 @@ mod tests {
         let mut caps = measured_pair();
         caps[0].free_bytes = 1024;
         caps[1].free_bytes = 1024;
-        let error = plan_split(&caps, 8000, WorkKind::MemoryBound, 4096).unwrap_err();
+        let error = plan_split(&caps, 8000, WorkKind::MemoryBound, 4096, MIN_USEFUL_ROWS).unwrap_err();
         assert!(matches!(error, ForgeError::OutOfMemory { .. }));
     }
 
@@ -463,14 +469,14 @@ mod tests {
     fn mala_praca_nie_jest_dzielona() {
         // Poniżej progu opłacalności wszystko idzie na najszybszą kartę —
         // wymiana aktywacji kosztuje 6,45 us i przy paru wierszach się nie zwraca.
-        let plan = plan_split(&measured_pair(), 64, WorkKind::MemoryBound, 0).unwrap();
+        let plan = plan_split(&measured_pair(), 64, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
         assert_eq!(plan.rows, vec![0, 64]);
     }
 
     #[test]
     fn jedno_urzadzenie_dostaje_calosc() {
         let caps = vec![measured_pair()[0]];
-        let plan = plan_split(&caps, 5000, WorkKind::MemoryBound, 0).unwrap();
+        let plan = plan_split(&caps, 5000, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
         assert_eq!(plan.rows, vec![5000]);
     }
 
@@ -485,7 +491,7 @@ mod tests {
         let rows = 10000;
         let mut spread_before = f64::MAX;
         for _ in 0..40 {
-            let plan = plan_split(&caps, rows, WorkKind::MemoryBound, 0).unwrap();
+            let plan = plan_split(&caps, rows, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
             let elapsed: Vec<f64> = (0..2)
                 .map(|i| plan.rows[i] as f64 / truth[i])
                 .collect();
