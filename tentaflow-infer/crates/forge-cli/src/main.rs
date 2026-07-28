@@ -200,11 +200,16 @@ enum Command {
         /// Max tokens to generate.
         #[arg(short = 'n', long = "max-tokens", default_value_t = 256)]
         max_tokens: usize,
-        #[arg(long = "temp", default_value_t = 0.7)]
-        temperature: f32,
-        /// Wrap the prompt in the model's chat template as a user message.
-        #[arg(long)]
+        /// Temperatura samplingu. Bez tej flagi bierze się z profilu modelu
+        /// (`forge-engine/src/model_profile/`).
+        #[arg(long = "temp")]
+        temperature: Option<f32>,
+        /// Owija prompt w szablon czatu modelu. Bez tej flagi decyduje profil
+        /// modelu; `--no-chat` wymusza surowy prompt.
+        #[arg(long, overrides_with = "no_chat")]
         chat: bool,
+        #[arg(long = "no-chat", overrides_with = "chat")]
+        no_chat: bool,
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
@@ -484,6 +489,7 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             chat,
+            no_chat,
             weights_pool_gb,
             weight_host_gb,
             weight_spill_dir,
@@ -515,6 +521,7 @@ fn main() -> Result<()> {
                 max_tokens,
                 temperature,
                 chat,
+                no_chat,
                 weights_pool_gb,
                 weight_host_gb,
                 weight_spill_dir.clone(),
@@ -1041,6 +1048,101 @@ fn resolve_ctx(
 }
 
 #[allow(clippy::too_many_arguments)]
+
+/// Ile bajtów wag niesie checkpoint. Dla GGUF to rozmiar pliku (nagłówek jest
+/// pomijalny), dla katalogu safetensors suma plików tensorów.
+fn checkpoint_weight_bytes(path: &Path) -> Result<usize> {
+    if path.is_dir() {
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|e| e == "safetensors") {
+                total += entry.metadata()?.len();
+            }
+        }
+        return Ok(total as usize);
+    }
+    Ok(std::fs::metadata(path)?.len() as usize)
+}
+
+/// Pamięć hosta, którą wolno zająć pod wagi. `MemAvailable` z `/proc/meminfo`
+/// jest jedyną wiarygodną miarą „ile da się wziąć bez wpychania systemu w swap";
+/// bierzemy z niej połowę, żeby zostawić miejsce na resztę procesu.
+fn host_offload_headroom() -> usize {
+    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kib: usize = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            return (kib / 2) * 1024;
+        }
+    }
+    0
+}
+
+/// Dobiera budżet RAM i katalog zrzutu, gdy wagi nie mieszczą się w VRAM.
+/// Jawne `--weight-host-gb` / `--weight-spill-dir` mają pierwszeństwo i nie są
+/// ruszane — automat działa tylko tam, gdzie użytkownik nic nie podał.
+fn resolve_offload(
+    path: &Path,
+    vram_weights_pool: usize,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
+) -> Result<(usize, Option<std::path::PathBuf>)> {
+    let explicit_host = (weight_host_gb * (1u64 << 30) as f64) as usize;
+    if explicit_host > 0 && weight_spill_dir.is_some() {
+        return Ok((explicit_host, weight_spill_dir));
+    }
+    let needed = checkpoint_weight_bytes(path).unwrap_or(0);
+    if needed == 0 || needed <= vram_weights_pool {
+        return Ok((explicit_host, weight_spill_dir));
+    }
+    // Zapas 15%: pula wag trzyma nie tylko same tensory, więc realny niedobór
+    // jest większy niż różnica rozmiarów.
+    let missing = (needed - vram_weights_pool) * 115 / 100;
+    let host = if explicit_host > 0 {
+        explicit_host
+    } else {
+        missing.min(host_offload_headroom())
+    };
+    // Zrzut na dysk wystawiamy ZAWSZE, gdy model nie mieści się w VRAM. Katalog
+    // sam z siebie nic nie kosztuje, a jest jedyną deską ratunku, gdy RAM też
+    // się skończy w trakcie ładowania.
+    let spill = match weight_spill_dir {
+        Some(dir) => Some(dir),
+        None => Some(default_spill_dir()?),
+    };
+    eprintln!(
+        "wagi {} MiB nie mieszczą się w puli VRAM {} MiB — RAM {} MiB{}",
+        needed >> 20,
+        vram_weights_pool >> 20,
+        host >> 20,
+        match spill.as_ref() {
+            Some(dir) => format!(", zrzut na NVMe: {}", dir.display()),
+            None => String::new(),
+        }
+    );
+    Ok((host, spill))
+}
+
+/// Katalog zrzutu wag na dysku. Trafia do cache użytkownika, nie do `/tmp` —
+/// `/tmp` bywa tmpfs w RAM, więc zrzut „na dysk" zjadłby tę samą pamięć.
+fn default_spill_dir() -> Result<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .context("nie da się ustalić katalogu cache na zrzut wag")?;
+    let dir = base.join("forge").join("weight-spill");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("utworzenie katalogu zrzutu {}", dir.display()))?;
+    Ok(dir)
+}
+
 fn load_auto(
     path: &Path,
     weights_pool_gb: f64,
@@ -1103,11 +1205,16 @@ fn load_auto(
         },
     )
     .context("open GPU device")?;
+    // Wagi, które nie mieszczą się w puli VRAM, mają zjechać do RAM, a potem na
+    // NVMe — automatycznie. Bez tego model większy od karty kończy się błędem
+    // pamięci, mimo że w maszynie jest i RAM, i dysk.
+    let (weight_host_budget, weight_spill_dir) =
+        resolve_offload(path, weights, weight_host_gb, weight_spill_dir)?;
     load_model(
         dev,
         path,
         ModelConfig {
-        weight_host_budget: (weight_host_gb * (1u64 << 30) as f64) as usize,
+        weight_host_budget,
         weight_spill_dir,
             kv_quant,
             kv_tier,
@@ -1605,8 +1712,9 @@ fn cmd_run(
     model_path: &Path,
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
+    temperature: Option<f32>,
     chat: bool,
+    no_chat: bool,
     weights_pool_gb: f64,
     weight_host_gb: f64,
     weight_spill_dir: Option<std::path::PathBuf>,
@@ -1618,6 +1726,33 @@ fn cmd_run(
     prefix_cache: bool,
     spec: SpeculativeConfig,
 ) -> Result<()> {
+    // Ustawienia domyślne bierze profil modelu; flagi CLI je nadpisują. Bez tego
+    // `forge run <model> "<prompt>"` losowałby przy temperaturze 0,7 i podawał
+    // surowy prompt modelowi instrukcyjnemu — jedno i drugie wygląda jak awaria
+    // modelu, a jest tylko złym ustawieniem domyślnym.
+    let profile = forge_engine::model_profile::resolve(
+        &forge_engine::model_profile::identify(model_path),
+    );
+    let temperature = temperature.unwrap_or(profile.temperature);
+    // `--ctx 0` znaczy „pełne okno modelu"; profil podaje wartość tam, gdzie
+    // pełne okno jest niepraktyczne (Gemma 4 żąda wtedy ponad 100 GB VRAM).
+    let ctx = if ctx == 0 {
+        profile.default_ctx.unwrap_or(0)
+    } else {
+        ctx
+    };
+    let chat = if chat {
+        true
+    } else if no_chat {
+        false
+    } else {
+        profile.chat_template
+    };
+    eprintln!(
+        "profil modelu: {} (temp {temperature}, szablon czatu {})",
+        profile.label, chat
+    );
+
     let t0 = Instant::now();
     // Speculation is mutually exclusive with the radix prefix cache (both manage
     // paged KV ownership); enabling it forces prefix caching off.

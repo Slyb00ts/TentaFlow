@@ -9,6 +9,7 @@ pub mod generate;
 pub mod gguf_vocab;
 pub mod kv;
 pub mod metrics;
+pub mod model_profile;
 pub mod multi_gpu;
 pub mod topology;
 pub mod model;
