@@ -273,9 +273,16 @@ pub fn update_capability(
 /// zapisuje, stąd czynnik 2.
 ///
 /// `free_bytes` bierzemy z urządzenia, bo to on ogranicza udział w podziale.
+/// `quant` MUSI być formatem wag modelu, który faktycznie pojedzie. Stały probe
+/// był błędem i widać to w liczbach: dla NVFP4 stosunek tych dwóch kart wychodzi
+/// 1 : 8,8 (7900 XT liczy na WMMA, 6900 XT bez jednostki macierzowej kończy się
+/// na wsadzie T=16), a dla Q4_K tych SAMYCH kart 0,95 : 1 — bo Q4_K nie ma
+/// kernela WMMA i obie liczą go na `dot4`, gdzie szybsza jest 6900 XT. Jeden
+/// pomiar nie opisuje obu przypadków, więc format musi wejść z zewnątrz.
 pub fn calibrate(
     devices: &[std::sync::Arc<dyn forge_hal::Device>],
     kernels: &[forge_kernels::Kernels],
+    quant: forge_types::QuantKind,
 ) -> Result<Vec<DeviceCapability>> {
     if devices.len() != kernels.len() {
         return Err(ForgeError::Scheduler(
@@ -308,7 +315,7 @@ pub fn calibrate(
         let free_bytes = device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
         caps.push(DeviceCapability {
             stream_bytes_per_s: bytes_per_s,
-            matmul_ops_per_s: measure_matmul(device.as_ref(), &kernels[index])?,
+            matmul_ops_per_s: measure_matmul(device.as_ref(), &kernels[index], quant)?,
             free_bytes,
         });
     }
@@ -326,9 +333,13 @@ pub fn calibrate(
 /// pary kart, także różnych producentów. Mierzenie wszystkich wspólnym
 /// mianownikiem (np. `dot4`, który ma każdy) zaniżyłoby kartę z lepszą
 /// jednostką — a właśnie po to ta kalibracja istnieje.
-fn measure_matmul(device: &dyn forge_hal::Device, kernels: &forge_kernels::Kernels) -> Result<f64> {
+fn measure_matmul(
+    device: &dyn forge_hal::Device,
+    kernels: &forge_kernels::Kernels,
+    quant: forge_types::QuantKind,
+) -> Result<f64> {
     use forge_hal::Pool;
-    use forge_types::MemKind;
+    use forge_types::{MemKind, QuantKind};
     const ROWS: usize = 4096;
     const COLS: usize = 4096;
     // Karty różnią się MAKSYMALNYM wsadem, jaki obsłuży ich ścieżka: bez
@@ -339,16 +350,27 @@ fn measure_matmul(device: &dyn forge_hal::Device, kernels: &forge_kernels::Kerne
     const TOKEN_CANDIDATES: [usize; 3] = [128, 32, 16];
     const WARMUP: usize = 2;
     const ITERS: usize = 5;
-    // Blok GGUF NVFP4: 36 bajtów na 64 wartości.
-    let weight_bytes = ROWS * (COLS / 64) * 36;
+
+    // Bajty na wiersz wynikają z układu bloku danego formatu.
+    let weight_bytes = match quant {
+        QuantKind::NVFP4Gguf => ROWS * (COLS / 64) * 36,
+        QuantKind::Q8_0 => ROWS * (COLS / 32) * 34,
+        QuantKind::Q4K => ROWS * (COLS / 256) * 144,
+        other => {
+            return Err(ForgeError::Unsupported(format!(
+                "kalibracja liczenia nie ma ścieżki dla formatu {other:?}"
+            )));
+        }
+    };
     let max_tokens = TOKEN_CANDIDATES[0];
     let weights = device.alloc(weight_bytes, MemKind::Device, Pool::Weights)?;
     let activations = device.alloc(max_tokens * COLS * 2, MemKind::Device, Pool::Weights)?;
     let output = device.alloc(max_tokens * ROWS * 2, MemKind::Device, Pool::Weights)?;
     let stream = device.create_stream()?;
+    let mut last_error: Option<ForgeError> = None;
     for tokens in TOKEN_CANDIDATES {
-        let run = || {
-            kernels.gemm_nvfp4_gguf_f16(
+        let run = || match quant {
+            QuantKind::NVFP4Gguf => kernels.gemm_nvfp4_gguf_f16(
                 &output,
                 &weights,
                 &activations,
@@ -357,9 +379,28 @@ fn measure_matmul(device: &dyn forge_hal::Device, kernels: &forge_kernels::Kerne
                 tokens,
                 1.0,
                 &stream,
-            )
+            ),
+            QuantKind::Q8_0 => {
+                kernels.gemm_q8_0_f16(&output, &weights, &activations, ROWS, COLS, tokens, &stream)
+            }
+            // `gemm_q4_k_f16` to rodzina wymagajaca artefaktow `_bm*`, ktorych
+            // AMD nie ma. Wejscie `_i8mma_at` jest wspolne dla wszystkich
+            // architektur i samo schodzi na kafle `dot4` tam, gdzie nie ma
+            // jednostki macierzowej — czyli mierzy to, czym karta REALNIE liczy.
+            QuantKind::Q4K => kernels.gemm_q4_k_i8mma_at(
+                &output,
+                &weights,
+                0,
+                &activations,
+                ROWS,
+                COLS,
+                tokens,
+                &stream,
+            ),
+            _ => unreachable!("format odrzucony wyżej"),
         };
-        if run().is_err() {
+        if let Err(error) = run() {
+            last_error = Some(error);
             continue;
         }
         for _ in 1..WARMUP {
@@ -378,9 +419,10 @@ fn measure_matmul(device: &dyn forge_hal::Device, kernels: &forge_kernels::Kerne
         let ops = 2.0 * ROWS as f64 * COLS as f64 * tokens as f64 * ITERS as f64;
         return Ok(ops / seconds);
     }
-    Err(ForgeError::Unsupported(
-        "kalibracja liczenia: żaden wsad nie przeszedł na tym backendzie".into(),
-    ))
+    Err(ForgeError::Unsupported(match last_error {
+        Some(error) => format!("kalibracja liczenia ({quant:?}) nie przeszła: {error}"),
+        None => format!("kalibracja liczenia ({quant:?}): brak wsadu do zmierzenia"),
+    }))
 }
 
 #[cfg(test)]
