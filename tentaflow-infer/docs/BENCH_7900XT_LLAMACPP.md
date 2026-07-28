@@ -204,6 +204,36 @@ czterech tokenów do 32 wywróciło decode z 51,8 na 27,6 tok/s — kafel WMMA N
 jest czysto pamięciowy (52 z 102 TFLOPS), więc ośmiokrotnie nadmiarowa praca
 macierzowa kosztuje realnie.
 
+### Głowa logitów: droga zamknięta pomiarem, nie brakiem pomysłu
+
+Głowa (`output.weight`, 248320 x 5120 Q8_0, **1351 MB**) jest czytana CZTERY razy
+na cykl MTP — trzy kroki draftu plus weryfikacja — czyli 5,4 z 24,4 GB ruchu (22%).
+Sprawdzone kolejno:
+
+1. **Sam kernel jest optymalny.** 1351 MB w 1777 us to **760 GB/s**, czyli POWYŻEJ
+   zmierzonego sufitu DRAM (735 GB/s, resztę dokłada Infinity Cache). Nie ma tam
+   czego przyspieszać.
+2. **Tańsza kopia dla draftu (`FORGE_MTP_DRAFT_HEAD=nvfp4`) NIE MIEŚCI SIĘ.**
+   Głowa NVFP4 to 715 MB, a szczyt zużycia to 20 070 z 20 464 MiB — zostaje
+   **394 MiB**. Zmierzone: 53,7 -> **42,1 tok/s**, bo część danych się wylewa, a
+   akceptacja spada z 1,69 do 1,43 na krok. Funkcja istnieje i działa, tylko ta
+   karta jej nie utrzyma.
+3. **Czytać rzadziej się nie da bez zmiany algorytmu**: weryfikacja potrzebuje
+   pełnego argmaxa na każdej z czterech pozycji, a kroki draftu są sekwencyjne,
+   więc nie da się ich zbatchować.
+
+Wniosek: przy tym modelu i tej karcie 22% ruchu na głowę jest kosztem wpisanym w
+MTP z K=3. Otwiera się dopiero przy większym VRAM (tańsza głowa draftu) albo przy
+spekulacji drzewiastej, gdzie jeden przebieg draftu daje wiele kandydatów.
+
+### Grafowanie proposera to znany ślepy zaułek
+
+Verifier ma już grafy T=3/T=4. Proposer pozostaje eager i tak ma zostać:
+próby jego przechwycenia na NVIDII **zbijały akceptację z 74,2% do 40-54%**,
+bo graf zamrażał stan kolejnych kroków MTP (`docs/BENCH_QWEN35_MTP_NVFP4.md`).
+Dlatego 13,2% bezczynności GPU w trybie MTP adresuje się fuzją kerneli, a nie
+kolejnym grafem.
+
 ZOSTAJE, w kolejności wartości:
 1. **~8 ms z 32 ms na token idzie w ~900 małych kerneli** (rmsnorm, DeltaNet,
    427 kopii D2D). To fuzja kerneli, nie strojenie pojedynczego.
