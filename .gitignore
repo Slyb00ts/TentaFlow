@@ -3,6 +3,7 @@
 # =============================================================================
 target/
 target_shared/
+target-amd/
 target-addon-wasm/
 target-service-context-test/*
 
