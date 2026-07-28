@@ -8686,6 +8686,12 @@ impl Kernels {
         // whose (rows,cols) has a committed (N,K,MPAD) instance and T ≤ 4096. A
         // shape/token count with no bucket (or decode-sized n_tokens < 64) falls
         // through to the portable hand int8-MMQ tiles.
+        // RDNA3 i nowsze: kafel WMMA czytajacy surowe superbloki Q4_K. Bez niego
+        // Q4_K schodzil na `dot4`, zostawiajac jednostke macierzowa bezczynna —
+        // zmierzone, ze wlasnie o to rozbijal sie prefill na 7900 XT.
+        if self.gemm_q4_k_wmma(y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)? {
+            return Ok(());
+        }
         if n_tokens >= 64
             && self.gemm_q4k_i8_native(y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)?
         {
@@ -8703,6 +8709,51 @@ impl Kernels {
             n_tokens,
             stream,
         )
+    }
+
+    /// Q4_K prefill GEMM on RDNA3 matrix units (WMMA 16x16x16), reading the raw
+    /// 144-byte GGUF superblocks. Returns `false` when the architecture has no
+    /// such artifact, so the caller keeps its existing path.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q4_k_wmma(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        const BN: usize = 64;
+        let (name, bm, block) = if n_tokens <= 32 {
+            ("gemm_q4_k_wmma_f16_bm32", 32usize, 128u32)
+        } else {
+            ("gemm_q4_k_wmma_f16_bm256", 256usize, 256u32)
+        };
+        if !self.artifacts.has(name) {
+            return Ok(false);
+        }
+        let kernel = self.artifacts.get(name)?;
+        let config = LaunchConfig {
+            grid: (
+                rows.div_ceil(BN) as u32,
+                n_tokens.div_ceil(bm) as u32,
+                1,
+            ),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q4k, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(kernel, &config, &args, stream)?;
+        Ok(true)
     }
 
     /// Smallest committed MPAD bucket ≥ `n_tokens`, or `None` if `n_tokens`

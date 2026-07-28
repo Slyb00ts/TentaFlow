@@ -642,6 +642,8 @@ const EMBEDDED_GFX1100: &[EmbeddedArtifact] = embedded_arch!["gfx1100", ".hsaco"
     "gemm_q4_k_dot4_128x64",
     "gemm_q4_k_dot4_64x64",
     "gemm_q4_k_dot4_out_f32_64x64",
+    "gemm_q4_k_wmma_f16_bm256",
+    "gemm_q4_k_wmma_f16_bm32",
     "gemm_q6_k_dot4_128x64",
     "gemm_q6_k_dot4_64x64",
     "gemm_q6_k_dot4_out_f32_64x64",

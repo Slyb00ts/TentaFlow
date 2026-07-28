@@ -1,5 +1,13 @@
 # Dwie karty AMD, dwa modele, dwa silniki — pomiar
 
+> **OSTRZEŻENIE DO TABEL PONIŻEJ.** Sprawdzenie wyjścia PO pomiarze wykazało, że
+> FORGE generuje BEŁKOT dla obu tych modeli, na OBU kartach, podczas gdy
+> llama.cpp z tych samych plików daje poprawny tekst. Liczby FORGE dla Gemmy i
+> Bielika mierzą więc szybkość błędnego liczenia i NIE SĄ porównywalne z
+> llama.cpp. Zostawiam je, bo opisują ścieżki kerneli, ale każdy wniosek o
+> „wydajności FORGE wobec llama.cpp" na tych modelach jest nieważny do czasu
+> naprawy. Szczegóły w sekcji „Poprawność".
+
 Data: 2026-07-28. Karty: RX 6900 XT (gfx1030) i RX 7900 XT (gfx1100) w jednej
 maszynie. llama.cpp `ff067f76` zbudowany na OBIE architektury
 (`-DGPU_TARGETS=gfx1030;gfx1100`), FORGE z tego drzewa.
@@ -8,6 +16,9 @@ Oba silniki czytają **ten sam plik GGUF**, więc różnice są różnicami siln
 nie kwantyzacji.
 
 ## Gemma 4 12B QAT (`gemma-4-12B-it-qat-UD-Q4_K_XL`, 6,24 GiB)
+
+Mimo nazwy pliku dominującym formatem tensorów jest **Q4_0**, nie Q4_K —
+llama.cpp też raportuje ten model jako `Q4_0`. Ścieżka Q4_K go nie dotyczy.
 
 | pomiar | 6900 XT | 7900 XT | 7900/6900 |
 |---|--:|--:|--:|
@@ -115,3 +126,50 @@ Q4_K ścieżkę WMMA na 7900 XT, czyli zamyka lukę prefillu z punktu 2.
   Gemmy i żąda 105 GB VRAM.
 - llama.cpp `pp512`/`tg128` to jego własny protokół pomiaru; liczby FORGE to
   mediana z 5 powtórzeń po rozgrzewce. Zgodność protokołów nie była wymuszana.
+
+## Poprawność — sprawdzona po pomiarach
+
+Pomiar przepustowości nie mówi nic o tym, czy wynik jest prawidłowy. Sprawdzenie
+wygenerowanego tekstu dało:
+
+| model | format | llama.cpp | FORGE 6900 XT | FORGE 7900 XT |
+|---|---|---|---|---|
+| Bielik Minitron 7B | Q4_K | poprawna polszczyzna | **bełkot** | **bełkot** |
+| Gemma 4 12B QAT | Q4_0 | — | **bełkot** | **bełkot** |
+| Mistral 7B | Q4_K | — | poprawny | poprawny |
+| Qwen3 0.6B | Q8_0 | — | poprawny | poprawny |
+
+Wniosek: **to nie jest problem kwantyzacji ani architektury karty.** Q4_K działa
+poprawnie na Mistralu na obu kartach, Q8_0 też. Bełkot jest specyficzny dla
+Bielika (llama, po Minitronie) i Gemmy 4 — czyli leży w obsłudze tych modeli, nie
+w ścieżce liczenia. Błąd jest WCZEŚNIEJSZY niż zmiany z tej sesji: występuje na
+6900 XT, która nie dotyka nowego kernela WMMA.
+
+## Kernel WMMA dla Q4_K — dodany i zweryfikowany
+
+`kernels/mojo/src/gemm_q4_k_wmma.mojo`: kafelkowany GEMM czytający surowe
+superbloki GGML Q4_K 144 B na jednostkach macierzowych RDNA3, zakres
+`amd:gfx11+`. Wcześniej Q4_K schodził na AMD na `dot4` i jednostka macierzowa
+7900 XT stała bezczynnie.
+
+Weryfikacja:
+- **Golden test** (`kernels/mojo/tests_amd_q4k_wmma.mojo`) wobec referencji
+  liczonej na hoście tą samą formułą co `_dequant_q4k`, cztery kształty łącznie
+  z niepełnymi kafelkami (`rows=70, cols=768, T=17`): największa różnica 0,48
+  przy referencji rzędu 1000, czyli dokładnie ziarno zaokrąglenia wyjścia f16.
+- **End-to-end**: Mistral 7B Q4_K, prompt 409 tokenów (prefill przez WMMA), tekst
+  spójny i zgodny z wariantem `dot4` na drugiej karcie.
+
+Zysk na Bieliku Q4_K, 7900 XT, prefill 512 tokenów:
+
+| | przed | po | zmiana |
+|---|--:|--:|--:|
+| FORGE prefill | 1598,9 tok/s | **2374,4 tok/s** | **+48,5%** |
+| llama.cpp prefill | 3002,6 tok/s | 3002,6 tok/s | — |
+| udział llama.cpp | 53% | **79%** | |
+
+6900 XT bez zmian (1647,8 → 1662,2), poprawnie: RDNA2 nie ma WMMA i zostaje na
+`dot4`. Dekodowanie bez zmian (92,8 → 92,6), bo idzie przez GEMV.
+
+Zastrzeżenie: ten zysk dotyczy szybkości ścieżki liczenia. Dla samego Bielika
+wynik końcowy pozostaje błędny z powodu opisanego wyżej, niezależnego błędu.
