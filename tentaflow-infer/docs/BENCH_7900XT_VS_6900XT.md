@@ -321,27 +321,29 @@ Zgodność wyjścia potwierdza poprawność, więc bramka pyta teraz o falę 32,
 o producenta. Zysku prędkości na RDNA3 NIE MA (0,4%, w granicach szumu) — w
 odróżnieniu od NVIDII, gdzie dokumentacja podaje 2,60-2,63x na samym skanie.
 
-## Otwarte: hybrydowy prefill na AMD jest ~90x wolniejszy niż na NVIDII
+## Hybrydowy prefill: szybka ścieżka wymaga NVFP4, nie NVIDII
 
 `forge bench qwen36-27b-Q4_K_M --prompt-tokens 2048 --tokens 32` na RX 7900 XT:
 
 | faza | wynik |
 |---|---|
-| prefill 2048 | 72 514 ms → **28,2 tok/s** |
+| prefill 2048 | 72 514 ms → 28,2 tok/s |
 | decode | 27,3 tok/s |
 
 Prefill idzie w tempie dekodowania, czyli praktycznie token po tokenie.
-Dokumentacja podaje dla tego modelu na NVIDII ~2498 tok/s prefillu.
 
-Co już wiadomo:
+**Zestawianie tego z ~2498 tok/s z `CLAUDE.md` byłoby jednak nieuczciwe**: tamta
+liczba dotyczy checkpointu ThinkingCap Qwen3.6-27B **NVFP4**, a tutaj mierzony
+jest Q4_K_M. To nie jest różnica między producentami:
 
-- Wszystkie artefakty wymagane przez `HYBRID_PREFILL_T128_SHARED` i
-  `HYBRID_PREFILL_T128_MATRIX_AMD` ORAZ triplet `gemm_q8_0_wmma_triplet_bm64`
-  są zbudowane dla gfx1100 — to NIE jest brak kerneli.
-- Wewnętrzny chunk hybrydowego prefill wychodzi 32, czyli najmniejszy.
-- `hybrid_prefill_b2_backend_capable` nadal wymaga NVIDII (rollout B2 T32),
-  ale to osobna, eksperymentalna bramka.
+- `hybrid_prefill_t128_backend_capable` akceptuje `Nvidia | Amd` z falą 32 —
+  AMD NIE jest tu blokowane.
+- Wszystkie artefakty `HYBRID_PREFILL_T128_SHARED`, `HYBRID_PREFILL_T128_MATRIX_AMD`
+  i triplet `gemm_q8_0_wmma_triplet_bm64` są zbudowane dla gfx1100.
+- Blokuje `hybrid_prefill_extended_structural_capable`, które wymaga, żeby KAŻDA
+  waga FFN była `DevWeight::NvFp4Gguf`. Dla Q4_K_M jest to fałsz na dowolnej
+  karcie, więc na NVIDII ten sam plik też zszedłby na prefill po tokenie.
 
-Kolejny krok: ustalić, czy blokuje `hybrid_prefill_extended_structural_capable`
-(budżet scratcha), czy sama ścieżka chunkowa nie daje na RDNA przyspieszenia
-względem pętli po tokenie.
+Wniosek: szybki hybrydowy prefill istnieje wyłącznie dla NVFP4. Żeby to zamknąć,
+trzeba albo dorobić warianty Q4_K kerneli layer-major, albo zmierzyć checkpoint
+NVFP4 Qwen3.6 na AMD — lokalnie takiego nie ma (jest tylko DeepSeek-V4-Flash-NVFP4).
