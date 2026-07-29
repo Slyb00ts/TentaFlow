@@ -181,14 +181,32 @@ fn main() {
     println!(
         "logity: max |różnica| {max_abs:.6}, względne L2 {l2:.2e}, inny argmax w {argmax_diff}/{count} krokach"
     );
-    // Zgodność jest NUMERYCZNA, nie bitowa, i to nie jest drobiazg: projekcja
-    // `down` sumuje ~11 tys. składników, które w dużej mierze się kasują, więc
-    // inna kolejność dodawania f32 daje na logitach błąd względny o kilka rzędów
-    // większy niż samo epsilon. Zmierzone na Bieliku 7B Q8_0: podział 32/11232
-    // daje 8e-6, po połowie 7e-3; CAŁY podział na jednej karcie wychodzi bitowo
-    // (0.0), co odróżnia to zjawisko od usterki. Próg jest więc progiem tej
-    // klasy różnicy, nie progiem zaokrągleń.
-    assert!(l2 < 5e-2, "logity podziału rozjechały się z jednokartowymi");
+    // Bramka sprawdza WŁASNOŚĆ, nie zapamiętaną liczbę.
+    //
+    // Gdy cała praca trafia na jedną kartę, podział liczy dokładnie to samo co
+    // silnik i musi wyjść BITOWO — to jest test odróżniający usterkę od
+    // nieprzemienności f32. Przy pracy dwóch kart zgodność jest już tylko
+    // numeryczna: projekcja `down` sumuje tysiące w dużej mierze kasujących się
+    // składników, więc inna kolejność dodawania daje błąd o kilka rzędów większy
+    // niż epsilon i ROSNĄCY z wymiarem pośrednim (Bielik 7B Q8_0 1,4e-2;
+    // 7B Q4_K 1,1e-2; 11B Q4_K, inter 14336, już 6,2e-2). Próg liczbowy dostrojony
+    // do jednego modelu byłby więc fałszywą bramką — sprawdzamy zamiast tego, że
+    // wybór tokenu praktycznie się nie zmienia.
+    let single_card = forced
+        .as_ref()
+        .is_some_and(|plan| plan.iter().filter(|&&c| c > 0).count() <= 1);
+    if single_card {
+        assert_eq!(
+            max_abs, 0.0,
+            "cały podział na jednej karcie musi wyjść bitowo"
+        );
+    } else {
+        assert!(
+            argmax_diff * 20 <= count,
+            "podział zmienił wybrany token w {argmax_diff}/{count} krokach"
+        );
+        assert!(l2 < 0.5, "logity podziału rozjechały się z jednokartowymi");
+    }
     println!(
         "przyspieszenie dekodowania: {:.2}x",
         single_time / split_time

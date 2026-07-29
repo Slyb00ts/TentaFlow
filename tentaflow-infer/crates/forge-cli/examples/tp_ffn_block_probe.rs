@@ -10,7 +10,7 @@
 // jednej karcie, dopiero potem czas. Ksztalty jak w FFN Bielika 7B.
 use forge_engine::cluster::Cluster;
 use forge_engine::multi_gpu::{DeviceCapability, WorkKind};
-use forge_engine::tensor_parallel::{FfnWorkspace, ffn_forward_split, upload_ffn_split};
+use forge_engine::tensor_parallel::{BlockFormat, FfnWorkspace, ffn_forward_split, upload_ffn_split};
 use forge_hal::{Pool, PoolSizes};
 use forge_types::{MemKind, QuantKind};
 use std::time::Instant;
@@ -134,6 +134,8 @@ fn main() {
         HIDDEN,
         INTER,
         WorkKind::MemoryBound,
+        BlockFormat::of(QuantKind::Q8_0).expect("format"),
+        BlockFormat::of(QuantKind::Q8_0).expect("format"),
         None,
     )
     .expect("podzial FFN");

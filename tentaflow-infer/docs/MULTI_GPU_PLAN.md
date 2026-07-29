@@ -421,3 +421,62 @@ niż 58 -> 83 dla samego dekodowania), z IDENTYCZNYM tekstem wyjściowym co do
 słowa. `serve` odpowiada poprawnie przez `/v1/chat/completions`.
 
 Bez tej flagi nic się nie zmienia: podział jest wyłącznie na żądanie operatora.
+
+### Formaty wag: co jest objęte, a co nie
+
+Podział liczy się w BLOKACH formatu, bo granica kolumn musi paść na cały blok.
+Objęte: Q8_0 (32 wartości / 34 B), Q4_K (256 / 144) i Q6_K (256 / 210).
+
+Q6_K wszedł nie dla kompletu, tylko z konieczności: `Q4_K_M` trzyma `gate`/`up` w
+Q4_K, a projekcję `down` w Q6_K. Pierwotny warunek „jeden format dla całej
+trójki" odrzucał więc najpopularniejszą kwantyzację w obiegu. Warunek jest teraz
+postawiony tam, gdzie naprawdę obowiązuje: `gate` i `up` muszą mieć wspólny format
+(dzieli je jeden plan wierszy), `down` może mieć własny — tylko on dzieli się po
+kolumnach i tylko on stawia warunek na granicę bloku.
+
+Zmierzone na RX 6900 XT + RX 7900 XT, 64 kroki dekodowania, podział z kalibracji:
+
+| model | format | jedna karta | podział | zysk | względne L2 | inny argmax |
+|---|---|---|---|---|---|---|
+| Bielik 7B | Q8_0 | 58,1 | 76,5 | 1,32x | 1,25e-2 | 0/64 |
+| Bielik 7B | Q4_K_M | 82,6 | 101,7 | 1,23x | 1,11e-2 | 0/64 |
+| Bielik 11B | Q4_K_M | 56,3 | 74,4 | 1,32x | 6,22e-2 | 0/64 |
+| Nemo 12B | Q4_K_M | 54,9 | 72,4 | 1,32x | 4,39e-2 | 3/64 |
+
+Rozjazd logitów rośnie z wymiarem pośrednim (11B ma 14336 wobec 11264 w 7B) — to
+ta sama nieprzemienność sumowania f32 co wcześniej, potwierdzona tym samym testem:
+cały podział na jednej karcie wychodzi BITOWO dla każdego z tych modeli, w obie
+strony. Dlatego bramka sondy sprawdza teraz właściwość, a nie zapamiętaną liczbę:
+przy jednej karcie wymaga bitowej zgodności, przy dwóch — żeby wybór tokenu
+zmienił się w najwyżej 5% kroków.
+
+**Nemo 12B zmienił token w 3 na 64 krokach.** To mieści się w bramce, ale jest
+najwyższą zaobserwowaną wartością i pokazuje, że przy `--tp-cards` nie da się
+obiecać identycznego wyniku co na jednej karcie.
+
+Gemma 12B Q4_K nie zmieściła się w 16 GiB karty modelu razem z kontekstem —
+niesprawdzona z powodu pamięci, nie formatu.
+
+### NVFP4 i modele hybrydowe: dlaczego ich tu nie ma
+
+ThinkingCap Qwen3.6-27B — i w NVFP4, i w Q4_K_M — to profil `qwen35`, czyli model
+HYBRYDOWY (DeltaNet + uwaga). Odrzuca go architektura, nie format: hybrydowe
+dekodowanie ma własną pętlę warstw i własny przechwycony graf, a podział jest
+wpięty w `run_step_separate`. Dodanie formatu NVFP4 nic by tu nie zmieniło.
+
+Sam NVFP4 ma osobną przeszkodę. Dekodowanie NVFP4 na AMD idzie przez
+`gemv_nvfp4_gguf_q8_1_group_f16`, a podział potrzebuje wariantu z wyjściem f32
+(sumy cząstkowe) — takiego kernela nie ma. Użycie zamiast niego istniejącego
+`gemv_nvfp4_gguf_out_f32` powtórzyłoby dokładnie ten błąd, który dziś kosztował
+pół dnia: inny kernel to inny wynik modelu, a nie inny rozkład pracy. Brakujący
+kernel dałoby się napisać — ale jedyny NVFP4 GGUF na tej maszynie to model
+hybrydowy, więc nie byłoby jak sprawdzić go od końca do końca. Nie dokładam kodu,
+którego nie umiem zweryfikować.
+
+Dla obu modeli 27B jest zresztą głębszy problem niż format: nie mieszczą się na
+jednej karcie (17,4 GiB NVFP4 i 16,0 GiB Q4_K wobec 16 GiB VRAM), więc dziś
+zjeżdżają na host i NVMe. Obecny podział trzyma PEŁNĄ kopię wag FFN na karcie
+modelu (prefill liczy je macierzowo), czyli zwiększa zapotrzebowanie na pamięć
+zamiast je rozłożyć. Żeby dwie karty niosły model, którego jedna nie unosi,
+podział musi objąć także prefill i zastąpić kopię jednokartową, a nie stanąć obok
+niej. To jest następny duży krok i to on, a nie kolejny format, odblokowuje 27B.

@@ -8,7 +8,7 @@
 // przypada JEDNA wymiana, a nie dwie.
 use forge_engine::cluster::Cluster;
 use forge_engine::multi_gpu::{DeviceCapability, WorkKind};
-use forge_engine::tensor_parallel::{gemv_q8_0_column_split, upload_column_split};
+use forge_engine::tensor_parallel::{BlockFormat, gemv_q8_0_column_split, upload_column_split};
 use forge_hal::{Pool, PoolSizes};
 use forge_types::{MemKind, QuantKind};
 use std::time::Instant;
@@ -101,7 +101,15 @@ fn main() {
         .expect("odczyt odniesienia");
 
     // Podzial kolumnowy.
-    let shards = upload_column_split(&cluster, &caps, &data, ROWS, COLS, WorkKind::MemoryBound)
+    let shards = upload_column_split(
+        &cluster,
+        &caps,
+        &data,
+        ROWS,
+        COLS,
+        WorkKind::MemoryBound,
+        BlockFormat::of(QuantKind::Q8_0).expect("format"),
+    )
         .expect("podzial kolumnowy");
     for index in 0..cluster.len() {
         println!(

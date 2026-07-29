@@ -14,7 +14,7 @@
 use crate::cluster::Cluster;
 use crate::multi_gpu::{DeviceCapability, MIN_USEFUL_ROWS, WorkKind, plan_split};
 use forge_hal::{DevBuffer, Pool};
-use forge_types::{ForgeError, MemKind, Result};
+use forge_types::{ForgeError, MemKind, QuantKind, Result};
 
 /// Macierz wag rozłożona na karty: fragment `i` leży na karcie `i` i obejmuje
 /// wiersze `[offset(i), offset(i) + rows(i))`.
@@ -228,6 +228,7 @@ pub struct ColShards {
     cols: Vec<usize>,
     offsets: Vec<usize>,
     rows: usize,
+    format: BlockFormat,
 }
 
 impl ColShards {
@@ -250,11 +251,41 @@ impl ColShards {
     }
 }
 
-/// Bloki Q8_0 niosą 32 wartości, więc granica podziału kolumn musi być ich
-/// wielokrotnością — inaczej fragment zaczynałby się w środku bloku i żaden
-/// kernel by go nie odczytał.
-const Q8_0_BLOCK: usize = 32;
-const Q8_0_BLOCK_BYTES: usize = 34;
+/// Blok formatu kwantyzacji: ile wartości niesie i ile zajmuje bajtów.
+///
+/// Granica podziału kolumn MUSI paść na całe bloki — fragment zaczynający się w
+/// środku bloku nie ma jak zostać odczytany przez żaden kernel. Stąd podział
+/// liczony jest w blokach, a nie w kolumnach.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlockFormat {
+    pub values: usize,
+    pub bytes: usize,
+    pub quant: QuantKind,
+}
+
+impl BlockFormat {
+    pub fn of(quant: QuantKind) -> Result<Self> {
+        let (values, bytes) = match quant {
+            QuantKind::Q8_0 => (32, 34),
+            QuantKind::Q4K => (256, 144),
+            QuantKind::Q6K => (256, 210),
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "podział FFN na karty nie ma ścieżki dla formatu {other:?}"
+                )));
+            }
+        };
+        Ok(Self {
+            values,
+            bytes,
+            quant,
+        })
+    }
+
+    fn row_bytes(&self, cols: usize) -> usize {
+        (cols / self.values) * self.bytes
+    }
+}
 
 /// Rozkłada macierz `[rows, cols]` w Q8_0 po kolumnach, proporcjonalnie do
 /// ZMIERZONEJ mocy kart i z zaokrągleniem do pełnych bloków.
@@ -265,8 +296,9 @@ pub fn upload_column_split(
     rows: usize,
     cols: usize,
     kind: WorkKind,
+    format: BlockFormat,
 ) -> Result<ColShards> {
-    upload_column_split_with(cluster, caps, data, rows, cols, kind, None)
+    upload_column_split_with(cluster, caps, data, rows, cols, kind, format, None)
 }
 
 /// Jak `upload_column_split`, ale z możliwością NARZUCENIA podziału (kolumny na
@@ -281,6 +313,7 @@ pub fn upload_column_split_with(
     rows: usize,
     cols: usize,
     kind: WorkKind,
+    format: BlockFormat,
     forced: Option<&[usize]>,
 ) -> Result<ColShards> {
     if caps.len() != cluster.len() {
@@ -288,12 +321,13 @@ pub fn upload_column_split_with(
             "liczba profili możliwości musi odpowiadać liczbie kart".into(),
         ));
     }
-    if !cols.is_multiple_of(Q8_0_BLOCK) {
+    if !cols.is_multiple_of(format.values) {
         return Err(ForgeError::Format(format!(
-            "podział kolumnowy Q8_0 wymaga cols % 32 == 0, jest {cols}"
+            "podział kolumnowy {:?} wymaga cols % {} == 0, jest {cols}",
+            format.quant, format.values
         )));
     }
-    let row_bytes = (cols / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES;
+    let row_bytes = format.row_bytes(cols);
     if rows == 0 || data.len() != rows * row_bytes {
         return Err(ForgeError::Format(format!(
             "macierz {rows}x{cols} to {} B, otrzymano {}",
@@ -303,7 +337,7 @@ pub fn upload_column_split_with(
     }
     // Dzielimy BLOKI, nie pojedyncze kolumny — stąd podział liczony w blokach
     // i przemnożony z powrotem przez 32.
-    let blocks = cols / Q8_0_BLOCK;
+    let blocks = cols / format.values;
     let plan = match forced {
         Some(columns) => {
             if columns.len() != cluster.len() || columns.iter().sum::<usize>() != cols {
@@ -312,16 +346,17 @@ pub fn upload_column_split_with(
                     cluster.len()
                 )));
             }
-            if let Some(bad) = columns.iter().find(|c| !c.is_multiple_of(Q8_0_BLOCK)) {
+            if let Some(bad) = columns.iter().find(|c| !c.is_multiple_of(format.values)) {
                 return Err(ForgeError::Scheduler(format!(
-                    "narzucony podział musi iść po pełnych blokach 32, jest {bad}"
+                    "narzucony podział musi iść po pełnych blokach {}, jest {bad}",
+                    format.values
                 )));
             }
             crate::multi_gpu::SplitPlan {
-                rows: columns.iter().map(|c| c / Q8_0_BLOCK).collect(),
+                rows: columns.iter().map(|c| c / format.values).collect(),
             }
         }
-        None => plan_split(caps, blocks, kind, Q8_0_BLOCK_BYTES * rows, 1)?,
+        None => plan_split(caps, blocks, kind, format.bytes * rows, 1)?,
     };
 
     let mut shards = Vec::with_capacity(cluster.len());
@@ -330,21 +365,21 @@ pub fn upload_column_split_with(
     let mut block_offset = 0usize;
     for (index, &count) in plan.rows.iter().enumerate() {
         let entry = cluster.device(index)?;
-        let shard_bytes = count.max(1) * Q8_0_BLOCK_BYTES * rows;
+        let shard_bytes = count.max(1) * format.bytes * rows;
         let buffer = entry.device.alloc(shard_bytes, MemKind::Device, Pool::Weights)?;
         if count > 0 {
             // Fragment jest ciągły w obrębie wiersza, ale nie w całej macierzy,
             // więc składamy go wierszami do bufora pośredniego.
-            let mut staged = Vec::with_capacity(count * Q8_0_BLOCK_BYTES * rows);
+            let mut staged = Vec::with_capacity(count * format.bytes * rows);
             for row in 0..rows {
-                let from = row * row_bytes + block_offset * Q8_0_BLOCK_BYTES;
-                staged.extend_from_slice(&data[from..from + count * Q8_0_BLOCK_BYTES]);
+                let from = row * row_bytes + block_offset * format.bytes;
+                staged.extend_from_slice(&data[from..from + count * format.bytes]);
             }
             entry.device.write(&staged, &buffer, 0)?;
         }
         shards.push(buffer);
-        offsets.push(block_offset * Q8_0_BLOCK);
-        cols_per_device.push(count * Q8_0_BLOCK);
+        offsets.push(block_offset * format.values);
+        cols_per_device.push(count * format.values);
         block_offset += count;
     }
     Ok(ColShards {
@@ -352,6 +387,7 @@ pub fn upload_column_split_with(
         cols: cols_per_device,
         offsets,
         rows,
+        format,
     })
 }
 
@@ -391,24 +427,49 @@ pub fn gemv_q8_0_column_split(
         let cols = shards.cols_on(index);
         // Ten sam wybór co wyżej — z wyjściem w f32, bo to są sumy CZĄSTKOWE i
         // dodawanie ich w f16 gubiłoby bity przy każdej karcie.
-        if cols <= forge_kernels::Kernels::DP4A_MAX_COLS {
-            entry.kernels.gemv_q8_0_dp4a_out_f32(
+        let dp4a = cols <= forge_kernels::Kernels::DP4A_MAX_COLS;
+        match (shards.format.quant, dp4a) {
+            (QuantKind::Q8_0, true) => entry.kernels.gemv_q8_0_dp4a_out_f32(
                 &y_parts[index],
                 shards.shard(index)?,
                 &x_parts[index],
                 rows,
                 cols,
                 stream,
-            )?;
-        } else {
-            entry.kernels.gemv_q8_0_out_f32(
+            )?,
+            (QuantKind::Q8_0, false) => entry.kernels.gemv_q8_0_out_f32(
                 &y_parts[index],
                 shards.shard(index)?,
                 &x_parts[index],
                 rows,
                 cols,
                 stream,
-            )?;
+            )?,
+            (QuantKind::Q4K, true) => entry.kernels.gemv_q4_k_dp4a_out_f32(
+                &y_parts[index],
+                0,
+                shards.shard(index)?,
+                &x_parts[index],
+                0,
+                rows,
+                cols,
+                stream,
+            )?,
+            (QuantKind::Q6K, _) => entry.kernels.gemv_q6_k_out_f32(
+                &y_parts[index],
+                0,
+                shards.shard(index)?,
+                &x_parts[index],
+                0,
+                rows,
+                cols,
+                stream,
+            )?,
+            (other, _) => {
+                return Err(ForgeError::Unsupported(format!(
+                    "podział FFN nie ma ścieżki GEMV dla {other:?}"
+                )));
+            }
         }
     }
     // Redukcja: karta zbierająca dodaje do siebie sumy cząstkowe pozostałych.
@@ -458,6 +519,10 @@ pub struct FfnShards {
     up: Vec<DevBuffer>,
     down: ColShards,
     rows: Vec<usize>,
+    /// Format `gate`/`up`. Może być INNY niż `down`: `Q4_K_M` trzyma projekcję
+    /// `down` w Q6_K. Dzielenie po wierszach nie stawia warunku na granicę, więc
+    /// wystarczy, że pokrywa się ona z granicą bloków `down`.
+    format: BlockFormat,
 }
 
 impl FfnShards {
@@ -480,17 +545,29 @@ pub fn upload_ffn_split(
     hidden: usize,
     inter: usize,
     kind: WorkKind,
+    format: BlockFormat,
+    down_format: BlockFormat,
     forced: Option<&[usize]>,
 ) -> Result<FfnShards> {
-    let down = upload_column_split_with(cluster, caps, down, hidden, inter, kind, forced)?;
+    let down = upload_column_split_with(
+        cluster,
+        caps,
+        down,
+        hidden,
+        inter,
+        kind,
+        down_format,
+        forced,
+    )?;
     let rows: Vec<usize> = (0..cluster.len()).map(|i| down.cols_on(i)).collect();
-    let gate = upload_rows_by_plan(cluster, gate, inter, hidden, &rows)?;
-    let up = upload_rows_by_plan(cluster, up, inter, hidden, &rows)?;
+    let gate = upload_rows_by_plan(cluster, gate, inter, hidden, &rows, format)?;
+    let up = upload_rows_by_plan(cluster, up, inter, hidden, &rows, format)?;
     Ok(FfnShards {
         gate,
         up,
         down,
         rows,
+        format,
     })
 }
 
@@ -502,8 +579,9 @@ fn upload_rows_by_plan(
     rows: usize,
     cols: usize,
     plan: &[usize],
+    format: BlockFormat,
 ) -> Result<Vec<DevBuffer>> {
-    let row_bytes = (cols / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES;
+    let row_bytes = format.row_bytes(cols);
     if data.len() != rows * row_bytes {
         return Err(ForgeError::Format(format!(
             "macierz {rows}x{cols} to {} B, otrzymano {}",
@@ -574,15 +652,32 @@ pub fn ffn_forward_split(
         // dp4a silnik kwantyzuje aktywację do int8. Liczenie tu dokładniej
         // brzmi niewinnie, ale znaczy, że podział zmienia wynik modelu — a ma
         // zmieniać wyłącznie to, która karta go liczy.
+        let dp4a = hidden <= forge_kernels::Kernels::DP4A_MAX_COLS;
         let gemv_f16 = |y: &DevBuffer, w: &DevBuffer| -> Result<()> {
-            if hidden <= forge_kernels::Kernels::DP4A_MAX_COLS {
-                entry
-                    .kernels
-                    .gemv_q8_0_dp4a_f16(y, w, &ws.x[index], rows, hidden, stream)
-            } else {
-                entry
-                    .kernels
-                    .gemv_q8_0_f16(y, w, &ws.x[index], rows, hidden, stream)
+            match (shards.format.quant, dp4a) {
+                (QuantKind::Q8_0, true) => {
+                    entry
+                        .kernels
+                        .gemv_q8_0_dp4a_f16(y, w, &ws.x[index], rows, hidden, stream)
+                }
+                (QuantKind::Q8_0, false) => {
+                    entry
+                        .kernels
+                        .gemv_q8_0_f16(y, w, &ws.x[index], rows, hidden, stream)
+                }
+                (QuantKind::Q4K, true) => {
+                    entry
+                        .kernels
+                        .gemv_q4_k_dp4a_f16(y, w, &ws.x[index], rows, hidden, stream)
+                }
+                (QuantKind::Q4K, false) => {
+                    entry
+                        .kernels
+                        .gemv_q4_k_f16(y, w, &ws.x[index], rows, hidden, stream)
+                }
+                (other, _) => Err(ForgeError::Unsupported(format!(
+                    "podział FFN nie ma ścieżki GEMV dla {other:?}"
+                ))),
             }
         };
         gemv_f16(&ws.gate[index], &shards.gate[index])?;

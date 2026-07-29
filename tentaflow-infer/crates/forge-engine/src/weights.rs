@@ -4868,16 +4868,31 @@ pub fn load_ffn_shards_gguf(
         ));
     }
     let src = GgufSource(&gguf);
-    let bytes = |what: &str, w: HostWeight, rows: usize, cols: usize| -> Result<Vec<u8>> {
-        match w {
-            HostWeight::Q8_0 { data, rows: r, cols: c } if r == rows && c == cols => Ok(data),
-            HostWeight::Q8_0 { rows: r, cols: c, .. } => Err(ForgeError::Format(format!(
+    // Format bloku bierzemy z SAMYCH wag, a nie z deklaracji: `Q4_K_M` trzyma
+    // część macierzy w Q4_K, a część w Q6_K, więc nazwa pliku nic tu nie
+    // rozstrzyga. Wszystkie trzy macierze FFN warstwy muszą mieć ten sam format,
+    // bo dzieli je jeden plan.
+    let bytes = |what: &str,
+                 w: HostWeight,
+                 rows: usize,
+                 cols: usize|
+     -> Result<(Vec<u8>, crate::tensor_parallel::BlockFormat)> {
+        let (data, r, c, quant) = match w {
+            HostWeight::Q8_0 { data, rows, cols } => (data, rows, cols, QuantKind::Q8_0),
+            HostWeight::Q4K { data, rows, cols } => (data, rows, cols, QuantKind::Q4K),
+            HostWeight::Q6K { data, rows, cols } => (data, rows, cols, QuantKind::Q6K),
+            _ => {
+                return Err(ForgeError::Unsupported(format!(
+                    "podział FFN na karty obejmuje wagi Q8_0, Q4_K i Q6_K, {what} jest w innym formacie"
+                )));
+            }
+        };
+        if r != rows || c != cols {
+            return Err(ForgeError::Format(format!(
                 "{what}: kształt [{r}, {c}], wymagano [{rows}, {cols}]"
-            ))),
-            _ => Err(ForgeError::Unsupported(format!(
-                "podział FFN na karty wymaga wag Q8_0, {what} jest w innym formacie"
-            ))),
+            )));
         }
+        Ok((data, crate::tensor_parallel::BlockFormat::of(quant)?))
     };
 
     let mut out = Vec::with_capacity(descriptor.layers.len());
@@ -4887,24 +4902,35 @@ pub fn load_ffn_shards_gguf(
                 .get(&role)
                 .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
         };
-        let gate = bytes(
+        let (gate, gate_fmt) = bytes(
             &format!("layer {idx} ffn_gate"),
             fetch_matrix(&src, name(WeightRole::FfnGate)?)?,
             params.intermediate_size,
             params.hidden_size,
         )?;
-        let up = bytes(
+        let (up, up_fmt) = bytes(
             &format!("layer {idx} ffn_up"),
             fetch_matrix(&src, name(WeightRole::FfnUp)?)?,
             params.intermediate_size,
             params.hidden_size,
         )?;
-        let down = bytes(
+        let (down, down_fmt) = bytes(
             &format!("layer {idx} ffn_down"),
             fetch_matrix(&src, name(WeightRole::FfnDown)?)?,
             params.hidden_size,
             params.intermediate_size,
         )?;
+        // `gate` i `up` dzielą się po WIERSZACH, więc muszą mieć wspólny format
+        // (liczy je jedno wywołanie), ale `down` może mieć inny — dzieli się po
+        // kolumnach i tylko on stawia warunek na granicę bloku. `Q4_K_M` trzyma
+        // właśnie `down` w Q6_K, więc wymaganie jednego formatu dla całej trójki
+        // odrzucałoby najpopularniejszą kwantyzację w obiegu.
+        if gate_fmt != up_fmt {
+            return Err(ForgeError::Unsupported(format!(
+                "layer {idx}: gate i up muszą mieć ten sam format, jest {:?} i {:?}",
+                gate_fmt.quant, up_fmt.quant
+            )));
+        }
         out.push(crate::tensor_parallel::upload_ffn_split(
             cluster,
             caps,
@@ -4914,6 +4940,8 @@ pub fn load_ffn_shards_gguf(
             params.hidden_size,
             params.intermediate_size,
             crate::multi_gpu::WorkKind::MemoryBound,
+            gate_fmt,
+            down_fmt,
             forced,
         )?);
     }
