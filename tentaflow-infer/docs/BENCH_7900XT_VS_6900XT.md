@@ -321,29 +321,39 @@ Zgodność wyjścia potwierdza poprawność, więc bramka pyta teraz o falę 32,
 o producenta. Zysku prędkości na RDNA3 NIE MA (0,4%, w granicach szumu) — w
 odróżnieniu od NVIDII, gdzie dokumentacja podaje 2,60-2,63x na samym skanie.
 
-## Hybrydowy prefill: szybka ścieżka wymaga NVFP4, nie NVIDII
+## Hybrydowy prefill na AMD: to format checkpointu, nie producent
 
-`forge bench qwen36-27b-Q4_K_M --prompt-tokens 2048 --tokens 32` na RX 7900 XT:
+Qwen3.6-27B na RX 7900 XT, `forge bench --prompt-tokens 2048 --tokens 32`,
+mediana z 5 powtórzeń:
 
-| faza | wynik |
-|---|---|
-| prefill 2048 | 72 514 ms → 28,2 tok/s |
-| decode | 27,3 tok/s |
+| checkpoint | prefill 2048 | decode |
+|---|---|---|
+| Q4_K_M | 72 514 ms → **28,2 tok/s** | 27,3 tok/s |
+| NVFP4 (ThinkingCap …-NVFP4-MTP) | 2 657 ms → **770,5 tok/s** | 32,3 tok/s |
 
-Prefill idzie w tempie dekodowania, czyli praktycznie token po tokenie.
+**27x różnicy na prefillu robi sam format wag**, nie karta. Q4_K schodzi na
+prefill token po tokenie (prefill w tempie dekodowania), NVFP4 wchodzi na
+ścieżkę layer-major.
 
-**Zestawianie tego z ~2498 tok/s z `CLAUDE.md` byłoby jednak nieuczciwe**: tamta
-liczba dotyczy checkpointu ThinkingCap Qwen3.6-27B **NVFP4**, a tutaj mierzony
-jest Q4_K_M. To nie jest różnica między producentami:
+Dlaczego — `hybrid_prefill_extended_structural_capable` wymaga, żeby KAŻDA waga
+FFN była `DevWeight::NvFp4Gguf`. Dla Q4_K_M jest to fałsz na dowolnej karcie,
+więc na NVIDII ten sam plik też zszedłby na prefill po tokenie. Backend AMD nie
+jest tu blokowany: `hybrid_prefill_t128_backend_capable` przyjmuje
+`Nvidia | Amd` z falą 32, a wszystkie artefakty `HYBRID_PREFILL_T128_SHARED`,
+`HYBRID_PREFILL_T128_MATRIX_AMD` i triplet `gemm_q8_0_wmma_triplet_bm64` są
+zbudowane dla gfx1100.
 
-- `hybrid_prefill_t128_backend_capable` akceptuje `Nvidia | Amd` z falą 32 —
-  AMD NIE jest tu blokowane.
-- Wszystkie artefakty `HYBRID_PREFILL_T128_SHARED`, `HYBRID_PREFILL_T128_MATRIX_AMD`
-  i triplet `gemm_q8_0_wmma_triplet_bm64` są zbudowane dla gfx1100.
-- Blokuje `hybrid_prefill_extended_structural_capable`, które wymaga, żeby KAŻDA
-  waga FFN była `DevWeight::NvFp4Gguf`. Dla Q4_K_M jest to fałsz na dowolnej
-  karcie, więc na NVIDII ten sam plik też zszedłby na prefill po tokenie.
+Odniesienie z `CLAUDE.md` dla tego samego checkpointu NVFP4 na RTX 4090 to
+2498,5 tok/s prefillu — RX 7900 XT osiąga **31% tego wyniku**. To jest realny
+stosunek tych kart, a nie awaria ścieżki.
 
-Wniosek: szybki hybrydowy prefill istnieje wyłącznie dla NVFP4. Żeby to zamknąć,
-trzeba albo dorobić warianty Q4_K kerneli layer-major, albo zmierzyć checkpoint
-NVFP4 Qwen3.6 na AMD — lokalnie takiego nie ma (jest tylko DeepSeek-V4-Flash-NVFP4).
+Model odpowiada poprawnie:
+
+```
+$ forge run ThinkingCap-Qwen3.6-27B-NVFP4-MTP.gguf "Stolica Polski to" --no-chat
+ Warszawa. To miasto, które jest największym ośrodkiem politycznym
+```
+
+Wniosek praktyczny: dla modeli hybrydowych na AMD używać checkpointów NVFP4.
+Dorobienie wariantów Q4_K kerneli layer-major zamknęłoby lukę dla pozostałych
+kwantyzacji, ale jest osobną, dużą pracą.
