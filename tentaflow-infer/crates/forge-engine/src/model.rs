@@ -13579,6 +13579,16 @@ impl Model {
             && std::env::var("FORGE_HYBRID_LAYER_MAJOR_ATTN").is_err()
             && !self.kernels.has_artifact("attn_prefill_fa_mojo_f16_hd256")
         {
+            // Bez flash-attention schodzimy na wariant PREFILL, nie na `Exact`.
+            // `Exact` liczy kernelem dekodowania, wiec caly chunk przechodzi
+            // przez sciezke pisana pod jeden token: profil RX 7900 XT pokazal
+            // 683 ms na 32 wywolania (13% calego prefillu), po 21 ms kazde.
+            if self
+                .kernels
+                .has_artifact("attn_prefill_device_pos_f16_hd256")
+            {
+                return Ok(HybridLayerMajorAttention::Prefill);
+            }
             return Ok(HybridLayerMajorAttention::Exact);
         }
         Ok(requested)
