@@ -275,3 +275,50 @@ mieści się z zapasem.
   hosta i wykonują się po kolei, więc druga karta czeka. Zysk daje dopiero
   przepychanie mikrowsadów przez `cluster.exchange` i `wait_for`, które są gotowe
   i zmierzone.
+
+## FFN tensor parallel w pętli warstw silnika
+
+`Model::enable_tp_ffn` rozkłada FFN na dodatkowe karty i wpina go w dekodowanie:
+`gate`/`up` po wierszach, `down` po kolumnach, JEDNA wymiana na warstwę
+(rozgłoszenie wejścia + redukcja sum cząstkowych). Klaster powstaje przez
+`Cluster::attach` wokół karty, na której model już stoi — bez otwierania jej po
+raz drugi. Krok dekodowania przestaje wtedy być jednym grafem i idzie jawnym
+łańcuchem `run_step_separate`.
+
+Zmierzone na Bieliku 7B Q8_0 (RX 6900 XT jako karta modelu + RX 7900 XT, P2P
+niedostępny), 64 kroki dekodowania:
+
+| przebieg | jedna karta | podział | zysk |
+|---|---|---|---|
+| podział 5024/6240 | 58,1 tok/s | 78,7 tok/s | 1,35x |
+| podział 4672/6592 | 58,1 tok/s | 80,0 tok/s | 1,38x |
+
+**Dobór kerneli musi być ten sam co w `Model::gemv`.** Pierwsza wersja liczyła
+`gate`/`up` dokładnie w f16, podczas gdy silnik dla Q8_0 w zasięgu dp4a
+kwantyzuje aktywację do int8. Podział był więc DOKŁADNIEJSZY od odniesienia i
+dawał na logitach błąd względny 2,8e-1 — wyglądający jak usterka, a będący inną
+matematyką. Po wyrównaniu doboru (dołożony `gemv_q8_0_dp4a_out_f32`) CAŁY podział
+na jednej karcie wychodzi **bitowo identycznie** z silnikiem, na obu kartach
+osobno.
+
+**Czego podział nie gwarantuje:** zgodności bitowej przy pracy dwóch kart.
+Projekcja `down` sumuje ~11 tys. składników, które w dużej mierze się kasują, więc
+inna kolejność dodawania f32 daje na logitach błąd względny o kilka rzędów większy
+niż samo epsilon. Zmierzone: podział 32/11232 → 8e-6, po połowie → 7e-3, na
+64 krokach względne L2 ok. 1,3e-2 i inny argmax w 0–2 krokach na 64. Błąd rośnie
+płynnie z wyrównaniem podziału, a jednokartowy jest zerowy — to odróżnia
+nieprzemienność f32 od usterki.
+
+**Kalibracja nie jest tu dobrą miarą podziału.** Mierzy duży przebieg
+strumieniowy, a warstwa to wąski GEMV; wskazania wahają się między przebiegami
+(2624–5024 wierszy dla karty 0) i to właśnie ta wariancja, nie sam podział,
+odpowiada za rozrzut wyniku 1,13–1,38x. Dlatego `upload_ffn_split` przyjmuje
+podział NARZUCONY (`TP_SPLIT` w `tp_decode_probe`) — dobór progu po pomiarze
+zamiast po kalibracji jest osobnym, jeszcze nieprzeprowadzonym krokiem.
+
+**Zakres:** modele gęste z Q8_0, dekodowanie. Prefill liczy FFN macierzowo na
+jednej karcie i zachowuje swoją kopię wag, więc podział kosztuje dodatkową pamięć
+równą udziałowi karty modelu. MoE, modele hybrydowe, obrotowy cache KV i tiering
+są odrzucane wprost przez `tp_ffn_capable`. Kernel `gemv_q8_0_dp4a_out_f32` i
+`cast_f32_f16` zbudowano dla gfx1030 i gfx1100; zestawy NVIDIA wymagają
+przebudowy katalogu na tamtym sprzęcie.
