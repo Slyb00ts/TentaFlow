@@ -836,7 +836,42 @@ fn build_moe_mtp(
     }))
 }
 
+/// Sprawdza, czy zakres etapu pipeline'u mieści się w modelu. Wydzielone z
+/// `restrict_layers`, żeby dało się to przetestować bez budowania całego
+/// deskryptora — sama arytmetyka granic jest tu jedyną rzeczą, która może się
+/// pomylić.
+pub fn check_pipeline_range(total: usize, first: usize, count: usize) -> Result<()> {
+    if count == 0 {
+        return Err(fmt_err("etap pipeline'u bez warstw"));
+    }
+    if first + count > total {
+        return Err(fmt_err(format!(
+            "zakres warstw {first}..{} wychodzi poza model o {total} warstwach",
+            first + count
+        )));
+    }
+    Ok(())
+}
+
 impl ModelDescriptor {
+    /// Ogranicza model do zakresu warstw `[first, first + count)`.
+    ///
+    /// Podstawa pipeline parallel: każdy etap ładuje WYŁĄCZNIE swoje warstwy,
+    /// więc model większy od jednej karty mieści się na kilku. Etap, który nie
+    /// zawiera warstwy zerowej, nie potrzebuje embeddingu, a etap bez ostatniej
+    /// — normy końcowej i głowy; o tym decyduje już wołający, bo tylko on wie,
+    /// czy jest pierwszy albo ostatni.
+    pub fn restrict_layers(&mut self, first: usize, count: usize) -> Result<()> {
+        check_pipeline_range(self.layers.len(), first, count)?;
+        self.layers = self.layers.drain(first..first + count).collect();
+        if !self.layer_kinds.is_empty() {
+            self.layer_kinds = self.layer_kinds.drain(first..first + count).collect();
+        }
+        self.params.block_count = count;
+        Ok(())
+    }
+
+
     /// Czy model używa RoPE PRZEPLATANEGO (pary `(2i, 2i+1)`) zamiast NeoX
     /// (pary `(i, i + d/2)`).
     ///
@@ -1995,5 +2030,32 @@ mod tests {
             ModelDescriptor::from_hf(&cfg),
             Err(ForgeError::Unsupported(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::check_pipeline_range;
+
+    #[test]
+    fn zakres_ze_srodka_jest_poprawny() {
+        assert!(check_pipeline_range(40, 20, 20).is_ok());
+        assert!(check_pipeline_range(65, 0, 33).is_ok());
+    }
+
+    #[test]
+    fn zakres_poza_model_jest_bledem() {
+        assert!(check_pipeline_range(40, 30, 20).is_err());
+        assert!(check_pipeline_range(40, 40, 1).is_err());
+    }
+
+    #[test]
+    fn etap_bez_warstw_jest_bledem() {
+        assert!(check_pipeline_range(40, 0, 0).is_err());
+    }
+
+    #[test]
+    fn caly_model_jako_jeden_etap_przechodzi() {
+        assert!(check_pipeline_range(40, 0, 40).is_ok());
     }
 }
