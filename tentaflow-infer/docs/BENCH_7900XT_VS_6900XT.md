@@ -189,3 +189,56 @@ Zysk na Bieliku Q4_K, 7900 XT, prefill 512 tokenów:
 
 Zastrzeżenie: ten zysk dotyczy szybkości ścieżki liczenia. Dla samego Bielika
 wynik końcowy pozostaje błędny z powodu opisanego wyżej, niezależnego błędu.
+
+## Audyt warunków „tylko NVIDIA" — 2026-07-29
+
+Zestaw testów FORGE nigdy wcześniej nie wykonał się na Radeonach: `forge-engine`,
+`forge-server`, `forge-whisper` i `forge-onnx` nie miały flagi wyboru backendu, a
+32 pliki testów i przykładów tworzyły `CudaDevice` wprost. Skutek uboczny — dziewięć
+plików testowych `forge-server` nie kompilowało się od czasu dodania pola
+`layer_range`, bo nikt ich nie budował.
+
+Po przestawieniu wszystkiego na `gpu::open` zestaw przechodzi w całości:
+**724 testy, 0 porażek, 20 pominiętych**.
+
+Odsłoniło to jeden powtarzający się błąd: kod pytał `vendor == Nvidia` tam, gdzie
+chodziło o konkretną zdolność sprzętową. RDNA ma falę 32 i instrukcję `dot4` na
+int8, więc warunek producenta wyłączał ścieżki, dla których kernele były
+ZBUDOWANE i poprawne.
+
+| miejsce | było | jest |
+|---|---|---|
+| `dense_prefill_backend_capable` | tylko NVIDIA | fala 32 + blok ≥256 |
+| uwaga segmentowana HD128 | wyłącznie kernel FA (`mma`) | FA gdy jest, inaczej przenośny kafel |
+| głowa logitów B16 Q8_0 | wyłącznie kernel NVIDII | dodatkowo kafle WMMA / `dot4` |
+| `attn_verify_segmented_*_warp32` | tylko NVIDIA | każda karta z falą 32 |
+| `gemm_qk_dp4a_batch_at` | tylko NVIDIA | fala 32 (`v_dot4_i32_i8`) |
+| `dense_prefill_auto_backend_capable` (serwer) | tylko NVIDIA | fala 32 + blok ≥256 |
+
+Batchowy dp4a Q4_K/Q6_K policzył na RX 7900 XT T=2/4/8/16 zgodnie z referencją
+dekwantyzacji CPU; wcześniej test cicho się pomijał.
+
+Osobno naprawiony rozjazd semantyki w HAL, zamaskowany komentarzem twierdzącym,
+że jest tak samo jak w CUDA:
+
+| | CUDA | HIP (było) |
+|---|---|---|
+| tryb przechwytywania grafu | THREAD_LOCAL | GLOBAL |
+| strumienie | NonBlocking | blokujące |
+
+Tryb globalny unieważnia przechwytywanie przy każdej ryzykownej operacji w CAŁYM
+procesie, także w innym wątku, który o grafie nic nie wie — stąd błędy 906/901
+tam, gdzie ta sama praca na NVIDII przechodziła.
+
+### Warunki producenta, które zostają
+
+- **Wybór zestawu wbudowanego** (`select_embedded_set`) — zgodność w przód PTX
+  jest własnością CUDA; `hsaco` wymaga dokładnego ISA.
+- **`fused_decode_available`** — decyzja z POMIARU, nie z ostrożności: kernele
+  `gemv_norm_*` przeliczają normę w każdej grupie roboczej i na gfx1030 dają
+  181 GB/s wobec 466 GB/s zwykłego GEMV. Rozdzielenie normy i GEMV dało tam
+  67,2 → 78,6 tok/s.
+- **NVFP4 CT** (repack/decode/prefill/TileN128K64) — ścieżka formatu
+  compressed-tensors pisana pod instrukcje NVIDII.
+- **Rollouty eksperymentalne** (hybrydowy prefill B2, MTP+n-gram) — bramki
+  wdrożeniowe, nie zdolności sprzętu.
