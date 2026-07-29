@@ -14043,6 +14043,19 @@ impl Kernels {
                 stream,
             );
         }
+        if self.gemm_kblock_wmma(
+            "gemm_q4_0_wmma_f16",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q4_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -14262,6 +14275,19 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q4_1 requires cols % 32 == 0, got {cols}"
             )));
+        }
+        if self.gemm_kblock_wmma(
+            "gemm_q4_1_wmma_f16",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q4_1_f16{suffix}"))?;
@@ -14483,6 +14509,19 @@ impl Kernels {
                 "gemm_q5_0 requires cols % 32 == 0, got {cols}"
             )));
         }
+        if self.gemm_kblock_wmma(
+            "gemm_q5_0_wmma_f16",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -14702,6 +14741,19 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q5_1 requires cols % 32 == 0, got {cols}"
             )));
+        }
+        if self.gemm_kblock_wmma(
+            "gemm_q5_1_wmma_f16",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_1_f16{suffix}"))?;
