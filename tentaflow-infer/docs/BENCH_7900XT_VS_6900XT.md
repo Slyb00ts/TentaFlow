@@ -305,3 +305,43 @@ $ forge run qwen36-27b-Q4_K_M.gguf "Stolica Polski to" --max-tokens 16 --temp 0 
 Prompt 170 tokenów przechodzi 5/5, 28 tok/s. Modele gęste bez zmian
 (Bielik 7B 121,8 tok/s, Bielik 11B 83,9, Gemma 12B QAT 105,2, Nemo 12B 55,9).
 Cały zestaw testów: 724 przechodzi, 0 porażek.
+
+## Persistent scan DeltaNet — zweryfikowany na AMD, bez zysku
+
+Po naprawie wyścigów dało się wreszcie sprawdzić bramkę
+`supports_deltanet_gated_scan_persistent_d128_f16`, która wymagała NVIDII.
+Qwen3.6-27B, prompt 582 tokeny, RX 7900 XT:
+
+| tryb | czas | wyjście |
+|---|---|---|
+| `chunked` | 21,07 s | — |
+| `persistent` | 20,98 s | **identyczne co do bajtu** |
+
+Zgodność wyjścia potwierdza poprawność, więc bramka pyta teraz o falę 32, a nie
+o producenta. Zysku prędkości na RDNA3 NIE MA (0,4%, w granicach szumu) — w
+odróżnieniu od NVIDII, gdzie dokumentacja podaje 2,60-2,63x na samym skanie.
+
+## Otwarte: hybrydowy prefill na AMD jest ~90x wolniejszy niż na NVIDII
+
+`forge bench qwen36-27b-Q4_K_M --prompt-tokens 2048 --tokens 32` na RX 7900 XT:
+
+| faza | wynik |
+|---|---|
+| prefill 2048 | 72 514 ms → **28,2 tok/s** |
+| decode | 27,3 tok/s |
+
+Prefill idzie w tempie dekodowania, czyli praktycznie token po tokenie.
+Dokumentacja podaje dla tego modelu na NVIDII ~2498 tok/s prefillu.
+
+Co już wiadomo:
+
+- Wszystkie artefakty wymagane przez `HYBRID_PREFILL_T128_SHARED` i
+  `HYBRID_PREFILL_T128_MATRIX_AMD` ORAZ triplet `gemm_q8_0_wmma_triplet_bm64`
+  są zbudowane dla gfx1100 — to NIE jest brak kerneli.
+- Wewnętrzny chunk hybrydowego prefill wychodzi 32, czyli najmniejszy.
+- `hybrid_prefill_b2_backend_capable` nadal wymaga NVIDII (rollout B2 T32),
+  ale to osobna, eksperymentalna bramka.
+
+Kolejny krok: ustalić, czy blokuje `hybrid_prefill_extended_structural_capable`
+(budżet scratcha), czy sama ścieżka chunkowa nie daje na RDNA przyspieszenia
+względem pętli po tokenie.

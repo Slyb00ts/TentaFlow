@@ -1975,8 +1975,7 @@ impl Kernels {
 
     pub fn supports_deltanet_gated_scan_persistent_d128_f16(&self) -> bool {
         let caps = self.device.caps();
-        caps.vendor == forge_types::Vendor::Nvidia
-            && caps.warp_size == 32
+        caps.warp_size == 32
             && caps.max_threads_per_block >= 64
             && self
                 .artifacts
