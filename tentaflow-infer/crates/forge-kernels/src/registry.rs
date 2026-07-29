@@ -2760,9 +2760,14 @@ mod tests {
             select_embedded_set("gfx1100", Vendor::Amd).map(|set| set.arch),
             Some("gfx1100")
         );
-        // RDNA4 dostanie własny zestaw dopiero po zbudowaniu katalogu na tej
-        // karcie; do tego czasu ma być czytelny błąd, a nie cudzy code object.
-        assert!(select_embedded_set("gfx1201", Vendor::Amd).is_none());
+        assert_eq!(
+            select_embedded_set("gfx1201", Vendor::Amd).map(|set| set.arch),
+            Some("gfx1201")
+        );
+        // Karta bez zbudowanego katalogu ma dostać czytelny błąd, a NIE cudzy
+        // code object — gfx1201 zdał ten egzamin, zanim doczekał się własnego
+        // zestawu, i tak samo ma być dla każdej następnej.
+        assert!(select_embedded_set("gfx1151", Vendor::Amd).is_none());
         assert!(select_embedded_set("gfx90a", Vendor::Amd).is_none());
     }
 
