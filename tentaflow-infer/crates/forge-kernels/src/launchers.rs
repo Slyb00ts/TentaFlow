@@ -9538,7 +9538,15 @@ impl Kernels {
         // 98, więc kafel dot byłby tam regresją względem STARSZEJ karty.
         // Obecność artefaktów jest jednocześnie testem architektury: zasięg
         // `amd:gfx11+` wpuszcza je wyłącznie do katalogów RDNA3 i nowszych.
-        if family == "q8_0" && self.artifacts.has("gemm_q8_0_wmma_64x128") {
+        //
+        // NA RDNA4 TEN POMIAR SIĘ ODWRACA. Zmierzone na Radeon AI PRO R9700,
+        // Bielik 7B Q8_0, prompt 2048: kafel dot daje 2047 tok/s, a WMMA 1838 —
+        // przewaga jednostki macierzowej z RDNA3 tam nie występuje, bo RDNA4
+        // przywróciło pełną przepustowość instrukcji dot. Dla Q4_K jest
+        // odwrotnie (WMMA 2279 wobec 1575), więc wybór musi być per rodzina
+        // ORAZ per architektura, a nie „jest artefakt, to bierzemy".
+        let rdna4 = self.device.caps().arch.starts_with("gfx12");
+        if family == "q8_0" && !rdna4 && self.artifacts.has("gemm_q8_0_wmma_64x128") {
             // Kafel 16x64 (BM=16, BN=64, 128 wątków) wobec 64x128 (BM=64,
             // BN=128, 128 wątków). Próg z pomiaru A/B na 7900 XT: duży kafel ma
             // lepsze reużycie danych, ale przy krótkim prompcie albo wąskiej
