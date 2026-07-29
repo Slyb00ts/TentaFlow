@@ -370,6 +370,7 @@ pub fn gemv_q8_0_column_split(
     y_full: &DevBuffer,
     staging: &DevBuffer,
     gather_on: usize,
+    gather_stream: &forge_hal::Stream,
 ) -> Result<()> {
     if x_parts.len() != cluster.len() || y_parts.len() != cluster.len() {
         return Err(ForgeError::Scheduler(
@@ -382,6 +383,11 @@ pub fn gemv_q8_0_column_split(
             continue;
         }
         let entry = cluster.device(index)?;
+        let stream = if index == gather_on {
+            gather_stream
+        } else {
+            &entry.stream
+        };
         let cols = shards.cols_on(index);
         // Ten sam wybór co wyżej — z wyjściem w f32, bo to są sumy CZĄSTKOWE i
         // dodawanie ich w f16 gubiłoby bity przy każdej karcie.
@@ -392,7 +398,7 @@ pub fn gemv_q8_0_column_split(
                 &x_parts[index],
                 rows,
                 cols,
-                &entry.stream,
+                stream,
             )?;
         } else {
             entry.kernels.gemv_q8_0_out_f32(
@@ -401,7 +407,7 @@ pub fn gemv_q8_0_column_split(
                 &x_parts[index],
                 rows,
                 cols,
-                &entry.stream,
+                stream,
             )?;
         }
     }
@@ -413,14 +419,9 @@ pub fn gemv_q8_0_column_split(
     // jej bufor cząstkowy nie został policzony i nie wolno nim zasiać sumy.
     let seeded = shards.cols_on(gather_on) > 0;
     if seeded {
-        target.device.copy(
-            &y_parts[gather_on],
-            0,
-            y_full,
-            0,
-            rows * 4,
-            &target.stream,
-        )?;
+        target
+            .device
+            .copy(&y_parts[gather_on], 0, y_full, 0, rows * 4, gather_stream)?;
     }
     let mut first = !seeded;
     for index in 0..cluster.len() {
@@ -428,16 +429,16 @@ pub fn gemv_q8_0_column_split(
             continue;
         }
         cluster.exchange(index, &y_parts[index], 0, gather_on, staging, 0, rows * 4)?;
-        cluster.wait_for(gather_on, index)?;
+        cluster.order(index, &cluster.device(index)?.stream, gather_on, gather_stream)?;
         if first {
             target
                 .device
-                .copy(staging, 0, y_full, 0, rows * 4, &target.stream)?;
+                .copy(staging, 0, y_full, 0, rows * 4, gather_stream)?;
             first = false;
         } else {
             target
                 .kernels
-                .add_f32(y_full, y_full, staging, rows, &target.stream)?;
+                .add_f32(y_full, y_full, staging, rows, gather_stream)?;
         }
     }
     if first {
@@ -556,6 +557,7 @@ pub fn ffn_forward_split(
     hidden: usize,
     activation: forge_formats::FfnActivation,
     gather_on: usize,
+    gather_stream: &forge_hal::Stream,
 ) -> Result<()> {
     for index in 0..cluster.len() {
         let rows = shards.rows_on(index);
@@ -563,6 +565,11 @@ pub fn ffn_forward_split(
             continue;
         }
         let entry = cluster.device(index)?;
+        let stream = if index == gather_on {
+            gather_stream
+        } else {
+            &entry.stream
+        };
         // Dobór kernela musi być TEN SAM co w `Model::gemv`: dla Q8_0 w zasięgu
         // dp4a silnik kwantyzuje aktywację do int8. Liczenie tu dokładniej
         // brzmi niewinnie, ale znaczy, że podział zmienia wynik modelu — a ma
@@ -571,11 +578,11 @@ pub fn ffn_forward_split(
             if hidden <= forge_kernels::Kernels::DP4A_MAX_COLS {
                 entry
                     .kernels
-                    .gemv_q8_0_dp4a_f16(y, w, &ws.x[index], rows, hidden, &entry.stream)
+                    .gemv_q8_0_dp4a_f16(y, w, &ws.x[index], rows, hidden, stream)
             } else {
                 entry
                     .kernels
-                    .gemv_q8_0_f16(y, w, &ws.x[index], rows, hidden, &entry.stream)
+                    .gemv_q8_0_f16(y, w, &ws.x[index], rows, hidden, stream)
             }
         };
         gemv_f16(&ws.gate[index], &shards.gate[index])?;
@@ -586,7 +593,7 @@ pub fn ffn_forward_split(
             &ws.gate[index],
             &ws.up[index],
             rows,
-            &entry.stream,
+            stream,
         )?;
     }
     gemv_q8_0_column_split(
@@ -597,6 +604,7 @@ pub fn ffn_forward_split(
         y_full,
         staging,
         gather_on,
+        gather_stream,
     )
 }
 
@@ -613,9 +621,6 @@ pub struct TpFfn {
     /// Suma w f32 — dodawanie w f16 gubiłoby bity przy każdej karcie.
     acc: DevBuffer,
     staging: DevBuffer,
-    /// Granica strumienia silnika i strumieni klastra, bez powrotu do hosta.
-    enter: forge_hal::Event,
-    leave: forge_hal::Event,
     hidden: usize,
 }
 
@@ -657,16 +662,12 @@ impl TpFfn {
         let staging = primary
             .device
             .alloc(hidden * 4, MemKind::Device, Pool::Activations)?;
-        let enter = primary.device.create_event()?;
-        let leave = primary.device.create_event()?;
         Ok(Self {
             cluster,
             layers,
             ws,
             acc,
             staging,
-            enter,
-            leave,
             hidden,
         })
     }
@@ -707,24 +708,29 @@ impl TpFfn {
             .get(layer)
             .ok_or_else(|| ForgeError::Scheduler(format!("brak warstwy {layer} w podziale")))?;
         let primary = self.cluster.device(0)?;
-        primary.device.record_event(&self.enter, model_stream)?;
-        for index in 0..self.cluster.len() {
-            let entry = self.cluster.device(index)?;
-            entry.device.wait_event(&entry.stream, &self.enter)?;
-        }
-
-        // Rozgłoszenie wejścia: wymiar ukryty nie jest dzielony, więc każda
-        // karta potrzebuje go w całości.
+        // Karta modelu pracuje strumieniem SILNIKA, nie własnym strumieniem
+        // klastra. Dzięki temu wejście i wyjście bloku są uporządkowane z resztą
+        // kroku za darmo, zamiast przez parę zdarzeń na każdej granicy —
+        // zmierzone 15 us za parę, dwie pary na warstwę.
         primary
             .device
-            .copy(x, 0, &self.ws.x[0], 0, self.hidden * 2, &primary.stream)?;
+            .copy(x, 0, &self.ws.x[0], 0, self.hidden * 2, model_stream)?;
         for index in 1..self.cluster.len() {
             if shards.rows_on(index) == 0 {
                 continue;
             }
+            self.cluster.exchange_on(
+                0,
+                model_stream,
+                x,
+                0,
+                index,
+                &self.ws.x[index],
+                0,
+                self.hidden * 2,
+            )?;
             self.cluster
-                .exchange(0, x, 0, index, &self.ws.x[index], 0, self.hidden * 2)?;
-            self.cluster.wait_for(index, 0)?;
+                .order(0, model_stream, index, &self.cluster.device(index)?.stream)?;
         }
 
         ffn_forward_split(
@@ -736,13 +742,10 @@ impl TpFfn {
             self.hidden,
             activation,
             0,
+            model_stream,
         )?;
         primary
             .kernels
-            .cast_f32_f16(y, &self.acc, self.hidden, &primary.stream)?;
-        primary
-            .device
-            .record_event(&self.leave, &primary.stream)?;
-        primary.device.wait_event(model_stream, &self.leave)
+            .cast_f32_f16(y, &self.acc, self.hidden, model_stream)
     }
 }

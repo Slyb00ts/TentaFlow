@@ -89,8 +89,10 @@ fn main() {
         .device
         .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
         .expect("wynik odniesienia");
+    // Odniesienie musi wybierac kernel DOKLADNIE tak jak `Model::gemv`: dla
+    // Q8_0 w zasiegu dp4a silnik kwantyzuje aktywacje do int8.
     dev0.kernels
-        .gemv_q8_0_out_f32(&y_ref, &w_all, &x_all, ROWS, COLS, &dev0.stream)
+        .gemv_q8_0_dp4a_out_f32(&y_ref, &w_all, &x_all, ROWS, COLS, &dev0.stream)
         .expect("gemv odniesienia");
     dev0.stream.synchronize().expect("sync");
     let mut reference = vec![0u8; ROWS * 4];
@@ -143,7 +145,16 @@ fn main() {
         .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
         .expect("bufor redukcji");
 
-    gemv_q8_0_column_split(&cluster, &shards, &x_parts, &y_parts, &y_full, &staging, 0)
+    gemv_q8_0_column_split(
+        &cluster,
+        &shards,
+        &x_parts,
+        &y_parts,
+        &y_full,
+        &staging,
+        0,
+        &dev0.stream,
+    )
         .expect("gemv kolumnowy");
     cluster.synchronize().expect("sync klastra");
     let mut split = vec![0u8; ROWS * 4];
@@ -184,14 +195,23 @@ fn main() {
     let mut whole_time = f64::MAX;
     for _ in 0..20 {
         let t0 = Instant::now();
-        gemv_q8_0_column_split(&cluster, &shards, &x_parts, &y_parts, &y_full, &staging, 0)
+        gemv_q8_0_column_split(
+        &cluster,
+        &shards,
+        &x_parts,
+        &y_parts,
+        &y_full,
+        &staging,
+        0,
+        &dev0.stream,
+    )
             .expect("gemv kolumnowy");
         cluster.synchronize().expect("sync");
         split_time = split_time.min(t0.elapsed().as_secs_f64());
 
         let t1 = Instant::now();
         dev0.kernels
-            .gemv_q8_0_out_f32(&y_ref, &w_all, &x_all, ROWS, COLS, &dev0.stream)
+            .gemv_q8_0_dp4a_out_f32(&y_ref, &w_all, &x_all, ROWS, COLS, &dev0.stream)
             .expect("gemv odniesienia");
         dev0.stream.synchronize().expect("sync");
         whole_time = whole_time.min(t1.elapsed().as_secs_f64());

@@ -208,10 +208,37 @@ impl Cluster {
             ));
         }
         let source = self.device(from)?;
+        self.exchange_on(from, &source.stream, src, src_offset, to, dst, dst_offset, bytes)
+    }
+
+    /// Jak `exchange`, ale kopia idzie WSKAZANYM strumieniem karty źródłowej.
+    ///
+    /// Istnieje dlatego, że karta, na której stoi model, pracuje strumieniem
+    /// silnika, a nie własnym strumieniem klastra. Zlecenie kopii na tym samym
+    /// strumieniu, co reszta kroku, oszczędza parę zdarzeń w obie strony —
+    /// zmierzone 15 us za parę, przy 110 us liczenia całego bloku FFN.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exchange_on(
+        &self,
+        from: usize,
+        from_stream: &Stream,
+        src: &forge_hal::DevBuffer,
+        src_offset: usize,
+        to: usize,
+        dst: &forge_hal::DevBuffer,
+        dst_offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        if from == to {
+            return Err(ForgeError::Scheduler(
+                "wymiana wymaga dwóch różnych kart".into(),
+            ));
+        }
+        let source = self.device(from)?;
         self.device(to)?;
         source
             .device
-            .copy(src, src_offset, dst, dst_offset, bytes, &source.stream)
+            .copy(src, src_offset, dst, dst_offset, bytes, from_stream)
     }
 
     /// Sprawia, że karta `waiter` czeka na zakończenie bieżącej pracy karty
@@ -223,8 +250,26 @@ impl Cluster {
         }
         let source = self.device(signaller)?;
         let target = self.device(waiter)?;
-        source.device.record_event(&source.done, &source.stream)?;
-        target.device.wait_event(&target.stream, &source.done)
+        self.order(signaller, &source.stream, waiter, &target.stream)
+    }
+
+    /// Jak `wait_for`, ale na WSKAZANYCH strumieniach obu kart.
+    pub fn order(
+        &self,
+        signaller: usize,
+        signaller_stream: &Stream,
+        waiter: usize,
+        waiter_stream: &Stream,
+    ) -> Result<()> {
+        if waiter == signaller {
+            return Ok(());
+        }
+        let source = self.device(signaller)?;
+        let target = self.device(waiter)?;
+        source
+            .device
+            .record_event(&source.done, signaller_stream)?;
+        target.device.wait_event(waiter_stream, &source.done)
     }
 
     /// Mierzy możliwości każdej karty tym samym testem. Format wag musi być

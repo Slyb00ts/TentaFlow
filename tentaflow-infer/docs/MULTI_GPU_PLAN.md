@@ -350,3 +350,35 @@ Sam blok FFN na dwóch kartach, po wyrównaniu doboru kerneli: 328,3 us na jedne
 karcie wobec 124,0 us na dwóch, czyli **2,65x**. Że w całym dekodowaniu wychodzi
 1,35x, a nie 1,6x wynikające z prawa Amdahla dla ok. 60% udziału FFN, mierzy
 narzut rozgłoszenia i redukcji — i to jest następne miejsce do poprawy.
+
+### Narzut wymiany, zmierzony i częściowo usunięty
+
+Blok FFN na dwóch kartach liczy się 2,2–3,0x szybciej niż na jednej, a całe
+dekodowanie przyspiesza 1,44x. Różnicę mierzy narzut podziału, rozbity na
+składniki (`tp_ffn_block_probe`, RX 6900 XT + RX 7900 XT, P2P otwarte):
+
+| co | koszt |
+|---|---|
+| para zdarzeń między kartami | ok. 15 us |
+| kopia 8 KiB (wejście warstwy) | ok. 15 us |
+| liczenie całego bloku na dwóch kartach | ok. 110–147 us |
+
+Pierwotnie warstwa płaciła CZTERY pary zdarzeń: dwie na własną pracę (rozesłanie
+wejścia i redukcja) i dwie wyłącznie na zmostkowanie strumienia silnika ze
+strumieniem klastra karty modelu. Te drugie zniknęły — karta modelu pracuje w
+podziale strumieniem SILNIKA (`Cluster::exchange_on` i `Cluster::order`
+przyjmują strumień jawnie), więc wejście i wyjście bloku są uporządkowane z resztą
+kroku za darmo. Zmierzone: **80,0 → 83,5 tok/s, 1,38x → 1,44x**, przy identycznych
+logitach (ta sama max różnica 0,691915) — zmiana jest czysto porządkowa.
+
+`TieredWeightDevice` nie przekazywał `ordinal` ani `enable_peer_access`, a oba mają
+domyślną implementację w traicie, więc BRAK przekazania nie był błędem kompilacji,
+tylko cichym zmyśleniem: opakowana karta modelu zgłaszała numer 0 i „ten backend
+nie obsługuje P2P". Klaster brał to za prawdę o sprzęcie. Po poprawce P2P jest
+otwarte w obie strony; na tej parze kart samo otwarcie P2P nie zmieniło czasu
+dekodowania — koszt wymiany siedzi w synchronizacji, nie w przepustowości — ale
+`ordinal` zwracany z opakowania to usterka niezależna od wydajności.
+
+Zostały dwie pary zdarzeń na warstwę (ok. 30 us) i kopia wejścia (15 us) przy
+110–147 us liczenia. Domyślna kalibracja daje 1,36–1,37x, podział dobrany
+pomiarem 1,44x.

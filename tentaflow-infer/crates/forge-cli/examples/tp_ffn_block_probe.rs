@@ -176,6 +176,7 @@ fn main() {
             HIDDEN,
             act,
             0,
+            &dev0.stream,
         )
         .expect("blok FFN na kartach");
     };
@@ -242,5 +243,31 @@ fn main() {
         bcast_time * 1e6,
         whole_time / bcast_time,
         (bcast_time - split_time) * 1e6
+    );
+
+    // Ile kosztuje SAMA para zdarzen miedzy kartami, bez kopii i bez liczenia.
+    // Blok FFN robi ich kilka na warstwe, wiec to jest podloga narzutu podzialu.
+    let mut pair_time = f64::MAX;
+    for _ in 0..50 {
+        let t = Instant::now();
+        cluster.wait_for(1, 0).unwrap();
+        cluster.wait_for(0, 1).unwrap();
+        cluster.synchronize().unwrap();
+        pair_time = pair_time.min(t.elapsed().as_secs_f64());
+    }
+    let mut copy_time = f64::MAX;
+    for _ in 0..50 {
+        let t = Instant::now();
+        cluster
+            .exchange(0, &ws.x[0], 0, 1, &ws.x[1], 0, HIDDEN * 2)
+            .unwrap();
+        cluster.synchronize().unwrap();
+        copy_time = copy_time.min(t.elapsed().as_secs_f64());
+    }
+    println!(
+        "dwie pary zdarzen bez pracy: {:.1} us; sama kopia {} B: {:.1} us",
+        pair_time * 1e6,
+        HIDDEN * 2,
+        copy_time * 1e6
     );
 }
