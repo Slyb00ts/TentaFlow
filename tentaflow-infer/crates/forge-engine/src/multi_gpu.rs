@@ -286,33 +286,75 @@ pub fn measure_device(
     kernels: &forge_kernels::Kernels,
     quant: forge_types::QuantKind,
 ) -> Result<DeviceCapability> {
-    const PROBE_BYTES: usize = 128 << 20;
-    const WARMUP: usize = 2;
-    const ITERS: usize = 8;
-        let stream = device.create_stream()?;
-        let source = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
-        let target = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
-        for _ in 0..WARMUP {
-            device.copy(&source, 0, &target, 0, PROBE_BYTES, &stream)?;
-        }
-        stream.synchronize()?;
-        let started = std::time::Instant::now();
-        for _ in 0..ITERS {
-            device.copy(&source, 0, &target, 0, PROBE_BYTES, &stream)?;
-        }
-        stream.synchronize()?;
-        let seconds = started.elapsed().as_secs_f64();
-        let bytes_per_s = if seconds > 0.0 {
-            2.0 * (PROBE_BYTES * ITERS) as f64 / seconds
-        } else {
-            0.0
-        };
-        let free_bytes = device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
+    let free_bytes = device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
     Ok(DeviceCapability {
-        stream_bytes_per_s: bytes_per_s,
+        stream_bytes_per_s: measure_gemv(device, kernels, quant)?,
         matmul_ops_per_s: measure_matmul(device, kernels, quant)?,
         free_bytes,
     })
+}
+
+/// Przepustowość karty na TEJ operacji, którą podział rozdziela w dekodowaniu:
+/// GEMV nad wagami kwantowanymi, jeden token.
+///
+/// Wcześniej mierzyła to kopia D2D, czyli czyste pasmo pamięci. To był błąd
+/// widoczny w wyniku: dla Bielika 7B Q8_0 na RX 6900 XT + RX 7900 XT kopia
+/// wskazywała podziały od 2624 do 5024 wierszy pośrednich dla karty modelu,
+/// podczas gdy zmierzone optimum dekodowania leży przy 4608 (69,9 tok/s przy
+/// 2048 wobec 80,0 przy 4608). Wąski GEMV nie skaluje się jak strumień: liczy
+/// się w nim opóźnienie uruchomienia i zachowanie pamięci podręcznej, a nie
+/// szczytowe pasmo. Probe musi więc być tą samą operacją, nie jej przybliżeniem.
+fn measure_gemv(
+    device: &dyn forge_hal::Device,
+    kernels: &forge_kernels::Kernels,
+    quant: forge_types::QuantKind,
+) -> Result<f64> {
+    use forge_hal::Pool;
+    use forge_types::{MemKind, QuantKind};
+    const ROWS: usize = 4096;
+    const COLS: usize = 4096;
+    const WARMUP: usize = 3;
+    const ITERS: usize = 20;
+
+    let weight_bytes = match quant {
+        QuantKind::NVFP4Gguf => ROWS * (COLS / 64) * 36,
+        QuantKind::Q8_0 => ROWS * (COLS / 32) * 34,
+        QuantKind::Q4K => ROWS * (COLS / 256) * 144,
+        other => {
+            return Err(ForgeError::Unsupported(format!(
+                "kalibracja pasma nie ma ścieżki dla formatu {other:?}"
+            )));
+        }
+    };
+    let weights = device.alloc(weight_bytes, MemKind::Device, Pool::Weights)?;
+    let x = device.alloc(COLS * 2, MemKind::Device, Pool::Weights)?;
+    let y = device.alloc(ROWS * 2, MemKind::Device, Pool::Weights)?;
+    let stream = device.create_stream()?;
+    // Dobór kernela jak w `Model::gemv` — mierzymy to, czym karta REALNIE liczy.
+    let run = || match quant {
+        QuantKind::NVFP4Gguf => {
+            kernels.gemv_nvfp4_gguf_f16(&y, &weights, &x, ROWS, COLS, 1.0, &stream)
+        }
+        QuantKind::Q8_0 => kernels.gemv_q8_0_dp4a_f16(&y, &weights, &x, ROWS, COLS, &stream),
+        QuantKind::Q4K => kernels.gemv_q4_k_dp4a_f16(&y, &weights, &x, ROWS, COLS, &stream),
+        _ => unreachable!("format odrzucony wyżej"),
+    };
+    for _ in 0..WARMUP {
+        run()?;
+    }
+    stream.synchronize()?;
+    let started = std::time::Instant::now();
+    for _ in 0..ITERS {
+        run()?;
+    }
+    stream.synchronize()?;
+    let seconds = started.elapsed().as_secs_f64();
+    if !(seconds > 0.0) {
+        return Err(ForgeError::Scheduler(
+            "kalibracja pasma zmierzyła zerowy czas".into(),
+        ));
+    }
+    Ok((weight_bytes * ITERS) as f64 / seconds)
 }
 
 pub fn calibrate(

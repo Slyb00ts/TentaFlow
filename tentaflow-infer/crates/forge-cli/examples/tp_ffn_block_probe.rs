@@ -102,18 +102,21 @@ fn main() {
     let mid_ref = alloc_a(INTER * 2);
     let y_ref = alloc_a(HIDDEN * 4);
 
+    // Odniesienie musi wybierac kernele DOKLADNIE tak jak `Model::gemv`: dla
+    // Q8_0 w zasiegu dp4a silnik kwantyzuje aktywacje do int8. Liczenie tu
+    // dokladniej dawaloby falszywy rozjazd z podzialem, ktory sluzy silnikowi.
     let whole = |dev: &forge_engine::cluster::ClusterDevice| {
         dev.kernels
-            .gemv_q8_0_f16(&gate_ref, &g_all, &x_all, INTER, HIDDEN, &dev.stream)
+            .gemv_q8_0_dp4a_f16(&gate_ref, &g_all, &x_all, INTER, HIDDEN, &dev.stream)
             .unwrap();
         dev.kernels
-            .gemv_q8_0_f16(&up_ref, &u_all, &x_all, INTER, HIDDEN, &dev.stream)
+            .gemv_q8_0_dp4a_f16(&up_ref, &u_all, &x_all, INTER, HIDDEN, &dev.stream)
             .unwrap();
         dev.kernels
             .glu_mul_f16(act, &mid_ref, &gate_ref, &up_ref, INTER, &dev.stream)
             .unwrap();
         dev.kernels
-            .gemv_q8_0_out_f32(&y_ref, &d_all, &mid_ref, HIDDEN, INTER, &dev.stream)
+            .gemv_q8_0_dp4a_out_f32(&y_ref, &d_all, &mid_ref, HIDDEN, INTER, &dev.stream)
             .unwrap();
     };
     whole(dev0);

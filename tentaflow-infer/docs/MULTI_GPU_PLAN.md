@@ -322,3 +322,31 @@ równą udziałowi karty modelu. MoE, modele hybrydowe, obrotowy cache KV i tier
 są odrzucane wprost przez `tp_ffn_capable`. Kernel `gemv_q8_0_dp4a_out_f32` i
 `cast_f32_f16` zbudowano dla gfx1030 i gfx1100; zestawy NVIDIA wymagają
 przebudowy katalogu na tamtym sprzęcie.
+
+### Podział dobierany GEMV-em, nie kopią
+
+Zmierzony przemiat podziału (Bielik 7B Q8_0, 32 kroki, wiersze pośrednie karty
+modelu z 11264):
+
+| 2048 | 3072 | 4096 | **4608** | 5120 | 5632 | 6144 | 7168 |
+|---|---|---|---|---|---|---|---|
+| 69,9 | 73,5 | 77,7 | **80,0** | 78,2 | 75,0 | 72,1 | 66,8 tok/s |
+
+Krzywa ma jedno maksimum i jest stroma: skrajne podziały tracą 17%. Kalibracja
+mierzyła wcześniej pasmo kopią D2D i wskazywała 2624–5024 wierszy — czyli od
+optimum aż po punkt tracący 13%. `measure_device` mierzy teraz `stream_bytes_per_s`
+tym samym GEMV-em, którym karta REALNIE liczy dekodowanie (dp4a dla Q8_0/Q4_K,
+`gemv_nvfp4_gguf_f16` dla NVFP4), na kształcie 4096x4096.
+
+Efekt: wskazania zwęziły się z 2624–5024 do 5120–5536, a wynik z 1,13–1,38x do
+1,30–1,35x. Zostaje jednak SYSTEMATYCZNE odchylenie w prawo: pomiar daje karcie
+modelu ok. 48% wymiaru pośredniego, a optimum leży przy 41%. Powód jest znany i
+strukturalny — karta zbierająca płaci dodatkowo rozgłoszenie wejścia, dodawanie
+sum cząstkowych i rzut f32→f16, więc powinna dostać MNIEJ niż jej udział w samym
+GEMV. Wielkości tej poprawki nie zgaduję; do czasu jej zmierzenia ostatnie ~6%
+zbiera się podziałem narzuconym ręcznie.
+
+Sam blok FFN na dwóch kartach, po wyrównaniu doboru kerneli: 328,3 us na jednej
+karcie wobec 124,0 us na dwóch, czyli **2,65x**. Że w całym dekodowaniu wychodzi
+1,35x, a nie 1,6x wynikające z prawa Amdahla dla ok. 60% udziału FFN, mierzy
+narzut rozgłoszenia i redukcji — i to jest następne miejsce do poprawy.
