@@ -13557,6 +13557,19 @@ impl Kernels {
                 "gemm_q3_k requires cols % 256 == 0, got {cols}"
             )));
         }
+        if self.gemm_kblock_wmma(
+            "gemm_q3_k_wmma_f16",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q3_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -13776,6 +13789,19 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q2_k requires cols % 256 == 0, got {cols}"
             )));
+        }
+        if self.gemm_kblock_wmma(
+            "gemm_q2_k_wmma_f16",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q2_k_f16{suffix}"))?;

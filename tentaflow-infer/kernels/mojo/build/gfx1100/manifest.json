@@ -505,6 +505,22 @@
       "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_a98cd718ba6ba9b7",
       "file": "gemm_nvfp4_gguf_wmma_f16_bm32.hsaco"
     },
+    "gemm_q2_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q2_k_wmma_gemm_q2_k_w6A6A6A6A_49f679acd5a6c2e1",
+      "file": "gemm_q2_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q2_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q2_k_wmma_gemm_q2_k_w6A6A6A6A_06bf15e16ed3dd19",
+      "file": "gemm_q2_k_wmma_f16_bm32.hsaco"
+    },
+    "gemm_q3_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q3_k_wmma_gemm_q3_k_w6A6A6A6A_622e37ed1a996be5",
+      "file": "gemm_q3_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q3_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q3_k_wmma_gemm_q3_k_w6A6A6A6A_e382e0d985a56925",
+      "file": "gemm_q3_k_wmma_f16_bm32.hsaco"
+    },
     "gemm_q4_0_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q4_0_dot4_im6A6A6A6A_8cd8233be13cc619",
       "file": "gemm_q4_0_dot4_128x128.hsaco"
