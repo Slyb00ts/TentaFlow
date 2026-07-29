@@ -380,3 +380,152 @@ pub fn gemv_q8_0_column_split(
     }
     Ok(())
 }
+
+/// Cały blok FFN rozłożony na karty: `gate`/`up` po wierszach, `down` po
+/// kolumnach — granice pokrywają się co do wiersza, więc kolumny, które karta
+/// dostaje w `down`, to dokładnie ten kawałek wymiaru pośredniego, który ta
+/// sama karta policzyła.
+pub struct FfnShards {
+    gate: Vec<DevBuffer>,
+    up: Vec<DevBuffer>,
+    down: ColShards,
+    rows: Vec<usize>,
+}
+
+impl FfnShards {
+    pub fn rows_on(&self, device: usize) -> usize {
+        self.rows.get(device).copied().unwrap_or(0)
+    }
+}
+
+/// Rozkłada trzy macierze FFN na karty jednym planem.
+///
+/// Plan wyznacza podział `down` po kolumnach (bo tam granica musi paść na pełny
+/// blok Q8_0), a `gate`/`up` dostają dokładnie te same granice w wierszach.
+pub fn upload_ffn_split(
+    cluster: &Cluster,
+    caps: &[DeviceCapability],
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    hidden: usize,
+    inter: usize,
+    kind: WorkKind,
+) -> Result<FfnShards> {
+    let down = upload_column_split(cluster, caps, down, hidden, inter, kind)?;
+    let rows: Vec<usize> = (0..cluster.len()).map(|i| down.cols_on(i)).collect();
+    let gate = upload_rows_by_plan(cluster, gate, inter, hidden, &rows)?;
+    let up = upload_rows_by_plan(cluster, up, inter, hidden, &rows)?;
+    Ok(FfnShards {
+        gate,
+        up,
+        down,
+        rows,
+    })
+}
+
+/// Rozkłada macierz po wierszach wg PODANEGO planu — używane tam, gdzie granice
+/// muszą się zgadzać z innym podziałem, a nie wynikać z własnego pomiaru.
+fn upload_rows_by_plan(
+    cluster: &Cluster,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    plan: &[usize],
+) -> Result<Vec<DevBuffer>> {
+    let row_bytes = (cols / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES;
+    if data.len() != rows * row_bytes {
+        return Err(ForgeError::Format(format!(
+            "macierz {rows}x{cols} to {} B, otrzymano {}",
+            rows * row_bytes,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(cluster.len());
+    let mut offset = 0usize;
+    for (index, &count) in plan.iter().enumerate() {
+        let entry = cluster.device(index)?;
+        let buffer = entry.device.alloc(
+            count.max(1) * row_bytes,
+            MemKind::Device,
+            Pool::Weights,
+        )?;
+        if count > 0 {
+            entry.device.write(
+                &data[offset * row_bytes..(offset + count) * row_bytes],
+                &buffer,
+                0,
+            )?;
+        }
+        out.push(buffer);
+        offset += count;
+    }
+    Ok(out)
+}
+
+/// Bufory robocze bloku FFN, jeden komplet na kartę.
+pub struct FfnWorkspace {
+    pub x: Vec<DevBuffer>,
+    pub gate: Vec<DevBuffer>,
+    pub up: Vec<DevBuffer>,
+    pub mid: Vec<DevBuffer>,
+    pub partial: Vec<DevBuffer>,
+}
+
+/// Liczy `y = down · act(gate·x, up·x)` na wszystkich kartach naraz.
+///
+/// `ws.x[i]` musi zawierać PEŁNE wejście (wymiar ukryty nie jest dzielony),
+/// reszta buforów jest per karta o rozmiarze jej kawałka. Na całą warstwę
+/// przypada JEDNA wymiana — redukcja sum cząstkowych `down`.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_forward_split(
+    cluster: &Cluster,
+    shards: &FfnShards,
+    ws: &FfnWorkspace,
+    y_full: &DevBuffer,
+    staging: &DevBuffer,
+    hidden: usize,
+    activation: forge_formats::FfnActivation,
+    gather_on: usize,
+) -> Result<()> {
+    for index in 0..cluster.len() {
+        let rows = shards.rows_on(index);
+        if rows == 0 {
+            continue;
+        }
+        let entry = cluster.device(index)?;
+        entry.kernels.gemv_q8_0_f16(
+            &ws.gate[index],
+            &shards.gate[index],
+            &ws.x[index],
+            rows,
+            hidden,
+            &entry.stream,
+        )?;
+        entry.kernels.gemv_q8_0_f16(
+            &ws.up[index],
+            &shards.up[index],
+            &ws.x[index],
+            rows,
+            hidden,
+            &entry.stream,
+        )?;
+        entry.kernels.glu_mul_f16(
+            activation,
+            &ws.mid[index],
+            &ws.gate[index],
+            &ws.up[index],
+            rows,
+            &entry.stream,
+        )?;
+    }
+    gemv_q8_0_column_split(
+        cluster,
+        &shards.down,
+        &ws.mid,
+        &ws.partial,
+        y_full,
+        staging,
+        gather_on,
+    )
+}

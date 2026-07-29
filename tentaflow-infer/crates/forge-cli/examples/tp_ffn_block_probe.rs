@@ -10,10 +10,8 @@
 // jednej karcie, dopiero potem czas. Ksztalty jak w FFN Bielika 7B.
 use forge_engine::cluster::Cluster;
 use forge_engine::multi_gpu::{DeviceCapability, WorkKind};
-use forge_engine::tensor_parallel::{
-    gemv_q8_0_column_split, upload_column_split, upload_row_split,
-};
-use forge_hal::{DevBuffer, Pool, PoolSizes};
+use forge_engine::tensor_parallel::{FfnWorkspace, ffn_forward_split, upload_ffn_split};
+use forge_hal::{Pool, PoolSizes};
 use forge_types::{MemKind, QuantKind};
 use std::time::Instant;
 
@@ -124,85 +122,58 @@ fn main() {
     dev0.device.read(&y_ref, 0, &mut reference).unwrap();
 
     // ---- podzial: gate/up po wierszach, down po kolumnach ----
-    // Podzial `down` narzuca granice: kolumny, ktore dostaje karta, musza sie
-    // pokrywac z wierszami gate/up, ktore ta sama karta policzyla.
-    let down = upload_column_split(&cluster, &caps, &w_down, HIDDEN, INTER, WorkKind::MemoryBound)
-        .expect("podzial down");
-    let rows_plan: Vec<usize> = (0..cluster.len()).map(|i| down.cols_on(i)).collect();
-    let gate = upload_row_split_exact(&cluster, &w_gate, INTER, HIDDEN, &rows_plan);
-    let up = upload_row_split_exact(&cluster, &w_up, INTER, HIDDEN, &rows_plan);
+    let shards = upload_ffn_split(
+        &cluster,
+        &caps,
+        &w_gate,
+        &w_up,
+        &w_down,
+        HIDDEN,
+        INTER,
+        WorkKind::MemoryBound,
+    )
+    .expect("podzial FFN");
+    let rows_plan: Vec<usize> = (0..cluster.len()).map(|i| shards.rows_on(i)).collect();
 
-    let mut x_copies = Vec::new();
-    let mut gate_parts = Vec::new();
-    let mut up_parts = Vec::new();
-    let mut mid_parts = Vec::new();
-    let mut y_parts = Vec::new();
+    let mut ws = FfnWorkspace {
+        x: Vec::new(),
+        gate: Vec::new(),
+        up: Vec::new(),
+        mid: Vec::new(),
+        partial: Vec::new(),
+    };
     for index in 0..cluster.len() {
         let entry = cluster.device(index).expect("karta");
         let rows = rows_plan[index].max(1);
-        let xc = entry
-            .device
-            .alloc(x.len(), MemKind::Device, Pool::Activations)
-            .unwrap();
-        entry.device.write(&x, &xc, 0).unwrap();
-        x_copies.push(xc);
         let mk = |n: usize| {
             entry
                 .device
                 .alloc(n, MemKind::Device, Pool::Activations)
                 .unwrap()
         };
-        gate_parts.push(mk(rows * 2));
-        up_parts.push(mk(rows * 2));
-        mid_parts.push(mk(rows * 2));
-        y_parts.push(mk(HIDDEN * 4));
+        let xc = mk(x.len());
+        entry.device.write(&x, &xc, 0).unwrap();
+        ws.x.push(xc);
+        ws.gate.push(mk(rows * 2));
+        ws.up.push(mk(rows * 2));
+        ws.mid.push(mk(rows * 2));
+        ws.partial.push(mk(HIDDEN * 4));
     }
     let y_full = alloc_a(HIDDEN * 4);
     let staging = alloc_a(HIDDEN * 4);
 
     let split_block = || {
-        for index in 0..cluster.len() {
-            let rows = rows_plan[index];
-            if rows == 0 {
-                continue;
-            }
-            let entry = cluster.device(index).expect("karta");
-            entry
-                .kernels
-                .gemv_q8_0_f16(
-                    &gate_parts[index],
-                    &gate[index],
-                    &x_copies[index],
-                    rows,
-                    HIDDEN,
-                    &entry.stream,
-                )
-                .unwrap();
-            entry
-                .kernels
-                .gemv_q8_0_f16(
-                    &up_parts[index],
-                    &up[index],
-                    &x_copies[index],
-                    rows,
-                    HIDDEN,
-                    &entry.stream,
-                )
-                .unwrap();
-            entry
-                .kernels
-                .glu_mul_f16(
-                    act,
-                    &mid_parts[index],
-                    &gate_parts[index],
-                    &up_parts[index],
-                    rows,
-                    &entry.stream,
-                )
-                .unwrap();
-        }
-        gemv_q8_0_column_split(&cluster, &down, &mid_parts, &y_parts, &y_full, &staging, 0)
-            .expect("down + redukcja");
+        ffn_forward_split(
+            &cluster,
+            &shards,
+            &ws,
+            &y_full,
+            &staging,
+            HIDDEN,
+            act,
+            0,
+        )
+        .expect("blok FFN na kartach");
     };
 
     split_block();
@@ -243,39 +214,4 @@ fn main() {
         split_time * 1e6,
         whole_time / split_time
     );
-}
-
-/// Rozklada macierz po wierszach wg PODANEGO planu, zeby granice `gate`/`up`
-/// pokrywaly sie co do wiersza z granicami kolumn `down`.
-fn upload_row_split_exact(
-    cluster: &Cluster,
-    data: &[u8],
-    rows: usize,
-    cols: usize,
-    plan: &[usize],
-) -> Vec<DevBuffer> {
-    let row_bytes = (cols / 32) * 34;
-    assert_eq!(data.len(), rows * row_bytes);
-    let mut out = Vec::with_capacity(cluster.len());
-    let mut offset = 0usize;
-    for (index, &count) in plan.iter().enumerate() {
-        let entry = cluster.device(index).expect("karta");
-        let buffer = entry
-            .device
-            .alloc(count.max(1) * row_bytes, MemKind::Device, Pool::Weights)
-            .expect("fragment wierszowy");
-        if count > 0 {
-            entry
-                .device
-                .write(
-                    &data[offset * row_bytes..(offset + count) * row_bytes],
-                    &buffer,
-                    0,
-                )
-                .expect("zapis fragmentu");
-        }
-        out.push(buffer);
-        offset += count;
-    }
-    out
 }
