@@ -242,3 +242,42 @@ tam, gdzie ta sama praca na NVIDII przechodziła.
   compressed-tensors pisana pod instrukcje NVIDII.
 - **Rollouty eksperymentalne** (hybrydowy prefill B2, MTP+n-gram) — bramki
   wdrożeniowe, nie zdolności sprzętu.
+
+## Otwarta usterka: hybrydowy prefill Qwen3.6 pada na AMD
+
+Qwen3.6-27B (`qwen35`, DeltaNet) na RX 7900 XT wywala się w prefillu:
+
+```
+Memory access fault by GPU node-2 ... Reason: Page not present or supervisor privilege.
+```
+
+Ustalone:
+
+- **Próg to jeden wewnętrzny chunk.** Prompt 26 tokenów przechodzi; od ~50 tokenów
+  w górę pada. Wewnętrzny chunk hybrydowego prefill wynosi tu 32.
+- **Niedeterministycznie** — około 2 na 3 uruchomienia tego samego polecenia.
+- **Niezależne od trybu skanu** (`chunked` i `persistent` padają tak samo) oraz od
+  `FORGE_HYBRID_LAYER_MAJOR_PREFILL`.
+- **`AMD_SERIALIZE_KERNEL=3` usuwa błąd** i model odpowiada poprawnie. To wskazuje
+  na naruszoną KOLEJNOŚĆ między kernelami, a nie na przekroczenie zakresu w indeksie
+  — serializacja nie naprawiłaby wyścigu wewnątrz kernela.
+- **Nie wnosi jej zmiana strumieni na NonBlocking** z 2026-07-29: z przywróconą
+  flagą blokującą błąd występuje z tą samą częstością.
+
+Usterka jest wcześniejsza niż ten audyt i zgodna z zapisem w `CLAUDE.md`, że ścieżkę
+hybrydową sprawdzono wykonawczo wyłącznie na CUDA. Skutek: Qwen3.6-27B jest na
+Radeonie bezużyteczny dla realnych promptów.
+
+Z tego powodu warunek `supports_deltanet_gated_scan_persistent_d128_f16` ZOSTAJE przy
+NVIDII. Artefakt `deltanet_gated_scan_persistent_d128_f16` jest zbudowany dla gfx1100,
+ale zdjęcie bramki nie ma jak zostać zweryfikowane, dopóki cała ścieżka hybrydowa na
+AMD pada — a bramka opisuje „kombinację zweryfikowaną", nie „kernel, który się
+skompilował".
+
+### Powtórzenie
+
+```bash
+P=$(python3 -c "print('Wyjasnij dzialanie pamieci podrecznej procesora. ' * 10)")
+HIP_VISIBLE_DEVICES=1 ./target-amd/release/forge run \
+  /mnt/d/models/bench/qwen36-27b-Q4_K_M.gguf "$P" --max-tokens 4 --temp 0
+```
