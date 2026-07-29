@@ -22,8 +22,12 @@ fn pools(var: &str, default_gib: usize) -> PoolSizes {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(default_gib)
             << 30,
-        kv_cache: 512 << 20,
-        activations: 512 << 20,
+        // Pula KV musi pomieścić geometrię NAJSZERSZEGO modelu, jaki tu wchodzi:
+        // 512 MB wystarczało Bielikowi, a Gemma 4 (48 warstw) kończyła na OOM
+        // przy ładowaniu — co wyglądało jak „model się nie mieści", a było
+        // zaszytą w sondzie liczbą.
+        kv_cache: 2 << 30,
+        activations: 1 << 30,
         kv_page_size: 256 << 10,
     }
 }
@@ -171,11 +175,25 @@ fn main() {
             println!("  krok {step}: względne L2 {:.2e}", (n / d.max(1e-12)).sqrt());
         }
         for (x, y) in a.iter().zip(b.iter()) {
+            // Część modeli maskuje nieużywane wpisy słownika minus nieskończonością
+            // (Gemma 4: 2 na krok). Są w OBU przebiegach, więc nie mówią nic o
+            // podziale, a wciągnięte do sumy zamieniają całą miarę w NaN.
+            if !x.is_finite() || !y.is_finite() {
+                continue;
+            }
             let diff = (x - y) as f64;
             max_abs = max_abs.max(diff.abs() as f32);
             num += diff * diff;
             den += (*x as f64) * (*x as f64);
         }
+    }
+    let nonfinite = |v: &[Vec<f32>]| v.iter().flatten().filter(|x| !x.is_finite()).count();
+    let (bad_ref, bad_split) = (nonfinite(&single), nonfinite(&split));
+    if bad_ref > 0 || bad_split > 0 {
+        println!(
+            "wartości nieskończone/NaN: jedna karta {bad_ref}, podział {bad_split} (z {})",
+            single.len() * single[0].len()
+        );
     }
     let l2 = (num / den.max(1e-12)).sqrt();
     println!(

@@ -480,3 +480,45 @@ modelu (prefill liczy je macierzowo), czyli zwiększa zapotrzebowanie na pamię�
 zamiast je rozłożyć. Żeby dwie karty niosły model, którego jedna nie unosi,
 podział musi objąć także prefill i zastąpić kopię jednokartową, a nie stanąć obok
 niej. To jest następny duży krok i to on, a nie kolejny format, odblokowuje 27B.
+
+### Gemma 4 12B i dwie poprawki w samym pomiarze
+
+Gemma nie „nie mieściła się" — ładuje się na jednej karcie bez problemu. Sonda
+miała zaszyte 512 MB puli KV, co wystarczało Bielikowi, a przy 48 warstwach Gemmy
+kończyło się `OutOfMemory` PRZY ŁADOWANIU, czyli zanim podział w ogóle wszedł w
+grę. Wyglądało to jak ograniczenie modelu, a było liczbą w sondzie.
+
+Druga poprawka dotyczy wskaźnika. Gemma maskuje nieużywane wpisy słownika minus
+nieskończonością (2 na krok), przez co względne L2 wychodziło NaN. Te wartości są
+w OBU przebiegach identycznie, więc nie mówią nic o podziale — miara je teraz
+pomija i liczy osobno.
+
+Zmierzone (64 kroki, dwa przebiegi): 49,2 -> 59,1–61,2 tok/s, czyli **1,20–1,24x**,
+względne L2 ok. 1,0e-1, inny argmax w **3–5 krokach na 64**. Cały podział na
+karcie 7900 XT wychodzi bitowo, więc to znowu nieprzemienność, nie usterka — ale
+Gemma jest z przebadanych modeli NAJWRAŻLIWSZA na podział i przekracza bramkę 5%.
+Softcap logitów zagęszcza remisy, więc ta sama różnica numeryczna przewraca wybór
+tokenu częściej niż gdzie indziej. Dla Gemmy `--tp-cards` daje prędkość kosztem
+odtwarzalności wyniku i to trzeba powiedzieć wprost.
+
+### Ograniczenie projektowe: podział NIE pozwala unieść większego modelu
+
+To jest realna wada obecnego kształtu, nie brak funkcji do dopisania.
+
+Prefill liczy FFN macierzowo na jednej karcie, więc karta modelu zachowuje PEŁNĄ
+kopię wag FFN, a fragment podziału DOKŁADA się do niej. Zapotrzebowanie na pamięć
+karty modelu więc rośnie, zamiast maleć. Widać to wprost: Gemma 12B Q4_K z
+podziałem `15360,0` (cały wymiar pośredni na karcie modelu) kończy się brakiem
+pamięci, choć bez podziału ten sam model działa.
+
+Konsekwencja jest taka, że dziś `--tp-cards` przyspiesza modele, które MIESZCZĄ
+się na jednej karcie, a nie pomaga tym, które się nie mieszczą — czyli nie robi
+tego, po co zwykle sięga się po dwie karty. ThinkingCap 27B (17,4 GiB NVFP4 /
+16,0 GiB Q4_K wobec 16 GiB VRAM) jest właśnie takim przypadkiem: dwie karty mają
+razem 36 GiB, model zmieściłby się z zapasem, a mimo to zjeżdża na host i NVMe.
+
+Naprawa nie jest kosmetyczna: fragmenty muszą stać się JEDYNĄ kopią wag FFN, co
+wymaga poprowadzenia przez podział także prefillu (GEMM zamiast GEMV: `gate`/`up`
+po wierszach dają `[T, rows_i]`, `down` po kolumnach daje sumę częściową `[T,
+hidden]`, redukcja jak w dekodowaniu) i usunięcia wag FFN z ładowania
+jednokartowego. Dopiero wtedy dwie karty niosą model, którego jedna nie unosi.
