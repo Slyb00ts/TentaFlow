@@ -8745,10 +8745,17 @@ impl Kernels {
         } else {
             ("_bm256", 256usize, 256u32)
         };
-        let name = format!("{family}{suffix}");
-        if !self.artifacts.has(&name) {
+        // Najpierw kafel na jednostce macierzowej, a gdy architektura jej nie ma
+        // (RDNA2) — kafel przenośny liczący w rejestrach. Ten sam wynik, wolniej.
+        let matrix = format!("{family}{suffix}");
+        let portable = format!("{}_tile_f16_bm32", family.trim_end_matches("_wmma_f16"));
+        let (name, bm, block) = if self.artifacts.has(&matrix) {
+            (matrix, bm, block)
+        } else if self.artifacts.has(&portable) {
+            (portable, 32usize, 128u32)
+        } else {
             return Ok(false);
-        }
+        };
         let kernel = self.artifacts.get(&name)?;
         let config = LaunchConfig {
             grid: (

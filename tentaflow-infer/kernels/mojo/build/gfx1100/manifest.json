@@ -505,6 +505,10 @@
       "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_a98cd718ba6ba9b7",
       "file": "gemm_nvfp4_gguf_wmma_f16_bm32.hsaco"
     },
+    "gemm_q2_k_tile_f16_bm32": {
+      "entry": "src_gemm_q2_k_wmma_gemm_q2_k_t6A6A6A6A_0092bb2bc02e8c9c",
+      "file": "gemm_q2_k_tile_f16_bm32.hsaco"
+    },
     "gemm_q2_k_wmma_f16_bm256": {
       "entry": "src_gemm_q2_k_wmma_gemm_q2_k_w6A6A6A6A_49f679acd5a6c2e1",
       "file": "gemm_q2_k_wmma_f16_bm256.hsaco"
@@ -512,6 +516,10 @@
     "gemm_q2_k_wmma_f16_bm32": {
       "entry": "src_gemm_q2_k_wmma_gemm_q2_k_w6A6A6A6A_06bf15e16ed3dd19",
       "file": "gemm_q2_k_wmma_f16_bm32.hsaco"
+    },
+    "gemm_q3_k_tile_f16_bm32": {
+      "entry": "src_gemm_q3_k_wmma_gemm_q3_k_t6A6A6A6A_845f130629c43ebe",
+      "file": "gemm_q3_k_tile_f16_bm32.hsaco"
     },
     "gemm_q3_k_wmma_f16_bm256": {
       "entry": "src_gemm_q3_k_wmma_gemm_q3_k_w6A6A6A6A_622e37ed1a996be5",
@@ -537,6 +545,10 @@
       "entry": "src_gemm_dot_gemm_q4_0_dot4_im6A6A6A6A_8c12ce75c2ca5978",
       "file": "gemm_q4_0_dot4_out_f32_64x64.hsaco"
     },
+    "gemm_q4_0_tile_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_a3bbbd6df661262d",
+      "file": "gemm_q4_0_tile_f16_bm32.hsaco"
+    },
     "gemm_q4_0_wmma_f16_bm256": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_d268d38f98517238",
       "file": "gemm_q4_0_wmma_f16_bm256.hsaco"
@@ -544,6 +556,10 @@
     "gemm_q4_0_wmma_f16_bm32": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_7f7a2633376d6274",
       "file": "gemm_q4_0_wmma_f16_bm32.hsaco"
+    },
+    "gemm_q4_1_tile_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_59594c0fb36a14c8",
+      "file": "gemm_q4_1_tile_f16_bm32.hsaco"
     },
     "gemm_q4_1_wmma_f16_bm256": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_78f5557ea9e765b9",
@@ -569,6 +585,10 @@
       "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_3bc4497d970ac7f4",
       "file": "gemm_q4_k_dot4_out_f32_64x64.hsaco"
     },
+    "gemm_q4_k_tile_f16_bm32": {
+      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_t6A6A6A6A_1523d1f2426d906d",
+      "file": "gemm_q4_k_tile_f16_bm32.hsaco"
+    },
     "gemm_q4_k_wmma_f16_bm256": {
       "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_6ffb3bf18966c422",
       "file": "gemm_q4_k_wmma_f16_bm256.hsaco"
@@ -576,6 +596,10 @@
     "gemm_q4_k_wmma_f16_bm32": {
       "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_eb34b3ede551428b",
       "file": "gemm_q4_k_wmma_f16_bm32.hsaco"
+    },
+    "gemm_q5_0_tile_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_4bd3423a869b7220",
+      "file": "gemm_q5_0_tile_f16_bm32.hsaco"
     },
     "gemm_q5_0_wmma_f16_bm256": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_a0b33d1a172bcf3b",
@@ -585,6 +609,10 @@
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_a2ec6baf36d94856",
       "file": "gemm_q5_0_wmma_f16_bm32.hsaco"
     },
+    "gemm_q5_1_tile_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_95029dbd5061e79c",
+      "file": "gemm_q5_1_tile_f16_bm32.hsaco"
+    },
     "gemm_q5_1_wmma_f16_bm256": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_0e56fdcddab62fd3",
       "file": "gemm_q5_1_wmma_f16_bm256.hsaco"
@@ -592,6 +620,10 @@
     "gemm_q5_1_wmma_f16_bm32": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_27331902ff6b0032",
       "file": "gemm_q5_1_wmma_f16_bm32.hsaco"
+    },
+    "gemm_q5_k_tile_f16_bm32": {
+      "entry": "src_gemm_q5_k_wmma_gemm_q5_k_t6A6A6A6A_7f8bd20a8ff89c2b",
+      "file": "gemm_q5_k_tile_f16_bm32.hsaco"
     },
     "gemm_q5_k_wmma_f16_bm256": {
       "entry": "src_gemm_q5_k_wmma_gemm_q5_k_w6A6A6A6A_1fd58864a3d63d75",

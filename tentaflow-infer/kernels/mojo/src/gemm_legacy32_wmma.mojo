@@ -168,3 +168,93 @@ comptime gemm_q5_0_wmma_f16_bm32 = gemm_legacy32_wmma_impl[2, 2, 1, 2, 2]
 comptime gemm_q5_0_wmma_f16_bm256 = gemm_legacy32_wmma_impl[4, 2, 4, 2, 2]
 comptime gemm_q5_1_wmma_f16_bm32 = gemm_legacy32_wmma_impl[2, 2, 1, 2, 3]
 comptime gemm_q5_1_wmma_f16_bm256 = gemm_legacy32_wmma_impl[4, 2, 4, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Wariant PRZENOŚNY dla kart bez jednostki macierzowej (RDNA2). Ta sama
+# dekwantyzacja, mnożenie w rejestrach; aktywacje i wagi idą przez LDS.
+
+
+def gemm_legacy32_tile_impl[BM: Int, BN: Int, FMT: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """GEMM starego formatu 32-elementowego bez jednostki macierzowej. Siatka
+    (ceil(n_rows / BN), ceil(n_tokens / BM)), blok (BM/4)*(BN/4) wątków."""
+    comptime TM = 4
+    comptime TN = 4
+    comptime THREADS = (BM // TM) * (BN // TN)
+    comptime BB = 18 + 2 * FMT
+
+    var tid = Int(thread_idx.x)
+    var thread_m = (tid // (BN // TN)) * TM
+    var thread_n = (tid % (BN // TN)) * TN
+    var base_m = Int(block_idx.y) * BM
+    var base_n = Int(block_idx.x) * BN
+    var blocks_per_row = n_cols // BLOCK_VALUES
+
+    xs = stack_allocation[
+        BM * BLOCK_VALUES, Float16, address_space = AddressSpace.SHARED
+    ]()
+    ws = stack_allocation[
+        BN * BLOCK_VALUES, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    var acc = InlineArray[SIMD[DType.float32, TN], TM](
+        fill=SIMD[DType.float32, TN](0.0)
+    )
+
+    for block in range(blocks_per_row):
+        var column0 = block * BLOCK_VALUES
+        var slot = tid
+        while slot < BM * GROUPS:
+            token = slot // GROUPS
+            part = slot % GROUPS
+            var m = base_m + token
+            if m > n_tokens - 1:
+                m = n_tokens - 1
+            (xs + token * BLOCK_VALUES + part * TILE).store(
+                (x + m * n_cols + column0 + part * TILE).load[
+                    width=TILE, alignment=2
+                ]()
+            )
+            slot += THREADS
+        slot = tid
+        while slot < BN * GROUPS:
+            local_row = slot // GROUPS
+            group = slot % GROUPS
+            var source_row = base_n + local_row
+            if source_row > n_rows - 1:
+                source_row = n_rows - 1
+            (ws + local_row * BLOCK_VALUES + group * TILE).store(
+                _weight_frag[FMT](
+                    weights, source_row * blocks_per_row * BB + block * BB, group
+                )
+            )
+            slot += THREADS
+        barrier()
+
+        for c in range(BLOCK_VALUES):
+            var b = SIMD[DType.float32, TN](0.0)
+            comptime for n in range(TN):
+                b[n] = Float32(ws[(thread_n + n) * BLOCK_VALUES + c])
+            comptime for m in range(TM):
+                acc[m] += Float32(xs[(thread_m + m) * BLOCK_VALUES + c]) * b
+        barrier()
+
+    comptime for m in range(TM):
+        comptime for n in range(TN):
+            var row = base_m + thread_m + m
+            var col = base_n + thread_n + n
+            if row < n_tokens and col < n_rows:
+                y[row * n_rows + col] = Float16(acc[m][n])
+
+
+comptime gemm_q4_0_tile_f16_bm32 = gemm_legacy32_tile_impl[32, 64, 0]
+comptime gemm_q4_1_tile_f16_bm32 = gemm_legacy32_tile_impl[32, 64, 1]
+comptime gemm_q5_0_tile_f16_bm32 = gemm_legacy32_tile_impl[32, 64, 2]
+comptime gemm_q5_1_tile_f16_bm32 = gemm_legacy32_tile_impl[32, 64, 3]
