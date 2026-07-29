@@ -45,6 +45,12 @@ RENAME_EXCHANGE = 2
 # Gramatyka: lista rozdzielona przecinkami, człon to `vendor` albo
 # `vendor:arch` z opcjonalnym `+` (ta architektura i nowsze). Brak komentarza
 # znaczy PRZENOŚNY — kernel musi się zbudować wszędzie.
+# UWAGA do zasiegu `amd:gfx11`: kernele WMMA celuja w intrinsiki MACIERZOWE
+# RDNA3 (`llvm.amdgcn.wmma.*.16x16x16.*`). RDNA4 ma wlasna jednostke macierzowa,
+# ale INNE intrinsiki — Mojo konczy na `Cannot select` przy budowie dla gfx1201.
+# Dlatego zasieg to `amd:gfx11`, a nie `amd:gfx11+`: to nie jest ten sam kernel
+# na nowszej karcie, tylko kernel, ktorego odpowiednika dla RDNA4 jeszcze nie ma.
+# RDNA4 liczy te ksztalty przenosnymi wariantami `dot4`.
 SCOPE_MARKER = "# arch:"
 
 
@@ -275,19 +281,140 @@ def inst_cache_line(arch):
     return 64
 
 
-def run_amdgcn_assembler(clang, text, arch, artifact, out_path):
+def amdgcn_features(arch):
+    """Cechy podzbioru ISA, ktore asembler musi wlaczyc dla danej architektury.
+
+    RDNA4 (gfx12) adresuje polowki rejestrow 16-bitowych (`v0.l`, `v0.h`) i Mojo
+    tak wlasnie emituje konwersje f32->f16. LLVM trzyma to za cecha
+    `real-true16`, DOMYSLNIE WYLACZONA, wiec bez niej asembler odrzuca wlasne
+    wyjscie kompilatora: `v_cvt_f16_f32_e32 v0.l, v4` -> „operands are not valid
+    for this GPU or mode".
+    """
+    vendor, generation = parse_arch(arch)
+    if vendor == "amd" and generation >= 12:
+        return ["+real-true16"]
+    return []
+
+
+# Pary VOPD (`v_dual_*` :: `v_dual_*`) wykonuja dwie operacje w jednym slocie.
+# Sprzet wymaga, zeby odpowiadajace sobie zrodla obu polowek lezaly w ROZNYCH
+# bankach rejestrow (bank = numer % 4), a Mojo dla gfx12 emituje pary, ktore ten
+# warunek lamia — asembler odrzuca wtedy WLASNE wyjscie kompilatora:
+#   v_dual_add_f32 v3, -1.0, v2 :: v_dual_add_f32 v2, 1.0, v2
+#                                    -> src1 operands must use different VGPR banks
+# Rozdzielamy takie pary na dwie zwykle instrukcje. Semantyka VOPD to „obie
+# polowki czytaja, potem obie pisza", wiec rozdzielenie jest rownowazne tylko przy
+# wlasciwej kolejnosci: instrukcja, ktorej wynik czyta ta druga, musi isc PO niej.
+VOPD_SPLIT = {
+    "v_dual_add_f32": ("v_add_f32", 2, None),
+    "v_dual_sub_f32": ("v_sub_f32", 2, None),
+    "v_dual_subrev_f32": ("v_subrev_f32", 2, None),
+    "v_dual_mul_f32": ("v_mul_f32", 2, None),
+    "v_dual_mul_dx9_zero_f32": ("v_mul_dx9_zero_f32", 2, None),
+    "v_dual_max_f32": ("v_max_f32", 2, None),
+    "v_dual_min_f32": ("v_min_f32", 2, None),
+    "v_dual_max_num_f32": ("v_max_num_f32", 2, None),
+    "v_dual_min_num_f32": ("v_min_num_f32", 2, None),
+    "v_dual_fmac_f32": ("v_fmac_f32", 2, None),
+    "v_dual_dot2acc_f32_f16": ("v_dot2acc_f32_f16", 2, None),
+    "v_dual_dot2acc_f32_bf16": ("v_dot2acc_f32_bf16", 2, None),
+    "v_dual_and_b32": ("v_and_b32", 2, None),
+    "v_dual_add_nc_u32": ("v_add_nc_u32", 2, None),
+    "v_dual_lshlrev_b32": ("v_lshlrev_b32", 2, None),
+    "v_dual_fmamk_f32": ("v_fmamk_f32", 3, None),
+    "v_dual_fmaak_f32": ("v_fmaak_f32", 3, None),
+    # Forma VOPD bierze maske z VCC NIEJAWNIE; zwykla wymaga jej wprost, a przy
+    # falach 32-elementowych (cale RDNA) jest to `vcc_lo`.
+    "v_dual_cndmask_b32": ("v_cndmask_b32", 2, "vcc_lo"),
+    "v_dual_mov_b32": ("v_mov_b32", 1, None),
+}
+
+# Instrukcje, ktore AKUMULUJA: cel jest jednoczesnie zrodlem, wiec liczy sie do
+# zaleznosci przy ustalaniu kolejnosci po rozdzieleniu pary.
+VOPD_ACCUMULATES = {"v_dual_fmac_f32", "v_dual_dot2acc_f32_f16"}
+
+
+def _vopd_half(text, artifact):
+    head, _, rest = text.strip().partition(" ")
+    if head not in VOPD_SPLIT:
+        raise RuntimeError(f"{artifact}: nieznana polowka VOPD `{head}`")
+    opcode, sources, extra = VOPD_SPLIT[head]
+    operands = [part.strip() for part in rest.split(",")]
+    if len(operands) != sources + 1:
+        raise RuntimeError(f"{artifact}: `{head}` ma {len(operands)} operandow")
+    tail = operands[1:] + ([extra] if extra else [])
+    reads = tail + ([operands[0]] if head in VOPD_ACCUMULATES else [])
+    return opcode, operands[0], tail, reads
+
+
+def split_vopd_pairs(text, artifact):
+    """Rozdziela pary VOPD na pojedyncze instrukcje, zachowujac semantyke."""
+    out = []
+    for line in text.splitlines():
+        if "v_dual_" not in line or "::" not in line:
+            out.append(line)
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        body, _, comment = line.partition("//")
+        first, second = body.split("::", 1)
+        op_a, dst_a, src_a, reads_a = _vopd_half(first, artifact)
+        op_b, dst_b, src_b, reads_b = _vopd_half(second, artifact)
+        a_feeds_b = dst_a in reads_b
+        b_feeds_a = dst_b in reads_a
+        if a_feeds_b and b_feeds_a:
+            raise RuntimeError(
+                f"{artifact}: para VOPD czyta nawzajem swoje wyniki, "
+                f"nie da sie jej rozdzielic bez rejestru pomocniczego: {line.strip()}"
+            )
+        pair = [(op_a, dst_a, src_a), (op_b, dst_b, src_b)]
+        if a_feeds_b:
+            pair.reverse()
+        for opcode, dst, sources in pair:
+            out.append(f"{indent}{opcode} {dst}, {', '.join(sources)}")
+        if comment.strip():
+            out.append(f"{indent}//{comment}")
+    return "\n".join(out) + "\n"
+
+
+def run_amdgcn_assembler(rocm, text, arch, artifact, out_path):
+    """Asembluje tekst .s i linkuje go do code objectu karty.
+
+    Asemblacja idzie przez `llvm-mc`, a nie przez sterownik clang, bo tylko ona
+    przyjmuje `-mattr`; clang wystawia cechy podzbioru ISA wylacznie przez
+    identyfikator celu (`gfx908:xnack-`), w ktorym `real-true16` nie istnieje.
+    """
+    assembler = rocm / "llvm" / "bin" / "llvm-mc"
+    clang = rocm / "llvm" / "bin" / "clang"
+    features = amdgcn_features(arch)
+    if features:
+        text = split_vopd_pairs(text, artifact)
     with tempfile.TemporaryDirectory(prefix="forge-amdgcn-") as work:
         source = Path(work) / f"{artifact}.s"
         source.write_text(text)
+        obj = Path(work) / f"{artifact}.o"
+        command = [
+            str(assembler),
+            "-triple=amdgcn-amd-amdhsa",
+            f"-mcpu={arch}",
+            "-filetype=obj",
+            str(source),
+            "-o",
+            str(obj),
+        ]
+        if features:
+            command.insert(3, "-mattr=" + ",".join(features))
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"asemblacja {artifact} dla {arch} nie powiodla sie: {result.stderr}"
+            )
         result = subprocess.run(
             [
                 str(clang),
-                "-x",
-                "assembler",
                 "-target",
                 "amdgcn-amd-amdhsa",
                 f"-mcpu={arch}",
-                str(source),
+                str(obj),
                 "-o",
                 str(out_path),
             ],
@@ -295,7 +422,7 @@ def run_amdgcn_assembler(clang, text, arch, artifact, out_path):
             text=True,
         )
     if result.returncode != 0:
-        raise RuntimeError(f"asemblacja {artifact} dla {arch} nie powiodla sie: {result.stderr}")
+        raise RuntimeError(f"linkowanie {artifact} dla {arch} nie powiodlo sie: {result.stderr}")
 
 
 def rewrite_inst_pref_size(text, value):
@@ -325,19 +452,19 @@ def kernel_code_size(rocm, object_path, artifact, entry):
 
 def assemble_amdgcn(text, arch, artifact, out_path):
     rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
-    clang = rocm / "llvm" / "bin" / "clang"
-    if not clang.is_file():
-        raise RuntimeError(f"brak {clang}; ustaw ROCM_PATH")
+    for tool in ("clang", "llvm-mc"):
+        if not (rocm / "llvm" / "bin" / tool).is_file():
+            raise RuntimeError(f"brak {rocm / 'llvm' / 'bin' / tool}; ustaw ROCM_PATH")
     if INST_PREF_MARKER not in text:
-        run_amdgcn_assembler(clang, text, arch, artifact, out_path)
+        run_amdgcn_assembler(rocm, text, arch, artifact, out_path)
         return
     # Rozmiar kodu znamy dopiero po asemblacji, więc pierwszy przebieg idzie z
     # wyzerowanym polem wyłącznie po to, żeby go zmierzyć.
-    run_amdgcn_assembler(clang, rewrite_inst_pref_size(text, 0), arch, artifact, out_path)
+    run_amdgcn_assembler(rocm, rewrite_inst_pref_size(text, 0), arch, artifact, out_path)
     entry = entry_from_amdgcn(text, artifact)
     lines = -(-kernel_code_size(rocm, out_path, artifact, entry) // inst_cache_line(arch))
     run_amdgcn_assembler(
-        clang, rewrite_inst_pref_size(text, min(lines, INST_PREF_MAX)), arch, artifact, out_path
+        rocm, rewrite_inst_pref_size(text, min(lines, INST_PREF_MAX)), arch, artifact, out_path
     )
 
 def requires_sm89_cubins(arch):
