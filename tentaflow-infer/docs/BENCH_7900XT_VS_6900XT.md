@@ -510,3 +510,23 @@ Kolejnosc, ktora te pomiary wyznaczaja:
 2. `iu4` dla Q4_K/Q4_0 — najwiekszy zysk na formacie, ktorego uzywamy najczesciej,
 3. FP8: wykrycie w HAL + kernele gfx12, dopiero razem — samo odblokowanie flagi
    wlaczyloby sciezke bez artefaktow dla tej architektury.
+
+### Czego dokladnie brakuje do FP8 na RDNA4
+
+Sprawdzone, a nie zalozone:
+
+- Artefaktow FP8 dla gfx1201 jest **17**: kwantyzacja aktywacji, pakowanie,
+  `kv_append_batch_fp8`, uwaga prefill/decode FP8, `gemv_fp8_*`. Te sa przenosne
+  i JUZ SIE ZBUDOWALY.
+- Brakuje **11** — wszystkie oznaczone `# arch: nvidia:sm_89+`, i wszystkie to
+  GEMM. To jest cala luka: mnozenie macierzy FP8 mamy tylko na `mma` NVIDII.
+- Cache KV w FP8 jest osobno zablokowany: `--kv-cache fp8` konczy sie „requires
+  the fused decode path", a sciezka fused jest swiadomie wylaczona poza NVIDIA
+  (kernele `gemv_norm_*` sa pod nia strojone i na AMD mierzylismy je wolniej).
+
+Wniosek: **nie da sie tego obejsc flaga.** Samo ustawienie `fp8_native = true`
+zamienilo by czysty komunikat „niedostepne" w blad wykonania, bo kernela GEMM
+FP8 dla tej architektury po prostu nie ma. Trudna czesc jest natomiast za nami:
+`v_wmma_f32_16x16x16_fp8_fp8` kompiluje sie z naszego lancucha i wychodzi w
+kodzie — czyli droga to napisanie kernela GEMM FP8 na tym intrinsiku, a dopiero
+potem wykrycie w HAL.
