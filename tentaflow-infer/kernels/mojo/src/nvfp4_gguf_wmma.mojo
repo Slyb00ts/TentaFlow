@@ -167,6 +167,25 @@ def gemm_nvfp4_gguf_wmma_impl[
 #   [8,2,4,2] BM512 na szesnastu falach: 48/47/48 TFLOPS — mieszcza sie, ale
 #     polowa blokow to za malo rownoleglosci i wychodzi PONIZEJ BM256.
 # Przy BM256 dekwantyzacja nie jest juz waskim gardlem, wiec jej dalsze
+# tanienie niczego nie kupuje.
+#
+# PODWOJNY BUFOR WAG W LDS SPRAWDZONY I ODRZUCONY (2026-07-29). Nastepny kafel
+# dekwantyzowal sie w trakcie liczenia na biezacym, jedna bariera na obrocie
+# zamiast dwoch. W izolacji wygrywal na wszystkich trzech ksztaltach 27B:
+# 52->55, 48->51, 50->53 TFLOPS. NA MODELU NIE DAL NIC — profil rocprof pokazal
+# 3488,6 wobec 3477,9 ms na te same 608 wywolan, a pelny prefill 836,3 wobec
+# 831,3 tok/s. Podwojenie kafla LDS zabiera zajetosc, co w realnym obciazeniu
+# kasuje zysk z nakladania. Wniosek ogolny: izolowany sweep kafli NIE przenosi
+# sie tu na model — kazda zmiane trzeba domierzyc na `bench`.
+#
+# BM=512 SPRAWDZONE I ODRZUCONE (2026-07-29). Rachunek mowil, ze powinno pomoc:
+# wagi rozpakowuja sie raz na blok, wiec calkowity koszt dekwantyzacji skaluje
+# sie jak 1/BM. Pomiar mowi inaczej:
+#   [4,2,8,2] BM512 na osmiu falach: 14/13/16 TFLOPS — MTILE=8 to szesnascie
+#     akumulatorow po 8 VGPR na fale, rejestry sie nie mieszcza,
+#   [8,2,4,2] BM512 na szesnastu falach: 48/47/48 TFLOPS — mieszcza sie, ale
+#     polowa blokow to za malo rownoleglosci i wychodzi PONIZEJ BM256.
+# Przy BM256 dekwantyzacja nie jest juz waskim gardlem, wiec jej dalsze
 # tanienie niczego nie kupuje. Nie powtarzac tej proby bez nowego argumentu.
 comptime gemm_nvfp4_gguf_wmma_f16_bm32 = gemm_nvfp4_gguf_wmma_impl[2, 2, 1, 2]
 comptime gemm_nvfp4_gguf_wmma_f16_bm256 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 2]

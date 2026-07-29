@@ -3124,10 +3124,12 @@ impl Model {
                 "zaalokowano prototypową arenę layer-major"
             );
         }
+        // Ten sam predykat, co decyduje o trasie w `prefill_hybrid` — inaczej
+        // profil rezerwuje spany na inna sciezke, niz sie wykona.
         let hybrid_batched = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
             .map_or(true, |value| value != "0")
             && prompt_tokens > 1
-            && self.validate_hybrid_speculation_target().is_ok();
+            && self.hybrid_batched_prefill_capable();
         let target_spans = if let Some(limit) = layer_major_limit {
             prompt_tokens.div_ceil(limit)
         } else if hybrid_batched {
@@ -9970,6 +9972,26 @@ impl Model {
     }
 
     /// Sprawdza target hybrydowy niezależnie od źródła tokenów draftu.
+    /// Warunki BATCHOWEGO prefillu hybrydowego — te same co dla verifiera
+    /// spekulacyjnego, ale BEZ wymogu na format glowy logitow.
+    ///
+    /// Prefill zwraca logity wylacznie OSTATNIEGO tokenu i liczy je zwykla
+    /// sciezka `logits_gemv`, ktora obsluguje kazdy format. Wymog F16/Q8_0
+    /// nalezy do verifiera, ktory liczy logity dla T pozycji naraz batchowym
+    /// headem. Zwiazanie tych dwoch rzeczy jednym warunkiem kosztowalo bardzo
+    /// duzo: GGUF Q4_K_M ma glowe Q6_K (konwencja llama.cpp), wiec KAZDY taki
+    /// model hybrydowy schodzil na prefill token po tokenie — na dowolnej
+    /// karcie. Qwen3.6-27B Q4_K_M: 28,4 wobec 200,2 tok/s prefillu, przy
+    /// wyjsciu identycznym co do bajtu.
+    fn hybrid_batched_prefill_capable(&self) -> bool {
+        self.is_hybrid()
+            && self.weights.descriptor.params.head_dim == 256
+            && !self.weights.is_moe()
+            && matches!(self.kv.cfg.quant, KvQuant::F16)
+            && self.tier.is_none()
+            && self.prefix_cache.is_none()
+    }
+
     pub fn validate_hybrid_speculation_target(&self) -> Result<()> {
         if !self.is_hybrid() {
             return Err(ForgeError::Unsupported(
@@ -15849,7 +15871,7 @@ impl Model {
         }
         let batched_enabled =
             std::env::var("FORGE_HYBRID_BATCH_PREFILL").map_or(true, |value| value != "0");
-        if batched_enabled && tokens.len() > 1 && self.validate_hybrid_speculation_target().is_ok()
+        if batched_enabled && tokens.len() > 1 && self.hybrid_batched_prefill_capable()
         {
             return self.prefill_hybrid_batched(seq, tokens);
         }
