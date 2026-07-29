@@ -93,3 +93,33 @@ def wmma_f16_16x16x16(
         return llvm_intrinsic[
             "llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16", SIMD[DType.float32, 8]
         ](a, b, c)
+
+
+@always_inline
+def wmma_fp8_16x16x16(
+    a: SIMD[DType.int32, 2],
+    b: SIMD[DType.int32, 2],
+    c: SIMD[DType.float32, 8],
+) -> SIMD[DType.float32, 8]:
+    """Kafel 16x16x16 FP8 (E4M3) z akumulacja f32, jedna instrukcja RDNA4.
+
+    Fragment to osiem bajtow FP8 na linie, spakowanych w dwa int32 — ten sam
+    rozmiar co `iu8` na RDNA4, wiec kafel `gemm_wmma.mojo` przenosi sie tu bez
+    zmiany geometrii; rozni sie wylacznie prymityw i skalowanie.
+
+    ISTNIEJE TYLKO NA RDNA4. NVIDIA liczy FP8 kaflem `m16n8k32` z `ld_matrix`,
+    czyli INNA geometria i inny sposob ladowania fragmentow — tego nie da sie
+    schowac za `comptime if` w jednym kernelu i dlatego `gemm_fp8.mojo` zostaje
+    kernelem NVIDII, a RDNA4 potrzebuje wlasnego, zbudowanego na tym helperze.
+    """
+    comptime if _accelerator_arch().startswith("amdgpu:gfx12"):
+        return llvm_intrinsic[
+            "llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8.v8f32.v2i32",
+            SIMD[DType.float32, 8],
+        ](a, b, c)
+    else:
+        # Poza RDNA4 tej instrukcji NIE MA. Kernel, ktory tu trafil, jest zle
+        # zakresowany w katalogu — zwracamy akumulator bez zmian, zeby bledny
+        # zakres wyszedl jako rozjazd z referencja w tescie zlotym, a nie jako
+        # cichy wynik z niewiadomej instrukcji.
+        return c
