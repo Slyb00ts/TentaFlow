@@ -22,7 +22,7 @@ from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 
-from src.arch_wmma import wmma_f16_16x16x16
+from src.arch_wmma import wmma_f16_16x16x16, wmma_acc_row
 from src.gemv2 import _e2m1x8
 from src.nvfp4_gguf_batch import _ue4m3_branchless
 
@@ -144,7 +144,7 @@ def gemm_nvfp4_gguf_wmma_impl[
         comptime for nt in range(NTILE):
             comptime for i in range(8):
                 # (m, n) tego pola: m = i*2 + lane//16, n = lane % 16.
-                var m = base_m + mt * TILE + i * 2 + lane // 16
+                var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                 var n = base_n + nt * TILE + lane % 16
                 if m < n_tokens and n < n_rows:
                     y[m * n_rows + n] = Float16(

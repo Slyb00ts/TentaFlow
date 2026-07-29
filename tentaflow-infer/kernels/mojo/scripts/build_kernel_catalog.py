@@ -45,12 +45,6 @@ RENAME_EXCHANGE = 2
 # Gramatyka: lista rozdzielona przecinkami, człon to `vendor` albo
 # `vendor:arch` z opcjonalnym `+` (ta architektura i nowsze). Brak komentarza
 # znaczy PRZENOŚNY — kernel musi się zbudować wszędzie.
-# UWAGA do zasiegu `amd:gfx11`: kernele WMMA celuja w intrinsiki MACIERZOWE
-# RDNA3 (`llvm.amdgcn.wmma.*.16x16x16.*`). RDNA4 ma wlasna jednostke macierzowa,
-# ale INNE intrinsiki — Mojo konczy na `Cannot select` przy budowie dla gfx1201.
-# Dlatego zasieg to `amd:gfx11`, a nie `amd:gfx11+`: to nie jest ten sam kernel
-# na nowszej karcie, tylko kernel, ktorego odpowiednika dla RDNA4 jeszcze nie ma.
-# RDNA4 liczy te ksztalty przenosnymi wariantami `dot4`.
 SCOPE_MARKER = "# arch:"
 
 

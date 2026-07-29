@@ -501,13 +501,37 @@
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_fb926ec38df7e9c4",
       "file": "gemm_nvfp4_gguf_out_f32_b8.hsaco"
     },
+    "gemm_nvfp4_gguf_wmma_f16_bm256": {
+      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_b66c9b7bd78a67cf",
+      "file": "gemm_nvfp4_gguf_wmma_f16_bm256.hsaco"
+    },
+    "gemm_nvfp4_gguf_wmma_f16_bm32": {
+      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_a98cd718ba6ba9b7",
+      "file": "gemm_nvfp4_gguf_wmma_f16_bm32.hsaco"
+    },
     "gemm_q2_k_tile_f16_bm32": {
       "entry": "src_gemm_q2_k_wmma_gemm_q2_k_t6A6A6A6A_0092bb2bc02e8c9c",
       "file": "gemm_q2_k_tile_f16_bm32.hsaco"
     },
+    "gemm_q2_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q2_k_wmma_gemm_q2_k_w6A6A6A6A_49f679acd5a6c2e1",
+      "file": "gemm_q2_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q2_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q2_k_wmma_gemm_q2_k_w6A6A6A6A_06bf15e16ed3dd19",
+      "file": "gemm_q2_k_wmma_f16_bm32.hsaco"
+    },
     "gemm_q3_k_tile_f16_bm32": {
       "entry": "src_gemm_q3_k_wmma_gemm_q3_k_t6A6A6A6A_845f130629c43ebe",
       "file": "gemm_q3_k_tile_f16_bm32.hsaco"
+    },
+    "gemm_q3_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q3_k_wmma_gemm_q3_k_w6A6A6A6A_622e37ed1a996be5",
+      "file": "gemm_q3_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q3_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q3_k_wmma_gemm_q3_k_w6A6A6A6A_e382e0d985a56925",
+      "file": "gemm_q3_k_wmma_f16_bm32.hsaco"
     },
     "gemm_q4_0_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q4_0_dot4_im6A6A6A6A_8cd8233be13cc619",
@@ -529,9 +553,25 @@
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_a3bbbd6df661262d",
       "file": "gemm_q4_0_tile_f16_bm32.hsaco"
     },
+    "gemm_q4_0_wmma_f16_bm256": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_d268d38f98517238",
+      "file": "gemm_q4_0_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q4_0_wmma_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_7f7a2633376d6274",
+      "file": "gemm_q4_0_wmma_f16_bm32.hsaco"
+    },
     "gemm_q4_1_tile_f16_bm32": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_59594c0fb36a14c8",
       "file": "gemm_q4_1_tile_f16_bm32.hsaco"
+    },
+    "gemm_q4_1_wmma_f16_bm256": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_78f5557ea9e765b9",
+      "file": "gemm_q4_1_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q4_1_wmma_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_8f7a5a0c4260fc74",
+      "file": "gemm_q4_1_wmma_f16_bm32.hsaco"
     },
     "gemm_q4_k_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_62a1a8428b04ff79",
@@ -549,21 +589,61 @@
       "entry": "src_gemm_dot_gemm_q4_k_dot4_im6A6A6A6A_3bc4497d970ac7f4",
       "file": "gemm_q4_k_dot4_out_f32_64x64.hsaco"
     },
+    "gemm_q4_k_i8wmma_f16_bm256": {
+      "entry": "src_gemm_q4_k_i8wmma_gemm_q4_k6A6A6A6A_203f24058ac963cf",
+      "file": "gemm_q4_k_i8wmma_f16_bm256.hsaco"
+    },
+    "gemm_q4_k_i8wmma_f16_bm32": {
+      "entry": "src_gemm_q4_k_i8wmma_gemm_q4_k6A6A6A6A_f2073ed661813f45",
+      "file": "gemm_q4_k_i8wmma_f16_bm32.hsaco"
+    },
     "gemm_q4_k_tile_f16_bm32": {
       "entry": "src_gemm_q4_k_wmma_gemm_q4_k_t6A6A6A6A_1523d1f2426d906d",
       "file": "gemm_q4_k_tile_f16_bm32.hsaco"
+    },
+    "gemm_q4_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_6ffb3bf18966c422",
+      "file": "gemm_q4_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q4_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_eb34b3ede551428b",
+      "file": "gemm_q4_k_wmma_f16_bm32.hsaco"
     },
     "gemm_q5_0_tile_f16_bm32": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_4bd3423a869b7220",
       "file": "gemm_q5_0_tile_f16_bm32.hsaco"
     },
+    "gemm_q5_0_wmma_f16_bm256": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_a0b33d1a172bcf3b",
+      "file": "gemm_q5_0_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q5_0_wmma_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_a2ec6baf36d94856",
+      "file": "gemm_q5_0_wmma_f16_bm32.hsaco"
+    },
     "gemm_q5_1_tile_f16_bm32": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_95029dbd5061e79c",
       "file": "gemm_q5_1_tile_f16_bm32.hsaco"
     },
+    "gemm_q5_1_wmma_f16_bm256": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_0e56fdcddab62fd3",
+      "file": "gemm_q5_1_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q5_1_wmma_f16_bm32": {
+      "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_27331902ff6b0032",
+      "file": "gemm_q5_1_wmma_f16_bm32.hsaco"
+    },
     "gemm_q5_k_tile_f16_bm32": {
       "entry": "src_gemm_q5_k_wmma_gemm_q5_k_t6A6A6A6A_7f8bd20a8ff89c2b",
       "file": "gemm_q5_k_tile_f16_bm32.hsaco"
+    },
+    "gemm_q5_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q5_k_wmma_gemm_q5_k_w6A6A6A6A_1fd58864a3d63d75",
+      "file": "gemm_q5_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q5_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q5_k_wmma_gemm_q5_k_w6A6A6A6A_8375b7c4cd9e6ea8",
+      "file": "gemm_q5_k_wmma_f16_bm32.hsaco"
     },
     "gemm_q6_k_dot4_128x64": {
       "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_688a2591e2b7b919",
@@ -652,6 +732,26 @@
     "gemm_q8_0_i8mma_out_f32_b4": {
       "entry": "src_q8_0_batch_gemm_q8_0_small6A6A6A6A_f5274eaa252bfe2e",
       "file": "gemm_q8_0_i8mma_out_f32_b4.hsaco"
+    },
+    "gemm_q8_0_wmma_16x64": {
+      "entry": "src_gemm_wmma_gemm_q8_0_wmma_i6A6A6A6A_501c28d00aba99e7",
+      "file": "gemm_q8_0_wmma_16x64.hsaco"
+    },
+    "gemm_q8_0_wmma_64x128": {
+      "entry": "src_gemm_wmma_gemm_q8_0_wmma_i6A6A6A6A_e70bd94465bbcfd6",
+      "file": "gemm_q8_0_wmma_64x128.hsaco"
+    },
+    "gemm_q8_0_wmma_out_f32_16x64": {
+      "entry": "src_gemm_wmma_gemm_q8_0_wmma_i6A6A6A6A_e140d028c0eb7eeb",
+      "file": "gemm_q8_0_wmma_out_f32_16x64.hsaco"
+    },
+    "gemm_q8_0_wmma_out_f32_64x128": {
+      "entry": "src_gemm_wmma_gemm_q8_0_wmma_i6A6A6A6A_bd7525c2abdb82aa",
+      "file": "gemm_q8_0_wmma_out_f32_64x128.hsaco"
+    },
+    "gemm_q8_0_wmma_triplet_bm64": {
+      "entry": "src_gemm_wmma_gemm_q8_0_wmma_t6A6A6A6A_02815c252779f5ab",
+      "file": "gemm_q8_0_wmma_triplet_bm64.hsaco"
     },
     "gemv_batch_f16_out_f32_b4": {
       "entry": "src_nvfp4_batch_gemv_batch_f166A6A6A6A_fe2ad2e9bb43fde0",

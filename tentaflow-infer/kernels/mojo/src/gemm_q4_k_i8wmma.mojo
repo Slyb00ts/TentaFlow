@@ -22,7 +22,7 @@ from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
 
-from src.arch_wmma import wmma_i8_16x16x16
+from src.arch_wmma import wmma_i8_16x16x16, wmma_acc_row
 from src.gemv2 import _q4k_scale_min
 
 comptime TILE = 16
@@ -142,7 +142,7 @@ def gemm_q4_k_i8wmma_impl[
         )
         comptime for mt in range(MTILE):
             comptime for i in range(8):
-                var m = base_m + mt * TILE + i * 2 + lane // 16
+                var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                 if m > n_tokens - 1:
                     m = n_tokens - 1
                 act_d[mt][i] = xd[b * n_tokens + m]
@@ -185,7 +185,7 @@ def gemm_q4_k_i8wmma_impl[
     comptime for mt in range(MTILE):
         comptime for nt in range(NTILE):
             comptime for i in range(8):
-                var m = base_m + mt * TILE + i * 2 + lane // 16
+                var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                 var n = base_n + nt * TILE + lane % 16
                 if m < n_tokens and n < n_rows:
                     y[m * n_rows + n] = Float16(acc[mt * NTILE + nt][i])

@@ -27,10 +27,11 @@
 # skalowana i dodawana do akumulatora f32. Identycznie jak w MMQ i w wariancie
 # dot4, więc wyniki obu ścieżek są porównywalne co do zaokrągleń.
 
+from std.sys.info import _accelerator_arch
 from std.gpu import block_idx, thread_idx
 from std.memory import bitcast
 
-from src.arch_wmma import wmma_i8_16x16x16
+from src.arch_wmma import wmma_i8_16x16x16, wmma_acc_row
 
 comptime TILE = 16  # bok kafla WMMA
 comptime QK = 32  # kolumny w bloku kwantyzacji Q8_0
@@ -41,13 +42,25 @@ comptime QBYTES = 34  # 2 bajty skali f16 + 32 kody int8
 def _row_frag_i8(
     src: UnsafePointer[Int8, MutAnyOrigin], offset: Int
 ) -> SIMD[DType.int32, 4]:
-    """Szesnaście kolejnych bajtów jako fragment WMMA jednej linii.
+    """Fragment WMMA jednej linii, w rozmiarze, jakiego zada karta.
 
-    Payload bloku Q8_0 zaczyna się dwa bajty za początkiem bloku, więc odczyt
-    jest NIEWYRÓWNANY — stąd jawne `alignment=1`.
+    RDNA3 wymaga CALEGO wiersza szesnastu bajtow na linie i dubluje go miedzy
+    polowami fali. RDNA4 dublowanie usunelo: linia niesie osiem bajtow, te ktore
+    wskazuje numer polowy fali. Czytanie tam pelnych szesnastu i odrzucanie
+    polowy kosztowalo ZMIERZONE 13% prefillu Q8_0 (2047 -> 1777 tok/s), wiec
+    rozmiar odczytu idzie za architektura, a nie za najszerszym wariantem.
+
+    Payload bloku Q8_0 zaczyna sie dwa bajty za poczatkiem bloku, wiec odczyt
+    jest NIEWYROWNANY — stad jawne `alignment=1`.
     """
-    var raw = (src + offset).load[width=16, alignment=1]()
-    return bitcast[DType.int32, 4](raw)
+    comptime if _accelerator_arch().startswith("amdgpu:gfx12"):
+        var half = Int(thread_idx.x) % 32 // 16
+        var raw = (src + offset + half * 8).load[width=8, alignment=1]()
+        var lo = bitcast[DType.int32, 2](raw)
+        return SIMD[DType.int32, 4](lo[0], lo[1], 0, 0)
+    else:
+        var raw = (src + offset).load[width=16, alignment=1]()
+        return bitcast[DType.int32, 4](raw)
 
 
 @always_inline
@@ -110,11 +123,11 @@ def _wmma_q8_tile[
             )
             comptime for mt in range(MTILE):
                 var block_acc = SIMD[DType.int32, 8](0)
-                block_acc = wmma_i8_16x16x16(a_lo[mt], b_lo, block_acc)
-                block_acc = wmma_i8_16x16x16(a_hi[mt], b_hi, block_acc)
+                block_acc = wmma_i8_16x16x16[preselected=True](a_lo[mt], b_lo, block_acc)
+                block_acc = wmma_i8_16x16x16[preselected=True](a_hi[mt], b_hi, block_acc)
                 comptime for i in range(8):
                     # (m, n) tego pola: m = i*2 + lane//16, n = lane % 16.
-                    var m = base_m + mt * TILE + i * 2 + lane // 16
+                    var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                     if m > n_tokens - 1:
                         m = n_tokens - 1
                     acc[mt * NTILE + nt][i] += (
@@ -124,7 +137,7 @@ def _wmma_q8_tile[
     comptime for mt in range(MTILE):
         comptime for nt in range(NTILE):
             comptime for i in range(8):
-                var m = base_m + mt * TILE + i * 2 + lane // 16
+                var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                 var n = base_n + nt * TILE + lane % 16
                 if m < n_tokens and n < n_rows:
                     y[m * n_rows + n] = acc[mt * NTILE + nt][i].cast[OUT]()

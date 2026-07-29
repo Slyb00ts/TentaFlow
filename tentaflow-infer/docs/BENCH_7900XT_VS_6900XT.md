@@ -432,3 +432,46 @@ sciezka NVFP4. Automat wybiera 1024.
 
 Wyjscie identyczne co do bajtu z referencja token-po-tokenie. Q4_K jest teraz na
 86% wyniku NVFP4 zamiast 3%.
+
+## RDNA4 (Radeon AI PRO R9700, gfx1201) — jednostka macierzowa
+
+Mojo nie umie wygenerowac WMMA dla gfx12: `Cannot select: intrinsic
+llvm.amdgcn.wmma.f32.16x16x16.f16`. Powod jest konkretny — RDNA4 ma WLASNE
+warianty tych intrinsikow, o polowe mniejsze fragmenty na linie:
+
+| operand | RDNA3 (gfx11) | RDNA4 (gfx12) |
+|---|---|---|
+| A/B f16 | `v16f16` (caly wiersz, dublowany miedzy polowami fali) | `v8f16` |
+| A/B iu8 | `v4i32` | `v2i32` |
+| akumulator | `v8f32` | `v8f32`, ale INNY uklad |
+
+Uklad akumulatora zmierzylem sonda na karcie, a nie przyjalem z dokumentacji:
+RDNA3 przeplata wiersze co drugi (`i*2 + polowa fali`), RDNA4 daje kazdej
+polowie fali osiem KOLEJNYCH wierszy (`8*polowa + i`); kolumna w obu to
+`lane % 16`. Pierwsza wersja zakladala uklad RDNA3 i test zloty pokazal blad
+wzgledny 42 — stad sonda zamiast kolejnego zgadywania. Roznica siedzi teraz w
+`arch_wmma.mojo` (`wmma_acc_row`), a kernele jej nie widza.
+
+Wszystkie testy zlote AMD przechodza na gfx1201 z bledem na poziomie
+kwantyzacji (4,8e-4 dla Q8_0, ulamek jednostki dla Q2_K–Q5_K).
+
+**Wynik jest MIESZANY i to jest istotne** (Bielik 7B, prompt 2048, jedna R9700):
+
+| format | prefill bez WMMA | prefill z WMMA | zmiana |
+|---|---|---|---|
+| Q4_K_M | 1575 tok/s | **2279 tok/s** | **+45%** |
+| Q8_0 | 2047 tok/s | 1838 tok/s | **-10%** |
+
+Dla Q8_0 przenosna sciezka `dot4` na RDNA4 jest wiec SZYBSZA od jednostki
+macierzowej. Czesc straty zabralo czytanie fragmentow: kernel ladowal 16 bajtow
+na linie (wymog RDNA3), z czego RDNA4 potrzebuje 8 — po zejsciu do 8 bajtow
+(`_row_frag_i8`, parametr `preselected` prymitywu) Q8_0 wrocilo z 1777 do 1838
+tok/s, ale nie do 2047.
+
+Nastepny krok jest wiec dispatch, nie kolejny kernel: wybor sciezki dla Q8_0 na
+gfx12 musi isc za POMIAREM, tak jak juz idzie wybor ukladu NVFP4. Do tego czasu
+Q8_0 prefill jest o 10% wolniejszy niz przed wlaczeniem WMMA — swiadomie
+zapisane, bo Q4_K zyskalo w tym samym ruchu 45%.
+
+Decode nie zmienil sie w zadnym z formatow (65,0 i 89,0 tok/s): to sciezka
+GEMV, ktorej jednostka macierzowa nie dotyka.
