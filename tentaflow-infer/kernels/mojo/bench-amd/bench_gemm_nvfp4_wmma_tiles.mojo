@@ -169,6 +169,52 @@ def shape(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int) raises:
           "|", Int(s_8fal_N4 * 1e6), "us =",
           Int(flops / s_8fal_N4 / 1e12), "TFLOPS")
 
+    # BM=512: calkowity koszt dekwantyzacji skaluje sie jak 1/BM, bo wagi
+    # rozpakowuja sie RAZ NA BLOK do LDS. Dwa ulozenia fal o tym samym BM.
+    comptime BM_M8 = 512
+    comptime BN_M8 = 64
+    var t_M8: Int = 0
+    for i in range(WARMUP + ITERS):
+        if i == WARMUP:
+            ctx.synchronize()
+            t_M8 = perf_counter_ns()
+        ctx.enqueue_function[gemm_nvfp4_gguf_wmma_impl[4, 2, 8, 2]](
+            y.unsafe_ptr(), w.unsafe_ptr(), x.unsafe_ptr(),
+            n_cols, n_rows, n_tokens, Float32(1.0),
+            grid_dim=(
+                (n_rows + BN_M8 - 1) // BN_M8,
+                (n_tokens + BM_M8 - 1) // BM_M8,
+            ),
+            block_dim=256,
+        )
+    ctx.synchronize()
+    s_M8 = Float64(perf_counter_ns() - t_M8) / 1e9 / Float64(ITERS)
+    print("    8fal-M8N2  BM", BM_M8, "BN", BN_M8,
+          "|", Int(s_M8 * 1e6), "us =",
+          Int(flops / s_M8 / 1e12), "TFLOPS")
+
+    comptime BM_W8 = 512
+    comptime BN_W8 = 64
+    var t_W8: Int = 0
+    for i in range(WARMUP + ITERS):
+        if i == WARMUP:
+            ctx.synchronize()
+            t_W8 = perf_counter_ns()
+        ctx.enqueue_function[gemm_nvfp4_gguf_wmma_impl[8, 2, 4, 2]](
+            y.unsafe_ptr(), w.unsafe_ptr(), x.unsafe_ptr(),
+            n_cols, n_rows, n_tokens, Float32(1.0),
+            grid_dim=(
+                (n_rows + BN_W8 - 1) // BN_W8,
+                (n_tokens + BM_W8 - 1) // BM_W8,
+            ),
+            block_dim=512,
+        )
+    ctx.synchronize()
+    s_W8 = Float64(perf_counter_ns() - t_W8) / 1e9 / Float64(ITERS)
+    print("    16fal-M4N2 BM", BM_W8, "BN", BN_W8,
+          "|", Int(s_W8 * 1e6), "us =",
+          Int(flops / s_W8 / 1e12), "TFLOPS")
+
 
 def main() raises:
     seed(20260727)

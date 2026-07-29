@@ -158,5 +158,15 @@ def gemm_nvfp4_gguf_wmma_impl[
 #  - BM32/BN64 dla krotkich chunkow, gdzie duzy kafel nie ma czym wypelnic fal.
 # Wariant BN32 z rodziny `mma` NIE ma tu odpowiednika: powstal ze strojenia pod
 # NVIDIE i nic go na tej karcie nie uzasadnia.
+#
+# BM=512 SPRAWDZONE I ODRZUCONE (2026-07-29). Rachunek mowil, ze powinno pomoc:
+# wagi rozpakowuja sie raz na blok, wiec calkowity koszt dekwantyzacji skaluje
+# sie jak 1/BM. Pomiar mowi inaczej:
+#   [4,2,8,2] BM512 na osmiu falach: 14/13/16 TFLOPS — MTILE=8 to szesnascie
+#     akumulatorow po 8 VGPR na fale, rejestry sie nie mieszcza,
+#   [8,2,4,2] BM512 na szesnastu falach: 48/47/48 TFLOPS — mieszcza sie, ale
+#     polowa blokow to za malo rownoleglosci i wychodzi PONIZEJ BM256.
+# Przy BM256 dekwantyzacja nie jest juz waskim gardlem, wiec jej dalsze
+# tanienie niczego nie kupuje. Nie powtarzac tej proby bez nowego argumentu.
 comptime gemm_nvfp4_gguf_wmma_f16_bm32 = gemm_nvfp4_gguf_wmma_impl[2, 2, 1, 2]
 comptime gemm_nvfp4_gguf_wmma_f16_bm256 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 2]
