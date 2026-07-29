@@ -84,10 +84,13 @@ fn main() {
     let peer = alloc(0, HIDDEN * 4);
     let sum = alloc(0, HIDDEN * 4);
 
-    let layer = |iters: usize| -> f64 {
+    // `ffn_only` pomija wymiane po bloku uwagi: uwage licza wtedy obie karty
+    // redundantnie, a dzielony jest tylko FFN. Polowa komunikacji za jedna
+    // trzecia zysku — wariant dla lacz, ktore nie udzwigna pelnego TP.
+    let layer = |iters: usize, ffn_only: bool| -> f64 {
         let started = Instant::now();
         for _ in 0..iters {
-            for stage in [&s_qkv, &s_gu] {
+            for (block, stage) in [&s_qkv, &s_gu].into_iter().enumerate() {
                 let (outs, src, cols) = if std::ptr::eq(stage, &s_qkv) {
                     (&out_qkv, &x, HIDDEN)
                 } else {
@@ -112,19 +115,23 @@ fn main() {
                     let e = cluster.device(d).unwrap();
                     e.kernels.gemv_q8_0_out_f32(&part[d], proj.shard(d).unwrap(), &input[d], rows, cols_in, &e.stream).unwrap();
                 }
-                // JEDNA wymiana + redukcja na koniec bloku.
-                cluster.exchange(1, &part[1], 0, 0, &peer, 0, HIDDEN * 4).unwrap();
-                cluster.wait_for(0, 1).unwrap();
-                let e0 = cluster.device(0).unwrap();
-                e0.kernels.add_f32(&sum, &part[0], &peer, HIDDEN, &e0.stream).unwrap();
+                // JEDNA wymiana + redukcja na koniec bloku. Przy `ffn_only`
+                // blok uwagi (block == 0) jej nie potrzebuje.
+                if !(ffn_only && block == 0) {
+                    cluster.exchange(1, &part[1], 0, 0, &peer, 0, HIDDEN * 4).unwrap();
+                    cluster.wait_for(0, 1).unwrap();
+                    let e0 = cluster.device(0).unwrap();
+                    e0.kernels.add_f32(&sum, &part[0], &peer, HIDDEN, &e0.stream).unwrap();
+                }
             }
             cluster.synchronize().unwrap();
         }
         started.elapsed().as_secs_f64() / iters as f64 * 1e6
     };
 
-    layer(5);
-    let tp_us = layer(100);
+    layer(5, false);
+    let tp_us = layer(100, false);
+    let ffn_us = layer(100, true);
 
     // Referencja: cala warstwa na mocniejszej karcie.
     let e1 = cluster.device(1).unwrap();
@@ -153,7 +160,10 @@ fn main() {
     single(5);
     let one_us = single(100);
 
-    println!("warstwa TP (2 karty): {tp_us:.1} us");
+    println!("warstwa TP pelny (2 wymiany): {tp_us:.1} us");
+    println!("warstwa TP tylko FFN (1 wymiana): {ffn_us:.1} us");
     println!("warstwa na samej 7900 XT: {one_us:.1} us");
-    println!("przyspieszenie: {:.2}x", one_us / tp_us);
+    println!("przyspieszenie pelny TP: {:.2}x", one_us / tp_us);
+    println!("przyspieszenie TP tylko FFN: {:.2}x", one_us / ffn_us);
+    println!("koszt jednej wymiany na warstwe: {:.1} us", tp_us - ffn_us);
 }

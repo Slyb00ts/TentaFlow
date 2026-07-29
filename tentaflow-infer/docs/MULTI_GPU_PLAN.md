@@ -137,6 +137,29 @@ Wybór nie jest konfiguracją: `topology::choose_technique` dostaje zmierzone
 techniki do najbardziej odpornej na słabe łącze. Prefill idzie osobną gałęzią,
 bo tam podział po tokenach bije podział po macierzach na wolnym łączu.
 
+## 2c. Zmierzone na pełnej warstwie (RX 6900 XT + RX 7900 XT)
+
+Kształty warstwy Bielika 7B, wagi Q8_0, dekodowanie jednego tokenu:
+
+| wariant | czas warstwy | przyspieszenie |
+|---|--:|--:|
+| sama 7900 XT | 291,6 us | 1,00x |
+| pełny TP (2 wymiany) | 245,3 us | 1,19x |
+| **TP tylko FFN (1 wymiana)** | **233,9 us** | **1,25x** |
+
+Sufit z sumy pasm (207 + 490 wobec 490 GB/s) to 1,42x.
+
+**TP tylko FFN jest tu SZYBSZY od pełnego TP.** To odwraca zwykłe założenie i
+wynika wprost z liczb: jedna zaoszczędzona wymiana to 11,3 us na warstwę — czyli
+dokładnie tyle, ile zmierzył `peer_probe` — a podział bloku uwagi wnosi mniej,
+bo uwaga to niewielka część warstwy w porównaniu z FFN. Wariant „pomiędzy" nie
+jest więc tylko ratunkiem dla wolnych łączy; na tej parze kart jest po prostu
+lepszym wyborem.
+
+Wniosek dla planera: `choose_technique` powinien porównywać zysk z podziału
+uwagi z kosztem wymiany, a nie zakładać, że pełny TP jest zawsze najlepszy tam,
+gdzie łącze go uniesie.
+
 ## 3. Serce projektu: model możliwości i zamknięta pętla
 
 Podział NIE jest stałą w konfiguracji. Każde urządzenie ma profil:
