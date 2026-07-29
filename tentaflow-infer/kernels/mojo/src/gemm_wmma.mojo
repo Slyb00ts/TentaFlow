@@ -229,5 +229,10 @@ def gemm_q8_0_wmma_triplet_bm64(
 
 comptime gemm_q8_0_wmma_64x128 = gemm_q8_0_wmma_impl[2, 2, 2, 4, DType.float16]
 comptime gemm_q8_0_wmma_out_f32_64x128 = gemm_q8_0_wmma_impl[2, 2, 2, 4, DType.float32]
+# BM=128: kafel dla WYSOKICH macierzy (gate/up, rows=11264). Ruch wag to
+# `(T/BM) * rows * cols` bajtow, wiec podwojenie BM POLOWI ponowne czytanie wag —
+# przy 49 MB wag gate/up to ono, a nie moc obliczeniowa, decydowalo o przegranej
+# kafla BM=64 z `dot4` (27 wobec 37 TOPS na R9700).
+comptime gemm_q8_0_wmma_128x128 = gemm_q8_0_wmma_impl[4, 2, 2, 4, DType.float16]
 comptime gemm_q8_0_wmma_16x64 = gemm_q8_0_wmma_impl[1, 4, 1, 1, DType.float16]
 comptime gemm_q8_0_wmma_out_f32_16x64 = gemm_q8_0_wmma_impl[1, 4, 1, 1, DType.float32]

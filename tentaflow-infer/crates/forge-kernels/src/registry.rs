@@ -1683,6 +1683,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gemm_q8_0_i8mma_b8",
     "gemm_q8_0_i8mma_out_f32_b3",
     "gemm_q8_0_i8mma_out_f32_b4",
+    "gemm_q8_0_wmma_128x128",
     "gemm_q8_0_wmma_16x64",
     "gemm_q8_0_wmma_64x128",
     "gemm_q8_0_wmma_out_f32_16x64",

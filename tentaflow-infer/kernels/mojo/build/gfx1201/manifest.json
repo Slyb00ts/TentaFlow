@@ -733,6 +733,10 @@
       "entry": "src_q8_0_batch_gemm_q8_0_small6A6A6A6A_f5274eaa252bfe2e",
       "file": "gemm_q8_0_i8mma_out_f32_b4.hsaco"
     },
+    "gemm_q8_0_wmma_128x128": {
+      "entry": "src_gemm_wmma_gemm_q8_0_wmma_i6A6A6A6A_a3a6c433255f0278",
+      "file": "gemm_q8_0_wmma_128x128.hsaco"
+    },
     "gemm_q8_0_wmma_16x64": {
       "entry": "src_gemm_wmma_gemm_q8_0_wmma_i6A6A6A6A_501c28d00aba99e7",
       "file": "gemm_q8_0_wmma_16x64.hsaco"

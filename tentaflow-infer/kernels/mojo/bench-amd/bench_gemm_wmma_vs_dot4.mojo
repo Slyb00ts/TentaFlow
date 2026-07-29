@@ -9,7 +9,7 @@ from std.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 
 from src.gemm_dot import gemm_q8_0_dot4_128x128
-from src.gemm_wmma import gemm_q8_0_wmma_16x64, gemm_q8_0_wmma_64x128
+from src.gemm_wmma import gemm_q8_0_wmma_16x64, gemm_q8_0_wmma_64x128, gemm_q8_0_wmma_128x128
 
 comptime QBYTES = 34
 comptime WARMUP = 3
@@ -55,6 +55,19 @@ def run(ctx: DeviceContext, n_tokens: Int, n_rows: Int, n_cols: Int) raises:
     ctx.synchronize()
     small_s = Float64(perf_counter_ns() - t2) / 1e9 / Float64(ITERS)
 
+    var t3: Int = 0
+    for i in range(WARMUP + ITERS):
+        if i == WARMUP:
+            ctx.synchronize()
+            t3 = perf_counter_ns()
+        ctx.enqueue_function[gemm_q8_0_wmma_128x128](
+            yd.unsafe_ptr(), wd.unsafe_ptr(), xqd.unsafe_ptr(), xdd.unsafe_ptr(),
+            xsm.unsafe_ptr(), n_cols, n_rows, n_tokens,
+            grid_dim=((n_rows + 127) // 128, (n_tokens + 127) // 128), block_dim=256,
+        )
+    ctx.synchronize()
+    tall_s = Float64(perf_counter_ns() - t3) / 1e9 / Float64(ITERS)
+
     # Kafel dot4 128x128: TM=8, TN=4, KB=2, blok (128/8)*(128/4) = 512 wątków.
     dg_x = (n_rows + 127) // 128
     dg_y = (n_tokens + 127) // 128
@@ -76,6 +89,7 @@ def run(ctx: DeviceContext, n_tokens: Int, n_rows: Int, n_cols: Int) raises:
     print(
         "T=", n_tokens, "rows=", n_rows, "cols=", n_cols,
         "| wmma 64x128", Int(ops / big_s / 1e12),
+        "| wmma 128x128", Int(ops / tall_s / 1e12),
         "| wmma 16x64", Int(ops / small_s / 1e12),
         "| dot4", Int(ops / dot_s / 1e12), "TOPS",
         "| najlepszy wmma / dot4", Int(dot_s / best * 100.0), "%",
@@ -84,9 +98,13 @@ def run(ctx: DeviceContext, n_tokens: Int, n_rows: Int, n_cols: Int) raises:
 
 def main() raises:
     var ctx = DeviceContext()
-    # Kształty projekcji z realnych modeli: 7B (4096) i mniejszy hybrydowy (1024).
-    run(ctx, 128, 4096, 4096)
-    run(ctx, 512, 4096, 4096)
+    # DOKLADNIE te ksztalty, ktore silnik wysyla w prefillu Bielika 7B przy
+    # chunku T=1024 (odczytane z FORGE_TRACE_ROUTE), a nie ksztalty przykladowe:
+    #   q/o    rows=4096  cols=4096
+    #   k/v    rows=1024  cols=4096
+    #   gate/up rows=11264 cols=4096
+    #   down   rows=4096  cols=11264
     run(ctx, 1024, 4096, 4096)
-    run(ctx, 1024, 1024, 1024)
-    run(ctx, 2048, 4096, 4096)
+    run(ctx, 1024, 1024, 4096)
+    run(ctx, 1024, 11264, 4096)
+    run(ctx, 1024, 4096, 11264)

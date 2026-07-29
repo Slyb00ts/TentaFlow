@@ -9539,14 +9539,43 @@ impl Kernels {
         // Obecność artefaktów jest jednocześnie testem architektury: zasięg
         // `amd:gfx11+` wpuszcza je wyłącznie do katalogów RDNA3 i nowszych.
         //
-        // NA RDNA4 TEN POMIAR SIĘ ODWRACA. Zmierzone na Radeon AI PRO R9700,
-        // Bielik 7B Q8_0, prompt 2048: kafel dot daje 2047 tok/s, a WMMA 1838 —
-        // przewaga jednostki macierzowej z RDNA3 tam nie występuje, bo RDNA4
-        // przywróciło pełną przepustowość instrukcji dot. Dla Q4_K jest
-        // odwrotnie (WMMA 2279 wobec 1575), więc wybór musi być per rodzina
-        // ORAZ per architektura, a nie „jest artefakt, to bierzemy".
+        // NA RDNA4 PRÓG MIĘDZY KAFLAMI JEST INNY. Zmierzone na Radeon AI PRO
+        // R9700 (`bench_gemm_wmma_vs_dot4`, rows=cols=4096, TOPS):
+        //
+        //   T=512   wmma 64x128 45 | wmma 16x64 20 | dot4 31
+        //   T=1024  wmma 64x128 48 | wmma 16x64 18 | dot4 34
+        //   T=2048  wmma 64x128 42 | wmma 16x64 21 | dot4 39
+        //
+        // Kafel BM=64 przegrywał z dot4 na WYSOKICH macierzach (gate/up,
+        // rows=11264): ruch wag to `(T/BM) * rows * cols` bajtów, więc mniejsze
+        // BM znaczy dwa razy więcej ponownych odczytów 49 MB wag. Kafel BM=128
+        // to naprawia i wygrywa na KAŻDYM zmierzonym kształcie prefillu
+        // Bielika 7B (T=1024, TOPS na R9700):
+        //
+        //   rows=4096  cols=4096  : 128x128 42 | 64x128 39 | dot4 29
+        //   rows=1024  cols=4096  : 128x128 30 | 64x128 29 | dot4 26
+        //   rows=11264 cols=4096  : 128x128 48 | 64x128 27 | dot4 39
+        //   rows=4096  cols=11264 : 128x128 53 | 64x128 45 | dot4 44
+        //
+        // Próg jest na KSZTAŁCIE, nie na modelu — ale kształty bierze się z
+        // modelu, więc geometria spoza zmierzonego zakresu wymaga własnego
+        // pomiaru, a nie założenia, że „już dobrane".
         let rdna4 = self.device.caps().arch.starts_with("gfx12");
-        if family == "q8_0" && !rdna4 && self.artifacts.has("gemm_q8_0_wmma_64x128") {
+        let tall_tile = rdna4
+            && n_tokens >= 128
+            && rows >= 1024
+            && self.artifacts.has("gemm_q8_0_wmma_128x128");
+        let big_tile = n_tokens >= 512 && rows >= 2048;
+        if family == "q8_0" && tall_tile {
+            if output_f32 {
+                return Some(DotTile::new("gemm_q8_0_wmma_out_f32_16x64", 16, 64, 1, 8));
+            }
+            return Some(DotTile::new("gemm_q8_0_wmma_128x128", 128, 128, 8, 8));
+        }
+        if family == "q8_0"
+            && (!rdna4 || big_tile)
+            && self.artifacts.has("gemm_q8_0_wmma_64x128")
+        {
             // Kafel 16x64 (BM=16, BN=64, 128 wątków) wobec 64x128 (BM=64,
             // BN=128, 128 wątków). Próg z pomiaru A/B na 7900 XT: duży kafel ma
             // lepsze reużycie danych, ale przy krótkim prompcie albo wąskiej
@@ -9554,7 +9583,7 @@ impl Kernels {
             if output_f32 {
                 return Some(DotTile::new("gemm_q8_0_wmma_out_f32_16x64", 16, 64, 1, 8));
             }
-            return Some(if n_tokens >= 512 && rows >= 2048 {
+            return Some(if big_tile {
                 DotTile::new("gemm_q8_0_wmma_64x128", 64, 128, 8, 8)
             } else {
                 DotTile::new("gemm_q8_0_wmma_16x64", 16, 64, 1, 8)
