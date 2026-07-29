@@ -49,8 +49,6 @@ extern "C" {
     fn hipFree(ptr: *mut c_void) -> c_int;
     fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
     fn hipHostFree(ptr: *mut c_void) -> c_int;
-    fn hipMemcpyHtoD(dst: *mut c_void, src: *const c_void, size: usize) -> c_int;
-    fn hipMemcpyDtoH(dst: *mut c_void, src: *const c_void, size: usize) -> c_int;
     /// Kierunek rozpoznawany z adresow (UVA) — jedyny wariant poprawny, gdy
     /// jednym z buforow jest przypieta pamiec hosta.
     fn hipMemcpyAsync(
@@ -149,6 +147,11 @@ fn cstr_field(bytes: &[c_char]) -> String {
 pub struct HipDevice {
     caps: DeviceCaps,
     ordinal: c_int,
+    /// Wlasny strumien kopii host<->GPU. `hipMemcpyHtoD`/`DtoH` chodza po
+    /// strumieniu domyslnym, a ten koliduje z trwajacym przechwytywaniem grafu
+    /// na innym strumieniu (kod 906). Kopie ida wiec po strumieniu jawnym,
+    /// zsynchronizowanym od razu — z zewnatrz nadal sa synchroniczne.
+    transfer: HipStream,
     weights: Arc<HipPool>,
     kv_cache: Arc<HipPool>,
     activations: Arc<HipPool>,
@@ -238,9 +241,16 @@ impl HipDevice {
             pools.activations,
             PoolArena::Ring(RingArena::new(pools.activations)),
         )?;
+        let mut transfer_raw: HipStreamRaw = std::ptr::null_mut();
+        check(
+            unsafe { hipStreamCreateWithFlags(&mut transfer_raw, HIP_STREAM_NON_BLOCKING) },
+            "hipStreamCreateWithFlags transfer",
+        )?;
+        let transfer = HipStream(transfer_raw);
         Ok(Arc::new(Self {
             caps,
             ordinal,
+            transfer,
             weights,
             kv_cache,
             activations,
@@ -775,13 +785,19 @@ impl Device for HipDevice {
         self.bind()?;
         check(
             unsafe {
-                hipMemcpyHtoD(
+                hipMemcpyAsync(
                     target.ptr.add(dst_offset),
                     src.as_ptr() as *const c_void,
                     src.len(),
+                    HIP_MEMCPY_DEFAULT,
+                    self.transfer.0,
                 )
             },
-            "hipMemcpyHtoD",
+            "hipMemcpyAsync HtoD",
+        )?;
+        check(
+            unsafe { hipStreamSynchronize(self.transfer.0) },
+            "hipStreamSynchronize transfer",
         )
     }
 
@@ -793,13 +809,19 @@ impl Device for HipDevice {
         self.bind()?;
         check(
             unsafe {
-                hipMemcpyDtoH(
+                hipMemcpyAsync(
                     dst.as_mut_ptr() as *mut c_void,
                     source.ptr.add(src_offset) as *const c_void,
                     dst.len(),
+                    HIP_MEMCPY_DEFAULT,
+                    self.transfer.0,
                 )
             },
-            "hipMemcpyDtoH",
+            "hipMemcpyAsync DtoH",
+        )?;
+        check(
+            unsafe { hipStreamSynchronize(self.transfer.0) },
+            "hipStreamSynchronize transfer",
         )
     }
 
