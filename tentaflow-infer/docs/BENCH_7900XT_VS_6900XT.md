@@ -475,3 +475,38 @@ zapisane, bo Q4_K zyskalo w tym samym ruchu 45%.
 
 Decode nie zmienil sie w zadnym z formatow (65,0 i 89,0 tok/s): to sciezka
 GEMV, ktorej jednostka macierzowa nie dotyka.
+
+### Co jeszcze RDNA4 ma w jednostce macierzowej
+
+Sprawdzone kompilacja na karcie (gfx1201), instrukcja odczytana z wygenerowanego
+kodu, nie z dokumentacji:
+
+| operacja | instrukcja | status |
+|---|---|---|
+| f16 x f16 -> f32 | `v_wmma_f32_16x16x16_f16` | uzywane |
+| iu8 x iu8 -> i32 | `v_wmma_i32_16x16x16_iu8` | uzywane |
+| **fp8 (E4M3) -> f32** | `v_wmma_f32_16x16x16_fp8_fp8` | **dostepne, NIEUZYWANE** |
+| **bf8 (E5M2) -> f32** | `v_wmma_f32_16x16x16_bf8_bf8` | **dostepne, NIEUZYWANE** |
+| **iu4 x iu4 -> i32, K=32** | `v_wmma_i32_16x16x32_iu4` | **dostepne, NIEUZYWANE** |
+| bf16 | — | probowana sygnatura `v8bf16` sie nie lowerowala; nierozstrzygniete |
+
+Dwie z nich sa bezposrednio na scieżce, ktora juz mamy:
+
+**iu4 z K=32.** Wagi Q4_K i Q4_0 SA czterobitowe. Dzis rozpakowujemy je do int8 i
+liczymy `iu8`, czyli placimy i za rozpakowanie, i za polowe wykorzystania
+instrukcji. `v_wmma_i32_16x16x32_iu4` bierze dwa razy wiecej K na instrukcje i
+nie wymaga rozpakowania. Q4_K jest juz dzis naszym najszybszym prefillem
+(2279 tok/s) — to jest miejsce, gdzie moze isc wyraznie wyzej.
+
+**fp8.** `DeviceCaps.fp8_native` jest w `hip.rs` ZASZYTE NA `false` dla kazdej
+karty HIP, z komentarzem „RDNA4 dopiero wprowadza FP8, wykrycie dopiszemy razem
+z kernelami". Dlatego `forge` melduje przy starcie „auto fp8mod niedostepny dla
+urzadzenia" — nie dlatego, ze karta nie umie, tylko dlatego, ze nikt jej o to nie
+zapytal. Silnik ma juz cala sciezke modularnego prefillu FP8 (`build_fp8_ffn`,
+`fp8mod-ffn`), zbudowana pod NVIDIE.
+
+Kolejnosc, ktora te pomiary wyznaczaja:
+1. dispatch Q8_0 na gfx12 wedlug pomiaru (odzyskac 10%, patrz wyzej),
+2. `iu4` dla Q4_K/Q4_0 — najwiekszy zysk na formacie, ktorego uzywamy najczesciej,
+3. FP8: wykrycie w HAL + kernele gfx12, dopiero razem — samo odblokowanie flagi
+   wlaczyloby sciezke bez artefaktow dla tej architektury.
