@@ -18,9 +18,16 @@ Połączenie (zmierzone `hipMemcpyPeer`, obie strony):
 | pomiar | wartość |
 |---|--:|
 | P2P dostępne | TAK, dwukierunkowo |
-| pasmo strumieniowe | 14,2 GB/s |
-| kopia 10 KiB w strumieniu | **6,45 us** |
-| wymiana 10 KiB + synchronizacja hosta obu strumieni | **35,2 us** |
+| pasmo strumieniowe (64 MiB) | 14,2 GB/s |
+| kopia 10 KiB w strumieniu | 6,63 us |
+| **wymiana 10 KiB + synchronizacja na zdarzeniu urządzenia** | **11,21 us** |
+| wymiana 10 KiB + synchronizacja hosta obu strumieni | 35,2 us |
+
+Liczby z 2026-07-29 pochodzą już z PRODUKCYJNEJ ścieżki HAL
+(`crates/forge-cli/examples/peer_probe.rs`), a nie ze spike'u obok silnika —
+`Device::enable_peer_access` otwiera P2P, `copy` idzie przez `hipMemcpyAsync`
+z adresowaniem współdzielonym, a `record_event`/`wait_event` synchronizują
+strumienie DWÓCH RÓŻNYCH kart bez powrotu do hosta.
 
 ### Wniosek, który przesądza o architekturze
 
@@ -67,7 +74,12 @@ pierwszą**, a PP dokładamy dla modeli, które nie mieszczą się na jednej kar
 27B, dekodowanie: 65 warstw x 2 punkty wymiany = 130 na token.
 
 - naiwnie (synchronizacja hosta): 130 x 35,2 us = **4,6 ms** wobec ~15 ms liczenia → 30% narzutu, **nie do przyjęcia**
-- na zdarzeniach urządzenia (bez powrotu do hosta): 130 x 6,45 us = **0,84 ms** → **5,4%**, akceptowalne
+- na zdarzeniach urządzenia (zmierzone): 130 x 11,21 us = **1,46 ms** → **9,7%**, akceptowalne
+
+Dla Bielika 7B (40 warstw, krok dekodowania ~10,8 ms) wychodzi 80 x 11,21 us =
+0,90 ms, czyli 8,3%. Oba przypadki mieszczą się w budżecie, ale margines jest
+mniejszy, niż zakładał pierwotny szacunek 6,45 us — dlatego liczy się teraz
+zmierzona wartość, nie sama kopia bez synchronizacji.
 
 **Warunek konieczny TP: synchronizacja przez zdarzenia HIP między strumieniami
 urządzeń, nigdy przez `hipStreamSynchronize` na hoście.** Bez tego cały zysk
@@ -116,7 +128,7 @@ mieści się z zapasem.
 
 | krok | zawartość | dlaczego w tej kolejności |
 |---|---|---|
-| **M1** ✅ częściowo | otwarcie N kart w jednym procesie **zweryfikowane**, kalibracja per karta działa. ZOSTAJE: kopia między urządzeniami i zdarzenia międzystrumieniowe w HAL | bez tego nie da się zrobić niczego |
+| **M1** ✅ | otwarcie N kart w jednym procesie, kalibracja per karta, P2P przez HAL, kopia między urządzeniami i synchronizacja na zdarzeniach — wszystko zmierzone | bez tego nie da się zrobić niczego |
 | **M2** ✅ | `DeviceCapability` + planer + kalibracja + pętla korekty, 10 testów | to jest odpowiedź na „nie jak najwolniejsza" |
 | **M3** | TP dla dekodowania: podział kolumnowy qkv/gate/up, wierszowy o/down, redukcja na zdarzeniach | pierwszy realny zysk przy jednym strumieniu |
 | **M4** | TP dla prefillu z WŁASNYM podziałem (inny stosunek mocy!) | prefill ma odwrotny stosunek kart |

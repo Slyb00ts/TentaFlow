@@ -451,6 +451,21 @@ pub trait Device: Send + Sync {
         stream: &Stream,
     ) -> Result<()>;
 
+    /// Otwiera bezpośredni dostęp do pamięci drugiej karty (P2P). Bez tego
+    /// kopia między urządzeniami idzie przez hosta i traci rząd wielkości.
+    /// Zwraca `Unsupported`, gdy backend albo para kart tego nie potrafi.
+    fn enable_peer_access(&self, _peer_ordinal: usize) -> Result<()> {
+        Err(ForgeError::Unsupported(
+            "ten backend nie obsługuje dostępu P2P".into(),
+        ))
+    }
+
+    /// Numer urządzenia w obrębie backendu — potrzebny, żeby wskazać partnera
+    /// przy otwieraniu P2P.
+    fn ordinal(&self) -> usize {
+        0
+    }
+
     /// Synchronous host→buffer staging write (init/load path, not hot path).
     fn write(&self, src: &[u8], dst: &DevBuffer, dst_offset: usize) -> Result<()>;
 

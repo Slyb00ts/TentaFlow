@@ -41,6 +41,8 @@ extern "C" {
     fn hipInit(flags: c_uint) -> c_int;
     fn hipGetDeviceCount(count: *mut c_int) -> c_int;
     fn hipSetDevice(device: c_int) -> c_int;
+    fn hipDeviceCanAccessPeer(can: *mut c_int, device: c_int, peer: c_int) -> c_int;
+    fn hipDeviceEnablePeerAccess(peer: c_int, flags: c_uint) -> c_int;
     fn hipDeviceSynchronize() -> c_int;
     fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
     fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
@@ -686,6 +688,40 @@ impl Device for HipDevice {
             "hipEventElapsedTime",
         )?;
         Ok(Some(ms))
+    }
+
+    fn ordinal(&self) -> usize {
+        self.ordinal as usize
+    }
+
+    /// Włącza P2P w kierunku `peer`. HIP zgłasza błąd przy powtórnym włączeniu
+    /// tej samej pary, więc traktujemy to jako sukces — stan docelowy jest ten
+    /// sam, a wołający nie musi śledzić, kto już otworzył dostęp.
+    fn enable_peer_access(&self, peer_ordinal: usize) -> Result<()> {
+        let peer = c_int::try_from(peer_ordinal)
+            .map_err(|_| ForgeError::Device("numer karty poza zakresem".into()))?;
+        if peer == self.ordinal {
+            return Ok(());
+        }
+        self.bind()?;
+        let mut can: c_int = 0;
+        check(
+            unsafe { hipDeviceCanAccessPeer(&mut can, self.ordinal, peer) },
+            "hipDeviceCanAccessPeer",
+        )?;
+        if can == 0 {
+            return Err(ForgeError::Unsupported(format!(
+                "karty {} i {peer} nie widzą swojej pamięci",
+                self.ordinal
+            )));
+        }
+        const ALREADY_ENABLED: c_int = 704;
+        let status = unsafe { hipDeviceEnablePeerAccess(peer, 0) };
+        if status == 0 || status == ALREADY_ENABLED {
+            Ok(())
+        } else {
+            check(status, "hipDeviceEnablePeerAccess")
+        }
     }
 
     fn copy(
