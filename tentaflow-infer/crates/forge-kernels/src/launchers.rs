@@ -1130,6 +1130,11 @@ fn nvfp4_gguf_dispatch(
         // powielamy tu strojenia NVIDII (sync1/prefetch/bn128) — te warianty
         // istnieją tylko w rodzinie `mma`, a ich odpowiedniki trzeba osobno
         // zmierzyć, zanim zaczną cokolwiek wybierać.
+        //
+        // Podział na BM32 i BM256 jest ZMIERZONY, nie domyślny: wymuszenie
+        // BM32 na prefillu 2048 tokenów Qwen3.6-27B NVFP4 dało 305,9 tok/s
+        // wobec 826,2 dla BM256. Duże BM amortyzuje dekwantyzację — każdy
+        // rozpakowany element wagi jest reużyty przez BM wierszy tokenów.
         17..=32 if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm32", 32, 64, Some(128)),
         _ if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm256", 256, 64, Some(256)),
         _ => {
