@@ -240,9 +240,38 @@ mieści się z zapasem.
   trafieniem — czyli RTX 4090 i RX 7900 XT w jednej maszynie były NIE DO
   zaadresowania równocześnie. To był cichy blokier dla par mieszanych.
 
-**Nie zrobione — i to jest większość pracy:**
+- **Klaster kart w jednym procesie** (`cluster.rs`): otwarte karty, ich strumienie
+  i zdarzenia, dostęp P2P otwarty między każdą parą. Wymiana 10 KiB ze zdarzeniem
+  **11,21 us**, przez hosta 35,2 us. Brak P2P nie jest błędem — jest wejściem dla
+  planera.
+- **Tensor parallel po wierszach** (`tensor_parallel.rs`): podział macierzy z
+  ZMIERZONEJ mocy kart, wynik zbierany na jednej karcie, zgodność bitowa z
+  przebiegiem jednokartowym. Zbiórka jest punkt-punkt, więc przy kilkunastu
+  kartach trzeba ją przerobić na drzewiastą.
+- **Pełna warstwa na dwóch kartach**: TP całej warstwy **1,19x**, TP samego FFN
+  **1,25x**. Technika „pomiędzy" wygrywa z pełnym TP na tym łączu — dokładnie to,
+  co przewidywała sekcja 2b.
+- **Pipeline parallel liczy token na wielu kartach.** `Model` przyjmuje zakres
+  warstw, etap nie-pierwszy pomija embedding (i skalowanie embeddingu rodziny
+  Gemma), a `prefill_stage` kończy na warstwach — bez głowy logitów. Granicą
+  etapu jest strumień rezydualny `pb.h` wystawiony przez `stage_hidden`;
+  następny etap normalizuje go po swojemu, więc przez łącze idzie wyłącznie
+  rezydual. Sprawdzone `pp_stage_probe` na podziale 2, 3, 4 i 5 etapów
+  (Bielik 7B, 40 warstw) oraz na 2 etapach Gemma 12B QAT i IT (48 warstw), na
+  RX 6900 XT + RX 7900 XT: **wybrany token zgadza się z jednokartowym**.
 
-M3-M6, czyli same techniki równoległości. Fundament stoi, ale żadna z nich nie
-liczy jeszcze ani jednego tokena na dwóch kartach naraz. Do TP brakuje w HAL
-kopii między urządzeniami i synchronizacji na zdarzeniach (bez niej, na
-synchronizacji hosta, narzut zjada 30% zysku — patrz sekcja 2).
+**Czego pipeline jeszcze nie robi:**
+
+- **Wynik nie jest bitowo zgodny**, tylko zgodny co do wyboru tokenu (max różnica
+  logitu 0,14 na Bieliku, 1,2 na Gemmie). Źródło jest znane: `rmsnorm_residual_f16`
+  liczy sumę kwadratów z NIEZAOKRĄGLONEJ sumy f32, a etap kolejny normalizuje już
+  zaokrągloną wartość f16 ze swojego bufora `h`. Różni się więc sam skalar `inv`.
+  Wyrównanie wymaga zaokrąglenia przed podniesieniem do kwadratu w tamtym kernelu,
+  co zmienia liczby także na jednej karcie — decyzja świadomie odłożona.
+- **Modele hybrydowe (Qwen3.6 z DeltaNet) nie są objęte.** `prefill_stage` je
+  wprost odrzuca: hybrydowy prefill ma osobną pętlę warstw i stan rekurencyjny,
+  którego granica etapu musi obejmować oprócz rezydualu.
+- **Nie ma sterownika produkcyjnego ani zysku prędkości.** Etapy przechodzą przez
+  hosta i wykonują się po kolei, więc druga karta czeka. Zysk daje dopiero
+  przepychanie mikrowsadów przez `cluster.exchange` i `wait_for`, które są gotowe
+  i zmierzone.

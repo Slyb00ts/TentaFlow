@@ -7,6 +7,9 @@ license.workspace = true
 
 [features]
 test-hooks = []
+# Backend AMD. Bez tego testy i przyklady silnika buduja sie z samym CUDA i na
+# maszynie z Radeonem nie widza zadnego urzadzenia.
+hip = ["forge-hal/hip", "forge-kernels/hip"]
 
 [dependencies]
 forge-types.workspace = true

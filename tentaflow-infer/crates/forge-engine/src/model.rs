@@ -5851,10 +5851,15 @@ impl Model {
         }
         // Rodzina Gemma mnoży embedding przez sqrt(hidden). Norma RMS jest na
         // to niewrażliwa, ale strumień rezydualny już nie — bez tego wyjście
-        // jest ciche.
-        if let Some(factor) = p.embd_scale {
-            kernels.scale_f16(&pb.h, rows * hidden, factor, stream)?;
+        // jest ciche. Skalowanie dotyczy WYŁĄCZNIE świeżo pobranego embeddingu:
+        // etap dalszy dostaje już przeskalowany rezydual i drugie mnożenie
+        // rozjechałoby stan.
+        if self.stage_first_layer == 0 {
+            if let Some(factor) = p.embd_scale {
+                kernels.scale_f16(&pb.h, rows * hidden, factor, stream)?;
+            }
         }
+        self.trace_f16("stage_in", &pb.h, (rows - 1) * hidden * 2, hidden);
         // Layer 0's attn-norm feeds the q/k/v projections.
         if fp8mod_fuse {
             kernels.rmsnorm_fp8_shared(
@@ -7213,6 +7218,57 @@ impl Model {
     /// gdzie przyjąć stan z poprzedniej karty.
     pub fn ensure_stage_buffers(&mut self) -> Result<()> {
         self.ensure_prefill_bufs()
+    }
+
+    /// Przepuszcza chunk przez warstwy TEGO etapu i zatrzymuje się na granicy —
+    /// bez głowy logitów.
+    ///
+    /// Etap zerowy pobiera embedding sam; etap dalszy oczekuje, że wołający
+    /// wpisał już rezydual poprzedniej karty do `stage_hidden`. Tokeny podaje
+    /// się każdemu etapowi, bo poza embeddingiem wyznaczają pozycje RoPE i
+    /// dopisanie do KV. Zwraca liczbę wierszy chunka.
+    pub fn prefill_stage(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<usize> {
+        self.ensure_kv_reuse_healthy()?;
+        if self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "etap pipeline'u obsługuje na razie wyłącznie model dense".into(),
+            ));
+        }
+        self.prefill_forward(seq, tokens, true)
+    }
+
+    /// Logity z rezydualu leżącego na granicy etapu — dopełnienie
+    /// `prefill_stage` na etapie OSTATNIM.
+    ///
+    /// Bierze wiersz `row` (zwykle ostatni token chunka), normalizuje go i
+    /// przepuszcza przez głowę tą samą ścieżką co dekodowanie.
+    pub fn stage_logits(&mut self, row: usize) -> Result<Vec<f32>> {
+        let hidden = self.weights.descriptor.params.hidden_size;
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .ok_or_else(|| ForgeError::Scheduler("bufory prefillu jeszcze nie istnieją".into()))?;
+        self.device
+            .copy(&pb.x, row * hidden * 2, &self.bufs.x, 0, hidden * 2, &self.stream)?;
+        self.trace_f16("result_norm", &self.bufs.x, 0, hidden);
+        self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        self.trace_f32("result_output", &self.bufs.logits, vocab);
+        self.device.copy(
+            &self.bufs.logits,
+            0,
+            &self.bufs.pinned_logits,
+            0,
+            vocab * 4,
+            &self.stream,
+        )?;
+        self.synchronize_kv_fatal("odczyt logitów etapu pipeline")?;
+        let lp = self
+            .bufs
+            .pinned_logits
+            .host_ptr()
+            .expect("pinned buffer has host mapping") as *const f32;
+        Ok(unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec())
     }
 
     /// Run a prompt chunk (≤ MAX_PREFILL_CHUNK tokens) through the model in one
