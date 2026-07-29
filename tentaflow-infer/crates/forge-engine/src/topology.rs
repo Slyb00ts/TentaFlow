@@ -191,6 +191,44 @@ pub fn tensor_parallel_viable(link: Link, profile: LayerProfile) -> bool {
     overhead <= gain * TP_OVERHEAD_BUDGET
 }
 
+/// Sposób, w jaki grupa kart dzieli między siebie pracę.
+///
+/// Te warianty NIE są alternatywami tego samego — każdy trafia w inny reżim
+/// łącza, a wybór wynika z pomiaru, nie z upodobania:
+///
+/// | technika | wymian na warstwę | czego wymaga od łącza |
+/// |---|---|---|
+/// | `TensorParallel` | 2 | najniższego opóźnienia |
+/// | `FfnTensorParallel` | 1 | połowy tego, co pełny TP |
+/// | `SpeculativeSplit` | 0 (same ID tokenów) | praktycznie niczego |
+/// | `SequenceParallel` | 1 na warstwę, ale DUŻA | pasma, nie opóźnienia |
+/// | `Pipeline` | 1 na granicę etapu | najmniej ze wszystkich |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Technique {
+    /// Każda macierz dzielona po wierszach; obie karty liczą tę samą warstwę.
+    /// Daje sumę mocy przy jednym strumieniu, ale płaci dwiema wymianami na
+    /// warstwę i jest najbardziej wrażliwa na opóźnienie.
+    TensorParallel,
+    /// Dzielone są WYŁĄCZNIE macierze FFN, a blok uwagi liczą obie karty
+    /// redundantnie. FFN to około dwóch trzecich mnożeń, więc oddajemy niewiele
+    /// mocy, a wymian jest o połowę mniej. Wariant na łącza, które nie udźwigną
+    /// pełnego TP.
+    FfnTensorParallel,
+    /// Model draftujący na słabszej karcie, weryfikujący na mocniejszej.
+    /// Przez łącze idą SAME identyfikatory tokenów, więc pasmo i opóźnienie są
+    /// bez znaczenia. Przyspiesza pojedynczy strumień przez spekulację, a nie
+    /// przez podział macierzy — i naturalnie pasuje do kart o różnej mocy.
+    SpeculativeSplit,
+    /// Prefill dzielony po TOKENACH: każda karta liczy inny fragment promptu.
+    /// Wymaga wymiany KV fragmentu (megabajty na warstwę), ale ta wymiana jest
+    /// ograniczona pasmem i daje się nałożyć na liczenie — opóźnienie łącza
+    /// prawie nie gra roli. Dotyczy wyłącznie prefillu.
+    SequenceParallel,
+    /// Warstwy rozdzielone między etapy. Nie przyspiesza pojedynczego strumienia,
+    /// za to daje pojemność i przepustowość przy wielu żądaniach.
+    Pipeline,
+}
+
 /// Grupa kart licząca te same warstwy razem (tensor parallel), będąca zarazem
 /// jednym etapem pipeline'u.
 #[derive(Clone, Debug, PartialEq)]
@@ -221,6 +259,63 @@ impl ExecutionPlan {
     /// Czy każdy etap to pojedyncza karta.
     pub fn is_pure_pipeline(&self) -> bool {
         self.stages.iter().all(|s| s.workers.len() == 1)
+    }
+}
+
+/// Ile FLOP-ów warstwy przypada na FFN. Dla architektur, które tu obsługujemy
+/// (SwiGLU, GQA), blok FFN to około dwóch trzecich mnożeń warstwy — więc TP
+/// ograniczony do FFN oddaje jedną trzecią potencjalnego zysku, płacąc połową
+/// komunikacji.
+const FFN_SHARE_OF_LAYER: f64 = 2.0 / 3.0;
+
+/// Wybiera technikę dla pary kart na podstawie zmierzonego łącza i profilu
+/// warstwy.
+///
+/// Kolejność prób idzie od najbardziej dochodowej do najbardziej odpornej na
+/// słabe łącze. `SpeculativeSplit` jest tu ostatnią deską ratunku dla
+/// DEKODOWANIA, bo nie wymaga od łącza niczego — ale wymaga modelu
+/// draftującego, więc wołający musi wiedzieć, czy nim dysponuje.
+pub fn choose_technique(
+    link: Link,
+    profile: LayerProfile,
+    kind: WorkKind,
+    speculation_available: bool,
+) -> Technique {
+    if kind == WorkKind::ComputeBound {
+        // Prefill: podział po tokenach nie potrzebuje niskiego opóźnienia, a
+        // wymianę KV da się nałożyć na liczenie.
+        if tensor_parallel_viable(link, profile) {
+            return Technique::TensorParallel;
+        }
+        return Technique::SequenceParallel;
+    }
+    if tensor_parallel_viable(link, profile) {
+        return Technique::TensorParallel;
+    }
+    // Połowa wymian to ten sam warunek przy dwukrotnie luźniejszym budżecie.
+    let half = LayerProfile {
+        layer_seconds: profile.layer_seconds * 2.0,
+        ..profile
+    };
+    if tensor_parallel_viable(link, half) {
+        return Technique::FfnTensorParallel;
+    }
+    if speculation_available {
+        return Technique::SpeculativeSplit;
+    }
+    Technique::Pipeline
+}
+
+/// Ułamek mocy warstwy, jaki dana technika realnie dzieli między karty.
+/// Służy planerowi do porównania wariantów, nie do raportowania wydajności.
+pub fn parallel_share(technique: Technique) -> f64 {
+    match technique {
+        Technique::TensorParallel | Technique::SequenceParallel => 1.0,
+        Technique::FfnTensorParallel => FFN_SHARE_OF_LAYER,
+        // Spekulacja nie dzieli warstwy — jej zysk bierze się z akceptacji
+        // draftu i nie da się go wyrazić udziałem w mnożeniach.
+        Technique::SpeculativeSplit => 0.0,
+        Technique::Pipeline => 0.0,
     }
 }
 
@@ -583,6 +678,63 @@ mod tests {
             .unwrap();
         assert_eq!(rows.total(), 4096);
         assert!(rows.rows[1] > rows.rows[0]);
+    }
+
+
+    #[test]
+    fn szybkie_lacze_wybiera_pelny_tensor_parallel() {
+        assert_eq!(
+            choose_technique(p2p(), profile(), WorkKind::MemoryBound, true),
+            Technique::TensorParallel
+        );
+    }
+
+    #[test]
+    fn lacze_na_granicy_schodzi_do_tp_samego_ffn() {
+        // Łącze, które nie uniesie dwóch wymian na warstwę, ale uniesie jedną.
+        let borderline = Link {
+            class: LinkClass::Rdma,
+            bytes_per_s: 12.5e9,
+            latency_s: 20.0e-6,
+        };
+        let mut long = profile();
+        long.layer_seconds = 0.30e-3;
+        assert!(!tensor_parallel_viable(borderline, long));
+        assert_eq!(
+            choose_technique(borderline, long, WorkKind::MemoryBound, false),
+            Technique::FfnTensorParallel
+        );
+    }
+
+    #[test]
+    fn wolne_lacze_z_draftem_wybiera_podzial_spekulacyjny() {
+        assert_eq!(
+            choose_technique(ethernet(), profile(), WorkKind::MemoryBound, true),
+            Technique::SpeculativeSplit
+        );
+    }
+
+    #[test]
+    fn wolne_lacze_bez_draftu_zostaje_przy_pipelinie() {
+        assert_eq!(
+            choose_technique(ethernet(), profile(), WorkKind::MemoryBound, false),
+            Technique::Pipeline
+        );
+    }
+
+    #[test]
+    fn prefill_po_wolnym_laczu_idzie_sekwencyjnie() {
+        // Prefill dzieli się po tokenach, więc opóźnienie łącza go nie blokuje.
+        assert_eq!(
+            choose_technique(ethernet(), profile(), WorkKind::ComputeBound, false),
+            Technique::SequenceParallel
+        );
+    }
+
+    #[test]
+    fn udzial_dzielonej_mocy_maleje_wraz_z_odpornoscia_techniki() {
+        assert!(parallel_share(Technique::TensorParallel) > parallel_share(Technique::FfnTensorParallel));
+        assert!(parallel_share(Technique::FfnTensorParallel) > parallel_share(Technique::Pipeline));
     }
 
     #[test]

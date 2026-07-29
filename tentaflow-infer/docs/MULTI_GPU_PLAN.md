@@ -97,6 +97,46 @@ Dekodowanie 27B jest ograniczone pamięcią i mierzy dziś 36,5 tok/s na 7900 XT
 To jest dokładnie „średnia ich wydajności" z pytania — a ściślej SUMA, bo praca
 dzieli się proporcjonalnie do możliwości.
 
+
+## 2b. Techniki „pomiędzy" — co robić, gdy łącze nie uniesie pełnego TP
+
+Pełny tensor parallel to jeden punkt na osi, nie jedyny wybór. Poniżej budżety
+policzone na ZMIERZONYM łączu tej maszyny (11,21 us na wymianę z synchronizacją,
+14,2 GB/s):
+
+| technika | wymian na warstwę | Bielik 7B | Qwen 27B | czego wymaga od łącza |
+|---|--:|--:|--:|---|
+| pełny TP | 2 | 0,94 ms (8,7%) | 1,55 ms (6,5%) | najniższego opóźnienia |
+| **TP tylko FFN** | 1 | 0,47 ms (4,4%) | 0,78 ms (3,2%) | połowy tego, co pełny TP |
+| **podział spekulacyjny** | 0 | ~0 | ~0 | praktycznie niczego |
+| **sekwencyjny prefill** | 1 duża | 6,4 ms na KV | 10,3 ms na KV | pasma, NIE opóźnienia |
+| pipeline | 1 na granicę | pomijalne | pomijalne | najmniej ze wszystkich |
+
+**TP tylko FFN.** Blok FFN to około dwóch trzecich mnożeń warstwy, a przy
+podziale kolumnowym `gate`/`up` i wierszowym `down` wystarcza mu JEDNA redukcja.
+Uwagę liczą wtedy obie karty redundantnie. Oddajemy jedną trzecią potencjalnego
+zysku, płacąc połową komunikacji — czyli dokładnie ten kompromis, o który chodzi
+przy łączu na granicy.
+
+**Podział spekulacyjny.** Model draftujący na słabszej karcie, weryfikujący na
+mocniejszej. Przez łącze idą SAME identyfikatory tokenów — kilkadziesiąt bajtów
+na krok. Pasmo i opóźnienie przestają mieć znaczenie, więc to jedyna technika,
+która przyspiesza POJEDYNCZY strumień przez zwykłą sieć. Dodatkowo sama z siebie
+pasuje do kart o różnej mocy: draft jest tani, więc trafia na słabszą kartę, a
+kosztowna weryfikacja na mocniejszą. FORGE ma już natywne MTP i n-gram, więc
+draft jest na miejscu.
+
+**Sekwencyjny prefill.** Prefill dzielony po TOKENACH, nie po macierzach: każda
+karta liczy inny fragment promptu. Wymaga wymiany KV fragmentu (2,1 MB na
+warstwę), ale to transfer ograniczony PASMEM, który da się nałożyć na liczenie —
+opóźnienie łącza prawie nie gra roli. Przy prefillu 512 tokenów trwającym ~210 ms
+te 6-10 ms transferu to kilka procent, i to możliwych do ukrycia.
+
+Wybór nie jest konfiguracją: `topology::choose_technique` dostaje zmierzone
+łącze, profil warstwy i rodzaj pracy, i schodzi od najbardziej dochodowej
+techniki do najbardziej odpornej na słabe łącze. Prefill idzie osobną gałęzią,
+bo tam podział po tokenach bije podział po macierzach na wolnym łączu.
+
 ## 3. Serce projektu: model możliwości i zamknięta pętla
 
 Podział NIE jest stałą w konfiguracji. Każde urządzenie ma profil:
@@ -134,6 +174,9 @@ mieści się z zapasem.
 | **M4** | TP dla prefillu z WŁASNYM podziałem (inny stosunek mocy!) | prefill ma odwrotny stosunek kart |
 | **M5** | PP dla modeli ponad 20 GB + mikrobatching | pojemność i przepustowość |
 | **M6** | EP dla MoE na bazie istniejącej rezydencji ekspertów | MoE ma już warstwę migracji ekspertów |
+| **M7** | TP tylko FFN — połowa komunikacji pełnego TP | dla łączy na granicy opłacalności |
+| **M8** | podział spekulacyjny draft/target między karty | jedyna technika działająca przez zwykłą sieć |
+| **M9** | sekwencyjny prefill dzielony po tokenach | prefill znosi opóźnienie, potrzebuje pasma |
 
 ## 5. Ryzyka nazwane wprost
 
