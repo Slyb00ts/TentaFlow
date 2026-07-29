@@ -7897,8 +7897,16 @@ impl Model {
             return self.run_step_moe();
         }
 
-        // Podział FFN na karty: krok obejmuje pracę dwóch urządzeń, więc nie
-        // mieści się w jednym grafie i idzie jawnym łańcuchem.
+        // Podział FFN na karty: krok obejmuje pracę dwóch urządzeń, więc idzie
+        // jawnym łańcuchem zamiast przechwyconego grafu.
+        //
+        // Nie z ostrożności — sprawdzone. Przechwycenie kroku obejmującego dwie
+        // karty (fork strumienia przez zdarzenie i join z powrotem, czyli wzorzec,
+        // który CUDA opisuje jako poprawny) ROCm przerywa asercją we WŁASNYM
+        // runtime: `hip::Stream*` … Assertion '__n < this->size()' failed, zrzut
+        // pamięci zamiast błędu do obsłużenia. Kosztuje to zmierzone 26 us na
+        // warstwę, czyli 0,83 ms na token — tyle wynosi premia za odtwarzanie
+        // grafu, której podział nie może na tym sterowniku dostać.
         if self.tp_ffn.is_some() {
             return self.run_step_separate(AttnSrc::Paged);
         }

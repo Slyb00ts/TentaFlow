@@ -382,3 +382,25 @@ dekodowania — koszt wymiany siedzi w synchronizacji, nie w przepustowości —
 Zostały dwie pary zdarzeń na warstwę (ok. 30 us) i kopia wejścia (15 us) przy
 110–147 us liczenia. Domyślna kalibracja daje 1,36–1,37x, podział dobrany
 pomiarem 1,44x.
+
+### Gdzie siedzi reszta narzutu
+
+Rozbite pomiarem, a nie szacunkiem. Podział `11264,0` daje karcie modelu CAŁY
+FFN, więc liczy dokładnie tę samą pracę co przebieg jednokartowy i nie wysyła nic
+na drugą kartę — a mimo to jest wolniejszy: **55,4 wobec 58,1 tok/s**, czyli
+26 us na warstwę. To nie jest koszt wymiany. To premia za odtwarzanie grafu,
+której podział nie dostaje: krok jednokartowy jest przechwycony i odtwarzany
+jednym wywołaniem, a krok z podziałem idzie setkami uruchomień kerneli.
+
+Przechwycenie kroku obejmującego dwie karty sprawdzone i NIEMOŻLIWE na tym
+sterowniku: wzorzec fork/join strumienia przez zdarzenie, który CUDA opisuje jako
+poprawny, ROCm przerywa asercją we własnym runtime (`hip::Stream*` …
+`Assertion '__n < this->size()' failed`) — zrzut pamięci zamiast błędu do
+obsłużenia. Odzyskanie tych 0,83 ms na token wymagałoby pocięcia kroku na odcinki
+przechwytywane osobno (graf na warstwę, między nimi wywołanie podziału), czyli
+przebudowy `run_step_separate` — to jest następny krok, nie drobiazg.
+
+Dla porządku: samo przerzucenie CAŁEGO FFN na szybszą kartę (`0,11264`) daje
+1,13x. Podział daje 1,44x, więc dzielenie pracy jest wyraźnie lepsze niż jej
+przeniesienie — i to jest odpowiedź na pytanie, czy warto było robić TP zamiast
+prostego offloadu.
