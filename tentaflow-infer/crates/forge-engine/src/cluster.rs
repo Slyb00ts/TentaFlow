@@ -24,6 +24,10 @@ pub struct ClusterDevice {
     pub stream: Stream,
     /// Zdarzenie zapisywane na `stream`, na które czekają pozostałe karty.
     pub done: Event,
+    /// Artefakty kerneli tej KONKRETNEJ karty. Przy kartach różnych
+    /// architektur każda dostaje swój zestaw — to był główny powód, dla którego
+    /// katalog jest zakresowany architekturą.
+    pub kernels: forge_kernels::Kernels,
 }
 
 /// Karty otwarte w jednym procesie, z otwartym dostępem P2P w obie strony.
@@ -54,10 +58,12 @@ impl Cluster {
             let device = gpu::open_id(id, pools)?;
             let stream = device.create_stream()?;
             let done = device.create_event()?;
+            let kernels = forge_kernels::Kernels::load(device.clone())?;
             devices.push(ClusterDevice {
                 device,
                 stream,
                 done,
+                kernels,
             });
         }
 
@@ -139,6 +145,24 @@ impl Cluster {
         let target = self.device(waiter)?;
         source.device.record_event(&source.done, &source.stream)?;
         target.device.wait_event(&target.stream, &source.done)
+    }
+
+    /// Mierzy możliwości każdej karty tym samym testem. Format wag musi być
+    /// tym, którym model faktycznie pojedzie — stosunek mocy kart zależy od
+    /// niego i potrafi się odwrócić.
+    pub fn calibrate(
+        &self,
+        quant: forge_types::QuantKind,
+    ) -> Result<Vec<crate::multi_gpu::DeviceCapability>> {
+        let mut caps = Vec::with_capacity(self.devices.len());
+        for entry in &self.devices {
+            caps.push(crate::multi_gpu::measure_device(
+                entry.device.as_ref(),
+                &entry.kernels,
+                quant,
+            )?);
+        }
+        Ok(caps)
     }
 
     /// Czeka na wszystkie karty. Wyłącznie do granic kroku i do testów — w

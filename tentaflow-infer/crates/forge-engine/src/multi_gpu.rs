@@ -279,21 +279,16 @@ pub fn update_capability(
 /// na wsadzie T=16), a dla Q4_K tych SAMYCH kart 0,95 : 1 — bo Q4_K nie ma
 /// kernela WMMA i obie liczą go na `dot4`, gdzie szybsza jest 6900 XT. Jeden
 /// pomiar nie opisuje obu przypadków, więc format musi wejść z zewnątrz.
-pub fn calibrate(
-    devices: &[std::sync::Arc<dyn forge_hal::Device>],
-    kernels: &[forge_kernels::Kernels],
+/// Mierzy JEDNĄ kartę. Wydzielone z `calibrate`, bo klaster trzyma zestawy
+/// kerneli w swoich strukturach i nie może z nich zrobić płaskiego wycinka.
+pub fn measure_device(
+    device: &dyn forge_hal::Device,
+    kernels: &forge_kernels::Kernels,
     quant: forge_types::QuantKind,
-) -> Result<Vec<DeviceCapability>> {
-    if devices.len() != kernels.len() {
-        return Err(ForgeError::Scheduler(
-            "kalibracja: liczba urządzeń i zestawów kerneli musi być równa".into(),
-        ));
-    }
+) -> Result<DeviceCapability> {
     const PROBE_BYTES: usize = 128 << 20;
     const WARMUP: usize = 2;
     const ITERS: usize = 8;
-    let mut caps = Vec::with_capacity(devices.len());
-    for (index, device) in devices.iter().enumerate() {
         let stream = device.create_stream()?;
         let source = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
         let target = device.alloc(PROBE_BYTES, forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
@@ -313,26 +308,33 @@ pub fn calibrate(
             0.0
         };
         let free_bytes = device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
-        caps.push(DeviceCapability {
-            stream_bytes_per_s: bytes_per_s,
-            matmul_ops_per_s: measure_matmul(device.as_ref(), &kernels[index], quant)?,
-            free_bytes,
-        });
+    Ok(DeviceCapability {
+        stream_bytes_per_s: bytes_per_s,
+        matmul_ops_per_s: measure_matmul(device, kernels, quant)?,
+        free_bytes,
+    })
+}
+
+pub fn calibrate(
+    devices: &[std::sync::Arc<dyn forge_hal::Device>],
+    kernels: &[forge_kernels::Kernels],
+    quant: forge_types::QuantKind,
+) -> Result<Vec<DeviceCapability>> {
+    if devices.len() != kernels.len() {
+        return Err(ForgeError::Scheduler(
+            "kalibracja: liczba urządzeń i zestawów kerneli musi być równa".into(),
+        ));
+    }
+    const PROBE_BYTES: usize = 128 << 20;
+    const WARMUP: usize = 2;
+    const ITERS: usize = 8;
+    let mut caps = Vec::with_capacity(devices.len());
+    for (index, device) in devices.iter().enumerate() {
+        caps.push(measure_device(device.as_ref(), &kernels[index], quant)?);
     }
     Ok(caps)
 }
 
-/// Mierzy przepustowość mnożenia macierzy TYM, CZYM DANA KARTA REALNIE LICZY.
-///
-/// Idzie przez produkcyjny `gemm_nvfp4_gguf_f16` — jedyne wejście z pełnym
-/// rozgałęzieniem na wszystkie obsługiwane architektury: `mma` na NVIDII, WMMA
-/// na RDNA3, warianty przenośne tam, gdzie jednostki macierzowej nie ma. Dzięki
-/// temu KAŻDA karta jest oceniana swoją najlepszą dostępną ścieżką.
-///
-/// To jest warunek, żeby stosunek mocy wychodził automatycznie dla DOWOLNEJ
-/// pary kart, także różnych producentów. Mierzenie wszystkich wspólnym
-/// mianownikiem (np. `dot4`, który ma każdy) zaniżyłoby kartę z lepszą
-/// jednostką — a właśnie po to ta kalibracja istnieje.
 fn measure_matmul(
     device: &dyn forge_hal::Device,
     kernels: &forge_kernels::Kernels,
@@ -380,9 +382,19 @@ fn measure_matmul(
                 1.0,
                 &stream,
             ),
-            QuantKind::Q8_0 => {
-                kernels.gemm_q8_0_f16(&output, &weights, &activations, ROWS, COLS, tokens, &stream)
-            }
+            // `gemm_q8_0_f16` to rodzina wymagająca artefaktów `_bm*`, których
+            // AMD nie ma; wejście `_i8mma_at` jest wspólne dla wszystkich
+            // architektur i samo schodzi na wariant dostępny na danej karcie.
+            QuantKind::Q8_0 => kernels.gemm_q8_0_i8mma_at(
+                &output,
+                &weights,
+                0,
+                &activations,
+                ROWS,
+                COLS,
+                tokens,
+                &stream,
+            ),
             // `gemm_q4_k_f16` to rodzina wymagajaca artefaktow `_bm*`, ktorych
             // AMD nie ma. Wejscie `_i8mma_at` jest wspolne dla wszystkich
             // architektur i samo schodzi na kafle `dot4` tam, gdzie nie ma

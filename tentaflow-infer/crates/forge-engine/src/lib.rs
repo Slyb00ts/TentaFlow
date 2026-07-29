@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod cluster;
 pub mod model_profile;
 pub mod multi_gpu;
+pub mod tensor_parallel;
 pub mod topology;
 pub mod model;
 pub mod moe_residency;
