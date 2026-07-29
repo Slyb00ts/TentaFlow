@@ -8689,6 +8689,9 @@ impl Kernels {
         // RDNA3 i nowsze: kafel WMMA czytajacy surowe superbloki Q4_K. Bez niego
         // Q4_K schodzil na `dot4`, zostawiajac jednostke macierzowa bezczynna —
         // zmierzone, ze wlasnie o to rozbijal sie prefill na 7900 XT.
+        if self.gemm_q4_k_i8wmma(y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)? {
+            return Ok(());
+        }
         if self.gemm_kblock_wmma(
             "gemm_q4_k_wmma_f16",
             y,
@@ -8719,6 +8722,60 @@ impl Kernels {
             n_tokens,
             stream,
         )
+    }
+
+    /// Prefillowy GEMM Q4_K na CAŁKOWITOLICZBOWEJ jednostce macierzowej RDNA3.
+    /// RDNA3 liczy int8 dwa razy szybciej niż f16, więc ten wariant wyprzedza
+    /// kafel f16 tam, gdzie oba są dostępne. Aktywacje przechodzą przez
+    /// `quantize_act_q8_1`, którego suma bloku pokrywa człon minimum Q4_K.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q4_k_i8wmma(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        const BN: usize = 64;
+        let (name, bm, block) = if n_tokens <= 32 {
+            ("gemm_q4_k_i8wmma_f16_bm32", 32usize, 128u32)
+        } else {
+            ("gemm_q4_k_i8wmma_f16_bm256", 256usize, 256u32)
+        };
+        // ZMIERZONE: ten wariant jest na razie 3,3x WOLNIEJSZY od kafla f16
+        // (735 wobec 2419 tok/s, Bielik Q4_K, RX 7900 XT). Sama jednostka int8
+        // jest na RDNA3 dwa razy szybsza, ale ten kernel nie stronicuje wag
+        // przez LDS i ładuje skale aktywacji osobno dla każdego pola
+        // akumulatora, co zjada całą przewagę. Zostaje za flagą do dalszej
+        // pracy — domyślnie NIE jest używany.
+        if !std::env::var("FORGE_Q4K_INT8_WMMA").is_ok_and(|v| v == "1") {
+            return Ok(false);
+        }
+        if !self.artifacts.has(name) || !cols.is_multiple_of(256) {
+            return Ok(false);
+        }
+        let kernel = self.artifacts.get(name)?;
+        let (xq, xd, xsm) = self.prequant_q8_1(x, cols, n_tokens, stream)?;
+        let config = LaunchConfig {
+            grid: (rows.div_ceil(BN) as u32, n_tokens.div_ceil(bm) as u32, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&xq)
+            .buf(&xd)
+            .buf(&xsm)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(kernel, &config, &args, stream)?;
+        Ok(true)
     }
 
     /// Przenośny kafel rejestrowy dla kart bez jednostki macierzowej. Jest
