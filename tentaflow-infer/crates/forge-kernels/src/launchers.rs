@@ -8689,7 +8689,17 @@ impl Kernels {
         // RDNA3 i nowsze: kafel WMMA czytajacy surowe superbloki Q4_K. Bez niego
         // Q4_K schodzil na `dot4`, zostawiajac jednostke macierzowa bezczynna —
         // zmierzone, ze wlasnie o to rozbijal sie prefill na 7900 XT.
-        if self.gemm_q4_k_wmma(y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)? {
+        if self.gemm_kblock_wmma(
+            "gemm_q4_k_wmma_f16",
+            y,
+            w_q4k,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
             return Ok(());
         }
         if n_tokens >= 64
@@ -8711,14 +8721,17 @@ impl Kernels {
         )
     }
 
-    /// Q4_K prefill GEMM on RDNA3 matrix units (WMMA 16x16x16), reading the raw
-    /// 144-byte GGUF superblocks. Returns `false` when the architecture has no
-    /// such artifact, so the caller keeps its existing path.
+    /// Prefillowy GEMM k-kwantów na jednostkach macierzowych RDNA3
+    /// (WMMA 16x16x16), czytający surowe superbloki GGUF. `family` to przedrostek
+    /// artefaktu, np. `gemm_q4_k_wmma_f16`. Zwraca `false`, gdy architektura nie
+    /// ma takiego artefaktu — wtedy wołający zostaje na swojej dotychczasowej
+    /// ścieżce.
     #[allow(clippy::too_many_arguments)]
-    fn gemm_q4_k_wmma(
+    fn gemm_kblock_wmma(
         &self,
+        family: &str,
         y: &DevBuffer,
-        w_q4k: &DevBuffer,
+        w: &DevBuffer,
         w_byte_off: usize,
         x: &DevBuffer,
         rows: usize,
@@ -8727,15 +8740,16 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<bool> {
         const BN: usize = 64;
-        let (name, bm, block) = if n_tokens <= 32 {
-            ("gemm_q4_k_wmma_f16_bm32", 32usize, 128u32)
+        let (suffix, bm, block) = if n_tokens <= 32 {
+            ("_bm32", 32usize, 128u32)
         } else {
-            ("gemm_q4_k_wmma_f16_bm256", 256usize, 256u32)
+            ("_bm256", 256usize, 256u32)
         };
-        if !self.artifacts.has(name) {
+        let name = format!("{family}{suffix}");
+        if !self.artifacts.has(&name) {
             return Ok(false);
         }
-        let kernel = self.artifacts.get(name)?;
+        let kernel = self.artifacts.get(&name)?;
         let config = LaunchConfig {
             grid: (
                 rows.div_ceil(BN) as u32,
@@ -8747,7 +8761,7 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf_at(w_q4k, w_byte_off)?
+            .buf_at(w, w_byte_off)?
             .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64)
@@ -13306,6 +13320,22 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q5_k requires cols % 256 == 0, got {cols}"
             )));
+        }
+        // RDNA3 i nowsze: kafel WMMA czytający surowe superbloki Q5_K. Rodzina
+        // `gemm_q5_k_f16{suffix}` wymaga fragmentu `mma`, którego AMD nie ma —
+        // bez tej gałęzi Q5_K nie uruchamiał się tam w ogóle.
+        if self.gemm_kblock_wmma(
+            "gemm_q5_k_wmma_f16",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_k_f16{suffix}"))?;

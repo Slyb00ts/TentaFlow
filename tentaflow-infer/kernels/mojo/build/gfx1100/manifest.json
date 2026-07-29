@@ -545,6 +545,14 @@
       "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_eb34b3ede551428b",
       "file": "gemm_q4_k_wmma_f16_bm32.hsaco"
     },
+    "gemm_q5_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q5_k_wmma_gemm_q5_k_w6A6A6A6A_1fd58864a3d63d75",
+      "file": "gemm_q5_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q5_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q5_k_wmma_gemm_q5_k_w6A6A6A6A_8375b7c4cd9e6ea8",
+      "file": "gemm_q5_k_wmma_f16_bm32.hsaco"
+    },
     "gemm_q6_k_dot4_128x64": {
       "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_688a2591e2b7b919",
       "file": "gemm_q6_k_dot4_128x64.hsaco"
