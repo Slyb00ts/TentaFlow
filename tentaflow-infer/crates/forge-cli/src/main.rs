@@ -1023,6 +1023,7 @@ fn load_for_serve(
         native_mtp,
         nvfp4_gguf_layout,
         nvfp4_ct_layout: resolve_nvfp4_ct_layout_from_env()?,
+        layer_range: None,
     };
     let loaded = load_model(dev, path, cfg)?;
     Ok((loaded, kv_pages, max_seq_len))
@@ -1225,6 +1226,7 @@ fn load_auto(
             native_mtp,
             nvfp4_gguf_layout,
             nvfp4_ct_layout: resolve_nvfp4_ct_layout_from_env()?,
+            layer_range: None,
         },
     )
 }

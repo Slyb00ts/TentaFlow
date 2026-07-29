@@ -3245,9 +3245,13 @@ impl ModelWeights {
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
         spill: Option<&ExpertSpill>,
         host_budget: usize,
+        layer_range: Option<(usize, usize)>,
     ) -> Result<Self> {
         let gguf = Gguf::open(path)?;
-        let descriptor = ModelDescriptor::detect(&gguf)?;
+        let mut descriptor = ModelDescriptor::detect(&gguf)?;
+        if let Some((first, count)) = layer_range {
+            descriptor.restrict_layers(first, count)?;
+        }
         let src = GgufSource(&gguf);
         Self::load(
             device.as_ref(),

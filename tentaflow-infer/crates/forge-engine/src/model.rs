@@ -1018,6 +1018,10 @@ pub struct ModelConfig {
     pub nvfp4_gguf_layout: Nvfp4GgufLayout,
     /// Polityka resident dla checkpointów compressed-tensors NVFP4.
     pub nvfp4_ct_layout: NvFp4CtLayoutPolicy,
+    /// Zakres warstw `(pierwsza, ile)` dla etapu pipeline'u. `None` ładuje cały
+    /// model. Etap wczytuje WYŁĄCZNIE swoje warstwy, więc model większy od
+    /// jednej karty mieści się na kilku.
+    pub layer_range: Option<(usize, usize)>,
 }
 
 impl Default for ModelConfig {
@@ -1034,6 +1038,7 @@ impl Default for ModelConfig {
             native_mtp: false,
             nvfp4_gguf_layout: Nvfp4GgufLayout::RowMajor36,
             nvfp4_ct_layout: NvFp4CtLayoutPolicy::RowMajorE4M3,
+            layer_range: None,
         }
     }
 }
@@ -2517,6 +2522,7 @@ impl Model {
                 tile_context,
                 spill.as_ref(),
                 cfg.weight_host_budget,
+                cfg.layer_range,
             )?;
         Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
