@@ -41,6 +41,18 @@ use crate::weights::{
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
+
+/// Liczba slotow przypietego bufora posredniego dla wejsc jednego tokenu.
+///
+/// Host wyprzedza GPU: kopie z przypietego bufora sa ASYNCHRONICZNE, wiec
+/// nadpisanie go dla kolejnego tokenu, zanim poprzednia kopia sie wykonala,
+/// wysyla na urzadzenie dane z PRZYSZLOSCI. Objawialo sie to `seq_len`
+/// wyprzedzajacym tablice stron: kernel czytal wpis `-1` i siegal poza pule KV
+/// (blad pamieci GPU w prefillu hybrydowym, tylko przy prompcie dluzszym niz
+/// jedna strona — dekodowanie synchronizuje sie co token po logity, wiec tam
+/// wyscig nie wystepowal).
+const STAGING_SLOTS: usize = 64;
+const STAGING_IN_BYTES: usize = 12;
 const HYBRID_PREFILL_PORTABLE_CHUNK: usize = 16;
 const HYBRID_PREFILL_LEGACY_CHUNK: usize = 32;
 const HYBRID_PREFILL_AUTO_CHUNK: usize = 128;
@@ -1128,6 +1140,10 @@ pub struct Model {
     /// (0 = none/stale). Spills, restores and batched growth invalidate it,
     /// forcing a re-upload on the next single-stream step.
     pt_seq: u64,
+    /// Pierscien slotow przypietego bufora posredniego i zdarzenie na kazdy z
+    /// nich. Slot wolno nadpisac dopiero, gdy jego kopia dotarla na urzadzenie.
+    staging_cursor: Cell<usize>,
+    staging_events: Vec<Event>,
     /// MoE scratch; `Some` only for Mixture-of-Experts models.
     moe_bufs: Option<MoeBufs>,
     /// Rezydencja ekspertów; `Some` tylko dla modeli MoE.
@@ -2835,9 +2851,13 @@ impl Model {
             logits: device.alloc(p.vocab_size * 4, MemKind::Device, Pool::Activations)?,
             ids: device.alloc(4, MemKind::Device, Pool::Activations)?,
             pos: device.alloc(4, MemKind::Device, Pool::Activations)?,
-            pinned_in: device.alloc(12, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_in: device.alloc(
+                STAGING_SLOTS * STAGING_IN_BYTES,
+                MemKind::PinnedHost,
+                Pool::Activations,
+            )?,
             pinned_pt: device.alloc(
-                max_pages_per_seq * 4,
+                STAGING_SLOTS * max_pages_per_seq * 4,
                 MemKind::PinnedHost,
                 Pool::Activations,
             )?,
@@ -2973,6 +2993,9 @@ impl Model {
             && weights.descriptor.params.ssm.is_none();
         let prefix_cache =
             prefix_eligible.then(|| crate::prefix::PrefixCache::new(cfg.kv_page_size));
+        let staging_events = (0..STAGING_SLOTS)
+            .map(|_| device.create_event())
+            .collect::<Result<Vec<_>>>()?;
         let mut model = Model {
             stage_first_layer: cfg.layer_range.map(|(first, _)| first).unwrap_or(0),
             device,
@@ -3005,6 +3028,8 @@ impl Model {
             tier,
             tier_bufs,
             pt_seq: 0,
+            staging_cursor: Cell::new(0),
+            staging_events,
             moe_bufs,
             moe_residency,
             expert_spill: spill,
@@ -7811,7 +7836,19 @@ impl Model {
     /// Stage [token, pos, seq_len] in pinned memory and push them with async
     /// copies on the compute stream — pinned H2D avoids the pageable
     /// legacy-stream drain that plain write() must perform.
+    /// Bierze kolejny slot pierscienia i CZEKA, az jego poprzednia kopia
+    /// dotarla na urzadzenie. Bez tego host nadpisuje przypiete bajty, ktore
+    /// czeka jeszcze zakolejkowana kopia.
+    fn claim_staging_slot(&self) -> Result<usize> {
+        let slot = self.staging_cursor.get() % STAGING_SLOTS;
+        self.staging_events[slot].synchronize()?;
+        self.staging_cursor.set(self.staging_cursor.get() + 1);
+        Ok(slot)
+    }
+
     fn upload_decode_inputs(&self, token_id: u32, pos: usize) -> Result<()> {
+        let slot = self.claim_staging_slot()?;
+        let offset = slot * STAGING_IN_BYTES;
         let host = self
             .bufs
             .pinned_in
@@ -7819,26 +7856,29 @@ impl Model {
             .expect("pinned buffer has host mapping");
         unsafe {
             let vals = [token_id as i32, pos as i32, (pos + 1) as i32];
-            std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, host, 12);
+            std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, host.add(offset), 12);
         }
         self.device
-            .copy(&self.bufs.pinned_in, 0, &self.bufs.ids, 0, 4, &self.stream)?;
+            .copy(&self.bufs.pinned_in, offset, &self.bufs.ids, 0, 4, &self.stream)?;
         self.device
-            .copy(&self.bufs.pinned_in, 4, &self.bufs.pos, 0, 4, &self.stream)?;
+            .copy(&self.bufs.pinned_in, offset + 4, &self.bufs.pos, 0, 4, &self.stream)?;
         self.device.copy(
             &self.bufs.pinned_in,
-            8,
+            offset + 8,
             &self.seq_len_dev,
             0,
             4,
             &self.stream,
         )?;
-        Ok(())
+        self.device
+            .record_event(&self.staging_events[slot], &self.stream)
     }
 
     /// Upload `seq`'s page table (pinned staging + async H2D) and mark it as
     /// the one resident in `page_table_dev`.
     fn upload_page_table(&mut self, seq: &SeqKv) -> Result<()> {
+        let slot = self.claim_staging_slot()?;
+        let pt_offset = slot * self.max_pages_per_seq * 4;
         let pt_host = self
             .bufs
             .pinned_pt
@@ -7849,18 +7889,20 @@ impl Model {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 pt.as_ptr() as *const u8,
-                pt_host,
+                pt_host.add(pt_offset),
                 self.max_pages_per_seq * 4,
             );
         }
         self.device.copy(
             &self.bufs.pinned_pt,
-            0,
+            pt_offset,
             &self.page_table_dev,
             0,
             self.max_pages_per_seq * 4,
             &self.stream,
         )?;
+        self.device
+            .record_event(&self.staging_events[slot], &self.stream)?;
         self.pt_seq = seq.id;
         Ok(())
     }
@@ -9671,6 +9713,8 @@ impl Model {
                 let row = table.get(base..base + p.hidden_size).ok_or_else(|| {
                     ForgeError::Format("wiersz embeddingu MTP wykracza poza tabelę".into())
                 })?;
+                let slot = self.claim_staging_slot()?;
+                let offset = slot * p.hidden_size * 2;
                 let staging = self
                     .hybrid_bufs
                     .as_ref()
@@ -9681,7 +9725,7 @@ impl Model {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         row.as_ptr() as *const u8,
-                        staging,
+                        staging.add(offset),
                         p.hidden_size * 2,
                     );
                 }
@@ -9691,12 +9735,14 @@ impl Model {
                         .as_ref()
                         .expect("bufory hybrid zaalokowane")
                         .pinned_embed,
-                    0,
+                    offset,
                     &mtp.token_embedding,
                     0,
                     p.hidden_size * 2,
                     &self.stream,
                 )?;
+                self.device
+                    .record_event(&self.staging_events[slot], &self.stream)?;
                 state.record_host_embedding_gather();
                 Ok(())
             }
@@ -15296,7 +15342,7 @@ impl Model {
             o: a16(value_dim)?,
             normed: a16(value_dim)?,
             pinned_embed: device.alloc(
-                p.hidden_size * 2,
+                STAGING_SLOTS * p.hidden_size * 2,
                 MemKind::PinnedHost,
                 Pool::Activations,
             )?,
@@ -15332,15 +15378,19 @@ impl Model {
             ForgeError::Scheduler(format!("token id {token_id} out of embedding range"))
         })?;
         let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+        let slot = self.claim_staging_slot()?;
+        let offset = slot * hidden * 2;
         let dst = hb
             .pinned_embed
             .host_ptr()
             .expect("pinned buffer has host mapping");
         unsafe {
-            std::ptr::copy_nonoverlapping(row.as_ptr() as *const u8, dst, hidden * 2);
+            std::ptr::copy_nonoverlapping(row.as_ptr() as *const u8, dst.add(offset), hidden * 2);
         }
         self.device
-            .copy(&hb.pinned_embed, 0, &self.bufs.h, 0, hidden * 2, &self.stream)
+            .copy(&hb.pinned_embed, offset, &self.bufs.h, 0, hidden * 2, &self.stream)?;
+        self.device
+            .record_event(&self.staging_events[slot], &self.stream)
     }
 
     fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
