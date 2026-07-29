@@ -6231,7 +6231,14 @@ impl Model {
                         stream,
                     )?;
                 } else if let Some((page_tables, base_positions)) = &segmented {
-                    if head_dim == 128 {
+                    // FA HD128 stoi na `mma` NVIDII. Karty bez tego artefaktu
+                    // liczą ten sam segment przenośnym kaflem — ta sama
+                    // matematyka, inny kernel.
+                    if head_dim == 128
+                        && kernels
+                            .artifacts()
+                            .has("attn_prefill_fa_segmented_f16_hd128")
+                    {
                         kernels.attn_prefill_fa_segmented_f16_hd128(
                             &pb.attn_out,
                             &pb.q,

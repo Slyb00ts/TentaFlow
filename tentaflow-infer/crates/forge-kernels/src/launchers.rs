@@ -1293,12 +1293,14 @@ pub enum DensePrefillLogitsKind {
     Q6K { rows: usize, cols: usize },
 }
 
-fn dense_prefill_backend_capable(
-    vendor: forge_types::Vendor,
-    warp_size: u32,
-    max_threads_per_block: u32,
-) -> bool {
-    matches!(vendor, forge_types::Vendor::Nvidia) && warp_size == 32 && max_threads_per_block >= 256
+/// Wymagania SPRZĘTOWE równego dense prefillu, bez pytania o producenta.
+///
+/// Kernele segmentowane zakładają falę 32 wątków i blok 256 — to jest cały
+/// kontrakt. Wcześniej stał tu warunek „tylko NVIDIA", który wyłączał tę
+/// ścieżkę na Radeonach mimo obecności wszystkich potrzebnych artefaktów;
+/// resztę i tak sprawdza `dense_prefill_artifacts_capable`.
+fn dense_prefill_backend_capable(warp_size: u32, max_threads_per_block: u32) -> bool {
+    warp_size == 32 && max_threads_per_block >= 256
 }
 
 fn dense_prefill_artifacts_capable(
@@ -1316,12 +1318,17 @@ fn dense_prefill_artifacts_capable(
     {
         return false;
     }
+    // HD128 ma dwa równoważne kernele: FA (mma NVIDII) i przenośny kafel
+    // segmentowany. Wystarczy jeden z nich — wybór należy do miejsca wywołania.
     let attention = match head_dim {
-        128 => "attn_prefill_fa_segmented_f16_hd128",
-        256 => "attn_prefill_segmented_f16_hd256",
-        _ => return false,
+        128 => {
+            has("attn_prefill_fa_segmented_f16_hd128")
+                || has("attn_prefill_segmented_f16_hd128")
+        }
+        256 => has("attn_prefill_segmented_f16_hd256"),
+        _ => false,
     };
-    if !has(attention) {
+    if !attention {
         return false;
     }
     match logits {
@@ -1336,13 +1343,19 @@ fn dense_prefill_artifacts_capable(
             if rows == 0 || !cols.is_multiple_of(32) {
                 return false;
             }
-            let kernel = match batch {
-                4 => "gemm_q8_0_f16_exact_out_f32_b4",
-                8 => "gemm_q8_0_f16_exact_out_f32_b8",
-                16 => Kernels::q8_0_out_f32_kernel(rows, batch),
-                _ => return false,
-            };
-            has(kernel)
+            match batch {
+                4 => has("gemm_q8_0_f16_exact_out_f32_b4"),
+                8 => has("gemm_q8_0_f16_exact_out_f32_b8"),
+                // B16 idzie przez `gemm_q8_0_out_f32_at`, które na kartach bez
+                // `mma` NVIDII wybiera kafel WMMA albo `dot4`. Zdolność ma więc
+                // każda z tych trzech dróg.
+                16 => {
+                    has(Kernels::q8_0_out_f32_kernel(rows, batch))
+                        || has("gemm_q8_0_wmma_out_f32_16x64")
+                        || has("gemm_q8_0_dot4_out_f32_64x64")
+                }
+                _ => false,
+            }
         }
         DensePrefillLogitsKind::NvFp4Gguf { rows, cols } => {
             if rows == 0 || !cols.is_multiple_of(64) {
@@ -1795,7 +1808,7 @@ impl Kernels {
         logits: DensePrefillLogitsKind,
     ) -> bool {
         let caps = self.device.caps();
-        dense_prefill_backend_capable(caps.vendor, caps.warp_size, caps.max_threads_per_block)
+        dense_prefill_backend_capable(caps.warp_size, caps.max_threads_per_block)
             && dense_prefill_artifacts_capable(head_dim, batch, logits, |name| {
                 self.artifacts.has(name)
             })
@@ -8002,7 +8015,10 @@ impl Kernels {
             max_pages,
         )?;
         let caps = self.device.caps();
-        let warp32 = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        // Wariant `_warp32` zaklada fale 32 watkow — to jest jego caly wymog.
+        // RDNA tez ma fale 32, wiec pytanie o producenta wysylalo Radeony do
+        // wariantu pisanego pod fale 64 i dawalo zle wyniki.
+        let warp32 = caps.warp_size == 32;
         let kernel_name = if warp32 {
             format!("attn_verify_segmented_f16_hd{head_dim}_warp32")
         } else {
@@ -18251,28 +18267,38 @@ mod nvfp4_gguf_dispatch_tests {
             Kernels::f16_out_f32_dispatch(32_000, 16, |_| false).0,
             "gemm_f16_out_f32"
         );
-        assert!(dense_prefill_backend_capable(
-            forge_types::Vendor::Nvidia,
-            32,
-            1024
-        ));
-        assert!(!dense_prefill_backend_capable(
-            forge_types::Vendor::Amd,
-            64,
-            1024
-        ));
-        assert!(!dense_prefill_backend_capable(
-            forge_types::Vendor::Nvidia,
-            64,
-            1024
-        ));
-        assert!(!dense_prefill_backend_capable(
-            forge_types::Vendor::Nvidia,
-            32,
-            128
+        // Fala 32 i blok co najmniej 256 — u obu producentow.
+        assert!(dense_prefill_backend_capable(32, 1024));
+        // Fala 64 (CDNA, stare GCN) nie spelnia kontraktu kerneli.
+        assert!(!dense_prefill_backend_capable(64, 1024));
+        assert!(!dense_prefill_backend_capable(32, 128));
+        // HD128 ma dwa rownowazne kernele uwagi, wiec brak jednego z nich NIE
+        // wylacza dense prefillu — dopiero brak obu.
+        for one_missing in [
+            "attn_prefill_fa_segmented_f16_hd128",
+            "attn_prefill_segmented_f16_hd128",
+        ] {
+            assert!(dense_prefill_artifacts_capable(
+                128,
+                16,
+                DensePrefillLogitsKind::NvFp4Gguf {
+                    rows: 32_000,
+                    cols: 4096,
+                },
+                |name| name != one_missing,
+            ));
+        }
+        assert!(!dense_prefill_artifacts_capable(
+            128,
+            16,
+            DensePrefillLogitsKind::NvFp4Gguf {
+                rows: 32_000,
+                cols: 4096,
+            },
+            |name| !name.starts_with("attn_prefill"),
         ));
         for (head_dim, attention) in [
-            (128, "attn_prefill_fa_segmented_f16_hd128"),
+            (128, "kv_append_batch_segmented_f16"),
             (256, "attn_prefill_segmented_f16_hd256"),
         ] {
             assert!(dense_prefill_artifacts_capable(
@@ -18335,11 +18361,19 @@ mod nvfp4_gguf_dispatch_tests {
                 DensePrefillLogitsKind::Q8_0 { rows, cols: 4096 },
                 |_| true,
             ));
-            assert!(!dense_prefill_artifacts_capable(
+            // Brak kernela NVIDII zostawia jeszcze kafle AMD, wiec zdolnosc
+            // znika dopiero, gdy nie ma zadnej z trzech drog.
+            assert!(dense_prefill_artifacts_capable(
                 128,
                 16,
                 DensePrefillLogitsKind::Q8_0 { rows, cols: 4096 },
                 |name| name != required,
+            ));
+            assert!(!dense_prefill_artifacts_capable(
+                128,
+                16,
+                DensePrefillLogitsKind::Q8_0 { rows, cols: 4096 },
+                |name| !name.starts_with("gemm_q8_0_"),
             ));
         }
         assert!(!dense_prefill_artifacts_capable(

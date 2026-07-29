@@ -60,7 +60,7 @@ extern "C" {
         kind: c_int,
         stream: HipStreamRaw,
     ) -> c_int;
-    fn hipStreamCreate(stream: *mut HipStreamRaw) -> c_int;
+    fn hipStreamCreateWithFlags(stream: *mut HipStreamRaw, flags: c_uint) -> c_int;
     fn hipStreamDestroy(stream: HipStreamRaw) -> c_int;
     fn hipStreamSynchronize(stream: HipStreamRaw) -> c_int;
     fn hipStreamWaitEvent(stream: HipStreamRaw, event: HipEventRaw, flags: c_uint) -> c_int;
@@ -110,10 +110,19 @@ extern "C" {
 const HIP_SUCCESS: c_int = 0;
 const HIP_ERROR_NOT_READY: c_int = 34;
 const HIP_EVENT_DISABLE_TIMING: c_uint = 2;
-/// `hipStreamCaptureModeGlobal` — ta sama semantyka co przechwytywanie CUDA.
-const HIP_CAPTURE_MODE_GLOBAL: c_uint = 0;
+/// `hipStreamCaptureModeThreadLocal` — tak samo jak backend CUDA.
+///
+/// Tryb globalny unieważnia przechwytywanie przy KAŻDEJ ryzykownej operacji w
+/// całym procesie, także wykonanej przez inny wątek, który o grafie nic nie
+/// wie. Backend CUDA używa trybu wątkowego, więc HIP w trybie globalnym dawał
+/// błąd 906/901 tam, gdzie ta sama praca na NVIDII przechodziła.
+const HIP_CAPTURE_MODE_THREAD_LOCAL: c_uint = 1;
 /// `hipMemcpyDefault` — kierunek wyprowadzany z adresow.
 const HIP_MEMCPY_DEFAULT: c_int = 4;
+/// `hipStreamNonBlocking` — strumień nie synchronizuje się ze strumieniem
+/// domyślnym, tak jak strumienie backendu CUDA. Strumień blokujący sprawiał,
+/// że kopia na strumieniu domyślnym wywracała trwające przechwytywanie grafu.
+const HIP_STREAM_NON_BLOCKING: c_uint = 1;
 
 /// Zamienia kod HIP na `ForgeError` z komunikatem ze sterownika.
 fn check(status: c_int, what: &str) -> Result<()> {
@@ -643,7 +652,10 @@ impl Device for HipDevice {
     fn create_stream(&self) -> Result<Stream> {
         self.bind()?;
         let mut raw: HipStreamRaw = std::ptr::null_mut();
-        check(unsafe { hipStreamCreate(&mut raw) }, "hipStreamCreate")?;
+        check(
+            unsafe { hipStreamCreateWithFlags(&mut raw, HIP_STREAM_NON_BLOCKING) },
+            "hipStreamCreateWithFlags",
+        )?;
         Ok(Stream::from_impl(Arc::new(HipStream(raw))))
     }
 
@@ -852,7 +864,7 @@ impl Device for HipDevice {
     fn begin_capture(&self, stream: &Stream) -> Result<()> {
         let stream = stream.downcast::<HipStream>()?;
         check(
-            unsafe { hipStreamBeginCapture(stream.0, HIP_CAPTURE_MODE_GLOBAL) },
+            unsafe { hipStreamBeginCapture(stream.0, HIP_CAPTURE_MODE_THREAD_LOCAL) },
             "hipStreamBeginCapture",
         )
     }
