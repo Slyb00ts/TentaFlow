@@ -73,6 +73,12 @@ fn greedy(model: &mut Model, prompt: &[u32], count: usize) -> Vec<u32> {
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn".into()),
+        )
+        .init();
     let path = std::path::PathBuf::from(std::env::args().nth(1).expect("ścieżka do gguf"));
     let prompt: Vec<u32> = std::env::args()
         .nth(2)

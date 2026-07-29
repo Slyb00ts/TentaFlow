@@ -74,7 +74,18 @@ impl Cluster {
                     continue;
                 }
                 let peer = devices[to].device.ordinal();
-                if devices[from].device.enable_peer_access(peer).is_err() {
+                if let Err(error) = devices[from].device.enable_peer_access(peer) {
+                    // Brak P2P nie jest błędem, ale JEST wiadomością: bez niego
+                    // wymiana 10 KiB rośnie z 6,6 us do dziesiątek. Połknięcie
+                    // powodu zamieniało regresję łącza w niewyjaśnialny wynik.
+                    tracing::warn!(
+                        from = devices[from].device.ordinal(),
+                        from_name = devices[from].device.caps().name,
+                        to = peer,
+                        to_name = devices[to].device.caps().name,
+                        %error,
+                        "karty nie widzą swojej pamięci — wymiana pójdzie wolniejszą drogą"
+                    );
                     peer_access = false;
                 }
             }
@@ -133,7 +144,18 @@ impl Cluster {
                     continue;
                 }
                 let peer = devices[to].device.ordinal();
-                if devices[from].device.enable_peer_access(peer).is_err() {
+                if let Err(error) = devices[from].device.enable_peer_access(peer) {
+                    // Brak P2P nie jest błędem, ale JEST wiadomością: bez niego
+                    // wymiana 10 KiB rośnie z 6,6 us do dziesiątek. Połknięcie
+                    // powodu zamieniało regresję łącza w niewyjaśnialny wynik.
+                    tracing::warn!(
+                        from = devices[from].device.ordinal(),
+                        from_name = devices[from].device.caps().name,
+                        to = peer,
+                        to_name = devices[to].device.caps().name,
+                        %error,
+                        "karty nie widzą swojej pamięci — wymiana pójdzie wolniejszą drogą"
+                    );
                     peer_access = false;
                 }
             }

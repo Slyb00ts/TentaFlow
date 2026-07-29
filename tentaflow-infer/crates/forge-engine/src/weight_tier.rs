@@ -154,6 +154,17 @@ impl Device for TieredWeightDevice {
     fn elapsed_event_ms(&self, start: &Event, end: &Event) -> Result<Option<f32>> {
         self.inner.elapsed_event_ms(start, end)
     }
+    // Oba mają domyślną implementację w traicie, więc ich BRAK tutaj nie był
+    // błędem kompilacji, tylko cichym zmyśleniem: opakowana karta zgłaszała
+    // numer 0 i „ten backend nie obsługuje P2P". Klaster brał to za prawdę o
+    // sprzęcie i schodził na wolniejszą drogę wymiany — 51,3 us zamiast 6,6 us
+    // na kopię 8 KiB.
+    fn ordinal(&self) -> usize {
+        self.inner.ordinal()
+    }
+    fn enable_peer_access(&self, peer_ordinal: usize) -> Result<()> {
+        self.inner.enable_peer_access(peer_ordinal)
+    }
     fn copy(
         &self,
         src: &DevBuffer,

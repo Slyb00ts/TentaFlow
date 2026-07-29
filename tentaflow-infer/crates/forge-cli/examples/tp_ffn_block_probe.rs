@@ -199,7 +199,21 @@ fn main() {
     println!("zgodnosc bloku FFN: max |roznica| {max_abs:.6}, wzgledne L2 {l2:.2e}");
     assert!(l2 < 1e-5, "blok FFN rozjechal sie z jednokartowym");
 
+    // Silnik musi PRZED blokiem rozeslac wejscie na karty — w probie x lezy juz
+    // na obu, wiec sam blok tego nie mierzy. Ta wersja dokłada rozgłoszenie,
+    // zeby bylo widac, ile kosztuje wymiana, a ile samo liczenie.
+    let split_with_broadcast = || {
+        for index in 1..cluster.len() {
+            cluster
+                .exchange(0, &ws.x[0], 0, index, &ws.x[index], 0, HIDDEN * 2)
+                .unwrap();
+            cluster.wait_for(index, 0).unwrap();
+        }
+        split_block();
+    };
+
     let mut split_time = f64::MAX;
+    let mut bcast_time = f64::MAX;
     let mut whole_time = f64::MAX;
     for _ in 0..30 {
         let t0 = Instant::now();
@@ -211,11 +225,22 @@ fn main() {
         whole(dev0);
         dev0.stream.synchronize().unwrap();
         whole_time = whole_time.min(t1.elapsed().as_secs_f64());
+
+        let t2 = Instant::now();
+        split_with_broadcast();
+        cluster.synchronize().unwrap();
+        bcast_time = bcast_time.min(t2.elapsed().as_secs_f64());
     }
     println!(
         "czas bloku FFN: jedna karta {:.1} us, dwie karty {:.1} us -> {:.2}x",
         whole_time * 1e6,
         split_time * 1e6,
         whole_time / split_time
+    );
+    println!(
+        "z rozgloszeniem wejscia: {:.1} us -> {:.2}x (samo rozgloszenie {:.1} us)",
+        bcast_time * 1e6,
+        whole_time / bcast_time,
+        (bcast_time - split_time) * 1e6
     );
 }
