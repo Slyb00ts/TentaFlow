@@ -2192,7 +2192,7 @@ fn gemm_qk_dp4a_batch_matches_formats_dequant() {
                 .gemm_qk_dp4a_batch_at(&yb, &wb, 0, &xb, rows, cols, n_tokens, q6, &stream)
                 .unwrap();
             if !routed {
-                // Ścieżka dp4a batch to cubin CUDA; inne backendy jej nie mają.
+                // Kernel istnieje dla fali 32; karta bez niego jest pomijana.
                 eprintln!("pomijam batch dp4a dla T={n_tokens}: brak kernela");
                 continue;
             }

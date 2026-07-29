@@ -382,29 +382,26 @@ fn parse_dense_prefill_batch(value: Option<&str>) -> Result<DensePrefillBatchMod
     }
 }
 
-fn dense_prefill_auto_backend_capable(
-    vendor: Vendor,
-    warp_size: u32,
-    max_threads_per_block: u32,
-) -> bool {
-    vendor == Vendor::Nvidia && warp_size == 32 && max_threads_per_block >= 256
+/// Wymagania sprzetowe rownego dense prefillu — te same, ktore sprawdza
+/// `Kernels::dense_prefill_batch_capable`. O kompletnosc artefaktow pyta
+/// osobno `rollout_capable`, wiec producent nie ma tu nic do rzeczy.
+fn dense_prefill_auto_backend_capable(warp_size: u32, max_threads_per_block: u32) -> bool {
+    warp_size == 32 && max_threads_per_block >= 256
 }
 
 fn resolve_dense_prefill_batch(
     mode: DensePrefillBatchMode,
-    vendor: Vendor,
     warp_size: u32,
     max_threads_per_block: u32,
     rollout_capable: bool,
 ) -> Result<bool> {
-    let backend_capable =
-        dense_prefill_auto_backend_capable(vendor, warp_size, max_threads_per_block);
+    let backend_capable = dense_prefill_auto_backend_capable(warp_size, max_threads_per_block);
     match mode {
         DensePrefillBatchMode::Auto => Ok(backend_capable && rollout_capable),
         DensePrefillBatchMode::Off => Ok(false),
         DensePrefillBatchMode::ForceOn if backend_capable && rollout_capable => Ok(true),
         DensePrefillBatchMode::ForceOn => Err(ForgeError::Unsupported(
-            "FORGE_DENSE_PREFILL_BATCH=1 wymaga NVIDIA warp32, limitu 256 wątków, dense F16 KV i pełnych artefaktów B4/B8/B16".into(),
+            "FORGE_DENSE_PREFILL_BATCH=1 wymaga fali 32, limitu 256 wątków, dense F16 KV i pełnych artefaktów B4/B8/B16".into(),
         )),
     }
 }
@@ -708,7 +705,6 @@ pub fn spawn_engine_batched(
     let caps = model.device.caps();
     let dense_prefill_batch = resolve_dense_prefill_batch(
         dense_prefill_mode,
-        caps.vendor,
         caps.warp_size,
         caps.max_threads_per_block,
         model.dense_prefill_rollout_capable(),
@@ -2875,7 +2871,6 @@ mod tests {
         assert!(parse_dense_prefill_batch(Some("")).is_err());
         assert!(resolve_dense_prefill_batch(
             DensePrefillBatchMode::Auto,
-            Vendor::Nvidia,
             32,
             1024,
             true,
@@ -2883,7 +2878,6 @@ mod tests {
         .unwrap());
         assert!(!resolve_dense_prefill_batch(
             DensePrefillBatchMode::Auto,
-            Vendor::Nvidia,
             32,
             1024,
             false,
@@ -2891,7 +2885,6 @@ mod tests {
         .unwrap());
         assert!(!resolve_dense_prefill_batch(
             DensePrefillBatchMode::Off,
-            Vendor::Nvidia,
             32,
             1024,
             true,
@@ -2899,7 +2892,6 @@ mod tests {
         .unwrap());
         assert!(resolve_dense_prefill_batch(
             DensePrefillBatchMode::ForceOn,
-            Vendor::Nvidia,
             32,
             1024,
             true,
@@ -2907,7 +2899,6 @@ mod tests {
         .unwrap());
         assert!(resolve_dense_prefill_batch(
             DensePrefillBatchMode::ForceOn,
-            Vendor::Nvidia,
             32,
             1024,
             false,
@@ -2919,23 +2910,18 @@ mod tests {
     }
 
     #[test]
-    fn dense_prefill_auto_odrzuca_amd_wave64_i_brak_artefaktow() {
-        assert!(!dense_prefill_auto_backend_capable(Vendor::Amd, 64, 1024));
-        assert!(!dense_prefill_auto_backend_capable(
-            Vendor::Nvidia,
-            64,
-            1024
-        ));
-        assert!(!dense_prefill_auto_backend_capable(Vendor::Nvidia, 32, 128));
-        for (vendor, warp_size, max_threads, rollout_capable) in [
-            (Vendor::Amd, 64, 1024, true),
-            (Vendor::Nvidia, 64, 1024, true),
-            (Vendor::Nvidia, 32, 128, true),
-            (Vendor::Nvidia, 32, 1024, false),
+    fn dense_prefill_auto_odrzuca_wave64_i_brak_artefaktow() {
+        // Fala 32 i blok 256 wystarcza u obu producentow; fala 64 nie.
+        assert!(dense_prefill_auto_backend_capable(32, 1024));
+        assert!(!dense_prefill_auto_backend_capable(64, 1024));
+        assert!(!dense_prefill_auto_backend_capable(32, 128));
+        for (warp_size, max_threads, rollout_capable) in [
+            (64, 1024, true),
+            (32, 128, true),
+            (32, 1024, false),
         ] {
             assert!(!resolve_dense_prefill_batch(
                 DensePrefillBatchMode::Auto,
-                vendor,
                 warp_size,
                 max_threads,
                 rollout_capable,

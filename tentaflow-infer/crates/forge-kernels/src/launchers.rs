@@ -12578,8 +12578,11 @@ impl Kernels {
         {
             return Ok(false);
         }
-        let caps = self.device.caps();
-        if caps.vendor != forge_types::Vendor::Nvidia || caps.warp_size != 32 {
+        // Kontraktem tych kerneli jest fala 32 i instrukcja dot4 na int8 —
+        // ma ja tak samo RDNA (`v_dot4_i32_i8`). Obecnosc artefaktu sprawdza
+        // sie ponizej, wiec warunek producenta tylko wylaczal karty, dla
+        // ktorych kernel jest zbudowany.
+        if self.device.caps().warp_size != 32 {
             return Ok(false);
         }
         let name = if q6 {
