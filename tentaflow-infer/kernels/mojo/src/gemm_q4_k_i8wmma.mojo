@@ -17,8 +17,10 @@
 # liczy i zapisuje do `xsm`. Blok kwantyzacji aktywacji ma 32 kolumny, dokładnie
 # tyle co podblok skali Q4_K, więc oba podziały pokrywają się co do kolumny.
 
-from std.gpu import block_idx, thread_idx
-from std.memory import bitcast
+from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu.sync import barrier
+from std.gpu.memory import AddressSpace
+from std.memory import bitcast, stack_allocation
 
 from src.arch_wmma import wmma_i8_16x16x16
 from src.gemv2 import _q4k_scale_min
@@ -64,32 +66,35 @@ def gemm_q4_k_i8wmma_impl[
     `xq`/`xd`/`xsm` pochodzą z `quantize_act_q8_1`: kody [T, K], skale i sumy w
     układzie blokowym [K/32, T]. Siatka (ceil(n_rows / BN), ceil(n_tokens / BM)),
     `n_cols % 256 == 0`.
+
+    Wagi bloku rozpakowujemy RAZ do LDS razem ze skalami wiersza, a skale
+    aktywacji ładujemy raz na blok do rejestrów. Bez tego obie te rzeczy
+    powtarzały się dla każdego kafla i zjadały całą przewagę jednostki int8
+    (zmierzone: 735 wobec 2419 tok/s dla wariantu naiwnego).
     """
     comptime BM = WAVES_M * MTILE * TILE
     comptime BN = WAVES_N * NTILE * TILE
 
     var lane = Int(thread_idx.x) % 32
     var wave = Int(thread_idx.x) // 32
+    var tid = Int(thread_idx.x)
+    var threads = Int(block_dim.x)
     var base_m = Int(block_idx.y) * BM + (wave // WAVES_N) * MTILE * TILE
     var base_n = Int(block_idx.x) * BN + (wave % WAVES_N) * NTILE * TILE
 
     var superblocks = n_cols // SUPERBLOCK
     var blocks = n_cols // 32
 
-    # Wiersze i tokeny poza zakresem czytają ostatni legalny indeks — ich wyniki
-    # i tak nie są zapisywane, a zacisk trzyma odczyty w obrębie buforów.
     var x_base = InlineArray[Int, MTILE](fill=0)
     comptime for mt in range(MTILE):
         var m = base_m + mt * TILE + lane % 16
         if m > n_tokens - 1:
             m = n_tokens - 1
         x_base[mt] = m * n_cols
-    var w_base = InlineArray[Int, NTILE](fill=0)
-    comptime for nt in range(NTILE):
-        var n = base_n + nt * TILE + lane % 16
-        if n > n_rows - 1:
-            n = n_rows - 1
-        w_base[nt] = n * superblocks * SB_BYTES
+
+    ws = stack_allocation[BN * 32, Int8, address_space = AddressSpace.SHARED]()
+    ws_ds = stack_allocation[BN, Float32, address_space = AddressSpace.SHARED]()
+    ws_dm = stack_allocation[BN, Float32, address_space = AddressSpace.SHARED]()
 
     var acc = InlineArray[SIMD[DType.float32, 8], MTILE * NTILE](
         fill=SIMD[DType.float32, 8](0.0)
@@ -99,6 +104,49 @@ def gemm_q4_k_i8wmma_impl[
         var superblock = b // 8
         var block = b % 8
         var column = b * 32
+
+        # Rozpakowanie wag bloku do LDS: jeden wątek na (wiersz, połówka).
+        var slot = tid
+        while slot < BN * 2:
+            local_row = slot // 2
+            half = slot % 2
+            var source_row = Int(block_idx.x) * BN + local_row
+            if source_row > n_rows - 1:
+                source_row = n_rows - 1
+            sb_off = source_row * superblocks * SB_BYTES + superblock * SB_BYTES
+            (ws + local_row * 32 + half * TILE).store(
+                bitcast[DType.int8, 16](_weight_frag_i8(weights, sb_off, block, half))
+            )
+            if half == 0:
+                header = (weights + sb_off).load[width=16, alignment=1]()
+                d = Float32(
+                    (weights + sb_off).bitcast[Float16]().load[width=1, alignment=1]()[0]
+                )
+                dmin = Float32(
+                    (weights + sb_off + 2)
+                    .bitcast[Float16]()
+                    .load[width=1, alignment=1]()[0]
+                )
+                sc, mn = _q4k_scale_min(header, block)
+                ws_ds[local_row] = d * sc
+                ws_dm[local_row] = dmin * mn
+            slot += threads
+        barrier()
+
+        # Skale aktywacji: raz na blok, wspólne dla wszystkich kafli N.
+        var act_d = InlineArray[SIMD[DType.float32, 8], MTILE](
+            fill=SIMD[DType.float32, 8](0.0)
+        )
+        var act_s = InlineArray[SIMD[DType.float32, 8], MTILE](
+            fill=SIMD[DType.float32, 8](0.0)
+        )
+        comptime for mt in range(MTILE):
+            comptime for i in range(8):
+                var m = base_m + mt * TILE + i * 2 + lane // 16
+                if m > n_tokens - 1:
+                    m = n_tokens - 1
+                act_d[mt][i] = xd[b * n_tokens + m]
+                act_s[mt][i] = xsm[b * n_tokens + m]
 
         var a_lo = InlineArray[SIMD[DType.int32, 4], MTILE](
             fill=SIMD[DType.int32, 4](0)
@@ -115,34 +163,24 @@ def gemm_q4_k_i8wmma_impl[
             )
 
         comptime for nt in range(NTILE):
-            var sb_off = w_base[nt] + superblock * SB_BYTES
-            var header = (weights + sb_off).load[width=16, alignment=1]()
-            var d = Float32(
-                (weights + sb_off).bitcast[Float16]().load[width=1, alignment=1]()[0]
+            local_n = (wave % WAVES_N) * NTILE * TILE + nt * TILE + lane % 16
+            var b_lo = bitcast[DType.int32, 4](
+                (ws + local_n * 32).load[width=16]()
             )
-            var dmin = Float32(
-                (weights + sb_off + 2).bitcast[Float16]().load[width=1, alignment=1]()[0]
+            var b_hi = bitcast[DType.int32, 4](
+                (ws + local_n * 32 + TILE).load[width=16]()
             )
-            sc, mn = _q4k_scale_min(header, block)
-            var ds = d * sc
-            var dm = dmin * mn
-
-            var b_lo = _weight_frag_i8(weights, sb_off, block, 0)
-            var b_hi = _weight_frag_i8(weights, sb_off, block, 1)
-
+            var ds = ws_ds[local_n]
+            var dm = ws_dm[local_n]
             comptime for mt in range(MTILE):
                 var block_acc = SIMD[DType.int32, 8](0)
                 block_acc = wmma_i8_16x16x16(a_lo[mt], b_lo, block_acc)
                 block_acc = wmma_i8_16x16x16(a_hi[mt], b_hi, block_acc)
-                comptime for i in range(8):
-                    # (m, n) tego pola: m = i*2 + lane//16, n = lane % 16.
-                    var m = base_m + mt * TILE + i * 2 + lane // 16
-                    if m > n_tokens - 1:
-                        m = n_tokens - 1
-                    acc[mt * NTILE + nt][i] += (
-                        Float32(block_acc[i]) * ds * xd[b * n_tokens + m]
-                        - dm * xsm[b * n_tokens + m]
-                    )
+                acc[mt * NTILE + nt] += (
+                    block_acc.cast[DType.float32]() * ds * act_d[mt]
+                    - dm * act_s[mt]
+                )
+        barrier()
 
     comptime for mt in range(MTILE):
         comptime for nt in range(NTILE):

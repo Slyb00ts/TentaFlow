@@ -121,46 +121,75 @@ def gemm_q4_k_wmma_impl[
     # to 8 KiB dla BN=64.
     comptime WEIGHT_TILE = BN * CHUNK
     ws = stack_allocation[
-        WEIGHT_TILE, Float16, address_space = AddressSpace.SHARED
+        2 * WEIGHT_TILE, Float16, address_space = AddressSpace.SHARED
     ]()
     var threads = Int(block_dim.x)
     var tid = Int(thread_idx.x)
 
-    for superblock in range(superblocks):
-        for chunk in range(SUPERBLOCK // CHUNK):
-            var slot = tid
-            while slot < BN * GROUPS:
-                local_row = slot // GROUPS
-                group = slot % GROUPS
+    # Podwójne buforowanie: kafel `slot` liczymy, a `slot ^ 1` w tym czasie się
+    # zapełnia. Bez tego każda iteracja miała barierę po stronie stronicowania i
+    # po stronie liczenia, więc jedno nie nakładało się na drugie.
+    var chunks = superblocks * (SUPERBLOCK // CHUNK)
+
+    var stage_superblock_0 = (0) // (SUPERBLOCK // CHUNK)
+    var stage_chunk_0 = (0) % (SUPERBLOCK // CHUNK)
+    var stage_base_0 = (0) * WEIGHT_TILE
+    var pos_0 = tid
+    while pos_0 < BN * GROUPS:
+        local_row = pos_0 // GROUPS
+        group = pos_0 % GROUPS
+        var source_row = Int(block_idx.x) * BN + local_row
+        if source_row > n_rows - 1:
+            source_row = n_rows - 1
+        frag = _weight_frag(
+            weights,
+            source_row * superblocks * SB_BYTES + stage_superblock_0 * SB_BYTES,
+            stage_chunk_0 * GROUPS + group,
+        )
+        (ws + stage_base_0 + local_row * CHUNK + group * TILE).store(frag)
+        pos_0 += threads
+
+    barrier()
+
+    for chunk_index in range(chunks):
+        var slot = chunk_index % 2
+        var compute_base = slot * WEIGHT_TILE
+        var column_base = chunk_index * CHUNK
+
+        if chunk_index + 1 < chunks:
+            var stage_superblock_next = (chunk_index + 1) // (SUPERBLOCK // CHUNK)
+            var stage_chunk_next = (chunk_index + 1) % (SUPERBLOCK // CHUNK)
+            var stage_base_next = (slot ^ 1) * WEIGHT_TILE
+            var pos_next = tid
+            while pos_next < BN * GROUPS:
+                local_row = pos_next // GROUPS
+                group = pos_next % GROUPS
                 var source_row = Int(block_idx.x) * BN + local_row
                 if source_row > n_rows - 1:
                     source_row = n_rows - 1
                 frag = _weight_frag(
                     weights,
-                    source_row * superblocks * SB_BYTES + superblock * SB_BYTES,
-                    chunk * GROUPS + group,
+                    source_row * superblocks * SB_BYTES + stage_superblock_next * SB_BYTES,
+                    stage_chunk_next * GROUPS + group,
                 )
-                (ws + local_row * CHUNK + group * TILE).store(frag)
-                slot += threads
-            barrier()
+                (ws + stage_base_next + local_row * CHUNK + group * TILE).store(frag)
+                pos_next += threads
 
-            comptime for sub in range(GROUPS):
-                var column = superblock * SUPERBLOCK + chunk * CHUNK + sub * TILE
-                var a = InlineArray[SIMD[DType.float16, 16], MTILE](
-                    fill=SIMD[DType.float16, 16](0.0)
-                )
+        comptime for sub in range(GROUPS):
+            var column = column_base + sub * TILE
+            var a = InlineArray[SIMD[DType.float16, 16], MTILE](
+                fill=SIMD[DType.float16, 16](0.0)
+            )
+            comptime for mt in range(MTILE):
+                a[mt] = (x + x_base[mt] + column).load[width=16, alignment=2]()
+            comptime for nt in range(NTILE):
+                local_n = (wave % WAVES_N) * NTILE * TILE + nt * TILE + lane % 16
+                b = (ws + compute_base + local_n * CHUNK + sub * TILE).load[width=16]()
                 comptime for mt in range(MTILE):
-                    a[mt] = (x + x_base[mt] + column).load[width=16, alignment=2]()
-                comptime for nt in range(NTILE):
-                    local_n = (
-                        (wave % WAVES_N) * NTILE * TILE + nt * TILE + lane % 16
+                    acc[mt * NTILE + nt] = wmma_f16_16x16x16(
+                        a[mt], b, acc[mt * NTILE + nt]
                     )
-                    b = (ws + local_n * CHUNK + sub * TILE).load[width=16]()
-                    comptime for mt in range(MTILE):
-                        acc[mt * NTILE + nt] = wmma_f16_16x16x16(
-                            a[mt], b, acc[mt * NTILE + nt]
-                        )
-            barrier()
+        barrier()
 
     comptime for mt in range(MTILE):
         comptime for nt in range(NTILE):
