@@ -1034,6 +1034,11 @@ fn load_for_serve(
 /// `requested == 0` defaults to the model's own maximum; a non-zero request is
 /// honored as-is (down to a single page, up to the model's positional limit).
 /// Whether the resulting KV pool fits VRAM is decided later by pool sizing.
+/// Dolna granica automatycznego zmniejszania kontekstu. Ponizej tej wartosci
+/// model przestaje byc uzyteczny, wiec zamiast ciac dalej zostawiamy resztę
+/// wag na sciezce offloadu.
+const MIN_AUTO_CTX_TOKENS: usize = 8192;
+
 fn resolve_ctx(
     max_position_embeddings: usize,
     requested: usize,
@@ -1166,7 +1171,7 @@ fn load_auto(
     // KVFlash (`hot_pages > 0`) fixes the VRAM pool to a constant page count
     // regardless of --ctx; else 0 = a pool covering the whole context (today's
     // behavior) and an explicit --kv-pages caps the hot VRAM working set.
-    let layout = resolve_kv_pool_layout(
+    let mut layout = resolve_kv_pool_layout(
         &desc,
         page_size,
         ctx_pages,
@@ -1176,6 +1181,44 @@ fn load_auto(
         kv_quant,
         native_mtp,
     )?;
+    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
+    // Automatycznie dobrany kontekst NIE MOZE zaglodzic wag. Kazdy token czyta
+    // cale wagi, a strony KV zapelniaja sie dopiero wraz z dlugoscia sekwencji,
+    // wiec oddanie rezydentnych wag za wiekszy kontekst jest zawsze zla
+    // zamiana: Qwen3.6-27B na karcie 20 GiB schodzil tak do 1,6 GiB w VRAM i
+    // czytal 89% wag przez PCIe. Kontekst podany recznie zostaje nietkniety —
+    // to wybor uzytkownika.
+    let mut max_seq_len = max_seq_len;
+    let mut ctx_pages = ctx_pages;
+    if ctx == 0 && weights_pool_gb == 0.0 && hot_pages == 0 && kv_pages_flag == 0 {
+        let needed = checkpoint_weight_bytes(path).unwrap_or(0);
+        let free = gpu::free_vram(0).context("query free VRAM")?;
+        let floor_pages = MIN_AUTO_CTX_TOKENS.div_ceil(page_size);
+        let full_seq_len = max_seq_len;
+        while ctx_pages > floor_pages
+            && free.saturating_sub(pool_reserve_bytes(layout.bytes, activations)?) < needed
+        {
+            ctx_pages = (ctx_pages / 2).max(floor_pages);
+            max_seq_len = ctx_pages * page_size;
+            layout = resolve_kv_pool_layout(
+                &desc,
+                page_size,
+                ctx_pages,
+                kv_pages_flag,
+                hot_pages,
+                &kv_tier,
+                kv_quant,
+                native_mtp,
+            )?;
+        }
+        if max_seq_len < full_seq_len {
+            eprintln!(
+                "kontekst zmniejszony z {full_seq_len} do {max_seq_len} tokenow, zeby wagi \
+                 ({} MiB) zostaly w VRAM — podaj --ctx, zeby wymusic wiekszy",
+                needed >> 20
+            );
+        }
+    }
     let kv_pages = layout.pages;
     let stage = if kv_tier.enabled() {
         tier_stage_bytes(&desc, page_size, ctx_pages, kv_quant)?
@@ -1183,7 +1226,6 @@ fn load_auto(
         0
     };
 
-    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
     // `KvCache` alokuje wszystkie slaby targetu i opcjonalnego MTP w dedykowanej
     // puli; rozmiar uwzględnia wyrównanie każdego bufora do granulacji slabów.
     let hal_kv = layout.bytes;
