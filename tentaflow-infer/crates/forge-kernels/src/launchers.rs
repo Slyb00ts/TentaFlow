@@ -8721,6 +8721,46 @@ impl Kernels {
         )
     }
 
+    /// Przenośny kafel rejestrowy dla kart bez jednostki macierzowej. Jest
+    /// OSTATNIĄ deską ratunku: wołany dopiero wtedy, gdy dla danego formatu nie
+    /// ma ani wariantu macierzowego, ani szybkiej ścieżki `dot4`. Wyprzedzenie
+    /// nim `dot4` kosztowało na RX 6900 XT trzynastokrotny spadek prefillu.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_kblock_portable(
+        &self,
+        family: &str,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        const BM: usize = 32;
+        const BN: usize = 64;
+        let name = format!("{family}_tile_f16_bm32");
+        if !self.artifacts.has(&name) {
+            return Ok(false);
+        }
+        let kernel = self.artifacts.get(&name)?;
+        let config = LaunchConfig {
+            grid: (rows.div_ceil(BN) as u32, n_tokens.div_ceil(BM) as u32, 1),
+            block: (((BM / 4) * (BN / 4)) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(kernel, &config, &args, stream)?;
+        Ok(true)
+    }
+
     /// Prefillowy GEMM k-kwantów na jednostkach macierzowych RDNA3
     /// (WMMA 16x16x16), czytający surowe superbloki GGUF. `family` to przedrostek
     /// artefaktu, np. `gemm_q4_k_wmma_f16`. Zwraca `false`, gdy architektura nie
@@ -8745,17 +8785,10 @@ impl Kernels {
         } else {
             ("_bm256", 256usize, 256u32)
         };
-        // Najpierw kafel na jednostce macierzowej, a gdy architektura jej nie ma
-        // (RDNA2) — kafel przenośny liczący w rejestrach. Ten sam wynik, wolniej.
-        let matrix = format!("{family}{suffix}");
-        let portable = format!("{}_tile_f16_bm32", family.trim_end_matches("_wmma_f16"));
-        let (name, bm, block) = if self.artifacts.has(&matrix) {
-            (matrix, bm, block)
-        } else if self.artifacts.has(&portable) {
-            (portable, 32usize, 128u32)
-        } else {
+        let name = format!("{family}{suffix}");
+        if !self.artifacts.has(&name) {
             return Ok(false);
-        };
+        }
         let kernel = self.artifacts.get(&name)?;
         let config = LaunchConfig {
             grid: (
@@ -13344,6 +13377,11 @@ impl Kernels {
         )? {
             return Ok(());
         }
+        if self.gemm_kblock_portable(
+            "gemm_q5_k", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+        )? {
+            return Ok(());
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -13577,6 +13615,11 @@ impl Kernels {
         )? {
             return Ok(());
         }
+        if self.gemm_kblock_portable(
+            "gemm_q3_k", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+        )? {
+            return Ok(());
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q3_k_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -13807,6 +13850,11 @@ impl Kernels {
             cols,
             n_tokens,
             stream,
+        )? {
+            return Ok(());
+        }
+        if self.gemm_kblock_portable(
+            "gemm_q2_k", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
         )? {
             return Ok(());
         }
@@ -14063,6 +14111,11 @@ impl Kernels {
         )? {
             return Ok(());
         }
+        if self.gemm_kblock_portable(
+            "gemm_q4_0", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+        )? {
+            return Ok(());
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q4_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -14293,6 +14346,11 @@ impl Kernels {
             cols,
             n_tokens,
             stream,
+        )? {
+            return Ok(());
+        }
+        if self.gemm_kblock_portable(
+            "gemm_q4_1", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
         )? {
             return Ok(());
         }
@@ -14529,6 +14587,11 @@ impl Kernels {
         )? {
             return Ok(());
         }
+        if self.gemm_kblock_portable(
+            "gemm_q5_0", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+        )? {
+            return Ok(());
+        }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q5_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
@@ -14759,6 +14822,11 @@ impl Kernels {
             cols,
             n_tokens,
             stream,
+        )? {
+            return Ok(());
+        }
+        if self.gemm_kblock_portable(
+            "gemm_q5_1", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
         )? {
             return Ok(());
         }
