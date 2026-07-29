@@ -141,6 +141,10 @@ pub fn gemv_q8_0_row_split(
     }
     // Zbiórka: fragmenty trafiają na kartę zbierającą pod swoje przesunięcia,
     // więc wynik jest ułożony tak samo jak przy liczeniu na jednej karcie.
+    //
+    // Zbiórka jest punkt-punkt, czyli N-1 wymian do jednej karty. Dla kilku kart
+    // to najtańsze rozwiązanie; przy kilkunastu opłaci się zbiórka drzewiasta
+    // albo pierścieniowa, bo koszt rośnie tu liniowo z liczbą kart.
     for index in 0..cluster.len() {
         let rows = shards.rows_on(index);
         if rows == 0 {
@@ -181,6 +185,27 @@ mod tests {
         let plan = plan_split(&profiles, 4096, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
         assert_eq!(plan.total(), 4096);
         assert!(plan.rows[1] > plan.rows[0]);
+    }
+
+    #[test]
+    fn podzial_dziala_dla_dowolnej_liczby_kart() {
+        // Nic w podziale nie jest zaszyte pod dwie karty: sprawdzane dla 1, 3
+        // i 8 profili o różnej mocy.
+        for count in [1usize, 3, 8] {
+            let profiles: Vec<DeviceCapability> = (0..count)
+                .map(|i| caps(100e9 * (i as f64 + 1.0), 1e12, 32))
+                .collect();
+            let plan =
+                plan_split(&profiles, 16384, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
+            assert_eq!(plan.rows.len(), count);
+            assert_eq!(plan.total(), 16384, "suma udziałów przy {count} kartach");
+            if count > 1 {
+                assert!(
+                    plan.rows[count - 1] > plan.rows[0],
+                    "mocniejsza karta musi dostać więcej"
+                );
+            }
+        }
     }
 
     #[test]

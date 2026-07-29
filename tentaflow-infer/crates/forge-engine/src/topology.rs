@@ -737,6 +737,64 @@ mod tests {
         assert!(parallel_share(Technique::FfnTensorParallel) > parallel_share(Technique::Pipeline));
     }
 
+
+    #[test]
+    fn osiem_kart_w_czterech_nodach_daje_cztery_etapy_po_dwie() {
+        // Sprawdzian, że nic tu nie jest zaszyte pod dwie karty: cztery nody po
+        // dwie karty, P2P w nodzie, ethernet między nodami.
+        let c = cap(700e9, 9.0e12, 20);
+        let workers: Vec<Worker> = (0..8)
+            .map(|i| Worker {
+                id: WorkerId {
+                    node: NodeId(i as u32 / 2),
+                    device: i % 2,
+                },
+                capability: c,
+            })
+            .collect();
+        let mut links = Vec::new();
+        for a in 0..8 {
+            for b in 0..8 {
+                links.push(if a == b {
+                    Link::same_device()
+                } else if a / 2 == b / 2 {
+                    p2p()
+                } else {
+                    ethernet()
+                });
+            }
+        }
+        let topology = Topology::new(workers, links).unwrap();
+        let plan = plan_execution(&topology, profile(), WorkKind::MemoryBound).unwrap();
+        assert_eq!(plan.stages.len(), 4);
+        for stage in &plan.stages {
+            assert_eq!(stage.workers.len(), 2);
+        }
+        let total: usize = plan.stages.iter().map(|s| s.layers).sum();
+        assert_eq!(total, 65);
+    }
+
+    #[test]
+    fn cztery_karty_na_szybkim_laczu_licza_razem() {
+        let caps = [
+            cap(336e9, 1.1e12, 16),
+            cap(735e9, 9.7e12, 20),
+            cap(500e9, 5.0e12, 24),
+            cap(900e9, 12.0e12, 32),
+        ];
+        let topology = Topology::single_node(&caps, p2p()).unwrap();
+        let plan = plan_execution(&topology, profile(), WorkKind::MemoryBound).unwrap();
+        assert!(plan.is_pure_tensor_parallel());
+        assert_eq!(plan.stages[0].workers.len(), 4);
+        let rows = plan_stage_rows(&topology, &plan.stages[0], 16384, WorkKind::MemoryBound, 0)
+            .unwrap();
+        assert_eq!(rows.total(), 16384);
+        // Najmocniejsza karta musi dostać najwięcej, najsłabsza najmniej.
+        assert!(rows.rows[3] > rows.rows[1]);
+        assert!(rows.rows[1] > rows.rows[2]);
+        assert!(rows.rows[2] > rows.rows[0]);
+    }
+
     #[test]
     fn ta_sama_karta_ma_zerowy_koszt_wymiany() {
         assert_eq!(Link::same_device().exchange_seconds(1 << 20), 0.0);
