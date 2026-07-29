@@ -7197,6 +7197,24 @@ impl Model {
         Ok((nll_sum / count.max(1) as f64, count))
     }
 
+    /// Strumień rezydualny prefillu — granica etapu pipeline'u.
+    ///
+    /// Etap oddaje TO, a nie znormalizowane `x`: następny etap normalizuje po
+    /// swojemu swoją warstwą zerową, więc między kartami wędruje wyłącznie
+    /// rezydual. Bufor istnieje dopiero po pierwszym prefillu.
+    pub fn stage_hidden(&self) -> Result<&DevBuffer> {
+        self.prefill_bufs
+            .as_ref()
+            .map(|pb| &pb.h)
+            .ok_or_else(|| ForgeError::Scheduler("bufory prefillu jeszcze nie istnieją".into()))
+    }
+
+    /// Przygotowuje bufory prefillu bez liczenia, żeby etap NIE pierwszy miał
+    /// gdzie przyjąć stan z poprzedniej karty.
+    pub fn ensure_stage_buffers(&mut self) -> Result<()> {
+        self.ensure_prefill_bufs()
+    }
+
     /// Run a prompt chunk (≤ MAX_PREFILL_CHUNK tokens) through the model in one
     /// batched pass, appending to `seq`, and return the last token's logits.
     /// Not graph-captured: T varies per call and prefill launches are large
