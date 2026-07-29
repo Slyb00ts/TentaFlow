@@ -243,41 +243,65 @@ tam, gdzie ta sama praca na NVIDII przechodziła.
 - **Rollouty eksperymentalne** (hybrydowy prefill B2, MTP+n-gram) — bramki
   wdrożeniowe, nie zdolności sprzętu.
 
-## Otwarta usterka: hybrydowy prefill Qwen3.6 pada na AMD
+## Naprawiona usterka: host wyprzedzał GPU i nadpisywał przypięte bufory
 
-Qwen3.6-27B (`qwen35`, DeltaNet) na RX 7900 XT wywala się w prefillu:
+Qwen3.6-27B (`qwen35`, DeltaNet) na RX 7900 XT wywalał się w prefillu:
 
 ```
 Memory access fault by GPU node-2 ... Reason: Page not present or supervisor privilege.
 ```
 
-Ustalone:
+### Jak to znaleziono
 
-- **Próg to jeden wewnętrzny chunk.** Prompt 26 tokenów przechodzi; od ~50 tokenów
-  w górę pada. Wewnętrzny chunk hybrydowego prefill wynosi tu 32.
-- **Niedeterministycznie** — około 2 na 3 uruchomienia tego samego polecenia.
-- **Niezależne od trybu skanu** (`chunked` i `persistent` padają tak samo) oraz od
-  `FORGE_HYBRID_LAYER_MAJOR_PREFILL`.
-- **`AMD_SERIALIZE_KERNEL=3` usuwa błąd** i model odpowiada poprawnie. To wskazuje
-  na naruszoną KOLEJNOŚĆ między kernelami, a nie na przekroczenie zakresu w indeksie
-  — serializacja nie naprawiłaby wyścigu wewnątrz kernela.
-- **Nie wnosi jej zmiana strumieni na NonBlocking** z 2026-07-29: z przywróconą
-  flagą blokującą błąd występuje z tą samą częstością.
+Kolejne obserwacje zawężały problem, aż wskazały jedno miejsce:
 
-Usterka jest wcześniejsza niż ten audyt i zgodna z zapisem w `CLAUDE.md`, że ścieżkę
-hybrydową sprawdzono wykonawczo wyłącznie na CUDA. Skutek: Qwen3.6-27B jest na
-Radeonie bezużyteczny dla realnych promptów.
+1. **Próg to 32 tokeny** — tyle mieści jedna strona KV. Krótszy prompt przechodził.
+2. **Niedeterministycznie**, około 2 na 3 uruchomienia, i niezależnie od trasy
+   prefillu (layer-major, batched, sekwencyjna — wszystkie padały tak samo).
+3. **`AMD_SERIALIZE_KERNEL=3` usuwał błąd.** To wyklucza zły indeks w kernelu i
+   wskazuje na kolejność.
+4. **Adres błędu leżał 48 KiB przed początkiem puli KV** — czyli kernel policzył
+   adres z indeksu strony `-1`, wartownika wpisów niewypełnionych.
+5. **Zastąpienie wartownika `-1` powtórzoną ważną stroną usuwało błąd** — dowód,
+   że kernel czyta wpis spoza ważnego zakresu.
+6. Kernel czyta jednak `position < seq_lens[seq]`, więc zakres był poprawny —
+   chyba że `seq_len` na urządzeniu WYPRZEDZAŁ tablicę stron.
 
-Z tego powodu warunek `supports_deltanet_gated_scan_persistent_d128_f16` ZOSTAJE przy
-NVIDII. Artefakt `deltanet_gated_scan_persistent_d128_f16` jest zbudowany dla gfx1100,
-ale zdjęcie bramki nie ma jak zostać zweryfikowane, dopóki cała ścieżka hybrydowa na
-AMD pada — a bramka opisuje „kombinację zweryfikowaną", nie „kernel, który się
-skompilował".
+### Przyczyna
 
-### Powtórzenie
+Wejścia jednego tokenu (`token_id`, `pos`, `seq_len`), tablica stron i wiersz
+embeddingu szły przez **pojedyncze** przypięte bufory pośrednie, z których kopie
+na urządzenie są ASYNCHRONICZNE. Host nadpisywał te bufory dla kolejnego tokenu,
+zanim poprzednia kopia zdążyła się wykonać, więc na urządzenie trafiały dane
+z przyszłości: `seq_len` rósł szybciej niż tablica stron, a kernel sięgał po
+stronę `-1`.
 
-```bash
-P=$(python3 -c "print('Wyjasnij dzialanie pamieci podrecznej procesora. ' * 10)")
-HIP_VISIBLE_DEVICES=1 ./target-amd/release/forge run \
-  /mnt/d/models/bench/qwen36-27b-Q4_K_M.gguf "$P" --max-tokens 4 --temp 0
+Dekodowanie tego nie ujawniało, bo synchronizuje się co token po logity —
+host nie ma jak wyprzedzić GPU. Prefill nie synchronizuje się aż do ostatniego
+tokenu i wyprzedza o setki kroków.
+
+### Naprawa
+
+Przypięte bufory pośrednie mają pierścień 64 slotów i zdarzenie na każdy z nich;
+slot wolno nadpisać dopiero po potwierdzeniu, że jego kopia dotarła. Ten sam
+wzorzec był już w kodzie dla prefillu layer-major
+(`HYBRID_HOST_STAGING_SLOTS`) — brakowało go w ścieżce per token.
+
+### Drugi wyścig: wiersz embeddingu
+
+Po naprawie awaria zniknęła, ale model odpowiadał bełkotem (`" to to to to"`).
+Ta sama przyczyna, inny bufor: `pinned_embed` też był pojedynczy, więc token
+dostawał embedding następnego. Rozstrzygnął test porównawczy — z
+`AMD_SERIALIZE_KERNEL=3` odpowiedź była poprawna, bez niego bełkot. Po objęciu
+embeddingu tym samym pierścieniem oba wyjścia są identyczne.
+
+### Wynik
+
 ```
+$ forge run qwen36-27b-Q4_K_M.gguf "Stolica Polski to" --max-tokens 16 --temp 0 --no-chat
+ miasto, które w ciągu ostatnich lat bardzo się rozwinęło. W
+```
+
+Prompt 170 tokenów przechodzi 5/5, 28 tok/s. Modele gęste bez zmian
+(Bielik 7B 121,8 tok/s, Bielik 11B 83,9, Gemma 12B QAT 105,2, Nemo 12B 55,9).
+Cały zestaw testów: 724 przechodzi, 0 porażek.
