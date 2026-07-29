@@ -404,3 +404,20 @@ Dla porządku: samo przerzucenie CAŁEGO FFN na szybszą kartę (`0,11264`) daje
 1,13x. Podział daje 1,44x, więc dzielenie pracy jest wyraźnie lepsze niż jej
 przeniesienie — i to jest odpowiedź na pytanie, czy warto było robić TP zamiast
 prostego offloadu.
+
+### Jak to włączyć
+
+`--tp-cards <numery>` w `forge run` i `forge serve`. Karta modelu jest zawsze
+pierwsza, wymienia się tylko te, które mają ją wesprzeć:
+
+```
+forge run model.gguf "prompt" --tp-cards 1
+forge serve model.gguf --bind 127.0.0.1:8099 --tp-cards 1
+```
+
+Sprawdzone na prawdziwej binarce, nie tylko w sondzie. Bielik 7B Q8_0, 64 tokeny,
+RX 6900 XT + RX 7900 XT: **72,0 -> 100,3 tok/s** (liczone z prefillem, stąd więcej
+niż 58 -> 83 dla samego dekodowania), z IDENTYCZNYM tekstem wyjściowym co do
+słowa. `serve` odpowiada poprawnie przez `/v1/chat/completions`.
+
+Bez tej flagi nic się nie zmienia: podział jest wyłącznie na żądanie operatora.

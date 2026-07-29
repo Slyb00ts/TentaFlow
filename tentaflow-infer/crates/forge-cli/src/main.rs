@@ -165,6 +165,12 @@ enum Command {
         /// przechodzi startup preflight pamięci. Spekulacja wyłącza prefix cache.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
+        /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
+        /// przecinku, np. `--tp-cards 1`. Karta modelu jest zawsze pierwsza,
+        /// wymienia się tylko te, które mają ją wesprzeć. Obejmuje dekodowanie
+        /// modeli gęstych z wagami Q8_0; prefill zostaje na jednej karcie.
+        #[arg(long = "tp-cards")]
+        tp_cards: Option<String>,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -274,6 +280,12 @@ enum Command {
         /// Włączenie wymusza `--prefix-cache off`.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
+        /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
+        /// przecinku, np. `--tp-cards 1`. Karta modelu jest zawsze pierwsza,
+        /// wymienia się tylko te, które mają ją wesprzeć. Obejmuje dekodowanie
+        /// modeli gęstych z wagami Q8_0; prefill zostaje na jednej karcie.
+        #[arg(long = "tp-cards")]
+        tp_cards: Option<String>,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -434,6 +446,7 @@ fn main() -> Result<()> {
             kvflash,
             prefix_cache,
             speculative,
+            tp_cards,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -464,6 +477,7 @@ fn main() -> Result<()> {
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
+                parse_tp_cards(tp_cards.as_deref())?,
             )
         }
         Command::Embed {
@@ -506,6 +520,7 @@ fn main() -> Result<()> {
             kvflash,
             prefix_cache,
             speculative,
+            tp_cards,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -532,6 +547,7 @@ fn main() -> Result<()> {
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
+                parse_tp_cards(tp_cards.as_deref())?,
             )
         }
         Command::Transcribe {
@@ -736,6 +752,62 @@ fn resolve_bench_nvfp4_gguf_layout(
         "1" => Ok(Nvfp4GgufLayout::TileN128K64),
         _ => bail!("FORGE_BENCH_NVFP4_TILE musi mieć wartość 0 albo 1"),
     }
+}
+
+/// Włącza podział FFN, gdy operator wskazał dodatkowe karty.
+///
+/// Pula wag kart pomocniczych jest tej samej wielkości co pula karty modelu:
+/// fragment jest mniejszy od całych wag, więc to margines, nie wymaganie.
+fn enable_tp_ffn(
+    model: &mut forge_engine::model::Model,
+    model_path: &Path,
+    cards: &[forge_hal::gpu::DeviceId],
+    weights_pool_gb: f64,
+) -> Result<()> {
+    if cards.is_empty() {
+        return Ok(());
+    }
+    let pools = forge_hal::PoolSizes {
+        weights: ((weights_pool_gb.max(1.0)) * (1u64 << 30) as f64) as usize,
+        kv_cache: 64 << 20,
+        activations: 256 << 20,
+        kv_page_size: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
+    };
+    model.enable_tp_ffn(model_path, cards, pools, None, None)?;
+    let tp = model.tp_ffn().expect("podział właśnie włączony");
+    eprintln!(
+        "podział FFN na {} kart (P2P {}): {:?} wierszy pośrednich warstwy 0",
+        tp.cards(),
+        tp.peer_access(),
+        tp.split_of(0)
+    );
+    Ok(())
+}
+
+/// Numery kart do podziału FFN, np. `1` albo `1,2`. `None` znaczy jedną kartę.
+fn parse_tp_cards(spec: Option<&str>) -> Result<Vec<forge_hal::gpu::DeviceId>> {
+    let Some(spec) = spec else {
+        return Ok(Vec::new());
+    };
+    let visible = forge_hal::gpu::enumerate();
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let index: usize = part
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--tp-cards: `{part}` nie jest numerem karty"))?;
+        let id = *visible.get(index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--tp-cards: nie ma karty {index}, widocznych jest {}",
+                visible.len()
+            )
+        })?;
+        if out.contains(&id) {
+            return Err(anyhow::anyhow!("--tp-cards: karta {index} podana dwa razy"));
+        }
+        out.push(id);
+    }
+    Ok(out)
 }
 
 fn parse_prefix_cache(s: &str) -> Result<bool> {
@@ -1525,6 +1597,7 @@ fn cmd_serve(
     hot_pages: usize,
     prefix_cache: bool,
     spec: SpeculativeConfig,
+    tp_cards: Vec<forge_hal::gpu::DeviceId>,
 ) -> Result<()> {
     // Speculation appends + rolls back draft KV on the plain paged cache; the
     // radix prefix cache donates/borrows pages and is mutually exclusive with
@@ -1553,6 +1626,7 @@ fn cmd_serve(
         ),
         Nvfp4GgufLayout::RowMajor36,
     )?;
+    enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
     let full_context_admission = kv_full_context_admission_capacity(
         kv_pages,
         max_seq_len.div_ceil(ModelConfig::default().kv_page_size),
@@ -1769,6 +1843,7 @@ fn cmd_run(
     hot_pages: usize,
     prefix_cache: bool,
     spec: SpeculativeConfig,
+    tp_cards: Vec<forge_hal::gpu::DeviceId>,
 ) -> Result<()> {
     // Ustawienia domyślne bierze profil modelu; flagi CLI je nadpisują. Bez tego
     // `forge run <model> "<prompt>"` losowałby przy temperaturze 0,7 i podawał
@@ -1819,6 +1894,7 @@ fn cmd_run(
         Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true, None)?;
 
     let prompt_text = if chat {
