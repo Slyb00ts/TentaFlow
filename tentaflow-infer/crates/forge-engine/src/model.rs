@@ -1119,6 +1119,8 @@ pub struct Model {
     hybrid_verify_graphs: HashMap<(usize, usize), ExecGraph>,
     /// Nieudana próba przechwycenia wyłącza kolejne próby dla danej pary.
     hybrid_verify_graph_disabled: HashSet<(usize, usize)>,
+    /// FFN rozłożony na karty. `None` = cały model liczy jedna karta.
+    tp_ffn: Option<crate::tensor_parallel::TpFfn>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
     /// Przechwycony krok dekodowania modelu hybrydowego (qwen35/DeltaNet).
@@ -3028,6 +3030,7 @@ impl Model {
             hybrid_layer_major_bufs: None,
             hybrid_verify_graphs: HashMap::new(),
             hybrid_verify_graph_disabled: HashSet::new(),
+            tp_ffn: None,
             decode_graph: None,
             decode_hybrid_graph: None,
             decode_moe_graph: None,
@@ -7731,6 +7734,80 @@ impl Model {
     /// downloading logits or synchronizing. The next-token logits are left
     /// in the device logits buffer for either the pinned D2H (`step`) or the
     /// on-GPU sampler (`step_and_sample`).
+    /// Czy model nadaje się do rozłożenia FFN na karty.
+    ///
+    /// Wymagania są wymaganiami ŚCIEŻKI, nie zachcianką: podział działa na
+    /// gęstym FFN liczonym jawnym łańcuchem dekodowania, więc MoE, model
+    /// hybrydowy, obrotowy cache i tiering odpadają — każde z nich ma własną
+    /// pętlę warstw, w której tego FFN po prostu nie ma.
+    pub fn tp_ffn_capable(&self) -> Result<()> {
+        if self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "podział FFN na karty obejmuje modele gęste".into(),
+            ));
+        }
+        if self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "model hybrydowy ma własną pętlę warstw, bez tego FFN".into(),
+            ));
+        }
+        if self.kv.cfg.quant.is_rot() {
+            return Err(ForgeError::Unsupported(
+                "obrotowy cache KV idzie osobnym łańcuchem dekodowania".into(),
+            ));
+        }
+        if self.tier.is_some() {
+            return Err(ForgeError::Unsupported(
+                "tiering KV wyklucza podział FFN na karty".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rozkłada FFN modelu na `extra` dodatkowych kart obok tej, na której model
+    /// już stoi.
+    ///
+    /// Wagi FFN są czytane z pliku PONOWNIE i cięte planem ze zmierzonej mocy
+    /// kart. Prefill nadal liczy je macierzowo na jednej karcie, więc jego kopia
+    /// zostaje — podział obejmuje dekodowanie, gdzie FFN jest ograniczony pasmem
+    /// i druga karta faktycznie coś wnosi.
+    pub fn enable_tp_ffn(
+        &mut self,
+        path: &Path,
+        extra: &[forge_hal::gpu::DeviceId],
+        pools: forge_hal::PoolSizes,
+        layer_range: Option<(usize, usize)>,
+        forced: Option<&[usize]>,
+    ) -> Result<()> {
+        if extra.is_empty() {
+            return Err(ForgeError::Scheduler(
+                "podział FFN wymaga co najmniej jednej dodatkowej karty".into(),
+            ));
+        }
+        self.tp_ffn_capable()?;
+        let cluster = crate::cluster::Cluster::attach(self.device.clone(), extra, pools)?;
+        let caps = cluster.calibrate(QuantKind::Q8_0)?;
+        let layers =
+            crate::weights::load_ffn_shards_gguf(path, &cluster, &caps, layer_range, forced)?;
+        if layers.len() != self.weights.layers.len() {
+            return Err(ForgeError::Format(format!(
+                "podział objął {} warstw, model ma {}",
+                layers.len(),
+                self.weights.layers.len()
+            )));
+        }
+        let hidden = self.weights.descriptor.params.hidden_size;
+        self.tp_ffn = Some(crate::tensor_parallel::TpFfn::new(cluster, layers, hidden)?);
+        // Krok dekodowania przestaje być jednokartowy, więc przechwycony graf
+        // przestaje go opisywać.
+        self.decode_graph = None;
+        Ok(())
+    }
+
+    pub fn tp_ffn(&self) -> Option<&crate::tensor_parallel::TpFfn> {
+        self.tp_ffn.as_ref()
+    }
+
     fn step_launch(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<()> {
         self.ensure_kv_reuse_healthy()?;
         self.tick_moe_residency()?;
@@ -7818,6 +7895,12 @@ impl Model {
                 return self.device.launch_graph(&graph, &self.stream);
             }
             return self.run_step_moe();
+        }
+
+        // Podział FFN na karty: krok obejmuje pracę dwóch urządzeń, więc nie
+        // mieści się w jednym grafie i idzie jawnym łańcuchem.
+        if self.tp_ffn.is_some() {
+            return self.run_step_separate(AttnSrc::Paged);
         }
 
         // Rot decode commits the current token into the packed store + ring and
@@ -12911,18 +12994,23 @@ impl Model {
                     stream,
                 )?;
 
-                match &layer.dense_ffn()?.gate_up {
-                    GateUpWeights::Fused(w) => {
-                        self.gemv(&b.gate_up, w, &b.x, stream)?;
-                        kernels.glu_mul_f16_at(self.ffn_act(), &b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
-                    }
-                    GateUpWeights::Split { gate, up } => {
-                        self.gemv(&b.gate, gate, &b.x, stream)?;
-                        self.gemv(&b.up, up, &b.x, stream)?;
-                        kernels.glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
+                match &self.tp_ffn {
+                    Some(tp) => tp.forward(stream, l, &b.x, &b.down, self.ffn_act())?,
+                    None => {
+                        match &layer.dense_ffn()?.gate_up {
+                            GateUpWeights::Fused(w) => {
+                                self.gemv(&b.gate_up, w, &b.x, stream)?;
+                                kernels.glu_mul_f16_at(self.ffn_act(), &b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
+                            }
+                            GateUpWeights::Split { gate, up } => {
+                                self.gemv(&b.gate, gate, &b.x, stream)?;
+                                self.gemv(&b.up, up, &b.x, stream)?;
+                                kernels.glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
+                            }
+                        }
+                        self.gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
                     }
                 }
-                self.gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
 
                 let next_norm = if l + 1 < n_layers {
                     &self.weights.layers[l + 1].attn_norm

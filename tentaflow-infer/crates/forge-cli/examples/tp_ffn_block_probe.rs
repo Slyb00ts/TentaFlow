@@ -131,6 +131,7 @@ fn main() {
         HIDDEN,
         INTER,
         WorkKind::MemoryBound,
+        None,
     )
     .expect("podzial FFN");
     let rows_plan: Vec<usize> = (0..cluster.len()).map(|i| shards.rows_on(i)).collect();

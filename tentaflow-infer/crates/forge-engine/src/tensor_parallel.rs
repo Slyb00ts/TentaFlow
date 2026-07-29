@@ -266,6 +266,23 @@ pub fn upload_column_split(
     cols: usize,
     kind: WorkKind,
 ) -> Result<ColShards> {
+    upload_column_split_with(cluster, caps, data, rows, cols, kind, None)
+}
+
+/// Jak `upload_column_split`, ale z możliwością NARZUCENIA podziału (kolumny na
+/// kartę). Zmierzona moc kart jest dobrym domyślnym planem, nie jedynym: pomiar
+/// robi duży przebieg strumieniowy, a pojedyncza warstwa to wąski GEMV, gdzie
+/// proporcje wychodzą inne. Jawny plan pozwala to zmierzyć zamiast zakładać.
+#[allow(clippy::too_many_arguments)]
+pub fn upload_column_split_with(
+    cluster: &Cluster,
+    caps: &[DeviceCapability],
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    kind: WorkKind,
+    forced: Option<&[usize]>,
+) -> Result<ColShards> {
     if caps.len() != cluster.len() {
         return Err(ForgeError::Scheduler(
             "liczba profili możliwości musi odpowiadać liczbie kart".into(),
@@ -287,7 +304,25 @@ pub fn upload_column_split(
     // Dzielimy BLOKI, nie pojedyncze kolumny — stąd podział liczony w blokach
     // i przemnożony z powrotem przez 32.
     let blocks = cols / Q8_0_BLOCK;
-    let plan = plan_split(caps, blocks, kind, Q8_0_BLOCK_BYTES * rows, 1)?;
+    let plan = match forced {
+        Some(columns) => {
+            if columns.len() != cluster.len() || columns.iter().sum::<usize>() != cols {
+                return Err(ForgeError::Scheduler(format!(
+                    "narzucony podział {columns:?} nie sumuje się do {cols} kolumn na {} kart",
+                    cluster.len()
+                )));
+            }
+            if let Some(bad) = columns.iter().find(|c| !c.is_multiple_of(Q8_0_BLOCK)) {
+                return Err(ForgeError::Scheduler(format!(
+                    "narzucony podział musi iść po pełnych blokach 32, jest {bad}"
+                )));
+            }
+            crate::multi_gpu::SplitPlan {
+                rows: columns.iter().map(|c| c / Q8_0_BLOCK).collect(),
+            }
+        }
+        None => plan_split(caps, blocks, kind, Q8_0_BLOCK_BYTES * rows, 1)?,
+    };
 
     let mut shards = Vec::with_capacity(cluster.len());
     let mut offsets = Vec::with_capacity(cluster.len());
@@ -347,36 +382,68 @@ pub fn gemv_q8_0_column_split(
             continue;
         }
         let entry = cluster.device(index)?;
-        entry.kernels.gemv_q8_0_out_f32(
-            &y_parts[index],
-            shards.shard(index)?,
-            &x_parts[index],
-            rows,
-            shards.cols_on(index),
-            &entry.stream,
-        )?;
+        let cols = shards.cols_on(index);
+        // Ten sam wybór co wyżej — z wyjściem w f32, bo to są sumy CZĄSTKOWE i
+        // dodawanie ich w f16 gubiłoby bity przy każdej karcie.
+        if cols <= forge_kernels::Kernels::DP4A_MAX_COLS {
+            entry.kernels.gemv_q8_0_dp4a_out_f32(
+                &y_parts[index],
+                shards.shard(index)?,
+                &x_parts[index],
+                rows,
+                cols,
+                &entry.stream,
+            )?;
+        } else {
+            entry.kernels.gemv_q8_0_out_f32(
+                &y_parts[index],
+                shards.shard(index)?,
+                &x_parts[index],
+                rows,
+                cols,
+                &entry.stream,
+            )?;
+        }
     }
     // Redukcja: karta zbierająca dodaje do siebie sumy cząstkowe pozostałych.
     // Każda z nich to pełny wektor `rows`, więc tu nie ma przesunięć — jest
     // dodawanie.
     let target = cluster.device(gather_on)?;
-    target.device.copy(
-        &y_parts[gather_on],
-        0,
-        y_full,
-        0,
-        rows * 4,
-        &target.stream,
-    )?;
+    // Karta zbierająca bywa bez kolumn (podział może jej nic nie dać) — wtedy
+    // jej bufor cząstkowy nie został policzony i nie wolno nim zasiać sumy.
+    let seeded = shards.cols_on(gather_on) > 0;
+    if seeded {
+        target.device.copy(
+            &y_parts[gather_on],
+            0,
+            y_full,
+            0,
+            rows * 4,
+            &target.stream,
+        )?;
+    }
+    let mut first = !seeded;
     for index in 0..cluster.len() {
         if index == gather_on || shards.cols_on(index) == 0 {
             continue;
         }
         cluster.exchange(index, &y_parts[index], 0, gather_on, staging, 0, rows * 4)?;
         cluster.wait_for(gather_on, index)?;
-        target
-            .kernels
-            .add_f32(y_full, y_full, staging, rows, &target.stream)?;
+        if first {
+            target
+                .device
+                .copy(staging, 0, y_full, 0, rows * 4, &target.stream)?;
+            first = false;
+        } else {
+            target
+                .kernels
+                .add_f32(y_full, y_full, staging, rows, &target.stream)?;
+        }
+    }
+    if first {
+        return Err(ForgeError::Scheduler(
+            "podział kolumnowy nie przydzielił kolumn żadnej karcie".into(),
+        ));
     }
     Ok(())
 }
@@ -402,6 +469,7 @@ impl FfnShards {
 ///
 /// Plan wyznacza podział `down` po kolumnach (bo tam granica musi paść na pełny
 /// blok Q8_0), a `gate`/`up` dostają dokładnie te same granice w wierszach.
+#[allow(clippy::too_many_arguments)]
 pub fn upload_ffn_split(
     cluster: &Cluster,
     caps: &[DeviceCapability],
@@ -411,8 +479,9 @@ pub fn upload_ffn_split(
     hidden: usize,
     inter: usize,
     kind: WorkKind,
+    forced: Option<&[usize]>,
 ) -> Result<FfnShards> {
-    let down = upload_column_split(cluster, caps, down, hidden, inter, kind)?;
+    let down = upload_column_split_with(cluster, caps, down, hidden, inter, kind, forced)?;
     let rows: Vec<usize> = (0..cluster.len()).map(|i| down.cols_on(i)).collect();
     let gate = upload_rows_by_plan(cluster, gate, inter, hidden, &rows)?;
     let up = upload_rows_by_plan(cluster, up, inter, hidden, &rows)?;
@@ -494,22 +563,23 @@ pub fn ffn_forward_split(
             continue;
         }
         let entry = cluster.device(index)?;
-        entry.kernels.gemv_q8_0_f16(
-            &ws.gate[index],
-            &shards.gate[index],
-            &ws.x[index],
-            rows,
-            hidden,
-            &entry.stream,
-        )?;
-        entry.kernels.gemv_q8_0_f16(
-            &ws.up[index],
-            &shards.up[index],
-            &ws.x[index],
-            rows,
-            hidden,
-            &entry.stream,
-        )?;
+        // Dobór kernela musi być TEN SAM co w `Model::gemv`: dla Q8_0 w zasięgu
+        // dp4a silnik kwantyzuje aktywację do int8. Liczenie tu dokładniej
+        // brzmi niewinnie, ale znaczy, że podział zmienia wynik modelu — a ma
+        // zmieniać wyłącznie to, która karta go liczy.
+        let gemv_f16 = |y: &DevBuffer, w: &DevBuffer| -> Result<()> {
+            if hidden <= forge_kernels::Kernels::DP4A_MAX_COLS {
+                entry
+                    .kernels
+                    .gemv_q8_0_dp4a_f16(y, w, &ws.x[index], rows, hidden, &entry.stream)
+            } else {
+                entry
+                    .kernels
+                    .gemv_q8_0_f16(y, w, &ws.x[index], rows, hidden, &entry.stream)
+            }
+        };
+        gemv_f16(&ws.gate[index], &shards.gate[index])?;
+        gemv_f16(&ws.up[index], &shards.up[index])?;
         entry.kernels.glu_mul_f16(
             activation,
             &ws.mid[index],
@@ -528,4 +598,151 @@ pub fn ffn_forward_split(
         staging,
         gather_on,
     )
+}
+
+/// Cały FFN modelu rozłożony na karty — to, co silnik trzyma i woła raz na
+/// warstwę zamiast trzech własnych GEMV.
+///
+/// Karta 0 klastra jest kartą modelu (patrz `Cluster::attach`), więc wejście i
+/// wyjście to bufory silnika, a nie kopie. Wymiana przypada JEDNA na warstwę:
+/// rozgłoszenie wejścia i redukcja sum cząstkowych `down`.
+pub struct TpFfn {
+    cluster: Cluster,
+    layers: Vec<FfnShards>,
+    ws: FfnWorkspace,
+    /// Suma w f32 — dodawanie w f16 gubiłoby bity przy każdej karcie.
+    acc: DevBuffer,
+    staging: DevBuffer,
+    /// Granica strumienia silnika i strumieni klastra, bez powrotu do hosta.
+    enter: forge_hal::Event,
+    leave: forge_hal::Event,
+    hidden: usize,
+}
+
+impl TpFfn {
+    /// Buduje kontekst z gotowych fragmentów wag (jeden komplet na warstwę).
+    pub fn new(cluster: Cluster, layers: Vec<FfnShards>, hidden: usize) -> Result<Self> {
+        if layers.is_empty() {
+            return Err(ForgeError::Scheduler("tensor parallel bez warstw".into()));
+        }
+        let mut ws = FfnWorkspace {
+            x: Vec::new(),
+            gate: Vec::new(),
+            up: Vec::new(),
+            mid: Vec::new(),
+            partial: Vec::new(),
+        };
+        // Bufory robocze muszą pomieścić NAJSZERSZY przydział spośród warstw —
+        // plan jest ten sam dla każdej z nich, ale liczony osobno, więc równości
+        // nie zakładamy.
+        for index in 0..cluster.len() {
+            let rows = layers
+                .iter()
+                .map(|l| l.rows_on(index))
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            let entry = cluster.device(index)?;
+            let mk = |bytes: usize| entry.device.alloc(bytes, MemKind::Device, Pool::Activations);
+            ws.x.push(mk(hidden * 2)?);
+            ws.gate.push(mk(rows * 2)?);
+            ws.up.push(mk(rows * 2)?);
+            ws.mid.push(mk(rows * 2)?);
+            ws.partial.push(mk(hidden * 4)?);
+        }
+        let primary = cluster.device(0)?;
+        let acc = primary
+            .device
+            .alloc(hidden * 4, MemKind::Device, Pool::Activations)?;
+        let staging = primary
+            .device
+            .alloc(hidden * 4, MemKind::Device, Pool::Activations)?;
+        let enter = primary.device.create_event()?;
+        let leave = primary.device.create_event()?;
+        Ok(Self {
+            cluster,
+            layers,
+            ws,
+            acc,
+            staging,
+            enter,
+            leave,
+            hidden,
+        })
+    }
+
+    pub fn layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn cards(&self) -> usize {
+        self.cluster.len()
+    }
+
+    pub fn peer_access(&self) -> bool {
+        self.cluster.peer_access()
+    }
+
+    /// Podział wierszy wymiaru pośredniego warstwy — do raportu przy starcie.
+    pub fn split_of(&self, layer: usize) -> Vec<usize> {
+        (0..self.cluster.len())
+            .map(|i| self.layers[layer].rows_on(i))
+            .collect()
+    }
+
+    /// `y = down · act(gate·x, up·x)` dla jednej warstwy, na wszystkich kartach.
+    ///
+    /// `x` i `y` to bufory f16 silnika na jego własnym strumieniu; kolejność z
+    /// pracą klastra pilnują zdarzenia, więc host nigdy nie synchronizuje.
+    pub fn forward(
+        &self,
+        model_stream: &forge_hal::Stream,
+        layer: usize,
+        x: &DevBuffer,
+        y: &DevBuffer,
+        activation: forge_formats::FfnActivation,
+    ) -> Result<()> {
+        let shards = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| ForgeError::Scheduler(format!("brak warstwy {layer} w podziale")))?;
+        let primary = self.cluster.device(0)?;
+        primary.device.record_event(&self.enter, model_stream)?;
+        for index in 0..self.cluster.len() {
+            let entry = self.cluster.device(index)?;
+            entry.device.wait_event(&entry.stream, &self.enter)?;
+        }
+
+        // Rozgłoszenie wejścia: wymiar ukryty nie jest dzielony, więc każda
+        // karta potrzebuje go w całości.
+        primary
+            .device
+            .copy(x, 0, &self.ws.x[0], 0, self.hidden * 2, &primary.stream)?;
+        for index in 1..self.cluster.len() {
+            if shards.rows_on(index) == 0 {
+                continue;
+            }
+            self.cluster
+                .exchange(0, x, 0, index, &self.ws.x[index], 0, self.hidden * 2)?;
+            self.cluster.wait_for(index, 0)?;
+        }
+
+        ffn_forward_split(
+            &self.cluster,
+            shards,
+            &self.ws,
+            &self.acc,
+            &self.staging,
+            self.hidden,
+            activation,
+            0,
+        )?;
+        primary
+            .kernels
+            .cast_f32_f16(y, &self.acc, self.hidden, &primary.stream)?;
+        primary
+            .device
+            .record_event(&self.leave, &primary.stream)?;
+        primary.device.wait_event(model_stream, &self.leave)
+    }
 }

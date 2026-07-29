@@ -4841,3 +4841,81 @@ mod tests {
         );
     }
 }
+
+/// Wczytuje wagi FFN modelu GGUF i rozkłada je na karty klastra.
+///
+/// Osobna ścieżka obok głównego ładowania: silnik trzyma swoje wagi na jednej
+/// karcie (prefill liczy je macierzowo), a tensor parallel potrzebuje TYCH
+/// SAMYCH macierzy pociętych inaczej. Czytanie ich drugi raz z pliku jest
+/// tańsze niż wprowadzanie podziału w środek loadera — i nie dotyka ścieżki,
+/// którą jedzie każdy inny model.
+pub fn load_ffn_shards_gguf(
+    path: &Path,
+    cluster: &crate::cluster::Cluster,
+    caps: &[crate::multi_gpu::DeviceCapability],
+    layer_range: Option<(usize, usize)>,
+    forced: Option<&[usize]>,
+) -> Result<Vec<crate::tensor_parallel::FfnShards>> {
+    let gguf = Gguf::open(path)?;
+    let mut descriptor = ModelDescriptor::detect(&gguf)?;
+    if let Some((first, count)) = layer_range {
+        descriptor.restrict_layers(first, count)?;
+    }
+    let params = descriptor.params.clone();
+    if params.moe.is_some() {
+        return Err(ForgeError::Unsupported(
+            "podział FFN na karty obejmuje modele gęste".into(),
+        ));
+    }
+    let src = GgufSource(&gguf);
+    let bytes = |what: &str, w: HostWeight, rows: usize, cols: usize| -> Result<Vec<u8>> {
+        match w {
+            HostWeight::Q8_0 { data, rows: r, cols: c } if r == rows && c == cols => Ok(data),
+            HostWeight::Q8_0 { rows: r, cols: c, .. } => Err(ForgeError::Format(format!(
+                "{what}: kształt [{r}, {c}], wymagano [{rows}, {cols}]"
+            ))),
+            _ => Err(ForgeError::Unsupported(format!(
+                "podział FFN na karty wymaga wag Q8_0, {what} jest w innym formacie"
+            ))),
+        }
+    };
+
+    let mut out = Vec::with_capacity(descriptor.layers.len());
+    for (idx, layer_map) in descriptor.layers.iter().enumerate() {
+        let name = |role: WeightRole| -> Result<&String> {
+            layer_map
+                .get(&role)
+                .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
+        };
+        let gate = bytes(
+            &format!("layer {idx} ffn_gate"),
+            fetch_matrix(&src, name(WeightRole::FfnGate)?)?,
+            params.intermediate_size,
+            params.hidden_size,
+        )?;
+        let up = bytes(
+            &format!("layer {idx} ffn_up"),
+            fetch_matrix(&src, name(WeightRole::FfnUp)?)?,
+            params.intermediate_size,
+            params.hidden_size,
+        )?;
+        let down = bytes(
+            &format!("layer {idx} ffn_down"),
+            fetch_matrix(&src, name(WeightRole::FfnDown)?)?,
+            params.hidden_size,
+            params.intermediate_size,
+        )?;
+        out.push(crate::tensor_parallel::upload_ffn_split(
+            cluster,
+            caps,
+            &gate,
+            &up,
+            &down,
+            params.hidden_size,
+            params.intermediate_size,
+            crate::multi_gpu::WorkKind::MemoryBound,
+            forced,
+        )?);
+    }
+    Ok(out)
+}

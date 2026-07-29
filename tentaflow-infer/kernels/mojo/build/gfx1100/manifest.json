@@ -229,6 +229,10 @@
       "entry": "src_attention_verify_split8_at6A6A6A6A_accfd7cac81a6e28",
       "file": "attn_verify_split8_f16_hd256_t4.hsaco"
     },
+    "cast_f32_f16": {
+      "entry": "src_activation_cast_f32_f166A6A6A6AoA6A6A_9cdfe5e4b2968860",
+      "file": "cast_f32_f16.hsaco"
+    },
     "compressor_add_ape_f32": {
       "entry": "src_deepseek_compressor_add_ap6A6A6A6A_95fdb01d8c10ac9c",
       "file": "compressor_add_ape_f32.hsaco"
@@ -1272,6 +1276,10 @@
     "gemv_q8_0_dp4a_group4_f16": {
       "entry": "src_decode_dp4a_gemv_q8_0_dp4a6A6A6A6A_30f0afa2bd21e639",
       "file": "gemv_q8_0_dp4a_group4_f16.hsaco"
+    },
+    "gemv_q8_0_dp4a_out_f32": {
+      "entry": "src_decode_dp4a_gemv_q8_0_dp4a6A6A6A6A_e539a2a6abe9c012",
+      "file": "gemv_q8_0_dp4a_out_f32.hsaco"
     },
     "gemv_q8_0_f16": {
       "entry": "src_gemv_gemv_q8_0_f16_Point6A6A6A6AoA6A6A_5ed103878a4af790",

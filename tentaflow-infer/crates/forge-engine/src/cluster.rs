@@ -86,6 +86,64 @@ impl Cluster {
         })
     }
 
+    /// Buduje klaster wokół JUŻ OTWARTEJ karty: `primary` staje się kartą 0, a
+    /// `extra` to porządkowe numery pozostałych kart do otwarcia.
+    ///
+    /// Tak wchodzi się w klaster z wnętrza silnika. Otwarcie karty modelu po raz
+    /// drugi dałoby drugi komplet pul pamięci i drugi zestaw artefaktów kerneli
+    /// na tej samej karcie — a bufory silnika i tak muszą być tymi samymi
+    /// buforami, na których liczy klaster.
+    pub fn attach(
+        primary: Arc<dyn Device>,
+        extra: &[gpu::DeviceId],
+        pools: PoolSizes,
+    ) -> Result<Self> {
+        let mut devices = Vec::with_capacity(extra.len() + 1);
+        let stream = primary.create_stream()?;
+        let done = primary.create_event()?;
+        let kernels = forge_kernels::Kernels::load(primary.clone())?;
+        devices.push(ClusterDevice {
+            device: primary,
+            stream,
+            done,
+            kernels,
+        });
+        for &id in extra {
+            if id.ordinal == devices[0].device.ordinal() {
+                return Err(ForgeError::Scheduler(format!(
+                    "karta {id} jest już kartą główną klastra"
+                )));
+            }
+            let device = gpu::open_id(id, pools)?;
+            let stream = device.create_stream()?;
+            let done = device.create_event()?;
+            let kernels = forge_kernels::Kernels::load(device.clone())?;
+            devices.push(ClusterDevice {
+                device,
+                stream,
+                done,
+                kernels,
+            });
+        }
+
+        let mut peer_access = true;
+        for from in 0..devices.len() {
+            for to in 0..devices.len() {
+                if from == to {
+                    continue;
+                }
+                let peer = devices[to].device.ordinal();
+                if devices[from].device.enable_peer_access(peer).is_err() {
+                    peer_access = false;
+                }
+            }
+        }
+        Ok(Self {
+            devices,
+            peer_access,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.devices.len()
     }

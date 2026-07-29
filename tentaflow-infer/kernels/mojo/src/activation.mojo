@@ -106,3 +106,20 @@ def softcap_f32(
         x = Float32(logits[i]) / cap
         e = exp(2.0 * x)
         logits[i] = cap * ((e - 1.0) / (e + 1.0))
+
+
+def cast_f32_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    src: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """out = f16(src) nad n elementami.
+
+    Tensor parallel sumuje wyniki cząstkowe projekcji `down` w f32, bo dodawanie
+    w f16 gubiłoby bity przy każdej karcie. Strumień rezydualny silnika jest
+    natomiast f16 — ten kernel jest jedynym miejscem, gdzie te dwie
+    reprezentacje się spotykają.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        out_ptr[i] = Float16(src[i])

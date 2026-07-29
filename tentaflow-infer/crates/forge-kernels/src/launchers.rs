@@ -2269,6 +2269,24 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// out = f16(src) nad `n` elementami.
+    ///
+    /// Tensor parallel sumuje wyniki cząstkowe projekcji `down` w f32, bo
+    /// dodawanie w f16 gubiłoby bity przy każdej karcie; strumień rezydualny
+    /// silnika jest f16. To jedyne miejsce styku tych dwóch reprezentacji.
+    pub fn cast_f32_f16(
+        &self,
+        out: &DevBuffer,
+        src: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("cast_f32_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(src).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// logits = cap * tanh(logits / cap) w miejscu (ograniczenie logitów Gemmy).
     /// `offset` liczony w elementach f32 — głowa batcha zapisuje kolejne lane'y
     /// do jednego bufora.
@@ -12288,6 +12306,36 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
+            .buf(w_q8)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Jak `gemv_q8_0_dp4a_f16`, ale wynik w f32.
+    ///
+    /// Tensor parallel potrzebuje sum cząstkowych w f32, a jednocześnie musi
+    /// liczyć DOKŁADNIE tym samym kernelem co ścieżka jednokartowa — inaczej
+    /// podział zmienia nie tylko rozkład pracy, ale i wynik.
+    pub fn gemv_q8_0_dp4a_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w_q8: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 32, "gemv_q8_0_dp4a_out_f32")?;
+        let k = self.artifacts.get("gemv_q8_0_dp4a_out_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
             .buf(w_q8)
             .buf(x)
             .scalar(cols as i64)

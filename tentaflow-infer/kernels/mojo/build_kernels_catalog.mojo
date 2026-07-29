@@ -19,7 +19,7 @@ from src.norm import (
     rmsnorm_fp8,
     rmsnorm_residual_fp8,
 )
-from src.activation import silu_mul_f16, gelu_mul_f16, scale_f16, softcap_f32, sigmoid_mul_f16, deinterleave_gate_f16
+from src.activation import silu_mul_f16, gelu_mul_f16, scale_f16, softcap_f32, sigmoid_mul_f16, deinterleave_gate_f16, cast_f32_f16
 from src.rope import rope_neox_f16, rope_neox_ff_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import (
@@ -398,6 +398,7 @@ from src.decode_dp4a import (
     gemv_q8_0_dp4a_group4_f16,
     gemv_q4_k_dp4a_f16,
     gemv_q4_k_dp4a_out_f32,
+    gemv_q8_0_dp4a_out_f32,
     gemv_q4_k_dp4a_f16_gidx,
 )
 from src.decode_dp4a import (
@@ -859,6 +860,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "gelu_mul_f16"))
     _ = ctx.compile_function[scale_f16, dump_asm=Path("scale_f16.ptx")]()
     entries.append(_finalize(out_dir, "scale_f16"))
+    _ = ctx.compile_function[cast_f32_f16, dump_asm=Path("cast_f32_f16.ptx")]()
+    entries.append(_finalize(out_dir, "cast_f32_f16"))
     _ = ctx.compile_function[softcap_f32, dump_asm=Path("softcap_f32.ptx")]()
     entries.append(_finalize(out_dir, "softcap_f32"))
 
@@ -2622,6 +2625,10 @@ def main() raises:
         gemv_q4_k_dp4a_out_f32, dump_asm=Path("gemv_q4_k_dp4a_out_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_out_f32"))
+    _ = ctx.compile_function[
+        gemv_q8_0_dp4a_out_f32, dump_asm=Path("gemv_q8_0_dp4a_out_f32.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q8_0_dp4a_out_f32"))
 
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_f16_gidx, dump_asm=Path("gemv_q4_k_dp4a_f16_gidx.ptx")
