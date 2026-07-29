@@ -1018,6 +1018,10 @@ pub struct ModelConfig {
     pub nvfp4_gguf_layout: Nvfp4GgufLayout,
     /// Polityka resident dla checkpointów compressed-tensors NVFP4.
     pub nvfp4_ct_layout: NvFp4CtLayoutPolicy,
+    /// Etap pipeline'u nie zaczynający się od warstwy zerowej dostaje stan
+    /// ukryty z poprzedniej karty zamiast liczyć embedding. Wynika to wprost z
+    /// `layer_range` i nie jest osobnym ustawieniem.
+    ///
     /// Zakres warstw `(pierwsza, ile)` dla etapu pipeline'u. `None` ładuje cały
     /// model. Etap wczytuje WYŁĄCZNIE swoje warstwy, więc model większy od
     /// jednej karty mieści się na kilku.
@@ -1056,6 +1060,10 @@ pub fn l2_normalize(v: &mut [f32]) {
 }
 
 pub struct Model {
+    /// Pierwsza warstwa TEGO etapu w numeracji całego modelu. Zero oznacza etap
+    /// pierwszy, który liczy embedding; wyższa wartość — etap dostający stan
+    /// ukryty z poprzedniej karty.
+    pub stage_first_layer: usize,
     pub device: Arc<dyn Device>,
     pub kernels: Kernels,
     pub weights: ModelWeights,
@@ -2966,6 +2974,7 @@ impl Model {
         let prefix_cache =
             prefix_eligible.then(|| crate::prefix::PrefixCache::new(cfg.kv_page_size));
         let mut model = Model {
+            stage_first_layer: cfg.layer_range.map(|(first, _)| first).unwrap_or(0),
             device,
             kernels,
             weights,
@@ -5826,14 +5835,20 @@ impl Model {
         let mut trace = PrefillTrace::new();
         trace.start(self.device.as_ref());
 
-        kernels.gather_rows_f16(
-            &pb.h,
-            &self.weights.token_embd_f16,
-            &pb.ids,
-            rows,
-            hidden,
-            stream,
-        )?;
+        // Etap pipeline'u, który nie zaczyna się od warstwy zerowej, dostaje
+        // strumień rezydualny z poprzedniej karty — `pb.h` jest już wypełniony,
+        // więc embeddingu się nie liczy. Granicą etapu jest właśnie `pb.h`, a
+        // nie znormalizowane `pb.x`: następny etap normalizuje po swojemu.
+        if self.stage_first_layer == 0 {
+            kernels.gather_rows_f16(
+                &pb.h,
+                &self.weights.token_embd_f16,
+                &pb.ids,
+                rows,
+                hidden,
+                stream,
+            )?;
+        }
         // Rodzina Gemma mnoży embedding przez sqrt(hidden). Norma RMS jest na
         // to niewrażliwa, ale strumień rezydualny już nie — bez tego wyjście
         // jest ciche.
