@@ -215,3 +215,168 @@ mod tests {
         assert!(data.len() != 10 * 4);
     }
 }
+
+/// Macierz rozłożona po KOLUMNACH: fragment `i` na karcie `i` obejmuje kolumny
+/// `[offset(i), offset(i) + cols(i))` KAŻDEGO wiersza.
+///
+/// Tak dzieli się projekcja `down` w FFN. Podział wierszowy `gate`/`up` daje
+/// każdej karcie własny kawałek wymiaru pośredniego, a `down` po kolumnach
+/// zjada dokładnie ten kawałek — dzięki temu na całą warstwę FFN przypada
+/// JEDNA wymiana (redukcja sum cząstkowych), a nie dwie.
+pub struct ColShards {
+    shards: Vec<DevBuffer>,
+    cols: Vec<usize>,
+    offsets: Vec<usize>,
+    rows: usize,
+}
+
+impl ColShards {
+    pub fn cols_on(&self, device: usize) -> usize {
+        self.cols.get(device).copied().unwrap_or(0)
+    }
+
+    pub fn offset_of(&self, device: usize) -> usize {
+        self.offsets.get(device).copied().unwrap_or(0)
+    }
+
+    pub fn shard(&self, device: usize) -> Result<&DevBuffer> {
+        self.shards
+            .get(device)
+            .ok_or_else(|| ForgeError::Scheduler(format!("brak fragmentu dla karty {device}")))
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// Bloki Q8_0 niosą 32 wartości, więc granica podziału kolumn musi być ich
+/// wielokrotnością — inaczej fragment zaczynałby się w środku bloku i żaden
+/// kernel by go nie odczytał.
+const Q8_0_BLOCK: usize = 32;
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Rozkłada macierz `[rows, cols]` w Q8_0 po kolumnach, proporcjonalnie do
+/// ZMIERZONEJ mocy kart i z zaokrągleniem do pełnych bloków.
+pub fn upload_column_split(
+    cluster: &Cluster,
+    caps: &[DeviceCapability],
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    kind: WorkKind,
+) -> Result<ColShards> {
+    if caps.len() != cluster.len() {
+        return Err(ForgeError::Scheduler(
+            "liczba profili możliwości musi odpowiadać liczbie kart".into(),
+        ));
+    }
+    if !cols.is_multiple_of(Q8_0_BLOCK) {
+        return Err(ForgeError::Format(format!(
+            "podział kolumnowy Q8_0 wymaga cols % 32 == 0, jest {cols}"
+        )));
+    }
+    let row_bytes = (cols / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES;
+    if rows == 0 || data.len() != rows * row_bytes {
+        return Err(ForgeError::Format(format!(
+            "macierz {rows}x{cols} to {} B, otrzymano {}",
+            rows * row_bytes,
+            data.len()
+        )));
+    }
+    // Dzielimy BLOKI, nie pojedyncze kolumny — stąd podział liczony w blokach
+    // i przemnożony z powrotem przez 32.
+    let blocks = cols / Q8_0_BLOCK;
+    let plan = plan_split(caps, blocks, kind, Q8_0_BLOCK_BYTES * rows, 1)?;
+
+    let mut shards = Vec::with_capacity(cluster.len());
+    let mut offsets = Vec::with_capacity(cluster.len());
+    let mut cols_per_device = Vec::with_capacity(cluster.len());
+    let mut block_offset = 0usize;
+    for (index, &count) in plan.rows.iter().enumerate() {
+        let entry = cluster.device(index)?;
+        let shard_bytes = count.max(1) * Q8_0_BLOCK_BYTES * rows;
+        let buffer = entry.device.alloc(shard_bytes, MemKind::Device, Pool::Weights)?;
+        if count > 0 {
+            // Fragment jest ciągły w obrębie wiersza, ale nie w całej macierzy,
+            // więc składamy go wierszami do bufora pośredniego.
+            let mut staged = Vec::with_capacity(count * Q8_0_BLOCK_BYTES * rows);
+            for row in 0..rows {
+                let from = row * row_bytes + block_offset * Q8_0_BLOCK_BYTES;
+                staged.extend_from_slice(&data[from..from + count * Q8_0_BLOCK_BYTES]);
+            }
+            entry.device.write(&staged, &buffer, 0)?;
+        }
+        shards.push(buffer);
+        offsets.push(block_offset * Q8_0_BLOCK);
+        cols_per_device.push(count * Q8_0_BLOCK);
+        block_offset += count;
+    }
+    Ok(ColShards {
+        shards,
+        cols: cols_per_device,
+        offsets,
+        rows,
+    })
+}
+
+/// Liczy `y = W·x` z macierzą rozłożoną po kolumnach: każda karta mnoży swój
+/// wycinek kolumn przez odpowiadający wycinek wejścia, a wyniki są SUMOWANE na
+/// karcie `gather_on`.
+///
+/// `x_parts[i]` musi zawierać wycinek wejścia `[offset(i), offset(i)+cols(i))`
+/// — nie całe wejście, bo to jest właśnie ten wymiar, który jest podzielony.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q8_0_column_split(
+    cluster: &Cluster,
+    shards: &ColShards,
+    x_parts: &[DevBuffer],
+    y_parts: &[DevBuffer],
+    y_full: &DevBuffer,
+    staging: &DevBuffer,
+    gather_on: usize,
+) -> Result<()> {
+    if x_parts.len() != cluster.len() || y_parts.len() != cluster.len() {
+        return Err(ForgeError::Scheduler(
+            "wejścia i wyjścia muszą być podane dla każdej karty".into(),
+        ));
+    }
+    let rows = shards.rows();
+    for index in 0..cluster.len() {
+        if shards.cols_on(index) == 0 {
+            continue;
+        }
+        let entry = cluster.device(index)?;
+        entry.kernels.gemv_q8_0_out_f32(
+            &y_parts[index],
+            shards.shard(index)?,
+            &x_parts[index],
+            rows,
+            shards.cols_on(index),
+            &entry.stream,
+        )?;
+    }
+    // Redukcja: karta zbierająca dodaje do siebie sumy cząstkowe pozostałych.
+    // Każda z nich to pełny wektor `rows`, więc tu nie ma przesunięć — jest
+    // dodawanie.
+    let target = cluster.device(gather_on)?;
+    target.device.copy(
+        &y_parts[gather_on],
+        0,
+        y_full,
+        0,
+        rows * 4,
+        &target.stream,
+    )?;
+    for index in 0..cluster.len() {
+        if index == gather_on || shards.cols_on(index) == 0 {
+            continue;
+        }
+        cluster.exchange(index, &y_parts[index], 0, gather_on, staging, 0, rows * 4)?;
+        cluster.wait_for(gather_on, index)?;
+        target
+            .kernels
+            .add_f32(y_full, y_full, staging, rows, &target.stream)?;
+    }
+    Ok(())
+}
