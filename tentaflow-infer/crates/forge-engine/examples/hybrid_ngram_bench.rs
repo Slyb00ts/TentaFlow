@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
 use forge_engine::speculation::{SpeculationCoordinator, SpeculativeConfig, SpeculativeState};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
 use half::f16;
@@ -703,7 +703,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("tryb benchmarku musi być równy ngram albo mtp+ngram".into()),
     };
     let max_seq_len = prompt_len + target + budget + 8;
-    let free = CudaDevice::free_vram(0)?;
+    let free = gpu::free_vram(0)?;
     let activations = if mtp_router {
         9usize << 27
     } else {
@@ -714,7 +714,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights = free
         .checked_sub(activations + kv_cache + reserve)
         .ok_or("za mało wolnego VRAM na benchmark")?;
-    let device: Arc<dyn Device> = CudaDevice::new(
+    let device: Arc<dyn Device> = gpu::open(
         0,
         PoolSizes {
             weights,

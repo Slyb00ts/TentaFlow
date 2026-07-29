@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use forge_engine::model::ModelConfig;
 use forge_engine::server::spawn_engine;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_server::toolcall::ToolParserKind;
@@ -65,7 +65,7 @@ async fn qwen3_tool_calls_end_to_end() {
             let kv_page_size = 32;
             let kv_pages = 256;
             let desc = read_descriptor(&load_dir).expect("read model descriptor");
-            let device = CudaDevice::new(
+            let device = gpu::open(
                 0,
                 PoolSizes {
                     weights: 3 << 30,
@@ -95,6 +95,7 @@ async fn qwen3_tool_calls_end_to_end() {
                     kv_quant: forge_engine::kv::KvQuant::F16,
                     kv_tier: Default::default(),
                     prefix_cache: false,
+                    layer_range: None,
                     native_mtp: false,
                     nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
                     nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,

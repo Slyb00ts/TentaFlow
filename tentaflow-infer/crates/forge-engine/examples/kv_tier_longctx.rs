@@ -15,7 +15,7 @@ use std::time::Instant;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_tokenize::{StreamDecoder, Tokenizer};
 
@@ -85,7 +85,7 @@ weight_spill_dir: None,
     // WEIGHTS pool, not the HAL kv_cache pool, so keep the latter tiny (a full
     // multi-GiB kv_cache arena would needlessly starve the weights pool on a
     // 20 GB model). Size weights from --weights-gb for large models.
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: (weights_gb * (1u64 << 30) as f64) as usize,

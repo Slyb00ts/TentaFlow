@@ -6,15 +6,15 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;
 
 const VOCAB: usize = 151_936;
 
-fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
+fn device() -> Option<Arc<dyn Device>> {
+    match gpu::open(
         0,
         PoolSizes {
             weights: 64 << 20,

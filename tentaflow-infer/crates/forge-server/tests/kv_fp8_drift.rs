@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use forge_engine::model::ModelConfig;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_types::DType;
@@ -103,7 +103,7 @@ fn run_pass_ids(
         forge_engine::kv::KvQuant::F16
     };
     let desc = read_descriptor(path).expect("read model descriptor");
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 8 << 30,
@@ -128,6 +128,7 @@ fn run_pass_ids(
             kv_quant,
             kv_tier: Default::default(),
             prefix_cache: false,
+            layer_range: None,
             native_mtp: false,
             nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
             nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,

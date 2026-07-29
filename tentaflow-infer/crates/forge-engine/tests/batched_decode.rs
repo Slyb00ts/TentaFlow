@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams, SeqSampleParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 
 const STEPS: usize = 24;
@@ -25,7 +25,7 @@ fn load() -> Option<Model> {
         eprintln!("skipping: test model missing at {}", path.display());
         return None;
     }
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 2 << 30,

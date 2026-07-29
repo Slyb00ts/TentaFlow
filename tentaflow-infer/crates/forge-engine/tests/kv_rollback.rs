@@ -9,11 +9,11 @@
 use std::sync::Arc;
 
 use forge_engine::kv::{KvCache, KvConfig, KvQuant};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 
 fn cache(page_size: usize, n_pages: usize) -> Option<KvCache> {
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 256 << 20,

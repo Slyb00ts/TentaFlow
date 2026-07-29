@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;
@@ -21,12 +21,12 @@ const HEAD_DIM: usize = 256;
 const CONTEXTS: [usize; 8] = [31, 32, 33, 64, 128, 161, 192, 256];
 type LayoutResult = (Vec<u16>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
-fn device() -> Option<Arc<CudaDevice>> {
+fn device() -> Option<Arc<dyn Device>> {
     if std::env::var("FORGE_GPU_TEST").ok().as_deref() != Some("1") {
         eprintln!("pomijam test GPU; ustaw FORGE_GPU_TEST=1");
         return None;
     }
-    match CudaDevice::new(
+    match gpu::open(
         0,
         PoolSizes {
             weights: 64 << 20,
@@ -101,7 +101,7 @@ fn download_bytes(device: &dyn Device, buffer: &DevBuffer) -> Vec<u8> {
 }
 
 fn run_layout(
-    device: &Arc<CudaDevice>,
+    device: &Arc<dyn Device>,
     kernels: &Kernels,
     context: usize,
     page_table: &[i32; MAX_PAGES],
@@ -226,7 +226,7 @@ fn run_layout(
 }
 
 fn run_batch_layout(
-    device: &Arc<CudaDevice>,
+    device: &Arc<dyn Device>,
     kernels: &Kernels,
     base: usize,
     tokens: usize,

@@ -28,7 +28,7 @@ use forge_engine::sample::SamplingParams;
 use forge_engine::server::{
     spawn_engine_batched, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
 };
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_tokenize::Tokenizer;
@@ -52,7 +52,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
     let kv_page_size = 32;
     let kv_pages = 512;
     let desc = read_descriptor(&path).expect("read descriptor");
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 3 << 30,
@@ -82,6 +82,7 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
             // Speculation and the radix prefix cache both manage paged KV
             // ownership; the eligible speculative path requires prefix off.
             prefix_cache: false,
+            layer_range: None,
             native_mtp: false,
             nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
             nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,

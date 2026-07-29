@@ -21,7 +21,7 @@ use forge_engine::speculation::{
 };
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_formats::Gguf;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
 use half::f16;
@@ -784,7 +784,7 @@ fn load_model_sized_with_tier(
     kv_pages: usize,
     kv_tier: KvTierConfig,
 ) -> Option<Model> {
-    let free = match CudaDevice::free_vram(0) {
+    let free = match gpu::free_vram(0) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("pominięto test puli hybrydowej: brak CUDA: {error}");
@@ -812,7 +812,7 @@ fn load_model_sized_with_tier(
         eprintln!("pominięto test puli hybrydowej: za mało wolnego VRAM");
         return None;
     };
-    let device: Arc<dyn Device> = match CudaDevice::new(
+    let device: Arc<dyn Device> = match gpu::open(
         0,
         PoolSizes {
             weights,

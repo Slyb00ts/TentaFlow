@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
 
@@ -24,11 +24,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let activations = 1usize << 30;
     let kv_cache = 4usize << 20;
     let reserve = 512usize << 20;
-    let free = CudaDevice::free_vram(0)?;
+    let free = gpu::free_vram(0)?;
     let weights = free
         .checked_sub(activations + kv_cache + reserve)
         .ok_or("za mało wolnego VRAM na pule MTP")?;
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights,

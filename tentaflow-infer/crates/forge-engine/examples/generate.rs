@@ -8,7 +8,7 @@ use std::sync::Arc;
 use forge_engine::generate::{generate, GenerateRequest, StreamEvent};
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::SamplingParams;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
 
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "The capital of France is".into());
     let max_tokens: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(48);
 
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 14 << 30,

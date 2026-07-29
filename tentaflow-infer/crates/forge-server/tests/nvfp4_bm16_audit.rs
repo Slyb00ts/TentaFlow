@@ -12,7 +12,7 @@ use std::sync::Arc;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::SeqSampleParams;
 use forge_engine::weights::NvFp4CtLayoutPolicy;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use serde_json::json;
@@ -203,7 +203,7 @@ fn load_bielik(batch: usize, layout: NvFp4CtLayoutPolicy) -> Model {
     let descriptor = read_descriptor(path).expect("odczyt deskryptora");
     let kv_page_size = 32;
     let kv_pages = (batch.max(1) * 48).max(96);
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 12 << 30,
@@ -234,6 +234,7 @@ fn load_bielik(batch: usize, layout: NvFp4CtLayoutPolicy) -> Model {
             kv_quant: forge_engine::kv::KvQuant::F16,
             kv_tier: Default::default(),
             prefix_cache: false,
+            layer_range: None,
             native_mtp: false,
             nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
             nvfp4_ct_layout: layout,

@@ -7449,6 +7449,24 @@ impl Kernels {
                 "gemm_q8_0_out_f32 requires cols % 32 == 0, got {cols}"
             )));
         }
+        // `gemm_q8_0_out_f32` jest kernelem NVIDII (mma m16n8k16). Karty bez
+        // tej instrukcji liczą tę samą głowę kaflem WMMA albo `dot4`, który
+        // wybiera architektura — dlatego wejście jest jedno, a rozgałęzienie
+        // siedzi tutaj, nie u wołającego.
+        if self.device.caps().vendor != forge_types::Vendor::Nvidia {
+            return self.gemm_i8mma_run(
+                "gemm_q8_0_i8mma",
+                true,
+                y_f32,
+                w_q8,
+                w_byte_off,
+                x,
+                rows,
+                cols,
+                n_tokens,
+                stream,
+            );
+        }
         let (_, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self
             .artifacts

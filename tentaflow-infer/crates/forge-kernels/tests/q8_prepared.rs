@@ -6,14 +6,14 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::{Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;
 use half::f16;
 
-fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
+fn device() -> Option<Arc<dyn Device>> {
+    match gpu::open(
         0,
         PoolSizes {
             weights: 256 << 20,
@@ -466,7 +466,7 @@ fn prepared_q8_chroni_scratch_miedzy_dwoma_streamami() {
 }
 
 fn measure(
-    device: &CudaDevice,
+    device: &dyn Device,
     stream: &forge_hal::Stream,
     repetitions: usize,
     mut launch: impl FnMut(),

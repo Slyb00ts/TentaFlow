@@ -12,7 +12,7 @@ use forge_engine::kv::KvQuant;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 
 /// One test at a time: they share the GPU's primary context, and a decode
@@ -29,7 +29,7 @@ fn load(kv_pages: usize, tier: KvTierConfig, quant: KvQuant) -> Option<Model> {
         eprintln!("skipping: test model missing at {}", path.display());
         return None;
     }
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 3 << 30,

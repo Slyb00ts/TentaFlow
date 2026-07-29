@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use forge_engine::model::{Model, ModelConfig, MAX_PREFILL_CHUNK};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 
 fn model_path() -> PathBuf {
@@ -25,7 +25,7 @@ fn load(prefix_cache: bool) -> Option<Model> {
         eprintln!("skipping: test model missing at {}", path.display());
         return None;
     }
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 3 << 30,

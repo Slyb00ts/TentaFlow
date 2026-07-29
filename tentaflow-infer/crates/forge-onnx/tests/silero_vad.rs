@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_onnx::Tensor;
 
@@ -38,7 +38,7 @@ fn model_path() -> Option<String> {
 
 fn device() -> Option<Arc<dyn Device>> {
     // Small pools: Silero is 2.3 MB and its activations are a handful of KB.
-    let dev = CudaDevice::new(
+    let dev = gpu::open(
         0,
         PoolSizes {
             weights: 64 << 20,

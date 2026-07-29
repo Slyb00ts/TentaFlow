@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{Sampler, SamplingParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_tokenize::{StreamDecoder, Tokenizer};
 
@@ -44,7 +44,7 @@ weight_spill_dir: None,
         nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::RowMajorE4M3,
     };
 
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 12 << 30,
