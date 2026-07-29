@@ -357,3 +357,28 @@ $ forge run ThinkingCap-Qwen3.6-27B-NVFP4-MTP.gguf "Stolica Polski to" --no-chat
 Wniosek praktyczny: dla modeli hybrydowych na AMD używać checkpointów NVFP4.
 Dorobienie wariantów Q4_K kerneli layer-major zamknęłoby lukę dla pozostałych
 kwantyzacji, ale jest osobną, dużą pracą.
+
+## Profil prefillu NVFP4 na RX 7900 XT
+
+`rocprofv3 --kernel-trace` na prefillu 2048 tokenów (suma czasu kerneli 5278 ms):
+
+| kernel | udział | wywołań |
+|---|---|---|
+| `nvfp4_gguf_wmma_gemm` | 66,1% | 608 |
+| `attn_decode_batch_exact_f16_hd256` | 13,0% | 32 |
+| `gemm_q8_0_wmma_triplet` + `i8mma` | 12,6% | 192 |
+| `deltanet_value_key` | 4,6% | 96 |
+
+Drugi wpis był błędem doboru: bez artefaktu flash-attention layer-major schodził
+na `Exact`, czyli liczył CAŁY chunk kernelem dekodowania — 21 ms na wywołanie.
+Wariant prefillowy `attn_prefill_device_pos_f16_hd256` jest zbudowany dla
+gfx1100 i nikt do niego nie prowadził. Po zmianie zejścia awaryjnego:
+
+| | prefill 2048 |
+|---|---|
+| zejście na `Exact` | 770,5 tok/s |
+| zejście na `Prefill` | **836,3 tok/s** (+8,5%) |
+
+Wyjście identyczne co do bajtu z obydwoma wariantami.
+
+Następny cel to same GEMM-y NVFP4 — 66% czasu, około 40% szczytu WMMA tej karty.
