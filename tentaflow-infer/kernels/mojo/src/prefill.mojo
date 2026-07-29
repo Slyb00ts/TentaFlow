@@ -434,18 +434,29 @@ def attn_prefill_segmented_f16[head_dim: Int, PT: Int](
             if h > n_valid:
                 h = n_valid
             if h > 0:
-                var dotv = SIMD[DType.float32, 8](0.0)
+                # Iloczyn Q·K przez `v_dot2_f32_f16` zamiast mnozen f32: dwa
+                # MAC-i f16 na takt na linie, czyli polowa instrukcji na te sama
+                # matematyke. Akumulacja zostaje w f32, wiec wynik nie traci
+                # precyzji wzgledem poprzedniej wersji — zmienia sie tylko
+                # kolejnosc dodawania (osiem czastkowych sum zamiast jednej
+                # redukcji SIMD na koncu).
+                var dot = Float32(0.0)
                 comptime for c in range(row_chunks):
                     kv8 = (
                         ks
                         + lane * head_dim
                         + ((c ^ (lane % row_chunks)) * 8)
-                    ).load[width=8, alignment=16]().cast[DType.float32]()
+                    ).load[width=8, alignment=16]()
                     qv8 = (
                         qs + (wid * QPW + i) * head_dim + c * 8
-                    ).load[width=8, alignment=16]().cast[DType.float32]()
-                    dotv += qv8 * kv8
-                var score = dotv.reduce_add() * scale
+                    ).load[width=8, alignment=16]()
+                    comptime for j in range(4):
+                        dot = dot2_f16(
+                            qv8.slice[2, offset = j * 2](),
+                            kv8.slice[2, offset = j * 2](),
+                            dot,
+                        )
+                var score = dot * scale
                 if lane >= h:
                     score = NEG_INF
                 mtile = warp.max(score)
