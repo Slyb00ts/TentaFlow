@@ -382,3 +382,53 @@ gfx1100 i nikt do niego nie prowadził. Po zmianie zejścia awaryjnego:
 Wyjście identyczne co do bajtu z obydwoma wariantami.
 
 Następny cel to same GEMM-y NVFP4 — 66% czasu, około 40% szczytu WMMA tej karty.
+
+## Q4_K na modelu hybrydowym: 28,4 → 724,9 tok/s
+
+Pytanie „a co z Q4_K" odsłoniło dwie usterki bramkowania. Q4_K na modelach
+GESTYCH byl caly czas w porzadku (Bielik 7B 1474,8 tok/s prefillu, Gemma 12B
+1168,8) — zalamywal sie wylacznie na hybrydowym.
+
+### 1. Batchowy prefill bramkowany formatem glowy verifiera
+
+`prefill_hybrid` wybieral sciezke batchowa przez `validate_hybrid_speculation_target()`,
+ktore wymaga glowy logitow F16 albo Q8_0. GGUF Q4_K_M ma z konwencji llama.cpp
+glowe **Q6_K**, wiec KAZDY hybrydowy model Q4_K_M schodzil na prefill token po
+tokenie — na dowolnej karcie, takze NVIDII.
+
+Wymog F16/Q8_0 nalezy do verifiera, ktory liczy logity dla T pozycji naraz.
+Prefill zwraca logity wylacznie ostatniego tokenu zwykla sciezka `logits_gemv`,
+obslugujaca kazdy format. Rozdzielone: batchowy prefill ma wlasny predykat
+`hybrid_batched_prefill_capable()`. Efekt: **28,4 → 198,3 tok/s**.
+
+Przy okazji profilowanie w `bench` powielalo decyzje o trasie i pytalo starego
+walidatora — rezerwowalo spany na inna sciezke, niz sie wykonywala, i przerywalo
+pomiar bledem. Oba miejsca uzywaja teraz tego samego predykatu.
+
+### 2. Chunk zabetonowany na 32
+
+Dla modeli bez NVFP4 `resolve_hybrid_prefill_chunk_size` zwracalo SZTYWNE 32.
+Wieksze chunki dzialaja i sa wyraznie szybsze — Qwen3.6-27B Q4_K_M, prefill 2048
+na RX 7900 XT:
+
+| chunk | prefill |
+|---|---|
+| 32 | 198,3 tok/s |
+| 128 | 440,4 |
+| 256 | 677,7 |
+| 512 | 720,5 |
+| 1024 | **726,3** |
+
+Granice stawia budzet puli aktywacji, nie format wag, wiec chunk dobiera sie
+teraz drabinka `[1024, 512, 256, 128, 32]` ograniczona ta sama miara scratcha co
+sciezka NVFP4. Automat wybiera 1024.
+
+### Wynik
+
+| model | przed | po |
+|---|---|---|
+| Qwen3.6-27B Q4_K_M | 28,4 tok/s | **724,9 tok/s** (25,5x) |
+| Qwen3.6-27B NVFP4 | 838,6 tok/s | 838,6 (bez zmian) |
+
+Wyjscie identyczne co do bajtu z referencja token-po-tokenie. Q4_K jest teraz na
+86% wyniku NVFP4 zamiast 3%.

@@ -56,6 +56,9 @@ const STAGING_IN_BYTES: usize = 12;
 const HYBRID_PREFILL_PORTABLE_CHUNK: usize = 16;
 const HYBRID_PREFILL_LEGACY_CHUNK: usize = 32;
 const HYBRID_PREFILL_AUTO_CHUNK: usize = 128;
+/// Kolejnosc prob dla chunka bez NVFP4 — od najwiekszego, bo wiekszy wygrywa
+/// az do nasycenia (patrz pomiar w `resolve_hybrid_prefill_chunk_size`).
+const HYBRID_PREFILL_LADDER: [usize; 5] = [1024, 512, 256, 128, 32];
 const HYBRID_PREFILL_ACTIVATION_RESERVE: usize = 64 * 1024 * 1024;
 const HYBRID_LAYER_MAJOR_MAX_TOKENS: usize = 4096;
 const HYBRID_HOST_STAGING_SLOTS: usize = 3;
@@ -241,6 +244,7 @@ fn resolve_hybrid_prefill_chunk_size(
     contains_nvfp4: bool,
     auto_chunk_limit: usize,
     nvfp4_chunk_limit: usize,
+    legacy_chunk_limit: usize,
     prepared_q8_tiled_capable: bool,
 ) -> Result<usize> {
     if contains_nvfp4 && nvfp4_chunk_limit < 3 {
@@ -270,11 +274,17 @@ fn resolve_hybrid_prefill_chunk_size(
         // Kwantyzacja aktywacji dla T>=32 wchodzi na kafle i8mma, których poza
         // NVIDIĄ nie ma — bez tego warunku Auto wybierało chunk, który zaraz
         // wywracał prefill na nieobsługiwanym kernelu.
-        return Ok(if prepared_q8_tiled_capable {
-            HYBRID_PREFILL_LEGACY_CHUNK
-        } else {
-            HYBRID_PREFILL_PORTABLE_CHUNK
-        });
+        if !prepared_q8_tiled_capable {
+            return Ok(HYBRID_PREFILL_PORTABLE_CHUNK);
+        }
+        // Dotad zwracalo się tu SZTYWNE 32, choc wieksze chunki dzialaja i sa
+        // wyraznie szybsze. Qwen3.6-27B Q4_K_M, prefill 2048 na RX 7900 XT:
+        // T32 198,3 tok/s, T128 440,4, T256 677,7, T512 720,5, T1024 726,3.
+        // Granice stawia budzet puli aktywacji, nie format wag.
+        return Ok(HYBRID_PREFILL_LADDER
+            .into_iter()
+            .find(|&chunk| chunk <= legacy_chunk_limit)
+            .unwrap_or(HYBRID_PREFILL_LEGACY_CHUNK));
     }
     let policy_limit = if auto_extended_capable {
         auto_chunk_limit.min(if auto_t128_capable {
@@ -13661,6 +13671,13 @@ impl Model {
             supported_limit.min(HYBRID_PREFILL_PORTABLE_CHUNK)
         };
         let auto_chunk_limit = supported_limit.min(budget_chunk_limit);
+        // Osobny limit dla modeli bez NVFP4: ta sama miara budzetu scratcha,
+        // ale bez sufitu `HYBRID_PREFILL_AUTO_CHUNK`, ktory dotyczy artefaktow
+        // NVFP4.
+        let legacy_chunk_limit = HYBRID_PREFILL_LADDER
+            .into_iter()
+            .find(|&chunk| self.hybrid_prefill_extended_budget_capable(chunk))
+            .unwrap_or(HYBRID_PREFILL_LEGACY_CHUNK);
         resolve_hybrid_prefill_chunk_size(
             config,
             extended_capable,
@@ -13669,6 +13686,7 @@ impl Model {
             self.hybrid_prefill_contains_nvfp4(),
             auto_chunk_limit,
             executable_chunk_limit,
+            legacy_chunk_limit,
             self.kernels.prepared_q8_tiled_capable(),
         )
     }
@@ -19511,7 +19529,8 @@ mod verify_rollback_tests {
                 true,
                 128,
                 1024,
-                true,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
             )
             .unwrap(),
             128
@@ -19528,7 +19547,8 @@ mod verify_rollback_tests {
                 true,
                 32,
                 1024,
-                true,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
             )
             .unwrap(),
             32
@@ -19545,7 +19565,8 @@ mod verify_rollback_tests {
                 true,
                 16,
                 16,
-                true,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
             )
             .unwrap(),
             16
@@ -19562,7 +19583,8 @@ mod verify_rollback_tests {
                 true,
                 32,
                 1024,
-                true,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
             )
             .unwrap(),
             32
@@ -19575,7 +19597,8 @@ mod verify_rollback_tests {
                 true,
                 16,
                 1024,
-                true,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
             )
             .unwrap(),
             16
@@ -19589,7 +19612,8 @@ mod verify_rollback_tests {
                     true,
                     chunk,
                     1024,
-                    true,
+                    super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
                 )
                 .unwrap(),
                 chunk
@@ -19602,6 +19626,7 @@ mod verify_rollback_tests {
             true,
             2,
             1024,
+            super::HYBRID_PREFILL_LEGACY_CHUNK,
             true,
         )
         .is_err());
@@ -19613,7 +19638,8 @@ mod verify_rollback_tests {
                 false,
                 0,
                 0,
-                true,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
             )
             .unwrap(),
             32
@@ -19656,7 +19682,8 @@ mod verify_rollback_tests {
                 false,
                 0,
                 0,
-                false,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            false,
             )
             .unwrap(),
             crate::model::HYBRID_PREFILL_PORTABLE_CHUNK
@@ -19670,6 +19697,7 @@ mod verify_rollback_tests {
             false,
             0,
             0,
+            super::HYBRID_PREFILL_LEGACY_CHUNK,
             false,
         )
         .is_err());
@@ -19681,7 +19709,8 @@ mod verify_rollback_tests {
                 false,
                 0,
                 0,
-                false,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            false,
             )
             .unwrap(),
             16
@@ -19699,7 +19728,8 @@ mod verify_rollback_tests {
                     true,
                     0,
                     1024,
-                    true,
+                    super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
                 )
                 .unwrap(),
                 chunk
@@ -19712,6 +19742,7 @@ mod verify_rollback_tests {
             true,
             0,
             16,
+            super::HYBRID_PREFILL_LEGACY_CHUNK,
             true,
         )
         .is_err());
@@ -19723,7 +19754,8 @@ mod verify_rollback_tests {
                 true,
                 0,
                 16,
-                true,
+                super::HYBRID_PREFILL_LEGACY_CHUNK,
+            true,
             )
             .unwrap(),
             16
@@ -19735,6 +19767,7 @@ mod verify_rollback_tests {
             true,
             0,
             3,
+            super::HYBRID_PREFILL_LEGACY_CHUNK,
             true,
         )
         .is_err());
@@ -19745,6 +19778,7 @@ mod verify_rollback_tests {
             true,
             0,
             2,
+            super::HYBRID_PREFILL_LEGACY_CHUNK,
             true,
         )
         .is_err());
@@ -19755,6 +19789,7 @@ mod verify_rollback_tests {
             true,
             0,
             3,
+            super::HYBRID_PREFILL_LEGACY_CHUNK,
             true,
         )
         .is_err());
@@ -19765,6 +19800,7 @@ mod verify_rollback_tests {
             true,
             0,
             0,
+            super::HYBRID_PREFILL_LEGACY_CHUNK,
             true,
         )
         .is_err());
