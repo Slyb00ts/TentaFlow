@@ -530,3 +530,56 @@ FP8 dla tej architektury po prostu nie ma. Trudna czesc jest natomiast za nami:
 `v_wmma_f32_16x16x16_fp8_fp8` kompiluje sie z naszego lancucha i wychodzi w
 kodzie — czyli droga to napisanie kernela GEMM FP8 na tym intrinsiku, a dopiero
 potem wykrycie w HAL.
+
+## Optymalizacja pod jedną R9700 — co dało ile
+
+Wszystko zmierzone na Bieliku 7B, prompt 2048, jedna karta:
+
+| krok | Q8_0 prefill | Q4_K prefill |
+|---|---|---|
+| stan wyjściowy (bez WMMA) | 2047 | 1575 |
+| jednostka macierzowa RDNA4 | 2047 (dot4 wygrywał) | 2287 |
+| kafel BM=128 | **2409** | 2287 |
+| flash attention na WMMA | **3026** | **2833** |
+| **razem** | **+47,8%** | **+79,9%** |
+
+Decode nie zmienił się (65,0 i 89,2 tok/s) — to ścieżka GEMV, ograniczona pasmem
+pamięci, której żaden z tych kroków nie dotyka.
+
+Kolejność wyznaczył PROFIL, nie intuicja. `rocprofv3 --kernel-trace` na prefillu
+Q8_0 pokazał: GEMM 64,9%, uwaga 23,4%, reszta poniżej 1%. Dla Q4_K odpowiednio
+47,2% / 29,9% / 17,0% (to trzecie to `down` w Q6_K).
+
+### Kafel BM=128
+
+Kafel WMMA BM=64 przegrywał z `dot4` na WYSOKICH macierzach. Ruch wag to
+`(T/BM) * rows * cols`, więc mniejsze BM znaczy dwa razy więcej odczytów tych
+samych 49 MB wag `gate/up`. Zmierzone (T=1024, TOPS):
+
+| kształt | 128x128 | 64x128 | dot4 |
+|---|---|---|---|
+| 4096x4096 (q/o) | 42 | 39 | 29 |
+| 1024x4096 (k/v) | 30 | 29 | 26 |
+| 11264x4096 (gate/up) | **48** | 27 | 39 |
+| 4096x11264 (down) | 53 | 45 | 44 |
+
+### Flash attention na WMMA
+
+`attn_prefill` trzyma jeden klucz na linię i liczy pełny iloczyn 128-elementowy
+na `v_dot2_f32_f16`. To już była szybka ścieżka skalarna — dalej można było
+wyłącznie jednostką macierzową, a to znaczy INNY rozkład pracy między liniami,
+czyli osobny kernel, nie `comptime if`.
+
+`prefill_wmma.mojo` liczy Q·Kᵀ i P·V kaflami 16x16. Jedyna nieoczywistość:
+wynik Q·Kᵀ wychodzi w układzie akumulatora (zapytanie rozrzucone po `e`), a P·V
+potrzebuje P w układzie operandu A (zapytanie w `lane%16`) — przejście idzie
+przez 512 B pamięci współdzielonej na falę.
+
+Zmierzone (32 głowice Q, 8 KV, head_dim 128): T=512 **2,25x**, T=1024 **3,00x**,
+T=2048 **3,28x**. Przewaga rośnie z długością sekwencji, bo koszt uwagi rośnie
+kwadratowo — widać to na prefillu całego modelu: przy 8192 tokenach nadal
+2351 tok/s, podczas gdy przed zmianami 4096 dawało 1874.
+
+Zakres: `head_dim == 128`, cache f16, bez okna przesuwnego. Pozostałe kształty
+idą starą ścieżką, a zasięg katalogu `amd:gfx12` trzyma kernel wyłącznie na
+RDNA4, bo używa natywnego fragmentu ośmioelementowego.

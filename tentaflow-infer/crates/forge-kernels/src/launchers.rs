@@ -8297,6 +8297,40 @@ impl Kernels {
                 AttnBackend::Scalar => {}
             }
         }
+        // RDNA4: flash attention na jednostce macierzowej. Kafel 16x16 liczy
+        // Q·Kᵀ i P·V przez WMMA zamiast iloczynów skalarnych na linię —
+        // zmierzone na R9700 (32 głowice Q, 8 KV, head_dim 128):
+        //   T=512  738 us -> 327 us (2,25x)
+        //   T=1024 2703 us -> 899 us (3,00x)
+        //   T=2048 8508 us -> 2591 us (3,28x)
+        // Przewaga rośnie z długością sekwencji, bo koszt uwagi rośnie
+        // kwadratowo. Kernel nie obsługuje okna przesuwnego ani cache'u innego
+        // niż f16, więc te przypadki idą dalej starą ścieżką.
+        if kv_dtype == DType::F16
+            && head_dim == 128
+            && window == 0
+            && self.artifacts.has("attn_prefill_wmma_hd128")
+        {
+            let k = self.artifacts.get("attn_prefill_wmma_hd128")?;
+            let cfg = LaunchConfig {
+                grid: ((n_tokens as u32).div_ceil(64), n_q_heads as u32, 1),
+                block: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let args = LaunchArgs::new()
+                .buf(out)
+                .buf(q)
+                .buf(k_cache)
+                .buf(v_cache)
+                .buf(page_table)
+                .scalar(base_pos as i64)
+                .scalar(n_q_heads as i64)
+                .scalar(n_kv_heads as i64)
+                .scalar(page_size as i64)
+                .scalar(scale)
+                .scalar(n_tokens as i64);
+            return self.device.launch(k, &cfg, &args, stream);
+        }
         let suffix = Self::kv_suffix(kv_dtype, "attn_prefill")?;
         let name = match (head_dim, kv_dtype) {
             (64, _) => format!("attn_prefill_{suffix}_hd64"),

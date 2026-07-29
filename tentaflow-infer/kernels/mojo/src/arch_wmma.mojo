@@ -81,14 +81,18 @@ def wmma_f16_16x16x16(
     b: SIMD[DType.float16, 16],
     c: SIMD[DType.float32, 8],
 ) -> SIMD[DType.float32, 8]:
-    """Kafel 16x16x16 f16 z akumulacją f32, jedna instrukcja."""
+    """Kafel 16x16x16 f16 z akumulacją f32, jedna instrukcja.
+
+    Przyjmuje fragment W UKŁADZIE RDNA3 (cały wiersz 16 wartości). Na RDNA4
+    wybiera z niego połowę należącą do tej linii i woła wariant natywny —
+    kernele pisane pod RDNA4 podają swoją połowę wprost przez
+    `wmma_f16_16x16x16_native` i nie czytają dwa razy więcej, niż potrzebują.
+    """
     comptime if _accelerator_arch().startswith("amdgpu:gfx12"):
         var half = _wave_half()
         var a8 = a.slice[8, offset=8]() if half == 1 else a.slice[8, offset=0]()
         var b8 = b.slice[8, offset=8]() if half == 1 else b.slice[8, offset=0]()
-        return llvm_intrinsic[
-            "llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16", SIMD[DType.float32, 8]
-        ](a8, b8, c)
+        return wmma_f16_16x16x16_native(a8, b8, c)
     else:
         return llvm_intrinsic[
             "llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16", SIMD[DType.float32, 8]
@@ -122,4 +126,24 @@ def wmma_fp8_16x16x16(
         # zakresowany w katalogu — zwracamy akumulator bez zmian, zeby bledny
         # zakres wyszedl jako rozjazd z referencja w tescie zlotym, a nie jako
         # cichy wynik z niewiadomej instrukcji.
+        return c
+
+
+@always_inline
+def wmma_f16_16x16x16_native(
+    a: SIMD[DType.float16, 8],
+    b: SIMD[DType.float16, 8],
+    c: SIMD[DType.float32, 8],
+) -> SIMD[DType.float32, 8]:
+    """Kafel 16x16x16 f16 we WŁASNYM rozmiarze fragmentu RDNA4 (osiem wartości).
+
+    ISTNIEJE TYLKO NA RDNA4 — RDNA3 wymaga szesnastu i ma inny wariant
+    intrinsika, wiec kernel wolajacy to wejscie musi byc zakresowany na gfx12.
+    """
+    comptime if _accelerator_arch().startswith("amdgpu:gfx12"):
+        return llvm_intrinsic[
+            "llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16",
+            SIMD[DType.float32, 8],
+        ](a, b, c)
+    else:
         return c
