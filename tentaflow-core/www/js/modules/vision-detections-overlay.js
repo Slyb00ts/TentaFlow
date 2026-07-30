@@ -665,7 +665,9 @@ class DetectionsOverlay {
         let g = wpis.glosy.get(tekst);
         if (!g) { g = { count: 0, maxScore: 0 }; wpis.glosy.set(tekst, g); }
         g.count += 1;
-        if (score > g.maxScore) g.maxScore = score;
+        // Tie-break trzyma TĘ SAMĄ miarę, po której wpuszczamy głos: pewność
+        // ODCZYTU (`conf`), nie pewność ramki detektora.
+        if (conf > g.maxScore) g.maxScore = conf;
         wpis.at = now;
       }
     }
