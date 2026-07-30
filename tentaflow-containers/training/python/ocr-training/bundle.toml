@@ -13,7 +13,11 @@ python_version = "3.12"
 # Zależności pinowane w pyproject. `pypi_package` to identity-package bundla;
 # torch z wariantu CUDA przez install_variants.extra_index.
 source = "pypi"
-pypi_package = "opencv-python-headless>=4.10"
+# Pakiet-tożsamość bundla (klucz cache), pinowany jak w pozostałych bundlach.
+# Realny graf zależności bierze się z `pyproject.toml` + `uv.lock` — bez LOCKA
+# deployer nie uzna bundla za uv-native i zainstaluje TYLKO ten pakiet, pomijając
+# torch/fastapi/uvicorn zadeklarowane w pyproject (serwis wtedy nie wstaje).
+pypi_package = "opencv-python-headless==5.0.0.93"
 
 [launch]
 command = "uvicorn"

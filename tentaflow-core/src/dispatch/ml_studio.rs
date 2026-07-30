@@ -5381,6 +5381,55 @@ fn stage_into_vision_dir(
     Ok((sha256, temp))
 }
 
+/// Wstawia wytrenowany czytnik OCR do katalogu modeli wizji pod nazwami, których
+/// szuka runtime (`adr_ocr.onnx` + `adr_ocr_alphabet.txt`). Oba pliki są najpierw
+/// stage'owane, a promowane dopiero gdy OBA się skopiowały — inaczej awaria w
+/// połowie zostawiłaby model nowy, a alfabet stary (CTC dekodowałby wtedy cyframi
+/// z innego zestawu, czyli po cichu bzdury).
+async fn publish_ocr_reader(metrics: &serde_json::Value) -> Result<(), String> {
+    const MODEL_FILE: &str = "adr_ocr.onnx";
+    const ALPHABET_FILE: &str = "adr_ocr_alphabet.txt";
+
+    let pick = |key: &str| -> Result<std::path::PathBuf, String> {
+        let raw = metrics
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("model bez `{key}` — eksport nie zapisał artefaktu"))?;
+        contained_artifact_file(std::path::Path::new(raw))
+    };
+    let onnx = pick("onnx_path")?;
+    let alphabet = pick("alphabet_path")?;
+
+    let staged = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+            let mut out = Vec::new();
+            for (src, name) in [(onnx, MODEL_FILE), (alphabet, ALPHABET_FILE)] {
+                let (_sha, temp) = stage_into_vision_dir(&src, name)?;
+                out.push((temp, crate::paths::vision_models_dir().join(name)));
+            }
+            Ok(out)
+        },
+    )
+    .await
+    .map_err(|e| format!("kopiowanie artefaktów OCR: {e}"))?
+    .map_err(|e| format!("kopiowanie artefaktów OCR: {e:#}"))?;
+
+    for (temp, final_path) in &staged {
+        if let Err(e) = std::fs::rename(temp, final_path) {
+            // Sprzątamy wszystkie stage'e — częściowa promocja jest gorsza niż brak.
+            for (t, _) in &staged {
+                let _ = std::fs::remove_file(t);
+            }
+            return Err(format!(
+                "promocja {} nieudana: {e}",
+                final_path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[handler(variant = "MlStudioVisionModelPublishRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -5410,13 +5459,6 @@ pub async fn ml_studio_vision_model_publish(
         ))
     };
 
-    // The registry name becomes the on-disk file name — validate it with the
-    // repository rule BEFORE any export/filesystem work so `../x` never
-    // reaches a `Path::join`.
-    if let Err(e) = crate::db::repository::validate_vision_model_name(&payload.model_name) {
-        return respond(false, Some(e));
-    }
-
     let metrics: serde_json::Value = serde_json::from_str(&model.metrics_json)
         .map_err(|e| ProtocolError::internal(format!("stored metrics corrupt: {}", e)))?;
 
@@ -5436,6 +5478,30 @@ pub async fn ml_studio_vision_model_publish(
                 "artefakty modelu żyją na węźle '{node}' — uruchom publikację na tym węźle"
             )),
         );
+    }
+
+    // Czytnik OCR NIE idzie przez rejestr vision: runtime (`vision::adr_ocr`)
+    // ładuje go po STAŁYCH nazwach plików z katalogu modeli wizji, nie po nazwie
+    // w rejestrze ani aliasie. Publikacja to więc podmiana tych dwóch plików —
+    // model bez alfabetu jest bezużyteczny, więc lecą razem.
+    if model.framework == "ocr-crnn" {
+        return match publish_ocr_reader(&metrics).await {
+            Ok(()) => {
+                // Proces trzyma silnik w cache; bez zrzucenia go operator
+                // widziałby sukces i stare odczyty aż do restartu.
+                crate::vision::adr_ocr::invalidate();
+                respond(true, None)
+            }
+            Err(e) => respond(false, Some(e)),
+        };
+    }
+
+    // Nazwa w rejestrze staje się nazwą pliku na dysku — waliduj regułą repozytorium
+    // ZANIM ruszy eksport czy zapis, żeby `../x` nigdy nie doszło do `Path::join`.
+    // Sprawdzane dopiero tutaj, bo tor OCR wyżej rejestru w ogóle nie używa (ładuje
+    // się po stałych nazwach plików) i nie ma po co wymagać od niego nazwy.
+    if let Err(e) = crate::db::repository::validate_vision_model_name(&payload.model_name) {
+        return respond(false, Some(e));
     }
 
     let (expected_op, contract) = match model.framework.as_str() {

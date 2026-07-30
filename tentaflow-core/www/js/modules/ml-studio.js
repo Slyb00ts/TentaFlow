@@ -6495,6 +6495,7 @@ function modelMetricsSummary(metricsJson) {
 const FRAMEWORK_LABELS = {
   rfdetr: 'Detekcja RF-DETR',
   'classifier-timm': 'Klasyfikator atrybutu',
+  'ocr-crnn': 'Czytnik OCR (CRNN + CTC)',
   'ocr-paddle': 'OCR',
 };
 function frameworkLabel(fw) {
@@ -6577,7 +6578,7 @@ function renderModelsTab(panel, p) {
           _framework: framework,
           // Modele wizyjne (RF-DETR / klasyfikator timm) można opublikować do
           // rejestru vision_models — pipeline'y kamer użyją ich bez rekompilacji.
-          _canPublishVision: Boolean(modelId && (framework === 'rfdetr' || framework === 'classifier-timm')),
+          _canPublishVision: Boolean(modelId && (framework === 'rfdetr' || framework === 'classifier-timm' || framework === 'ocr-crnn')),
           _canExport: Boolean(modelId && framework !== 'rfdetr' && (baseModel.trim().length > 0 || framework === 'classifier-timm')),
           _canChat: Boolean(modelId && deployed),
           _deploying: Boolean(modelId && deploying),
@@ -6593,7 +6594,9 @@ function renderModelsTab(panel, p) {
           pub.setAttribute('size', 'sm');
           pub.setAttribute('variant', 'outline');
           pub.setAttribute('icon', 'eye');
-          pub.textContent = 'Publikuj do kamer';
+          // Czytnik OCR nie trafia do rejestru kamer, tylko podmienia czytnik
+          // ADR węzła — przycisk nie może obiecywać czegoś innego.
+          pub.textContent = row._framework === 'ocr-crnn' ? 'Ustaw jako czytnik ADR' : 'Publikuj do kamer';
           pub.addEventListener('click', () => openVisionPublishPanel(p, row, () => renderModelsTab(panel, p)));
           return pub;
         };
@@ -6825,6 +6828,9 @@ function openVisionShareModal(bundleRef = 'vision-all') {
 function openVisionPublishPanel(p, row, onDone) {
   const modelId = row._modelId;
   if (!modelId) return;
+  // Czytnik OCR nie idzie przez rejestr vision — runtime ładuje go po stałych
+  // nazwach plików, więc nazwa/alias/próg/operacja są dla niego bez znaczenia.
+  const isOcr = row._framework === 'ocr-crnn';
   const op = row._framework === 'rfdetr' ? 'detect' : 'classify';
   const suggested = String(row._modelName || '')
     .toLowerCase()
@@ -6832,22 +6838,25 @@ function openVisionPublishPanel(p, row, onDone) {
     .replace(/^-+|-+$/g, '');
   const modal = document.createElement('tf-modal');
   modal.setAttribute('variant', 'modal');
-  modal.setAttribute('title', `Publikuj do kamer — ${row._modelName}`);
+  modal.setAttribute('title', isOcr ? `Ustaw jako czytnik ADR — ${row._modelName}` : `Publikuj do kamer — ${row._modelName}`);
   modal.setAttribute('size', 'md');
-  modal.innerHTML = `
-    <div slot="body">
-      <p class="ml-studio-export-intro">Model trafi do rejestru modeli wizyjnych (silnik onnx-cv). Pipeline'y kamer wskazują go przez alias lub bezpośrednio po nazwie — bez rekompilacji. Jeśli ONNX nie był jeszcze wyeksportowany, eksport uruchomi się automatycznie (RF-DETR: kilka minut).</p>
+  const bodyHtml = isOcr
+    ? `<p class="ml-studio-export-intro">Model zastąpi czytnik tablic ADR tego węzła: pliki <code>adr_ocr.onnx</code> i <code>adr_ocr_alphabet.txt</code> trafią do katalogu modeli wizji, a pipeline kamer zacznie ich używać od razu — bez restartu i bez rejestru (ten czytnik ładuje się po stałej nazwie, nie po aliasie). Poprzedni czytnik zostanie nadpisany.</p>`
+    : `<p class="ml-studio-export-intro">Model trafi do rejestru modeli wizyjnych (silnik onnx-cv). Pipeline'y kamer wskazują go przez alias lub bezpośrednio po nazwie — bez rekompilacji. Jeśli ONNX nie był jeszcze wyeksportowany, eksport uruchomi się automatycznie (RF-DETR: kilka minut).</p>
       <tf-input id="ml-studio-vision-name" label="Nazwa w rejestrze (a-z, 0-9, -, _)" value="${escapeAttr(suggested)}"></tf-input>
       <tf-select id="ml-studio-vision-op" label="Operacja" value="${op}" disabled>
         <option value="${op}">${op === 'detect' ? 'detekcja (RF-DETR)' : 'klasyfikacja (softmax)'}</option>
       </tf-select>
       ${op === 'detect' ? '<tf-input type="number" id="ml-studio-vision-threshold" label="Domyślny próg pewności" value="0.5" min="0" max="1" step="0.05"></tf-input>' : ''}
-      <tf-input id="ml-studio-vision-alias" label="Alias (opcjonalnie, np. tentavision-detect)"></tf-input>
+      <tf-input id="ml-studio-vision-alias" label="Alias (opcjonalnie, np. tentavision-detect)"></tf-input>`;
+  modal.innerHTML = `
+    <div slot="body">
+      ${bodyHtml}
       <div id="ml-studio-vision-publish-status" style="margin-top:10px"></div>
     </div>
     <div slot="footer">
       <tf-button variant="ghost" data-vision-close>Anuluj</tf-button>
-      <tf-button variant="primary" icon="eye" id="ml-studio-vision-go">Publikuj</tf-button>
+      <tf-button variant="primary" icon="eye" id="ml-studio-vision-go">${isOcr ? 'Ustaw czytnik' : 'Publikuj'}</tf-button>
     </div>
   `;
   document.body.appendChild(modal);
@@ -6859,8 +6868,12 @@ function openVisionPublishPanel(p, row, onDone) {
   const go = modal.querySelector('#ml-studio-vision-go');
   go?.addEventListener('click', async () => {
     const status = modal.querySelector('#ml-studio-vision-publish-status');
-    const modelName = String(modal.querySelector('#ml-studio-vision-name')?.value || '').trim();
-    if (!/^[a-z0-9-_]+$/.test(modelName)) {
+    // Dla OCR nazwa nie jest używana po stronie serwera (brak wpisu w rejestrze),
+    // ale pole payloadu jest wymagane — wysyłamy stałą, czytelną w logach.
+    const modelName = isOcr
+      ? 'adr-ocr'
+      : String(modal.querySelector('#ml-studio-vision-name')?.value || '').trim();
+    if (!isOcr && !/^[a-z0-9-_]+$/.test(modelName)) {
       if (status) status.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Nazwa musi pasować do [a-z0-9-_]+.</div>`;
       return;
     }
@@ -6877,7 +6890,7 @@ function openVisionPublishPanel(p, row, onDone) {
         alias: alias || null,
       }, { timeoutMs: 20 * 60 * 1000 });
       if (!resp.ok) throw new Error(resp.error || 'publikacja odrzucona');
-      toast(`Model „${modelName}" opublikowany do rejestru kamer`, 'success');
+      toast(isOcr ? 'Czytnik ADR zaktualizowany' : `Model „${modelName}" opublikowany do rejestru kamer`, 'success');
       close();
       if (typeof onDone === 'function') onDone();
     } catch (err) {

@@ -891,6 +891,16 @@ fn split_rows(gray: &[u8], w: u32, h: u32) -> (&[u8], u32, &[u8], u32) {
 /// dostarcza pliki modelu, kolejne wywołanie mogło je załadować bez restartu.
 static ENGINE: OnceLock<Mutex<Option<Arc<AdrOcr>>>> = OnceLock::new();
 
+/// Zrzuca zapamiętany silnik, żeby następne `get()` wczytało model z dysku od
+/// nowa. Wołane po opublikowaniu świeżo wytrenowanego czytnika: bez tego proces
+/// trzymałby STARY `adr_ocr.onnx` w cache do restartu, a operator widziałby
+/// „opublikowano" i zero zmiany w odczytach.
+pub fn invalidate() {
+    if let Some(slot) = ENGINE.get() {
+        *slot.lock() = None;
+    }
+}
+
 /// Zwraca clone Arc-a do naszego silnika ADR OCR, ładując go leniwie z
 /// `vision_models_dir()`. `None`, gdy modelu jeszcze nie ma — caller schodzi
 /// wtedy na fallback PP-OCRv5.
