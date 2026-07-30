@@ -202,8 +202,12 @@
       "file": "attn_prefill_segmented_f16_hd256.hsaco"
     },
     "attn_prefill_wmma_hd128": {
-      "entry": "src_prefill_wmma_attn_prefill_6A6A6A6A_08e55d3931def082",
+      "entry": "src_prefill_wmma_attn_prefill_6A6A6A6A_cb08bfa0c940c6d5",
       "file": "attn_prefill_wmma_hd128.hsaco"
+    },
+    "attn_prefill_wmma_hd256": {
+      "entry": "src_prefill_wmma_attn_prefill_6A6A6A6A_a44b436104df2ba0",
+      "file": "attn_prefill_wmma_hd256.hsaco"
     },
     "attn_verify_segmented_f16_hd128": {
       "entry": "src_attention_attn_verify_segm6A6A6A6A_5d6ea2bd9b705a84",

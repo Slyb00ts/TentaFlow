@@ -8423,12 +8423,20 @@ impl Kernels {
         // Przewaga rośnie z długością sekwencji, bo koszt uwagi rośnie
         // kwadratowo. Kernel nie obsługuje okna przesuwnego ani cache'u innego
         // niż f16, więc te przypadki idą dalej starą ścieżką.
-        if kv_dtype == DType::F16
-            && head_dim == 128
-            && window == 0
-            && self.artifacts.has("attn_prefill_wmma_hd128")
-        {
-            let k = self.artifacts.get("attn_prefill_wmma_hd128")?;
+        //
+        // `head_dim` NALEŻY DO MODELU, więc kernel ma je jako parametr
+        // kompilacji, a nie jako stałą — wybór idzie po `head_dim` z deskryptora
+        // i po obecności artefaktu tej instancji. Dołożenie kolejnego kształtu
+        // to alias w `prefill_wmma.mojo` plus wpis w katalogu; nic tutaj nie
+        // trzeba zmieniać i żaden inny model na tym nie ucierpi.
+        let wmma_variant = match head_dim {
+            128 => Some("attn_prefill_wmma_hd128"),
+            256 => Some("attn_prefill_wmma_hd256"),
+            _ => None,
+        }
+        .filter(|name| self.artifacts.has(name));
+        if kv_dtype == DType::F16 && window == 0 && wmma_variant.is_some() {
+            let k = self.artifacts.get(wmma_variant.expect("wariant sprawdzony"))?;
             let cfg = LaunchConfig {
                 grid: ((n_tokens as u32).div_ceil(64), n_q_heads as u32, 1),
                 block: (128, 1, 1),

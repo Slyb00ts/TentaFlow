@@ -1557,6 +1557,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "attn_prefill_segmented_f16_hd128",
     "attn_prefill_segmented_f16_hd256",
     "attn_prefill_wmma_hd128",
+    "attn_prefill_wmma_hd256",
     "attn_verify_segmented_f16_hd128",
     "attn_verify_segmented_f16_hd128_warp32",
     "attn_verify_segmented_f16_hd256",

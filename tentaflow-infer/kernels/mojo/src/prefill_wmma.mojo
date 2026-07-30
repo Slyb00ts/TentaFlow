@@ -1,6 +1,7 @@
 # =============================================================================
 # Plik: prefill_wmma.mojo
-# Opis: Flash attention prefillu na jednostce macierzowej, head_dim 128, KV f16.
+# Opis: Flash attention prefillu na jednostce macierzowej, KV f16. `head_dim`
+#       jest PARAMETREM KOMPILACJI, nie stala modulu — kazdy model ma swoje.
 #       Q·Kᵀ i P·V liczy WMMA 16x16x16 zamiast iloczynów skalarnych na linię.
 # Przykład: attn_prefill_wmma_hd128(out, q, k, v, page_table, ...)
 # =============================================================================
@@ -31,14 +32,12 @@ from src.arch_wmma import wmma_f16_16x16x16_native
 
 comptime WARP: Int = 32
 comptime TILE: Int = 16
-comptime HD: Int = 128
-comptime CHUNKS: Int = HD // TILE
 comptime WAVES: Int = 4
 comptime QT: Int = WAVES * TILE
 comptime NEG_INF: Float32 = -3.0e38
 
 
-def attn_prefill_wmma_hd128(
+def attn_prefill_wmma_impl[HD: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
     k_cache: UnsafePointer[Float16, MutAnyOrigin],
@@ -58,6 +57,7 @@ def attn_prefill_wmma_hd128(
     czytany przez wszystkie cztery fale, więc bajt cache'u pobiera się raz na 64
     zapytania.
     """
+    comptime CHUNKS: Int = HD // TILE
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP
     tid = Int(thread_idx.x)
@@ -205,3 +205,11 @@ def attn_prefill_wmma_hd128(
                 out_ptr[base + c * TILE + col] = (acc[c][e] * inv).cast[
                     DType.float16
                 ]()
+
+
+# `head_dim` NALEZY DO MODELU, nie do kernela. Instancje sa tu jawne, a launcher
+# wybiera je po `params.head_dim`, wiec dolozenie kolejnego ksztaltu to dopisanie
+# aliasu i wpisu w katalogu — nie edycja stalej, ktora zepsulaby pozostale modele.
+# Bielik i Mistral maja 128, ThinkingCap-Qwen3.6-27B ma 256.
+comptime attn_prefill_wmma_hd128 = attn_prefill_wmma_impl[128]
+comptime attn_prefill_wmma_hd256 = attn_prefill_wmma_impl[256]

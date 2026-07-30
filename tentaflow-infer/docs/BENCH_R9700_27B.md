@@ -319,9 +319,15 @@ Kolejność prac, jaką wyznaczają te liczby:
    GEMM-u tej samej warstwy — czyli przepakowanie CHOWA SIĘ całkowicie za
    liczeniem poprzedniej warstwy, a scratch kosztuje 356 MB zamiast 11 GiB.
    Wymaga bramki jakościowej: e4m3 na wierzchu Q4_K to drugie zaokrąglenie.
-2. **`attn_prefill` idzie ścieżką skalarną.** Kernel WMMA flash attention pokrywa
-   `head_dim == 128`, a ten model ma 256 — czyli 41 ms liczy się na `dot2`
-   (~5 TFLOPS). Rozszerzenie zakresu na 256 to czysty, ograniczony zysk.
+2. **`attn_prefill` idzie ścieżką skalarną i to NIE jest już kwestia zakresu.**
+   `head_dim` przestało być stałą modułu: `attn_prefill_wmma_impl[HD]` ma
+   instancje 128 i 256, a launcher wybiera po `head_dim` z deskryptora, więc
+   kolejny kształt to alias plus wpis w katalogu. Pomiar pokazał jednak, że to
+   nie wystarczy: **prefill hybrydowy nie woła `attn_prefill`**, tylko własny
+   `hybrid_layer_major_attention_backend`, i tamtędy nadal idzie
+   `attn_prefill_device` (40,8 ms, ~5 TFLOPS). Zysk będzie dopiero po wpięciu
+   wariantu WMMA w TEN wybór — prefill po samej parametryzacji nie drgnął
+   (1443,6 -> 1446,7 tok/s, czyli szum).
 3. **`deltanet_value_key` 68 ms** to skan rekurencyjny z synchronizacją siatki na
    token. Chunkowa postać macierzowa (jak w chunked linear attention) zamieniłaby
    go na GEMM-y — duża zmiana algorytmiczna, ale to jedyna droga poniżej ~60 ms.
