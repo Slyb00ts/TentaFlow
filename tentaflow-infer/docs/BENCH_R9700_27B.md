@@ -333,10 +333,15 @@ Kolejność prac, jaką wyznaczają te liczby:
      na gfx1201 go po prostu nie ma. Stąd 40,8 ms w
      `attn_prefill_device_pos_f16_hd256`.
 
-   Wpięcie: `attn_prefill_wmma_hd256` JEST zbudowany dla gfx1201 i sprawdzony,
-   więc trzeba go wystawić jako backend `Flash` na AMD — czyli routing w
-   launcherze wariantu `_pos` (semantyka pozycji: kernel WMMA bierze `base_pos`,
-   więc kontrakt się zgadza). To jedyne miejsce; sam kernel jest gotowy.
+   Wpięcie NIE jest samym routingiem i to jest ostatni ustalony szczegół:
+   `attn_prefill_device_pos_f16_hd256` bierze `base_pos` jako **bufor GPU** (ta
+   pozycja powstaje w poprzednich kernelach chunka), a `attn_prefill_wmma_impl`
+   bierze ją jako **skalar hosta**. Potrzebny jest więc wariant kernela czytający
+   `base_pos[0]` z bufora — zmiana jednego parametru i jednego odczytu, ale
+   wymaga przebudowy katalogu. Sam kafel WMMA jest zbudowany dla gfx1201 i
+   sprawdzony (`tests_amd_q6k_wmma`-owej klasy test złoty przeszedł dla obu
+   instancji HD), więc po tej jednej zmianie zostaje wystawienie go jako backend
+   `Flash` na AMD.
 
 3. **`deltanet_value_key` 68 ms** to skan rekurencyjny z synchronizacją siatki na
    token. Chunkowa postać macierzowa (jak w chunked linear attention) zamieniłaby
