@@ -319,15 +319,25 @@ Kolejność prac, jaką wyznaczają te liczby:
    GEMM-u tej samej warstwy — czyli przepakowanie CHOWA SIĘ całkowicie za
    liczeniem poprzedniej warstwy, a scratch kosztuje 356 MB zamiast 11 GiB.
    Wymaga bramki jakościowej: e4m3 na wierzchu Q4_K to drugie zaokrąglenie.
-2. **`attn_prefill` idzie ścieżką skalarną i to NIE jest już kwestia zakresu.**
-   `head_dim` przestało być stałą modułu: `attn_prefill_wmma_impl[HD]` ma
-   instancje 128 i 256, a launcher wybiera po `head_dim` z deskryptora, więc
-   kolejny kształt to alias plus wpis w katalogu. Pomiar pokazał jednak, że to
-   nie wystarczy: **prefill hybrydowy nie woła `attn_prefill`**, tylko własny
-   `hybrid_layer_major_attention_backend`, i tamtędy nadal idzie
-   `attn_prefill_device` (40,8 ms, ~5 TFLOPS). Zysk będzie dopiero po wpięciu
-   wariantu WMMA w TEN wybór — prefill po samej parametryzacji nie drgnął
-   (1443,6 -> 1446,7 tok/s, czyli szum).
+2. **Uwaga prefillu: RDNA4 nigdy nie dostaje flash attention.** Diagnoza jest
+   domknięta i jest to ta sama klasa co „NVIDIA-only", którą już raz zdejmowano
+   z dense prefillu:
+   - `head_dim` przestało być stałą modułu — `attn_prefill_wmma_impl[HD]` ma
+     instancje 128 i 256, launcher wybiera po `head_dim` z deskryptora, a
+     dołożenie kształtu to alias plus wpis w katalogu;
+   - **ale to nie wystarczyło i pomiar to pokazał** (1443,6 -> 1446,7 tok/s,
+     szum): prefill hybrydowy nie woła `attn_prefill`, tylko wybiera backend w
+     `hybrid_layer_major_attention_backend`;
+   - ten wybór schodzi z `Flash` na `Prefill`, bo **artefakt
+     `attn_prefill_fa_mojo_f16_hd256` ma w katalogu zakres `# arch: nvidia`** —
+     na gfx1201 go po prostu nie ma. Stąd 40,8 ms w
+     `attn_prefill_device_pos_f16_hd256`.
+
+   Wpięcie: `attn_prefill_wmma_hd256` JEST zbudowany dla gfx1201 i sprawdzony,
+   więc trzeba go wystawić jako backend `Flash` na AMD — czyli routing w
+   launcherze wariantu `_pos` (semantyka pozycji: kernel WMMA bierze `base_pos`,
+   więc kontrakt się zgadza). To jedyne miejsce; sam kernel jest gotowy.
+
 3. **`deltanet_value_key` 68 ms** to skan rekurencyjny z synchronizacją siatki na
    token. Chunkowa postać macierzowa (jak w chunked linear attention) zamieniłaby
    go na GEMM-y — duża zmiana algorytmiczna, ale to jedyna droga poniżej ~60 ms.
