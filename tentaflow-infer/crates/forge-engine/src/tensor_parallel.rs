@@ -256,29 +256,42 @@ impl ColShards {
 /// Granica podziału kolumn MUSI paść na całe bloki — fragment zaczynający się w
 /// środku bloku nie ma jak zostać odczytany przez żaden kernel. Stąd podział
 /// liczony jest w blokach, a nie w kolumnach.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct BlockFormat {
     pub values: usize,
     pub bytes: usize,
     pub quant: QuantKind,
+    /// Mnożnik całego tensora. GGUF NVFP4 trzyma go obok bloków i kernel GEMV
+    /// przyjmuje go argumentem; pozostałe formaty mają go wtopiony w bloki i
+    /// przekazują 1.0. Jest własnością KONKRETNEJ macierzy, nie formatu, więc
+    /// `gate` i `up` mogą mieć ten sam `quant` i różne skale — dlatego porównanie
+    /// formatów idzie po `quant`, a nie po całej strukturze.
+    pub output_scale: f32,
 }
 
 impl BlockFormat {
-    pub fn of(quant: QuantKind) -> Result<Self> {
+    pub fn of(quant: QuantKind, output_scale: f32) -> Result<Self> {
         let (values, bytes) = match quant {
             QuantKind::Q8_0 => (32, 34),
             QuantKind::Q4K => (256, 144),
             QuantKind::Q6K => (256, 210),
+            QuantKind::NVFP4Gguf => (64, 36),
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "podział FFN na karty nie ma ścieżki dla formatu {other:?}"
                 )));
             }
         };
+        if !output_scale.is_finite() || output_scale <= 0.0 {
+            return Err(ForgeError::Format(format!(
+                "skala tensora musi być skończona i dodatnia, otrzymano {output_scale}"
+            )));
+        }
         Ok(Self {
             values,
             bytes,
             quant,
+            output_scale,
         })
     }
 
@@ -398,7 +411,7 @@ pub fn upload_column_split_with(
 /// `x_parts[i]` musi zawierać wycinek wejścia `[offset(i), offset(i)+cols(i))`
 /// — nie całe wejście, bo to jest właśnie ten wymiar, który jest podzielony.
 #[allow(clippy::too_many_arguments)]
-pub fn gemv_q8_0_column_split(
+pub fn gemv_column_split(
     cluster: &Cluster,
     shards: &ColShards,
     x_parts: &[DevBuffer],
@@ -445,7 +458,26 @@ pub fn gemv_q8_0_column_split(
                 cols,
                 stream,
             )?,
+            (QuantKind::NVFP4Gguf, _) => entry.kernels.gemv_nvfp4_gguf_q8_1_out_f32(
+                &y_parts[index],
+                shards.shard(index)?,
+                &x_parts[index],
+                rows,
+                cols,
+                shards.format.output_scale,
+                stream,
+            )?,
             (QuantKind::Q4K, true) => entry.kernels.gemv_q4_k_dp4a_out_f32(
+                &y_parts[index],
+                0,
+                shards.shard(index)?,
+                &x_parts[index],
+                0,
+                rows,
+                cols,
+                stream,
+            )?,
+            (QuantKind::Q4K, false) => entry.kernels.gemv_q4_k_out_f32(
                 &y_parts[index],
                 0,
                 shards.shard(index)?,
@@ -519,10 +551,13 @@ pub struct FfnShards {
     up: Vec<DevBuffer>,
     down: ColShards,
     rows: Vec<usize>,
-    /// Format `gate`/`up`. Może być INNY niż `down`: `Q4_K_M` trzyma projekcję
+    /// Formaty `gate` i `up`. Mogą być INNE niż `down`: `Q4_K_M` trzyma projekcję
     /// `down` w Q6_K. Dzielenie po wierszach nie stawia warunku na granicę, więc
-    /// wystarczy, że pokrywa się ona z granicą bloków `down`.
-    format: BlockFormat,
+    /// wystarczy, że pokrywa się ona z granicą bloków `down`. Kwantyzacja `gate`
+    /// i `up` jest ta sama, ale skala tensora bywa różna, więc oba dostają swój
+    /// opis.
+    gate_format: BlockFormat,
+    up_format: BlockFormat,
 }
 
 impl FfnShards {
@@ -545,10 +580,17 @@ pub fn upload_ffn_split(
     hidden: usize,
     inter: usize,
     kind: WorkKind,
-    format: BlockFormat,
+    gate_format: BlockFormat,
+    up_format: BlockFormat,
     down_format: BlockFormat,
     forced: Option<&[usize]>,
 ) -> Result<FfnShards> {
+    if gate_format.quant != up_format.quant {
+        return Err(ForgeError::Unsupported(format!(
+            "gate i up dzieli jeden plan, więc muszą mieć tę samą kwantyzację, jest {:?} i {:?}",
+            gate_format.quant, up_format.quant
+        )));
+    }
     let down = upload_column_split_with(
         cluster,
         caps,
@@ -560,14 +602,15 @@ pub fn upload_ffn_split(
         forced,
     )?;
     let rows: Vec<usize> = (0..cluster.len()).map(|i| down.cols_on(i)).collect();
-    let gate = upload_rows_by_plan(cluster, gate, inter, hidden, &rows, format)?;
-    let up = upload_rows_by_plan(cluster, up, inter, hidden, &rows, format)?;
+    let gate = upload_rows_by_plan(cluster, gate, inter, hidden, &rows, gate_format)?;
+    let up = upload_rows_by_plan(cluster, up, inter, hidden, &rows, up_format)?;
     Ok(FfnShards {
         gate,
         up,
         down,
         rows,
-        format,
+        gate_format,
+        up_format,
     })
 }
 
@@ -653,8 +696,8 @@ pub fn ffn_forward_split(
         // brzmi niewinnie, ale znaczy, że podział zmienia wynik modelu — a ma
         // zmieniać wyłącznie to, która karta go liczy.
         let dp4a = hidden <= forge_kernels::Kernels::DP4A_MAX_COLS;
-        let gemv_f16 = |y: &DevBuffer, w: &DevBuffer| -> Result<()> {
-            match (shards.format.quant, dp4a) {
+        let gemv_f16 = |y: &DevBuffer, w: &DevBuffer, format: BlockFormat| -> Result<()> {
+            match (format.quant, dp4a) {
                 (QuantKind::Q8_0, true) => {
                     entry
                         .kernels
@@ -675,13 +718,54 @@ pub fn ffn_forward_split(
                         .kernels
                         .gemv_q4_k_f16(y, w, &ws.x[index], rows, hidden, stream)
                 }
+                (QuantKind::Q6K, _) => {
+                    entry
+                        .kernels
+                        .gemv_q6_k_f16(y, w, &ws.x[index], rows, hidden, stream)
+                }
+                (QuantKind::NVFP4Gguf, _) => entry.kernels.gemv_nvfp4_gguf_f16(
+                    y,
+                    w,
+                    &ws.x[index],
+                    rows,
+                    hidden,
+                    format.output_scale,
+                    stream,
+                ),
                 (other, _) => Err(ForgeError::Unsupported(format!(
                     "podział FFN nie ma ścieżki GEMV dla {other:?}"
                 ))),
             }
         };
-        gemv_f16(&ws.gate[index], &shards.gate[index])?;
-        gemv_f16(&ws.up[index], &shards.up[index])?;
+        // GGUF NVFP4 ma grupowy wariant, który kwantyzuje aktywację do Q8_1 RAZ
+        // dla obu projekcji i liczy je przez dp4a — to jest ten sam kernel,
+        // którym `gate`/`up` idą bez podziału. Wołanie tu wariantu f16 byłoby
+        // liczeniem połowy pracy wolniejszą matematyką, czyli oddaniem części
+        // zysku z drugiej karty zanim się pojawi.
+        if shards.gate_format.quant == QuantKind::NVFP4Gguf {
+            entry.kernels.gemv_nvfp4_gguf_q8_1_group_f16(
+                &[
+                    forge_kernels::Nvfp4GgufQ8Projection {
+                        output: &ws.gate[index],
+                        weights: &shards.gate[index],
+                        rows,
+                        output_scale: shards.gate_format.output_scale,
+                    },
+                    forge_kernels::Nvfp4GgufQ8Projection {
+                        output: &ws.up[index],
+                        weights: &shards.up[index],
+                        rows,
+                        output_scale: shards.up_format.output_scale,
+                    },
+                ],
+                &ws.x[index],
+                hidden,
+                stream,
+            )?;
+        } else {
+            gemv_f16(&ws.gate[index], &shards.gate[index], shards.gate_format)?;
+            gemv_f16(&ws.up[index], &shards.up[index], shards.up_format)?;
+        }
         entry.kernels.glu_mul_f16(
             activation,
             &ws.mid[index],
@@ -691,7 +775,7 @@ pub fn ffn_forward_split(
             stream,
         )?;
     }
-    gemv_q8_0_column_split(
+    gemv_column_split(
         cluster,
         &shards.down,
         &ws.mid,

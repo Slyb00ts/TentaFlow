@@ -5256,6 +5256,104 @@ impl Kernels {
         Ok(())
     }
 
+    /// `gemv_nvfp4_gguf_q8_1_f16` z wynikiem w f32 — dla sum CZĄSTKOWYCH.
+    ///
+    /// Podział kolumnowy między karty daje na każdej karcie fragment iloczynu,
+    /// który dopiero po zsumowaniu jest wierszem wyniku. Wariant f16 gubiłby na
+    /// tym bity przy każdej karcie, a wariant `..._out_f32_wave` liczy aktywację
+    /// w f16 zamiast przez dp4a — czyli wolniej niż ścieżka jednokartowa, którą
+    /// podział ma przyspieszać, a nie zastępować.
+    pub fn gemv_nvfp4_gguf_q8_1_out_f32(
+        &self,
+        y: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) || !output_scale.is_finite() {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_nvfp4_gguf_q8_1_out_f32 wymaga rows > 0, cols % 64 == 0 i skończonej skali; rows={rows}, cols={cols}, scale={output_scale}"
+            )));
+        }
+        let output_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_q8_1_out_f32", &[rows], 4)?;
+        let weight_bytes =
+            checked_buffer_bytes("gemv_nvfp4_gguf_q8_1_out_f32", &[rows, cols / 64], 36)?;
+        let input_bytes = checked_buffer_bytes("gemv_nvfp4_gguf_q8_1_out_f32", &[cols], 2)?;
+        if y.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "gemv_nvfp4_gguf_q8_1_out_f32: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        if !(raw_nvfp4_dp4a_supported(self.device.caps().warp_size)
+            && self.artifacts.has("gemv_nvfp4_gguf_q8_1_out_f32")
+            && self.artifacts.has("quantize_act_q8_1"))
+        {
+            return self
+                .gemv_nvfp4_gguf_out_f32(y, weights, x, rows, cols, output_scale, stream);
+        }
+        let need_codes = cols;
+        let need_blocks = cols / 32;
+        let mut scratch = self.prequant.lock().expect("prequant scratch poisoned");
+        if scratch.cap_codes < need_codes {
+            scratch.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            scratch.cap_codes = need_codes;
+        }
+        if scratch.cap_blocks < need_blocks {
+            scratch.xd = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            scratch.xsm = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            scratch.cap_blocks = need_blocks;
+        }
+        let xq = scratch.xq.as_ref().expect("xq zaalokowane");
+        let xd = scratch.xd.as_ref().expect("xd zaalokowane");
+        let xsm = scratch.xsm.as_ref().expect("xsm zaalokowane");
+        let quant = self.artifacts.get("quantize_act_q8_1")?;
+        let quant_args = LaunchArgs::new()
+            .buf(xq)
+            .buf(xd)
+            .buf(xsm)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(1i64);
+        self.device.launch(
+            quant,
+            &LaunchConfig::linear(need_blocks as u32, BLOCK),
+            &quant_args,
+            stream,
+        )?;
+        let kernel = self.artifacts.get("gemv_nvfp4_gguf_q8_1_out_f32")?;
+        let grid_x = u32::try_from(rows.div_ceil(8)).map_err(|_| {
+            ForgeError::Kernel("gemv_nvfp4_gguf_q8_1_out_f32: siatka przekracza u32".into())
+        })?;
+        let config = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(weights)
+            .buf(xq)
+            .buf(xd)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(output_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Przepakowuje pełną macierz GGUF NVFP4 do układu TileN128K64 na GPU.
     pub fn repack_nvfp4_gguf_tile_n128_k64(
         &self,

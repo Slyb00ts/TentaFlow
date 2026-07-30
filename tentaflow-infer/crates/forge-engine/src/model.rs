@@ -7845,10 +7845,21 @@ impl Model {
                 "podział FFN na karty obejmuje modele gęste".into(),
             ));
         }
-        if self.is_hybrid() {
-            return Err(ForgeError::Unsupported(
-                "model hybrydowy ma własną pętlę warstw, bez tego FFN".into(),
-            ));
+        // Model hybrydowy MA gęsty FFN w każdej warstwie — inny jest tylko mikser
+        // przed nim. Podział czyta wagi z pliku po rolach, więc jedynym realnym
+        // wymaganiem jest rozdzielone `gate`/`up`: scalona macierz nie ma jak
+        // dostać granicy wiersza wspólnej z podziałem kolumn `down`.
+        for (index, layer) in self.weights.layers.iter().enumerate() {
+            let LayerFfn::Dense(ffn) = &layer.ffn else {
+                return Err(ForgeError::Unsupported(format!(
+                    "warstwa {index} nie ma gęstego FFN do podziału"
+                )));
+            };
+            if matches!(ffn.gate_up, GateUpWeights::Fused(_)) {
+                return Err(ForgeError::Unsupported(format!(
+                    "warstwa {index} ma scalone gate/up, podział wymaga rozdzielonych"
+                )));
+            }
         }
         if self.kv.cfg.quant.is_rot() {
             return Err(ForgeError::Unsupported(
@@ -7884,8 +7895,21 @@ impl Model {
             ));
         }
         self.tp_ffn_capable()?;
+        // Kalibracja musi iść formatem, którym model faktycznie liczy — stosunek
+        // mocy kart zależy od niego i przy różnych architekturach potrafi się
+        // odwrócić.
+        let quant = match &self.weights.layers[0].ffn {
+            LayerFfn::Dense(ffn) => match &ffn.gate_up {
+                GateUpWeights::Split { gate, .. } => gate.split_quant(),
+                GateUpWeights::Fused(_) => None,
+            },
+            LayerFfn::Moe(_) => None,
+        }
+        .ok_or_else(|| {
+            ForgeError::Unsupported("format wag FFN nie ma ścieżki podziału na karty".into())
+        })?;
         let cluster = crate::cluster::Cluster::attach(self.device.clone(), extra, pools)?;
-        let caps = cluster.calibrate(QuantKind::Q8_0)?;
+        let caps = cluster.calibrate(quant)?;
         let layers =
             crate::weights::load_ffn_shards_gguf(path, &cluster, &caps, layer_range, forced)?;
         if layers.len() != self.weights.layers.len() {
@@ -7897,9 +7921,11 @@ impl Model {
         }
         let hidden = self.weights.descriptor.params.hidden_size;
         self.tp_ffn = Some(crate::tensor_parallel::TpFfn::new(cluster, layers, hidden)?);
-        // Krok dekodowania przestaje być jednokartowy, więc przechwycony graf
-        // przestaje go opisywać.
+        // Krok dekodowania przestaje być jednokartowy, więc przechwycone grafy
+        // przestają go opisywać — dotyczy to obu ścieżek, gęstej i hybrydowej.
         self.decode_graph = None;
+        self.decode_hybrid_graph = None;
+        self.hybrid_verify_graphs.clear();
         Ok(())
     }
 
@@ -7963,6 +7989,12 @@ impl Model {
         if self.is_hybrid() {
             self.ensure_hybrid_bufs()?;
             self.stage_hybrid_embedding(token_id)?;
+            // Krok obejmujący dwie karty idzie jawnym łańcuchem: przechwycenie
+            // rozwidlenia strumienia między kartami ROCm przerywa asercją we
+            // własnym runtime (patrz `run_step`).
+            if self.tp_ffn.is_some() {
+                return self.hybrid_forward_staged(true, AttnSrc::Paged);
+            }
             if self.decode_hybrid_graph.is_none() {
                 let graph = self.capture_hybrid_step()?;
                 self.decode_hybrid_graph = Some(graph);
@@ -15772,9 +15804,12 @@ impl Model {
                 eps,
                 stream,
             )?;
-            match &layer.ffn {
-                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream)?,
-                LayerFfn::Dense(ffn) => {
+            match (&layer.ffn, &self.tp_ffn) {
+                (LayerFfn::Dense(_), Some(tp)) => {
+                    tp.forward(stream, l, &b.x, &b.down, self.ffn_act())?
+                }
+                (LayerFfn::Moe(moe), _) => self.moe_decode_ffn(moe, l, hidden, stream)?,
+                (LayerFfn::Dense(ffn), None) => {
                     match &ffn.gate_up {
                         GateUpWeights::Fused(weight) => {
                             self.gemv(&b.gate_up, weight, &b.x, stream)?;

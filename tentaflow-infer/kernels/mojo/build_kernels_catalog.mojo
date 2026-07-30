@@ -100,6 +100,7 @@ from src.nvfp4 import (
 )
 from src.nvfp4_gguf_dp4a import (
     gemv_nvfp4_gguf_q8_1_f16,
+    gemv_nvfp4_gguf_q8_1_out_f32,
     gemv_nvfp4_gguf_q8_1_group4_f16,
     gemv_nvfp4_gguf_q8_1_b2_f16,
     gemv_nvfp4_gguf_q8_1_b4_f16,
@@ -714,6 +715,7 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
         or name == "gemv_nvfp4_gguf_out_f32_wave"
         or name == "pack_q8_0_nvfp4_gguf"
         or name == "gemv_nvfp4_gguf_q8_1_f16"
+        or name == "gemv_nvfp4_gguf_q8_1_out_f32"
         or name == "mtp_prepare_f16"
         or name == "mtp_stage_step"
         or name == "mtp_norm_join_shifted_f16"
@@ -1253,6 +1255,11 @@ def main() raises:
         gemv_nvfp4_gguf_q8_1_f16, dump_asm=Path("gemv_nvfp4_gguf_q8_1_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_q8_1_f16"))
+    _ = ctx.compile_function[
+        gemv_nvfp4_gguf_q8_1_out_f32,
+        dump_asm=Path("gemv_nvfp4_gguf_q8_1_out_f32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_q8_1_out_f32"))
     _ = ctx.compile_function[
         gemv_nvfp4_gguf_q8_1_group4_f16,
         dump_asm=Path("gemv_nvfp4_gguf_q8_1_group4_f16.ptx"),

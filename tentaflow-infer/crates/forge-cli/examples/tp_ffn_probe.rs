@@ -8,7 +8,7 @@
 // przypada JEDNA wymiana, a nie dwie.
 use forge_engine::cluster::Cluster;
 use forge_engine::multi_gpu::{DeviceCapability, WorkKind};
-use forge_engine::tensor_parallel::{BlockFormat, gemv_q8_0_column_split, upload_column_split};
+use forge_engine::tensor_parallel::{BlockFormat, gemv_column_split, upload_column_split};
 use forge_hal::{Pool, PoolSizes};
 use forge_types::{MemKind, QuantKind};
 use std::time::Instant;
@@ -108,7 +108,7 @@ fn main() {
         ROWS,
         COLS,
         WorkKind::MemoryBound,
-        BlockFormat::of(QuantKind::Q8_0).expect("format"),
+        BlockFormat::of(QuantKind::Q8_0, 1.0).expect("format"),
     )
         .expect("podzial kolumnowy");
     for index in 0..cluster.len() {
@@ -153,7 +153,7 @@ fn main() {
         .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
         .expect("bufor redukcji");
 
-    gemv_q8_0_column_split(
+    gemv_column_split(
         &cluster,
         &shards,
         &x_parts,
@@ -203,7 +203,7 @@ fn main() {
     let mut whole_time = f64::MAX;
     for _ in 0..20 {
         let t0 = Instant::now();
-        gemv_q8_0_column_split(
+        gemv_column_split(
         &cluster,
         &shards,
         &x_parts,

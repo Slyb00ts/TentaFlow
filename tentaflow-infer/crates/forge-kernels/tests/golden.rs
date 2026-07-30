@@ -697,6 +697,68 @@ fn gemv_nvfp4_gguf_q8_1_matches_cpu_dequant() {
     }
 }
 
+/// Wariant f32 musi liczyć DOKŁADNIE ten sam iloczyn co f16 — różni je wyłącznie
+/// szerokość zapisu. Podział kolumnowy między karty sumuje te wyniki, więc gdyby
+/// matematyka się rozjechała, model na dwóch kartach liczyłby coś innego niż na
+/// jednej, a to jest jedyna rzecz, której podziałowi nie wolno zrobić.
+#[test]
+fn gemv_nvfp4_gguf_q8_1_out_f32_matches_f16_variant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    if !kernels.artifacts().has("gemv_nvfp4_gguf_q8_1_out_f32") {
+        eprintln!("pomijam: brak kernela gemv_nvfp4_gguf_q8_1_out_f32 dla tej architektury");
+        return;
+    }
+    let stream = dev.create_stream().unwrap();
+
+    for (rows, cols) in [(7usize, 64usize), (5120usize, 8704usize)] {
+        let weights = make_nvfp4_gguf(rows, cols);
+        let x: Vec<f32> = (0..cols)
+            .map(|i| f16::from_f32(fill(i) * 0.025).to_f32())
+            .collect();
+        let weights_buffer = dev
+            .alloc(weights.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        dev.write(&weights, &weights_buffer, 0).unwrap();
+        let input = upload_f16(dev.as_ref(), &x);
+        let half = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+        let full = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+        let output_scale = 0.3125;
+        kernels
+            .gemv_nvfp4_gguf_q8_1_group_f16(
+                &[Nvfp4GgufQ8Projection {
+                    output: &half,
+                    weights: &weights_buffer,
+                    rows,
+                    output_scale,
+                }],
+                &input,
+                cols,
+                &stream,
+            )
+            .unwrap();
+        kernels
+            .gemv_nvfp4_gguf_q8_1_out_f32(
+                &full, &weights_buffer, &input, rows, cols, output_scale, &stream,
+            )
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        let got_half = download_f16(dev.as_ref(), &half, rows);
+        let mut raw = vec![0u8; rows * 4];
+        dev.read(&full, 0, &mut raw).unwrap();
+        let got_full: &[f32] = bytemuck::cast_slice(&raw);
+        for row in 0..rows {
+            let want = f16::from_f32(got_full[row]).to_f32();
+            assert_eq!(
+                got_half[row], want,
+                "kształt {rows}x{cols}, wiersz {row}: f16 {} vs f32 zawężony {want}",
+                got_half[row]
+            );
+        }
+    }
+}
+
 #[test]
 fn gemm_nvfp4_gguf_dispatch_matches_cpu() {
     let Some(dev) = device() else { return };

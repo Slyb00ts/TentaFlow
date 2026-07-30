@@ -51,9 +51,46 @@ def gemv_nvfp4_gguf_q8_1_f16(
     _row_dot_store(y, weights, xq, xd, lut, n_cols, row, lane, output_scale)
 
 
+def gemv_nvfp4_gguf_q8_1_out_f32(
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    output_scale: Float32,
+):
+    """Ten sam iloczyn co `gemv_nvfp4_gguf_q8_1_f16`, wynik zapisany w f32.
+
+    Podział kolumnowy między karty daje SUMY CZĄSTKOWE, które dopiero po
+    zsumowaniu tworzą wiersz wyniku. Zapis takiej sumy w f16 gubiłby bity przy
+    każdej karcie, a to jest jedyna różnica wobec wariantu jednokartowego —
+    matematyka iloczynu zostaje ta sama.
+    """
+    tid = Int(thread_idx.x)
+    lane = tid % WARP
+    warp_id = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + warp_id
+    lut = stack_allocation[16, Int8, address_space=AddressSpace.SHARED]()
+    comptime values = SIMD[DType.int8, 16](
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12,
+    )
+    if tid < 16:
+        lut[tid] = values[tid]
+    barrier()
+    if row >= n_rows:
+        return
+    _row_dot_store[DType.float32](
+        y, weights, xq, xd, lut, n_cols, row, lane, output_scale
+    )
+
+
 @always_inline
-def _row_dot_store(
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def _row_dot_store[
+    OUT: DType = DType.float16
+](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
     xq: UnsafePointer[Int8, MutAnyOrigin],
     xd: UnsafePointer[Float32, MutAnyOrigin],
@@ -109,7 +146,7 @@ def _row_dot_store(
 
     total = warp.sum(acc)
     if lane == 0:
-        y[row] = Float16(total * output_scale)
+        y[row] = (total * output_scale).cast[OUT]()
 
 def gemv_nvfp4_gguf_q8_1_group4_f16(
     y0: UnsafePointer[Float16, MutAnyOrigin],

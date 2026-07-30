@@ -1217,6 +1217,10 @@
       "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_3a75b1144235dd74",
       "file": "gemv_nvfp4_gguf_q8_1_group4_f16.hsaco"
     },
+    "gemv_nvfp4_gguf_q8_1_out_f32": {
+      "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_542eba1b4a19bdf4",
+      "file": "gemv_nvfp4_gguf_q8_1_out_f32.hsaco"
+    },
     "gemv_nvfp4_tile128_coop_q8_1_f16": {
       "entry": "src_nvfp4_tile128_decode_gemv_6A6A6A6A_6ad039a7df9d7cde",
       "file": "gemv_nvfp4_tile128_coop_q8_1_f16.hsaco"

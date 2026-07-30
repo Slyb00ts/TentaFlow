@@ -391,6 +391,15 @@ enum Command {
         /// Liczba mierzonych prób po jednym osobnym przebiegu rozgrzewającym.
         #[arg(long = "reps", default_value_t = 5)]
         reps: usize,
+        /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
+        /// przecinku, np. `--tp-cards 1`.
+        #[arg(long = "tp-cards")]
+        tp_cards: Option<String>,
+        /// Narzucony podział wymiaru pośredniego, np. `8704,8704`. Bez tego
+        /// podział idzie ze zmierzonej mocy kart, co dla kart tej samej
+        /// architektury bywa obarczone błędem samego pomiaru.
+        #[arg(long = "tp-split")]
+        tp_split: Option<String>,
     },
     /// Measure next-token perplexity on a fixed held-out passage (W4A8 quality
     /// gate). Runs whatever GEMM `FORGE_GEMM` selects (W4A8 is calibrated first).
@@ -583,6 +592,8 @@ fn main() -> Result<()> {
             prefix_cache,
             speculative,
             reps,
+            tp_cards,
+            tp_split,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -608,6 +619,8 @@ fn main() -> Result<()> {
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
                 reps,
+                parse_tp_cards(tp_cards.as_deref())?,
+                parse_tp_split(tp_split.as_deref())?,
             )
         }
         Command::Ppl { model_path, ctx } => cmd_ppl(&model_path, ctx),
@@ -764,16 +777,42 @@ fn enable_tp_ffn(
     cards: &[forge_hal::gpu::DeviceId],
     weights_pool_gb: f64,
 ) -> Result<()> {
+    enable_tp_ffn_with(model, model_path, cards, weights_pool_gb, None)
+}
+
+fn enable_tp_ffn_with(
+    model: &mut forge_engine::model::Model,
+    model_path: &Path,
+    cards: &[forge_hal::gpu::DeviceId],
+    weights_pool_gb: f64,
+    forced: Option<&[usize]>,
+) -> Result<()> {
     if cards.is_empty() {
         return Ok(());
     }
+    // Karta wspierająca trzyma WYŁĄCZNIE fragmenty FFN i garść buforów roboczych
+    // — żadnego KV, bo uwaga zostaje na karcie modelu. Domyślna pula z
+    // `--weights-pool-gb 0` to jeden gibibajt, czyli mniej niż połowa FFN
+    // dwudziestosiedmiomiliardowego modelu, więc bez tego podział kończy się
+    // brakiem pamięci przy pierwszej warstwie.
+    let weights = if weights_pool_gb > 0.0 {
+        (weights_pool_gb * (1u64 << 30) as f64) as usize
+    } else {
+        let mut free = usize::MAX;
+        for card in cards {
+            free = free.min(forge_hal::gpu::free_vram(card.ordinal).with_context(|| {
+                format!("odczyt wolnego VRAM karty {}", card.ordinal)
+            })?);
+        }
+        free / 10 * 8
+    };
     let pools = forge_hal::PoolSizes {
-        weights: ((weights_pool_gb.max(1.0)) * (1u64 << 30) as f64) as usize,
-        kv_cache: 64 << 20,
+        weights,
+        kv_cache: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
         activations: 256 << 20,
         kv_page_size: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
     };
-    model.enable_tp_ffn(model_path, cards, pools, None, None)?;
+    model.enable_tp_ffn(model_path, cards, pools, None, forced)?;
     let tp = model.tp_ffn().expect("podział właśnie włączony");
     eprintln!(
         "podział FFN na {} kart (P2P {}): {:?} wierszy pośrednich warstwy 0",
@@ -782,6 +821,22 @@ fn enable_tp_ffn(
         tp.split_of(0)
     );
     Ok(())
+}
+
+/// Narzucony podział wymiaru pośredniego, np. `8704,8704`.
+fn parse_tp_split(spec: Option<&str>) -> Result<Option<Vec<usize>>> {
+    let Some(spec) = spec else { return Ok(None) };
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        out.push(
+            part.parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("--tp-split: `{part}` nie jest liczbą kolumn"))?,
+        );
+    }
+    if out.len() < 2 {
+        return Err(anyhow::anyhow!("--tp-split wymaga udziału dla każdej karty"));
+    }
+    Ok(Some(out))
 }
 
 /// Numery kart do podziału FFN, np. `1` albo `1,2`. `None` znaczy jedną kartę.
@@ -2186,6 +2241,8 @@ fn cmd_bench(
     prefix_cache: bool,
     spec: SpeculativeConfig,
     reps: usize,
+    tp_cards: Vec<forge_hal::gpu::DeviceId>,
+    tp_split: Option<Vec<usize>>,
 ) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
@@ -2216,6 +2273,13 @@ fn cmd_bench(
         resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    enable_tp_ffn_with(
+        &mut loaded.model,
+        model_path,
+        &tp_cards,
+        weights_pool_gb,
+        tp_split.as_deref(),
+    )?;
     maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true, None)?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);

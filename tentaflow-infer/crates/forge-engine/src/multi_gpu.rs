@@ -315,6 +315,7 @@ fn measure_gemv(
     const COLS: usize = 4096;
     const WARMUP: usize = 3;
     const ITERS: usize = 20;
+    const BATCHES: usize = 5;
 
     let weight_bytes = match quant {
         QuantKind::NVFP4Gguf => ROWS * (COLS / 64) * 36,
@@ -332,9 +333,21 @@ fn measure_gemv(
     let stream = device.create_stream()?;
     // Dobór kernela jak w `Model::gemv` — mierzymy to, czym karta REALNIE liczy.
     let run = || match quant {
-        QuantKind::NVFP4Gguf => {
-            kernels.gemv_nvfp4_gguf_f16(&y, &weights, &x, ROWS, COLS, 1.0, &stream)
-        }
+        // GGUF NVFP4 idzie w modelu przez wariant grupowy z aktywacją Q8_1 i
+        // dp4a, także dla pojedynczej projekcji. Sonda liczyła tu wariant f16,
+        // czyli mierzyła kernel, którego dekodowanie nigdy nie uruchamia — na
+        // dwóch identycznych kartach dawało to podział 7872/9536 zamiast równego.
+        QuantKind::NVFP4Gguf => kernels.gemv_nvfp4_gguf_q8_1_group_f16(
+            &[forge_kernels::Nvfp4GgufQ8Projection {
+                output: &y,
+                weights: &weights,
+                rows: ROWS,
+                output_scale: 1.0,
+            }],
+            &x,
+            COLS,
+            &stream,
+        ),
         QuantKind::Q8_0 => kernels.gemv_q8_0_dp4a_f16(&y, &weights, &x, ROWS, COLS, &stream),
         QuantKind::Q4K => kernels.gemv_q4_k_dp4a_f16(&y, &weights, &x, ROWS, COLS, &stream),
         _ => unreachable!("format odrzucony wyżej"),
@@ -343,18 +356,27 @@ fn measure_gemv(
         run()?;
     }
     stream.synchronize()?;
-    let started = std::time::Instant::now();
-    for _ in 0..ITERS {
-        run()?;
+    // NAJKRÓTSZA z kilku serii, nie średnia z jednej. Kernel jest
+    // deterministyczny, więc każde odchylenie w górę pochodzi z zakłócenia, a
+    // nie z karty — uśrednianie wpuszcza je do wyniku. Jedna seria dawała na
+    // dwóch IDENTYCZNYCH kartach podziały od 7872/9536 do 10048/7360, czyli
+    // rozrzut większy niż jakakolwiek realna różnica mocy, i każdy taki podział
+    // kosztuje przepustowość, bo krok trwa tyle, ile najdłuższy fragment.
+    let mut best = f64::INFINITY;
+    for _ in 0..BATCHES {
+        let started = std::time::Instant::now();
+        for _ in 0..ITERS {
+            run()?;
+        }
+        stream.synchronize()?;
+        best = best.min(started.elapsed().as_secs_f64());
     }
-    stream.synchronize()?;
-    let seconds = started.elapsed().as_secs_f64();
-    if !(seconds > 0.0) {
+    if !(best > 0.0) {
         return Err(ForgeError::Scheduler(
             "kalibracja pasma zmierzyła zerowy czas".into(),
         ));
     }
-    Ok((weight_bytes * ITERS) as f64 / seconds)
+    Ok((weight_bytes * ITERS) as f64 / best)
 }
 
 pub fn calibrate(
@@ -367,9 +389,6 @@ pub fn calibrate(
             "kalibracja: liczba urządzeń i zestawów kerneli musi być równa".into(),
         ));
     }
-    const PROBE_BYTES: usize = 128 << 20;
-    const WARMUP: usize = 2;
-    const ITERS: usize = 8;
     let mut caps = Vec::with_capacity(devices.len());
     for (index, device) in devices.iter().enumerate() {
         caps.push(measure_device(device.as_ref(), &kernels[index], quant)?);

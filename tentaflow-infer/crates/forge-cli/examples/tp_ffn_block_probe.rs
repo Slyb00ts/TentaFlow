@@ -134,8 +134,9 @@ fn main() {
         HIDDEN,
         INTER,
         WorkKind::MemoryBound,
-        BlockFormat::of(QuantKind::Q8_0).expect("format"),
-        BlockFormat::of(QuantKind::Q8_0).expect("format"),
+        BlockFormat::of(QuantKind::Q8_0, 1.0).expect("format"),
+        BlockFormat::of(QuantKind::Q8_0, 1.0).expect("format"),
+        BlockFormat::of(QuantKind::Q8_0, 1.0).expect("format"),
         None,
     )
     .expect("podzial FFN");

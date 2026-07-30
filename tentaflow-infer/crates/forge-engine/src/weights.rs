@@ -303,6 +303,18 @@ impl DevWeight {
         NvFp4CtRowWindow::new(data, *physical_rows, *cols, row_offset, rows)
     }
 
+    /// Kwantyzacja wagi dla tych formatów, które umie dzielić tensor parallel.
+    /// `None` znaczy „ten format nie ma ścieżki podziału", a nie „nieznany".
+    pub fn split_quant(&self) -> Option<QuantKind> {
+        match self {
+            DevWeight::Q8_0 { .. } => Some(QuantKind::Q8_0),
+            DevWeight::Q4K { .. } => Some(QuantKind::Q4K),
+            DevWeight::Q6K { .. } => Some(QuantKind::Q6K),
+            DevWeight::NvFp4Gguf { .. } => Some(QuantKind::NVFP4Gguf),
+            _ => None,
+        }
+    }
+
     /// Jedyny bufor bajtów wagi. `None` dla formatów trzymających kilka
     /// buforów (compressed-tensors NVFP4 ma osobne pakiety i skale), które nie
     /// dają się opisać jednym wskaźnikiem bazowym.
@@ -4921,13 +4933,19 @@ pub fn load_ffn_shards_gguf(
                  rows: usize,
                  cols: usize|
      -> Result<(Vec<u8>, crate::tensor_parallel::BlockFormat)> {
-        let (data, r, c, quant) = match w {
-            HostWeight::Q8_0 { data, rows, cols } => (data, rows, cols, QuantKind::Q8_0),
-            HostWeight::Q4K { data, rows, cols } => (data, rows, cols, QuantKind::Q4K),
-            HostWeight::Q6K { data, rows, cols } => (data, rows, cols, QuantKind::Q6K),
+        let (data, r, c, quant, scale) = match w {
+            HostWeight::Q8_0 { data, rows, cols } => (data, rows, cols, QuantKind::Q8_0, 1.0),
+            HostWeight::Q4K { data, rows, cols } => (data, rows, cols, QuantKind::Q4K, 1.0),
+            HostWeight::Q6K { data, rows, cols } => (data, rows, cols, QuantKind::Q6K, 1.0),
+            HostWeight::NvFp4Gguf {
+                data,
+                output_scale,
+                rows,
+                cols,
+            } => (data, rows, cols, QuantKind::NVFP4Gguf, output_scale),
             _ => {
                 return Err(ForgeError::Unsupported(format!(
-                    "podział FFN na karty obejmuje wagi Q8_0, Q4_K i Q6_K, {what} jest w innym formacie"
+                    "podział FFN na karty obejmuje wagi Q8_0, Q4_K, Q6_K i GGUF NVFP4, {what} jest w innym formacie"
                 )));
             }
         };
@@ -4936,7 +4954,7 @@ pub fn load_ffn_shards_gguf(
                 "{what}: kształt [{r}, {c}], wymagano [{rows}, {cols}]"
             )));
         }
-        Ok((data, crate::tensor_parallel::BlockFormat::of(quant)?))
+        Ok((data, crate::tensor_parallel::BlockFormat::of(quant, scale)?))
     };
 
     let mut out = Vec::with_capacity(descriptor.layers.len());
@@ -4969,7 +4987,9 @@ pub fn load_ffn_shards_gguf(
         // kolumnach i tylko on stawia warunek na granicę bloku. `Q4_K_M` trzyma
         // właśnie `down` w Q6_K, więc wymaganie jednego formatu dla całej trójki
         // odrzucałoby najpopularniejszą kwantyzację w obiegu.
-        if gate_fmt != up_fmt {
+        // Porównanie idzie po kwantyzacji, nie po całym opisie: skala tensora
+        // NVFP4 należy do konkretnej macierzy i `gate` z `up` mają swoje własne.
+        if gate_fmt.quant != up_fmt.quant {
             return Err(ForgeError::Unsupported(format!(
                 "layer {idx}: gate i up muszą mieć ten sam format, jest {:?} i {:?}",
                 gate_fmt.quant, up_fmt.quant
@@ -4985,6 +5005,7 @@ pub fn load_ffn_shards_gguf(
             params.intermediate_size,
             crate::multi_gpu::WorkKind::MemoryBound,
             gate_fmt,
+            up_fmt,
             down_fmt,
             forced,
         )?);
