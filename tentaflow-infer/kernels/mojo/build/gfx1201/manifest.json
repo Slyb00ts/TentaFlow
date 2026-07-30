@@ -365,6 +365,10 @@
       "entry": "src_deltanet_prepare_tiled_del6A6A6A6A_bb783b8cb3393138",
       "file": "deltanet_prepare_tiled_d128_c4_f16.hsaco"
     },
+    "deltanet_prepare_tokens_f16_t32": {
+      "entry": "src_deltanet_verify_deltanet_p6A6A6A6A_7ae860102babfe97",
+      "file": "deltanet_prepare_tokens_f16_t32.hsaco"
+    },
     "deltanet_value_key_commit_recompute_f32": {
       "entry": "src_deltanet_value_key_deltane6A6A6A6A_1ccb9b3fc9a1adc5",
       "file": "deltanet_value_key_commit_recompute_f32.hsaco"

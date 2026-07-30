@@ -2617,10 +2617,20 @@ impl Kernels {
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
+        // Wariant `tokens` dzieli tokeny na drugą oś siatki. Wariant dynamiczny
+        // ma JEDEN BLOK NA GŁOWĘ i przechodzi wszystkie tokeny w pętli — dla 27B
+        // to 64 bloki na karcie o 64 CU, czyli dwie fale na SIMD przy 1024
+        // iteracjach szeregowo. Jedyna zależność między tokenami to przyczynowy
+        // splot o oknie `d_conv - 1`, którego wejście już leży w pamięci, więc
+        // podział niczego nie łamie. Zmierzone na R9700 (kształt 27B, T=1024):
+        // 3036 us wobec 346 us, czyli 8,8x, wynik bitowo identyczny.
+        let tokens_variant = n_steps > 4
+            && self.artifacts.has("deltanet_prepare_tokens_f16_t32");
         let kernel_name = match n_steps {
             2 => "deltanet_prepare_t2_f16",
             3 => "deltanet_prepare_t3_f16",
             4 => "deltanet_prepare_t4_f16",
+            _ if tokens_variant => "deltanet_prepare_tokens_f16_t32",
             1.. => "deltanet_prepare_dynamic_f16",
             _ => return Err(ForgeError::Kernel("deltanet_prepare wymaga T > 0".into())),
         };
@@ -2690,6 +2700,15 @@ impl Kernels {
         let grid_x = u32::try_from(n_k_heads + n_v_heads).map_err(|_| {
             ForgeError::Kernel("deltanet_prepare: liczba głów przekracza u32".into())
         })?;
+        // Wariant `tokens` bierze po 32 tokeny na blok; dynamiczny ma jedną
+        // płaszczyznę i przechodzi wszystkie tokeny w pętli.
+        let grid_y = if tokens_variant {
+            u32::try_from(n_steps.div_ceil(32)).map_err(|_| {
+                ForgeError::Kernel("deltanet_prepare: liczba kawałków przekracza u32".into())
+            })?
+        } else {
+            1
+        };
         let block_x = u32::try_from(d_state.max(32)).map_err(|_| {
             ForgeError::Kernel("deltanet_prepare: rozmiar bloku przekracza u32".into())
         })?;
@@ -2703,7 +2722,7 @@ impl Kernels {
             .map_err(|_| ForgeError::Kernel("deltanet_prepare: d_conv przekracza i64".into()))?;
         let kernel = self.artifacts.get(kernel_name)?;
         let config = LaunchConfig {
-            grid: (grid_x, 1, 1),
+            grid: (grid_x, grid_y, 1),
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -9034,8 +9053,16 @@ impl Kernels {
         // aktywacje są czytane `rows / 128` razy zamiast `rows / 64`; liczby są
         // w nagłówkach kerneli. BM=512 potrzebuje T >= 512, żeby mieć czym
         // wypełnić kafel.
+        //
+        // WĄSKIE WYJŚCIE MA WŁASNĄ REGUŁĘ. Kafel prefillowy pokrywa 128 wierszy,
+        // więc projekcja o 48 wierszach (bramki `ssm_alpha`/`ssm_beta`) dostaje
+        // JEDEN blok w osi wierszy — przy BM=512 daje to dwa bloki robocze na
+        // karcie o 64 CU. Zmierzone: 222 us na wywołanie, 96 wywołań na prefill
+        // 27B, czyli 21 ms zmarnowane na 2,6% prefillu. Mały kafel ma tam 32
+        // bloki zamiast dwóch.
         let has = |s: &str| self.artifacts.has(&format!("{family}{s}"));
-        let (suffix, bm, bn, block) = if n_tokens <= 32 {
+        let narrow = rows <= 64;
+        let (suffix, bm, bn, block) = if n_tokens <= 32 || narrow {
             ("_bm32", 32usize, 64usize, 128u32)
         } else if n_tokens >= 512 && has("_bm512_bn128") {
             ("_bm512_bn128", 512usize, 128usize, 512u32)

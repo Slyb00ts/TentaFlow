@@ -1505,9 +1505,7 @@ const EMBEDDED_SM121A: &[EmbeddedArtifact] = embedded_arch![
     "topk_partial_f32",
 ];
 
-const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch![
-    "gfx1201",
-    ".hsaco",
+const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco",
     "act_quant_fp4_f16",
     "act_quant_fp8_f16",
     "add_f32",
@@ -1599,6 +1597,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch![
     "deltanet_prepare_t3_f16",
     "deltanet_prepare_t4_f16",
     "deltanet_prepare_tiled_d128_c4_f16",
+    "deltanet_prepare_tokens_f16_t32",
     "deltanet_value_key_commit_recompute_f32",
     "deltanet_value_key_scan_checkpoints_f16",
     "deltanet_value_key_scan_inplace_f16",

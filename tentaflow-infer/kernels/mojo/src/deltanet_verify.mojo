@@ -234,6 +234,82 @@ def deltanet_prepare_dynamic_f16(
                 beta_out[gate_index] = 1.0 / (1.0 + exp(-Float32(beta_raw[gate_index])))
 
 
+def deltanet_prepare_tokens_f16[TOK: Int](
+    q_out: UnsafePointer[Float16, MutAnyOrigin], k_out: UnsafePointer[Float16, MutAnyOrigin],
+    v_out: UnsafePointer[Float16, MutAnyOrigin], g_out: UnsafePointer[Float32, MutAnyOrigin],
+    beta_out: UnsafePointer[Float32, MutAnyOrigin], conv_checkpoints: UnsafePointer[Float16, MutAnyOrigin],
+    conv_initial: UnsafePointer[Float16, MutAnyOrigin], qkv_mixed: UnsafePointer[Float16, MutAnyOrigin],
+    conv_weight: UnsafePointer[Float16, MutAnyOrigin], alpha_raw: UnsafePointer[Float16, MutAnyOrigin],
+    beta_raw: UnsafePointer[Float16, MutAnyOrigin], dt_bias: UnsafePointer[Float16, MutAnyOrigin],
+    a_scale: UnsafePointer[Float16, MutAnyOrigin], n_steps: Int, n_k_heads: Int,
+    n_v_heads: Int, d_state: Int, d_conv: Int, eps: Float32,
+):
+    """To samo co `deltanet_prepare_dynamic_f16`, ale RÓWNOLEGLE PO TOKENACH.
+
+    Wariant dynamiczny ma jeden blok na głowę i przechodzi wszystkie tokeny w
+    pętli: dla 27B to 64 bloki na karcie o 64 CU, czyli dwie fale na SIMD i
+    1024 iteracji szeregowo. Tymczasem JEDYNA zależność między tokenami to
+    przyczynowy splot o oknie `d_conv - 1`, a jego wejście leży już w pamięci —
+    czyli podział tokenów między bloki niczego nie łamie i nie wymaga wymiany
+    danych. Druga oś siatki daje `heads x ceil(T / TOK)` bloków zamiast `heads`.
+
+    Matematyka jest identyczna co do kolejności operacji, więc wynik jest
+    bitowo ten sam.
+    """
+    block = Int(block_idx.x)
+    lane = Int(thread_idx.x)
+    active = lane < d_state
+    conv_dim = (2 * n_k_heads + n_v_heads) * d_state
+    var first = Int(block_idx.y) * TOK
+    var last = first + TOK
+    if last > n_steps:
+        last = n_steps
+
+    if block < n_k_heads:
+        q_channel = block * d_state + lane
+        k_channel = n_k_heads * d_state + block * d_state + lane
+        repeats = n_v_heads // n_k_heads
+        for token in range(first, last):
+            var q_value: Float32 = 0.0
+            var k_value: Float32 = 0.0
+            if active:
+                q_value = _deltanet_conv_value_f16(conv_initial, qkv_mixed, conv_weight, q_channel, token, conv_dim, d_conv)
+                k_value = _deltanet_conv_value_f16(conv_initial, qkv_mixed, conv_weight, k_channel, token, conv_dim, d_conv)
+                _deltanet_store_conv_checkpoint_f16(conv_checkpoints, conv_initial, qkv_mixed, q_channel, token, conv_dim, d_conv)
+                _deltanet_store_conv_checkpoint_f16(conv_checkpoints, conv_initial, qkv_mixed, k_channel, token, conv_dim, d_conv)
+            q_inv = rsqrt(block_reduce_sum(q_value * q_value) + eps)
+            k_inv = rsqrt(block_reduce_sum(k_value * k_value) + eps)
+            if active:
+                for repeat in range(repeats):
+                    out_head = repeat * n_k_heads + block
+                    out_index = (token * n_v_heads + out_head) * d_state + lane
+                    q_out[out_index] = Float16(q_value * q_inv)
+                    k_out[out_index] = Float16(k_value * k_inv)
+    else:
+        v_head = block - n_k_heads
+        if v_head >= n_v_heads:
+            return
+        v_channel = 2 * n_k_heads * d_state + v_head * d_state + lane
+        for token in range(first, last):
+            if active:
+                value = _deltanet_conv_value_f16(conv_initial, qkv_mixed, conv_weight, v_channel, token, conv_dim, d_conv)
+                out_index = (token * n_v_heads + v_head) * d_state + lane
+                v_out[out_index] = Float16(value)
+                _deltanet_store_conv_checkpoint_f16(conv_checkpoints, conv_initial, qkv_mixed, v_channel, token, conv_dim, d_conv)
+            if lane == 0:
+                gate_index = token * n_v_heads + v_head
+                alpha = Float32(alpha_raw[gate_index]) + Float32(dt_bias[v_head])
+                softplus = alpha if alpha > 20.0 else log(1.0 + exp(alpha))
+                g_out[gate_index] = softplus * Float32(a_scale[v_head])
+                beta_out[gate_index] = 1.0 / (1.0 + exp(-Float32(beta_raw[gate_index])))
+
+
+# Dlugosc kawalka dobrana pomiarem na R9700 (`bench-amd/bench_deltanet_prepare.mojo`,
+# ksztalt 27B, T=1024): wariant dynamiczny 3036 us, TOK=16 358 us, TOK=32 346 us,
+# TOK=64 412 us. Powyzej 32 tokenow siatka znowu robi sie za mala.
+comptime deltanet_prepare_tokens_f16_t32 = deltanet_prepare_tokens_f16[32]
+
+
 def deltanet_prepare_segmented_f16(
     q_out: UnsafePointer[Float16, MutAnyOrigin], k_out: UnsafePointer[Float16, MutAnyOrigin],
     v_out: UnsafePointer[Float16, MutAnyOrigin], g_out: UnsafePointer[Float32, MutAnyOrigin],

@@ -147,3 +147,34 @@ def wmma_f16_16x16x16_native(
         ](a, b, c)
     else:
         return c
+
+@always_inline
+def wmma_iu4_16x16x32(
+    a: SIMD[DType.int32, 2],
+    b: SIMD[DType.int32, 2],
+    c: SIMD[DType.int32, 8],
+) -> SIMD[DType.int32, 8]:
+    """Kafel 16x16x32 int4 ze znakiem, akumulacja int32, jedna instrukcja RDNA4.
+
+    DWA RAZY WIĘCEJ K NA INSTRUKCJĘ niż `iu8`, a fragment ma ten sam rozmiar
+    (osiem bajtów na linię, czyli 32 czterobitowe kody). Dla wag czterobitowych
+    (Q4_K, Q4_0) znika też rozpakowanie do int8.
+
+    K=32 to DOKŁADNIE jeden podblok skali Q4_K — dlatego akumulator int32 zrzuca
+    się do f32 raz na instrukcję, a nie raz na dwie jak przy `iu8`.
+
+    Dwa argumenty `i1` wybierają interpretację ZE ZNAKIEM — ta sama pułapka co w
+    `dot4_i8` i `wmma_i8`: bez nich instrukcja liczy bez znaku i cicho zwraca
+    śmieci na ujemnych kodach.
+
+    ISTNIEJE TYLKO NA RDNA4.
+    """
+    comptime if _accelerator_arch().startswith("amdgpu:gfx12"):
+        return llvm_intrinsic[
+            "llvm.amdgcn.wmma.i32.16x16x32.iu4.v8i32.v2i32", SIMD[DType.int32, 8]
+        ](True, a, True, b, c, False)
+    else:
+        # Poza RDNA4 tej instrukcji NIE MA. Kernel, ktory tu trafil, jest zle
+        # zakresowany w katalogu — zwracamy akumulator bez zmian, zeby bledny
+        # zakres wyszedl jako rozjazd z referencja w tescie zlotym.
+        return c

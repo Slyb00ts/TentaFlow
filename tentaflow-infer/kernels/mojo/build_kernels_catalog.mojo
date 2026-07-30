@@ -68,6 +68,7 @@ from src.deltanet_verify import (
     deltanet_prepare_t3_f16,
     deltanet_prepare_t4_f16,
     deltanet_prepare_dynamic_f16,
+    deltanet_prepare_tokens_f16_t32,
     deltanet_prepare_segmented_f16,
     deltanet_prepare_segmented_final_f16,
     deltanet_gated_scan_t2_f16,
@@ -1076,6 +1077,11 @@ def main() raises:
         dump_asm=Path("deltanet_prepare_dynamic_f16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "deltanet_prepare_dynamic_f16"))
+    _ = ctx.compile_function[
+        deltanet_prepare_tokens_f16_t32,
+        dump_asm=Path("deltanet_prepare_tokens_f16_t32.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "deltanet_prepare_tokens_f16_t32"))
     _ = ctx.compile_function[
         deltanet_prepare_segmented_f16,
         dump_asm=Path("deltanet_prepare_segmented_f16.ptx"),
