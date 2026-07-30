@@ -294,7 +294,25 @@ Kolejność prac, jaką wyznaczają te liczby:
    obsługuje GGUF, ale odrzuca modele HYBRYDOWE, bo prefill hybrydowy idzie
    własnym `hybrid_layer_major_prefill`, który o paczkach e4m3 nic nie wie.
    Brakuje więc budowania paczek e4m3 dla hybrydowego GGUF-a i routingu w tym
-   właśnie prefillu — plus DROGA NA PAMIĘĆ. Rezydentna kopia FP8 całego modelu to +11 GiB przy 15,65 GiB Q4_K i
+   właśnie prefillu — plus DROGA NA PAMIĘĆ.
+
+   `build_fp8_gpu` pakuje z REZYDENTNYCH wag przez `pack_gguf_fp8` i obsługuje
+   Q4_K, Q6_K oraz Q8_0, ale odrzuca warstwę, której mikser nie jest uwagą —
+   czyli wszystkie 48 warstw DeltaNet. FFN (`gate`/`up`/`down`) jest natomiast
+   gęsty w KAŻDEJ warstwie, więc to on jest naturalnym zakresem dla modelu
+   hybrydowego. Trzy warianty rezydencji z policzonym kosztem (model waży
+   15,65 GiB, karta ma 31,8 GiB, pula aktywacji 1,1 GiB):
+
+   | zakres paczek FP8 | VRAM paczek | GEMM przed | GEMM po | prefill | max kontekst |
+   |---|--:|--:|--:|--:|--:|
+   | tylko `ffn_down` | 5,8 GiB | 101 ms | ~45 ms | ~1570 tok/s | ~110k |
+   | `gate` + `up` | 11,6 GiB | 225 ms | ~115 ms | ~1710 tok/s | ~48k |
+   | cały FFN per warstwa, strumieniowo | 0,36 GiB | 326 ms | ~155 ms + 0,76 ms/warstwa | ~1740 synchronicznie, ~1900 z nakładaniem | bez zmian |
+
+   Wariant strumieniowy jako jedyny nie zabiera kontekstu i jako jedyny skaluje
+   się na większe modele — kosztuje za to podwójnie buforowany scratch i drugi
+   strumień. Przepakowanie warstwy to 417 MB ruchu (0,76 ms) wobec 5,0 ms
+   GEMM-u tej samej warstwy, więc przy nakładaniu chowa się całe. Rezydentna kopia FP8 całego modelu to +11 GiB przy 15,65 GiB Q4_K i
    32 GiB karty, więc nie wchodzi. Wchodzi **przepakowanie per warstwa do
    podwójnie buforowanego scratcha na DRUGIM STRUMIENIU**: `pack_q4_k_fp8` już
    istnieje dla gfx1201, koszt to 278 MB ruchu na warstwę (0,5 ms) wobec 1,7 ms
