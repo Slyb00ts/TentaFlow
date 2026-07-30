@@ -104,9 +104,9 @@ naprawiony.** Stan po naprawie (prompt 4672 + odpowiedź 512):
 | model | tryb | FORGE decode | llama.cpp decode | FORGE łącznie | llama.cpp łącznie |
 |---|---|--:|--:|--:|--:|
 | Q4_K_M | bez spekulacji | **26,6** | 26,9 | **22,63 s** | 24,22 s |
-| Q4_K_M | MTP K=3 | 27,3 -> **38,6** | 43,5 | 22,21 -> **16,72 s** | 16,77 s |
+| Q4_K_M | MTP K=3 | 27,3 -> **38,5** | 43,5 | 22,21 -> **16,76 s** | 16,77 s |
 | NVFP4 | bez spekulacji | **28,0** | 27,4 | **21,92 s** | 24,36 s |
-| NVFP4 | MTP K=3 | 34,0 -> **51,9** | 59,9 | 18,71 -> **13,50 s** | 14,03 s |
+| NVFP4 | MTP K=3 | 34,0 -> **53,7** | 59,9 | 18,71 -> **13,18 s** | 14,03 s |
 
 NVFP4 z MTP wygrywa teraz cały przebieg (13,52 s wobec 14,03 s), bo nasz prefill
 jest o połowę szybszy; w samym decode zostaje 0,86x i to jest praca do zrobienia.
@@ -170,20 +170,37 @@ Bezczynność ma trzy zidentyfikowane źródła (1,8 ms/krok) i jedno rozproszon
   kerneli.** Forward celu jest przechwycony w graf (`hybrid_verify_graphs`), więc
   jego ~700 uruchomień jest tanie; **pętla draftu graf, którego nie ma**.
 
-Stąd konkretne następne zadanie z policzoną wartością: **przechwycić krok draftu
-MTP w graf** i utrzymać pętlę draftu na GPU (argmax i gather po indeksie z
-bufora, bez powrotu do hosta). To zdejmuje większość z 8,4 ms/krok, czyli
-podnosi decode z 51,9 do ~58 tok/s. Drugie zadanie, mniejsze: `lm_head` draftu
-czyta 1,27 GB Q8_0 na KAŻDY z trzech tokenów (6,4 ms/krok). Kopia NVFP4 tej
-głowy istnieje (`FORGE_MTP_DRAFT_HEAD=nvfp4`), ale jest WOLNIEJSZA (15,36 s
-wobec 13,50) i profil mówi dlaczego: `gemv_nvfp4_gguf_out_f32` uruchamia
-**248320 grup roboczych, czyli jedną na wiersz słownika**, i osiąga 111 GB/s,
-podczas gdy wariant Q8_0 bierze 8 wierszy na grupę i osiąga 597 GB/s. Po
-przepisaniu tego kernela na 8 wierszy na grupę głowa NVFP4 powinna dać ~1,2 ms
-zamiast 2,13 ms na token draftu, czyli kolejne ~2,9 ms/krok.
+Dalszy przebieg tej pracy — co zadziałało, a co nie:
 
-Razem oba zadania: ~58 + ~3 tok/s, czyli wyjście POWYŻEJ llama.cpp bez zmiany
-ani jednego tokena na wyjściu.
+**Głowa `lm_head` draftu: 15,36 s -> 13,18 s.** Diagnoza z profilu potwierdziła
+się co do joty. `gemv_nvfp4_gguf_out_f32` liczył JEDEN workgroup na wiersz
+słownika (248320 grup roboczych) i czytał wagi oraz aktywacje BAJT PO BAJCIE —
+111 GB/s. Obok, w tym samym pliku, stał już szybki wariant `_wave`: fala na
+wiersz, redukcja wewnątrz fali bez LDS, odczyty ośmioelementowe. Różnił się
+tylko typem zapisu (f16). Sparametryzowanie go przez `OUT: DType` i usunięcie
+starego kernela odwróciło wynik: głowa NVFP4 draftu z REGRESJI 1,86 s stała się
+przewagą 0,18 s wobec Q8_0, przy nieco wyższej akceptacji (2,15 wobec 2,13).
+`FORGE_MTP_DRAFT_HEAD=nvfp4` jest więc teraz szybsze; zostaje opcją, bo kosztuje
+~0,7 GiB VRAM na przepakowaną kopię głowy, czyli zabiera kontekst.
+
+**Dwa pełne drenaże urządzenia na krok — sprawdzone, prawie bez wpływu.** Krok
+weryfikacji ma `device.synchronize()` w propose i po grafie celu. Zwężenie ich do
+`stream.synchronize()` (czekamy na TEN strumień, nie na wszystkie) dało 13,50 ->
+13,36 s, czyli 1%. Zmiana została, bo jest ściśle węższa i poprawna, ale
+hipoteza „drenaże to 8 ms/krok" jest OBALONA.
+
+**Pętla draftu jest już w całości na GPU** — wbrew temu, co sugerowały przerwy w
+śladzie. `mtp_propose_pending` robi gather po indeksie z bufora, argmax na GPU i
+JEDEN odczyt K identyfikatorów na końcu; nie ma powrotu do hosta na token.
+
+Zostaje więc jedno wyjaśnienie 13% bezczynności: **narzut wysyłki ~1400 uruchomień
+kerneli na krok.** Forward celu jest w grafie, pętla draftu nie — i tu jest
+konkretny blokad: `MtpDraftState::stage_step` bierze pozycję i mapowanie stron
+jako SKALARY HOSTA (`self.seq.len`, `new_page_mapping`), więc graf zapiekłby
+nieaktualną pozycję. Odblokowanie jest znane i wąskie: zarezerwować strony dla
+K+1 tokenów PRZED pętlą i zapisać tabelę stron jednym zapisem (`stage_batch` już
+tak robi), po czym pętla dotyka wyłącznie buforów urządzenia i daje się
+przechwycić tak samo jak `hybrid_verify_graphs`.
 
 **K nie jest tu dźwignią** — sprawdzone po naprawie, długi kontekst:
 
