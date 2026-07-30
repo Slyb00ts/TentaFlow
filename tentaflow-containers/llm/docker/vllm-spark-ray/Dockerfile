@@ -11,7 +11,7 @@
 # bazy obecny na nodzie); jej brak = czytelny blad w preflight (NIE rebuild).
 # =============================================================================
 
-ARG BASE_IMAGE=tentaflow/vllm-spark:0.25.1
+ARG BASE_IMAGE=tentaflow/vllm-spark:0.26.0
 FROM ${BASE_IMAGE}
 
 # rdma-core/libibverbs: userspace IB verbs — bez nich NCCL nie otworzy

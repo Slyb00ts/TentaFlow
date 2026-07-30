@@ -1,5 +1,5 @@
 # Pre-cache wheels dla bundla vllm-spark. Faktyczny resolver odpala sie
-# przez `pip install -e .` z klona vllm @ v0.25.1 (source = "git"); ten plik
+# przez `pip install -e .` z klona vllm @ v0.26.0 (source = "git"); ten plik
 # tylko pre-warmuje torcha (najwolniejszy wheel w lancuchu).
 #
 # Wersje torcha bez sufixu `+cu130` — `--extra-index-url` z install_variants
@@ -10,7 +10,7 @@ torch==2.11.0
 torchvision==0.26.0
 torchaudio==2.11.0
 
-# Build tooling — vllm 0.25.1 build z source wymaga ninja (parallel CUDA
+# Build tooling — vllm 0.26.0 build z source wymaga ninja (parallel CUDA
 # kernel compile) i cmake (setuptools-rust niektorych deps).
 ninja
 cmake

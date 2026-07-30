@@ -15,7 +15,7 @@ engine = "vllm-metal"
 description = "vLLM Metal plugin dla Apple Silicon (MLX)"
 python_version = "3.12"
 source = "vllm-metal"
-vllm_version = "0.25.1"
+vllm_version = "0.26.0"
 vllm_metal_repo = "vllm-project/vllm-metal"
 
 [launch]
