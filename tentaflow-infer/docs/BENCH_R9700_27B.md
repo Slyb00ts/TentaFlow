@@ -45,9 +45,9 @@ nie kończy tury). llama.cpp: `--spec-type draft-mtp --spec-draft-n-max 3`.
 | model | tryb | FORGE | llama.cpp | |
 |---|---|--:|--:|---|
 | Q4_K_M | bez spekulacji | **31,9** | 27,7 | **FORGE 1,15x** |
-| Q4_K_M | MTP K=3 | **48,7** | 43,4 | **FORGE 1,12x** |
+| Q4_K_M | MTP K=3 | **52,1** | 43,4 | **FORGE 1,20x** |
 | NVFP4 | bez spekulacji | **33,6** | 28,1 | **FORGE 1,20x** |
-| NVFP4 | MTP K=3 | **56,8** | 54,1 | **FORGE 1,05x** |
+| NVFP4 | MTP K=3 | **58,0** | 54,1 | **FORGE 1,07x** |
 
 Liczby FORGE to `tok/s overall`, czyli RAZEM z prefillem 32-tokenowego promptu;
 liczby llama.cpp to samo `Generation`. Przewaga jest więc liczona na niekorzyść
@@ -106,7 +106,7 @@ naprawiony.** Stan po naprawie (prompt 4672 + odpowiedź 512):
 | Q4_K_M | bez spekulacji | **26,6** | 26,9 | **22,63 s** | 24,22 s |
 | Q4_K_M | MTP K=3 | 27,3 -> **38,5** | 43,5 | 22,21 -> **16,76 s** | 16,77 s |
 | NVFP4 | bez spekulacji | **28,0** | 27,4 | **21,92 s** | 24,36 s |
-| NVFP4 | MTP K=3 | 34,0 -> **53,7** | 59,9 | 18,71 -> **13,18 s** | 14,03 s |
+| NVFP4 | MTP K=3 | 34,0 -> **54,2** | 59,9 | 18,71 -> **13,08 s** | 14,03 s |
 
 NVFP4 z MTP wygrywa teraz cały przebieg (13,52 s wobec 14,03 s), bo nasz prefill
 jest o połowę szybszy; w samym decode zostaje 0,86x i to jest praca do zrobienia.
@@ -172,35 +172,50 @@ Bezczynność ma trzy zidentyfikowane źródła (1,8 ms/krok) i jedno rozproszon
 
 Dalszy przebieg tej pracy — co zadziałało, a co nie:
 
-**Głowa `lm_head` draftu: 15,36 s -> 13,18 s.** Diagnoza z profilu potwierdziła
-się co do joty. `gemv_nvfp4_gguf_out_f32` liczył JEDEN workgroup na wiersz
-słownika (248320 grup roboczych) i czytał wagi oraz aktywacje BAJT PO BAJCIE —
-111 GB/s. Obok, w tym samym pliku, stał już szybki wariant `_wave`: fala na
-wiersz, redukcja wewnątrz fali bez LDS, odczyty ośmioelementowe. Różnił się
-tylko typem zapisu (f16). Sparametryzowanie go przez `OUT: DType` i usunięcie
-starego kernela odwróciło wynik: głowa NVFP4 draftu z REGRESJI 1,86 s stała się
-przewagą 0,18 s wobec Q8_0, przy nieco wyższej akceptacji (2,15 wobec 2,13).
-`FORGE_MTP_DRAFT_HEAD=nvfp4` jest więc teraz szybsze; zostaje opcją, bo kosztuje
-~0,7 GiB VRAM na przepakowaną kopię głowy, czyli zabiera kontekst.
+**Głowa `lm_head` draftu: 15,36 s -> 13,08 s, i jest teraz domyślna.** Diagnoza z
+profilu potwierdziła się co do joty. `gemv_nvfp4_gguf_out_f32` liczył JEDEN
+workgroup na wiersz słownika (248320 grup roboczych) i czytał wagi BAJT PO
+BAJCIE — 111 GB/s. Obok, w tym samym pliku, stał już szybki wariant `_wave`:
+fala na wiersz, redukcja wewnątrz fali bez LDS, odczyty ośmioelementowe. Różnił
+się WYŁĄCZNIE typem zapisu (f16). Sparametryzowanie go przez `OUT: DType` i
+usunięcie starego odwróciło wynik, więc `FORGE_MTP_DRAFT_HEAD` ma teraz domyślne
+`auto`: repack robi się, gdy head źródłowy jest Q8_0 i mieści się w puli wag, a
+inaczej zostaje Q8_0 (jawne `nvfp4` nadal jest błędem, jeśli się nie da). Target
+weryfikuje na oryginalnym headzie, więc wyjście jest bez zmian.
 
-**Dwa pełne drenaże urządzenia na krok — sprawdzone, prawie bez wpływu.** Krok
-weryfikacji ma `device.synchronize()` w propose i po grafie celu. Zwężenie ich do
-`stream.synchronize()` (czekamy na TEN strumień, nie na wszystkie) dało 13,50 ->
-13,36 s, czyli 1%. Zmiana została, bo jest ściśle węższa i poprawna, ale
-hipoteza „drenaże to 8 ms/krok" jest OBALONA.
+To NIE dotyczy checkpointu Q4_K_M: jego `output.weight` jest Q6_K, nie Q8_0, więc
+`auto` zostawia go w spokoju. Ta sama różnica tłumaczy lukę w akceptacji —
+**1,73/krok na Q4_K wobec 2,15 na NVFP4** przy identycznym wyjściu obu
+kwantyzacji. Głowa 6-bitowa daje gorsze propozycje draftu, a nie gorszy model.
 
-**Pętla draftu jest już w całości na GPU** — wbrew temu, co sugerowały przerwy w
-śladzie. `mtp_propose_pending` robi gather po indeksie z bufora, argmax na GPU i
-JEDEN odczyt K identyfikatorów na końcu; nie ma powrotu do hosta na token.
+**Trzy hipotezy o bezczynności GPU — WSZYSTKIE OBALONE pomiarem:**
 
-Zostaje więc jedno wyjaśnienie 13% bezczynności: **narzut wysyłki ~1400 uruchomień
-kerneli na krok.** Forward celu jest w grafie, pętla draftu nie — i tu jest
-konkretny blokad: `MtpDraftState::stage_step` bierze pozycję i mapowanie stron
-jako SKALARY HOSTA (`self.seq.len`, `new_page_mapping`), więc graf zapiekłby
-nieaktualną pozycję. Odblokowanie jest znane i wąskie: zarezerwować strony dla
-K+1 tokenów PRZED pętlą i zapisać tabelę stron jednym zapisem (`stage_batch` już
-tak robi), po czym pętla dotyka wyłącznie buforów urządzenia i daje się
-przechwycić tak samo jak `hybrid_verify_graphs`.
+1. *Drenaże urządzenia.* Zwężenie `device.synchronize()` do `stream.synchronize()`
+   w propose i po grafie celu: 13,50 -> 13,36 s, czyli 1%. Zmiana została, bo jest
+   ściśle węższa i poprawna, ale to nie było źródło.
+2. *Powroty do hosta w pętli draftu.* `mtp_propose_pending` jest JUŻ w całości na
+   GPU: gather po indeksie z bufora, argmax na GPU, jeden odczyt K identyfikatorów
+   na końcu.
+3. *Narzut wysyłki w niezgrafowanej pętli draftu.* Segmentacja śladu pokazała coś
+   odwrotnego niż zakładałem:
+
+   | faza kroku | uruchomienia | zajęte | bezczynne |
+   |---|--:|--:|--:|
+   | draft (3 kroki MTP) | 65 | 7,65 ms | **0,77 ms** |
+   | cel (forward T=4) | 1793 | 45,46 ms | **~9 ms** |
+
+   Draft jest oszczędny. Cała bezczynność siedzi w forwardzie CELU — a on JEST w
+   grafie. `FORGE_HYBRID_VERIFY_GRAPH=0` daje 13,57 wobec 13,38 s, czyli graf
+   odzyskuje 1,4%. Zatem te ~9 ms to nie narzut wysyłki, tylko przestoje na
+   łańcuchu 1793 kerneli, z których większość jest drobna: 516 kwantyzacji
+   aktywacji (0,79 ms realnej pracy), 171 `copyBuffer`, 136 rmsnorm.
+
+Stąd jedyna pozostała droga jest strukturalna: **zmniejszyć liczbę kerneli w
+forwardzie celu.** Dwa konkretne miejsca: (a) `prequant_q8_1` kwantyzuje
+aktywację OSOBNO dla każdej projekcji, choć `q`/`k`/`v` oraz `gate`/`up` dzielą to
+samo wejście — potrzebny jawny uchwyt „przygotowanej" aktywacji, wzorem
+istniejącego `Q8ActPrepared`, bez nowego kernela Mojo; (b) migawka stanu DeltaNet
+to 96 osobnych kopii D2D na krok, bo stan każdej warstwy jest osobną alokacją.
 
 **K nie jest tu dźwignią** — sprawdzone po naprawie, długi kontekst:
 
