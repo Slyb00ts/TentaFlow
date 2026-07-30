@@ -65,6 +65,12 @@ pub struct Mp4StreamPublisher {
     stream_id: String,
     init_segment: Mutex<Option<Bytes>>,
     init_ready: Notify,
+    /// Budzone, gdy gałąź B tego publishera REALNIE wpięła się do pipeline'u.
+    /// Wpięcie może być odroczone (tee negocjuje caps dopiero po pierwszym
+    /// buforze), a budżet na init segment ma mierzyć „mux wpięty i milczy", nie
+    /// „kamera jeszcze wstaje" — dlatego zegar w `init_segment()` startuje od
+    /// nowa na ten sygnał.
+    branch_attached: Notify,
     /// `None` once the publisher has terminally failed — `chunk_broadcaster`
     /// reports that to the hub so the subscribe collapses to a clean failure
     /// (no init segment, no hung empty stream) instead of being cached as an
@@ -128,6 +134,7 @@ impl Mp4StreamPublisher {
             },
             init_segment: Mutex::new(None),
             init_ready: Notify::new(),
+            branch_attached: Notify::new(),
             chunks_tx: Mutex::new(Some(chunks_tx)),
             first_chunk_seen: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
@@ -261,6 +268,15 @@ impl Mp4StreamPublisher {
         }
     }
 
+    /// Sesja zgłasza, że gałąź B tego publishera została wpięta do pipeline'u.
+    /// Resetuje budżet oczekiwania na init segment: wpięcie bywa odroczone o
+    /// sekundy (zimna kamera, tee bez caps), a bez tego resetu publisher bywał
+    /// uznawany za martwy CHWILĘ PO tym, jak gałąź wreszcie ruszyła — mux nie
+    /// miał kiedy wypluć ftyp+moov.
+    pub fn mark_branch_attached(&self) {
+        self.branch_attached.notify_waiters();
+    }
+
     /// Mark the publisher as permanently undeliverable. Called by the session
     /// when the attach refuses (non-H.264 codec, mux build failure, File/Local
     /// source with no tee) or on an init-segment timeout. Drops the broadcast
@@ -302,19 +318,42 @@ impl BinaryStreamSource for Mp4StreamPublisher {
         if self.terminal.load(Ordering::Acquire) {
             return None;
         }
-        match tokio::time::timeout(INIT_SEGMENT_TIMEOUT, notified).await {
-            Ok(()) => self.init_segment.lock().clone(),
-            Err(_) => {
-                tracing::warn!(
-                    timeout_s = INIT_SEGMENT_TIMEOUT.as_secs(),
-                    "fMP4 publisher: init segment timed out, marking unsupported"
-                );
-                // Init never arrived in time: make the publisher terminal so
-                // `chunk_broadcaster()` returns None and subscribe fails cleanly
-                // (live receivers get Closed) instead of caching a hung empty
-                // stream that never delivers an init segment.
-                self.mark_unsupported();
-                None
+        // Zegar liczy od WPIĘCIA gałęzi, nie od subskrypcji. Wpięcie jest
+        // odraczane, dopóki tee nie wynegocjuje caps (zimna kamera, świeżo
+        // przebudowany pipeline), a stały budżet od subskrypcji wypalał się na
+        // tym czekaniu: w logu produkcyjnym publisher był uznawany za martwy
+        // 0,25 s PO `branch B attached`. Każde wpięcie restartuje budżet, więc
+        // 10 s mierzy to, co miało mierzyć — wpięty mux, który nic nie produkuje.
+        let mut notified = notified;
+        let mut deadline = tokio::time::Instant::now() + INIT_SEGMENT_TIMEOUT;
+        loop {
+            let attached = self.branch_attached.notified();
+            tokio::select! {
+                _ = notified => return self.init_segment.lock().clone(),
+                _ = attached => {
+                    deadline = tokio::time::Instant::now() + INIT_SEGMENT_TIMEOUT;
+                    // `notified` został skonsumowany przez `select!`, więc trzeba
+                    // uzbroić nowe oczekiwanie PRZED ponownym sprawdzeniem stanu.
+                    notified = self.init_ready.notified();
+                    if let Some(b) = self.init_segment.lock().clone() {
+                        return Some(b);
+                    }
+                    if self.terminal.load(Ordering::Acquire) {
+                        return None;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!(
+                        timeout_s = INIT_SEGMENT_TIMEOUT.as_secs(),
+                        "fMP4 publisher: init segment timed out, marking unsupported"
+                    );
+                    // Init never arrived in time: make the publisher terminal so
+                    // `chunk_broadcaster()` returns None and subscribe fails cleanly
+                    // (live receivers get Closed) instead of caching a hung empty
+                    // stream that never delivers an init segment.
+                    self.mark_unsupported();
+                    return None;
+                }
             }
         }
     }
@@ -509,6 +548,44 @@ mod tests {
         assert!(
             rx.recv().await.is_err(),
             "dropping the sender closes outstanding receivers"
+        );
+    }
+
+    /// Regresja z produkcji: gałąź B bywa wpinana z opóźnieniem (tee negocjuje
+    /// caps dopiero po pierwszym buforze), a budżet liczony od SUBSKRYPCJI
+    /// wypalał się na tym czekaniu — w logu publisher był uznawany za martwy
+    /// 0,25 s PO `branch B attached`, więc mux nie miał kiedy wypluć ftyp+moov.
+    /// Wpięcie musi restartować zegar.
+    #[tokio::test(start_paused = true)]
+    async fn branch_attach_restarts_the_init_budget() {
+        let (pub_, _cmd_rx) = make_publisher();
+        let waiter = {
+            let pub_ = Arc::clone(&pub_);
+            tokio::spawn(async move { pub_.init_segment().await })
+        };
+
+        // Prawie cały pierwotny budżet mija bez wpięcia gałęzi.
+        tokio::time::sleep(INIT_SEGMENT_TIMEOUT - Duration::from_millis(250)).await;
+        assert!(!waiter.is_finished(), "budżet nie powinien jeszcze wygasnąć");
+
+        // Gałąź wreszcie się wpina — od tego momentu liczymy 10 s od nowa.
+        pub_.mark_branch_attached();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !waiter.is_finished(),
+            "po wpięciu gałęzi publisher nie może umrzeć na starym deadline"
+        );
+
+        // Init segment przychodzi normalnie po wpięciu. Pieczętuje go dopiero
+        // pierwszy `moof` (patrz `push_chunk`), stąd pełna trójka jak w `seed_init`.
+        pub_.push_chunk(mp4_box(b"ftyp", &[0xDE, 0xAD, 0xBE, 0xEF]));
+        pub_.push_chunk(mp4_box(b"moof", &[0x00]));
+        pub_.push_chunk(mp4_box(b"mdat", &[0x00]));
+        let got = waiter.await.expect("waiter task");
+        assert!(got.is_some(), "init segment po wpięciu musi dotrzeć");
+        assert!(
+            pub_.chunk_broadcaster().is_some(),
+            "publisher, który dostarczył init, nie może być terminalny"
         );
     }
 

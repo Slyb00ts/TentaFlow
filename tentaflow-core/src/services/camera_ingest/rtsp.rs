@@ -3132,6 +3132,9 @@ pub async fn run_rtsp_session(
                                             preview,
                                             "rtsp: branch B attached (fMP4 mux)"
                                         );
+                                        // Restart budżetu na init segment — liczy się
+                                        // od wpięcia, nie od subskrypcji.
+                                        publisher.mark_branch_attached();
                                         *slot = Some(state);
                                         let weak = Some(std::sync::Arc::downgrade(&publisher));
                                         if preview {
@@ -3287,6 +3290,10 @@ pub async fn run_rtsp_session(
                                     preview,
                                     "rtsp: branch B attached (odroczone wpięcie)"
                                 );
+                                // Tu reset budżetu jest KRYTYCZNY: odroczenie mogło
+                                // trwać sekundy, a bez niego publisher umierał tuż
+                                // po wpięciu.
+                                publisher.mark_branch_attached();
                                 *slot = Some(state);
                                 *pending = None;
                                 let weak = Some(std::sync::Arc::downgrade(&publisher));
