@@ -2,36 +2,66 @@
 # File: gen_synth.py
 # Purpose: Synthetic single-row ADR digit sample generator (image + label) with
 #          aggressive augmentation to bridge the synthetic->real domain gap.
+#          The (kemler, UN) catalogue is INJECTED by the server from the training
+#          request (Core reads the deployment's adr-list.json) — this module never
+#          touches the filesystem for data, so the same code runs in a container
+#          without the vision model dir mounted.
+# Example: gen_synth.set_catalogue([("30", "1202"), ...]); img, text = make_sample()
 # =============================================================================
-import os, json, random, math
-import numpy as np
+import glob
+import math
+import os
+import random
+
 import cv2
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 IMG_H, IMG_W = 32, 128  # CRNN input (grayscale)
 
-FONT_PATHS = [
-    "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansCondensed-Bold.ttf",
-    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/liberation/LiberationMono-Bold.ttf",
-    "/usr/share/fonts/noto/NotoSansMono-Bold.ttf",
-    "/usr/share/fonts/noto/NotoSansMono-Black.ttf",
+# Bold monospace/sans faces resembling the stencil digits on a real placard.
+# Globs, not fixed paths: font packages land in different directories per distro,
+# so the set is discovered at runtime and the absence of ALL of them is a hard
+# error at job start (a silent fallback to one thin face would quietly cost
+# accuracy on real crops).
+_FONT_GLOBS = [
+    "/usr/share/fonts/**/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/**/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/**/DejaVuSansCondensed-Bold.ttf",
+    "/usr/share/fonts/**/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/**/LiberationMono-Bold.ttf",
+    "/usr/share/fonts/**/NotoSansMono-Bold.ttf",
+    "/usr/share/fonts/**/NotoSansMono-Black.ttf",
+    "/usr/share/fonts/**/*Mono*Bold*.ttf",
+    "/usr/share/fonts/**/*Sans*Bold*.ttf",
 ]
 
-def _load_adr_rows():
-    with open(os.path.join(HERE, "adr-list.json"), encoding="utf-8") as f:
-        data = json.load(f)
-    kemlers, uns = [], []
-    for p in data["pary"]:
-        kemlers.append(str(p["kemler"]))
-        uns.append(str(p["un"]))
-    return kemlers, uns
+_FONT_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+_FONTS: list[str] = []
+_KEMLERS: list[str] = []
+_UNS: list[str] = []
 
-_KEMLERS, _UNS = _load_adr_rows()
-_FONT_CACHE = {}
+
+def discover_fonts() -> list[str]:
+    """Bold TrueType faces available on this machine (deduplicated, sorted)."""
+    global _FONTS
+    if _FONTS:
+        return _FONTS
+    found: set[str] = set()
+    for pattern in _FONT_GLOBS:
+        for path in glob.glob(pattern, recursive=True):
+            if os.path.isfile(path):
+                found.add(path)
+    _FONTS = sorted(found)
+    return _FONTS
+
+
+def set_catalogue(pairs: list[tuple[str, str]]) -> None:
+    """Installs the deployment's (kemler, UN) pairs as the synthetic label source."""
+    global _KEMLERS, _UNS
+    _KEMLERS = [str(k) for k, _ in pairs if str(k).isdigit()]
+    _UNS = [str(u) for _, u in pairs if str(u).isdigit()]
+
 
 def _get_font(path, size):
     key = (path, size)
@@ -39,14 +69,15 @@ def _get_font(path, size):
         _FONT_CACHE[key] = ImageFont.truetype(path, size)
     return _FONT_CACHE[key]
 
+
 def sample_label():
-    """Return a digit string for one row following the prescribed 50/50 mix."""
-    r = random.random()
-    if r < 0.5:
+    """Return a digit string for one row: half from the catalogue (real
+    combinations the reader will actually meet), half random digit groups of
+    plausible length (generalization). Without a catalogue every row is random."""
+    if _KEMLERS and random.random() < 0.5:
         if random.random() < 0.5:
             return random.choice(_KEMLERS)
         return random.choice(_UNS)
-    # random generalization rows
     if random.random() < 0.5:
         n = random.choice([2, 2, 3])  # kemler
     else:
@@ -56,7 +87,10 @@ def sample_label():
 
 def _render_row(text):
     """Render black digits on orange plate background at working resolution."""
-    font_path = random.choice(FONT_PATHS)
+    fonts = discover_fonts()
+    if not fonts:
+        raise RuntimeError("brak czcionek TrueType do generowania danych syntetycznych")
+    font_path = random.choice(fonts)
     fsize = random.randint(46, 72)
     font = _get_font(font_path, fsize)
     # letter spacing
@@ -116,15 +150,16 @@ def _rand_perspective(img):
     h, w = img.shape[:2]
     m = min(h, w)
     d = m * random.uniform(0.0, 0.18)
+
     def jit():
         return random.uniform(-d, d)
+
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
     dst = np.float32([
         [0 + jit(), 0 + jit()], [w + jit(), 0 + jit()],
         [w + jit(), h + jit()], [0 + jit(), h + jit()],
     ])
     M = cv2.getPerspectiveTransform(src, dst)
-    border = tuple(int(v) for v in img[0, 0])
     return cv2.warpPerspective(img, M, (w, h), borderMode=cv2.BORDER_REFLECT)
 
 
@@ -160,7 +195,10 @@ def _motion_blur(img):
     return cv2.filter2D(img, -1, kernel)
 
 
-def _augment(img):
+def augment(img):
+    """Domain-gap augmentation. Public because REAL crops go through the same
+    pipeline (minus the render step): a handful of hand-labelled plates would
+    otherwise be memorized in a couple of epochs."""
     # geometric
     if random.random() < 0.85:
         img = _rand_perspective(img)
@@ -231,26 +269,10 @@ def _augment(img):
 
 
 def make_sample():
+    """One synthetic (grayscale 32x128, label) pair."""
     text = sample_label()
     rgb = _render_row(text)
-    rgb = _augment(rgb)
+    rgb = augment(rgb)
     gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
     return gray, text
-
-
-if __name__ == "__main__":
-    # quick visual sanity montage
-    random.seed(0)
-    cols, rows, cell = 8, 8, 140
-    canvas = Image.new("RGB", (cols * cell, rows * (cell // 2 + 20)), (30, 30, 30))
-    dr = ImageDraw.Draw(canvas)
-    for i in range(cols * rows):
-        g, t = make_sample()
-        im = Image.fromarray(g).convert("RGB").resize((cell - 8, (cell - 8) // 4))
-        r, c = divmod(i, cols)
-        y = r * (cell // 2 + 20)
-        canvas.paste(im, (c * cell + 4, y + 4))
-        dr.text((c * cell + 4, y + (cell // 4)), t, fill=(0, 255, 0))
-    canvas.save(os.path.join(HERE, "synth_preview.png"))
-    print("wrote synth_preview.png")

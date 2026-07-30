@@ -2566,6 +2566,51 @@ pub fn encode_ml_studio_classifier_train_start_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioOcrTrainStartRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ml_studio_ocr_train_start_request(
+    project_id: String,
+    dataset_id: String,
+    attribute: String,
+    source_class: String,
+    epochs: i32,
+    batch_size: i32,
+    learning_rate: f32,
+    synthetic_per_epoch: i32,
+    real_repeat: i32,
+    target_node_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::OcrTrainStartRequest(
+            tentaflow_protocol::MlStudioOcrTrainStartRequest {
+                project_id,
+                dataset_id,
+                attribute,
+                source_class,
+                hyperparams: tentaflow_protocol::MlStudioOcrHyperparams {
+                    epochs,
+                    batch_size,
+                    learning_rate,
+                    synthetic_per_epoch,
+                    real_repeat,
+                },
+                target_node_id,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioTrainCancelRequest)]
+pub fn encode_ml_studio_train_cancel_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::TrainCancelRequest(
+            tentaflow_protocol::MlStudioTrainCancelRequest { run_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioGenericTrainStatusRequest)]
 pub fn encode_ml_studio_generic_train_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -11122,6 +11167,34 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "runId", resp.run_id.clone().into());
             set(obj, "run_id", resp.run_id.into());
             set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::OcrTrainStartRequest(req) => {
+            set(obj, "variant", "MlStudioOcrTrainStartRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "attribute", req.attribute.into());
+            set(obj, "sourceClass", req.source_class.clone().into());
+            set(obj, "source_class", req.source_class.into());
+        }
+        tentaflow_protocol::MlStudioPayload::OcrTrainStartResponse(resp) => {
+            set(obj, "variant", "MlStudioOcrTrainStartResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::TrainCancelRequest(req) => {
+            set(obj, "variant", "MlStudioTrainCancelRequest".into());
+            set(obj, "runId", req.run_id.clone().into());
+            set(obj, "run_id", req.run_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::TrainCancelResponse(resp) => {
+            set(obj, "variant", "MlStudioTrainCancelResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+            set(obj, "cancelled", resp.cancelled.into());
         }
         tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(req) => {
             set(obj, "variant", "MlStudioGenericTrainStatusRequest".into());

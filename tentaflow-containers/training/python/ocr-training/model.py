@@ -2,6 +2,10 @@
 # File: model.py
 # Purpose: Small CRNN (CNN backbone -> height collapse -> BiLSTM -> CTC head)
 #          for single-row ADR digit reading. Alphabet = 0-9, CTC blank = 0.
+#          The geometry here IS the runtime contract of `vision/adr_ocr.rs`:
+#          input [B,1,32,128] grayscale normalized to (p/255-0.5)/0.5, output
+#          logits [B,T,11] decoded with CTC greedy (blank at index 0). Changing
+#          IMG_H/IMG_W or the alphabet breaks every deployed reader.
 # =============================================================================
 import torch
 import torch.nn as nn
@@ -39,4 +43,4 @@ class CRNN(nn.Module):
         f = f.squeeze(2).permute(0, 2, 1)  # [B, W', 128]
         r, _ = self.rnn(f)              # [B, W', 2H]
         y = self.fc(r)                  # [B, W', C]
-        return y                        # logits (T=B dim=1)
+        return y                        # logits (T on dim=1)

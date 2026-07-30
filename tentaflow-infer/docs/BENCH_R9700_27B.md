@@ -98,35 +98,65 @@ odjęcia prefillu):
 | NVFP4 | 4096 | **28,3** | 27,5 | 1,03x |
 | NVFP4 | 8192 | **27,4** | 27,1 | 1,01x |
 
-**Ale z MTP na długim kontekście przegrywamy, i to wyraźnie** (prompt 4672 +
-odpowiedź 512, czas całego przebiegu):
+**MTP na długim kontekście miał defekt strukturalny — znaleziony profilem i
+naprawiony.** Stan po naprawie (prompt 4672 + odpowiedź 512):
 
 | model | tryb | FORGE decode | llama.cpp decode | FORGE łącznie | llama.cpp łącznie |
 |---|---|--:|--:|--:|--:|
-| Q4_K_M | bez spekulacji | 26,6 | 26,9 | **22,63 s** | 24,22 s |
-| Q4_K_M | MTP K=3 | 27,2 | **43,5** | 22,21 s | **16,77 s** |
-| NVFP4 | bez spekulacji | 28,0 | 27,4 | **21,92 s** | 24,36 s |
-| NVFP4 | MTP K=3 | 34,0 | **59,9** | 18,71 s | **14,03 s** |
+| Q4_K_M | bez spekulacji | **26,6** | 26,9 | **22,63 s** | 24,22 s |
+| Q4_K_M | MTP K=3 | 27,3 -> **37,6** | 43,5 | 22,21 -> **17,06 s** | 16,77 s |
+| NVFP4 | bez spekulacji | **28,0** | 27,4 | **21,92 s** | 24,36 s |
+| NVFP4 | MTP K=3 | 34,0 -> **51,8** | 59,9 | 18,71 -> **13,52 s** | 14,03 s |
 
-Bez spekulacji wygrywamy oba modele. Z MTP llama.cpp jest 1,60x (Q4_K) i 1,76x
-(NVFP4) szybsza w samym decode.
+NVFP4 z MTP wygrywa teraz cały przebieg (13,52 s wobec 14,03 s), bo nasz prefill
+jest o połowę szybszy; w samym decode zostaje 0,86x i to jest praca do zrobienia.
 
-**To NIE jest akceptacja draftu.** Na tym prompcie mamy 1,77/krok dla Q4_K i
-2,11/krok dla NVFP4 — czyli nawet lepiej niż na krótkim. Liczy się koszt jednego
-forwardu weryfikującego:
+### Defekt: uwaga weryfikatora liczyła się kaflem PREFILLOWYM
 
-| kontekst | forward zwykły | forward weryfikujący T=4 | stosunek |
+`rocprofv3 --kernel-trace`, ten sam przebieg z MTP i bez, kontekst 4672:
+
+| kernel | bez MTP | z MTP | delta |
 |---|--:|--:|--:|
-| 32 tokeny | 29,8 ms | 50,0 ms | 1,68x |
-| 4672 tokeny | 37,6 ms | 101,7 ms | **2,70x** |
+| `attn_prefill_wmma` | 245,9 ms | **804,0 ms** | +558,1 |
+| `gemv_nvfp4_gguf_q8_1_b4` | 0 | 526,1 ms | +526,1 |
 
-Weryfikacja czterech tokenów powinna kosztować niewiele więcej niż jednego —
-decode jest ograniczony czytaniem wag, a wagi czyta się raz niezależnie od T.
-Rośnie natomiast z kontekstem, i to szybciej niż sam decode (2,70x wobec 1,68x).
-Czyli w ścieżce weryfikacji jest praca proporcjonalna do długości kontekstu,
-której zwykły krok dekodowania nie wykonuje. To jest następne zadanie i ma
-konkretny cel liczbowy: sprowadzić stosunek 2,70x do bliskiego 1,0x, co samo z
-siebie ustawiłoby decode+MTP na NVFP4 w okolicy 2,7 * 28,0 = ~75 tok/s.
+Kafel prefillowy zrównolegla po TOKENACH. Przy weryfikacji T=4 daje to grid
+`ceil(4/64) x 24 głowice` = **24 grupy robocze na 64 CU**, z których każda
+szeregowo przechodzi cały kontekst — 2,28 ms na warstwę, razy 16 warstw uwagi,
+czyli 36,5 ms na krok weryfikacji.
+
+Kernel z podziałem kontekstu (`attn_verify_split8_f16_hd256_t3/t4`) istniał,
+artefakty dla gfx1201 BYŁY w katalogu, a launcher i tak go nie brał, bo bramka
+sprawdzała `caps.vendor != Nvidia`. Kernel nie ma ani jednego intrinsicu
+producenta — `warp.sum`, bariery, LDS — więc realnym wymogiem jest fala 32 i
+pojemność LDS, i tak brzmi teraz warunek. Po zmianie: **804,0 -> 49,0 ms**
+(16,4x), suma SHA bez zmian dla obu kwantyzacji, z MTP i bez.
+
+To trzeci raz w tym pliku, gdy „NVIDIA-only" okazuje się bramką postawioną za
+szeroko, a nie własnością kernela — po dense prefillu i po `head_dim`.
+
+### Co zostaje: 0,86x w samym decode
+
+Druga pozycja z profilu, `gemv_nvfp4_gguf_q8_1_b4` (526 ms), NIE jest defektem:
+to poprawny kernel WSADOWY B4, a 27,7 ms na krok wobec ~31 ms teoretycznego
+pełnego odczytu wag oznacza, że siedzi na roofline pamięci.
+
+Rozkład kroku weryfikacji po naprawie: 55 ms pracy GPU i 8,6 ms bezczynności
+(13% śladu). Bezczynność ma dwa źródła i oba są małe: `copyBuffer` po migawce
+stanu DeltaNet (16,3 ms na cały przebieg) oraz powrót do hosta po każdym tokenie
+draftu (58 przerw po 271 us — pętla draftu jest z natury szeregowa).
+
+Prawdziwe pytanie zostaje takie: forward weryfikujący T=4 kosztuje 55 ms wobec
+35,7 ms forwardu dekodowania T=1, mimo że oba czytają wagi RAZ. Nadwyżka 19 ms
+to koszt trzech kroków draftu (głowa MTP plus `lm_head`) i to jest następne
+miejsce do zmierzenia.
+
+**K nie jest tu dźwignią** — sprawdzone po naprawie, długi kontekst:
+
+| model | K=2 | K=3 |
+|---|--:|--:|
+| NVFP4 | 2,50 tok/forward, 14,98 s | **3,13 tok/forward, 13,52 s** |
+| Q4_K_M | 2,42 tok/forward, 26,06 s | **2,73 tok/forward, 17,06 s** |
 
 ## 3. Optymalizacja prefillu — co dało ile
 

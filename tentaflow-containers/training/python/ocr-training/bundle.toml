@@ -1,0 +1,42 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle natywnego serwera treningowego czytnika OCR tablic
+#       (CRNN + CTC). server.py uruchamiany przez uvicorn na :8204.
+# Przykład: TentaFlow startuje server.py, a Core wysyła POST /train (COCO →
+#           wycinki → wiersze → trening) i POST /export (→ adr_ocr.onnx).
+# =============================================================================
+
+[bundle]
+engine = "ocr-training"
+description = "ADR placard OCR training server (COCO crops → rows → CRNN/CTC → ONNX)"
+python_version = "3.12"
+# Zależności pinowane w pyproject. `pypi_package` to identity-package bundla;
+# torch z wariantu CUDA przez install_variants.extra_index.
+source = "pypi"
+pypi_package = "opencv-python-headless>=4.10"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}",
+    "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8204}",
+]
+internal_port = 8204
+
+[requires]
+gpu_memory_gb = 4
+disk_gb = 20
+platforms = ["linux-x86_64"]
+
+# torch z kołami CUDA 13.0 (PyPI domyślnie serwuje wariant CPU). Model ma ~1 M
+# parametrów, więc wariant `cpu` też jest użyteczny — tylko wolniejszy.
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = []
+
+[[install_variants]]
+backend = "cpu"
+extras = []

@@ -1,0 +1,26 @@
+# Manifest serwisu OCR Training — serwer treningowy czytnika tablic (CRNN + CTC).
+# Trenuje na WIERSZACH wycinków z datasetu COCO: wartość atrybutu OCR adnotacji
+# (np. "kod" = "<kemler>/<UN>") daje etykietę górnego i dolnego wiersza tablicy.
+# Realne wiersze są mieszane z danymi syntetycznymi generowanymi w locie, bo
+# ręcznych odczytów jest z natury mało. Eksport (POST /export) daje adr_ocr.onnx
+# + adr_ocr_alphabet.txt — dokładnie to, czego szuka runtime czytnika w Core.
+# Atrybut, klasa źródłowa i dane są parametrem JOBA — requires_model = false.
+
+[engine]
+id = "ocr-training"
+category = "training"
+name = "OCR Training"
+description_pl = "Serwer treningowy czytnika OCR tablic (CRNN + CTC): trening na wierszach wycinków z COCO wg atrybutu OCR adnotacji, mieszanka danych realnych i syntetycznych, eksport do ONNX. Atrybut, klasę źródłową i dane podajesz per job przez REST API."
+description_en = "ADR placard OCR reader training server (CRNN + CTC): trains on rows of COCO bbox crops labelled by an OCR annotation attribute, mixing real and synthetic data, ONNX export. Attribute, source class and data are supplied per job over a REST API."
+homepage = "https://github.com/pytorch/pytorch"
+license = "Apache-2.0"
+icon = "search"
+default_port = 8204
+api = "custom"
+version = "1.0.0"
+requires_model = false
+
+[deploy.native]
+platforms = ["linux"]
+runtime = "python-bundle"
+bundle_path = "training/python/ocr-training"

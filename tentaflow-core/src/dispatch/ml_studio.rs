@@ -3211,17 +3211,6 @@ pub async fn ml_studio_classifier_train_start(
     }
     // Treść atrybutu i wartości trafia po stronie serwisu do metadanych/ścieżek —
     // whitelist znaków, bez pustych i `.`/`..`/separatorów ścieżek (path traversal).
-    let is_valid_ml_name = |s: &str| -> bool {
-        let t = s.trim();
-        if t.is_empty() || t == "." || t == ".." {
-            return false;
-        }
-        let n = s.chars().count();
-        n >= 1
-            && n <= 64
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' '))
-    };
     if !is_valid_ml_name(&payload.attribute) {
         return Err(ProtocolError::bad_request(
             "attribute zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
@@ -3361,6 +3350,193 @@ pub async fn ml_studio_classifier_train_start(
     Ok(MessageBody::MlStudioBody(
         MlStudioPayload::ClassifierTrainStartResponse(
             tentaflow_protocol::MlStudioClassifierTrainStartResponse {
+                run_id,
+                status: start_status.to_string(),
+            },
+        ),
+    ))
+}
+
+/// Nazwa atrybutu / klasy / wartości bezpieczna do przekazania serwisowi
+/// treningowemu: trafia u niego do metadanych i ŚCIEŻEK, więc whitelist znaków,
+/// bez pustych i bez `.`/`..`/separatorów ścieżek (path traversal).
+fn is_valid_ml_name(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t == "." || t == ".." {
+        return false;
+    }
+    let n = s.chars().count();
+    n >= 1
+        && n <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' '))
+}
+
+#[handler(variant = "MlStudioOcrTrainStartRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_ocr_train_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::OcrTrainStartRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioOcrTrainStartRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    // Atrybut i klasa źródłowa trafiają po stronie serwisu do metadanych/ścieżek —
+    // whitelist znaków, bez pustych i `.`/`..`/separatorów ścieżek.
+    if !is_valid_ml_name(&payload.attribute) {
+        return Err(ProtocolError::bad_request(
+            "attribute zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+        ));
+    }
+    if !payload.source_class.is_empty() && !is_valid_ml_name(&payload.source_class) {
+        return Err(ProtocolError::bad_request(
+            "source_class zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+        ));
+    }
+    let hp = &payload.hyperparams;
+    if hp.epochs < 1 || hp.batch_size < 1 || hp.learning_rate <= 0.0 {
+        return Err(ProtocolError::bad_request(
+            "epochs i batch_size muszą być >= 1, a learning_rate > 0",
+        ));
+    }
+    if hp.synthetic_per_epoch < 0 || hp.real_repeat < 1 {
+        return Err(ProtocolError::bad_request(
+            "synthetic_per_epoch nie może być ujemne, a real_repeat musi być >= 1",
+        ));
+    }
+    // Syntetyk bez katalogu ADR uczyłby się wyłącznie losowych cyfr — to cicha
+    // utrata jakości, więc odmawiamy zamiast startować gorszy trening.
+    if hp.synthetic_per_epoch > 0 && crate::ml_studio::train_ocr::adr_pairs_json().is_empty() {
+        return Err(ProtocolError::bad_request(
+            "brak katalogu ADR (adr-list.json w katalogu modeli wizji) — dodaj go albo ustaw liczbę próbek syntetycznych na 0",
+        ));
+    }
+
+    // Mesh-distributed: węzeł docelowy. Pusty/local → trening lokalny.
+    let local_node = ctx.state.local_node_id.to_string();
+    let target_node = {
+        let t = payload.target_node_id.trim();
+        if t.is_empty() || t == local_node {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+
+    let hyperparams_json = serde_json::json!({
+        "epochs": hp.epochs,
+        "batch_size": hp.batch_size,
+        "learning_rate": hp.learning_rate,
+        "synthetic_per_epoch": hp.synthetic_per_epoch,
+        "real_repeat": hp.real_repeat,
+    });
+    let config_json = serde_json::json!({
+        "kind": "ocr",
+        "attribute": payload.attribute,
+        "source_class": payload.source_class,
+        "dataset_id": payload.dataset_id,
+        "node_id": target_node.clone().unwrap_or_else(|| local_node.clone()),
+        "hyperparams": hyperparams_json,
+    })
+    .to_string();
+
+    let run_id =
+        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+
+    let target_was_remote = target_node.is_some();
+    match target_node {
+        None => {
+            crate::ml_studio::train_ocr::spawn_ocr_training(
+                run_id.clone(),
+                payload.project_id.clone(),
+                org.user_id.clone(),
+                payload.dataset_id.clone(),
+                payload.attribute.clone(),
+                payload.source_class.clone(),
+                payload.hyperparams.clone(),
+            );
+        }
+        Some(target) => {
+            // Trening ZDALNY (Node B): dataset COCO → mesh (content-addr po hashu),
+            // po zmaterializowaniu start treningu OCR na B (kind="ocr").
+            let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
+                })?;
+            if dataset.kind != "coco_path" {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(
+                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
+                ));
+            }
+            let raw =
+                repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            let dataset_dir = String::from_utf8_lossy(&raw).trim().to_string();
+            let dataset_hash = crate::ml_studio::train_recognition::coco_content_hash(
+                std::path::Path::new(&dataset_dir),
+            )
+            .map_err(|e| ProtocolError::bad_request(format!("hash datasetu: {}", e)))?;
+            let spec_json = serde_json::json!({
+                "kind": "ocr",
+                "dataset_dir": format!("mesh:{}", dataset_hash),
+                "dataset_hash": dataset_hash,
+                "attribute": payload.attribute,
+                "source_class": payload.source_class,
+                "output_dir": format!("ocr/{}/{}", payload.project_id, run_id),
+                "hyperparams": hyperparams_json,
+            })
+            .to_string();
+
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                ProtocolError::internal(
+                    "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                )
+            })?;
+            if !security.is_trusted(&target) {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    target
+                )));
+            }
+
+            let _ = repository::update_training_run_status(&run_id, "syncing");
+            crate::ml_studio::train_recognition::spawn_mesh_dataset_push_and_train(
+                iroh,
+                target,
+                run_id.clone(),
+                dataset_dir,
+                dataset_hash,
+                spec_json,
+            );
+        }
+    }
+
+    let start_status = if target_was_remote {
+        "syncing"
+    } else {
+        "running"
+    };
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::OcrTrainStartResponse(
+            tentaflow_protocol::MlStudioOcrTrainStartResponse {
                 run_id,
                 status: start_status.to_string(),
             },

@@ -3295,6 +3295,56 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(OcrTrainStartRequest) — startuje ASYNCHRONICZNY
+   * trening CZYTNIKA OCR (CRNN + CTC) na wierszach wycinków (np. atrybut "kod"
+   * klasy tablica_adr, wartości w formacie <kemler>/<UN>). Wycinki, podział na
+   * wiersze i etykiety buduje serwis Python. Odpowiedź natychmiast z runId;
+   * postęp odpytuj przez mlStudioGenericTrainStatusRequest.
+   * payload: { projectId, datasetId, attribute, sourceClass,
+   * hyperparams:{epochs,batchSize,learningRate,syntheticPerEpoch,realRepeat},
+   * targetNodeId }.
+   */
+  mlStudioOcrTrainStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const hp = payload.hyperparams ?? {};
+    const body = _wasm.encodeMlStudioOcrTrainStartRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.attribute ?? ''),
+      String(payload.sourceClass ?? payload.source_class ?? ''),
+      (hp.epochs ?? 30) | 0,
+      (hp.batchSize ?? hp.batch_size ?? 64) | 0,
+      Number(hp.learningRate ?? hp.learning_rate ?? 3e-4),
+      (hp.syntheticPerEpoch ?? hp.synthetic_per_epoch ?? 20000) | 0,
+      (hp.realRepeat ?? hp.real_repeat ?? 8) | 0,
+      String(payload.targetNodeId ?? payload.target_node_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(TrainCancelRequest) — anuluje TRWAJĄCY trening
+   * (dowolny tor). payload: { runId }.
+   */
+  mlStudioTrainCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioTrainCancelRequest(
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(ClassifierTrainStartRequest) — startuje
    * ASYNCHRONICZNY trening KLASYFIKATORA ATRYBUTU na wycinkach (np. atrybut
    * "stan" o wartościach czysta/brudna). Cropy buduje serwis Python. Odpowiedź

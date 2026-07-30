@@ -1051,6 +1051,8 @@ impl MeshCommandExecutor {
         } else if kind == "classifier" {
             crate::ml_studio::train_classifier::mesh_train_start_classifier(&run_id, &spec_json)
                 .await
+        } else if kind == "ocr" {
+            crate::ml_studio::train_ocr::mesh_train_start_ocr(&run_id, &spec_json).await
         } else {
             crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await
         };
@@ -1067,6 +1069,8 @@ impl MeshCommandExecutor {
             crate::ml_studio::train_llm::mesh_train_status_llm(&run_id).await
         } else if crate::ml_studio::train_classifier::is_classifier_mesh_job(&run_id) {
             crate::ml_studio::train_classifier::mesh_train_status_classifier(&run_id).await
+        } else if crate::ml_studio::train_ocr::is_ocr_mesh_job(&run_id) {
+            crate::ml_studio::train_ocr::mesh_train_status_ocr(&run_id).await
         } else {
             crate::ml_studio::train_recognition::mesh_train_status(&run_id).await
         };
@@ -1085,6 +1089,8 @@ impl MeshCommandExecutor {
             crate::ml_studio::train_llm::mesh_train_cancel_llm(&run_id).await
         } else if crate::ml_studio::train_classifier::is_classifier_mesh_job(&run_id) {
             crate::ml_studio::train_classifier::mesh_train_cancel_classifier(&run_id).await
+        } else if crate::ml_studio::train_ocr::is_ocr_mesh_job(&run_id) {
+            crate::ml_studio::train_ocr::mesh_train_cancel_ocr(&run_id).await
         } else {
             crate::ml_studio::train_recognition::mesh_train_cancel(&run_id).await
         };
