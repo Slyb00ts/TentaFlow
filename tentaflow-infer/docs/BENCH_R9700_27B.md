@@ -766,3 +766,39 @@ Praktyczny wniosek: pojedynczego dekodowania nie da się rozpędzić powyżej
 podnosząc intensywność arytmetyczną — spekulacją (MTP weryfikuje T tokenów na
 jednym odczycie wag) albo batchem. Dlatego MTP daje 79,5 tok/s przy tym samym
 paśmie.
+
+## Q4_K_M: stan i następny krok (zmierzone)
+
+| konfiguracja | początek | po zmianach |
+|---|--:|--:|
+| 1 karta, decode | 28,3 | **30,1** |
+| 2 karty, decode | 35,3 | **37,3** |
+| 1 karta, prefill | ~1315 | **1325,2** |
+
+Odniesienie llama.cpp `ea63b4d` (30.07) na tych samych kartach: Vulkan 31,95 na
+JEDNEJ karcie, ROCm 28,1. Obu backendom `-sm row` odmawia startu
+(`device does not support split buffers`), więc druga karta nie daje im nic:
+Vulkan spada do 26,9, ROCm do 27,9.
+
+Co dało zysk:
+- `gemv_q4_k_dp4a_group4_f16` — grupowanie jednorodne,
+- `gemv_mixed_dp4a_group4_f16` — grupowanie MIESZANE, bo `Q4_K_M` dobiera
+  format per tensor (`q`/`k` w Q4_K obok `v` w Q6_K, `attn_qkv` w Q6_K obok
+  bramki w Q4_K); bez tego najliczniejsze trójki i czwórki szły pojedynczo,
+- dp4a dla Q6_K w dekodowaniu.
+
+Uruchomienia spadły z 1287 do 1046 na token, czas z 33,0 do 31,8 ms.
+
+**Następny krok, z liczbami.** `ffn_down` to teraz 64 uruchomienia i 7,10 ms na
+token (22% kroku), a jego wariant Q6_K osiąga tylko **459 GB/s** przy suficie
+~620. Powód: przy 17408 kolumnach nie mieści się w oknie aktywacji LDS
+(`X_MAX = 16384`), więc idzie ścieżką bez stagingu — każdy blok wierszy czyta
+aktywację z pamięci od nowa, co przy 640 blokach dokłada ~22 MB do 58,9 MB wag.
+
+Podnoszenie `X_MAX` jest ODRZUCONE pomiarem (29,2 -> 28,1: większy bufor zabiera
+zajętość wszystkim kernelom dp4a). Rozwiązaniem jest staging aktywacji W DWÓCH
+KAWAŁKACH po <= 16384 kolumn z akumulacją iloczynu: LDS zostaje 20 KiB, a
+`ffn_down` wchodzi na dp4a. Wymaga wariantu `_dot_q4k_i8` / `_dot_q6k_i8` z
+zakresem bloków — waga indeksowana GLOBALNIE (krok wiersza z pełnej szerokości),
+a `xq`/`xds` LOKALNIE dla bieżącego kawałka. Szacunek z profilu: ~1,5 ms na
+token, czyli ~31,5 tok/s.
