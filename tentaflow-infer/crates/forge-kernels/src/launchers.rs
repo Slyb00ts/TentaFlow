@@ -17,6 +17,8 @@ const BLOCK: u32 = 256;
 
 /// GEMV NVFP4 z jedną falą na wiersz; `GEMV_WAVE_ROWS` w `src/nvfp4.mojo`.
 const GEMV_NVFP4_WAVE: &str = "gemv_nvfp4_gguf_f16_wave";
+/// Wierszy na blok w rodzinie `gemv_nvfp4_gguf_*_wave` (osiem fal po 32 linie).
+const GEMV_WAVE_ROWS: usize = 8;
 /// Zlozone do czterech projekcji NVFP4 na wspolnej aktywacji Q8_1.
 const GEMV_NVFP4_GROUP4: &str = "gemv_nvfp4_gguf_q8_1_group4_f16";
 /// Złożone do czterech projekcji Q8_0 na wspólnej aktywacji.
@@ -4931,12 +4933,20 @@ impl Kernels {
         }
         let caps = self.device.caps();
         let nvidia = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        // Wariant przenośny liczy FALĘ NA WIERSZ, tak jak `gemv_q8_0_out_f32_v2`.
+        // Poprzedni dawał JEDEN workgroup na wiersz słownika — dla głowy MTP to
+        // 248320 grup roboczych i 111 GB/s, wobec 597 GB/s wariantu Q8_0.
         let name = if nvidia {
             "gemm_nvfp4_gguf_out_f32_b1_nvidia"
         } else {
-            "gemv_nvfp4_gguf_out_f32"
+            "gemv_nvfp4_gguf_out_f32_wave"
         };
-        let grid_x = u32::try_from(if nvidia { rows.div_ceil(2) } else { rows }).map_err(|_| {
+        let grid_x = u32::try_from(if nvidia {
+            rows.div_ceil(2)
+        } else {
+            rows.div_ceil(GEMV_WAVE_ROWS)
+        })
+        .map_err(|_| {
             ForgeError::Kernel("gemv_nvfp4_gguf_out_f32: siatka przekracza u32".into())
         })?;
         let kernel = self.artifacts.get(name)?;
@@ -4949,9 +4959,10 @@ impl Kernels {
             .buf(y)
             .buf(weights)
             .buf(x)
-            .scalar(cols as i64);
+            .scalar(cols as i64)
+            .scalar(rows as i64);
         let args = if nvidia {
-            args.scalar(rows as i64).scalar(1i64).scalar(output_scale)
+            args.scalar(1i64).scalar(output_scale)
         } else {
             args.scalar(output_scale)
         };

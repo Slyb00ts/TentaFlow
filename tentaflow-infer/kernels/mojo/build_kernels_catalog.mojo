@@ -94,7 +94,7 @@ from src.nvfp4 import (
     pack_f16_fp8,
     pack_nvfp4_fp8,
     gemv_nvfp4_gguf_f16,
-    gemv_nvfp4_gguf_out_f32,
+    gemv_nvfp4_gguf_out_f32_wave,
     pack_q8_0_nvfp4_gguf,
 )
 from src.nvfp4_gguf_dp4a import (
@@ -710,7 +710,7 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
     # dlatego nie wymagaja instrukcji FP8 dostepnych dopiero od Ada.
     return (
         name == "gemv_nvfp4_gguf_f16"
-        or name == "gemv_nvfp4_gguf_out_f32"
+        or name == "gemv_nvfp4_gguf_out_f32_wave"
         or name == "pack_q8_0_nvfp4_gguf"
         or name == "gemv_nvfp4_gguf_q8_1_f16"
         or name == "mtp_prepare_f16"
@@ -1236,9 +1236,10 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_f16_wave"))
     _ = ctx.compile_function[
-        gemv_nvfp4_gguf_out_f32, dump_asm=Path("gemv_nvfp4_gguf_out_f32.ptx")
+        gemv_nvfp4_gguf_out_f32_wave,
+        dump_asm=Path("gemv_nvfp4_gguf_out_f32_wave.ptx"),
     ]()
-    entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_out_f32"))
+    entries.append(_finalize(out_dir, "gemv_nvfp4_gguf_out_f32_wave"))
     _ = ctx.compile_function[
         pack_q8_0_nvfp4_gguf, dump_asm=Path("pack_q8_0_nvfp4_gguf.ptx")
     ]()

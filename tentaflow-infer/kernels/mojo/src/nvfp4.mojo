@@ -236,8 +236,8 @@ def gemv_nvfp4_gguf_f16(
 comptime GEMV_WAVE_ROWS = 8  # wierszy na blok: osiem fal po 32 linie
 
 
-def gemv_nvfp4_gguf_f16_wave(
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemv_nvfp4_gguf_wave_impl[OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
@@ -292,41 +292,11 @@ def gemv_nvfp4_gguf_f16_wave(
 
     total = warp.sum(acc0 + acc1)
     if lane == 0:
-        y[row] = Float16(total * output_scale)
+        y[row] = (total * output_scale).cast[OUT]()
 
 
-def gemv_nvfp4_gguf_out_f32(
-    y: UnsafePointer[Float32, MutAnyOrigin],
-    weights: UnsafePointer[UInt8, MutAnyOrigin],
-    x: UnsafePointer[Float16, MutAnyOrigin],
-    n_cols: Int,
-    output_scale: Float32,
-):
-    """Liczy logity F32 bezposrednio z blokow GGUF NVFP4."""
-    row = Int(block_idx.x)
-    groups = n_cols // GROUP
-    row_base = row * (n_cols // 64) * 36
-
-    var acc: Float32 = 0.0
-    var group = Int(thread_idx.x)
-    while group < groups:
-        block = group // 4
-        subblock = group % 4
-        block_base = row_base + block * 36
-        packed_base = block_base + 4 + subblock * 8
-        x_base = group * GROUP
-        scale = _ue4m3_portable(weights[block_base + subblock])
-        var dot: Float32 = 0.0
-        for j in range(8):
-            code = weights[packed_base + j]
-            dot += _e2m1(code & 0x0F) * Float32(x[x_base + j])
-            dot += _e2m1((code >> 4) & 0x0F) * Float32(x[x_base + j + 8])
-        acc += scale * dot
-        group += Int(block_dim.x)
-
-    total = block_reduce_sum(acc)
-    if Int(thread_idx.x) == 0:
-        y[row] = total * output_scale
+comptime gemv_nvfp4_gguf_f16_wave = gemv_nvfp4_gguf_wave_impl[DType.float16]
+comptime gemv_nvfp4_gguf_out_f32_wave = gemv_nvfp4_gguf_wave_impl[DType.float32]
 
 
 def _fp32_to_ue4m3(value: Float32) -> UInt8:

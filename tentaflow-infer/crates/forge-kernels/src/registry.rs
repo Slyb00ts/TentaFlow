@@ -1803,7 +1803,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gemv_nvfp4_f16_v2",
     "gemv_nvfp4_gguf_f16",
     "gemv_nvfp4_gguf_f16_wave",
-    "gemv_nvfp4_gguf_out_f32",
+    "gemv_nvfp4_gguf_out_f32_wave",
     "gemv_nvfp4_gguf_q8_1_b2_f16",
     "gemv_nvfp4_gguf_q8_1_b4_f16",
     "gemv_nvfp4_gguf_q8_1_b8_f16",

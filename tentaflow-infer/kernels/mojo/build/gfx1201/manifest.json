@@ -1186,12 +1186,12 @@
       "file": "gemv_nvfp4_gguf_f16.hsaco"
     },
     "gemv_nvfp4_gguf_f16_wave": {
-      "entry": "src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_e71fc82a096529c3",
+      "entry": "src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_f9b54b0580dfadfe",
       "file": "gemv_nvfp4_gguf_f16_wave.hsaco"
     },
-    "gemv_nvfp4_gguf_out_f32": {
-      "entry": "src_nvfp4_gemv_nvfp4_gguf_out_6A6A6A6A_f86ea6d141753a07",
-      "file": "gemv_nvfp4_gguf_out_f32.hsaco"
+    "gemv_nvfp4_gguf_out_f32_wave": {
+      "entry": "src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_bcc7964595ec5e51",
+      "file": "gemv_nvfp4_gguf_out_f32_wave.hsaco"
     },
     "gemv_nvfp4_gguf_q8_1_b2_f16": {
       "entry": "src_nvfp4_gguf_dp4a_gemv_nvfp46A6A6A6A_b242342975ebe570",

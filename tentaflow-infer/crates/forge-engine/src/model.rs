@@ -8773,7 +8773,10 @@ impl Model {
                 5 * 4,
                 &self.stream,
             )?;
-            self.device.synchronize()?;
+            // Czekamy na TEN strumień, nie na całe urządzenie: `device.synchronize`
+            // drenuje wszystkie strumienie i to on dawał 8,4 ms bezczynności GPU
+            // na krok MTP (dwa drenaże: propose i weryfikacja).
+            self.stream.synchronize()?;
             let host = state
                 .pinned_token_ids
                 .host_ptr()
@@ -12404,7 +12407,10 @@ impl Model {
             } else {
                 self.run_hybrid_verify_compute(t)?;
             }
-            self.device.synchronize()?;
+            // Czekamy na TEN strumień, nie na całe urządzenie: `device.synchronize`
+            // drenuje wszystkie strumienie i to on dawał 8,4 ms bezczynności GPU
+            // na krok MTP (dwa drenaże: propose i weryfikacja).
+            self.stream.synchronize()?;
             let decision =
                 hv.pinned_decision
                     .host_ptr()
