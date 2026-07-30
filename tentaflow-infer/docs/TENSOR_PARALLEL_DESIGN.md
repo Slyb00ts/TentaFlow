@@ -146,6 +146,52 @@ splocie i skanie, które też przestają być liczone dwa razy.
 Wniosek praktyczny: `ssm_out` NIE nadaje się do wdrożenia osobno. Jest ostatnim
 krokiem podziału DeltaNet po głowicach i ma sens dopiero razem z nim.
 
+## Podziału po głowicach NIE WOLNO wdrażać po kawałku
+
+To jest ograniczenie POPRAWNOŚCI, nie wydajności, i łatwo je przeoczyć.
+
+Stan rekurencyjny DeltaNet jest wspólny dla wszystkich ścieżek: dekodowania,
+prefillu i weryfikacji draftu MTP. Jeśli mikser zostanie podzielony po głowicach
+tylko w JEDNEJ z nich, to karta modelu przestaje aktualizować stan głowic, które
+policzyła ranga wspierająca — a każda inna ścieżka nadal czyta ten stan z karty
+modelu i dostaje wartości NIEAKTUALNE. Nie ma z tego błędu ani asercji: model po
+prostu liczy coś innego, a przy weryfikacji MTP jeszcze to zatwierdza.
+
+Wniosek: podział DeltaNet po głowicach jest zmianą WSZYSTKO ALBO NIC. Stan musi
+stać się per ranga w tym samym kroku, w którym mikser zaczyna być liczony per
+ranga, i muszą to objąć wszystkie ścieżki naraz — łącznie z checkpointami i
+rollbackiem MTP. Bramkowanie go „na razie tylko dla dekodowania bez spekulacji"
+jest właśnie tym niebezpiecznym półśrodkiem.
+
+Praktycznie: `SsmState` (bufory `conv` i `state`) jest czytany bezpośrednio w
+~60 miejscach POZA pulą i w 7 miejscach wewnątrz niej. Rozsądna droga to nadać
+mu dostęp per ranga, zostawiając dzisiejsze `.conv`/`.state` jako rangę zero —
+wtedy istniejące miejsca zostają nietknięte, a zmiana skupia się w puli i w
+mikserze. Ale przełączenie musi objąć wszystkie ścieżki w jednym kroku.
+
+## Ile to jest warte — zmierzone, nie oszacowane
+
+Profil `rocprofv3` dekodowania (prompt 128, 64 tokeny, warmup + 1 przebieg):
+
+| | kernele karty 0 | uruchomienia karty 0 | kernele karty 1 |
+|---|--:|--:|--:|
+| 1 karta | 4260,5 ms | 165 057 | — |
+| 2 karty | 2998,6 ms | **201 693** | 1669,2 ms |
+
+Karta modelu wykonuje 29,6% mniej pracy, ale ma o 22% WIĘCEJ uruchomień, czyli
+około 290 dodatkowych na token. To dokładnie 48 warstw DeltaNet razy sześć
+operacji rozgłoszenia, zbiórki i zdarzeń — koszt składania wyników projekcji.
+Przy zmierzonych ~4,5 us na uruchomienie to ~1,3 ms na token przy kroku ~26 ms.
+
+Podział po głowicach wygrywa więc DWA RAZY: usuwa te same ~288 uruchomień (bo
+nie ma czego składać) i dopiero wtedy pozwala podzielić `ssm_out` (9,7% odczytu,
+~1,4 ms). Razem ~2,7 ms z ~26 ms, czyli oczekiwane ~+11% dekodowania — i tyle
+samo na ścieżce MTP, której dzisiejszy podział projekcji w ogóle nie dotyczy.
+
+Kontrola: sam podział projekcji DeltaNet zmierzony A/B daje 38,4 wobec 37,7
+tok/s. Jest na plus, ale skromnie — bo połowa zysku z odczytu wraca jako koszt
+składania. To jest ta sama liczba widziana z drugiej strony.
+
 ## Zgodność bitowa
 
 - **Kolumnowo równoległe** (podział wyjścia): każdy element wyniku liczony w
