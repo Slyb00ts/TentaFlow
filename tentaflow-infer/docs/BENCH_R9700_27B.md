@@ -224,6 +224,76 @@ to 96 osobnych kopii D2D na krok, bo stan każdej warstwy jest osobną alokacją
 | NVFP4 | 2,50 tok/forward, 14,98 s | **3,13 tok/forward, 13,50 s** |
 | Q4_K_M | 2,42 tok/forward, 26,06 s | **2,73 tok/forward, 16,72 s** |
 
+## 2c. Realne zadanie generacyjne — kod Snake 3D
+
+Prompt 331 tokenów (specyfikacja gry Snake 3D w Pythonie: pygame + PyOpenGL,
+kamera orbitalna, kolizje, HUD, zapis wyniku), 1536 wygenerowanych tokenów kodu.
+`llama-cli -st -c 8192 -f` wobec `forge run`. Prefill FORGE liczony z przebiegu
+`-n 1` po odjęciu jednego kroku dekodowania; decode z pary `-n 1` i `-n 1536`.
+
+| model | tryb | FORGE prefill | llama.cpp | | FORGE decode | llama.cpp | |
+|---|---|--:|--:|--:|--:|--:|--:|
+| NVFP4 | bez MTP | **931** | 695 | **1,34x** | **29,8** | 27,8 | **1,07x** |
+| NVFP4 | MTP K=3 | **847** | 685 | **1,24x** | 51,2 | **58,5** | 0,88x |
+| Q4_K_M | bez MTP | **964** | 766 | **1,26x** | **27,9** | 27,1 | **1,03x** |
+| Q4_K_M | MTP K=3 | **876** | 714 | **1,23x** | 44,9 | **45,9** | 0,98x |
+
+Prefill wygrywa w KAŻDEJ komórce, decode bez spekulacji w obu modelach; decode z
+MTP to remis na Q4_K i przegrana na NVFP4. Prefill jest nieco niższy przy
+włączonym MTP, bo dochodzi catch-up głowy MTP przez prompt.
+
+**Akceptacja zależy od PROMPTU, nie od kwantyzacji.** Na tym zadaniu NVFP4 daje
+1,83/krok a Q4_K 2,11 — dokładnie ODWROTNIE niż na streszczeniu (2,15 wobec
+1,73). Wcześniejsza teza z tego dokumentu, że 6-bitowa głowa `output.weight`
+Q4_K daje gorsze propozycje, NIE MA POPARCIA i zostaje wycofana.
+
+### Bezczynność GPU skaluje się z liczbą uruchomień kerneli
+
+Zmierzone na obu ścieżkach, kontekst 4672:
+
+| ścieżka | uruchomienia | zajęte | bezczynne | us/uruchomienie |
+|---|--:|--:|--:|--:|
+| decode bez MTP (na token) | 1600 | 31,5 ms | 6,13 ms (16%) | 3,8 |
+| krok weryfikacji T=4 | 1793 | 45,5 ms | ~9 ms | 5,0 |
+
+To jest stała naszego potoku: **każde uruchomienie kernela kosztuje ~4-5 us
+przestoju**, niezależnie od tego, ile pracy wykonuje. Rozkład na token pokazał, że
+około 1060 uruchomień wykonuje 1,8 ms pracy i kosztuje ~4 ms przestoju.
+
+Największa pozycja: **430 kopii `copyBuffer` na token** przy 0,48 ms realnej
+pracy. Profil wskazał je jako serie po ~8 na warstwę DeltaNet, a źródłem była
+replikacja GQA w `hybrid_delta_mixer`:
+
+```rust
+for r in 0..rep {                 // rep = n_v / n_k = 4
+    self.device.copy(&hb.q16, 0, &hb.q32, r * key_bytes, key_bytes, stream)?;
+    self.device.copy(&hb.k16, 0, &hb.k32, r * key_bytes, key_bytes, stream)?;
+}
+```
+
+Osiem kopii na warstwę razy 48 warstw = 384 uruchomienia na token, żeby
+przenieść 8 KiB. Zastąpił je jeden kernel `deltanet_repeat_qk_f16`. Dodatkowo
+cięcie wyjścia splotu na wycinki q/k robiły dwie kolejne kopie na warstwę tylko
+po to, żeby konsument dostał bufor od zera — `l2norm_heads_f16_at` czyta je przez
+przesunięcie bajtowe, bez nowego kernela Mojo (bufory `q16src`/`k16src` usunięte).
+
+Wynik, ta sama sekwencja, kontekst 4672:
+
+| | uruchomienia/token | `copyBuffer`/token | zegar/token | bezczynne |
+|---|--:|--:|--:|--:|
+| przed | 1600 | 430,2 | 37,66 ms | 6,13 ms |
+| **po** | **1269** | **52,2** | **36,92 ms** | **5,04 ms** |
+
+Minus 331 uruchomień i minus 1,09 ms przestoju na token; decode bez spekulacji
+29,1 -> 29,8 (NVFP4) i 27,4 -> 27,9 (Q4_K). Suma SHA bez zmian — kernel robi
+dokładnie tę samą kopię.
+
+**Ścieżka MTP na tym nie zyskała** i to jest spójne: weryfikacja T=4 nie używa
+miksera jednotokenowego, tylko `deltanet_prepare_f16`, który ma podział QKV oraz
+L2/repeat JUŻ SCALONE w jednym kernelu, i dzieli kwantyzację aktywacji przez
+`prepare_q8_1`. Dlatego miała 171 kopii na krok, nie 430 — czyli ta klasa błędu
+była tam naprawiona od początku.
+
 ## 3. Optymalizacja prefillu — co dało ile
 
 Kolejność wyznaczył PROFIL (`rocprofv3 --kernel-trace`), nie intuicja. Rozkład
