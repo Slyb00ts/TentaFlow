@@ -1285,6 +1285,10 @@
       "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_30c98f506bf2dcc3",
       "file": "gemv_q4_k_dp4a_f16_gidx.hsaco"
     },
+    "gemv_q4_k_dp4a_group4_f16": {
+      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_5a3638f212025056",
+      "file": "gemv_q4_k_dp4a_group4_f16.hsaco"
+    },
     "gemv_q4_k_dp4a_out_f32": {
       "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_a7de9900c90dfc6c",
       "file": "gemv_q4_k_dp4a_out_f32.hsaco"

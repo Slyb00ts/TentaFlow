@@ -23,6 +23,7 @@ const GEMV_WAVE_ROWS: usize = 8;
 const GEMV_NVFP4_GROUP4: &str = "gemv_nvfp4_gguf_q8_1_group4_f16";
 /// Złożone do czterech projekcji Q8_0 na wspólnej aktywacji.
 const GEMV_Q8_GROUP4: &str = "gemv_q8_0_dp4a_group4_f16";
+const GEMV_Q4K_GROUP4: &str = "gemv_q4_k_dp4a_group4_f16";
 const GEMV_NVFP4_WAVE_ROWS: u32 = 8;
 const FP8_MODULAR_BN256_SMEM: usize = 98_304;
 const FP8_MODULAR_BN256_TOKENS: usize = 1024;
@@ -12844,6 +12845,61 @@ impl Kernels {
         };
         self.device
             .launch(self.artifacts.get(GEMV_Q8_GROUP4)?, &cfg, &args, stream)?;
+        Ok(true)
+    }
+
+    /// Do czterech projekcji Q4_K na WSPÓLNEJ aktywacji, jednym uruchomieniem.
+    ///
+    /// `Q4_K_M` trzyma w tym formacie projekcje uwagi, wejściowe projekcje
+    /// DeltaNet oraz `gate`/`up` FFN — wszystkie czytają ten sam znormalizowany
+    /// `x`. Osobno każda ma za wąską siatkę, żeby wypełnić kartę; złożone razem
+    /// dają siatkę o sumie wierszy. `false` znaczy „nie ma tej ścieżki, licz
+    /// projekcje osobno".
+    pub fn gemv_q4_k_dp4a_group_f16(
+        &self,
+        projections: &[(&DevBuffer, &DevBuffer, usize)],
+        x: &DevBuffer,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        if !(2..=4).contains(&projections.len()) || !self.artifacts.has(GEMV_Q4K_GROUP4) {
+            return Ok(false);
+        }
+        Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_group")?;
+        let mut grid_x = 0u32;
+        for &(_, _, rows) in projections {
+            grid_x = grid_x
+                .checked_add(u32::try_from(rows.div_ceil(8)).map_err(|_| {
+                    ForgeError::Kernel("gemv Q4_K group: siatka przekracza u32".into())
+                })?)
+                .ok_or_else(|| {
+                    ForgeError::Kernel("gemv Q4_K group: siatka przekracza u32".into())
+                })?;
+        }
+        let mut args = LaunchArgs::new();
+        for slot in 0..4 {
+            match projections.get(slot) {
+                Some(&(y, w, rows)) => {
+                    args = args.buf(y).buf(w).scalar(rows as i64);
+                }
+                // Nieużyty slot: zero wierszy nie tworzy bloku, więc wskaźniki
+                // nie są dotykane.
+                None => {
+                    args = args
+                        .buf(projections[0].0)
+                        .buf(projections[0].1)
+                        .scalar(0i64);
+                }
+            }
+        }
+        let args = args.buf(x).scalar(cols as i64);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.device
+            .launch(self.artifacts.get(GEMV_Q4K_GROUP4)?, &cfg, &args, stream)?;
         Ok(true)
     }
 

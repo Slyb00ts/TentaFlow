@@ -3961,6 +3961,40 @@ impl Model {
             .gemv_q8_0_dp4a_group_f16(&group, x, cols, stream)
     }
 
+    /// To samo dla Q4_K: `Q4_K_M` trzyma w tym formacie projekcje uwagi,
+    /// wejściowe projekcje DeltaNet oraz `gate`/`up` FFN.
+    fn gemv_q4_k_group(
+        &self,
+        projections: &[(&DevBuffer, &DevWeight)],
+        x: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let mut cols = None;
+        let mut group = Vec::with_capacity(projections.len());
+        for &(output, weight) in projections {
+            let DevWeight::Q4K {
+                buf,
+                rows,
+                cols: weight_cols,
+            } = weight
+            else {
+                return Ok(false);
+            };
+            if cols.is_some_and(|value| value != *weight_cols) {
+                return Ok(false);
+            }
+            cols = Some(*weight_cols);
+            group.push((output, buf, *rows));
+        }
+        let Some(cols) = cols else {
+            return Ok(false);
+        };
+        if cols > Kernels::DP4A_MAX_COLS {
+            return Ok(false);
+        }
+        self.kernels.gemv_q4_k_dp4a_group_f16(&group, x, cols, stream)
+    }
+
     fn gemv_nvfp4_gguf_group(
         &self,
         projections: &[(&DevBuffer, &DevWeight)],
@@ -5100,7 +5134,9 @@ impl Model {
                 if n_tokens == 1 {
                     // Obie projekcje czytają TĘ SAMĄ znormalizowaną aktywację,
                     // więc idą jednym uruchomieniem ze wspólną kwantyzacją.
-                    if !self.gemv_nvfp4_gguf_group(&[(bufs.gate, gate), (bufs.up, up)], bufs.x, stream)?
+                    let pair = [(bufs.gate, gate), (bufs.up, up)];
+                    if !self.gemv_nvfp4_gguf_group(&pair, bufs.x, stream)?
+                        && !self.gemv_q4_k_group(&pair, bufs.x, stream)?
                     {
                         self.gemv(bufs.gate, gate, bufs.x, stream)?;
                         self.gemv(bufs.up, up, bufs.x, stream)?;
@@ -16000,8 +16036,9 @@ impl Model {
         };
         // Gated Q projection [2*q_dim], then de-interleave per head: q at
         // h*2*head_dim, gate at h*2*head_dim + head_dim.
-        let qkv_grouped =
-            self.gemv_nvfp4_gguf_group(&[(&hb.q_full, wq), (&b.k, wk), (&b.v, wv)], &b.x, stream)?;
+        let triple = [(&hb.q_full, wq), (&b.k, wk), (&b.v, wv)];
+        let qkv_grouped = self.gemv_nvfp4_gguf_group(&triple, &b.x, stream)?
+            || self.gemv_q4_k_group(&triple, &b.x, stream)?;
         if !qkv_grouped {
             self.gemv(&hb.q_full, wq, &b.x, stream)?;
             self.gemv(&b.k, wk, &b.x, stream)?;
@@ -16152,6 +16189,13 @@ impl Model {
                         break;
                     }
                 }
+            }
+            // Wszystkie cztery w Q4_K: jedna grupa, jedno uruchomienie.
+            if nvfp4.is_empty()
+                && q8.is_empty()
+                && self.gemv_q4_k_group(&projections, x, &self.stream)?
+            {
+                return Ok(());
             }
             if nvfp4.len() + q8.len() == projections.len() {
                 for (subset, is_nvfp4) in [(&nvfp4, true), (&q8, false)] {
