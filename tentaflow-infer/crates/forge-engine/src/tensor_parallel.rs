@@ -991,6 +991,22 @@ pub struct TpDecode {
     /// Bramka `z` DeltaNet przeniesiona w CAŁOŚCI na kartę wspierającą, jeden
     /// wpis na warstwę (`None` dla warstw, które nie są DeltaNetem).
     delta_proj: Vec<Option<DeltaProjShards>>,
+    /// Bufory podziału FFN dla KILKU tokenów naraz. Weryfikacja draftu MTP
+    /// przepuszcza przez warstwę cały draft (T=3..4) i jest tak samo ograniczona
+    /// odczytem wag jak pojedynczy token, więc podział działa tam tak samo.
+    batch: Vec<Option<BatchWorkspace>>,
+    batch_acc: Option<DevBuffer>,
+    batch_staging: Option<DevBuffer>,
+    batch_max_tokens: usize,
+}
+
+struct BatchWorkspace {
+    /// Karta modelu liczy wprost z bufora silnika, więc nie ma własnego wejścia.
+    x: Option<DevBuffer>,
+    gate: DevBuffer,
+    up: DevBuffer,
+    mid: DevBuffer,
+    partial: DevBuffer,
 }
 
 /// Dwie duże projekcje wejściowe jednej warstwy DeltaNet, podzielone po
@@ -1079,6 +1095,10 @@ impl TpDecode {
             hidden,
             lm_head: None,
             delta_proj: Vec::new(),
+            batch: Vec::new(),
+            batch_acc: None,
+            batch_staging: None,
+            batch_max_tokens: 0,
         })
     }
 
@@ -1126,6 +1146,199 @@ impl TpDecode {
             cols: hidden,
         });
         Ok(())
+    }
+
+    /// Wymiarowuje bufory podziału FFN dla `max_tokens` tokenów naraz.
+    pub fn attach_batch(&mut self, max_tokens: usize, hidden: usize) -> Result<()> {
+        if max_tokens == 0 {
+            return Err(ForgeError::Scheduler("podział batcha bez tokenów".into()));
+        }
+        let mut batch = Vec::with_capacity(self.cluster.len());
+        for index in 0..self.cluster.len() {
+            let rows = self
+                .layers
+                .iter()
+                .map(|l| l.rows_on(index))
+                .max()
+                .unwrap_or(0);
+            if rows == 0 {
+                batch.push(None);
+                continue;
+            }
+            let entry = self.cluster.device(index)?;
+            let mk = |bytes: usize| entry.device.alloc(bytes, MemKind::Device, Pool::Activations);
+            batch.push(Some(BatchWorkspace {
+                x: if index == 0 {
+                    None
+                } else {
+                    Some(mk(max_tokens * hidden * 2)?)
+                },
+                gate: mk(max_tokens * rows * 2)?,
+                up: mk(max_tokens * rows * 2)?,
+                mid: mk(max_tokens * rows * 2)?,
+                partial: mk(max_tokens * hidden * 4)?,
+            }));
+        }
+        let primary = self.cluster.device(0)?;
+        self.batch_acc = Some(primary.device.alloc(
+            max_tokens * hidden * 4,
+            MemKind::Device,
+            Pool::Activations,
+        )?);
+        self.batch_staging = Some(primary.device.alloc(
+            max_tokens * hidden * 4,
+            MemKind::Device,
+            Pool::Activations,
+        )?);
+        self.batch = batch;
+        self.batch_max_tokens = max_tokens;
+        Ok(())
+    }
+
+    /// `y = down · act(gate·x, up·x)` dla `tokens` tokenów naraz.
+    ///
+    /// Ta sama geometria co przy jednym tokenie — `gate`/`up` po wierszach,
+    /// `down` po kolumnach — tylko kernelami macierzowymi. `false` znaczy „ten
+    /// kształt nie ma obsługi, licz sam".
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch(
+        &self,
+        model_stream: &forge_hal::Stream,
+        layer: usize,
+        tokens: usize,
+        hidden: usize,
+        activation: forge_formats::FfnActivation,
+        x: &DevBuffer,
+        y: &DevBuffer,
+    ) -> Result<bool> {
+        // Kernele sum cząstkowych f32 istnieją dla wybranych szerokości; inne
+        // zostają na ścieżce jednokartowej zamiast liczyć czymś innym niż zwykle.
+        if tokens > self.batch_max_tokens
+            || self.batch.is_empty()
+            || !matches!(tokens, 2 | 4 | 8 | 16)
+        {
+            return Ok(false);
+        }
+        let Some(shards) = self.layers.get(layer) else {
+            return Ok(false);
+        };
+        if shards.gate_format.quant != QuantKind::NVFP4Gguf
+            || shards.down.format.quant != QuantKind::NVFP4Gguf
+        {
+            return Ok(false);
+        }
+        for index in 1..self.cluster.len() {
+            if shards.rows_on(index) == 0 {
+                continue;
+            }
+            let Some(Some(ws)) = self.batch.get(index) else {
+                return Ok(false);
+            };
+            let destination = ws.x.as_ref().expect("karta wspierająca ma bufor wejścia");
+            self.cluster.exchange_on(
+                0,
+                model_stream,
+                x,
+                0,
+                index,
+                destination,
+                0,
+                tokens * hidden * 2,
+            )?;
+            self.cluster
+                .order(0, model_stream, index, &self.cluster.device(index)?.stream)?;
+        }
+        for index in 0..self.cluster.len() {
+            let rows = shards.rows_on(index);
+            if rows == 0 {
+                continue;
+            }
+            let entry = self.cluster.device(index)?;
+            let Some(Some(ws)) = self.batch.get(index) else {
+                return Ok(false);
+            };
+            let (stream, input) = if index == 0 {
+                (model_stream, x)
+            } else {
+                (&entry.stream, ws.x.as_ref().expect("bufor wejścia"))
+            };
+            for (out, shard, format) in [
+                (&ws.gate, &shards.gate[index], shards.gate_format),
+                (&ws.up, &shards.up[index], shards.up_format),
+            ] {
+                entry.kernels.gemm_nvfp4_gguf_layout_f16(
+                    out,
+                    shard,
+                    input,
+                    rows,
+                    hidden,
+                    tokens,
+                    format.output_scale,
+                    forge_kernels::Nvfp4GgufLayout::RowMajor36,
+                    stream,
+                )?;
+            }
+            entry
+                .kernels
+                .glu_mul_f16(activation, &ws.mid, &ws.gate, &ws.up, tokens * rows, stream)?;
+            entry.kernels.gemm_nvfp4_gguf_out_f32_batch(
+                &ws.partial,
+                shards.down.shard(index)?,
+                &ws.mid,
+                hidden,
+                rows,
+                tokens,
+                shards.down.format.output_scale,
+                stream,
+            )?;
+        }
+        let primary = self.cluster.device(0)?;
+        let acc = self.batch_acc.as_ref().expect("bufor sumy");
+        let staging = self.batch_staging.as_ref().expect("bufor wymiany");
+        let contributors: Vec<usize> = (0..self.cluster.len())
+            .filter(|&i| shards.rows_on(i) > 0)
+            .collect();
+        let Some((&last, rest)) = contributors.split_last() else {
+            return Ok(false);
+        };
+        let bytes = tokens * hidden * 4;
+        let mut accumulated = 0usize;
+        for &index in rest {
+            let part = &self.batch[index].as_ref().expect("bufor").partial;
+            let target = if accumulated == 0 { acc } else { staging };
+            if index == 0 {
+                primary.device.copy(part, 0, target, 0, bytes, model_stream)?;
+            } else {
+                self.cluster.exchange(index, part, 0, 0, target, 0, bytes)?;
+                self.cluster
+                    .order(index, &self.cluster.device(index)?.stream, 0, model_stream)?;
+            }
+            if accumulated > 0 {
+                primary
+                    .kernels
+                    .add_f32(acc, acc, staging, tokens * hidden, model_stream)?;
+            }
+            accumulated += 1;
+        }
+        let tail = if last == 0 {
+            &self.batch[0].as_ref().expect("bufor").partial
+        } else {
+            let part = &self.batch[last].as_ref().expect("bufor").partial;
+            self.cluster.exchange(last, part, 0, 0, staging, 0, bytes)?;
+            self.cluster
+                .order(last, &self.cluster.device(last)?.stream, 0, model_stream)?;
+            staging
+        };
+        if accumulated == 0 {
+            primary
+                .kernels
+                .cast_f32_f16(y, tail, tokens * hidden, model_stream)?;
+        } else {
+            primary
+                .kernels
+                .add_f32_out_f16(y, acc, tail, tokens * hidden, model_stream)?;
+        }
+        Ok(true)
     }
 
     /// Odświeża wolne miejsce w profilach kart po już wykonanych podziałach.

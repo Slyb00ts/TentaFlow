@@ -5036,12 +5036,36 @@ impl Model {
     /// każde miejsce z osobna i mogła cicho ominąć te, o których się zapomniało.
     fn ffn_dense_block(
         &self,
+        layer: usize,
         ffn: &crate::weights::DenseFfn,
         bufs: FfnBlockBufs<'_>,
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
+        let hidden = self.weights.descriptor.params.hidden_size;
         let inter = self.weights.descriptor.params.intermediate_size;
+        // Podział na karty wpina się TUTAJ — w jedynym miejscu, w którym ten blok
+        // jest liczony. Dzięki temu obejmuje każdą ścieżkę hybrydy naraz i żadna
+        // nie może go cicho ominąć.
+        if let Some(tp) = &self.tp_ffn {
+            let split = if n_tokens == 1 {
+                tp.forward(stream, layer, bufs.x, bufs.out, self.ffn_act())?;
+                true
+            } else {
+                tp.forward_batch(
+                    stream,
+                    layer,
+                    n_tokens,
+                    hidden,
+                    self.ffn_act(),
+                    bufs.x,
+                    bufs.out,
+                )?
+            };
+            if split {
+                return Ok(());
+            }
+        }
         match &ffn.gate_up {
             GateUpWeights::Fused(weight) => match (n_tokens, bufs.gate_up) {
                 // Jeden token ze scalonym `gate_up`: pojedyncza projekcja do
@@ -8041,6 +8065,9 @@ impl Model {
                 tp.attach_lm_head(&caps, &data, vocab, cols, quant)?;
             }
         }
+        // Weryfikacja draftu MTP przepuszcza przez warstwę cały draft naraz;
+        // kernele sum cząstkowych f32 obsługują do 16 tokenów.
+        tp.attach_batch(16, hidden)?;
         self.tp_ffn = Some(tp);
         // Krok dekodowania przestaje być jednokartowy, więc przechwycone grafy
         // przestają go opisywać — dotyczy to obu ścieżek, gęstej i hybrydowej.
@@ -11591,6 +11618,7 @@ impl Model {
                 ));
             };
             self.ffn_dense_block(
+                layer_index,
                 ffn,
                 FfnBlockBufs {
                     x: &pb.x,
@@ -12184,6 +12212,7 @@ impl Model {
                     return Err(ForgeError::Unsupported("MTP B2 nie obsługuje MoE".into()));
                 };
                 self.ffn_dense_block(
+                    layer_index,
                     ffn,
                     FfnBlockBufs {
                         x: &pb.x,
@@ -15463,6 +15492,7 @@ impl Model {
                     unreachable!("capability odrzuca MoE")
                 };
                 self.ffn_dense_block(
+                    layer_index,
                     ffn,
                     FfnBlockBufs {
                         x: &b2.x,
@@ -15896,12 +15926,10 @@ impl Model {
                 eps,
                 stream,
             )?;
-            match (&layer.ffn, &self.tp_ffn) {
-                (LayerFfn::Dense(_), Some(tp)) => {
-                    tp.forward(stream, l, &b.x, &b.down, self.ffn_act())?
-                }
-                (LayerFfn::Moe(moe), _) => self.moe_decode_ffn(moe, l, hidden, stream)?,
-                (LayerFfn::Dense(ffn), None) => self.ffn_dense_block(
+            match &layer.ffn {
+                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream)?,
+                LayerFfn::Dense(ffn) => self.ffn_dense_block(
+                    l,
                     ffn,
                     FfnBlockBufs {
                         x: &b.x,
@@ -17064,6 +17092,7 @@ impl Model {
                     ));
                 };
                 self.ffn_dense_block(
+                    layer_index,
                     ffn,
                     FfnBlockBufs {
                         x: &arena.x,
