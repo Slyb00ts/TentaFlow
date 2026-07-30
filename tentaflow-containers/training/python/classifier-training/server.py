@@ -99,6 +99,9 @@ class JobState:
     train_loss: Optional[float] = None
     val_acc: Optional[float] = None
     val_macro_f1: Optional[float] = None
+    # F1 per klasa z ostatniej walidacji (`{nazwa: f1}`) — macro samo nie mówi,
+    # która klasa ciągnie wynik w dół.
+    val_f1_per_class: Optional[dict[str, float]] = None
     error: Optional[str] = None
     artifact_path: Optional[str] = None
     # Etap joba do podglądu na żywo (przygotowanie → budowa cropów → trening → ewaluacja → eksport).
@@ -121,6 +124,7 @@ class JobState:
             "train_loss": self.train_loss,
             "val_acc": self.val_acc,
             "val_macro_f1": self.val_macro_f1,
+            "val_f1_per_class": self.val_f1_per_class,
             "error": self.error,
             "artifact_path": self.artifact_path,
             "gpu_mem_mb": _gpu_mem_mb(),
@@ -503,8 +507,11 @@ def _build_transforms(image_size: int):  # noqa: ANN201
     return train_tf, val_tf
 
 
-def _macro_f1(confusion: list[list[int]], num_classes: int) -> tuple[float, float]:
-    """Liczy accuracy i macro-F1 z macierzy pomyłek [true][pred]."""
+def _macro_f1(confusion: list[list[int]], num_classes: int) -> tuple[float, float, list[float]]:
+    """Liczy accuracy, macro-F1 i F1 PER KLASA z macierzy pomyłek [true][pred].
+    Per-klasowe F1 wychodzi na zewnątrz, bo samo macro nie mówi, KTÓRA klasa
+    zawodzi — a przy silnie niezbalansowanym zbiorze to jedyna informacja, która
+    kieruje następnym krokiem (dosypać zdjęć konkretnego stanu)."""
     total = sum(sum(r) for r in confusion)
     correct = sum(confusion[i][i] for i in range(num_classes))
     acc = correct / total if total else 0.0
@@ -518,7 +525,7 @@ def _macro_f1(confusion: list[list[int]], num_classes: int) -> tuple[float, floa
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
         f1s.append(f1)
     macro_f1 = sum(f1s) / num_classes if num_classes else 0.0
-    return acc, macro_f1
+    return acc, macro_f1, f1s
 
 
 def _train_worker(req: TrainRequest, job_id: str) -> None:
@@ -580,6 +587,12 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
         criterion = nn.CrossEntropyLoss(weight=weights)
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=hp.learning_rate, weight_decay=1e-4)
+        # Wygaszanie LR cosinusem przez cały przebieg. Bez niego (stałe LR) model
+        # dobijał do minimum i przez resztę epok wokół niego skakał: na produkcji
+        # macro-F1 oscylowało w paśmie ~0.72-0.90 do samego końca, więc wartość z
+        # OSTATNIEJ epoki była loterią, a nie wynikiem. Malejące LR pozwala się w
+        # tym minimum ustatkować. `T_max` = liczba epok, krok raz na epokę.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=hp.epochs)
 
         pin = device.type == "cuda"
         # Wycinki leżą na dysku jako JPEG, więc każdy batch wymaga dekodowania na
@@ -637,7 +650,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
                         preds = model(imgs).argmax(dim=1)
                         for t, p in zip(targets.tolist(), preds.tolist()):
                             confusion[t][p] += 1
-            val_acc, val_macro_f1 = _macro_f1(confusion, num_classes)
+            val_acc, val_macro_f1, per_class_f1 = _macro_f1(confusion, num_classes)
 
             with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([
@@ -646,7 +659,10 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             _update(
                 job_id, epoch=epoch, train_loss=train_loss,
                 val_acc=val_acc, val_macro_f1=val_macro_f1,
+                val_f1_per_class=dict(zip(req.values, per_class_f1)),
             )
+
+            scheduler.step()
 
             if val_macro_f1 >= best_f1:
                 best_f1 = val_macro_f1
@@ -663,6 +679,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
                             "epoch": epoch,
                             "val_macro_f1": val_macro_f1,
                             "val_acc": val_acc,
+                            "val_f1_per_class": dict(zip(req.values, per_class_f1)),
                         },
                         f,
                         ensure_ascii=False,
