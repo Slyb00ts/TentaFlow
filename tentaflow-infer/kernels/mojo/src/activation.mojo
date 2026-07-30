@@ -123,3 +123,22 @@ def cast_f32_f16(
     i = Int(global_idx.x)
     if i < n:
         out_ptr[i] = Float16(src[i])
+
+
+def add_f32_out_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    a: UnsafePointer[Float32, MutAnyOrigin],
+    b: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """out = f16(a + b) nad n elementami.
+
+    Ogon podziału kolumnowego na dwie karty: suma cząstkowa karty zbierającej
+    plus przysłana suma drugiej karty, od razu zawężona do f16 strumienia
+    rezydualnego. Osobne dodawanie i osobne zawężenie to były dwa uruchomienia na
+    warstwę, czyli 130 na token — przy zmierzonym narzucie rzędu 4,5 us na
+    uruchomienie to więcej niż cała wymiana aktywacji między kartami.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        out_ptr[i] = Float16(a[i] + b[i])

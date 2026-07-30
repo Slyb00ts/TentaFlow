@@ -13,6 +13,10 @@
       "entry": "src_onnx_ops_add_f32_Pointer6A6A6A6AoA6A6A_255674d20f814f4e",
       "file": "add_f32.hsaco"
     },
+    "add_f32_out_f16": {
+      "entry": "src_activation_add_f32_out_f166A6A6A6A_bd2ea6907d8641bb",
+      "file": "add_f32_out_f16.hsaco"
+    },
     "argmax_batched_f32": {
       "entry": "src_sampling_argmax_batched_f36A6A6A6A_6235ea989779b294",
       "file": "argmax_batched_f32.hsaco"

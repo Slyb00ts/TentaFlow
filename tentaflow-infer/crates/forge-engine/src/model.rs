@@ -176,6 +176,16 @@ fn hybrid_layer_major_prefill_requested() -> bool {
     std::env::var("FORGE_HYBRID_LAYER_MAJOR_PREFILL").map_or(true, |value| value != "0")
 }
 
+/// `FORGE_HYBRID_DECODE_GRAPH=0` wykonuje krok hybrydowy jawnym łańcuchem
+/// zamiast odtwarzania grafu.
+///
+/// Podział FFN na karty i tak nie może użyć grafu (ROCm przerywa asercją przy
+/// przechwytywaniu rozwidlenia między kartami), więc bez tego przełącznika nie da
+/// się oddzielić zysku z drugiej karty od kosztu utraconego odtwarzania.
+fn hybrid_decode_graph_requested() -> bool {
+    std::env::var("FORGE_HYBRID_DECODE_GRAPH").map_or(true, |value| value != "0")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HybridLayerMajorAttention {
     Exact,
@@ -7992,7 +8002,7 @@ impl Model {
             // Krok obejmujący dwie karty idzie jawnym łańcuchem: przechwycenie
             // rozwidlenia strumienia między kartami ROCm przerywa asercją we
             // własnym runtime (patrz `run_step`).
-            if self.tp_ffn.is_some() {
+            if self.tp_ffn.is_some() || !hybrid_decode_graph_requested() {
                 return self.hybrid_forward_staged(true, AttnSrc::Paged);
             }
             if self.decode_hybrid_graph.is_none() {

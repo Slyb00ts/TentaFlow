@@ -8,7 +8,7 @@
 // przypada JEDNA wymiana, a nie dwie.
 use forge_engine::cluster::Cluster;
 use forge_engine::multi_gpu::{DeviceCapability, WorkKind};
-use forge_engine::tensor_parallel::{BlockFormat, gemv_column_split, upload_column_split};
+use forge_engine::tensor_parallel::{gemv_column_split, upload_column_split, BlockFormat};
 use forge_hal::{Pool, PoolSizes};
 use forge_types::{MemKind, QuantKind};
 use std::time::Instant;
@@ -68,9 +68,7 @@ fn main() {
 
     // Wejscie: wymiar POSREDNI, bo to on jest podzielony.
     let x: Vec<u8> = (0..COLS)
-        .flat_map(|i| {
-            f16_bytes(((i % 13) as f32 - 6.0) * 0.05)
-        })
+        .flat_map(|i| f16_bytes(((i % 13) as f32 - 6.0) * 0.05))
         .collect();
 
     // Odniesienie: cala macierz na karcie 0.
@@ -110,7 +108,7 @@ fn main() {
         WorkKind::MemoryBound,
         BlockFormat::of(QuantKind::Q8_0, 1.0).expect("format"),
     )
-        .expect("podzial kolumnowy");
+    .expect("podzial kolumnowy");
     for index in 0..cluster.len() {
         println!(
             "  dev{index}: kolumny {}..{}",
@@ -153,17 +151,19 @@ fn main() {
         .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
         .expect("bufor redukcji");
 
+    let x_refs: Vec<&forge_hal::DevBuffer> = x_parts.iter().collect();
     gemv_column_split(
         &cluster,
         &shards,
-        &x_parts,
+        &x_refs,
         &y_parts,
         &y_full,
+        None,
         &staging,
         0,
         &dev0.stream,
     )
-        .expect("gemv kolumnowy");
+    .expect("gemv kolumnowy");
     cluster.synchronize().expect("sync klastra");
     let mut split = vec![0u8; ROWS * 4];
     dev0.device
@@ -204,16 +204,17 @@ fn main() {
     for _ in 0..20 {
         let t0 = Instant::now();
         gemv_column_split(
-        &cluster,
-        &shards,
-        &x_parts,
-        &y_parts,
-        &y_full,
-        &staging,
-        0,
-        &dev0.stream,
-    )
-            .expect("gemv kolumnowy");
+            &cluster,
+            &shards,
+            &x_refs,
+            &y_parts,
+            &y_full,
+            None,
+            &staging,
+            0,
+            &dev0.stream,
+        )
+        .expect("gemv kolumnowy");
         cluster.synchronize().expect("sync");
         split_time = split_time.min(t0.elapsed().as_secs_f64());
 

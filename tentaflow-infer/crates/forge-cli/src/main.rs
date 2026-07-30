@@ -11,6 +11,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_engine::kv::KvQuant;
+use forge_engine::model::Fp8PackOutcome;
 use forge_engine::model::{ModelConfig, Nvfp4GgufLayout, MAX_SPEC_DRAFT};
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{
@@ -20,9 +21,8 @@ use forge_engine::speculation::{ProposerKind, SpeculationKind};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::weights::NvFp4CtLayoutPolicy;
 use forge_formats::PoolingType;
-use forge_hal::{gpu, PoolSizes};
 use forge_hal::Device;
-use forge_engine::model::Fp8PackOutcome;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{
     kv_pool_bytes, load_model, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
 };
@@ -800,12 +800,14 @@ fn enable_tp_ffn_with(
     } else {
         let mut free = usize::MAX;
         for card in cards {
-            free = free.min(forge_hal::gpu::free_vram(card.ordinal).with_context(|| {
-                format!("odczyt wolnego VRAM karty {}", card.ordinal)
-            })?);
+            free = free.min(
+                forge_hal::gpu::free_vram(card.ordinal)
+                    .with_context(|| format!("odczyt wolnego VRAM karty {}", card.ordinal))?,
+            );
         }
         free / 10 * 8
     };
+    eprintln!("pula wag kart wspierających: {} MiB", weights >> 20);
     let pools = forge_hal::PoolSizes {
         weights,
         kv_cache: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
@@ -815,9 +817,10 @@ fn enable_tp_ffn_with(
     model.enable_tp_ffn(model_path, cards, pools, None, forced)?;
     let tp = model.tp_ffn().expect("podział właśnie włączony");
     eprintln!(
-        "podział FFN na {} kart (P2P {}): {:?} wierszy pośrednich warstwy 0",
+        "podział FFN na {} kart (P2P {}, pula wag kart wspierających {} MiB): {:?} wierszy pośrednich warstwy 0",
         tp.cards(),
         tp.peer_access(),
+        weights >> 20,
         tp.split_of(0)
     );
     Ok(())
@@ -834,7 +837,9 @@ fn parse_tp_split(spec: Option<&str>) -> Result<Option<Vec<usize>>> {
         );
     }
     if out.len() < 2 {
-        return Err(anyhow::anyhow!("--tp-split wymaga udziału dla każdej karty"));
+        return Err(anyhow::anyhow!(
+            "--tp-split wymaga udziału dla każdej karty"
+        ));
     }
     Ok(Some(out))
 }
@@ -1384,8 +1389,8 @@ fn load_auto(
         dev,
         path,
         ModelConfig {
-        weight_host_budget,
-        weight_spill_dir,
+            weight_host_budget,
+            weight_spill_dir,
             kv_quant,
             kv_tier,
             kv_page_size: page_size,
@@ -1904,9 +1909,8 @@ fn cmd_run(
     // `forge run <model> "<prompt>"` losowałby przy temperaturze 0,7 i podawał
     // surowy prompt modelowi instrukcyjnemu — jedno i drugie wygląda jak awaria
     // modelu, a jest tylko złym ustawieniem domyślnym.
-    let profile = forge_engine::model_profile::resolve(
-        &forge_engine::model_profile::identify(model_path),
-    );
+    let profile =
+        forge_engine::model_profile::resolve(&forge_engine::model_profile::identify(model_path));
     let temperature = temperature.unwrap_or(profile.temperature);
     // `--ctx 0` znaczy „pełne okno modelu"; profil podaje wartość tam, gdzie
     // pełne okno jest niepraktyczne (Gemma 4 żąda wtedy ponad 100 GB VRAM).
@@ -1950,7 +1954,13 @@ fn cmd_run(
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true, None)?;
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        true,
+        None,
+    )?;
 
     let prompt_text = if chat {
         ChatTemplateEngine::new()
@@ -2062,7 +2072,13 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         Nvfp4GgufLayout::RowMajor36,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, false, None)?;
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        false,
+        None,
+    )?;
 
     let tokens = loaded
         .bundle
@@ -2280,7 +2296,13 @@ fn cmd_bench(
         weights_pool_gb,
         tp_split.as_deref(),
     )?;
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer, true, None)?;
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        true,
+        None,
+    )?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
     let (prompt_ids, prompt_sha256, prompt_source) = if let Some(path) = prompt_token_ids {
@@ -2483,9 +2505,9 @@ mod speculation_cli_tests {
     };
     use forge_engine::kv::KvQuant;
     use forge_engine::model::Nvfp4GgufLayout;
-    use forge_engine::weights::NvFp4CtLayoutPolicy;
     use forge_engine::speculation::{ProposerKind, SpeculationKind};
     use forge_engine::tier::{KvTierConfig, KvTierMode};
+    use forge_engine::weights::NvFp4CtLayoutPolicy;
     use forge_formats::{HfConfig, LayerKind, ModelDescriptor};
 
     fn qwen_hybrid_descriptor() -> ModelDescriptor {

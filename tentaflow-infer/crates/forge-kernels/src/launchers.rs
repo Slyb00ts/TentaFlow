@@ -2298,6 +2298,31 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `out = f16(a + b)` — ogon redukcji podziału kolumnowego na dwie karty.
+    pub fn add_f32_out_f16(
+        &self,
+        out: &DevBuffer,
+        a: &DevBuffer,
+        b: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n == 0 {
+            return Err(ForgeError::Kernel("add_f32_out_f16 wymaga n > 0".into()));
+        }
+        let f32_bytes = checked_buffer_bytes("add_f32_out_f16 wejście", &[n], 4)?;
+        let f16_bytes = checked_buffer_bytes("add_f32_out_f16 wyjście", &[n], 2)?;
+        if out.len() < f16_bytes || a.len() < f32_bytes || b.len() < f32_bytes {
+            return Err(ForgeError::Kernel(
+                "add_f32_out_f16: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let k = self.artifacts.get("add_f32_out_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(a).buf(b).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// logits = cap * tanh(logits / cap) w miejscu (ograniczenie logitów Gemmy).
     /// `offset` liczony w elementach f32 — głowa batcha zapisuje kolejne lane'y
     /// do jednego bufora.
@@ -2704,8 +2729,7 @@ impl Kernels {
         // splot o oknie `d_conv - 1`, którego wejście już leży w pamięci, więc
         // podział niczego nie łamie. Zmierzone na R9700 (kształt 27B, T=1024):
         // 3036 us wobec 346 us, czyli 8,8x, wynik bitowo identyczny.
-        let tokens_variant = n_steps > 4
-            && self.artifacts.has("deltanet_prepare_tokens_f16_t32");
+        let tokens_variant = n_steps > 4 && self.artifacts.has("deltanet_prepare_tokens_f16_t32");
         let kernel_name = match n_steps {
             2 => "deltanet_prepare_t2_f16",
             3 => "deltanet_prepare_t3_f16",
@@ -5024,9 +5048,7 @@ impl Kernels {
         } else {
             rows.div_ceil(GEMV_WAVE_ROWS)
         })
-        .map_err(|_| {
-            ForgeError::Kernel("gemv_nvfp4_gguf_out_f32: siatka przekracza u32".into())
-        })?;
+        .map_err(|_| ForgeError::Kernel("gemv_nvfp4_gguf_out_f32: siatka przekracza u32".into()))?;
         let kernel = self.artifacts.get(name)?;
         let config = LaunchConfig {
             grid: (grid_x, 1, 1),
@@ -5291,8 +5313,7 @@ impl Kernels {
             && self.artifacts.has("gemv_nvfp4_gguf_q8_1_out_f32")
             && self.artifacts.has("quantize_act_q8_1"))
         {
-            return self
-                .gemv_nvfp4_gguf_out_f32(y, weights, x, rows, cols, output_scale, stream);
+            return self.gemv_nvfp4_gguf_out_f32(y, weights, x, rows, cols, output_scale, stream);
         }
         let need_codes = cols;
         let need_blocks = cols / 32;
@@ -8623,7 +8644,9 @@ impl Kernels {
         }
         .filter(|name| self.artifacts.has(name));
         if kv_dtype == DType::F16 && window == 0 && wmma_variant.is_some() {
-            let k = self.artifacts.get(wmma_variant.expect("wariant sprawdzony"))?;
+            let k = self
+                .artifacts
+                .get(wmma_variant.expect("wariant sprawdzony"))?;
             let cfg = LaunchConfig {
                 grid: ((n_tokens as u32).div_ceil(64), n_q_heads as u32, 1),
                 block: (128, 1, 1),

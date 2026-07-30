@@ -10,7 +10,9 @@
 // jednej karcie, dopiero potem czas. Ksztalty jak w FFN Bielika 7B.
 use forge_engine::cluster::Cluster;
 use forge_engine::multi_gpu::{DeviceCapability, WorkKind};
-use forge_engine::tensor_parallel::{BlockFormat, FfnWorkspace, ffn_forward_split, upload_ffn_split};
+use forge_engine::tensor_parallel::{
+    ffn_forward_split, upload_ffn_split, BlockFormat, FfnWorkspace,
+};
 use forge_hal::{Pool, PoolSizes};
 use forge_types::{MemKind, QuantKind};
 use std::time::Instant;
@@ -160,7 +162,7 @@ fn main() {
         };
         let xc = mk(x.len());
         entry.device.write(&x, &xc, 0).unwrap();
-        ws.x.push(xc);
+        ws.x.push(if index == 0 { None } else { Some(xc) });
         ws.gate.push(mk(rows * 2));
         ws.up.push(mk(rows * 2));
         ws.mid.push(mk(rows * 2));
@@ -174,7 +176,9 @@ fn main() {
             &cluster,
             &shards,
             &ws,
+            &x_all,
             &y_full,
+            None,
             &staging,
             HIDDEN,
             act,
@@ -209,7 +213,15 @@ fn main() {
     let split_with_broadcast = || {
         for index in 1..cluster.len() {
             cluster
-                .exchange(0, &ws.x[0], 0, index, &ws.x[index], 0, HIDDEN * 2)
+                .exchange(
+                    0,
+                    &x_all,
+                    0,
+                    index,
+                    ws.x[index].as_ref().unwrap(),
+                    0,
+                    HIDDEN * 2,
+                )
                 .unwrap();
             cluster.wait_for(index, 0).unwrap();
         }
@@ -262,7 +274,7 @@ fn main() {
     for _ in 0..50 {
         let t = Instant::now();
         cluster
-            .exchange(0, &ws.x[0], 0, 1, &ws.x[1], 0, HIDDEN * 2)
+            .exchange(0, &x_all, 0, 1, ws.x[1].as_ref().unwrap(), 0, HIDDEN * 2)
             .unwrap();
         cluster.synchronize().unwrap();
         copy_time = copy_time.min(t.elapsed().as_secs_f64());

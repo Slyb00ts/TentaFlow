@@ -1505,7 +1505,9 @@ const EMBEDDED_SM121A: &[EmbeddedArtifact] = embedded_arch![
     "topk_partial_f32",
 ];
 
-const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco",
+const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch![
+    "gfx1201",
+    ".hsaco",
     "act_quant_fp4_f16",
     "act_quant_fp8_f16",
     "add_f32",
@@ -1566,6 +1568,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "attn_verify_split8_combine_f16_hd256",
     "attn_verify_split8_f16_hd256_t3",
     "attn_verify_split8_f16_hd256_t4",
+    "add_f32_out_f16",
     "cast_f32_f16",
     "compressor_add_ape_f32",
     "compressor_pool_f16",

@@ -722,7 +722,9 @@ fn gemv_nvfp4_gguf_q8_1_out_f32_matches_f16_variant() {
         dev.write(&weights, &weights_buffer, 0).unwrap();
         let input = upload_f16(dev.as_ref(), &x);
         let half = upload_f16(dev.as_ref(), &vec![0.0; rows]);
-        let full = dev.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+        let full = dev
+            .alloc(rows * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
         let output_scale = 0.3125;
         kernels
             .gemv_nvfp4_gguf_q8_1_group_f16(
@@ -739,7 +741,13 @@ fn gemv_nvfp4_gguf_q8_1_out_f32_matches_f16_variant() {
             .unwrap();
         kernels
             .gemv_nvfp4_gguf_q8_1_out_f32(
-                &full, &weights_buffer, &input, rows, cols, output_scale, &stream,
+                &full,
+                &weights_buffer,
+                &input,
+                rows,
+                cols,
+                output_scale,
+                &stream,
             )
             .unwrap();
         dev.synchronize().unwrap();

@@ -14,8 +14,8 @@ use crate::mtp::{MtpEmbedding, MtpTensorLoader, MtpWeights};
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
 use forge_formats::w4a8::{col_absmax, smoothing_scale, w4a8_pack_smoothed, W4A8_GROUP};
-use forge_formats::{dequantize_to_f32, Gguf, HfConfig, LayerKind, ModelDescriptor, WeightRole};
 use forge_formats::MtpWeightRole;
+use forge_formats::{dequantize_to_f32, Gguf, HfConfig, LayerKind, ModelDescriptor, WeightRole};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::{Kernels, Nvfp4GgufLayout};
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
@@ -946,11 +946,9 @@ fn resolve_nvfp4_ct_plan(
         NvFp4CtLayoutPolicy::S0N64K128 if !capable => Err(ForgeError::Unsupported(
             "S0 N64/K128 wymaga NVIDIA sm80 warp32 i pełnych 16 artefaktów".into(),
         )),
-        NvFp4CtLayoutPolicy::S0N64K128 if !aligned || tensors == 0 => {
-            Err(ForgeError::Unsupported(
-                "S0 N64/K128 wymaga wszystkich kształtów wyrównanych do N64/K128".into(),
-            ))
-        }
+        NvFp4CtLayoutPolicy::S0N64K128 if !aligned || tensors == 0 => Err(ForgeError::Unsupported(
+            "S0 N64/K128 wymaga wszystkich kształtów wyrównanych do N64/K128".into(),
+        )),
         NvFp4CtLayoutPolicy::S0N64K128 => Ok(NvFp4CtLoadPlan::S0N64K128),
     }
 }
@@ -1088,26 +1086,25 @@ fn nvfp4_ct_physical_manifest(
     let mut manifest = Vec::new();
     for (index, layer) in descriptor.layers.iter().enumerate() {
         let name = |role: WeightRole| {
-            layer.get(&role).cloned().ok_or_else(|| {
-                ForgeError::Format(format!("warstwa {index}: brak roli {role:?}"))
-            })
+            layer
+                .get(&role)
+                .cloned()
+                .ok_or_else(|| ForgeError::Format(format!("warstwa {index}: brak roli {role:?}")))
         };
         manifest.push(vec![
             name(WeightRole::AttnQ)?,
             name(WeightRole::AttnK)?,
             name(WeightRole::AttnV)?,
         ]);
-        manifest.push(vec![
-            name(WeightRole::FfnGate)?,
-            name(WeightRole::FfnUp)?,
-        ]);
+        manifest.push(vec![name(WeightRole::FfnGate)?, name(WeightRole::FfnUp)?]);
         manifest.push(vec![name(WeightRole::FfnDown)?]);
         manifest.push(vec![name(WeightRole::AttnO)?]);
     }
     if native_mtp {
-        let mtp = descriptor.mtp.as_ref().ok_or_else(|| {
-            ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into())
-        })?;
+        let mtp = descriptor
+            .mtp
+            .as_ref()
+            .ok_or_else(|| ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into()))?;
         let matrix_roles = [
             MtpWeightRole::AttnQ,
             MtpWeightRole::AttnK,
@@ -1240,7 +1237,9 @@ fn plan_nvfp4_ct_safetensors(
             group_rows = group_rows.checked_add(rows).ok_or_else(|| {
                 ForgeError::Format(format!("{weight_name}: przepełnienie fused rows"))
             })?;
-            if group_cols.replace(cols).is_some_and(|previous| previous != cols)
+            if group_cols
+                .replace(cols)
+                .is_some_and(|previous| previous != cols)
                 || group_scale
                     .replace(global_scale.to_bits())
                     .is_some_and(|previous| previous != global_scale.to_bits())
@@ -1267,13 +1266,12 @@ fn plan_nvfp4_ct_safetensors(
             eligible = false;
         }
     }
-    let plan =
-        resolve_nvfp4_ct_plan(
-            policy,
-            capable,
-            aligned && eligible,
-            expected_identities.len(),
-        )?;
+    let plan = resolve_nvfp4_ct_plan(
+        policy,
+        capable,
+        aligned && eligible,
+        expected_identities.len(),
+    )?;
     Ok(NvFp4CtPreflight {
         plan,
         max_cols,
@@ -1326,13 +1324,17 @@ fn create_nvfp4_ct_upload_context<'a>(
             "NVFP4 CT: staging przekracza ustalony limit".into(),
         ));
     }
-    let resident_bytes = preflight
-        .expected_identities
-        .iter()
-        .try_fold(0usize, |total, identity| {
-            total.checked_add(nvfp4_ct_s0_resident_bytes(identity.rows, identity.cols)?)
-                .ok_or_else(|| ForgeError::Format("NVFP4 CT: przepełnienie sumy resident".into()))
-        })?;
+    let resident_bytes =
+        preflight
+            .expected_identities
+            .iter()
+            .try_fold(0usize, |total, identity| {
+                total
+                    .checked_add(nvfp4_ct_s0_resident_bytes(identity.rows, identity.cols)?)
+                    .ok_or_else(|| {
+                        ForgeError::Format("NVFP4 CT: przepełnienie sumy resident".into())
+                    })
+            })?;
     tracing::info!(
         expected_uploads = preflight.expected_identities.len(),
         resident_bytes,
@@ -1372,7 +1374,6 @@ impl TensorSource for GgufSource<'_> {
     fn byte_len(&self, name: &str) -> Option<usize> {
         self.0.tensor(name).map(|t| t.size_bytes)
     }
-
 
     fn fetch(&self, name: &str) -> Result<TensorFetch> {
         let t = self
@@ -1504,7 +1505,6 @@ impl TensorSource for StSource<'_> {
         }
         fetch_deepseek_weight(self.st, name)
     }
-
 
     fn fetch(&self, name: &str) -> Result<TensorFetch> {
         let t = self
@@ -1909,7 +1909,6 @@ impl HostWeight {
     }
 }
 
-
 /// Przestawia wiersze Q/K tak, żeby kernel RoPE w stylu NeoX policzył rotację
 /// PRZEPLATANĄ, której wymaga rodzina Llama.
 ///
@@ -1929,33 +1928,33 @@ fn permute_rope_pairs(weight: &mut HostWeight, head_dim: usize) -> Result<()> {
         )));
     }
     let (data, rows) = match weight {
-            HostWeight::F16 { data, rows, .. } => (data, *rows),
-            HostWeight::Q8_0 { data, rows, .. } => (data, *rows),
-            HostWeight::Q4K { data, rows, .. } => (data, *rows),
-            HostWeight::Q6K { data, rows, .. } => (data, *rows),
-            HostWeight::Q5K { data, rows, .. } => (data, *rows),
-            HostWeight::Q3K { data, rows, .. } => (data, *rows),
-            HostWeight::Q2K { data, rows, .. } => (data, *rows),
-            HostWeight::Q4_0 { data, rows, .. } => (data, *rows),
-            HostWeight::Q4_1 { data, rows, .. } => (data, *rows),
-            HostWeight::Q5_0 { data, rows, .. } => (data, *rows),
-            HostWeight::Q5_1 { data, rows, .. } => (data, *rows),
-            HostWeight::Iq4Nl { data, rows, .. } => (data, *rows),
-            HostWeight::Iq4Xs { data, rows, .. } => (data, *rows),
-            HostWeight::Mxfp4 { data, rows, .. } => (data, *rows),
-            HostWeight::Iq2Xs { data, rows, .. } => (data, *rows),
-            HostWeight::Iq2S { data, rows, .. } => (data, *rows),
-            HostWeight::Iq3S { data, rows, .. } => (data, *rows),
-            HostWeight::Iq2Xxs { data, rows, .. } => (data, *rows),
-            HostWeight::Iq3Xxs { data, rows, .. } => (data, *rows),
-            HostWeight::Iq1S { data, rows, .. } => (data, *rows),
-            HostWeight::Iq1M { data, rows, .. } => (data, *rows),
-            HostWeight::NvFp4Gguf { data, rows, .. } => (data, *rows),
-            _ => {
-                return Err(ForgeError::Unsupported(
-                    "RoPE przeplatany nie obsługuje tego formatu wag".into(),
-                ));
-            }
+        HostWeight::F16 { data, rows, .. } => (data, *rows),
+        HostWeight::Q8_0 { data, rows, .. } => (data, *rows),
+        HostWeight::Q4K { data, rows, .. } => (data, *rows),
+        HostWeight::Q6K { data, rows, .. } => (data, *rows),
+        HostWeight::Q5K { data, rows, .. } => (data, *rows),
+        HostWeight::Q3K { data, rows, .. } => (data, *rows),
+        HostWeight::Q2K { data, rows, .. } => (data, *rows),
+        HostWeight::Q4_0 { data, rows, .. } => (data, *rows),
+        HostWeight::Q4_1 { data, rows, .. } => (data, *rows),
+        HostWeight::Q5_0 { data, rows, .. } => (data, *rows),
+        HostWeight::Q5_1 { data, rows, .. } => (data, *rows),
+        HostWeight::Iq4Nl { data, rows, .. } => (data, *rows),
+        HostWeight::Iq4Xs { data, rows, .. } => (data, *rows),
+        HostWeight::Mxfp4 { data, rows, .. } => (data, *rows),
+        HostWeight::Iq2Xs { data, rows, .. } => (data, *rows),
+        HostWeight::Iq2S { data, rows, .. } => (data, *rows),
+        HostWeight::Iq3S { data, rows, .. } => (data, *rows),
+        HostWeight::Iq2Xxs { data, rows, .. } => (data, *rows),
+        HostWeight::Iq3Xxs { data, rows, .. } => (data, *rows),
+        HostWeight::Iq1S { data, rows, .. } => (data, *rows),
+        HostWeight::Iq1M { data, rows, .. } => (data, *rows),
+        HostWeight::NvFp4Gguf { data, rows, .. } => (data, *rows),
+        _ => {
+            return Err(ForgeError::Unsupported(
+                "RoPE przeplatany nie obsługuje tego formatu wag".into(),
+            ));
+        }
     };
     if rows == 0 || !rows.is_multiple_of(head_dim) {
         return Err(ForgeError::Format(format!(
@@ -1977,10 +1976,8 @@ fn permute_rope_pairs(weight: &mut HostWeight, head_dim: usize) -> Result<()> {
             let src_odd = (base + 2 * i + 1) * row_bytes;
             let dst_lo = (base + i) * row_bytes;
             let dst_hi = (base + half + i) * row_bytes;
-            out[dst_lo..dst_lo + row_bytes]
-                .copy_from_slice(&data[src_even..src_even + row_bytes]);
-            out[dst_hi..dst_hi + row_bytes]
-                .copy_from_slice(&data[src_odd..src_odd + row_bytes]);
+            out[dst_lo..dst_lo + row_bytes].copy_from_slice(&data[src_even..src_even + row_bytes]);
+            out[dst_hi..dst_hi + row_bytes].copy_from_slice(&data[src_odd..src_odd + row_bytes]);
         }
     }
     *data = out;
@@ -2153,12 +2150,18 @@ fn load_compressor(
     src: &dyn TensorSource,
     prefix: &str,
 ) -> Result<Option<CompressorWeights>> {
-    if src.fetch_optional(&format!("{prefix}.wkv.weight"))?.is_none() {
+    if src
+        .fetch_optional(&format!("{prefix}.wkv.weight"))?
+        .is_none()
+    {
         return Ok(None);
     }
     Ok(Some(CompressorWeights {
         wkv: upload_weight(device, fetch_matrix(src, &format!("{prefix}.wkv.weight"))?)?,
-        wgate: upload_weight(device, fetch_matrix(src, &format!("{prefix}.wgate.weight"))?)?,
+        wgate: upload_weight(
+            device,
+            fetch_matrix(src, &format!("{prefix}.wgate.weight"))?,
+        )?,
         ape: upload_f32(device, src, &format!("{prefix}.ape"))?,
         norm: upload_norm(device, src, &format!("{prefix}.norm.weight"))?,
     }))
@@ -2183,12 +2186,13 @@ fn load_deepseek_attention(
     {
         let compressor = load_compressor(device, src, &format!("{p}.indexer.compressor"))?
             .ok_or_else(|| {
-                ForgeError::Format(format!(
-                    "warstwa {layer}: indekser bez własnego kompresora"
-                ))
+                ForgeError::Format(format!("warstwa {layer}: indekser bez własnego kompresora"))
             })?;
         Some(IndexerWeights {
-            wq_b: upload_weight(device, fetch_matrix(src, &format!("{p}.indexer.wq_b.weight"))?)?,
+            wq_b: upload_weight(
+                device,
+                fetch_matrix(src, &format!("{p}.indexer.wq_b.weight"))?,
+            )?,
             weights_proj: upload_weight(
                 device,
                 fetch_matrix(src, &format!("{p}.indexer.weights_proj.weight"))?,
@@ -2234,9 +2238,9 @@ fn load_deepseek_layers(
     let mut layers = Vec::with_capacity(descriptor.params.block_count);
     for (index, layer_map) in descriptor.layers.iter().enumerate() {
         let name = |role: WeightRole| -> Result<&String> {
-            layer_map.get(&role).ok_or_else(|| {
-                ForgeError::Format(format!("warstwa {index}: brak roli {role:?}"))
-            })
+            layer_map
+                .get(&role)
+                .ok_or_else(|| ForgeError::Format(format!("warstwa {index}: brak roli {role:?}")))
         };
         let attn = load_deepseek_attention(device, src, index)?;
         let router = match fetch_matrix(src, name(WeightRole::FfnGateInp)?)? {
@@ -2461,7 +2465,6 @@ pub fn load_deepseek_layer_for_test(
     };
     load_deepseek_attention(device, &src, layer)
 }
-
 
 /// Ile bajtów ekspertów wolno zostawić w pamięci przy tym modelu.
 ///
@@ -3621,7 +3624,10 @@ impl ModelWeights {
                         Ok(fused) => {
                             fused_gate_up_layers += 1;
                             GateUpWeights::Fused(upload_target_weight(
-                                device, fused, target_tile, nvfp4_ct,
+                                device,
+                                fused,
+                                target_tile,
+                                nvfp4_ct,
                             )?)
                         }
                         Err(mut parts) => {
@@ -3710,9 +3716,27 @@ impl ModelWeights {
                     };
                     LayerFfn::Moe(Box::new(MoeFfn {
                         router,
-                        gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill, budget.as_ref())?,
-                        up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill, budget.as_ref())?,
-                        down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill, budget.as_ref())?,
+                        gate_exps: upload_expert_stack(
+                            device,
+                            gate_exps,
+                            moe.n_experts,
+                            spill,
+                            budget.as_ref(),
+                        )?,
+                        up_exps: upload_expert_stack(
+                            device,
+                            up_exps,
+                            moe.n_experts,
+                            spill,
+                            budget.as_ref(),
+                        )?,
+                        down_exps: upload_expert_stack(
+                            device,
+                            down_exps,
+                            moe.n_experts,
+                            spill,
+                            budget.as_ref(),
+                        )?,
                         shared,
                         shared_gate: None,
                         n_experts: moe.n_experts,
@@ -4064,9 +4088,27 @@ impl ModelWeights {
 
                 LayerFfn::Moe(Box::new(MoeFfn {
                     router,
-                    gate_exps: upload_expert_stack(device, gate_exps, moe.n_experts, spill, budget.as_ref())?,
-                    up_exps: upload_expert_stack(device, up_exps, moe.n_experts, spill, budget.as_ref())?,
-                    down_exps: upload_expert_stack(device, down_exps, moe.n_experts, spill, budget.as_ref())?,
+                    gate_exps: upload_expert_stack(
+                        device,
+                        gate_exps,
+                        moe.n_experts,
+                        spill,
+                        budget.as_ref(),
+                    )?,
+                    up_exps: upload_expert_stack(
+                        device,
+                        up_exps,
+                        moe.n_experts,
+                        spill,
+                        budget.as_ref(),
+                    )?,
+                    down_exps: upload_expert_stack(
+                        device,
+                        down_exps,
+                        moe.n_experts,
+                        spill,
+                        budget.as_ref(),
+                    )?,
                     shared: Some(DenseFfn {
                         gate_up: GateUpWeights::Split {
                             gate: sh_gate,
@@ -4326,8 +4368,8 @@ impl ModelWeights {
             // expansion of every projection); run the layer's seven
             // projections on worker threads and keep the device uploads on
             // this thread. Peak host memory stays one layer of f32.
-            let mut packed = std::thread::scope(
-                |scope| -> Result<Vec<(Vec<u8>, Vec<u8>, usize, usize)>> {
+            let mut packed =
+                std::thread::scope(|scope| -> Result<Vec<(Vec<u8>, Vec<u8>, usize, usize)>> {
                     let handles: Vec<_> = ROLES
                         .iter()
                         .map(|&role| {
@@ -4342,13 +4384,13 @@ impl ModelWeights {
                     handles
                         .into_iter()
                         .map(|h| {
-                            h.join()
-                                .map_err(|_| ForgeError::Format("fp8 pack worker panicked".into()))?
+                            h.join().map_err(|_| {
+                                ForgeError::Format("fp8 pack worker panicked".into())
+                            })?
                         })
                         .collect()
-                },
-            )?
-            .into_iter();
+                })?
+                .into_iter();
             let mut next = || -> Result<Fp8Weight> {
                 let (codes, scales, rows, cols) = packed.next().expect("seven packed projections");
                 Ok(Fp8Weight {
@@ -4647,12 +4689,8 @@ mod tests {
             resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::Auto, false, true, 12).unwrap(),
             NvFp4CtLoadPlan::RowMajorE4M3
         );
-        assert!(
-            resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::S0N64K128, false, true, 12).is_err()
-        );
-        assert!(
-            resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::S0N64K128, true, false, 12).is_err()
-        );
+        assert!(resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::S0N64K128, false, true, 12).is_err());
+        assert!(resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::S0N64K128, true, false, 12).is_err());
         assert_eq!(
             resolve_nvfp4_ct_plan(NvFp4CtLayoutPolicy::Auto, true, true, 12).unwrap(),
             NvFp4CtLoadPlan::S0N64K128
@@ -4685,12 +4723,8 @@ mod tests {
         assert!(weight.nvfp4_ct_row_window(192, 128).is_err());
         let row_major = DevWeight::NvFp4 {
             storage: NvFp4CtStorage::RowMajorE4M3 {
-                packed: device
-                    .alloc(64, MemKind::Device, Pool::Weights)
-                    .unwrap(),
-                scales: device
-                    .alloc(8, MemKind::Device, Pool::Weights)
-                    .unwrap(),
+                packed: device.alloc(64, MemKind::Device, Pool::Weights).unwrap(),
+                scales: device.alloc(8, MemKind::Device, Pool::Weights).unwrap(),
             },
             inv_global_scale: 1.0,
             rows: 64,
@@ -4700,9 +4734,7 @@ mod tests {
         for bytes in [256 * 128 * 9 / 16 - 1, 256 * 128 * 9 / 16 + 1] {
             let malformed = DevWeight::NvFp4 {
                 storage: NvFp4CtStorage::S0N64K128 {
-                    data: device
-                        .alloc(bytes, MemKind::Device, Pool::Weights)
-                        .unwrap(),
+                    data: device.alloc(bytes, MemKind::Device, Pool::Weights).unwrap(),
                 },
                 inv_global_scale: 1.0,
                 rows: 256,
@@ -4734,59 +4766,45 @@ mod tests {
         assert!(validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[0, 64], 16).is_err());
         assert!(validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[64, 0], 16).is_err());
         assert!(
-            validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[64, usize::MAX], 16)
-                .is_err()
+            validate_nvfp4_ct_packed_metadata("packed", DType::U8, &[64, usize::MAX], 16).is_err()
         );
 
         assert_eq!(
-            validate_nvfp4_ct_scale_metadata("scale", DType::F8E4M3, &[64, 8], 64, 128)
-                .unwrap(),
+            validate_nvfp4_ct_scale_metadata("scale", DType::F8E4M3, &[64, 8], 64, 128).unwrap(),
             512
         );
-        assert!(
-            validate_nvfp4_ct_scale_metadata("scale", DType::U8, &[64, 8], 64, 128).is_err()
-        );
-        assert!(
-            validate_nvfp4_ct_scale_metadata("scale", DType::F8E4M3, &[512], 64, 128).is_err()
-        );
-        assert!(
-            validate_nvfp4_ct_scale_metadata(
-                "scale",
-                DType::F8E4M3,
-                &[usize::MAX, 8],
-                usize::MAX,
-                128,
-            )
-            .is_err()
-        );
+        assert!(validate_nvfp4_ct_scale_metadata("scale", DType::U8, &[64, 8], 64, 128).is_err());
+        assert!(validate_nvfp4_ct_scale_metadata("scale", DType::F8E4M3, &[512], 64, 128).is_err());
+        assert!(validate_nvfp4_ct_scale_metadata(
+            "scale",
+            DType::F8E4M3,
+            &[usize::MAX, 8],
+            usize::MAX,
+            128,
+        )
+        .is_err());
 
-        assert!(
-            validate_nvfp4_ct_global_scale_metadata(
-                "global",
-                DType::F32,
-                &[1],
-                &1.0f32.to_le_bytes(),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_nvfp4_ct_global_scale_metadata(
-                "global",
-                DType::F16,
-                &[1],
-                &1.0f32.to_le_bytes(),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_nvfp4_ct_global_scale_metadata(
-                "global",
-                DType::F32,
-                &[],
-                &1.0f32.to_le_bytes(),
-            )
-            .is_err()
-        );
+        assert!(validate_nvfp4_ct_global_scale_metadata(
+            "global",
+            DType::F32,
+            &[1],
+            &1.0f32.to_le_bytes(),
+        )
+        .is_ok());
+        assert!(validate_nvfp4_ct_global_scale_metadata(
+            "global",
+            DType::F16,
+            &[1],
+            &1.0f32.to_le_bytes(),
+        )
+        .is_err());
+        assert!(validate_nvfp4_ct_global_scale_metadata(
+            "global",
+            DType::F32,
+            &[],
+            &1.0f32.to_le_bytes(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -4821,8 +4839,7 @@ mod tests {
             128,
             1.0f32.to_bits(),
         );
-        let down =
-            nvfp4_ct_upload_identity(vec!["down".to_string()], 64, 128, 1.0f32.to_bits());
+        let down = nvfp4_ct_upload_identity(vec!["down".to_string()], 64, 128, 1.0f32.to_bits());
         let expected = HashSet::from([qkv.clone(), down]);
         let same_count_wrong = HashSet::from([
             qkv,
@@ -4856,36 +4873,20 @@ mod tests {
     #[test]
     fn nvfp4_ct_tozsamosc_jest_strukturalna() {
         let separator = '\u{1f}';
-        let one_name = nvfp4_ct_upload_identity(
-            vec![format!("q{separator}k")],
-            64,
-            128,
-            1.0f32.to_bits(),
-        );
+        let one_name =
+            nvfp4_ct_upload_identity(vec![format!("q{separator}k")], 64, 128, 1.0f32.to_bits());
         let two_names = nvfp4_ct_upload_identity(
             vec!["q".to_string(), "k".to_string()],
             64,
             128,
             1.0f32.to_bits(),
         );
-        let wrong_rows = nvfp4_ct_upload_identity(
-            vec![format!("q{separator}k")],
-            128,
-            128,
-            1.0f32.to_bits(),
-        );
-        let wrong_cols = nvfp4_ct_upload_identity(
-            vec![format!("q{separator}k")],
-            64,
-            256,
-            1.0f32.to_bits(),
-        );
-        let wrong_scale = nvfp4_ct_upload_identity(
-            vec![format!("q{separator}k")],
-            64,
-            128,
-            2.0f32.to_bits(),
-        );
+        let wrong_rows =
+            nvfp4_ct_upload_identity(vec![format!("q{separator}k")], 128, 128, 1.0f32.to_bits());
+        let wrong_cols =
+            nvfp4_ct_upload_identity(vec![format!("q{separator}k")], 64, 256, 1.0f32.to_bits());
+        let wrong_scale =
+            nvfp4_ct_upload_identity(vec![format!("q{separator}k")], 64, 128, 2.0f32.to_bits());
 
         assert_ne!(one_name, two_names);
         assert_ne!(one_name, wrong_rows);
@@ -4957,6 +4958,8 @@ pub fn load_ffn_shards_gguf(
         Ok((data, crate::tensor_parallel::BlockFormat::of(quant, scale)?))
     };
 
+    // Plan podziału liczony RAZ, z pojemnością na wszystkie warstwy naraz.
+    let mut plan: Option<Vec<usize>> = forced.map(|columns| columns.to_vec());
     let mut out = Vec::with_capacity(descriptor.layers.len());
     for (idx, layer_map) in descriptor.layers.iter().enumerate() {
         let name = |role: WeightRole| -> Result<&String> {
@@ -4995,6 +4998,22 @@ pub fn load_ffn_shards_gguf(
                 gate_fmt.quant, up_fmt.quant
             )));
         }
+        let columns = match &plan {
+            Some(columns) => columns.clone(),
+            None => {
+                let columns = crate::tensor_parallel::plan_ffn_split(
+                    caps,
+                    params.hidden_size,
+                    params.intermediate_size,
+                    crate::multi_gpu::WorkKind::MemoryBound,
+                    gate_fmt,
+                    down_fmt,
+                    descriptor.layers.len(),
+                )?;
+                plan = Some(columns.clone());
+                columns
+            }
+        };
         out.push(crate::tensor_parallel::upload_ffn_split(
             cluster,
             caps,
@@ -5007,7 +5026,7 @@ pub fn load_ffn_shards_gguf(
             gate_fmt,
             up_fmt,
             down_fmt,
-            forced,
+            Some(&columns),
         )?);
     }
     Ok(out)

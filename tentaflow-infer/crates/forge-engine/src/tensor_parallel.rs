@@ -12,7 +12,7 @@
 // to, czego ten projekt ma uniknąć.
 
 use crate::cluster::Cluster;
-use crate::multi_gpu::{DeviceCapability, MIN_USEFUL_ROWS, WorkKind, plan_split};
+use crate::multi_gpu::{plan_split, DeviceCapability, WorkKind, MIN_USEFUL_ROWS};
 use forge_hal::{DevBuffer, Pool};
 use forge_types::{ForgeError, MemKind, QuantKind, Result};
 
@@ -84,9 +84,11 @@ pub fn upload_row_split(
         let bytes = count.max(1) * row_bytes;
         let buffer = entry.device.alloc(bytes, MemKind::Device, Pool::Weights)?;
         if count > 0 {
-            entry
-                .device
-                .write(&data[offset * row_bytes..(offset + count) * row_bytes], &buffer, 0)?;
+            entry.device.write(
+                &data[offset * row_bytes..(offset + count) * row_bytes],
+                &buffer,
+                0,
+            )?;
         }
         shards.push(buffer);
         offsets.push(offset);
@@ -249,6 +251,11 @@ impl ColShards {
     pub fn rows(&self) -> usize {
         self.rows
     }
+
+    /// Pełna szerokość macierzy przed podziałem.
+    pub fn total_cols(&self) -> usize {
+        self.cols.iter().sum()
+    }
 }
 
 /// Blok formatu kwantyzacji: ile wartości niesie i ile zajmuje bajtów.
@@ -379,7 +386,9 @@ pub fn upload_column_split_with(
     for (index, &count) in plan.rows.iter().enumerate() {
         let entry = cluster.device(index)?;
         let shard_bytes = count.max(1) * format.bytes * rows;
-        let buffer = entry.device.alloc(shard_bytes, MemKind::Device, Pool::Weights)?;
+        let buffer = entry
+            .device
+            .alloc(shard_bytes, MemKind::Device, Pool::Weights)?;
         if count > 0 {
             // Fragment jest ciągły w obrębie wiersza, ale nie w całej macierzy,
             // więc składamy go wierszami do bufora pośredniego.
@@ -414,9 +423,10 @@ pub fn upload_column_split_with(
 pub fn gemv_column_split(
     cluster: &Cluster,
     shards: &ColShards,
-    x_parts: &[DevBuffer],
+    x_parts: &[&DevBuffer],
     y_parts: &[DevBuffer],
     y_full: &DevBuffer,
+    out_f16: Option<&DevBuffer>,
     staging: &DevBuffer,
     gather_on: usize,
     gather_stream: &forge_hal::Stream,
@@ -440,12 +450,17 @@ pub fn gemv_column_split(
         let cols = shards.cols_on(index);
         // Ten sam wybór co wyżej — z wyjściem w f32, bo to są sumy CZĄSTKOWE i
         // dodawanie ich w f16 gubiłoby bity przy każdej karcie.
-        let dp4a = cols <= forge_kernels::Kernels::DP4A_MAX_COLS;
+        //
+        // Próg dp4a liczony z PEŁNEJ szerokości, nie z kawałka karty. Macierz
+        // szersza od progu idzie bez dp4a na jednej karcie, ale jej połowy już
+        // się w progu mieszczą — wybór po kawałku znaczyłby, że podział zmienia
+        // matematykę modelu, a ma zmieniać wyłącznie to, która karta go liczy.
+        let dp4a = shards.total_cols() <= forge_kernels::Kernels::DP4A_MAX_COLS;
         match (shards.format.quant, dp4a) {
             (QuantKind::Q8_0, true) => entry.kernels.gemv_q8_0_dp4a_out_f32(
                 &y_parts[index],
                 shards.shard(index)?,
-                &x_parts[index],
+                x_parts[index],
                 rows,
                 cols,
                 stream,
@@ -453,7 +468,7 @@ pub fn gemv_column_split(
             (QuantKind::Q8_0, false) => entry.kernels.gemv_q8_0_out_f32(
                 &y_parts[index],
                 shards.shard(index)?,
-                &x_parts[index],
+                x_parts[index],
                 rows,
                 cols,
                 stream,
@@ -461,7 +476,7 @@ pub fn gemv_column_split(
             (QuantKind::NVFP4Gguf, _) => entry.kernels.gemv_nvfp4_gguf_q8_1_out_f32(
                 &y_parts[index],
                 shards.shard(index)?,
-                &x_parts[index],
+                x_parts[index],
                 rows,
                 cols,
                 shards.format.output_scale,
@@ -471,7 +486,7 @@ pub fn gemv_column_split(
                 &y_parts[index],
                 0,
                 shards.shard(index)?,
-                &x_parts[index],
+                x_parts[index],
                 0,
                 rows,
                 cols,
@@ -481,7 +496,7 @@ pub fn gemv_column_split(
                 &y_parts[index],
                 0,
                 shards.shard(index)?,
-                &x_parts[index],
+                x_parts[index],
                 0,
                 rows,
                 cols,
@@ -491,7 +506,7 @@ pub fn gemv_column_split(
                 &y_parts[index],
                 0,
                 shards.shard(index)?,
-                &x_parts[index],
+                x_parts[index],
                 0,
                 rows,
                 cols,
@@ -508,38 +523,79 @@ pub fn gemv_column_split(
     // Każda z nich to pełny wektor `rows`, więc tu nie ma przesunięć — jest
     // dodawanie.
     let target = cluster.device(gather_on)?;
-    // Karta zbierająca bywa bez kolumn (podział może jej nic nie dać) — wtedy
-    // jej bufor cząstkowy nie został policzony i nie wolno nim zasiać sumy.
-    let seeded = shards.cols_on(gather_on) > 0;
-    if seeded {
-        target
-            .device
-            .copy(&y_parts[gather_on], 0, y_full, 0, rows * 4, gather_stream)?;
-    }
-    let mut first = !seeded;
-    for index in 0..cluster.len() {
-        if index == gather_on || shards.cols_on(index) == 0 {
-            continue;
-        }
-        cluster.exchange(index, &y_parts[index], 0, gather_on, staging, 0, rows * 4)?;
-        cluster.order(index, &cluster.device(index)?.stream, gather_on, gather_stream)?;
-        if first {
-            target
-                .device
-                .copy(staging, 0, y_full, 0, rows * 4, gather_stream)?;
-            first = false;
+    let contributors: Vec<usize> = (0..cluster.len())
+        .filter(|&index| shards.cols_on(index) > 0)
+        .collect();
+    let Some((&last, rest)) = contributors.split_last() else {
+        return Err(ForgeError::Scheduler(
+            "podział kolumnowy nie przydzielił kolumn żadnej karcie".into(),
+        ));
+    };
+    // Sumy cząstkowe wszystkich kart poza OSTATNIĄ trafiają do `y_full`. Ostatnia
+    // domyka redukcję — i gdy wołający chce wyniku w f16, to domknięcie jest tym
+    // samym uruchomieniem co zawężenie. Osobne dodawanie i osobne zawężenie
+    // kosztowały dwa uruchomienia na warstwę, czyli 130 na token przy zmierzonym
+    // narzucie rzędu 4,5 us — więcej niż cała wymiana aktywacji między kartami.
+    let mut accumulated = 0usize;
+    for &index in rest {
+        let bring = |destination: &DevBuffer| -> Result<()> {
+            if index == gather_on {
+                target
+                    .device
+                    .copy(&y_parts[index], 0, destination, 0, rows * 4, gather_stream)
+            } else {
+                cluster.exchange(
+                    index,
+                    &y_parts[index],
+                    0,
+                    gather_on,
+                    destination,
+                    0,
+                    rows * 4,
+                )?;
+                cluster.order(
+                    index,
+                    &cluster.device(index)?.stream,
+                    gather_on,
+                    gather_stream,
+                )
+            }
+        };
+        if accumulated == 0 {
+            bring(y_full)?;
         } else {
+            bring(staging)?;
             target
                 .kernels
                 .add_f32(y_full, y_full, staging, rows, gather_stream)?;
         }
+        accumulated += 1;
     }
-    if first {
-        return Err(ForgeError::Scheduler(
-            "podział kolumnowy nie przydzielił kolumn żadnej karcie".into(),
-        ));
+
+    let tail = if last == gather_on {
+        &y_parts[last]
+    } else {
+        cluster.exchange(last, &y_parts[last], 0, gather_on, staging, 0, rows * 4)?;
+        cluster.order(
+            last,
+            &cluster.device(last)?.stream,
+            gather_on,
+            gather_stream,
+        )?;
+        staging
+    };
+    match (out_f16, accumulated) {
+        (Some(out), 0) => target.kernels.cast_f32_f16(out, tail, rows, gather_stream),
+        (Some(out), _) => target
+            .kernels
+            .add_f32_out_f16(out, y_full, tail, rows, gather_stream),
+        (None, 0) => target
+            .device
+            .copy(tail, 0, y_full, 0, rows * 4, gather_stream),
+        (None, _) => target
+            .kernels
+            .add_f32(y_full, y_full, tail, rows, gather_stream),
     }
-    Ok(())
 }
 
 /// Cały blok FFN rozłożony na karty: `gate`/`up` po wierszach, `down` po
@@ -564,6 +620,48 @@ impl FfnShards {
     pub fn rows_on(&self, device: usize) -> usize {
         self.rows.get(device).copied().unwrap_or(0)
     }
+}
+
+/// Ile kolumn wymiaru pośredniego dostaje każda karta, licząc pojemność dla
+/// WSZYSTKICH `layers` warstw naraz.
+///
+/// Plan musi powstać raz dla całego modelu, a nie osobno przy każdej warstwie.
+/// Wolny VRAM w profilach kart jest odczytem sprzed ładowania, więc plan liczony
+/// per warstwa uznawał całą pulę za dostępną 65 razy z rzędu — karta modelu, na
+/// której leży już cały model, dostawała udział mieszczący się raz i kończyła
+/// brakiem pamięci w połowie ładowania zamiast wziąć mniej.
+pub fn plan_ffn_split(
+    caps: &[DeviceCapability],
+    hidden: usize,
+    inter: usize,
+    kind: WorkKind,
+    gate_format: BlockFormat,
+    down_format: BlockFormat,
+    layers: usize,
+) -> Result<Vec<usize>> {
+    if layers == 0 {
+        return Err(ForgeError::Scheduler("podział FFN bez warstw".into()));
+    }
+    if !inter.is_multiple_of(down_format.values) {
+        return Err(ForgeError::Format(format!(
+            "podział kolumnowy {:?} wymaga inter % {} == 0, jest {inter}",
+            down_format.quant, down_format.values
+        )));
+    }
+    // Blok podziału to `down_format.values` kolumn wymiaru pośredniego. Kosztuje
+    // tyle bajtów `down`, ile ma wierszy ukrytych, plus tyle wierszy `gate` i
+    // `up`, ile obejmuje — te dwie macierze idą tym samym planem, więc muszą
+    // wejść do wyceny, inaczej jest ona trzykrotnie za niska.
+    let per_block = (down_format.bytes * hidden
+        + 2 * down_format.values * gate_format.row_bytes(hidden))
+        * layers;
+    Ok(
+        plan_split(caps, inter / down_format.values, kind, per_block, 1)?
+            .rows
+            .iter()
+            .map(|blocks| blocks * down_format.values)
+            .collect(),
+    )
 }
 
 /// Rozkłada trzy macierze FFN na karty jednym planem.
@@ -591,6 +689,16 @@ pub fn upload_ffn_split(
             gate_format.quant, up_format.quant
         )));
     }
+    // Plan liczony JEDEN RAZ dla całej trójki i dopiero potem narzucony podziałowi
+    // kolumnowemu. Sam `upload_column_split_with` wycenia wyłącznie `down`, a
+    // karta rezerwuje jeszcze swój kawałek `gate` i `up` — czyli około trzy razy
+    // więcej. Przy takiej wycenie karta modelu, której pula wag jest już zajęta
+    // przez cały model, dostawała udział, jakiego nie miała gdzie umieścić, i
+    // podział kończył się brakiem pamięci zamiast mniejszym udziałem.
+    let plan = match forced {
+        Some(columns) => columns.to_vec(),
+        None => plan_ffn_split(caps, hidden, inter, kind, gate_format, down_format, 1)?,
+    };
     let down = upload_column_split_with(
         cluster,
         caps,
@@ -599,7 +707,7 @@ pub fn upload_ffn_split(
         inter,
         kind,
         down_format,
-        forced,
+        Some(&plan),
     )?;
     let rows: Vec<usize> = (0..cluster.len()).map(|i| down.cols_on(i)).collect();
     let gate = upload_rows_by_plan(cluster, gate, inter, hidden, &rows, gate_format)?;
@@ -636,11 +744,10 @@ fn upload_rows_by_plan(
     let mut offset = 0usize;
     for (index, &count) in plan.iter().enumerate() {
         let entry = cluster.device(index)?;
-        let buffer = entry.device.alloc(
-            count.max(1) * row_bytes,
-            MemKind::Device,
-            Pool::Weights,
-        )?;
+        let buffer =
+            entry
+                .device
+                .alloc(count.max(1) * row_bytes, MemKind::Device, Pool::Weights)?;
         if count > 0 {
             entry.device.write(
                 &data[offset * row_bytes..(offset + count) * row_bytes],
@@ -656,7 +763,10 @@ fn upload_rows_by_plan(
 
 /// Bufory robocze bloku FFN, jeden komplet na kartę.
 pub struct FfnWorkspace {
-    pub x: Vec<DevBuffer>,
+    /// Wejście per karta. Karta zbierająca ma `None` — czyta wprost z bufora
+    /// wołającego, więc kopiowanie go do własnego bufora roboczego byłoby
+    /// uruchomieniem na warstwę bez żadnego skutku.
+    pub x: Vec<Option<DevBuffer>>,
     pub gate: Vec<DevBuffer>,
     pub up: Vec<DevBuffer>,
     pub mid: Vec<DevBuffer>,
@@ -665,21 +775,32 @@ pub struct FfnWorkspace {
 
 /// Liczy `y = down · act(gate·x, up·x)` na wszystkich kartach naraz.
 ///
-/// `ws.x[i]` musi zawierać PEŁNE wejście (wymiar ukryty nie jest dzielony),
-/// reszta buforów jest per karta o rozmiarze jej kawałka. Na całą warstwę
-/// przypada JEDNA wymiana — redukcja sum cząstkowych `down`.
+/// Wejście karty zbierającej to `x_primary`, pozostałych — `ws.x[i]`, i każde z
+/// nich musi zawierać PEŁNE wejście (wymiar ukryty nie jest dzielony). Reszta
+/// buforów jest per karta o rozmiarze jej kawałka. `out_f16` domyka redukcję
+/// zawężeniem do f16; `None` zostawia sumę w `y_full`.
 #[allow(clippy::too_many_arguments)]
 pub fn ffn_forward_split(
     cluster: &Cluster,
     shards: &FfnShards,
     ws: &FfnWorkspace,
+    x_primary: &DevBuffer,
     y_full: &DevBuffer,
+    out_f16: Option<&DevBuffer>,
     staging: &DevBuffer,
     hidden: usize,
     activation: forge_formats::FfnActivation,
     gather_on: usize,
     gather_stream: &forge_hal::Stream,
 ) -> Result<()> {
+    let input = |index: usize| -> Result<&DevBuffer> {
+        if index == gather_on {
+            return Ok(x_primary);
+        }
+        ws.x[index]
+            .as_ref()
+            .ok_or_else(|| ForgeError::Scheduler(format!("karta {index} nie ma bufora wejścia")))
+    };
     for index in 0..cluster.len() {
         let rows = shards.rows_on(index);
         if rows == 0 {
@@ -701,32 +822,32 @@ pub fn ffn_forward_split(
                 (QuantKind::Q8_0, true) => {
                     entry
                         .kernels
-                        .gemv_q8_0_dp4a_f16(y, w, &ws.x[index], rows, hidden, stream)
+                        .gemv_q8_0_dp4a_f16(y, w, input(index)?, rows, hidden, stream)
                 }
                 (QuantKind::Q8_0, false) => {
                     entry
                         .kernels
-                        .gemv_q8_0_f16(y, w, &ws.x[index], rows, hidden, stream)
+                        .gemv_q8_0_f16(y, w, input(index)?, rows, hidden, stream)
                 }
                 (QuantKind::Q4K, true) => {
                     entry
                         .kernels
-                        .gemv_q4_k_dp4a_f16(y, w, &ws.x[index], rows, hidden, stream)
+                        .gemv_q4_k_dp4a_f16(y, w, input(index)?, rows, hidden, stream)
                 }
                 (QuantKind::Q4K, false) => {
                     entry
                         .kernels
-                        .gemv_q4_k_f16(y, w, &ws.x[index], rows, hidden, stream)
+                        .gemv_q4_k_f16(y, w, input(index)?, rows, hidden, stream)
                 }
                 (QuantKind::Q6K, _) => {
                     entry
                         .kernels
-                        .gemv_q6_k_f16(y, w, &ws.x[index], rows, hidden, stream)
+                        .gemv_q6_k_f16(y, w, input(index)?, rows, hidden, stream)
                 }
                 (QuantKind::NVFP4Gguf, _) => entry.kernels.gemv_nvfp4_gguf_f16(
                     y,
                     w,
-                    &ws.x[index],
+                    input(index)?,
                     rows,
                     hidden,
                     format.output_scale,
@@ -758,7 +879,7 @@ pub fn ffn_forward_split(
                         output_scale: shards.up_format.output_scale,
                     },
                 ],
-                &ws.x[index],
+                input(index)?,
                 hidden,
                 stream,
             )?;
@@ -775,12 +896,14 @@ pub fn ffn_forward_split(
             stream,
         )?;
     }
+    let mid: Vec<&DevBuffer> = ws.mid.iter().collect();
     gemv_column_split(
         cluster,
         &shards.down,
-        &ws.mid,
+        &mid,
         &ws.partial,
         y_full,
+        out_f16,
         staging,
         gather_on,
         gather_stream,
@@ -827,8 +950,17 @@ impl TpFfn {
                 .unwrap_or(0)
                 .max(1);
             let entry = cluster.device(index)?;
-            let mk = |bytes: usize| entry.device.alloc(bytes, MemKind::Device, Pool::Activations);
-            ws.x.push(mk(hidden * 2)?);
+            let mk = |bytes: usize| {
+                entry
+                    .device
+                    .alloc(bytes, MemKind::Device, Pool::Activations)
+            };
+            // Karta 0 jest kartą modelu i liczy wprost z jego bufora.
+            ws.x.push(if index == 0 {
+                None
+            } else {
+                Some(mk(hidden * 2)?)
+            });
             ws.gate.push(mk(rows * 2)?);
             ws.up.push(mk(rows * 2)?);
             ws.mid.push(mk(rows * 2)?);
@@ -886,25 +1018,25 @@ impl TpFfn {
             .layers
             .get(layer)
             .ok_or_else(|| ForgeError::Scheduler(format!("brak warstwy {layer} w podziale")))?;
-        let primary = self.cluster.device(0)?;
         // Karta modelu pracuje strumieniem SILNIKA, nie własnym strumieniem
         // klastra. Dzięki temu wejście i wyjście bloku są uporządkowane z resztą
         // kroku za darmo, zamiast przez parę zdarzeń na każdej granicy —
-        // zmierzone 15 us za parę, dwie pary na warstwę.
-        primary
-            .device
-            .copy(x, 0, &self.ws.x[0], 0, self.hidden * 2, model_stream)?;
+        // zmierzone 15 us za parę, dwie pary na warstwę. Sama karta modelu liczy
+        // wprost z `x`, więc rozgłoszenie dotyczy tylko kart wspierających.
         for index in 1..self.cluster.len() {
             if shards.rows_on(index) == 0 {
                 continue;
             }
+            let destination = self.ws.x[index].as_ref().ok_or_else(|| {
+                ForgeError::Scheduler(format!("karta {index} nie ma bufora wejścia"))
+            })?;
             self.cluster.exchange_on(
                 0,
                 model_stream,
                 x,
                 0,
                 index,
-                &self.ws.x[index],
+                destination,
                 0,
                 self.hidden * 2,
             )?;
@@ -916,15 +1048,14 @@ impl TpFfn {
             &self.cluster,
             shards,
             &self.ws,
+            x,
             &self.acc,
+            Some(y),
             &self.staging,
             self.hidden,
             activation,
             0,
             model_stream,
-        )?;
-        primary
-            .kernels
-            .cast_f32_f16(y, &self.acc, self.hidden, model_stream)
+        )
     }
 }

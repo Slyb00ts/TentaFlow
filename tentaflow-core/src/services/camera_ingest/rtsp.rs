@@ -2269,11 +2269,29 @@ fn attach_mp4_branch_preview(
         ));
     }
 
+    // Nazwy elementów MUSZĄ różnić się między wariantami: pełna jakość i podgląd
+    // to dwie NIEZALEŻNE gałęzie na tym samym tee, a `gst_bin_add` odrzuca element
+    // o nazwie już obecnej w binie. Wspólna nazwa dla obu wariantów sprawiała, że
+    // wpięcie drugiej gałęzi padało na `add_many` — kafelek pojedynczy nie działał,
+    // gdy działał kafelek siatki (i odwrotnie). Sufiks jak w wariancie MJPEG.
+    let name_suffix = if publisher.is_preview() {
+        "_preview"
+    } else {
+        ""
+    };
+    // Etykieta wariantu do komunikatów błędu: dotąd każdy mówił „preview", także
+    // dla gałęzi pełnej jakości, przez co log twierdził `preview=false
+    // reason="... branch B preview ..."` i mylił przy diagnozie.
+    let wariant = if publisher.is_preview() {
+        "preview"
+    } else {
+        "full"
+    };
     // Kolejka przed dekoderem — NIE-leaky: bufory to surowe pakiety RTP, drop
     // psułby access-unity aż do najbliższego IDR. Gubienie przy spiętrzeniu
     // dopiero ZA dekoderem (queue_dec niżej), na pełnych klatkach.
     let queue_b = gst::ElementFactory::make("queue")
-        .property("name", "queue_branch_b_preview")
+        .property("name", format!("queue_branch_b{name_suffix}"))
         .property("max-size-buffers", 120u32)
         .build()
         .map_err(|e| format!("queue_b preview build: {e}"))?;
@@ -2286,7 +2304,8 @@ fn attach_mp4_branch_preview(
     let dec = gst::ElementFactory::make("avdec_h264")
         .build()
         .map_err(|e| format!("avdec_h264 build: {e}"))?;
-    let queue_dec = build_raw_leaky_queue("queue_decoded_b_preview").map_err(|e| e.to_string())?;
+    let queue_dec =
+        build_raw_leaky_queue(&format!("queue_decoded_b{name_suffix}")).map_err(|e| e.to_string())?;
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| format!("videoconvert build: {e}"))?;
@@ -2326,7 +2345,7 @@ fn attach_mp4_branch_preview(
         .build()
         .map_err(|e| format!("mp4mux build: {e}"))?;
     let sink = gst::ElementFactory::make("appsink")
-        .property("name", "sink_mp4_preview")
+        .property("name", format!("sink_mp4{name_suffix}"))
         .property("emit-signals", false)
         .property("sync", false)
         .property("max-buffers", 8u32)
@@ -2350,11 +2369,12 @@ fn attach_mp4_branch_preview(
     ];
     pipeline
         .add_many(elements)
-        .map_err(|e| format!("add_many branch B preview: {e}"))?;
+        .map_err(|e| format!("add_many branch B {wariant}: {e}"))?;
 
     // Od tego miejsca elementy SĄ w pipeline, więc KAŻDA ścieżka błędu musi je
-    // usunąć. Trzy z nich mają stałe nazwy (`queue_branch_b_preview`,
-    // `queue_decoded_b_preview`, `sink_mp4_preview`), a `gst_bin_add` odrzuca
+    // usunąć. Trzy z nich mają nazwy stałe w obrębie wariantu
+    // (`queue_branch_b{,_preview}`, `queue_decoded_b{,_preview}`,
+    // `sink_mp4{,_preview}`), a `gst_bin_add` odrzuca
     // element o nazwie już obecnej w binie — osierocona gałąź blokuje więc
     // KAŻDĄ kolejną próbę wpięcia na `add_many`, trwale, aż do przebudowy
     // pipeline'u. Dlatego kroki fallible siedzą w jednym domknięciu i mają
@@ -2362,8 +2382,8 @@ fn attach_mp4_branch_preview(
     let wired = (|| -> std::result::Result<gst::Pad, String> {
         let queue_b_sink = queue_b
             .static_pad("sink")
-            .ok_or_else(|| "queue_b preview sink pad missing".to_string())?;
-        gst::Element::link_many(elements).map_err(|e| format!("link branch B preview: {e}"))?;
+            .ok_or_else(|| format!("queue_b {wariant} sink pad missing"))?;
+        gst::Element::link_many(elements).map_err(|e| format!("link branch B {wariant}: {e}"))?;
 
         wire_mp4_appsink(&sink, publisher)?;
 
@@ -2379,7 +2399,7 @@ fn attach_mp4_branch_preview(
 
         for el in elements {
             el.sync_state_with_parent()
-                .map_err(|e| format!("sync_state branch B preview element: {e}"))?;
+                .map_err(|e| format!("sync_state branch B {wariant} element: {e}"))?;
         }
         Ok(queue_b_sink)
     })();
@@ -2407,7 +2427,7 @@ fn attach_mp4_branch_preview(
             let _ = el.set_state(gst::State::Null);
         }
         let _ = pipeline.remove_many(elements);
-        return Err("tee src_%u request for branch B preview failed".to_string());
+        return Err(format!("tee src_%u request for branch B {wariant} failed"));
     };
     if let Err(e) = tee_src_pad.link(&queue_b_sink) {
         detach_mp4_branch(
@@ -2418,7 +2438,7 @@ fn attach_mp4_branch_preview(
                 elements: elements.iter().map(|el| (*el).clone()).collect(),
             },
         );
-        return Err(format!("tee → queue_b preview: {e:?}"));
+        return Err(format!("tee → queue_b {wariant}: {e:?}"));
     }
 
     // Jak w gałęzi passthrough: nowy widz wpina się w działający strumień, a

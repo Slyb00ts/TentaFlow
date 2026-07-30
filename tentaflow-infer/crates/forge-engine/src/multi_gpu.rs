@@ -286,11 +286,16 @@ pub fn measure_device(
     kernels: &forge_kernels::Kernels,
     quant: forge_types::QuantKind,
 ) -> Result<DeviceCapability> {
-    let free_bytes = device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
+    // Wolne miejsce odczytywane PO sondach, nie przed. Sondy biorą swoje bufory
+    // z tej samej puli wag i ich nie zwracają, więc odczyt sprzed nich obiecywał
+    // podziałowi pamięć, której już nie było — karta modelu, mająca i tak
+    // najmniej luzu, kończyła ładowanie fragmentów brakiem pamięci.
+    let stream_bytes_per_s = measure_gemv(device, kernels, quant)?;
+    let matmul_ops_per_s = measure_matmul(device, kernels, quant)?;
     Ok(DeviceCapability {
-        stream_bytes_per_s: measure_gemv(device, kernels, quant)?,
-        matmul_ops_per_s: measure_matmul(device, kernels, quant)?,
-        free_bytes,
+        stream_bytes_per_s,
+        matmul_ops_per_s,
+        free_bytes: device.pool_available(forge_hal::Pool::Weights).unwrap_or(0),
     })
 }
 
@@ -520,7 +525,14 @@ mod tests {
 
     #[test]
     fn podzial_idzie_za_pasmem_w_dekodowaniu() {
-        let plan = plan_split(&measured_pair(), 17408, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
+        let plan = plan_split(
+            &measured_pair(),
+            17408,
+            WorkKind::MemoryBound,
+            0,
+            MIN_USEFUL_ROWS,
+        )
+        .unwrap();
         assert_eq!(plan.total(), 17408);
         // 336 / (336+735) = 31,4%
         let share = plan.rows[0] as f64 / 17408.0;
@@ -547,13 +559,23 @@ mod tests {
         );
         // 97 / (97+43) = 69,3%
         let share = prefill.rows[0] as f64 / 17408.0;
-        assert!((share - 0.693).abs() < 0.01, "udział 6900 XT w prefillu: {share}");
+        assert!(
+            (share - 0.693).abs() < 0.01,
+            "udział 6900 XT w prefillu: {share}"
+        );
     }
 
     #[test]
     fn suma_udzialow_jest_dokladna_takze_przy_brzydkich_liczbach() {
         for rows in [129, 1000, 4097, 17408, 248320] {
-            let plan = plan_split(&measured_pair(), rows, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
+            let plan = plan_split(
+                &measured_pair(),
+                rows,
+                WorkKind::MemoryBound,
+                0,
+                MIN_USEFUL_ROWS,
+            )
+            .unwrap();
             assert_eq!(plan.total(), rows, "rows={rows}");
             assert_eq!(plan.offset(0), 0);
             assert_eq!(plan.offset(1), plan.rows[0]);
@@ -567,7 +589,11 @@ mod tests {
         caps[1].free_bytes = 1000 * 4096;
         let plan = plan_split(&caps, 8000, WorkKind::MemoryBound, 4096, MIN_USEFUL_ROWS).unwrap();
         assert_eq!(plan.total(), 8000);
-        assert!(plan.rows[1] <= 1000, "przydział ponad pojemność: {:?}", plan.rows);
+        assert!(
+            plan.rows[1] <= 1000,
+            "przydział ponad pojemność: {:?}",
+            plan.rows
+        );
         assert_eq!(plan.rows[0], 8000 - plan.rows[1]);
     }
 
@@ -576,7 +602,8 @@ mod tests {
         let mut caps = measured_pair();
         caps[0].free_bytes = 1024;
         caps[1].free_bytes = 1024;
-        let error = plan_split(&caps, 8000, WorkKind::MemoryBound, 4096, MIN_USEFUL_ROWS).unwrap_err();
+        let error =
+            plan_split(&caps, 8000, WorkKind::MemoryBound, 4096, MIN_USEFUL_ROWS).unwrap_err();
         assert!(matches!(error, ForgeError::OutOfMemory { .. }));
     }
 
@@ -584,7 +611,14 @@ mod tests {
     fn mala_praca_nie_jest_dzielona() {
         // Poniżej progu opłacalności wszystko idzie na najszybszą kartę —
         // wymiana aktywacji kosztuje 6,45 us i przy paru wierszach się nie zwraca.
-        let plan = plan_split(&measured_pair(), 64, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
+        let plan = plan_split(
+            &measured_pair(),
+            64,
+            WorkKind::MemoryBound,
+            0,
+            MIN_USEFUL_ROWS,
+        )
+        .unwrap();
         assert_eq!(plan.rows, vec![0, 64]);
     }
 
@@ -607,13 +641,10 @@ mod tests {
         let mut spread_before = f64::MAX;
         for _ in 0..40 {
             let plan = plan_split(&caps, rows, WorkKind::MemoryBound, 0, MIN_USEFUL_ROWS).unwrap();
-            let elapsed: Vec<f64> = (0..2)
-                .map(|i| plan.rows[i] as f64 / truth[i])
-                .collect();
+            let elapsed: Vec<f64> = (0..2).map(|i| plan.rows[i] as f64 / truth[i]).collect();
             let spread = (elapsed[0] - elapsed[1]).abs() / elapsed[0].max(elapsed[1]);
             spread_before = spread;
-            update_capability(&mut caps, &plan.rows, &elapsed, WorkKind::MemoryBound, 0.5)
-                .unwrap();
+            update_capability(&mut caps, &plan.rows, &elapsed, WorkKind::MemoryBound, 0.5).unwrap();
         }
         // Po zbieżności obie karty kończą praktycznie razem.
         assert!(
@@ -647,8 +678,7 @@ mod tests {
         let mut caps = measured_pair();
         assert!(update_capability(&mut caps, &[1], &[1.0], WorkKind::MemoryBound, 0.5).is_err());
         assert!(
-            update_capability(&mut caps, &[1, 1], &[1.0, 1.0], WorkKind::MemoryBound, 2.0)
-                .is_err()
+            update_capability(&mut caps, &[1, 1], &[1.0, 1.0], WorkKind::MemoryBound, 2.0).is_err()
         );
     }
 }
