@@ -725,3 +725,44 @@ Kolejność prac, jaką wyznaczają te liczby:
    (`gather_q4_k_*`, `deltanet_prepare_tokens_f16_t32`,
    `gemv_q6_k_dp4a_batch_out_f32_*`) należą do wszystkich zestawów i trafią tam
    przy najbliższym buildzie na tamtych kartach. gfx1201 przechodzi.
+
+## Sufit pasma i rola Infinity Cache (zmierzone)
+
+R9700 ma 64 MB Infinity Cache (L3), 8 MB L2, 64 CU. Zmierzona przepustowość
+odczytu zależy od tego, czy zbiór roboczy MIEŚCI SIĘ w L3 i jest ponownie
+używany:
+
+| zbiór roboczy | przepustowość |
+|---|--:|
+| 48 MiB | **1033 GB/s** |
+| 64 MiB | **1124 GB/s** |
+| 256 MiB | 572 GB/s |
+| 1 GiB | 519 GB/s |
+| 4 GiB | **552 GB/s** |
+
+Wniosek jest jednoznaczny: Infinity Cache daje około **dwukrotność** pasma
+VRAM, ale WYŁĄCZNIE przy ponownym użyciu danych mieszczących się w 64 MB.
+
+**Dekodowanie tego nie spełnia i spełnić nie może.** Krok dekodu czyta ~16,1 GB
+wag — 250 razy więcej, niż mieści L3 — i czyta każdy bajt DOKŁADNIE RAZ. Zanim
+kolejny token sięgnie po tę samą wagę, przez cache przepłynęło 16 GB, więc jest
+ona dawno wyparta. Cache nie jest tu „źle użyty": jest zarządzany sprzętowo i po
+prostu nie ma czego przyspieszyć.
+
+Sufitem dekodowania jest więc strumieniowe pasmo VRAM, ~552 GB/s:
+
+    16,1 GB / 552 GB/s = 29,2 ms/token = 34,1 tok/s
+
+To jest TWARDA granica dla Q4_K_M na jednej karcie, nie cel do pobicia.
+Zmierzone: FORGE 29,2 tok/s (86% sufitu), llama.cpp Vulkan 31,95 (94%).
+Dwie karty dają 36,0 tok/s, czyli WIĘCEJ niż sufit jednej — bo dzielenie wag
+podnosi sam sufit.
+
+Prefill korzysta z L3 naprawdę: macierz jest tam używana wielokrotnie w kaflu
+GEMM, a 48-59 MB mieści się w 64 MB. Stąd 1322 tok/s.
+
+Praktyczny wniosek: pojedynczego dekodowania nie da się rozpędzić powyżej
+~34 tok/s żadną optymalizacją kerneli. Przez tę ścianę przechodzi się TYLKO
+podnosząc intensywność arytmetyczną — spekulacją (MTP weryfikuje T tokenów na
+jednym odczycie wag) albo batchem. Dlatego MTP daje 79,5 tok/s przy tym samym
+paśmie.
