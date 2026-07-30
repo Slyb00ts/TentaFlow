@@ -3368,6 +3368,78 @@ pub async fn ml_studio_classifier_train_start(
     ))
 }
 
+#[handler(variant = "MlStudioTrainCancelRequest", since = (1, 0))]
+/// Anuluje TRWAJĄCY run treningowy — wspólne wejście dla wszystkich torów.
+/// Kolejność jest istotna: najpierw flaga w Core (widzą ją pętle nadzoru i pętla
+/// transferu datasetu przez mesh), potem `/cancel` na serwisie treningowym. Gdy
+/// trening biegnie na węźle B, żądanie idzie tam komendą mesh — flaga na A i tak
+/// domknie run po stronie inicjatora, więc nieosiągalny węzeł B nie zostawia
+/// runu na wieki w stanie `running`.
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_train_cancel(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::TrainCancelRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioTrainCancelRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let run = repository::get_training_run(&payload.run_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
+    require_project_editor(&org.user_id, &run.project_id)?;
+
+    // Run już domknięty — nie ma czego anulować (i nie jest to błąd wołającego).
+    if !matches!(run.status.as_str(), "running" | "syncing") {
+        return Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::TrainCancelResponse(tentaflow_protocol::MlStudioTrainCancelResponse {
+                run_id: payload.run_id.clone(),
+                status: run.status,
+                cancelled: false,
+            }),
+        ));
+    }
+
+    crate::ml_studio::live_view::request_cancel(&payload.run_id);
+
+    let local_node = ctx.state.local_node_id.to_string();
+    let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    match run_node.filter(|n| *n != local_node) {
+        Some(node) => {
+            if let Some(iroh) = ctx.state.quic_mesh.clone() {
+                let cmd = tentaflow_protocol::mesh::MeshCommandType::MlTrainCancel {
+                    run_id: payload.run_id.clone(),
+                };
+                if let Err(e) = iroh.send_command_and_wait(&node, cmd, 30).await {
+                    // Węzeł B nieosiągalny: flaga na A domknie run przy najbliższym
+                    // obiegu, więc logujemy i idziemy dalej zamiast zwracać błąd.
+                    tracing::warn!(run_id = %payload.run_id, node = %node, error = %e,
+                        "mesh train cancel nie dotarł do węzła treningowego");
+                }
+            }
+        }
+        None => {
+            crate::ml_studio::live_view::cancel_local_job(&payload.run_id).await;
+        }
+    }
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::TrainCancelResponse(tentaflow_protocol::MlStudioTrainCancelResponse {
+            run_id: payload.run_id.clone(),
+            status: "cancelling".to_string(),
+            cancelled: true,
+        }),
+    ))
+}
+
 #[handler(variant = "MlStudioGenericTrainStatusRequest", since = (1, 0))]
 /// Guarded by `require_project_member` on the run's project. Not read-only: the
 /// poll is also the reconcile point of the training run, so it mirrors the
@@ -6387,6 +6459,8 @@ mod policy_tests {
             "MlStudioFtTrainStartRequest",
             "MlStudioRecogTrainStartRequest",
             "MlStudioClassifierTrainStartRequest",
+            "MlStudioOcrTrainStartRequest",
+            "MlStudioTrainCancelRequest",
             "MlStudioTabularTrainRequest",
             "MlStudioRecogSaveAnnotationsRequest",
             "MlStudioVisionModelDeleteRequest",

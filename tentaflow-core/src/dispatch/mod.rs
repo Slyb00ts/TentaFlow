@@ -771,6 +771,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ClassifierTrainStartResponse(_) => {
                 "MlStudioClassifierTrainStartResponse"
             }
+            tentaflow_protocol::MlStudioPayload::OcrTrainStartRequest(_) => {
+                "MlStudioOcrTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::OcrTrainStartResponse(_) => {
+                "MlStudioOcrTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainCancelRequest(_) => {
+                "MlStudioTrainCancelRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainCancelResponse(_) => {
+                "MlStudioTrainCancelResponse"
+            }
             tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(_) => {
                 "MlStudioGenericTrainStatusRequest"
             }

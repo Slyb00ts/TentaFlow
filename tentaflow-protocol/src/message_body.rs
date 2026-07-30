@@ -2232,6 +2232,62 @@ pub struct MlStudioGenericTrainStatusResponse {
     pub stage: String,
 }
 
+/// Anulowanie TRWAJĄCEGO treningu ML Studio — jeden wariant dla wszystkich torów
+/// (detekcja, klasyfikator, OCR, LLM), bo run zna swój tor po `config_json`.
+/// Handler woła `/cancel` serwisu treningowego (lokalnie albo przez mesh na węźle
+/// treningowym) i podnosi flagę anulowania, którą widzą pętle nadzoru Core.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainCancelRequest {
+    pub run_id: String,
+}
+
+/// `cancelled = false` znaczy „nie było co anulować" (run już się zakończył);
+/// `status` to stan runu po żądaniu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainCancelResponse {
+    pub run_id: String,
+    pub status: String,
+    pub cancelled: bool,
+}
+
+/// Hiperparametry treningu czytnika OCR (CRNN + CTC) na wierszach tablic.
+/// `synthetic_per_epoch` to liczba próbek syntetycznych generowanych na epokę
+/// (0 = trening wyłącznie na realnych wierszach), `real_repeat` ile razy realne
+/// wiersze są powtarzane w epoce — realnych etykiet jest z natury mało, więc bez
+/// powtórzeń syntetyk by je zdominował.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioOcrHyperparams {
+    pub epochs: i32,
+    pub batch_size: i32,
+    pub learning_rate: f32,
+    pub synthetic_per_epoch: i32,
+    pub real_repeat: i32,
+}
+
+/// Start treningu CZYTNIKA OCR na wierszach wycinków (np. atrybut "kod" klasy
+/// `tablica_adr` o wartościach w formacie `<kemler>/<UN>`). Wycinki, podział na
+/// wiersze i etykiety buduje SERWIS `ocr-training`; Core przekazuje dataset +
+/// specyfikację atrybutu. Biegnie ASYNCHRONICZNIE (zob. `train_ocr.rs`); UI pyta
+/// o postęp przez `MlStudioGenericTrainStatusRequest`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioOcrTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub attribute: String,
+    pub source_class: String,
+    pub hyperparams: MlStudioOcrHyperparams,
+    /// Węzeł docelowy treningu: "" = trening lokalny; inny node_id → trening na
+    /// zdalnym węźle (Node B) przez komendę mesh, status proxowany z powrotem.
+    #[serde(default)]
+    pub target_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioOcrTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
 /// Żądanie eksportu wytrenowanego modelu FT do GGUF. Eksport (merge adaptera +
 /// konwersja) trwa, więc biegnie ASYNCHRONICZNIE w tle Core (zob.
 /// `export_llm.rs`); odpowiedź wraca natychmiast, a UI odpytuje przez
@@ -2908,6 +2964,10 @@ pub enum MlStudioPayload {
     RemoteImportStartResponse(MlStudioRemoteImportStartResponse),
     RemoteImportStatusRequest(MlStudioRemoteImportStatusRequest),
     RemoteImportStatusResponse(MlStudioRemoteImportStatusResponse),
+    TrainCancelRequest(MlStudioTrainCancelRequest),
+    TrainCancelResponse(MlStudioTrainCancelResponse),
+    OcrTrainStartRequest(MlStudioOcrTrainStartRequest),
+    OcrTrainStartResponse(MlStudioOcrTrainStartResponse),
 }
 
 // ----- Robots screen (UserSession) -----

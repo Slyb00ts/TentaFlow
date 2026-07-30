@@ -153,13 +153,16 @@ def _supports_bf16() -> bool:
 @dataclass
 class JobState:
     job_id: str
-    status: str = "running"  # running | succeeded | failed
+    status: str = "running"  # running | succeeded | failed | cancelled
     step: int = 0
     total_steps: int = 0
     train_loss: Optional[float] = None
     eval_loss: Optional[float] = None
     error: Optional[str] = None
     output_dir: str = ""
+    # Żądanie anulowania (`POST /cancel/{job_id}`) — ProgressCallback zatrzymuje
+    # Trainer na najbliższym kroku, a worker zamyka job jako `cancelled`.
+    cancel_requested: bool = False
     artifact_path: Optional[str] = None
 
     def snapshot(self) -> dict[str, Any]:
@@ -235,6 +238,12 @@ def _update(job_id: str, **changes: Any) -> None:
             setattr(st, key, value)
 
 
+def _cancel_requested(job_id: str) -> bool:
+    with _JOBS_LOCK:
+        st = _JOBS.get(job_id)
+        return bool(st and st.cancel_requested)
+
+
 class ProgressCallback(TrainerCallback):
     """Mostek między Trainerem a globalnym słownikiem statusów."""
 
@@ -246,6 +255,8 @@ class ProgressCallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001
         _update(self.job_id, step=int(state.global_step))
+        if _cancel_requested(self.job_id):
+            control.should_training_stop = True
 
     def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: ANN001
         if not logs:
@@ -595,7 +606,10 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             artifact = _run_sft(req, job_id)
         else:
             raise ValueError(f"unknown objective: {req.objective}")
-        _update(job_id, status="succeeded", artifact_path=artifact)
+        if _cancel_requested(job_id):
+            _update(job_id, status="cancelled")
+        else:
+            _update(job_id, status="succeeded", artifact_path=artifact)
     except torch.cuda.OutOfMemoryError as exc:  # noqa: PERF203
         torch.cuda.empty_cache()
         _update(job_id, status="failed", error=f"CUDA OOM: {exc}")
@@ -811,6 +825,21 @@ def status(job_id: str) -> dict[str, Any]:
         if st is None:
             raise HTTPException(404, f"unknown job: {job_id}")
         return st.snapshot()
+
+
+@app.post("/cancel/{job_id}")
+def cancel(job_id: str) -> dict[str, Any]:
+    """Podnosi flagę anulowania; Trainer zatrzymuje się na najbliższym kroku
+    (`should_training_stop`), a worker zamyka job jako `cancelled`. Job już
+    zakończony wraca z `cancelled: false`."""
+    with _JOBS_LOCK:
+        st = _JOBS.get(job_id)
+        if st is None:
+            raise HTTPException(404, f"unknown job: {job_id}")
+        if st.status != "running":
+            return {"job_id": job_id, "status": st.status, "cancelled": False}
+        st.cancel_requested = True
+        return {"job_id": job_id, "status": st.status, "cancelled": True}
 
 
 @app.get("/models/{job_id}/path")

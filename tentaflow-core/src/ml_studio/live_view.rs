@@ -57,6 +57,63 @@ pub fn local_job(run_id: &str) -> Option<(String, String)> {
         .and_then(|m| m.get(run_id).cloned())
 }
 
+// Runy, dla których użytkownik zażądał anulowania. Rejestr jest niezależny od
+// rejestru jobów, bo żądanie może zastać run w KAŻDEJ fazie: pakowania datasetu,
+// transferu przez mesh albo już właściwego treningu. Każda z tych pętli sprawdza
+// tę flagę i kończy pracę, a serwis treningowy dostaje osobno `POST /cancel`.
+static CANCEL_REQUESTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn cancel_requests() -> &'static Mutex<std::collections::HashSet<String>> {
+    CANCEL_REQUESTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Zapisuje żądanie anulowania runu (pętle treningu/transferu je zobaczą).
+pub fn request_cancel(run_id: &str) {
+    if let Ok(mut m) = cancel_requests().lock() {
+        m.insert(run_id.to_string());
+    }
+}
+
+/// Czy dla runu zażądano anulowania.
+pub fn is_cancel_requested(run_id: &str) -> bool {
+    cancel_requests()
+        .lock()
+        .map(|m| m.contains(run_id))
+        .unwrap_or(false)
+}
+
+/// Zdejmuje żądanie anulowania (po domknięciu runu — bez tego kolejny run o tym
+/// samym id nigdy by nie wystartował; id są UUID, więc to czysto higieniczne).
+pub fn clear_cancel(run_id: &str) {
+    if let Ok(mut m) = cancel_requests().lock() {
+        m.remove(run_id);
+    }
+}
+
+/// Blokujący `POST {base}/cancel/{job_id}` do serwisu treningowego. Zwraca `true`,
+/// gdy serwis przyjął żądanie. Brak endpointu / błąd sieci → `false`: flaga
+/// `request_cancel` i tak zatrzyma pętlę nadzoru po stronie Core.
+pub fn cancel_service_job_blocking(base: &str, job_id: &str) -> bool {
+    let url = format!("{}/cancel/{}", base.trim_end_matches('/'), job_id);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .build()
+        .into();
+    agent.post(&url).send_empty().is_ok()
+}
+
+/// Anuluje LOKALNY job treningowy runu: zapisuje flagę i woła `/cancel` serwisu.
+/// Zwraca `true`, gdy serwis potwierdził przyjęcie żądania.
+pub async fn cancel_local_job(run_id: &str) -> bool {
+    request_cancel(run_id);
+    let Some((base, job_id)) = local_job(run_id) else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || cancel_service_job_blocking(&base, &job_id))
+        .await
+        .unwrap_or(false)
+}
+
 /// Parsuje pola live-view z surowej odpowiedzi `/status` serwisu treningowego.
 /// Toleruje brak każdego pola (defaulty). Publiczne, by handlery zdalne (mesh)
 /// mogły reużyć tę samą logikę na `status_json` z węzła B.

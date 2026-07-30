@@ -602,6 +602,12 @@ pub enum MeshCommandType {
         recording_refs: Vec<String>,
         target_node_id: String,
     },
+    /// ML Studio: anuluj zdalny trening o `run_id` (odbiorca woła `POST /cancel`
+    /// swojego lokalnego serwisu treningowego). Odpowiedź: Empty (ok/error).
+    /// Appended at END (ciborium index rule).
+    MlTrainCancel {
+        run_id: String,
+    },
 }
 
 /// Per-node spec distributed-deployu policzony przez koordynatora z
@@ -995,6 +1001,10 @@ impl std::fmt::Debug for MeshCommandType {
                 .finish(),
             Self::MlTrainStatus { run_id } => f
                 .debug_struct("MlTrainStatus")
+                .field("run_id", run_id)
+                .finish(),
+            Self::MlTrainCancel { run_id } => f
+                .debug_struct("MlTrainCancel")
                 .field("run_id", run_id)
                 .finish(),
             Self::MlDatasetChunk { dataset_hash, seq, total, data_b64 } => f

@@ -473,6 +473,9 @@ impl MeshCommandExecutor {
                 self.handle_ml_train_start(run_id, spec_json).await
             }
             MeshCommandType::MlTrainStatus { run_id } => self.handle_ml_train_status(run_id).await,
+            MeshCommandType::MlTrainCancel { run_id } => {
+                self.handle_ml_train_cancel(run_id).await
+            }
             MeshCommandType::MlDatasetChunk {
                 dataset_hash,
                 seq,
@@ -1072,6 +1075,22 @@ impl MeshCommandExecutor {
                 CommandResponse::ok(MeshCommandResponsePayload::MlTrainStatusResult { status_json })
             }
             Err(e) => CommandResponse::fail(format!("mesh train status: {}", e)),
+        }
+    }
+
+    /// Owner side: anuluje trening zlecony tu przez mesh. Ten sam router rejestrów
+    /// co status — jeden `run_id` istnieje w dokładnie jednym z nich.
+    async fn handle_ml_train_cancel(&self, run_id: String) -> CommandResponse {
+        let res = if crate::ml_studio::train_llm::is_llm_mesh_job(&run_id) {
+            crate::ml_studio::train_llm::mesh_train_cancel_llm(&run_id).await
+        } else if crate::ml_studio::train_classifier::is_classifier_mesh_job(&run_id) {
+            crate::ml_studio::train_classifier::mesh_train_cancel_classifier(&run_id).await
+        } else {
+            crate::ml_studio::train_recognition::mesh_train_cancel(&run_id).await
+        };
+        match res {
+            Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+            Err(e) => CommandResponse::fail(format!("mesh train cancel: {}", e)),
         }
     }
 

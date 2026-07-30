@@ -160,6 +160,13 @@ async fn run_training_against_dir(
                 JOB_TIMEOUT.as_secs()
             );
         }
+        // Anulowanie zgłoszone przez użytkownika: serwis dostał już `POST /cancel`
+        // od handlera, więc pętla nadzoru nie ma czego pilnować.
+        if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+            repository::update_training_run_status(run_id, "cancelled")?;
+            crate::ml_studio::live_view::clear_cancel(run_id);
+            return Ok(());
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
 
         let url = status_url.clone();
@@ -178,6 +185,11 @@ async fn run_training_against_dir(
 
         match st.status.as_str() {
             "running" => continue,
+            "cancelled" => {
+                repository::update_training_run_status(run_id, "cancelled")?;
+                crate::ml_studio::live_view::clear_cancel(run_id);
+                return Ok(());
+            }
             "succeeded" => {
                 let metrics_json = json!({
                     "task": "classifier",
@@ -339,6 +351,25 @@ pub async fn mesh_train_start_classifier(run_id: &str, spec_json: &str) -> anyho
         .lock()
         .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
         .insert(run_id.to_string(), (base, job_id));
+    Ok(())
+}
+
+/// B-side (odbiorca `MlTrainCancel`): woła `/cancel` lokalnego serwisu klasyfikatora
+/// dla joba zmapowanego z `run_id`.
+pub async fn mesh_train_cancel_classifier(run_id: &str) -> anyhow::Result<()> {
+    let (base, job_id) = mesh_jobs()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
+        .get(run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany run_id na tym nodzie: {}", run_id))?;
+    let ok = tokio::task::spawn_blocking(move || {
+        crate::ml_studio::live_view::cancel_service_job_blocking(&base, &job_id)
+    })
+    .await?;
+    if !ok {
+        anyhow::bail!("serwis klasyfikatora odrzucił żądanie anulowania");
+    }
     Ok(())
 }
 

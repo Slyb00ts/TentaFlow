@@ -206,6 +206,13 @@ async fn run_training_against_dir(
                 JOB_TIMEOUT.as_secs()
             );
         }
+        // Anulowanie zgłoszone przez użytkownika: serwis dostał już `POST /cancel`
+        // od handlera, więc pętla nadzoru nie ma czego pilnować.
+        if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+            repository::update_training_run_status(run_id, "cancelled")?;
+            crate::ml_studio::live_view::clear_cancel(run_id);
+            return Ok(());
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
 
         let url = status_url.clone();
@@ -221,6 +228,11 @@ async fn run_training_against_dir(
 
         match st.status.as_str() {
             "running" => continue,
+            "cancelled" => {
+                repository::update_training_run_status(run_id, "cancelled")?;
+                crate::ml_studio::live_view::clear_cancel(run_id);
+                return Ok(());
+            }
             "succeeded" => {
                 let metrics_json = json!({
                     "train_loss": st.train_loss,
@@ -889,18 +901,31 @@ pub fn spawn_mesh_dataset_push_and_train(
             Err(e) => Err(anyhow::anyhow!("zip join: {}", e)),
         };
         if let Err(err) = result {
-            tracing::warn!(run_id = %run_id, error = %err, "mesh dataset push/train failed");
-            set_recog_sync(
-                &run_id,
-                DatasetSyncProgress {
-                    phase: "error".into(),
-                    error: Some(err.to_string()),
-                    ..Default::default()
-                },
-            );
-            let _ = repository::update_training_run_status(&run_id, "failed");
+            finish_failed_mesh_push(&run_id, &err, "mesh dataset push/train failed");
         }
     });
+}
+
+/// Domyka run, którego transfer datasetu przez mesh się nie udał. Anulowanie
+/// przez użytkownika kończy run jako `cancelled` (nie `failed`) i nie zostawia
+/// paska błędu w UI — to nie awaria, tylko decyzja operatora.
+fn finish_failed_mesh_push(run_id: &str, err: &anyhow::Error, log_msg: &str) {
+    if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+        clear_recog_sync(run_id);
+        let _ = repository::update_training_run_status(run_id, "cancelled");
+        crate::ml_studio::live_view::clear_cancel(run_id);
+        return;
+    }
+    tracing::warn!(run_id = %run_id, error = %err, "{}", log_msg);
+    set_recog_sync(
+        run_id,
+        DatasetSyncProgress {
+            phase: "error".into(),
+            error: Some(err.to_string()),
+            ..Default::default()
+        },
+    );
+    let _ = repository::update_training_run_status(run_id, "failed");
 }
 
 /// Wariant generyczny: transfer GOTOWEGO zip-a (np. spakowany blob JSONL dla LLM)
@@ -924,16 +949,7 @@ pub fn spawn_mesh_push_and_train(
         )
         .await
         {
-            tracing::warn!(run_id = %run_id, error = %err, "mesh blob push/train failed");
-            set_recog_sync(
-                &run_id,
-                DatasetSyncProgress {
-                    phase: "error".into(),
-                    error: Some(err.to_string()),
-                    ..Default::default()
-                },
-            );
-            let _ = repository::update_training_run_status(&run_id, "failed");
+            finish_failed_mesh_push(&run_id, &err, "mesh blob push/train failed");
         }
     });
 }
@@ -967,6 +983,11 @@ async fn mesh_push_and_train(
     let mut rate_bps: u64 = 0;
     let mut seq: u32 = 0;
     while seq < total_chunks {
+        // Anulowanie w trakcie transferu: przerywamy wysyłkę zamiast dowozić kilka
+        // GB datasetu na węzeł, na którym trening już nie ma wystartować.
+        if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+            anyhow::bail!("anulowane przez użytkownika");
+        }
         if last_advance.elapsed() > SYNC_STALL_TIMEOUT {
             anyhow::bail!(
                 "transfer datasetu utknął — brak postępu przez {}s",
@@ -1266,6 +1287,26 @@ pub async fn mesh_train_start(run_id: &str, spec_json: &str) -> anyhow::Result<(
         .lock()
         .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
         .insert(run_id.to_string(), (base, job_id));
+    Ok(())
+}
+
+/// B-side (odbiorca `MlTrainCancel`): woła `/cancel` lokalnego serwisu dla joba
+/// zmapowanego z `run_id`. Postęp anulowania inicjator zobaczy przez zwykły status
+/// (serwis przechodzi w `cancelled`).
+pub async fn mesh_train_cancel(run_id: &str) -> anyhow::Result<()> {
+    let (base, job_id) = mesh_jobs()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
+        .get(run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany run_id na tym nodzie: {}", run_id))?;
+    let ok = tokio::task::spawn_blocking(move || {
+        crate::ml_studio::live_view::cancel_service_job_blocking(&base, &job_id)
+    })
+    .await?;
+    if !ok {
+        anyhow::bail!("serwis treningowy odrzucił żądanie anulowania");
+    }
     Ok(())
 }
 

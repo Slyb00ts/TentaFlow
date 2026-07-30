@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import gc
 import json
+import multiprocessing
 import os
 import threading
 import time
@@ -47,6 +48,8 @@ _JOBS: dict[str, "JobState"] = {}
 _JOBS_LOCK = threading.Lock()
 # Jeden trening naraz — RF-DETR wysyca GPU; równoległe joby = OOM.
 _TRAIN_SLOT = threading.Semaphore(1)
+# Plik, do którego proces potomny treningu zapisuje traceback przed wyjściem.
+_CHILD_ERROR_FILE = "train_error.txt"
 _EXPORTS: dict[str, "ExportState"] = {}
 _EXPORTS_LOCK = threading.Lock()
 _EXPORT_SLOT = threading.Semaphore(1)
@@ -67,7 +70,7 @@ def _gpu_mem_mb() -> float:
 @dataclass
 class JobState:
     job_id: str
-    status: str = "running"  # running | succeeded | failed
+    status: str = "running"  # running | succeeded | failed | cancelled
     epoch: int = 0
     total_epochs: int = 0
     train_loss: Optional[float] = None
@@ -79,6 +82,11 @@ class JobState:
     stage: str = "przygotowanie"
     # Znacznik startu joba (monotoniczny) do liczenia elapsed_s/eta_s.
     start_time: float = field(default_factory=time.monotonic)
+    # Żądanie anulowania złożone przez Core (`POST /cancel/{job_id}`). Worker ubija
+    # proces potomny treningu, gdy je zobaczy.
+    cancel_requested: bool = False
+    # PID procesu potomnego treningu (diagnostyka; ubijaniem steruje worker).
+    pid: Optional[int] = None
 
     def snapshot(self) -> dict[str, Any]:
         elapsed = time.monotonic() - self.start_time
@@ -249,30 +257,18 @@ def _resolve_variant(variant: str):  # noqa: ANN001
     return getattr(rfdetr, name)
 
 
-def _train_worker(req: TrainRequest, job_id: str) -> None:
-    output_dir = _sanitize_output_dir(req.output_dir)
-    metrics_csv = os.path.join(output_dir, "metrics.csv")
-    stop_poll = threading.Event()
+def _train_child(payload: dict[str, Any], output_dir: str) -> None:
+    """Ciało treningu wykonywane w PROCESIE POTOMNYM (start metodą "spawn").
 
-    # Wątek-poller: w trakcie treningu odświeża status z metrics.csv co 5 s,
-    # żeby Core widział postęp (RF-DETR/PTL nie daje prostego callbacku metryk).
-    def poll_metrics() -> None:
-        while not stop_poll.wait(5.0):
-            m = _read_metrics(metrics_csv)
-            if m:
-                _update(
-                    job_id,
-                    epoch=m.get("epoch") or 0,
-                    train_loss=m.get("train_loss"),
-                    map50=m.get("map50"),
-                    map50_95=m.get("map50_95"),
-                    stage="trening",
-                )
-
-    poller = threading.Thread(target=poll_metrics, daemon=True)
-    poller.start()
+    `RFDETR.train()` to jedno blokujące wywołanie bez callbacku, więc jedynym
+    natychmiastowym i pewnym sposobem anulowania jest ubicie procesu — to także
+    zwalnia całą pamięć GPU bez zdawania się na `empty_cache()`. Postęp wraca do
+    rodzica przez `metrics.csv`, który RF-DETR zapisuje w `output_dir` (rodzic i tak
+    go pollował), więc żaden dodatkowy kanał IPC nie jest potrzebny. Wyjątek trafia
+    do `error.txt` w `output_dir` i kończy proces kodem != 0.
+    """
     try:
-        os.makedirs(output_dir, exist_ok=True)
+        req = TrainRequest(**payload)
         cls = _resolve_variant(req.variant)
         model = cls(gradient_checkpointing=True)
         hp = req.hyperparams
@@ -291,7 +287,80 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             run_test=True,
             log_per_class_metrics=True,
         )
-        stop_poll.set()
+    except BaseException as exc:  # noqa: BLE001
+        try:
+            with open(os.path.join(output_dir, _CHILD_ERROR_FILE), "w", encoding="utf-8") as f:
+                f.write(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(1)
+    os._exit(0)
+
+
+def _train_worker(req: TrainRequest, job_id: str) -> None:
+    output_dir = _sanitize_output_dir(req.output_dir)
+    metrics_csv = os.path.join(output_dir, "metrics.csv")
+    proc = None
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        # Stary ślad błędu z poprzedniego przebiegu tego samego output_dir nie może
+        # zostać odczytany jako przyczyna TEGO joba.
+        err_path = os.path.join(output_dir, _CHILD_ERROR_FILE)
+        if os.path.exists(err_path):
+            os.remove(err_path)
+
+        # "spawn", nie "fork": rodzic ma zainicjowaną CUDA (m.in. `_gpu_mem_mb`),
+        # a forkowanie procesu z aktywnym kontekstem CUDA jest niepoprawne.
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(
+            target=_train_child,
+            args=(req.model_dump(), output_dir),
+            daemon=False,
+        )
+        proc.start()
+        with _JOBS_LOCK:
+            state = _JOBS.get(job_id)
+            if state is not None:
+                state.pid = proc.pid
+
+        # Pętla nadzoru: postęp z metrics.csv + reakcja na żądanie anulowania.
+        while proc.is_alive():
+            proc.join(timeout=2.0)
+            with _JOBS_LOCK:
+                state = _JOBS.get(job_id)
+                cancel = bool(state and state.cancel_requested)
+            if cancel and proc.is_alive():
+                _update(job_id, stage="anulowanie")
+                proc.terminate()
+                proc.join(timeout=30.0)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=10.0)
+                _update(job_id, status="cancelled", stage="anulowany")
+                return
+            m = _read_metrics(metrics_csv)
+            if m:
+                _update(
+                    job_id,
+                    epoch=m.get("epoch") or 0,
+                    train_loss=m.get("train_loss"),
+                    map50=m.get("map50"),
+                    map50_95=m.get("map50_95"),
+                    stage="trening",
+                )
+
+        if proc.exitcode != 0:
+            detail = ""
+            try:
+                with open(err_path, encoding="utf-8") as f:
+                    detail = f.read()
+            except OSError:
+                detail = ""
+            raise RuntimeError(
+                f"proces treningu zakończył się kodem {proc.exitcode}"
+                + (f"\n{detail}" if detail else "")
+            )
+
         _update(job_id, stage="ewaluacja")
         # Po treningu domykamy metryki finalnym odczytem (test mAP).
         m = _read_metrics(metrics_csv)
@@ -300,21 +369,22 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
         _update(
             job_id,
             status="succeeded",
-            epoch=m.get("epoch") or hp.epochs,
+            epoch=m.get("epoch") or req.hyperparams.epochs,
             train_loss=m.get("train_loss"),
             map50=m.get("map50"),
             map50_95=m.get("map50_95"),
             artifact_path=artifact,
         )
     except Exception as exc:  # noqa: BLE001
-        stop_poll.set()
         _update(
             job_id,
             status="failed",
             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
         )
     finally:
-        stop_poll.set()
+        if proc is not None and proc.is_alive():
+            proc.kill()
+            proc.join(timeout=10.0)
         try:
             import torch
 
@@ -415,6 +485,21 @@ def status(job_id: str) -> dict[str, Any]:
     if st is None:
         raise HTTPException(404, "job not found")
     return st.snapshot()
+
+
+@app.post("/cancel/{job_id}")
+def cancel(job_id: str) -> dict[str, Any]:
+    """Podnosi flagę anulowania; worker ubija proces potomny treningu przy
+    najbliższym obiegu nadzoru (do ~2 s). Job już zakończony wraca z aktualnym
+    statusem i `cancelled: false` — anulowanie nie jest błędem wołającego."""
+    with _JOBS_LOCK:
+        st = _JOBS.get(job_id)
+        if st is None:
+            raise HTTPException(404, "job not found")
+        if st.status != "running":
+            return {"job_id": job_id, "status": st.status, "cancelled": False}
+        st.cancel_requested = True
+        return {"job_id": job_id, "status": st.status, "cancelled": True}
 
 
 @app.post("/export")

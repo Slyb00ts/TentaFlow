@@ -11153,9 +11153,14 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<bool> {
         let caps = self.device.caps();
+        // Kernel jest przenośny — `warp.sum`, bariery i LDS, zero intrinsiców
+        // producenta — więc jedynym realnym wymogiem jest fala 32 i pojemność
+        // LDS. Bramka na vendora zostawiała RDNA4 na kaflu PREFILLOWYM, który
+        // zrównolegla po TOKENACH: przy T=4 to 24 grupy robocze na 64 CU, każda
+        // szeregowo przez cały kontekst. Zmierzone na R9700, kontekst 4672:
+        // 2,28 ms na warstwę razy 16 warstw = 36,5 ms na krok weryfikacji.
         if !verify_attn_split8_enabled(std::env::var("FORGE_VERIFY_ATTN_SPLIT8").ok().as_deref())
             || !matches!(n_tokens, 3 | 4)
-            || caps.vendor != forge_types::Vendor::Nvidia
             || caps.warp_size != 32
             || caps.max_threads_per_block < 256
             || caps.max_shared_mem_per_block < 33_024
