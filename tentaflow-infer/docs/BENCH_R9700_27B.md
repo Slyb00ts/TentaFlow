@@ -339,6 +339,57 @@ Kolejność redukcji różni się od wariantu sekwencyjnego, ale catch-up karmi
 PROPOSER, a target weryfikuje każdy token — suma SHA 128 tokenów jest niezmieniona
 (`0bf2b86b…`) dla obu kwantyzacji, z MTP i bez.
 
+## 2e. Systematyczne polowanie na wzorzec „kernel jednotokenowy we wsadzie"
+
+Ten sam błąd wyszedł w tej sesji trzy razy, więc zamiast czekać na czwarty
+przeszukałem kod trzema kryteriami. Wynik: **na poziomie launcherów jest czysto,
+zostaje rozproszony podatek od uruchomień.**
+
+1. **Siatka `(wiersze/X, n_tokens)`** — wagi czytane raz na token. Jedno
+   trafienie w całym `launchers.rs`: `mtp_project_joined_q8_f16` (naprawione,
+   §2d). Pozostałe siatki z `n_tokens` są albo kafelkowane
+   (`n_tokens.div_ceil(bm)`), albo dotyczą uwagi i KV, gdzie praca na token jest
+   z natury per token i nie ma macierzy wag.
+2. **Jeden workgroup na wiersz bez kafelkowania** — `rmsnorm_*` i `layernorm_*`
+   (poprawne: jeden blok na token, każdy token normalizowany niezależnie),
+   `gemv_f16`/`gemv_f16_bias` (z definicji batch 1), `pack_gguf_fp8` (jednorazowy
+   pack). Jedyny błędny przypadek, `gemv_nvfp4_gguf_out_f32`, naprawiono
+   wcześniej.
+3. **Pętle hosta wysyłające wiele uruchomień** — pętle po warstwach są
+   nieuniknione (każda ma inne wagi). Nie-warstwowe: replikacja GQA (naprawiona),
+   `perplexity` z jednym uruchomieniem na token (ścieżka pomiarowa, nie serwująca)
+   oraz `mtp_catchup_verified_prefix_pending` z pętlą po zaakceptowanych tokenach
+   (do 4 iteracji, marginalne).
+
+Ranking pomiarowy tego, co zostało — po LICZBIE uruchomień, nie po czasie pracy
+(faza decode, 64 tokeny z MTP, kontekst 4672):
+
+| kernel | uruchomienia | praca | us/szt |
+|---|--:|--:|--:|
+| `quantize_act_q8_1` | 9289 | 14,2 ms | 1,5 |
+| `gemv_nvfp4_gguf_q8_1_b4` | 5472 | 492,8 ms | 90,1 |
+| `gemm_q8_0_small_batch` | 3456 | 123,6 ms | 35,8 |
+| `copyBuffer` | 3078 | 13,0 ms | 4,2 |
+| `rmsnorm_residual_f16` | 2450 | 12,8 ms | 5,2 |
+
+Dwie pozycje robią realną pracę (`b4` i `small_batch` siedzą na roofline
+pamięci). Trzy pozostałe to 14 800 uruchomień wykonujących 40 ms pracy — przy
+~4,5 us przestoju na uruchomienie kosztują około 67 ms, czyli **więcej niż
+wykonują**. Ale w przeciwieństwie do 384 kopii GQA nie da się ich usunąć jednym
+kernelem:
+
+- `quantize_act_q8_1` (516 na krok) to jedna kwantyzacja na GEMM; rodzeństwo
+  projekcji dzieli wejście, więc jawny uchwyt „przygotowanej" aktywacji wzorem
+  `Q8ActPrepared` zdjąłby jej część — szacunkowo 1-2%;
+- `copyBuffer` (171 na krok) to w większości migawka stanu DeltaNet: 48 warstw
+  razy dwa bufory. Scalenie wymaga jednej ciągłej alokacji stanu zamiast alokacji
+  per warstwa, czyli przebudowy puli stanów;
+- `rmsnorm_residual` jest już jednym uruchomieniem na warstwę.
+
+**Wniosek: skoncentrowane instancje wzorca zostały wyczyszczone.** To, co zostało,
+to podatek rozłożony po ~1800 uruchomieniach na krok i zdejmuje się go fuzją
+(norm + kwantyzacja + GEMM w jednym kernelu), a nie kolejnym pojedynczym fixem.
+
 ## 3. Optymalizacja prefillu — co dało ile
 
 Kolejność wyznaczył PROFIL (`rocprofv3 --kernel-trace`), nie intuicja. Rozkład
