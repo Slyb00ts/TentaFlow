@@ -285,10 +285,16 @@ dźwignia to CZYTAĆ MNIEJ BAJTÓW NA TOKEN, czyli akceptacja spekulacji.
 
 Kolejność prac, jaką wyznaczają te liczby:
 
-1. **Wpiąć FP8 w silnik.** Kernel jest zrobiony i sprawdzony (§3.7), brakuje
-   trzech rzeczy: wykrycia `fp8_native` w HAL dla gfx12 (dziś zaszyte na `false`
-   dla każdej karty HIP), routingu w launcherze oraz — to jest sedno — DROGI NA
-   PAMIĘĆ. Rezydentna kopia FP8 całego modelu to +11 GiB przy 15,65 GiB Q4_K i
+1. **Wpiąć FP8 w silnik.** Kernel jest zrobiony i sprawdzony (§3.7), wykrycie
+   `fp8_native` dla `gfx12` i routing w launcherze też — `gemm_fp8_tile` wybiera
+   kafel WMMA po obecności artefaktu, bo rodzina `mma` NVIDII i rodzina WMMA mają
+   ten sam kontrakt argumentów. **Ale ścieżka nie startuje na tym modelu i to nie
+   jest kwestia karty**: `build_fp8_ffn` (`fp8mod-ffn`) wymaga KATALOGU
+   checkpointu NVFP4 compressed-tensors, a my mamy GGUF; `build_fp8_modular_auto`
+   obsługuje GGUF, ale odrzuca modele HYBRYDOWE, bo prefill hybrydowy idzie
+   własnym `hybrid_layer_major_prefill`, który o paczkach e4m3 nic nie wie.
+   Brakuje więc budowania paczek e4m3 dla hybrydowego GGUF-a i routingu w tym
+   właśnie prefillu — plus DROGA NA PAMIĘĆ. Rezydentna kopia FP8 całego modelu to +11 GiB przy 15,65 GiB Q4_K i
    32 GiB karty, więc nie wchodzi. Wchodzi **przepakowanie per warstwa do
    podwójnie buforowanego scratcha na DRUGIM STRUMIENIU**: `pack_q4_k_fp8` już
    istnieje dla gfx1201, koszt to 278 MB ruchu na warstwę (0,5 ms) wobec 1,7 ms

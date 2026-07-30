@@ -10067,14 +10067,28 @@ impl Kernels {
     /// Tile selection for the fp8 GEMM: `(suffix, BM, BN, block_threads)`. The
     /// f32 mma accumulate is exact across tile shapes (bit-identical, like the
     /// integer i8mma), so this is a pure perf gate; mirrors `gemm_i8mma_tile`.
-    fn gemm_fp8_tile(rows: usize, n_tokens: usize) -> (&'static str, u32, u32, u32) {
+    /// Nazwa kernela i geometria kafla FP8. Rodzina `mma` NVIDII i rodzina WMMA
+    /// RDNA4 liczą TĘ SAMĄ matematykę i mają ten sam kontrakt argumentów
+    /// (`y, w, wscales, xq, xs, cols, rows, n_tokens`), więc wybór idzie
+    /// wyłącznie po obecności artefaktu. Kafle RDNA4 zmierzone w
+    /// `bench-amd/bench_gemm_fp8_wmma.mojo`.
+    fn gemm_fp8_tile(&self, rows: usize, n_tokens: usize) -> (String, u32, u32, u32) {
+        if self.artifacts.has("gemm_fp8_wmma_bm512_bn128") {
+            if n_tokens <= 32 {
+                return ("gemm_fp8_wmma_bm32".into(), 32, 64, 128);
+            }
+            if n_tokens >= 512 {
+                return ("gemm_fp8_wmma_bm512_bn128".into(), 512, 128, 512);
+            }
+            return ("gemm_fp8_wmma_bm256_bn128".into(), 256, 128, 256);
+        }
         let big_blocks = rows.div_ceil(128) * n_tokens.div_ceil(128);
         if n_tokens >= 1024 && big_blocks >= 256 {
-            ("_big", 128, 128, 512)
+            ("gemm_fp8_f16_big".into(), 128, 128, 512)
         } else if n_tokens >= 256 {
-            ("", 128, 64, 256)
+            ("gemm_fp8_f16".into(), 128, 64, 256)
         } else {
-            ("_bm64", 64, 64, 256)
+            ("gemm_fp8_f16_bm64".into(), 64, 64, 256)
         }
     }
 
@@ -10137,8 +10151,8 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
-        let (suffix, bm, bn, threads) = Self::gemm_fp8_tile(rows, n_tokens);
-        let gk = self.artifacts.get(&format!("gemm_fp8_f16{suffix}"))?;
+        let (name, bm, bn, threads) = self.gemm_fp8_tile(rows, n_tokens);
+        let gk = self.artifacts.get(&name)?;
         let cfg = LaunchConfig {
             grid: (
                 (rows as u32).div_ceil(bn),

@@ -188,6 +188,7 @@ impl HipDevice {
         // `gcnArchName` niesie sufiksy cech (np. "gfx1030:xnack-"), a artefakty
         // adresujemy samą nazwą architektury.
         let arch = arch.split(':').next().unwrap_or(&arch).to_string();
+        let rdna4 = arch.starts_with("gfx12");
         if raw.warp_size != 32 && raw.warp_size != 64 {
             return Err(ForgeError::Device(format!(
                 "nieoczekiwany rozmiar wavefrontu {} dla {arch}",
@@ -211,9 +212,12 @@ impl HipDevice {
             // workgroup ląduje na jednym WGP; przy przenoszeniu heurystyk
             // liczących „bloki na SM" trzeba o tym pamiętać.
             sm_count: raw.cu_count as u32,
-            // RDNA2/RDNA3 nie mają potoku FP8 ani FP4; RDNA4 dopiero wprowadza
-            // FP8, więc wykrycie po architekturze dopisujemy razem z kernelami.
-            fp8_native: false,
+            // RDNA2/RDNA3 nie mają potoku FP8 ani FP4. RDNA4 ma
+            // `v_wmma_f32_16x16x16_fp8_fp8` — zmierzone na R9700 378 TFLOPS
+            // wobec 179 dla f16 — i kernel `gemm_fp8_wmma` na niej stoi.
+            // Rodzina wystarcza: `gfx12` to cała RDNA4, a brak artefaktu i tak
+            // zatrzyma launcher.
+            fp8_native: rdna4,
             fp4_native: false,
             bf16_native: false,
             supports_p2p: false,
