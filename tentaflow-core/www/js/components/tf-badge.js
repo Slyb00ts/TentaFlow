@@ -4,7 +4,7 @@
 //       a value from attribute or slot content.
 // =============================================================================
 
-const VALID_TONES = new Set(['accent', 'danger', 'success', 'warning', 'info']);
+const VALID_TONES = new Set(['accent', 'danger', 'success', 'warning', 'info', 'neutral']);
 
 class TfBadge extends HTMLElement {
   static get observedAttributes() {

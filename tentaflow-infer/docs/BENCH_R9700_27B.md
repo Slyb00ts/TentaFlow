@@ -104,9 +104,9 @@ naprawiony.** Stan po naprawie (prompt 4672 + odpowiedź 512):
 | model | tryb | FORGE decode | llama.cpp decode | FORGE łącznie | llama.cpp łącznie |
 |---|---|--:|--:|--:|--:|
 | Q4_K_M | bez spekulacji | **26,6** | 26,9 | **22,63 s** | 24,22 s |
-| Q4_K_M | MTP K=3 | 27,3 -> **37,6** | 43,5 | 22,21 -> **17,06 s** | 16,77 s |
+| Q4_K_M | MTP K=3 | 27,3 -> **38,6** | 43,5 | 22,21 -> **16,72 s** | 16,77 s |
 | NVFP4 | bez spekulacji | **28,0** | 27,4 | **21,92 s** | 24,36 s |
-| NVFP4 | MTP K=3 | 34,0 -> **51,8** | 59,9 | 18,71 -> **13,52 s** | 14,03 s |
+| NVFP4 | MTP K=3 | 34,0 -> **51,9** | 59,9 | 18,71 -> **13,50 s** | 14,03 s |
 
 NVFP4 z MTP wygrywa teraz cały przebieg (13,52 s wobec 14,03 s), bo nasz prefill
 jest o połowę szybszy; w samym decode zostaje 0,86x i to jest praca do zrobienia.
@@ -135,28 +135,62 @@ pojemność LDS, i tak brzmi teraz warunek. Po zmianie: **804,0 -> 49,0 ms**
 To trzeci raz w tym pliku, gdy „NVIDIA-only" okazuje się bramką postawioną za
 szeroko, a nie własnością kernela — po dense prefillu i po `head_dim`.
 
-### Co zostaje: 0,86x w samym decode
+### Co zostaje: 0,87x w samym decode i gdzie dokładnie siedzi
 
 Druga pozycja z profilu, `gemv_nvfp4_gguf_q8_1_b4` (526 ms), NIE jest defektem:
 to poprawny kernel WSADOWY B4, a 27,7 ms na krok wobec ~31 ms teoretycznego
 pełnego odczytu wag oznacza, że siedzi na roofline pamięci.
 
-Rozkład kroku weryfikacji po naprawie: 55 ms pracy GPU i 8,6 ms bezczynności
-(13% śladu). Bezczynność ma dwa źródła i oba są małe: `copyBuffer` po migawce
-stanu DeltaNet (16,3 ms na cały przebieg) oraz powrót do hosta po każdym tokenie
-draftu (58 przerw po 271 us — pętla draftu jest z natury szeregowa).
+Ślad rozdzielony na cel i draft (segmentacja po wsadowym `lm_head` celu):
 
-Prawdziwe pytanie zostaje takie: forward weryfikujący T=4 kosztuje 55 ms wobec
-35,7 ms forwardu dekodowania T=1, mimo że oba czytają wagi RAZ. Nadwyżka 19 ms
-to koszt trzech kroków draftu (głowa MTP plus `lm_head`) i to jest następne
-miejsce do zmierzenia.
+| część kroku weryfikacji | ms/krok | uwaga |
+|---|--:|---|
+| cel, forward T=4 | 45,8 | z tego 27,7 to NVFP4 B4 na roofline |
+| draft, 3 kroki MTP | 7,6 | z tego **6,4 to `lm_head` draftu** |
+| **razem GPU zajęte** | **53,4** | |
+| bezczynność GPU | 8,4 | 13% zegara |
+
+Dwa wnioski liczbowe:
+
+1. **Forward celu T=4 jest już optymalny.** Kosztuje 45,8 ms wobec 35,7 ms
+   forwardu dekodowania T=1 i daje do czterech tokenów zamiast jednego. Część
+   NVFP4 czyta model RAZ, z przepustowością 551 GB/s.
+2. **Cała nadwyżka to draft i narzut uruchomień.** Przy 53,4 ms pracy GPU i
+   3,13 tokena na forward wychodzi 17,1 ms na token, czyli **58,6 tok/s** —
+   praktycznie tyle, co llama.cpp (59,9). Mierzymy 51,9, więc **całą różnicę
+   zjada 13% bezczynności GPU.**
+
+Bezczynność ma trzy zidentyfikowane źródła (1,8 ms/krok) i jedno rozproszone:
+
+- powrót do hosta po każdym tokenie draftu (3 x 273 us) — pętla draftu czyta
+  argmax na hoście, więc jest z natury szeregowa;
+- `synchronize` po grafie celu (278 us) — konieczny, host czyta decyzję;
+- `copyBuffer` po migawce stanu DeltaNet (145 us);
+- **reszta, ~6,6 ms/krok, to przerwy poniżej 5 us rozłożone na ~1400 uruchomień
+  kerneli.** Forward celu jest przechwycony w graf (`hybrid_verify_graphs`), więc
+  jego ~700 uruchomień jest tanie; **pętla draftu graf, którego nie ma**.
+
+Stąd konkretne następne zadanie z policzoną wartością: **przechwycić krok draftu
+MTP w graf** i utrzymać pętlę draftu na GPU (argmax i gather po indeksie z
+bufora, bez powrotu do hosta). To zdejmuje większość z 8,4 ms/krok, czyli
+podnosi decode z 51,9 do ~58 tok/s. Drugie zadanie, mniejsze: `lm_head` draftu
+czyta 1,27 GB Q8_0 na KAŻDY z trzech tokenów (6,4 ms/krok). Kopia NVFP4 tej
+głowy istnieje (`FORGE_MTP_DRAFT_HEAD=nvfp4`), ale jest WOLNIEJSZA (15,36 s
+wobec 13,50) i profil mówi dlaczego: `gemv_nvfp4_gguf_out_f32` uruchamia
+**248320 grup roboczych, czyli jedną na wiersz słownika**, i osiąga 111 GB/s,
+podczas gdy wariant Q8_0 bierze 8 wierszy na grupę i osiąga 597 GB/s. Po
+przepisaniu tego kernela na 8 wierszy na grupę głowa NVFP4 powinna dać ~1,2 ms
+zamiast 2,13 ms na token draftu, czyli kolejne ~2,9 ms/krok.
+
+Razem oba zadania: ~58 + ~3 tok/s, czyli wyjście POWYŻEJ llama.cpp bez zmiany
+ani jednego tokena na wyjściu.
 
 **K nie jest tu dźwignią** — sprawdzone po naprawie, długi kontekst:
 
 | model | K=2 | K=3 |
 |---|--:|--:|
-| NVFP4 | 2,50 tok/forward, 14,98 s | **3,13 tok/forward, 13,52 s** |
-| Q4_K_M | 2,42 tok/forward, 26,06 s | **2,73 tok/forward, 17,06 s** |
+| NVFP4 | 2,50 tok/forward, 14,98 s | **3,13 tok/forward, 13,50 s** |
+| Q4_K_M | 2,42 tok/forward, 26,06 s | **2,73 tok/forward, 16,72 s** |
 
 ## 3. Optymalizacja prefillu — co dało ile
 

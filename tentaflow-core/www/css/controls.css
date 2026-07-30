@@ -2744,6 +2744,8 @@ tf-badge { display: inline-flex; vertical-align: middle; }
 .tf-badge.success { background: rgba(34, 197, 94, 0.18); color: var(--tf-success); }
 .tf-badge.warning { background: rgba(245, 158, 11, 0.18); color: var(--tf-warning); }
 .tf-badge.info    { background: rgba(96, 165, 250, 0.18); color: var(--tf-info); }
+/* Stan wygaszony: ani sukces, ani błąd (np. trening anulowany przez operatora). */
+.tf-badge.neutral { background: var(--tf-bg-3); color: var(--tf-text-2); }
 
 /* Status-dot badge variants (BadgeVariant::Dot / ::Pulse). The dot follows the
    badge tone (`color` carries the tone), so a Success badge shows a green dot

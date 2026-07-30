@@ -147,6 +147,8 @@ function statusTone(status) {
   if (s === 'training' || s === 'running' || s === 'trening') return 'warning';
   if (s === 'error' || s === 'failed' || s === 'blad') return 'danger';
   if (s === 'draft' || s === 'szkic') return 'info';
+  if (s === 'cancelled' || s === 'anulowany') return 'neutral';
+  if (s === 'syncing' || s === 'cancelling') return 'info';
   return 'accent';
 }
 
@@ -163,6 +165,9 @@ const STATUS_LABEL = {
   failed: 'błąd',
   archived: 'zarchiwizowany',
   paused: 'wstrzymany',
+  cancelled: 'anulowany',
+  cancelling: 'anulowanie',
+  syncing: 'transfer danych',
 };
 
 function statusLabel(status) {
@@ -882,7 +887,7 @@ function renderDetail(host, p, focus = {}) {
   // zakładkę Trening i wznowić dla niego widok LIVE (zamiast formularza startu).
   // Konsumowane jednorazowo — kolejne ręczne wejścia w Trening pokażą już setup.
   const focusRunId = focus && focus.runId ? String(focus.runId) : '';
-  const focusKind = focus && focus.kind ? String(focus.kind) : '';
+  let focusKind = focus && focus.kind ? String(focus.kind) : '';
   let pendingFocusRunId = focusRunId;
   // "Przegląd" jest zawsze pierwszą zakładką (stan projektu na jednym ekranie),
   // a "Zasoby" zawsze ostatnią (§11.3 — zasoby mesh przydzielone projektowi).
@@ -969,13 +974,18 @@ function renderDetail(host, p, focus = {}) {
   // Pozwala skrótom z zakładki "Przegląd" przełączać aktywną zakładkę:
   // tf-tabs przyjmuje value="ml-tab-N" i sam wyemituje `change`, ale tutaj
   // wołamy renderPanel wprost, bo ustawienie value nie zawsze re-emituje event.
-  const selectTab = (label) => {
+  // `focus` (opcjonalne) pozwala wejść w zakładkę Trening z konkretnym runem —
+  // tak historia treningów otwiera podgląd trwającego joba.
+  const selectTab = (label, focusRun = null) => {
     const i = tabs.indexOf(label);
-    if (i >= 0) {
-      const el = byId('ml-studio-tabs');
-      if (el) el.value = 'ml-tab-' + i;
-      renderPanel('ml-tab-' + i);
+    if (i < 0) return;
+    if (focusRun && focusRun.runId) {
+      pendingFocusRunId = String(focusRun.runId);
+      focusKind = String(focusRun.kind || '');
     }
+    const el = byId('ml-studio-tabs');
+    if (el) el.value = 'ml-tab-' + i;
+    renderPanel('ml-tab-' + i);
   };
   const renderPanel = (tabId) => {
     const panel = byId('ml-studio-tab-panel');
@@ -1037,7 +1047,7 @@ function renderDetail(host, p, focus = {}) {
       return;
     }
     if (label === 'Treningi') {
-      renderRunsTab(panel, p);
+      renderRunsTab(panel, p, { selectTab });
       return;
     }
     if (label === 'Zasoby') {
@@ -5330,6 +5340,54 @@ const TRAIN_TARGET_LABELS = {
   ocr: 'OCR',
 };
 
+// Etykieta toru treningu w historii runów.
+const TRAIN_KIND_LABELS = {
+  detection: 'Detekcja',
+  classifier: 'Klasyfikator',
+  ocr: 'OCR',
+  llm: 'LLM',
+};
+
+// Statusy runu, przy których trening jeszcze żyje (transfer datasetu przez mesh
+// liczy się jako trwający — job na węźle B jeszcze nie wystartował).
+const ACTIVE_RUN_STATUSES = ['running', 'syncing'];
+
+// Tor treningu runu: z `config_json.kind` (detection|classifier|ocr|llm). Wpisy
+// bez `kind` to stare runy detekcji, sprzed rozbicia na tory.
+function runKind(run) {
+  try {
+    const cfg = JSON.parse(run.configJson ?? run.config_json ?? '{}');
+    return String(cfg.kind || 'detection');
+  } catch (_) {
+    return 'detection';
+  }
+}
+
+// Opcje widoku LIVE per tor: detekcja ma własny status (mAP@50), pozostałe tory
+// raportują przez status generyczny z inną metryką główną.
+function liveOptsForKind(kind, selectTab) {
+  const k = String(kind || '').toLowerCase();
+  if (k === 'classifier' || k.includes('klas')) {
+    return {
+      selectTab,
+      metricLabel: 'macro-F1',
+      statusRequest: 'mlStudioGenericTrainStatusRequest',
+      liveTitle: 'Trening klasyfikatora na żywo',
+    };
+  }
+  if (k === 'ocr') {
+    return {
+      selectTab,
+      metricLabel: 'exact-match (realne)',
+      metricKey: 'val_exact_real',
+      extraMetrics: [{ key: 'val_exact_synth', label: 'exact-match (syntet.)' }],
+      statusRequest: 'mlStudioGenericTrainStatusRequest',
+      liveTitle: 'Trening czytnika OCR na żywo',
+    };
+  }
+  return { selectTab, liveTitle: 'Trening detekcji na żywo' };
+}
+
 // Zakładka "Trening" dla recognition: wybór CELU (detekcja / klasyfikator / OCR)
 // wyprowadzonego ze schematu projektu, potem wybór datasetu + wariantu +
 // hiperparametry + start treningu. Po starcie przechodzi w widok LIVE.
@@ -5371,19 +5429,36 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
   `;
 
   // Wznowienie widoku LIVE dla joba wybranego w panelu „Joby": chowamy formularz
-  // startu i od razu podłączamy polling. Klasyfikator raportuje przez generyczny
-  // status (macro-F1), detekcja przez status detekcji (mAP@50).
+  // startu i od razu podłączamy polling.
   if (focusRunId) {
     const setup = byId('ml-studio-recog-setup');
     if (setup) setup.hidden = true;
-    const isClassifier = String(focusKind || '').toLowerCase().includes('klas')
-      || String(focusKind || '').toLowerCase() === 'classifier';
-    const liveOpts = isClassifier
-      ? { selectTab, metricLabel: 'macro-F1', statusRequest: 'mlStudioGenericTrainStatusRequest' }
-      : { selectTab };
-    startRecogLive(byId('ml-studio-recog-live'), focusRunId, liveOpts);
+    startRecogLive(byId('ml-studio-recog-live'), focusRunId, liveOptsForKind(focusKind, selectTab));
     return;
   }
+
+  // Bez wskazanego runu: sprawdź, czy w tym projekcie NIE biegnie już trening.
+  // Wyjście z zakładki nie zabija joba, więc bez tego powrót pokazywałby formularz
+  // startu i podglądu trwającego treningu nie dałoby się już otworzyć.
+  (async () => {
+    let active = null;
+    try {
+      const resp = await ApiBinary.one('mlStudioTrainingRunsListRequest', { projectId: pid });
+      const runs = Array.isArray(resp.runs) ? resp.runs : [];
+      active = runs.find((r) => ACTIVE_RUN_STATUSES.includes(String(r.status || '')));
+    } catch (_) { active = null; }
+    if (!active) return;
+    const setup = byId('ml-studio-recog-setup');
+    // Użytkownik mógł w tym czasie wystartować własny trening — wtedy widok live
+    // już stoi i nie wolno go podmieniać.
+    if (!setup || setup.hidden) return;
+    setup.hidden = true;
+    startRecogLive(
+      byId('ml-studio-recog-live'),
+      active.runId ?? active.run_id,
+      liveOptsForKind(runKind(active), selectTab),
+    );
+  })();
 
   // Segmented control celu: detekcja zawsze aktywna, klasyfikator aktywny gdy
   // schemat ma nadający się atrybut, OCR na razie disabled (faza 2).
@@ -5750,7 +5825,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
     btn?.setAttribute('disabled', '');
     try {
       let runId;
-      let liveOpts = { selectTab };
+      let liveOpts = liveOptsForKind('detection', selectTab);
       if (cfg.target === 'classifier') {
         const target = clfTargets().find((t) => t.attribute === cfg.attribute);
         if (!target) throw new Error('Wybierz atrybut do klasyfikacji.');
@@ -5771,7 +5846,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
           targetNodeId: cfg.targetNodeId || '',
         });
         runId = resp.runId ?? resp.run_id;
-        liveOpts = { selectTab, metricLabel: 'macro-F1', statusRequest: 'mlStudioGenericTrainStatusRequest' };
+        liveOpts = liveOptsForKind('classifier', selectTab);
       } else if (cfg.target === 'ocr') {
         if (!cfg.ocrAttribute) throw new Error('Wybierz atrybut z odczytem OCR.');
         const resp = await ApiBinary.one('mlStudioOcrTrainStartRequest', {
@@ -5789,7 +5864,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
           targetNodeId: cfg.targetNodeId || '',
         });
         runId = resp.runId ?? resp.run_id;
-        liveOpts = { selectTab, metricLabel: 'exact-match', statusRequest: 'mlStudioGenericTrainStatusRequest' };
+        liveOpts = liveOptsForKind('ocr', selectTab);
       } else {
         const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
           projectId: pid,
@@ -5910,7 +5985,7 @@ function stageLabel(stage) {
   return STAGE_LABEL[s] || stage;
 }
 
-function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', statusRequest = 'mlStudioRecogTrainStatusRequest', liveTitle = '' } = {}) {
+function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', statusRequest = 'mlStudioRecogTrainStatusRequest', liveTitle = '', metricKey = '', extraMetrics = [] } = {}) {
   if (!host) return;
   stopFtPolling();
   // Klasyfikator raportuje przez generyczny status (curve:[{epoch,metricName,value}])
@@ -5995,15 +6070,25 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
     let curve;
     let loss;
     let metricVal;
+    // Ostatnia wartość każdej metryki po nazwie — dla dodatkowych kafli KPI toru
+    // (np. OCR raportuje exact-match osobno na realnych i syntetycznych wierszach).
+    const lastByName = new Map();
     if (isGeneric) {
       const byEpoch = new Map();
       for (const c of rawCurve) {
+        const metricName = String(c.metricName ?? c.metric_name ?? '').toLowerCase();
+        if (metricName) lastByName.set(metricName, Number(c.value));
         const e = Number(c.epoch ?? 0);
         if (!byEpoch.has(e)) byEpoch.set(e, { epoch: e, trainLoss: undefined, map50: undefined });
         const slot = byEpoch.get(e);
         const name = String(c.metricName ?? c.metric_name ?? '').toLowerCase();
         const val = Number(c.value);
         if (name.includes('loss')) slot.trainLoss = val;
+        // Tor może raportować kilka metryk poza stratą (OCR: exact-match na
+        // realnych i na syntetycznych wierszach). `metricKey` wskazuje TĘ, która
+        // jest metryką główną — bez tego na krzywej lądowałaby przypadkowa
+        // (ostatnia w kolejności zapisu).
+        else if (metricKey) { if (name === metricKey.toLowerCase()) slot.map50 = val; }
         else slot.map50 = val;
       }
       curve = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch);
@@ -6068,9 +6153,14 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
     }
     const kpi = byId('ml-studio-recog-kpi');
     if (kpi) {
+      const extra = extraMetrics.map((m) => {
+        const v = lastByName.get(String(m.key).toLowerCase());
+        return `<div class="ml-studio-ft-kpi"><div class="lbl">${escapeHtml(m.label)}</div><div class="val">${Number.isFinite(v) ? Number(v).toFixed(4) : '—'}</div></div>`;
+      }).join('');
       kpi.innerHTML = `
         <div class="ml-studio-ft-kpi"><div class="lbl">train loss</div><div class="val">${loss != null ? Number(loss).toFixed(4) : '—'}</div></div>
         <div class="ml-studio-ft-kpi"><div class="lbl">${escapeHtml(metricLabel)}</div><div class="val">${metricVal != null ? Number(metricVal).toFixed(4) : '—'}</div></div>
+        ${extra}
         <div class="ml-studio-ft-kpi"><div class="lbl">epoka</div><div class="val">${epoch}${total > 0 ? ' / ' + total : ''}</div></div>
       `;
     }
@@ -8212,7 +8302,7 @@ function openProjectRemoteImportModal() {
 // (mlStudioFtTrainStatusRequest działa dla KAŻDEGO runa, też zakończonego).
 // =============================================================================
 
-function renderRunsTab(panel, p) {
+function renderRunsTab(panel, p, { selectTab } = {}) {
   const pid = projectId(p);
   panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
   ApiBinary.one('mlStudioTrainingRunsListRequest', { projectId: pid })
@@ -8248,27 +8338,80 @@ function renderRunsTab(panel, p) {
       table.setAttribute('variant', 'lined');
       table.innerHTML = `
         <tf-column key="run" label="Run" renderer="html"></tf-column>
+        <tf-column key="kind" label="Tor"></tf-column>
         <tf-column key="status" label="Status" renderer="html"></tf-column>
         <tf-column key="started" label="Start"></tf-column>
         <tf-column key="finished" label="Koniec"></tf-column>
+        <tf-column key="actions" label="" renderer="html"></tf-column>
       `;
       table.rows = runs.map((r) => {
         const runId = String(r.runId ?? r.run_id ?? '');
         const b = runBadge(r.status);
         const finished = r.finishedAt ?? r.finished_at;
+        const kind = runKind(r);
+        const activeRun = ACTIVE_RUN_STATUSES.includes(String(r.status || ''));
+        // Trwający job: podgląd na żywo + anulowanie wprost z listy. Bez tego
+        // jedyne wejście w postęp ginęło po wyjściu z zakładki Trening.
+        const actions = activeRun
+          ? `<div class="tf-toolbar" style="gap:6px;margin:0">
+               <tf-button variant="outline" size="sm" icon="cpu" data-live="${escapeAttr(runId)}">Podgląd</tf-button>
+               <tf-button variant="danger" size="sm" icon="close" data-cancel="${escapeAttr(runId)}">Anuluj</tf-button>
+             </div>`
+          : '';
         return {
           runId,
+          runKind: kind,
+          activeRun,
           run: `<span class="ml-studio-mono">${escapeHtml(runId.slice(0, 8) || '—')}</span>`,
+          kind: TRAIN_KIND_LABELS[kind] || kind,
           status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
           started: formatRelative(r.startedAt ?? r.started_at),
           finished: finished ? formatRelative(finished) : '—',
+          actions,
         };
       });
       table.addEventListener('row-click', (e) => {
         const runId = e.detail?.row?.runId;
         if (runId) renderRunDetail(detail, runId);
       });
-      byId('ml-studio-runs-table')?.appendChild(table);
+      // Delegacja na kontenerze: przyciski żyją w komórkach tabeli, które
+      // tf-table renderuje jako HTML (bez własnych handlerów).
+      const tableHost = byId('ml-studio-runs-table');
+      tableHost?.addEventListener('click', async (e) => {
+        const liveBtn = e.target?.closest?.('[data-live]');
+        if (liveBtn) {
+          e.stopPropagation();
+          const runId = liveBtn.getAttribute('data-live');
+          const row = runs.find((r) => String(r.runId ?? r.run_id ?? '') === runId);
+          // Podgląd żyje w zakładce Trening — tam jest widok live i jego polling.
+          if (selectTab) selectTab('Trening', { runId, kind: runKind(row || {}) });
+          return;
+        }
+        const cancelBtn = e.target?.closest?.('[data-cancel]');
+        if (!cancelBtn) return;
+        e.stopPropagation();
+        if (!(await confirmDialog({
+          title: 'Anulować trening?',
+          lead: 'Trening zostanie przerwany, a model z tego przebiegu nie powstanie.',
+          consequences: ['Job zwalnia GPU', 'Zebrane epoki przepadają', 'Run zostaje w historii jako anulowany'],
+          confirmLabel: 'Anuluj trening',
+          cancelLabel: 'Zostaw trening',
+          variant: 'danger',
+        }))) return;
+        cancelBtn.setAttribute('disabled', '');
+        try {
+          const resp = await ApiBinary.one('mlStudioTrainCancelRequest', {
+            runId: cancelBtn.getAttribute('data-cancel'),
+          });
+          toast(resp.cancelled === false ? 'Trening już się zakończył.' : 'Anulowanie zgłoszone.', resp.cancelled === false ? 'info' : 'success');
+        } catch (err) {
+          cancelBtn.removeAttribute('disabled');
+          toast(`Anulowanie treningu: ${err.message}`, 'error');
+          return;
+        }
+        renderRunsTab(panel, p, { selectTab });
+      });
+      tableHost?.appendChild(table);
     })
     .catch((err) => {
       panel.innerHTML = '';
