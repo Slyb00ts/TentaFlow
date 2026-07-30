@@ -53,7 +53,8 @@ Liczby FORGE to `tok/s overall`, czyli RAZEM z prefillem 32-tokenowego promptu;
 liczby llama.cpp to samo `Generation`. Przewaga jest więc liczona na niekorzyść
 FORGE — przy prompcie 32 tokenów prefill to poniżej 1% czasu przebiegu.
 
-**Wszystkie cztery komórki wygrywają.** Poprzednia wersja tego dokumentu
+**Wszystkie cztery komórki wygrywają — ale to jest pomiar na prompcie
+32-tokenowym; na długim kontekście MTP przegrywa, patrz §2b.** Poprzednia wersja tego dokumentu
 notowała MTP na NVFP4 jako jedyną przegraną (40,6 wobec 46,4) i wskazywała
 akceptację draftu jako przyczynę. Pomiar tego nie potwierdza:
 
@@ -67,6 +68,65 @@ wcześniej 1,35/krok — czyli hipoteza „słaby proposer na NVFP4" nie ma pods
 Stara liczba nie jest odtwarzalna z obecnego drzewa i była zbierana przy innym
 obramowaniu promptu (56 tokenów zamiast 32), więc nie przypisuję poprawy
 konkretnej zmianie; przypisuję ją protokołowi pomiaru.
+
+## 2b. Długi kontekst — tu MTP nam się sypie
+
+Protokół §2 ma prompt 32-tokenowy. Ta sama para silników na **realnym prompcie
+4672 tokenów** (28 notatek technicznych po polsku, plik, nie ziarno tokenizera) i
+odpowiedzi 512 tokenów wygląda inaczej. `llama-cli -st -c 8192 -f`, `forge run`.
+
+Prefill rośnie łagodnie po obu stronach i FORGE wygrywa na całej długości —
+`llama-bench -p` wobec `forge bench --prompt-tokens`, oba przemierzone dziś:
+
+| model | miara | FORGE | llama.cpp | |
+|---|---|--:|--:|---|
+| Q4_K_M | pp1024 | **1477,9** | 1043,4 | 1,42x |
+| Q4_K_M | pp4096 | **1369,6** | 965,6 | 1,42x |
+| Q4_K_M | pp8192 | **1293,8** | 901,2 | 1,44x |
+| NVFP4 | pp1024 | **1287,8** | 920,0 | 1,40x |
+| NVFP4 | pp4096 | **1292,9** | 860,4 | 1,50x |
+| NVFP4 | pp8192 | **1228,2** | 814,7 | 1,51x |
+
+Decode bez spekulacji też trzyma się na długim kontekście (liczby llama.cpp
+wyliczone z `-pg pp,tg`: to przepustowość ŁĄCZNA, więc decode wychodzi z
+odjęcia prefillu):
+
+| model | kontekst | FORGE | llama.cpp | |
+|---|---|--:|--:|---|
+| Q4_K_M | 4096 | **26,6** | 26,7 | remis |
+| Q4_K_M | 8192 | 25,9 | **26,2** | llama.cpp 1,01x |
+| NVFP4 | 4096 | **28,3** | 27,5 | 1,03x |
+| NVFP4 | 8192 | **27,4** | 27,1 | 1,01x |
+
+**Ale z MTP na długim kontekście przegrywamy, i to wyraźnie** (prompt 4672 +
+odpowiedź 512, czas całego przebiegu):
+
+| model | tryb | FORGE decode | llama.cpp decode | FORGE łącznie | llama.cpp łącznie |
+|---|---|--:|--:|--:|--:|
+| Q4_K_M | bez spekulacji | 26,6 | 26,9 | **22,63 s** | 24,22 s |
+| Q4_K_M | MTP K=3 | 27,2 | **43,5** | 22,21 s | **16,77 s** |
+| NVFP4 | bez spekulacji | 28,0 | 27,4 | **21,92 s** | 24,36 s |
+| NVFP4 | MTP K=3 | 34,0 | **59,9** | 18,71 s | **14,03 s** |
+
+Bez spekulacji wygrywamy oba modele. Z MTP llama.cpp jest 1,60x (Q4_K) i 1,76x
+(NVFP4) szybsza w samym decode.
+
+**To NIE jest akceptacja draftu.** Na tym prompcie mamy 1,77/krok dla Q4_K i
+2,11/krok dla NVFP4 — czyli nawet lepiej niż na krótkim. Liczy się koszt jednego
+forwardu weryfikującego:
+
+| kontekst | forward zwykły | forward weryfikujący T=4 | stosunek |
+|---|--:|--:|--:|
+| 32 tokeny | 29,8 ms | 50,0 ms | 1,68x |
+| 4672 tokeny | 37,6 ms | 101,7 ms | **2,70x** |
+
+Weryfikacja czterech tokenów powinna kosztować niewiele więcej niż jednego —
+decode jest ograniczony czytaniem wag, a wagi czyta się raz niezależnie od T.
+Rośnie natomiast z kontekstem, i to szybciej niż sam decode (2,70x wobec 1,68x).
+Czyli w ścieżce weryfikacji jest praca proporcjonalna do długości kontekstu,
+której zwykły krok dekodowania nie wykonuje. To jest następne zadanie i ma
+konkretny cel liczbowy: sprowadzić stosunek 2,70x do bliskiego 1,0x, co samo z
+siebie ustawiłoby decode+MTP na NVFP4 w okolicy 2,7 * 28,0 = ~75 tok/s.
 
 ## 3. Optymalizacja prefillu — co dało ile
 
