@@ -1600,6 +1600,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "deltanet_prepare_t4_f16",
     "deltanet_prepare_tiled_d128_c4_f16",
     "deltanet_prepare_tokens_f16_t32",
+    "deltanet_repeat_qk_f16",
     "deltanet_value_key_commit_recompute_f32",
     "deltanet_value_key_scan_checkpoints_f16",
     "deltanet_value_key_scan_inplace_f16",
