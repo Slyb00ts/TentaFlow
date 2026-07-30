@@ -213,3 +213,33 @@ def attn_prefill_wmma_impl[HD: Int](
 # Bielik i Mistral maja 128, ThinkingCap-Qwen3.6-27B ma 256.
 comptime attn_prefill_wmma_hd128 = attn_prefill_wmma_impl[128]
 comptime attn_prefill_wmma_hd256 = attn_prefill_wmma_impl[256]
+
+
+def attn_prefill_wmma_pos_impl[HD: Int](
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    base_pos: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    scale: Float32,
+    n_tokens: Int,
+):
+    """Ten sam kafel, ale pozycja bazowa leży na urządzeniu.
+
+    Prefill layer-major trzyma długość sekwencji w buforze GPU, bo chunk rusza
+    zanim host pozna jej wartość. Odczyt jest skalarny i jednakowy dla całego
+    bloku, więc kompilator trzyma go w rejestrze skalarnym — kafel pracuje bez
+    zmian.
+    """
+    attn_prefill_wmma_impl[HD](
+        out_ptr, q, k_cache, v_cache, page_table, Int(base_pos[0]),
+        n_q_heads, n_kv_heads, page_size, scale, n_tokens,
+    )
+
+
+comptime attn_prefill_wmma_pos_hd128 = attn_prefill_wmma_pos_impl[128]
+comptime attn_prefill_wmma_pos_hd256 = attn_prefill_wmma_pos_impl[256]

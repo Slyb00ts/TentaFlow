@@ -343,7 +343,11 @@ from src.gemm_q4k_i8_multistage import (
 )
 from src.gemm_q6k_i8_multistage import (
 )
-from src.prefill_wmma import attn_prefill_wmma_hd128, attn_prefill_wmma_hd256
+from src.prefill_wmma import (
+    attn_prefill_wmma_hd128,
+    attn_prefill_wmma_hd256,
+    attn_prefill_wmma_pos_hd256,
+)
 from src.prefill import (
     kv_append_batch_f16,
     attn_prefill_f16_hd64,
@@ -2371,6 +2375,12 @@ def main() raises:
         attn_prefill_wmma_hd256, dump_asm=Path("attn_prefill_wmma_hd256.ptx")
     ]()
     entries.append(_finalize(out_dir, "attn_prefill_wmma_hd256"))
+    # arch: amd:gfx12
+    _ = ctx.compile_function[
+        attn_prefill_wmma_pos_hd256,
+        dump_asm=Path("attn_prefill_wmma_pos_hd256.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "attn_prefill_wmma_pos_hd256"))
 
     _ = ctx.compile_function[
         attn_prefill_f16_hd256, dump_asm=Path("attn_prefill_f16_hd256.ptx")

@@ -209,6 +209,10 @@
       "entry": "src_prefill_wmma_attn_prefill_6A6A6A6A_a44b436104df2ba0",
       "file": "attn_prefill_wmma_hd256.hsaco"
     },
+    "attn_prefill_wmma_pos_hd256": {
+      "entry": "src_prefill_wmma_attn_prefill_6A6A6A6A_bea47d04f3e7da87",
+      "file": "attn_prefill_wmma_pos_hd256.hsaco"
+    },
     "attn_verify_segmented_f16_hd128": {
       "entry": "src_attention_attn_verify_segm6A6A6A6A_5d6ea2bd9b705a84",
       "file": "attn_verify_segmented_f16_hd128.hsaco"

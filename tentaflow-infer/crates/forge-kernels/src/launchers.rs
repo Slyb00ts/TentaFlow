@@ -8513,10 +8513,21 @@ impl Kernels {
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("attn_prefill_device_pos_f16_hd256")?;
+        // RDNA4 liczy ten sam kafel na jednostce macierzowej. Kontrakt wywołania
+        // jest identyczny — różni się tylko rozkład pracy: 64 zapytania na blok
+        // czterema falami zamiast 16 zapytań ośmioma. Bez artefaktu zostaje
+        // ścieżka skalarna, więc pozostałe karty nic nie tracą.
+        let (k, per_block, threads) = match self.artifacts.get("attn_prefill_wmma_pos_hd256") {
+            Ok(k) => (k, 64u32, 128u32),
+            Err(_) => (
+                self.artifacts.get("attn_prefill_device_pos_f16_hd256")?,
+                16u32,
+                256u32,
+            ),
+        };
         let cfg = LaunchConfig {
-            grid: ((n_tokens as u32).div_ceil(16), n_q_heads as u32, 1),
-            block: (256, 1, 1),
+            grid: ((n_tokens as u32).div_ceil(per_block), n_q_heads as u32, 1),
+            block: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
