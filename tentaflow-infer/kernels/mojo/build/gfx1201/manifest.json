@@ -1665,16 +1665,20 @@
       "entry": "src_nvfp4_pack_nvfp4_fp8_Poi6A6A6A6AoA6A6A_b14853b36db40564",
       "file": "pack_nvfp4_fp8.hsaco"
     },
+    "pack_nvfp4_gguf_fp8": {
+      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_d271e2cb079b9886",
+      "file": "pack_nvfp4_gguf_fp8.hsaco"
+    },
     "pack_q4_k_fp8": {
-      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_f4171dc2883529b5",
+      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_23cf63fa8f5bcc47",
       "file": "pack_q4_k_fp8.hsaco"
     },
     "pack_q6_k_fp8": {
-      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_3f40765589f0372a",
+      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_8a8e90be080887be",
       "file": "pack_q6_k_fp8.hsaco"
     },
     "pack_q8_0_fp8": {
-      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_987bef7eb9bb7a52",
+      "entry": "src_pack_gguf_fp8_pack_gguf_fp6A6A6A6A_a73f6313f7d05350",
       "file": "pack_q8_0_fp8.hsaco"
     },
     "pack_q8_0_nvfp4_gguf": {

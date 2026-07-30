@@ -13,6 +13,8 @@ from std.gpu.primitives import warp
 from std.math import floor
 from std.memory import bitcast
 from src.reduce import block_reduce_max
+from src.gemv2 import _e2m1x8
+from src.nvfp4_gguf_batch import _ue4m3_branchless
 
 comptime BLOCK = 256
 
@@ -133,6 +135,27 @@ def _dequant_q6k(
     return d * Float32(s) * Float32(q - 32)
 
 
+def _dequant_nvfp4_gguf(
+    w: UnsafePointer[UInt8, MutAnyOrigin], off: Int, r: Int
+) -> Float32:
+    """Jedna waga bloku GGUF NVFP4: 4 bajty skal UE4M3 + 32 bajty kodów E2M1.
+
+    Podblok to 16 kolumn ze wspólną skalą. Bajt `i` ósemki kodów niesie kolumnę
+    `i` w młodszym półbajcie i kolumnę `i + 8` w starszym — stąd wybór półbajtu
+    idzie po `within >= 8`, a nie po parzystości.
+    """
+    subblock = r // 16
+    within = r % 16
+    byte = (w + off + 4 + subblock * 8 + (within % 8))[0]
+    var code: UInt8
+    if within < 8:
+        code = byte & 0x0F
+    else:
+        code = byte >> 4
+    magnitude = _e2m1x8(SIMD[DType.uint8, 8](code))[0]
+    return magnitude * _ue4m3_branchless(w[off + subblock])
+
+
 def _dequant_q8_0(
     w: UnsafePointer[UInt8, MutAnyOrigin], off: Int, r: Int
 ) -> Float32:
@@ -141,20 +164,29 @@ def _dequant_q8_0(
 
 
 # FMT: 0 = Q4_K (256-elem, 144 B), 1 = Q6_K (256-elem, 210 B),
-# 2 = Q8_0 (32-elem, 34 B).
+# 2 = Q8_0 (32-elem, 34 B), 3 = NVFP4 GGUF (64-elem, 36 B).
 def pack_gguf_fp8_impl[FMT: Int](
     codes: UnsafePointer[UInt8, MutAnyOrigin],
     scales_out: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
+    out_scale: Float32,
 ):
+    """`out_scale` mnoży skalę wiersza, nie kody.
+
+    NVFP4 GGUF trzyma jeden mnożnik na cały tensor obok bloków; GEMM e4m3 nie ma
+    takiego parametru, więc mnożnik wchodzi w skalę wierszową. Kody zostają
+    nietknięte, bo mnożenie przez stałą nie zmienia, gdzie leży absmax wiersza.
+    Pozostałe formaty przekazują 1.0."""
     row = Int(block_idx.x)
     if row >= n_rows:
         return
     tid = Int(thread_idx.x)
-    comptime blk_elems = 32 if FMT == 2 else 256
-    comptime blk_bytes = 34 if FMT == 2 else (144 if FMT == 0 else 210)
+    comptime blk_elems = 32 if FMT == 2 else (64 if FMT == 3 else 256)
+    comptime blk_bytes = 34 if FMT == 2 else (
+        36 if FMT == 3 else (144 if FMT == 0 else 210)
+    )
     row_base = row * (n_cols // blk_elems) * blk_bytes
 
     var m: Float32 = 0.0
@@ -167,6 +199,8 @@ def pack_gguf_fp8_impl[FMT: Int](
             v = _dequant_q4k(w, off, r)
         elif FMT == 1:
             v = _dequant_q6k(w, off, r)
+        elif FMT == 3:
+            v = _dequant_nvfp4_gguf(w, off, r)
         else:
             v = _dequant_q8_0(w, off, r)
         m = max(m, abs(v))
@@ -182,7 +216,7 @@ def pack_gguf_fp8_impl[FMT: Int](
             i += BLOCK
         return
     if tid == 0:
-        scales_out[row] = m / 448.0
+        scales_out[row] = m / 448.0 * out_scale
     inv = 448.0 / m
     i = tid
     while i < n_cols:
@@ -193,6 +227,8 @@ def pack_gguf_fp8_impl[FMT: Int](
             v = _dequant_q4k(w, off, r)
         elif FMT == 1:
             v = _dequant_q6k(w, off, r)
+        elif FMT == 3:
+            v = _dequant_nvfp4_gguf(w, off, r)
         else:
             v = _dequant_q8_0(w, off, r)
         codes[row * n_cols + i] = _f32_to_f8e4m3(v * inv)
@@ -202,3 +238,4 @@ def pack_gguf_fp8_impl[FMT: Int](
 comptime pack_q4_k_fp8 = pack_gguf_fp8_impl[0]
 comptime pack_q6_k_fp8 = pack_gguf_fp8_impl[1]
 comptime pack_q8_0_fp8 = pack_gguf_fp8_impl[2]
+comptime pack_nvfp4_gguf_fp8 = pack_gguf_fp8_impl[3]

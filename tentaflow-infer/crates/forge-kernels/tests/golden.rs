@@ -2380,11 +2380,20 @@ fn pack_gguf_fp8_matches_cpu_pack() {
     let kernels = Kernels::load(dev.clone()).unwrap();
     let stream = dev.create_stream().unwrap();
 
-    for quant in [QuantKind::Q4K, QuantKind::Q6K, QuantKind::Q8_0] {
+    // `output_scale` mnozy skale wiersza, wiec kazdy format przechodzi raz z
+    // jedynka, a NVFP4 dodatkowo z mnoznikiem — tylko on go niesie w GGUF.
+    for (quant, output_scale) in [
+        (QuantKind::Q4K, 1.0f32),
+        (QuantKind::Q6K, 1.0),
+        (QuantKind::Q8_0, 1.0),
+        (QuantKind::NVFP4Gguf, 1.0),
+        (QuantKind::NVFP4Gguf, 0.0625),
+    ] {
         let (rows, cols) = (33usize, 512usize);
         let wq = match quant {
             QuantKind::Q4K => build_q4k(rows, cols),
             QuantKind::Q6K => build_q6k(rows, cols),
+            QuantKind::NVFP4Gguf => q8_0_to_nvfp4_reference(&make_q8_0(rows, cols), rows, cols),
             _ => build_q8_0(rows, cols),
         };
         let w_f32 =
@@ -2398,7 +2407,7 @@ fn pack_gguf_fp8_matches_cpu_pack() {
             if absmax == 0.0 {
                 continue;
             }
-            want_scales[r] = absmax / 448.0;
+            want_scales[r] = absmax / 448.0 * output_scale;
             let inv = 448.0 / absmax;
             for (c, &x) in row.iter().enumerate() {
                 want_codes[r * cols + c] = forge_formats::nvfp4::f32_to_f8e4m3(x * inv);
@@ -2412,7 +2421,17 @@ fn pack_gguf_fp8_matches_cpu_pack() {
             .unwrap();
         let scales = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
         kernels
-            .pack_gguf_fp8(&codes, &scales, &wb, 0, rows, cols, quant, &stream)
+            .pack_gguf_fp8(
+                &codes,
+                &scales,
+                &wb,
+                0,
+                rows,
+                cols,
+                quant,
+                output_scale,
+                &stream,
+            )
             .unwrap();
         dev.synchronize().unwrap();
 

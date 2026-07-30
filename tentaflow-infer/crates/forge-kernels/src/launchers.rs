@@ -12985,12 +12985,14 @@ impl Kernels {
         rows: usize,
         cols: usize,
         fmt: QuantKind,
+        output_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
         let (name, blk_elems, blk_bytes) = match fmt {
             QuantKind::Q4K => ("pack_q4_k_fp8", 256, 144),
             QuantKind::Q6K => ("pack_q6_k_fp8", 256, 210),
             QuantKind::Q8_0 => ("pack_q8_0_fp8", 32, 34),
+            QuantKind::NVFP4Gguf => ("pack_nvfp4_gguf_fp8", 64, 36),
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "pack_gguf_fp8: nieobsługiwany format {other:?}"
@@ -13027,7 +13029,8 @@ impl Kernels {
             .buf(scales)
             .buf_at(w, w_byte_off)?
             .scalar(cols as i64)
-            .scalar(rows as i64);
+            .scalar(rows as i64)
+            .scalar(output_scale);
         self.device.launch(gk, &cfg, &args, stream)
     }
 

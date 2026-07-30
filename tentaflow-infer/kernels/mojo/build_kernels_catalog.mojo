@@ -664,6 +664,7 @@ from src.pack_gguf_fp8 import (
     pack_q4_k_fp8,
     pack_q6_k_fp8,
     pack_q8_0_fp8,
+    pack_nvfp4_gguf_fp8,
 )
 from src.nvfp4_ct_direct import (
     gemm_nvfp4_ct_bm16_qkv_m4,
@@ -1735,6 +1736,11 @@ def main() raises:
         dump_asm=Path("pack_q8_0_fp8.ptx"),
     ]()
     entries.append(_finalize(out_dir, "pack_q8_0_fp8"))
+    _ = ctx.compile_function[
+        pack_nvfp4_gguf_fp8,
+        dump_asm=Path("pack_nvfp4_gguf_fp8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "pack_nvfp4_gguf_fp8"))
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_b16,
         dump_asm=Path("gemm_q8_0_i8mma_b16.ptx"),

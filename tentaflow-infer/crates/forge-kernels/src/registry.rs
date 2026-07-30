@@ -1922,6 +1922,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "pack_f16_fp8",
     "pack_nvfp4_ct_s0_fp8",
     "pack_nvfp4_fp8",
+    "pack_nvfp4_gguf_fp8",
     "pack_q4_k_fp8",
     "pack_q6_k_fp8",
     "pack_q8_0_fp8",

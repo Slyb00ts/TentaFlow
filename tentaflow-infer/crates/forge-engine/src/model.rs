@@ -33,9 +33,9 @@ use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weight_tier::{TieredWeightDevice, WeightResidency};
 use crate::weights::{
-    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Layer, Fp8Weight, GateUpWeights,
-    LayerFfn, LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy, NvFp4CtStorage, QkvWeights,
-    W4A8Weight,
+    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Layer, Fp8Weight,
+    GateUpWeights, LayerFfn, LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy,
+    NvFp4CtStorage, QkvWeights, W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -6689,6 +6689,27 @@ impl Model {
         Ok(())
     }
 
+    /// Format źródłowy projekcji, jeśli `pack_gguf_fp8` umie ją przepakować na
+    /// e4m3 wprost z rezydentnych bajtów GGUF.
+    fn fp8_packable(w: &DevWeight) -> Option<(&DevBuffer, usize, usize, QuantKind, f32)> {
+        match w {
+            DevWeight::Q4K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q4K, 1.0)),
+            DevWeight::Q6K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q6K, 1.0)),
+            DevWeight::Q8_0 { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q8_0, 1.0)),
+            // Paker czyta surowe bloki 36 B, więc przepakowany układ kafelkowy
+            // do niego nie pasuje. `output_scale` mnoży wynik całego tensora i
+            // wchodzi w skalę wierszową paczki.
+            DevWeight::NvFp4Gguf {
+                buf,
+                rows,
+                cols,
+                layout: Nvfp4GgufLayout::RowMajor36,
+                output_scale,
+            } => Some((buf, *rows, *cols, QuantKind::NVFP4Gguf, *output_scale)),
+            _ => None,
+        }
+    }
+
     /// Build the fp8 (e4m3) prefill packs from the resident GGUF weights. No
     /// calibration pass is needed (e4m3's exponent captures the per-row range),
     /// so this just dequantizes every dense projection and repacks it to e4m3
@@ -6715,6 +6736,7 @@ impl Model {
         &self,
         buf: &DevBuffer,
         quant: QuantKind,
+        output_scale: f32,
         row_off: usize,
         rows: usize,
         cols: usize,
@@ -6733,6 +6755,7 @@ impl Model {
             rows,
             cols,
             quant,
+            output_scale,
             &self.stream,
         )?;
         Ok(Fp8Weight {
@@ -6747,27 +6770,19 @@ impl Model {
     /// re-read, no CPU dequant). Returns `Ok(false)` when any projection is
     /// not Q4_K/Q6_K/Q8_0 — the caller falls back to the CPU rebuild.
     pub fn build_fp8_gpu(&mut self) -> Result<bool> {
-        fn packable(w: &DevWeight) -> Option<(&DevBuffer, usize, usize, QuantKind)> {
-            match w {
-                DevWeight::Q4K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q4K)),
-                DevWeight::Q6K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q6K)),
-                DevWeight::Q8_0 { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q8_0)),
-                _ => None,
-            }
-        }
         let pack_full = |w: &DevWeight| -> Result<Option<Fp8Weight>> {
-            let Some((buf, rows, cols, quant)) = packable(w) else {
+            let Some((buf, rows, cols, quant, output_scale)) = Self::fp8_packable(w) else {
                 return Ok(None);
             };
-            self.pack_fp8_gpu_window(buf, quant, 0, rows, cols)
+            self.pack_fp8_gpu_window(buf, quant, output_scale, 0, rows, cols)
                 .map(Some)
         };
         let pack_window =
             |w: &DevWeight, row_off: usize, rows: usize| -> Result<Option<Fp8Weight>> {
-                let Some((buf, _, cols, quant)) = packable(w) else {
+                let Some((buf, _, cols, quant, output_scale)) = Self::fp8_packable(w) else {
                     return Ok(None);
                 };
-                self.pack_fp8_gpu_window(buf, quant, row_off, rows, cols)
+                self.pack_fp8_gpu_window(buf, quant, output_scale, row_off, rows, cols)
                     .map(Some)
             };
         // Nothing is allocated before every projection passes the format
@@ -6789,7 +6804,7 @@ impl Model {
                 GateUpWeights::Split { gate, up } => ws.extend([gate, up]),
                 GateUpWeights::Fused(gu) => ws.push(gu),
             }
-            if ws.into_iter().any(|w| packable(w).is_none()) {
+            if ws.into_iter().any(|w| Self::fp8_packable(w).is_none()) {
                 return Ok(false);
             }
         }

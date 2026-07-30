@@ -438,6 +438,7 @@ pub fn w4a8_enabled() -> bool {
 /// Because e4m3 is floating point, one per-row scale (not per-32-block like
 /// int8) captures the row's magnitude spread — the block-to-block variation is
 /// absorbed by e4m3's 4-bit exponent.
+#[derive(Clone)]
 pub struct Fp8Weight {
     /// e4m3 bytes [rows, cols], row-major (one byte per weight).
     pub qweight: DevBuffer,
