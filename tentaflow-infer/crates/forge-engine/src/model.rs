@@ -61,6 +61,20 @@ const HYBRID_PREFILL_AUTO_CHUNK: usize = 128;
 const HYBRID_PREFILL_LADDER: [usize; 5] = [1024, 512, 256, 128, 32];
 const HYBRID_PREFILL_ACTIVATION_RESERVE: usize = 64 * 1024 * 1024;
 const HYBRID_LAYER_MAJOR_MAX_TOKENS: usize = 4096;
+
+/// Bufory jednego wywołania gęstego bloku FFN.
+///
+/// `act` wolno wskazywać ten sam bufor co `gate` — ścieżka layer-major prefillu
+/// liczy bramkowanie w miejscu. `gate_up` jest potrzebne wyłącznie przy scalonej
+/// macierzy `gate_up` i jednym tokenie.
+struct FfnBlockBufs<'a> {
+    x: &'a DevBuffer,
+    gate: &'a DevBuffer,
+    up: &'a DevBuffer,
+    act: &'a DevBuffer,
+    out: &'a DevBuffer,
+    gate_up: Option<&'a DevBuffer>,
+}
 const HYBRID_HOST_STAGING_SLOTS: usize = 3;
 const NVFP4_CT_QKV_ROWS: usize = 6144;
 const NVFP4_CT_GATE_UP_ROWS: usize = 22528;
@@ -2851,7 +2865,6 @@ impl Model {
         // projekcji — bufory muszą pomieścić najszerszą z nich.
         let q_dim = p.max_q_dim();
         let kv_dim = p.max_kv_dim();
-        let inter = p.intermediate_size;
         let attn_parts_bytes = p
             .n_heads
             .checked_mul(ATTN_DECODE_GQA_SPLITS)
@@ -2864,6 +2877,7 @@ impl Model {
         // pool provisioned for exactly this purpose, and nothing else uses it
         // on the LLM path anymore (the ring never needs to wrap).
         let alloc = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        let inter = p.intermediate_size;
         let bufs = DecodeBufs {
             h: alloc(hidden)?,
             h32: device.alloc(hidden * 4, MemKind::Device, Pool::Activations)?,
@@ -5013,6 +5027,81 @@ impl Model {
     }
 
     /// Batched GEMM over row-major activations x[t][col].
+    /// Gęsty blok FFN: `out = down · act(gate·x, up·x)` dla `n_tokens` tokenów.
+    ///
+    /// JEDNA implementacja dla wszystkich ścieżek hybrydy — dekodowania,
+    /// prefillu layer-major, weryfikacji draftu MTP i verifiera segmentowanego.
+    /// Wcześniej ten sam blok był przepisany osobno w każdej z nich, przez co
+    /// każda zmiana (a podział na karty w szczególności) wymagała wpięcia w
+    /// każde miejsce z osobna i mogła cicho ominąć te, o których się zapomniało.
+    fn ffn_dense_block(
+        &self,
+        ffn: &crate::weights::DenseFfn,
+        bufs: FfnBlockBufs<'_>,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let inter = self.weights.descriptor.params.intermediate_size;
+        match &ffn.gate_up {
+            GateUpWeights::Fused(weight) => match (n_tokens, bufs.gate_up) {
+                // Jeden token ze scalonym `gate_up`: pojedyncza projekcja do
+                // wspólnego bufora, a bramkowanie czyta obie połowy przez
+                // przesunięcie.
+                (1, Some(gate_up)) => {
+                    self.gemv(gate_up, weight, bufs.x, stream)?;
+                    self.kernels.glu_mul_f16_at(
+                        self.ffn_act(),
+                        bufs.act,
+                        gate_up,
+                        0,
+                        inter * 2,
+                        inter,
+                        stream,
+                    )?;
+                }
+                _ => {
+                    self.gemm_rows(bufs.gate, weight, bufs.x, n_tokens, 0, inter, stream)?;
+                    self.gemm_rows(bufs.up, weight, bufs.x, n_tokens, inter, inter, stream)?;
+                    self.kernels.glu_mul_f16(
+                        self.ffn_act(),
+                        bufs.act,
+                        bufs.gate,
+                        bufs.up,
+                        n_tokens * inter,
+                        stream,
+                    )?;
+                }
+            },
+            GateUpWeights::Split { gate, up } => {
+                if n_tokens == 1 {
+                    // Obie projekcje czytają TĘ SAMĄ znormalizowaną aktywację,
+                    // więc idą jednym uruchomieniem ze wspólną kwantyzacją.
+                    if !self.gemv_nvfp4_gguf_group(&[(bufs.gate, gate), (bufs.up, up)], bufs.x, stream)?
+                    {
+                        self.gemv(bufs.gate, gate, bufs.x, stream)?;
+                        self.gemv(bufs.up, up, bufs.x, stream)?;
+                    }
+                } else {
+                    self.gemm(bufs.gate, gate, bufs.x, n_tokens, stream)?;
+                    self.gemm(bufs.up, up, bufs.x, n_tokens, stream)?;
+                }
+                self.kernels.glu_mul_f16(
+                    self.ffn_act(),
+                    bufs.act,
+                    bufs.gate,
+                    bufs.up,
+                    n_tokens * inter,
+                    stream,
+                )?;
+            }
+        }
+        if n_tokens == 1 {
+            self.gemv(bufs.out, &ffn.down, bufs.act, stream)
+        } else {
+            self.gemm(bufs.out, &ffn.down, bufs.act, n_tokens, stream)
+        }
+    }
+
     fn gemm(
         &self,
         y: &DevBuffer,
@@ -11501,41 +11590,19 @@ impl Model {
                     "hybrydowy verifier MTP nie obsługuje jeszcze targetu MoE".into(),
                 ));
             };
-            match &ffn.gate_up {
-                GateUpWeights::Fused(weight) => {
-                    self.gemm_rows(
-                        &pb.gate,
-                        weight,
-                        &pb.x,
-                        t,
-                        0,
-                        p.intermediate_size,
-                        &self.stream,
-                    )?;
-                    self.gemm_rows(
-                        &pb.up,
-                        weight,
-                        &pb.x,
-                        t,
-                        p.intermediate_size,
-                        p.intermediate_size,
-                        &self.stream,
-                    )?;
-                }
-                GateUpWeights::Split { gate, up } => {
-                    self.gemm(&pb.gate, gate, &pb.x, t, &self.stream)?;
-                    self.gemm(&pb.up, up, &pb.x, t, &self.stream)?;
-                }
-            }
-            self.kernels.glu_mul_f16(
-                self.ffn_act(),
-                &pb.act,
-                &pb.gate,
-                &pb.up,
-                t * p.intermediate_size,
+            self.ffn_dense_block(
+                ffn,
+                FfnBlockBufs {
+                    x: &pb.x,
+                    gate: &pb.gate,
+                    up: &pb.up,
+                    act: &pb.act,
+                    out: &pb.down,
+                    gate_up: None,
+                },
+                t,
                 &self.stream,
             )?;
-            self.gemm(&pb.down, &ffn.down, &pb.act, t, &self.stream)?;
             let next_norm = if layer_index + 1 < self.weights.layers.len() {
                 &self.weights.layers[layer_index + 1].attn_norm
             } else {
@@ -11660,7 +11727,6 @@ impl Model {
         let q_norm_rows = checked_elements("mtp b2 q norm", &[total, p.n_heads])?;
         let kv_norm_rows = checked_elements("mtp b2 kv norm", &[total, p.n_kv_heads])?;
         let delta_norm_rows = checked_elements("mtp b2 delta norm", &[total, ssm.n_v_heads()])?;
-        let ffn_rows = checked_elements("mtp b2 ffn", &[total, p.intermediate_size])?;
         let key_width = checked_elements("mtp b2 key width", &[ssm.d_state, ssm.n_group])?;
         let value_width = checked_elements("mtp b2 value width", &[ssm.d_state, ssm.n_v_heads()])?;
         let conv_width = key_width
@@ -12117,22 +12183,19 @@ impl Model {
                 let LayerFfn::Dense(ffn) = &layer.ffn else {
                     return Err(ForgeError::Unsupported("MTP B2 nie obsługuje MoE".into()));
                 };
-                let GateUpWeights::Split { gate, up } = &ffn.gate_up else {
-                    return Err(ForgeError::Unsupported(
-                        "MTP B2 wymaga rozdzielonych gate/up".into(),
-                    ));
-                };
-                self.gemm(&pb.gate, gate, &pb.x, total, &self.stream)?;
-                self.gemm(&pb.up, up, &pb.x, total, &self.stream)?;
-                self.kernels.glu_mul_f16(
-                    self.ffn_act(),
-                    &pb.act,
-                    &pb.gate,
-                    &pb.up,
-                    ffn_rows,
+                self.ffn_dense_block(
+                    ffn,
+                    FfnBlockBufs {
+                        x: &pb.x,
+                        gate: &pb.gate,
+                        up: &pb.up,
+                        act: &pb.act,
+                        out: &pb.down,
+                        gate_up: None,
+                    },
+                    total,
                     &self.stream,
                 )?;
-                self.gemm(&pb.down, &ffn.down, &pb.act, total, &self.stream)?;
                 let next_norm = if layer_index + 1 < self.weights.layers.len() {
                     &self.weights.layers[layer_index + 1].attn_norm
                 } else {
@@ -14974,7 +15037,6 @@ impl Model {
         let q_norm_rows = TOTAL * p.n_heads;
         let kv_norm_rows = TOTAL * p.n_kv_heads;
         let delta_norm_rows = TOTAL * ssm.n_v_heads();
-        let ffn_rows = TOTAL * p.intermediate_size;
         let state_bytes = ssm.n_v_heads() * ssm.d_state * ssm.d_state * 4;
         let mut snapshot_ready = false;
         let mut work_enqueued = false;
@@ -15400,20 +15462,19 @@ impl Model {
                 let LayerFfn::Dense(ffn) = &layer.ffn else {
                     unreachable!("capability odrzuca MoE")
                 };
-                let GateUpWeights::Split { gate, up } = &ffn.gate_up else {
-                    unreachable!("capability wymaga rozdzielonych gate/up")
-                };
-                self.gemm(&b2.gate, gate, &b2.x, TOTAL, &self.stream)?;
-                self.gemm(&b2.up, up, &b2.x, TOTAL, &self.stream)?;
-                self.kernels.glu_mul_f16(
-                    self.ffn_act(),
-                    &b2.act,
-                    &b2.gate,
-                    &b2.up,
-                    ffn_rows,
+                self.ffn_dense_block(
+                    ffn,
+                    FfnBlockBufs {
+                        x: &b2.x,
+                        gate: &b2.gate,
+                        up: &b2.up,
+                        act: &b2.act,
+                        out: &b2.down,
+                        gate_up: None,
+                    },
+                    TOTAL,
                     &self.stream,
                 )?;
-                self.gemm(&b2.down, &ffn.down, &b2.act, TOTAL, &self.stream)?;
                 let next_norm = if layer_index + 1 < self.weights.layers.len() {
                     &self.weights.layers[layer_index + 1].attn_norm
                 } else {
@@ -15797,7 +15858,6 @@ impl Model {
     fn hybrid_forward_staged(&self, want_logits: bool, src: AttnSrc) -> Result<()> {
         let p = self.weights.descriptor.params.clone();
         let hidden = p.hidden_size;
-        let inter = p.intermediate_size;
         let eps = p.rms_norm_eps;
         let kernels = &self.kernels;
         let stream = &self.stream;
@@ -15841,44 +15901,19 @@ impl Model {
                     tp.forward(stream, l, &b.x, &b.down, self.ffn_act())?
                 }
                 (LayerFfn::Moe(moe), _) => self.moe_decode_ffn(moe, l, hidden, stream)?,
-                (LayerFfn::Dense(ffn), None) => {
-                    match &ffn.gate_up {
-                        GateUpWeights::Fused(weight) => {
-                            self.gemv(&b.gate_up, weight, &b.x, stream)?;
-                            kernels.glu_mul_f16_at(
-                                self.ffn_act(),
-                                &b.act,
-                                &b.gate_up,
-                                0,
-                                inter * 2,
-                                inter,
-                                stream,
-                            )?;
-                        }
-                        GateUpWeights::Split { gate, up } => {
-                            // Obie projekcje czytają TĘ SAMĄ znormalizowaną
-                            // aktywację, więc idą jednym uruchomieniem ze
-                            // wspólną kwantyzacją zamiast dwoma.
-                            if !self.gemv_nvfp4_gguf_group(
-                                &[(&b.gate, gate), (&b.up, up)],
-                                &b.x,
-                                stream,
-                            )? {
-                                self.gemv(&b.gate, gate, &b.x, stream)?;
-                                self.gemv(&b.up, up, &b.x, stream)?;
-                            }
-                            kernels.glu_mul_f16(
-                                self.ffn_act(),
-                                &b.act,
-                                &b.gate,
-                                &b.up,
-                                inter,
-                                stream,
-                            )?;
-                        }
-                    }
-                    self.gemv(&b.down, &ffn.down, &b.act, stream)?;
-                }
+                (LayerFfn::Dense(ffn), None) => self.ffn_dense_block(
+                    ffn,
+                    FfnBlockBufs {
+                        x: &b.x,
+                        gate: &b.gate,
+                        up: &b.up,
+                        act: &b.act,
+                        out: &b.down,
+                        gate_up: Some(&b.gate_up),
+                    },
+                    1,
+                    stream,
+                )?,
             }
             let next_norm = if l + 1 < n_layers {
                 &self.weights.layers[l + 1].attn_norm
@@ -17028,41 +17063,21 @@ impl Model {
                         "layer-major nie obsługuje targetu MoE".into(),
                     ));
                 };
-                match &ffn.gate_up {
-                    GateUpWeights::Fused(weight) => {
-                        self.gemm_rows(
-                            &arena.gate,
-                            weight,
-                            &arena.x,
-                            t,
-                            0,
-                            p.intermediate_size,
-                            &self.stream,
-                        )?;
-                        self.gemm_rows(
-                            &arena.up,
-                            weight,
-                            &arena.x,
-                            t,
-                            p.intermediate_size,
-                            p.intermediate_size,
-                            &self.stream,
-                        )?;
-                    }
-                    GateUpWeights::Split { gate, up } => {
-                        self.gemm(&arena.gate, gate, &arena.x, t, &self.stream)?;
-                        self.gemm(&arena.up, up, &arena.x, t, &self.stream)?;
-                    }
-                }
-                self.kernels.glu_mul_f16(
-                    self.ffn_act(),
-                    &arena.gate,
-                    &arena.gate,
-                    &arena.up,
-                    t * p.intermediate_size,
+                self.ffn_dense_block(
+                    ffn,
+                    FfnBlockBufs {
+                        x: &arena.x,
+                        gate: &arena.gate,
+                        up: &arena.up,
+                        // Bramkowanie liczone W MIEJSCU: `act` to ten sam bufor
+                        // co `gate`.
+                        act: &arena.gate,
+                        out: &arena.mixer_out,
+                        gate_up: None,
+                    },
+                    t,
                     &self.stream,
                 )?;
-                self.gemm(&arena.mixer_out, &ffn.down, &arena.gate, t, &self.stream)?;
                 let next_norm = if layer_index + 1 < self.weights.layers.len() {
                     &self.weights.layers[layer_index + 1].attn_norm
                 } else {
