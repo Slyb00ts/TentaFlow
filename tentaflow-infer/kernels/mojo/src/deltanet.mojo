@@ -215,3 +215,27 @@ def deltanet_beta_sigmoid_f32(
     if h >= n_v_heads:
         return
     beta_out[h] = 1.0 / (1.0 + exp(-Float32(beta_in[h])))
+
+
+def deltanet_repeat_qk_f16(
+    q_dst: UnsafePointer[Float16, MutAnyOrigin],
+    k_dst: UnsafePointer[Float16, MutAnyOrigin],
+    q_src: UnsafePointer[Float16, MutAnyOrigin],
+    k_src: UnsafePointer[Float16, MutAnyOrigin],
+    n_elems: Int,
+    rep: Int,
+):
+    """Powtarza bloki q/k głowic K `rep` razy, żeby pokryć głowice V (GQA).
+
+    Skan gated-delta indeksuje q/k numerem głowicy V, więc bloki głowic K muszą
+    leżeć powtórzone. Robił to `rep` par kopii D2D na warstwę — osiem uruchomień
+    przy `rep = 4`, czyli 384 na token dla 48 warstw DeltaNet. Zmierzone na
+    R9700: sama kopia trwa 1,1 us, ale każde uruchomienie kosztuje jeszcze ~3,8 us
+    przestoju, więc liczy się ICH LICZBA, nie przenoszone bajty.
+    """
+    index = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if index >= n_elems * rep:
+        return
+    source = index % n_elems
+    q_dst[index] = q_src[source]
+    k_dst[index] = k_src[source]

@@ -2352,27 +2352,47 @@ fn attach_mp4_branch_preview(
         .add_many(elements)
         .map_err(|e| format!("add_many branch B preview: {e}"))?;
 
-    let queue_b_sink = queue_b
-        .static_pad("sink")
-        .ok_or_else(|| "queue_b preview sink pad missing".to_string())?;
-    gst::Element::link_many(elements).map_err(|e| format!("link branch B preview: {e}"))?;
+    // Od tego miejsca elementy SĄ w pipeline, więc KAŻDA ścieżka błędu musi je
+    // usunąć. Trzy z nich mają stałe nazwy (`queue_branch_b_preview`,
+    // `queue_decoded_b_preview`, `sink_mp4_preview`), a `gst_bin_add` odrzuca
+    // element o nazwie już obecnej w binie — osierocona gałąź blokuje więc
+    // KAŻDĄ kolejną próbę wpięcia na `add_many`, trwale, aż do przebudowy
+    // pipeline'u. Dlatego kroki fallible siedzą w jednym domknięciu i mają
+    // JEDNO wspólne sprzątanie, którego nie da się pominąć przy kolejnej edycji.
+    let wired = (|| -> std::result::Result<gst::Pad, String> {
+        let queue_b_sink = queue_b
+            .static_pad("sink")
+            .ok_or_else(|| "queue_b preview sink pad missing".to_string())?;
+        gst::Element::link_many(elements).map_err(|e| format!("link branch B preview: {e}"))?;
 
-    wire_mp4_appsink(&sink, publisher)?;
+        wire_mp4_appsink(&sink, publisher)?;
 
-    // Ta sama semantyka resetu bazy PTS co w gałęzi passthrough (rebuild =
-    // nowa oś), ale probe stoi na WEJŚCIU gałęzi (src pad queue_b za tee,
-    // przed depay/dekodem): x264enc przesuwa timestampy o stały offset, więc
-    // baza zdjęta za enkoderem leżałaby w innej osi niż PTS detekcji i klient
-    // w trybie PTS nie rysowałby boxów. PTS pierwszej klatki wchodzącej do
-    // gałęzi to oś detekcji (Branch A), spójna z media-time pierwszej próbki
-    // fragmentu z dokładnością do opóźnienia enkodera (1-2 klatki).
-    publisher.reset_base_pts_ns();
-    install_branch_input_base_pts_probe(&queue_b, publisher);
+        // Ta sama semantyka resetu bazy PTS co w gałęzi passthrough (rebuild =
+        // nowa oś), ale probe stoi na WEJŚCIU gałęzi (src pad queue_b za tee,
+        // przed depay/dekodem): x264enc przesuwa timestampy o stały offset, więc
+        // baza zdjęta za enkoderem leżałaby w innej osi niż PTS detekcji i klient
+        // w trybie PTS nie rysowałby boxów. PTS pierwszej klatki wchodzącej do
+        // gałęzi to oś detekcji (Branch A), spójna z media-time pierwszej próbki
+        // fragmentu z dokładnością do opóźnienia enkodera (1-2 klatki).
+        publisher.reset_base_pts_ns();
+        install_branch_input_base_pts_probe(&queue_b, publisher);
 
-    for el in elements {
-        el.sync_state_with_parent()
-            .map_err(|e| format!("sync_state branch B preview element: {e}"))?;
-    }
+        for el in elements {
+            el.sync_state_with_parent()
+                .map_err(|e| format!("sync_state branch B preview element: {e}"))?;
+        }
+        Ok(queue_b_sink)
+    })();
+    let queue_b_sink = match wired {
+        Ok(pad) => pad,
+        Err(reason) => {
+            for el in elements {
+                let _ = el.set_state(gst::State::Null);
+            }
+            let _ = pipeline.remove_many(elements);
+            return Err(reason);
+        }
+    };
 
     // Pad tee linkujemy DOPIERO po aktywacji całej gałęzi. Push tee w okno
     // między linkiem a aktywacją queue_b zwraca FLUSHING, a tee trwale

@@ -1832,8 +1832,6 @@ struct HybridBufs {
     /// Per-head-split conv q/k `[key_dim]` and their repeat to `[value_dim]`.
     q16: DevBuffer,
     k16: DevBuffer,
-    q16src: DevBuffer,
-    k16src: DevBuffer,
     q32: DevBuffer,
     k32: DevBuffer,
     /// Conv value heads `[value_dim]` f16.
@@ -15652,8 +15650,6 @@ impl Model {
             conv_out: a16(conv_dim)?,
             q16: a16(key_dim)?,
             k16: a16(key_dim)?,
-            q16src: a16(key_dim)?,
-            k16src: a16(key_dim)?,
             q32: a16(value_dim)?,
             k32: a16(value_dim)?,
             vtok: a16(value_dim)?,
@@ -16084,17 +16080,9 @@ impl Model {
             d_conv,
             stream,
         )?;
-        // Split conv output into q/k (key_dim each) and v (value_dim).
-        self.device
-            .copy(&hb.conv_out, 0, &hb.q16src, 0, key_dim * 2, stream)?;
-        self.device.copy(
-            &hb.conv_out,
-            key_dim * 2,
-            &hb.k16src,
-            0,
-            key_dim * 2,
-            stream,
-        )?;
+        // Wyjście splotu niesie q, k i v jeden za drugim. Normalizacja czyta swój
+        // wycinek przez przesunięcie bajtowe, a nie z osobnego bufora — dawne
+        // trzy kopie D2D na warstwę były tylko po to, żeby zaczynać od zera.
         self.device.copy(
             &hb.conv_out,
             2 * key_dim * 2,
@@ -16104,17 +16092,27 @@ impl Model {
             stream,
         )?;
         // Per-head L2 norm on the key-head q/k (n_k heads over d_state).
-        kernels.l2norm_heads_f16(&hb.q16, &hb.q16src, n_k, d_state, eps, stream)?;
-        kernels.l2norm_heads_f16(&hb.k16, &hb.k16src, n_k, d_state, eps, stream)?;
+        kernels.l2norm_heads_f16_at(&hb.q16, &hb.conv_out, 0, n_k, d_state, eps, stream)?;
+        kernels.l2norm_heads_f16_at(
+            &hb.k16,
+            &hb.conv_out,
+            key_dim * 2,
+            n_k,
+            d_state,
+            eps,
+            stream,
+        )?;
         // Format GGUF przestawia tensory strony V do układu kafelkowego, więc
         // każda głowa V używa głowy K o indeksie `head % n_k`.
-        let key_bytes = n_k * d_state * 2;
-        for r in 0..rep {
-            self.device
-                .copy(&hb.q16, 0, &hb.q32, r * key_bytes, key_bytes, stream)?;
-            self.device
-                .copy(&hb.k16, 0, &hb.k32, r * key_bytes, key_bytes, stream)?;
-        }
+        kernels.deltanet_repeat_qk_f16(
+            &hb.q32,
+            &hb.k32,
+            &hb.q16,
+            &hb.k16,
+            n_k * d_state,
+            rep,
+            stream,
+        )?;
         // Per-head log-decay g = softplus(alpha + dt_bias)·a and beta gate.
         kernels.deltanet_log_decay_f32_at(
             &hb.g,

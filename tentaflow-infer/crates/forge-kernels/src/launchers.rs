@@ -2531,6 +2531,35 @@ impl Kernels {
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
+        self.l2norm_heads_f16_at(out, x_in, 0, n_heads, d_state, eps, stream)
+    }
+
+    /// Ten sam kernel, ale czyta wejście od przesunięcia bajtowego.
+    ///
+    /// Mikser DeltaNet ciął wyjście splotu na wycinki q/k/v trzema kopiami D2D na
+    /// warstwę, tylko po to, żeby konsument dostał bufor od zera. Kernel bierze
+    /// wskaźnik, więc wystarczy go przesunąć — kopie były 144 uruchomieniami na
+    /// token przy 48 warstwach.
+    #[allow(clippy::too_many_arguments)]
+    pub fn l2norm_heads_f16_at(
+        &self,
+        out: &DevBuffer,
+        x_in: &DevBuffer,
+        x_byte_off: usize,
+        n_heads: usize,
+        d_state: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let span = checked_buffer_bytes("l2norm_heads wejscie", &[n_heads, d_state], 2)?;
+        let end = x_byte_off.checked_add(span).ok_or_else(|| {
+            ForgeError::Kernel("l2norm_heads_f16_at: przepełnienie przesunięcia".into())
+        })?;
+        if end > x_in.len() || out.len() < span {
+            return Err(ForgeError::Kernel(
+                "l2norm_heads_f16_at: okno wykracza poza bufor".into(),
+            ));
+        }
         let k = self.artifacts.get("l2norm_heads_f16")?;
         let cfg = LaunchConfig {
             grid: (n_heads as u32, 1, 1),
@@ -2539,9 +2568,58 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(out)
-            .buf(x_in)
+            .buf_at(x_in, x_byte_off)?
             .scalar(d_state as i64)
             .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Powtarza bloki q/k głowic K `rep` razy do buforów głowic V (GQA).
+    ///
+    /// Zastępuje `2 * rep` kopii D2D JEDNYM uruchomieniem. Kopie były tanie w
+    /// bajtach (1,1 us każda), ale przy 48 warstwach DeltaNet dawały 384
+    /// uruchomienia na token, a każde kosztuje jeszcze ~3,8 us przestoju.
+    pub fn deltanet_repeat_qk_f16(
+        &self,
+        q_dst: &DevBuffer,
+        k_dst: &DevBuffer,
+        q_src: &DevBuffer,
+        k_src: &DevBuffer,
+        n_elems: usize,
+        rep: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n_elems == 0 || rep == 0 {
+            return Err(ForgeError::Kernel(
+                "deltanet_repeat_qk_f16 wymaga n_elems > 0 i rep > 0".into(),
+            ));
+        }
+        let total = n_elems.checked_mul(rep).ok_or_else(|| {
+            ForgeError::Kernel("deltanet_repeat_qk_f16: przepełnienie rozmiaru".into())
+        })?;
+        if q_src.len() < n_elems * 2
+            || k_src.len() < n_elems * 2
+            || q_dst.len() < total * 2
+            || k_dst.len() < total * 2
+        {
+            return Err(ForgeError::Kernel(
+                "deltanet_repeat_qk_f16: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let k = self.artifacts.get("deltanet_repeat_qk_f16")?;
+        let cfg = LaunchConfig::linear(
+            u32::try_from(total).map_err(|_| {
+                ForgeError::Kernel("deltanet_repeat_qk_f16: siatka przekracza u32".into())
+            })?,
+            BLOCK,
+        );
+        let args = LaunchArgs::new()
+            .buf(q_dst)
+            .buf(k_dst)
+            .buf(q_src)
+            .buf(k_src)
+            .scalar(n_elems as i64)
+            .scalar(rep as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 

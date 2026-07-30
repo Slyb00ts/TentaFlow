@@ -55,6 +55,7 @@ from src.deltanet import (
     deltanet_gated_step_f16,
     deltanet_gated_rmsnorm_f16,
     deltanet_log_decay_f32,
+    deltanet_repeat_qk_f16,
     deltanet_beta_sigmoid_f32,
 )
 from src.deltanet_value_key import (
@@ -1216,6 +1217,10 @@ def main() raises:
         deltanet_log_decay_f32, dump_asm=Path("deltanet_log_decay_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "deltanet_log_decay_f32"))
+    _ = ctx.compile_function[
+        deltanet_repeat_qk_f16, dump_asm=Path("deltanet_repeat_qk_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "deltanet_repeat_qk_f16"))
 
     _ = ctx.compile_function[
         deltanet_beta_sigmoid_f32,

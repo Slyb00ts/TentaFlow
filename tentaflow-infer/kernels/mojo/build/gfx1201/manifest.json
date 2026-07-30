@@ -377,6 +377,10 @@
       "entry": "src_deltanet_verify_deltanet_p6A6A6A6A_7ae860102babfe97",
       "file": "deltanet_prepare_tokens_f16_t32.hsaco"
     },
+    "deltanet_repeat_qk_f16": {
+      "entry": "src_deltanet_deltanet_repeat_q6A6A6A6A_3215377ce1f3e873",
+      "file": "deltanet_repeat_qk_f16.hsaco"
+    },
     "deltanet_value_key_commit_recompute_f32": {
       "entry": "src_deltanet_value_key_deltane6A6A6A6A_1ccb9b3fc9a1adc5",
       "file": "deltanet_value_key_commit_recompute_f32.hsaco"
