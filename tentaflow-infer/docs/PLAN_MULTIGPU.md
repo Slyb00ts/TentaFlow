@@ -34,11 +34,16 @@ Pomiar z tego stanowiska, prompt 512 tokenów, 128 tokenów dekodu, mediana z 3 
 
 | model | 1 karta | 2 karty | zysk |
 |---|--:|--:|--:|
-| Qwen3.6-27B NVFP4 | 30,0 tok/s | **36,0 tok/s** | +20,0% |
+| Qwen3.6-27B NVFP4 | 30,0 tok/s | **38,4 tok/s** | +28,0% |
 | Qwen3.6-27B Q4_K_M | 28,3 tok/s | **35,3 tok/s** | +24,7% |
-| NVFP4 + MTP | 73,7 tok/s | 73,0 tok/s | bez zmian |
+| NVFP4 + MTP | 73,2 tok/s | 72,7 tok/s | bez zmian |
 
-Prefill jest nietknięty (nadal jedna karta): 1200 tok/s w obu przypadkach.
+Dzielone są: FFN (`gate`/`up` po wierszach, `down` po kolumnach), obie duże
+projekcje wejściowe DeltaNet (`in_proj` NVFP4 i `gate_proj` Q8_0 — różne formaty,
+wspólny udział wierszy) oraz głowa logitów Q8_0 po wierszach słownika.
+
+Prefill jest nietknięty (nadal jedna karta): ~1195 tok/s w obu przypadkach —
+patrz etap C, gdzie podział po tokenach został sprawdzony i odrzucony.
 
 ### Dlaczego +20%, a nie +100%
 
@@ -94,8 +99,25 @@ DeltaNet dzieli się po GŁOWICACH — stan rekurencyjny jest per głowica i nie
 więc karta trzyma stan swoich głowic bez wymiany w skanie. To obejmuje pozostałe
 44% wag i jest jedyną drogą, żeby dekodowanie zbliżyło się do 2x.
 
-**C. TP w prefillu.** Ta sama geometria, ale kernele macierzowe zamiast GEMV.
-Prefill jest compute-bound, więc zysk jest bliski liniowemu.
+**C. TP w prefillu — podział po tokenach SPRAWDZONY I ODRZUCONY.**
+Zaimplementowany i zmierzony: pełne macierze FFN na karcie wspierającej, ogon
+tokenów liczony tam w całości (więc bitowo zgodnie), prefiks na karcie modelu.
+SHA nie drgnął, ale przepustowość też nie: 1199 tok/s na jednej karcie wobec
+1197 na dwóch, i żaden udział z zakresu 0,4-1,0 tego nie odwrócił.
+
+Profil `rocprofv3` mówi dlaczego. Karta modelu wykonuje realnie MNIEJ pracy
+(902,6 -> 705,9 ms kerneli), karta wspierająca dokłada 307,2 ms — ale ŁĄCZNA
+praca rośnie z 565 do 670 ms samego GEMM NVFP4. Obie karty strumieniują PEŁNE
+macierze FFN, więc koszt odczytu wag się DUBLUJE, a dzieli się tylko arytmetyka.
+Karta wspierająca kończy swoją połowę później, niż karta modelu kończy swoją, i
+zaoszczędzone ~98 ms na prefill schodzi na czekanie i wymianę. Kod usunięty —
+kosztował 9,3 GiB VRAM na karcie wspierającej i czas ładowania za zero.
+
+Wniosek dla prefillu: musi to być podział po WAGACH (każda karta czyta połowę
+macierzy), a nie po tokenach. To z kolei wymaga GEMM z wyjściem f32 dla
+projekcji `down`, bo sumy cząstkowe dwóch kart zapisane w f16 zmieniałyby wynik
+prefillu, czyli cały strumień tokenów. Bez tego kernela podział prefillu nie ma
+bitowo zgodnej ścieżki.
 
 **D. Podział ścieżki weryfikacji MTP.** Dziś MTP omija podział całkowicie: krok
 spekulacyjny to weryfikacja T=3 tokenów osobnym, segmentowanym łańcuchem, do
