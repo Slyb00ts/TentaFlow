@@ -119,10 +119,29 @@ projekcji `down`, bo sumy cząstkowe dwóch kart zapisane w f16 zmieniałyby wyn
 prefillu, czyli cały strumień tokenów. Bez tego kernela podział prefillu nie ma
 bitowo zgodnej ścieżki.
 
-**D. Podział ścieżki weryfikacji MTP.** Dziś MTP omija podział całkowicie: krok
-spekulacyjny to weryfikacja T=3 tokenów osobnym, segmentowanym łańcuchem, do
-którego `TpFfn` nie jest wpięty. Stąd 73,7 wobec 73,0 tok/s. Wymaga wariantu
-batchowego podziału, nie GEMV.
+**D. Podział ścieżki weryfikacji MTP — NAJWIĘKSZA pozostała nagroda.**
+Weryfikacja draftu jest tak samo ograniczona odczytem wag jak zwykły krok: przy
+T=3 arytmetyka nie przeważa, więc podział wag powinien dać tu te same ~28% co w
+dekodowaniu — a że MTP startuje z 73 tok/s, to zysk bezwzględny ponad dwa razy
+większy niż na ścieżce niespekulacyjnej.
+
+Kernel jest gotowy: `gemm_nvfp4_gguf_out_f32_batch` liczy sumy cząstkowe `down`
+w f32 dla 2/4/8/16 tokenów, więc redukcja między kartami nie wymaga nowego kodu
+GPU. Batchowy wariant `TpDecode::forward_batch` też został napisany.
+
+Czego BRAKUJE: miejsca wpięcia. Sprawdzone dwa kandydujące bloki FFN ścieżki
+weryfikacji (`b2`/`TOTAL` oraz `pb`/`total`) — ŻADEN nie jest wykonywany przy
+`--speculative mtp` na jednej sekwencji, co potwierdza log, który nigdy nie
+padł. Realna ścieżka leży gdzie indziej (kandydaci: `hybrid_verify_delta_layer`,
+`hybrid_verify_attention_layer` albo przechwycony `hybrid_verify_graphs`).
+Trzeba ją najpierw ZNALEŹĆ, np. profilem albo logiem na wejściu każdego
+kandydata — dopisywanie kodu do bloków, które się nie wykonują, tylko wygląda
+jak postęp. Niepodpięty wariant został usunięty, żeby nie zostawiać martwej
+gałęzi.
+
+UWAGA na przechwytywanie: gdyby ścieżka szła przez graf, podziału nie da się w
+nim przechwycić (ROCm przerywa asercją przy rozwidleniu między kartami) — trzeba
+ją wtedy wykonywać jawnym łańcuchem, jak zrobiono dla kroku hybrydowego.
 
 **E. Pipeline parallel.** Podział po warstwach zamiast po wagach. Nie skraca
 opóźnienia pojedynczego żądania tak jak TP, ale skaluje się na więcej kart i
@@ -135,10 +154,12 @@ testowego byłby to kod niesprawdzony na realnych danych.
 
 ## Kolejność
 
-B -> C -> D -> E -> F. B daje najwięcej, bo to jedyne pozostałe 44% wag w
-ścieżce dekodu. C jest drugie, bo prefill już wygrywamy z llama.cpp i podwojenie
-go przesuwa przewagę z 1,3x na ~2,5x. D odblokowuje podział dla najszybszego
-trybu, jaki mamy. E i F nie mają dziś czym być zweryfikowane na tym stanowisku.
+D -> C -> B -> E -> F. D pierwsze: najszybszy tryb, jaki mamy, nie korzysta z
+drugiej karty w ogóle, a kernel redukcji jest już gotowy — brakuje wyłącznie
+znalezienia właściwego miejsca wpięcia. C drugie, ale wymaga podziału po WAGACH
+(patrz wyżej) i GEMM z wyjściem f32 dla `down` przy dużych T. B na końcu z tej
+trójki, bo projekcje uwagi to tylko 6% odczytu. E i F nie mają dziś czym być
+zweryfikowane na tym stanowisku.
 
 **Bramka jakości: wynik podziału musi zgadzać się z jednokartowym co do
 kolejności redukcji, jaką narzuca geometria.** Podział wierszowy ma być bit w
