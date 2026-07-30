@@ -94,6 +94,36 @@ głowicach każda ranga liczy swoje głowice do końca miksera i wymienia dopier
 sumę cząstkową projekcji wyjściowej. To jest ta sama liczba wymian dla całej
 warstwy, jaką ma dziś sam FFN.
 
+## Dlaczego reasemblacja jest zakazana (i skąd biorą się DWIE redukcje)
+
+To jest najważniejsze ograniczenie projektowe i najłatwiej je przeoczyć.
+
+Macierz kolumnowo równoległa daje na karcie blok ZWARTY `[T, wiersze_rangi]`.
+Bufor, którego oczekuje kolejny krok, jest ułożony token-major `[T, pełny_wymiar]`,
+więc złożenie fragmentów z dwóch rang wymaga rozrzucenia Z KROKIEM — a tego
+kernele GEMM nie robią, bo piszą wyjście zwarte. Dla `T = 1` problem nie
+istnieje (krok równa się szerokości) i dlatego podział pojedynczego tokena
+działa. Dla `T > 1` reasemblacja kosztuje albo `T` osobnych kopii, albo osobny
+kernel rozrzucający — przy 48 warstwach zjada to cały zysk z podziału.
+
+Wniosek nie brzmi „napisz kernel rozrzucający", tylko: **po macierzy kolumnowo
+równoległej NIE WOLNO składać wyniku.** Ma go skonsumować macierz wierszowo
+równoległa NA TEJ SAMEJ randze. Wtedy jedyne, co przechodzi między kartami, to
+suma cząstkowa na końcu.
+
+FFN jest tego dowodem i działa: `gate`/`up` (kolumnowe) zostają lokalne,
+bramkowanie jest lokalne, `down` (wierszowe) redukuje. Zero składania.
+
+DeltaNet i uwaga muszą być zrobione tak samo: ranga liczy SWOJE głowice przez
+splot, normy i skan rekurencyjny, i dopiero projekcja wyjściowa redukuje. Podział
+samych projekcji wejściowych z odsyłaniem wyników na kartę 0 — czyli to, co robi
+dzisiejsza proteza — jest właśnie tym zakazanym składaniem i dlatego nie da się
+go rozszerzyć na `T > 1`.
+
+Stąd biorą się DOKŁADNIE dwie redukcje na warstwę. Nie jest to wybór
+optymalizacyjny, tylko konsekwencja tego, że każda ścieżka przez warstwę ma
+postać: kolumnowa -> lokalne przetwarzanie -> wierszowa -> redukcja.
+
 ## Zgodność bitowa
 
 - **Kolumnowo równoległe** (podział wyjścia): każdy element wyniku liczony w
