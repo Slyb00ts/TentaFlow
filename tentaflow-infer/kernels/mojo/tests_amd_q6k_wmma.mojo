@@ -1,41 +1,43 @@
-# Golden test kafla Q4_K WMMA: wynik GPU wobec referencji liczonej na hoscie
-# dokladnie ta sama formula co `_dequant_q4k` (nibble * d*sc - dmin*mn).
+# Golden test kafla Q6_K WMMA: wynik GPU wobec referencji liczonej na hoscie
+# dokladnie ta sama formula co `_gemv_q6_k_row_acc` ((q6 - 32) * d * sc).
 from std.gpu.host import DeviceContext
 from std.random import random_si64, seed
 
-from src.gemm_q4_k_wmma import (
-    gemm_q4_k_wmma_f16_bm32,
-    gemm_q4_k_wmma_f16_bm256,
-    gemm_q4_k_wmma_f16_bm256_bn128,
-    gemm_q4_k_wmma_f16_bm512_bn128,
+from src.gemm_q6_k_wmma import (
+    gemm_q6_k_wmma_f16_bm32,
+    gemm_q6_k_wmma_f16_bm256,
+    gemm_q6_k_wmma_f16_bm256_bn128,
+    gemm_q6_k_wmma_f16_bm512_bn128,
 )
 
-comptime SB_BYTES = 144
+comptime SB_BYTES = 210
 comptime SUPERBLOCK = 256
 
 
-def scale_min(s: UnsafePointer[UInt8, MutUntrackedOrigin], j: Int) -> Tuple[Float32, Float32]:
-    if j < 4:
-        return (Float32(Int(s[4 + j] & 63)), Float32(Int(s[8 + j] & 63)))
-    return (
-        Float32(Int((s[8 + j] & 0x0F) | ((s[4 + j - 4] >> 6) << 4))),
-        Float32(Int((s[8 + j] >> 4) | ((s[4 + j] >> 6) << 4))),
-    )
-
-
-def reference(w: UnsafePointer[UInt8, MutUntrackedOrigin], row: Int, col: Int, n_cols: Int) -> Float32:
+def reference(
+    w: UnsafePointer[UInt8, MutUntrackedOrigin], row: Int, col: Int, n_cols: Int
+) -> Float32:
     sb = row * (n_cols // SUPERBLOCK) * SB_BYTES + (col // SUPERBLOCK) * SB_BYTES
     r = col % SUPERBLOCK
-    d = Float32((w + sb).bitcast[Float16]().load[width=1, alignment=1]()[0])
-    dmin = Float32((w + sb + 2).bitcast[Float16]().load[width=1, alignment=1]()[0])
-    sc, mn = scale_min(w + sb, r // 32)
-    byte = (w + sb + 16 + (r // 64) * 32 + (r % 32))[0]
+    half = r // 128
+    j = r % 128
+    group = j // 32
+    l = j % 32
+    d = Float32((w + sb + 208).bitcast[Float16]().load[width=1, alignment=1]()[0])
+    sc = Float32(
+        (w + sb + 192 + half * 8 + group * 2 + l // 16)
+        .bitcast[Int8]()
+        .load[width=1, alignment=1]()[0]
+    )
+    byte = (w + sb + half * 64 + (group % 2) * 32 + l)[0]
     var nib: Int
-    if (r % 64) < 32:
+    if group < 2:
         nib = Int(byte & 0x0F)
     else:
         nib = Int(byte >> 4)
-    return Float32(nib) * (d * sc) - dmin * mn
+    hb = (w + sb + 128 + half * 32 + l)[0]
+    bits = Int((hb >> UInt8(group * 2)) & 3)
+    return Float32((nib | (bits << 4)) - 32) * (d * sc)
 
 
 def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, tile: Int) raises:
@@ -45,15 +47,16 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, tile: Int) 
     ctx.synchronize()
     for i in range(n_rows * sbs * SB_BYTES):
         wh[i] = UInt8(Int(random_si64(0, 255)))
-    # d/dmin musza byc male i dodatnie, zeby referencja f32 i akumulacja f32
-    # zostaly w porownywalnym zakresie.
+    # `d` male i dodatnie, skale w waskim zakresie ze znakiem — inaczej
+    # referencja f32 i akumulacja f32 rozjezdzaja sie na samym zakresie, a nie
+    # na kernelu.
     for r in range(n_rows):
         for s in range(sbs):
             base = r * sbs * SB_BYTES + s * SB_BYTES
-            wh[base] = 0x00
-            wh[base + 1] = 0x2C      # f16 ~0.0625
-            wh[base + 2] = 0x00
-            wh[base + 3] = 0x28      # f16 ~0.03125
+            wh[base + 208] = 0x00
+            wh[base + 209] = 0x2C  # f16 ~0.0625
+            for k in range(16):
+                wh[base + 192 + k] = UInt8(Int(random_si64(-8, 8)) & 0xFF)
     for i in range(n_tokens * n_cols):
         xh[i] = Float16(Float64(Int(random_si64(-4, 4))) * 0.25)
 
@@ -67,7 +70,7 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, tile: Int) 
     if tile == 0:
         comptime BM = 32
         comptime BN = 64
-        ctx.enqueue_function[gemm_q4_k_wmma_f16_bm32](
+        ctx.enqueue_function[gemm_q6_k_wmma_f16_bm32](
             y.unsafe_ptr(), w.unsafe_ptr(), x.unsafe_ptr(),
             n_cols, n_rows, n_tokens,
             grid_dim=((n_rows + BN - 1) // BN, (n_tokens + BM - 1) // BM),
@@ -76,7 +79,7 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, tile: Int) 
     elif tile == 1:
         comptime BM = 256
         comptime BN = 64
-        ctx.enqueue_function[gemm_q4_k_wmma_f16_bm256](
+        ctx.enqueue_function[gemm_q6_k_wmma_f16_bm256](
             y.unsafe_ptr(), w.unsafe_ptr(), x.unsafe_ptr(),
             n_cols, n_rows, n_tokens,
             grid_dim=((n_rows + BN - 1) // BN, (n_tokens + BM - 1) // BM),
@@ -85,7 +88,7 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, tile: Int) 
     elif tile == 2:
         comptime BM = 256
         comptime BN = 128
-        ctx.enqueue_function[gemm_q4_k_wmma_f16_bm256_bn128](
+        ctx.enqueue_function[gemm_q6_k_wmma_f16_bm256_bn128](
             y.unsafe_ptr(), w.unsafe_ptr(), x.unsafe_ptr(),
             n_cols, n_rows, n_tokens,
             grid_dim=((n_rows + BN - 1) // BN, (n_tokens + BM - 1) // BM),
@@ -94,7 +97,7 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, tile: Int) 
     else:
         comptime BM = 512
         comptime BN = 128
-        ctx.enqueue_function[gemm_q4_k_wmma_f16_bm512_bn128](
+        ctx.enqueue_function[gemm_q6_k_wmma_f16_bm512_bn128](
             y.unsafe_ptr(), w.unsafe_ptr(), x.unsafe_ptr(),
             n_cols, n_rows, n_tokens,
             grid_dim=((n_rows + BN - 1) // BN, (n_tokens + BM - 1) // BM),
@@ -110,15 +113,28 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, tile: Int) 
         for r in range(n_rows):
             var acc: Float32 = 0.0
             for c in range(n_cols):
-                acc += reference(wh.unsafe_ptr(), r, c, n_cols) * Float32(xh[t * n_cols + c])
+                acc += reference(wh.unsafe_ptr(), r, c, n_cols) * Float32(
+                    xh[t * n_cols + c]
+                )
             got = Float64(Float32(yh[t * n_rows + r]))
             diff = abs(got - Float64(acc))
             if diff > worst:
                 worst = diff
                 worst_ref = Float64(acc)
     var label = String("kafel ") + String(tile)
-    print(label, "rows=", n_rows, "cols=", n_cols, "T=", n_tokens,
-          "| najgorsza roznica", worst, "przy referencji", worst_ref)
+    print(
+        label,
+        "rows=",
+        n_rows,
+        "cols=",
+        n_cols,
+        "T=",
+        n_tokens,
+        "| najgorsza roznica",
+        worst,
+        "przy referencji",
+        worst_ref,
+    )
 
 
 def main() raises:

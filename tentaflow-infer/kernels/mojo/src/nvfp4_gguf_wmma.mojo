@@ -30,6 +30,8 @@ comptime TILE = 16
 comptime BLOCK_VALUES = 64  # wartości opisane jednym blokiem GGUF
 comptime BLOCK_BYTES = 36  # 4 bajty skal + 32 bajty kodów
 comptime SUBBLOCKS = 4  # podbloki po 16 kolumn, każdy z własną skalą
+# Rozsuniecie wierszy kafla wag w LDS, dobrane pomiarem — patrz `ROW` nizej.
+comptime LDS_PAD = 16
 
 
 @always_inline
@@ -49,7 +51,7 @@ def _weight_frag(
 
 
 def gemm_nvfp4_gguf_wmma_impl[
-    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, PAD: Int = 0
 ](
     y: UnsafePointer[Float16, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
@@ -99,7 +101,16 @@ def gemm_nvfp4_gguf_wmma_impl[
     # tokenow dekwantyzowala DOKLADNIE TE SAME kolumny — a pomiar z podmieniona
     # na stala waga pokazal, ze sama dekwantyzacja to polowa czasu kernela
     # (25 wobec 48 TFLOPS). Kafel BN x 64 wartosci to 8 KiB dla BN=64.
-    comptime WEIGHT_TILE = BN * BLOCK_VALUES
+    # `PAD` rozsuwa wiersze kafla wag w LDS. Bez niego szesnaście linii czyta
+    # fragment `b` z adresów odległych o `BLOCK_VALUES * 2 = 128 B`, czyli o
+    # wielokrotność 32 banków — wszystkie trafiają w ten sam bank. Zmierzone na
+    # R9700 (`bench-amd/bench_nvfp4_wmma_pad.mojo`, TFLOPS, T=1024):
+    #
+    #   rows=17408 cols=5120  : pad0 65 | pad8 65 | pad16 65 | pad24 66
+    #   rows=5120  cols=17408 : pad0 62 | pad8 64 | pad16 64 | pad24 64
+    #   rows=6144  cols=5120  : pad0 51 | pad8 67 | pad16 68 | pad24 66
+    comptime ROW = BLOCK_VALUES + PAD
+    comptime WEIGHT_TILE = BN * ROW
     ws = stack_allocation[
         WEIGHT_TILE, Float16, address_space = AddressSpace.SHARED
     ]()
@@ -120,7 +131,7 @@ def gemm_nvfp4_gguf_wmma_impl[
                 source_row * blocks_per_row * BLOCK_BYTES + block * BLOCK_BYTES,
                 subblock,
             )
-            (ws + local_row * BLOCK_VALUES + subblock * TILE).store(frag)
+            (ws + local_row * ROW + subblock * TILE).store(frag)
             slot += threads
         barrier()
 
@@ -133,7 +144,7 @@ def gemm_nvfp4_gguf_wmma_impl[
                 a[mt] = (x + x_base[mt] + column).load[width=16, alignment=2]()
             comptime for nt in range(NTILE):
                 local_n = (wave % WAVES_N) * NTILE * TILE + nt * TILE + lane % 16
-                b = (ws + local_n * BLOCK_VALUES + sub * TILE).load[width=16]()
+                b = (ws + local_n * ROW + sub * TILE).load[width=16, alignment=2]()
                 comptime for mt in range(MTILE):
                     acc[mt * NTILE + nt] = wmma_f16_16x16x16(
                         a[mt], b, acc[mt * NTILE + nt]
@@ -152,40 +163,14 @@ def gemm_nvfp4_gguf_wmma_impl[
                     )
 
 
-# Dwa kafle, oba wybrane pomiarem na 7900 XT (sweep w
-# `bench-amd/bench_gemm_nvfp4_wmma_tiles.mojo`, ksztalty projekcji 27B):
-#  - BM256/BN64 na osmiu falach: 52/50/45 TFLOPS, najlepszy w kazdym ksztalcie,
-#  - BM32/BN64 dla krotkich chunkow, gdzie duzy kafel nie ma czym wypelnic fal.
-# Wariant BN32 z rodziny `mma` NIE ma tu odpowiednika: powstal ze strojenia pod
-# NVIDIE i nic go na tej karcie nie uzasadnia.
+# Kafle dobrane pomiarem na R9700 (`bench-amd/bench_nvfp4_wmma_pad.mojo`,
+# TFLOPS, T=1024):
 #
-# BM=512 SPRAWDZONE I ODRZUCONE (2026-07-29). Rachunek mowil, ze powinno pomoc:
-# wagi rozpakowuja sie raz na blok, wiec calkowity koszt dekwantyzacji skaluje
-# sie jak 1/BM. Pomiar mowi inaczej:
-#   [4,2,8,2] BM512 na osmiu falach: 14/13/16 TFLOPS — MTILE=8 to szesnascie
-#     akumulatorow po 8 VGPR na fale, rejestry sie nie mieszcza,
-#   [8,2,4,2] BM512 na szesnastu falach: 48/47/48 TFLOPS — mieszcza sie, ale
-#     polowa blokow to za malo rownoleglosci i wychodzi PONIZEJ BM256.
-# Przy BM256 dekwantyzacja nie jest juz waskim gardlem, wiec jej dalsze
-# tanienie niczego nie kupuje.
-#
-# PODWOJNY BUFOR WAG W LDS SPRAWDZONY I ODRZUCONY (2026-07-29). Nastepny kafel
-# dekwantyzowal sie w trakcie liczenia na biezacym, jedna bariera na obrocie
-# zamiast dwoch. W izolacji wygrywal na wszystkich trzech ksztaltach 27B:
-# 52->55, 48->51, 50->53 TFLOPS. NA MODELU NIE DAL NIC — profil rocprof pokazal
-# 3488,6 wobec 3477,9 ms na te same 608 wywolan, a pelny prefill 836,3 wobec
-# 831,3 tok/s. Podwojenie kafla LDS zabiera zajetosc, co w realnym obciazeniu
-# kasuje zysk z nakladania. Wniosek ogolny: izolowany sweep kafli NIE przenosi
-# sie tu na model — kazda zmiane trzeba domierzyc na `bench`.
-#
-# BM=512 SPRAWDZONE I ODRZUCONE (2026-07-29). Rachunek mowil, ze powinno pomoc:
-# wagi rozpakowuja sie raz na blok, wiec calkowity koszt dekwantyzacji skaluje
-# sie jak 1/BM. Pomiar mowi inaczej:
-#   [4,2,8,2] BM512 na osmiu falach: 14/13/16 TFLOPS — MTILE=8 to szesnascie
-#     akumulatorow po 8 VGPR na fale, rejestry sie nie mieszcza,
-#   [8,2,4,2] BM512 na szesnastu falach: 48/47/48 TFLOPS — mieszcza sie, ale
-#     polowa blokow to za malo rownoleglosci i wychodzi PONIZEJ BM256.
-# Przy BM256 dekwantyzacja nie jest juz waskim gardlem, wiec jej dalsze
-# tanienie niczego nie kupuje. Nie powtarzac tej proby bez nowego argumentu.
-comptime gemm_nvfp4_gguf_wmma_f16_bm32 = gemm_nvfp4_gguf_wmma_impl[2, 2, 1, 2]
-comptime gemm_nvfp4_gguf_wmma_f16_bm256 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 2]
+#   ksztalt              BM256/BN64  BM256/BN128  BM512/BN128
+#   17408x5120                   65           77           85
+#   5120x17408                   63           73           74
+#   6144x5120                    64           82           99
+comptime gemm_nvfp4_gguf_wmma_f16_bm32 = gemm_nvfp4_gguf_wmma_impl[2, 2, 1, 2, LDS_PAD]
+comptime gemm_nvfp4_gguf_wmma_f16_bm256 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 2, LDS_PAD]
+comptime gemm_nvfp4_gguf_wmma_f16_bm256_bn128 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 4, LDS_PAD]
+comptime gemm_nvfp4_gguf_wmma_f16_bm512_bn128 = gemm_nvfp4_gguf_wmma_impl[8, 2, 4, 4, LDS_PAD]

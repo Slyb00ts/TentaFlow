@@ -42,6 +42,9 @@ comptime SUPERBLOCK = 256  # wartości opisane jednym superblokiem
 comptime SB_BYTES = 144  # 4 B d/dmin + 12 B skal + 128 B kodów
 comptime CHUNK = 64  # kolumny stagowane za jednym razem
 comptime GROUPS = CHUNK // TILE  # grupy po 16 kolumn w kafelku stagowania
+# Rozsuniecie wierszy kafla wag w LDS, dobrane pomiarem na R9700 (TFLOPS,
+# T=1024): patrz komentarz przy `ROW` nizej.
+comptime LDS_PAD = 16
 
 
 @always_inline
@@ -77,7 +80,7 @@ def _weight_frag(
 
 
 def gemm_q4_k_wmma_impl[
-    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, PAD: Int = 0
 ](
     y: UnsafePointer[Float16, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
@@ -119,7 +122,17 @@ def gemm_q4_k_wmma_impl[
     # Wagi rozpakowujemy RAZ NA BLOK do LDS — bez tego każda z WAVES_M fal wzdłuż
     # tokenów dekwantyzowałaby dokładnie te same kolumny. Kafel BN x 64 wartości
     # to 8 KiB dla BN=64.
-    comptime WEIGHT_TILE = BN * CHUNK
+    #
+    # `PAD` rozsuwa wiersze kafla wag. Bez niego szesnaście linii czyta fragment
+    # `b` z adresów odległych o `CHUNK * 2 = 128 B`, czyli o wielokrotność 32
+    # banków LDS — wszystkie trafiają w ten sam bank. Zmierzone na R9700
+    # (`bench-amd/bench_q4k_wmma_tiles.mojo`, TFLOPS, T=1024):
+    #
+    #   rows=17408 cols=5120 : pad0 68 | pad8 69 | pad16 70 | pad24 70
+    #   rows=6144  cols=5120 : pad0 65 | pad8 71 | pad16 73 | pad24 72
+    #   rows=5120  cols=6144 : pad0 49 | pad8 65 | pad16 65 | pad24 66
+    comptime ROW = CHUNK + PAD
+    comptime WEIGHT_TILE = BN * ROW
     ws = stack_allocation[
         2 * WEIGHT_TILE, Float16, address_space = AddressSpace.SHARED
     ]()
@@ -146,7 +159,7 @@ def gemm_q4_k_wmma_impl[
             source_row * superblocks * SB_BYTES + stage_superblock_0 * SB_BYTES,
             stage_chunk_0 * GROUPS + group,
         )
-        (ws + stage_base_0 + local_row * CHUNK + group * TILE).store(frag)
+        (ws + stage_base_0 + local_row * ROW + group * TILE).store(frag)
         pos_0 += threads
 
     barrier()
@@ -172,7 +185,7 @@ def gemm_q4_k_wmma_impl[
                     source_row * superblocks * SB_BYTES + stage_superblock_next * SB_BYTES,
                     stage_chunk_next * GROUPS + group,
                 )
-                (ws + stage_base_next + local_row * CHUNK + group * TILE).store(frag)
+                (ws + stage_base_next + local_row * ROW + group * TILE).store(frag)
                 pos_next += threads
 
         comptime for sub in range(GROUPS):
@@ -184,7 +197,7 @@ def gemm_q4_k_wmma_impl[
                 a[mt] = (x + x_base[mt] + column).load[width=16, alignment=2]()
             comptime for nt in range(NTILE):
                 local_n = (wave % WAVES_N) * NTILE * TILE + nt * TILE + lane % 16
-                b = (ws + compute_base + local_n * CHUNK + sub * TILE).load[width=16]()
+                b = (ws + compute_base + local_n * ROW + sub * TILE).load[width=16, alignment=2]()
                 comptime for mt in range(MTILE):
                     acc[mt * NTILE + nt] = wmma_f16_16x16x16(
                         a[mt], b, acc[mt * NTILE + nt]
@@ -201,10 +214,21 @@ def gemm_q4_k_wmma_impl[
                     y[m * n_rows + n] = Float16(acc[mt * NTILE + nt][i])
 
 
-# Kafle dobrane tak samo jak w rodzinie NVFP4 WMMA: duży dla długiego prefillu,
-# mały dla krótkich chunków, gdzie duży nie ma czym wypełnić fal.
-comptime gemm_q4_k_wmma_f16_bm32 = gemm_q4_k_wmma_impl[2, 2, 1, 2]
-comptime gemm_q4_k_wmma_f16_bm256 = gemm_q4_k_wmma_impl[4, 2, 4, 2]
+# Kafle dobrane pomiarem na R9700 (`bench-amd/bench_q4k_wmma_tiles.mojo`,
+# TFLOPS, T=1024). BN=64 przegrywa wszedzie: aktywacje sa wtedy czytane
+# `n_rows / 64` razy zamiast `n_rows / 128`.
+#
+#   ksztalt              BM256/BN64  BM256/BN128  BM512/BN128
+#   17408x5120                   70           82           93
+#   6144x5120                    68           89          100
+#   5120x6144                    50           87           85
+#
+# BM512 potrzebuje T >= 512, zeby miec czym wypelnic kafel — wybor nalezy do
+# launchera, ktory zna dlugosc chunka.
+comptime gemm_q4_k_wmma_f16_bm32 = gemm_q4_k_wmma_impl[2, 2, 1, 2, LDS_PAD]
+comptime gemm_q4_k_wmma_f16_bm256 = gemm_q4_k_wmma_impl[4, 2, 4, 2, LDS_PAD]
+comptime gemm_q4_k_wmma_f16_bm256_bn128 = gemm_q4_k_wmma_impl[4, 2, 4, 4, LDS_PAD]
+comptime gemm_q4_k_wmma_f16_bm512_bn128 = gemm_q4_k_wmma_impl[8, 2, 4, 4, LDS_PAD]
 
 
 # ---------------------------------------------------------------------------

@@ -275,7 +275,8 @@ fn build_q6k_ref(rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
     (raw, deq)
 }
 
-/// Q6_K przez launcher (na AMD trafia w kafel int8 `v_dot4_i32_i8`).
+/// Q6_K przez launcher (na kartach z jednostką macierzową trafia w kafel WMMA,
+/// bez niej w kafel int8 `v_dot4_i32_i8`).
 #[test]
 fn gemm_q6_k_matches_canonical_dequant_shapes() {
     let dev = device();
@@ -293,7 +294,14 @@ fn gemm_q6_k_matches_canonical_dequant_shapes() {
         let x: Vec<f32> = (0..n_tokens * cols)
             .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
             .collect();
-        let xq = quantize_act_q8_1_host(&x, cols);
+        // Kafel `dot4` kwantyzuje aktywacje do int8 przed mnożeniem, kafel WMMA
+        // mnoży je w f16 — referencja musi iść tą samą drogą co dispatch,
+        // inaczej mierzy kwantyzację aktywacji zamiast kernela.
+        let xq = if kernels.has_artifact("gemm_q6_k_wmma_f16_bm32") {
+            x.clone()
+        } else {
+            quantize_act_q8_1_host(&x, cols)
+        };
         let wb = dev.alloc(raw.len(), MemKind::Device, Pool::Weights).unwrap();
         dev.write(&raw, &wb, 0).unwrap();
         let xb = upload(dev.as_ref(), &x);
@@ -322,7 +330,13 @@ fn gemm_q6_k_matches_canonical_dequant_shapes() {
         eprintln!(
             "q6_k rows={rows} cols={cols} T={n_tokens}: worst rel {worst:.4} at {worst_at:?}"
         );
-        assert!(worst < 0.02, "rows={rows} cols={cols} T={n_tokens} rel={worst}");
+        // Próg batchowy jak w `golden.rs`. Referencja jest dokładną
+        // dekwantyzacją f32, a kafel prefillowy trzyma rozpakowaną wagę w f16.
+        // Tam, gdzie iloczyn skalarny KASUJE SIĘ prawie do zera — zmierzone
+        // `want` 1,8e-3 przy członach rzędu 1 — daje to kilka procent błędu
+        // WZGLĘDNEGO bez żadnej usterki kernela, więc ostrzejszy próg mierzyłby
+        // cancellation, a nie kernel.
+        assert!(worst < 0.05, "rows={rows} cols={cols} T={n_tokens} rel={worst}");
     }
 }
 

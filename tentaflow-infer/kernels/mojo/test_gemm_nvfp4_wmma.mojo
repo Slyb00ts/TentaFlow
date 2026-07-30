@@ -9,8 +9,7 @@ from std.random import random_si64, seed
 
 from src.nvfp4_gguf_wmma import (
     gemm_nvfp4_gguf_wmma_f16_bm32,
-    gemm_nvfp4_gguf_wmma_f16_bm128,
-    gemm_nvfp4_gguf_wmma_f16_bm128_bn32,
+    gemm_nvfp4_gguf_wmma_f16_bm256,
 )
 
 comptime BLOCK_VALUES = 64
@@ -73,11 +72,7 @@ def check(ctx: DeviceContext, n_tokens: Int, n_rows: Int, n_cols: Int, tile: Int
     var bm = 32
     var bn = 64
     if tile == 1:
-        bm = 128
-        bn = 64
-    elif tile == 2:
-        bm = 128
-        bn = 32
+        bm = 256
     grid_x = (n_rows + bn - 1) // bn
     grid_y = (n_tokens + bm - 1) // bm
     if tile == 0:
@@ -86,17 +81,11 @@ def check(ctx: DeviceContext, n_tokens: Int, n_rows: Int, n_cols: Int, tile: Int
             n_cols, n_rows, n_tokens, output_scale,
             grid_dim=(grid_x, grid_y), block_dim=128,
         )
-    elif tile == 1:
-        ctx.enqueue_function[gemm_nvfp4_gguf_wmma_f16_bm128](
-            yd.unsafe_ptr(), wd.unsafe_ptr(), xd.unsafe_ptr(),
-            n_cols, n_rows, n_tokens, output_scale,
-            grid_dim=(grid_x, grid_y), block_dim=128,
-        )
     else:
-        ctx.enqueue_function[gemm_nvfp4_gguf_wmma_f16_bm128_bn32](
+        ctx.enqueue_function[gemm_nvfp4_gguf_wmma_f16_bm256](
             yd.unsafe_ptr(), wd.unsafe_ptr(), xd.unsafe_ptr(),
             n_cols, n_rows, n_tokens, output_scale,
-            grid_dim=(grid_x, grid_y), block_dim=128,
+            grid_dim=(grid_x, grid_y), block_dim=256,
         )
     ctx.synchronize()
 
@@ -143,7 +132,7 @@ def check(ctx: DeviceContext, n_tokens: Int, n_rows: Int, n_cols: Int, tile: Int
 def main() raises:
     seed(20260727)
     var ctx = DeviceContext()
-    for tile in range(3):
+    for tile in range(2):
         check(ctx, 32, 64, 128, tile)
         check(ctx, 17, 70, 192, tile)
     print("GEMM NVFP4 WMMA: wszystkie kafle zgodne z referencja")

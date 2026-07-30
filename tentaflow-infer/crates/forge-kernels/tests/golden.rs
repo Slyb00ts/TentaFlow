@@ -481,10 +481,12 @@ fn gemm_q6_k_matches_formats_dequant() {
     }
     dev.synchronize().unwrap();
 
-    let xref = if kernels.int8_batch_activations() {
-        quantize_act_q8_1_host(&x, cols)
-    } else {
+    // Kafel `dot4` kwantyzuje aktywacje do int8 przed mnożeniem, kafel WMMA
+    // mnoży je w f16 — referencja musi iść tą samą drogą co dispatch.
+    let xref = if kernels.has_artifact("gemm_q6_k_wmma_f16_bm32") {
         x.clone()
+    } else {
+        quantize_act_q8_1_host(&x, cols)
     };
     let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
     for t in 0..n_tokens {
@@ -700,7 +702,9 @@ fn gemm_nvfp4_gguf_dispatch_matches_cpu() {
     let Some(dev) = device() else { return };
     let kernels = Kernels::load(dev.clone()).unwrap();
     if !kernels.artifacts().has("gemm_nvfp4_f16_bm64") {
-        eprintln!("pomijam nvfp4 gguf dispatch: brak kernela gemm_nvfp4_f16_bm64 dla tej architektury");
+        eprintln!(
+            "pomijam nvfp4 gguf dispatch: brak kernela gemm_nvfp4_f16_bm64 dla tej architektury"
+        );
         return;
     }
     let stream = dev.create_stream().unwrap();
@@ -2257,7 +2261,9 @@ fn pack_gguf_fp8_matches_cpu_pack() {
 
         let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
         dev.write(&wq, &wb, 0).unwrap();
-        let codes = dev.alloc(rows * cols, MemKind::Device, Pool::Weights).unwrap();
+        let codes = dev
+            .alloc(rows * cols, MemKind::Device, Pool::Weights)
+            .unwrap();
         let scales = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
         kernels
             .pack_gguf_fp8(&codes, &scales, &wb, 0, rows, cols, quant, &stream)
@@ -2286,7 +2292,10 @@ fn pack_gguf_fp8_matches_cpu_pack() {
             .zip(&want_codes)
             .filter(|(g, w)| g != w)
             .count();
-        assert_eq!(bad, 0, "{quant:?}: {bad} e4m3 codes differ from the CPU pack");
+        assert_eq!(
+            bad, 0,
+            "{quant:?}: {bad} e4m3 codes differ from the CPU pack"
+        );
     }
 }
 
@@ -2485,11 +2494,6 @@ fn gemm_case(quant: QuantKind, gemm: GemmFn) {
         }
         panic!("gemm: {e}");
     }
-    let xref = if kernels.int8_batch_activations() {
-        quantize_act_q8_1_host(&x, cols)
-    } else {
-        x.clone()
-    };
     dev.synchronize().unwrap();
 
     let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);

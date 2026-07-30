@@ -108,7 +108,9 @@ const CUDA_FATTN_ENTRIES: &[(&str, &str)] = &[
     ),
 ];
 
-const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_arch!["gfx1030", ".hsaco",
+const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_arch![
+    "gfx1030",
+    ".hsaco",
     "act_quant_fp4_f16",
     "act_quant_fp8_f16",
     "add_f32",
@@ -522,7 +524,9 @@ const EMBEDDED_GFX1030: &[EmbeddedArtifact] = embedded_arch!["gfx1030", ".hsaco"
     "topk_partial_f32",
 ];
 
-const EMBEDDED_GFX1100: &[EmbeddedArtifact] = embedded_arch!["gfx1100", ".hsaco",
+const EMBEDDED_GFX1100: &[EmbeddedArtifact] = embedded_arch![
+    "gfx1100",
+    ".hsaco",
     "act_quant_fp4_f16",
     "act_quant_fp8_f16",
     "add_f32",
@@ -961,7 +965,9 @@ const EMBEDDED_GFX1100: &[EmbeddedArtifact] = embedded_arch!["gfx1100", ".hsaco"
     "topk_partial_f32",
 ];
 
-const EMBEDDED_SM121A: &[EmbeddedArtifact] = embedded_arch!["sm_121a", ".ptx",
+const EMBEDDED_SM121A: &[EmbeddedArtifact] = embedded_arch![
+    "sm_121a",
+    ".ptx",
     "act_quant_fp4_f16",
     "act_quant_fp8_f16",
     "add_f32",
@@ -1627,7 +1633,9 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gemm_nvfp4_gguf_out_f32_b4",
     "gemm_nvfp4_gguf_out_f32_b8",
     "gemm_nvfp4_gguf_wmma_f16_bm256",
+    "gemm_nvfp4_gguf_wmma_f16_bm256_bn128",
     "gemm_nvfp4_gguf_wmma_f16_bm32",
+    "gemm_nvfp4_gguf_wmma_f16_bm512_bn128",
     "gemm_q2_k_tile_f16_bm32",
     "gemm_q2_k_wmma_f16_bm256",
     "gemm_q2_k_wmma_f16_bm32",
@@ -1652,7 +1660,9 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gemm_q4_k_i8wmma_f16_bm32",
     "gemm_q4_k_tile_f16_bm32",
     "gemm_q4_k_wmma_f16_bm256",
+    "gemm_q4_k_wmma_f16_bm256_bn128",
     "gemm_q4_k_wmma_f16_bm32",
+    "gemm_q4_k_wmma_f16_bm512_bn128",
     "gemm_q5_0_tile_f16_bm32",
     "gemm_q5_0_wmma_f16_bm256",
     "gemm_q5_0_wmma_f16_bm32",
@@ -1665,6 +1675,10 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gemm_q6_k_dot4_128x64",
     "gemm_q6_k_dot4_64x64",
     "gemm_q6_k_dot4_out_f32_64x64",
+    "gemm_q6_k_wmma_f16_bm256",
+    "gemm_q6_k_wmma_f16_bm256_bn128",
+    "gemm_q6_k_wmma_f16_bm32",
+    "gemm_q6_k_wmma_f16_bm512_bn128",
     "gemm_q8_0_dot4_128x128",
     "gemm_q8_0_dot4_128x64",
     "gemm_q8_0_dot4_64x64",
@@ -1940,7 +1954,9 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "topk_partial_f32",
 ];
 
-const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded_arch!["sm_89", ".ptx",
+const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded_arch![
+    "sm_89",
+    ".ptx",
     "rmsnorm_f16",
     "rmsnorm_residual_f16",
     "rmsnorm_fp8",
@@ -2513,7 +2529,11 @@ fn select_embedded_set(arch: &str, vendor: forge_types::Vendor) -> Option<&'stat
             Some((built, false)) => built <= device_capability,
             None => false,
         })
-        .max_by_key(|set| nvidia_capability(set.arch).map(|(built, _)| built).unwrap_or(0))
+        .max_by_key(|set| {
+            nvidia_capability(set.arch)
+                .map(|(built, _)| built)
+                .unwrap_or(0)
+        })
 }
 
 fn resolve_artifact_path(arch_dir: &Path, file: &str) -> Result<PathBuf> {
@@ -2575,8 +2595,7 @@ impl KernelArtifacts {
                  do EMBEDDED_SETS — albo wskaż gotowy katalog w FORGE_KERNEL_DIR"
             ))
         })?;
-        let (manifest_src, set, set_name) =
-            (selected.manifest, selected.artifacts, selected.name);
+        let (manifest_src, set, set_name) = (selected.manifest, selected.artifacts, selected.name);
         // Przenośny PTX Mojo ma `.target sm_80`, a sterownik JIT kompiluje go
         // dla bieżącej karty. Moduły z `.target sm_89` wymagają Ada lub nowszej
         // architektury, natomiast cubiny SASS są ładowane tylko na dokładnym sm_89.
@@ -2809,10 +2828,13 @@ mod tests {
                 set.artifacts.iter().map(|a| a.name).collect();
             let declared: std::collections::HashSet<&str> =
                 manifest.kernels.keys().map(String::as_str).collect();
-            assert_eq!(embedded, declared, "{} rozjechal sie z manifestem", set.name);
+            assert_eq!(
+                embedded, declared,
+                "{} rozjechal sie z manifestem",
+                set.name
+            );
         }
     }
-
 
     const PORTABLE_RAW_NVFP4: &[&str] = &[
         "gemv_nvfp4_gguf_f16",

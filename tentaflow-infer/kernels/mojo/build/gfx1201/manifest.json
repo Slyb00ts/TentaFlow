@@ -506,12 +506,20 @@
       "file": "gemm_nvfp4_gguf_out_f32_b8.hsaco"
     },
     "gemm_nvfp4_gguf_wmma_f16_bm256": {
-      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_b66c9b7bd78a67cf",
+      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_e718b1181bcef524",
       "file": "gemm_nvfp4_gguf_wmma_f16_bm256.hsaco"
     },
+    "gemm_nvfp4_gguf_wmma_f16_bm256_bn128": {
+      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_2b35a023f3d05844",
+      "file": "gemm_nvfp4_gguf_wmma_f16_bm256_bn128.hsaco"
+    },
     "gemm_nvfp4_gguf_wmma_f16_bm32": {
-      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_a98cd718ba6ba9b7",
+      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_f0f9218f2a5582d6",
       "file": "gemm_nvfp4_gguf_wmma_f16_bm32.hsaco"
+    },
+    "gemm_nvfp4_gguf_wmma_f16_bm512_bn128": {
+      "entry": "src_nvfp4_gguf_wmma_gemm_nvfp46A6A6A6A_a1eca5129f7eab26",
+      "file": "gemm_nvfp4_gguf_wmma_f16_bm512_bn128.hsaco"
     },
     "gemm_q2_k_tile_f16_bm32": {
       "entry": "src_gemm_q2_k_wmma_gemm_q2_k_t6A6A6A6A_0092bb2bc02e8c9c",
@@ -606,12 +614,20 @@
       "file": "gemm_q4_k_tile_f16_bm32.hsaco"
     },
     "gemm_q4_k_wmma_f16_bm256": {
-      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_6ffb3bf18966c422",
+      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_5011ec1f3d9ff518",
       "file": "gemm_q4_k_wmma_f16_bm256.hsaco"
     },
+    "gemm_q4_k_wmma_f16_bm256_bn128": {
+      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_b28baad67e468d36",
+      "file": "gemm_q4_k_wmma_f16_bm256_bn128.hsaco"
+    },
     "gemm_q4_k_wmma_f16_bm32": {
-      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_eb34b3ede551428b",
+      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_5450e319edc0dc88",
       "file": "gemm_q4_k_wmma_f16_bm32.hsaco"
+    },
+    "gemm_q4_k_wmma_f16_bm512_bn128": {
+      "entry": "src_gemm_q4_k_wmma_gemm_q4_k_w6A6A6A6A_6a4ab7cda04adf6a",
+      "file": "gemm_q4_k_wmma_f16_bm512_bn128.hsaco"
     },
     "gemm_q5_0_tile_f16_bm32": {
       "entry": "src_gemm_legacy32_wmma_gemm_le6A6A6A6A_4bd3423a869b7220",
@@ -660,6 +676,22 @@
     "gemm_q6_k_dot4_out_f32_64x64": {
       "entry": "src_gemm_dot_gemm_q6_k_dot4_im6A6A6A6A_f57c01f037882756",
       "file": "gemm_q6_k_dot4_out_f32_64x64.hsaco"
+    },
+    "gemm_q6_k_wmma_f16_bm256": {
+      "entry": "src_gemm_q6_k_wmma_gemm_q6_k_w6A6A6A6A_4d0516423ae9a993",
+      "file": "gemm_q6_k_wmma_f16_bm256.hsaco"
+    },
+    "gemm_q6_k_wmma_f16_bm256_bn128": {
+      "entry": "src_gemm_q6_k_wmma_gemm_q6_k_w6A6A6A6A_b6e325f60a624202",
+      "file": "gemm_q6_k_wmma_f16_bm256_bn128.hsaco"
+    },
+    "gemm_q6_k_wmma_f16_bm32": {
+      "entry": "src_gemm_q6_k_wmma_gemm_q6_k_w6A6A6A6A_5d02d28c3fd228ec",
+      "file": "gemm_q6_k_wmma_f16_bm32.hsaco"
+    },
+    "gemm_q6_k_wmma_f16_bm512_bn128": {
+      "entry": "src_gemm_q6_k_wmma_gemm_q6_k_w6A6A6A6A_65d8a8f88aa07f60",
+      "file": "gemm_q6_k_wmma_f16_bm512_bn128.hsaco"
     },
     "gemm_q8_0_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_2373e5e906402c3b",

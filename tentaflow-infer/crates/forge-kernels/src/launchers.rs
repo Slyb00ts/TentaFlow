@@ -1049,6 +1049,7 @@ fn nvfp4_gguf_dispatch(
     bn128_available: bool,
     is_nvidia: bool,
     wmma_available: bool,
+    wmma_bn128_available: bool,
     int8_batch_available: bool,
     warp_size: u32,
     max_threads: u32,
@@ -1136,6 +1137,13 @@ fn nvfp4_gguf_dispatch(
         // wobec 826,2 dla BM256. Duże BM amortyzuje dekwantyzację — każdy
         // rozpakowany element wagi jest reużyty przez BM wierszy tokenów.
         17..=32 if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm32", 32, 64, Some(128)),
+        // BN=128 czyta aktywacje `rows / 128` razy zamiast `rows / 64`; na
+        // każdym zmierzonym kształcie 27B wygrywa (liczby w nagłówku kernela).
+        // BM=512 potrzebuje T >= 512, żeby mieć czym wypełnić kafel.
+        _ if wmma_bn128_available && n_tokens >= 512 => {
+            ("gemm_nvfp4_gguf_wmma_f16_bm512_bn128", 512, 128, Some(512))
+        }
+        _ if wmma_bn128_available => ("gemm_nvfp4_gguf_wmma_f16_bm256_bn128", 256, 128, Some(256)),
         _ if wmma_available => ("gemm_nvfp4_gguf_wmma_f16_bm256", 256, 64, Some(256)),
         _ => {
             return Err(ForgeError::Kernel(format!(
@@ -1172,6 +1180,7 @@ fn nvfp4_gguf_layout_dispatch(
     tile_bn128_available: bool,
     is_nvidia: bool,
     wmma_available: bool,
+    wmma_bn128_available: bool,
     int8_batch_available: bool,
     warp_size: u32,
     max_threads: u32,
@@ -1186,6 +1195,7 @@ fn nvfp4_gguf_layout_dispatch(
             bn128_available,
             is_nvidia,
             wmma_available,
+            wmma_bn128_available,
             int8_batch_available,
             warp_size,
             max_threads,
@@ -5265,6 +5275,8 @@ impl Kernels {
             matches!(caps.vendor, forge_types::Vendor::Nvidia),
             self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm256")
                 && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm32"),
+            self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm256_bn128")
+                && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm512_bn128"),
             raw_nvfp4_dp4a_supported(caps.warp_size)
                 && self.artifacts.has("gemv_nvfp4_gguf_q8_1_b4_f16"),
             caps.warp_size,
@@ -8926,11 +8938,25 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<bool> {
-        const BN: usize = 64;
-        let (suffix, bm, block) = if n_tokens <= 32 {
-            ("_bm32", 32usize, 128u32)
+        // NAZWA KAFLA NIESIE JEGO GEOMETRIĘ. Obraz HSACO jest związany z
+        // architekturą, więc zestawy już zbudowane (gfx1100) mają pod `_bm256`
+        // kafel BN=64. Gdyby nowa geometria weszła pod starą nazwą, launcher
+        // liczyłby siatkę z BN=128 dla kernela kafelkującego po 64 i po cichu
+        // pomijałby połowę wierszy.
+        //
+        // BN=128 wygrywa na KAŻDYM zmierzonym kształcie prefillu 27B, bo
+        // aktywacje są czytane `rows / 128` razy zamiast `rows / 64`; liczby są
+        // w nagłówkach kerneli. BM=512 potrzebuje T >= 512, żeby mieć czym
+        // wypełnić kafel.
+        let has = |s: &str| self.artifacts.has(&format!("{family}{s}"));
+        let (suffix, bm, bn, block) = if n_tokens <= 32 {
+            ("_bm32", 32usize, 64usize, 128u32)
+        } else if n_tokens >= 512 && has("_bm512_bn128") {
+            ("_bm512_bn128", 512usize, 128usize, 512u32)
+        } else if has("_bm256_bn128") {
+            ("_bm256_bn128", 256usize, 128usize, 256u32)
         } else {
-            ("_bm256", 256usize, 256u32)
+            ("_bm256", 256usize, 64usize, 256u32)
         };
         let name = format!("{family}{suffix}");
         if !self.artifacts.has(&name) {
@@ -8938,11 +8964,7 @@ impl Kernels {
         }
         let kernel = self.artifacts.get(&name)?;
         let config = LaunchConfig {
-            grid: (
-                rows.div_ceil(BN) as u32,
-                n_tokens.div_ceil(bm) as u32,
-                1,
-            ),
+            grid: (rows.div_ceil(bn) as u32, n_tokens.div_ceil(bm) as u32, 1),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -9542,14 +9564,6 @@ impl Kernels {
     /// Kafel dobrany pomiarem na gfx1030 (4096x4096, T=1024): 128x128 daje
     /// 35 TOPS, 128x64 32, a 64x64 29 i jest potrzebny tylko dla wąskich
     /// kształtów, gdzie większy kafel liczy głównie odrzucane wiersze.
-    /// Czy batchowe GEMM-y kwantyzuja aktywacje do int8 przed mnozeniem.
-    /// Karty bez jednostki macierzowej licza kaflem `v_dot4_i32_i8`, wiec
-    /// wynik zawiera blad kwantyzacji aktywacji — referencje testow musza go
-    /// odtwarzac, inaczej mierza kwantyzacje, nie kernel.
-    pub fn int8_batch_activations(&self) -> bool {
-        self.device.caps().vendor != forge_types::Vendor::Nvidia
-    }
-
     fn gemm_dot4_tile(
         &self,
         kernel_base: &str,
@@ -10755,6 +10769,24 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q6_k requires cols % 256 == 0, got {cols}"
             )));
+        }
+        // Kafel WMMA czytający surowe superbloki Q6_K. Q6_K był jedynym
+        // K-kwantem bez wariantu macierzowego i schodził na `dot4`: profil
+        // prefillu 27B Q4_K_M na R9700 pokazał 25,4% czasu w `ffn_down`,
+        // 4,66 ms wobec 1,43 ms typowej projekcji Q4_K o tej samej liczbie
+        // mnożeń.
+        if self.gemm_kblock_wmma(
+            "gemm_q6_k_wmma_f16",
+            y,
+            w_q6k,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
+        )? {
+            return Ok(());
         }
         // Rodzina `gemm_q6_k_f16` dekwantyzuje wagi do f16 i mnoży na mma.
         // Karta bez jednostki macierzowej idzie zamiast tego kaflem int8, co
@@ -17996,6 +18028,7 @@ mod nvfp4_gguf_dispatch_tests {
             is_nvidia,
             false,
             false,
+            false,
             warp_size,
             max_threads,
         )
@@ -19258,17 +19291,17 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn wybiera_bn128_i_sync1_z_regresyjnym_wyjatkiem() {
         let large =
-            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, false, false, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, false, false, false, 32, 1024).unwrap();
         assert_eq!(large.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn128");
         assert_eq!((large.row_tile, large.block_threads), (128, 256));
 
         let m128 =
-            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, false, false, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, false, false, false, 32, 1024).unwrap();
         assert_eq!(m128.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1");
         assert_eq!((m128.row_tile, m128.block_threads), (64, 256));
 
         let regression =
-            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, false, false, 32, 1024).unwrap();
+            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, false, false, false, 32, 1024).unwrap();
         assert_eq!(regression.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_prefetch");
     }
 
@@ -19287,9 +19320,9 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             false,
             false,
+            false,
             32,
-            1024,
-        )
+            1024)
         .unwrap();
         assert_eq!(
             (
@@ -19314,9 +19347,9 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             false,
             false,
+            false,
             32,
-            1024,
-        )
+            1024)
         .unwrap();
         assert_eq!(
             (bn128.kernel, bn128.row_tile),
@@ -19336,9 +19369,9 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             false,
             false,
+            false,
             32,
-            1024,
-        )
+            1024)
         .unwrap();
         assert_eq!(
             (fallback.kernel, fallback.row_tile),
@@ -19358,10 +19391,10 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 false,
+            false,
                 false,
                 32,
-                1024,
-            ),
+                1024),
             nvfp4_gguf_layout_dispatch(
                 Nvfp4GgufLayout::TileN128K64,
                 128,
@@ -19374,10 +19407,10 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 false,
+            false,
                 false,
                 32,
-                1024,
-            ),
+                1024),
             nvfp4_gguf_layout_dispatch(
                 Nvfp4GgufLayout::TileN128K64,
                 128,
@@ -19390,10 +19423,10 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 false,
                 false,
+            false,
                 false,
                 32,
-                1024,
-            ),
+                1024),
         ] {
             assert!(result.is_err());
         }
