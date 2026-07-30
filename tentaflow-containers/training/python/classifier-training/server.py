@@ -582,13 +582,20 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
         optimizer = torch.optim.AdamW(params, lr=hp.learning_rate, weight_decay=1e-4)
 
         pin = device.type == "cuda"
+        # Wycinki leżą na dysku jako JPEG, więc każdy batch wymaga dekodowania na
+        # CPU. Przy sztywnych 4 workerach większy `batch_size` NIE przyspieszał —
+        # wąskim gardłem stawał się dekoder, a karta czekała. Skalujemy do liczby
+        # rdzeni (z zapasem jednego na resztę procesu), a `persistent_workers`
+        # oszczędza respawn puli na każdej epoce (przy 60+ epokach to realny czas).
+        workers = min(8, max(0, (os.cpu_count() or 2) - 1))
         train_loader = DataLoader(
-            train_ds, batch_size=hp.batch_size, shuffle=True, num_workers=4,
+            train_ds, batch_size=hp.batch_size, shuffle=True, num_workers=workers,
             pin_memory=pin, drop_last=False,
+            persistent_workers=workers > 0, prefetch_factor=4 if workers > 0 else None,
         )
         val_loader = DataLoader(
-            valid_ds, batch_size=hp.batch_size, shuffle=False, num_workers=4,
-            pin_memory=pin,
+            valid_ds, batch_size=hp.batch_size, shuffle=False, num_workers=workers,
+            pin_memory=pin, persistent_workers=workers > 0,
         )
         remap = remap.to(device)
 
