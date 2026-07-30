@@ -1505,7 +1505,9 @@ const EMBEDDED_SM121A: &[EmbeddedArtifact] = embedded_arch![
     "topk_partial_f32",
 ];
 
-const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco",
+const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch![
+    "gfx1201",
+    ".hsaco",
     "act_quant_fp4_f16",
     "act_quant_fp8_f16",
     "add_f32",
@@ -1605,6 +1607,8 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gather_nvfp4_gguf_row_f16",
     "gather_nvfp4_gguf_rows_f16",
     "gather_nvfp4_gguf_rows_f16_nvidia",
+    "gather_q4_k_row_f16",
+    "gather_q4_k_rows_f16",
     "gather_q8_0_row_f16",
     "gather_q8_0_rows_f16",
     "gather_rows_f16",
@@ -1829,6 +1833,9 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gemv_q6_k_dp4a_batch_b2",
     "gemv_q6_k_dp4a_batch_b4",
     "gemv_q6_k_dp4a_batch_b8",
+    "gemv_q6_k_dp4a_batch_out_f32_b2",
+    "gemv_q6_k_dp4a_batch_out_f32_b4",
+    "gemv_q6_k_dp4a_batch_out_f32_b8",
     "gemv_q6_k_dp4a_out_f32",
     "gemv_q6_k_f16_gidx",
     "gemv_q6_k_f16_v2",

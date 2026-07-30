@@ -806,6 +806,29 @@ impl MtpTensorLoader for SourceMtpLoader<'_> {
         upload_weight_with_nvfp4_ct(self.device, weight, self.nvfp4_ct)
     }
 
+    fn matrix_q8(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight> {
+        let weight = fetch_matrix(self.source, name)?;
+        if weight.rows() != rows || weight.cols() != cols {
+            return Err(ForgeError::Format(format!(
+                "MTP {name}: kształt [{}, {}], wymagano [{rows}, {cols}]",
+                weight.rows(),
+                weight.cols()
+            )));
+        }
+        if matches!(weight, HostWeight::Q8_0 { .. }) {
+            return upload_weight_with_nvfp4_ct(self.device, weight, self.nvfp4_ct);
+        }
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Format(format!(
+                "MTP {name}: przekwantowanie do Q8_0 wymaga cols % 32 == 0, jest {cols}"
+            )));
+        }
+        let (data, dtype, quant, _) = self.source.fetch(name)?;
+        let values = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+        let buf = upload(self.device, &pack_q8_0(&values))?;
+        Ok(DevWeight::Q8_0 { buf, rows, cols })
+    }
+
     fn vector(&mut self, name: &str, len: usize) -> Result<DevBuffer> {
         let (data, dtype, quant, dims) = self.source.fetch(name)?;
         let elements = dims.iter().product::<usize>();
@@ -817,6 +840,22 @@ impl MtpTensorLoader for SourceMtpLoader<'_> {
         let values = dequantize_to_f32(dtype, quant, &data, elements)?;
         upload(self.device, &f32s_to_f16_bytes(&values))
     }
+}
+
+/// Pakuje wartości f32 do bloków GGML Q8_0 (32 wartości, 34 B: skala f16 plus
+/// 32 kody int8, `d = amax / 127`).
+fn pack_q8_0(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() / 32 * 34);
+    for block in values.chunks_exact(32) {
+        let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for v in block {
+            out.push(((v * inv).round().clamp(-127.0, 127.0) as i8) as u8);
+        }
+    }
+    out
 }
 
 struct Fp8Host {
@@ -1791,7 +1830,9 @@ enum HostWeight {
 impl HostWeight {
     fn mtp_device_bytes(&self) -> Option<usize> {
         match self {
-            HostWeight::Q8_0 { data, .. } | HostWeight::NvFp4Gguf { data, .. } => Some(data.len()),
+            HostWeight::Q8_0 { data, .. }
+            | HostWeight::Q4K { data, .. }
+            | HostWeight::NvFp4Gguf { data, .. } => Some(data.len()),
             _ => None,
         }
     }
@@ -4081,7 +4122,9 @@ impl ModelWeights {
                 ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into())
             })?;
             let embedding_bytes = host_embedding.mtp_device_bytes().ok_or_else(|| {
-                ForgeError::Unsupported("MTP hybrid obsługuje embedding Q8_0 lub GGUF NVFP4".into())
+                ForgeError::Unsupported(
+                    "MTP hybrid obsługuje embedding Q8_0, Q4_K lub GGUF NVFP4".into(),
+                )
             })?;
             let mut loader = SourceMtpLoader {
                 device,

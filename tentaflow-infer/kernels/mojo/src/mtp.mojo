@@ -10,6 +10,7 @@ from std.gpu.sync import barrier
 from std.math import rsqrt
 from std.memory import bitcast, stack_allocation
 from src.nvfp4 import _e2m1, _ue4m3_portable
+from src.gemv2 import _q4k_scale_min
 
 comptime MTP_MAX_HIDDEN = 5120
 comptime ROWS_PER_BLOCK = 8
@@ -56,6 +57,43 @@ def gather_q8_0_row_f16(
         scale = Float32((weights + offset).bitcast[Float16]()[0])
         code = (weights + offset + 2).bitcast[Int8]()[element % 32]
         output[element] = Float16(scale * Float32(code))
+
+
+def gather_q4_k_row_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    token: UnsafePointer[Int32, MutAnyOrigin],
+    status: UnsafePointer[Int32, MutAnyOrigin],
+    vocab_size: Int,
+    hidden_size: Int,
+):
+    """Dekwantyzuje jeden wiersz tied embeddingu Q4_K wskazany na GPU."""
+    row = Int(token[0])
+    var element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row < 0 or row >= vocab_size:
+        if element < hidden_size:
+            output[element] = 0.0
+        if element == 0:
+            status[0] = 1
+    elif element < hidden_size:
+        superblock = element // 256
+        r = element % 256
+        offset = (row * (hidden_size // 256) + superblock) * 144
+        header = (weights + offset).load[width=16, alignment=1]()
+        d = Float32(
+            (weights + offset).bitcast[Float16]().load[width=1, alignment=1]()[0]
+        )
+        dmin = Float32(
+            (weights + offset + 2).bitcast[Float16]().load[width=1, alignment=1]()[0]
+        )
+        sc, mn = _q4k_scale_min(header, r // 32)
+        byte = (weights + offset + 16 + (r // 64) * 32 + (r % 32))[0]
+        var nib: UInt8
+        if (r % 64) < 32:
+            nib = byte & 0x0F
+        else:
+            nib = byte >> 4
+        output[element] = Float16(Float32(Int(nib)) * (d * sc) - dmin * mn)
 
 
 def gather_f16_row_f16(
@@ -150,6 +188,50 @@ def gather_q8_0_rows_f16(
             scale = Float32((weights + offset).bitcast[Float16]()[0])
             code = (weights + offset + 2).bitcast[Int8]()[element % 32]
             output[out_index] = Float16(scale * Float32(code))
+
+
+def gather_q4_k_rows_f16(
+    output: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    rows: Int,
+    vocab_size: Int,
+    hidden_size: Int,
+):
+    """Dekwantyzuje batch wierszy tied embeddingu Q4_K wskazanych na GPU.
+
+    Superblok 144 B / 256 wartosci: d f16, dmin f16, 12 B spakowanych par
+    skala/minimum na osiem podblokow po 32, potem 128 B polbajtow. Wartosc to
+    `q4 * (d * sc) - dmin * mn`, ta sama formula co `gemm_q4_k_wmma`.
+    """
+    row_index = Int(block_idx.y)
+    element = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row_index < rows and element < hidden_size:
+        row = Int(ids[row_index])
+        out_index = row_index * hidden_size + element
+        if row < 0 or row >= vocab_size:
+            output[out_index] = 0.0
+        else:
+            superblock = element // 256
+            r = element % 256
+            offset = (row * (hidden_size // 256) + superblock) * 144
+            header = (weights + offset).load[width=16, alignment=1]()
+            d = Float32(
+                (weights + offset).bitcast[Float16]().load[width=1, alignment=1]()[0]
+            )
+            dmin = Float32(
+                (weights + offset + 2)
+                .bitcast[Float16]()
+                .load[width=1, alignment=1]()[0]
+            )
+            sc, mn = _q4k_scale_min(header, r // 32)
+            byte = (weights + offset + 16 + (r // 64) * 32 + (r % 32))[0]
+            var nib: UInt8
+            if (r % 64) < 32:
+                nib = byte & 0x0F
+            else:
+                nib = byte >> 4
+            output[out_index] = Float16(Float32(Int(nib)) * (d * sc) - dmin * mn)
 
 
 def gather_nvfp4_gguf_rows_f16(

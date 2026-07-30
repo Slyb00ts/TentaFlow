@@ -112,9 +112,11 @@ from src.mtp import (
     mtp_project_joined_q8_f16,
     gather_f16_row_f16,
     gather_q8_0_row_f16,
+    gather_q4_k_row_f16,
     gather_nvfp4_gguf_row_f16,
     mtp_pack_verify_inputs,
     gather_q8_0_rows_f16,
+    gather_q4_k_rows_f16,
     gather_nvfp4_gguf_rows_f16,
     gather_nvfp4_gguf_rows_f16_nvidia,
     mtp_verify_decide,
@@ -644,6 +646,9 @@ from src.decode_dp4a_batch import (
     gemv_q6_k_dp4a_batch_b4,
     gemv_q6_k_dp4a_batch_b8,
     gemv_q6_k_dp4a_batch_b16,
+    gemv_q6_k_dp4a_batch_out_f32_b2,
+    gemv_q6_k_dp4a_batch_out_f32_b4,
+    gemv_q6_k_dp4a_batch_out_f32_b8,
 )
 from src.pack_gguf_fp8 import (
     pack_q4_k_fp8,
@@ -703,9 +708,11 @@ def _is_portable_raw_nvfp4(name: StringSlice) -> Bool:
         or name == "mtp_project_joined_q8_f16"
         or name == "gather_f16_row_f16"
         or name == "gather_q8_0_row_f16"
+        or name == "gather_q4_k_row_f16"
         or name == "gather_nvfp4_gguf_row_f16"
         or name == "mtp_pack_verify_inputs"
         or name == "gather_q8_0_rows_f16"
+        or name == "gather_q4_k_rows_f16"
         or name == "gather_nvfp4_gguf_rows_f16"
         or name == "gather_nvfp4_gguf_rows_f16_nvidia"
         or name == "gemm_nvfp4_gguf_f16_b2"
@@ -1278,6 +1285,10 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gather_q8_0_row_f16"))
     _ = ctx.compile_function[
+        gather_q4_k_row_f16, dump_asm=Path("gather_q4_k_row_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gather_q4_k_row_f16"))
+    _ = ctx.compile_function[
         gather_nvfp4_gguf_row_f16,
         dump_asm=Path("gather_nvfp4_gguf_row_f16.ptx"),
     ]()
@@ -1290,6 +1301,10 @@ def main() raises:
         gather_q8_0_rows_f16, dump_asm=Path("gather_q8_0_rows_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "gather_q8_0_rows_f16"))
+    _ = ctx.compile_function[
+        gather_q4_k_rows_f16, dump_asm=Path("gather_q4_k_rows_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gather_q4_k_rows_f16"))
     _ = ctx.compile_function[
         gather_nvfp4_gguf_rows_f16,
         dump_asm=Path("gather_nvfp4_gguf_rows_f16.ptx"),
@@ -1675,6 +1690,21 @@ def main() raises:
         dump_asm=Path("gemv_q6_k_dp4a_batch_b16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_b16"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_batch_out_f32_b2,
+        dump_asm=Path("gemv_q6_k_dp4a_batch_out_f32_b2.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_out_f32_b2"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_batch_out_f32_b4,
+        dump_asm=Path("gemv_q6_k_dp4a_batch_out_f32_b4.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_out_f32_b4"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_batch_out_f32_b8,
+        dump_asm=Path("gemv_q6_k_dp4a_batch_out_f32_b8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_batch_out_f32_b8"))
     _ = ctx.compile_function[
         pack_q4_k_fp8,
         dump_asm=Path("pack_q4_k_fp8.ptx"),

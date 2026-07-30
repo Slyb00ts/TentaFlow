@@ -1139,6 +1139,94 @@ fn q8_0_dot(weights: &[u8], row: usize, cols: usize, x: &[f32]) -> f32 {
 }
 
 #[test]
+fn mtp_gather_q4_k_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (vocab_size, hidden_size) = (7usize, 512usize);
+    let weights = build_q4k(vocab_size, hidden_size);
+    let reference = forge_formats::dequant::dequantize_to_f32(
+        DType::F32,
+        QuantKind::Q4K,
+        &weights,
+        vocab_size * hidden_size,
+    )
+    .unwrap();
+    let weights_buffer = dev
+        .alloc(weights.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(&weights, &weights_buffer, 0).unwrap();
+
+    // Batch: ID poza zakresem MUSI dać wyzerowany wiersz, nie odczyt spoza bufora.
+    let ids: Vec<i32> = vec![3, 0, 6, -1];
+    let ids_buffer = dev
+        .alloc(ids.len() * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    dev.write(bytemuck::cast_slice(&ids), &ids_buffer, 0)
+        .unwrap();
+    let output = upload_f16(dev.as_ref(), &vec![0.0; ids.len() * hidden_size]);
+    if let Err(e) = kernels.gather_q4_k_rows_f16(
+        &output,
+        &weights_buffer,
+        &ids_buffer,
+        ids.len(),
+        vocab_size,
+        hidden_size,
+        &stream,
+    ) {
+        if skip_if_absent(&e, "gather_q4_k_rows_f16") {
+            return;
+        }
+        panic!("gather_q4_k_rows_f16: {e}");
+    }
+    dev.synchronize().unwrap();
+    let got = download_f16(dev.as_ref(), &output, ids.len() * hidden_size);
+    for (slot, &id) in ids.iter().enumerate() {
+        for element in 0..hidden_size {
+            let want = if id < 0 {
+                0.0
+            } else {
+                reference[id as usize * hidden_size + element]
+            };
+            let value = got[slot * hidden_size + element];
+            assert!(
+                (value - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "slot {slot} id {id} element {element}: got {value} want {want}"
+            );
+        }
+    }
+
+    // Pojedynczy wiersz: ta sama matematyka, inny kernel.
+    let token_buffer = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&5i32.to_le_bytes(), &token_buffer, 0).unwrap();
+    let status = dev.alloc(4, MemKind::Device, Pool::Activations).unwrap();
+    dev.write(&0i32.to_le_bytes(), &status, 0).unwrap();
+    let row = upload_f16(dev.as_ref(), &vec![0.0; hidden_size]);
+    kernels
+        .gather_q4_k_row_f16(
+            &row,
+            &weights_buffer,
+            &token_buffer,
+            &status,
+            0,
+            vocab_size,
+            hidden_size,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+    let got_row = download_f16(dev.as_ref(), &row, hidden_size);
+    for element in 0..hidden_size {
+        let want = reference[5 * hidden_size + element];
+        assert!(
+            (got_row[element] - want).abs() <= 1e-3 * (1.0 + want.abs()),
+            "element {element}: got {} want {want}",
+            got_row[element]
+        );
+    }
+}
+
+#[test]
 fn mtp_gather_q8_0_row_matches_cpu() {
     let Some(dev) = device() else { return };
     let kernels = Kernels::load(dev.clone()).unwrap();
@@ -2168,6 +2256,64 @@ fn gemv_q4_k_dp4a_matches_formats_dequant() {
 // Weight-stationary small-batch dp4a GEMV (T=2/4/8/16): every token's row
 // dot must match the CPU dequant reference within the q8_1 activation
 // tolerance, for both Q4_K (min term) and Q6_K.
+/// Wariant f32 batchowej głowy Q6_K liczy DOKŁADNIE tę samą matematykę co
+/// wariant f16 — różni się wyłącznie typem zapisu. Referencją jest więc wariant
+/// f16, a nie osobny rachunek: każda różnica poza zaokrągleniem f16 to usterka.
+#[test]
+fn gemv_q6_k_batch_out_f32_matches_f16_variant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (rows, cols) = (33usize, 512usize);
+    let wq = build_q6k(rows, cols);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    for n_tokens in [2usize, 4, 8] {
+        let x: Vec<f32> = (0..n_tokens * cols)
+            .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+            .collect();
+        let xb = upload_f16(dev.as_ref(), &x);
+        let y16 = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+        let y32 = dev
+            .alloc(n_tokens * rows * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        dev.write(&vec![0u8; n_tokens * rows * 4], &y32, 0).unwrap();
+
+        if !kernels
+            .gemm_qk_dp4a_batch_at(&y16, &wb, 0, &xb, rows, cols, n_tokens, true, &stream)
+            .unwrap()
+        {
+            eprintln!("pomijam T={n_tokens}: brak kernela f16");
+            continue;
+        }
+        if !kernels
+            .gemv_q6_k_dp4a_batch_out_f32_at(&y32, &wb, 0, &xb, rows, cols, n_tokens, &stream)
+            .unwrap()
+        {
+            eprintln!("pomijam T={n_tokens}: brak kernela f32");
+            continue;
+        }
+        dev.synchronize().unwrap();
+
+        let got16 = download_f16(dev.as_ref(), &y16, n_tokens * rows);
+        let mut bytes = vec![0u8; n_tokens * rows * 4];
+        dev.read(&y32, 0, &mut bytes).unwrap();
+        let got32: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for (i, (&a, &b)) in got16.iter().zip(got32.iter()).enumerate() {
+            let rounded = f16::from_f32(b).to_f32();
+            assert!(
+                (a - rounded).abs() <= f32::EPSILON * (1.0 + a.abs()),
+                "T={n_tokens} element {i}: f16 {a} wobec zaokrąglonego f32 {rounded}"
+            );
+        }
+    }
+}
+
 #[test]
 fn gemm_qk_dp4a_batch_matches_formats_dequant() {
     let Some(dev) = device() else { return };

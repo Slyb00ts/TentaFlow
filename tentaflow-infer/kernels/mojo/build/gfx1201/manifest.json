@@ -397,6 +397,14 @@
       "entry": "src_mtp_gather_nvfp4_gguf_rows6A6A6A6A_ffc2e9a365666f78",
       "file": "gather_nvfp4_gguf_rows_f16_nvidia.hsaco"
     },
+    "gather_q4_k_row_f16": {
+      "entry": "src_mtp_gather_q4_k_row_f166A6A6A6AoA6A6A_243736ceb0a4cf6c",
+      "file": "gather_q4_k_row_f16.hsaco"
+    },
+    "gather_q4_k_rows_f16": {
+      "entry": "src_mtp_gather_q4_k_rows_f166A6A6A6AoA6A_8348ed206f09858a",
+      "file": "gather_q4_k_rows_f16.hsaco"
+    },
     "gather_q8_0_row_f16": {
       "entry": "src_mtp_gather_q8_0_row_f166A6A6A6AoA6A6A_59690f8d4404073c",
       "file": "gather_q8_0_row_f16.hsaco"
@@ -1278,20 +1286,32 @@
       "file": "gemv_q5_k_out_f32_v2.hsaco"
     },
     "gemv_q6_k_dp4a_batch_b16": {
-      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_bd8ac77acfa75f02",
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_91f02809ce31e0f8",
       "file": "gemv_q6_k_dp4a_batch_b16.hsaco"
     },
     "gemv_q6_k_dp4a_batch_b2": {
-      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_68d4aa601b8f2373",
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_9b2afd0b19110891",
       "file": "gemv_q6_k_dp4a_batch_b2.hsaco"
     },
     "gemv_q6_k_dp4a_batch_b4": {
-      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a69d5d7ce99a9359",
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_f250db6e8d9711ad",
       "file": "gemv_q6_k_dp4a_batch_b4.hsaco"
     },
     "gemv_q6_k_dp4a_batch_b8": {
-      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_d80b02466f349d8c",
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_56b02fea7f7e7f21",
       "file": "gemv_q6_k_dp4a_batch_b8.hsaco"
+    },
+    "gemv_q6_k_dp4a_batch_out_f32_b2": {
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_3376ed97d5a6eeaf",
+      "file": "gemv_q6_k_dp4a_batch_out_f32_b2.hsaco"
+    },
+    "gemv_q6_k_dp4a_batch_out_f32_b4": {
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_438ae35dc44a6064",
+      "file": "gemv_q6_k_dp4a_batch_out_f32_b4.hsaco"
+    },
+    "gemv_q6_k_dp4a_batch_out_f32_b8": {
+      "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_16188584a578add4",
+      "file": "gemv_q6_k_dp4a_batch_out_f32_b8.hsaco"
     },
     "gemv_q6_k_dp4a_out_f32": {
       "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_6d5b209d3fd09722",

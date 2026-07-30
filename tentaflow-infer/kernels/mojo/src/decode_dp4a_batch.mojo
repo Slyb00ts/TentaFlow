@@ -88,8 +88,8 @@ def gemv_q4_k_dp4a_batch_impl[token_tile: Int](
             y[token * n_rows + row] = Float16(total)
 
 
-def gemv_q6_k_dp4a_batch_impl[token_tile: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemv_q6_k_dp4a_batch_impl[token_tile: Int, OUT: DType](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq_g: UnsafePointer[Int8, MutAnyOrigin],
     xd: UnsafePointer[Float32, MutAnyOrigin],
@@ -156,14 +156,20 @@ def gemv_q6_k_dp4a_batch_impl[token_tile: Int](
     comptime for token in range(token_tile):
         total = warp.sum(acc[token])
         if lane == 0 and token < n_tokens:
-            y[token * n_rows + row] = Float16(total)
+            y[token * n_rows + row] = total.cast[OUT]()
 
 
 comptime gemv_q4_k_dp4a_batch_b2 = gemv_q4_k_dp4a_batch_impl[2]
 comptime gemv_q4_k_dp4a_batch_b4 = gemv_q4_k_dp4a_batch_impl[4]
 comptime gemv_q4_k_dp4a_batch_b8 = gemv_q4_k_dp4a_batch_impl[8]
 comptime gemv_q4_k_dp4a_batch_b16 = gemv_q4_k_dp4a_batch_impl[16]
-comptime gemv_q6_k_dp4a_batch_b2 = gemv_q6_k_dp4a_batch_impl[2]
-comptime gemv_q6_k_dp4a_batch_b4 = gemv_q6_k_dp4a_batch_impl[4]
-comptime gemv_q6_k_dp4a_batch_b8 = gemv_q6_k_dp4a_batch_impl[8]
-comptime gemv_q6_k_dp4a_batch_b16 = gemv_q6_k_dp4a_batch_impl[16]
+comptime gemv_q6_k_dp4a_batch_b2 = gemv_q6_k_dp4a_batch_impl[2, DType.float16]
+comptime gemv_q6_k_dp4a_batch_b4 = gemv_q6_k_dp4a_batch_impl[4, DType.float16]
+comptime gemv_q6_k_dp4a_batch_b8 = gemv_q6_k_dp4a_batch_impl[8, DType.float16]
+comptime gemv_q6_k_dp4a_batch_b16 = gemv_q6_k_dp4a_batch_impl[16, DType.float16]
+# Wariant f32 dla batchowej głowy logitów: ta sama matematyka i ten sam odczyt
+# wag, inny tylko typ zapisu. Bez niego weryfikacja MTP przy głowie Q6_K
+# czytałaby całą głowę RAZ NA TOKEN draftu zamiast raz na cykl.
+comptime gemv_q6_k_dp4a_batch_out_f32_b2 = gemv_q6_k_dp4a_batch_impl[2, DType.float32]
+comptime gemv_q6_k_dp4a_batch_out_f32_b4 = gemv_q6_k_dp4a_batch_impl[4, DType.float32]
+comptime gemv_q6_k_dp4a_batch_out_f32_b8 = gemv_q6_k_dp4a_batch_impl[8, DType.float32]

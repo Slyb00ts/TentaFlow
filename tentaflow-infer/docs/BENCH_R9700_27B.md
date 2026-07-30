@@ -164,30 +164,59 @@ prawdą, a jedyne żywe użycie było właśnie w tej referencji.
 Suma SHA 128 wygenerowanych tokenów jest przez całą tę drogę ta sama
 (`0bf2b86b…`) i identyczna dla obu kwantyzacji.
 
-## 4. Czego jeszcze brakuje
+## 4. MTP dla Q4_K_M — czego brakowało
 
-1. **MTP dla Q4_K_M w ogóle nie wstaje.** `mtp_device_bytes` przyjmuje wyłącznie
-   `Q8_0` i `NvFp4Gguf`, a w tym pliku `token_embd` ORAZ `nextn.eh_proj` są w
-   Q4_K. llama.cpp wyciąga z MTP na tym samym pliku 1,33x, my zero — to jest
-   największa pojedyncza luka w tabeli i nie jest to luka wydajnościowa, tylko
-   brakujący gather i brakująca projekcja.
-2. **Akceptacja draftu MTP.** 1,35 tokena na krok wobec zysku 1,62x u llama.cpp
-   na tym samym pliku NVFP4.
-3. **Kafle WMMA stoją na ~55% szczytu karty** (100 TFLOPS wobec zmierzonych 179
+llama.cpp wyciągał z MTP na tym pliku 1,33x, my nie startowaliśmy w ogóle. To
+nie była luka wydajnościowa, tylko trzy brakujące kawałki — w Q4_K_M inne
+tensory są w innych formatach niż w wariancie NVFP4:
+
+| tensor | NVFP4 | Q4_K_M | co było potrzebne |
+|---|---|---|---|
+| `token_embd` | NVFP4 | **Q4_K** | gather Q4_K (wsadowy i jednowierszowy) |
+| `nextn.eh_proj` | Q8_0 | **Q4_K** | przekwantowanie przy ładowaniu |
+| `output` (głowa) | Q8_0 | **Q6_K** | batchowa głowa logitów z wyjściem f32 |
+
+1. **Gather embeddingu.** 715 MB tablicy — przekwantowanie odpada, więc doszły
+   `gather_q4_k_rows_f16` i `gather_q4_k_row_f16`, ta sama formuła co
+   `gemm_q4_k_wmma`. Test złoty porównuje oba z kanoniczną dekwantyzacją
+   `forge-formats` i sprawdza, że ID spoza zakresu daje wyzerowany wiersz.
+2. **`eh_proj`.** Cała ścieżka MTP (`mtp_prepare_f16`, `mtp_project_joined_q8_f16`)
+   czyta tę jedną macierz kernelem Q8_0. Przekwantowanie przy ładowaniu kosztuje
+   26 MiB VRAM na całą głowę i jest tańsze niż drugi komplet kerneli o innej
+   arytmetyce — stąd `MtpTensorLoader::matrix_q8`, używane wyłącznie dla
+   `eh_proj`.
+3. **Głowa logitów Q6_K.** Weryfikacja MTP potrzebuje logitów dla T tokenów
+   naraz, a `logits_gemm` miał dla K-kwantów tylko przemiat per token — czyli
+   odczyt CAŁEJ głowy (1,27 GiB) raz na token draftu. Kernel batchowy Q6_K
+   istniał, ale wyłącznie z wyjściem f16; sampling weryfikatora wymaga f32.
+   Wariant f32 powstał przez sparametryzowanie tego samego kernela typem zapisu
+   (`OUT: DType`, wzorzec z `gemm_dot.mojo`), więc matematyka i odczyt wag są te
+   same — test złoty wiąże go wprost z wariantem f16.
+
+## 5. Czego jeszcze brakuje
+
+1. **Akceptacja draftu MTP.** 1,35 tokena na krok wobec zysku 1,62x u llama.cpp
+   na tym samym pliku NVFP4. Rozbicie kosztu (profil `rocprofv3` decode):
+   cykl weryfikacji kosztuje u nas ~1,69x zwykłego forwardu, u llama.cpp ~1,45x.
+   To NIE jest koszt targetu — ten batchuje T=4 poprawnie (bez spekulacji
+   28,9 ms/forward, z MTP 3,7 s wobec 7,4 s GPU na te same 256 tokenów) — tylko
+   koszt samych propozycji: głowa draftu Q8_0 to 466 ms z 3,7 s cyklu.
+   `FORGE_MTP_DRAFT_HEAD=nvfp4` jest gotowym eksperymentem na ten koszt.
+2. **Kafle WMMA stoją na ~55% szczytu karty** (100 TFLOPS wobec zmierzonych 179
    TFLOPS f16 WMMA; int8 WMMA ma 354 TOPS). Jednostka int8 nie jest tu prostym
    zyskiem: skala Q4_K/Q6_K zmienia się co 32 kolumny, więc akumulator int32
    trzeba zrzucać do f32 co dwie instrukcje, a to zjada przewagę — dlatego
    wcześniejsza próba `gemm_q4_k_i8wmma` wyszła 3,3x wolniej. Realna droga to
    `v_wmma_i32_16x16x32_iu4`: K=32 to dokładnie jeden podblok skali, czyli jedno
    zrzucenie na instrukcję.
-4. Po zamianie kafla Q6_K na WMMA rozkład prefillu Q4_K to `gemm_q4_k_wmma`
+3. Po zamianie kafla Q6_K na WMMA rozkład prefillu Q4_K to `gemm_q4_k_wmma`
    60,9%, `deltanet_prepare` 14,3%, `gemm_q6_k_wmma` 12,5%, `deltanet_value_key`
    6,8%, uwaga 4,2%. **DeltaNet jest teraz drugim kosztem** i nie był jeszcze
    dotykany na tej karcie.
-5. Rozsunięcie LDS i kafel BN=128 wpisano do Q4_K, Q6_K i NVFP4. **Q2_K, Q3_K i
+4. Rozsunięcie LDS i kafel BN=128 wpisano do Q4_K, Q6_K i NVFP4. **Q2_K, Q3_K i
    Q5_K mają ten sam defekt** i czekają na własny pomiar — ten checkpoint ich nie
    używa.
-6. `test_catalog_matches_committed_manifest` jest CZERWONY dla `gfx1100` i był
+5. `test_catalog_matches_committed_manifest` jest CZERWONY dla `gfx1100` i był
    czerwony już przed tą pracą (`gemm_q8_0_wmma_128x128` z poprzedniej sesji):
    zestaw 7900 XT wymaga przebudowania na tej karcie, a jej nie ma w maszynie.
    gfx1201 przechodzi.

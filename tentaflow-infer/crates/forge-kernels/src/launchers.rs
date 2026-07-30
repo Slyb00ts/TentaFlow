@@ -5,8 +5,8 @@
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use forge_hal::{DevBuffer, Device, Event, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
@@ -91,11 +91,7 @@ pub struct Nvfp4CtS0View<'a> {
 
 impl<'a> Nvfp4CtS0View<'a> {
     pub fn new(buffer: &'a DevBuffer, rows: usize, cols: usize) -> Result<Self> {
-        if rows == 0
-            || !rows.is_multiple_of(64)
-            || cols == 0
-            || !cols.is_multiple_of(128)
-        {
+        if rows == 0 || !rows.is_multiple_of(64) || cols == 0 || !cols.is_multiple_of(128) {
             return Err(ForgeError::Kernel(format!(
                 "NVFP4 S0 N64/K128 wymaga rows % 64 == 0 i cols % 128 == 0; rows={rows}, cols={cols}"
             )));
@@ -331,9 +327,7 @@ fn validate_nvfp4_ct_b1_extents(
         .ok_or_else(|| ForgeError::Kernel("decode NVFP4 CT: przepełnienie zakresu".into()))?;
     let required_output = checked_buffer_bytes("decode NVFP4 CT output", &[rows], 2)?;
     let required_input = checked_buffer_bytes("decode NVFP4 CT input", &[cols], 2)?;
-    if source_end > physical_rows
-        || output_bytes < required_output
-        || input_bytes < required_input
+    if source_end > physical_rows || output_bytes < required_output || input_bytes < required_input
     {
         return Err(ForgeError::Kernel(
             "decode NVFP4 CT: okno lub bufor nie pasuje do widoku".into(),
@@ -1299,13 +1293,28 @@ const HYBRID_PREFILL_T128_MATRIX_AMD: [&str; 5] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DensePrefillLogitsKind {
-    F16 { rows: usize, cols: usize },
-    Q8_0 { rows: usize, cols: usize },
-    NvFp4Gguf { rows: usize, cols: usize },
+    F16 {
+        rows: usize,
+        cols: usize,
+    },
+    Q8_0 {
+        rows: usize,
+        cols: usize,
+    },
+    NvFp4Gguf {
+        rows: usize,
+        cols: usize,
+    },
     /// Q4_K/Q6_K heads run the per-lane dp4a GEMV sweep inside `logits_gemm`
     /// (no batched GEMM-out-f32 kernel; one weight read per lane).
-    Q4K { rows: usize, cols: usize },
-    Q6K { rows: usize, cols: usize },
+    Q4K {
+        rows: usize,
+        cols: usize,
+    },
+    Q6K {
+        rows: usize,
+        cols: usize,
+    },
 }
 
 /// Wymagania SPRZĘTOWE równego dense prefillu, bez pytania o producenta.
@@ -1337,8 +1346,7 @@ fn dense_prefill_artifacts_capable(
     // segmentowany. Wystarczy jeden z nich — wybór należy do miejsca wywołania.
     let attention = match head_dim {
         128 => {
-            has("attn_prefill_fa_segmented_f16_hd128")
-                || has("attn_prefill_segmented_f16_hd128")
+            has("attn_prefill_fa_segmented_f16_hd128") || has("attn_prefill_segmented_f16_hd128")
         }
         256 => has("attn_prefill_segmented_f16_hd256"),
         _ => false,
@@ -1409,10 +1417,7 @@ fn has_hybrid_prefill_b2_artifacts(mut has: impl FnMut(&str) -> bool) -> bool {
     HYBRID_PREFILL_B2_ARTIFACTS.iter().all(|name| has(name))
 }
 
-fn has_hybrid_prefill_t128_artifacts(
-    nvidia: bool,
-    mut has: impl FnMut(&str) -> bool,
-) -> bool {
+fn has_hybrid_prefill_t128_artifacts(nvidia: bool, mut has: impl FnMut(&str) -> bool) -> bool {
     let matrix: &[&str] = if nvidia {
         &HYBRID_PREFILL_T128_MATRIX_NVIDIA
     } else {
@@ -2266,13 +2271,7 @@ impl Kernels {
     }
 
     /// buf *= factor w miejscu (skalowanie embeddingu w rodzinie Gemma).
-    pub fn scale_f16(
-        &self,
-        buf: &DevBuffer,
-        n: usize,
-        factor: f32,
-        stream: &Stream,
-    ) -> Result<()> {
+    pub fn scale_f16(&self, buf: &DevBuffer, n: usize, factor: f32, stream: &Stream) -> Result<()> {
         let k = self.artifacts.get("scale_f16")?;
         let cfg = LaunchConfig::linear(n as u32, BLOCK);
         let args = LaunchArgs::new().buf(buf).scalar(n as i64).scalar(factor);
@@ -2378,9 +2377,7 @@ impl Kernels {
             block: ((head_dim as u32 / 2).clamp(32, 256), 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut args = LaunchArgs::new()
-            .buf(x_io)
-            .buf(positions);
+        let mut args = LaunchArgs::new().buf(x_io).buf(positions);
         if let Some(ff) = freq_factors {
             args = args.buf(ff);
         }
@@ -2418,9 +2415,7 @@ impl Kernels {
             block: ((head_dim as u32 / 2).clamp(32, 256), 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut args = LaunchArgs::new()
-            .buf_at(x_io, byte_off)?
-            .buf(positions);
+        let mut args = LaunchArgs::new().buf_at(x_io, byte_off)?.buf(positions);
         if let Some(ff) = freq_factors {
             args = args.buf(ff);
         }
@@ -4349,26 +4344,21 @@ impl Kernels {
                 "repack NVFP4 CT wymaga pełnych kafli N64/K128".into(),
             ));
         }
-        let target_end = target_row_offset.checked_add(source_rows).ok_or_else(|| {
-            ForgeError::Kernel("repack NVFP4 CT: przepełnienie zakresu".into())
-        })?;
+        let target_end = target_row_offset
+            .checked_add(source_rows)
+            .ok_or_else(|| ForgeError::Kernel("repack NVFP4 CT: przepełnienie zakresu".into()))?;
         if target_end > physical_rows {
             return Err(ForgeError::Kernel(
                 "repack NVFP4 CT: chunk wykracza poza resident".into(),
             ));
         }
-        let target_bytes = checked_buffer_bytes(
-            "repack NVFP4 CT target",
-            &[physical_rows, cols],
-            9,
-        )? / 16;
+        let target_bytes =
+            checked_buffer_bytes("repack NVFP4 CT target", &[physical_rows, cols], 9)? / 16;
         let packed_bytes =
             checked_buffer_bytes("repack NVFP4 CT packed", &[source_rows, cols], 1)? / 2;
         let scale_bytes =
             checked_buffer_bytes("repack NVFP4 CT scales", &[source_rows, cols], 1)? / 16;
-        if target.len() != target_bytes
-            || packed.len() < packed_bytes
-            || scales.len() < scale_bytes
+        if target.len() != target_bytes || packed.len() < packed_bytes || scales.len() < scale_bytes
         {
             return Err(ForgeError::Kernel(
                 "repack NVFP4 CT: niezgodny rozmiar bufora".into(),
@@ -4484,8 +4474,7 @@ impl Kernels {
                 )))
             }
         };
-        let output_bytes =
-            checked_buffer_bytes("decode NVFP4 CT output", &[n_tokens, rows], 2)?;
+        let output_bytes = checked_buffer_bytes("decode NVFP4 CT output", &[n_tokens, rows], 2)?;
         let input_bytes =
             checked_buffer_bytes("decode NVFP4 CT input", &[n_tokens, weights.cols], 2)?;
         let output_end = y_byte_offset.checked_add(output_bytes).ok_or_else(|| {
@@ -4517,9 +4506,9 @@ impl Kernels {
                 "decode NVFP4 CT wymaga wyrównanego okna N64 i skończonej skali".into(),
             ));
         }
-        let source_end = source_row_offset.checked_add(rows).ok_or_else(|| {
-            ForgeError::Kernel("decode NVFP4 CT: przepełnienie zakresu".into())
-        })?;
+        let source_end = source_row_offset
+            .checked_add(rows)
+            .ok_or_else(|| ForgeError::Kernel("decode NVFP4 CT: przepełnienie zakresu".into()))?;
         if source_end > weights.rows {
             return Err(ForgeError::Kernel(
                 "decode NVFP4 CT: okno lub bufor nie pasuje do widoku".into(),
@@ -4579,16 +4568,15 @@ impl Kernels {
                 "prefill NVFP4 CT wymaga okna N64, K128 i skończonej skali".into(),
             ));
         }
-        let source_end = source_row_offset.checked_add(rows).ok_or_else(|| {
-            ForgeError::Kernel("prefill NVFP4 CT: przepełnienie zakresu".into())
-        })?;
+        let source_end = source_row_offset
+            .checked_add(rows)
+            .ok_or_else(|| ForgeError::Kernel("prefill NVFP4 CT: przepełnienie zakresu".into()))?;
         if source_end > weights.rows {
             return Err(ForgeError::Kernel(
                 "prefill NVFP4 CT: okno wykracza poza widok wag".into(),
             ));
         }
-        let output_bytes =
-            checked_buffer_bytes("prefill NVFP4 CT output", &[n_tokens, rows], 2)?;
+        let output_bytes = checked_buffer_bytes("prefill NVFP4 CT output", &[n_tokens, rows], 2)?;
         let input_bytes =
             checked_buffer_bytes("prefill NVFP4 CT input", &[n_tokens, weights.cols], 2)?;
         if y.len() < output_bytes || x.len() < input_bytes {
@@ -4657,9 +4645,7 @@ impl Kernels {
             ))
         })?;
         let kernel_name = projection.kernel_name(logical_m).ok_or_else(|| {
-            ForgeError::Kernel(format!(
-                "NVFP4 CT direct nie ma kernela dla M{logical_m}"
-            ))
+            ForgeError::Kernel(format!("NVFP4 CT direct nie ma kernela dla M{logical_m}"))
         })?;
         let (rows, cols, parts) = projection.dims();
         let (row_tile, block_threads) = projection.launch_shape(physical_m);
@@ -4827,9 +4813,13 @@ impl Kernels {
         }
         let k = self.artifacts.get("gemv_nvfp4_gguf_f16")?;
         let cfg = LaunchConfig {
-            grid: (u32::try_from(rows).map_err(|_| {
-                ForgeError::Kernel("gemv_nvfp4_gguf_f16_at: za dużo wierszy".into())
-            })?, 1, 1),
+            grid: (
+                u32::try_from(rows).map_err(|_| {
+                    ForgeError::Kernel("gemv_nvfp4_gguf_f16_at: za dużo wierszy".into())
+                })?,
+                1,
+                1,
+            ),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -5850,6 +5840,53 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
+    /// Dekwantyzuje staged embedding row z tied Q4_K według ID na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_q4_k_row_f16(
+        &self,
+        output: &DevBuffer,
+        weights: &DevBuffer,
+        token: &DevBuffer,
+        status: &DevBuffer,
+        status_offset: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(
+                "gather_q4_k_row_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let output_bytes = checked_buffer_bytes("gather_q4_k_row_f16 output", &[hidden_size], 2)?;
+        let weight_bytes = checked_buffer_bytes(
+            "gather_q4_k_row_f16 weights",
+            &[vocab_size, hidden_size / 256],
+            144,
+        )?;
+        if output.len() < output_bytes
+            || weights.len() < weight_bytes
+            || token.len() < 4
+            || status_offset
+                .checked_add(4)
+                .is_none_or(|end| end > status.len())
+        {
+            return Err(ForgeError::Kernel(
+                "gather_q4_k_row_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("gather_q4_k_row_f16")?;
+        let config = LaunchConfig::linear(hidden_size as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(weights)
+            .buf(token)
+            .buf_at(status, status_offset)?
+            .scalar(vocab_size as i64)
+            .scalar(hidden_size as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Dekwantyzuje staged embedding row z tied GGUF NVFP4 według ID na GPU.
     #[allow(clippy::too_many_arguments)]
     pub fn gather_nvfp4_gguf_row_f16(
@@ -5943,6 +5980,51 @@ impl Kernels {
             .buf(lane1_ids)
             .buf(base_positions)
             .scalar(steps as i64);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
+    /// Dekwantyzuje batch wierszy target embeddingu Q4_K według ID na GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_q4_k_rows_f16(
+        &self,
+        output: &DevBuffer,
+        weights: &DevBuffer,
+        ids: &DevBuffer,
+        rows: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(
+                "gather_q4_k_rows_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let output_bytes =
+            checked_buffer_bytes("gather_q4_k_rows_f16 output", &[rows, hidden_size], 2)?;
+        let weight_bytes = checked_buffer_bytes(
+            "gather_q4_k_rows_f16 weights",
+            &[vocab_size, hidden_size / 256],
+            144,
+        )?;
+        if output.len() < output_bytes || weights.len() < weight_bytes || ids.len() < rows * 4 {
+            return Err(ForgeError::Kernel(
+                "gather_q4_k_rows_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let kernel = self.artifacts.get("gather_q4_k_rows_f16")?;
+        let config = LaunchConfig {
+            grid: ((hidden_size as u32).div_ceil(BLOCK), rows as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(output)
+            .buf(weights)
+            .buf(ids)
+            .scalar(rows as i64)
+            .scalar(vocab_size as i64)
+            .scalar(hidden_size as i64);
         self.device.launch(kernel, &config, &args, stream)
     }
 
@@ -7365,7 +7447,10 @@ impl Kernels {
         // na mma/ldmatrix) i idą kaflem na `v_dot2_f32_f16`.
         if let Some(tile) = self.gemm_dot2_tile(rows, n_tokens) {
             if std::env::var("FORGE_TRACE_ROUTE").is_ok() {
-                eprintln!("ROUTE dot2 {} rows={rows} cols={cols} T={n_tokens}", tile.name);
+                eprintln!(
+                    "ROUTE dot2 {} rows={rows} cols={cols} T={n_tokens}",
+                    tile.name
+                );
             }
             let k = self.artifacts.get(tile.name)?;
             return self
@@ -7602,10 +7687,11 @@ impl Kernels {
             .lock()
             .map_err(|_| ForgeError::Kernel("sample parts scratch poisoned".into()))?;
         if sc.cap < need_parts {
-            sc.vals = Some(
-                self.device
-                    .alloc(need_parts * 4, MemKind::Device, Pool::Activations)?,
-            );
+            sc.vals = Some(self.device.alloc(
+                need_parts * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
             sc.idx = Some(
                 self.device
                     .alloc(need_parts * 4, MemKind::Device, Pool::Activations)?,
@@ -9518,7 +9604,10 @@ impl Kernels {
         // Karty bez jednostki macierzowej: kafel int8 na `v_dot4_i32_i8`.
         if let Some(tile) = self.gemm_dot4_tile(kernel_base, output_f32, rows, n_tokens) {
             if std::env::var("FORGE_TRACE_ROUTE").is_ok() {
-                eprintln!("ROUTE dot4 {} rows={rows} cols={cols} T={n_tokens}", tile.name);
+                eprintln!(
+                    "ROUTE dot4 {} rows={rows} cols={cols} T={n_tokens}",
+                    tile.name
+                );
             }
             let gk = self.artifacts.get(tile.name)?;
             let cfg = tile.config(rows, n_tokens);
@@ -9620,10 +9709,7 @@ impl Kernels {
             }
             return Some(DotTile::new("gemm_q8_0_wmma_128x128", 128, 128, 8, 8));
         }
-        if family == "q8_0"
-            && (!rdna4 || big_tile)
-            && self.artifacts.has("gemm_q8_0_wmma_64x128")
-        {
+        if family == "q8_0" && (!rdna4 || big_tile) && self.artifacts.has("gemm_q8_0_wmma_64x128") {
             // Kafel 16x64 (BM=16, BN=64, 128 wątków) wobec 64x128 (BM=64,
             // BN=128, 128 wątków). Próg z pomiaru A/B na 7900 XT: duży kafel ma
             // lepsze reużycie danych, ale przy krótkim prompcie albo wąskiej
@@ -9742,12 +9828,7 @@ impl Kernels {
     /// Kafel `gemm_nvfp4_dot4`, albo `None` na NVIDII i dla kształtów, które
     /// obsługują wyspecjalizowane gemv batchowe (do 16 tokenów) — tam kafel
     /// prefillowy liczyłby w większości odrzucane wiersze.
-    fn gemm_nvfp4_dot4_tile(
-        &self,
-        rows: usize,
-        cols: usize,
-        n_tokens: usize,
-    ) -> Option<DotTile> {
+    fn gemm_nvfp4_dot4_tile(&self, rows: usize, cols: usize, n_tokens: usize) -> Option<DotTile> {
         if self.device.caps().vendor == forge_types::Vendor::Nvidia {
             return None;
         }
@@ -10143,8 +10224,7 @@ impl Kernels {
                 "pack NVFP4 CT: okno wykracza poza resident".into(),
             ));
         }
-        let output_bytes =
-            checked_buffer_bytes("pack NVFP4 CT output", &[rows, weights.cols], 1)?;
+        let output_bytes = checked_buffer_bytes("pack NVFP4 CT output", &[rows, weights.cols], 1)?;
         let scale_bytes = checked_buffer_bytes("pack NVFP4 CT scales", &[rows], 4)?;
         if output.len() < output_bytes || output_scales.len() < scale_bytes {
             return Err(ForgeError::Kernel(
@@ -10310,15 +10390,12 @@ impl Kernels {
         } else {
             base_kernel_name.as_str()
         };
-        let gk = self
-            .artifacts
-            .get(kernel_name)
-            .map_err(|_| {
-                ForgeError::Kernel(format!(
-                    "gemm_fp8_modular: no committed Modular fp8 kernel for \
+        let gk = self.artifacts.get(kernel_name).map_err(|_| {
+            ForgeError::Kernel(format!(
+                "gemm_fp8_modular: no committed Modular fp8 kernel for \
                      (rows={rows}, cols={cols}); build one in gemm_fp8_modular.mojo"
-                ))
-            })?;
+            ))
+        })?;
 
         let need_codes = n_tokens * cols;
         let mut sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
@@ -10516,15 +10593,12 @@ impl Kernels {
         } else {
             base_kernel_name.as_str()
         };
-        let gk = self
-            .artifacts
-            .get(kernel_name)
-            .map_err(|_| {
-                ForgeError::Kernel(format!(
-                    "gemm_fp8_modular_prequant: no committed Modular fp8 kernel for \
+        let gk = self.artifacts.get(kernel_name).map_err(|_| {
+            ForgeError::Kernel(format!(
+                "gemm_fp8_modular_prequant: no committed Modular fp8 kernel for \
                      (rows={rows}, cols={cols}); build one in gemm_fp8_modular.mojo"
-                ))
-            })?;
+            ))
+        })?;
         let sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
         if sc.cap_codes < n_tokens * cols || sc.cap_tokens < n_tokens {
             return Err(ForgeError::Kernel(
@@ -10895,9 +10969,9 @@ impl Kernels {
             !matches!(plan, AttnDecodePlan::Generic(_)),
         )?;
         if !matches!(plan, AttnDecodePlan::Generic(_)) {
-            let partial =
-                self.artifacts
-                    .get(&format!("attn_decode_split8_f16_{split_suffix}"))?;
+            let partial = self
+                .artifacts
+                .get(&format!("attn_decode_split8_f16_{split_suffix}"))?;
             let partial_config = LaunchConfig {
                 grid: (grid_x, grid_y, ATTN_HD256_SPLITS as u32),
                 block: (ATTN_HD256_BLOCK, 1, 1),
@@ -12493,12 +12567,8 @@ impl Kernels {
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        self.device.launch(
-            self.artifacts.get(GEMV_Q8_GROUP4)?,
-            &cfg,
-            &args,
-            stream,
-        )?;
+        self.device
+            .launch(self.artifacts.get(GEMV_Q8_GROUP4)?, &cfg, &args, stream)?;
         Ok(true)
     }
 
@@ -12687,10 +12757,11 @@ impl Kernels {
                 self.device
                     .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
             );
-            sc.xsm = Some(
-                self.device
-                    .alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?,
-            );
+            sc.xsm = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
             sc.cap_blocks = need_blocks;
         }
         let qk = self.artifacts.get("quantize_act_q8_1")?;
@@ -12749,7 +12820,8 @@ impl Kernels {
             return Ok(false);
         };
         let block_bytes = if q6 { 210 } else { 144 };
-        let weight_bytes = checked_buffer_bytes("dp4a batch weights", &[rows, cols / 256], block_bytes)?;
+        let weight_bytes =
+            checked_buffer_bytes("dp4a batch weights", &[rows, cols / 256], block_bytes)?;
         let weight_end = w_byte_off
             .checked_add(weight_bytes)
             .ok_or_else(|| ForgeError::Kernel("dp4a batch: przepełnienie wag".into()))?;
@@ -12778,6 +12850,63 @@ impl Kernels {
             .scalar(rows as i64)
             .scalar(n_tokens as i64);
         self.device.launch(&gk, &cfg, &args, stream)?;
+        Ok(true)
+    }
+
+    /// Batchowa głowa logitów Q6_K z wyjściem f32: ten sam przemiat wag co
+    /// `gemm_qk_dp4a_batch_at`, ale zapis w f32, którego wymaga sampling
+    /// weryfikatora. Bez tego wariantu weryfikacja MTP przy głowie Q6_K czyta
+    /// CAŁĄ głowę raz na token draftu (1,27 GiB x T) zamiast raz na cykl.
+    /// Zwraca `false`, gdy kształt, szerokość batcha albo artefakt nie pasują —
+    /// wołający zostaje przy przemiatnięciu per token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q6_k_dp4a_batch_out_f32_at(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        if !matches!(n_tokens, 2 | 4 | 8) || rows == 0 || cols == 0 || !cols.is_multiple_of(256) {
+            return Ok(false);
+        }
+        if self.device.caps().warp_size != 32 {
+            return Ok(false);
+        }
+        let name = format!("gemv_q6_k_dp4a_batch_out_f32_b{n_tokens}");
+        let Ok(kernel) = self.artifacts.get(&name) else {
+            return Ok(false);
+        };
+        let weight_bytes =
+            checked_buffer_bytes("q6_k batch head weights", &[rows, cols / 256], 210)?;
+        let weight_end = w_byte_off
+            .checked_add(weight_bytes)
+            .ok_or_else(|| ForgeError::Kernel("q6_k batch head: przepełnienie wag".into()))?;
+        let output_bytes = checked_buffer_bytes("q6_k batch head output", &[n_tokens, rows], 4)?;
+        if y_f32.len() < output_bytes || w.len() < weight_end {
+            return Err(ForgeError::Kernel(
+                "q6_k batch head: bufor wyjścia lub wag jest za mały".into(),
+            ));
+        }
+        let sc = self.qk_batch_quantize(x, 0, cols, n_tokens, stream)?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(4), 1, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf_at(w, w_byte_off)?
+            .buf(sc.xq.as_ref().expect("xq allocated"))
+            .buf(sc.xd.as_ref().expect("xd allocated"))
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(&kernel, &cfg, &args, stream)?;
         Ok(true)
     }
 
@@ -12857,10 +12986,7 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<bool> {
-        if !matches!(n_tokens, 2 | 4 | 8 | 16)
-            || rows == 0
-            || cols == 0
-            || !cols.is_multiple_of(32)
+        if !matches!(n_tokens, 2 | 4 | 8 | 16) || rows == 0 || cols == 0 || !cols.is_multiple_of(32)
         {
             return Ok(false);
         }
@@ -13627,7 +13753,15 @@ impl Kernels {
             return Ok(());
         }
         if self.gemm_kblock_portable(
-            "gemm_q5_k", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+            "gemm_q5_k",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
         )? {
             return Ok(());
         }
@@ -13865,7 +13999,15 @@ impl Kernels {
             return Ok(());
         }
         if self.gemm_kblock_portable(
-            "gemm_q3_k", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+            "gemm_q3_k",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
         )? {
             return Ok(());
         }
@@ -14103,7 +14245,15 @@ impl Kernels {
             return Ok(());
         }
         if self.gemm_kblock_portable(
-            "gemm_q2_k", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+            "gemm_q2_k",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
         )? {
             return Ok(());
         }
@@ -14361,7 +14511,15 @@ impl Kernels {
             return Ok(());
         }
         if self.gemm_kblock_portable(
-            "gemm_q4_0", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+            "gemm_q4_0",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
         )? {
             return Ok(());
         }
@@ -14599,7 +14757,15 @@ impl Kernels {
             return Ok(());
         }
         if self.gemm_kblock_portable(
-            "gemm_q4_1", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+            "gemm_q4_1",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
         )? {
             return Ok(());
         }
@@ -14837,7 +15003,15 @@ impl Kernels {
             return Ok(());
         }
         if self.gemm_kblock_portable(
-            "gemm_q5_0", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+            "gemm_q5_0",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
         )? {
             return Ok(());
         }
@@ -15075,7 +15249,15 @@ impl Kernels {
             return Ok(());
         }
         if self.gemm_kblock_portable(
-            "gemm_q5_1", y, w, w_byte_off, x, rows, cols, n_tokens, stream,
+            "gemm_q5_1",
+            y,
+            w,
+            w_byte_off,
+            x,
+            rows,
+            cols,
+            n_tokens,
+            stream,
         )? {
             return Ok(());
         }
@@ -17767,23 +17949,22 @@ impl Kernels {
 mod nvfp4_gguf_dispatch_tests {
     use super::{
         attn_decode_plan, delta_state_layout_dispatch, dense_prefill_artifacts_capable,
-        dense_prefill_backend_capable, ensure_prepared_q8_usable, has_delta_value_key_artifacts,
-        has_hybrid_prefill_b2_artifacts, has_hybrid_prefill_t128_artifacts,
-        has_nvfp4_gguf_tile_artifacts, hybrid_prefill_nvfp4_artifact_chunk_limit,
-        lock_prepared_q8_scratch, fp8_modular_bn256_capable,
-        nvfp4_gguf_dispatch as nvfp4_gguf_dispatch_impl,
-        nvfp4_gguf_layout_dispatch, nvfp4_ct_s0_manual_capable,
-        nvfp4_ct_split_pipeline_supported, q8_nvfp4_pack_launch,
-        raw_nvfp4_dp4a_supported, resolve_prepared_q8_marker, validate_attn_decode_f16,
-        validate_attn_prefill_fa_f16_hd256, validate_attn_verify_split8,
+        dense_prefill_backend_capable, ensure_prepared_q8_usable, fp8_modular_bn256_capable,
+        has_delta_value_key_artifacts, has_hybrid_prefill_b2_artifacts,
+        has_hybrid_prefill_t128_artifacts, has_nvfp4_gguf_tile_artifacts,
+        hybrid_prefill_nvfp4_artifact_chunk_limit, lock_prepared_q8_scratch,
+        nvfp4_ct_s0_manual_capable, nvfp4_ct_split_pipeline_supported,
+        nvfp4_gguf_dispatch as nvfp4_gguf_dispatch_impl, nvfp4_gguf_layout_dispatch,
+        q8_nvfp4_pack_launch, raw_nvfp4_dp4a_supported, resolve_prepared_q8_marker,
+        validate_attn_decode_f16, validate_attn_prefill_fa_f16_hd256, validate_attn_verify_split8,
         validate_deltanet_gated_step_f16, validate_f32_byte_offset,
         validate_kv_append_batch_segmented_f16, validate_kv_append_batch_segmented_masked_f16,
-        validate_nvfp4_ct_b1_extents, validate_nvfp4_ct_repack_extents,
-        verify_attn_split8_enabled, AttnDecodePlan, DeltaStateLayout, DensePrefillLogitsKind,
-        Kernels, Nvfp4GgufLayout, PrequantScratch, Q8PreparedProjection,
-        HYBRID_PREFILL_B2_ARTIFACTS, HYBRID_PREFILL_T128_MATRIX_AMD,
-        HYBRID_PREFILL_T128_MATRIX_NVIDIA, HYBRID_PREFILL_T128_SHARED, PREPARED_Q8_GEMM_LAUNCHES,
-        PREPARED_Q8_RECORD_FAILURES, PREPARED_Q8_SYNC_FAILURES, NVFP4_CT_S0_ARTIFACTS,
+        validate_nvfp4_ct_b1_extents, validate_nvfp4_ct_repack_extents, verify_attn_split8_enabled,
+        AttnDecodePlan, DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4GgufLayout,
+        PrequantScratch, Q8PreparedProjection, HYBRID_PREFILL_B2_ARTIFACTS,
+        HYBRID_PREFILL_T128_MATRIX_AMD, HYBRID_PREFILL_T128_MATRIX_NVIDIA,
+        HYBRID_PREFILL_T128_SHARED, NVFP4_CT_S0_ARTIFACTS, PREPARED_Q8_GEMM_LAUNCHES,
+        PREPARED_Q8_RECORD_FAILURES, PREPARED_Q8_SYNC_FAILURES,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::cuda::{CudaDevice, PoolSizes};
@@ -17927,55 +18108,35 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn nvfp4_ct_repack_waliduje_extenty_i_overflow() {
         assert_eq!(
-            validate_nvfp4_ct_repack_extents(9216, 4096, 512, 128, 128, 64, 64)
-                .unwrap(),
+            validate_nvfp4_ct_repack_extents(9216, 4096, 512, 128, 128, 64, 64).unwrap(),
             1
         );
-        assert!(
-            validate_nvfp4_ct_repack_extents(9216 + 256, 4096, 512, 128, 128, 64, 64)
-                .is_err()
-        );
-        assert!(
-            validate_nvfp4_ct_repack_extents(9216, 4095, 512, 128, 128, 64, 64)
-                .is_err()
-        );
-        assert!(
-            validate_nvfp4_ct_repack_extents(
-                9216,
-                4096,
-                512,
-                usize::MAX - 63,
-                128,
-                64,
-                usize::MAX - 63,
-            )
-            .is_err()
-        );
+        assert!(validate_nvfp4_ct_repack_extents(9216 + 256, 4096, 512, 128, 128, 64, 64).is_err());
+        assert!(validate_nvfp4_ct_repack_extents(9216, 4095, 512, 128, 128, 64, 64).is_err());
+        assert!(validate_nvfp4_ct_repack_extents(
+            9216,
+            4096,
+            512,
+            usize::MAX - 63,
+            128,
+            64,
+            usize::MAX - 63,
+        )
+        .is_err());
     }
 
     #[test]
     fn nvfp4_ct_b1_waliduje_okno_i_overflow() {
         assert_eq!(
-            validate_nvfp4_ct_b1_extents(128 + 256, 256, 128, 128, 64, 64, 1.0)
-                .unwrap(),
+            validate_nvfp4_ct_b1_extents(128 + 256, 256, 128, 128, 64, 64, 1.0).unwrap(),
             8
         );
         assert!(validate_nvfp4_ct_b1_extents(127, 256, 128, 128, 64, 64, 1.0).is_err());
         assert!(
-            validate_nvfp4_ct_b1_extents(
-                128,
-                256,
-                usize::MAX,
-                128,
-                usize::MAX - 63,
-                64,
-                1.0,
-            )
-            .is_err()
+            validate_nvfp4_ct_b1_extents(128, 256, usize::MAX, 128, usize::MAX - 63, 64, 1.0,)
+                .is_err()
         );
-        assert!(
-            validate_nvfp4_ct_b1_extents(128, 256, 128, 128, 64, 64, f32::NAN).is_err()
-        );
+        assert!(validate_nvfp4_ct_b1_extents(128, 256, 128, 128, 64, 64, f32::NAN).is_err());
     }
 
     #[test]
@@ -18127,7 +18288,10 @@ mod nvfp4_gguf_dispatch_tests {
             (256, AttnDecodePlan::Split8Hd256),
             (512, AttnDecodePlan::Split8Hd512),
         ] {
-            assert_eq!(attn_decode_plan(head_dim, 32, 1024, true).unwrap(), expected);
+            assert_eq!(
+                attn_decode_plan(head_dim, 32, 1024, true).unwrap(),
+                expected
+            );
         }
         for (head_dim, generic) in [
             (64usize, "attn_decode_f16_hd64"),
@@ -18380,7 +18544,10 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn prefill_t128_wymaga_pelnego_zestawu_artefaktow_swojej_rodziny() {
         for nvidia in [true, false] {
-            assert!(has_hybrid_prefill_t128_artifacts(nvidia, |_| true), "{nvidia}");
+            assert!(
+                has_hybrid_prefill_t128_artifacts(nvidia, |_| true),
+                "{nvidia}"
+            );
             let matrix: &[&str] = if nvidia {
                 &HYBRID_PREFILL_T128_MATRIX_NVIDIA
             } else {
@@ -18746,7 +18913,9 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn prepared_q8_t32_t128_jest_zgodny_z_baseline_i_chroni_canary() {
-        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = PREPARED_Q8_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = match CudaDevice::new(
             0,
             PoolSizes {
@@ -18849,7 +19018,9 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn fused_q8_triplet_t32_t128_jest_bitowo_zgodny_i_chroni_canary() {
-        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = PREPARED_Q8_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = match CudaDevice::new(
             0,
             PoolSizes {
@@ -18983,7 +19154,9 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn publiczny_flow_uniewaznia_handle_po_bledzie_record() {
-        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = PREPARED_Q8_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = match CudaDevice::new(
             0,
             PoolSizes {
@@ -19140,7 +19313,9 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn blad_record_z_udanym_sync_resetuje_marker_bez_zatrucia() {
-        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = PREPARED_Q8_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device: Arc<dyn Device> = CpuDevice::new();
         let mut scratch = PrequantScratch {
             ready: Some(device.create_event().unwrap()),
@@ -19162,7 +19337,9 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn blad_record_i_sync_zatruwa_scratch_i_blokuje_nastepne_prepare() {
-        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = PREPARED_Q8_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device: Arc<dyn Device> = CpuDevice::new();
         let mut scratch = PrequantScratch {
             ready: Some(device.create_event().unwrap()),
@@ -19185,7 +19362,9 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn zatruty_mutex_zwraca_blad_bez_odzyskania_scratch() {
-        let _serialized = PREPARED_Q8_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = PREPARED_Q8_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let scratch = Arc::new(Mutex::new(PrequantScratch::default()));
         let panicking = scratch.clone();
         assert!(std::thread::spawn(move || {
@@ -19290,18 +19469,24 @@ mod nvfp4_gguf_dispatch_tests {
 
     #[test]
     fn wybiera_bn128_i_sync1_z_regresyjnym_wyjatkiem() {
-        let large =
-            nvfp4_gguf_dispatch_impl(2048, 5120, 6144, true, true, true, true, false, false, false, 32, 1024).unwrap();
+        let large = nvfp4_gguf_dispatch_impl(
+            2048, 5120, 6144, true, true, true, true, false, false, false, 32, 1024,
+        )
+        .unwrap();
         assert_eq!(large.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn128");
         assert_eq!((large.row_tile, large.block_threads), (128, 256));
 
-        let m128 =
-            nvfp4_gguf_dispatch_impl(128, 5120, 5120, true, true, true, true, false, false, false, 32, 1024).unwrap();
+        let m128 = nvfp4_gguf_dispatch_impl(
+            128, 5120, 5120, true, true, true, true, false, false, false, 32, 1024,
+        )
+        .unwrap();
         assert_eq!(m128.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1");
         assert_eq!((m128.row_tile, m128.block_threads), (64, 256));
 
-        let regression =
-            nvfp4_gguf_dispatch_impl(128, 17408, 5120, true, true, true, true, false, false, false, 32, 1024).unwrap();
+        let regression = nvfp4_gguf_dispatch_impl(
+            128, 17408, 5120, true, true, true, true, false, false, false, 32, 1024,
+        )
+        .unwrap();
         assert_eq!(regression.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_prefetch");
     }
 
@@ -19322,7 +19507,8 @@ mod nvfp4_gguf_dispatch_tests {
             false,
             false,
             32,
-            1024)
+            1024,
+        )
         .unwrap();
         assert_eq!(
             (
@@ -19349,7 +19535,8 @@ mod nvfp4_gguf_dispatch_tests {
             false,
             false,
             32,
-            1024)
+            1024,
+        )
         .unwrap();
         assert_eq!(
             (bn128.kernel, bn128.row_tile),
@@ -19371,7 +19558,8 @@ mod nvfp4_gguf_dispatch_tests {
             false,
             false,
             32,
-            1024)
+            1024,
+        )
         .unwrap();
         assert_eq!(
             (fallback.kernel, fallback.row_tile),
@@ -19391,10 +19579,11 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 false,
-            false,
+                false,
                 false,
                 32,
-                1024),
+                1024,
+            ),
             nvfp4_gguf_layout_dispatch(
                 Nvfp4GgufLayout::TileN128K64,
                 128,
@@ -19407,10 +19596,11 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 false,
-            false,
+                false,
                 false,
                 32,
-                1024),
+                1024,
+            ),
             nvfp4_gguf_layout_dispatch(
                 Nvfp4GgufLayout::TileN128K64,
                 128,
@@ -19423,10 +19613,11 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 false,
                 false,
-            false,
+                false,
                 false,
                 32,
-                1024),
+                1024,
+            ),
         ] {
             assert!(result.is_err());
         }

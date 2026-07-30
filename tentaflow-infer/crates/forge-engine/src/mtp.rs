@@ -19,6 +19,13 @@ use crate::weights::{
 /// Adapter źródła tensorów używany przez loader MTP niezależnie od GGUF i safetensors.
 pub trait MtpTensorLoader {
     fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight>;
+    /// Ładuje macierz i GWARANTUJE Q8_0 na urządzeniu, przekwantowując z
+    /// formatu pliku, jeżeli trzeba. Używane wyłącznie dla `eh_proj`: cała
+    /// ścieżka MTP (`mtp_prepare_f16`, `mtp_project_joined_q8_f16`) czyta ją
+    /// jednym kernelem Q8_0, a checkpointy Q4_K trzymają tę jedną macierz w
+    /// Q4_K. Przekwantowanie kosztuje tu 26 MiB VRAM na całą głowę i jest
+    /// tańsze niż drugi komplet kerneli o innej arytmetyce.
+    fn matrix_q8(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight>;
     fn vector(&mut self, name: &str, len: usize) -> Result<DevBuffer>;
 }
 
@@ -76,6 +83,7 @@ impl MtpWeights {
                 MtpEmbedding::HostF16
                     | MtpEmbedding::Device(DevWeight::F16 { .. })
                     | MtpEmbedding::Device(DevWeight::Q8_0 { .. })
+                    | MtpEmbedding::Device(DevWeight::Q4K { .. })
                     | MtpEmbedding::Device(DevWeight::NvFp4Gguf {
                         layout: Nvfp4GgufLayout::RowMajor36,
                         ..
@@ -216,7 +224,7 @@ impl MtpWeights {
                 }),
             };
             layers.push(MtpLayerWeights {
-                eh_proj: loader.matrix(name(MtpWeightRole::EhProj)?, hidden, 2 * hidden)?,
+                eh_proj: loader.matrix_q8(name(MtpWeightRole::EhProj)?, hidden, 2 * hidden)?,
                 enorm: loader.vector(name(MtpWeightRole::ENorm)?, hidden)?,
                 hnorm: loader.vector(name(MtpWeightRole::HNorm)?, hidden)?,
                 shared_head_norm: loader.vector(name(MtpWeightRole::SharedHeadNorm)?, hidden)?,
@@ -868,6 +876,17 @@ mod tests {
                 buf: self
                     .device
                     .alloc(rows * cols * 2, MemKind::Device, Pool::Weights)?,
+                rows,
+                cols,
+            })
+        }
+
+        fn matrix_q8(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight> {
+            self.loaded.push((name.to_string(), rows, cols));
+            Ok(DevWeight::Q8_0 {
+                buf: self
+                    .device
+                    .alloc(rows * (cols / 32) * 34, MemKind::Device, Pool::Weights)?,
                 rows,
                 cols,
             })
