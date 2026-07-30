@@ -378,11 +378,13 @@ fn build_rtspsrc(url: &str, timeout_secs: u32) -> Result<gst::Element> {
 
     // `protocols` is GstRTSPLowerTrans (GFlags) — can't be set as raw u32.
     // We pass through stringified flags which gst-rs parses via GFlags::from_str:
-    //   - rtsp://  -> `[vision] rtsp_protocols`, default "tcp" (interleaved).
-    //     Across routed networks UDP media dies SILENTLY (conntrack/NAT idle
-    //     timeouts) while the RTSP control TCP stays healthy — the session then
-    //     sat "ONLINE" with a black tile. Interleaved TCP cannot die silently;
-    //     the mid-session stall watchdog remains as defense in depth.
+    //   - rtsp://  -> `[vision] rtsp_protocols`, default "udp+udp-mcast+tcp"
+    //     (patrz `default_rtsp_protocols` w `config/mod.rs` — tam jest źródło
+    //     prawdy i pomiar, dla którego UDP zostało domyślne: interleaved TCP
+    //     zderzył się z backpressure startu naszego łańcucha tee i sesja nigdy
+    //     nie wchodziła online). UDP z kolei potrafi umrzeć CICHO na trasowanych
+    //     sieciach (timeouty conntrack/NAT) przy zdrowym kanale kontrolnym TCP —
+    //     pilnuje tego watchdog stallu w trakcie sesji.
     //   - rtsps:// -> "tcp+tls" (TLS over TCP; udp-over-tls is rare)
     // Without `tls` in the mask, rtspsrc would silently fail on rtsps:// URLs.
     let is_tls = url.starts_with("rtsps://");
