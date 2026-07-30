@@ -24,6 +24,25 @@ const GEMV_NVFP4_GROUP4: &str = "gemv_nvfp4_gguf_q8_1_group4_f16";
 /// Złożone do czterech projekcji Q8_0 na wspólnej aktywacji.
 const GEMV_Q8_GROUP4: &str = "gemv_q8_0_dp4a_group4_f16";
 const GEMV_Q4K_GROUP4: &str = "gemv_q4_k_dp4a_group4_f16";
+const GEMV_MIXED_GROUP4: &str = "gemv_mixed_dp4a_group4_f16";
+
+/// Format wagi w grupie mieszanej. Wartości muszą odpowiadać `_dot_mixed_i8`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixedQuant {
+    Q4K = 0,
+    Q6K = 1,
+    Q8_0 = 2,
+}
+
+impl MixedQuant {
+    /// Liczba wartości w bloku kwantyzacji tego formatu.
+    fn block(self) -> usize {
+        match self {
+            MixedQuant::Q4K | MixedQuant::Q6K => 256,
+            MixedQuant::Q8_0 => 32,
+        }
+    }
+}
 const GEMV_NVFP4_WAVE_ROWS: u32 = 8;
 const FP8_MODULAR_BN256_SMEM: usize = 98_304;
 const FP8_MODULAR_BN256_TOKENS: usize = 1024;
@@ -12903,6 +12922,71 @@ impl Kernels {
         Ok(true)
     }
 
+    /// Do czterech projekcji o RÓŻNYCH formatach, jednym uruchomieniem.
+    ///
+    /// `Q4_K_M` dobiera format PER TENSOR: `q`/`k` są w Q4_K, a `v` w Q6_K;
+    /// wejściowa projekcja DeltaNet w Q6_K, a bramka w Q4_K. Grupowanie
+    /// jednorodne omijało więc najliczniejsze trójki i czwórki projekcji.
+    ///
+    /// `projections` to `(wyjście, waga, wiersze, format)`, gdzie format wybiera
+    /// `MixedQuant`. Wszystkie sloty muszą mieć tę samą liczbę kolumn — czytają
+    /// tę samą aktywację.
+    pub fn gemv_mixed_dp4a_group_f16(
+        &self,
+        projections: &[(&DevBuffer, &DevBuffer, usize, MixedQuant)],
+        x: &DevBuffer,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        if !(2..=4).contains(&projections.len()) || !self.artifacts.has(GEMV_MIXED_GROUP4) {
+            return Ok(false);
+        }
+        // Wspólny prepass kwantyzacji wymaga wielokrotności najgrubszego bloku
+        // spośród formatów w grupie.
+        let step = projections
+            .iter()
+            .map(|&(_, _, _, q)| q.block())
+            .max()
+            .unwrap_or(256);
+        Self::check_dp4a_cols(cols, step, "gemv_mixed_dp4a_group")?;
+        let mut grid_x = 0u32;
+        for &(_, _, rows, _) in projections {
+            grid_x = grid_x
+                .checked_add(u32::try_from(rows.div_ceil(8)).map_err(|_| {
+                    ForgeError::Kernel("gemv mixed group: siatka przekracza u32".into())
+                })?)
+                .ok_or_else(|| {
+                    ForgeError::Kernel("gemv mixed group: siatka przekracza u32".into())
+                })?;
+        }
+        let mut args = LaunchArgs::new();
+        for slot in 0..4 {
+            match projections.get(slot) {
+                Some(&(y, w, rows, quant)) => {
+                    args = args.buf(y).buf(w).scalar(rows as i64).scalar(quant as i64);
+                }
+                // Nieużyty slot: zero wierszy nie tworzy bloku, więc wskaźniki
+                // nie są dotykane.
+                None => {
+                    args = args
+                        .buf(projections[0].0)
+                        .buf(projections[0].1)
+                        .scalar(0i64)
+                        .scalar(0i64);
+                }
+            }
+        }
+        let args = args.buf(x).scalar(cols as i64);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.device
+            .launch(self.artifacts.get(GEMV_MIXED_GROUP4)?, &cfg, &args, stream)?;
+        Ok(true)
+    }
+
     /// Q4_K GEMV with int8-quantized activations (q8_1) and dp4a dots.
     pub fn gemv_q4_k_dp4a_f16(
         &self,
@@ -13635,6 +13719,32 @@ impl Kernels {
 
     /// Q6_K logit GEMV (f32 out) with dp4a dots.
     #[allow(clippy::too_many_arguments)]
+    /// Q6_K GEMV z aktywacją int8 (q8_1) i iloczynami dp4a, wyjście f16.
+    pub fn gemv_q6_k_dp4a_f16(
+        &self,
+        y: &DevBuffer,
+        w_q6k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_q6_k_dp4a")?;
+        let k = self.artifacts.get("gemv_q6_k_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q6k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     pub fn gemv_q6_k_dp4a_out_f32(
         &self,
         y_f32: &DevBuffer,

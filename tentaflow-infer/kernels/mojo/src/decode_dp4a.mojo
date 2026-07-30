@@ -35,6 +35,10 @@ comptime ROWS_PER_BLOCK = 8
 comptime MAX_HIDDEN = 8192
 # Column bound for the kernels that stage x from GLOBAL memory (plain +
 # residual variants): 16 KiB int8 + 4 KiB scale/sum pairs of shared memory.
+# Zbiór roboczy aktywacji w LDS. NIE podnosić, żeby objąć `ffn_down` (17408
+# kolumn): zmierzone 29,2 -> 28,1 tok/s na Qwen3.6-27B Q4_K_M. Większy bufor
+# zabiera zajętość WSZYSTKIM kernelom dp4a, a `ffn_down` na ścieżce dp4a zyskuje
+# przy tym 0,1 tok/s — bilans wychodzi mocno na minus.
 comptime X_MAX = 16384
 comptime XDS_MAX = X_MAX // 32 * 2
 comptime XDS_HID = MAX_HIDDEN // 32 * 2
@@ -1023,6 +1027,110 @@ def gemv_residual_q6_k_dp4a_f16(
         v = Float32(h_io[row]) + Float32(Float16(total))
         h_io[row] = Float16(v)
         h32[row] = v
+
+@always_inline
+def _dot_mixed_i8(
+    fmt: Int,
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    xq: UnsafePointer[
+        Int8, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    xds: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    lane: Int,
+) -> Float32:
+    """Iloczyn wiersza wagi o formacie wybranym W CZASIE WYKONANIA.
+
+    Format jest staly dla calego bloku (jeden slot = jedna macierz), wiec
+    rozgalezienie jest jednorodne w obrebie fali i nie kosztuje dywergencji.
+    """
+    if fmt == 0:
+        return _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
+    if fmt == 1:
+        return _dot_q6k_i8(w, row, xq, xds, n_cols, lane)
+    return _dot_q8_0_i8(w, row, xq, xds, n_cols, lane)
+
+
+def gemv_mixed_dp4a_group4_f16(
+    y0: UnsafePointer[Float16, MutAnyOrigin],
+    w0: UnsafePointer[UInt8, MutAnyOrigin],
+    rows0: Int,
+    fmt0: Int,
+    y1: UnsafePointer[Float16, MutAnyOrigin],
+    w1: UnsafePointer[UInt8, MutAnyOrigin],
+    rows1: Int,
+    fmt1: Int,
+    y2: UnsafePointer[Float16, MutAnyOrigin],
+    w2: UnsafePointer[UInt8, MutAnyOrigin],
+    rows2: Int,
+    fmt2: Int,
+    y3: UnsafePointer[Float16, MutAnyOrigin],
+    w3: UnsafePointer[UInt8, MutAnyOrigin],
+    rows3: Int,
+    fmt3: Int,
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+):
+    """Do czterech projekcji o ROZNYCH formatach, jednym uruchomieniem.
+
+    Grupowanie dotad wymagalo jednego formatu we wszystkich slotach, a `Q4_K_M`
+    dobiera format PER TENSOR: q/k sa w Q4_K, a v w Q6_K; wejsciowa projekcja
+    DeltaNet w Q6_K, a bramka w Q4_K. Przez to najliczniejsze trojki i czworki
+    projekcji szly pojedynczo, z siatka za waska, zeby wypelnic karte.
+
+    Format slotu: 0 = Q4_K, 1 = Q6_K, 2 = Q8_0. Nieuzyte sloty maja `rows = 0`.
+    Siatka to suma `ceil(rows_i / 8)`. Kwantyzacja aktywacji do LDS jest
+    wspolna, wiec zlozenie jej nie powiela.
+    """
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+
+    var tile = Int(block_idx.x)
+    blocks0 = (rows0 + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK
+    blocks1 = (rows1 + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK
+    blocks2 = (rows2 + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK
+
+    if tile < blocks0:
+        row0 = tile * ROWS_PER_BLOCK + wid
+        if row0 < rows0:
+            t0 = _dot_mixed_i8(fmt0, w0, row0, xq, xds, n_cols, lane)
+            if lane == 0:
+                y0[row0] = Float16(t0)
+        return
+    tile -= blocks0
+    if tile < blocks1:
+        row1 = tile * ROWS_PER_BLOCK + wid
+        if row1 < rows1:
+            t1 = _dot_mixed_i8(fmt1, w1, row1, xq, xds, n_cols, lane)
+            if lane == 0:
+                y1[row1] = Float16(t1)
+        return
+    tile -= blocks1
+    if tile < blocks2:
+        row2 = tile * ROWS_PER_BLOCK + wid
+        if row2 < rows2:
+            t2 = _dot_mixed_i8(fmt2, w2, row2, xq, xds, n_cols, lane)
+            if lane == 0:
+                y2[row2] = Float16(t2)
+        return
+    tile -= blocks2
+    row3 = tile * ROWS_PER_BLOCK + wid
+    if row3 < rows3:
+        t3 = _dot_mixed_i8(fmt3, w3, row3, xq, xds, n_cols, lane)
+        if lane == 0:
+            y3[row3] = Float16(t3)
+
 
 def gemv_q4_k_dp4a_group4_f16(
     y0: UnsafePointer[Float16, MutAnyOrigin],

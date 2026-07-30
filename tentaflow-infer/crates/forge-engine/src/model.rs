@@ -16,6 +16,7 @@ use forge_hal::DEVICE_ALLOC_ALIGN;
 use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
 pub use forge_kernels::Nvfp4GgufLayout;
 use forge_kernels::{
+    MixedQuant,
     nvfp4_ct_physical_m, DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4CtProjection,
     Nvfp4CtS0View, Nvfp4GgufQ8Projection, Q8ActPrepared, Q8PreparedProjection,
 };
@@ -3795,8 +3796,18 @@ impl Model {
                     self.kernels.gemv_q4_k_f16(y, buf, x, *rows, *cols, stream)
                 }
             }
+            // Q6_K przez dp4a tam, gdzie się mieści w oknie aktywacji. Stary
+            // komentarz odradzał tę ścieżkę, ale rozdzielony pomiar pokazał, że
+            // przy NIEZMIENIONYM `X_MAX` jest szybsza: 28,2 -> 28,6 tok/s.
+            // Wcześniejsza regresja pochodziła wyłącznie z podniesienia bufora
+            // aktywacji w LDS, nie z samego dp4a.
             DevWeight::Q6K { buf, rows, cols } => {
-                self.kernels.gemv_q6_k_f16(y, buf, x, *rows, *cols, stream)
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels
+                        .gemv_q6_k_dp4a_f16(y, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels.gemv_q6_k_f16(y, buf, x, *rows, *cols, stream)
+                }
             }
             DevWeight::Q5K { buf, rows, cols } => {
                 self.kernels.gemv_q5_k_f16(y, buf, x, *rows, *cols, stream)
@@ -3993,6 +4004,40 @@ impl Model {
             return Ok(false);
         }
         self.kernels.gemv_q4_k_dp4a_group_f16(&group, x, cols, stream)
+    }
+
+    /// Grupa projekcji o RÓŻNYCH formatach — jedno uruchomienie.
+    ///
+    /// `Q4_K_M` dobiera format per tensor, więc jednorodne grupowanie omijało
+    /// najliczniejsze trójki i czwórki: `q`/`k` w Q4_K obok `v` w Q6_K, oraz
+    /// wejściową projekcję DeltaNet w Q6_K obok bramki w Q4_K.
+    fn gemv_mixed_group(
+        &self,
+        projections: &[(&DevBuffer, &DevWeight)],
+        x: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let mut cols = None;
+        let mut group = Vec::with_capacity(projections.len());
+        for &(output, weight) in projections {
+            let (buf, rows, weight_cols, quant) = match weight {
+                DevWeight::Q4K { buf, rows, cols } => (buf, *rows, *cols, MixedQuant::Q4K),
+                DevWeight::Q6K { buf, rows, cols } => (buf, *rows, *cols, MixedQuant::Q6K),
+                DevWeight::Q8_0 { buf, rows, cols } => (buf, *rows, *cols, MixedQuant::Q8_0),
+                _ => return Ok(false),
+            };
+            if cols.is_some_and(|value| value != weight_cols) {
+                return Ok(false);
+            }
+            cols = Some(weight_cols);
+            group.push((output, buf, rows, quant));
+        }
+        let Some(cols) = cols else { return Ok(false) };
+        if cols > Kernels::DP4A_MAX_COLS {
+            return Ok(false);
+        }
+        self.kernels
+            .gemv_mixed_dp4a_group_f16(&group, x, cols, stream)
     }
 
     fn gemv_nvfp4_gguf_group(
@@ -5137,6 +5182,7 @@ impl Model {
                     let pair = [(bufs.gate, gate), (bufs.up, up)];
                     if !self.gemv_nvfp4_gguf_group(&pair, bufs.x, stream)?
                         && !self.gemv_q4_k_group(&pair, bufs.x, stream)?
+                        && !self.gemv_mixed_group(&pair, bufs.x, stream)?
                     {
                         self.gemv(bufs.gate, gate, bufs.x, stream)?;
                         self.gemv(bufs.up, up, bufs.x, stream)?;
@@ -16038,7 +16084,8 @@ impl Model {
         // h*2*head_dim, gate at h*2*head_dim + head_dim.
         let triple = [(&hb.q_full, wq), (&b.k, wk), (&b.v, wv)];
         let qkv_grouped = self.gemv_nvfp4_gguf_group(&triple, &b.x, stream)?
-            || self.gemv_q4_k_group(&triple, &b.x, stream)?;
+            || self.gemv_q4_k_group(&triple, &b.x, stream)?
+            || self.gemv_mixed_group(&triple, &b.x, stream)?;
         if !qkv_grouped {
             self.gemv(&hb.q_full, wq, &b.x, stream)?;
             self.gemv(&b.k, wk, &b.x, stream)?;
@@ -16190,10 +16237,11 @@ impl Model {
                     }
                 }
             }
-            // Wszystkie cztery w Q4_K: jedna grupa, jedno uruchomienie.
+            // Jedna grupa na wszystkie cztery — najpierw jednorodna, a gdy
+            // formaty się różnią, wariant mieszany.
             if nvfp4.is_empty()
-                && q8.is_empty()
-                && self.gemv_q4_k_group(&projections, x, &self.stream)?
+                && (self.gemv_q4_k_group(&projections, x, &self.stream)?
+                    || self.gemv_mixed_group(&projections, x, &self.stream)?)
             {
                 return Ok(());
             }

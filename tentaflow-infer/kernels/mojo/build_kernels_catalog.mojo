@@ -423,6 +423,7 @@ from src.decode_dp4a import (
     gemv_q8_0_dp4a_f16,
     gemv_q8_0_dp4a_group4_f16,
     gemv_q4_k_dp4a_group4_f16,
+    gemv_mixed_dp4a_group4_f16,
     gemv_q4_k_dp4a_f16,
     gemv_q4_k_dp4a_out_f32,
     gemv_q8_0_dp4a_out_f32,
@@ -442,7 +443,7 @@ from src.decode_dp4a import (
     gemv_residual_q8_0_dp4a_f16,
     gemv_residual_q4_k_dp4a_f16,
 )
-from src.decode_dp4a import gemv_residual_q6_k_dp4a_f16, gemv_q6_k_dp4a_out_f32
+from src.decode_dp4a import gemv_residual_q6_k_dp4a_f16, gemv_q6_k_dp4a_out_f32, gemv_q6_k_dp4a_f16
 from src.gemv2 import gemv_q5_k_f16_v2, gemv_q5_k_out_f32_v2
 from src.gemm import gemm_q5_k_f16, gemm_q5_k_f16_bm64
 from src.decode_fused import (
@@ -2781,6 +2782,11 @@ def main() raises:
         dump_asm=Path("gemv_q4_k_dp4a_group4_f16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_group4_f16"))
+    _ = ctx.compile_function[
+        gemv_mixed_dp4a_group4_f16,
+        dump_asm=Path("gemv_mixed_dp4a_group4_f16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_mixed_dp4a_group4_f16"))
 
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_f16, dump_asm=Path("gemv_q4_k_dp4a_f16.ptx")
@@ -2934,6 +2940,10 @@ def main() raises:
         gemv_q6_k_dp4a_out_f32, dump_asm=Path("gemv_q6_k_dp4a_out_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_out_f32"))
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_f16, dump_asm=Path("gemv_q6_k_dp4a_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_f16"))
 
     _ = ctx.compile_function[
         kv_pack_rot_hd64_b4, dump_asm=Path("kv_pack_rot_hd64_b4.ptx")

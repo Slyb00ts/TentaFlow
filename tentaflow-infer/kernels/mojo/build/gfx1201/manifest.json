@@ -961,6 +961,10 @@
       "entry": "src_gemv2_gemv_iq4_xs_out_f32_6A6A6A6A_35872117f0641189",
       "file": "gemv_iq4_xs_out_f32_v2.hsaco"
     },
+    "gemv_mixed_dp4a_group4_f16": {
+      "entry": "src_decode_dp4a_gemv_mixed_dp46A6A6A6A_5fff29dceaaca265",
+      "file": "gemv_mixed_dp4a_group4_f16.hsaco"
+    },
     "gemv_mxfp4_f16_v2": {
       "entry": "src_gemv2_gemv_mxfp4_f16_v26A6A6A6AoA6A6A_532b8ff992b5cdde",
       "file": "gemv_mxfp4_f16_v2.hsaco"
@@ -1352,6 +1356,10 @@
     "gemv_q6_k_dp4a_batch_out_f32_b8": {
       "entry": "src_decode_dp4a_batch_gemv_q6_6A6A6A6A_16188584a578add4",
       "file": "gemv_q6_k_dp4a_batch_out_f32_b8.hsaco"
+    },
+    "gemv_q6_k_dp4a_f16": {
+      "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_7ccf82b4a2bf38d5",
+      "file": "gemv_q6_k_dp4a_f16.hsaco"
     },
     "gemv_q6_k_dp4a_out_f32": {
       "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_6d5b209d3fd09722",
