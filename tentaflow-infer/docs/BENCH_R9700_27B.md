@@ -21,10 +21,10 @@ llama.cpp: build `3018a11e (109)`, `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201`,
 
 | model | miara | FORGE przed | **FORGE teraz** | llama.cpp | |
 |---|---|--:|--:|--:|---|
-| Q4_K_M | prefill p1024 | 842,9 | **1261,7** | 1027,9 | **FORGE 1,23x** |
+| Q4_K_M | prefill p1024 | 842,9 | **1481,2** | 1027,9 | **FORGE 1,44x** |
 | Q4_K_M | decode tg128 | 27,7 | **27,7** | 27,4 | FORGE 1,01x |
 | Q4_K_M | decode tg128 + MTP | *nie startowało* | **55,8** | brak w llama-bench | 2,01x nad własnym decode |
-| NVFP4 | prefill p1024 | 1013,4 | **1282,2** | 929,0 | **FORGE 1,38x** |
+| NVFP4 | prefill p1024 | 1013,4 | **1311,2** | 929,0 | **FORGE 1,41x** |
 | NVFP4 | decode tg128 | 29,1 | **29,1** | 28,0 | FORGE 1,04x |
 | NVFP4 | decode tg128 + MTP | 66,0 | **66,0** | brak w llama-bench | 2,27x nad własnym decode |
 
@@ -285,67 +285,57 @@ dźwignia to CZYTAĆ MNIEJ BAJTÓW NA TOKEN, czyli akceptacja spekulacji.
 
 Kolejność prac, jaką wyznaczają te liczby:
 
-1. **Wpiąć FP8 w silnik.** Kernel jest zrobiony i sprawdzony (§3.7), wykrycie
-   `fp8_native` dla `gfx12` i routing w launcherze też — `gemm_fp8_tile` wybiera
-   kafel WMMA po obecności artefaktu, bo rodzina `mma` NVIDII i rodzina WMMA mają
-   ten sam kontrakt argumentów. **Ale ścieżka nie startuje na tym modelu i to nie
-   jest kwestia karty**: `build_fp8_ffn` (`fp8mod-ffn`) wymaga KATALOGU
-   checkpointu NVFP4 compressed-tensors, a my mamy GGUF; `build_fp8_modular_auto`
-   obsługuje GGUF, ale odrzuca modele HYBRYDOWE, bo prefill hybrydowy idzie
-   własnym `hybrid_layer_major_prefill`, który o paczkach e4m3 nic nie wie.
-   Brakuje więc budowania paczek e4m3 dla hybrydowego GGUF-a i routingu w tym
-   właśnie prefillu — plus DROGA NA PAMIĘĆ.
+1. **FP8 strumieniowo — ZMIERZONE I ODRZUCONE.** Ścieżka powstała w całości
+   (paker NVFP4->e4m3, dwa gniazda, drugi strumień, zdarzenia `packed`/
+   `consumed`) i dała **970,0 tok/s wobec 1311,2** na NVFP4 p1024, czyli
+   regresję o 26%. Projekcja „0,76 ms przepakowania chowa się za 5,0 ms GEMM-u"
+   była błędna z dwóch powodów naraz:
 
-   `build_fp8_gpu` pakuje z REZYDENTNYCH wag przez `pack_gguf_fp8` i obsługuje
-   Q4_K, Q6_K oraz Q8_0, ale odrzuca warstwę, której mikser nie jest uwagą —
-   czyli wszystkie 48 warstw DeltaNet. FFN (`gate`/`up`/`down`) jest natomiast
-   gęsty w KAŻDEJ warstwie, więc to on jest naturalnym zakresem dla modelu
-   hybrydowego. Trzy warianty rezydencji z policzonym kosztem (model waży
-   15,65 GiB, karta ma 31,8 GiB, pula aktywacji 1,1 GiB):
+   - **Przepakowanie robi tę samą pracę co GEMM, tylko dwa razy.** Paker
+     dekwantyzuje każdą wagę w przebiegu absmax i drugi raz przy kodowaniu, a
+     GEMM rozpakowywał ją raz. Dla `17408 x 5120` to 267 M wartości na projekcję
+     i 3 projekcje na warstwę.
+   - **Drugi strumień niczego nie chowa, bo obie prace są PRZEPUSTOWOŚCIOWE.**
+     Nakładanie ukrywa opóźnienie, nie zajętość. Nie ma wolnych jednostek, w
+     których cień mógłby się zmieścić, więc czas się sumuje: +345 ms
+     przepakowania wobec ~70 ms oszczędności na GEMM-ach.
 
-   | zakres paczek FP8 | VRAM paczek | GEMM przed | GEMM po | prefill | max kontekst |
-   |---|--:|--:|--:|--:|--:|
-   | tylko `ffn_down` | 5,8 GiB | 101 ms | ~45 ms | ~1570 tok/s | ~110k |
-   | `gate` + `up` | 11,6 GiB | 225 ms | ~115 ms | ~1710 tok/s | ~48k |
-   | cały FFN per warstwa, strumieniowo | 0,36 GiB | 326 ms | ~155 ms + 0,76 ms/warstwa | ~1740 synchronicznie, ~1900 z nakładaniem | bez zmian |
+   Sedno jest strukturalne: **każda paczka służy dokładnie jednemu GEMM-owi**,
+   więc jej koszt nigdy się nie amortyzuje. FP8 wygrywa TYLKO jako rezydencja,
+   gdzie pakuje się raz przy ładowaniu i używa w każdym prefillu — a wtedy
+   ogranicza je VRAM (pełna kopia e4m3 FFN to 17,4 GB przy modelu 17 GB na
+   karcie 32 GiB). Realny wariant to rezydencja CZĘŚCIOWA: tyle warstw, ile
+   mieści się w zapasie, bez kosztu przepakowania po rozgrzaniu.
 
-   Wariant strumieniowy jako jedyny nie zabiera kontekstu i jako jedyny skaluje
-   się na większe modele — kosztuje za to podwójnie buforowany scratch i drugi
-   strumień. Przepakowanie warstwy to 417 MB ruchu (0,76 ms) wobec 5,0 ms
-   GEMM-u tej samej warstwy, więc przy nakładaniu chowa się całe. Rezydentna kopia FP8 całego modelu to +11 GiB przy 15,65 GiB Q4_K i
-   32 GiB karty, więc nie wchodzi. Wchodzi **przepakowanie per warstwa do
-   podwójnie buforowanego scratcha na DRUGIM STRUMIENIU**: `pack_q4_k_fp8` już
-   istnieje dla gfx1201, koszt to 278 MB ruchu na warstwę (0,5 ms) wobec 1,7 ms
-   GEMM-u tej samej warstwy — czyli przepakowanie CHOWA SIĘ całkowicie za
-   liczeniem poprzedniej warstwy, a scratch kosztuje 356 MB zamiast 11 GiB.
-   Wymaga bramki jakościowej: e4m3 na wierzchu Q4_K to drugie zaokrąglenie.
-2. **Uwaga prefillu: RDNA4 nigdy nie dostaje flash attention.** Diagnoza jest
-   domknięta i jest to ta sama klasa co „NVIDIA-only", którą już raz zdejmowano
-   z dense prefillu:
-   - `head_dim` przestało być stałą modułu — `attn_prefill_wmma_impl[HD]` ma
-     instancje 128 i 256, launcher wybiera po `head_dim` z deskryptora, a
-     dołożenie kształtu to alias plus wpis w katalogu;
-   - **ale to nie wystarczyło i pomiar to pokazał** (1443,6 -> 1446,7 tok/s,
-     szum): prefill hybrydowy nie woła `attn_prefill`, tylko wybiera backend w
-     `hybrid_layer_major_attention_backend`;
-   - ten wybór schodzi z `Flash` na `Prefill`, bo **artefakt
-     `attn_prefill_fa_mojo_f16_hd256` ma w katalogu zakres `# arch: nvidia`** —
-     na gfx1201 go po prostu nie ma. Stąd 40,8 ms w
-     `attn_prefill_device_pos_f16_hd256`.
+   Z tej pracy ZOSTAJE `pack_nvfp4_gguf_fp8`: paker czyta surowe bloki 36 B GGUF
+   NVFP4 i wkłada `output_scale` tensora w skalę wierszową paczki (GEMM e4m3 nie
+   ma mnożnika wyniku). Jest bramkowany złotym testem
+   `pack_gguf_fp8_matches_cpu_pack` w pięciu wariantach, w tym NVFP4 z
+   mnożnikiem 0,0625. To on jest warunkiem wariantu rezydentnego.
 
-   Wpięcie NIE jest samym routingiem i to jest ostatni ustalony szczegół:
-   `attn_prefill_device_pos_f16_hd256` bierze `base_pos` jako **bufor GPU** (ta
-   pozycja powstaje w poprzednich kernelach chunka), a `attn_prefill_wmma_impl`
-   bierze ją jako **skalar hosta**. Potrzebny jest więc wariant kernela czytający
-   `base_pos[0]` z bufora — zmiana jednego parametru i jednego odczytu, ale
-   wymaga przebudowy katalogu. Sam kafel WMMA jest zbudowany dla gfx1201 i
-   sprawdzony (`tests_amd_q6k_wmma`-owej klasy test złoty przeszedł dla obu
-   instancji HD), więc po tej jednej zmianie zostaje wystawienie go jako backend
-   `Flash` na AMD.
+2. **Uwaga prefillu na kaflu macierzowym — ZROBIONE.** `head_dim` jest
+   parametrem kompilacji (`attn_prefill_wmma_impl[HD]`, instancje 128 i 256), a
+   brakującym ogniwem był kontrakt pozycji bazowej: prefill layer-major podaje
+   ją jako BUFOR GPU, a kafel WMMA brał SKALAR HOSTA. Wariant
+   `attn_prefill_wmma_pos_hd256` czyta `base_pos[0]` i wchodzi w launcherze
+   `attn_prefill_device_pos_f16_hd256`; bez artefaktu zostaje ścieżka skalarna,
+   więc pozostałe karty nic nie tracą.
 
-3. **`deltanet_value_key` 68 ms** to skan rekurencyjny z synchronizacją siatki na
-   token. Chunkowa postać macierzowa (jak w chunked linear attention) zamieniłaby
-   go na GEMM-y — duża zmiana algorytmiczna, ale to jedyna droga poniżej ~60 ms.
+   | model | przed | po |
+   |---|--:|--:|
+   | Q4_K_M p1024 | 1446,7 | **1481,2** |
+   | NVFP4 p1024 | 1295,9 | **1311,2** |
+
+   Suma SHA bez zmian — kafel jest bitowo zgodny ze ścieżką skalarną.
+
+3. **`deltanet_value_key`** — sprawdzona i ODRZUCONA tania hipoteza: skan ma na
+   token dwie redukcje warpowe spięte zależnością `predicted -> delta -> state`,
+   więc wyglądał na ograniczony opóźnieniem. Cztery kolumny na falę zamiast
+   dwóch (cztery przeplatające się łańcuchy zamiast dwóch, wynik bitowo ten sam)
+   dały **1475,2 tok/s wobec 1481,2** — czyli nic, w granicach szumu. Skan nie
+   stoi na ILP redukcji. Zostaje chunkowa postać macierzowa (chunked linear
+   attention), która zamienia go na GEMM-y — duża zmiana algorytmiczna.
+
 4. **Akceptacja draftu MTP na NVFP4** — jedyna przegrana komórka w tabeli.
    Zmierzone, że to NIE jest koszt cyklu: target batchuje T=4 poprawnie (7,4 s
    GPU bez spekulacji wobec 3,7 s z MTP na te same 256 tokenów), a na
