@@ -124,6 +124,28 @@ Stąd biorą się DOKŁADNIE dwie redukcje na warstwę. Nie jest to wybór
 optymalizacyjny, tylko konsekwencja tego, że każda ścieżka przez warstwę ma
 postać: kolumnowa -> lokalne przetwarzanie -> wierszowa -> redukcja.
 
+## Dowód liczbowy: połowa projektu nie wystarcza
+
+`ssm_out` (9,7% odczytu na token) został zaimplementowany jako macierz wierszowo
+równoległa — podział po kolumnach na granicy `d_state`, sumy cząstkowe w f32,
+jedna redukcja. Sama ta zmiana ZMIERZYŁA SIĘ NA MINUS: dekodowanie 38,6 -> 37,0
+tok/s. Kod usunięty.
+
+Rachunek pokazuje dlaczego i jest to ten sam wniosek co wyżej. Dopóki mikser
+DeltaNet liczy się w całości na karcie modelu, `normed` powstaje TAM, więc każda
+z 48 warstw musi najpierw WYSŁAĆ wycinek wejścia i dopiero potem odebrać sumę
+cząstkową: dwie wymiany plus zdarzenia plus redukcja, około 6 dodatkowych
+uruchomień na warstwę. Przy 48 warstwach to ~1,3 ms na token — tyle samo, ile
+warte jest zaoszczędzone 765 MiB odczytu (~1,4 ms).
+
+Przy podziale po GŁOWICACH ranga liczy `normed` swoich głowic SAMA. Wysyłka
+wejścia znika, zostaje wyłącznie redukcja — czyli połowa kosztu przy tym samym
+zysku, i to jeszcze zanim doliczy się oszczędność na projekcjach wejściowych,
+splocie i skanie, które też przestają być liczone dwa razy.
+
+Wniosek praktyczny: `ssm_out` NIE nadaje się do wdrożenia osobno. Jest ostatnim
+krokiem podziału DeltaNet po głowicach i ma sens dopiero razem z nim.
+
 ## Zgodność bitowa
 
 - **Kolumnowo równoległe** (podział wyjścia): każdy element wyniku liczony w

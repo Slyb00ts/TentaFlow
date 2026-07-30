@@ -141,6 +141,11 @@ równoległa, a jej konsument (sampling) nie jest wierszowo równoległy, więc 
 trzeba SKŁADAĆ — patrz ograniczenie reasemblacji w `TENSOR_PARALLEL_DESIGN.md`.
 Kod usunięty.
 
+**Sprawdzone i odrzucone:** `ssm_out` jako osobna macierz wierszowo równoległa
+w dekodowaniu — zmierzone 38,6 -> 37,0 tok/s. Uzasadnienie liczbowe w
+`TENSOR_PARALLEL_DESIGN.md`: dopóki `normed` powstaje na karcie modelu, każda z
+48 warstw płaci wysyłką wejścia, co kasuje oszczędność 9,7% odczytu.
+
 **Pozostała część D:** projekcje DeltaNet w weryfikacji. Blokuje je to samo
 ograniczenie: podział wierszowy `in_proj` daje blok zwarty `[T, wiersze]`, a
 bufor jest token-major, więc przy T>1 trzeba składać. Rozwiązaniem NIE jest
