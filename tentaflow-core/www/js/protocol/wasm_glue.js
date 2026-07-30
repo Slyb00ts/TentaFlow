@@ -4220,6 +4220,39 @@ export function encodeMlStudioModelsListRequest(project_id) {
 }
 
 /**
+ * @param {string} project_id
+ * @param {string} dataset_id
+ * @param {string} attribute
+ * @param {string} source_class
+ * @param {number} epochs
+ * @param {number} batch_size
+ * @param {number} learning_rate
+ * @param {number} synthetic_per_epoch
+ * @param {number} real_repeat
+ * @param {string} target_node_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioOcrTrainStartRequest(project_id, dataset_id, attribute, source_class, epochs, batch_size, learning_rate, synthetic_per_epoch, real_repeat, target_node_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(attribute, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(source_class, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(target_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioOcrTrainStartRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, epochs, batch_size, learning_rate, synthetic_per_epoch, real_repeat, ptr4, len4);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
  * @param {string} name
  * @param {string} description
  * @param {string} project_type
@@ -5055,6 +5088,22 @@ export function encodeMlStudioTabularTrainRequest(project_id, dataset_id, target
     var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v6;
+}
+
+/**
+ * @param {string} run_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioTrainCancelRequest(run_id) {
+    const ptr0 = passStringToWasm0(run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioTrainCancelRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**

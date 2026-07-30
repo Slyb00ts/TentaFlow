@@ -7,6 +7,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import { byId, escapeHtml, escapeAttr, toast, bytesToHex } from '/js/utils.js';
 import { Router } from '/js/router.js';
 import { I18n } from '/js/i18n.js';
@@ -3099,7 +3100,24 @@ const CLF_HP = [
   { key: 'imageSize', label: 'rozmiar obrazu', def: 224, step: '32', min: 96 },
 ];
 
+// Hiperparametry czytnika OCR (CRNN + CTC). `syntheticPerEpoch` to liczba wierszy
+// syntetycznych na epokę (0 = tylko realne odczyty), `realRepeat` ile razy realne
+// wiersze powtarzamy w epoce — ręcznych odczytów jest z natury mało, bez powtórzeń
+// syntetyk by je zdominował.
+const OCR_HP = [
+  { key: 'epochs', label: 'epoki', def: 30, step: '1', min: 1 },
+  { key: 'batchSize', label: 'batch size', def: 64, step: '1', min: 1 },
+  { key: 'learningRate', label: 'learning rate', def: 0.001, step: '0.0001', min: 0 },
+  { key: 'syntheticPerEpoch', label: 'próbki syntetyczne / epokę', def: 20000, step: '1000', min: 0 },
+  { key: 'realRepeat', label: 'powtórzenia realnych', def: 8, step: '1', min: 1 },
+];
+
 const recogCfg = {};
+function defaultOcrHyperparams() {
+  const hp = {};
+  for (const h of OCR_HP) hp[h.key] = h.def;
+  return hp;
+}
 function defaultClfHyperparams() {
   const hp = {};
   for (const h of CLF_HP) hp[h.key] = h.def;
@@ -3113,6 +3131,7 @@ function defaultRecogCfg() {
     datasetId: '', target: 'detection', variant: 'base',
     attribute: '', sourceClass: '', clfVariant: 'mobilenetv4',
     clfHyperparams: defaultClfHyperparams(),
+    ocrAttribute: '', ocrSourceClass: '', ocrHyperparams: defaultOcrHyperparams(),
     targetNodeId: '', earlyStopping: true, hyperparams,
   };
 }
@@ -5372,11 +5391,12 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
     const host = byId('ml-studio-train-target');
     if (!host) return;
     const hasClassifier = trainTargets.some((t) => t.task === 'classifier');
-    const avail = { detection: true, classifier: hasClassifier, ocr: false };
+    const hasOcr = trainTargets.some((t) => t.task === 'ocr');
+    const avail = { detection: true, classifier: hasClassifier, ocr: hasOcr };
     host.innerHTML = ['detection', 'classifier', 'ocr'].map((task) => {
       const on = cfg.target === task;
       const dis = !avail[task];
-      const suffix = task === 'ocr' ? ' (wkrótce)' : '';
+      const suffix = '';
       return `<button type="button" role="tab" data-target="${task}"
         class="ml-studio-target-seg-btn${on ? ' selected' : ''}"
         aria-selected="${on}"${dis ? ' disabled' : ''}>${escapeHtml(TRAIN_TARGET_LABELS[task])}${suffix}</button>`;
@@ -5401,6 +5421,9 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
     if (cfg.target === 'classifier') {
       host.innerHTML = classifierFormHtml();
       bindClassifierForm();
+    } else if (cfg.target === 'ocr') {
+      host.innerHTML = ocrFormHtml();
+      bindOcrForm();
     } else {
       host.innerHTML = detectionFormHtml();
       bindDetectionForm();
@@ -5481,6 +5504,77 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
           <span><strong>Zamroź backbone</strong> — trenuje tylko głowicę klasyfikatora (szybciej, mniej danych)</span>
         </div>
       </section>`;
+  }
+
+  function ocrFormHtml() {
+    const hpInputs = OCR_HP.map((h) => `
+      <div class="ml-studio-ft-hp-field">
+        <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-ocr-hp-${escapeAttr(h.key)}"
+                  value="${escapeAttr(String(cfg.ocrHyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
+      </div>`).join('');
+    return `
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('search')} Atrybut z odczytem
+          <span class="ml-studio-data-hint">wartość atrybutu OCR jest etykietą wierszy tablicy (format &lt;górny&gt;/&lt;dolny&gt;, np. 99/3257)</span>
+        </div>
+        <tf-select id="ml-studio-ocr-attr" label="Atrybut"></tf-select>
+        <tf-select id="ml-studio-ocr-source-class" label="Klasa źródłowa wycinków" style="margin-top:8px"></tf-select>
+        <div id="ml-studio-ocr-labels" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
+        <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
+        <p class="ml-studio-ft-hp-hint">Czytnik uczy się na zatwierdzonych odczytach zmieszanych z wierszami syntetycznymi generowanymi z katalogu ADR wdrożenia. Sam model (CRNN + CTC, wejście 32×128) nie ma wariantów — po treningu Core eksportuje adr_ocr.onnx z alfabetem.</p>
+      </section>`;
+  }
+
+  function ocrTargets() {
+    return trainTargets.filter((t) => t.task === 'ocr');
+  }
+
+  function bindOcrForm() {
+    const attrs = ocrTargets();
+    if (!attrs.length) return;
+    let current = attrs.find((t) => t.attribute === cfg.ocrAttribute) || attrs[0];
+    cfg.ocrAttribute = current.attribute;
+
+    const attrSel = byId('ml-studio-ocr-attr');
+    const attrOpts = attrs.map((t) => ({ value: t.attribute, label: t.attribute }));
+    if (attrSel?.setOptions) attrSel.setOptions(attrOpts, cfg.ocrAttribute);
+
+    const syncSource = () => {
+      current = attrs.find((t) => t.attribute === cfg.ocrAttribute) || attrs[0];
+      const srcSel = byId('ml-studio-ocr-source-class');
+      const srcOpts = [{ value: '', label: 'Wszystkie klasy' }, ...(current.sourceClasses || []).map((c) => ({ value: c, label: c }))];
+      // Domyślnie pierwsza klasa niosąca ten atrybut: OCR ma sens dla KONKRETNEJ
+      // tablicy, a nie dla wycinków wszystkich klas naraz.
+      if (!srcOpts.some((o) => o.value === cfg.ocrSourceClass)) {
+        cfg.ocrSourceClass = (current.sourceClasses || [])[0] || '';
+      }
+      if (srcSel?.setOptions) srcSel.setOptions(srcOpts, cfg.ocrSourceClass);
+      const info = byId('ml-studio-ocr-labels');
+      if (info) {
+        info.innerHTML = `Etykiety bierzemy z atrybutu <strong>${escapeHtml(cfg.ocrAttribute)}</strong>`
+          + ` ramek klasy <strong>${escapeHtml(cfg.ocrSourceClass || 'wszystkich klas')}</strong>`
+          + ' — tylko z obrazów <strong>zatwierdzonych</strong> w edytorze.';
+      }
+    };
+
+    attrSel?.addEventListener('change', (e) => {
+      cfg.ocrAttribute = e.detail?.value || attrSel.value || '';
+      syncSource();
+    });
+    byId('ml-studio-ocr-source-class')?.addEventListener('change', (e) => {
+      cfg.ocrSourceClass = e.detail?.value ?? byId('ml-studio-ocr-source-class').value ?? '';
+      syncSource();
+    });
+    for (const h of OCR_HP) {
+      byId('ml-studio-ocr-hp-' + h.key)?.addEventListener('input', (e) => {
+        const v = Number(e.target.value);
+        if (Number.isFinite(v)) cfg.ocrHyperparams[h.key] = v;
+      });
+    }
+    syncSource();
   }
 
   function clfTargets() {
@@ -5641,6 +5735,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
     trainTargets = deriveTrainTargets(schema, cocoCategories);
     // Jeśli zapamiętany cel nie ma już pokrycia, wróć do detekcji.
     if (cfg.target === 'classifier' && !trainTargets.some((t) => t.task === 'classifier')) cfg.target = 'detection';
+    if (cfg.target === 'ocr' && !trainTargets.some((t) => t.task === 'ocr')) cfg.target = 'detection';
     renderTargetSeg();
     renderTargetForm();
   })();
@@ -5677,6 +5772,24 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
         });
         runId = resp.runId ?? resp.run_id;
         liveOpts = { selectTab, metricLabel: 'macro-F1', statusRequest: 'mlStudioGenericTrainStatusRequest' };
+      } else if (cfg.target === 'ocr') {
+        if (!cfg.ocrAttribute) throw new Error('Wybierz atrybut z odczytem OCR.');
+        const resp = await ApiBinary.one('mlStudioOcrTrainStartRequest', {
+          projectId: pid,
+          datasetId: cfg.datasetId,
+          attribute: cfg.ocrAttribute,
+          sourceClass: cfg.ocrSourceClass,
+          hyperparams: {
+            epochs: cfg.ocrHyperparams.epochs,
+            batchSize: cfg.ocrHyperparams.batchSize,
+            learningRate: cfg.ocrHyperparams.learningRate,
+            syntheticPerEpoch: cfg.ocrHyperparams.syntheticPerEpoch,
+            realRepeat: cfg.ocrHyperparams.realRepeat,
+          },
+          targetNodeId: cfg.targetNodeId || '',
+        });
+        runId = resp.runId ?? resp.run_id;
+        liveOpts = { selectTab, metricLabel: 'exact-match', statusRequest: 'mlStudioGenericTrainStatusRequest' };
       } else {
         const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
           projectId: pid,
@@ -5797,17 +5910,19 @@ function stageLabel(stage) {
   return STAGE_LABEL[s] || stage;
 }
 
-function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', statusRequest = 'mlStudioRecogTrainStatusRequest' } = {}) {
+function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', statusRequest = 'mlStudioRecogTrainStatusRequest', liveTitle = '' } = {}) {
   if (!host) return;
   stopFtPolling();
   // Klasyfikator raportuje przez generyczny status (curve:[{epoch,metricName,value}])
   // i inną metrykę główną (macro-F1); detekcja zostaje przy mAP@50 + train loss.
   const isGeneric = statusRequest !== 'mlStudioRecogTrainStatusRequest';
-  const headTitle = isGeneric ? 'Trening klasyfikatora na żywo' : 'Trening detekcji na żywo';
+  const headTitle = liveTitle || (isGeneric ? 'Trening klasyfikatora na żywo' : 'Trening detekcji na żywo');
   host.innerHTML = `
     <section class="ml-studio-data-card ml-studio-ft-live">
       <div class="ml-studio-data-head">${sprite('cpu')} ${escapeHtml(headTitle)}
         <span class="ml-studio-ft-status" id="ml-studio-recog-badge"><tf-badge tone="warning" value="trening trwa"></tf-badge></span>
+        <span class="tf-toolbar-spacer"></span>
+        <tf-button variant="danger" icon="close" id="ml-studio-recog-cancel">Anuluj trening</tf-button>
       </div>
       <div class="ml-studio-ft-progress">
         <div class="ml-studio-ft-progress-meta" id="ml-studio-recog-meta">epoka 0</div>
@@ -5965,7 +6080,20 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
     if (badge) {
       if (status === 'succeeded') badge.innerHTML = '<tf-badge tone="success" value="zakończony"></tf-badge>';
       else if (status === 'failed') badge.innerHTML = '<tf-badge tone="danger" value="błąd"></tf-badge>';
+      else if (status === 'cancelled') badge.innerHTML = '<tf-badge tone="neutral" value="anulowany"></tf-badge>';
+      else if (status === 'cancelling') badge.innerHTML = '<tf-badge tone="warning" value="anulowanie…"></tf-badge>';
       else badge.innerHTML = '<tf-badge tone="warning" value="trening trwa"></tf-badge>';
+    }
+    // Job domknięty → nie ma czego anulować.
+    const cancelBtn = byId('ml-studio-recog-cancel');
+    if (cancelBtn && ['succeeded', 'failed', 'cancelled'].includes(status)) cancelBtn.hidden = true;
+    if (status === 'cancelled') {
+      stopFtPolling();
+      const done = byId('ml-studio-recog-done');
+      if (done) {
+        done.hidden = false;
+        done.innerHTML = `<div class="ml-studio-ft-done-msg">${sprite('close')} Trening anulowany — model nie powstał.</div>`;
+      }
     }
     if (status === 'succeeded') {
       stopFtPolling();
@@ -5984,6 +6112,32 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
       if (done) { done.hidden = false; done.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(st.error || 'Trening zakończył się błędem.')}</div>`; }
     }
   };
+
+  byId('ml-studio-recog-cancel')?.addEventListener('click', async () => {
+    const btn = byId('ml-studio-recog-cancel');
+    if (!(await confirmDialog({
+      title: 'Anulować trening?',
+      lead: 'Trening zostanie przerwany, a model z tego przebiegu nie powstanie.',
+      consequences: ['Job zwalnia GPU', 'Zebrane epoki przepadają', 'Run zostaje w historii jako anulowany'],
+      confirmLabel: 'Anuluj trening',
+      cancelLabel: 'Zostaw trening',
+      variant: 'danger',
+    }))) return;
+    btn?.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('mlStudioTrainCancelRequest', { runId });
+      if (resp.cancelled === false) {
+        toast('Trening już się zakończył.', 'info');
+      } else {
+        toast('Anulowanie zgłoszone — job zwalnia GPU.', 'success');
+        const badge = byId('ml-studio-recog-badge');
+        if (badge) badge.innerHTML = '<tf-badge tone="warning" value="anulowanie…"></tf-badge>';
+      }
+    } catch (err) {
+      btn?.removeAttribute('disabled');
+      toast(`Anulowanie treningu: ${err.message}`, 'error');
+    }
+  });
 
   const poll = async () => {
     try {

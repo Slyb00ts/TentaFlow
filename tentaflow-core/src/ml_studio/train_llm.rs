@@ -52,6 +52,7 @@ pub fn spawn_ft_training(
     num_gpus: Option<u32>,
 ) {
     tokio::spawn(async move {
+        crate::ml_studio::live_view::register_local_run(&run_id);
         if let Err(err) = run_training(
             &run_id,
             &project_id,
@@ -73,6 +74,8 @@ pub fn spawn_ft_training(
             tracing::warn!(run_id = %run_id, error = %err, "LLM fine-tuning failed");
             let _ = repository::update_training_run_status(&run_id, "failed");
         }
+        crate::ml_studio::live_view::clear_local_job(&run_id);
+        crate::ml_studio::live_view::forget_local_run(&run_id);
     });
 }
 

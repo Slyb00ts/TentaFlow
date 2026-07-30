@@ -12330,7 +12330,10 @@ impl Model {
                     &self.stream,
                 )?;
             }
-            self.device.synchronize()?;
+            // Migawka i ewentualne odtworzenie idą TYM SAMYM strumieniem, więc
+            // kolejność FIFO już gwarantuje, że restore zobaczy komplet kopii.
+            // Pełny drain urządzenia na każdy krok weryfikacji kosztował 11%
+            // bezczynności GPU w śladzie kroku MTP.
             snapshot_ready = true;
             for _ in 0..t {
                 self.kv.grow(seq)?;

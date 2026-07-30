@@ -59,6 +59,7 @@ pub fn spawn_recog_training(
     hyperparams: tentaflow_protocol::MlStudioRecogHyperparams,
 ) {
     tokio::spawn(async move {
+        crate::ml_studio::live_view::register_local_run(&run_id);
         if let Err(err) = run_training(
             &run_id,
             &project_id,
@@ -72,8 +73,9 @@ pub fn spawn_recog_training(
             tracing::warn!(run_id = %run_id, error = %err, "RF-DETR training failed");
             let _ = repository::update_training_run_status(&run_id, "failed");
         }
-        // Sprzątamy wpis live-view niezależnie od wyniku (job już nie żyje).
+        // Sprzątamy wpisy live-view niezależnie od wyniku (job już nie żyje).
         crate::ml_studio::live_view::clear_local_job(&run_id);
+        crate::ml_studio::live_view::forget_local_run(&run_id);
     });
 }
 

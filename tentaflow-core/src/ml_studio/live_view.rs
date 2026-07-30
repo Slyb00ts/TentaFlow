@@ -57,6 +57,44 @@ pub fn local_job(run_id: &str) -> Option<(String, String)> {
         .and_then(|m| m.get(run_id).cloned())
 }
 
+// Runy, których pętla nadzoru żyje W TYM procesie. Marker zakłada się przy starcie
+// taska treningowego — czyli ZANIM serwis przyjmie job i pojawi się wpis w
+// `LOCAL_JOBS` (przygotowanie datasetu potrafi trwać minuty). Dzięki temu brak
+// markera jednoznacznie znaczy „ten proces nie nadzoruje tego runu", co pozwala
+// odróżnić trening w toku od runu OSIEROCONEGO przez restart Core — bez zgadywania
+// po czasie startu.
+static LOCAL_RUNS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn local_runs() -> &'static Mutex<std::collections::HashSet<String>> {
+    LOCAL_RUNS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Zgłasza, że pętla nadzoru runu startuje w tym procesie.
+pub fn register_local_run(run_id: &str) {
+    if let Ok(mut m) = local_runs().lock() {
+        m.insert(run_id.to_string());
+    }
+}
+
+/// Zdejmuje marker po zakończeniu pętli nadzoru (sukces, błąd, anulowanie).
+pub fn forget_local_run(run_id: &str) {
+    if let Ok(mut m) = local_runs().lock() {
+        m.remove(run_id);
+    }
+}
+
+/// Czy ten proces nadzoruje run (marker albo już zarejestrowany job serwisu).
+pub fn is_local_run_live(run_id: &str) -> bool {
+    if local_runs()
+        .lock()
+        .map(|m| m.contains(run_id))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    local_job(run_id).is_some()
+}
+
 // Runy, dla których użytkownik zażądał anulowania. Rejestr jest niezależny od
 // rejestru jobów, bo żądanie może zastać run w KAŻDEJ fazie: pakowania datasetu,
 // transferu przez mesh albo już właściwego treningu. Każda z tych pętli sprawdza

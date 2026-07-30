@@ -3075,6 +3075,7 @@ pub async fn ml_studio_recog_train_status(
     let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
         .ok()
         .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    reconcile_orphan_local_run(&mut run, run_node.as_deref(), &local_node);
     if let Some(node) = run_node.filter(|n| *n != local_node) {
         if run.status == "running" {
             if let Some(iroh) = ctx.state.quic_mesh.clone() {
@@ -3355,6 +3356,38 @@ pub async fn ml_studio_classifier_train_start(
             },
         ),
     ))
+}
+
+/// Domyka run OSIEROCONY przez restart Core. Pętla nadzoru treningu żyje w
+/// procesie, który ją wystartował — po restarcie nikt nie domknie wiersza, a UI
+/// pokazywałoby wieczne „trening trwa" i nie dałoby się nawet anulować (job
+/// serwisu jest nieznany). Warunek jest jednoznaczny, bez heurystyk czasowych:
+/// run lokalny, w stanie `running`, bez markera nadzoru w TYM procesie i bez
+/// transferu datasetu przez mesh w toku. Zwraca `true`, gdy run został domknięty.
+fn reconcile_orphan_local_run(
+    run: &mut repository::TrainingRunRow,
+    run_node: Option<&str>,
+    local_node: &str,
+) -> bool {
+    if run.status != "running" {
+        return false;
+    }
+    if run_node.is_some_and(|n| n != local_node) {
+        return false;
+    }
+    if crate::ml_studio::live_view::is_local_run_live(&run.run_id) {
+        return false;
+    }
+    if crate::ml_studio::train_recognition::recog_sync_progress(&run.run_id).is_some() {
+        return false;
+    }
+    let _ = repository::set_training_run_error(
+        &run.run_id,
+        "trening przerwany przez restart TentaFlow — uruchom go ponownie",
+    );
+    let _ = repository::update_training_run_status(&run.run_id, "failed");
+    run.status = "failed".to_string();
+    true
 }
 
 /// Nazwa atrybutu / klasy / wartości bezpieczna do przekazania serwisowi
@@ -3710,6 +3743,7 @@ pub async fn ml_studio_generic_train_status(
     let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
         .ok()
         .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    reconcile_orphan_local_run(&mut run, run_node.as_deref(), &local_node);
     if let Some(node) = run_node.filter(|n| *n != local_node) {
         if run.status == "running" {
             if let Some(iroh) = ctx.state.quic_mesh.clone() {
