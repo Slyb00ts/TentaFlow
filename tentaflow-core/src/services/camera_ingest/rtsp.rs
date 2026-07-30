@@ -2203,6 +2203,38 @@ pub(super) fn install_branch_input_base_pts_probe(
 /// bo x264enc przesuwa timestampy za sobą o stały offset.
 /// Dekoder jest osobny od Branch A (własny avdec za tee), więc podgląd nie
 /// zakłóca ścieżki detekcji. Ta sama bramka kodeka co passthrough: H.264.
+/// Jedna próba wpięcia gałęzi B (fMP4) dla `publisher`. Wariant wybiera ścieżkę:
+/// MJPEG transkoduje JPEG→H.264, podgląd schodzi do 720p/1,5 Mbit/s (kafelki),
+/// a pojedynczy kafelek do 1080p/4 Mbit/s — przeglądarka nie dekoduje 4K w czasie
+/// rzeczywistym (≈5 fps i rozjechana oś czasu nakładki detekcji).
+fn try_attach_branch_b(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    publisher: &Arc<Mp4StreamPublisher>,
+    is_mjpeg: bool,
+    target_fps: u32,
+) -> std::result::Result<Mp4BranchState, String> {
+    let preview = publisher.is_preview();
+    if is_mjpeg {
+        super::mjpeg::attach_mp4_branch_mjpeg(pipeline, tee, publisher, preview, target_fps)
+    } else if preview {
+        attach_mp4_branch_preview(pipeline, tee, publisher, target_fps, 1280, 1500)
+    } else {
+        attach_mp4_branch_preview(pipeline, tee, publisher, target_fps, 1920, 4000)
+    }
+}
+
+/// Czy odmowa wpięcia gałęzi B jest PRZEJŚCIOWA. `tee` negocjuje caps dopiero gdy
+/// popłynie pierwszy bufor, a subskrypcja z dashboardu trafia zwykle wcześniej:
+/// pipeline jest świeżo zbudowany, RTSP jeszcze się zestawia. Zabicie takiej
+/// subskrypcji czyni podgląd niemożliwym przez cały warmup (a przy flapującym
+/// transporcie — w praktyce zawsze), więc taki publisher czeka na wpięcie zamiast
+/// dostać `mark_unsupported`. Pozostałe odmowy (obcy kodek, błąd budowy muxa) są
+/// trwałe i muszą kończyć subskrypcję natychmiast.
+fn attach_refusal_is_transient(reason: &str) -> bool {
+    reason.contains("caps not yet negotiated")
+}
+
 fn attach_mp4_branch_preview(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
@@ -2839,6 +2871,12 @@ pub async fn run_rtsp_session(
         // nowym pipeline daje nowy init segment i nową bazę PTS.
         let mut branch_b_full: Option<Mp4BranchState> = None;
         let mut branch_b_preview: Option<Mp4BranchState> = None;
+        // Publisher, którego wpięcie odroczono do wynegocjowania caps na `tee`
+        // (patrz `attach_refusal_is_transient`). `Weak`, bo porzucony przez hub
+        // publisher nie może się tu trzymać w nieskończoność — nieudane
+        // `upgrade()` JEST sygnałem, że subskrybent już odszedł.
+        let mut pending_attach_full: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
+        let mut pending_attach_preview: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
         // Słabe referencje do publisherów aktualnie wpiętych gałęzi B. Służą do:
         // (a) zamknięcia strumieni przy rozbiórce pipeline'u, (b) ignorowania
         // przeterminowanych `DetachMp4Branch` od STARYCH publisherów (komenda
@@ -3065,37 +3103,7 @@ pub async fn run_rtsp_session(
                                 );
                                 publisher.mark_unsupported();
                             } else {
-                                // MJPEG transkoduje JPEG → H.264 (x264enc);
-                                // RTSP w pełnej jakości przepakowuje H.264 z RTP
-                                // bez rekompresji, a w podglądzie transkoduje do
-                                // 720p/1,5 Mbit/s (kafelki Live view przez WAN).
-                                let attach_result = if is_mjpeg {
-                                    super::mjpeg::attach_mp4_branch_mjpeg(pipeline, &tee, &publisher, preview, config.target_fps)
-                                } else if preview {
-                                    // Grid tiles: 720p / 1.5 Mbit/s.
-                                    attach_mp4_branch_preview(
-                                        pipeline,
-                                        &tee,
-                                        &publisher,
-                                        config.target_fps,
-                                        1280,
-                                        1500,
-                                    )
-                                } else {
-                                    // Single tile: transcode to 1080p / 4 Mbit/s instead of
-                                    // forwarding raw 4K — the browser could not decode 4K in
-                                    // real time (jumpy ≈5 fps playback that also broke the
-                                    // detection overlay's media-time sync).
-                                    attach_mp4_branch_preview(
-                                        pipeline,
-                                        &tee,
-                                        &publisher,
-                                        config.target_fps,
-                                        1920,
-                                        4000,
-                                    )
-                                };
-                                match attach_result {
+                                match try_attach_branch_b(pipeline, &tee, &publisher, is_mjpeg, config.target_fps) {
                                     Ok(state) => {
                                         tracing::info!(
                                             camera_id = %cam_id,
@@ -3108,6 +3116,29 @@ pub async fn run_rtsp_session(
                                             branch_b_preview_publisher = weak;
                                         } else {
                                             branch_b_full_publisher = weak;
+                                        }
+                                    }
+                                    Err(reason) if attach_refusal_is_transient(&reason) => {
+                                        // Caps jeszcze nie ma — parkujemy publishera i
+                                        // wpinamy go na najbliższym ticku (1 s), gdy
+                                        // popłynie pierwszy bufor. Nowe żądanie zastępuje
+                                        // stare: hub tworzy świeżego publishera przy każdym
+                                        // resubscribe, a stary już nikogo nie karmi.
+                                        tracing::info!(
+                                            camera_id = %cam_id,
+                                            preview,
+                                            reason = %reason,
+                                            "rtsp: branch B attach odroczone — czekam na caps"
+                                        );
+                                        let pending = if preview {
+                                            &mut pending_attach_preview
+                                        } else {
+                                            &mut pending_attach_full
+                                        };
+                                        if let Some(stale) = pending.replace(std::sync::Arc::downgrade(&publisher)) {
+                                            if let Some(stale) = stale.upgrade() {
+                                                stale.mark_unsupported();
+                                            }
                                         }
                                     }
                                     Err(reason) => {
@@ -3200,6 +3231,62 @@ pub async fn run_rtsp_session(
                     }
                     if let Some(reason) = terminate {
                         break Some(reason);
+                    }
+
+                    // Odroczone wpięcia gałęzi B: caps na `tee` pojawiają się po
+                    // pierwszym buforze, więc subskrypcja złożona w trakcie warmupu
+                    // dowiązuje się dopiero tutaj. Bez tego kroku podgląd był
+                    // nieosiągalny dla każdej subskrypcji, która trafiła w świeżo
+                    // zbudowany pipeline — a przy flapującym transporcie RTSP to
+                    // znaczyło: dla każdej.
+                    for preview in [false, true] {
+                        let (pending, slot) = if preview {
+                            (&mut pending_attach_preview, &mut branch_b_preview)
+                        } else {
+                            (&mut pending_attach_full, &mut branch_b_full)
+                        };
+                        let Some(weak) = pending.as_ref() else { continue };
+                        let Some(publisher) = weak.upgrade() else {
+                            // Subskrybent odszedł (hub porzucił źródło) — nie ma
+                            // czego wpinać.
+                            *pending = None;
+                            continue;
+                        };
+                        if slot.is_some() {
+                            // Inny publisher zdążył zająć ten wariant.
+                            publisher.mark_unsupported();
+                            *pending = None;
+                            continue;
+                        }
+                        match try_attach_branch_b(pipeline, &tee, &publisher, is_mjpeg, config.target_fps) {
+                            Ok(state) => {
+                                tracing::info!(
+                                    camera_id = %cam_id,
+                                    preview,
+                                    "rtsp: branch B attached (odroczone wpięcie)"
+                                );
+                                *slot = Some(state);
+                                *pending = None;
+                                let weak = Some(std::sync::Arc::downgrade(&publisher));
+                                if preview {
+                                    branch_b_preview_publisher = weak;
+                                } else {
+                                    branch_b_full_publisher = weak;
+                                }
+                            }
+                            // Caps wciąż nie ma — czekamy dalej (kolejny tick).
+                            Err(reason) if attach_refusal_is_transient(&reason) => {}
+                            Err(reason) => {
+                                tracing::warn!(
+                                    camera_id = %cam_id,
+                                    preview,
+                                    reason = %reason,
+                                    "rtsp: branch B attach refused (po odroczeniu)"
+                                );
+                                publisher.mark_unsupported();
+                                *pending = None;
+                            }
+                        }
                     }
 
                     // On-demand RGB branch (Stage 3, NV12 crops path only): attach
@@ -3668,6 +3755,26 @@ pub fn spawn_rtsp_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Odroczenie wpięcia gałęzi B stoi na ROZPOZNANIU treści odmowy, więc ten
+    /// test wiąże klasyfikator z komunikatem, który realnie produkuje ścieżka
+    /// attach. Zmiana tego napisu bez zmiany klasyfikatora cicho przywróciłaby
+    /// stary błąd: podgląd nieosiągalny przez cały warmup kamery.
+    #[test]
+    fn caps_refusal_is_transient_permanent_ones_are_not() {
+        assert!(attach_refusal_is_transient("tee caps not yet negotiated"));
+        for permanent in [
+            "tee has no sink pad",
+            "unsupported codec: H265",
+            "mux build failed: element factory mp4mux missing",
+            "",
+        ] {
+            assert!(
+                !attach_refusal_is_transient(permanent),
+                "{permanent:?} musi kończyć subskrypcję, nie czekać na caps"
+            );
+        }
+    }
 
     #[test]
     fn test_validate_rtsp_url_accepts_rtsp() {
