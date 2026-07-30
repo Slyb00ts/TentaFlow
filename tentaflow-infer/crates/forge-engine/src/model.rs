@@ -9093,7 +9093,9 @@ impl Model {
         })?;
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
-        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+        // Ścieżka wsadowa idzie przez `self.gemm`, który obsługuje każdy format
+        // wagi; kontrola została, bo reszta catch-upu zakłada Q8_0.
+        let DevWeight::Q8_0 { .. } = &layer.eh_proj else {
             return Err(ForgeError::Unsupported(
                 "batchowy catch-up MTP wymaga eh_proj Q8_0".into(),
             ));
@@ -9181,8 +9183,15 @@ impl Model {
             hidden * 2,
             stream,
         )?;
-        self.kernels
-            .mtp_project_joined_q8_f16(&pb.h, &hv.q_full, eh_proj, t, hidden, stream)?;
+        // Projekcja eh_proj to zwykły GEMM `[t, 2h] x [h, 2h]ᵀ`. Kernel
+        // `mtp_project_joined_q8_f16` bierze siatkę `(h/8, n_tokens)`, czyli
+        // CZYTA CAŁĄ MACIERZ WAG NA KAŻDY TOKEN — dla promptu 4096 to 137,6 ms
+        // zamiast jednego przejścia. Wsadowa ścieżka Q8_0 czyta wagi raz.
+        // Kolejność redukcji jest inna niż w wariancie sekwencyjnym, ale to
+        // PROPOSER: target i tak weryfikuje każdy token, więc wyjście się nie
+        // zmienia — zmienić się może wyłącznie akceptacja.
+        self.gemm(&pb.h, &layer.eh_proj, &hv.q_full, t, stream)?;
+
         self.kernels.rmsnorm_f16(
             &pb.x,
             &pb.h,
@@ -9445,7 +9454,9 @@ impl Model {
         let layer = mtp.layers.first().ok_or_else(|| {
             ForgeError::Unsupported("batchowy catch-up MTP wymaga jednej warstwy".into())
         })?;
-        let DevWeight::Q8_0 { buf: eh_proj, .. } = &layer.eh_proj else {
+        // Ścieżka wsadowa idzie przez `self.gemm`; kontrola formatu została, bo
+        // reszta catch-upu zakłada Q8_0.
+        let DevWeight::Q8_0 { .. } = &layer.eh_proj else {
             return Err(ForgeError::Unsupported(
                 "batchowy catch-up MTP wymaga eh_proj Q8_0".into(),
             ));
@@ -9549,14 +9560,11 @@ impl Model {
             hidden_bytes,
             &self.stream,
         )?;
-        self.kernels.mtp_project_joined_q8_f16(
-            &arena.h,
-            &arena.q_full,
-            eh_proj,
-            t,
-            p.hidden_size,
-            &self.stream,
-        )?;
+        // Zwykły GEMM `[t, 2h] x [h, 2h]ᵀ`. `mtp_project_joined_q8_f16` bierze
+        // siatkę `(h/8, n_tokens)`, czyli CZYTA CAŁĄ MACIERZ WAG NA KAŻDY TOKEN.
+        // Kolejność redukcji jest inna niż w wariancie sekwencyjnym, ale to
+        // PROPOSER — target weryfikuje każdy token, więc wyjście się nie zmienia.
+        self.gemm(&arena.h, &layer.eh_proj, &arena.q_full, t, &self.stream)?;
         self.kernels.rmsnorm_f16(
             &arena.x,
             &arena.h,
