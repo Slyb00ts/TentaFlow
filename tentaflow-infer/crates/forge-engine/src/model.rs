@@ -2708,22 +2708,38 @@ impl Model {
             },
             kv_layer_map,
         )?;
-        let draft_head_mode = std::env::var("FORGE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "q8".into());
+        // `auto` przepakowuje head MTP do NVFP4 WYŁĄCZNIE na propozycje draftu:
+        // czyta o połowę mniej bajtów na token draftu, a target weryfikuje na
+        // oryginalnym Q8_0, więc wyjście zostaje bez zmian. Zmierzone na R9700,
+        // prompt 4672 + odpowiedź 512: 13,36 -> 13,18 s przy akceptacji 2,13 ->
+        // 2,15/krok. Kosztuje kopię headu w puli wag, więc gdy jej nie ma albo
+        // head źródłowy nie jest Q8_0, zostaje Q8_0. Jawne `nvfp4` nie schodzi
+        // po cichu — prośba o konkretny wariant ma być błędem, jeśli się nie da.
+        let draft_head_mode =
+            std::env::var("FORGE_MTP_DRAFT_HEAD").unwrap_or_else(|_| "auto".into());
+        let strict_nvfp4 = draft_head_mode == "nvfp4";
         match draft_head_mode.as_str() {
             "q8" => {}
-            "nvfp4" => {
-                let (source, rows, cols) = match weights.mtp.as_ref().map(|mtp| &mtp.output) {
-                    Some(DevWeight::Q8_0 { buf, rows, cols }) => (buf.clone(), *rows, *cols),
-                    Some(_) => {
+            "nvfp4" | "auto" => {
+                let source = match weights.mtp.as_ref().map(|mtp| &mtp.output) {
+                    Some(DevWeight::Q8_0 { buf, rows, cols }) => Some((buf.clone(), *rows, *cols)),
+                    Some(_) if strict_nvfp4 => {
                         return Err(ForgeError::Unsupported(
                             "FORGE_MTP_DRAFT_HEAD=nvfp4 wymaga headu źródłowego Q8_0".into(),
                         ));
                     }
-                    None => {
+                    None if strict_nvfp4 => {
                         return Err(ForgeError::Unsupported(
                             "FORGE_MTP_DRAFT_HEAD=nvfp4 wymaga modelu z MTP".into(),
                         ));
                     }
+                    _ => None,
+                };
+                // Blok etykietowany zamiast wczesnego `return`: jesteśmy w środku
+                // konstruktora, model jeszcze nie istnieje.
+                'pack: {
+                let Some((source, rows, cols)) = source else {
+                    break 'pack;
                 };
                 let bytes = rows
                     .checked_mul(cols / 64)
@@ -2733,10 +2749,17 @@ impl Model {
                     })?;
                 if let Some(available) = device.pool_available(Pool::Weights) {
                     if bytes > available {
-                        return Err(ForgeError::OutOfMemory {
-                            requested: bytes,
-                            available,
-                        });
+                        if strict_nvfp4 {
+                            return Err(ForgeError::OutOfMemory {
+                                requested: bytes,
+                                available,
+                            });
+                        }
+                        tracing::info!(
+                            "head draftu MTP zostaje Q8_0: brak {bytes} B w puli wag \
+                             (dostępne {available} B)"
+                        );
+                        break 'pack;
                     }
                 }
                 let packed = device.alloc(bytes, MemKind::Device, Pool::Weights)?;
@@ -2753,10 +2776,11 @@ impl Model {
                     cols,
                     layout: Nvfp4GgufLayout::RowMajor36,
                 });
+                }
             }
             value => {
                 return Err(ForgeError::Unsupported(format!(
-                    "FORGE_MTP_DRAFT_HEAD={value}: oczekiwano q8 lub nvfp4"
+                    "FORGE_MTP_DRAFT_HEAD={value}: oczekiwano auto, q8 lub nvfp4"
                 )));
             }
         }
