@@ -37,22 +37,36 @@ zmieniły ani jednego tokena.
 
 ## 2. Realny prompt — jedyny uczciwy pomiar MTP
 
-Ten sam prompt po polsku (pytanie o HBM wobec GDDR), 200 tokenów, `temp 0`,
-szablon czatu po obu stronach. `llama-cli -st` wobec `forge run`. Liczby FORGE to
-sam decode (całość minus prefill 56 tokenów).
+`llama-bench` nie ma trybu spekulatywnego, więc MTP mierzy się osobno. Protokół:
+ten sam prompt po polsku (pytanie o HBM wobec GDDR), 200 tokenów, `temp 0`,
+szablon czatu po obu stronach, `-st` po stronie llama.cpp (bez tego `llama-cli`
+nie kończy tury). llama.cpp: `--spec-type draft-mtp --spec-draft-n-max 3`.
 
 | model | tryb | FORGE | llama.cpp | |
 |---|---|--:|--:|---|
-| Q4_K_M | bez spekulacji | 27,3 | 27,3 | remis |
-| Q4_K_M | MTP K=3 | **37,6** | 36,4 | **FORGE 1,03x** |
-| NVFP4 | bez spekulacji | **28,6** | 27,9 | FORGE 1,03x |
-| NVFP4 | MTP K=3 | 40,6 | **46,4** | llama.cpp 1,14x |
+| Q4_K_M | bez spekulacji | **31,9** | 27,7 | **FORGE 1,15x** |
+| Q4_K_M | MTP K=3 | **48,7** | 43,4 | **FORGE 1,12x** |
+| NVFP4 | bez spekulacji | **33,6** | 28,1 | **FORGE 1,20x** |
+| NVFP4 | MTP K=3 | **56,8** | 54,1 | **FORGE 1,05x** |
 
-Syntetyczny prompt z ziarna tokenizera zawyża MTP po obu stronach (model
-przewiduje sam siebie): stąd 66,0 tok/s w §1 wobec 40,6 tok/s tutaj.
+Liczby FORGE to `tok/s overall`, czyli RAZEM z prefillem 32-tokenowego promptu;
+liczby llama.cpp to samo `Generation`. Przewaga jest więc liczona na niekorzyść
+FORGE — przy prompcie 32 tokenów prefill to poniżej 1% czasu przebiegu.
 
-**Została jedna przegrana komórka w całej tabeli: MTP na NVFP4.** Rozbicie
-poniżej pokazuje, że nie jest to koszt cyklu, tylko akceptacja draftu.
+**Wszystkie cztery komórki wygrywają.** Poprzednia wersja tego dokumentu
+notowała MTP na NVFP4 jako jedyną przegraną (40,6 wobec 46,4) i wskazywała
+akceptację draftu jako przyczynę. Pomiar tego nie potwierdza:
+
+| model | akceptacja | tokeny na forward |
+|---|--:|--:|
+| Q4_K_M | 1,96/krok | 2,96x |
+| NVFP4 | 1,87/krok | 2,87x |
+
+Akceptacja jest praktycznie taka sama dla obu kwantyzacji i daleko od notowanych
+wcześniej 1,35/krok — czyli hipoteza „słaby proposer na NVFP4" nie ma podstaw.
+Stara liczba nie jest odtwarzalna z obecnego drzewa i była zbierana przy innym
+obramowaniu promptu (56 tokenów zamiast 32), więc nie przypisuję poprawy
+konkretnej zmianie; przypisuję ją protokołowi pomiaru.
 
 ## 3. Optymalizacja prefillu — co dało ile
 
@@ -336,15 +350,11 @@ Kolejność prac, jaką wyznaczają te liczby:
    stoi na ILP redukcji. Zostaje chunkowa postać macierzowa (chunked linear
    attention), która zamienia go na GEMM-y — duża zmiana algorytmiczna.
 
-4. **Akceptacja draftu MTP na NVFP4** — jedyna przegrana komórka w tabeli.
-   Zmierzone, że to NIE jest koszt cyklu: target batchuje T=4 poprawnie (7,4 s
-   GPU bez spekulacji wobec 3,7 s z MTP na te same 256 tokenów), a na
-   syntetycznym prompcie przyspieszenie zgadza się z tym stosunkiem. Sprawdzone i
-   ODRZUCONE dwie gotowe dźwignie: tańsza głowa draftu
-   (`FORGE_MTP_DRAFT_HEAD=nvfp4`) podnosi akceptację 1,35 -> 1,44/krok, ale
-   przebieg jest wolniejszy (5,78 s wobec 4,97 s), a K=2 wobec K=3 to remis
-   (4,93 wobec 4,96 s). Zostaje jakość samego proposera — to wymaga porównania
-   propozycji token po tokenie z llama.cpp, nie kolejnego pomiaru przepustowości.
+4. **Akceptacja draftu MTP na NVFP4 — ZAMKNIĘTE, nie było czego naprawiać.**
+   Przemierzone na jednym protokole (§2): akceptacja to 1,87/krok na NVFP4 i
+   1,96/krok na Q4_K, czyli praktycznie tyle samo, a NVFP4 z MTP wygrywa z
+   llama.cpp 56,8 wobec 54,1. Lekcja jest o pomiarze, nie o kernelu: „przegrana
+   komórka" pochodziła z porównania dwóch różnie obramowanych przebiegów.
 5. Rozsunięcie LDS i kafel BN=128 wpisano do Q4_K, Q6_K i NVFP4. **Q2_K, Q3_K i
    Q5_K mają ten sam defekt** i czekają na własny pomiar — ten checkpoint ich nie
    używa.
