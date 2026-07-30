@@ -1,5 +1,12 @@
 # Zrównoleglenie na wiele kart — plan oparty na pomiarze
 
+> **Status: ten podział jest PROTEZĄ.** Jest asymetryczny (karta 0 „jest
+> modelem", karta 1 pomaga w wybranych miejscach wywołania), więc każda ścieżka
+> wymaga osobnego wpięcia i każde wpięcie może być martwe. Docelowa architektura
+> — SPMD z podziałem raz przy ładowaniu i dwiema redukcjami na warstwę, tak jak
+> robi to vLLM — jest w `TENSOR_PARALLEL_DESIGN.md` i ZASTĘPUJE to, co niżej.
+> Pomiary poniżej zostają, bo są prawdziwe i wyznaczają punkt odniesienia.
+
 Stanowisko: dwie Radeon AI PRO R9700 (`gfx1201`, 32 GiB każda), model
 ThinkingCap-Qwen3.6-27B (`qwen35`): **gęsty** (bez MoE), ale **hybrydowy** —
 48 warstw Gated-DeltaNet + 16 warstw uwagi + 1 blok MTP.
