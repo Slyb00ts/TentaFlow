@@ -2897,8 +2897,20 @@ pub async fn run_rtsp_session(
         // (patrz `attach_refusal_is_transient`). `Weak`, bo porzucony przez hub
         // publisher nie może się tu trzymać w nieskończoność — nieudane
         // `upgrade()` JEST sygnałem, że subskrybent już odszedł.
-        let mut pending_attach_full: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
-        let mut pending_attach_preview: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
+        // Para: publisher czekający na wpięcie + moment zaparkowania (do wykrycia
+        // czekania, które trwa podejrzanie długo).
+        let mut pending_attach_full: Option<(std::sync::Weak<Mp4StreamPublisher>, tokio::time::Instant)> =
+            None;
+        let mut pending_attach_preview: Option<(
+            std::sync::Weak<Mp4StreamPublisher>,
+            tokio::time::Instant,
+        )> = None;
+        // Po tylu sekundach czekania na caps mówimy o tym GŁOŚNO. `tee` dostaje
+        // caps od pierwszego bufora RTP, więc długie czekanie nie znaczy „zaraz
+        // będzie" tylko „kamera nie dostarcza ani jednego pakietu" — bez tego
+        // ostrzeżenia log pokazywał jedynie ciszę i ponawiane subskrypcje.
+        const PENDING_ATTACH_STALL: Duration = Duration::from_secs(15);
+        let mut pending_stall_logged = [false, false];
         // Słabe referencje do publisherów aktualnie wpiętych gałęzi B. Służą do:
         // (a) zamknięcia strumieni przy rozbiórce pipeline'u, (b) ignorowania
         // przeterminowanych `DetachMp4Branch` od STARYCH publisherów (komenda
@@ -3160,7 +3172,10 @@ pub async fn run_rtsp_session(
                                         } else {
                                             &mut pending_attach_full
                                         };
-                                        if let Some(stale) = pending.replace(std::sync::Arc::downgrade(&publisher)) {
+                                        if let Some((stale, _)) = pending.replace((
+                                            std::sync::Arc::downgrade(&publisher),
+                                            tokio::time::Instant::now(),
+                                        )) {
                                             if let Some(stale) = stale.upgrade() {
                                                 stale.mark_unsupported();
                                             }
@@ -3270,7 +3285,8 @@ pub async fn run_rtsp_session(
                         } else {
                             (&mut pending_attach_full, &mut branch_b_full)
                         };
-                        let Some(weak) = pending.as_ref() else { continue };
+                        let Some((weak, parked_at)) = pending.as_ref() else { continue };
+                        let waiting = parked_at.elapsed();
                         let Some(publisher) = weak.upgrade() else {
                             // Subskrybent odszedł (hub porzucił źródło) — nie ma
                             // czego wpinać.
@@ -3288,12 +3304,14 @@ pub async fn run_rtsp_session(
                                 tracing::info!(
                                     camera_id = %cam_id,
                                     preview,
+                                    waited_ms = waiting.as_millis() as u64,
                                     "rtsp: branch B attached (odroczone wpięcie)"
                                 );
                                 // Tu reset budżetu jest KRYTYCZNY: odroczenie mogło
                                 // trwać sekundy, a bez niego publisher umierał tuż
                                 // po wpięciu.
                                 publisher.mark_branch_attached();
+                                pending_stall_logged[usize::from(preview)] = false;
                                 *slot = Some(state);
                                 *pending = None;
                                 let weak = Some(std::sync::Arc::downgrade(&publisher));
@@ -3303,8 +3321,23 @@ pub async fn run_rtsp_session(
                                     branch_b_full_publisher = weak;
                                 }
                             }
-                            // Caps wciąż nie ma — czekamy dalej (kolejny tick).
-                            Err(reason) if attach_refusal_is_transient(&reason) => {}
+                            // Caps wciąż nie ma — czekamy dalej (kolejny tick). Gdy
+                            // czekanie się przeciąga, mówimy o tym RAZ: `tee` bierze
+                            // caps z pierwszego bufora RTP, więc to nie jest „zaraz
+                            // będzie", tylko „kamera nie dostarcza ani pakietu".
+                            Err(reason) if attach_refusal_is_transient(&reason) => {
+                                let logged = &mut pending_stall_logged[usize::from(preview)];
+                                if !*logged && waiting >= PENDING_ATTACH_STALL {
+                                    *logged = true;
+                                    tracing::warn!(
+                                        camera_id = %cam_id,
+                                        preview,
+                                        waiting_s = waiting.as_secs(),
+                                        reason = %reason,
+                                        "rtsp: gałąź B czeka na caps — brak danych z kamery na tee"
+                                    );
+                                }
+                            }
                             Err(reason) => {
                                 tracing::warn!(
                                     camera_id = %cam_id,

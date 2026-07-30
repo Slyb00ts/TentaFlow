@@ -35,7 +35,17 @@ const MAX_RESUBSCRIBE_ATTEMPTS = 6;
 // subskrypcje jak nieudana — pelny reset pipeline'u + retry z backoffem. Lapie
 // kazdy przypadek cichej smierci (np. SubscribeResponse bez danych, zawieszony
 // handler po stronie serwera).
-const NO_DATA_WATCHDOG_MS = 6000;
+//
+// Wartosc MUSI przekraczac najgorszy legalny czas przygotowania po stronie
+// serwera, inaczej klient zrywa subskrypcje TUZ PRZED danymi i nic nigdy nie
+// dolatuje. Hub odsyla `SubscribeResponse` dopiero z gotowym init segmentem, a
+// serwer daje na to 10 s (`INIT_SEGMENT_TIMEOUT`), restartowane w momencie
+// wpiecia galezi B — czyli do ~20 s, gdy galaz czeka na wynegocjowanie caps
+// zimnej kamery. Zmierzone na produkcji: attach po 7,5 s, init segment 3 s
+// pozniej; przy 6 s klient zrywal w 53. sekundzie to, co serwer konczyl w 58.
+// Dluga wartosc nie opoznia realnych awarii: serwer i tak konczy w swoim budzecie
+// i odsyla blad, ktory leci przez `_onSubscriptionError` bez czekania na ten timer.
+const NO_DATA_WATCHDOG_MS = 25000;
 
 // Twardy limit dlugosci kolejki appendow do SourceBuffera. Gdy dekoder nie
 // nadaza (karta w tle, wolny sprzet), WebSocket dalej dostarcza chunki i
