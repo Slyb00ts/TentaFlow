@@ -151,19 +151,91 @@ Przy okazji usunięty został predykat `Kernels::int8_batch_activations()`: mów
 „na AMD batch kwantyzuje aktywacje", co po wejściu kafli WMMA przestało być
 prawdą, a jedyne żywe użycie było właśnie w tej referencji.
 
-### 3.5 Wynik
+### 3.5 Roofline karty — zmierzony, nie z papieru
+
+Bez tych liczb nie da się powiedzieć, czy kernel jest szybki. Wszystkie zmierzone
+na tej R9700 (`bench-amd/bench_wmma_gfx11.mojo`, `bench_roofline_gfx.mojo`):
+
+| jednostka | przepustowość | wobec f16 |
+|---|--:|--:|
+| f16 WMMA 16x16x16 | 179 TFLOPS | 1,0x |
+| int8 WMMA 16x16x16 | 357 TOPS | 2,0x |
+| **fp8 WMMA 16x16x16** | **378 TFLOPS** | **2,1x** |
+| **iu4 WMMA 16x16x32** | **743 TOPS** | **4,2x** |
+| odczyt DRAM | 551 GB/s | |
+| odczyt Infinity Cache (64 MiB) | 1828 GB/s | 3,3x DRAM |
+
+`iu4` sprawdzony na przypadku ujemnym (−32 zamiast cichego 15 wariantu bez znaku).
+
+### 3.6 Gdzie naprawdę jest sufit kafla f16
+
+Kafel Q4_K liczy 73–104 TFLOPS zależnie od kształtu. Trzy pomiary rozstrzygają,
+co go trzyma — i dwa pierwsze obalają hipotezy, które wyglądały oczywiście:
+
+1. **Dekwantyzacja nie kosztuje nic.** Ten sam kafel na wagach JUŻ w f16 daje
+   97 TFLOPS wobec 97–104 dla Q4_K. Rozpakowanie superbloku chowa się całkowicie
+   za mnożeniami.
+2. **To nie jest ruch globalny.** Fragment `a` czyta szesnaście wierszy odległych
+   o `n_cols * 2` bajtów (10 KB), czyli zupełnie nieskoalescowanie — ale
+   przepuszczenie aktywacji przez LDS jest DWA RAZY WOLNIEJSZE (35–67 TFLOPS).
+3. **To ściana rejestrów.** Kafel ma 189 z 256 VGPR: 16 akumulatorów po 8 f32 to
+   128, a każdy fragment f16 zajmuje 8. Każda zmiana, która potrzebuje więcej —
+   potokowanie odczytu następnego podkroku (18 TFLOPS), MTILE=8 (17 TFLOPS) —
+   kończy się zrzutem rejestrów. Sama instrukcja nie jest winna: mikrobenchmark
+   z szesnastoma niezależnymi akumulatorami trzyma 180 TFLOPS.
+
+**Wniosek: f16 nie da się poprawić kafelkowaniem, a formaty z blokową skalą nie
+pomogą.** Przy skali zmieniającej się co 32 kolumny (Q4_K, Q6_K, NVFP4)
+akumulator int32 trzeba zrzucić do f32 w środku pętli: dla `iu4` to około 26
+cykli na kafel wobec 13,6 cyklu samej instrukcji, czyli mimo 4,2x szybszej
+instrukcji rachunek wychodzi gorzej niż f16. Dlatego wcześniejsza próba
+`gemm_q4_k_i8wmma` wyszła 3,3x wolniej — i dlatego kolejna próba w tę stronę też
+by wyszła.
+
+### 3.7 FP8 zdejmuje ścianę
+
+`src/gemm_fp8_wmma.mojo` ma tę samą geometrię, ale fragment operandu zajmuje
+**2 VGPR zamiast 8**, a skale są per wiersz wagi i per token — czyli stałe wzdłuż
+K, więc w pętli wewnętrznej NIE MA żadnego zrzucania akumulatora. Zmierzone
+(TFLOPS, T=1024):
+
+| kształt | kafel f16 | **fp8 BM512/BN128** | **fp8 BM256/BN128** |
+|---|--:|--:|--:|
+| 17408x5120 (`ffn_gate`/`ffn_up`) | 97 | **203** | 172 |
+| 5120x6144 (`ssm_out`) | 79 | 139 | **184** |
+
+**2,1–2,3x na najgrubszym kernelu prefillu**, przy błędzie względnym 1,5e-5 wobec
+referencji hosta (test złoty `tests_amd_fp8_wmma.mojo`, trzy kafle). To jest
+pierwsza wersja, bez potokowania — na które teraz jest miejsce w rejestrach.
+
+### 3.8 Wynik
 
 | krok | Q4_K_M prefill | NVFP4 prefill |
 |---|--:|--:|
 | stan wyjściowy | 842,9 | 1013,4 |
 | WMMA dla Q6_K | 975,8 | — |
 | rozsunięcie LDS | 1008,9 | 1036,1 |
-| kafel BN=128 | **1261,7** | **1282,2** |
-| **razem** | **+49,7%** | **+26,5%** |
-| **wobec llama.cpp** | **1,23x** | **1,38x** |
+| kafel BN=128 | 1261,7 | 1282,2 |
+| DeltaNet równolegle po tokenach + wąskie kafle | **1442,4** | 1283,8 |
+| **razem** | **+71,1%** | **+26,7%** |
+| **wobec llama.cpp** | **1,40x** | **1,38x** |
 
 Suma SHA 128 wygenerowanych tokenów jest przez całą tę drogę ta sama
 (`0bf2b86b…`) i identyczna dla obu kwantyzacji.
+
+### 3.9 DeltaNet: 8,8x z samego kształtu siatki
+
+`deltanet_prepare_dynamic_f16` miał JEDEN BLOK NA GŁOWĘ i przechodził wszystkie
+tokeny w pętli — dla 27B to 64 bloki na karcie o 64 CU, czyli dwie fale na SIMD
+przy 1024 iteracjach szeregowo. Tymczasem jedyna zależność między tokenami to
+przyczynowy splot o oknie `d_conv - 1`, którego wejście już leży w pamięci.
+Druga oś siatki (32 tokeny na blok) daje 3036 -> 346 us na warstwę, **bitowo ten
+sam wynik** (0 rozbieżnych wartości), czyli 135 -> 17 ms w prefillu.
+
+Tą samą drogą poszły wąskie projekcje: bramki `ssm_alpha`/`ssm_beta` mają 48
+wierszy, a kafel prefillowy pokrywa 128, więc dostawały DWA bloki robocze na całą
+kartę — 222 us na wywołanie, 96 wywołań, 21 ms zmarnowane. Mały kafel ma tam 32
+bloki: 21 -> 8,9 ms.
 
 ## 4. MTP dla Q4_K_M — czego brakowało
 
@@ -194,41 +266,58 @@ tensory są w innych formatach niż w wariancie NVFP4:
    (`OUT: DType`, wzorzec z `gemm_dot.mojo`), więc matematyka i odczyt wag są te
    same — test złoty wiąże go wprost z wariantem f16.
 
-## 5. Czego jeszcze brakuje
+## 5. Co dalej — z pomiarem, nie z intuicji
 
-1. **Akceptacja draftu MTP na NVFP4** — jedyna przegrana komórka. Zmierzone, a
-   nie zgadnięte, że to NIE jest koszt cyklu:
-   - target batchuje T=4 poprawnie: profil `rocprofv3` daje 7,4 s GPU na 256
-     tokenów bez spekulacji i 3,7 s z MTP na te same 256 tokenów, czyli praca
-     targetu na token spada 2,8x (20 -> 7,2 ms);
-   - na syntetycznym prompcie przyspieszenie (2,27x) zgadza się z tym stosunkiem,
-     na realnym wychodzi 1,42x — różnicę robi WYŁĄCZNIE akceptacja (2,35 wobec
-     ~3,9 tokena na forward);
-   - `FORGE_MTP_DRAFT_HEAD=nvfp4` podnosi akceptację (1,35 -> 1,44/krok), ale
-     przebieg jest WOLNIEJSZY (5,78 s wobec 4,97 s) — tańsza głowa draftu nie
-     jest tu dźwignią;
-   - K=2 wobec K=3 to remis (4,93 s wobec 4,96 s), więc długość draftu też nie.
+**Decode jest domknięty sprzętowo.** 16,8 GB wag na token w 33,6 ms to 500 GB/s
+z osiągalnych 551 — **91% roofline'u DRAM**. Nie ma tam czego kafelkować: jedyna
+dźwignia to CZYTAĆ MNIEJ BAJTÓW NA TOKEN, czyli akceptacja spekulacji.
 
-   Zostaje jakość samego proposera MTP. llama.cpp wyciąga na tym pliku 1,66x
-   wobec naszych 1,42x przy tej samej głowie NextN, więc różnica siedzi w tym,
-   ILE tokenów draftu przechodzi weryfikację, a nie w tym, ile kosztuje jeden
-   cykl. To jest następny odcinek do zrobienia i wymaga porównania samych
-   propozycji token po tokenie, a nie kolejnego pomiaru przepustowości.
-2. **Kafle WMMA stoją na ~55% szczytu karty** (100 TFLOPS wobec zmierzonych 179
-   TFLOPS f16 WMMA; int8 WMMA ma 354 TOPS). Jednostka int8 nie jest tu prostym
-   zyskiem: skala Q4_K/Q6_K zmienia się co 32 kolumny, więc akumulator int32
-   trzeba zrzucać do f32 co dwie instrukcje, a to zjada przewagę — dlatego
-   wcześniejsza próba `gemm_q4_k_i8wmma` wyszła 3,3x wolniej. Realna droga to
-   `v_wmma_i32_16x16x32_iu4`: K=32 to dokładnie jeden podblok skali, czyli jedno
-   zrzucenie na instrukcję.
-3. Po zamianie kafla Q6_K na WMMA rozkład prefillu Q4_K to `gemm_q4_k_wmma`
-   60,9%, `deltanet_prepare` 14,3%, `gemm_q6_k_wmma` 12,5%, `deltanet_value_key`
-   6,8%, uwaga 4,2%. **DeltaNet jest teraz drugim kosztem** i nie był jeszcze
-   dotykany na tej karcie.
-4. Rozsunięcie LDS i kafel BN=128 wpisano do Q4_K, Q6_K i NVFP4. **Q2_K, Q3_K i
+**Prefill po tych zmianach** (per przebieg, Q4_K_M, T=1024):
+
+| kernel | ms | udział |
+|---|--:|--:|
+| `gemm_q4_k_wmma` | 438,7 | 62% |
+| `gemm_q6_k_wmma` | 101,2 | 14% |
+| `deltanet_value_key` (skan) | 68,0 | 9,6% |
+| `attn_prefill` | 41,0 | 5,8% |
+| `deltanet_prepare` | 17,1 | 2,4% |
+| reszta | ~34 | 5% |
+
+Kolejność prac, jaką wyznaczają te liczby:
+
+1. **Wpiąć FP8 w silnik.** Kernel jest zrobiony i sprawdzony (§3.7), brakuje
+   trzech rzeczy: wykrycia `fp8_native` w HAL dla gfx12 (dziś zaszyte na `false`
+   dla każdej karty HIP), routingu w launcherze oraz — to jest sedno — DROGI NA
+   PAMIĘĆ. Rezydentna kopia FP8 całego modelu to +11 GiB przy 15,65 GiB Q4_K i
+   32 GiB karty, więc nie wchodzi. Wchodzi **przepakowanie per warstwa do
+   podwójnie buforowanego scratcha na DRUGIM STRUMIENIU**: `pack_q4_k_fp8` już
+   istnieje dla gfx1201, koszt to 278 MB ruchu na warstwę (0,5 ms) wobec 1,7 ms
+   GEMM-u tej samej warstwy — czyli przepakowanie CHOWA SIĘ całkowicie za
+   liczeniem poprzedniej warstwy, a scratch kosztuje 356 MB zamiast 11 GiB.
+   Wymaga bramki jakościowej: e4m3 na wierzchu Q4_K to drugie zaokrąglenie.
+2. **`attn_prefill` idzie ścieżką skalarną.** Kernel WMMA flash attention pokrywa
+   `head_dim == 128`, a ten model ma 256 — czyli 41 ms liczy się na `dot2`
+   (~5 TFLOPS). Rozszerzenie zakresu na 256 to czysty, ograniczony zysk.
+3. **`deltanet_value_key` 68 ms** to skan rekurencyjny z synchronizacją siatki na
+   token. Chunkowa postać macierzowa (jak w chunked linear attention) zamieniłaby
+   go na GEMM-y — duża zmiana algorytmiczna, ale to jedyna droga poniżej ~60 ms.
+4. **Akceptacja draftu MTP na NVFP4** — jedyna przegrana komórka w tabeli.
+   Zmierzone, że to NIE jest koszt cyklu: target batchuje T=4 poprawnie (7,4 s
+   GPU bez spekulacji wobec 3,7 s z MTP na te same 256 tokenów), a na
+   syntetycznym prompcie przyspieszenie zgadza się z tym stosunkiem. Sprawdzone i
+   ODRZUCONE dwie gotowe dźwignie: tańsza głowa draftu
+   (`FORGE_MTP_DRAFT_HEAD=nvfp4`) podnosi akceptację 1,35 -> 1,44/krok, ale
+   przebieg jest wolniejszy (5,78 s wobec 4,97 s), a K=2 wobec K=3 to remis
+   (4,93 wobec 4,96 s). Zostaje jakość samego proposera — to wymaga porównania
+   propozycji token po tokenie z llama.cpp, nie kolejnego pomiaru przepustowości.
+5. Rozsunięcie LDS i kafel BN=128 wpisano do Q4_K, Q6_K i NVFP4. **Q2_K, Q3_K i
    Q5_K mają ten sam defekt** i czekają na własny pomiar — ten checkpoint ich nie
    używa.
-5. `test_catalog_matches_committed_manifest` jest CZERWONY dla `gfx1100` i był
-   czerwony już przed tą pracą (`gemm_q8_0_wmma_128x128` z poprzedniej sesji):
-   zestaw 7900 XT wymaga przebudowania na tej karcie, a jej nie ma w maszynie.
-   gfx1201 przechodzi.
+6. `test_catalog_matches_committed_manifest` jest CZERWONY dla `gfx1100` i
+   `gfx1030` i był czerwony już przed tą pracą (`gemm_q8_0_wmma_128x128` z
+   poprzedniej sesji). Przyczyna jest strukturalna: HSACO jest związany z
+   architekturą, więc katalog danej karty da się zbudować TYLKO na niej, a 7900 XT
+   i 6900 XT nie ma już w maszynie. Kernele przenośne dodane w tej pracy
+   (`gather_q4_k_*`, `deltanet_prepare_tokens_f16_t32`,
+   `gemv_q6_k_dp4a_batch_out_f32_*`) należą do wszystkich zestawów i trafią tam
+   przy najbliższym buildzie na tamtych kartach. gfx1201 przechodzi.
