@@ -239,8 +239,13 @@ kamera orbitalna, kolizje, HUD, zapis wyniku), 1536 wygenerowanych tokenów kodu
 | Q4_K_M | MTP K=3 | **876** | 714 | **1,23x** | 44,9 | **45,9** | 0,98x |
 
 Prefill wygrywa w KAŻDEJ komórce, decode bez spekulacji w obu modelach; decode z
-MTP to remis na Q4_K i przegrana na NVFP4. Prefill jest nieco niższy przy
-włączonym MTP, bo dochodzi catch-up głowy MTP przez prompt.
+MTP to remis na Q4_K i przegrana na NVFP4.
+
+**Uwaga o kolumnie prefillu: te liczby są WYPROWADZONE i zaniżone dla trybu MTP.**
+Prefill FORGE liczyłem jako `331 / (T_1 - 1/decode)`, ale przy MTP pierwszy krok
+to pełna weryfikacja (~53 ms), a nie `1/51,5 s = 19 ms`. Odjąłem o ~34 ms za
+mało, więc spadek prefillu przy MTP jest w tej tabeli sztucznie zawyżony. Pomiar
+FAZAMI z `forge bench` (§2d) pokazuje prawdziwy obraz.
 
 **Akceptacja zależy od PROMPTU, nie od kwantyzacji.** Na tym zadaniu NVFP4 daje
 1,83/krok a Q4_K 2,11 — dokładnie ODWROTNIE niż na streszczeniu (2,15 wobec
@@ -293,6 +298,46 @@ miksera jednotokenowego, tylko `deltanet_prepare_f16`, który ma podział QKV or
 L2/repeat JUŻ SCALONE w jednym kernelu, i dzieli kwantyzację aktywacji przez
 `prepare_q8_1`. Dlatego miała 171 kopii na krok, nie 430 — czyli ta klasa błędu
 była tam naprawiona od początku.
+
+## 2d. Ile naprawdę kosztuje MTP przy prompcie
+
+`forge bench` raportuje fazy osobno, więc nie trzeba nic wyprowadzać. p1024:
+
+| model | prefill bez MTP | prefill z MTP | | catch-up MTP | TTFT bez -> z MTP |
+|---|--:|--:|--:|--:|--:|
+| NVFP4 | 1323,1 | 1310,7 | -0,9% | 34,4 -> **3,5 ms** | 781 -> 823 -> **805 ms** |
+| Q4_K_M | 1461,1 | 1449,6 | -0,8% | 34,3 -> **3,5 ms** | 707 -> 747 -> **720 ms** |
+
+**Sam prefill spada o 0,9%**, czyli tyle samo co u llama.cpp (-1,4%). Cały koszt
+MTP przy prompcie siedział w OSOBNEJ fazie catch-upu, która dokłada się do TTFT,
+a nie zmniejsza przepustowości prefillu.
+
+### Catch-up czytał macierz wag na każdy token
+
+Faza skalowała się liniowo — 34,3 ms dla 1024 i 137,6 ms dla 4096, czyli stałe
+33,5 us na token promptu. Dla porównania prefill CELU to 11,7 us na token na
+warstwę, a catch-up przechodzi przez JEDNĄ warstwę MTP. Trzykrotność kosztu
+warstwy była sygnałem, że coś jest nie tak.
+
+`mtp_project_joined_q8_f16` ma `token = block_idx.y`, czyli siatkę
+`(hidden/8, n_tokens)`: **jeden blok na parę (grupa wierszy, token)**, więc każdy
+token czyta całą macierz `eh_proj` (5120 x 10240 Q8_0 = 55,7 MB) od nowa. To ten
+sam antywzorzec co w głowie draftu — kernel jednotokenowy użyty do wsadu.
+
+Projekcja `eh_proj` to zwykły GEMM `[t, 2h] x [h, 2h]ᵀ`, więc ścieżka wsadowa
+przechodzi teraz przez `self.gemm`, który czyta wagi RAZ:
+
+| prompt | catch-up przed | po | |
+|---|--:|--:|--:|
+| 1024 | 34,3 ms | **3,47 ms** | **9,8x** |
+| 4096 | 137,6 ms | **12,3 ms** | **11,1x** |
+
+TTFT z MTP spada o 18-27 ms, czyli różnica wobec przebiegu bez spekulacji zeszła
+z +5,3% do **+0,5%** (NVFP4) i z +5,7% do **+0,3%** (Q4_K).
+
+Kolejność redukcji różni się od wariantu sekwencyjnego, ale catch-up karmi
+PROPOSER, a target weryfikuje każdy token — suma SHA 128 tokenów jest niezmieniona
+(`0bf2b86b…`) dla obu kwantyzacji, z MTP i bez.
 
 ## 3. Optymalizacja prefillu — co dało ile
 
