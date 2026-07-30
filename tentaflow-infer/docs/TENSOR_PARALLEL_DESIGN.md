@@ -192,6 +192,38 @@ Kontrola: sam podział projekcji DeltaNet zmierzony A/B daje 38,4 wobec 37,7
 tok/s. Jest na plus, ale skromnie — bo połowa zysku z odczytu wraca jako koszt
 składania. To jest ta sama liczba widziana z drugiej strony.
 
+## KOREKTA: podział DeltaNet po głowicach nie jest tak czysty, jak zakładano
+
+Powyższa tabela mówiła „ssm_* dzielone po głowicach" i to było uproszczenie,
+które ZAIMPLEMENTOWANO i które NIE DZIAŁA. Dwa ustalenia z realnego kodu:
+
+**1. GGUF przypisuje głowicę V do głowicy K przez MODULO, nie blokowo.**
+`deltanet_repeat_qk_f16` liczy `source = index % n_elems`, czyli głowica V `h`
+używa głowicy K `h % n_k`. Ciągły zakres głowic V potrzebuje więc WSZYSTKICH
+głowic K — chyba że jest wyrównany do wielokrotności `n_k`. Dla tego modelu
+`n_v = 48`, `n_k = 16`, więc jedyne dopuszczalne podziały na dwie karty to 16/32
+albo 32/16: z natury nierówne (33%/67%). Alternatywa to replikacja q/k na obu
+kartach, czyli 40% wierszy `in_proj` czytanych dwa razy.
+
+Implementacja, która tego nie uwzględniała (karta 0 dostała głowice V 0-20 i K
+0-6), produkowała TEKST-ŚMIEĆ — głowica V nr 7 sięgała po głowicę K nr 7, której
+ta karta nie miała. Wykryte dopiero po obejrzeniu wygenerowanego tekstu; sam SHA
+pokazywał tylko „inaczej", a spadek przepustowości wyglądał jak zwykły narzut.
+
+**2. Kernele miksera są ograniczone OPÓŹNIENIEM, nie pasmem.** Splot, l2norm,
+powielanie q/k, log-decay, sigmoid bety, skan i bramkowany RMSNorm operują na
+kilkudziesięciu głowicach po 128 wartości. Podzielenie ich na pół nie skraca
+ich czasu, a podwaja liczbę uruchomień, bo teraz liczą je obie karty. Zmierzone:
+dekodowanie 38,5 -> 32,7 tok/s, czyli 15% W DÓŁ.
+
+**Wniosek, który unieważnia wcześniejsze oszacowanie „+11%".** Podział po
+głowicach opłaca się tylko dla części CIĘŻKIEJ WAGAMI (`in_proj`, `gate`,
+`ssm_out`), a nie dla samego miksera. Sensowny wariant do sprawdzenia to podział
+głowic V wyrównany do `n_k`, z REPLIKACJĄ q/k i całej lekkiej ścieżki q/k na obu
+kartach — czyli dzielenie tylko strony V. Nie zostało to zmierzone i nie wolno
+zakładać, że wygra: punktem odniesienia jest 38,4 tok/s, a poprzednia próba
+przegrała o 15%.
+
 ## Zgodność bitowa
 
 - **Kolumnowo równoległe** (podział wyjścia): każdy element wyniku liczony w
