@@ -200,8 +200,10 @@ async fn run_training_against_dir(
                     "values": values,
                     "val_acc": st.val_acc,
                     "val_macro_f1": st.val_macro_f1,
-                    "onnx_path": st.onnx_path,
-                    "checkpoint_path": st.checkpoint_path,
+                    // Eksport ONNX robi dopiero publikacja (`locate_or_export_onnx`
+                    // woła `/export` z tym checkpointem), więc tu zapisujemy sam
+                    // checkpoint — jedyny artefakt, który istnieje po treningu.
+                    "checkpoint_path": st.artifact_path,
                 })
                 .to_string();
                 let model_name = format!("classifier-{}-{}", attribute, variant);
@@ -474,10 +476,13 @@ struct StatusResponse {
     val_macro_f1: Option<f64>,
     #[serde(default)]
     error: Option<String>,
+    /// Serwis raportuje ścieżkę checkpointu POD TĄ nazwą (`JobState.artifact_path`
+    /// w `server.py`) — czytanie `checkpoint_path`/`onnx_path`, których nigdy nie
+    /// wysyła, zapisywało w metrykach modelu `null` i publikacja do rejestru
+    /// wizji odbijała się o „model bez checkpoint_path". Tor detekcji mapuje to
+    /// pole tak samo.
     #[serde(default)]
-    onnx_path: Option<String>,
-    #[serde(default)]
-    checkpoint_path: Option<String>,
+    artifact_path: Option<String>,
 }
 
 fn http_agent() -> ureq::Agent {
