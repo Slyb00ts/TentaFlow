@@ -41,9 +41,9 @@ Pomiar z tego stanowiska, prompt 512 tokenów, 128 tokenów dekodu, mediana z 3 
 
 | model | 1 karta | 2 karty | zysk |
 |---|--:|--:|--:|
-| Qwen3.6-27B NVFP4 | 30,0 tok/s | **38,4 tok/s** | +28,0% |
+| Qwen3.6-27B NVFP4 | 30,0 tok/s | **38,6 tok/s** | +28,7% |
 | Qwen3.6-27B Q4_K_M | 28,3 tok/s | **35,3 tok/s** | +24,7% |
-| NVFP4 + MTP | 73,2 tok/s | 72,7 tok/s | bez zmian |
+| **NVFP4 + MTP** | 72,9 tok/s | **79,5 tok/s** | **+9,1%** |
 
 Dzielone są: FFN (`gate`/`up` po wierszach, `down` po kolumnach), obie duże
 projekcje wejściowe DeltaNet (`in_proj` NVFP4 i `gate_proj` Q8_0 — różne formaty,
@@ -126,7 +126,30 @@ projekcji `down`, bo sumy cząstkowe dwóch kart zapisane w f16 zmieniałyby wyn
 prefillu, czyli cały strumień tokenów. Bez tego kernela podział prefillu nie ma
 bitowo zgodnej ścieżki.
 
-**D. Podział ścieżki weryfikacji MTP — NAJWIĘKSZA pozostała nagroda.**
+**D. Podział ścieżki weryfikacji MTP — ZROBIONE (72,9 -> 79,5 tok/s).**
+
+Nie przez znalezienie „właściwego miejsca do wpięcia", tylko przez USUNIĘCIE
+miejsc wpięcia. Pięć bloków FFN hybrydy (dekodowanie, prefill layer-major,
+weryfikacja MTP, MTP B2, verifier segmentowany) zostało zastąpionych JEDNYM
+`Model::ffn_dense_block`, a podział wpina się w nim raz. Weryfikacja MTP dostała
+go wtedy sama — bez szukania, bo nie ma już czego szukać. Refaktor jest obojętny
+na wynik: wszystkie cztery konfiguracje zachowały SHA i przepustowość.
+
+Sprawdzone i ODRZUCONE w tym samym kroku: podział głowy logitów dla kilku
+tokenów. Zmierzone 79,2-79,4 wobec 79,5, czyli zero. Głowa jest kolumnowo
+równoległa, a jej konsument (sampling) nie jest wierszowo równoległy, więc wynik
+trzeba SKŁADAĆ — patrz ograniczenie reasemblacji w `TENSOR_PARALLEL_DESIGN.md`.
+Kod usunięty.
+
+**Pozostała część D:** projekcje DeltaNet w weryfikacji. Blokuje je to samo
+ograniczenie: podział wierszowy `in_proj` daje blok zwarty `[T, wiersze]`, a
+bufor jest token-major, więc przy T>1 trzeba składać. Rozwiązaniem NIE jest
+kernel rozrzucający, tylko podział DeltaNet po GŁOWICACH z mikserem liczonym w
+całości na randze — czyli architektura docelowa.
+
+---
+
+*(poniżej pierwotna analiza tego etapu)*
 Weryfikacja draftu jest tak samo ograniczona odczytem wag jak zwykły krok: przy
 T=3 arytmetyka nie przeważa, więc podział wag powinien dać tu te same ~28% co w
 dekodowaniu — a że MTP startuje z 73 tok/s, to zysk bezwzględny ponad dwa razy
