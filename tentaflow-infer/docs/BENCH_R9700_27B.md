@@ -390,6 +390,43 @@ kernelem:
 to podatek rozłożony po ~1800 uruchomieniach na krok i zdejmuje się go fuzją
 (norm + kwantyzacja + GEMM w jednym kernelu), a nie kolejnym pojedynczym fixem.
 
+## 2f. Dwie karty — co z nich mamy dzisiaj
+
+W maszynie są dwie R9700 (`rocminfo` widzi dwa agenty `gfx1201`). Wszystkie
+pomiary w tym dokumencie są JEDNOKARTOWE, i dla tego modelu nie da się inaczej.
+
+**Tensor parallel nie obejmuje tego modelu.** Jedyny mechanizm wielokartowy w
+FORGE to `--tp-cards`, czyli podział FFN. `tp_ffn_capable` odrzuca modele
+hybrydowe, co sprawdzone na sprzęcie:
+
+```
+$ forge run qwen36-27b-NVFP4.gguf --tp-cards 1
+Error: unsupported: model hybrydowy ma własną pętlę warstw, bez tego FFN
+```
+
+Ograniczenia `--tp-cards` są zresztą szersze niż samo „bez hybryd": obejmuje
+DEKODOWANIE modeli gęstych z wagami Q8_0, a prefill i tak zostaje na jednej
+karcie. Dla `qwen35` nie zadziała nic z tego — model jest hybrydowy (48 warstw
+DeltaNet + 16 uwagi), a jego wagi to NVFP4 albo Q4_K/Q6_K.
+
+**Data parallel działa i skaluje się liniowo.** Dwie niezależne instancje, po
+jednej na kartę, ten sam prompt 4672 + 512 tokenów z MTP:
+
+| | czas | wobec jednej karty solo (12,95 s) |
+|---|--:|--:|
+| karta 0 | 12,94 s | 1,00x |
+| karta 1 | 12,77 s | 0,99x |
+
+Zero interferencji — każda instancja trzyma pełną prędkość jednokartową, więc
+przepustowość zbiorcza jest **2x**. Model waży 17 GB, karta ma 32 GB, więc
+komplet mieści się dwa razy.
+
+Podsumowując: dziś druga karta podwaja PRZEPUSTOWOŚĆ (dwa równoległe żądania),
+ale nie skraca opóźnienia POJEDYNCZEGO żądania ani o milisekundę. Żeby to
+zmienić, trzeba by rozszerzyć podział na pętlę warstw modelu hybrydowego i objąć
+nim prefill oraz formaty inne niż Q8_0 — czyli praktycznie napisać ścieżkę TP od
+nowa pod ten model.
+
 ## 3. Optymalizacja prefillu — co dało ile
 
 Kolejność wyznaczył PROFIL (`rocprofv3 --kernel-trace`), nie intuicja. Rozkład
