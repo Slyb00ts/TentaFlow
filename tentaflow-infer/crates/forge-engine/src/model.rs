@@ -1118,7 +1118,7 @@ pub struct Model {
     /// Nieudana próba przechwycenia wyłącza kolejne próby dla danej pary.
     hybrid_verify_graph_disabled: HashSet<(usize, usize)>,
     /// FFN rozłożony na karty. `None` = cały model liczy jedna karta.
-    tp_ffn: Option<crate::tensor_parallel::TpFfn>,
+    tp_ffn: Option<crate::tensor_parallel::TpDecode>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
     /// Przechwycony krok dekodowania modelu hybrydowego (qwen35/DeltaNet).
@@ -4858,6 +4858,11 @@ impl Model {
         // pojedynczym strumieniu niż w batchu (który liczy głowę w F16), czyli
         // jakość zależną od współbieżności. Paczka zostaje dla prefillu, gdzie
         // liczą się aktywacje, a nie wybór tokena.
+        if let Some(tp) = &self.tp_ffn {
+            if tp.forward_logits(stream, x, y_f32)? {
+                return Ok(());
+            }
+        }
         self.logits_weight_gemv(y_f32, 0, x, 0, &self.weights.lm_head, stream)
     }
 
@@ -7919,7 +7924,7 @@ impl Model {
             ForgeError::Unsupported("format wag FFN nie ma ścieżki podziału na karty".into())
         })?;
         let cluster = crate::cluster::Cluster::attach(self.device.clone(), extra, pools)?;
-        let caps = cluster.calibrate(quant)?;
+        let mut caps = cluster.calibrate(quant)?;
         let layers =
             crate::weights::load_ffn_shards_gguf(path, &cluster, &caps, layer_range, forced)?;
         if layers.len() != self.weights.layers.len() {
@@ -7930,7 +7935,24 @@ impl Model {
             )));
         }
         let hidden = self.weights.descriptor.params.hidden_size;
-        self.tp_ffn = Some(crate::tensor_parallel::TpFfn::new(cluster, layers, hidden)?);
+        let mut tp = crate::tensor_parallel::TpDecode::new(cluster, layers, hidden)?;
+        // Każdy kolejny podział planuje pojemność z ODŚWIEŻONEGO stanu pul —
+        // inaczej trzy niezależne plany obiecałyby sobie nawzajem to samo
+        // miejsce na karcie modelu.
+        tp.refresh_free(&mut caps);
+        // Dwie duże projekcje wejściowe DeltaNet: razem 16,5% odczytu na token.
+        tp.attach_delta_projections(&caps, &crate::weights::load_delta_projection_source(path)?)?;
+        tp.refresh_free(&mut caps);
+        // Głowa logitów to jedna macierz czytana raz na token — na tym modelu
+        // 8% całego odczytu, czyli więcej niż wszystkie projekcje uwagi razem.
+        // Dzieli się po wierszach słownika, więc wynik jest bitowo zgodny z
+        // jednokartowym.
+        if let Some((data, vocab, cols, quant)) = crate::weights::load_lm_head_shard_source(path)? {
+            if cols == hidden && vocab == self.weights.descriptor.params.vocab_size {
+                tp.attach_lm_head(&caps, &data, vocab, cols, quant)?;
+            }
+        }
+        self.tp_ffn = Some(tp);
         // Krok dekodowania przestaje być jednokartowy, więc przechwycone grafy
         // przestają go opisywać — dotyczy to obu ścieżek, gęstej i hybrydowej.
         self.decode_graph = None;
@@ -7939,7 +7961,7 @@ impl Model {
         Ok(())
     }
 
-    pub fn tp_ffn(&self) -> Option<&crate::tensor_parallel::TpFfn> {
+    pub fn tp_ffn(&self) -> Option<&crate::tensor_parallel::TpDecode> {
         self.tp_ffn.as_ref()
     }
 
@@ -15799,7 +15821,7 @@ impl Model {
                 }
                 LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, &src)?,
                 LayerMixer::DeltaNet(d) => {
-                    self.hybrid_delta_projections(d, &b.x, 1)?;
+                    self.hybrid_delta_projections(l, d, &b.x, 1)?;
                     self.hybrid_delta_mixer(l, d, 0)?;
                 }
             }
@@ -16017,6 +16039,7 @@ impl Model {
     /// jednolane'owa, więc numeryka się nie zmienia.
     fn hybrid_delta_projections(
         &self,
+        layer: usize,
         d: &DeltaNetWeights,
         x: &DevBuffer,
         n_rows: usize,
@@ -16028,12 +16051,26 @@ impl Model {
                 hb.projection_rows
             )));
         }
-        let projections = [
-            (&hb.batched_qkv_mixed, &d.in_proj),
-            (&hb.batched_z, &d.gate_proj),
+        // Dwie duże projekcje mogą być rozłożone na karty — każda karta liczy
+        // swój zakres wierszy OBU naraz, więc grupowanie zostaje po obu stronach.
+        let split_big = match (&self.tp_ffn, n_rows) {
+            (Some(tp), 1) => tp.forward_delta_projections(
+                &self.stream,
+                layer,
+                x,
+                &hb.batched_qkv_mixed,
+                &hb.batched_z,
+            )?,
+            _ => false,
+        };
+        let mut projections: Vec<(&DevBuffer, &DevWeight)> = vec![
             (&hb.batched_alpha, &d.alpha_proj),
             (&hb.batched_beta_raw, &d.beta_proj),
         ];
+        if !split_big {
+            projections.insert(0, (&hb.batched_qkv_mixed, &d.in_proj));
+            projections.insert(1, (&hb.batched_z, &d.gate_proj));
+        }
         // Cztery projekcje czytają TEN SAM znormalizowany `x`, ale NIE MAJĄ tego
         // samego formatu: `in_proj` jest NVFP4, a bramka, alfa i beta Q8_0.
         // Dlatego grupujemy PER FORMAT — jednorodna próba na całej czwórce
@@ -16042,7 +16079,7 @@ impl Model {
         if n_rows == 1 {
             let mut nvfp4: Vec<(&DevBuffer, &DevWeight)> = Vec::new();
             let mut q8: Vec<(&DevBuffer, &DevWeight)> = Vec::new();
-            for &(y, w) in &projections {
+            for &(y, w) in projections.iter() {
                 match w {
                     DevWeight::NvFp4Gguf { .. } => nvfp4.push((y, w)),
                     DevWeight::Q8_0 { .. } => q8.push((y, w)),
@@ -17904,7 +17941,7 @@ impl Model {
             // z `bb.x` — jeden przebieg po wagach zamiast jednego na lane.
             if let LayerMixer::DeltaNet(delta) = &self.weights.layers[layer_index].mixer {
                 let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
-                self.hybrid_delta_projections(delta, &bb.x, n)?;
+                self.hybrid_delta_projections(layer_index, delta, &bb.x, n)?;
             }
             for (lane, seq) in seqs.iter_mut().enumerate() {
                 self.activate_hybrid_sequence(seq)?;

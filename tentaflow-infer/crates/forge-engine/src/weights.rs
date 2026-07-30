@@ -4899,6 +4899,88 @@ mod tests {
     }
 }
 
+/// Wczytuje głowę logitów z GGUF jako surowe bajty gotowe do podziału.
+///
+/// Zwraca `None`, gdy głowa jest współdzielona z tablicą embeddingów albo ma
+/// format bez kernela z wyjściem f32 — wtedy zostaje w całości na karcie modelu.
+/// Głowa jest czytana raz na token, więc jej podział liczy się w dekodowaniu tyle
+/// samo co kilka warstw FFN.
+pub fn load_lm_head_shard_source(path: &Path) -> Result<Option<(Vec<u8>, usize, usize, QuantKind)>> {
+    let gguf = Gguf::open(path)?;
+    let descriptor = ModelDescriptor::detect(&gguf)?;
+    let Some(name) = descriptor.globals.get(&WeightRole::LmHead) else {
+        return Ok(None);
+    };
+    let src = GgufSource(&gguf);
+    match fetch_matrix(&src, name)? {
+        HostWeight::Q8_0 { data, rows, cols } => Ok(Some((data, rows, cols, QuantKind::Q8_0))),
+        _ => Ok(None),
+    }
+}
+
+/// Wczytuje dwie duże projekcje wejściowe DeltaNet — `in_proj` i `gate_proj`.
+///
+/// Na tym modelu to 1350 MiB i 1530 MiB, czyli razem 16,5% całego odczytu na
+/// token. Obie czytają ten sam `x` i na karcie idą jednym uruchomieniem
+/// grupowym, więc dzieli się je TYM SAMYM udziałem wierszy — rozdzielenie ich
+/// między karty w całości rozbijało grupowanie i było wolniejsze.
+///
+/// Wpis `None` znaczy „ta warstwa nie jest DeltaNetem".
+pub fn load_delta_projection_source(
+    path: &Path,
+) -> Result<Vec<Option<(crate::tensor_parallel::DeltaMatrix, crate::tensor_parallel::DeltaMatrix)>>>
+{
+    let gguf = Gguf::open(path)?;
+    let descriptor = ModelDescriptor::detect(&gguf)?;
+    let src = GgufSource(&gguf);
+    let matrix = |name: &str| -> Result<Option<crate::tensor_parallel::DeltaMatrix>> {
+        Ok(match fetch_matrix(&src, name)? {
+            HostWeight::NvFp4Gguf {
+                data,
+                output_scale,
+                rows,
+                cols,
+            } => Some(crate::tensor_parallel::DeltaMatrix {
+                data,
+                rows,
+                cols,
+                quant: QuantKind::NVFP4Gguf,
+                output_scale,
+            }),
+            HostWeight::Q8_0 { data, rows, cols } => Some(crate::tensor_parallel::DeltaMatrix {
+                data,
+                rows,
+                cols,
+                quant: QuantKind::Q8_0,
+                output_scale: 1.0,
+            }),
+            HostWeight::Q4K { data, rows, cols } => Some(crate::tensor_parallel::DeltaMatrix {
+                data,
+                rows,
+                cols,
+                quant: QuantKind::Q4K,
+                output_scale: 1.0,
+            }),
+            _ => None,
+        })
+    };
+    let mut out = Vec::with_capacity(descriptor.layers.len());
+    for layer in descriptor.layers.iter() {
+        let (Some(in_name), Some(gate_name)) = (
+            layer.get(&WeightRole::SsmInProj),
+            layer.get(&WeightRole::SsmGate),
+        ) else {
+            out.push(None);
+            continue;
+        };
+        out.push(match (matrix(in_name)?, matrix(gate_name)?) {
+            (Some(a), Some(b)) if a.cols == b.cols => Some((a, b)),
+            _ => None,
+        });
+    }
+    Ok(out)
+}
+
 /// Wczytuje wagi FFN modelu GGUF i rozkłada je na karty klastra.
 ///
 /// Osobna ścieżka obok głównego ładowania: silnik trzyma swoje wagi na jednej

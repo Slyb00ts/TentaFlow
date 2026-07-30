@@ -21,29 +21,39 @@ fn peer_access_and_exchange_cost() {
     println!("karty: {}", cluster.len());
     println!("peer access: {}", cluster.peer_access());
 
-    let bytes = 5120 * 2; // ukryty stan f16 jednego tokena
+    // Rozmiary, które REALNIE występują w podziale: ukryty stan tokena,
+    // projekcje DeltaNet i pełny wektor logitów. Jedna liczba nie wystarczy —
+    // mała wymiana mierzy opóźnienie, duża przepustowość, a decyzja o tym, co
+    // wolno dzielić, potrzebuje obu.
+    let cap = 4 << 20;
     let alloc = |index: usize| {
         cluster
             .device(index)
             .unwrap()
             .device
-            .alloc(bytes, MemKind::Device, Pool::Activations)
+            .alloc(cap, MemKind::Device, Pool::Activations)
             .unwrap()
     };
     let src = alloc(0);
     let dst = alloc(1);
 
-    // Rozgrzewka, potem 200 wymian.
-    for _ in 0..10 {
-        cluster.exchange(0, &src, 0, 1, &dst, 0, bytes).unwrap();
+    for &bytes in &[5120 * 2usize, 64 << 10, 512 << 10, 1 << 20, 4 << 20] {
+        for _ in 0..10 {
+            cluster.exchange(0, &src, 0, 1, &dst, 0, bytes).unwrap();
+        }
+        cluster.synchronize().unwrap();
+        let iters = if bytes > (256 << 10) { 50 } else { 200 };
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            cluster.exchange(0, &src, 0, 1, &dst, 0, bytes).unwrap();
+        }
+        cluster.synchronize().unwrap();
+        let per = start.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "wymiana {:>7} B: {:8.2} us, {:6.2} GB/s",
+            bytes,
+            per * 1e6,
+            bytes as f64 / per / 1e9
+        );
     }
-    cluster.synchronize().unwrap();
-    let start = std::time::Instant::now();
-    for _ in 0..200 {
-        cluster.exchange(0, &src, 0, 1, &dst, 0, bytes).unwrap();
-    }
-    cluster.synchronize().unwrap();
-    let per = start.elapsed().as_secs_f64() * 1e6 / 200.0;
-    println!("wymiana {bytes} B: {per:.2} us");
-    println!("65 warstw x 2 wymiany na token: {:.2} ms", per * 130.0 / 1000.0);
 }

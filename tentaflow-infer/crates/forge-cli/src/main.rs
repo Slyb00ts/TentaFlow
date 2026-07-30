@@ -823,6 +823,15 @@ fn enable_tp_ffn_with(
         weights >> 20,
         tp.split_of(0)
     );
+    if let Some(split) = tp.lm_head_split() {
+        eprintln!("głowa logitów podzielona po wierszach słownika: {split:?}");
+    }
+    if let Some((in_split, gate_split)) = tp.delta_proj_split() {
+        eprintln!(
+            "projekcje DeltaNet podzielone w {} warstwach: in {in_split:?}, gate {gate_split:?}",
+            tp.delta_proj_layers()
+        );
+    }
     Ok(())
 }
 

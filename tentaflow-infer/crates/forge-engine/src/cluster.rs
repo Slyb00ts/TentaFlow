@@ -290,6 +290,20 @@ impl Cluster {
         Ok(caps)
     }
 
+    /// Odświeża wolne miejsce w profilach kart po tym, jak coś już zajęło pulę.
+    ///
+    /// Kolejne podziały (FFN, projekcje DeltaNet, głowa logitów) planują
+    /// pojemność z tego samego profilu. Bez odświeżenia każdy z nich uważałby
+    /// całą pulę za wolną, a karta modelu — mająca i tak najmniej luzu —
+    /// obiecywałaby to samo miejsce trzy razy.
+    pub fn refresh_free(&self, caps: &mut [crate::multi_gpu::DeviceCapability]) {
+        for (index, entry) in self.devices.iter().enumerate() {
+            if let Some(cap) = caps.get_mut(index) {
+                cap.free_bytes = entry.device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
+            }
+        }
+    }
+
     /// Czeka na wszystkie karty. Wyłącznie do granic kroku i do testów — w
     /// pętli warstw używa się `wait_for`.
     pub fn synchronize(&self) -> Result<()> {

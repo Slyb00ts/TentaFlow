@@ -49,6 +49,65 @@ impl RowShards {
     }
 }
 
+/// Jedna macierz wagowa wczytana z pliku, gotowa do podziału.
+pub struct DeltaMatrix {
+    pub data: Vec<u8>,
+    pub rows: usize,
+    pub cols: usize,
+    pub quant: QuantKind,
+    pub output_scale: f32,
+}
+
+/// Rozkłada macierz wierszami wg PODANEGO planu.
+///
+/// Istnieje obok `upload_row_split`, bo plan bywa wspólny dla kilku macierzy i
+/// kilkudziesięciu warstw — liczony osobno przy każdej z nich uznawałby tę samą
+/// pulę pamięci za wolną tyle razy, ile jest wywołań.
+pub fn upload_row_split_with(
+    cluster: &Cluster,
+    data: &[u8],
+    row_bytes: usize,
+    plan: &[usize],
+) -> Result<RowShards> {
+    if plan.len() != cluster.len() {
+        return Err(ForgeError::Scheduler(
+            "plan podziału musi mieć wpis dla każdej karty".into(),
+        ));
+    }
+    let rows: usize = plan.iter().sum();
+    if rows == 0 || row_bytes == 0 || data.len() != rows * row_bytes {
+        return Err(ForgeError::Format(format!(
+            "macierz {rows}x{row_bytes} B nie zgadza się z {} B danych",
+            data.len()
+        )));
+    }
+    let mut shards = Vec::with_capacity(cluster.len());
+    let mut offsets = Vec::with_capacity(cluster.len());
+    let mut offset = 0usize;
+    for (index, &count) in plan.iter().enumerate() {
+        let entry = cluster.device(index)?;
+        let buffer = entry
+            .device
+            .alloc(count.max(1) * row_bytes, MemKind::Device, Pool::Weights)?;
+        if count > 0 {
+            entry.device.write(
+                &data[offset * row_bytes..(offset + count) * row_bytes],
+                &buffer,
+                0,
+            )?;
+        }
+        shards.push(buffer);
+        offsets.push(offset);
+        offset += count;
+    }
+    Ok(RowShards {
+        shards,
+        rows: plan.to_vec(),
+        offsets,
+        row_bytes,
+    })
+}
+
 /// Rozkłada macierz wierszami na karty proporcjonalnie do ZMIERZONEJ mocy.
 ///
 /// `data` to surowe bajty macierzy wiersz-major (dowolny format blokowy),
@@ -916,7 +975,7 @@ pub fn ffn_forward_split(
 /// Karta 0 klastra jest kartą modelu (patrz `Cluster::attach`), więc wejście i
 /// wyjście to bufory silnika, a nie kopie. Wymiana przypada JEDNA na warstwę:
 /// rozgłoszenie wejścia i redukcja sum cząstkowych `down`.
-pub struct TpFfn {
+pub struct TpDecode {
     cluster: Cluster,
     layers: Vec<FfnShards>,
     ws: FfnWorkspace,
@@ -924,9 +983,47 @@ pub struct TpFfn {
     acc: DevBuffer,
     staging: DevBuffer,
     hidden: usize,
+    /// Głowa logitów rozłożona po WIERSZACH słownika. Wiersze są niezależne, więc
+    /// w odróżnieniu od podziału kolumnowego `down` ten jest bitowo zgodny z
+    /// jednokartowym: każda karta liczy dokładnie te same iloczyny, tylko dla
+    /// swojego zakresu tokenów.
+    lm_head: Option<LmHeadShards>,
+    /// Bramka `z` DeltaNet przeniesiona w CAŁOŚCI na kartę wspierającą, jeden
+    /// wpis na warstwę (`None` dla warstw, które nie są DeltaNetem).
+    delta_proj: Vec<Option<DeltaProjShards>>,
 }
 
-impl TpFfn {
+/// Dwie duże projekcje wejściowe jednej warstwy DeltaNet, podzielone po
+/// WIERSZACH tym samym udziałem.
+///
+/// Obie czytają ten sam `x` i na karcie idą JEDNYM uruchomieniem grupowym — a
+/// wąska projekcja mierzy 425 GB/s wobec 960 GB/s szerokiej, więc rozdzielenie
+/// ich między karty (każda cała gdzie indziej) kosztuje więcej, niż daje podział
+/// odczytu. Zmierzone: 37,8 -> 36,0 tok/s. Podział po wierszach zostawia każdej
+/// karcie obie projekcje, więc grupowanie zostaje po obu stronach.
+pub struct DeltaProjShards {
+    in_proj: RowShards,
+    gate: RowShards,
+    in_format: BlockFormat,
+    gate_format: BlockFormat,
+    /// Wyniki cząstkowe kart wspierających. Karta modelu pisze wprost do buforów
+    /// silnika, bo jej zakres zaczyna się od wiersza 0.
+    parts_in: Vec<Option<DevBuffer>>,
+    parts_gate: Vec<Option<DevBuffer>>,
+    cols: usize,
+}
+
+/// Głowa logitów rozłożona na karty wraz z buforami wyników cząstkowych.
+pub struct LmHeadShards {
+    shards: RowShards,
+    /// Wyniki cząstkowe kart wspierających. Karta modelu pisze wprost do bufora
+    /// logitów silnika, bo jej zakres zaczyna się od wiersza 0.
+    parts: Vec<Option<DevBuffer>>,
+    quant: QuantKind,
+    cols: usize,
+}
+
+impl TpDecode {
     /// Buduje kontekst z gotowych fragmentów wag (jeden komplet na warstwę).
     pub fn new(cluster: Cluster, layers: Vec<FfnShards>, hidden: usize) -> Result<Self> {
         if layers.is_empty() {
@@ -980,7 +1077,387 @@ impl TpFfn {
             acc,
             staging,
             hidden,
+            lm_head: None,
+            delta_proj: Vec::new(),
         })
+    }
+
+    /// Dokłada głowę logitów rozłożoną po wierszach słownika.
+    ///
+    /// `data` to surowe bajty macierzy `[vocab, hidden]` w formacie `quant`.
+    /// Głowa jest czytana raz na token i na tym modelu to 8% całego odczytu —
+    /// więcej niż wszystkie projekcje uwagi razem. Wiersze słownika są
+    /// niezależne, więc podział jest bitowo zgodny z jednokartowym.
+    pub fn attach_lm_head(
+        &mut self,
+        caps: &[DeviceCapability],
+        data: &[u8],
+        vocab: usize,
+        hidden: usize,
+        quant: QuantKind,
+    ) -> Result<()> {
+        let format = BlockFormat::of(quant, 1.0)?;
+        let row_bytes = format.row_bytes(hidden);
+        let shards = upload_row_split(
+            &self.cluster,
+            caps,
+            data,
+            vocab,
+            row_bytes,
+            WorkKind::MemoryBound,
+        )?;
+        let mut parts = Vec::with_capacity(self.cluster.len());
+        for index in 0..self.cluster.len() {
+            let rows = shards.rows_on(index);
+            parts.push(if index == 0 || rows == 0 {
+                None
+            } else {
+                Some(self.cluster.device(index)?.device.alloc(
+                    rows * 4,
+                    MemKind::Device,
+                    Pool::Activations,
+                )?)
+            });
+        }
+        self.lm_head = Some(LmHeadShards {
+            shards,
+            parts,
+            quant,
+            cols: hidden,
+        });
+        Ok(())
+    }
+
+    /// Odświeża wolne miejsce w profilach kart po już wykonanych podziałach.
+    pub fn refresh_free(&self, caps: &mut [DeviceCapability]) {
+        self.cluster.refresh_free(caps);
+    }
+
+    pub fn lm_head_split(&self) -> Option<Vec<usize>> {
+        let head = self.lm_head.as_ref()?;
+        Some(
+            (0..self.cluster.len())
+                .map(|i| head.shards.rows_on(i))
+                .collect(),
+        )
+    }
+
+    /// `logits = lm_head · x` z głową rozłożoną po wierszach słownika.
+    ///
+    /// Karta modelu liczy swój zakres wprost do bufora logitów silnika, karty
+    /// wspierające do własnych buforów, skąd wyniki trafiają pod swoje
+    /// przesunięcia.
+    pub fn forward_logits(
+        &self,
+        model_stream: &forge_hal::Stream,
+        x: &DevBuffer,
+        logits: &DevBuffer,
+    ) -> Result<bool> {
+        let Some(head) = self.lm_head.as_ref() else {
+            return Ok(false);
+        };
+        for index in 1..self.cluster.len() {
+            if head.shards.rows_on(index) == 0 {
+                continue;
+            }
+            let destination = self.ws.x[index].as_ref().ok_or_else(|| {
+                ForgeError::Scheduler(format!("karta {index} nie ma bufora wejścia"))
+            })?;
+            self.cluster
+                .exchange_on(0, model_stream, x, 0, index, destination, 0, self.hidden * 2)?;
+            self.cluster
+                .order(0, model_stream, index, &self.cluster.device(index)?.stream)?;
+        }
+        for index in 0..self.cluster.len() {
+            let rows = head.shards.rows_on(index);
+            if rows == 0 {
+                continue;
+            }
+            let entry = self.cluster.device(index)?;
+            let (stream, out, input) = if index == 0 {
+                (model_stream, logits, x)
+            } else {
+                (
+                    &entry.stream,
+                    head.parts[index].as_ref().ok_or_else(|| {
+                        ForgeError::Scheduler(format!("karta {index} nie ma bufora logitów"))
+                    })?,
+                    self.ws.x[index].as_ref().expect("bufor wejścia sprawdzony wyżej"),
+                )
+            };
+            match head.quant {
+                QuantKind::Q8_0 => entry.kernels.gemv_q8_0_out_f32(
+                    out,
+                    head.shards.shard(index)?,
+                    input,
+                    rows,
+                    head.cols,
+                    stream,
+                )?,
+                other => {
+                    return Err(ForgeError::Unsupported(format!(
+                        "podział głowy logitów nie ma ścieżki dla {other:?}"
+                    )));
+                }
+            }
+        }
+        for index in 1..self.cluster.len() {
+            let rows = head.shards.rows_on(index);
+            if rows == 0 {
+                continue;
+            }
+            let part = head.parts[index].as_ref().expect("bufor sprawdzony wyżej");
+            self.cluster.exchange(
+                index,
+                part,
+                0,
+                0,
+                logits,
+                head.shards.offset_of(index) * 4,
+                rows * 4,
+            )?;
+            self.cluster
+                .order(index, &self.cluster.device(index)?.stream, 0, model_stream)?;
+        }
+        Ok(true)
+    }
+
+    /// Rozkłada dwie duże projekcje wejściowe DeltaNet po wierszach.
+    ///
+    /// `sources[l]` to `(in_proj, gate_proj)` warstwy `l` albo `None`, gdy ta
+    /// warstwa nie jest DeltaNetem. Obie macierze mają ten sam wymiar wejściowy i
+    /// ten sam format, więc dzieli je JEDEN udział — inaczej karta grupowałaby
+    /// projekcje o niedopasowanych zakresach.
+    pub fn attach_delta_projections(
+        &mut self,
+        caps: &[DeviceCapability],
+        sources: &[Option<(DeltaMatrix, DeltaMatrix)>],
+    ) -> Result<()> {
+        if self.cluster.len() < 2 {
+            return Ok(());
+        }
+        let layers = sources.iter().filter(|s| s.is_some()).count();
+        if layers == 0 {
+            return Ok(());
+        }
+        let Some((first_in, first_gate)) = sources.iter().flatten().next() else {
+            return Ok(());
+        };
+        let in_format = BlockFormat::of(first_in.quant, first_in.output_scale)?;
+        let gate_format = BlockFormat::of(first_gate.quant, first_gate.output_scale)?;
+        if first_in.cols != first_gate.cols {
+            return Err(ForgeError::Unsupported(
+                "projekcje DeltaNet czytają ten sam `x`, więc muszą mieć wspólne wejście".into(),
+            ));
+        }
+        let cols = first_in.cols;
+        let in_row_bytes = in_format.row_bytes(cols);
+        let gate_row_bytes = gate_format.row_bytes(cols);
+        // Formaty MOGĄ się różnić — na tym modelu `in_proj` jest w NVFP4, a
+        // bramka w Q8_0, i to jest normalne: to dwie osobne macierze, które łączy
+        // wyłącznie wspólne wejście. Wspólny jest UDZIAŁ, nie format.
+        //
+        // Udział liczony raz, na całą pracę wszystkich warstw: jednostką jest
+        // tysięczna część obu macierzy, żeby pojemność kart była wyceniona ich
+        // rzeczywistymi bajtami, a nie liczbą wierszy o różnej długości.
+        const UNITS: usize = 1000;
+        let bytes_per_unit =
+            (first_in.rows * in_row_bytes + first_gate.rows * gate_row_bytes) * layers / UNITS;
+        let plan = plan_split(caps, UNITS, WorkKind::MemoryBound, bytes_per_unit, 1)?;
+        let share = |rows: usize| -> Vec<usize> {
+            let mut out: Vec<usize> = plan.rows.iter().map(|u| u * rows / UNITS).collect();
+            let assigned: usize = out.iter().sum();
+            out[0] += rows - assigned;
+            out
+        };
+        let in_plan = share(first_in.rows);
+        let gate_plan = share(first_gate.rows);
+
+        let mut shards = Vec::with_capacity(sources.len());
+        for source in sources {
+            let Some((in_src, gate_src)) = source else {
+                shards.push(None);
+                continue;
+            };
+            let in_proj =
+                upload_row_split_with(&self.cluster, &in_src.data, in_row_bytes, &in_plan)?;
+            let gate =
+                upload_row_split_with(&self.cluster, &gate_src.data, gate_row_bytes, &gate_plan)?;
+            let mut parts_in = Vec::with_capacity(self.cluster.len());
+            let mut parts_gate = Vec::with_capacity(self.cluster.len());
+            for index in 0..self.cluster.len() {
+                let entry = self.cluster.device(index)?;
+                let mk = |rows: usize| -> Result<Option<DevBuffer>> {
+                    if index == 0 || rows == 0 {
+                        return Ok(None);
+                    }
+                    Ok(Some(entry.device.alloc(
+                        rows * 2,
+                        MemKind::Device,
+                        Pool::Activations,
+                    )?))
+                };
+                parts_in.push(mk(in_proj.rows_on(index))?);
+                parts_gate.push(mk(gate.rows_on(index))?);
+            }
+            shards.push(Some(DeltaProjShards {
+                in_proj,
+                gate,
+                in_format,
+                gate_format,
+                parts_in,
+                parts_gate,
+                cols,
+            }));
+        }
+        self.delta_proj = shards;
+        Ok(())
+    }
+
+    pub fn delta_proj_layers(&self) -> usize {
+        self.delta_proj.iter().filter(|g| g.is_some()).count()
+    }
+
+    /// Udział wierszy obu projekcji DeltaNet — do raportu przy starcie.
+    pub fn delta_proj_split(&self) -> Option<(Vec<usize>, Vec<usize>)> {
+        let shards = self.delta_proj.iter().flatten().next()?;
+        Some((
+            (0..self.cluster.len())
+                .map(|i| shards.in_proj.rows_on(i))
+                .collect(),
+            (0..self.cluster.len())
+                .map(|i| shards.gate.rows_on(i))
+                .collect(),
+        ))
+    }
+
+    /// Liczy obie duże projekcje wejściowe warstwy DeltaNet na wszystkich kartach
+    /// i składa wyniki w buforach silnika. `false` znaczy „ta warstwa nie jest
+    /// podzielona".
+    pub fn forward_delta_projections(
+        &self,
+        model_stream: &forge_hal::Stream,
+        layer: usize,
+        x: &DevBuffer,
+        qkv: &DevBuffer,
+        z: &DevBuffer,
+    ) -> Result<bool> {
+        let Some(Some(shards)) = self.delta_proj.get(layer) else {
+            return Ok(false);
+        };
+        for index in 1..self.cluster.len() {
+            if shards.in_proj.rows_on(index) == 0 && shards.gate.rows_on(index) == 0 {
+                continue;
+            }
+            let destination = self.ws.x[index].as_ref().ok_or_else(|| {
+                ForgeError::Scheduler(format!("karta {index} nie ma bufora wejścia"))
+            })?;
+            self.cluster
+                .exchange_on(0, model_stream, x, 0, index, destination, 0, self.hidden * 2)?;
+            self.cluster
+                .order(0, model_stream, index, &self.cluster.device(index)?.stream)?;
+        }
+        for index in 0..self.cluster.len() {
+            let rows_in = shards.in_proj.rows_on(index);
+            let rows_gate = shards.gate.rows_on(index);
+            if rows_in == 0 && rows_gate == 0 {
+                continue;
+            }
+            let entry = self.cluster.device(index)?;
+            let (stream, input) = if index == 0 {
+                (model_stream, x)
+            } else {
+                (
+                    &entry.stream,
+                    self.ws.x[index].as_ref().expect("bufor sprawdzony wyżej"),
+                )
+            };
+            let out_in = if index == 0 {
+                qkv
+            } else {
+                shards.parts_in[index].as_ref().expect("bufor cząstkowy")
+            };
+            let out_gate = if index == 0 {
+                z
+            } else {
+                shards.parts_gate[index].as_ref().expect("bufor cząstkowy")
+            };
+            // Każda macierz swoim kernelem: formaty się różnią, więc jednego
+            // uruchomienia grupowego dla obu i tak nie ma — dokładnie tak samo
+            // liczy je ścieżka jednokartowa.
+            let dp4a = shards.cols <= forge_kernels::Kernels::DP4A_MAX_COLS;
+            for (out, shard, rows, format) in [
+                (out_in, shards.in_proj.shard(index)?, rows_in, shards.in_format),
+                (out_gate, shards.gate.shard(index)?, rows_gate, shards.gate_format),
+            ] {
+                if rows == 0 {
+                    continue;
+                }
+                match (format.quant, dp4a) {
+                    (QuantKind::NVFP4Gguf, _) => entry.kernels.gemv_nvfp4_gguf_q8_1_group_f16(
+                        &[forge_kernels::Nvfp4GgufQ8Projection {
+                            output: out,
+                            weights: shard,
+                            rows,
+                            output_scale: format.output_scale,
+                        }],
+                        input,
+                        shards.cols,
+                        stream,
+                    )?,
+                    (QuantKind::Q8_0, true) => entry
+                        .kernels
+                        .gemv_q8_0_dp4a_f16(out, shard, input, rows, shards.cols, stream)?,
+                    (QuantKind::Q8_0, false) => entry
+                        .kernels
+                        .gemv_q8_0_f16(out, shard, input, rows, shards.cols, stream)?,
+                    (QuantKind::Q4K, true) => entry
+                        .kernels
+                        .gemv_q4_k_dp4a_f16(out, shard, input, rows, shards.cols, stream)?,
+                    (QuantKind::Q4K, false) => entry
+                        .kernels
+                        .gemv_q4_k_f16(out, shard, input, rows, shards.cols, stream)?,
+                    (QuantKind::Q6K, _) => entry
+                        .kernels
+                        .gemv_q6_k_f16(out, shard, input, rows, shards.cols, stream)?,
+                    (other, _) => {
+                        return Err(ForgeError::Unsupported(format!(
+                            "projekcje DeltaNet nie mają ścieżki GEMV dla {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        for index in 1..self.cluster.len() {
+            let entry = self.cluster.device(index)?;
+            let mut moved = false;
+            for (part, target, offset, rows) in [
+                (
+                    &shards.parts_in[index],
+                    qkv,
+                    shards.in_proj.offset_of(index) * 2,
+                    shards.in_proj.rows_on(index),
+                ),
+                (
+                    &shards.parts_gate[index],
+                    z,
+                    shards.gate.offset_of(index) * 2,
+                    shards.gate.rows_on(index),
+                ),
+            ] {
+                let Some(part) = part else { continue };
+                if rows == 0 {
+                    continue;
+                }
+                self.cluster
+                    .exchange(index, part, 0, 0, target, offset, rows * 2)?;
+                moved = true;
+            }
+            if moved {
+                self.cluster.order(index, &entry.stream, 0, model_stream)?;
+            }
+        }
+        Ok(true)
     }
 
     pub fn layers(&self) -> usize {
