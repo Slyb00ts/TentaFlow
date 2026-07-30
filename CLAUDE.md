@@ -191,6 +191,39 @@ The renderer validates public URLs before navigation and aborts private/local su
 requests inside Playwright routing, so Core can use it without exposing local node networks to
 web pages.
 
+## ML Studio training tors
+
+`tentaflow-core/src/ml_studio/` drives three vision tors off ONE COCO dataset, each with its
+own Python training service under `tentaflow-containers/training/`:
+
+| Tor | Core driver | Service | Artefakt |
+|-----|-------------|---------|----------|
+| detection (17 klas ADR) | `train_recognition.rs` | `rfdetr-training` :8202 | checkpoint RF-DETR |
+| classifier atrybutu (`stan`) | `train_classifier.rs` | `classifier-training` :8203 | ONNX timm |
+| czytnik OCR (`kod`) | `train_ocr.rs` | `ocr-training` :8204 | `adr_ocr.onnx` + alfabet |
+
+**Bramka `approved` jest obowiązkowa dla każdego toru.** Do treningu wchodzą WYŁĄCZNIE obrazy
+z `approved: true` (edytor, „Zapisz i zatwierdź"); predykcje auto-labela z `predicted: true`,
+których nikt nie obejrzał, nie mogą uczyć modelu na jego własnych wyjściach. Detekcja filtruje
+w `pool_splits` (Core), pozostałe tory w `_collect_*` serwisu. Dataset, w którym ŻADEN obraz nie
+ma pola `approved`, nie przeszedł przez nasz edytor (zewnętrzny COCO) i idzie w całości.
+
+Tor OCR uczy się na WIERSZACH wycinków: wartość atrybutu typu `ocr` w formacie
+`<kemler>/<UN>` (np. `99/3257`) etykietuje górny i dolny wiersz tablicy, ciętej tą samą 6%
+przerwą co runtime (`SPLIT_MARGIN` w `vision/adr_ocr.rs`). Realne wiersze są mieszane z
+syntetycznymi generowanymi z `adr-list.json` wdrożenia (`synthetic_per_epoch`, `real_repeat`) —
+ręcznych odczytów jest z natury kilkaset. Po sukcesie Core od razu woła `/export`: artefaktem
+toru jest ONNX + alfabet, nie checkpoint torcha, a serwis odrzuca eksport rozjeżdżający się
+liczbowo z modelem. `scripts/train-adr-ocr/` to już tylko harness ewaluacyjny (`eval.py`).
+
+**Anulowanie treningu**: `MlStudioTrainCancelRequest` (jeden wariant dla wszystkich torów) →
+flaga w `live_view` (widzą ją pętle nadzoru Core i pętla transferu datasetu przez mesh) +
+`POST /cancel/{job_id}` serwisu, a dla treningu zdalnego komenda mesh `MlTrainCancel`.
+RF-DETR i LLM anulują się przez ubicie procesu potomnego (`RFDETR.train()` to jedno blokujące
+wywołanie bez callbacku, a torchrun to osobne rangi), klasyfikator i OCR kooperacyjnie na
+batchu. Run osierocony przez restart Core domyka `reconcile_orphan_local_run` — marker
+`register_local_run` odróżnia „nadzorujemy" od „nikt tego nie pilnuje", bez heurystyk czasowych.
+
 ## Admin Scheduler
 
 `tentaflow-core/src/scheduler/`, state in SQLite (`scheduled_jobs`, `scheduled_runs`). Runs
