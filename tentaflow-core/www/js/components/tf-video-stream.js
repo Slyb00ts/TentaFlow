@@ -16,8 +16,19 @@ const DEFAULT_HEIGHT_PX = 320;
 
 // Backoff kolejnych prob resubscribe po zerwaniu strumienia (lag / pad
 // transportu / zamkniecie zrodla). Pierwsza proba szybko (UI nie miga bez
-// powodu), kolejne coraz rzadziej; ostatnia wartosc powtarzana az do sukcesu.
+// powodu), kolejne coraz rzadziej; ostatnia wartosc powtarzana do wyczerpania
+// limitu prob.
 const RESUBSCRIBE_BACKOFF_MS = [1000, 2000, 5000];
+
+// Ile razy probujemy sie wznowic, zanim uznamy strumien za trwale niedostepny.
+// Serwer zwraca `stream_not_registered` ZAROWNO gdy kamera wlasnie wstaje (stan
+// przejsciowy — retry ma sens), JAK I gdy jej u niego nie ma wcale (stan trwaly —
+// retry nie pomoze NIGDY). Klient nie umie tych dwoch rozroznic, wiec probuje
+// przez ~23 s (1+2+5*4) i potem oddaje decyzje uzytkownikowi. Bez tego limitu
+// kazdy martwy kafelek pukal co 5 s bez konca, zasmiecajac konsole i zajmujac
+// slot z puli MAX_STREAM_SUBS_PER_USER (8) — az kolejne kafelki dostawaly
+// falszywy blad o przekroczeniu limitu subskrypcji.
+const MAX_RESUBSCRIBE_ATTEMPTS = 6;
 
 // Watchdog "subskrybowano, ale zero danych": jesli po wyslaniu SubscribeRequest
 // przez ten czas nie przyjdzie ZADEN StreamFrame (nawet init segment), traktujemy
@@ -136,8 +147,12 @@ class TfVideoStream extends HTMLElement {
       video { width: 100%; height: 100%; object-fit: cover; background: #000; display: block; }
       .label { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.7); color: #fff; padding: 4px 10px; border-radius: 4px; font: 12px var(--font-mono, monospace); pointer-events: none; }
       .label[hidden] { display: none; }
-      .status { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted, #999); font-style: italic; pointer-events: none; padding: 0 12px; text-align: center; }
+      .status { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px; align-items: center; justify-content: center; color: var(--text-muted, #999); font-style: italic; pointer-events: none; padding: 0 12px; text-align: center; }
       .status[hidden] { display: none; }
+      /* Przycisk ponowienia to jedyny klikalny element nakladki statusu —
+         reszta zostaje przezroczysta dla zdarzen (dblclick = fullscreen). */
+      .status .retry { pointer-events: auto; font-style: normal; cursor: pointer; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--tf-border, #1f2548); background: var(--tf-bg-3, #131736); color: var(--tf-text, #f5f6ff); font: inherit; }
+      .status .retry:hover { border-color: var(--tf-border-hover, #2f3668); }
     `;
     this._video = document.createElement('video');
     this._video.autoplay = true;
@@ -202,6 +217,27 @@ class TfVideoStream extends HTMLElement {
     } else {
       this._statusEl.hidden = true;
     }
+  }
+
+  /// Kafelek po wyczerpaniu prob: uczciwy komunikat + ręczne ponowienie. Zero
+  /// dalszych automatycznych prób — strumień, którego serwer nie zna, nie wróci
+  /// sam, a pukanie do niego zajmuje slot subskrypcji użytkownika.
+  _showUnavailable() {
+    if (!this._statusEl) return;
+    this._statusEl.hidden = false;
+    this._statusEl.textContent = '';
+    const msg = document.createElement('div');
+    msg.textContent = 'Podgląd niedostępny — serwer nie ma tego strumienia.';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'retry';
+    btn.textContent = 'Ponów';
+    btn.addEventListener('click', () => {
+      this._resubscribeAttempt = 0;
+      this._resetMediaPipeline();
+      this._startSubscription();
+    });
+    this._statusEl.append(msg, btn);
   }
 
   _startSubscription() {
@@ -614,7 +650,14 @@ class TfVideoStream extends HTMLElement {
   _scheduleResubscribe() {
     if (this._disposed) return;
     if (this._resubscribeTimer != null) return;
-    this._setStatus('Łączenie ponownie…');
+    if (this._resubscribeAttempt >= MAX_RESUBSCRIBE_ATTEMPTS) {
+      // Limit wyczerpany: koniec slepych prob, ale powrot transportu to REALNY
+      // sygnal zmiany (nie zgadywanie po timerze), wiec on nadal wznawia kafelek.
+      this._showUnavailable();
+      this._armLifecycleResume();
+      return;
+    }
+    this._setStatus(`Łączenie ponownie… (${this._resubscribeAttempt + 1}/${MAX_RESUBSCRIBE_ATTEMPTS})`);
     const delay =
       RESUBSCRIBE_BACKOFF_MS[Math.min(this._resubscribeAttempt, RESUBSCRIBE_BACKOFF_MS.length - 1)];
     this._resubscribeAttempt += 1;
@@ -625,21 +668,29 @@ class TfVideoStream extends HTMLElement {
     }, delay);
     // Gdy WS lezy, nie czekaj slepo na tick backoffu — jednorazowy listener
     // lifecycle 'open' wznawia subskrypcje od razu po powrocie transportu.
-    if (!ApiBinary.isConnected() && !this._lifecycleUnsub) {
-      this._lifecycleUnsub = ApiBinary.onLifecycle((ev) => {
-        if (ev.type !== 'open') return;
-        if (this._lifecycleUnsub) {
-          this._lifecycleUnsub();
-          this._lifecycleUnsub = null;
-        }
-        if (this._disposed || !this.isConnected) return;
-        if (this._resubscribeTimer != null) {
-          clearTimeout(this._resubscribeTimer);
-          this._resubscribeTimer = null;
-        }
-        this._startSubscription();
-      });
-    }
+    if (!ApiBinary.isConnected()) this._armLifecycleResume();
+  }
+
+  /// Jednorazowy listener lifecycle WS: powrot transportu ('open') zeruje licznik
+  /// prob i wznawia subskrypcje natychmiast. Zerowanie jest tu istotne — bez niego
+  /// dluga przerwa w WS wypalilaby limit prob i kafelek zostalby martwy mimo
+  /// wrocenia lacza.
+  _armLifecycleResume() {
+    if (this._disposed || this._lifecycleUnsub) return;
+    this._lifecycleUnsub = ApiBinary.onLifecycle((ev) => {
+      if (ev.type !== 'open') return;
+      if (this._lifecycleUnsub) {
+        this._lifecycleUnsub();
+        this._lifecycleUnsub = null;
+      }
+      if (this._disposed || !this.isConnected) return;
+      if (this._resubscribeTimer != null) {
+        clearTimeout(this._resubscribeTimer);
+        this._resubscribeTimer = null;
+      }
+      this._resubscribeAttempt = 0;
+      this._startSubscription();
+    });
   }
 
   _stopSubscription(_reason) {
