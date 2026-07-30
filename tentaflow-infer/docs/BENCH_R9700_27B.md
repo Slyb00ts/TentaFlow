@@ -15,21 +15,25 @@ Modele (oba to ten sam checkpoint `ThinkingCap-Qwen3.6-27B-MTP`, `qwen35`,
 llama.cpp: build `3018a11e (109)`, `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201`,
 `-ngl 99 -fa 1`. FORGE: `forge bench --prefix-cache off`.
 
-## 1. Stan wyjściowy — punkt odniesienia
+## 1. Wynik — p1024 / tg128
 
 `llama-bench -p 1024 -n 128` wobec `forge bench --prompt-tokens 1024 --tokens 128`.
 
-| model | miara | FORGE | llama.cpp | |
-|---|---|--:|--:|---|
-| Q4_K_M | prefill p1024 | 842,9 tok/s | **1027,9** tok/s | llama.cpp 1,22x |
-| Q4_K_M | decode tg128 | **27,7** tok/s | 27,4 tok/s | FORGE 1,01x |
-| Q4_K_M | decode tg128 + MTP | **nieobsługiwane** | — | patrz §4 |
-| NVFP4 | prefill p1024 | **1013,4** tok/s | 929,0 tok/s | FORGE 1,09x |
-| NVFP4 | decode tg128 | **29,1** tok/s | 28,0 tok/s | FORGE 1,04x |
-| NVFP4 | decode tg128 + MTP | **66,0** tok/s | brak w llama-bench | 2,27x nad własnym decode |
+| model | miara | FORGE przed | **FORGE teraz** | llama.cpp | |
+|---|---|--:|--:|--:|---|
+| Q4_K_M | prefill p1024 | 842,9 | **1261,7** | 1027,9 | **FORGE 1,23x** |
+| Q4_K_M | decode tg128 | 27,7 | **27,7** | 27,4 | FORGE 1,01x |
+| Q4_K_M | decode tg128 + MTP | *nie startowało* | **55,8** | brak w llama-bench | 2,01x nad własnym decode |
+| NVFP4 | prefill p1024 | 1013,4 | **1282,2** | 929,0 | **FORGE 1,38x** |
+| NVFP4 | decode tg128 | 29,1 | **29,1** | 28,0 | FORGE 1,04x |
+| NVFP4 | decode tg128 + MTP | 66,0 | **66,0** | brak w llama-bench | 2,27x nad własnym decode |
 
 `llama-bench` nie ma trybu spekulatywnego, więc MTP po obu stronach mierzy się
 osobno, na realnym prompcie (§2).
+
+Suma SHA 128 wygenerowanych tokenów jest **ta sama dla obu kwantyzacji, z
+MTP i bez** (`0bf2b86b…`) — czyli ani optymalizacje prefillu, ani spekulacja nie
+zmieniły ani jednego tokena.
 
 ## 2. Realny prompt — jedyny uczciwy pomiar MTP
 
@@ -39,19 +43,16 @@ sam decode (całość minus prefill 56 tokenów).
 
 | model | tryb | FORGE | llama.cpp | |
 |---|---|--:|--:|---|
-| Q4_K_M | bez spekulacji | 26,6 tok/s | **27,3** tok/s | llama.cpp 1,03x |
-| Q4_K_M | MTP K=3 | **nieobsługiwane** | **36,4** tok/s | luka |
-| NVFP4 | bez spekulacji | **28,2** tok/s | 27,9 tok/s | FORGE 1,01x |
-| NVFP4 | MTP K=3 | 39,2 tok/s | **45,3** tok/s | llama.cpp 1,16x |
-| NVFP4 | zysk z samego MTP | 1,39x | **1,62x** | |
-
-Wniosek jest ten sam co na RDNA3: **bazowy decode mamy na równi albo minimalnie
-lepszy, a przegrywamy na maszynerii spekulacji.** Nasza akceptacja to 1,35
-zaakceptowanego tokena na krok (2,35x tokenów na forward) — to jest miejsce do
-poprawy, nie same kernele dekodowania.
+| Q4_K_M | bez spekulacji | 27,3 | 27,3 | remis |
+| Q4_K_M | MTP K=3 | **37,6** | 36,4 | **FORGE 1,03x** |
+| NVFP4 | bez spekulacji | **28,6** | 27,9 | FORGE 1,03x |
+| NVFP4 | MTP K=3 | 40,6 | **46,4** | llama.cpp 1,14x |
 
 Syntetyczny prompt z ziarna tokenizera zawyża MTP po obu stronach (model
-przewiduje sam siebie): stąd 66,0 tok/s w §1 wobec 39,2 tok/s tutaj.
+przewiduje sam siebie): stąd 66,0 tok/s w §1 wobec 40,6 tok/s tutaj.
+
+**Została jedna przegrana komórka w całej tabeli: MTP na NVFP4.** Rozbicie
+poniżej pokazuje, że nie jest to koszt cyklu, tylko akceptacja draftu.
 
 ## 3. Optymalizacja prefillu — co dało ile
 
@@ -195,13 +196,24 @@ tensory są w innych formatach niż w wariancie NVFP4:
 
 ## 5. Czego jeszcze brakuje
 
-1. **Akceptacja draftu MTP.** 1,35 tokena na krok wobec zysku 1,62x u llama.cpp
-   na tym samym pliku NVFP4. Rozbicie kosztu (profil `rocprofv3` decode):
-   cykl weryfikacji kosztuje u nas ~1,69x zwykłego forwardu, u llama.cpp ~1,45x.
-   To NIE jest koszt targetu — ten batchuje T=4 poprawnie (bez spekulacji
-   28,9 ms/forward, z MTP 3,7 s wobec 7,4 s GPU na te same 256 tokenów) — tylko
-   koszt samych propozycji: głowa draftu Q8_0 to 466 ms z 3,7 s cyklu.
-   `FORGE_MTP_DRAFT_HEAD=nvfp4` jest gotowym eksperymentem na ten koszt.
+1. **Akceptacja draftu MTP na NVFP4** — jedyna przegrana komórka. Zmierzone, a
+   nie zgadnięte, że to NIE jest koszt cyklu:
+   - target batchuje T=4 poprawnie: profil `rocprofv3` daje 7,4 s GPU na 256
+     tokenów bez spekulacji i 3,7 s z MTP na te same 256 tokenów, czyli praca
+     targetu na token spada 2,8x (20 -> 7,2 ms);
+   - na syntetycznym prompcie przyspieszenie (2,27x) zgadza się z tym stosunkiem,
+     na realnym wychodzi 1,42x — różnicę robi WYŁĄCZNIE akceptacja (2,35 wobec
+     ~3,9 tokena na forward);
+   - `FORGE_MTP_DRAFT_HEAD=nvfp4` podnosi akceptację (1,35 -> 1,44/krok), ale
+     przebieg jest WOLNIEJSZY (5,78 s wobec 4,97 s) — tańsza głowa draftu nie
+     jest tu dźwignią;
+   - K=2 wobec K=3 to remis (4,93 s wobec 4,96 s), więc długość draftu też nie.
+
+   Zostaje jakość samego proposera MTP. llama.cpp wyciąga na tym pliku 1,66x
+   wobec naszych 1,42x przy tej samej głowie NextN, więc różnica siedzi w tym,
+   ILE tokenów draftu przechodzi weryfikację, a nie w tym, ile kosztuje jeden
+   cykl. To jest następny odcinek do zrobienia i wymaga porównania samych
+   propozycji token po tokenie, a nie kolejnego pomiaru przepustowości.
 2. **Kafle WMMA stoją na ~55% szczytu karty** (100 TFLOPS wobec zmierzonych 179
    TFLOPS f16 WMMA; int8 WMMA ma 354 TOPS). Jednostka int8 nie jest tu prostym
    zyskiem: skala Q4_K/Q6_K zmienia się co 32 kolumny, więc akumulator int32
