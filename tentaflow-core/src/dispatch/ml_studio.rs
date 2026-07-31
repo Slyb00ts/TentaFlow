@@ -5386,6 +5386,7 @@ fn stage_into_vision_dir(
 /// stage'owane, a promowane dopiero gdy OBA się skopiowały — inaczej awaria w
 /// połowie zostawiłaby model nowy, a alfabet stary (CTC dekodowałby wtedy cyframi
 /// z innego zestawu, czyli po cichu bzdury).
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 async fn publish_ocr_reader(metrics: &serde_json::Value) -> Result<(), String> {
     const MODEL_FILE: &str = "adr_ocr.onnx";
     const ALPHABET_FILE: &str = "adr_ocr_alphabet.txt";
@@ -5485,15 +5486,33 @@ pub async fn ml_studio_vision_model_publish(
     // w rejestrze ani aliasie. Publikacja to więc podmiana tych dwóch plików —
     // model bez alfabetu jest bezużyteczny, więc lecą razem.
     if model.framework == "ocr-crnn" {
-        return match publish_ocr_reader(&metrics).await {
-            Ok(()) => {
-                // Proces trzyma silnik w cache; bez zrzucenia go operator
-                // widziałby sukces i stare odczyty aż do restartu.
-                crate::vision::adr_ocr::invalidate();
-                respond(true, None)
-            }
-            Err(e) => respond(false, Some(e)),
-        };
+        // Apple nie ma tego czytnika: `vision::adr_ocr` jest tam wycięty
+        // (`cfg(not(macos|ios))`), bo OCR pokrywa `apple_ocr`. Podmiana plików nie
+        // miałaby czego uruchomić, więc odmawiamy wprost zamiast zapisywać model,
+        // którego nic nie wczyta.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            return respond(
+                false,
+                Some(
+                    "czytnik ADR nie jest dostępny na macOS/iOS (OCR idzie przez apple_ocr) \
+                     — opublikuj go na węźle z tą ścieżką wizji"
+                        .to_string(),
+                ),
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            return match publish_ocr_reader(&metrics).await {
+                Ok(()) => {
+                    // Proces trzyma silnik w cache; bez zrzucenia go operator
+                    // widziałby sukces i stare odczyty aż do restartu.
+                    crate::vision::adr_ocr::invalidate();
+                    respond(true, None)
+                }
+                Err(e) => respond(false, Some(e)),
+            };
+        }
     }
 
     // Nazwa w rejestrze staje się nazwą pliku na dysku — waliduj regułą repozytorium

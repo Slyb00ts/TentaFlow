@@ -836,7 +836,7 @@ fn session_builder_with_eps(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (trt_cache_dir, trt_profile, device_id);
+        let _ = (trt_cache_dir, trt_profile, device_id, with_tensorrt);
         // CoreML (Metal/ANE) — akceleracja na Apple Silicon.
         eps.push(ort::ep::CoreML::default().build());
     }

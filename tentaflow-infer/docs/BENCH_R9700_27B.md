@@ -1005,6 +1005,32 @@ Zostało 128 uruchomień w zasięgu tej samej metody (`silu_mul` 64,
 `gated_rmsnorm` 48, `sigmoid_mul` 16), warte razem około 0,5 ms, czyli okolice
 31,5 tok/s.
 
+**NAJWIĘKSZA POZOSTAŁA POZYCJA: ścieżka hybrydowa nie używa scalonego łańcucha
+FFN, który JUŻ ISTNIEJE.** Model gęsty scala `gate` i `up` w jeden bufor przy
+ładowaniu (`fused_gate_up_layers`) i dzięki temu idzie kernelami
+`gemv_norm_silu_*_dp4a_f16` (norma + para `gate`/`up` + `silu` w JEDNYM
+uruchomieniu) oraz `gemv_residual_*` (projekcja z dodaniem rezyduum w miejscu).
+`load_hybrid` ustawia `fused_gate_up_layers: 0`, więc hybryda liczy to samo
+trzema osobnymi uruchomieniami na warstwę: `rmsnorm_residual`, grupowy GEMV
+`gate`/`up`, `silu_mul`.
+
+Rachunek, dlaczego to jest warte roboty — i dlaczego NIE jest sprzeczne z
+odrzuceniem fuzji normy w szeroki GEMV opisanym wyżej. Tamten rachunek dotyczył
+kernela o 4352 blokach: każdy przeliczałby normę, dokładając 43 MB ruchu L2.
+Kernel parowy liczy `gate` i `up` w TEJ SAMEJ fali i ma `rows_per_warp`
+iteracji, więc dla `inter = 17408` jego siatka to około 544 bloków — osiem razy
+mniej. Ten sam przeliczony norm kosztuje tam ~5,4 MB, czyli około 3 us, wobec
+7,4 us oszczędzonych na samym uruchomieniu. Bilans odwraca się na plus WYŁĄCZNIE
+dzięki parowaniu; to jest ta sama liczba widziana z drugiej strony.
+
+Do zdjęcia: 128 uruchomień `rmsnorm_residual`, 64 `silu_mul` i część grupowych
+GEMV-ów — rzędu 200 na token, czyli ~0,7 ms samego przestoju plus praca. Warunki:
+loader hybrydowy musi scalać `gate|up` w jeden bufor, a projekcje wyjściowe
+miksera i `down` muszą przejść na warianty `gemv_residual_*`, żeby rezyduum
+dodawało się w tym samym uruchomieniu. Numeryka jest opisana w
+`_norm_quant_to_shared`: kody int8 są bitowo takie same jak przy kwantyzacji
+osobno zapisanego `x`, więc bramką pozostaje suma SHA.
+
 **`gated_rmsnorm` do skanu DeltaNet — ODRZUCONE ANALIZĄ, nie próbą.** Kształt
 kusi, bo oba są per głowica V, ale skan ValueKey ma `COLUMN_TILES = 32`, czyli
 128 kolumn jednej głowicy liczą 32 OSOBNE bloki. Redukcja normy po głowicy
