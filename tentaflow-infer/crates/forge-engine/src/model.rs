@@ -1021,6 +1021,7 @@ impl PrefillTrace {
     }
 }
 
+#[derive(Clone)]
 pub struct ModelConfig {
     /// Budżet pamięci hosta (bajty) na wagi, które nie zmieszczą się w VRAM.
     /// GPU czyta je wprost przez PCIe, więc model większy od karty daje się
@@ -1099,6 +1100,24 @@ pub fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+/// Podział SPMD: pozostałe rangi i to, czego wymaga redukcja między nimi.
+///
+/// Ranga to pełny `Model` zbudowany na swojej karcie z deskryptora o
+/// PODZIELONYCH liczbach głowic i wymiarze pośrednim. Dzięki temu nie ma zakresu
+/// głowic do przewlekania przez silnik: ranga po prostu widzi mniejszy model, a
+/// pętla warstw, KV, stan DeltaNet i bufory aktywacji są te, które `Model` już
+/// umie sobie zbudować.
+struct TpSpmd {
+    /// Rangi 1..world. Ranga zerowa to model, który to pole trzyma.
+    ranks: Vec<Model>,
+    /// Zdarzenie każdej rangi (zerowej włącznie) do porządkowania redukcji.
+    events: Vec<Event>,
+    /// Akumulator f32 redukcji, na karcie rangi zbierającej.
+    acc: DevBuffer,
+    /// Bufor przywożonej sumy cząstkowej, na karcie rangi zbierającej.
+    staging: DevBuffer,
+}
+
 pub struct Model {
     /// Pierwsza warstwa TEGO etapu w numeracji całego modelu. Zero oznacza etap
     /// pierwszy, który liczy embedding; wyższa wartość — etap dostający stan
@@ -1139,6 +1158,9 @@ pub struct Model {
     hybrid_verify_graph_disabled: HashSet<(usize, usize)>,
     /// FFN rozłożony na karty. `None` = cały model liczy jedna karta.
     tp_ffn: Option<crate::tensor_parallel::TpDecode>,
+    /// Pozostałe rangi podziału SPMD. `Some` wyłącznie na randze zerowej, która
+    /// jest jedynym wejściem do modelu i prowadzi pętlę warstw za wszystkie.
+    tp: Option<Box<TpSpmd>>,
     /// Suma cząstkowa tej rangi w f32, `[hidden]`. `Some` wyłącznie wtedy, gdy
     /// model jest fragmentem podziału tensor-parallel (`world > 1`).
     ///
@@ -2560,6 +2582,89 @@ impl Model {
         );
     }
 
+    /// Ładuje model rozłożony na `devices` jako podział tensor-parallel.
+    ///
+    /// KOLEJNOŚĆ JEST WYMUSZONA: rangi powstają PIERWSZE, a dostęp P2P otwiera
+    /// się dopiero nad ICH urządzeniami. Odwrotna kolejność — otwarcie kart
+    /// najpierw, a potem budowanie na nich modeli — dałaby na każdej karcie
+    /// drugi komplet pul pamięci i drugi zestaw artefaktów kerneli, a bufory,
+    /// na których liczy redukcja, nie byłyby tymi, na których liczy ranga.
+    pub fn load_tp(devices: &[Arc<dyn Device>], path: &Path, cfg: ModelConfig) -> Result<Self> {
+        let world = devices.len();
+        if world < 2 {
+            return Err(ForgeError::Scheduler(
+                "podział tensor-parallel wymaga co najmniej dwóch kart".into(),
+            ));
+        }
+        let mut ranks = Vec::with_capacity(world);
+        for (rank, device) in devices.iter().enumerate() {
+            let mut rank_cfg = cfg.clone();
+            rank_cfg.tp_shard = forge_formats::TpShard::new(rank, world)?;
+            let model = Model::load_gguf(device.clone(), path, rank_cfg)?;
+            model.tp_refuse_uncovered(&cfg)?;
+            ranks.push(model);
+        }
+        if !crate::cluster::enable_peer_mesh(devices) {
+            tracing::warn!(
+                "rangi nie widzą swojej pamięci — obie redukcje na warstwę pójdą przez hosta"
+            );
+        }
+        let mut zero = ranks.remove(0);
+        let hidden = zero.weights.descriptor.params.hidden_size;
+        let events = std::iter::once(&zero)
+            .chain(ranks.iter())
+            .map(|member| member.device.create_event())
+            .collect::<Result<Vec<_>>>()?;
+        let acc = zero
+            .device
+            .alloc(hidden * 4, MemKind::Device, Pool::Activations)?;
+        let staging = zero
+            .device
+            .alloc(hidden * 4, MemKind::Device, Pool::Activations)?;
+        tracing::info!(
+            world,
+            hidden,
+            heads = zero.weights.descriptor.params.n_heads,
+            kv_heads = zero.weights.descriptor.params.n_kv_heads,
+            inter = zero.weights.descriptor.params.intermediate_size,
+            "model podzielony na rangi; każda widzi swój fragment"
+        );
+        zero.tp = Some(Box::new(TpSpmd {
+            ranks,
+            events,
+            acc,
+            staging,
+        }));
+        Ok(zero)
+    }
+
+    /// Odmawia wszystkiego, czego sterownik podziału jeszcze nie prowadzi.
+    ///
+    /// Ścieżka, której podział nie obejmuje, nie liczy się źle w sposób widoczny:
+    /// ranga po prostu użyłaby pociętej macierzy bez redukcji i wyprodukowała
+    /// tekst-śmieć bez błędu i bez asercji. Dlatego to jest twarda odmowa przy
+    /// starcie, a nie ostrzeżenie.
+    fn tp_refuse_uncovered(&self, cfg: &ModelConfig) -> Result<()> {
+        let refuse = |what: &str| -> Result<()> {
+            Err(ForgeError::Unsupported(format!(
+                "podział na rangi nie obejmuje jeszcze: {what}"
+            )))
+        };
+        if !self.is_hybrid() {
+            return refuse("modeli innych niż hybrydowe");
+        }
+        if self.weights.is_moe() {
+            return refuse("warstw MoE");
+        }
+        if cfg.native_mtp {
+            return refuse("natywnej głowy MTP/NextN");
+        }
+        if cfg.kv_tier.enabled() {
+            return refuse("tieringu KV");
+        }
+        Ok(())
+    }
+
     pub fn load_gguf(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Result<Self> {
         let kernels = Kernels::load(device.clone())?;
         let stream = device.create_stream()?;
@@ -3085,6 +3190,7 @@ impl Model {
             hybrid_verify_graphs: HashMap::new(),
             hybrid_verify_graph_disabled: HashSet::new(),
             tp_ffn: None,
+            tp: None,
             tp_partial,
             decode_graph: None,
             decode_hybrid_graph: None,
@@ -3389,6 +3495,7 @@ impl Model {
         let pool = self.hybrid_states.as_mut().ok_or_else(|| {
             ForgeError::Scheduler("model hybrydowy nie ma puli stanów DeltaNet".into())
         })?;
+        let fresh = seq.hybrid_state.is_none();
         let lease = match seq.hybrid_state {
             Some(lease) => lease,
             None => {
@@ -3397,7 +3504,29 @@ impl Model {
                 lease
             }
         };
-        pool.activate(lease, &self.stream)
+        pool.activate(lease, &self.stream)?;
+        // Stan DeltaNet jest per ranga (ranga liczy własne głowice), ale slot i
+        // generacja muszą być te same, bo lease jest jeden na sekwencję. Pule
+        // rang są identyczne i dostają te same wołania, więc `acquire` wybiera
+        // ten sam slot — sprawdzane, bo rozjazd dałby rangę liczącą na cudzym
+        // stanie bez żadnego błędu.
+        for index in 0..self.tp_rank_count() {
+            let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
+            let pool = rank.hybrid_states.as_mut().ok_or_else(|| {
+                ForgeError::Scheduler("ranga podziału nie ma puli stanów DeltaNet".into())
+            })?;
+            if fresh {
+                let mirrored = pool.acquire()?;
+                if mirrored != lease {
+                    return Err(ForgeError::Scheduler(format!(
+                        "ranga {} wzięła inny slot stanu DeltaNet niż ranga zerowa",
+                        index + 1
+                    )));
+                }
+            }
+            pool.activate(lease, &rank.stream)?;
+        }
+        Ok(())
     }
 
     fn active_ssm(&self) -> &[Option<SsmState>] {
@@ -8290,7 +8419,7 @@ impl Model {
             // Krok obejmujący dwie karty idzie jawnym łańcuchem: przechwycenie
             // rozwidlenia strumienia między kartami ROCm przerywa asercją we
             // własnym runtime (patrz `run_step`).
-            if self.tp_ffn.is_some() || !hybrid_decode_graph_requested() {
+            if self.tp_ffn.is_some() || self.tp.is_some() || !hybrid_decode_graph_requested() {
                 return self.hybrid_forward_staged(true, AttnSrc::Paged);
             }
             if self.decode_hybrid_graph.is_none() {
@@ -8415,7 +8544,11 @@ impl Model {
             &self.stream,
         )?;
         self.device
-            .record_event(&self.staging_events[slot], &self.stream)
+            .record_event(&self.staging_events[slot], &self.stream)?;
+        for rank in self.tp_ranks() {
+            rank.upload_decode_inputs(token_id, pos)?;
+        }
+        Ok(())
     }
 
     /// Upload `seq`'s page table (pinned staging + async H2D) and mark it as
@@ -8448,6 +8581,13 @@ impl Model {
         self.device
             .record_event(&self.staging_events[slot], &self.stream)?;
         self.pt_seq = seq.id;
+        // Strony przydziela WYŁĄCZNIE ranga zerowa, a pozostałe indeksują nimi
+        // swoje własne slaby. Dzięki temu listy wolnych stron nie mogą się
+        // rozjechać: poza rangą zerową nikt niczego nie przydziela.
+        for index in 0..self.tp_rank_count() {
+            let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
+            rank.upload_page_table(seq)?;
+        }
         Ok(())
     }
 
@@ -15931,6 +16071,10 @@ impl Model {
     /// Allocate the hybrid single-token scratch (gated-attention de-interleave +
     /// DeltaNet conv/recurrence buffers) on first use.
     fn ensure_hybrid_bufs(&mut self) -> Result<()> {
+        for index in 0..self.tp_rank_count() {
+            let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
+            rank.ensure_hybrid_bufs()?;
+        }
         let rows = self.batch_cap.max(1);
         if self
             .hybrid_bufs
@@ -16025,7 +16169,13 @@ impl Model {
             &self.stream,
         )?;
         self.device
-            .record_event(&self.staging_events[slot], &self.stream)
+            .record_event(&self.staging_events[slot], &self.stream)?;
+        // Strumień rezydualny jest replikowany, więc embedding musi wylądować na
+        // KAŻDEJ randze — inaczej rangi liczyłyby swoje fragmenty z różnych wejść.
+        for rank in self.tp_ranks() {
+            rank.stage_hybrid_embedding(token_id)?;
+        }
+        Ok(())
     }
 
     /// Jedna warstwa kroku dekodowania modelu hybrydowego.
@@ -16127,7 +16277,118 @@ impl Model {
 
     /// Krok hybrydowy OD wstawionego embeddingu — bez niczego zależnego od
     /// `token_id`, więc nadaje się do przechwycenia w graf.
+    /// Rangi POZA zerową. Pusto, gdy model liczy jedna karta.
+    fn tp_ranks(&self) -> impl Iterator<Item = &Model> {
+        self.tp
+            .as_ref()
+            .map(|tp| tp.ranks.as_slice())
+            .unwrap_or_default()
+            .iter()
+    }
+
+    fn tp_rank_count(&self) -> usize {
+        self.tp.as_ref().map_or(0, |tp| tp.ranks.len())
+    }
+
+    /// Rangi podziału w kolejności numerów: zerowa, potem reszta.
+    fn tp_members(&self) -> impl Iterator<Item = &Model> {
+        std::iter::once(self).chain(
+            self.tp
+                .as_ref()
+                .map(|tp| tp.ranks.as_slice())
+                .unwrap_or_default()
+                .iter(),
+        )
+    }
+
+    /// Domyka jeden punkt redukcji: sumy cząstkowe rang wchodzą, a każda ranga
+    /// wychodzi z pełnym wektorem we wskazanym buforze f16.
+    ///
+    /// Obie rangi potrzebują wyniku, bo każda liczy własny `rmsnorm_residual` na
+    /// własnym strumieniu rezydualnym — a ten jest replikowany za darmo, skoro
+    /// wagi norm ładują się jako `Replicated`.
+    fn tp_all_reduce(&self, out_of: fn(&DecodeBufs) -> &DevBuffer) -> Result<()> {
+        let tp = self
+            .tp
+            .as_ref()
+            .ok_or_else(|| ForgeError::Scheduler("redukcja bez aktywnego podziału".into()))?;
+        let members: Vec<&Model> = self.tp_members().collect();
+        let ranks: Vec<crate::cluster::ReduceRank<'_>> = members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| crate::cluster::ReduceRank {
+                device: member.device.as_ref(),
+                stream: &member.stream,
+                kernels: &member.kernels,
+                done: &tp.events[index],
+                part: member.tp_partial.as_ref(),
+            })
+            .collect();
+        let out: Vec<&DevBuffer> = members.iter().map(|m| out_of(&m.bufs)).collect();
+        crate::cluster::all_reduce_f16(
+            &ranks,
+            0,
+            &tp.acc,
+            &tp.staging,
+            &out,
+            self.weights.descriptor.params.hidden_size,
+        )
+    }
+
+    /// Krok modelu hybrydowego rozłożony na rangi.
+    ///
+    /// To jest CAŁY sterownik podziału: ta sama warstwa wykonuje się na każdej
+    /// randze na jej fragmencie wag, a między częściami stoją dokładnie dwie
+    /// redukcje — po projekcji wyjściowej miksera i po `down` FFN. Prefill,
+    /// dekodowanie i każda inna ścieżka przechodząca przez warstwę dostają
+    /// podział z tego jednego miejsca, bo `T` jest parametrem, a nie osobną
+    /// architekturą.
+    fn hybrid_forward_staged_tp(&self, want_logits: bool) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let n_layers = self.weights.layers.len();
+        for member in self.tp_members() {
+            member.kernels.rmsnorm_f16(
+                &member.bufs.x,
+                &member.bufs.h,
+                &member.weights.layers[0].attn_norm,
+                1,
+                hidden,
+                eps,
+                &member.stream,
+            )?;
+        }
+        for l in 0..n_layers {
+            for member in self.tp_members() {
+                member.hybrid_decode_mixer(l, &AttnSrc::Paged)?;
+            }
+            self.tp_all_reduce(|b| &b.o_out)?;
+            for member in self.tp_members() {
+                member.hybrid_decode_ffn(l)?;
+            }
+            self.tp_all_reduce(|b| &b.down)?;
+            for member in self.tp_members() {
+                member.hybrid_decode_residual(l)?;
+            }
+        }
+        if want_logits {
+            // Głowa logitów jest replikowana, więc liczy ją ranga zerowa na
+            // swoim (już pełnym) strumieniu rezydualnym.
+            self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        }
+        Ok(())
+    }
+
     fn hybrid_forward_staged(&self, want_logits: bool, src: AttnSrc) -> Result<()> {
+        if self.tp.is_some() {
+            let AttnSrc::Paged = src else {
+                return Err(ForgeError::Unsupported(
+                    "podział na rangi nie obejmuje uwagi ze stagingu tieringu".into(),
+                ));
+            };
+            return self.hybrid_forward_staged_tp(want_logits);
+        }
         let p = self.weights.descriptor.params.clone();
         let hidden = p.hidden_size;
         let eps = p.rms_norm_eps;
@@ -16596,12 +16857,17 @@ impl Model {
     /// the resident DeltaNet state advances untouched.
     fn prefill_hybrid(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
         self.activate_hybrid_sequence(seq)?;
-        if tokens.len() >= 32 && self.hybrid_layer_major_route_capable() {
+        // Warianty layer-major i batchowy liczą warstwę własnym kodem, poza
+        // dwoma punktami redukcji, więc na randze z pociętymi wagami dałyby
+        // wynik po cichu zły. Podział prowadzi prefill token po tokenie — przez
+        // tę samą warstwę co dekodowanie, a więc z redukcjami na miejscu.
+        let split = self.tp.is_some();
+        if !split && tokens.len() >= 32 && self.hybrid_layer_major_route_capable() {
             return self.prefill_hybrid_layer_major(seq, tokens);
         }
         let batched_enabled =
             std::env::var("FORGE_HYBRID_BATCH_PREFILL").map_or(true, |value| value != "0");
-        if batched_enabled && tokens.len() > 1 && self.hybrid_batched_prefill_capable() {
+        if !split && batched_enabled && tokens.len() > 1 && self.hybrid_batched_prefill_capable() {
             return self.prefill_hybrid_batched(seq, tokens);
         }
         self.ensure_hybrid_bufs()?;

@@ -85,6 +85,7 @@ async fn constrained_decoding_end_to_end() {
                     kv_tier: Default::default(),
                     prefix_cache: false,
                     layer_range: None,
+                    tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
                     native_mtp: false,
                     nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
                     nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,

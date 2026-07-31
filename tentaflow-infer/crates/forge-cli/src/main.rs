@@ -24,7 +24,7 @@ use forge_formats::PoolingType;
 use forge_hal::Device;
 use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{
-    kv_pool_bytes, load_model, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
+    kv_pool_bytes, load_model, load_model_tp, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
 };
 use forge_server::toolcall::ToolParserKind;
 use forge_server::{EmbedModel, ServerConfig, ServerState, SharedEmbed};
@@ -286,6 +286,12 @@ enum Command {
         /// modeli gęstych z wagami Q8_0; prefill zostaje na jednej karcie.
         #[arg(long = "tp-cards")]
         tp_cards: Option<String>,
+        /// Podział SPMD na N kart: model jest dzielony RAZ, przy ładowaniu, a
+        /// każda karta wykonuje tę samą pętlę warstw na swoim fragmencie każdej
+        /// macierzy. Obejmuje modele hybrydowe; dzielnik musi dzielić liczbę
+        /// głowic KV. 1 (domyślnie) = jedna karta.
+        #[arg(long = "tp", default_value_t = 1)]
+        tp: usize,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -530,6 +536,7 @@ fn main() -> Result<()> {
             prefix_cache,
             speculative,
             tp_cards,
+            tp,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -557,6 +564,7 @@ fn main() -> Result<()> {
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
                 parse_tp_cards(tp_cards.as_deref())?,
+                tp,
             )
         }
         Command::Transcribe {
@@ -1304,6 +1312,7 @@ fn load_auto(
     prefix_cache: bool,
     native_mtp: bool,
     nvfp4_gguf_layout: Nvfp4GgufLayout,
+    tp_world: usize,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
@@ -1380,25 +1389,34 @@ fn load_auto(
         free.saturating_sub(pool_reserve_bytes(hal_kv, activations)?)
             .max(1 << 30)
     };
-    let dev: Arc<dyn Device> = gpu::open(
-        0,
-        PoolSizes {
+    // Podział na rangi: każda karta dostaje pule liczone z WŁASNEJ wolnej
+    // pamięci, bo trzyma swój fragment wag i swój fragment KV. Karty otwierają
+    // się tutaj, a dostęp P2P nad nimi dopiero po zbudowaniu modeli — inaczej
+    // każda karta płaciłaby drugim kompletem pul.
+    let pools = |ordinal: usize| -> Result<PoolSizes> {
+        let weights = if weights_pool_gb > 0.0 {
+            ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+                .checked_add(stage)
+                .context("rozmiar puli wag i staging przekracza zakres usize")?
+        } else {
+            let free = gpu::free_vram(ordinal).context("query free VRAM")?;
+            free.saturating_sub(pool_reserve_bytes(hal_kv, activations)?)
+                .max(1 << 30)
+        };
+        Ok(PoolSizes {
             weights,
             kv_cache: hal_kv,
             activations,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
-        },
-    )
-    .context("open GPU device")?;
-    // Wagi, które nie mieszczą się w puli VRAM, mają zjechać do RAM, a potem na
-    // NVMe — automatycznie. Bez tego model większy od karty kończy się błędem
-    // pamięci, mimo że w maszynie jest i RAM, i dysk.
-    let (weight_host_budget, weight_spill_dir) =
-        resolve_offload(path, weights, weight_host_gb, weight_spill_dir)?;
-    load_model(
-        dev,
-        path,
-        ModelConfig {
+        })
+    };
+    let config = |weights: usize| -> Result<ModelConfig> {
+        // Wagi, które nie mieszczą się w puli VRAM, mają zjechać do RAM, a potem
+        // na NVMe — automatycznie. Bez tego model większy od karty kończy się
+        // błędem pamięci, mimo że w maszynie jest i RAM, i dysk.
+        let (weight_host_budget, weight_spill_dir) =
+            resolve_offload(path, weights, weight_host_gb, weight_spill_dir.clone())?;
+        Ok(ModelConfig {
             weight_host_budget,
             weight_spill_dir,
             kv_quant,
@@ -1412,8 +1430,30 @@ fn load_auto(
             nvfp4_ct_layout: resolve_nvfp4_ct_layout_from_env()?,
             layer_range: None,
             tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
-        },
-    )
+        })
+    };
+    if tp_world > 1 {
+        let visible = gpu::enumerate().len();
+        if visible < tp_world {
+            anyhow::bail!("--tp {tp_world}: widocznych jest {visible} kart");
+        }
+        let mut devices = Vec::with_capacity(tp_world);
+        let mut first_weights = 0usize;
+        for ordinal in 0..tp_world {
+            let sizes = pools(ordinal)?;
+            if ordinal == 0 {
+                first_weights = sizes.weights;
+            }
+            devices.push(
+                gpu::open(ordinal, sizes).with_context(|| format!("open GPU device {ordinal}"))?,
+            );
+        }
+        return load_model_tp(&devices, path, config(first_weights)?);
+    }
+    let sizes = pools(0)?;
+    let weights = sizes.weights;
+    let dev: Arc<dyn Device> = gpu::open(0, sizes).context("open GPU device")?;
+    load_model(dev, path, config(weights)?)
 }
 
 /// Load a Whisper model on its own GPU device with pools sized from the
@@ -1510,6 +1550,7 @@ fn cmd_embed(
         false,
         false,
         Nvfp4GgufLayout::RowMajor36,
+        1,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
@@ -1915,6 +1956,7 @@ fn cmd_run(
     prefix_cache: bool,
     spec: SpeculativeConfig,
     tp_cards: Vec<forge_hal::gpu::DeviceId>,
+    tp_world: usize,
 ) -> Result<()> {
     // Ustawienia domyślne bierze profil modelu; flagi CLI je nadpisują. Bez tego
     // `forge run <model> "<prompt>"` losowałby przy temperaturze 0,7 i podawał
@@ -1962,6 +2004,7 @@ fn cmd_run(
             SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
         ),
         Nvfp4GgufLayout::RowMajor36,
+        tp_world,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
@@ -2081,6 +2124,7 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         false,
         false,
         Nvfp4GgufLayout::RowMajor36,
+        1,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     maybe_calibrate_w4a8(
@@ -2298,6 +2342,7 @@ fn cmd_bench(
             SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
         ),
         resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
+        1,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     enable_tp_ffn_with(

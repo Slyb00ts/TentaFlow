@@ -362,6 +362,28 @@ pub fn load_model(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Res
     })
 }
 
+/// Jak `load_model`, ale model jest rozłożony na `devices` jako podział
+/// tensor-parallel. Tokenizer i szablon są jedne — dotyczą modelu, nie rangi.
+pub fn load_model_tp(
+    devices: &[Arc<dyn Device>],
+    path: &Path,
+    cfg: ModelConfig,
+) -> Result<LoadedModel> {
+    if path.is_dir() {
+        anyhow::bail!("podział na rangi czyta na razie wyłącznie pojedynczy plik GGUF");
+    }
+    let gguf = Gguf::open(path)?;
+    let bundle = load_tokenizer_gguf(&gguf)?;
+    drop(gguf);
+    let model = Model::load_tp(devices, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let chat_template = bundle.resolve_template(&model.weights.descriptor.arch)?;
+    Ok(LoadedModel {
+        model,
+        bundle,
+        chat_template,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

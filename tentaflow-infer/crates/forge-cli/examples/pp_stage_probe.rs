@@ -75,6 +75,7 @@ fn main() {
         kv_pages: 16,
         prefix_cache: false,
         layer_range: range,
+        tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
         ..ModelConfig::default()
     };
 

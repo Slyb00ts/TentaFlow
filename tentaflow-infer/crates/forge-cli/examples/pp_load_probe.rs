@@ -35,6 +35,7 @@ fn main() {
                 kv_pages: 8,
                 prefix_cache: false,
                 layer_range: Some((first, count)),
+                tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
                 ..ModelConfig::default()
             },
         )
