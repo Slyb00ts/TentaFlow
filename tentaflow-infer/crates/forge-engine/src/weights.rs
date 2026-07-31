@@ -3534,7 +3534,7 @@ impl ModelWeights {
 
     fn load(
         device: &dyn Device,
-        descriptor: ModelDescriptor,
+        mut descriptor: ModelDescriptor,
         src: &dyn TensorSource,
         native_mtp: bool,
         target_tile: Option<(&Kernels, &forge_hal::Stream, &Cell<usize>)>,
@@ -3549,10 +3549,17 @@ impl ModelWeights {
         // Hybrid attention/DeltaNet arches (qwen35moe) have per-layer weight
         // sets that differ by kind and a gated attention Q projection the
         // generic shape checks would reject; they take a dedicated loader.
-        if shard.world > 1 && (descriptor.arch == "deepseek_v4" || descriptor.params.ssm.is_none())
-        {
+        if shard.world > 1 && descriptor.arch == "deepseek_v4" {
             return Err(ForgeError::Unsupported(
-                "podział tensor-parallel jest opisany dla architektury hybrydowej".into(),
+                "podział tensor-parallel nie obejmuje uwagi latentnej DeepSeeka V4".into(),
+            ));
+        }
+        // Naprzemienna geometria uwagi (Gemma 4) ma inne `q_dim`/`kv_dim` w
+        // różnych warstwach, a plan podziału liczy się z JEDNEJ liczby głowic.
+        // Podział po takim planie dałby randze cudze głowice w połowie warstw.
+        if shard.world > 1 && descriptor.params.alt_attn.is_some() {
+            return Err(ForgeError::Unsupported(
+                "podział tensor-parallel nie obejmuje naprzemiennej geometrii uwagi".into(),
             ));
         }
         if descriptor.arch == "deepseek_v4" {
@@ -3583,6 +3590,11 @@ impl ModelWeights {
                 .ok_or_else(|| ForgeError::Format(format!("missing global weight {role:?}")))
         };
 
+        // Plan cięcia opisuje wycinek PEŁNEJ macierzy, więc liczy się z pełnych
+        // hiperparametrów; deskryptor, który zostaje w modelu, ma już kształty
+        // rangi, żeby cała reszta silnika widziała po prostu mniejszy model.
+        let full_params = descriptor.params.clone();
+        let plan = |role: WeightRole| -> Result<RoleShard> { shard.role_shard(&full_params, role) };
         let embd_name = global(WeightRole::TokenEmbd)?;
         let (token_embd_f16, vocab, hidden) = upload_embedding(device, src, embd_name)?;
         let output_norm = upload_norm(device, src, global(WeightRole::OutputNorm)?)?;
@@ -3697,15 +3709,21 @@ impl ModelWeights {
                 permute_rope_pairs(&mut q, head_dim)?;
                 permute_rope_pairs(&mut k, head_dim)?;
             }
-            let (q, k) = (q, k);
+            let (q, k) = (
+                shard_host_weight(q, &plan(WeightRole::AttnQ)?)?,
+                shard_host_weight(k, &plan(WeightRole::AttnK)?)?,
+            );
             // Brak projekcji V oznacza wariant, w którym V = K (warstwy
             // globalne Gemmy 4); wtedy fuzja bierze K drugi raz.
             let v = if p.has_v_proj(idx) {
                 let v = fetch_matrix(src, name(WeightRole::AttnV)?)?;
                 expect(&at("attn_v"), &v, kv_dim, p.hidden_size)?;
-                v
+                shard_host_weight(v, &plan(WeightRole::AttnV)?)?
             } else {
-                fetch_matrix(src, name(WeightRole::AttnK)?)?
+                shard_host_weight(
+                    fetch_matrix(src, name(WeightRole::AttnK)?)?,
+                    &plan(WeightRole::AttnK)?,
+                )?
             };
             // Modele z naprzemienną geometrią uwagi (Gemma 4) nie scalają q|k|v:
             // dekodowanie musi liczyć normy i rope per warstwa (dwie podstawy
@@ -3751,6 +3769,7 @@ impl ModelWeights {
 
             let attn_o = fetch_matrix(src, name(WeightRole::AttnO)?)?;
             expect(&at("attn_o"), &attn_o, p.hidden_size, q_dim)?;
+            let attn_o = shard_host_weight(attn_o, &plan(WeightRole::AttnO)?)?;
 
             let ffn = match &p.moe {
                 None => {
@@ -3758,6 +3777,8 @@ impl ModelWeights {
                     let up = fetch_matrix(src, name(WeightRole::FfnUp)?)?;
                     expect(&at("ffn_gate"), &gate, p.intermediate_size, p.hidden_size)?;
                     expect(&at("ffn_up"), &up, p.intermediate_size, p.hidden_size)?;
+                    let gate = shard_host_weight(gate, &plan(WeightRole::FfnGate)?)?;
+                    let up = shard_host_weight(up, &plan(WeightRole::FfnUp)?)?;
                     let gate_up = match fuse_rows(vec![gate, up]) {
                         Ok(fused) => {
                             fused_gate_up_layers += 1;
@@ -3779,12 +3800,18 @@ impl ModelWeights {
                     };
                     let down = fetch_matrix(src, name(WeightRole::FfnDown)?)?;
                     expect(&at("ffn_down"), &down, p.hidden_size, p.intermediate_size)?;
+                    let down = shard_host_weight(down, &plan(WeightRole::FfnDown)?)?;
                     LayerFfn::Dense(DenseFfn {
                         gate_up,
                         down: upload_target_weight(device, down, target_tile, nvfp4_ct)?,
                     })
                 }
                 Some(moe) => {
+                    if shard.world > 1 {
+                        return Err(ForgeError::Unsupported(
+                            "podział tensor-parallel nie obejmuje jeszcze warstw MoE".into(),
+                        ));
+                    }
                     let router = fetch_matrix(src, name(WeightRole::FfnGateInp)?)?;
                     expect(&at("ffn_gate_inp"), &router, moe.n_experts, p.hidden_size)?;
                     let router = match router {
@@ -3929,6 +3956,10 @@ impl ModelWeights {
             });
         }
 
+        // Deskryptor zostaje w modelu z kształtami RANGI: mniej głowic, mniejszy
+        // wymiar pośredni. Dzięki temu KV, bufory aktywacji i cała pętla warstw
+        // widzą po prostu mniejszy model, bez przewlekania zakresu głowic.
+        descriptor.params = full_params.shard(shard)?;
         let mtp = if native_mtp {
             let mtp_descriptor = descriptor.mtp.as_ref().ok_or_else(|| {
                 ForgeError::Unsupported("model nie zawiera głowy MTP/NextN".into())

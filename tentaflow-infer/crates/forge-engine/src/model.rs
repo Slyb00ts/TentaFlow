@@ -1107,6 +1107,17 @@ pub fn l2_normalize(v: &mut [f32]) {
 /// głowic do przewlekania przez silnik: ranga po prostu widzi mniejszy model, a
 /// pętla warstw, KV, stan DeltaNet i bufory aktywacji są te, które `Model` już
 /// umie sobie zbudować.
+/// Czego sekwencyjny prefill pod podziałem ma dostarczyć na końcu chunka.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitPrefillLogits {
+    /// Chunk pośredni — głowa logitów w ogóle się nie liczy.
+    None,
+    /// Logity zostają w `bufs.logits` dla samplingu GPU.
+    Device,
+    /// Logity wracają na hosta.
+    Host,
+}
+
 struct TpSpmd {
     /// Rangi 1..world. Ranga zerowa to model, który to pole trzyma.
     ranks: Vec<Model>,
@@ -2650,9 +2661,6 @@ impl Model {
                 "podział na rangi nie obejmuje jeszcze: {what}"
             )))
         };
-        if !self.is_hybrid() {
-            return refuse("modeli innych niż hybrydowe");
-        }
         if self.weights.is_moe() {
             return refuse("warstw MoE");
         }
@@ -4302,7 +4310,13 @@ impl Model {
     /// per-row math, only the norm recompute is repeated (gate/up adds an
     /// elementwise silu_mul). Anything else records the separate chain.
     fn fused_decode_supported(&self) -> bool {
-        Self::fused_decode_available(&self.weights, self.device.caps().vendor)
+        // Łańcuch scalony liczy `attn_o` i `ffn_down` przez `gemv_residual`,
+        // czyli dokłada rezyduum W TYM SAMYM kernelu co projekcję. Pod podziałem
+        // wynik tej projekcji jest dopiero sumą CZĄSTKOWĄ, więc rezyduum wolno
+        // dodać dopiero po redukcji — ranga idzie łańcuchem rozdzielonym, który
+        // ma te dwa kroki osobno.
+        self.tp_partial.is_none()
+            && Self::fused_decode_available(&self.weights, self.device.caps().vendor)
     }
 
     fn fused_decode_available(weights: &ModelWeights, vendor: forge_types::Vendor) -> bool {
@@ -6148,6 +6162,76 @@ impl Model {
         }
     }
 
+    /// Prefill modelu gęstego pod podziałem: token po tokenie, tą samą warstwą
+    /// co dekodowanie.
+    ///
+    /// Batchowy prefill liczy warstwę własnym kodem, poza dwoma punktami
+    /// redukcji, więc na randze z pociętymi wagami dałby wynik po cichu zły.
+    /// Ta ścieżka jest wolniejsza, ale przechodzi przez `dense_decode_*`, czyli
+    /// przez redukcje — i to jest ta sama decyzja, którą podjęła hybryda.
+    fn prefill_dense_split(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+        logits: SplitPrefillLogits,
+    ) -> Result<Vec<f32>> {
+        let p = self.weights.descriptor.params.clone();
+        let vocab = p.vocab_size;
+        let page_size = self.kv.cfg.page_size;
+        let mut last_logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = seq.len;
+            if pos >= p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {pos} exceeds model context {}",
+                    p.max_position_embeddings
+                )));
+            }
+            let page_boundary = seq.len.is_multiple_of(page_size);
+            self.kv.grow(seq)?;
+            self.upload_decode_inputs(tok, pos)?;
+            if page_boundary || self.pt_seq != seq.id {
+                self.upload_page_table(seq)?;
+            }
+            let last = i + 1 == tokens.len();
+            self.dense_forward_staged_tp(
+                &AttnSrc::Paged,
+                last && logits != SplitPrefillLogits::None,
+            )?;
+            if last && logits == SplitPrefillLogits::Host {
+                self.device.copy(
+                    &self.bufs.logits,
+                    0,
+                    &self.bufs.pinned_logits,
+                    0,
+                    vocab * 4,
+                    &self.stream,
+                )?;
+                self.device.synchronize()?;
+                let lp = self
+                    .bufs
+                    .pinned_logits
+                    .host_ptr()
+                    .expect("pinned buffer has host mapping")
+                    as *const f32;
+                last_logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
+            }
+        }
+        Ok(last_logits)
+    }
+
+    /// Prefill modelu gęstego liczy warstwę WŁASNYM kodem, poza dwoma punktami
+    /// redukcji, więc na randze z pociętymi wagami dałby wynik po cichu zły.
+    /// Sterownik go jeszcze nie prowadzi, więc jest to twarda odmowa.
+    fn refuse_split_prefill(&self) -> Result<()> {
+        match self.tp_partial {
+            Some(_) => Err(ForgeError::Unsupported(
+                "podział na rangi nie obejmuje jeszcze prefillu modelu gęstego".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
     fn prefill_forward(
         &mut self,
         seq: &mut SeqKv,
@@ -7833,6 +7917,10 @@ impl Model {
         if self.is_hybrid() {
             return self.prefill_hybrid(seq, tokens);
         }
+        if self.tp.is_some() {
+            return self.prefill_dense_split(seq, tokens, SplitPrefillLogits::Host);
+        }
+        self.refuse_split_prefill()?;
         self.profile_target_start()?;
         let t = self.prefill_forward(seq, tokens, true)?;
         let hidden = self.weights.descriptor.params.hidden_size;
@@ -7884,6 +7972,13 @@ impl Model {
                 "device-only prefill chunk obsługuje wyłącznie model dense".into(),
             ));
         }
+        if self.tp.is_some() {
+            // Sekwencyjny prefill zostawia logity ostatniego tokenu w
+            // `bufs.logits` — dokładnie tam, gdzie oczekuje ich sampling GPU.
+            self.prefill_dense_split(seq, tokens, SplitPrefillLogits::Device)?;
+            return Ok(());
+        }
+        self.refuse_split_prefill()?;
         self.profile_target_start()?;
         let t = self.prefill_forward(seq, tokens, false)?;
         let hidden = self.weights.descriptor.params.hidden_size;
@@ -7913,6 +8008,10 @@ impl Model {
     /// ponownym użyciem współdzielonych buforów przez następny chunk.
     pub fn prefill_chunk_device_sync(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<()> {
         self.ensure_kv_reuse_healthy()?;
+        if self.tp.is_some() && !self.is_hybrid() {
+            self.prefill_dense_split(seq, tokens, SplitPrefillLogits::None)?;
+            return self.stream.synchronize();
+        }
         if self.is_hybrid() {
             return Err(ForgeError::Unsupported(
                 "device-only prefill chunk obsługuje wyłącznie model dense".into(),
@@ -8467,6 +8566,14 @@ impl Model {
         // grafu, której podział nie może na tym sterowniku dostać.
         if self.tp_ffn.is_some() {
             return self.run_step_separate(AttnSrc::Paged);
+        }
+
+        // Podział SPMD modelu gęstego: ta sama pętla warstw na każdej randze,
+        // z dwiema redukcjami. Idzie jawnym łańcuchem z tego samego powodu, co
+        // wyżej — przechwycenie kroku obejmującego dwie karty ROCm przerywa
+        // asercją we własnym runtime.
+        if self.tp.is_some() {
+            return self.dense_forward_staged_tp(&AttnSrc::Paged, true);
         }
 
         // Rot decode commits the current token into the packed store + ring and
@@ -13345,10 +13452,308 @@ impl Model {
     /// ffn. `src` selects the attention's K/V source: the paged cache
     /// (recorded into the replayable graph) or the tier staging slabs holding
     /// the sequence's full context per layer (streamed path, never captured).
-    fn run_step_separate(&self, src: AttnSrc) -> Result<()> {
+    /// Część 1 warstwy gęstej: mikser do projekcji wyjściowej włącznie.
+    fn dense_decode_mixer(&self, l: usize, src: &AttnSrc) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let layer = &self.weights.layers[l];
+        // Geometria bywa różna per warstwa (Gemma 4), więc szerokości i
+        // offsety sekcji scalonego q|k|v muszą być liczone W PĘTLI —
+        // policzone raz dla całego modelu wskazywały poza bufor warstwy.
+        let head_dim = p.head_dim_at(l);
+        let n_kv_heads = p.n_kv_heads_at(l);
+        let scale = p.attn_scale_at(l);
+        let q_dim = p.n_heads * head_dim;
+        let kv_dim = p.n_kv_heads_at(l) * head_dim;
+        // Byte offsets of the K and V sections inside the fused q|k|v
+        // decode buffer (q occupies rows 0..q_dim, so its offset is 0).
+        let k_byte_off = q_dim * 2;
+        let v_byte_off = (q_dim + kv_dim) * 2;
+
+        // Fused layers project q|k|v with ONE GEMV into one buffer,
+        // then qkv_post fuses the whole q/k-norm + RoPE + kv-append
+        // stretch into a second single launch (sections resolved via
+        // host-computed byte offsets; rotated K lands directly in the
+        // cache, so the K section of b.qkv is left un-rotated —
+        // nothing reads it after this point).
+        let q_buf = match &layer.attn().attn_qkv {
+            QkvWeights::Fused(w) => {
+                self.gemv(&b.qkv, w, &b.x, stream)?;
+                kernels.qkv_post_f16(
+                    &b.qkv,
+                    0,
+                    &b.qkv,
+                    k_byte_off,
+                    &b.qkv,
+                    v_byte_off,
+                    layer.attn().q_norm.as_ref(),
+                    layer.attn().k_norm.as_ref(),
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
+                    &b.pos,
+                    &self.page_table_dev,
+                    &self.seq_len_dev,
+                    p.n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    self.kv.cfg.page_size,
+                    eps,
+                    p.rope_theta_at(l),
+                    stream,
+                )?;
+                &b.qkv
+            }
+            QkvWeights::FusedQk { qk, v } => {
+                // q|k land at the front of b.qkv (same section
+                // offsets as the fully fused layout); v is projected
+                // into its own buffer and handed to qkv_post by
+                // pointer.
+                self.gemv(&b.qkv, qk, &b.x, stream)?;
+                self.gemv(&b.v, v, &b.x, stream)?;
+                kernels.qkv_post_f16(
+                    &b.qkv,
+                    0,
+                    &b.qkv,
+                    k_byte_off,
+                    &b.v,
+                    0,
+                    layer.attn().q_norm.as_ref(),
+                    layer.attn().k_norm.as_ref(),
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
+                    &b.pos,
+                    &self.page_table_dev,
+                    &self.seq_len_dev,
+                    p.n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    self.kv.cfg.page_size,
+                    eps,
+                    p.rope_theta_at(l),
+                    stream,
+                )?;
+                &b.qkv
+            }
+            QkvWeights::Split { q, k, v } => {
+                self.gemv(&b.q, q, &b.x, stream)?;
+                self.gemv(&b.k, k, &b.x, stream)?;
+                self.gemv(&b.v, v, &b.x, stream)?;
+                let aw = layer.attn();
+                match (aw.q_norm.as_ref(), aw.k_norm.as_ref(), aw.v_norm.as_ref()) {
+                    (Some(qn), Some(kn), Some(vn)) => {
+                        kernels.rmsnorm_qkv_f16(
+                            &b.q, &b.k, &b.v, qn, kn, vn, p.n_heads, n_kv_heads, head_dim,
+                            eps, stream,
+                        )?;
+                    }
+                    _ => {
+                        if let Some(qn) = aw.q_norm.as_ref() {
+                            kernels.rmsnorm_f16(
+                                &b.q, &b.q, qn, p.n_heads, head_dim, eps, stream,
+                            )?;
+                        }
+                        if let Some(kn) = aw.k_norm.as_ref() {
+                            kernels.rmsnorm_f16(
+                                &b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream,
+                            )?;
+                        }
+                        if let Some(vn) = aw.v_norm.as_ref() {
+                            kernels.rmsnorm_f16(
+                                &b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream,
+                            )?;
+                        }
+                    }
+                }
+                kernels.rope_neox_f16(
+                    &b.q,
+                    &b.pos,
+                    1,
+                    p.n_heads,
+                    head_dim,
+                    p.rope_theta_at(l),
+                    self.rope_freqs_at(&p, l),
+                    stream,
+                )?;
+                kernels.rope_neox_f16(
+                    &b.k,
+                    &b.pos,
+                    1,
+                    p.n_kv_heads_at(l),
+                    head_dim,
+                    p.rope_theta_at(l),
+                    self.rope_freqs_at(&p, l),
+                    stream,
+                )?;
+                kernels.kv_append_f16(
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
+                    &b.k,
+                    &b.v,
+                    &self.page_table_dev,
+                    &self.seq_len_dev,
+                    n_kv_heads,
+                    self.kv.cfg.page_size,
+                    head_dim,
+                    stream,
+                )?;
+                &b.q
+            }
+        };
+
+        match &src {
+            AttnSrc::Paged => {
+                kernels.attn_decode_f16(
+                    &b.attn_out,
+                    &b.attn_parts,
+                    q_buf,
+                    &self.kv.k[self.target_kv_layer(l)],
+                    &self.kv.v[self.target_kv_layer(l)],
+                    &self.page_table_dev,
+                    &self.seq_len_dev,
+                    1,
+                    p.n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    self.kv.cfg.page_size,
+                    self.max_pages_per_seq,
+                    scale,
+                    self.attn_window(l),
+                    stream,
+                )?;
+            }
+            AttnSrc::Staged(seq) => {
+                // qkv_post / kv_append above already committed the new
+                // token to the canonical paged slab; staging picks it
+                // up through the resident-page D2D copies.
+                let tier = self
+                    .tier
+                    .as_ref()
+                    .expect("staged attention requires tiering");
+                let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
+                let slot = &tb.slots[0];
+                tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
+                kernels.attn_decode_f16(
+                    &b.attn_out,
+                    &b.attn_parts,
+                    q_buf,
+                    &slot.stage[0],
+                    &slot.stage[1],
+                    &tb.identity_pt,
+                    &self.seq_len_dev,
+                    1,
+                    p.n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    self.kv.cfg.page_size,
+                    self.max_pages_per_seq,
+                    scale,
+                    self.attn_window(l),
+                    stream,
+                )?;
+            }
+        }
+
+        self.row_parallel_gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
+        Ok(())
+    }
+
+    /// Część 2: rezyduum miksera, norma przed FFN i blok FFN do `down`.
+    fn dense_decode_ffn(&self, l: usize) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let layer = &self.weights.layers[l];
+        close_block(
+            kernels,
+            layer.post_attn_norm.as_ref(),
+            None,
+            &b.x,
+            &b.h,
+            &b.o_out,
+            &layer.ffn_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
+
+        match &self.tp_ffn {
+            Some(tp) => tp.forward(stream, l, &b.x, &b.down, self.ffn_act())?,
+            None => {
+                match &layer.dense_ffn()?.gate_up {
+                    GateUpWeights::Fused(w) => {
+                        self.gemv(&b.gate_up, w, &b.x, stream)?;
+                        kernels.glu_mul_f16_at(
+                            self.ffn_act(),
+                            &b.act,
+                            &b.gate_up,
+                            0,
+                            inter * 2,
+                            inter,
+                            stream,
+                        )?;
+                    }
+                    GateUpWeights::Split { gate, up } => {
+                        self.gemv(&b.gate, gate, &b.x, stream)?;
+                        self.gemv(&b.up, up, &b.x, stream)?;
+                        kernels.glu_mul_f16(
+                            self.ffn_act(),
+                            &b.act,
+                            &b.gate,
+                            &b.up,
+                            inter,
+                            stream,
+                        )?;
+                    }
+                }
+                self.row_parallel_gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Część 3: rezyduum FFN i norma wejścia następnej warstwy.
+    fn dense_decode_residual(&self, l: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let n_layers = self.weights.layers.len();
+        let layer = &self.weights.layers[l];
+        let next_norm = if l + 1 < n_layers {
+            &self.weights.layers[l + 1].attn_norm
+        } else {
+            &self.weights.output_norm
+        };
+        close_block(
+            kernels,
+            layer.post_ffw_norm.as_ref(),
+            layer.layer_output_scale,
+            &b.x,
+            &b.h,
+            &b.down,
+            next_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
+        Ok(())
+    }
+
+    fn run_step_separate(&self, src: AttnSrc) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
         let eps = p.rms_norm_eps;
         let kernels = &self.kernels;
         let stream = &self.stream;
@@ -13379,269 +13784,9 @@ impl Model {
 
             let n_layers = self.weights.layers.len();
             for l in 0..n_layers {
-                let layer = &self.weights.layers[l];
-                // Geometria bywa różna per warstwa (Gemma 4), więc szerokości i
-                // offsety sekcji scalonego q|k|v muszą być liczone W PĘTLI —
-                // policzone raz dla całego modelu wskazywały poza bufor warstwy.
-                let head_dim = p.head_dim_at(l);
-                let n_kv_heads = p.n_kv_heads_at(l);
-                let scale = p.attn_scale_at(l);
-                let q_dim = p.n_heads * head_dim;
-                let kv_dim = p.n_kv_heads_at(l) * head_dim;
-                // Byte offsets of the K and V sections inside the fused q|k|v
-                // decode buffer (q occupies rows 0..q_dim, so its offset is 0).
-                let k_byte_off = q_dim * 2;
-                let v_byte_off = (q_dim + kv_dim) * 2;
-
-                // Fused layers project q|k|v with ONE GEMV into one buffer,
-                // then qkv_post fuses the whole q/k-norm + RoPE + kv-append
-                // stretch into a second single launch (sections resolved via
-                // host-computed byte offsets; rotated K lands directly in the
-                // cache, so the K section of b.qkv is left un-rotated —
-                // nothing reads it after this point).
-                let q_buf = match &layer.attn().attn_qkv {
-                    QkvWeights::Fused(w) => {
-                        self.gemv(&b.qkv, w, &b.x, stream)?;
-                        kernels.qkv_post_f16(
-                            &b.qkv,
-                            0,
-                            &b.qkv,
-                            k_byte_off,
-                            &b.qkv,
-                            v_byte_off,
-                            layer.attn().q_norm.as_ref(),
-                            layer.attn().k_norm.as_ref(),
-                            &self.kv.k[self.target_kv_layer(l)],
-                            &self.kv.v[self.target_kv_layer(l)],
-                            &b.pos,
-                            &self.page_table_dev,
-                            &self.seq_len_dev,
-                            p.n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            self.kv.cfg.page_size,
-                            eps,
-                            p.rope_theta_at(l),
-                            stream,
-                        )?;
-                        &b.qkv
-                    }
-                    QkvWeights::FusedQk { qk, v } => {
-                        // q|k land at the front of b.qkv (same section
-                        // offsets as the fully fused layout); v is projected
-                        // into its own buffer and handed to qkv_post by
-                        // pointer.
-                        self.gemv(&b.qkv, qk, &b.x, stream)?;
-                        self.gemv(&b.v, v, &b.x, stream)?;
-                        kernels.qkv_post_f16(
-                            &b.qkv,
-                            0,
-                            &b.qkv,
-                            k_byte_off,
-                            &b.v,
-                            0,
-                            layer.attn().q_norm.as_ref(),
-                            layer.attn().k_norm.as_ref(),
-                            &self.kv.k[self.target_kv_layer(l)],
-                            &self.kv.v[self.target_kv_layer(l)],
-                            &b.pos,
-                            &self.page_table_dev,
-                            &self.seq_len_dev,
-                            p.n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            self.kv.cfg.page_size,
-                            eps,
-                            p.rope_theta_at(l),
-                            stream,
-                        )?;
-                        &b.qkv
-                    }
-                    QkvWeights::Split { q, k, v } => {
-                        self.gemv(&b.q, q, &b.x, stream)?;
-                        self.gemv(&b.k, k, &b.x, stream)?;
-                        self.gemv(&b.v, v, &b.x, stream)?;
-                        let aw = layer.attn();
-                        match (aw.q_norm.as_ref(), aw.k_norm.as_ref(), aw.v_norm.as_ref()) {
-                            (Some(qn), Some(kn), Some(vn)) => {
-                                kernels.rmsnorm_qkv_f16(
-                                    &b.q, &b.k, &b.v, qn, kn, vn, p.n_heads, n_kv_heads, head_dim,
-                                    eps, stream,
-                                )?;
-                            }
-                            _ => {
-                                if let Some(qn) = aw.q_norm.as_ref() {
-                                    kernels.rmsnorm_f16(
-                                        &b.q, &b.q, qn, p.n_heads, head_dim, eps, stream,
-                                    )?;
-                                }
-                                if let Some(kn) = aw.k_norm.as_ref() {
-                                    kernels.rmsnorm_f16(
-                                        &b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream,
-                                    )?;
-                                }
-                                if let Some(vn) = aw.v_norm.as_ref() {
-                                    kernels.rmsnorm_f16(
-                                        &b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream,
-                                    )?;
-                                }
-                            }
-                        }
-                        kernels.rope_neox_f16(
-                            &b.q,
-                            &b.pos,
-                            1,
-                            p.n_heads,
-                            head_dim,
-                            p.rope_theta_at(l),
-                            self.rope_freqs_at(&p, l),
-                            stream,
-                        )?;
-                        kernels.rope_neox_f16(
-                            &b.k,
-                            &b.pos,
-                            1,
-                            p.n_kv_heads_at(l),
-                            head_dim,
-                            p.rope_theta_at(l),
-                            self.rope_freqs_at(&p, l),
-                            stream,
-                        )?;
-                        kernels.kv_append_f16(
-                            &self.kv.k[self.target_kv_layer(l)],
-                            &self.kv.v[self.target_kv_layer(l)],
-                            &b.k,
-                            &b.v,
-                            &self.page_table_dev,
-                            &self.seq_len_dev,
-                            n_kv_heads,
-                            self.kv.cfg.page_size,
-                            head_dim,
-                            stream,
-                        )?;
-                        &b.q
-                    }
-                };
-
-                match &src {
-                    AttnSrc::Paged => {
-                        kernels.attn_decode_f16(
-                            &b.attn_out,
-                            &b.attn_parts,
-                            q_buf,
-                            &self.kv.k[self.target_kv_layer(l)],
-                            &self.kv.v[self.target_kv_layer(l)],
-                            &self.page_table_dev,
-                            &self.seq_len_dev,
-                            1,
-                            p.n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            self.kv.cfg.page_size,
-                            self.max_pages_per_seq,
-                            scale,
-                            self.attn_window(l),
-                            stream,
-                        )?;
-                    }
-                    AttnSrc::Staged(seq) => {
-                        // qkv_post / kv_append above already committed the new
-                        // token to the canonical paged slab; staging picks it
-                        // up through the resident-page D2D copies.
-                        let tier = self
-                            .tier
-                            .as_ref()
-                            .expect("staged attention requires tiering");
-                        let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
-                        let slot = &tb.slots[0];
-                        tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
-                        kernels.attn_decode_f16(
-                            &b.attn_out,
-                            &b.attn_parts,
-                            q_buf,
-                            &slot.stage[0],
-                            &slot.stage[1],
-                            &tb.identity_pt,
-                            &self.seq_len_dev,
-                            1,
-                            p.n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            self.kv.cfg.page_size,
-                            self.max_pages_per_seq,
-                            scale,
-                            self.attn_window(l),
-                            stream,
-                        )?;
-                    }
-                }
-
-                self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
-                close_block(
-                    kernels,
-                    layer.post_attn_norm.as_ref(),
-                    None,
-                    &b.x,
-                    &b.h,
-                    &b.o_out,
-                    &layer.ffn_norm,
-                    1,
-                    hidden,
-                    eps,
-                    stream,
-                )?;
-
-                match &self.tp_ffn {
-                    Some(tp) => tp.forward(stream, l, &b.x, &b.down, self.ffn_act())?,
-                    None => {
-                        match &layer.dense_ffn()?.gate_up {
-                            GateUpWeights::Fused(w) => {
-                                self.gemv(&b.gate_up, w, &b.x, stream)?;
-                                kernels.glu_mul_f16_at(
-                                    self.ffn_act(),
-                                    &b.act,
-                                    &b.gate_up,
-                                    0,
-                                    inter * 2,
-                                    inter,
-                                    stream,
-                                )?;
-                            }
-                            GateUpWeights::Split { gate, up } => {
-                                self.gemv(&b.gate, gate, &b.x, stream)?;
-                                self.gemv(&b.up, up, &b.x, stream)?;
-                                kernels.glu_mul_f16(
-                                    self.ffn_act(),
-                                    &b.act,
-                                    &b.gate,
-                                    &b.up,
-                                    inter,
-                                    stream,
-                                )?;
-                            }
-                        }
-                        self.gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
-                    }
-                }
-
-                let next_norm = if l + 1 < n_layers {
-                    &self.weights.layers[l + 1].attn_norm
-                } else {
-                    &self.weights.output_norm
-                };
-                close_block(
-                    kernels,
-                    layer.post_ffw_norm.as_ref(),
-                    layer.layer_output_scale,
-                    &b.x,
-                    &b.h,
-                    &b.down,
-                    next_norm,
-                    1,
-                    hidden,
-                    eps,
-                    stream,
-                )?;
+                self.dense_decode_mixer(l, &src)?;
+                self.dense_decode_ffn(l)?;
+                self.dense_decode_residual(l)?;
             }
 
             self.logits_gemv(&b.logits, &b.x, stream)
@@ -16375,6 +16520,59 @@ impl Model {
         if want_logits {
             // Głowa logitów jest replikowana, więc liczy ją ranga zerowa na
             // swoim (już pełnym) strumieniu rezydualnym.
+            self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
+        }
+        Ok(())
+    }
+
+    /// Krok modelu gęstego rozłożony na rangi.
+    ///
+    /// Ten sam kształt co hybrydowy — trzy części warstwy i dwie redukcje między
+    /// nimi. Różni się wyłącznie tym, którą warstwę woła, bo mikser gęsty i
+    /// hybrydowy mają inne wnętrze, a ten sam punkt cięcia.
+    fn dense_forward_staged_tp(&self, src: &AttnSrc, want_logits: bool) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let n_layers = self.weights.layers.len();
+        for member in self.tp_members() {
+            member.kernels.gather_rows_f16(
+                &member.bufs.h,
+                &member.weights.token_embd_f16,
+                &member.bufs.ids,
+                1,
+                hidden,
+                &member.stream,
+            )?;
+            if let Some(factor) = p.embd_scale {
+                member
+                    .kernels
+                    .scale_f16(&member.bufs.h, hidden, factor, &member.stream)?;
+            }
+            member.kernels.rmsnorm_f16(
+                &member.bufs.x,
+                &member.bufs.h,
+                &member.weights.layers[0].attn_norm,
+                1,
+                hidden,
+                eps,
+                &member.stream,
+            )?;
+        }
+        for l in 0..n_layers {
+            for member in self.tp_members() {
+                member.dense_decode_mixer(l, src)?;
+            }
+            self.tp_all_reduce(|b| &b.o_out)?;
+            for member in self.tp_members() {
+                member.dense_decode_ffn(l)?;
+            }
+            self.tp_all_reduce(|b| &b.down)?;
+            for member in self.tp_members() {
+                member.dense_decode_residual(l)?;
+            }
+        }
+        if want_logits {
             self.logits_gemv(&self.bufs.logits, &self.bufs.x, &self.stream)?;
         }
         Ok(())

@@ -1137,3 +1137,42 @@ Czego ten wynik NIE obejmuje: prefill idzie token po tokenie (warianty
 layer-major i batchowy liczą warstwę własnym kodem, poza punktami redukcji),
 głowa logitów jest replikowana, a spekulacja wyłączona. To są następne kroki, a
 nie regresje — każdy z nich podnosi liczbę, żaden jej nie psuje.
+
+## 6. Modele gęste pod podziałem — zmierzone, i wynik jest OSTRZEŻENIEM (2026-07-31)
+
+Sterownik obejmuje już architektury gęste (`weights.rs` nie odrzuca `ssm.is_none()`).
+Loader tnie q/k/v PRZED sklejeniem ich w `QkvWeights::Fused`, więc scalony tensor
+rangi powstaje z jej własnych głowic. Dekodowanie idzie łańcuchem ROZDZIELONYM,
+bo scalony liczy `attn_o` i `ffn_down` przez `gemv_residual` — jednym kernelem
+razem z rezyduum, którego pod podziałem nie wolno dodać przed redukcją.
+
+| model | 1 karta | 2 karty | |
+|---|--:|--:|---|
+| bielik-7b Q4_K_M | 124,0 | 123,6 | **0%** |
+| bielik-11b Q4_K_M | 86,1 | 92,5 | +7,4% |
+| nemo-12b Q4_K_M | 78,0 | **67,0** | **-14%** |
+
+**Podział opłaca się dopiero wtedy, gdy krok jest ograniczony ODCZYTEM WAG.**
+Przy 7-12B na tych kartach ogranicza go LICZBA URUCHOMIEŃ, a ta się nie dzieli —
+obie rangi płacą ten sam podatek, a redukcje dokładają do niego dwa punkty
+synchronizacji na warstwę. Dlatego nemo-12b (40 warstw) traci, bielik-11b ledwo
+zyskuje, a hybrydowy 27B z §5 zyskuje 26-35%. To jest dokładnie ten sam rachunek,
+który `TENSOR_PARALLEL_DESIGN.md` prowadzi dla przestoju: „podatek od liczby
+uruchomień jest wspólny dla obu rang i NIE maleje od dołożenia karty".
+
+Wniosek praktyczny: `--tp 2` nie jest ustawieniem domyślnym dla modeli gęstych
+tej wielkości i nie wolno go tak reklamować. Do modeli 7-12B na dwóch R9700 nie
+warto go włączać.
+
+Tekst modelu gęstego ROZJEŻDŻA SIĘ z jednokartowym po około 30 tokenach (przy
+hybrydowym 27B był identyczny). Zgadzające się 30 tokenów to sygnatura różnicy
+ZAOKRĄGLENIA, a nie złego podziału — źle pocięta macierz daje tekst-śmieć od
+pierwszego tokenu (tak wyglądała nieudana próba podziału DeltaNet po głowicach).
+Kolejność sumowania jest inna, więc bitowej zgodności nie obiecywano; przy 7B
+greedy jest na tyle czuły, że różnica ostatniego bitu wychodzi na powierzchnię.
+Właściwą bramką jest tu perplexity, a ta NIE ZOSTAŁA JESZCZE ZMIERZONA dla
+modeli gęstych — do czasu pomiaru podział gęsty należy uważać za niesprawdzony
+jakościowo.
+
+Prefill gęsty pod podziałem idzie token po tokenie, tak samo jak hybrydowy i z
+tego samego powodu.
