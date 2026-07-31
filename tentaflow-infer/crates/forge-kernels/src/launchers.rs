@@ -2736,6 +2736,77 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Czy scalony wstęp warstwy uwagi ma artefakt i pasuje do geometrii.
+    /// Blok ma `head_dim` wątków i mieści redukcję normy, a `n_rot` musi być
+    /// parzyste, bo RoPE łączy indeksy `j` i `j + n_rot/2`.
+    pub fn attn_prepare_qk_capable(&self, head_dim: usize, n_rot: usize) -> bool {
+        self.artifacts.get("attn_prepare_qk_f16").is_ok()
+            && head_dim > 0
+            && head_dim <= 1024
+            && n_rot > 0
+            && n_rot.is_multiple_of(2)
+            && n_rot <= head_dim
+    }
+
+    /// Rozplecenie bramkowanej projekcji Q, obie normy głowic i oba częściowe
+    /// RoPE jednym uruchomieniem. Zastępuje pięć uruchomień na warstwę uwagi.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prepare_qk_f16(
+        &self,
+        qc: &DevBuffer,
+        gatec: &DevBuffer,
+        k_io: &DevBuffer,
+        q_full: &DevBuffer,
+        q_norm: &DevBuffer,
+        k_norm: &DevBuffer,
+        positions: &DevBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        theta_base: f32,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !self.attn_prepare_qk_capable(head_dim, n_rot) {
+            return Err(ForgeError::Kernel(
+                "attn_prepare_qk_f16: brak artefaktu albo geometria poza kontraktem".into(),
+            ));
+        }
+        let q_span = checked_buffer_bytes("attn_prepare_qk q", &[n_heads, head_dim], 2)?;
+        let kv_span = checked_buffer_bytes("attn_prepare_qk kv", &[n_kv_heads, head_dim], 2)?;
+        if qc.len() < q_span
+            || gatec.len() < q_span
+            || k_io.len() < kv_span
+            || q_full.len() < 2 * q_span
+        {
+            return Err(ForgeError::Kernel(
+                "attn_prepare_qk_f16: bufor jest mniejszy od kształtu głowic".into(),
+            ));
+        }
+        let k = self.artifacts.get("attn_prepare_qk_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((n_heads + n_kv_heads) as u32, 1, 1),
+            block: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(qc)
+            .buf(gatec)
+            .buf(k_io)
+            .buf(q_full)
+            .buf(q_norm)
+            .buf(k_norm)
+            .buf(positions)
+            .scalar(n_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(head_dim as i64)
+            .scalar(n_rot as i64)
+            .scalar(theta_base)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Powtarza bloki q/k głowic K `rep` razy do buforów głowic V (GQA).
     ///
     /// Zastępuje `2 * rep` kopii D2D JEDNYM uruchomieniem. Kopie były tanie w

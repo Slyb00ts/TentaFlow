@@ -16091,16 +16091,34 @@ impl Model {
             self.gemv(&b.k, wk, &b.x, stream)?;
             self.gemv(&b.v, wv, &b.x, stream)?;
         }
-        kernels.deinterleave_gate_f16(&hb.qc, &hb.gatec, &hb.q_full, head_dim, q_dim, stream)?;
-        if let Some(qn) = &a.q_norm {
-            kernels.rmsnorm_f16(&hb.qc, &hb.qc, qn, n_heads, head_dim, eps, stream)?;
+        // Rozplecenie bramki, obie normy głowic i oba częściowe RoPE mieszczą
+        // się w jednym uruchomieniu, gdy obie normy istnieją — same kernele
+        // czytają po kilkadziesiąt kB, więc ich koszt to niemal wyłącznie
+        // przestój, który karta płaci za każdą dyspozycję.
+        match (&a.q_norm, &a.k_norm) {
+            (Some(qn), Some(kn)) if kernels.attn_prepare_qk_capable(head_dim, n_rot) => {
+                kernels.attn_prepare_qk_f16(
+                    &hb.qc, &hb.gatec, &b.k, &hb.q_full, qn, kn, &b.pos, n_heads, n_kv, head_dim,
+                    n_rot, theta, eps, stream,
+                )?;
+            }
+            _ => {
+                kernels.deinterleave_gate_f16(
+                    &hb.qc, &hb.gatec, &hb.q_full, head_dim, q_dim, stream,
+                )?;
+                if let Some(qn) = &a.q_norm {
+                    kernels.rmsnorm_f16(&hb.qc, &hb.qc, qn, n_heads, head_dim, eps, stream)?;
+                }
+                if let Some(kn) = &a.k_norm {
+                    kernels.rmsnorm_f16(&b.k, &b.k, kn, n_kv, head_dim, eps, stream)?;
+                }
+                kernels.rope_neox_partial_f16(
+                    &hb.qc, &b.pos, 1, n_heads, head_dim, n_rot, theta, stream,
+                )?;
+                kernels
+                    .rope_neox_partial_f16(&b.k, &b.pos, 1, n_kv, head_dim, n_rot, theta, stream)?;
+            }
         }
-        if let Some(kn) = &a.k_norm {
-            kernels.rmsnorm_f16(&b.k, &b.k, kn, n_kv, head_dim, eps, stream)?;
-        }
-        kernels
-            .rope_neox_partial_f16(&hb.qc, &b.pos, 1, n_heads, head_dim, n_rot, theta, stream)?;
-        kernels.rope_neox_partial_f16(&b.k, &b.pos, 1, n_kv, head_dim, n_rot, theta, stream)?;
         kernels.kv_append_f16(
             &self.kv.k[self.target_kv_layer(l)],
             &self.kv.v[self.target_kv_layer(l)],
