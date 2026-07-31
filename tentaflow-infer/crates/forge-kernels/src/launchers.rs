@@ -15,6 +15,18 @@ use crate::registry::KernelArtifacts;
 
 const BLOCK: u32 = 256;
 
+/// Szerokość bloku normy wiersza. Krok dekodowania normalizuje JEDEN wiersz, więc
+/// siatka ma jeden blok roboczy — cała norma liczy się na jednym CU z 64 i stoi
+/// na paśmie tego CU, nie karty. Szerszy blok jest jedynym sposobem dołożenia
+/// równoległości bez rozbijania redukcji na dwa uruchomienia.
+fn norm_block(rows: usize, cols: usize) -> u32 {
+    if rows > 8 {
+        return BLOCK;
+    }
+    let want = (cols.div_ceil(8)).next_power_of_two().clamp(64, 1024);
+    u32::try_from(want).unwrap_or(BLOCK)
+}
+
 /// GEMV NVFP4 z jedną falą na wiersz; `GEMV_WAVE_ROWS` w `src/nvfp4.mojo`.
 const GEMV_NVFP4_WAVE: &str = "gemv_nvfp4_gguf_f16_wave";
 /// Wierszy na blok w rodzinie `gemv_nvfp4_gguf_*_wave` (osiem fal po 32 linie).
@@ -2224,7 +2236,7 @@ impl Kernels {
         let k = self.artifacts.get("rmsnorm_residual_f16")?;
         let cfg = LaunchConfig {
             grid: (rows as u32, 1, 1),
-            block: (BLOCK, 1, 1),
+            block: (norm_block(rows, cols), 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
