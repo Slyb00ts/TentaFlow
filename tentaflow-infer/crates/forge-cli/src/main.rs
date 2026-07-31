@@ -1380,15 +1380,6 @@ fn load_auto(
     // `KvCache` alokuje wszystkie slaby targetu i opcjonalnego MTP w dedykowanej
     // puli; rozmiar uwzględnia wyrównanie każdego bufora do granulacji slabów.
     let hal_kv = layout.bytes;
-    let weights = if weights_pool_gb > 0.0 {
-        ((weights_pool_gb * (1u64 << 30) as f64) as usize)
-            .checked_add(stage)
-            .context("rozmiar puli wag i staging przekracza zakres usize")?
-    } else {
-        let free = gpu::free_vram(0).context("query free VRAM")?;
-        free.saturating_sub(pool_reserve_bytes(hal_kv, activations)?)
-            .max(1 << 30)
-    };
     // Podział na rangi: każda karta dostaje pule liczone z WŁASNEJ wolnej
     // pamięci, bo trzyma swój fragment wag i swój fragment KV. Karty otwierają
     // się tutaj, a dostęp P2P nad nimi dopiero po zbudowaniu modeli — inaczej

@@ -1100,3 +1100,40 @@ po obu stronach: dosypywanie kolejnych macierzy do dzisiejszej protezy nie
 zadziała, bo każda dołożona macierz DOKŁADA kopie do tych 343. Dopiero SPMD —
 gdzie ranga liczy swoje głowice do końca miksera i wymienia wyłącznie sumę
 cząstkową — zdejmuje jedno i drugie naraz.
+
+## 5. Podział SPMD na dwie karty — zmierzony (2026-07-31)
+
+Sterownik SPMD z `TENSOR_PARALLEL_DESIGN.md` jest w drzewie: `forge run --tp 2`.
+Model dzieli się RAZ, przy ładowaniu (`heads` 24 -> 12, `kv_heads` 4 -> 2,
+`inter` 17408 -> 8704), a każda ranga wykonuje tę samą pętlę warstw na swoim
+fragmencie, z dwiema redukcjami na warstwę.
+
+Protokół: obie karty gfx1201, ten sam prompt (24 tokeny), `-n 256`,
+`--prefix-cache off`, trzy powtórzenia. Liczba to `tok/s overall` z `forge run`,
+czyli RAZEM z prefillem — dlatego jest niższa niż samo `tg128` z §1. Obie strony
+mierzone tak samo, więc stosunek jest uczciwy.
+
+| model | 1 karta | **2 karty (`--tp 2`)** | |
+|---|--:|--:|---|
+| NVFP4 | 33,7 / 33,7 / 33,6 | **42,5 / 42,4 / 42,4** | **+25,8%** |
+| Q4_K_M | 33,6 / 33,7 / 33,6 | **45,5 / 45,5 / 45,5** | **+35,4%** |
+
+Rozrzut trzech powtórzeń to 0,1 tok/s, więc różnica nie jest szumem.
+
+**Bramka jakości: wygenerowany tekst jest IDENTYCZNY co do znaku** między jedną
+a dwiema kartami — sprawdzone na 128 tokenach (NVFP4) i sumą SHA-256 na 192
+tokenach (Q4_K_M, `9dda7847…` po obu stronach). To jest właściwa bramka dla
+macierzy wierszowo równoległej: sumy cząstkowe idą w f32 i zawężają się do f16
+DOPIERO po sumie, więc zostaje wyłącznie różnica KOLEJNOŚCI sumowania i bitowej
+zgodności nie wolno obiecywać. Na tym checkpoincie okazała się i tak zachowana.
+
+Podział ODMAWIA głośno wszędzie tam, gdzie sterownik nie prowadzi warstwy —
+`--tp 3` (4 głowice KV nie dzielą się na 3), natywne MTP, tiering KV, MoE,
+modele niehybrydowe i FFN dla wielu tokenów. Ścieżka nieobjęta podziałem nie
+liczy się źle w sposób widoczny: użyłaby pociętej macierzy bez redukcji i dała
+tekst-śmieć bez błędu — dlatego to twarda odmowa przy starcie, a nie ostrzeżenie.
+
+Czego ten wynik NIE obejmuje: prefill idzie token po tokenie (warianty
+layer-major i batchowy liczą warstwę własnym kodem, poza punktami redukcji),
+głowa logitów jest replikowana, a spekulacja wyłączona. To są następne kroki, a
+nie regresje — każdy z nich podnosi liczbę, żaden jej nie psuje.
