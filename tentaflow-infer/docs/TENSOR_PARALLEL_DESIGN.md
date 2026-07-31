@@ -292,6 +292,38 @@ dzieli się przez dwa — podatek od liczby uruchomień jest wspólny dla obu ra
 Krok wychodzi ~21 ms, czyli **47-48 tok/s wobec dzisiejszych 39,7**. Tyle jest do
 wzięcia i nie więcej; kto obiecuje 2x, nie policzył przestoju.
 
+## Sterownik: jedno niepodzielne lądowanie i jedna pułapka własności
+
+Fundament jest w drzewie i zabramkowany (kontrakt podziału, krojenie macierzy,
+plan per rola, loader zweryfikowany na realnym checkpoincie, prymityw redukcji,
+warstwa rozcięta w dwóch punktach redukcji). Zostaje sterownik — i on NIE DZIELI
+SIĘ na mniejsze kroki, bo każdy z jego trzech elementów osobno jest kodem,
+którego nic nie woła:
+
+1. bufory sum cząstkowych i wyjście f32 dla `out_proj` oraz `ffn_down` per ranga
+   (warianty `gemv_*_out_f32` już istnieją),
+2. noga rozgłoszenia w redukcji — `reduce_partials` ZBIERA na jednej karcie, a
+   w SPMD OBIE rangi potrzebują zsumowanego wektora, żeby policzyć własny
+   `rmsnorm_residual` na własnym `bufs.h`; dla dwóch rang to zbiórka plus jedna
+   kopia,
+3. pętla nad `Vec<Model>`: część 1 na każdej randze -> redukcja -> część 2 ->
+   redukcja -> część 3.
+
+**Strumień rezydualny jest replikowany ZA DARMO** i to jest miła konsekwencja
+kształtu: każda ranga to pełny `Model` z własnym `bufs.h`, a wagi norm ładują się
+jako `Replicated`. Gdy zredukowany wektor trafi na każdą rangę, rozgłaszanie `x`
+przed każdą macierzą znika bez ani jednej dodatkowej linijki.
+
+**PUŁAPKA WŁASNOŚCI, do rozstrzygnięcia PRZED pisaniem.** `Cluster::attach`
+otwiera karty pomocnicze SAM i tworzy dla każdej własny strumień oraz własny
+komplet artefaktów kerneli. `Model::load_gguf` robi dokładnie to samo dla karty,
+którą dostanie. Zbudowanie rangi na karcie klastra da więc na tej karcie DWA
+zestawy kerneli i DWA strumienie — dokładnie to, przed czym ostrzega komentarz
+przy `attach` w odniesieniu do karty głównej. Sterownik ma budować `Model`
+najpierw, a klaster spinać nad ICH urządzeniami (`Model::device`), a nie
+odwrotnie; inaczej każda karta płaci drugim modułem kerneli i drugim strumieniem,
+a bufory, na których liczy redukcja, nie będą tymi, na których liczy ranga.
+
 ## Co trzeba zrobić w tym drzewie
 
 Kolejność jest wymuszona zależnościami, nie preferencją:
