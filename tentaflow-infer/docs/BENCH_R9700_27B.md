@@ -868,3 +868,164 @@ więc są wyrównane tylko do 2 bajtów, co wymusza odczyty par `uint16` zamiast
 szerokich, wyrównanych wektorów. Q4_K (144 B, wyrównane do 16) mierzy na tym
 samym kształcie 532 GB/s wobec 449 GB/s Q6_K — różnica 18% przy identycznej
 geometrii wskazuje właśnie na koszt układu bajtów, a nie na równoległość.
+
+## Dekodowanie: gdzie NAPRAWDĘ jest sufit (2026-07-31)
+
+Poprzednie sekcje szukały wolnych kerneli. Pomiar mówi, że ich nie ma — a
+sufit jest niżej, niż zakładał rachunek `16,1 GB / 552 GB/s = 34,1 tok/s`.
+
+### Każdy kernel GEMV płaci stały narzut rozbiegu, rosnący gdy jest krótki
+
+Zestawienie z profilu (`rocprofv3`, Q4_K_M, kontekst 128) z bajtami liczonymi z
+nagłówka GGUF, obok pomiaru tych samych kształtów na ZIMNYM DRAM
+(`bench-amd/bench_decode_cold.mojo` — każda iteracja czyta inny wycinek bufora
+4 GiB, więc Infinity Cache nie ma czego powtórzyć):
+
+| kernel | MB | us w modelu | GB/s | us mikro (zimny) |
+|---|--:|--:|--:|--:|
+| `lm_head` Q6_K | 1042,9 | 1657,8 | **629** | — |
+| `ffn_gate`+`up` (grupa) | 100,3 | 176,8 | 567 | 172 |
+| `ffn_down` Q6_K | 73,1 | 128,2 | 570 | — |
+| `ffn_down` Q4_K | 50,1 | 93,8 | 534 | — |
+| DeltaNet in_proj+gate (mieszana) | 60,8 | 106,7 | 570 | — |
+| uwaga q/k/v (grupa) | 41,3 | 75,8 | 545 | — |
+| `ssm_out` / `attn_output` | 17,7 | 39,3 | **450** | 36 |
+
+Mikrobenchmark odtwarza czasy z modelu co do mikrosekundy, więc **żaden kernel
+nie jest wolny — są za krótkie.** Sweep po liczbie wierszy przy stałej długości
+wiersza pokazuje monotoniczny wzrost pasma z czasem trwania kernela: 14,7 MB →
+473 GB/s, 100 MB → 582, 401 MB → 597. To rozbieg podsystemu pamięci, nie ogon
+fal grup roboczych — bo siatka TRWAŁA (blok przechodzi po kaflach krokiem
+siatki, `bench-amd/bench_persist_grid.mojo`) odzyskuje najwyżej 9% na wąskich
+macierzach i DOKŁADNIE ZERO na `17408 x 5120`.
+
+**PUŁAPKA POMIAROWA, na którą sam wpadłem:** pierwszy mikrobenchmark czytał w
+kółko ten sam bufor i pokazywał 980 GB/s dla `attn_qkv` Q6_K — bo 43 MB mieści
+się w 64 MB Infinity Cache. Każdy pomiar pasma kernela dekodowania MUSI czytać
+dane spoza cache, inaczej mierzy L3.
+
+Rachunek sufitu, uczciwie: 15,82 GB czytane na token (16,80 GB pliku minus
+`token_embd`, z którego decode bierze jeden wiersz, minus blok MTP). Przy
+najlepszym zmierzonym paśmie kernela strumieniowego (629 GB/s, `lm_head`) to
+25,1 ms. Ale tego pasma dosięga WYŁĄCZNIE kernel trwający 1,7 ms; 257 uruchomień
+GEMV na token trwa po 39-177 us i siedzi na 450-570 GB/s. Realny sufit tej
+ścieżki to **~28,5 ms samych GEMV-ów**, czyli około 33-34 tok/s ŁĄCZNIE z resztą
+kroku — a nie 34 tok/s dla samego odczytu wag.
+
+### Druga składowa: 3,5 us przestoju na KAŻDE uruchomienie
+
+Rozkład przerw między kernelami na token (profil, 30 tokenów):
+
+| przerwa | sztuk/token | ms/token |
+|---|--:|--:|
+| 2-5 us | 1027,9 | 3,636 |
+| 5-10 us | 2,1 | 0,016 |
+| >10 us | 2,0 | 0,326 |
+
+Rozkład jest jednorodny: **nie ma pojedynczego wąskiego gardła, jest podatek od
+liczby uruchomień.** Graf HIP tego nie zdejmuje (zmierzone wcześniej: 1,7%), bo
+koszt jest po stronie GPU — bariera i drenaż fal między dyspozycjami, nie
+wysyłka z hosta. Jedyne lekarstwo to MNIEJ KERNELI.
+
+### Co z tego zrobiono
+
+1. **Scalony wstęp kroku DeltaNet — 7 uruchomień na warstwę w 1.**
+   `deltanet_step_prepare_f16` robi splot+SiLU, wycięcie v, obie normalizacje L2
+   głowic q/k, powielenie GQA, log-decay i bramkę beta naraz. Podział bez
+   zależności między blokami: siatka to głowice K, a blok `h` obsługuje kanały
+   swojej głowicy q, swojej k i głowic V `h + r*n_k` — bo powielenie GQA mapuje
+   głowicę V na `v % n_k`. Suma kanałów to dokładnie `conv_dim`.
+   Blok ma `d_state` wątków, więc `block_reduce_sum` redukuje tyle samo wartości
+   w tej samej kolejności co `l2norm_heads_f16` — **bitowo ten sam wynik**.
+   Efekt: 1033 -> 745 uruchomień na token, `copyBuffer` 53 -> 5.
+2. **Szerszy blok normy wiersza przy dekodowaniu jednego wiersza.** Krok dekodu
+   normalizuje JEDEN wiersz, więc siatka miała jeden blok na 64 CU: 5,06 us.
+   Blok dobrany do liczby kolumn daje 3,94 us.
+   **REGRESJA ZŁAPANA PRZY POMIARZE:** pierwsza wersja warunku brzmiała
+   `rows <= 8` i objęła weryfikację MTP (T=4). Szerszy blok zmienia KSZTAŁT
+   redukcji, więc ta sama sekwencja policzyła inne ostatnie bity — suma SHA
+   ścieżki Q4_K+MTP przestała się zgadzać, a przepustowość spadła 58,8 -> 56,9.
+   Warunek to teraz `rows == 1`. Lekcja: każda zmiana szerokości bloku, w którym
+   siedzi redukcja, jest zmianą ARYTMETYKI i musi być bramkowana sumą SHA
+   WSZYSTKICH ścieżek, nie tylko tej, którą się stroi.
+3. **Siatka trwała dla wąskich GEMV-ów** (`ssm_out`, `attn_output` — 640 kafli).
+   Zmierzone +0,3% w modelu wobec 9% w izolacji; zostaje, bo jest bitowo zgodna
+   i mierzalnie na plus, ale to już koniec tej dźwigni. Powyżej 2048 kafli
+   kernel trwa dość długo, żeby rozbieg się zamortyzował — tam siatka trwała
+   mierzy się na remis i nie jest używana.
+
+### Wynik, wszystkie cztery komórki z tą samą sumą SHA `0bf2b86b…`
+
+Protokół: `forge bench --prompt-tokens 1024 --tokens 128 --reps 3
+--prefix-cache off`, jedna karta (`HIP_VISIBLE_DEVICES=0`), stan przed zmierzony
+tym samym poleceniem na `d5c8ffc5`.
+
+| model | tryb | przed | po | |
+|---|---|--:|--:|--:|
+| Q4_K_M | bez spekulacji | 30,0 | **30,8** | +2,7% |
+| Q4_K_M | MTP K=3 | 58,8 | 58,6 | remis |
+| NVFP4 | bez spekulacji | 30,0 | **30,7** | +2,3% |
+| NVFP4 | MTP K=3 | 70,3 | 70,0 | remis |
+
+Ścieżki MTP nie zyskują i to jest spójne: weryfikacja T=4 nie używa miksera
+jednotokenowego, tylko `deltanet_prepare_f16`, który ma te kernele scalone od
+początku.
+
+UWAGA do wcześniejszych wpisów: notowane tu `NVFP4 decode 29,1` było
+NIEAKTUALNE — ta sama binarka na `d5c8ffc5` mierzy dziś 30,0. Porównania
+„przed/po" wolno robić wyłącznie wobec przebiegu wykonanego tego samego dnia na
+tej samej maszynie, a nie wobec liczby z dokumentu.
+
+### Czego z tego NIE da się wycisnąć więcej
+
+Po zmianach: 32,4 ms na token, z czego 28,6 ms to same GEMV-y siedzące na
+rozbiegu pamięci, ~1,8 ms reszta pracy i ~2,0 ms przestoju na 745 uruchomieniach.
+Zostały fuzje warte razem około 0,9 ms (wstęp warstwy uwagi: `rmsnorm_f16` +
+rope + `kv_append` + `deinterleave_gate` + `sigmoid_mul` to 113 uruchomień na
+16 warstw; `gated_rmsnorm` do GEMV `ssm_out`; `silu_mul` do `ffn_down`), czyli
+okolice 31,8 tok/s.
+
+**Fuzja normy rezyduum w SZEROKI GEMV jest odrzucona rachunkiem, nie próbą.**
+`rmsnorm_residual` kosztuje 3,94 us pracy plus ~3,5 us przestoju. Gdyby liczył go
+każdy blok konsumenta, przy 4352 blokach grupy `gate`/`up` doszłoby 43 MB ruchu
+L2 na jedno wywołanie — 24 us przy 1800 GB/s. Norma jest tania właśnie dlatego,
+że liczy się RAZ; wąskim gardłem jest tu uruchomienie, ale lekarstwo nie może
+kosztować więcej niż choroba. Do tego dochodzi wyścig: bloki, które czytają
+rezyduum PO tym, jak inny blok je zaktualizował, dodałyby deltę dwa razy.
+
+**34 tok/s na jednej karcie dla tego checkpointu nie jest osiągalne.** Przez tę
+ścianę przechodzi się wyłącznie podnosząc intensywność arytmetyczną — spekulacją
+(MTP daje 58,6 i 70,0) albo drugą kartą.
+
+## Dwie karty: co dokładnie kosztuje (2026-07-31)
+
+NVFP4, p1024/tg128, `--tp-cards 1`: decode **39,7 tok/s** wobec 30,7 na jednej
+karcie (+29%), MTP **78,6** wobec 70,0 (+12%). Suma SHA bez zmian.
+
+Podział obejmuje dziś 88,5% bajtów czytanych na token (FFN, obie wejściowe
+projekcje DeltaNet, głowa logitów), więc karta modelu powinna czytać 8,8 GB i
+kończyć krok w okolicach 20 ms. Mierzymy 25,2 ms. Profil obu agentów
+(`rocprofv3`, kontekst 128) mówi, gdzie jest różnica:
+
+| | karta 0 | karta 1 |
+|---|--:|--:|
+| uruchomienia / token | **1290** | 626 |
+| zajętość / token | 20,14 ms | 13,02 ms |
+| `copyBuffer` / token | **182** | 161 |
+
+Dwie mierzalne wady, obie wynikające z ASYMETRII podziału:
+
+1. **343 kopie D2D na token.** Jedna karta trzyma stan i KV, więc każda
+   pomocnicza projekcja wraca do niej. Na jednej karcie ten sam krok ma 5 kopii.
+   Przy ~2 us pracy i ~3,5 us przestoju na kopię to około 1,9 ms na token.
+2. **Karta 0 wykonuje 55% więcej pracy.** To NIE jest zły stosunek podziału —
+   sweep `--tp-split` od 8704/8704 do 6656/10752 pokazuje, że równy podział jest
+   NAJLEPSZY, a każde przesunięcie w stronę karty 1 pogarsza wynik (3172 ->
+   3372 ms). Nadwyżka karty 0 to praca NIEPODZIELONA: projekcje uwagi,
+   `ssm_out`, cały mikser DeltaNet, normy i sampling — razem ~5,6 ms.
+
+Wniosek jest ten sam, co w `TENSOR_PARALLEL_DESIGN.md`, tylko teraz z liczbami
+po obu stronach: dosypywanie kolejnych macierzy do dzisiejszej protezy nie
+zadziała, bo każda dołożona macierz DOKŁADA kopie do tych 343. Dopiero SPMD —
+gdzie ranga liczy swoje głowice do końca miksera i wymienia wyłącznie sumę
+cząstkową — zdejmuje jedno i drugie naraz.
