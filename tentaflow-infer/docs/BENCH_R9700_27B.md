@@ -1202,3 +1202,65 @@ jakościowo.
 
 Prefill gęsty pod podziałem idzie token po tokenie, tak samo jak hybrydowy i z
 tego samego powodu.
+
+## 7. Wyścig w redukcji symetrycznej — i dlaczego wyglądał jak zaokrąglenie
+
+Redukcja symetryczna z §6 miała WYŚCIG, wykryty dopiero przy powtarzaniu tego
+samego przebiegu: jedna suma SHA na pięć była inna. Rozjazd raz na kilka
+przebiegów wygląda dokładnie jak różnica zaokrąglenia, więc łatwo go odłożyć jako
+znany, dopuszczalny skutek innej kolejności sumowania — i to jest tu najgroźniejsze.
+
+Przyczyna: ranga, która skończyła dodawanie, rusza do następnej warstwy i
+NADPISUJE swoją sumę cząstkową, podczas gdy druga wciąż ją czyta przez P2P.
+Zapisy zdarzeń porządkowały tylko „moja cząstka jest gotowa"; nic nie
+porządkowało „skończyłam czytać twoją".
+
+Domknięcie: drugie zdarzenie na rangę („skończyłam czytać cudze cząstki") i
+oczekiwanie na nie u wszystkich przed wyjściem z redukcji. To są same zdarzenia,
+zero uruchomień kerneli. Koszt zmierzony: 44,6 -> 42,8 tok/s (-4,0%) na
+qwen3.6-27B NVFP4, wobec 33,7 na jednej karcie — czyli nadal +27%.
+
+Po domknięciu pięć kolejnych przebiegów daje tę samą sumę dla obu kwantyzacji
+27B i obie zgadzają się z jedną kartą (`3446474217c2`, `9dda78477ad6`).
+Modele gęste są teraz też powtarzalne, ale nadal różnią się od jednokartowych —
+czyli tam rozjazd JEST zaokrągleniem, a nie tym wyścigiem. Bramką zostaje
+perplexity.
+
+**Wniosek metodyczny: rozjazd „raz na kilka przebiegów" NIGDY nie jest różnicą
+zaokrąglenia.** Zaokrąglenie jest deterministyczne. Każdą taką obserwację trzeba
+najpierw wykluczyć jako wyścig, powtarzając przebieg, a nie tłumaczyć numeryką.
+
+## 8. Prefill pod podziałem: zmierzony sufit i dlaczego kernel jest jedynym wyjściem
+
+`--tp 2` prowadzi prefill TOKEN PO TOKENIE i to boli: prompt 820 tokenów na
+qwen3.6-27B NVFP4 to **17,1 s wobec 1,7 s na jednej karcie**. Dla realnych
+promptów podział dziś przegrywa, mimo +27% na dekodowaniu.
+
+Prefill batchowy pod podziałem został zaimplementowany i ZMIERZONY, a potem
+WYCOFANY. Powód jest liczbowy. Sumę cząstkową dają wyłącznie kernele z wyjściem
+f32, a wariant GGUF NVFP4 przyjmuje `B = 2/4/8/16` — czyli podział musiałby
+liczyć chunkami po 16. Ta szerokość okazała się najgorszym możliwym wyborem:
+
+| ścieżka (820 tokenów promptu) | czas |
+|---|--:|
+| 1 karta, layer-major T=128 | **1,71 s** |
+| 1 karta, batched T=128 | 2,57 s |
+| 1 karta, batched T=32 | 3,84 s |
+| 1 karta, batched T=16 | **37,25 s** |
+| 2 karty, batched T=16 (podział) | 15,23 s |
+| 2 karty, token po tokenie | 17,12 s |
+
+Między T=16 a T=32 jest CLIFF 9,7x, a nie krzywa: poniżej 32 tokenów wchodzi
+rodzina małych batchy, ważona per token. Podział robi na tej ścieżce uczciwe
+2,45x (37,25 -> 15,23), ale ścieżka jest 22x gorsza od tej, którą jedna karta i
+tak ma. Wychodzi 15,23 s wobec 17,12 s — 11% zysku za utratę zgodności
+wygenerowanego tekstu z jedną kartą (inny podział chunka to inny kafel GEMM).
+
+Ta wymiana się nie opłaca, więc batchowy prefill pod podziałem został cofnięty i
+zostaje sekwencyjny, który zgodność ZACHOWUJE.
+
+**Jedyne prawdziwe wyjście to kernel Mojo: GEMM z epilogiem f32 dla dużego `T`**
+(`gemm_nvfp4_gguf_out_f32` obok istniejącego `gemm_nvfp4_f16_bm32`, dokładnie tak
+jak `gemm_f16_out_f32_bm32` stoi obok swojego wariantu f16). Dopiero on pozwoli
+podziałowi liczyć prefill przy T=128 i wtedy 2,45x zadziała na WŁAŚCIWEJ ścieżce.
+Q4_K_M potrzebuje tego samego dla Q4_K i Q6_K.
