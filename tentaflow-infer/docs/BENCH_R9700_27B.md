@@ -841,12 +841,30 @@ czytanych na token, czyli 30% wag, chodzących ~470 zamiast ~630 GB/s. Przy
 suficie to 7,8 ms zamiast 10,4 ms, czyli ~2,6 ms na token; z 32 ms kroku daje to
 około +8%, czyli okolice 32,5 tok/s.
 
-Lekarstwo: SPLIT-K. Wiersz dzielony na `n` zakresów kolumn liczonych przez osobne
-bloki, każdy staginguje tylko swój wycinek aktywacji (więc bufor w LDS zostaje
-nietknięty), wyniki cząstkowe w f32 lądują w buforze `[n, rows]`, a mały kernel
-redukujący sumuje je i zawęża do f16. Dla `ffn_down` podział na 2 daje 1280
-bloków, na 4 — 2560.
+**SPLIT-K SPRAWDZONY I ODRZUCONY.** Zaimplementowany w całości:
+`gemv_q4_k_dp4a_splitk_partial`, `gemv_q6_k_dp4a_splitk_partial` i
+`splitk_reduce_f16` — wiersz dzielony na `n` zakresów kolumn liczonych przez
+osobne bloki, każdy stagingujący tylko swój wycinek aktywacji, sumy cząstkowe w
+f32 sumowane i zawężane do f16 jednym zaokrągleniem.
 
-UWAGA na dobór `n`: przy podziale rośnie liczba stagingów aktywacji, bo każdy blok
-staginguje swój wycinek. Zysk z równoległości trzeba zważyć z tym kosztem —
-zaczynać od `n = 2` i mierzyć, nie zakładać.
+Zmierzone:
+
+| wariant | decode tok/s |
+|---|--:|
+| bez split-K | **30,0** |
+| `splits = 2` | 30,0 |
+| `splits = 4` | 29,5 |
+
+Na poziomie kernela zysk JEST, ale mały: Q6_K `ffn_down` 449 -> 478 GB/s
+(123,3 us wobec 131,3), Q4_K bez zmian. Suma czasu kerneli spadła 32,09 -> 31,80
+ms, czyli 0,29 ms — i to ginie w czasie ściennym. Przy czterech podziałach
+koszt stagingu (każdy blok staginguje swój wycinek osobno) przeważa i wynik
+spada. Kod usunięty.
+
+Wniosek: sama liczba bloków NIE jest wąskim gardłem `ffn_down`. To już TRZECIA
+odrzucona hipoteza dla tej macierzy — po podniesieniu `X_MAX` i stagingu w
+kawałkach. Kolejnym podejrzanym jest sam format: superbloki Q6_K mają 210 bajtów,
+więc są wyrównane tylko do 2 bajtów, co wymusza odczyty par `uint16` zamiast
+szerokich, wyrównanych wektorów. Q4_K (144 B, wyrównane do 16) mierzy na tym
+samym kształcie 532 GB/s wobec 449 GB/s Q6_K — różnica 18% przy identycznej
+geometrii wskazuje właśnie na koszt układu bajtów, a nie na równoległość.
