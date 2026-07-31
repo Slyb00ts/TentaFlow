@@ -247,3 +247,7 @@ target_clippy_fixed/
 # Katalogi robocze buildu kerneli (publikacja podmienia je atomowo; gdy build
 # zostanie przerwany, zostaja na dysku i nie moga trafic do repo).
 tentaflow-infer/kernels/mojo/build/.kernel-build-*/
+
+# Scratch Playwright (skrypty QA, zrzuty ekranu, profile przegladarki) — nigdy do repo.
+# Trafialy tu tez klucze API wklejane do testow, wiec ta reguła jest zabezpieczeniem, nie porzadkami.
+.pw-tmp/
