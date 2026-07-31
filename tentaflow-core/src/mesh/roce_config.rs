@@ -82,6 +82,22 @@ fn enumerate_linux() -> Vec<RoceInterfaceInfo> {
     out
 }
 
+/// Nazwa urzadzenia RoCE/IB powiazanego z netdev, albo None gdy karta nie ma
+/// RDMA. Uwaga: sysfs indeksuje urzadzenia RDMA po ICH nazwie (`rocep1s0f0`),
+/// ktora nie ma nic wspolnego z nazwa netdev — jedyne poprawne przejscie
+/// prowadzi przez `/sys/class/net/<netdev>/device/infiniband/`.
+pub fn rdma_device_for_netdev(netdev: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        read_roce_device(netdev)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = netdev;
+        None
+    }
+}
+
 /// Odczytuje nazwe urzadzenia RoCE/IB powiazanego z netdev. Zwraca pierwszy
 /// (zwykle jedyny) wpis katalogu `device/infiniband`.
 #[cfg(target_os = "linux")]
@@ -144,6 +160,16 @@ fn compute_group_key(netdev: &str, pci_slot: &str) -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !switch_id.is_empty() {
+        // `phys_switch_id` identyfikuje ASIC, nie port — na DGX Spark WSZYSTKIE
+        // cztery netdevy (dwa porty QSFP x dwie domeny PCI) maja go identyczny.
+        // Dopiero `phys_port_name` (p0/p1) rozdziela fizyczne porty, wiec bez
+        // niego twins jednego portu zlalyby sie z drugim portem.
+        let port = std::fs::read_to_string(format!("/sys/class/net/{}/phys_port_name", netdev))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !port.is_empty() {
+            return format!("switch:{}/{}", switch_id, port);
+        }
         return format!("switch:{}", switch_id);
     }
     // Rodzic endpointu PCI = upstream bridge wspoldzielony przez porty jednej karty.

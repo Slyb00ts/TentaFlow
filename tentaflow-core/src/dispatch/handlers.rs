@@ -1786,7 +1786,9 @@ fn db_cluster_to_info(
     }
 }
 
-/// Liczy ilu czlonkow klastra ma status "online" w peer_store.
+/// Liczy ilu czlonkow klastra jest osiagalnych wg peer_store. Peer_store nadaje
+/// statusy "connected"/"reachable"/"discovered"/"disconnected"/"offline" — nody
+/// zdolne przyjac komende mesh to dwa pierwsze.
 fn count_online_members(ctx: &HandlerContext, cluster_id: &str) -> (u32, u32) {
     let members = match repository::list_cluster_members(&ctx.state.db, cluster_id) {
         Ok(m) => m,
@@ -1799,7 +1801,7 @@ fn count_online_members(ctx: &HandlerContext, cluster_id: &str) -> (u32, u32) {
             ctx.state
                 .mesh_peer_store
                 .get(&m.node_id)
-                .map(|p| p.status == "online")
+                .map(|p| matches!(p.status.as_str(), "connected" | "reachable"))
                 .unwrap_or(false)
         })
         .count() as u32;

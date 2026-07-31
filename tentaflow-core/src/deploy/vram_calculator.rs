@@ -1295,7 +1295,9 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     // kart w jednym splicie. Default = layer-split (PP=gpu_count, TP=1): to
     // natywny tryb llama.cpp i jedyny shardujacy KV rowno (bezpieczny na PCIe
     // bez NVLink). Jawne TP od usera nadal wygrywa przez requested_*.unwrap_or.
-    let (rec_tp, rec_pp) = match req.engine {
+    // Rekomendacje spelniaja tp*pp == gpu_count, wiec PP odtwarzamy z gpu_count
+    // i faktycznie wybranego TP — patrz `chosen_pp` nizej.
+    let (rec_tp, _) = match req.engine {
         DeployEngine::LlamaCpp => (1, req.gpu_count.max(1)),
         // MLX to pojedyncze urzadzenie (unified memory) - brak TP/PP.
         DeployEngine::Mlx => (1, 1),
@@ -1311,10 +1313,18 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     // MLX ignoruje TP/PP nawet jesli user je poda; jedno urzadzenie => parallel=1.
     let (chosen_tp, chosen_pp) = match req.engine {
         DeployEngine::Mlx => (1, 1),
-        _ => (
-            req.requested_tensor_parallel.unwrap_or(rec_tp),
-            req.requested_pipeline_parallel.unwrap_or(rec_pp),
-        ),
+        _ => {
+            let tp = req.requested_tensor_parallel.unwrap_or(rec_tp).max(1);
+            // PP musi wynikac z WYBRANEGO TP, nie z niezaleznej rekomendacji:
+            // rec_pp zaklada rec_tp, wiec zlozony z cudzym TP (np. zablokowanym
+            // przez cluster deploy) dawal swiat TP*PP > gpu_count i budzet VRAM
+            // przemnozony przez nieistniejace GPU.
+            let pp = req
+                .requested_pipeline_parallel
+                .unwrap_or_else(|| (req.gpu_count.max(1) / tp).max(1))
+                .max(1);
+            (tp, pp)
+        }
     };
     let parallel = (chosen_tp.max(1) * chosen_pp.max(1)) as f64;
     // Etykieta V cache: osobna gdy podana, inaczej K (kv_cache_dtype).

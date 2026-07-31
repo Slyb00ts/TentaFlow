@@ -3626,9 +3626,8 @@ pub fn remove_cluster_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> 
     Ok(())
 }
 
-/// Lista klastrow z agregatami liczby czlonkow (LEFT JOIN cluster_members).
-/// `members_online` przyjmuje `members_count` jako proxy — peer_store dolicza
-/// online/offline po stronie handlera (peer_store nie jest w DB).
+/// Lista klastrow z agregatem liczby czlonkow. Liczba online nie jest w DB —
+/// wylicza ja handler z peer_store.
 pub fn list_clusters_with_counts(
     pool: &DbPool,
 ) -> Result<Vec<crate::db::models::DbClusterWithCounts>> {
@@ -3647,7 +3646,6 @@ pub fn list_clusters_with_counts(
             Ok(crate::db::models::DbClusterWithCounts {
                 cluster,
                 members_count,
-                members_online: members_count,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

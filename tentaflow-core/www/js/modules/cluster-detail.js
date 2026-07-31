@@ -1035,7 +1035,8 @@ function clusterStatus(members) {
 // swiezy stan polaczenia z mesh node list (nodesById -> member.live).
 function memberOnline(m) {
   if (!m) return false;
-  if (String(m.status || '').toLowerCase() === 'online') return true;
+  // Statusy pochodza wprost z peer_store ("connected"/"reachable"/...).
+  if (['connected', 'reachable'].includes(String(m.status || '').toLowerCase())) return true;
   return isOnline(m.live);
 }
 

@@ -159,7 +159,6 @@ pub struct DbCluster {
 pub struct DbClusterWithCounts {
     pub cluster: DbCluster,
     pub members_count: i64,
-    pub members_online: i64,
 }
 
 /// Czlonek klastra (node przypisany do klastra)

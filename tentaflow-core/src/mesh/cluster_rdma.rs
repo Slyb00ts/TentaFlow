@@ -96,14 +96,34 @@ pub fn plan_cluster(
         }
     }
 
+    let shared = shared_subnets(members);
     let mut planned: HashSet<Ipv4Addr> = HashSet::new();
     members
         .iter()
         .map(|m| {
-            let res = plan_one(m, target_mtu, &existing, &mut planned);
+            let res = plan_one(m, target_mtu, &existing, &mut planned, &shared);
             (m.node_id.clone(), res)
         })
         .collect()
+}
+
+/// Prefiksy /24 obecne na kartach RoCE KAZDEGO czlonka. Adres, ktory twin juz
+/// nosi, wolno zaadoptowac tylko gdy jego podsiec maja wszyscy — inaczej NCCL
+/// dostalby HCA niewidzace pozostalych nodow (przypadek luznej karty w LAN).
+fn shared_subnets(members: &[MemberRoceInput]) -> HashSet<[u8; 3]> {
+    let mut per_member = members.iter().map(|m| {
+        m.roce
+            .iter()
+            .flat_map(|r| r.ipv4.iter().chain(r.ipv4_aliases.iter()))
+            .filter_map(|a| a.parse::<Ipv4Addr>().ok())
+            .map(|ip| {
+                let o = ip.octets();
+                [o[0], o[1], o[2]]
+            })
+            .collect::<HashSet<[u8; 3]>>()
+    });
+    let first = per_member.next().unwrap_or_default();
+    per_member.fold(first, |acc, s| acc.intersection(&s).copied().collect())
 }
 
 /// Czy dany interfejs nosi (jako primary lub alias) podany adres.
@@ -111,16 +131,12 @@ fn iface_has_ip(iface: &RoceInterfaceInfo, ip: &str) -> bool {
     iface.ipv4.as_deref() == Some(ip) || iface.ipv4_aliases.iter().any(|a| a == ip)
 }
 
-/// Czy interfejs ma JAKIKOLWIEK adres IPv4.
-fn iface_has_any_ip(iface: &RoceInterfaceInfo) -> bool {
-    iface.ipv4.is_some() || !iface.ipv4_aliases.is_empty()
-}
-
 fn plan_one(
     member: &MemberRoceInput,
     target_mtu: u32,
     existing: &HashSet<Ipv4Addr>,
     planned: &mut HashSet<Ipv4Addr>,
+    shared: &HashSet<[u8; 3]>,
 ) -> Result<MemberRdmaPlan, String> {
     let primary_ip = member.primary_ip.as_str();
     let up: Vec<&RoceInterfaceInfo> = member.roce.iter().filter(|r| r.link_up).collect();
@@ -202,40 +218,59 @@ fn plan_one(
         needs_mtu_change: primary.mtu != target_mtu,
     });
 
-    for (idx, twin) in twins.iter().enumerate() {
-        // Sekundarna podsiec: trzeci oktet primary + (idx+1), ten sam host oktet.
-        let new_third = o[2] as u16 + (idx as u16) + 1;
-        if new_third > 255 {
-            return Err(format!(
-                "wyprowadzenie podsieci RDMA z {} przekroczyloby trzeci oktet 255 \
-                 (wraparound) — przenies interconnect na nizsza podsiec",
-                primary_ip
-            ));
-        }
-        let target = Ipv4Addr::new(o[0], o[1], new_third as u8, o[3]);
-        let target_str = target.to_string();
+    let mut derived_idx = 0usize;
+    for twin in twins.iter() {
+        // Twin na podsieci, ktora maja WSZYSCY czlonkowie, jest juz poprawnie
+        // skonfigurowany (typowy DGX Spark: oba porty QSFP okablowane, kazdy na
+        // wlasnej /24). Adoptujemy go bez ruszania IP — karta i tak wchodzi do
+        // NCCL_IB_HCA. Adres wyprowadzamy tylko dla twina BEZ adresu.
+        let adopted = twin
+            .ipv4
+            .iter()
+            .chain(twin.ipv4_aliases.iter())
+            .find(|a| {
+                a.parse::<Ipv4Addr>()
+                    .map(|ip| {
+                        let o = ip.octets();
+                        shared.contains(&[o[0], o[1], o[2]])
+                    })
+                    .unwrap_or(false)
+            })
+            .cloned();
 
-        let needs_ip_change = if iface_has_ip(twin, &target_str) {
-            // Idempotentne: twin juz ma docelowy adres.
-            false
-        } else if iface_has_any_ip(twin) {
-            // Twin MA inny adres — to aktywny interfejs. NIE nadpisujemy (P1-1).
-            return Err(format!(
-                "twin {} ma juz adres {} — odmawiam nadpisania aktywnego interfejsu",
-                twin.netdev,
-                twin.ipv4.clone().unwrap_or_default()
-            ));
+        let (ipv4, netmask, needs_ip_change) = if let Some(existing_ip) = adopted {
+            let mask = twin
+                .netmask
+                .clone()
+                .unwrap_or_else(|| "255.255.255.0".to_string());
+            (existing_ip, mask, false)
+        } else if twin.ipv4.is_some() || !twin.ipv4_aliases.is_empty() {
+            // Karta ma adres, ale w podsieci ktorej nie widza pozostale nody —
+            // cudzy aktywny interfejs. NIE nadpisujemy go i NIE wpuszczamy do
+            // NCCL_IB_HCA (P1-1).
+            continue;
         } else {
-            // Twin bez adresu — bezpieczny do przypisania. Sprawdz kolizje (P1-2).
+            // Sekundarna podsiec: trzeci oktet primary + (n+1), ten sam host oktet.
+            let new_third = o[2] as u16 + (derived_idx as u16) + 1;
+            derived_idx += 1;
+            if new_third > 255 {
+                return Err(format!(
+                    "wyprowadzenie podsieci RDMA z {} przekroczyloby trzeci oktet 255 \
+                     (wraparound) — przenies interconnect na nizsza podsiec",
+                    primary_ip
+                ));
+            }
+            let target = Ipv4Addr::new(o[0], o[1], new_third as u8, o[3]);
+            // Kolizja z cudzym primary albo innym zaplanowanym adresem (P1-2).
             if existing.contains(&target) || planned.contains(&target) {
                 return Err(format!(
                     "zaplanowany adres RDMA {} dla {} koliduje z istniejacym/innym \
                      zaplanowanym adresem w klastrze",
-                    target_str, twin.netdev
+                    target, twin.netdev
                 ));
             }
             planned.insert(target);
-            true
+            (target.to_string(), "255.255.255.0".to_string(), true)
         };
 
         roce_devices.push(twin.roce_device.clone());
@@ -243,12 +278,20 @@ fn plan_one(
             netdev: twin.netdev.clone(),
             roce_device: twin.roce_device.clone(),
             role: "secondary",
-            ipv4: target_str,
-            netmask: "255.255.255.0".to_string(),
+            ipv4,
+            netmask,
             mtu: target_mtu,
             needs_ip_change,
             needs_mtu_change: twin.mtu != target_mtu,
         });
+    }
+
+    if roce_devices.len() < 2 {
+        return Err(format!(
+            "w grupie portu interconnectu {} nie ma uzytecznego twina RoCE \
+             (kazdy kandydat nosi adres w podsieci niewidocznej dla pozostalych nodow)",
+            primary.netdev
+        ));
     }
 
     Ok(MemberRdmaPlan {
@@ -376,26 +419,84 @@ mod tests {
 
     #[test]
     fn does_not_clobber_unrelated_active_rdma_iface() {
-        // Second RoCE iface in the SAME group already carries a different address.
-        let roce = vec![
-            iface(
+        // Twin in the SAME group carries an address on a subnet the OTHER member
+        // does not have — a LAN card that happens to be RDMA-capable. It must be
+        // left alone AND kept out of NCCL_IB_HCA, so the member has no usable twin.
+        let a = member(
+            "a",
+            "10.10.10.24",
+            vec![
+                iface(
+                    "enP2p1s0f0np0",
+                    "roceP2p1s0f0",
+                    Some("10.10.10.24"),
+                    1500,
+                    "switch:s",
+                ),
+                iface(
+                    "enp1s0f0np0",
+                    "rocep1s0f0",
+                    Some("192.168.50.7"),
+                    1500,
+                    "switch:s",
+                ),
+            ],
+        );
+        let b = member(
+            "b",
+            "10.10.10.25",
+            vec![iface(
                 "enP2p1s0f0np0",
                 "roceP2p1s0f0",
-                Some("10.10.10.24"),
+                Some("10.10.10.25"),
                 1500,
                 "switch:s",
-            ),
-            iface(
-                "enp1s0f0np0",
-                "rocep1s0f0",
-                Some("192.168.50.7"),
-                1500,
-                "switch:s",
-            ),
-        ];
-        let res = plan_cluster(&[member("n", "10.10.10.24", roce)], 9000, &[]);
+            )],
+        );
+        let res = plan_cluster(&[a, b], 9000, &[]);
         let err = res.into_iter().next().unwrap().1.unwrap_err();
-        assert!(err.contains("odmawiam nadpisania"), "{}", err);
+        assert!(err.contains("uzytecznego twina"), "{}", err);
+    }
+
+    #[test]
+    fn adopts_twin_already_addressed_on_shared_subnet() {
+        // Real 2x DGX Spark: BOTH QSFP ports cabled and addressed on their own /24.
+        // The twin is already configured — adopt it (no IP rewrite), only MTU moves.
+        let mk = |host: u8| {
+            member(
+                &format!("n{}", host),
+                &format!("10.10.11.{}", host),
+                vec![
+                    iface(
+                        "enp1s0f0np0",
+                        "rocep1s0f0",
+                        Some(&format!("10.10.11.{}", host)),
+                        9000,
+                        "switch:s/p0",
+                    ),
+                    iface(
+                        "enP2p1s0f0np0",
+                        "roceP2p1s0f0",
+                        Some(&format!("10.10.10.{}", host)),
+                        1500,
+                        "switch:s/p0",
+                    ),
+                ],
+            )
+        };
+        let res = plan_cluster(&[mk(24), mk(25)], 9000, &[]);
+        let plan = ok_plan(res, "n24");
+        assert_eq!(plan.rdma_devices, "rocep1s0f0,roceP2p1s0f0");
+        assert_eq!(plan.socket_ifname, "enp1s0f0np0");
+        assert_eq!(plan.primary_ip, "10.10.11.24");
+        let twin = plan
+            .interfaces
+            .iter()
+            .find(|i| i.netdev == "enP2p1s0f0np0")
+            .expect("twin in plan");
+        assert_eq!(twin.ipv4, "10.10.10.24", "adopted, not rewritten");
+        assert!(!twin.needs_ip_change);
+        assert!(twin.needs_mtu_change, "1500 -> 9000");
     }
 
     #[test]
