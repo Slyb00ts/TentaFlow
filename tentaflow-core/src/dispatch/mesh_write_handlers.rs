@@ -867,6 +867,7 @@ pub async fn cluster_rdma_configure(
                 &confirmed_devices.join(","),
                 &plan.primary_ip,
                 &plan.socket_ifname,
+                plan.gid_index,
             ) {
                 warn!("update_cluster_member_rdma nieudany: {}", e);
             }

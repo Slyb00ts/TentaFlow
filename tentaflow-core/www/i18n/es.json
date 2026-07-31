@@ -3655,7 +3655,10 @@
     "instance_short": "instancias",
     "run_tests": "Probar todos",
     "testing": "Probando...",
-    "tests_done": "Pruebas completadas"
+    "tests_done": "Pruebas completadas",
+    "interconnect_nic": "NIC de interconexion",
+    "nic_saved": "NIC guardada",
+    "nic_save_failed": "No se pudo guardar la NIC"
   },
   "cluster_wizard": {
     "step1_label": "Datos básicos y enrutamiento",

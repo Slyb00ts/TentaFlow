@@ -63,7 +63,9 @@ fn enumerate_linux() -> Vec<RoceInterfaceInfo> {
         };
 
         let pci_slot = read_pci_slot(&netdev);
+        let gid_index = read_rocev2_gid_index(&roce_device);
         out.push(RoceInterfaceInfo {
+            gid_index,
             netdev: netdev.clone(),
             roce_device,
             ipv4,
@@ -107,6 +109,29 @@ fn read_roce_device(netdev: &str) -> Option<String> {
     entries
         .find_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
+}
+
+/// Indeks GID RoCE v2 z adresem IPv4-mapped dla urzadzenia RDMA. NCCL potrzebuje
+/// go w `NCCL_IB_GID_INDEX`, a jego wartosc zalezy od sprzetu i kolejnosci
+/// wpisow w tablicy GID — nie wolno jej zakladac. Szukamy pierwszego wpisu typu
+/// "RoCE v2", ktorego GID jest IPv4-mapped (`::ffff:a.b.c.d`).
+#[cfg(target_os = "linux")]
+fn read_rocev2_gid_index(roce_device: &str) -> Option<u32> {
+    for i in 0..16u32 {
+        let base = format!("/sys/class/infiniband/{}/ports/1", roce_device);
+        let gid_type = match std::fs::read_to_string(format!("{}/gid_attrs/types/{}", base, i)) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !gid_type.trim().contains("RoCE v2") {
+            continue;
+        }
+        match std::fs::read_to_string(format!("{}/gids/{}", base, i)) {
+            Ok(gid) if gid.contains("ffff:") => return Some(i),
+            _ => continue,
+        }
+    }
+    None
 }
 
 /// Link UP gdy carrier == "1" (preferowane) albo operstate == "up".

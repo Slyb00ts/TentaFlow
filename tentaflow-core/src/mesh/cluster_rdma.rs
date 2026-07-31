@@ -56,6 +56,9 @@ pub struct MemberRdmaPlan {
     pub primary_ip: String,
     /// Netdev portu QSFP nosacy `primary_ip` (NCCL_SOCKET_IFNAME bootstrap).
     pub socket_ifname: String,
+    /// Indeks GID RoCE v2 karty primary (NCCL_IB_GID_INDEX). `None` gdy nod go
+    /// nie podal — wtedy zapisana wartosc zostaje bez zmian.
+    pub gid_index: Option<u32>,
 }
 
 /// Wyznacza plan RDMA dla CALEGO klastra naraz.
@@ -298,6 +301,7 @@ fn plan_one(
         interfaces,
         rdma_devices: roce_devices.join(","),
         primary_ip: primary_ip.to_string(),
+        gid_index: primary.gid_index,
         socket_ifname: primary.netdev.clone(),
     })
 }
@@ -324,6 +328,7 @@ mod tests {
             speed_mbps: 200_000,
             pci_slot: "/sys/devices/pci/x".to_string(),
             group_key: group.to_string(),
+            gid_index: Some(3),
         }
     }
 

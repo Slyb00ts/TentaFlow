@@ -695,6 +695,12 @@ pub struct RoceInterfaceInfo {
     /// ConnectX), a gdy go brak — rodzic sciezki PCI. Pusty gdy nieznany.
     #[serde(default)]
     pub group_key: String,
+    /// Indeks GID RoCE v2 / IPv4 tej karty, odczytany NA nodzie z
+    /// `/sys/class/infiniband/<dev>/ports/1/gid_attrs`. Trafia do
+    /// `NCCL_IB_GID_INDEX` — zalezy od sprzetu, wiec nie wolno go zakladac.
+    /// `None` gdy nie da sie ustalic (starszy peer albo brak wpisu RoCE v2).
+    #[serde(default)]
+    pub gid_index: Option<u32>,
 }
 
 // =============================================================================
