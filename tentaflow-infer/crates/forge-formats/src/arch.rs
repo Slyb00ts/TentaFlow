@@ -2059,3 +2059,228 @@ mod pipeline_tests {
         assert!(check_pipeline_range(40, 0, 40).is_ok());
     }
 }
+
+// ===== Kontrakt podziału tensor-parallel =====
+//
+// Ranga to osobny model na własnej karcie, zbudowany z deskryptora o
+// PODZIELONYCH liczbach głowic. Dzięki temu prefill, dekodowanie, weryfikacja
+// MTP i batch przechodzą przez ten sam kod na mniejszym kształcie, zamiast
+// wymagać osobnego wpięcia każda z osobna.
+//
+// Ten moduł nie dzieli wag — opisuje WYŁĄCZNIE, co komu przypada, i odmawia,
+// gdy kształt się nie dzieli. Wszystko, co dzieli wagi, ma się o niego pytać.
+
+/// Przydział rangi w podziale tensor-parallel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TpShard {
+    pub rank: usize,
+    pub world: usize,
+}
+
+impl TpShard {
+    pub fn new(rank: usize, world: usize) -> Result<Self> {
+        if world == 0 || rank >= world {
+            return Err(fmt_err(format!(
+                "tensor parallel: ranga {rank} poza światem {world}"
+            )));
+        }
+        Ok(Self { rank, world })
+    }
+
+    /// Podział pojedynczego wymiaru; `align` to najmniejsza niepodzielna
+    /// jednostka (blok kwantyzacji albo `head_dim`).
+    fn split(&self, what: &str, total: usize, align: usize) -> Result<usize> {
+        if align == 0 || !total.is_multiple_of(align) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {what} = {total} nie jest wielokrotnością {align}"
+            )));
+        }
+        let units = total / align;
+        if !units.is_multiple_of(self.world) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {what} = {total} daje {units} jednostek po {align}, \
+                 czego nie da się podzielić na {} rang",
+                self.world
+            )));
+        }
+        Ok(total / self.world)
+    }
+}
+
+impl Hyperparams {
+    /// Hiperparametry JEDNEJ rangi. Odmawia zamiast dobierać po cichu — podział,
+    /// który nie wychodzi, ma się zatrzymać przy starcie, a nie policzyć co
+    /// innego.
+    pub fn shard(&self, shard: TpShard) -> Result<Self> {
+        if shard.world == 1 {
+            return Ok(self.clone());
+        }
+        if self.moe.is_some() {
+            return Err(fmt_err(
+                "tensor parallel: MoE dzieli się po ekspertach, nie po głowicach",
+            ));
+        }
+        if self.alt_attn.is_some() {
+            return Err(fmt_err(
+                "tensor parallel: naprzemienna geometria uwagi nie ma opisanego podziału",
+            ));
+        }
+        let mut out = self.clone();
+        // GQA jest tu NAJCIAŚNIEJSZE: głowic KV jest zwykle kilka, więc to one
+        // wyznaczają dopuszczalną liczbę rang, a nie liczba głowic Q.
+        out.n_kv_heads = shard.split("n_kv_heads", self.n_kv_heads, 1)?;
+        out.n_heads = shard.split("n_heads", self.n_heads, 1)?;
+        if !out.n_heads.is_multiple_of(out.n_kv_heads) {
+            return Err(fmt_err(format!(
+                "tensor parallel: po podziale zostaje {} głowic Q na {} KV — grupa GQA \
+                 musi zostać cała na jednej randze",
+                out.n_heads, out.n_kv_heads
+            )));
+        }
+        // Wymiar pośredni dzieli się po WIERSZACH `gate`/`up` i po KOLUMNACH
+        // `down`, więc musi zostać wielokrotnością największego bloku kwantyzacji
+        // K-kwantów; inaczej kolumnowy wycinek `down` trafiałby w środek bloku.
+        out.intermediate_size = shard.split("intermediate_size", self.intermediate_size, 256)?;
+        if let Some(ssm) = &self.ssm {
+            out.ssm = Some(ssm.shard(shard)?);
+        }
+        Ok(out)
+    }
+}
+
+impl SsmParams {
+    /// Parametry DeltaNet jednej rangi.
+    ///
+    /// PUŁAPKA, na której rozbiła się poprzednia próba: GGUF przypisuje głowicę
+    /// V do głowicy K przez MODULO (`deltanet_repeat_qk_f16` liczy
+    /// `source = index % key_dim`), więc CIĄGŁY zakres głowic V nie pokrywa się z
+    /// żadnym zakresem głowic K. Ranga, która dostała V 24-47 i K 8-15, sięga
+    /// głowicą V 39 po głowicę K 7 — której nie ma. Nie ma z tego błędu ani
+    /// asercji, tylko tekst-śmieć.
+    ///
+    /// Dlatego podział idzie po KLASACH RESZTY: ranga bierze głowice K
+    /// `[r*n_k/W, (r+1)*n_k/W)` oraz te głowice V, których reszta z dzielenia
+    /// przez `n_k` wpada w ten zakres. Odpowiada to `n_v / n_k` ciągłym
+    /// przebiegom — patrz `TpShard::v_head_runs`.
+    pub fn shard(&self, shard: TpShard) -> Result<Self> {
+        if shard.world == 1 {
+            return Ok(self.clone());
+        }
+        if !self.dt_rank.is_multiple_of(self.n_group) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {} głowic V nie jest wielokrotnością {} głowic K, \
+                 więc mapowanie GQA DeltaNet nie ma podziału",
+                self.dt_rank, self.n_group
+            )));
+        }
+        let mut out = self.clone();
+        out.n_group = shard.split("ssm.group_count", self.n_group, 1)?;
+        out.dt_rank = shard.split("ssm.time_step_rank", self.dt_rank, 1)?;
+        out.d_inner = out.dt_rank * self.d_state;
+        Ok(out)
+    }
+}
+
+impl TpShard {
+    /// Globalne indeksy głowic K tej rangi (ciągły zakres).
+    pub fn k_head_range(&self, n_k_heads: usize) -> Result<(usize, usize)> {
+        let per = self.split("ssm.group_count", n_k_heads, 1)?;
+        Ok((self.rank * per, per))
+    }
+
+    /// Globalne indeksy głowic V tej rangi, W KOLEJNOŚCI LOKALNEJ.
+    ///
+    /// Kolejność jest istotna, a nie kosmetyczna: scalony wstęp kroku DeltaNet
+    /// numeruje głowice V jako `h_local + run * n_k_local`, więc loader musi
+    /// ułożyć wiersze dokładnie w tej kolejności. Inaczej ranga liczyłaby swoje
+    /// głowice poprawnie, ale przypisała im cudze wagi.
+    pub fn v_head_order(&self, n_k_heads: usize, n_v_heads: usize) -> Result<Vec<usize>> {
+        if n_k_heads == 0 || !n_v_heads.is_multiple_of(n_k_heads) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {n_v_heads} głowic V nie jest wielokrotnością {n_k_heads} głowic K"
+            )));
+        }
+        let (first_k, per_k) = self.k_head_range(n_k_heads)?;
+        let runs = n_v_heads / n_k_heads;
+        let mut order = Vec::with_capacity(runs * per_k);
+        for run in 0..runs {
+            for h in 0..per_k {
+                order.push(run * n_k_heads + first_k + h);
+            }
+        }
+        Ok(order)
+    }
+}
+
+#[cfg(test)]
+mod tp_shard_tests {
+    use super::*;
+
+    fn qwen35_ssm() -> SsmParams {
+        SsmParams {
+            d_conv: 4,
+            d_inner: 6144,
+            d_state: 128,
+            dt_rank: 48,
+            n_group: 16,
+        }
+    }
+
+    #[test]
+    fn dwie_rangi_dziela_glowice_qwen35() {
+        let shard = TpShard::new(1, 2).expect("ranga w zasięgu");
+        let ssm = qwen35_ssm().shard(shard).expect("qwen35 dzieli się na dwie");
+        assert_eq!(ssm.n_group, 8);
+        assert_eq!(ssm.dt_rank, 24);
+        assert_eq!(ssm.d_inner, 24 * 128);
+    }
+
+    #[test]
+    fn glowice_v_ida_klasami_reszty_a_nie_ciagiem() {
+        let rank0 = TpShard::new(0, 2).expect("ranga 0");
+        let rank1 = TpShard::new(1, 2).expect("ranga 1");
+        let v0 = rank0.v_head_order(16, 48).expect("podział V");
+        let v1 = rank1.v_head_order(16, 48).expect("podział V");
+        // Ciągły podział dałby 0-23 i 24-47, i głowica V 39 sięgałaby po
+        // głowicę K 7, której ranga 1 nie ma.
+        assert_eq!(&v0[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(&v0[8..16], &[16, 17, 18, 19, 20, 21, 22, 23]);
+        assert_eq!(&v0[16..], &[32, 33, 34, 35, 36, 37, 38, 39]);
+        assert_eq!(&v1[..8], &[8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(v0.len() + v1.len(), 48);
+        // Każda głowica V trafia dokładnie raz i na tę rangę, która ma jej K.
+        let mut all: Vec<usize> = v0.iter().chain(v1.iter()).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..48).collect::<Vec<_>>());
+        for (rank, heads) in [(0usize, &v0), (1usize, &v1)] {
+            let (first_k, per_k) = TpShard::new(rank, 2)
+                .expect("ranga")
+                .k_head_range(16)
+                .expect("zakres K");
+            for &v in heads {
+                let k = v % 16;
+                assert!(
+                    k >= first_k && k < first_k + per_k,
+                    "głowica V {v} sięga po K {k} spoza rangi {rank}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn niepodzielne_ksztalty_sa_odrzucane() {
+        let shard = TpShard::new(0, 3).expect("ranga 0 z trzech");
+        // 16 głowic K nie dzieli się na trzy rangi.
+        assert!(qwen35_ssm().shard(shard).is_err());
+        let mut ssm = qwen35_ssm();
+        // 48 głowic V przy 5 głowicach K nie ma mapowania GQA.
+        ssm.n_group = 5;
+        assert!(ssm.shard(TpShard::new(0, 2).expect("ranga")).is_err());
+    }
+
+    #[test]
+    fn ranga_poza_swiatem_jest_bledem() {
+        assert!(TpShard::new(2, 2).is_err());
+        assert!(TpShard::new(0, 0).is_err());
+    }
+}
