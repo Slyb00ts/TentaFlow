@@ -240,6 +240,58 @@ Kernele redukcji już są: `gemm_nvfp4_gguf_out_f32_batch` (2/4/8/16 tokenów),
 Brakuje wariantu f32 dla dużych `T` (prefill) — to jedyna nowa praca po stronie
 Mojo.
 
+## Kształt implementacji: ranga to OSOBNY `Model`, nie parametr w miksarze
+
+Pierwsza wersja tego dokumentu opisywała krok 2 jako „wydzielić `Rank`" i
+sugerowała przewleczenie zakresu głowic przez miejsca, które indeksują stan.
+Przegląd drzewa mówi, że to zła droga, i warto zapisać dlaczego, zanim ktoś
+zacznie: `model.rs` ma 34 odczyty `.state` i 22 `.conv`, ale to NIE jest cała
+powierzchnia — ranga potrzebuje też własnego KV, własnych buforów aktywacji,
+własnych wag norm i własnej głowy logitów. Przewleczenie zakresu głowic załatwia
+jedną z tych pięciu rzeczy.
+
+Tańszy kształt wychodzi z obserwacji, że `Model` UMIE JUŻ wszystko, czego
+potrzebuje ranga: wczytać wagi, zaalokować KV, zaalokować stan DeltaNet i
+przejść pętlę warstw. Ranga to po prostu `Model` zbudowany na karcie `r` z
+deskryptora, w którym liczby głowic, `inter` i słownik są PODZIELONE. Wtedy:
+
+- nie ma zakresu głowic do przewlekania — ranga ma po prostu mniej głowic i całą
+  resztę kodu widzi bez zmian;
+- prefill, dekodowanie, weryfikacja MTP, batch i checkpointy dziedziczą podział
+  ZA DARMO, bo to ten sam kod na mniejszym kształcie — czyli znika ograniczenie
+  „wszystko albo nic", które wywróciło poprzednie podejście;
+- nowy kod ogranicza się do trzech rzeczy: ładowania fragmentu tensora zamiast
+  całego, dwóch redukcji na warstwę i sterownika, który zakolejkowuje warstwę na
+  każdej randze, zanim zsynchronizuje.
+
+Czego to wymaga i co jest w tym ryzykowne:
+
+1. **Loader musi umieć wczytać FRAGMENT tensora.** Dziś `load_row_split` czyta
+   plik po raz drugi — to proteza asymetrii. Docelowo ranga czyta wyłącznie
+   swoje wiersze, raz.
+2. **Deskryptor per ranga.** `n_v_heads`, `n_k_heads`, `head_count`,
+   `head_count_kv`, `feed_forward_length` i `vocab_size` różnią się między rangą
+   a modelem. Trzeba sprawdzić przy starcie, czy dzielą się przez liczbę rang, i
+   ODMÓWIĆ, zamiast dobierać po cichu. GQA ma tu 4 głowice KV, więc dopuszczalne
+   TP to 1, 2 i 4.
+3. **Dwie redukcje na warstwę** (po projekcji wyjściowej miksera i po `down`),
+   sumy cząstkowe w f32, zawężenie do f16 dopiero po sumie. Kernele redukcji
+   już są (`add_f32`, `add_f32_out_f16`, warianty `out_f32` GEMV-ów).
+4. **Strumień rezydualny replikowany.** Po redukcji obie rangi mają ten sam
+   wektor, więc każda liczy swoją normę lokalnie i nie ma rozgłaszania `x`.
+5. **Głowa logitów** kolumnowo, z all-gather na randze próbkującej.
+6. **Przechwytywanie grafu** sprawdzić osobno: ROCm przerywa asercją przy
+   przechwytywaniu rozwidlenia strumienia MIĘDZY kartami, więc albo każda ranga
+   ma własny graf z redukcjami poza nim, albo krok idzie jawnym łańcuchem
+   (zmierzony koszt utraty grafu na ścieżce hybrydowej: 1,7%).
+
+**Ile to jest warte — z pomiaru z 2026-07-31, nie z oszacowania.** Przebieg
+jednokartowy NVFP4 to 1001 uruchomień, 30,04 ms zajętości i 3,81 ms przestoju na
+token. Przy pełnym podziale zajętość rangi schodzi do ~15,8 ms, ale przestój NIE
+dzieli się przez dwa — podatek od liczby uruchomień jest wspólny dla obu rang.
+Krok wychodzi ~21 ms, czyli **47-48 tok/s wobec dzisiejszych 39,7**. Tyle jest do
+wzięcia i nie więcej; kto obiecuje 2x, nie policzył przestoju.
+
 ## Co trzeba zrobić w tym drzewie
 
 Kolejność jest wymuszona zależnościami, nie preferencją:
