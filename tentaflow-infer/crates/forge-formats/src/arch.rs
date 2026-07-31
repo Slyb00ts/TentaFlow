@@ -2374,28 +2374,42 @@ impl BlockMatrix<'_> {
         Ok(out)
     }
 
-    /// Wycinek KOLUMN, ten sam w każdym wierszu. Granice muszą paść na blok.
-    pub fn take_cols(&self, first: usize, count: usize) -> Result<Vec<u8>> {
+    /// Wycinek KOLUMN, ten sam w każdym wierszu, sklejony w PODANEJ KOLEJNOŚCI.
+    ///
+    /// Zakresów jest kilka z tego samego powodu co przy wierszach: `ssm_out`
+    /// czyta wymiar głowic V, a te idą klasami reszty, więc ranga bierze
+    /// `n_v / n_k` rozłącznych przebiegów kolumn. Granice muszą paść na blok.
+    pub fn take_cols(&self, ranges: &[(usize, usize)]) -> Result<Vec<u8>> {
         let (values, block_bytes, row_bytes) = self.geometry()?;
-        if !first.is_multiple_of(values) || !count.is_multiple_of(values) {
-            return Err(fmt_err(format!(
-                "podział kolumn: granica [{first}, {}) nie pada na blok {values} wartości",
-                first + count
-            )));
+        let mut spans = Vec::with_capacity(ranges.len());
+        let mut take_bytes = 0usize;
+        for &(first, count) in ranges {
+            if !first.is_multiple_of(values) || !count.is_multiple_of(values) {
+                return Err(fmt_err(format!(
+                    "podział kolumn: granica [{first}, {}) nie pada na blok {values} wartości",
+                    first + count
+                )));
+            }
+            let end = first
+                .checked_add(count)
+                .ok_or_else(|| fmt_err("podział kolumn: przepełnienie zakresu"))?;
+            if end > self.cols {
+                return Err(fmt_err(format!(
+                    "podział kolumn: zakres [{first}, {end}) wykracza poza {} kolumn",
+                    self.cols
+                )));
+            }
+            let from = (first / values) * block_bytes;
+            let bytes = (count / values) * block_bytes;
+            spans.push((from, bytes));
+            take_bytes += bytes;
         }
-        let end = first + count;
-        if end > self.cols {
-            return Err(fmt_err(format!(
-                "podział kolumn: zakres [{first}, {end}) wykracza poza {} kolumn",
-                self.cols
-            )));
-        }
-        let take_from = (first / values) * block_bytes;
-        let take_bytes = (count / values) * block_bytes;
         let mut out = Vec::with_capacity(self.rows * take_bytes);
         for row in 0..self.rows {
-            let base = row * row_bytes + take_from;
-            out.extend_from_slice(&self.data[base..base + take_bytes]);
+            for &(from, bytes) in &spans {
+                let base = row * row_bytes + from;
+                out.extend_from_slice(&self.data[base..base + bytes]);
+            }
         }
         Ok(out)
     }
@@ -2449,7 +2463,7 @@ mod block_matrix_tests {
             cols: 1024,
             quant: QuantKind::Q4K,
         };
-        let out = m.take_cols(512, 512).expect("wycinek");
+        let out = m.take_cols(&[(512, 512)]).expect("wycinek");
         assert_eq!(out.len(), 4 * 2 * 144);
         for r in 0..4 {
             assert_eq!(out[r * 2 * 144], (r % 251) as u8);
@@ -2465,8 +2479,8 @@ mod block_matrix_tests {
             cols: 512,
             quant: QuantKind::Q4K,
         };
-        assert!(m.take_cols(128, 256).is_err());
-        assert!(m.take_cols(0, 300).is_err());
+        assert!(m.take_cols(&[(128, 256)]).is_err());
+        assert!(m.take_cols(&[(0, 300)]).is_err());
         assert!(m.take_rows(&[(1, 2)]).is_err());
     }
 
@@ -2480,5 +2494,250 @@ mod block_matrix_tests {
             quant: QuantKind::Q4K,
         };
         assert!(m.take_rows(&[(0, 1)]).is_err());
+    }
+}
+
+/// Jak pociąć tensor danej roli dla jednej rangi.
+///
+/// `Rows` obsługuje macierze kolumnowo równoległe (dzielone WYJŚCIE, wynik
+/// zostaje lokalny), `Cols` wierszowo równoległe (dzielone WEJŚCIE, wynik to
+/// suma cząstkowa kończąca się redukcją). Oba niosą LISTĘ zakresów, bo głowice V
+/// DeltaNet idą klasami reszty i dają kilka rozłącznych przebiegów.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleShard {
+    Replicated,
+    Rows(Vec<(usize, usize)>),
+    Cols(Vec<(usize, usize)>),
+}
+
+impl TpShard {
+    /// Plan cięcia tensora danej roli dla architektury hybrydowej `qwen35`.
+    ///
+    /// Liczony z PEŁNYCH hiperparametrów, bo opisuje wycinek pełnej macierzy.
+    /// Rola nieznana temu podziałowi jest BŁĘDEM, a nie cichą replikacją —
+    /// tensor, o którym nikt nie pomyślał, replikowany po cichu daje model,
+    /// który liczy poprawnie i czyta dwa razy więcej, więc nikt tego nie zauważy
+    /// poza brakiem przyspieszenia.
+    pub fn role_shard(&self, p: &Hyperparams, role: WeightRole) -> Result<RoleShard> {
+        if self.world == 1 {
+            return Ok(RoleShard::Replicated);
+        }
+        let head_dim = p.head_dim;
+        let q_per = self.split("n_heads", p.n_heads, 1)?;
+        let kv_per = self.split("n_kv_heads", p.n_kv_heads, 1)?;
+        let inter_per = self.split("intermediate_size", p.intermediate_size, 256)?;
+        let one = |first: usize, count: usize| vec![(first, count)];
+        Ok(match role {
+            // Uwaga. Projekcja Q niesie na głowicę DWA bloki `head_dim`, bo
+            // druga połowa to bramka wyjścia (`attn_gated`) — wycinek musi objąć
+            // obie, inaczej ranga dostałaby bramkę cudzej głowicy.
+            WeightRole::AttnQ => {
+                let per = q_per * head_dim * if p.attn_gated { 2 } else { 1 };
+                RoleShard::Rows(one(self.rank * per, per))
+            }
+            WeightRole::AttnK | WeightRole::AttnV => {
+                let per = kv_per * head_dim;
+                RoleShard::Rows(one(self.rank * per, per))
+            }
+            WeightRole::AttnO => {
+                let per = q_per * head_dim;
+                RoleShard::Cols(one(self.rank * per, per))
+            }
+            // FFN: `gate`/`up` kolumnowo, `down` wierszowo — granice pokrywają
+            // się co do wiersza, więc kolumny `down` to dokładnie ten kawałek
+            // wymiaru pośredniego, który ta ranga policzyła.
+            WeightRole::FfnGate | WeightRole::FfnUp => {
+                RoleShard::Rows(one(self.rank * inter_per, inter_per))
+            }
+            WeightRole::FfnDown => RoleShard::Cols(one(self.rank * inter_per, inter_per)),
+            // DeltaNet.
+            WeightRole::SsmInProj
+            | WeightRole::SsmGate
+            | WeightRole::SsmAlpha
+            | WeightRole::SsmBeta
+            | WeightRole::SsmA
+            | WeightRole::SsmDt
+            | WeightRole::SsmConv1d
+            | WeightRole::SsmOut => {
+                let ssm = p.ssm.as_ref().ok_or_else(|| {
+                    fmt_err("podział: rola DeltaNet w modelu bez parametrów SSM")
+                })?;
+                let d_state = ssm.d_state;
+                let n_k = ssm.n_k_heads();
+                let n_v = ssm.n_v_heads();
+                let key_dim = ssm.key_dim();
+                let (first_k, per_k) = self.k_head_range(n_k)?;
+                let v_order = self.v_head_order(n_k, n_v)?;
+                // Głowice V rangi to `n_v / n_k` ciągłych przebiegów po `per_k`
+                // głowic; zwijamy je z listy indeksów, żeby wycinek był kilkoma
+                // zakresami zamiast kilkudziesięcioma.
+                let runs: Vec<usize> = v_order
+                    .chunks(per_k)
+                    .map(|run| run[0])
+                    .collect();
+                let v_rows = |width: usize, base: usize| -> Vec<(usize, usize)> {
+                    runs.iter()
+                        .map(|&first| (base + first * width, per_k * width))
+                        .collect()
+                };
+                match role {
+                    // Wejściowa projekcja niesie q, k i v jedno za drugim, więc
+                    // ranga bierze TRZY grupy zakresów w tej właśnie kolejności —
+                    // taki układ ma jej lokalny `conv_dim`.
+                    WeightRole::SsmInProj | WeightRole::SsmConv1d => {
+                        let mut ranges = vec![
+                            (first_k * d_state, per_k * d_state),
+                            (key_dim + first_k * d_state, per_k * d_state),
+                        ];
+                        ranges.extend(v_rows(d_state, 2 * key_dim));
+                        RoleShard::Rows(ranges)
+                    }
+                    WeightRole::SsmGate => RoleShard::Rows(v_rows(d_state, 0)),
+                    WeightRole::SsmAlpha
+                    | WeightRole::SsmBeta
+                    | WeightRole::SsmA
+                    | WeightRole::SsmDt => RoleShard::Rows(v_rows(1, 0)),
+                    // Projekcja wyjściowa czyta wymiar głowic V, więc dzieli się
+                    // po KOLUMNACH tymi samymi przebiegami. Kończy się redukcją.
+                    WeightRole::SsmOut => RoleShard::Cols(v_rows(d_state, 0)),
+                    _ => unreachable!("rola DeltaNet obsłużona wyżej"),
+                }
+            }
+            // Replikowane: wektory norm i tablica embeddingu. Dekodowanie pobiera
+            // z niej JEDEN wiersz, więc dzielenie nic nie daje.
+            WeightRole::AttnNorm
+            | WeightRole::AttnQNorm
+            | WeightRole::AttnKNorm
+            | WeightRole::FfnNorm
+            | WeightRole::PostAttnNorm
+            | WeightRole::PostFfwNorm
+            | WeightRole::SsmNorm
+            | WeightRole::OutputNorm
+            | WeightRole::TokenEmbd
+            | WeightRole::RopeFreqs => RoleShard::Replicated,
+            other => {
+                return Err(fmt_err(format!(
+                    "podział tensor-parallel nie ma planu dla roli {other:?}"
+                )));
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod role_shard_tests {
+    use super::*;
+
+    fn qwen35() -> Hyperparams {
+        Hyperparams {
+            block_count: 64,
+            hidden_size: 5120,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            intermediate_size: 17408,
+            vocab_size: 248320,
+            rope_theta: 1.0e6,
+            rms_norm_eps: 1.0e-6,
+            max_position_embeddings: 262144,
+            tie_word_embeddings: false,
+            pooling_type: PoolingType::None,
+            moe: None,
+            qk_norm_over_hidden: false,
+            v_rms_norm: false,
+            suppress_tokens: Vec::new(),
+            ssm: Some(SsmParams {
+                d_conv: 4,
+                d_inner: 6144,
+                d_state: 128,
+                dt_rank: 48,
+                n_group: 16,
+            }),
+            rope_sections: None,
+            full_attention_interval: 4,
+            attn_gated: true,
+            ffn_activation: FfnActivation::SiLU,
+            alt_attn: None,
+            final_logit_softcap: 0.0,
+            attn_logit_scale: None,
+            deepseek_v4: None,
+            embd_scale: None,
+        }
+    }
+
+    /// Suma wycinków obu rang musi pokryć KAŻDY wiersz (albo kolumnę) dokładnie
+    /// raz. To jest bramka, która łapie i lukę, i nakładkę.
+    fn assert_partition(p: &Hyperparams, role: WeightRole, total: usize) {
+        let mut seen = vec![0usize; total];
+        for rank in 0..2 {
+            let shard = TpShard::new(rank, 2).expect("ranga");
+            let ranges = match shard.role_shard(p, role).expect("plan") {
+                RoleShard::Rows(r) | RoleShard::Cols(r) => r,
+                RoleShard::Replicated => panic!("{role:?} miała być dzielona"),
+            };
+            for (first, count) in ranges {
+                for i in first..first + count {
+                    seen[i] += 1;
+                }
+            }
+        }
+        for (i, hits) in seen.iter().enumerate() {
+            assert_eq!(*hits, 1, "{role:?}: element {i} pokryty {hits} razy");
+        }
+    }
+
+    #[test]
+    fn podzialy_pokrywaja_kazdy_element_dokladnie_raz() {
+        let p = qwen35();
+        let ssm = p.ssm.clone().expect("ssm");
+        assert_partition(&p, WeightRole::AttnQ, 24 * 256 * 2);
+        assert_partition(&p, WeightRole::AttnK, 4 * 256);
+        assert_partition(&p, WeightRole::AttnO, 24 * 256);
+        assert_partition(&p, WeightRole::FfnGate, 17408);
+        assert_partition(&p, WeightRole::FfnDown, 17408);
+        assert_partition(&p, WeightRole::SsmInProj, ssm.conv_dim());
+        assert_partition(&p, WeightRole::SsmConv1d, ssm.conv_dim());
+        assert_partition(&p, WeightRole::SsmGate, ssm.value_dim());
+        assert_partition(&p, WeightRole::SsmOut, ssm.value_dim());
+        assert_partition(&p, WeightRole::SsmAlpha, 48);
+    }
+
+    #[test]
+    fn wejsciowa_projekcja_trzyma_kolejnosc_q_k_v() {
+        let p = qwen35();
+        let shard = TpShard::new(1, 2).expect("ranga 1");
+        let RoleShard::Rows(ranges) = shard
+            .role_shard(&p, WeightRole::SsmInProj)
+            .expect("plan")
+        else {
+            panic!("in_proj dzieli się po wierszach");
+        };
+        // q, k, potem trzy przebiegi v — dokładnie ten układ ma lokalny conv_dim.
+        assert_eq!(ranges.len(), 5);
+        assert_eq!(ranges[0], (8 * 128, 8 * 128));
+        assert_eq!(ranges[1], (2048 + 8 * 128, 8 * 128));
+        assert_eq!(ranges[2], (4096 + 8 * 128, 8 * 128));
+        assert_eq!(ranges[3], (4096 + 24 * 128, 8 * 128));
+        assert_eq!(ranges[4], (4096 + 40 * 128, 8 * 128));
+        let width: usize = ranges.iter().map(|(_, c)| c).sum();
+        let local = p.shard(shard).expect("hiperparametry rangi");
+        assert_eq!(width, local.ssm.expect("ssm rangi").conv_dim());
+    }
+
+    #[test]
+    fn bramkowana_projekcja_q_bierze_obie_polowki_glowicy() {
+        let p = qwen35();
+        let shard = TpShard::new(1, 2).expect("ranga 1");
+        let RoleShard::Rows(ranges) = shard.role_shard(&p, WeightRole::AttnQ).expect("plan") else {
+            panic!("q dzieli się po wierszach");
+        };
+        assert_eq!(ranges, vec![(12 * 256 * 2, 12 * 256 * 2)]);
+    }
+
+    #[test]
+    fn nieznana_rola_jest_bledem_a_nie_cicha_replikacja() {
+        let p = qwen35();
+        let shard = TpShard::new(0, 2).expect("ranga");
+        assert!(shard.role_shard(&p, WeightRole::FfnGateInp).is_err());
     }
 }
