@@ -953,6 +953,26 @@ wysyłka z hosta. Jedyne lekarstwo to MNIEJ KERNELI.
    i mierzalnie na plus, ale to już koniec tej dźwigni. Powyżej 2048 kafli
    kernel trwa dość długo, żeby rozbieg się zamortyzował — tam siatka trwała
    mierzy się na remis i nie jest używana.
+4. **Scalony wstęp warstwy uwagi — 5 uruchomień w 1.** `attn_prepare_qk_f16`
+   robi rozplecenie bramkowanej projekcji Q, RMSNorm głowic q, RMSNorm głowic k
+   oraz oba częściowe RoPE. Siatka to głowice: bloki `[0, n_heads)` obsługują q,
+   dalsze głowice k; blok ma `head_dim` wątków, więc `block_reduce_sum` redukuje
+   tyle samo wartości w tej samej kolejności co `rmsnorm_f16`. Rozplecenie jest
+   czystym ruchem f16, więc czytanie normy wprost z `q_full` daje tę samą
+   wartość co czytanie zapisanego `qc` — **bitowo ten sam wynik**. Bariera po
+   zapisie normy jest konieczna, bo RoPE łączy indeksy `j` i `j + n_rot/2`,
+   czyli dwa różne wątki. 8,0 -> 2,34 us na warstwę.
+
+Rachunek uruchomień i przestoju przez całą tę drogę (profil, kontekst 128):
+
+| stan | uruchomienia / token | przestój / token |
+|---|--:|--:|
+| wyjściowy | 1033 | 3,98 ms |
+| po scaleniu wstępu DeltaNet | 745 | 2,97 ms |
+| po scaleniu wstępu uwagi | **681** | **2,74 ms** |
+
+Zajętość kerneli nie drgnęła (30,65 -> 30,35 ms) i tak miało być: te fuzje nie
+przyspieszają liczenia, tylko zdejmują podatek od liczby dyspozycji.
 
 ### Wynik, wszystkie cztery komórki z tą samą sumą SHA `0bf2b86b…`
 
@@ -962,14 +982,15 @@ tym samym poleceniem na `d5c8ffc5`.
 
 | model | tryb | przed | po | |
 |---|---|--:|--:|--:|
-| Q4_K_M | bez spekulacji | 30,0 | **30,8** | +2,7% |
-| Q4_K_M | MTP K=3 | 58,8 | 58,6 | remis |
-| NVFP4 | bez spekulacji | 30,0 | **30,7** | +2,3% |
-| NVFP4 | MTP K=3 | 70,3 | 70,0 | remis |
+| Q4_K_M | bez spekulacji | 30,0 | **31,0** | +3,3% |
+| Q4_K_M | MTP K=3 | 58,8 | **58,9** | +0,2% |
+| NVFP4 | bez spekulacji | 30,0 | **30,9** | +3,0% |
+| NVFP4 | MTP K=3 | 70,3 | **70,4** | +0,1% |
+| NVFP4, 2 karty | bez spekulacji | 39,7 | **40,0** | +0,8% |
 
-Ścieżki MTP nie zyskują i to jest spójne: weryfikacja T=4 nie używa miksera
-jednotokenowego, tylko `deltanet_prepare_f16`, który ma te kernele scalone od
-początku.
+Ścieżki MTP zyskują minimalnie i to jest spójne: weryfikacja T=4 nie używa
+miksera jednotokenowego, tylko `deltanet_prepare_f16`, który ma te kernele
+scalone od początku — więc zostaje im wyłącznie to, co scalił wstęp uwagi.
 
 UWAGA do wcześniejszych wpisów: notowane tu `NVFP4 decode 29,1` było
 NIEAKTUALNE — ta sama binarka na `d5c8ffc5` mierzy dziś 30,0. Porównania
@@ -978,12 +999,16 @@ tej samej maszynie, a nie wobec liczby z dokumentu.
 
 ### Czego z tego NIE da się wycisnąć więcej
 
-Po zmianach: 32,4 ms na token, z czego 28,6 ms to same GEMV-y siedzące na
-rozbiegu pamięci, ~1,8 ms reszta pracy i ~2,0 ms przestoju na 745 uruchomieniach.
-Zostały fuzje warte razem około 0,9 ms (wstęp warstwy uwagi: `rmsnorm_f16` +
-rope + `kv_append` + `deinterleave_gate` + `sigmoid_mul` to 113 uruchomień na
-16 warstw; `gated_rmsnorm` do GEMV `ssm_out`; `silu_mul` do `ffn_down`), czyli
-okolice 31,8 tok/s.
+Po zmianach: 32,2 ms na token, z czego 28,6 ms to same GEMV-y siedzące na
+rozbiegu pamięci, ~1,7 ms reszta pracy i ~1,9 ms przestoju na 681 uruchomieniach.
+Zostało 128 uruchomień w zasięgu tej samej metody (`silu_mul` 64,
+`gated_rmsnorm` 48, `sigmoid_mul` 16), warte razem około 0,5 ms, czyli okolice
+31,5 tok/s.
+
+**`gated_rmsnorm` do skanu DeltaNet — ODRZUCONE ANALIZĄ, nie próbą.** Kształt
+kusi, bo oba są per głowica V, ale skan ValueKey ma `COLUMN_TILES = 32`, czyli
+128 kolumn jednej głowicy liczą 32 OSOBNE bloki. Redukcja normy po głowicy
+wymagałaby synchronizacji całej siatki, a nie bloku.
 
 **Fuzja normy rezyduum w SZEROKI GEMV jest odrzucona rachunkiem, nie próbą.**
 `rmsnorm_residual` kosztuje 3,94 us pracy plus ~3,5 us przestoju. Gdyby liczył go
