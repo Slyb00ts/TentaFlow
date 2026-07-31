@@ -818,3 +818,35 @@ kolumn, czyli 68 superbloków, a macierz tylko 5120 wierszy, czyli 640 bloków
 roboczych. Długi szeregowy spacer po wierszu przy małej liczbie bloków nie ma
 czym ukryć opóźnienia. Lekarstwem jest podział wiersza między bloki (split-K) z
 redukcją, a nie zmiana sposobu stagingu aktywacji.
+
+## Dlaczego część kerneli stoi na 430-530 GB/s: ZA MAŁO BLOKÓW
+
+Zmierzone GB/s zestawione z liczbą bloków roboczych (8 wierszy na blok):
+
+| tensor | bloków | MB | us | GB/s |
+|---|--:|--:|--:|--:|
+| `ffn_gate`+`up` (grupa) | 4352 | 95,6 | 146,1 | **654** |
+| `lm_head` Q6_K | 31040 | 1043,0 | 1657,1 | **629** |
+| `ffn_down` Q4_K | 640 | 50,1 | 94,2 | 532 |
+| `ffn_down` Q6_K | 640 | 58,9 | 131,3 | **449** |
+| `ssm_out` Q4_K | 640 | 16,9 | 39,2 | **431** |
+
+To nie jest kwestia formatu ani długości wiersza — `ssm_out` ma wiersze KRÓTKIE
+(24 superbloki) i też stoi na 431 GB/s. Wspólnym mianownikiem jest liczba bloków:
+macierze o 5120 wierszach dają 640 bloków, czyli 10 na 64 CU. Za mało, żeby ukryć
+opóźnienia pamięci. Powyżej ~4000 bloków wszystko siada na suficie.
+
+Dotyczy to `ffn_down`, `ssm_out` i `attn_output` — razem około 4,9 GB z 16,1 GB
+czytanych na token, czyli 30% wag, chodzących ~470 zamiast ~630 GB/s. Przy
+suficie to 7,8 ms zamiast 10,4 ms, czyli ~2,6 ms na token; z 32 ms kroku daje to
+około +8%, czyli okolice 32,5 tok/s.
+
+Lekarstwo: SPLIT-K. Wiersz dzielony na `n` zakresów kolumn liczonych przez osobne
+bloki, każdy staginguje tylko swój wycinek aktywacji (więc bufor w LDS zostaje
+nietknięty), wyniki cząstkowe w f32 lądują w buforze `[n, rows]`, a mały kernel
+redukujący sumuje je i zawęża do f16. Dla `ffn_down` podział na 2 daje 1280
+bloków, na 4 — 2560.
+
+UWAGA na dobór `n`: przy podziale rośnie liczba stagingów aktywacji, bo każdy blok
+staginguje swój wycinek. Zysk z równoległości trzeba zważyć z tym kosztem —
+zaczynać od `n = 2` i mierzyć, nie zakładać.
