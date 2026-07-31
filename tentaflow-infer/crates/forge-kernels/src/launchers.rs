@@ -15,6 +15,12 @@ use crate::registry::KernelArtifacts;
 
 const BLOCK: u32 = 256;
 
+/// Siatka trwałego GEMV dekodowania. Wąskie macierze (`ssm_out`, `attn_output`
+/// — 640 kafli) kończą się niepełną ostatnią falą grup roboczych, a blok, który
+/// przechodzi po kaflach krokiem siatki, staje w jednej fali i kwantyzuje
+/// aktywację raz zamiast raz na kafel. Zmierzone na R9700 jako optimum sweepu.
+const PERSIST_GRID: u32 = 384;
+
 /// Szerokość bloku normy wiersza. Krok dekodowania normalizuje JEDEN wiersz, więc
 /// siatka ma jeden blok roboczy — cała norma liczy się na jednym CU z 64 i stoi
 /// na paśmie tego CU, nie karty. Szerszy blok jest jedynym sposobem dołożenia
@@ -13105,9 +13111,20 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
-        let k = self.artifacts.get("gemv_q4_k_dp4a_f16")?;
+        let tiles = (rows as u32).div_ceil(8);
+        // Powyżej ~2048 kafli kernel trwa dość długo, żeby rozbieg pamięci się
+        // zamortyzował, a sweep pokazał tam remis — zysk jest wyłącznie na
+        // wąskich macierzach, więc tylko one schodzą na siatkę trwałą.
+        let persist = tiles > PERSIST_GRID
+            && tiles <= 2048
+            && self.artifacts.get("gemv_q4_k_dp4a_persist_f16").is_ok();
+        let k = if persist {
+            self.artifacts.get("gemv_q4_k_dp4a_persist_f16")?
+        } else {
+            self.artifacts.get("gemv_q4_k_dp4a_f16")?
+        };
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), 1, 1),
+            grid: (if persist { PERSIST_GRID } else { tiles }, 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };

@@ -421,6 +421,7 @@ from src.decode_fused import gemv_norm_q4_k_f16, gemv_norm_q6_k_f16
 from src.decode_fused import gemv_norm_silu_q4_k_f16, gemv_norm_silu_q6_k_f16
 from src.decode_fused import gemv_residual_q4_k_f16, gemv_residual_q6_k_f16
 from src.decode_dp4a import (
+    gemv_q4_k_dp4a_persist_f16,
     gemv_q8_0_dp4a_f16,
     gemv_q8_0_dp4a_group4_f16,
     gemv_q4_k_dp4a_group4_f16,
@@ -1233,6 +1234,12 @@ def main() raises:
         dump_asm=Path("deltanet_step_prepare_f16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "deltanet_step_prepare_f16"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_persist_f16,
+        dump_asm=Path("gemv_q4_k_dp4a_persist_f16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_persist_f16"))
+
 
     _ = ctx.compile_function[
         deltanet_beta_sigmoid_f32,

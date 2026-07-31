@@ -1831,6 +1831,7 @@ const EMBEDDED_GFX1201: &[EmbeddedArtifact] = embedded_arch!["gfx1201", ".hsaco"
     "gemv_q4_k_dp4a_f16_gidx",
     "gemv_q4_k_dp4a_group4_f16",
     "gemv_q4_k_dp4a_out_f32",
+    "gemv_q4_k_dp4a_persist_f16",
     "gemv_q4_k_f16_v2",
     "gemv_q4_k_out_f32_v2",
     "gemv_q5_0_f16_v2",

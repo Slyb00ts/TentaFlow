@@ -20,7 +20,7 @@
 # against an f64 CPU reference and checks fused-vs-plain consistency WITHIN
 # the dp4a path.
 
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import block_dim, block_idx, thread_idx, grid_dim
 from std.gpu.primitives import warp
 from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
@@ -618,6 +618,48 @@ def gemv_q4_k_dp4a_f16(
     total = _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
     if lane == 0:
         y[row] = Float16(total)
+
+
+def gemv_q4_k_dp4a_persist_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Ten sam iloczyn co `gemv_q4_k_dp4a_f16`, ale siatka jest TRWALA.
+
+    Wariant jeden-kafel-na-blok konczy sie niepelna ostatnia fala grup
+    roboczych: przy 640 blokach i ~192 rezydentnych ostatnia fala zajmuje
+    trzecia czesc karty, a caly kernel czeka na nia. Zmierzone na R9700 jako
+    6-11 us stalego narzutu KAZDEGO uruchomienia GEMV — przy 257 uruchomieniach
+    na token to okolo 2 ms.
+
+    Blok przechodzi po kolejnych kaflach wierszy krokiem `grid_dim.x`, wiec
+    launcher moze zamowic siatke rowna pojemnosci karty i fala jest jedna.
+    Kwantyzacja aktywacji do LDS dzieje sie RAZ na blok, a nie raz na kafel
+    osmiu wierszy, wiec ubywa tez powtorzonych odczytow `x`.
+
+    Bitowo: wiersz nadal liczy w calosci jedna fala tym samym `_dot_q4k_i8`,
+    zmienia sie wylacznie przypisanie wierszy do blokow.
+    """
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    var row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    stride = Int(grid_dim.x) * ROWS_PER_BLOCK
+    while row < n_rows:
+        total = _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
+        if lane == 0:
+            y[row] = Float16(total)
+        row += stride
 
 
 def gemv_q4_k_dp4a_f16_gidx(
