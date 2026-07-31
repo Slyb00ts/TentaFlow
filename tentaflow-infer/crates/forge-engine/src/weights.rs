@@ -15,7 +15,10 @@ use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
 use forge_formats::w4a8::{col_absmax, smoothing_scale, w4a8_pack_smoothed, W4A8_GROUP};
 use forge_formats::MtpWeightRole;
-use forge_formats::{dequantize_to_f32, Gguf, HfConfig, LayerKind, ModelDescriptor, WeightRole};
+use forge_formats::{
+    dequantize_to_f32, BlockMatrix, Gguf, HfConfig, LayerKind, ModelDescriptor, RoleShard, TpShard,
+    WeightRole,
+};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::{Kernels, Nvfp4GgufLayout};
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
@@ -1706,6 +1709,130 @@ fn load_vector_weight(
     })
 }
 
+/// Wycinek macierzy hosta dla jednej rangi tensor-parallel.
+///
+/// Cięcie idzie na BAJTACH, bez dekwantyzacji: wiersze leżą ciągle w każdym
+/// formacie blokowym, a wycinek kolumn pada na granicę bloku (wymusza to
+/// `BlockMatrix`). Format wraca ten sam, więc pocięty tensor wchodzi w zwykłą
+/// ścieżkę uploadu i nie potrzebuje osobnych kerneli.
+fn shard_host_weight(weight: HostWeight, plan: &RoleShard) -> Result<HostWeight> {
+    if matches!(plan, RoleShard::Replicated) {
+        return Ok(weight);
+    }
+    let (data, rows, cols, quant, output_scale) = match weight {
+        HostWeight::F16 { data, rows, cols } => (data, rows, cols, QuantKind::None, 1.0),
+        HostWeight::Q8_0 { data, rows, cols } => (data, rows, cols, QuantKind::Q8_0, 1.0),
+        HostWeight::Q4K { data, rows, cols } => (data, rows, cols, QuantKind::Q4K, 1.0),
+        HostWeight::Q6K { data, rows, cols } => (data, rows, cols, QuantKind::Q6K, 1.0),
+        HostWeight::NvFp4Gguf {
+            data,
+            output_scale,
+            rows,
+            cols,
+        } => (data, rows, cols, QuantKind::NVFP4Gguf, output_scale),
+        _ => {
+            return Err(ForgeError::Unsupported(
+                "podział tensor-parallel obejmuje F16, Q8_0, Q4_K, Q6_K i GGUF NVFP4".into(),
+            ));
+        }
+    };
+    let matrix = BlockMatrix {
+        data: &data,
+        rows,
+        cols,
+        quant,
+    };
+    let (sliced, out_rows, out_cols) = match plan {
+        RoleShard::Replicated => unreachable!("obsłużone wyżej"),
+        RoleShard::Rows(ranges) => {
+            let taken = ranges.iter().map(|(_, count)| count).sum::<usize>();
+            (matrix.take_rows(ranges)?, taken, cols)
+        }
+        RoleShard::Cols(ranges) => {
+            let taken = ranges.iter().map(|(_, count)| count).sum::<usize>();
+            (matrix.take_cols(ranges)?, rows, taken)
+        }
+    };
+    Ok(match quant {
+        QuantKind::None => HostWeight::F16 {
+            data: sliced,
+            rows: out_rows,
+            cols: out_cols,
+        },
+        QuantKind::Q8_0 => HostWeight::Q8_0 {
+            data: sliced,
+            rows: out_rows,
+            cols: out_cols,
+        },
+        QuantKind::Q4K => HostWeight::Q4K {
+            data: sliced,
+            rows: out_rows,
+            cols: out_cols,
+        },
+        QuantKind::Q6K => HostWeight::Q6K {
+            data: sliced,
+            rows: out_rows,
+            cols: out_cols,
+        },
+        QuantKind::NVFP4Gguf => HostWeight::NvFp4Gguf {
+            data: sliced,
+            output_scale,
+            rows: out_rows,
+            cols: out_cols,
+        },
+        other => {
+            return Err(ForgeError::Unsupported(format!(
+                "podział tensor-parallel nie zna formatu {other:?}"
+            )));
+        }
+    })
+}
+
+/// Wektor f32/f16 (normy, `conv1d`, `ssm_a`, `ssm_dt`) pocięty tym samym planem.
+///
+/// `row_width` to liczba wartości przypadająca na jednostkę planu: `d_conv` dla
+/// splotu, jeden dla wektorów per głowica. Plan liczy jednostki, nie wartości —
+/// dzięki temu ten sam zakres opisuje wiersze `in_proj` i kanały `conv1d`.
+fn upload_norm_shard(
+    device: &dyn Device,
+    src: &dyn TensorSource,
+    name: &str,
+    plan: &RoleShard,
+    row_width: usize,
+) -> Result<DevBuffer> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    let numel = dims.iter().product();
+    let f32s = dequantize_to_f32(dtype, quant, &data, numel)?;
+    let RoleShard::Rows(ranges) = plan else {
+        if matches!(plan, RoleShard::Replicated) {
+            return upload(device, &f32s_to_f16_bytes(&f32s));
+        }
+        return Err(ForgeError::Unsupported(
+            "wektor normy dzieli się wyłącznie po jednostkach planu".into(),
+        ));
+    };
+    if row_width == 0 || !numel.is_multiple_of(row_width) {
+        return Err(ForgeError::Format(format!(
+            "{name}: {numel} wartości nie jest wielokrotnością {row_width}"
+        )));
+    }
+    let mut out = Vec::with_capacity(
+        ranges.iter().map(|(_, count)| count * row_width).sum::<usize>(),
+    );
+    for &(first, count) in ranges {
+        let from = first * row_width;
+        let to = (first + count) * row_width;
+        if to > f32s.len() {
+            return Err(ForgeError::Format(format!(
+                "{name}: zakres [{from}, {to}) wykracza poza {} wartości",
+                f32s.len()
+            )));
+        }
+        out.extend_from_slice(&f32s[from..to]);
+    }
+    upload(device, &f32s_to_f16_bytes(&out))
+}
+
 /// A weight matrix still on the host, in the exact byte layout the fused
 /// kernels consume. Kept host-side long enough to row-concatenate sibling
 /// projections (QKV, gate/up) before the single upload.
@@ -3303,6 +3430,7 @@ impl ModelWeights {
         spill: Option<&ExpertSpill>,
         host_budget: usize,
         layer_range: Option<(usize, usize)>,
+        shard: TpShard,
     ) -> Result<Self> {
         let gguf = Gguf::open(path)?;
         let mut descriptor = ModelDescriptor::detect(&gguf)?;
@@ -3319,6 +3447,7 @@ impl ModelWeights {
             None,
             spill,
             host_budget,
+            shard,
         )
     }
 
@@ -3374,6 +3503,7 @@ impl ModelWeights {
             Some(&context),
             spill,
             host_budget,
+            TpShard::new(0, 1)?,
         )
         .and_then(|weights| {
             validate_nvfp4_ct_upload_manifest(
@@ -3411,6 +3541,7 @@ impl ModelWeights {
         nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
         spill: Option<&ExpertSpill>,
         host_budget: usize,
+        shard: TpShard,
     ) -> Result<Self> {
         if target_tile.is_some() {
             preflight_target_tile(device, &descriptor)?;
@@ -3418,6 +3549,12 @@ impl ModelWeights {
         // Hybrid attention/DeltaNet arches (qwen35moe) have per-layer weight
         // sets that differ by kind and a gated attention Q projection the
         // generic shape checks would reject; they take a dedicated loader.
+        if shard.world > 1 && (descriptor.arch == "deepseek_v4" || descriptor.params.ssm.is_none())
+        {
+            return Err(ForgeError::Unsupported(
+                "podział tensor-parallel jest opisany dla architektury hybrydowej".into(),
+            ));
+        }
         if descriptor.arch == "deepseek_v4" {
             return Self::load_deepseek_v4(device, descriptor, src, spill, host_budget);
         }
@@ -3436,6 +3573,7 @@ impl ModelWeights {
                 nvfp4_ct,
                 spill,
                 host_budget,
+                shard,
             );
         }
         let global = |role: WeightRole| -> Result<&String> {
@@ -3929,8 +4067,14 @@ impl ModelWeights {
         nvfp4_ct: Option<&NvFp4CtUploadContext<'_>>,
         spill: Option<&ExpertSpill>,
         host_budget: usize,
+        shard: TpShard,
     ) -> Result<Self> {
         let budget = expert_residency_budget(device, &descriptor, src, host_budget);
+        // Plan cięcia opisuje wycinek PEŁNEJ macierzy, więc liczy się z pełnych
+        // hiperparametrów; deskryptor, który zostaje w modelu, ma już kształty
+        // rangi, żeby cała reszta silnika widziała po prostu mniejszy model.
+        let full_params = descriptor.params.clone();
+        let plan = |role: WeightRole| -> Result<RoleShard> { shard.role_shard(&full_params, role) };
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
                 .globals
@@ -3994,27 +4138,30 @@ impl ModelWeights {
 
             let mixer = match descriptor.layer_kinds[idx] {
                 LayerKind::Attention => {
+                    let sharded = |role: WeightRole| -> Result<HostWeight> {
+                        shard_host_weight(fetch_matrix(src, name(role)?)?, &plan(role)?)
+                    };
                     let q = upload_target_weight(
                         device,
-                        fetch_matrix(src, name(WeightRole::AttnQ)?)?,
+                        sharded(WeightRole::AttnQ)?,
                         target_tile,
                         nvfp4_ct,
                     )?;
                     let k = upload_target_weight(
                         device,
-                        fetch_matrix(src, name(WeightRole::AttnK)?)?,
+                        sharded(WeightRole::AttnK)?,
                         target_tile,
                         nvfp4_ct,
                     )?;
                     let v = upload_target_weight(
                         device,
-                        fetch_matrix(src, name(WeightRole::AttnV)?)?,
+                        sharded(WeightRole::AttnV)?,
                         target_tile,
                         nvfp4_ct,
                     )?;
                     let attn_o = upload_target_weight(
                         device,
-                        fetch_matrix(src, name(WeightRole::AttnO)?)?,
+                        sharded(WeightRole::AttnO)?,
                         target_tile,
                         nvfp4_ct,
                     )?;
@@ -4026,42 +4173,72 @@ impl ModelWeights {
                         attn_o,
                     }))
                 }
-                LayerKind::DeltaNet => LayerMixer::DeltaNet(Box::new(DeltaNetWeights {
-                    in_proj: upload_target_weight(
-                        device,
-                        fetch_matrix(src, name(WeightRole::SsmInProj)?)?,
-                        target_tile,
-                        nvfp4_ct,
-                    )?,
-                    gate_proj: upload_target_weight(
-                        device,
-                        fetch_matrix(src, name(WeightRole::SsmGate)?)?,
-                        target_tile,
-                        nvfp4_ct,
-                    )?,
-                    conv1d: upload_norm(device, src, name(WeightRole::SsmConv1d)?)?,
-                    dt_bias: upload_norm(device, src, name(WeightRole::SsmDt)?)?,
-                    a: upload_norm(device, src, name(WeightRole::SsmA)?)?,
-                    beta_proj: upload_target_weight(
-                        device,
-                        fetch_matrix(src, name(WeightRole::SsmBeta)?)?,
-                        target_tile,
-                        nvfp4_ct,
-                    )?,
-                    alpha_proj: upload_target_weight(
-                        device,
-                        fetch_matrix(src, name(WeightRole::SsmAlpha)?)?,
-                        target_tile,
-                        nvfp4_ct,
-                    )?,
-                    ssm_norm: upload_norm(device, src, name(WeightRole::SsmNorm)?)?,
-                    out_proj: upload_target_weight(
-                        device,
-                        fetch_matrix(src, name(WeightRole::SsmOut)?)?,
-                        target_tile,
-                        nvfp4_ct,
-                    )?,
-                })),
+                LayerKind::DeltaNet => {
+                    let sharded = |role: WeightRole| -> Result<HostWeight> {
+                        shard_host_weight(fetch_matrix(src, name(role)?)?, &plan(role)?)
+                    };
+                    let d_conv = full_params
+                        .ssm
+                        .as_ref()
+                        .expect("hybryda ma parametry SSM")
+                        .d_conv;
+                    LayerMixer::DeltaNet(Box::new(DeltaNetWeights {
+                        in_proj: upload_target_weight(
+                            device,
+                            sharded(WeightRole::SsmInProj)?,
+                            target_tile,
+                            nvfp4_ct,
+                        )?,
+                        gate_proj: upload_target_weight(
+                            device,
+                            sharded(WeightRole::SsmGate)?,
+                            target_tile,
+                            nvfp4_ct,
+                        )?,
+                        // Splot ma `d_conv` wartości na kanał, a plan liczy
+                        // kanały — te same zakresy co wiersze `in_proj`.
+                        conv1d: upload_norm_shard(
+                            device,
+                            src,
+                            name(WeightRole::SsmConv1d)?,
+                            &plan(WeightRole::SsmConv1d)?,
+                            d_conv,
+                        )?,
+                        dt_bias: upload_norm_shard(
+                            device,
+                            src,
+                            name(WeightRole::SsmDt)?,
+                            &plan(WeightRole::SsmDt)?,
+                            1,
+                        )?,
+                        a: upload_norm_shard(
+                            device,
+                            src,
+                            name(WeightRole::SsmA)?,
+                            &plan(WeightRole::SsmA)?,
+                            1,
+                        )?,
+                        beta_proj: upload_target_weight(
+                            device,
+                            sharded(WeightRole::SsmBeta)?,
+                            target_tile,
+                            nvfp4_ct,
+                        )?,
+                        alpha_proj: upload_target_weight(
+                            device,
+                            sharded(WeightRole::SsmAlpha)?,
+                            target_tile,
+                            nvfp4_ct,
+                        )?,
+                        ssm_norm: upload_norm(device, src, name(WeightRole::SsmNorm)?)?,
+                        out_proj: upload_target_weight(
+                            device,
+                            sharded(WeightRole::SsmOut)?,
+                            target_tile,
+                            nvfp4_ct,
+                        )?,
+                    }))
+                }
             };
 
             let ffn = if let Some(moe) = &moe {
@@ -4126,21 +4303,24 @@ impl ModelWeights {
                     usage: ExpertUsage::new(device, moe.n_experts)?,
                 }))
             } else {
+                let sharded = |role: WeightRole| -> Result<HostWeight> {
+                    shard_host_weight(fetch_matrix(src, name(role)?)?, &plan(role)?)
+                };
                 let gate = upload_target_weight(
                     device,
-                    fetch_matrix(src, name(WeightRole::FfnGate)?)?,
+                    sharded(WeightRole::FfnGate)?,
                     target_tile,
                     nvfp4_ct,
                 )?;
                 let up = upload_target_weight(
                     device,
-                    fetch_matrix(src, name(WeightRole::FfnUp)?)?,
+                    sharded(WeightRole::FfnUp)?,
                     target_tile,
                     nvfp4_ct,
                 )?;
                 let down = upload_target_weight(
                     device,
-                    fetch_matrix(src, name(WeightRole::FfnDown)?)?,
+                    sharded(WeightRole::FfnDown)?,
                     target_tile,
                     nvfp4_ct,
                 )?;
@@ -4241,6 +4421,11 @@ impl ModelWeights {
             None
         };
 
+        // Deskryptor, który zostaje w modelu, ma kształty RANGI — dzięki temu
+        // cała reszta silnika (bufory, KV, stan DeltaNet, kernele) widzi po
+        // prostu mniejszy model i nie potrzebuje ani jednego wpięcia.
+        let mut descriptor = descriptor;
+        descriptor.params = full_params.shard(shard)?;
         Ok(ModelWeights {
             descriptor,
             token_embd_f16,

@@ -17,8 +17,8 @@ pub mod speculation_manifest;
 pub mod w4a8;
 
 pub use arch::{
-    AltAttnParams, ArchSpec, FfnActivation, Hyperparams, LayerKind, ModelDescriptor, MoeParams,
-    MtpDescriptor, MtpWeightRole, PoolingType, SsmParams, WeightRole,
+    AltAttnParams, ArchSpec, BlockMatrix, FfnActivation, Hyperparams, LayerKind, ModelDescriptor,
+    MoeParams, MtpDescriptor, MtpWeightRole, PoolingType, RoleShard, SsmParams, TpShard, WeightRole,
 };
 pub use dequant::dequantize_to_f32;
 pub use gguf::{Gguf, GgufTensor, MetaValue};
