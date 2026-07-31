@@ -23,15 +23,18 @@ Ostatnia aktualizacja: 2026-07-25.
   **3,5 us przestoju na KAŻDE uruchomienie** (1028 przerw na token, wszystkie w
   paśmie 2-5 us) — grafu HIP to nie zdejmuje, bo koszt jest po stronie GPU.
   Jedyna dźwignia to MNIEJ KERNELI. Zrobione: scalony wstęp kroku DeltaNet
-  (7 uruchomień na warstwę w 1, bitowo zgodny), szerszy blok normy przy
-  dekodowaniu jednego wiersza, siatka trwała dla wąskich GEMV-ów — razem
-  1033 -> 745 uruchomień na token. Wynik przy niezmienionej sumie SHA
-  `0bf2b86b…` we wszystkich czterech komórkach: Q4_K_M **30,0 -> 30,8**,
-  NVFP4 **30,0 -> 30,7**, obie ścieżki MTP na remisie (58,6 i 70,0 — weryfikacja
-  T=4 miała te kernele scalone od początku). Zostało fuzji za ~0,9 ms, czyli
-  okolice 31,8 tok/s; **34 tok/s na jednej karcie dla tego checkpointu nie jest
-  osiągalne** i przez tę ścianę przechodzi się wyłącznie spekulacją albo drugą
-  kartą. Pomiary, pułapka Infinity Cache i złapana regresja MTP:
+  (7 uruchomień na warstwę w 1), scalony wstęp warstwy uwagi (5 w 1), szerszy
+  blok normy przy dekodowaniu jednego wiersza, siatka trwała dla wąskich
+  GEMV-ów — razem **1033 -> 681 uruchomień** na token i przestój **3,98 -> 2,74
+  ms**, przy niezmienionej zajętości kerneli (30,65 -> 30,35 ms), bo te fuzje nie
+  przyspieszają liczenia, tylko zdejmują podatek od dyspozycji. Obie fuzje są
+  bitowo zgodne (blok ma tyle wątków, ile redukcja miała wartości). Wynik przy
+  niezmienionej sumie SHA `0bf2b86b…` we wszystkich komórkach: Q4_K_M
+  **30,0 -> 31,0**, NVFP4 **30,0 -> 30,9**, MTP 58,8 -> 58,9 i 70,3 -> 70,4,
+  dwie karty 39,7 -> 40,0. Zostało 128 uruchomień w zasięgu tej samej metody
+  (`silu_mul`, `gated_rmsnorm`, `sigmoid_mul`), warte ~0,5 ms; **34 tok/s na
+  jednej karcie dla tego checkpointu nie jest osiągalne** i przez tę ścianę
+  przechodzi się wyłącznie spekulacją albo drugą kartą. Pomiary, pułapka Infinity Cache i złapana regresja MTP:
   `docs/BENCH_R9700_27B.md`.
 - ❌ **Dwie karty: 39,7 tok/s zamiast możliwych ~50, i wiadomo dlaczego
   (2026-07-31).** Podział obejmuje 88,5% czytanych bajtów, więc karta modelu
