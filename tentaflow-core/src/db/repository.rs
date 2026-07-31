@@ -3466,11 +3466,22 @@ pub fn update_cluster_member_rdma(
     rdma_devices: &str,
     rdma_ip: &str,
     rdma_socket_ifname: &str,
+    rdma_gid_index: Option<u32>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    // COALESCE: nod, ktory nie umial ustalic indeksu GID, nie kasuje wartosci
+    // zapisanej wczesniej.
     conn.execute(
-        "UPDATE cluster_members SET rdma_devices = ?3, rdma_ip = ?4, rdma_socket_ifname = ?5 WHERE cluster_id = ?1 AND node_id = ?2",
-        rusqlite::params![cluster_id, node_id, rdma_devices, rdma_ip, rdma_socket_ifname],
+        "UPDATE cluster_members SET rdma_devices = ?3, rdma_ip = ?4, rdma_socket_ifname = ?5, \
+         rdma_gid_index = COALESCE(?6, rdma_gid_index) WHERE cluster_id = ?1 AND node_id = ?2",
+        rusqlite::params![
+            cluster_id,
+            node_id,
+            rdma_devices,
+            rdma_ip,
+            rdma_socket_ifname,
+            rdma_gid_index
+        ],
     )?;
     Ok(())
 }
@@ -3567,8 +3578,22 @@ pub fn add_cluster_member(
     interface_type: &str,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    // UPSERT, nie INSERT OR REPLACE: REPLACE kasuje wiersz i wstawia nowy, wiec
+    // gubil kolumny spoza tej listy — konfiguracje RDMA (`rdma_*`) i `joined_at`.
+    // Ponowne dodanie noda po cichu rozbrajalo klaster do deployu.
+    //
+    // NULLIF/COALESCE: puste pole znaczy "nie podano", nie "wyczysc". Dodanie
+    // noda bez jawnego wyboru karty nie moze skasowac przypisania z testu
+    // polaczen ani recznego wyboru admina.
     conn.execute(
-        "INSERT OR REPLACE INTO cluster_members (cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO cluster_members (cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(cluster_id, node_id) DO UPDATE SET \
+           role = excluded.role, \
+           interface_name = COALESCE(NULLIF(excluded.interface_name, ''), cluster_members.interface_name), \
+           interface_ip = COALESCE(NULLIF(excluded.interface_ip, ''), cluster_members.interface_ip), \
+           interface_speed_mbps = COALESCE(NULLIF(excluded.interface_speed_mbps, 0), cluster_members.interface_speed_mbps), \
+           interface_type = COALESCE(NULLIF(excluded.interface_type, ''), cluster_members.interface_type)",
         rusqlite::params![cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type],
     )?;
     Ok(())
@@ -3626,9 +3651,8 @@ pub fn remove_cluster_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> 
     Ok(())
 }
 
-/// Lista klastrow z agregatami liczby czlonkow (LEFT JOIN cluster_members).
-/// `members_online` przyjmuje `members_count` jako proxy — peer_store dolicza
-/// online/offline po stronie handlera (peer_store nie jest w DB).
+/// Lista klastrow z agregatem liczby czlonkow. Liczba online nie jest w DB —
+/// wylicza ja handler z peer_store.
 pub fn list_clusters_with_counts(
     pool: &DbPool,
 ) -> Result<Vec<crate::db::models::DbClusterWithCounts>> {
@@ -3647,7 +3671,6 @@ pub fn list_clusters_with_counts(
             Ok(crate::db::models::DbClusterWithCounts {
                 cluster,
                 members_count,
-                members_online: members_count,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

@@ -4642,6 +4642,14 @@ pub struct ClusterAddMemberRequest {
     pub node_id: String,
     pub interface_type: Option<String>,
     pub interface_speed_mbps: Option<u32>,
+    /// Netdev interconnectu wskazany RECZNIE przez admina (np. `enp1s0f0np0`).
+    /// `None` = zostaw wybor automatowi z testu polaczen. Dla istniejacego
+    /// czlonka to zmiana karty — handler robi UPSERT, nie duplikat.
+    #[serde(default)]
+    pub interface_name: Option<String>,
+    /// Adres IPv4 tej karty, uzywany jako adres interconnectu klastra.
+    #[serde(default)]
+    pub interface_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

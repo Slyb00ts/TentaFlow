@@ -185,6 +185,7 @@ function renderDetail() {
     `;
     bindBack(content);
     bindBodyClicks(content);
+    bindNicPicker(content);
   }
 
   const nameEl = byId('cd-name');
@@ -229,6 +230,16 @@ function bindBack(root) {
       const { Router } = await import('/js/router.js');
       Router.navigate('clusters');
     }
+  });
+}
+
+function bindNicPicker(root) {
+  root.addEventListener('change', async (e) => {
+    const sel = e.target.closest('.cd-nic-select');
+    if (!sel) return;
+    const nodeId = sel.dataset.nodeId;
+    const value = e.detail?.value ?? sel.value;
+    if (nodeId && value) await setMemberInterface(nodeId, value);
   });
 }
 
@@ -348,8 +359,68 @@ function renderNodeMini(member) {
         ${renderMiniBar('VRAM', vramPct)}
       </div>
       ${linkLabel ? `<div class="cdn-link"><span class="link-chip ${linkClass}">${asg ? '✓ ' : ''}${escapeHtml(linkLabel)}${asgDetail ? ` · ${escapeHtml(asgDetail)}` : ''}</span></div>` : ''}
+      ${renderNicPicker(member)}
     </div>
   `;
+}
+
+/// Interfejsy noda nadajace sie na interconnect klastra: link UP i z adresem
+/// IPv4. Karty RDMA na gorze — to one daja RoCE, reszta to fallback ethernet.
+function interconnectCandidates(nodeId) {
+  const node = nodesById.get(nodeId);
+  const ifaces = (node && (node.networkInterfaces || node.network_interfaces)) || [];
+  return ifaces
+    .filter(i => (i.linkUp ?? i.link_up) && (i.ipv4Address || i.ipv4_address))
+    .map(i => ({
+      name: i.name,
+      ip: i.ipv4Address || i.ipv4_address,
+      speed: i.speedMbps || i.speed_mbps || 0,
+      rdma: !!(i.rdmaAvailable ?? i.rdma_available),
+    }))
+    .sort((a, b) => (b.rdma - a.rdma) || (b.speed - a.speed) || a.name.localeCompare(b.name));
+}
+
+/// Reczny wybor karty interconnectu. Test polaczen wybiera ja automatycznie, ale
+/// admin musi moc go nadpisac — bez tego jedyna droga do zmiany karty byloby
+/// przestawianie adresow w systemie.
+function renderNicPicker(member) {
+  const cands = interconnectCandidates(member.node_id);
+  if (cands.length === 0) return '';
+  const current = member.interface_name || (findAssignment(member.node_id) || {}).interface_name || '';
+  const opts = cands.map(c => {
+    const label = `${c.name} · ${c.ip}${c.speed ? ` · ${Math.round(c.speed / 1000)}G` : ''}${c.rdma ? ' · RDMA' : ''}`;
+    return `<option value="${escapeAttr(c.name)}"${c.name === current ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
+  return `
+    <div class="cdn-nic">
+      <label>${escapeHtml(I18n.t('cluster_detail.interconnect_nic'))}</label>
+      <tf-select class="cd-nic-select" data-node-id="${escapeAttr(member.node_id)}"
+        value="${escapeAttr(current)}">${opts}</tf-select>
+    </div>
+  `;
+}
+
+/// Zapisuje wybrana karte jako interconnect czlonka. Adres/predkosc/typ biore z
+/// danych noda, zeby zapis byl spojny z tym, co pokazuje lista.
+async function setMemberInterface(nodeId, ifaceName) {
+  const cand = interconnectCandidates(nodeId).find(c => c.name === ifaceName);
+  if (!cand) return;
+  try {
+    const res = await ApiBinary.action('clusterAddMemberRequest', {
+      clusterId: currentClusterId,
+      nodeId,
+      interfaceName: cand.name,
+      interfaceIp: cand.ip,
+      interfaceSpeedMbps: cand.speed,
+      interfaceType: cand.rdma ? 'rdma' : 'ethernet',
+    });
+    if (res && res.ok === false) throw new Error(res.error || 'failed');
+    toast(I18n.t('cluster_detail.nic_saved'), 'success');
+    await loadAll();
+    renderDetail();
+  } catch (err) {
+    toast(`${I18n.t('cluster_detail.nic_save_failed')}: ${err.message || err}`, 'error');
+  }
 }
 
 function renderMiniBar(label, pct) {
@@ -1035,7 +1106,8 @@ function clusterStatus(members) {
 // swiezy stan polaczenia z mesh node list (nodesById -> member.live).
 function memberOnline(m) {
   if (!m) return false;
-  if (String(m.status || '').toLowerCase() === 'online') return true;
+  // Statusy pochodza wprost z peer_store ("connected"/"reachable"/...).
+  if (['connected', 'reachable'].includes(String(m.status || '').toLowerCase())) return true;
   return isOnline(m.live);
 }
 

@@ -1469,20 +1469,6 @@ fn detect_link_speed(name: &str) -> Option<u64> {
     }
 }
 
-/// Sprawdza czy RDMA jest dostepne dla interfejsu (Linux: /sys/class/infiniband/)
-fn detect_rdma_available(name: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let path = format!("/sys/class/infiniband/{}", name);
-        std::path::Path::new(&path).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        false
-    }
-}
-
 /// Pobiera WSZYSTKIE adresy IPv4 interfejsu (bridge moze miec wiele adresow)
 fn detect_all_ipv4_info(name: &str, nets: &Networks) -> Vec<(String, String)> {
     let mut result = Vec::new();
@@ -1600,7 +1586,8 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
             let ipv4_gateway = detect_gateway(&iface_name);
             let mac_address = detect_mac_address(&iface_name);
             let interface_type = detect_interface_type(&iface_name);
-            let rdma_available = detect_rdma_available(&iface_name);
+            let rdma_available =
+                crate::mesh::roce_config::rdma_device_for_netdev(&iface_name).is_some();
             let speed_mbps = detect_link_speed(&iface_name);
             let numa_node = detect_numa_node(&iface_name);
 

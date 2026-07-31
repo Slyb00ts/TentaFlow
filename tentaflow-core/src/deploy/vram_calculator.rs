@@ -484,6 +484,11 @@ pub fn kv_bytes_per_element(engine: DeployEngine, label: &str) -> Option<f64> {
     }
 }
 
+/// Domyslna szerokosc kroku schedulera vLLM (chunked prefill). NIE jest to
+/// `max_model_len`: przy dlugim kontekscie taki batch dawalby szczyt aktywacji
+/// o rzad wielkosci wiekszy niz realny i zjadal budzet puli KV.
+pub const DEFAULT_VLLM_BATCH_TOKENS: u64 = 8192;
+
 /// Konfiguracja runtime do estymacji.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VramEstimateInput {
@@ -1252,6 +1257,10 @@ pub struct AutoFitRequest {
     pub requested_max_num_seqs: Option<u64>,
     pub requested_tensor_parallel: Option<u32>,
     pub requested_pipeline_parallel: Option<u32>,
+    /// Szerokosc kroku schedulera napedzajaca szczyt aktywacji vLLM. `None` =
+    /// `DEFAULT_VLLM_BATCH_TOKENS`. MUSI trafic tez do `applied`, inaczej fit
+    /// liczylby sie na innym batchu niz pozniejsza estymata.
+    pub max_num_batched_tokens: Option<u64>,
     pub lock_max_model_len: bool,
     pub lock_max_num_seqs: bool,
     pub lock_tensor_parallel: bool,
@@ -1295,7 +1304,9 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     // kart w jednym splicie. Default = layer-split (PP=gpu_count, TP=1): to
     // natywny tryb llama.cpp i jedyny shardujacy KV rowno (bezpieczny na PCIe
     // bez NVLink). Jawne TP od usera nadal wygrywa przez requested_*.unwrap_or.
-    let (rec_tp, rec_pp) = match req.engine {
+    // Rekomendacje spelniaja tp*pp == gpu_count, wiec PP odtwarzamy z gpu_count
+    // i faktycznie wybranego TP — patrz `chosen_pp` nizej.
+    let (rec_tp, _) = match req.engine {
         DeployEngine::LlamaCpp => (1, req.gpu_count.max(1)),
         // MLX to pojedyncze urzadzenie (unified memory) - brak TP/PP.
         DeployEngine::Mlx => (1, 1),
@@ -1311,10 +1322,18 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     // MLX ignoruje TP/PP nawet jesli user je poda; jedno urzadzenie => parallel=1.
     let (chosen_tp, chosen_pp) = match req.engine {
         DeployEngine::Mlx => (1, 1),
-        _ => (
-            req.requested_tensor_parallel.unwrap_or(rec_tp),
-            req.requested_pipeline_parallel.unwrap_or(rec_pp),
-        ),
+        _ => {
+            let tp = req.requested_tensor_parallel.unwrap_or(rec_tp).max(1);
+            // PP musi wynikac z WYBRANEGO TP, nie z niezaleznej rekomendacji:
+            // rec_pp zaklada rec_tp, wiec zlozony z cudzym TP (np. zablokowanym
+            // przez cluster deploy) dawal swiat TP*PP > gpu_count i budzet VRAM
+            // przemnozony przez nieistniejace GPU.
+            let pp = req
+                .requested_pipeline_parallel
+                .unwrap_or_else(|| (req.gpu_count.max(1) / tp).max(1))
+                .max(1);
+            (tp, pp)
+        }
     };
     let parallel = (chosen_tp.max(1) * chosen_pp.max(1)) as f64;
     // Etykieta V cache: osobna gdy podana, inaczej K (kv_cache_dtype).
@@ -1342,6 +1361,12 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     };
     let seqs_requested = req.requested_max_num_seqs.is_some();
     let req_seqs = req.requested_max_num_seqs.unwrap_or(default_seqs).max(1);
+    // Jedno zrodlo prawdy dla szerokosci kroku schedulera — ta sama wartosc
+    // napedza szczyt aktywacji tutaj i w `estimate_vram` przez `applied`.
+    let batch_tokens = req
+        .max_num_batched_tokens
+        .unwrap_or(DEFAULT_VLLM_BATCH_TOKENS)
+        .max(1);
 
     // Engine-specific per-GPU activations. vLLM: scheduler-step activation peak
     // (8192 tokens, same default as VramEstimateInput) + CUDA-graph const + NCCL.
@@ -1352,7 +1377,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             DeployEngine::Vllm => {
                 let act_dtype_bytes = 2.0;
                 let activation_peak = bytes_to_gib(
-                    8192.0
+                    batch_tokens as f64
                         * (2.0 * model.hidden_size as f64 + model.intermediate_size.max(1) as f64)
                         * act_dtype_bytes,
                 );
@@ -1437,7 +1462,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             pipeline_parallel: chosen_pp,
             max_model_len: ctx,
             max_num_seqs: seqs,
-            max_num_batched_tokens: 8192,
+            max_num_batched_tokens: batch_tokens,
             kv_cache_dtype: req.kv_cache_dtype.clone(),
             kv_cache_dtype_v: req.kv_cache_dtype_v.clone(),
             gpu_memory_utilization: req.gpu_memory_utilization,
@@ -3156,6 +3181,7 @@ mod tests {
             requested_max_num_seqs: None,
             requested_tensor_parallel: None,
             requested_pipeline_parallel: None,
+            max_num_batched_tokens: None,
             lock_max_model_len: false,
             lock_max_num_seqs: false,
             lock_tensor_parallel: false,
@@ -3511,6 +3537,7 @@ mod tests {
             requested_max_num_seqs: Some(8),
             requested_tensor_parallel: None,
             requested_pipeline_parallel: None,
+            max_num_batched_tokens: None,
             lock_max_model_len: false,
             lock_max_num_seqs: false,
             lock_tensor_parallel: false,
@@ -3567,6 +3594,7 @@ mod tests {
                 requested_max_num_seqs: Some(256),
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: true,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
@@ -3605,6 +3633,7 @@ mod tests {
                 requested_max_num_seqs: Some(256),
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: true,
                 lock_max_num_seqs: true,
                 lock_tensor_parallel: false,
@@ -3637,6 +3666,7 @@ mod tests {
                 requested_max_num_seqs: Some(64),
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
@@ -3669,6 +3699,7 @@ mod tests {
                 requested_max_num_seqs: None,
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
@@ -3718,6 +3749,7 @@ mod tests {
                 requested_max_num_seqs: None,
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
@@ -4066,6 +4098,7 @@ mod tests {
                 requested_max_num_seqs: None,
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
@@ -4556,6 +4589,7 @@ mod tests {
                 requested_max_num_seqs: None,
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
@@ -4833,6 +4867,7 @@ mod tests {
             requested_max_num_seqs: Some(8),
             requested_tensor_parallel: None,
             requested_pipeline_parallel: None,
+            max_num_batched_tokens: None,
             lock_max_model_len: true,
             lock_max_num_seqs: true,
             lock_tensor_parallel: false,
@@ -5244,6 +5279,7 @@ mod tests {
             requested_max_num_seqs: None,
             requested_tensor_parallel: None,
             requested_pipeline_parallel: None,
+            max_num_batched_tokens: None,
             lock_max_model_len: false,
             lock_max_num_seqs: false,
             lock_tensor_parallel: false,
@@ -5311,6 +5347,7 @@ mod tests {
                 requested_max_num_seqs: None,
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,

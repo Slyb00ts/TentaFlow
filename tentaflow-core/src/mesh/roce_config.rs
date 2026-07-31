@@ -63,7 +63,9 @@ fn enumerate_linux() -> Vec<RoceInterfaceInfo> {
         };
 
         let pci_slot = read_pci_slot(&netdev);
+        let gid_index = read_rocev2_gid_index(&roce_device);
         out.push(RoceInterfaceInfo {
+            gid_index,
             netdev: netdev.clone(),
             roce_device,
             ipv4,
@@ -82,6 +84,22 @@ fn enumerate_linux() -> Vec<RoceInterfaceInfo> {
     out
 }
 
+/// Nazwa urzadzenia RoCE/IB powiazanego z netdev, albo None gdy karta nie ma
+/// RDMA. Uwaga: sysfs indeksuje urzadzenia RDMA po ICH nazwie (`rocep1s0f0`),
+/// ktora nie ma nic wspolnego z nazwa netdev — jedyne poprawne przejscie
+/// prowadzi przez `/sys/class/net/<netdev>/device/infiniband/`.
+pub fn rdma_device_for_netdev(netdev: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        read_roce_device(netdev)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = netdev;
+        None
+    }
+}
+
 /// Odczytuje nazwe urzadzenia RoCE/IB powiazanego z netdev. Zwraca pierwszy
 /// (zwykle jedyny) wpis katalogu `device/infiniband`.
 #[cfg(target_os = "linux")]
@@ -91,6 +109,29 @@ fn read_roce_device(netdev: &str) -> Option<String> {
     entries
         .find_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
+}
+
+/// Indeks GID RoCE v2 z adresem IPv4-mapped dla urzadzenia RDMA. NCCL potrzebuje
+/// go w `NCCL_IB_GID_INDEX`, a jego wartosc zalezy od sprzetu i kolejnosci
+/// wpisow w tablicy GID — nie wolno jej zakladac. Szukamy pierwszego wpisu typu
+/// "RoCE v2", ktorego GID jest IPv4-mapped (`::ffff:a.b.c.d`).
+#[cfg(target_os = "linux")]
+fn read_rocev2_gid_index(roce_device: &str) -> Option<u32> {
+    for i in 0..16u32 {
+        let base = format!("/sys/class/infiniband/{}/ports/1", roce_device);
+        let gid_type = match std::fs::read_to_string(format!("{}/gid_attrs/types/{}", base, i)) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !gid_type.trim().contains("RoCE v2") {
+            continue;
+        }
+        match std::fs::read_to_string(format!("{}/gids/{}", base, i)) {
+            Ok(gid) if gid.contains("ffff:") => return Some(i),
+            _ => continue,
+        }
+    }
+    None
 }
 
 /// Link UP gdy carrier == "1" (preferowane) albo operstate == "up".
@@ -144,6 +185,16 @@ fn compute_group_key(netdev: &str, pci_slot: &str) -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !switch_id.is_empty() {
+        // `phys_switch_id` identyfikuje ASIC, nie port — na DGX Spark WSZYSTKIE
+        // cztery netdevy (dwa porty QSFP x dwie domeny PCI) maja go identyczny.
+        // Dopiero `phys_port_name` (p0/p1) rozdziela fizyczne porty, wiec bez
+        // niego twins jednego portu zlalyby sie z drugim portem.
+        let port = std::fs::read_to_string(format!("/sys/class/net/{}/phys_port_name", netdev))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !port.is_empty() {
+            return format!("switch:{}/{}", switch_id, port);
+        }
         return format!("switch:{}", switch_id);
     }
     // Rodzic endpointu PCI = upstream bridge wspoldzielony przez porty jednej karty.

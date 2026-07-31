@@ -1786,7 +1786,9 @@ fn db_cluster_to_info(
     }
 }
 
-/// Liczy ilu czlonkow klastra ma status "online" w peer_store.
+/// Liczy ilu czlonkow klastra jest osiagalnych wg peer_store. Peer_store nadaje
+/// statusy "connected"/"reachable"/"discovered"/"disconnected"/"offline" — nody
+/// zdolne przyjac komende mesh to dwa pierwsze.
 fn count_online_members(ctx: &HandlerContext, cluster_id: &str) -> (u32, u32) {
     let members = match repository::list_cluster_members(&ctx.state.db, cluster_id) {
         Ok(m) => m,
@@ -1799,7 +1801,7 @@ fn count_online_members(ctx: &HandlerContext, cluster_id: &str) -> (u32, u32) {
             ctx.state
                 .mesh_peer_store
                 .get(&m.node_id)
-                .map(|p| p.status == "online")
+                .map(|p| matches!(p.status.as_str(), "connected" | "reachable"))
                 .unwrap_or(false)
         })
         .count() as u32;
@@ -2068,8 +2070,8 @@ pub fn cluster_add_member(
         &payload.cluster_id,
         &payload.node_id,
         "worker",
-        "",
-        "",
+        payload.interface_name.as_deref().unwrap_or(""),
+        payload.interface_ip.as_deref().unwrap_or(""),
         payload.interface_speed_mbps.map(|v| v as i64).unwrap_or(0),
         payload.interface_type.as_deref().unwrap_or(""),
     )
@@ -4966,6 +4968,7 @@ pub async fn deploy_vllm_recommend(
             requested_max_num_seqs: payload.max_num_seqs,
             requested_tensor_parallel: payload.tensor_parallel,
             requested_pipeline_parallel: payload.pipeline_parallel,
+            max_num_batched_tokens: payload.max_num_batched_tokens,
             lock_max_model_len: lock_ctx,
             lock_max_num_seqs: lock_seqs,
             lock_tensor_parallel: lock_tp,
@@ -4980,15 +4983,11 @@ pub async fn deploy_vllm_recommend(
         error: fit_error,
     } = fit;
 
-    // auto_fit nie propaguje typu V cache ani batcha tokenow — ustawiamy je na
-    // applied PRZED estymacja i builderem argow, zeby estymata KV (osobne K/V)
-    // i wygenerowana komenda uzywaly tych samych wartosci co wybor uzytkownika.
-    // Domyslny batch = max_model_len (min. 8192) napedza szczyt aktywacji w
-    // modelu puli KV vLLM.
+    // auto_fit nie propaguje typu V cache — ustawiamy go na applied PRZED
+    // estymacja i builderem argow. Batcha NIE ruszamy: auto_fit dobral ctx wlasnie
+    // pod niego, wiec podmiana tutaj kazalaby estymacie ocenic wybor na innym
+    // szczycie aktywacji niz ten, dla ktorego zostal policzony.
     applied_input.kv_cache_dtype_v = payload.kv_cache_dtype_v.clone();
-    applied_input.max_num_batched_tokens = payload
-        .max_num_batched_tokens
-        .unwrap_or_else(|| applied_input.max_model_len.max(8192));
 
     // Over-budget NIE jest twardym bledem requestu — auto_fit zwraca uzywalny
     // `applied` (minimalny ctx/seqs), wiec liczymy estymacje i oddajemy
@@ -5838,16 +5837,14 @@ pub async fn engine_recommend(
                 requested_max_num_seqs: None,
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
                 weights_bytes_override: weights_override,
             };
             let outcome = auto_fit_config(&spec, &req_fit);
-            let mut cfg = outcome.applied;
-            // Spojnie z deploy_vllm_recommend: applied nie niesie batcha tokenow,
-            // ustawiamy default (max_model_len, min 8192) dla szczytu aktywacji.
-            cfg.max_num_batched_tokens = cfg.max_model_len.max(8192);
+            let cfg = outcome.applied;
             if let Some(err) = outcome.error {
                 warnings.push(err);
             }

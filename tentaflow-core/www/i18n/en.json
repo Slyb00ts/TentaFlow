@@ -4689,7 +4689,10 @@
     "deploy_stop_partial": "Deployment stopped with warnings",
     "deploy_pricing_title": "Pricing (PLN / 1k tokens)",
     "deploy_pricing_hint": "For billing in Metrics (optional).",
-    "deploy_pricing_invalid": "Prices must be numbers >= 0."
+    "deploy_pricing_invalid": "Prices must be numbers >= 0.",
+    "interconnect_nic": "Interconnect NIC",
+    "nic_saved": "NIC saved",
+    "nic_save_failed": "Could not save NIC"
   },
   "cluster_wizard": {
     "step1_label": "Basic info and routing",

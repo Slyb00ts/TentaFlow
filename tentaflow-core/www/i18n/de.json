@@ -3655,7 +3655,10 @@
     "instance_short": "Instanzen",
     "run_tests": "Alle testen",
     "testing": "Test läuft...",
-    "tests_done": "Tests abgeschlossen"
+    "tests_done": "Tests abgeschlossen",
+    "interconnect_nic": "Interconnect-NIC",
+    "nic_saved": "NIC gespeichert",
+    "nic_save_failed": "NIC konnte nicht gespeichert werden"
   },
   "cluster_wizard": {
     "step1_label": "Basisdaten und Routing",

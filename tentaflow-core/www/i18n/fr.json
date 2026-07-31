@@ -3655,7 +3655,10 @@
     "instance_short": "instances",
     "run_tests": "Tout tester",
     "testing": "Test en cours...",
-    "tests_done": "Tests terminés"
+    "tests_done": "Tests terminés",
+    "interconnect_nic": "Carte d'interconnexion",
+    "nic_saved": "Carte enregistree",
+    "nic_save_failed": "Echec de l'enregistrement de la carte"
   },
   "cluster_wizard": {
     "step1_label": "Données de base et routage",
