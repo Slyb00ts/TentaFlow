@@ -30,11 +30,43 @@ pub struct ClusterDevice {
     pub kernels: forge_kernels::Kernels,
 }
 
-/// Sumy cząstkowe rang, gotowe do zebrania na jednej karcie.
+/// Jedna ranga widziana przez redukcję: jej karta, strumień, na którym policzyła
+/// swoją sumę cząstkową, kernele i zdarzenie do porządkowania.
 ///
-/// Pola opisują JEDEN punkt redukcji, a nie stan klastra — dzięki temu ten sam
+/// Redukcja bierze te cztery rzeczy JAWNIE, a nie z `Cluster`, bo w podziale
+/// SPMD ranga jest pełnym modelem i pracuje SWOIM strumieniem oraz SWOIM
+/// kompletem kerneli. Gdyby prymityw sięgał po strumienie klastra, każda karta
+/// niosłaby drugi zestaw artefaktów i drugi strumień, a redukcja liczyłaby na
+/// buforach innych niż te, na których liczy ranga.
+pub struct ReduceRank<'a> {
+    pub device: &'a dyn Device,
+    pub stream: &'a Stream,
+    pub kernels: &'a forge_kernels::Kernels,
+    /// Zdarzenie tej rangi; redukcja zapisuje je i każe czekać drugiej karcie.
+    pub done: &'a Event,
+    /// Suma cząstkowa tej rangi w f32; `None`, gdy nie liczyła tego fragmentu.
+    pub part: Option<&'a forge_hal::DevBuffer>,
+}
+
+/// Jeden punkt redukcji: sumy cząstkowe rang zebrane na jednej karcie.
+///
+/// Opisuje JEDEN punkt redukcji, a nie stan klastra — dzięki temu ten sam
 /// prymityw obsługuje dekodowanie (`elems = hidden`) i batch
 /// (`elems = tokens * hidden`), bo `T` jest parametrem, a nie osobną ścieżką.
+pub struct Reduction<'a> {
+    pub ranks: &'a [ReduceRank<'a>],
+    pub gather_on: usize,
+    /// Akumulator f32 na karcie zbierającej; wolno wskazać ten sam bufor co
+    /// wyjście f32.
+    pub acc: &'a forge_hal::DevBuffer,
+    /// Bufor na przywiezioną sumę cząstkową.
+    pub staging: &'a forge_hal::DevBuffer,
+    /// Wynik zawężony do f16; `None` zostawia sumę w `acc`.
+    pub out_f16: Option<&'a forge_hal::DevBuffer>,
+    pub elems: usize,
+}
+
+/// Sumy cząstkowe rang, gotowe do zebrania na jednej karcie.
 pub struct PartialSum<'a> {
     /// Suma cząstkowa karty `i`; `None`, gdy ta karta nie liczyła tego fragmentu.
     pub parts: &'a [Option<&'a forge_hal::DevBuffer>],
@@ -89,29 +121,12 @@ impl Cluster {
             });
         }
 
-        let mut peer_access = true;
-        for from in 0..devices.len() {
-            for to in 0..devices.len() {
-                if from == to {
-                    continue;
-                }
-                let peer = devices[to].device.ordinal();
-                if let Err(error) = devices[from].device.enable_peer_access(peer) {
-                    // Brak P2P nie jest błędem, ale JEST wiadomością: bez niego
-                    // wymiana 10 KiB rośnie z 6,6 us do dziesiątek. Połknięcie
-                    // powodu zamieniało regresję łącza w niewyjaśnialny wynik.
-                    tracing::warn!(
-                        from = devices[from].device.ordinal(),
-                        from_name = devices[from].device.caps().name,
-                        to = peer,
-                        to_name = devices[to].device.caps().name,
-                        %error,
-                        "karty nie widzą swojej pamięci — wymiana pójdzie wolniejszą drogą"
-                    );
-                    peer_access = false;
-                }
-            }
-        }
+        let peer_access = enable_peer_mesh(
+            &devices
+                .iter()
+                .map(|entry| entry.device.clone())
+                .collect::<Vec<_>>(),
+        );
 
         Ok(Self {
             devices,
@@ -159,29 +174,12 @@ impl Cluster {
             });
         }
 
-        let mut peer_access = true;
-        for from in 0..devices.len() {
-            for to in 0..devices.len() {
-                if from == to {
-                    continue;
-                }
-                let peer = devices[to].device.ordinal();
-                if let Err(error) = devices[from].device.enable_peer_access(peer) {
-                    // Brak P2P nie jest błędem, ale JEST wiadomością: bez niego
-                    // wymiana 10 KiB rośnie z 6,6 us do dziesiątek. Połknięcie
-                    // powodu zamieniało regresję łącza w niewyjaśnialny wynik.
-                    tracing::warn!(
-                        from = devices[from].device.ordinal(),
-                        from_name = devices[from].device.caps().name,
-                        to = peer,
-                        to_name = devices[to].device.caps().name,
-                        %error,
-                        "karty nie widzą swojej pamięci — wymiana pójdzie wolniejszą drogą"
-                    );
-                    peer_access = false;
-                }
-            }
-        }
+        let peer_access = enable_peer_mesh(
+            &devices
+                .iter()
+                .map(|entry| entry.device.clone())
+                .collect::<Vec<_>>(),
+        );
         Ok(Self {
             devices,
             peer_access,
@@ -307,79 +305,32 @@ impl Cluster {
     /// warstwę, czyli 130 na token — więcej niż cała wymiana aktywacji między
     /// kartami, która na tym stanowisku trwa 5,5 us.
     pub fn reduce_partials(&self, sum: PartialSum<'_>) -> Result<()> {
-        let target = self.device(sum.gather_on)?;
-        let contributors: Vec<usize> = (0..self.len())
-            .filter(|&index| sum.parts.get(index).and_then(|p| *p).is_some())
+        let ranks: Vec<ReduceRank<'_>> = self
+            .devices
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| ReduceRank {
+                device: entry.device.as_ref(),
+                // Karta zbierająca pracuje strumieniem silnika, pozostałe swoim
+                // strumieniem klastra.
+                stream: if index == sum.gather_on {
+                    sum.gather_stream
+                } else {
+                    &entry.stream
+                },
+                kernels: &entry.kernels,
+                done: &entry.done,
+                part: sum.parts.get(index).copied().flatten(),
+            })
             .collect();
-        let Some((&last, rest)) = contributors.split_last() else {
-            return Err(ForgeError::Scheduler(
-                "redukcja bez ani jednej sumy cząstkowej".into(),
-            ));
-        };
-        let bytes = sum.elems.checked_mul(4).ok_or_else(|| {
-            ForgeError::Scheduler("redukcja: przepełnienie rozmiaru sumy".into())
-        })?;
-        let part = |index: usize| -> Result<&forge_hal::DevBuffer> {
-            sum.parts
-                .get(index)
-                .and_then(|p| *p)
-                .ok_or_else(|| ForgeError::Scheduler(format!("brak sumy cząstkowej karty {index}")))
-        };
-        let mut accumulated = 0usize;
-        for &index in rest {
-            let destination = if accumulated == 0 { sum.acc } else { sum.staging };
-            if index == sum.gather_on {
-                target
-                    .device
-                    .copy(part(index)?, 0, destination, 0, bytes, sum.gather_stream)?;
-            } else {
-                self.exchange(index, part(index)?, 0, sum.gather_on, destination, 0, bytes)?;
-                self.order(
-                    index,
-                    &self.device(index)?.stream,
-                    sum.gather_on,
-                    sum.gather_stream,
-                )?;
-            }
-            if accumulated > 0 {
-                target
-                    .kernels
-                    .add_f32(sum.acc, sum.acc, sum.staging, sum.elems, sum.gather_stream)?;
-            }
-            accumulated += 1;
-        }
-        let tail = if last == sum.gather_on {
-            part(last)?
-        } else {
-            self.exchange(last, part(last)?, 0, sum.gather_on, sum.staging, 0, bytes)?;
-            self.order(
-                last,
-                &self.device(last)?.stream,
-                sum.gather_on,
-                sum.gather_stream,
-            )?;
-            sum.staging
-        };
-        match (sum.out_f16, accumulated) {
-            (Some(out), 0) => {
-                target
-                    .kernels
-                    .cast_f32_f16(out, tail, sum.elems, sum.gather_stream)
-            }
-            (Some(out), _) => target.kernels.add_f32_out_f16(
-                out,
-                sum.acc,
-                tail,
-                sum.elems,
-                sum.gather_stream,
-            ),
-            (None, 0) => target
-                .device
-                .copy(tail, 0, sum.acc, 0, bytes, sum.gather_stream),
-            (None, _) => target
-                .kernels
-                .add_f32(sum.acc, sum.acc, tail, sum.elems, sum.gather_stream),
-        }
+        reduce_partials(Reduction {
+            ranks: &ranks,
+            gather_on: sum.gather_on,
+            acc: sum.acc,
+            staging: sum.staging,
+            out_f16: sum.out_f16,
+            elems: sum.elems,
+        })
     }
 
     /// Mierzy możliwości każdej karty tym samym testem. Format wag musi być
@@ -422,6 +373,178 @@ impl Cluster {
         }
         Ok(())
     }
+}
+
+/// Otwiera dostęp P2P między każdą parą kart i mówi, czy KAŻDA para się widzi.
+///
+/// Brak P2P NIE jest błędem — jest informacją dla planera, bo bez niego wymiana
+/// idzie przez hosta i technika oparta na łączu przestaje się opłacać.
+pub fn enable_peer_mesh(devices: &[Arc<dyn Device>]) -> bool {
+    let mut peer_access = true;
+    for from in 0..devices.len() {
+        for to in 0..devices.len() {
+            if from == to {
+                continue;
+            }
+            let peer = devices[to].ordinal();
+            if let Err(error) = devices[from].enable_peer_access(peer) {
+                // Brak P2P nie jest błędem, ale JEST wiadomością: bez niego
+                // wymiana 10 KiB rośnie z 6,6 us do dziesiątek. Połknięcie
+                // powodu zamieniało regresję łącza w niewyjaśnialny wynik.
+                tracing::warn!(
+                    from = devices[from].ordinal(),
+                    from_name = devices[from].caps().name,
+                    to = peer,
+                    to_name = devices[to].caps().name,
+                    %error,
+                    "karty nie widzą swojej pamięci — wymiana pójdzie wolniejszą drogą"
+                );
+                peer_access = false;
+            }
+        }
+    }
+    peer_access
+}
+
+/// Zbiera sumy cząstkowe rang na jednej karcie i domyka je jednym wynikiem.
+///
+/// To jest operacja, którą macierz WIERSZOWO równoległa kończy KAŻDĄ ścieżkę
+/// przez warstwę — `attn_output`, `ssm_out` i `ffn_down`. Kontrakt liczbowy:
+/// każda ranga akumuluje swój fragment w f32, suma idzie w f32 i DOPIERO wynik
+/// jest zawężany do f16, czyli z jednym zaokrągleniem, tak jak na jednej karcie.
+///
+/// Ostatnia ranga domyka redukcję TYM SAMYM uruchomieniem, którym zawęża do f16.
+/// Osobne dodawanie i osobne zawężenie kosztowały dwa uruchomienia na warstwę,
+/// czyli 130 na token — więcej niż cała wymiana aktywacji między kartami, która
+/// na tym stanowisku trwa 5,5 us.
+pub fn reduce_partials(sum: Reduction<'_>) -> Result<()> {
+    let rank = |index: usize| -> Result<&ReduceRank<'_>> {
+        sum.ranks
+            .get(index)
+            .ok_or_else(|| ForgeError::Scheduler(format!("redukcja nie ma rangi {index}")))
+    };
+    let target = rank(sum.gather_on)?;
+    let contributors: Vec<usize> = (0..sum.ranks.len())
+        .filter(|&index| sum.ranks[index].part.is_some())
+        .collect();
+    let Some((&last, rest)) = contributors.split_last() else {
+        return Err(ForgeError::Scheduler(
+            "redukcja bez ani jednej sumy cząstkowej".into(),
+        ));
+    };
+    let bytes = sum
+        .elems
+        .checked_mul(4)
+        .ok_or_else(|| ForgeError::Scheduler("redukcja: przepełnienie rozmiaru sumy".into()))?;
+    let part = |index: usize| -> Result<&forge_hal::DevBuffer> {
+        sum.ranks
+            .get(index)
+            .and_then(|r| r.part)
+            .ok_or_else(|| ForgeError::Scheduler(format!("brak sumy cząstkowej rangi {index}")))
+    };
+    // Kopia idzie strumieniem ŹRÓDŁA — to ta ranga wie, kiedy jej suma jest
+    // gotowa; karta zbierająca dowiaduje się o tym ze zdarzenia.
+    let bring = |index: usize, destination: &forge_hal::DevBuffer| -> Result<()> {
+        let source = rank(index)?;
+        source
+            .device
+            .copy(part(index)?, 0, destination, 0, bytes, source.stream)?;
+        source.device.record_event(source.done, source.stream)?;
+        target.device.wait_event(target.stream, source.done)
+    };
+    let mut accumulated = 0usize;
+    for &index in rest {
+        let destination = if accumulated == 0 { sum.acc } else { sum.staging };
+        if index == sum.gather_on {
+            target
+                .device
+                .copy(part(index)?, 0, destination, 0, bytes, target.stream)?;
+        } else {
+            bring(index, destination)?;
+        }
+        if accumulated > 0 {
+            target
+                .kernels
+                .add_f32(sum.acc, sum.acc, sum.staging, sum.elems, target.stream)?;
+        }
+        accumulated += 1;
+    }
+    let tail = if last == sum.gather_on {
+        part(last)?
+    } else {
+        bring(last, sum.staging)?;
+        sum.staging
+    };
+    match (sum.out_f16, accumulated) {
+        (Some(out), 0) => target
+            .kernels
+            .cast_f32_f16(out, tail, sum.elems, target.stream),
+        (Some(out), _) => target
+            .kernels
+            .add_f32_out_f16(out, sum.acc, tail, sum.elems, target.stream),
+        (None, 0) => target
+            .device
+            .copy(tail, 0, sum.acc, 0, bytes, target.stream),
+        (None, _) => target
+            .kernels
+            .add_f32(sum.acc, sum.acc, tail, sum.elems, target.stream),
+    }
+}
+
+/// Redukcja z nogą rozgłoszenia: po niej KAŻDA ranga ma pełny wynik w f16.
+///
+/// Tego wymaga podział SPMD, a nie sama redukcja: po projekcji wierszowo
+/// równoległej każda ranga liczy własny `rmsnorm_residual` na własnym strumieniu
+/// rezydualnym, więc zsumowany wektor musi trafić do każdej z nich. Rozgłoszenie
+/// to jedno zdarzenie karty zbierającej i po jednej kopii na pozostałe rangi —
+/// dla dwóch kart dokładnie jedna kopia.
+pub fn all_reduce_f16(
+    ranks: &[ReduceRank<'_>],
+    gather_on: usize,
+    acc: &forge_hal::DevBuffer,
+    staging: &forge_hal::DevBuffer,
+    out: &[&forge_hal::DevBuffer],
+    elems: usize,
+) -> Result<()> {
+    if out.len() != ranks.len() {
+        return Err(ForgeError::Scheduler(format!(
+            "all-reduce: {} rang wobec {} buforów wyjścia",
+            ranks.len(),
+            out.len()
+        )));
+    }
+    let source = ranks
+        .get(gather_on)
+        .ok_or_else(|| ForgeError::Scheduler(format!("all-reduce nie ma rangi {gather_on}")))?;
+    reduce_partials(Reduction {
+        ranks,
+        gather_on,
+        acc,
+        staging,
+        out_f16: Some(out[gather_on]),
+        elems,
+    })?;
+    let bytes = elems
+        .checked_mul(2)
+        .ok_or_else(|| ForgeError::Scheduler("all-reduce: przepełnienie rozmiaru wyniku".into()))?;
+    for index in 0..ranks.len() {
+        if index == gather_on {
+            continue;
+        }
+        source
+            .device
+            .copy(out[gather_on], 0, out[index], 0, bytes, source.stream)?;
+    }
+    if ranks.len() > 1 {
+        source.device.record_event(source.done, source.stream)?;
+        for (index, rank) in ranks.iter().enumerate() {
+            if index == gather_on {
+                continue;
+            }
+            rank.device.wait_event(rank.stream, source.done)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
