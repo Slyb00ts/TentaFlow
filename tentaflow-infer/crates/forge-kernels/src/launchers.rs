@@ -5760,6 +5760,96 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
+    /// GEMM GGUF NVFP4 z wyjściem f32 dla dużego `T` (RDNA3+, WMMA).
+    ///
+    /// Istnieje po to, żeby macierz WIERSZOWO równoległa podziału na rangi mogła
+    /// liczyć prefill przy pełnym `T`. Rodzina `gemm_nvfp4_gguf_out_f32_b*`
+    /// przyjmuje wyłącznie `B = 2/4/8/16`, a `T = 16` leży POD progiem, przy
+    /// którym wchodzi kafel macierzowy — zmierzone 37,25 s wobec 3,84 s przy
+    /// T = 32 na prompcie 820 tokenów.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_gguf_wmma_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        weights: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        output_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0
+            || n_tokens == 0
+            || cols < 64
+            || !cols.is_multiple_of(64)
+            || !output_scale.is_finite()
+        {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_nvfp4_gguf_wmma_out_f32 wymaga rows > 0, cols % 64 == 0 i skończonej skali; otrzymano rows={rows}, cols={cols}, scale={output_scale}"
+            )));
+        }
+        let bn128 = self
+            .artifacts
+            .has("gemm_nvfp4_gguf_wmma_out_f32_bm256_bn128");
+        let (kernel_name, token_tile, row_tile, block_threads) = if bn128 {
+            ("gemm_nvfp4_gguf_wmma_out_f32_bm256_bn128", 256, 128, 256u32)
+        } else {
+            ("gemm_nvfp4_gguf_wmma_out_f32_bm256", 256, 64, 256u32)
+        };
+        if !self.artifacts.has(kernel_name) {
+            return Err(ForgeError::Kernel(
+                "gemm_nvfp4_gguf_wmma_out_f32: brak artefaktu dla tej architektury".into(),
+            ));
+        }
+        if block_threads > self.device.caps().max_threads_per_block {
+            return Err(ForgeError::Kernel(
+                "gemm_nvfp4_gguf_wmma_out_f32: blok przekracza limit urządzenia".into(),
+            ));
+        }
+        let output_bytes =
+            checked_buffer_bytes("gemm_nvfp4_gguf_wmma_out_f32 output", &[n_tokens, rows], 4)?;
+        let weight_bytes = checked_buffer_bytes(
+            "gemm_nvfp4_gguf_wmma_out_f32 weights",
+            &[rows, cols / 64],
+            36,
+        )?;
+        let input_bytes =
+            checked_buffer_bytes("gemm_nvfp4_gguf_wmma_out_f32 input", &[n_tokens, cols], 2)?;
+        if y_f32.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
+            return Err(ForgeError::Kernel(
+                "gemm_nvfp4_gguf_wmma_out_f32: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let grid_x = u32::try_from(rows.div_ceil(row_tile)).map_err(|_| {
+            ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: grid.x przekracza u32".into())
+        })?;
+        let grid_y = u32::try_from(n_tokens.div_ceil(token_tile)).map_err(|_| {
+            ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: grid.y przekracza u32".into())
+        })?;
+        let kernel = self.artifacts.get(kernel_name)?;
+        let config = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(weights)
+            .buf(x)
+            .scalar(i64::try_from(cols).map_err(|_| {
+                ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: cols przekracza i64".into())
+            })?)
+            .scalar(i64::try_from(rows).map_err(|_| {
+                ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: rows przekracza i64".into())
+            })?)
+            .scalar(i64::try_from(n_tokens).map_err(|_| {
+                ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: T przekracza i64".into())
+            })?)
+            .scalar(output_scale);
+        self.device.launch(kernel, &config, &args, stream)
+    }
+
     /// Liczy dwa wiersze logitów F32 bez dekwantyzacji głowy GGUF NVFP4.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_nvfp4_gguf_out_f32_b2(

@@ -55,6 +55,10 @@ pub const MAX_PREFILL_CHUNK: usize = 1024;
 const STAGING_SLOTS: usize = 64;
 const STAGING_IN_BYTES: usize = 12;
 const HYBRID_PREFILL_PORTABLE_CHUNK: usize = 16;
+
+/// Najszerszy chunk prefillu, jaki podział na rangi wykona w jednym przebiegu.
+/// Wyznacza rozmiar bufora sumy cząstkowej każdej rangi.
+const MAX_SPLIT_PREFILL_CHUNK: usize = 256;
 const HYBRID_PREFILL_LEGACY_CHUNK: usize = 32;
 const HYBRID_PREFILL_AUTO_CHUNK: usize = 128;
 /// Kolejnosc prob dla chunka bez NVFP4 — od najwiekszego, bo wiekszy wygrywa
@@ -3182,9 +3186,15 @@ impl Model {
         let staging_events = (0..STAGING_SLOTS)
             .map(|_| device.create_event())
             .collect::<Result<Vec<_>>>()?;
+        // Suma cząstkowa musi pomieścić NAJSZERSZY chunk, jaki podział wykona:
+        // prefill liczy `T` wierszy naraz i każdy z nich ma własną sumę.
         let tp_partial = match cfg.tp_shard.world {
             1 => None,
-            _ => Some(device.alloc(hidden * 4, MemKind::Device, Pool::Activations)?),
+            _ => Some(device.alloc(
+                MAX_SPLIT_PREFILL_CHUNK * hidden * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?),
         };
         let mut model = Model {
             stage_first_layer: cfg.layer_range.map(|(first, _)| first).unwrap_or(0),
@@ -5204,16 +5214,31 @@ impl Model {
                         "suma cząstkowa GGUF NVFP4 wymaga układu RowMajor36".into(),
                     ));
                 }
-                self.kernels.gemm_nvfp4_gguf_out_f32_batch(
-                    partial,
-                    buf,
-                    x,
-                    *rows,
-                    *cols,
-                    n_tokens,
-                    *output_scale,
-                    stream,
-                )
+                // B = 2/4/8/16 to rodzina małych batchy, ważona per token.
+                // Powyżej idzie kafel macierzowy z epilogiem f32 — ten sam
+                // przepływ co wariant f16, tylko bez zawężenia wyniku.
+                match n_tokens {
+                    2 | 4 | 8 | 16 => self.kernels.gemm_nvfp4_gguf_out_f32_batch(
+                        partial,
+                        buf,
+                        x,
+                        *rows,
+                        *cols,
+                        n_tokens,
+                        *output_scale,
+                        stream,
+                    ),
+                    _ => self.kernels.gemm_nvfp4_gguf_wmma_out_f32(
+                        partial,
+                        buf,
+                        x,
+                        *rows,
+                        *cols,
+                        n_tokens,
+                        *output_scale,
+                        stream,
+                    ),
+                }
             }
             other => Err(ForgeError::Unsupported(format!(
                 "podział nie ma GEMM z wyjściem f32 dla formatu {:?} przy T={n_tokens}",
@@ -12041,6 +12066,9 @@ impl Model {
     /// Uruchamia wspólny batched forward hybrydowego targetu.
     fn run_hybrid_batch_layers(&self, t: usize, commit_prefill: bool) -> Result<()> {
         self.hybrid_batch_entry_norm(t)?;
+        if self.tp.is_some() {
+            return self.run_hybrid_batch_layers_tp(t, commit_prefill);
+        }
         for layer_index in 0..self.weights.layers.len() {
             self.hybrid_batch_mixer(layer_index, t, commit_prefill)?;
             self.hybrid_batch_ffn(layer_index, t)?;
@@ -12065,6 +12093,64 @@ impl Model {
             p.rms_norm_eps,
             &self.stream,
         )
+    }
+
+    /// Czy podział umie policzyć chunk batchowy tego modelu.
+    ///
+    /// Warunkiem są WYŁĄCZNIE trzy macierze wierszowo równoległe: ich wynik jest
+    /// sumą cząstkową, więc każda potrzebuje GEMM z wyjściem f32 dla dużego `T`.
+    /// Format bez takiego kernela (dziś Q4_K i Q6_K) schodzi na prefill
+    /// sekwencyjny — wolniejszy, ale liczący to samo.
+    fn split_batch_prefill_capable(&self) -> bool {
+        let partial_capable = |w: &DevWeight| {
+            matches!(
+                w,
+                DevWeight::F16 { .. } | DevWeight::Q8_0 { .. } | DevWeight::NvFp4Gguf { .. }
+            )
+        };
+        self.weights.layers.iter().all(|layer| {
+            let mixer_ok = match &layer.mixer {
+                LayerMixer::Attention(a) => partial_capable(&a.attn_o),
+                LayerMixer::DeltaNet(d) => partial_capable(&d.out_proj),
+                LayerMixer::DeepseekAttention(_) => false,
+            };
+            let ffn_ok = match &layer.ffn {
+                LayerFfn::Dense(ffn) => partial_capable(&ffn.down),
+                LayerFfn::Moe(_) => false,
+            };
+            mixer_ok && ffn_ok
+        })
+    }
+
+    /// Chunk batchowy rozłożony na rangi.
+    ///
+    /// Ten sam kształt co dekodowanie — trzy części i dwie redukcje — tylko `T`
+    /// jest większe. To jest cała różnica między prefillem a dekodowaniem pod
+    /// podziałem i dlatego prefill nie potrzebuje własnej architektury.
+    fn run_hybrid_batch_layers_tp(&self, t: usize, commit_prefill: bool) -> Result<()> {
+        for member in self.tp_ranks() {
+            member.hybrid_batch_entry_norm(t)?;
+        }
+        let hidden = self.weights.descriptor.params.hidden_size;
+        if t > MAX_SPLIT_PREFILL_CHUNK {
+            return Err(ForgeError::Unsupported(format!(
+                "chunk {t} przekracza bufor sumy cząstkowej ({MAX_SPLIT_PREFILL_CHUNK})"
+            )));
+        }
+        for layer_index in 0..self.weights.layers.len() {
+            for member in self.tp_members() {
+                member.hybrid_batch_mixer(layer_index, t, commit_prefill)?;
+            }
+            self.tp_all_reduce(Self::prefill_o_out, t * hidden)?;
+            for member in self.tp_members() {
+                member.hybrid_batch_ffn(layer_index, t)?;
+            }
+            self.tp_all_reduce(Self::prefill_down, t * hidden)?;
+            for member in self.tp_members() {
+                member.hybrid_batch_residual(layer_index, t)?;
+            }
+        }
+        Ok(())
     }
 
     /// Część 1 chunka: mikser do projekcji wyjściowej włącznie.
@@ -16587,6 +16673,22 @@ impl Model {
         &model.bufs.down
     }
 
+    fn prefill_o_out(model: &Model) -> &DevBuffer {
+        &model
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe")
+            .o_out
+    }
+
+    fn prefill_down(model: &Model) -> &DevBuffer {
+        &model
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe")
+            .down
+    }
+
     /// Krok modelu hybrydowego rozłożony na rangi.
     ///
     /// To jest CAŁY sterownik podziału: ta sama warstwa wykonuje się na każdej
@@ -17175,7 +17277,12 @@ impl Model {
         }
         let batched_enabled =
             std::env::var("FORGE_HYBRID_BATCH_PREFILL").map_or(true, |value| value != "0");
-        if !split && batched_enabled && tokens.len() > 1 && self.hybrid_batched_prefill_capable() {
+        let batch_capable = !split || self.split_batch_prefill_capable();
+        if batched_enabled
+            && batch_capable
+            && tokens.len() > 1
+            && self.hybrid_batched_prefill_capable()
+        {
             return self.prefill_hybrid_batched(seq, tokens);
         }
         self.ensure_hybrid_bufs()?;
@@ -18142,7 +18249,12 @@ impl Model {
         }
         self.ensure_hybrid_bufs()?;
         self.ensure_prefill_bufs()?;
-        let chunk_size = self.hybrid_prefill_chunk_size;
+        // Sumę cząstkową rangi trzyma bufor o stałym rozmiarze, więc chunk pod
+        // podziałem nie może go przekroczyć.
+        let chunk_size = match self.tp.is_some() {
+            true => self.hybrid_prefill_chunk_size.min(MAX_SPLIT_PREFILL_CHUNK),
+            false => self.hybrid_prefill_chunk_size,
+        };
         let prefill_cap = tokens.len().min(chunk_size);
         let saved_graphs = if prefill_cap > 4 {
             self.ensure_hybrid_verify_bufs(4)?;

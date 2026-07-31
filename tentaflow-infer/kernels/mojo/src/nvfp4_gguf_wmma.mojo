@@ -174,3 +174,126 @@ comptime gemm_nvfp4_gguf_wmma_f16_bm32 = gemm_nvfp4_gguf_wmma_impl[2, 2, 1, 2, L
 comptime gemm_nvfp4_gguf_wmma_f16_bm256 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 2, LDS_PAD]
 comptime gemm_nvfp4_gguf_wmma_f16_bm256_bn128 = gemm_nvfp4_gguf_wmma_impl[4, 2, 4, 4, LDS_PAD]
 comptime gemm_nvfp4_gguf_wmma_f16_bm512_bn128 = gemm_nvfp4_gguf_wmma_impl[8, 2, 4, 4, LDS_PAD]
+
+
+def gemm_nvfp4_gguf_wmma_out_f32_impl[
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, PAD: Int = 0
+](
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    output_scale: Float32,
+):
+    """GEMM NVFP4 na WMMA z wyjściem f32: Y[t, r] = dot(w[r], x[t]) * output_scale.
+
+    Ta sama matematyka i ten sam przepływ co `gemm_nvfp4_gguf_wmma_impl` —
+    różni się WYŁĄCZNIE tym, że nie zawęża wyniku do f16.
+
+    Tego wymaga macierz wierszowo równoległa w podziale tensor-parallel: jej
+    wynik jest sumą CZĄSTKOWĄ i wolno go zawęzić dopiero po dodaniu cudzych,
+    inaczej zaokrąglenie następuje dwa razy zamiast raz.
+    """
+    comptime BM = WAVES_M * MTILE * TILE
+    comptime BN = WAVES_N * NTILE * TILE
+
+    var lane = Int(thread_idx.x) % 32
+    var wave = Int(thread_idx.x) // 32
+    var base_m = Int(block_idx.y) * BM + (wave // WAVES_N) * MTILE * TILE
+    var base_n = Int(block_idx.x) * BN + (wave % WAVES_N) * NTILE * TILE
+
+    var blocks_per_row = n_cols // BLOCK_VALUES
+
+    # Wiersze i tokeny poza zakresem czytają ostatni legalny indeks — ich wyniki
+    # i tak nie są zapisywane, a zacisk trzyma odczyty w obrębie buforów.
+    var x_base = InlineArray[Int, MTILE](fill=0)
+    comptime for mt in range(MTILE):
+        var m = base_m + mt * TILE + lane % 16
+        if m > n_tokens - 1:
+            m = n_tokens - 1
+        x_base[mt] = m * n_cols
+    var w_base = InlineArray[Int, NTILE](fill=0)
+    comptime for nt in range(NTILE):
+        var n = base_n + nt * TILE + lane % 16
+        if n > n_rows - 1:
+            n = n_rows - 1
+        w_base[nt] = n * blocks_per_row * BLOCK_BYTES
+
+    var acc = InlineArray[SIMD[DType.float32, 8], MTILE * NTILE](
+        fill=SIMD[DType.float32, 8](0.0)
+    )
+
+    # Wagi rozpakowujemy RAZ NA BLOK do LDS. Bez tego kazda z WAVES_M fal wzdluz
+    # tokenow dekwantyzowala DOKLADNIE TE SAME kolumny — a pomiar z podmieniona
+    # na stala waga pokazal, ze sama dekwantyzacja to polowa czasu kernela
+    # (25 wobec 48 TFLOPS). Kafel BN x 64 wartosci to 8 KiB dla BN=64.
+    # `PAD` rozsuwa wiersze kafla wag w LDS. Bez niego szesnaście linii czyta
+    # fragment `b` z adresów odległych o `BLOCK_VALUES * 2 = 128 B`, czyli o
+    # wielokrotność 32 banków — wszystkie trafiają w ten sam bank. Zmierzone na
+    # R9700 (`bench-amd/bench_nvfp4_wmma_pad.mojo`, TFLOPS, T=1024):
+    #
+    #   rows=17408 cols=5120  : pad0 65 | pad8 65 | pad16 65 | pad24 66
+    #   rows=5120  cols=17408 : pad0 62 | pad8 64 | pad16 64 | pad24 64
+    #   rows=6144  cols=5120  : pad0 51 | pad8 67 | pad16 68 | pad24 66
+    comptime ROW = BLOCK_VALUES + PAD
+    comptime WEIGHT_TILE = BN * ROW
+    ws = stack_allocation[
+        WEIGHT_TILE, Float16, address_space = AddressSpace.SHARED
+    ]()
+    var threads = Int(block_dim.x)
+    var tid = Int(thread_idx.x)
+
+    for block in range(blocks_per_row):
+        # Kazdy watek bierze kolejne podbloki (wiersz, podblok) az wyczerpie kafel.
+        var slot = tid
+        while slot < BN * SUBBLOCKS:
+            local_row = slot // SUBBLOCKS
+            subblock = slot % SUBBLOCKS
+            var source_row = Int(block_idx.x) * BN + local_row
+            if source_row > n_rows - 1:
+                source_row = n_rows - 1
+            frag = _weight_frag(
+                weights,
+                source_row * blocks_per_row * BLOCK_BYTES + block * BLOCK_BYTES,
+                subblock,
+            )
+            (ws + local_row * ROW + subblock * TILE).store(frag)
+            slot += threads
+        barrier()
+
+        comptime for sub in range(SUBBLOCKS):
+            var column = block * BLOCK_VALUES + sub * TILE
+            var a = InlineArray[SIMD[DType.float16, 16], MTILE](
+                fill=SIMD[DType.float16, 16](0.0)
+            )
+            comptime for mt in range(MTILE):
+                a[mt] = (x + x_base[mt] + column).load[width=16, alignment=2]()
+            comptime for nt in range(NTILE):
+                local_n = (wave % WAVES_N) * NTILE * TILE + nt * TILE + lane % 16
+                b = (ws + local_n * ROW + sub * TILE).load[width=16, alignment=2]()
+                comptime for mt in range(MTILE):
+                    acc[mt * NTILE + nt] = wmma_f16_16x16x16(
+                        a[mt], b, acc[mt * NTILE + nt]
+                    )
+        barrier()
+
+    comptime for mt in range(MTILE):
+        comptime for nt in range(NTILE):
+            comptime for i in range(8):
+                # (m, n) tego pola: m = i*2 + lane//16, n = lane % 16.
+                var m = base_m + mt * TILE + wmma_acc_row(lane, i)
+                var n = base_n + nt * TILE + lane % 16
+                if m < n_tokens and n < n_rows:
+                    y[m * n_rows + n] = Float32(
+                        acc[mt * NTILE + nt][i] * output_scale
+                    )
+
+
+comptime gemm_nvfp4_gguf_wmma_out_f32_bm256 = gemm_nvfp4_gguf_wmma_out_f32_impl[
+    4, 2, 4, 2, LDS_PAD
+]
+comptime gemm_nvfp4_gguf_wmma_out_f32_bm256_bn128 = (
+    gemm_nvfp4_gguf_wmma_out_f32_impl[4, 2, 4, 4, LDS_PAD]
+)
