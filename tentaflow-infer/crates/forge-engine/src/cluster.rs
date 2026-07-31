@@ -30,6 +30,28 @@ pub struct ClusterDevice {
     pub kernels: forge_kernels::Kernels,
 }
 
+/// Sumy cząstkowe rang, gotowe do zebrania na jednej karcie.
+///
+/// Pola opisują JEDEN punkt redukcji, a nie stan klastra — dzięki temu ten sam
+/// prymityw obsługuje dekodowanie (`elems = hidden`) i batch
+/// (`elems = tokens * hidden`), bo `T` jest parametrem, a nie osobną ścieżką.
+pub struct PartialSum<'a> {
+    /// Suma cząstkowa karty `i`; `None`, gdy ta karta nie liczyła tego fragmentu.
+    pub parts: &'a [Option<&'a forge_hal::DevBuffer>],
+    pub gather_on: usize,
+    /// Strumień karty zbierającej. Karta modelu pracuje strumieniem silnika, a
+    /// nie własnym strumieniem klastra.
+    pub gather_stream: &'a Stream,
+    /// Akumulator f32 na karcie zbierającej; wolno wskazać ten sam bufor co
+    /// wyjście f32.
+    pub acc: &'a forge_hal::DevBuffer,
+    /// Bufor na przywiezioną sumę cząstkową.
+    pub staging: &'a forge_hal::DevBuffer,
+    /// Wynik zawężony do f16; `None` zostawia sumę w `acc`.
+    pub out_f16: Option<&'a forge_hal::DevBuffer>,
+    pub elems: usize,
+}
+
 /// Karty otwarte w jednym procesie, z otwartym dostępem P2P w obie strony.
 pub struct Cluster {
     devices: Vec<ClusterDevice>,
@@ -270,6 +292,94 @@ impl Cluster {
             .device
             .record_event(&source.done, signaller_stream)?;
         target.device.wait_event(waiter_stream, &source.done)
+    }
+
+    /// Zbiera sumy cząstkowe rang na jednej karcie i domyka je jednym wynikiem.
+    ///
+    /// To jest operacja, którą macierz WIERSZOWO równoległa kończy KAŻDĄ ścieżkę
+    /// przez warstwę — `attn_output`, `ssm_out` i `ffn_down`. Kontrakt liczbowy:
+    /// każda ranga akumuluje swój fragment w f32, suma idzie w f32 i DOPIERO
+    /// wynik jest zawężany do f16, czyli z jednym zaokrągleniem, tak jak na
+    /// jednej karcie.
+    ///
+    /// Ostatnia ranga domyka redukcję TYM SAMYM uruchomieniem, którym zawęża do
+    /// f16. Osobne dodawanie i osobne zawężenie kosztowały dwa uruchomienia na
+    /// warstwę, czyli 130 na token — więcej niż cała wymiana aktywacji między
+    /// kartami, która na tym stanowisku trwa 5,5 us.
+    pub fn reduce_partials(&self, sum: PartialSum<'_>) -> Result<()> {
+        let target = self.device(sum.gather_on)?;
+        let contributors: Vec<usize> = (0..self.len())
+            .filter(|&index| sum.parts.get(index).and_then(|p| *p).is_some())
+            .collect();
+        let Some((&last, rest)) = contributors.split_last() else {
+            return Err(ForgeError::Scheduler(
+                "redukcja bez ani jednej sumy cząstkowej".into(),
+            ));
+        };
+        let bytes = sum.elems.checked_mul(4).ok_or_else(|| {
+            ForgeError::Scheduler("redukcja: przepełnienie rozmiaru sumy".into())
+        })?;
+        let part = |index: usize| -> Result<&forge_hal::DevBuffer> {
+            sum.parts
+                .get(index)
+                .and_then(|p| *p)
+                .ok_or_else(|| ForgeError::Scheduler(format!("brak sumy cząstkowej karty {index}")))
+        };
+        let mut accumulated = 0usize;
+        for &index in rest {
+            let destination = if accumulated == 0 { sum.acc } else { sum.staging };
+            if index == sum.gather_on {
+                target
+                    .device
+                    .copy(part(index)?, 0, destination, 0, bytes, sum.gather_stream)?;
+            } else {
+                self.exchange(index, part(index)?, 0, sum.gather_on, destination, 0, bytes)?;
+                self.order(
+                    index,
+                    &self.device(index)?.stream,
+                    sum.gather_on,
+                    sum.gather_stream,
+                )?;
+            }
+            if accumulated > 0 {
+                target
+                    .kernels
+                    .add_f32(sum.acc, sum.acc, sum.staging, sum.elems, sum.gather_stream)?;
+            }
+            accumulated += 1;
+        }
+        let tail = if last == sum.gather_on {
+            part(last)?
+        } else {
+            self.exchange(last, part(last)?, 0, sum.gather_on, sum.staging, 0, bytes)?;
+            self.order(
+                last,
+                &self.device(last)?.stream,
+                sum.gather_on,
+                sum.gather_stream,
+            )?;
+            sum.staging
+        };
+        match (sum.out_f16, accumulated) {
+            (Some(out), 0) => {
+                target
+                    .kernels
+                    .cast_f32_f16(out, tail, sum.elems, sum.gather_stream)
+            }
+            (Some(out), _) => target.kernels.add_f32_out_f16(
+                out,
+                sum.acc,
+                tail,
+                sum.elems,
+                sum.gather_stream,
+            ),
+            (None, 0) => target
+                .device
+                .copy(tail, 0, sum.acc, 0, bytes, sum.gather_stream),
+            (None, _) => target
+                .kernels
+                .add_f32(sum.acc, sum.acc, tail, sum.elems, sum.gather_stream),
+        }
     }
 
     /// Mierzy możliwości każdej karty tym samym testem. Format wag musi być

@@ -581,80 +581,18 @@ pub fn gemv_column_split(
     // Redukcja: karta zbierająca dodaje do siebie sumy cząstkowe pozostałych.
     // Każda z nich to pełny wektor `rows`, więc tu nie ma przesunięć — jest
     // dodawanie.
-    let target = cluster.device(gather_on)?;
-    let contributors: Vec<usize> = (0..cluster.len())
-        .filter(|&index| shards.cols_on(index) > 0)
+    let parts: Vec<Option<&DevBuffer>> = (0..cluster.len())
+        .map(|index| (shards.cols_on(index) > 0).then_some(&y_parts[index]))
         .collect();
-    let Some((&last, rest)) = contributors.split_last() else {
-        return Err(ForgeError::Scheduler(
-            "podział kolumnowy nie przydzielił kolumn żadnej karcie".into(),
-        ));
-    };
-    // Sumy cząstkowe wszystkich kart poza OSTATNIĄ trafiają do `y_full`. Ostatnia
-    // domyka redukcję — i gdy wołający chce wyniku w f16, to domknięcie jest tym
-    // samym uruchomieniem co zawężenie. Osobne dodawanie i osobne zawężenie
-    // kosztowały dwa uruchomienia na warstwę, czyli 130 na token przy zmierzonym
-    // narzucie rzędu 4,5 us — więcej niż cała wymiana aktywacji między kartami.
-    let mut accumulated = 0usize;
-    for &index in rest {
-        let bring = |destination: &DevBuffer| -> Result<()> {
-            if index == gather_on {
-                target
-                    .device
-                    .copy(&y_parts[index], 0, destination, 0, rows * 4, gather_stream)
-            } else {
-                cluster.exchange(
-                    index,
-                    &y_parts[index],
-                    0,
-                    gather_on,
-                    destination,
-                    0,
-                    rows * 4,
-                )?;
-                cluster.order(
-                    index,
-                    &cluster.device(index)?.stream,
-                    gather_on,
-                    gather_stream,
-                )
-            }
-        };
-        if accumulated == 0 {
-            bring(y_full)?;
-        } else {
-            bring(staging)?;
-            target
-                .kernels
-                .add_f32(y_full, y_full, staging, rows, gather_stream)?;
-        }
-        accumulated += 1;
-    }
-
-    let tail = if last == gather_on {
-        &y_parts[last]
-    } else {
-        cluster.exchange(last, &y_parts[last], 0, gather_on, staging, 0, rows * 4)?;
-        cluster.order(
-            last,
-            &cluster.device(last)?.stream,
-            gather_on,
-            gather_stream,
-        )?;
-        staging
-    };
-    match (out_f16, accumulated) {
-        (Some(out), 0) => target.kernels.cast_f32_f16(out, tail, rows, gather_stream),
-        (Some(out), _) => target
-            .kernels
-            .add_f32_out_f16(out, y_full, tail, rows, gather_stream),
-        (None, 0) => target
-            .device
-            .copy(tail, 0, y_full, 0, rows * 4, gather_stream),
-        (None, _) => target
-            .kernels
-            .add_f32(y_full, y_full, tail, rows, gather_stream),
-    }
+    cluster.reduce_partials(crate::cluster::PartialSum {
+        parts: &parts,
+        gather_on,
+        gather_stream,
+        acc: y_full,
+        staging,
+        out_f16,
+        elems: rows,
+    })
 }
 
 /// Cały blok FFN rozłożony na karty: `gate`/`up` po wierszach, `down` po
@@ -1292,52 +1230,24 @@ impl TpDecode {
                 stream,
             )?;
         }
-        let primary = self.cluster.device(0)?;
         let acc = self.batch_acc.as_ref().expect("bufor sumy");
         let staging = self.batch_staging.as_ref().expect("bufor wymiany");
-        let contributors: Vec<usize> = (0..self.cluster.len())
-            .filter(|&i| shards.rows_on(i) > 0)
+        let parts: Vec<Option<&DevBuffer>> = (0..self.cluster.len())
+            .map(|index| {
+                (shards.rows_on(index) > 0)
+                    .then(|| self.batch[index].as_ref().map(|ws| &ws.partial))
+                    .flatten()
+            })
             .collect();
-        let Some((&last, rest)) = contributors.split_last() else {
-            return Ok(false);
-        };
-        let bytes = tokens * hidden * 4;
-        let mut accumulated = 0usize;
-        for &index in rest {
-            let part = &self.batch[index].as_ref().expect("bufor").partial;
-            let target = if accumulated == 0 { acc } else { staging };
-            if index == 0 {
-                primary.device.copy(part, 0, target, 0, bytes, model_stream)?;
-            } else {
-                self.cluster.exchange(index, part, 0, 0, target, 0, bytes)?;
-                self.cluster
-                    .order(index, &self.cluster.device(index)?.stream, 0, model_stream)?;
-            }
-            if accumulated > 0 {
-                primary
-                    .kernels
-                    .add_f32(acc, acc, staging, tokens * hidden, model_stream)?;
-            }
-            accumulated += 1;
-        }
-        let tail = if last == 0 {
-            &self.batch[0].as_ref().expect("bufor").partial
-        } else {
-            let part = &self.batch[last].as_ref().expect("bufor").partial;
-            self.cluster.exchange(last, part, 0, 0, staging, 0, bytes)?;
-            self.cluster
-                .order(last, &self.cluster.device(last)?.stream, 0, model_stream)?;
-            staging
-        };
-        if accumulated == 0 {
-            primary
-                .kernels
-                .cast_f32_f16(y, tail, tokens * hidden, model_stream)?;
-        } else {
-            primary
-                .kernels
-                .add_f32_out_f16(y, acc, tail, tokens * hidden, model_stream)?;
-        }
+        self.cluster.reduce_partials(crate::cluster::PartialSum {
+            parts: &parts,
+            gather_on: 0,
+            gather_stream: model_stream,
+            acc,
+            staging,
+            out_f16: Some(y),
+            elems: tokens * hidden,
+        })?;
         Ok(true)
     }
 
