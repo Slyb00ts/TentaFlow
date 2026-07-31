@@ -42,8 +42,15 @@ pub struct ReduceRank<'a> {
     pub device: &'a dyn Device,
     pub stream: &'a Stream,
     pub kernels: &'a forge_kernels::Kernels,
-    /// Zdarzenie tej rangi; redukcja zapisuje je i każe czekać drugiej karcie.
+    /// Zdarzenie „moja suma cząstkowa jest zapisana".
     pub done: &'a Event,
+    /// Zdarzenie „skończyłam czytać CUDZE sumy cząstkowe".
+    ///
+    /// Bez niego redukcja symetryczna ma wyścig: ranga, która skończyła
+    /// dodawanie, rusza do następnej warstwy i NADPISUJE swoją sumę cząstkową,
+    /// podczas gdy druga wciąż ją czyta. Objawia się to rozjazdem jednego
+    /// przebiegu na kilka — czyli wyglądem różnicy zaokrąglenia, nie błędu.
+    pub read_done: &'a Event,
     /// Suma cząstkowa tej rangi w f32; `None`, gdy nie liczyła tego fragmentu.
     pub part: Option<&'a forge_hal::DevBuffer>,
 }
@@ -320,6 +327,9 @@ impl Cluster {
                 },
                 kernels: &entry.kernels,
                 done: &entry.done,
+                // Wariant zbierający kopiuje cząstki do własnych buforów, więc
+                // nie ma czytania cudzej pamięci do domknięcia.
+                read_done: &entry.done,
                 part: sum.parts.get(index).copied().flatten(),
             })
             .collect();
@@ -565,6 +575,18 @@ pub fn all_reduce_f16(
                 }
                 rank.kernels
                     .cast_f32_f16(out[index], acc[index], elems, rank.stream)?;
+            }
+        }
+    }
+    // Domknięcie: nikt nie wychodzi z redukcji, dopóki wszyscy nie skończyli
+    // czytać cudzych sum cząstkowych. Następna warstwa nadpisuje ten bufor.
+    for rank in ranks {
+        rank.device.record_event(rank.read_done, rank.stream)?;
+    }
+    for (index, rank) in ranks.iter().enumerate() {
+        for (peer, other) in ranks.iter().enumerate() {
+            if peer != index {
+                rank.device.wait_event(rank.stream, other.read_done)?;
             }
         }
     }

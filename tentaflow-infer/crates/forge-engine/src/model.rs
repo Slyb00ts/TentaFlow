@@ -1121,8 +1121,10 @@ enum SplitPrefillLogits {
 struct TpSpmd {
     /// Rangi 1..world. Ranga zerowa to model, który to pole trzyma.
     ranks: Vec<Model>,
-    /// Zdarzenie każdej rangi (zerowej włącznie) do porządkowania redukcji.
+    /// Zdarzenie każdej rangi (zerowej włącznie): suma cząstkowa jest zapisana.
     events: Vec<Event>,
+    /// Zdarzenie każdej rangi: skończyła czytać cudze sumy cząstkowe.
+    read_events: Vec<Event>,
     /// Akumulator f32 KAŻDEJ rangi, na jej własnej karcie. Redukcja jest
     /// symetryczna — każda ranga sumuje u siebie — więc nie ma jednej karty
     /// zbierającej ani bufora na przywożone cząstki.
@@ -2629,6 +2631,10 @@ impl Model {
             .chain(ranks.iter())
             .map(|member| member.device.create_event())
             .collect::<Result<Vec<_>>>()?;
+        let read_events = std::iter::once(&zero)
+            .chain(ranks.iter())
+            .map(|member| member.device.create_event())
+            .collect::<Result<Vec<_>>>()?;
         let acc = std::iter::once(&zero)
             .chain(ranks.iter())
             .map(|member| {
@@ -2645,7 +2651,12 @@ impl Model {
             inter = zero.weights.descriptor.params.intermediate_size,
             "model podzielony na rangi; każda widzi swój fragment"
         );
-        zero.tp = Some(Box::new(TpSpmd { ranks, events, acc }));
+        zero.tp = Some(Box::new(TpSpmd {
+            ranks,
+            events,
+            read_events,
+            acc,
+        }));
         Ok(zero)
     }
 
@@ -5152,6 +5163,65 @@ impl Model {
         Ok(())
     }
 
+    /// Macierz WIERSZOWO równoległa dla `n_tokens` wierszy naraz.
+    ///
+    /// `T` jest tu PARAMETREM, a nie osobną architekturą: dekodowanie
+    /// (`T = 1`), weryfikacja draftu (`T = 3/4`) i prefill (`T` = chunk) idą tą
+    /// samą drogą i przez te same dwa punkty redukcji.
+    fn row_parallel_gemm(
+        &self,
+        dst: &DevBuffer,
+        w: &DevWeight,
+        x: &DevBuffer,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        // Jedna karta liczy DOKŁADNIE to co przedtem — także dla `T = 1`, które w
+        // ścieżce batchowej idzie kaflem GEMM, a nie GEMV. Sprowadzenie go tutaj
+        // do GEMV zmieniło rodzinę kerneli i wygenerowany tekst.
+        let Some(partial) = &self.tp_partial else {
+            return self.gemm(dst, w, x, n_tokens, stream);
+        };
+        if n_tokens == 1 {
+            return self.gemv_out_f32(partial, 0, x, 0, w, stream);
+        }
+        match w {
+            DevWeight::F16 { buf, rows, cols } => self
+                .kernels
+                .gemm_f16_out_f32_at(partial, buf, 0, x, *rows, *cols, n_tokens, stream),
+            DevWeight::Q8_0 { buf, rows, cols } => self
+                .kernels
+                .gemm_q8_0_out_f32_at(partial, buf, 0, x, *rows, *cols, n_tokens, stream),
+            DevWeight::NvFp4Gguf {
+                buf,
+                output_scale,
+                rows,
+                cols,
+                layout,
+            } => {
+                if *layout != Nvfp4GgufLayout::RowMajor36 {
+                    return Err(ForgeError::Unsupported(
+                        "suma cząstkowa GGUF NVFP4 wymaga układu RowMajor36".into(),
+                    ));
+                }
+                self.kernels.gemm_nvfp4_gguf_out_f32_batch(
+                    partial,
+                    buf,
+                    x,
+                    *rows,
+                    *cols,
+                    n_tokens,
+                    *output_scale,
+                    stream,
+                )
+            }
+            other => Err(ForgeError::Unsupported(format!(
+                "podział nie ma GEMM z wyjściem f32 dla formatu {:?} przy T={n_tokens}",
+                std::mem::discriminant(other)
+            ))),
+        }
+    }
+
     /// Macierz WIERSZOWO równoległa: `attn_output`, `ssm_out` i `ffn_down`.
     ///
     /// Na jednej karcie to zwykła projekcja do bufora f16. Gdy model jest rangą
@@ -5403,19 +5473,12 @@ impl Model {
                 )?;
             }
         }
+        // Dekodowanie ma własną rodzinę GEMV, prefill kafel GEMM — tak było i tak
+        // musi zostać, bo to różne zaokrąglenie i różny wygenerowany tekst.
         if n_tokens == 1 {
             self.row_parallel_gemv(bufs.out, &ffn.down, bufs.act, stream)
         } else {
-            if self.tp_partial.is_some() {
-                // Ranga ma pocięte `down`, więc wynik wielu tokenów też jest sumą
-                // cząstkową — a wariant GEMM nie ma jeszcze wyjścia f32 ani punktu
-                // redukcji. Milczące policzenie go dałoby tekst-śmieć bez żadnego
-                // błędu, więc ścieżka odmawia zamiast zgadywać.
-                return Err(ForgeError::Unsupported(
-                    "podział na rangi nie obejmuje jeszcze FFN dla wielu tokenów".into(),
-                ));
-            }
-            self.gemm(bufs.out, &ffn.down, bufs.act, n_tokens, stream)
+            self.row_parallel_gemm(bufs.out, &ffn.down, bufs.act, n_tokens, stream)
         }
     }
 
@@ -6092,6 +6155,10 @@ impl Model {
     }
 
     fn ensure_prefill_bufs(&mut self) -> Result<()> {
+        for index in 0..self.tp_rank_count() {
+            let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
+            rank.ensure_prefill_bufs()?;
+        }
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
         // Bufory muszą pomieścić najszerszą warstwę modelu — przy
@@ -10853,6 +10920,10 @@ impl Model {
     }
 
     fn ensure_hybrid_verify_bufs(&mut self, cap: usize) -> Result<()> {
+        for index in 0..self.tp_rank_count() {
+            let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
+            rank.ensure_hybrid_verify_bufs(cap)?;
+        }
         if self
             .hybrid_verify_bufs
             .as_ref()
@@ -11675,7 +11746,7 @@ impl Model {
             p.rms_norm_eps,
             stream,
         )?;
-        self.gemm(&pb.o_out, &delta.out_proj, &hv.normed, t, stream)
+        self.row_parallel_gemm(&pb.o_out, &delta.out_proj, &hv.normed, t, stream)
     }
 
     fn hybrid_verify_attention_layer(
@@ -11822,7 +11893,7 @@ impl Model {
         kernels.sigmoid_mul_f16(&hv.gated, &pb.attn_out, &hv.gatec, t * q_dim, stream)?;
         debug_assert_eq!(attention.attn_o.cols(), q_dim);
         debug_assert!(pb.k.len() >= t * kv_dim * 2);
-        self.gemm(&pb.o_out, &attention.attn_o, &hv.gated, t, stream)
+        self.row_parallel_gemm(&pb.o_out, &attention.attn_o, &hv.gated, t, stream)
     }
 
     /// Zatwierdza na GPU stan odpowiadający zaakceptowanemu prefiksowi.
@@ -11969,6 +12040,17 @@ impl Model {
 
     /// Uruchamia wspólny batched forward hybrydowego targetu.
     fn run_hybrid_batch_layers(&self, t: usize, commit_prefill: bool) -> Result<()> {
+        self.hybrid_batch_entry_norm(t)?;
+        for layer_index in 0..self.weights.layers.len() {
+            self.hybrid_batch_mixer(layer_index, t, commit_prefill)?;
+            self.hybrid_batch_ffn(layer_index, t)?;
+            self.hybrid_batch_residual(layer_index, t)?;
+        }
+        Ok(())
+    }
+
+    /// Norma wejścia pierwszej warstwy dla chunka batchowego.
+    fn hybrid_batch_entry_norm(&self, t: usize) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let pb = self
             .prefill_bufs
@@ -11982,9 +12064,13 @@ impl Model {
             p.hidden_size,
             p.rms_norm_eps,
             &self.stream,
-        )?;
+        )
+    }
 
-        for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+    /// Część 1 chunka: mikser do projekcji wyjściowej włącznie.
+    fn hybrid_batch_mixer(&self, layer_index: usize, t: usize, commit_prefill: bool) -> Result<()> {
+        let layer = &self.weights.layers[layer_index];
+        {
             match &layer.mixer {
                 LayerMixer::DeepseekAttention(_) => {
                     unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
@@ -11999,53 +12085,71 @@ impl Model {
                     }
                 }
             }
-            self.kernels.rmsnorm_residual_f16(
-                &pb.x,
-                &pb.h,
-                &pb.o_out,
-                &layer.ffn_norm,
-                t,
-                p.hidden_size,
-                p.rms_norm_eps,
-                &self.stream,
-            )?;
-            let LayerFfn::Dense(ffn) = &layer.ffn else {
-                return Err(ForgeError::Unsupported(
-                    "hybrydowy verifier MTP nie obsługuje jeszcze targetu MoE".into(),
-                ));
-            };
-            self.ffn_dense_block(
-                layer_index,
-                ffn,
-                FfnBlockBufs {
-                    x: &pb.x,
-                    gate: &pb.gate,
-                    up: &pb.up,
-                    act: &pb.act,
-                    out: &pb.down,
-                    gate_up: None,
-                },
-                t,
-                &self.stream,
-            )?;
-            let next_norm = if layer_index + 1 < self.weights.layers.len() {
-                &self.weights.layers[layer_index + 1].attn_norm
-            } else {
-                &self.weights.output_norm
-            };
-            self.kernels.rmsnorm_residual_f16(
-                &pb.x,
-                &pb.h,
-                &pb.down,
-                next_norm,
-                t,
-                p.hidden_size,
-                p.rms_norm_eps,
-                &self.stream,
-            )?;
         }
-
         Ok(())
+    }
+
+    /// Część 2 chunka: rezyduum miksera, norma przed FFN i blok FFN do `down`.
+    fn hybrid_batch_ffn(&self, layer_index: usize, t: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let layer = &self.weights.layers[layer_index];
+        self.kernels.rmsnorm_residual_f16(
+            &pb.x,
+            &pb.h,
+            &pb.o_out,
+            &layer.ffn_norm,
+            t,
+            p.hidden_size,
+            p.rms_norm_eps,
+            &self.stream,
+        )?;
+        let LayerFfn::Dense(ffn) = &layer.ffn else {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy verifier MTP nie obsługuje jeszcze targetu MoE".into(),
+            ));
+        };
+        self.ffn_dense_block(
+            layer_index,
+            ffn,
+            FfnBlockBufs {
+                x: &pb.x,
+                gate: &pb.gate,
+                up: &pb.up,
+                act: &pb.act,
+                out: &pb.down,
+                gate_up: None,
+            },
+            t,
+            &self.stream,
+        )
+    }
+
+    /// Część 3 chunka: rezyduum FFN i norma wejścia następnej warstwy.
+    fn hybrid_batch_residual(&self, layer_index: usize, t: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let next_norm = if layer_index + 1 < self.weights.layers.len() {
+            &self.weights.layers[layer_index + 1].attn_norm
+        } else {
+            &self.weights.output_norm
+        };
+        self.kernels.rmsnorm_residual_f16(
+            &pb.x,
+            &pb.h,
+            &pb.down,
+            next_norm,
+            t,
+            p.hidden_size,
+            p.rms_norm_eps,
+            &self.stream,
+        )
     }
 
     /// Uruchamia stałą część verifiera hybrydowego bez synchronizacji z hostem.
@@ -16452,7 +16556,7 @@ impl Model {
     /// Obie rangi potrzebują wyniku, bo każda liczy własny `rmsnorm_residual` na
     /// własnym strumieniu rezydualnym — a ten jest replikowany za darmo, skoro
     /// wagi norm ładują się jako `Replicated`.
-    fn tp_all_reduce(&self, out_of: fn(&DecodeBufs) -> &DevBuffer) -> Result<()> {
+    fn tp_all_reduce(&self, out_of: fn(&Model) -> &DevBuffer, elems: usize) -> Result<()> {
         let tp = self
             .tp
             .as_ref()
@@ -16466,17 +16570,21 @@ impl Model {
                 stream: &member.stream,
                 kernels: &member.kernels,
                 done: &tp.events[index],
+                read_done: &tp.read_events[index],
                 part: member.tp_partial.as_ref(),
             })
             .collect();
-        let out: Vec<&DevBuffer> = members.iter().map(|m| out_of(&m.bufs)).collect();
+        let out: Vec<&DevBuffer> = members.iter().map(|m| out_of(m)).collect();
         let acc: Vec<&DevBuffer> = tp.acc.iter().collect();
-        crate::cluster::all_reduce_f16(
-            &ranks,
-            &acc,
-            &out,
-            self.weights.descriptor.params.hidden_size,
-        )
+        crate::cluster::all_reduce_f16(&ranks, &acc, &out, elems)
+    }
+
+    fn decode_o_out(model: &Model) -> &DevBuffer {
+        &model.bufs.o_out
+    }
+
+    fn decode_down(model: &Model) -> &DevBuffer {
+        &model.bufs.down
     }
 
     /// Krok modelu hybrydowego rozłożony na rangi.
@@ -16507,11 +16615,11 @@ impl Model {
             for member in self.tp_members() {
                 member.hybrid_decode_mixer(l, &AttnSrc::Paged)?;
             }
-            self.tp_all_reduce(|b| &b.o_out)?;
+            self.tp_all_reduce(Self::decode_o_out, hidden)?;
             for member in self.tp_members() {
                 member.hybrid_decode_ffn(l)?;
             }
-            self.tp_all_reduce(|b| &b.down)?;
+            self.tp_all_reduce(Self::decode_down, hidden)?;
             for member in self.tp_members() {
                 member.hybrid_decode_residual(l)?;
             }
@@ -16562,11 +16670,11 @@ impl Model {
             for member in self.tp_members() {
                 member.dense_decode_mixer(l, src)?;
             }
-            self.tp_all_reduce(|b| &b.o_out)?;
+            self.tp_all_reduce(Self::decode_o_out, hidden)?;
             for member in self.tp_members() {
                 member.dense_decode_ffn(l)?;
             }
-            self.tp_all_reduce(|b| &b.down)?;
+            self.tp_all_reduce(Self::decode_down, hidden)?;
             for member in self.tp_members() {
                 member.dense_decode_residual(l)?;
             }
@@ -17058,6 +17166,9 @@ impl Model {
         // dwoma punktami redukcji, więc na randze z pociętymi wagami dałyby
         // wynik po cichu zły. Podział prowadzi prefill token po tokenie — przez
         // tę samą warstwę co dekodowanie, a więc z redukcjami na miejscu.
+        // Layer-major liczy warstwę własnym kodem, poza dwoma punktami redukcji,
+        // więc na randze z pociętymi wagami dałby wynik po cichu zły. Batchowy
+        // przechodzi przez te punkty i podział go używa.
         let split = self.tp.is_some();
         if !split && tokens.len() >= 32 && self.hybrid_layer_major_route_capable() {
             return self.prefill_hybrid_layer_major(seq, tokens);
@@ -17916,6 +18027,104 @@ impl Model {
         result
     }
 
+    /// Wgrywa wejścia jednego chunka batchowego prefill na TĘ rangę.
+    ///
+    /// Dane hosta są wspólne dla całego podziału (te same tokeny, te same
+    /// pozycje, ta sama tablica stron — strony przydziela wyłącznie ranga
+    /// zerowa), ale bufory przypięte i docelowe należą do rangi, więc każda
+    /// wykonuje wgranie u siebie.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_hybrid_batch_chunk(
+        &self,
+        chunk: &[u32],
+        base: usize,
+        t: usize,
+        page_table: &[i32],
+        ids: &[i32],
+        positions: &[i32],
+        visible_lens: &[i32],
+        staging_slot: usize,
+        wait_for_slot: bool,
+    ) -> Result<Event> {
+        let hidden_bytes = self.weights.descriptor.params.hidden_size * 2;
+        let p = &self.weights.descriptor.params;
+        let pb = self
+            .prefill_bufs
+            .as_ref()
+            .expect("bufory prefill są gotowe");
+        let hv = self
+            .hybrid_verify_bufs
+            .as_ref()
+            .expect("bufory hybrydowego prefill są gotowe");
+        let host_staging = &hv.host_staging[staging_slot];
+        let staging_ready = host_staging.ready.clone();
+        if wait_for_slot {
+            staging_ready.synchronize()?;
+        }
+        write_pinned(bytemuck::cast_slice(page_table), &host_staging.page_table)?;
+        write_pinned(bytemuck::cast_slice(ids), &host_staging.ids)?;
+        write_pinned(bytemuck::cast_slice(positions), &host_staging.positions)?;
+        write_pinned(bytemuck::cast_slice(visible_lens), &host_staging.visible_lens)?;
+        write_pinned(&(base as i32).to_le_bytes(), &host_staging.base_pos)?;
+        write_pinned(&(t as i32).to_le_bytes(), &host_staging.accepted)?;
+        let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
+            ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
+        })?;
+        let staging_buffer = &host_staging.embedding;
+        let staging = staging_buffer
+            .host_ptr()
+            .expect("pinned embedding ma mapowanie hosta");
+        for (row_index, &token) in chunk.iter().enumerate() {
+            let source = table
+                .get(token as usize * p.hidden_size..(token as usize + 1) * p.hidden_size)
+                .ok_or_else(|| {
+                    ForgeError::Scheduler(format!(
+                        "token id {token} wykracza poza embedding targetu"
+                    ))
+                })?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr() as *const u8,
+                    staging.add(row_index * hidden_bytes),
+                    hidden_bytes,
+                );
+            }
+        }
+        self.device.copy(
+            &host_staging.page_table,
+            0,
+            &self.page_table_dev,
+            0,
+            page_table.len() * 4,
+            &self.stream,
+        )?;
+        self.device
+            .copy(&host_staging.ids, 0, &pb.ids, 0, t * 4, &self.stream)?;
+        self.device.copy(
+            &host_staging.positions,
+            0,
+            &pb.positions,
+            0,
+            t * 4,
+            &self.stream,
+        )?;
+        self.device
+            .copy(&host_staging.base_pos, 0, &hv.base_pos, 0, 4, &self.stream)?;
+        self.device.copy(
+            &host_staging.visible_lens,
+            0,
+            &hv.visible_lens,
+            0,
+            t * 4,
+            &self.stream,
+        )?;
+        self.device
+            .copy(&host_staging.accepted, 0, &hv.accepted, 0, 4, &self.stream)?;
+        self.device
+            .copy(staging_buffer, 0, &pb.h, 0, t * hidden_bytes, &self.stream)?;
+        self.device.record_event(&staging_ready, &self.stream)?;
+        Ok(staging_ready)
+    }
     fn prefill_hybrid_batched(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(ForgeError::Scheduler("empty prefill chunk".into()));
@@ -17976,85 +18185,34 @@ impl Model {
                 let positions: Vec<i32> =
                     (base..base + t).map(|position| position as i32).collect();
                 let visible_lens: Vec<i32> = (base + 1..=base + t).map(|len| len as i32).collect();
-                let pb = self
-                    .prefill_bufs
-                    .as_ref()
-                    .expect("bufory prefill są gotowe");
-                let hv = self
-                    .hybrid_verify_bufs
-                    .as_ref()
-                    .expect("bufory hybrydowego prefill są gotowe");
                 let staging_slot = chunk_index % HYBRID_HOST_STAGING_SLOTS;
-                let host_staging = &hv.host_staging[staging_slot];
-                let staging_ready = host_staging.ready.clone();
-                if staging_recorded[staging_slot] {
-                    staging_ready.synchronize()?;
+                let staging_ready = self.stage_hybrid_batch_chunk(
+                    chunk,
+                    base,
+                    t,
+                    &page_table,
+                    &ids,
+                    &positions,
+                    &visible_lens,
+                    staging_slot,
+                    staging_recorded[staging_slot],
+                )?;
+                // Ta sama porcja wejść na pozostałych rangach; strumień
+                // rezydualny jest replikowany, więc każda musi dostać ten
+                // sam embedding, te same pozycje i tę samą tablicę stron.
+                for rank in self.tp_ranks() {
+                    rank.stage_hybrid_batch_chunk(
+                        chunk,
+                        base,
+                        t,
+                        &page_table,
+                        &ids,
+                        &positions,
+                        &visible_lens,
+                        staging_slot,
+                        staging_recorded[staging_slot],
+                    )?;
                 }
-                write_pinned(bytemuck::cast_slice(&page_table), &host_staging.page_table)?;
-                write_pinned(bytemuck::cast_slice(&ids), &host_staging.ids)?;
-                write_pinned(bytemuck::cast_slice(&positions), &host_staging.positions)?;
-                write_pinned(
-                    bytemuck::cast_slice(&visible_lens),
-                    &host_staging.visible_lens,
-                )?;
-                write_pinned(&(base as i32).to_le_bytes(), &host_staging.base_pos)?;
-                write_pinned(&(t as i32).to_le_bytes(), &host_staging.accepted)?;
-                let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
-                    ForgeError::Unsupported("hybrydowy target nie ma hostowego embeddingu".into())
-                })?;
-                let staging_buffer = &host_staging.embedding;
-                let staging = staging_buffer
-                    .host_ptr()
-                    .expect("pinned embedding ma mapowanie hosta");
-                for (row_index, &token) in chunk.iter().enumerate() {
-                    let source = table
-                        .get(token as usize * p.hidden_size..(token as usize + 1) * p.hidden_size)
-                        .ok_or_else(|| {
-                            ForgeError::Scheduler(format!(
-                                "token id {token} wykracza poza embedding targetu"
-                            ))
-                        })?;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            source.as_ptr() as *const u8,
-                            staging.add(row_index * hidden_bytes),
-                            hidden_bytes,
-                        );
-                    }
-                }
-                self.device.copy(
-                    &host_staging.page_table,
-                    0,
-                    &self.page_table_dev,
-                    0,
-                    page_table.len() * 4,
-                    &self.stream,
-                )?;
-                self.device
-                    .copy(&host_staging.ids, 0, &pb.ids, 0, t * 4, &self.stream)?;
-                self.device.copy(
-                    &host_staging.positions,
-                    0,
-                    &pb.positions,
-                    0,
-                    t * 4,
-                    &self.stream,
-                )?;
-                self.device
-                    .copy(&host_staging.base_pos, 0, &hv.base_pos, 0, 4, &self.stream)?;
-                self.device.copy(
-                    &host_staging.visible_lens,
-                    0,
-                    &hv.visible_lens,
-                    0,
-                    t * 4,
-                    &self.stream,
-                )?;
-                self.device
-                    .copy(&host_staging.accepted, 0, &hv.accepted, 0, 4, &self.stream)?;
-                self.device
-                    .copy(staging_buffer, 0, &pb.h, 0, t * hidden_bytes, &self.stream)?;
-                self.device.record_event(&staging_ready, &self.stream)?;
                 staging_recorded[staging_slot] = true;
 
                 self.profile_target_start()?;
