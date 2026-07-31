@@ -5286,7 +5286,9 @@
       "port": "Port",
       "pricing_title": "Pricing (optional)",
       "pricing_hint": "Rates for usage billing. Empty fields are skipped.",
-      "pricing_invalid": "Invalid pricing — values must be >= 0."
+      "pricing_invalid": "Invalid pricing — values must be >= 0.",
+      "ready_timeout": "Model load budget (s)",
+      "ready_timeout_hint": "Time for weights to load and /v1/models to answer. Exceeding it tears the whole cluster down. Default scales with weight size."
     }
   },
   "category": {

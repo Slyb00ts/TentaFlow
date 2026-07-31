@@ -23,7 +23,7 @@ use tentaflow_protocol::{
     MeshPairingStartResponse, MeshTrustRetrustRequest, MeshTrustRetrustResponse,
     MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody, ProtocolError, ProtocolErrorCode,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
 
@@ -1797,6 +1797,15 @@ async fn cdeploy_fail(
         MessageBody::ClusterDeployResponseBody(r) => r.message.unwrap_or(reason),
         _ => reason,
     };
+    // Log_bus zyje tylko dopoki ktos oglada strumien w UI. Bez wpisu w logu
+    // serwera nieudany deploy nie zostawial zadnego sladu — po zamknieciu
+    // przegladarki powod porazki byl nie do odtworzenia.
+    error!(
+        deployment_cluster_id = %deployment_cluster_id,
+        head_node_id = %head_node_id,
+        "distributed deploy FAILED: {}",
+        msg
+    );
     crate::deploy::log_bus::fail(
         &ctx.state.db,
         deployment_cluster_id,

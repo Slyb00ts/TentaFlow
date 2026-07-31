@@ -4181,7 +4181,11 @@
     "gpu_mode_specific_desc": "Indica qué GPUs asignar para este deployment.",
     "gpu_mode_none_title": "Solo CPU",
     "gpu_mode_none_desc": "El deployment no tocará las GPU — toda la inferencia en CPU.",
-    "gpu_list_hint": "GPUs disponibles ({n})"
+    "gpu_list_hint": "GPUs disponibles ({n})",
+    "cluster": {
+      "ready_timeout": "Presupuesto de carga (s)",
+      "ready_timeout_hint": "Tiempo para cargar los pesos y que /v1/models responda. Al superarlo se desmonta todo el cluster."
+    }
   },
   "category": {
     "engines": "Motores",

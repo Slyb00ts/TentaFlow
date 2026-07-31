@@ -5422,7 +5422,9 @@
       "port": "Port",
       "pricing_title": "Cennik (opcjonalnie)",
       "pricing_hint": "Stawki do rozliczeń zużycia. Puste pola pomijane.",
-      "pricing_invalid": "Nieprawidłowy cennik — wartości muszą być >= 0."
+      "pricing_invalid": "Nieprawidłowy cennik — wartości muszą być >= 0.",
+      "ready_timeout": "Budzet ladowania modelu (s)",
+      "ready_timeout_hint": "Czas na zaladowanie wag i odpowiedz /v1/models. Po przekroczeniu Core rozbiera caly klaster. Domyslnie skalowane z rozmiarem wag."
     }
   },
   "category": {

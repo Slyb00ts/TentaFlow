@@ -4181,7 +4181,11 @@
     "gpu_mode_specific_desc": "Wählen Sie welche GPUs für dieses Deployment reserviert werden.",
     "gpu_mode_none_title": "Nur CPU",
     "gpu_mode_none_desc": "Deployment ignoriert GPUs — Inferenz läuft auf der CPU.",
-    "gpu_list_hint": "Verfügbare GPUs ({n})"
+    "gpu_list_hint": "Verfügbare GPUs ({n})",
+    "cluster": {
+      "ready_timeout": "Modell-Ladebudget (s)",
+      "ready_timeout_hint": "Zeit bis die Gewichte geladen sind und /v1/models antwortet. Bei Ueberschreitung wird der ganze Cluster abgebaut."
+    }
   },
   "category": {
     "engines": "Engines",

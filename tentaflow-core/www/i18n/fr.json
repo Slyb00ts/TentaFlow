@@ -4181,7 +4181,11 @@
     "gpu_mode_specific_desc": "Indiquez quels GPU allouer pour ce déploiement.",
     "gpu_mode_none_title": "CPU uniquement",
     "gpu_mode_none_desc": "Pas de GPU — l’inférence tourne sur le processeur.",
-    "gpu_list_hint": "GPU disponibles ({n})"
+    "gpu_list_hint": "GPU disponibles ({n})",
+    "cluster": {
+      "ready_timeout": "Budget de chargement (s)",
+      "ready_timeout_hint": "Temps pour charger les poids et obtenir une reponse de /v1/models. Au-dela, tout le cluster est demonte."
+    }
   },
   "category": {
     "engines": "Moteurs",
