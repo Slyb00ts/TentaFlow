@@ -26,7 +26,11 @@ const PERSIST_GRID: u32 = 384;
 /// na paśmie tego CU, nie karty. Szerszy blok jest jedynym sposobem dołożenia
 /// równoległości bez rozbijania redukcji na dwa uruchomienia.
 fn norm_block(rows: usize, cols: usize) -> u32 {
-    if rows > 8 {
+    // Wyłącznie dekodowanie JEDNEGO wiersza. Szerszy blok zmienia kształt
+    // redukcji, więc każdy inny `rows` (weryfikacja MTP T>1, prefill, batch)
+    // musi zostać na dotychczasowym bloku — inaczej ta sama sekwencja liczy
+    // ostatnie bity inaczej niż ścieżka jednotokenowa.
+    if rows != 1 {
         return BLOCK;
     }
     let want = (cols.div_ceil(8)).next_power_of_two().clamp(64, 1024);
