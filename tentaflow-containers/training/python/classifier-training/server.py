@@ -828,11 +828,17 @@ def export(req: ExportRequest) -> dict[str, Any]:
         model.eval()
         dummy = torch.randn(1, 3, image_size, image_size)
         onnx_path = os.path.join(out_dir, "model.onnx")
+        # `dynamo=False` JEST WYMAGANE: od torch 2.9 domyślny jest eksporter
+        # torch.export, który zapisuje wagi OBOK grafu (`model.onnx` 0,25 MB +
+        # `model.onnx.data` 94 MB). Publikacja kopiuje wyłącznie plik `.onnx`, więc
+        # do rejestru trafiałby graf BEZ WAG — model ładowałby się (albo i nie) i
+        # zwracał bzdury. Eksporter TorchScript daje jeden samowystarczalny plik.
         torch.onnx.export(
             model, dummy, onnx_path,
             input_names=["input"], output_names=["logits"],
             opset_version=17,
             dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+            dynamo=False,
         )
         with open(os.path.join(out_dir, "classes.json"), "w", encoding="utf-8") as f:
             json.dump({"classes": req.values, "image_size": image_size}, f, ensure_ascii=False)

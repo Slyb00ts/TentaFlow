@@ -253,14 +253,27 @@ async fn run_export(base: &str, checkpoint_path: &str, output_dir: &str) -> anyh
     });
     let value: serde_json::Value =
         tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+            // `http_status_as_error(false)`: bez tego ureq zamienia 4xx/5xx na błąd
+            // BEZ treści odpowiedzi, a operator w GUI widział goły „http status: 500",
+            // podczas gdy serwis dokładnie opisał przyczynę w body. Czytamy status
+            // sami i przy błędzie dołączamy tę treść.
             let http: ureq::Agent = ureq::Agent::config_builder()
                 .timeout_global(Some(EXPORT_TIMEOUT))
+                .http_status_as_error(false)
                 .build()
                 .into();
             let mut resp = http
                 .post(&url)
                 .send_json(&body)
                 .map_err(|e| anyhow::anyhow!("POST {} failed: {}", url, e))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let detail = resp
+                    .body_mut()
+                    .read_to_string()
+                    .unwrap_or_else(|e| format!("<nie udało się odczytać treści: {e}>"));
+                anyhow::bail!("serwis odrzucił eksport ({}): {}", status, detail.trim());
+            }
             resp.body_mut()
                 .read_json()
                 .map_err(|e| anyhow::anyhow!("decode /export response: {}", e))
