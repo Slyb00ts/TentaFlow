@@ -1264,3 +1264,44 @@ zostaje sekwencyjny, który zgodność ZACHOWUJE.
 jak `gemm_f16_out_f32_bm32` stoi obok swojego wariantu f16). Dopiero on pozwoli
 podziałowi liczyć prefill przy T=128 i wtedy 2,45x zadziała na WŁAŚCIWEJ ścieżce.
 Q4_K_M potrzebuje tego samego dla Q4_K i Q6_K.
+
+## 9. Kernel z epilogiem f32 — prefill pod podziałem wchodzi na właściwą ścieżkę
+
+§8 kończyło się wnioskiem, że prefill odblokuje jeden kernel Mojo. Napisany i
+zmierzony: `gemm_nvfp4_gguf_wmma_out_f32_bm256{,_bn128}` w
+`src/nvfp4_gguf_wmma.mojo`. Różni się od wariantu f16 WYŁĄCZNIE typem wskaźnika
+wyjścia i jedną linią zapisu — ta sama matematyka, ten sam przepływ, brak
+zawężenia do f16.
+
+KOREKTA do §8: wzorem NIE była rodzina z `gemm.mojo` (`gemm_q8_0_out_f32_impl`
+obok `gemm_q8_0_impl`). Te warianty są oznaczone `# arch: nvidia` i NIE MA ICH w
+buildach AMD — na gfx1201 prefill NVFP4 liczy rodzina WMMA. Kernel powstał więc w
+niej i został zweryfikowany na tej karcie, a nie w rodzinie, której ta karta nie
+używa.
+
+| ścieżka (prompt 820 tokenów, `-n 32`) | przed | **teraz** |
+|---|--:|--:|
+| qwen3.6-27B NVFP4, 1 karta | 1,71 s | 1,71 s |
+| qwen3.6-27B NVFP4, **2 karty** | **17,12 s** | **1,79 s** |
+
+Prefill pod podziałem jest na równi z jednokartowym (różnica 4,7%), a
+dekodowanie zostaje na 45,2 wobec 33,7 tok/s. `--tp 2` przestał być użyteczny
+tylko dla krótkich promptów — to była jego główna wada z §8.
+
+Wygenerowany tekst jest IDENTYCZNY między jedną a dwiema kartami na prompcie
+długim (`b3a0c611…`, trzy przebiegi) i krótkim (`3446474217c2`).
+
+Q4_K_M nie dostaje tej ścieżki: jego macierze wierszowo równoległe to Q4_K
+(`attn_output`, `ssm_out`) i Q6_K (`ffn_down`), a wariantów WMMA z wyjściem f32
+dla nich jeszcze nie ma. `split_batch_prefill_capable` sprawdza to PER MODEL i
+schodzi na prefill sekwencyjny (16,9 s) zamiast odmawiać — bo sekwencyjny liczy
+to samo, tylko wolniej. Te dwa kernele to ta sama mechaniczna zmiana i jedyne, co
+dzieli Q4_K_M od parytetu.
+
+### Katalog kerneli nie budował się na HEAD
+
+Przy okazji: `build_kernels_catalog.mojo` miał pusty import z NIEISTNIEJĄCEGO
+modułu (`src/gemm_q6k_i8_multistage`), przez co parser odrzucał cały plik.
+Właściwym wejściem jest `build_kernels.mojo` (kompiluje w izolowanych jednostkach
+i dzieli je po błędzie offloadu), ale martwy import blokował też jego. Usunięty;
+katalog gfx1201 przechodzi i ma teraz 469 kerneli zamiast 467.
