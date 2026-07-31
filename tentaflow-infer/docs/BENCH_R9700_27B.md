@@ -796,9 +796,25 @@ token (22% kroku), a jego wariant Q6_K osiąga tylko **459 GB/s** przy suficie
 aktywację z pamięci od nowa, co przy 640 blokach dokłada ~22 MB do 58,9 MB wag.
 
 Podnoszenie `X_MAX` jest ODRZUCONE pomiarem (29,2 -> 28,1: większy bufor zabiera
-zajętość wszystkim kernelom dp4a). Rozwiązaniem jest staging aktywacji W DWÓCH
-KAWAŁKACH po <= 16384 kolumn z akumulacją iloczynu: LDS zostaje 20 KiB, a
-`ffn_down` wchodzi na dp4a. Wymaga wariantu `_dot_q4k_i8` / `_dot_q6k_i8` z
-zakresem bloków — waga indeksowana GLOBALNIE (krok wiersza z pełnej szerokości),
-a `xq`/`xds` LOKALNIE dla bieżącego kawałka. Szacunek z profilu: ~1,5 ms na
-token, czyli ~31,5 tok/s.
+zajętość wszystkim kernelom dp4a).
+
+**Staging w kawałkach też ODRZUCONY — zaimplementowany i zmierzony.**
+Powstały `gemv_q4_k_dp4a_wide_f16` i `gemv_q6_k_dp4a_wide_f16`: aktywacja
+stagingowana w dwóch turach po <= 16384 kolumn, iloczyn akumulowany między nimi,
+LDS nietknięte. Kernele są POPRAWNE — dają ten sam SHA co `ffn_down` przez dp4a
+z podniesionym `X_MAX`, czyli inna droga i identyczna matematyka. Ale nie dają
+NIC: Q6_K `ffn_down` 131,3 us wobec 128,2 us ścieżką f16, całość 30,2 wobec 30,1
+tok/s. Kod usunięty.
+
+Hipoteza, która to napędzała, była BŁĘDNA. Zakładałem, że wariant f16 marnuje
+pasmo, bo każdy z 640 bloków wierszy czyta aktywację z pamięci od nowa — ~22 MB
+dołożone do 58,9 MB wag. Ale aktywacja to 34,8 KiB i MIEŚCI SIĘ W CACHE: te
+odczyty nigdy nie szły do VRAM. Nie było czego odzyskiwać. To jest ten sam
+Infinity Cache, o którym wyżej napisano, że dekodowaniu nie pomaga — pomaga, ale
+małym danym wielokrotnie czytanym, nie strumieniowi wag.
+
+Co naprawdę ogranicza `ffn_down` (449-535 GB/s wobec ~620): wiersz ma 17408
+kolumn, czyli 68 superbloków, a macierz tylko 5120 wierszy, czyli 640 bloków
+roboczych. Długi szeregowy spacer po wierszu przy małej liczbie bloków nie ma
+czym ukryć opóźnienia. Lekarstwem jest podział wiersza między bloki (split-K) z
+redukcją, a nie zmiana sposobu stagingu aktywacji.
