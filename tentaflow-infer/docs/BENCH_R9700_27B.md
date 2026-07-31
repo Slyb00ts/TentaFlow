@@ -1138,40 +1138,66 @@ layer-major i batchowy liczą warstwę własnym kodem, poza punktami redukcji),
 głowa logitów jest replikowana, a spekulacja wyłączona. To są następne kroki, a
 nie regresje — każdy z nich podnosi liczbę, żaden jej nie psuje.
 
-## 6. Modele gęste pod podziałem — zmierzone, i wynik jest OSTRZEŻENIEM (2026-07-31)
+## 6. Modele gęste pod podziałem, i redukcja symetryczna (2026-07-31)
 
-Sterownik obejmuje już architektury gęste (`weights.rs` nie odrzuca `ssm.is_none()`).
-Loader tnie q/k/v PRZED sklejeniem ich w `QkvWeights::Fused`, więc scalony tensor
-rangi powstaje z jej własnych głowic. Dekodowanie idzie łańcuchem ROZDZIELONYM,
-bo scalony liczy `attn_o` i `ffn_down` przez `gemv_residual` — jednym kernelem
-razem z rezyduum, którego pod podziałem nie wolno dodać przed redukcją.
+Sterownik obejmuje już architektury gęste. Loader tnie q/k/v PRZED sklejeniem ich
+w `QkvWeights::Fused`, więc scalony tensor rangi powstaje z jej własnych głowic.
+Dekodowanie idzie łańcuchem ROZDZIELONYM, bo scalony liczy `attn_o` i `ffn_down`
+przez `gemv_residual` — jednym kernelem razem z rezyduum, którego pod podziałem
+nie wolno dodać przed redukcją.
 
-| model | 1 karta | 2 karty | |
+Pierwszy pomiar wyszedł ŹLE i to on wskazał właściwą poprawkę:
+
+| model | 1 karta | 2 karty (redukcja zbierająca) |
+|---|--:|--:|
+| bielik-7b Q4_K_M | 124,0 | 123,6 (0%) |
+| bielik-11b Q4_K_M | 86,1 | 92,5 (+7,4%) |
+| nemo-12b Q4_K_M | 78,0 | **67,0 (-14%)** |
+
+Podział zachodził naprawdę (32 -> 16 głowic, `inter` 11264 -> 5632), a mimo to
+nemo-12b TRACIŁ. Przy 7-12B krok ogranicza LICZBA URUCHOMIEŃ, nie odczyt wag, a
+redukcja zbierająca dokładała do niej trzy uruchomienia i dwie zależności między
+kartami na każdy z dwóch punktów redukcji w każdej warstwie.
+
+### Redukcja symetryczna: każda ranga sumuje u siebie
+
+Zamiast zwozić cząstki na jedną kartę, dodawać i rozgłaszać wynik, każda ranga
+czyta cudzą sumę cząstkową WPROST przez P2P i liczy pełną sumę u siebie. Dla
+dwóch kart to JEDNO uruchomienie na rangę (`add_f32_out_f16` nad dwoma
+wskaźnikami) zamiast kopii, dodawania i rozgłoszenia — i rangi przestają czekać
+na siebie po kolei. Kontrakt liczbowy bez zmian: suma w f32, jedno zawężenie do
+f16 na końcu.
+
+Bez P2P ta redukcja nie ma czym działać, więc `load_tp` ODMAWIA zamiast schodzić
+na wolniejszą drogę przez hosta — objazd kosztowałby więcej, niż podział daje.
+
+| model | 1 karta | **2 karty (symetryczna)** | |
 |---|--:|--:|---|
-| bielik-7b Q4_K_M | 124,0 | 123,6 | **0%** |
-| bielik-11b Q4_K_M | 86,1 | 92,5 | +7,4% |
-| nemo-12b Q4_K_M | 78,0 | **67,0** | **-14%** |
+| qwen3.6-27B Q4_K_M | 34,6 | **48,2** | **+39,3%** |
+| qwen3.6-27B NVFP4 | 33,7 | **44,6** | **+32,3%** |
+| nemo-12b Q4_K_M | 74,2 | **100,1** | **+34,9%** |
+| bielik-11b Q4_K_M | 77,4 | **101,3** | **+30,9%** |
+| bielik-7b Q4_K_M | 111,6 | **139,2** | **+24,7%** |
 
-**Podział opłaca się dopiero wtedy, gdy krok jest ograniczony ODCZYTEM WAG.**
-Przy 7-12B na tych kartach ogranicza go LICZBA URUCHOMIEŃ, a ta się nie dzieli —
-obie rangi płacą ten sam podatek, a redukcje dokładają do niego dwa punkty
-synchronizacji na warstwę. Dlatego nemo-12b (40 warstw) traci, bielik-11b ledwo
-zyskuje, a hybrydowy 27B z §5 zyskuje 26-35%. To jest dokładnie ten sam rachunek,
-który `TENSOR_PARALLEL_DESIGN.md` prowadzi dla przestoju: „podatek od liczby
-uruchomień jest wspólny dla obu rang i NIE maleje od dołożenia karty".
+Regresja nemo-12b zniknęła: -14% -> +34,9%. Pary 1/2 karty mierzone w jednym
+przebiegu, `-n 192`, ten sam prompt; liczby między przebiegami wahają się o
+kilka procent, więc porównywać wolno tylko wewnątrz pary.
 
-Wniosek praktyczny: `--tp 2` nie jest ustawieniem domyślnym dla modeli gęstych
-tej wielkości i nie wolno go tak reklamować. Do modeli 7-12B na dwóch R9700 nie
-warto go włączać.
+Suma SHA wygenerowanego tekstu obu checkpointów 27B jest IDENTYCZNA między jedną
+a dwiema kartami i NIE ZMIENIŁA SIĘ po przejściu na redukcję symetryczną
+(`9dda7847…` dla Q4_K_M) — czyli zmiana nie ruszyła ani jednego tokenu.
 
-Tekst modelu gęstego ROZJEŻDŻA SIĘ z jednokartowym po około 30 tokenach (przy
-hybrydowym 27B był identyczny). Zgadzające się 30 tokenów to sygnatura różnicy
+### Modele gęste: tekst nadal się rozjeżdża
+
+bielik-7b i nemo-12b dają INNY tekst na dwóch kartach niż na jednej (pierwsze
+kilkadziesiąt tokenów się zgadza, potem rozjazd). To sygnatura różnicy
 ZAOKRĄGLENIA, a nie złego podziału — źle pocięta macierz daje tekst-śmieć od
-pierwszego tokenu (tak wyglądała nieudana próba podziału DeltaNet po głowicach).
-Kolejność sumowania jest inna, więc bitowej zgodności nie obiecywano; przy 7B
-greedy jest na tyle czuły, że różnica ostatniego bitu wychodzi na powierzchnię.
-Właściwą bramką jest tu perplexity, a ta NIE ZOSTAŁA JESZCZE ZMIERZONA dla
-modeli gęstych — do czasu pomiaru podział gęsty należy uważać za niesprawdzony
+pierwszego tokenu. Kolejność sumowania jest inna, więc bitowej zgodności nie
+obiecywano; przy modelach tej wielkości greedy jest na tyle czuły, że różnica
+ostatniego bitu wychodzi na powierzchnię, a przy 27B nie wyszła.
+
+Właściwą bramką jest tu perplexity i ona NIE ZOSTAŁA JESZCZE ZMIERZONA dla
+modeli gęstych. Do czasu pomiaru podział gęsty jest sprawdzony WYKONAWCZO, nie
 jakościowo.
 
 Prefill gęsty pod podziałem idzie token po tokenie, tak samo jak hybrydowy i z

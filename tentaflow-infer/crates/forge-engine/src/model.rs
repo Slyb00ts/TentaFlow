@@ -1123,10 +1123,10 @@ struct TpSpmd {
     ranks: Vec<Model>,
     /// Zdarzenie każdej rangi (zerowej włącznie) do porządkowania redukcji.
     events: Vec<Event>,
-    /// Akumulator f32 redukcji, na karcie rangi zbierającej.
-    acc: DevBuffer,
-    /// Bufor przywożonej sumy cząstkowej, na karcie rangi zbierającej.
-    staging: DevBuffer,
+    /// Akumulator f32 KAŻDEJ rangi, na jej własnej karcie. Redukcja jest
+    /// symetryczna — każda ranga sumuje u siebie — więc nie ma jednej karty
+    /// zbierającej ani bufora na przywożone cząstki.
+    acc: Vec<DevBuffer>,
 }
 
 pub struct Model {
@@ -2615,10 +2615,13 @@ impl Model {
             model.tp_refuse_uncovered(&cfg)?;
             ranks.push(model);
         }
+        // Redukcja czyta cudzą sumę cząstkową WPROST, więc bez P2P nie ma jej
+        // czym wykonać. Objazd przez hosta i tak kosztowałby więcej, niż podział
+        // daje, więc to odmowa, a nie wolniejsza droga.
         if !crate::cluster::enable_peer_mesh(devices) {
-            tracing::warn!(
-                "rangi nie widzą swojej pamięci — obie redukcje na warstwę pójdą przez hosta"
-            );
+            return Err(ForgeError::Scheduler(
+                "podział na rangi wymaga, żeby karty widziały swoją pamięć (P2P)".into(),
+            ));
         }
         let mut zero = ranks.remove(0);
         let hidden = zero.weights.descriptor.params.hidden_size;
@@ -2626,12 +2629,14 @@ impl Model {
             .chain(ranks.iter())
             .map(|member| member.device.create_event())
             .collect::<Result<Vec<_>>>()?;
-        let acc = zero
-            .device
-            .alloc(hidden * 4, MemKind::Device, Pool::Activations)?;
-        let staging = zero
-            .device
-            .alloc(hidden * 4, MemKind::Device, Pool::Activations)?;
+        let acc = std::iter::once(&zero)
+            .chain(ranks.iter())
+            .map(|member| {
+                member
+                    .device
+                    .alloc(hidden * 4, MemKind::Device, Pool::Activations)
+            })
+            .collect::<Result<Vec<_>>>()?;
         tracing::info!(
             world,
             hidden,
@@ -2640,12 +2645,7 @@ impl Model {
             inter = zero.weights.descriptor.params.intermediate_size,
             "model podzielony na rangi; każda widzi swój fragment"
         );
-        zero.tp = Some(Box::new(TpSpmd {
-            ranks,
-            events,
-            acc,
-            staging,
-        }));
+        zero.tp = Some(Box::new(TpSpmd { ranks, events, acc }));
         Ok(zero)
     }
 
@@ -16470,11 +16470,10 @@ impl Model {
             })
             .collect();
         let out: Vec<&DevBuffer> = members.iter().map(|m| out_of(&m.bufs)).collect();
+        let acc: Vec<&DevBuffer> = tp.acc.iter().collect();
         crate::cluster::all_reduce_f16(
             &ranks,
-            0,
-            &tp.acc,
-            &tp.staging,
+            &acc,
             &out,
             self.weights.descriptor.params.hidden_size,
         )

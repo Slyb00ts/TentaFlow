@@ -491,57 +491,81 @@ pub fn reduce_partials(sum: Reduction<'_>) -> Result<()> {
     }
 }
 
-/// Redukcja z nogą rozgłoszenia: po niej KAŻDA ranga ma pełny wynik w f16.
+/// All-reduce SYMETRYCZNY: każda ranga sama sumuje wszystkie sumy cząstkowe,
+/// czytając cudze WPROST przez P2P.
 ///
-/// Tego wymaga podział SPMD, a nie sama redukcja: po projekcji wierszowo
-/// równoległej każda ranga liczy własny `rmsnorm_residual` na własnym strumieniu
-/// rezydualnym, więc zsumowany wektor musi trafić do każdej z nich. Rozgłoszenie
-/// to jedno zdarzenie karty zbierającej i po jednej kopii na pozostałe rangi —
-/// dla dwóch kart dokładnie jedna kopia.
+/// Wariant zbierający (`reduce_partials`) zwozi cząstki na jedną kartę, dodaje i
+/// rozgłasza wynik. To są trzy uruchomienia i dwie zależności między kartami na
+/// KAŻDY punkt redukcji, czyli przy 64 warstwach i dwóch punktach — setki
+/// uruchomień na token. A podatek od liczby uruchomień jest wspólny dla obu rang
+/// i NIE maleje od dołożenia karty, więc to on decyduje, czy podział coś daje.
+///
+/// Tutaj nie ma ani kopii, ani rozgłoszenia: dostęp P2P sprawia, że kernel rangi
+/// `r` może zdereferencjonować bufor rangi `s`, więc każda ranga liczy pełną
+/// sumę u siebie. Dla dwóch kart to JEDNO uruchomienie na rangę, a rangi
+/// przestają czekać na siebie po kolei — obie ruszają, gdy tylko cudza cząstka
+/// jest gotowa.
+///
+/// Kontrakt liczbowy zostaje ten sam: dodawanie idzie w f32, a zawężenie do f16
+/// jest jedno, na końcu.
 pub fn all_reduce_f16(
     ranks: &[ReduceRank<'_>],
-    gather_on: usize,
-    acc: &forge_hal::DevBuffer,
-    staging: &forge_hal::DevBuffer,
+    acc: &[&forge_hal::DevBuffer],
     out: &[&forge_hal::DevBuffer],
     elems: usize,
 ) -> Result<()> {
-    if out.len() != ranks.len() {
+    if out.len() != ranks.len() || acc.len() != ranks.len() {
         return Err(ForgeError::Scheduler(format!(
-            "all-reduce: {} rang wobec {} buforów wyjścia",
+            "all-reduce: {} rang wobec {} buforów wyjścia i {} akumulatorów",
             ranks.len(),
-            out.len()
+            out.len(),
+            acc.len()
         )));
     }
-    let source = ranks
-        .get(gather_on)
-        .ok_or_else(|| ForgeError::Scheduler(format!("all-reduce nie ma rangi {gather_on}")))?;
-    reduce_partials(Reduction {
-        ranks,
-        gather_on,
-        acc,
-        staging,
-        out_f16: Some(out[gather_on]),
-        elems,
-    })?;
-    let bytes = elems
-        .checked_mul(2)
-        .ok_or_else(|| ForgeError::Scheduler("all-reduce: przepełnienie rozmiaru wyniku".into()))?;
-    for index in 0..ranks.len() {
-        if index == gather_on {
-            continue;
-        }
-        source
-            .device
-            .copy(out[gather_on], 0, out[index], 0, bytes, source.stream)?;
+    let part = |index: usize| -> Result<&forge_hal::DevBuffer> {
+        ranks
+            .get(index)
+            .and_then(|r| r.part)
+            .ok_or_else(|| ForgeError::Scheduler(format!("brak sumy cząstkowej rangi {index}")))
+    };
+    // Najpierw KAŻDA ranga ogłasza, że jej cząstka jest zapisana. Dopiero potem
+    // ktokolwiek czeka — inaczej ranga zerowa czekałaby na zdarzenie, którego
+    // druga jeszcze nie zapisała, i redukcja by się zserializowała.
+    for rank in ranks {
+        rank.device.record_event(rank.done, rank.stream)?;
     }
-    if ranks.len() > 1 {
-        source.device.record_event(source.done, source.stream)?;
-        for (index, rank) in ranks.iter().enumerate() {
-            if index == gather_on {
-                continue;
+    for (index, rank) in ranks.iter().enumerate() {
+        let peers: Vec<usize> = (0..ranks.len()).filter(|&other| other != index).collect();
+        for &peer in &peers {
+            rank.device.wait_event(rank.stream, ranks[peer].done)?;
+        }
+        match peers.as_slice() {
+            // Jedna ranga: nie ma czego sumować, zostaje samo zawężenie.
+            [] => rank
+                .kernels
+                .cast_f32_f16(out[index], part(index)?, elems, rank.stream)?,
+            // Dwie karty: suma i zawężenie w JEDNYM uruchomieniu, bez
+            // akumulatora. Żadna ranga nie pisze po swojej cząstce, więc druga
+            // może ją czytać bez wyścigu.
+            [peer] => rank.kernels.add_f32_out_f16(
+                out[index],
+                part(index)?,
+                part(*peer)?,
+                elems,
+                rank.stream,
+            )?,
+            // Więcej kart: sumujemy do WŁASNEGO akumulatora, nigdy w miejsce
+            // cząstki — cudza ranga wciąż ją czyta.
+            [first, rest @ ..] => {
+                rank.kernels
+                    .add_f32(acc[index], part(index)?, part(*first)?, elems, rank.stream)?;
+                for &peer in rest {
+                    rank.kernels
+                        .add_f32(acc[index], acc[index], part(peer)?, elems, rank.stream)?;
+                }
+                rank.kernels
+                    .cast_f32_f16(out[index], acc[index], elems, rank.stream)?;
             }
-            rank.device.wait_event(rank.stream, source.done)?;
         }
     }
     Ok(())
