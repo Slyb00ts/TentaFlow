@@ -16300,7 +16300,6 @@ impl Model {
         let rep = n_v / n_k;
         let kernels = &self.kernels;
         let stream = &self.stream;
-        let b = &self.bufs;
         let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
         let st = self.active_ssm()[l]
             .as_ref()
@@ -16310,9 +16309,39 @@ impl Model {
         // lane'ów naraz. Konsumenci czytają swój wiersz przez przesunięcie
         // bajtowe, więc nie ma kopii do jednotokenowego scratchu.
         let qkv_off = lane * conv_dim * 2;
-        let z_off = lane * value_dim * 2;
         let head_off = lane * n_v * 2;
 
+        // Wstęp kroku — splot+SiLU, wycięcie v, normalizacje L2, powielenie GQA,
+        // log-decay i beta — mieści się w jednym uruchomieniu, gdy geometria
+        // pozwala podzielić pracę po głowicach K bez zależności między blokami.
+        // Łańcuch poniżej robi ~9 us pracy na warstwę w siedmiu uruchomieniach,
+        // a każde uruchomienie kosztuje jeszcze ~3,5 us przestoju.
+        if kernels.deltanet_step_prepare_capable(d_state, n_k, n_v) {
+            kernels.deltanet_step_prepare_f16(
+                &hb.q32,
+                &hb.k32,
+                &hb.vtok,
+                &hb.g,
+                &hb.beta_f,
+                &st.conv,
+                &hb.batched_qkv_mixed,
+                qkv_off,
+                &d.conv1d,
+                &hb.batched_alpha,
+                head_off,
+                &hb.batched_beta_raw,
+                head_off,
+                &d.dt_bias,
+                &d.a,
+                d_state,
+                n_k,
+                n_v,
+                d_conv,
+                eps,
+                stream,
+            )?;
+            return self.hybrid_delta_mixer_tail(d, lane, st);
+        }
         // Causal depthwise conv + SiLU (advances the conv window in place).
         kernels.deltanet_conv_silu_f16_at(
             &hb.conv_out,
@@ -16376,6 +16405,28 @@ impl Model {
             n_v,
             stream,
         )?;
+        self.hybrid_delta_mixer_tail(d, lane, st)
+    }
+
+    /// Rekurencja gated-delta, bramkowany RMSNorm wyjścia i projekcja wyjściowa
+    /// — część kroku wspólna dla ścieżki scalonego wstępu i łańcucha kerneli.
+    fn hybrid_delta_mixer_tail(
+        &self,
+        d: &DeltaNetWeights,
+        lane: usize,
+        st: &SsmState,
+    ) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.as_ref().expect("hybrid has ssm params");
+        let eps = p.rms_norm_eps;
+        let d_state = ssm.d_state;
+        let n_v = ssm.n_v_heads();
+        let z_off = lane * ssm.value_dim() * 2;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+
         // Rank-1 gated-delta recurrence (advances the state matrix in place).
         match self.delta_state_layout() {
             DeltaStateLayout::ValueKey => kernels.deltanet_value_key_scan_inplace_f16(

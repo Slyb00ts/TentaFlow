@@ -217,6 +217,95 @@ def deltanet_beta_sigmoid_f32(
     beta_out[h] = 1.0 / (1.0 + exp(-Float32(beta_in[h])))
 
 
+def deltanet_step_prepare_f16(
+    q_dst: UnsafePointer[Float16, MutAnyOrigin],
+    k_dst: UnsafePointer[Float16, MutAnyOrigin],
+    v_dst: UnsafePointer[Float16, MutAnyOrigin],
+    g_out: UnsafePointer[Float32, MutAnyOrigin],
+    beta_out: UnsafePointer[Float32, MutAnyOrigin],
+    win_io: UnsafePointer[Float16, MutAnyOrigin],
+    x_new: UnsafePointer[Float16, MutAnyOrigin],
+    conv_w: UnsafePointer[Float16, MutAnyOrigin],
+    alpha_in: UnsafePointer[Float16, MutAnyOrigin],
+    beta_in: UnsafePointer[Float16, MutAnyOrigin],
+    dt_bias: UnsafePointer[Float16, MutAnyOrigin],
+    a_scale: UnsafePointer[Float16, MutAnyOrigin],
+    d_state: Int,
+    n_k_heads: Int,
+    rep: Int,
+    d_conv: Int,
+    eps: Float32,
+):
+    """Caly wstep jednotokenowego kroku DeltaNet w JEDNYM uruchomieniu.
+
+    Zastepuje lancuch: splot+SiLU, wyciecie v, dwie normalizacje L2 glowic q/k,
+    powielenie q/k na glowice V, log-decay i bramke beta — siedem uruchomien na
+    warstwe, czyli 288 na token przy 48 warstwach. Kazde uruchomienie kosztuje
+    ~3,5 us przestoju niezaleznie od wykonanej pracy, wiec liczy sie ICH LICZBA:
+    same kernele robily ~9 us pracy na warstwe.
+
+    Podzial bez zaleznosci miedzy blokami: siatka to glowice K, a blok `h`
+    obsluguje kanaly splotu swojej glowicy q, swojej glowicy k oraz glowic V
+    `h + r*n_k_heads` — bo powielenie GQA mapuje glowice V na `v % n_k_heads`.
+    Suma kanalow to dokladnie `conv_dim`, wiec pokrycie jest pelne.
+
+    Blok ma `d_state` watkow, wiec `block_reduce_sum` redukuje tyle samo
+    wartosci w tej samej kolejnosci co `l2norm_heads_f16` — wynik jest bitowo
+    ten sam. Zaokraglenie do f16 przed suma kwadratow tez jest zachowane: tamten
+    kernel czytal juz zapisane wyjscie splotu.
+    """
+    h = Int(block_idx.x)
+    tid = Int(thread_idx.x)
+    key_dim = n_k_heads * d_state
+    win_n = d_conv - 1
+
+    # Splot przyczynowy jednego kanalu + SiLU, z obrotem okna w miejscu.
+    # Kolejnosc akumulacji i zaokraglen jak w `deltanet_conv_silu_f16`.
+    @parameter
+    def conv_silu_at(c: Int) -> Float32:
+        wbase = c * d_conv
+        sbase = c * win_n
+        var acc: Float32 = 0.0
+        for j in range(win_n):
+            acc += Float32(conv_w[wbase + j]) * Float32(win_io[sbase + j])
+        xn = Float32(x_new[c])
+        acc += Float32(conv_w[wbase + win_n]) * xn
+        for j in range(win_n - 1):
+            win_io[sbase + j] = win_io[sbase + j + 1]
+        if win_n > 0:
+            win_io[sbase + win_n - 1] = Float16(xn)
+        return _silu(acc)
+
+    q_raw = Float16(conv_silu_at(h * d_state + tid))
+    k_raw = Float16(conv_silu_at(key_dim + h * d_state + tid))
+    for r in range(rep):
+        v = h + r * n_k_heads
+        vv = Float16(conv_silu_at(2 * key_dim + v * d_state + tid))
+        v_dst[v * d_state + tid] = vv
+
+    qf = Float32(q_raw)
+    ssq = block_reduce_sum(qf * qf)
+    qn = Float16(qf * rsqrt(ssq + eps))
+    kf = Float32(k_raw)
+    ssk = block_reduce_sum(kf * kf)
+    kn = Float16(kf * rsqrt(ssk + eps))
+    for r in range(rep):
+        v = h + r * n_k_heads
+        q_dst[v * d_state + tid] = qn
+        k_dst[v * d_state + tid] = kn
+
+    if tid < rep:
+        v = h + tid * n_k_heads
+        x = Float32(alpha_in[v]) + Float32(dt_bias[v])
+        var sp: Float32
+        if x > 20.0:
+            sp = x
+        else:
+            sp = log(1.0 + exp(x))
+        g_out[v] = sp * Float32(a_scale[v])
+        beta_out[v] = 1.0 / (1.0 + exp(-Float32(beta_in[v])))
+
+
 def deltanet_repeat_qk_f16(
     q_dst: UnsafePointer[Float16, MutAnyOrigin],
     k_dst: UnsafePointer[Float16, MutAnyOrigin],

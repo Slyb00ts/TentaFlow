@@ -2619,6 +2619,101 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Czy scalony wstęp kroku DeltaNet ma artefakt i pasuje do geometrii.
+    ///
+    /// Podział bloków wymaga, żeby każda głowica V mapowała się na głowicę K
+    /// przez modulo `n_k`, czyli `n_v` musi być wielokrotnością `n_k`, a blok
+    /// ma `d_state` wątków — powyżej 1024 nie zmieściłby się w bloku.
+    pub fn deltanet_step_prepare_capable(
+        &self,
+        d_state: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+    ) -> bool {
+        self.artifacts.get("deltanet_step_prepare_f16").is_ok()
+            && n_k_heads > 0
+            && d_state > 0
+            && d_state <= 1024
+            && n_v_heads % n_k_heads == 0
+    }
+
+    /// Cały wstęp jednotokenowego kroku DeltaNet w jednym uruchomieniu:
+    /// splot+SiLU, wycięcie v, normalizacje L2 głowic q/k, powielenie GQA,
+    /// log-decay i bramka beta. Zastępuje siedem uruchomień na warstwę.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_step_prepare_f16(
+        &self,
+        q_dst: &DevBuffer,
+        k_dst: &DevBuffer,
+        v_dst: &DevBuffer,
+        g_out: &DevBuffer,
+        beta_out: &DevBuffer,
+        win_io: &DevBuffer,
+        x_new: &DevBuffer,
+        x_byte_off: usize,
+        conv_w: &DevBuffer,
+        alpha_in: &DevBuffer,
+        alpha_byte_off: usize,
+        beta_in: &DevBuffer,
+        beta_byte_off: usize,
+        dt_bias: &DevBuffer,
+        a_scale: &DevBuffer,
+        d_state: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        d_conv: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !self.deltanet_step_prepare_capable(d_state, n_k_heads, n_v_heads) {
+            return Err(ForgeError::Kernel(
+                "deltanet_step_prepare_f16: brak artefaktu albo geometria poza kontraktem".into(),
+            ));
+        }
+        let rep = n_v_heads / n_k_heads;
+        let value_span = checked_buffer_bytes("deltanet_step_prepare v", &[n_v_heads, d_state], 2)?;
+        if q_dst.len() < value_span || k_dst.len() < value_span || v_dst.len() < value_span {
+            return Err(ForgeError::Kernel(
+                "deltanet_step_prepare_f16: bufor q/k/v mniejszy od kształtu głowic V".into(),
+            ));
+        }
+        let conv_span = checked_buffer_bytes(
+            "deltanet_step_prepare wejscie",
+            &[n_k_heads * 2 + n_v_heads, d_state],
+            2,
+        )?;
+        if x_byte_off.checked_add(conv_span).is_none_or(|end| end > x_new.len()) {
+            return Err(ForgeError::Kernel(
+                "deltanet_step_prepare_f16: okno wejścia wykracza poza bufor".into(),
+            ));
+        }
+        let k = self.artifacts.get("deltanet_step_prepare_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_k_heads as u32, 1, 1),
+            block: (d_state as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(q_dst)
+            .buf(k_dst)
+            .buf(v_dst)
+            .buf(g_out)
+            .buf(beta_out)
+            .buf(win_io)
+            .buf_at(x_new, x_byte_off)?
+            .buf(conv_w)
+            .buf_at(alpha_in, alpha_byte_off)?
+            .buf_at(beta_in, beta_byte_off)?
+            .buf(dt_bias)
+            .buf(a_scale)
+            .scalar(d_state as i64)
+            .scalar(n_k_heads as i64)
+            .scalar(rep as i64)
+            .scalar(d_conv as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Powtarza bloki q/k głowic K `rep` razy do buforów głowic V (GQA).
     ///
     /// Zastępuje `2 * rep` kopii D2D JEDNYM uruchomieniem. Kopie były tanie w
