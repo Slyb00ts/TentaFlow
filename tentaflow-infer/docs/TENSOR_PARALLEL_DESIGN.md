@@ -292,9 +292,35 @@ dzieli się przez dwa — podatek od liczby uruchomień jest wspólny dla obu ra
 Krok wychodzi ~21 ms, czyli **47-48 tok/s wobec dzisiejszych 39,7**. Tyle jest do
 wzięcia i nie więcej; kto obiecuje 2x, nie policzył przestoju.
 
-## Sterownik: jedno niepodzielne lądowanie i jedna pułapka własności
+## Sterownik: WDROŻONY (2026-07-31)
 
-Fundament jest w drzewie i zabramkowany (kontrakt podziału, krojenie macierzy,
+Sterownik jest w drzewie i zmierzony na dwóch R9700: `forge run --tp 2` daje
+33,7 -> 42,4 tok/s (NVFP4) i 33,6 -> 45,5 tok/s (Q4_K_M), przy tekście
+IDENTYCZNYM co do znaku wobec jednej karty. Liczby i protokół:
+`BENCH_R9700_27B.md` §5.
+
+Wyszło to na trzech elementach opisanych niżej i na jednym ustaleniu, którego
+nie było w planie: `Model::logits_weight_gemv` miał już gotowy, ogólny dyspozytor
+GEMV z wyjściem f32 obsługujący Q4_K, Q6_K i NvFp4Gguf. Wystarczyło wydzielić z
+niego `gemv_out_f32` (cap i maska zostały u wołającego) — ŻADEN nowy kernel Mojo
+nie był potrzebny.
+
+Czego sterownik NIE prowadzi i co przez to ODMAWIA przy starcie: natywnego MTP,
+tieringu KV, MoE, modeli niehybrydowych, `--tp` niedzielącego głowic KV oraz FFN
+dla wielu tokenów. Prefill idzie token po tokenie, bo warianty layer-major i
+batchowy liczą warstwę własnym kodem, poza dwoma punktami redukcji. Głowa
+logitów jest replikowana (`load_hybrid` nie tnie `lm_head`), więc podział jej
+jeszcze nie przyspiesza — to następny krok, nie regresja.
+
+Dzisiejsza proteza `--tp-cards` NADAL JEST w drzewie obok sterownika. Nie wolno
+zostawić tego na stałe: to dwie implementacje tej samej rzeczy, a proteza jest tą
+gorszą (patrz cały początek tego dokumentu). Usunąć ją razem z
+`tensor_parallel.rs`, `tp_ffn` i przykładami `tp_*_probe`, gdy sterownik obejmie
+prefill.
+
+## Zapis stanu sprzed wdrożenia
+
+Fundament był w drzewie i zabramkowany (kontrakt podziału, krojenie macierzy,
 plan per rola, loader zweryfikowany na realnym checkpoincie, prymityw redukcji,
 warstwa rozcięta w dwóch punktach redukcji). Zostaje sterownik — i on NIE DZIELI
 SIĘ na mniejsze kroki, bo każdy z jego trzech elementów osobno jest kodem,
