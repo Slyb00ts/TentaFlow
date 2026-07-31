@@ -702,9 +702,40 @@ pub fn build_ort_session(
     device_id: i32,
     fp16: bool,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16)?
-        .commit_from_file(model_path)
-        .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display()))
+    let build = |with_trt: bool| -> Result<ort::session::Session> {
+        session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16, with_trt)?
+            .commit_from_file(model_path)
+            .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display()))
+    };
+    retry_without_tensorrt(build, &model_path.display().to_string())
+}
+
+/// Buduje sesję z TensorRT, a gdy TRT nie potrafi skompilować grafu — POWTARZA
+/// bez niego (CUDA→CPU).
+///
+/// TensorRT przejmuje węzły ZANIM zbuduje dla nich silnik. Gdy build padnie
+/// (`Error Code 10: Could not find any implementation for node ...`), ORT nie
+/// oddaje tych węzłów CUDA-zie — cały `commit` zwraca błąd i sesja nie powstaje.
+/// Bez tego ponowienia jeden model z nietypowym wzorcem grafu kładł CAŁĄ ścieżkę
+/// detekcji na głucho: każdy dispatch padał, a pętla analizy w kółko eksmitowała
+/// zawieszone joby (`forward stalled`, `analysed=0`). Model działający wolniej na
+/// CUDA jest nieskończenie lepszy od modelu, który nie działa wcale.
+fn retry_without_tensorrt<F>(build: F, model_label: &str) -> Result<ort::session::Session>
+where
+    F: Fn(bool) -> Result<ort::session::Session>,
+{
+    match build(true) {
+        Ok(session) => Ok(session),
+        Err(trt_err) => {
+            warn!(
+                "[ort] TensorRT nie zbudował silnika dla {model_label} ({trt_err}) — \
+                 ponawiam bez TensorRT (CUDA→CPU); ten model będzie wolniejszy"
+            );
+            build(false).map_err(|cuda_err| {
+                anyhow!("bez TensorRT też się nie udało: {cuda_err} (TensorRT: {trt_err})")
+            })
+        }
+    }
 }
 
 /// Like [`build_ort_session`] but committing from an in-memory model. Used by
@@ -717,9 +748,12 @@ pub fn build_ort_session_from_memory(
     device_id: i32,
     fp16: bool,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16)?
-        .commit_from_memory(model_bytes)
-        .map_err(|e| anyhow!("ort commit_from_memory: {e}"))
+    let build = |with_trt: bool| -> Result<ort::session::Session> {
+        session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16, with_trt)?
+            .commit_from_memory(model_bytes)
+            .map_err(|e| anyhow!("ort commit_from_memory: {e}"))
+    };
+    retry_without_tensorrt(build, "model z pamięci")
 }
 
 /// Whether the small OCR / classifier CRNN heads run in TensorRT FP16. Default
@@ -730,11 +764,14 @@ pub fn ocr_fp16() -> bool {
     crate::vision::settings::get().ocr_fp16
 }
 
+/// `with_tensorrt=false` pomija EP TensorRT — używane przy ponowieniu po
+/// nieudanym buildzie silnika (patrz [`retry_without_tensorrt`]).
 fn session_builder_with_eps(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     device_id: i32,
     fp16: bool,
+    with_tensorrt: bool,
 ) -> Result<ort::session::builder::SessionBuilder> {
     use ort::ep::{ExecutionProvider, ExecutionProviderDispatch};
     use ort::session::Session;
@@ -742,7 +779,7 @@ fn session_builder_with_eps(
     let mut eps: Vec<ExecutionProviderDispatch> = Vec::new();
 
     #[cfg(not(target_os = "macos"))]
-    {
+    if with_tensorrt {
         // TensorRT — najwyższy priorytet. Engine-cache trzyma zserializowane plany
         // silników na dysku (pierwszy forward po zmianie modelu/GPU buduje je od
         // nowa i jest wolny; kolejne wczytują z cache). FP16 dla przepustowości.
@@ -788,9 +825,13 @@ fn session_builder_with_eps(
             trt = trt.with_cuda_graph(true);
         }
         eps.push(trt.build());
-        // CUDA — dotychczasowa, działająca ścieżka; teraz MIĘKKO (bez
-        // error_on_failure), bo poprzedza ją TensorRT. Ten sam `device_id` co TRT,
-        // żeby fallback TRT→CUDA został na tej samej karcie.
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // CUDA — dotychczasowa, działająca ścieżka; MIĘKKO (bez error_on_failure),
+        // bo poprzedza ją TensorRT. Ten sam `device_id` co TRT, żeby zejście
+        // TRT→CUDA zostało na tej samej karcie. Rejestrowana ZAWSZE, także przy
+        // ponowieniu bez TensorRT — wtedy jest pierwszym wyborem.
         eps.push(ort::ep::CUDA::default().with_device_id(device_id).build());
     }
     #[cfg(target_os = "macos")]
