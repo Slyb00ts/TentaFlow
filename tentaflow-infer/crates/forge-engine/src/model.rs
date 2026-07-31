@@ -15966,6 +15966,66 @@ impl Model {
             .record_event(&self.staging_events[slot], &self.stream)
     }
 
+    /// Jedna warstwa kroku dekodowania modelu hybrydowego.
+    ///
+    /// Wydzielona z pętli, bo podział na rangi wykonuje warstwę NA KAŻDEJ z nich
+    /// i dopiero potem redukuje — a nie da się tego zrobić, dopóki ciało warstwy
+    /// żyje wyłącznie w środku pętli.
+    fn hybrid_decode_layer(&self, l: usize, src: &AttnSrc) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let n_layers = self.weights.layers.len();
+        let layer = &self.weights.layers[l];
+        match &layer.mixer {
+            LayerMixer::DeepseekAttention(_) => {
+                unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
+            }
+            LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, src)?,
+            LayerMixer::DeltaNet(d) => {
+                self.hybrid_delta_projections(l, d, &b.x, 1)?;
+                self.hybrid_delta_mixer(l, d, 0)?;
+            }
+        }
+        // Residual add (mixer output) + post-attention norm for the FFN.
+        kernels.rmsnorm_residual_f16(
+            &b.x,
+            &b.h,
+            &b.o_out,
+            &layer.ffn_norm,
+            1,
+            hidden,
+            eps,
+            stream,
+        )?;
+        match &layer.ffn {
+            LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream)?,
+            LayerFfn::Dense(ffn) => self.ffn_dense_block(
+                l,
+                ffn,
+                FfnBlockBufs {
+                    x: &b.x,
+                    gate: &b.gate,
+                    up: &b.up,
+                    act: &b.act,
+                    out: &b.down,
+                    gate_up: Some(&b.gate_up),
+                },
+                1,
+                stream,
+            )?,
+        }
+        let next_norm = if l + 1 < n_layers {
+            &self.weights.layers[l + 1].attn_norm
+        } else {
+            &self.weights.output_norm
+        };
+        kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)
+    }
+
     fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
         self.stage_hybrid_embedding(token_id)?;
         self.hybrid_forward_staged(want_logits, src)
@@ -15992,51 +16052,7 @@ impl Model {
         )?;
 
         for l in 0..n_layers {
-            let layer = &self.weights.layers[l];
-            match &layer.mixer {
-                LayerMixer::DeepseekAttention(_) => {
-                    unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
-                }
-                LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, &src)?,
-                LayerMixer::DeltaNet(d) => {
-                    self.hybrid_delta_projections(l, d, &b.x, 1)?;
-                    self.hybrid_delta_mixer(l, d, 0)?;
-                }
-            }
-            // Residual add (mixer output) + post-attention norm for the FFN.
-            kernels.rmsnorm_residual_f16(
-                &b.x,
-                &b.h,
-                &b.o_out,
-                &layer.ffn_norm,
-                1,
-                hidden,
-                eps,
-                stream,
-            )?;
-            match &layer.ffn {
-                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream)?,
-                LayerFfn::Dense(ffn) => self.ffn_dense_block(
-                    l,
-                    ffn,
-                    FfnBlockBufs {
-                        x: &b.x,
-                        gate: &b.gate,
-                        up: &b.up,
-                        act: &b.act,
-                        out: &b.down,
-                        gate_up: Some(&b.gate_up),
-                    },
-                    1,
-                    stream,
-                )?,
-            }
-            let next_norm = if l + 1 < n_layers {
-                &self.weights.layers[l + 1].attn_norm
-            } else {
-                &self.weights.output_norm
-            };
-            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
+            self.hybrid_decode_layer(l, &src)?;
 
             if self.hybrid_debug {
                 self.device.synchronize()?;
@@ -16044,7 +16060,7 @@ impl Model {
                 self.device.read(&b.h, 0, &mut hb)?;
                 let hf: &[f16] = bytemuck::cast_slice(&hb);
                 let norm: f32 = hf.iter().map(|v| v.to_f32().powi(2)).sum::<f32>().sqrt();
-                let kind = if matches!(layer.mixer, LayerMixer::DeltaNet(_)) {
+                let kind = if matches!(self.weights.layers[l].mixer, LayerMixer::DeltaNet(_)) {
                     "delta"
                 } else {
                     "attn"
