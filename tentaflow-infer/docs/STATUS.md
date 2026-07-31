@@ -12,6 +12,39 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Sufit dekodowania na R9700 jest ZMIERZONY i nie jest tam, gdzie zakładał
+  rachunek pasma (2026-07-31).** Rachunek `16,1 GB / 552 GB/s = 34,1 tok/s`
+  milcząco zakładał, że każdy bajt idzie pełnym pasmem. Nie idzie: mikrobenchmark
+  na ZIMNYM DRAM odtwarza czasy kerneli z modelu co do mikrosekundy i pokazuje,
+  że pasmo rośnie MONOTONICZNIE z czasem trwania kernela — 14,7 MB daje 473 GB/s,
+  100 MB 582, 401 MB 597, a 1,04 GB (`lm_head`) 629. Krok dekodowania to 257
+  uruchomień GEMV po 39-177 us, więc siedzi na 450-570 GB/s i żadnym
+  kafelkowaniem się tego nie podnosi. Do tego dochodzi jednorodny podatek
+  **3,5 us przestoju na KAŻDE uruchomienie** (1028 przerw na token, wszystkie w
+  paśmie 2-5 us) — grafu HIP to nie zdejmuje, bo koszt jest po stronie GPU.
+  Jedyna dźwignia to MNIEJ KERNELI. Zrobione: scalony wstęp kroku DeltaNet
+  (7 uruchomień na warstwę w 1, bitowo zgodny), szerszy blok normy przy
+  dekodowaniu jednego wiersza, siatka trwała dla wąskich GEMV-ów — razem
+  1033 -> 745 uruchomień na token. Wynik przy niezmienionej sumie SHA
+  `0bf2b86b…` we wszystkich czterech komórkach: Q4_K_M **30,0 -> 30,8**,
+  NVFP4 **30,0 -> 30,7**, obie ścieżki MTP na remisie (58,6 i 70,0 — weryfikacja
+  T=4 miała te kernele scalone od początku). Zostało fuzji za ~0,9 ms, czyli
+  okolice 31,8 tok/s; **34 tok/s na jednej karcie dla tego checkpointu nie jest
+  osiągalne** i przez tę ścianę przechodzi się wyłącznie spekulacją albo drugą
+  kartą. Pomiary, pułapka Infinity Cache i złapana regresja MTP:
+  `docs/BENCH_R9700_27B.md`.
+- ❌ **Dwie karty: 39,7 tok/s zamiast możliwych ~50, i wiadomo dlaczego
+  (2026-07-31).** Podział obejmuje 88,5% czytanych bajtów, więc karta modelu
+  powinna kończyć krok w ~20 ms; mierzymy 25,2. Profil obu agentów: karta 0 ma
+  **1290 uruchomień na token wobec 745 jednokartowych** i **182 kopie D2D**
+  (jednokartowo: 5), a jej zajętość to 20,1 ms wobec 13,0 ms karty
+  wspierającej. Nadwyżka NIE jest złym stosunkiem podziału — sweep `--tp-split`
+  pokazuje, że równy podział jest najlepszy — tylko pracą NIEPODZIELONĄ
+  (projekcje uwagi, `ssm_out`, cały mikser DeltaNet, normy): ~5,6 ms. To
+  domyka rachunek za `TENSOR_PARALLEL_DESIGN.md`: dokładanie kolejnych macierzy
+  do dzisiejszej protezy DOKŁADA kopie zamiast je usuwać, więc następnym krokiem
+  jest SPMD, a nie kolejne wpięcie.
+
 - ❌ **llama.cpp bije nas na Radeonie w prefillu hybrydowym: 7x na 0,8B i 26x
   na 27B (2026-07-27).** Pierwsze porównanie na RX 7900 XT z llama.cpp
   zbudowanym pod ROCm/gfx1100 (`ff067f76`). Qwen3.6-27B NVFP4 MTP, model w
