@@ -844,8 +844,12 @@ pub async fn stop(
     // Process shutdown: only the process-owning transports actually have a PID.
     if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
         if let Some(pid) = svc.runtime_pid {
-            // SIGTERM with short grace then SIGKILL — handled inside terminate.
-            let _ = crate::deploy::process_ctl::terminate(pid as u32);
+            // SIGTERM → grace → SIGKILL, i to dla CALEJ GRUPY, nie tylko lidera:
+            // `terminate` przestaje pilnowac, gdy zginie rodzic, a workery vLLM
+            // (`EngineCore`) schodza wolniej i zostawaly osierocone, trzymajac
+            // VRAM. Nastepny deploy widzial wtedy mniej wolnej pamieci i padal.
+            // Sweep po porcie ponizej ich NIE lapie — worker nie slucha na porcie.
+            let _ = crate::deploy::process_ctl::terminate_group(pid as u32);
         }
         // Belt-and-suspenders: `terminate(runtime_pid)` misses the real port-holder
         // when the tracked PID is stale/None (crash + un-recorded respawn) or when a
