@@ -1139,6 +1139,15 @@ pub struct Model {
     hybrid_verify_graph_disabled: HashSet<(usize, usize)>,
     /// FFN rozłożony na karty. `None` = cały model liczy jedna karta.
     tp_ffn: Option<crate::tensor_parallel::TpDecode>,
+    /// Suma cząstkowa tej rangi w f32, `[hidden]`. `Some` wyłącznie wtedy, gdy
+    /// model jest fragmentem podziału tensor-parallel (`world > 1`).
+    ///
+    /// Obecność tego bufora JEST przełącznikiem: macierz wierszowo równoległa
+    /// (`attn_output`, `ssm_out`, `ffn_down`) pisze do niego w f32 zamiast do
+    /// swojego bufora f16, bo jej wynik to dopiero połowa sumy. Zawężenie do f16
+    /// robi redukcja, po zsumowaniu — jedno zaokrąglenie, tak jak na jednej
+    /// karcie.
+    tp_partial: Option<DevBuffer>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
     /// Przechwycony krok dekodowania modelu hybrydowego (qwen35/DeltaNet).
@@ -3049,6 +3058,10 @@ impl Model {
         let staging_events = (0..STAGING_SLOTS)
             .map(|_| device.create_event())
             .collect::<Result<Vec<_>>>()?;
+        let tp_partial = match cfg.tp_shard.world {
+            1 => None,
+            _ => Some(device.alloc(hidden * 4, MemKind::Device, Pool::Activations)?),
+        };
         let mut model = Model {
             stage_first_layer: cfg.layer_range.map(|(first, _)| first).unwrap_or(0),
             device,
@@ -3072,6 +3085,7 @@ impl Model {
             hybrid_verify_graphs: HashMap::new(),
             hybrid_verify_graph_disabled: HashSet::new(),
             tp_ffn: None,
+            tp_partial,
             decode_graph: None,
             decode_hybrid_graph: None,
             decode_moe_graph: None,
@@ -4974,11 +4988,68 @@ impl Model {
         weight: &DevWeight,
         stream: &Stream,
     ) -> Result<()> {
+        self.gemv_out_f32(y_f32, y_off, x, x_off, weight, stream)?;
+        // Ograniczenie logitów (Gemma): cap * tanh(x / cap). Nakładane tutaj, bo
+        // to jedyne wyjście głowy — sampling i logprob widzą już wartości po capie.
+        let cap = self.weights.descriptor.params.final_logit_softcap;
+        if cap > 0.0 {
+            self.kernels
+                .softcap_f32(y_f32, y_off, weight.rows(), cap, stream)?;
+        }
+        // Maska tokenów zabronionych: kopie stream-ordered z jednoelementowego
+        // bufora -inf, więc mieszczą się w przechwytywanym grafie decode.
+        if let Some(neg_inf) = &self.weights.neg_inf {
+            for &id in &self.weights.descriptor.params.suppress_tokens {
+                let slot = y_off + id as usize;
+                if slot < y_off + weight.rows() {
+                    self.device.copy(neg_inf, 0, y_f32, slot * 4, 4, stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Macierz WIERSZOWO równoległa: `attn_output`, `ssm_out` i `ffn_down`.
+    ///
+    /// Na jednej karcie to zwykła projekcja do bufora f16. Gdy model jest rangą
+    /// podziału, ta sama macierz ma podzielone WEJŚCIE, więc jej wynik to suma
+    /// cząstkowa — idzie w f32 do bufora rangi i czeka na redukcję, która dopiero
+    /// zapisze `dst`. To są jedyne trzy miejsca, w których cokolwiek przechodzi
+    /// między kartami.
+    fn row_parallel_gemv(
+        &self,
+        dst: &DevBuffer,
+        w: &DevWeight,
+        x: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        match &self.tp_partial {
+            Some(partial) => self.gemv_out_f32(partial, 0, x, 0, w, stream),
+            None => self.gemv(dst, w, x, stream),
+        }
+    }
+
+    /// Projekcja z wyjściem f32, bez obróbki właściwej głowie logitów.
+    ///
+    /// Ma dwóch wołających i oba potrzebują dokładnie tego samego: głowa logitów
+    /// (która dokłada cap i maskę) oraz macierz WIERSZOWO równoległa podziału na
+    /// rangi, której wynik jest sumą CZĄSTKOWĄ. Kontrakt liczbowy podziału
+    /// wymaga, żeby ranga akumulowała w f32 i żeby zawężenie do f16 nastąpiło
+    /// dopiero PO sumie — czyli dokładnie tego, co daje ta rodzina kerneli.
+    fn gemv_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        y_off: usize,
+        x: &DevBuffer,
+        x_off: usize,
+        weight: &DevWeight,
+        stream: &Stream,
+    ) -> Result<()> {
         if (y_off != 0 || x_off != 0)
             && !matches!(weight, DevWeight::Q4K { .. } | DevWeight::Q6K { .. })
         {
             return Err(ForgeError::Unsupported(
-                "gemv głowy logitów z offsetem lane obsługuje tylko Q4_K/Q6_K".into(),
+                "gemv z wyjściem f32 i offsetem lane obsługuje tylko Q4_K/Q6_K".into(),
             ));
         }
         let out = match weight {
@@ -4987,7 +5058,7 @@ impl Model {
             // z mikserem DeepSeeka.
             DevWeight::Fp8Row { .. } => {
                 return Err(ForgeError::Unsupported(
-                    "głowa logitów nie obsługuje jeszcze wag FP8 ze skalą wierszową".into(),
+                    "wagi FP8 ze skalą wierszową nie mają GEMV z wyjściem f32".into(),
                 ))
             }
             DevWeight::F16 { buf, rows, cols } => self
@@ -5066,7 +5137,7 @@ impl Model {
                 .kernels
                 .gemv_iq1_m_out_f32(y_f32, buf, x, *rows, *cols, stream),
             DevWeight::NvFp4 { .. } => Err(ForgeError::Unsupported(
-                "NVFP4 lm_head has no f32-logit kernel yet".into(),
+                "NVFP4 compressed-tensors nie ma kernela GEMV z wyjściem f32".into(),
             )),
             DevWeight::NvFp4Gguf {
                 buf,
@@ -5079,7 +5150,7 @@ impl Model {
                     y_f32
                 } else {
                     return Err(ForgeError::Unsupported(
-                        "głowa logitów nie obsługuje TileN128K64".into(),
+                        "GEMV z wyjściem f32 nie obsługuje TileN128K64".into(),
                     ));
                 },
                 buf,
@@ -5090,25 +5161,7 @@ impl Model {
                 stream,
             ),
         };
-        out?;
-        // Ograniczenie logitów (Gemma): cap * tanh(x / cap). Nakładane tutaj, bo
-        // to jedyne wyjście głowy — sampling i logprob widzą już wartości po capie.
-        let cap = self.weights.descriptor.params.final_logit_softcap;
-        if cap > 0.0 {
-            self.kernels
-                .softcap_f32(y_f32, y_off, weight.rows(), cap, stream)?;
-        }
-        // Maska tokenów zabronionych: kopie stream-ordered z jednoelementowego
-        // bufora -inf, więc mieszczą się w przechwytywanym grafie decode.
-        if let Some(neg_inf) = &self.weights.neg_inf {
-            for &id in &self.weights.descriptor.params.suppress_tokens {
-                let slot = y_off + id as usize;
-                if slot < y_off + weight.rows() {
-                    self.device.copy(neg_inf, 0, y_f32, slot * 4, 4, stream)?;
-                }
-            }
-        }
-        Ok(())
+        out
     }
 
     /// Batched GEMM over row-major activations x[t][col].
@@ -5208,8 +5261,17 @@ impl Model {
             }
         }
         if n_tokens == 1 {
-            self.gemv(bufs.out, &ffn.down, bufs.act, stream)
+            self.row_parallel_gemv(bufs.out, &ffn.down, bufs.act, stream)
         } else {
+            if self.tp_partial.is_some() {
+                // Ranga ma pocięte `down`, więc wynik wielu tokenów też jest sumą
+                // cząstkową — a wariant GEMM nie ma jeszcze wyjścia f32 ani punktu
+                // redukcji. Milczące policzenie go dałoby tekst-śmieć bez żadnego
+                // błędu, więc ścieżka odmawia zamiast zgadywać.
+                return Err(ForgeError::Unsupported(
+                    "podział na rangi nie obejmuje jeszcze FFN dla wielu tokenów".into(),
+                ));
+            }
             self.gemm(bufs.out, &ffn.down, bufs.act, n_tokens, stream)
         }
     }
@@ -16244,7 +16306,7 @@ impl Model {
         // Output gate: out = attn ⊙ sigmoid(gate), applied on-device so the
         // whole mixer stays on the compute stream (no per-layer host sync).
         kernels.sigmoid_mul_f16(&hb.gated, &b.attn_out, &hb.gatec, q_dim, stream)?;
-        self.gemv(&b.o_out, &a.attn_o, &hb.gated, stream)?;
+        self.row_parallel_gemv(&b.o_out, &a.attn_o, &hb.gated, stream)?;
         Ok(())
     }
 
@@ -16522,7 +16584,7 @@ impl Model {
             eps,
             stream,
         )?;
-        self.gemv(&b.o_out, &d.out_proj, &hb.normed, stream)?;
+        self.row_parallel_gemv(&b.o_out, &d.out_proj, &hb.normed, stream)?;
         Ok(())
     }
 
