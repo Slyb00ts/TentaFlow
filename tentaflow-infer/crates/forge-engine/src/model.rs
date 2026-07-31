@@ -15968,30 +15968,44 @@ impl Model {
 
     /// Jedna warstwa kroku dekodowania modelu hybrydowego.
     ///
-    /// Wydzielona z pętli, bo podział na rangi wykonuje warstwę NA KAŻDEJ z nich
-    /// i dopiero potem redukuje — a nie da się tego zrobić, dopóki ciało warstwy
-    /// żyje wyłącznie w środku pętli.
+    /// Rozcięta na trzy części DOKŁADNIE w punktach, w których macierz wierszowo
+    /// równoległa kończy się sumą cząstkową: po projekcji wyjściowej miksera i
+    /// po `down` FFN. Podział na rangi wstawia tam redukcję, a jedna karta
+    /// wywołuje te trzy części jedna po drugiej i nie widzi różnicy.
+    ///
+    /// To nie jest podział kosmetyczny — te dwa miejsca są jedynymi, w których
+    /// cokolwiek przechodzi między kartami, i wynikają z kształtu warstwy:
+    /// kolumnowa -> lokalne przetwarzanie -> wierszowa -> redukcja.
     fn hybrid_decode_layer(&self, l: usize, src: &AttnSrc) -> Result<()> {
-        let p = &self.weights.descriptor.params;
-        let hidden = p.hidden_size;
-        let eps = p.rms_norm_eps;
-        let kernels = &self.kernels;
-        let stream = &self.stream;
+        self.hybrid_decode_mixer(l, src)?;
+        self.hybrid_decode_ffn(l)?;
+        self.hybrid_decode_residual(l)
+    }
+
+    /// Część 1: mikser warstwy, do projekcji wyjściowej włącznie.
+    fn hybrid_decode_mixer(&self, l: usize, src: &AttnSrc) -> Result<()> {
         let b = &self.bufs;
-        let n_layers = self.weights.layers.len();
-        let layer = &self.weights.layers[l];
-        match &layer.mixer {
+        match &self.weights.layers[l].mixer {
             LayerMixer::DeepseekAttention(_) => {
                 unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
             }
-            LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, src)?,
+            LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, src),
             LayerMixer::DeltaNet(d) => {
                 self.hybrid_delta_projections(l, d, &b.x, 1)?;
-                self.hybrid_delta_mixer(l, d, 0)?;
+                self.hybrid_delta_mixer(l, d, 0)
             }
         }
-        // Residual add (mixer output) + post-attention norm for the FFN.
-        kernels.rmsnorm_residual_f16(
+    }
+
+    /// Część 2: rezyduum miksera, norma przed FFN i cały blok FFN do `down`.
+    fn hybrid_decode_ffn(&self, l: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let layer = &self.weights.layers[l];
+        self.kernels.rmsnorm_residual_f16(
             &b.x,
             &b.h,
             &b.o_out,
@@ -16002,7 +16016,7 @@ impl Model {
             stream,
         )?;
         match &layer.ffn {
-            LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream)?,
+            LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, l, hidden, stream),
             LayerFfn::Dense(ffn) => self.ffn_dense_block(
                 l,
                 ffn,
@@ -16016,14 +16030,32 @@ impl Model {
                 },
                 1,
                 stream,
-            )?,
+            ),
         }
+    }
+
+    /// Część 3: rezyduum FFN i norma wejścia następnej warstwy.
+    fn hybrid_decode_residual(&self, l: usize) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let b = &self.bufs;
+        let n_layers = self.weights.layers.len();
         let next_norm = if l + 1 < n_layers {
             &self.weights.layers[l + 1].attn_norm
         } else {
             &self.weights.output_norm
         };
-        kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)
+        self.kernels.rmsnorm_residual_f16(
+            &b.x,
+            &b.h,
+            &b.down,
+            next_norm,
+            1,
+            hidden,
+            eps,
+            &self.stream,
+        )
     }
 
     fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
