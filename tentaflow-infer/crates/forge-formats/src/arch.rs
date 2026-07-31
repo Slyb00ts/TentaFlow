@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use forge_types::{ForgeError, Result};
+use forge_types::{ForgeError, QuantKind, Result};
 use serde::Deserialize;
 
 use crate::gguf::Gguf;
@@ -2282,5 +2282,203 @@ mod tp_shard_tests {
     fn ranga_poza_swiatem_jest_bledem() {
         assert!(TpShard::new(2, 2).is_err());
         assert!(TpShard::new(0, 0).is_err());
+    }
+}
+
+/// Geometria bloku kwantyzacji: ile wartości i ile bajtów zajmuje jeden blok.
+///
+/// Podział tensor-parallel tnie macierze bez dekwantyzacji, więc musi znać
+/// dokładnie tę jedną rzecz. Lista jest świadomie WĄSKA — to formaty, w których
+/// leżą checkpointy objęte podziałem. Każdy inny ma tu paść głośno, a nie zostać
+/// pocięty regułą, której nikt nie sprawdził na danych.
+pub fn block_geometry(quant: QuantKind) -> Result<(usize, usize)> {
+    Ok(match quant {
+        QuantKind::None => (1, 2),
+        QuantKind::Q8_0 => (32, 34),
+        QuantKind::Q4K => (256, 144),
+        QuantKind::Q6K => (256, 210),
+        QuantKind::NVFP4Gguf => (64, 36),
+        other => {
+            return Err(fmt_err(format!(
+                "podział tensor-parallel nie zna geometrii bloku {other:?}"
+            )));
+        }
+    })
+}
+
+/// Macierz `[rows, cols]` w formacie blokowym, krojona na rangi bez
+/// dekwantyzacji.
+///
+/// Dwa kierunki cięcia wynikają wprost z tego, który wymiar jest dzielony:
+///
+/// - macierz **kolumnowo równoległa** (dzielone WYJŚCIE) tnie WIERSZE, a wynik
+///   zostaje lokalny. Wiersze leżą ciągle w każdym formacie blokowym, więc
+///   wycinek to sklejenie zakresów bajtów;
+/// - macierz **wierszowo równoległa** (dzielone WEJŚCIE) tnie KOLUMNY, czyli
+///   wycinek WEWNĄTRZ każdego wiersza. Dlatego granica musi paść na blok:
+///   inaczej wycinek zaczynałby się w środku bloku, a jego skala opisywałaby
+///   wagi, których na tej randze nie ma.
+pub struct BlockMatrix<'a> {
+    pub data: &'a [u8],
+    pub rows: usize,
+    pub cols: usize,
+    pub quant: QuantKind,
+}
+
+impl BlockMatrix<'_> {
+    fn geometry(&self) -> Result<(usize, usize, usize)> {
+        let (values, block_bytes) = block_geometry(self.quant)?;
+        if !self.cols.is_multiple_of(values) {
+            return Err(fmt_err(format!(
+                "podział: {} kolumn nie jest wielokrotnością bloku {values}",
+                self.cols
+            )));
+        }
+        let row_bytes = (self.cols / values) * block_bytes;
+        let expected = self.rows * row_bytes;
+        if self.data.len() != expected {
+            return Err(fmt_err(format!(
+                "podział: [{}, {}] w {:?} ma zajmować {expected} B, a tensor ma {} B",
+                self.rows,
+                self.cols,
+                self.quant,
+                self.data.len()
+            )));
+        }
+        Ok((values, block_bytes, row_bytes))
+    }
+
+    /// Wycinek WIERSZY: skleja podane zakresy W PODANEJ KOLEJNOŚCI.
+    ///
+    /// Kolejność jest częścią kontraktu, a nie kosmetyką. Głowice V DeltaNet idą
+    /// klasami reszty (`TpShard::v_head_order`), więc ranga dostaje kilka
+    /// rozłącznych przebiegów, które muszą trafić do wag dokładnie w tej
+    /// kolejności, w jakiej numeruje je kernel. Odwrotna kolejność nie daje
+    /// błędu — daje cudze wagi pod właściwą głowicą.
+    pub fn take_rows(&self, ranges: &[(usize, usize)]) -> Result<Vec<u8>> {
+        let (_, _, row_bytes) = self.geometry()?;
+        let mut out =
+            Vec::with_capacity(ranges.iter().map(|(_, count)| count * row_bytes).sum::<usize>());
+        for &(first, count) in ranges {
+            let end = first
+                .checked_add(count)
+                .ok_or_else(|| fmt_err("podział wierszy: przepełnienie zakresu"))?;
+            if end > self.rows {
+                return Err(fmt_err(format!(
+                    "podział wierszy: zakres [{first}, {end}) wykracza poza {} wierszy",
+                    self.rows
+                )));
+            }
+            out.extend_from_slice(&self.data[first * row_bytes..end * row_bytes]);
+        }
+        Ok(out)
+    }
+
+    /// Wycinek KOLUMN, ten sam w każdym wierszu. Granice muszą paść na blok.
+    pub fn take_cols(&self, first: usize, count: usize) -> Result<Vec<u8>> {
+        let (values, block_bytes, row_bytes) = self.geometry()?;
+        if !first.is_multiple_of(values) || !count.is_multiple_of(values) {
+            return Err(fmt_err(format!(
+                "podział kolumn: granica [{first}, {}) nie pada na blok {values} wartości",
+                first + count
+            )));
+        }
+        let end = first + count;
+        if end > self.cols {
+            return Err(fmt_err(format!(
+                "podział kolumn: zakres [{first}, {end}) wykracza poza {} kolumn",
+                self.cols
+            )));
+        }
+        let take_from = (first / values) * block_bytes;
+        let take_bytes = (count / values) * block_bytes;
+        let mut out = Vec::with_capacity(self.rows * take_bytes);
+        for row in 0..self.rows {
+            let base = row * row_bytes + take_from;
+            out.extend_from_slice(&self.data[base..base + take_bytes]);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod block_matrix_tests {
+    use super::*;
+
+    /// Q4_K: 144 B na 256 wartości. Bajt `i` wiersza `r` niesie numer wiersza,
+    /// więc każdy wycinek da się sprawdzić po zawartości, a nie po długości.
+    fn matrix(rows: usize, cols: usize) -> Vec<u8> {
+        let row_bytes = (cols / 256) * 144;
+        let mut data = vec![0u8; rows * row_bytes];
+        for r in 0..rows {
+            for b in 0..row_bytes {
+                data[r * row_bytes + b] = (r % 251) as u8;
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn wycinek_wierszy_zachowuje_kolejnosc_zakresow() {
+        let data = matrix(48, 256);
+        let m = BlockMatrix {
+            data: &data,
+            rows: 48,
+            cols: 256,
+            quant: QuantKind::Q4K,
+        };
+        // Kolejność głowic V rangi 1 przy n_k = 16, n_v = 48.
+        let order = TpShard::new(1, 2)
+            .expect("ranga")
+            .v_head_order(16, 48)
+            .expect("podział V");
+        let ranges: Vec<(usize, usize)> = order.iter().map(|&h| (h, 1)).collect();
+        let out = m.take_rows(&ranges).expect("wycinek");
+        assert_eq!(out.len() / 144, order.len());
+        for (slot, &head) in order.iter().enumerate() {
+            assert_eq!(out[slot * 144], (head % 251) as u8, "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn wycinek_kolumn_bierze_ten_sam_zakres_w_kazdym_wierszu() {
+        let data = matrix(4, 1024);
+        let m = BlockMatrix {
+            data: &data,
+            rows: 4,
+            cols: 1024,
+            quant: QuantKind::Q4K,
+        };
+        let out = m.take_cols(512, 512).expect("wycinek");
+        assert_eq!(out.len(), 4 * 2 * 144);
+        for r in 0..4 {
+            assert_eq!(out[r * 2 * 144], (r % 251) as u8);
+        }
+    }
+
+    #[test]
+    fn granica_w_srodku_bloku_jest_bledem() {
+        let data = matrix(2, 512);
+        let m = BlockMatrix {
+            data: &data,
+            rows: 2,
+            cols: 512,
+            quant: QuantKind::Q4K,
+        };
+        assert!(m.take_cols(128, 256).is_err());
+        assert!(m.take_cols(0, 300).is_err());
+        assert!(m.take_rows(&[(1, 2)]).is_err());
+    }
+
+    #[test]
+    fn niezgodna_dlugosc_tensora_jest_bledem() {
+        let data = vec![0u8; 100];
+        let m = BlockMatrix {
+            data: &data,
+            rows: 2,
+            cols: 512,
+            quant: QuantKind::Q4K,
+        };
+        assert!(m.take_rows(&[(0, 1)]).is_err());
     }
 }
