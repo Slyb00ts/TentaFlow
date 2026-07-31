@@ -40,9 +40,14 @@ Ostatnia aktualizacja: 2026-07-25.
   (jednokartowo: 5), a jej zajętość to 20,1 ms wobec 13,0 ms karty
   wspierającej. Nadwyżka NIE jest złym stosunkiem podziału — sweep `--tp-split`
   pokazuje, że równy podział jest najlepszy — tylko pracą NIEPODZIELONĄ
-  (projekcje uwagi, `ssm_out`, cały mikser DeltaNet, normy): ~5,6 ms. To
-  domyka rachunek za `TENSOR_PARALLEL_DESIGN.md`: dokładanie kolejnych macierzy
-  do dzisiejszej protezy DOKŁADA kopie zamiast je usuwać, więc następnym krokiem
+  (projekcje uwagi, `ssm_out`, cały mikser DeltaNet, normy). Wobec przebiegu
+  jednokartowego TEGO SAMEGO modelu (1001 uruchomień, 30,04 ms zajętości,
+  3,81 ms przestoju) karta 0 ma +289 uruchomień (~1,0 ms) i ~2,3 ms czekania na
+  kartę 1. Pełny podział warstwy dałby ~15,8 ms zajętości na rangę i krok ~21 ms,
+  czyli **47-48 tok/s wobec 39,7** — cała pula, jaka jest do wzięcia na dwóch
+  kartach, bo podatek od liczby uruchomień jest wspólny dla obu rang. To domyka
+  rachunek za `TENSOR_PARALLEL_DESIGN.md`: dokładanie kolejnych macierzy do
+  dzisiejszej protezy DOKŁADA kopie zamiast je usuwać, więc następnym krokiem
   jest SPMD, a nie kolejne wpięcie.
 
 - ❌ **llama.cpp bije nas na Radeonie w prefillu hybrydowym: 7x na 0,8B i 26x

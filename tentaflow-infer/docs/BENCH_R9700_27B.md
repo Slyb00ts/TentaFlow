@@ -1004,25 +1004,45 @@ karcie (+29%), MTP **78,6** wobec 70,0 (+12%). Suma SHA bez zmian.
 
 Podział obejmuje dziś 88,5% bajtów czytanych na token (FFN, obie wejściowe
 projekcje DeltaNet, głowa logitów), więc karta modelu powinna czytać 8,8 GB i
-kończyć krok w okolicach 20 ms. Mierzymy 25,2 ms. Profil obu agentów
-(`rocprofv3`, kontekst 128) mówi, gdzie jest różnica:
+kończyć krok w okolicach 20 ms. Mierzymy 25,2 ms. Profil (`rocprofv3`, kontekst
+128), zestawiony z przebiegiem JEDNOKARTOWYM TEGO SAMEGO modelu:
 
-| | karta 0 | karta 1 |
-|---|--:|--:|
-| uruchomienia / token | **1290** | 626 |
-| zajętość / token | 20,14 ms | 13,02 ms |
-| `copyBuffer` / token | **182** | 161 |
+| | 1 karta | karta 0 z 2 | karta 1 z 2 |
+|---|--:|--:|--:|
+| uruchomienia / token | 1001 | **1290** | 626 |
+| zajętość / token | 30,04 ms | 20,14 ms | 13,02 ms |
+| przestój / token | 3,81 ms | **7,08 ms** | — |
+| `copyBuffer` / token | 5 | **182** | 161 |
+| czas ścienny / token | 33,85 ms | **27,22 ms** | |
+
+Nadwyżka przestoju karty 0 rozkłada się na dwie pozycje: **+289 uruchomień**
+(kopie, dodawania sum cząstkowych, projekcje liczone osobno zamiast grupowo)
+kosztuje przy 3,5 us około **1,0 ms**, a pozostałe **~2,3 ms to czekanie na
+kartę 1**.
 
 Dwie mierzalne wady, obie wynikające z ASYMETRII podziału:
 
 1. **343 kopie D2D na token.** Jedna karta trzyma stan i KV, więc każda
    pomocnicza projekcja wraca do niej. Na jednej karcie ten sam krok ma 5 kopii.
-   Przy ~2 us pracy i ~3,5 us przestoju na kopię to około 1,9 ms na token.
-2. **Karta 0 wykonuje 55% więcej pracy.** To NIE jest zły stosunek podziału —
-   sweep `--tp-split` od 8704/8704 do 6656/10752 pokazuje, że równy podział jest
-   NAJLEPSZY, a każde przesunięcie w stronę karty 1 pogarsza wynik (3172 ->
-   3372 ms). Nadwyżka karty 0 to praca NIEPODZIELONA: projekcje uwagi,
-   `ssm_out`, cały mikser DeltaNet, normy i sampling — razem ~5,6 ms.
+2. **Karta 0 wykonuje 55% więcej pracy niż karta 1.** To NIE jest zły stosunek
+   podziału — sweep `--tp-split` od 8704/8704 do 6656/10752 pokazuje, że równy
+   podział jest NAJLEPSZY, a każde przesunięcie w stronę karty 1 pogarsza wynik
+   (3172 -> 3372 ms). Nadwyżka karty 0 to praca NIEPODZIELONA: projekcje uwagi,
+   `ssm_out`, cały mikser DeltaNet, normy i sampling.
+
+**Ile jest do wzięcia, liczone z tych pomiarów.** Gdyby podział objął CAŁĄ
+warstwę, zajętość rangi zeszłaby do około 15,8 ms (połowa jednokartowych 30,04
+plus redukcje), a przestój NIE dzieli się przez dwa — zostaje jednokartowe
+3,81 ms plus synchronizacja, czyli ~5 ms. Krok wychodzi ~21 ms, czyli około
+**47-48 tok/s wobec dzisiejszych 39,7**. To jest cała pula SPMD dla dwóch kart —
+nie 2x, bo podatek od liczby uruchomień jest wspólny dla obu rang i nie maleje
+od dołożenia karty.
+
+UWAGA METODOLOGICZNA: pierwsza wersja tego akapitu zestawiała 1290 uruchomień
+karty 0 (NVFP4) z 745 uruchomieniami jednokartowymi zmierzonymi na **Q4_K_M** i
+wychodziło z tego +545. To było porównanie dwóch różnych kwantyzacji. Właściwa
+baza dla NVFP4 to 1001, a nadwyżka wynosi +289 — czyli dokładnie tyle, ile
+notował `TENSOR_PARALLEL_DESIGN.md`.
 
 Wniosek jest ten sam, co w `TENSOR_PARALLEL_DESIGN.md`, tylko teraz z liczbami
 po obu stronach: dosypywanie kolejnych macierzy do dzisiejszej protezy nie
