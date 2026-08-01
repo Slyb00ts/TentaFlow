@@ -1397,6 +1397,10 @@ mod services_manifest_build {
         /// Mirror of runtime `Engine.cluster_launch` ("ray" default / "vllm-mp").
         #[serde(default)]
         pub cluster_launch: Option<String>,
+        /// Mirror of runtime `Engine.preset_only` — katalog chowa karte takiego
+        /// silnika i pokazuje wylacznie jego kafelki modeli.
+        #[serde(default)]
+        pub preset_only: Option<bool>,
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,

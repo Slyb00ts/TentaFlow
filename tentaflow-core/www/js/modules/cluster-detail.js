@@ -1111,6 +1111,9 @@ function resolveMembers(cluster) {
       rdma_ip: m.rdmaIp || m.rdma_ip || '',
       rdma_devices: m.rdmaDevices || m.rdma_devices || '',
       rdma_socket_ifname: m.rdmaSocketIfname || m.rdma_socket_ifname || '',
+      interface_name: m.interfaceName || m.interface_name || '',
+      interface_ip: m.interfaceIp || m.interface_ip || '',
+      rdma_gid_index: m.rdmaGidIndex ?? m.rdma_gid_index ?? null,
       live,
     };
   });
