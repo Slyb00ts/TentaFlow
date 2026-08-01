@@ -53,9 +53,10 @@ quantization = "nvfp4"
 # DSpark, nie MTP: glowa draftujaca siedzi w checkpoincie i jest ~1.2-1.4x
 # szybsza od stockowego MTP przy tej samej jakosci (spekulacja jest bezstratna).
 speculator_method = "dspark"
-# k MUSI rownac sie `dspark_block_size` checkpointu — krotszy blok daje BLEDNE
-# wyjscie. Preview deklarowal 5, 0731 deklaruje 7 (karta modelu).
-speculator_num_tokens = 7
+# k MUSI rownac sie `dspark_block_size` checkpointu. UWAGA: karta modelu 0731
+# podaje 7, ale jego wlasny config.json deklaruje 5 — sprawdzone na pobranych
+# plikach. Bierzemy wartosc z checkpointu, nie z dokumentacji.
+speculator_num_tokens = 5
 recommended = true
 featured = true
 
