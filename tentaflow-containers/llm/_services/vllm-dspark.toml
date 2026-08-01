@@ -58,3 +58,10 @@ speculator_method = "dspark"
 speculator_num_tokens = 7
 recommended = true
 featured = true
+
+# Wartosci z karty modelu 0731. `temperature = 1.0` jest nietypowa (wiekszosc
+# modeli chce ~0.7), wiec bez jawnego ustawienia serwer wystartowalby z domyslem,
+# przy ktorym ten model odpowiada gorzej. `top_p = 0.95` to profil agentowy.
+[model_preset.sampling]
+temperature = 1.0
+top_p = 0.95

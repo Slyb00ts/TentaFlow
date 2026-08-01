@@ -666,6 +666,10 @@ pub struct DistributedDeploySpec {
     /// zaszywac per silnik. `None` = zostaw domyslna silnika.
     #[serde(default)]
     pub speculative_num_tokens: Option<u32>,
+    /// Domyslny sampling presetu jako JSON do `--override-generation-config`.
+    /// `None` = manifest nie deklaruje, silnik zostaje przy swoim.
+    #[serde(default)]
+    pub generation_config_json: Option<String>,
     /// Dodatkowy config usera (vllm_args, gpu_select_mode, gpu_ids) jako JSON.
     pub config_json: String,
 }

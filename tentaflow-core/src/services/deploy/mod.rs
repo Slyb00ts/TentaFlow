@@ -2989,6 +2989,7 @@ mod tests {
                 speculator_repo: None,
                 speculator_method: None,
                 speculator_num_tokens: None,
+                sampling: None,
                 vllm: None,
                 checkpoint_file: None,
                 quant_variants: Vec::new(),

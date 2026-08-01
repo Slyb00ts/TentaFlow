@@ -227,6 +227,12 @@ fn build_mp_serve_command(
         serve.push(' ');
         serve.push_str(&sh_quote(&tok));
     }
+    // Sampling presetu PRZED `vllm_args` usera, zeby jawne ustawienie w formularzu
+    // nadal wygrywalo (argparse: ostatnie wystapienie).
+    if let Some(gen_cfg) = spec.generation_config_json.as_deref() {
+        serve.push_str(" --override-generation-config ");
+        serve.push_str(&sh_quote(gen_cfg));
+    }
     for tok in user_vllm_arg_tokens(spec)? {
         serve.push(' ');
         serve.push_str(&sh_quote(&tok));
@@ -1352,6 +1358,7 @@ mod tests {
             socket_ifname: "enP2p1s0f0np0".into(),
             gid_index: 3,
             speculative_num_tokens: None,
+            generation_config_json: None,
             config_json: String::new(),
         }
     }

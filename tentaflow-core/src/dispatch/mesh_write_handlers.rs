@@ -1255,6 +1255,7 @@ fn build_member_spec(
     ray_head_ip: &str,
     ray_port: u16,
     speculative_num_tokens: Option<u32>,
+    generation_config_json: Option<String>,
     user_config_json: &str,
 ) -> tentaflow_protocol::mesh::DistributedDeploySpec {
     // Wstrzykujemy `_target_node_id` do user-config JSON (do routingu mesh).
@@ -1295,6 +1296,7 @@ fn build_member_spec(
         // hardcode in the deploy path (P2-2).
         gid_index: member.rdma_gid_index.max(0) as u32,
         speculative_num_tokens,
+        generation_config_json,
         config_json: serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string()),
     }
 }
@@ -1390,13 +1392,15 @@ pub async fn cluster_deploy(
     // Liczba tokenow draftu jest wlasnoscia CHECKPOINTU, nie silnika: dla DSpark
     // musi rownac sie `dspark_block_size` z jego config.json (preview = 5,
     // 0731 = 7), bo krotszy blok daje bledne wyjscie. Bierzemy ja z presetu.
-    let speculative_num_tokens = model_preset_id.as_deref().and_then(|pid| {
-        manifest
-            .model_presets
-            .iter()
-            .find(|p| p.id == pid)
-            .and_then(|p| p.speculator_num_tokens)
-    });
+    let preset = model_preset_id
+        .as_deref()
+        .and_then(|pid| manifest.model_presets.iter().find(|p| p.id == pid));
+    let speculative_num_tokens = preset.and_then(|p| p.speculator_num_tokens);
+    // Sampling zalecany przez autora checkpointu — bez niego silnik startuje z
+    // wlasnym domyslem, ktory dla czesci modeli jest wyraznie za niski.
+    let generation_config_json = preset
+        .and_then(|p| p.sampling.as_ref())
+        .and_then(|s| s.to_generation_config_json());
 
     // P1-4: reject a second deploy only when a LIVE deployment (deploying/running)
     // exists — a node has one GPU set, so two TP deployments would collide on GPU
@@ -1544,6 +1548,7 @@ pub async fn cluster_deploy(
                 &ray_head_ip,
                 ray_port,
                 speculative_num_tokens,
+                generation_config_json.clone(),
                 &user_cfg,
             ),
         ));

@@ -102,6 +102,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             speculator_repo: None,
             speculator_method: None,
             speculator_num_tokens: None,
+            sampling: None,
             vllm: None,
             quant_variants: vec![],
         }],
