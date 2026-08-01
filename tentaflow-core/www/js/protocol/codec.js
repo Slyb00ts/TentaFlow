@@ -568,6 +568,8 @@ export const encode = {
       payload.nodeId,
       payload.interfaceType ?? null,
       payload.interfaceSpeedMbps ?? null,
+      payload.interfaceName ?? null,
+      payload.interfaceIp ?? null,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

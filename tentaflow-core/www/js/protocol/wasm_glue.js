@@ -2128,22 +2128,28 @@ export function encodeChatStreamRequestSimple(model_id, user_message, flow_id, s
  * @param {string} node_id
  * @param {string | null} [interface_type]
  * @param {number | null} [interface_speed_mbps]
+ * @param {string | null} [interface_name]
+ * @param {string | null} [interface_ip]
  * @returns {Uint8Array}
  */
-export function encodeClusterAddMemberRequest(cluster_id, node_id, interface_type, interface_speed_mbps) {
+export function encodeClusterAddMemberRequest(cluster_id, node_id, interface_type, interface_speed_mbps, interface_name, interface_ip) {
     const ptr0 = passStringToWasm0(cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
     var ptr2 = isLikeNone(interface_type) ? 0 : passStringToWasm0(interface_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeClusterAddMemberRequest(ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(interface_speed_mbps) ? Number.MAX_SAFE_INTEGER : (interface_speed_mbps) >>> 0);
+    var ptr3 = isLikeNone(interface_name) ? 0 : passStringToWasm0(interface_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(interface_ip) ? 0 : passStringToWasm0(interface_ip, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeClusterAddMemberRequest(ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(interface_speed_mbps) ? Number.MAX_SAFE_INTEGER : (interface_speed_mbps) >>> 0, ptr3, len3, ptr4, len4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v4;
+    return v6;
 }
 
 /**

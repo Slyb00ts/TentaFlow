@@ -546,6 +546,8 @@ pub fn encode_cluster_add_member_request(
     node_id: String,
     interface_type: Option<String>,
     interface_speed_mbps: Option<u32>,
+    interface_name: Option<String>,
+    interface_ip: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ClusterAddMemberRequestBody(
         ClusterAddMemberRequest {
@@ -553,6 +555,8 @@ pub fn encode_cluster_add_member_request(
             node_id,
             interface_type,
             interface_speed_mbps,
+            interface_name,
+            interface_ip,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -13533,6 +13537,15 @@ fn cluster_member_to_js(m: tentaflow_protocol::ClusterMember) -> js_sys::Object 
     }
     if let Some(s) = m.rdma_socket_ifname {
         set(&item, "rdmaSocketIfname", s.into());
+    }
+    if let Some(n) = m.interface_name {
+        set(&item, "interfaceName", n.into());
+    }
+    if let Some(ip) = m.interface_ip {
+        set(&item, "interfaceIp", ip.into());
+    }
+    if let Some(g) = m.rdma_gid_index {
+        set(&item, "rdmaGidIndex", g.into());
     }
     item
 }
