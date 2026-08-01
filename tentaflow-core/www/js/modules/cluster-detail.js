@@ -359,7 +359,22 @@ function renderNodeMini(member) {
         ${renderMiniBar('VRAM', vramPct)}
       </div>
       ${linkLabel ? `<div class="cdn-link"><span class="link-chip ${linkClass}">${asg ? '✓ ' : ''}${escapeHtml(linkLabel)}${asgDetail ? ` · ${escapeHtml(asgDetail)}` : ''}</span></div>` : ''}
+      ${renderRdmaSummary(member)}
       ${renderNicPicker(member)}
+    </div>
+  `;
+}
+
+/// Co realnie pojedzie do NCCL przy distributed deployu. Bez tego jedynym
+/// sposobem sprawdzenia konfiguracji RDMA byloby zagladanie do bazy.
+function renderRdmaSummary(member) {
+  if (!member.rdma_devices) return '';
+  const gid = member.rdma_gid_index;
+  return `
+    <div class="cdn-rdma">
+      <code>${escapeHtml(member.rdma_devices)}</code>
+      <span>${escapeHtml(member.rdma_ip || '—')}</span>
+      <span>GID ${gid == null ? '—' : escapeHtml(String(gid))}</span>
     </div>
   `;
 }
@@ -937,6 +952,12 @@ async function openDeployModal() {
   // clean it up explicitly here.
   const clusterId = currentClusterId;
   const label = clusterData.name || clusterId;
+  // Nazwy GPU czlonkow decyduja o bramce Sparka w katalogu. Bez nich klaster
+  // ze Sparkow dostawal takze silniki jawnie z Sparkiem niezgodne.
+  const gpuNames = members.flatMap((m) => {
+    const live = m.live || nodesById.get(m.node_id) || {};
+    return (Array.isArray(live.gpus) ? live.gpus : []).map((g) => g.name || '');
+  }).filter(Boolean);
   ClusterDetailScreen.cleanup();
   const { Router } = await import('/js/router.js');
   Router.navigate('catalog', {
@@ -945,7 +966,8 @@ async function openDeployModal() {
       id: clusterId,
       label,
       os: null,
-      gpuNames: [],
+      gpuNames,
+      isDgxSpark: gpuNames.length > 0 && gpuNames.every((n) => /GB10/i.test(n)),
     },
   });
 }

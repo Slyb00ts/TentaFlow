@@ -130,14 +130,23 @@ fn mp_node_rank(spec: &DistributedDeploySpec) -> Result<u32, String> {
 }
 
 /// Stale argumenty `vllm serve` dla silnika w trybie vllm-mp. `vllm-dspark` =
-/// zweryfikowany profil DeepSeek V4 Flash DSpark (garble-fix 2026-07-03:
-/// probabilistyczny draft, 3 tokeny spekulacyjne, capture-size == max-num-seqs).
+/// zweryfikowany profil DeepSeek V4 Flash DSpark.
+///
+/// `num_speculative_tokens` MUSI rownac sie `dspark_block_size` z config.json
+/// checkpointu, wiec przychodzi z PRESETU, nie z tej funkcji: preview ma 5, a
+/// 0731 deklaruje 7. Blok krotszy niz zadeklarowany daje BLEDNE wyjscie, wiec
+/// wczesniejsze zaszyte 3 leczylo objaw garblingu jego wlasna przyczyna —
+/// wlasciwym lekarstwem jest probabilistyczny draft przy PELNYM bloku.
 /// `--max-num-seqs`/`--max-cudagraph-capture-size` mozna nadpisac przez
 /// `vllm_args` (argparse: ostatnie wystapienie wygrywa).
-fn vllm_mp_engine_args(engine_id: &str) -> Vec<String> {
+fn vllm_mp_engine_args(engine_id: &str, spec_num_tokens: Option<u32>) -> Vec<String> {
     if engine_id != "vllm-dspark" {
         return Vec::new();
     }
+    let k = spec_num_tokens.unwrap_or(5).max(1);
+    let speculative_config = format!(
+        r#"{{"method":"dspark","num_speculative_tokens":{k},"draft_sample_method":"probabilistic"}}"#
+    );
     [
         "--trust-remote-code",
         "--kv-cache-dtype",
@@ -154,7 +163,7 @@ fn vllm_mp_engine_args(engine_id: &str) -> Vec<String> {
         "--async-scheduling",
         "--enable-chunked-prefill",
         "--speculative-config",
-        r#"{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}"#,
+        speculative_config.as_str(),
         "--tokenizer-mode",
         "deepseek_v4",
         "--tool-call-parser",
@@ -214,7 +223,7 @@ fn build_mp_serve_command(
     if headless {
         serve.push_str(" --headless");
     }
-    for tok in vllm_mp_engine_args(&spec.engine_id) {
+    for tok in vllm_mp_engine_args(&spec.engine_id, spec.speculative_num_tokens) {
         serve.push(' ');
         serve.push_str(&sh_quote(&tok));
     }
@@ -1342,6 +1351,7 @@ mod tests {
             rdma_devices: "roceP2p1s0f0,rocep1s0f0".into(),
             socket_ifname: "enP2p1s0f0np0".into(),
             gid_index: 3,
+            speculative_num_tokens: None,
             config_json: String::new(),
         }
     }

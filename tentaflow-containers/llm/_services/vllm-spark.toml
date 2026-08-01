@@ -96,15 +96,6 @@ speculator_method = "draft_model"
 speculator_num_tokens = 4
 featured = true
 
-# DeepSeek V4 Flash (284B/13B-act MoE, 1M ctx) na CLUSTER 4-8x DGX Spark przez
-# RDMA 200Gbit (distributed.rs: Ray + NCCL/RoCE). DSpark self-speculative (glowa w
-# checkpoincie). fp8 kv-cache + block-size 256 + EP dokłada Core. Pro 1.6T nie
-# mie sci sie nawet na 8 Sparkach (1TB unified) — Pro tylko na datacenter (vllm.toml).
-[[model_preset]]
-id = "deepseek-v4-flash-dspark"
-display_name = "DeepSeek V4 Flash (DSpark, cluster Spark RDMA)"
-repo = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
-quantization = "fp8"
-speculator_method = "dspark"
-speculator_num_tokens = 4
-featured = true
+# DeepSeek V4 Flash NIE jest tu presetem: checkpoint wymaga obrazu z kernelami
+# sm_121 (`nvfp4_ds_mla`, `flashinfer_b12x`, block-size 256), ktorych stockowy
+# vLLM nie ma. Jedyna wspierana sciezka to `vllm-dspark.toml`.

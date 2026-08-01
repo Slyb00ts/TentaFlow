@@ -4573,6 +4573,17 @@ pub struct ClusterMember {
     /// `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME` bootstrap interface).
     #[serde(default)]
     pub rdma_socket_ifname: Option<String>,
+    /// Netdev chosen as the cluster interconnect for this member, and its IPv4.
+    /// Without them the UI cannot show WHICH card is currently in use, so a NIC
+    /// picker would have nothing to preselect.
+    #[serde(default)]
+    pub interface_name: Option<String>,
+    #[serde(default)]
+    pub interface_ip: Option<String>,
+    /// RoCE v2 GID index handed to `NCCL_IB_GID_INDEX`, read from the member's
+    /// own GID table by the RDMA auto-config.
+    #[serde(default)]
+    pub rdma_gid_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

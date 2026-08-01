@@ -60,6 +60,14 @@ pub struct Engine {
     /// across a cluster. The unified deploy wizard offers it as a cluster target.
     #[serde(default)]
     pub cluster_capable: Option<bool>,
+    /// `Some(true)` for a runtime that exists ONLY to back its own model presets
+    /// (e.g. `vllm-dspark` — a patched image pinned to one checkpoint). The
+    /// catalog then hides its engine card and shows only the model tiles;
+    /// deploying a preset still resolves this engine normally. Without it such a
+    /// runtime shows up under "Engines" named after a model and reads as a
+    /// duplicate of its own preset.
+    #[serde(default)]
+    pub preset_only: Option<bool>,
     /// Multi-node launch mode for cluster deploy. `None`/"ray" = Ray GCS on the
     /// head + `vllm serve --distributed-executor-backend ray` exec'd on the head
     /// once every worker joined. "vllm-mp" = vLLM native multi-node

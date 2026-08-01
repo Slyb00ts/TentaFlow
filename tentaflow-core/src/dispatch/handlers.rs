@@ -1748,6 +1748,17 @@ fn build_cluster_members(
                 } else {
                     Some(m.rdma_socket_ifname.clone())
                 },
+                interface_name: if m.interface_name.is_empty() {
+                    None
+                } else {
+                    Some(m.interface_name.clone())
+                },
+                interface_ip: if m.interface_ip.is_empty() {
+                    None
+                } else {
+                    Some(m.interface_ip.clone())
+                },
+                rdma_gid_index: u32::try_from(m.rdma_gid_index).ok(),
             }
         })
         .collect()

@@ -660,6 +660,12 @@ pub struct DistributedDeploySpec {
     /// per-czlonek (D1); nie hardkodowany. Domyslnie 3 (zweryfikowana wartosc
     /// RoCEv2 IPv4 na ConnectX-7 DGX Spark).
     pub gid_index: u32,
+    /// `num_speculative_tokens` z presetu modelu. Wartosc jest wlasnoscia
+    /// KONKRETNEGO checkpointu (dla DSpark musi rownac sie jego
+    /// `dspark_block_size`, inaczej wyjscie jest bledne), wiec nie wolno jej
+    /// zaszywac per silnik. `None` = zostaw domyslna silnika.
+    #[serde(default)]
+    pub speculative_num_tokens: Option<u32>,
     /// Dodatkowy config usera (vllm_args, gpu_select_mode, gpu_ids) jako JSON.
     pub config_json: String,
 }

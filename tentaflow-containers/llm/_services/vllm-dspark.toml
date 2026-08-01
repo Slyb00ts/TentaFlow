@@ -11,7 +11,7 @@
 id = "vllm-dspark"
 backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 category = "llm"
-name = "DeepSeek V4 Flash DSpark (2x Spark)"
+name = "DeepSeek V4 Flash DSpark (2-8x Spark)"
 description_pl = "DeepSeek V4 Flash 284B MoE z DSpark spec-decode i NVFP4 KV-cache na klaster 2x DGX Spark (RoCE). 50-60 tok/s."
 description_en = "DeepSeek V4 Flash 284B MoE with DSpark spec-decode and NVFP4 KV cache on a 2x DGX Spark cluster (RoCE). 50-60 tok/s."
 homepage = "https://github.com/tonyd2wild/DeepSeek-v4-Flash-DSpark-1M-NVFP4-KV-2x-DGX-Spark"
@@ -26,6 +26,10 @@ dgx_spark = true
 cluster_capable = true
 # Multi-node przez natywny vLLM mp (--nnodes/--headless, worker-first), nie Ray.
 cluster_launch = "vllm-mp"
+# Obraz jest przypiety do JEDNEGO checkpointu (patche nvfp4_ds_mla), wiec silnik
+# nie ma sensu w oderwaniu od swojego presetu. Katalog pokazuje tylko kafelek
+# modelu; kafelek silnika nazwany modelem czytal sie jak jego duplikat.
+preset_only = true
 
 [deploy.docker]
 context_path = "llm/docker/vllm-dspark"
@@ -38,11 +42,19 @@ transport = "direct-http"
 # max-num-seqs mozna nadpisac w polu vllm_args (`--max-num-seqs N
 # --max-cudagraph-capture-size N`). Sufit YaRN modelu = 1M (1048576).
 [[model_preset]]
-id = "deepseek-v4-flash-dspark-nvfp4"
-display_name = "DeepSeek V4 Flash (NVFP4 KV, 1M ctx, cluster 2x Spark)"
-repo = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+id = "deepseek-v4-flash-0731"
+display_name = "DeepSeek V4 Flash 0731 (NVFP4, DSpark, 1M ctx, cluster 2-8x Spark)"
+repo = "deepseek-ai/DeepSeek-V4-Flash-0731"
+# Oficjalne wydanie z 2026-07-31, zastepuje preview: mocniejsze agentowo, ta sama
+# architektura (konfiguracja serwowania przenosi sie 1:1). Wagi to ta sama
+# mieszanka FP4+FP8 co preview (eksperci MoE w I8 po dwie wartosci 4-bit + skale
+# E8M0), wiec osobny "wariant NVFP4" nie istnieje i nie jest potrzebny.
 quantization = "nvfp4"
+# DSpark, nie MTP: glowa draftujaca siedzi w checkpoincie i jest ~1.2-1.4x
+# szybsza od stockowego MTP przy tej samej jakosci (spekulacja jest bezstratna).
 speculator_method = "dspark"
-speculator_num_tokens = 3
+# k MUSI rownac sie `dspark_block_size` checkpointu — krotszy blok daje BLEDNE
+# wyjscie. Preview deklarowal 5, 0731 deklaruje 7 (karta modelu).
+speculator_num_tokens = 7
 recommended = true
 featured = true

@@ -204,6 +204,7 @@ mod tests {
                 default_port: 11434,
                 dgx_spark: None,
                 cluster_capable: None,
+                preset_only: None,
                 cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),

@@ -489,6 +489,11 @@ pub fn kv_bytes_per_element(engine: DeployEngine, label: &str) -> Option<f64> {
 /// o rzad wielkosci wiekszy niz realny i zjadal budzet puli KV.
 pub const DEFAULT_VLLM_BATCH_TOKENS: u64 = 8192;
 
+/// Staly narzut na GPU poza tym, co widzi vLLM: runtime CUDA i metadane
+/// alokatora. Rezerwowany PRZED wyliczeniem puli KV — inaczej pula zjada go
+/// w calosci i suma nie domyka sie z budzetem.
+pub const VLLM_CUDA_OVERHEAD_GB: f64 = 0.5;
+
 /// Konfiguracja runtime do estymacji.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VramEstimateInput {
@@ -630,9 +635,13 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
     let nccl = if tp > 1.0 { 0.3 * tp } else { 0.0 };
     let activations_per_gpu = activation_peak + cuda_graph_const + nccl;
     let activations_gb = activations_per_gpu * parallel; // cluster-wide (informational)
-    let overhead_gb = 0.5; // CUDA runtime, allocator metadata - per cluster
+    // Overhead MUSI wejsc do stalego footprintu, nie tylko do sumy. Pula KV to z
+    // definicji reszta budzetu, wiec dodanie overheadu dopiero do `total_gb`
+    // sprawialo, ze suma zawsze przekraczala budzet o te 0.5 GB — `fits_total`
+    // nie mogl byc prawdziwy dla ZADNEGO modelu wypelniajacego pule.
+    let overhead_gb = VLLM_CUDA_OVERHEAD_GB * parallel;
 
-    let required_fixed_per_gpu = weights_per_gpu + activations_per_gpu;
+    let required_fixed_per_gpu = weights_per_gpu + activations_per_gpu + VLLM_CUDA_OVERHEAD_GB;
 
     // KV shardsuje sie tylko do `min(tp, kv_heads)` — powyzej vLLM REPLIKUJE glowy
     // KV (kazdy rank trzyma >=1 cala glowe), wiec per-GPU KV przestaje malec. PP
@@ -1407,7 +1416,15 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     // evenly over all cards (budget × parallel); row-split keeps KV on the main
     // GPU (single-card budget). MLX: single device.
     let kv_budget_bytes_for = |seqs: u64| -> f64 {
-        let per_gpu = (usable_per_gpu - weights_per_gpu - activations_per_gpu_for(seqs)).max(0.0);
+        // Ten sam staly narzut co w `estimate_vllm_vram` — budzety obu stron
+        // musza wychodzic z tej samej rezerwy, inaczej auto-fit dobiera kontekst
+        // pod szerszy budzet niz ten, ktorym estymata go potem ocenia.
+        let overhead = match engine {
+            DeployEngine::Vllm => VLLM_CUDA_OVERHEAD_GB,
+            DeployEngine::LlamaCpp | DeployEngine::Mlx => 0.0,
+        };
+        let per_gpu =
+            (usable_per_gpu - weights_per_gpu - activations_per_gpu_for(seqs) - overhead).max(0.0);
         let gb = match engine {
             DeployEngine::Vllm | DeployEngine::Mlx => per_gpu,
             DeployEngine::LlamaCpp => {
