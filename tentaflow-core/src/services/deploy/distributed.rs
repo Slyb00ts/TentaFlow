@@ -153,16 +153,18 @@ fn vllm_mp_engine_args(engine_id: &str, spec_num_tokens: Option<u32>) -> Vec<Str
         "nvfp4_ds_mla",
         "--block-size",
         "256",
-        // 6, nie 12: przy k=5 capture CUDA-graph rosnie ~k-krotnie, a na Sparku
-        // idzie z tej samej pamieci unified co wagi. Przy 12 pula KV wychodzila
-        // -25 GiB i silnik odmawial startu ("No available memory for the cache
-        // blocks"). Nadpisywalne przez `vllm_args`.
+        // Przy 12 pula KV wychodzila -25 GiB ("No available memory for the cache
+        // blocks") — capture CUDA-graph rosnie z glebokoscia draftu, a na Sparku
+        // idzie z tej samej pamieci unified co wagi.
         "--max-num-seqs",
         "6",
         "--max-num-batched-tokens",
         "8192",
+        // Capture MUSI byc wielokrotnoscia `num_speculative_tokens + 1` (= 6 przy
+        // k=5), inaczej po zaokragleniu nie zostaje zaden prawidlowy rozmiar.
+        // 36 = max_num_seqs * (k+1); sama szostka jest za mala.
         "--max-cudagraph-capture-size",
-        "6",
+        "36",
         "--enable-prefix-caching",
         "--async-scheduling",
         "--enable-chunked-prefill",

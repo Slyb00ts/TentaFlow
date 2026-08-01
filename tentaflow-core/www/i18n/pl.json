@@ -5424,7 +5424,9 @@
       "pricing_hint": "Stawki do rozliczeń zużycia. Puste pola pomijane.",
       "pricing_invalid": "Nieprawidłowy cennik — wartości muszą być >= 0.",
       "ready_timeout": "Budzet ladowania modelu (s)",
-      "ready_timeout_hint": "Czas na zaladowanie wag i odpowiedz /v1/models. Po przekroczeniu Core rozbiera caly klaster. Domyslnie skalowane z rozmiarem wag."
+      "ready_timeout_hint": "Czas na zaladowanie wag i odpowiedz /v1/models. Po przekroczeniu Core rozbiera caly klaster. Domyslnie skalowane z rozmiarem wag.",
+      "vllm_args": "Dodatkowe argumenty vLLM",
+      "vllm_args_hint": "Doklejane PO argumentach silnika, wiec nadpisuja jego domysle (argparse bierze ostatnie wystapienie). Puste = profil silnika."
     }
   },
   "category": {

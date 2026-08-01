@@ -4184,7 +4184,9 @@
     "gpu_list_hint": "GPU disponibles ({n})",
     "cluster": {
       "ready_timeout": "Budget de chargement (s)",
-      "ready_timeout_hint": "Temps pour charger les poids et obtenir une reponse de /v1/models. Au-dela, tout le cluster est demonte."
+      "ready_timeout_hint": "Temps pour charger les poids et obtenir une reponse de /v1/models. Au-dela, tout le cluster est demonte.",
+      "vllm_args": "Arguments vLLM supplementaires",
+      "vllm_args_hint": "Ajoutes apres les arguments du moteur, ils remplacent donc ses valeurs par defaut."
     }
   },
   "category": {

@@ -4184,7 +4184,9 @@
     "gpu_list_hint": "Verfügbare GPUs ({n})",
     "cluster": {
       "ready_timeout": "Modell-Ladebudget (s)",
-      "ready_timeout_hint": "Zeit bis die Gewichte geladen sind und /v1/models antwortet. Bei Ueberschreitung wird der ganze Cluster abgebaut."
+      "ready_timeout_hint": "Zeit bis die Gewichte geladen sind und /v1/models antwortet. Bei Ueberschreitung wird der ganze Cluster abgebaut.",
+      "vllm_args": "Zusaetzliche vLLM-Argumente",
+      "vllm_args_hint": "Werden nach den Engine-Argumenten angehaengt und ueberschreiben deren Vorgaben."
     }
   },
   "category": {

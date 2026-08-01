@@ -2282,6 +2282,14 @@ function renderStepClusterConfig() {
     </div>
 
     <div class="form-group">
+      <tf-input type="text" id="edw-cluster-vllm-args"
+        label="${escapeAttr(tCluster('vllm_args'))}"
+        placeholder="--max-num-seqs 6 --max-cudagraph-capture-size 36"
+        value="${escapeAttr(selection.clusterVllmArgs || '')}"></tf-input>
+      <div class="form-hint">${escapeHtml(tCluster('vllm_args_hint'))}</div>
+    </div>
+
+    <div class="form-group">
       <label>${escapeHtml(tCluster('pricing_title'))}</label>
       <div class="form-hint" style="margin-bottom:6px;">${escapeHtml(tCluster('pricing_hint'))}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
@@ -2335,6 +2343,13 @@ function bindStepClusterConfigInputs() {
     readyInput.addEventListener('input', (e) => {
       const v = parseInt(e.detail?.value ?? readyInput.value, 10);
       selection.readyTimeoutSecs = Number.isFinite(v) ? v : null;
+    });
+  }
+
+  const argsInput = document.getElementById('edw-cluster-vllm-args');
+  if (argsInput) {
+    argsInput.addEventListener('input', (e) => {
+      selection.clusterVllmArgs = String(e.detail?.value ?? argsInput.value ?? '');
     });
   }
 
@@ -3411,11 +3426,18 @@ async function startClusterDeploy() {
 
   if (btn) btn.setAttribute('disabled', '');
   const readyTimeoutSecs = clusterReadyTimeoutSecs();
+  // `config_json` niesie `vllm_args` — backend dokleja je PO argumentach silnika,
+  // wiec argparse pozwala nimi nadpisac kazdy zaszyty domysl bez przebudowy.
+  // Protokol mial to pole od poczatku, ale sciezka klastrowa go nie wysylala,
+  // przez co jedyna droga do zmiany np. `--max-num-seqs` byl rebuild.
+  const clusterArgs = String(selection.clusterVllmArgs || '').trim();
+  const configJson = clusterArgs ? JSON.stringify({ vllm_args: clusterArgs }) : null;
   try {
     const resp = await ApiBinary.action(
       'clusterDeployRequest',
       {
         clusterId: selection.clusterId,
+        configJson,
         engineId: eng.id,
         modelRepo,
         modelPresetId: selection.modelPresetId || null,
