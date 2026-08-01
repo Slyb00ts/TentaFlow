@@ -1586,6 +1586,11 @@ mod services_manifest_build {
         pub speculator_method: Option<String>,
         #[serde(default)]
         pub speculator_num_tokens: Option<u32>,
+        /// Mirror `ModelPreset::sampling` — bez tego pola serde po cichu gubi
+        /// blok `[model_preset.sampling]`, a runtime czyta manifesty wlasnie
+        /// z JSON-a generowanego tutaj.
+        #[serde(default)]
+        pub sampling: Option<SamplingDefaults>,
         /// Plik checkpointu image-gen (ComfyUI) pobierany z `repo` przy deployu.
         /// Mirror `ModelPreset::checkpoint_file` z `services/manifest/types.rs`.
         #[serde(default)]
@@ -1603,6 +1608,19 @@ mod services_manifest_build {
         pub repo: String,
         #[serde(default)]
         pub display_name: Option<String>,
+    }
+
+    /// Mirror `manifest::types::SamplingDefaults`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SamplingDefaults {
+        #[serde(default)]
+        pub temperature: Option<f64>,
+        #[serde(default)]
+        pub top_p: Option<f64>,
+        #[serde(default)]
+        pub top_k: Option<i64>,
+        #[serde(default)]
+        pub min_p: Option<f64>,
     }
 
     // Single source of truth for the three wire-string allow-lists is

@@ -1929,7 +1929,7 @@ async fn cluster_serve_log_poller(
     while !stop.load(Ordering::Relaxed) {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         if let Some(tail) =
-            crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 40).await
+            crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300).await
         {
             let lines: Vec<&str> = tail.lines().collect();
             let start = match &anchor {
@@ -2405,7 +2405,7 @@ async fn run_cluster_deploy_phases(
     {
         serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let reason = if head_node_id == local_id {
-            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 40)
+            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300)
                 .await
             {
                 Some(tail) => format!(
