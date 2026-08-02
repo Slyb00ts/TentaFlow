@@ -2216,7 +2216,12 @@ mod tests {
             counter: 5,
             origin_node: "node_b".to_string(),
         };
-        assert!(same_counter_b > same_counter_a);
+        // At an equal counter the LOWER origin_node is the winner, so it must be
+        // the maximum: that is the same node `decide_roles` elects as donor, and
+        // the two decisions have to agree without further negotiation.
+        assert!(same_counter_a > same_counter_b);
+        assert!(same_counter_a.wins_over(&same_counter_b));
+        assert!(!same_counter_b.wins_over(&same_counter_a));
     }
 
     #[test]
