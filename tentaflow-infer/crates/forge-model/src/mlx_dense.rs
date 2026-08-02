@@ -381,6 +381,36 @@ impl MlxDense {
         Ok(u32::from_le_bytes(raw))
     }
 
+    /// Feeds a prompt and continues it greedily.
+    ///
+    /// The prompt goes through token by token, which is correct and slow: one
+    /// pass over 4.2 GB of weights per prompt token, where a batched prefill
+    /// would read them once for the whole prompt. That is the next lever, not
+    /// an oversight — and it is the reason a long prompt costs what it costs
+    /// here (PLAN_NAPRAWY §8).
+    pub fn generate(&mut self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(ForgeError::Format("pusty prompt".into()));
+        }
+        let mut next = 0u32;
+        for (i, &token) in prompt.iter().enumerate() {
+            if i + 1 == prompt.len() {
+                next = self.step_argmax(token)?;
+            } else {
+                self.step_no_readback(token)?;
+                self.stream.synchronize()?;
+                self.position += 1;
+            }
+        }
+        let mut out = Vec::with_capacity(max_new);
+        out.push(next);
+        for _ in 1..max_new {
+            next = self.step_argmax(next)?;
+            out.push(next);
+        }
+        Ok(out)
+    }
+
     fn step_no_readback(&mut self, token: u32) -> Result<()> {
         if self.position >= self.seq_cap {
             return Err(ForgeError::Unsupported(format!(
