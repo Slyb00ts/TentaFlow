@@ -90,29 +90,37 @@ def run(url: str, model: str, prompt: str, max_tokens: int, timeout: int):
     }
 
 
-def describe_env(container: str) -> None:
+def describe_env(venv: str, log: str) -> None:
     """Stamp what was actually measured. A baseline without the runtime version
     and the serve flags is unusable six weeks later, when the only question that
     matters is 'faster than what, exactly?'."""
     import subprocess
 
-    def sh(cmd: list[str]) -> str:
-        try:
-            return subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60, check=False
-            ).stdout.strip()
-        except Exception:  # noqa: BLE001
-            return "?"
+    ver = "?"
+    try:
+        ver = subprocess.run(
+            [f"{venv}/bin/python", "-c",
+             "import vllm,torch;print(vllm.__version__,'|torch',torch.__version__)"],
+            capture_output=True, text=True, timeout=120, check=False,
+        ).stdout.strip() or "?"
+    except Exception:  # noqa: BLE001
+        pass
 
-    ver = sh(["docker", "exec", container, "python3", "-c",
-              "import vllm,torch;print(vllm.__version__,'|torch',torch.__version__)"])
-    args = sh(["docker", "exec", container, "sh", "-c",
-               "grep -o 'non-default args:.*' /tmp/vllm-serve.log | head -1"])
+    args = ""
+    try:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "non-default args:" in line:
+                    args = line.split("non-default args:", 1)[1]
+                    break
+    except OSError:
+        pass
+
     keep = ("speculative_config", "kv_cache_dtype", "block_size", "max_num_seqs",
             "gpu_memory_utilization", "max_model_len")
     flags = [p.strip() for p in args.split(",") if any(k in p for k in keep)]
     print(f"vLLM       : {ver}")
-    print(f"kontener   : {container}")
+    print(f"bundle     : {venv}")
     for f in flags:
         print(f"  {f}")
     print()
@@ -120,11 +128,12 @@ def describe_env(container: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://10.10.10.24:5001/v1/chat/completions")
+    ap.add_argument("--url", default="http://10.10.10.24:8100/v1/chat/completions")
     ap.add_argument("--model", default="deepseek-ai/DeepSeek-V4-Flash-0731")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--timeout", type=int, default=900)
-    ap.add_argument("--container", default="tentaflow-vllm-dspark-5001")
+    ap.add_argument("--venv", default="/opt/TentaFlow/.runtime/bundles/vllm-spark/venv")
+    ap.add_argument("--log", default="/opt/TentaFlow/.runtime/cache/vllm/serve-rank0.log")
     ap.add_argument("--repeat", type=int, default=1, help="powtorzenia per kontekst")
     ap.add_argument(
         "--contexts",
@@ -134,10 +143,14 @@ def main() -> int:
     ap.add_argument("--show-text", type=int, default=0, help="ile znakow odpowiedzi")
     args = ap.parse_args()
 
-    describe_env(args.container)
-    print(f"{'prompt tok':>10} {'TTFT s':>8} {'decode tok/s':>13} "
-          f"{'out tok':>8} {'total s':>8}")
-    print("-" * 52)
+    describe_env(args.venv, args.log)
+    # Prefill rate is prompt_tokens/TTFT. TTFT also carries queueing and
+    # scheduling, so this is a lower bound on raw prefill throughput -- but it is
+    # the honest number available from the API, and unlike TTFT alone it stays
+    # comparable across context lengths.
+    print(f"{'prompt tok':>10} {'TTFT s':>8} {'prefill tok/s':>14} "
+          f"{'decode tok/s':>13} {'out tok':>8} {'total s':>8}")
+    print("-" * 68)
     for target in [int(x) for x in args.contexts.split(",")]:
         prompt = build_prompt(target)
         for _ in range(max(1, args.repeat)):
@@ -147,11 +160,12 @@ def main() -> int:
                 print(f"{target:>10}  BLAD: {exc}")
                 continue
             u = r["usage"] or {}
-            pin = u.get("prompt_tokens", "?")
+            pin = u.get("prompt_tokens", 0)
             out = u.get("completion_tokens", r["chunks"])
             rate = (out / r["decode_s"]) if r["decode_s"] and out else 0.0
+            pre = (pin / r["ttft_s"]) if r["ttft_s"] and pin else 0.0
             print(
-                f"{pin:>10} {r['ttft_s']:>8.2f} {rate:>13.1f} "
+                f"{pin:>10} {r['ttft_s']:>8.2f} {pre:>14.0f} {rate:>13.1f} "
                 f"{out:>8} {r['total_s']:>8.2f}"
             )
             if args.show_text:

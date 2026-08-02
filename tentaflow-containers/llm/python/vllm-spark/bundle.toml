@@ -68,17 +68,23 @@ platforms = ["linux-aarch64"]
 # zadziala bez build-time TORCH_CUDA_ARCH_LIST).
 [[install_variants]]
 backend = "cuda-spark"
-# Nightly aarch64 wheels torcha pod cu130 — wymagane jako baseline dla
-# vllm 0.26.0 (PyTorch 2.11 + CUDA 13.0). Stable PyPI nie ma jeszcze
-# torch-2.11.0+cu130 dla aarch64 + sm_121.
-extra_index = "https://download.pytorch.org/whl/nightly/cu130"
+# Stabilny indeks cu130 ma juz torch-2.11.0+cu130 dla aarch64 (cp310-cp314),
+# wiec nightly nie jest potrzebny — a nightly zmienia sie pod reka i potrafi
+# rozjechac ABI z kompilowanymi kernelami vllm.
+extra_index = "https://download.pytorch.org/whl/cu130"
 extras = []
 
 # Env wstrzykiwane WYLACZNIE do procesow `pip install` (a wiec rowniez do
 # source builda vllm 0.26.0). Bez tego nvcc kompiluje kernele do sm_120
 # i runtime crashuje na sm_121 z `cudaErrorLaunchFailure` / illegal instruction.
 [install_variants.env]
-TORCH_CUDA_ARCH_LIST = "12.1a"
+# MUSI byc gole `12.1`, nie `12.1a`: CMake vllm sam dokleja `a` (CMakeLists
+# mapuje 12.1 -> 12.1a dla kerneli arch-specific), a parser architektur torcha
+# odrzuca wpis `12.1a` i po cichu schodzi do 12.0. Build konczy sie sukcesem i
+# produkuje runtime BEZ kerneli FlashMLA dla tego GPU — blad widoczny dopiero
+# przy starcie kernela. Weryfikacja: cuobjdump na zbudowanych .so musi pokazac
+# sm_121 (robi to scripts/build-vllm-spark-venv.sh).
+TORCH_CUDA_ARCH_LIST = "12.1"
 VLLM_TARGET_DEVICE = "cuda"
 # Build kerneli z lokalnych zrodel — bez tego pip moglby probowac
 # sciagnac prebuilt wheel z PyPI.
