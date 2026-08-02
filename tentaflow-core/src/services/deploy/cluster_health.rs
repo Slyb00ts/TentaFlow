@@ -28,37 +28,45 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 /// Domyslny port Ray GCS — ten sam, ktorego uzywa deploy.
 const RAY_PORT: u16 = 6379;
 
-/// Rekoncyliacja przy starcie procesu. Deployment w stanie `deploying` byl
-/// prowadzony przez zadanie, ktore zginelo razem z poprzednim procesem — nikt
-/// go nie dokonczy, a rekord blokuje kolejny deploy na tym klastrze
-/// (`active_cluster_deployment` liczy `deploying` jako aktywny). Oznaczamy go
-/// `failed`, zeby admin zobaczyl prawde i mogl ponowic.
+/// Rekoncyliacja przy starcie procesu.
 ///
-/// Rekordow `running` NIE ruszamy tutaj: kontener przezywa restart TentaFlow,
-/// wiec deployment moze byc w pelni sprawny. Weryfikuje je petla zdrowia, ktora
-/// daje im czas na odpowiedz zamiast skazywac je na podstawie jednej sondy w
-/// momencie bootu.
+/// `deploying` — fazy prowadzilo zadanie, ktore zginelo razem z poprzednim
+/// procesem. Nikt go nie dokonczy, a rekord blokuje kolejny deploy na tym
+/// klastrze (`active_cluster_deployment` liczy `deploying` jako aktywny), wiec
+/// oznaczamy `failed`: deploy faktycznie sie nie udal.
+///
+/// `running` — TentaFlow celowo ubija zarzadzane silniki przy zamykaniu, wiec
+/// po restarcie serwer NIE dziala, mimo ze kontener (trzymany przez
+/// `sleep infinity`) zyje dalej. To jest `stopped`, nie `failed`: nic nie
+/// padlo, deployment zostal wylaczony razem z programem. Rozroznienie jest dla
+/// czlowieka patrzacego na dashboard — `failed` kazalby szukac awarii, ktorej
+/// nie bylo. Status `failed` zostaje dla modelu, ktory padl SAM, przy dzialajacym
+/// TentaFlow; to wykrywa petla zdrowia.
 pub fn reconcile_on_startup(db: &DbPool) {
-    let interrupted = match crate::db::repository::cluster_deployments_by_status(db, &["deploying"])
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("cluster health: nie moge odczytac deploymentow: {}", e);
-            return;
-        }
-    };
-    for d in interrupted {
-        warn!(
-            deployment_cluster_id = %d.deployment_cluster_id,
-            model = %d.model,
-            "cluster health: deploy przerwany restartem procesu — oznaczam jako failed"
-        );
-        if let Err(e) = crate::db::repository::set_cluster_deployment_status(
-            db,
-            &d.deployment_cluster_id,
-            "failed",
-        ) {
-            warn!("cluster health: zapis statusu nieudany: {}", e);
+    for (status, next, note) in [
+        ("deploying", "failed", "deploy przerwany restartem procesu"),
+        ("running", "stopped", "silnik wylaczony razem z TentaFlow"),
+    ] {
+        let rows = match crate::db::repository::cluster_deployments_by_status(db, &[status]) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("cluster health: nie moge odczytac deploymentow: {}", e);
+                return;
+            }
+        };
+        for d in rows {
+            info!(
+                deployment_cluster_id = %d.deployment_cluster_id,
+                model = %d.model,
+                "cluster health: {} — {} -> {}", note, status, next
+            );
+            if let Err(e) = crate::db::repository::set_cluster_deployment_status(
+                db,
+                &d.deployment_cluster_id,
+                next,
+            ) {
+                warn!("cluster health: zapis statusu nieudany: {}", e);
+            }
         }
     }
 }
