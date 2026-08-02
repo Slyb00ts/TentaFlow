@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use forge_hal::metal_device::MetalDevice;
 use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool, Stream};
-use forge_kernels::msl::{self, ScaleDtype};
+use forge_kernels::msl::{self, OutDtype, ScaleDtype};
 use forge_types::MemKind;
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/mlx_ffn_bielik.bin");
@@ -184,12 +184,12 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
     let gpu = Gpu { dev, stream };
 
     let scales = ScaleDtype::Bf16;
-    let qmv_src = msl::qmv_affine_4bit_source(scales);
+    let qmv_src = msl::qmv_affine_4bit_source(scales, OutDtype::F32);
     let qmv = gpu
         .dev
         .load_module(qmv_src.as_bytes())
         .unwrap()
-        .kernel(&msl::qmv_affine_4bit_name(scales))
+        .kernel(&msl::qmv_affine_4bit_name(scales, OutDtype::F32))
         .unwrap();
     let norm_src = msl::rmsnorm_source(scales);
     let rmsnorm = gpu
@@ -362,12 +362,12 @@ fn each_kernel_is_also_checked_in_isolation() {
     let gpu = Gpu { dev, stream };
     let scales = ScaleDtype::Bf16;
 
-    let qmv_src = msl::qmv_affine_4bit_source(scales);
+    let qmv_src = msl::qmv_affine_4bit_source(scales, OutDtype::F32);
     let qmv = gpu
         .dev
         .load_module(qmv_src.as_bytes())
         .unwrap()
-        .kernel(&msl::qmv_affine_4bit_name(scales))
+        .kernel(&msl::qmv_affine_4bit_name(scales, OutDtype::F32))
         .unwrap();
     let (hidden, inter) = (f.hidden, f.inter);
 

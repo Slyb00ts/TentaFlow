@@ -51,9 +51,35 @@ pub const QMV_ROWS_PER_GROUP: u32 = 4;
 /// Four SIMD groups of 32 lanes.
 pub const QMV_THREADS: u32 = QMV_ROWS_PER_GROUP * 32;
 
-/// Entry-point name for a given scale type.
-pub fn qmv_affine_4bit_name(scales: ScaleDtype) -> String {
-    format!("qmv_affine_4bit_r4_{}", scales.suffix())
+/// Element type the kernel writes. A parameter, not a separate family: the
+/// previous engine grew a `*_out_f32` twin of every tile that differed by the
+/// pointer type and one store, and each pair then drifted apart on its own
+/// (PLAN_NAPRAWY §2, D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutDtype {
+    F16,
+    F32,
+}
+
+impl OutDtype {
+    fn msl(self) -> &'static str {
+        match self {
+            OutDtype::F16 => "half",
+            OutDtype::F32 => "float",
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            OutDtype::F16 => "f16",
+            OutDtype::F32 => "f32",
+        }
+    }
+}
+
+/// Entry-point name for a given scale type and output type.
+pub fn qmv_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
+    format!("qmv_affine_4bit_r4_{}_out{}", scales.suffix(), out.suffix())
 }
 
 /// Grid for a given output width. Derived, never written out by hand.
@@ -69,16 +95,17 @@ pub fn qmv_affine_4bit_groups(n_rows: u32) -> u32 {
 /// straight out of the packed word. Reading the whole matrix once is the entire
 /// cost of a decode step, so anything that writes a dequantized copy first
 /// doubles the traffic that dominates it.
-pub fn qmv_affine_4bit_source(scales: ScaleDtype) -> String {
+pub fn qmv_affine_4bit_source(scales: ScaleDtype, out: OutDtype) -> String {
     let ty = scales.msl();
-    let name = qmv_affine_4bit_name(scales);
+    let out_ty = out.msl();
+    let name = qmv_affine_4bit_name(scales, out);
     format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
 
 kernel void {name}(
-    device float*         y        [[buffer(0)]],
+    device {out_ty}*      y        [[buffer(0)]],
     device const uint*    packed   [[buffer(1)]],
     device const {ty}*    scales   [[buffer(2)]],
     device const {ty}*    biases   [[buffer(3)]],
@@ -114,11 +141,12 @@ kernel void {name}(
     }}
 
     const float total = simd_sum(acc);
-    if (lane == 0u) {{ y[row] = total; }}
+    if (lane == 0u) {{ y[row] = {out_ty}(total); }}
 }}
 "#,
         name = name,
         ty = ty,
+        out_ty = out_ty,
         rows = QMV_ROWS_PER_GROUP,
     )
 }
@@ -511,6 +539,35 @@ pub fn elementwise_groups(n: u32) -> u32 {
     n.div_ceil(ELEMENTWISE_THREADS)
 }
 
+/// Writes one position's keys or values into the KV cache.
+///
+/// The source is `[kv_head][dim]` contiguous and the destination is
+/// `[kv_head][seq][dim]`, so the write is strided. Doing it with one copy per
+/// head would mean sixteen device copies per layer per token — the previous
+/// engine measured 430 such copies per token to move 8 KiB (PLAN_NAPRAWY §3 pkt 3).
+pub const KV_APPEND_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void kv_append_f16(
+    device half*         cache    [[buffer(0)]],
+    device const half*   src      [[buffer(1)]],
+    constant uint&       kv_heads [[buffer(2)]],
+    constant uint&       dim      [[buffer(3)]],
+    constant uint&       seq_cap  [[buffer(4)]],
+    constant uint&       pos      [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint total = kv_heads * dim;
+    if (gid >= total || pos >= seq_cap) { return; }
+    const uint head = gid / dim;
+    const uint c    = gid % dim;
+    cache[(head * seq_cap + pos) * dim + c] = src[gid];
+}
+"#;
+
+pub const KV_APPEND_NAME: &str = "kv_append_f16";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,12 +585,12 @@ mod tests {
     #[test]
     fn the_name_carries_geometry_and_scale_type() {
         assert_eq!(
-            qmv_affine_4bit_name(ScaleDtype::Bf16),
-            "qmv_affine_4bit_r4_bf16"
+            qmv_affine_4bit_name(ScaleDtype::Bf16, OutDtype::F32),
+            "qmv_affine_4bit_r4_bf16_outf32"
         );
         assert_eq!(
-            qmv_affine_4bit_name(ScaleDtype::F16),
-            "qmv_affine_4bit_r4_f16"
+            qmv_affine_4bit_name(ScaleDtype::F16, OutDtype::F16),
+            "qmv_affine_4bit_r4_f16_outf16"
         );
         assert_eq!(QMV_THREADS, QMV_ROWS_PER_GROUP * 32);
     }
@@ -588,6 +645,45 @@ mod tests {
     }
 
     #[test]
+    fn output_type_is_a_parameter_not_a_second_family() {
+        let a = qmv_affine_4bit_source(ScaleDtype::Bf16, OutDtype::F32);
+        let b = qmv_affine_4bit_source(ScaleDtype::Bf16, OutDtype::F16);
+        // Poza typem zapisu i nazwą oba źródła są identyczne — to jest różnica
+        // między parametrem a drugą rodziną kerneli, która potem żyje własnym
+        // życiem i rozjeżdża się przy pierwszej poprawce.
+        //
+        // Podmiana obejmuje DOKŁADNIE dwa miejsca: deklarację wyjścia i zapis.
+        // Podmiana samego napisu „float" trafiłaby też w `bfloat` i w
+        // akumulatory, a wtedy test porównywałby dwa równie zniekształcone
+        // teksty i przechodził niezależnie od tego, co robi generator.
+        let strip = |src: &str, out: OutDtype| {
+            let ty = out.msl();
+            src.replace(
+                &format!("device {ty}*      y"),
+                "device OUT_T*      y",
+            )
+            .replace(
+                &format!("y[row] = {ty}(total)"),
+                "y[row] = OUT_T(total)",
+            )
+            .replace(&qmv_affine_4bit_name(ScaleDtype::Bf16, out), "ENTRY")
+        };
+        let stripped_a = strip(&a, OutDtype::F32);
+        assert!(stripped_a.contains("device OUT_T*      y"), "podmiana nie trafiła");
+        assert!(stripped_a.contains("y[row] = OUT_T(total)"), "podmiana nie trafiła");
+        assert_eq!(stripped_a, strip(&b, OutDtype::F16));
+    }
+
+    #[test]
+    fn kv_append_scatters_by_head_and_position() {
+        assert!(KV_APPEND_SOURCE.contains(KV_APPEND_NAME));
+        // Adres w cache'u musi zawierać i głowicę, i pozycję; pominięcie
+        // którejkolwiek nadpisuje cudzy wpis bez żadnego objawu.
+        assert!(KV_APPEND_SOURCE.contains("(head * seq_cap + pos) * dim + c"));
+        assert!(KV_APPEND_SOURCE.contains("pos >= seq_cap"));
+    }
+
+    #[test]
     fn embedding_lookup_indexes_by_token_in_both_arrays() {
         let src = embed_gather_source(ScaleDtype::Bf16);
         assert_eq!(embed_gather_name(ScaleDtype::Bf16), "embed_gather_4bit_bf16");
@@ -609,8 +705,8 @@ mod tests {
 
     #[test]
     fn both_variants_come_from_one_template() {
-        let f16 = qmv_affine_4bit_source(ScaleDtype::F16);
-        let bf16 = qmv_affine_4bit_source(ScaleDtype::Bf16);
+        let f16 = qmv_affine_4bit_source(ScaleDtype::F16, OutDtype::F32);
+        let bf16 = qmv_affine_4bit_source(ScaleDtype::Bf16, OutDtype::F32);
         assert!(f16.contains("device const half*    scales"));
         assert!(bf16.contains("device const bfloat*    scales"));
         // Poza nazwą i typem skal źródła muszą być identyczne: dwie ręcznie
@@ -619,14 +715,14 @@ mod tests {
             s.replace(ty, "SCALE_T").replace(name, "ENTRY")
         };
         assert_eq!(
-            norm(&f16, "half*    scales", &qmv_affine_4bit_name(ScaleDtype::F16))
+            norm(&f16, "half*    scales", &qmv_affine_4bit_name(ScaleDtype::F16, OutDtype::F32))
                 .replace("half*    biases", "SCALE_T biases")
                 .replace("const half* s", "const SCALE_T s")
                 .replace("const half* b", "const SCALE_T b"),
             norm(
                 &bf16,
                 "bfloat*    scales",
-                &qmv_affine_4bit_name(ScaleDtype::Bf16)
+                &qmv_affine_4bit_name(ScaleDtype::Bf16, OutDtype::F32)
             )
             .replace("bfloat*    biases", "SCALE_T biases")
             .replace("const bfloat* s", "const SCALE_T s")

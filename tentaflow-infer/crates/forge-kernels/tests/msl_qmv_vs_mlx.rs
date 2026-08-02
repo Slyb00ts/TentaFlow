@@ -10,7 +10,7 @@
 
 use forge_hal::metal_device::MetalDevice;
 use forge_hal::{Device, LaunchArgs, LaunchConfig, Pool};
-use forge_kernels::msl::{self, ScaleDtype};
+use forge_kernels::msl::{self, OutDtype, ScaleDtype};
 use forge_types::MemKind;
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/mlx_qmv_bielik.bin");
@@ -95,10 +95,10 @@ fn dequant_gemv_matches_mlx_on_real_weights() {
     };
     // Bielik jest konwertowany przez mlx-lm, czyli skale w bf16.
     let scale_dtype = ScaleDtype::Bf16;
-    let source = msl::qmv_affine_4bit_source(scale_dtype);
+    let source = msl::qmv_affine_4bit_source(scale_dtype, OutDtype::F32);
     let module = dev.load_module(source.as_bytes()).unwrap();
     let kernel = module
-        .kernel(&msl::qmv_affine_4bit_name(scale_dtype))
+        .kernel(&msl::qmv_affine_4bit_name(scale_dtype, OutDtype::F32))
         .unwrap();
     let stream = dev.create_stream().unwrap();
 
@@ -189,10 +189,10 @@ fn a_wrong_group_size_is_visible_in_the_result() {
         return;
     };
     let c = &cases[0];
-    let source = msl::qmv_affine_4bit_source(ScaleDtype::Bf16);
+    let source = msl::qmv_affine_4bit_source(ScaleDtype::Bf16, OutDtype::F32);
     let module = dev.load_module(source.as_bytes()).unwrap();
     let kernel = module
-        .kernel(&msl::qmv_affine_4bit_name(ScaleDtype::Bf16))
+        .kernel(&msl::qmv_affine_4bit_name(ScaleDtype::Bf16, OutDtype::F32))
         .unwrap();
     let stream = dev.create_stream().unwrap();
 
