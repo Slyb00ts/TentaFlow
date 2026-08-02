@@ -10,6 +10,8 @@ default = ["cuda"]
 cuda = ["dep:cudarc"]
 # Backend HIP/ROCm. Wymaga ROCm w czasie budowy (ROCM_PATH, domyślnie /opt/rocm).
 hip = []
+# Backend Metal (macOS). Shim Objective-C budowany przez build.rs.
+metal = []
 
 [dependencies]
 forge-types.workspace = true

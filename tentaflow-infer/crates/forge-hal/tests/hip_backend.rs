@@ -1,4 +1,9 @@
 // ===== File: hip_backend.rs — HIP backend: caps, memory, module load, launch =====
+// Gated on the feature it tests: without it the crate has no `hip` module and
+// the whole test target failed to compile, which took the rest of the suite
+// down with it on every machine that is not building for ROCm.
+#![cfg(feature = "hip")]
+
 // Test buduje code object w locie przez `hipcc --genco`, więc nie zależy od
 // artefaktów Mojo ani od niczego w drzewie. Pomija się czysto, gdy nie ma
 // urządzenia HIP albo ROCm.

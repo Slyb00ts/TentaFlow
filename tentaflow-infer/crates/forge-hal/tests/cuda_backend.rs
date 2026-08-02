@@ -22,7 +22,19 @@ const TEST_POOLS: PoolSizes = PoolSizes {
 };
 
 fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(0, TEST_POOLS) {
+    // `catch_unwind`, not just the `Err` arm: on a host with no CUDA driver
+    // library at all — any Mac, for one — cudarc panics while lazily loading
+    // it, so the graceful skip below never got a chance and the whole suite
+    // went red instead of quiet.
+    let created = std::panic::catch_unwind(|| CudaDevice::new(0, TEST_POOLS));
+    let created = match created {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!("skipping CUDA test: brak sterownika CUDA na tej maszynie");
+            return None;
+        }
+    };
+    match created {
         Ok(dev) => Some(dev),
         Err(e) => {
             eprintln!("skipping CUDA test: no usable CUDA device ({e})");
@@ -350,7 +362,7 @@ fn bounds_check_rejects_offset_overflow() {
 #[test]
 fn cross_device_handles_rejected() {
     let Some(dev) = device() else { return };
-    let Ok(other) = CudaDevice::new(1, TEST_POOLS) else {
+    let Ok(Ok(other)) = std::panic::catch_unwind(|| CudaDevice::new(1, TEST_POOLS)) else {
         eprintln!("skipping cross-device test: no second CUDA device");
         return;
     };

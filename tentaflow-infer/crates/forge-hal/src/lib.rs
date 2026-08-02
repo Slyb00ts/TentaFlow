@@ -15,6 +15,10 @@ pub mod cpu;
 pub mod hip;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_device;
 #[cfg(any(feature = "cuda", feature = "hip"))]
 pub mod gpu;
 
@@ -93,12 +97,25 @@ impl KernelScalar for usize {
     }
 }
 
+/// What one argument slot holds. Recorded alongside the slot value because a
+/// raw address is enough for an API that takes pointers and not enough for one
+/// that binds buffers by index: Metal needs to know WHICH arguments are
+/// buffers, and recovering that by comparing slot values against buffer
+/// addresses would be a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    Scalar,
+    /// Index into `retained()` plus the byte offset requested at build time.
+    Buffer { retained: usize, byte_offset: u64 },
+}
+
 /// Typed kernel-argument builder. Each argument occupies one address-stable
 /// 8-byte slot; buffers contribute their raw device address and are retained
 /// (Arc clone) so the asynchronous launch cannot outlive the allocation.
 #[derive(Default)]
 pub struct LaunchArgs {
     slots: Vec<u64>,
+    kinds: Vec<ArgKind>,
     retained: Vec<DevBuffer>,
 }
 
@@ -110,6 +127,10 @@ impl LaunchArgs {
     /// Pass the buffer's base device address as a pointer argument.
     pub fn buf(mut self, buffer: &DevBuffer) -> Self {
         self.slots.push(buffer.device_ptr());
+        self.kinds.push(ArgKind::Buffer {
+            retained: self.retained.len(),
+            byte_offset: 0,
+        });
         self.retained.push(buffer.clone());
         self
     }
@@ -124,6 +145,10 @@ impl LaunchArgs {
             )));
         }
         self.slots.push(buffer.device_ptr() + byte_offset as u64);
+        self.kinds.push(ArgKind::Buffer {
+            retained: self.retained.len(),
+            byte_offset: byte_offset as u64,
+        });
         self.retained.push(buffer.clone());
         Ok(self)
     }
@@ -131,6 +156,7 @@ impl LaunchArgs {
     /// Pass a scalar by value.
     pub fn scalar<T: KernelScalar>(mut self, value: T) -> Self {
         self.slots.push(value.to_slot());
+        self.kinds.push(ArgKind::Scalar);
         self
     }
 
@@ -153,6 +179,12 @@ impl LaunchArgs {
     /// retain these so replays cannot dereference freed memory.
     pub fn retained(&self) -> &[DevBuffer] {
         &self.retained
+    }
+
+    /// Per-slot kind, parallel to `slots()`. Backends that bind arguments by
+    /// index rather than by address read this instead of guessing.
+    pub fn kinds(&self) -> &[ArgKind] {
+        &self.kinds
     }
 }
 
