@@ -56,27 +56,46 @@ tam jest największy zapas.
 
 ## Znane usterki tej platformy
 
-### Grafy CUDA zawieszają silnik
+### Grafy CUDA zawieszają silnik — kolektywa przechwycona w grafie
 
-Sygnatura złapana przez `py-spy` w trakcie zawieszenia: wątek workera stoi w
-`cudaEventSynchronize` po nieblokującej kopii GPU→host do pamięci pinned, **GPU
-jest w 0% wykorzystania**, a drugi rank TP jest bezczynny z pustą kolejką —
-więc nic nie liczy i żadna kolektywa nie czeka. Zdarzenie po prostu nie zostaje
-zasygnalizowane.
+Zawis wystepuje DOKLADNIE wtedy, gdy `all-reduce` z podzialu tensorowego zostaje
+przechwycona w grafie CUDA i wykonana miedzy dwoma wezlami. Cztery pomiary:
 
-Miejsce zależy od konfiguracji: `async_copy_ready_event.synchronize()` przy
-async scheduling, `transfer_event.synchronize()` w `_to_list` bez niego.
-`patch_event_sync_026.py` usuwa oba te zdarzenia — i zawis przenosi się w
-kolejne miejsce, co wskazuje, że problemem jest samo odtwarzanie grafu, a nie
-konkretne zdarzenie.
+| konfiguracja | kolektywa w grafie | stabilna | decode tok/s |
+|---|---|---|---|
+| TP=2 + grafy FULL_AND_PIECEWISE | tak | **nie** | 26,5 |
+| TP=2 + grafy PIECEWISE, `vllm::all_reduce` w `splitting_ops` | nie | tak | 15,7 |
+| PP=2 + grafy (brak kolektyw miedzywezlowych) | nie dotyczy | tak | 15,5 |
+| TP=2 + `--enforce-eager` | brak grafow | tak | **16,7** |
 
-Wykluczone dowodowo (każde osobnym pomiarem): parsery `deepseek_v4`, numer
-żądania, `max_tokens`, kompilacja Tritona (limit 1800 s wyczerpany bez żadnej
-kompilacji), `--async-scheduling` (po jawnym `--no-async-scheduling`), cache
-prefiksów, wyczerpanie pamięci (przy 0,80 wolne nigdy nie spadło poniżej 14 GiB)
-oraz `VLLM_USE_BREAKABLE_CUDAGRAPH=0`.
+Kontrola rozstrzygajaca: ten sam vLLM, JEDEN Spark, TP=1, grafy wlaczone,
+model Bielik-PL-Minitron-7B-NVFP4 — 9/9 zadan, 48 tok/s decode, zero zawiesen.
+Grafy na GB10 sa wiec sprawne; psuje sie dopiero ich zlozenie z komunikacja
+miedzywezlowa.
 
-**Obejście:** `--enforce-eager`. Kosztuje ok. 37% wydajności dekodowania.
+Sygnatura zlapana przez `py-spy --native` w trakcie zawieszenia: rank0 stoi
+WEWNATRZ `cuMemcpyDtoHAsync_v2` (libcuda), GPU ma 0% wykorzystania, rank1 jest
+bezczynny z pusta kolejka, sterownik nie zglasza bledu. Wywolanie, ktore ma
+wrocic natychmiast, czeka na oproznienie strumienia, ktory nie postepuje.
+
+Wykluczone dowodowo, kazde osobnym pomiarem: parsery `deepseek_v4`, numer
+zadania, `max_tokens`, kompilacja Tritona (limit 1800 s wyczerpany bez zadnej
+kompilacji), `--async-scheduling` (po jawnym `--no-async-scheduling`, wczesniejszy
+test byl pusty — domyslne `None` oznacza WLACZONE), cache prefiksow, zapas
+pamieci (przy util 0,70 wolne nie spadlo ponizej 28 GiB), `VLLM_USE_BREAKABLE_CUDAGRAPH=0`,
+`NCCL_GRAPH_MIXING_SUPPORT=1`, tryb `FULL_DECODE_ONLY` oraz wlasna latka usuwajaca
+oba `cudaEventSynchronize` (`patch_event_sync_026.py`) — zawis przenosil sie
+wtedy w kolejne miejsce.
+
+**Wniosek:** 58% przewagi grafow bierze sie z przechwycenia calej warstwy RAZEM
+z kolektywa, czyli z tego, co sie psuje. Konfiguracja tego nie odzyska —
+wszystkie stabilne warianty mieszcza sie w 15,5-16,7 tok/s, a najszybszy z nich
+to zwykly eager. Grafy piecewise sa WOLNIEJSZE od eagera (15,7 vs 16,7): narzut
+przechwytywania bez korzysci, bo najdrozsza synchronizacja i tak wypada poza graf.
+
+Naprawa wymaga zmiany w vLLM albo NCCL w obsludze kolektyw przechwyconych w
+grafach przy wielu wezlach. Material do zgloszenia jest komplety: minimalna
+reprodukcja, stos natywny, dowod bezczynnosci GPU i kontrola jednowezlowa.
 
 ### DSpark nie startuje
 

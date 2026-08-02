@@ -58,6 +58,11 @@ PREFIX="${PREFIX:-on}"
 # copy; grafy sa ostatnia warstwa, ktora moze na to wplywac.
 GRAPHS="${GRAPHS:-off}"
 BREAKABLE="${BREAKABLE:-1}"
+# TP robi all-reduce na kazda warstwe miedzy wezlami; PP przesyla tylko
+# aktywacje miedzy etapami. Jesli zawis to kolektywa przechwycona w grafie,
+# PP powinno go nie miec.
+TP="${TP:-2}"
+PP="${PP:-1}"
 SEQS="${SEQS:-6}"
 KVEC=5                       # = dspark_block_size checkpointu, NIE do strojenia
 CAPTURE=""                   # domyslnie seqs*(k+1)
@@ -76,6 +81,8 @@ while [ $# -gt 0 ]; do
     --prefix)  PREFIX="$2"; shift 2;;
     --graphs)  GRAPHS="$2"; shift 2;;
     --breakable) BREAKABLE="$2"; shift 2;;
+    --tp)      TP="$2"; shift 2;;
+    --pp)      PP="$2"; shift 2;;
     --seqs)    SEQS="$2"; shift 2;;
     --maxlen)  MAXLEN="$2"; shift 2;;
     --batched) BATCHED="$2"; shift 2;;
@@ -110,6 +117,11 @@ write_launcher() {  # $1 = rank, $2 = this node's RDMA ip
 set -x
 export NCCL_IB_HCA=$IB_HCA NCCL_SOCKET_IFNAME=$SOCKET_IF GLOO_SOCKET_IFNAME=$SOCKET_IF
 export NCCL_IB_DISABLE=0 NCCL_IB_GID_INDEX=$GID VLLM_HOST_IP=$ip
+# CUDA graphs work on a single Spark but deadlock across two, with rank0
+# blocked in cuMemcpyDtoHAsync while rank1 sits idle -- the signature of a
+# collective captured in a graph that the peer never joins. NCCL needs this
+# to be told that graph and non-graph launches are mixed.
+export NCCL_GRAPH_MIXING_SUPPORT=${NCCL_GRAPH_MIXING_SUPPORT:-1}
 export HF_HUB_CACHE=$MODELS_DIR HF_HUB_OFFLINE=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_SKIP_INIT_MEMORY_CHECK=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -148,7 +160,7 @@ export PATH=$VENV/bin:/usr/local/cuda/bin:\$PATH
 # which is what made long prompts return 500 with "RPC call to sample_tokens
 # timed out" while short ones worked.
 exec $VENV/bin/vllm serve $MODEL --host 0.0.0.0 --port $PORT \\
-  --tensor-parallel-size 2 --pipeline-parallel-size 1 \\
+  --tensor-parallel-size $TP --pipeline-parallel-size $PP \\
   --distributed-executor-backend mp \\
   --nnodes 2 --node-rank $rank --master-addr $HEAD_IP --master-port $DIST_PORT $headless \\
   --trust-remote-code \\
@@ -205,7 +217,7 @@ mkdir -p "$CACHE_DIR"
 case "$cmd" in
   up)
     [ -x "$VENV/bin/vllm" ] || { echo "brak bundla: $VENV — uruchom scripts/build-vllm-spark-venv.sh"; exit 1; }
-    echo "profil: util=$UTIL seqs=$SEQS capture=$CAPTURE maxlen=$MAXLEN batched=$BATCHED k=$KVEC kv=$KVDTYPE spec=$SPEC parsery=$PARSERS async=$ASYNC prefix=$PREFIX grafy=$GRAPHS breakable=$BREAKABLE"
+    echo "profil: tp=$TP pp=$PP util=$UTIL seqs=$SEQS capture=$CAPTURE maxlen=$MAXLEN batched=$BATCHED k=$KVEC kv=$KVDTYPE spec=$SPEC parsery=$PARSERS async=$ASYNC prefix=$PREFIX grafy=$GRAPHS breakable=$BREAKABLE"
     "$0" down >/dev/null 2>&1
     # Worker pierwszy: head binduje TCPStore master i od razu szuka rankow.
     start_node 1 "$WORKER_IP" "$WORKER_SSH" && echo "worker: start"
