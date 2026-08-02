@@ -25,6 +25,11 @@ set -uo pipefail
 PREFIX="${PREFIX:-/opt/TentaFlow/.runtime/bundles/vllm-spark}"
 VLLM_REF="${VLLM_REF:-v0.26.0}"
 TORCH_SPEC="${TORCH_SPEC:-torch==2.11.0+cu130}"
+# DeepSeek V4 imports torchvision (multimodal preprocessing), so it is not
+# optional: without it the worker dies at init with ModuleNotFoundError long
+# after the weights have loaded. It must come from the SAME cu130 index and be
+# the release paired with this torch -- 0.26.0 goes with torch 2.11.
+TORCHVISION_SPEC="${TORCHVISION_SPEC:-torchvision==0.26.0+cu130}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 JOBS="${MAX_JOBS:-8}"
@@ -73,8 +78,12 @@ fi
 # wheel over the cu130 aarch64 one and the CUDA kernels would build against the
 # wrong runtime.
 if ! done_step torch; then
-  log "torch $TORCH_SPEC z $TORCH_INDEX (~2-4 min)"
+  log "torch $TORCH_SPEC + $TORCHVISION_SPEC z $TORCH_INDEX (~2-4 min)"
   "$PY" -m pip install "$TORCH_SPEC" --index-url "$TORCH_INDEX" || die "torch"
+  # --no-deps: torchvision's own dependency pin would happily pull a different
+  # torch over the cu130 one we just placed.
+  "$PY" -m pip install --no-deps "$TORCHVISION_SPEC" --index-url "$TORCH_INDEX" \
+    || die "torchvision"
   mark torch
 fi
 "$PY" - <<'EOF' || die "torch nie widzi CUDA"
