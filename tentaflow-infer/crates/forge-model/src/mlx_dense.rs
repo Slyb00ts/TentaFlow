@@ -23,6 +23,14 @@ use forge_hal::{DevBuffer, Device, KernelHandle, LaunchArgs, LaunchConfig, Pool,
 use forge_kernels::msl::{self, OutDtype, ScaleDtype};
 use forge_types::{ForgeError, MemKind, Result};
 
+/// Prompt tokens carried through the layers in one pass.
+///
+/// Not a round number picked for looks: past roughly this many tokens the
+/// batched matmul stops winning, because its activation tile no longer fits in
+/// cache and starts being re-read once per output row. Measured on M4 at 2.09x
+/// for 128 and 0.72x for 512 (docs/pomiary/eks-a4-batched-matmul-m4.md).
+pub const PREFILL_CHUNK: u32 = 128;
+
 /// Everything the decode loop needs to know about the architecture.
 #[derive(Debug, Clone, Copy)]
 pub struct DenseShape {
@@ -74,6 +82,8 @@ struct Layer {
 struct Pipelines {
     qmv_f16: KernelHandle,
     qmv_f32: KernelHandle,
+    qmm_f16: KernelHandle,
+    qmm_f32: KernelHandle,
     rmsnorm: KernelHandle,
     silu_mul: KernelHandle,
     rope: KernelHandle,
@@ -97,6 +107,8 @@ struct Scratch {
     act: DevBuffer,
     logits: DevBuffer,
     token: DevBuffer,
+    /// Identyfikatory tokenów kafla, czytane przez kernel osadzeń.
+    ids: DevBuffer,
 }
 
 pub struct MlxDense {
@@ -205,6 +217,14 @@ impl MlxDense {
                 &msl::qmv_affine_4bit_source(scales_dtype, OutDtype::F32),
                 &msl::qmv_affine_4bit_name(scales_dtype, OutDtype::F32),
             )?,
+            qmm_f16: compile(
+                &msl::qmm_affine_4bit_source(scales_dtype, OutDtype::F16),
+                &msl::qmm_affine_4bit_name(scales_dtype, OutDtype::F16),
+            )?,
+            qmm_f32: compile(
+                &msl::qmm_affine_4bit_source(scales_dtype, OutDtype::F32),
+                &msl::qmm_affine_4bit_name(scales_dtype, OutDtype::F32),
+            )?,
             rmsnorm: compile(
                 &msl::rmsnorm_source(scales_dtype),
                 &msl::rmsnorm_name(scales_dtype),
@@ -226,19 +246,25 @@ impl MlxDense {
 
         let f16 = |elems: u32| device.alloc(elems as usize * 2, MemKind::Device, Pool::Activations);
         let f32b = |elems: u32| device.alloc(elems as usize * 4, MemKind::Device, Pool::Activations);
+        // Wszystko poza logitami ma miejsce na cały kafel prefillu: dekodowanie
+        // używa pierwszego wiersza tych samych buforów. Logity liczymy tylko dla
+        // ostatniego tokenu, więc zostają jednym wierszem — 32 tys. kolumn razy
+        // 128 byłoby 16 MB na coś, z czego czytamy 1/128.
+        let n = PREFILL_CHUNK;
         let scratch = Scratch {
-            h: f16(shape.hidden)?,
-            norm: f16(shape.hidden)?,
-            q: f16(shape.hidden)?,
-            k: f16(shape.kv_width())?,
-            v: f16(shape.kv_width())?,
-            attn: f16(shape.hidden)?,
-            proj: f32b(shape.hidden)?,
-            gate: f32b(shape.inter)?,
-            up: f32b(shape.inter)?,
-            act: f16(shape.inter)?,
+            h: f16(n * shape.hidden)?,
+            norm: f16(n * shape.hidden)?,
+            q: f16(n * shape.hidden)?,
+            k: f16(n * shape.kv_width())?,
+            v: f16(n * shape.kv_width())?,
+            attn: f16(n * shape.hidden)?,
+            proj: f32b(n * shape.hidden)?,
+            gate: f32b(n * shape.inter)?,
+            up: f32b(n * shape.inter)?,
+            act: f16(n * shape.inter)?,
             logits: f32b(shape.vocab)?,
             token: f32b(1)?,
+            ids: device.alloc(n as usize * 4, MemKind::Device, Pool::Activations)?,
         };
 
         let stream = device.create_stream()?;
@@ -286,6 +312,7 @@ impl MlxDense {
     pub fn probe(&mut self, token: u32, layers: usize) -> Result<Vec<f32>> {
         let s = self.shape;
         let (pos, seq) = (self.position, self.position + 1);
+        self.device.write(&token.to_le_bytes(), &self.scratch.ids, 0)?;
         self.launch(
             &self.pipes.embed,
             LaunchArgs::new()
@@ -293,14 +320,15 @@ impl MlxDense {
                 .buf(&self.embed.packed)
                 .buf(&self.embed.scales)
                 .buf(&self.embed.biases)
-                .scalar(token)
+                .buf(&self.scratch.ids)
                 .scalar(s.hidden)
-                .scalar(s.group),
+                .scalar(s.group)
+                .scalar(1u32),
             msl::elementwise_groups(s.hidden),
             msl::ELEMENTWISE_THREADS,
         )?;
         for index in 0..layers.min(self.layers.len()) {
-            self.layer(index, pos, seq)?;
+            self.layer(index, pos, seq, 1)?;
         }
         self.stream.synchronize()?;
         self.hidden_state()
@@ -318,41 +346,11 @@ impl MlxDense {
     /// at the end. That is the whole reason the backend exposes a command
     /// buffer as an object rather than hiding it inside "launch".
     pub fn step(&mut self, token: u32) -> Result<Vec<f32>> {
-        if self.position >= self.seq_cap {
-            return Err(ForgeError::Unsupported(format!(
-                "kontekst przekroczył pojemność cache'u ({})",
-                self.seq_cap
-            )));
-        }
-        let s = self.shape;
-        let pos = self.position;
-        let seq = pos + 1;
-
-        self.launch(
-            &self.pipes.embed,
-            LaunchArgs::new()
-                .buf(&self.scratch.h)
-                .buf(&self.embed.packed)
-                .buf(&self.embed.scales)
-                .buf(&self.embed.biases)
-                .scalar(token)
-                .scalar(s.hidden)
-                .scalar(s.group),
-            msl::elementwise_groups(s.hidden),
-            msl::ELEMENTWISE_THREADS,
-        )?;
-
-        for index in 0..self.layers.len() {
-            self.layer(index, pos, seq)?;
-        }
-
-        self.rmsnorm(&self.scratch.norm, &self.scratch.h, &self.final_norm)?;
-        self.gemv_f32(&self.scratch.logits, &self.lm_head, &self.scratch.norm)?;
+        self.forward(&[token])?;
         self.stream.synchronize()?;
 
-        let mut raw = vec![0u8; s.vocab as usize * 4];
+        let mut raw = vec![0u8; self.shape.vocab as usize * 4];
         self.device.read(&self.scratch.logits, 0, &mut raw)?;
-        self.position += 1;
         Ok(raw
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -362,46 +360,45 @@ impl MlxDense {
     /// Greedy choice done on the device, so the vocabulary never crosses the
     /// bus just to be scanned for its maximum.
     pub fn step_argmax(&mut self, token: u32) -> Result<u32> {
-        let s = self.shape;
-        let logits_len = s.vocab;
         self.step_no_readback(token)?;
+        self.argmax_of_logits()
+    }
+
+    /// Feeds a prompt in one pass per chunk and returns the token that follows it.
+    ///
+    /// This is where a prompt stops costing one full read of the weights per
+    /// token. The chunk is bounded because past it the batched matmul stops
+    /// paying off, so a long prompt is several chunks rather than one launch.
+    pub fn prefill(&mut self, prompt: &[u32]) -> Result<u32> {
+        if prompt.is_empty() {
+            return Err(ForgeError::Format("pusty prompt".into()));
+        }
+        for chunk in prompt.chunks(PREFILL_CHUNK as usize) {
+            self.forward(chunk)?;
+            self.stream.synchronize()?;
+        }
+        self.argmax_of_logits()
+    }
+
+    fn argmax_of_logits(&mut self) -> Result<u32> {
         self.launch(
             &self.pipes.argmax,
             LaunchArgs::new()
                 .buf(&self.scratch.token)
                 .buf(&self.scratch.logits)
-                .scalar(logits_len),
+                .scalar(self.shape.vocab),
             1,
             msl::ARGMAX_THREADS,
         )?;
         self.stream.synchronize()?;
         let mut raw = [0u8; 4];
         self.device.read(&self.scratch.token, 0, &mut raw)?;
-        self.position += 1;
         Ok(u32::from_le_bytes(raw))
     }
 
     /// Feeds a prompt and continues it greedily.
-    ///
-    /// The prompt goes through token by token, which is correct and slow: one
-    /// pass over 4.2 GB of weights per prompt token, where a batched prefill
-    /// would read them once for the whole prompt. That is the next lever, not
-    /// an oversight — and it is the reason a long prompt costs what it costs
-    /// here (PLAN_NAPRAWY §8).
     pub fn generate(&mut self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Err(ForgeError::Format("pusty prompt".into()));
-        }
-        let mut next = 0u32;
-        for (i, &token) in prompt.iter().enumerate() {
-            if i + 1 == prompt.len() {
-                next = self.step_argmax(token)?;
-            } else {
-                self.step_no_readback(token)?;
-                self.stream.synchronize()?;
-                self.position += 1;
-            }
-        }
+        let mut next = self.prefill(prompt)?;
         let mut out = Vec::with_capacity(max_new);
         out.push(next);
         for _ in 1..max_new {
@@ -412,14 +409,35 @@ impl MlxDense {
     }
 
     fn step_no_readback(&mut self, token: u32) -> Result<()> {
-        if self.position >= self.seq_cap {
+        self.forward(&[token])
+    }
+
+    /// Runs `tokens` through the whole model, leaving the logits for the LAST
+    /// of them in scratch. Positions run from the current one upwards.
+    ///
+    /// One code path for a prompt chunk and for a single decode step. The batch
+    /// size reaches the kernels as an argument, and at one token every kernel
+    /// does exactly what it did before this existed — which is what makes the
+    /// bit-for-bit agreement between the two forms testable rather than assumed.
+    fn forward(&mut self, tokens: &[u32]) -> Result<()> {
+        let n = tokens.len() as u32;
+        if n == 0 || n > PREFILL_CHUNK {
+            return Err(ForgeError::Unsupported(format!(
+                "kafel {n} tokenów poza zakresem 1..={PREFILL_CHUNK}"
+            )));
+        }
+        if self.position + n > self.seq_cap {
             return Err(ForgeError::Unsupported(format!(
                 "kontekst przekroczył pojemność cache'u ({})",
                 self.seq_cap
             )));
         }
         let s = self.shape;
-        let (pos, seq) = (self.position, self.position + 1);
+        let (pos, seq) = (self.position, self.position + n);
+
+        let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.device.write(&ids, &self.scratch.ids, 0)?;
+
         self.launch(
             &self.pipes.embed,
             LaunchArgs::new()
@@ -427,32 +445,49 @@ impl MlxDense {
                 .buf(&self.embed.packed)
                 .buf(&self.embed.scales)
                 .buf(&self.embed.biases)
-                .scalar(token)
+                .buf(&self.scratch.ids)
                 .scalar(s.hidden)
-                .scalar(s.group),
-            msl::elementwise_groups(s.hidden),
+                .scalar(s.group)
+                .scalar(n),
+            msl::elementwise_groups(n * s.hidden),
             msl::ELEMENTWISE_THREADS,
         )?;
         for index in 0..self.layers.len() {
-            self.layer(index, pos, seq)?;
+            self.layer(index, pos, seq, n)?;
         }
-        self.rmsnorm(&self.scratch.norm, &self.scratch.h, &self.final_norm)?;
-        self.gemv_f32(&self.scratch.logits, &self.lm_head, &self.scratch.norm)
+        self.rmsnorm(&self.scratch.norm, &self.scratch.h, &self.final_norm, n)?;
+
+        // Logity tylko dla ostatniego tokenu kafla: pozostałe wiersze służą
+        // wyłącznie zapełnieniu cache'u, a głowa wyjściowa jest z 32 tysiącami
+        // wierszy najdroższą pojedynczą macierzą w modelu.
+        let last = (n - 1) as usize * s.hidden as usize * 2;
+        self.gemv(
+            &self.pipes.qmv_f32,
+            &self.scratch.logits,
+            &self.lm_head,
+            &self.scratch.norm,
+            last,
+        )?;
+        // Licznik pozycji przechodzi przez to jedno miejsce. Drugi kafel prefillu
+        // musi zacząć tam, gdzie skończył pierwszy, a odejmowanie jedynki „na
+        // koniec" jest poprawne wyłącznie dla ostatniego z nich.
+        self.position += n;
+        Ok(())
     }
 
-    fn layer(&self, index: usize, pos: u32, seq: u32) -> Result<()> {
+    fn layer(&self, index: usize, pos: u32, seq: u32, tokens: u32) -> Result<()> {
         let s = self.shape;
         let l = &self.layers[index];
 
-        self.rmsnorm(&self.scratch.norm, &self.scratch.h, &l.attn_norm)?;
-        self.gemv_f16(&self.scratch.q, &l.q, &self.scratch.norm)?;
-        self.gemv_f16(&self.scratch.k, &l.k, &self.scratch.norm)?;
-        self.gemv_f16(&self.scratch.v, &l.v, &self.scratch.norm)?;
+        self.rmsnorm(&self.scratch.norm, &self.scratch.h, &l.attn_norm, tokens)?;
+        self.matmul(&self.scratch.q, &l.q, &self.scratch.norm, tokens, true)?;
+        self.matmul(&self.scratch.k, &l.k, &self.scratch.norm, tokens, true)?;
+        self.matmul(&self.scratch.v, &l.v, &self.scratch.norm, tokens, true)?;
 
-        self.rope(&self.scratch.q, s.heads, pos)?;
-        self.rope(&self.scratch.k, s.kv_heads, pos)?;
-        self.kv_append(&l.k_cache, &self.scratch.k, pos)?;
-        self.kv_append(&l.v_cache, &self.scratch.v, pos)?;
+        self.rope(&self.scratch.q, s.heads, pos, tokens)?;
+        self.rope(&self.scratch.k, s.kv_heads, pos, tokens)?;
+        self.kv_append(&l.k_cache, &self.scratch.k, pos, tokens)?;
+        self.kv_append(&l.v_cache, &self.scratch.v, pos, tokens)?;
 
         self.launch(
             &self.pipes.attn,
@@ -465,32 +500,39 @@ impl MlxDense {
                 .scalar(s.kv_heads)
                 .scalar(seq)
                 .scalar(self.seq_cap)
-                .scalar(s.attn_scale()),
-            s.heads,
+                .scalar(s.attn_scale())
+                .scalar(tokens),
+            msl::attn_groups(s.heads, tokens),
             msl::ATTN_THREADS,
         )?;
 
-        self.gemv_f32(&self.scratch.proj, &l.o, &self.scratch.attn)?;
-        self.residual(&self.scratch.proj)?;
+        self.matmul(&self.scratch.proj, &l.o, &self.scratch.attn, tokens, false)?;
+        self.residual(&self.scratch.proj, tokens)?;
 
-        self.rmsnorm(&self.scratch.norm, &self.scratch.h, &l.ffn_norm)?;
-        self.gemv_f32(&self.scratch.gate, &l.gate, &self.scratch.norm)?;
-        self.gemv_f32(&self.scratch.up, &l.up, &self.scratch.norm)?;
+        self.rmsnorm(&self.scratch.norm, &self.scratch.h, &l.ffn_norm, tokens)?;
+        self.matmul(&self.scratch.gate, &l.gate, &self.scratch.norm, tokens, false)?;
+        self.matmul(&self.scratch.up, &l.up, &self.scratch.norm, tokens, false)?;
         self.launch(
             &self.pipes.silu_mul,
             LaunchArgs::new()
                 .buf(&self.scratch.act)
                 .buf(&self.scratch.gate)
                 .buf(&self.scratch.up)
-                .scalar(s.inter),
-            msl::silu_mul_groups(s.inter),
+                .scalar(tokens * s.inter),
+            msl::silu_mul_groups(tokens * s.inter),
             msl::SILU_MUL_THREADS,
         )?;
-        self.gemv_f32(&self.scratch.proj, &l.down, &self.scratch.act)?;
-        self.residual(&self.scratch.proj)
+        self.matmul(&self.scratch.proj, &l.down, &self.scratch.act, tokens, false)?;
+        self.residual(&self.scratch.proj, tokens)
     }
 
-    fn rmsnorm(&self, out: &DevBuffer, input: &DevBuffer, weight: &DevBuffer) -> Result<()> {
+    fn rmsnorm(
+        &self,
+        out: &DevBuffer,
+        input: &DevBuffer,
+        weight: &DevBuffer,
+        tokens: u32,
+    ) -> Result<()> {
         self.launch(
             &self.pipes.rmsnorm,
             LaunchArgs::new()
@@ -499,13 +541,19 @@ impl MlxDense {
                 .buf(weight)
                 .scalar(self.shape.hidden)
                 .scalar(self.shape.eps),
-            1,
+            tokens,
             msl::RMSNORM_THREADS,
         )
     }
 
-    fn gemv(&self, kernel: &KernelHandle, out: &DevBuffer, w: &Quantized, x: &DevBuffer)
-        -> Result<()> {
+    fn gemv(
+        &self,
+        kernel: &KernelHandle,
+        out: &DevBuffer,
+        w: &Quantized,
+        x: &DevBuffer,
+        x_offset: usize,
+    ) -> Result<()> {
         self.launch(
             kernel,
             LaunchArgs::new()
@@ -513,7 +561,7 @@ impl MlxDense {
                 .buf(&w.packed)
                 .buf(&w.scales)
                 .buf(&w.biases)
-                .buf(x)
+                .buf_at(x, x_offset)?
                 .scalar(w.rows)
                 .scalar(w.cols)
                 .scalar(self.shape.group),
@@ -522,15 +570,54 @@ impl MlxDense {
         )
     }
 
-    fn gemv_f16(&self, out: &DevBuffer, w: &Quantized, x: &DevBuffer) -> Result<()> {
-        self.gemv(&self.pipes.qmv_f16, out, w, x)
+    /// Projection for a whole batch. One token takes the vector form, which is
+    /// three times faster there because the tile would compute eight columns and
+    /// keep one; more than one takes the tile, which is what makes prefill cheap.
+    /// The two agree bit for bit, so this choice cannot change an answer.
+    fn matmul(
+        &self,
+        out: &DevBuffer,
+        w: &Quantized,
+        x: &DevBuffer,
+        tokens: u32,
+        f16_out: bool,
+    ) -> Result<()> {
+        if tokens == 1 {
+            let k = if f16_out {
+                &self.pipes.qmv_f16
+            } else {
+                &self.pipes.qmv_f32
+            };
+            return self.gemv(k, out, w, x, 0);
+        }
+        let k = if f16_out {
+            &self.pipes.qmm_f16
+        } else {
+            &self.pipes.qmm_f32
+        };
+        let (gx, gy) = msl::qmm_affine_4bit_groups(w.rows, tokens);
+        self.device.launch(
+            k,
+            &LaunchConfig {
+                grid: (gx, gy, 1),
+                block: (msl::QMV_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(out)
+                .buf(&w.packed)
+                .buf(&w.scales)
+                .buf(&w.biases)
+                .buf(x)
+                .scalar(w.rows)
+                .scalar(w.cols)
+                .scalar(self.shape.group)
+                .scalar(tokens),
+            &self.stream,
+        )
     }
 
-    fn gemv_f32(&self, out: &DevBuffer, w: &Quantized, x: &DevBuffer) -> Result<()> {
-        self.gemv(&self.pipes.qmv_f32, out, w, x)
-    }
-
-    fn rope(&self, buf: &DevBuffer, heads: u32, pos: u32) -> Result<()> {
+    fn rope(&self, buf: &DevBuffer, heads: u32, pos: u32, tokens: u32) -> Result<()> {
         let threads = msl::ELEMENTWISE_THREADS;
         self.launch(
             &self.pipes.rope,
@@ -539,13 +626,14 @@ impl MlxDense {
                 .scalar(heads)
                 .scalar(self.shape.head_dim)
                 .scalar(pos)
-                .scalar(self.shape.rope_theta),
-            msl::rope_groups(heads, self.shape.head_dim, threads),
+                .scalar(self.shape.rope_theta)
+                .scalar(tokens),
+            msl::rope_groups(heads, self.shape.head_dim, tokens, threads),
             threads,
         )
     }
 
-    fn kv_append(&self, cache: &DevBuffer, src: &DevBuffer, pos: u32) -> Result<()> {
+    fn kv_append(&self, cache: &DevBuffer, src: &DevBuffer, pos: u32, tokens: u32) -> Result<()> {
         let s = self.shape;
         self.launch(
             &self.pipes.kv_append,
@@ -555,8 +643,9 @@ impl MlxDense {
                 .scalar(s.kv_heads)
                 .scalar(s.head_dim)
                 .scalar(self.seq_cap)
-                .scalar(pos),
-            msl::elementwise_groups(s.kv_width()),
+                .scalar(pos)
+                .scalar(tokens),
+            msl::elementwise_groups(tokens * s.kv_width()),
             msl::ELEMENTWISE_THREADS,
         )
     }
@@ -564,15 +653,15 @@ impl MlxDense {
     /// `h += delta`, in place. The kernel reads and writes the same index, so
     /// aliasing the output onto the input is safe and saves a buffer that would
     /// otherwise be copied every layer.
-    fn residual(&self, delta: &DevBuffer) -> Result<()> {
+    fn residual(&self, delta: &DevBuffer, tokens: u32) -> Result<()> {
         self.launch(
             &self.pipes.residual,
             LaunchArgs::new()
                 .buf(&self.scratch.h)
                 .buf(&self.scratch.h)
                 .buf(delta)
-                .scalar(self.shape.hidden),
-            msl::elementwise_groups(self.shape.hidden),
+                .scalar(tokens * self.shape.hidden),
+            msl::elementwise_groups(tokens * self.shape.hidden),
             msl::ELEMENTWISE_THREADS,
         )
     }

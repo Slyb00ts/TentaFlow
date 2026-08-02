@@ -105,6 +105,12 @@ fn embedding_lookup_matches_mlx_for_every_token() {
         };
         // Fikstura trzyma pojedynczy wiersz, więc token wewnątrz kernela to 0 —
         // sam offset wierszowy sprawdza osobny test niżej, na sklejonej tabeli.
+        let ids = {
+            let bytes = 0u32.to_le_bytes();
+            let buf = dev.alloc(4, MemKind::Device, Pool::Weights).unwrap();
+            dev.write(&bytes, &buf, 0).unwrap();
+            buf
+        };
         let packed = upload(format!("packed_{token}"));
         let s = upload(format!("scales_{token}"));
         let b = upload(format!("biases_{token}"));
@@ -114,9 +120,10 @@ fn embedding_lookup_matches_mlx_for_every_token() {
             .buf(&packed)
             .buf(&s)
             .buf(&b)
-            .scalar(0u32)
+            .buf(&ids)
             .scalar(f.hidden)
-            .scalar(f.group);
+            .scalar(f.group)
+            .scalar(1u32);
         dev.launch(
             &kernel,
             &LaunchConfig {
@@ -190,9 +197,10 @@ fn the_row_offset_is_applied_to_scales_as_well_as_to_bits() {
         .buf(&upload(&packed))
         .buf(&upload(&scales))
         .buf(&upload(&biases))
-        .scalar(1u32)
+        .buf(&upload(&1u32.to_le_bytes()))
         .scalar(f.hidden)
-        .scalar(f.group);
+        .scalar(f.group)
+        .scalar(1u32);
     dev.launch(
         &kernel,
         &LaunchConfig {

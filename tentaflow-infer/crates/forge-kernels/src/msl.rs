@@ -298,11 +298,17 @@ kernel void {name}(
     device const {ty}*   w      [[buffer(2)]],
     constant uint&       n      [[buffer(3)]],
     constant float&      eps    [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {{
     threadgroup float partial[{groups}];
+
+    // Jedna grupa robocza na wiersz. Waga jest wspolna dla wszystkich wierszy,
+    // wiec przesuwa sie tylko wejscie i wyjscie.
+    x += tgid * n;
+    y += tgid * n;
 
     float sum = 0.0f;
     for (uint i = tid; i < n; i += {threads}u) {{
@@ -384,20 +390,25 @@ kernel void rope_half_split_f16(
     constant uint&       dims   [[buffer(2)]],
     constant uint&       pos    [[buffer(3)]],
     constant float&      theta  [[buffer(4)]],
+    constant uint&       tokens [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
 {
     const uint half_dims = dims / 2u;
-    const uint head = gid / half_dims;
-    const uint i    = gid % half_dims;
-    if (head >= heads) { return; }
+    const uint per_token = heads * half_dims;
+    const uint token = gid / per_token;
+    const uint rest  = gid % per_token;
+    const uint head  = rest / half_dims;
+    const uint i     = rest % half_dims;
+    if (token >= tokens) { return; }
 
     // Czestotliwosc liczona w f32: przy base 1e6 i dims 128 wykladnik schodzi
     // do 1e-6, a w f16 to juz jest zero i caly obrot znika dla polowy kanalow.
-    const float freq = float(pos) * pow(theta, -2.0f * float(i) / float(dims));
+    // Kolejne tokeny kafla siedza na kolejnych pozycjach, wiec kat rosnie z nimi.
+    const float freq = float(pos + token) * pow(theta, -2.0f * float(i) / float(dims));
     const float c = cos(freq);
     const float s = sin(freq);
 
-    device half* row = v + head * dims;
+    device half* row = v + (token * heads + head) * dims;
     const float x0 = float(row[i]);
     const float x1 = float(row[i + half_dims]);
     row[i]             = half(x0 * c - x1 * s);
@@ -407,8 +418,8 @@ kernel void rope_half_split_f16(
 
 pub const ROPE_HALF_SPLIT_NAME: &str = "rope_half_split_f16";
 
-pub fn rope_groups(heads: u32, dims: u32, threads_per_group: u32) -> u32 {
-    (heads * dims / 2).div_ceil(threads_per_group)
+pub fn rope_groups(heads: u32, dims: u32, tokens: u32, threads_per_group: u32) -> u32 {
+    (tokens * heads * dims / 2).div_ceil(threads_per_group)
 }
 
 /// Threads in the argmax threadgroup. One group scans the whole vocabulary.
@@ -509,29 +520,36 @@ kernel void {name}(
     constant uint&       seq        [[buffer(6)]],
     constant uint&       seq_cap    [[buffer(7)]],
     constant float&      scale      [[buffer(8)]],
+    constant uint&       n_tokens   [[buffer(9)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {{
     const uint dim = {dim}u;
-    const uint head = tgid;
+    const uint head  = tgid % n_heads;
+    const uint token = tgid / n_heads;
     // Dlugosc WAZNA i POJEMNOSC to dwie rozne liczby. Krok skladowania w
     // cache'u wyznacza pojemnosc, a petla po kluczach dlugosc; wziecie jednej
     // za druga adresuje glowice od zlego wiersza i nie zmienia ani ksztaltu,
     // ani rzedu wielkosci wyniku.
-    if (head >= n_heads || seq > seq_cap || seq_cap > {max_seq}u) {{ return; }}
+    if (token >= n_tokens || seq > seq_cap || seq_cap > {max_seq}u) {{ return; }}
     const uint kv_head = head / (n_heads / n_kv_heads);
+
+    // Przyczynowosc bez maski: zapytanie kafla siedzi na pozycji
+    // `seq - n_tokens + token`, wiec po prostu konczy petle na swojej wlasnej.
+    // Maska dolozylaby minus nieskonczonosci, ktore i tak trzeba pominac.
+    const uint len = seq - n_tokens + token + 1u;
 
     threadgroup float scores[{max_seq}];
     threadgroup float reduce[{simdgroups}];
 
-    device const half* qh = q + head * dim;
+    device const half* qh = q + (token * n_heads + head) * dim;
     device const half* kh = k + kv_head * seq_cap * dim;
     device const half* vh = v + kv_head * seq_cap * dim;
 
     // Faza 1: iloczyn skalarny zapytania z kazdym kluczem.
-    for (uint j = tid; j < seq; j += {threads}u) {{
+    for (uint j = tid; j < len; j += {threads}u) {{
         float acc = 0.0f;
         device const half* kj = kh + j * dim;
         for (uint c = 0; c < dim; ++c) {{
@@ -545,7 +563,7 @@ kernel void {name}(
     // exp jest tu warunkiem poprawnosci, nie ostroznoscia: bez niego dlugi
     // kontekst przelewa f32 i softmax daje NaN.
     float local = -INFINITY;
-    for (uint j = tid; j < seq; j += {threads}u) {{ local = max(local, scores[j]); }}
+    for (uint j = tid; j < len; j += {threads}u) {{ local = max(local, scores[j]); }}
     local = simd_max(local);
     if (lane == 0u) {{ reduce[sg] = local; }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -553,7 +571,7 @@ kernel void {name}(
     for (uint g = 1u; g < {simdgroups}u; ++g) {{ m = max(m, reduce[g]); }}
 
     float partial = 0.0f;
-    for (uint j = tid; j < seq; j += {threads}u) {{
+    for (uint j = tid; j < len; j += {threads}u) {{
         const float e = exp(scores[j] - m);
         scores[j] = e;
         partial += e;
@@ -567,10 +585,10 @@ kernel void {name}(
     // Faza 3: jeden watek na kanal wyjscia.
     if (tid < dim) {{
         float acc = 0.0f;
-        for (uint j = 0; j < seq; ++j) {{
+        for (uint j = 0; j < len; ++j) {{
             acc = fma(scores[j], float(vh[j * dim + tid]), acc);
         }}
-        out[head * dim + tid] = half(acc / total);
+        out[(token * n_heads + head) * dim + tid] = half(acc / total);
     }}
 }}
 "#,
@@ -580,6 +598,12 @@ kernel void {name}(
         threads = ATTN_THREADS,
         simdgroups = ATTN_THREADS / 32,
     )
+}
+
+/// One threadgroup per (token, head). Derived so a caller cannot size the grid
+/// for a batch the kernel was not given.
+pub fn attn_groups(heads: u32, tokens: u32) -> u32 {
+    heads * tokens
 }
 
 pub fn attn_decode_name(head_dim: u32) -> String {
@@ -609,21 +633,27 @@ kernel void {name}(
     device const uint*    packed   [[buffer(1)]],
     device const {ty}*    scales   [[buffer(2)]],
     device const {ty}*    biases   [[buffer(3)]],
-    constant uint&        token    [[buffer(4)]],
+    device const uint*    tokens   [[buffer(4)]],
     constant uint&        hidden   [[buffer(5)]],
     constant uint&        group    [[buffer(6)]],
+    constant uint&        n_tokens [[buffer(7)]],
     uint gid [[thread_position_in_grid]])
 {{
-    if (gid >= hidden) {{ return; }}
+    const uint row = gid / hidden;
+    const uint col = gid % hidden;
+    if (row >= n_tokens) {{ return; }}
+    // Identyfikatory ida buforem, a nie skalarem, bo prefill podaje ich naraz
+    // caly kafel. Przy jednym tokenie to ten sam kernel i ten sam wynik.
+    const uint token = tokens[row];
     const uint words_per_row  = hidden / 8u;
     const uint groups_per_row = hidden / group;
 
-    const uint word = gid / 8u;
-    const uint slot = gid % 8u;
+    const uint word = col / 8u;
+    const uint slot = col % 8u;
     const uint bits = packed[token * words_per_row + word];
     const float q = float((bits >> (slot * 4u)) & 0xFu);
 
-    const uint g = gid / group;
+    const uint g = col / group;
     const float sc = float(scales[token * groups_per_row + g]);
     const float bi = float(biases[token * groups_per_row + g]);
     out[gid] = half(fma(q, sc, bi));
@@ -682,13 +712,16 @@ kernel void kv_append_f16(
     constant uint&       dim      [[buffer(3)]],
     constant uint&       seq_cap  [[buffer(4)]],
     constant uint&       pos      [[buffer(5)]],
+    constant uint&       tokens   [[buffer(6)]],
     uint gid [[thread_position_in_grid]])
 {
     const uint total = kv_heads * dim;
-    if (gid >= total || pos >= seq_cap) { return; }
-    const uint head = gid / dim;
-    const uint c    = gid % dim;
-    cache[(head * seq_cap + pos) * dim + c] = src[gid];
+    const uint token = gid / total;
+    const uint rest  = gid % total;
+    if (token >= tokens || pos + token >= seq_cap) { return; }
+    const uint head = rest / dim;
+    const uint c    = rest % dim;
+    cache[(head * seq_cap + pos + token) * dim + c] = src[gid];
 }
 "#;
 
@@ -743,8 +776,10 @@ mod tests {
     #[test]
     fn rope_grid_covers_every_rotated_pair() {
         // 32 głowice po 128 wymiarów to 2048 par, czyli 8 grup po 256 wątków.
-        assert_eq!(rope_groups(32, 128, 256), 8);
-        assert_eq!(rope_groups(1, 128, 64), 1);
+        assert_eq!(rope_groups(32, 128, 1, 256), 8);
+        assert_eq!(rope_groups(1, 128, 1, 64), 1);
+        // Kafel tokenów mnoży pracę, a nie dzieli ją między te same wątki.
+        assert_eq!(rope_groups(32, 128, 8, 256), 64);
         assert!(ROPE_HALF_SPLIT_SOURCE.contains(ROPE_HALF_SPLIT_NAME));
         // Para to (i, i + dims/2), nie (2i, 2i+1) — gdyby ktoś przepisał kernel
         // na wariant sąsiadujący, ten warunek to złapie zanim złapie to model.
@@ -808,8 +843,8 @@ mod tests {
         assert!(KV_APPEND_SOURCE.contains(KV_APPEND_NAME));
         // Adres w cache'u musi zawierać i głowicę, i pozycję; pominięcie
         // którejkolwiek nadpisuje cudzy wpis bez żadnego objawu.
-        assert!(KV_APPEND_SOURCE.contains("(head * seq_cap + pos) * dim + c"));
-        assert!(KV_APPEND_SOURCE.contains("pos >= seq_cap"));
+        assert!(KV_APPEND_SOURCE.contains("(head * seq_cap + pos + token) * dim + c"));
+        assert!(KV_APPEND_SOURCE.contains("pos + token >= seq_cap"));
     }
 
     #[test]

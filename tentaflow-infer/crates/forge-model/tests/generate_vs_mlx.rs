@@ -203,3 +203,106 @@ fn generate_agrees_with_stepping_by_hand() {
 
     assert_eq!(via_api, by_hand, "`generate` odbiega od ręcznej pętli");
 }
+
+#[test]
+fn a_prompt_longer_than_one_chunk_lands_where_stepping_lands() {
+    // Prompt dłuższy niż kafel przechodzi przez WIĘCEJ NIŻ JEDNO wywołanie, a
+    // drugie z nich musi zacząć tam, gdzie skończyło pierwsze. Pomyłka o jeden
+    // w tym miejscu daje wynik poprawnego kształtu, policzony dla kontekstu
+    // przesuniętego o token — czyli dokładnie taki, jakiego żadna asercja
+    // rozmiaru nie zobaczy.
+    let oracle = load();
+    let Some(dir) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu Bielika");
+        return;
+    };
+    let Ok(device) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+
+    let chunk = forge_model::mlx_dense::PREFILL_CHUNK as usize;
+    let mut prompt = oracle.prompt_ids.clone();
+    while prompt.len() <= chunk + 8 {
+        prompt.extend_from_slice(&oracle.prompt_ids[1..]);
+    }
+    assert!(prompt.len() > chunk, "prompt mieści się w jednym kaflu");
+
+    let batched = model.prefill(&prompt).expect("prefill");
+    let after = model.position();
+    assert_eq!(after as usize, prompt.len(), "pozycja po prefillu");
+
+    model.reset();
+    let mut stepped = 0u32;
+    for &token in &prompt {
+        stepped = model.step_argmax(token).expect("krok");
+    }
+    assert_eq!(
+        model.position() as usize,
+        prompt.len(),
+        "pozycja po krokach"
+    );
+    assert_eq!(
+        batched, stepped,
+        "prefill kafelkowany wybrał inny token niż krok po kroku"
+    );
+}
+
+/// Pomiar, uruchamiany jawnie: `cargo test --release ... -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn how_fast_a_prompt_goes_through() {
+    let oracle = load();
+    let Some(dir) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu Bielika");
+        return;
+    };
+    let Ok(device) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+
+    let mut prompt = Vec::new();
+    while prompt.len() < 256 {
+        prompt.extend_from_slice(&oracle.prompt_ids);
+    }
+    prompt.truncate(256);
+
+    model.reset();
+    let t0 = std::time::Instant::now();
+    let a = model.prefill(&prompt).expect("prefill");
+    let batched = t0.elapsed();
+
+    model.reset();
+    let t0 = std::time::Instant::now();
+    let mut b = 0u32;
+    for &token in &prompt {
+        b = model.step_argmax(token).expect("krok");
+    }
+    let stepped = t0.elapsed();
+
+    assert_eq!(a, b, "różny token, więc czasy nie dotyczą tej samej pracy");
+    eprintln!(
+        "prompt {} tokenów: kaflowo {:.3} s ({:.1} tok/s), token po tokenie {:.3} s ({:.1} tok/s), {:.2}x",
+        prompt.len(),
+        batched.as_secs_f64(),
+        prompt.len() as f64 / batched.as_secs_f64(),
+        stepped.as_secs_f64(),
+        prompt.len() as f64 / stepped.as_secs_f64(),
+        stepped.as_secs_f64() / batched.as_secs_f64()
+    );
+
+    // Dekodowanie zaraz po prefillu, bo to ta liczba, którą widzi użytkownik.
+    let t0 = std::time::Instant::now();
+    let out = model.generate(&prompt, 32).expect("generacja");
+    let total = t0.elapsed();
+    eprintln!(
+        "prefill {} + 32 tokeny wyjścia: {:.3} s, dekodowanie {:.1} tok/s",
+        prompt.len(),
+        total.as_secs_f64(),
+        31.0 / (total.as_secs_f64() - batched.as_secs_f64()).max(1e-6)
+    );
+    assert_eq!(out.len(), 32);
+}

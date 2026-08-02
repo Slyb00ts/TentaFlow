@@ -125,11 +125,12 @@ fn decode_attention_matches_mlx_with_grouped_heads() {
         .scalar(f.kv_heads)
         .scalar(f.seq)
         .scalar(f.seq)
-        .scalar(f.scale);
+        .scalar(f.scale)
+        .scalar(1u32);
     dev.launch(
         &kernel,
         &LaunchConfig {
-            grid: (f.heads, 1, 1),
+            grid: (msl::attn_groups(f.heads, 1), 1, 1),
             block: (msl::ATTN_THREADS, 1, 1),
             shared_mem_bytes: 0,
         },
@@ -249,11 +250,12 @@ fn a_cache_longer_than_the_declared_bound_is_refused() {
         .scalar(f.kv_heads)
         .scalar(msl::ATTN_MAX_SEQ + 1)
         .scalar(msl::ATTN_MAX_SEQ + 1)
-        .scalar(f.scale);
+        .scalar(f.scale)
+        .scalar(1u32);
     dev.launch(
         &kernel,
         &LaunchConfig {
-            grid: (f.heads, 1, 1),
+            grid: (msl::attn_groups(f.heads, 1), 1, 1),
             block: (msl::ATTN_THREADS, 1, 1),
             shared_mem_bytes: 0,
         },

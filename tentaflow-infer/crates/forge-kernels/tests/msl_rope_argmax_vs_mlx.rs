@@ -108,11 +108,12 @@ fn rope_matches_mlx_on_the_half_split_convention() {
         .scalar(f.heads)
         .scalar(f.dims)
         .scalar(f.pos)
-        .scalar(f.theta);
+        .scalar(f.theta)
+        .scalar(1u32);
     dev.launch(
         &kernel,
         &LaunchConfig {
-            grid: (msl::rope_groups(f.heads, f.dims, threads), 1, 1),
+            grid: (msl::rope_groups(f.heads, f.dims, 1, threads), 1, 1),
             block: (threads, 1, 1),
             shared_mem_bytes: 0,
         },

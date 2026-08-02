@@ -60,3 +60,26 @@ kolejność sumowania jest w obu ta sama z konstrukcji. Sprawdza to
 `the_batched_form_agrees_with_the_vector_form_bit_for_bit`, a poprawność
 arytmetyki wobec MLX i prawdy w f64 —
 `batched_matmul_is_no_further_from_the_truth_than_mlx`.
+
+## Wynik na całym modelu
+
+Kernel to jedno, a model to drugie: w warstwie są też uwaga, normalizacje i
+obroty, a one też przeszły na kafel. Bielik-7B 4-bit, prompt 256 tokenów,
+`cargo test --release -p forge-model --features metal --test generate_vs_mlx --
+--ignored --nocapture`:
+
+| ścieżka | czas | przepustowość |
+|---|---:|---:|
+| token po tokenie | 11,967 s | 21,4 tok/s |
+| kaflami po 128 | 4,553 s | **56,2 tok/s** |
+
+Przyspieszenie **2,63x**, czyli więcej niż same 2,09x z izolowanego mnożenia —
+uwaga liczy teraz wszystkie zapytania kafla jednym wywołaniem, zamiast jednego
+na token.
+
+Dekodowanie po prefillu: 18,4 tok/s. Cel z planu (§7.6) to 19 tok/s dla
+dekodowania i 175 tok/s dla prefillu, więc prefill jest po tym kroku na jednej
+trzeciej drogi, a nie u celu.
+
+Obie ścieżki wybierają ten sam token — sprawdza to asercja w samym pomiarze,
+bo inaczej porównywałby dwie różne prace.
