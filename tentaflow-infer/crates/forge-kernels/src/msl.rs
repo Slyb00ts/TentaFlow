@@ -432,6 +432,85 @@ pub fn attn_decode_name(head_dim: u32) -> String {
     format!("attn_decode_d{head_dim}_s{ATTN_MAX_SEQ}")
 }
 
+/// Threads per group for the embedding lookup and the residual add. Both are
+/// plain elementwise passes, so the count is a tuning choice.
+pub const ELEMENTWISE_THREADS: u32 = 256;
+
+/// Dequantizes ONE row of a quantized embedding table.
+///
+/// In MLX the embedding is quantized exactly like a projection, so a lookup is
+/// a dequantize of a single row. It is also the only read in a decode step
+/// indexed by a token rather than sequential, which makes a wrong row offset
+/// produce a correctly shaped vector holding someone else's word.
+pub fn embed_gather_source(scales: ScaleDtype) -> String {
+    let ty = scales.msl();
+    let name = embed_gather_name(scales);
+    format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void {name}(
+    device half*          out      [[buffer(0)]],
+    device const uint*    packed   [[buffer(1)]],
+    device const {ty}*    scales   [[buffer(2)]],
+    device const {ty}*    biases   [[buffer(3)]],
+    constant uint&        token    [[buffer(4)]],
+    constant uint&        hidden   [[buffer(5)]],
+    constant uint&        group    [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{{
+    if (gid >= hidden) {{ return; }}
+    const uint words_per_row  = hidden / 8u;
+    const uint groups_per_row = hidden / group;
+
+    const uint word = gid / 8u;
+    const uint slot = gid % 8u;
+    const uint bits = packed[token * words_per_row + word];
+    const float q = float((bits >> (slot * 4u)) & 0xFu);
+
+    const uint g = gid / group;
+    const float sc = float(scales[token * groups_per_row + g]);
+    const float bi = float(biases[token * groups_per_row + g]);
+    out[gid] = half(fma(q, sc, bi));
+}}
+"#,
+        name = name,
+        ty = ty,
+    )
+}
+
+pub fn embed_gather_name(scales: ScaleDtype) -> String {
+    format!("embed_gather_4bit_{}", scales.suffix())
+}
+
+/// `out[i] = a[i] + b[i]` over f16, which is the residual connection.
+///
+/// The sum is formed in f32 and narrowed once. Adding in f16 loses the small
+/// residual against a large activation, and the residual is precisely the part
+/// that carries information across forty layers.
+pub const RESIDUAL_ADD_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void residual_add_f16(
+    device half*         out  [[buffer(0)]],
+    device const half*   a    [[buffer(1)]],
+    device const float*  b    [[buffer(2)]],
+    constant uint&       n    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) { return; }
+    out[gid] = half(float(a[gid]) + b[gid]);
+}
+"#;
+
+pub const RESIDUAL_ADD_NAME: &str = "residual_add_f16";
+
+pub fn elementwise_groups(n: u32) -> u32 {
+    n.div_ceil(ELEMENTWISE_THREADS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +585,26 @@ mod tests {
         assert!(src.contains(&format!("threadgroup float scores[{ATTN_MAX_SEQ}]")));
         assert!(src.contains(&format!("seq > {ATTN_MAX_SEQ}u")));
         assert!(src.contains("head / (n_heads / n_kv_heads)"));
+    }
+
+    #[test]
+    fn embedding_lookup_indexes_by_token_in_both_arrays() {
+        let src = embed_gather_source(ScaleDtype::Bf16);
+        assert_eq!(embed_gather_name(ScaleDtype::Bf16), "embed_gather_4bit_bf16");
+        // Wiersz wybiera token — i w upakowanych bitach, i w skalach. Pominięcie
+        // przesunięcia w którejkolwiek z tych tablic daje wektor o poprawnym
+        // kształcie zbudowany z cudzych liczb.
+        assert!(src.contains("packed[token * words_per_row + word]"));
+        assert!(src.contains("scales[token * groups_per_row + g]"));
+        assert!(src.contains("biases[token * groups_per_row + g]"));
+    }
+
+    #[test]
+    fn residual_sums_in_f32_before_narrowing() {
+        assert!(RESIDUAL_ADD_SOURCE.contains(RESIDUAL_ADD_NAME));
+        assert!(RESIDUAL_ADD_SOURCE.contains("half(float(a[gid]) + b[gid])"));
+        assert_eq!(elementwise_groups(4096), 16);
+        assert_eq!(elementwise_groups(1), 1);
     }
 
     #[test]
