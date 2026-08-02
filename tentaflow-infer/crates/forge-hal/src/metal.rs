@@ -53,7 +53,8 @@ extern "C" {
         scalars: *const u64,
         is_buffer: *const c_int,
         arg_count: c_int,
-        threadgroups: u32,
+        threadgroups_x: u32,
+        threadgroups_y: u32,
         threads_per_group: u32,
     );
     fn fm_commit(cmdbuf: *mut c_void);
@@ -284,13 +285,28 @@ impl MetalCommandBuffer {
         self.dispatches
     }
 
-    /// Adds one dispatch. Argument `i` binds to Metal index `i`, which is the
-    /// order the kernels declare `[[buffer(n)]]` in.
+    /// Adds one dispatch over a one-dimensional grid.
     pub fn dispatch(
         &mut self,
         pipeline: &MetalPipeline,
         args: &[MetalArg<'_>],
         threadgroups: u32,
+        threads_per_group: u32,
+    ) -> Result<()> {
+        self.dispatch_2d(pipeline, args, (threadgroups, 1), threads_per_group)
+    }
+
+    /// Adds one dispatch. Argument `i` binds to Metal index `i`, which is the
+    /// order the kernels declare `[[buffer(n)]]` in.
+    ///
+    /// The second grid dimension exists for kernels that tile two independent
+    /// axes at once — a batched matmul tiles output rows and tokens — where
+    /// folding them into one index would make the kernel divide to get them back.
+    pub fn dispatch_2d(
+        &mut self,
+        pipeline: &MetalPipeline,
+        args: &[MetalArg<'_>],
+        threadgroups: (u32, u32),
         threads_per_group: u32,
     ) -> Result<()> {
         if threads_per_group == 0 || threads_per_group > pipeline.max_threads_per_group {
@@ -328,7 +344,8 @@ impl MetalCommandBuffer {
                 scalars.as_ptr(),
                 is_buffer.as_ptr(),
                 args.len() as c_int,
-                threadgroups,
+                threadgroups.0,
+                threadgroups.1,
                 threads_per_group,
             );
         }

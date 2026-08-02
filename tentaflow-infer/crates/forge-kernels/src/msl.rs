@@ -151,6 +151,127 @@ kernel void {name}(
     )
 }
 
+/// Rows of activation one threadgroup carries through a single pass over the
+/// weights. This constant IS the prefill lever: a decode step reads the whole
+/// matrix to serve one token, so eight tokens sharing that read cut the traffic
+/// that dominates prefill by eight. Larger tiles keep paying off arithmetically
+/// but cost a register per token per lane, and eight fits without spilling.
+pub const QMM_TILE: u32 = 8;
+
+/// Entry-point name for the batched form.
+pub fn qmm_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
+    format!(
+        "qmm_affine_4bit_r{}t{}_{}_out{}",
+        QMV_ROWS_PER_GROUP,
+        QMM_TILE,
+        scales.suffix(),
+        out.suffix()
+    )
+}
+
+/// Grid for an output width and a token count. Two dimensions, both derived.
+pub fn qmm_affine_4bit_groups(n_rows: u32, n_tokens: u32) -> (u32, u32) {
+    (
+        n_rows.div_ceil(QMV_ROWS_PER_GROUP),
+        n_tokens.div_ceil(QMM_TILE),
+    )
+}
+
+/// Fused dequantize + matrix-matrix product for MLX affine weights.
+///
+/// `y[t,n] = sum_k x[t,k] * (q[n,k] * scale[n,k/G] + bias[n,k/G])`
+///
+/// Same arithmetic as the vector form, same accumulation order per output, so
+/// prefill and decode agree bit for bit on a shared position — which is what
+/// makes it legitimate to test one against the other.
+///
+/// The unpacked weight stays in a register and is applied to every token in the
+/// tile before the next word is read. That ordering is the whole point: it is
+/// what turns one pass over a multi-gigabyte matrix into eight tokens of work
+/// instead of one.
+pub fn qmm_affine_4bit_source(scales: ScaleDtype, out: OutDtype) -> String {
+    let ty = scales.msl();
+    let out_ty = out.msl();
+    let name = qmm_affine_4bit_name(scales, out);
+    format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void {name}(
+    device {out_ty}*      y        [[buffer(0)]],
+    device const uint*    packed   [[buffer(1)]],
+    device const {ty}*    scales   [[buffer(2)]],
+    device const {ty}*    biases   [[buffer(3)]],
+    device const half*    x        [[buffer(4)]],
+    constant uint&        n_rows   [[buffer(5)]],
+    constant uint&        n_cols   [[buffer(6)]],
+    constant uint&        group    [[buffer(7)]],
+    constant uint&        n_tokens [[buffer(8)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{{
+    const uint row = tgid.x * {rows}u + sg;
+    if (row >= n_rows) {{ return; }}
+    const uint tok0 = tgid.y * {tile}u;
+    if (tok0 >= n_tokens) {{ return; }}
+    const uint tail = min({tile}u, n_tokens - tok0);
+
+    const uint words_per_row  = n_cols / 8u;
+    const uint groups_per_row = n_cols / group;
+    device const uint* w = packed + row * words_per_row;
+    device const {ty}* s = scales + row * groups_per_row;
+    device const {ty}* b = biases + row * groups_per_row;
+
+    // Wiersz aktywacji na pozycję kafla. Poza ogonem wskazuje na token ostatni,
+    // a nie na nic: liczymy dla niego śmieci, których nigdy nie zapisujemy.
+    // Alternatywą jest warunek w pętli, a warunek robi z liczby przebiegów
+    // wielkość zmienną — i wtedy `acc` przestaje być rejestrami. Zmierzone:
+    // 1351 us wobec 294 us dla tej samej pracy przy T=1.
+    device const half* xp[{tile}];
+    for (uint t = 0; t < {tile}u; ++t) {{
+        xp[t] = x + min(tok0 + t, n_tokens - 1u) * n_cols;
+    }}
+
+    float acc[{tile}];
+    for (uint t = 0; t < {tile}u; ++t) {{ acc[t] = 0.0f; }}
+
+    for (uint word = lane; word < words_per_row; word += 32u) {{
+        const uint bits = w[word];
+        const uint col0 = word * 8u;
+        const uint g    = col0 / group;
+        const float sc  = float(s[g]);
+        const float bi  = float(b[g]);
+
+        float wv[8];
+        for (uint j = 0; j < 8u; ++j) {{
+            wv[j] = fma(float((bits >> (j * 4u)) & 0xFu), sc, bi);
+        }}
+        // Kolejność sumowania po j jest ta sama co w formie wektorowej, żeby
+        // prefill i dekodowanie zgadzały się bit w bit na tej samej pozycji.
+        for (uint t = 0; t < {tile}u; ++t) {{
+            device const half* xr = xp[t] + col0;
+            for (uint j = 0; j < 8u; ++j) {{
+                acc[t] = fma(float(xr[j]), wv[j], acc[t]);
+            }}
+        }}
+    }}
+
+    for (uint t = 0; t < tail; ++t) {{
+        const float total = simd_sum(acc[t]);
+        if (lane == 0u) {{ y[(tok0 + t) * n_rows + row] = {out_ty}(total); }}
+    }}
+}}
+"#,
+        name = name,
+        ty = ty,
+        out_ty = out_ty,
+        rows = QMV_ROWS_PER_GROUP,
+        tile = QMM_TILE,
+    )
+}
+
 /// Threads in one RMSNorm threadgroup. The reduction is per SIMD group and
 /// then across the eight of them, so the count is fixed by the kernel body and
 /// is not something a caller may pick.

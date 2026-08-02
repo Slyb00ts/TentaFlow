@@ -124,7 +124,8 @@ void fm_dispatch(void *cmdbuf,
                  const unsigned long long *scalars,
                  const int *is_buffer,
                  int arg_count,
-                 unsigned int threadgroups,
+                 unsigned int threadgroups_x,
+                 unsigned int threadgroups_y,
                  unsigned int threads_per_group) {
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)cmdbuf;
     id<MTLComputePipelineState> pipe = (__bridge id<MTLComputePipelineState>)pipeline;
@@ -138,7 +139,7 @@ void fm_dispatch(void *cmdbuf,
             [enc setBytes:&scalars[i] length:sizeof(unsigned long long) atIndex:(NSUInteger)i];
         }
     }
-    [enc dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+    [enc dispatchThreadgroups:MTLSizeMake(threadgroups_x, threadgroups_y, 1)
         threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
     [enc endEncoding];
 }

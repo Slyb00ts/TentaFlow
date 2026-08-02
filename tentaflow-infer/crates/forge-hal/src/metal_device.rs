@@ -351,9 +351,11 @@ impl Device for MetalDevice {
         let k = kernel.downcast::<MetalKernel>()?;
         let s = self.stream_of(stream)?;
 
-        if cfg.grid.1 != 1 || cfg.grid.2 != 1 || cfg.block.1 != 1 || cfg.block.2 != 1 {
+        // Grid z i oraz blok wielowymiarowy nie mają dziś kernela, który by ich
+        // używał, więc są odrzucane zamiast po cichu spłaszczane.
+        if cfg.grid.2 != 1 || cfg.block.1 != 1 || cfg.block.2 != 1 {
             return Err(ForgeError::Unsupported(format!(
-                "Metal: dyspozycja wielowymiarowa {:?}/{:?} nie jest obsługiwana",
+                "Metal: dyspozycja {:?}/{:?} nie jest obsługiwana",
                 cfg.grid, cfg.block
             )));
         }
@@ -384,7 +386,14 @@ impl Device for MetalDevice {
             }
         }
 
-        s.with_open(|cb| cb.dispatch(&k.pipeline, &metal_args, cfg.grid.0, cfg.block.0))
+        s.with_open(|cb| {
+            cb.dispatch_2d(
+                &k.pipeline,
+                &metal_args,
+                (cfg.grid.0, cfg.grid.1),
+                cfg.block.0,
+            )
+        })
     }
 
     fn synchronize(&self) -> Result<()> {
