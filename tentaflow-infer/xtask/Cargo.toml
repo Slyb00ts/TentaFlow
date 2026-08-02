@@ -1,0 +1,11 @@
+# ===== File: Cargo.toml — xtask: mechanical repository gates (lint, env inventory) =====
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# No dependencies on purpose: the gates must build and run on any machine, with
+# any backend feature set, without pulling CUDA/ROCm/Metal into the graph.
+[dependencies]

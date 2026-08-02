@@ -1,7 +1,7 @@
 # ===== File: Cargo.toml — FORGE workspace manifest =====
 [workspace]
 resolver = "2"
-members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize", "crates/forge-grammar", "crates/forge-engine", "crates/forge-whisper", "crates/forge-onnx", "crates/forge-server", "crates/forge-cli"]
+members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize", "crates/forge-grammar", "crates/forge-engine", "crates/forge-whisper", "crates/forge-onnx", "crates/forge-server", "crates/forge-cli", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

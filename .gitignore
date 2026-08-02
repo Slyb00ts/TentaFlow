@@ -92,6 +92,9 @@ config.toml
 # settings (jobs, profile defaults, linker, sccache) zadzialaly dla
 # wszystkich. Nadpisuje regule `config.toml` powyzej.
 !.cargo/config.toml
+# To samo dla workspace tentaflow-infer: alias `cargo xtask` jest czescia
+# kontraktu bramek jakosci i musi byc dostepny dla kazdego i w CI.
+!tentaflow-infer/.cargo/config.toml
 .env
 .env.*
 !.env.example
