@@ -123,6 +123,98 @@ kernel void {name}(
     )
 }
 
+/// Threads in one RMSNorm threadgroup. The reduction is per SIMD group and
+/// then across the eight of them, so the count is fixed by the kernel body and
+/// is not something a caller may pick.
+pub const RMSNORM_THREADS: u32 = 256;
+
+/// Root-mean-square normalisation with a learned per-channel weight.
+///
+/// `y[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i]`
+///
+/// Accumulates in f32 regardless of the storage type: the mean of squares over
+/// four thousand channels is exactly where a narrow accumulator loses the
+/// small values, and on Apple f32 accumulation costs 1.3% (EKS-A2).
+pub fn rmsnorm_source(weight: ScaleDtype) -> String {
+    let ty = weight.msl();
+    let name = rmsnorm_name(weight);
+    format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void {name}(
+    device half*         y      [[buffer(0)]],
+    device const half*   x      [[buffer(1)]],
+    device const {ty}*   w      [[buffer(2)]],
+    constant uint&       n      [[buffer(3)]],
+    constant float&      eps    [[buffer(4)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{{
+    threadgroup float partial[{groups}];
+
+    float sum = 0.0f;
+    for (uint i = tid; i < n; i += {threads}u) {{
+        const float v = float(x[i]);
+        sum = fma(v, v, sum);
+    }}
+    sum = simd_sum(sum);
+    if (lane == 0u) {{ partial[sg] = sum; }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = 0.0f;
+    for (uint i = 0; i < {groups}u; ++i) {{ total += partial[i]; }}
+    const float scale = rsqrt(total / float(n) + eps);
+
+    for (uint i = tid; i < n; i += {threads}u) {{
+        y[i] = half(float(x[i]) * scale * float(w[i]));
+    }}
+}}
+"#,
+        name = name,
+        ty = ty,
+        threads = RMSNORM_THREADS,
+        groups = RMSNORM_THREADS / 32,
+    )
+}
+
+pub fn rmsnorm_name(weight: ScaleDtype) -> String {
+    format!("rmsnorm_t{}_{}", RMSNORM_THREADS, weight.suffix())
+}
+
+/// Threads per group for the elementwise gate. Nothing in the body depends on
+/// it, so it is a tuning choice rather than a contract.
+pub const SILU_MUL_THREADS: u32 = 256;
+
+/// `out[i] = silu(gate[i]) * up[i]`, with `silu(v) = v * sigmoid(v)`.
+///
+/// The two projections arrive in f32 straight from the GEMV and the result
+/// feeds the next one as f16, so the narrowing happens exactly once, here.
+pub const SILU_MUL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void silu_mul_f32_f16(
+    device half*         out   [[buffer(0)]],
+    device const float*  gate  [[buffer(1)]],
+    device const float*  up    [[buffer(2)]],
+    constant uint&       n     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) { return; }
+    const float g = gate[gid];
+    out[gid] = half(g / (1.0f + exp(-g)) * up[gid]);
+}
+"#;
+
+pub const SILU_MUL_NAME: &str = "silu_mul_f32_f16";
+
+pub fn silu_mul_groups(n: u32) -> u32 {
+    n.div_ceil(SILU_MUL_THREADS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +240,25 @@ mod tests {
             "qmv_affine_4bit_r4_f16"
         );
         assert_eq!(QMV_THREADS, QMV_ROWS_PER_GROUP * 32);
+    }
+
+    #[test]
+    fn rmsnorm_name_and_body_agree_on_the_thread_count() {
+        let src = rmsnorm_source(ScaleDtype::Bf16);
+        assert_eq!(rmsnorm_name(ScaleDtype::Bf16), "rmsnorm_t256_bf16");
+        assert!(src.contains("rmsnorm_t256_bf16"));
+        // Krok pętli MUSI być tą samą liczbą co w nazwie: rozjazd zostawiłby
+        // część kanałów niepoliczonych, bez żadnego błędu.
+        assert!(src.contains(&format!("i += {RMSNORM_THREADS}u")));
+        assert!(src.contains(&format!("threadgroup float partial[{}]", RMSNORM_THREADS / 32)));
+    }
+
+    #[test]
+    fn silu_mul_grid_covers_a_ragged_tail() {
+        assert_eq!(silu_mul_groups(11264), 44);
+        assert_eq!(silu_mul_groups(1), 1);
+        assert_eq!(silu_mul_groups(257), 2);
+        assert!(SILU_MUL_SOURCE.contains(SILU_MUL_NAME));
     }
 
     #[test]

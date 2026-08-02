@@ -43,7 +43,7 @@ size	crates/forge-engine/src/weights.rs	5332
 size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3617
 size	crates/forge-formats/src/arch.rs	2743
 size	crates/forge-formats/src/iq_tables.rs	3969
-size	crates/forge-kernels/src/launchers.rs	20430
+size	crates/forge-kernels/src/launchers.rs	20421
 size	crates/forge-kernels/src/registry.rs	3073
 size	crates/forge-kernels/tests/golden.rs	3029
 vendor_gate	crates/forge-kernels/src/launchers.rs	2

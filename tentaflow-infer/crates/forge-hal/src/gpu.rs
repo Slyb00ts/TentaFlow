@@ -95,6 +95,20 @@ pub fn backend(ordinal: usize) -> Result<Backend> {
 }
 
 fn free_vram_on(backend: Backend, ordinal: usize) -> Result<usize> {
+    // Sonda opakowana w `catch_unwind`, bo brak biblioteki sterownika nie jest
+    // bledem programu, tylko wlasnoscia maszyny. Ladowanie sterownika w cudarc
+    // panikuje, gdy biblioteki nie ma — a to zdarza sie na kazdym hoscie bez
+    // danego producenta i musi konczyc sie komunikatem, nie przerwaniem procesu.
+    match std::panic::catch_unwind(|| free_vram_probe(backend, ordinal)) {
+        Ok(result) => result,
+        Err(_) => Err(ForgeError::Device(format!(
+            "backend {} nie ma zainstalowanego sterownika na tej maszynie",
+            backend.as_str()
+        ))),
+    }
+}
+
+fn free_vram_probe(backend: Backend, ordinal: usize) -> Result<usize> {
     match backend {
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::cuda::CudaDevice::free_vram(ordinal),
@@ -112,8 +126,6 @@ fn free_vram_on(backend: Backend, ordinal: usize) -> Result<usize> {
 pub fn free_vram(ordinal: usize) -> Result<usize> {
     free_vram_on(backend(ordinal)?, ordinal)
 }
-
-/// Otwiera urządzenie `ordinal` z podanymi budżetami pul.
 
 /// Adres karty w systemie: backend PLUS numer w obrębie tego backendu.
 ///
@@ -166,6 +178,7 @@ pub fn open_id(id: DeviceId, pools: PoolSizes) -> Result<Arc<dyn Device>> {
     }
 }
 
+/// Otwiera urządzenie `ordinal` z podanymi budżetami pul.
 pub fn open(ordinal: usize, pools: PoolSizes) -> Result<Arc<dyn Device>> {
     match backend(ordinal)? {
         #[cfg(feature = "cuda")]

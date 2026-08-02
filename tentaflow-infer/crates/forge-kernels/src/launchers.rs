@@ -18707,6 +18707,31 @@ mod nvfp4_gguf_dispatch_tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
+    /// Urzadzenie testowe albo `None`, gdy maszyna nie ma sterownika CUDA.
+    ///
+    /// `catch_unwind`, nie sam wariant `Err`: bez biblioteki sterownika — czyli
+    /// na kazdym Macu — cudarc panikuje przy jej leniwym ladowaniu, wiec samo
+    /// dopasowanie `Err` nigdy nie dochodzilo do skutku i caly zestaw testow
+    /// byl czerwony zamiast cichy.
+    fn test_device(activations: usize) -> Option<std::sync::Arc<CudaDevice>> {
+        let pools = PoolSizes {
+            weights: 16 << 20,
+            kv_cache: 4 << 20,
+            activations,
+            kv_page_size: 256 << 10,
+        };
+        match std::panic::catch_unwind(|| CudaDevice::new(0, pools)) {
+            Ok(Ok(device)) => Some(device),
+            Ok(Err(error)) => {
+                eprintln!("pominieto: brak uzytecznego urzadzenia CUDA ({error})");
+                None
+            }
+            Err(_) => {
+                eprintln!("pominieto: brak sterownika CUDA na tej maszynie");
+                None
+            }
+        }
+    }
     #[test]
     fn fp8_bn256_wymaga_pelnego_m1024_i_zasobow() {
         assert!(fp8_modular_bn256_capable(
@@ -19649,21 +19674,11 @@ mod nvfp4_gguf_dispatch_tests {
         let _serialized = PREPARED_Q8_SCRATCH
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let device = match CudaDevice::new(
-            0,
-            PoolSizes {
-                weights: 16 << 20,
-                kv_cache: 4 << 20,
-                activations: 64 << 20,
-                kv_page_size: 256 << 10,
-            },
-        ) {
-            Ok(device) => device,
-            Err(error) => {
-                eprintln!("pominięto parity prepared Q8 T32/T128 bez CUDA: {error}");
-                return;
-            }
-        };
+        // `catch_unwind`, nie sam wariant `Err`: na maszynie bez biblioteki
+        // sterownika CUDA — czyli na kazdym Macu — cudarc panikuje przy jej
+        // leniwym ladowaniu, wiec ponizsze pomijanie nigdy nie dochodzilo do
+        // skutku i caly zestaw testow byl czerwony zamiast cichy.
+        let Some(device) = test_device(64 << 20) else { return };
         let kernels = Kernels::load(device.clone()).unwrap();
         let stream = device.create_stream().unwrap();
         let rows = 65usize;
@@ -19754,21 +19769,11 @@ mod nvfp4_gguf_dispatch_tests {
         let _serialized = PREPARED_Q8_SCRATCH
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let device = match CudaDevice::new(
-            0,
-            PoolSizes {
-                weights: 16 << 20,
-                kv_cache: 4 << 20,
-                activations: 64 << 20,
-                kv_page_size: 256 << 10,
-            },
-        ) {
-            Ok(device) => device,
-            Err(error) => {
-                eprintln!("pominięto parity fused Q8 triplet bez CUDA: {error}");
-                return;
-            }
-        };
+        // `catch_unwind`, nie sam wariant `Err`: na maszynie bez biblioteki
+        // sterownika CUDA — czyli na kazdym Macu — cudarc panikuje przy jej
+        // leniwym ladowaniu, wiec ponizsze pomijanie nigdy nie dochodzilo do
+        // skutku i caly zestaw testow byl czerwony zamiast cichy.
+        let Some(device) = test_device(64 << 20) else { return };
         let kernels = Kernels::load(device.clone()).unwrap();
         let stream = device.create_stream().unwrap();
         let rows = [65usize, 17, 9];
@@ -19890,21 +19895,7 @@ mod nvfp4_gguf_dispatch_tests {
         let _serialized = PREPARED_Q8_SCRATCH
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let device = match CudaDevice::new(
-            0,
-            PoolSizes {
-                weights: 16 << 20,
-                kv_cache: 4 << 20,
-                activations: 16 << 20,
-                kv_page_size: 256 << 10,
-            },
-        ) {
-            Ok(device) => device,
-            Err(error) => {
-                eprintln!("pominięto test fault injection prepared Q8 bez CUDA: {error}");
-                return;
-            }
-        };
+        let Some(device) = test_device(16 << 20) else { return };
         let kernels = Kernels::load(device.clone()).unwrap();
         let stream = device.create_stream().unwrap();
         let tokens = 6usize;

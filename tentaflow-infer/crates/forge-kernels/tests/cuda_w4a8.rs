@@ -17,18 +17,28 @@ use forge_types::{MemKind, Result};
 use half::f16;
 
 fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
-        0,
-        PoolSizes {
-            weights: 2048 << 20,
-            kv_cache: 16 << 20,
-            activations: 1024 << 20,
-            kv_page_size: 256 << 10,
-        },
-    ) {
-        Ok(d) => Some(d),
-        Err(e) => {
+    // `catch_unwind`, nie sam wariant `Err`: bez biblioteki sterownika CUDA —
+    // czyli na kazdym Macu — cudarc panikuje przy jej leniwym ladowaniu, wiec
+    // ponizsze pomijanie nigdy nie dochodzilo do skutku.
+    let created = std::panic::catch_unwind(|| {
+        CudaDevice::new(
+            0,
+            PoolSizes {
+                weights: 2048 << 20,
+                kv_cache: 16 << 20,
+                activations: 1024 << 20,
+                kv_page_size: 256 << 10,
+            },
+        )
+    });
+    match created {
+        Ok(Ok(d)) => Some(d),
+        Ok(Err(e)) => {
             eprintln!("skipping CUDA w4a8 tests: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("skipping CUDA w4a8 tests: brak sterownika CUDA");
             None
         }
     }
