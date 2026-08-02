@@ -39,6 +39,13 @@ PORT="${PORT:-8100}"
 DIST_PORT="${DIST_PORT:-8101}"
 
 UTIL="${UTIL:-0.75}"
+# fp8_ds_mla is upstream's first-class packed DSV4 layout (448B NoPE + 128B RoPE
+# + 8B scale = 584B/token) and the one the SM120 FlashInfer sparse kernel
+# validates against. nvfp4_ds_mla is a third-party dtype that upstream does not
+# thread through its ~20 layout decisions, so it silently degrades to bf16 rows.
+KVDTYPE="${KVDTYPE:-fp8_ds_mla}"
+# "dspark" albo "off" — do izolowania bledow dispatchu kerneli.
+SPEC="${SPEC:-dspark}"
 SEQS="${SEQS:-6}"
 KVEC=5                       # = dspark_block_size checkpointu, NIE do strojenia
 CAPTURE=""                   # domyslnie seqs*(k+1)
@@ -50,6 +57,8 @@ cmd="${1:-help}"; shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --util)    UTIL="$2"; shift 2;;
+    --kv-dtype) KVDTYPE="$2"; shift 2;;
+    --spec)    SPEC="$2"; shift 2;;
     --seqs)    SEQS="$2"; shift 2;;
     --maxlen)  MAXLEN="$2"; shift 2;;
     --batched) BATCHED="$2"; shift 2;;
@@ -67,7 +76,8 @@ done
 # threading them through ssh + eval strips them silently -- vLLM then sees
 # `{method:dspark,...}` and dies with an empty log.
 write_launcher() {  # $1 = rank, $2 = this node's RDMA ip
-  local rank="$1" ip="$2" headless=""
+  local rank="$1" ip="$2" headless="" SPEC_ARG=""
+  [ "$SPEC" = "off" ] || SPEC_ARG="--speculative-config '{\"method\":\"$SPEC\",\"num_speculative_tokens\":$KVEC,\"draft_sample_method\":\"probabilistic\"}'"
   [ "$rank" = "0" ] || headless="--headless"
   cat > "$CACHE_DIR/serve-rank$rank.sh" <<LAUNCH
 #!/bin/bash
@@ -86,19 +96,28 @@ export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 # "requires FlashInfer's sparse MLA decode API" even though the API is present.
 # We deliberately carry no flashinfer-cubin package: no build matching
 # flashinfer-python 0.6.14 exists on PyPI, and JIT covers it.
-export PATH=/usr/local/cuda/bin:\$PATH
-export FLASHINFER_CACHE_DIR=$CACHE_DIR/flashinfer
+# The venv's own bin must be on PATH too. Calling \$VENV/bin/vllm directly does
+# NOT activate it, so FlashInfer's JIT could not find ninja -- which lives
+# there -- and died with "[Errno 2] No such file or directory".
+# NOTE: this heredoc is unquoted, so backticks and \$(...) here would be
+# EXECUTED while generating the script. Keep prose free of both.
+export PATH=$VENV/bin:/usr/local/cuda/bin:\$PATH
+# Do NOT redirect FLASHINFER_CACHE_DIR here: \`python -m flashinfer
+# download-cubin\` ignores it and writes to the default under \$HOME, so pointing
+# the server elsewhere hides the prebuilt cubins and sends it back to JIT --
+# which is what made long prompts return 500 with "RPC call to sample_tokens
+# timed out" while short ones worked.
 exec $VENV/bin/vllm serve $MODEL --host 0.0.0.0 --port $PORT \\
   --tensor-parallel-size 2 --pipeline-parallel-size 1 \\
   --distributed-executor-backend mp \\
   --nnodes 2 --node-rank $rank --master-addr $HEAD_IP --master-port $DIST_PORT $headless \\
   --trust-remote-code \\
-  --kv-cache-dtype nvfp4_ds_mla --block-size 256 \\
+  --kv-cache-dtype $KVDTYPE --block-size 256 \\
   --max-model-len $MAXLEN --max-num-seqs $SEQS \\
   --max-num-batched-tokens $BATCHED --max-cudagraph-capture-size $CAPTURE \\
   --gpu-memory-utilization $UTIL \\
   --enable-prefix-caching --enable-chunked-prefill --async-scheduling \\
-  --speculative-config '{"method":"dspark","num_speculative_tokens":$KVEC,"draft_sample_method":"probabilistic"}' \\
+  $SPEC_ARG \\
   --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 \\
   --tool-call-parser deepseek_v4 --enable-auto-tool-choice \\
   --override-generation-config '{"temperature":1.0,"top_p":0.95}' \\
@@ -147,7 +166,7 @@ mkdir -p "$CACHE_DIR"
 case "$cmd" in
   up)
     [ -x "$VENV/bin/vllm" ] || { echo "brak bundla: $VENV — uruchom scripts/build-vllm-spark-venv.sh"; exit 1; }
-    echo "profil: util=$UTIL seqs=$SEQS capture=$CAPTURE maxlen=$MAXLEN batched=$BATCHED k=$KVEC"
+    echo "profil: util=$UTIL seqs=$SEQS capture=$CAPTURE maxlen=$MAXLEN batched=$BATCHED k=$KVEC kv=$KVDTYPE spec=$SPEC"
     "$0" down >/dev/null 2>&1
     # Worker pierwszy: head binduje TCPStore master i od razu szuka rankow.
     start_node 1 "$WORKER_IP" "$WORKER_SSH" && echo "worker: start"
