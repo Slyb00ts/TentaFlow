@@ -79,6 +79,15 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_SKIP_INIT_MEMORY_CHECK=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=$CACHE_DIR/fi-at
 export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+# nvcc MUST be on PATH. vLLM's has_flashinfer() reports FlashInfer as
+# unavailable when there are no pre-built cubins AND nvcc is missing, because it
+# then cannot JIT its kernels. On SM120 the DeepSeek V4 MLA path is
+# FLASHINFER_MLA_SPARSE_DSV4, so without this the engine refuses to start with
+# "requires FlashInfer's sparse MLA decode API" even though the API is present.
+# We deliberately carry no flashinfer-cubin package: no build matching
+# flashinfer-python 0.6.14 exists on PyPI, and JIT covers it.
+export PATH=/usr/local/cuda/bin:\$PATH
+export FLASHINFER_CACHE_DIR=$CACHE_DIR/flashinfer
 exec $VENV/bin/vllm serve $MODEL --host 0.0.0.0 --port $PORT \\
   --tensor-parallel-size 2 --pipeline-parallel-size 1 \\
   --distributed-executor-backend mp \\
