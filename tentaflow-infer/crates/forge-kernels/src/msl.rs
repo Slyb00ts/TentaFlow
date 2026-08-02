@@ -215,6 +215,115 @@ pub fn silu_mul_groups(n: u32) -> u32 {
     n.div_ceil(SILU_MUL_THREADS)
 }
 
+/// Threads per head for the rotary embedding: one thread per rotated pair.
+pub const ROPE_THREADS_PER_HEAD: u32 = 64;
+
+/// Rotary positional embedding, half-split convention.
+///
+/// Rotates the pair `(i, i + dims/2)` rather than `(2i, 2i+1)`. The two
+/// conventions produce equally plausible tensors of the same shape and differ
+/// only in which channels move together, so picking the wrong one yields a
+/// model that reads as fluent nonsense — the gate against MLX is the only
+/// thing that distinguishes them.
+pub const ROPE_HALF_SPLIT_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_half_split_f16(
+    device half*         v      [[buffer(0)]],
+    constant uint&       heads  [[buffer(1)]],
+    constant uint&       dims   [[buffer(2)]],
+    constant uint&       pos    [[buffer(3)]],
+    constant float&      theta  [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint half_dims = dims / 2u;
+    const uint head = gid / half_dims;
+    const uint i    = gid % half_dims;
+    if (head >= heads) { return; }
+
+    // Czestotliwosc liczona w f32: przy base 1e6 i dims 128 wykladnik schodzi
+    // do 1e-6, a w f16 to juz jest zero i caly obrot znika dla polowy kanalow.
+    const float freq = float(pos) * pow(theta, -2.0f * float(i) / float(dims));
+    const float c = cos(freq);
+    const float s = sin(freq);
+
+    device half* row = v + head * dims;
+    const float x0 = float(row[i]);
+    const float x1 = float(row[i + half_dims]);
+    row[i]             = half(x0 * c - x1 * s);
+    row[i + half_dims] = half(x0 * s + x1 * c);
+}
+"#;
+
+pub const ROPE_HALF_SPLIT_NAME: &str = "rope_half_split_f16";
+
+pub fn rope_groups(heads: u32, dims: u32, threads_per_group: u32) -> u32 {
+    (heads * dims / 2).div_ceil(threads_per_group)
+}
+
+/// Threads in the argmax threadgroup. One group scans the whole vocabulary.
+pub const ARGMAX_THREADS: u32 = 256;
+
+/// Greedy token choice: the index of the largest logit, ties going to the
+/// LOWEST index.
+///
+/// The tie rule is not decoration. Logits collide often enough at low
+/// temperature that a different rule changes one token in a few thousand, and
+/// a model that diverges once in a while is far harder to debug than one that
+/// is wrong always.
+pub const ARGMAX_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void argmax_f32(
+    device uint*         out     [[buffer(0)]],
+    device const float*  logits  [[buffer(1)]],
+    constant uint&       n       [[buffer(2)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float best_val[8];
+    threadgroup uint  best_idx[8];
+
+    float val = -INFINITY;
+    uint  idx = 0u;
+    for (uint i = tid; i < n; i += 256u) {
+        const float v = logits[i];
+        // Ostra nierownosc: przy rowności zostaje indeks mniejszy, bo ten
+        // watek doszedl do niego wczesniej.
+        if (v > val) { val = v; idx = i; }
+    }
+
+    // Redukcja wewnatrz fali, z ta sama regula remisu.
+    for (uint offset = 16u; offset > 0u; offset >>= 1) {
+        const float other_val = simd_shuffle_down(val, offset);
+        const uint  other_idx = simd_shuffle_down(idx, offset);
+        if (other_val > val || (other_val == val && other_idx < idx)) {
+            val = other_val;
+            idx = other_idx;
+        }
+    }
+    if (lane == 0u) { best_val[sg] = val; best_idx[sg] = idx; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float bv = best_val[0];
+        uint  bi = best_idx[0];
+        for (uint g = 1u; g < 8u; ++g) {
+            if (best_val[g] > bv || (best_val[g] == bv && best_idx[g] < bi)) {
+                bv = best_val[g];
+                bi = best_idx[g];
+            }
+        }
+        out[0] = bi;
+    }
+}
+"#;
+
+pub const ARGMAX_NAME: &str = "argmax_f32";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +368,24 @@ mod tests {
         assert_eq!(silu_mul_groups(1), 1);
         assert_eq!(silu_mul_groups(257), 2);
         assert!(SILU_MUL_SOURCE.contains(SILU_MUL_NAME));
+    }
+
+    #[test]
+    fn rope_grid_covers_every_rotated_pair() {
+        // 32 głowice po 128 wymiarów to 2048 par, czyli 8 grup po 256 wątków.
+        assert_eq!(rope_groups(32, 128, 256), 8);
+        assert_eq!(rope_groups(1, 128, 64), 1);
+        assert!(ROPE_HALF_SPLIT_SOURCE.contains(ROPE_HALF_SPLIT_NAME));
+        // Para to (i, i + dims/2), nie (2i, 2i+1) — gdyby ktoś przepisał kernel
+        // na wariant sąsiadujący, ten warunek to złapie zanim złapie to model.
+        assert!(ROPE_HALF_SPLIT_SOURCE.contains("row[i + half_dims]"));
+    }
+
+    #[test]
+    fn argmax_declares_its_tie_rule() {
+        assert!(ARGMAX_SOURCE.contains(ARGMAX_NAME));
+        assert!(ARGMAX_SOURCE.contains("other_idx < idx"));
+        assert_eq!(ARGMAX_THREADS, 256);
     }
 
     #[test]
