@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 # Backend AMD dla testów kerneli (kompilowane razem z CUDA, wybór w forge-hal::gpu).
 hip = ["forge-hal/hip"]
+# Kernele Metal (macOS). Zrodla MSL kompilowane przez backend przy ladowaniu.
+metal = ["forge-hal/metal"]
 
 [dependencies]
 forge-types.workspace = true

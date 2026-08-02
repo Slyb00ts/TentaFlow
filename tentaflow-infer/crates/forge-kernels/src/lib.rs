@@ -4,6 +4,8 @@
 // typed launch wrappers so the engine never touches raw entry symbols.
 
 mod launchers;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod msl;
 mod registry;
 
 pub use launchers::{
