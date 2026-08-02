@@ -588,6 +588,17 @@ async fn run_server(args: Args) -> Result<()> {
         router.set_services_snapshot_rx(rx);
     }
 
+    // Deployment klastra zyje w kontenerach, ktore przezywaja restart procesu,
+    // ale jego fazy prowadzi zadanie ginace razem z procesem. Bez tego rekord
+    // zostawal `deploying` na zawsze (i blokowal kolejny deploy), a `running`
+    // nie mial kto zweryfikowac — supervisor serwisow celowo pomija czlonkow
+    // distributed, bo headless worker zawsze wypadlby u niego jako awaria.
+    tentaflow_core::services::deploy::cluster_health::reconcile_on_startup(&db);
+    tentaflow_core::services::deploy::cluster_health::spawn_health_loop(
+        db.clone(),
+        std::sync::Arc::from(local_node_id_str.as_str()),
+    );
+
     // Best-effort discovery of user-managed external daemons (Ollama). Runs in
     // the background so a slow probe does not block the rest of startup; any
     // failure is logged and ignored — auto-detect is a convenience, not a

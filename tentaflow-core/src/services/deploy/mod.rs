@@ -6,6 +6,7 @@
 //                deployments. If it fails, ROLLBACK is invoked to undo prepare.
 
 pub mod binary;
+pub mod cluster_health;
 pub mod distributed;
 pub mod docker;
 pub mod embedded;

@@ -3925,6 +3925,35 @@ pub fn active_cluster_deployment(
     Ok(res)
 }
 
+/// Wszystkie deploymenty klastra o podanych statusach, niezaleznie od klastra.
+/// Uzywane przy starcie procesu (rekoncyliacja osieroconych) i przez petle
+/// zdrowia — te sciezki nie znaja `cluster_id` z gory.
+pub fn cluster_deployments_by_status(
+    pool: &DbPool,
+    statuses: &[&str],
+) -> Result<Vec<DbClusterDeployment>> {
+    if statuses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = acquire(pool)?;
+    let placeholders = statuses
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM cluster_deployments WHERE status IN ({}) ORDER BY created_at",
+        CLUSTER_DEPLOYMENT_COLS, placeholders
+    ))?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        statuses.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let rows = stmt
+        .query_map(params.as_slice(), row_to_cluster_deployment)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// All `failed` distributed deployments of a cluster — cleared (best-effort
 /// teardown + delete) before a fresh deploy so a stale failed record never blocks
 /// a redeploy.
