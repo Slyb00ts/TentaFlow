@@ -30,12 +30,13 @@ CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 JOBS="${MAX_JOBS:-8}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# GB10 is sm_121a, but this list must say plain `12.1`: vLLM's CMake appends the
-# `a` itself (CMakeLists maps 12.1 -> 12.1a for arch-specific kernels). Passing
-# `12.1a` makes torch's arch parser drop the entry and silently fall back to
-# 12.0, which then refuses to compile FlashMLA -- a build that succeeds and
-# produces a runtime with no MLA kernels for this GPU.
-ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1}"
+# GB10 reports sm_121, yet the right value here is `12.0` -- NOT 12.1 or 12.1a.
+# Under CUDA >= 13 vLLM's CUDA_SUPPORTED_ARCHS deliberately drops 12.1 and uses
+# NVIDIA's family-specific targets instead (12.0f covers the whole 12.x family),
+# so a `12.1` entry is filtered out and the build silently falls back to torch's
+# default arch set. Family cubins built this way do run on sm_121 -- proven
+# below by launching a real vLLM kernel on the device, not by reading labels.
+ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
 
 VENV="$PREFIX/venv"
 SRC="$PREFIX/src"
@@ -116,18 +117,41 @@ log "weryfikacja"
 SITE=$("$PY" -c "import vllm,os;print(os.path.dirname(vllm.__file__))") || die "import vllm"
 "$PY" -c "import vllm;print(f'vllm {vllm.__version__}')" || die "import vllm"
 
-# The 12.1a fallback is invisible until a kernel launches, so prove the SASS is
-# there. FlashMLA is the module that matters for DeepSeek V4.
-miss=0
-for so in "$SITE"/_C*.abi3.so "$SITE"/_flashmla_C*.abi3.so; do
+for so in "$SITE"/_C*.abi3.so "$SITE"/_moe_C*.abi3.so; do
   [ -f "$so" ] || continue
   archs=$("$CUDA_HOME/bin/cuobjdump" "$so" 2>/dev/null | grep -oE 'sm_[0-9]+a?' | sort -u | tr '\n' ' ')
+  printf '  %-38s %s\n' "$(basename "$so")" "$archs"
   case "$archs" in
-    *sm_121*) printf '  \033[32mOK\033[0m   %-34s %s\n' "$(basename "$so")" "$archs" ;;
-    *)        printf '  \033[31mBRAK\033[0m %-34s %s\n' "$(basename "$so")" "$archs"; miss=1 ;;
+    *sm_120*|*sm_121*) ;;
+    *) die "$(basename "$so") nie ma zadnego celu z rodziny 12.x — sprawdz TORCH_CUDA_ARCH_LIST" ;;
   esac
 done
-[ "$miss" = 0 ] || die "brak kerneli sm_121a — build zszedl do innej architektury (sprawdz TORCH_CUDA_ARCH_LIST)"
+
+# The decisive check. A cubin labelled sm_120 may or may not run here: family
+# targets (12.0f) do, architecture-specific ones (12.0a) do not, and cuobjdump
+# prints `sm_120` for both. Reading the label proves nothing -- launching a
+# kernel does. This is also what catches a build that quietly targeted the wrong
+# family, which otherwise only surfaces mid-inference as "no kernel image".
+"$PY" - <<'EOF' || die "kernel vLLM nie uruchamia sie na tym GPU — build celuje w niewlasciwa rodzine"
+import sys
+import torch
+from vllm import _custom_ops as ops
+
+cap = torch.cuda.get_device_capability(0)
+x = torch.randn(8, 512, device="cuda", dtype=torch.float16)
+w = torch.ones(512, device="cuda", dtype=torch.float16)
+out = torch.empty_like(x)
+try:
+    ops.rms_norm(out, x, w, 1e-6)
+    torch.cuda.synchronize()
+except Exception as exc:  # noqa: BLE001
+    sys.exit(f"  kernel padl na {torch.cuda.get_device_name(0)} sm_{cap[0]}{cap[1]}: {exc}")
+print(f"  kernel vLLM dziala na {torch.cuda.get_device_name(0)} (sm_{cap[0]}{cap[1]})")
+EOF
+
+# FlashMLA is absent on purpose: upstream lists only 9.0a and 10.0f/10.0a for it,
+# with no 12.x variant at all, so it is not buildable for this GPU in any
+# configuration. DeepSeek V4 runs its MLA path through another backend here.
 
 # The patch is idempotent and errors on a missing anchor, but a successful run
 # says nothing about whether the running interpreter imports THAT tree -- which

@@ -78,13 +78,15 @@ extras = []
 # source builda vllm 0.26.0). Bez tego nvcc kompiluje kernele do sm_120
 # i runtime crashuje na sm_121 z `cudaErrorLaunchFailure` / illegal instruction.
 [install_variants.env]
-# MUSI byc gole `12.1`, nie `12.1a`: CMake vllm sam dokleja `a` (CMakeLists
-# mapuje 12.1 -> 12.1a dla kerneli arch-specific), a parser architektur torcha
-# odrzuca wpis `12.1a` i po cichu schodzi do 12.0. Build konczy sie sukcesem i
-# produkuje runtime BEZ kerneli FlashMLA dla tego GPU — blad widoczny dopiero
-# przy starcie kernela. Weryfikacja: cuobjdump na zbudowanych .so musi pokazac
-# sm_121 (robi to scripts/build-vllm-spark-venv.sh).
-TORCH_CUDA_ARCH_LIST = "12.1"
+# MUSI byc `12.0`, mimo ze GB10 raportuje sm_121. Pod CUDA >= 13 vllm celowo
+# usuwa 12.1 z CUDA_SUPPORTED_ARCHS i uzywa celow RODZINOWYCH NVIDII (12.0f
+# obejmuje cala rodzine 12.x), wiec wpis `12.1` albo `12.1a` jest odfiltrowany
+# i build po cichu schodzi do domyslnej listy architektur torcha.
+# Zweryfikowane wykonawczo: kernel zbudowany tak uruchamia sie na sm_121
+# (scripts/build-vllm-spark-venv.sh odpala prawdziwy kernel na GPU — etykieta
+# `sm_120` w cuobjdump nie odroznia celu rodzinowego 12.0f od arch-specific
+# 12.0a, a tylko ten pierwszy dziala na 12.1).
+TORCH_CUDA_ARCH_LIST = "12.0"
 VLLM_TARGET_DEVICE = "cuda"
 # Build kerneli z lokalnych zrodel — bez tego pip moglby probowac
 # sciagnac prebuilt wheel z PyPI.
