@@ -38,14 +38,14 @@ GID="${GID:-3}"
 PORT="${PORT:-8100}"
 DIST_PORT="${DIST_PORT:-8101}"
 
-UTIL="${UTIL:-0.75}"
+UTIL="${UTIL:-0.80}"
 # fp8_ds_mla is upstream's first-class packed DSV4 layout (448B NoPE + 128B RoPE
 # + 8B scale = 584B/token) and the one the SM120 FlashInfer sparse kernel
 # validates against. nvfp4_ds_mla is a third-party dtype that upstream does not
 # thread through its ~20 layout decisions, so it silently degrades to bf16 rows.
 KVDTYPE="${KVDTYPE:-fp8_ds_mla}"
 # "dspark" albo "off" — do izolowania bledow dispatchu kerneli.
-SPEC="${SPEC:-dspark}"
+SPEC="${SPEC:-off}"
 # "on"/"off" — parsery reasoning/tool-call dzialaja per token w strumieniu.
 PARSERS="${PARSERS:-on}"
 # "on"/"off" — async scheduling rozdziela execute_model i sample_tokens na osobne
@@ -56,7 +56,7 @@ ASYNC="${ASYNC:-on}"
 PREFIX="${PREFIX:-on}"
 # "on"/"off" — grafy CUDA. Zawis siedzi w cudaEventSynchronize po async D2H
 # copy; grafy sa ostatnia warstwa, ktora moze na to wplywac.
-GRAPHS="${GRAPHS:-on}"
+GRAPHS="${GRAPHS:-off}"
 BREAKABLE="${BREAKABLE:-1}"
 SEQS="${SEQS:-6}"
 KVEC=5                       # = dspark_block_size checkpointu, NIE do strojenia
