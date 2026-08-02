@@ -131,7 +131,7 @@ def main() -> int:
     ap.add_argument("--url", default="http://10.10.10.24:8100/v1/chat/completions")
     ap.add_argument("--model", default="deepseek-ai/DeepSeek-V4-Flash-0731")
     ap.add_argument("--max-tokens", type=int, default=256)
-    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--timeout", type=int, default=2100)
     ap.add_argument("--venv", default="/opt/TentaFlow/.runtime/bundles/vllm-spark/venv")
     ap.add_argument("--log", default="/opt/TentaFlow/.runtime/cache/vllm/serve-rank0.log")
     ap.add_argument("--repeat", type=int, default=1, help="powtorzenia per kontekst")
@@ -157,15 +157,19 @@ def main() -> int:
             try:
                 r = run(args.url, args.model, prompt, args.max_tokens, args.timeout)
             except Exception as exc:  # noqa: BLE001
-                print(f"{target:>10}  BLAD: {exc}")
+                print(f"{target:>10}  BLAD: {type(exc).__name__}: {exc}", flush=True)
                 continue
             u = r["usage"] or {}
             pin = u.get("prompt_tokens", 0)
             out = u.get("completion_tokens", r["chunks"])
             rate = (out / r["decode_s"]) if r["decode_s"] and out else 0.0
             pre = (pin / r["ttft_s"]) if r["ttft_s"] and pin else 0.0
+            # A stream cut short (client timeout, engine death) leaves ttft unset;
+            # formatting None crashed the whole run and threw away the rows that
+            # had already been measured.
+            ttft = f"{r['ttft_s']:>8.2f}" if r["ttft_s"] is not None else f"{'—':>8}"
             print(
-                f"{pin:>10} {r['ttft_s']:>8.2f} {pre:>14.0f} {rate:>13.1f} "
+                f"{pin:>10} {ttft} {pre:>14.0f} {rate:>13.1f} "
                 f"{out:>8} {r['total_s']:>8.2f}"
             )
             if args.show_text:

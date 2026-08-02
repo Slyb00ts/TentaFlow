@@ -46,6 +46,18 @@ UTIL="${UTIL:-0.75}"
 KVDTYPE="${KVDTYPE:-fp8_ds_mla}"
 # "dspark" albo "off" — do izolowania bledow dispatchu kerneli.
 SPEC="${SPEC:-dspark}"
+# "on"/"off" — parsery reasoning/tool-call dzialaja per token w strumieniu.
+PARSERS="${PARSERS:-on}"
+# "on"/"off" — async scheduling rozdziela execute_model i sample_tokens na osobne
+# RPC; zawieszenia widzimy wlasnie w sample_tokens.
+ASYNC="${ASYNC:-on}"
+# "on"/"off" — cache prefiksow; czesciowe trafienie + prefill w kawalkach to
+# najlepszy kandydat na zrodlo pelzania przy promptach > max-num-batched-tokens.
+PREFIX="${PREFIX:-on}"
+# "on"/"off" — grafy CUDA. Zawis siedzi w cudaEventSynchronize po async D2H
+# copy; grafy sa ostatnia warstwa, ktora moze na to wplywac.
+GRAPHS="${GRAPHS:-on}"
+BREAKABLE="${BREAKABLE:-1}"
 SEQS="${SEQS:-6}"
 KVEC=5                       # = dspark_block_size checkpointu, NIE do strojenia
 CAPTURE=""                   # domyslnie seqs*(k+1)
@@ -59,6 +71,11 @@ while [ $# -gt 0 ]; do
     --util)    UTIL="$2"; shift 2;;
     --kv-dtype) KVDTYPE="$2"; shift 2;;
     --spec)    SPEC="$2"; shift 2;;
+    --parsers) PARSERS="$2"; shift 2;;
+    --async)   ASYNC="$2"; shift 2;;
+    --prefix)  PREFIX="$2"; shift 2;;
+    --graphs)  GRAPHS="$2"; shift 2;;
+    --breakable) BREAKABLE="$2"; shift 2;;
     --seqs)    SEQS="$2"; shift 2;;
     --maxlen)  MAXLEN="$2"; shift 2;;
     --batched) BATCHED="$2"; shift 2;;
@@ -78,6 +95,15 @@ done
 write_launcher() {  # $1 = rank, $2 = this node's RDMA ip
   local rank="$1" ip="$2" headless="" SPEC_ARG=""
   [ "$SPEC" = "off" ] || SPEC_ARG="--speculative-config '{\"method\":\"$SPEC\",\"num_speculative_tokens\":$KVEC,\"draft_sample_method\":\"probabilistic\"}'"
+  local PARSER_ARG="" ASYNC_ARG="" PREFIX_ARG="--no-enable-prefix-caching"
+  local GRAPH_ARG="--max-cudagraph-capture-size $CAPTURE"
+  [ "$GRAPHS" = "off" ] && GRAPH_ARG="--enforce-eager"
+  [ "$PREFIX" = "off" ] || PREFIX_ARG="--enable-prefix-caching"
+  # SchedulerConfig.async_scheduling defaults to None, which means ENABLED --
+  # "If set to False, disable async scheduling". Omitting the flag therefore
+  # disables nothing, so an earlier A/B that just dropped it tested nothing.
+  if [ "$ASYNC" = "off" ]; then ASYNC_ARG="--no-async-scheduling"; else ASYNC_ARG="--async-scheduling"; fi
+  [ "$PARSERS" = "off" ] || PARSER_ARG="--reasoning-parser deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice"
   [ "$rank" = "0" ] || headless="--headless"
   cat > "$CACHE_DIR/serve-rank$rank.sh" <<LAUNCH
 #!/bin/bash
@@ -89,6 +115,20 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_SKIP_INIT_MEMORY_CHECK=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=$CACHE_DIR/fi-at
 export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+# vLLM auto-enables breakable cudagraphs on this platform and says so at
+# startup. They are the newer capture mode and the prime suspect for the
+# hang in cudaEventSynchronize after an async D2H copy; 0 opts out.
+export VLLM_USE_BREAKABLE_CUDAGRAPH=$BREAKABLE
+# vLLM JIT-compiles Triton kernels per SHAPE during inference (its own monitor
+# says so: "_build_c128a_topk_metadata_kernel ... causes a latency spike"). On
+# this aarch64/sm_121 pair a first-time compile can exceed the 300s default of
+# VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS, which applies only when TP > 1 -- exactly
+# our case. The RPC then times out and takes EngineCore down, which looked like
+# a random hang: a repeated prompt reuses a cached shape and is fast, while a
+# new prompt length compiles and dies.
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=\${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}
+# Persist the compiled kernels so the cost is paid once, not per restart.
+export TRITON_CACHE_DIR=$CACHE_DIR/triton
 # nvcc MUST be on PATH. vLLM's has_flashinfer() reports FlashInfer as
 # unavailable when there are no pre-built cubins AND nvcc is missing, because it
 # then cannot JIT its kernels. On SM120 the DeepSeek V4 MLA path is
@@ -114,12 +154,11 @@ exec $VENV/bin/vllm serve $MODEL --host 0.0.0.0 --port $PORT \\
   --trust-remote-code \\
   --kv-cache-dtype $KVDTYPE --block-size 256 \\
   --max-model-len $MAXLEN --max-num-seqs $SEQS \\
-  --max-num-batched-tokens $BATCHED --max-cudagraph-capture-size $CAPTURE \\
+  --max-num-batched-tokens $BATCHED $GRAPH_ARG \\
   --gpu-memory-utilization $UTIL \\
-  --enable-prefix-caching --enable-chunked-prefill --async-scheduling \\
+  $PREFIX_ARG --enable-chunked-prefill $ASYNC_ARG \\
   $SPEC_ARG \\
-  --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 \\
-  --tool-call-parser deepseek_v4 --enable-auto-tool-choice \\
+  --tokenizer-mode deepseek_v4 $PARSER_ARG \\
   --override-generation-config '{"temperature":1.0,"top_p":0.95}' \\
   $EXTRA
 LAUNCH
@@ -166,7 +205,7 @@ mkdir -p "$CACHE_DIR"
 case "$cmd" in
   up)
     [ -x "$VENV/bin/vllm" ] || { echo "brak bundla: $VENV — uruchom scripts/build-vllm-spark-venv.sh"; exit 1; }
-    echo "profil: util=$UTIL seqs=$SEQS capture=$CAPTURE maxlen=$MAXLEN batched=$BATCHED k=$KVEC kv=$KVDTYPE spec=$SPEC"
+    echo "profil: util=$UTIL seqs=$SEQS capture=$CAPTURE maxlen=$MAXLEN batched=$BATCHED k=$KVEC kv=$KVDTYPE spec=$SPEC parsery=$PARSERS async=$ASYNC prefix=$PREFIX grafy=$GRAPHS breakable=$BREAKABLE"
     "$0" down >/dev/null 2>&1
     # Worker pierwszy: head binduje TCPStore master i od razu szuka rankow.
     start_node 1 "$WORKER_IP" "$WORKER_SSH" && echo "worker: start"
@@ -175,6 +214,20 @@ case "$cmd" in
     echo "log: $0 logs   |   gotowosc: curl -s http://$HEAD_IP:$PORT/v1/models"
     ;;
   logs)   tail -f "$CACHE_DIR/serve-rank0.log";;
+  wait)
+    # Poll the API, never the log: a readiness string from a PREVIOUS run is
+    # still in the file until the next start truncates it, and grepping for it
+    # reports ready while the engine is loading weights -- which sends a whole
+    # benchmark into connection-refused.
+    deadline=$(( $(date +%s) + ${WAIT_SECS:-3600} ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      [ "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$HEAD_IP:$PORT/v1/models")" = "200" ] && {
+        echo "gotowy"; exit 0; }
+      p=$(cat "$CACHE_DIR/serve-rank0.pid" 2>/dev/null)
+      [ -n "$p" ] && kill -0 "$p" 2>/dev/null || { echo "proces head padl"; exit 1; }
+      sleep 15
+    done
+    echo "przekroczono czas oczekiwania"; exit 1;;
   status)
     printf "head   : %s\n" "$(node_status 0 '')"
     printf "worker : %s\n" "$(node_status 1 "$WORKER_SSH")"
