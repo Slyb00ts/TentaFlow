@@ -7,6 +7,8 @@
 // co-resident LLM engine.
 
 pub mod audio;
+pub mod cpu_ref;
+pub mod flavour;
 pub mod mel;
 pub mod weights;
 
@@ -86,6 +88,21 @@ impl WhisperModel {
         let dir = dir.as_ref();
         let kernels = Kernels::load(device.clone())?;
         let weights = WhisperWeights::load(device.as_ref(), dir)?;
+
+        // Kernel availability, checked here rather than in the loader: reading
+        // weights does not depend on which attention specializations exist, and
+        // the host reference path needs neither.
+        let head_dim = weights.config.head_dim();
+        if head_dim != 64 && head_dim != 128 {
+            return Err(ForgeError::Unsupported(format!(
+                "whisper head_dim {head_dim} has no attention specialization"
+            )));
+        }
+        if weights.config.encoder_attention_heads != weights.config.decoder_attention_heads {
+            return Err(ForgeError::Unsupported(
+                "whisper: differing encoder/decoder head counts".into(),
+            ));
+        }
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
 
         let special = |name: &str| {
