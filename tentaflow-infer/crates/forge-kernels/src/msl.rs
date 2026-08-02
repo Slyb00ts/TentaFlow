@@ -324,6 +324,114 @@ kernel void argmax_f32(
 
 pub const ARGMAX_NAME: &str = "argmax_f32";
 
+/// Longest KV cache one attention threadgroup can hold scores for. The score
+/// array lives in threadgroup memory, so the bound is real and the kernel
+/// REFUSES a longer cache rather than reading past it — the caller chunks.
+pub const ATTN_MAX_SEQ: u32 = 2048;
+
+/// One thread per output channel, which is what makes the second phase a plain
+/// parallel loop with no reduction at all.
+pub const ATTN_THREADS: u32 = 128;
+
+/// Single-query attention over a whole KV cache, with grouped query heads.
+///
+/// Three phases inside one threadgroup: scores for every key, softmax over
+/// them, then the weighted sum of values. Splitting differently — a thread per
+/// key in the last phase — would need an accumulator of `head_dim` floats per
+/// thread, which does not fit.
+///
+/// The query-to-KV mapping is `head / (n_heads / n_kv_heads)`. A wrong mapping
+/// changes neither the shape nor the norm of the result; it produces a model
+/// reading another head's memory, which is why the gate compares values.
+pub fn attn_decode_source(head_dim: u32) -> String {
+    let name = attn_decode_name(head_dim);
+    format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void {name}(
+    device half*         out        [[buffer(0)]],
+    device const half*   q          [[buffer(1)]],
+    device const half*   k          [[buffer(2)]],
+    device const half*   v          [[buffer(3)]],
+    constant uint&       n_heads    [[buffer(4)]],
+    constant uint&       n_kv_heads [[buffer(5)]],
+    constant uint&       seq        [[buffer(6)]],
+    constant float&      scale      [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{{
+    const uint dim = {dim}u;
+    const uint head = tgid;
+    if (head >= n_heads || seq > {max_seq}u) {{ return; }}
+    const uint kv_head = head / (n_heads / n_kv_heads);
+
+    threadgroup float scores[{max_seq}];
+    threadgroup float reduce[{simdgroups}];
+
+    device const half* qh = q + head * dim;
+    device const half* kh = k + kv_head * seq * dim;
+    device const half* vh = v + kv_head * seq * dim;
+
+    // Faza 1: iloczyn skalarny zapytania z kazdym kluczem.
+    for (uint j = tid; j < seq; j += {threads}u) {{
+        float acc = 0.0f;
+        device const half* kj = kh + j * dim;
+        for (uint c = 0; c < dim; ++c) {{
+            acc = fma(float(qh[c]), float(kj[c]), acc);
+        }}
+        scores[j] = acc * scale;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Faza 2: maksimum, potem wykladniki i ich suma. Odjecie maksimum przed
+    // exp jest tu warunkiem poprawnosci, nie ostroznoscia: bez niego dlugi
+    // kontekst przelewa f32 i softmax daje NaN.
+    float local = -INFINITY;
+    for (uint j = tid; j < seq; j += {threads}u) {{ local = max(local, scores[j]); }}
+    local = simd_max(local);
+    if (lane == 0u) {{ reduce[sg] = local; }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = reduce[0];
+    for (uint g = 1u; g < {simdgroups}u; ++g) {{ m = max(m, reduce[g]); }}
+
+    float partial = 0.0f;
+    for (uint j = tid; j < seq; j += {threads}u) {{
+        const float e = exp(scores[j] - m);
+        scores[j] = e;
+        partial += e;
+    }}
+    partial = simd_sum(partial);
+    if (lane == 0u) {{ reduce[sg] = partial; }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = reduce[0];
+    for (uint g = 1u; g < {simdgroups}u; ++g) {{ total += reduce[g]; }}
+
+    // Faza 3: jeden watek na kanal wyjscia.
+    if (tid < dim) {{
+        float acc = 0.0f;
+        for (uint j = 0; j < seq; ++j) {{
+            acc = fma(scores[j], float(vh[j * dim + tid]), acc);
+        }}
+        out[head * dim + tid] = half(acc / total);
+    }}
+}}
+"#,
+        name = name,
+        dim = head_dim,
+        max_seq = ATTN_MAX_SEQ,
+        threads = ATTN_THREADS,
+        simdgroups = ATTN_THREADS / 32,
+    )
+}
+
+pub fn attn_decode_name(head_dim: u32) -> String {
+    format!("attn_decode_d{head_dim}_s{ATTN_MAX_SEQ}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +494,18 @@ mod tests {
         assert!(ARGMAX_SOURCE.contains(ARGMAX_NAME));
         assert!(ARGMAX_SOURCE.contains("other_idx < idx"));
         assert_eq!(ARGMAX_THREADS, 256);
+    }
+
+    #[test]
+    fn attention_name_carries_the_bounds_the_body_enforces() {
+        let src = attn_decode_source(128);
+        assert_eq!(attn_decode_name(128), "attn_decode_d128_s2048");
+        assert!(src.contains("attn_decode_d128_s2048"));
+        // Limit dlugosci cache'u jest w nazwie, w deklaracji tablicy i w
+        // warunku odmowy — rozjazd któregokolwiek z nich to odczyt poza bufor.
+        assert!(src.contains(&format!("threadgroup float scores[{ATTN_MAX_SEQ}]")));
+        assert!(src.contains(&format!("seq > {ATTN_MAX_SEQ}u")));
+        assert!(src.contains("head / (n_heads / n_kv_heads)"));
     }
 
     #[test]
