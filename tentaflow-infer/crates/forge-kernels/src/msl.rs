@@ -386,7 +386,8 @@ kernel void {name}(
     constant uint&       n_heads    [[buffer(4)]],
     constant uint&       n_kv_heads [[buffer(5)]],
     constant uint&       seq        [[buffer(6)]],
-    constant float&      scale      [[buffer(7)]],
+    constant uint&       seq_cap    [[buffer(7)]],
+    constant float&      scale      [[buffer(8)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
@@ -394,15 +395,19 @@ kernel void {name}(
 {{
     const uint dim = {dim}u;
     const uint head = tgid;
-    if (head >= n_heads || seq > {max_seq}u) {{ return; }}
+    // Dlugosc WAZNA i POJEMNOSC to dwie rozne liczby. Krok skladowania w
+    // cache'u wyznacza pojemnosc, a petla po kluczach dlugosc; wziecie jednej
+    // za druga adresuje glowice od zlego wiersza i nie zmienia ani ksztaltu,
+    // ani rzedu wielkosci wyniku.
+    if (head >= n_heads || seq > seq_cap || seq_cap > {max_seq}u) {{ return; }}
     const uint kv_head = head / (n_heads / n_kv_heads);
 
     threadgroup float scores[{max_seq}];
     threadgroup float reduce[{simdgroups}];
 
     device const half* qh = q + head * dim;
-    device const half* kh = k + kv_head * seq * dim;
-    device const half* vh = v + kv_head * seq * dim;
+    device const half* kh = k + kv_head * seq_cap * dim;
+    device const half* vh = v + kv_head * seq_cap * dim;
 
     // Faza 1: iloczyn skalarny zapytania z kazdym kluczem.
     for (uint j = tid; j < seq; j += {threads}u) {{
@@ -640,7 +645,10 @@ mod tests {
         // Limit dlugosci cache'u jest w nazwie, w deklaracji tablicy i w
         // warunku odmowy — rozjazd któregokolwiek z nich to odczyt poza bufor.
         assert!(src.contains(&format!("threadgroup float scores[{ATTN_MAX_SEQ}]")));
-        assert!(src.contains(&format!("seq > {ATTN_MAX_SEQ}u")));
+        assert!(src.contains(&format!("seq_cap > {ATTN_MAX_SEQ}u")));
+        // Krok składowania liczy się z POJEMNOŚCI, nie z bieżącej długości.
+        assert!(src.contains("kv_head * seq_cap * dim"));
+        assert!(!src.contains("kv_head * seq * dim"));
         assert!(src.contains("head / (n_heads / n_kv_heads)"));
     }
 

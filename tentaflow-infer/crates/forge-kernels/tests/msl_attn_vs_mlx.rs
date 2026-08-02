@@ -124,6 +124,7 @@ fn decode_attention_matches_mlx_with_grouped_heads() {
         .scalar(f.heads)
         .scalar(f.kv_heads)
         .scalar(f.seq)
+        .scalar(f.seq)
         .scalar(f.scale);
     dev.launch(
         &kernel,
@@ -246,6 +247,7 @@ fn a_cache_longer_than_the_declared_bound_is_refused() {
         .buf(&q)
         .scalar(f.heads)
         .scalar(f.kv_heads)
+        .scalar(msl::ATTN_MAX_SEQ + 1)
         .scalar(msl::ATTN_MAX_SEQ + 1)
         .scalar(f.scale);
     dev.launch(
