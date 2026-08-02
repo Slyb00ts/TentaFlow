@@ -4600,6 +4600,41 @@ pub struct ClusterDetailRequest {
 pub struct ClusterDetailResponse {
     pub cluster: ClusterInfo,
     pub members: Vec<ClusterMember>,
+    /// Live distributed deployment of this cluster, if any. Without it the
+    /// dashboard only knew about a deployment it had started itself in the
+    /// current page session, so a refresh made a running cluster look idle and
+    /// offered "deploy" again. `default` keeps peers that predate the field
+    /// decodable.
+    #[serde(default)]
+    pub deployment: Option<ClusterDeploymentInfo>,
+}
+
+/// A distributed deployment as the dashboard needs to render it: identity,
+/// endpoint and per-member placement.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeploymentInfo {
+    pub deployment_cluster_id: String,
+    pub engine_id: String,
+    pub model: String,
+    pub served_model_name: String,
+    pub tp_size: u32,
+    pub head_node_id: String,
+    pub port: u32,
+    pub endpoint_url: Option<String>,
+    /// "deploying" | "running" | "failed" | "stopped".
+    pub status: String,
+    pub created_at: String,
+    pub members: Vec<ClusterDeploymentMemberInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeploymentMemberInfo {
+    pub node_id: String,
+    pub hostname: Option<String>,
+    /// "head" | "worker".
+    pub role: String,
+    /// Empty for a deployment that runs no container (native bundle).
+    pub container_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

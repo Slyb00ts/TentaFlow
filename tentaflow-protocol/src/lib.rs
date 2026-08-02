@@ -250,6 +250,8 @@ pub use message_body::{
     ClusterDeployResponse,
     ClusterDeployStopRequest,
     ClusterDeployStopResponse,
+    ClusterDeploymentInfo,
+    ClusterDeploymentMemberInfo,
     ClusterDetailRequest,
     ClusterDetailResponse,
     ClusterInfo,

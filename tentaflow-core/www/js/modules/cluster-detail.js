@@ -101,6 +101,11 @@ async function loadAll() {
       // Skleic ClusterInfo + members[] z osobnych pol odpowiedzi w jeden obiekt
       // pasujacy do reszty kodu (resolveMembers oczekuje cluster.members).
       clusterData = { ...detailBody.cluster, members: detailBody.members || [] };
+      // Zrodlem prawdy o wdrozeniu jest serwer, nie stan tej karty przegladarki:
+      // deployment przezywa odswiezenie GUI i restart core'a, a jego brak
+      // oznacza, ze naprawde nic nie dziala.
+      activeDeployment = detailBody.deployment || null;
+      if (activeDeployment) deployResult = null;
     } else {
       clusterData = null;
     }
@@ -895,19 +900,22 @@ function renderDeploySection(members) {
 
 function renderActiveDeployment(dep) {
   const memberRows = (dep.members || []).map(m => renderDeployMemberRow(m)).join('');
-  const endpoint = dep.endpointUrl
-    ? `<div class="cluster-deploy-endpoint"><span class="k">${escapeHtml(I18n.t('cluster_detail.deploy_endpoint'))}</span><code>${escapeHtml(dep.endpointUrl)}</code></div>`
-    : '';
+  const running = dep.status === 'running';
+  const row = (label, value) => (value
+    ? `<div class="cluster-deploy-endpoint"><span class="k">${escapeHtml(label)}</span><code>${escapeHtml(String(value))}</code></div>`
+    : '');
   return `
     <div class="cluster-deploy-active">
       <div class="cluster-deploy-active-head">
-        <tf-chip status="${dep.ok ? 'online' : 'warning'}" dot>${escapeHtml(dep.ok ? I18n.t('cluster_detail.deploy_active') : I18n.t('cluster_detail.deploy_degraded'))}</tf-chip>
+        <tf-chip status="${running ? 'online' : 'warning'}" dot>${escapeHtml(running ? I18n.t('cluster_detail.deploy_active') : I18n.t('cluster_detail.deploying'))}</tf-chip>
         <span class="cluster-deploy-id"><code>${escapeHtml(dep.deploymentClusterId || '')}</code></span>
         <tf-button variant="danger" size="sm" icon="stop" id="btn-deploy-stop">${escapeHtml(I18n.t('cluster_detail.deploy_stop'))}</tf-button>
       </div>
-      ${endpoint}
+      ${row(I18n.t('cluster_detail.deploy_model'), dep.servedModelName || dep.model)}
+      ${row(I18n.t('cluster_detail.deploy_engine'), dep.engineId)}
+      ${row(I18n.t('cluster_detail.deploy_tp_size'), dep.tpSize)}
+      ${row(I18n.t('cluster_detail.deploy_endpoint'), dep.endpointUrl)}
       <table class="cluster-rdma-table"><tbody>${memberRows}</tbody></table>
-      ${dep.message ? `<div class="cluster-deploy-message">${escapeHtml(dep.message)}</div>` : ''}
     </div>
   `;
 }
@@ -926,13 +934,10 @@ function renderDeployResult(res) {
 }
 
 function renderDeployMemberRow(m) {
-  const detail = m.error
-    ? `<tf-chip status="error">${escapeHtml(m.error)}</tf-chip>`
-    : `<tf-chip status="success">${escapeHtml(I18n.t('cluster_detail.deploy_member_ok'))}</tf-chip>${m.deployId ? ` <code>${escapeHtml(m.deployId)}</code>` : ''}`;
   return `<tr>
     <th>${escapeHtml(m.hostname || m.nodeId)}</th>
     <td><tf-chip status="neutral">${escapeHtml(m.role)}</tf-chip></td>
-    <td>${detail}</td>
+    <td><tf-chip status="success">${escapeHtml(I18n.t('cluster_detail.deploy_member_ok'))}</tf-chip>${m.containerName ? ` <code>${escapeHtml(m.containerName)}</code>` : ''}</td>
   </tr>`;
 }
 

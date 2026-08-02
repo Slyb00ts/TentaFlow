@@ -1864,12 +1864,64 @@ pub fn cluster_detail(
     let members = build_cluster_members(ctx, &payload.cluster_id);
     let info = db_cluster_to_info(&cluster, total, online, members.clone());
 
+    let deployment = build_cluster_deployment(ctx, &payload.cluster_id, &members);
+
     Ok(MessageBody::ClusterDetailResponseBody(
         tentaflow_protocol::ClusterDetailResponse {
             cluster: info,
             members,
+            deployment,
         },
     ))
+}
+
+/// The live distributed deployment of a cluster, resolved from the database so
+/// it survives a dashboard refresh and a core restart. Hostnames come from the
+/// cluster members already assembled for the response — the deployment tables
+/// only carry node ids, and an id is not what an operator recognises.
+fn build_cluster_deployment(
+    ctx: &HandlerContext,
+    cluster_id: &str,
+    members: &[tentaflow_protocol::ClusterMember],
+) -> Option<tentaflow_protocol::ClusterDeploymentInfo> {
+    let dep = repository::active_cluster_deployment(&ctx.state.db, cluster_id)
+        .ok()
+        .flatten()?;
+
+    let hostname_of = |node_id: &str| {
+        members
+            .iter()
+            .find(|m| m.node_id == node_id)
+            .map(|m| m.hostname.clone())
+    };
+
+    let dep_members = repository::list_cluster_deployment_members(
+        &ctx.state.db,
+        &dep.deployment_cluster_id,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|m| tentaflow_protocol::ClusterDeploymentMemberInfo {
+        hostname: hostname_of(&m.node_id),
+        node_id: m.node_id,
+        role: m.role,
+        container_name: m.container_name,
+    })
+    .collect();
+
+    Some(tentaflow_protocol::ClusterDeploymentInfo {
+        deployment_cluster_id: dep.deployment_cluster_id,
+        engine_id: dep.engine_id,
+        model: dep.model,
+        served_model_name: dep.served_model_name,
+        tp_size: dep.tp_size.max(0) as u32,
+        head_node_id: dep.head_node_id,
+        port: dep.port.max(0) as u32,
+        endpoint_url: dep.endpoint_url,
+        status: dep.status,
+        created_at: dep.created_at,
+        members: dep_members,
+    })
 }
 
 #[handler(variant = "ClusterCreateRequest", since = (1, 0))]

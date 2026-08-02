@@ -7693,6 +7693,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 arr.push(&cluster_member_to_js(m).into());
             }
             set(&obj, "members", arr.into());
+            if let Some(dep) = resp.deployment {
+                set(&obj, "deployment", cluster_deployment_to_js(dep).into());
+            }
         }
         MessageBody::ClusterCreateRequestBody(req) => {
             set(&obj, "variant", "ClusterCreateRequest".into());
@@ -13548,6 +13551,37 @@ fn cluster_member_to_js(m: tentaflow_protocol::ClusterMember) -> js_sys::Object 
         set(&item, "rdmaGidIndex", g.into());
     }
     item
+}
+
+fn cluster_deployment_to_js(
+    d: tentaflow_protocol::ClusterDeploymentInfo,
+) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "deploymentClusterId", d.deployment_cluster_id.into());
+    set(&obj, "engineId", d.engine_id.into());
+    set(&obj, "model", d.model.into());
+    set(&obj, "servedModelName", d.served_model_name.into());
+    set(&obj, "tpSize", d.tp_size.into());
+    set(&obj, "headNodeId", d.head_node_id.into());
+    set(&obj, "port", d.port.into());
+    if let Some(u) = d.endpoint_url {
+        set(&obj, "endpointUrl", u.into());
+    }
+    set(&obj, "status", d.status.into());
+    set(&obj, "createdAt", d.created_at.into());
+    let arr = js_sys::Array::new();
+    for m in d.members {
+        let item = js_sys::Object::new();
+        set(&item, "nodeId", m.node_id.into());
+        if let Some(h) = m.hostname {
+            set(&item, "hostname", h.into());
+        }
+        set(&item, "role", m.role.into());
+        set(&item, "containerName", m.container_name.into());
+        arr.push(&item.into());
+    }
+    set(&obj, "members", arr.into());
+    obj
 }
 
 fn cluster_info_to_js(c: tentaflow_protocol::ClusterInfo) -> js_sys::Object {
