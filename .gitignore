@@ -254,3 +254,11 @@ tentaflow-infer/kernels/mojo/build/.kernel-build-*/
 # Scratch Playwright (skrypty QA, zrzuty ekranu, profile przegladarki) — nigdy do repo.
 # Trafialy tu tez klucze API wklejane do testow, wiec ta reguła jest zabezpieczeniem, nie porzadkami.
 .pw-tmp/
+
+# =============================================================================
+# Fikstury testowe
+# =============================================================================
+# SA zrodlem, nie artefaktem builda: testy golden wciagaja je przez
+# include_bytes!, wiec bez nich nie kompiluja sie u nikogo innego. Wpis MUSI
+# stac po regulach *.bin i *.safetensors, bo w .gitignore wygrywa pozniejszy.
+!tentaflow-infer/crates/*/tests/fixtures/**

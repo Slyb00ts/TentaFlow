@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use forge_types::{ForgeError, Result};
 use serde::Deserialize;
