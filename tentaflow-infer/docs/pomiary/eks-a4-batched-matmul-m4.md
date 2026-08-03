@@ -133,6 +133,36 @@ roboczej**, po czym ten sam rozpakowany blok karmi wszystkie fragmenty tokenów.
 Przy bloku 32 tokenów koszt rozpakowania nibbli dzieli się przez 32 zamiast być
 płacony na token.
 
+### Potokowanie zmienia optimum
+
+Najpierw wynik, bo on tłumaczy kolejność tabel: **następny blok jest czytany z
+pamięci i rozpakowywany DO REJESTRÓW w czasie, gdy jednostki macierzowe liczą
+bieżący.** Bez tego każdy krok po K zaczyna się od czekania na pamięć przy
+bezczynnych jednostkach. Przeplot siedzi w rejestrach, nie w drugiej kopii
+pamięci grupy roboczej, więc nie kosztuje zajętości.
+
+To dało 38,7 → 35,2 us na token — ale ważniejsze jest co innego: **przesunęło
+optimum bloku**. Blok 64x64x32 przed potokowaniem kosztował 47,0 us na token i
+był jednym z gorszych; po nim daje 31,0 i jest najlepszy. Gdyby geometrię
+ustalić raz i nie wracać do niej po zmianie strukturalnej, ta zmiana zostałaby
+w połowie wykorzystana.
+
+| blok | przed potokowaniem | po potokowaniu |
+|---|---:|---:|
+| 32x32x32 | 50,0 us/token | — |
+| 32x64x32 | 39,6 | 35,2 |
+| 32x128x32 | 39,1 | 35,1 |
+| 32x64x64 | — | 36,4 |
+| 64x64x64 | — | 31,8 |
+| **64x64x32** | 47,0 | **31,0** |
+| 128x64x32 | — | 247,0 |
+| 64x128x32 | — | 230,0 |
+
+Powyżej 64x64 wszystko się załamuje: 32 akumulatory na linię to już rozlanie
+rejestrów, a nie kompromis.
+
+### Wcześniejsze przemiary (przed potokowaniem)
+
 Blok i podział na grupy SIMD są **przemierzone**, nie dobrane z góry (T=128):
 
 | blok BMxBNxBK | us/token |
@@ -170,8 +200,8 @@ Blok 32x64x32, cztery grupy SIMD w układzie 1x4, akumulator f32:
 | 1 | 1375,7 us/token | 1016,8 us/token | 344,3 us |
 | 8 | 176,7 us/token | **79,7 us/token** | 266,1 us/token |
 | 32 | 58,5 us/token | 74,1 us/token | 263,6 us/token |
-| 128 | **38,7 us/token** | 72,2 us/token | 262,3 us/token |
-| 256 | 37,4 us/token | 73,0 us/token | 270,3 us/token |
+| 128 | **31,0 us/token** | 72,6 us/token | 265,0 us/token |
+| 256 | 30,1 us/token | 72,8 us/token | 259,5 us/token |
 
 Poniżej pełnego bloku forma macierzowa przegrywa — przy 8 tokenach zostawia
 trzy czwarte bloku pustych. Stąd trzy formy z ZMIERZONYMI zakresami: wektorowa
@@ -203,22 +233,25 @@ obroty, a one też przeszły na kafel. Bielik-7B 4-bit, prompt 256 tokenów,
 
 | ścieżka | czas | przepustowość |
 |---|---:|---:|
-| token po tokenie | 11,541 s | 22,2 tok/s |
-| kaflami po 128 | 1,614 s | **158,6 tok/s** |
+| token po tokenie | 11,446 s | 22,4 tok/s |
+| kaflami po 128 | 1,333 s | **192,1 tok/s** |
 
-Przyspieszenie **7,15x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
+Przyspieszenie **8,59x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
 wywołaniem, zamiast jednego na token, więc całość zyskuje więcej niż samo
 mnożenie.
 
-Dekodowanie po prefillu: 19,1 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
-Cel prefillu to 175 tok/s, więc ta ścieżka jest na 91% drogi.
+Dekodowanie po prefillu: 19,3 tok/s, powyżej celu 19 tok/s z planu (§7.6).
+**Cel prefillu 175 tok/s jest przekroczony** — 192,1 to 110% celu.
 
-Gdzie jest sufit teraz: 38,7 us na token przy T=128 to 2,38 TFLOPS wobec
-zmierzonych 3,94 TFLOPS dla jednostki macierzowej, czyli 60%. Model liczy przy
-tym 2,26 TFLOPS, czyli **96% czasu prefillu to same mnożenia** — uwaga,
-normalizacje, obroty i reszta warstwy mieszczą się w pozostałych czterech
-procentach. Dalsze przyspieszenie prefillu musi więc przyjść z tego kernela,
-a nie znikąd indziej.
+Gdzie jest sufit: 31,0 us na token przy T=128 to 2,97 TFLOPS wobec zmierzonych
+3,94 TFLOPS dla jednostki macierzowej, czyli **75%**. Model liczy przy tym
+2,88 TFLOPS, więc niemal cały czas prefillu to już samo to mnożenie — uwaga,
+normalizacje, obroty i reszta warstwy mieszczą się w kilku procentach.
+
+Bezwzględny sufit obliczeniowy z EKS-A2 dla tej klasy modelu to ~260 tok/s.
+Jesteśmy na 74% niego i na 75% szczytu instrukcji macierzowej — to jest miejsce,
+w którym dalsze przyspieszanie przestaje być dobieraniem stałych, a zaczyna być
+przepisywaniem harmonogramu.
 
 Obie ścieżki wybierają ten sam token — sprawdza to asercja w samym pomiarze,
 bo inaczej porównywałby dwie różne prace.

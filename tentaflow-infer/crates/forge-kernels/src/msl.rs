@@ -309,7 +309,7 @@ kernel void {name}(
 /// Swept, not chosen: at a full prefill chunk 32x64x32 costs 39.6 us per token
 /// against 50.0 for 32x32x32, 41.3 for 64x32x32 and 47.0 for 64x64x32. Wider
 /// than 64 rows stops paying and starts costing threadgroup memory.
-pub const QMG_BM: u32 = 32;
+pub const QMG_BM: u32 = 64;
 pub const QMG_BN: u32 = 64;
 pub const QMG_BK: u32 = 32;
 /// Block of the token axis, which is the batch a caller must reach to use this.
@@ -319,8 +319,8 @@ pub const QMG_BLOCK: u32 = QMG_BM;
 ///
 /// Also swept. Two groups instead of four load fewer fragments per multiply but
 /// lose more to having less to run: 49.4 us per token against 39.2.
-pub const QMG_SG_M: u32 = 1;
-pub const QMG_SG_N: u32 = 4;
+pub const QMG_SG_M: u32 = 2;
+pub const QMG_SG_N: u32 = 2;
 pub const QMG_THREADS: u32 = QMG_SG_M * QMG_SG_N * 32;
 
 pub fn qmg_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
@@ -430,31 +430,61 @@ kernel void {name}(
         for (uint j = 0; j < {fn}u; ++j) {{ acc[i][j] = simdgroup_matrix<float, 8, 8>(0); }}
     }}
 
-    for (uint k0 = 0; k0 < n_cols; k0 += {bk}u) {{
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Potokowanie: nastepny blok jest czytany z pamieci urzadzenia i
+    // rozpakowywany DO REJESTROW w czasie, gdy jednostki macierzowe licza
+    // biezacy. Bez tego kazdy krok po K zaczyna sie od czekania na pamiec przy
+    // bezczynnych jednostkach. Bufor wspoldzielony zostaje jeden — przeplot
+    // siedzi w rejestrach, nie w drugiej kopii pamieci grupy roboczej.
+    const uint xs_per_thread = {bm}u * {bk}u / {threads}u;
+    const uint ws_per_thread = {bn}u * {bk}u / 8u / {threads}u;
+    half  x_pre[{xs_pt}];
+    half  w_pre[{ws_pt} * 8];
 
-        // Wagi: jeden przebieg na pare (wiersz, slowo), bo slowo to dokladnie
-        // osiem rozpakowanych wartosci i nie ma reszty do dosprzatania.
-        for (uint p = tid; p < {bn}u * {bk}u / 8u; p += {threads}u) {{
-            const uint n_local = p / ({bk}u / 8u);
-            const uint w_local = p % ({bk}u / 8u);
-            const uint rr   = row0 + n_local;
-            const uint col  = k0 + w_local * 8u;
-            const uint bits = packed[rr * words_per_row + col / 8u];
-            const float sc  = float(scales[rr * groups_per_row + col / group]);
-            const float bi  = float(biases[rr * groups_per_row + col / group]);
-            for (uint j = 0; j < 8u; ++j) {{
-                const float q = float((bits >> (j * 4u)) & 0xFu);
-                ws[(w_local * 8u + j) * {bn}u + n_local] = half(fma(q, sc, bi));
+    for (uint pass = 0; pass * {bk}u < n_cols + {bk}u; ++pass) {{
+        const uint k0 = pass * {bk}u;
+
+        // Wystawienie tego, co przeczytano w poprzednim obiegu.
+        if (pass > 0u) {{
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = 0; e < xs_per_thread; ++e) {{
+                const uint i = tid + e * {threads}u;
+                xs[(i / {bk}u) * {bk}u + i % {bk}u] = x_pre[e];
+            }}
+            for (uint e = 0; e < ws_per_thread; ++e) {{
+                const uint p = tid + e * {threads}u;
+                const uint n_local = p / ({bk}u / 8u);
+                const uint w_local = p % ({bk}u / 8u);
+                for (uint j = 0; j < 8u; ++j) {{
+                    ws[(w_local * 8u + j) * {bn}u + n_local] = w_pre[e * 8u + j];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // Odczyt nastepnego bloku do rejestrow — niezalezny od mnozen ponizej,
+        // wiec sprzet ma czym zapelnic czas oczekiwania na pamiec.
+        if (k0 < n_cols) {{
+            for (uint e = 0; e < xs_per_thread; ++e) {{
+                const uint i = tid + e * {threads}u;
+                x_pre[e] = x[min(tok0 + i / {bk}u, n_tokens - 1u) * n_cols + k0 + i % {bk}u];
+            }}
+            for (uint e = 0; e < ws_per_thread; ++e) {{
+                const uint p = tid + e * {threads}u;
+                const uint n_local = p / ({bk}u / 8u);
+                const uint w_local = p % ({bk}u / 8u);
+                const uint rr   = row0 + n_local;
+                const uint col  = k0 + w_local * 8u;
+                const uint bits = packed[rr * words_per_row + col / 8u];
+                const float sc  = float(scales[rr * groups_per_row + col / group]);
+                const float bi  = float(biases[rr * groups_per_row + col / group]);
+                for (uint j = 0; j < 8u; ++j) {{
+                    w_pre[e * 8u + j] =
+                        half(fma(float((bits >> (j * 4u)) & 0xFu), sc, bi));
+                }}
             }}
         }}
-        // Aktywacje: token poza wsadem wskazuje na ostatni.
-        for (uint i = tid; i < {bm}u * {bk}u; i += {threads}u) {{
-            const uint t = i / {bk}u;
-            const uint c = i % {bk}u;
-            xs[t * {bk}u + c] = x[min(tok0 + t, n_tokens - 1u) * n_cols + k0 + c];
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (pass == 0u) {{ continue; }}
 
         for (uint kk = 0; kk < {bk}u; kk += 8u) {{
             simdgroup_matrix<half, 8, 8> a[{fm}], b[{fn}];
@@ -486,6 +516,8 @@ kernel void {name}(
         sub_bn = QMG_BN / QMG_SG_N,
         fm = fm,
         fn = fn_,
+        xs_pt = QMG_BM * QMG_BK / QMG_THREADS,
+        ws_pt = QMG_BN * QMG_BK / 8 / QMG_THREADS,
         floats = floats,
         threads = QMG_THREADS,
         epilogue = epilogue,
