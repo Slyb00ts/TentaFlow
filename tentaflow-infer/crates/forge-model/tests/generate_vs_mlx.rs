@@ -270,10 +270,22 @@ fn how_fast_a_prompt_goes_through() {
     }
     prompt.truncate(256);
 
-    model.reset();
-    let t0 = std::time::Instant::now();
-    let a = model.prefill(&prompt).expect("prefill");
-    let batched = t0.elapsed();
+    // Rozgrzewka i mediana, jak po stronie MLX. Pojedynczy zimny przebieg
+    // mierzy rezydencję wag i kompilację kerneli, a nie kernel — i porównanie
+    // takiej liczby z rozgrzaną medianą konkurenta jest porównaniem dwóch
+    // różnych rzeczy.
+    let mut batched_times = Vec::new();
+    let mut a = 0u32;
+    for run in 0..4 {
+        model.reset();
+        let t0 = std::time::Instant::now();
+        a = model.prefill(&prompt).expect("prefill");
+        if run > 0 {
+            batched_times.push(t0.elapsed().as_secs_f64());
+        }
+    }
+    batched_times.sort_by(f64::total_cmp);
+    let batched = batched_times[batched_times.len() / 2];
 
     model.reset();
     let t0 = std::time::Instant::now();
@@ -281,28 +293,70 @@ fn how_fast_a_prompt_goes_through() {
     for &token in &prompt {
         b = model.step_argmax(token).expect("krok");
     }
-    let stepped = t0.elapsed();
+    let stepped = t0.elapsed().as_secs_f64();
 
     assert_eq!(a, b, "różny token, więc czasy nie dotyczą tej samej pracy");
     eprintln!(
-        "prompt {} tokenów: kaflowo {:.3} s ({:.1} tok/s), token po tokenie {:.3} s ({:.1} tok/s), {:.2}x",
+        "prompt {} tokenów: kaflowo {:.3} s ({:.1} tok/s), token po tokenie {:.3} s \
+         ({:.1} tok/s), {:.2}x",
         prompt.len(),
-        batched.as_secs_f64(),
-        prompt.len() as f64 / batched.as_secs_f64(),
-        stepped.as_secs_f64(),
-        prompt.len() as f64 / stepped.as_secs_f64(),
-        stepped.as_secs_f64() / batched.as_secs_f64()
+        batched,
+        prompt.len() as f64 / batched,
+        stepped,
+        prompt.len() as f64 / stepped,
+        stepped / batched
     );
+    // Samo dekodowanie mierzy `how_fast_decode_runs` — osobno, bo to inna ściana.
+}
 
-    // Dekodowanie zaraz po prefillu, bo to ta liczba, którą widzi użytkownik.
-    let t0 = std::time::Instant::now();
-    let out = model.generate(&prompt, 32).expect("generacja");
-    let total = t0.elapsed();
+/// Pomiar dekodowania, uruchamiany jawnie. Bezpośrednio porównywalny z
+/// `tools/mlx-oracle/bench_mlx.py`: ten sam model, ten sam prompt, ten sam
+/// zakres pozycji.
+///
+/// Osobno od pomiaru prefillu, bo dekodowanie ogranicza PAMIĘĆ, a nie
+/// obliczenia — jeden token to jedno przejście przez wszystkie wagi — i jedna
+/// liczba na oba nie mówi, którą ścianę się właśnie dotyka.
+#[test]
+#[ignore]
+fn how_fast_decode_runs() {
+    let oracle = load();
+    let Some(dir) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu Bielika");
+        return;
+    };
+    let Ok(device) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+
+    let mut prompt = Vec::new();
+    while prompt.len() < 256 {
+        prompt.extend_from_slice(&oracle.prompt_ids);
+    }
+    prompt.truncate(256);
+    const STEPS: usize = 31;
+
+    let mut times = Vec::new();
+    for run in 0..4 {
+        model.reset();
+        let mut token = model.prefill(&prompt).expect("prefill");
+        let t0 = std::time::Instant::now();
+        for _ in 0..STEPS {
+            token = model.step_argmax(token).expect("krok");
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        // Pierwszy przebieg to rozgrzewka: rezydencja wag i kompilacja.
+        if run > 0 {
+            times.push(dt);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    let median = times[times.len() / 2];
     eprintln!(
-        "prefill {} + 32 tokeny wyjścia: {:.3} s, dekodowanie {:.1} tok/s",
-        prompt.len(),
-        total.as_secs_f64(),
-        31.0 / (total.as_secs_f64() - batched.as_secs_f64()).max(1e-6)
+        "dekodowanie po 256 tokenach promptu: {median:.3} s na {STEPS} tokenów \
+         ({:.1} tok/s), przepustowość wag {:.1} GB/s",
+        STEPS as f64 / median,
+        4.207 * STEPS as f64 / median
     );
-    assert_eq!(out.len(), 32);
 }
