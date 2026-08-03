@@ -16,9 +16,29 @@ Wobec startu sesji (2 957 tok/s przy 2048) to **+67%**, przy niezmienionej
 generacji. Wiersze 512 i 4096 pochodza sprzed kilku zmian i nie zostaly
 powtorzone — nie sa punktem odniesienia dla dzisiejszych bramek.
 
-Odniesienie na tym samym sprzęcie i modelu: **vLLM 0.26 daje 48 tok/s decode**
-oraz ~10 000 tok/s prefillu na zimno (mierzone przez HTTP, więc lekko zaniżone
-dla vLLM).
+Odniesienie na tym samym sprzęcie: **vLLM 0.26 daje 48 tok/s decode** oraz
+rzekomo ~10 000 tok/s prefillu (mierzone przez HTTP).
+
+**Ta druga liczba nie przechodzi rachunku i nie nalezy na niej opierac celow.**
+Prompt 2048 na modelu 7B to 2*7e9*2048 = 28,7 TFLOP. Przy 10 000 tok/s wychodzi
+204,8 ms, czyli **140 TFLOPS calego modelu** — razem z uwaga i elementwise.
+Sufit f16 na GB10 to okolo 125 TFLOPS (polowa zmierzonych 251 dla FP8), wiec
+140 jest ponad nim i przy jakiejkolwiek sciezce z aktywacjami f16 jest to
+**fizycznie niemozliwe**. Nasze 5676 tok/s to okolo 80 TFLOPS calego modelu.
+
+Do tego vLLM na sm_121a najprawdopodobniej **nie liczy w FP4**: jego kernele
+CUTLASS FP4 sa odcinane guardem `enable_sm120_only` (`#if CUDA_ARCH == 1200`,
+a GB10 to 1210), a lancuch fallbackow konczy sie na **Marlinie W4A16** — wagi
+4-bitowe, aktywacje f16. To znaczy, ze vLLM siedzi tu pod sufitem f16, czyli
+prawdopodobnie PONIZEJ naszej sciezki FP8. Zrodlo: zgloszenia vllm-project
+#31085 i forum NVIDII o stanie FP4 na DGX Spark — poszlaka ze streszczen, do
+potwierdzenia uruchomieniem kontenera.
+
+Wniosek dla planu: **MXFP4 przestaje byc opcja, a staje sie glowna droga.**
+Zmierzone 497,9 TFLOPS dla `kind::mxf4.block_scale.m16n8k64` na sm_121a to
+sciezka, ktorej konkurencja na tym ukladzie nie ma — bo sprzet nie przyjmuje
+NVFP4 ze skalami e4m3, ktorego chce CUTLASS, a przyjmuje MXFP4 ze skalami
+ue8m0. Nas nic do CUTLASS-a nie przywiazuje.
 
 Prefill 3 192 tok/s przy 2048 tokenach to 2·7e9·2048 / 0,64 s = **44,7 TFLOPS**.
 

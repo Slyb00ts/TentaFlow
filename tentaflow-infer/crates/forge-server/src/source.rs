@@ -391,7 +391,7 @@ mod tests {
     use forge_tokenize::{ChatMessage, ChatTemplateEngine};
 
     fn qwen_hybrid_descriptor(native_mtp: bool) -> ModelDescriptor {
-        let config: HfConfig = serde_json::from_str(
+        let config: HfConfig = HfConfig::from_json_str(
             r#"{
                 "architectures": ["LlamaForCausalLM"],
                 "model_type": "llama",
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn pula_kv_rezerwuje_slab_mtp_tylko_gdy_runtime_jest_wlaczony() {
-        let config: HfConfig = serde_json::from_str(
+        let config: HfConfig = HfConfig::from_json_str(
             r#"{
                 "architectures": ["LlamaForCausalLM"],
                 "model_type": "llama",
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn hybrydowa_pula_kv_obejmuje_tylko_warstwy_attention() {
-        let config: HfConfig = serde_json::from_str(
+        let config: HfConfig = HfConfig::from_json_str(
             r#"{
                 "architectures": ["LlamaForCausalLM"],
                 "model_type": "llama",

@@ -3613,8 +3613,7 @@ impl ModelWeights {
         host_budget: usize,
     ) -> Result<Self> {
         let config_text = std::fs::read_to_string(dir.join("config.json"))?;
-        let config: HfConfig = serde_json::from_str::<HfConfig>(&config_text)
-            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
+        let config: HfConfig = HfConfig::from_json_str(&config_text)?;
         let mut descriptor = ModelDescriptor::from_hf(&config)?;
         let st = ShardedSafeTensors::load_dir(dir)?;
         // Opis z `config.json` deklaruje role opcjonalne dla wszystkich warstw;

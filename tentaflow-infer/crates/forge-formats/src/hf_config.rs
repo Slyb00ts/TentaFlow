@@ -109,9 +109,39 @@ fn default_rms_norm_eps() -> f32 {
 }
 
 impl HfConfig {
+    /// Wczytuje `config.json`, akceptujac takze uklad multimodalny.
+    ///
+    /// Modele z wiezami wizyjnymi (Gemma 4, Llama 4) trzymaja parametry czesci
+    /// tekstowej w zagniezdzonym `text_config`, a na wierzchu zostawiaja tylko
+    /// rzeczy wspolne — `architectures`, `quantization_config`, konfiguracje
+    /// pozostalych wiez. Bierzemy wtedy wierzch jako baze i nakladamy na nia
+    /// `text_config`, zeby pola wspolne nie przepadly, a tekstowe wygraly.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::read(path.as_ref())?;
-        serde_json::from_slice(&bytes).map_err(|e| ForgeError::Format(format!("config.json: {e}")))
+        Self::from_json_slice(&bytes)
+    }
+
+    /// Ten sam scalajacy odczyt co `load`, dla wywolan majacych juz tresc.
+    pub fn from_json_str(raw: &str) -> Result<Self> {
+        Self::from_json_slice(raw.as_bytes())
+    }
+
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self> {
+        let raw: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
+        let merged = match (raw.as_object(), raw.get("text_config").and_then(|t| t.as_object())) {
+            (Some(top), Some(text)) => {
+                let mut out = top.clone();
+                out.remove("text_config");
+                for (key, value) in text {
+                    out.insert(key.clone(), value.clone());
+                }
+                serde_json::Value::Object(out)
+            }
+            _ => raw,
+        };
+        serde_json::from_value(merged)
+            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))
     }
 
     pub fn num_key_value_heads(&self) -> usize {

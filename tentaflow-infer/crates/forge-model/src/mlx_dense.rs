@@ -157,7 +157,7 @@ impl MlxDense {
             .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
         let json: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
-        let hf: HfConfig = serde_json::from_str(&raw)
+        let hf: HfConfig = HfConfig::from_json_str(&raw)
             .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
         let quant = MlxQuantConfig::from_config(&json)?.ok_or_else(|| {
             ForgeError::Unsupported("checkpoint nie deklaruje kwantyzacji MLX".into())
