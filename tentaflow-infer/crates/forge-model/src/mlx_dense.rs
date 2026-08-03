@@ -39,7 +39,7 @@ use crate::cpu_matmul::{CpuMatmul, Operands};
 /// batched matmul stops winning, because its activation tile no longer fits in
 /// cache and starts being re-read once per output row. Measured on M4 at 2.09x
 /// for 128 and 0.72x for 512 (docs/pomiary/eks-a4-batched-matmul-m4.md).
-pub const PREFILL_CHUNK: u32 = 512;
+pub const PREFILL_CHUNK: u32 = 1024;
 
 /// Everything the decode loop needs to know about the architecture.
 #[derive(Debug, Clone, Copy)]
@@ -727,46 +727,10 @@ impl MlxDense {
         } else {
             &self.pipes.qmg_f32
         };
-        // The CPU half reads `x` with its own load instructions, so `x` has to
-        // BE there. Everything that produces it is sitting in the open command
-        // buffer, queued and not yet run: the GPU half is ordered after it and
-        // is therefore safe, but the CPU is not ordered against the GPU at all.
-        // Without this wait the CPU multiplies whatever the buffer happened to
-        // hold — which is not a crash, just a different model.
-        if split.is_some() {
-            self.stream.synchronize()?;
-        }
-        let gpu_rows = split.map_or(w.rows, |s| s.gpu_rows);
-        let (gx, gy) = msl::qmg_affine_4bit_groups(gpu_rows, tokens);
-        self.device.launch(
-            k,
-            &LaunchConfig {
-                grid: (gx, gy, 1),
-                block: (msl::QMG_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            &LaunchArgs::new()
-                .buf(out)
-                .buf(&w.packed)
-                .buf(&w.scales)
-                .buf(&w.biases)
-                .buf(x)
-                .scalar(w.rows)
-                .scalar(w.cols)
-                .scalar(self.shape.group)
-                .scalar(tokens),
-            &self.stream,
-        )?;
         let Some(split) = split else {
-            return Ok(());
+            let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
+            return self.launch_qmg(k, out, w, x, tokens, (gx, gy));
         };
-
-        // Submit, or the dispatch would sit in the open command buffer and the
-        // CPU would spend its share racing an idle GPU. This is the one place
-        // that deliberately pays for a command buffer of its own — 19,6 us
-        // against 0,61 (EKS-A3) — and `plan` only allows it where that is a
-        // couple of percent of the work being overlapped.
-        self.device.record_event(&self.split_event, &self.stream)?;
 
         let operands = Operands {
             packed: host_slice(&w.packed)?,
@@ -782,16 +746,74 @@ impl MlxDense {
             cols: w.cols,
             group: self.shape.group,
         };
+        let mut cpu = self.cpu.borrow_mut();
+        cpu.check(&operands, split.gpu_rows, split.cpu_rows)?;
+
+        // Unpacking FIRST, before the wait below. It needs only the weights,
+        // which are static, so it costs nothing here: it runs in the window
+        // where the CPU would otherwise be idle watching the GPU finish the
+        // activations. Measured at 938 us a product, this is the difference
+        // between paying for it and hiding it.
+        cpu.unpack(&operands, split.gpu_rows as usize, split.cpu_rows as usize);
+
+        // The CPU half reads `x` with its own load instructions, so `x` has to
+        // BE there. Everything that produces it is sitting in the open command
+        // buffer, queued and not yet run: the GPU half is ordered after it and
+        // is therefore safe, but the CPU is not ordered against the GPU at all.
+        // Without this wait the CPU multiplies whatever the buffer happened to
+        // hold — which is not a crash, just a different model.
+        self.stream.synchronize()?;
+
+        let (gx, gy) = msl::qmg_affine_4bit_groups(split.gpu_rows, tokens);
+        self.launch_qmg(k, out, w, x, tokens, (gx, gy))?;
+
+        // Submit, or the dispatch would sit in the open command buffer and the
+        // CPU would spend its share racing an idle GPU. This is the one place
+        // that deliberately pays for a command buffer of its own — 19,6 us
+        // against 0,61 (EKS-A3) — and `split_rows` only allows it where that is
+        // a couple of percent of the work being overlapped.
+        self.device.record_event(&self.split_event, &self.stream)?;
+
         // SAFETY: the GPU dispatch above writes rows below `gpu_rows` and this
         // writes from `gpu_rows` up, into the same shared allocation. The two
         // ranges are disjoint, so no ordering between them is needed — only the
         // wait below, before anything reads the whole result.
-        unsafe {
-            self.cpu
-                .borrow_mut()
-                .run(&operands, split.gpu_rows, split.cpu_rows)?;
-        }
+        unsafe { cpu.multiply(&operands, split.gpu_rows, split.cpu_rows)? };
+        drop(cpu);
         self.split_event.synchronize()
+    }
+
+    /// The matrix-unit dispatch itself. The kernel always receives the FULL row
+    /// count — that is the stride it writes with — and the grid is what decides
+    /// which rows it touches.
+    fn launch_qmg(
+        &self,
+        k: &KernelHandle,
+        out: &DevBuffer,
+        w: &Quantized,
+        x: &DevBuffer,
+        tokens: u32,
+        grid: (u32, u32),
+    ) -> Result<()> {
+        self.device.launch(
+            k,
+            &LaunchConfig {
+                grid: (grid.0, grid.1, 1),
+                block: (msl::QMG_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(out)
+                .buf(&w.packed)
+                .buf(&w.scales)
+                .buf(&w.biases)
+                .buf(x)
+                .scalar(w.rows)
+                .scalar(w.cols)
+                .scalar(self.shape.group)
+                .scalar(tokens),
+            &self.stream,
+        )
     }
 
     /// Register-blocked loop, for batches too small to fill a matrix block.

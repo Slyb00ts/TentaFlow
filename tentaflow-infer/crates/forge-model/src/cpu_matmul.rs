@@ -63,7 +63,12 @@ impl CpuMatmul {
     }
 
     /// Unpacks rows `[row0, row0 + count)` of the weight into the scratch.
-    fn unpack(&mut self, op: &Operands<'_>, row0: usize, count: usize) {
+    ///
+    /// Depends on NOTHING the GPU produces — the weights are uploaded once at
+    /// load and never written again — so the caller is free to run this before
+    /// waiting for the activations, in the window where the CPU would otherwise
+    /// be watching the GPU work.
+    pub fn unpack(&mut self, op: &Operands<'_>, row0: usize, count: usize) {
         let cols = op.cols as usize;
         self.weights.resize(count * cols, f16::ZERO);
         let job = DequantJob {
@@ -99,8 +104,16 @@ impl CpuMatmul {
     /// `row0` in the same buffer at the same time, which is disjoint and
     /// therefore fine on unified memory.
     pub unsafe fn run(&mut self, op: &Operands<'_>, row0: u32, count: u32) -> Result<()> {
+        self.check(op, row0, count)?;
+        self.unpack(op, row0 as usize, count as usize);
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { self.multiply(op, row0, count) }
+    }
+
+    /// Shapes the caller has to get right before either half runs.
+    pub fn check(&self, op: &Operands<'_>, row0: u32, count: u32) -> Result<()> {
         let (rows, cols, group) = (op.rows as usize, op.cols as usize, op.group as usize);
-        let (tokens, row0, count) = (op.tokens as usize, row0 as usize, count as usize);
+        let (row0, count) = (row0 as usize, count as usize);
         if cols % group != 0 || cols % 8 != 0 {
             return Err(ForgeError::Unsupported(format!(
                 "CPU: kolumny {cols} nie dzielą się na grupę {group} i słowa po 8"
@@ -112,8 +125,18 @@ impl CpuMatmul {
                 row0 + count
             )));
         }
+        Ok(())
+    }
 
-        self.unpack(op, row0, count);
+    /// Multiplies the already-unpacked rows into `out`. This one DOES need the
+    /// activations, so it is what the wait for the GPU has to precede.
+    ///
+    /// # Safety
+    ///
+    /// As `run`, plus: `unpack` must have been called for the same slice.
+    pub unsafe fn multiply(&mut self, op: &Operands<'_>, row0: u32, count: u32) -> Result<()> {
+        let (rows, cols) = (op.rows as usize, op.cols as usize);
+        let (tokens, row0, count) = (op.tokens as usize, row0 as usize, count as usize);
         let out_ty = if op.out_f16 { BNNS_F16 } else { BNNS_F32 };
         let elem = if op.out_f16 { 2 } else { 4 };
         let a = descriptor(cols, tokens, op.x.as_ptr() as *mut c_void, BNNS_F16, 0);

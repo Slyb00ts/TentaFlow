@@ -224,7 +224,71 @@ stroną, która czeka, mimo 19,3% czekania w profilu. Te 19,3% to synchronizacja
 PRZED podziałem, na pracę, której CPU nie umie przejąć (uwaga, normy, k/v przy
 krótkim kaflu), a nie czekanie po nim.
 
+## Trzecia runda — kafel i kolejność
+
+**Rozmiar kafla był dobrany przed istnieniem ścieżki CPU.** `PREFILL_CHUNK`
+zostało ustawione na 512 z pomiaru samego GPU. Ale rozpakowanie amortyzuje się
+liczbą tokenów w kaflu, więc dołożenie CPU przesunęło to optimum. Mediany z
+trzech przebiegów, prompt 2048:
+
+| kafel | 512 | 1024 | 2048 |
+|---|---:|---:|---:|
+| tok/s | 241,7 | **269,5** | 235,7 |
+
+1024 wygrywa o 11,5%; przy 2048 wraca ten sam problem, dla którego stała była
+512 (kafel aktywacji przestaje mieścić się w cache), tylko przy dwa razy
+większym progu.
+
+**Rozpakowanie nie potrzebuje aktywacji.** Wagi są statyczne, więc rozpakowanie
+wycinka może się dziać ZANIM zaczekamy na `x` — w oknie, w którym CPU i tak stoi
+i patrzy, jak GPU liczy. Wcześniej działo się po tym czekaniu, czyli na ścieżce
+krytycznej. Profil przed i po, prefill 1024 tokenów:
+
+| | przed | po |
+|---|---:|---:|
+| libBNNS — CPU mnoży | 70,6% | **77,9%** |
+| jądro — czekanie na GPU | 19,3% | 17,6% |
+| nasz kod (rozpakowanie + kodowanie) | 9,5% | **4,4%** |
+
+Udział produktywnego mnożenia wzrósł o 7 punktów, a nasz własny narzut spadł
+ponad dwukrotnie.
+
+### Wynik trzeciej rundy
+
+Pomiar przeplatany z MLX, w jednym stanie termicznym:
+
+| prompt | nasze | MLX | przewaga |
+|---|---:|---:|---:|
+| 1024 | 270,8 / 243,1 tok/s | 202,6 / 216,9 | **+22%** |
+| 2048 | 254,7 / 246,3 | 207,3 / 212,4 | **+19%** |
+
+**Ostrzeżenie metodyczne.** Po kilku godzinach obciążenia maszyna zwolniła o
+około 20%: prompt 256 na NIEZMIENIONYM kodzie dawał 257 tok/s rano i 199-216
+wieczorem, a MLX spadł z 218,9 na 202-217. Liczby bezwzględne z różnych godzin
+tej sesji NIE są porównywalne; porównywalne są wyłącznie pomiary przeplatane, i
+tylko takie są tu podstawą wniosków. Jedna próbka potrafiła odbiec o 17% (236,0
+przy trzech kolejnych 261,8 / 260,6 / 262,6), więc pojedynczy przebieg nie
+rozstrzyga niczego poniżej kilkunastu procent.
+
+### Sprawdzone i odrzucone w tej rundzie
+
+**Większy udział CPU przy kaflu 1024.** 0,67 i 0,70 wyszły nierozróżnialne
+(268,3 / 266,3 wobec 267,3 / 264,5), 0,64 wyraźnie gorsze. Rampa kończy się
+więc na 512 i powyżej trzyma 0,70 — nie ma tam czego dopasowywać.
+
+**NEON do rozpakowania.** Prototyp `vqtbl1q_u8` z dwiema tablicami bajtowymi
+jest 2,66x szybszy od skalarnego i zgodny co do bitu (0 różnic na 13 mln
+elementów). NIE wdrożony: po przełożeniu kolejności rozpakowanie zeszło do 4,4%
+czasu wątku i jest w większości schowane za czekaniem, więc zysk byłby poniżej
+progu, przy którym da się go w ogóle zmierzyć na tej maszynie (rozrzut ~5%).
+Prototyp zostaje opisany tutaj, żeby nie trzeba go było wymyślać drugi raz.
+
 ## Nierozstrzygnięte
+
+Uwaga nadal nie jest dzielona. Rachunek mówi, że przy 1024 tokenach to około
+2,4% całej pracy, a przy 2048 około 4,8% — czyli mniej, niż wcześniej
+sugerowałem, i podział wymagałby zupełnie innego mechanizmu niż podział wierszy
+GEMM.
 
 Wsad 128 i mniejsze nie korzystają z CPU w ogóle, bo rozpakowanie się nie
 amortyzuje. Trwała kopia f16 wycinka CPU zdjęłaby ten koszt i otworzyła krótsze

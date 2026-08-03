@@ -165,8 +165,10 @@ mod metal_forms {
     /// them, and unpacking costs the same at 256 tokens as at 512 while there
     /// is half as much multiplying to hide it behind. So the smaller the batch,
     /// the worse the CPU's effective rate and the more the GPU should take.
-    /// Chunking bounds the batch to [256, 512], so two measured points and a
-    /// straight line between them cover every case that can occur.
+    /// Two measured points and a straight line between them. Above 512 the
+    /// line stops: swept at a full 1024-token chunk, 0,67 and 0,70 came out
+    /// indistinguishable (268,3 / 266,3 against 267,3 / 264,5 tok/s) and only
+    /// 0,64 was clearly worse, so there is nothing there to fit.
     fn gpu_row_share(tokens: u32) -> f32 {
         const AT_256: f32 = 0.74;
         const AT_512: f32 = 0.70;
