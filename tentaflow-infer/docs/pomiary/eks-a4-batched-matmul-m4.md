@@ -249,9 +249,28 @@ Gdzie jest sufit: 31,0 us na token przy T=128 to 2,97 TFLOPS wobec zmierzonych
 normalizacje, obroty i reszta warstwy mieszczą się w kilku procentach.
 
 Bezwzględny sufit obliczeniowy z EKS-A2 dla tej klasy modelu to ~260 tok/s.
-Jesteśmy na 74% niego i na 75% szczytu instrukcji macierzowej — to jest miejsce,
-w którym dalsze przyspieszanie przestaje być dobieraniem stałych, a zaczyna być
-przepisywaniem harmonogramu.
+Jesteśmy na 74% niego i na 75% szczytu instrukcji macierzowej.
+
+Ostatnia rzecz sprawdzona i odrzucona: **czytanie fragmentu aktywacji wprost z
+pamięci urządzenia**, bez wystawiania go do pamięci grupy roboczej.
+`simdgroup_load` to potrafi, a wystawianie kosztuje odczyt i zapis na wartość,
+więc wyglądało to na czystą oszczędność instrukcji. Wyszło 31,6 wobec 31,0 us
+na token — te same osiem wierszy jest czytane ponownie dla każdego kroku po K i
+dla każdego bloku wierszy, a opóźnienie pamięci urządzenia jest większe niż
+wspólnej. Doszedłby przy tym wymóg dopełniania bufora WEJŚCIOWEGO. Odrzucone.
+
+## Bilans wobec sufitów sprzętowych
+
+| ścieżka | wynik | sufit | wykorzystanie |
+|---|---:|---:|---:|
+| prefill | 192,1 tok/s | ~260 tok/s (ALU, EKS-A2) | **74%** |
+| dekodowanie | 19,3 tok/s | ~24,4 tok/s (4,2 GB przy 102,4 GB/s) | **79%** |
+
+Dekodowanie jest ograniczone pamięcią i nie ma czego w nim liczyć szybciej:
+każdy token wymaga jednego przejścia przez wszystkie wagi. Prefill jest
+ograniczony obliczeniami i dalsze przyspieszanie przestaje być dobieraniem
+stałych, a zaczyna przepisywaniem harmonogramu — albo czekaniem na M5, gdzie
+według tej samej analizy pojawiają się dedykowane akceleratory neuronowe.
 
 Obie ścieżki wybierają ten sam token — sprawdza to asercja w samym pomiarze,
 bo inaczej porównywałby dwie różne prace.

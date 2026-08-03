@@ -213,8 +213,11 @@ fn unsupported_paths_say_so_instead_of_pretending() {
     assert!(dev.begin_capture(&stream).is_err());
     assert!(dev.end_capture(&stream).is_err());
 
-    // Wielowymiarowa siatka i pamięć grupy roboczej deklarowana przy wywołaniu
-    // to kontrakt CUDA; Metal ma je inaczej i cicha zamiana byłaby złym wynikiem.
+    // Druga oś siatki JEST obsługiwana — używa jej batchowy matmul, który
+    // kafelkuje wiersze wyjścia i tokeny naraz. Trzecia oś i wielowymiarowy
+    // blok nie mają dziś kernela, który by ich potrzebował, więc są odrzucane
+    // zamiast po cichu spłaszczane. Pamięć grupy roboczej deklarowana przy
+    // wywołaniu to kontrakt CUDA; w Metalu deklaruje ją kernel.
     let module = dev.load_module(SRC.as_bytes()).unwrap();
     let kernel = module.kernel("scale_add").unwrap();
     let buf = dev.alloc(64, MemKind::Device, Pool::Weights).unwrap();
@@ -225,7 +228,21 @@ fn unsupported_paths_say_so_instead_of_pretending() {
         block: (64, 1, 1),
         shared_mem_bytes: 0,
     };
-    assert!(dev.launch(&kernel, &two_d, &args, &stream).is_err());
+    assert!(dev.launch(&kernel, &two_d, &args, &stream).is_ok());
+
+    let three_d = LaunchConfig {
+        grid: (1, 1, 2),
+        block: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    assert!(dev.launch(&kernel, &three_d, &args, &stream).is_err());
+
+    let two_d_block = LaunchConfig {
+        grid: (1, 1, 1),
+        block: (64, 2, 1),
+        shared_mem_bytes: 0,
+    };
+    assert!(dev.launch(&kernel, &two_d_block, &args, &stream).is_err());
 
     let with_smem = LaunchConfig {
         grid: (1, 1, 1),
