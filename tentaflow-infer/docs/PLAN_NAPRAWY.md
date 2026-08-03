@@ -886,6 +886,14 @@ Bielik-Minitron-7B-MLX-4bit, plik **4 206 804 396 B = 4,207 GB**:
 | Sufit obliczeniowy prefillu | **3,94 TFLOPS zmierzone** ÷ ~15 GFLOP/token | **~260 tok/s** |
 | Cel prefill v1 | 70% sufitu | **≥ 175 tok/s** |
 
+**Korekta po EKS-A5 (2026-08-03): oba cele v1 są ZANIŻONE wobec poprzeczki.**
+MLX zmierzony na tej maszynie, tym modelu i tym promptcie robi **219,0 tok/s
+prefillu i 22,4 tok/s dekodowania** (`docs/pomiary/eks-a5-wobec-mlx-m4.md`).
+Progi 175 i 19 to były procenty sufitu sprzętowego, a nie prędkość konkurenta,
+więc ich przekroczenie NIE oznacza spełnienia warunku „≥ 1,0× mlx" z §8.4.
+Wiążący jest ten drugi. MLX wyciąga 92% sufitu pamięciowego w dekodowaniu i 84%
+obliczeniowego w prefillu — to są liczby do pobicia.
+
 **Korekta po EKS-A1 (2026-08-02).** Pierwsza wersja tej tabeli miała **dwa błędy naraz**:
 rozmiar modelu wzięty z `du` w GiB i wpisany jako GB (3,9 zamiast 4,207) oraz przepustowość
 **katalogowa** 120 GB/s zamiast zmierzonej 102,4. Iloczyn zawyżał sufit o 27% i dawał cel
