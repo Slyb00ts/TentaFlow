@@ -6,9 +6,8 @@
 mod launchers;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod msl;
-// Predykaty wariantow siegaja po stale z `msl`, wiec modul zyje pod tym samym
-// warunkiem co on. Bez tego crate nie kompiluje sie poza macOS.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+// Czesc wspolna rejestru (Problem, Variant, Registry) kompiluje sie wszedzie;
+// listy form sa per platforma, bo to platforma decyduje, ktore w ogole istnieja.
 pub mod variant;
 mod registry;
 

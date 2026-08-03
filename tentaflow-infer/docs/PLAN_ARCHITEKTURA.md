@@ -114,7 +114,7 @@ realnym ryzykiem przy ręcznym dopisywaniu.
 Do zrobienia w tym etapie: `gemm_for(&Problem)` i `pack` przeniesione na ten sam
 kontrakt.
 
-### Etap 3 — podział `launchers.rs` i wspólny rejestr wariantów
+### Etap 3 — podział `launchers.rs` i wspólny rejestr wariantów ✅ rejestr ZROBIONY
 20 515 linii → `launchers/{gemm, attention, norm, quant, sample}.rs`.
 
 Rejestr wariantów uogólniony z tego, co drugi agent zrobił dla Apple:
@@ -123,6 +123,17 @@ Variant { name, applies: fn(&Problem) -> bool, because: "zmierzone uzasadnienie"
 ```
 Dziś istnieje tylko pod `cfg(metal, macos)`; ma objąć CUDA i ROCm. Wybór kernela
 staje się deklaratywny i **udokumentowany pomiarem**, zamiast rozsypanych `if`-ów.
+
+Zrobione: część wspólna (`Problem`, `Variant`, `Registry`, predykat końcowy)
+kompiluje się na każdej platformie, a listy form zostają per platforma — bo to
+platforma decyduje, które formy w ogóle istnieją, a nie który kształt problemu
+je wybiera. Doszedł rejestr `NVFP4_MATMUL` z dwiema formami (przepakowanie do
+FP8, rozpakowywanie wprost), każda z zapisanym pomiarem, oraz trzy testy: na
+totalność po zamiatanym zbiorze kształtów i na to, że dekodowanie wybiera
+ścieżkę bez drugiej kopii wag.
+
+Podział pliku na domeny pozostaje do zrobienia; to część czysto mechaniczna,
+podczas gdy rejestr był tą, która zmienia zachowanie.
 
 ### Etap 4 — podział `model.rs` po architekturach
 21 457 linii → `model/{loader, prefill, decode}.rs` +

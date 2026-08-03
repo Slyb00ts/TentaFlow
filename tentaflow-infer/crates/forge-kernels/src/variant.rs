@@ -69,178 +69,276 @@ impl<K: Copy + 'static> Registry<K> {
     }
 }
 
-/// Forms of the quantized matrix product on Metal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatmulForm {
-    /// One SIMD group per output row, one token. Decode.
-    Vector,
-    /// A tile of tokens in registers. Batches too small for a matrix block.
-    RegisterBlocked,
-    /// SIMD matrix units over a block of tokens and rows. Prefill.
-    MatrixUnits,
-}
 
-/// Forms of attention on Metal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttentionForm {
-    /// One threadgroup per (token, head), incremental softmax. Decode.
-    PerToken,
-    /// Blocked over queries and keys, both products on the matrix units.
-    Blocked,
-}
-
-fn qmg_serves(p: &Problem) -> bool {
-    p.tokens >= crate::msl::QMG_BM && crate::msl::qmg_fits(p.rows, p.cols)
-}
-
-fn qmm_serves(p: &Problem) -> bool {
-    p.tokens > 1
-}
-
+/// Predykat wpisu koncowego: obsluguje kazdy problem. Rejestr bez takiego wpisu
+/// nie jest totalny, wiec jakis ksztalt zostalby bez formy.
 fn always(_: &Problem) -> bool {
     true
 }
 
-/// Order and thresholds from EKS-A4: the matrix form costs 29.8 us per token at
-/// a full block and 176.7 at eight tokens, where the register-blocked form
-/// costs 79.7; the vector form is three times faster than either at one token,
-/// because a tile would compute eight columns and keep one.
-pub const MATMUL_FORMS: Registry<MatmulForm> = Registry {
-    op: "qmatmul",
+// ---------------------------------------------------------------------------
+// CUDA — te same reguly, inne formy. Rejestr jest wspolny, bo wybor kernela to
+// pytanie o KSZTALT PROBLEMU, a nie o platforme; platforma decyduje tylko,
+// ktore formy w ogole istnieja.
+// ---------------------------------------------------------------------------
+
+/// Formy iloczynu macierzowego dla wag NVFP4 na CUDA.
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nvfp4MatmulForm {
+    /// Wagi przepakowane do FP8 przy ladowaniu; GEMM czyta e4m3.
+    /// Szybsze dzis, ale kosztuje DRUGA kopie wag w pamieci.
+    Fp8Repacked,
+    /// Wagi czytane w NVFP4, rozpakowywane w kernelu. Jedna kopia wag i
+    /// polowa bajtow przez HBM.
+    DirectUnpack,
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub static NVFP4_MATMUL: Registry<Nvfp4MatmulForm> = Registry {
+    op: "nvfp4_matmul",
     variants: &[
         Variant {
-            name: "qmg_matrix_units",
-            form: MatmulForm::MatrixUnits,
-            applies: qmg_serves,
-            because: "EKS-A4: 29,8 us/token przy pełnym bloku wobec 72,2 blokowo",
+            name: "fp8_repacked",
+            form: Nvfp4MatmulForm::Fp8Repacked,
+            // Prefill wielotokenowy: 4 899 wobec 2 064 tok/s na Bieliku 7B.
+            // Roznica nie bierze sie z pamieci ani zajetosci — kernel wprost ma
+            // 80 rejestrow i 56,4% przepustowosci SM wobec 224 i 43,5% — tylko
+            // z tego, ze polowa jego pracy to rozpakowywanie FP4 (jednostka
+            // tensorowa 25,1%). Gdy to sie poprawi, kolejnosc tu sie odwroci.
+            applies: |p| p.tokens > 1,
+            because: "prefill 4899 vs 2064 tok/s (Bielik 7B, prompt 2048)",
         },
         Variant {
-            name: "qmm_register_blocked",
-            form: MatmulForm::RegisterBlocked,
-            applies: qmm_serves,
-            because: "EKS-A4: przy 8 tokenach 79,7 us/token wobec 176,7 macierzowo",
-        },
-        Variant {
-            name: "qmv_vector",
-            form: MatmulForm::Vector,
+            name: "direct_unpack",
+            form: Nvfp4MatmulForm::DirectUnpack,
+            // Wpis koncowy MUSI obslugiwac wszystko. Dla dekodowania jest tez
+            // wlasciwym wyborem: 38,2 wobec 38,4 tok/s, czyli tyle samo, przy
+            // 7,35 GB mniej pamieci.
             applies: always,
-            because: "EKS-A4: przy jednym tokenie 344 us wobec 1004 blokowo",
+            because: "decode 38,2 vs 38,4 tok/s przy 7,35 GB mniej pamieci",
         },
     ],
 };
 
-/// Order and thresholds from EKS-A6: the blocked form needs a full block of
-/// queries to be worth its shape, and below it the per-token form is the only
-/// sensible one.
-pub const ATTENTION_FORMS: Registry<AttentionForm> = Registry {
-    op: "attention",
-    variants: &[
-        Variant {
-            name: "flash_blocked",
-            form: AttentionForm::Blocked,
-            applies: |p| p.tokens >= crate::msl::FLASH_BQ,
-            because: "EKS-A6: uwaga z 431 na 230 ms przy 1024 tokenach",
-        },
-        Variant {
-            name: "attn_per_token",
-            form: AttentionForm::PerToken,
-            applies: always,
-            because: "EKS-A6: przy jednym tokenie blok liczyłby 31 pustych wierszy",
-        },
-    ],
-};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod metal_forms {
+    use super::*;
+    /// Forms of the quantized matrix product on Metal.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MatmulForm {
+        /// One SIMD group per output row, one token. Decode.
+        Vector,
+        /// A tile of tokens in registers. Batches too small for a matrix block.
+        RegisterBlocked,
+        /// SIMD matrix units over a block of tokens and rows. Prefill.
+        MatrixUnits,
+    }
 
-#[cfg(test)]
-mod tests {
+    /// Forms of attention on Metal.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AttentionForm {
+        /// One threadgroup per (token, head), incremental softmax. Decode.
+        PerToken,
+        /// Blocked over queries and keys, both products on the matrix units.
+        Blocked,
+    }
+
+    fn qmg_serves(p: &Problem) -> bool {
+        p.tokens >= crate::msl::QMG_BM && crate::msl::qmg_fits(p.rows, p.cols)
+    }
+
+    fn qmm_serves(p: &Problem) -> bool {
+        p.tokens > 1
+    }
+
+    /// Order and thresholds from EKS-A4: the matrix form costs 29.8 us per token at
+    /// a full block and 176.7 at eight tokens, where the register-blocked form
+    /// costs 79.7; the vector form is three times faster than either at one token,
+    /// because a tile would compute eight columns and keep one.
+    pub const MATMUL_FORMS: Registry<MatmulForm> = Registry {
+        op: "qmatmul",
+        variants: &[
+            Variant {
+                name: "qmg_matrix_units",
+                form: MatmulForm::MatrixUnits,
+                applies: qmg_serves,
+                because: "EKS-A4: 29,8 us/token przy pełnym bloku wobec 72,2 blokowo",
+            },
+            Variant {
+                name: "qmm_register_blocked",
+                form: MatmulForm::RegisterBlocked,
+                applies: qmm_serves,
+                because: "EKS-A4: przy 8 tokenach 79,7 us/token wobec 176,7 macierzowo",
+            },
+            Variant {
+                name: "qmv_vector",
+                form: MatmulForm::Vector,
+                applies: always,
+                because: "EKS-A4: przy jednym tokenie 344 us wobec 1004 blokowo",
+            },
+        ],
+    };
+
+    /// Order and thresholds from EKS-A6: the blocked form needs a full block of
+    /// queries to be worth its shape, and below it the per-token form is the only
+    /// sensible one.
+    pub const ATTENTION_FORMS: Registry<AttentionForm> = Registry {
+        op: "attention",
+        variants: &[
+            Variant {
+                name: "flash_blocked",
+                form: AttentionForm::Blocked,
+                applies: |p| p.tokens >= crate::msl::FLASH_BQ,
+                because: "EKS-A6: uwaga z 431 na 230 ms przy 1024 tokenach",
+            },
+            Variant {
+                name: "attn_per_token",
+                form: AttentionForm::PerToken,
+                applies: always,
+                because: "EKS-A6: przy jednym tokenie blok liczyłby 31 pustych wierszy",
+            },
+        ],
+    };
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Kształty warstw Bielika-7B plus jeden nietypowy, żeby sprawdzić, że
+        /// wybór nie zależy od tego, czy kształt jest „ładny".
+        const SHAPES: &[(u32, u32)] = &[
+            (4096, 4096),
+            (1024, 4096),
+            (11264, 4096),
+            (4096, 11264),
+            (32128, 4096),
+            (100, 300),
+        ];
+
+        #[test]
+        fn every_problem_is_served_by_something() {
+            // Bez tego rejestr jest tylko listą: pierwszy kształt, którego nikt nie
+            // przewidział, nie ma czym się policzyć i kernel odmawia w środku
+            // przebiegu, a nie przy wczytywaniu.
+            for &(rows, cols) in SHAPES {
+                for tokens in [1u32, 2, 7, 31, 32, 63, 64, 128, 511, 512] {
+                    let p = Problem { tokens, rows, cols };
+                    assert!(
+                        MATMUL_FORMS.pick(&p).is_some(),
+                        "mnożenie: {p:?} bez wariantu"
+                    );
+                    assert!(
+                        ATTENTION_FORMS.pick(&p).is_some(),
+                        "uwaga: {p:?} bez wariantu"
+                    );
+                    assert!(MATMUL_FORMS.fallback_covers(&p), "mnożenie: ostatni wariant nie jest uniwersalny");
+                    assert!(ATTENTION_FORMS.fallback_covers(&p), "uwaga: ostatni wariant nie jest uniwersalny");
+                }
+            }
+        }
+
+        #[test]
+        fn the_choice_changes_with_the_batch() {
+            // Kontrola samego rejestru: gdyby wszystkie problemy trafiały w ten sam
+            // wariant, powyższy test przechodziłby i nie znaczyłby nic.
+            let shape = (4096u32, 4096u32);
+            let at = |tokens| {
+                MATMUL_FORMS
+                    .pick(&Problem {
+                        tokens,
+                        rows: shape.0,
+                        cols: shape.1,
+                    })
+                    .unwrap()
+                    .form
+            };
+            assert_eq!(at(1), MatmulForm::Vector);
+            assert_eq!(at(8), MatmulForm::RegisterBlocked);
+            assert_eq!(at(128), MatmulForm::MatrixUnits);
+        }
+
+        #[test]
+        fn a_shape_the_matrix_form_cannot_take_falls_back_instead_of_failing() {
+            // 300 kolumn nie dzieli się na bloki po 32, więc forma macierzowa nie
+            // ma prawa jej dotknąć — i właśnie dlatego rejestr ma ostatni wpis.
+            let p = Problem {
+                tokens: 256,
+                rows: 100,
+                cols: 300,
+            };
+            assert_eq!(
+                MATMUL_FORMS.pick(&p).unwrap().form,
+                MatmulForm::RegisterBlocked
+            );
+        }
+
+        #[test]
+        fn every_entry_says_why_it_is_where_it_is() {
+            let named: Vec<(&str, &str)> = MATMUL_FORMS
+                .variants
+                .iter()
+                .map(|v| (v.name, v.because))
+                .chain(
+                    ATTENTION_FORMS
+                        .variants
+                        .iter()
+                        .map(|v| (v.name, v.because)),
+                )
+                .collect();
+            for (name, because) in named {
+                assert!(
+                    because.contains("EKS-"),
+                    "{name}: uzasadnienie bez odwołania do pomiaru"
+                );
+                assert!(!name.is_empty());
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(all(feature = "metal", target_os = "macos"))))]
+mod cuda_registry_tests {
     use super::*;
 
-    /// Kształty warstw Bielika-7B plus jeden nietypowy, żeby sprawdzić, że
-    /// wybór nie zależy od tego, czy kształt jest „ładny".
-    const SHAPES: &[(u32, u32)] = &[
-        (4096, 4096),
-        (1024, 4096),
-        (11264, 4096),
-        (4096, 11264),
-        (32128, 4096),
-        (100, 300),
-    ];
+    fn problem(tokens: u32, rows: u32, cols: u32) -> Problem {
+        Problem { tokens, rows, cols }
+    }
 
+    /// Totalnosc: kazdy ksztalt dostaje jakas forme. To wlasnie ta wlasnosc
+    /// odrozia rejestr od lancucha `if` — tam ksztalt, ktorego nikt nie
+    /// przewidzial, po prostu wypada.
     #[test]
-    fn every_problem_is_served_by_something() {
-        // Bez tego rejestr jest tylko listą: pierwszy kształt, którego nikt nie
-        // przewidział, nie ma czym się policzyć i kernel odmawia w środku
-        // przebiegu, a nie przy wczytywaniu.
-        for &(rows, cols) in SHAPES {
-            for tokens in [1u32, 2, 7, 31, 32, 63, 64, 128, 511, 512] {
-                let p = Problem { tokens, rows, cols };
+    fn every_shape_gets_a_form() {
+        for tokens in [1u32, 2, 7, 64, 1024, 4096] {
+            for (rows, cols) in [(4096u32, 4096u32), (11264, 4096), (1024, 4096)] {
+                let p = problem(tokens, rows, cols);
                 assert!(
-                    MATMUL_FORMS.pick(&p).is_some(),
-                    "mnożenie: {p:?} bez wariantu"
+                    NVFP4_MATMUL.pick(&p).is_some(),
+                    "brak formy dla {tokens} tokenow, {rows}x{cols}"
                 );
                 assert!(
-                    ATTENTION_FORMS.pick(&p).is_some(),
-                    "uwaga: {p:?} bez wariantu"
+                    NVFP4_MATMUL.fallback_covers(&p),
+                    "wpis koncowy nie obsluguje {tokens} tokenow"
                 );
-                assert!(MATMUL_FORMS.fallback_covers(&p), "mnożenie: ostatni wariant nie jest uniwersalny");
-                assert!(ATTENTION_FORMS.fallback_covers(&p), "uwaga: ostatni wariant nie jest uniwersalny");
             }
         }
     }
 
+    /// Dekodowanie (jeden token) ma isc sciezka bez drugiej kopii wag: tam
+    /// przepakowanie do FP8 nic nie daje (38,2 vs 38,4 tok/s), a kosztuje
+    /// 7,35 GB.
     #[test]
-    fn the_choice_changes_with_the_batch() {
-        // Kontrola samego rejestru: gdyby wszystkie problemy trafiały w ten sam
-        // wariant, powyższy test przechodziłby i nie znaczyłby nic.
-        let shape = (4096u32, 4096u32);
-        let at = |tokens| {
-            MATMUL_FORMS
-                .pick(&Problem {
-                    tokens,
-                    rows: shape.0,
-                    cols: shape.1,
-                })
-                .unwrap()
-                .form
-        };
-        assert_eq!(at(1), MatmulForm::Vector);
-        assert_eq!(at(8), MatmulForm::RegisterBlocked);
-        assert_eq!(at(128), MatmulForm::MatrixUnits);
+    fn decode_prefers_the_path_without_a_second_copy() {
+        let f = NVFP4_MATMUL.pick(&problem(1, 4096, 4096)).expect("forma");
+        assert_eq!(f.form, Nvfp4MatmulForm::DirectUnpack);
     }
 
+    /// Prefill dzis wybiera przepakowanie — dopoki kernel wprost nie przestanie
+    /// tracic polowy pracy na rozpakowywanie.
     #[test]
-    fn a_shape_the_matrix_form_cannot_take_falls_back_instead_of_failing() {
-        // 300 kolumn nie dzieli się na bloki po 32, więc forma macierzowa nie
-        // ma prawa jej dotknąć — i właśnie dlatego rejestr ma ostatni wpis.
-        let p = Problem {
-            tokens: 256,
-            rows: 100,
-            cols: 300,
-        };
-        assert_eq!(
-            MATMUL_FORMS.pick(&p).unwrap().form,
-            MatmulForm::RegisterBlocked
-        );
-    }
-
-    #[test]
-    fn every_entry_says_why_it_is_where_it_is() {
-        let named: Vec<(&str, &str)> = MATMUL_FORMS
-            .variants
-            .iter()
-            .map(|v| (v.name, v.because))
-            .chain(
-                ATTENTION_FORMS
-                    .variants
-                    .iter()
-                    .map(|v| (v.name, v.because)),
-            )
-            .collect();
-        for (name, because) in named {
-            assert!(
-                because.contains("EKS-"),
-                "{name}: uzasadnienie bez odwołania do pomiaru"
-            );
-            assert!(!name.is_empty());
-        }
+    fn prefill_prefers_the_faster_kernel_today() {
+        let f = NVFP4_MATMUL.pick(&problem(2048, 11264, 4096)).expect("forma");
+        assert_eq!(f.form, Nvfp4MatmulForm::Fp8Repacked);
     }
 }
