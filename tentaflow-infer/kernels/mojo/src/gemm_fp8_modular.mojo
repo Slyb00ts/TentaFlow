@@ -123,9 +123,33 @@ comptime gemm_fp8_mod_2048x14336_4096 = gemm_fp8_mod_tile[2048, 4096, 256, 14336
 # (197 ms) przy podlodze obliczeniowej 118 ms. Jeden przebieg to 14,7 GB (66 ms),
 # czyli ponizej podlogi. Mikrobench tego NIE pokazywal — tam ta sama macierz
 # wracala do L2 co iteracje i plastry wychodzily gorzej.
+#
+# Launcher NIE ma juz tabeli ksztaltow: liczy docelowa szerokosc z liczby SM i
+# liczby tokenow, a potem sklada N z tych plastrow, ktore SA w artefaktach.
+# Drabina schodzi do 256, wiec kazde N podzielne przez 256 da sie zlozyc.
+# Dolozenie modelu to dopisanie ponizszych szesciu linii dla jego (LDY, K) —
+# launcher zostaje bez zmian.
+#
+# Runtime'owe LDY nie wchodzi w gre, mimo ze skusiloby sie o jedna instancje na
+# (szerokosc, K): `probe_fp8_dynamic.mojo` pokazuje, ze samo LDY z runtime'u
+# jest darmowe i bitowo neutralne, ale zmiana sygnatury uniewaznilaby
+# zacommitowane artefakty sm_89, ktorych nie da sie tu przebudowac (host ma
+# wylacznie GB10). Statyczne LDY kosztuje tyle samo instancji, bo (LDY, K) jest
+# klasa projekcji, a tych model ma trzy.
+comptime gemm_fp8_mod_2048x4096_4096 = gemm_fp8_mod_tile[2048, 4096, 256, 4096]
 comptime gemm_fp8_mod_1536x4096_4096 = gemm_fp8_mod_tile[1536, 4096, 256, 4096]
 comptime gemm_fp8_mod_1024x4096_4096 = gemm_fp8_mod_tile[1024, 4096, 256, 4096]
+comptime gemm_fp8_mod_512x4096_4096 = gemm_fp8_mod_tile[512, 4096, 256, 4096]
+comptime gemm_fp8_mod_256x4096_4096 = gemm_fp8_mod_tile[256, 4096, 256, 4096]
+
+comptime gemm_fp8_mod_2048x4096_11264 = gemm_fp8_mod_tile[2048, 11264, 256, 4096]
 comptime gemm_fp8_mod_1536x4096_11264 = gemm_fp8_mod_tile[1536, 11264, 256, 4096]
 comptime gemm_fp8_mod_1024x4096_11264 = gemm_fp8_mod_tile[1024, 11264, 256, 4096]
+comptime gemm_fp8_mod_512x4096_11264 = gemm_fp8_mod_tile[512, 11264, 256, 4096]
+comptime gemm_fp8_mod_256x4096_11264 = gemm_fp8_mod_tile[256, 11264, 256, 4096]
+
+comptime gemm_fp8_mod_2048x11264_4096 = gemm_fp8_mod_tile[2048, 4096, 256, 11264]
 comptime gemm_fp8_mod_1536x11264_4096 = gemm_fp8_mod_tile[1536, 4096, 256, 11264]
+comptime gemm_fp8_mod_1024x11264_4096 = gemm_fp8_mod_tile[1024, 4096, 256, 11264]
 comptime gemm_fp8_mod_512x11264_4096 = gemm_fp8_mod_tile[512, 4096, 256, 11264]
+comptime gemm_fp8_mod_256x11264_4096 = gemm_fp8_mod_tile[256, 4096, 256, 11264]

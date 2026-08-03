@@ -533,6 +533,10 @@
       "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_d35d210e9fdea037",
       "file": "gemm_fp8_mod_1024_4096.ptx"
     },
+    "gemm_fp8_mod_1024x11264_4096": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_d6e0be32868c5f5c",
+      "file": "gemm_fp8_mod_1024x11264_4096.ptx"
+    },
     "gemm_fp8_mod_1024x4096_11264": {
       "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_7cb7fa3e7ae30abe",
       "file": "gemm_fp8_mod_1024x4096_11264.ptx"
@@ -565,9 +569,33 @@
       "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_33397a41bfee4575",
       "file": "gemm_fp8_mod_1536x4096_4096.ptx"
     },
+    "gemm_fp8_mod_2048x11264_4096": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_a7c88c8bb6f60b6f",
+      "file": "gemm_fp8_mod_2048x11264_4096.ptx"
+    },
     "gemm_fp8_mod_2048x14336_4096": {
       "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_1d5903dbe8679c7a",
       "file": "gemm_fp8_mod_2048x14336_4096.ptx"
+    },
+    "gemm_fp8_mod_2048x4096_11264": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_2c33a41953c711b3",
+      "file": "gemm_fp8_mod_2048x4096_11264.ptx"
+    },
+    "gemm_fp8_mod_2048x4096_4096": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_16120a3df41c9920",
+      "file": "gemm_fp8_mod_2048x4096_4096.ptx"
+    },
+    "gemm_fp8_mod_256x11264_4096": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_63b2b98f6fd788ae",
+      "file": "gemm_fp8_mod_256x11264_4096.ptx"
+    },
+    "gemm_fp8_mod_256x4096_11264": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_4fa2ac9bf4323804",
+      "file": "gemm_fp8_mod_256x4096_11264.ptx"
+    },
+    "gemm_fp8_mod_256x4096_4096": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_7256c8e925716b1b",
+      "file": "gemm_fp8_mod_256x4096_4096.ptx"
     },
     "gemm_fp8_mod_3072x11264_4096": {
       "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_fff715c0878c1c92",
@@ -608,6 +636,14 @@
     "gemm_fp8_mod_512x11264_4096": {
       "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_9cb030cb1b37cf51",
       "file": "gemm_fp8_mod_512x11264_4096.ptx"
+    },
+    "gemm_fp8_mod_512x4096_11264": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_a59cd335ca810c5b",
+      "file": "gemm_fp8_mod_512x4096_11264.ptx"
+    },
+    "gemm_fp8_mod_512x4096_4096": {
+      "entry": "src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_6eed7483b7148540",
+      "file": "gemm_fp8_mod_512x4096_4096.ptx"
     },
     "gemm_iq1_m_f16": {
       "entry": "src_gemm_gemm_iq1_m_impl_SIM6A6A6A6AcB6A6A_7e6586679f79b8b8",

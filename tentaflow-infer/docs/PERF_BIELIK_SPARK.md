@@ -7,14 +7,23 @@ Pomiary na GB10 (sm_121a, 48 SM, pamięć zunifikowana 121 GiB),
 
 | prompt | prefill tok/s | decode tok/s | zmierzone |
 |---|---|---|---|
-| 2 048 | **5 676** | 37,8–37,9 | 2026-08-03, plastry 1536, SHA tokenow bez zmian |
+| 512 | **5 609** | 39,1 | 2026-08-03, plaster liczony z liczby SM |
+| 2 048 | **5 643** | 36,6 | 2026-08-03, plaster liczony z liczby SM |
+| 4 096 | **4 761** | 34,3 | 2026-08-03, plaster liczony z liczby SM |
+| 2 048 | 5 676 | 37,8–37,9 | 2026-08-03, plastry 1536 wpisane recznie |
 | 2 048 | 4 966 | 38,3 | 2026-08-03, przed plastrami |
-| 512 | 3 930 | 40,2 | starszy pomiar |
-| 4 096 | 3 902 | 35,4 | starszy pomiar |
+| 2 048 | 3 423 | — | 2026-08-03, plastry wylaczone (kontrola A/B) |
 
-Wobec startu sesji (2 957 tok/s przy 2048) to **+67%**, przy niezmienionej
-generacji. Wiersze 512 i 4096 pochodza sprzed kilku zmian i nie zostaly
-powtorzone — nie sa punktem odniesienia dla dzisiejszych bramek.
+Wobec startu sesji (2 957 tok/s przy 2048) to **+91%**, przy niezmienionej
+generacji. Plaster liczony w runtime odtwarza wynik recznej tabeli przy 2048
+(5 643 wobec 5 676 — roznica jest w szumie miedzy przebiegami) i podnosi
+pozostale dlugosci promptu, ktore ta tabela w ogole pomijala: 512 z 3 930 na
+5 609, a 4 096 z 3 902 na 4 761.
+
+SHA wygenerowanych tokenow jest **identyczny przy plastrach wylaczonych, przy
+1536 i przy 4096** — rozklad kolumn jest wiec dowiedziona operacja neutralna dla
+wyniku, co zgadza sie z matematyka (kazdy plaster liczy rozlaczny zakres kolumn
+z ta sama redukcja po K).
 
 Odniesienie na tym samym sprzęcie: **vLLM 0.26 daje 48 tok/s decode** oraz
 rzekomo ~10 000 tok/s prefillu (mierzone przez HTTP).
@@ -435,6 +444,57 @@ dzwignia, ktora dzialala na `gate/up`, tyle ze dobrana pod liczbe SM zamiast pod
 "N=4096". Uwaga: w MIKROBENCHU plastry wychodzily gorzej (672 wobec 617 us) i
 dlatego zostaly wczesniej odrzucone — tam L2 miedzy powtorzeniami maskowal caly
 efekt. Silnik jest tu uczciwym pomiarem, mikrobench nie.
+
+#### Szerokosc plastra liczona z liczby SM, nie wpisana recznie
+
+Pierwsza wersja byla tabela `match (rows, cols)` z nazwami kerneli. Dzialalo to
+dla Bielika i dla nikogo wiecej: kształty Gemmy 4 (`8192x5376`, `21504x5376`,
+`5376x21504`) nie trafialy ani w tabele, ani w liste skompilowanych instancji,
+wiec caly zysk dotyczyl jednego modelu.
+
+Regula, ktora ta tabela realizowala, jest jednak jawna: siatka plastra to
+`(szerokosc/256, tokeny/128)`, a chcemy, zeby jej iloczyn wyszedl na liczbe SM.
+Stad `szerokosc = 256 * SM / ceil(tokeny/128)`; dla 48 SM i 1024 tokenow daje to
+1536, czyli dokladnie te liczbe, ktora byla wpisana recznie. Launcher liczy ja
+teraz w runtime i sklada N z drabiny `{4096, 3072, 2048, 1536, 1024, 512, 256}`,
+biorac wylacznie te szerokosci, ktore SA w artefaktach. Dolozenie modelu to
+dopisanie instancji w `gemm_fp8_modular.mojo`; launcher zostaje nietkniety.
+Test jednostkowy pilnuje, ze dla 1024 tokenow wychodza dokladnie te trzy plany,
+ktore zmierzyly sie jako 4966 -> 5676 tok/s, a dla malej liczby tokenow — dawna
+tabela stalych kawalkow.
+
+Zaokraglac trzeba W GORE, nie w dol. Pierwsza wersja brala najszerszy plaster
+NIE WIEKSZY od celu i to jest pulapka: gdy celu nie ma w drabinie, schodzi sie
+o poziom za nisko i maszyna stoi pusta. A/B na promptcie 2048 (wymuszona
+szerokosc, ten sam SHA tokenow):
+
+| szerokosc | bloki na 48 SM | prefill 2048 |
+|---|--:|--:|
+| bez plastrow | — | 598,3 ms (3 423 tok/s) |
+| 4096 | 16 x m | 401,6 ms (5 099 tok/s) |
+| **1536 (wybor domyslny)** | 6 x 8 = 48 | **362,4 ms (5 651 tok/s)** |
+| 512 | 2 x 16 = 32 | 641,2 ms (3 194 tok/s) |
+
+Plaster 512 jest wolniejszy niz brak plastrow w ogole. Dlatego regula brzmi:
+najwezszy plaster NIE MNIEJSZY od celu, a gdy zadnego takiego nie ma —
+najszerszy dostepny.
+
+Kusilo, zeby pojsc dalej i wpuscic wymiary do argumentow kernela, bo wtedy
+zostaje jedna instancja na `(szerokosc, K)`. `probe_fp8_dynamic.mojo` mowi,
+ktore wymiary to znosza:
+
+| wymiar z runtime'u | wynik |
+|---|---|
+| `LDY` (krok wiersza wyjscia) | bitowo identyczny, zero kosztu |
+| `N` (szerokosc plastra) | **przestawione wiersze wyniku** — 74% elementow sie nie zgadza |
+| `K` (glebokosc kontrakcji) | inna kolejnosc redukcji, 2,3% elementow rozni sie o ULP |
+
+Predkosc jest w kazdym wariancie ta sama (`bench_fp8_dynamic.mojo`), wiec
+`multistage_gemm_kernel` nie placi za dynamiczne ksztalty — po prostu jego
+mapowanie epilogu zaklada statyczne N. Zostaje wiec statyczne `N` i `K`.
+Samo runtime'owe `LDY` bylo do wziecia, ale uniewaznialoby zacommitowane
+artefakty sm_89, ktorych na tym hoscie (wylacznie GB10) nie da sie przebudowac,
+a nie kupuje nic: `(LDY, K)` to klasa projekcji, a tych model ma trzy.
 
 ### Ogon elementwise jest SKONCZONY — nie szukac tam zyskow
 

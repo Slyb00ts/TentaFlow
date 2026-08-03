@@ -1,81 +1,83 @@
 // ===== File: gemm/fp8.rs — GEMM/GEMV na FP8 e4m3 i W4A8 =====
 use super::*;
 
-/// Kolumny liczone plastrami; kazdy plaster pisze wycinek do pelnej macierzy
-/// wyjsciowej, wiec jego kernel zna krok wiersza `LDY` rowny pelnemu N.
-///
-/// Szerokosc plastra dobiera sie pod LICZBE SM, nie pod „N=4096".
-///
-/// Siatka kawalka to `(plaster/256, tokeny/128)`. Przy pelnym kawalku prefillu
-/// (1024 tokenow) daje to 8 wierszy M, wiec plaster 1536 = 6 kafli kolumnowych,
-/// czyli 48 blokow na 48 SM: wszystkie wiersze M rezydentne naraz i dzielace ten
-/// sam kafel wag. Dotychczasowe 16 kafli kolumnowych mieszczilo 3 wiersze M,
-/// wiec kazda macierz wag szla przez pamiec TRZY razy.
-///
-/// W silniku to jest cala roznica, bo kazda z 40 warstw ma inne wagi i L2 nie
-/// pomaga miedzy wywolaniami. `nsys` na prefillu 2048: 44,1 GB ruchu wag
-/// (197 ms) przy podlodze obliczeniowej 118 ms; jeden przebieg to 14,7 GB
-/// (66 ms), czyli ponizej podlogi. Mikrobench tego nie pokazywal — tam ta sama
-/// macierz wracala do L2 co iteracje.
-///
-/// Prog `n_tokens > 512` jest istotny: ponizej niego wierszy M jest 4 lub mniej,
-/// wiec wagi i tak ida przez pamiec raz, a waskie plastry tylko zabieraja
-/// zajetosc (przy 1 wierszu M plaster 1536 zajmuje 6 z 48 SM).
-const STRIP_MIN_TOKENS: usize = 512;
+/// Drabina szerokosci plastrow kolumnowych, malejaco. Kazda pozycja jest
+/// wielokrotnoscia 256, wiec z tych, ktore sa w artefaktach, da sie zlozyc
+/// dowolne N podzielne przez 256. Powyzej 4096 kolumn ten GEMM i tak sie
+/// zalamuje (142 -> 47 TFLOPS miedzy N=4096 a N=11264), wiec drabina tam sie
+/// konczy.
+const STRIP_LADDER: [usize; 7] = [4096, 3072, 2048, 1536, 1024, 512, 256];
 
-fn fp8_modular_column_chunks(
+fn strip_kernel_name(width: usize, ldy: usize, k: usize) -> String {
+    format!("gemm_fp8_mod_{width}x{ldy}_{k}")
+}
+
+/// Rozklad N na plastry kolumnowe policzony z LICZBY SM, nie z tabeli ksztaltow.
+///
+/// Siatka plastra to `(szerokosc/256, tokeny/128)`. Chcemy, zeby iloczyn wyszedl
+/// mniej wiecej na liczbe SM: wtedy wszystkie wiersze M sa rezydentne naraz i
+/// dziela ten sam kafel wag, czyli kazda macierz wag idzie przez pamiec RAZ.
+/// Przy 48 SM i pelnym kawalku prefillu (1024 tokenow, 8 wierszy M) daje to
+/// 1536 kolumn — dokladnie to, co wczesniej bylo wpisane recznie.
+///
+/// Bez tego kazda macierz wag idzie przez pamiec kilka razy: przy 16 kaflach
+/// kolumnowych rezydentne sa tylko 3 wiersze M, wiec wagi krazily TRZY razy.
+/// W silniku to jest cala roznica, bo kazda z 40 warstw ma inne wagi i L2 nie
+/// pomaga miedzy wywolaniami — `nsys` na prefillu 2048 pokazal 44,1 GB ruchu
+/// wag (197 ms) przy podlodze obliczeniowej 118 ms, a jeden przebieg to 14,7 GB
+/// (66 ms). Mikrobench tego NIE pokazywal: tam ta sama macierz wracala do L2 co
+/// iteracje i plastry wychodzily gorzej.
+///
+/// Wybor jest sterowany artefaktami: brak instancji o danej szerokosci po prostu
+/// wypada z drabiny, wiec dolozenie modelu to dopisanie kerneli w
+/// `gemm_fp8_modular.mojo`, bez dotykania tego pliku.
+fn fp8_strip_plan(
     rows: usize,
     cols: usize,
     n_tokens: usize,
-) -> Option<&'static [(usize, &'static str)]> {
-    if n_tokens > STRIP_MIN_TOKENS {
-        match (rows, cols) {
-            // q/o
-            (4096, 4096) => {
-                return Some(&[
-                    (1536, "gemm_fp8_mod_1536x4096_4096"),
-                    (1536, "gemm_fp8_mod_1536x4096_4096"),
-                    (1024, "gemm_fp8_mod_1024x4096_4096"),
-                ])
-            }
-            // down
-            (4096, 11264) => {
-                return Some(&[
-                    (1536, "gemm_fp8_mod_1536x4096_11264"),
-                    (1536, "gemm_fp8_mod_1536x4096_11264"),
-                    (1024, "gemm_fp8_mod_1024x4096_11264"),
-                ])
-            }
-            // gate/up
-            (11264, 4096) => {
-                return Some(&[
-                    (1536, "gemm_fp8_mod_1536x11264_4096"),
-                    (1536, "gemm_fp8_mod_1536x11264_4096"),
-                    (1536, "gemm_fp8_mod_1536x11264_4096"),
-                    (1536, "gemm_fp8_mod_1536x11264_4096"),
-                    (1536, "gemm_fp8_mod_1536x11264_4096"),
-                    (1536, "gemm_fp8_mod_1536x11264_4096"),
-                    (1536, "gemm_fp8_mod_1536x11264_4096"),
-                    (512, "gemm_fp8_mod_512x11264_4096"),
-                ])
-            }
-            _ => {}
+    sm_count: usize,
+    has: impl Fn(&str) -> bool,
+) -> Option<Vec<(usize, String)>> {
+    if sm_count == 0 || !rows.is_multiple_of(256) {
+        return None;
+    }
+    let available = |w: usize| w < rows && has(&strip_kernel_name(w, rows, cols));
+    let m_tiles = n_tokens.div_ceil(128).max(1);
+    let target = (256 * sm_count / m_tiles).max(256);
+    // Zaokraglamy W GORE, nie w dol: plaster wezszy od celu nie zapelnia
+    // maszyny. Przy 2048 tokenach cel wypada na 768, ktorego nie ma w
+    // artefaktach — zejscie do 512 daje 2 kafle kolumnowe x 16 wierszy M, czyli
+    // 32 bloki na 48 SM, i kosztuje 641 ms wobec 362 ms (zmierzone, prompt
+    // 2048). Zaokraglenie w gore bierze 1024, czyli 64 bloki: druga fala jest
+    // niepelna, ale zadna nie jest pusta.
+    let width = STRIP_LADDER
+        .iter()
+        .rev()
+        .copied()
+        .find(|&w| w >= target && available(w))
+        .or_else(|| STRIP_LADDER.iter().copied().find(|&w| available(w)))?;
+
+    let mut plan = Vec::new();
+    let mut left = rows;
+    while left >= width {
+        plan.push((width, strip_kernel_name(width, rows, cols)));
+        left -= width;
+    }
+    for w in STRIP_LADDER {
+        if !available(w) {
+            continue;
+        }
+        while left >= w {
+            plan.push((w, strip_kernel_name(w, rows, cols)));
+            left -= w;
         }
     }
-    match (rows, cols) {
-        (11264, 4096) => Some(&[
-            (4096, "gemm_fp8_mod_4096x11264_4096"),
-            (4096, "gemm_fp8_mod_4096x11264_4096"),
-            (3072, "gemm_fp8_mod_3072x11264_4096"),
-        ]),
-        (14336, 4096) => Some(&[
-            (4096, "gemm_fp8_mod_4096x14336_4096"),
-            (4096, "gemm_fp8_mod_4096x14336_4096"),
-            (4096, "gemm_fp8_mod_4096x14336_4096"),
-            (2048, "gemm_fp8_mod_2048x14336_4096"),
-        ]),
-        _ => None,
+    // Ogon, ktorego drabina nie sklada, oraz plan z jednego plastra (czyli
+    // zwykle wywolanie) zostawiamy sciezce bazowej.
+    if left != 0 || plan.len() < 2 {
+        return None;
     }
+    Some(plan)
 }
 
 impl Kernels {
@@ -628,32 +630,32 @@ impl Kernels {
         // Podzial szerokiego N na kawalki po <=4096 kolumn, gdy komplet kerneli
         // czastkowych jest w artefaktach. Kazdy kawalek dostaje przesuniete
         // wagi (wiersze B), skale wierszy i kolumne startowa w Y.
-        if let Some(chunks) = fp8_modular_column_chunks(rows, cols, n_tokens) {
-            if chunks.iter().all(|(_, name)| self.artifacts.has(name)) {
-                let mut start = 0usize;
-                for (chunk_rows, name) in chunks {
-                    let ck = self.artifacts.get(name)?;
-                    let ccfg = LaunchConfig {
-                        grid: (
-                            (*chunk_rows as u32).div_ceil(256),
-                            (n_tokens as u32).div_ceil(128),
-                            1,
-                        ),
-                        block: (256, 1, 1),
-                        shared_mem_bytes: FP8_MODULAR_BN256_SMEM as u32,
-                    };
-                    let cargs = LaunchArgs::new()
-                        .buf_at(y, start * 2)?
-                        .buf(xq)
-                        .buf_at(w, start * cols)?
-                        .buf(xs)
-                        .buf_at(wscales, start * 4)?
-                        .scalar(n_tokens as i64);
-                    self.device.launch(ck, &ccfg, &cargs, stream)?;
-                    start += chunk_rows;
-                }
-                return Ok(());
+        if let Some(plan) = fp8_strip_plan(rows, cols, n_tokens, caps.sm_count as usize, |name| {
+            self.artifacts.has(name)
+        }) {
+            let mut start = 0usize;
+            for (strip_rows, name) in plan {
+                let ck = self.artifacts.get(&name)?;
+                let ccfg = LaunchConfig {
+                    grid: (
+                        (strip_rows as u32).div_ceil(256),
+                        (n_tokens as u32).div_ceil(128),
+                        1,
+                    ),
+                    block: (256, 1, 1),
+                    shared_mem_bytes: FP8_MODULAR_BN256_SMEM as u32,
+                };
+                let cargs = LaunchArgs::new()
+                    .buf_at(y, start * 2)?
+                    .buf(xq)
+                    .buf_at(w, start * cols)?
+                    .buf(xs)
+                    .buf_at(wscales, start * 4)?
+                    .scalar(n_tokens as i64);
+                self.device.launch(ck, &ccfg, &cargs, stream)?;
+                start += strip_rows;
             }
+            return Ok(());
         }
 
         let args = LaunchArgs::new()
@@ -737,32 +739,32 @@ impl Kernels {
         // Ten sam podzial szerokiego N co w `gemm_fp8_modular`. Tedy idzie FFN
         // gate/up, czyli dokladnie ksztalt (11264, 4096), na ktorym pojedyncze
         // wywolanie osiaga 47 TFLOPS zamiast 142.
-        if let Some(chunks) = fp8_modular_column_chunks(rows, cols, n_tokens) {
-            if chunks.iter().all(|(_, name)| self.artifacts.has(name)) {
-                let mut start = 0usize;
-                for (chunk_rows, name) in chunks {
-                    let ck = self.artifacts.get(name)?;
-                    let ccfg = LaunchConfig {
-                        grid: (
-                            (*chunk_rows as u32).div_ceil(256),
-                            (n_tokens as u32).div_ceil(128),
-                            1,
-                        ),
-                        block: (256, 1, 1),
-                        shared_mem_bytes: FP8_MODULAR_BN256_SMEM as u32,
-                    };
-                    let cargs = LaunchArgs::new()
-                        .buf_at(y, start * 2)?
-                        .buf(xq)
-                        .buf_at(w, start * cols)?
-                        .buf(xs)
-                        .buf_at(wscales, start * 4)?
-                        .scalar(n_tokens as i64);
-                    self.device.launch(ck, &ccfg, &cargs, stream)?;
-                    start += chunk_rows;
-                }
-                return Ok(());
+        if let Some(plan) = fp8_strip_plan(rows, cols, n_tokens, caps.sm_count as usize, |name| {
+            self.artifacts.has(name)
+        }) {
+            let mut start = 0usize;
+            for (strip_rows, name) in plan {
+                let ck = self.artifacts.get(&name)?;
+                let ccfg = LaunchConfig {
+                    grid: (
+                        (strip_rows as u32).div_ceil(256),
+                        (n_tokens as u32).div_ceil(128),
+                        1,
+                    ),
+                    block: (256, 1, 1),
+                    shared_mem_bytes: FP8_MODULAR_BN256_SMEM as u32,
+                };
+                let cargs = LaunchArgs::new()
+                    .buf_at(y, start * 2)?
+                    .buf(xq)
+                    .buf_at(w, start * cols)?
+                    .buf(xs)
+                    .buf_at(wscales, start * 4)?
+                    .scalar(n_tokens as i64);
+                self.device.launch(ck, &ccfg, &cargs, stream)?;
+                start += strip_rows;
             }
+            return Ok(());
         }
 
         let args = LaunchArgs::new()
@@ -774,5 +776,100 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(gk, &cfg, &args, stream)
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Instancje plastrow zacommitowane dla Bielika (LDY, K) i Mistrala.
+    const COMMITTED: &[&str] = &[
+        "gemm_fp8_mod_2048x4096_4096",
+        "gemm_fp8_mod_1536x4096_4096",
+        "gemm_fp8_mod_1024x4096_4096",
+        "gemm_fp8_mod_512x4096_4096",
+        "gemm_fp8_mod_256x4096_4096",
+        "gemm_fp8_mod_2048x4096_11264",
+        "gemm_fp8_mod_1536x4096_11264",
+        "gemm_fp8_mod_1024x4096_11264",
+        "gemm_fp8_mod_512x4096_11264",
+        "gemm_fp8_mod_256x4096_11264",
+        "gemm_fp8_mod_4096x11264_4096",
+        "gemm_fp8_mod_3072x11264_4096",
+        "gemm_fp8_mod_2048x11264_4096",
+        "gemm_fp8_mod_1536x11264_4096",
+        "gemm_fp8_mod_1024x11264_4096",
+        "gemm_fp8_mod_512x11264_4096",
+        "gemm_fp8_mod_256x11264_4096",
+        "gemm_fp8_mod_4096x14336_4096",
+        "gemm_fp8_mod_2048x14336_4096",
+    ];
+
+    fn plan(rows: usize, cols: usize, n_tokens: usize) -> Option<Vec<usize>> {
+        fp8_strip_plan(rows, cols, n_tokens, 48, |name| COMMITTED.contains(&name))
+            .map(|p| p.into_iter().map(|(w, _)| w).collect())
+    }
+
+    /// Plan musi pokryc dokladnie N — inaczej czesc kolumn zostaje niepoliczona.
+    fn assert_covers(rows: usize, widths: &[usize]) {
+        assert_eq!(widths.iter().sum::<usize>(), rows);
+    }
+
+    #[test]
+    fn full_prefill_chunk_reproduces_the_measured_plan() {
+        // 1024 tokenow to 8 wierszy M, wiec cel to 256*48/8 = 1536 kolumn.
+        // Te trzy plany zmierzyly sie jako 4966 -> 5676 tok/s.
+        let qo = plan(4096, 4096, 1024).unwrap();
+        assert_eq!(qo, vec![1536, 1536, 1024]);
+        let down = plan(4096, 11264, 1024).unwrap();
+        assert_eq!(down, vec![1536, 1536, 1024]);
+        let gate_up = plan(11264, 4096, 1024).unwrap();
+        assert_eq!(
+            gate_up,
+            vec![1536; 7].into_iter().chain([512]).collect::<Vec<_>>()
+        );
+        assert_covers(11264, &gate_up);
+    }
+
+    #[test]
+    fn few_tokens_widen_the_strip() {
+        // Przy jednym wierszu M cel jest szerszy niz drabina, wiec schodzimy do
+        // jej gornego konca — tego samego, co dawna tabela stalych kawalkow.
+        assert_eq!(plan(11264, 4096, 128).unwrap(), vec![4096, 4096, 3072]);
+        assert_eq!(
+            plan(14336, 4096, 128).unwrap(),
+            vec![4096, 4096, 4096, 2048]
+        );
+    }
+
+    #[test]
+    fn more_tokens_narrow_the_strip() {
+        // 2048 tokenow to 16 wierszy M, cel 768 — nie ma go w artefaktach, wiec
+        // idziemy W GORE do 1024 (64 bloki), nie w dol do 512 (32 bloki na
+        // 48 SM, zmierzone 641 ms wobec 362 ms).
+        let gate_up = plan(11264, 4096, 2048).unwrap();
+        assert_eq!(gate_up[0], 1024);
+        assert_covers(11264, &gate_up);
+    }
+
+    #[test]
+    fn missing_widths_round_up_to_the_committed_ladder() {
+        // Mistral ma tylko 4096 i 2048; cel 1536 nie ma pokrycia, wiec bierzemy
+        // najblizszy szerszy zamiast wracac do jednego wywolania.
+        let gate_up = plan(14336, 4096, 1024).unwrap();
+        assert_eq!(gate_up, vec![2048; 7]);
+    }
+
+    #[test]
+    fn shapes_without_strips_stay_on_the_base_kernel() {
+        // K/V (1024 kolumn) nie ma zadnej instancji wezszej od siebie.
+        assert!(plan(1024, 4096, 1024).is_none());
+        // `down` Mistrala (LDY=4096, K=14336) tez nie.
+        assert!(plan(4096, 14336, 1024).is_none());
+    }
+
+    #[test]
+    fn host_without_sm_count_disables_strips() {
+        assert!(fp8_strip_plan(4096, 4096, 1024, 0, |_| true).is_none());
+    }
 }
