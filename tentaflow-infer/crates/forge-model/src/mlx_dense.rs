@@ -600,7 +600,7 @@ impl MlxDense {
             k,
             &LaunchConfig {
                 grid: (gx, gy, 1),
-                block: (msl::QMV_THREADS, 1, 1),
+                block: (msl::QMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             },
             &LaunchArgs::new()

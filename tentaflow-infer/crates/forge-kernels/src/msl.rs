@@ -158,11 +158,23 @@ kernel void {name}(
 /// but cost a register per token per lane, and eight fits without spilling.
 pub const QMM_TILE: u32 = 8;
 
+/// Output rows one threadgroup carries, one SIMD group each.
+///
+/// This is the second knob, and it works on a different term than the tile.
+/// The tile decides how many tokens share one read of the weights; this decides
+/// how many output rows share one read of the ACTIVATIONS. At large batches the
+/// activation term is the one that dominates — with four rows a 512-token chunk
+/// re-reads its activations a thousand times over, which is exactly why the
+/// first version regressed there.
+pub const QMM_ROWS_PER_GROUP: u32 = 16;
+/// Threads per batched threadgroup: one SIMD group per output row.
+pub const QMM_THREADS: u32 = QMM_ROWS_PER_GROUP * 32;
+
 /// Entry-point name for the batched form.
 pub fn qmm_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
     format!(
         "qmm_affine_4bit_r{}t{}_{}_out{}",
-        QMV_ROWS_PER_GROUP,
+        QMM_ROWS_PER_GROUP,
         QMM_TILE,
         scales.suffix(),
         out.suffix()
@@ -172,7 +184,7 @@ pub fn qmm_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
 /// Grid for an output width and a token count. Two dimensions, both derived.
 pub fn qmm_affine_4bit_groups(n_rows: u32, n_tokens: u32) -> (u32, u32) {
     (
-        n_rows.div_ceil(QMV_ROWS_PER_GROUP),
+        n_rows.div_ceil(QMM_ROWS_PER_GROUP),
         n_tokens.div_ceil(QMM_TILE),
     )
 }
@@ -267,7 +279,7 @@ kernel void {name}(
         name = name,
         ty = ty,
         out_ty = out_ty,
-        rows = QMV_ROWS_PER_GROUP,
+        rows = QMM_ROWS_PER_GROUP,
         tile = QMM_TILE,
     )
 }

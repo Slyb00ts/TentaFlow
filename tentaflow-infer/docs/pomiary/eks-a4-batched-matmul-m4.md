@@ -15,13 +15,47 @@ msl_qmm_vs_mlx -- --ignored --nocapture`.
 
 ## Wynik
 
-| T | kafel | pętla GEMV | przyspieszenie |
+Geometria dobrana pomiarem, nie z góry: kafel 8 tokenów, 16 wierszy wyjścia na
+grupę roboczą (uzasadnienie obu liczb niżej).
+
+| T | kafel | na token | pętla GEMV | przyspieszenie |
+|---:|---:|---:|---:|---:|
+| 1 | 1148,6 us | 1148,6 us | 410,8 us | 0,36x |
+| 8 | 923,0 us | 115,4 us | 2308,9 us | **2,50x** |
+| 32 | 3435,0 us | 107,3 us | 8494,7 us | **2,47x** |
+| 64 | 7413,9 us | 115,8 us | 17074,5 us | **2,30x** |
+| 128 | 13902,8 us | 108,6 us | 40649,3 us | **2,92x** |
+| 192 | 26819,8 us | 139,7 us | 51282,2 us | 1,91x |
+| 256 | 50247,5 us | 196,3 us | 68665,1 us | 1,37x |
+
+Koszt na token jest płaski (107-116 us) do 128 tokenów i od 192 rośnie. Stąd
+kafel prefillu 128 — i stąd też wiadomo, że powyżej tej granicy problemem nie
+jest już odczyt wag.
+
+## Dwie liczby geometrii, obie zmierzone
+
+**Wierszy wyjścia na grupę roboczą: 16.** Kafel tokenów decyduje, ilu tokenów
+obsłuży jeden odczyt WAG; liczba wierszy decyduje, ile wierszy wyjścia obsłuży
+jeden odczyt AKTYWACJI. Przy dużych kaflach to drugie zaczyna dominować.
+
+| wiersze | T=32 | T=128 | T=512 |
 |---:|---:|---:|---:|
-| 1 | 1142,7 us | 344,4 us | 0,30x |
-| 8 | 719,2 us | 2097,9 us | **2,92x** |
-| 32 | 3839,6 us | 8402,3 us | **2,19x** |
-| 128 | 16345,6 us | 34150,8 us | **2,09x** |
-| 512 | 193624,7 us | 140221,2 us | 0,72x |
+| 4 | 2,19x | 2,09x | 0,72x |
+| 8 | 2,32x | 2,21x | 0,81x |
+| 16 | **2,47x** | **2,43x** | 1,25x |
+| 32 | 2,43x | 2,15x | 1,55x |
+
+32 wiersze wygrywają dopiero przy T=512, czyli poza naszym punktem pracy, i
+płacą za to przy 128. Wybrane 16.
+
+**Kafel tokenów: 8.** Większy kafel dzieli odczyt wag na więcej tokenów, więc
+„powinien" pomagać. Nie pomaga — akumulatory przestają się mieścić w rejestrach:
+
+| kafel | T=32 | T=128 |
+|---:|---:|---:|
+| 8 | **107 us/token** | **109 us/token** |
+| 16 | 204 us/token | 210 us/token |
+| 32 | 192 us/token | 199 us/token |
 
 ## Co z tego wynika
 
@@ -70,16 +104,20 @@ obroty, a one też przeszły na kafel. Bielik-7B 4-bit, prompt 256 tokenów,
 
 | ścieżka | czas | przepustowość |
 |---|---:|---:|
-| token po tokenie | 11,967 s | 21,4 tok/s |
-| kaflami po 128 | 4,553 s | **56,2 tok/s** |
+| token po tokenie | 11,769 s | 21,8 tok/s |
+| kaflami po 128 | 3,876 s | **66,0 tok/s** |
 
-Przyspieszenie **2,63x**, czyli więcej niż same 2,09x z izolowanego mnożenia —
-uwaga liczy teraz wszystkie zapytania kafla jednym wywołaniem, zamiast jednego
-na token.
+Przyspieszenie **3,04x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
+wywołaniem, zamiast jednego na token, więc całość zyskuje więcej niż samo
+mnożenie.
 
-Dekodowanie po prefillu: 18,4 tok/s. Cel z planu (§7.6) to 19 tok/s dla
-dekodowania i 175 tok/s dla prefillu, więc prefill jest po tym kroku na jednej
-trzeciej drogi, a nie u celu.
+Dekodowanie po prefillu: 20,4 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
+Cel prefillu to 175 tok/s, więc ta ścieżka jest na 38% drogi.
+
+Co zostało do wyjaśnienia: 109 us na token przy T=128 to 862 GFLOPS wobec
+zmierzonego szczytu 3,07 TFLOPS (28%) i wobec 28 us wynikających z samego ruchu
+wag. Ani jedno, ani drugie ograniczenie nie jest jeszcze osiągnięte, więc
+przyczyna leży gdzie indziej i nie zgaduję jej tutaj.
 
 Obie ścieżki wybierają ten sam token — sprawdza to asercja w samym pomiarze,
 bo inaczej porównywałby dwie różne prace.

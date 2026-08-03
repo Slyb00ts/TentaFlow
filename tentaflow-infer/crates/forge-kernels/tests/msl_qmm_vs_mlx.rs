@@ -174,7 +174,7 @@ fn batched_matmul_is_no_further_from_the_truth_than_mlx() {
                 &kernel,
                 &LaunchConfig {
                     grid: (gx, gy, 1),
-                    block: (msl::QMV_THREADS, 1, 1),
+                    block: (msl::QMM_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 },
                 &LaunchArgs::new()
@@ -257,7 +257,7 @@ fn the_batched_form_agrees_with_the_vector_form_bit_for_bit() {
             &mm_kernel,
             &LaunchConfig {
                 grid: (gx, gy, 1),
-                block: (msl::QMV_THREADS, 1, 1),
+                block: (msl::QMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             },
             &LaunchArgs::new()
@@ -360,7 +360,7 @@ fn how_much_the_tile_actually_buys() {
     let scales = g.upload(&vec![0x38u8; rows as usize * groups_per_row * 2]);
     let biases = g.upload(&vec![0x00u8; rows as usize * groups_per_row * 2]);
 
-    for &tokens in&[1u32, 8, 32, 128, 512] {
+    for &tokens in &[1u32, 8, 32, 64, 128, 192, 256] {
         let row = cols as usize * 2;
         let x = g.upload(&vec![0x3Cu8; tokens as usize * row]);
         let y = g
@@ -371,7 +371,7 @@ fn how_much_the_tile_actually_buys() {
         let (gx, gy) = msl::qmm_affine_4bit_groups(rows, tokens);
         let cfg_mm = LaunchConfig {
             grid: (gx, gy, 1),
-            block: (msl::QMV_THREADS, 1, 1),
+            block: (msl::QMM_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let args_mm = LaunchArgs::new()
@@ -419,8 +419,10 @@ fn how_much_the_tile_actually_buys() {
         let looped = t0.elapsed().as_secs_f64() / REPS as f64;
 
         eprintln!(
-            "T={tokens:4}: kafel {:8.1} us, pętla GEMV {:9.1} us, przyspieszenie {:5.2}x",
+            "T={tokens:4}: kafel {:8.1} us ({:6.1} us/token), pętla GEMV {:9.1} us, \
+             przyspieszenie {:5.2}x",
             batched * 1e6,
+            batched * 1e6 / tokens as f64,
             looped * 1e6,
             looped / batched
         );
