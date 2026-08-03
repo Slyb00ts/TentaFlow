@@ -306,16 +306,29 @@ kernel void {name}(
 
 /// Output block of the matrix-unit form: tokens, rows and depth per threadgroup.
 ///
-/// All three are 32 because the block is built from 8x8 fragments and four SIMD
-/// groups each take a 16x16 quarter of it. Changing one changes that division.
-pub const QMG_BLOCK: u32 = 32;
-/// Four SIMD groups, one 16x16 quarter of the output block each.
-pub const QMG_THREADS: u32 = 128;
+/// Swept, not chosen: at a full prefill chunk 32x64x32 costs 39.6 us per token
+/// against 50.0 for 32x32x32, 41.3 for 64x32x32 and 47.0 for 64x64x32. Wider
+/// than 64 rows stops paying and starts costing threadgroup memory.
+pub const QMG_BM: u32 = 32;
+pub const QMG_BN: u32 = 64;
+pub const QMG_BK: u32 = 32;
+/// Block of the token axis, which is the batch a caller must reach to use this.
+pub const QMG_BLOCK: u32 = QMG_BM;
+
+/// How the SIMD groups divide the block: tokens by rows.
+///
+/// Also swept. Two groups instead of four load fewer fragments per multiply but
+/// lose more to having less to run: 49.4 us per token against 39.2.
+pub const QMG_SG_M: u32 = 1;
+pub const QMG_SG_N: u32 = 4;
+pub const QMG_THREADS: u32 = QMG_SG_M * QMG_SG_N * 32;
 
 pub fn qmg_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
     format!(
-        "qmg_affine_4bit_b{}_{}_out{}",
-        QMG_BLOCK,
+        "qmg_affine_4bit_m{}n{}k{}_{}_out{}",
+        QMG_BM,
+        QMG_BN,
+        QMG_BK,
         scales.suffix(),
         out.suffix()
     )
@@ -323,20 +336,20 @@ pub fn qmg_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
 
 /// Grid for the matrix-unit form.
 pub fn qmg_affine_4bit_groups(n_rows: u32, n_tokens: u32) -> (u32, u32) {
-    (n_rows / QMG_BLOCK, n_tokens.div_ceil(QMG_BLOCK))
+    (n_rows.div_ceil(QMG_BN), n_tokens.div_ceil(QMG_BM))
 }
 
 /// Whether a shape can use the matrix-unit form at all.
 pub fn qmg_fits(n_rows: u32, n_cols: u32) -> bool {
-    n_rows % QMG_BLOCK == 0 && n_cols % QMG_BLOCK == 0
+    n_rows % QMG_BN == 0 && n_cols % QMG_BK == 0
 }
 
 /// Fused dequantize + matrix product on the SIMD matrix units.
 ///
 /// The weight block is dequantized ONCE into threadgroup memory and then feeds
 /// every token fragment in the block. That is what makes unpacking affordable:
-/// against a 32-token block, the cost of turning nibbles into halves is divided
-/// by 32 instead of being paid per token.
+/// against a block of tokens, the cost of turning nibbles into halves is
+/// divided by the block instead of being paid per token.
 ///
 /// The accumulation order is NOT the one the vector form uses — the matrix unit
 /// sums its own way — so this kernel is not bit-comparable with decode. It is
@@ -346,6 +359,36 @@ pub fn qmg_affine_4bit_source(scales: ScaleDtype, out: OutDtype) -> String {
     let ty = scales.msl();
     let out_ty = out.msl();
     let name = qmg_affine_4bit_name(scales, out);
+    let (fm, fn_) = (QMG_BM / QMG_SG_M / 8, QMG_BN / QMG_SG_N / 8);
+    let stage_halfs = QMG_BM * QMG_BK + QMG_BK * QMG_BN;
+
+    // Wynik przechodzi przez pamiec grupy roboczej, w obu wariantach wyjscia.
+    // Zapis wprost z jednostki macierzowej probowano: `simdgroup_store` do
+    // pamieci urzadzenia rozrzuca osiem wierszy co `n_rows`, i mimo mniejszego
+    // zuzycia pamieci grupy roboczej wychodzi wolniej (40,9 wobec 39,2 us na
+    // token). Half i tak nie umie tam trafic, bo cel musi byc typu akumulatora.
+    let floats = stage_halfs.div_ceil(2).max(QMG_BM * QMG_BN);
+    let epilogue = format!(
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \x20   for (uint i = 0; i < {fm}u; ++i) {{\n\
+         \x20       for (uint j = 0; j < {fn}u; ++j) {{\n\
+         \x20           simdgroup_store(\n\
+         \x20               acc[i][j], cs + (sg_tok + i * 8u) * {bn}u + sg_row + j * 8u, {bn}u);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \x20   for (uint i = tid; i < {bm}u * {bn}u; i += {threads}u) {{\n\
+         \x20       const uint t = tok0 + i / {bn}u;\n\
+         \x20       if (t < n_tokens) {{ y[t * n_rows + row0 + i % {bn}u] = {out_ty}(cs[i]); }}\n\
+         \x20   }}",
+        fm = fm,
+        fn = fn_,
+        bm = QMG_BM,
+        bn = QMG_BN,
+        threads = QMG_THREADS,
+        out_ty = out_ty
+    );
+
     format!(
         r#"
 #include <metal_stdlib>
@@ -366,38 +409,35 @@ kernel void {name}(
     uint  sg   [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
 {{
-    const uint B = {block}u;
     const uint tid  = sg * 32u + lane;
-    const uint row0 = tgid.x * B;
-    const uint tok0 = tgid.y * B;
+    const uint row0 = tgid.x * {bn}u;
+    const uint tok0 = tgid.y * {bm}u;
 
     const uint words_per_row  = n_cols / 8u;
     const uint groups_per_row = n_cols / group;
 
-    // Jedna tablica na wszystko: w pętli po K trzyma aktywacje i rozpakowane
-    // wagi (po 2 KB), a po niej wynik bloku w f32 (4 KB). Bez tego nałożenia
-    // kernel zajmowałby 8 KB pamięci grupy roboczej zamiast 4, a zajętość jest
-    // tu wielkością zmierzoną, nie teoretyczną.
-    threadgroup float cs[{block}u * {block}u];
+    // Jedna tablica na wszystko: w petli po K trzyma aktywacje i rozpakowane
+    // wagi, a po niej — o ile wyjscie tego wymaga — wynik bloku w f32.
+    threadgroup float cs[{floats}u];
     threadgroup half* xs = (threadgroup half*)cs;
-    threadgroup half* ws = xs + {block}u * {block}u;
+    threadgroup half* ws = xs + {bm}u * {bk}u;
 
-    // Ćwiartka 16x16 bloku na grupę SIMD, czyli cztery fragmenty 8x8.
-    const uint sg_tok = (sg >> 1) * 16u;
-    const uint sg_row = (sg & 1u) * 16u;
-    simdgroup_matrix<float, 8, 8> acc[2][2];
-    for (uint i = 0; i < 2u; ++i) {{
-        for (uint j = 0; j < 2u; ++j) {{ acc[i][j] = simdgroup_matrix<float, 8, 8>(0); }}
+    // Wycinek bloku na grupe SIMD.
+    const uint sg_tok = (sg / {sg_n}u) * {sub_bm}u;
+    const uint sg_row = (sg % {sg_n}u) * {sub_bn}u;
+    simdgroup_matrix<float, 8, 8> acc[{fm}][{fn}];
+    for (uint i = 0; i < {fm}u; ++i) {{
+        for (uint j = 0; j < {fn}u; ++j) {{ acc[i][j] = simdgroup_matrix<float, 8, 8>(0); }}
     }}
 
-    for (uint k0 = 0; k0 < n_cols; k0 += B) {{
+    for (uint k0 = 0; k0 < n_cols; k0 += {bk}u) {{
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Wagi: jeden wątek na parę (wiersz, słowo). 32 wiersze po 4 słowa to
-        // dokładnie 128 wątków, więc rozpakowanie nie ma ani pętli, ani reszty.
-        {{
-            const uint n_local = tid / 4u;
-            const uint w_local = tid % 4u;
+        // Wagi: jeden przebieg na pare (wiersz, slowo), bo slowo to dokladnie
+        // osiem rozpakowanych wartosci i nie ma reszty do dosprzatania.
+        for (uint p = tid; p < {bn}u * {bk}u / 8u; p += {threads}u) {{
+            const uint n_local = p / ({bk}u / 8u);
+            const uint w_local = p % ({bk}u / 8u);
             const uint rr   = row0 + n_local;
             const uint col  = k0 + w_local * 8u;
             const uint bits = packed[rr * words_per_row + col / 8u];
@@ -405,53 +445,50 @@ kernel void {name}(
             const float bi  = float(biases[rr * groups_per_row + col / group]);
             for (uint j = 0; j < 8u; ++j) {{
                 const float q = float((bits >> (j * 4u)) & 0xFu);
-                ws[(w_local * 8u + j) * B + n_local] = half(fma(q, sc, bi));
+                ws[(w_local * 8u + j) * {bn}u + n_local] = half(fma(q, sc, bi));
             }}
         }}
-        // Aktywacje: token poza wsadem wskazuje na ostatni, a jego wynik i tak
-        // trafia w dopełnienie bufora wyjściowego.
-        for (uint i = tid; i < B * B; i += {threads}u) {{
-            const uint t = i / B;
-            const uint c = i % B;
-            xs[t * B + c] = x[min(tok0 + t, n_tokens - 1u) * n_cols + k0 + c];
+        // Aktywacje: token poza wsadem wskazuje na ostatni.
+        for (uint i = tid; i < {bm}u * {bk}u; i += {threads}u) {{
+            const uint t = i / {bk}u;
+            const uint c = i % {bk}u;
+            xs[t * {bk}u + c] = x[min(tok0 + t, n_tokens - 1u) * n_cols + k0 + c];
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint kk = 0; kk < B; kk += 8u) {{
-            simdgroup_matrix<half, 8, 8> a0, a1, b0, b1;
-            simdgroup_load(a0, xs + (sg_tok + 0u) * B + kk, B);
-            simdgroup_load(a1, xs + (sg_tok + 8u) * B + kk, B);
-            simdgroup_load(b0, ws + kk * B + sg_row + 0u, B);
-            simdgroup_load(b1, ws + kk * B + sg_row + 8u, B);
-            simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
-            simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
-            simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
-            simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+        for (uint kk = 0; kk < {bk}u; kk += 8u) {{
+            simdgroup_matrix<half, 8, 8> a[{fm}], b[{fn}];
+            for (uint i = 0; i < {fm}u; ++i) {{
+                simdgroup_load(a[i], xs + (sg_tok + i * 8u) * {bk}u + kk, {bk}u);
+            }}
+            for (uint j = 0; j < {fn}u; ++j) {{
+                simdgroup_load(b[j], ws + kk * {bn}u + sg_row + j * 8u, {bn}u);
+            }}
+            for (uint i = 0; i < {fm}u; ++i) {{
+                for (uint j = 0; j < {fn}u; ++j) {{
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                }}
+            }}
         }}
     }}
 
-    // Wynik przez pamięć grupy roboczej, bo `simdgroup_store` wymaga celu tego
-    // samego typu co akumulator, a wyjście bywa half. Przy okazji zapis idzie
-    // przez zwykłe wątki, więc tokeny poza wsadem można po prostu pominąć —
-    // kernel nie wymaga dopełnionego bufora wyjściowego.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = 0; i < 2u; ++i) {{
-        for (uint j = 0; j < 2u; ++j) {{
-            simdgroup_store(acc[i][j], cs + (sg_tok + i * 8u) * B + sg_row + j * 8u, B);
-        }}
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < B * B; i += {threads}u) {{
-        const uint t = tok0 + i / B;
-        if (t < n_tokens) {{ y[t * n_rows + row0 + i % B] = {out_ty}(cs[i]); }}
-    }}
+{epilogue}
 }}
 "#,
         name = name,
         ty = ty,
         out_ty = out_ty,
-        block = QMG_BLOCK,
+        bm = QMG_BM,
+        bn = QMG_BN,
+        bk = QMG_BK,
+        sg_n = QMG_SG_N,
+        sub_bm = QMG_BM / QMG_SG_M,
+        sub_bn = QMG_BN / QMG_SG_N,
+        fm = fm,
+        fn = fn_,
+        floats = floats,
         threads = QMG_THREADS,
+        epilogue = epilogue,
     )
 }
 

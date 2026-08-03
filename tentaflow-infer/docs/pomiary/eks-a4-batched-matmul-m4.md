@@ -133,15 +133,45 @@ roboczej**, po czym ten sam rozpakowany blok karmi wszystkie fragmenty tokenów.
 Przy bloku 32 tokenów koszt rozpakowania nibbli dzieli się przez 32 zamiast być
 płacony na token.
 
-Blok 32x32x32, cztery grupy SIMD po ćwiartce 16x16, akumulator f32:
+Blok i podział na grupy SIMD są **przemierzone**, nie dobrane z góry (T=128):
+
+| blok BMxBNxBK | us/token |
+|---|---:|
+| 32x32x32 | 50,0 |
+| 64x32x32 | 41,3 |
+| 32x32x64 | 43,0 |
+| 64x64x32 | 47,0 |
+| 32x128x32 | 39,1 |
+| **32x64x32** | **39,6** |
+
+| podział grup SIMD (tokeny x wiersze) | us/token |
+|---|---:|
+| 2x2 (128 wątków) | 39,7 |
+| 1x2 (64 wątki) | 49,4 |
+| 2x1 (64 wątki) | 49,0 |
+| 2x4 (256 wątków) | 41,0 |
+| **1x4 (128 wątków)** | **39,2** |
+
+Mniej grup SIMD to więcej fragmentów na grupę, czyli więcej mnożeń na jeden
+odczyt — i mimo to 64 wątki przegrywają wyraźnie: brak równoległości kosztuje
+więcej, niż daje lepszy stosunek.
+
+Trzy rzeczy, które przy tym kernelu NIE pomogły, wszystkie sprawdzone:
+dopełnienie kroku wiersza wag przeciw konfliktom banków (39,7 wobec 39,6),
+transponowane wystawianie wagi z ciągłym zapisem (40,6), oraz zapis wyniku
+wprost z jednostki macierzowej zamiast przez pamięć grupy roboczej (40,9) —
+to ostatnie dlatego, że `simdgroup_store` do pamięci urządzenia rozrzuca osiem
+wierszy co `n_rows`, a droga przez pamięć wspólną ten zapis skleja.
+
+Blok 32x64x32, cztery grupy SIMD w układzie 1x4, akumulator f32:
 
 | T | macierzowo | blokowo | pętla GEMV |
 |---:|---:|---:|---:|
 | 1 | 1375,7 us/token | 1016,8 us/token | 344,3 us |
 | 8 | 176,7 us/token | **79,7 us/token** | 266,1 us/token |
 | 32 | 58,5 us/token | 74,1 us/token | 263,6 us/token |
-| 128 | **50,0 us/token** | 73,0 us/token | 259,9 us/token |
-| 256 | 52,0 us/token | 72,7 us/token | 261,4 us/token |
+| 128 | **38,7 us/token** | 72,2 us/token | 262,3 us/token |
+| 256 | 37,4 us/token | 73,0 us/token | 270,3 us/token |
 
 Poniżej pełnego bloku forma macierzowa przegrywa — przy 8 tokenach zostawia
 trzy czwarte bloku pustych. Stąd trzy formy z ZMIERZONYMI zakresami: wektorowa
@@ -173,18 +203,22 @@ obroty, a one też przeszły na kafel. Bielik-7B 4-bit, prompt 256 tokenów,
 
 | ścieżka | czas | przepustowość |
 |---|---:|---:|
-| token po tokenie | 11,748 s | 21,8 tok/s |
-| kaflami po 128 | 1,882 s | **136,0 tok/s** |
+| token po tokenie | 11,541 s | 22,2 tok/s |
+| kaflami po 128 | 1,614 s | **158,6 tok/s** |
 
-Przyspieszenie **6,24x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
+Przyspieszenie **7,15x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
 wywołaniem, zamiast jednego na token, więc całość zyskuje więcej niż samo
 mnożenie.
 
-Dekodowanie po prefillu: 19,7 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
-Cel prefillu to 175 tok/s, więc ta ścieżka jest na 78% drogi.
+Dekodowanie po prefillu: 19,1 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
+Cel prefillu to 175 tok/s, więc ta ścieżka jest na 91% drogi.
 
-Gdzie jest sufit teraz: 50,0 us na token przy T=128 to 1,84 TFLOPS wobec
-zmierzonych 3,94 TFLOPS dla jednostki macierzowej, czyli 47%.
+Gdzie jest sufit teraz: 38,7 us na token przy T=128 to 2,38 TFLOPS wobec
+zmierzonych 3,94 TFLOPS dla jednostki macierzowej, czyli 60%. Model liczy przy
+tym 2,26 TFLOPS, czyli **96% czasu prefillu to same mnożenia** — uwaga,
+normalizacje, obroty i reszta warstwy mieszczą się w pozostałych czterech
+procentach. Dalsze przyspieszenie prefillu musi więc przyjść z tego kernela,
+a nie znikąd indziej.
 
 Obie ścieżki wybierają ten sam token — sprawdza to asercja w samym pomiarze,
 bo inaczej porównywałby dwie różne prace.
