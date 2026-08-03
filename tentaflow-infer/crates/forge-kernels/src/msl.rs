@@ -883,6 +883,277 @@ kernel void {name}(
     )
 }
 
+/// Queries carried by one threadgroup of the blocked attention kernel.
+pub const FLASH_BQ: u32 = 32;
+/// Keys processed per inner step.
+pub const FLASH_BK: u32 = 32;
+/// Four SIMD groups, eight queries each.
+pub const FLASH_THREADS: u32 = 128;
+/// How far, in log2 units, the running maximum may drift before the output
+/// accumulator is rescaled. FlashAttention-4's idea; the threshold matters more
+/// here than there, because a Metal fragment cannot be scaled in place.
+pub const FLASH_TAU: u32 = 14;
+
+pub fn flash_attn_name(head_dim: u32) -> String {
+    format!("flash_attn_prefill_d{head_dim}")
+}
+
+/// One threadgroup per (head, block of queries).
+pub fn flash_attn_groups(heads: u32, tokens: u32) -> u32 {
+    heads * tokens.div_ceil(FLASH_BQ)
+}
+
+/// Whether a batch is worth the blocked form. Below a full block of queries it
+/// would leave most of the block idle, and the per-token kernel wins.
+pub fn flash_fits(tokens: u32, head_dim: u32) -> bool {
+    tokens >= FLASH_BQ && head_dim % 8 == 0
+}
+
+/// Blocked attention on the SIMD matrix units, for prefill.
+///
+/// The per-token kernel next door computes one query at a time, each thread
+/// walking a whole key row scalar by scalar: measured at 0.41 TFLOPS and 52 ms
+/// of a 1226 ms prefill. Here both products are matrix operations — Q·Kᵀ and
+/// P·V — with the same tiling and online maximum that FlashAttention describes.
+///
+/// TWO PASSES over the keys, not one. The single-pass form has to rescale the
+/// output accumulator whenever the running maximum moves, and a Metal
+/// `simdgroup_matrix` is opaque: scaling it means storing it to threadgroup
+/// memory and loading it back. FlashAttention-4 makes that rescale rare with a
+/// threshold, which is the right answer where the accumulator lives in tensor
+/// memory; here the cheaper trade is to find the maximum first and then build
+/// the probabilities against a fixed one. It costs Q·Kᵀ twice — and Q·Kᵀ is
+/// half the arithmetic and now runs on the matrix units.
+///
+/// The exponent goes through `exp2` with `log2(e)` folded into the scale, so
+/// the change of base costs nothing. FlashAttention-4 goes further and computes
+/// it as a polynomial on the FMA units, because on Blackwell the tensor cores
+/// outran the exponential unit by an order of magnitude. On this machine the
+/// matrix instruction beats plain FMA by 1.28x (EKS-A2), so that asymmetry does
+/// not exist and neither does the reason for the polynomial.
+pub fn flash_attn_source(head_dim: u32) -> String {
+    let name = flash_attn_name(head_dim);
+    format!(
+        r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void {name}(
+    device half*         out        [[buffer(0)]],
+    device const half*   q          [[buffer(1)]],
+    device const half*   k          [[buffer(2)]],
+    device const half*   v          [[buffer(3)]],
+    constant uint&       n_heads    [[buffer(4)]],
+    constant uint&       n_kv_heads [[buffer(5)]],
+    constant uint&       seq        [[buffer(6)]],
+    constant uint&       seq_cap    [[buffer(7)]],
+    constant float&      scale      [[buffer(8)]],
+    constant uint&       n_tokens   [[buffer(9)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{{
+    const uint dim = {dim}u;
+    const uint BQ  = {bq}u;
+    const uint BK  = {bk}u;
+    const uint blocks_q = (n_tokens + BQ - 1u) / BQ;
+    const uint head = tgid.x / blocks_q;
+    const uint qb   = tgid.x % blocks_q;
+    if (head >= n_heads || seq > seq_cap) {{ return; }}
+    const uint kv_head = head / (n_heads / n_kv_heads);
+    const uint tid = sg * 32u + lane;
+
+    const uint q0 = qb * BQ;
+    // Pozycja bezwzgledna zapytania: kafel siedzi na koncu kontekstu.
+    const uint base_pos = seq - n_tokens;
+
+    device const half* qh = q + head * dim;          // krok wiersza: n_heads*dim
+    device const half* kh = k + kv_head * seq_cap * dim;
+    device const half* vh = v + kv_head * seq_cap * dim;
+    const uint q_stride = n_heads * dim;
+
+    // Ten bufor sluzy dwóm rzeczom: wynikom Q·Kᵀ w petli i zapisowi wyjscia po
+    // niej. To drugie potrzebuje osmiu zapytan po `dim` kanalow, wiec rozmiar
+    // jest MAKSIMUM z obu — przy malym bloku kluczy sam iloczyn by wystarczyl,
+    // a wyjscie pisaloby poza tablice.
+    threadgroup float sbuf[{sbuf}u];
+    threadgroup half  pbuf[{bq}u * {bk}u];
+    threadgroup float mbuf[{bq}u];
+    threadgroup float lbuf[{bq}u];
+    // Redukcja czastkowa: kazdy wiersz zapytania obsluguja CZTERY watki, po
+    // osmiu kluczach kazdy. Przy jednym watku na wiersz pracowala jedna grupa
+    // SIMD z czterech, a lancuch exp2 byl czterokrotnie dluzszy.
+    threadgroup float rmax[{bq}u * 4u];
+    threadgroup float rsum[{bq}u * 4u];
+    threadgroup float fbuf[{bq}u];
+    threadgroup float obuf[8u * {dim}u];
+    threadgroup uint  flag[1];
+
+    const uint sg_q = sg * 8u;                        // osiem zapytan tej grupy
+    const uint my_q = q0 + tid;                       // wiersz obslugiwany w redukcjach
+    const uint my_pos = base_pos + my_q;
+    const uint my_len = my_q < n_tokens ? my_pos + 1u : 0u;
+
+    // Skala z wpisanym log2(e): dalej wystarczy exp2.
+    const float scale2 = scale * 1.4426950408889634f;
+
+    if (tid < BQ) {{ mbuf[tid] = -INFINITY; lbuf[tid] = 0.0f; }}
+    if (tid == 0u) {{ flag[0] = 0u; }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+
+    // Najdluzszy wiersz w bloku wyznacza, ile blokow kluczy trzeba przejsc.
+    const uint last_q = min(q0 + BQ, n_tokens) - 1u;
+    const uint len_max = base_pos + last_q + 1u;
+
+    simdgroup_matrix<float, 8, 8> oacc[{d_frags}];
+    for (uint d = 0; d < {d_frags}u; ++d) {{ oacc[d] = simdgroup_matrix<float, 8, 8>(0); }}
+
+    for (uint j0 = 0; j0 < len_max; j0 += BK) {{
+        simdgroup_matrix<float, 8, 8> sacc[{bk_frags}];
+        for (uint n = 0; n < {bk_frags}u; ++n) {{ sacc[n] = simdgroup_matrix<float, 8, 8>(0); }}
+        for (uint c = 0; c < dim; c += 8u) {{
+            simdgroup_matrix<half, 8, 8> qf, kf;
+            simdgroup_load(qf, qh + (q0 + sg_q) * q_stride + c, q_stride);
+            for (uint n = 0; n < {bk_frags}u; ++n) {{
+                simdgroup_load(kf, kh + (j0 + n * 8u) * dim + c, dim, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sacc[n], qf, kf, sacc[n]);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint n = 0; n < {bk_frags}u; ++n) {{
+            simdgroup_store(sacc[n], sbuf + sg_q * BK + n * 8u, BK);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Maksimum bloku, liczone przez CZTERY watki na wiersz zapytania. Przy
+        // jednym pracowala jedna grupa SIMD z czterech, a lancuch exp2 byl
+        // czterokrotnie dluzszy.
+        const uint qrow = tid % BQ;
+        const uint part = tid / BQ;
+        const uint q_len = q0 + qrow < n_tokens ? base_pos + q0 + qrow + 1u : 0u;
+        const uint here = min(BK, q_len > j0 ? q_len - j0 : 0u);
+        const uint n_lo = part * (BK / 4u);
+        const uint n_hi = min(n_lo + BK / 4u, here);
+        {{
+            float bm = -INFINITY;
+            for (uint n = n_lo; n < n_hi; ++n) {{
+                bm = max(bm, sbuf[qrow * BK + n] * scale2);
+            }}
+            rmax[qrow * 4u + part] = bm;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Przeskalowanie WARUNKOWE — pomysl z FlashAttention-4. Akumulator
+        // zostaje w starej bazie, dopoki nowe maksimum nie przerosnie jej o
+        // wiecej niz {tau} w skali log2; do tego progu wykladniki mieszcza sie
+        // bez ryzyka. Tutaj to oszczedza wiecej niz na Blackwellu: fragment
+        // Metala jest NIEPRZEZROCZYSTY, wiec kazde przeskalowanie oznacza
+        // przepuszczenie calego akumulatora przez pamiec grupy roboczej.
+        if (tid < BQ) {{
+            float bm = rmax[tid * 4u];
+            for (uint g = 1u; g < 4u; ++g) {{ bm = max(bm, rmax[tid * 4u + g]); }}
+            const float m_old = mbuf[tid];
+            const bool need = m_old == -INFINITY || bm > m_old + {tau}.0f;
+            const float m_new = need ? max(m_old, bm) : m_old;
+            fbuf[tid] = m_old == -INFINITY ? 0.0f : exp2(m_old - m_new);
+            mbuf[tid] = m_new;
+            if (need) {{ flag[0] = 1u; }}
+        }}
+        if (tid == 0u && j0 == 0u) {{ flag[0] = 1u; }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (flag[0] != 0u) {{
+            for (uint g = 0; g < 4u; ++g) {{
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == g) {{
+                    for (uint d = 0; d < {d_frags}u; ++d) {{
+                        simdgroup_store(oacc[d], obuf + d * 8u, dim);
+                    }}
+                }}
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint i = tid; i < 8u * dim; i += {threads}u) {{
+                    obuf[i] *= fbuf[g * 8u + i / dim];
+                }}
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == g) {{
+                    for (uint d = 0; d < {d_frags}u; ++d) {{
+                        simdgroup_load(oacc[d], obuf + d * 8u, dim);
+                    }}
+                }}
+            }}
+            if (tid < BQ) {{ lbuf[tid] *= fbuf[tid]; }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {{ flag[0] = 0u; }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Prawdopodobienstwa w BIEZACEJ bazie. Maska przyczynowa przez zero, a
+        // nie przez minus nieskonczonosc: to samo, a exp2 nie widzi NaN.
+        {{
+            const float m = mbuf[qrow];
+            float bl = 0.0f;
+            for (uint n = part * (BK / 4u); n < (part + 1u) * (BK / 4u); ++n) {{
+                const float e =
+                    n < here ? exp2(sbuf[qrow * BK + n] * scale2 - m) : 0.0f;
+                pbuf[qrow * BK + n] = half(e);
+                bl += e;
+            }}
+            rsum[qrow * 4u + part] = bl;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < BQ) {{
+            float bl = 0.0f;
+            for (uint g = 0; g < 4u; ++g) {{ bl += rsum[tid * 4u + g]; }}
+            lbuf[tid] += bl;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint n = 0; n < {bk_frags}u; ++n) {{
+            simdgroup_matrix<half, 8, 8> pf, vf;
+            simdgroup_load(pf, pbuf + sg_q * BK + n * 8u, BK);
+            for (uint d = 0; d < {d_frags}u; ++d) {{
+                simdgroup_load(vf, vh + (j0 + n * 8u) * dim + d * 8u, dim);
+                simdgroup_multiply_accumulate(oacc[d], pf, vf, oacc[d]);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    // Wyjscie grupa po grupie przez bufor wspolny: `simdgroup_store` wymaga celu
+    // typu akumulatora, a wyjscie jest w half. Osiem zapytan po `dim` kanalow to
+    // dokladnie tyle floatow, ile ma `sbuf`, wiec nie trzeba nowej pamieci.
+    for (uint g = 0; g < 4u; ++g) {{
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == g) {{
+            for (uint d = 0; d < {d_frags}u; ++d) {{
+                simdgroup_store(oacc[d], sbuf + d * 8u, dim);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 8u * dim; i += {threads}u) {{
+            const uint qi = g * 8u + i / dim;
+            if (q0 + qi < n_tokens) {{
+                out[(q0 + qi) * q_stride + head * dim + i % dim] =
+                    half(sbuf[i] / lbuf[qi]);
+            }}
+        }}
+    }}
+}}
+"#,
+        name = name,
+        dim = head_dim,
+        bq = FLASH_BQ,
+        bk = FLASH_BK,
+        bk_frags = FLASH_BK / 8,
+        sbuf = (FLASH_BQ * FLASH_BK).max(8 * head_dim),
+        tau = FLASH_TAU,
+        d_frags = head_dim / 8,
+        threads = FLASH_THREADS,
+    )
+}
+
 /// One threadgroup per (token, head). Derived so a caller cannot size the grid
 /// for a batch the kernel was not given.
 pub fn attn_groups(heads: u32, tokens: u32) -> u32 {

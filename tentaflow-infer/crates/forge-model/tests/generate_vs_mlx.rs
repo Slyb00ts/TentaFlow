@@ -264,11 +264,18 @@ fn how_fast_a_prompt_goes_through() {
     };
     let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
 
+    // Długość promptu z otoczenia, żeby dało się porównać z MLX na tej samej
+    // skali. Prefill jest ograniczony obliczeniami, a wydajność mnożenia rośnie
+    // z liczbą tokenów w kaflu, więc jedna długość nie opisuje ścieżki.
+    let want: usize = std::env::var("FORGE_BENCH_PROMPT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
     let mut prompt = Vec::new();
-    while prompt.len() < 256 {
+    while prompt.len() < want {
         prompt.extend_from_slice(&oracle.prompt_ids);
     }
-    prompt.truncate(256);
+    prompt.truncate(want);
 
     // Rozgrzewka i mediana, jak po stronie MLX. Pojedynczy zimny przebieg
     // mierzy rezydencję wag i kompilację kerneli, a nie kernel — i porównanie

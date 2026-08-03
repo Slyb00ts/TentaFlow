@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use forge_hal::metal_device::MetalDevice;
-use forge_hal::{Device, LaunchArgs, LaunchConfig, Pool};
+use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool};
 use forge_kernels::msl;
 use forge_types::MemKind;
 
@@ -274,4 +274,162 @@ fn a_length_past_the_cache_capacity_is_refused() {
         raw.iter().all(|b| *b == 0),
         "kernel powinien odmówić i nie dotknąć wyjścia"
     );
+}
+
+/// Forma blokowa wobec formy per-token, na wsadzie zapytań.
+///
+/// Ta druga jest przypięta do MLX testem wyżej, więc zgodność z nią domyka
+/// łańcuch bez drugiej wyroczni. Porównanie jest przy tym mocniejsze niż
+/// „obie dają coś sensownego": obie liczą maskę przyczynową, więc rozjazd o
+/// jedną pozycję w masce zmienia wynik dla każdego zapytania osobno.
+#[test]
+fn blocked_attention_agrees_with_the_per_token_form() {
+    let Ok(dev) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let stream = dev.create_stream().unwrap();
+
+    const DIM: u32 = 128;
+    const HEADS: u32 = 32;
+    const KV_HEADS: u32 = 8;
+    const TOKENS: u32 = 96; // celowo NIE wielokrotność bloku 32... jest; patrz niżej
+    const CAP: u32 = 256;
+    let seq = TOKENS;
+    let scale = 1.0f32 / (DIM as f32).sqrt();
+
+    // Dane pseudolosowe, deterministyczne: liczby mają być różne i skończone,
+    // a nie realistyczne — maskę i układ sprawdza porównanie, nie rozkład.
+    let mut state = 0x2026_0803u32;
+    let mut next = || {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((state >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 2.0
+    };
+    let to_h = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|x| half::f16::from_f32(*x).to_bits().to_le_bytes())
+            .collect()
+    };
+
+    let q_host: Vec<f32> = (0..(TOKENS * HEADS * DIM) as usize).map(|_| next()).collect();
+    let mut k_host = vec![0f32; (KV_HEADS * CAP * DIM) as usize];
+    let mut v_host = vec![0f32; (KV_HEADS * CAP * DIM) as usize];
+    for h in 0..KV_HEADS as usize {
+        for t in 0..TOKENS as usize {
+            for d in 0..DIM as usize {
+                k_host[(h * CAP as usize + t) * DIM as usize + d] = next();
+                v_host[(h * CAP as usize + t) * DIM as usize + d] = next();
+            }
+        }
+    }
+
+    let up = |bytes: &[u8]| {
+        let b = dev
+            .alloc(bytes.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        dev.write(bytes, &b, 0).unwrap();
+        b
+    };
+    let q = up(&to_h(&q_host));
+    let k = up(&to_h(&k_host));
+    let v = up(&to_h(&v_host));
+    let out_len = (TOKENS * HEADS * DIM) as usize;
+    let out_a = dev
+        .alloc(out_len * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let out_b = dev
+        .alloc(out_len * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+
+    let args = |o: &DevBuffer| {
+        LaunchArgs::new()
+            .buf(o)
+            .buf(&q)
+            .buf(&k)
+            .buf(&v)
+            .scalar(HEADS)
+            .scalar(KV_HEADS)
+            .scalar(seq)
+            .scalar(CAP)
+            .scalar(scale)
+            .scalar(TOKENS)
+    };
+
+    let per_token = dev
+        .load_module(msl::attn_decode_source(DIM).as_bytes())
+        .unwrap()
+        .kernel(&msl::attn_decode_name(DIM))
+        .unwrap();
+    dev.launch(
+        &per_token,
+        &LaunchConfig {
+            grid: (msl::attn_groups(HEADS, TOKENS), 1, 1),
+            block: (msl::ATTN_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &args(&out_a),
+        &stream,
+    )
+    .unwrap();
+
+    assert!(msl::flash_fits(TOKENS, DIM));
+    let blocked = dev
+        .load_module(msl::flash_attn_source(DIM).as_bytes())
+        .unwrap()
+        .kernel(&msl::flash_attn_name(DIM))
+        .unwrap();
+    dev.launch(
+        &blocked,
+        &LaunchConfig {
+            grid: (msl::flash_attn_groups(HEADS, TOKENS), 1, 1),
+            block: (msl::FLASH_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &args(&out_b),
+        &stream,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let read = |b: &DevBuffer| -> Vec<f32> {
+        let mut raw = vec![0u8; out_len * 2];
+        dev.read(b, 0, &mut raw).unwrap();
+        raw.chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_le_bytes(c.try_into().unwrap())).to_f32())
+            .collect()
+    };
+    let a = read(&out_a);
+    let b = read(&out_b);
+
+    // Per token, nie na całości: błąd w jednym zapytaniu — na przykład w tym,
+    // które jako jedyne widzi cały kontekst — ginie w normie po wszystkich.
+    let mut worst = 0f64;
+    for t in 0..TOKENS as usize {
+        let lo = t * (HEADS * DIM) as usize;
+        let hi = lo + (HEADS * DIM) as usize;
+        let num: f64 = a[lo..hi]
+            .iter()
+            .zip(&b[lo..hi])
+            .map(|(x, y)| (*x as f64 - *y as f64).powi(2))
+            .sum();
+        let den: f64 = a[lo..hi].iter().map(|x| (*x as f64).powi(2)).sum();
+        let rel = (num / den.max(1e-30)).sqrt();
+        worst = worst.max(rel);
+        assert!(
+            rel < 3e-3,
+            "token {t}: forma blokowa odbiega od per-token o {rel:.3e}"
+        );
+    }
+    eprintln!("największa różnica na token: {worst:.3e}");
+
+    // Kontrola samego porównania: bez maski przyczynowej ostatni token nic by
+    // nie zmienił, a pierwszy — wszystko. Sprawdzamy, że wyniki NIE są stałe.
+    let first = &a[0..(HEADS * DIM) as usize];
+    let last = &a[(TOKENS as usize - 1) * (HEADS * DIM) as usize..];
+    let diff: f64 = first
+        .iter()
+        .zip(last)
+        .map(|(x, y)| (*x as f64 - *y as f64).abs())
+        .sum();
+    assert!(diff > 1.0, "wyniki nie zależą od pozycji — maska nie działa");
 }

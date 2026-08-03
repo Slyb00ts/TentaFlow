@@ -41,6 +41,7 @@ def main() -> int:
     prompt = (base * (n_prompt // len(base) + 1))[:n_prompt]
     print(f"prompt {len(prompt)} tokenów, model {ckpt.name}")
 
+    print(f"(kafel MLX: pelny prompt w jednym wywolaniu)")
     prefill_times, decode_times = [], []
     for r in range(REPEATS + 1):
         cache = make_prompt_cache(model)

@@ -94,6 +94,7 @@ struct Pipelines {
     silu_mul: KernelHandle,
     rope: KernelHandle,
     attn: KernelHandle,
+    flash: KernelHandle,
     embed: KernelHandle,
     residual: KernelHandle,
     kv_append: KernelHandle,
@@ -248,6 +249,10 @@ impl MlxDense {
             attn: compile(
                 &msl::attn_decode_source(shape.head_dim),
                 &msl::attn_decode_name(shape.head_dim),
+            )?,
+            flash: compile(
+                &msl::flash_attn_source(shape.head_dim),
+                &msl::flash_attn_name(shape.head_dim),
             )?,
             embed: compile(
                 &msl::embed_gather_source(scales_dtype),
@@ -503,8 +508,26 @@ impl MlxDense {
         self.kv_append(&l.k_cache, &self.scratch.k, pos, tokens)?;
         self.kv_append(&l.v_cache, &self.scratch.v, pos, tokens)?;
 
+        // Uwaga: forma blokowa dla wsadu, per-token dla pojedynczego kroku.
+        // Ta pierwsza liczy oba iloczyny na jednostkach macierzowych i wymaga
+        // pelnego bloku zapytan, zeby nie liczyc pustych wierszy; ta druga jest
+        // przy jednym tokenie jedyna sensowna. Zgodnosc obu jest przypieta
+        // testem, a per-token jest przypieta do MLX.
+        let (kernel, groups, threads) = if msl::flash_fits(tokens, s.head_dim) {
+            (
+                &self.pipes.flash,
+                msl::flash_attn_groups(s.heads, tokens),
+                msl::FLASH_THREADS,
+            )
+        } else {
+            (
+                &self.pipes.attn,
+                msl::attn_groups(s.heads, tokens),
+                msl::ATTN_THREADS,
+            )
+        };
         self.launch(
-            &self.pipes.attn,
+            kernel,
             LaunchArgs::new()
                 .buf(&self.scratch.attn)
                 .buf(&self.scratch.q)
@@ -516,8 +539,8 @@ impl MlxDense {
                 .scalar(self.seq_cap)
                 .scalar(s.attn_scale())
                 .scalar(tokens),
-            msl::attn_groups(s.heads, tokens),
-            msl::ATTN_THREADS,
+            groups,
+            threads,
         )?;
 
         self.matmul(&self.scratch.proj, &l.o, &self.scratch.attn, tokens, false)?;
