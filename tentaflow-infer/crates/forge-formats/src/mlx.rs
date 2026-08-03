@@ -209,6 +209,100 @@ pub fn dequantize_affine(
     Ok(())
 }
 
+/// Bytes of one GGML Q4_1 block: scale, minimum, then 32 nibbles.
+pub const Q4_1_BLOCK_BYTES: usize = 20;
+/// Elements per Q4_1 block.
+pub const Q4_1_BLOCK_ELEMS: usize = 32;
+
+/// Repacks an MLX affine 4-bit tensor into GGML Q4_1 blocks.
+///
+/// This is the whole reason MLX checkpoints can run on the CUDA and HIP
+/// backends without a single new kernel. The two formats compute the SAME
+/// thing — `w = q * scale + bias` with a scale and an offset shared by a group
+/// of consecutive weights — and the engine already carries twenty-three Q4_1
+/// kernels: plain and batched matrix products, the logit head, and the fused
+/// norm-plus-projection pairs. What differs is only how the bits are laid out.
+///
+/// Three differences, all mechanical:
+///
+///   * MLX packs eight weights per 32-bit word, the earliest in the least
+///     significant bits; Q4_1 packs a block of 32 with the first sixteen in the
+///     low nibbles and the last sixteen in the high nibbles of the same bytes.
+///   * MLX shares one scale and bias across `group_size` weights (64 for the
+///     checkpoints in hand); Q4_1 fixes the group at 32. A group that is a
+///     multiple of 32 simply becomes several blocks carrying the same pair,
+///     which is why a group that is not is refused rather than approximated.
+///   * MLX writes the pair in the converter's type — bf16 from mlx-lm, f16 from
+///     mlx-whisper — and Q4_1 wants f16.
+///
+/// That last one is the only place a value could change, so it is CHECKED
+/// rather than assumed: f16 carries three more mantissa bits than bf16, so the
+/// conversion is exact whenever the exponent fits, and a value whose exponent
+/// does not is an error here instead of a silently wrong weight later.
+pub fn repack_affine_to_q4_1(
+    tensor: &MlxAffineTensor<'_>,
+    cfg: &MlxQuantConfig,
+) -> Result<Vec<u8>> {
+    tensor.validate(cfg)?;
+    if cfg.bits != 4 {
+        return Err(ForgeError::Unsupported(format!(
+            "MLX->Q4_1: format ma {} bitów, a Q4_1 jest czterobitowy",
+            cfg.bits
+        )));
+    }
+    if cfg.group_size % Q4_1_BLOCK_ELEMS != 0 {
+        return Err(ForgeError::Unsupported(format!(
+            "MLX->Q4_1: grupa {} nie dzieli się na bloki po {Q4_1_BLOCK_ELEMS}",
+            cfg.group_size
+        )));
+    }
+
+    let per_word = cfg.per_word();
+    let words_per_row = tensor.cols / per_word;
+    let groups_per_row = tensor.cols / cfg.group_size;
+    let blocks_per_row = tensor.cols / Q4_1_BLOCK_ELEMS;
+    let mut out = vec![0u8; tensor.rows * blocks_per_row * Q4_1_BLOCK_BYTES];
+
+    // Pojedyncza wartość z upakowanego wiersza, po numerze kolumny.
+    let nibble = |words: &[u32], col: usize| -> u8 {
+        let word = words[col / per_word];
+        ((word >> ((col % per_word) * 4)) & 0xF) as u8
+    };
+
+    for row in 0..tensor.rows {
+        let words = &tensor.packed[row * words_per_row..(row + 1) * words_per_row];
+        for block in 0..blocks_per_row {
+            let col0 = block * Q4_1_BLOCK_ELEMS;
+            let g = row * groups_per_row + col0 / cfg.group_size;
+            let d = to_exact_f16(tensor.scales.get(g), "skala")?;
+            let m = to_exact_f16(tensor.biases.get(g), "przesunięcie")?;
+
+            let at = (row * blocks_per_row + block) * Q4_1_BLOCK_BYTES;
+            out[at..at + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+            out[at + 2..at + 4].copy_from_slice(&m.to_bits().to_le_bytes());
+            for j in 0..16 {
+                let lo = nibble(words, col0 + j);
+                let hi = nibble(words, col0 + j + 16);
+                out[at + 4 + j] = lo | (hi << 4);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// f32 -> f16 bez straty, albo błąd. Wartości pochodzą z bf16 albo f16, więc
+/// mantysa mieści się zawsze; zawieść może wyłącznie wykładnik, a cicha zamiana
+/// skali na nieskończoność albo na zero zepsułaby całą grupę wag.
+fn to_exact_f16(value: f32, what: &str) -> Result<half::f16> {
+    let h = half::f16::from_f32(value);
+    if h.to_f32() != value {
+        return Err(ForgeError::Unsupported(format!(
+            "MLX->Q4_1: {what} {value:e} nie mieści się w f16 bez straty"
+        )));
+    }
+    Ok(h)
+}
+
 /// Which of the three tensors an MLX name refers to. A quantized weight is
 /// stored as a triple; the architecture registry names only the `.weight`, so
 /// the other two would otherwise look like tensors nobody claims.

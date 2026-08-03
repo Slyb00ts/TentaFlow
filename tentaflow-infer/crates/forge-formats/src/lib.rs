@@ -26,8 +26,9 @@ pub use dequant::dequantize_to_f32;
 pub use gguf::{Gguf, GgufTensor, MetaValue};
 pub use hf_config::HfConfig;
 pub use mlx::{
-    dequantize_affine, map_checkpoint, split_component, MlxAffineTensor, MlxComponent,
-    MlxLayout, MlxMode, MlxParams, MlxQuantConfig,
+    dequantize_affine, map_checkpoint, repack_affine_to_q4_1, split_component, MlxAffineTensor,
+    MlxComponent, MlxLayout, MlxMode, MlxParams, MlxQuantConfig, Q4_1_BLOCK_BYTES,
+    Q4_1_BLOCK_ELEMS,
 };
 pub use nvfp4::{
     nvfp4_ct_s0_from_e4m3, nvfp4_ct_s0_to_f32, NvFp4Scheme, NvFp4TensorNames, NVFP4_CT_S0_NAN,

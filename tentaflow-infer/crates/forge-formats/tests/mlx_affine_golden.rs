@@ -12,7 +12,11 @@
 
 use half::{bf16, f16};
 
-use forge_formats::{dequantize_affine, MlxAffineTensor, MlxMode, MlxParams, MlxQuantConfig};
+use forge_formats::{
+    dequantize_affine, dequantize_to_f32, repack_affine_to_q4_1, MlxAffineTensor, MlxMode,
+    MlxParams, MlxQuantConfig, Q4_1_BLOCK_ELEMS,
+};
+use forge_types::{DType, QuantKind};
 
 /// Two real checkpoints, deliberately different in what they exercise:
 /// a dense text model with bf16 scales, and a Whisper encoder-decoder with f16
@@ -247,5 +251,62 @@ fn affine_decode_matches_mlx() {
             c.name
         );
     }
+    }
+}
+
+#[test]
+fn repacking_to_q4_1_changes_the_layout_and_nothing_else() {
+    // To jest bramka pod uruchamianie modeli MLX na CUDA i HIP BEZ nowego
+    // kernela: silnik ma już dwadzieścia trzy kernele Q4_1, a Q4_1 liczy to
+    // samo, co MLX affine — `q * skala + przesunięcie`. Jedyne, co się różni,
+    // to układ bitów, więc przepakowanie musi być zamianą układu i niczym
+    // więcej. Porównanie jest wobec ścieżki MLX, która sama jest przypięta do
+    // MLX bit w bit testem wyżej.
+    for (model, fixture) in FIXTURES {
+        let (cfg, cases) = load(fixture);
+        if cfg.bits != 4 || cfg.group_size % Q4_1_BLOCK_ELEMS != 0 {
+            eprintln!("{model}: format poza zakresem Q4_1, pomijam");
+            continue;
+        }
+        for c in &cases {
+            let t = MlxAffineTensor {
+                packed: &c.packed,
+                scales: c.scales.view(),
+                biases: c.biases.view(),
+                rows: c.rows,
+                cols: c.cols,
+            };
+            let mut want = vec![0f32; c.rows * c.cols];
+            dequantize_affine(&t, &cfg, &mut want).unwrap();
+
+            let blocks = repack_affine_to_q4_1(&t, &cfg).unwrap();
+            let got = dequantize_to_f32(
+                DType::F16,
+                QuantKind::Q4_1,
+                &blocks,
+                c.rows * c.cols,
+            )
+            .unwrap();
+
+            assert_eq!(got.len(), want.len(), "{}: rozmiar", c.name);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{}: element {i} — przepakowanie zmieniło wartość ({g} wobec {w})",
+                    c.name
+                );
+            }
+
+            // Kontrola samego porównania: gdyby wagi były stałe, każdy błąd
+            // przestawienia nibbli byłby niewidoczny.
+            let distinct = want.iter().map(|v| v.to_bits()).collect::<std::collections::HashSet<_>>();
+            assert!(
+                distinct.len() > 8,
+                "{}: fikstura ma za mało różnych wartości, żeby wykryć przestawienie",
+                c.name
+            );
+        }
+        eprintln!("{model}: przepakowanie do Q4_1 zgodne co do bitu");
     }
 }
