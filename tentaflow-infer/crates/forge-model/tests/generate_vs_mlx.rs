@@ -367,3 +367,58 @@ fn how_fast_decode_runs() {
         4.207 * STEPS as f64 / median
     );
 }
+
+/// Bramka „bez klifu": rejestr wariantów ma dobierać formę tak, żeby koszt na
+/// token NIE ROSŁ skokowo przy przejściu z jednej formy na drugą.
+///
+/// Uruchamiana jawnie, bo mierzy czas. Nie sprawdza, że jest szybko — sprawdza,
+/// że nie ma rozmiaru wsadu, na którym silnik nagle zwalnia, bo to jest ten
+/// rodzaj usterki, którego nie widać w żadnym pomiarze pojedynczej długości.
+#[test]
+#[ignore]
+fn no_batch_size_falls_off_a_cliff() {
+    let oracle = load();
+    let Some(dir) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu Bielika");
+        return;
+    };
+    let Ok(device) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+
+    // Rozmiary wokół obu progów rejestru: 32 (blok uwagi) i 64 (blok macierzy).
+    const SIZES: &[usize] = &[8, 16, 31, 32, 33, 63, 64, 65, 128, 256];
+    let mut per_token = Vec::new();
+    for &n in SIZES {
+        let mut prompt = Vec::new();
+        while prompt.len() < n {
+            prompt.extend_from_slice(&oracle.prompt_ids);
+        }
+        prompt.truncate(n);
+
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            model.reset();
+            let t0 = std::time::Instant::now();
+            model.prefill(&prompt).expect("prefill");
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        let us = best * 1e6 / n as f64;
+        eprintln!("wsad {n:4}: {us:8.1} us/token");
+        per_token.push((n, us));
+    }
+
+    // Koszt na token ma maleć albo stać. Wzrost oznacza, że większy wsad trafił
+    // w formę gorszą od tej, która obsłużyła mniejszy — czyli że próg w
+    // rejestrze jest po złej stronie pomiaru.
+    for pair in per_token.windows(2) {
+        let (n0, t0) = pair[0];
+        let (n1, t1) = pair[1];
+        assert!(
+            t1 <= t0 * 1.25,
+            "klif: wsad {n1} kosztuje {t1:.1} us/token, a mniejszy {n0} tylko {t0:.1}"
+        );
+    }
+}

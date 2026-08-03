@@ -6,6 +6,7 @@
 mod launchers;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod msl;
+pub mod variant;
 mod registry;
 
 pub use launchers::{

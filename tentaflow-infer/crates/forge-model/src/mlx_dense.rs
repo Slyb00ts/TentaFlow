@@ -21,6 +21,7 @@ use forge_formats::safetensors::SafeTensors;
 use forge_formats::{HfConfig, MlxQuantConfig, ModelDescriptor, WeightRole};
 use forge_hal::{DevBuffer, Device, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_kernels::msl::{self, OutDtype, ScaleDtype};
+use forge_kernels::variant::{AttentionForm, MatmulForm, Problem, ATTENTION_FORMS, MATMUL_FORMS};
 use forge_types::{ForgeError, MemKind, Result};
 
 /// Prompt tokens carried through the layers in one pass.
@@ -392,7 +393,18 @@ impl MlxDense {
         if prompt.is_empty() {
             return Err(ForgeError::Format("pusty prompt".into()));
         }
-        for chunk in prompt.chunks(PREFILL_CHUNK as usize) {
+        // Podział WYRÓWNANY do bloku formy macierzowej. Bez tego prompt o
+        // jeden token dłuższy od wielokrotności bloku każe policzyć drugi blok
+        // prawie pusty: zmierzone 5227 us/token przy 64 tokenach i 9318 przy 65,
+        // czyli o jeden token więcej za prawie dwa razy tyle pracy. Reszta idzie
+        // osobnym, krótszym kaflem, który rejestr obsłuży formą blokową.
+        let block = msl::QMG_BM as usize;
+        let aligned = prompt.len() / block * block;
+        for chunk in prompt[..aligned].chunks(PREFILL_CHUNK as usize) {
+            self.forward(chunk)?;
+            self.stream.synchronize()?;
+        }
+        for chunk in prompt[aligned..].chunks(PREFILL_CHUNK as usize) {
             self.forward(chunk)?;
             self.stream.synchronize()?;
         }
@@ -508,23 +520,27 @@ impl MlxDense {
         self.kv_append(&l.k_cache, &self.scratch.k, pos, tokens)?;
         self.kv_append(&l.v_cache, &self.scratch.v, pos, tokens)?;
 
-        // Uwaga: forma blokowa dla wsadu, per-token dla pojedynczego kroku.
-        // Ta pierwsza liczy oba iloczyny na jednostkach macierzowych i wymaga
-        // pelnego bloku zapytan, zeby nie liczyc pustych wierszy; ta druga jest
-        // przy jednym tokenie jedyna sensowna. Zgodnosc obu jest przypieta
-        // testem, a per-token jest przypieta do MLX.
-        let (kernel, groups, threads) = if msl::flash_fits(tokens, s.head_dim) {
-            (
+        // Która forma uwagi obsługuje który wsad — decyduje rejestr, tak samo
+        // jak przy mnożeniu. Zgodność obu form jest przypięta testem, a forma
+        // per-token jest przypięta do MLX.
+        let attn = ATTENTION_FORMS
+            .pick(&Problem {
+                tokens,
+                rows: s.heads,
+                cols: s.head_dim,
+            })
+            .ok_or_else(|| ForgeError::Unsupported("brak wariantu uwagi".into()))?;
+        let (kernel, groups, threads) = match attn.form {
+            AttentionForm::Blocked if msl::flash_fits(tokens, s.head_dim) => (
                 &self.pipes.flash,
                 msl::flash_attn_groups(s.heads, tokens),
                 msl::FLASH_THREADS,
-            )
-        } else {
-            (
+            ),
+            _ => (
                 &self.pipes.attn,
                 msl::attn_groups(s.heads, tokens),
                 msl::ATTN_THREADS,
-            )
+            ),
         };
         self.launch(
             kernel,
@@ -609,15 +625,13 @@ impl MlxDense {
 
     /// Projection for a whole batch.
     ///
-    /// Three forms, each with a measured range. One token takes the vector
-    /// form. Below a full block the matrix form would leave most of that block
-    /// idle — at 8 tokens it is 177 us against 80 — so that range takes the
-    /// register-blocked loop. From a full block up, the matrix units win by
-    /// 1.46x and keep winning.
+    /// Projection for a whole batch.
     ///
-    /// The two do NOT agree bit for bit — a matrix unit sums its own way — so
-    /// prefill and decode can differ in the last place on a shared position.
-    /// Both are held to the same numerical gate against MLX and an f64 truth.
+    /// Which form serves which batch is a decision of the registry, not of this
+    /// function: the thresholds and the measurements behind them live in
+    /// `forge_kernels::variant`, where they can be checked for totality and for
+    /// the absence of a cliff. Here there is only the mapping from a chosen
+    /// form to the pipeline that implements it.
     fn matmul(
         &self,
         out: &DevBuffer,
@@ -626,50 +640,52 @@ impl MlxDense {
         tokens: u32,
         f16_out: bool,
     ) -> Result<()> {
-        if tokens == 1 {
-            let k = if f16_out {
-                &self.pipes.qmv_f16
-            } else {
-                &self.pipes.qmv_f32
-            };
-            return self.gemv(k, out, w, x, 0);
-        }
-        if tokens < msl::QMG_BLOCK {
-            return self.matmul_blocked(out, w, x, tokens, f16_out);
-        }
-        if !msl::qmg_fits(w.rows, w.cols) {
-            return Err(ForgeError::Unsupported(format!(
-                "kształt [{}, {}] nie dzieli się na bloki po {}",
-                w.rows,
-                w.cols,
-                msl::QMG_BLOCK
-            )));
-        }
-        let k = if f16_out {
-            &self.pipes.qmg_f16
-        } else {
-            &self.pipes.qmg_f32
+        let problem = Problem {
+            tokens,
+            rows: w.rows,
+            cols: w.cols,
         };
-        let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
-        self.device.launch(
-            k,
-            &LaunchConfig {
-                grid: (gx, gy, 1),
-                block: (msl::QMG_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            &LaunchArgs::new()
-                .buf(out)
-                .buf(&w.packed)
-                .buf(&w.scales)
-                .buf(&w.biases)
-                .buf(x)
-                .scalar(w.rows)
-                .scalar(w.cols)
-                .scalar(self.shape.group)
-                .scalar(tokens),
-            &self.stream,
-        )
+        let chosen = MATMUL_FORMS.pick(&problem).ok_or_else(|| {
+            ForgeError::Unsupported(format!("brak wariantu mnożenia dla {problem:?}"))
+        })?;
+        match chosen.form {
+            MatmulForm::Vector => {
+                let k = if f16_out {
+                    &self.pipes.qmv_f16
+                } else {
+                    &self.pipes.qmv_f32
+                };
+                self.gemv(k, out, w, x, 0)
+            }
+            MatmulForm::RegisterBlocked => self.matmul_blocked(out, w, x, tokens, f16_out),
+            MatmulForm::MatrixUnits => {
+                let k = if f16_out {
+                    &self.pipes.qmg_f16
+                } else {
+                    &self.pipes.qmg_f32
+                };
+                let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
+                self.device.launch(
+                    k,
+                    &LaunchConfig {
+                        grid: (gx, gy, 1),
+                        block: (msl::QMG_THREADS, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &LaunchArgs::new()
+                        .buf(out)
+                        .buf(&w.packed)
+                        .buf(&w.scales)
+                        .buf(&w.biases)
+                        .buf(x)
+                        .scalar(w.rows)
+                        .scalar(w.cols)
+                        .scalar(self.shape.group)
+                        .scalar(tokens),
+                    &self.stream,
+                )
+            }
+        }
     }
 
     /// Register-blocked loop, for batches too small to fill a matrix block.
