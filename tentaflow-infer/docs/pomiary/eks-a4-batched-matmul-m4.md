@@ -87,6 +87,25 @@ wynik**, z 2,92x na 1,29x przy T=8. Wektorowy odczyt jest tu typową „oczywist
 optymalizacją", która nie działa, i dlatego został wycofany, a nie zostawiony
 z komentarzem, że powinien pomagać.
 
+## Trzecia rzecz, która nie zadziałała: aktywacje w pamięci grupy roboczej
+
+Rachunek ruchu pamięci przy T=128 wychodzi na 1,1 GB w 13,9 ms, czyli 79 GB/s
+przy suficie 102 — i dwie trzecie tego to AKTYWACJE, czytane osobno przez każdą
+z 16 grup SIMD. Postawienie ich raz w pamięci grupy roboczej powinno więc ściąć
+ruch trzykrotnie.
+
+Pierwsza wersja wyszła 188 us na token wobec 109 wyjściowych. Winne były
+dzielenia całkowite w pętli ładującej (`i / halfs_here`), a nie sam pomysł: po
+ich usunięciu kernel schodzi do 102,9 us i przestaje tracić przy dużych
+kaflach — koszt na token jest płaski aż do 256 tokenów.
+
+I mimo to **na modelu jest wolniej**: 59,2 wobec 67,5 tok/s prefillu. Osiem
+kilobajtów pamięci grupy roboczej obniża zajętość, a w modelu ten kernel dzieli
+układ z kilkunastoma innymi, podczas gdy w mikrobenchmarku ma go dla siebie.
+Wycofane — i opisane, żeby nie wracać do tego z tym samym rachunkiem w ręku.
+Wniosek ogólniejszy: sam rachunek ruchu pamięci nie wystarcza, bo redundantne
+odczyty aktywacji i tak są wyłapywane przez cache.
+
 ## Zgodność
 
 Kafel i forma wektorowa dają **identyczne bity** na tej samej pozycji —
