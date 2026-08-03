@@ -6615,29 +6615,12 @@ impl Model {
                     self.gemm_fp8(&pb.v, &fl.v, &pb.x, rows, stream)?;
                 }
             } else if let Some(fl) = fp8_ffn_layer {
+                // K/V ida ta sama sciezka FP8 co Q. Wczesniej hybryda liczyla je
+                // natywnie w NVFP4 (33 TFLOPS wobec 142), bo paczki ich nie
+                // obejmowaly — obejmuja od czasu rozszerzenia `Fp8FfnLayer`.
                 self.gemm_fp8(&pb.q, &fl.q, &pb.x, rows, stream)?;
-                match &layer.attn().attn_qkv {
-                    QkvWeights::Fused(w) => {
-                        self.gemm_rows(&pb.k, w, &pb.x, rows, q_dim, kv_dim, stream)?;
-                    }
-                    QkvWeights::FusedQk { qk, .. } => {
-                        self.gemm_rows(&pb.k, qk, &pb.x, rows, q_dim, kv_dim, stream)?;
-                    }
-                    QkvWeights::Split { k, .. } => {
-                        self.gemm(&pb.k, k, &pb.x, rows, stream)?;
-                    }
-                }
-                match &layer.attn().attn_qkv {
-                    QkvWeights::Fused(w) => {
-                        self.gemm_rows(&pb.v, w, &pb.x, rows, q_dim + kv_dim, kv_dim, stream)?;
-                    }
-                    QkvWeights::FusedQk { v, .. } => {
-                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
-                    }
-                    QkvWeights::Split { v, .. } => {
-                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
-                    }
-                }
+                self.gemm_fp8(&pb.k, &fl.k, &pb.x, rows, stream)?;
+                self.gemm_fp8(&pb.v, &fl.v, &pb.x, rows, stream)?;
             } else {
                 match &layer.attn().attn_qkv {
                     QkvWeights::Fused(w) => {
@@ -7711,7 +7694,24 @@ impl Model {
                 QkvWeights::Fused(weight) | QkvWeights::FusedQk { qk: weight, .. } => weight,
                 QkvWeights::Split { q, .. } => q,
             };
+            let kv_rows = params.n_kv_heads * params.head_dim;
+            let kv_ok = match &layer.attn().attn_qkv {
+                QkvWeights::Fused(w) => {
+                    add_required(self.preflight_nvfp4_pack(w, q_rows, kv_rows)).is_some()
+                        && add_required(self.preflight_nvfp4_pack(w, q_rows + kv_rows, kv_rows))
+                            .is_some()
+                }
+                QkvWeights::FusedQk { qk, v } => {
+                    add_required(self.preflight_nvfp4_pack(qk, q_rows, kv_rows)).is_some()
+                        && add_required(self.preflight_nvfp4_pack(v, 0, v.rows())).is_some()
+                }
+                QkvWeights::Split { k, v, .. } => {
+                    add_required(self.preflight_nvfp4_pack(k, 0, k.rows())).is_some()
+                        && add_required(self.preflight_nvfp4_pack(v, 0, v.rows())).is_some()
+                }
+            };
             if add_required(self.preflight_nvfp4_pack(q_source, 0, q_rows)).is_none()
+                || !kv_ok
                 || add_required(self.preflight_nvfp4_pack(
                     &layer.attn().attn_o,
                     0,
@@ -7786,6 +7786,22 @@ impl Model {
                     self.fp8_build_step(self.pack_nvfp4_rows(q, 0, q.rows()))?
                 }
             };
+            let kv_rows = self.weights.descriptor.params.n_kv_heads
+                * self.weights.descriptor.params.head_dim;
+            let (k, v) = match &layer.attn().attn_qkv {
+                QkvWeights::Fused(w) => (
+                    self.fp8_build_step(self.pack_nvfp4_rows(w, q_rows, kv_rows))?,
+                    self.fp8_build_step(self.pack_nvfp4_rows(w, q_rows + kv_rows, kv_rows))?,
+                ),
+                QkvWeights::FusedQk { qk, v } => (
+                    self.fp8_build_step(self.pack_nvfp4_rows(qk, q_rows, kv_rows))?,
+                    self.fp8_build_step(self.pack_nvfp4_rows(v, 0, v.rows()))?,
+                ),
+                QkvWeights::Split { k, v, .. } => (
+                    self.fp8_build_step(self.pack_nvfp4_rows(k, 0, k.rows()))?,
+                    self.fp8_build_step(self.pack_nvfp4_rows(v, 0, v.rows()))?,
+                ),
+            };
             let attn_o = self.fp8_build_step(self.pack_nvfp4_rows(
                 &layer.attn().attn_o,
                 0,
@@ -7810,6 +7826,8 @@ impl Model {
             let down = self.fp8_build_step(self.pack_nvfp4_rows(&ffn.down, 0, ffn.down.rows()))?;
             layers.push(crate::weights::Fp8FfnLayer {
                 q,
+                k,
+                v,
                 attn_o,
                 gate,
                 up,

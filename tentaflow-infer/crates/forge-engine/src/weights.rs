@@ -480,6 +480,12 @@ pub struct Fp8Layer {
 /// Paczki FP8 dla projekcji używanych przez hybrydowy prefill.
 pub struct Fp8FfnLayer {
     pub q: Fp8Weight,
+    /// K i V. Hybryda dlugo zostawiala je na NVFP4: profil prefillu Bielika
+    /// pokazal 320 wywolan `nvfp4_ct_prefill_gemm` po 0.26 ms, czyli 33 TFLOPS
+    /// tam, gdzie sciezka FP8 robi 142. Paczki dla nich to ~336 MB przy 7 GB
+    /// calosci, wiec koszt pamieci jest marginalny.
+    pub k: Fp8Weight,
+    pub v: Fp8Weight,
     pub attn_o: Fp8Weight,
     pub gate: Fp8Weight,
     pub up: Fp8Weight,
@@ -786,6 +792,15 @@ pub struct ModelWeights {
 pub(crate) type TensorFetch = (Vec<u8>, DType, QuantKind, Vec<usize>);
 
 pub(crate) trait TensorSource {
+    /// Czy zrodlo trzyma wiersze Q/K w ORYGINALNEJ, przeplatanej kolejnosci
+    /// rodziny Llama. GGUF tak; HF permutuje je juz przy konwersji, zeby moc
+    /// liczyc rotacja NeoX. Kernele RoPE silnika sa NeoX, wiec przestawiac
+    /// wiersze wolno TYLKO dla zrodel, ktore tego nie zrobily — inaczej
+    /// permutacja zostaje nalozona dwa razy i model generuje smieci.
+    fn stores_original_rope_order(&self) -> bool {
+        false
+    }
+
     fn fetch(&self, name: &str) -> Result<TensorFetch>;
     fn fetch_optional(&self, name: &str) -> Result<Option<TensorFetch>>;
     /// NVFP4 triple fetch; None when the tensor is not NVFP4-packed.
@@ -1374,6 +1389,10 @@ fn finish_nvfp4_ct_load<T>(load: Result<T>, reset: Result<()>) -> Result<T> {
 struct GgufSource<'a>(&'a Gguf);
 
 impl TensorSource for GgufSource<'_> {
+    fn stores_original_rope_order(&self) -> bool {
+        true
+    }
+
     fn byte_len(&self, name: &str) -> Option<usize> {
         self.0.tensor(name).map(|t| t.size_bytes)
     }
@@ -3738,7 +3757,7 @@ impl ModelWeights {
             // RoPE w silniku liczą wariant NeoX. Przestawienie wierszy Q i K raz
             // przy ładowaniu sprowadza jedno do drugiego bez kosztu w czasie
             // wykonania — patrz `permute_rope_pairs`.
-            if descriptor.rope_interleaved() {
+            if descriptor.rope_interleaved() && src.stores_original_rope_order() {
                 let head_dim = p.head_dim_at(idx);
                 permute_rope_pairs(&mut q, head_dim)?;
                 permute_rope_pairs(&mut k, head_dim)?;
