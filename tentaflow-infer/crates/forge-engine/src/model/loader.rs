@@ -859,7 +859,6 @@ impl Model {
         tracing::info!(
             resident_pack_bytes = required_bytes,
             layer_count = layers.len(),
-            kv_packs = 0,
             available_after_bytes = self.device.pool_available(Pool::Weights),
             "paczki FP8 gotowe do publikacji"
         );

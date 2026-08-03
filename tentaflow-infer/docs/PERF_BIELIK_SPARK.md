@@ -5,14 +5,15 @@ Pomiary na GB10 (sm_121a, 48 SM, pamięć zunifikowana 121 GiB),
 
 ## Stan
 
-| prompt | prefill tok/s | decode tok/s |
-|---|---|---|
-| 512 | 3 930 | 40,2 |
-| 2 048 | **4 537** | 38,2 |
-| 4 096 | 3 902 | 35,4 |
+| prompt | prefill tok/s | decode tok/s | zmierzone |
+|---|---|---|---|
+| 2 048 | **4 938** | 38,0–38,1 | 2026-08-03, mediana z 3 przebiegow |
+| 512 | 3 930 | 40,2 | starszy pomiar |
+| 4 096 | 3 902 | 35,4 | starszy pomiar |
 
-Wobec startu sesji (2 957 tok/s przy 2048) to **+53%**, przy niezmienionym SHA
-generowanych tokenow na kazdej dlugosci.
+Wobec startu sesji (2 957 tok/s przy 2048) to **+67%**, przy niezmienionej
+generacji. Wiersze 512 i 4096 pochodza sprzed kilku zmian i nie zostaly
+powtorzone — nie sa punktem odniesienia dla dzisiejszych bramek.
 
 Odniesienie na tym samym sprzęcie i modelu: **vLLM 0.26 daje 48 tok/s decode**
 oraz ~10 000 tok/s prefillu na zimno (mierzone przez HTTP, więc lekko zaniżone
@@ -105,14 +106,50 @@ okolo 895 ms realnej pracy:
 | normalizacje | 41 | 5% |
 | kwantyzacja aktywacji | 37 | 4% |
 
+## Rozklad po zmianach (nsys, 2026-08-03, prompt 2048)
+
+Zmierzone na biezacej wersji, bez jednorazowego pakowania wag:
+
+| skladnik | udzial |
+|---|---|
+| GEMM-y FP8 (5 wariantow) | **68,6%** |
+| uwaga `attn_prefill_fa` | 18,6% |
+| `silu_mul_quant` | 7,2% |
+| normalizacje | 5,7% |
+
+**`nvfp4_ct_prefill_gemm` nie wystepuje w prefillu w ogole.** K/V sa dzis w
+paczkach FP8; jedyne NVFP4 w profilu to jednorazowy `nvfp4_ct_fp8_pack` przy
+ladowaniu. Punkt „K/V wciaz na NVFP4 (9%)" byl NIEAKTUALNY, a utrzymywaly go
+przy zyciu dwa komunikaty: tekst CLI mowiacy „K/V i warstwy decode pozostaja
+NVFP4" oraz pole `kv_packs = 0` wpisane na sztywno w log. Oba poprawione — to
+one wysylaly kolejna osobe za nieistniejacym problemem.
+
 Nastepne cele w kolejnosci zysku do ryzyka:
 
-1. **K/V wciaz na NVFP4** (9%). Paczki FP8 obejmuja Q/O/FFN/lm_head, a K/V nie —
-   mimo ze kernel `gemm_fp8_mod_1024_4096` dla ich ksztaltu JEST zbudowany.
-2. **`down` na 109 TFLOPS** wobec 142 osiaganych przez q/o i gate/up. N=4096 jest
-   juz optymalne, wiec zostaje dlugie K=11264; podzial K wymaga akumulacji i
-   redukcji, wiec jest istotnie trudniejszy niz podzial N.
-3. **Uwaga** (18%) — zmierzona, nie zgadywana. `ncu` na `attn_prefill_fa_mma`:
+1. **Projekcja `down`** — najwolniejszy pojedynczy GEMM: 480 wywolan po 882 us,
+   czyli 107 TFLOPS wobec 142 osiaganych przez q/o. N=4096 jest juz optymalne,
+   wiec zostaje dlugie K=11264; podzial K wymaga akumulacji i redukcji, wiec
+   jest istotnie trudniejszy niz podzial N.
+2. **Uwaga** (18,6%) — sufit rejestrow juz zalozony (patrz nizej); dalsze
+   zejscie wymagaloby mniejszego akumulatora, a nie ustawienia `ptxas`.
+
+### Sufit rejestrow uwagi — zrobione
+
+`ptxas` dawal `attn_prefill_fa_mojo_f16_hd128` **176 rejestrow**, choc te sama
+prace wykonuje w **148 bez ani jednego bajtu spillu**. Przy 128 watkach na blok
+176 rejestrow miesci dwa bloki na SM, a 148 — trzy, czyli sufit wynikajacy i tak
+z 32 KiB pamieci wspoldzielonej. Polowa zajetosci szla na nic.
+
+Dyrektywe `.maxnreg 152` wstrzykuje builder katalogu z tabeli niosacej pomiar,
+wiec przezywa przebudowe. Mediana z trzech przebiegow: prefill **4 856 -> 4 938
+tok/s**. HD256 celowo poza tabela: sam akumulator zajmuje tam 128 rejestrow,
+wiec kazdy sufit ponizej 252 spilluje (672 B juz przy 200).
+
+Wczesniejszy pomiar `ncu` (ponizej) mowil o zejsciu do 128 rejestrow i czterech
+blokach — to bylo za daleko. Pamiec wspoldzielona ogranicza do trzech niezaleznie
+od rejestrow, a ponizej 148 zaczynaja sie spille.
+
+`ncu` na `attn_prefill_fa_mma` (pomiar historyczny):
 
    | metryka | wartosc |
    |---|---|

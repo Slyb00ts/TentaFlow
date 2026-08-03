@@ -2269,7 +2269,7 @@ fn maybe_calibrate_w4a8(
         let t0 = Instant::now();
         match model.build_fp8_ffn()? {
             Fp8PackOutcome::Built => eprintln!(
-                "paczki FP8 Q/O/FFN/lm_head zbudowane na GPU w {:.3}s (K/V i warstwy decode pozostają NVFP4)",
+                "paczki FP8 Q/O/K/V/FFN/lm_head zbudowane na GPU w {:.3}s (dekodowanie zostaje na NVFP4)",
                 t0.elapsed().as_secs_f32()
             ),
             Fp8PackOutcome::Unsupported => {
