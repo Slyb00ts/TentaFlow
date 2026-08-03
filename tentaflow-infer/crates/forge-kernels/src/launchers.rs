@@ -83,6 +83,12 @@ fn fp8_modular_bn256_kernel(rows: usize, cols: usize) -> Option<&'static str> {
     match (rows, cols) {
         (4096, 4096) => Some("gemm_fp8_mod_4096_4096_bn256"),
         (11264, 4096) => Some("gemm_fp8_mod_11264_4096_bn256"),
+        // Projekcja `down`: BN=256 daje tu nieporównanie więcej niż gdzie
+        // indziej. Sweep na GB10 przy M=1024: 1471.9 -> 867.0 us, czyli
+        // 64 -> 109 TFLOPS. q/o i gate/up zyskują po ~4%, więc to ten kształt
+        // decydował o prefillu, a akurat jego wariantu brakowało.
+        (4096, 11264) => Some("gemm_fp8_mod_4096_11264_bn256"),
+        (4096, 14336) => Some("gemm_fp8_mod_4096_14336_bn256"),
         _ => None,
     }
 }

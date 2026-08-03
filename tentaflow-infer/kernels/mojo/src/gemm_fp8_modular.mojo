@@ -84,3 +84,10 @@ comptime gemm_fp8_mod_11264_4096 = gemm_fp8_mod_tile[11264, 4096, 128]
 comptime gemm_fp8_mod_4096_11264 = gemm_fp8_mod_tile[4096, 11264, 128]
 comptime gemm_fp8_mod_4096_4096_bn256 = gemm_fp8_mod_tile[4096, 4096, 256]
 comptime gemm_fp8_mod_11264_4096_bn256 = gemm_fp8_mod_tile[11264, 4096, 256]
+# Projekcja `down` (N=4096, K=duże) zyskuje na BN=256 nieporównanie więcej niż
+# pozostałe: sweep `bench_fp8_modular_tiles.mojo` na GB10 dla M=1024 daje
+# 1471.9 -> 867.0 us (-41%), czyli 64 -> 109 TFLOPS, podczas gdy q/o i gate/up
+# zyskują po ~4%. Brak tych wariantów zostawiał najwolniejszy GEMM prefillu na
+# kaflu, który jest dla niego najgorszy.
+comptime gemm_fp8_mod_4096_11264_bn256 = gemm_fp8_mod_tile[4096, 11264, 256]
+comptime gemm_fp8_mod_4096_14336_bn256 = gemm_fp8_mod_tile[4096, 14336, 256]

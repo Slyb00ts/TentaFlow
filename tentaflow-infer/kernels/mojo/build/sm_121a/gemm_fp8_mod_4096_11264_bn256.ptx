@@ -6,16 +6,16 @@
 .target sm_121a
 .address_size 64
 
-	// .globl	src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738
-.extern .shared .align 4 .b8 extern_ptr_syml_8[];
+	// .globl	src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143
+.extern .shared .align 4 .b8 extern_ptr_syml_4[];
 
-.visible .entry src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738(
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_0,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_1,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_2,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_3,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_4,
-	.param .u64 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_5
+.visible .entry src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143(
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_0,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_1,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_2,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_3,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_4,
+	.param .u64 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_5
 )
 {
 	.reg .pred 	%p<394>;
@@ -23,15 +23,15 @@
 	.reg .b32 	%r<1170>;
 	.reg .b64 	%rd<1566>;
 
-	ld.param.b64 	%rd88, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_5];
-	ld.param.b64 	%rd107, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_0];
-	ld.param.b64 	%rd108, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_1];
+	ld.param.b64 	%rd88, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_5];
+	ld.param.b64 	%rd107, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_0];
+	ld.param.b64 	%rd108, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_1];
 	cvta.to.global.u64 	%rd109, %rd108;
-	ld.param.b64 	%rd110, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_2];
+	ld.param.b64 	%rd110, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_2];
 	cvta.to.global.u64 	%rd111, %rd110;
 	cvta.to.global.u64 	%rd1, %rd107;
-	ld.param.b64 	%rd112, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_3];
-	ld.param.b64 	%rd113, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_8a57c5d3d8ebc738_param_4];
+	ld.param.b64 	%rd112, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_3];
+	ld.param.b64 	%rd113, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_c475a7b981cd1143_param_4];
 	cvta.to.global.u64 	%rd2, %rd113;
 	cvta.to.global.u64 	%rd3, %rd112;
 	mov.u32 	%r28, %tid.x;
@@ -45,19 +45,19 @@
 	cvt.u64.u32 	%rd4, %r31;
 	mov.u32 	%r32, %ctaid.y;
 	cvt.u64.u32 	%rd5, %r32;
-	mul.wide.u32 	%rd117, %r32, 524288;
+	mul.wide.u32 	%rd117, %r32, 1441792;
 	mul.wide.u32 	%rd118, %r32, 128;
 	sub.s64 	%rd119, %rd88, %rd118;
 	max.s64 	%rd120, %rd119, 0;
 	min.s64 	%rd121, %rd120, 128;
 	add.s64 	%rd122, %rd109, %rd117;
-	mul.wide.u32 	%rd123, %r31, 1048576;
+	mul.wide.u32 	%rd123, %r31, 2883584;
 	add.s64 	%rd124, %rd111, %rd123;
 	cvt.u32.u64 	%r33, %rd115;
 	shr.u32 	%r34, %r33, 5;
 	shfl.sync.idx.b32 	%r35, %r34, 0, 31, -1;
 	bfe.u64 	%rd125, %rd114, 2, 6;
-	shl.b64 	%rd126, %rd125, 12;
+	mul.lo.s64 	%rd126, %rd125, 11264;
 	mul.wide.u32 	%rd127, %r28, 16;
 	and.b64 	%rd128, %rd127, 48;
 	or.b64 	%rd129, %rd126, %rd128;
@@ -66,23 +66,23 @@
 	shl.b32 	%r37, %r36, 6;
 	cvt.u32.u64 	%r38, %rd128;
 	add.s64 	%rd91, %rd124, %rd129;
-	add.s64 	%rd94, %rd91, 786432;
-	add.s64 	%rd93, %rd91, 524288;
-	add.s64 	%rd92, %rd91, 262144;
+	add.s64 	%rd94, %rd91, 2162688;
+	add.s64 	%rd93, %rd91, 1441792;
+	add.s64 	%rd92, %rd91, 720896;
 	or.b32 	%r39, %r37, %r38;
-	shl.b64 	%rd130, %rd121, 12;
+	mul.lo.s64 	%rd130, %rd121, 11264;
 	sub.s64 	%rd131, %rd130, %rd129;
 	shl.b32 	%r40, %r36, 3;
 	and.b32 	%r41, %r40, 48;
 	xor.b32 	%r42, %r39, %r41;
 	setp.gt.s64 	%p1, %rd131, 0;
 	selp.b32 	%r257, 16, 0, %p1;
-	mov.b32 	%r43, extern_ptr_syml_8;
+	mov.b32 	%r43, extern_ptr_syml_4;
 	add.s32 	%r10, %r43, %r42;
 	cp.async.cg.shared.global [%r10], [%rd89], 16, %r257;
-	setp.gt.s64 	%p2, %rd131, 262144;
+	setp.gt.s64 	%p2, %rd131, 720896;
 	selp.b32 	%r259, 16, 0, %p2;
-	add.s64 	%rd90, %rd89, 262144;
+	add.s64 	%rd90, %rd89, 720896;
 	add.s32 	%r11, %r10, 4096;
 	cp.async.cg.shared.global [%r11], [%rd90], 16, %r259;
 	add.s32 	%r12, %r10, 32768;
@@ -94,14 +94,14 @@
 	add.s32 	%r15, %r10, 45056;
 	cp.async.cg.shared.global [%r15], [%rd94], 16;
 	add.s64 	%rd97, %rd91, 64;
-	add.s64 	%rd100, %rd91, 786496;
-	add.s64 	%rd99, %rd91, 524352;
-	add.s64 	%rd98, %rd91, 262208;
+	add.s64 	%rd100, %rd91, 2162752;
+	add.s64 	%rd99, %rd91, 1441856;
+	add.s64 	%rd98, %rd91, 720960;
 	cp.async.commit_group;
 	add.s64 	%rd95, %rd89, 64;
 	add.s32 	%r16, %r10, 8192;
 	cp.async.cg.shared.global [%r16], [%rd95], 16, %r257;
-	add.s64 	%rd96, %rd89, 262208;
+	add.s64 	%rd96, %rd89, 720960;
 	add.s32 	%r17, %r10, 12288;
 	cp.async.cg.shared.global [%r17], [%rd96], 16, %r259;
 	add.s32 	%r18, %r10, 49152;
@@ -113,14 +113,14 @@
 	add.s32 	%r21, %r10, 61440;
 	cp.async.cg.shared.global [%r21], [%rd100], 16;
 	add.s64 	%rd103, %rd91, 128;
-	add.s64 	%rd106, %rd91, 786560;
-	add.s64 	%rd105, %rd91, 524416;
-	add.s64 	%rd104, %rd91, 262272;
+	add.s64 	%rd106, %rd91, 2162816;
+	add.s64 	%rd105, %rd91, 1441920;
+	add.s64 	%rd104, %rd91, 721024;
 	cp.async.commit_group;
 	add.s64 	%rd101, %rd89, 128;
 	add.s32 	%r22, %r10, 16384;
 	cp.async.cg.shared.global [%r22], [%rd101], 16, %r257;
-	add.s64 	%rd102, %rd89, 262272;
+	add.s64 	%rd102, %rd89, 721024;
 	add.s32 	%r23, %r10, 20480;
 	cp.async.cg.shared.global [%r23], [%rd102], 16, %r259;
 	add.s32 	%r24, %r10, 65536;
@@ -178,7 +178,7 @@
 	shl.b32 	%r7, %r53, 4;
 	mov.b32 	%r54, 0f00000000;
 	mov.b64 	%rd1563, {%r54, %r54};
-	mov.b64 	%rd1565, 64;
+	mov.b64 	%rd1565, 176;
 	mov.b32 	%r1168, 0;
 	mov.b32 	%r1167, 192;
 	mov.b64 	%rd1564, 192;
@@ -642,9 +642,9 @@ $L__BB0_1:
 	mov.b64 	{%r215, %r216}, %rd1500;
 	mov.b64 	{%r217, %r218}, %rd1501;
 	mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%r549, %r550, %r551, %r552}, {%r187, %r188, %r189, %r190}, {%r141, %r142}, {%r215, %r216, %r217, %r218};
-	add.s64 	%rd264, %rd1565, -68;
-	setp.lt.s64 	%p6, %rd264, -64;
-	setp.gt.s64 	%p7, %rd264, -65;
+	add.s64 	%rd264, %rd1565, -180;
+	setp.lt.s64 	%p6, %rd264, -176;
+	setp.gt.s64 	%p7, %rd264, -177;
 	@%p6 bra 	$L__BB0_4;
 	add.s32 	%r55, %r1169, 49152;
 	add.s32 	%r56, %r1169, -16384;
@@ -652,11 +652,11 @@ $L__BB0_1:
 	selp.b32 	%r8, %r56, %r55, %p3;
 	cvt.u64.u32 	%rd149, %r1167;
 	add.s64 	%rd267, %rd91, %rd149;
-	add.s64 	%rd270, %rd267, 786432;
-	add.s64 	%rd269, %rd267, 524288;
-	add.s64 	%rd268, %rd267, 262144;
+	add.s64 	%rd270, %rd267, 2162688;
+	add.s64 	%rd269, %rd267, 1441792;
+	add.s64 	%rd268, %rd267, 720896;
 	add.s64 	%rd265, %rd89, %rd1564;
-	add.s64 	%rd266, %rd265, 262144;
+	add.s64 	%rd266, %rd265, 720896;
 	add.s32 	%r57, %r1168, 24576;
 	add.s32 	%r58, %r1168, -8192;
 	setp.gt.u32 	%p4, %r57, 32767;

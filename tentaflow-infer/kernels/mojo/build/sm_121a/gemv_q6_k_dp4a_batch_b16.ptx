@@ -6,16 +6,16 @@
 .target sm_121a
 .address_size 64
 
-	// .globl	src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1
+	// .globl	src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd
 
-.visible .entry src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1(
-	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_0,
-	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_1,
-	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_2,
-	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_3,
-	.param .u64 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_4,
-	.param .u64 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_5,
-	.param .u64 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_6
+.visible .entry src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd(
+	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_0,
+	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_1,
+	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_2,
+	.param .u64 .ptr .align 1 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_3,
+	.param .u64 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_4,
+	.param .u64 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_5,
+	.param .u64 src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_6
 )
 {
 	.reg .pred 	%p<70>;
@@ -23,7 +23,7 @@
 	.reg .b32 	%r<553>;
 	.reg .b64 	%rd<108>;
 
-	ld.param.b64 	%rd71, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_5];
+	ld.param.b64 	%rd71, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_5];
 	mov.u32 	%r9, %tid.x;
 	cvt.u64.u32 	%rd15, %r9;
 	shr.u64 	%rd72, %rd15, 5;
@@ -32,9 +32,9 @@
 	add.s64 	%rd18, %rd73, %rd72;
 	setp.ge.s64 	%p34, %rd18, %rd71;
 	@%p34 bra 	$L__BB0_100;
-	ld.param.b64 	%rd65, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_6];
-	ld.param.b64 	%rd64, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_4];
-	ld.param.b64 	%rd66, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_0];
+	ld.param.b64 	%rd65, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_6];
+	ld.param.b64 	%rd64, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_4];
+	ld.param.b64 	%rd66, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_0];
 	cvta.to.global.u64 	%rd69, %rd66;
 	setp.gt.s64 	%p31, %rd65, 0;
 	setp.gt.s64 	%p32, %rd65, 1;
@@ -68,11 +68,11 @@
 	mov.b32 	%r538, %r552;
 	mov.b32 	%r537, %r552;
 	@%p36 bra 	$L__BB0_68;
-	ld.param.b64 	%rd67, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_2];
+	ld.param.b64 	%rd67, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_2];
 	cvta.to.global.u64 	%rd1, %rd67;
-	ld.param.b64 	%rd68, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_1];
+	ld.param.b64 	%rd68, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_1];
 	cvta.to.global.u64 	%rd2, %rd68;
-	ld.param.b64 	%rd70, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_a89a218fec9654d1_param_3];
+	ld.param.b64 	%rd70, [src_decode_dp4a_batch_gemv_q6_6A6A6A6A_b0ce97aa1326befd_param_3];
 	cvta.to.global.u64 	%rd106, %rd70;
 	mul.lo.s64 	%rd3, %rd64, 15;
 	mul.lo.s64 	%rd4, %rd64, 14;

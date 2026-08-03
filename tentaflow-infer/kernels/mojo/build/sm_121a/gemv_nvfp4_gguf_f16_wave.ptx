@@ -6,15 +6,15 @@
 .target sm_121a
 .address_size 64
 
-	// .globl	src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b
+	// .globl	src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682
 
-.visible .entry src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b(
-	.param .u64 .ptr .align 1 src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_0,
-	.param .u64 .ptr .align 1 src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_1,
-	.param .u64 .ptr .align 1 src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_2,
-	.param .u64 src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_3,
-	.param .u64 src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_4,
-	.param .f32 src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_5
+.visible .entry src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682(
+	.param .u64 .ptr .align 1 src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_0,
+	.param .u64 .ptr .align 1 src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_1,
+	.param .u64 .ptr .align 1 src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_2,
+	.param .u64 src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_3,
+	.param .u64 src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_4,
+	.param .f32 src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_5
 )
 {
 	.local .align 4 .b8 	__local_depot0[16];
@@ -28,7 +28,7 @@
 	mov.b64 	%SPL, __local_depot0;
 	cvta.local.u64 	%SP, %SPL;
 	mov.u32 	%r1, %tid.x;
-	ld.param.b64 	%rd15, [src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_4];
+	ld.param.b64 	%rd15, [src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_4];
 	cvt.u64.u32 	%rd16, %r1;
 	shr.u64 	%rd17, %rd16, 5;
 	mov.u32 	%r3, %ctaid.x;
@@ -36,7 +36,7 @@
 	add.s64 	%rd4, %rd18, %rd17;
 	setp.ge.s64 	%p1, %rd4, %rd15;
 	@%p1 bra 	$L__BB0_9;
-	ld.param.b64 	%rd10, [src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_3];
+	ld.param.b64 	%rd10, [src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_3];
 	and.b64 	%rd3, %rd16, 31;
 	shr.s64 	%rd20, %rd10, 63;
 	shr.u64 	%rd21, %rd20, 59;
@@ -49,9 +49,9 @@
 	setp.ge.s64 	%p4, %rd3, %rd6;
 	mov.b32 	%r490, 0f00000000;
 	@%p4 bra 	$L__BB0_7;
-	ld.param.b64 	%rd13, [src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_1];
+	ld.param.b64 	%rd13, [src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_1];
 	cvta.to.global.u64 	%rd1, %rd13;
-	ld.param.b64 	%rd14, [src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_2];
+	ld.param.b64 	%rd14, [src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_2];
 	cvta.to.global.u64 	%rd2, %rd14;
 	shr.u64 	%rd26, %rd20, 58;
 	add.s64 	%rd27, %rd10, %rd26;
@@ -1009,8 +1009,8 @@ $L__BB0_7:
 	add.f32 	%r480, %r478, %r479;
 	shfl.sync.bfly.b32 	%r481, %r480, 1, 31, -1;
 	@%p9 bra 	$L__BB0_9;
-	ld.param.b64 	%rd11, [src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_0];
-	ld.param.b32 	%r2, [src_nvfp4_gemv_nvfp4_gguf_f16_6A6A6A6A_1ced4e110dd4ff7b_param_5];
+	ld.param.b64 	%rd11, [src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_0];
+	ld.param.b32 	%r2, [src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682_param_5];
 	cvta.to.global.u64 	%rd12, %rd11;
 	shl.b64 	%rd19, %rd4, 1;
 	add.s64 	%rd5, %rd12, %rd19;

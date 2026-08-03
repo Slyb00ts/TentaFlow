@@ -7,7 +7,7 @@
 .address_size 64
 
 	// .globl	src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_242fba7a60ded285
-.extern .shared .align 4 .b8 extern_ptr_syml_4[];
+.extern .shared .align 4 .b8 extern_ptr_syml_5[];
 
 .visible .entry src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_242fba7a60ded285(
 	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_242fba7a60ded285_param_0,
@@ -77,7 +77,7 @@
 	xor.b32 	%r48, %r45, %r47;
 	setp.gt.s64 	%p1, %rd137, 0;
 	selp.b32 	%r263, 16, 0, %p1;
-	mov.b32 	%r49, extern_ptr_syml_4;
+	mov.b32 	%r49, extern_ptr_syml_5;
 	add.s32 	%r10, %r49, %r48;
 	cp.async.cg.shared.global [%r10], [%rd89], 16, %r263;
 	setp.gt.s64 	%p2, %rd137, 458752;

@@ -318,6 +318,8 @@ from src.gemm_fp8_modular import (
     gemm_fp8_mod_4096_11264,
     gemm_fp8_mod_4096_4096_bn256,
     gemm_fp8_mod_11264_4096_bn256,
+    gemm_fp8_mod_4096_11264_bn256,
+    gemm_fp8_mod_4096_14336_bn256,
 )
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.gemm_q4k_i8_multistage import (
@@ -3868,6 +3870,20 @@ def main() raises:
         dump_asm=Path("gemm_fp8_mod_11264_4096_bn256.ptx"),
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_11264_4096_bn256"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_4096_11264_bn256,
+        dump_asm=Path("gemm_fp8_mod_4096_11264_bn256.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_11264_bn256"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_4096_14336_bn256,
+        dump_asm=Path("gemm_fp8_mod_4096_14336_bn256.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_14336_bn256"))
 
     # arch: nvidia
     _ = ctx.compile_function[
