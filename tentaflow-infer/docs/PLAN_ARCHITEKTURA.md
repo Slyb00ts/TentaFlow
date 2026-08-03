@@ -123,7 +123,28 @@ podobnych zniknęło z `gemm_rows`; każde było kopią tego, co `QuantKind` ju�
 wie. `block_quant` nie ma gałęzi `_ =>`, więc nowy wariant `DevWeight` nie
 skompiluje się bez podania geometrii.
 
-#### Zmierzony kształt pozostałego iloczynu
+Zrobione: wszystkie sześć rodzin GEMV/GEMM czyta z JEDNEJ tabeli formatów
+(`model/quant_dispatch.rs`). Osiemnaście formatów blokowych miało w każdej
+rodzinie po jednym kernelu i było rozpisane sześć razy; teraz to sześć kolumn
+jednego wiersza. Dodanie kwantyzacji do wszystkich ścieżek dekodowania i
+batcha to jeden wiersz zamiast sześciu `match`-y, z których łatwo trafić pięć.
+
+| miara | przed | po |
+|---|---|---|
+| `model/gemm.rs` | 1 976 linii | **613** |
+| `model/quant_dispatch.rs` | — | 702 |
+| wystąpień `DevWeight::` w `model/` | 283 | **173** |
+
+Formaty różniące się TREŚCIĄ zostają wypisane osobno i zostały przeniesione
+dosłownie: Q8_0 wybiera w `gemm_rows` między dp4a, małym batchem i i8mma, Q4_K
+i Q6_K mają tam ścieżkę batch dp4a, a w `gemv_out_f32` próg, `NvFp4` rozgałęzia
+się po układzie pamięci.
+
+`gemm_rows` dało się zwinąć DOPIERO po `row_offset_bytes` — wcześniej jego
+osiemnaście ramion miało szesnaście różnych kształtów, bo każde niosło własną
+arytmetykę bajtów.
+
+#### Zmierzony kształt iloczynu (stan przed zwinięciem)
 
 Dyspozycja w `model/gemm.rs` to 24 warianty `DevWeight` × 6 rodzin operacji,
 rozpisane w 165 miejscach. Wyciąg z kodu pokazuje, że iloczyn jest niemal
