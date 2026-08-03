@@ -2077,6 +2077,24 @@ fn permute_rope_pairs(weight: &mut HostWeight, head_dim: usize) -> Result<()> {
         HostWeight::Iq1S { data, rows, .. } => (data, *rows),
         HostWeight::Iq1M { data, rows, .. } => (data, *rows),
         HostWeight::NvFp4Gguf { data, rows, .. } => (data, *rows),
+        // NVFP4 compressed-tensors trzyma wartości i skale w OSOBNYCH buforach,
+        // więc nie pasuje do wzorca "jeden bufor". Wiersze są w obu niezależne
+        // (bloki biegną wzdłuż kolumn: cols/2 bajtów wartości i cols/16 skal na
+        // wiersz), więc ta sama permutacja zastosowana do obu daje ten sam
+        // wynik co dla formatów jednobuforowych — bez dekwantyzacji.
+        HostWeight::NvFp4 {
+            packed,
+            scales,
+            rows,
+            cols,
+            ..
+        } => {
+            let rows = *rows;
+            let cols = *cols;
+            permute_rows(packed, rows, cols / 2, head_dim)?;
+            permute_rows(scales, rows, cols / 16, head_dim)?;
+            return Ok(());
+        }
         _ => {
             return Err(ForgeError::Unsupported(
                 "RoPE przeplatany nie obsługuje tego formatu wag".into(),
@@ -2094,6 +2112,20 @@ fn permute_rope_pairs(weight: &mut HostWeight, head_dim: usize) -> Result<()> {
         ));
     }
     let row_bytes = data.len() / rows;
+    permute_rows(data, rows, row_bytes, head_dim)
+}
+
+/// Przestawia wiersze bufora w kolejność `[0, 2, 4, …, 1, 3, 5, …]` w obrębie
+/// każdej głowy. Wydzielone z `permute_rope_pairs`, bo formaty trzymające
+/// wartości i skale osobno muszą przepuścić przez to OBA bufory, każdy ze swoim
+/// krokiem wiersza.
+fn permute_rows(data: &mut Vec<u8>, rows: usize, row_bytes: usize, head_dim: usize) -> Result<()> {
+    if data.len() != rows * row_bytes {
+        return Err(ForgeError::Format(format!(
+            "bufor {} B nie odpowiada {rows} wierszom po {row_bytes} B",
+            data.len()
+        )));
+    }
     let half = head_dim / 2;
     let mut out = vec![0u8; data.len()];
     for head in 0..rows / head_dim {
