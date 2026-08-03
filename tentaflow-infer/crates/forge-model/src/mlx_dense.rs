@@ -33,7 +33,7 @@ use forge_types::{ForgeError, MemKind, Result};
 /// batched matmul stops winning, because its activation tile no longer fits in
 /// cache and starts being re-read once per output row. Measured on M4 at 2.09x
 /// for 128 and 0.72x for 512 (docs/pomiary/eks-a4-batched-matmul-m4.md).
-pub const PREFILL_CHUNK: u32 = 128;
+pub const PREFILL_CHUNK: u32 = 512;
 
 /// Everything the decode loop needs to know about the architecture.
 #[derive(Debug, Clone, Copy)]

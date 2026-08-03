@@ -216,9 +216,11 @@ fn a_wrong_query_to_kv_mapping_is_visible() {
 }
 
 #[test]
-fn a_cache_longer_than_the_declared_bound_is_refused() {
-    // Limit siedzi w pamięci grupy roboczej, więc nie da się go przekroczyć
-    // „trochę". Kernel ma odmówić, a nie czytać poza tablicę.
+fn a_length_past_the_cache_capacity_is_refused() {
+    // Softmax przyrostowy zniósł limit wpisany w rozmiar tablicy wyników — na
+    // długość kontekstu kernel nie ma już własnego sufitu. Co ZOSTAJE: nie
+    // wolno czytać dalej, niż sięga cache. Ta granica jest realna, bo pamięć
+    // za nią należy do kogoś innego.
     let f = load();
     let Ok(dev) = MetalDevice::new() else {
         eprintln!("pomijam: brak urządzenia Metal");
@@ -248,8 +250,8 @@ fn a_cache_longer_than_the_declared_bound_is_refused() {
         .buf(&q)
         .scalar(f.heads)
         .scalar(f.kv_heads)
-        .scalar(msl::ATTN_MAX_SEQ + 1)
-        .scalar(msl::ATTN_MAX_SEQ + 1)
+        .scalar(64u32)
+        .scalar(32u32)
         .scalar(f.scale)
         .scalar(1u32);
     dev.launch(
