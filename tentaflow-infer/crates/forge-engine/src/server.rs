@@ -407,7 +407,7 @@ fn resolve_dense_prefill_batch(
 }
 
 fn mtp_ngram_auto_backend(vendor: Vendor, warp_size: u32) -> bool {
-    vendor == Vendor::Nvidia && warp_size == 32
+    forge_types::nvidia_warp32(vendor, warp_size)
 }
 
 fn resolve_mtp_ngram_batch(

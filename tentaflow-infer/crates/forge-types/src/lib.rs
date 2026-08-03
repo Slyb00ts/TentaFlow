@@ -45,6 +45,28 @@ pub struct DeviceCaps {
     pub supports_graph_capture: bool,
 }
 
+/// Czy urządzenie ma jednostkę macierzową i falę 32 — warunek wariantów
+/// pisanych pod ten kształt.
+///
+/// Świadomie NIE pyta o producenta. Warunek `vendor == Nvidia` stał kiedyś w
+/// bramce chunków prefillu i kazał każdemu modelowi qwen35 na Radeonie liczyć
+/// go porcjami po 16 tokenów, czyli czytać komplet wag 64 razy na prompt o
+/// długości 1024. Sufit wynika z rozmiaru bloku i szerokości fali, nie z
+/// nazwy producenta.
+pub fn matrix_warp32(vendor: Vendor, warp_size: u32) -> bool {
+    matches!(vendor, Vendor::Nvidia | Vendor::Amd) && warp_size == 32
+}
+
+/// Czy wolno użyć wariantu zbudowanego WYŁĄCZNIE pod NVIDIĘ.
+///
+/// To węższe pytanie od [`matrix_warp32`] i takie ma pozostać dopóki
+/// odpowiednika dla AMD nie ma w zestawie artefaktów albo nikt go nie zmierzył.
+/// Każde użycie jest kandydatem na tę samą usterkę co powyżej — sprawdzenie
+/// wymaga jednak Radeona, więc nie zgaduje się go z fotela.
+pub fn nvidia_warp32(vendor: Vendor, warp_size: u32) -> bool {
+    vendor == Vendor::Nvidia && warp_size == 32
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Vendor {

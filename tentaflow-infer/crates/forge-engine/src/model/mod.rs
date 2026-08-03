@@ -326,7 +326,7 @@ fn resolve_hybrid_prefill_chunk_size(
 /// Radeonie liczył prefill chunkami po 16 tokenów, czyli czytał komplet wag
 /// 64 razy na 1024-tokenowy prompt.
 fn hybrid_prefill_t128_backend_capable(vendor: Vendor, warp_size: u32) -> bool {
-    matches!(vendor, Vendor::Nvidia | Vendor::Amd) && warp_size == 32
+    forge_types::matrix_warp32(vendor, warp_size)
 }
 
 fn hybrid_prefill_nvfp4_chunk_limit(
@@ -340,7 +340,7 @@ fn hybrid_prefill_nvfp4_chunk_limit(
     // Karty z jednostką macierzową i falą 32 dzielą tę samą politykę: sufit
     // wynika z rozmiaru bloku, a nie z producenta. Czy kafle T32/T128 REALNIE
     // istnieją, rozstrzyga osobno limit artefaktów.
-    if matches!(vendor, Vendor::Nvidia | Vendor::Amd) && warp_size == 32 {
+    if forge_types::matrix_warp32(vendor, warp_size) {
         return if max_threads_per_block >= 512 {
             MAX_PREFILL_CHUNK
         } else if max_threads_per_block >= 64 {
@@ -2434,7 +2434,7 @@ struct MoeBufs {
 }
 
 pub(crate) fn hybrid_prefill_b2_backend_capable(vendor: Vendor, warp_size: u32) -> bool {
-    vendor == Vendor::Nvidia && warp_size == 32
+    forge_types::nvidia_warp32(vendor, warp_size)
 }
 
 /// Normy „sandwich" rodziny Gemma: delta bloku (wyjście uwagi albo FFN) jest

@@ -23,7 +23,7 @@ impl Kernels {
     pub fn hybrid_prefill_nvfp4_artifact_chunk_limit(&self) -> usize {
         let caps = self.device.caps();
         let nvidia_warp32 =
-            matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+            forge_types::nvidia_warp32(caps.vendor, caps.warp_size);
         hybrid_prefill_nvfp4_artifact_chunk_limit(nvidia_warp32, |name| self.artifacts.has(name))
     }
 
@@ -534,7 +534,7 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         let caps = self.device.caps();
-        if !matches!(caps.vendor, forge_types::Vendor::Nvidia) || caps.warp_size != 32 {
+        if !forge_types::nvidia_warp32(caps.vendor, caps.warp_size) {
             return Err(ForgeError::Unsupported(
                 "gemv_nvfp4_gguf_b1_f16 wymaga NVIDIA z warpem 32".into(),
             ));
@@ -600,7 +600,7 @@ impl Kernels {
             ));
         }
         let caps = self.device.caps();
-        let nvidia = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        let nvidia = forge_types::nvidia_warp32(caps.vendor, caps.warp_size);
         // Wariant przenośny liczy FALĘ NA WIERSZ, tak jak `gemv_q8_0_out_f32_v2`.
         // Poprzedni dawał JEDEN workgroup na wiersz słownika — dla głowy MTP to
         // 248320 grup roboczych i 111 GB/s, wobec 597 GB/s wariantu Q8_0.
@@ -1315,7 +1315,7 @@ impl Kernels {
             ));
         }
         let caps = self.device.caps();
-        let nvidia = matches!(caps.vendor, forge_types::Vendor::Nvidia) && caps.warp_size == 32;
+        let nvidia = forge_types::nvidia_warp32(caps.vendor, caps.warp_size);
         let (name, elements, block) = if nvidia {
             ("gather_nvfp4_gguf_rows_f16_nvidia", hidden_size / 2, 128u32)
         } else {

@@ -952,7 +952,7 @@ impl Kernels {
             return Ok(false);
         }
         let caps = self.device.caps();
-        if caps.vendor != forge_types::Vendor::Nvidia || caps.warp_size != 32 {
+        if !forge_types::nvidia_warp32(caps.vendor, caps.warp_size) {
             return Ok(false);
         }
         let Ok(gk) = self.artifacts.get(&format!("gemm_q8_0_i8mma_b{n_tokens}")) else {
