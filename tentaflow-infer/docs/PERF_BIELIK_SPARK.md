@@ -390,6 +390,24 @@ efekt. Silnik jest tu uczciwym pomiarem, mikrobench nie.
 Po plastrach uwaga to 73,9 ms z 364,1 ms, czyli 20,3% prefillu i drugi co do
 wielkosci skladnik. Jest tez najgorsza proporcjonalnie w calym profilu.
 
+**Transpozycja V zmierzona osobno: 4,12x.** `bench_v_transpose.mojo` wstawia
+kafle KV przy siatce i liczbie kafli jak w drugim kawalku prefillu: dzisiejsza
+wersja 648,0 us, to samo z V zapisywanym wektorowo 157,2 us. Sama transpozycja
+to 491 us z 648.
+
+Powod jest w rozkladzie bankow. `vs[(col + i) * BK + row] = vv[i]` to osiem
+osobnych zapisow po 2 bajty, a watki 0-15 maja ten sam `row`, wiec ich adresy
+roznia sie o `8*BK` wartosci f16, czyli 512 bajtow — wszystkie w tym samym
+banku. 16-drozny konflikt razy osiem zapisow.
+
+**Dopelnienie wiersza tego nie naprawi** i nie ma sensu probowac: zapis
+potrzebowalby kroku NIEpodzielnego przez 8 wartosci f16, a `ld_matrix` wymaga
+wierszy 16-bajtowych, czyli kroku podzielnego przez 8. Warunki sa sprzeczne.
+Jedyne wyjscie to nie transponowac wcale: zapisywac V tak samo jak K (wektorowo,
+bez konfliktow) i czytac operand B w P*V przez `ldmatrix.trans`, ktore
+transponuje kafle 8x8 w samej instrukcji. To zmiana ukladu fragmentow, wiec
+wymaga golden testu przed wdrozeniem.
+
 
 1,38 TFLOP (przyczynowa, 32 glowice Q, 8 KV, hd=128, dwa kawalki) w 73,9 ms to
 **19 TFLOPS**. Sufit f16 to polowa fp8, czyli okolo 125 TFLOPS, wiec uwaga
