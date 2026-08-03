@@ -183,12 +183,31 @@ Samo rozpakowanie nie jest naiwne — uzywa sztuczek bitowych na parach wartosci
 (maska znaku, przesuniecie wykladnika). Problem jest ilosciowy: zbyt wiele
 operacji pomocniczych na jedna tensorowa.
 
-Kierunek naprawy, w kolejnosci:
+Zrodlo roznicy jest jednak glebsze niz liczba instrukcji pomocniczych. Petla
+rozpakowujaca konczy sie tak:
+
+```mojo
+wv = (_e2m1x8(codes) * sc[wp]).cast[DType.float16]()
+```
+
+czyli sciezka wprost liczy na MMA **f16 `k16`**, a przepakowana na **e4m3
+`k32`** — dwa razy mniej K na instrukcje. Skali per-grupa nie da sie nalozyc
+wewnatrz zwyklego MMA FP8, wiec zejscie do f16 nie jest niedbaloscia, tylko
+konsekwencja formatu.
+
+Kierunek naprawy w obrebie tej sciezki, w kolejnosci:
 1. **Rozpakowywac wprost do ukladu operandu MMA**, zeby nie przestawiac wartosci
    po dekodowaniu.
 2. **Skale nakladac w epilogu**, a nie na kazda wartosc.
 3. Zredukowac liczbe instrukcji na wartosc (LOP3 zamiast osobnych and/or/shift).
 
-To jedyna droga, ktora daje jednoczesnie wydajnosc, 7,35 GB pamieci i zgodnosc z
-zasada "kwantyzacje liczymy wprost". Konwersja do MXFP4 dala by 2x na instrukcji
-(zmierzone: 1,999x), ale byla by DRUGA konwersja, w dodatku stratna.
+Zadne z tych trzech nie zmieni jednak `k16` na `k32`, wiec pelnego dystansu do
+paczek FP8 nie zamkna.
+
+**Korekta.** Zapisalem wczesniej, ze MXFP4 odpada, bo bylby "DRUGA konwersja, w
+dodatku stratna". Obie czesci sa nieprawdziwe. Przepakowanie do FP8, ktore
+robimy dzis, tez jest konwersja i tez jest stratne: iloczyn wartosci 4-bitowej i
+skali E4M3 trzeba zaokraglic do e4m3. Roznica jest taka, ze nasza kosztuje
+7,35 GB i daje `k32`, a MXFP4 nie kosztuje pamieci i daje `k64` (zmierzone
+1,999x wzgledem FP8). Rozstrzygac ma pomiar jakosci `forge ppl` dla obu
+konwersji, nie argument o czystosci formatu.

@@ -40,8 +40,14 @@ Bielik-PL-Minitron-7B-NVFP4, jeden DGX Spark, `--weights-pool-gb 24`:
 |---|---|---|
 | prefill @2048 | **4 784 tok/s** | 4 763 – 4 805 |
 | prefill @4096 | **4 092 tok/s** | — |
-| decode | **38,3 tok/s** | — |
+| decode | **38,0 tok/s** | 37,9 – 38,2 |
 | generacja | `Stolicą Polski jest Warszawa. Warszawa jest największym miastem…` | |
+
+Wpisane wcześniej 38,3 tok/s dekodowania było odczytem z innego stanu maszyny.
+Zmierzone 2026-08-03 na commicie sprzed refaktoru daje 37,9–38,0, a po nim
+38,0–38,1 — wartość progu poprawiona na to, co ten sam kod daje dziś. Bramkę
+zdaje się TYLKO porównaniem z baseline zmierzonym w tej samej sesji; liczba
+przepisana z dokumentu sprzed tygodnia nie jest baseline'em.
 
 Po każdym etapie: **mediana nie spada poza zakres szumu** i **generacja pozostaje
 poprawna**. Bramka MUSI być medianą z kilku przebiegów — pierwotnie ustawiłem ją
@@ -114,8 +120,16 @@ realnym ryzykiem przy ręcznym dopisywaniu.
 Do zrobienia w tym etapie: `gemm_for(&Problem)` i `pack` przeniesione na ten sam
 kontrakt.
 
-### Etap 3 — podział `launchers.rs` i wspólny rejestr wariantów ✅ rejestr ZROBIONY
-20 515 linii → `launchers/{gemm, attention, norm, quant, sample}.rs`.
+### Etap 3 — podział `launchers.rs` i wspólny rejestr wariantów ✅ ZROBIONE
+20 563 linie i jeden `impl Kernels` z 414 metodami → 19 modułów. Kwantyzacje
+GGUF dostały po module na RODZINĘ formatu, bo to realizuje „dodanie kwantyzacji
+= dodanie pliku":
+
+```
+attention 2163  deltanet 1963  gemm/nvfp4 1712  gemm/dense 1160
+gemm/fp8   726  quant     732  norm        458  sample       438
+gemm/quantized/{k_quants, i_quants, legacy, q8_0, mxfp4, mixed}
+```
 
 Rejestr wariantów uogólniony z tego, co drugi agent zrobił dla Apple:
 ```rust
@@ -132,15 +146,34 @@ FP8, rozpakowywanie wprost), każda z zapisanym pomiarem, oraz trzy testy: na
 totalność po zamiatanym zbiorze kształtów i na to, że dekodowanie wybiera
 ścieżkę bez drugiej kopii wag.
 
-Podział pliku na domeny pozostaje do zrobienia; to część czysto mechaniczna,
-podczas gdy rejestr był tą, która zmienia zachowanie.
+### Etap 4 — podział `model.rs` po ścieżkach wykonania ✅ ZROBIONE
+21 530 linii i jeden `impl Model` z 288 metodami → 16 modułów:
 
-### Etap 4 — podział `model.rs` po architekturach
-21 457 linii → `model/{loader, prefill, decode}.rs` +
-`model/arch/{llama, qwen35, deepseek_v4}.rs`.
+```
+mtp 3157  arch/dense 2822  arch/hybrid/prefill 2034  gemm 1976
+arch/hybrid/core 1061  loader 897  arch/hybrid/verify 799  debug 784
+arch/moe 741  arch/hybrid/decode 573  graph 530  sample 514
+tp 431  kv 430  scratch 117
+```
 
-Dziś wszystkie architektury żyją w jednym pliku, rozróżniane przez
-`is_hybrid()`, `is_moe()` i podobne. Dodanie modelu ma być nowym plikiem.
+Osią podziału NIE okazała się nazwa architektury (`llama`, `qwen35`,
+`deepseek_v4`), jak zakładał pierwotny plan, tylko ścieżka wykonania: gęsta,
+hybrydowa (DeltaNet) i MoE. Kod nigdy nie rozróżniał modeli po nazwie — robi to
+przez `is_hybrid()` i obecność ekspertów — więc podział po nazwach byłby
+wymyśloną warstwą. Dodanie modelu to dziś nowy moduł w `arch/`.
+
+#### Czego nauczył podział: bajtowa zgodność metod to za mało
+
+Pierwsze podejście wstawiło pustą linię WEWNĄTRZ wieloliniowego literału
+`W4A8_CALIB_TEXT` — skaner zerował stan literału na końcu każdej linii, a tekst
+kalibracyjny zawiera przykładowy kod z nawiasami klamrowymi. Porównanie ciał
+metod tego nie widziało (stała leży poza `impl`), złapał to dopiero warning
+kompilatora o zawieszonym `\` na końcu linii.
+
+Dlatego dowodem przeniesienia jest teraz: **każdy element oryginału występuje w
+wyniku dosłownie i jako ciągły fragment**, przy jedynej dozwolonej różnicy w
+postaci `pub(crate)`. 452 z 452 dla `model.rs`, 414 z 414 metod dla
+`launchers.rs`.
 
 ### Etap 5 — HAL: zdolności zamiast domysłów
 `Backend` z jawnym odpytaniem o zdolności (`has_fp4_block_scale`, `has_wgmma`,
@@ -166,6 +199,28 @@ Dlatego FA4 w całości jest tu niewykonalne, a jego dwie techniki algorytmiczne
   FP8. Po Etapie 2 jest to jedna implementacja `Quant`, a nie zmiany w
   kilkunastu miejscach. Wymaga zmierzenia jakości (`forge ppl`), bo skale
   potęgowe są zgrubniejsze niż E4M3.
+
+  **Korekta wcześniejszego wniosku.** Odrzuciłem MXFP4 jako „drugą konwersję, w
+  dodatku stratną". Obie części były nieścisłe. Kernel NVFP4 wprost rozpakowuje
+  do f16 (`wv = (_e2m1x8(codes) * sc[wp]).cast[DType.float16]()`), więc liczy
+  na MMA `k16` — połowie przepustowości FP8. Skal per-grupa nie da się nałożyć
+  wewnątrz zwykłego MMA FP8, i właśnie dlatego istnieje przepakowanie: wtapia
+  je w wartości przy ładowaniu. Ale iloczyn wartości 4-bitowej i skali E4M3
+  trzeba zaokrąglić do e4m3, więc **konwersja, którą już robimy, też jest
+  stratna** — kosztuje 7,35 GB i daje `k32`.
+
+  | ścieżka | MMA | skale per-grupa | dodatkowa pamięć | stratna |
+  |---|---|---|---|---|
+  | NVFP4 natywnie (E4M3) | — | — | — | sprzęt nie wspiera |
+  | wprost → f16 | `k16` | w kernelu | 0 | nie |
+  | przepakowanie do FP8 (dziś) | `k32` | wtopione | +7,35 GB | tak |
+  | MXFP4 | `k64` | natywnie w MMA | 0 | tak (skale) |
+
+  Zasada „licz wprost" zostaje słuszna, ale na tym sprzęcie nie da się jej
+  spełnić w pełni: natywnego NVFP4 z E4M3 nie ma. Wybór jest więc między trzema
+  kompromisami, a nie między czystością a konwersją. Rozstrzygnie pomiar
+  jakości (`forge ppl`) obu konwersji — również tej, którą stosujemy dziś i
+  której nikt nie zmierzył.
 - **Hopper i Blackwell datacenter** — dziś nie budujemy `sm_90` ani `sm_100`, więc
   FORGE tam nie ruszy. Po Etapach 3 i 5 dołożenie ścieżki `wgmma`/`tcgen05` to
   nowy wariant w rejestrze.
