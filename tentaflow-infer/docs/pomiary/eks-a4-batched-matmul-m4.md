@@ -121,6 +121,41 @@ Wycofane — i opisane, żeby nie wracać do tego z tym samym rachunkiem w ręku
 Wniosek ogólniejszy: sam rachunek ruchu pamięci nie wystarcza, bo redundantne
 odczyty aktywacji i tak są wyłapywane przez cache.
 
+## Jednostki macierzowe
+
+Blokowanie rejestrowe doszło do 1,29 TFLOPS, czyli 42% szczytu FMA. Reszta to
+mieszanka instrukcji — i tu wchodzi `simdgroup_matrix`, zmierzony w EKS-A2 na
+3,94 TFLOPS wobec 3,07 dla zwykłego FMA.
+
+Trudność jest jedna: wagi są 4-bitowe, a jednostka macierzowa nie umie ich
+czytać. Rozwiązaniem jest **dekwantyzacja bloku wagi RAZ do pamięci grupy
+roboczej**, po czym ten sam rozpakowany blok karmi wszystkie fragmenty tokenów.
+Przy bloku 32 tokenów koszt rozpakowania nibbli dzieli się przez 32 zamiast być
+płacony na token.
+
+Blok 32x32x32, cztery grupy SIMD po ćwiartce 16x16, akumulator f32:
+
+| T | macierzowo | blokowo | pętla GEMV |
+|---:|---:|---:|---:|
+| 1 | 1375,7 us/token | 1016,8 us/token | 344,3 us |
+| 8 | 176,7 us/token | **79,7 us/token** | 266,1 us/token |
+| 32 | 58,5 us/token | 74,1 us/token | 263,6 us/token |
+| 128 | **50,0 us/token** | 73,0 us/token | 259,9 us/token |
+| 256 | 52,0 us/token | 72,7 us/token | 261,4 us/token |
+
+Poniżej pełnego bloku forma macierzowa przegrywa — przy 8 tokenach zostawia
+trzy czwarte bloku pustych. Stąd trzy formy z ZMIERZONYMI zakresami: wektorowa
+dla jednego tokenu, blokowa poniżej 32, macierzowa od 32 w górę.
+
+Aktywacje, rozpakowane wagi i wynik bloku dzielą JEDNĄ tablicę 4 KB w pamięci
+grupy roboczej: w pętli po K żyją tam pierwsze dwie, po niej trzecia. Osiem
+kilobajtów zamiast czterech kosztowałoby zajętość, co ten sam dokument mierzy
+wyżej przy odrzuconym kafelkowaniu aktywacji.
+
+Cena: **forma macierzowa nie jest bitowo zgodna** z wektorową, bo jednostka
+sumuje po swojemu. Trzyma ją więc ten sam próg liczbowy co MLX — nie dalej od
+prawdy w f64 niż sama wyrocznia — a nie równość bitowa.
+
 ## Zgodność
 
 Kafel i forma wektorowa dają **identyczne bity** na tej samej pozycji —
@@ -138,20 +173,18 @@ obroty, a one też przeszły na kafel. Bielik-7B 4-bit, prompt 256 tokenów,
 
 | ścieżka | czas | przepustowość |
 |---|---:|---:|
-| token po tokenie | 11,680 s | 21,9 tok/s |
-| kaflami po 128 | 3,058 s | **83,7 tok/s** |
+| token po tokenie | 11,748 s | 21,8 tok/s |
+| kaflami po 128 | 1,882 s | **136,0 tok/s** |
 
-Przyspieszenie **3,82x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
+Przyspieszenie **6,24x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
 wywołaniem, zamiast jednego na token, więc całość zyskuje więcej niż samo
 mnożenie.
 
-Dekodowanie po prefillu: 19,2 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
-Cel prefillu to 175 tok/s, więc ta ścieżka jest na 48% drogi.
+Dekodowanie po prefillu: 19,7 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
+Cel prefillu to 175 tok/s, więc ta ścieżka jest na 78% drogi.
 
-Gdzie jest sufit: 72,3 us na token przy T=128 to 1,29 TFLOPS wobec zmierzonego
-szczytu FMA 3,07 TFLOPS, czyli 42%. Sam ruch wag daje 28 us, więc pamięć nadal
-nie jest ograniczeniem. Zostaje mieszanka instrukcji — i to jest miejsce, w
-którym wchodzi `simdgroup_matrix` (zmierzone 1,28x wobec FMA, EKS-A2).
+Gdzie jest sufit teraz: 50,0 us na token przy T=128 to 1,84 TFLOPS wobec
+zmierzonych 3,94 TFLOPS dla jednostki macierzowej, czyli 47%.
 
 Obie ścieżki wybierają ten sam token — sprawdza to asercja w samym pomiarze,
 bo inaczej porównywałby dwie różne prace.

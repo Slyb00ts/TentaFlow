@@ -221,6 +221,87 @@ fn batched_matmul_is_no_further_from_the_truth_than_mlx() {
 }
 
 #[test]
+fn the_matrix_unit_form_is_no_further_from_the_truth_than_mlx() {
+    // Ta forma NIE jest bitowo zgodna z wektorową — jednostka macierzowa sumuje
+    // po swojemu — więc trzyma ją ten sam próg co MLX: nie dalej od prawdy w f64
+    // niż sama wyrocznia. Wagi idą do niej przez half, czyli 11 bitów mantysy,
+    // a MLX dekwantyzuje do bf16, czyli ośmiu; gdyby ta droga była gorsza, ten
+    // próg by to pokazał.
+    let (group, _bits, tokens, cases) = load();
+    let Some(g) = gpu() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+
+    let (sd, od) = (ScaleDtype::Bf16, OutDtype::F32);
+    let module = g
+        .dev
+        .load_module(msl::qmg_affine_4bit_source(sd, od).as_bytes())
+        .unwrap();
+    let kernel = module.kernel(&msl::qmg_affine_4bit_name(sd, od)).unwrap();
+
+    for c in &cases {
+        assert!(
+            msl::qmg_fits(c.rows, c.cols),
+            "{}: kształt [{}, {}] nie pasuje do bloku",
+            c.name,
+            c.rows,
+            c.cols
+        );
+        let packed = g.upload(&c.packed);
+        let scales = g.upload(&c.scales);
+        let biases = g.upload(&c.biases);
+        let x = g.upload(&c.x);
+        let y = g
+            .dev
+            .alloc((tokens * c.rows) as usize * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+
+        let (gx, gy) = msl::qmg_affine_4bit_groups(c.rows, tokens);
+        g.dev
+            .launch(
+                &kernel,
+                &LaunchConfig {
+                    grid: (gx, gy, 1),
+                    block: (msl::QMG_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &LaunchArgs::new()
+                    .buf(&y)
+                    .buf(&packed)
+                    .buf(&scales)
+                    .buf(&biases)
+                    .buf(&x)
+                    .scalar(c.rows)
+                    .scalar(c.cols)
+                    .scalar(group)
+                    .scalar(tokens),
+                &g.stream,
+            )
+            .unwrap();
+        g.stream.synchronize().unwrap();
+        let got = g.read_f32(&y, (tokens * c.rows) as usize);
+
+        for t in 0..tokens as usize {
+            let lo = t * c.rows as usize;
+            let hi = lo + c.rows as usize;
+            let ours: Vec<f64> = got[lo..hi].iter().map(|v| *v as f64).collect();
+            let mlx: Vec<f64> = c.y_mlx[lo..hi].iter().map(|v| *v as f64).collect();
+            let truth = &c.y_true[lo..hi];
+            let mlx_err = rel_l2_f64(&mlx, truth);
+            let our_err = rel_l2_f64(&ours, truth);
+            assert!(
+                our_err <= mlx_err,
+                "{} token {t}: jednostka macierzowa odbiega od prawdy o {our_err:.3e}, \
+                 MLX o {mlx_err:.3e}",
+                c.name
+            );
+        }
+        eprintln!("{}: jednostka macierzowa zgodna na {tokens} tokenach", c.name);
+    }
+}
+
+#[test]
 fn the_batched_form_agrees_with_the_vector_form_bit_for_bit() {
     let (group, _bits, tokens, cases) = load();
     let Some(g) = gpu() else {
@@ -351,6 +432,11 @@ fn how_much_the_tile_actually_buys() {
         .load_module(msl::qmv_affine_4bit_source(sd, od).as_bytes())
         .unwrap();
     let mv_kernel = mv.kernel(&msl::qmv_affine_4bit_name(sd, od)).unwrap();
+    let mg = g
+        .dev
+        .load_module(msl::qmg_affine_4bit_source(sd, od).as_bytes())
+        .unwrap();
+    let mg_kernel = mg.kernel(&msl::qmg_affine_4bit_name(sd, od)).unwrap();
 
     // Pełny kształt warstwy, nie wycinek z fikstury. To jest cała różnica:
     // 128 wierszy Bielika to 720 KB wagi, która mieści się w cache, więc pętla
@@ -420,13 +506,40 @@ fn how_much_the_tile_actually_buys() {
         g.stream.synchronize().unwrap();
         let looped = t0.elapsed().as_secs_f64() / REPS as f64;
 
+        let (ggx, ggy) = msl::qmg_affine_4bit_groups(rows, tokens);
+        let cfg_mg = LaunchConfig {
+            grid: (ggx, ggy, 1),
+            block: (msl::QMG_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args_mg = LaunchArgs::new()
+            .buf(&y)
+            .buf(&packed)
+            .buf(&scales)
+            .buf(&biases)
+            .buf(&x)
+            .scalar(rows)
+            .scalar(cols)
+            .scalar(group)
+            .scalar(tokens);
+        g.dev.launch(&mg_kernel, &cfg_mg, &args_mg, &g.stream).unwrap();
+        g.stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..REPS {
+            g.dev.launch(&mg_kernel, &cfg_mg, &args_mg, &g.stream).unwrap();
+        }
+        g.stream.synchronize().unwrap();
+        let matrix = t0.elapsed().as_secs_f64() / REPS as f64;
+
         eprintln!(
-            "T={tokens:4}: kafel {:8.1} us ({:6.1} us/token), pętla GEMV {:9.1} us, \
-             przyspieszenie {:5.2}x",
+            "T={tokens:4}: macierzowo {:8.1} us ({:6.1} us/token), kafel {:8.1} us \
+             ({:6.1} us/token), pętla GEMV {:9.1} us, przyspieszenie {:5.2}x",
+            matrix * 1e6,
+            matrix * 1e6 / tokens as f64,
             batched * 1e6,
             batched * 1e6 / tokens as f64,
             looped * 1e6,
-            looped / batched
+            looped / matrix
         );
     }
 }

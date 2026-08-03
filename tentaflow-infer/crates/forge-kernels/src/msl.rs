@@ -304,6 +304,157 @@ kernel void {name}(
     )
 }
 
+/// Output block of the matrix-unit form: tokens, rows and depth per threadgroup.
+///
+/// All three are 32 because the block is built from 8x8 fragments and four SIMD
+/// groups each take a 16x16 quarter of it. Changing one changes that division.
+pub const QMG_BLOCK: u32 = 32;
+/// Four SIMD groups, one 16x16 quarter of the output block each.
+pub const QMG_THREADS: u32 = 128;
+
+pub fn qmg_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
+    format!(
+        "qmg_affine_4bit_b{}_{}_out{}",
+        QMG_BLOCK,
+        scales.suffix(),
+        out.suffix()
+    )
+}
+
+/// Grid for the matrix-unit form.
+pub fn qmg_affine_4bit_groups(n_rows: u32, n_tokens: u32) -> (u32, u32) {
+    (n_rows / QMG_BLOCK, n_tokens.div_ceil(QMG_BLOCK))
+}
+
+/// Whether a shape can use the matrix-unit form at all.
+pub fn qmg_fits(n_rows: u32, n_cols: u32) -> bool {
+    n_rows % QMG_BLOCK == 0 && n_cols % QMG_BLOCK == 0
+}
+
+/// Fused dequantize + matrix product on the SIMD matrix units.
+///
+/// The weight block is dequantized ONCE into threadgroup memory and then feeds
+/// every token fragment in the block. That is what makes unpacking affordable:
+/// against a 32-token block, the cost of turning nibbles into halves is divided
+/// by 32 instead of being paid per token.
+///
+/// The accumulation order is NOT the one the vector form uses — the matrix unit
+/// sums its own way — so this kernel is not bit-comparable with decode. It is
+/// held to the same numerical gate instead: no further from an f64 truth than
+/// MLX itself.
+pub fn qmg_affine_4bit_source(scales: ScaleDtype, out: OutDtype) -> String {
+    let ty = scales.msl();
+    let out_ty = out.msl();
+    let name = qmg_affine_4bit_name(scales, out);
+    format!(
+        r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void {name}(
+    device {out_ty}*      y        [[buffer(0)]],
+    device const uint*    packed   [[buffer(1)]],
+    device const {ty}*    scales   [[buffer(2)]],
+    device const {ty}*    biases   [[buffer(3)]],
+    device const half*    x        [[buffer(4)]],
+    constant uint&        n_rows   [[buffer(5)]],
+    constant uint&        n_cols   [[buffer(6)]],
+    constant uint&        group    [[buffer(7)]],
+    constant uint&        n_tokens [[buffer(8)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{{
+    const uint B = {block}u;
+    const uint tid  = sg * 32u + lane;
+    const uint row0 = tgid.x * B;
+    const uint tok0 = tgid.y * B;
+
+    const uint words_per_row  = n_cols / 8u;
+    const uint groups_per_row = n_cols / group;
+
+    // Jedna tablica na wszystko: w pętli po K trzyma aktywacje i rozpakowane
+    // wagi (po 2 KB), a po niej wynik bloku w f32 (4 KB). Bez tego nałożenia
+    // kernel zajmowałby 8 KB pamięci grupy roboczej zamiast 4, a zajętość jest
+    // tu wielkością zmierzoną, nie teoretyczną.
+    threadgroup float cs[{block}u * {block}u];
+    threadgroup half* xs = (threadgroup half*)cs;
+    threadgroup half* ws = xs + {block}u * {block}u;
+
+    // Ćwiartka 16x16 bloku na grupę SIMD, czyli cztery fragmenty 8x8.
+    const uint sg_tok = (sg >> 1) * 16u;
+    const uint sg_row = (sg & 1u) * 16u;
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2u; ++i) {{
+        for (uint j = 0; j < 2u; ++j) {{ acc[i][j] = simdgroup_matrix<float, 8, 8>(0); }}
+    }}
+
+    for (uint k0 = 0; k0 < n_cols; k0 += B) {{
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Wagi: jeden wątek na parę (wiersz, słowo). 32 wiersze po 4 słowa to
+        // dokładnie 128 wątków, więc rozpakowanie nie ma ani pętli, ani reszty.
+        {{
+            const uint n_local = tid / 4u;
+            const uint w_local = tid % 4u;
+            const uint rr   = row0 + n_local;
+            const uint col  = k0 + w_local * 8u;
+            const uint bits = packed[rr * words_per_row + col / 8u];
+            const float sc  = float(scales[rr * groups_per_row + col / group]);
+            const float bi  = float(biases[rr * groups_per_row + col / group]);
+            for (uint j = 0; j < 8u; ++j) {{
+                const float q = float((bits >> (j * 4u)) & 0xFu);
+                ws[(w_local * 8u + j) * B + n_local] = half(fma(q, sc, bi));
+            }}
+        }}
+        // Aktywacje: token poza wsadem wskazuje na ostatni, a jego wynik i tak
+        // trafia w dopełnienie bufora wyjściowego.
+        for (uint i = tid; i < B * B; i += {threads}u) {{
+            const uint t = i / B;
+            const uint c = i % B;
+            xs[t * B + c] = x[min(tok0 + t, n_tokens - 1u) * n_cols + k0 + c];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < B; kk += 8u) {{
+            simdgroup_matrix<half, 8, 8> a0, a1, b0, b1;
+            simdgroup_load(a0, xs + (sg_tok + 0u) * B + kk, B);
+            simdgroup_load(a1, xs + (sg_tok + 8u) * B + kk, B);
+            simdgroup_load(b0, ws + kk * B + sg_row + 0u, B);
+            simdgroup_load(b1, ws + kk * B + sg_row + 8u, B);
+            simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+        }}
+    }}
+
+    // Wynik przez pamięć grupy roboczej, bo `simdgroup_store` wymaga celu tego
+    // samego typu co akumulator, a wyjście bywa half. Przy okazji zapis idzie
+    // przez zwykłe wątki, więc tokeny poza wsadem można po prostu pominąć —
+    // kernel nie wymaga dopełnionego bufora wyjściowego.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 2u; ++i) {{
+        for (uint j = 0; j < 2u; ++j) {{
+            simdgroup_store(acc[i][j], cs + (sg_tok + i * 8u) * B + sg_row + j * 8u, B);
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < B * B; i += {threads}u) {{
+        const uint t = tok0 + i / B;
+        if (t < n_tokens) {{ y[t * n_rows + row0 + i % B] = {out_ty}(cs[i]); }}
+    }}
+}}
+"#,
+        name = name,
+        ty = ty,
+        out_ty = out_ty,
+        block = QMG_BLOCK,
+        threads = QMG_THREADS,
+    )
+}
+
 /// Threads in one RMSNorm threadgroup. The reduction is per SIMD group and
 /// then across the eight of them, so the count is fixed by the kernel body and
 /// is not something a caller may pick.

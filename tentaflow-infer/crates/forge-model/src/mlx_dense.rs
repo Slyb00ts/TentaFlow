@@ -25,6 +25,10 @@ use forge_types::{ForgeError, MemKind, Result};
 
 /// Prompt tokens carried through the layers in one pass.
 ///
+/// A multiple of the matrix-unit block, because that kernel writes whole
+/// blocks: a chunk of 100 tokens stores 128 rows and the last 28 are padding
+/// the scratch has to hold.
+///
 /// Not a round number picked for looks: past roughly this many tokens the
 /// batched matmul stops winning, because its activation tile no longer fits in
 /// cache and starts being re-read once per output row. Measured on M4 at 2.09x
@@ -84,6 +88,8 @@ struct Pipelines {
     qmv_f32: KernelHandle,
     qmm_f16: KernelHandle,
     qmm_f32: KernelHandle,
+    qmg_f16: KernelHandle,
+    qmg_f32: KernelHandle,
     rmsnorm: KernelHandle,
     silu_mul: KernelHandle,
     rope: KernelHandle,
@@ -224,6 +230,14 @@ impl MlxDense {
             qmm_f32: compile(
                 &msl::qmm_affine_4bit_source(scales_dtype, OutDtype::F32),
                 &msl::qmm_affine_4bit_name(scales_dtype, OutDtype::F32),
+            )?,
+            qmg_f16: compile(
+                &msl::qmg_affine_4bit_source(scales_dtype, OutDtype::F16),
+                &msl::qmg_affine_4bit_name(scales_dtype, OutDtype::F16),
+            )?,
+            qmg_f32: compile(
+                &msl::qmg_affine_4bit_source(scales_dtype, OutDtype::F32),
+                &msl::qmg_affine_4bit_name(scales_dtype, OutDtype::F32),
             )?,
             rmsnorm: compile(
                 &msl::rmsnorm_source(scales_dtype),
@@ -570,10 +584,17 @@ impl MlxDense {
         )
     }
 
-    /// Projection for a whole batch. One token takes the vector form, which is
-    /// three times faster there because the tile would compute eight columns and
-    /// keep one; more than one takes the tile, which is what makes prefill cheap.
-    /// The two agree bit for bit, so this choice cannot change an answer.
+    /// Projection for a whole batch.
+    ///
+    /// Three forms, each with a measured range. One token takes the vector
+    /// form. Below a full block the matrix form would leave most of that block
+    /// idle — at 8 tokens it is 177 us against 80 — so that range takes the
+    /// register-blocked loop. From a full block up, the matrix units win by
+    /// 1.46x and keep winning.
+    ///
+    /// The two do NOT agree bit for bit — a matrix unit sums its own way — so
+    /// prefill and decode can differ in the last place on a shared position.
+    /// Both are held to the same numerical gate against MLX and an f64 truth.
     fn matmul(
         &self,
         out: &DevBuffer,
@@ -590,6 +611,53 @@ impl MlxDense {
             };
             return self.gemv(k, out, w, x, 0);
         }
+        if tokens < msl::QMG_BLOCK {
+            return self.matmul_blocked(out, w, x, tokens, f16_out);
+        }
+        if !msl::qmg_fits(w.rows, w.cols) {
+            return Err(ForgeError::Unsupported(format!(
+                "kształt [{}, {}] nie dzieli się na bloki po {}",
+                w.rows,
+                w.cols,
+                msl::QMG_BLOCK
+            )));
+        }
+        let k = if f16_out {
+            &self.pipes.qmg_f16
+        } else {
+            &self.pipes.qmg_f32
+        };
+        let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
+        self.device.launch(
+            k,
+            &LaunchConfig {
+                grid: (gx, gy, 1),
+                block: (msl::QMG_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(out)
+                .buf(&w.packed)
+                .buf(&w.scales)
+                .buf(&w.biases)
+                .buf(x)
+                .scalar(w.rows)
+                .scalar(w.cols)
+                .scalar(self.shape.group)
+                .scalar(tokens),
+            &self.stream,
+        )
+    }
+
+    /// Register-blocked loop, for batches too small to fill a matrix block.
+    fn matmul_blocked(
+        &self,
+        out: &DevBuffer,
+        w: &Quantized,
+        x: &DevBuffer,
+        tokens: u32,
+        f16_out: bool,
+    ) -> Result<()> {
         let k = if f16_out {
             &self.pipes.qmm_f16
         } else {
