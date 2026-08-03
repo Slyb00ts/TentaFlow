@@ -7,6 +7,11 @@ from std.gpu.primitives.warp import shuffle_xor
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
+
+# Prog warunkowego przeskalowania softmaxu. exp(8) ~ 2981, czyli daleko od
+# zakresu f32, a im wyzszy prog tym rzadsze przeskalowania — FA4 raportuje
+# okolo dziesieciokrotnie mniej tych operacji.
+comptime SOFTMAX_RESCALE_T: Float32 = 8.0
 from std.gpu.compute.mma import mma, ld_matrix
 from src.arch_dot import dot2_f16
 from src.kv_fp8 import kv_row8_f16
@@ -301,7 +306,14 @@ def attn_prefill[head_dim: Int, kv_dtype: DType, PT: Int](
                             )
                     score = dotv.reduce_add() * scale
                 mtile = warp.max(score)
-                if mtile > m[i]:
+                # Warunkowe przeskalowanie (FlashAttention-4). Maksimum biezacego
+                # kafla przesuwa `m` DOPIERO gdy urosnie o wiecej niz prog —
+                # inaczej zostawiamy stare `m` i pomijamy przeskalowanie `l` i
+                # `acc`. Niezmiennik: po tym warunku zawsze `score <= m[i] + T`,
+                # wiec `p = exp(score - m[i]) <= exp(T)` i akumulacja f32 zostaje
+                # w bezpiecznym zakresie. Znormalizowanie przez `l` na koncu i tak
+                # skraca wspolny czynnik, wiec wynik jest ten sam.
+                if mtile > m[i] + SOFTMAX_RESCALE_T:
                     rescale = exp(m[i] - mtile)
                     l[i] *= rescale
                     acc[i] = acc[i] * rescale
