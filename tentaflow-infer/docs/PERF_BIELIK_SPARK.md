@@ -416,6 +416,23 @@ dzwignia, ktora dzialala na `gate/up`, tyle ze dobrana pod liczbe SM zamiast pod
 dlatego zostaly wczesniej odrzucone — tam L2 miedzy powtorzeniami maskowal caly
 efekt. Silnik jest tu uczciwym pomiarem, mikrobench nie.
 
+### Ogon elementwise jest SKONCZONY — nie szukac tam zyskow
+
+61,0 ms kerneli nie-GEMM i nie-uwagi, z czego realnie do wziecia okolo 10 ms, i
+to przy zalozeniu 100% pasma, ktorego nie osiaga nic:
+
+| kernel | n | ms | GB/s | % pasma | podloga | zysk |
+|---|--:|--:|--:|--:|--:|--:|
+| `silu_mul_quant` | 80 | 28,3 | 163 | 73% | 20,6 | 7,7 |
+| `rmsnorm_residual_fp8` | 158 | 23,0 | 202 | **90%** | 20,7 | 2,3 |
+| `rope_neox` | 160 | 5,1 | 526 | z L2 | — | 0 |
+| `quantize_act` | 80 | 2,7 | 375 | z L2 | — | 0 |
+| `kv_append` | 80 | 1,9 | 180 | 80% | 1,5 | 0,4 |
+
+`rope` i `quantize_act` przekraczaja pasmo pamieci, wiec czytaja z L2 — model
+bajtow je przeszacowuje i nie ma tam czego poprawiac. Jedyny kernel z realnym
+zapasem to `silu_mul_quant` (73%), wart okolo 8 ms z 361.
+
 ### Uwaga: 19 TFLOPS, czyli 15% wlasnego sufitu — TERAZ NAJWIEKSZY POJEDYNCZY CEL
 
 Po plastrach uwaga to 73,9 ms z 364,1 ms, czyli 20,3% prefillu i drugi co do
