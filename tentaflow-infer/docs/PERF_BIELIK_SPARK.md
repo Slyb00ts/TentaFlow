@@ -7,7 +7,8 @@ Pomiary na GB10 (sm_121a, 48 SM, pamięć zunifikowana 121 GiB),
 
 | prompt | prefill tok/s | decode tok/s | zmierzone |
 |---|---|---|---|
-| 2 048 | **4 938** | 38,0–38,1 | 2026-08-03, mediana z 3 przebiegow |
+| 2 048 | **5 676** | 37,8–37,9 | 2026-08-03, plastry 1536, SHA tokenow bez zmian |
+| 2 048 | 4 966 | 38,3 | 2026-08-03, przed plastrami |
 | 512 | 3 930 | 40,2 | starszy pomiar |
 | 4 096 | 3 902 | 35,4 | starszy pomiar |
 
@@ -365,6 +366,18 @@ GEMM-y sa zwiazane pamiecia; przy plastrze 1536 spada do 66 ms, czyli ponizej
 podlogi — i GEMM-y staja sie zwiazane obliczeniem. Szacowany zysk: 271 -> okolo
 150-180 ms.
 
+**ZROBIONE, potwierdzone pomiarem.** Prefill 412,4 -> 360,8 ms (4966 -> 5676
+tok/s), SHA256 wygenerowanych tokenow bez zmian. `nsys` przypisuje calosc
+GEMM-om: 271,9 -> 220,4 ms, czyli 109 -> **134 TFLOPS**, przy nieruszonych
+uwadze (74,2 -> 73,9), SwiGLU (29,2 -> 28,3) i normach (22,8 -> 23,4).
+Liczba wywolan GEMM rosnie 880 -> 2160, przez co zajetosc GPU spada 99,1% ->
+98,0% — okolo 7 ms oddane na koszt uruchomien, przy 51 ms zysku.
+
+Zostaje 220,4 ms wobec 195 ms, ktore wyszlyby z plateau mikrobenchu (151
+TFLOPS), i wobec 118 ms podlogi obliczeniowej. Slabym punktem jest ogon
+gate/up: 11264 = 7 x 1536 + 512, a ten ostatni plaster ma 2 kafle kolumnowe,
+czyli 16 blokow z 48.
+
 Plaster 1536 daje dokladnie 6 kafli kolumnowych na 8 wierszy M, czyli 48 blokow
 = 48 SM: wszystkie wiersze M rezydentne naraz i komplet SM zajety. To ta sama
 dzwignia, ktora dzialala na `gate/up`, tyle ze dobrana pod liczbe SM zamiast pod
@@ -372,7 +385,11 @@ dzwignia, ktora dzialala na `gate/up`, tyle ze dobrana pod liczbe SM zamiast pod
 dlatego zostaly wczesniej odrzucone — tam L2 miedzy powtorzeniami maskowal caly
 efekt. Silnik jest tu uczciwym pomiarem, mikrobench nie.
 
-### Uwaga: 19 TFLOPS, czyli 15% wlasnego sufitu
+### Uwaga: 19 TFLOPS, czyli 15% wlasnego sufitu — TERAZ NAJWIEKSZY POJEDYNCZY CEL
+
+Po plastrach uwaga to 73,9 ms z 364,1 ms, czyli 20,3% prefillu i drugi co do
+wielkosci skladnik. Jest tez najgorsza proporcjonalnie w calym profilu.
+
 
 1,38 TFLOP (przyczynowa, 32 glowice Q, 8 KV, hd=128, dwa kawalki) w 73,9 ms to
 **19 TFLOPS**. Sufit f16 to polowa fp8, czyli okolo 125 TFLOPS, wiec uwaga
