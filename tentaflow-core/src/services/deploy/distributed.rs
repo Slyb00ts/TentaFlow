@@ -140,7 +140,9 @@ fn mp_node_rank(spec: &DistributedDeploySpec) -> Result<u32, String> {
 /// `--max-num-seqs`/`--max-cudagraph-capture-size` mozna nadpisac przez
 /// `vllm_args` (argparse: ostatnie wystapienie wygrywa).
 fn vllm_mp_engine_args(engine_id: &str, spec_num_tokens: Option<u32>) -> Vec<String> {
-    if engine_id != "vllm-dspark" {
+    // `vllm-dspark` (prebuilt fork) i `vllm-dspark-src` (vLLM 0.26 ze zrodel)
+    // serwuja ten sam checkpoint tym samym dialektem — profil jest wspolny.
+    if !matches!(engine_id, "vllm-dspark" | "vllm-dspark-src") {
         return Vec::new();
     }
     let k = spec_num_tokens.unwrap_or(5).max(1);

@@ -1872,7 +1872,20 @@ mod nvfp4_gguf_dispatch_tests {
             1024,
             |_| true,
         ));
+        // Kształt spoza tablicy BN=256 (projekcja K/V) nie ma wariantu i musi
+        // zostać odrzucony. `down` (4096, 11264) świadomie NIE jest już takim
+        // kształtem — to jemu BN=256 daje najwięcej.
         assert!(!fp8_modular_bn256_capable(
+            Vendor::Nvidia,
+            32,
+            1024,
+            100 * 1024,
+            1024,
+            4096,
+            1024,
+            |_| true,
+        ));
+        assert!(fp8_modular_bn256_capable(
             Vendor::Nvidia,
             32,
             1024,

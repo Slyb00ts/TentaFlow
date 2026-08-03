@@ -58,10 +58,35 @@ RUN --mount=type=cache,target=/ccache \
     python3 -m pip install --no-build-isolation -r requirements/build/cuda.txt && \
     python3 -m pip install --no-build-isolation .
 
+# The base image carries flashinfer-cubin from ITS vLLM (0.19); installing 0.26
+# pulls a newer flashinfer and the two are version-locked against each other --
+# the worker dies at init with "flashinfer-cubin (x) does not match flashinfer
+# (y)". Resolve the cubin from whatever flashinfer actually landed rather than
+# pinning a number that goes stale at the next bump.
+#
+# Read the version from package METADATA, not by importing flashinfer: the very
+# check we are fixing runs at import time, so `import flashinfer` raises the
+# mismatch instead of reporting it.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    FI=$(python3 -c "from importlib.metadata import version; print(version('flashinfer'))") && \
+    echo "flashinfer=$FI -- dopasowuje cubin" && \
+    python3 -m pip install --no-deps --force-reinstall "flashinfer-cubin==$FI" && \
+    python3 -c "import flashinfer; print('flashinfer OK', flashinfer.__version__)"
+
+# Drop the checkout. It is build residue, and worse: /src/vllm/vllm SHADOWS the
+# installed package on sys.path, so the runtime imports unpatched sources while
+# the patch reports success against dist-packages. The image boots, serves, and
+# silently rejects nvfp4_ds_mla.
+WORKDIR /
+RUN rm -rf /src
+
 # The one thing upstream still does not have: the nvfp4_ds_mla KV cache dtype.
+# Five anchored edits -- dtype registration, page geometry, model-side resolution.
+# The 0.21-era script is NOT usable here: it also forced the 584B page envelope,
+# which upstream now computes itself, and its anchors predate the restructure.
 # Anchor-based and idempotent -- a vLLM bump that moves an anchor fails the build
 # here with the file name instead of producing a runtime that boots and lies.
-COPY tentaflow-containers/llm/patches/dspark/patch_nvfp4_stages.py /tmp/patch_nvfp4.py
+COPY tentaflow-containers/llm/patches/dspark/patch_nvfp4_026.py /tmp/patch_nvfp4.py
 RUN python3 /tmp/patch_nvfp4.py && rm /tmp/patch_nvfp4.py
 
 # Fabric variables (NCCL_IB_HCA / NCCL_SOCKET_IFNAME / NCCL_IB_GID_INDEX /
