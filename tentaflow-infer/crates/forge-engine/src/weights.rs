@@ -2055,6 +2055,76 @@ impl HostWeight {
     }
 }
 
+
+impl HostWeight {
+    /// Bufory tego formatu ułożone WIERSZOWO, wraz z krokiem wiersza w bajtach.
+    ///
+    /// Każdy format odpowiada tu za siebie, zamiast być wyliczany w cudzym
+    /// `match` razem z dwudziestoma innymi. Tamten kształt kosztował: NVFP4
+    /// compressed-tensors wpadał w gałąź „nieobsługiwane", bo trzyma wartości i
+    /// skale w DWÓCH buforach i nie pasował do wzorca „jeden bufor".
+    ///
+    /// Zwraca liczbę wierszy i listę widoków; operacja wierszowa (dziś
+    /// permutacja RoPE) przechodzi po wszystkich, każdy ze swoim krokiem.
+    fn row_views_mut(&mut self) -> Result<(usize, Vec<(&mut Vec<u8>, usize)>)> {
+        // Formaty jednobuforowe: krok wiersza wynika z rozmiaru bufora.
+        macro_rules! single {
+            ($data:expr, $rows:expr) => {{
+                let rows = $rows;
+                let data = $data;
+                if rows == 0 || !data.len().is_multiple_of(rows) {
+                    return Err(ForgeError::Format(
+                        "rozmiar macierzy nie dzieli się na równe wiersze".into(),
+                    ));
+                }
+                let row_bytes = data.len() / rows;
+                Ok((rows, vec![(data, row_bytes)]))
+            }};
+        }
+        match self {
+            HostWeight::F16 { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q8_0 { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q4K { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q6K { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q5K { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q3K { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q2K { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q4_0 { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q4_1 { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q5_0 { data, rows, .. } => single!(data, *rows),
+            HostWeight::Q5_1 { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq4Nl { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq4Xs { data, rows, .. } => single!(data, *rows),
+            HostWeight::Mxfp4 { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq2Xs { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq2S { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq3S { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq2Xxs { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq3Xxs { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq1S { data, rows, .. } => single!(data, *rows),
+            HostWeight::Iq1M { data, rows, .. } => single!(data, *rows),
+            HostWeight::NvFp4Gguf { data, rows, .. } => single!(data, *rows),
+            // NVFP4 compressed-tensors: wartości i skale osobno. Wiersze są
+            // niezależne w obu (bloki biegną wzdłuż kolumn), więc ta sama
+            // permutacja nałożona na oba daje ten sam wynik co dla formatów
+            // jednobuforowych — bez dekwantyzacji.
+            HostWeight::NvFp4 {
+                packed,
+                scales,
+                rows,
+                cols,
+                ..
+            } => {
+                let (rows, cols) = (*rows, *cols);
+                Ok((rows, vec![(packed, cols / 2), (scales, cols / 16)]))
+            }
+            _ => Err(ForgeError::Unsupported(
+                "ten format wag nie deklaruje układu wierszowego".into(),
+            )),
+        }
+    }
+}
+
 /// Przestawia wiersze Q/K tak, żeby kernel RoPE w stylu NeoX policzył rotację
 /// PRZEPLATANĄ, której wymaga rodzina Llama.
 ///
@@ -2073,65 +2143,16 @@ fn permute_rope_pairs(weight: &mut HostWeight, head_dim: usize) -> Result<()> {
             "RoPE przeplatany wymaga parzystego head_dim, jest {head_dim}"
         )));
     }
-    let (data, rows) = match weight {
-        HostWeight::F16 { data, rows, .. } => (data, *rows),
-        HostWeight::Q8_0 { data, rows, .. } => (data, *rows),
-        HostWeight::Q4K { data, rows, .. } => (data, *rows),
-        HostWeight::Q6K { data, rows, .. } => (data, *rows),
-        HostWeight::Q5K { data, rows, .. } => (data, *rows),
-        HostWeight::Q3K { data, rows, .. } => (data, *rows),
-        HostWeight::Q2K { data, rows, .. } => (data, *rows),
-        HostWeight::Q4_0 { data, rows, .. } => (data, *rows),
-        HostWeight::Q4_1 { data, rows, .. } => (data, *rows),
-        HostWeight::Q5_0 { data, rows, .. } => (data, *rows),
-        HostWeight::Q5_1 { data, rows, .. } => (data, *rows),
-        HostWeight::Iq4Nl { data, rows, .. } => (data, *rows),
-        HostWeight::Iq4Xs { data, rows, .. } => (data, *rows),
-        HostWeight::Mxfp4 { data, rows, .. } => (data, *rows),
-        HostWeight::Iq2Xs { data, rows, .. } => (data, *rows),
-        HostWeight::Iq2S { data, rows, .. } => (data, *rows),
-        HostWeight::Iq3S { data, rows, .. } => (data, *rows),
-        HostWeight::Iq2Xxs { data, rows, .. } => (data, *rows),
-        HostWeight::Iq3Xxs { data, rows, .. } => (data, *rows),
-        HostWeight::Iq1S { data, rows, .. } => (data, *rows),
-        HostWeight::Iq1M { data, rows, .. } => (data, *rows),
-        HostWeight::NvFp4Gguf { data, rows, .. } => (data, *rows),
-        // NVFP4 compressed-tensors trzyma wartości i skale w OSOBNYCH buforach,
-        // więc nie pasuje do wzorca "jeden bufor". Wiersze są w obu niezależne
-        // (bloki biegną wzdłuż kolumn: cols/2 bajtów wartości i cols/16 skal na
-        // wiersz), więc ta sama permutacja zastosowana do obu daje ten sam
-        // wynik co dla formatów jednobuforowych — bez dekwantyzacji.
-        HostWeight::NvFp4 {
-            packed,
-            scales,
-            rows,
-            cols,
-            ..
-        } => {
-            let rows = *rows;
-            let cols = *cols;
-            permute_rows(packed, rows, cols / 2, head_dim)?;
-            permute_rows(scales, rows, cols / 16, head_dim)?;
-            return Ok(());
-        }
-        _ => {
-            return Err(ForgeError::Unsupported(
-                "RoPE przeplatany nie obsługuje tego formatu wag".into(),
-            ));
-        }
-    };
+    let (rows, views) = weight.row_views_mut()?;
     if rows == 0 || !rows.is_multiple_of(head_dim) {
         return Err(ForgeError::Format(format!(
             "liczba wierszy {rows} nie jest wielokrotnością head_dim {head_dim}"
         )));
     }
-    if !data.len().is_multiple_of(rows) {
-        return Err(ForgeError::Format(
-            "rozmiar macierzy nie dzieli się na równe wiersze".into(),
-        ));
+    for (data, row_bytes) in views {
+        permute_rows(data, rows, row_bytes, head_dim)?;
     }
-    let row_bytes = data.len() / rows;
-    permute_rows(data, rows, row_bytes, head_dim)
+    Ok(())
 }
 
 /// Przestawia wiersze bufora w kolejność `[0, 2, 4, …, 1, 3, 5, …]` w obrębie
@@ -5383,3 +5404,63 @@ pub fn load_ffn_shards_gguf(
     Ok(out)
 }
 
+
+#[cfg(test)]
+mod rope_permute_tests {
+    use super::*;
+
+    /// Permutacja musi ruszyc OBA bufory NVFP4 compressed-tensors, kazdy swoim
+    /// krokiem. Wczesniej ten format w ogole nie mial deklaracji ukladu i
+    /// wpadal w galaz "nieobslugiwane"; po dopisaniu go na wyczucie latwo bylo
+    /// pomylic krok skal (cols/16) z krokiem wartosci (cols/2).
+    #[test]
+    fn nvfp4_ct_permutes_values_and_scales_with_their_own_stride() {
+        let rows = 4usize; // head_dim = 4, jedna glowa
+        let cols = 32usize;
+        let packed_row = cols / 2; // 16 B
+        let scale_row = cols / 16; // 2 B
+        let mut w = HostWeight::NvFp4 {
+            names: vec!["t".into()],
+            packed: (0..rows)
+                .flat_map(|r| std::iter::repeat(r as u8).take(packed_row))
+                .collect(),
+            scales: (0..rows)
+                .flat_map(|r| std::iter::repeat(100 + r as u8).take(scale_row))
+                .collect(),
+            global_scale: 1.0,
+            rows,
+            cols,
+        };
+        permute_rope_pairs(&mut w, 4).expect("permutacja");
+        let HostWeight::NvFp4 { packed, scales, .. } = &w else {
+            panic!("wariant zmieniony");
+        };
+        // [0,1,2,3] -> [0,2,1,3]
+        let want = [0u8, 2, 1, 3];
+        for (i, r) in want.iter().enumerate() {
+            assert_eq!(packed[i * packed_row], *r, "wartosci, wiersz {i}");
+            assert_eq!(scales[i * scale_row], 100 + *r, "skale, wiersz {i}");
+        }
+    }
+
+    /// Format jednobuforowy zachowuje sie tak samo — jeden kontrakt dla obu.
+    #[test]
+    fn single_buffer_format_uses_the_same_contract() {
+        let rows = 4usize;
+        let row_bytes = 8usize;
+        let mut w = HostWeight::F16 {
+            data: (0..rows)
+                .flat_map(|r| std::iter::repeat(r as u8).take(row_bytes))
+                .collect(),
+            rows,
+            cols: row_bytes / 2,
+        };
+        permute_rope_pairs(&mut w, 4).expect("permutacja");
+        let HostWeight::F16 { data, .. } = &w else {
+            panic!("wariant zmieniony");
+        };
+        for (i, r) in [0u8, 2, 1, 3].iter().enumerate() {
+            assert_eq!(data[i * row_bytes], *r, "wiersz {i}");
+        }
+    }
+}

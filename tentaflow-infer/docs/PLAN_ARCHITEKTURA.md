@@ -63,7 +63,7 @@ warstwy to trzy wywołania bez rozgałęzień.
 
 Zysk: dodanie formatu przestaje wymagać dopisywania go w każdym miejscu wywołania.
 
-### Etap 2 — kwantyzacja jako trait
+### Etap 2 — kwantyzacja jako trait ✅ ZROBIONE (pierwszy wycinek)
 `trait Quant { fn pack(..); fn permute_rope_rows(..); fn gemm_for(&Problem) -> KernelChoice; }`
 z implementacjami: `nvfp4_ct`, `nvfp4_gguf`, `fp8`, `q4k`, `q8_0`, …
 
@@ -71,6 +71,16 @@ Likwiduje klasę błędów, której przykładem była permutacja RoPE: format sa
 odpowiada, czy i jak go permutować, zamiast być wyliczany w cudzym `match`.
 
 Warunek dodatkowy: test regresyjny na permutację per format.
+
+Zrobione: `HostWeight::row_views_mut` — każdy format deklaruje własny układ
+wierszowy (bufory + krok), a `permute_rope_pairs` przechodzi po widokach zamiast
+wyliczać dwadzieścia wariantów. NVFP4 CT przestaje być przypadkiem szczególnym:
+dwa bufory z krokami `cols/2` i `cols/16` to zwykły wpis. Dwa testy regresyjne
+pilnują, że oba bufory są permutowane KAŻDY SWOIM krokiem — pomylenie ich było
+realnym ryzykiem przy ręcznym dopisywaniu.
+
+Do zrobienia w tym etapie: `gemm_for(&Problem)` i `pack` przeniesione na ten sam
+kontrakt.
 
 ### Etap 3 — podział `launchers.rs` i wspólny rejestr wariantów
 20 515 linii → `launchers/{gemm, attention, norm, quant, sample}.rs`.
