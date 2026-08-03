@@ -121,6 +121,11 @@ pub static NVFP4_MATMUL: Registry<Nvfp4MatmulForm> = Registry {
     ],
 };
 
+// The Metal forms live in a module so their tests sit beside them, but the
+// registry is a public interface — `mlx_dense` picks its kernel through it.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal_forms::*;
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_forms {
     use super::*;
