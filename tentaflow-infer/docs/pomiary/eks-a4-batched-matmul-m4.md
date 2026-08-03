@@ -200,8 +200,8 @@ Blok 32x64x32, cztery grupy SIMD w układzie 1x4, akumulator f32:
 | 1 | 1375,7 us/token | 1016,8 us/token | 344,3 us |
 | 8 | 176,7 us/token | **79,7 us/token** | 266,1 us/token |
 | 32 | 58,5 us/token | 74,1 us/token | 263,6 us/token |
-| 128 | **31,0 us/token** | 72,6 us/token | 265,0 us/token |
-| 256 | 30,1 us/token | 72,8 us/token | 259,5 us/token |
+| 128 | **29,8 us/token** | 72,2 us/token | 261,5 us/token |
+| 256 | 29,0 us/token | 72,7 us/token | 264,5 us/token |
 
 Poniżej pełnego bloku forma macierzowa przegrywa — przy 8 tokenach zostawia
 trzy czwarte bloku pustych. Stąd trzy formy z ZMIERZONYMI zakresami: wektorowa
@@ -234,9 +234,11 @@ obroty, a one też przeszły na kafel. Bielik-7B 4-bit, prompt 256 tokenów,
 | ścieżka | czas | przepustowość |
 |---|---:|---:|
 | token po tokenie | 11,446 s | 22,4 tok/s |
-| kaflami po 128 | 1,333 s | **192,1 tok/s** |
+| kaflami po 128 | 1,275 s | **200,8 tok/s** |
 
-Przyspieszenie **8,59x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
+Przyspieszenie **9,29x**. Pomiar z rozgrzewką i medianą, testy uruchamiane
+pojedynczo (`--test-threads=1`) — patrz EKS-A5, gdzie zaniedbanie obu rzeczy
+kosztowało błędny wniosek. Uwaga liczy teraz wszystkie zapytania kafla jednym
 wywołaniem, zamiast jednego na token, więc całość zyskuje więcej niż samo
 mnożenie.
 
@@ -251,8 +253,29 @@ normalizacje, obroty i reszta warstwy mieszczą się w kilku procentach.
 Bezwzględny sufit obliczeniowy z EKS-A2 dla tej klasy modelu to ~260 tok/s.
 Jesteśmy na 74% niego i na 75% szczytu instrukcji macierzowej.
 
-Ostatnia rzecz sprawdzona i odrzucona: **czytanie fragmentu aktywacji wprost z
-pamięci urządzenia**, bez wystawiania go do pamięci grupy roboczej.
+### Podwójny bufor: jedna bariera na krok zamiast dwóch
+
+Przy jednym buforze w pamięci grupy roboczej krok po K potrzebuje bariery PRZED
+zapisem (żeby nikt jeszcze nie czytał starej zawartości) i PO nim (żeby wszyscy
+zobaczyli nową). Przy dwóch buforach zapis idzie tam, skąd nikt akurat nie
+czyta, więc zostaje jedna bariera. Przy 352 krokach po K na blok wyjścia to jest
+352 barier mniej, każda na 128 wątkach.
+
+**Kosztuje to zero pamięci grupy roboczej**, bo szczyt jej zużycia i tak
+wyznacza epilog (64x64 f32 = 16 KB), a podwojone wystawianie wejść mieści się
+dokładnie w tym samym. 31,0 → 29,8 us na token, a na modelu 194,1 → 200,8 tok/s.
+
+Rozpakowanie liczy się teraz w half zamiast w f32 z konwersją na końcu: skale są
+i tak bf16, więc osiem bitów mantysy, a half ma jedenaście. Bramka wobec prawdy
+w f64 pilnuje, że to zdanie jest prawdziwe.
+
+Po tej zmianie blok przemierzono raz jeszcze — 64x64x32 się utrzymał (29,9 wobec
+32,7 dla 32x64x32 i 30,3 dla 64x64x16), a 64x128x32 nadal się rozlewa (219 us).
+
+Sprawdzone i odrzucone także **po** wprowadzeniu potokowania, bo wcześniejsze
+werdykty zapadały przy innej strukturze: transponowane wystawianie wagi (31,3
+wobec 31,0, czyli szum) oraz **czytanie fragmentu aktywacji wprost z
+pamięci urządzenia** bez wystawiania go do pamięci grupy roboczej.
 `simdgroup_load` to potrafi, a wystawianie kosztuje odczyt i zapis na wartość,
 więc wyglądało to na czystą oszczędność instrukcji. Wyszło 31,6 wobec 31,0 us
 na token — te same osiem wierszy jest czytane ponownie dla każdego kroku po K i

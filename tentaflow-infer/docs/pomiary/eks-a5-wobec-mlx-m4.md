@@ -23,8 +23,11 @@ nie sygnalizuje pomyłki.
 
 | | MLX | nasz | stosunek |
 |---|---:|---:|---:|
-| prefill | **219,0 tok/s** | 194,1 tok/s | **89%** |
+| prefill | **219,0 tok/s** | 200,8 tok/s | **92%** |
 | dekodowanie | **22,4 tok/s** | 21,9 tok/s | **98%** |
+
+Prefill podniósł się ze 194,1 po wprowadzeniu podwójnego buforowania w kernelu
+macierzowym (EKS-A4).
 
 ### Korekta pierwszej wersji tego pomiaru
 
@@ -54,9 +57,9 @@ więc dogonienia konkurenta, tylko dogonienie nieaktualnej liczby. Zapisane
 tutaj, bo dokument, który podaje cel, powinien podawać też skąd ten cel
 pochodzi i kiedy przestał być prawdziwy.
 
-**Prefill: brakuje 11%, i to jest jedyna realna luka.** Jesteśmy na 75% sufitu
+**Prefill: brakuje 8%, i to jest jedyna realna luka.** Jesteśmy na 77% sufitu
 obliczeniowego (EKS-A2: ~260 tok/s), MLX na 84%. Nasz kernel macierzowy wyciąga
-2,97 z 3,94 TFLOPS.
+3,08 z 3,94 TFLOPS.
 
 **Dekodowanie: praktycznie na równi.** Dekodowanie jest ograniczone pamięcią:
 jeden token to jedno przejście przez 4,2 GB wag, co przy zmierzonych 102,4 GB/s

@@ -360,7 +360,7 @@ pub fn qmg_affine_4bit_source(scales: ScaleDtype, out: OutDtype) -> String {
     let out_ty = out.msl();
     let name = qmg_affine_4bit_name(scales, out);
     let (fm, fn_) = (QMG_BM / QMG_SG_M / 8, QMG_BN / QMG_SG_N / 8);
-    let stage_halfs = QMG_BM * QMG_BK + QMG_BK * QMG_BN;
+    let stage_halfs = 2 * (QMG_BM * QMG_BK + QMG_BK * QMG_BN);
 
     // Wynik przechodzi przez pamiec grupy roboczej, w obu wariantach wyjscia.
     // Zapis wprost z jednostki macierzowej probowano: `simdgroup_store` do
@@ -420,7 +420,7 @@ kernel void {name}(
     // wagi, a po niej — o ile wyjscie tego wymaga — wynik bloku w f32.
     threadgroup float cs[{floats}u];
     threadgroup half* xs = (threadgroup half*)cs;
-    threadgroup half* ws = xs + {bm}u * {bk}u;
+    threadgroup half* ws = xs + 2u * {bm}u * {bk}u;
 
     // Wycinek bloku na grupe SIMD.
     const uint sg_tok = (sg / {sg_n}u) * {sub_bm}u;
@@ -440,59 +440,67 @@ kernel void {name}(
     half  x_pre[{xs_pt}];
     half  w_pre[{ws_pt} * 8];
 
-    for (uint pass = 0; pass * {bk}u < n_cols + {bk}u; ++pass) {{
-        const uint k0 = pass * {bk}u;
+    // Dwa komplety buforow w pamieci grupy roboczej, na przemian. Przy jednym
+    // trzeba bariery PRZED zapisem (zeby nikt jeszcze nie czytal) i PO nim (zeby
+    // wszyscy zobaczyli) — dwie na krok po K. Przy dwoch zapis idzie tam, skad
+    // nikt teraz nie czyta, wiec zostaje jedna. Szczyt zuzycia pamieci grupy
+    // roboczej sie nie zmienia, bo wyznacza go i tak epilog.
+    const uint blocks = (n_cols + {bk}u - 1u) / {bk}u;
 
-        // Wystawienie tego, co przeczytano w poprzednim obiegu.
-        if (pass > 0u) {{
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint e = 0; e < xs_per_thread; ++e) {{
-                const uint i = tid + e * {threads}u;
-                xs[(i / {bk}u) * {bk}u + i % {bk}u] = x_pre[e];
-            }}
-            for (uint e = 0; e < ws_per_thread; ++e) {{
-                const uint p = tid + e * {threads}u;
-                const uint n_local = p / ({bk}u / 8u);
-                const uint w_local = p % ({bk}u / 8u);
-                for (uint j = 0; j < 8u; ++j) {{
-                    ws[(w_local * 8u + j) * {bn}u + n_local] = w_pre[e * 8u + j];
-                }}
-            }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+#define QMG_FETCH(K0)                                                          \
+    for (uint e = 0; e < xs_per_thread; ++e) {{                                 \
+        const uint i = tid + e * {threads}u;                                    \
+        x_pre[e] = x[min(tok0 + i / {bk}u, n_tokens - 1u) * n_cols              \
+                     + (K0) + i % {bk}u];                                       \
+    }}                                                                          \
+    for (uint e = 0; e < ws_per_thread; ++e) {{                                 \
+        const uint p = tid + e * {threads}u;                                    \
+        const uint n_local = p / ({bk}u / 8u);                                  \
+        const uint w_local = p % ({bk}u / 8u);                                  \
+        const uint rr   = row0 + n_local;                                       \
+        const uint col  = (K0) + w_local * 8u;                                  \
+        const uint bits = packed[rr * words_per_row + col / 8u];                \
+        const half sc = half(scales[rr * groups_per_row + col / group]);        \
+        const half bi = half(biases[rr * groups_per_row + col / group]);        \
+        for (uint j = 0; j < 8u; ++j) {{                                        \
+            w_pre[e * 8u + j] = fma(half((bits >> (j * 4u)) & 0xFu), sc, bi);   \
+        }}                                                                      \
+    }}
+
+    QMG_FETCH(0u)
+
+    for (uint blk = 0; blk < blocks; ++blk) {{
+        threadgroup half* xcur = xs + (blk & 1u) * {bm}u * {bk}u;
+        threadgroup half* wcur = ws + (blk & 1u) * {bk}u * {bn}u;
+
+        for (uint e = 0; e < xs_per_thread; ++e) {{
+            const uint i = tid + e * {threads}u;
+            xcur[i] = x_pre[e];
         }}
-
-        // Odczyt nastepnego bloku do rejestrow — niezalezny od mnozen ponizej,
-        // wiec sprzet ma czym zapelnic czas oczekiwania na pamiec.
-        if (k0 < n_cols) {{
-            for (uint e = 0; e < xs_per_thread; ++e) {{
-                const uint i = tid + e * {threads}u;
-                x_pre[e] = x[min(tok0 + i / {bk}u, n_tokens - 1u) * n_cols + k0 + i % {bk}u];
-            }}
-            for (uint e = 0; e < ws_per_thread; ++e) {{
-                const uint p = tid + e * {threads}u;
-                const uint n_local = p / ({bk}u / 8u);
-                const uint w_local = p % ({bk}u / 8u);
-                const uint rr   = row0 + n_local;
-                const uint col  = k0 + w_local * 8u;
-                const uint bits = packed[rr * words_per_row + col / 8u];
-                const float sc  = float(scales[rr * groups_per_row + col / group]);
-                const float bi  = float(biases[rr * groups_per_row + col / group]);
-                for (uint j = 0; j < 8u; ++j) {{
-                    w_pre[e * 8u + j] =
-                        half(fma(float((bits >> (j * 4u)) & 0xFu), sc, bi));
-                }}
+        for (uint e = 0; e < ws_per_thread; ++e) {{
+            const uint p = tid + e * {threads}u;
+            const uint n_local = p / ({bk}u / 8u);
+            const uint w_local = p % ({bk}u / 8u);
+            for (uint j = 0; j < 8u; ++j) {{
+                wcur[(w_local * 8u + j) * {bn}u + n_local] = w_pre[e * 8u + j];
             }}
         }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (pass == 0u) {{ continue; }}
+        // Nastepny blok do rejestrow — niezalezny od mnozen ponizej, wiec
+        // sprzet ma czym zapelnic czas oczekiwania na pamiec.
+        if (blk + 1u < blocks) {{
+            const uint k_next = (blk + 1u) * {bk}u;
+            QMG_FETCH(k_next)
+        }}
 
         for (uint kk = 0; kk < {bk}u; kk += 8u) {{
             simdgroup_matrix<half, 8, 8> a[{fm}], b[{fn}];
             for (uint i = 0; i < {fm}u; ++i) {{
-                simdgroup_load(a[i], xs + (sg_tok + i * 8u) * {bk}u + kk, {bk}u);
+                simdgroup_load(a[i], xcur + (sg_tok + i * 8u) * {bk}u + kk, {bk}u);
             }}
             for (uint j = 0; j < {fn}u; ++j) {{
-                simdgroup_load(b[j], ws + kk * {bn}u + sg_row + j * 8u, {bn}u);
+                simdgroup_load(b[j], wcur + kk * {bn}u + sg_row + j * 8u, {bn}u);
             }}
             for (uint i = 0; i < {fm}u; ++i) {{
                 for (uint j = 0; j < {fn}u; ++j) {{
@@ -501,6 +509,7 @@ kernel void {name}(
             }}
         }}
     }}
+#undef QMG_FETCH
 
 {epilogue}
 }}
