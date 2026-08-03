@@ -113,7 +113,13 @@ impl CpuDevice {
                 warp_size: 1,
                 sm_count: 0,
                 fp8_native: false,
-                fp4_native: false,
+                // Blokowo skalowane FP4, wgmma, tcgen05 i TMA to instrukcje NVIDII;
+                // ten backend nie ma zadnego z tych rdzeni.
+                fp4_block_scale_ue8m0: false,
+                fp4_block_scale_e4m3: false,
+                wgmma: false,
+                tcgen05: false,
+                tma: false,
                 bf16_native: false,
                 supports_p2p: false,
                 supports_graph_capture: false,

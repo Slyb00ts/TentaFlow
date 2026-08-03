@@ -218,7 +218,13 @@ impl HipDevice {
             // Rodzina wystarcza: `gfx12` to cała RDNA4, a brak artefaktu i tak
             // zatrzyma launcher.
             fp8_native: rdna4,
-            fp4_native: false,
+            // Blokowo skalowane FP4, wgmma, tcgen05 i TMA to instrukcje NVIDII;
+            // ten backend nie ma zadnego z tych rdzeni.
+            fp4_block_scale_ue8m0: false,
+            fp4_block_scale_e4m3: false,
+            wgmma: false,
+            tcgen05: false,
+            tma: false,
             bf16_native: false,
             supports_p2p: false,
             supports_graph_capture: true,

@@ -465,6 +465,37 @@ impl CudaDevice {
     }
 }
 
+// Blackwell splits into two lines that do NOT share the tensor-core ISA, and
+// the compute capability alone does not say which one a device is on: sm_100
+// and sm_103 are the datacenter parts, sm_120 and sm_121 the consumer ones.
+// Establshed by assembling each instruction with `ptxas` on GB10 (sm_121a);
+// see docs/PLAN_ARCHITEKTURA.md.
+
+/// Block-scaled FP4 MMA with UE8M0 scales — MXFP4. Present on both Blackwell
+/// lines; accepted by `ptxas` on sm_121a.
+fn mxf4_block_scale(sm: i32) -> bool {
+    sm >= 100
+}
+
+/// Block-scaled FP4 MMA with E4M3 scales — NVFP4 computed natively. Datacenter
+/// Blackwell only: `ptxas` REJECTS it on sm_121a, which is why the consumer
+/// part has to repack NVFP4 or unpack it into f16.
+fn nvf4_block_scale(sm: i32) -> bool {
+    (100..120).contains(&sm)
+}
+
+/// Warp-group MMA, the core of FlashAttention-3. Hopper-only architecture-
+/// specific instruction; rejected on sm_121a.
+fn wgmma_available(sm: i32) -> bool {
+    sm == 90
+}
+
+/// Fifth-generation tensor-core instruction plus tensor memory, the core of
+/// FlashAttention-4. Datacenter Blackwell only; rejected on sm_121a.
+fn tcgen05_available(sm: i32) -> bool {
+    (100..120).contains(&sm)
+}
+
 fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
     let name = ctx.name().map_err(|e| cu_err("cuDeviceGetName", e))?;
     let (major, minor) = ctx
@@ -492,11 +523,14 @@ fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
         max_threads_per_block,
         warp_size,
         sm_count,
-        // FP8 matmul is native from Ada (sm_89); FP4 tensor cores from
-        // Blackwell (sm_100). Below those, NVFP4/FP8 take the software
-        // fused-dequant path.
+        // FP8 matmul is native from Ada (sm_89). Below it, FP8 takes the
+        // software fused-dequant path.
         fp8_native: sm >= 89,
-        fp4_native: sm >= 100,
+        fp4_block_scale_ue8m0: mxf4_block_scale(sm),
+        fp4_block_scale_e4m3: nvf4_block_scale(sm),
+        wgmma: wgmma_available(sm),
+        tcgen05: tcgen05_available(sm),
+        tma: sm >= 90,
         bf16_native: sm >= 80,
         supports_p2p,
         supports_graph_capture: true,
@@ -975,7 +1009,9 @@ impl Device for CudaDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::PoolSizes;
+    use super::{
+        mxf4_block_scale, nvf4_block_scale, tcgen05_available, wgmma_available, PoolSizes,
+    };
 
     #[test]
     fn suma_pul_cuda_odrzuca_przepelnienie() {
@@ -987,5 +1023,29 @@ mod tests {
         };
 
         assert!(pools.total().is_err());
+    }
+
+    #[test]
+    fn blackwell_rozdziela_sie_na_dwie_linie_o_roznym_isa() {
+        // GB10 to sm_121: ma MXFP4 i TMA, nie ma natywnego NVFP4 ani rdzeni
+        // FA3/FA4. Zweryfikowane skladaniem kazdej z tych instrukcji `ptxas`.
+        assert!(mxf4_block_scale(121));
+        assert!(!nvf4_block_scale(121));
+        assert!(!wgmma_available(121));
+        assert!(!tcgen05_available(121));
+
+        // Blackwell serwerowy ma odwrotny zestaw: natywne NVFP4 i tcgen05.
+        assert!(nvf4_block_scale(100));
+        assert!(tcgen05_available(103));
+        assert!(!wgmma_available(100));
+
+        // Hopper ma wgmma i nie ma zadnego FP4.
+        assert!(wgmma_available(90));
+        assert!(!mxf4_block_scale(90));
+        assert!(!nvf4_block_scale(90));
+
+        // Ada nie ma nic z tego; FP8 owszem, ale to osobne pole.
+        assert!(!mxf4_block_scale(89));
+        assert!(!wgmma_available(89));
     }
 }

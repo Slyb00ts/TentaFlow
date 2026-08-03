@@ -52,7 +52,13 @@ impl MetalDevice {
             // there is no fp4 path at all on this generation. bf16 costs the
             // same as f16 (EKS-A2).
             fp8_native: false,
-            fp4_native: false,
+            // Blokowo skalowane FP4, wgmma, tcgen05 i TMA to instrukcje NVIDII;
+            // ten backend nie ma zadnego z tych rdzeni.
+            fp4_block_scale_ue8m0: false,
+            fp4_block_scale_e4m3: false,
+            wgmma: false,
+            tcgen05: false,
+            tma: false,
             bf16_native: true,
             supports_p2p: false,
             supports_graph_capture: false,

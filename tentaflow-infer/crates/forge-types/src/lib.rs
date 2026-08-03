@@ -28,9 +28,18 @@ pub struct DeviceCaps {
     pub sm_count: u32,
     /// Native FP8 (E4M3/E5M2) matrix pipeline available.
     pub fp8_native: bool,
-    /// Native FP4 tensor cores (NVIDIA Blackwell+). Absent => NVFP4 uses the
-    /// software fused-dequant path.
-    pub fp4_native: bool,
+    /// Block-scaled FP4 MMA with UE8M0 (power-of-two) scales — the MXFP4
+    /// instruction. Doubles K per instruction against FP8.
+    pub fp4_block_scale_ue8m0: bool,
+    /// Block-scaled FP4 MMA with E4M3 scales — NVFP4 computed natively, with
+    /// no repack and no second copy of the weights.
+    pub fp4_block_scale_e4m3: bool,
+    /// `wgmma` warp-group MMA — the core of FlashAttention-3.
+    pub wgmma: bool,
+    /// `tcgen05` plus tensor memory — the core of FlashAttention-4.
+    pub tcgen05: bool,
+    /// Tensor Memory Accelerator (`cp.async.bulk.tensor`).
+    pub tma: bool,
     pub bf16_native: bool,
     pub supports_p2p: bool,
     pub supports_graph_capture: bool,

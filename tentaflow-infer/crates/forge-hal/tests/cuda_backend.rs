@@ -70,7 +70,11 @@ fn caps_report() {
     let sm: u32 = caps.arch.trim_start_matches("sm_").parse().unwrap();
     assert_eq!(caps.bf16_native, sm >= 80);
     assert_eq!(caps.fp8_native, sm >= 89);
-    assert_eq!(caps.fp4_native, sm >= 100);
+    // FP4 nie jest jedna zdolnoscia: blokowe skale UE8M0 (MXFP4) ma cala rodzina
+    // Blackwella, a skale E4M3 (natywne NVFP4) wylacznie linia serwerowa.
+    assert_eq!(caps.fp4_block_scale_ue8m0, sm >= 100);
+    assert_eq!(caps.fp4_block_scale_e4m3, (100..120).contains(&sm));
+    assert_eq!(caps.tma, sm >= 90);
 }
 
 #[test]

@@ -57,6 +57,9 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Report what each visible device can actually do — the facts kernel
+    /// selection is allowed to depend on.
+    Caps,
     /// Serve an OpenAI-compatible HTTP API for one model.
     Serve {
         /// GGUF file or HF snapshot directory.
@@ -434,6 +437,7 @@ fn main() -> Result<()> {
             token,
             dir,
         } => cmd_pull(repo, file, revision, token, dir),
+        Command::Caps => cmd_caps(),
         Command::Serve {
             model_path,
             bind,
@@ -2097,6 +2101,55 @@ graphics processing unit performs trillions of floating-point operations every \
 second, enabling the training and deployment of large neural networks that \
 translate languages, recognize images, and generate fluent text across dozens \
 of domains and writing styles with remarkable and often surprising competence.";
+
+/// Print the capability report of every visible device.
+///
+/// Kernel selection is meant to follow facts about the hardware rather than
+/// proxies for them, and this is where those facts become readable. It exists
+/// because the alternative was assembling a probe instruction with `ptxas` by
+/// hand every time the question came up.
+fn cmd_caps() -> Result<()> {
+    let devices = forge_hal::gpu::enumerate();
+    if devices.is_empty() {
+        println!("nie znaleziono zadnego urzadzenia GPU");
+        return Ok(());
+    }
+    for id in devices {
+        // Najmniejsze pule, jakie backend przyjmie: pytamy o zdolnosci, nie
+        // uruchamiamy modelu, wiec zajmowanie VRAM byloby czysta szkoda.
+        let device = forge_hal::gpu::open_id(
+            id,
+            forge_hal::PoolSizes {
+                weights: 0,
+                kv_cache: 0,
+                activations: 0,
+                kv_page_size: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
+            },
+        )?;
+        let c = device.caps();
+        println!("{} ({:?}, {})", c.name, c.vendor, c.arch);
+        println!("  pamiec                {} MiB", c.total_memory >> 20);
+        println!("  SM / warp / watki     {} / {} / {}", c.sm_count, c.warp_size, c.max_threads_per_block);
+        println!("  pamiec wspoldzielona  {} KiB na blok", c.max_shared_mem_per_block >> 10);
+        println!("  bf16                  {}", tak_nie(c.bf16_native));
+        println!("  fp8 (e4m3/e5m2)       {}", tak_nie(c.fp8_native));
+        println!("  fp4 blokowe ue8m0     {}   (MXFP4)", tak_nie(c.fp4_block_scale_ue8m0));
+        println!("  fp4 blokowe e4m3      {}   (NVFP4 natywnie)", tak_nie(c.fp4_block_scale_e4m3));
+        println!("  wgmma                 {}   (rdzen FlashAttention-3)", tak_nie(c.wgmma));
+        println!("  tcgen05 + TMEM        {}   (rdzen FlashAttention-4)", tak_nie(c.tcgen05));
+        println!("  TMA                   {}", tak_nie(c.tma));
+        println!("  grafy / P2P           {} / {}", tak_nie(c.supports_graph_capture), tak_nie(c.supports_p2p));
+    }
+    Ok(())
+}
+
+fn tak_nie(value: bool) -> &'static str {
+    if value {
+        "jest "
+    } else {
+        "brak "
+    }
+}
 
 /// Compute mean next-token perplexity of the held-out passage under the active
 /// GEMM backend (W4A8 when `FORGE_GEMM=w4a8`, else the committed Q4_K path).
