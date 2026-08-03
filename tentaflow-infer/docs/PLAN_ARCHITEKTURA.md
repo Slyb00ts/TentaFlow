@@ -36,20 +36,23 @@ rozgałęzień sprzętowych.
 
 Bielik-PL-Minitron-7B-NVFP4, jeden DGX Spark, `--weights-pool-gb 24`:
 
-| miara | wartość |
-|---|---|
-| prefill @2048 | **4 811 tok/s** |
-| prefill @4096 | **4 094 tok/s** |
-| decode | **38,2 tok/s** |
-| generacja | `Stolicą Polski jest Warszawa. Warszawa jest największym miastem…` |
+| miara | mediana | zakres z 3 przebiegów |
+|---|---|---|
+| prefill @2048 | **4 784 tok/s** | 4 763 – 4 805 |
+| prefill @4096 | **4 092 tok/s** | — |
+| decode | **38,3 tok/s** | — |
+| generacja | `Stolicą Polski jest Warszawa. Warszawa jest największym miastem…` | |
 
-Po każdym etapie: **wydajność nie spada** i **generacja pozostaje poprawna**.
+Po każdym etapie: **mediana nie spada poza zakres szumu** i **generacja pozostaje
+poprawna**. Bramka MUSI być medianą z kilku przebiegów — pierwotnie ustawiłem ją
+na pojedynczym odczycie 4 811, czyli na górnej krawędzi rozrzutu, co kazałoby
+odrzucić zmianę neutralną wydajnościowo.
 Sam benchmark nie wystarcza — identyczne SHA tokenów dowodzą powtarzalności, a
 nie poprawności. Tego nauczył nas błąd z RoPE.
 
 ## Etapy
 
-### Etap 1 — projekcje sprowadzone do jednego typu
+### Etap 1 — projekcje sprowadzone do jednego typu ✅ ZROBIONE
 Dziś iloczyn: format wag (W4A8 / pełny FP8 / hybryda FP8 / natywny NVFP4) ×
 układ (`Fused` / `FusedQk` / `Split`) = 12 kombinacji rozpisanych ręcznie w
 kilku miejscach wywołania.

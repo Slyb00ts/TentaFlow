@@ -36,7 +36,7 @@ use crate::weight_tier::{TieredWeightDevice, WeightResidency};
 use crate::weights::{
     AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Layer, Fp8Weight,
     GateUpWeights, LayerFfn, LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy,
-    NvFp4CtStorage, QkvWeights, W4A8Weight,
+    NvFp4CtStorage, QkvWeights, W4A8Weight, W4A8Layer, LayerWeights, Fp8FfnLayer,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -2522,6 +2522,27 @@ fn layer_output_scale(
         kernels.scale_f16(h, n, f, stream)?;
     }
     Ok(())
+}
+
+/// Jedna projekcja: CO pomnożyć i CZYM, rozstrzygnięte raz zamiast przy każdym
+/// wywołaniu.
+///
+/// Wcześniej każde miejsce wywołania rozpisywało iloczyn dwóch wymiarów —
+/// formatu wag (W4A8 / pełny FP8 / hybryda FP8 / natywny) i układu QKV
+/// (`Fused` / `FusedQk` / `Split`) — czyli dwanaście kombinacji, w kilku
+/// miejscach naraz. Stąd dwie usterki z jednego dnia: podział szerokiego N
+/// trafił w jeden z dwóch punktów wejścia GEMM, a przeniesienie K/V na FP8
+/// wymagało zmian w trzech miejscach z czterech potrzebnych.
+enum ProjectionPlan<'w> {
+    W4A8(&'w W4A8Weight),
+    Fp8(&'w Fp8Weight),
+    /// Okno wierszy macierzy natywnej. Obsługuje `Split` (offset 0, całe
+    /// wiersze) i oba warianty fused bez osobnych gałęzi.
+    Rows {
+        w: &'w DevWeight,
+        row_off: usize,
+        rows: usize,
+    },
 }
 
 impl Model {
@@ -5696,6 +5717,78 @@ impl Model {
 
     /// W4A8 prefill projection GEMM (per-token int8 activation quant + int4xint8
     /// GEMM). Each W4A8 weight is a standalone logical matrix, so no windowing.
+    /// Wykonuje projekcję wybraną wcześniej. `shared_act` mówi, że fuzowana
+    /// norma wyemitowała już wspólną aktywację e4m3 i nie trzeba jej kwantyzować
+    /// per projekcja.
+    fn project(
+        &self,
+        y: &DevBuffer,
+        p: &ProjectionPlan<'_>,
+        x: &DevBuffer,
+        rows: usize,
+        shared_act: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        match p {
+            ProjectionPlan::W4A8(w) => self.gemm_w4a8(y, w, x, rows, stream),
+            ProjectionPlan::Fp8(w) if shared_act => self.gemm_fp8_prequant(y, w, rows, stream),
+            ProjectionPlan::Fp8(w) => self.gemm_fp8(y, w, x, rows, stream),
+            ProjectionPlan::Rows { w, row_off, rows: n } => {
+                self.gemm_rows(y, w, x, rows, *row_off, *n, stream)
+            }
+        }
+    }
+
+    /// Q/K/V warstwy `l` w jednej postaci, niezależnie od formatu i układu wag.
+    fn qkv_projections<'w>(
+        &'w self,
+        layer: &'w LayerWeights,
+        w4a8: Option<&'w W4A8Layer>,
+        fp8: Option<&'w Fp8Layer>,
+        fp8_ffn: Option<&'w Fp8FfnLayer>,
+        q_rows: usize,
+        kv_rows: usize,
+    ) -> [ProjectionPlan<'w>; 3] {
+        if let Some(wl) = w4a8 {
+            return [
+                ProjectionPlan::W4A8(&wl.q),
+                ProjectionPlan::W4A8(&wl.k),
+                ProjectionPlan::W4A8(&wl.v),
+            ];
+        }
+        if let Some(fl) = fp8 {
+            return [
+                ProjectionPlan::Fp8(&fl.q),
+                ProjectionPlan::Fp8(&fl.k),
+                ProjectionPlan::Fp8(&fl.v),
+            ];
+        }
+        if let Some(fl) = fp8_ffn {
+            return [
+                ProjectionPlan::Fp8(&fl.q),
+                ProjectionPlan::Fp8(&fl.k),
+                ProjectionPlan::Fp8(&fl.v),
+            ];
+        }
+        match &layer.attn().attn_qkv {
+            QkvWeights::Fused(w) => [
+                ProjectionPlan::Rows { w, row_off: 0, rows: q_rows },
+                ProjectionPlan::Rows { w, row_off: q_rows, rows: kv_rows },
+                ProjectionPlan::Rows { w, row_off: q_rows + kv_rows, rows: kv_rows },
+            ],
+            QkvWeights::FusedQk { qk, v } => [
+                ProjectionPlan::Rows { w: qk, row_off: 0, rows: q_rows },
+                ProjectionPlan::Rows { w: qk, row_off: q_rows, rows: kv_rows },
+                ProjectionPlan::Rows { w: v, row_off: 0, rows: v.rows() },
+            ],
+            QkvWeights::Split { q, k, v } => [
+                ProjectionPlan::Rows { w: q, row_off: 0, rows: q.rows() },
+                ProjectionPlan::Rows { w: k, row_off: 0, rows: k.rows() },
+                ProjectionPlan::Rows { w: v, row_off: 0, rows: v.rows() },
+            ],
+        }
+    }
+
     fn gemm_w4a8(
         &self,
         y: &DevBuffer,
@@ -6601,54 +6694,21 @@ impl Model {
             // (attention/rope/append index (t*heads+h)*head_dim), so a fused
             // matrix is consumed as three row-window GEMMs into separate
             // buffers — same weight bytes, no second copy in VRAM.
-            if let Some(wl) = w4a8_layer {
-                self.gemm_w4a8(&pb.q, &wl.q, &pb.x, rows, stream)?;
-                self.gemm_w4a8(&pb.k, &wl.k, &pb.x, rows, stream)?;
-                self.gemm_w4a8(&pb.v, &wl.v, &pb.x, rows, stream)?;
-            } else if let Some(fl) = fp8_layer {
-                if fp8mod_fuse {
-                    // q/k/v read the shared per-token e4m3 activation the attn-norm
-                    // already emitted — no per-projection requant.
-                    self.gemm_fp8_prequant(&pb.q, &fl.q, rows, stream)?;
-                    self.gemm_fp8_prequant(&pb.k, &fl.k, rows, stream)?;
-                    self.gemm_fp8_prequant(&pb.v, &fl.v, rows, stream)?;
-                } else {
-                    self.gemm_fp8(&pb.q, &fl.q, &pb.x, rows, stream)?;
-                    self.gemm_fp8(&pb.k, &fl.k, &pb.x, rows, stream)?;
-                    self.gemm_fp8(&pb.v, &fl.v, &pb.x, rows, stream)?;
-                }
-            } else if let Some(fl) = fp8_ffn_layer {
-                // K/V ida ta sama sciezka FP8 co Q. Wczesniej hybryda liczyla je
-                // natywnie w NVFP4 (33 TFLOPS wobec 142), bo paczki ich nie
-                // obejmowaly — obejmuja od czasu rozszerzenia `Fp8FfnLayer`.
-                if fp8mod_ffn_fuse {
-                    self.gemm_fp8_prequant(&pb.q, &fl.q, rows, stream)?;
-                    self.gemm_fp8_prequant(&pb.k, &fl.k, rows, stream)?;
-                    self.gemm_fp8_prequant(&pb.v, &fl.v, rows, stream)?;
-                } else {
-                    self.gemm_fp8(&pb.q, &fl.q, &pb.x, rows, stream)?;
-                    self.gemm_fp8(&pb.k, &fl.k, &pb.x, rows, stream)?;
-                    self.gemm_fp8(&pb.v, &fl.v, &pb.x, rows, stream)?;
-                }
-            } else {
-                match &layer.attn().attn_qkv {
-                    QkvWeights::Fused(w) => {
-                        self.gemm_rows(&pb.q, w, &pb.x, rows, 0, q_dim, stream)?;
-                        self.gemm_rows(&pb.k, w, &pb.x, rows, q_dim, kv_dim, stream)?;
-                        self.gemm_rows(&pb.v, w, &pb.x, rows, q_dim + kv_dim, kv_dim, stream)?;
-                    }
-                    QkvWeights::FusedQk { qk, v } => {
-                        self.gemm_rows(&pb.q, qk, &pb.x, rows, 0, q_dim, stream)?;
-                        self.gemm_rows(&pb.k, qk, &pb.x, rows, q_dim, kv_dim, stream)?;
-                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
-                    }
-                    QkvWeights::Split { q, k, v } => {
-                        self.gemm(&pb.q, q, &pb.x, rows, stream)?;
-                        self.gemm(&pb.k, k, &pb.x, rows, stream)?;
-                        self.gemm(&pb.v, v, &pb.x, rows, stream)?;
-                    }
-                }
-            }
+            // Format wag i uklad QKV rozstrzygniete raz; dalej trzy identyczne
+            // wywolania zamiast dwunastu kombinacji rozpisanych recznie.
+            let projs = self.qkv_projections(
+                layer,
+                w4a8_layer,
+                fp8_layer,
+                fp8_ffn_layer,
+                q_dim,
+                kv_dim,
+            );
+            let shared_act = fp8mod_fuse || fp8mod_ffn_fuse;
+            self.project(&pb.q, &projs[0], &pb.x, rows, shared_act, stream)?;
+            self.project(&pb.k, &projs[1], &pb.x, rows, shared_act, stream)?;
+            self.project(&pb.v, &projs[2], &pb.x, rows, shared_act, stream)?;
+
             if l == 0 {
                 self.trace_f16("Qcur-0", &pb.q, (rows - 1) * q_dim * 2, q_dim);
                 self.trace_f16("Kcur-0", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
