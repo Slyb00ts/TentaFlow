@@ -238,13 +238,27 @@ RÓŻNYM ISA rdzeni tensorowych, czego numer zdolności obliczeniowej sam nie
 rozstrzyga. Pole nie miało ani jednego czytelnika, więc nic się nie psuło;
 czekało tylko na pierwszego, który by mu uwierzył.
 
-**Do zrobienia.** Rejestr wariantów nadal NIE wybiera po tych faktach, a 63
-miejsca pytają `Vendor::Nvidia` i 31 o `warp_size == 32`. To są zastępniki:
-`warp_size == 32` znaczy w nich „nasze wyspecjalizowane PTX-y są tu ważne", a
-nie „warp ma 32 pasy". Zamiana ich na zdolności zmienia dyspozycję kerneli,
-więc jest osobną zmianą z własną bramką pomiarową — nie doklejką do tej.
+Zrobione też: dwa pytania o falę 32 mają nazwy zamiast czterech zapisów.
+`matrix_warp32` pyta o jednostkę macierzową i falę 32 i ŚWIADOMIE nie pyta o
+producenta; `nvidia_warp32` jest węższe.
 
-Świadomie nie dopisałem gałęzi „gdy karta ma natywne NVFP4", bo nie mamy
+**Korekta wcześniejszego opisu tego etapu.** Napisałem, że „63 miejsca pytają
+`Vendor::Nvidia`, a 31 o `warp_size == 32`", sugerując jeden sweep. Po
+przeliczeniu: oba warunki łączy tylko **dziewięć** miejsc, a reszta to
+niezależne pytania. Skala była więc podana błędnie.
+
+**Do zrobienia.** Rejestr wariantów nadal nie wybiera po tych faktach — wybór
+kernela siedzi w `if`-ach, choć wiele z nich niesie już pomiar w komentarzu
+(np. 111 GB/s wobec 597 GB/s dla wariantu falowego). Przeniesienie ich do
+rejestru to zmiana PER MIEJSCE z własnym uzasadnieniem pomiarowym, nie sweep.
+
+Osobno: każde użycie `nvidia_warp32` jest kandydatem na usterkę, którą już raz
+złapaliśmy — `vendor == Nvidia` w bramce chunków prefillu kazał modelom qwen35
+na Radeonie czytać komplet wag 64 razy na prompt 1024. Rozstrzygnięcie wymaga
+Radeona, którego nie mamy, więc te miejsca zostają oznaczone, a nie zmienione
+w ciemno.
+
+Świadomie nie dopisałem też gałęzi „gdy karta ma natywne NVFP4", bo nie mamy
 kernela, który by ją obsłużył; byłby to stub udający wybór.
 
 Podstawa jest zweryfikowana sondowaniem `ptxas` na GB10:
