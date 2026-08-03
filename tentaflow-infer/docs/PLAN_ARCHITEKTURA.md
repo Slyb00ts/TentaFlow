@@ -175,9 +175,27 @@ wyniku dosłownie i jako ciągły fragment**, przy jedynej dozwolonej różnicy 
 postaci `pub(crate)`. 452 z 452 dla `model.rs`, 414 z 414 metod dla
 `launchers.rs`.
 
-### Etap 5 — HAL: zdolności zamiast domysłów
-`Backend` z jawnym odpytaniem o zdolności (`has_fp4_block_scale`, `has_wgmma`,
-`has_tmem`, `warp_size`, …), tak by rejestr wariantów wybierał po FAKTACH.
+### Etap 5 — HAL: zdolności zamiast domysłów ⚠ CZĘŚCIOWO
+
+**Zrobione.** `DeviceCaps` niesie po jednym polu na INSTRUKCJĘ, a nie na
+pokoleniowe hasło marketingowe: `fp4_block_scale_ue8m0`,
+`fp4_block_scale_e4m3`, `wgmma`, `tcgen05`, `tma`. `forge caps` je wypisuje,
+więc odpowiedź nie wymaga już ręcznego składania sondy.
+
+Przy okazji wyszedł błąd. Pole `fp4_native = sm >= 100` na GB10 (sm_121) dawało
+prawdę, a natywnego NVFP4 tam nie ma — Blackwell dzieli się na dwie linie o
+RÓŻNYM ISA rdzeni tensorowych, czego numer zdolności obliczeniowej sam nie
+rozstrzyga. Pole nie miało ani jednego czytelnika, więc nic się nie psuło;
+czekało tylko na pierwszego, który by mu uwierzył.
+
+**Do zrobienia.** Rejestr wariantów nadal NIE wybiera po tych faktach, a 63
+miejsca pytają `Vendor::Nvidia` i 31 o `warp_size == 32`. To są zastępniki:
+`warp_size == 32` znaczy w nich „nasze wyspecjalizowane PTX-y są tu ważne", a
+nie „warp ma 32 pasy". Zamiana ich na zdolności zmienia dyspozycję kerneli,
+więc jest osobną zmianą z własną bramką pomiarową — nie doklejką do tej.
+
+Świadomie nie dopisałem gałęzi „gdy karta ma natywne NVFP4", bo nie mamy
+kernela, który by ją obsłużył; byłby to stub udający wybór.
 
 Podstawa jest zweryfikowana sondowaniem `ptxas` na GB10:
 
