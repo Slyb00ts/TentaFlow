@@ -7,9 +7,12 @@ Pomiary na GB10 (sm_121a, 48 SM, pamięć zunifikowana 121 GiB),
 
 | prompt | prefill tok/s | decode tok/s |
 |---|---|---|
-| 512 | 2 989 | 40,5 |
-| 2 048 | 3 192 | 38,5 |
-| 4 096 | 2 877 | 35,8 |
+| 512 | 3 930 | 40,2 |
+| 2 048 | **4 537** | 38,2 |
+| 4 096 | 3 902 | 35,4 |
+
+Wobec startu sesji (2 957 tok/s przy 2048) to **+53%**, przy niezmienionym SHA
+generowanych tokenow na kazdej dlugosci.
 
 Odniesienie na tym samym sprzęcie i modelu: **vLLM 0.26 daje 48 tok/s decode**
 oraz ~10 000 tok/s prefillu na zimno (mierzone przez HTTP, więc lekko zaniżone
@@ -86,6 +89,31 @@ Każda sprawdzona pomiarem, nie odrzucona z rozumowania:
   konfigurację w czasie wykonania.
 - **Własne kernele `gemm_fp8_wmma_*`**: budowane wyłącznie dla AMD, nie ma ich
   w zestawie sm_121a.
+
+## Rozklad czasu prefillu (nsys, prompt 2048)
+
+Po odjeciu jednorazowego pakowania wag (212 ms: `nvfp4_ct_fp8_pack` 169,6 ms +
+`nvfp4_ct_layout_repack` 42,8 ms — oba przy ladowaniu, nie w przebiegu) zostaje
+okolo 895 ms realnej pracy:
+
+| skladnik | ms | udzial |
+|---|---|---|
+| GEMM-y FP8 (4 warianty) | 511 | 57% |
+| uwaga `attn_prefill_fa_mma` | 156 | 17% |
+| GEMM NVFP4 — projekcje K/V | 83 | 9% |
+| `silu_mul` | 46 | 5% |
+| normalizacje | 41 | 5% |
+| kwantyzacja aktywacji | 37 | 4% |
+
+Nastepne cele w kolejnosci zysku do ryzyka:
+
+1. **K/V wciaz na NVFP4** (9%). Paczki FP8 obejmuja Q/O/FFN/lm_head, a K/V nie —
+   mimo ze kernel `gemm_fp8_mod_1024_4096` dla ich ksztaltu JEST zbudowany.
+2. **`down` na 109 TFLOPS** wobec 142 osiaganych przez q/o i gate/up. N=4096 jest
+   juz optymalne, wiec zostaje dlugie K=11264; podzial K wymaga akumulacji i
+   redukcji, wiec jest istotnie trudniejszy niz podzial N.
+3. **Uwaga** (17%). Przy kauzalnym maskowaniu teoretyczny koszt to ~10 ms na
+   przebieg wobec ~39 ms mierzonych.
 
 ## Wniosek
 
