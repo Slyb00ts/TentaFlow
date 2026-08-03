@@ -138,6 +138,68 @@ mod metal_forms {
         RegisterBlocked,
         /// SIMD matrix units over a block of tokens and rows. Prefill.
         MatrixUnits,
+        /// The same kernel over the leading rows, with the tail computed on the
+        /// CPU at the same time. Prefill only, and only when the product is
+        /// large enough to pay for the command buffer that starting the GPU
+        /// early costs.
+        MatrixUnitsSharedWithCpu,
+    }
+
+    /// How the rows of one product are divided between the two units.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RowSplit {
+        /// Rows `[0, gpu_rows)` — the matrix-unit kernel.
+        pub gpu_rows: u32,
+        /// Rows `[gpu_rows, rows)` — Accelerate on the CPU.
+        pub cpu_rows: u32,
+    }
+
+    /// Fraction of rows left to the GPU.
+    ///
+    /// EKS-A7 measured the pair concurrently: 3,02 TFLOPS on the GPU against
+    /// 1,15 on the CPU once unpacking is paid. Both finish together when the
+    /// GPU takes 3,02 / (3,02 + 1,15) of the rows. Getting this wrong costs
+    /// only the waiting — there is no correctness stake in the ratio.
+    const GPU_ROW_SHARE: f32 = 0.72;
+
+    /// Smallest product worth splitting.
+    ///
+    /// Starting the GPU early means committing a command buffer of its own:
+    /// 19,6 us against 0,61 for a dispatch that joins the open one (EKS-A3).
+    /// Chosen to sit between the two shapes that bracket it at 256 tokens —
+    /// k_proj would spend 22% of its GPU time on that boundary, q_proj 5,6%
+    /// against a gain near 28%.
+    const MIN_SPLIT_WORK: u64 = 6 * 1024 * 1024 * 1024;
+
+    /// Smallest batch worth splitting.
+    ///
+    /// The CPU has to unpack its rows before it can multiply them, and that
+    /// unpacking costs the same whether it then multiplies by 128 tokens or by
+    /// 512 — it is proportional to rows x cols, the product to rows x cols x
+    /// tokens. So the CPU's share gets worse as the batch shrinks: 27% overhead
+    /// at 256 tokens, about twice that at 128. Measured, that is the difference
+    /// between +10,9% at 256 and -17% at 128, which is where this cut sits.
+    const MIN_SPLIT_TOKENS: u32 = 256;
+
+    /// Where the boundary falls, or `None` when the whole product stays on the
+    /// GPU. Every shape is allowed to answer `None`; that is the fallback and
+    /// it is always correct.
+    pub fn split_rows(p: &Problem) -> Option<RowSplit> {
+        let work = 2 * u64::from(p.rows) * u64::from(p.cols) * u64::from(p.tokens);
+        if p.tokens < MIN_SPLIT_TOKENS || work < MIN_SPLIT_WORK {
+            return None;
+        }
+        // The kernel writes whole blocks of QMG_BN rows, so the boundary has to
+        // fall on one or the GPU would overwrite the CPU's rows.
+        let gpu = ((p.rows as f32 * GPU_ROW_SHARE) as u32 / crate::msl::QMG_BN)
+            * crate::msl::QMG_BN;
+        if gpu == 0 || gpu >= p.rows {
+            return None;
+        }
+        Some(RowSplit {
+            gpu_rows: gpu,
+            cpu_rows: p.rows - gpu,
+        })
     }
 
     /// Forms of attention on Metal.
@@ -164,6 +226,12 @@ mod metal_forms {
     pub const MATMUL_FORMS: Registry<MatmulForm> = Registry {
         op: "qmatmul",
         variants: &[
+            Variant {
+                name: "qmg_matrix_units_shared_with_cpu",
+                form: MatmulForm::MatrixUnitsSharedWithCpu,
+                applies: |p| qmg_serves(p) && split_rows(p).is_some(),
+                because: "EKS-A7: 3,02 + 1,47 TFLOPS współbieżnie, GPU traci 0,3%",
+            },
             Variant {
                 name: "qmg_matrix_units",
                 form: MatmulForm::MatrixUnits,
@@ -261,6 +329,49 @@ mod metal_forms {
             assert_eq!(at(1), MatmulForm::Vector);
             assert_eq!(at(8), MatmulForm::RegisterBlocked);
             assert_eq!(at(128), MatmulForm::MatrixUnits);
+        }
+
+        #[test]
+        fn only_products_that_can_pay_for_the_boundary_are_shared_with_the_cpu() {
+            let at = |tokens, rows, cols| {
+                MATMUL_FORMS
+                    .pick(&Problem { tokens, rows, cols })
+                    .unwrap()
+                    .form
+            };
+            // gate/up i q/o przy pełnym kaflu — dość pracy, żeby granica
+            // kosztowała kilka procent.
+            assert_eq!(at(256, 11264, 4096), MatmulForm::MatrixUnitsSharedWithCpu);
+            assert_eq!(at(256, 4096, 4096), MatmulForm::MatrixUnitsSharedWithCpu);
+            // k/v są za małe: granica zjadłaby jedną piątą czasu GPU.
+            assert_eq!(at(256, 1024, 4096), MatmulForm::MatrixUnits);
+            // Przy 128 tokenach rozpakowanie kosztuje tyle samo, a jest czym
+            // dzielić o połowę mniej — zmierzone -17%, więc podziału nie ma
+            // NAWET dla największego kształtu.
+            assert_eq!(at(128, 11264, 4096), MatmulForm::MatrixUnits);
+            // Dekodowanie nie ma prawa się dzielić NIEZALEŻNIE od kształtu —
+            // jest ograniczone pasmem, a pomiar pokazał tam 20,9 -> 17,9 tok/s.
+            assert_eq!(at(1, 11264, 4096), MatmulForm::Vector);
+            assert!(split_rows(&Problem { tokens: 1, rows: 11264, cols: 4096 }).is_none());
+        }
+
+        #[test]
+        fn the_split_leaves_whole_blocks_to_the_gpu_and_the_rest_to_the_cpu() {
+            let p = Problem {
+                tokens: 256,
+                rows: 11264,
+                cols: 4096,
+            };
+            let s = split_rows(&p).expect("gate_proj powinien się dzielić");
+            // Gdyby granica nie padła na blok, kernel nadpisałby wiersze CPU.
+            assert_eq!(s.gpu_rows % crate::msl::QMG_BN, 0);
+            assert_eq!(s.gpu_rows + s.cpu_rows, p.rows, "wiersze muszą się domykać");
+            assert!(s.cpu_rows > 0, "podział bez pracy dla CPU to nie podział");
+            let share = f64::from(s.gpu_rows) / f64::from(p.rows);
+            assert!(
+                (0.70..0.74).contains(&share),
+                "udział GPU {share:.3} rozjechał się ze zmierzonym stosunkiem"
+            );
         }
 
         #[test]

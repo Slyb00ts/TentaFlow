@@ -14,15 +14,20 @@
 //     dequantized copy of this checkpoint would be 16 GB against 4.2, and
 //     reading the weights once IS the cost of a decode step.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
 use forge_formats::safetensors::SafeTensors;
 use forge_formats::{HfConfig, MlxQuantConfig, ModelDescriptor, WeightRole};
-use forge_hal::{DevBuffer, Device, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
+use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_kernels::msl::{self, OutDtype, ScaleDtype};
-use forge_kernels::variant::{AttentionForm, MatmulForm, Problem, ATTENTION_FORMS, MATMUL_FORMS};
+use forge_kernels::variant::{
+    self, AttentionForm, MatmulForm, Problem, RowSplit, ATTENTION_FORMS, MATMUL_FORMS,
+};
 use forge_types::{ForgeError, MemKind, Result};
+
+use crate::cpu_matmul::{CpuMatmul, Operands};
 
 /// Prompt tokens carried through the layers in one pass.
 ///
@@ -131,6 +136,17 @@ pub struct MlxDense {
     pipes: Pipelines,
     scratch: Scratch,
     position: u32,
+    /// Scratch for the CPU's share of a split product. Behind a cell because
+    /// the whole forward pass runs through `&self` and this is the only piece
+    /// of it that has to be written.
+    cpu: RefCell<CpuMatmul>,
+    /// Names the command buffer a split submitted, so the wait is for THAT
+    /// work rather than for the whole queue.
+    split_event: Event,
+    /// Whether prefill may hand part of a product to the CPU. Always on in
+    /// normal use; `set_cpu_share` takes it away so the gate can run the same
+    /// prompt down both paths and compare them.
+    cpu_share: bool,
 }
 
 impl MlxDense {
@@ -288,6 +304,7 @@ impl MlxDense {
         };
 
         let stream = device.create_stream()?;
+        let split_event = device.create_event()?;
         Ok(Self {
             device,
             stream,
@@ -300,6 +317,9 @@ impl MlxDense {
             pipes,
             scratch,
             position: 0,
+            cpu: RefCell::new(CpuMatmul::new()),
+            split_event,
+            cpu_share: true,
         })
     }
 
@@ -360,6 +380,26 @@ impl MlxDense {
         self.position = 0;
     }
 
+    /// Turns the CPU's share of prefill on or off.
+    ///
+    /// Exists so the gate can run the SAME prompt down both paths and compare
+    /// them; without it, "the split changed the answer" could only be asserted,
+    /// never shown.
+    pub fn set_cpu_share(&mut self, on: bool) {
+        self.cpu_share = on;
+    }
+
+    /// The logits currently in the scratch buffer — whatever the last forward
+    /// pass left there, whether it was one token or a whole chunk.
+    pub fn logits(&self) -> Result<Vec<f32>> {
+        let mut raw = vec![0u8; self.shape.vocab as usize * 4];
+        self.device.read(&self.scratch.logits, 0, &mut raw)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    }
+
     /// Feeds one token and returns the logits for the next one.
     ///
     /// Every dispatch lands in a single command buffer and the host waits once,
@@ -368,13 +408,7 @@ impl MlxDense {
     pub fn step(&mut self, token: u32) -> Result<Vec<f32>> {
         self.forward(&[token])?;
         self.stream.synchronize()?;
-
-        let mut raw = vec![0u8; self.shape.vocab as usize * 4];
-        self.device.read(&self.scratch.logits, 0, &mut raw)?;
-        Ok(raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect())
+        self.logits()
     }
 
     /// Greedy choice done on the device, so the vocabulary never crosses the
@@ -659,33 +693,105 @@ impl MlxDense {
             }
             MatmulForm::RegisterBlocked => self.matmul_blocked(out, w, x, tokens, f16_out),
             MatmulForm::MatrixUnits => {
-                let k = if f16_out {
-                    &self.pipes.qmg_f16
-                } else {
-                    &self.pipes.qmg_f32
-                };
-                let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
-                self.device.launch(
-                    k,
-                    &LaunchConfig {
-                        grid: (gx, gy, 1),
-                        block: (msl::QMG_THREADS, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &LaunchArgs::new()
-                        .buf(out)
-                        .buf(&w.packed)
-                        .buf(&w.scales)
-                        .buf(&w.biases)
-                        .buf(x)
-                        .scalar(w.rows)
-                        .scalar(w.cols)
-                        .scalar(self.shape.group)
-                        .scalar(tokens),
-                    &self.stream,
-                )
+                self.matmul_matrix_units(out, w, x, tokens, f16_out, None)
+            }
+            MatmulForm::MatrixUnitsSharedWithCpu if !self.cpu_share => {
+                self.matmul_matrix_units(out, w, x, tokens, f16_out, None)
+            }
+            MatmulForm::MatrixUnitsSharedWithCpu => {
+                let split = variant::split_rows(&problem).ok_or_else(|| {
+                    ForgeError::Other(format!("podział wybrany dla {problem:?}, ale niemożliwy"))
+                })?;
+                self.matmul_matrix_units(out, w, x, tokens, f16_out, Some(split))
             }
         }
+    }
+
+    /// The matrix-unit form, optionally sharing its rows with the CPU.
+    ///
+    /// The kernel always receives the FULL row count — that is the stride it
+    /// writes with — and the grid is what decides which rows it touches. So
+    /// giving it a shorter grid leaves the tail of every row untouched, which
+    /// is exactly the window the CPU then fills.
+    fn matmul_matrix_units(
+        &self,
+        out: &DevBuffer,
+        w: &Quantized,
+        x: &DevBuffer,
+        tokens: u32,
+        f16_out: bool,
+        split: Option<RowSplit>,
+    ) -> Result<()> {
+        let k = if f16_out {
+            &self.pipes.qmg_f16
+        } else {
+            &self.pipes.qmg_f32
+        };
+        // The CPU half reads `x` with its own load instructions, so `x` has to
+        // BE there. Everything that produces it is sitting in the open command
+        // buffer, queued and not yet run: the GPU half is ordered after it and
+        // is therefore safe, but the CPU is not ordered against the GPU at all.
+        // Without this wait the CPU multiplies whatever the buffer happened to
+        // hold — which is not a crash, just a different model.
+        if split.is_some() {
+            self.stream.synchronize()?;
+        }
+        let gpu_rows = split.map_or(w.rows, |s| s.gpu_rows);
+        let (gx, gy) = msl::qmg_affine_4bit_groups(gpu_rows, tokens);
+        self.device.launch(
+            k,
+            &LaunchConfig {
+                grid: (gx, gy, 1),
+                block: (msl::QMG_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(out)
+                .buf(&w.packed)
+                .buf(&w.scales)
+                .buf(&w.biases)
+                .buf(x)
+                .scalar(w.rows)
+                .scalar(w.cols)
+                .scalar(self.shape.group)
+                .scalar(tokens),
+            &self.stream,
+        )?;
+        let Some(split) = split else {
+            return Ok(());
+        };
+
+        // Submit, or the dispatch would sit in the open command buffer and the
+        // CPU would spend its share racing an idle GPU. This is the one place
+        // that deliberately pays for a command buffer of its own — 19,6 us
+        // against 0,61 (EKS-A3) — and `plan` only allows it where that is a
+        // couple of percent of the work being overlapped.
+        self.device.record_event(&self.split_event, &self.stream)?;
+
+        let operands = Operands {
+            packed: host_slice(&w.packed)?,
+            scales: host_slice(&w.scales)?,
+            biases: host_slice(&w.biases)?,
+            x: host_slice(x)?,
+            out: out
+                .host_ptr()
+                .ok_or_else(|| ForgeError::Other("Metal: wyjście bez adresu hosta".into()))?,
+            out_f16: f16_out,
+            tokens,
+            rows: w.rows,
+            cols: w.cols,
+            group: self.shape.group,
+        };
+        // SAFETY: the GPU dispatch above writes rows below `gpu_rows` and this
+        // writes from `gpu_rows` up, into the same shared allocation. The two
+        // ranges are disjoint, so no ordering between them is needed — only the
+        // wait below, before anything reads the whole result.
+        unsafe {
+            self.cpu
+                .borrow_mut()
+                .run(&operands, split.gpu_rows, split.cpu_rows)?;
+        }
+        self.split_event.synchronize()
     }
 
     /// Register-blocked loop, for batches too small to fill a matrix block.
@@ -810,6 +916,28 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13),
     };
     f32::from_bits(out)
+}
+
+/// Host view of a device buffer.
+///
+/// On Apple every allocation is shared, so this is literally the memory the GPU
+/// reads — no copy and no transfer. It is only ever taken for buffers the GPU
+/// is READING during a split (weights and activations); the one buffer both
+/// units write is handed over as a raw pointer with its disjointness spelled
+/// out at the call site.
+fn host_slice<T>(buf: &DevBuffer) -> Result<&[T]> {
+    let ptr = buf
+        .host_ptr()
+        .ok_or_else(|| ForgeError::Other("Metal: bufor bez adresu hosta".into()))?;
+    if ptr as usize % std::mem::align_of::<T>() != 0 {
+        return Err(ForgeError::Other(format!(
+            "Metal: adres {ptr:p} nie jest wyrównany do {} B",
+            std::mem::align_of::<T>()
+        )));
+    }
+    // SAFETY: the allocation is `buf.len()` bytes of shared memory, alive for
+    // as long as the buffer, and nothing writes it while the borrow lasts.
+    Ok(unsafe { std::slice::from_raw_parts(ptr as *const T, buf.len() / std::mem::size_of::<T>()) })
 }
 
 fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {

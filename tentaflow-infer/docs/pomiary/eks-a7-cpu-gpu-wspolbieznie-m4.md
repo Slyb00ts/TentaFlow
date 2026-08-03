@@ -108,11 +108,59 @@ podział daje 0,66x, czyli szkodzi. Nas to nie dotyczy — dispatchujemy zachła
 do bufora poleceń, nie budujemy leniwego grafu jak MLX. To akurat jest przewaga,
 którą mamy za darmo z wcześniejszej decyzji architektonicznej.
 
+## Co wyszło po wdrożeniu
+
+Zaimplementowane jako podział wierszy: GPU liczy `[0, split)` skróconą siatką,
+CPU resztę, rozpakowując swój wycinek w locie (zero dodatkowej pamięci).
+Pomiar PRZEPLATANY — `MlxDense::set_cpu_share(false)` daje odniesienie w tej
+samej sesji i temperaturze, bo maszyna dryfuje i dwa osobne przebiegi
+porównywałyby temperatury:
+
+| prompt | samo GPU | z CPU | zysk | MLX (ta sama sesja) |
+|---|---:|---:|---:|---:|
+| 256 | 216,1 / 216,2 tok/s | 238,6 / 232,4 | **+8,9%** | 218,9 |
+| 1024 | 214,8 / 215,0 | 249,1 / 255,1 | **+17,3%** | 216,7 |
+
+Czyli **+7,6% nad MLX przy 256 i +16,3% przy 1024** — pierwszy raz przewaga,
+a nie parytet. Dłuższy prompt zyskuje więcej, bo kafle są wtedy pełne (512),
+a rozpakowanie amortyzuje się liczbą tokenów.
+
+Dekodowanie bez zmian: 20,8 tok/s przy 87,6 GB/s, bo forma dekodowania nie
+kwalifikuje się do podziału i nie ma jak w niego wejść.
+
+### Dwie rzeczy, które wyszły dopiero z pomiaru
+
+**Bariera nie jest tam, gdzie jej szukałem.** Spodziewałem się kosztu za osobny
+command buffer. Prawdziwym kosztem okazało się coś innego: CPU czyta aktywacje
+`x` własnymi instrukcjami, a te są produkowane przez kernele stojące w
+NIEZATWIERDZONYM buforze poleceń. `commit` tylko kolejkuje. Bez czekania na `x`
+CPU mnoży to, co akurat leżało w buforze — nie ma awarii, jest inny model.
+Bramka na logitach pokazała to jako względną L2 **1,66**; po dodaniu czekania
+spadła do **1,15e-2**. To jedyny powód, dla którego ta ścieżka ma własne
+czekanie na strumień, mimo że EKS-A3 zabrania powrotów na hosta per warstwa.
+
+**Próg musi patrzeć na tokeny, nie na pracę.** Rozpakowanie kosztuje
+proporcjonalnie do `wiersze x kolumny`, a mnożenie do `wiersze x kolumny x
+tokeny` — więc udział rozpakowania rośnie, gdy wsad maleje. Pierwsza wersja
+progu (sama praca) dzieliła też przy 128 tokenach i dawała tam **-17%**, przy
++10,9% dla 256. Stąd osobny próg `MIN_SPLIT_TOKENS = 256`.
+
+### Zgodność
+
+Podział zmienia arytmetykę (CPU akumuluje w f32 przez BNNS — sprawdzone
+detektorem: suma 4096 jedynek wychodzi dokładnie, więc nie f16), więc kontrakt
+jest tolerancyjny, ale nie dowolny: największa różnica logitów wobec samego GPU
+to **0,24% rozpiętości**, przy naszej udokumentowanej różnicy wobec MLX rzędu
+0,4–2,6%. Podział jest więc mniejszym źródłem błędu niż wszystko, co już
+uznaliśmy za poprawne. Osobno bramka wymaga, żeby przy marginesie zwycięzcy
+powyżej 5% rozpiętości wybór był IDENTYCZNY — zmierzony margines 26,2%, wybór
+ten sam.
+
 ## Nierozstrzygnięte
 
-Bariera synchronizacji jest jedyną dużą niewiadomą i nie da się jej zmierzyć bez
-prototypu — trzeba realnie podzielić jedno mnożenie i porównać zegar oraz
-zgodność co do bitu z obecną ścieżką.
+Wsad 128 i mniejsze nie korzystają z CPU w ogóle, bo rozpakowanie się nie
+amortyzuje. Trwała kopia f16 wycinka CPU zdjęłaby ten koszt i otworzyła krótsze
+kafle, ale kosztuje 4,5 GB i została świadomie odrzucona.
 
 ## Źródła
 

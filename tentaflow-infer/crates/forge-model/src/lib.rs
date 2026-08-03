@@ -6,4 +6,6 @@
 // lives outside the engine monolith rather than as another branch inside it.
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod cpu_matmul;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod mlx_dense;
