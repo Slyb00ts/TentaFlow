@@ -2315,6 +2315,54 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// SwiGLU + kwantyzacja aktywacji w jednym przejściu.
+    ///
+    /// Rozdzielnie kosztowało trzy przejścia przez bufor pośredni [T, n_cols]:
+    /// `silu_mul` czytał gate i up i zapisywał wynik, a `quantize_act_fp8`
+    /// czytał ten wynik dwa razy (absmax, kodowanie). Kernel fuzowany trzyma
+    /// wynik w pamięci współdzielonej, więc z HBM idzie tylko odczyt gate i up
+    /// oraz zapis kodów.
+    ///
+    /// Zwraca `false`, gdy artefaktu nie ma albo `n_cols` nie mieści się w
+    /// pamięci współdzielonej — wtedy woła się starą parę kerneli.
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_mul_quant_fp8(
+        &self,
+        gate: &DevBuffer,
+        up: &DevBuffer,
+        n_cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let smem = n_cols * 2;
+        if !self.artifacts.has("silu_mul_quant_fp8")
+            || smem > self.device.caps().max_shared_mem_per_block
+        {
+            return Ok(false);
+        }
+        // Ta sama pula co u zsynchronizowanej normy, wiec `gemm_fp8_prequant`
+        // czyta wynik bez posrednictwa.
+        self.fp8_act_ensure(n_tokens * n_cols, n_tokens)?;
+        let sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let xs = sc.xs.as_ref().expect("xs allocated");
+        let k = self.artifacts.get("silu_mul_quant_fp8")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: smem as u32,
+        };
+        let args = LaunchArgs::new()
+            .buf(xq)
+            .buf(xs)
+            .buf(gate)
+            .buf(up)
+            .scalar(n_cols as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)?;
+        Ok(true)
+    }
+
     /// Nazwa kernela nieliniowości bramkowanego FFN.
     fn glu_kernel(act: forge_formats::FfnActivation) -> &'static str {
         match act {

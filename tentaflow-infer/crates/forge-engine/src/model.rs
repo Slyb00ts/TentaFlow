@@ -7176,14 +7176,24 @@ impl Model {
                         }
                     }
                     trace.mark(self.device.as_ref(), "gemm_gateup");
-                    kernels.glu_mul_f16(
-                        self.ffn_act(),
-                        &pb.act,
-                        &pb.gate,
-                        &pb.up,
-                        rows * inter,
-                        stream,
-                    )?;
+                    // SwiGLU + kwantyzacja jednym kernelem, gdy wynik i tak
+                    // trafia do projekcji FP8: wtedy bufor posredni [T, inter]
+                    // nie jedzie trzy razy przez HBM. Kalibracja czyta `pb.act`,
+                    // wiec przy niej zostaje stara para kerneli.
+                    let fused_act = fp8mod_ffn_fuse
+                        && calib.is_none()
+                        && matches!(self.ffn_act(), forge_formats::FfnActivation::SiLU)
+                        && kernels.silu_mul_quant_fp8(&pb.gate, &pb.up, inter, rows, stream)?;
+                    if !fused_act {
+                        kernels.glu_mul_f16(
+                            self.ffn_act(),
+                            &pb.act,
+                            &pb.gate,
+                            &pb.up,
+                            rows * inter,
+                            stream,
+                        )?;
+                    }
                     trace.mark(self.device.as_ref(), "silu");
                     // Calibration capture 4/4: down_proj input (SwiGLU output).
                     if let Some(cal) = calib.as_mut() {
@@ -7196,7 +7206,10 @@ impl Model {
                             &mut cal.scratch,
                         )?;
                     }
-                    if let Some(wl) = w4a8_layer {
+                    if fused_act {
+                        let fl = fp8_ffn_layer.expect("fused_act wymaga paczek FP8");
+                        self.gemm_fp8_prequant(&pb.down, &fl.down, rows, stream)?;
+                    } else if let Some(wl) = w4a8_layer {
                         self.gemm_w4a8(&pb.down, &wl.down, &pb.act, rows, stream)?;
                     } else if let Some(fl) = fp8_layer {
                         self.gemm_fp8(&pb.down, &fl.down, &pb.act, rows, stream)?;

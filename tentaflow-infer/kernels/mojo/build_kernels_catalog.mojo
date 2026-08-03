@@ -304,6 +304,7 @@ from src.q8_single_big_poststage import (
 from src.gemm import quantize_act_q8_1
 from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64, gemm_q4_k_i8mma_big
 from src.gemm_fp8 import (
+    silu_mul_quant_fp8,
     gemm_fp8_f16,
     gemm_fp8_f16_bm64,
     gemm_fp8_f16_big,
@@ -3909,6 +3910,12 @@ def main() raises:
         dump_asm=Path("gemm_fp8_mod_4096x14336_4096.ptx"),
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096x14336_4096"))
+
+    # arch: nvidia
+    _ = ctx.compile_function[
+        silu_mul_quant_fp8, dump_asm=Path("silu_mul_quant_fp8.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "silu_mul_quant_fp8"))
 
     # arch: nvidia:sm_89+
     _ = ctx.compile_function[
