@@ -16,7 +16,7 @@ use forge_formats::safetensors::ShardedSafeTensors;
 use forge_formats::w4a8::{col_absmax, smoothing_scale, w4a8_pack_smoothed, W4A8_GROUP};
 use forge_formats::MtpWeightRole;
 use forge_formats::{
-    dequantize_to_f32, BlockMatrix, Gguf, HfConfig, LayerKind, MlxQuantConfig, ModelDescriptor,
+    dequantize_to_f32, BlockMatrix, Gguf, HfConfig, LayerKind, ModelDescriptor,
     RoleShard, TpShard, WeightRole,
 };
 use forge_hal::{DevBuffer, Device, Pool};
