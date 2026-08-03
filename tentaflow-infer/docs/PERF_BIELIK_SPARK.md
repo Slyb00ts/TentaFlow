@@ -52,6 +52,31 @@ Punkt zagiecia lezy przy 1120 FLOP na bajt. Sufit 251 TFLOPS zgadza sie z
 48 SM x 2048 FLOP/cykl x 2,45 GHz, wiec jest to prawdziwy sufit sprzetu, a nie
 artefakt probki.
 
+## Skad wziac drugie 2x: prefill liczy w FP8, a sprzet umie FP4
+
+| sufit instrukcji (ILP niezalezny, `bench_fp8_ceiling.mojo`) | TFLOPS |
+|---|--:|
+| FP8 e4m3 `m16n8k32` | 251,4 |
+| **FP4 e2m1 `kind::mxf4.block_scale.m16n8k64`** | **497,9** |
+
+Instrukcja FP4 wykonuje sie w TYM SAMYM czasie co FP8, a przerabia dwa razy
+wiecej K — zmierzone 1,98x. Model jest NVFP4, a my go konwertujemy do FP8 na
+prefill, wiec placimy dwa razy:
+
+1. sufit mma spada z 498 do 251 TFLOPS,
+2. paczki zajmuja 7,35 GB zamiast okolo 3,7, czyli ruch wag jest dwukrotny.
+
+Obie polowy skladaja sie na te sama dzwignie. Podloga obliczeniowa GEMM-ow
+spadlaby ze 118 do 59 ms, a ruch wag przy jednym przebiegu z 66 do 33 ms —
+czyli GEMM-y z dzisiejszych 220 ms do okolo 110-120.
+
+**Czego to wymaga i jaki jest haczyk.** `ptxas` przyjmuje na sm_121a wariant ze
+skalami **ue8m0** (potegi dwojki, co 32 wartosci) i ODRZUCA skale e4m3, czyli
+natywne NVFP4 (skale e4m3 co 16 wartosci). Trzeba wiec przekwantowac NVFP4 na
+MXFP4, zaokraglajac skale do potegi dwojki. To jest strata jakosci o nieznanej
+wielkosci i **rozstrzygnac ma ja pomiar `forge ppl`, a nie rachunek sufitow**.
+Dopoki tego nie zmierzymy, 2x jest policzone, ale nie obiecane.
+
 ## Model: ile razy wagi przechodza przez pamiec
 
 Kernel dostaje siatke `(N/BN, M/BM)` i CUDA rozdaje bloki x-major, wiec
