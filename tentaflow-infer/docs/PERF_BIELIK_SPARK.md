@@ -21,6 +21,71 @@ dla vLLM).
 
 Prefill 3 192 tok/s przy 2048 tokenach to 2·7e9·2048 / 0,64 s = **44,7 TFLOPS**.
 
+## Protokol pomiaru — przeczytac przed dopisaniem jakiejkolwiek liczby
+
+GB10 bezczynny stoi na **208 MHz** przy 3003 MHz maksymalnych i pod obciazeniem
+wchodzi na ~2561 MHz (54 W, 55 C, wiec ani prad ani temperatura nie ograniczaja).
+Rozgrzewka liczona w kilku wywolaniach tego nie podnosi. Skutek jest brutalny:
+ten sam ksztalt `(N=4096, K=11264)` zmierzony jako PIERWSZY przypadek w
+benchmarku daje **876 us**, a po sekundzie mielenia **617 us**. To 1,42x
+roznicy zaleznej wylacznie od kolejnosci przypadkow.
+
+Dwie liczby w poprzedniej wersji tego dokumentu byly wlasnie takim artefaktem
+i wyslaly analize w slepa uliczke (patrz "Co bylo zmierzone zle"). Kazdy
+benchmark w `bench_fp8_traffic.mojo` wola wiec `_warmup` (4000 pelnych GEMM-ow)
+przed pierwszym pomiarem i mierzy kazdy przypadek dwukrotnie.
+
+## Roofline GB10 — dwie liczby, ktore rzadza wszystkim
+
+`bench_fp8_ceiling.mojo` (mma bez ruchu pamieci, rosnacy ILP) i probe
+strumieniowy:
+
+| wielkosc | wartosc |
+|---|---|
+| sufit mma e4m3 `m16n8k32` | **251 TFLOPS** (wysycony juz przy ILP=1) |
+| odczyt strumieniowy z pamieci | **~224 GB/s** |
+| L2 | 24 MiB |
+| SM / zegar pod obciazeniem | 48 / 2561 MHz |
+
+Punkt zagiecia lezy przy 1120 FLOP na bajt. Sufit 251 TFLOPS zgadza sie z
+48 SM x 2048 FLOP/cykl x 2,45 GHz, wiec jest to prawdziwy sufit sprzetu, a nie
+artefakt probki.
+
+## Model: ile razy wagi przechodza przez pamiec
+
+Kernel dostaje siatke `(N/BN, M/BM)` i CUDA rozdaje bloki x-major, wiec
+rezydentne naraz sa WSZYSTKIE kafle kolumnowe jednego wiersza M. Liczba
+wierszy M mielonych jednoczesnie to `conc = 48 / (N/BN)`, a stad liczba
+przebiegow, ktore B musi odbyc przez pamiec:
+
+```
+passes = ceil( (M/BM) / conc )
+TFLOPS = 2 * M * BW / passes          (o ile nie ogranicza plateau kernela)
+```
+
+Model zgadza sie z pomiarem na calym zakresie (M=1024, BM=128, BN=256,
+BW=224 GB/s):
+
+| ksztalt | passes | przewidziane | zmierzone |
+|---|---|---|---|
+| N=4096, K=9216..16384 | 3 | 152,9 | 150,2–152,9 |
+| N=5632, K=4096 | 3,7 | 125,0 | 123,5 |
+| N=8192, K=4096 | 5,3 | 86,1 | 88,6 |
+| N=11264, K=4096 | 7,3 | 62,6 | 67,7 |
+| N=14336, K=4096 | 8 | 57,3 | 60,2 |
+
+Dwa wnioski, oba istotne:
+
+1. **Plateau obliczeniowe tego kernela to ~150 TFLOPS, czyli 60% sufitu.**
+   Widac je na `q/o` (B = 16 MiB miesci sie w L2, pamiec robi ledwie 120 GB/s,
+   a mimo to wychodzi 146 TFLOPS). Tam nic nie ogranicza od strony ruchu — to
+   jest czysta sprawnosc kernela.
+2. **Dla `down` oba ograniczenia wypadaja w tym samym miejscu** (pasmo 152,9
+   wobec plateau 150). Sama zmiana kolejnosci blokow NIC by tam nie dala.
+
+Dlatego jedyna droga dalej to podniesienie plateau, czyli wlasny GEMM — a nie
+swizzle, jak zakladala poprzednia wersja tego dokumentu.
+
 ## Ścieżka wykonania
 
 `FORGE_GEMM` bez wartości włącza automatycznie hybrydowy prefill FP8:
@@ -35,7 +100,31 @@ projekcje Q/O/gate/up/down NVFP4 i `lm_head` są przepakowywane do FP8 na GPU
 
 Decode jest identyczny we wszystkich wariantach (38,1–38,3), bo zostaje na NVFP4.
 
-## Trzy GEMM-y prefillu nie są równe
+## Co bylo zmierzone zle
+
+Dwie tezy z poprzedniej wersji nie przezyly powtorzenia pomiaru z rozgrzewka:
+
+- **„`down` to najwolniejszy GEMM prefillu, 107 TFLOPS wobec 142 dla q/o".**
+  Nieprawda. Na rozgrzanym ukladzie `(4096, 11264)` robi **150–153 TFLOPS**,
+  czyli dokladnie tyle co reszta. Liczba 107 wziela sie z pomiaru na zimnych
+  zegarach. Punkt 1 listy „nastepne cele" wskazywal wiec na nieistniejacy
+  problem — dokladnie tak jak wczesniej robily to dwa komunikaty o `kv_packs`.
+- **„`gate/up` i `down` maja identyczny ruch operandow, a roznia sie 2,3x, i
+  tlumaczy to liczba kafli kolumnowych".** Ruch faktycznie jest identyczny, ale
+  roznica nie jest zagadka: to model `passes` powyzej. Przy N=11264 rezydentny
+  jest jeden wiersz M, wiec B idzie przez pamiec 8 razy zamiast 3.
+
+Odwrotnie, teza o zalamaniu przy szerokim N **potwierdzila sie** w powtorzonym
+pomiarze (N=4096 → 140 TFLOPS, N=11264 → 67,7, powtorka 66,2), wiec dzielenie
+`gate/up` na kawalki zostaje: zmierzone 1396 us jednym wywolaniem wobec 655 us
+w kawalkach, czyli **2,13x**.
+
+Sprawdzone i ODRZUCONE: dzielenie `down` na plastry kolumn miesczace B w L2.
+Plastry po 1024 kolumny daja 672 us, po 2048 — 697 us, a jedno wywolanie 617 us.
+Waskie plastry wymuszaja pelna wspolbieznosc po M, ale zostawiaja 32 z 48 SM
+bezczynnych i to kosztuje wiecej, niz daje oszczedzony ruch.
+
+## Trzy GEMM-y prefillu nie są równe (pomiar historyczny, zimne zegary)
 
 `bench_fp8_modular_tiles.mojo`, M=1024, najlepszy kafel:
 
@@ -126,10 +215,12 @@ one wysylaly kolejna osobe za nieistniejacym problemem.
 
 Nastepne cele w kolejnosci zysku do ryzyka:
 
-1. **Projekcja `down`** — najwolniejszy pojedynczy GEMM: 480 wywolan po 882 us,
-   czyli 107 TFLOPS wobec 142 osiaganych przez q/o. N=4096 jest juz optymalne,
-   wiec zostaje dlugie K=11264; podzial K wymaga akumulacji i redukcji, wiec
-   jest istotnie trudniejszy niz podzial N.
+1. **Plateau kernela GEMM: 150 z 251 TFLOPS.** Nie chodzi o zaden pojedynczy
+   ksztalt — wszystkie leza na tej samej wartosci. Ogranicza je 8 warpow na SM
+   (224 rejestry + 98,3 KB pamieci wspoldzielonej na blok), a kafla warpa
+   innego niz 64x64 kernel Modulara nie przyjmuje. Stad wlasny GEMM: 16 warpow
+   z akumulatorem 32x64 zamiast 8 warpow z 64x64, przy tej samej pamieci
+   wspoldzielonej.
 2. **Uwaga** (18,6%) — sufit rejestrow juz zalozony (patrz nizej); dalsze
    zejscie wymagaloby mniejszego akumulatora, a nie ustawienia `ptxas`.
 
@@ -174,20 +265,24 @@ od rejestrow, a ponizej 148 zaczynaja sie spille.
 
 W obrębie `multistage_gemm_kernel` Modulara pokrętła są wyczerpane. Zajętość
 16,67% wynika z rozmiaru rejestrów i pamięci współdzielonej tego kernela, a nie
-z naszego doboru kafla — a dwa niezależne ograniczenia oznaczają, że zbicie
-jednego niczego nie da.
+z naszego doboru kafla.
 
-Dalsze możliwości, od najtańszej:
+Po zmierzeniu roofline'u zostaje JEDNA droga, a nie trzy:
 
-1. **Kolejność bloków w siatce.** Kernel dostaje siatkę `(N/BN, T/BM)`, więc
-   kolejne bloki różnią się kaflem B (1 MiB każdy). Przy 44 kaflach kolumnowych
-   `gate/up` trzyma w locie 44 MiB wag, przy 16 w `down` — 16 MiB. To najlepiej
-   tłumaczy różnicę 2,3× przy identycznym ruchu, ale zmiana mapowania wymaga
-   wejścia w kernel, bo indeksy liczone są z `blockIdx`.
-2. **Własny GEMM FP8 pod te kształty** dla sm_121a — pełna kontrola nad kaflem,
-   etapami i kolejnością bloków.
+1. **Wlasny GEMM FP8 dla sm_121a.** Cel jest ilosciowy: podniesc plateau ze 150
+   TFLOPS. Dzwignia to liczba warpow — 8 warpow na SM nie ma czym zaslonic
+   opoznien 4-etapowego potoku cp.async. Kafel warpa 32x64 zamiast 64x64 daje
+   64 rejestry akumulatora zamiast 128, czyli 16 warpow (512 watkow) przy tej
+   samej pamieci wspoldzielonej i nadal jednym bloku na SM. Kierunek popiera
+   pomiar z `MOJO_NOTES.md`: na int8 wariant 16 warpow x 32 akumulatory bil
+   8 warpow x 64 o 7%.
+2. **Kolejnosc blokow w siatce** — ZDEGRADOWANA z pozycji pierwszej. Model
+   `passes` pokazuje, ze dla `down` swizzle nic nie da, bo pasmo i plateau
+   wypadaja w tym samym punkcie (152,9 wobec 150). Ma sens dopiero PO
+   podniesieniu plateau, i wtedy zastapi dzielenie `gate/up` na kawalki.
 3. Nowszy kernel z biblioteki Modulara, jeśli mają wariant dla Blackwella;
-   pakiet jest skompilowany, więc bez źródeł nie da się tego sprawdzić z repo.
+   pakiet jest skompilowany (`linalg.mojoc`, bez zrodel), więc bez nich nie da
+   się tego sprawdzić z repo.
 
 
 ## Dlaczego sciezka NVFP4 wprost jest wolniejsza od konwersji do FP8
