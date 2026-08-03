@@ -158,7 +158,15 @@ kernel void {name}(
 /// but cost a register per token per lane, and eight fits without spilling.
 pub const QMM_TILE: u32 = 8;
 
-/// Output rows one threadgroup carries, one SIMD group each.
+/// Output rows one SIMD GROUP carries at once.
+///
+/// The third knob, and it works on the instruction mix rather than on traffic.
+/// With one row per group every activation value feeds exactly one multiply, so
+/// the loop issues roughly as many loads as FMAs and cannot get near the ALU.
+/// Two rows share each loaded activation between two multiplies.
+pub const QMM_ROWS_PER_SIMD: u32 = 2;
+
+/// Output rows one threadgroup carries.
 ///
 /// This is the second knob, and it works on a different term than the tile.
 /// The tile decides how many tokens share one read of the weights; this decides
@@ -166,15 +174,16 @@ pub const QMM_TILE: u32 = 8;
 /// activation term is the one that dominates — with four rows a 512-token chunk
 /// re-reads its activations a thousand times over, which is exactly why the
 /// first version regressed there.
-pub const QMM_ROWS_PER_GROUP: u32 = 16;
-/// Threads per batched threadgroup: one SIMD group per output row.
-pub const QMM_THREADS: u32 = QMM_ROWS_PER_GROUP * 32;
+pub const QMM_ROWS_PER_GROUP: u32 = 32;
+/// Threads per batched threadgroup: 32 lanes per SIMD group.
+pub const QMM_THREADS: u32 = (QMM_ROWS_PER_GROUP / QMM_ROWS_PER_SIMD) * 32;
 
 /// Entry-point name for the batched form.
 pub fn qmm_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
     format!(
-        "qmm_affine_4bit_r{}t{}_{}_out{}",
+        "qmm_affine_4bit_r{}s{}t{}_{}_out{}",
         QMM_ROWS_PER_GROUP,
+        QMM_ROWS_PER_SIMD,
         QMM_TILE,
         scales.suffix(),
         out.suffix()
@@ -224,17 +233,15 @@ kernel void {name}(
     uint  sg   [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
 {{
-    const uint row = tgid.x * {rows}u + sg;
-    if (row >= n_rows) {{ return; }}
+    const uint row0 = tgid.x * {rows}u + sg * {per_simd}u;
+    if (row0 >= n_rows) {{ return; }}
     const uint tok0 = tgid.y * {tile}u;
     if (tok0 >= n_tokens) {{ return; }}
     const uint tail = min({tile}u, n_tokens - tok0);
+    const uint rows_here = min({per_simd}u, n_rows - row0);
 
     const uint words_per_row  = n_cols / 8u;
     const uint groups_per_row = n_cols / group;
-    device const uint* w = packed + row * words_per_row;
-    device const {ty}* s = scales + row * groups_per_row;
-    device const {ty}* b = biases + row * groups_per_row;
 
     // Wiersz aktywacji na pozycję kafla. Poza ogonem wskazuje na token ostatni,
     // a nie na nic: liczymy dla niego śmieci, których nigdy nie zapisujemy.
@@ -246,33 +253,45 @@ kernel void {name}(
         xp[t] = x + min(tok0 + t, n_tokens - 1u) * n_cols;
     }}
 
-    float acc[{tile}];
-    for (uint t = 0; t < {tile}u; ++t) {{ acc[t] = 0.0f; }}
+    float acc[{per_simd}][{tile}];
+    for (uint r = 0; r < {per_simd}u; ++r) {{
+        for (uint t = 0; t < {tile}u; ++t) {{ acc[r][t] = 0.0f; }}
+    }}
 
     for (uint word = lane; word < words_per_row; word += 32u) {{
-        const uint bits = w[word];
         const uint col0 = word * 8u;
         const uint g    = col0 / group;
-        const float sc  = float(s[g]);
-        const float bi  = float(b[g]);
 
-        float wv[8];
-        for (uint j = 0; j < 8u; ++j) {{
-            wv[j] = fma(float((bits >> (j * 4u)) & 0xFu), sc, bi);
+        // Wagi wszystkich obsługiwanych wierszy rozpakowane RAZ, zanim ruszą
+        // aktywacje: to one mają być tym, co zostaje w rejestrach, gdy jeden
+        // odczyt aktywacji karmi {per_simd} mnożeń zamiast jednego.
+        float wv[{per_simd}][8];
+        for (uint r = 0; r < {per_simd}u; ++r) {{
+            const uint rr = min(row0 + r, n_rows - 1u);
+            const uint bits = packed[rr * words_per_row + word];
+            const float sc  = float(scales[rr * groups_per_row + g]);
+            const float bi  = float(biases[rr * groups_per_row + g]);
+            for (uint j = 0; j < 8u; ++j) {{
+                wv[r][j] = fma(float((bits >> (j * 4u)) & 0xFu), sc, bi);
+            }}
         }}
-        // Kolejność sumowania po j jest ta sama co w formie wektorowej, żeby
-        // prefill i dekodowanie zgadzały się bit w bit na tej samej pozycji.
+
         for (uint t = 0; t < {tile}u; ++t) {{
             device const half* xr = xp[t] + col0;
             for (uint j = 0; j < 8u; ++j) {{
-                acc[t] = fma(float(xr[j]), wv[j], acc[t]);
+                const float xv = float(xr[j]);
+                for (uint r = 0; r < {per_simd}u; ++r) {{
+                    acc[r][t] = fma(xv, wv[r][j], acc[r][t]);
+                }}
             }}
         }}
     }}
 
-    for (uint t = 0; t < tail; ++t) {{
-        const float total = simd_sum(acc[t]);
-        if (lane == 0u) {{ y[(tok0 + t) * n_rows + row] = {out_ty}(total); }}
+    for (uint r = 0; r < rows_here; ++r) {{
+        for (uint t = 0; t < tail; ++t) {{
+            const float total = simd_sum(acc[r][t]);
+            if (lane == 0u) {{ y[(tok0 + t) * n_rows + row0 + r] = {out_ty}(total); }}
+        }}
     }}
 }}
 "#,
@@ -280,6 +299,7 @@ kernel void {name}(
         ty = ty,
         out_ty = out_ty,
         rows = QMM_ROWS_PER_GROUP,
+        per_simd = QMM_ROWS_PER_SIMD,
         tile = QMM_TILE,
     )
 }

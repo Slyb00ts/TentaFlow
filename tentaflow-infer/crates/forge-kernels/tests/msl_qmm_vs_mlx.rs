@@ -333,7 +333,9 @@ fn the_batched_form_agrees_with_the_vector_form_bit_for_bit() {
 #[test]
 #[ignore]
 fn how_much_the_tile_actually_buys() {
-    let (group, _bits, _tokens, cases) = load();
+    // Sam rozmiar grupy kwantyzacji, bo wagę bierzemy syntetyczną w pełnym
+    // rozmiarze warstwy — ale rozmiar grupy ma zostać ten, co w checkpoincie.
+    let group = load().0;
     let Some(g) = gpu() else {
         eprintln!("pomijam: brak urządzenia Metal");
         return;

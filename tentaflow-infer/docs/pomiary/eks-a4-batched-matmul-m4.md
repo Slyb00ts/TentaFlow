@@ -15,26 +15,41 @@ msl_qmm_vs_mlx -- --ignored --nocapture`.
 
 ## Wynik
 
-Geometria dobrana pomiarem, nie z góry: kafel 8 tokenów, 16 wierszy wyjścia na
-grupę roboczą (uzasadnienie obu liczb niżej).
+Geometria dobrana pomiarem, nie z góry: kafel 8 tokenów, 2 wiersze wyjścia na
+grupę SIMD, 32 wiersze na grupę roboczą (uzasadnienie każdej liczby niżej).
 
 | T | kafel | na token | pętla GEMV | przyspieszenie |
 |---:|---:|---:|---:|---:|
-| 1 | 1148,6 us | 1148,6 us | 410,8 us | 0,36x |
-| 8 | 923,0 us | 115,4 us | 2308,9 us | **2,50x** |
-| 32 | 3435,0 us | 107,3 us | 8494,7 us | **2,47x** |
-| 64 | 7413,9 us | 115,8 us | 17074,5 us | **2,30x** |
-| 128 | 13902,8 us | 108,6 us | 40649,3 us | **2,92x** |
-| 192 | 26819,8 us | 139,7 us | 51282,2 us | 1,91x |
-| 256 | 50247,5 us | 196,3 us | 68665,1 us | 1,37x |
+| 1 | 1003,8 us | 1003,8 us | 326,7 us | 0,33x |
+| 8 | 643,3 us | 80,4 us | 2210,0 us | **3,44x** |
+| 32 | 2368,4 us | 74,0 us | 8354,0 us | **3,53x** |
+| 64 | 4647,6 us | 72,6 us | 16725,3 us | **3,60x** |
+| 128 | 9255,3 us | 72,3 us | 33332,0 us | **3,60x** |
+| 192 | 13918,6 us | 72,5 us | 50089,9 us | **3,60x** |
+| 256 | 18639,9 us | 72,8 us | 66742,2 us | **3,58x** |
 
-Koszt na token jest płaski (107-116 us) do 128 tokenów i od 192 rośnie. Stąd
-kafel prefillu 128 — i stąd też wiadomo, że powyżej tej granicy problemem nie
-jest już odczyt wag.
+Koszt na token jest płaski przez cały zakres — degradacja przy dużych kaflach,
+którą miała wcześniejsza wersja, zniknęła wraz z blokowaniem rejestrowym.
 
 ## Dwie liczby geometrii, obie zmierzone
 
-**Wierszy wyjścia na grupę roboczą: 16.** Kafel tokenów decyduje, ilu tokenów
+**Wierszy wyjścia na grupę SIMD: 2.** To był największy pojedynczy skok:
+102,9 na 72,3 us na token. Przy jednym wierszu każda wczytana aktywacja karmi
+dokładnie jedno mnożenie, więc pętla wykonuje mniej więcej tyle odczytów, co
+FMA, i nie ma jak zbliżyć się do jednostek arytmetycznych. Dwa wiersze dzielą
+każdy odczyt między dwa mnożenia. Cztery i osiem już się nie mieszczą:
+
+| wierszy na grupę SIMD | T=128 |
+|---:|---:|
+| 1 | 102,9 us/token |
+| 2 | **72,3 us/token** |
+| 4 | 130,1 us/token |
+| 8 | 447,3 us/token |
+
+Po tej zmianie szerokość grupy roboczej przestała mieć znaczenie (16, 32 i 64
+wiersze dają 72-74 us), bo redundantne odczyty aktywacji już nie są problemem.
+
+**Wierszy wyjścia na grupę roboczą: wcześniej 16.** Kafel tokenów decyduje, ilu tokenów
 obsłuży jeden odczyt WAG; liczba wierszy decyduje, ile wierszy wyjścia obsłuży
 jeden odczyt AKTYWACJI. Przy dużych kaflach to drugie zaczyna dominować.
 
@@ -123,20 +138,20 @@ obroty, a one też przeszły na kafel. Bielik-7B 4-bit, prompt 256 tokenów,
 
 | ścieżka | czas | przepustowość |
 |---|---:|---:|
-| token po tokenie | 11,769 s | 21,8 tok/s |
-| kaflami po 128 | 3,876 s | **66,0 tok/s** |
+| token po tokenie | 11,680 s | 21,9 tok/s |
+| kaflami po 128 | 3,058 s | **83,7 tok/s** |
 
-Przyspieszenie **3,04x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
+Przyspieszenie **3,82x**. Uwaga liczy teraz wszystkie zapytania kafla jednym
 wywołaniem, zamiast jednego na token, więc całość zyskuje więcej niż samo
 mnożenie.
 
-Dekodowanie po prefillu: 20,4 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
-Cel prefillu to 175 tok/s, więc ta ścieżka jest na 38% drogi.
+Dekodowanie po prefillu: 19,2 tok/s, czyli powyżej celu 19 tok/s z planu (§7.6).
+Cel prefillu to 175 tok/s, więc ta ścieżka jest na 48% drogi.
 
-Co zostało do wyjaśnienia: 109 us na token przy T=128 to 862 GFLOPS wobec
-zmierzonego szczytu 3,07 TFLOPS (28%) i wobec 28 us wynikających z samego ruchu
-wag. Ani jedno, ani drugie ograniczenie nie jest jeszcze osiągnięte, więc
-przyczyna leży gdzie indziej i nie zgaduję jej tutaj.
+Gdzie jest sufit: 72,3 us na token przy T=128 to 1,29 TFLOPS wobec zmierzonego
+szczytu FMA 3,07 TFLOPS, czyli 42%. Sam ruch wag daje 28 us, więc pamięć nadal
+nie jest ograniczeniem. Zostaje mieszanka instrukcji — i to jest miejsce, w
+którym wchodzi `simdgroup_matrix` (zmierzone 1,28x wobec FMA, EKS-A2).
 
 Obie ścieżki wybierają ten sam token — sprawdza to asercja w samym pomiarze,
 bo inaczej porównywałby dwie różne prace.
