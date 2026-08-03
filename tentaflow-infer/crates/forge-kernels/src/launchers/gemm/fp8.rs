@@ -1,15 +1,67 @@
 // ===== File: gemm/fp8.rs — GEMM/GEMV na FP8 e4m3 i W4A8 =====
 use super::*;
 
-/// Szerokie N liczone jako kilka wywolan po <=4096 kolumn.
+/// Kolumny liczone plastrami; kazdy plaster pisze wycinek do pelnej macierzy
+/// wyjsciowej, wiec jego kernel zna krok wiersza `LDY` rowny pelnemu N.
 ///
-/// Wydajnosc `multistage_gemm_kernel` ma maksimum przy N=4096 i zalamuje sie
-/// powyzej. Zmierzone na GB10 przy K=4096 i M=1024: 142 TFLOPS dla N=4096,
-/// 103 dla 5632, 62 dla 8192, 47 dla 11264. Te same 94.5 GFLOP policzone jako
-/// 4096+4096+3072 zajmuja 661 us zamiast 2016, czyli 3.05x szybciej. Kazdy
-/// kawalek pisze wycinek kolumn do pelnej macierzy wyjsciowej, wiec jego kernel
-/// zna krok wiersza `LDY` rowny pelnemu N.
-fn fp8_modular_column_chunks(rows: usize, cols: usize) -> Option<&'static [(usize, &'static str)]> {
+/// Szerokosc plastra dobiera sie pod LICZBE SM, nie pod „N=4096".
+///
+/// Siatka kawalka to `(plaster/256, tokeny/128)`. Przy pelnym kawalku prefillu
+/// (1024 tokenow) daje to 8 wierszy M, wiec plaster 1536 = 6 kafli kolumnowych,
+/// czyli 48 blokow na 48 SM: wszystkie wiersze M rezydentne naraz i dzielace ten
+/// sam kafel wag. Dotychczasowe 16 kafli kolumnowych mieszczilo 3 wiersze M,
+/// wiec kazda macierz wag szla przez pamiec TRZY razy.
+///
+/// W silniku to jest cala roznica, bo kazda z 40 warstw ma inne wagi i L2 nie
+/// pomaga miedzy wywolaniami. `nsys` na prefillu 2048: 44,1 GB ruchu wag
+/// (197 ms) przy podlodze obliczeniowej 118 ms; jeden przebieg to 14,7 GB
+/// (66 ms), czyli ponizej podlogi. Mikrobench tego nie pokazywal — tam ta sama
+/// macierz wracala do L2 co iteracje.
+///
+/// Prog `n_tokens > 512` jest istotny: ponizej niego wierszy M jest 4 lub mniej,
+/// wiec wagi i tak ida przez pamiec raz, a waskie plastry tylko zabieraja
+/// zajetosc (przy 1 wierszu M plaster 1536 zajmuje 6 z 48 SM).
+const STRIP_MIN_TOKENS: usize = 512;
+
+fn fp8_modular_column_chunks(
+    rows: usize,
+    cols: usize,
+    n_tokens: usize,
+) -> Option<&'static [(usize, &'static str)]> {
+    if n_tokens > STRIP_MIN_TOKENS {
+        match (rows, cols) {
+            // q/o
+            (4096, 4096) => {
+                return Some(&[
+                    (1536, "gemm_fp8_mod_1536x4096_4096"),
+                    (1536, "gemm_fp8_mod_1536x4096_4096"),
+                    (1024, "gemm_fp8_mod_1024x4096_4096"),
+                ])
+            }
+            // down
+            (4096, 11264) => {
+                return Some(&[
+                    (1536, "gemm_fp8_mod_1536x4096_11264"),
+                    (1536, "gemm_fp8_mod_1536x4096_11264"),
+                    (1024, "gemm_fp8_mod_1024x4096_11264"),
+                ])
+            }
+            // gate/up
+            (11264, 4096) => {
+                return Some(&[
+                    (1536, "gemm_fp8_mod_1536x11264_4096"),
+                    (1536, "gemm_fp8_mod_1536x11264_4096"),
+                    (1536, "gemm_fp8_mod_1536x11264_4096"),
+                    (1536, "gemm_fp8_mod_1536x11264_4096"),
+                    (1536, "gemm_fp8_mod_1536x11264_4096"),
+                    (1536, "gemm_fp8_mod_1536x11264_4096"),
+                    (1536, "gemm_fp8_mod_1536x11264_4096"),
+                    (512, "gemm_fp8_mod_512x11264_4096"),
+                ])
+            }
+            _ => {}
+        }
+    }
     match (rows, cols) {
         (11264, 4096) => Some(&[
             (4096, "gemm_fp8_mod_4096x11264_4096"),
@@ -576,7 +628,7 @@ impl Kernels {
         // Podzial szerokiego N na kawalki po <=4096 kolumn, gdy komplet kerneli
         // czastkowych jest w artefaktach. Kazdy kawalek dostaje przesuniete
         // wagi (wiersze B), skale wierszy i kolumne startowa w Y.
-        if let Some(chunks) = fp8_modular_column_chunks(rows, cols) {
+        if let Some(chunks) = fp8_modular_column_chunks(rows, cols, n_tokens) {
             if chunks.iter().all(|(_, name)| self.artifacts.has(name)) {
                 let mut start = 0usize;
                 for (chunk_rows, name) in chunks {
@@ -685,7 +737,7 @@ impl Kernels {
         // Ten sam podzial szerokiego N co w `gemm_fp8_modular`. Tedy idzie FFN
         // gate/up, czyli dokladnie ksztalt (11264, 4096), na ktorym pojedyncze
         // wywolanie osiaga 47 TFLOPS zamiast 142.
-        if let Some(chunks) = fp8_modular_column_chunks(rows, cols) {
+        if let Some(chunks) = fp8_modular_column_chunks(rows, cols, n_tokens) {
             if chunks.iter().all(|(_, name)| self.artifacts.has(name)) {
                 let mut start = 0usize;
                 for (chunk_rows, name) in chunks {

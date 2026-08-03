@@ -325,6 +325,12 @@ from src.gemm_fp8_modular import (
     gemm_fp8_mod_3072x11264_4096,
     gemm_fp8_mod_4096x14336_4096,
     gemm_fp8_mod_2048x14336_4096,
+    gemm_fp8_mod_1536x4096_4096,
+    gemm_fp8_mod_1024x4096_4096,
+    gemm_fp8_mod_1536x4096_11264,
+    gemm_fp8_mod_1024x4096_11264,
+    gemm_fp8_mod_1536x11264_4096,
+    gemm_fp8_mod_512x11264_4096,
 )
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.gemm_q4k_i8_multistage import (
@@ -3861,6 +3867,48 @@ def main() raises:
         gemm_fp8_mod_4096_11264, dump_asm=Path("gemm_fp8_mod_4096_11264.ptx")
     ]()
     entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_4096_11264"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_1536x4096_4096,
+        dump_asm=Path("gemm_fp8_mod_1536x4096_4096.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_1536x4096_4096"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_1024x4096_4096,
+        dump_asm=Path("gemm_fp8_mod_1024x4096_4096.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_1024x4096_4096"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_1536x4096_11264,
+        dump_asm=Path("gemm_fp8_mod_1536x4096_11264.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_1536x4096_11264"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_1024x4096_11264,
+        dump_asm=Path("gemm_fp8_mod_1024x4096_11264.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_1024x4096_11264"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_1536x11264_4096,
+        dump_asm=Path("gemm_fp8_mod_1536x11264_4096.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_1536x11264_4096"))
+
+    # arch: nvidia:sm_89+
+    _ = ctx.compile_function[
+        gemm_fp8_mod_512x11264_4096,
+        dump_asm=Path("gemm_fp8_mod_512x11264_4096.ptx"),
+    ]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_mod_512x11264_4096"))
 
     # arch: nvidia:sm_89+
     _ = ctx.compile_function[

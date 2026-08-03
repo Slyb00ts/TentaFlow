@@ -108,3 +108,24 @@ comptime gemm_fp8_mod_4096x11264_4096 = gemm_fp8_mod_tile[4096, 4096, 256, 11264
 comptime gemm_fp8_mod_3072x11264_4096 = gemm_fp8_mod_tile[3072, 4096, 256, 11264]
 comptime gemm_fp8_mod_4096x14336_4096 = gemm_fp8_mod_tile[4096, 4096, 256, 14336]
 comptime gemm_fp8_mod_2048x14336_4096 = gemm_fp8_mod_tile[2048, 4096, 256, 14336]
+
+
+# Plastry po 1536 kolumn — dobrane pod LICZBE SM, nie pod „N=4096".
+#
+# Siatka to (plaster/256, tokeny/128). Przy pelnym kawalku prefillu (1024
+# tokenow) wychodzi 8 wierszy M, wiec plaster 1536 daje 6 kafli kolumnowych,
+# czyli 48 blokow na 48 SM: WSZYSTKIE wiersze M sa rezydentne naraz i dziela ten
+# sam kafel wag. Dotychczasowe 16 kafli kolumnowych mieszczilo tylko 3 wiersze M,
+# wiec kazda macierz wag szla przez pamiec trzy razy zamiast raz.
+#
+# W silniku to jest cala roznica, bo kazda z 40 warstw ma inne wagi i L2 nigdy
+# nie pomaga miedzy wywolaniami: `nsys` pokazal 44,1 GB ruchu wag na prefill
+# (197 ms) przy podlodze obliczeniowej 118 ms. Jeden przebieg to 14,7 GB (66 ms),
+# czyli ponizej podlogi. Mikrobench tego NIE pokazywal — tam ta sama macierz
+# wracala do L2 co iteracje i plastry wychodzily gorzej.
+comptime gemm_fp8_mod_1536x4096_4096 = gemm_fp8_mod_tile[1536, 4096, 256, 4096]
+comptime gemm_fp8_mod_1024x4096_4096 = gemm_fp8_mod_tile[1024, 4096, 256, 4096]
+comptime gemm_fp8_mod_1536x4096_11264 = gemm_fp8_mod_tile[1536, 11264, 256, 4096]
+comptime gemm_fp8_mod_1024x4096_11264 = gemm_fp8_mod_tile[1024, 11264, 256, 4096]
+comptime gemm_fp8_mod_1536x11264_4096 = gemm_fp8_mod_tile[1536, 4096, 256, 11264]
+comptime gemm_fp8_mod_512x11264_4096 = gemm_fp8_mod_tile[512, 4096, 256, 11264]
