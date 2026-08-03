@@ -112,8 +112,26 @@ Nastepne cele w kolejnosci zysku do ryzyka:
 2. **`down` na 109 TFLOPS** wobec 142 osiaganych przez q/o i gate/up. N=4096 jest
    juz optymalne, wiec zostaje dlugie K=11264; podzial K wymaga akumulacji i
    redukcji, wiec jest istotnie trudniejszy niz podzial N.
-3. **Uwaga** (17%). Przy kauzalnym maskowaniu teoretyczny koszt to ~10 ms na
-   przebieg wobec ~39 ms mierzonych.
+3. **Uwaga** (18%) — zmierzona, nie zgadywana. `ncu` na `attn_prefill_fa_mma`:
+
+   | metryka | wartosc |
+   |---|---|
+   | jednostka specjalna (`exp`) | **2,78%** |
+   | FMA | 2,81% |
+   | jednostka tensorowa | 13,5% |
+   | przepustowosc SM | 12,9% |
+   | aktywne warpy | **15,2%** |
+   | rejestry/watek | **176** -> limit 2 bloki/SM |
+   | pamiec wspoldzielona | 0 -> limit 3 bloki/SM |
+
+   Zadna jednostka nie jest wysycona; kernel stoi na opoznieniach przy zbyt
+   malej liczbie warpow. Ogranicza go WYLACZNIE zuzycie rejestrow: 128 watkow x
+   176 rejestrow to 2 bloki na SM, czyli 8 warpow z 48. Zejscie do ~128
+   rejestrow dalo by 4 bloki i podwojenie zajetosci.
+
+   **Wniosek dla FA4:** wielomianowa wykladnicza (technika #2) NIE pomoze tutaj —
+   jednostka specjalna jest wysycona w 2,78%, wiec nie jest waskim gardlem.
+   Zmierzone przed implementacja, ktora byla by praca bez efektu.
 
 ## Wniosek
 
