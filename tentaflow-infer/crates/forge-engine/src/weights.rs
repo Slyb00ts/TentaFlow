@@ -359,6 +359,33 @@ impl DevWeight {
         Some(row_off * (cols / quant.block_elems()) * quant.block_bytes())
     }
 
+    /// Format źródłowy przepakowania do FP8: bufor, kształt, kwantyzacja i
+    /// mnożnik wyjścia — albo `None`, gdy `pack_gguf_fp8` nie umie czytać
+    /// bajtów tego formatu wprost.
+    ///
+    /// Stoi obok [`Self::block_quant`] i [`Self::row_offset_bytes`], bo to to
+    /// samo pytanie: co ten format o sobie wie. Gałąź `_ => None` jest tu
+    /// bezpieczna — nieznany format po prostu nie jest przepakowywany i
+    /// zostaje na swojej ścieżce.
+    pub fn fp8_repack_source(&self) -> Option<(&DevBuffer, usize, usize, QuantKind, f32)> {
+        match self {
+        DevWeight::Q4K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q4K, 1.0)),
+            DevWeight::Q6K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q6K, 1.0)),
+            DevWeight::Q8_0 { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q8_0, 1.0)),
+            // Paker czyta surowe bloki 36 B, więc przepakowany układ kafelkowy
+            // do niego nie pasuje. `output_scale` mnoży wynik całego tensora i
+            // wchodzi w skalę wierszową paczki.
+            DevWeight::NvFp4Gguf {
+                buf,
+                rows,
+                cols,
+                layout: Nvfp4GgufLayout::RowMajor36,
+                output_scale,
+            } => Some((buf, *rows, *cols, QuantKind::NVFP4Gguf, *output_scale)),
+            _ => None,
+        }
+    }
+
     /// Kwantyzacja wagi dla tych formatów, które umie dzielić tensor parallel.
     /// `None` znaczy „ten format nie ma ścieżki podziału", a nie „nieznany".
     pub fn split_quant(&self) -> Option<QuantKind> {

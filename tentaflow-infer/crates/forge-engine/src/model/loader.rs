@@ -310,26 +310,6 @@ impl Model {
         Ok(())
     }
 
-    /// Format źródłowy projekcji, jeśli `pack_gguf_fp8` umie ją przepakować na
-    /// e4m3 wprost z rezydentnych bajtów GGUF.
-    fn fp8_packable(w: &DevWeight) -> Option<(&DevBuffer, usize, usize, QuantKind, f32)> {
-        match w {
-            DevWeight::Q4K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q4K, 1.0)),
-            DevWeight::Q6K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q6K, 1.0)),
-            DevWeight::Q8_0 { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q8_0, 1.0)),
-            // Paker czyta surowe bloki 36 B, więc przepakowany układ kafelkowy
-            // do niego nie pasuje. `output_scale` mnoży wynik całego tensora i
-            // wchodzi w skalę wierszową paczki.
-            DevWeight::NvFp4Gguf {
-                buf,
-                rows,
-                cols,
-                layout: Nvfp4GgufLayout::RowMajor36,
-                output_scale,
-            } => Some((buf, *rows, *cols, QuantKind::NVFP4Gguf, *output_scale)),
-            _ => None,
-        }
-    }
 
     /// Build the fp8 (e4m3) prefill packs from the resident GGUF weights. No
     /// calibration pass is needed (e4m3's exponent captures the per-row range),
@@ -392,7 +372,7 @@ impl Model {
     /// not Q4_K/Q6_K/Q8_0 — the caller falls back to the CPU rebuild.
     pub fn build_fp8_gpu(&mut self) -> Result<bool> {
         let pack_full = |w: &DevWeight| -> Result<Option<Fp8Weight>> {
-            let Some((buf, rows, cols, quant, output_scale)) = Self::fp8_packable(w) else {
+            let Some((buf, rows, cols, quant, output_scale)) = w.fp8_repack_source() else {
                 return Ok(None);
             };
             self.pack_fp8_gpu_window(buf, quant, output_scale, 0, rows, cols)
@@ -400,7 +380,7 @@ impl Model {
         };
         let pack_window =
             |w: &DevWeight, row_off: usize, rows: usize| -> Result<Option<Fp8Weight>> {
-                let Some((buf, _, cols, quant, output_scale)) = Self::fp8_packable(w) else {
+                let Some((buf, _, cols, quant, output_scale)) = w.fp8_repack_source() else {
                     return Ok(None);
                 };
                 self.pack_fp8_gpu_window(buf, quant, output_scale, row_off, rows, cols)
@@ -425,7 +405,7 @@ impl Model {
                 GateUpWeights::Split { gate, up } => ws.extend([gate, up]),
                 GateUpWeights::Fused(gu) => ws.push(gu),
             }
-            if ws.into_iter().any(|w| Self::fp8_packable(w).is_none()) {
+            if ws.into_iter().any(|w| w.fp8_repack_source().is_none()) {
                 return Ok(false);
             }
         }
