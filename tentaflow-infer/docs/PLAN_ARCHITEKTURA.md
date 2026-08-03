@@ -117,8 +117,37 @@ dwa bufory z krokami `cols/2` i `cols/16` to zwykły wpis. Dwa testy regresyjne
 pilnują, że oba bufory są permutowane KAŻDY SWOIM krokiem — pomylenie ich było
 realnym ryzykiem przy ręcznym dopisywaniu.
 
-Do zrobienia w tym etapie: `gemm_for(&Problem)` i `pack` przeniesione na ten sam
-kontrakt.
+Zrobione: `DevWeight::row_offset_bytes` — geometrię wiersza podaje format, a nie
+miejsce wywołania. Dwadzieścia jeden wyrażeń `row_off * (cols / 256) * 176` i
+podobnych zniknęło z `gemm_rows`; każde było kopią tego, co `QuantKind` już
+wie. `block_quant` nie ma gałęzi `_ =>`, więc nowy wariant `DevWeight` nie
+skompiluje się bez podania geometrii.
+
+#### Zmierzony kształt pozostałego iloczynu
+
+Dyspozycja w `model/gemm.rs` to 24 warianty `DevWeight` × 6 rodzin operacji,
+rozpisane w 165 miejscach. Wyciąg z kodu pokazuje, że iloczyn jest niemal
+całkowicie regularny:
+
+| rodzina | ramion | różnych list argumentów |
+|---|---|---|
+| `gemv_norm` | 21 | **1** |
+| `gemv_norm_silu` | 21 | **1** |
+| `gemm_rows` | 18 | 16 → **1** po `row_offset_bytes` |
+| `gemv`, `gemv_residual`, `gemv_out_f32` | 18–20 | do zbadania |
+
+Nazwy kerneli układają się mechanicznie (`gemv_norm_<fmt>_f16`,
+`gemv_norm_silu_<fmt>_f16`, `gemm_<fmt>_f16_at`), z jedynym wyjątkiem w postaci
+wariantów DP4A dla Q4K, Q6K i Q8_0.
+
+Skoro w dwóch rodzinach format wpływa WYŁĄCZNIE na nazwę kernela, 42 ramiona
+sprowadzają się do jednej tabeli 21 wierszy, a dodanie kwantyzacji do tych
+ścieżek staje się dopisaniem linii. Trzy formaty o niejednorodnej ścieżce
+(`Fp8Row`, `NvFp4`, `NvFp4Gguf`) zostają wypisane osobno, bo naprawdę różnią
+się treścią, a nie tylko nazwą.
+
+Do zrobienia w tym etapie: zwinięcie tych dwóch rodzin w tabelę oraz `pack`
+przeniesiony na ten sam kontrakt.
 
 ### Etap 3 — podział `launchers.rs` i wspólny rejestr wariantów ✅ ZROBIONE
 20 563 linie i jeden `impl Kernels` z 414 metodami → 19 modułów. Kwantyzacje
