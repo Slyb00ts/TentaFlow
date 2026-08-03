@@ -6538,7 +6538,10 @@ impl Model {
         }
         self.trace_f16("stage_in", &pb.h, (rows - 1) * hidden * 2, hidden);
         // Layer 0's attn-norm feeds the q/k/v projections.
-        if fp8mod_fuse {
+        // Hybryda tez: odkad K/V sa w paczkach FP8, wszystkie trzy projekcje
+        // czytaja te sama aktywacje, wiec kwantyzowanie jej osobno dla kazdej
+        // bylo trzykrotna powtorka tej samej pracy.
+        if fp8mod_fuse || fp8mod_ffn_fuse {
             kernels.rmsnorm_fp8_shared(
                 &pb.x,
                 &pb.h,
@@ -6618,9 +6621,15 @@ impl Model {
                 // K/V ida ta sama sciezka FP8 co Q. Wczesniej hybryda liczyla je
                 // natywnie w NVFP4 (33 TFLOPS wobec 142), bo paczki ich nie
                 // obejmowaly — obejmuja od czasu rozszerzenia `Fp8FfnLayer`.
-                self.gemm_fp8(&pb.q, &fl.q, &pb.x, rows, stream)?;
-                self.gemm_fp8(&pb.k, &fl.k, &pb.x, rows, stream)?;
-                self.gemm_fp8(&pb.v, &fl.v, &pb.x, rows, stream)?;
+                if fp8mod_ffn_fuse {
+                    self.gemm_fp8_prequant(&pb.q, &fl.q, rows, stream)?;
+                    self.gemm_fp8_prequant(&pb.k, &fl.k, rows, stream)?;
+                    self.gemm_fp8_prequant(&pb.v, &fl.v, rows, stream)?;
+                } else {
+                    self.gemm_fp8(&pb.q, &fl.q, &pb.x, rows, stream)?;
+                    self.gemm_fp8(&pb.k, &fl.k, &pb.x, rows, stream)?;
+                    self.gemm_fp8(&pb.v, &fl.v, &pb.x, rows, stream)?;
+                }
             } else {
                 match &layer.attn().attn_qkv {
                     QkvWeights::Fused(w) => {
@@ -7152,7 +7161,7 @@ impl Model {
             };
             // This norm feeds the NEXT layer's q/k/v (or, for the last layer, the
             // logit head — never fused, keeps the f16 hidden state).
-            if l + 1 < n_layers && fp8mod_fuse {
+            if l + 1 < n_layers && (fp8mod_fuse || fp8mod_ffn_fuse) {
                 pre_residual_norm(
                     kernels,
                     layer.post_ffw_norm.as_ref(),
