@@ -156,6 +156,74 @@ uznaliśmy za poprawne. Osobno bramka wymaga, żeby przy marginesie zwycięzcy
 powyżej 5% rozpiętości wybór był IDENTYCZNY — zmierzony margines 26,2%, wybór
 ten sam.
 
+## Druga runda — profil zamiast szacunków
+
+`nsys` i `perf` nie istnieją na Apple; odpowiednikiem jest `sample`/`xctrace`.
+Profil głównego wątku podczas prefillu 1024 tokenów rozkłada się tak:
+
+| | udział |
+|---|---:|
+| libBNNS — CPU mnoży | **70,6%** |
+| jądro — czekanie na GPU | 19,3% |
+| nasz kod (rozpakowanie + kodowanie dyspozycji) | 9,5% |
+
+Czyli CPU jest zajęty w 80%, a nie bezczynny. Pierwsze odczytanie profilu było
+błędne — `prefill` ma KILKA gałęzi `forward`, więc patrzenie na jedną sugerowało
+75% czekania, którego nie ma.
+
+### Rozpakowanie przez tablicę wartości
+
+Szesnaście wartości to CAŁY alfabet wagi 4-bitowej, a grupa dzieli jedną skalę i
+jedno przesunięcie — więc wartości grupy da się zbudować raz i potem tylko
+czytać, zamiast mnożyć, dodawać i zaokrąglać do half osobno dla każdego z 64
+elementów. Rozpakowanie **1345 → 938 us (-30%)**, cała połowa CPU z 1,35 na
+**1,40 TFLOPS**.
+
+### Udział nie jest stałą, tylko funkcją wsadu
+
+Przemiatanie na obu końcach daje dwa różne optima:
+
+| wsad | 0,68 | 0,70 | 0,72 | 0,74 | 0,76 |
+|---|---:|---:|---:|---:|---:|
+| 256 tokenów | — | 230,6 | 247,4 | **256,5** | 240,8 |
+| 512 tokenów | 257,0 | **261,9** | 258,5 | 254,2 | — |
+
+Optimum przesuwa się, bo rozpakowanie kosztuje tyle samo przy 256 co przy 512
+tokenach, a jest czym je ukryć o połowę mniej — im mniejszy kafel, tym gorsza
+efektywna przepustowość CPU i tym więcej ma wziąć GPU. Kafle są ograniczone do
+512, więc dwa zmierzone punkty i prosta między nimi pokrywają wszystko, co może
+wystąpić. Stała 0,72 z pierwszej rundy była kompromisem między dwoma przypadkami
+i przegrywała z każdym z nich osobno.
+
+### Próg pracy
+
+Obniżony z 6 na 3 GiB: k/v przy 512 tokenach (4,3 GiB pracy) opłaca się dzielić
+i dają **+1,2%**, podczas gdy te same k/v przy 256 (2,1 GiB) nadal zostają
+całe, bo granica kosztowałaby piątą część ich czasu GPU.
+
+### Wynik drugiej rundy
+
+| prompt | pierwsza runda | druga runda | MLX (ta sama sesja) | przewaga |
+|---|---:|---:|---:|---:|
+| 256 | 238,6 tok/s | **257,2** | 218,9 | **+17,5%** |
+| 1024 | 256,1 | **261,7** | 216,6 | **+20,8%** |
+
+Wobec punktu wyjścia (samo GPU, 215,6 / 214,9) to **+19,3%** i **+21,8%**.
+
+Dekodowanie nadal nietknięte: 21,1 tok/s przy 89,0 GB/s. Zgodność poprawiła się
+przy okazji — największa różnica logitów 0,0531 zamiast 0,0814, czyli 0,16%
+rozpiętości.
+
+### Sprawdzone i odrzucone
+
+**Wsad 128.** Nawet z tańszym rozpakowaniem 5291,8 wobec 4766,1 us/token bez
+podziału. Próg zostaje na 256.
+
+**Większy udział CPU przy 512.** 0,66 daje 247,3 wobec 261,9 — CPU nie jest
+stroną, która czeka, mimo 19,3% czekania w profilu. Te 19,3% to synchronizacja
+PRZED podziałem, na pracę, której CPU nie umie przejąć (uwaga, normy, k/v przy
+krótkim kaflu), a nie czekanie po nim.
+
 ## Nierozstrzygnięte
 
 Wsad 128 i mniejsze nie korzystają z CPU w ogóle, bo rozpakowanie się nie

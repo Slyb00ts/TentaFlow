@@ -154,22 +154,35 @@ mod metal_forms {
         pub cpu_rows: u32,
     }
 
-    /// Fraction of rows left to the GPU.
+    /// Fraction of rows left to the GPU, as a function of the batch.
     ///
-    /// EKS-A7 measured the pair concurrently: 3,02 TFLOPS on the GPU against
-    /// 1,15 on the CPU once unpacking is paid. Both finish together when the
-    /// GPU takes 3,02 / (3,02 + 1,15) of the rows. Getting this wrong costs
-    /// only the waiting — there is no correctness stake in the ratio.
-    const GPU_ROW_SHARE: f32 = 0.72;
+    /// NOT a constant, and not derived — swept at both ends, and the optimum
+    /// moves: 256 tokens peaks at 0,74 (0,72 -> 247,4 tok/s, **0,74 -> 256,5**,
+    /// 0,76 -> 240,8) while 512 peaks at 0,70 (0,68 -> 257,0, **0,70 -> 261,9**,
+    /// 0,72 -> 258,5).
+    ///
+    /// It moves because the CPU has to unpack its rows before it can multiply
+    /// them, and unpacking costs the same at 256 tokens as at 512 while there
+    /// is half as much multiplying to hide it behind. So the smaller the batch,
+    /// the worse the CPU's effective rate and the more the GPU should take.
+    /// Chunking bounds the batch to [256, 512], so two measured points and a
+    /// straight line between them cover every case that can occur.
+    fn gpu_row_share(tokens: u32) -> f32 {
+        const AT_256: f32 = 0.74;
+        const AT_512: f32 = 0.70;
+        let t = tokens.clamp(MIN_SPLIT_TOKENS, 512) as f32;
+        AT_256 + (AT_512 - AT_256) * (t - 256.0) / 256.0
+    }
 
     /// Smallest product worth splitting.
     ///
     /// Starting the GPU early means committing a command buffer of its own:
     /// 19,6 us against 0,61 for a dispatch that joins the open one (EKS-A3).
-    /// Chosen to sit between the two shapes that bracket it at 256 tokens —
-    /// k_proj would spend 22% of its GPU time on that boundary, q_proj 5,6%
-    /// against a gain near 28%.
-    const MIN_SPLIT_WORK: u64 = 6 * 1024 * 1024 * 1024;
+    /// The cut sits between two measured cases and clear of both: k/v at 256
+    /// tokens (2,1 GiB of work) stay whole, because the boundary would cost a
+    /// fifth of their GPU time, while the same k/v at 512 (4,3 GiB) do split
+    /// and are worth +1,2% end to end.
+    const MIN_SPLIT_WORK: u64 = 3 * 1024 * 1024 * 1024;
 
     /// Smallest batch worth splitting.
     ///
@@ -191,7 +204,7 @@ mod metal_forms {
         }
         // The kernel writes whole blocks of QMG_BN rows, so the boundary has to
         // fall on one or the GPU would overwrite the CPU's rows.
-        let gpu = ((p.rows as f32 * GPU_ROW_SHARE) as u32 / crate::msl::QMG_BN)
+        let gpu = ((p.rows as f32 * gpu_row_share(p.tokens)) as u32 / crate::msl::QMG_BN)
             * crate::msl::QMG_BN;
         if gpu == 0 || gpu >= p.rows {
             return None;
@@ -367,10 +380,22 @@ mod metal_forms {
             assert_eq!(s.gpu_rows % crate::msl::QMG_BN, 0);
             assert_eq!(s.gpu_rows + s.cpu_rows, p.rows, "wiersze muszą się domykać");
             assert!(s.cpu_rows > 0, "podział bez pracy dla CPU to nie podział");
+            // Udział ma odpowiadać zmierzonemu optimum dla TEGO wsadu, z
+            // dokładnością do zaokrąglenia w dół do pełnego bloku.
+            let want = f64::from(gpu_row_share(p.tokens));
             let share = f64::from(s.gpu_rows) / f64::from(p.rows);
+            let block = f64::from(crate::msl::QMG_BN) / f64::from(p.rows);
             assert!(
-                (0.70..0.74).contains(&share),
-                "udział GPU {share:.3} rozjechał się ze zmierzonym stosunkiem"
+                share <= want && share > want - block,
+                "udział GPU {share:.4} nie jest zaokrągleniem {want:.4} w dół do bloku"
+            );
+
+            // Mniejszy wsad musi zostawiać GPU WIĘCEJ, bo rozpakowanie po
+            // stronie CPU kosztuje tyle samo, a jest czym je ukryć o połowę mniej.
+            let at = |t| split_rows(&Problem { tokens: t, rows: 11264, cols: 4096 }).unwrap();
+            assert!(
+                at(256).gpu_rows > at(512).gpu_rows,
+                "udział GPU nie maleje z rosnącym wsadem"
             );
         }
 

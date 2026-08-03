@@ -62,6 +62,33 @@ impl CpuMatmul {
         }
     }
 
+    /// Unpacks rows `[row0, row0 + count)` of the weight into the scratch.
+    fn unpack(&mut self, op: &Operands<'_>, row0: usize, count: usize) {
+        let cols = op.cols as usize;
+        self.weights.resize(count * cols, f16::ZERO);
+        let job = DequantJob {
+            out: self.weights.as_mut_ptr(),
+            packed: op.packed.as_ptr(),
+            scales: op.scales.as_ptr(),
+            biases: op.biases.as_ptr(),
+            row0,
+            count,
+            cols,
+            group: op.group as usize,
+            tiles: self.tiles,
+        };
+        // SAFETY: every tile writes a disjoint row range of `self.weights` and
+        // reads only immutable inputs, so the pointers may cross threads.
+        unsafe {
+            dispatch_apply_f(
+                self.tiles,
+                dispatch_get_global_queue(QOS_USER_INITIATED, 0),
+                &job as *const DequantJob as *mut c_void,
+                dequant_tile,
+            );
+        }
+    }
+
     /// Computes rows `[row0, row0 + count)` of `out = x * wᵀ`.
     ///
     /// # Safety
@@ -86,29 +113,7 @@ impl CpuMatmul {
             )));
         }
 
-        self.weights.resize(count * cols, f16::ZERO);
-        let job = DequantJob {
-            out: self.weights.as_mut_ptr(),
-            packed: op.packed.as_ptr(),
-            scales: op.scales.as_ptr(),
-            biases: op.biases.as_ptr(),
-            row0,
-            count,
-            cols,
-            group,
-            tiles: self.tiles,
-        };
-        // SAFETY: every tile writes a disjoint row range of `self.weights` and
-        // reads only immutable inputs, so the pointers may cross threads.
-        unsafe {
-            dispatch_apply_f(
-                self.tiles,
-                dispatch_get_global_queue(QOS_USER_INITIATED, 0),
-                &job as *const DequantJob as *mut c_void,
-                dequant_tile,
-            );
-        }
-
+        self.unpack(op, row0, count);
         let out_ty = if op.out_f16 { BNNS_F16 } else { BNNS_F32 };
         let elem = if op.out_f16 { 2 } else { 4 };
         let a = descriptor(cols, tokens, op.x.as_ptr() as *mut c_void, BNNS_F16, 0);
@@ -180,20 +185,33 @@ extern "C" fn dequant_tile(ctx: *mut c_void, tile: usize) {
 
     let words_per_row = job.cols / 8;
     let groups_per_row = job.cols / job.group;
+    let words_per_group = job.group / 8;
 
     for local in first..last {
         let row = job.row0 + local;
-        for col in (0..job.cols).step_by(8) {
+        let (qrow, grow, orow) = (row * words_per_row, row * groups_per_row, local * job.cols);
+        for g in 0..groups_per_row {
             // SAFETY: indices are inside the shapes checked in `run`.
-            let bits = unsafe { *job.packed.add(row * words_per_row + col / 8) };
-            let g = row * groups_per_row + col / job.group;
-            let sc = bf16(unsafe { *job.scales.add(g) });
-            let bi = bf16(unsafe { *job.biases.add(g) });
-            for j in 0..8 {
-                let nib = ((bits >> (j * 4)) & 0xF) as f32;
-                // SAFETY: `local * cols + col + j` is inside the resized scratch.
-                unsafe {
-                    *job.out.add(local * job.cols + col + j) = f16::from_f32(nib * sc + bi);
+            let sc = bf16(unsafe { *job.scales.add(grow + g) });
+            let bi = bf16(unsafe { *job.biases.add(grow + g) });
+
+            // Sixteen values ARE the whole alphabet of a 4-bit weight, and a
+            // group shares one scale and one bias — so the group's values can
+            // be built once and then only read, instead of a multiply, an add
+            // and a rounding to half per element. Sixty-four elements per group
+            // means the arithmetic is done a quarter as often.
+            let mut lut = [f16::ZERO; 16];
+            for (n, slot) in lut.iter_mut().enumerate() {
+                *slot = f16::from_f32(n as f32 * sc + bi);
+            }
+
+            for w in 0..words_per_group {
+                // SAFETY: as above.
+                let bits = unsafe { *job.packed.add(qrow + g * words_per_group + w) };
+                let base = orow + g * job.group + w * 8;
+                for j in 0..8 {
+                    // SAFETY: `base + j` is inside the resized scratch.
+                    unsafe { *job.out.add(base + j) = lut[((bits >> (j * 4)) & 0xF) as usize] };
                 }
             }
         }
@@ -387,5 +405,74 @@ mod tests {
         // SAFETY: odrzucenie następuje przed jakimkolwiek dostępem do `out`.
         let err = unsafe { cpu.run(&op, 32, 64) };
         assert!(err.is_err(), "wycinek poza macierzą musi być odrzucony");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Ile z czasu CPU zjada samo rozpakowanie, na realnym kształcie.
+    ///
+    /// To ono decyduje, ile wierszy CPU może wziąć i od jakiego wsadu podział w
+    /// ogóle się opłaca, więc jest mierzone osobno od mnożenia.
+    #[test]
+    #[ignore]
+    fn how_much_of_the_cpu_half_is_unpacking() {
+        const ROWS: usize = 3264; // przydział CPU z gate_proj
+        const COLS: usize = 4096;
+        const GROUP: usize = 64;
+        const TOKENS: usize = 512;
+
+        let packed: Vec<u32> = (0..ROWS * COLS / 8)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761))
+            .collect();
+        let groups = ROWS * COLS / GROUP;
+        let scales = vec![0x3F00u16; groups];
+        let biases = vec![0xBB80u16; groups];
+        let x = vec![f16::from_f32(0.01).to_bits(); TOKENS * COLS];
+        let mut out = vec![0f32; TOKENS * ROWS];
+
+        let op = Operands {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            out: out.as_mut_ptr() as *mut u8,
+            out_f16: false,
+            tokens: TOKENS as u32,
+            rows: ROWS as u32,
+            cols: COLS as u32,
+            group: GROUP as u32,
+        };
+        let mut cpu = CpuMatmul::new();
+        // SAFETY: `out` mieści TOKENS * ROWS f32 i nikt inny go nie dotyka.
+        unsafe { cpu.run(&op, 0, ROWS as u32).expect("rozgrzewka") };
+
+        let reps = 10;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            // SAFETY: jak wyżej.
+            unsafe { cpu.run(&op, 0, ROWS as u32).expect("całość") };
+        }
+        let whole = t0.elapsed().as_secs_f64() / f64::from(reps);
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            cpu.unpack(&op, 0, ROWS);
+        }
+        let unpack = t0.elapsed().as_secs_f64() / f64::from(reps);
+
+        let flops = 2.0 * ROWS as f64 * COLS as f64 * TOKENS as f64;
+        eprintln!(
+            "[{ROWS} x {COLS}] x {TOKENS}: całość {:.0} us ({:.2} TFLOPS), \
+             rozpakowanie {:.0} us ({:.0}%), samo mnożenie {:.0} us ({:.2} TFLOPS)",
+            whole * 1e6,
+            flops / whole / 1e12,
+            unpack * 1e6,
+            100.0 * unpack / whole,
+            (whole - unpack) * 1e6,
+            flops / (whole - unpack) / 1e12
+        );
     }
 }
