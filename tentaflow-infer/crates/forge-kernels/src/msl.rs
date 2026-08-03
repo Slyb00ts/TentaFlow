@@ -612,20 +612,23 @@ pub const SILU_MUL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void silu_mul_f32_f16(
+kernel void silu_mul_f16(
     device half*         out   [[buffer(0)]],
-    device const float*  gate  [[buffer(1)]],
-    device const float*  up    [[buffer(2)]],
+    device const half*   gate  [[buffer(1)]],
+    device const half*   up    [[buffer(2)]],
     constant uint&       n     [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= n) { return; }
-    const float g = gate[gid];
-    out[gid] = half(g / (1.0f + exp(-g)) * up[gid]);
+    // Wejscia sa w half, a sigmoid liczony w f32: przy prefillu te dwa bufory
+    // to najwiekszy pojedynczy ruch pamieci poza samymi wagami, a dokladnosc
+    // traci sie dopiero na wykladniku, nie na skladowaniu.
+    const float g = float(gate[gid]);
+    out[gid] = half(g / (1.0f + exp(-g)) * float(up[gid]));
 }
 "#;
 
-pub const SILU_MUL_NAME: &str = "silu_mul_f32_f16";
+pub const SILU_MUL_NAME: &str = "silu_mul_f16";
 
 pub fn silu_mul_groups(n: u32) -> u32 {
     n.div_ceil(SILU_MUL_THREADS)

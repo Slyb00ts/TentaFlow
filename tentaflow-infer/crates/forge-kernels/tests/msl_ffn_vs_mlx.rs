@@ -184,12 +184,15 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
     let gpu = Gpu { dev, stream };
 
     let scales = ScaleDtype::Bf16;
-    let qmv_src = msl::qmv_affine_4bit_source(scales, OutDtype::F32);
+    // Bramka i projekcje po niej licza na wejsciu w half, bo tak trzyma
+    // aktywacje MLX i tak trzyma je model — f32 byloby tu inna sciezka niz ta,
+    // ktora dziala naprawde.
+    let qmv_src = msl::qmv_affine_4bit_source(scales, OutDtype::F16);
     let qmv = gpu
         .dev
         .load_module(qmv_src.as_bytes())
         .unwrap()
-        .kernel(&msl::qmv_affine_4bit_name(scales, OutDtype::F32))
+        .kernel(&msl::qmv_affine_4bit_name(scales, OutDtype::F16))
         .unwrap();
     let norm_src = msl::rmsnorm_source(scales);
     let rmsnorm = gpu
@@ -243,10 +246,10 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
     let (up_w, up_s, up_b) = proj(&format!("{prefix}.up_proj"));
     let (down_w, down_s, down_b) = proj(&format!("{prefix}.down_proj"));
 
-    let g = gpu.empty(inter as usize * 4);
-    let u = gpu.empty(inter as usize * 4);
+    let g = gpu.empty(inter as usize * 2);
+    let u = gpu.empty(inter as usize * 2);
     let a = gpu.empty(inter as usize * 2);
-    let y = gpu.empty(hidden as usize * 4);
+    let y = gpu.empty(hidden as usize * 2);
 
     let gemv = |out: &DevBuffer,
                     w: &DevBuffer,
@@ -310,13 +313,13 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
     );
     check(
         "gate",
-        &gpu.read_f32(&g, inter as usize),
+        &gpu.read_f16(&g, inter as usize),
         &f.f64s("g_true"),
         &f.f32s("g_mlx").iter().map(|v| *v as f64).collect::<Vec<_>>(),
     );
     check(
         "up",
-        &gpu.read_f32(&u, inter as usize),
+        &gpu.read_f16(&u, inter as usize),
         &f.f64s("u_true"),
         &f.f32s("u_mlx").iter().map(|v| *v as f64).collect::<Vec<_>>(),
     );
@@ -337,7 +340,7 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
         .collect::<Vec<_>>();
     check(
         "łańcuch",
-        &gpu.read_f32(&y, hidden as usize),
+        &gpu.read_f16(&y, hidden as usize),
         &f.f64s("y_chain_true"),
         &mlx_chain,
     );

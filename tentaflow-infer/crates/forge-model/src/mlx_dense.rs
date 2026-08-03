@@ -273,8 +273,8 @@ impl MlxDense {
             v: f16(n * shape.kv_width())?,
             attn: f16(n * shape.hidden)?,
             proj: f32b(n * shape.hidden)?,
-            gate: f32b(n * shape.inter)?,
-            up: f32b(n * shape.inter)?,
+            gate: f16(n * shape.inter)?,
+            up: f16(n * shape.inter)?,
             act: f16(n * shape.inter)?,
             logits: f32b(shape.vocab)?,
             token: f32b(1)?,
@@ -524,8 +524,8 @@ impl MlxDense {
         self.residual(&self.scratch.proj, tokens)?;
 
         self.rmsnorm(&self.scratch.norm, &self.scratch.h, &l.ffn_norm, tokens)?;
-        self.matmul(&self.scratch.gate, &l.gate, &self.scratch.norm, tokens, false)?;
-        self.matmul(&self.scratch.up, &l.up, &self.scratch.norm, tokens, false)?;
+        self.matmul(&self.scratch.gate, &l.gate, &self.scratch.norm, tokens, true)?;
+        self.matmul(&self.scratch.up, &l.up, &self.scratch.norm, tokens, true)?;
         self.launch(
             &self.pipes.silu_mul,
             LaunchArgs::new()
