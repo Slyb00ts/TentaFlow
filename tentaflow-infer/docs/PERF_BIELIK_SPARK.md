@@ -295,6 +295,57 @@ dopelnienia, parowane ldmatrix.x4 dla B, szeregowanie potoku) — ta sama
 przewaga `ptxas`, ktora `CODEGEN_PROOF.md` opisuje dla int8. Oba pliki zostaly
 cofniete, sciezka Modulara zostaje.
 
+### Nastawy MatmulConfig — przeszukane, domyslne sa najlepsze
+
+`gemm_fp8_modular.mojo` podawal `MatmulConfig` tylko dwa ksztalty kafla, wiec
+`num_pipeline_stages=4`, `k_group_size=1` i `num_k_partitions=1` zostawaly
+domyslne. Przeszukane (`bench_fp8_config.mojo`, q/o, M=1024):
+
+| BM x BN x BK | etapy | k_group | czas |
+|---|--:|--:|--:|
+| 128x256x64 | 4 | 1 | **233,2 us** (baza) |
+| 128x256x64 | 3 | 1 | 233,9 us |
+| 256x128x64 | 4 | 1 | 235,5 us |
+| 128x128x64 | 6 | 1 | 241,7 us |
+| 128x128x128 | 3 | 1 | 250,1 us |
+| 128x256x128 | 2 | 1 | 271,1 us |
+| 128x128x128 | 3 | 2 | 281,5 us |
+| 128x256x128 | 2 | 2 | 303,9 us |
+
+Nic nie bije domyslnej nastawy, a `k_group_size=2` wyraznie szkodzi. Uwaga na
+ograniczenie kernela: `num_k_mmas` (czyli BK/32 dla fp8) musi byc wielokrotnoscia
+`2*k_group_size`, wiec `k_group_size=2` wymaga BK=128, a BK=32 nie przechodzi w
+ogole.
+
+### Epilog wektorowy — ZROBIONE
+
+To byl blad po NASZEJ stronie, nie w kernelu Modulara. Lambda epilogu dostaje
+`SIMD[dtype, width]` sasiednich kolumn, a nasza petla zapisywala je pojedynczo
+po 2 bajty. Jeden odczyt skal wierszy i jeden zapis wektorowy daja
+**q/o 232,7 -> 226,4 us i down 621,9 -> 605,8 us** (+2,6-2,8%); na `gate/up`,
+gdzie ogranicza pasmo, nie zmienia nic. Golden `test_gemm_fp8_modular_bn256`
+przechodzi bez zmiany wyniku (0 rozbieznosci).
+
+### GDZIE NAPRAWDE JEST 2x: silnik, nie kernel
+
+Zestawienie, ktore przewaza wszystko powyzej:
+
+| | |
+|---|---|
+| te same ksztalty w mikrobenchu, rozgrzane | **151 TFLOPS** |
+| te same ksztalty w silniku (68,6% z 415 ms) | **96 TFLOPS** |
+| vLLM, ten sam uklad, prefill 2048 | 205 ms wobec naszych 415 ms |
+
+Kernel liczy 1,57x szybciej w izolacji niz w silniku. Tej roznicy nie zrobi
+zaden kafel ani zaden swizzle — to koszt tego, co dzieje sie MIEDZY GEMM-ami:
+przerwy miedzy uruchomieniami (prefill nie idzie przez graf CUDA), wypieranie
+L2 przez normy, kwantyzacje i uwage wplecione miedzy projekcje, oraz osobne
+przejscia po pamieci na kazdy z tych krokow. To samo pokazuje dystans do vLLM.
+
+Nastepny krok to `nsys` na PRAWDZIWYM prefillu z osobnymi spanami na
+uruchomienie i na luki miedzy nimi — dopiero to powie, ile z brakujacego 1,57x
+to puste okna, a ile zimny L2.
+
 ### Co zostaje
 
 1. **Podniesienie plateau wymagaloby CUDA, nie Mojo.** Precedens jest jeden:
