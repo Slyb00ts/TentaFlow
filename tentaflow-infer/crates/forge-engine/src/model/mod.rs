@@ -2524,6 +2524,7 @@ mod graph;
 mod kv;
 mod loader;
 mod mtp;
+mod quant_dispatch;
 mod sample;
 mod scratch;
 mod tp;
