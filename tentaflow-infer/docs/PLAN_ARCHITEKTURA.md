@@ -63,6 +63,38 @@ warstwy to trzy wywołania bez rozgałęzień.
 
 Zysk: dodanie formatu przestaje wymagać dopisywania go w każdym miejscu wywołania.
 
+### Zasada: kwantyzację liczymy WPROST, konwersja jest wyjątkiem
+
+Format kwantyzacji istnieje po to, żeby liczyć na nim bezpośrednio — mniej
+bajtów przez HBM i jedna kopia wag. Konwersja jest dopuszczalna TYLKO gdy sprzęt
+albo kernel nie obsługuje formatu, i wtedy musi mieć zapisane uzasadnienie
+pomiarowe.
+
+FORGE stosuje tę zasadę niemal wszędzie: `q2_k`, `q3_k`, `q4_0`, `q4_1`, `q4_k`,
+`q5_0`, `q5_1`, `q6_k`, `q8_0`, `iq1_m`, `iq1_s`, `iq2_s`, `iq2_xs`, `iq2_xxs`,
+`iq3_s`, `iq3_xxs`, `iq4_nl`, `iq4_xs`, `mxfp4`, `nvfp4` — każdy ma własne
+kernele.
+
+**Wyjątkiem jest NVFP4 compressed-tensors w prefillu.** Ma 22 własne kernele, a
+mimo to przepakowujemy go do FP8 przy ładowaniu. Zmierzone na Bieliku 7B:
+
+| ścieżka | prefill | decode | dodatkowa pamięć |
+|---|---|---|---|
+| paczki FP8 | 4 899 tok/s | 38,4 | **+7,35 GB** |
+| NVFP4 wprost | 2 064 tok/s | 38,2 | 0 |
+
+Czyli konwersja kupuje 2,4x w prefillu kosztem 7,35 GB zdublowanych wag, a
+dekodowaniu nie daje nic (obie ścieżki czytają NVFP4). To NIE jest brak
+wsparcia — to słabszy kernel, i naprawa należy do kernela, nie do formatu.
+
+Dla porównania vLLM nie konwertuje wcale: ma rodzinę kerneli NVFP4
+(`CutlassNvFp4`, `MarlinNvFp4`, `FlashInferCuteDslNvFp4`, `FbgemmNvFp4`,
+`HummingNvFp4`, `EmulationNvFp4`) wybieranych po zdolnościach karty.
+
+Wniosek dla `trait Quant`: `gemm_for(&Problem)` musi domyślnie wskazywać kernel
+NA FORMACIE, a konwersja ma być jawnym, uzasadnionym wariantem — nie domyślnym
+zachowaniem, które łatwo przeoczyć.
+
 ### Etap 2 — kwantyzacja jako trait ✅ ZROBIONE (pierwszy wycinek)
 `trait Quant { fn pack(..); fn permute_rope_rows(..); fn gemm_for(&Problem) -> KernelChoice; }`
 z implementacjami: `nvfp4_ct`, `nvfp4_gguf`, `fp8`, `q4k`, `q8_0`, …
