@@ -70,6 +70,12 @@ Obie polowy skladaja sie na te sama dzwignie. Podloga obliczeniowa GEMM-ow
 spadlaby ze 118 do 59 ms, a ruch wag przy jednym przebiegu z 66 do 33 ms —
 czyli GEMM-y z dzisiejszych 220 ms do okolo 110-120.
 
+**Bramka jakosci — punkt odniesienia zmierzony.** Dzisiejsza sciezka (wagi
+NVFP4, paczki FP8 na prefill) daje `forge ppl` = **3,1256** (mean_nll 1,13961).
+To liczba, ktora MXFP4 musi dorownac. Uwaga na wielkosc probki: `forge ppl`
+punktuje tu 353 tokeny, wiec do decyzji o zmianie formatu wag trzeba policzyc
+wiecej — na 353 tokenach roznica rzedu procenta jest w szumie.
+
 **Czego to wymaga i jaki jest haczyk.** `ptxas` przyjmuje na sm_121a wariant ze
 skalami **ue8m0** (potegi dwojki, co 32 wartosci) i ODRZUCA skale e4m3, czyli
 natywne NVFP4 (skale e4m3 co 16 wartosci). Trzeba wiec przekwantowac NVFP4 na
