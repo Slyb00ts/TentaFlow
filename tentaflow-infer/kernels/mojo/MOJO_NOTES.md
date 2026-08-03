@@ -393,6 +393,44 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
     below 2 CTAs/SM, the documented 512-prefill occupancy tripwire). **Do not retry
     deep K-unroll for perf** — Mojo emits it faithfully, it just doesn't pay.
 
+## FP8 prefill GEMM on GB10: a hand-written multistage kernel LOSES to Modular
+- **Measured 2026-08-03, sm_121a. Do not retry the "more warps" lever.** The
+  shipped prefill GEMM is Modular's `multistage_gemm_kernel` at block 128x256x64
+  with a 64x64 warp tile: 8 warps, 224 regs, 98.3 KB smem, 1 CTA/SM = 16.67 %
+  occupancy, and it plateaus at ~150 TFLOPS against a **251 TFLOPS** e4m3 mma
+  ceiling (`bench_fp8_ceiling.mojo`, independent accumulators). The obvious
+  hypothesis — shrink the warp tile to 32x64 so the accumulator drops 128 -> 64
+  regs and 16 warps fit — was implemented in full (cp.async multistage, 3 stages,
+  ldmatrix fragments, fused scale epilogue, LDY column slices) and **it is
+  slower, not faster**:
+
+  | shape | warp tile | warps | ours | Modular |
+  |---|---|--:|--:|--:|
+  | q/o (4096,4096) | 64x64 | 8 | 306.0 us | **258.0 us** |
+  | q/o (4096,4096) | 32x64 | 16 | 327.5 us | **244.7 us** |
+  | down (4096,11264) | 64x64 | 8 | 997.0 us | **865.6 us** |
+  | down (4096,11264) | 32x64 | 16 | 1026.8 us | **878.6 us** |
+
+  Output was **bit-identical** to Modular's on every case, so this is a pure
+  perf result, not a correctness artifact.
+- **Why more warps loses, quantitatively.** Per k-step the block issues
+  `BM*BN/(16*WN)` A-ldmatrix and `BM*BN/(8*WM)` B-ldmatrix instructions, so A
+  traffic scales as 1/WN and B traffic as 1/WM. Halving WM from 64 to 32 leaves
+  A alone and **doubles** the shared-memory reads of B. The kernel is smem-
+  bandwidth bound before it is occupancy bound, which is exactly why Modular
+  rejects any warp tile other than 64x64. Registers were never the binding
+  constraint. (The opposite result on the int8 MMQ path — 16 warps x 32 acc
+  beating 8 warps x 64 — does NOT carry over: that kernel spends its smem
+  budget on unpacking, not on ldmatrix.)
+- **32x32 (32 warps, 1024 threads) does not launch at all** —
+  `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`; 1024 threads x 64 acc regs is the whole
+  65536-register file before operands.
+- Even at the IDENTICAL 64x64 tiling our kernel trails by 15-19 %, i.e. the gap
+  is implementation quality (smem swizzle vs our padding, paired B ldmatrix.x4,
+  pipeline scheduling), the same ptxas-scheduling advantage `CODEGEN_PROOF.md`
+  documents for int8. Closing it is a multi-day rewrite against a known wall.
+  **Both files were reverted; the committed Modular path is retained.**
+
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and
   `Scalar[DType.float8_e4m3fn](f32)` casts (RN, satfinite ±448, denormals and

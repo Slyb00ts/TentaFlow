@@ -267,15 +267,39 @@ W obrębie `multistage_gemm_kernel` Modulara pokrętła są wyczerpane. Zajęto�
 16,67% wynika z rozmiaru rejestrów i pamięci współdzielonej tego kernela, a nie
 z naszego doboru kafla.
 
-Po zmierzeniu roofline'u zostaje JEDNA droga, a nie trzy:
+### Wlasny GEMM — ZBUDOWANY I ODRZUCONY
 
-1. **Wlasny GEMM FP8 dla sm_121a.** Cel jest ilosciowy: podniesc plateau ze 150
-   TFLOPS. Dzwignia to liczba warpow — 8 warpow na SM nie ma czym zaslonic
-   opoznien 4-etapowego potoku cp.async. Kafel warpa 32x64 zamiast 64x64 daje
-   64 rejestry akumulatora zamiast 128, czyli 16 warpow (512 watkow) przy tej
-   samej pamieci wspoldzielonej i nadal jednym bloku na SM. Kierunek popiera
-   pomiar z `MOJO_NOTES.md`: na int8 wariant 16 warpow x 32 akumulatory bil
-   8 warpow x 64 o 7%.
+Napisany w calosci (cp.async, 3 etapy, fragmenty ldmatrix, fuzowany epilog ze
+skalami, wycinki kolumn LDY) i **przegrywa z kernelem Modulara na kazdym
+ksztalcie i kazdej konfiguracji**, przy wyjsciu bit w bit takim samym:
+
+| ksztalt | kafel warpa | warpy | nasz | Modular |
+|---|---|--:|--:|--:|
+| q/o (4096,4096) | 64x64 | 8 | 306,0 us | **258,0 us** |
+| q/o (4096,4096) | 32x64 | 16 | 327,5 us | **244,7 us** |
+| down (4096,11264) | 64x64 | 8 | 997,0 us | **865,6 us** |
+| down (4096,11264) | 32x64 | 16 | 1026,8 us | **878,6 us** |
+
+Hipoteza „wiecej warpow" jest **falszywa i wiadomo dlaczego**. Na krok k blok
+wykonuje `BM*BN/(16*WN)` odczytow ldmatrix dla A i `BM*BN/(8*WM)` dla B, czyli
+ruch A skaluje sie jak 1/WN, a ruch B jak 1/WM. Zejscie WM z 64 na 32 nie
+zmienia A i **podwaja** odczyty B z pamieci wspoldzielonej. Kernel jest zwiazany
+pasmem pamieci wspoldzielonej, zanim zwiaze go zajetosc — i dokladnie dlatego
+Modular nie przyjmuje kafla innego niz 64x64. Rejestry nigdy nie byly tu
+ograniczeniem. Wariant 32x32 (32 warpy) w ogole sie nie uruchamia:
+1024 watki x 64 rejestry akumulatora to caly plik rejestrow.
+
+Przy IDENTYCZNYM kaflu 64x64 nasz kernel traci 15-19%, czyli roznica lezy w
+jakosci implementacji (swizzle pamieci wspoldzielonej zamiast naszego
+dopelnienia, parowane ldmatrix.x4 dla B, szeregowanie potoku) — ta sama
+przewaga `ptxas`, ktora `CODEGEN_PROOF.md` opisuje dla int8. Oba pliki zostaly
+cofniete, sciezka Modulara zostaje.
+
+### Co zostaje
+
+1. **Podniesienie plateau wymagaloby CUDA, nie Mojo.** Precedens jest jeden:
+   `kernels/cuda/gemm_i8mma.cu`, jedyny wyjatek od ADR-0001, wziety dokladnie z
+   tego powodu. To jedyna niesprawdzona droga do 251 TFLOPS.
 2. **Kolejnosc blokow w siatce** — ZDEGRADOWANA z pozycji pierwszej. Model
    `passes` pokazuje, ze dla `down` swizzle nic nie da, bo pasmo i plateau
    wypadaja w tym samym punkcie (152,9 wobec 150). Ma sens dopiero PO
