@@ -1519,6 +1519,17 @@ impl Model {
         n_rows: usize,
         stream: &Stream,
     ) -> Result<()> {
+        // Przesunięcie wiersza podaje format z własnej geometrii bloku.
+        // Miejsce wywołania przepisywało je wcześniej osobno dla każdego
+        // z osiemnastu formatów, a rozmiar bloku i długość bloku w bajtach
+        // są tą samą wiedzą, którą `QuantKind` już niesie.
+        let row_bytes = || -> Result<usize> {
+            w.row_offset_bytes(row_off).ok_or_else(|| {
+                ForgeError::Unsupported(
+                    "ten format nie adresuje wiersza jednym przesunięciem".into(),
+                )
+            })
+        };
         match w {
             // Wagi FP8 ze skalą wierszową mają na razie tylko prostą ścieżkę
             // GEMV; pozostałe warianty powstaną razem z mikserem DeepSeeka.
@@ -1528,7 +1539,7 @@ impl Model {
             DevWeight::F16 { buf, cols, .. } => self.kernels.gemm_f16_at(
                 y,
                 buf,
-                row_off * cols * 2,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1543,7 +1554,7 @@ impl Model {
             // GEMV (see gemv). Marshalling the mma's 4x s32 output uses
             // inlined_assembly + _RegisterPackType (see kernels/mojo/MOJO_NOTES.md).
             DevWeight::Q8_0 { buf, cols, .. } => {
-                let off = row_off * (cols / 32) * 34;
+                let off = row_bytes()?;
                 // Jeden token bierze ten sam dp4a GEMV co dekod jednosekwencyjny.
                 // Kafel i8mma dopełnia do >=64 tokenów i kwantyzuje aktywacje
                 // inaczej, więc ścieżka batchowa dla B=1 dawała trwale inne
@@ -1566,7 +1577,7 @@ impl Model {
             // dp4a GEMV: one weight sweep serves every token instead of the
             // >=64-token tile the GEMM kernels pad to.
             DevWeight::Q4K { buf, cols, .. } => {
-                let off = row_off * (cols / 256) * 144;
+                let off = row_bytes()?;
                 if self
                     .kernels
                     .gemm_qk_dp4a_batch_at(y, buf, off, x, n_rows, *cols, n_tokens, false, stream)?
@@ -1577,7 +1588,7 @@ impl Model {
                     .gemm_q4_k_i8mma_at(y, buf, off, x, n_rows, *cols, n_tokens, stream)
             }
             DevWeight::Q6K { buf, cols, .. } => {
-                let off = row_off * (cols / 256) * 210;
+                let off = row_bytes()?;
                 if self
                     .kernels
                     .gemm_qk_dp4a_batch_at(y, buf, off, x, n_rows, *cols, n_tokens, true, stream)?
@@ -1590,7 +1601,7 @@ impl Model {
             DevWeight::Q5K { buf, cols, .. } => self.kernels.gemm_q5_k_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 176,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1600,7 +1611,7 @@ impl Model {
             DevWeight::Q3K { buf, cols, .. } => self.kernels.gemm_q3_k_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 110,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1610,7 +1621,7 @@ impl Model {
             DevWeight::Q2K { buf, cols, .. } => self.kernels.gemm_q2_k_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 84,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1620,7 +1631,7 @@ impl Model {
             DevWeight::Q4_0 { buf, cols, .. } => self.kernels.gemm_q4_0_f16_at(
                 y,
                 buf,
-                row_off * (cols / 32) * 18,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1630,7 +1641,7 @@ impl Model {
             DevWeight::Q4_1 { buf, cols, .. } => self.kernels.gemm_q4_1_f16_at(
                 y,
                 buf,
-                row_off * (cols / 32) * 20,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1640,7 +1651,7 @@ impl Model {
             DevWeight::Q5_0 { buf, cols, .. } => self.kernels.gemm_q5_0_f16_at(
                 y,
                 buf,
-                row_off * (cols / 32) * 22,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1650,7 +1661,7 @@ impl Model {
             DevWeight::Q5_1 { buf, cols, .. } => self.kernels.gemm_q5_1_f16_at(
                 y,
                 buf,
-                row_off * (cols / 32) * 24,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1660,7 +1671,7 @@ impl Model {
             DevWeight::Iq4Nl { buf, cols, .. } => self.kernels.gemm_iq4_nl_f16_at(
                 y,
                 buf,
-                row_off * (cols / 32) * 18,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1670,7 +1681,7 @@ impl Model {
             DevWeight::Iq4Xs { buf, cols, .. } => self.kernels.gemm_iq4_xs_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 136,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1680,7 +1691,7 @@ impl Model {
             DevWeight::Mxfp4 { buf, cols, .. } => self.kernels.gemm_mxfp4_f16_at(
                 y,
                 buf,
-                row_off * (cols / 32) * 17,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1690,7 +1701,7 @@ impl Model {
             DevWeight::Iq2Xs { buf, cols, .. } => self.kernels.gemm_iq2_xs_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 74,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1700,7 +1711,7 @@ impl Model {
             DevWeight::Iq2S { buf, cols, .. } => self.kernels.gemm_iq2_s_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 82,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1710,7 +1721,7 @@ impl Model {
             DevWeight::Iq3S { buf, cols, .. } => self.kernels.gemm_iq3_s_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 110,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1720,7 +1731,7 @@ impl Model {
             DevWeight::Iq2Xxs { buf, cols, .. } => self.kernels.gemm_iq2_xxs_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 66,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1730,7 +1741,7 @@ impl Model {
             DevWeight::Iq3Xxs { buf, cols, .. } => self.kernels.gemm_iq3_xxs_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 98,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1740,7 +1751,7 @@ impl Model {
             DevWeight::Iq1S { buf, cols, .. } => self.kernels.gemm_iq1_s_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 50,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,
@@ -1750,7 +1761,7 @@ impl Model {
             DevWeight::Iq1M { buf, cols, .. } => self.kernels.gemm_iq1_m_f16_at(
                 y,
                 buf,
-                row_off * (cols / 256) * 56,
+                row_bytes()?,
                 x,
                 n_rows,
                 *cols,

@@ -306,6 +306,59 @@ impl DevWeight {
         NvFp4CtRowWindow::new(data, *physical_rows, *cols, row_offset, rows)
     }
 
+    /// Format bloku tej wagi, dla formatów trzymających wiersz jako ciągłe
+    /// pasmo bloków. `None` dla F16 (nie ma bloków) i dla formatów o kilku
+    /// buforach, w których wiersz nie jest jednym pasmem.
+    ///
+    /// Celowo bez gałęzi `_ =>`: nowy wariant `DevWeight` ma tu nie
+    /// skompilować się, dopóki ktoś nie poda jego geometrii. Milcząco wpaść w
+    /// gałąź domyślną znaczyłoby czytać wagi spod złego adresu.
+    pub fn block_quant(&self) -> Option<QuantKind> {
+        Some(match self {
+            DevWeight::Q8_0 { .. } => QuantKind::Q8_0,
+            DevWeight::Q4K { .. } => QuantKind::Q4K,
+            DevWeight::Q6K { .. } => QuantKind::Q6K,
+            DevWeight::Q5K { .. } => QuantKind::Q5K,
+            DevWeight::Q3K { .. } => QuantKind::Q3K,
+            DevWeight::Q2K { .. } => QuantKind::Q2K,
+            DevWeight::Q4_0 { .. } => QuantKind::Q4_0,
+            DevWeight::Q4_1 { .. } => QuantKind::Q4_1,
+            DevWeight::Q5_0 { .. } => QuantKind::Q5_0,
+            DevWeight::Q5_1 { .. } => QuantKind::Q5_1,
+            DevWeight::Iq4Nl { .. } => QuantKind::IQ4NL,
+            DevWeight::Iq4Xs { .. } => QuantKind::IQ4XS,
+            DevWeight::Iq2Xs { .. } => QuantKind::IQ2XS,
+            DevWeight::Iq2S { .. } => QuantKind::IQ2S,
+            DevWeight::Iq3S { .. } => QuantKind::IQ3S,
+            DevWeight::Iq2Xxs { .. } => QuantKind::IQ2XXS,
+            DevWeight::Iq3Xxs { .. } => QuantKind::IQ3XXS,
+            DevWeight::Iq1S { .. } => QuantKind::IQ1S,
+            DevWeight::Iq1M { .. } => QuantKind::IQ1M,
+            DevWeight::Mxfp4 { .. } => QuantKind::MXFP4,
+            DevWeight::NvFp4Gguf { .. } => QuantKind::NVFP4Gguf,
+            DevWeight::F16 { .. } | DevWeight::NvFp4 { .. } | DevWeight::Fp8Row { .. } => {
+                return None
+            }
+        })
+    }
+
+    /// Bajtowe przesunięcie pierwszego bajtu wiersza `row_off`.
+    ///
+    /// Wyliczone z geometrii formatu, a nie z przepisanej stałej. Ta sama
+    /// liczba stała wcześniej osobno w każdym ramieniu `gemm_rows`
+    /// (`row_off * (cols / 256) * 176` dla Q5K, `* 110` dla Q3K, …) — czyli
+    /// szesnaście kopii tego, co `QuantKind` już o sobie wie. Pomyłka w
+    /// którejkolwiek czyta wagi spod złego adresu przy zgadzających się
+    /// kształtach, więc nic jej nie zatrzymuje aż do bezsensownego wyjścia.
+    pub fn row_offset_bytes(&self, row_off: usize) -> Option<usize> {
+        let cols = self.cols();
+        if matches!(self, DevWeight::F16 { .. }) {
+            return Some(row_off * cols * 2);
+        }
+        let quant = self.block_quant()?;
+        Some(row_off * (cols / quant.block_elems()) * quant.block_bytes())
+    }
+
     /// Kwantyzacja wagi dla tych formatów, które umie dzielić tensor parallel.
     /// `None` znaczy „ten format nie ma ścieżki podziału", a nie „nieznany".
     pub fn split_quant(&self) -> Option<QuantKind> {
@@ -5462,5 +5515,44 @@ mod rope_permute_tests {
         for (i, r) in [0u8, 2, 1, 3].iter().enumerate() {
             assert_eq!(data[i * row_bytes], *r, "wiersz {i}");
         }
+    }
+}
+
+#[cfg(test)]
+mod row_offset_geometry_tests {
+    use forge_types::QuantKind;
+
+    /// Przesunięcie wiersza liczone z geometrii formatu musi dawać dokładnie
+    /// to, co przez osiemnaście formatów stało wpisane ręcznie w ramionach
+    /// `gemm_rows`. Lewa strona to wyliczenie, prawa — wyrażenie, które tam
+    /// było; ten test jest jedynym powodem, dla którego wolno było je usunąć.
+    #[test]
+    fn wyliczone_przesuniecie_zgadza_sie_z_dawnymi_stalymi() {
+        const COLS: usize = 4096;
+        const ROW: usize = 7;
+        let derived = |q: QuantKind| ROW * (COLS / q.block_elems()) * q.block_bytes();
+
+        assert_eq!(derived(QuantKind::Q8_0), ROW * (COLS / 32) * 34);
+        assert_eq!(derived(QuantKind::Q4_0), ROW * (COLS / 32) * 18);
+        assert_eq!(derived(QuantKind::Q4_1), ROW * (COLS / 32) * 20);
+        assert_eq!(derived(QuantKind::Q5_0), ROW * (COLS / 32) * 22);
+        assert_eq!(derived(QuantKind::Q5_1), ROW * (COLS / 32) * 24);
+        assert_eq!(derived(QuantKind::IQ4NL), ROW * (COLS / 32) * 18);
+        assert_eq!(derived(QuantKind::MXFP4), ROW * (COLS / 32) * 17);
+
+        assert_eq!(derived(QuantKind::Q2K), ROW * (COLS / 256) * 84);
+        assert_eq!(derived(QuantKind::Q3K), ROW * (COLS / 256) * 110);
+        assert_eq!(derived(QuantKind::Q4K), ROW * (COLS / 256) * 144);
+        assert_eq!(derived(QuantKind::Q5K), ROW * (COLS / 256) * 176);
+        assert_eq!(derived(QuantKind::Q6K), ROW * (COLS / 256) * 210);
+
+        assert_eq!(derived(QuantKind::IQ1S), ROW * (COLS / 256) * 50);
+        assert_eq!(derived(QuantKind::IQ1M), ROW * (COLS / 256) * 56);
+        assert_eq!(derived(QuantKind::IQ2XXS), ROW * (COLS / 256) * 66);
+        assert_eq!(derived(QuantKind::IQ2XS), ROW * (COLS / 256) * 74);
+        assert_eq!(derived(QuantKind::IQ2S), ROW * (COLS / 256) * 82);
+        assert_eq!(derived(QuantKind::IQ3XXS), ROW * (COLS / 256) * 98);
+        assert_eq!(derived(QuantKind::IQ3S), ROW * (COLS / 256) * 110);
+        assert_eq!(derived(QuantKind::IQ4XS), ROW * (COLS / 256) * 136);
     }
 }
