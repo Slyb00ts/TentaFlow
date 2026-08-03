@@ -326,7 +326,61 @@ po 2 bajty. Jeden odczyt skal wierszy i jeden zapis wektorowy daja
 gdzie ogranicza pasmo, nie zmienia nic. Golden `test_gemm_fp8_modular_bn256`
 przechodzi bez zmiany wyniku (0 rozbieznosci).
 
-### GDZIE NAPRAWDE JEST 2x: silnik, nie kernel
+## Profil PRAWDZIWEGO prefillu (nsys, prompt 2048, 412,5 ms)
+
+Nie mikrobench — `forge bench` pod `nsys`, ślad rozbity na serie rozdzielone
+przerwami. Dwa mierzone powtórzenia dały 412,5 i 413,4 ms po 1529 kerneli.
+
+**GPU jest zajety w 99,1%** — w oknie 412,5 ms luki sumuja sie do 3,8 ms. Graf
+CUDA ani megakernel nie maja tu czego odzyskac. Przerwy rzedu 328 ms widoczne w
+sladzie leza MIEDZY powtórzeniami (praca hosta w harnessie), nie w prefillu.
+
+| skladnik | wywolan | ms | % |
+|---|--:|--:|--:|
+| GEMM-y FP8 | 880 | **271,2** | 65,7% |
+| uwaga `attn_prefill_fa` | 80 | **73,9** | 17,9% |
+| `silu_mul_quant` | 80 | 29,0 | 7,0% |
+| `rmsnorm_residual_fp8` | 158 | 22,7 | 5,5% |
+| rope / kv_append / quant | 320 | 10,3 | 2,5% |
+
+11 GEMM-ow na warstwe na kawalek: q, o, down (siatka 16x8), gate i up po trzy
+kawalki kolumn (2x 16x8 + 1x 12x8), oraz k i v (8x8, blok 128).
+
+### GEMM-y: 109 TFLOPS, bo wagi ida przez pamiec TRZY razy
+
+29,5 TFLOP w 271,2 ms to **109 TFLOPS**, przy 151 w rozgrzanym mikrobenchu tych
+samych ksztaltow. Roznica nie jest zagadka: w mikrobenchu ta sama macierz B
+wraca do L2 co iteracje, a w silniku **kazda z 40 warstw ma wlasne wagi, wiec B
+jest zawsze zimne**. Liczy sie wiec model `passes` z sekcji wyzej, tyle ze bez
+zadnej pomocy L2 miedzy wywolaniami:
+
+| uklad | conc | przebiegi | ruch wag | czas wag | blokow |
+|---|--:|--:|--:|--:|--:|
+| dzis, N=4096, gridX=16 | 3 | **3** | 44,1 GB | **197 ms** | 128 |
+| plaster 1536, gridX=6 | 8 | **1** | 14,7 GB | **66 ms** | 48 |
+| plaster 1024, gridX=4 | 12 | 1 | 14,7 GB | 66 ms | 32 |
+
+Podloga obliczeniowa to 118 ms. Dzis ruch wag (197 ms) jest POWYZEJ niej, wiec
+GEMM-y sa zwiazane pamiecia; przy plastrze 1536 spada do 66 ms, czyli ponizej
+podlogi — i GEMM-y staja sie zwiazane obliczeniem. Szacowany zysk: 271 -> okolo
+150-180 ms.
+
+Plaster 1536 daje dokladnie 6 kafli kolumnowych na 8 wierszy M, czyli 48 blokow
+= 48 SM: wszystkie wiersze M rezydentne naraz i komplet SM zajety. To ta sama
+dzwignia, ktora dzialala na `gate/up`, tyle ze dobrana pod liczbe SM zamiast pod
+"N=4096". Uwaga: w MIKROBENCHU plastry wychodzily gorzej (672 wobec 617 us) i
+dlatego zostaly wczesniej odrzucone — tam L2 miedzy powtorzeniami maskowal caly
+efekt. Silnik jest tu uczciwym pomiarem, mikrobench nie.
+
+### Uwaga: 19 TFLOPS, czyli 15% wlasnego sufitu
+
+1,38 TFLOP (przyczynowa, 32 glowice Q, 8 KV, hd=128, dwa kawalki) w 73,9 ms to
+**19 TFLOPS**. Sufit f16 to polowa fp8, czyli okolo 125 TFLOPS, wiec uwaga
+chodzi na **15%** — najgorsza sprawnosc w calym prefillu, duzo gorsza niz GEMM-y.
+Przy 60% sufitu zajelaby 18 ms zamiast 73,9. KV to tylko 336 MB na kawalek, wiec
+nie ogranicza jej pasmo.
+
+### Stary wniosek o silniku (zachowany, bo prowadzil tutaj)
 
 Zestawienie, ktore przewaza wszystko powyzej:
 
