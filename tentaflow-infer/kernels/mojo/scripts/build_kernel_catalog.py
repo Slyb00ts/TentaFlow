@@ -219,13 +219,48 @@ def entry_from_ptx(text, artifact):
     return text[start + len(marker) : end]
 
 
+# Sufit rejestrow na kernel. `ptxas` domyslnie optymalizuje ILP kosztem
+# zajetosci, wiec potrafi wziac wiecej rejestrow, niz potrzebuje — a przy
+# 128 watkach na blok kazde 22528 rejestrow to jeden blok mniej na SM.
+#
+# Wpis wolno dodac TYLKO po sprawdzeniu, ze `ptxas --verbose` nie raportuje ani
+# jednego bajtu spillu, i po zmierzeniu zysku end-to-end. Sufit ponizej progu
+# bez spillu zamienia rejestry na ruch do pamieci lokalnej i jest strata.
+PTX_MAX_REGISTERS = {
+    # 176 -> 148 rejestrow, zero spillu: 2 -> 3 bloki na SM (sufit pamieci
+    # wspoldzielonej przy 32 KiB na blok). RTX GB10, Bielik-7B, prompt 2048:
+    # mediana prefillu 4856 -> 4929 tok/s z trzech przebiegow.
+    #
+    # Wariantu HD256 nie ma na tej liscie SWIADOMIE: tam sam akumulator zajmuje
+    # 128 rejestrow, wiec kazdy sufit ponizej 252 spilluje (672 B juz przy 200).
+    "attn_prefill_fa_mojo_f16_hd128": 152,
+}
+
+
+def with_max_registers(text, artifact):
+    """Dopisuje `.maxnreg` do wejscia kernela, gdy artefakt ma zmierzony sufit."""
+    cap = PTX_MAX_REGISTERS.get(artifact)
+    if cap is None:
+        return text
+    if ".maxnreg" in text:
+        return text
+    marker = ".visible .entry "
+    start = text.find(marker)
+    if start < 0:
+        raise RuntimeError(f"brak wpisu .visible .entry w {artifact}.ptx")
+    open_brace = text.find("{", start)
+    if open_brace < 0:
+        raise RuntimeError(f"brak ciala kernela w {artifact}.ptx")
+    return f"{text[:open_brace]}.maxnreg {cap}\n{text[open_brace:]}"
+
+
 def normalized_ptx(text, artifact, portable_nvfp4):
     if artifact in portable_nvfp4 or ("fp8" not in artifact and "nvfp4" not in artifact):
         text = text.replace(".target sm_89", ".target sm_80")
     if artifact.startswith("gemm_fp8"):
         for version in ("8.0", "8.1", "8.2", "8.3"):
             text = text.replace(f".version {version}", ".version 8.4")
-    return text
+    return with_max_registers(text, artifact)
 
 
 # --- AMD (AMDGCN) -----------------------------------------------------------

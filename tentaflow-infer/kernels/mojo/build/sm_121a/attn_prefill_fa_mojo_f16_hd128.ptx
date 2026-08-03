@@ -24,6 +24,7 @@
 	.param .f32 src_prefill_attn_prefill_fa_mm6A6A6A6A_6b49d452b38ec32c_param_9,
 	.param .u64 src_prefill_attn_prefill_fa_mm6A6A6A6A_6b49d452b38ec32c_param_10
 )
+.maxnreg 152
 {
 	.reg .pred 	%p<47>;
 	.reg .b16 	%rs<75>;
