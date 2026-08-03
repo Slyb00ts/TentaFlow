@@ -151,3 +151,44 @@ Dalsze możliwości, od najtańszej:
    etapami i kolejnością bloków.
 3. Nowszy kernel z biblioteki Modulara, jeśli mają wariant dla Blackwella;
    pakiet jest skompilowany, więc bez źródeł nie da się tego sprawdzić z repo.
+
+
+## Dlaczego sciezka NVFP4 wprost jest wolniejsza od konwersji do FP8
+
+Zmierzone na Bieliku 7B, prompt 2048:
+
+| sciezka | prefill | decode | dodatkowa pamiec |
+|---|---|---|---|
+| paczki FP8 | 4 899 tok/s | 38,4 | +7,35 GB |
+| NVFP4 wprost | 2 064 tok/s | 38,2 | 0 |
+
+`nsys` na sciezce wprost: JEDEN kernel `nvfp4_ct_prefill_gemm` to **85,3% czasu**
+(1722 ms / 1120 wywolan, po 1,54 ms). Ta sama praca w FP8 zajmuje okolo 540 ms.
+
+`ncu` na tym kernelu — wbrew oczekiwaniu NIE jest ograniczony zajetoscia ani
+pamiecia:
+
+| metryka | NVFP4 wprost | FP8 modular |
+|---|---|---|
+| przepustowosc SM | **56,4%** | 43,5% |
+| rejestry/watek | **80** (limit 6 blokow) | 224 (limit 1 blok) |
+| pamiec wspoldzielona | 0 dynamicznej | 98,3 KB |
+| jednostka tensorowa | **25,1%** | — |
+
+Rozjazd 56,4% SM wobec 25,1% jednostki tensorowej mowi wszystko: **polowa pracy
+SM to nie mnozenie macierzy, tylko rozpakowywanie FP4**. Kernel jest zajety, ale
+nie liczeniem.
+
+Samo rozpakowanie nie jest naiwne — uzywa sztuczek bitowych na parach wartosci
+(maska znaku, przesuniecie wykladnika). Problem jest ilosciowy: zbyt wiele
+operacji pomocniczych na jedna tensorowa.
+
+Kierunek naprawy, w kolejnosci:
+1. **Rozpakowywac wprost do ukladu operandu MMA**, zeby nie przestawiac wartosci
+   po dekodowaniu.
+2. **Skale nakladac w epilogu**, a nie na kazda wartosc.
+3. Zredukowac liczbe instrukcji na wartosc (LOP3 zamiast osobnych and/or/shift).
+
+To jedyna droga, ktora daje jednoczesnie wydajnosc, 7,35 GB pamieci i zgodnosc z
+zasada "kwantyzacje liczymy wprost". Konwersja do MXFP4 dala by 2x na instrukcji
+(zmierzone: 1,999x), ale byla by DRUGA konwersja, w dodatku stratna.
