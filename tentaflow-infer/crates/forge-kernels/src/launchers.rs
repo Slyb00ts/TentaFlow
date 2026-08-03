@@ -79,6 +79,32 @@ fn fp8_modular_bn256_enabled() -> bool {
     })
 }
 
+
+/// Szerokie N liczone jako kilka wywolan po <=4096 kolumn.
+///
+/// Wydajnosc `multistage_gemm_kernel` ma maksimum przy N=4096 i zalamuje sie
+/// powyzej. Zmierzone na GB10 przy K=4096 i M=1024: 142 TFLOPS dla N=4096,
+/// 103 dla 5632, 62 dla 8192, 47 dla 11264. Te same 94.5 GFLOP policzone jako
+/// 4096+4096+3072 zajmuja 661 us zamiast 2016, czyli 3.05x szybciej. Kazdy
+/// kawalek pisze wycinek kolumn do pelnej macierzy wyjsciowej, wiec jego kernel
+/// zna krok wiersza `LDY` rowny pelnemu N.
+fn fp8_modular_column_chunks(rows: usize, cols: usize) -> Option<&'static [(usize, &'static str)]> {
+    match (rows, cols) {
+        (11264, 4096) => Some(&[
+            (4096, "gemm_fp8_mod_4096x11264_4096"),
+            (4096, "gemm_fp8_mod_4096x11264_4096"),
+            (3072, "gemm_fp8_mod_3072x11264_4096"),
+        ]),
+        (14336, 4096) => Some(&[
+            (4096, "gemm_fp8_mod_4096x14336_4096"),
+            (4096, "gemm_fp8_mod_4096x14336_4096"),
+            (4096, "gemm_fp8_mod_4096x14336_4096"),
+            (2048, "gemm_fp8_mod_2048x14336_4096"),
+        ]),
+        _ => None,
+    }
+}
+
 fn fp8_modular_bn256_kernel(rows: usize, cols: usize) -> Option<&'static str> {
     match (rows, cols) {
         (4096, 4096) => Some("gemm_fp8_mod_4096_4096_bn256"),
@@ -11022,6 +11048,37 @@ impl Kernels {
             block: (block_threads, 1, 1),
             shared_mem_bytes,
         };
+        // Podzial szerokiego N na kawalki po <=4096 kolumn, gdy komplet kerneli
+        // czastkowych jest w artefaktach. Kazdy kawalek dostaje przesuniete
+        // wagi (wiersze B), skale wierszy i kolumne startowa w Y.
+        if let Some(chunks) = fp8_modular_column_chunks(rows, cols) {
+            if chunks.iter().all(|(_, name)| self.artifacts.has(name)) {
+                let mut start = 0usize;
+                for (chunk_rows, name) in chunks {
+                    let ck = self.artifacts.get(name)?;
+                    let ccfg = LaunchConfig {
+                        grid: (
+                            (*chunk_rows as u32).div_ceil(256),
+                            (n_tokens as u32).div_ceil(128),
+                            1,
+                        ),
+                        block: (256, 1, 1),
+                        shared_mem_bytes: FP8_MODULAR_BN256_SMEM as u32,
+                    };
+                    let cargs = LaunchArgs::new()
+                        .buf_at(y, start * 2)?
+                        .buf(xq)
+                        .buf_at(w, start * cols)?
+                        .buf(xs)
+                        .buf_at(wscales, start * 4)?
+                        .scalar(n_tokens as i64);
+                    self.device.launch(ck, &ccfg, &cargs, stream)?;
+                    start += chunk_rows;
+                }
+                return Ok(());
+            }
+        }
+
         let args = LaunchArgs::new()
             .buf(y)
             .buf(xq)
@@ -11197,6 +11254,37 @@ impl Kernels {
             block: (block_threads, 1, 1),
             shared_mem_bytes,
         };
+        // Ten sam podzial szerokiego N co w `gemm_fp8_modular`. Tedy idzie FFN
+        // gate/up, czyli dokladnie ksztalt (11264, 4096), na ktorym pojedyncze
+        // wywolanie osiaga 47 TFLOPS zamiast 142.
+        if let Some(chunks) = fp8_modular_column_chunks(rows, cols) {
+            if chunks.iter().all(|(_, name)| self.artifacts.has(name)) {
+                let mut start = 0usize;
+                for (chunk_rows, name) in chunks {
+                    let ck = self.artifacts.get(name)?;
+                    let ccfg = LaunchConfig {
+                        grid: (
+                            (*chunk_rows as u32).div_ceil(256),
+                            (n_tokens as u32).div_ceil(128),
+                            1,
+                        ),
+                        block: (256, 1, 1),
+                        shared_mem_bytes: FP8_MODULAR_BN256_SMEM as u32,
+                    };
+                    let cargs = LaunchArgs::new()
+                        .buf_at(y, start * 2)?
+                        .buf(xq)
+                        .buf_at(w, start * cols)?
+                        .buf(xs)
+                        .buf_at(wscales, start * 4)?
+                        .scalar(n_tokens as i64);
+                    self.device.launch(ck, &ccfg, &cargs, stream)?;
+                    start += chunk_rows;
+                }
+                return Ok(());
+            }
+        }
+
         let args = LaunchArgs::new()
             .buf(y)
             .buf(xq)

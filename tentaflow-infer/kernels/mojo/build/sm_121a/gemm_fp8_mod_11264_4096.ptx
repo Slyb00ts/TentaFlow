@@ -6,16 +6,16 @@
 .target sm_121a
 .address_size 64
 
-	// .globl	src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183
+	// .globl	src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52
 .extern .shared .align 4 .b8 extern_ptr_syml_0[];
 
-.visible .entry src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183(
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_0,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_1,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_2,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_3,
-	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_4,
-	.param .u64 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_5
+.visible .entry src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52(
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_0,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_1,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_2,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_3,
+	.param .u64 .ptr .align 1 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_4,
+	.param .u64 src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_5
 )
 {
 	.reg .pred 	%p<396>;
@@ -23,15 +23,15 @@
 	.reg .b32 	%r<1180>;
 	.reg .b64 	%rd<1444>;
 
-	ld.param.b64 	%rd152, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_5];
-	ld.param.b64 	%rd177, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_0];
-	ld.param.b64 	%rd178, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_1];
+	ld.param.b64 	%rd152, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_5];
+	ld.param.b64 	%rd177, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_0];
+	ld.param.b64 	%rd178, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_1];
 	cvta.to.global.u64 	%rd179, %rd178;
-	ld.param.b64 	%rd180, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_2];
+	ld.param.b64 	%rd180, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_2];
 	cvta.to.global.u64 	%rd181, %rd180;
 	cvta.to.global.u64 	%rd1, %rd177;
-	ld.param.b64 	%rd182, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_3];
-	ld.param.b64 	%rd183, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_05b272ea3babb183_param_4];
+	ld.param.b64 	%rd182, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_3];
+	ld.param.b64 	%rd183, [src_gemm_fp8_modular_gemm_fp8_6A6A6A6A_e888d3853163fd52_param_4];
 	cvta.to.global.u64 	%rd2, %rd183;
 	cvta.to.global.u64 	%rd3, %rd182;
 	mov.u32 	%r34, %tid.x;

@@ -21,7 +21,7 @@ from std.utils.index import Index, IndexList
 
 
 def gemm_fp8_mod_tile[
-    N: Int, K: Int, BN: Int
+    N: Int, K: Int, BN: Int, LDY: Int = N
 ](
     y: UnsafePointer[Float16, MutAnyOrigin],
     a: UnsafePointer[Float8_e4m3fn, MutAnyOrigin],
@@ -58,7 +58,7 @@ def gemm_fp8_mod_tile[
         var col = idx[1]
         var sa = xs[t]
         comptime for j in range(width):
-            y[t * N + col + j] = (
+            y[t * LDY + col + j] = (
                 val[j].cast[DType.float32]() * sa * ws[col + j]
             ).cast[DType.float16]()
 
@@ -91,3 +91,14 @@ comptime gemm_fp8_mod_11264_4096_bn256 = gemm_fp8_mod_tile[11264, 4096, 256]
 # kaflu, który jest dla niego najgorszy.
 comptime gemm_fp8_mod_4096_11264_bn256 = gemm_fp8_mod_tile[4096, 11264, 256]
 comptime gemm_fp8_mod_4096_14336_bn256 = gemm_fp8_mod_tile[4096, 14336, 256]
+
+
+# Wydajnosc tego GEMM ma maksimum przy N=4096 i zalamuje sie powyzej: przy
+# K=4096 i M=1024 zmierzono 142 TFLOPS dla N=4096, 62 dla N=8192 i 47 dla
+# N=11264. Te same 94.5 GFLOP policzone jako 4096+4096+3072 zajmuja 661 us
+# zamiast 2016 us, czyli 3.05x szybciej. Ponizsze warianty licza WYCINEK kolumn
+# i zapisuja go do pelnej macierzy wyjsciowej o kroku wiersza LDY.
+comptime gemm_fp8_mod_4096x11264_4096 = gemm_fp8_mod_tile[4096, 4096, 256, 11264]
+comptime gemm_fp8_mod_3072x11264_4096 = gemm_fp8_mod_tile[3072, 4096, 256, 11264]
+comptime gemm_fp8_mod_4096x14336_4096 = gemm_fp8_mod_tile[4096, 4096, 256, 14336]
+comptime gemm_fp8_mod_2048x14336_4096 = gemm_fp8_mod_tile[2048, 4096, 256, 14336]
