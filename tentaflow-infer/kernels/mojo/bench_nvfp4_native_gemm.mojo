@@ -4,14 +4,18 @@
 # Przyklad: pixi run mojo bench_nvfp4_native_gemm.mojo
 # =============================================================================
 #
-# Pierwsza wersja liczaca PRAWDZIWY GEMM na
-# `kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` — uklad operandow jest
-# zweryfikowany w `probe_nvfp4_mma_layout.mojo` i `probe_nvfp4_mma_golden.mojo`.
+# GEMM na `kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` — uklad operandow
+# jest zweryfikowany w `probe_nvfp4_mma_layout.mojo` i `probe_nvfp4_mma_golden.mojo`.
 #
-# Swiadomie NIE MA tu jeszcze pamieci wspoldzielonej ani `cp.async`: jeden warp
-# liczy kafel 16x8 i czyta fragmenty wprost z pamieci globalnej. Chodzi o to,
-# zeby najpierw miec rdzen, ktory zgadza sie z referencja co do bitu, i dopiero
-# na nim budowac kafelkowanie. Pomiar ponizej jest wiec PODLOGA, nie sufitem.
+# Dwa jadra stoja tu obok siebie i licza BITOWO TO SAMO:
+#   `gemm_nvfp4`       — jeden warp na kafel 16x64, fragmenty wprost z pamieci
+#                        globalnej. Rdzen referencyjny: prosty do przeczytania,
+#                        sprawdzony przeciw CPU, i podloga pomiaru.
+#   `gemm_nvfp4_tiled` — kafel BM x BN liczony przez NW warpow, oba operandy
+#                        przez potok `cp.async` w dynamicznej pamieci
+#                        wspoldzielonej, siatka przenumerowana pod L2.
+# Kolejnosc sumowania po K jest w obu identyczna, wiec kafelkowanie mozna
+# sprawdzac tym samym testem na rownosc CO DO BITU, a nie na tolerancje.
 #
 # Uklad danych wejsciowych jest taki, jaki ma model: A i B trzymaja kody e2m1
 # po dwa na bajt (mlodsza polbajtowka to mniejsze k), a skale ue4m3 po jednej na
@@ -22,14 +26,27 @@
 #   skale wiersza dla calego kroku K64 = u32 pod indeksem row*(K/64) + kb
 
 from std.gpu import block_idx, thread_idx
-from std.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from std.gpu.host import DeviceContext
 from std.gpu.intrinsics import inlined_assembly
-from std.sys import _RegisterPackType
+from std.gpu.memory import (
+    AddressSpace,
+    async_copy,
+    async_copy_commit_group,
+    async_copy_wait_group,
+    external_memory,
+)
+from std.gpu.sync import barrier
+from std.sys import _RegisterPackType, size_of
 from std.time import perf_counter_ns
 
 comptime LANES = 32
 comptime ROUNDS = 5
 comptime ITERS = 10
+
+
+def _smem_bytes[BM: Int, BN: Int, KC: Int, NS: Int]() -> Int:
+    """Bajty pamieci wspoldzielonej kafla: kody + skale, razy glebokosc potoku."""
+    return 4 * NS * ((BM + BN) * (8 * KC + 4) + (BM + BN) * KC)
 
 
 def mma_nvfp4(
@@ -54,9 +71,9 @@ def mma_nvfp4(
 
 
 def gemm_nvfp4[
-    N: Int, K: Int, NT: Int = 8
+    OUT: DType, N: Int, K: Int, NT: Int = 8
 ](
-    y: UnsafePointer[Float32, MutAnyOrigin],
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     a: UnsafePointer[UInt32, MutAnyOrigin],
     sa: UnsafePointer[UInt32, MutAnyOrigin],
     b: UnsafePointer[UInt32, MutAnyOrigin],
@@ -111,7 +128,212 @@ def gemm_nvfp4[
         comptime for i in range(4):
             var row = tile_m * 16 + g + 8 * (i // 2)
             var col = (tile_n + t) * 8 + 2 * q + (i % 2)
-            y[row * N + col] = acc[t][i]
+            y[row * N + col] = Scalar[OUT](acc[t][i])
+
+
+def _stage[
+    ROWS: Int, KC: Int, NTHR: Int, LDA: Int
+](
+    s: Int,
+    buf: Int,
+    tid: Int,
+    row0: Int,
+    row_words: Int,
+    scale_words: Int,
+    src: UnsafePointer[UInt32, MutAnyOrigin],
+    src_s: UnsafePointer[UInt32, MutAnyOrigin],
+    dst: UnsafePointer[
+        UInt32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    dst_s: UnsafePointer[
+        UInt32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+):
+    """cp.async etapu `s` (KC blokow K64) kafla ROWS wierszy do slotu `buf`.
+
+    Kody ida po 16 B (4 u32), skale po 4*KC B — wiersz skal to dokladnie KC
+    kolejnych u32, wiec jeden `cp.async` na wiersz wystarczy do KC=4.
+    """
+    comptime TILE = ROWS * LDA
+    comptime STILE = ROWS * KC
+    comptime CPR = 2 * KC          # kopii 16-bajtowych na wiersz
+    comptime CODES = ROWS * CPR
+    k_word = s * (8 * KC)
+
+    comptime for p in range((CODES + NTHR - 1) // NTHR):
+        cid = tid + p * NTHR
+        if cid < CODES:
+            r = cid // CPR
+            w4 = (cid % CPR) * 4
+            async_copy[16](
+                (src + (row0 + r) * row_words + k_word + w4).address_space_cast[
+                    AddressSpace.GLOBAL
+                ](),
+                dst + buf * TILE + r * LDA + w4,
+            )
+
+    comptime for p in range((ROWS + NTHR - 1) // NTHR):
+        r = tid + p * NTHR
+        if r < ROWS:
+            async_copy[4 * KC](
+                (src_s + (row0 + r) * scale_words + s * KC).address_space_cast[
+                    AddressSpace.GLOBAL
+                ](),
+                dst_s + buf * STILE + r * KC,
+            )
+
+
+def gemm_nvfp4_tiled[
+    OUT: DType,
+    N: Int, K: Int, BM: Int, BN: Int, KC: Int, NW: Int, WM: Int, GM: Int,
+    NS: Int,
+](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
+    a: UnsafePointer[UInt32, MutAnyOrigin],
+    sa: UnsafePointer[UInt32, MutAnyOrigin],
+    b: UnsafePointer[UInt32, MutAnyOrigin],
+    sb: UnsafePointer[UInt32, MutAnyOrigin],
+    tiles_m: Int,
+):
+    """Y[M,N] = A[M,K] * B[N,K]^T na kaflu BM x BN, KC blokow K64 na etap.
+
+    Blok NW warpow ustawionych WM x (NW/WM); kazdy warp liczy podkafel
+    (MT*16) x (NT*8) i czyta fragmenty z pamieci wspoldzielonej, ktora oba
+    operandy dostaja przez podwojnie buforowany `cp.async`. Wynik jest BITOWO
+    IDENTYCZNY z wersja naiwna: kolejnosc sumowania po K sie nie zmienia.
+
+    Odstep wiersza LDA = 8*KC + 4 u32 jest dobrany tak, zeby 32 pasy warpa
+    trafialy w 32 rozne banki (adres pasa to g*LDA + q, a LDA mod 32 jest
+    wielokrotnoscia 4 wzajemnie pierwsza z 8) — bez tego odczyt fragmentu A
+    zderza sie cztero-drozne.
+
+    Siatka jest JEDNOWYMIAROWA i przenumerowana grupami po GM kafli M: bloki
+    lecace obok siebie maja wspolne n0, wiec plat B, ktory czytaja, zostaje w
+    L2 na caly czas ich zycia. Przy naturalnej kolejnosci (n najszybsze) fala
+    bloków przemiata cale B dla jednego m i czyta je z DRAM-u ponownie dla
+    kazdego kolejnego — to na tej maszynie kosztuje wielokrotnosc, bo 273 GB/s
+    LPDDR5X jest tu ograniczeniem, nie tensor core.
+    """
+    comptime LDA = 8 * KC + 4
+    comptime ATILE = BM * LDA
+    comptime BTILE = BN * LDA
+    comptime SATILE = BM * KC
+    comptime SBTILE = BN * KC
+    comptime NTHR = NW * LANES
+    comptime WN = NW // WM
+    comptime MT = BM // (WM * 16)
+    comptime NT = BN // (WN * 8)
+    comptime A_ROW = K // 8
+    comptime S_ROW = K // 64
+    comptime STAGES = K // (64 * KC)
+    comptime TN = N // BN
+
+    # Jeden blok dynamicznej pamieci wspoldzielonej pociety na cztery kafle:
+    # statyczne `stack_allocation` ma twardy sufit 48 KiB, a NS>2 albo szerszy
+    # kafel od razu go przekracza (limit opt-in na tej maszynie to 99 KiB).
+    sm = external_memory[
+        UInt32, address_space = AddressSpace.SHARED, alignment=16
+    ]()
+    a_sm = sm
+    b_sm = sm + NS * ATILE
+    sa_sm = sm + NS * (ATILE + BTILE)
+    sb_sm = sm + NS * (ATILE + BTILE + SATILE)
+
+    tid = Int(thread_idx.x)
+    lane = tid % LANES
+    wid = tid // LANES
+    g = lane // 4
+    q = lane % 4
+    bid = Int(block_idx.x)
+    grp = bid // (GM * TN)
+    m_first = grp * GM
+    gm = min(GM, tiles_m - m_first)
+    rank = bid - m_first * TN
+    m0 = (m_first + rank % gm) * BM
+    n0 = (rank // gm) * BN
+    warp_m = (wid % WM) * (MT * 16)
+    warp_n = (wid // WM) * (NT * 8)
+    # Pas 4r niesie skale wiersza r, pas 4r+1 wiersza r+8 (patrz wersja naiwna).
+    s_off = 8 if (q == 1) else 0
+
+    var acc = InlineArray[SIMD[DType.float32, 4], MT * NT](
+        fill=SIMD[DType.float32, 4](0.0)
+    )
+
+    # NS-1 etapow w locie zanim wejdziemy w petle; potem kazdy obrot dorzuca
+    # jeden. Grupa jest zatwierdzana ZAWSZE, takze pusta w ogonie — dzieki temu
+    # numer grupy zawsze rowna sie numerowi etapu i `wait_group(NS-1)` czeka
+    # dokladnie na etap `s`, bez rozgalezienia w petli.
+    comptime for i in range(NS - 1):
+        _stage[BM, KC, NTHR, LDA](i, i, tid, m0, A_ROW, S_ROW, a, sa, a_sm, sa_sm)
+        _stage[BN, KC, NTHR, LDA](i, i, tid, n0, A_ROW, S_ROW, b, sb, b_sm, sb_sm)
+        async_copy_commit_group()
+
+    var s = 0
+    while s < STAGES:
+        nxt = s + NS - 1
+        if nxt < STAGES:
+            nbuf = nxt % NS
+            _stage[BM, KC, NTHR, LDA](
+                nxt, nbuf, tid, m0, A_ROW, S_ROW, a, sa, a_sm, sa_sm
+            )
+            _stage[BN, KC, NTHR, LDA](
+                nxt, nbuf, tid, n0, A_ROW, S_ROW, b, sb, b_sm, sb_sm
+            )
+        async_copy_commit_group()
+        async_copy_wait_group(Int32(NS - 1))
+        barrier()
+
+        buf = s % NS
+        comptime for c in range(KC):
+            var a0 = InlineArray[UInt32, MT](uninitialized=True)
+            var a1 = InlineArray[UInt32, MT](uninitialized=True)
+            var a2 = InlineArray[UInt32, MT](uninitialized=True)
+            var a3 = InlineArray[UInt32, MT](uninitialized=True)
+            var asc = InlineArray[UInt32, MT](uninitialized=True)
+            comptime for mi in range(MT):
+                lo = a_sm + buf * ATILE + (warp_m + mi * 16 + g) * LDA + 8 * c + q
+                hi = lo + 8 * LDA
+                a0[mi] = lo[0]
+                a1[mi] = hi[0]
+                a2[mi] = lo[4]
+                a3[mi] = hi[4]
+                asc[mi] = sa_sm[
+                    buf * SATILE + (warp_m + mi * 16 + g + s_off) * KC + c
+                ]
+            comptime for ni in range(NT):
+                col = warp_n + ni * 8 + g
+                bp = b_sm + buf * BTILE + col * LDA + 8 * c + q
+                b0 = bp[0]
+                b1 = bp[4]
+                bsc = sb_sm[buf * SBTILE + col * KC + c]
+                comptime for mi in range(MT):
+                    var r = mma_nvfp4(
+                        a0[mi], a1[mi], a2[mi], a3[mi],
+                        b0, b1,
+                        acc[mi * NT + ni],
+                        asc[mi], bsc,
+                    )
+                    acc[mi * NT + ni] = SIMD[DType.float32, 4](
+                        r[0], r[1], r[2], r[3]
+                    )
+        barrier()
+        s += 1
+
+    # d[0],d[1] to sasiadujace kolumny 2q i 2q+1, wiec ida JEDNYM zapisem
+    # 8-bajtowym: osiem pasow o tym samym wierszu pokrywa wtedy 32 bajty
+    # ciagiem, zamiast czterech rozrzuconych zapisow po 4 bajty.
+    comptime for mi in range(MT):
+        comptime for ni in range(NT):
+            d = acc[mi * NT + ni]
+            row = m0 + warp_m + mi * 16 + g
+            col = n0 + warp_n + ni * 8 + 2 * q
+            (y + row * N + col).store[width=2, alignment = 2 * size_of[OUT]()](
+                SIMD[DType.float32, 2](d[0], d[1]).cast[OUT]()
+            )
+            (y + (row + 8) * N + col).store[
+                width=2, alignment = 2 * size_of[OUT]()
+            ](SIMD[DType.float32, 2](d[2], d[3]).cast[OUT]())
 
 
 def _e2m1(code: Int) -> Float32:
@@ -148,7 +370,11 @@ def _ue4m3(code: Int) -> Float32:
     return value
 
 
-def _check[M: Int, N: Int, K: Int](ctx: DeviceContext) raises:
+def _check[
+    M: Int, N: Int, K: Int,
+    BM: Int = 128, BN: Int = 256, KC: Int = 1, NW: Int = 8, WM: Int = 2,
+    GM: Int = 8, NS: Int = 2,
+](ctx: DeviceContext, tiled: Bool) raises:
     """Maly ksztalt liczony rownolegle na GPU i szeregowo na CPU."""
     comptime A_U32 = M * K // 8
     comptime B_U32 = N * K // 8
@@ -205,11 +431,21 @@ def _check[M: Int, N: Int, K: Int](ctx: DeviceContext) raises:
                 packed |= UInt32(sb_code[i * 4 + j]) << UInt32(8 * j)
             v[i] = packed
 
-    ctx.enqueue_function[gemm_nvfp4[N, K]](
-        y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
-        b.unsafe_ptr(), sb.unsafe_ptr(),
-        grid_dim=(N // 64, M // 16), block_dim=LANES,
-    )
+    if tiled:
+        ctx.enqueue_function[
+            gemm_nvfp4_tiled[DType.float32, N, K, BM, BN, KC, NW, WM, GM, NS]
+        ](
+            y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
+            b.unsafe_ptr(), sb.unsafe_ptr(), M // BM,
+            grid_dim=(M // BM) * (N // BN), block_dim=NW * LANES,
+            shared_mem_bytes = _smem_bytes[BM, BN, KC, NS](),
+        )
+    else:
+        ctx.enqueue_function[gemm_nvfp4[DType.float32, N, K]](
+            y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
+            b.unsafe_ptr(), sb.unsafe_ptr(),
+            grid_dim=(N // 64, M // 16), block_dim=LANES,
+        )
     ctx.enqueue_copy(host, y)
     ctx.synchronize()
 
@@ -233,39 +469,67 @@ def _check[M: Int, N: Int, K: Int](ctx: DeviceContext) raises:
                         "m" + String(m) + "n" + String(n) + " oczekiwane "
                         + String(total) + ", otrzymane " + String(host[m * N + n])
                     )
+    var tag = String("kafel ") + String(BM) + "x" + String(BN) + "x" + String(
+        64 * KC
+    ) + " " + String(NW) + "w" if tiled else String("naiwny")
     if bad == 0:
         print(
-            "poprawnosc M=" + String(M) + " N=" + String(N) + " K=" + String(K)
+            tag + " M=" + String(M) + " N=" + String(N) + " K=" + String(K)
             + ": ZGADZA SIE co do bitu (" + String(M * N) + " elementow)"
         )
     else:
-        print("poprawnosc: ROZNICE", bad, "z", M * N, "| pierwsza:", first)
+        print(tag, "ROZNICE", bad, "z", M * N, "| pierwsza:", first)
 
 
-def _time[M: Int, N: Int, K: Int](ctx: DeviceContext, name: String) raises:
+def _time[
+    M: Int, N: Int, K: Int,
+    BM: Int = 128, BN: Int = 256, KC: Int = 1, NW: Int = 8, WM: Int = 2,
+    GM: Int = 8, NS: Int = 2, OUT: DType = DType.float16,
+](ctx: DeviceContext, name: String, tiled: Bool) raises:
     var a = ctx.enqueue_create_buffer[DType.uint32](M * K // 8)
     var b = ctx.enqueue_create_buffer[DType.uint32](N * K // 8)
     var sa = ctx.enqueue_create_buffer[DType.uint32](M * K // 64)
     var sb = ctx.enqueue_create_buffer[DType.uint32](N * K // 64)
-    var y = ctx.enqueue_create_buffer[DType.float32](M * N)
+    var y = ctx.enqueue_create_buffer[OUT](M * N)
 
-    for _ in range(50):
-        ctx.enqueue_function[gemm_nvfp4[N, K]](
-            y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
-            b.unsafe_ptr(), sb.unsafe_ptr(),
-            grid_dim=(N // 64, M // 16), block_dim=LANES,
-        )
+    # Bezczynne GPU siedzi na niskim zegarze — bez rozgrzewki pomiar klamie.
+    for _ in range(300):
+        if tiled:
+            ctx.enqueue_function[
+                    gemm_nvfp4_tiled[OUT, N, K, BM, BN, KC, NW, WM, GM, NS]
+                ](
+                y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
+                b.unsafe_ptr(), sb.unsafe_ptr(), M // BM,
+                grid_dim=(M // BM) * (N // BN), block_dim=NW * LANES,
+                shared_mem_bytes = _smem_bytes[BM, BN, KC, NS](),
+            )
+        else:
+            ctx.enqueue_function[gemm_nvfp4[OUT, N, K]](
+                y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
+                b.unsafe_ptr(), sb.unsafe_ptr(),
+                grid_dim=(N // 64, M // 16), block_dim=LANES,
+            )
     ctx.synchronize()
 
     var best = Float64(1.0e30)
     for _ in range(ROUNDS):
         var t0 = perf_counter_ns()
         for _ in range(ITERS):
-            ctx.enqueue_function[gemm_nvfp4[N, K]](
-                y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
-                b.unsafe_ptr(), sb.unsafe_ptr(),
-                grid_dim=(N // 64, M // 16), block_dim=LANES,
-            )
+            if tiled:
+                ctx.enqueue_function[
+                    gemm_nvfp4_tiled[OUT, N, K, BM, BN, KC, NW, WM, GM, NS]
+                ](
+                    y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
+                    b.unsafe_ptr(), sb.unsafe_ptr(), M // BM,
+                    grid_dim=(M // BM) * (N // BN), block_dim=NW * LANES,
+                    shared_mem_bytes = _smem_bytes[BM, BN, KC, NS](),
+                )
+            else:
+                ctx.enqueue_function[gemm_nvfp4[OUT, N, K]](
+                    y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
+                    b.unsafe_ptr(), sb.unsafe_ptr(),
+                    grid_dim=(N // 64, M // 16), block_dim=LANES,
+                )
         ctx.synchronize()
         var dt = Float64(perf_counter_ns() - t0) / Float64(ITERS)
         if dt < best:
@@ -276,10 +540,70 @@ def _time[M: Int, N: Int, K: Int](ctx: DeviceContext, name: String) raises:
 
 def main() raises:
     var ctx = DeviceContext()
-    _check[32, 64, 128](ctx)
-    _check[64, 128, 256](ctx)
-    _check[128, 64, 512](ctx)
+    _check[32, 64, 128](ctx, False)
+    _check[64, 128, 256](ctx, False)
+    _check[128, 64, 512](ctx, False)
+    _check[128, 256, 128](ctx, True)
+    _check[256, 256, 256](ctx, True)
+    _check[128, 128, 256, 128, 128, 2, 4, 2](ctx, True)
+    _check[128, 256, 256, 128, 256, 1, 8, 2, 8, 3](ctx, True)
+    _check[128, 256, 512, 128, 256, 1, 8, 2, 8, 4](ctx, True)
+
     print("")
-    _time[1024, 4096, 4096](ctx, "q/o     (1024x4096x4096):")
-    _time[1024, 11264, 4096](ctx, "gate/up (1024x11264x4096):")
-    _time[1024, 4096, 11264](ctx, "down    (1024x4096x11264):")
+    print("Sufit tej maszyny (bench_fp8_ceiling): 497 TFLOPS na tej instrukcji,")
+    print("222 GB/s odczytu z DRAM. Przy M=1024 wszystkie trzy ksztalty sa")
+    print("OGRANICZONE PASMEM, wiec dtype wyjscia wazy tyle co uklad kafla.")
+    print("")
+
+    print("--- naiwny (1 warp na kafel 16x64, bez smem), wyjscie f16 ---")
+    _time[1024, 4096, 4096](ctx, "q/o     :", False)
+    _time[1024, 11264, 4096](ctx, "gate/up :", False)
+    _time[1024, 4096, 11264](ctx, "down    :", False)
+
+    print("")
+    print("--- 128x256x64, 8w, potok 2 etapy (39 KiB) ---")
+    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 2](ctx, "q/o     :", True)
+    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 2](ctx, "gate/up :", True)
+    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 2](ctx, "down    :", True)
+
+    print("")
+    print("--- 128x256x64, 8w, potok 3 etapy (59 KiB) ---")
+    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 3](ctx, "q/o     :", True)
+    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 3](ctx, "gate/up :", True)
+    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 3](ctx, "down    :", True)
+
+    print("")
+    print("--- 128x256x64, 8w, potok 4 etapy (78 KiB) ---")
+    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 4](ctx, "q/o     :", True)
+    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 4](ctx, "gate/up :", True)
+    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 4](ctx, "down    :", True)
+
+    print("")
+    print("--- 128x256x128, 8w, potok 2 etapy (66 KiB) ---")
+    _time[1024, 4096, 4096, 128, 256, 2, 8, 2, 8, 2](ctx, "q/o     :", True)
+    _time[1024, 11264, 4096, 128, 256, 2, 8, 2, 8, 2](ctx, "gate/up :", True)
+    _time[1024, 4096, 11264, 128, 256, 2, 8, 2, 8, 2](ctx, "down    :", True)
+
+    print("")
+    print("--- 128x128x128, 4w, potok 3 etapy (66 KiB) ---")
+    _time[1024, 4096, 4096, 128, 128, 2, 4, 2, 8, 3](ctx, "q/o     :", True)
+    _time[1024, 11264, 4096, 128, 128, 2, 4, 2, 8, 3](ctx, "gate/up :", True)
+    _time[1024, 4096, 11264, 128, 128, 2, 4, 2, 8, 3](ctx, "down    :", True)
+
+    print("")
+    print("--- 128x128x128, 4w, potok 4 etapy (88 KiB) ---")
+    _time[1024, 4096, 4096, 128, 128, 2, 4, 2, 8, 4](ctx, "q/o     :", True)
+    _time[1024, 11264, 4096, 128, 128, 2, 4, 2, 8, 4](ctx, "gate/up :", True)
+    _time[1024, 4096, 11264, 128, 128, 2, 4, 2, 8, 4](ctx, "down    :", True)
+
+    print("")
+    print("--- 128x256x64, 8w, 3 etapy, ale wyjscie f32 (koszt pasma) ---")
+    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 3, DType.float32](
+        ctx, "q/o     :", True
+    )
+    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 3, DType.float32](
+        ctx, "gate/up :", True
+    )
+    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 3, DType.float32](
+        ctx, "down    :", True
+    )
