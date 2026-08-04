@@ -18,6 +18,7 @@ prefill: 0.039% rozpiętości, argmax 372
 krok 1:  0.013% rozpiętości, argmax 28725
 krok 2:  0.016% rozpiętości, argmax 264
 24 tokeny w 1.42 s: "Warszawa.\nWarszawa to miasto położone w środkowo-wsch"
+kafel 626 tokenów wobec 626 kroków: 0.014% rozpiętości, ten sam token
 ```
 
 Trzy odstępstwa od tego, co ten plik zakładał — wszystkie warte zapisania:

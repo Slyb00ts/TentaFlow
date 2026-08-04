@@ -114,6 +114,96 @@ fn the_cuda_executor_agrees_with_the_host_reference() {
     }
 }
 
+/// Ten sam prompt kaflem i po tokenie — długi, bo krótki niczego nie wybiera.
+///
+/// Wybór wariantu mnożenia zależy od liczby tokenów, więc test na sześciu
+/// tokenach sprawdza JEDEN kafel z kilku. Ta klasa błędu właśnie się tu
+/// zdarzyła po stronie Metalu: podział produktu z CPU wchodzi od 256 tokenów i
+/// mnożył sześciobitowe wagi samą młodszą połówką kodu, a test na siedmiu
+/// tokenach nigdy tam nie wchodził — GGUF Bielika dawał płynną, błędną
+/// polszczyznę na każdym prompcie, jaki ktokolwiek by napisał.
+///
+/// Wzorzec hostowy nie może tego pilnować, bo prefill 256 tokenów kosztuje go
+/// dwadzieścia kilka minut. Za to forma wektorowa JEST wobec niego sprawdzona,
+/// więc kafel można trzymać wobec niej: ten sam kontekst, ten sam ostatni
+/// token, dwie różne drogi.
+#[test]
+#[ignore = "wymaga karty NVIDIA i checkpointu GGUF"]
+fn the_batched_form_agrees_with_the_single_steps() {
+    let Some(path) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu GGUF");
+        return;
+    };
+    let Ok(device) = CudaDevice::new(0, pools()) else {
+        eprintln!("pomijam: brak urządzenia CUDA");
+        return;
+    };
+
+    let gguf = forge_formats::Gguf::open(&path).expect("otwarcie GGUF");
+    let vocab = forge_tokenize::gguf_vocab(&gguf).expect("słownik z GGUF");
+    let tokenizer = forge_tokenize::Tokenizer::from_gguf_vocab(&vocab).expect("tokenizator");
+    drop(gguf);
+
+    let mut model = Dense::load(&path, |spec| CudaExec::new(device.clone() as Arc<_>, spec))
+        .expect("wczytanie modelu na CUDA");
+
+    // Prawdziwy tekst, powtórzony aż przekroczy KAFEL wykonawcy. Dłuższy prompt
+    // dokłada drugą rzecz do sprawdzenia: licznik pozycji między kaflami. Kafel
+    // drugi musi zacząć tam, gdzie skończył pierwszy, a maska przyczynowa i
+    // RoPE liczą się od pozycji bezwzględnej — pomyłka o jeden kafel nie jest
+    // awarią, tylko innym tekstem.
+    let unit = tokenizer.encode(PARAGRAPH, true).expect("tokenizacja");
+    let mut prompt = unit.clone();
+    while prompt.len() <= model.max_tokens() as usize {
+        prompt.extend_from_slice(&unit[1..]);
+    }
+    assert!(
+        prompt.len() > model.max_tokens() as usize,
+        "prompt {} tokenów nie przekracza kafla {}",
+        prompt.len(),
+        model.max_tokens()
+    );
+
+    let t = std::time::Instant::now();
+    let tiled = model.prefill(&prompt).expect("prefill kaflem");
+    let tiled_logits = model.logits().expect("logity kafla");
+    eprintln!(
+        "kafel {} tokenów w {:.2} s",
+        prompt.len(),
+        t.elapsed().as_secs_f64()
+    );
+
+    model.reset();
+    let t = std::time::Instant::now();
+    let mut stepped = 0;
+    for &token in &prompt {
+        stepped = model.step_argmax(token).expect("krok");
+    }
+    let stepped_logits = model.logits().expect("logity kroków");
+    eprintln!("po tokenie w {:.2} s", t.elapsed().as_secs_f64());
+
+    let err = common::spread_error(&tiled_logits, &stepped_logits);
+    let a = common::top_k(&tiled_logits, 5);
+    let b = common::top_k(&stepped_logits, 5);
+    eprintln!("kafel wobec kroków: {:.3}% rozpiętości", err * 100.0);
+    assert_eq!(tiled, stepped, "kafel wybrał inny token niż kroki");
+    assert_eq!(a[..3], b[..3], "czołówka: kafel {a:?}, kroki {b:?}");
+    // Luźniej niż wobec wzorca: obie drogi liczą w f16, ale sumują w innej
+    // kolejności, a przy 300 tokenach kontekstu jest co sumować.
+    assert!(
+        err < 0.05,
+        "{:.3}% rozpiętości — kafel liczy co innego niż kroki",
+        err * 100.0
+    );
+}
+
+/// Akapit, którego długość jest tu jedyną istotną cechą.
+const PARAGRAPH: &str = "Warszawa jest stolicą i największym miastem Polski, \
+położonym w środkowo-wschodniej części kraju, nad Wisłą. Miasto pełni funkcję \
+ośrodka administracyjnego, gospodarczego i kulturalnego, a jego historia sięga \
+średniowiecza. W czasie drugiej wojny światowej zabudowa została zniszczona \
+niemal doszczętnie i odbudowana w kolejnych dekadach.";
+
 /// Wynik ma być JĘZYKIEM.
 ///
 /// Zgodność ze wzorcem mówi, że oba liczą to samo, ale nie mówi, że to samo
