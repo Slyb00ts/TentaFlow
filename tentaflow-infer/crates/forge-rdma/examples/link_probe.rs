@@ -57,6 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // i "opoznienie" wychodzi zerowe.
     const TO_B: u64 = 0;
     const TO_A: u64 = 4096;
+    // Strumien przepustowosci leci OBOK skrzynek: 64 MiB zapisane spod zera
+    // przykryloby licznik sasiada razem z wartownikiem konca.
+    const BULK: u64 = 8 << 20;
+    const DONE: u64 = u64::MAX;
     let (inbox, outbox) = if listen { (TO_B, TO_A) } else { (TO_A, TO_B) };
 
     let base = buf.as_mut_ptr();
@@ -83,7 +87,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             link.write(outbox, PING, 1, true)?;
             link.wait(1)?;
         }
-        println!("odbicia zakonczone");
+        // Kolejka musi zyc przez caly pomiar przepustowosci: RDMA WRITE nie
+        // budzi zdalnego CPU, ale pisze do ISTNIEJACEGO QP. Wyjscie tutaj
+        // zrywalo polaczenie i klient dostawal RETRY_EXC_ERR.
+        println!("odbicia zakonczone, trzymam kolejke do konca pomiaru");
+        while recv() != DONE {
+            std::hint::spin_loop();
+        }
+        println!("wartownik konca odebrany");
     } else {
         // Rozgrzewka, potem pomiar opoznienia tam i z powrotem.
         for i in 1..=64u64 {
@@ -116,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut outstanding = 0;
             for i in 0..iters {
                 let sig = i % 32 == 31;
-                link.write(outbox, len as u32, i as u64, sig)?;
+                link.write(BULK, len as u32, i as u64, sig)?;
                 if sig {
                     outstanding += 1;
                     if outstanding >= 4 {
@@ -130,6 +141,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let gb = (iters * len) as f64 / 1e9;
             println!("zapis {mb:3} MiB: {:.1} GB/s", gb / secs);
         }
+        send(DONE);
+        link.write(outbox, 8, 99, true)?;
+        link.wait(1)?;
     }
     Ok(())
 }
