@@ -28,7 +28,7 @@ use forge_kernels::variant::{
 };
 use forge_types::{DType, ForgeError, MemKind, Result};
 
-use crate::cpu_matmul::{CpuMatmul, Operands};
+use forge_kernels::cpu_matmul::{CpuMatmul, Operands};
 use crate::exec::{Act, WeightId};
 
 /// Prompt tokens carried through the layers in one pass.
@@ -84,20 +84,6 @@ struct Quantized {
     group: u32,
     rows: u32,
     cols: u32,
-}
-
-struct Layer {
-    attn_norm: DevBuffer,
-    q: Quantized,
-    k: Quantized,
-    v: Quantized,
-    o: Quantized,
-    ffn_norm: DevBuffer,
-    gate: Quantized,
-    up: Quantized,
-    down: Quantized,
-    k_cache: DevBuffer,
-    v_cache: DevBuffer,
 }
 
 /// Cztery warianty jednej rodziny kerneli.
@@ -442,11 +428,11 @@ impl MlxDense {
         // Wagi trafiają do wykonawcy, model dostaje indeksy. To jest cała
         // różnica między opisem architektury a modelem dla tej karty.
         let mut weights: Vec<Weight> = Vec::new();
-        let mut put_q = |w: Quantized, out: &mut Vec<Weight>| {
+        let put_q = |w: Quantized, out: &mut Vec<Weight>| {
             out.push(Weight::Quant(w));
             WeightId(out.len() as u32 - 1)
         };
-        let mut put_p = |b: DevBuffer, out: &mut Vec<Weight>| {
+        let put_p = |b: DevBuffer, out: &mut Vec<Weight>| {
             out.push(Weight::Plain(b));
             WeightId(out.len() as u32 - 1)
         };

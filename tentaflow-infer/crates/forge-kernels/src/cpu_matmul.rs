@@ -1,5 +1,10 @@
 // ===== File: cpu_matmul.rs — the CPU's share of a prefill matrix product =====
 //
+// Lives with the kernels because it IS one: the same product, computed by the
+// other unit on the same chip. Which unit runs a piece of work is exactly the
+// question this crate exists to answer, and exactly the question the layer
+// above must not be asked.
+//
 // Prefill leaves the GPU at 77% of its matrix ceiling (3,02 of 3,94 TFLOPS) and
 // barely touches memory, because it reads each weight once per tile instead of
 // once per token. That is the one condition under which a second compute unit
