@@ -42,13 +42,15 @@ from std.sys import _RegisterPackType, size_of
 from std.time import perf_counter_ns
 
 comptime LANES = 32
+# Odstep wiersza kafla w u32: 8*KC kodow + SMEM_PAD.
+comptime SMEM_PAD = 4
 comptime ROUNDS = 5
 comptime ITERS = 10
 
 
 def _smem_bytes[BM: Int, BN: Int, KC: Int, NS: Int]() -> Int:
     """Bajty pamieci wspoldzielonej kafla: kody + skale, razy glebokosc potoku."""
-    return 4 * NS * ((BM + BN) * (8 * KC + 4) + (BM + BN) * KC)
+    return 4 * NS * ((BM + BN) * (8 * KC + SMEM_PAD) + (BM + BN) * KC)
 
 
 def mma_nvfp4(
@@ -216,7 +218,7 @@ def gemm_nvfp4_tiled[
     kazdego kolejnego — to na tej maszynie kosztuje wielokrotnosc, bo 273 GB/s
     LPDDR5X jest tu ograniczeniem, nie tensor core.
     """
-    comptime LDA = 8 * KC + 4
+    comptime LDA = 8 * KC + SMEM_PAD
     comptime ATILE = BM * LDA
     comptime BTILE = BN * LDA
     comptime SATILE = BM * KC
@@ -275,62 +277,114 @@ def gemm_nvfp4_tiled[
         fill=SIMD[DType.float32, 4](0.0)
     )
 
-    # NS-1 etapow w locie zanim wejdziemy w petle; potem kazdy obrot dorzuca
-    # jeden. Grupa jest zatwierdzana ZAWSZE, takze pusta w ogonie — dzieki temu
-    # numer grupy zawsze rowna sie numerowi etapu i `wait_group(NS-1)` czeka
-    # dokladnie na etap `s`, bez rozgalezienia w petli.
+    # Fragmenty leza w DWOCH kompletach rejestrow: zanim pojdzie `mma` kroku k,
+    # `ldmatrix` kroku k+1 jest juz wystawiony do drugiego kompletu. Bez tego
+    # opoznienie `ldmatrix` stoi odsloniete na poczatku kazdego etapu, a przy
+    # 1 CTA na SM nie ma innych warpow, ktore by je zaslonily.
+    # Podwojnie buforowane sa TYLKO kody. Skale zostaja w pamieci wspoldzielonej
+    # i sa czytane dopiero przy `mma`: to odczyty rozgloszeniowe (cala czworka
+    # pasow bierze ten sam adres), a trzymanie ich w drugim komplecie kosztowalo
+    # 2*(MT+NT) rejestrow i wpychalo jadro w spille przy 255.
+    var af = InlineArray[SIMD[DType.uint32, 4], 2 * MT](uninitialized=True)
+    var bf = InlineArray[SIMD[DType.uint32, 2], 2 * NT](uninitialized=True)
+
     comptime for i in range(NS - 1):
         _stage[BM, KC, NTHR, LDA](i, i, tid, m0, A_ROW, S_ROW, a, sa, a_sm, sa_sm)
         _stage[BN, KC, NTHR, LDA](i, i, tid, n0, A_ROW, S_ROW, b, sb, b_sm, sb_sm)
         async_copy_commit_group()
+    async_copy_wait_group(Int32(NS - 2))
+    barrier()
 
+    comptime for mi in range(MT):
+        af[mi] = bitcast[DType.uint32, 4](
+            ld_matrix[8](a_f16 + 2 * (mi * 16 * LDA) + a_frag)
+        )
+    comptime for ni in range(NT):
+        bf[ni] = bitcast[DType.uint32, 2](
+            ld_matrix[4](b_f16 + 2 * (ni * 8 * LDA) + b_frag)
+        )
+
+    # Etapy ida PARAMI, zeby parzystosc kompletu rejestrow (`cur`) byla stala
+    # w czasie kompilacji takze dla nieparzystego KC. Indeks kompletu liczony
+    # z `s` w czasie wykonania zepchnalby fragmenty do pamieci lokalnej.
     var s = 0
     while s < STAGES:
-        nxt = s + NS - 1
-        if nxt < STAGES:
-            nbuf = nxt % NS
-            _stage[BM, KC, NTHR, LDA](
-                nxt, nbuf, tid, m0, A_ROW, S_ROW, a, sa, a_sm, sa_sm
-            )
-            _stage[BN, KC, NTHR, LDA](
-                nxt, nbuf, tid, n0, A_ROW, S_ROW, b, sb, b_sm, sb_sm
-            )
-        async_copy_commit_group()
-        async_copy_wait_group(Int32(NS - 1))
-        barrier()
-
-        buf = s % NS
-        comptime for c in range(KC):
-            var af = InlineArray[SIMD[DType.uint32, 4], MT](uninitialized=True)
-            var asc = InlineArray[UInt32, MT](uninitialized=True)
-            comptime for mi in range(MT):
-                af[mi] = bitcast[DType.uint32, 4](
-                    ld_matrix[8](
-                        a_f16 + 2 * (buf * ATILE + mi * 16 * LDA + 8 * c) + a_frag
-                    )
-                )
-                asc[mi] = sa_sm[
-                    buf * SATILE + (warp_m + mi * 16 + g + s_off) * KC + c
-                ]
-            comptime for ni in range(NT):
-                bf = bitcast[DType.uint32, 2](
-                    ld_matrix[4](
-                        b_f16 + 2 * (buf * BTILE + ni * 8 * LDA + 8 * c) + b_frag
-                    )
-                )
-                bsc = sb_sm[buf * SBTILE + (warp_n + ni * 8 + g) * KC + c]
+        comptime for half in range(2):
+            st = s + half
+            buf = st % NS
+            comptime for c in range(KC):
+                comptime cur = (half * KC + c) % 2
+                comptime nx = 1 - cur
+                # Skale MUSZA byc odczytane ZANIM ponizej ruszy `cp.async`
+                # nadpisujacy bufor (st-1) % NS: bariera konczaca poprzedni etap
+                # ogradza tylko to, co przed nia. Odczyt przy `mma` — juz za
+                # bariera tego etapu — scigalby sie z tym zapisem.
+                var ascv = InlineArray[UInt32, MT](uninitialized=True)
+                var bscv = InlineArray[UInt32, NT](uninitialized=True)
                 comptime for mi in range(MT):
-                    var r = mma_nvfp4(
-                        af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                        bf[0], bf[1],
-                        acc[mi * NT + ni],
-                        asc[mi], bsc,
+                    ascv[mi] = sa_sm[
+                        buf * SATILE + (warp_m + mi * 16 + g + s_off) * KC + c
+                    ]
+                comptime for ni in range(NT):
+                    bscv[ni] = sb_sm[
+                        buf * SBTILE + (warp_n + ni * 8 + g) * KC + c
+                    ]
+
+                var nbuf = buf
+                var nc = c + 1
+
+                comptime if c + 1 == KC:
+                    # Ostatni krok K etapu: dopiero TERAZ wolno pisac do bufora
+                    # (st-1) % NS, bo bariera konczaca poprzedni etap juz
+                    # zagwarantowala, ze nikt go nie czyta. Stad JEDNA bariera
+                    # na etap, nie dwie.
+                    nxt = st + NS - 1
+                    if nxt < STAGES:
+                        _stage[BM, KC, NTHR, LDA](
+                            nxt, nxt % NS, tid, m0, A_ROW, S_ROW,
+                            a, sa, a_sm, sa_sm,
+                        )
+                        _stage[BN, KC, NTHR, LDA](
+                            nxt, nxt % NS, tid, n0, A_ROW, S_ROW,
+                            b, sb, b_sm, sb_sm,
+                        )
+                    async_copy_commit_group()
+                    nc = 0
+                    if st + 1 < STAGES:
+                        nbuf = (st + 1) % NS
+                        async_copy_wait_group(Int32(NS - 2))
+                        barrier()
+
+                comptime for mi in range(MT):
+                    af[nx * MT + mi] = bitcast[DType.uint32, 4](
+                        ld_matrix[8](
+                            a_f16
+                            + 2 * (nbuf * ATILE + mi * 16 * LDA + 8 * nc)
+                            + a_frag
+                        )
                     )
-                    acc[mi * NT + ni] = SIMD[DType.float32, 4](
-                        r[0], r[1], r[2], r[3]
+                comptime for ni in range(NT):
+                    bf[nx * NT + ni] = bitcast[DType.uint32, 2](
+                        ld_matrix[4](
+                            b_f16
+                            + 2 * (nbuf * BTILE + ni * 8 * LDA + 8 * nc)
+                            + b_frag
+                        )
                     )
-        barrier()
-        s += 1
+
+                comptime for ni in range(NT):
+                    comptime for mi in range(MT):
+                        var r = mma_nvfp4(
+                            af[cur * MT + mi][0], af[cur * MT + mi][1],
+                            af[cur * MT + mi][2], af[cur * MT + mi][3],
+                            bf[cur * NT + ni][0], bf[cur * NT + ni][1],
+                            acc[mi * NT + ni],
+                            ascv[mi], bscv[ni],
+                        )
+                        acc[mi * NT + ni] = SIMD[DType.float32, 4](
+                            r[0], r[1], r[2], r[3]
+                        )
+        s += 2
 
     # d[0],d[1] to sasiadujace kolumny 2q i 2q+1, wiec ida JEDNYM zapisem
     # 8-bajtowym: osiem pasow o tym samym wierszu pokrywa wtedy 32 bajty

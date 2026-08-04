@@ -572,10 +572,58 @@ Czego NIE robic (zmierzone, bez zysku):
 - **Nie ma jednego najlepszego kafla.** q/o i gate/up wola 128x128x128 na 4
   warpach, down wola 128x256x64 na 8 warpach. Roznica ~8%.
 
-Gdzie lezy reszta luki: ksztalt **2048x2048x2048 miesci sie caly w L2** (13 MiB),
-a mimo to daje **150 TFLOPS, czyli 30% sufitu** — DRAM nie jest wiec ograniczeniem
-petli wewnetrznej. `ptxas` melduje 185-234 rejestrow i **zero spilli**, czyli i
-rejestry nie sa wina. To ta sama sciana co udokumentowana wyzej dla int8 i FP8:
-ten sam uklad kernela `nvcc`/`ptxas` planuje do ~90% sufitu, backend Mojo do
-30-40%. Na duzych ksztaltach jestesmy przy 39-46% roofline'u (osobno liczonego
-dla pasma i dla obliczen), co jest gorna czescia tego pasma.
+### Podwojne buforowanie fragmentow w rejestrach i JEDNA bariera na etap
+
+**Wczesniejszy wniosek w tym pliku — ze reszta luki to sciana codegenu Mojo — byl
+BLEDNY i zostal wycofany.** Powstal z porownania do wlasnego zlego kodu. Lektura
+`src/modular_i8/multistage_i8.mojo` (wendorowana kopia jadra Modulara) pokazala
+trzy konkretne bledy w naszej petli:
+
+1. **Opoznienie `ldmatrix` stalo odsloniete.** Nasza petla to bylo
+   `bariera -> ldmatrix -> mma -> bariera`, czyli 12 ladowan i dopiero potem 32
+   `mma`, z pelna zaleznoscia miedzy nimi. Przy 1 CTA na SM nie ma innych warpow,
+   ktore by to zaslonily. Modular trzyma fragmenty w DWOCH kompletach rejestrow
+   (`a_reg_tiles[next]`, `num_reg_tiles = 2 * k_group_size`) i wystawia
+   `ldmatrix` kroku k+1 PRZED `mma` kroku k.
+2. **Dwie bariery na etap zamiast jednej.** Wystawialismy `cp.async` PRZED bariera
+   etapu, wiec zapis scigal sie z odczytami poprzedniego etapu i trzeba bylo
+   bariery zamykajacej. Modular wystawia prefetch W SRODKU petli po k, juz za
+   bariera — wtedy bufor `(s-1) % NS` jest z definicji wolny i wystarczy JEDNA.
+3. Przy okazji: `wait_group` liczy sie inaczej w tej strukturze — `NS-2`, nie
+   `NS-1`, i przy `NS=2` nie ma juz zadnego nakladania, wiec **NS=3 jest teraz
+   ustawieniem domyslnym**, a nie NS=2.
+
+PULAPKA, ktora to wprowadzilo (zlapana testem na rownosc co do bitu): skale nie
+moga byc czytane z pamieci wspoldzielonej dopiero przy `mma`. Bariera etapu
+ogradza tylko to, co przed nia, a `cp.async` nadpisujacy bufor `(s-1) % NS`
+rusza zaraz po niej — odczyt skal za bariera scigal sie z tym zapisem
+(512 blednych elementow na 65536). Skale czyta sie na POCZATKU kroku K, przed
+awansem potoku. Trzymanie ich w drugim komplecie rejestrow tez dziala, ale
+kosztuje `2*(MT+NT)` rejestrow i wpycha jadro w spille przy 255.
+
+Wynik (128x256x64, 8 warpow, potok 3 etapy, wyjscie f16):
+
+| | q/o | gate/up | down | 2048^3 w L2 |
+|---|--:|--:|--:|--:|
+| przed | 196,6 us | 500,7 us | 484,2 us | 118,8 us |
+| po | **183,6** | **506,7** | **462,9** | **108,6** |
+
+`ptxas`: 230-254 rejestrow, zero spilli. Ksztalt L2-rezydentny poprawil sie o 9%,
+czyli poprawa jest w samej petli, nie w ruchu pamieci.
+
+### Co zostalo niezrobione: swizzle zamiast wypelnienia
+
+`LDA = 8*KC + SMEM_PAD` jest bezkonfliktowy dla ODCZYTU `ldmatrix` (osiem
+wierszy po 16 B trafia w 32 rozne banki), ale **nie dla ZAPISU `cp.async`**:
+adres `(tid/2)*LDA + (tid%2)*4` przy LDA=12 daje kilkudrozne kolizje. Wiekszego
+wypelnienia nie da sie tu uzyc — LDA=20 przekracza limit pamieci wspoldzielonej
+przy NS=4. Wlasciwe rozwiazanie to XOR-swizzle (`layout.swizzle`,
+`make_ldmatrix_swizzle`), ktory naprawia obie strony I ZMNIEJSZA zajetosc
+(LDA=8*KC bez wypelnienia). Warunek: wiersz musi miec 128 B, czyli **KC=4**
+(przy KC=1 wiersz ma 32 B, osiem wierszy to 256 B i dwudrozna kolizja zostaje
+niezaleznie od permutacji). Przy KC=4, `chunk ^ (r % 8)` rozklada osiem wierszy
+na wszystkie 32 banki.
+
+Stan na dzis: 187-204 TFLOPS przy suficie 497, czyli 38-41%. Wlasne jadro FP8
+Modulara na tej samej maszynie osiaga 60% swojego sufitu, wiec zapas nadal jest
+i NIE jest to ograniczenie jezyka.
