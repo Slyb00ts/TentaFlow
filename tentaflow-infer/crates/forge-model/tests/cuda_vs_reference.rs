@@ -43,6 +43,20 @@ fn checkpoint() -> Option<PathBuf> {
         .find(|p| p.extension().is_some_and(|e| e == "gguf"))
 }
 
+/// The card, or nothing — and the difference between "nothing" and "busy".
+///
+/// A test that skips when the device fails to open reports a pass for a machine
+/// whose card was merely taken by the previous run. So the two cases are told
+/// apart: no CUDA at all is a skip, a CUDA that refuses the pools is a failure
+/// with the reason attached.
+fn device() -> Option<Arc<CudaDevice>> {
+    if CudaDevice::free_vram(0).is_err() {
+        eprintln!("pomijam: brak urządzenia CUDA");
+        return None;
+    }
+    Some(CudaDevice::new(0, pools()).expect("karta jest, a nie oddała pul"))
+}
+
 /// Pools claimed for this test.
 ///
 /// Explicit rather than `with_default_pools`, which takes 90% of free VRAM: on
@@ -76,10 +90,7 @@ fn the_cuda_executor_agrees_with_the_host_reference() {
         eprintln!("pomijam: brak checkpointu GGUF");
         return;
     };
-    let Ok(device) = CudaDevice::new(0, pools()) else {
-        eprintln!("pomijam: brak urządzenia CUDA");
-        return;
-    };
+    let Some(device) = device() else { return };
 
     let t = std::time::Instant::now();
     let mut gpu = Dense::load(&path, |spec| CudaExec::new(device.clone() as Arc<_>, spec))
@@ -138,10 +149,7 @@ fn the_batched_form_agrees_with_the_single_steps() {
         eprintln!("pomijam: brak checkpointu GGUF");
         return;
     };
-    let Ok(device) = CudaDevice::new(0, pools()) else {
-        eprintln!("pomijam: brak urządzenia CUDA");
-        return;
-    };
+    let Some(device) = device() else { return };
 
     let gguf = forge_formats::Gguf::open(&path).expect("otwarcie GGUF");
     let vocab = forge_tokenize::gguf_vocab(&gguf).expect("słownik z GGUF");
@@ -298,10 +306,7 @@ fn cuda_lanes_match_solo_runs() {
         eprintln!("pomijam: brak checkpointu GGUF");
         return;
     };
-    let Ok(device) = CudaDevice::new(0, pools()) else {
-        eprintln!("pomijam: brak urządzenia CUDA");
-        return;
-    };
+    let Some(device) = device() else { return };
     let mut model = Dense::load(&path, |spec| CudaExec::new(device.clone() as Arc<_>, spec))
         .expect("wczytanie modelu na CUDA");
     assert!(model.max_lanes() >= 4, "wykonawca trzyma za mało lane'ów");
@@ -388,10 +393,7 @@ fn the_cuda_executor_continues_a_polish_prompt() {
         eprintln!("pomijam: brak checkpointu GGUF");
         return;
     };
-    let Ok(device) = CudaDevice::new(0, pools()) else {
-        eprintln!("pomijam: brak urządzenia CUDA");
-        return;
-    };
+    let Some(device) = device() else { return };
 
     let gguf = forge_formats::Gguf::open(&path).expect("otwarcie GGUF");
     let vocab = forge_tokenize::gguf_vocab(&gguf).expect("słownik z GGUF");

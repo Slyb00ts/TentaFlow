@@ -230,15 +230,21 @@ ma, silnik chudnie, a produkcja przechodzi DOPIERO po zrównaniu w pomiarze.
 
 Kolejność, w której każdy krok odblokowuje następny:
 
-1. **Wspólna warstwa stanu.** ZACZĘTE: `forge-state` istnieje i trzyma
-   stronicowane KV oraz drzewo radix, oba wyjęte z `forge-engine` bez zmiany
-   ani jednej linii logiki. Zostaje druga połowa — żeby `CudaExec` używał tego
-   zamiast własnego stronicowania, które musiało powstać, dopóki tamto należało
-   do jednej ścieżki. Admission i continuous batching (`server.rs`) idą tą samą
-   drogą: też nie zależą od tego, jak model liczy warstwę, tylko od stron i
-   tokenów. Na Apple wspólne stronicowanie wymaga stronicowanych wariantów
-   dwóch kerneli MSL, bo `MetalExec` trzyma dziś cache jako jedną ciągłą połać
-   na warstwę.
+1. **Wspólna warstwa stanu.** ZROBIONE dla KV: `forge-state` trzyma stronicowany
+   cache i drzewo radix, oba wyjęte z `forge-engine` bez zmiany ani jednej linii
+   logiki, a `CudaExec` porzucił własne stronicowanie na ich rzecz — te same
+   slaby, te same identyfikatory stron, ta sama arytmetyka (0,019% prefillu i
+   0,572% kroku wobec wzorca, bez zmiany po przesiadce). Zostaje admission i
+   continuous batching (`server.rs`), które idą tą samą drogą: też nie zależą od
+   tego, jak model liczy warstwę, tylko od stron i tokenów. Na Apple wspólne
+   stronicowanie wymaga stronicowanych wariantów dwóch kerneli MSL, bo
+   `MetalExec` trzyma dziś cache jako jedną ciągłą połać na warstwę i deklaruje
+   przez to jeden lane.
+
+   Przesiadka pokazała jedną rzecz wartą zapisania: `KvCache::grow` liczy tokeny
+   PRZYROSTOWO, a mapowanie stron woła się raz na warstwę — czterdzieści razy na
+   krok. Ręczna wersja była idempotentna przypadkiem, wspólna musi być celowo, i
+   jest na to asercja, która sama powiedziała, co się stało.
 2. **Fuzja jako pass** (§7.3 `ZADANIE_CUDA_EXECUTOR.md`). Nowa ścieżka wykonuje
    szesnaście uruchomień na warstwę tam, gdzie scalony łańcuch silnika ma trzy.
    Dopóki tak jest, porównanie obu ścieżek mierzy narzut uruchomień, a nie

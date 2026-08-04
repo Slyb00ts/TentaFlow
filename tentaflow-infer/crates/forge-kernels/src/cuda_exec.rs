@@ -14,9 +14,10 @@
 //     the executor's exactly so that both can be right.
 //   * The KV cache is PAGED, and the model does not know it. `KvAppend` and
 //     `Attention` name a layer and a lane; where that lane's context physically
-//     sits is answered here, by a free list and a page table. That is the
-//     question step 2 of docs/ZADANIE_CUDA_EXECUTOR.md asks, and the answer is
-//     yes: paging needs nothing from the vocabulary.
+//     sits is answered by `forge-state` — the SAME paged cache the engine uses,
+//     not a second one written for this side. That is the question step 2 of
+//     docs/ZADANIE_CUDA_EXECUTOR.md asks, and the answer is yes: paging needs
+//     nothing from the vocabulary, and it needs only one implementation.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use half::f16;
 use forge_formats::FfnActivation;
 use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Step, Tile, WeightId, WeightStore};
 use forge_hal::{DevBuffer, Device, Pool, Stream};
+use forge_state::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
 use crate::launchers::{Kernels, SAMPLE_SCRATCH_PAIRS};
@@ -105,19 +107,6 @@ struct Scratch {
     sample_idx: DevBuffer,
 }
 
-/// Which pages hold which sequence.
-///
-/// The free list is the reason this is paging and not an array of slabs: a lane
-/// takes a page only when it fills the last one, so the budget is spent on what
-/// the sequences actually reached rather than on what they might reach.
-struct Pages {
-    free: Vec<u32>,
-    /// Pages of each slot, in context order.
-    held: Vec<Vec<u32>>,
-    /// Pages one slot may hold — the page-table width the kernels are told.
-    per_lane: usize,
-}
-
 /// The dense vocabulary on a CUDA device.
 pub struct CudaExec {
     device: Arc<dyn Device>,
@@ -126,8 +115,9 @@ pub struct CudaExec {
     weights: Vec<Weight>,
     /// Key and value per layer, `[strona][głowica KV][pozycja][wymiar]` f16 —
     /// the layout every paged kernel in the catalogue reads.
-    kv: Vec<(DevBuffer, DevBuffer)>,
-    pages: RefCell<Pages>,
+    kv: RefCell<KvCache>,
+    /// One slot's page table and length, owned by the shared cache's types.
+    seqs: RefCell<Vec<SeqKv>>,
     scratch: Scratch,
     /// Kopie tego, co stoi w buforach sterujących na urządzeniu. Patrz
     /// `stage_i32` — bez nich każdy zapis byłby wyścigiem z tym, co już stoi w
@@ -196,26 +186,28 @@ impl CudaExec {
         };
 
         let page_bytes = (shape.kv_heads * PAGE * shape.head_dim) as usize * 2;
-        let pages = page_budget(&*device, page_bytes, shape.layers as usize, per_lane)?;
-        let mut kv = Vec::with_capacity(shape.layers as usize);
-        for _ in 0..shape.layers {
-            kv.push((
-                device.alloc(pages * page_bytes, MemKind::Device, Pool::KvCache)?,
-                device.alloc(pages * page_bytes, MemKind::Device, Pool::KvCache)?,
-            ));
-        }
+        let cfg = KvConfig {
+            n_layers: shape.layers as usize,
+            n_kv_heads: shape.kv_heads as usize,
+            head_dim: shape.head_dim as usize,
+            page_size: PAGE as usize,
+            n_pages: page_budget(&*device, page_bytes, shape.layers as usize, per_lane)?,
+            max_pages_per_seq: per_lane,
+            // Pełna wierność. Kwantyzacja KV jest w tym cache'u od dawna i to
+            // jest właśnie powód, dla którego ten wykonawca go bierze zamiast
+            // hodować własny — ale włączenie jej to osobny pomiar jakości.
+            quant: KvQuant::F16,
+        };
+        let kv = KvCache::new(&*device, cfg)?;
+        let seqs = (0..MAX_LANES).map(|_| kv.new_seq()).collect();
 
         Ok(Self {
             device,
             kernels,
             stream,
             weights: Vec::new(),
-            kv,
-            pages: RefCell::new(Pages {
-                free: (0..pages as u32).rev().collect(),
-                held: vec![Vec::new(); MAX_LANES as usize],
-                per_lane,
-            }),
+            kv: RefCell::new(kv),
+            seqs: RefCell::new(seqs),
             scratch,
             staged: std::array::from_fn(|_| RefCell::new(Vec::new())),
             shape,
@@ -541,45 +533,52 @@ impl CudaExec {
     /// this sequence" and inventing one for a case the data already states
     /// would be a wider contract bought for nothing.
     fn map_pages(&self, step: &Step) -> Result<()> {
-        let mut pages = self.pages.borrow_mut();
-        let per_lane = pages.per_lane;
+        let mut kv = self.kv.borrow_mut();
+        let mut seqs = self.seqs.borrow_mut();
+        let per_lane = kv.cfg.max_pages_per_seq;
         for lane in step.lanes() {
-            let slot = lane.slot as usize;
-            let need = (lane.pos + step.tokens()).div_ceil(PAGE) as usize;
-            // Oddaje się WYŁĄCZNIE nadmiar, i tylko sekwencji zaczynającej od
-            // zera. Oddanie wszystkiego i wzięcie z powrotem dałoby ten sam
-            // wynik tylko dopóki lista wolnych stron jest stosem — a ta sama
-            // operacja wykonuje się czterdzieści razy na krok, raz na warstwę,
-            // więc strona przesunięta pod inny lane w połowie kroku byłaby
-            // cudzym kontekstem w odpowiedzi.
-            if lane.pos == 0 && pages.held[slot].len() > need {
-                let extra = pages.held[slot].split_off(need);
-                pages.free.extend(extra);
+            let seq = &mut seqs[lane.slot as usize];
+            let target = (lane.pos + step.tokens()) as usize;
+            // IDEMPOTENTNIE, bo to woła się raz na warstwę — czterdzieści razy
+            // na krok. `KvCache::grow` liczy tokeny przyrostowo, więc pętla po
+            // `tokens` rosłaby czterdziestokrotnie i sekwencja odjechałaby od
+            // pozycji, którą model jej przypisał.
+            if seq.len == target {
+                continue;
             }
-            while pages.held[slot].len() < need {
-                let page = pages.free.pop().ok_or_else(|| ForgeError::OutOfMemory {
-                    requested: need,
-                    available: pages.held[slot].len(),
-                })?;
-                pages.held[slot].push(page);
+            // Pozycja zero to sekwencja zaczynająca się od nowa, więc oddaje
+            // strony, których nowa długość nie potrzebuje. Wywnioskowane z
+            // danych, bo słownictwo nie ma czasownika „zapomnij tę sekwencję",
+            // a wymyślanie go dla przypadku, który dane już mówią, byłoby
+            // szerszym kontraktem kupionym za nic.
+            if lane.pos == 0 {
+                kv.rollback(seq, 0);
+            } else if seq.len != lane.pos as usize {
+                return Err(ForgeError::Other(format!(
+                    "slot {} stoi na {} tokenach, a krok wznawia od {}",
+                    lane.slot, seq.len, lane.pos
+                )));
+            }
+            while seq.len < target {
+                kv.grow(seq)?;
             }
         }
         // Tablica idzie w KOLEJNOŚCI LANE'ÓW kroku, nie slotów: kernele
         // adresują ją tym samym indeksem, którym adresują wiersze aktywacji.
         let mut table = vec![0i32; step.lanes().len() * per_lane];
         for (i, lane) in step.lanes().iter().enumerate() {
-            for (p, &page) in pages.held[lane.slot as usize].iter().enumerate() {
-                table[i * per_lane + p] = page as i32;
-            }
+            let held = &seqs[lane.slot as usize].pages;
+            table[i * per_lane..i * per_lane + held.len()].copy_from_slice(held);
         }
-        drop(pages);
+        drop(seqs);
+        drop(kv);
         self.stage_i32(&self.scratch.pages, STAGE_PAGES, table)
     }
 
     /// Pages one lane holds, as a table of its own — that is what the
     /// single-sequence prefill kernel takes.
     fn lane_pages(&self, lane: usize) -> Result<DevBuffer> {
-        let per_lane = self.pages.borrow().per_lane;
+        let per_lane = self.kv.borrow().cfg.max_pages_per_seq;
         self.device
             .sub_buffer(&self.scratch.pages, lane * per_lane * 4, per_lane * 4)
     }
@@ -646,14 +645,17 @@ impl CudaExec {
     /// Klucz i wartość kroku na swoje strony w cache'u warstwy.
     fn op_kv_append(&self, layer: usize, step: &Step) -> Result<()> {
         let s = self.shape;
-        let (kc, vc) = self.layer_kv(layer)?;
         self.map_pages(step)?;
         self.stage_i32(
             &self.scratch.bases,
             STAGE_BASES,
             step.lanes().iter().map(|l| l.pos as i32).collect(),
         )?;
-        let per_lane = self.pages.borrow().per_lane;
+        // Uchwyt cache'u żyje do końca uruchomienia, bo kernel czyta jego
+        // bufory; `map_pages` skończyło swoje zapożyczenie wyżej.
+        let kv = self.kv.borrow();
+        let per_lane = kv.cfg.max_pages_per_seq;
+        let (kc, vc) = layer_slabs(&kv, layer)?;
         self.kernels.kv_append_batch_segmented_f16(
             kc,
             vc,
@@ -680,8 +682,9 @@ impl CudaExec {
     /// przyczynową.
     fn op_attention(&self, layer: usize, step: &Step) -> Result<()> {
         let s = self.shape;
-        let (kc, vc) = self.layer_kv(layer)?;
-        let per_lane = self.pages.borrow().per_lane;
+        let kv = self.kv.borrow();
+        let per_lane = kv.cfg.max_pages_per_seq;
+        let (kc, vc) = layer_slabs(&kv, layer)?;
         if step.tokens() == 1 {
             self.stage_i32(
                 &self.scratch.lengths,
@@ -791,12 +794,6 @@ impl CudaExec {
         Ok(())
     }
 
-    fn layer_kv(&self, layer: usize) -> Result<(&DevBuffer, &DevBuffer)> {
-        self.kv
-            .get(layer)
-            .map(|(k, v)| (k, v))
-            .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))
-    }
 
     /// Wiersze jednego lane'a w buforze aktywacji jako własny uchwyt.
     fn lane_rows(&self, buf: &DevBuffer, lane: usize, rows: usize) -> Result<DevBuffer> {
@@ -876,6 +873,18 @@ impl CudaExec {
                 .gemm_q4_k_f16(out, &w.blocks, x, r, c, rows as usize, &self.stream)
         }
     }
+}
+
+/// Slaby K i V jednej warstwy modelu.
+///
+/// Przez mapę warstw cache'u, a nie przez indeks wprost: architektura, w której
+/// tylko część warstw ma uwagę, trzyma zwarty slab i pomyłka o ten jeden krok
+/// czytałaby cudzą warstwę.
+fn layer_slabs<'a>(kv: &'a KvCache, layer: usize) -> Result<(&'a DevBuffer, &'a DevBuffer)> {
+    let index = kv
+        .layer_index(layer)
+        .ok_or_else(|| ForgeError::Other(format!("warstwa {layer} nie ma cache'u KV")))?;
+    Ok((&kv.k[index], &kv.v[index]))
 }
 
 fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
