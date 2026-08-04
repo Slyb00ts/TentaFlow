@@ -379,7 +379,10 @@ struct BnnsNdArray {
     data_bias: f32,
 }
 
-#[link(name = "Accelerate", kind = "framework")]
+// Atrybut linkowania, nie deklaracje: `cargo check` ma przejść wszędzie, żeby
+// zmiana wspólnego kontraktu odbiła się od kompilatora także na maszynie bez
+// Apple. Budowana ta ścieżka jest wyłącznie na Apple, gdzie framework jest.
+#[cfg_attr(target_vendor = "apple", link(name = "Accelerate", kind = "framework"))]
 unsafe extern "C" {
     fn BNNSMatMul(
         trans_a: bool,

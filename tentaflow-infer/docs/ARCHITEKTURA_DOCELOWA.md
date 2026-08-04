@@ -259,3 +259,21 @@ Kolejność, w której każdy krok odblokowuje następny:
 Reguła na cały ten czas: żaden krok nie kończy się deklaracją, tylko pomiarem
 wobec wzorca hostowego (poprawność) i wobec silnika (wydajność), na tym samym
 checkpoincie.
+
+### Kontrakt zmienia się na WSZYSTKICH platformach naraz
+
+Rozszerzenie `Op` o lane'y złamało `MetalExec` i nikt tego nie zauważył, bo
+ścieżka Metalowa była zabramkowana systemem operacyjnym: jedyna maszyna, która
+by to zobaczyła, była tą jedną z Makiem. Przy trzech wykonawcach i celu „to samo
+na każdej platformie" taka dziura kosztuje tyle, ile trwa zauważenie.
+
+Dlatego `forge-kernels` ma cechę `metal-check`, która TYPUJE wykonawcę Metalowego
+wszędzie — bez backendu HAL-a i bez linkowania frameworków Apple:
+
+```bash
+cargo check -p forge-kernels --features metal-check
+```
+
+Zmiana `Op`, `Executor` albo `WeightStore` nie jest skończona, dopóki to nie
+przechodzi. Nie zastępuje budowy na Macu — kernele MSL kompilują się dopiero
+tam — ale łapie całą warstwę rustową, czyli to, co się właśnie zepsuło.

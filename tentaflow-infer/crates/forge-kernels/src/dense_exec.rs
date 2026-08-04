@@ -339,21 +339,41 @@ impl Executor for MetalExec {
     /// a nie w modelu — dzięki temu backend, który czegoś nie umie, odmawia w
     /// jednym miejscu, zamiast implementować zaślepkę.
     fn run(&self, op: &Op) -> Result<()> {
+        let step = match op {
+            Op::Embed { step, .. }
+            | Op::RmsNorm { step, .. }
+            | Op::MatMul { step, .. }
+            | Op::Rope { step, .. }
+            | Op::KvAppend { step, .. }
+            | Op::Attention { step, .. }
+            | Op::SiluMul { step }
+            | Op::Residual { step, .. }
+            | Op::LogitsOfLast { step, .. } => step,
+        };
+        // Cache jest jedną ciągłą połacią na warstwę, więc ten wykonawca trzyma
+        // JEDNĄ sekwencję i mówi to przez `Tile::max_lanes`. Krok z wieloma
+        // lane'ami odbija się TU, zamiast policzyć się nad cudzym kontekstem —
+        // stronicowanie po tej stronie to osobna praca i osobne kernele MSL.
+        let pos = match step.lanes() {
+            [lane] if lane.slot == 0 => lane.pos,
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "{} lane'ów, a ten wykonawca trzyma jeden ciągły cache",
+                    other.len()
+                )))
+            }
+        };
+        let tokens = step.tokens();
         match op {
-            Op::Embed { table, tokens } => self.op_embed(*table, tokens),
-            Op::RmsNorm { out, x, w, tokens } => self.op_rmsnorm(*out, *x, *w, *tokens),
-            Op::MatMul { out, w, x, tokens } => self.op_matmul(*out, *w, *x, *tokens),
-            Op::Rope {
-                act,
-                heads,
-                pos,
-                tokens,
-            } => self.op_rope(*act, *heads, *pos, *tokens),
-            Op::KvAppend { layer, pos, tokens } => self.op_kv_append(*layer, *pos, *tokens),
-            Op::Attention { layer, seq, tokens } => self.op_attention(*layer, *seq, *tokens),
-            Op::SiluMul { tokens } => self.op_silu_mul(*tokens),
-            Op::Residual { src, tokens } => self.op_residual(*src, *tokens),
-            Op::LogitsOfLast { w, x, tokens } => self.op_logits_of_last(*w, *x, *tokens),
+            Op::Embed { table, tokens, .. } => self.op_embed(*table, tokens),
+            Op::RmsNorm { out, x, w, .. } => self.op_rmsnorm(*out, *x, *w, tokens),
+            Op::MatMul { out, w, x, .. } => self.op_matmul(*out, *w, *x, tokens),
+            Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, pos, tokens),
+            Op::KvAppend { layer, .. } => self.op_kv_append(*layer, pos, tokens),
+            Op::Attention { layer, .. } => self.op_attention(*layer, pos + tokens, tokens),
+            Op::SiluMul { .. } => self.op_silu_mul(tokens),
+            Op::Residual { src, .. } => self.op_residual(*src, tokens),
+            Op::LogitsOfLast { w, x, .. } => self.op_logits_of_last(*w, *x, tokens),
         }
     }
 
@@ -379,7 +399,12 @@ impl Executor for MetalExec {
             .collect())
     }
 
-    fn argmax(&self, act: Act) -> Result<u32> {
+    fn argmax(&self, act: Act, lanes: usize) -> Result<Vec<u32>> {
+        if lanes != 1 {
+            return Err(ForgeError::Unsupported(format!(
+                "wybór dla {lanes} lane'ów, a ten wykonawca trzyma jeden"
+            )));
+        }
         self.launch(
             &self.pipes.argmax,
             LaunchArgs::new()
@@ -392,7 +417,7 @@ impl Executor for MetalExec {
         self.stream.synchronize()?;
         let mut raw = [0u8; 4];
         self.device.read(&self.scratch.token, 0, &mut raw)?;
-        Ok(u32::from_le_bytes(raw))
+        Ok(vec![u32::from_le_bytes(raw)])
     }
 
     fn seq_cap(&self) -> u32 {
@@ -402,6 +427,7 @@ impl Executor for MetalExec {
     fn tile(&self) -> Tile {
         Tile {
             max_tokens: PREFILL_CHUNK,
+            max_lanes: 1,
             align: msl::QMG_BM,
         }
     }

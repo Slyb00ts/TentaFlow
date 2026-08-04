@@ -102,7 +102,7 @@ fn always(_: &Problem) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Formy iloczynu macierzowego dla wag NVFP4 na CUDA.
-#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+#[cfg(not(any(feature = "metal", feature = "metal-check")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nvfp4MatmulForm {
     /// Wagi przepakowane do FP8 przy ladowaniu; GEMM czyta e4m3.
@@ -113,7 +113,7 @@ pub enum Nvfp4MatmulForm {
     DirectUnpack,
 }
 
-#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+#[cfg(not(any(feature = "metal", feature = "metal-check")))]
 pub static NVFP4_MATMUL: Registry<Nvfp4MatmulForm> = Registry {
     op: "nvfp4_matmul",
     variants: &[
@@ -142,10 +142,10 @@ pub static NVFP4_MATMUL: Registry<Nvfp4MatmulForm> = Registry {
 
 // The Metal forms live in a module so their tests sit beside them, but the
 // registry is a public interface — `dense_exec` picks its kernel through it.
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[cfg(any(feature = "metal", feature = "metal-check"))]
 pub use metal_forms::*;
 
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[cfg(any(feature = "metal", feature = "metal-check"))]
 mod metal_forms {
     use super::*;
     /// Forms of the quantized matrix product on Metal.
@@ -495,7 +495,7 @@ mod metal_forms {
     }
 }
 
-#[cfg(all(test, not(all(feature = "metal", any(target_os = "macos", target_os = "ios")))))]
+#[cfg(all(test, not(any(feature = "metal", feature = "metal-check"))))]
 mod cuda_registry_tests {
     use super::*;
 

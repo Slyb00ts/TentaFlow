@@ -10,6 +10,12 @@ license.workspace = true
 hip = ["forge-hal/hip"]
 # Kernele Metal (macOS). Zrodla MSL kompilowane przez backend przy ladowaniu.
 metal = ["forge-hal/metal"]
+# Typuje ścieżkę Metalową na KAŻDEJ platformie, bez backendu HAL-a i bez
+# linkowania. Istnieje, bo zmiana wspólnego kontraktu (`Op`, `Executor`) psuła
+# `MetalExec` po cichu: jedyna maszyna, która to widziała, była tą jedną z
+# Makiem. `cargo check -p forge-kernels --features metal-check` odbija to od
+# kompilatora wszędzie.
+metal-check = []
 
 [dependencies]
 forge-types.workspace = true

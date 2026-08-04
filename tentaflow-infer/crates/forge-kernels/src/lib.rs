@@ -3,9 +3,9 @@
 // (ADR-0001). This crate loads those artifacts onto a HAL device and exposes
 // typed launch wrappers so the engine never touches raw entry symbols.
 
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[cfg(any(feature = "metal", feature = "metal-check"))]
 pub mod cpu_matmul;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[cfg(any(feature = "metal", feature = "metal-check"))]
 mod dense_exec;
 mod launchers;
 // Wzorzec hostowy jest DOSTĘPNY WSZĘDZIE i to jest jego sens: kontrakt, który
@@ -16,9 +16,9 @@ pub use host_exec::HostExec;
 // więc kompiluje się wszędzie i odmawia dopiero tam, gdzie nie ma artefaktów.
 mod cuda_exec;
 pub use cuda_exec::CudaExec;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[cfg(any(feature = "metal", feature = "metal-check"))]
 pub use dense_exec::MetalExec;
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[cfg(any(feature = "metal", feature = "metal-check"))]
 pub mod msl;
 // Czesc wspolna rejestru (Problem, Variant, Registry) kompiluje sie wszedzie;
 // listy form sa per platforma, bo to platforma decyduje, ktore w ogole istnieja.
