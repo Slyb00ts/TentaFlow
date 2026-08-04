@@ -554,6 +554,54 @@ fn nibble(packed_row: &[u8], index: usize) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    /// Przepakowanie do bloków GGUF musi dać TE SAME liczby co dekod wprost.
+    ///
+    /// Obie drogi czytają ten sam tensor: jedna dekoduje kody i skale osobno,
+    /// druga składa je w blok GGUF i dekoduje go. Jeżeli się rozjeżdżają, to
+    /// model wczytany przez konwersję liczy innymi wagami niż ten sam model
+    /// wczytany wprost — a różnica rzędu procenta wygląda w wyniku jak
+    /// zaokrąglenie i nie jest nim.
+    #[test]
+    fn the_gguf_repack_decodes_to_the_same_numbers() {
+        let (rows, cols) = (2usize, 128usize);
+        let packed: Vec<u8> = (0..rows * cols / 2).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        // Skale E4M3 bez bitu znaku i bez NaN — konwersja odrzuca oba jawnie.
+        let scales: Vec<u8> = (0..rows * cols / 16).map(|i| (0x30 + (i % 16)) as u8).collect();
+        let global = 0.125f32;
+
+        let direct = dequantize_nvfp4(&packed, &scales, global, rows, cols, 16).expect("wprost");
+        let blocks = nvfp4_ct_to_gguf_blocks(&packed, &scales, rows, cols).expect("przepakowanie");
+        let repacked = crate::dequant::dequantize_to_f32(
+            forge_types::DType::U8,
+            forge_types::QuantKind::NVFP4Gguf,
+            &blocks,
+            rows * cols,
+        )
+        .expect("dekod bloków");
+
+        // Skalar tensora nie mieści się w bloku GGUF, więc dekod bloków go nie
+        // zna — porównanie musi go dołożyć po tej stronie i to jest jedyna
+        // dozwolona różnica. DZIELI, bo `weight_global_scale` jest dzielnikiem
+        // użytym przy kwantyzacji; pomnożenie zamiast podzielenia daje rozjazd
+        // o KWADRAT skalara i wygląda jak zepsuty konwerter, którym nie jest.
+        let mut worst = (0usize, 0.0f32, 0.0f32, 0.0f32);
+        for (i, (&a, &b)) in direct.iter().zip(&repacked).enumerate() {
+            let scaled = b / global;
+            let diff = (a - scaled).abs();
+            if diff > worst.3 {
+                worst = (i, a, scaled, diff);
+            }
+        }
+        assert!(
+            worst.3 == 0.0,
+            "element {}: wprost {}, przez bloki {} (roznica {})",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3
+        );
+    }
+
     use super::*;
 
     /// Przepakowanie musi być przestawieniem bajtów, nie przybliżeniem: te same
