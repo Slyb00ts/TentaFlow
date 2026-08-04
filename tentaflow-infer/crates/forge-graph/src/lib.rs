@@ -275,6 +275,25 @@ pub trait WeightStore {
     fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId>;
 }
 
+/// Płaszczyzny bajtów, z których składa się waga.
+///
+/// Formaty blokowe GGUF-a mają JEDNĄ — skale siedzą wewnątrz bloku. NVFP4 ma
+/// kody, osobny bufor skal i skalar na cały tensor; FP8 ze skalą wierszową ma
+/// bajty i wektor skal. Dopóki typ mówił „waga to jedna bryła bajtów", te trzy
+/// nie mogły wejść do wspólnej tabeli i musiały mieć własne gałęzie — czyli
+/// dokładnie te odnogi, których ten układ ma nie mieć.
+///
+/// Jedna płaszczyzna jest tu przypadkiem ZDEGENEROWANYM, a nie regułą.
+#[derive(Debug, Default)]
+pub struct Planes {
+    /// Kody wagi w układzie źródła. Zawsze obecne.
+    pub codes: Vec<u8>,
+    /// Skale, gdy format trzyma je poza kodami.
+    pub scales: Option<Vec<u8>>,
+    /// Skalar całego tensora, gdy format go ma.
+    pub global: Option<f32>,
+}
+
 /// Waga kwantyzowana w postaci, w jakiej oddało ją źródło.
 ///
 /// Przepisanie na postać, której chcą kernele, należy do WYKONAWCY, a nie do
@@ -283,14 +302,43 @@ pub trait WeightStore {
 /// model przepisujący wszystko „na jedno" musiałby wybrać jedną z tych dwóch
 /// stron. Wybór na rzecz postaci afinicznej jest przy tym STRATNY dla Q6_K,
 /// bo sześciu bitów nie da się włożyć w cztery.
+#[derive(Debug)]
+pub struct PackedWeight {
+    pub planes: Planes,
+    pub quant: QuantKind,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl PackedWeight {
+    /// Skale jako osobna płaszczyzna — dla formatów, które ich tam szukają.
+    ///
+    /// Wiersz tabeli DEKLARUJE, czego potrzebuje, więc waga bez tej płaszczyzny
+    /// odbija się przy wgraniu, a nie przy mnożeniu. Odwrotna kolejność znaczy
+    /// kernel czytający cudzą pamięć albo zera.
+    pub fn scales(&self) -> Result<&[u8]> {
+        self.planes.scales.as_deref().ok_or_else(|| {
+            ForgeError::Format(format!(
+                "{:?} wymaga osobnej płaszczyzny skal, a źródło jej nie oddało",
+                self.quant
+            ))
+        })
+    }
+
+    /// Skalar całego tensora — tak samo deklarowany, tak samo sprawdzany.
+    pub fn global(&self) -> Result<f32> {
+        self.planes.global.ok_or_else(|| {
+            ForgeError::Format(format!(
+                "{:?} wymaga skalara tensora, a źródło go nie oddało",
+                self.quant
+            ))
+        })
+    }
+}
+
 pub enum QuantWeight {
-    /// Bloki w układzie źródła, wiersz po wierszu.
-    Blocks {
-        data: Vec<u8>,
-        quant: QuantKind,
-        rows: usize,
-        cols: usize,
-    },
+    /// Kody i, gdy format ich potrzebuje, osobne skale.
+    Packed(PackedWeight),
     /// Źródło trzyma postać afiniczną NATYWNIE i nie ma innej — tak wygląda
     /// eksport MLX, którego skale są w bf16. Przepuszczanie go przez format
     /// pośredni po to, żeby wszystko wyglądało jednakowo, zwężało je do f16.
@@ -302,7 +350,7 @@ impl QuantWeight {
     /// oczekuje architektura.
     pub fn shape(&self) -> (usize, usize) {
         match self {
-            Self::Blocks { rows, cols, .. } => (*rows, *cols),
+            Self::Packed(p) => (p.rows, p.cols),
             Self::Affine(t) => (t.rows, t.cols),
         }
     }
@@ -325,6 +373,40 @@ mod tests {
         let apart = vec![Lane { slot: 0, pos: 3 }, Lane { slot: 1, pos: 7 }];
         let step = Step::new(apart, 2).expect("dwa różne sloty");
         assert_eq!(step.rows(), 4, "wiersze to lane'y razy tokeny");
+    }
+
+    /// Waga bez płaszczyzny, której format żąda, ma się zatrzymać przy pytaniu
+    /// o nią — a nie policzyć bez niej.
+    ///
+    /// To jest cały mechanizm, przez który NVFP4 i FP8 mieszczą się w tej samej
+    /// tabeli co Q4_K: wiersz DEKLARUJE, czego potrzebuje, zamiast każdy
+    /// wykonawca sprawdzał, które pola są wypełnione.
+    #[test]
+    fn a_missing_plane_is_refused_where_it_is_asked_for() {
+        let one_blob = PackedWeight {
+            planes: Planes {
+                codes: vec![0u8; 144],
+                ..Planes::default()
+            },
+            quant: QuantKind::Q4K,
+            rows: 1,
+            cols: 256,
+        };
+        assert!(one_blob.scales().is_err(), "brakująca płaszczyzna przeszła");
+        assert!(one_blob.global().is_err(), "brakujący skalar przeszedł");
+
+        let three = PackedWeight {
+            planes: Planes {
+                codes: vec![0u8; 128],
+                scales: Some(vec![0u8; 16]),
+                global: Some(0.5),
+            },
+            quant: QuantKind::NVFP4Gguf,
+            rows: 1,
+            cols: 256,
+        };
+        assert_eq!(three.scales().expect("skale").len(), 16);
+        assert_eq!(three.global().expect("skalar"), 0.5);
     }
 
     /// Pusty krok nie ma czego policzyć, a każdy kernel dostałby zero wierszy

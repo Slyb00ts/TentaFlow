@@ -284,25 +284,32 @@ impl WeightStore for HostExec {
     fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
         match w {
             QuantWeight::Affine(t) => self.put_affine(t),
-            QuantWeight::Blocks {
-                data,
-                quant,
-                rows,
-                cols,
-            } => {
+            QuantWeight::Packed(p) => {
                 // Sprawdzane TU, przy wgraniu: wiersz, który nie dzieli się na
                 // całe bloki, adresowałby cudzy blok przy każdym odczycie.
-                if !cols.is_multiple_of(quant.block_elems()) {
+                if !p.cols.is_multiple_of(p.quant.block_elems()) {
                     return Err(ForgeError::Unsupported(format!(
-                        "{cols} kolumn nie dzieli się na bloki {quant:?} po {}",
-                        quant.block_elems()
+                        "{} kolumn nie dzieli się na bloki {:?} po {}",
+                        p.cols,
+                        p.quant,
+                        p.quant.block_elems()
+                    )));
+                }
+                // Wzorzec dekoduje kody, więc żąda wagi, która niesie WSZYSTKO
+                // w nich. Format z osobnymi skalami zatrzyma się tutaj, dopóki
+                // dekoder wzorca ich nie przyjmie — cicho policzony byłby
+                // wynikiem bez skal, czyli płynnym, złym tekstem.
+                if p.planes.scales.is_some() || p.planes.global.is_some() {
+                    return Err(ForgeError::Unsupported(format!(
+                        "{:?} niesie skale poza kodami, a wzorzec czyta same kody",
+                        p.quant
                     )));
                 }
                 self.weights.push(HostWeight::Blocks(HostBlocks {
-                    data,
-                    quant,
-                    rows,
-                    cols,
+                    data: p.planes.codes,
+                    quant: p.quant,
+                    rows: p.rows,
+                    cols: p.cols,
                 }));
                 Ok(WeightId(self.weights.len() as u32 - 1))
             }

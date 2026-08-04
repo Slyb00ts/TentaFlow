@@ -19,7 +19,8 @@ use forge_formats::checkpoint::Checkpoint;
 use forge_formats::source::TensorSource;
 use forge_formats::WeightRole;
 use forge_graph::{
-    Act, ExecSpec, Executor, Lane, Op, QuantWeight, Step, Tile, WeightId, WeightStore,
+    Act, ExecSpec, Executor, Lane, Op, PackedWeight, Planes, QuantWeight, Step, Tile, WeightId,
+    WeightStore,
 };
 use forge_types::{DType, DenseShape, ForgeError, Result};
 
@@ -510,12 +511,15 @@ fn fetch_quant(
             if let Some(head_dim) = rope {
                 permute_rope_rows(&mut data, rows as usize, head_dim)?;
             }
-            QuantWeight::Blocks {
-                data,
+            QuantWeight::Packed(PackedWeight {
+                planes: Planes {
+                    codes: data,
+                    ..Planes::default()
+                },
                 quant,
                 rows: rows as usize,
                 cols: cols as usize,
-            }
+            })
         }
     };
     let (r, c) = w.shape();

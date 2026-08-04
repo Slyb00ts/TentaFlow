@@ -256,37 +256,43 @@ impl WeightStore for CudaExec {
     /// quantized model that quietly loses two bits per weight still produces
     /// fluent text.
     fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
-        let QuantWeight::Blocks {
-            data,
-            quant,
-            rows,
-            cols,
-        } = w
-        else {
+        let QuantWeight::Packed(w) = w else {
             return Err(ForgeError::Unsupported(
                 "kernele CUDA czytają bloki źródła, a to źródło oddaje wyłącznie \
                  postać afiniczną"
                     .into(),
             ));
         };
-        if !Self::knows(quant) {
+        if !Self::knows(w.quant) {
             return Err(ForgeError::Unsupported(format!(
-                "{quant:?}: ten wykonawca nie ma dla niego kerneli"
+                "{:?}: ten wykonawca nie ma dla niego kerneli",
+                w.quant
             )));
         }
         // Wiersz krótszy niż blok adresowałby cudzy blok, więc sprawdzane TU,
         // przy wgraniu, a nie zakładane przy każdym mnożeniu.
-        if !cols.is_multiple_of(quant.block_elems()) {
+        if !w.cols.is_multiple_of(w.quant.block_elems()) {
             return Err(ForgeError::Unsupported(format!(
-                "{cols} kolumn nie dzieli się na bloki {quant:?} po {}",
-                quant.block_elems()
+                "{} kolumn nie dzieli się na bloki {:?} po {}",
+                w.cols,
+                w.quant,
+                w.quant.block_elems()
+            )));
+        }
+        // Każdy wiersz DZISIEJSZEJ tabeli czyta skale z wnętrza bloku. Waga,
+        // która niesie je osobno, zatrzymuje się tutaj — zamiast trafić na
+        // kernel, który tej płaszczyzny nie dostanie i policzy bez niej.
+        if w.planes.scales.is_some() {
+            return Err(ForgeError::Unsupported(format!(
+                "{:?} niesie skale poza kodami, a ta tabela ich nie wiąże",
+                w.quant
             )));
         }
         self.weights.push(Weight::Quant(Quantized {
-            blocks: upload(&*self.device, &data)?,
-            quant,
-            rows,
-            cols,
+            blocks: upload(&*self.device, &w.planes.codes)?,
+            quant: w.quant,
+            rows: w.rows,
+            cols: w.cols,
         }));
         Ok(WeightId(self.weights.len() as u32 - 1))
     }

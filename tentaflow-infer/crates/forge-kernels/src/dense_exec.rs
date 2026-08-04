@@ -277,12 +277,9 @@ impl WeightStore for MetalExec {
     fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
         let t = match w {
             QuantWeight::Affine(t) => t,
-            QuantWeight::Blocks {
-                data,
-                quant,
-                rows,
-                cols,
-            } => to_affine_triple(&data, quant, rows, cols)?,
+            QuantWeight::Packed(p) => {
+                to_affine_triple(&p.planes.codes, p.quant, p.rows, p.cols)?
+            }
         };
         self.put_affine(t)
     }
