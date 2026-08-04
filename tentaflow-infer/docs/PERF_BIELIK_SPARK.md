@@ -120,6 +120,31 @@ byte-id/thread-id) trzeba potwierdzic zlotym testem przeciw dequantowi CPU,
 zanim cokolwiek z tego wejdzie do silnika. Powyzszy pomiar jest sufitem
 instrukcji na atrapach operandow, nie dzialajacym GEMM-em.
 
+### Rdzen GEMM-u: policzony i zgodny co do bitu
+
+`bench_nvfp4_native_gemm.mojo` liczy prawdziwy GEMM na tej instrukcji i
+porownuje z referencja CPU — zgadza sie co do bitu na `32x64x128`, `64x128x256`
+i `128x64x512`. Kernel jest CELOWO naiwny: jeden warp na kafel `16 x 64`, bez
+pamieci wspoldzielonej i bez `cp.async`, fragmenty czytane wprost z pamieci
+globalnej. Uklad wejscia jest ten, ktory ma model: kody e2m1 po dwa na bajt i
+skale ue4m3 co 16 wartosci, wiec kazdy fragment to jeden odczyt czterobajtowy.
+
+| ksztalt (M=1024) | jeden warp = 16x8 | jeden warp = 16x64 |
+|---|--:|--:|
+| q/o `4096x4096` | 27,7 TFLOPS | **31,3** |
+| gate/up `11264x4096` | 12,9 | **27,5** |
+| down `4096x11264` | 23,9 | **29,6** |
+
+Rozszerzenie kafla warpa z 16x8 na 16x64 daje ponowne uzycie fragmentow A w
+rejestrach (jeden odczyt na osiem podkafli) i podnosi `gate/up` 2,1x. To jedyne
+ponowne uzycie osiagalne bez pamieci wspoldzielonej.
+
+31 wobec 475 TFLOPS sufitu mowi, gdzie jest reszta roboty: kazdy warp wciaz
+czyta B od nowa. Nastepny krok to warstwa kafelkowania — blok wielowarpowy,
+kafle A i B w pamieci wspoldzielonej, wieloetapowy `cp.async` — czyli dokladnie
+to, co w sciezce FP8 robi kernel Modulara. Rdzen jest juz sprawdzony, wiec ta
+warstwa buduje sie na czyms, co nie klamie.
+
 Ktore warianty `ptxas` przyjmuje na sm_121a (sprawdzone kompilacja):
 
 | wariant | wynik |
@@ -148,10 +173,20 @@ To liczba, ktora MXFP4 musi dorownac. Uwaga na wielkosc probki: `forge ppl`
 punktuje tu 353 tokeny, wiec do decyzji o zmianie formatu wag trzeba policzyc
 wiecej — na 353 tokenach roznica rzedu procenta jest w szumie.
 
-**Bramka jakosci jest juz niepotrzebna** — patrz retrakcja wyzej. Sprzet liczy
-natywne NVFP4, wiec wagi zostaja bit w bit takie, jakie sa dzis w decode, a
-`forge ppl` = 3,1256 pozostaje punktem odniesienia tylko po to, zeby wychwycic
-blad implementacji kernela, a nie strate formatu.
+**Bramka jakosci jest potrzebna, ale dotyczy AKTYWACJI, nie wag.** Sprostowanie
+wczesniejszego zdania z tej sekcji: napisalem, ze bramka odpada w calosci, i to
+bylo za mocne. `mma` mnozy FP4 przez FP4, wiec zeby dostac k64, OBA operandy
+musza byc czterobitowe. Wagi sa za darmo — model jest w NVFP4. Aktywacje dzis
+ida w FP8 e4m3 i zejscie ich do NVFP4 (e2m1 ze skala e4m3 co 16 wartosci) jest
+NOWA strata, ktorej wielkosci nie znamy. `forge ppl` przeciw 3,1256 pozostaje
+wiec bramka — tyle ze mierzy kwantyzacje aktywacji, a nie format wag.
+
+Wariant bez tej straty istnieje i ma inny bilans: `kind::mxf8f6f4` przyjmuje
+mieszane typy (e4m3 razy e2m1), czyli aktywacje osmiobitowe i wagi czterobitowe.
+Ksztalt to jednak `m16n8k32`, wiec liczba instrukcji nie spada — zysk bylby
+wylacznie na ruchu wag (polowa), a ten po wprowadzeniu plastrow nie jest juz
+waskim gardlem (66 ms wobec 118 ms podlogi obliczeniowej). Dlatego pelne 2x
+wymaga aktywacji FP4 i pomiaru jakosci.
 
 ## Model: ile razy wagi przechodza przez pamiec
 
