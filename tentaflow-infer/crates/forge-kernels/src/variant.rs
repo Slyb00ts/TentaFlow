@@ -362,11 +362,7 @@ mod metal_forms {
             let shape = (4096u32, 4096u32);
             let at = |tokens| {
                 MATMUL_FORMS
-                    .pick(&Problem {
-                        tokens,
-                        rows: shape.0,
-                        cols: shape.1,
-                    })
+                    .pick(&Problem::new(tokens, shape.0, shape.1))
                     .unwrap()
                     .form
             };

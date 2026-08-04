@@ -21,6 +21,9 @@ use std::fmt;
 pub enum ScaleDtype {
     F16,
     Bf16,
+    /// Normy w GGUF-ie. Skale kwantyzacji nigdy nie są f32 — ten wariant
+    /// istnieje dla wag, które nie są skalami, a dzielą z nimi ten parametr.
+    F32,
 }
 
 impl ScaleDtype {
@@ -29,6 +32,7 @@ impl ScaleDtype {
         match self {
             ScaleDtype::F16 => "half",
             ScaleDtype::Bf16 => "bfloat",
+            ScaleDtype::F32 => "float",
         }
     }
 
@@ -36,6 +40,7 @@ impl ScaleDtype {
         match self {
             ScaleDtype::F16 => "f16",
             ScaleDtype::Bf16 => "bf16",
+            ScaleDtype::F32 => "f32",
         }
     }
 }

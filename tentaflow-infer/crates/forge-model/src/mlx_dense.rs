@@ -78,6 +78,9 @@ struct Quantized {
     /// Cztery albo sześć. Jeden model potrafi mieć oba: Q4_K_M kładzie sześć
     /// bitów na attn_v, ffn_down i głowie, a cztery na reszcie.
     bits: u32,
+    /// Wag na jedną skalę. Też własność TEJ wagi, nie modelu — Q4_K daje 32,
+    /// Q6_K szesnaście, a MLX 64, i wszystkie trzy mogą wystąpić naraz.
+    group: u32,
     rows: u32,
     cols: u32,
 }
@@ -219,9 +222,10 @@ impl MlxDense {
         let norm_dtype = match src.fetch(&desc.globals[&WeightRole::OutputNorm])?.1 {
             DType::F16 => ScaleDtype::F16,
             DType::BF16 => ScaleDtype::Bf16,
+            DType::F32 => ScaleDtype::F32,
             other => {
                 return Err(ForgeError::Unsupported(format!(
-                    "waga normy ma typ {other:?}, a kernel zna f16 i bf16"
+                    "waga normy ma typ {other:?}, a kernel zna f16, bf16 i f32"
                 )))
             }
         };
@@ -248,9 +252,9 @@ impl MlxDense {
                     t.rows, t.cols
                 )));
             }
-            if t.group != group as usize {
+            if !(cols as usize).is_multiple_of(t.group) {
                 return Err(ForgeError::Unsupported(format!(
-                    "{name}: grupa {} wobec {group} w reszcie modelu",
+                    "{name}: {cols} kolumn nie dzieli się na grupy po {}",
                     t.group
                 )));
             }
@@ -263,6 +267,7 @@ impl MlxDense {
                 scales: upload(&*device, &t.scales)?,
                 biases: upload(&*device, &t.biases)?,
                 bits: t.bits,
+                group: t.group as u32,
                 rows,
                 cols,
             })
@@ -699,7 +704,7 @@ impl MlxDense {
             weight_args(LaunchArgs::new().buf(out), w, x, x_offset)?
                 .scalar(w.rows)
                 .scalar(w.cols)
-                .scalar(self.shape.group),
+                .scalar(w.group),
             msl::qmv_affine_4bit_groups(w.rows),
             msl::QMV_THREADS,
         )
@@ -784,7 +789,7 @@ impl MlxDense {
             tokens,
             rows: w.rows,
             cols: w.cols,
-            group: self.shape.group,
+            group: w.group,
         };
         let mut cpu = self.cpu.borrow_mut();
         cpu.check(&operands, split.gpu_rows, split.cpu_rows)?;
@@ -845,7 +850,7 @@ impl MlxDense {
             &weight_args(LaunchArgs::new().buf(out), w, x, 0)?
                 .scalar(w.rows)
                 .scalar(w.cols)
-                .scalar(self.shape.group)
+                .scalar(w.group)
                 .scalar(tokens),
             &self.stream,
         )
@@ -872,7 +877,7 @@ impl MlxDense {
             &weight_args(LaunchArgs::new().buf(out), w, x, 0)?
                 .scalar(w.rows)
                 .scalar(w.cols)
-                .scalar(self.shape.group)
+                .scalar(w.group)
                 .scalar(tokens),
             &self.stream,
         )
