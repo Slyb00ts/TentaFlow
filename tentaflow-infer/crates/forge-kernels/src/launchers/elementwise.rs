@@ -57,6 +57,26 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `h += delta` nad n elementami f16 — strumień rezydualny bez fuzji.
+    ///
+    /// Silnik nigdy tego nie potrzebował, bo każde dodanie do strumienia
+    /// wchodzi u niego w kernel, który tego strumienia dotyka jako następny
+    /// (`rmsnorm_residual_f16`, `gemv_residual_*`). Słownictwo operacji ma
+    /// `Residual` osobno, więc potrzebuje postaci niescalonej; fuzja przyjdzie
+    /// jako pass nad ciągiem operacji, a nie jako założenie wykonawcy.
+    pub fn residual_add_f16(
+        &self,
+        h_io: &DevBuffer,
+        delta: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("residual_add_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(h_io).buf(delta).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// buf *= factor w miejscu (skalowanie embeddingu w rodzinie Gemma).
     pub fn scale_f16(&self, buf: &DevBuffer, n: usize, factor: f32, stream: &Stream) -> Result<()> {
         let k = self.artifacts.get("scale_f16")?;
@@ -413,5 +433,4 @@ impl Kernels {
             .scalar(hidden as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
-
 }

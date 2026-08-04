@@ -125,6 +125,27 @@ def cast_f32_f16(
         out_ptr[i] = Float16(src[i])
 
 
+def residual_add_f16(
+    h_io: UnsafePointer[Float16, MutAnyOrigin],
+    delta: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+):
+    """h += delta over n elements, summed in f32 and rounded once.
+
+    The catalogue had every FUSED form of this — `rmsnorm_residual_f16`,
+    `gemv_residual_*` — because the engine hand-fuses the residual add into
+    whichever kernel touches the stream next. A vocabulary of separate
+    operations needs the unfused one, and this is it.
+
+    The sum widens to f32 before rounding so that a later fusion pass, which
+    replaces this plus the following norm with `rmsnorm_residual_f16`, produces
+    the SAME residual stream bit for bit rather than a differently rounded one.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        h_io[i] = Float16(Float32(h_io[i]) + Float32(delta[i]))
+
+
 def add_f32_out_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     a: UnsafePointer[Float32, MutAnyOrigin],

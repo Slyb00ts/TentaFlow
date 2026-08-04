@@ -2201,6 +2201,10 @@
       "entry": "src_nvfp4_ct_layout_repack_nvf6A6A6A6A_74d9dccace582979",
       "file": "repack_nvfp4_ct_s0_n64k128_into.ptx"
     },
+    "residual_add_f16": {
+      "entry": "src_activation_residual_add_f16A6A6A6A_255ff53989925352",
+      "file": "residual_add_f16.ptx"
+    },
     "rmsnorm_delta_residual_f16": {
       "entry": "src_norm_rmsnorm_delta_residua6A6A6A6A_9fb6c03a9c09104c",
       "file": "rmsnorm_delta_residual_f16.ptx"
