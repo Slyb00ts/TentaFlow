@@ -495,3 +495,27 @@ rejestr jest zuzywany; sprawdzone dla wszystkich czterech wartosci.
 Kontrola poprawnosci: A i B same jedynki, wszystkie skale 1.0, `m16n8k64` daje
 64.0 w kazdym elemencie wyjscia (4 bloki po 16). Podniesienie jednej skali A do
 2.0 daje 80.0 w calym wierszu — po 16 na blok.
+
+### Uklad fragmentow danych
+
+Watek `t` ma grupe `g = t/4` i pozycje `q = t%4`; kazdy rejestr `.b32` niesie
+osiem wartosci czterobitowych, mlodsza polbajtowka to mniejsze `k`:
+
+| rejestr | co niesie |
+|---|---|
+| `a0` | wiersz `g`, `k = 8q .. 8q+7` |
+| `a1` | wiersz `g+8`, `k = 8q .. 8q+7` |
+| `a2` | wiersz `g`, `k = 32 + 8q .. 32+8q+7` |
+| `a3` | wiersz `g+8`, `k = 32 + 8q .. 32+8q+7` |
+| `b0` | kolumna `g`, `k = 8q .. 8q+7` |
+| `b1` | kolumna `g`, `k = 32 + 8q .. 32+8q+7` |
+
+Akumulator jak w kazdym `m16n8`: element `i` watku `t` to
+`wiersz = t/4 + 8*(i/2)`, `kolumna = 2*(t%4) + i%2`.
+
+`probe_nvfp4_mma_golden.mojo` liczy pelny kafel `16x8x64` z losowymi wartosciami
+i skalami, i porownuje z referencja CPU **dokladnie** — wartosci sa dobrane tak,
+zeby kazdy iloczyn i kazda suma byly w f32 scisle reprezentowalne, wiec test
+wykrywa zly uklad, a nie zaokraglenie. Przechodzi na wszystkich 128 elementach.
+
+To komplet potrzebny do napisania GEMM-u: wartosci, skale i akumulator.
