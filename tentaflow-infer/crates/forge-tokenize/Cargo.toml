@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 forge-types = { workspace = true }
+forge-formats = { workspace = true }
 tokenizers = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }

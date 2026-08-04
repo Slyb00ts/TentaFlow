@@ -70,8 +70,14 @@ impl DenseShape {
 /// A quantized weight: packed nibbles plus per-group scale and zero point.
 struct Quantized {
     packed: DevBuffer,
+    /// Bity czwarty i piąty, gdy `bits` wynosi sześć. Pusty bufor przy czterech
+    /// — kernel czterobitowy go nie deklaruje, więc nie ma czego związać.
+    high: Option<DevBuffer>,
     scales: DevBuffer,
     biases: DevBuffer,
+    /// Cztery albo sześć. Jeden model potrafi mieć oba: Q4_K_M kładzie sześć
+    /// bitów na attn_v, ffn_down i głowie, a cztery na reszcie.
+    bits: u32,
     rows: u32,
     cols: u32,
 }
@@ -90,13 +96,25 @@ struct Layer {
     v_cache: DevBuffer,
 }
 
+/// Cztery warianty jednej rodziny kerneli.
+struct QuantPipes {
+    /// [szerokość kodu: 4→0, 6→1][wyjście: f32→0, f16→1]
+    by: [[KernelHandle; 2]; 2],
+}
+
+impl QuantPipes {
+    fn get(&self, bits: u32, f16_out: bool) -> &KernelHandle {
+        &self.by[usize::from(bits == 6)][usize::from(f16_out)]
+    }
+}
+
 struct Pipelines {
-    qmv_f16: KernelHandle,
-    qmv_f32: KernelHandle,
-    qmm_f16: KernelHandle,
-    qmm_f32: KernelHandle,
-    qmg_f16: KernelHandle,
-    qmg_f32: KernelHandle,
+    /// Jedna rodzina, cztery warianty: dwie szerokości kodu razy dwa typy
+    /// wyjścia. Trzymane w tablicy, a nie w czterech polach, bo wybór jest
+    /// wyliczany, a nie pisany ręcznie w każdym miejscu wywołania.
+    qmv: QuantPipes,
+    qmm: QuantPipes,
+    qmg: QuantPipes,
     rmsnorm: KernelHandle,
     silu_mul: KernelHandle,
     rope: KernelHandle,
@@ -238,8 +256,13 @@ impl MlxDense {
             }
             Ok(Quantized {
                 packed: upload(&*device, bytemuck::cast_slice(&t.packed))?,
+                high: match t.bits {
+                    6 => Some(upload(&*device, bytemuck::cast_slice(&t.high))?),
+                    _ => None,
+                },
                 scales: upload(&*device, &t.scales)?,
                 biases: upload(&*device, &t.biases)?,
+                bits: t.bits,
                 rows,
                 cols,
             })
@@ -272,34 +295,13 @@ impl MlxDense {
             });
         }
 
-        let compile = |source: &str, entry: &str| -> Result<KernelHandle> {
+        let mut compile = |source: &str, entry: &str| -> Result<KernelHandle> {
             device.load_module(source.as_bytes())?.kernel(entry)
         };
         let pipes = Pipelines {
-            qmv_f16: compile(
-                &msl::qmv_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F16),
-                &msl::qmv_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F16),
-            )?,
-            qmv_f32: compile(
-                &msl::qmv_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F32),
-                &msl::qmv_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F32),
-            )?,
-            qmm_f16: compile(
-                &msl::qmm_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F16),
-                &msl::qmm_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F16),
-            )?,
-            qmm_f32: compile(
-                &msl::qmm_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F32),
-                &msl::qmm_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F32),
-            )?,
-            qmg_f16: compile(
-                &msl::qmg_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F16),
-                &msl::qmg_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F16),
-            )?,
-            qmg_f32: compile(
-                &msl::qmg_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F32),
-                &msl::qmg_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F32),
-            )?,
+            qmv: quant_pipes(&mut compile, msl::qmv_affine_source, msl::qmv_affine_name, scales_dtype)?,
+            qmm: quant_pipes(&mut compile, msl::qmm_affine_source, msl::qmm_affine_name, scales_dtype)?,
+            qmg: quant_pipes(&mut compile, msl::qmg_affine_source, msl::qmg_affine_name, scales_dtype)?,
             rmsnorm: compile(
                 &msl::rmsnorm_source(norm_dtype),
                 &msl::rmsnorm_name(norm_dtype),
@@ -582,7 +584,7 @@ impl MlxDense {
         // wierszy najdroższą pojedynczą macierzą w modelu.
         let last = (n - 1) as usize * s.hidden as usize * 2;
         self.gemv(
-            &self.pipes.qmv_f32,
+            self.pipes.qmv.get(self.lm_head.bits, false),
             &self.scratch.logits,
             &self.lm_head,
             &self.scratch.norm,
@@ -613,11 +615,7 @@ impl MlxDense {
         // jak przy mnożeniu. Zgodność obu form jest przypięta testem, a forma
         // per-token jest przypięta do MLX.
         let attn = ATTENTION_FORMS
-            .pick(&Problem {
-                tokens,
-                rows: s.heads,
-                cols: s.head_dim,
-            })
+            .pick(&Problem::new(tokens, s.heads, s.head_dim))
             .ok_or_else(|| ForgeError::Unsupported("brak wariantu uwagi".into()))?;
         let (kernel, groups, threads) = match attn.form {
             AttentionForm::Blocked if msl::flash_fits(tokens, s.head_dim) => (
@@ -698,12 +696,7 @@ impl MlxDense {
     ) -> Result<()> {
         self.launch(
             kernel,
-            LaunchArgs::new()
-                .buf(out)
-                .buf(&w.packed)
-                .buf(&w.scales)
-                .buf(&w.biases)
-                .buf_at(x, x_offset)?
+            weight_args(LaunchArgs::new().buf(out), w, x, x_offset)?
                 .scalar(w.rows)
                 .scalar(w.cols)
                 .scalar(self.shape.group),
@@ -733,18 +726,14 @@ impl MlxDense {
             tokens,
             rows: w.rows,
             cols: w.cols,
+            bits: w.bits,
         };
         let chosen = MATMUL_FORMS.pick(&problem).ok_or_else(|| {
             ForgeError::Unsupported(format!("brak wariantu mnożenia dla {problem:?}"))
         })?;
         match chosen.form {
             MatmulForm::Vector => {
-                let k = if f16_out {
-                    &self.pipes.qmv_f16
-                } else {
-                    &self.pipes.qmv_f32
-                };
-                self.gemv(k, out, w, x, 0)
+                self.gemv(self.pipes.qmv.get(w.bits, f16_out), out, w, x, 0)
             }
             MatmulForm::RegisterBlocked => self.matmul_blocked(out, w, x, tokens, f16_out),
             MatmulForm::MatrixUnits => {
@@ -777,11 +766,7 @@ impl MlxDense {
         f16_out: bool,
         split: Option<RowSplit>,
     ) -> Result<()> {
-        let k = if f16_out {
-            &self.pipes.qmg_f16
-        } else {
-            &self.pipes.qmg_f32
-        };
+        let k = self.pipes.qmg.get(w.bits, f16_out);
         let Some(split) = split else {
             let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
             return self.launch_qmg(k, out, w, x, tokens, (gx, gy));
@@ -857,12 +842,7 @@ impl MlxDense {
                 block: (msl::QMG_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             },
-            &LaunchArgs::new()
-                .buf(out)
-                .buf(&w.packed)
-                .buf(&w.scales)
-                .buf(&w.biases)
-                .buf(x)
+            &weight_args(LaunchArgs::new().buf(out), w, x, 0)?
                 .scalar(w.rows)
                 .scalar(w.cols)
                 .scalar(self.shape.group)
@@ -880,11 +860,7 @@ impl MlxDense {
         tokens: u32,
         f16_out: bool,
     ) -> Result<()> {
-        let k = if f16_out {
-            &self.pipes.qmm_f16
-        } else {
-            &self.pipes.qmm_f32
-        };
+        let k = self.pipes.qmm.get(w.bits, f16_out);
         let (gx, gy) = msl::qmm_affine_4bit_groups(w.rows, tokens);
         self.device.launch(
             k,
@@ -893,12 +869,7 @@ impl MlxDense {
                 block: (msl::QMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             },
-            &LaunchArgs::new()
-                .buf(out)
-                .buf(&w.packed)
-                .buf(&w.scales)
-                .buf(&w.biases)
-                .buf(x)
+            &weight_args(LaunchArgs::new().buf(out), w, x, 0)?
                 .scalar(w.rows)
                 .scalar(w.cols)
                 .scalar(self.shape.group)
@@ -1024,6 +995,57 @@ fn dtype_of(d: DType) -> Result<ScaleDtype> {
         DType::BF16 => Ok(ScaleDtype::Bf16),
         other => Err(ForgeError::Unsupported(format!(
             "skale w {other:?}, a kernel zna f16 i bf16"
+        ))),
+    }
+}
+
+/// Kompiluje cztery warianty jednej rodziny: dwie szerokości kodu razy dwa
+/// typy wyjścia. Wypisywanie ich ręcznie znaczyłoby dwanaście wywołań, w
+/// których łatwo pomylić jeden parametr i dostać kernel liczący co innego.
+fn quant_pipes(
+    compile: &mut impl FnMut(&str, &str) -> Result<KernelHandle>,
+    source: fn(msl::Bits, ScaleDtype, OutDtype) -> String,
+    name: fn(msl::Bits, ScaleDtype, OutDtype) -> String,
+    scales: ScaleDtype,
+) -> Result<QuantPipes> {
+    let mut one = |bits, out| compile(&source(bits, scales, out), &name(bits, scales, out));
+    Ok(QuantPipes {
+        by: [
+            [
+                one(msl::Bits::Four, OutDtype::F32)?,
+                one(msl::Bits::Four, OutDtype::F16)?,
+            ],
+            [
+                one(msl::Bits::Six, OutDtype::F32)?,
+                one(msl::Bits::Six, OutDtype::F16)?,
+            ],
+        ],
+    })
+}
+
+/// Bufory wagi w kolejności, której oczekuje kernel.
+///
+/// Sześciobitowy deklaruje jeden bufor więcej, więc kolejność skalarów zależy
+/// od szerokości kodu. Zbierane w jednym miejscu, bo rozjazd między tym a
+/// deklaracją kernela nie jest błędem kompilacji — jest złym wynikiem.
+fn weight_args(
+    args: LaunchArgs,
+    w: &Quantized,
+    x: &DevBuffer,
+    x_offset: usize,
+) -> Result<LaunchArgs> {
+    let args = args
+        .buf(&w.packed)
+        .buf(&w.scales)
+        .buf(&w.biases)
+        .buf_at(x, x_offset)?;
+    match (&w.high, w.bits) {
+        (Some(h), 6) => Ok(args.buf(h)),
+        (None, 4) => Ok(args),
+        _ => Err(ForgeError::Other(format!(
+            "waga deklaruje {} bitów, a bufor wyższych bitów {}",
+            w.bits,
+            if w.high.is_some() { "jest" } else { "go nie ma" }
         ))),
     }
 }

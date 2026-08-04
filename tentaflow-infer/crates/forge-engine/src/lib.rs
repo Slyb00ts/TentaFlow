@@ -6,7 +6,6 @@
 pub mod deepseek;
 pub mod expert_spill;
 pub mod generate;
-pub mod gguf_vocab;
 pub mod kv;
 pub mod metrics;
 pub mod cluster;

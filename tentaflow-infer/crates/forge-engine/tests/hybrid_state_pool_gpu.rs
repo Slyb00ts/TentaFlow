@@ -11,7 +11,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use forge_engine::gguf_vocab::gguf_vocab;
+use forge_tokenize::gguf_vocab;
 use forge_engine::kv::SeqKv;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};

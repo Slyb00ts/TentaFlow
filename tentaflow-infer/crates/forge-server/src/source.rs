@@ -185,7 +185,7 @@ pub fn load_tokenizer_dir(dir: &Path) -> Result<TokenizerBundle> {
 
 /// Build the tokenizer bundle from GGUF-embedded metadata.
 pub fn load_tokenizer_gguf(gguf: &Gguf) -> Result<TokenizerBundle> {
-    let vocab = forge_engine::gguf_vocab::gguf_vocab(gguf).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vocab = forge_tokenize::gguf_vocab(gguf).map_err(|e| anyhow::anyhow!("{e}"))?;
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
     let piece = |id: Option<u32>| id.and_then(|i| tokenizer.token_to_piece(i));
     let bos_token = piece(vocab.bos_id);

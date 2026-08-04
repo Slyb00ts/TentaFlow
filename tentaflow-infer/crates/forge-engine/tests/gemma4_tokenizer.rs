@@ -1,6 +1,6 @@
 // ===== File: gemma4_tokenizer.rs — round-trip tokenizera Gemma 4 z realnego GGUF =====
 
-use forge_engine::gguf_vocab::gguf_vocab;
+use forge_tokenize::gguf_vocab;
 use forge_formats::gguf::Gguf;
 use forge_tokenize::Tokenizer;
 

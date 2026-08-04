@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (model, tokenizer)
     } else {
         let gguf = forge_formats::Gguf::open(&path)?;
-        let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+        let vocab = forge_tokenize::gguf_vocab(&gguf)?;
         drop(gguf);
         let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
         let model = Model::load_gguf(dev, &path, ModelConfig::default())?;

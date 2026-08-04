@@ -1,7 +1,12 @@
-// ===== File: gguf_vocab.rs — bridge GGUF tokenizer metadata → forge-tokenize =====
+// ===== File: gguf_vocab.rs — the tokenizer a GGUF carries inside itself =====
+//
+// A GGUF file embeds its own vocabulary, merges and template. Reading them is a
+// format question, and the answer is the same on every machine — so this lives
+// beside the tokenizer it feeds rather than inside one backend's engine, where
+// it spent long enough that the Metal path could not reach it.
 
 use forge_formats::Gguf;
-use forge_tokenize::GgufVocab;
+use crate::GgufVocab;
 use forge_types::{ForgeError, Result};
 
 /// Extract the embedded tokenizer definition from GGUF metadata.

@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         embedding.quant,
         embedding.size_bytes >> 20
     );
-    let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+    let vocab = forge_tokenize::gguf_vocab(&gguf)?;
     drop(gguf);
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
     let mut model = Model::load_gguf(

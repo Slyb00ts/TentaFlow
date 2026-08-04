@@ -31,6 +31,25 @@ pub struct Problem {
     pub rows: u32,
     /// Reduction width.
     pub cols: u32,
+    /// Width of one weight code.
+    ///
+    /// A SECOND axis, and it earns its place: one model can hold both widths at
+    /// once. Q4_K_M puts six bits on attn_v, ffn_down and the output head and
+    /// four on everything else, so "which form" stops being a question about
+    /// shape alone.
+    pub bits: u32,
+}
+
+impl Problem {
+    /// The common case: four-bit weights.
+    pub fn new(tokens: u32, rows: u32, cols: u32) -> Self {
+        Self {
+            tokens,
+            rows,
+            cols,
+            bits: 4,
+        }
+    }
 }
 
 /// One way of computing an operation.
@@ -321,7 +340,7 @@ mod metal_forms {
             // przebiegu, a nie przy wczytywaniu.
             for &(rows, cols) in SHAPES {
                 for tokens in [1u32, 2, 7, 31, 32, 63, 64, 128, 511, 512] {
-                    let p = Problem { tokens, rows, cols };
+                    let p = Problem::new(tokens, rows, cols);
                     assert!(
                         MATMUL_FORMS.pick(&p).is_some(),
                         "mnożenie: {p:?} bez wariantu"
@@ -360,7 +379,7 @@ mod metal_forms {
         fn only_products_that_can_pay_for_the_boundary_are_shared_with_the_cpu() {
             let at = |tokens, rows, cols| {
                 MATMUL_FORMS
-                    .pick(&Problem { tokens, rows, cols })
+                    .pick(&Problem::new(tokens, rows, cols))
                     .unwrap()
                     .form
             };
@@ -377,16 +396,12 @@ mod metal_forms {
             // Dekodowanie nie ma prawa się dzielić NIEZALEŻNIE od kształtu —
             // jest ograniczone pasmem, a pomiar pokazał tam 20,9 -> 17,9 tok/s.
             assert_eq!(at(1, 11264, 4096), MatmulForm::Vector);
-            assert!(split_rows(&Problem { tokens: 1, rows: 11264, cols: 4096 }).is_none());
+            assert!(split_rows(&Problem::new(1, 11264, 4096)).is_none());
         }
 
         #[test]
         fn the_split_leaves_whole_blocks_to_the_gpu_and_the_rest_to_the_cpu() {
-            let p = Problem {
-                tokens: 256,
-                rows: 11264,
-                cols: 4096,
-            };
+            let p = Problem::new(256, 11264, 4096);
             let s = split_rows(&p).expect("gate_proj powinien się dzielić");
             // Gdyby granica nie padła na blok, kernel nadpisałby wiersze CPU.
             assert_eq!(s.gpu_rows % crate::msl::QMG_BN, 0);
@@ -404,7 +419,7 @@ mod metal_forms {
 
             // Mniejszy wsad musi zostawiać GPU WIĘCEJ, bo rozpakowanie po
             // stronie CPU kosztuje tyle samo, a jest czym je ukryć o połowę mniej.
-            let at = |t| split_rows(&Problem { tokens: t, rows: 11264, cols: 4096 }).unwrap();
+            let at = |t| split_rows(&Problem::new(t, 11264, 4096)).unwrap();
             assert!(
                 at(256).gpu_rows > at(512).gpu_rows,
                 "udział GPU nie maleje z rosnącym wsadem"
@@ -415,11 +430,7 @@ mod metal_forms {
         fn a_shape_the_matrix_form_cannot_take_falls_back_instead_of_failing() {
             // 300 kolumn nie dzieli się na bloki po 32, więc forma macierzowa nie
             // ma prawa jej dotknąć — i właśnie dlatego rejestr ma ostatni wpis.
-            let p = Problem {
-                tokens: 256,
-                rows: 100,
-                cols: 300,
-            };
+            let p = Problem::new(256, 100, 300);
             assert_eq!(
                 MATMUL_FORMS.pick(&p).unwrap().form,
                 MatmulForm::RegisterBlocked
@@ -455,7 +466,7 @@ mod cuda_registry_tests {
     use super::*;
 
     fn problem(tokens: u32, rows: u32, cols: u32) -> Problem {
-        Problem { tokens, rows, cols }
+        Problem::new(tokens, rows, cols)
     }
 
     /// Totalnosc: kazdy ksztalt dostaje jakas forme. To wlasnie ta wlasnosc

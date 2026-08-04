@@ -11,7 +11,7 @@ fn main() -> forge_types::Result<()> {
     let gguf = forge_formats::Gguf::open(&path)?;
     let descriptor = forge_formats::ModelDescriptor::detect(&gguf)?;
     println!("{:#?}", descriptor.params);
-    let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+    let vocab = forge_tokenize::gguf_vocab(&gguf)?;
     drop(gguf);
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
     for text in [
