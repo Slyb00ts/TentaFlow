@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use half::f16;
 
-use forge_formats::affine::AffineTriple;
-use forge_graph::{Act, ExecSpec, Executor, Op, Tile, WeightId, WeightStore};
+use forge_formats::affine::{to_affine_triple, AffineTriple};
+use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Tile, WeightId, WeightStore};
 use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, Result};
 
@@ -195,8 +195,10 @@ impl MetalExec {
             argmax: compile(msl::ARGMAX_SOURCE, msl::ARGMAX_NAME)?,
         };
 
-        let f16b = |elems: u32| device.alloc(elems as usize * 2, MemKind::Device, Pool::Activations);
-        let f32b = |elems: u32| device.alloc(elems as usize * 4, MemKind::Device, Pool::Activations);
+        let f16b =
+            |elems: u32| device.alloc(elems as usize * 2, MemKind::Device, Pool::Activations);
+        let f32b =
+            |elems: u32| device.alloc(elems as usize * 4, MemKind::Device, Pool::Activations);
         // Wszystko poza logitami ma miejsce na cały kafel prefillu: dekodowanie
         // używa pierwszego wiersza tych samych buforów. Logity liczymy tylko dla
         // ostatniego tokenu, więc zostają jednym wierszem — 32 tys. kolumn razy
@@ -269,6 +271,30 @@ impl MetalExec {
 }
 
 impl WeightStore for MetalExec {
+    /// Kernele Metalowe indeksują trzy osobne tablice, więc źródło oddające
+    /// bloki jest przepisywane TU. Model tego nie robi, bo nie zna kerneli —
+    /// a to samo źródło idzie na CUDA bez ani jednego przepisania.
+    fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
+        let t = match w {
+            QuantWeight::Affine(t) => t,
+            QuantWeight::Blocks {
+                data,
+                quant,
+                rows,
+                cols,
+            } => to_affine_triple(&data, quant, rows, cols)?,
+        };
+        self.put_affine(t)
+    }
+
+    fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId> {
+        let buf = upload(&*self.device, &bytes)?;
+        self.weights.push(Weight::Plain(buf));
+        Ok(WeightId(self.weights.len() as u32 - 1))
+    }
+}
+
+impl MetalExec {
     fn put_affine(&mut self, t: AffineTriple) -> Result<WeightId> {
         // Trzy właściwości sprawdzane TU, przy użyciu, a nie zakładane przy
         // wołaniu. Każda z nich była już raz źródłem poprawnie wyglądającego,
@@ -304,12 +330,6 @@ impl WeightStore for MetalExec {
             rows: t.rows as u32,
             cols: t.cols as u32,
         }));
-        Ok(WeightId(self.weights.len() as u32 - 1))
-    }
-
-    fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId> {
-        let buf = upload(&*self.device, &bytes)?;
-        self.weights.push(Weight::Plain(buf));
         Ok(WeightId(self.weights.len() as u32 - 1))
     }
 }
@@ -829,7 +849,11 @@ fn host_slice<T>(buf: &DevBuffer) -> Result<&[T]> {
     }
     // SAFETY: the allocation is `buf.len()` bytes of shared memory, alive for
     // as long as the buffer, and nothing writes it while the borrow lasts.
-    Ok(unsafe { std::slice::from_raw_parts(ptr as *const T, buf.len() / std::mem::size_of::<T>()) })
+    Ok(
+        unsafe {
+            std::slice::from_raw_parts(ptr as *const T, buf.len() / std::mem::size_of::<T>())
+        },
+    )
 }
 
 /// Typ parametrów kwantyzacji w wersji, którą znają kernele.
@@ -902,7 +926,11 @@ fn weight_args(
         _ => Err(ForgeError::Other(format!(
             "waga deklaruje {} bitów, a bufor wyższych bitów {}",
             w.bits,
-            if w.high.is_some() { "jest" } else { "go nie ma" }
+            if w.high.is_some() {
+                "jest"
+            } else {
+                "go nie ma"
+            }
         ))),
     }
 }

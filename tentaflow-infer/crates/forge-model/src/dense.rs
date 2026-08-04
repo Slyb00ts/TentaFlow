@@ -14,11 +14,11 @@
 
 use std::path::Path;
 
-use forge_formats::affine::{permute_rope_rows, to_affine_triple, AffineTriple};
+use forge_formats::affine::permute_rope_rows;
 use forge_formats::checkpoint::Checkpoint;
 use forge_formats::source::TensorSource;
 use forge_formats::WeightRole;
-use forge_graph::{Act, ExecSpec, Executor, Op, Tile, WeightId, WeightStore};
+use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Tile, WeightId, WeightStore};
 use forge_types::{DType, DenseShape, ForgeError, Result};
 
 /// A dense decoder running on `E`.
@@ -110,8 +110,8 @@ impl<E: Executor + WeightStore> Dense<E> {
         // źródła trzeba je przestawić RAZ, przy ładowaniu. Warunek stawiają
         // wspólne warstwy: architektura mówi, że tego wymaga, a źródło mówi, że
         // jeszcze tego nie zrobiło.
-        let rope = (desc.rope_interleaved() && src.stores_original_rope_order())
-            .then_some(p.head_dim);
+        let rope =
+            (desc.rope_interleaved() && src.stores_original_rope_order()).then_some(p.head_dim);
 
         let (h, kvw, inter) = (shape.hidden, shape.kv_width(), shape.inter);
         let src = &*src;
@@ -317,22 +317,91 @@ impl<E: Executor + WeightStore> Dense<E> {
         let s = self.shape;
         let l = &self.layers[index];
         vec![
-            Op::RmsNorm { out: Act::Norm, x: Act::Hidden, w: l.attn_norm, tokens },
-            Op::MatMul { out: Act::Query, w: l.q, x: Act::Norm, tokens },
-            Op::MatMul { out: Act::Key, w: l.k, x: Act::Norm, tokens },
-            Op::MatMul { out: Act::Value, w: l.v, x: Act::Norm, tokens },
-            Op::Rope { act: Act::Query, heads: s.heads, pos, tokens },
-            Op::Rope { act: Act::Key, heads: s.kv_heads, pos, tokens },
-            Op::KvAppend { layer: index, pos, tokens },
-            Op::Attention { layer: index, seq, tokens },
-            Op::MatMul { out: Act::Proj, w: l.o, x: Act::Attn, tokens },
-            Op::Residual { src: Act::Proj, tokens },
-            Op::RmsNorm { out: Act::Norm, x: Act::Hidden, w: l.ffn_norm, tokens },
-            Op::MatMul { out: Act::Gate, w: l.gate, x: Act::Norm, tokens },
-            Op::MatMul { out: Act::Up, w: l.up, x: Act::Norm, tokens },
+            Op::RmsNorm {
+                out: Act::Norm,
+                x: Act::Hidden,
+                w: l.attn_norm,
+                tokens,
+            },
+            Op::MatMul {
+                out: Act::Query,
+                w: l.q,
+                x: Act::Norm,
+                tokens,
+            },
+            Op::MatMul {
+                out: Act::Key,
+                w: l.k,
+                x: Act::Norm,
+                tokens,
+            },
+            Op::MatMul {
+                out: Act::Value,
+                w: l.v,
+                x: Act::Norm,
+                tokens,
+            },
+            Op::Rope {
+                act: Act::Query,
+                heads: s.heads,
+                pos,
+                tokens,
+            },
+            Op::Rope {
+                act: Act::Key,
+                heads: s.kv_heads,
+                pos,
+                tokens,
+            },
+            Op::KvAppend {
+                layer: index,
+                pos,
+                tokens,
+            },
+            Op::Attention {
+                layer: index,
+                seq,
+                tokens,
+            },
+            Op::MatMul {
+                out: Act::Proj,
+                w: l.o,
+                x: Act::Attn,
+                tokens,
+            },
+            Op::Residual {
+                src: Act::Proj,
+                tokens,
+            },
+            Op::RmsNorm {
+                out: Act::Norm,
+                x: Act::Hidden,
+                w: l.ffn_norm,
+                tokens,
+            },
+            Op::MatMul {
+                out: Act::Gate,
+                w: l.gate,
+                x: Act::Norm,
+                tokens,
+            },
+            Op::MatMul {
+                out: Act::Up,
+                w: l.up,
+                x: Act::Norm,
+                tokens,
+            },
             Op::SiluMul { tokens },
-            Op::MatMul { out: Act::Proj, w: l.down, x: Act::Activated, tokens },
-            Op::Residual { src: Act::Proj, tokens },
+            Op::MatMul {
+                out: Act::Proj,
+                w: l.down,
+                x: Act::Activated,
+                tokens,
+            },
+            Op::Residual {
+                src: Act::Proj,
+                tokens,
+            },
         ]
     }
 }
@@ -351,8 +420,8 @@ fn quant<E: WeightStore>(
     cols: u32,
     rope: Option<usize>,
 ) -> Result<WeightId> {
-    let t = affine(src, name, rows, cols, rope)?;
-    exec.put_affine(t)
+    let w = fetch_quant(src, name, rows, cols, rope)?;
+    exec.put_quant(w)
         .map_err(|e| ForgeError::Format(format!("{name}: {e}")))
 }
 
@@ -361,44 +430,63 @@ fn plain<E: WeightStore>(exec: &mut E, src: &dyn TensorSource, name: &str) -> Re
     exec.put_plain(src.fetch(name)?.0)
 }
 
-/// One weight in the affine form every backend indexes.
+/// One weight, in whatever form its source keeps it.
 ///
-/// A source that already stores it that way hands it over; the rest go through
-/// a rewrite. Either way the executor above gets the same thing, which is the
-/// whole reason a second format costs no branch in the model.
+/// The model does NOT rewrite it. Which layout the multiply wants is a property
+/// of the kernels, so the rewrite belongs to the executor: one backend wants
+/// three separate arrays, another wants the source's blocks untouched, and a
+/// model choosing for both would be choosing against one of them.
 ///
 /// `rope` carries the head width when the rows still need permuting, and
 /// nothing when they do not — an `Option` rather than a `bool` plus a width,
 /// because those two can disagree and this cannot.
-fn affine(
+fn fetch_quant(
     src: &dyn TensorSource,
     name: &str,
     rows: u32,
     cols: u32,
     rope: Option<usize>,
-) -> Result<AffineTriple> {
-    let mut t = match src.fetch_affine(name)? {
-        Some(t) => t,
+) -> Result<QuantWeight> {
+    let w = match src.fetch_affine(name)? {
+        // Źródło, które trzyma postać afiniczną natywnie, przestawia wiersze
+        // już przy konwersji — `stores_original_rope_order` jest tam fałszem, a
+        // to ono włącza `rope`. Gdyby kiedyś powstało źródło z obiema tymi
+        // właściwościami, ma się zatrzymać TUTAJ, a nie po cichu pominąć
+        // permutację: brak permutacji daje płynny, całkowicie inny tekst.
+        Some(t) => {
+            if rope.is_some() {
+                return Err(ForgeError::Unsupported(format!(
+                    "{name}: postać afiniczna źródła wymaga permutacji wierszy RoPE, \
+                     a ta działa na bajtach źródła"
+                )));
+            }
+            QuantWeight::Affine(t)
+        }
         None => {
-            let (data, _, quant, dims) = src.fetch(name)?;
+            let (mut data, _, quant, dims) = src.fetch(name)?;
             if dims != vec![rows as usize, cols as usize] {
                 return Err(ForgeError::Format(format!(
                     "{name}: kształt {dims:?}, oczekiwano [{rows}, {cols}]"
                 )));
             }
-            to_affine_triple(&data, quant, rows as usize, cols as usize)?
+            if let Some(head_dim) = rope {
+                permute_rope_rows(&mut data, rows as usize, head_dim)?;
+            }
+            QuantWeight::Blocks {
+                data,
+                quant,
+                rows: rows as usize,
+                cols: cols as usize,
+            }
         }
     };
-    if t.rows != rows as usize || t.cols != cols as usize {
+    let (r, c) = w.shape();
+    if r != rows as usize || c != cols as usize {
         return Err(ForgeError::Format(format!(
-            "{name}: kształt [{}, {}], oczekiwano [{rows}, {cols}]",
-            t.rows, t.cols
+            "{name}: kształt [{r}, {c}], oczekiwano [{rows}, {cols}]"
         )));
     }
-    if let Some(head_dim) = rope {
-        permute_rope_rows(&mut t, head_dim)?;
-    }
-    Ok(t)
+    Ok(w)
 }
 
 /// Names of the weights a dense checkpoint must provide, for callers that want

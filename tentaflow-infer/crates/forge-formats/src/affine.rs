@@ -143,47 +143,39 @@ pub fn to_affine_triple(
 /// tekst. Warunkiem jest `ModelDescriptor::rope_interleaved()` po stronie
 /// architektury i `TensorSource::stores_original_rope_order()` po stronie
 /// źródła — jedno bez drugiego nakłada permutację nie tam, gdzie trzeba.
-pub fn permute_rope_rows(t: &mut AffineTriple, head_dim: usize) -> Result<()> {
-    if head_dim == 0 || !head_dim.is_multiple_of(2) || !t.rows.is_multiple_of(head_dim) {
+///
+/// Działa na BAJTACH źródła, a nie na postaci przepisanej, bo to jest ta
+/// postać, którą widzą wszyscy wykonawcy — jeden ją potem rozkłada na trzy
+/// tablice, drugi zostawia bloki tak, jak leżą. Wiersz dowolnego formatu
+/// blokowego GGUF-a jest ciągłym zakresem bajtów, więc przestawienie wierszy
+/// nie musi wiedzieć, który to format; musi tylko wiedzieć, że wiersze są
+/// równe.
+pub fn permute_rope_rows(data: &mut [u8], rows: usize, head_dim: usize) -> Result<()> {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) || rows == 0 || !rows.is_multiple_of(head_dim) {
         return Err(ForgeError::Format(format!(
-            "RoPE: {} wierszy nie dzieli się na głowice po {head_dim}",
-            t.rows
+            "RoPE: {rows} wierszy nie dzieli się na głowice po {head_dim}"
         )));
     }
+    if !data.len().is_multiple_of(rows) {
+        return Err(ForgeError::Format(format!(
+            "RoPE: {} B nie dzieli się na {rows} równych wierszy",
+            data.len()
+        )));
+    }
+    let width = data.len() / rows;
     let half = head_dim / 2;
-    let per_row = |len: usize| len / t.rows;
-    let (wp, wh, ws) = (
-        per_row(t.packed.len()),
-        if t.high.is_empty() { 0 } else { per_row(t.high.len()) },
-        per_row(t.scales.len()),
-    );
-
-    let mut packed = vec![0u32; t.packed.len()];
-    let mut high = vec![0u32; t.high.len()];
-    let mut scales = vec![0u8; t.scales.len()];
-    let mut biases = vec![0u8; t.biases.len()];
-    for head in 0..t.rows / head_dim {
+    let mut out = vec![0u8; data.len()];
+    for head in 0..rows / head_dim {
         for a in 0..2 {
             for b in 0..half {
                 let dst = head * head_dim + a * half + b;
                 let src = head * head_dim + b * 2 + a;
-                packed[dst * wp..(dst + 1) * wp]
-                    .copy_from_slice(&t.packed[src * wp..(src + 1) * wp]);
-                if wh > 0 {
-                    high[dst * wh..(dst + 1) * wh]
-                        .copy_from_slice(&t.high[src * wh..(src + 1) * wh]);
-                }
-                scales[dst * ws..(dst + 1) * ws]
-                    .copy_from_slice(&t.scales[src * ws..(src + 1) * ws]);
-                biases[dst * ws..(dst + 1) * ws]
-                    .copy_from_slice(&t.biases[src * ws..(src + 1) * ws]);
+                out[dst * width..(dst + 1) * width]
+                    .copy_from_slice(&data[src * width..(src + 1) * width]);
             }
         }
     }
-    t.packed = packed;
-    t.high = high;
-    t.scales = scales;
-    t.biases = biases;
+    data.copy_from_slice(&out);
     Ok(())
 }
 
@@ -435,30 +427,46 @@ mod tests {
     }
 
     #[test]
-    fn the_rope_permutation_is_its_own_inverse_twice_over() {
+    fn the_rope_permutation_moves_whole_rows() {
         // Permutacja jest inwolucją tylko dla head_dim == 2; ogólnie NIE jest,
         // więc test sprawdza to, co naprawdę musi zachodzić: że przestawia
         // wiersze zgodnie ze wzorem, a nie że da się ją nałożyć dwa razy.
-        let (rows, cols, hd) = (8usize, 64usize, 4usize);
-        let mut t = AffineTriple::new_f16(rows, cols, GGML_AFFINE_GROUP);
-        for r in 0..rows {
-            for c in 0..cols {
-                t.put(r, c, (r as u8) & 0xF);
-            }
-        }
-        permute_rope_rows(&mut t, hd).expect("permutacja");
+        //
+        // Szerokość wiersza jest tu superblokiem Q4_K, żeby test mówił o tej
+        // jednostce, która naprawdę przechodzi: cały wiersz bloków, a nie bajt.
+        let (rows, hd, width) = (8usize, 4usize, Q4_K_BYTES);
+        let mut data: Vec<u8> = (0..rows * width).map(|i| (i / width) as u8).collect();
+        permute_rope_rows(&mut data, rows, hd).expect("permutacja");
         // HF[h*hd + a*(hd/2) + b] = GGUF[h*hd + b*2 + a]
         for head in 0..rows / hd {
             for a in 0..2 {
                 for b in 0..hd / 2 {
                     let dst = head * hd + a * (hd / 2) + b;
                     let src = head * hd + b * 2 + a;
-                    let at = dst * cols;
-                    let got = (t.packed[at / 8] >> ((at % 8) * 4)) & 0xF;
-                    assert_eq!(got, (src as u32) & 0xF, "wiersz {dst} wziął zły oryginał");
+                    assert!(
+                        data[dst * width..(dst + 1) * width]
+                            .iter()
+                            .all(|&v| v == src as u8),
+                        "wiersz {dst} wziął zły oryginał"
+                    );
                 }
             }
         }
+    }
+
+    /// Nierówny podział na wiersze musi być błędem, a nie cichym przesunięciem.
+    ///
+    /// Permutacja na bajtach nie zna formatu, więc jedyne, co ją chroni przed
+    /// pocięciem bloków w poprzek, to ten warunek.
+    #[test]
+    fn rows_that_do_not_divide_the_bytes_are_refused() {
+        let mut data = vec![0u8; 3 * Q4_K_BYTES + 1];
+        assert!(permute_rope_rows(&mut data, 3, 2).is_err());
+        let mut data = vec![0u8; 6 * Q4_K_BYTES];
+        assert!(
+            permute_rope_rows(&mut data, 6, 4).is_err(),
+            "6 wierszy na głowice po 4"
+        );
     }
 
     #[test]

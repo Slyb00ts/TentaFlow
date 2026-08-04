@@ -19,7 +19,7 @@
 // Ten crate NIE WIE o HAL i nie ma prawa się dowiedzieć.
 
 use forge_formats::affine::AffineTriple;
-use forge_types::{DType, DenseShape, Result};
+use forge_types::{DType, DenseShape, QuantKind, Result};
 
 /// Waga, którą wykonawca wgrał i trzyma.
 ///
@@ -65,22 +65,57 @@ pub enum Act {
 #[derive(Debug, Clone)]
 pub enum Op {
     /// Osadzenia tokenów kafla trafiają do `Act::Hidden`.
-    Embed { table: WeightId, tokens: Vec<u32> },
-    RmsNorm { out: Act, x: Act, w: WeightId, tokens: u32 },
+    Embed {
+        table: WeightId,
+        tokens: Vec<u32>,
+    },
+    RmsNorm {
+        out: Act,
+        x: Act,
+        w: WeightId,
+        tokens: u32,
+    },
     /// `out = x * wagaᵀ`. Formę wybiera wykonawca; model nie ma tu zdania.
-    MatMul { out: Act, w: WeightId, x: Act, tokens: u32 },
-    Rope { act: Act, heads: u32, pos: u32, tokens: u32 },
+    MatMul {
+        out: Act,
+        w: WeightId,
+        x: Act,
+        tokens: u32,
+    },
+    Rope {
+        act: Act,
+        heads: u32,
+        pos: u32,
+        tokens: u32,
+    },
     /// Dopisuje klucz i wartość tego kafla do cache'u warstwy.
-    KvAppend { layer: usize, pos: u32, tokens: u32 },
-    Attention { layer: usize, seq: u32, tokens: u32 },
+    KvAppend {
+        layer: usize,
+        pos: u32,
+        tokens: u32,
+    },
+    Attention {
+        layer: usize,
+        seq: u32,
+        tokens: u32,
+    },
     /// `Activated = silu(Gate) * Up`.
-    SiluMul { tokens: u32 },
+    SiluMul {
+        tokens: u32,
+    },
     /// `Hidden += src`.
-    Residual { src: Act, tokens: u32 },
+    Residual {
+        src: Act,
+        tokens: u32,
+    },
     /// Głowa wyjściowa, wyłącznie dla OSTATNIEGO tokenu kafla — pozostałe
     /// wiersze służą tylko zapełnieniu cache'u, a ta macierz jest największa
     /// w modelu.
-    LogitsOfLast { w: WeightId, x: Act, tokens: u32 },
+    LogitsOfLast {
+        w: WeightId,
+        x: Act,
+        tokens: u32,
+    },
 }
 
 /// Maszyna, która potrafi wykonać te operacje.
@@ -150,10 +185,43 @@ pub struct ExecSpec {
 /// docelowe miejsce — a przekazanie przez referencję kazałoby im skopiować
 /// każdą wagę modelu, czyli drugi raz zająć tyle pamięci, ile checkpoint waży.
 pub trait WeightStore {
-    /// Waga kwantyzowana afinicznie. Wykonawca SPRAWDZA, czy pasuje do tego, w
-    /// czym skompilował kernele — zamiast ufać, że wołający pamiętał.
-    fn put_affine(&mut self, t: AffineTriple) -> Result<WeightId>;
+    /// Waga kwantyzowana, w postaci ŹRÓDŁOWEJ. Wykonawca SPRAWDZA, czy pasuje do
+    /// tego, w czym skompilował kernele — zamiast ufać, że wołający pamiętał.
+    fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId>;
 
     /// Waga niekwantyzowana, w bajtach źródła.
     fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId>;
+}
+
+/// Waga kwantyzowana w postaci, w jakiej oddało ją źródło.
+///
+/// Przepisanie na postać, której chcą kernele, należy do WYKONAWCY, a nie do
+/// modelu. To nie jest kosmetyka: kernele Metalowe indeksują trzy osobne
+/// tablice, a kernele CUDA czytają bloki GGUF-a w oryginalnym układzie, więc
+/// model przepisujący wszystko „na jedno" musiałby wybrać jedną z tych dwóch
+/// stron. Wybór na rzecz postaci afinicznej jest przy tym STRATNY dla Q6_K,
+/// bo sześciu bitów nie da się włożyć w cztery.
+pub enum QuantWeight {
+    /// Bloki w układzie źródła, wiersz po wierszu.
+    Blocks {
+        data: Vec<u8>,
+        quant: QuantKind,
+        rows: usize,
+        cols: usize,
+    },
+    /// Źródło trzyma postać afiniczną NATYWNIE i nie ma innej — tak wygląda
+    /// eksport MLX, którego skale są w bf16. Przepuszczanie go przez format
+    /// pośredni po to, żeby wszystko wyglądało jednakowo, zwężało je do f16.
+    Affine(AffineTriple),
+}
+
+impl QuantWeight {
+    /// Kształt, niezależnie od postaci — do sprawdzenia wobec tego, czego
+    /// oczekuje architektura.
+    pub fn shape(&self) -> (usize, usize) {
+        match self {
+            Self::Blocks { rows, cols, .. } => (*rows, *cols),
+            Self::Affine(t) => (t.rows, t.cols),
+        }
+    }
 }

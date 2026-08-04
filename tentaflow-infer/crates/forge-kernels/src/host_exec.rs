@@ -24,8 +24,8 @@ use std::cell::RefCell;
 
 use half::{bf16, f16};
 
-use forge_formats::affine::AffineTriple;
-use forge_graph::{Act, ExecSpec, Executor, Op, Tile, WeightId, WeightStore};
+use forge_formats::affine::{to_affine_triple, AffineTriple};
+use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Tile, WeightId, WeightStore};
 use forge_types::{DType, DenseShape, ForgeError, Result};
 
 /// Tokens carried through the layers in one pass.
@@ -207,6 +207,31 @@ impl HostExec {
 }
 
 impl WeightStore for HostExec {
+    /// The reference indexes the affine triple, so a source that hands over
+    /// blocks is rewritten HERE — by the executor that wants that shape, not by
+    /// the model, which would then be choosing a layout on every backend's
+    /// behalf.
+    fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
+        let t = match w {
+            QuantWeight::Affine(t) => t,
+            QuantWeight::Blocks {
+                data,
+                quant,
+                rows,
+                cols,
+            } => to_affine_triple(&data, quant, rows, cols)?,
+        };
+        self.put_affine(t)
+    }
+
+    fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId> {
+        let v = widen(&bytes, self.norm_weights)?;
+        self.weights.push(HostWeight::Plain(v));
+        Ok(WeightId(self.weights.len() as u32 - 1))
+    }
+}
+
+impl HostExec {
     fn put_affine(&mut self, t: AffineTriple) -> Result<WeightId> {
         if t.param_dtype != self.quant_params {
             return Err(ForgeError::Format(format!(
@@ -236,12 +261,6 @@ impl WeightStore for HostExec {
             rows: t.rows,
             cols: t.cols,
         }));
-        Ok(WeightId(self.weights.len() as u32 - 1))
-    }
-
-    fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId> {
-        let v = widen(&bytes, self.norm_weights)?;
-        self.weights.push(HostWeight::Plain(v));
         Ok(WeightId(self.weights.len() as u32 - 1))
     }
 }
@@ -302,7 +321,10 @@ impl Executor for HostExec {
                 let mut row = vec![0.0f32; w.cols];
                 for (r, out) in dst.iter_mut().enumerate() {
                     w.row_into(r, &mut row);
-                    *out = row.iter().zip(&src).fold(0.0f32, |a, (x, y)| x.mul_add(*y, a));
+                    *out = row
+                        .iter()
+                        .zip(&src)
+                        .fold(0.0f32, |a, (x, y)| x.mul_add(*y, a));
                 }
                 Ok(())
             }
@@ -386,10 +408,7 @@ impl Executor for HostExec {
                         let mut scores = vec![0.0f32; len];
                         for (j, sc) in scores.iter_mut().enumerate() {
                             let kj = &kc[j * width + kv_head * dims..][..dims];
-                            *sc = qh
-                                .iter()
-                                .zip(kj)
-                                .fold(0.0f32, |a, (x, y)| x.mul_add(*y, a))
+                            *sc = qh.iter().zip(kj).fold(0.0f32, |a, (x, y)| x.mul_add(*y, a))
                                 * scale;
                         }
                         let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -509,7 +528,11 @@ mod tests {
             Act::Activated,
             Act::Logits,
         ];
-        assert_eq!(all.len(), SLOT_COUNT, "liczba slotów rozjechała się z listą");
+        assert_eq!(
+            all.len(),
+            SLOT_COUNT,
+            "liczba slotów rozjechała się z listą"
+        );
         let mut seen = vec![false; SLOT_COUNT];
         for a in all {
             let i = slot(a);

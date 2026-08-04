@@ -87,7 +87,7 @@ fn the_host_reference_decodes_the_same_tokens_as_mlx_lm() {
 #[test]
 fn the_reference_refuses_a_weight_it_was_not_set_up_for() {
     use forge_formats::affine::AffineTriple;
-    use forge_graph::{ExecSpec, WeightStore};
+    use forge_graph::{ExecSpec, QuantWeight, WeightStore};
     use forge_types::{DType, DenseShape};
 
     let shape = DenseShape {
@@ -112,13 +112,22 @@ fn the_reference_refuses_a_weight_it_was_not_set_up_for() {
     // liczby — dokładnie ta pomyłka dawała wcześniej płynny, zły tekst.
     let mut t = AffineTriple::new_f16(8, 64, 32);
     t.param_dtype = DType::BF16;
-    assert!(exec.put_affine(t).is_err(), "zły typ parametrów przeszedł");
+    assert!(
+        exec.put_quant(QuantWeight::Affine(t)).is_err(),
+        "zły typ parametrów przeszedł"
+    );
 
     // Grupa, która nie dzieli wiersza, adresowałaby skale poza ich tablicą.
     let mut t = AffineTriple::new_f16(8, 64, 32);
     t.group = 48;
-    assert!(exec.put_affine(t).is_err(), "grupa niedzieląca wiersza przeszła");
+    assert!(
+        exec.put_quant(QuantWeight::Affine(t)).is_err(),
+        "grupa niedzieląca wiersza przeszła"
+    );
 
     let t = AffineTriple::new_f16(8, 64, 32);
-    assert!(exec.put_affine(t).is_ok(), "poprawna waga odrzucona");
+    assert!(
+        exec.put_quant(QuantWeight::Affine(t)).is_ok(),
+        "poprawna waga odrzucona"
+    );
 }
