@@ -611,19 +611,73 @@ Wynik (128x256x64, 8 warpow, potok 3 etapy, wyjscie f16):
 `ptxas`: 230-254 rejestrow, zero spilli. Ksztalt L2-rezydentny poprawil sie o 9%,
 czyli poprawa jest w samej petli, nie w ruchu pamieci.
 
-### Co zostalo niezrobione: swizzle zamiast wypelnienia
+### Permutacja kawalkow zamiast wypelnienia
 
-`LDA = 8*KC + SMEM_PAD` jest bezkonfliktowy dla ODCZYTU `ldmatrix` (osiem
-wierszy po 16 B trafia w 32 rozne banki), ale **nie dla ZAPISU `cp.async`**:
-adres `(tid/2)*LDA + (tid%2)*4` przy LDA=12 daje kilkudrozne kolizje. Wiekszego
-wypelnienia nie da sie tu uzyc — LDA=20 przekracza limit pamieci wspoldzielonej
-przy NS=4. Wlasciwe rozwiazanie to XOR-swizzle (`layout.swizzle`,
-`make_ldmatrix_swizzle`), ktory naprawia obie strony I ZMNIEJSZA zajetosc
-(LDA=8*KC bez wypelnienia). Warunek: wiersz musi miec 128 B, czyli **KC=4**
-(przy KC=1 wiersz ma 32 B, osiem wierszy to 256 B i dwudrozna kolizja zostaje
-niezaleznie od permutacji). Przy KC=4, `chunk ^ (r % 8)` rozklada osiem wierszy
-na wszystkie 32 banki.
+Wypelnienie `LDA = 8*KC + 4` bylo bezkonfliktowe dla ODCZYTU `ldmatrix`, ale nie
+dla ZAPISU `cp.async`, i zadne wypelnienie tego nie naprawia: przy KC=1 wiersz
+ma 32 B, wiec osiem wierszy to 256 B — dwa razy wiecej niz 128-bajtowy zasieg
+bankow. Rozwiazaniem jest permutacja gniazd (`_swz`), nie odstep.
 
-Stan na dzis: 187-204 TFLOPS przy suficie 497, czyli 38-41%. Wlasne jadro FP8
-Modulara na tej samej maszynie osiaga 60% swojego sufitu, wiec zapas nadal jest
-i NIE jest to ograniczenie jezyka.
+Wbrew temu, co bylo tu napisane wczesniej, **nie wymaga to KC=4**. Wiersz ma
+NCH = 2*KC kawalkow po 16 B, wiec 128-bajtowy blok mieszci BRB = 8/NCH kolejnych
+WIERSZY, a gniazdo przesuwa sie o numer bloku:
+
+    slot(r, ch) = ((r % BRB) * NCH + ch + (r // BRB) % NCH) % 8
+    offset_u32  = (r // BRB) * 32 + 4 * slot
+
+Sprawdzone wyczerpujaco dla KC=1,2,4 po OBU stronach (osiem wierszy `ldmatrix`
+i osiem pasow `cp.async` trafiaja w 32 rozne banki).
+
+PULAPKA: sam wzor to za malo. `% 8` w petli sprawia, ze adres przestaje byc
+"wskaznik + stala", ptxas rozbija go na osobne rejestry i jadro wchodzi w spille
+przy 255 — wynik byl wtedy o 10% GORSZY niz z wypelnieniem. Trzeba wyliczyc
+JEDEN wskaznik na krok K i na pas przed petla (`a_ptr[c]`, `b_ptr[c]`); wtedy w
+petli zostaje sam skok o blok i spille znikaja.
+
+Zysk: 1-2% czasu i **jedna trzecia mniej pamieci wspoldzielonej** (8 zamiast 12
+u32 na wiersz), dzieki czemu potok 3 etapow miesci sie w 40 KiB zamiast 59.
+
+### Stan i co zmierzono o reszcie luki
+
+128x256x64, 8 warpow, potok 3 etapy, wyjscie f16, GB10:
+
+| | q/o | gate/up | down |
+|---|--:|--:|--:|
+| czas | 182,4 us | 489,2 us | 453,9 us |
+| TFLOPS | 188 | 193 | 208 |
+| roofline ksztaltu | 50% | 47% | 42% |
+| sufit instrukcji (497) | 38% | 39% | 42% |
+
+Trzy pomiary, ktore ZAMYKAJA hipotezy, zamiast je mnozyc:
+
+- **Liczba akumulatorow nie jest wina.** `bench_fp8_ceiling` z ILP=16 i ILP=32
+  (czyli 128 rejestrow akumulatora, tyle co nasz podkafel 64x64) trzyma
+  494-499 TFLOPS. Sufit nie spada przy naszym obciazeniu rejestrow.
+- **Skale kosztuja 14% na ksztaltach dlugich po K i ZERO w petli.** Podmiana
+  odczytu skal na stala (wynik bledny, sam pomiar): `down` 454 -> 390 us, ale
+  ksztalt L2-rezydentny bez zmian (109,2 vs 108,7). Czyli placi sie za RUCH skal
+  z DRAM, nie za ich odczyt z pamieci wspoldzielonej — a to jest wpisane w
+  format (1/16 bajta na element, +12,5% ruchu).
+- **SASS jest zdrowy**: 64 OMMA na cialo petli, akumulatory niezalezne, flagi
+  `.reuse`, zero kopii akumulatora przy `mma`, zero spilli (248 rejestrow).
+
+Czego NIE robic:
+
+- **16 warpow nie startuje.** 512 watkow x ~135 rejestrow > 65536
+  (`CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`), tak samo jak udokumentowane wyzej dla
+  FP8. Podkafel 64x64 na 8 warpach zostaje.
+- **Potok glebszy niz 4 etapy szkodzi** (NS=6: -38%), mimo ze po permutacji
+  miesci sie w pamieci.
+- Parowanie B w `ldmatrix.x4` — w granicach szumu (patrz wyzej).
+
+Dla porownania: wlasne jadro FP8 Modulara na tej samej maszynie plateauje na
+~150 TFLOPS przy suficie 251, czyli 60%. My mamy 208 TFLOPS przy suficie 497,
+czyli 42%. W liczbach bezwzglednych NVFP4 daje wiec 1,39x wzgledem FP8, a nie
+2x, ktore obiecuje sama instrukcja — i to ta roznica miedzy 42% a 60% jest tym,
+co zostalo do wziecia.
+
+Nastepna konkretna dzwignia (zmierzona, niezrobiona): skale ida osobnym
+`cp.async` po **4 bajty na wiersz na etap** — to jedna trzecia wszystkich kopii
+przy jednej dziewiatej bajtow. Skale kolejnych blokow K sa w pamieci ciagle,
+wiec da sie brac cztery etapy naraz jednym 16-bajtowym `cp.async`, kosztem
+osobnego, glebszego pierscienia na skale.

@@ -300,3 +300,8 @@ def main() raises:
     _report_nvf4[1](ctx, dst)
     _report_nvf4[4](ctx, dst)
     _report_nvf4[8](ctx, dst)
+    # Nasza petla GEMM trzyma 32 akumulatory (128 rejestrow) na watek. Jesli
+    # sufit przy tym ILP spada, to nie uklad kafla jest wina, tylko sama liczba
+    # zywych akumulatorow.
+    _report_nvf4[16](ctx, dst)
+    _report_nvf4[32](ctx, dst)

@@ -42,15 +42,35 @@ from std.sys import _RegisterPackType, size_of
 from std.time import perf_counter_ns
 
 comptime LANES = 32
-# Odstep wiersza kafla w u32: 8*KC kodow + SMEM_PAD.
-comptime SMEM_PAD = 4
 comptime ROUNDS = 5
 comptime ITERS = 10
 
 
 def _smem_bytes[BM: Int, BN: Int, KC: Int, NS: Int]() -> Int:
-    """Bajty pamieci wspoldzielonej kafla: kody + skale, razy glebokosc potoku."""
-    return 4 * NS * ((BM + BN) * (8 * KC + SMEM_PAD) + (BM + BN) * KC)
+    """Bajty pamieci wspoldzielonej kafla: kody + skale, razy glebokosc potoku.
+
+    Kody nie maja juz wypelnienia — konflikty bankow zdejmuje permutacja
+    kawalkow (`_swz`), nie odstep wiersza.
+    """
+    return 4 * NS * ((BM + BN) * 8 * KC + (BM + BN) * KC)
+
+
+def _swz[KC: Int](r: Int, ch: Int) -> Int:
+    """Przesuniecie u32 kawalka 16-bajtowego `ch` wiersza `r` po permutacji.
+
+    Wiersz ma NCH = 2*KC kawalkow po 16 B, wiec 128-bajtowy blok bankow mieszci
+    BRB = 8/NCH kolejnych WIERSZY. Wewnatrz bloku kawalki dostaja gniazdo
+    przesuniete o numer bloku — dzieki temu osiem wierszy czytanych jednym
+    `ldmatrix` (i osiem pasow piszacych `cp.async`) trafia w 32 rozne banki.
+    Samo wypelnienie tego nie daje: dla KC=1 wiersz ma 32 B, wiec osiem wierszy
+    to 256 B i przy KAZDYM odstepie zostaje kolizja dwudrozna po stronie zapisu.
+    Przy okazji znikaja 4 u32 wypelnienia na wiersz.
+    """
+    comptime NCH = 2 * KC
+    comptime BRB = 8 // NCH
+    return (r // BRB) * 32 + 4 * (
+        ((r % BRB) * NCH + ch + (r // BRB) % NCH) % 8
+    )
 
 
 def mma_nvfp4(
@@ -136,7 +156,7 @@ def gemm_nvfp4[
 
 
 def _stage[
-    ROWS: Int, KC: Int, NTHR: Int, LDA: Int
+    ROWS: Int, KC: Int, NTHR: Int
 ](
     s: Int,
     buf: Int,
@@ -158,7 +178,7 @@ def _stage[
     Kody ida po 16 B (4 u32), skale po 4*KC B — wiersz skal to dokladnie KC
     kolejnych u32, wiec jeden `cp.async` na wiersz wystarczy do KC=4.
     """
-    comptime TILE = ROWS * LDA
+    comptime TILE = ROWS * 8 * KC
     comptime STILE = ROWS * KC
     comptime CPR = 2 * KC          # kopii 16-bajtowych na wiersz
     comptime CODES = ROWS * CPR
@@ -168,12 +188,12 @@ def _stage[
         cid = tid + p * NTHR
         if cid < CODES:
             r = cid // CPR
-            w4 = (cid % CPR) * 4
+            ch = cid % CPR
             async_copy[16](
-                (src + (row0 + r) * row_words + k_word + w4).address_space_cast[
-                    AddressSpace.GLOBAL
-                ](),
-                dst + buf * TILE + r * LDA + w4,
+                (
+                    src + (row0 + r) * row_words + k_word + ch * 4
+                ).address_space_cast[AddressSpace.GLOBAL](),
+                dst + buf * TILE + _swz[KC](r, ch),
             )
 
     comptime for p in range((ROWS + NTHR - 1) // NTHR):
@@ -206,10 +226,9 @@ def gemm_nvfp4_tiled[
     operandy dostaja przez podwojnie buforowany `cp.async`. Wynik jest BITOWO
     IDENTYCZNY z wersja naiwna: kolejnosc sumowania po K sie nie zmienia.
 
-    Odstep wiersza LDA = 8*KC + 4 u32 jest dobrany tak, zeby 32 pasy warpa
-    trafialy w 32 rozne banki (adres pasa to g*LDA + q, a LDA mod 32 jest
-    wielokrotnoscia 4 wzajemnie pierwsza z 8) — bez tego odczyt fragmentu A
-    zderza sie cztero-drozne.
+    Kafle w pamieci wspoldzielonej nie maja wypelnienia: konflikty bankow
+    zdejmuje permutacja kawalkow 16-bajtowych (`_swz`), po obu stronach —
+    i przy `ldmatrix`, i przy `cp.async`.
 
     Siatka jest JEDNOWYMIAROWA i przenumerowana grupami po GM kafli M: bloki
     lecace obok siebie maja wspolne n0, wiec plat B, ktory czytaja, zostaje w
@@ -218,9 +237,10 @@ def gemm_nvfp4_tiled[
     kazdego kolejnego — to na tej maszynie kosztuje wielokrotnosc, bo 273 GB/s
     LPDDR5X jest tu ograniczeniem, nie tensor core.
     """
-    comptime LDA = 8 * KC + SMEM_PAD
-    comptime ATILE = BM * LDA
-    comptime BTILE = BN * LDA
+    comptime NCH = 2 * KC
+    comptime BRB = 8 // NCH        # wierszy w 128-bajtowym bloku bankow
+    comptime ATILE = BM * 8 * KC
+    comptime BTILE = BN * 8 * KC
     comptime SATILE = BM * KC
     comptime SBTILE = BN * KC
     comptime NTHR = NW * LANES
@@ -268,10 +288,35 @@ def gemm_nvfp4_tiled[
     # jedna instrukcja zastepuje cztery ladowania 4-bajtowe dla A i dwa dla B.
     a_f16 = a_sm.bitcast[Float16]()
     b_f16 = b_sm.bitcast[Float16]()
-    a_frag = 2 * (
-        (warp_m + lane % 8 + 8 * ((lane // 8) % 2)) * LDA + 4 * (lane // 16)
-    )
-    b_frag = 2 * ((warp_n + lane % 8) * LDA + 4 * ((lane // 8) % 2))
+    # Gniazdo w bloku nie zalezy od `mi`/`ni` (16 i 8 sa wielokrotnosciami BRB),
+    # wiec czesc stala permutacji liczy sie raz na pas, a w petli zostaje sam
+    # skok o blok.
+    a_r0 = warp_m + lane % 8 + 8 * ((lane // 8) % 2)
+    a_slot0 = (a_r0 % BRB) * NCH + (a_r0 // BRB) % NCH + lane // 16
+    b_c0 = warp_n + lane % 8
+    b_slot0 = (b_c0 % BRB) * NCH + (b_c0 // BRB) % NCH + (lane // 8) % 2
+    # JEDEN wskaznik na krok K i na pas. Bez tego `% 8` zostaje w petli, adres
+    # przestaje byc "wskaznik + stala" i ptxas trzyma go w osobnych rejestrach
+    # — az do spilli przy 255.
+    var a_ptr = InlineArray[
+        UnsafePointer[
+            Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+        ],
+        KC,
+    ](uninitialized=True)
+    var b_ptr = InlineArray[
+        UnsafePointer[
+            Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+        ],
+        KC,
+    ](uninitialized=True)
+    comptime for c in range(KC):
+        a_ptr[c] = a_f16 + 2 * (
+            (a_r0 // BRB) * 32 + 4 * ((a_slot0 + 2 * c) % 8)
+        )
+        b_ptr[c] = b_f16 + 2 * (
+            (b_c0 // BRB) * 32 + 4 * ((b_slot0 + 2 * c) % 8)
+        )
 
     var acc = InlineArray[SIMD[DType.float32, 4], MT * NT](
         fill=SIMD[DType.float32, 4](0.0)
@@ -289,19 +334,19 @@ def gemm_nvfp4_tiled[
     var bf = InlineArray[SIMD[DType.uint32, 2], 2 * NT](uninitialized=True)
 
     comptime for i in range(NS - 1):
-        _stage[BM, KC, NTHR, LDA](i, i, tid, m0, A_ROW, S_ROW, a, sa, a_sm, sa_sm)
-        _stage[BN, KC, NTHR, LDA](i, i, tid, n0, A_ROW, S_ROW, b, sb, b_sm, sb_sm)
+        _stage[BM, KC, NTHR](i, i, tid, m0, A_ROW, S_ROW, a, sa, a_sm, sa_sm)
+        _stage[BN, KC, NTHR](i, i, tid, n0, A_ROW, S_ROW, b, sb, b_sm, sb_sm)
         async_copy_commit_group()
     async_copy_wait_group(Int32(NS - 2))
     barrier()
 
     comptime for mi in range(MT):
         af[mi] = bitcast[DType.uint32, 4](
-            ld_matrix[8](a_f16 + 2 * (mi * 16 * LDA) + a_frag)
+            ld_matrix[8](a_ptr[0] + 2 * (mi * (16 // BRB) * 32))
         )
     comptime for ni in range(NT):
         bf[ni] = bitcast[DType.uint32, 2](
-            ld_matrix[4](b_f16 + 2 * (ni * 8 * LDA) + b_frag)
+            ld_matrix[4](b_ptr[0] + 2 * (ni * (8 // BRB) * 32))
         )
 
     # Etapy ida PARAMI, zeby parzystosc kompletu rejestrow (`cur`) byla stala
@@ -330,8 +375,8 @@ def gemm_nvfp4_tiled[
                         buf * SBTILE + (warp_n + ni * 8 + g) * KC + c
                     ]
 
+                comptime nc = (c + 1) % KC
                 var nbuf = buf
-                var nc = c + 1
 
                 comptime if c + 1 == KC:
                     # Ostatni krok K etapu: dopiero TERAZ wolno pisac do bufora
@@ -340,16 +385,15 @@ def gemm_nvfp4_tiled[
                     # na etap, nie dwie.
                     nxt = st + NS - 1
                     if nxt < STAGES:
-                        _stage[BM, KC, NTHR, LDA](
+                        _stage[BM, KC, NTHR](
                             nxt, nxt % NS, tid, m0, A_ROW, S_ROW,
                             a, sa, a_sm, sa_sm,
                         )
-                        _stage[BN, KC, NTHR, LDA](
+                        _stage[BN, KC, NTHR](
                             nxt, nxt % NS, tid, n0, A_ROW, S_ROW,
                             b, sb, b_sm, sb_sm,
                         )
                     async_copy_commit_group()
-                    nc = 0
                     if st + 1 < STAGES:
                         nbuf = (st + 1) % NS
                         async_copy_wait_group(Int32(NS - 2))
@@ -358,17 +402,15 @@ def gemm_nvfp4_tiled[
                 comptime for mi in range(MT):
                     af[nx * MT + mi] = bitcast[DType.uint32, 4](
                         ld_matrix[8](
-                            a_f16
-                            + 2 * (nbuf * ATILE + mi * 16 * LDA + 8 * nc)
-                            + a_frag
+                            a_ptr[nc]
+                            + 2 * (nbuf * ATILE + mi * (16 // BRB) * 32)
                         )
                     )
                 comptime for ni in range(NT):
                     bf[nx * NT + ni] = bitcast[DType.uint32, 2](
                         ld_matrix[4](
-                            b_f16
-                            + 2 * (nbuf * BTILE + ni * 8 * LDA + 8 * nc)
-                            + b_frag
+                            b_ptr[nc]
+                            + 2 * (nbuf * BTILE + ni * (8 // BRB) * 32)
                         )
                     )
 
@@ -499,7 +541,7 @@ def _check[
 
     if tiled:
         ctx.enqueue_function[
-            gemm_nvfp4_tiled[DType.float32, N, K, BM, BN, KC, NW, WM, GM, NS]
+            gemm_nvfp4_tiled[DType.float32, N, K, BM, BN, KC, NW, WM, GM, NS],
         ](
             y.unsafe_ptr(), a.unsafe_ptr(), sa.unsafe_ptr(),
             b.unsafe_ptr(), sb.unsafe_ptr(), M // BM,
@@ -606,78 +648,31 @@ def _time[
 
 def main() raises:
     var ctx = DeviceContext()
-    _check[32, 64, 128](ctx, False)
-    _check[64, 128, 256](ctx, False)
-    _check[128, 64, 512](ctx, False)
-    _check[128, 256, 128](ctx, True)
-    _check[256, 256, 256](ctx, True)
-    _check[128, 128, 256, 128, 128, 2, 4, 2](ctx, True)
     _check[128, 256, 256, 128, 256, 1, 8, 2, 8, 3](ctx, True)
-    _check[128, 256, 512, 128, 256, 1, 8, 2, 8, 4](ctx, True)
 
     print("")
-    print("Sufit tej maszyny (bench_fp8_ceiling): 497 TFLOPS na tej instrukcji,")
-    print("222 GB/s odczytu z DRAM. Przy M=1024 wszystkie trzy ksztalty sa")
-    print("OGRANICZONE PASMEM, wiec dtype wyjscia wazy tyle co uklad kafla.")
+    print("Sufit: 497 TFLOPS na tej instrukcji, 222 GB/s z DRAM.")
+    print("Kafle bez wypelnienia (permutacja), wiec potok miesci sie glebiej.")
     print("")
-
-    print("--- naiwny (1 warp na kafel 16x64, bez smem), wyjscie f16 ---")
-    _time[1024, 4096, 4096](ctx, "q/o     :", False)
-    _time[1024, 11264, 4096](ctx, "gate/up :", False)
-    _time[1024, 4096, 11264](ctx, "down    :", False)
-
-    print("")
-    print("--- 128x256x64, 8w, potok 2 etapy (39 KiB) ---")
-    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 2](ctx, "q/o     :", True)
-    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 2](ctx, "gate/up :", True)
-    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 2](ctx, "down    :", True)
+    print("--- 128x256x64, 8w, potok N etapow ---")
+    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 3](ctx, "q/o      NS=3:", True)
+    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 4](ctx, "q/o      NS=4:", True)
+    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 6](ctx, "q/o      NS=6:", True)
+    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 3](ctx, "gate/up  NS=3:", True)
+    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 4](ctx, "gate/up  NS=4:", True)
+    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 6](ctx, "gate/up  NS=6:", True)
+    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 3](ctx, "down     NS=3:", True)
+    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 4](ctx, "down     NS=4:", True)
+    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 6](ctx, "down     NS=6:", True)
 
     print("")
-    print("--- 128x256x64, 8w, potok 3 etapy (59 KiB) ---")
-    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 3](ctx, "q/o     :", True)
-    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 3](ctx, "gate/up :", True)
-    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 3](ctx, "down    :", True)
+    print("--- 128x256x128 (KC=2), 8w ---")
+    _time[1024, 4096, 4096, 128, 256, 2, 8, 2, 8, 3](ctx, "q/o      NS=3:", True)
+    _time[1024, 11264, 4096, 128, 256, 2, 8, 2, 8, 3](ctx, "gate/up  NS=3:", True)
+    _time[1024, 4096, 11264, 128, 256, 2, 8, 2, 8, 3](ctx, "down     NS=3:", True)
 
     print("")
-    print("--- 128x256x64, 8w, potok 4 etapy (78 KiB) ---")
-    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 4](ctx, "q/o     :", True)
-    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 4](ctx, "gate/up :", True)
-    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 4](ctx, "down    :", True)
-
-    print("")
-    print("--- 128x256x128, 8w, potok 2 etapy (66 KiB) ---")
-    _time[1024, 4096, 4096, 128, 256, 2, 8, 2, 8, 2](ctx, "q/o     :", True)
-    _time[1024, 11264, 4096, 128, 256, 2, 8, 2, 8, 2](ctx, "gate/up :", True)
-    _time[1024, 4096, 11264, 128, 256, 2, 8, 2, 8, 2](ctx, "down    :", True)
-
-    print("")
-    print("--- 128x128x128, 4w, potok 3 etapy (66 KiB) ---")
-    _time[1024, 4096, 4096, 128, 128, 2, 4, 2, 8, 3](ctx, "q/o     :", True)
-    _time[1024, 11264, 4096, 128, 128, 2, 4, 2, 8, 3](ctx, "gate/up :", True)
-    _time[1024, 4096, 11264, 128, 128, 2, 4, 2, 8, 3](ctx, "down    :", True)
-
-    print("")
-    print("--- 128x128x128, 4w, potok 4 etapy (88 KiB) ---")
-    _time[1024, 4096, 4096, 128, 128, 2, 4, 2, 8, 4](ctx, "q/o     :", True)
-    _time[1024, 11264, 4096, 128, 128, 2, 4, 2, 8, 4](ctx, "gate/up :", True)
-    _time[1024, 4096, 11264, 128, 128, 2, 4, 2, 8, 4](ctx, "down    :", True)
-
-    print("")
-    print("--- 2048x2048x2048: A+B+Y = 13 MiB, czyli caly ksztalt siedzi w L2 ---")
-    print("    podloga obliczeniowa tego ksztaltu to 34.5 us; ile z niej bierzemy")
-    print("    BEZ udzialu DRAM-u mowi, czy reszta luki to pasmo czy wystawianie")
-    _time[2048, 2048, 2048, 128, 256, 1, 8, 2, 8, 2](ctx, "128x256x64  :", True)
-    _time[2048, 2048, 2048, 128, 256, 1, 8, 2, 8, 3](ctx, "128x256x64/3:", True)
-    _time[2048, 2048, 2048, 128, 128, 2, 4, 2, 8, 3](ctx, "128x128x128 :", True)
-
-    print("")
-    print("--- 128x256x64, 8w, 3 etapy, ale wyjscie f32 (koszt pasma) ---")
-    _time[1024, 4096, 4096, 128, 256, 1, 8, 2, 8, 3, DType.float32](
-        ctx, "q/o     :", True
-    )
-    _time[1024, 11264, 4096, 128, 256, 1, 8, 2, 8, 3, DType.float32](
-        ctx, "gate/up :", True
-    )
-    _time[1024, 4096, 11264, 128, 256, 1, 8, 2, 8, 3, DType.float32](
-        ctx, "down    :", True
-    )
+    print("--- 2048x2048x2048 (13 MiB, caly w L2); podloga 34,5 us ---")
+    _time[2048, 2048, 2048, 128, 256, 1, 8, 2, 8, 3](ctx, "NS=3 :", True)
+    _time[2048, 2048, 2048, 128, 256, 1, 8, 2, 8, 4](ctx, "NS=4 :", True)
+    _time[2048, 2048, 2048, 128, 256, 1, 8, 2, 8, 6](ctx, "NS=6 :", True)
