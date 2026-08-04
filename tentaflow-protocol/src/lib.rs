@@ -653,6 +653,8 @@ pub use message_body::{
     ServiceOauthPollResponse,
     ServiceOauthStartRequest,
     ServiceOauthStartResponse,
+    ServiceAgentRequest,
+    ServiceAgentResponse,
     ServicePauseRequest,
     ServicePauseResponse,
     ServicePayload,

@@ -99,9 +99,9 @@ pub struct ServiceInfo {
     /// llm / stt / tts / embeddings / image-gen / agents / ...
     pub category: String,
     pub display_name: String,
-    /// docker / native_embedded / native_binary / native_python_bundle / external.
+    /// docker / native_embedded / native_binary / native_python_bundle / native_managed_cli / external.
     pub deploy_method: String,
-    /// embedded / http_direct / sidecar_quic / external_http.
+    /// embedded / http_direct / sidecar_quic / external_http / agent_rpc.
     pub transport: String,
     /// deploying / starting / running / degraded / failed / stopped / interrupted.
     pub status: String,
@@ -465,6 +465,24 @@ pub struct ServiceOauthPollResponse {
     pub error: Option<String>,
 }
 
+/// Request routed to a deployed Codex or Claude Code CLI bridge.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAgentRequest {
+    pub service_id: i64,
+    pub node_id: Option<String>,
+    /// Stable bridge operation name, for example `auth.status` or `session.turn`.
+    pub operation: String,
+    /// Operation-specific JSON. The owner validates it before contacting the bridge.
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAgentResponse {
+    pub success: bool,
+    pub result_json: String,
+    pub error: Option<String>,
+}
+
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -493,6 +511,8 @@ pub enum ServicePayload {
     ResOauthStart(ServiceOauthStartResponse),
     ReqOauthPoll(ServiceOauthPollRequest),
     ResOauthPoll(ServiceOauthPollResponse),
+    ReqAgent(ServiceAgentRequest),
+    ResAgent(ServiceAgentResponse),
 }
 
 // =============================================================================

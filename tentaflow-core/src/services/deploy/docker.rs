@@ -1280,10 +1280,14 @@ impl DeployStrategy for DockerDeploy {
             .map(|d| d.role == "worker")
             .unwrap_or(false);
 
-        let transport = match &distributed {
-            Some(_) if is_worker => Transport::Embedded,
-            Some(_) => Transport::HttpDirect,
-            None => self.pick_transport(),
+        let transport = if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code") {
+            Transport::AgentRpc
+        } else {
+            match &distributed {
+                Some(_) if is_worker => Transport::Embedded,
+                Some(_) => Transport::HttpDirect,
+                None => self.pick_transport(),
+            }
         };
         let internal_port = self.manifest.engine.default_port;
         let mut allocated = Vec::new();
@@ -1334,6 +1338,10 @@ impl DeployStrategy for DockerDeploy {
             env.insert(k, v);
         }
         env.insert("PORT".into(), internal_port.to_string());
+        env.insert(
+            "TENTAFLOW_ENGINE_ID".into(),
+            self.manifest.engine.id.clone(),
+        );
         // Distributed: VLLM_PORT is the torch.distributed TCPStore master port and
         // MUST differ from the serve API port — the manifest default (8000) is never
         // allocated, so without this every member's vLLM would land on 8000 and
@@ -1540,6 +1548,36 @@ impl DeployStrategy for DockerDeploy {
                 false,
             ),
         ];
+        if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code") {
+            let workspace = self
+                .user_config
+                .get("workspace_root")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir().map_err(|e| {
+                    DeployError::Manifest(format!("resolve coding-agent workspace: {e}"))
+                })?);
+            let workspace = std::fs::canonicalize(&workspace).map_err(|e| {
+                DeployError::Manifest(format!(
+                    "invalid coding-agent workspace {}: {e}",
+                    workspace.display()
+                ))
+            })?;
+            if !workspace.is_dir() {
+                return Err(DeployError::Manifest(
+                    "coding-agent workspace_root is not a directory".to_string(),
+                ));
+            }
+            let state = crate::paths::keys_dir()
+                .join("coding-agents")
+                .join(&self.manifest.engine.id);
+            std::fs::create_dir_all(&state).map_err(|e| {
+                DeployError::Manifest(format!("create coding-agent state directory: {e}"))
+            })?;
+            binds.push((workspace, "/workspace".to_string(), false));
+            binds.push((state, "/data".to_string(), false));
+        }
 
         // ComfyUI nie pobiera wag sam: bez checkpointu w `models/checkpoints`
         // kazda generacja konczy sie `ckpt_name not in []`. Sciagamy plik

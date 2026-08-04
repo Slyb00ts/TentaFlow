@@ -125,9 +125,9 @@ pub fn project_service_row(
             .by_id(&svc.engine_id)
             .map(|m| match svc.deploy_method {
                 DeployMethod::Docker => m.docker_source_hash.as_str(),
-                DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => {
-                    m.native_source_hash.as_str()
-                }
+                DeployMethod::NativeBinary
+                | DeployMethod::NativePythonBundle
+                | DeployMethod::NativeManagedCli => m.native_source_hash.as_str(),
                 _ => "",
             })
             .unwrap_or("");

@@ -3389,6 +3389,7 @@ async function startDeploy() {
       deployId: id,
       engineId: eng.id,
       deployMethod: selection.deployMethod,
+      nodeId: selection.nodeId,
     });
   } catch (err) {
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');

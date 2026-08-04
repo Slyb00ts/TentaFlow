@@ -250,6 +250,7 @@ pub struct Supervisor {
     /// by `(node_id, service_id)` so the supervisor can abort the right task
     /// when a row is removed from the snapshot. Sole producer.
     reconnect_tasks: Arc<Mutex<HashMap<(String, i64), JoinHandle<()>>>>,
+    agent_model_sync: Arc<Mutex<HashMap<i64, Instant>>>,
     /// Optional catalog provider; when set, every successful
     /// `reconcile_handles` tick triggers a rebuild so deploy / undeploy /
     /// peer announce/disconnect propagate to `/v1/models` without an
@@ -295,6 +296,7 @@ impl Supervisor {
             mesh_registry,
             live_handles,
             reconnect_tasks: Arc::new(Mutex::new(HashMap::new())),
+            agent_model_sync: Arc::new(Mutex::new(HashMap::new())),
             catalog_provider: None,
             // Shared singleton zgodny z router/handler/executor/flow_engine.
             // reconcile uzywa go do rejestrowania HTTP backendow STT services
@@ -406,6 +408,8 @@ impl Supervisor {
         if let Err(e) = self.auto_start_pinned().await {
             tracing::warn!("supervisor: auto_start_pinned failed: {}", e);
         }
+
+        self.sync_coding_agent_models(&services).await;
 
         // Mesh registry + live handles reconcile before the V2 snapshot so
         // call sites that pull handles via `live_handles.get_for_model` see a
@@ -743,6 +747,7 @@ impl Supervisor {
             // baked hash, ale nie przebudował obrazu — running obraz jest stary,
             // a DB twierdzi że aktualny). ŹRÓDŁEM PRAWDY jest tag obrazu.
             self.sync_docker_deployed_hashes(&services).await;
+            self.sync_coding_agent_models(&services).await;
 
             // pinned-respawn handled by Krok N4 — list_pinned() is already
             // available in services_repo for the consumer there.
@@ -876,6 +881,55 @@ impl Supervisor {
         })
         .await
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
+    }
+
+    async fn sync_coding_agent_models(&self, services: &[ServiceRow]) {
+        const INTERVAL: Duration = Duration::from_secs(300);
+        for service in services {
+            if service.transport != Transport::AgentRpc
+                || !matches!(service.status, ServiceStatus::Running | ServiceStatus::Degraded)
+            {
+                continue;
+            }
+            {
+                let mut last = self.agent_model_sync.lock().await;
+                if last
+                    .get(&service.id)
+                    .is_some_and(|instant| instant.elapsed() < INTERVAL)
+                {
+                    continue;
+                }
+                last.insert(service.id, Instant::now());
+            }
+            let auth = match crate::services::coding_agent::execute(service, "auth.status", "{}")
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!(service_id = service.id, %error, "coding-agent auth probe failed");
+                    continue;
+                }
+            };
+            let authenticated = serde_json::from_str::<serde_json::Value>(&auth)
+                .ok()
+                .and_then(|value| value.get("authenticated").and_then(|v| v.as_bool()))
+                .unwrap_or(false);
+            if !authenticated {
+                continue;
+            }
+            match crate::services::coding_agent::execute(service, "models.list", "{}").await {
+                Ok(result) => {
+                    if let Err(error) =
+                        crate::services::coding_agent::sync_models(&self.db, service, &result)
+                    {
+                        tracing::warn!(service_id = service.id, %error, "coding-agent model sync failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(service_id = service.id, %error, "coding-agent model discovery failed");
+                }
+            }
+        }
     }
 
     async fn write_runtime(&self, id: i64, runtime: &RuntimeHandle) -> Result<(), SupervisorError> {
@@ -1225,7 +1279,7 @@ impl Supervisor {
                 Some(p) => p.probe("").await,
                 None => HealthStatus::Ok,
             },
-            Transport::HttpDirect => match endpoint_url {
+            Transport::HttpDirect | Transport::AgentRpc => match endpoint_url {
                 Some(url) => http_probe(url, self.health_timeout).await,
                 None => HealthStatus::Failed("HttpDirect: missing endpoint_url".into()),
             },

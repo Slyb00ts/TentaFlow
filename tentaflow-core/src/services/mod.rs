@@ -23,6 +23,7 @@ pub mod camera_ingest;
 #[cfg(feature = "camera")]
 pub mod camera_relay;
 pub mod catalog;
+pub mod coding_agent;
 pub mod deploy;
 pub mod detection_bus;
 pub mod document;

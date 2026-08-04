@@ -608,6 +608,12 @@ pub enum MeshCommandType {
     MlTrainCancel {
         run_id: String,
     },
+    /// Forward a validated coding-agent bridge operation to its owner node.
+    AgentRpc {
+        service_id: i64,
+        operation: String,
+        payload_json: String,
+    },
 }
 
 /// Per-node spec distributed-deployu policzony przez koordynatora z
@@ -864,6 +870,8 @@ pub enum MeshCommandResponsePayload {
     CameraRecordingPullResult {
         pulled_refs: Vec<String>,
     },
+    /// JSON response returned by a coding-agent bridge on the owner node.
+    AgentRpcResult { result_json: String },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -1022,6 +1030,11 @@ impl std::fmt::Debug for MeshCommandType {
             Self::MlTrainCancel { run_id } => f
                 .debug_struct("MlTrainCancel")
                 .field("run_id", run_id)
+                .finish(),
+            Self::AgentRpc { service_id, operation, .. } => f
+                .debug_struct("AgentRpc")
+                .field("service_id", service_id)
+                .field("operation", operation)
                 .finish(),
             Self::MlDatasetChunk { dataset_hash, seq, total, data_b64 } => f
                 .debug_struct("MlDatasetChunk")

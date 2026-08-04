@@ -178,6 +178,16 @@ pub fn validate_engine(
                     });
                 }
             }
+            NativeRuntime::ManagedCli => {
+                if native.binary_path.is_none()
+                    || native.feature_flag.is_some()
+                    || native.bundle_path.is_some()
+                {
+                    errors.push(ValidationError::BinaryRequiresBinaryPath {
+                        engine_id: eid.clone(),
+                    });
+                }
+            }
         }
     }
 

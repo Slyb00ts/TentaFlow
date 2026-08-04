@@ -1,0 +1,30 @@
+[engine]
+id = "codex"
+category = "agents"
+resource_kind = "ai"
+provider = "coding-agents"
+name = "Codex"
+description_pl = "Oficjalny Codex CLI z trwałymi sesjami, narzędziami i dostępem do workspace."
+description_en = "Official Codex CLI with durable sessions, tools, and workspace access."
+homepage = "https://github.com/openai/codex"
+license = "Apache-2.0"
+icon = "codex"
+default_port = 8765
+api = "custom"
+version = "0.146.0"
+requires_model = false
+gpu_supported = false
+
+[deploy.docker]
+context_path = "agents"
+platforms = ["linux", "macos"]
+transport = "direct-http"
+
+[deploy.docker.default_build_args]
+CLI_PACKAGE = "@openai/codex"
+CLI_VERSION = "0.146.0"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "managed-cli"
+binary_path = "agents/native/coding-agent-bridge"

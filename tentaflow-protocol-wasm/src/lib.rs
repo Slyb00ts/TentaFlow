@@ -3980,6 +3980,17 @@ pub fn encode_service_oauth_poll_request(payload_json: String) -> Result<Vec<u8>
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::ServiceBody(ServicePayload::ReqAgent) — execute a validated
+/// operation against a node-owned Codex or Claude Code bridge.
+#[wasm_bindgen(js_name = encodeServiceAgentRequest)]
+pub fn encode_service_agent_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceAgentRequest, ServicePayload};
+    let payload: ServiceAgentRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("ServiceAgentRequest JSON: {e}")))?;
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqAgent(payload)))
+        .map_err(|e| JsError::new(&e))
+}
+
 // --- Prompts --------------------------------------------------------------
 
 /// MessageBody::PromptListRequest (unit).
@@ -5361,6 +5372,20 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(obj, "accountLabel", a.clone().into());
                 set(obj, "account_label", a.into());
             }
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqAgent(r) => {
+            set(obj, "variant", "ServiceAgentRequest".into());
+            set(obj, "serviceId", r.service_id.into());
+            set(obj, "operation", r.operation.into());
+        }
+        SP::ResAgent(r) => {
+            set(obj, "variant", "ServiceAgentResponse".into());
+            set(obj, "success", r.success.into());
+            set(obj, "resultJson", r.result_json.clone().into());
+            set(obj, "result_json", r.result_json.into());
             if let Some(e) = r.error {
                 set(obj, "error", e.into());
             }

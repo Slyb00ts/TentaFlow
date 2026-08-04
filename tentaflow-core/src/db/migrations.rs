@@ -642,7 +642,73 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "conversation_messages_citations",
             MigrationStep::Rust(conversation_messages_add_citations_column),
         ),
+        (
+            121,
+            "managed_cli_service_tags",
+            MigrationStep::RustSelfManaged(managed_cli_service_tags),
+        ),
     ]
+}
+
+fn managed_cli_service_tags(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+        r#"
+CREATE TABLE services_coding_agent_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    engine_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    deploy_method TEXT NOT NULL CHECK(deploy_method IN ('docker','native_embedded','native_binary','native_python_bundle','native_managed_cli','external')),
+    transport TEXT NOT NULL CHECK(transport IN ('embedded','http_direct','sidecar_quic','external_http','agent_rpc')),
+    status TEXT NOT NULL CHECK(status IN ('deploying','starting','running','degraded','failed','stopped','interrupted')) DEFAULT 'starting',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    paused INTEGER NOT NULL DEFAULT 0,
+    runtime_pid INTEGER,
+    runtime_port INTEGER,
+    sidecar_quic_port INTEGER,
+    endpoint_url TEXT,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    active_deploy_id TEXT NOT NULL DEFAULT '',
+    last_deploy_id TEXT NOT NULL DEFAULT '',
+    deployment_progress_pct INTEGER NOT NULL DEFAULT 0,
+    deployed_source_hash TEXT NOT NULL DEFAULT '',
+    health_last_ok TIMESTAMP,
+    health_last_err TEXT,
+    progress_message TEXT,
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO services_coding_agent_new SELECT
+    id, engine_id, category, display_name, deploy_method, transport, status,
+    pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url,
+    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct, deployed_source_hash,
+    health_last_ok, health_last_err, progress_message, restart_count, created_at, updated_at
+FROM services;
+DROP TABLE services;
+ALTER TABLE services_coding_agent_new RENAME TO services;
+CREATE INDEX idx_services_status ON services(status);
+CREATE INDEX idx_services_engine ON services(engine_id);
+CREATE INDEX idx_services_category ON services(category);
+CREATE INDEX idx_services_active_deploy ON services(active_deploy_id);
+"#,
+        )?;
+        let violations = foreign_key_check(&tx)?;
+        if !violations.is_empty() {
+            anyhow::bail!("managed_cli_service_tags: {}", violations.join("; "));
+        }
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
 }
 
 // v112 — the built-in Notes screen was removed in favor of the notes addon

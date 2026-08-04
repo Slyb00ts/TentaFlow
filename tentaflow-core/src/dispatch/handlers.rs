@@ -4816,6 +4816,7 @@ fn resolve_deploy_method(
                 NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
                 NativeRuntime::Binary => DeployMethod::NativeBinary,
                 NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
+                NativeRuntime::ManagedCli => DeployMethod::NativeManagedCli,
             })
         }
         other => Err(format!(
@@ -10789,6 +10790,99 @@ pub async fn service_oauth_poll(
     let (status, account_label, error) =
         crate::services::backend::codex_oauth::poll(&payload.flow_id);
     poll_resp(status, account_label, error)
+}
+
+#[handler(variant = "ServiceAgentRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub async fn service_agent(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqAgent(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqAgent",
+            ))
+        }
+    };
+    let response = |result_json: String, error: Option<String>| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResAgent(
+                tentaflow_protocol::ServiceAgentResponse {
+                    success: error.is_none(),
+                    result_json,
+                    error,
+                },
+            ),
+        ))
+    };
+    let is_admin = matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(role), .. } if role == "admin"
+    );
+    let auth_terminal_input = payload.operation == "session.input"
+        && serde_json::from_str::<serde_json::Value>(&payload.payload_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("session_id")
+                    .and_then(|id| id.as_str())
+                    .map(|id| id.starts_with("auth-"))
+            })
+            .unwrap_or(false);
+    if (payload.operation == "auth.start" || auth_terminal_input) && !is_admin {
+        return response(
+            String::new(),
+            Some("administrator_required_for_login".to_string()),
+        );
+    }
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let command = tentaflow_protocol::mesh::MeshCommandType::AgentRpc {
+            service_id: payload.service_id,
+            operation: payload.operation,
+            payload_json: payload.payload_json,
+        };
+        return match forward_command(ctx, target, command).await {
+            Ok(result) if result.ok => match result.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::AgentRpcResult {
+                    result_json,
+                } => response(result_json, None),
+                _ => response(String::new(), Some("unexpected mesh response".to_string())),
+            },
+            Ok(result) => response(
+                String::new(),
+                result
+                    .error
+                    .or(Some("remote coding-agent request failed".to_string())),
+            ),
+            Err(error) => response(String::new(), Some(error)),
+        };
+    }
+    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let service = fetch_service_row(ctx, payload.service_id)?;
+    match crate::services::coding_agent::execute(
+        &service,
+        &payload.operation,
+        &payload.payload_json,
+    )
+    .await
+    {
+        Ok(result_json) => {
+            if payload.operation == "models.list" {
+                if let Err(error) = crate::services::coding_agent::sync_models(
+                    &ctx.state.db,
+                    &service,
+                    &result_json,
+                ) {
+                    return response(String::new(), Some(error));
+                }
+            }
+            response(result_json, None)
+        }
+        Err(error) => response(String::new(), Some(error)),
+    }
 }
 
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]

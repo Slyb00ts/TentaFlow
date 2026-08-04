@@ -1528,6 +1528,7 @@ mod services_manifest_build {
         Embedded,
         Binary,
         PythonBundle,
+        ManagedCli,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1708,6 +1709,18 @@ mod services_manifest_build {
                         errors.push(format!(
                             "engine '{}': deploy.native.runtime = python-bundle wymaga \
                              pola bundle_path (i nie moze miec feature_flag/binary_path)",
+                            eid
+                        ));
+                    }
+                }
+                NativeRuntime::ManagedCli => {
+                    if n.binary_path.is_none()
+                        || n.feature_flag.is_some()
+                        || n.bundle_path.is_some()
+                    {
+                        errors.push(format!(
+                            "engine '{}': deploy.native.runtime = managed-cli wymaga pola \
+                             binary_path (i nie moze miec feature_flag/bundle_path)",
                             eid
                         ));
                     }

@@ -469,6 +469,14 @@ impl MeshCommandExecutor {
             MeshCommandType::VectorOp { request_cbor } => self.handle_vector_op(request_cbor).await,
             MeshCommandType::OauthStart { provider } => self.handle_oauth_start(provider).await,
             MeshCommandType::OauthPoll { flow_id } => self.handle_oauth_poll(flow_id).await,
+            MeshCommandType::AgentRpc {
+                service_id,
+                operation,
+                payload_json,
+            } => {
+                self.handle_agent_rpc(service_id, operation, payload_json)
+                    .await
+            }
             MeshCommandType::MlTrainStart { run_id, spec_json } => {
                 self.handle_ml_train_start(run_id, spec_json).await
             }
@@ -1137,6 +1145,43 @@ impl MeshCommandExecutor {
             account_label,
             error,
         })
+    }
+
+    async fn handle_agent_rpc(
+        &self,
+        service_id: i64,
+        operation: String,
+        payload_json: String,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("coding-agent service context is not initialized");
+        };
+        let service = {
+            let conn = match ctx.db.read() {
+                Ok(conn) => conn,
+                Err(_) => return CommandResponse::fail("database pool is poisoned"),
+            };
+            match crate::services_repo::services::get(&conn, service_id) {
+                Ok(Some(service)) => service,
+                Ok(None) => {
+                    return CommandResponse::fail(format!("service id={service_id} not found"))
+                }
+                Err(error) => return CommandResponse::fail(error.to_string()),
+            }
+        };
+        match crate::services::coding_agent::execute(&service, &operation, &payload_json).await {
+            Ok(result_json) => {
+                if operation == "models.list" {
+                    if let Err(error) =
+                        crate::services::coding_agent::sync_models(&ctx.db, &service, &result_json)
+                    {
+                        return CommandResponse::fail(error);
+                    }
+                }
+                CommandResponse::ok(MeshCommandResponsePayload::AgentRpcResult { result_json })
+            }
+            Err(error) => CommandResponse::fail(error),
+        }
     }
 
     /// Owner side of a forwarded vector op: run it against THIS node's local
@@ -2747,6 +2792,7 @@ fn resolve_deploy_method(
                 NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
                 NativeRuntime::Binary => DeployMethod::NativeBinary,
                 NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
+                NativeRuntime::ManagedCli => DeployMethod::NativeManagedCli,
             })
         }
         other => Err(format!(

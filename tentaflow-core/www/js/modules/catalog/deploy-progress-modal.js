@@ -13,7 +13,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 
 const LOG_BUFFER_LIMIT = 200;
 
-export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
+export function openDeployProgressModal({ deployId, engineId, deployMethod, nodeId }) {
   const win = document.createElement('tf-window');
   win.setAttribute('title', `${I18n.t('deploy.progress_title')}: ${engineId}`);
   win.setAttribute('buttons', 'close');
@@ -138,6 +138,12 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
     } else if (body.finalStatus === 'success') {
       appendLine(`— ${I18n.t('deploy.success')} (${body.durationMs || 0} ms)`);
       toast(I18n.t('deploy.success'), 'success');
+      if (engineId === 'codex' || engineId === 'claude-code') {
+        import('/js/modules/coding-agent.js').then(async (module) => {
+          const service = await module.findDeployedAgent(engineId, nodeId);
+          await module.openAgentLogin(service);
+        }).catch((error) => toast(error.message || String(error), 'error'));
+      }
     }
   }
 

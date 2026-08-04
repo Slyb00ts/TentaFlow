@@ -517,6 +517,13 @@ pub async fn deploy(
             hf_token.clone(),
             sink.clone(),
         )),
+        DeployMethod::NativeManagedCli => Box::new(binary::BinaryDeploy::new(
+            manifest.clone(),
+            user_config.clone(),
+            ports.clone(),
+            hf_token.clone(),
+            sink.clone(),
+        )),
         DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
             manifest.clone(),
             user_config.clone(),
@@ -697,6 +704,14 @@ pub async fn respawn(
             None,
             preserved_port,
         )),
+        DeployMethod::NativeManagedCli => Box::new(binary::BinaryDeploy::new_with_port(
+            manifest,
+            user_config,
+            ports.clone(),
+            hf_token.clone(),
+            None,
+            preserved_port,
+        )),
         DeployMethod::NativePythonBundle => {
             Box::new(python_bundle::PythonBundleDeploy::new_with_port(
                 manifest,
@@ -843,7 +858,10 @@ pub async fn stop(
     }
 
     // Process shutdown: only the process-owning transports actually have a PID.
-    if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+    if matches!(
+        svc.deploy_method,
+        DM::NativeBinary | DM::NativePythonBundle | DM::NativeManagedCli
+    ) {
         if let Some(pid) = svc.runtime_pid {
             // SIGTERM → grace → SIGKILL, i to dla CALEJ GRUPY, nie tylko lidera:
             // `terminate` przestaje pilnowac, gdy zginie rodzic, a workery vLLM
@@ -918,7 +936,10 @@ pub async fn stop_checked(
     // deploy wpadłby w duplikat runtime'u / OOM. Reużywamy detektora żywotności
     // supervisora (`process_ctl::is_alive`, który wykrywa też zombie przez
     // /proc/<pid>/status), żeby potwierdzić śmierć po stopie.
-    if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+    if matches!(
+        svc.deploy_method,
+        DM::NativeBinary | DM::NativePythonBundle | DM::NativeManagedCli
+    ) {
         if let Some(pid) = svc.runtime_pid {
             let pid = pid as u32;
             if crate::deploy::process_ctl::is_alive(pid) {
@@ -1179,9 +1200,9 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         .by_id(&prepared.engine_id)
         .map(|m| match prepared.deploy_method {
             DeployMethod::Docker => m.docker_source_hash.clone(),
-            DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => {
-                m.native_source_hash.clone()
-            }
+            DeployMethod::NativeBinary
+            | DeployMethod::NativePythonBundle
+            | DeployMethod::NativeManagedCli => m.native_source_hash.clone(),
             _ => String::new(),
         })
         .unwrap_or_default();
@@ -1314,6 +1335,7 @@ fn placeholder_transport(method: DeployMethod) -> Transport {
         DeployMethod::External => Transport::ExternalHttp,
         DeployMethod::Docker => Transport::SidecarQuic,
         DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => Transport::HttpDirect,
+        DeployMethod::NativeManagedCli => Transport::AgentRpc,
     }
 }
 

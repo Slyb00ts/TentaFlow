@@ -153,6 +153,11 @@ pub fn entry_to_service_backend(
                 tts_config: None,
             }
         }
+        Transport::AgentRpc => {
+            return Err(TransportClientError::UnsupportedTransport(
+                "coding-agent RPC is not an inference transport".into(),
+            ));
+        }
     };
 
     Ok(ServiceBackend {

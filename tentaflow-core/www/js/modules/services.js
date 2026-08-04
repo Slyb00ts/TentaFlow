@@ -1,5 +1,5 @@
 // =============================================================================
-// File: modules/services.js — Services screen with 3 tabs (tf-tabs underline)
+// File: modules/services.js — Services screen with service, coding-agent, alias, and model tabs.
 //   1) List     — deployed services table (binary serviceListRequest), 5s refresh
 //   2) Aliases  — model alias CRUD (binary modelAlias*Request), tf-window editor
 //   3) Models   — mesh-wide model aggregate (binary catalogListRequest)
@@ -19,6 +19,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
+import { agentRequest, openAgentLogin } from '/js/modules/coding-agent.js';
 
 // Kolumna SILNIK tymczasowo ukryta na zyczenie — flip na true zeby przywrocic.
 const SHOW_ENGINE_COL = false;
@@ -50,6 +51,7 @@ let aliasEditDraft = null;
 // single-open (one panel at a time) to keep the lazy consumer fetch cheap.
 let aliasAccessId = null;
 let modelAccessId = null;
+let currentUserIsAdmin = false;
 // Per-model visibility map keyed by modelId — merged from modelVisibilityListRequest
 // over the modelListRequest catalog (default 'restricted' when a model is absent).
 let modelVisibility = new Map();
@@ -59,7 +61,7 @@ function sprite(id) {
 }
 
 // Allowed tab ids — guards against arbitrary input from Router params.
-const VALID_TABS = new Set(['list', 'aliases', 'models']);
+const VALID_TABS = new Set(['list', 'coding-agents', 'aliases', 'models']);
 
 export function setActiveTab(tabName) {
   if (!VALID_TABS.has(tabName)) return;
@@ -85,6 +87,7 @@ const ServicesScreen = {
 
       <tf-tabs variant="underline" value="${currentTab}" id="svc-tabs">
         <tf-tab id="list" icon="services" count="0">${escapeHtml(I18n.t('services.tab_list'))}</tf-tab>
+        <tf-tab id="coding-agents" icon="terminal" count="0">Coding agents</tf-tab>
         <tf-tab id="aliases" icon="share" count="0">${escapeHtml(I18n.t('services.tab_aliases'))}</tf-tab>
         <tf-tab id="models" icon="model" count="0">${escapeHtml(I18n.t('services.tab_models'))}</tf-tab>
       </tf-tabs>
@@ -115,6 +118,7 @@ const ServicesScreen = {
     modelVisibility = new Map();
     aliasAccessId = null;
     modelAccessId = null;
+    currentUserIsAdmin = false;
     Access.clearAccessCache();
   },
 };
@@ -123,13 +127,14 @@ const ServicesScreen = {
 
 async function loadAll() {
   try {
-    const [svc, al, nodes, unified, models, modelVis] = await Promise.all([
+    const [svc, al, nodes, unified, models, modelVis, me] = await Promise.all([
       ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
       ApiBinary.list('catalogListRequest', { arrayKey: 'entries' }).catch(() => []),
       ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
       ApiBinary.one('modelVisibilityListRequest').catch(() => null),
+      ApiBinary.one('authMeRequest').catch(() => null),
       ManifestStore.init().catch(() => false),
     ]);
     services = Array.isArray(svc) ? svc : [];
@@ -137,6 +142,7 @@ async function loadAll() {
     meshNodes = nodes || [];
     unifiedModels = Array.isArray(unified) ? unified : [];
     modelsCache = Array.isArray(models) ? models : [];
+    currentUserIsAdmin = String(me?.role || '').toLowerCase() === 'admin' || me?.isAdmin === true;
     setModelVisibility(modelVis);
     // Legacy unified merge feeds the per-node models[] still consumed by the
     // Mesh detail page; the Models tab itself reads from modelsCache.
@@ -181,6 +187,9 @@ async function loadForCurrentTab() {
       services = Array.isArray(svc) ? svc : [];
       meshNodes = Array.isArray(nodes) ? nodes : meshNodes;
       patchListTab();
+    } else if (currentTab === 'coding-agents') {
+      services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
+      patchCodingAgentsTab();
     } else if (currentTab === 'aliases') {
       aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
       patchAliasesTab();
@@ -218,9 +227,11 @@ function updateTabCounts() {
   const listTab = tabs.querySelector('tf-tab#list');
   const aliasTab = tabs.querySelector('tf-tab#aliases');
   const modelsTab = tabs.querySelector('tf-tab#models');
+  const agentsTab = tabs.querySelector('tf-tab#coding-agents');
   if (listTab) listTab.setAttribute('count', String(services.length));
   if (aliasTab) aliasTab.setAttribute('count', String(aliases.length));
   if (modelsTab) modelsTab.setAttribute('count', String(collectUniqueModels().length));
+  if (agentsTab) agentsTab.setAttribute('count', String(codingAgentServices().length));
 }
 
 // ---- Tabs -----------------------------------------------------------------
@@ -236,6 +247,7 @@ function renderTab() {
   const body = byId('svc-tab-body');
   if (!body) return;
   if (currentTab === 'list') body.innerHTML = renderListTab();
+  else if (currentTab === 'coding-agents') body.innerHTML = renderCodingAgentsTab();
   else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
   else if (currentTab === 'models') body.innerHTML = renderModelsTab();
   bindTabEvents();
@@ -257,6 +269,14 @@ function patchAliasesTab() {
   bindTabEvents();
 }
 
+function patchCodingAgentsTab() {
+  if (currentTab !== 'coding-agents') return;
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  patchInner(body, renderCodingAgentsTab());
+  bindTabEvents();
+}
+
 function patchModelsTab() {
   if (currentTab !== 'models') return;
   const body = byId('svc-tab-body');
@@ -268,6 +288,14 @@ function patchModelsTab() {
 function bindTabEvents() {
   const body = byId('svc-tab-body');
   if (!body) return;
+
+  body.querySelectorAll('[data-agent-login]').forEach((button) => {
+    button.onclick = () => openAgentLogin(codingAgentById(button.dataset.agentLogin))
+      .catch((error) => toast(error.message || String(error), 'error'));
+  });
+  body.querySelectorAll('[data-agent-open]').forEach((button) => {
+    button.onclick = () => openCodingAgentConsole(codingAgentById(button.dataset.agentOpen));
+  });
 
   // List tab — N5 row actions: Pause/Play toggle, Pin toggle, Delete.
   body.querySelectorAll('[data-svc-delete]').forEach((b) => {
@@ -682,6 +710,142 @@ async function updateAliasActive(id, checked) {
 }
 
 // ---- List tab -------------------------------------------------------------
+
+function codingAgentServices() {
+  return services.filter((service) => ['codex', 'claude-code'].includes(service.engineId || service.engine_id));
+}
+
+function codingAgentById(id) {
+  return codingAgentServices().find((service) => String(service.id) === String(id));
+}
+
+function renderCodingAgentsTab() {
+  const agents = codingAgentServices();
+  if (!agents.length) {
+    return `<div class="empty-big">${sprite('terminal')}<h3>Codex i Claude Code</h3><p>Wdróż usługę z katalogu, aby uruchamiać i wznawiać sesje na wybranym węźle.</p><tf-button variant="primary" icon="plus" data-empty-cta>Dodaj coding agenta</tf-button></div>`;
+  }
+  return `<div class="service-card-grid">${agents.map((service) => {
+    const node = nodeLabelFor(service.nodeId || service.node_id);
+    return `<section class="service-card">
+      <div class="service-card-header"><div><h3>${escapeHtml(service.displayName || service.display_name)}</h3><span class="form-hint">${escapeHtml(node.label)}</span></div><tf-chip status="${service.status === 'running' ? 'online' : 'warn'}" dot>${escapeHtml(service.status)}</tf-chip></div>
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+        <tf-button variant="primary" data-agent-open="${service.id}">Sesje</tf-button>
+        ${currentUserIsAdmin ? `<tf-button variant="ghost" icon="key" data-agent-login="${service.id}">Logowanie</tf-button>` : ''}
+      </div>
+    </section>`;
+  }).join('')}</div>`;
+}
+
+async function openCodingAgentConsole(service) {
+  if (!service) return;
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', `${service.displayName || service.display_name} — sesje`);
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', '760');
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.innerHTML = `
+    <div data-agent-auth-state></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <tf-input data-agent-workspace label="Workspace (ścieżka na węźle)" placeholder="/workspace/project"></tf-input>
+      <tf-select data-agent-mode label="Tryb" value="new"><option value="new">Nowa sesja</option><option value="resume">Wznów sesję</option><option value="fork">Rozgałęź sesję</option></tf-select>
+    </div>
+    <tf-select data-agent-model label="Model" disabled><option value="">Pobieranie modeli z CLI…</option></tf-select>
+    <tf-input data-agent-vendor label="ID istniejącej sesji" placeholder="Wymagane dla wznowienia lub fork"></tf-input>
+    <div style="display:flex;gap:8px;margin:10px 0"><tf-button variant="primary" data-agent-create>Otwórz sesję</tf-button></div>
+    <div data-agent-session-list></div>
+    <pre data-agent-output style="min-height:180px;max-height:360px;overflow:auto;white-space:pre-wrap"></pre>
+    <tf-input data-agent-prompt label="Polecenie"></tf-input>`;
+  const footer = document.createElement('div');
+  footer.slot = 'footer';
+  footer.innerHTML = '<tf-button variant="primary" data-agent-turn disabled>Wyślij</tf-button>';
+  win.append(body, footer);
+  document.body.appendChild(win);
+
+  let sessionId = null;
+  let afterSeq = 0;
+  let closed = false;
+  win.addEventListener('close', () => { closed = true; win.remove(); });
+  const auth = await agentRequest(service, 'auth.status');
+  if (!auth.authenticated) {
+    const state = body.querySelector('[data-agent-auth-state]');
+    if (state) state.innerHTML = `<tf-chip status="error" dot>Sesja CLI wygasła</tf-chip><p>${currentUserIsAdmin
+      ? 'Użyj przycisku Logowanie na karcie usługi, aby ponownie zalogować konto.'
+      : 'Ponowne logowanie może wykonać wyłącznie administrator.'}</p>`;
+    body.querySelector('[data-agent-create]')?.setAttribute('disabled', '');
+    body.querySelector('[data-agent-model]').innerHTML = '<option value="">Brak aktywnej sesji CLI</option>';
+    return;
+  }
+  const modelSelect = body.querySelector('[data-agent-model]');
+  try {
+    const result = await agentRequest(service, 'models.list');
+    const models = result.models || result.data || [];
+    if (!models.length) throw new Error('CLI nie zwróciło dostępnych modeli');
+    modelSelect.innerHTML = models.map((model) => {
+      const id = model.id || model.model;
+      const name = model.display_name || model.displayName || id;
+      const selected = model.selected || model.isDefault || model.is_default;
+      return `<option value="${escapeAttr(id)}"${selected ? ' selected' : ''}>${escapeHtml(name)}</option>`;
+    }).join('');
+    modelSelect.removeAttribute('disabled');
+  } catch (error) {
+    modelSelect.innerHTML = `<option value="">${escapeHtml(error.message || String(error))}</option>`;
+    toast(error.message || String(error), 'error');
+  }
+  const refreshSessions = async () => {
+    const result = await agentRequest(service, 'sessions.list');
+    const list = body.querySelector('[data-agent-session-list]');
+    if (list) list.innerHTML = (result.sessions || []).map((session) =>
+      `<tf-button variant="ghost" data-use-session="${escapeAttr(session.vendor_session_id)}">${escapeHtml(session.vendor_session_id)} · ${escapeHtml(session.workspace)}</tf-button>`).join('');
+    list?.querySelectorAll('[data-use-session]').forEach((button) => {
+      button.onclick = () => { body.querySelector('[data-agent-vendor]').value = button.dataset.useSession; };
+    });
+  };
+  await refreshSessions();
+  body.querySelector('[data-agent-create]')?.addEventListener('click', async () => {
+    try {
+      const workspace = String(body.querySelector('[data-agent-workspace]')?.value || '').trim();
+      const mode = body.querySelector('[data-agent-mode]')?.value || 'new';
+      const vendor = String(body.querySelector('[data-agent-vendor]')?.value || '').trim();
+      const model = String(modelSelect?.value || '').trim();
+      if (!workspace) throw new Error('Podaj workspace');
+      if (!model) throw new Error('Wybierz model');
+      if (mode !== 'new' && !vendor) throw new Error('Podaj ID istniejącej sesji');
+      const result = await agentRequest(service, 'session.create', {
+        workspace,
+        model,
+        resume_vendor_session_id: mode === 'new' ? null : vendor,
+        fork: mode === 'fork',
+      });
+      sessionId = result.session.id;
+      footer.querySelector('[data-agent-turn]')?.removeAttribute('disabled');
+      await refreshSessions();
+      pollAgentEvents();
+    } catch (error) { toast(error.message || String(error), 'error'); }
+  });
+  footer.querySelector('[data-agent-turn]')?.addEventListener('click', async () => {
+    const input = body.querySelector('[data-agent-prompt]');
+    const prompt = String(input?.value || '').trim();
+    if (!sessionId || !prompt) return;
+    await agentRequest(service, 'session.turn', { session_id: sessionId, prompt });
+    input.value = '';
+  });
+  const pollAgentEvents = async () => {
+    while (!closed && sessionId) {
+      try {
+        const result = await agentRequest(service, 'session.events', { session_id: sessionId, after_seq: afterSeq });
+        const output = body.querySelector('[data-agent-output]');
+        for (const event of result.events || []) {
+          afterSeq = Math.max(afterSeq, Number(event.seq || 0));
+          const text = event.data?.text || event.data?.delta || JSON.stringify(event.data);
+          if (output) output.textContent += `${text}\n`;
+        }
+        if (output) output.scrollTop = output.scrollHeight;
+      } catch (error) { toast(error.message || String(error), 'error'); return; }
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    }
+  };
+}
 
 function renderListTab() {
   if (services.length === 0) {

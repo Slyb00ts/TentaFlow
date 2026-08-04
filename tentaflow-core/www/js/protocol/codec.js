@@ -1516,6 +1516,15 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ServiceBody(ServicePayload::ReqAgent) */
+  serviceAgentRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceAgentRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
   /** MessageBody::ServiceQuicStatusRequest (unit) */
   serviceQuicStatusRequest(correlationId, sequence = 1) {
     assertReady();

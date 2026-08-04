@@ -77,7 +77,10 @@ impl BinaryDeploy {
                 self.manifest.engine.id
             ))
         })?;
-        if native.runtime != NativeRuntime::Binary {
+        if !matches!(
+            native.runtime,
+            NativeRuntime::Binary | NativeRuntime::ManagedCli
+        ) {
             return Err(DeployError::Manifest(format!(
                 "engine '{}' is not a binary runtime ({:?})",
                 self.manifest.engine.id, native.runtime
@@ -101,6 +104,109 @@ impl BinaryDeploy {
         }
         Ok(path)
     }
+
+    async fn prepare_managed_cli_env(
+        &self,
+        native: &crate::services::manifest::NativeDeploy,
+        env: &mut std::collections::HashMap<String, String>,
+    ) -> DeployResult<()> {
+        if native.runtime != NativeRuntime::ManagedCli {
+            return Ok(());
+        }
+        let (package, executable) = match self.manifest.engine.id.as_str() {
+            "codex" => ("@openai/codex", "codex"),
+            "claude-code" => ("@anthropic-ai/claude-code", "claude"),
+            other => {
+                return Err(DeployError::Manifest(format!(
+                    "managed-cli engine '{other}' has no installer mapping"
+                )))
+            }
+        };
+        let install_root = crate::paths::cache_dir()
+            .join("coding-agents")
+            .join(&self.manifest.engine.id)
+            .join(&self.manifest.engine.version);
+        let bin_dir = if cfg!(windows) {
+            install_root.clone()
+        } else {
+            install_root.join("bin")
+        };
+        let executable_name = if cfg!(windows) {
+            format!("{executable}.cmd")
+        } else {
+            executable.to_string()
+        };
+        if !bin_dir.join(executable_name).exists() {
+            std::fs::create_dir_all(&install_root).map_err(|e| {
+                DeployError::Spawn(format!("create managed-cli install directory: {e}"))
+            })?;
+            if let Some(s) = &self.log_sink {
+                s.info(&format!(
+                    "[managed-cli] installing {}@{}",
+                    package, self.manifest.engine.version
+                ));
+            }
+            let output = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+                .arg("install")
+                .arg("--prefix")
+                .arg(&install_root)
+                .arg("--no-audit")
+                .arg("--no-fund")
+                .arg(format!("{}@{}", package, self.manifest.engine.version))
+                .output()
+                .await
+                .map_err(|e| DeployError::Spawn(format!("start npm installer: {e}")))?;
+            if !output.status.success() {
+                return Err(DeployError::Spawn(format!(
+                    "npm install {}@{} failed: {}",
+                    package,
+                    self.manifest.engine.version,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin_dir];
+        paths.extend(std::env::split_paths(&inherited_path));
+        let joined = std::env::join_paths(paths)
+            .map_err(|e| DeployError::Spawn(format!("build managed-cli PATH: {e}")))?;
+        env.insert("PATH".to_string(), joined.to_string_lossy().into_owned());
+        let state_dir = crate::paths::category_dir(crate::paths::StorageCategory::Keys)
+            .join("coding-agents")
+            .join(&self.manifest.engine.id);
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|e| DeployError::Spawn(format!("create managed-cli state directory: {e}")))?;
+        env.insert(
+            "TENTAFLOW_CODING_AGENT_DATA_DIR".to_string(),
+            state_dir.to_string_lossy().into_owned(),
+        );
+        let workspace_root =
+            self.user_config
+                .get("workspace_root")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir().map_err(|e| {
+                    DeployError::Spawn(format!("resolve coding-agent workspace: {e}"))
+                })?);
+        let workspace_root = std::fs::canonicalize(&workspace_root).map_err(|e| {
+            DeployError::Spawn(format!(
+                "invalid coding-agent workspace {}: {e}",
+                workspace_root.display()
+            ))
+        })?;
+        env.insert(
+            "TENTAFLOW_WORKSPACE_ROOT".to_string(),
+            workspace_root.to_string_lossy().into_owned(),
+        );
+        if self.manifest.engine.id == "codex" {
+            env.insert(
+                "CODEX_HOME".to_string(),
+                state_dir.to_string_lossy().into_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -120,6 +226,32 @@ impl DeployStrategy for BinaryDeploy {
         }
 
         let root = self.binary_root()?;
+        if native.runtime == NativeRuntime::ManagedCli {
+            #[cfg(windows)]
+            let server = root.join("server.exe");
+            #[cfg(not(windows))]
+            let server = root.join("server");
+            if !server.exists() {
+                if let Some(s) = &self.log_sink {
+                    s.info("[managed-cli] building the local bridge");
+                }
+                #[cfg(windows)]
+                let status = Command::new("powershell.exe")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(root.join("build.ps1"))
+                    .status()
+                    .await;
+                #[cfg(not(windows))]
+                let status = Command::new("sh").arg(root.join("build.sh")).status().await;
+                let status = status
+                    .map_err(|e| DeployError::Spawn(format!("build coding-agent bridge: {e}")))?;
+                if !status.success() || !server.exists() {
+                    return Err(DeployError::Spawn(format!(
+                        "coding-agent bridge build failed with status {status}"
+                    )));
+                }
+            }
+        }
         // Respawn istniejacego serwisu zachowuje port z DB.
         let port = self
             .ports
@@ -129,6 +261,9 @@ impl DeployStrategy for BinaryDeploy {
 
         // Pick the executable: prefer `<root>/server`, then `<root>/run.sh`,
         // then `<root>/start.sh`, then `<root>/build.sh` (used by tests).
+        #[cfg(windows)]
+        let candidates = ["server.exe", "run.cmd", "run.ps1", "start.cmd"];
+        #[cfg(not(windows))]
         let candidates = ["server", "run.sh", "start.sh", "build.sh"];
         let exe = candidates
             .iter()
@@ -161,6 +296,10 @@ impl DeployStrategy for BinaryDeploy {
             env.entry(k).or_insert(v);
         }
         env.insert("PORT".to_string(), port.to_string());
+        env.insert(
+            "TENTAFLOW_ENGINE_ID".to_string(),
+            self.manifest.engine.id.clone(),
+        );
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".to_string(), model);
         }
@@ -180,6 +319,7 @@ impl DeployStrategy for BinaryDeploy {
         }
         super::apply_engine_env(&self.user_config, &mut env);
         super::apply_gpu_selection_env(&self.user_config, &mut env);
+        self.prepare_managed_cli_env(native, &mut env).await?;
 
         let mut cmd = Command::new(&exe);
         cmd.current_dir(&root);
@@ -306,12 +446,21 @@ impl DeployStrategy for BinaryDeploy {
         let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
+        let managed_cli = native.runtime == NativeRuntime::ManagedCli;
         Ok(PreparedDeploy {
             engine_id: self.manifest.engine.id.clone(),
             category: category_tag(&self.manifest).to_string(),
             display_name: resolve_display_name(&self.manifest),
-            deploy_method: DeployMethod::NativeBinary,
-            transport: Transport::HttpDirect,
+            deploy_method: if managed_cli {
+                DeployMethod::NativeManagedCli
+            } else {
+                DeployMethod::NativeBinary
+            },
+            transport: if managed_cli {
+                Transport::AgentRpc
+            } else {
+                Transport::HttpDirect
+            },
             runtime,
             models,
             config_json,

@@ -549,6 +549,8 @@ pub enum NativeRuntime {
     Binary,
     /// Python bundle managed by TentaFlow.
     PythonBundle,
+    /// Vendor CLI managed as a long-lived service bridge (Codex / Claude Code).
+    ManagedCli,
 }
 
 impl NativeRuntime {
@@ -557,6 +559,7 @@ impl NativeRuntime {
             NativeRuntime::Embedded => "embedded",
             NativeRuntime::Binary => "binary",
             NativeRuntime::PythonBundle => "python-bundle",
+            NativeRuntime::ManagedCli => "managed-cli",
         }
     }
 }

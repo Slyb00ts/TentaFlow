@@ -304,6 +304,9 @@ pub fn build_handle(svc: &ServiceInfo, creds: Option<ExternalProviderCreds>) -> 
                 quic_config,
             ))))
         }
+        Transport::AgentRpc => Err(anyhow!(
+            "coding-agent RPC services are managed through ServiceAgentRequest, not inference routing"
+        )),
     }
 }
 
