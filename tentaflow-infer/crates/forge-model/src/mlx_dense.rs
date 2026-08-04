@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use forge_formats::affine::{to_affine_triple, GGML_AFFINE_GROUP};
+use forge_formats::affine::{permute_rope_rows, to_affine_triple, GGML_AFFINE_GROUP};
 use forge_formats::checkpoint::Checkpoint;
 use forge_formats::WeightRole;
 use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
@@ -231,7 +231,15 @@ impl MlxDense {
         };
         let seq_cap = msl::ATTN_MAX_SEQ;
 
-        let quantized = |name: &str, rows: u32, cols: u32| -> Result<Quantized> {
+        // GGUF trzyma wiersze Q i K w kolejności llama.cpp, bo tam RoPE liczy na
+        // przeplatanych parach. Nasz kernel obraca połówki, więc dla takiego
+        // źródła trzeba je przestawić RAZ, przy ładowaniu. Warunek stawiają
+        // wspólne warstwy: architektura mówi, że tego wymaga, a źródło mówi, że
+        // jeszcze tego nie zrobiło.
+        let permute_qk = desc.rope_interleaved() && src.stores_original_rope_order();
+        let head_dim = p.head_dim;
+
+        let quantized = |name: &str, rows: u32, cols: u32, rope: bool| -> Result<Quantized> {
             // Źródło, które trzyma wagi afinicznie, oddaje je wprost; reszta
             // przechodzi przez przepisanie. W obu razach model dostaje to samo.
             let t = match src.fetch_affine(name)? {
@@ -251,6 +259,10 @@ impl MlxDense {
                     "{name}: kształt [{}, {}], oczekiwano [{rows}, {cols}]",
                     t.rows, t.cols
                 )));
+            }
+            let mut t = t;
+            if rope && permute_qk {
+                permute_rope_rows(&mut t, head_dim)?;
             }
             if !(cols as usize).is_multiple_of(t.group) {
                 return Err(ForgeError::Unsupported(format!(
@@ -277,9 +289,9 @@ impl MlxDense {
             upload(&*device, &data)
         };
 
-        let embed = quantized(&desc.globals[&WeightRole::TokenEmbd], shape.vocab, shape.hidden)?;
+        let embed = quantized(&desc.globals[&WeightRole::TokenEmbd], shape.vocab, shape.hidden, false)?;
         let final_norm = plain(&desc.globals[&WeightRole::OutputNorm])?;
-        let lm_head = quantized(&desc.globals[&WeightRole::LmHead], shape.vocab, shape.hidden)?;
+        let lm_head = quantized(&desc.globals[&WeightRole::LmHead], shape.vocab, shape.hidden, false)?;
 
         let kv_bytes = (shape.kv_heads * seq_cap * shape.head_dim) as usize * 2;
         let mut layers = Vec::with_capacity(shape.layers as usize);
@@ -287,14 +299,14 @@ impl MlxDense {
             let name = |role: WeightRole| -> &str { l[&role].as_str() };
             layers.push(Layer {
                 attn_norm: plain(name(WeightRole::AttnNorm))?,
-                q: quantized(name(WeightRole::AttnQ), shape.hidden, shape.hidden)?,
-                k: quantized(name(WeightRole::AttnK), shape.kv_width(), shape.hidden)?,
-                v: quantized(name(WeightRole::AttnV), shape.kv_width(), shape.hidden)?,
-                o: quantized(name(WeightRole::AttnO), shape.hidden, shape.hidden)?,
+                q: quantized(name(WeightRole::AttnQ), shape.hidden, shape.hidden, true)?,
+                k: quantized(name(WeightRole::AttnK), shape.kv_width(), shape.hidden, true)?,
+                v: quantized(name(WeightRole::AttnV), shape.kv_width(), shape.hidden, false)?,
+                o: quantized(name(WeightRole::AttnO), shape.hidden, shape.hidden, false)?,
                 ffn_norm: plain(name(WeightRole::FfnNorm))?,
-                gate: quantized(name(WeightRole::FfnGate), shape.inter, shape.hidden)?,
-                up: quantized(name(WeightRole::FfnUp), shape.inter, shape.hidden)?,
-                down: quantized(name(WeightRole::FfnDown), shape.hidden, shape.inter)?,
+                gate: quantized(name(WeightRole::FfnGate), shape.inter, shape.hidden, false)?,
+                up: quantized(name(WeightRole::FfnUp), shape.inter, shape.hidden, false)?,
+                down: quantized(name(WeightRole::FfnDown), shape.hidden, shape.inter, false)?,
                 k_cache: device.alloc(kv_bytes, MemKind::Device, Pool::KvCache)?,
                 v_cache: device.alloc(kv_bytes, MemKind::Device, Pool::KvCache)?,
             });

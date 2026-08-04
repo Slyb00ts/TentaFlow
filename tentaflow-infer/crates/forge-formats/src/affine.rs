@@ -133,6 +133,60 @@ pub fn to_affine_triple(
     }
 }
 
+/// Przestawia wiersze Q albo K z kolejności GGUF-a do kolejności HF.
+///
+/// llama.cpp liczy RoPE na przeplatanych parach, HF obraca połówki wektora, a
+/// konwerter GGUF-a przestawia wiersze tak, żeby pasowały do tego pierwszego.
+/// Kernel, który obraca połówki, musi to cofnąć — RAZ, przy ładowaniu.
+///
+/// Nie objawia się awarią: bez tego model generuje płynny, całkowicie inny
+/// tekst. Warunkiem jest `ModelDescriptor::rope_interleaved()` po stronie
+/// architektury i `TensorSource::stores_original_rope_order()` po stronie
+/// źródła — jedno bez drugiego nakłada permutację nie tam, gdzie trzeba.
+pub fn permute_rope_rows(t: &mut AffineTriple, head_dim: usize) -> Result<()> {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) || !t.rows.is_multiple_of(head_dim) {
+        return Err(ForgeError::Format(format!(
+            "RoPE: {} wierszy nie dzieli się na głowice po {head_dim}",
+            t.rows
+        )));
+    }
+    let half = head_dim / 2;
+    let per_row = |len: usize| len / t.rows;
+    let (wp, wh, ws) = (
+        per_row(t.packed.len()),
+        if t.high.is_empty() { 0 } else { per_row(t.high.len()) },
+        per_row(t.scales.len()),
+    );
+
+    let mut packed = vec![0u32; t.packed.len()];
+    let mut high = vec![0u32; t.high.len()];
+    let mut scales = vec![0u8; t.scales.len()];
+    let mut biases = vec![0u8; t.biases.len()];
+    for head in 0..t.rows / head_dim {
+        for a in 0..2 {
+            for b in 0..half {
+                let dst = head * head_dim + a * half + b;
+                let src = head * head_dim + b * 2 + a;
+                packed[dst * wp..(dst + 1) * wp]
+                    .copy_from_slice(&t.packed[src * wp..(src + 1) * wp]);
+                if wh > 0 {
+                    high[dst * wh..(dst + 1) * wh]
+                        .copy_from_slice(&t.high[src * wh..(src + 1) * wh]);
+                }
+                scales[dst * ws..(dst + 1) * ws]
+                    .copy_from_slice(&t.scales[src * ws..(src + 1) * ws]);
+                biases[dst * ws..(dst + 1) * ws]
+                    .copy_from_slice(&t.biases[src * ws..(src + 1) * ws]);
+            }
+        }
+    }
+    t.packed = packed;
+    t.high = high;
+    t.scales = scales;
+    t.biases = biases;
+    Ok(())
+}
+
 /// Whether `to_affine_triple` will take this format.
 pub fn is_affine(quant: QuantKind) -> bool {
     matches!(quant, QuantKind::Q4_1 | QuantKind::Q4K | QuantKind::Q6K)
@@ -378,6 +432,33 @@ mod tests {
                 .copy_from_slice(&f16::from_f32(0.0017).to_le_bytes());
         }
         agrees(QuantKind::Q6K, &data, rows, cols);
+    }
+
+    #[test]
+    fn the_rope_permutation_is_its_own_inverse_twice_over() {
+        // Permutacja jest inwolucją tylko dla head_dim == 2; ogólnie NIE jest,
+        // więc test sprawdza to, co naprawdę musi zachodzić: że przestawia
+        // wiersze zgodnie ze wzorem, a nie że da się ją nałożyć dwa razy.
+        let (rows, cols, hd) = (8usize, 64usize, 4usize);
+        let mut t = AffineTriple::new_f16(rows, cols, GGML_AFFINE_GROUP);
+        for r in 0..rows {
+            for c in 0..cols {
+                t.put(r, c, (r as u8) & 0xF);
+            }
+        }
+        permute_rope_rows(&mut t, hd).expect("permutacja");
+        // HF[h*hd + a*(hd/2) + b] = GGUF[h*hd + b*2 + a]
+        for head in 0..rows / hd {
+            for a in 0..2 {
+                for b in 0..hd / 2 {
+                    let dst = head * hd + a * (hd / 2) + b;
+                    let src = head * hd + b * 2 + a;
+                    let at = dst * cols;
+                    let got = (t.packed[at / 8] >> ((at % 8) * 4)) & 0xF;
+                    assert_eq!(got, (src as u32) & 0xF, "wiersz {dst} wziął zły oryginał");
+                }
+            }
+        }
     }
 
     #[test]
