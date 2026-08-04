@@ -8,7 +8,7 @@ pub mod shape;
 pub use dtype::DType;
 pub use error::{ForgeError, Result};
 pub use quant::QuantKind;
-pub use shape::Shape;
+pub use shape::{DenseShape, Shape};
 
 use serde::{Deserialize, Serialize};
 

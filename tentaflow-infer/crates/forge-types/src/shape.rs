@@ -48,3 +48,37 @@ impl std::fmt::Display for Shape {
         )
     }
 }
+
+/// Wymiary architektury gęstej.
+///
+/// Mieszkają tu, a nie przy modelu, bo potrzebują ich OBIE strony granicy
+/// sprzętowej: model, żeby opisać kolejność operacji, i wykonawca, żeby
+/// wymiarować bufory. Gdyby leżały wyżej, wykonawca musiałby sięgnąć w górę —
+/// czego układ zależności zabrania i słusznie.
+///
+/// Nie ma tu rozmiaru grupy kwantyzacji. To NIE jest własność architektury,
+/// tylko pojedynczej wagi: Q4_K_M trzyma 32 na większości i 16 na tych w Q6_K.
+/// Póki było tu polem, kernel osadzeń dostawał grupę modelu zamiast swojej i
+/// działał tylko dlatego, że akurat się zgadzały.
+#[derive(Debug, Clone, Copy)]
+pub struct DenseShape {
+    pub hidden: u32,
+    pub layers: u32,
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub inter: u32,
+    pub vocab: u32,
+    pub eps: f32,
+    pub rope_theta: f32,
+}
+
+impl DenseShape {
+    pub fn kv_width(&self) -> u32 {
+        self.kv_heads * self.head_dim
+    }
+
+    pub fn attn_scale(&self) -> f32 {
+        1.0 / (self.head_dim as f32).sqrt()
+    }
+}

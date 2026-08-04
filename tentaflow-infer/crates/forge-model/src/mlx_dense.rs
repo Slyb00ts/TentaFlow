@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use forge_formats::affine::{permute_rope_rows, to_affine_triple, GGML_AFFINE_GROUP};
+use forge_formats::affine::{permute_rope_rows, to_affine_triple};
 use forge_formats::checkpoint::Checkpoint;
 use forge_formats::WeightRole;
 use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
@@ -26,7 +26,7 @@ use forge_kernels::msl::{self, OutDtype, ScaleDtype};
 use forge_kernels::variant::{
     self, AttentionForm, MatmulForm, Problem, RowSplit, ATTENTION_FORMS, MATMUL_FORMS,
 };
-use forge_types::{DType, ForgeError, MemKind, Result};
+use forge_types::{DType, DenseShape, ForgeError, MemKind, Result};
 
 use forge_kernels::cpu_matmul::{CpuMatmul, Operands};
 use crate::exec::{Act, WeightId};
@@ -43,30 +43,6 @@ use crate::exec::{Act, WeightId};
 /// for 128 and 0.72x for 512 (docs/pomiary/eks-a4-batched-matmul-m4.md).
 pub const PREFILL_CHUNK: u32 = 1024;
 
-/// Everything the decode loop needs to know about the architecture.
-#[derive(Debug, Clone, Copy)]
-pub struct DenseShape {
-    pub hidden: u32,
-    pub layers: u32,
-    pub heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
-    pub inter: u32,
-    pub vocab: u32,
-    pub eps: f32,
-    pub rope_theta: f32,
-    pub group: u32,
-}
-
-impl DenseShape {
-    fn kv_width(&self) -> u32 {
-        self.kv_heads * self.head_dim
-    }
-
-    fn attn_scale(&self) -> f32 {
-        1.0 / (self.head_dim as f32).sqrt()
-    }
-}
 
 /// A quantized weight: packed nibbles plus per-group scale and zero point.
 struct Quantized {
@@ -325,9 +301,12 @@ impl MlxDense {
         // egzekwowane na każdej kolejnej, żeby model nie liczył dwóch układów
         // naraz.
         let probe = desc.globals[&WeightRole::TokenEmbd].clone();
-        let (group, scales_dtype) = match src.fetch_affine(&probe)? {
-            Some(t) => (t.group as u32, dtype_of(t.param_dtype)?),
-            None => (GGML_AFFINE_GROUP as u32, ScaleDtype::F16),
+        // Typ skal jest własnością źródła, więc wystarczy zapytać PIERWSZĄ wagę;
+        // rozmiar grupy nie — ten podróżuje z każdą wagą osobno, bo Q4_K_M ma
+        // dwa naraz.
+        let scales_dtype = match src.fetch_affine(&probe)? {
+            Some(t) => dtype_of(t.param_dtype)?,
+            None => ScaleDtype::F16,
         };
 
         let shape = DenseShape {
@@ -342,7 +321,6 @@ impl MlxDense {
             rope_theta: p.rope_theta,
             // Po konwersji każdy format ma jedną grupę — to właśnie ona jest
             // wspólnym mianownikiem, do którego sprowadza je `forge-formats`.
-            group,
         };
         if shape.heads * shape.head_dim != shape.hidden {
             return Err(ForgeError::Unsupported(format!(
@@ -594,7 +572,7 @@ impl MlxDense {
                 .buf(&emb.biases)
                 .buf(&self.exec.scratch.ids)
                 .scalar(s.hidden)
-                .scalar(s.group)
+                .scalar(emb.group)
                 .scalar(1u32),
             msl::elementwise_groups(s.hidden),
             msl::ELEMENTWISE_THREADS,
@@ -757,7 +735,7 @@ impl MlxDense {
                 .buf(&emb.biases)
                 .buf(&self.exec.scratch.ids)
                 .scalar(s.hidden)
-                .scalar(s.group)
+                .scalar(emb.group)
                 .scalar(n),
             msl::elementwise_groups(n * s.hidden),
             msl::ELEMENTWISE_THREADS,
