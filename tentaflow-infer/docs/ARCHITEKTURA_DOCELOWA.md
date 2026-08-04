@@ -155,7 +155,10 @@ model, kernele i loader naraz.
 2. **`forge-graph` z samym `enum Op` i wykonawcą sekwencyjnym.** Bez passów.
 3. **`dense` emituje operacje**; `MetalExec` staje się `impl Executor` w
    `forge-kernels`. Wtedy `forge-model` przestaje zależeć od HAL-a i od kerneli —
-   sprawdzalne zapadką, dziś liczy 3.
+   sprawdzalne zapadką. ZROBIONE: zapadka `hal_boundary` dla `forge-model/src`
+   spadła z 3 na 0, a wykonawca dochodzi jako WYTWÓRNIA, bo nie może powstać
+   przed odczytaniem checkpointu — dopiero ten mówi, ile warstw dostanie cache
+   i dla jakiego typu skompilować kernele.
 4. **CUDA implementuje ten sam `Executor`.** Dopiero to kasuje 2822 linie
    `dense.rs`, i dopiero wtedy hybryda oraz MoE działają na Metalu bez
    przepisywania.

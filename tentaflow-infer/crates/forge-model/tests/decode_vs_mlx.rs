@@ -15,7 +15,15 @@
 use std::path::PathBuf;
 
 use forge_hal::metal_device::MetalDevice;
-use forge_model::mlx_dense::MlxDense;
+use forge_kernels::MetalExec;
+use forge_model::dense::Dense;
+
+/// Model plus wykonawca. To jedyne miejsce w teście, które wie, co liczy —
+/// `Dense` dostaje wykonawcę jako wytwórnię i nigdy nie pyta, czym on jest.
+fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<MetalExec> {
+    Dense::load(path, |spec| MetalExec::new(device, spec)).expect("wczytanie modelu")
+}
+
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/mlx_logits_bielik.bin");
 const CHECKPOINT: &str = concat!(
@@ -101,7 +109,7 @@ fn decode_loop_matches_mlx_lm_step_by_step() {
         return;
     };
 
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
     let shape = model.shape();
     assert_eq!(shape.layers, 40);
     assert_eq!(shape.vocab as usize, oracle.vocab);
@@ -164,7 +172,7 @@ fn greedy_choice_on_the_device_agrees_with_the_readback() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     for (step, &token) in oracle.tokens.iter().enumerate() {
         let chosen = model.step_argmax(token).expect("krok dekodowania");
@@ -185,7 +193,7 @@ fn a_context_past_the_cache_capacity_is_refused() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
     assert_eq!(model.position(), 0);
     model.step(1).expect("pierwszy krok");
     assert_eq!(model.position(), 1);
@@ -215,7 +223,7 @@ fn hidden_state_tracks_mlx_at_every_depth() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     for &(layers, expected) in REFERENCE_NORMS {
         let h = model.probe(1, layers).expect("sonda");

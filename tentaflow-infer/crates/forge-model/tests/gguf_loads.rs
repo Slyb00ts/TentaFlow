@@ -10,7 +10,15 @@
 use std::path::{Path, PathBuf};
 
 use forge_hal::metal_device::MetalDevice;
-use forge_model::mlx_dense::MlxDense;
+use forge_kernels::MetalExec;
+use forge_model::dense::Dense;
+
+/// Model plus wykonawca. To jedyne miejsce w teście, które wie, co liczy —
+/// `Dense` dostaje wykonawcę jako wytwórnię i nigdy nie pyta, czym on jest.
+fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<MetalExec> {
+    Dense::load(path, |spec| MetalExec::new(device, spec)).expect("wczytanie modelu")
+}
+
 
 const GGUF: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -34,7 +42,7 @@ fn the_gguf_build_of_the_same_model_loads_and_generates() {
         return;
     };
 
-    let mut model = MlxDense::load(device, Path::new(&path)).expect("wczytanie GGUF");
+    let mut model = open(device, Path::new(&path));
     let shape = model.shape();
     assert_eq!(shape.layers, 40, "inna liczba warstw niż w MLX");
     assert_eq!(shape.hidden, 4096);
@@ -98,7 +106,7 @@ fn the_two_formats_of_the_same_model_side_by_side() {
     prompt.insert(0, 1);
 
     let row = |label: &str, path: &Path| {
-        let mut m = MlxDense::load(device.clone(), path).expect("wczytanie");
+        let mut m = open(device.clone(), path);
         // Rozgrzewka, potem mediana z trzech — jak w pozostałych pomiarach.
         let mut prefills = Vec::new();
         let mut first = 0;

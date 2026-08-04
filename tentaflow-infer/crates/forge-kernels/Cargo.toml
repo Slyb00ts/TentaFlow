@@ -15,6 +15,7 @@ metal = ["forge-hal/metal"]
 forge-types.workspace = true
 forge-hal.workspace = true
 forge-formats.workspace = true
+forge-graph.workspace = true
 half.workspace = true
 bytemuck.workspace = true
 serde.workspace = true

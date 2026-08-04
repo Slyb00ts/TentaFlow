@@ -1,4 +1,4 @@
-# ===== File: Cargo.toml — forge-model: dense decode loop over the HAL =====
+# ===== File: Cargo.toml — forge-model: a dense decoder as an order of operations =====
 [package]
 name = "forge-model"
 version.workspace = true
@@ -6,18 +6,17 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Kernele Metal. Bez tej cechy crate buduje sie, ale nie ma czym liczyc.
+# Kernele Metal dla TESTÓW. Sam model ich nie potrzebuje — nie zna wykonawcy,
+# więc buduje się wszędzie i tak samo.
 metal = ["forge-hal/metal", "forge-kernels/metal"]
 
 [dependencies]
 forge-types.workspace = true
-forge-hal.workspace = true
-forge-kernels.workspace = true
 forge-formats.workspace = true
 forge-graph.workspace = true
-bytemuck.workspace = true
-half.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
+forge-hal.workspace = true
+forge-kernels.workspace = true
 forge-tokenize.workspace = true
+serde_json.workspace = true

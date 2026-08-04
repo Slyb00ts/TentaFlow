@@ -6,8 +6,9 @@
 // Różnica nie jest kosmetyczna. Gdy operacje są wywołaniami traitu, model musi
 // znać wykonawcę, więc zależy od warstwy sprzętowej, więc jest modelem DLA tego
 // sprzętu — i następny sprzęt dostaje własny model. Tak w tym repo powstały
-// 2822 linie `dense.rs` obok 1096 linii `mlx_dense.rs`, opisujące tę samą
-// kolejność warstw (docs/PRZEGLAD_UKLADU.md).
+// dwa pliki opisujące tę samą kolejność warstw: 2822 linie `forge-engine`
+// dla CUDA i 1096 linii `forge-model` dla Metalu (docs/PRZEGLAD_UKLADU.md).
+// Drugi z nich jest już wykonawcą i modelem osobno; pierwszy czeka.
 //
 // Gdy operacje są DANYMI, model nie ma czym nazwać bufora. Granica sprzętowa
 // przestaje być regułą, której trzeba pilnować, a staje się faktem wynikającym
@@ -17,7 +18,8 @@
 //
 // Ten crate NIE WIE o HAL i nie ma prawa się dowiedzieć.
 
-use forge_types::Result;
+use forge_formats::affine::AffineTriple;
+use forge_types::{DType, DenseShape, Result};
 
 /// Waga, którą wykonawca wgrał i trzyma.
 ///
@@ -93,8 +95,62 @@ pub trait Executor {
     fn sync(&self) -> Result<()>;
 
     /// Odczytuje slot na hosta. `len` w elementach.
+    ///
+    /// Typ zapisu slotu jest sprawą wykonawcy, więc rozszerzenie do `f32` też:
+    /// model, który musiałby wiedzieć, że akurat ten bufor jest półprecyzyjny,
+    /// byłby modelem dla tego wykonawcy.
     fn read(&self, act: Act, len: usize) -> Result<Vec<f32>>;
 
     /// Zachłanny wybór, policzony tam, gdzie logity już są.
     fn argmax(&self, act: Act) -> Result<u32>;
+
+    /// Ile tokenów zmieści cache klucza i wartości.
+    fn seq_cap(&self) -> u32;
+
+    /// Kafel, w jakim wykonawca chce dostawać tokeny.
+    fn tile(&self) -> Tile;
+}
+
+/// Ile tokenów naraz i w jakiej wielokrotności.
+///
+/// Obie liczby są własnością WYKONAWCY, nie modelu: pierwsza wynika z tego, ile
+/// aktywacji zmieścił, druga z geometrii kafla jego kerneli. Model, który by je
+/// znał na stałe, znałby jeden backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tile {
+    pub max_tokens: u32,
+    /// Wielokrotność, do której warto wyrównać podział promptu. Prompt o jeden
+    /// token dłuższy od niej każe policzyć następny kafel prawie pusty —
+    /// zmierzone 5227 us/token przy 64 tokenach i 9318 przy 65.
+    pub align: u32,
+}
+
+/// Wszystko, co wykonawca musi wiedzieć, ZANIM zobaczy pierwszą wagę.
+///
+/// Dwa typy, a nie jeden, bo to dwie różne rzeczy: parametry kwantyzacji i wagi
+/// normalizacji. W MLX oba są bf16, więc zlanie ich w jeden wyglądało na
+/// uproszczenie — i dawało poprawnie wyglądający, zły tekst dla każdego źródła,
+/// które trzyma normy inaczej niż skale.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecSpec {
+    pub shape: DenseShape,
+    /// Typ, w którym leżą skale i przesunięcia kwantyzacji.
+    pub quant_params: DType,
+    /// Typ wag normalizacji.
+    pub norm_weights: DType,
+}
+
+/// Miejsce, w którym mieszkają wagi.
+///
+/// Model ładuje checkpoint, ale go nie TRZYMA: oddaje każdą wagę tutaj i
+/// dostaje w zamian identyfikator. Dzięki temu model nie ma w sobie ani jednego
+/// bufora urządzenia — a to jest jedyny powód, dla którego ten sam model liczy
+/// się na dwóch kartach bez drugiej kopii.
+pub trait WeightStore {
+    /// Waga kwantyzowana afinicznie. Wykonawca SPRAWDZA, czy pasuje do tego, w
+    /// czym skompilował kernele — zamiast ufać, że wołający pamiętał.
+    fn put_affine(&mut self, t: &AffineTriple) -> Result<WeightId>;
+
+    /// Waga niekwantyzowana, w bajtach źródła.
+    fn put_plain(&mut self, bytes: &[u8]) -> Result<WeightId>;
 }

@@ -1,10 +1,9 @@
 // ===== File: lib.rs — forge-model: model graphs built from weights =====
 //
 // Where a checkpoint becomes a sequence of operations. The crate knows about
-// architectures and about the kernel facade; it does NOT know which hardware is
-// underneath, which is the boundary PLAN_NAPRAWY §5.1 draws and the reason this
-// lives outside the engine monolith rather than as another branch inside it.
+// architectures; it does NOT know which hardware is underneath, and — since the
+// executor moved out — it has no way to find out. That is the boundary
+// PLAN_NAPRAWY §5.1 draws, and it is now a property of the dependencies rather
+// than a rule somebody has to remember.
 
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub mod mlx_dense;
+pub mod dense;

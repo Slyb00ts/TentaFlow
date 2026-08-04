@@ -12,7 +12,15 @@
 use std::path::PathBuf;
 
 use forge_hal::metal_device::MetalDevice;
-use forge_model::mlx_dense::MlxDense;
+use forge_kernels::MetalExec;
+use forge_model::dense::Dense;
+
+/// Model plus wykonawca. To jedyne miejsce w teście, które wie, co liczy —
+/// `Dense` dostaje wykonawcę jako wytwórnię i nigdy nie pyta, czym on jest.
+fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<MetalExec> {
+    Dense::load(path, |spec| MetalExec::new(device, spec)).expect("wczytanie modelu")
+}
+
 use forge_tokenize::Tokenizer;
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/mlx_generate_bielik.bin");
@@ -102,7 +110,7 @@ fn greedy_generation_matches_mlx_lm_token_for_token() {
         return;
     };
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     // Kontekst WYMUSZONY: na każdym kroku model dostaje prompt plus tokeny,
     // które wybrał MLX, i porównujemy sam wybór. Bez tego pierwszy rozjazd
@@ -177,7 +185,7 @@ fn generate_agrees_with_stepping_by_hand() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     let steps = 3usize;
     let via_api = model.generate(&oracle.prompt_ids, steps).expect("generacja");
@@ -220,9 +228,9 @@ fn a_prompt_longer_than_one_chunk_lands_where_stepping_lands() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
-    let chunk = forge_model::mlx_dense::PREFILL_CHUNK as usize;
+    let chunk = model.max_tokens() as usize;
     let mut prompt = oracle.prompt_ids.clone();
     while prompt.len() <= chunk + 8 {
         prompt.extend_from_slice(&oracle.prompt_ids[1..]);
@@ -262,7 +270,7 @@ fn how_fast_a_prompt_goes_through() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     // Długość promptu z otoczenia, żeby dało się porównać z MLX na tej samej
     // skali. Prefill jest ograniczony obliczeniami, a wydajność mnożenia rośnie
@@ -342,7 +350,7 @@ fn how_fast_decode_runs() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     let mut prompt = Vec::new();
     while prompt.len() < 256 {
@@ -393,7 +401,7 @@ fn no_batch_size_falls_off_a_cliff() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     // Rozmiary wokół obu progów rejestru: 32 (blok uwagi) i 64 (blok macierzy).
     const SIZES: &[usize] = &[8, 16, 24, 31, 32, 33, 40, 48, 56, 63, 64, 65, 128, 256];
@@ -464,7 +472,7 @@ fn the_cpu_share_computes_the_same_thing_as_the_gpu_alone() {
         eprintln!("pomijam: brak urządzenia Metal");
         return;
     };
-    let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
+    let mut model = open(device, &dir);
 
     // Dość długi, żeby q/o i gate/up/down faktycznie weszły w podział.
     let mut prompt = Vec::new();
@@ -473,12 +481,12 @@ fn the_cpu_share_computes_the_same_thing_as_the_gpu_alone() {
     }
     prompt.truncate(256);
 
-    model.set_cpu_prefill(false);
+    model.exec_mut().set_cpu_share(false);
     model.reset();
     model.prefill(&prompt).expect("prefill bez podziału");
     let alone = model.logits().expect("logity bez podziału");
 
-    model.set_cpu_prefill(true);
+    model.exec_mut().set_cpu_share(true);
     model.reset();
     model.prefill(&prompt).expect("prefill z podziałem");
     let shared = model.logits().expect("logity z podziałem");

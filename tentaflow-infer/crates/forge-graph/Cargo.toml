@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 forge-types.workspace = true
+forge-formats.workspace = true
