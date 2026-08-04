@@ -32,7 +32,28 @@ pub struct Rule {
 /// that is the intended starting position, not a mistake.
 const CONFIG_MODULE: &str = "crates/forge-types/src/config/load.rs";
 
+/// Crates that PLAN_NAPRAWY 5.1 lets touch the hardware. Everything above this
+/// line describes a model, a format or a schedule, and must not know whether a
+/// GPU is underneath — that is the whole point of the layering, and the reason
+/// one checkpoint reads the same on every machine.
+const HAL_IS_ALLOWED_IN: &[&str] = &[
+    "crates/forge-kernels/",
+    "crates/forge-state/",
+    "crates/forge-cli/",
+    "crates/forge-hal/",
+];
+
 pub const RULES: &[Rule] = &[
+    Rule {
+        id: "hal_boundary",
+        title: "forge-hal reached from a layer that must not know the hardware",
+        why: "a model that imports the HAL grows one loader per platform, and the second loader is the one that quietly misses a format quirk",
+        unit: "occurrences",
+        default_allowance: 0,
+        scopes: &[Scope::RustAll],
+        eval: eval_hal_boundary,
+        review_only: false,
+    },
     Rule {
         id: "size",
         title: "File size limit",
@@ -466,5 +487,25 @@ mod tests {
             lines: justified,
         };
         assert_eq!(eval_vendor_gate(&ok).metric, 0);
+    }
+}
+
+/// Counts imports of the hardware layer from crates PLAN_NAPRAWY 5.1 forbids it in.
+fn eval_hal_boundary(file: &SourceFile) -> Measure {
+    // Regula opisuje graf crate'ow, a `xtask` w nim nie lezy — bez tego lapie
+    // wlasny kod wykrywajacy.
+    if !file.rel.starts_with("crates/") || HAL_IS_ALLOWED_IN.iter().any(|c| file.rel.starts_with(c)) {
+        return Measure { metric: 0, samples: Vec::new() };
+    }
+    let mut hits = Vec::new();
+    for (i, line) in file.lines.iter().enumerate() {
+        let code = strip_comment(line, file.lang);
+        if code.contains("forge_hal::") || code.contains("use forge_hal") {
+            hits.push((i + 1, line.trim().to_string()));
+        }
+    }
+    Measure {
+        metric: hits.len(),
+        samples: hits,
     }
 }
