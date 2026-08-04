@@ -51,44 +51,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let link = unsafe { Link::bind(&dev, port, buf.as_mut_ptr(), BUF, &addr, listen)? };
     println!("polaczone przez {dev} port {port}");
 
-    // Pierwsze slowo bufora sluzy za odbicie: strona A pisze licznik, strona B
-    // widzi zmiane i odsyla. Tylko jedna strona mierzy, druga odbija.
-    let cell = unsafe { std::slice::from_raw_parts(link.buffer().as_ptr(), 8) };
-    let mine = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u64, 1) };
+    // KAZDY kierunek ma wlasna skrzynke. Przy wspolnym offsecie obie strony
+    // pisza pod ten sam adres i kasuja sobie licznik, a strona mierzaca czeka
+    // na komorke, ktora sama przed chwila ustawila — petla konczy sie od razu
+    // i "opoznienie" wychodzi zerowe.
+    const TO_B: u64 = 0;
+    const TO_A: u64 = 4096;
+    let (inbox, outbox) = if listen { (TO_B, TO_A) } else { (TO_A, TO_B) };
+
+    let base = buf.as_mut_ptr();
+    // Do skrzynki odbiorczej pisze sasiad przez DMA, wiec czytamy ja ulotnie —
+    // inaczej kompilator ma prawo podniesc odczyt ponad petle.
+    let inbox_ptr = unsafe { base.add(inbox as usize) as *const u64 };
+    let outbox_ptr = unsafe { base.add(outbox as usize) as *mut u64 };
+    let recv = || unsafe { std::ptr::read_volatile(inbox_ptr) };
+    let send = |v: u64| unsafe { std::ptr::write_volatile(outbox_ptr, v) };
 
     if listen {
         // Odbijacz: kreci sie, az zobaczy nowy licznik, i odsyla go z powrotem.
         let mut last = 0u64;
         for _ in 0..ROUNDS {
             loop {
-                let v = u64::from_le_bytes(cell[0..8].try_into().unwrap());
+                let v = recv();
                 if v != last {
                     last = v;
                     break;
                 }
                 std::hint::spin_loop();
             }
-            mine[0] = last;
-            link.write(0, PING, 1, true)?;
+            send(last);
+            link.write(outbox, PING, 1, true)?;
             link.wait(1)?;
         }
         println!("odbicia zakonczone");
     } else {
         // Rozgrzewka, potem pomiar opoznienia tam i z powrotem.
         for i in 1..=64u64 {
-            mine[0] = i;
-            link.write(0, PING, 1, true)?;
+            send(i);
+            link.write(outbox, PING, 1, true)?;
             link.wait(1)?;
-            while u64::from_le_bytes(cell[0..8].try_into().unwrap()) != i {
+            while recv() != i {
                 std::hint::spin_loop();
             }
         }
         let t0 = Instant::now();
         for i in 65..(65 + ROUNDS as u64 - 64) {
-            mine[0] = i;
-            link.write(0, PING, 1, true)?;
+            send(i);
+            link.write(outbox, PING, 1, true)?;
             link.wait(1)?;
-            while u64::from_le_bytes(cell[0..8].try_into().unwrap()) != i {
+            while recv() != i {
                 std::hint::spin_loop();
             }
         }
@@ -105,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut outstanding = 0;
             for i in 0..iters {
                 let sig = i % 32 == 31;
-                link.write(0, len as u32, i as u64, sig)?;
+                link.write(outbox, len as u32, i as u64, sig)?;
                 if sig {
                     outstanding += 1;
                     if outstanding >= 4 {
