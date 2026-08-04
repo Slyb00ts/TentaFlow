@@ -97,7 +97,7 @@ fn the_two_formats_of_the_same_model_side_by_side() {
     let mut prompt = tokenizer.encode("Stolica Polski to", false).expect("encode");
     prompt.insert(0, 1);
 
-    let mut row = |label: &str, path: &Path| {
+    let row = |label: &str, path: &Path| {
         let mut m = MlxDense::load(device.clone(), path).expect("wczytanie");
         // Rozgrzewka, potem mediana z trzech — jak w pozostałych pomiarach.
         let mut prefills = Vec::new();

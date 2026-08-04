@@ -29,7 +29,7 @@ use forge_kernels::variant::{
 use forge_types::{DType, DenseShape, ForgeError, MemKind, Result};
 
 use forge_kernels::cpu_matmul::{CpuMatmul, Operands};
-use crate::exec::{Act, WeightId};
+use forge_graph::{Act, Executor, Op, WeightId};
 
 /// Prompt tokens carried through the layers in one pass.
 ///
@@ -165,6 +165,55 @@ struct LayerIds {
     down: WeightId,
 }
 
+impl Executor for MetalExec {
+    /// Jedno wejście dla całego słownictwa. Rozgałęzienie jest TU, w wykonawcy,
+    /// a nie w modelu — dzięki temu backend, który czegoś nie umie, odmawia w
+    /// jednym miejscu, zamiast implementować zaślepkę.
+    fn run(&self, op: &Op) -> Result<()> {
+        match op {
+            Op::Embed { table, tokens } => self.op_embed(*table, tokens),
+            Op::RmsNorm { out, x, w, tokens } => self.op_rmsnorm(*out, *x, *w, *tokens),
+            Op::MatMul { out, w, x, tokens } => self.op_matmul(*out, *w, *x, *tokens),
+            Op::Rope { act, heads, pos, tokens } => self.op_rope(*act, *heads, *pos, *tokens),
+            Op::KvAppend { layer, pos, tokens } => self.op_kv_append(*layer, *pos, *tokens),
+            Op::Attention { layer, seq, tokens } => self.op_attention(*layer, *seq, *tokens),
+            Op::SiluMul { tokens } => self.op_silu_mul(*tokens),
+            Op::Residual { src, tokens } => self.op_residual(*src, *tokens),
+            Op::LogitsOfLast { w, x, tokens } => self.op_logits_of_last(*w, *x, *tokens),
+        }
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.stream.synchronize()
+    }
+
+    fn read(&self, act: Act, len: usize) -> Result<Vec<f32>> {
+        self.stream.synchronize()?;
+        let mut raw = vec![0u8; len * 4];
+        self.device.read(self.buf(act), 0, &mut raw)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    }
+
+    fn argmax(&self, act: Act) -> Result<u32> {
+        self.launch(
+            &self.pipes.argmax,
+            LaunchArgs::new()
+                .buf(&self.scratch.token)
+                .buf(self.buf(act))
+                .scalar(self.shape.vocab),
+            1,
+            msl::ARGMAX_THREADS,
+        )?;
+        self.stream.synchronize()?;
+        let mut raw = [0u8; 4];
+        self.device.read(&self.scratch.token, 0, &mut raw)?;
+        Ok(u32::from_le_bytes(raw))
+    }
+}
+
 impl MetalExec {
     /// Bufor tego slotu.
     fn buf(&self, a: Act) -> &DevBuffer {
@@ -186,6 +235,41 @@ impl MetalExec {
     /// Czy slot trzyma połówkową precyzję. Własność slotu, nie wywołania.
     fn is_half(a: Act) -> bool {
         !matches!(a, Act::Proj | Act::Logits)
+    }
+
+    /// Osadzenia tokenów kafla do `Act::Hidden`.
+    fn op_embed(&self, table: WeightId, tokens: &[u32]) -> Result<()> {
+        let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.device.write(&ids, &self.scratch.ids, 0)?;
+        let w = self.quant(table)?;
+        let n = tokens.len() as u32;
+        self.launch(
+            &self.pipes.embed,
+            LaunchArgs::new()
+                .buf(self.buf(Act::Hidden))
+                .buf(&w.packed)
+                .buf(&w.scales)
+                .buf(&w.biases)
+                .buf(&self.scratch.ids)
+                .scalar(self.shape.hidden)
+                .scalar(w.group)
+                .scalar(n),
+            msl::elementwise_groups(n * self.shape.hidden),
+            msl::ELEMENTWISE_THREADS,
+        )
+    }
+
+    /// Głowa wyjściowa dla ostatniego tokenu kafla.
+    fn op_logits_of_last(&self, w: WeightId, x: Act, tokens: u32) -> Result<()> {
+        let last = (tokens - 1) as usize * self.shape.hidden as usize * 2;
+        let weight = self.quant(w)?;
+        self.gemv(
+            self.pipes.qmv.get(weight.bits, false),
+            self.buf(Act::Logits),
+            weight,
+            self.buf(x),
+            last,
+        )
     }
 
     /// `out = norm(x) * waga`.
@@ -578,7 +662,9 @@ impl MlxDense {
             msl::ELEMENTWISE_THREADS,
         )?;
         for index in 0..layers.min(self.layers.len()) {
-            self.layer(index, pos, seq, 1)?;
+            for op in self.layer_ops(index, pos, seq, 1) {
+                self.exec.run(&op)?;
+            }
         }
         self.exec.stream.synchronize()?;
         self.hidden_state()
@@ -741,7 +827,9 @@ impl MlxDense {
             msl::ELEMENTWISE_THREADS,
         )?;
         for index in 0..self.layers.len() {
-            self.layer(index, pos, seq, n)?;
+            for op in self.layer_ops(index, pos, seq, n) {
+                self.exec.run(&op)?;
+            }
         }
         let fnw = self.exec.plain(self.final_norm)?;
         self.exec.rmsnorm(&self.exec.scratch.norm, &self.exec.scratch.h, fnw, n)?;
@@ -764,36 +852,34 @@ impl MlxDense {
         Ok(())
     }
 
-    /// Jedna warstwa: kolejność operacji i nic poza nią.
+    /// Jedna warstwa jako CIĄG OPERACJI.
     ///
-    /// Ani jednego bufora, ani jednego kernela, ani jednej decyzji o formie —
-    /// to wszystko należy do wykonawcy. Ta funkcja jest tym, co jest wspólne
-    /// dla każdej maszyny, na której ten model ma działać.
-    fn layer(&self, index: usize, pos: u32, seq: u32, tokens: u32) -> Result<()> {
+    /// Zwraca dane, a nie wykonuje — dzięki temu ten sam opis da się później
+    /// przepisać przed wykonaniem (złączyć, przestawić, dobrać wariant) bez
+    /// dotykania modelu, i dzięki temu model nie ma czym nazwać bufora.
+    fn layer_ops(&self, index: usize, pos: u32, seq: u32, tokens: u32) -> Vec<Op> {
         let s = self.shape;
         let l = &self.layers[index];
-        let e = &self.exec;
-
-        e.op_rmsnorm(Act::Norm, Act::Hidden, l.attn_norm, tokens)?;
-        e.op_matmul(Act::Query, l.q, Act::Norm, tokens)?;
-        e.op_matmul(Act::Key, l.k, Act::Norm, tokens)?;
-        e.op_matmul(Act::Value, l.v, Act::Norm, tokens)?;
-
-        e.op_rope(Act::Query, s.heads, pos, tokens)?;
-        e.op_rope(Act::Key, s.kv_heads, pos, tokens)?;
-        e.op_kv_append(index, pos, tokens)?;
-
-        e.op_attention(index, seq, tokens)?;
-        e.op_matmul(Act::Proj, l.o, Act::Attn, tokens)?;
-        e.op_residual(Act::Proj, tokens)?;
-
-        e.op_rmsnorm(Act::Norm, Act::Hidden, l.ffn_norm, tokens)?;
-        e.op_matmul(Act::Gate, l.gate, Act::Norm, tokens)?;
-        e.op_matmul(Act::Up, l.up, Act::Norm, tokens)?;
-        e.op_silu_mul(tokens)?;
-        e.op_matmul(Act::Proj, l.down, Act::Activated, tokens)?;
-        e.op_residual(Act::Proj, tokens)
+        vec![
+            Op::RmsNorm { out: Act::Norm, x: Act::Hidden, w: l.attn_norm, tokens },
+            Op::MatMul { out: Act::Query, w: l.q, x: Act::Norm, tokens },
+            Op::MatMul { out: Act::Key, w: l.k, x: Act::Norm, tokens },
+            Op::MatMul { out: Act::Value, w: l.v, x: Act::Norm, tokens },
+            Op::Rope { act: Act::Query, heads: s.heads, pos, tokens },
+            Op::Rope { act: Act::Key, heads: s.kv_heads, pos, tokens },
+            Op::KvAppend { layer: index, pos, tokens },
+            Op::Attention { layer: index, seq, tokens },
+            Op::MatMul { out: Act::Proj, w: l.o, x: Act::Attn, tokens },
+            Op::Residual { src: Act::Proj, tokens },
+            Op::RmsNorm { out: Act::Norm, x: Act::Hidden, w: l.ffn_norm, tokens },
+            Op::MatMul { out: Act::Gate, w: l.gate, x: Act::Norm, tokens },
+            Op::MatMul { out: Act::Up, w: l.up, x: Act::Norm, tokens },
+            Op::SiluMul { tokens },
+            Op::MatMul { out: Act::Proj, w: l.down, x: Act::Activated, tokens },
+            Op::Residual { src: Act::Proj, tokens },
+        ]
     }
+
 
 
 }
@@ -1224,7 +1310,6 @@ mod tests {
             vocab: 32128,
             eps: 1e-5,
             rope_theta: 1e6,
-            group: 64,
         };
         assert_eq!(s.kv_width(), 1024);
         assert!((s.attn_scale() - 0.088_388).abs() < 1e-5);
