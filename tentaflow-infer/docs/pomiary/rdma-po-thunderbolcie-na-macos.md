@@ -19,16 +19,20 @@ Zweryfikowane lokalnie w SDK (`xcrun --show-sdk-path`):
 | biblioteka | `usr/lib/librdma.tbd` |
 | symbole | 47 wpisów `ibv_*` / `rdma_*`, m.in. `ibv_alloc_pd`, `ibv_cmd_create_qp`, `ibv_poll_cq` |
 
-Deklarowane parametry: **80 Gb/s** i opóźnienia **5–9 us** przy Thunderbolt 5,
-do **czterech Maców** połączonych każdy z każdym (bez przełącznika).
+Deklarowane parametry: **80 Gb/s** i opóźnienia **5–9 us**, do **czterech
+Maców** połączonych każdy z każdym (bez przełącznika).
 
-## Czego ta maszyna nie zrobi
+## Której generacji Thunderbolta to wymaga — NIE USTALONE
 
-Mac mini M4, na którym pracujemy: macOS **26.5.2**, ale magistrale Thunderbolt
-raportują **40 Gb/s**, czyli Thunderbolt 4. RDMA po Thunderbolcie wymaga
-**Thunderbolt 5**, więc tutaj skompiluje się i zalinkuje, ale nie zobaczy
-urządzenia. Do realnego uruchomienia potrzebny jest Mac z TB5 (M4 Pro/Max i
-nowsze) — i drugi taki sam.
+Wtórne omówienia mówią o Thunderbolt 5. Nie udało się tego potwierdzić w nocie
+źródłowej TN3205 (strona nie dała się pobrać), a użytkownik projektu podaje, że
+działa również na Thunderbolt 4. **Ten dokument tego nie rozstrzyga** — 80 Gb/s
+to parametr łącza TB5, ale to nie to samo co warunek działania.
+
+Sonda na tej maszynie (Mac mini M4, macOS 26.5.2, magistrale 40 Gb/s = TB4)
+zwraca `ibv_get_device_list` = 0 urządzeń. Jest to jednak NIEROZSTRZYGAJĄCE:
+nic nie jest podłączone drugim końcem kabla, a urządzenie RDMA ma prawo pojawić
+się dopiero przy istniejącym łączu.
 
 ## Dlaczego `forge-rdma` się nie linkował
 
