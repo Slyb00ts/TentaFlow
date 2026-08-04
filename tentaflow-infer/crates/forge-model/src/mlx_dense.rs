@@ -29,7 +29,7 @@ use forge_kernels::variant::{
 use forge_types::{DType, ForgeError, MemKind, Result};
 
 use crate::cpu_matmul::{CpuMatmul, Operands};
-use crate::exec::WeightId;
+use crate::exec::{Act, WeightId};
 
 /// Prompt tokens carried through the layers in one pass.
 ///
@@ -204,6 +204,107 @@ struct LayerIds {
 }
 
 impl MetalExec {
+    /// Bufor tego slotu.
+    fn buf(&self, a: Act) -> &DevBuffer {
+        match a {
+            Act::Hidden => &self.scratch.h,
+            Act::Norm => &self.scratch.norm,
+            Act::Query => &self.scratch.q,
+            Act::Key => &self.scratch.k,
+            Act::Value => &self.scratch.v,
+            Act::Attn => &self.scratch.attn,
+            Act::Proj => &self.scratch.proj,
+            Act::Gate => &self.scratch.gate,
+            Act::Up => &self.scratch.up,
+            Act::Activated => &self.scratch.act,
+            Act::Logits => &self.scratch.logits,
+        }
+    }
+
+    /// Czy slot trzyma połówkową precyzję. Własność slotu, nie wywołania.
+    fn is_half(a: Act) -> bool {
+        !matches!(a, Act::Proj | Act::Logits)
+    }
+
+    /// `out = norm(x) * waga`.
+    fn op_rmsnorm(&self, out: Act, x: Act, w: WeightId, tokens: u32) -> Result<()> {
+        self.rmsnorm(self.buf(out), self.buf(x), self.plain(w)?, tokens)
+    }
+
+    /// `out = x * wagaᵀ`. Formę wybiera rejestr, typ zapisu wynika ze slotu.
+    fn op_matmul(&self, out: Act, w: WeightId, x: Act, tokens: u32) -> Result<()> {
+        self.matmul(self.buf(out), self.quant(w)?, self.buf(x), tokens, Self::is_half(out))
+    }
+
+    fn op_rope(&self, a: Act, heads: u32, pos: u32, tokens: u32) -> Result<()> {
+        self.rope(self.buf(a), heads, pos, tokens)
+    }
+
+    /// Dopisuje klucz i wartość tego kafla do cache'u warstwy.
+    fn op_kv_append(&self, layer: usize, pos: u32, tokens: u32) -> Result<()> {
+        let (kc, vc) = &self.kv[layer];
+        self.kv_append(kc, self.buf(Act::Key), pos, tokens)?;
+        self.kv_append(vc, self.buf(Act::Value), pos, tokens)
+    }
+
+    /// `Hidden += src`.
+    fn op_residual(&self, src: Act, tokens: u32) -> Result<()> {
+        self.residual(self.buf(src), tokens)
+    }
+
+    /// `Activated = silu(Gate) * Up`.
+    fn op_silu_mul(&self, tokens: u32) -> Result<()> {
+        let n = tokens * self.shape.inter;
+        self.launch(
+            &self.pipes.silu_mul,
+            LaunchArgs::new()
+                .buf(self.buf(Act::Activated))
+                .buf(self.buf(Act::Gate))
+                .buf(self.buf(Act::Up))
+                .scalar(n),
+            msl::silu_mul_groups(n),
+            msl::SILU_MUL_THREADS,
+        )
+    }
+
+    /// Uwaga nad cache'em warstwy. Formę wybiera rejestr, tak samo jak przy
+    /// mnożeniu — model nie ma tu zdania.
+    fn op_attention(&self, layer: usize, seq: u32, tokens: u32) -> Result<()> {
+        let s = self.shape;
+        let (kc, vc) = &self.kv[layer];
+        let form = ATTENTION_FORMS
+            .pick(&Problem::new(tokens, s.heads, s.head_dim))
+            .ok_or_else(|| ForgeError::Unsupported("brak wariantu uwagi".into()))?;
+        let (kernel, groups, threads) = match form.form {
+            AttentionForm::Blocked if msl::flash_fits(tokens, s.head_dim) => (
+                &self.pipes.flash,
+                msl::flash_attn_groups(s.heads, tokens),
+                msl::FLASH_THREADS,
+            ),
+            _ => (
+                &self.pipes.attn,
+                msl::attn_groups(s.heads, tokens),
+                msl::ATTN_THREADS,
+            ),
+        };
+        self.launch(
+            kernel,
+            LaunchArgs::new()
+                .buf(self.buf(Act::Attn))
+                .buf(self.buf(Act::Query))
+                .buf(kc)
+                .buf(vc)
+                .scalar(s.heads)
+                .scalar(s.kv_heads)
+                .scalar(seq)
+                .scalar(self.seq_cap)
+                .scalar(s.attn_scale())
+                .scalar(tokens),
+            groups,
+            threads,
+        )
+    }
+
     fn quant(&self, id: WeightId) -> Result<&Quantized> {
         match self.weights.get(id.0 as usize) {
             Some(Weight::Quant(q)) => Ok(q),
@@ -498,7 +599,7 @@ impl MlxDense {
         let (pos, seq) = (self.position, self.position + 1);
         self.exec.device.write(&token.to_le_bytes(), &self.exec.scratch.ids, 0)?;
         let emb = self.exec.quant(self.embed)?;
-        self.launch(
+        self.exec.launch(
             &self.exec.pipes.embed,
             LaunchArgs::new()
                 .buf(&self.exec.scratch.h)
@@ -603,7 +704,7 @@ impl MlxDense {
     }
 
     fn argmax_of_logits(&mut self) -> Result<u32> {
-        self.launch(
+        self.exec.launch(
             &self.exec.pipes.argmax,
             LaunchArgs::new()
                 .buf(&self.exec.scratch.token)
@@ -661,7 +762,7 @@ impl MlxDense {
         self.exec.device.write(&ids, &self.exec.scratch.ids, 0)?;
 
         let emb = self.exec.quant(self.embed)?;
-        self.launch(
+        self.exec.launch(
             &self.exec.pipes.embed,
             LaunchArgs::new()
                 .buf(&self.exec.scratch.h)
@@ -679,13 +780,13 @@ impl MlxDense {
             self.layer(index, pos, seq, n)?;
         }
         let fnw = self.exec.plain(self.final_norm)?;
-        self.rmsnorm(&self.exec.scratch.norm, &self.exec.scratch.h, fnw, n)?;
+        self.exec.rmsnorm(&self.exec.scratch.norm, &self.exec.scratch.h, fnw, n)?;
 
         // Logity tylko dla ostatniego tokenu kafla: pozostałe wiersze służą
         // wyłącznie zapełnieniu cache'u, a głowa wyjściowa jest z 32 tysiącami
         // wierszy najdroższą pojedynczą macierzą w modelu.
         let last = (n - 1) as usize * s.hidden as usize * 2;
-        self.gemv(
+        self.exec.gemv(
             self.exec.pipes.qmv.get(self.exec.quant(self.lm_head)?.bits, false),
             &self.exec.scratch.logits,
             self.exec.quant(self.lm_head)?,
@@ -699,76 +800,41 @@ impl MlxDense {
         Ok(())
     }
 
+    /// Jedna warstwa: kolejność operacji i nic poza nią.
+    ///
+    /// Ani jednego bufora, ani jednego kernela, ani jednej decyzji o formie —
+    /// to wszystko należy do wykonawcy. Ta funkcja jest tym, co jest wspólne
+    /// dla każdej maszyny, na której ten model ma działać.
     fn layer(&self, index: usize, pos: u32, seq: u32, tokens: u32) -> Result<()> {
         let s = self.shape;
         let l = &self.layers[index];
-        let (kc, vc) = &self.exec.kv[index];
+        let e = &self.exec;
 
-        self.rmsnorm(&self.exec.scratch.norm, &self.exec.scratch.h, self.exec.plain(l.attn_norm)?, tokens)?;
-        self.matmul(&self.exec.scratch.q, self.exec.quant(l.q)?, &self.exec.scratch.norm, tokens, true)?;
-        self.matmul(&self.exec.scratch.k, self.exec.quant(l.k)?, &self.exec.scratch.norm, tokens, true)?;
-        self.matmul(&self.exec.scratch.v, self.exec.quant(l.v)?, &self.exec.scratch.norm, tokens, true)?;
+        e.op_rmsnorm(Act::Norm, Act::Hidden, l.attn_norm, tokens)?;
+        e.op_matmul(Act::Query, l.q, Act::Norm, tokens)?;
+        e.op_matmul(Act::Key, l.k, Act::Norm, tokens)?;
+        e.op_matmul(Act::Value, l.v, Act::Norm, tokens)?;
 
-        self.rope(&self.exec.scratch.q, s.heads, pos, tokens)?;
-        self.rope(&self.exec.scratch.k, s.kv_heads, pos, tokens)?;
-        self.kv_append(kc, &self.exec.scratch.k, pos, tokens)?;
-        self.kv_append(vc, &self.exec.scratch.v, pos, tokens)?;
+        e.op_rope(Act::Query, s.heads, pos, tokens)?;
+        e.op_rope(Act::Key, s.kv_heads, pos, tokens)?;
+        e.op_kv_append(index, pos, tokens)?;
 
-        // Która forma uwagi obsługuje który wsad — decyduje rejestr, tak samo
-        // jak przy mnożeniu. Zgodność obu form jest przypięta testem, a forma
-        // per-token jest przypięta do MLX.
-        let attn = ATTENTION_FORMS
-            .pick(&Problem::new(tokens, s.heads, s.head_dim))
-            .ok_or_else(|| ForgeError::Unsupported("brak wariantu uwagi".into()))?;
-        let (kernel, groups, threads) = match attn.form {
-            AttentionForm::Blocked if msl::flash_fits(tokens, s.head_dim) => (
-                &self.exec.pipes.flash,
-                msl::flash_attn_groups(s.heads, tokens),
-                msl::FLASH_THREADS,
-            ),
-            _ => (
-                &self.exec.pipes.attn,
-                msl::attn_groups(s.heads, tokens),
-                msl::ATTN_THREADS,
-            ),
-        };
-        self.launch(
-            kernel,
-            LaunchArgs::new()
-                .buf(&self.exec.scratch.attn)
-                .buf(&self.exec.scratch.q)
-                .buf(kc)
-                .buf(vc)
-                .scalar(s.heads)
-                .scalar(s.kv_heads)
-                .scalar(seq)
-                .scalar(self.seq_cap)
-                .scalar(s.attn_scale())
-                .scalar(tokens),
-            groups,
-            threads,
-        )?;
+        e.op_attention(index, seq, tokens)?;
+        e.op_matmul(Act::Proj, l.o, Act::Attn, tokens)?;
+        e.op_residual(Act::Proj, tokens)?;
 
-        self.matmul(&self.exec.scratch.proj, self.exec.quant(l.o)?, &self.exec.scratch.attn, tokens, false)?;
-        self.residual(&self.exec.scratch.proj, tokens)?;
-
-        self.rmsnorm(&self.exec.scratch.norm, &self.exec.scratch.h, self.exec.plain(l.ffn_norm)?, tokens)?;
-        self.matmul(&self.exec.scratch.gate, self.exec.quant(l.gate)?, &self.exec.scratch.norm, tokens, true)?;
-        self.matmul(&self.exec.scratch.up, self.exec.quant(l.up)?, &self.exec.scratch.norm, tokens, true)?;
-        self.launch(
-            &self.exec.pipes.silu_mul,
-            LaunchArgs::new()
-                .buf(&self.exec.scratch.act)
-                .buf(&self.exec.scratch.gate)
-                .buf(&self.exec.scratch.up)
-                .scalar(tokens * s.inter),
-            msl::silu_mul_groups(tokens * s.inter),
-            msl::SILU_MUL_THREADS,
-        )?;
-        self.matmul(&self.exec.scratch.proj, self.exec.quant(l.down)?, &self.exec.scratch.act, tokens, false)?;
-        self.residual(&self.exec.scratch.proj, tokens)
+        e.op_rmsnorm(Act::Norm, Act::Hidden, l.ffn_norm, tokens)?;
+        e.op_matmul(Act::Gate, l.gate, Act::Norm, tokens)?;
+        e.op_matmul(Act::Up, l.up, Act::Norm, tokens)?;
+        e.op_silu_mul(tokens)?;
+        e.op_matmul(Act::Proj, l.down, Act::Activated, tokens)?;
+        e.op_residual(Act::Proj, tokens)
     }
 
+
+}
+
+impl MetalExec {
     fn rmsnorm(
         &self,
         out: &DevBuffer,
@@ -777,7 +843,7 @@ impl MlxDense {
         tokens: u32,
     ) -> Result<()> {
         self.launch(
-            &self.exec.pipes.rmsnorm,
+            &self.pipes.rmsnorm,
             LaunchArgs::new()
                 .buf(out)
                 .buf(input)
@@ -836,13 +902,13 @@ impl MlxDense {
         })?;
         match chosen.form {
             MatmulForm::Vector => {
-                self.gemv(self.exec.pipes.qmv.get(w.bits, f16_out), out, w, x, 0)
+                self.gemv(self.pipes.qmv.get(w.bits, f16_out), out, w, x, 0)
             }
             MatmulForm::RegisterBlocked => self.matmul_blocked(out, w, x, tokens, f16_out),
             MatmulForm::MatrixUnits => {
                 self.matmul_matrix_units(out, w, x, tokens, f16_out, None)
             }
-            MatmulForm::MatrixUnitsSharedWithCpu if !self.exec.cpu_share => {
+            MatmulForm::MatrixUnitsSharedWithCpu if !self.cpu_share => {
                 self.matmul_matrix_units(out, w, x, tokens, f16_out, None)
             }
             MatmulForm::MatrixUnitsSharedWithCpu => {
@@ -869,7 +935,7 @@ impl MlxDense {
         f16_out: bool,
         split: Option<RowSplit>,
     ) -> Result<()> {
-        let k = self.exec.pipes.qmg.get(w.bits, f16_out);
+        let k = self.pipes.qmg.get(w.bits, f16_out);
         let Some(split) = split else {
             let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
             return self.launch_qmg(k, out, w, x, tokens, (gx, gy));
@@ -889,7 +955,7 @@ impl MlxDense {
             cols: w.cols,
             group: w.group,
         };
-        let mut cpu = self.exec.cpu.borrow_mut();
+        let mut cpu = self.cpu.borrow_mut();
         cpu.check(&operands, split.gpu_rows, split.cpu_rows)?;
 
         // Unpacking FIRST, before the wait below. It needs only the weights,
@@ -905,7 +971,7 @@ impl MlxDense {
         // is therefore safe, but the CPU is not ordered against the GPU at all.
         // Without this wait the CPU multiplies whatever the buffer happened to
         // hold — which is not a crash, just a different model.
-        self.exec.stream.synchronize()?;
+        self.stream.synchronize()?;
 
         let (gx, gy) = msl::qmg_affine_4bit_groups(split.gpu_rows, tokens);
         self.launch_qmg(k, out, w, x, tokens, (gx, gy))?;
@@ -915,7 +981,7 @@ impl MlxDense {
         // that deliberately pays for a command buffer of its own — 19,6 us
         // against 0,61 (EKS-A3) — and `split_rows` only allows it where that is
         // a couple of percent of the work being overlapped.
-        self.exec.device.record_event(&self.exec.split_event, &self.exec.stream)?;
+        self.device.record_event(&self.split_event, &self.stream)?;
 
         // SAFETY: the GPU dispatch above writes rows below `gpu_rows` and this
         // writes from `gpu_rows` up, into the same shared allocation. The two
@@ -923,7 +989,7 @@ impl MlxDense {
         // wait below, before anything reads the whole result.
         unsafe { cpu.multiply(&operands, split.gpu_rows, split.cpu_rows)? };
         drop(cpu);
-        self.exec.split_event.synchronize()
+        self.split_event.synchronize()
     }
 
     /// The matrix-unit dispatch itself. The kernel always receives the FULL row
@@ -938,7 +1004,7 @@ impl MlxDense {
         tokens: u32,
         grid: (u32, u32),
     ) -> Result<()> {
-        self.exec.device.launch(
+        self.device.launch(
             k,
             &LaunchConfig {
                 grid: (grid.0, grid.1, 1),
@@ -950,7 +1016,7 @@ impl MlxDense {
                 .scalar(w.cols)
                 .scalar(w.group)
                 .scalar(tokens),
-            &self.exec.stream,
+            &self.stream,
         )
     }
 
@@ -963,9 +1029,9 @@ impl MlxDense {
         tokens: u32,
         f16_out: bool,
     ) -> Result<()> {
-        let k = self.exec.pipes.qmm.get(w.bits, f16_out);
+        let k = self.pipes.qmm.get(w.bits, f16_out);
         let (gx, gy) = msl::qmm_affine_4bit_groups(w.rows, tokens);
-        self.exec.device.launch(
+        self.device.launch(
             k,
             &LaunchConfig {
                 grid: (gx, gy, 1),
@@ -977,14 +1043,14 @@ impl MlxDense {
                 .scalar(w.cols)
                 .scalar(w.group)
                 .scalar(tokens),
-            &self.exec.stream,
+            &self.stream,
         )
     }
 
     fn rope(&self, buf: &DevBuffer, heads: u32, pos: u32, tokens: u32) -> Result<()> {
         let threads = msl::ELEMENTWISE_THREADS;
         self.launch(
-            &self.exec.pipes.rope,
+            &self.pipes.rope,
             LaunchArgs::new()
                 .buf(buf)
                 .scalar(heads)
@@ -1000,7 +1066,7 @@ impl MlxDense {
     fn kv_append(&self, cache: &DevBuffer, src: &DevBuffer, pos: u32, tokens: u32) -> Result<()> {
         let s = self.shape;
         self.launch(
-            &self.exec.pipes.kv_append,
+            &self.pipes.kv_append,
             LaunchArgs::new()
                 .buf(cache)
                 .buf(src)
@@ -1019,10 +1085,10 @@ impl MlxDense {
     /// otherwise be copied every layer.
     fn residual(&self, delta: &DevBuffer, tokens: u32) -> Result<()> {
         self.launch(
-            &self.exec.pipes.residual,
+            &self.pipes.residual,
             LaunchArgs::new()
-                .buf(&self.exec.scratch.h)
-                .buf(&self.exec.scratch.h)
+                .buf(&self.scratch.h)
+                .buf(&self.scratch.h)
                 .buf(delta)
                 .scalar(tokens * self.shape.hidden),
             msl::elementwise_groups(tokens * self.shape.hidden),
@@ -1032,7 +1098,7 @@ impl MlxDense {
 
     fn launch(&self, kernel: &KernelHandle, args: LaunchArgs, groups: u32, threads: u32)
         -> Result<()> {
-        self.exec.device.launch(
+        self.device.launch(
             kernel,
             &LaunchConfig {
                 grid: (groups, 1, 1),
@@ -1040,7 +1106,7 @@ impl MlxDense {
                 shared_mem_bytes: 0,
             },
             &args,
-            &self.exec.stream,
+            &self.stream,
         )
     }
 }

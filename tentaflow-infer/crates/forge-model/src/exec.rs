@@ -22,3 +22,30 @@
 /// accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WeightId(pub u32);
+
+/// Bufor roboczy, nazwany tym, co model w nim trzyma.
+///
+/// Typ zapisu NIE jest tu wymieniony celowo: wynika ze slotu, a nie z decyzji
+/// modelu. Aktywacje idące dalej w mnożenia są półprecyzyjne, a te, które
+/// wracają do strumienia rezydualnego albo do wyboru tokenu — pojedynczej.
+/// Model, który mógłby to ustawić, mógłby to ustawić źle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    /// Strumień rezydualny.
+    Hidden,
+    /// Wyjście bieżącej normalizacji.
+    Norm,
+    Query,
+    Key,
+    Value,
+    /// Wyjście uwagi, przed projekcją wyjściową.
+    Attn,
+    /// Wynik projekcji, dodawany z powrotem do strumienia.
+    Proj,
+    Gate,
+    Up,
+    /// Bramka i „up" złączone aktywacją.
+    Activated,
+    /// Logity ostatniego tokenu kafla.
+    Logits,
+}
