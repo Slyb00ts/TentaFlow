@@ -24,9 +24,10 @@ use std::cell::RefCell;
 
 use half::{bf16, f16};
 
-use forge_formats::affine::{to_affine_triple, AffineTriple};
+use forge_formats::affine::AffineTriple;
+use forge_formats::dequant::dequantize_to_f32;
 use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Tile, WeightId, WeightStore};
-use forge_types::{DType, DenseShape, ForgeError, Result};
+use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
 /// Tokens carried through the layers in one pass.
 ///
@@ -81,9 +82,65 @@ impl HostQuant {
     }
 }
 
+/// A quantized weight in the source's own blocks.
+///
+/// The reference decodes them with `forge-formats`, which knows every
+/// quantization the checkpoints use — so the oracle covers all of them instead
+/// of the three that fit the affine triple. That matters because a format is
+/// only migrated to the new path once something can say the GPU got it right.
+struct HostBlocks {
+    data: Vec<u8>,
+    quant: QuantKind,
+    rows: usize,
+    cols: usize,
+}
+
+impl HostBlocks {
+    /// Bytes of one row. Every block format here is row-major over whole
+    /// blocks, which is the same fact the RoPE row permutation stands on.
+    fn row_bytes(&self) -> usize {
+        self.cols / self.quant.block_elems() * self.quant.block_bytes()
+    }
+
+    fn row_into(&self, row: usize, out: &mut [f32]) -> Result<()> {
+        let width = self.row_bytes();
+        let decoded = dequantize_to_f32(
+            DType::F32,
+            self.quant,
+            &self.data[row * width..(row + 1) * width],
+            self.cols,
+        )?;
+        out[..self.cols].copy_from_slice(&decoded);
+        Ok(())
+    }
+}
+
 enum HostWeight {
-    Quant(HostQuant),
+    /// Postać afiniczna, gdy źródło ma tylko ją — tak wygląda eksport MLX.
+    Affine(HostQuant),
+    Blocks(HostBlocks),
     Plain(Vec<f32>),
+}
+
+impl HostWeight {
+    fn shape(&self) -> (usize, usize) {
+        match self {
+            Self::Affine(q) => (q.rows, q.cols),
+            Self::Blocks(b) => (b.rows, b.cols),
+            Self::Plain(_) => (0, 0),
+        }
+    }
+
+    fn row_into(&self, row: usize, out: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Affine(q) => {
+                q.row_into(row, out);
+                Ok(())
+            }
+            Self::Blocks(b) => b.row_into(row, out),
+            Self::Plain(_) => Err(ForgeError::Other("waga zwykła nie ma wierszy".into())),
+        }
+    }
 }
 
 /// Named activation slots, all f32.
@@ -155,9 +212,9 @@ impl HostExec {
         })
     }
 
-    fn quant(&self, id: WeightId) -> Result<&HostQuant> {
+    fn quant(&self, id: WeightId) -> Result<&HostWeight> {
         match self.weights.get(id.0 as usize) {
-            Some(HostWeight::Quant(q)) => Ok(q),
+            Some(w @ (HostWeight::Affine(_) | HostWeight::Blocks(_))) => Ok(w),
             _ => Err(ForgeError::Other(format!(
                 "waga {} nie jest kwantyzowana",
                 id.0
@@ -190,28 +247,29 @@ impl HostExec {
     }
 
     /// `out = x * wagaᵀ`, plain and unblocked.
-    fn matmul(&self, out: Act, w: &HostQuant, x: Act, tokens: usize) -> Result<()> {
+    fn matmul(&self, out: Act, w: &HostWeight, x: Act, tokens: usize) -> Result<()> {
+        let (rows, cols) = w.shape();
         let src = self.with(x, <[f32]>::to_vec);
-        if src.len() < tokens * w.cols {
+        if src.len() < tokens * cols {
             return Err(ForgeError::Other(format!(
                 "wejście ma {} wartości, a mnożenie chce {}",
                 src.len(),
-                tokens * w.cols
+                tokens * cols
             )));
         }
-        self.resize(out, tokens * w.rows);
+        self.resize(out, tokens * rows);
         let mut dst = self.acts.borrow_mut();
         let dst = &mut dst.by[slot(out)];
-        let mut row = vec![0.0f32; w.cols];
-        for r in 0..w.rows {
-            w.row_into(r, &mut row);
+        let mut row = vec![0.0f32; cols];
+        for r in 0..rows {
+            w.row_into(r, &mut row)?;
             for t in 0..tokens {
-                let xs = &src[t * w.cols..(t + 1) * w.cols];
+                let xs = &src[t * cols..(t + 1) * cols];
                 let mut acc = 0.0f32;
-                for c in 0..w.cols {
+                for c in 0..cols {
                     acc = row[c].mul_add(xs[c], acc);
                 }
-                dst[t * w.rows + r] = acc;
+                dst[t * rows + r] = acc;
             }
         }
         Ok(())
@@ -224,16 +282,31 @@ impl WeightStore for HostExec {
     /// the model, which would then be choosing a layout on every backend's
     /// behalf.
     fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
-        let t = match w {
-            QuantWeight::Affine(t) => t,
+        match w {
+            QuantWeight::Affine(t) => self.put_affine(t),
             QuantWeight::Blocks {
                 data,
                 quant,
                 rows,
                 cols,
-            } => to_affine_triple(&data, quant, rows, cols)?,
-        };
-        self.put_affine(t)
+            } => {
+                // Sprawdzane TU, przy wgraniu: wiersz, który nie dzieli się na
+                // całe bloki, adresowałby cudzy blok przy każdym odczycie.
+                if !cols.is_multiple_of(quant.block_elems()) {
+                    return Err(ForgeError::Unsupported(format!(
+                        "{cols} kolumn nie dzieli się na bloki {quant:?} po {}",
+                        quant.block_elems()
+                    )));
+                }
+                self.weights.push(HostWeight::Blocks(HostBlocks {
+                    data,
+                    quant,
+                    rows,
+                    cols,
+                }));
+                Ok(WeightId(self.weights.len() as u32 - 1))
+            }
+        }
     }
 
     fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId> {
@@ -263,7 +336,7 @@ impl HostExec {
                 t.bits
             )));
         }
-        self.weights.push(HostWeight::Quant(HostQuant {
+        self.weights.push(HostWeight::Affine(HostQuant {
             packed: t.packed,
             high: t.high,
             bits: t.bits,
@@ -287,6 +360,7 @@ impl Executor for HostExec {
                 step,
             } => {
                 let w = self.quant(*table)?;
+                let (vocab, _) = w.shape();
                 self.resize(Act::Hidden, tokens.len() * s.hidden as usize);
                 if tokens.len() as u32 != step.rows() {
                     return Err(ForgeError::Format(format!(
@@ -298,14 +372,13 @@ impl Executor for HostExec {
                 let mut acts = self.acts.borrow_mut();
                 let h = &mut acts.by[slot(Act::Hidden)];
                 for (t, &id) in tokens.iter().enumerate() {
-                    if id as usize >= w.rows {
+                    if id as usize >= vocab {
                         return Err(ForgeError::Format(format!(
-                            "token {id} poza słownikiem {}",
-                            w.rows
+                            "token {id} poza słownikiem {vocab}"
                         )));
                     }
                     let base = t * s.hidden as usize;
-                    w.row_into(id as usize, &mut h[base..base + s.hidden as usize]);
+                    w.row_into(id as usize, &mut h[base..base + s.hidden as usize])?;
                 }
                 Ok(())
             }
@@ -336,22 +409,23 @@ impl Executor for HostExec {
             Op::LogitsOfLast { w, x, step } => {
                 // Ostatni token KAŻDEGO lane'a, każdy w swoim wierszu wyniku.
                 let w = self.quant(*w)?;
+                let (w_rows, w_cols) = w.shape();
                 let tokens = step.tokens() as usize;
-                let last = |lane: usize| (lane * tokens + tokens - 1) * w.cols;
+                let last = |lane: usize| (lane * tokens + tokens - 1) * w_cols;
                 let src = self.with(*x, |v| {
                     (0..step.lanes().len())
-                        .flat_map(|lane| v[last(lane)..last(lane) + w.cols].to_vec())
+                        .flat_map(|lane| v[last(lane)..last(lane) + w_cols].to_vec())
                         .collect::<Vec<f32>>()
                 });
-                self.resize(Act::Logits, step.lanes().len() * w.rows);
+                self.resize(Act::Logits, step.lanes().len() * w_rows);
                 let mut acts = self.acts.borrow_mut();
                 let dst = &mut acts.by[slot(Act::Logits)];
-                let mut row = vec![0.0f32; w.cols];
-                for r in 0..w.rows {
-                    w.row_into(r, &mut row);
+                let mut row = vec![0.0f32; w_cols];
+                for r in 0..w_rows {
+                    w.row_into(r, &mut row)?;
                     for lane in 0..step.lanes().len() {
-                        let xs = &src[lane * w.cols..(lane + 1) * w.cols];
-                        dst[lane * w.rows + r] = row
+                        let xs = &src[lane * w_cols..(lane + 1) * w_cols];
+                        dst[lane * w_rows + r] = row
                             .iter()
                             .zip(xs)
                             .fold(0.0f32, |a, (x, y)| x.mul_add(*y, a));
