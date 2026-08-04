@@ -195,8 +195,12 @@ pub struct SpilledRange {
 }
 
 /// Uchwyt stanu rekurencyjnego przypisanego do jednej sekwencji hybrydowej.
+///
+/// Publiczny, bo stan sekwencji i to, co liczy warstwę, są od tego commitu w
+/// osobnych crate'ach — a to jest ta sama granica co zawsze, tylko teraz
+/// widoczna dla kompilatora.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HybridStateLease {
+pub struct HybridStateLease {
     pub slot: usize,
     pub generation: u64,
 }
@@ -224,7 +228,7 @@ pub struct SeqKv {
     /// prefix), released and extended on completion. `None` = no borrow.
     pub prefix_node: Option<crate::prefix::NodeId>,
     /// Slot stanu DeltaNet; `None` do pierwszego przebiegu modelu hybrydowego.
-    pub(crate) hybrid_state: Option<HybridStateLease>,
+    pub hybrid_state: Option<HybridStateLease>,
 }
 
 impl SeqKv {
@@ -474,11 +478,11 @@ impl KvCache {
         self.free_pages.len()
     }
 
-    pub(crate) fn pop_free(&mut self) -> Option<i32> {
+    pub fn pop_free(&mut self) -> Option<i32> {
         self.free_pages.pop()
     }
 
-    pub(crate) fn push_free(&mut self, page: i32) {
+    pub fn push_free(&mut self, page: i32) {
         self.free_pages.push(page);
     }
 }

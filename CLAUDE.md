@@ -584,9 +584,11 @@ model jest CIĄGIEM OPERACJI (`forge-graph`), a nie ciągiem wywołań na
 urządzeniu. `forge-model` emituje `Op` i nie zna ani HAL-a, ani kerneli; ten sam
 opis liczą trzy wykonawcy tego samego kontraktu — Metal, wzorzec hostowy w f32
 (wyrocznia, działa bez akceleratora) i `CudaExec`. Postać wagi i stronicowanie
-KV należą do WYKONAWCY, nie do modelu. Silnik z `forge-engine` zostaje bez
-zmian; zacznie chudnąć dopiero, gdy słownictwo obejmie fuzję (kroki §7
-`docs/ZADANIE_CUDA_EXECUTOR.md`).
+KV należą do WYKONAWCY, nie do modelu. Postanowione: to jest jedyna docelowa
+ścieżka, a `forge-engine` ma się na nią przepisać i zniknąć — kolejność i
+mierzona skala w §8 `docs/ARCHITEKTURA_DOCELOWA.md`. Pierwszy krok zrobiony:
+stronicowane KV i drzewo radix mieszkają w `forge-state`, wspólnym dla obu
+ścieżek. Do czasu zrównania w pomiarze produkcją pozostaje `forge-engine`.
 
 ### Ścieżka NVFP4/FP8
 

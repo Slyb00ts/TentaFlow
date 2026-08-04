@@ -230,17 +230,19 @@ ma, silnik chudnie, a produkcja przechodzi DOPIERO po zrównaniu w pomiarze.
 
 Kolejność, w której każdy krok odblokowuje następny:
 
-1. **Fuzja jako pass** (§7.3 `ZADANIE_CUDA_EXECUTOR.md`). Nowa ścieżka wykonuje
+1. **Wspólna warstwa stanu.** ZACZĘTE: `forge-state` istnieje i trzyma
+   stronicowane KV oraz drzewo radix, oba wyjęte z `forge-engine` bez zmiany
+   ani jednej linii logiki. Zostaje druga połowa — żeby `CudaExec` używał tego
+   zamiast własnego stronicowania, które musiało powstać, dopóki tamto należało
+   do jednej ścieżki. Admission i continuous batching (`server.rs`) idą tą samą
+   drogą: też nie zależą od tego, jak model liczy warstwę, tylko od stron i
+   tokenów. Na Apple wspólne stronicowanie wymaga stronicowanych wariantów
+   dwóch kerneli MSL, bo `MetalExec` trzyma dziś cache jako jedną ciągłą połać
+   na warstwę.
+2. **Fuzja jako pass** (§7.3 `ZADANIE_CUDA_EXECUTOR.md`). Nowa ścieżka wykonuje
    szesnaście uruchomień na warstwę tam, gdzie scalony łańcuch silnika ma trzy.
    Dopóki tak jest, porównanie obu ścieżek mierzy narzut uruchomień, a nie
    architekturę — i nie wolno na jego podstawie niczego przełączać.
-2. **Wspólna warstwa stanu.** Stronicowane KV, radix (`prefix.rs`), admission i
-   continuous batching NIE zależą od tego, jak model liczy warstwę — operują na
-   stronach i tokenach. Wyciągnięte z `forge-engine` do własnego crate'a stają
-   się jedną implementacją dla obu ścieżek, zamiast być powodem, dla którego
-   nowa ścieżka nigdy nie dogoni starej. To najtańszy krok o największym
-   zasięgu. Na Apple wymaga stronicowanych wariantów dwóch kerneli MSL, bo
-   `MetalExec` trzyma dziś cache jako jedną ciągłą połać na warstwę.
 3. **Formaty wag.** 24 wobec 2, ale to nie jest dwunastokrotność pracy:
    `put_quant` bierze bloki źródła, launchery istnieją dla wszystkich, a
    `forge-formats::dequant` jest wzorcem CPU każdego z nich. To tablica

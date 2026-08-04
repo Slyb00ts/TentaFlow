@@ -6,7 +6,6 @@
 pub mod deepseek;
 pub mod expert_spill;
 pub mod generate;
-pub mod kv;
 pub mod metrics;
 pub mod cluster;
 pub mod model_profile;
@@ -16,13 +15,18 @@ pub mod topology;
 pub mod model;
 pub mod moe_residency;
 pub mod mtp;
-pub mod prefix;
 pub mod sample;
 pub mod server;
 pub mod speculation;
 pub mod tier;
 pub mod weight_tier;
 pub mod weights;
+
+// Stronicowane KV i drzewo prefiksów mieszkają teraz w `forge-state`, bo nie
+// zależą od tego, jak model liczy warstwę — i dopóki mieszkały tutaj, druga
+// ścieżka wykonania musiała wyhodować własne stronicowanie. Reeksport zostaje,
+// żeby `forge_engine::kv::…` u wołających dalej wskazywało to samo miejsce.
+pub use forge_state::{kv, prefix};
 
 pub use generate::{GenerateRequest, Generated, StreamEvent};
 pub use model::Model;

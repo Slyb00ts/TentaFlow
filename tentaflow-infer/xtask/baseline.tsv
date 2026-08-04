@@ -34,7 +34,6 @@ hal_boundary	crates/forge-engine/examples/mtp_bench.rs	2
 hal_boundary	crates/forge-engine/examples/mtp_smoke.rs	2
 hal_boundary	crates/forge-engine/src/cluster.rs	19
 hal_boundary	crates/forge-engine/src/deepseek.rs	1
-hal_boundary	crates/forge-engine/src/kv.rs	3
 hal_boundary	crates/forge-engine/src/model/mod.rs	4
 hal_boundary	crates/forge-engine/src/model/tp.rs	2
 hal_boundary	crates/forge-engine/src/moe_residency.rs	2
