@@ -12,7 +12,7 @@
 // Fixture: tools/mlx-oracle/gen_logits.py
 #![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
-use std::path::PathBuf;
+mod common;
 
 use forge_hal::metal_device::MetalDevice;
 use forge_kernels::MetalExec;
@@ -25,82 +25,10 @@ fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<Me
 }
 
 
-const FIXTURE: &[u8] = include_bytes!("fixtures/mlx_logits_bielik.bin");
-const CHECKPOINT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../.runtime/models/models--agentGreg--Bielik-Minitron-7B-v3.0-Instruct-MLX-4bit/snapshots"
-);
-
-struct Oracle {
-    tokens: Vec<u32>,
-    vocab: usize,
-    logits: Vec<Vec<f32>>,
-}
-
-fn load() -> Oracle {
-    assert_eq!(&FIXTURE[0..4], b"LOG1", "zły magic fikstury");
-    let mut pos = 4usize;
-    let u32_at = |p: &mut usize| {
-        let v = u32::from_le_bytes(FIXTURE[*p..*p + 4].try_into().unwrap());
-        *p += 4;
-        v
-    };
-    assert_eq!(u32_at(&mut pos), 1, "wersja fikstury");
-    let steps = u32_at(&mut pos) as usize;
-    let vocab = u32_at(&mut pos) as usize;
-    let tokens: Vec<u32> = (0..steps).map(|_| u32_at(&mut pos)).collect();
-
-    let mut logits = Vec::with_capacity(steps);
-    for _ in 0..steps {
-        let row: Vec<f32> = FIXTURE[pos..pos + vocab * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        pos += vocab * 4;
-        logits.push(row);
-    }
-    Oracle {
-        tokens,
-        vocab,
-        logits,
-    }
-}
-
-fn checkpoint() -> Option<PathBuf> {
-    let snapshots = PathBuf::from(CHECKPOINT);
-    let dir = std::fs::read_dir(&snapshots).ok()?.flatten().next()?.path();
-    dir.join("model.safetensors").is_file().then_some(dir)
-}
-
-/// Średnia różnica na logit, wyrażona w rozpiętości logitów tego kroku.
-///
-/// Nie `rel_l2`: przy pierwszym tokenie model nie ma kontekstu i logity są
-/// prawie płaskie, więc ich norma jest mała i KAŻDA różnica wygląda w niej
-/// wielko — miara mówiłaby wtedy o rozkładzie wyjścia, a nie o zgodności.
-/// Rozpiętość `max - min` jest tym, wobec czego różnica faktycznie się liczy,
-/// bo to ona decyduje o kolejności tokenów.
-fn spread_error(got: &[f32], want: &[f32]) -> f64 {
-    let mut diff = 0f64;
-    for (g, v) in got.iter().zip(want) {
-        diff += (*g as f64 - *v as f64).powi(2);
-    }
-    let rms = (diff / got.len() as f64).sqrt();
-    let max = want.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let min = want.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
-    rms / (max - min).max(1e-6)
-}
-
-fn top_k(logits: &[f32], k: usize) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b)));
-    idx.truncate(k);
-    idx
-}
-
 #[test]
 fn decode_loop_matches_mlx_lm_step_by_step() {
-    let oracle = load();
-    let Some(dir) = checkpoint() else {
+    let oracle = common::load();
+    let Some(dir) = common::checkpoint() else {
         eprintln!("pomijam: brak checkpointu Bielika");
         return;
     };
@@ -119,9 +47,9 @@ fn decode_loop_matches_mlx_lm_step_by_step() {
         let want = &oracle.logits[step];
         assert_eq!(got.len(), want.len());
 
-        let err = spread_error(&got, want);
-        let ours = top_k(&got, 5);
-        let theirs = top_k(want, 5);
+        let err = common::spread_error(&got, want);
+        let ours = common::top_k(&got, 5);
+        let theirs = common::top_k(want, 5);
         eprintln!(
             "krok {}: błąd {:.2}% rozpiętości, argmax {}",
             step + 1,
@@ -163,8 +91,8 @@ fn greedy_choice_on_the_device_agrees_with_the_readback() {
     // Ta sama sekwencja, ale token wybiera kernel na GPU zamiast hosta.
     // Jeśli te dwie drogi się rozjadą, winna jest reguła remisu albo redukcja,
     // i lepiej dowiedzieć się tego tutaj niż po dziesięciu tokenach tekstu.
-    let oracle = load();
-    let Some(dir) = checkpoint() else {
+    let oracle = common::load();
+    let Some(dir) = common::checkpoint() else {
         eprintln!("pomijam: brak checkpointu Bielika");
         return;
     };
@@ -176,7 +104,7 @@ fn greedy_choice_on_the_device_agrees_with_the_readback() {
 
     for (step, &token) in oracle.tokens.iter().enumerate() {
         let chosen = model.step_argmax(token).expect("krok dekodowania");
-        let expected = top_k(&oracle.logits[step], 1)[0] as u32;
+        let expected = common::top_k(&oracle.logits[step], 1)[0] as u32;
         assert_eq!(chosen, expected, "krok {}", step + 1);
     }
 }
@@ -185,7 +113,7 @@ fn greedy_choice_on_the_device_agrees_with_the_readback() {
 fn a_context_past_the_cache_capacity_is_refused() {
     // Pojemność cache'u jest własnością kernela uwagi, a nie życzeniem: model
     // ma odmówić, zanim zacznie pisać poza tablicę.
-    let Some(dir) = checkpoint() else {
+    let Some(dir) = common::checkpoint() else {
         eprintln!("pomijam: brak checkpointu Bielika");
         return;
     };
@@ -215,7 +143,7 @@ const REFERENCE_NORMS: &[(usize, f64)] = &[
 
 #[test]
 fn hidden_state_tracks_mlx_at_every_depth() {
-    let Some(dir) = checkpoint() else {
+    let Some(dir) = common::checkpoint() else {
         eprintln!("pomijam: brak checkpointu Bielika");
         return;
     };

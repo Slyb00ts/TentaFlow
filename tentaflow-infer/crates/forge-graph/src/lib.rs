@@ -146,11 +146,14 @@ pub struct ExecSpec {
 /// dostaje w zamian identyfikator. Dzięki temu model nie ma w sobie ani jednego
 /// bufora urządzenia — a to jest jedyny powód, dla którego ten sam model liczy
 /// się na dwóch kartach bez drugiej kopii.
+/// Oba przyjmują wagę NA WŁASNOŚĆ, bo dla części wykonawców to jest ich
+/// docelowe miejsce — a przekazanie przez referencję kazałoby im skopiować
+/// każdą wagę modelu, czyli drugi raz zająć tyle pamięci, ile checkpoint waży.
 pub trait WeightStore {
     /// Waga kwantyzowana afinicznie. Wykonawca SPRAWDZA, czy pasuje do tego, w
     /// czym skompilował kernele — zamiast ufać, że wołający pamiętał.
-    fn put_affine(&mut self, t: &AffineTriple) -> Result<WeightId>;
+    fn put_affine(&mut self, t: AffineTriple) -> Result<WeightId>;
 
     /// Waga niekwantyzowana, w bajtach źródła.
-    fn put_plain(&mut self, bytes: &[u8]) -> Result<WeightId>;
+    fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId>;
 }

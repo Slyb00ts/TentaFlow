@@ -8,6 +8,10 @@ mod launchers;
 pub mod cpu_matmul;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 mod dense_exec;
+// Wzorzec hostowy jest DOSTĘPNY WSZĘDZIE i to jest jego sens: kontrakt, który
+// da się uruchomić bez akceleratora, można sprawdzić na każdej maszynie.
+mod host_exec;
+pub use host_exec::HostExec;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use dense_exec::MetalExec;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]

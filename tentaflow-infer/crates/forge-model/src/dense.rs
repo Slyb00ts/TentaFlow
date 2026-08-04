@@ -352,13 +352,13 @@ fn quant<E: WeightStore>(
     rope: Option<usize>,
 ) -> Result<WeightId> {
     let t = affine(src, name, rows, cols, rope)?;
-    exec.put_affine(&t)
+    exec.put_affine(t)
         .map_err(|e| ForgeError::Format(format!("{name}: {e}")))
 }
 
 /// The same, for a weight that is not quantized — the norms.
 fn plain<E: WeightStore>(exec: &mut E, src: &dyn TensorSource, name: &str) -> Result<WeightId> {
-    exec.put_plain(&src.fetch(name)?.0)
+    exec.put_plain(src.fetch(name)?.0)
 }
 
 /// One weight in the affine form every backend indexes.

@@ -269,7 +269,7 @@ impl MetalExec {
 }
 
 impl WeightStore for MetalExec {
-    fn put_affine(&mut self, t: &AffineTriple) -> Result<WeightId> {
+    fn put_affine(&mut self, t: AffineTriple) -> Result<WeightId> {
         // Trzy właściwości sprawdzane TU, przy użyciu, a nie zakładane przy
         // wołaniu. Każda z nich była już raz źródłem poprawnie wyglądającego,
         // złego tekstu.
@@ -307,8 +307,8 @@ impl WeightStore for MetalExec {
         Ok(WeightId(self.weights.len() as u32 - 1))
     }
 
-    fn put_plain(&mut self, bytes: &[u8]) -> Result<WeightId> {
-        let buf = upload(&*self.device, bytes)?;
+    fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId> {
+        let buf = upload(&*self.device, &bytes)?;
         self.weights.push(Weight::Plain(buf));
         Ok(WeightId(self.weights.len() as u32 - 1))
     }

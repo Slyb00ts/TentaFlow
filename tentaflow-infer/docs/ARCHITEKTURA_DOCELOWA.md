@@ -159,11 +159,32 @@ model, kernele i loader naraz.
    spadła z 3 na 0, a wykonawca dochodzi jako WYTWÓRNIA, bo nie może powstać
    przed odczytaniem checkpointu — dopiero ten mówi, ile warstw dostanie cache
    i dla jakiego typu skompilować kernele.
-4. **CUDA implementuje ten sam `Executor`.** Dopiero to kasuje 2822 linie
-   `dense.rs`, i dopiero wtedy hybryda oraz MoE działają na Metalu bez
-   przepisywania.
+4. **Drugi wykonawca tego samego kontraktu.** CZĘŚCIOWO: wzorzec hostowy
+   (`HostExec`) liczy te same operacje w zwykłym Ruście i zgadza się z tą samą
+   wyrocznią mlx-lm co Metal, nie dzieląc z nim ani jednej linii poza
+   kontraktem. Kontrakt z jednym wykonawcą jest kontraktem na papierze; ten
+   przestał nim być. Wzorzec jest przy okazji jedyną bramką na cały przebieg,
+   którą da się uruchomić na maszynie bez akceleratora.
+
+   **CUDA — nie, i szacunek „to kasuje 2822 linie" był zły.** Po przeczytaniu
+   `forge-engine/src/model/arch/dense.rs`: kolejność warstw to jego niewielka
+   część. Reszta to `prefill_forward_lanes` (871 linii, prefill wsadowy z
+   doklejonymi wierszami dekodowania), TRZY osobne łańcuchy dekodowania
+   (`run_step_rot`, `run_step_separate`, `run_step_fused`), bramkowanie fuzji po
+   dwudziestu kilku formatach wag, `batched_decode` i `mixed_prefill_decode_step`.
+   Dzisiejsze `Op` nie wyraża ani stronicowanego KV, ani lane'ów wsadu, ani sum
+   częściowych pod tensor parallel, ani szerokości spekulacji — a scalony
+   łańcuch to nie inna kolejność, tylko FUZJA tej samej, czyli krok 6, nie 4.
+
+   Dlatego krok 4 rozpada się na: (a) rozszerzenie słownictwa o lane'y i
+   stronicowane KV, (b) fuzję jako pass nad `Vec<Op>` zamiast trzech ręcznych
+   łańcuchów, (c) dopiero wtedy chudnięcie pliku silnika. Żadnego z nich nie
+   wolno napisać na ślepo: w tym repozytorium nie ma karty NVIDIA, a ten
+   dokument w całości jest o tym, że błąd w takiej ścieżce nie objawia się
+   awarią, tylko płynnym, złym tekstem.
 5. **`forge-quant` wydzielony z `forge-formats`**, z wzorcem CPU jako wyrocznią.
 6. **Passy nad `Vec<Op>`** — fuzja i autotuning, bez dotykania modeli.
 
 Kroki 1–3 są mechaniczne i sprawdzalne istniejącymi testami. Krok 4 jest tym, po
-którym widać zysk. Kroki 5–6 są ulepszeniami, nie warunkami.
+którym widać zysk — i jedynym, który wymaga sprzętu, którego tu nie ma. Kroki
+5–6 są ulepszeniami, nie warunkami.
