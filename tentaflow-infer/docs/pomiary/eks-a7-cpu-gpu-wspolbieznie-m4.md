@@ -276,14 +276,53 @@ rozstrzyga niczego poniżej kilkunastu procent.
 (268,3 / 266,3 wobec 267,3 / 264,5), 0,64 wyraźnie gorsze. Rampa kończy się
 więc na 512 i powyżej trzyma 0,70 — nie ma tam czego dopasowywać.
 
-**NEON do rozpakowania.** Prototyp `vqtbl1q_u8` z dwiema tablicami bajtowymi
-jest 2,66x szybszy od skalarnego i zgodny co do bitu (0 różnic na 13 mln
-elementów). NIE wdrożony: po przełożeniu kolejności rozpakowanie zeszło do 4,4%
-czasu wątku i jest w większości schowane za czekaniem, więc zysk byłby poniżej
-progu, przy którym da się go w ogóle zmierzyć na tej maszynie (rozrzut ~5%).
-Prototyp zostaje opisany tutaj, żeby nie trzeba go było wymyślać drugi raz.
+**NEON do rozpakowania — odrzucony z szacunku, przywrócony z pomiaru.**
+Pierwsza ocena była taka, że po przełożeniu kolejności rozpakowanie zeszło do
+4,4% czasu wątku i zysk byłby poniżej rozdzielczości pomiarowej. Sprawdzone
+zegarem, a nie rachunkiem: patrz runda czwarta.
+
+## Czwarta runda — potanieć pracę, bo przestawiać jej nie ma jak
+
+Najpierw pytanie, czy jest jeszcze zapas w samym CPU: jedno wywołanie BNNS daje
+1,71 TFLOPS, trzy równoległe 1,79 — **+5%**. Procesor jest wysycony, więc
+przenoszenie pracy między wątkami (np. rozpakowanie w tle) nic nie stworzy;
+jedyne, co zostaje, to zrobić tę samą pracę taniej.
+
+Przy okazji wyszło, że BNNS przy 1024 tokenach daje 1,71 TFLOPS zamiast 1,55
+przy 512 — jeszcze jeden argument za większym kaflem.
+
+### Tablica przez `vqtbl1q_u8`
+
+Tablica wartości ma dokładnie szesnaście wpisów, czyli tyle, ile indeksuje
+instrukcja `vqtbl1q_u8`. Dwie tablice bajtowe (młodszy i starszy bajt half),
+szesnaście nibbli na raz, potem przeplot z powrotem w half.
+
+| | przed | po |
+|---|---:|---:|
+| rozpakowanie | 938 us | **538 us** |
+| udział w połowie CPU | 10% | 6% |
+| cała połowa CPU | 1,40 TFLOPS | **1,48 TFLOPS** |
+
+Przeplatane A/B na modelu, prompt 1024, trzy rundy:
+
+| | przebiegi | mediana |
+|---|---|---:|
+| NEON | 275,2 / 265,2 / 276,5 | **275,2** |
+| skalarnie | 225,8 / 265,5 / 264,9 | 264,9 |
+
+**+3,9%**, przy czym najgorszy przebieg NEON równa się medianie skalarnej. Więcej,
+niż wynikało z szacunku (2%), i dlatego szacunek nie wystarczył — decyzja
+„nie warto" z rundy trzeciej była błędna i została cofnięta pomiarem.
+
+Ścieżka szeroka i wąska są przypięte do siebie osobną bramką bit po bicie dla
+grup 32/64/128, bo dwie implementacje tego samego bez takiej bramki znaczą
+wynik zależny od tego, na czym się akurat kompiluje.
 
 ## Nierozstrzygnięte
+
+Udział GPU nie został przemierzony po przyspieszeniu rozpakowania. Optimum
+powinno przesunąć się o około pół punktu w dół, czyli poniżej rozdzielczości
+tego stanowiska — i dlatego zostało.
 
 Uwaga nadal nie jest dzielona. Rachunek mówi, że przy 1024 tokenach to około
 2,4% całej pracy, a przy 2048 około 4,8% — czyli mniej, niż wcześniej
