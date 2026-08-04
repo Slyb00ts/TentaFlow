@@ -209,3 +209,51 @@ model, kernele i loader naraz.
 Kroki 1–3 są mechaniczne i sprawdzalne istniejącymi testami. Krok 4 jest tym, po
 którym widać zysk; jego pierwsza część jest zrobiona, reszta czeka na
 słownictwo, którego dziś nie ma. Kroki 5–6 są ulepszeniami, nie warunkami.
+
+## 8. Jak z dwóch ścieżek zrobić jedną
+
+Dziś w repozytorium liczą DWIE rzeczy i dzielą tylko kernele:
+
+| | `forge-engine` | `forge-model` + wykonawcy |
+|---|---|---|
+| formaty wag | **24** | 2 |
+| rodziny architektur | dense, MoE, hybrid, DeepSeek | dense |
+| radix, continuous batching, spekulacja, TP | **jest** | nie ma |
+| Apple / Metal | **zero wystąpień** | jedyna, która tam liczy |
+
+Kierunek zejścia nie jest wyborem. Silnik nie przeniesie się na Metal ani na
+żaden następny backend, bo jego model JEST kodem wołającym kernele jednej
+rodziny kart — „przeniesienie" znaczyłoby napisanie go drugi raz, czyli
+dokładnie ten błąd, który ten dokument opisuje w §2. Nowa ścieżka wyraża to
+samo danymi i ma trzech wykonawców. Więc: nowa ścieżka rośnie o to, co silnik
+ma, silnik chudnie, a produkcja przechodzi DOPIERO po zrównaniu w pomiarze.
+
+Kolejność, w której każdy krok odblokowuje następny:
+
+1. **Fuzja jako pass** (§7.3 `ZADANIE_CUDA_EXECUTOR.md`). Nowa ścieżka wykonuje
+   szesnaście uruchomień na warstwę tam, gdzie scalony łańcuch silnika ma trzy.
+   Dopóki tak jest, porównanie obu ścieżek mierzy narzut uruchomień, a nie
+   architekturę — i nie wolno na jego podstawie niczego przełączać.
+2. **Wspólna warstwa stanu.** Stronicowane KV, radix (`prefix.rs`), admission i
+   continuous batching NIE zależą od tego, jak model liczy warstwę — operują na
+   stronach i tokenach. Wyciągnięte z `forge-engine` do własnego crate'a stają
+   się jedną implementacją dla obu ścieżek, zamiast być powodem, dla którego
+   nowa ścieżka nigdy nie dogoni starej. To najtańszy krok o największym
+   zasięgu. Na Apple wymaga stronicowanych wariantów dwóch kerneli MSL, bo
+   `MetalExec` trzyma dziś cache jako jedną ciągłą połać na warstwę.
+3. **Formaty wag.** 24 wobec 2, ale to nie jest dwunastokrotność pracy:
+   `put_quant` bierze bloki źródła, launchery istnieją dla wszystkich, a
+   `forge-formats::dequant` jest wzorcem CPU każdego z nich. To tablica
+   dyspozycji w wykonawcy plus bramka na wzorcu per format.
+4. **MoE i hybrid w słownictwie.** Jedyna pozycja, która jest prawdziwą pracą
+   projektową: `Op` musi wyrazić routing ekspertów i stan rekurencyjny
+   DeltaNet, a każda platforma potrzebuje tych kerneli — inaczej „wszystko na
+   każdym systemie" jest nieprawdą, a nie planem.
+5. **Spekulacja jako pass plus kontrakt proposera.** `forge-engine::speculation`
+   ma już typowany `Proposer` i statystyki akceptacji, więc to przeniesienie,
+   nie wymyślanie.
+6. **Serwer przechodzi, silnik chudnie.** Dopiero tutaj kasujemy cokolwiek.
+
+Reguła na cały ten czas: żaden krok nie kończy się deklaracją, tylko pomiarem
+wobec wzorca hostowego (poprawność) i wobec silnika (wydajność), na tym samym
+checkpoincie.
