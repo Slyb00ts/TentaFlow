@@ -1,0 +1,12 @@
+# ===== File: Cargo.toml — forge-rdma: transport RoCE miedzy wezlami =====
+[package]
+name = "forge-rdma"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+
+[build-dependencies]
+cc = "1"
