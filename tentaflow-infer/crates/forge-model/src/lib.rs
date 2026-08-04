@@ -7,5 +7,6 @@
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod cpu_matmul;
+pub mod exec;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod mlx_dense;
