@@ -6,7 +6,7 @@
 // Both are pinned against MLX here rather than against a reading of the docs.
 //
 // Fixture: tools/mlx-oracle/gen_rope_argmax.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::collections::HashMap;
 

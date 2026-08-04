@@ -7,7 +7,7 @@
 // 140 zeroed rows, and on a zero row a wrong offset also produces zeros.
 //
 // Fixture: tools/mlx-oracle/gen_embed.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::collections::HashMap;
 

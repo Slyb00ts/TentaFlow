@@ -10,7 +10,7 @@
 // bug separate themselves immediately.
 //
 // Fixture: tools/mlx-oracle/gen_logits.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::path::PathBuf;
 

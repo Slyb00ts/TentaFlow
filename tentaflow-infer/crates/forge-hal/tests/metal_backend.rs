@@ -3,7 +3,7 @@
 // Exercised the way the engine uses it: allocate, write, load a module, launch
 // on a stream, synchronize, read back. Skips cleanly when no Metal device is
 // present so the suite stays green elsewhere.
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::sync::Arc;
 

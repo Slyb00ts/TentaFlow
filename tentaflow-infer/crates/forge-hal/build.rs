@@ -32,30 +32,52 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=amdhip64");
 }
 
-/// Shim Metala. Buduje się wyłącznie z cechą `metal` i wyłącznie na macOS,
+/// Shim Metala. Buduje się wyłącznie z cechą `metal` i wyłącznie na Apple,
 /// więc Linux i Windows kompilują forge-hal bez zmian.
+///
+/// iOS potrzebuje jawnego celu i sysrootu SDK — bez nich clang zbudowałby
+/// obiekt dla macOS, a linker odrzuciłby go dopiero na końcu, z komunikatem
+/// nie wskazującym na przyczynę.
 fn build_metal_shim() {
     println!("cargo:rerun-if-changed=metal/forge_metal_shim.m");
     if std::env::var_os("CARGO_FEATURE_METAL").is_none() {
         return;
     }
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        panic!("cecha `metal` wymaga celu macOS");
-    }
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let sdk = match os.as_str() {
+        "macos" => None,
+        "ios" => Some(
+            if std::env::var("TARGET").unwrap_or_default().ends_with("-sim") {
+                ("iphonesimulator", "arm64-apple-ios13.0-simulator")
+            } else {
+                ("iphoneos", "arm64-apple-ios13.0")
+            },
+        ),
+        other => panic!("cecha `metal` wymaga celu Apple, a nie `{other}`"),
+    };
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let obj = format!("{out}/forge_metal_shim.o");
-    let status = std::process::Command::new("clang")
-        .args([
-            "-O2",
-            "-fPIC",
-            "-fobjc-arc",
-            "-c",
-            "metal/forge_metal_shim.m",
-            "-o",
-            &obj,
-        ])
-        .status()
-        .expect("uruchomienie clang");
+    let mut cmd = std::process::Command::new("clang");
+    cmd.args([
+        "-O2",
+        "-fPIC",
+        "-fobjc-arc",
+        "-c",
+        "metal/forge_metal_shim.m",
+        "-o",
+        &obj,
+    ]);
+    if let Some((sdk_name, target)) = sdk {
+        let path = std::process::Command::new("xcrun")
+            .args(["--sdk", sdk_name, "--show-sdk-path"])
+            .output()
+            .expect("uruchomienie xcrun");
+        assert!(path.status.success(), "brak SDK `{sdk_name}`");
+        cmd.arg("-isysroot")
+            .arg(String::from_utf8_lossy(&path.stdout).trim())
+            .args(["-target", target]);
+    }
+    let status = cmd.status().expect("uruchomienie clang");
     assert!(status.success(), "kompilacja shimu Metal nie powiodla sie");
     let lib = format!("{out}/libforge_metal_shim.a");
     let status = std::process::Command::new("ar")

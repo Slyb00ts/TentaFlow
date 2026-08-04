@@ -7,7 +7,7 @@
 // wrong mapping and asserts the comparison can tell.
 //
 // Fixture: tools/mlx-oracle/gen_attn.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::collections::HashMap;
 

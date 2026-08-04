@@ -143,9 +143,8 @@ pub struct MlxDense {
     /// Names the command buffer a split submitted, so the wait is for THAT
     /// work rather than for the whole queue.
     split_event: Event,
-    /// Whether prefill may hand part of a product to the CPU. Always on in
-    /// normal use; `set_cpu_share` takes it away so the gate can run the same
-    /// prompt down both paths and compare them.
+    /// Whether prefill may hand part of a product to the CPU. See
+    /// `set_cpu_prefill`.
     cpu_share: bool,
 }
 
@@ -380,12 +379,24 @@ impl MlxDense {
         self.position = 0;
     }
 
-    /// Turns the CPU's share of prefill on or off.
+    /// Turns the CPU's share of prefill on or off. On by default.
     ///
-    /// Exists so the gate can run the SAME prompt down both paths and compare
-    /// them; without it, "the split changed the answer" could only be asserted,
-    /// never shown.
-    pub fn set_cpu_share(&mut self, on: bool) {
+    /// Default ON because it is measured to win on every Apple part this runs
+    /// on: prefill leaves the GPU at 77% of its matrix ceiling with bandwidth
+    /// to spare, so the CPU adds throughput instead of taking it
+    /// (docs/pomiary/eks-a7-cpu-gpu-wspolbieznie-m4.md).
+    ///
+    /// Reasons a caller might still turn it off:
+    ///
+    ///   * the CPU is wanted for something else — the two DO compete, and a
+    ///     concurrent load costs this path up to a third of its rate;
+    ///   * power, not speed, is the budget: the split trades watts for latency;
+    ///   * pinning down where a numerical difference comes from, which is what
+    ///     the correctness gate uses it for.
+    ///
+    /// Decode never takes this path whatever this is set to — it is bandwidth
+    /// bound, and adding compute there measured -14%.
+    pub fn set_cpu_prefill(&mut self, on: bool) {
         self.cpu_share = on;
     }
 

@@ -112,7 +112,7 @@ którą mamy za darmo z wcześniejszej decyzji architektonicznej.
 
 Zaimplementowane jako podział wierszy: GPU liczy `[0, split)` skróconą siatką,
 CPU resztę, rozpakowując swój wycinek w locie (zero dodatkowej pamięci).
-Pomiar PRZEPLATANY — `MlxDense::set_cpu_share(false)` daje odniesienie w tej
+Pomiar PRZEPLATANY — `MlxDense::set_cpu_prefill(false)` daje odniesienie w tej
 samej sesji i temperaturze, bo maszyna dryfuje i dwa osobne przebiegi
 porównywałyby temperatury:
 
@@ -318,7 +318,54 @@ niż wynikało z szacunku (2%), i dlatego szacunek nie wystarczył — decyzja
 grup 32/64/128, bo dwie implementacje tego samego bez takiej bramki znaczą
 wynik zależny od tego, na czym się akurat kompiluje.
 
+## Piąta runda — sufit CPU i zasięg ścieżki
+
+### Czy Accelerate wyciska z CPU wszystko
+
+Dotąd „CPU wysycony" znaczyło „BNNS nie daje więcej", a nie „krzem nie daje
+więcej". Różnica jest istotna, więc zmierzona osobno.
+
+| | |
+|---|---:|
+| szczyt NEON (f32 FMA w rejestrach, 10 wątków) | **576 GFLOPS** |
+| BNNS przez AMX | **1,67-1,71 TFLOPS** |
+
+Koprocesor macierzowy jest około **trzy razy szybszy niż cała reszta SIMD tej
+maszyny razem wzięta**, więc własny GEMM na NEON nie ma jak wygrać z Accelerate
+— ten kierunek jest zamknięty, a nie „nieopłacalny".
+
+Kontrola bezpośrednia: BNNS puszczony RÓWNOLEGLE z obciążeniem NEON.
+
+| wątki NEON w tle | BNNS |
+|---:|---:|
+| 2 | −8,0% |
+| 4 | −24,8% |
+| 6 | −36,0% |
+
+Każda dodatkowa praca na CPU odbiera BNNS-owi mniej więcej tyle, ile sama wnosi
+albo więcej. Nie ma bezczynnego krzemu do zagospodarowania — **CPU jest
+wykorzystany do końca**, a jedyne, co pozostaje, to potanienie pracy (jak NEON
+w rundzie czwartej), nie jej przestawianie.
+
+### Zasięg i wyłącznik
+
+Ścieżka CPU jest wyłącznie Apple'owa i teraz jawnie obejmuje macOS ORAZ iOS —
+`build.rs` HAL-a odrzucał wcześniej każdy cel poza macOS, więc iOS nie
+kompilował się w ogóle. Sprawdzone kompilacyjnie dla `aarch64-apple-ios` i
+`aarch64-apple-ios-sim`; **uruchomienia na urządzeniu nie ma i nie należy go
+zakładać** — kompilacja dowodzi tylko kompilacji.
+
+Wyłącznik: `MlxDense::set_cpu_prefill(false)`. Domyślnie WŁĄCZONY, bo na każdej
+części Apple, na której to działa, jest zmierzoną wygraną. Powody, dla których
+wywołujący może chcieć go zdjąć, są w dokumentacji metody: procesor potrzebny do
+czegoś innego (te dwie ścieżki REALNIE konkurują — patrz tabela wyżej), budżet
+liczony w watach zamiast w milisekundach, albo lokalizowanie różnicy numerycznej.
+
 ## Nierozstrzygnięte
+
+`forge-model` nie jest wpięty w serwer ani CLI — żaden z nich go nie używa —
+więc wyłącznik jest dziś opcją biblioteki, a nie flagą wiersza poleceń. Gdy
+ścieżka trafi do serwera, flaga powinna się o niego oprzeć.
 
 Udział GPU nie został przemierzony po przyspieszeniu rozpakowania. Optimum
 powinno przesunąć się o około pół punktu w dół, czyli poniżej rozdzielczości

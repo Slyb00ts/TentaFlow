@@ -7,7 +7,7 @@
 // text that simply is not the model's.
 //
 // Fixture: tools/mlx-oracle/gen_generate.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::path::PathBuf;
 
@@ -396,7 +396,7 @@ fn no_batch_size_falls_off_a_cliff() {
     let mut model = MlxDense::load(device, &dir).expect("wczytanie modelu");
 
     // Rozmiary wokół obu progów rejestru: 32 (blok uwagi) i 64 (blok macierzy).
-    const SIZES: &[usize] = &[8, 16, 31, 32, 33, 63, 64, 65, 128, 256];
+    const SIZES: &[usize] = &[8, 16, 24, 31, 32, 33, 40, 48, 56, 63, 64, 65, 128, 256];
     let mut per_token = Vec::new();
     for &n in SIZES {
         let mut prompt = Vec::new();
@@ -428,6 +428,21 @@ fn no_batch_size_falls_off_a_cliff() {
             "klif: wsad {n1} kosztuje {t1:.1} us/token, a mniejszy {n0} tylko {t0:.1}"
         );
     }
+
+    // Wsad tuż poniżej pełnego bloku MUSI kosztować podobnie co pełny. Forma
+    // macierzowa liczy blok niezależnie od tego, ile w nim tokenów, więc
+    // odesłanie 63 tokenów do formy blokowej kosztowało 11 848 us/token wobec
+    // 5 186 dla 64 — ten sam blok pracy, dwa razy drożej. To jest asercja na
+    // decyzję, nie na kernel: pilnuje, żeby próg formy macierzowej nie wrócił
+    // do wysokości bloku.
+    let at = |n: usize| per_token.iter().find(|(s, _)| *s == n).expect("rozmiar w zestawie").1;
+    assert!(
+        at(63) <= at(64) * 1.5,
+        "wsad 63 kosztuje {:.1} us/token przy {:.1} dla pełnego bloku — forma \
+         macierzowa nie obsługuje niepełnego bloku",
+        at(63),
+        at(64)
+    );
 }
 
 /// Czy oddanie części wierszy CPU zmienia WYNIK, a nie tylko czas.
@@ -458,12 +473,12 @@ fn the_cpu_share_computes_the_same_thing_as_the_gpu_alone() {
     }
     prompt.truncate(256);
 
-    model.set_cpu_share(false);
+    model.set_cpu_prefill(false);
     model.reset();
     model.prefill(&prompt).expect("prefill bez podziału");
     let alone = model.logits().expect("logity bez podziału");
 
-    model.set_cpu_share(true);
+    model.set_cpu_prefill(true);
     model.reset();
     model.prefill(&prompt).expect("prefill z podziałem");
     let shared = model.logits().expect("logity z podziałem");

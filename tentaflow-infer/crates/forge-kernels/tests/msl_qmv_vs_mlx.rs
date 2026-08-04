@@ -6,7 +6,7 @@
 // implementation of the same kernel.
 //
 // Fixture: tools/mlx-oracle/gen_qmv.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use forge_hal::metal_device::MetalDevice;
 use forge_hal::{Device, LaunchArgs, LaunchConfig, Pool};

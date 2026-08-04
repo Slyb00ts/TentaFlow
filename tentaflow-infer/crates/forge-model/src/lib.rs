@@ -5,7 +5,7 @@
 // underneath, which is the boundary PLAN_NAPRAWY §5.1 draws and the reason this
 // lives outside the engine monolith rather than as another branch inside it.
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod cpu_matmul;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod mlx_dense;

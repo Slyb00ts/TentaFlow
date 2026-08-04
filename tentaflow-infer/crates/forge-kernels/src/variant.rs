@@ -83,7 +83,7 @@ fn always(_: &Problem) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Formy iloczynu macierzowego dla wag NVFP4 na CUDA.
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
+#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nvfp4MatmulForm {
     /// Wagi przepakowane do FP8 przy ladowaniu; GEMM czyta e4m3.
@@ -94,7 +94,7 @@ pub enum Nvfp4MatmulForm {
     DirectUnpack,
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
+#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
 pub static NVFP4_MATMUL: Registry<Nvfp4MatmulForm> = Registry {
     op: "nvfp4_matmul",
     variants: &[
@@ -123,10 +123,10 @@ pub static NVFP4_MATMUL: Registry<Nvfp4MatmulForm> = Registry {
 
 // The Metal forms live in a module so their tests sit beside them, but the
 // registry is a public interface — `mlx_dense` picks its kernel through it.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal_forms::*;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 mod metal_forms {
     use super::*;
     /// Forms of the quantized matrix product on Metal.
@@ -226,8 +226,18 @@ mod metal_forms {
         Blocked,
     }
 
+    /// Smallest batch the matrix form takes.
+    ///
+    /// NOT the block height. The kernel already tolerates a partial block — it
+    /// clamps its reads and guards its writes — and a partial block costs
+    /// exactly what a full one costs, because the work is the block. So the
+    /// question is not "does the batch fill a block" but "is a whole block
+    /// cheaper than the blocked form would be for this many tokens", and past
+    /// roughly a third of a block it is.
+    const MIN_MATRIX_TOKENS: u32 = 32;
+
     fn qmg_serves(p: &Problem) -> bool {
-        p.tokens >= crate::msl::QMG_BM && crate::msl::qmg_fits(p.rows, p.cols)
+        p.tokens >= MIN_MATRIX_TOKENS && crate::msl::qmg_fits(p.rows, p.cols)
     }
 
     fn qmm_serves(p: &Problem) -> bool {
@@ -440,7 +450,7 @@ mod metal_forms {
     }
 }
 
-#[cfg(all(test, not(all(feature = "metal", target_os = "macos"))))]
+#[cfg(all(test, not(all(feature = "metal", any(target_os = "macos", target_os = "ios")))))]
 mod cuda_registry_tests {
     use super::*;
 

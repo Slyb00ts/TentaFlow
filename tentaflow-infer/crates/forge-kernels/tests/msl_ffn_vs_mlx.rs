@@ -12,7 +12,7 @@
 // every weight to eight mantissa bits before multiplying.
 //
 // Fixture: tools/mlx-oracle/gen_ffn.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::collections::HashMap;
 

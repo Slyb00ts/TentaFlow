@@ -4,7 +4,7 @@
 // typed launch wrappers so the engine never touches raw entry symbols.
 
 mod launchers;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod msl;
 // Czesc wspolna rejestru (Problem, Variant, Registry) kompiluje sie wszedzie;
 // listy form sa per platforma, bo to platforma decyduje, ktore w ogole istnieja.

@@ -17,7 +17,7 @@
 // token 3's answer into token 4's row.
 //
 // Fixture: tools/mlx-oracle/gen_qmm.py
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use std::sync::Arc;
 

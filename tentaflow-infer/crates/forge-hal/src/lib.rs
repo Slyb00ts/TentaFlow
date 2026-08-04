@@ -15,9 +15,9 @@ pub mod cpu;
 pub mod hip;
 #[cfg(feature = "cuda")]
 pub mod cuda;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_device;
 #[cfg(any(feature = "cuda", feature = "hip"))]
 pub mod gpu;
