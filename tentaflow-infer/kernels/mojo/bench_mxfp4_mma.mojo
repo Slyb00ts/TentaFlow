@@ -59,6 +59,36 @@ def mma_mxfp4_k64(
     ](a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3], sa, sb, bid, tid)
 
 
+def mma_nvfp4_k64(
+    a0: UInt32, a1: UInt32, a2: UInt32, a3: UInt32,
+    b0: UInt32, b1: UInt32,
+    c: SIMD[DType.float32, 4],
+    sa: UInt32, sb: UInt32, bid: UInt16, tid: UInt16,
+) -> _RegisterPackType[Float32, Float32, Float32, Float32]:
+    """Natywne NVFP4: blok 16 wartosci, skale ue4m3 — bez rekwantyzacji."""
+    return inlined_assembly[
+        (
+            "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3"
+            " {$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12,"
+            " $13}, {$14}, {$16, $17}, {$15}, {$16, $17};"
+        ),
+        _RegisterPackType[Float32, Float32, Float32, Float32],
+        constraints="=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r,r,h,h",
+        has_side_effect=False,
+    ](a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3], sa, sb, bid, tid)
+
+
+def kern_nvfp4(out_ptr: UnsafePointer[Float32, MutAnyOrigin]):
+    var acc = SIMD[DType.float32, 4](0.0)
+    var a = UInt32(Int(thread_idx.x) | 0x01010101)
+    var s = UInt32(0x3C3C3C3C)
+    for _ in range(ITERS):
+        var r = mma_nvfp4_k64(a, a, a, a, a, a, acc, s, s, UInt16(0), UInt16(0))
+        acc = SIMD[DType.float32, 4](r[0], r[1], r[2], r[3])
+    if Int(thread_idx.x) == 0:
+        out_ptr[Int(block_idx.x)] = acc[0]
+
+
 def kern_fp8(out_ptr: UnsafePointer[Float32, MutAnyOrigin]):
     var acc = SIMD[DType.float32, 4](0.0)
     var a = UInt32(Int(thread_idx.x) | 0x01010101)
@@ -92,10 +122,14 @@ def main() raises:
         ctx.enqueue_function[kern_mxfp4](
             dst.unsafe_ptr(), grid_dim=BLOCKS, block_dim=THREADS
         )
+        ctx.enqueue_function[kern_nvfp4](
+            dst.unsafe_ptr(), grid_dim=BLOCKS, block_dim=THREADS
+        )
     ctx.synchronize()
 
     var best_fp8 = Float64(1.0e30)
     var best_fp4 = Float64(1.0e30)
+    var best_nv4 = Float64(1.0e30)
     for _ in range(ROUNDS):
         var t0 = perf_counter_ns()
         for _ in range(10):
@@ -117,7 +151,21 @@ def main() raises:
         if dt < best_fp4:
             best_fp4 = dt
 
+        t0 = perf_counter_ns()
+        for _ in range(10):
+            ctx.enqueue_function[kern_nvfp4](
+                dst.unsafe_ptr(), grid_dim=BLOCKS, block_dim=THREADS
+            )
+        ctx.synchronize()
+        dt = Float64(perf_counter_ns() - t0) / 1.0e6
+        if dt < best_nv4:
+            best_nv4 = dt
+
     # Ta sama liczba instrukcji; FP4 przerabia dwa razy wiecej K na instrukcje.
-    print("FP8  k32:", best_fp8, "ms")
-    print("MXFP4 k64:", best_fp4, "ms")
-    print("przyspieszenie na te sama prace:", (best_fp8 * 2.0) / best_fp4)
+    var work = 2.0 * 16.0 * 8.0 * Float64(ITERS) * Float64(BLOCKS)
+        * Float64(THREADS // 32) * 10.0
+    print("FP8   k32 :", best_fp8, "ms |", work * 32.0 / (best_fp8 * 1.0e9), "TFLOPS")
+    print("MXFP4 k64 :", best_fp4, "ms |", work * 64.0 / (best_fp4 * 1.0e9), "TFLOPS")
+    print("NVFP4 k64 :", best_nv4, "ms |", work * 64.0 / (best_nv4 * 1.0e9), "TFLOPS")
+    print("MXFP4 wobec FP8 na te sama prace:", (best_fp8 * 2.0) / best_fp4)
+    print("NVFP4 wobec FP8 na te sama prace:", (best_fp8 * 2.0) / best_nv4)

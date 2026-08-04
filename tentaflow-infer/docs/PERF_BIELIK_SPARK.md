@@ -43,11 +43,10 @@ prawdopodobnie PONIZEJ naszej sciezki FP8. Zrodlo: zgloszenia vllm-project
 #31085 i forum NVIDII o stanie FP4 na DGX Spark — poszlaka ze streszczen, do
 potwierdzenia uruchomieniem kontenera.
 
-Wniosek dla planu: **MXFP4 przestaje byc opcja, a staje sie glowna droga.**
-Zmierzone 497,9 TFLOPS dla `kind::mxf4.block_scale.m16n8k64` na sm_121a to
-sciezka, ktorej konkurencja na tym ukladzie nie ma — bo sprzet nie przyjmuje
-NVFP4 ze skalami e4m3, ktorego chce CUTLASS, a przyjmuje MXFP4 ze skalami
-ue8m0. Nas nic do CUTLASS-a nie przywiazuje.
+Wniosek dla planu: **FP4 przestaje byc opcja, a staje sie glowna droga** — i to
+w formacie, ktory model JUZ MA. Patrz sekcja o NVFP4 nizej: sprzet przyjmuje
+natywne NVFP4 (blok 16, skale e4m3) i liczy je z ta sama predkoscia co MXFP4,
+wiec zadna rekwantyzacja ani bramka jakosci nie jest potrzebna.
 
 Prefill 3 192 tok/s przy 2048 tokenach to 2·7e9·2048 / 0,64 s = **44,7 TFLOPS**.
 
@@ -88,6 +87,50 @@ artefakt probki.
 | FP8 e4m3 `m16n8k32` | 251,4 |
 | **FP4 e2m1 `kind::mxf4.block_scale.m16n8k64`** | **497,9** |
 
+### Sprzet liczy NATYWNE NVFP4 — rekwantyzacja jest niepotrzebna
+
+**To jest retrakcja.** Poprzednia wersja tej sekcji twierdzila, ze `ptxas`
+odrzuca skale e4m3, wiec trzeba przekwantowac wagi na MXFP4 (blok 32, skale
+ue8m0) i przyjac nieznana strate jakosci. Nieprawda, i blad byl moj: typ skali
+nazywa sie **`ue4m3`**, nie `e4m3`, i wymaga innego `kind` oraz jawnego
+`scale_vec`. Poprawna instrukcja to
+
+```
+mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+```
+
+czyli dokladnie NVFP4: blok 16 wartosci, skale e4m3. Pomiar (`bench_mxfp4_mma.mojo`,
+ta sama liczba instrukcji, ILP niezalezny):
+
+| instrukcja | czas | TFLOPS | wobec FP8 na te sama prace |
+|---|--:|--:|--:|
+| FP8 e4m3 `m16n8k32` | 0,561 ms | 239,4 | 1,00 |
+| MXFP4 `kind::mxf4` ue8m0 (blok 32) | 0,564 ms | 475,8 | 1,99 |
+| **NVFP4 `kind::mxf4nvf4` ue4m3 (blok 16)** | **0,565 ms** | **474,9** | **1,98** |
+
+Natywne NVFP4 nie kosztuje nic wobec MXFP4. **Model jest juz w NVFP4**, wiec
+cala sciezka „przekwantuj i zmierz `forge ppl` przeciw 3,1256" odpada — nie ma
+czego psuc. Zostaje sama dzwignia: sufit mma 251 -> 475 TFLOPS ORAZ koniec
+paczek FP8 (7,35 GB), czyli polowa ruchu wag.
+
+Co jest sprawdzone, a co nie: instrukcja **asembluje sie i wykonuje z pelna
+predkoscia** na sm_121a. Poprawnosc liczbowa NIE jest jeszcze zweryfikowana —
+uklad operandow skal (`scale_vec::4X` wybiera bajt skali przez pare
+byte-id/thread-id) trzeba potwierdzic zlotym testem przeciw dequantowi CPU,
+zanim cokolwiek z tego wejdzie do silnika. Powyzszy pomiar jest sufitem
+instrukcji na atrapach operandow, nie dzialajacym GEMM-em.
+
+Ktore warianty `ptxas` przyjmuje na sm_121a (sprawdzone kompilacja):
+
+| wariant | wynik |
+|---|---|
+| `kind::mxf4` + ue8m0 (blok 32) | przechodzi |
+| `kind::mxf4` + `scale_vec::2X` + ue8m0 | przechodzi |
+| **`kind::mxf4nvf4` + `scale_vec::4X` + ue4m3 (blok 16)** | **przechodzi** |
+| `kind::mxf4nvf4` + `scale_vec::2X` + ue8m0 | przechodzi |
+| `kind::mxf8f6f4` + `scale_vec::1X` + ue8m0 (k32) | przechodzi |
+| `kind::mxf4nvf4` + `scale_vec::4X` + `e4m3` (bez `u`) | odrzucone |
+
 Instrukcja FP4 wykonuje sie w TYM SAMYM czasie co FP8, a przerabia dwa razy
 wiecej K — zmierzone 1,98x. Model jest NVFP4, a my go konwertujemy do FP8 na
 prefill, wiec placimy dwa razy:
@@ -105,12 +148,10 @@ To liczba, ktora MXFP4 musi dorownac. Uwaga na wielkosc probki: `forge ppl`
 punktuje tu 353 tokeny, wiec do decyzji o zmianie formatu wag trzeba policzyc
 wiecej — na 353 tokenach roznica rzedu procenta jest w szumie.
 
-**Czego to wymaga i jaki jest haczyk.** `ptxas` przyjmuje na sm_121a wariant ze
-skalami **ue8m0** (potegi dwojki, co 32 wartosci) i ODRZUCA skale e4m3, czyli
-natywne NVFP4 (skale e4m3 co 16 wartosci). Trzeba wiec przekwantowac NVFP4 na
-MXFP4, zaokraglajac skale do potegi dwojki. To jest strata jakosci o nieznanej
-wielkosci i **rozstrzygnac ma ja pomiar `forge ppl`, a nie rachunek sufitow**.
-Dopoki tego nie zmierzymy, 2x jest policzone, ale nie obiecane.
+**Bramka jakosci jest juz niepotrzebna** — patrz retrakcja wyzej. Sprzet liczy
+natywne NVFP4, wiec wagi zostaja bit w bit takie, jakie sa dzis w decode, a
+`forge ppl` = 3,1256 pozostaje punktem odniesienia tylko po to, zeby wychwycic
+blad implementacji kernela, a nie strate formatu.
 
 ## Model: ile razy wagi przechodza przez pamiec
 
