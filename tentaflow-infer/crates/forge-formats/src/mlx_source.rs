@@ -6,12 +6,12 @@
 // compute. Everything downstream — scheduler, KV cache, speculation, tiering —
 // is untouched and unaware the checkpoint came from MLX.
 
-use forge_formats::safetensors::ShardedSafeTensors;
-use forge_formats::{repack_affine_to_q4_1, MlxAffineTensor, MlxParams, MlxQuantConfig};
+use crate::safetensors::ShardedSafeTensors;
+use crate::{repack_affine_to_q4_1, MlxAffineTensor, MlxParams, MlxQuantConfig};
 use forge_types::{DType, ForgeError, QuantKind, Result};
 use half::{bf16, f16};
 
-use crate::weights::{Fp8Host, NvFp4Host, TensorFetch, TensorSource};
+use crate::source::{Fp8Host, NvFp4Host, TensorFetch, TensorSource};
 
 /// Źródło tensorów dla checkpointów MLX.
 ///
@@ -23,7 +23,7 @@ use crate::weights::{Fp8Host, NvFp4Host, TensorFetch, TensorSource};
 ///
 /// Przepakowanie jest po stronie hosta, przy wczytywaniu, i jest sprawdzone co
 /// do bitu wobec ścieżki MLX (`forge-formats`, `repack_affine_to_q4_1`).
-pub(crate) struct MlxSource<'a> {
+pub struct MlxSource<'a> {
     st: &'a ShardedSafeTensors,
     cfg: MlxQuantConfig,
 }
@@ -31,11 +31,11 @@ pub(crate) struct MlxSource<'a> {
 impl<'a> MlxSource<'a> {
     /// `None`, gdy katalog nie jest checkpointem MLX affine 4-bit — czyli gdy
     /// wagi ma wziąć zwykłe źródło safetensors.
-    pub(crate) fn detect(config_text: &str, st: &'a ShardedSafeTensors) -> Option<Self> {
+    pub fn detect(config_text: &str, st: &'a ShardedSafeTensors) -> Option<Self> {
         let cfg = serde_json::from_str::<serde_json::Value>(config_text)
             .ok()
             .and_then(|v| MlxQuantConfig::from_config(&v).ok().flatten())
-            .filter(|c| c.mode == forge_formats::MlxMode::Affine && c.bits == 4)?;
+            .filter(|c| c.mode == crate::MlxMode::Affine && c.bits == 4)?;
         Some(Self { st, cfg })
     }
 
@@ -162,7 +162,7 @@ impl TensorSource for MlxSource<'_> {
 #[cfg(test)]
 mod mlx_source_tests {
     use super::*;
-    use forge_formats::dequantize_to_f32;
+    use crate::dequantize_to_f32;
     use std::path::PathBuf;
 
     fn checkpoint() -> Option<PathBuf> {
@@ -236,7 +236,7 @@ mod mlx_source_tests {
                 cols,
             };
             let mut want = vec![0f32; rows * cols];
-            forge_formats::dequantize_affine(&tensor, &cfg, &mut want).unwrap();
+            crate::dequantize_affine(&tensor, &cfg, &mut want).unwrap();
 
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert_eq!(

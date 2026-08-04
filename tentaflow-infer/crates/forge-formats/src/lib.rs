@@ -9,6 +9,8 @@ pub mod arch;
 pub mod deltanet;
 pub mod dequant;
 pub mod gguf;
+pub mod mlx_source;
+pub mod source;
 pub mod hf_config;
 pub mod iq_tables;
 pub mod mlx;

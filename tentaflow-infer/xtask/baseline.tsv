@@ -39,7 +39,7 @@ size	crates/forge-cli/src/main.rs	2813
 size	crates/forge-engine/src/model.rs	21430
 size	crates/forge-engine/src/server.rs	3259
 size	crates/forge-engine/src/tensor_parallel.rs	1661
-size	crates/forge-engine/src/weights.rs	5332
+size	crates/forge-engine/src/weights.rs	5034
 size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3617
 size	crates/forge-formats/src/arch.rs	2743
 size	crates/forge-formats/src/iq_tables.rs	3969
