@@ -159,14 +159,25 @@ model, kernele i loader naraz.
    spadła z 3 na 0, a wykonawca dochodzi jako WYTWÓRNIA, bo nie może powstać
    przed odczytaniem checkpointu — dopiero ten mówi, ile warstw dostanie cache
    i dla jakiego typu skompilować kernele.
-4. **Drugi wykonawca tego samego kontraktu.** CZĘŚCIOWO: wzorzec hostowy
-   (`HostExec`) liczy te same operacje w zwykłym Ruście i zgadza się z tą samą
-   wyrocznią mlx-lm co Metal, nie dzieląc z nim ani jednej linii poza
-   kontraktem. Kontrakt z jednym wykonawcą jest kontraktem na papierze; ten
+4. **Drugi wykonawca tego samego kontraktu.** ZROBIONE dla jednej sekwencji.
+   Wzorzec hostowy (`HostExec`) liczy te same operacje w zwykłym Ruście i
+   zgadza się z tą samą wyrocznią mlx-lm co Metal, nie dzieląc z nim ani jednej
+   linii poza kontraktem. Kontrakt z jednym wykonawcą jest kontraktem na papierze; ten
    przestał nim być. Wzorzec jest przy okazji jedyną bramką na cały przebieg,
    którą da się uruchomić na maszynie bez akceleratora.
 
-   **CUDA — nie, i szacunek „to kasuje 2822 linie" był zły.** Po przeczytaniu
+   **CUDA — TAK, dla jednej sekwencji.** `CudaExec` liczy to samo słownictwo na
+   GGUF-ie Q4_K_M, zgadza się ze wzorcem hostowym na 0,013–0,039% rozpiętości
+   logitów przy identycznych tokenach i kontynuuje polski prompt poprawnie
+   (`crates/forge-model/tests/cuda_vs_reference.rs`, DGX Spark GB10). Trzeci
+   wykonawca rozstrzygnął przy okazji dwie rzeczy, których dwaj pierwsi nie
+   mogli: postać wagi jest sprawą WYKONAWCY, nie modelu (Metal chce trójki
+   afinicznej, CUDA bloków źródła — trzymanie jednej z nich w modelu wybierało
+   przeciwko drugiemu i było stratne dla Q6_K), a permutacja wierszy RoPE należy
+   przez to do bajtów źródła. Szczegóły i odstępstwa:
+   `docs/ZADANIE_CUDA_EXECUTOR.md`.
+
+   **Szacunek „to kasuje 2822 linie" był natomiast zły.** Po przeczytaniu
    `forge-engine/src/model/arch/dense.rs`: kolejność warstw to jego niewielka
    część. Reszta to `prefill_forward_lanes` (871 linii, prefill wsadowy z
    doklejonymi wierszami dekodowania), TRZY osobne łańcuchy dekodowania
@@ -179,12 +190,12 @@ model, kernele i loader naraz.
    Dlatego krok 4 rozpada się na: (a) rozszerzenie słownictwa o lane'y i
    stronicowane KV, (b) fuzję jako pass nad `Vec<Op>` zamiast trzech ręcznych
    łańcuchów, (c) dopiero wtedy chudnięcie pliku silnika. Żadnego z nich nie
-   wolno napisać na ślepo: w tym repozytorium nie ma karty NVIDIA, a ten
-   dokument w całości jest o tym, że błąd w takiej ścieżce nie objawia się
-   awarią, tylko płynnym, złym tekstem.
+   wolno napisać na ślepo: ten dokument w całości jest o tym, że błąd w takiej
+   ścieżce nie objawia się awarią, tylko płynnym, złym tekstem — więc każdy z
+   nich potrzebuje karty, wzorca i wykonanego porównania, a nie przeglądu.
 5. **`forge-quant` wydzielony z `forge-formats`**, z wzorcem CPU jako wyrocznią.
 6. **Passy nad `Vec<Op>`** — fuzja i autotuning, bez dotykania modeli.
 
 Kroki 1–3 są mechaniczne i sprawdzalne istniejącymi testami. Krok 4 jest tym, po
-którym widać zysk — i jedynym, który wymaga sprzętu, którego tu nie ma. Kroki
-5–6 są ulepszeniami, nie warunkami.
+którym widać zysk; jego pierwsza część jest zrobiona, reszta czeka na
+słownictwo, którego dziś nie ma. Kroki 5–6 są ulepszeniami, nie warunkami.

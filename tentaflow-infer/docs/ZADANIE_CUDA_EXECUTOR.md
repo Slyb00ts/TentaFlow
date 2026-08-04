@@ -7,6 +7,51 @@ to zadanie tu leży zamiast być zrobione.
 Kontekst i uzasadnienie całości: `docs/ARCHITEKTURA_DOCELOWA.md`. Ten plik jest
 tylko instrukcją wykonawczą.
 
+## 0. Stan: kamień milowy 1 ZROBIONY, z trzema odstępstwami
+
+Wykonane na DGX Spark (GB10, `sm_121a`) wobec
+`speakleash/Bielik-Minitron-7B-v3.0-Instruct-GGUF` Q4_K_M:
+
+```
+CUDA: prefill w 0.17 s          wzorzec: prefill w 32.1 s
+prefill: 0.039% rozpiętości, argmax 372
+krok 1:  0.013% rozpiętości, argmax 28725
+krok 2:  0.016% rozpiętości, argmax 264
+24 tokeny w 1.42 s: "Warszawa.\nWarszawa to miasto położone w środkowo-wsch"
+```
+
+Trzy odstępstwa od tego, co ten plik zakładał — wszystkie warte zapisania:
+
+1. **Jednego kernela brakowało**, wbrew tabeli w §2: `Residual` nie ma launchera
+   w `elementwise.rs`. Katalog miał wszystkie SCALONE postaci dodania do
+   strumienia rezydualnego (`rmsnorm_residual_f16`, `gemv_residual_*`), bo
+   silnik fuzjuje je ręcznie i nigdy nie potrzebował osobnej. Słownictwo
+   operacji potrzebuje niescalonej, więc doszedł `residual_add_f16` — dziewięć
+   linii Mojo, suma w f32 i jedno zaokrąglenie, dokładnie jak w
+   `rmsnorm_residual_f16`, żeby fuzja z kroku 3 §7 dała TEN SAM strumień co do
+   bitu. Zbudowany przyrostowo (`FORGE_KERNEL_BUILD_ONLY`), katalog 576 → 577.
+2. **Punkt 2 z §4 (fikstura mlx-lm) nie jest wykonalny dla tej ścieżki.**
+   Fikstura należy do eksportu MLX 4-bit, a te kernele czytają bloki źródła, nie
+   trójkę afiniczną — więc nie da się ich w ogóle wycelować w tamten
+   checkpoint. Q4_K_M to INNA kwantyzacja tego samego modelu, więc jego logity
+   są legalnie innymi liczbami i porównanie z tamtą fiksturą mierzyłoby
+   kwantyzację, a nie wykonawcę. Zostaje punkt 3, który ten plik sam nazywa
+   ważniejszym, plus druga bramka: wynik ma być językiem.
+3. **`gather_q4_k_rows_f16` jest jedynym kernelem zbierającym wiersze osadzeń**
+   i czyta wyłącznie Q4_K. Dla Q4_K_M to wystarcza (`token_embd` jest Q4_K),
+   ale checkpoint z sześciobitową tablicą osadzeń odbije się na wgraniu.
+
+Decyzja z §3 poszła na **(B)**, wraz z odpowiednikiem `permute_rope_rows` na
+układzie natywnym. Ten odpowiednik nie zna formatu: wiersz dowolnego formatu
+blokowego GGUF-a jest ciągłym zakresem bajtów, więc permutacja przestawia równe
+zakresy i odmawia, gdy bajty nie dzielą się na wiersze. Wersja na trójce
+afinicznej zniknęła — źródło, które oddaje ją natywnie, przestawiło wiersze już
+przy konwersji, a kombinacja „afiniczne ORAZ oryginalna kolejność" zatrzymuje
+się teraz błędem zamiast po cichu pominąć permutację.
+
+Czego kamień milowy 1 NIE zawiera, zgodnie z §2: wsadu, stronicowanego KV,
+spekulacji, fuzji. Kolejność dalszej pracy zostaje jak w §7.
+
 ## 1. Co już jest
 
 | co | gdzie | stan |
@@ -33,8 +78,9 @@ Nowych kerneli nie trzeba, bo każda operacja słownictwa ma już launcher w
 | `MatMul` (Q4_K / Q6_K) | `gemv_q4_k_f16`, `gemv_q6_k_f16`, `gemm_q4_k_f16`, `gemm_q6_k_f16` (`gemm/quantized/k_quants.rs`) |
 | `RmsNorm` | `rmsnorm_f16` (`norm.rs`) |
 | `Rope` | `rope_neox_f16` (`attention.rs`) — nasz RoPE jest NeoX, patrz §5 |
-| `Attention` | `attn_decode_f16` (`attention.rs`) |
-| `SiluMul`, `Residual` | `elementwise.rs` |
+| `Attention` | `attn_full_f16` (`attention.rs`) — ciągłe K/V, bo bez stron |
+| `SiluMul` | `glu_mul_f16` (`elementwise.rs`) |
+| `Residual` | `residual_add_f16` (`elementwise.rs`) — DOPISANY, patrz §0 |
 | `Embed` | `gather_q4_k_row_f16` (`k_quants.rs`) |
 | `argmax` | `sample.rs` |
 
