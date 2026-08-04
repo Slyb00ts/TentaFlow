@@ -15,6 +15,7 @@ pub mod source;
 pub mod hf_config;
 pub mod iq_tables;
 pub mod mlx;
+pub mod mxfp4;
 pub mod nvfp4;
 pub mod safetensors;
 pub mod speculation_manifest;

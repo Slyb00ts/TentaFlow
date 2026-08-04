@@ -127,8 +127,25 @@ fn fetch_deepseek_weight(st: &ShardedSafeTensors, name: &str) -> Result<Option<H
     }
     let base = name.strip_suffix(".weight").unwrap_or(name);
 
-    // Ekspert NVFP4: pakiet U8 plus skale co 16 elementów i skala globalna.
-    if info.dtype == DType::U8 {
+    // DeepSeek publikuje ten model w dwóch kwantyzacjach FP4 i rozstrzyga o tym
+    // NAZWA skali, nie typ pakietu: NVFP4 ma `.weight_scale` (UE4M3 co 16) oraz
+    // `.weight_scale_2`, MXFP4 ma `.scale` (E8M0 co 32). Kody e2m1 są w obu te
+    // same, więc MXFP4 przeliczamy na układ NVFP4 i dalej idzie jedna ścieżka
+    // kerneli — przeliczenie jest dokładne, bo E8M0 to czysta potęga dwójki.
+    if matches!(info.dtype, DType::U8 | DType::I8) {
+        let mx = crate::mxfp4::DeepseekMxFp4Names::for_weight(name)?;
+        if st.tensor(&mx.scale).is_some() {
+            let packed = st.data(&mx.packed)?;
+            let scales = st.data(&mx.scale)?;
+            let repacked =
+                crate::mxfp4::deepseek_expert_mxfp4_to_gguf(packed, &info.shape, scales)?;
+            return Ok(Some(HostWeight::NvFp4Gguf {
+                data: repacked.blocks,
+                output_scale: repacked.output_scale,
+                rows: repacked.rows,
+                cols: repacked.cols,
+            }));
+        }
         let names = nvfp4::DeepseekNvFp4Names::for_weight(name)?;
         let scales = st.data(&names.scale)?;
         let global_bytes = st.data(&names.global_scale)?;
