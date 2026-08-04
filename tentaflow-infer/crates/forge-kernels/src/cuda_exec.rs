@@ -269,17 +269,17 @@ impl WeightStore for CudaExec {
                     .into(),
             ));
         };
-        if !matches!(quant, QuantKind::Q4K | QuantKind::Q6K) {
+        if !Self::knows(quant) {
             return Err(ForgeError::Unsupported(format!(
-                "{quant:?}: ten wykonawca zna Q4_K i Q6_K"
+                "{quant:?}: ten wykonawca nie ma dla niego kerneli"
             )));
         }
-        // 256 wartości na superblok w obu formatach. Wiersz krótszy niż
-        // superblok adresowałby cudzy blok, więc sprawdzane TU, przy wgraniu,
-        // a nie zakładane przy każdym mnożeniu.
-        if !cols.is_multiple_of(256) {
+        // Wiersz krótszy niż blok adresowałby cudzy blok, więc sprawdzane TU,
+        // przy wgraniu, a nie zakładane przy każdym mnożeniu.
+        if !cols.is_multiple_of(quant.block_elems()) {
             return Err(ForgeError::Unsupported(format!(
-                "{cols} kolumn nie dzieli się na superbloki po 256"
+                "{cols} kolumn nie dzieli się na bloki {quant:?} po {}",
+                quant.block_elems()
             )));
         }
         self.weights.push(Weight::Quant(Quantized {
@@ -768,6 +768,9 @@ impl CudaExec {
         for lane in 0..step.lanes().len() {
             let x_off = (lane * tokens + tokens - 1) * self.shape.hidden as usize * 2;
             let y_off = lane * self.shape.vocab as usize * 4;
+            // Q4_K i Q6_K mają wariant z przesunięciami, więc nie płacą za
+            // pod-bufory na ścieżce, którą naprawdę chodzimy; reszta formatów
+            // dostaje ten sam wiersz przez uchwyt na wycinek.
             match weight.quant {
                 QuantKind::Q4K => self.kernels.gemv_q4_k_out_f32(
                     &self.scratch.logits,
@@ -779,7 +782,7 @@ impl CudaExec {
                     weight.cols,
                     &self.stream,
                 )?,
-                _ => self.kernels.gemv_q6_k_out_f32(
+                QuantKind::Q6K => self.kernels.gemv_q6_k_out_f32(
                     &self.scratch.logits,
                     y_off,
                     &weight.blocks,
@@ -789,6 +792,15 @@ impl CudaExec {
                     weight.cols,
                     &self.stream,
                 )?,
+                quant => {
+                    let y = self
+                        .device
+                        .sub_buffer(&self.scratch.logits, y_off, weight.rows * 4)?;
+                    let row = self
+                        .device
+                        .sub_buffer(self.buf(x), x_off, weight.cols * 2)?;
+                    self.gemv_out_f32_by_kind(quant, &y, &weight.blocks, &row, weight.rows, weight.cols)?;
+                }
             }
         }
         Ok(())
@@ -832,25 +844,24 @@ impl CudaExec {
         // przy f16 — wolniej, ale to jedyna z tych trzech form, która nie ma
         // granicy kolumn.
         let int8_fits = c <= Kernels::DP4A_MAX_COLS;
+        // Trzy formaty kwantyzują aktywację blokowo i mają dla niej własne
+        // kernele; reszta idzie tabelą. Ta różnica jest w TREŚCI, nie w nazwie,
+        // więc stoi osobno, a nie jako kolejny wiersz.
+        let dp4a = matches!(w.quant, QuantKind::Q4K | QuantKind::Q6K) && int8_fits;
         if rows == 1 {
-            return match (q6, int8_fits) {
+            return match (dp4a, q6) {
                 (true, true) => {
                     self.kernels
                         .gemv_q6_k_dp4a_f16(out, &w.blocks, x, r, c, &self.stream)
                 }
-                (false, true) => {
+                (true, false) => {
                     self.kernels
                         .gemv_q4_k_dp4a_f16(out, &w.blocks, x, r, c, &self.stream)
                 }
-                (true, false) => self
-                    .kernels
-                    .gemv_q6_k_f16(out, &w.blocks, x, r, c, &self.stream),
-                (false, false) => self
-                    .kernels
-                    .gemv_q4_k_f16(out, &w.blocks, x, r, c, &self.stream),
+                _ => self.gemv_by_kind(w.quant, out, &w.blocks, x, r, c),
             };
         }
-        if int8_fits
+        if dp4a
             && self.kernels.gemm_qk_dp4a_batch_at(
                 out,
                 &w.blocks,
@@ -865,13 +876,7 @@ impl CudaExec {
         {
             return Ok(());
         }
-        if q6 {
-            self.kernels
-                .gemm_q6_k_f16(out, &w.blocks, x, r, c, rows as usize, &self.stream)
-        } else {
-            self.kernels
-                .gemm_q4_k_f16(out, &w.blocks, x, r, c, rows as usize, &self.stream)
-        }
+        self.gemm_by_kind(w.quant, out, &w.blocks, x, r, c, rows as usize)
     }
 }
 
@@ -891,4 +896,110 @@ fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
     let buf = device.alloc(bytes.len().max(1), MemKind::Device, Pool::Weights)?;
     device.write(bytes, &buf, 0)?;
     Ok(buf)
+}
+
+/// Formaty, w których format wybiera WYŁĄCZNIE nazwę kernela.
+///
+/// Ta tabela jest przeniesiona z `forge-engine::model::quant_dispatch`, gdzie
+/// powstała po tym, jak cztery rodziny GEMV rozjechały się na dwudziestu jeden
+/// ramionach i Q4_K trafiło w jednej ścieżce na inny kernel niż w drugiej.
+/// Należy do wykonawcy, bo to on wie, czym mnoży — a dodanie kwantyzacji jest
+/// tu jednym wierszem.
+///
+/// `match` nie ma gałęzi „reszta": kwantyzacja spoza tabeli ma się TU odbić, a
+/// nie policzyć czymkolwiek.
+macro_rules! block_formats {
+    ($($k:ident => $gemv:ident, $gemm:ident, $out_f32:ident;)+) => {
+        impl CudaExec {
+            /// Czy ten wykonawca ma kernele dla tej kwantyzacji.
+            fn knows(quant: QuantKind) -> bool {
+                matches!(quant, QuantKind::Q4K | QuantKind::Q6K | $(QuantKind::$k)|+)
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn gemv_by_kind(
+                &self,
+                quant: QuantKind,
+                y: &DevBuffer,
+                w: &DevBuffer,
+                x: &DevBuffer,
+                rows: usize,
+                cols: usize,
+            ) -> Result<()> {
+                match quant {
+                    QuantKind::Q4K => {
+                        self.kernels.gemv_q4_k_f16(y, w, x, rows, cols, &self.stream)
+                    }
+                    QuantKind::Q6K => {
+                        self.kernels.gemv_q6_k_f16(y, w, x, rows, cols, &self.stream)
+                    }
+                    $(QuantKind::$k => self.kernels.$gemv(y, w, x, rows, cols, &self.stream),)+
+                    other => Err(ForgeError::Unsupported(format!("{other:?}: brak GEMV"))),
+                }
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn gemm_by_kind(
+                &self,
+                quant: QuantKind,
+                y: &DevBuffer,
+                w: &DevBuffer,
+                x: &DevBuffer,
+                rows: usize,
+                cols: usize,
+                n_tokens: usize,
+            ) -> Result<()> {
+                match quant {
+                    QuantKind::Q4K => {
+                        self.kernels.gemm_q4_k_f16_at(y, w, 0, x, rows, cols, n_tokens, &self.stream)
+                    }
+                    QuantKind::Q6K => {
+                        self.kernels.gemm_q6_k_f16_at(y, w, 0, x, rows, cols, n_tokens, &self.stream)
+                    }
+                    $(QuantKind::$k => {
+                        self.kernels.$gemm(y, w, 0, x, rows, cols, n_tokens, &self.stream)
+                    })+
+                    other => Err(ForgeError::Unsupported(format!("{other:?}: brak GEMM"))),
+                }
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn gemv_out_f32_by_kind(
+                &self,
+                quant: QuantKind,
+                y: &DevBuffer,
+                w: &DevBuffer,
+                x: &DevBuffer,
+                rows: usize,
+                cols: usize,
+            ) -> Result<()> {
+                match quant {
+                    $(QuantKind::$k => {
+                        self.kernels.$out_f32(y, w, x, rows, cols, &self.stream)
+                    })+
+                    other => Err(ForgeError::Unsupported(format!("{other:?}: brak głowy f32"))),
+                }
+            }
+        }
+    };
+}
+
+block_formats! {
+    Q5K    => gemv_q5_k_f16   , gemm_q5_k_f16_at   , gemv_q5_k_out_f32;
+    Q3K    => gemv_q3_k_f16   , gemm_q3_k_f16_at   , gemv_q3_k_out_f32;
+    Q2K    => gemv_q2_k_f16   , gemm_q2_k_f16_at   , gemv_q2_k_out_f32;
+    Q4_0   => gemv_q4_0_f16   , gemm_q4_0_f16_at   , gemv_q4_0_out_f32;
+    Q4_1   => gemv_q4_1_f16   , gemm_q4_1_f16_at   , gemv_q4_1_out_f32;
+    Q5_0   => gemv_q5_0_f16   , gemm_q5_0_f16_at   , gemv_q5_0_out_f32;
+    Q5_1   => gemv_q5_1_f16   , gemm_q5_1_f16_at   , gemv_q5_1_out_f32;
+    IQ4NL  => gemv_iq4_nl_f16 , gemm_iq4_nl_f16_at , gemv_iq4_nl_out_f32;
+    IQ4XS  => gemv_iq4_xs_f16 , gemm_iq4_xs_f16_at , gemv_iq4_xs_out_f32;
+    MXFP4  => gemv_mxfp4_f16  , gemm_mxfp4_f16_at  , gemv_mxfp4_out_f32;
+    IQ2XS  => gemv_iq2_xs_f16 , gemm_iq2_xs_f16_at , gemv_iq2_xs_out_f32;
+    IQ2S   => gemv_iq2_s_f16  , gemm_iq2_s_f16_at  , gemv_iq2_s_out_f32;
+    IQ3S   => gemv_iq3_s_f16  , gemm_iq3_s_f16_at  , gemv_iq3_s_out_f32;
+    IQ2XXS => gemv_iq2_xxs_f16, gemm_iq2_xxs_f16_at, gemv_iq2_xxs_out_f32;
+    IQ3XXS => gemv_iq3_xxs_f16, gemm_iq3_xxs_f16_at, gemv_iq3_xxs_out_f32;
+    IQ1S   => gemv_iq1_s_f16  , gemm_iq1_s_f16_at  , gemv_iq1_s_out_f32;
+    IQ1M   => gemv_iq1_m_f16  , gemm_iq1_m_f16_at  , gemv_iq1_m_out_f32;
 }
