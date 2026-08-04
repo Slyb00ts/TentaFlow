@@ -111,3 +111,50 @@ dałoby model, który generuje poprawnie wyglądający, całkowicie błędny tek
 
 Punkty 1–3 są mechaniczne. Punkt 4 jest realną pracą, a punkt 5 decyduje o tym,
 czy da się w ogóle porównać wyjście tekstowe z obecną ścieżką.
+
+## Zmierzone po uruchomieniu (2026-08-04, M4)
+
+Oba formaty tego samego modelu, PRZEPLATANE w jednym przebiegu (maszyna dryfuje
+termicznie, więc dwa osobne uruchomienia porównywałyby temperatury). Prompt
+1024 tokenów ciągłego tekstu, dekodowanie 15 tokenów po nim.
+
+| odczyt | MLX prefill | GGUF prefill | MLX dekod. | GGUF dekod. |
+|---|---:|---:|---:|---:|
+| 1 | 194,5 tok/s | 165,9 tok/s | 12,1 tok/s | 7,8 tok/s |
+| 2 | 211,0 | 196,6 | 13,7 | 8,9 |
+| **stosunek** | — | **0,85–0,93** | — | **0,65** |
+
+**Absolutne liczby z tego dnia są zaniżone i nie wolno ich zestawiać z
+EKS-A7.** W tej samej sesji `how_fast_decode_runs` pokazał 67,1 GB/s
+przepustowości wag wobec 89,0 GB/s zapisanych wcześniej — czyli maszyna
+pracowała na około trzech czwartych swoich możliwości. Dekodowanie jest
+ograniczone pasmem, więc to jest miara stanu maszyny, a nie ścieżki. Wiarygodny
+jest STOSUNEK, mierzony w tej samej sesji.
+
+Dekodowanie: **GGUF jest o 35% wolniejszy**, przy przewidywanym z rozmiaru
+sufitcie −6,5%. Różnica nie bierze się więc z bajtów, tylko z wyłuskania kodu:
+41 tensorów Q6_K czyta dwie tablice zamiast jednej i składa sześć bitów z
+dwóch pól (EKS-A8 wskazał wyłuskanie jako ścianę dekodowania).
+
+Prefill: **GGUF jest o 7–15% wolniejszy** — mniej, bo prefill jest ograniczony
+obliczeniami, a nie odczytem wagi.
+
+### Błąd, który ten pomiar znalazł
+
+Do 2026-08-04 GGUF był sprawdzany promptem siedmiotokenowym. Przy takim wsadzie
+mnożenie idzie formą wektorową albo blokową, więc podział pracy z CPU (od 256
+tokenów) NIGDY się nie uruchamiał. Uruchomiony — liczył wagi Q6_K z samych
+młodszych czterech bitów, bo `Operands` nie ma pola na starsze, a rozpakowanie
+to tablica szesnastu wpisów indeksowana nibblem. Wynikiem był płynny, błędny
+tekst na promptach, jakich używa się naprawdę.
+
+Naprawa jest w dwóch warstwach: rejestr nie oddaje sześciobitowej wagi do
+podziału, a `CpuMatmul::check` odmawia wszystkiego poza czterema bitami. Bramka
+gdzie indziej i sprawdzenie w miejscu użycia to nie to samo — ten błąd jest na
+to dowodem.
+
+Doszedł też test, którego brakowało: sześć bitów miało bramkę wyłącznie na
+formie wektorowej, czyli tej od dekodowania. `msl_quant_forms.rs` sprawdza teraz
+każdą z trzech form dla każdej realnej pary szerokość/grupa (4/64 z MLX, 4/32 z
+Q4_K, 6/16 z Q6_K) wobec wzorca w f64. Wszystkie dziewięć kombinacji przechodzi,
+więc kernele były czyste — błąd siedział wyłącznie w ścieżce CPU.

@@ -102,8 +102,38 @@ fn the_two_formats_of_the_same_model_side_by_side() {
     let gg = forge_formats::gguf::Gguf::open(&gguf_path).expect("gguf");
     let vocab = forge_tokenize::gguf_vocab(&gg).expect("słownik z gguf");
     let tokenizer = forge_tokenize::Tokenizer::from_gguf_vocab(&vocab).expect("tokenizer");
-    let mut prompt = tokenizer.encode("Stolica Polski to", false).expect("encode");
-    prompt.insert(0, 1);
+    // Prompt DŁUGI, nie ten siedmiotokenowy, którym zaczyna się rozmowa.
+    // Prefill jest ograniczony obliczeniami i jego przepustowość rośnie z
+    // liczbą tokenów w kaflu: na siedmiu tokenach mierzy się narzut stały, a
+    // wynik w tok/s mówi wtedy o starcie, nie o ścieżce. Domyślnie tyle, ile
+    // wynosi kafel prefillu, żeby pomiar objął formę macierzową i podział
+    // pracy z CPU — czyli to, co w prefillu naprawdę liczy.
+    //
+    // Tekst CIĄGŁY, a nie jedno zdanie powtórzone sto razy. Kilkaset powtórzeń
+    // tych samych siedmiu tokenów to wejście, na które KAŻDY model odpowiada
+    // zapętleniem — i wtedy bramka „to ma być język" mierzy zdegenerowany
+    // prompt, a nie ścieżkę liczenia.
+    const TEKST: &str = "Wisła jest najdłuższą rzeką Polski i płynie z południa \
+        na północ, od Baraniej Góry aż po Zatokę Gdańską. Po drodze mija Kraków, \
+        Sandomierz, Warszawę i Toruń, a jej dorzecze obejmuje niemal połowę \
+        powierzchni kraju. Przez wieki była główną drogą handlową: spławiano nią \
+        zboże i drewno do Gdańska, skąd towary trafiały na rynki całej Europy. \
+        Dzisiaj żegluga ma znaczenie głównie turystyczne, ale rzeka nadal \
+        kształtuje krajobraz, rolnictwo i miasta, które nad nią wyrosły. \
+        Wiosenne roztopy potrafią podnieść poziom wody o kilka metrów, dlatego \
+        wzdłuż brzegów usypano wały, a w dolinie zachowano tereny zalewowe. \
+        Ochrona przyrody i bezpieczeństwo powodziowe bywają tu w sprzeczności, \
+        którą trzeba rozstrzygać osobno dla każdego odcinka. ";
+    let want: usize = std::env::var("FORGE_BENCH_PROMPT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let seed = tokenizer.encode(TEKST, false).expect("encode");
+    let mut prompt = vec![1];
+    while prompt.len() < want {
+        prompt.extend_from_slice(&seed);
+    }
+    prompt.truncate(want);
 
     let row = |label: &str, path: &Path| {
         let mut m = open(device.clone(), path);
@@ -130,7 +160,8 @@ fn the_two_formats_of_the_same_model_side_by_side() {
         }
         let decode = t.elapsed().as_secs_f64();
         eprintln!(
-            "{label:6}: prefill {:.3} s ({:.1} tok/s), dekodowanie {:.1} tok/s",
+            "{label:6}: prefill {} tok w {:.3} s ({:.1} tok/s), dekodowanie {:.1} tok/s",
+            prompt.len(),
             prefill,
             prompt.len() as f64 / prefill,
             15.0 / decode

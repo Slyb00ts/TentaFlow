@@ -679,6 +679,7 @@ impl MetalExec {
             rows: w.rows,
             cols: w.cols,
             group: w.group,
+            bits: w.bits,
         };
         let mut cpu = self.cpu.borrow_mut();
         cpu.check(&operands, split.gpu_rows, split.cpu_rows)?;

@@ -54,6 +54,15 @@ pub struct Operands<'a> {
     pub rows: u32,
     pub cols: u32,
     pub group: u32,
+    /// Code width of this weight. Carried so `check` can REFUSE anything but
+    /// four, rather than trust that whoever chose the split knew.
+    ///
+    /// There is already a gate in the variant registry. It is not enough: when
+    /// six-bit weights did reach here, the half of every code that lives in a
+    /// second array was simply absent, and the result was fluent nonsense out
+    /// of a checkpoint that decodes correctly at short prompts. A gate
+    /// elsewhere and a check at the point of use are not the same thing.
+    pub bits: u32,
 }
 
 impl CpuMatmul {
@@ -119,6 +128,12 @@ impl CpuMatmul {
     pub fn check(&self, op: &Operands<'_>, row0: u32, count: u32) -> Result<()> {
         let (rows, cols, group) = (op.rows as usize, op.cols as usize, op.group as usize);
         let (row0, count) = (row0 as usize, count as usize);
+        if op.bits != 4 {
+            return Err(ForgeError::Unsupported(format!(
+                "CPU: {} bitów na wagę, a rozpakowanie zna cztery",
+                op.bits
+            )));
+        }
         if cols % group != 0 || cols % 8 != 0 {
             return Err(ForgeError::Unsupported(format!(
                 "CPU: kolumny {cols} nie dzielą się na grupę {group} i słowa po 8"
@@ -457,6 +472,7 @@ mod tests {
             rows: ROWS as u32,
             cols: COLS as u32,
             group: GROUP as u32,
+        bits: 4,
         };
         // SAFETY: `out` holds TOKENS * ROWS f32 and nothing else writes it here.
         unsafe {
@@ -526,6 +542,7 @@ mod tests {
             rows: 64,
             cols: 64,
             group: 64,
+        bits: 4,
         };
         // SAFETY: odrzucenie następuje przed jakimkolwiek dostępem do `out`.
         let err = unsafe { cpu.run(&op, 32, 64) };
@@ -569,6 +586,7 @@ mod bench {
             rows: ROWS as u32,
             cols: COLS as u32,
             group: GROUP as u32,
+        bits: 4,
         };
         let mut cpu = CpuMatmul::new();
         // SAFETY: `out` mieści TOKENS * ROWS f32 i nikt inny go nie dotyka.

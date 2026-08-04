@@ -219,6 +219,16 @@ mod metal_forms {
     /// GPU. Every shape is allowed to answer `None`; that is the fallback and
     /// it is always correct.
     pub fn split_rows(p: &Problem) -> Option<RowSplit> {
+        // The CPU unpacker knows FOUR bits. A six-bit weight keeps half of each
+        // code in a second array that `Operands` does not even carry, so the CPU
+        // would multiply its share using the low nibbles alone — not a worse
+        // answer, a different model. Q4_K_M puts six bits on attn_v, ffn_down
+        // and the output head, and a prompt of 256 tokens or more takes this
+        // path: measured as fluent nonsense out of an otherwise working
+        // checkpoint.
+        if p.bits != 4 {
+            return None;
+        }
         let work = 2 * u64::from(p.rows) * u64::from(p.cols) * u64::from(p.tokens);
         if p.tokens < MIN_SPLIT_TOKENS || work < MIN_SPLIT_WORK {
             return None;
@@ -393,6 +403,34 @@ mod metal_forms {
             // jest ograniczone pasmem, a pomiar pokazał tam 20,9 -> 17,9 tok/s.
             assert_eq!(at(1, 11264, 4096), MatmulForm::Vector);
             assert!(split_rows(&Problem::new(1, 11264, 4096)).is_none());
+        }
+
+        /// Sześciobitowa waga NIGDY nie idzie w podział.
+        ///
+        /// Rozpakowanie po stronie CPU zna cztery bity, a starsze dwa leżą w
+        /// tablicy, której `Operands` nie niesie. Q4_K_M ma w tym kształcie
+        /// `ffn_down`, więc bez tej bramki prompt od 256 tokenów w górę liczy
+        /// część wierszy z samych młodszych bitów i pisze bełkot — przy
+        /// SIEDMIU tokenach ten sam model pisze polszczyzną, bo tam podziału
+        /// nie ma.
+        #[test]
+        fn a_six_bit_weight_is_never_shared_with_the_cpu() {
+            let six = |tokens, rows, cols| Problem {
+                tokens,
+                rows,
+                cols,
+                bits: 6,
+            };
+            assert!(split_rows(&six(256, 11264, 4096)).is_none());
+            assert!(split_rows(&six(1024, 4096, 11264)).is_none());
+            assert_eq!(
+                MATMUL_FORMS.pick(&six(1024, 4096, 11264)).unwrap().form,
+                MatmulForm::MatrixUnits,
+                "sześć bitów ma spaść na formę czysto GPU, nie niżej"
+            );
+            // Ta sama praca na czterech bitach dzieli się dalej — bramka jest o
+            // szerokości kodu, a nie o kształcie.
+            assert!(split_rows(&Problem::new(1024, 4096, 11264)).is_some());
         }
 
         #[test]
