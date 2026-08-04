@@ -136,9 +136,15 @@ presją pamięci efektywne pasmo się załamuje, a z nim cała ścieżka. Tryb
 oszczędzania jest wyłączony, zasilanie sieciowe, `pmset` nie odnotował
 ostrzeżenia termicznego — to pamięć, nie temperatura.
 
-Wniosek dla następnego pomiaru: liczby bezwzględne bierz z maszyny po
-restarcie, z jednym modelem naraz. Wiarygodny bez tego jest wyłącznie STOSUNEK,
-mierzony przeplatanie w tej samej sesji.
+Potwierdzone powrotem: po zejściu procesów sesji swap spadł do 2,2 GB, a ten
+sam test dał 20,0-21,1 tok/s przy 84,0-88,9 GB/s — czyli dokładnie zapisane
+21,1 przy 89,0. Restart nie był potrzebny, wystarczyło zwolnić pamięć.
+
+Wniosek dla następnego pomiaru: przed odczytem liczb bezwzględnych sprawdź
+`sysctl vm.swapusage` i trzymaj jeden model naraz. Bez tego wiarygodny jest
+wyłącznie STOSUNEK, mierzony przeplatanie w tej samej sesji — a przepustowość
+wag z `how_fast_decode_runs` jest najtańszym sprawdzianem, czy maszyna w ogóle
+nadaje się dziś do mierzenia.
 
 Dekodowanie: **GGUF jest o 35% wolniejszy**, przy przewidywanym z rozmiaru
 sufitcie −6,5%. Różnica nie bierze się więc z bajtów, tylko z wyłuskania kodu:
