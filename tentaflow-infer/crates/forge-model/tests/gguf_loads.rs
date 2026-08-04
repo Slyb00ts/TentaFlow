@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use forge_hal::metal_device::MetalDevice;
 use forge_kernels::MetalExec;
-use forge_model::dense::Dense;
+use forge_model::dense::{Dense, Feed};
+
+/// Slot cache'u tych testów. Jedna sekwencja, więc zawsze ten sam.
+const SLOT: usize = 0;
 
 /// Model plus wykonawca. To jedyne miejsce w teście, które wie, co liczy —
 /// `Dense` dostaje wykonawcę jako wytwórnię i nigdy nie pyta, czym on jest.
@@ -52,10 +55,11 @@ fn the_gguf_build_of_the_same_model_loads_and_generates() {
     // dekodowanie (wektorowa), czyli przez wszystkie trzy formy na obu
     // szerokościach kodu naraz.
     let prompt: Vec<u32> = vec![1, 4234, 8123, 302, 15];
-    let first = model.prefill(&prompt).expect("prefill");
+    let first = model.prefill(SLOT, &prompt).expect("prefill");
     let mut out = vec![first];
     for _ in 0..3 {
-        out.push(model.step_argmax(*out.last().unwrap()).expect("krok"));
+        let token = *out.last().unwrap();
+        out.push(model.decode(&[Feed { slot: SLOT, token }]).expect("krok")[0]);
     }
     eprintln!("wygenerowane tokeny: {out:?}");
     assert!(
@@ -141,9 +145,9 @@ fn the_two_formats_of_the_same_model_side_by_side() {
         let mut prefills = Vec::new();
         let mut first = 0;
         for r in 0..4 {
-            m.reset();
+            m.reset(SLOT).expect("reset");
             let t = std::time::Instant::now();
-            first = m.prefill(&prompt).expect("prefill");
+            first = m.prefill(SLOT, &prompt).expect("prefill");
             if r > 0 {
                 prefills.push(t.elapsed().as_secs_f64());
             }
@@ -155,7 +159,7 @@ fn the_two_formats_of_the_same_model_side_by_side() {
         let mut tok = first;
         let mut out = vec![first];
         for _ in 0..15 {
-            tok = m.step_argmax(tok).expect("krok");
+            tok = m.decode(&[Feed { slot: SLOT, token: tok }]).expect("krok")[0];
             out.push(tok);
         }
         let decode = t.elapsed().as_secs_f64();

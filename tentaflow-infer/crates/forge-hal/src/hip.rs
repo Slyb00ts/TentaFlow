@@ -665,7 +665,7 @@ impl Device for HipDevice {
         match &*arena {
             PoolArena::Bump(bump) => Some(bump.available()),
             PoolArena::Ring(ring) => Some(ring.available()),
-            PoolArena::Slab(_) => None,
+            PoolArena::Slab(slab) => Some(slab.available()),
         }
     }
 

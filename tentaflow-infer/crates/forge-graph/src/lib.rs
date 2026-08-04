@@ -18,8 +18,10 @@
 //
 // Ten crate NIE WIE o HAL i nie ma prawa się dowiedzieć.
 
+use std::sync::Arc;
+
 use forge_formats::affine::AffineTriple;
-use forge_types::{DType, DenseShape, QuantKind, Result};
+use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
 /// Waga, którą wykonawca wgrał i trzyma.
 ///
@@ -57,64 +59,137 @@ pub enum Act {
     Logits,
 }
 
+/// Jedna sekwencja niesiona przez krok: gdzie trzyma swój kontekst i od której
+/// pozycji go dokłada.
+///
+/// `slot` jest tożsamością sekwencji dla wykonawcy, a nie adresem: jak ten slot
+/// wygląda w pamięci — jedna ciągła połać czy lista stron — jest sprawą tego,
+/// kto trzyma cache. Model wie tylko, że dwie sekwencje o różnych slotach się
+/// nie mieszają.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lane {
+    pub slot: u32,
+    /// Pozycja PIERWSZEGO tokenu tego kroku w tej sekwencji.
+    pub pos: u32,
+}
+
+/// Sekwencje niesione przez jeden krok i ile tokenów niesie każda z nich.
+///
+/// JEDNA lista dla wszystkich operacji kroku, a nie liczba wierszy w jednych i
+/// pozycje w drugich. Rozjazd między „ile wierszy mnoży projekcja" a „ile
+/// lane'ów czyta uwaga" nie jest błędem kompilacji — jest cudzym kontekstem w
+/// wyniku, czyli płynnym, złym tekstem.
+#[derive(Debug, Clone)]
+pub struct Step {
+    lanes: Arc<[Lane]>,
+    tokens: u32,
+}
+
+impl Step {
+    /// Tyle samo tokenów w każdym lane. Krok mieszający prefill jednej
+    /// sekwencji z dekodowaniem innych to osobna rzecz i osobne słownictwo —
+    /// dopisanie go tutaj przez „długość na lane" pozwoliłoby modelowi opisać
+    /// kształt, którego żaden kernel nie liczy.
+    pub fn new(lanes: impl Into<Arc<[Lane]>>, tokens: u32) -> Result<Self> {
+        let lanes = lanes.into();
+        if lanes.is_empty() || tokens == 0 {
+            return Err(ForgeError::Format(format!(
+                "krok {} lane'ów po {tokens} tokenów jest pusty",
+                lanes.len()
+            )));
+        }
+        // Dwa lane'y w jednym slocie zapisałyby ten sam cache dwa razy w jednym
+        // kroku, a wynik zależałby od kolejności bloków w kernelu.
+        for (i, lane) in lanes.iter().enumerate() {
+            if lanes[..i].iter().any(|other| other.slot == lane.slot) {
+                return Err(ForgeError::Format(format!(
+                    "slot {} występuje w kroku dwa razy",
+                    lane.slot
+                )));
+            }
+        }
+        Ok(Self { lanes, tokens })
+    }
+
+    /// Jedna sekwencja — prefill i każdy przebieg, który nie jest wsadem.
+    pub fn single(slot: u32, pos: u32, tokens: u32) -> Result<Self> {
+        Self::new(vec![Lane { slot, pos }], tokens)
+    }
+
+    pub fn lanes(&self) -> &[Lane] {
+        &self.lanes
+    }
+
+    pub fn tokens(&self) -> u32 {
+        self.tokens
+    }
+
+    /// Wierszy aktywacji, lane po lanie. To jest ta liczba, którą dostają
+    /// wszystkie operacje nieznające kontekstu.
+    pub fn rows(&self) -> u32 {
+        self.lanes.len() as u32 * self.tokens
+    }
+}
+
 /// Jedna operacja architektury gęstej.
 ///
 /// Celowo wąskie i celowo nieogólne: to słownictwo JEDNEJ rodziny architektur,
 /// a nie lista instrukcji. Szerszy zestaw pozwalałby modelowi wyrazić rzeczy,
 /// których żaden backend nie liczy, a kompilator by tego nie powiedział.
+///
+/// Każda operacja niesie ten sam `Step`, więc wykonawca nigdy nie musi zgadywać,
+/// ile wierszy ma przed sobą ani czyje one są.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// Osadzenia tokenów kafla trafiają do `Act::Hidden`.
+    /// Osadzenia tokenów kroku trafiają do `Act::Hidden`, lane po lanie.
     Embed {
         table: WeightId,
         tokens: Vec<u32>,
+        step: Step,
     },
     RmsNorm {
         out: Act,
         x: Act,
         w: WeightId,
-        tokens: u32,
+        step: Step,
     },
     /// `out = x * wagaᵀ`. Formę wybiera wykonawca; model nie ma tu zdania.
     MatMul {
         out: Act,
         w: WeightId,
         x: Act,
-        tokens: u32,
+        step: Step,
     },
     Rope {
         act: Act,
         heads: u32,
-        pos: u32,
-        tokens: u32,
+        step: Step,
     },
-    /// Dopisuje klucz i wartość tego kafla do cache'u warstwy.
+    /// Dopisuje klucz i wartość tego kroku do cache'u warstwy.
     KvAppend {
         layer: usize,
-        pos: u32,
-        tokens: u32,
+        step: Step,
     },
     Attention {
         layer: usize,
-        seq: u32,
-        tokens: u32,
+        step: Step,
     },
     /// `Activated = silu(Gate) * Up`.
     SiluMul {
-        tokens: u32,
+        step: Step,
     },
     /// `Hidden += src`.
     Residual {
         src: Act,
-        tokens: u32,
+        step: Step,
     },
-    /// Głowa wyjściowa, wyłącznie dla OSTATNIEGO tokenu kafla — pozostałe
-    /// wiersze służą tylko zapełnieniu cache'u, a ta macierz jest największa
-    /// w modelu.
+    /// Głowa wyjściowa, wyłącznie dla OSTATNIEGO tokenu KAŻDEGO lane'a —
+    /// pozostałe wiersze służą tylko zapełnieniu cache'u, a ta macierz jest
+    /// największa w modelu. Wynik to `[lane'y, słownik]`.
     LogitsOfLast {
         w: WeightId,
         x: Act,
-        tokens: u32,
+        step: Step,
     },
 }
 
@@ -136,10 +211,10 @@ pub trait Executor {
     /// byłby modelem dla tego wykonawcy.
     fn read(&self, act: Act, len: usize) -> Result<Vec<f32>>;
 
-    /// Zachłanny wybór, policzony tam, gdzie logity już są.
-    fn argmax(&self, act: Act) -> Result<u32>;
+    /// Zachłanny wybór na lane, policzony tam, gdzie logity już są.
+    fn argmax(&self, act: Act, lanes: usize) -> Result<Vec<u32>>;
 
-    /// Ile tokenów zmieści cache klucza i wartości.
+    /// Ile tokenów zmieści JEDNA sekwencja.
     fn seq_cap(&self) -> u32;
 
     /// Kafel, w jakim wykonawca chce dostawać tokeny.
@@ -154,6 +229,13 @@ pub trait Executor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tile {
     pub max_tokens: u32,
+    /// Ile sekwencji naraz. Też własność wykonawcy: tyle, ile zmieścił slotów
+    /// cache'u i wierszy aktywacji.
+    ///
+    /// Nie mnoży się swobodnie przez `max_tokens`: wykonawca może dodatkowo
+    /// ograniczać ILOCZYN, bo to on jest liczbą wierszy scratcha. Krok ponad tę
+    /// granicę odbija się przy uruchomieniu, z podaną liczbą wierszy.
+    pub max_lanes: u32,
     /// Wielokrotność, do której warto wyrównać podział promptu. Prompt o jeden
     /// token dłuższy od niej każe policzyć następny kafel prawie pusty —
     /// zmierzone 5227 us/token przy 64 tokenach i 9318 przy 65.
@@ -223,5 +305,36 @@ impl QuantWeight {
             Self::Blocks { rows, cols, .. } => (*rows, *cols),
             Self::Affine(t) => (t.rows, t.cols),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Krok, w którym ten sam slot występuje dwa razy, musi być błędem.
+    ///
+    /// Oba lane'y dopisałyby do jednego cache'u w jednym kroku, więc wynik
+    /// zależałby od kolejności bloków w kernelu — a to jest niepowtarzalna
+    /// odpowiedź, nie awaria.
+    #[test]
+    fn one_slot_cannot_be_two_lanes_of_one_step() {
+        let twice = vec![Lane { slot: 1, pos: 0 }, Lane { slot: 1, pos: 7 }];
+        assert!(Step::new(twice, 1).is_err(), "powtórzony slot przeszedł");
+
+        let apart = vec![Lane { slot: 0, pos: 3 }, Lane { slot: 1, pos: 7 }];
+        let step = Step::new(apart, 2).expect("dwa różne sloty");
+        assert_eq!(step.rows(), 4, "wiersze to lane'y razy tokeny");
+    }
+
+    /// Pusty krok nie ma czego policzyć, a każdy kernel dostałby zero wierszy
+    /// i cicho nic nie zrobił.
+    #[test]
+    fn an_empty_step_is_refused() {
+        assert!(Step::new(vec![], 1).is_err(), "krok bez lane'ów przeszedł");
+        assert!(
+            Step::single(0, 0, 0).is_err(),
+            "krok bez tokenów przeszedł"
+        );
     }
 }

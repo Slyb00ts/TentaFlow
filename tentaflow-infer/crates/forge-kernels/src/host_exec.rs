@@ -34,10 +34,17 @@ use forge_types::{DType, DenseShape, ForgeError, Result};
 /// bounds how much scratch one call may need.
 const MAX_TOKENS: u32 = 512;
 
-/// Context this executor will hold. Not an allocation: the caches grow with the
-/// tokens that actually arrive, so the number is a refusal threshold rather
-/// than a promise of memory.
+/// Context this executor will hold PER SEQUENCE. Not an allocation: the caches
+/// grow with the tokens that actually arrive, so the number is a refusal
+/// threshold rather than a promise of memory.
 const SEQ_CAP: u32 = 32768;
+
+/// Sequences held at once.
+///
+/// The reference has nothing to size here — its caches grow — so this is only
+/// the count it agrees to be asked about. It exists at all because a reference
+/// that could not hold a batch could not be the oracle for one.
+const MAX_LANES: u32 = 8;
 
 /// A quantized weight, exactly as the source packed it.
 ///
@@ -118,13 +125,14 @@ fn slot(a: Act) -> usize {
 /// The dense vocabulary, computed on the host.
 pub struct HostExec {
     weights: Vec<HostWeight>,
-    /// Key and value per layer, token-major: `[pos][kv_head][dim]`.
+    /// Key and value per (layer, slot), token-major: `[pos][kv_head][dim]`.
     ///
     /// Token-major and GROWN rather than head-major and preallocated, because
     /// the reference has no kernel whose addressing this has to suit — and a
     /// head-major cache would have to reserve the whole context up front, which
-    /// at this precision is gigabytes of untouched memory.
-    kv: RefCell<Vec<(Vec<f32>, Vec<f32>)>>,
+    /// at this precision is gigabytes of untouched memory. One run per slot,
+    /// for the same reason: nothing here is paged, so a slot IS its own run.
+    kv: RefCell<Vec<Vec<(Vec<f32>, Vec<f32>)>>>,
     acts: RefCell<Slots>,
     shape: DenseShape,
     quant_params: DType,
@@ -137,7 +145,7 @@ impl HostExec {
             weights: Vec::new(),
             kv: RefCell::new(
                 (0..spec.shape.layers)
-                    .map(|_| (Vec::new(), Vec::new()))
+                    .map(|_| (0..MAX_LANES).map(|_| (Vec::new(), Vec::new())).collect())
                     .collect(),
             ),
             acts: RefCell::new(Slots::new()),
@@ -155,6 +163,10 @@ impl HostExec {
                 id.0
             ))),
         }
+    }
+
+    fn no_such_slot(slot: u32) -> ForgeError {
+        ForgeError::Other(format!("brak slotu {slot} w cache'u wzorca"))
     }
 
     fn plain(&self, id: WeightId) -> Result<&[f32]> {
@@ -269,9 +281,20 @@ impl Executor for HostExec {
     fn run(&self, op: &Op) -> Result<()> {
         let s = self.shape;
         match op {
-            Op::Embed { table, tokens } => {
+            Op::Embed {
+                table,
+                tokens,
+                step,
+            } => {
                 let w = self.quant(*table)?;
                 self.resize(Act::Hidden, tokens.len() * s.hidden as usize);
+                if tokens.len() as u32 != step.rows() {
+                    return Err(ForgeError::Format(format!(
+                        "{} osadzeń na {} wierszy kroku",
+                        tokens.len(),
+                        step.rows()
+                    )));
+                }
                 let mut acts = self.acts.borrow_mut();
                 let h = &mut acts.by[slot(Act::Hidden)];
                 for (t, &id) in tokens.iter().enumerate() {
@@ -287,14 +310,15 @@ impl Executor for HostExec {
                 Ok(())
             }
 
-            Op::RmsNorm { out, x, w, tokens } => {
+            Op::RmsNorm { out, x, w, step } => {
                 let weight = self.plain(*w)?.to_vec();
                 let src = self.with(*x, <[f32]>::to_vec);
                 let n = s.hidden as usize;
-                self.resize(*out, *tokens as usize * n);
+                let rows = step.rows() as usize;
+                self.resize(*out, rows * n);
                 let mut acts = self.acts.borrow_mut();
                 let dst = &mut acts.by[slot(*out)];
-                for t in 0..*tokens as usize {
+                for t in 0..rows {
                     let row = &src[t * n..(t + 1) * n];
                     let mean = row.iter().map(|v| v * v).sum::<f32>() / n as f32;
                     let scale = 1.0 / (mean + s.eps).sqrt();
@@ -305,124 +329,57 @@ impl Executor for HostExec {
                 Ok(())
             }
 
-            Op::MatMul { out, w, x, tokens } => {
-                self.matmul(*out, self.quant(*w)?, *x, *tokens as usize)
+            Op::MatMul { out, w, x, step } => {
+                self.matmul(*out, self.quant(*w)?, *x, step.rows() as usize)
             }
 
-            Op::LogitsOfLast { w, x, tokens } => {
-                // Tylko ostatni token kafla, więc jego wiersz jest przepisywany
-                // na początek i mnożony jako pojedynczy.
+            Op::LogitsOfLast { w, x, step } => {
+                // Ostatni token KAŻDEGO lane'a, każdy w swoim wierszu wyniku.
                 let w = self.quant(*w)?;
-                let last = (*tokens as usize - 1) * w.cols;
-                let src = self.with(*x, |v| v[last..last + w.cols].to_vec());
-                self.resize(Act::Logits, w.rows);
+                let tokens = step.tokens() as usize;
+                let last = |lane: usize| (lane * tokens + tokens - 1) * w.cols;
+                let src = self.with(*x, |v| {
+                    (0..step.lanes().len())
+                        .flat_map(|lane| v[last(lane)..last(lane) + w.cols].to_vec())
+                        .collect::<Vec<f32>>()
+                });
+                self.resize(Act::Logits, step.lanes().len() * w.rows);
                 let mut acts = self.acts.borrow_mut();
                 let dst = &mut acts.by[slot(Act::Logits)];
                 let mut row = vec![0.0f32; w.cols];
-                for (r, out) in dst.iter_mut().enumerate() {
+                for r in 0..w.rows {
                     w.row_into(r, &mut row);
-                    *out = row
-                        .iter()
-                        .zip(&src)
-                        .fold(0.0f32, |a, (x, y)| x.mul_add(*y, a));
-                }
-                Ok(())
-            }
-
-            Op::Rope {
-                act,
-                heads,
-                pos,
-                tokens,
-            } => {
-                let dims = s.head_dim as usize;
-                let half = dims / 2;
-                let mut acts = self.acts.borrow_mut();
-                let v = &mut acts.by[slot(*act)];
-                for t in 0..*tokens as usize {
-                    for h in 0..*heads as usize {
-                        let base = (t * *heads as usize + h) * dims;
-                        for i in 0..half {
-                            // Częstotliwość w f32 i podstawa z kształtu: przy
-                            // base 1e6 i dims 128 wykładnik schodzi do 1e-6.
-                            let freq = (*pos as usize + t) as f32
-                                * s.rope_theta.powf(-2.0 * i as f32 / dims as f32);
-                            let (sin, cos) = freq.sin_cos();
-                            let x0 = v[base + i];
-                            let x1 = v[base + i + half];
-                            v[base + i] = x0 * cos - x1 * sin;
-                            v[base + i + half] = x0 * sin + x1 * cos;
-                        }
+                    for lane in 0..step.lanes().len() {
+                        let xs = &src[lane * w.cols..(lane + 1) * w.cols];
+                        dst[lane * w.rows + r] = row
+                            .iter()
+                            .zip(xs)
+                            .fold(0.0f32, |a, (x, y)| x.mul_add(*y, a));
                     }
                 }
                 Ok(())
             }
 
-            Op::KvAppend { layer, pos, tokens } => {
-                let width = s.kv_width() as usize;
-                let (k, v) = (
-                    self.with(Act::Key, <[f32]>::to_vec),
-                    self.with(Act::Value, <[f32]>::to_vec),
-                );
-                let mut kv = self.kv.borrow_mut();
-                let (kc, vc) = kv
-                    .get_mut(*layer)
-                    .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))?;
-                // Cache rośnie na końcu, ale kafel może zaczynać się TAM, GDZIE
-                // JUŻ COŚ JEST — po cofnięciu pozycji przez `reset`. Nadpisanie
-                // jest wtedy poprawne, doklejenie nie.
-                let (from, end) = (
-                    *pos as usize * width,
-                    (*pos as usize + *tokens as usize) * width,
-                );
-                if kc.len() < end {
-                    kc.resize(end, 0.0);
-                    vc.resize(end, 0.0);
-                }
-                kc[from..end].copy_from_slice(&k[..*tokens as usize * width]);
-                vc[from..end].copy_from_slice(&v[..*tokens as usize * width]);
-                Ok(())
-            }
-
-            Op::Attention { layer, seq, tokens } => {
-                let (heads, kvh) = (s.heads as usize, s.kv_heads as usize);
+            Op::Rope { act, heads, step } => {
                 let dims = s.head_dim as usize;
-                let width = kvh * dims;
-                let q = self.with(Act::Query, <[f32]>::to_vec);
-                let kv = self.kv.borrow();
-                let (kc, vc) = kv
-                    .get(*layer)
-                    .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))?;
-                let per_kv = heads / kvh;
-                self.resize(Act::Attn, *tokens as usize * heads * dims);
+                let half = dims / 2;
+                let tokens = step.tokens() as usize;
                 let mut acts = self.acts.borrow_mut();
-                let out = &mut acts.by[slot(Act::Attn)];
-                let scale = s.attn_scale();
-                for t in 0..*tokens as usize {
-                    // Przyczynowość bez maski: zapytanie kafla siedzi na
-                    // pozycji `seq - tokens + t`, więc pętla kończy się na niej.
-                    let len = *seq as usize - *tokens as usize + t + 1;
-                    for h in 0..heads {
-                        let kv_head = h / per_kv;
-                        let qh = &q[(t * heads + h) * dims..][..dims];
-                        let mut scores = vec![0.0f32; len];
-                        for (j, sc) in scores.iter_mut().enumerate() {
-                            let kj = &kc[j * width + kv_head * dims..][..dims];
-                            *sc = qh.iter().zip(kj).fold(0.0f32, |a, (x, y)| x.mul_add(*y, a))
-                                * scale;
-                        }
-                        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let mut total = 0.0f32;
-                        for sc in scores.iter_mut() {
-                            *sc = (*sc - m).exp();
-                            total += *sc;
-                        }
-                        let base = (t * heads + h) * dims;
-                        for (j, sc) in scores.iter().enumerate() {
-                            let vj = &vc[j * width + kv_head * dims..][..dims];
-                            let p = sc / total;
-                            for c in 0..dims {
-                                out[base + c] = p.mul_add(vj[c], out[base + c]);
+                let v = &mut acts.by[slot(*act)];
+                for (lane, l) in step.lanes().iter().enumerate() {
+                    for t in 0..tokens {
+                        for h in 0..*heads as usize {
+                            let base = ((lane * tokens + t) * *heads as usize + h) * dims;
+                            for i in 0..half {
+                                // Częstotliwość w f32 i podstawa z kształtu: przy
+                                // base 1e6 i dims 128 wykładnik schodzi do 1e-6.
+                                let freq = (l.pos as usize + t) as f32
+                                    * s.rope_theta.powf(-2.0 * i as f32 / dims as f32);
+                                let (sin, cos) = freq.sin_cos();
+                                let x0 = v[base + i];
+                                let x1 = v[base + i + half];
+                                v[base + i] = x0 * cos - x1 * sin;
+                                v[base + i + half] = x0 * sin + x1 * cos;
                             }
                         }
                     }
@@ -430,8 +387,90 @@ impl Executor for HostExec {
                 Ok(())
             }
 
-            Op::SiluMul { tokens } => {
-                let n = *tokens as usize * s.inter as usize;
+            Op::KvAppend { layer, step } => {
+                let width = s.kv_width() as usize;
+                let tokens = step.tokens() as usize;
+                let (k, v) = (
+                    self.with(Act::Key, <[f32]>::to_vec),
+                    self.with(Act::Value, <[f32]>::to_vec),
+                );
+                let mut kv = self.kv.borrow_mut();
+                let slots = kv
+                    .get_mut(*layer)
+                    .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))?;
+                for (lane, l) in step.lanes().iter().enumerate() {
+                    let (kc, vc) = slots
+                        .get_mut(l.slot as usize)
+                        .ok_or_else(|| Self::no_such_slot(l.slot))?;
+                    // Cache rośnie na końcu, ale krok może zaczynać się TAM,
+                    // GDZIE JUŻ COŚ JEST — po cofnięciu pozycji przez `reset`.
+                    // Nadpisanie jest wtedy poprawne, doklejenie nie.
+                    let (from, end) = (l.pos as usize * width, (l.pos as usize + tokens) * width);
+                    if kc.len() < end {
+                        kc.resize(end, 0.0);
+                        vc.resize(end, 0.0);
+                    }
+                    let src = lane * tokens * width;
+                    kc[from..end].copy_from_slice(&k[src..src + tokens * width]);
+                    vc[from..end].copy_from_slice(&v[src..src + tokens * width]);
+                }
+                Ok(())
+            }
+
+            Op::Attention { layer, step } => {
+                let (heads, kvh) = (s.heads as usize, s.kv_heads as usize);
+                let dims = s.head_dim as usize;
+                let width = kvh * dims;
+                let tokens = step.tokens() as usize;
+                let q = self.with(Act::Query, <[f32]>::to_vec);
+                let kv = self.kv.borrow();
+                let slots = kv
+                    .get(*layer)
+                    .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))?;
+                let per_kv = heads / kvh;
+                self.resize(Act::Attn, step.rows() as usize * heads * dims);
+                let mut acts = self.acts.borrow_mut();
+                let out = &mut acts.by[slot(Act::Attn)];
+                let scale = s.attn_scale();
+                for (lane, l) in step.lanes().iter().enumerate() {
+                    let (kc, vc) = slots
+                        .get(l.slot as usize)
+                        .ok_or_else(|| Self::no_such_slot(l.slot))?;
+                    for t in 0..tokens {
+                        // Przyczynowość bez maski: zapytanie siedzi na pozycji
+                        // `pos + t`, więc pętla kończy się na niej.
+                        let len = l.pos as usize + t + 1;
+                        for h in 0..heads {
+                            let kv_head = h / per_kv;
+                            let base = ((lane * tokens + t) * heads + h) * dims;
+                            let qh = &q[base..][..dims];
+                            let mut scores = vec![0.0f32; len];
+                            for (j, sc) in scores.iter_mut().enumerate() {
+                                let kj = &kc[j * width + kv_head * dims..][..dims];
+                                *sc = qh.iter().zip(kj).fold(0.0f32, |a, (x, y)| x.mul_add(*y, a))
+                                    * scale;
+                            }
+                            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            let mut total = 0.0f32;
+                            for sc in scores.iter_mut() {
+                                *sc = (*sc - m).exp();
+                                total += *sc;
+                            }
+                            for (j, sc) in scores.iter().enumerate() {
+                                let vj = &vc[j * width + kv_head * dims..][..dims];
+                                let p = sc / total;
+                                for c in 0..dims {
+                                    out[base + c] = p.mul_add(vj[c], out[base + c]);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            Op::SiluMul { step } => {
+                let n = step.rows() as usize * s.inter as usize;
                 let (gate, up) = (
                     self.with(Act::Gate, <[f32]>::to_vec),
                     self.with(Act::Up, <[f32]>::to_vec),
@@ -446,9 +485,9 @@ impl Executor for HostExec {
                 Ok(())
             }
 
-            Op::Residual { src, tokens } => {
+            Op::Residual { src, step } => {
                 let delta = self.with(*src, <[f32]>::to_vec);
-                let n = *tokens as usize * s.hidden as usize;
+                let n = step.rows() as usize * s.hidden as usize;
                 let mut acts = self.acts.borrow_mut();
                 let h = &mut acts.by[slot(Act::Hidden)];
                 for i in 0..n {
@@ -476,18 +515,28 @@ impl Executor for HostExec {
         })
     }
 
-    fn argmax(&self, act: Act) -> Result<u32> {
+    fn argmax(&self, act: Act, lanes: usize) -> Result<Vec<u32>> {
+        let vocab = self.shape.vocab as usize;
         self.with(act, |v| {
-            if v.is_empty() {
-                return Err(ForgeError::Other("pusty slot do wyboru".into()));
+            if v.len() < lanes * vocab {
+                return Err(ForgeError::Other(format!(
+                    "slot ma {} wartości, a wybór dla {lanes} lane'ów chce {}",
+                    v.len(),
+                    lanes * vocab
+                )));
             }
-            let mut best = 0usize;
-            for (i, &x) in v.iter().enumerate() {
-                if x > v[best] {
-                    best = i;
-                }
-            }
-            Ok(best as u32)
+            Ok((0..lanes)
+                .map(|lane| {
+                    let row = &v[lane * vocab..(lane + 1) * vocab];
+                    let mut best = 0usize;
+                    for (i, &x) in row.iter().enumerate() {
+                        if x > row[best] {
+                            best = i;
+                        }
+                    }
+                    best as u32
+                })
+                .collect())
         })
     }
 
@@ -498,6 +547,7 @@ impl Executor for HostExec {
     fn tile(&self) -> Tile {
         Tile {
             max_tokens: MAX_TOKENS,
+            max_lanes: MAX_LANES,
             align: 1,
         }
     }

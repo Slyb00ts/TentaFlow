@@ -193,6 +193,16 @@ model, kernele i loader naraz.
    wolno napisać na ślepo: ten dokument w całości jest o tym, że błąd w takiej
    ścieżce nie objawia się awarią, tylko płynnym, złym tekstem — więc każdy z
    nich potrzebuje karty, wzorca i wykonanego porównania, a nie przeglądu.
+
+   (a) jest zrobione. `Op` niesie `Step` — lane'y i tokeny na lane — a
+   stronicowane KV zmieściło się CAŁE po stronie wykonawcy: lane mówi, w którym
+   slocie siedzi i od której pozycji, a strony, lista wolnych i tablica stron
+   nie mają w słownictwie ani jednego pola. Cztery sekwencje naraz kosztują 6%
+   na sekwencję i dają 3,8x łącznie (35,7 -> 133,9 tok/s, Bielik 7B Q4_K_M na
+   DGX Spark). Przy okazji wyszła rzecz, której nie dało się zgadnąć: kafel
+   prefillu jest ZŁYM kernelem dla wsadu dekodowania i przy trzech lane'ach był
+   wolniejszy niż trzy osobne przebiegi — szczegóły w
+   `docs/ZADANIE_CUDA_EXECUTOR.md`.
 5. **`forge-quant` wydzielony z `forge-formats`**, z wzorcem CPU jako wyrocznią.
 6. **Passy nad `Vec<Op>`** — fuzja i autotuning, bez dotykania modeli.
 

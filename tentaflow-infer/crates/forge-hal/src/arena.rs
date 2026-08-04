@@ -108,6 +108,15 @@ impl SlabArena {
         Ok((offset, size))
     }
 
+    /// Bytes still free, across all ranges.
+    ///
+    /// A sum and not the largest range: the caller sizing a KV budget asks how
+    /// many equal slabs fit, and every one of them is a separate allocation.
+    /// The largest range would answer a question nobody asks.
+    pub(crate) fn available(&self) -> usize {
+        self.free.values().sum()
+    }
+
     /// Return a previously allocated range, coalescing with neighbours.
     pub(crate) fn free(&mut self, offset: usize, size: usize) {
         debug_assert!(offset.is_multiple_of(self.page_size) && size.is_multiple_of(self.page_size));

@@ -677,7 +677,7 @@ impl Device for CudaDevice {
         match &*arena {
             PoolArena::Bump(bump) => Some(bump.available()),
             PoolArena::Ring(ring) => Some(ring.available()),
-            _ => None,
+            PoolArena::Slab(slab) => Some(slab.available()),
         }
     }
 

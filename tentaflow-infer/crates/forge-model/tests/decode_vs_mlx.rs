@@ -16,7 +16,10 @@ mod common;
 
 use forge_hal::metal_device::MetalDevice;
 use forge_kernels::MetalExec;
-use forge_model::dense::Dense;
+use forge_model::dense::{Dense, Feed};
+
+/// Slot cache'u tych testów. Jedna sekwencja, więc zawsze ten sam.
+const SLOT: usize = 0;
 
 /// Model plus wykonawca. To jedyne miejsce w teście, które wie, co liczy —
 /// `Dense` dostaje wykonawcę jako wytwórnię i nigdy nie pyta, czym on jest.
@@ -43,7 +46,10 @@ fn decode_loop_matches_mlx_lm_step_by_step() {
     assert_eq!(shape.vocab as usize, oracle.vocab);
 
     for (step, &token) in oracle.tokens.iter().enumerate() {
-        let got = model.step(token).expect("krok dekodowania");
+        model
+            .decode(&[Feed { slot: SLOT, token }])
+            .expect("krok dekodowania");
+        let got = model.logits(0).expect("logity");
         let want = &oracle.logits[step];
         assert_eq!(got.len(), want.len());
 
@@ -103,7 +109,9 @@ fn greedy_choice_on_the_device_agrees_with_the_readback() {
     let mut model = open(device, &dir);
 
     for (step, &token) in oracle.tokens.iter().enumerate() {
-        let chosen = model.step_argmax(token).expect("krok dekodowania");
+        let chosen = model
+            .decode(&[Feed { slot: SLOT, token }])
+            .expect("krok dekodowania")[0];
         let expected = common::top_k(&oracle.logits[step], 1)[0] as u32;
         assert_eq!(chosen, expected, "krok {}", step + 1);
     }
@@ -122,11 +130,13 @@ fn a_context_past_the_cache_capacity_is_refused() {
         return;
     };
     let mut model = open(device, &dir);
-    assert_eq!(model.position(), 0);
-    model.step(1).expect("pierwszy krok");
-    assert_eq!(model.position(), 1);
-    model.reset();
-    assert_eq!(model.position(), 0);
+    assert_eq!(model.position(SLOT).expect("pozycja"), 0);
+    model
+        .decode(&[Feed { slot: SLOT, token: 1 }])
+        .expect("pierwszy krok");
+    assert_eq!(model.position(SLOT).expect("pozycja"), 1);
+    model.reset(SLOT).expect("reset");
+    assert_eq!(model.position(SLOT).expect("pozycja"), 0);
 }
 
 /// Normy stanu ukrytego na kolejnych głębokościach, zmierzone w mlx-lm dla
@@ -154,7 +164,7 @@ fn hidden_state_tracks_mlx_at_every_depth() {
     let mut model = open(device, &dir);
 
     for &(layers, expected) in REFERENCE_NORMS {
-        let h = model.probe(1, layers).expect("sonda");
+        let h = model.probe(SLOT, 1, layers).expect("sonda");
         let norm: f64 = h
             .iter()
             .map(|v| (*v as f64) * (*v as f64))

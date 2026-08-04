@@ -12,10 +12,11 @@
 //     separate arrays and get them by rewriting; the kernels here read
 //     superblocks directly, so rewriting would be work undone. The choice is
 //     the executor's exactly so that both can be right.
-//   * The KV cache is one contiguous run per layer, `[pos][kv_head][dim]`, and
-//     `KvAppend` is a copy into it. Paging is a property of a scheduler that
-//     serves many sequences; one sequence does not need it, and `Op` does not
-//     yet say it.
+//   * The KV cache is PAGED, and the model does not know it. `KvAppend` and
+//     `Attention` name a layer and a lane; where that lane's context physically
+//     sits is answered here, by a free list and a page table. That is the
+//     question step 2 of docs/ZADANIE_CUDA_EXECUTOR.md asks, and the answer is
+//     yes: paging needs nothing from the vocabulary.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -23,21 +24,37 @@ use std::sync::Arc;
 use half::f16;
 
 use forge_formats::FfnActivation;
-use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Tile, WeightId, WeightStore};
+use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Step, Tile, WeightId, WeightStore};
 use forge_hal::{DevBuffer, Device, Pool, Stream};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
 use crate::launchers::{Kernels, SAMPLE_SCRATCH_PAIRS};
 
-/// Prompt tokens carried through the layers in one pass.
+/// Activation rows carried through the layers in one pass — lanes times tokens.
 ///
 /// Bounded by the scratch it forces: at 4096 hidden and 11264 intermediate,
-/// every extra token costs about 100 KB across the eleven slots.
-const PREFILL_CHUNK: u32 = 512;
+/// every extra row costs about 100 KB across the eleven slots.
+const MAX_ROWS: u32 = 512;
 
-/// Context the cache will hold. An allocation, not a threshold — the cache is
-/// contiguous, so its length is fixed when the executor is built.
+/// Sequences held at once.
+///
+/// Small on purpose. Every lane is a live context and they share the page
+/// budget below, so raising this without raising the budget only means the
+/// lanes run out of pages sooner.
+const MAX_LANES: u32 = 4;
+
+/// Context one sequence may reach.
 const SEQ_CAP: u32 = 4096;
+
+/// Tokens in one KV page.
+///
+/// The page is the unit of allocation, so it trades two things off: a large
+/// page wastes the tail of every sequence, a small one makes the page table
+/// long and the indirection frequent. This is the size the engine's cache uses.
+const PAGE: u32 = 256;
+
+/// Splits of the context in the decode attention's partial pass.
+const DECODE_SPLITS: u32 = 8;
 
 /// A quantized weight, in the blocks the source packed and the kernels read.
 struct Quantized {
@@ -70,14 +87,35 @@ struct Scratch {
     up: DevBuffer,
     act: DevBuffer,
     logits: DevBuffer,
-    /// Token ids of the current tile, read by the embedding gather.
+    /// Token ids of the current step, read by the embedding gather.
     ids: DevBuffer,
-    /// Absolute positions of the current tile, read by RoPE.
+    /// Absolute position of every row, read by RoPE.
     positions: DevBuffer,
-    /// Chosen id (i32) plus its logprob (f32), written by the argmax.
+    /// First position of every lane, read by the KV append.
+    bases: DevBuffer,
+    /// Pages of every lane of this step, lane-major.
+    pages: DevBuffer,
+    /// Context length of every lane, read by the decode attention.
+    lengths: DevBuffer,
+    /// Per-split partial sums of the decode attention.
+    parts: DevBuffer,
+    /// Chosen id per lane.
     choice: DevBuffer,
     sample_vals: DevBuffer,
     sample_idx: DevBuffer,
+}
+
+/// Which pages hold which sequence.
+///
+/// The free list is the reason this is paging and not an array of slabs: a lane
+/// takes a page only when it fills the last one, so the budget is spent on what
+/// the sequences actually reached rather than on what they might reach.
+struct Pages {
+    free: Vec<u32>,
+    /// Pages of each slot, in context order.
+    held: Vec<Vec<u32>>,
+    /// Pages one slot may hold — the page-table width the kernels are told.
+    per_lane: usize,
 }
 
 /// The dense vocabulary on a CUDA device.
@@ -86,21 +124,29 @@ pub struct CudaExec {
     kernels: Kernels,
     stream: Stream,
     weights: Vec<Weight>,
-    /// Key and value per layer, `[pos][kv_head][dim]` f16 — the layout
-    /// `attn_full_f16` reads and `Act::Key` already has, so appending is a copy.
+    /// Key and value per layer, `[strona][głowica KV][pozycja][wymiar]` f16 —
+    /// the layout every paged kernel in the catalogue reads.
     kv: Vec<(DevBuffer, DevBuffer)>,
+    pages: RefCell<Pages>,
     scratch: Scratch,
-    /// Kopie tego, co stoi w `ids` i `positions` na urządzeniu. Patrz
-    /// `stage_i32` — bez nich każdy zapis sterujący byłby wyścigiem z tym, co
-    /// już stoi w kolejce.
-    ids_host: RefCell<Vec<i32>>,
-    positions_host: RefCell<Vec<i32>>,
+    /// Kopie tego, co stoi w buforach sterujących na urządzeniu. Patrz
+    /// `stage_i32` — bez nich każdy zapis byłby wyścigiem z tym, co już stoi w
+    /// kolejce, a tablica stron jest ta sama dla wszystkich czterdziestu warstw
+    /// kroku.
+    staged: [RefCell<Vec<i32>>; 5],
     shape: DenseShape,
     /// Dtype the source keeps its normalization weights in. GGUF says f32 and
     /// the kernels read f16, so the conversion happens on upload — and a source
     /// that says something else is refused rather than reinterpreted.
     norm_weights: DType,
 }
+
+/// Which staged buffer a mirror belongs to.
+const STAGE_IDS: usize = 0;
+const STAGE_POSITIONS: usize = 1;
+const STAGE_BASES: usize = 2;
+const STAGE_PAGES: usize = 3;
+const STAGE_LENGTHS: usize = 4;
 
 impl CudaExec {
     /// Loads the kernel catalogue and allocates everything a step writes into.
@@ -117,11 +163,12 @@ impl CudaExec {
         let kernels = Kernels::load(device.clone())?;
         let stream = device.create_stream()?;
 
-        let n = PREFILL_CHUNK;
+        let n = MAX_ROWS;
         let f16b =
             |elems: u32| device.alloc(elems as usize * 2, MemKind::Device, Pool::Activations);
         let i32b =
             |elems: u32| device.alloc(elems as usize * 4, MemKind::Device, Pool::Activations);
+        let per_lane = SEQ_CAP.div_ceil(PAGE) as usize;
         let scratch = Scratch {
             h: f16b(n * shape.hidden)?,
             norm: f16b(n * shape.hidden)?,
@@ -133,22 +180,28 @@ impl CudaExec {
             gate: f16b(n * shape.inter)?,
             up: f16b(n * shape.inter)?,
             act: f16b(n * shape.inter)?,
-            // Logity liczymy tylko dla ostatniego tokenu kafla, więc jeden
-            // wiersz — słownik razy kafel to megabajty, z których czytamy 1/n.
-            logits: i32b(shape.vocab)?,
+            // Logity liczymy tylko dla ostatniego tokenu każdego lane'a, więc
+            // wiersz na lane — słownik razy kafel to megabajty, z których
+            // czytamy 1/n.
+            logits: i32b(MAX_LANES * shape.vocab)?,
             ids: i32b(n)?,
             positions: i32b(n)?,
-            choice: i32b(2)?,
+            bases: i32b(MAX_LANES)?,
+            pages: i32b(MAX_LANES * per_lane as u32)?,
+            lengths: i32b(MAX_LANES)?,
+            parts: i32b(MAX_LANES * shape.heads * DECODE_SPLITS * (shape.head_dim + 4))?,
+            choice: i32b(MAX_LANES.max(2))?,
             sample_vals: i32b(SAMPLE_SCRATCH_PAIRS as u32)?,
             sample_idx: i32b(SAMPLE_SCRATCH_PAIRS as u32)?,
         };
 
-        let kv_bytes = (SEQ_CAP * shape.kv_width()) as usize * 2;
+        let page_bytes = (shape.kv_heads * PAGE * shape.head_dim) as usize * 2;
+        let pages = page_budget(&*device, page_bytes, shape.layers as usize, per_lane)?;
         let mut kv = Vec::with_capacity(shape.layers as usize);
         for _ in 0..shape.layers {
             kv.push((
-                device.alloc(kv_bytes, MemKind::Device, Pool::KvCache)?,
-                device.alloc(kv_bytes, MemKind::Device, Pool::KvCache)?,
+                device.alloc(pages * page_bytes, MemKind::Device, Pool::KvCache)?,
+                device.alloc(pages * page_bytes, MemKind::Device, Pool::KvCache)?,
             ));
         }
 
@@ -158,13 +211,49 @@ impl CudaExec {
             stream,
             weights: Vec::new(),
             kv,
+            pages: RefCell::new(Pages {
+                free: (0..pages as u32).rev().collect(),
+                held: vec![Vec::new(); MAX_LANES as usize],
+                per_lane,
+            }),
             scratch,
-            ids_host: RefCell::new(Vec::new()),
-            positions_host: RefCell::new(Vec::new()),
+            staged: std::array::from_fn(|_| RefCell::new(Vec::new())),
             shape,
             norm_weights: spec.norm_weights,
         })
     }
+}
+
+/// How many pages the KV pool can carry, capped by what the lanes could ever
+/// use.
+///
+/// Asked of the pool rather than assumed, because the answer decides whether a
+/// long sequence runs or is refused — and reserving `lanes * seq_cap` up front
+/// would be the very thing paging exists to avoid.
+fn page_budget(
+    device: &dyn Device,
+    page_bytes: usize,
+    layers: usize,
+    per_lane: usize,
+) -> Result<usize> {
+    let want = per_lane * MAX_LANES as usize;
+    // Jedna strona kosztuje tyle we WSZYSTKICH warstwach naraz i po obu
+    // stronach cache'u — inaczej budżet mówiłby o czymś, czego się nie
+    // alokuje.
+    let each = page_bytes
+        .checked_mul(layers * 2)
+        .ok_or_else(|| ForgeError::Device("przepełnienie budżetu stron KV".into()))?;
+    let pages = match device.pool_available(Pool::KvCache) {
+        Some(free) => want.min(free / each),
+        None => want,
+    };
+    if pages < per_lane {
+        return Err(ForgeError::OutOfMemory {
+            requested: per_lane * each,
+            available: pages * each,
+        });
+    }
+    Ok(pages)
 }
 
 impl WeightStore for CudaExec {
@@ -244,36 +333,43 @@ impl WeightStore for CudaExec {
 
 impl Executor for CudaExec {
     fn run(&self, op: &Op) -> Result<()> {
+        let step = match op {
+            Op::Embed { step, .. }
+            | Op::RmsNorm { step, .. }
+            | Op::MatMul { step, .. }
+            | Op::Rope { step, .. }
+            | Op::KvAppend { step, .. }
+            | Op::Attention { step, .. }
+            | Op::SiluMul { step }
+            | Op::Residual { step, .. }
+            | Op::LogitsOfLast { step, .. } => step,
+        };
+        self.admit(step)?;
         match op {
-            Op::Embed { table, tokens } => self.op_embed(*table, tokens),
-            Op::RmsNorm { out, x, w, tokens } => self.op_rmsnorm(*out, *x, *w, *tokens),
-            Op::MatMul { out, w, x, tokens } => {
+            Op::Embed { table, tokens, .. } => self.op_embed(*table, tokens),
+            Op::RmsNorm { out, x, w, .. } => self.op_rmsnorm(*out, *x, *w, step),
+            Op::MatMul { out, w, x, .. } => {
                 let w = self.quant(*w)?;
-                self.matmul(self.buf(*out), w, self.buf(*x), *tokens)
+                self.matmul(self.buf(*out), w, self.buf(*x), step.rows())
             }
-            Op::Rope {
-                act,
-                heads,
-                pos,
-                tokens,
-            } => self.op_rope(*act, *heads, *pos, *tokens),
-            Op::KvAppend { layer, pos, tokens } => self.op_kv_append(*layer, *pos, *tokens),
-            Op::Attention { layer, seq, tokens } => self.op_attention(*layer, *seq, *tokens),
-            Op::SiluMul { tokens } => self.kernels.glu_mul_f16(
+            Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, step),
+            Op::KvAppend { layer, .. } => self.op_kv_append(*layer, step),
+            Op::Attention { layer, .. } => self.op_attention(*layer, step),
+            Op::SiluMul { .. } => self.kernels.glu_mul_f16(
                 FfnActivation::SiLU,
                 &self.scratch.act,
                 &self.scratch.gate,
                 &self.scratch.up,
-                *tokens as usize * self.shape.inter as usize,
+                step.rows() as usize * self.shape.inter as usize,
                 &self.stream,
             ),
-            Op::Residual { src, tokens } => self.kernels.residual_add_f16(
+            Op::Residual { src, .. } => self.kernels.residual_add_f16(
                 &self.scratch.h,
                 self.buf(*src),
-                *tokens as usize * self.shape.hidden as usize,
+                step.rows() as usize * self.shape.hidden as usize,
                 &self.stream,
             ),
-            Op::LogitsOfLast { w, x, tokens } => self.op_logits_of_last(*w, *x, *tokens),
+            Op::LogitsOfLast { w, x, .. } => self.op_logits_of_last(*w, *x, step),
         }
     }
 
@@ -301,20 +397,36 @@ impl Executor for CudaExec {
 
     /// Greedy choice on the device, so the vocabulary never crosses the bus
     /// just to be scanned for its maximum.
-    fn argmax(&self, act: Act) -> Result<u32> {
-        self.kernels.sample_argmax_f32(
-            &self.scratch.choice,
-            &self.scratch.sample_vals,
-            &self.scratch.sample_idx,
-            self.buf(act),
-            self.shape.vocab as usize,
-            &self.stream,
-        )?;
+    fn argmax(&self, act: Act, lanes: usize) -> Result<Vec<u32>> {
+        let vocab = self.shape.vocab as usize;
+        if lanes == 1 {
+            self.kernels.sample_argmax_f32(
+                &self.scratch.choice,
+                &self.scratch.sample_vals,
+                &self.scratch.sample_idx,
+                self.buf(act),
+                vocab,
+                &self.stream,
+            )?;
+        } else {
+            self.kernels.sample_batched_argmax_f32(
+                &self.scratch.choice,
+                self.buf(act),
+                lanes,
+                vocab,
+                &self.stream,
+            )?;
+        }
         self.stream.synchronize()?;
-        let mut raw = [0u8; 4];
+        let mut raw = vec![0u8; lanes * 4];
         self.device.read(&self.scratch.choice, 0, &mut raw)?;
-        let id = i32::from_le_bytes(raw);
-        u32::try_from(id).map_err(|_| ForgeError::Other(format!("wybór zwrócił token {id}")))
+        raw.chunks_exact(4)
+            .map(|c| {
+                let id = i32::from_le_bytes(c.try_into().unwrap());
+                u32::try_from(id)
+                    .map_err(|_| ForgeError::Other(format!("wybór zwrócił token {id}")))
+            })
+            .collect()
     }
 
     fn seq_cap(&self) -> u32 {
@@ -323,8 +435,9 @@ impl Executor for CudaExec {
 
     fn tile(&self) -> Tile {
         Tile {
-            max_tokens: PREFILL_CHUNK,
-            // Kernele biorą liczbę tokenów jako argument i same domykają ogon,
+            max_tokens: MAX_ROWS,
+            max_lanes: MAX_LANES,
+            // Kernele biorą liczbę wierszy jako argument i same domykają ogon,
             // więc nie ma kształtu, do którego warto by prompt dociągać.
             align: 1,
         }
@@ -348,6 +461,39 @@ impl CudaExec {
         }
     }
 
+    /// Checks a step against what this executor actually holds.
+    ///
+    /// In one place and before anything runs, because the alternative is each
+    /// kernel discovering its own half of the problem: the scratch would clip
+    /// the rows, the page table would address a lane that has none, and the
+    /// answer would come out finished and wrong.
+    fn admit(&self, step: &Step) -> Result<()> {
+        if step.rows() > MAX_ROWS {
+            return Err(ForgeError::Unsupported(format!(
+                "{} lane'ów po {} tokenów to {} wierszy, a scratch ma {MAX_ROWS}",
+                step.lanes().len(),
+                step.tokens(),
+                step.rows()
+            )));
+        }
+        for lane in step.lanes() {
+            if lane.slot >= MAX_LANES {
+                return Err(ForgeError::Unsupported(format!(
+                    "slot {}, a wykonawca trzyma {MAX_LANES}",
+                    lane.slot
+                )));
+            }
+            if lane.pos + step.tokens() > SEQ_CAP {
+                return Err(ForgeError::Unsupported(format!(
+                    "slot {} sięga pozycji {}, a cache trzyma {SEQ_CAP}",
+                    lane.slot,
+                    lane.pos + step.tokens()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn quant(&self, id: WeightId) -> Result<&Quantized> {
         match self.weights.get(id.0 as usize) {
             Some(Weight::Quant(q)) => Ok(q),
@@ -365,20 +511,17 @@ impl CudaExec {
         }
     }
 
-    /// Stages the small i32 control data — token ids, positions — a tile needs.
+    /// Stages the small i32 control data — ids, positions, page tables — a step
+    /// needs.
     ///
     /// A HAL write lands on the legacy stream while this executor's stream is
     /// non-blocking, so it is NOT ordered against work already queued: a write
     /// issued now can overwrite bytes a queued kernel has not read yet. That
-    /// content changes exactly once per tile, so the answer is to notice when
-    /// it changes and drain then — the alternative, draining on every call,
-    /// would be eighty-one drains a token for data that never moved.
-    fn stage_i32(
-        &self,
-        dst: &DevBuffer,
-        mirror: &RefCell<Vec<i32>>,
-        values: Vec<i32>,
-    ) -> Result<()> {
+    /// content changes at most once per step, so the answer is to notice when
+    /// it changes and drain then — the page table alone is read by eighty
+    /// kernels a step and moves for none of them.
+    fn stage_i32(&self, dst: &DevBuffer, mirror: usize, values: Vec<i32>) -> Result<()> {
+        let mirror = &self.staged[mirror];
         if *mirror.borrow() == values {
             return Ok(());
         }
@@ -387,6 +530,58 @@ impl CudaExec {
         self.device.write(&raw, dst, 0)?;
         *mirror.borrow_mut() = values;
         Ok(())
+    }
+
+    /// Gives every lane of this step the pages its context needs, and stages
+    /// the table the kernels read.
+    ///
+    /// A lane starting at position zero is a sequence starting over, so it
+    /// gives back whatever it no longer needs. Inferred from the position
+    /// rather than announced, because the vocabulary has no verb for "forget
+    /// this sequence" and inventing one for a case the data already states
+    /// would be a wider contract bought for nothing.
+    fn map_pages(&self, step: &Step) -> Result<()> {
+        let mut pages = self.pages.borrow_mut();
+        let per_lane = pages.per_lane;
+        for lane in step.lanes() {
+            let slot = lane.slot as usize;
+            let need = (lane.pos + step.tokens()).div_ceil(PAGE) as usize;
+            // Oddaje się WYŁĄCZNIE nadmiar, i tylko sekwencji zaczynającej od
+            // zera. Oddanie wszystkiego i wzięcie z powrotem dałoby ten sam
+            // wynik tylko dopóki lista wolnych stron jest stosem — a ta sama
+            // operacja wykonuje się czterdzieści razy na krok, raz na warstwę,
+            // więc strona przesunięta pod inny lane w połowie kroku byłaby
+            // cudzym kontekstem w odpowiedzi.
+            if lane.pos == 0 && pages.held[slot].len() > need {
+                let extra = pages.held[slot].split_off(need);
+                pages.free.extend(extra);
+            }
+            while pages.held[slot].len() < need {
+                let page = pages.free.pop().ok_or_else(|| ForgeError::OutOfMemory {
+                    requested: need,
+                    available: pages.held[slot].len(),
+                })?;
+                pages.held[slot].push(page);
+            }
+        }
+        // Tablica idzie w KOLEJNOŚCI LANE'ÓW kroku, nie slotów: kernele
+        // adresują ją tym samym indeksem, którym adresują wiersze aktywacji.
+        let mut table = vec![0i32; step.lanes().len() * per_lane];
+        for (i, lane) in step.lanes().iter().enumerate() {
+            for (p, &page) in pages.held[lane.slot as usize].iter().enumerate() {
+                table[i * per_lane + p] = page as i32;
+            }
+        }
+        drop(pages);
+        self.stage_i32(&self.scratch.pages, STAGE_PAGES, table)
+    }
+
+    /// Pages one lane holds, as a table of its own — that is what the
+    /// single-sequence prefill kernel takes.
+    fn lane_pages(&self, lane: usize) -> Result<DevBuffer> {
+        let per_lane = self.pages.borrow().per_lane;
+        self.device
+            .sub_buffer(&self.scratch.pages, lane * per_lane * 4, per_lane * 4)
     }
 
     fn op_embed(&self, table: WeightId, tokens: &[u32]) -> Result<()> {
@@ -399,7 +594,7 @@ impl CudaExec {
         }
         self.stage_i32(
             &self.scratch.ids,
-            &self.ids_host,
+            STAGE_IDS,
             tokens.iter().map(|&t| t as i32).collect(),
         )?;
         self.kernels.gather_q4_k_rows_f16(
@@ -413,30 +608,33 @@ impl CudaExec {
         )
     }
 
-    fn op_rmsnorm(&self, out: Act, x: Act, w: WeightId, tokens: u32) -> Result<()> {
+    fn op_rmsnorm(&self, out: Act, x: Act, w: WeightId, step: &Step) -> Result<()> {
         self.kernels.rmsnorm_f16(
             self.buf(out),
             self.buf(x),
             self.plain(w)?,
-            tokens as usize,
+            step.rows() as usize,
             self.shape.hidden as usize,
             self.shape.eps,
             &self.stream,
         )
     }
 
-    fn op_rope(&self, act: Act, heads: u32, pos: u32, tokens: u32) -> Result<()> {
+    fn op_rope(&self, act: Act, heads: u32, step: &Step) -> Result<()> {
         // Pozycje są bezwzględne i idą przez bufor urządzenia, bo kernel czyta
-        // je stamtąd — jeden zapis na kafel, nie jeden na token.
+        // je stamtąd — jeden zapis na krok, nie jeden na wiersz.
         self.stage_i32(
             &self.scratch.positions,
-            &self.positions_host,
-            (0..tokens).map(|t| (pos + t) as i32).collect(),
+            STAGE_POSITIONS,
+            step.lanes()
+                .iter()
+                .flat_map(|l| (0..step.tokens()).map(move |t| (l.pos + t) as i32))
+                .collect(),
         )?;
         self.kernels.rope_neox_f16(
             self.buf(act),
             &self.scratch.positions,
-            tokens as usize,
+            step.rows() as usize,
             heads as usize,
             self.shape.head_dim as usize,
             self.shape.rope_theta,
@@ -445,102 +643,237 @@ impl CudaExec {
         )
     }
 
-    /// Klucz i wartość kafla na swoje miejsce w cache'u warstwy.
-    ///
-    /// Kopia, nie kernel: `Act::Key` ma już układ `[token][kv_head][dim]`, a
-    /// cache jest tym samym układem rozciągniętym na kontekst, więc kafel jest
-    /// ciągłym zakresem bajtów pod pozycją `pos`.
-    fn op_kv_append(&self, layer: usize, pos: u32, tokens: u32) -> Result<()> {
-        let (kc, vc) = self
-            .kv
-            .get(layer)
-            .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))?;
-        let width = self.shape.kv_width() as usize * 2;
-        let (at, bytes) = (pos as usize * width, tokens as usize * width);
-        self.device
-            .copy(&self.scratch.k, 0, kc, at, bytes, &self.stream)?;
-        self.device
-            .copy(&self.scratch.v, 0, vc, at, bytes, &self.stream)
-    }
-
-    fn op_attention(&self, layer: usize, seq: u32, tokens: u32) -> Result<()> {
+    /// Klucz i wartość kroku na swoje strony w cache'u warstwy.
+    fn op_kv_append(&self, layer: usize, step: &Step) -> Result<()> {
         let s = self.shape;
-        let (kc, vc) = self
-            .kv
-            .get(layer)
-            .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))?;
-        self.kernels.attn_full_f16(
-            &self.scratch.attn,
-            &self.scratch.q,
+        let (kc, vc) = self.layer_kv(layer)?;
+        self.map_pages(step)?;
+        self.stage_i32(
+            &self.scratch.bases,
+            STAGE_BASES,
+            step.lanes().iter().map(|l| l.pos as i32).collect(),
+        )?;
+        let per_lane = self.pages.borrow().per_lane;
+        self.kernels.kv_append_batch_segmented_f16(
             kc,
             vc,
-            tokens as usize,
-            s.heads as usize,
+            &self.scratch.k,
+            &self.scratch.v,
+            &self.scratch.pages,
+            &self.scratch.bases,
+            step.lanes().len(),
+            step.tokens() as usize,
+            per_lane,
             s.kv_heads as usize,
+            PAGE as usize,
             s.head_dim as usize,
-            seq as usize,
-            true,
-            // Wiersz zapytania `t` siedzi na pozycji bezwzględnej `seq - tokens
-            // + t`, i to ona decyduje, dokąd sięga maska przyczynowa.
-            (seq - tokens) as usize,
-            s.attn_scale(),
             &self.stream,
         )
     }
 
-    /// The output head, for the LAST token of the tile only.
-    fn op_logits_of_last(&self, w: WeightId, x: Act, tokens: u32) -> Result<()> {
-        let weight = self.quant(w)?;
-        let last = (tokens - 1) as usize * self.shape.hidden as usize * 2;
-        match weight.quant {
-            QuantKind::Q4K => self.kernels.gemv_q4_k_out_f32(
-                &self.scratch.logits,
+    /// Uwaga nad cache'em warstwy.
+    ///
+    /// Dwa kształty, dwa kernele, i podział przebiega tam, gdzie przebiega
+    /// naprawdę: krok dekodowania to JEDNO zapytanie na lane nad długim
+    /// kontekstem i liczy wszystkie lane'y jednym uruchomieniem, a kafel
+    /// prefillu to wiele zapytań jednej sekwencji i liczy je z maską
+    /// przyczynową.
+    fn op_attention(&self, layer: usize, step: &Step) -> Result<()> {
+        let s = self.shape;
+        let (kc, vc) = self.layer_kv(layer)?;
+        let per_lane = self.pages.borrow().per_lane;
+        if step.tokens() == 1 {
+            self.stage_i32(
+                &self.scratch.lengths,
+                STAGE_LENGTHS,
+                step.lanes().iter().map(|l| (l.pos + 1) as i32).collect(),
+            )?;
+            return self.kernels.attn_decode_f16(
+                &self.scratch.attn,
+                &self.scratch.parts,
+                &self.scratch.q,
+                kc,
+                vc,
+                &self.scratch.pages,
+                &self.scratch.lengths,
+                step.lanes().len(),
+                s.heads as usize,
+                s.kv_heads as usize,
+                s.head_dim as usize,
+                PAGE as usize,
+                per_lane,
+                s.attn_scale(),
                 0,
-                &weight.blocks,
-                self.buf(x),
-                last,
-                weight.rows,
-                weight.cols,
                 &self.stream,
-            ),
-            _ => self.kernels.gemv_q6_k_out_f32(
-                &self.scratch.logits,
-                0,
-                &weight.blocks,
-                self.buf(x),
-                last,
-                weight.rows,
-                weight.cols,
-                &self.stream,
-            ),
+            );
         }
+        for (lane, l) in step.lanes().iter().enumerate() {
+            let rows = step.tokens() as usize;
+            let (q, out) = (
+                self.lane_rows(&self.scratch.q, lane, rows)?,
+                self.lane_rows(&self.scratch.attn, lane, rows)?,
+            );
+            self.kernels.attn_prefill(
+                &out,
+                &q,
+                kc,
+                vc,
+                &self.lane_pages(lane)?,
+                l.pos as usize,
+                rows,
+                s.heads as usize,
+                s.kv_heads as usize,
+                s.head_dim as usize,
+                PAGE as usize,
+                DType::F16,
+                s.attn_scale(),
+                0,
+                &self.stream,
+            )?;
+        }
+        Ok(())
     }
 
-    /// `out = x * wagaᵀ`, in the form this batch size wants.
+    /// The output head, for the LAST token of every lane.
     ///
-    /// One token reads the whole matrix for one column of results, so it is
-    /// bandwidth bound and takes the vector form; a tile reuses each weight
-    /// across its rows and takes the blocked one. The threshold is the batch
-    /// size itself because that is what the two kernels differ over — there is
-    /// no third choice to arbitrate here yet.
-    fn matmul(&self, out: &DevBuffer, w: &Quantized, x: &DevBuffer, tokens: u32) -> Result<()> {
-        let (rows, cols) = (w.rows, w.cols);
-        match (w.quant, tokens) {
-            (QuantKind::Q4K, 1) => {
-                self.kernels
-                    .gemv_q4_k_f16(out, &w.blocks, x, rows, cols, &self.stream)
+    /// One GEMV per lane, which is what the engine's own batched head does for
+    /// these formats: the Q4_K/Q6_K kernels have no row-count-agnostic batched
+    /// form, and inventing one here would be a kernel choice made without a
+    /// measurement.
+    fn op_logits_of_last(&self, w: WeightId, x: Act, step: &Step) -> Result<()> {
+        let weight = self.quant(w)?;
+        let tokens = step.tokens() as usize;
+        // Wsad dekodowania ma ostatnie tokeny wszystkich lane'ów OBOK SIEBIE,
+        // więc głowa może przemiatać swoje 0,9 GiB raz dla całego wsadu zamiast
+        // raz na lane. Ten wariant istnieje tylko dla Q6_K — a głowa Q4_K_M
+        // jest właśnie Q6_K.
+        if tokens == 1
+            && weight.quant == QuantKind::Q6K
+            && self.kernels.gemv_q6_k_dp4a_batch_out_f32_at(
+                &self.scratch.logits,
+                &weight.blocks,
+                0,
+                self.buf(x),
+                weight.rows,
+                weight.cols,
+                step.lanes().len(),
+                &self.stream,
+            )?
+        {
+            return Ok(());
+        }
+        for lane in 0..step.lanes().len() {
+            let x_off = (lane * tokens + tokens - 1) * self.shape.hidden as usize * 2;
+            let y_off = lane * self.shape.vocab as usize * 4;
+            match weight.quant {
+                QuantKind::Q4K => self.kernels.gemv_q4_k_out_f32(
+                    &self.scratch.logits,
+                    y_off,
+                    &weight.blocks,
+                    self.buf(x),
+                    x_off,
+                    weight.rows,
+                    weight.cols,
+                    &self.stream,
+                )?,
+                _ => self.kernels.gemv_q6_k_out_f32(
+                    &self.scratch.logits,
+                    y_off,
+                    &weight.blocks,
+                    self.buf(x),
+                    x_off,
+                    weight.rows,
+                    weight.cols,
+                    &self.stream,
+                )?,
             }
-            (QuantKind::Q4K, n) => {
-                self.kernels
-                    .gemm_q4_k_f16(out, &w.blocks, x, rows, cols, n as usize, &self.stream)
-            }
-            (_, 1) => self
-                .kernels
-                .gemv_q6_k_f16(out, &w.blocks, x, rows, cols, &self.stream),
-            (_, n) => {
-                self.kernels
-                    .gemm_q6_k_f16(out, &w.blocks, x, rows, cols, n as usize, &self.stream)
-            }
+        }
+        Ok(())
+    }
+
+    fn layer_kv(&self, layer: usize) -> Result<(&DevBuffer, &DevBuffer)> {
+        self.kv
+            .get(layer)
+            .map(|(k, v)| (k, v))
+            .ok_or_else(|| ForgeError::Other(format!("brak cache'u warstwy {layer}")))
+    }
+
+    /// Wiersze jednego lane'a w buforze aktywacji jako własny uchwyt.
+    fn lane_rows(&self, buf: &DevBuffer, lane: usize, rows: usize) -> Result<DevBuffer> {
+        let width = self.shape.hidden as usize * 2;
+        self.device
+            .sub_buffer(buf, lane * rows * width, rows * width)
+    }
+
+    /// `out = x * wagaᵀ`, in the form this row count wants.
+    ///
+    /// Three forms, and the split is between DECODING and a PROMPT rather than
+    /// between one row and many:
+    ///
+    ///   * one row — the vector form, weight-stationary, activations quantized
+    ///     to int8;
+    ///   * a handful of rows — a decode BATCH: one sweep of the weights serves
+    ///     every lane, same int8 activations;
+    ///   * many rows — a prompt tile, activations in f16.
+    ///
+    /// The first two share an arithmetic on purpose. The tile quantizes
+    /// differently, so a lane decoded alone and the same lane decoded in a
+    /// batch would otherwise disagree by 2,5% of the logit spread and pick the
+    /// other token on a tie; sharing it brings that to 0,38%.
+    ///
+    /// The prompt tile is a bad kernel for a decode batch and that had to be
+    /// measured rather than assumed: at three lanes on a DGX Spark the batch
+    /// through `gemm_q4_k_f16` was SLOWER (17,2 tok/s together) than three
+    /// separate sequences, because that tile is built for hundreds of rows and
+    /// four cannot fill its waves. The batch form knows widths 2/4/8/16 and
+    /// refuses outside them, so three lanes fall back to the tile.
+    fn matmul(&self, out: &DevBuffer, w: &Quantized, x: &DevBuffer, rows: u32) -> Result<()> {
+        let (r, c) = (w.rows, w.cols);
+        let q6 = w.quant != QuantKind::Q4K;
+        // Aktywacja idzie do int8 w blokach po 32, a kernel adresuje te bloki
+        // typem, który kończy się na tej szerokości. Szersza projekcja zostaje
+        // przy f16 — wolniej, ale to jedyna z tych trzech form, która nie ma
+        // granicy kolumn.
+        let int8_fits = c <= Kernels::DP4A_MAX_COLS;
+        if rows == 1 {
+            return match (q6, int8_fits) {
+                (true, true) => {
+                    self.kernels
+                        .gemv_q6_k_dp4a_f16(out, &w.blocks, x, r, c, &self.stream)
+                }
+                (false, true) => {
+                    self.kernels
+                        .gemv_q4_k_dp4a_f16(out, &w.blocks, x, r, c, &self.stream)
+                }
+                (true, false) => self
+                    .kernels
+                    .gemv_q6_k_f16(out, &w.blocks, x, r, c, &self.stream),
+                (false, false) => self
+                    .kernels
+                    .gemv_q4_k_f16(out, &w.blocks, x, r, c, &self.stream),
+            };
+        }
+        if int8_fits
+            && self.kernels.gemm_qk_dp4a_batch_at(
+                out,
+                &w.blocks,
+                0,
+                x,
+                r,
+                c,
+                rows as usize,
+                q6,
+                &self.stream,
+            )?
+        {
+            return Ok(());
+        }
+        if q6 {
+            self.kernels
+                .gemm_q6_k_f16(out, &w.blocks, x, r, c, rows as usize, &self.stream)
+        } else {
+            self.kernels
+                .gemm_q4_k_f16(out, &w.blocks, x, r, c, rows as usize, &self.stream)
         }
     }
 }

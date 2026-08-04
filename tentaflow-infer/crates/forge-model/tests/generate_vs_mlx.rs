@@ -13,7 +13,10 @@ use std::path::PathBuf;
 
 use forge_hal::metal_device::MetalDevice;
 use forge_kernels::MetalExec;
-use forge_model::dense::Dense;
+use forge_model::dense::{Dense, Feed};
+
+/// Slot cache'u tych testów. Jedna sekwencja, więc zawsze ten sam.
+const SLOT: usize = 0;
 
 /// Model plus wykonawca. To jedyne miejsce w teście, które wie, co liczy —
 /// `Dense` dostaje wykonawcę jako wytwórnię i nigdy nie pyta, czym on jest.
@@ -122,7 +125,7 @@ fn greedy_generation_matches_mlx_lm_token_for_token() {
 
     let mut got = Vec::with_capacity(oracle.generated.len());
     for (i, &token) in forced.iter().enumerate() {
-        let choice = model.step_argmax(token).expect("krok");
+        let choice = model.decode(&[Feed { slot: SLOT, token }]).expect("krok")[0];
         if i + 1 >= oracle.prompt_ids.len() {
             got.push(choice);
         }
@@ -188,24 +191,24 @@ fn generate_agrees_with_stepping_by_hand() {
     let mut model = open(device, &dir);
 
     let steps = 3usize;
-    let via_api = model.generate(&oracle.prompt_ids, steps).expect("generacja");
+    let via_api = model.generate(SLOT, &oracle.prompt_ids, steps).expect("generacja");
     assert_eq!(via_api.len(), steps);
     assert_eq!(
-        model.position() as usize,
+        model.position(SLOT).expect("pozycja") as usize,
         oracle.prompt_ids.len() + steps - 1,
         "pozycja po generacji"
     );
 
-    model.reset();
+    model.reset(SLOT).expect("reset");
     let mut by_hand = Vec::with_capacity(steps);
     let mut next = 0u32;
     for (i, &token) in oracle.prompt_ids.iter().enumerate() {
-        next = model.step_argmax(token).expect("krok");
+        next = model.decode(&[Feed { slot: SLOT, token }]).expect("krok")[0];
         let _ = i;
     }
     by_hand.push(next);
     for _ in 1..steps {
-        next = model.step_argmax(next).expect("krok");
+        next = model.decode(&[Feed { slot: SLOT, token: next }]).expect("krok")[0];
         by_hand.push(next);
     }
 
@@ -237,17 +240,17 @@ fn a_prompt_longer_than_one_chunk_lands_where_stepping_lands() {
     }
     assert!(prompt.len() > chunk, "prompt mieści się w jednym kaflu");
 
-    let batched = model.prefill(&prompt).expect("prefill");
-    let after = model.position();
+    let batched = model.prefill(SLOT, &prompt).expect("prefill");
+    let after = model.position(SLOT).expect("pozycja");
     assert_eq!(after as usize, prompt.len(), "pozycja po prefillu");
 
-    model.reset();
+    model.reset(SLOT).expect("reset");
     let mut stepped = 0u32;
     for &token in &prompt {
-        stepped = model.step_argmax(token).expect("krok");
+        stepped = model.decode(&[Feed { slot: SLOT, token }]).expect("krok")[0];
     }
     assert_eq!(
-        model.position() as usize,
+        model.position(SLOT).expect("pozycja") as usize,
         prompt.len(),
         "pozycja po krokach"
     );
@@ -292,9 +295,9 @@ fn how_fast_a_prompt_goes_through() {
     let mut batched_times = Vec::new();
     let mut a = 0u32;
     for run in 0..4 {
-        model.reset();
+        model.reset(SLOT).expect("reset");
         let t0 = std::time::Instant::now();
-        a = model.prefill(&prompt).expect("prefill");
+        a = model.prefill(SLOT, &prompt).expect("prefill");
         if run > 0 {
             batched_times.push(t0.elapsed().as_secs_f64());
         }
@@ -302,11 +305,11 @@ fn how_fast_a_prompt_goes_through() {
     batched_times.sort_by(f64::total_cmp);
     let batched = batched_times[batched_times.len() / 2];
 
-    model.reset();
+    model.reset(SLOT).expect("reset");
     let t0 = std::time::Instant::now();
     let mut b = 0u32;
     for &token in &prompt {
-        b = model.step_argmax(token).expect("krok");
+        b = model.decode(&[Feed { slot: SLOT, token }]).expect("krok")[0];
     }
     let stepped = t0.elapsed().as_secs_f64();
 
@@ -361,11 +364,11 @@ fn how_fast_decode_runs() {
 
     let mut times = Vec::new();
     for run in 0..4 {
-        model.reset();
-        let mut token = model.prefill(&prompt).expect("prefill");
+        model.reset(SLOT).expect("reset");
+        let mut token = model.prefill(SLOT, &prompt).expect("prefill");
         let t0 = std::time::Instant::now();
         for _ in 0..STEPS {
-            token = model.step_argmax(token).expect("krok");
+            token = model.decode(&[Feed { slot: SLOT, token }]).expect("krok")[0];
         }
         let dt = t0.elapsed().as_secs_f64();
         // Pierwszy przebieg to rozgrzewka: rezydencja wag i kompilacja.
@@ -415,9 +418,9 @@ fn no_batch_size_falls_off_a_cliff() {
 
         let mut best = f64::INFINITY;
         for _ in 0..3 {
-            model.reset();
+            model.reset(SLOT).expect("reset");
             let t0 = std::time::Instant::now();
-            model.prefill(&prompt).expect("prefill");
+            model.prefill(SLOT, &prompt).expect("prefill");
             best = best.min(t0.elapsed().as_secs_f64());
         }
         let us = best * 1e6 / n as f64;
@@ -482,14 +485,14 @@ fn the_cpu_share_computes_the_same_thing_as_the_gpu_alone() {
     prompt.truncate(256);
 
     model.exec_mut().set_cpu_share(false);
-    model.reset();
-    model.prefill(&prompt).expect("prefill bez podziału");
-    let alone = model.logits().expect("logity bez podziału");
+    model.reset(SLOT).expect("reset");
+    model.prefill(SLOT, &prompt).expect("prefill bez podziału");
+    let alone = model.logits(0).expect("logity bez podziału");
 
     model.exec_mut().set_cpu_share(true);
-    model.reset();
-    model.prefill(&prompt).expect("prefill z podziałem");
-    let shared = model.logits().expect("logity z podziałem");
+    model.reset(SLOT).expect("reset");
+    model.prefill(SLOT, &prompt).expect("prefill z podziałem");
+    let shared = model.logits(0).expect("logity z podziałem");
 
     assert_eq!(alone.len(), shared.len());
     let mut worst = 0.0f32;

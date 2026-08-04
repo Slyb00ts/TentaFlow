@@ -579,6 +579,15 @@ forward pass, scheduler queue) / server+cli (OpenAI API). Kernel toolchain:
 E2E proven: Bielik-PL-Minitron-7B-NVFP4 (software FP4 dequant) generates
 coherent Polish on the RTX 4090.
 
+Obok silnika rośnie DRUGI układ, opisany w `docs/ARCHITEKTURA_DOCELOWA.md`:
+model jest CIĄGIEM OPERACJI (`forge-graph`), a nie ciągiem wywołań na
+urządzeniu. `forge-model` emituje `Op` i nie zna ani HAL-a, ani kerneli; ten sam
+opis liczą trzy wykonawcy tego samego kontraktu — Metal, wzorzec hostowy w f32
+(wyrocznia, działa bez akceleratora) i `CudaExec`. Postać wagi i stronicowanie
+KV należą do WYKONAWCY, nie do modelu. Silnik z `forge-engine` zostaje bez
+zmian; zacznie chudnąć dopiero, gdy słownictwo obejmie fuzję (kroki §7
+`docs/ZADANIE_CUDA_EXECUTOR.md`).
+
 ### Ścieżka NVFP4/FP8
 
 - Dla katalogowego checkpointu brak `FORGE_GEMM` automatycznie próbuje włączyć

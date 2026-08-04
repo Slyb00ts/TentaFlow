@@ -79,7 +79,7 @@ Nowych kerneli nie trzeba, bo każda operacja słownictwa ma już launcher w
 | `MatMul` (Q4_K / Q6_K) | `gemv_q4_k_f16`, `gemv_q6_k_f16`, `gemm_q4_k_f16`, `gemm_q6_k_f16` (`gemm/quantized/k_quants.rs`) |
 | `RmsNorm` | `rmsnorm_f16` (`norm.rs`) |
 | `Rope` | `rope_neox_f16` (`attention.rs`) — nasz RoPE jest NeoX, patrz §5 |
-| `Attention` | `attn_full_f16` (`attention.rs`) — ciągłe K/V, bo bez stron |
+| `Attention` | `attn_full_f16` w kamieniu 1; po kroku §7.2 `attn_prefill` i `attn_decode_f16` nad stronami |
 | `SiluMul` | `glu_mul_f16` (`elementwise.rs`) |
 | `Residual` | `residual_add_f16` (`elementwise.rs`) — DOPISANY, patrz §0 |
 | `Embed` | `gather_q4_k_row_f16` (`k_quants.rs`) |
@@ -179,16 +179,59 @@ Wszystkie dały poprawnie wyglądające zdania i żadna nie dała awarii:
 W tej kolejności, każdy krok z własnym testem:
 
 1. **Lane'y wsadu** w `Op` (`tokens` → `[B, T]`) — bo `prefill_forward_lanes`
-   silnika i `batched_decode` bez tego nie mają jak powstać.
+   silnika i `batched_decode` bez tego nie mają jak powstać. **ZROBIONE.**
+   `tokens: u32` w każdej operacji zastąpił `Step`: lista lane'ów (slot cache'u
+   plus pozycja pierwszego tokenu) i liczba tokenów na lane. JEDNA lista dla
+   wszystkich operacji kroku, bo rozjazd między „ile wierszy mnoży projekcja" a
+   „ile lane'ów czyta uwaga" nie jest błędem kompilacji, tylko cudzym kontekstem
+   w odpowiedzi. Model dostał sloty (`prefill(slot, …)`, `decode(&[Feed])`),
+   `Executor::argmax` zwraca wybór na lane, a `Tile` niesie `max_lanes`.
 2. **Stronicowane KV** jako kontrakt wykonawcy, nie modelu: `KvAppend` i
    `Attention` już dziś biorą tylko numer warstwy i pozycję, więc stronicowanie
-   może zostać po stronie `CudaExec`. Sprawdzić, czy naprawdę może.
+   może zostać po stronie `CudaExec`. Sprawdzić, czy naprawdę może. **ZROBIONE,
+   i naprawdę może.** Cache jest stronicowany (strona 256 tokenów, lista wolnych
+   stron, tablica stron budowana per krok), a słownictwo nie zyskało ani jednego
+   pola: lane niesie slot i pozycję, reszta jest sprawą tego, kto trzyma pamięć.
+   Sekwencja startująca od pozycji zero oddaje swoje strony — wywnioskowane z
+   danych, bo czasownik „zapomnij tę sekwencję" byłby szerszym kontraktem
+   kupionym za nic. Budżet stron pyta pulę KV o wolne miejsce zamiast rezerwować
+   `lane'y * seq_cap`, czyli dokładnie to, przed czym stronicowanie ma chronić.
 3. **Fuzja jako pass nad `Vec<Op>`** — `gemv_norm_*`, `gemv_norm_silu_*`,
    `gemv_residual_*` istnieją i są tym, czym silnik dziś ręcznie składa trzy
    łańcuchy dekodowania. Pass rozpoznaje parę `RmsNorm`+`MatMul` i
    `MatMul`+`Residual` i podmienia je na operację scaloną.
 4. **Dopiero teraz** silnik może zacząć chudnąć, bo dopiero teraz kontrakt
    wyraża to, co on robi.
+
+### Co pomiar powiedział o krokach 1–2
+
+Bielik-Minitron-7B Q4_K_M, DGX Spark, jeden przebieg na raz:
+
+| | dekodowanie | łącznie |
+|---|--:|--:|
+| jedna sekwencja | 35,7 tok/s | 35,7 tok/s |
+| cztery lane'y | 33,5 tok/s na sekwencję | **133,9 tok/s** |
+
+Czterokrotny wsad kosztuje 6% na sekwencję, czyli 3,8x łącznie — i to jest cała
+racja bytu lane'ów: dekodowanie czyta CAŁĄ macierz na krok, więc sekwencje mają
+co dzielić.
+
+Dwie rzeczy trzeba było przy tym zmierzyć, a nie założyć:
+
+- **Kafel prefillu jest złym kernelem dla wsadu dekodowania.** Przy trzech
+  lane'ach wsad przez `gemm_q4_k_f16` był WOLNIEJSZY (17,2 tok/s łącznie) niż
+  trzy osobne sekwencje: ten kafel jest zbudowany pod setki wierszy i przy
+  trzech nie ma czym wypełnić fal. Wsad idzie więc przez
+  `gemm_qk_dp4a_batch_at` — jedno przemiecenie wag na cały wsad — i to samo
+  robi głowa wyjściowa Q6_K. Kernel zna szerokości 2/4/8/16 i sam odmawia poza
+  nimi, więc trzy lane'y wracają na kafel.
+- **Dekodowanie jednej sekwencji też należało przenieść na tę arytmetykę.**
+  Wsad kwantyzuje aktywacje do int8, a `gemv_q4_k_f16` liczył je w f16, więc
+  przy różnych ścieżkach ten sam kontekst dostawał logity różne o 2,5%
+  rozpiętości i przy remisie inny token. Po ujednoliceniu różnica spada do
+  0,38%, a dekodowanie jednej sekwencji przyspiesza z 21,0 do 35,7 tok/s.
+  Zostają więc DWA reżimy liczbowe i to jest własność, nie usterka: prefill
+  mnoży w f16 (0,019% wobec wzorca), dekodowanie w int8 (0,572%).
 
 ## 8. Konwencje repozytorium
 

@@ -16,7 +16,7 @@
 mod common;
 
 use forge_kernels::HostExec;
-use forge_model::dense::Dense;
+use forge_model::dense::{Dense, Feed};
 
 /// Around fifteen seconds a token, and NOT marked ignored for it. A reference
 /// nobody runs is a reference nobody can trust, and the machines that most need
@@ -41,7 +41,10 @@ fn the_host_reference_decodes_the_same_tokens_as_mlx_lm() {
     // nie odpowiadając na nowe pytanie.
     for (step, &token) in oracle.tokens.iter().take(2).enumerate() {
         let t = std::time::Instant::now();
-        let got = model.step(token).expect("krok dekodowania");
+        model
+            .decode(&[Feed { slot: 0, token }])
+            .expect("krok dekodowania");
+        let got = model.logits(0).expect("logity");
         let want = &oracle.logits[step];
         assert_eq!(got.len(), want.len());
 
