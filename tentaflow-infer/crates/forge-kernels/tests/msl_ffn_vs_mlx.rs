@@ -187,12 +187,12 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
     // Bramka i projekcje po niej licza na wejsciu w half, bo tak trzyma
     // aktywacje MLX i tak trzyma je model — f32 byloby tu inna sciezka niz ta,
     // ktora dziala naprawde.
-    let qmv_src = msl::qmv_affine_4bit_source(scales, OutDtype::F16);
+    let qmv_src = msl::qmv_affine_source(msl::Bits::Four, scales, OutDtype::F16);
     let qmv = gpu
         .dev
         .load_module(qmv_src.as_bytes())
         .unwrap()
-        .kernel(&msl::qmv_affine_4bit_name(scales, OutDtype::F16))
+        .kernel(&msl::qmv_affine_name(msl::Bits::Four, scales, OutDtype::F16))
         .unwrap();
     let norm_src = msl::rmsnorm_source(scales);
     let rmsnorm = gpu
@@ -365,12 +365,12 @@ fn each_kernel_is_also_checked_in_isolation() {
     let gpu = Gpu { dev, stream };
     let scales = ScaleDtype::Bf16;
 
-    let qmv_src = msl::qmv_affine_4bit_source(scales, OutDtype::F32);
+    let qmv_src = msl::qmv_affine_source(msl::Bits::Four, scales, OutDtype::F32);
     let qmv = gpu
         .dev
         .load_module(qmv_src.as_bytes())
         .unwrap()
-        .kernel(&msl::qmv_affine_4bit_name(scales, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(msl::Bits::Four, scales, OutDtype::F32))
         .unwrap();
     let (hidden, inter) = (f.hidden, f.inter);
 

@@ -317,9 +317,9 @@ fn the_batched_form_agrees_with_the_vector_form_bit_for_bit() {
     let mm_kernel = mm.kernel(&msl::qmm_affine_4bit_name(sd, od)).unwrap();
     let mv = g
         .dev
-        .load_module(msl::qmv_affine_4bit_source(sd, od).as_bytes())
+        .load_module(msl::qmv_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mv_kernel = mv.kernel(&msl::qmv_affine_4bit_name(sd, od)).unwrap();
+    let mv_kernel = mv.kernel(&msl::qmv_affine_name(msl::Bits::Four, sd, od)).unwrap();
 
     let c = &cases[0];
     let packed = g.upload(&c.packed);
@@ -429,9 +429,9 @@ fn how_much_the_tile_actually_buys() {
     let mm_kernel = mm.kernel(&msl::qmm_affine_4bit_name(sd, od)).unwrap();
     let mv = g
         .dev
-        .load_module(msl::qmv_affine_4bit_source(sd, od).as_bytes())
+        .load_module(msl::qmv_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mv_kernel = mv.kernel(&msl::qmv_affine_4bit_name(sd, od)).unwrap();
+    let mv_kernel = mv.kernel(&msl::qmv_affine_name(msl::Bits::Four, sd, od)).unwrap();
     let mg = g
         .dev
         .load_module(msl::qmg_affine_4bit_source(sd, od).as_bytes())

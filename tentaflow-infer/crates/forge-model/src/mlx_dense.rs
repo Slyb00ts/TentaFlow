@@ -277,12 +277,12 @@ impl MlxDense {
         };
         let pipes = Pipelines {
             qmv_f16: compile(
-                &msl::qmv_affine_4bit_source(scales_dtype, OutDtype::F16),
-                &msl::qmv_affine_4bit_name(scales_dtype, OutDtype::F16),
+                &msl::qmv_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F16),
+                &msl::qmv_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F16),
             )?,
             qmv_f32: compile(
-                &msl::qmv_affine_4bit_source(scales_dtype, OutDtype::F32),
-                &msl::qmv_affine_4bit_name(scales_dtype, OutDtype::F32),
+                &msl::qmv_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F32),
+                &msl::qmv_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F32),
             )?,
             qmm_f16: compile(
                 &msl::qmm_affine_4bit_source(scales_dtype, OutDtype::F16),

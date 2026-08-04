@@ -95,10 +95,10 @@ fn dequant_gemv_matches_mlx_on_real_weights() {
     };
     // Bielik jest konwertowany przez mlx-lm, czyli skale w bf16.
     let scale_dtype = ScaleDtype::Bf16;
-    let source = msl::qmv_affine_4bit_source(scale_dtype, OutDtype::F32);
+    let source = msl::qmv_affine_source(msl::Bits::Four, scale_dtype, OutDtype::F32);
     let module = dev.load_module(source.as_bytes()).unwrap();
     let kernel = module
-        .kernel(&msl::qmv_affine_4bit_name(scale_dtype, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(msl::Bits::Four, scale_dtype, OutDtype::F32))
         .unwrap();
     let stream = dev.create_stream().unwrap();
 
@@ -189,10 +189,10 @@ fn a_wrong_group_size_is_visible_in_the_result() {
         return;
     };
     let c = &cases[0];
-    let source = msl::qmv_affine_4bit_source(ScaleDtype::Bf16, OutDtype::F32);
+    let source = msl::qmv_affine_source(msl::Bits::Four, ScaleDtype::Bf16, OutDtype::F32);
     let module = dev.load_module(source.as_bytes()).unwrap();
     let kernel = module
-        .kernel(&msl::qmv_affine_4bit_name(ScaleDtype::Bf16, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(msl::Bits::Four, ScaleDtype::Bf16, OutDtype::F32))
         .unwrap();
     let stream = dev.create_stream().unwrap();
 
@@ -267,4 +267,104 @@ fn cosine(got: &[f32], want: &[f32]) -> f64 {
         nb += v * v;
     }
     dot / (na.sqrt() * nb.sqrt()).max(1e-300)
+}
+
+/// Sześć bitów liczy tę samą formułę, więc jedyne, co może się rozjechać, to
+/// wyłuskanie kodu — a to widać dopiero na GPU, nie w generatorze.
+///
+/// Wzorcem jest tu CPU: te same wagi rozpakowane w Ruście i pomnożone w f64,
+/// żeby porównanie nie mierzyło błędu drugiej implementacji GPU.
+#[test]
+fn six_bit_gemv_agrees_with_the_cpu_reference() {
+    let Ok(dev) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    const ROWS: usize = 64;
+    const COLS: usize = 256;
+    const GROUP: usize = 16;
+
+    // Kody 0..63, skale i przesunięcia w f16 — jak po konwersji z Q6_K.
+    let codes: Vec<u8> = (0..ROWS * COLS).map(|i| ((i * 7 + 11) % 64) as u8).collect();
+    let groups = ROWS * COLS / GROUP;
+    let scales: Vec<half::f16> = (0..groups)
+        .map(|i| half::f16::from_f32(0.002 + (i % 5) as f32 * 0.0003))
+        .collect();
+    let biases: Vec<half::f16> = (0..groups)
+        .map(|i| half::f16::from_f32(-0.03 - (i % 3) as f32 * 0.001))
+        .collect();
+    let x: Vec<half::f16> = (0..COLS)
+        .map(|i| half::f16::from_f32((i % 11) as f32 * 0.05 - 0.25))
+        .collect();
+
+    let mut packed = vec![0u32; ROWS * COLS / 8];
+    let mut high = vec![0u32; ROWS * COLS / 16];
+    for (i, &c) in codes.iter().enumerate() {
+        packed[i / 8] |= u32::from(c & 0xF) << ((i % 8) * 4);
+        high[i / 16] |= u32::from((c >> 4) & 0x3) << ((i % 16) * 2);
+    }
+
+    let want: Vec<f64> = (0..ROWS)
+        .map(|r| {
+            (0..COLS)
+                .map(|c| {
+                    let g = r * (COLS / GROUP) + c / GROUP;
+                    let w = f64::from(codes[r * COLS + c]) * f64::from(scales[g])
+                        + f64::from(biases[g]);
+                    f64::from(x[c]) * w
+                })
+                .sum()
+        })
+        .collect();
+
+    let source = msl::qmv_affine_source(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32);
+    let module = dev.load_module(source.as_bytes()).unwrap();
+    let kernel = module
+        .kernel(&msl::qmv_affine_name(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32))
+        .unwrap();
+    let stream = dev.create_stream().unwrap();
+    let up = |b: &[u8]| {
+        let buf = dev.alloc(b.len(), MemKind::Device, Pool::Weights).unwrap();
+        dev.write(b, &buf, 0).unwrap();
+        buf
+    };
+    let out = dev.alloc(ROWS * 4, MemKind::Device, Pool::Activations).unwrap();
+    dev.launch(
+        &kernel,
+        &LaunchConfig {
+            grid: (msl::qmv_affine_4bit_groups(ROWS as u32), 1, 1),
+            block: (msl::QMV_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &LaunchArgs::new()
+            .buf(&out)
+            .buf(&up(bytemuck::cast_slice(&packed)))
+            .buf(&up(bytemuck::cast_slice(&scales)))
+            .buf(&up(bytemuck::cast_slice(&biases)))
+            .buf(&up(bytemuck::cast_slice(&x)))
+            .buf(&up(bytemuck::cast_slice(&high)))
+            .scalar(ROWS as u32)
+            .scalar(COLS as u32)
+            .scalar(GROUP as u32),
+        &stream,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let mut raw = vec![0u8; ROWS * 4];
+    dev.read(&out, 0, &mut raw).unwrap();
+    let got: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    let span = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+    let mut worst = 0f64;
+    for (g, w) in got.iter().zip(&want) {
+        worst = worst.max((f64::from(*g) - w).abs());
+    }
+    assert!(
+        worst <= span * 1e-3,
+        "sześć bitów rozjeżdża się z wzorcem: {worst:.3e} przy zakresie {span:.3e}"
+    );
 }
