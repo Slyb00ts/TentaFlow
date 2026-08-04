@@ -125,11 +125,20 @@ termicznie, więc dwa osobne uruchomienia porównywałyby temperatury). Prompt
 | **stosunek** | — | **0,85–0,93** | — | **0,65** |
 
 **Absolutne liczby z tego dnia są zaniżone i nie wolno ich zestawiać z
-EKS-A7.** W tej samej sesji `how_fast_decode_runs` pokazał 67,1 GB/s
-przepustowości wag wobec 89,0 GB/s zapisanych wcześniej — czyli maszyna
-pracowała na około trzech czwartych swoich możliwości. Dekodowanie jest
-ograniczone pasmem, więc to jest miara stanu maszyny, a nie ścieżki. Wiarygodny
-jest STOSUNEK, mierzony w tej samej sesji.
+EKS-A7.** Sprawdzone, a nie założone: `47a804dc` — czyli DOKŁADNIE ten commit,
+na którym powstało EKS-A7 — wykonany tego samego dnia daje 15,4 tok/s przy
+64,9 GB/s zamiast zapisanych 21,1 przy 89,0. HEAD po całym refaktorze daje
+15,3-15,9 przy 64,6-66,8. Ten sam kod, ta sama maszyna, 27% mniej pasma.
+
+Przyczyna: `sysctl vm.swapusage` pokazał 4,5 GB użytego swapu z 6,1 GB na
+maszynie z 16 GB RAM. Dekodowanie czyta 4,2 GB wag na KAŻDY token, więc pod
+presją pamięci efektywne pasmo się załamuje, a z nim cała ścieżka. Tryb
+oszczędzania jest wyłączony, zasilanie sieciowe, `pmset` nie odnotował
+ostrzeżenia termicznego — to pamięć, nie temperatura.
+
+Wniosek dla następnego pomiaru: liczby bezwzględne bierz z maszyny po
+restarcie, z jednym modelem naraz. Wiarygodny bez tego jest wyłącznie STOSUNEK,
+mierzony przeplatanie w tej samej sesji.
 
 Dekodowanie: **GGUF jest o 35% wolniejszy**, przy przewidywanym z rozmiaru
 sufitcie −6,5%. Różnica nie bierze się więc z bajtów, tylko z wyłuskania kodu:
