@@ -153,9 +153,9 @@ fn batched_matmul_is_no_further_from_the_truth_than_mlx() {
     let (sd, od) = (ScaleDtype::Bf16, OutDtype::F32);
     let module = g
         .dev
-        .load_module(msl::qmm_affine_4bit_source(sd, od).as_bytes())
+        .load_module(msl::qmm_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let kernel = module.kernel(&msl::qmm_affine_4bit_name(sd, od)).unwrap();
+    let kernel = module.kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od)).unwrap();
 
     for c in &cases {
         let packed = g.upload(&c.packed);
@@ -236,9 +236,9 @@ fn the_matrix_unit_form_is_no_further_from_the_truth_than_mlx() {
     let (sd, od) = (ScaleDtype::Bf16, OutDtype::F32);
     let module = g
         .dev
-        .load_module(msl::qmg_affine_4bit_source(sd, od).as_bytes())
+        .load_module(msl::qmg_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let kernel = module.kernel(&msl::qmg_affine_4bit_name(sd, od)).unwrap();
+    let kernel = module.kernel(&msl::qmg_affine_name(msl::Bits::Four, sd, od)).unwrap();
 
     for c in &cases {
         assert!(
@@ -312,9 +312,9 @@ fn the_batched_form_agrees_with_the_vector_form_bit_for_bit() {
     let (sd, od) = (ScaleDtype::Bf16, OutDtype::F32);
     let mm = g
         .dev
-        .load_module(msl::qmm_affine_4bit_source(sd, od).as_bytes())
+        .load_module(msl::qmm_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mm_kernel = mm.kernel(&msl::qmm_affine_4bit_name(sd, od)).unwrap();
+    let mm_kernel = mm.kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od)).unwrap();
     let mv = g
         .dev
         .load_module(msl::qmv_affine_source(msl::Bits::Four, sd, od).as_bytes())
@@ -424,9 +424,9 @@ fn how_much_the_tile_actually_buys() {
     let (sd, od) = (ScaleDtype::Bf16, OutDtype::F32);
     let mm = g
         .dev
-        .load_module(msl::qmm_affine_4bit_source(sd, od).as_bytes())
+        .load_module(msl::qmm_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mm_kernel = mm.kernel(&msl::qmm_affine_4bit_name(sd, od)).unwrap();
+    let mm_kernel = mm.kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od)).unwrap();
     let mv = g
         .dev
         .load_module(msl::qmv_affine_source(msl::Bits::Four, sd, od).as_bytes())
@@ -434,9 +434,9 @@ fn how_much_the_tile_actually_buys() {
     let mv_kernel = mv.kernel(&msl::qmv_affine_name(msl::Bits::Four, sd, od)).unwrap();
     let mg = g
         .dev
-        .load_module(msl::qmg_affine_4bit_source(sd, od).as_bytes())
+        .load_module(msl::qmg_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mg_kernel = mg.kernel(&msl::qmg_affine_4bit_name(sd, od)).unwrap();
+    let mg_kernel = mg.kernel(&msl::qmg_affine_name(msl::Bits::Four, sd, od)).unwrap();
 
     // Pełny kształt warstwy, nie wycinek z fikstury. To jest cała różnica:
     // 128 wierszy Bielika to 720 KB wagi, która mieści się w cache, więc pętla
@@ -540,6 +540,137 @@ fn how_much_the_tile_actually_buys() {
             batched * 1e6 / tokens as f64,
             looped * 1e6,
             looped / matrix
+        );
+    }
+}
+
+/// Obie formy prefillowe na sześciu bitach, przypięte do formy wektorowej.
+///
+/// Wektorowa jest już przypięta do wzorca CPU, więc porównanie z nią sprawdza
+/// dokładnie to, co może się rozjechać: czy blokowa i macierzowa wyłuskują kod
+/// tak samo, mimo że robią to w innym miejscu pętli.
+#[test]
+fn the_six_bit_prefill_forms_agree_with_the_vector_form() {
+    let Ok(dev) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    const ROWS: usize = 128;
+    const COLS: usize = 256;
+    const GROUP: usize = 16;
+    const TOKENS: usize = 64;
+
+    let codes: Vec<u8> = (0..ROWS * COLS).map(|i| ((i * 13 + 5) % 64) as u8).collect();
+    let groups = ROWS * COLS / GROUP;
+    let scales: Vec<half::f16> = (0..groups)
+        .map(|i| half::f16::from_f32(0.0015 + (i % 7) as f32 * 0.0002))
+        .collect();
+    let biases: Vec<half::f16> = (0..groups)
+        .map(|i| half::f16::from_f32(-0.02 - (i % 4) as f32 * 0.0008))
+        .collect();
+    let x: Vec<half::f16> = (0..TOKENS * COLS)
+        .map(|i| half::f16::from_f32((i % 13) as f32 * 0.04 - 0.24))
+        .collect();
+
+    let mut packed = vec![0u32; ROWS * COLS / 8];
+    let mut high = vec![0u32; ROWS * COLS / 16];
+    for (i, &c) in codes.iter().enumerate() {
+        packed[i / 8] |= u32::from(c & 0xF) << ((i % 8) * 4);
+        high[i / 16] |= u32::from((c >> 4) & 0x3) << ((i % 16) * 2);
+    }
+
+    let stream = dev.create_stream().unwrap();
+    let up = |b: &[u8]| {
+        let buf = dev.alloc(b.len(), MemKind::Device, Pool::Weights).unwrap();
+        dev.write(b, &buf, 0).unwrap();
+        buf
+    };
+    let (bp, bs, bb, bx, bh) = (
+        up(bytemuck::cast_slice(&packed)),
+        up(bytemuck::cast_slice(&scales)),
+        up(bytemuck::cast_slice(&biases)),
+        up(bytemuck::cast_slice(&x)),
+        up(bytemuck::cast_slice(&high)),
+    );
+
+    // Wzorzec: forma wektorowa, token po tokenie.
+    let vec_src = msl::qmv_affine_source(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32);
+    let vec_mod = dev.load_module(vec_src.as_bytes()).unwrap();
+    let vec_k = vec_mod
+        .kernel(&msl::qmv_affine_name(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32))
+        .unwrap();
+    let mut want = vec![0f32; TOKENS * ROWS];
+    for t in 0..TOKENS {
+        let row = dev.alloc(ROWS * 4, MemKind::Device, Pool::Activations).unwrap();
+        let xt = up(bytemuck::cast_slice(&x[t * COLS..(t + 1) * COLS]));
+        dev.launch(
+            &vec_k,
+            &LaunchConfig {
+                grid: (msl::qmv_affine_4bit_groups(ROWS as u32), 1, 1),
+                block: (msl::QMV_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(&row).buf(&bp).buf(&bs).buf(&bb).buf(&xt).buf(&bh)
+                .scalar(ROWS as u32).scalar(COLS as u32).scalar(GROUP as u32),
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let mut raw = vec![0u8; ROWS * 4];
+        dev.read(&row, 0, &mut raw).unwrap();
+        for (r, c) in raw.chunks_exact(4).enumerate() {
+            want[t * ROWS + r] = f32::from_le_bytes(c.try_into().unwrap());
+        }
+    }
+
+    for (label, src, name, grid, threads) in [
+        (
+            "blokowa",
+            msl::qmm_affine_source(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32),
+            msl::qmm_affine_name(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32),
+            msl::qmm_affine_4bit_groups(ROWS as u32, TOKENS as u32),
+            msl::QMM_THREADS,
+        ),
+        (
+            "macierzowa",
+            msl::qmg_affine_source(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32),
+            msl::qmg_affine_name(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32),
+            msl::qmg_affine_4bit_groups(ROWS as u32, TOKENS as u32),
+            msl::QMG_THREADS,
+        ),
+    ] {
+        let module = dev.load_module(src.as_bytes()).unwrap();
+        let kernel = module.kernel(&name).unwrap();
+        let out = dev
+            .alloc(TOKENS * ROWS * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
+        dev.launch(
+            &kernel,
+            &LaunchConfig {
+                grid: (grid.0, grid.1, 1),
+                block: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(&out).buf(&bp).buf(&bs).buf(&bb).buf(&bx).buf(&bh)
+                .scalar(ROWS as u32).scalar(COLS as u32).scalar(GROUP as u32)
+                .scalar(TOKENS as u32),
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let mut raw = vec![0u8; TOKENS * ROWS * 4];
+        dev.read(&out, 0, &mut raw).unwrap();
+
+        let span = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let mut worst = 0f32;
+        for (i, c) in raw.chunks_exact(4).enumerate() {
+            worst = worst.max((f32::from_le_bytes(c.try_into().unwrap()) - want[i]).abs());
+        }
+        assert!(
+            worst <= span * 2e-3,
+            "forma {label} na sześciu bitach rozjeżdża się z wektorową: {worst:.3e} przy {span:.3e}"
         );
     }
 }

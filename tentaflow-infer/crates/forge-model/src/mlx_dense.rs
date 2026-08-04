@@ -285,20 +285,20 @@ impl MlxDense {
                 &msl::qmv_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F32),
             )?,
             qmm_f16: compile(
-                &msl::qmm_affine_4bit_source(scales_dtype, OutDtype::F16),
-                &msl::qmm_affine_4bit_name(scales_dtype, OutDtype::F16),
+                &msl::qmm_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F16),
+                &msl::qmm_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F16),
             )?,
             qmm_f32: compile(
-                &msl::qmm_affine_4bit_source(scales_dtype, OutDtype::F32),
-                &msl::qmm_affine_4bit_name(scales_dtype, OutDtype::F32),
+                &msl::qmm_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F32),
+                &msl::qmm_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F32),
             )?,
             qmg_f16: compile(
-                &msl::qmg_affine_4bit_source(scales_dtype, OutDtype::F16),
-                &msl::qmg_affine_4bit_name(scales_dtype, OutDtype::F16),
+                &msl::qmg_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F16),
+                &msl::qmg_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F16),
             )?,
             qmg_f32: compile(
-                &msl::qmg_affine_4bit_source(scales_dtype, OutDtype::F32),
-                &msl::qmg_affine_4bit_name(scales_dtype, OutDtype::F32),
+                &msl::qmg_affine_source(msl::Bits::Four, scales_dtype, OutDtype::F32),
+                &msl::qmg_affine_name(msl::Bits::Four, scales_dtype, OutDtype::F32),
             )?,
             rmsnorm: compile(
                 &msl::rmsnorm_source(norm_dtype),

@@ -140,9 +140,10 @@ pub const QMM_ROWS_PER_GROUP: u32 = 32;
 pub const QMM_THREADS: u32 = (QMM_ROWS_PER_GROUP / QMM_ROWS_PER_SIMD) * 32;
 
 /// Entry-point name for the batched form.
-pub fn qmm_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
+pub fn qmm_affine_name(bits: Bits, scales: ScaleDtype, out: OutDtype) -> String {
     format!(
-        "qmm_affine_4bit_r{}s{}t{}_{}_out{}",
+        "qmm_affine_{}_r{}s{}t{}_{}_out{}",
+        bits.suffix(),
         QMM_ROWS_PER_GROUP,
         QMM_ROWS_PER_SIMD,
         QMM_TILE,
@@ -171,10 +172,17 @@ pub fn qmm_affine_4bit_groups(n_rows: u32, n_tokens: u32) -> (u32, u32) {
 /// tile before the next word is read. That ordering is the whole point: it is
 /// what turns one pass over a multi-gigabyte matrix into eight tokens of work
 /// instead of one.
-pub fn qmm_affine_4bit_source(scales: ScaleDtype, out: OutDtype) -> String {
+pub fn qmm_affine_source(bits: Bits, scales: ScaleDtype, out: OutDtype) -> String {
+    let high_param = bits.high_param(5);
+    let high_word = bits.high_word_at("rr", "col0");
+    let code = bits.code("j");
+    let (b_rows, b_cols, b_group, b_tokens) = match bits {
+        Bits::Four => (5, 6, 7, 8),
+        Bits::Six => (6, 7, 8, 9),
+    };
     let ty = scales.msl();
     let out_ty = out.msl();
-    let name = qmm_affine_4bit_name(scales, out);
+    let name = qmm_affine_name(bits, scales, out);
     format!(
         r#"
 #include <metal_stdlib>
@@ -186,10 +194,10 @@ kernel void {name}(
     device const {ty}*    scales   [[buffer(2)]],
     device const {ty}*    biases   [[buffer(3)]],
     device const half*    x        [[buffer(4)]],
-    constant uint&        n_rows   [[buffer(5)]],
-    constant uint&        n_cols   [[buffer(6)]],
-    constant uint&        group    [[buffer(7)]],
-    constant uint&        n_tokens [[buffer(8)]],
+{high_param}    constant uint&        n_rows   [[buffer({b_rows})]],
+    constant uint&        n_cols   [[buffer({b_cols})]],
+    constant uint&        group    [[buffer({b_group})]],
+    constant uint&        n_tokens [[buffer({b_tokens})]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint  sg   [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
@@ -232,8 +240,9 @@ kernel void {name}(
             const uint bits = packed[rr * words_per_row + word];
             const float sc  = float(scales[rr * groups_per_row + g]);
             const float bi  = float(biases[rr * groups_per_row + g]);
+            {high_word}
             for (uint j = 0; j < 8u; ++j) {{
-                wv[r][j] = fma(float((bits >> (j * 4u)) & 0xFu), sc, bi);
+                wv[r][j] = fma(float({code}), sc, bi);
             }}
         }}
 
@@ -259,6 +268,13 @@ kernel void {name}(
         name = name,
         ty = ty,
         out_ty = out_ty,
+        high_param = high_param,
+        high_word = high_word,
+        code = code,
+        b_rows = b_rows,
+        b_cols = b_cols,
+        b_group = b_group,
+        b_tokens = b_tokens,
         rows = QMM_ROWS_PER_GROUP,
         per_simd = QMM_ROWS_PER_SIMD,
         tile = QMM_TILE,
@@ -284,9 +300,10 @@ pub const QMG_SG_M: u32 = 2;
 pub const QMG_SG_N: u32 = 2;
 pub const QMG_THREADS: u32 = QMG_SG_M * QMG_SG_N * 32;
 
-pub fn qmg_affine_4bit_name(scales: ScaleDtype, out: OutDtype) -> String {
+pub fn qmg_affine_name(bits: Bits, scales: ScaleDtype, out: OutDtype) -> String {
     format!(
-        "qmg_affine_4bit_m{}n{}k{}_{}_out{}",
+        "qmg_affine_{}_m{}n{}k{}_{}_out{}",
+        bits.suffix(),
         QMG_BM,
         QMG_BN,
         QMG_BK,
@@ -316,10 +333,17 @@ pub fn qmg_fits(n_rows: u32, n_cols: u32) -> bool {
 /// sums its own way — so this kernel is not bit-comparable with decode. It is
 /// held to the same numerical gate instead: no further from an f64 truth than
 /// MLX itself.
-pub fn qmg_affine_4bit_source(scales: ScaleDtype, out: OutDtype) -> String {
+pub fn qmg_affine_source(bits: Bits, scales: ScaleDtype, out: OutDtype) -> String {
+    let high_param = bits.high_param(5);
+    let qmg_high = bits.high_word_at("rr", "col");
+    let qmg_code = bits.code("j");
+    let (b_rows, b_cols, b_group, b_tokens) = match bits {
+        Bits::Four => (5, 6, 7, 8),
+        Bits::Six => (6, 7, 8, 9),
+    };
     let ty = scales.msl();
     let out_ty = out.msl();
-    let name = qmg_affine_4bit_name(scales, out);
+    let name = qmg_affine_name(bits, scales, out);
     let (fm, fn_) = (QMG_BM / QMG_SG_M / 8, QMG_BN / QMG_SG_N / 8);
     let stage_halfs = 2 * (QMG_BM * QMG_BK + QMG_BK * QMG_BN);
 
@@ -362,10 +386,10 @@ kernel void {name}(
     device const {ty}*    scales   [[buffer(2)]],
     device const {ty}*    biases   [[buffer(3)]],
     device const half*    x        [[buffer(4)]],
-    constant uint&        n_rows   [[buffer(5)]],
-    constant uint&        n_cols   [[buffer(6)]],
-    constant uint&        group    [[buffer(7)]],
-    constant uint&        n_tokens [[buffer(8)]],
+{high_param}    constant uint&        n_rows   [[buffer({b_rows})]],
+    constant uint&        n_cols   [[buffer({b_cols})]],
+    constant uint&        group    [[buffer({b_group})]],
+    constant uint&        n_tokens [[buffer({b_tokens})]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint  sg   [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
@@ -423,8 +447,9 @@ kernel void {name}(
         const uint bits = packed[rr * words_per_row + col / 8u];                \
         const half sc = half(scales[rr * groups_per_row + col / group]);        \
         const half bi = half(biases[rr * groups_per_row + col / group]);        \
+        {qmg_high}                                                              \
         for (uint j = 0; j < 8u; ++j) {{                                        \
-            w_pre[e * 8u + j] = fma(half((bits >> (j * 4u)) & 0xFu), sc, bi);   \
+            w_pre[e * 8u + j] = fma(half({qmg_code}), sc, bi);                  \
         }}                                                                      \
     }}
 
@@ -478,6 +503,13 @@ kernel void {name}(
         name = name,
         ty = ty,
         out_ty = out_ty,
+        high_param = high_param,
+        qmg_high = qmg_high,
+        qmg_code = qmg_code,
+        b_rows = b_rows,
+        b_cols = b_cols,
+        b_group = b_group,
+        b_tokens = b_tokens,
         bm = QMG_BM,
         bn = QMG_BN,
         bk = QMG_BK,

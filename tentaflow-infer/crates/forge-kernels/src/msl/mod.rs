@@ -84,6 +84,18 @@ impl Bits {
         }
     }
 
+    /// The same, when the row is only known inside the loop — the blocked and
+    /// matrix forms walk several rows per iteration.
+    fn high_word_at(self, row: &str, col: &str) -> String {
+        match self {
+            Bits::Four => String::new(),
+            Bits::Six => format!(
+                "const uint hw = high[({row}) * (n_cols / 16u) + ({col}) / 16u]; \
+                 const uint hb = (({col}) % 16u) * 2u;"
+            ),
+        }
+    }
+
     /// Loads the high-bit word covering the eight codes starting at `col0`.
     fn high_word(self, col0: &str) -> String {
         match self {
