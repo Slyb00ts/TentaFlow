@@ -9,6 +9,7 @@ pub mod arch;
 pub mod deltanet;
 pub mod dequant;
 pub mod affine;
+pub mod checkpoint;
 pub mod gguf;
 pub mod mlx_source;
 pub mod source;

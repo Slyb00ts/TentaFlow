@@ -44,6 +44,16 @@ pub trait TensorSource {
     fn fetch_deepseek(&self, _name: &str) -> Result<Option<HostWeight>> {
         Ok(None)
     }
+    /// Wagi 4-bitowe afiniczne w postaci trzech tablic, gdy źródło potrafi je
+    /// tak oddać BEZ konwersji. `None` znaczy „zapytaj przez `fetch` i przepisz
+    /// sam" — a nie „ten tensor nie jest afiniczny".
+    ///
+    /// Istnieje, bo MLX trzyma dokładnie tę postać natywnie, ze skalami w bf16.
+    /// Przepuszczanie go przez format pośredni po to, żeby wszystko wyglądało
+    /// jednakowo, zwężało skale do f16 i gubiło te najmniejsze.
+    fn fetch_affine(&self, _name: &str) -> Result<Option<crate::affine::AffineTriple>> {
+        Ok(None)
+    }
     /// Rozmiar tensora na dysku, bez jego wczytywania. `None`, gdy źródło nie
     /// potrafi go podać — wtedy budżet rezydencji ekspertów jest nieznany.
     fn byte_len(&self, name: &str) -> Option<usize>;

@@ -124,7 +124,51 @@ impl<'a> MlxSource<'a> {
     }
 }
 
+impl MlxSource<'_> {
+    /// Trójka bez konwersji: nibble przepakowane do słów, a skale i
+    /// przesunięcia oddane w typie, w jakim leżą w pliku.
+    fn affine(&self, name: &str) -> Result<Option<crate::affine::AffineTriple>> {
+        let (Some(scales_name), Some(biases_name)) = (
+            Self::sibling(name, ".scales"),
+            Self::sibling(name, ".biases"),
+        ) else {
+            return Ok(None);
+        };
+        let (Some(wi), Some(si)) = (self.st.tensor(name), self.st.tensor(&scales_name)) else {
+            return Ok(None);
+        };
+        if self.st.tensor(&biases_name).is_none() {
+            return Ok(None);
+        }
+        let rows = wi.shape[0];
+        let cols = rows_cols_from(wi, self.cfg.per_word())?;
+        let packed: Vec<u32> = self
+            .st
+            .data(name)?
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok(Some(crate::affine::AffineTriple {
+            packed,
+            scales: self.st.data(&scales_name)?.to_vec(),
+            biases: self.st.data(&biases_name)?.to_vec(),
+            param_dtype: si.dtype,
+            group: self.cfg.group_size,
+            rows,
+            cols,
+        }))
+    }
+}
+
+fn rows_cols_from(info: &crate::safetensors::StTensor, per_word: usize) -> Result<usize> {
+    Ok(info.shape[1] * per_word)
+}
+
 impl TensorSource for MlxSource<'_> {
+    fn fetch_affine(&self, name: &str) -> Result<Option<crate::affine::AffineTriple>> {
+        self.affine(name)
+    }
+
     fn byte_len(&self, name: &str) -> Option<usize> {
         let info = self.st.tensor(name)?;
         Some(info.numel() * info.dtype.size())

@@ -20,32 +20,45 @@ use half::f16;
 
 use forge_types::{DType, ForgeError, QuantKind, Result};
 
-/// Weights per scale after conversion.
+/// Block a GGML-style source converts into. Thirty-two because that is the
+/// coarsest block Q4_1 and Q4_K can be cut into without splitting one of their
+/// own sub-blocks.
 ///
-/// Thirty-two, because that is the coarsest block every supported source can be
-/// cut into without splitting one of its own: Q4_1 blocks are 32, Q4_K's
-/// sub-blocks are 32, and MLX's group of 64 divides evenly. A wider group would
-/// have to merge two blocks that do NOT share a scale.
-pub const AFFINE_GROUP: usize = 32;
+/// NOT a property of the triple — a source whose blocks are already affine
+/// keeps its own group, because re-cutting it would be work for nothing.
+pub const GGML_AFFINE_GROUP: usize = 32;
 
-/// A quantized matrix in the shape the Metal kernels index.
+/// A quantized matrix in the shape the kernels index.
+///
+/// The parameters keep the dtype they had at the SOURCE. Forcing one dtype here
+/// looked tidier and was wrong: MLX stores its scales in bf16, whose smallest
+/// magnitudes are outside what f16 can hold, so a conversion "to be uniform"
+/// silently narrows weights that were fine where they came from.
 pub struct AffineTriple {
     /// Nibbles, eight per word, least significant first.
     pub packed: Vec<u32>,
-    /// One per (row, group), in the same order as `packed`.
-    pub scales: Vec<f16>,
-    pub biases: Vec<f16>,
+    /// One per (row, group), in the same order as `packed`, raw bytes of
+    /// `param_dtype`.
+    pub scales: Vec<u8>,
+    pub biases: Vec<u8>,
+    pub param_dtype: DType,
+    /// Weights sharing one scale and bias.
+    pub group: usize,
     pub rows: usize,
     pub cols: usize,
 }
 
 impl AffineTriple {
-    fn new(rows: usize, cols: usize) -> Self {
-        let groups = rows * cols / AFFINE_GROUP;
+    /// Builds an empty triple with f16 parameters, which is what every GGML
+    /// source produces.
+    pub fn new_f16(rows: usize, cols: usize, group: usize) -> Self {
+        let groups = rows * cols / group;
         Self {
             packed: vec![0; rows * cols / 8],
-            scales: vec![f16::ZERO; groups],
-            biases: vec![f16::ZERO; groups],
+            scales: vec![0; groups * 2],
+            biases: vec![0; groups * 2],
+            param_dtype: DType::F16,
+            group,
             rows,
             cols,
         }
@@ -54,16 +67,17 @@ impl AffineTriple {
     /// Writes one weight. `col` is the logical column, so the caller does not
     /// have to know the word packing.
     #[inline]
-    fn put(&mut self, row: usize, col: usize, nibble: u8) {
+    pub fn put(&mut self, row: usize, col: usize, nibble: u8) {
         let at = row * self.cols + col;
         self.packed[at / 8] |= u32::from(nibble & 0xF) << ((at % 8) * 4);
     }
 
+    /// Only valid while `param_dtype` is f16 — the GGML sources' case.
     #[inline]
-    fn set_params(&mut self, row: usize, group: usize, scale: f32, bias: f32) {
-        let at = row * (self.cols / AFFINE_GROUP) + group;
-        self.scales[at] = f16::from_f32(scale);
-        self.biases[at] = f16::from_f32(bias);
+    pub fn set_params_f16(&mut self, row: usize, group: usize, scale: f32, bias: f32) {
+        let at = (row * (self.cols / self.group) + group) * 2;
+        self.scales[at..at + 2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+        self.biases[at..at + 2].copy_from_slice(&f16::from_f32(bias).to_le_bytes());
     }
 }
 
@@ -78,9 +92,9 @@ pub fn to_affine_triple(
     rows: usize,
     cols: usize,
 ) -> Result<AffineTriple> {
-    if !cols.is_multiple_of(AFFINE_GROUP) {
+    if !cols.is_multiple_of(GGML_AFFINE_GROUP) {
         return Err(ForgeError::Unsupported(format!(
-            "affine: {cols} kolumn nie dzieli się na grupy po {AFFINE_GROUP}"
+            "affine: {cols} kolumn nie dzieli się na grupy po {GGML_AFFINE_GROUP}"
         )));
     }
     match quant {
@@ -109,7 +123,7 @@ fn f16_le(b: &[u8]) -> f32 {
 /// weights are the LOW nibbles, the next sixteen the HIGH ones — the two halves
 /// interleave in the byte, not in the sequence.
 fn from_q4_1(data: &[u8], rows: usize, cols: usize) -> Result<AffineTriple> {
-    let blocks = rows * cols / AFFINE_GROUP;
+    let blocks = rows * cols / GGML_AFFINE_GROUP;
     let want = blocks * Q4_1_BYTES;
     if data.len() != want {
         return Err(ForgeError::Format(format!(
@@ -117,14 +131,14 @@ fn from_q4_1(data: &[u8], rows: usize, cols: usize) -> Result<AffineTriple> {
             data.len()
         )));
     }
-    let mut out = AffineTriple::new(rows, cols);
-    let per_row = cols / AFFINE_GROUP;
+    let mut out = AffineTriple::new_f16(rows, cols, GGML_AFFINE_GROUP);
+    let per_row = cols / GGML_AFFINE_GROUP;
     for b in 0..blocks {
         let raw = &data[b * Q4_1_BYTES..(b + 1) * Q4_1_BYTES];
         let (d, m) = (f16_le(&raw[0..2]), f16_le(&raw[2..4]));
         let (row, group) = (b / per_row, b % per_row);
-        out.set_params(row, group, d, m);
-        let base = group * AFFINE_GROUP;
+        out.set_params_f16(row, group, d, m);
+        let base = group * GGML_AFFINE_GROUP;
         for j in 0..16 {
             out.put(row, base + j, raw[4 + j] & 0x0F);
             out.put(row, base + j + 16, raw[4 + j] >> 4);
@@ -151,7 +165,7 @@ fn from_q4_k(data: &[u8], rows: usize, cols: usize) -> Result<AffineTriple> {
             data.len()
         )));
     }
-    let mut out = AffineTriple::new(rows, cols);
+    let mut out = AffineTriple::new_f16(rows, cols, GGML_AFFINE_GROUP);
     let supers_per_row = cols / Q4_K_ELEMS;
     for s in 0..supers {
         let raw = &data[s * Q4_K_BYTES..(s + 1) * Q4_K_BYTES];
@@ -167,10 +181,10 @@ fn from_q4_k(data: &[u8], rows: usize, cols: usize) -> Result<AffineTriple> {
             let q = &qs[pair * 32..pair * 32 + 32];
             for (half, sub) in [(0usize, pair * 2), (1, pair * 2 + 1)] {
                 let (sc, mn) = scale_min_k4(sub, packed_scales);
-                let base = col0 + sub * AFFINE_GROUP;
-                out.set_params(
+                let base = col0 + sub * GGML_AFFINE_GROUP;
+                out.set_params_f16(
                     row,
-                    base / AFFINE_GROUP,
+                    base / GGML_AFFINE_GROUP,
                     d * f32::from(sc),
                     -dmin * f32::from(mn),
                 );
@@ -208,8 +222,10 @@ mod tests {
             for c in 0..t.cols {
                 let at = r * t.cols + c;
                 let nib = (t.packed[at / 8] >> ((at % 8) * 4)) & 0xF;
-                let g = r * (t.cols / AFFINE_GROUP) + c / AFFINE_GROUP;
-                out[at] = nib as f32 * f32::from(t.scales[g]) + f32::from(t.biases[g]);
+                let g = (r * (t.cols / t.group) + c / t.group) * 2;
+                let sc = f16::from_le_bytes([t.scales[g], t.scales[g + 1]]);
+                let bi = f16::from_le_bytes([t.biases[g], t.biases[g + 1]]);
+                out[at] = nib as f32 * f32::from(sc) + f32::from(bi);
             }
         }
         out
@@ -243,8 +259,8 @@ mod tests {
     fn q4_1_rewrites_into_the_triple() {
         // 64 kolumny = dwa bloki na wiersz, więc sprawdza też adresowanie grup.
         let (rows, cols) = (3usize, 64usize);
-        let mut data = noise(rows * cols / AFFINE_GROUP * Q4_1_BYTES, 7);
-        for b in 0..rows * cols / AFFINE_GROUP {
+        let mut data = noise(rows * cols / GGML_AFFINE_GROUP * Q4_1_BYTES, 7);
+        for b in 0..rows * cols / GGML_AFFINE_GROUP {
             // Skale muszą być sensownymi f16, inaczej porównanie mierzy NaN-y.
             data[b * Q4_1_BYTES..b * Q4_1_BYTES + 2]
                 .copy_from_slice(&f16::from_f32(0.013).to_le_bytes());

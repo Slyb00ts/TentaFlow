@@ -18,14 +18,15 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use forge_formats::safetensors::SafeTensors;
-use forge_formats::{HfConfig, MlxQuantConfig, ModelDescriptor, WeightRole};
+use forge_formats::affine::{to_affine_triple, GGML_AFFINE_GROUP};
+use forge_formats::checkpoint::Checkpoint;
+use forge_formats::WeightRole;
 use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_kernels::msl::{self, OutDtype, ScaleDtype};
 use forge_kernels::variant::{
     self, AttentionForm, MatmulForm, Problem, RowSplit, ATTENTION_FORMS, MATMUL_FORMS,
 };
-use forge_types::{ForgeError, MemKind, Result};
+use forge_types::{DType, ForgeError, MemKind, Result};
 
 use crate::cpu_matmul::{CpuMatmul, Operands};
 
@@ -152,35 +153,39 @@ impl MlxDense {
     /// Loads a checkpoint onto `device`. The KV cache is sized once, at the
     /// kernel's declared bound, because a cache that grows mid-run would mean
     /// reallocating inside a decode step.
-    pub fn load(device: Arc<dyn Device>, dir: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(dir.join("config.json"))
-            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
-        let json: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
-        let hf: HfConfig = HfConfig::from_json_str(&raw)
-            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
-        let quant = MlxQuantConfig::from_config(&json)?.ok_or_else(|| {
-            ForgeError::Unsupported("checkpoint nie deklaruje kwantyzacji MLX".into())
-        })?;
-        if quant.bits != 4 {
-            return Err(ForgeError::Unsupported(format!(
-                "ta ścieżka obsługuje 4 bity, checkpoint ma {}",
-                quant.bits
-            )));
-        }
-        let desc = ModelDescriptor::from_hf(&hf)?;
+    pub fn load(device: Arc<dyn Device>, path: &Path) -> Result<Self> {
+        // Format checkpointu jest pytaniem do warstwy formatów, nie do modelu.
+        // Katalog safetensors, eksport MLX i pojedynczy GGUF wchodzą TĄ SAMĄ
+        // drogą; model widzi tylko role i bajty, więc nie ma tu ani jednej
+        // gałęzi „jeśli GGUF".
+        let ckpt = Checkpoint::open(path)?;
+        let desc = ckpt.descriptor();
+        let src = ckpt.source();
+        let p = &desc.params;
+
+        // Grupa i typ skal to własność ŹRÓDŁA, nie modelu: MLX ma 64 i bf16,
+        // GGML po przepisaniu 32 i f16. Odczytane z pierwszej wagi i potem
+        // egzekwowane na każdej kolejnej, żeby model nie liczył dwóch układów
+        // naraz.
+        let probe = desc.globals[&WeightRole::TokenEmbd].clone();
+        let (group, scales_dtype) = match src.fetch_affine(&probe)? {
+            Some(t) => (t.group as u32, dtype_of(t.param_dtype)?),
+            None => (GGML_AFFINE_GROUP as u32, ScaleDtype::F16),
+        };
 
         let shape = DenseShape {
-            hidden: json["hidden_size"].as_u64().unwrap_or(0) as u32,
+            hidden: p.hidden_size as u32,
             layers: desc.layers.len() as u32,
-            heads: json["num_attention_heads"].as_u64().unwrap_or(0) as u32,
-            kv_heads: json["num_key_value_heads"].as_u64().unwrap_or(0) as u32,
-            head_dim: json["head_dim"].as_u64().unwrap_or(0) as u32,
-            inter: json["intermediate_size"].as_u64().unwrap_or(0) as u32,
-            vocab: json["vocab_size"].as_u64().unwrap_or(0) as u32,
-            eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
-            rope_theta: json["rope_theta"].as_f64().unwrap_or(10000.0) as f32,
-            group: quant.group_size as u32,
+            heads: p.n_heads as u32,
+            kv_heads: p.n_kv_heads as u32,
+            head_dim: p.head_dim as u32,
+            inter: p.intermediate_size as u32,
+            vocab: p.vocab_size as u32,
+            eps: p.rms_norm_eps,
+            rope_theta: p.rope_theta,
+            // Po konwersji każdy format ma jedną grupę — to właśnie ona jest
+            // wspólnym mianownikiem, do którego sprowadza je `forge-formats`.
+            group,
         };
         if shape.heads * shape.head_dim != shape.hidden {
             return Err(ForgeError::Unsupported(format!(
@@ -189,21 +194,60 @@ impl MlxDense {
             )));
         }
 
-        let st = SafeTensors::open(dir.join("model.safetensors"))?;
-        let scales_dtype = ScaleDtype::Bf16;
+        // DWA RÓŻNE typy, dotąd mylone w jeden, bo w MLX oba są bf16.
+        // Skale kwantyzacji są f16, bo taka jest trójka po konwersji — to
+        // własność wspólnego formatu, nie checkpointu. Waga normy zostaje
+        // natomiast w typie, w jakim leży w pliku, i ten trzeba odczytać.
+        let norm_dtype = match src.fetch(&desc.globals[&WeightRole::OutputNorm])?.1 {
+            DType::F16 => ScaleDtype::F16,
+            DType::BF16 => ScaleDtype::Bf16,
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "waga normy ma typ {other:?}, a kernel zna f16 i bf16"
+                )))
+            }
+        };
         let seq_cap = msl::ATTN_MAX_SEQ;
 
         let quantized = |name: &str, rows: u32, cols: u32| -> Result<Quantized> {
-            let base = name.strip_suffix(".weight").unwrap_or(name);
+            // Źródło, które trzyma wagi afinicznie, oddaje je wprost; reszta
+            // przechodzi przez przepisanie. W obu razach model dostaje to samo.
+            let t = match src.fetch_affine(name)? {
+                Some(t) => t,
+                None => {
+                    let (data, _, quant, dims) = src.fetch(name)?;
+                    if dims != vec![rows as usize, cols as usize] {
+                        return Err(ForgeError::Format(format!(
+                            "{name}: kształt {dims:?}, oczekiwano [{rows}, {cols}]"
+                        )));
+                    }
+                    to_affine_triple(&data, quant, rows as usize, cols as usize)?
+                }
+            };
+            if t.rows != rows as usize || t.cols != cols as usize {
+                return Err(ForgeError::Format(format!(
+                    "{name}: kształt [{}, {}], oczekiwano [{rows}, {cols}]",
+                    t.rows, t.cols
+                )));
+            }
+            if t.group != group as usize {
+                return Err(ForgeError::Unsupported(format!(
+                    "{name}: grupa {} wobec {group} w reszcie modelu",
+                    t.group
+                )));
+            }
             Ok(Quantized {
-                packed: upload(&*device, st.data(name)?)?,
-                scales: upload(&*device, st.data(&format!("{base}.scales"))?)?,
-                biases: upload(&*device, st.data(&format!("{base}.biases"))?)?,
+                packed: upload(&*device, bytemuck::cast_slice(&t.packed))?,
+                scales: upload(&*device, &t.scales)?,
+                biases: upload(&*device, &t.biases)?,
                 rows,
                 cols,
             })
         };
-        let plain = |name: &str| -> Result<DevBuffer> { upload(&*device, st.data(name)?) };
+        let plain = |name: &str| -> Result<DevBuffer> {
+            let (data, _, _, _) = src.fetch(name)?;
+            upload(&*device, &data)
+        };
 
         let embed = quantized(&desc.globals[&WeightRole::TokenEmbd], shape.vocab, shape.hidden)?;
         let final_norm = plain(&desc.globals[&WeightRole::OutputNorm])?;
@@ -257,8 +301,8 @@ impl MlxDense {
                 &msl::qmg_affine_4bit_name(scales_dtype, OutDtype::F32),
             )?,
             rmsnorm: compile(
-                &msl::rmsnorm_source(scales_dtype),
-                &msl::rmsnorm_name(scales_dtype),
+                &msl::rmsnorm_source(norm_dtype),
+                &msl::rmsnorm_name(norm_dtype),
             )?,
             silu_mul: compile(msl::SILU_MUL_SOURCE, msl::SILU_MUL_NAME)?,
             rope: compile(msl::ROPE_HALF_SPLIT_SOURCE, msl::ROPE_HALF_SPLIT_NAME)?,
@@ -971,6 +1015,17 @@ fn host_slice<T>(buf: &DevBuffer) -> Result<&[T]> {
     // SAFETY: the allocation is `buf.len()` bytes of shared memory, alive for
     // as long as the buffer, and nothing writes it while the borrow lasts.
     Ok(unsafe { std::slice::from_raw_parts(ptr as *const T, buf.len() / std::mem::size_of::<T>()) })
+}
+
+/// Typ parametrów kwantyzacji w wersji, którą znają kernele.
+fn dtype_of(d: DType) -> Result<ScaleDtype> {
+    match d {
+        DType::F16 => Ok(ScaleDtype::F16),
+        DType::BF16 => Ok(ScaleDtype::Bf16),
+        other => Err(ForgeError::Unsupported(format!(
+            "skale w {other:?}, a kernel zna f16 i bf16"
+        ))),
+    }
 }
 
 fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
