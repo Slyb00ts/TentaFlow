@@ -460,3 +460,38 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
 ## Files / OS
 - `import std.os as os` → `os.makedirs(String(path), exist_ok=True)`, `os.remove(...)`.
 - `from std.pathlib import Path` → `p.read_text()`, `p.write_text(s)`, `/` join.
+
+## Natywne NVFP4 `mma` na sm_121a — uklad operandow skal
+
+Sprzet liczy NVFP4 wprost, bez rekwantyzacji do MXFP4:
+
+```
+mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+  {d0..d3}, {a0..a3}, {b0,b1}, {c0..c3}, {sa}, {bid_a, tid_a}, {sb}, {bid_b, tid_b};
+```
+
+Typ skali nazywa sie **`ue4m3`**, nie `e4m3` — ta druga nazwa jest odrzucana
+przez `ptxas` i wlasnie ona kazala nam wczesniej sadzic, ze natywne NVFP4 jest
+niedostepne. `kind::mxf4nvf4` oraz jawne `scale_vec::4X` sa obowiazkowe.
+
+Kodowanie: e2m1 1.0 = `0x2` (bajt dwoch jedynek = `0x22`), ue4m3 1.0 = `0x38`,
+ue4m3 2.0 = `0x40`, ue8m0 1.0 = `0x7F`.
+
+Operand skali to rejestr `.b32` W KAZDYM watku, ale licza sie tylko niektore.
+Zmapowane empirycznie przez `probe_nvfp4_mma_layout.mojo` (A i B same jedynki,
+jedna skala podniesiona do 2.0, obserwacja ktore wyjscie drgnelo):
+
+| co | gdzie |
+|---|---|
+| skala wiersza `r` macierzy A (r = 0..7) | pas `4r`, przy `tid_a` parzystym |
+| skala wiersza `r+8` macierzy A | pas `4r+1` |
+| skala kolumny `n` macierzy B (n = 0..7) | pas `4n` |
+| blok K `j` (k = 16j..16j+15) | bajt `j` rejestru, po obu stronach |
+
+`tid` NIEPARZYSTY przesuwa pare pasow w kwadzie: licza wtedy `4r+2` i `4r+3`
+(odwzorowane tak samo). `bid` przy `scale_vec::4X` **nie ma znaczenia** — caly
+rejestr jest zuzywany; sprawdzone dla wszystkich czterech wartosci.
+
+Kontrola poprawnosci: A i B same jedynki, wszystkie skale 1.0, `m16n8k64` daje
+64.0 w kazdym elemencie wyjscia (4 bloki po 16). Podniesienie jednej skali A do
+2.0 daje 80.0 w calym wierszu — po 16 na blok.
