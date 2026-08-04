@@ -519,3 +519,63 @@ zeby kazdy iloczyn i kazda suma byly w f32 scisle reprezentowalne, wiec test
 wykrywa zly uklad, a nie zaokraglenie. Przechodzi na wszystkich 128 elementach.
 
 To komplet potrzebny do napisania GEMM-u: wartosci, skale i akumulator.
+
+### Warstwa kafelkowania nad tym rdzeniem (GB10, sm_121a, 2026-08-04)
+
+`bench_nvfp4_native_gemm.mojo` trzyma dwa jadra liczace BITOWO to samo: naiwne
+(jeden warp na kafel 16x64, prosto z pamieci globalnej) i kafelkowe. Kolejnosc
+sumowania po K jest w obu identyczna, wiec kazdy krok optymalizacji sprawdza sie
+testem na ROWNOSC CO DO BITU wzgledem CPU, nie na tolerancje.
+
+Sufity tej maszyny (`bench_fp8_ceiling.mojo`): **497 TFLOPS** dla samej
+instrukcji `mxf4nvf4/ue4m3` (mierzone osobno od `mxf4/ue8m0` — wychodzi tyle
+samo) i **222 GB/s** odczytu strumieniowego. 48 SM, 24 MiB L2, LPDDR5X 256 bit.
+
+Co dalo wynik, w kolejnosci wagi:
+
+| krok | q/o | gate/up | down |
+|---|--:|--:|--:|
+| naiwny | 1104 us | 3413 us | 3233 us |
+| + kafel BM x BN, `cp.async`, smem | 251 | 1699 | 583 |
+| + przenumerowanie siatki pod L2 | 236 | 635 | 497 |
+| + wyjscie f16 zamiast f32 | 213 | 558 | 505 |
+| + `ldmatrix` na fragmenty | **197** | **500** | **484** |
+
+- **Przenumerowanie siatki to najwiekszy pojedynczy skok** (gate/up 2,7x).
+  Siatka jest 1-D i liczona grupami po GM kafli M, wiec bloki lecace obok siebie
+  maja wspolne `n0` i dziela plat B w L2. Przy naturalnej kolejnosci (n
+  najszybsze) fala bloków przemiata cale B dla jednego m i czyta je z DRAM-u od
+  nowa dla kazdego kolejnego.
+- **Dtype wyjscia to nie kosmetyka.** Przy M=1024 wagi NVFP4 to 0,5625 B na
+  element, a wyjscie f32 az 4 B: dla gate/up wyjscie (46 MB) wazylo WIECEJ niz
+  wagi (26 MB). Stad `OUT` jest parametrem jadra — sprawdzenie idzie na f32
+  (mocniejsze porownanie), a mierzona sciezka pisze f16.
+- **`LDA = 8*KC + 4`** u32 rozklada 32 pasy fragmentu na 32 rozne banki; bez tego
+  odczyt A zderza sie wielodroznie. Ten sam odstep jest bezkonfliktowy dla
+  `ldmatrix` (osiem wierszy po 16 B na plytke).
+- **Fragment `mma` k64 to dokladnie to, co oddaje `ldmatrix`**: `ld_matrix[8]`
+  (x4) na ukladzie wierszowym daje `a0..a3` bez zadnego przepakowania, a
+  `ld_matrix[4]` (x2) daje `b0,b1`. Adresy podaje sie w innym rozbiciu pasa
+  (osiem wierszy na plytke) niz to, w ktorym instrukcja oddaje dane. Warte 2-4%.
+- Statyczne `stack_allocation` ma sufit 48 KiB, wiec potok glebszy niz 2 etapy
+  wymaga `external_memory` + `shared_mem_bytes` (opt-in na tej maszynie: 99 KiB).
+
+Czego NIE robic (zmierzone, bez zysku):
+
+- **Potok glebszy niz 3 etapy szkodzi.** 4 etapy przy 128x256x64 to 78 KiB smem,
+  1 CTA/SM i **-35%** (q/o 197 -> 268 us). 2 i 3 etapy sa w granicach szumu.
+- **Parowanie B w `ldmatrix.x4`** (jeden `.x4` na dwa podkafle N zamiast dwoch
+  `.x2`) — polowa ladowan B, zmiana **w granicach szumu** (197,0 vs 196,7 us;
+  ksztalt L2-rezydentny 150,5 vs 151,1). Wycofane: zlozonosc bez zysku.
+  To ten sam wniosek, co w sekcji int8/FP8 wyzej — liczba instrukcji w zrodle
+  nie jest tu dzwignia.
+- **Nie ma jednego najlepszego kafla.** q/o i gate/up wola 128x128x128 na 4
+  warpach, down wola 128x256x64 na 8 warpach. Roznica ~8%.
+
+Gdzie lezy reszta luki: ksztalt **2048x2048x2048 miesci sie caly w L2** (13 MiB),
+a mimo to daje **150 TFLOPS, czyli 30% sufitu** — DRAM nie jest wiec ograniczeniem
+petli wewnetrznej. `ptxas` melduje 185-234 rejestrow i **zero spilli**, czyli i
+rejestry nie sa wina. To ta sama sciana co udokumentowana wyzej dla int8 i FP8:
+ten sam uklad kernela `nvcc`/`ptxas` planuje do ~90% sufitu, backend Mojo do
+30-40%. Na duzych ksztaltach jestesmy przy 39-46% roofline'u (osobno liczonego
+dla pasma i dla obliczen), co jest gorna czescia tego pasma.

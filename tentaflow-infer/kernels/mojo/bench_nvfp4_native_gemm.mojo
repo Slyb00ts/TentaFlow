@@ -35,6 +35,8 @@ from std.gpu.memory import (
     async_copy_wait_group,
     external_memory,
 )
+from std.gpu.compute.mma import ld_matrix
+from std.memory import bitcast
 from std.gpu.sync import barrier
 from std.sys import _RegisterPackType, size_of
 from std.time import perf_counter_ns
@@ -256,6 +258,19 @@ def gemm_nvfp4_tiled[
     # Pas 4r niesie skale wiersza r, pas 4r+1 wiersza r+8 (patrz wersja naiwna).
     s_off = 8 if (q == 1) else 0
 
+    # Fragment `mma` k64 to DOKLADNIE to, co zwraca `ldmatrix`: pas 4g+q ma
+    # dostac u32 numer q wiersza g, wiersza g+8 oraz oba te u32 przesuniete o
+    # pol kafla — czyli cztery plytki 8x8 b16 czytane z ukladu wierszowego.
+    # Adresy podaje sie w innym rozbiciu pasa (osiem wierszy na plytke) niz
+    # to, w ktorym instrukcja potem oddaje dane, i to jest cala sztuczka:
+    # jedna instrukcja zastepuje cztery ladowania 4-bajtowe dla A i dwa dla B.
+    a_f16 = a_sm.bitcast[Float16]()
+    b_f16 = b_sm.bitcast[Float16]()
+    a_frag = 2 * (
+        (warp_m + lane % 8 + 8 * ((lane // 8) % 2)) * LDA + 4 * (lane // 16)
+    )
+    b_frag = 2 * ((warp_n + lane % 8) * LDA + 4 * ((lane // 8) % 2))
+
     var acc = InlineArray[SIMD[DType.float32, 4], MT * NT](
         fill=SIMD[DType.float32, 4](0.0)
     )
@@ -286,31 +301,28 @@ def gemm_nvfp4_tiled[
 
         buf = s % NS
         comptime for c in range(KC):
-            var a0 = InlineArray[UInt32, MT](uninitialized=True)
-            var a1 = InlineArray[UInt32, MT](uninitialized=True)
-            var a2 = InlineArray[UInt32, MT](uninitialized=True)
-            var a3 = InlineArray[UInt32, MT](uninitialized=True)
+            var af = InlineArray[SIMD[DType.uint32, 4], MT](uninitialized=True)
             var asc = InlineArray[UInt32, MT](uninitialized=True)
             comptime for mi in range(MT):
-                lo = a_sm + buf * ATILE + (warp_m + mi * 16 + g) * LDA + 8 * c + q
-                hi = lo + 8 * LDA
-                a0[mi] = lo[0]
-                a1[mi] = hi[0]
-                a2[mi] = lo[4]
-                a3[mi] = hi[4]
+                af[mi] = bitcast[DType.uint32, 4](
+                    ld_matrix[8](
+                        a_f16 + 2 * (buf * ATILE + mi * 16 * LDA + 8 * c) + a_frag
+                    )
+                )
                 asc[mi] = sa_sm[
                     buf * SATILE + (warp_m + mi * 16 + g + s_off) * KC + c
                 ]
             comptime for ni in range(NT):
-                col = warp_n + ni * 8 + g
-                bp = b_sm + buf * BTILE + col * LDA + 8 * c + q
-                b0 = bp[0]
-                b1 = bp[4]
-                bsc = sb_sm[buf * SBTILE + col * KC + c]
+                bf = bitcast[DType.uint32, 2](
+                    ld_matrix[4](
+                        b_f16 + 2 * (buf * BTILE + ni * 8 * LDA + 8 * c) + b_frag
+                    )
+                )
+                bsc = sb_sm[buf * SBTILE + (warp_n + ni * 8 + g) * KC + c]
                 comptime for mi in range(MT):
                     var r = mma_nvfp4(
-                        a0[mi], a1[mi], a2[mi], a3[mi],
-                        b0, b1,
+                        af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                        bf[0], bf[1],
                         acc[mi * NT + ni],
                         asc[mi], bsc,
                     )
@@ -595,6 +607,14 @@ def main() raises:
     _time[1024, 4096, 4096, 128, 128, 2, 4, 2, 8, 4](ctx, "q/o     :", True)
     _time[1024, 11264, 4096, 128, 128, 2, 4, 2, 8, 4](ctx, "gate/up :", True)
     _time[1024, 4096, 11264, 128, 128, 2, 4, 2, 8, 4](ctx, "down    :", True)
+
+    print("")
+    print("--- 2048x2048x2048: A+B+Y = 13 MiB, czyli caly ksztalt siedzi w L2 ---")
+    print("    podloga obliczeniowa tego ksztaltu to 34.5 us; ile z niej bierzemy")
+    print("    BEZ udzialu DRAM-u mowi, czy reszta luki to pasmo czy wystawianie")
+    _time[2048, 2048, 2048, 128, 256, 1, 8, 2, 8, 2](ctx, "128x256x64  :", True)
+    _time[2048, 2048, 2048, 128, 256, 1, 8, 2, 8, 3](ctx, "128x256x64/3:", True)
+    _time[2048, 2048, 2048, 128, 128, 2, 4, 2, 8, 3](ctx, "128x128x128 :", True)
 
     print("")
     print("--- 128x256x64, 8w, 3 etapy, ale wyjscie f32 (koszt pasma) ---")
