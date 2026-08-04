@@ -26,7 +26,7 @@ use half::{bf16, f16};
 
 use forge_formats::affine::AffineTriple;
 use forge_formats::dequant::dequantize_to_f32;
-use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Tile, WeightId, WeightStore};
+use forge_graph::{Act, ExecSpec, Executor, Layout, Op, QuantWeight, Tile, WeightId, WeightStore};
 use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
 /// Tokens carried through the layers in one pass.
@@ -91,6 +91,12 @@ impl HostQuant {
 struct HostBlocks {
     data: Vec<u8>,
     quant: QuantKind,
+    /// Typ zapisu — istotny wyłącznie dla wagi niekwantyzowanej, gdzie JEST
+    /// jej formatem.
+    dtype: DType,
+    /// Skalar całego tensora, gdy format go ma. Dekoder bloków go nie zna, bo
+    /// to własność tensora, a nie bloku.
+    global: Option<f32>,
     rows: usize,
     cols: usize,
 }
@@ -98,18 +104,35 @@ struct HostBlocks {
 impl HostBlocks {
     /// Bytes of one row. Every block format here is row-major over whole
     /// blocks, which is the same fact the RoPE row permutation stands on.
-    fn row_bytes(&self) -> usize {
-        self.cols / self.quant.block_elems() * self.quant.block_bytes()
+    fn row_bytes(&self) -> Result<usize> {
+        if self.quant == QuantKind::None {
+            // Waga niekwantyzowana nie ma bloków — wiersz to kolumny razy
+            // szerokość jej typu, i to ten typ jest tu formatem.
+            return Ok(self.cols * plain_width(self.dtype)?);
+        }
+        Ok(self.cols / self.quant.block_elems() * self.quant.block_bytes())
     }
 
     fn row_into(&self, row: usize, out: &mut [f32]) -> Result<()> {
-        let width = self.row_bytes();
-        let decoded = dequantize_to_f32(
-            DType::F32,
+        let width = self.row_bytes()?;
+        // Dla wagi niekwantyzowanej dekoderowi trzeba podać JEJ typ; podanie
+        // f32 przeczytałoby pary bajtów f16 jako połówki innych liczb.
+        let mut decoded = dequantize_to_f32(
+            self.dtype,
             self.quant,
             &self.data[row * width..(row + 1) * width],
             self.cols,
         )?;
+        // Skalar tensora wchodzi dopiero tutaj, bo dekoder bloków go nie zna —
+        // to własność tensora, a nie bloku. MNOŻY, bo płaszczyzna niesie już
+        // odwrotność `weight_global_scale`; to jest ta sama liczba, którą
+        // kernele dostają jako `output_scale`, i obie strony muszą jej użyć tak
+        // samo, inaczej różnią się o jej kwadrat.
+        if let Some(global) = self.global {
+            for v in decoded.iter_mut() {
+                *v *= global;
+            }
+        }
         out[..self.cols].copy_from_slice(&decoded);
         Ok(())
     }
@@ -285,6 +308,22 @@ impl WeightStore for HostExec {
         match w {
             QuantWeight::Affine(t) => self.put_affine(t),
             QuantWeight::Packed(p) => {
+                // Wzorzec dekoduje bloki. Inny układ zatrzyma się tutaj, bo
+                // jego bajty znaczą co innego niż to, co czyta dekoder.
+                if p.layout != Layout::Blocks {
+                    return Err(ForgeError::Unsupported(format!(
+                        "{:?} w układzie {:?}, a wzorzec czyta bloki",
+                        p.quant, p.layout
+                    )));
+                }
+                // Osobnej PŁASZCZYZNY skal wzorzec nie czyta — jego dekoder
+                // bierze je z wnętrza bloku; skalar tensora owszem.
+                if p.planes.scales.is_some() {
+                    return Err(ForgeError::Unsupported(format!(
+                        "{:?} niesie skale poza kodami, a wzorzec czyta je z bloku",
+                        p.quant
+                    )));
+                }
                 // Sprawdzane TU, przy wgraniu: wiersz, który nie dzieli się na
                 // całe bloki, adresowałby cudzy blok przy każdym odczycie.
                 if !p.cols.is_multiple_of(p.quant.block_elems()) {
@@ -295,19 +334,11 @@ impl WeightStore for HostExec {
                         p.quant.block_elems()
                     )));
                 }
-                // Wzorzec dekoduje kody, więc żąda wagi, która niesie WSZYSTKO
-                // w nich. Format z osobnymi skalami zatrzyma się tutaj, dopóki
-                // dekoder wzorca ich nie przyjmie — cicho policzony byłby
-                // wynikiem bez skal, czyli płynnym, złym tekstem.
-                if p.planes.scales.is_some() || p.planes.global.is_some() {
-                    return Err(ForgeError::Unsupported(format!(
-                        "{:?} niesie skale poza kodami, a wzorzec czyta same kody",
-                        p.quant
-                    )));
-                }
                 self.weights.push(HostWeight::Blocks(HostBlocks {
                     data: p.planes.codes,
                     quant: p.quant,
+                    dtype: p.dtype,
+                    global: p.planes.global,
                     rows: p.rows,
                     cols: p.cols,
                 }));
@@ -671,6 +702,17 @@ mod tests {
             assert!(!seen[i], "{a:?} dzieli slot {i} z inną aktywacją");
             seen[i] = true;
         }
+    }
+}
+
+/// Bajtów na wartość w wadze niekwantyzowanej.
+fn plain_width(dtype: DType) -> Result<usize> {
+    match dtype {
+        DType::F16 | DType::BF16 => Ok(2),
+        DType::F32 => Ok(4),
+        other => Err(ForgeError::Unsupported(format!(
+            "waga niekwantyzowana ma typ {other:?}"
+        ))),
     }
 }
 

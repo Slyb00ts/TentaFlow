@@ -80,9 +80,16 @@ impl Checkpoint {
             Store::Gguf(g) => Box::new(GgufSource(g)),
             Store::SafeTensors { st, config } => match MlxSource::detect(config, st) {
                 Some(mlx) => Box::new(mlx),
+                // Schemat kwantyzacji jest własnością CHECKPOINTU, a nie
+                // wołającego. Wpisane tu na sztywno `None` znaczyło, że NVFP4
+                // z compressed-tensors czytało się jako brak tensora — czyli
+                // że tą drogą nie dawało się go wczytać w ogóle.
                 None => Box::new(StSource {
                     st,
-                    scheme: None,
+                    scheme: serde_json::from_str::<crate::hf_config::HfConfig>(config)
+                        .ok()
+                        .as_ref()
+                        .and_then(crate::nvfp4::NvFp4Scheme::detect),
                     fp8: false,
                     deepseek_v4: false,
                 }),

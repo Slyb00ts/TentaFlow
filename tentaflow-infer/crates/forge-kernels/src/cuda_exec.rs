@@ -25,7 +25,9 @@ use std::sync::Arc;
 use half::f16;
 
 use forge_formats::FfnActivation;
-use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Step, Tile, WeightId, WeightStore};
+use forge_graph::{
+    Act, ExecSpec, Executor, Layout, Op, QuantWeight, Step, Tile, WeightId, WeightStore,
+};
 use forge_hal::{DevBuffer, Device, Pool, Stream};
 use forge_state::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
@@ -61,6 +63,9 @@ const DECODE_SPLITS: u32 = 8;
 /// A quantized weight, in the blocks the source packed and the kernels read.
 struct Quantized {
     blocks: DevBuffer,
+    /// Skalar całego tensora, gdy kernele formatu go biorą. Jedynka dla
+    /// pozostałych — trzymany osobno, bo to on dzieli tabelę na dwie sekcje.
+    output_scale: f32,
     /// Q4_K or Q6_K. Q4_K_M carries BOTH in one model — six bits on `attn_v`,
     /// `ffn_down` and the head, four on everything else — so this is a property
     /// of the weight and never of the model.
@@ -256,7 +261,7 @@ impl WeightStore for CudaExec {
     /// quantized model that quietly loses two bits per weight still produces
     /// fluent text.
     fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
-        let QuantWeight::Packed(w) = w else {
+        let QuantWeight::Packed(mut w) = w else {
             return Err(ForgeError::Unsupported(
                 "kernele CUDA czytają bloki źródła, a to źródło oddaje wyłącznie \
                  postać afiniczną"
@@ -269,6 +274,34 @@ impl WeightStore for CudaExec {
                 w.quant
             )));
         }
+        // Cała dzisiejsza tabela czyta bloki. Waga w innym układzie zatrzyma
+        // się tutaj, a nie trafi na kernel, który przeczyta jej bajty jak bloki.
+        if w.layout != Layout::Blocks {
+            return Err(ForgeError::Unsupported(format!(
+                "{:?} w układzie {:?}, a ta tabela czyta bloki",
+                w.quant, w.layout
+            )));
+        }
+        // Waga niekwantyzowana JEST formatem — jej dtype jest jej formatem.
+        // Kernele czytają f16, więc bf16 zwęża się tutaj, raz.
+        let codes = if w.quant == QuantKind::None {
+            to_f16_bytes(&w.planes.codes, w.dtype)?
+        } else {
+            std::mem::take(&mut w.planes.codes)
+        };
+        // Sekcja skalowana ŻĄDA skalara, pozostałe go nie przyjmują. Kernel,
+        // który dostałby jedynkę zamiast prawdziwej skali, policzyłby wagi
+        // mniejsze o stały czynnik — czyli model, który mówi, tylko nie to.
+        let output_scale = if Self::scaled(w.quant) {
+            w.global()?
+        } else if w.planes.global.is_some() {
+            return Err(ForgeError::Unsupported(format!(
+                "{:?} niesie skalar tensora, a jego kernele go nie biorą",
+                w.quant
+            )));
+        } else {
+            1.0
+        };
         // Wiersz krótszy niż blok adresowałby cudzy blok, więc sprawdzane TU,
         // przy wgraniu, a nie zakładane przy każdym mnożeniu.
         if !w.cols.is_multiple_of(w.quant.block_elems()) {
@@ -289,7 +322,8 @@ impl WeightStore for CudaExec {
             )));
         }
         self.weights.push(Weight::Quant(Quantized {
-            blocks: upload(&*self.device, &w.planes.codes)?,
+            blocks: upload(&*self.device, &codes)?,
+            output_scale,
             quant: w.quant,
             rows: w.rows,
             cols: w.cols,
@@ -591,26 +625,37 @@ impl CudaExec {
 
     fn op_embed(&self, table: WeightId, tokens: &[u32]) -> Result<()> {
         let w = self.quant(table)?;
-        if w.quant != QuantKind::Q4K {
-            return Err(ForgeError::Unsupported(format!(
-                "tablica osadzeń jest {:?}, a jedyny kernel zbierający wiersze czyta Q4_K",
-                w.quant
-            )));
-        }
         self.stage_i32(
             &self.scratch.ids,
             STAGE_IDS,
             tokens.iter().map(|&t| t as i32).collect(),
         )?;
-        self.kernels.gather_q4_k_rows_f16(
-            &self.scratch.h,
-            &w.blocks,
-            &self.scratch.ids,
-            tokens.len(),
-            w.rows,
-            w.cols,
-            &self.stream,
-        )
+        // Zbieranie wierszy ma kernel NA FORMAT, a nie jeden na wszystkie —
+        // tablica osadzeń w formacie bez takiego kernela zatrzyma się tutaj, bo
+        // jej wiersza nie ma czym przeczytać. NVFP4 z compressed-tensors nie
+        // kwantyzuje osadzeń, więc przychodzą jako f16 i idą drugą gałęzią.
+        match w.quant {
+            QuantKind::Q4K => self.kernels.gather_q4_k_rows_f16(
+                &self.scratch.h,
+                &w.blocks,
+                &self.scratch.ids,
+                tokens.len(),
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            QuantKind::None => self.kernels.gather_rows_f16(
+                &self.scratch.h,
+                &w.blocks,
+                &self.scratch.ids,
+                tokens.len(),
+                w.cols,
+                &self.stream,
+            ),
+            other => Err(ForgeError::Unsupported(format!(
+                "tablica osadzeń jest {other:?}, a jej wierszy nie ma czym zebrać"
+            ))),
+        }
     }
 
     fn op_rmsnorm(&self, out: Act, x: Act, w: WeightId, step: &Step) -> Result<()> {
@@ -805,7 +850,15 @@ impl CudaExec {
                     let row = self
                         .device
                         .sub_buffer(self.buf(x), x_off, weight.cols * 2)?;
-                    self.gemv_out_f32_by_kind(quant, &y, &weight.blocks, &row, weight.rows, weight.cols)?;
+                    self.gemv_out_f32_by_kind(
+                        quant,
+                        &y,
+                        &weight.blocks,
+                        &row,
+                        weight.rows,
+                        weight.cols,
+                        weight.output_scale,
+                    )?;
                 }
             }
         }
@@ -864,7 +917,7 @@ impl CudaExec {
                     self.kernels
                         .gemv_q4_k_dp4a_f16(out, &w.blocks, x, r, c, &self.stream)
                 }
-                _ => self.gemv_by_kind(w.quant, out, &w.blocks, x, r, c),
+                _ => self.gemv_by_kind(w.quant, out, &w.blocks, x, r, c, w.output_scale),
             };
         }
         if dp4a
@@ -882,7 +935,7 @@ impl CudaExec {
         {
             return Ok(());
         }
-        self.gemm_by_kind(w.quant, out, &w.blocks, x, r, c, rows as usize)
+        self.gemm_by_kind(w.quant, out, &w.blocks, x, r, c, rows as usize, w.output_scale)
     }
 }
 
@@ -896,6 +949,28 @@ fn layer_slabs<'a>(kv: &'a KvCache, layer: usize) -> Result<(&'a DevBuffer, &'a 
         .layer_index(layer)
         .ok_or_else(|| ForgeError::Other(format!("warstwa {layer} nie ma cache'u KV")))?;
     Ok((&kv.k[index], &kv.v[index]))
+}
+
+/// Bajty wagi niekwantyzowanej w f16, w którym czytają je kernele.
+fn to_f16_bytes(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
+    match dtype {
+        DType::F16 => Ok(bytes.to_vec()),
+        DType::BF16 => Ok(bytes
+            .chunks_exact(2)
+            .flat_map(|c| {
+                f16::from_f32(half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).to_le_bytes()
+            })
+            .collect()),
+        DType::F32 => Ok(bytes
+            .chunks_exact(4)
+            .flat_map(|c| {
+                f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes()
+            })
+            .collect()),
+        other => Err(ForgeError::Unsupported(format!(
+            "waga niekwantyzowana ma typ {other:?}, a kernele czytają f16"
+        ))),
+    }
 }
 
 fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
@@ -915,11 +990,24 @@ fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
 /// `match` nie ma gałęzi „reszta": kwantyzacja spoza tabeli ma się TU odbić, a
 /// nie policzyć czymkolwiek.
 macro_rules! block_formats {
-    ($($k:ident => $gemv:ident, $gemm:ident, $out_f32:ident;)+) => {
+    (
+        plain { $($k:ident => $gemv:ident, $gemm:ident, $out_f32:ident;)+ }
+        scaled { $($sk:ident => $sgemv:ident, $sgemm:ident, $sout:ident;)+ }
+    ) => {
         impl CudaExec {
             /// Czy ten wykonawca ma kernele dla tej kwantyzacji.
             fn knows(quant: QuantKind) -> bool {
-                matches!(quant, QuantKind::Q4K | QuantKind::Q6K | $(QuantKind::$k)|+)
+                matches!(
+                    quant,
+                    QuantKind::Q4K | QuantKind::Q6K
+                        | $(QuantKind::$k)|+
+                        | $(QuantKind::$sk)|+
+                )
+            }
+
+            /// Czy kernele tego formatu biorą skalar całego tensora.
+            fn scaled(quant: QuantKind) -> bool {
+                matches!(quant, $(QuantKind::$sk)|+)
             }
 
             #[allow(clippy::too_many_arguments)]
@@ -931,6 +1019,7 @@ macro_rules! block_formats {
                 x: &DevBuffer,
                 rows: usize,
                 cols: usize,
+                scale: f32,
             ) -> Result<()> {
                 match quant {
                     QuantKind::Q4K => {
@@ -940,6 +1029,9 @@ macro_rules! block_formats {
                         self.kernels.gemv_q6_k_f16(y, w, x, rows, cols, &self.stream)
                     }
                     $(QuantKind::$k => self.kernels.$gemv(y, w, x, rows, cols, &self.stream),)+
+                    $(QuantKind::$sk => {
+                        self.kernels.$sgemv(y, w, x, rows, cols, scale, &self.stream)
+                    })+
                     other => Err(ForgeError::Unsupported(format!("{other:?}: brak GEMV"))),
                 }
             }
@@ -954,6 +1046,7 @@ macro_rules! block_formats {
                 rows: usize,
                 cols: usize,
                 n_tokens: usize,
+                scale: f32,
             ) -> Result<()> {
                 match quant {
                     QuantKind::Q4K => {
@@ -964,6 +1057,9 @@ macro_rules! block_formats {
                     }
                     $(QuantKind::$k => {
                         self.kernels.$gemm(y, w, 0, x, rows, cols, n_tokens, &self.stream)
+                    })+
+                    $(QuantKind::$sk => {
+                        self.kernels.$sgemm(y, w, x, rows, cols, n_tokens, scale, &self.stream)
                     })+
                     other => Err(ForgeError::Unsupported(format!("{other:?}: brak GEMM"))),
                 }
@@ -978,10 +1074,14 @@ macro_rules! block_formats {
                 x: &DevBuffer,
                 rows: usize,
                 cols: usize,
+                scale: f32,
             ) -> Result<()> {
                 match quant {
                     $(QuantKind::$k => {
                         self.kernels.$out_f32(y, w, x, rows, cols, &self.stream)
+                    })+
+                    $(QuantKind::$sk => {
+                        self.kernels.$sout(y, w, x, rows, cols, scale, &self.stream)
                     })+
                     other => Err(ForgeError::Unsupported(format!("{other:?}: brak głowy f32"))),
                 }
@@ -991,6 +1091,8 @@ macro_rules! block_formats {
 }
 
 block_formats! {
+    plain {
+    None   => gemv_f16        , gemm_f16_at        , gemv_f16_out_f32;
     Q5K    => gemv_q5_k_f16   , gemm_q5_k_f16_at   , gemv_q5_k_out_f32;
     Q3K    => gemv_q3_k_f16   , gemm_q3_k_f16_at   , gemv_q3_k_out_f32;
     Q2K    => gemv_q2_k_f16   , gemm_q2_k_f16_at   , gemv_q2_k_out_f32;
@@ -1008,4 +1110,12 @@ block_formats! {
     IQ3XXS => gemv_iq3_xxs_f16, gemm_iq3_xxs_f16_at, gemv_iq3_xxs_out_f32;
     IQ1S   => gemv_iq1_s_f16  , gemm_iq1_s_f16_at  , gemv_iq1_s_out_f32;
     IQ1M   => gemv_iq1_m_f16  , gemm_iq1_m_f16_at  , gemv_iq1_m_out_f32;
+    }
+    // Kernele NVFP4 biorą skalar całego tensora, bo w bloku siedzi tylko
+    // czterobitowy wykładnik na szesnaście wartości — reszta zakresu jest w tym
+    // jednym mnożniku. To różnica w TREŚCI wywołania, nie w nazwie kernela, i
+    // dlatego osobna sekcja, a nie kolejny wiersz.
+    scaled {
+    NVFP4Gguf => gemv_nvfp4_gguf_f16, gemm_nvfp4_gguf_f16, gemv_nvfp4_gguf_out_f32;
+    }
 }

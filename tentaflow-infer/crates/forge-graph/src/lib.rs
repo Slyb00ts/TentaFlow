@@ -294,6 +294,27 @@ pub struct Planes {
     pub global: Option<f32>,
 }
 
+/// Gdzie leżą bajty jednej kwantyzacji.
+///
+/// NVFP4 przychodzi w dwóch układach — blokach GGUF-a i trzech tensorach
+/// compressed-tensors — a one kodują TE SAME LICZBY co do bitu (pilnuje tego
+/// `the_gguf_repack_decodes_to_the_same_numbers` w `forge-formats`). Nazwanie
+/// ich dwiema kwantyzacjami mówiłoby nieprawdę i pociągnęło dwie tabele
+/// formatów; różni się miejsce bajtów, a nie format.
+///
+/// Dzięki temu przepakowanie przy wczytaniu jest DECYZJĄ, a nie przymusem:
+/// wykonawca może wziąć układ źródła albo poprosić o przepisany, i rozstrzyga
+/// to pomiar, a nie kształt typu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// Bloki formatu, wiersz po wierszu — tak leży GGUF i każda kwantyzacja,
+    /// która trzyma skale wewnątrz bloku.
+    #[default]
+    Blocks,
+    /// Kody i skale w osobnych tensorach — układ compressed-tensors.
+    Split,
+}
+
 /// Waga kwantyzowana w postaci, w jakiej oddało ją źródło.
 ///
 /// Przepisanie na postać, której chcą kernele, należy do WYKONAWCY, a nie do
@@ -306,6 +327,12 @@ pub struct Planes {
 pub struct PackedWeight {
     pub planes: Planes,
     pub quant: QuantKind,
+    /// Gdzie leżą bajty tej kwantyzacji.
+    pub layout: Layout,
+    /// Typ zapisu kodów. Dla formatów blokowych to bajty i nikt go nie czyta;
+    /// dla wagi NIEKWANTYZOWANEJ to jest cały jej format, bo `QuantKind::None`
+    /// samo w sobie nie mówi, czy to f16 czy bf16.
+    pub dtype: DType,
     pub rows: usize,
     pub cols: usize,
 }
@@ -389,6 +416,8 @@ mod tests {
                 ..Planes::default()
             },
             quant: QuantKind::Q4K,
+            layout: Layout::Blocks,
+            dtype: DType::U8,
             rows: 1,
             cols: 256,
         };
@@ -402,6 +431,8 @@ mod tests {
                 global: Some(0.5),
             },
             quant: QuantKind::NVFP4Gguf,
+            layout: Layout::Blocks,
+            dtype: DType::U8,
             rows: 1,
             cols: 256,
         };

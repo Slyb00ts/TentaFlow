@@ -15,14 +15,15 @@
 use std::path::Path;
 
 use forge_formats::affine::permute_rope_rows;
+use forge_formats::nvfp4::nvfp4_ct_to_gguf_blocks;
 use forge_formats::checkpoint::Checkpoint;
 use forge_formats::source::TensorSource;
 use forge_formats::WeightRole;
 use forge_graph::{
-    Act, ExecSpec, Executor, Lane, Op, PackedWeight, Planes, QuantWeight, Step, Tile, WeightId,
-    WeightStore,
+    Act, ExecSpec, Executor, Lane, Layout, Op, PackedWeight, Planes, QuantWeight, Step, Tile,
+    WeightId, WeightStore,
 };
-use forge_types::{DType, DenseShape, ForgeError, Result};
+use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
 /// A dense decoder running on `E`.
 pub struct Dense<E> {
@@ -501,8 +502,37 @@ fn fetch_quant(
             }
             QuantWeight::Affine(t)
         }
+        // NVFP4 z compressed-tensors przychodzi w trzech tensorach. Sprowadzamy
+        // je przy WCZYTANIU do jednobuforowych bloków GGUF, bo to ta sama
+        // kwantyzacja i te same liczby co do bitu — a wtedy jest zwykłym
+        // wierszem tabeli wykonawcy zamiast własną ścieżką. Instrukcja FP4
+        // Blackwella jest jedna dla obu układów, więc konwersja niczego nie
+        // zamyka; `Layout` zostaje w typie, żeby dało się kiedyś NIE konwertować.
+        None if src.fetch_nvfp4(name)?.is_some() => {
+            let nv = src.fetch_nvfp4(name)?.expect("sprawdzone wyżej");
+            if rope.is_some() {
+                return Err(ForgeError::Unsupported(format!(
+                    "{name}: NVFP4 wymagałby permutacji wierszy RoPE przed przepakowaniem"
+                )));
+            }
+            QuantWeight::Packed(PackedWeight {
+                planes: Planes {
+                    codes: nvfp4_ct_to_gguf_blocks(&nv.packed, &nv.scales, nv.rows, nv.cols)?,
+                    scales: None,
+                    // Kernele mnożą przez ODWROTNOŚĆ: `weight_global_scale` to
+                    // dzielnik użyty przy kwantyzacji. Pomylenie strony daje
+                    // rozjazd o kwadrat skalara — i logity NaN.
+                    global: Some(1.0 / nv.global_scale),
+                },
+                quant: QuantKind::NVFP4Gguf,
+                layout: Layout::Blocks,
+                dtype: DType::U8,
+                rows: nv.rows,
+                cols: nv.cols,
+            })
+        }
         None => {
-            let (mut data, _, quant, dims) = src.fetch(name)?;
+            let (mut data, dtype, quant, dims) = src.fetch(name)?;
             if dims != vec![rows as usize, cols as usize] {
                 return Err(ForgeError::Format(format!(
                     "{name}: kształt {dims:?}, oczekiwano [{rows}, {cols}]"
@@ -517,6 +547,8 @@ fn fetch_quant(
                     ..Planes::default()
                 },
                 quant,
+                layout: Layout::Blocks,
+                dtype,
                 rows: rows as usize,
                 cols: cols as usize,
             })
