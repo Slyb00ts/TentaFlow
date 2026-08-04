@@ -12,5 +12,13 @@ fn main() {
         .file("src/shim.c")
         .flag_if_supported("-O2")
         .compile("forge_rdma_shim");
-    println!("cargo:rustc-link-lib=ibverbs");
+    // Apple wystawia TO SAMO API verbs, ale pod inna nazwa biblioteki: naglowek
+    // to nadal `infiniband/verbs.h`, a symbole `ibv_*` mieszkaja w `librdma`.
+    // RDMA po Thunderbolcie dziala od macOS 26.2 i wymaga Thunderbolt 5
+    // (TN3205); Thunderbolt 4 skompiluje sie, ale urzadzenia nie zobaczy.
+    let apple = std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple");
+    println!(
+        "cargo:rustc-link-lib={}",
+        if apple { "rdma" } else { "ibverbs" }
+    );
 }
