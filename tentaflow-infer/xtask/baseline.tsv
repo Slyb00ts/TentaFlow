@@ -59,6 +59,7 @@ hal_boundary	crates/forge-engine/tests/kv_rollback.rs	2
 hal_boundary	crates/forge-engine/tests/kv_tier.rs	2
 hal_boundary	crates/forge-engine/tests/prefix_cache.rs	2
 hal_boundary	crates/forge-engine/tests/tp_shard_load.rs	1
+hal_boundary	crates/forge-model/tests/cuda_vs_reference.rs	1
 hal_boundary	crates/forge-model/tests/decode_vs_mlx.rs	1
 hal_boundary	crates/forge-model/tests/generate_vs_mlx.rs	1
 hal_boundary	crates/forge-model/tests/gguf_loads.rs	1
