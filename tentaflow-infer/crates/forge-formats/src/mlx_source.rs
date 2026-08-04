@@ -150,6 +150,8 @@ impl MlxSource<'_> {
             .collect();
         Ok(Some(crate::affine::AffineTriple {
             packed,
+            high: Vec::new(),
+            bits: 4,
             scales: self.st.data(&scales_name)?.to_vec(),
             biases: self.st.data(&biases_name)?.to_vec(),
             param_dtype: si.dtype,

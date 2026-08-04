@@ -35,8 +35,16 @@ pub const GGML_AFFINE_GROUP: usize = 32;
 /// magnitudes are outside what f16 can hold, so a conversion "to be uniform"
 /// silently narrows weights that were fine where they came from.
 pub struct AffineTriple {
-    /// Nibbles, eight per word, least significant first.
+    /// Low four bits of each weight, eight per word, least significant first.
     pub packed: Vec<u32>,
+    /// Bits four and five, sixteen per word — empty when `bits` is four.
+    ///
+    /// Split rather than interleaved because a six-bit field straddles word
+    /// boundaries and the extraction is what limits decode (EKS-A8). Two loads
+    /// of aligned fields beat one load plus a shift across words.
+    pub high: Vec<u32>,
+    /// Four or six.
+    pub bits: u32,
     /// One per (row, group), in the same order as `packed`, raw bytes of
     /// `param_dtype`.
     pub scales: Vec<u8>,
@@ -55,6 +63,8 @@ impl AffineTriple {
         let groups = rows * cols / group;
         Self {
             packed: vec![0; rows * cols / 8],
+            high: Vec::new(),
+            bits: 4,
             scales: vec![0; groups * 2],
             biases: vec![0; groups * 2],
             param_dtype: DType::F16,
@@ -62,6 +72,22 @@ impl AffineTriple {
             rows,
             cols,
         }
+    }
+
+    /// Same, for the six-bit form.
+    pub fn new_f16_6bit(rows: usize, cols: usize, group: usize) -> Self {
+        let mut t = Self::new_f16(rows, cols, group);
+        t.high = vec![0; rows * cols / 16];
+        t.bits = 6;
+        t
+    }
+
+    /// Writes one six-bit weight, splitting it across the two arrays.
+    #[inline]
+    pub fn put6(&mut self, row: usize, col: usize, value: u8) {
+        let at = row * self.cols + col;
+        self.packed[at / 8] |= u32::from(value & 0xF) << ((at % 8) * 4);
+        self.high[at / 16] |= u32::from((value >> 4) & 0x3) << ((at % 16) * 2);
     }
 
     /// Writes one weight. `col` is the logical column, so the caller does not
@@ -100,6 +126,7 @@ pub fn to_affine_triple(
     match quant {
         QuantKind::Q4_1 => from_q4_1(data, rows, cols),
         QuantKind::Q4K => from_q4_k(data, rows, cols),
+        QuantKind::Q6K => from_q6_k(data, rows, cols),
         other => Err(ForgeError::Unsupported(format!(
             "affine: {other:?} nie jest czterobitową formą afiniczną"
         ))),
@@ -107,8 +134,62 @@ pub fn to_affine_triple(
 }
 
 /// Whether `to_affine_triple` will take this format.
-pub fn is_affine_4bit(quant: QuantKind) -> bool {
-    matches!(quant, QuantKind::Q4_1 | QuantKind::Q4K)
+pub fn is_affine(quant: QuantKind) -> bool {
+    matches!(quant, QuantKind::Q4_1 | QuantKind::Q4K | QuantKind::Q6K)
+}
+
+const Q6_K_BYTES: usize = 210;
+const Q6_K_ELEMS: usize = 256;
+/// Q6_K keeps one scale per sixteen weights.
+pub const Q6_K_GROUP: usize = 16;
+
+/// Q6_K: `y = d * sc * (q - 32)` with `q` six bits and one `sc` per sixteen
+/// weights — affine again, with the offset folded into the bias. The awkward
+/// part is only the filing: four weights share a byte of high bits, and the
+/// four quarters of a 128-block are interleaved rather than consecutive.
+fn from_q6_k(data: &[u8], rows: usize, cols: usize) -> Result<AffineTriple> {
+    if !cols.is_multiple_of(Q6_K_ELEMS) {
+        return Err(ForgeError::Unsupported(format!(
+            "Q6_K: {cols} kolumn nie dzieli się na superbloki po {Q6_K_ELEMS}"
+        )));
+    }
+    let supers = rows * cols / Q6_K_ELEMS;
+    let want = supers * Q6_K_BYTES;
+    if data.len() != want {
+        return Err(ForgeError::Format(format!(
+            "Q6_K: {} B na {rows}x{cols}, oczekiwano {want}",
+            data.len()
+        )));
+    }
+    let mut out = AffineTriple::new_f16_6bit(rows, cols, Q6_K_GROUP);
+    let supers_per_row = cols / Q6_K_ELEMS;
+    for s in 0..supers {
+        let raw = &data[s * Q6_K_BYTES..(s + 1) * Q6_K_BYTES];
+        let (ql, qh, sc) = (&raw[0..128], &raw[128..192], &raw[192..208]);
+        let d = f16_le(&raw[208..210]);
+        let row = s / supers_per_row;
+        let col0 = (s % supers_per_row) * Q6_K_ELEMS;
+
+        for n in 0..2 {
+            let (ql, qh, sc) = (&ql[n * 64..], &qh[n * 32..], &sc[n * 8..]);
+            for l in 0..32 {
+                let is = l / 16;
+                let quarters = [
+                    (ql[l] & 0x0F) | ((qh[l] & 3) << 4),
+                    (ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4),
+                    (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4),
+                    (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4),
+                ];
+                for (q, &value) in quarters.iter().enumerate() {
+                    let col = col0 + n * 128 + q * 32 + l;
+                    let scale = d * f32::from(sc[is + q * 2] as i8);
+                    out.set_params_f16(row, col / Q6_K_GROUP, scale, -32.0 * scale);
+                    out.put6(row, col, value);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 const Q4_1_BYTES: usize = 20;
@@ -221,7 +302,10 @@ mod tests {
         for r in 0..t.rows {
             for c in 0..t.cols {
                 let at = r * t.cols + c;
-                let nib = (t.packed[at / 8] >> ((at % 8) * 4)) & 0xF;
+                let mut nib = (t.packed[at / 8] >> ((at % 8) * 4)) & 0xF;
+                if t.bits == 6 {
+                    nib |= ((t.high[at / 16] >> ((at % 16) * 2)) & 0x3) << 4;
+                }
                 let g = (r * (t.cols / t.group) + c / t.group) * 2;
                 let sc = f16::from_le_bytes([t.scales[g], t.scales[g + 1]]);
                 let bi = f16::from_le_bytes([t.biases[g], t.biases[g + 1]]);
@@ -285,12 +369,25 @@ mod tests {
     }
 
     #[test]
-    fn a_format_that_is_not_four_bit_affine_is_refused() {
-        // Q6_K liczy tę samą formułę, ale sześcioma bitami — cicha konwersja
-        // obcinałaby wagi do nibbla i model nadal by mówił.
-        assert!(!is_affine_4bit(QuantKind::Q6K));
-        assert!(to_affine_triple(&[0u8; 210], QuantKind::Q6K, 1, 256).is_err());
-        assert!(is_affine_4bit(QuantKind::Q4K));
-        assert!(is_affine_4bit(QuantKind::Q4_1));
+    fn q6_k_rewrites_into_the_six_bit_triple() {
+        let (rows, cols) = (2usize, 256usize);
+        let mut data = noise(rows * cols / 256 * 210, 29);
+        for s in 0..rows * cols / 256 {
+            // Skale Q6_K są ośmiobitowe ZE ZNAKIEM, a `d` w f16.
+            data[s * 210 + 208..s * 210 + 210]
+                .copy_from_slice(&f16::from_f32(0.0017).to_le_bytes());
+        }
+        agrees(QuantKind::Q6K, &data, rows, cols);
+    }
+
+    #[test]
+    fn a_format_that_is_not_affine_is_refused() {
+        // Q8_0 to skala bez przesunięcia, a Q5_K piąty bit trzyma inaczej —
+        // żadne z nich nie jest tą formą i cicha konwersja psułaby wagi.
+        assert!(!is_affine(QuantKind::Q8_0));
+        assert!(to_affine_triple(&[0u8; 210], QuantKind::Q5K, 1, 256).is_err());
+        assert!(is_affine(QuantKind::Q4K));
+        assert!(is_affine(QuantKind::Q4_1));
+        assert!(is_affine(QuantKind::Q6K));
     }
 }
