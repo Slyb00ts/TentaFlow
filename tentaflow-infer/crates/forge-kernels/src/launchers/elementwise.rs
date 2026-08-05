@@ -85,6 +85,20 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// out = f32(src) over n elements.
+    pub fn cast_f16_f32(
+        &self,
+        out: &DevBuffer,
+        src: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("cast_f16_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(src).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// out = f16(src) nad `n` elementami.
     ///
     /// Tensor parallel sumuje wyniki cząstkowe projekcji `down` w f32, bo

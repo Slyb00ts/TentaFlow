@@ -19,7 +19,7 @@ from src.norm import (
     rmsnorm_fp8,
     rmsnorm_residual_fp8,
 )
-from src.activation import silu_mul_f16, gelu_mul_f16, scale_f16, softcap_f32, sigmoid_mul_f16, deinterleave_gate_f16, cast_f32_f16, add_f32_out_f16, residual_add_f16
+from src.activation import silu_mul_f16, gelu_mul_f16, scale_f16, softcap_f32, sigmoid_mul_f16, deinterleave_gate_f16, cast_f16_f32, cast_f32_f16, add_f32_out_f16, residual_add_f16
 from src.rope import rope_neox_f16, rope_neox_ff_f16, attn_prepare_qk_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import (
@@ -919,6 +919,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "gelu_mul_f16"))
     _ = ctx.compile_function[scale_f16, dump_asm=Path("scale_f16.ptx")]()
     entries.append(_finalize(out_dir, "scale_f16"))
+    _ = ctx.compile_function[cast_f16_f32, dump_asm=Path("cast_f16_f32.ptx")]()
+    entries.append(_finalize(out_dir, "cast_f16_f32"))
     _ = ctx.compile_function[cast_f32_f16, dump_asm=Path("cast_f32_f16.ptx")]()
     entries.append(_finalize(out_dir, "cast_f32_f16"))
     _ = ctx.compile_function[add_f32_out_f16, dump_asm=Path("add_f32_out_f16.ptx")]()

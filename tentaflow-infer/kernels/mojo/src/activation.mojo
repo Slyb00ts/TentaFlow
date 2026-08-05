@@ -108,6 +108,17 @@ def softcap_f32(
         logits[i] = cap * ((e - 1.0) / (e + 1.0))
 
 
+def cast_f16_f32(
+    out_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    src: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+):
+    """out = f32(src) over n elements."""
+    i = Int(global_idx.x)
+    if i < n:
+        out_ptr[i] = Float32(src[i])
+
+
 def cast_f32_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     src: UnsafePointer[Float32, MutAnyOrigin],

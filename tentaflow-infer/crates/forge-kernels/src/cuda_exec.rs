@@ -390,7 +390,10 @@ impl Executor for CudaExec {
         };
         self.admit(step)?;
         match op {
-            Op::Embed { table, tokens, .. } => self.op_embed(*table, tokens),
+            Op::Embed { table, tokens, .. } => {
+                self.op_embed(*table, tokens)?;
+                self.sync_h32(step.rows())
+            }
             Op::RmsNorm { out, x, w, .. } => self.op_rmsnorm(*out, *x, *w, step),
             Op::MatMul { out, w, x, .. } => {
                 let w = self.quant(*w)?;
@@ -496,12 +499,15 @@ impl Executor for CudaExec {
                 step.rows() as usize * self.shape.inter as usize,
                 &self.stream,
             ),
-            Op::Residual { src, .. } => self.kernels.residual_add_f16(
-                &self.scratch.h,
-                self.buf(*src),
-                step.rows() as usize * self.shape.hidden as usize,
-                &self.stream,
-            ),
+            Op::Residual { src, .. } => {
+                self.kernels.residual_add_f16(
+                    &self.scratch.h,
+                    self.buf(*src),
+                    step.rows() as usize * self.shape.hidden as usize,
+                    &self.stream,
+                )?;
+                self.sync_h32(step.rows())
+            },
             Op::LogitsOfLast { w, x, .. } => self.op_logits_of_last(*w, *x, step),
         }
     }
@@ -722,6 +728,15 @@ impl CudaExec {
         let per_lane = self.kv.borrow().cfg.max_pages_per_seq;
         self.device
             .sub_buffer(&self.scratch.pages, lane * per_lane * 4, per_lane * 4)
+    }
+
+    fn sync_h32(&self, rows: u32) -> Result<()> {
+        self.kernels.cast_f16_f32(
+            &self.scratch.h32,
+            &self.scratch.h,
+            rows as usize * self.shape.hidden as usize,
+            &self.stream,
+        )
     }
 
     fn op_embed(&self, table: WeightId, tokens: &[u32]) -> Result<()> {
@@ -1174,7 +1189,7 @@ impl CudaExec {
     ) -> Result<()> {
         let rows = w.rows;
         let cols = w.cols;
-        let ss_from_h16 = true;
+        let ss_from_h16 = false;
         let dp4a = cols <= Kernels::DP4A_MAX_COLS;
         match w.quant {
             QuantKind::None => self.kernels.gemv_norm_f16(
