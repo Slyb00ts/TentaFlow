@@ -84,6 +84,8 @@ enum Weight {
 /// the sampler reads.
 struct Scratch {
     h: DevBuffer,
+    /// Unrounded residual values used by fused kernels for precise norm recomputation.
+    h32: DevBuffer,
     norm: DevBuffer,
     q: DevBuffer,
     k: DevBuffer,
@@ -161,11 +163,14 @@ impl CudaExec {
         let n = MAX_ROWS;
         let f16b =
             |elems: u32| device.alloc(elems as usize * 2, MemKind::Device, Pool::Activations);
+        let f32b =
+            |elems: u32| device.alloc(elems as usize * 4, MemKind::Device, Pool::Activations);
         let i32b =
             |elems: u32| device.alloc(elems as usize * 4, MemKind::Device, Pool::Activations);
         let per_lane = SEQ_CAP.div_ceil(PAGE) as usize;
         let scratch = Scratch {
             h: f16b(n * shape.hidden)?,
+            h32: f32b(n * shape.hidden)?,
             norm: f16b(n * shape.hidden)?,
             q: f16b(n * shape.hidden)?,
             k: f16b(n * shape.kv_width())?,
@@ -394,30 +399,45 @@ impl Executor for CudaExec {
                 x,
                 step,
             } => {
-                self.run(&Op::RmsNorm {
-                    out: Act::Norm,
-                    x: *x,
-                    w: *norm_w,
-                    step: step.clone(),
-                })?;
-                self.run(&Op::MatMul {
-                    out: *out,
-                    w: *w,
-                    x: Act::Norm,
-                    step: step.clone(),
-                })
+                let quant = self.quant(*w)?;
+                if step.tokens() == 1 && Self::fused_quant(quant.quant) {
+                    self.gemv_norm_by_kind(
+                        quant,
+                        self.buf(*out),
+                        self.buf(*x),
+                        self.plain(*norm_w)?,
+                    )
+                } else {
+                    self.run(&Op::RmsNorm {
+                        out: Act::Norm,
+                        x: *x,
+                        w: *norm_w,
+                        step: step.clone(),
+                    })?;
+                    self.run(&Op::MatMul {
+                        out: *out,
+                        w: *w,
+                        x: Act::Norm,
+                        step: step.clone(),
+                    })
+                }
             }
             Op::FusedMatMulResidual { w, x, step } => {
-                self.run(&Op::MatMul {
-                    out: Act::Proj,
-                    w: *w,
-                    x: *x,
-                    step: step.clone(),
-                })?;
-                self.run(&Op::Residual {
-                    src: Act::Proj,
-                    step: step.clone(),
-                })
+                let quant = self.quant(*w)?;
+                if step.tokens() == 1 && Self::fused_quant(quant.quant) {
+                    self.gemv_residual_by_kind(quant, self.buf(*x))
+                } else {
+                    self.run(&Op::MatMul {
+                        out: Act::Proj,
+                        w: *w,
+                        x: *x,
+                        step: step.clone(),
+                    })?;
+                    self.run(&Op::Residual {
+                        src: Act::Proj,
+                        step: step.clone(),
+                    })
+                }
             }
             Op::FusedNormSilu {
                 gate_w,
@@ -987,6 +1007,187 @@ impl CudaExec {
     /// other token on a tie; sharing it brings that to 0,38%.
     ///
     /// The prompt tile is a bad kernel for a decode batch and that had to be
+    fn fused_quant(quant: QuantKind) -> bool {
+        matches!(
+            quant,
+            QuantKind::None | QuantKind::Q4K | QuantKind::Q6K | QuantKind::Q8_0
+        )
+    }
+
+    fn gemv_norm_by_kind(
+        &self,
+        w: &Quantized,
+        y: &DevBuffer,
+        h: &DevBuffer,
+        norm_w: &DevBuffer,
+    ) -> Result<()> {
+        let rows = w.rows;
+        let cols = w.cols;
+        let ss_from_h16 = true;
+        let dp4a = cols <= Kernels::DP4A_MAX_COLS;
+        match w.quant {
+            QuantKind::None => self.kernels.gemv_norm_f16(
+                y,
+                &w.blocks,
+                h,
+                &self.scratch.h32,
+                norm_w,
+                rows,
+                cols,
+                ss_from_h16,
+                self.shape.eps,
+                &self.stream,
+            ),
+            QuantKind::Q4K if dp4a => self.kernels.gemv_norm_q4_k_dp4a_f16(
+                y,
+                &w.blocks,
+                h,
+                &self.scratch.h32,
+                norm_w,
+                rows,
+                cols,
+                ss_from_h16,
+                self.shape.eps,
+                &self.stream,
+            ),
+            QuantKind::Q4K => self.kernels.gemv_norm_q4_k_f16(
+                y,
+                &w.blocks,
+                h,
+                &self.scratch.h32,
+                norm_w,
+                rows,
+                cols,
+                ss_from_h16,
+                self.shape.eps,
+                &self.stream,
+            ),
+            QuantKind::Q6K if dp4a => self.kernels.gemv_norm_q6_k_dp4a_f16(
+                y,
+                &w.blocks,
+                h,
+                &self.scratch.h32,
+                norm_w,
+                rows,
+                cols,
+                ss_from_h16,
+                self.shape.eps,
+                &self.stream,
+            ),
+            QuantKind::Q6K => self.kernels.gemv_norm_q6_k_f16(
+                y,
+                &w.blocks,
+                h,
+                &self.scratch.h32,
+                norm_w,
+                rows,
+                cols,
+                ss_from_h16,
+                self.shape.eps,
+                &self.stream,
+            ),
+            QuantKind::Q8_0 if dp4a => self.kernels.gemv_norm_q8_0_dp4a_f16(
+                y,
+                &w.blocks,
+                h,
+                &self.scratch.h32,
+                norm_w,
+                rows,
+                cols,
+                ss_from_h16,
+                self.shape.eps,
+                &self.stream,
+            ),
+            QuantKind::Q8_0 => self.kernels.gemv_norm_q8_0_f16(
+                y,
+                &w.blocks,
+                h,
+                &self.scratch.h32,
+                norm_w,
+                rows,
+                cols,
+                ss_from_h16,
+                self.shape.eps,
+                &self.stream,
+            ),
+            other => Err(ForgeError::Unsupported(format!(
+                "{other:?}: brak scalonego GEMV norm"
+            ))),
+        }
+    }
+
+    fn gemv_residual_by_kind(&self, w: &Quantized, x: &DevBuffer) -> Result<()> {
+        let dp4a = w.cols <= Kernels::DP4A_MAX_COLS;
+        match w.quant {
+            QuantKind::None => self.kernels.gemv_residual_f16(
+                &self.scratch.h,
+                &self.scratch.h32,
+                &w.blocks,
+                x,
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            QuantKind::Q4K if dp4a => self.kernels.gemv_residual_q4_k_dp4a_f16(
+                &self.scratch.h,
+                &self.scratch.h32,
+                &w.blocks,
+                x,
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            QuantKind::Q4K => self.kernels.gemv_residual_q4_k_f16(
+                &self.scratch.h,
+                &self.scratch.h32,
+                &w.blocks,
+                x,
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            QuantKind::Q6K if dp4a => self.kernels.gemv_residual_q6_k_dp4a_f16(
+                &self.scratch.h,
+                &self.scratch.h32,
+                &w.blocks,
+                x,
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            QuantKind::Q6K => self.kernels.gemv_residual_q6_k_f16(
+                &self.scratch.h,
+                &self.scratch.h32,
+                &w.blocks,
+                x,
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            QuantKind::Q8_0 if dp4a => self.kernels.gemv_residual_q8_0_dp4a_f16(
+                &self.scratch.h,
+                &self.scratch.h32,
+                &w.blocks,
+                x,
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            QuantKind::Q8_0 => self.kernels.gemv_residual_q8_0_f16(
+                &self.scratch.h,
+                &self.scratch.h32,
+                &w.blocks,
+                x,
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
+            other => Err(ForgeError::Unsupported(format!(
+                "{other:?}: brak scalonego GEMV residual"
+            ))),
+        }
+    }
+
     /// measured rather than assumed: at three lanes on a DGX Spark the batch
     /// through `gemm_q4_k_f16` was SLOWER (17,2 tok/s together) than three
     /// separate sequences, because that tile is built for hundreds of rows and
