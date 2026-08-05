@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+pub mod fuse;
+
 use forge_formats::affine::AffineTriple;
 use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
@@ -79,7 +81,7 @@ pub struct Lane {
 /// pozycje w drugich. Rozjazd między „ile wierszy mnoży projekcja" a „ile
 /// lane'ów czyta uwaga" nie jest błędem kompilacji — jest cudzym kontekstem w
 /// wyniku, czyli płynnym, złym tekstem.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     lanes: Arc<[Lane]>,
     tokens: u32,
@@ -176,6 +178,28 @@ pub enum Op {
     },
     /// `Activated = silu(Gate) * Up`.
     SiluMul {
+        step: Step,
+    },
+    /// RMSNorm followed by a projection, fused for decode-capable executors.
+    FusedNormMatMul {
+        out: Act,
+        w: WeightId,
+        norm_w: WeightId,
+        x: Act,
+        step: Step,
+    },
+    /// Projection followed by adding its result to the hidden stream.
+    FusedMatMulResidual {
+        w: WeightId,
+        x: Act,
+        step: Step,
+    },
+    /// RMSNorm, gate/up projections and SiLU multiplication as one operation.
+    FusedNormSilu {
+        gate_w: WeightId,
+        up_w: WeightId,
+        norm_w: WeightId,
+        x: Act,
         step: Step,
     },
     /// `Hidden += src`.
@@ -445,9 +469,6 @@ mod tests {
     #[test]
     fn an_empty_step_is_refused() {
         assert!(Step::new(vec![], 1).is_err(), "krok bez lane'ów przeszedł");
-        assert!(
-            Step::single(0, 0, 0).is_err(),
-            "krok bez tokenów przeszedł"
-        );
+        assert!(Step::single(0, 0, 0).is_err(), "krok bez tokenów przeszedł");
     }
 }

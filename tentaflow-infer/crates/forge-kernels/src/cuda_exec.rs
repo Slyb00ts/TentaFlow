@@ -373,6 +373,9 @@ impl Executor for CudaExec {
             | Op::KvAppend { step, .. }
             | Op::Attention { step, .. }
             | Op::SiluMul { step }
+            | Op::FusedNormMatMul { step, .. }
+            | Op::FusedMatMulResidual { step, .. }
+            | Op::FusedNormSilu { step, .. }
             | Op::Residual { step, .. }
             | Op::LogitsOfLast { step, .. } => step,
         };
@@ -383,6 +386,65 @@ impl Executor for CudaExec {
             Op::MatMul { out, w, x, .. } => {
                 let w = self.quant(*w)?;
                 self.matmul(self.buf(*out), w, self.buf(*x), step.rows())
+            }
+            Op::FusedNormMatMul {
+                out,
+                w,
+                norm_w,
+                x,
+                step,
+            } => {
+                self.run(&Op::RmsNorm {
+                    out: Act::Norm,
+                    x: *x,
+                    w: *norm_w,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: *out,
+                    w: *w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })
+            }
+            Op::FusedMatMulResidual { w, x, step } => {
+                self.run(&Op::MatMul {
+                    out: Act::Proj,
+                    w: *w,
+                    x: *x,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::Residual {
+                    src: Act::Proj,
+                    step: step.clone(),
+                })
+            }
+            Op::FusedNormSilu {
+                gate_w,
+                up_w,
+                norm_w,
+                x,
+                step,
+            } => {
+                self.run(&Op::RmsNorm {
+                    out: Act::Norm,
+                    x: *x,
+                    w: *norm_w,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: Act::Gate,
+                    w: *gate_w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: Act::Up,
+                    w: *up_w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::SiluMul { step: step.clone() })
             }
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, step),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, step),
@@ -644,6 +706,15 @@ impl CudaExec {
                 w.cols,
                 &self.stream,
             ),
+            QuantKind::Q8_0 => self.kernels.gather_q8_0_rows_f16(
+                &self.scratch.h,
+                &w.blocks,
+                &self.scratch.ids,
+                tokens.len(),
+                w.rows,
+                w.cols,
+                &self.stream,
+            ),
             QuantKind::None => self.kernels.gather_rows_f16(
                 &self.scratch.h,
                 &w.blocks,
@@ -843,6 +914,33 @@ impl CudaExec {
                     weight.cols,
                     &self.stream,
                 )?,
+                QuantKind::Q8_0 => {
+                    let y = self
+                        .device
+                        .sub_buffer(&self.scratch.logits, y_off, weight.rows * 4)?;
+                    let row = self
+                        .device
+                        .sub_buffer(self.buf(x), x_off, weight.cols * 2)?;
+                    if weight.cols <= Kernels::DP4A_MAX_COLS {
+                        self.kernels.gemv_q8_0_dp4a_out_f32(
+                            &y,
+                            &weight.blocks,
+                            &row,
+                            weight.rows,
+                            weight.cols,
+                            &self.stream,
+                        )?;
+                    } else {
+                        self.kernels.gemv_q8_0_out_f32(
+                            &y,
+                            &weight.blocks,
+                            &row,
+                            weight.rows,
+                            weight.cols,
+                            &self.stream,
+                        )?;
+                    }
+                }
                 quant => {
                     let y = self
                         .device
@@ -864,7 +962,6 @@ impl CudaExec {
         }
         Ok(())
     }
-
 
     /// Wiersze jednego lane'a w buforze aktywacji jako własny uchwyt.
     fn lane_rows(&self, buf: &DevBuffer, lane: usize, rows: usize) -> Result<DevBuffer> {
@@ -903,11 +1000,16 @@ impl CudaExec {
         // przy f16 — wolniej, ale to jedyna z tych trzech form, która nie ma
         // granicy kolumn.
         let int8_fits = c <= Kernels::DP4A_MAX_COLS;
-        // Trzy formaty kwantyzują aktywację blokowo i mają dla niej własne
-        // kernele; reszta idzie tabelą. Ta różnica jest w TREŚCI, nie w nazwie,
-        // więc stoi osobno, a nie jako kolejny wiersz.
-        let dp4a = matches!(w.quant, QuantKind::Q4K | QuantKind::Q6K) && int8_fits;
+        // Q4_K, Q6_K and Q8_0 have dedicated int8 activation kernels for
+        // decode; other formats use their table entry.
+        let dp4a =
+            matches!(w.quant, QuantKind::Q4K | QuantKind::Q6K | QuantKind::Q8_0) && int8_fits;
         if rows == 1 {
+            if dp4a && w.quant == QuantKind::Q8_0 {
+                return self
+                    .kernels
+                    .gemv_q8_0_dp4a_f16(out, &w.blocks, x, r, c, &self.stream);
+            }
             return match (dp4a, q6) {
                 (true, true) => {
                     self.kernels
@@ -920,7 +1022,8 @@ impl CudaExec {
                 _ => self.gemv_by_kind(w.quant, out, &w.blocks, x, r, c, w.output_scale),
             };
         }
-        if dp4a
+        if matches!(w.quant, QuantKind::Q4K | QuantKind::Q6K)
+            && dp4a
             && self.kernels.gemm_qk_dp4a_batch_at(
                 out,
                 &w.blocks,
@@ -935,7 +1038,16 @@ impl CudaExec {
         {
             return Ok(());
         }
-        self.gemm_by_kind(w.quant, out, &w.blocks, x, r, c, rows as usize, w.output_scale)
+        self.gemm_by_kind(
+            w.quant,
+            out,
+            &w.blocks,
+            x,
+            r,
+            c,
+            rows as usize,
+            w.output_scale,
+        )
     }
 }
 
@@ -963,9 +1075,7 @@ fn to_f16_bytes(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
             .collect()),
         DType::F32 => Ok(bytes
             .chunks_exact(4)
-            .flat_map(|c| {
-                f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes()
-            })
+            .flat_map(|c| f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes())
             .collect()),
         other => Err(ForgeError::Unsupported(format!(
             "waga niekwantyzowana ma typ {other:?}, a kernele czytają f16"
@@ -1094,6 +1204,7 @@ block_formats! {
     plain {
     None   => gemv_f16        , gemm_f16_at        , gemv_f16_out_f32;
     Q5K    => gemv_q5_k_f16   , gemm_q5_k_f16_at   , gemv_q5_k_out_f32;
+    Q8_0   => gemv_q8_0_f16   , gemm_q8_0_f16_at   , gemv_q8_0_out_f32;
     Q3K    => gemv_q3_k_f16   , gemm_q3_k_f16_at   , gemv_q3_k_out_f32;
     Q2K    => gemv_q2_k_f16   , gemm_q2_k_f16_at   , gemv_q2_k_out_f32;
     Q4_0   => gemv_q4_0_f16   , gemm_q4_0_f16_at   , gemv_q4_0_out_f32;

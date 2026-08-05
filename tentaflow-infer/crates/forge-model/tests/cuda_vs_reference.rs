@@ -43,6 +43,22 @@ fn checkpoint() -> Option<PathBuf> {
         .find(|p| p.extension().is_some_and(|e| e == "gguf"))
 }
 
+fn q8_checkpoint() -> Option<PathBuf> {
+    let dir = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../.runtime/models/bielik-minitron-7b-v3-gguf"
+    ));
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("Q8_0"))
+        })
+}
+
 /// The card, or nothing — and the difference between "nothing" and "busy".
 ///
 /// A test that skips when the device fails to open reports a pass for a machine
@@ -462,6 +478,33 @@ fn compare(what: &str, gpu: &Dense<CudaExec>, cpu: &Dense<HostExec>) {
         "{what}: {:.3}% rozpiętości to nie jest ta sama arytmetyka",
         err * 100.0
     );
+}
+
+#[test]
+#[ignore = "wymaga karty NVIDIA i checkpointu Q8_0"]
+fn q8_0_agrees_with_the_host_reference() {
+    let Some(path) = q8_checkpoint() else {
+        eprintln!("pomijam: brak checkpointu Q8_0");
+        return;
+    };
+    let Some(device) = device() else { return };
+
+    let mut gpu = Dense::load(&path, |spec| CudaExec::new(device.clone() as Arc<_>, spec))
+        .expect("wczytanie Q8_0 na CUDA");
+    let mut cpu = Dense::load(&path, HostExec::new).expect("wczytanie Q8_0 na wzorcu");
+
+    let gpu_first = gpu.prefill(SLOT, &PROMPT).expect("prefill Q8_0 CUDA");
+    let cpu_first = cpu.prefill(SLOT, &PROMPT).expect("prefill Q8_0 wzorca");
+    assert_eq!(gpu_first, cpu_first, "Q8_0: prefill wybrał inny token");
+    compare("Q8_0 prefill", &gpu, &cpu);
+
+    let feed = [Feed {
+        slot: SLOT,
+        token: gpu_first,
+    }];
+    gpu.decode(&feed).expect("krok Q8_0 CUDA");
+    cpu.decode(&feed).expect("krok Q8_0 wzorca");
+    compare("Q8_0 krok", &gpu, &cpu);
 }
 
 /// NVFP4 z safetensors idzie TĄ SAMĄ ścieżką co NVFP4 z GGUF-a.

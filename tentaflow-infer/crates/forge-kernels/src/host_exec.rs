@@ -444,6 +444,66 @@ impl Executor for HostExec {
                 self.matmul(*out, self.quant(*w)?, *x, step.rows() as usize)
             }
 
+            Op::FusedNormMatMul {
+                out,
+                w,
+                norm_w,
+                x,
+                step,
+            } => {
+                self.run(&Op::RmsNorm {
+                    out: Act::Norm,
+                    x: *x,
+                    w: *norm_w,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: *out,
+                    w: *w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })
+            }
+            Op::FusedMatMulResidual { w, x, step } => {
+                self.run(&Op::MatMul {
+                    out: Act::Proj,
+                    w: *w,
+                    x: *x,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::Residual {
+                    src: Act::Proj,
+                    step: step.clone(),
+                })
+            }
+            Op::FusedNormSilu {
+                gate_w,
+                up_w,
+                norm_w,
+                x,
+                step,
+            } => {
+                self.run(&Op::RmsNorm {
+                    out: Act::Norm,
+                    x: *x,
+                    w: *norm_w,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: Act::Gate,
+                    w: *gate_w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: Act::Up,
+                    w: *up_w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::SiluMul { step: step.clone() })
+            }
+
             Op::LogitsOfLast { w, x, step } => {
                 // Ostatni token KAŻDEGO lane'a, każdy w swoim wierszu wyniku.
                 let w = self.quant(*w)?;

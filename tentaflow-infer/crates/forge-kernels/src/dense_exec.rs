@@ -277,9 +277,7 @@ impl WeightStore for MetalExec {
     fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
         let t = match w {
             QuantWeight::Affine(t) => t,
-            QuantWeight::Packed(p) => {
-                to_affine_triple(&p.planes.codes, p.quant, p.rows, p.cols)?
-            }
+            QuantWeight::Packed(p) => to_affine_triple(&p.planes.codes, p.quant, p.rows, p.cols)?,
         };
         self.put_affine(t)
     }
@@ -344,6 +342,9 @@ impl Executor for MetalExec {
             | Op::KvAppend { step, .. }
             | Op::Attention { step, .. }
             | Op::SiluMul { step }
+            | Op::FusedNormMatMul { step, .. }
+            | Op::FusedMatMulResidual { step, .. }
+            | Op::FusedNormSilu { step, .. }
             | Op::Residual { step, .. }
             | Op::LogitsOfLast { step, .. } => step,
         };
@@ -365,6 +366,65 @@ impl Executor for MetalExec {
             Op::Embed { table, tokens, .. } => self.op_embed(*table, tokens),
             Op::RmsNorm { out, x, w, .. } => self.op_rmsnorm(*out, *x, *w, tokens),
             Op::MatMul { out, w, x, .. } => self.op_matmul(*out, *w, *x, tokens),
+            Op::FusedNormMatMul {
+                out,
+                w,
+                norm_w,
+                x,
+                step,
+            } => {
+                self.run(&Op::RmsNorm {
+                    out: Act::Norm,
+                    x: *x,
+                    w: *norm_w,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: *out,
+                    w: *w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })
+            }
+            Op::FusedMatMulResidual { w, x, step } => {
+                self.run(&Op::MatMul {
+                    out: Act::Proj,
+                    w: *w,
+                    x: *x,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::Residual {
+                    src: Act::Proj,
+                    step: step.clone(),
+                })
+            }
+            Op::FusedNormSilu {
+                gate_w,
+                up_w,
+                norm_w,
+                x,
+                step,
+            } => {
+                self.run(&Op::RmsNorm {
+                    out: Act::Norm,
+                    x: *x,
+                    w: *norm_w,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: Act::Gate,
+                    w: *gate_w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::MatMul {
+                    out: Act::Up,
+                    w: *up_w,
+                    x: Act::Norm,
+                    step: step.clone(),
+                })?;
+                self.run(&Op::SiluMul { step: step.clone() })
+            }
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, pos, tokens),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, pos, tokens),
             Op::Attention { layer, .. } => self.op_attention(*layer, pos + tokens, tokens),

@@ -15,13 +15,13 @@
 use std::path::Path;
 
 use forge_formats::affine::permute_rope_rows;
-use forge_formats::nvfp4::nvfp4_ct_to_gguf_blocks;
 use forge_formats::checkpoint::Checkpoint;
+use forge_formats::nvfp4::nvfp4_ct_to_gguf_blocks;
 use forge_formats::source::TensorSource;
 use forge_formats::WeightRole;
 use forge_graph::{
-    Act, ExecSpec, Executor, Lane, Layout, Op, PackedWeight, Planes, QuantWeight, Step, Tile,
-    WeightId, WeightStore,
+    fuse::fuse, Act, ExecSpec, Executor, Lane, Layout, Op, PackedWeight, Planes, QuantWeight, Step,
+    Tile, WeightId, WeightStore,
 };
 use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
@@ -223,7 +223,7 @@ impl<E: Executor + WeightStore> Dense<E> {
             step: step.clone(),
         })?;
         for index in 0..layers.min(self.layers.len()) {
-            for op in self.layer_ops(index, &step) {
+            for op in fuse(&self.layer_ops(index, &step)) {
                 self.exec.run(&op)?;
             }
         }
@@ -354,7 +354,7 @@ impl<E: Executor + WeightStore> Dense<E> {
             step: step.clone(),
         })?;
         for index in 0..self.layers.len() {
-            for op in self.layer_ops(index, step) {
+            for op in fuse(&self.layer_ops(index, step)) {
                 self.exec.run(&op)?;
             }
         }
