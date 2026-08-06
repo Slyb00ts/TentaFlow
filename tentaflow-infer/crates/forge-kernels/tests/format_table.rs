@@ -48,6 +48,19 @@ const WIDTH: usize = 256;
 /// 2/4/8/16 the Q4_K batch kernel accepts, so it is the tile that runs.
 const TILE_TOKENS: u32 = 32;
 
+/// The formats the executor repacks to e4m3 for a prompt-width multiply.
+///
+/// Spelled out here rather than asked of the executor, for the same reason the
+/// format list is: a copy of its own answer would agree with it about a format
+/// it forgot. What this list changes is only the BOUND — every format still
+/// runs all three families and is still compared against the CPU decoder.
+const SECOND_FORM: &[QuantKind] = &[
+    QuantKind::Q4K,
+    QuantKind::Q6K,
+    QuantKind::Q8_0,
+    QuantKind::NVFP4Gguf,
+];
+
 /// Every format the table claims, including the two written out by hand and
 /// the one that takes a tensor scalar.
 ///
@@ -383,8 +396,25 @@ fn every_format_agrees_with_the_cpu_reference() {
         // accumulate in f16 or int8 where the reference stays in f32 — and far
         // tighter than a row reaching the wrong format, which misreads the
         // block layout and lands orders of magnitude away.
+        //
+        // The tile is held to a different number for the four formats that
+        // have a SECOND FORM, and that difference is the e4m3 pack rather than
+        // a kernel: above the batch widths the executor multiplies through it,
+        // and it trades a scale per 32 weights for a scale per row plus four
+        // exponent bits. On the unstructured rows of this fixture that costs
+        // 3–5% of row spread whatever the length of the dot product (measured
+        // 5,0% at K=256, 5,0% at 512, 3,6% at 1024), because there is nothing
+        // in random data for the exponent to exploit. On a real checkpoint the
+        // same route measures 0,56% — see the Bielik comparison in
+        // `forge-model` — so this bound describes the fixture's regime and not
+        // the model's.
         for (family, err) in [("GEMV", gemv), ("głowa", head), ("GEMM", gemm)] {
-            if !(err < 0.02) {
+            let bound = if family == "GEMM" && SECOND_FORM.contains(&quant) {
+                0.06
+            } else {
+                0.02
+            };
+            if !(err < bound) {
                 failures.push(format!("{quant:?} {family}: {:.3}% rozpiętości", err * 100.0));
             }
         }

@@ -206,8 +206,12 @@ fn the_hybrid_continues_a_factual_prompt() {
 /// greedy continuation of a factual prompt repeats itself either way.
 ///
 /// Slow, and the slowness is thirty recurrent layers walked one token at a time
-/// in scalar f32 with every MXFP4 row decoded on demand. The prompt is as short
-/// as a prompt can be.
+/// in scalar f32 with every MXFP4 row decoded on demand. The prompt is therefore
+/// as short as it can be and still cross the width above which the executor
+/// stops routing token by token and REORDERS the step so each expert multiplies
+/// its own block of rows at once. That threshold matters most here: this is the
+/// only checkpoint on this path with a shared expert, so the batched form of it
+/// is compared against an oracle nowhere else.
 #[test]
 #[ignore = "wymaga karty NVIDIA i checkpointu Qwen3.6-MoE; wzorzec liczy minutami na token"]
 fn the_hybrid_agrees_with_the_host_reference() {
@@ -236,7 +240,8 @@ fn the_hybrid_agrees_with_the_host_reference() {
     let mut cpu = Dense::load(&path, HostExec::new).expect("wczytanie na wzorcu");
     eprintln!("wzorzec wczytany w {:.1} s", t.elapsed().as_secs_f64());
 
-    let prompt = [785u32, 6722, 315, 9625, 374];
+    let unit = [785u32, 6722, 315, 9625, 374];
+    let prompt: Vec<u32> = unit.iter().cycle().take(20).copied().collect();
     let t = std::time::Instant::now();
     let gpu_first = gpu.prefill(0, &prompt).expect("prefill CUDA");
     eprintln!("CUDA: prefill w {:.2} s", t.elapsed().as_secs_f64());
@@ -264,6 +269,23 @@ fn the_hybrid_agrees_with_the_host_reference() {
         "krok",
         &gpu.logits(0).expect("logity CUDA"),
         &cpu.logits(0).expect("logity wzorca"),
+        0.02,
+    );
+
+    // The same prompt one token at a time, which is below the threshold and so
+    // routes the OTHER way — including a shared expert folded per token rather
+    // than for the whole step. Two routes agreeing proves nothing by itself,
+    // but the first has just been pinned to the f32 reference.
+    let grouped = gpu.logits(0).expect("logity CUDA");
+    gpu.reset(0).expect("reset");
+    for &token in &prompt {
+        gpu.decode(&[Feed { slot: 0, token }]).expect("krok");
+    }
+    gpu.decode(&feed).expect("krok po prompcie");
+    common::agrees(
+        "krok po kroku",
+        &gpu.logits(0).expect("logity kroków"),
+        &grouped,
         0.02,
     );
 }

@@ -172,10 +172,56 @@ def moe_scale_add_gidx_f16(
 def moe_sigmoid_f16_to_f32(
     out_ptr: UnsafePointer[Float32, MutAnyOrigin],
     in_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
 ):
-    """out[0] = sigmoid(in[0]); the shared-expert gate logit (f16, produced by
-    its gate GEMV) becomes a device-resident f32 scale so moe_scale_add_gidx can
-    fold the shared expert without a per-layer host round-trip. Single thread."""
-    if Int(global_idx.x) == 0:
-        logit = Float32(in_ptr[0])
-        out_ptr[0] = 1.0 / (1.0 + exp(-logit))
+    """out[i] = sigmoid(in[i]) over n shared-expert gate logits.
+
+    The logits (f16, produced by the gate projection) become device-resident
+    f32 scales, so folding the shared expert costs no host round-trip. `n` is
+    the step's token count: one logit per token, and the whole step at once
+    when its projections ran as one matrix."""
+    i = Int(global_idx.x)
+    if i < n:
+        logit = Float32(in_ptr[i])
+        out_ptr[i] = 1.0 / (1.0 + exp(-logit))
+
+
+def moe_combine_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    src_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    slots_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    weights_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    cols: Int,
+    top_k: Int,
+    init: Int,
+):
+    """out[t] = sum_j weights[t*top_k+j] * src[slots[t*top_k+j]] over cols f16.
+
+    The inverse of the gather that groups a step's selections by expert: once
+    every expert has multiplied its own block of rows, each token's answer is
+    scattered across `top_k` rows of `src` and this brings them back together.
+
+    One block per token, and the sum walks `j` in the order the router chose,
+    which is the order the per-token route accumulated in. It differs from that
+    route in ONE respect and deliberately: the running sum stays f32 across all
+    `top_k` and is rounded to f16 once, where folding expert by expert rounded
+    after each. That is a step TOWARD the f32 reference, not away from it.
+
+    `init` overwrites instead of accumulating. The shared expert folds on top
+    of the routed sum through this same kernel with `top_k = 1` and identity
+    slots: its per-token sigmoid gate IS a routing weight, and giving it a
+    second kernel would mean two places to keep the rounding equal.
+    """
+    t = Int(block_idx.x)
+    base = t * top_k
+    i = Int(thread_idx.x)
+    while i < cols:
+        acc = Float32(0)
+        for j in range(top_k):
+            row = Int(slots_ptr[base + j])
+            acc += weights_ptr[base + j] * Float32(src_ptr[row * cols + i])
+        if init != 0:
+            out_ptr[t * cols + i] = Float16(acc)
+        else:
+            out_ptr[t * cols + i] = Float16(Float32(out_ptr[t * cols + i]) + acc)
+        i += Int(block_dim.x)

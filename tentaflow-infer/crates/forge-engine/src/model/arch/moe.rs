@@ -373,7 +373,7 @@ impl Model {
             if let Some(sg) = &moe.shared_gate {
                 self.gemv(&mb.tmp, sg, &b.x, stream)?;
                 self.kernels
-                    .moe_sigmoid_f16_to_f32(&mb.shared_scale, &mb.tmp, stream)?;
+                    .moe_sigmoid_f16_to_f32(&mb.shared_scale, &mb.tmp, 1, stream)?;
             }
             self.kernels.moe_router_f16(
                 &mb.ids,

@@ -63,11 +63,17 @@ macro_rules! block_formats {
             }
 
             #[allow(clippy::too_many_arguments)]
+            /// `w_off` addresses ONE expert inside a flat stack: every kernel
+            /// of the plain section takes a byte offset into the weights, so a
+            /// grouped mixture needs no separate family. The scaled section has
+            /// no such parameter, so a stack in one of those formats stops here
+            /// rather than multiplying the wrong expert's rows.
             pub(super) fn gemm_by_kind(
                 &self,
                 quant: QuantKind,
                 y: &DevBuffer,
                 w: &DevBuffer,
+                w_off: usize,
                 x: &DevBuffer,
                 rows: usize,
                 cols: usize,
@@ -82,14 +88,19 @@ macro_rules! block_formats {
                     // variants by shape and token count and always covers.
                     QuantKind::Q4K => self
                         .kernels
-                        .gemm_q4_k_i8mma_at(y, w, 0, x, rows, cols, n_tokens, &self.stream),
+                        .gemm_q4_k_i8mma_at(y, w, w_off, x, rows, cols, n_tokens, &self.stream),
                     QuantKind::Q6K => {
-                        self.kernels.gemm_q6_k_f16_at(y, w, 0, x, rows, cols, n_tokens, &self.stream)
+                        self.kernels.gemm_q6_k_f16_at(y, w, w_off, x, rows, cols, n_tokens, &self.stream)
                     }
                     $(QuantKind::$k => {
-                        self.kernels.$gemm(y, w, 0, x, rows, cols, n_tokens, &self.stream)
+                        self.kernels.$gemm(y, w, w_off, x, rows, cols, n_tokens, &self.stream)
                     })+
                     $(QuantKind::$sk => {
+                        if w_off != 0 {
+                            return Err(ForgeError::Unsupported(format!(
+                                "{quant:?}: GEMM tego formatu nie adresuje wagi przesunięciem"
+                            )));
+                        }
                         self.kernels.$sgemm(y, w, x, rows, cols, n_tokens, scale, &self.stream)
                     })+
                     other => Err(ForgeError::Unsupported(format!("{other:?}: brak GEMM"))),

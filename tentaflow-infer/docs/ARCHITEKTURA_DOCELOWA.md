@@ -401,10 +401,68 @@ Trzy rzeczy z tego, ważniejsze niż sam mnożnik:
   a nie tej ścieżki. Dla Qwen3.6-35B punktu odniesienia nie ma: silnik przewraca
   się na nim na `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.
 
+Dwie rzeczy zmierzone przy okazji, obie odwracające założenie:
+
+- **Wyspecjalizowany kernel nie jest szybszy od przenośnego.** `gemm_fp8_modular`
+  wymaga skompilowanego z wyprzedzeniem kernela na parę `(wiersze, kolumny)`;
+  przenośny `gemm_fp8` obsługuje każdy kształt. Bielik 512 tokenów: 5309 wobec
+  5266 tok/s, czyli 0,8%. Cały katalog kształtów kupuje tu tyle co nic, a nowa
+  ścieżka nie ma przez to ograniczenia do modeli, których kształty ktoś wpisał.
+- **e4m3 kosztuje 3–5% na danych nieustrukturyzowanych i nie maleje z długością
+  iloczynu skalarnego** (`format_table.rs`: 5,0% przy K=256, 5,0% przy 512, 3,6%
+  przy 1024), a na prawdziwym checkpoincie 0,56%. Różnica jest w DANYCH, nie w
+  K: skala na wiersz plus cztery bity wykładnika nie mają czego wykorzystać w
+  losowym szumie. Bramka tabeli formatów trzyma więc te cztery formaty do innej
+  liczby na kaflu i mówi wprost, że opisuje reżim fikstury, a nie modelu.
+
 `forge-kernels/examples/prefill_bench.rs` mierzy to powtarzalnie: rozgrzewka,
 którą się wyrzuca, bo to ona płaci za paczki, potem powtórzenia i mediana.
 Liczba z testu poprawności jest ZIMNA i nie nadaje się do porównań (1505 tok/s
 na tych samych wagach, dla których ustalona przepustowość to 5230).
+
+### Mieszanka: pętla po tokenach kosztowała ośmiokrotność
+
+Druga postać wagi nie ruszyła mieszanki ani hybrydy, i to był właściwy wynik —
+ich prefill nie stał na arytmetyce projekcji, tylko na LICZBIE URUCHOMIEŃ.
+`op_moe_ffn` szedł token po tokenie, bo kernele czytające numer eksperta na
+urządzeniu biorą jeden wiersz aktywacji: przy prompcie 512 tokenów i ośmiu
+ekspertach to `512 · 8 · 3` uruchomień NA WARSTWĘ, każde czytające całą macierz
+eksperta dla jednego wiersza. Silnik robi to tak samo i ma tę samą liczbę.
+
+Zamiast tego krok się PRZESTAWIA: wybory sortują się po ekspercie, każdy ekspert
+mnoży swój blok wierszy jednym GEMM-em, a odpowiedzi wracają na miejsca swoich
+tokenów. Liczba uruchomień przestaje zależeć od liczby tokenów i zaczyna od
+liczby ekspertów, a ekspert, którego nikt nie wybrał, nie kosztuje nic — gdzie
+wcześniej kosztował raz na każdy token, który go nie wybrał.
+
+Zmierzone, prompt 256 tokenów: **Qwen3-30B-A3B 83 → 685 tok/s** (8,3×, wobec
+87,1 silnika, czyli 7,9× silnika) i **Qwen3.6-35B-A3B 38 → 67** (1,8×; tu zostaje
+sekwencyjny DeltaNet). Wzorzec: 0,306% / 0,260% dla mieszanki, 0,545% / 0,570%
+dla hybrydy.
+
+Trzy rzeczy warte zapamiętania:
+
+- **Nowe kernele prawie nie były potrzebne.** GEMM-y formatów przyjmują
+  przesunięcie bajtowe wagi, więc plaster jednego eksperta jest zwykłym
+  mnożeniem — wystarczyło przepuścić to przesunięcie przez `gemm_by_kind`.
+  Doszedł jeden kernel scalający i rozszerzenie sigmoidu bramki na cały krok.
+- **Jedna synchronizacja na warstwę jest ceną, a nie wadą.** Rozmiar bloku
+  każdego eksperta jest siatką jego uruchomienia, a siatki nie da się podać na
+  urządzeniu — więc wybory wracają na hosta. To `rows·top_k` liczb całkowitych
+  wobec dwunastu tysięcy uruchomień, których nie ma.
+- **Bramka złapała regres, którego nikt nie szukał.** Wydłużenie promptu
+  porównywanego z wzorcem do 20 tokenów — powyżej progu grupowania — pokazało
+  2,931% rozjazdu z prawdziwą zamianą w czołówce. Winne nie było grupowanie,
+  tylko druga postać wagi w projekcjach DeltaNet: **rekurencja składa swoje
+  wejście przez całą sekwencję, więc cztery bity mantysy stracone na wejściu
+  wracają pomnożone.** Po ich wyłączeniu 0,545% — a przepustowość 69 wobec 68
+  tok/s, czyli e4m3 nie dawało tam NIC. Uwaga takiej dźwigni nie ma, i dlatego ta
+  sama wymiana jest tam dobra, a tutaj zła.
+
+Skoro szeroki prompt włącza inną trasę niż wąski, DŁUGOŚĆ PROMPTU W TEŚCIE
+ODNIESIENIA JEST CZĘŚCIĄ BRAMKI. Pięciotokenowy prompt zostawiał grupowanie,
+wsadowego eksperta współdzielonego i e4m3 w DeltaNet bez żadnej wyroczni —
+a wszystkie trzy dawały poprawną angielszczyznę.
 
 ### Kontrakt zmienia się na WSZYSTKICH platformach naraz
 

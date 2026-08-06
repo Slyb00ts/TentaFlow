@@ -139,14 +139,29 @@ struct MoeScratch {
     /// How often each expert was picked — the router writes it; nothing here
     /// reads it yet, and residency is what will.
     counts: DevBuffer,
-    /// One expert's contribution before it is scaled into the accumulator.
+    /// The shared expert's output for every row of the step, before its gate
+    /// scales it into the accumulator.
     tmp: DevBuffer,
-    /// The shared expert's gate logit for this token, and the same after the
-    /// sigmoid — one f16 and one f32. The second is read by the accumulate
-    /// kernel in the very place it reads a routing weight, so the gate never
-    /// crosses the bus.
+    /// The shared expert's gate logit per row, and the same after the sigmoid —
+    /// f16 and f32. The second is read by the combine kernel in the very place
+    /// it reads a routing weight, so the gate never crosses the bus.
     shared_logit: DevBuffer,
     shared_scale: DevBuffer,
+    /// The grouped order: `order[p]` is the token whose activation row sits at
+    /// position p once the step's selections are sorted by expert.
+    order: DevBuffer,
+    /// Its inverse: where each token's j-th selection landed in that order.
+    slots: DevBuffer,
+    /// `[0, 1, 2, …]`, the slot table of a single selection per token — the
+    /// shared expert folds through the same combine kernel as the routed sum.
+    identity: DevBuffer,
+    /// Activations, both feed-forward halves and the answers, all in grouped
+    /// order. Sized by SELECTIONS rather than rows: one token appears in
+    /// `top_k` of them, which is what the reorder is for.
+    grouped_x: DevBuffer,
+    grouped_gate: DevBuffer,
+    grouped_up: DevBuffer,
+    grouped_out: DevBuffer,
     selections: usize,
     experts: usize,
 }
@@ -1422,6 +1437,7 @@ impl CudaExec {
             w.quant,
             out,
             &w.blocks,
+            0,
             x,
             r,
             c,

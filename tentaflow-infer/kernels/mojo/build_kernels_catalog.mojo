@@ -615,6 +615,7 @@ from src.sampling import (
 )
 from src.sampling import penalize_histogram_f32, penalized_argmax_f32
 from src.moe import (
+    moe_combine_f16,
     moe_router_f16,
     moe_scale_add_f16,
     moe_scale_add_gidx_f16,
@@ -3163,6 +3164,11 @@ def main() raises:
         moe_sigmoid_f16_to_f32, dump_asm=Path("moe_sigmoid_f16_to_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "moe_sigmoid_f16_to_f32"))
+
+    _ = ctx.compile_function[
+        moe_combine_f16, dump_asm=Path("moe_combine_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "moe_combine_f16"))
 
     _ = ctx.compile_function[
         gemv_q5_k_f16_v2, dump_asm=Path("gemv_q5_k_f16_v2.ptx")

@@ -2053,6 +2053,10 @@
       "entry": "src_onnx_ops_lstm_f32_Pointe6A6A6A6AoA6A6A_f087703d1fc6f40f",
       "file": "lstm_f32.ptx"
     },
+    "moe_combine_f16": {
+      "entry": "src_moe_moe_combine_f16_Poin6A6A6A6AoA6A6A_f39556ba15edb720",
+      "file": "moe_combine_f16.ptx"
+    },
     "moe_gate_sqrtsoftplus_f16": {
       "entry": "src_deepseek_moe_gate_sqrtsoft6A6A6A6A_92871b0b1fa8af7a",
       "file": "moe_gate_sqrtsoftplus_f16.ptx"
@@ -2070,7 +2074,7 @@
       "file": "moe_scale_add_gidx_f16.ptx"
     },
     "moe_sigmoid_f16_to_f32": {
-      "entry": "src_moe_moe_sigmoid_f16_to_f326A6A6A6A_4d5abdd4736611be",
+      "entry": "src_moe_moe_sigmoid_f16_to_f326A6A6A6A_f0d4fe72f78d15a2",
       "file": "moe_sigmoid_f16_to_f32.ptx"
     },
     "mtp_commit_catchup_metadata_segmented": {

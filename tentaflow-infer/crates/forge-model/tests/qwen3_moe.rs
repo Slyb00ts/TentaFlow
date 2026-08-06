@@ -133,6 +133,12 @@ fn the_mixture_continues_a_factual_prompt() {
 /// near-tie between two experts could be broken differently on the two sides.
 /// If that happens the logits diverge far past this threshold and the test says
 /// so, rather than the difference being absorbed into a loose bound.
+///
+/// The prompt is 20 tokens and that number is load-bearing: above a threshold
+/// the executor stops routing token by token and REORDERS the step so each
+/// expert multiplies its own block of rows at once. A five-token prompt would
+/// leave that route uncompared against anything — which is how it could ship
+/// wrong and still produce Polish.
 #[test]
 #[ignore = "wymaga karty NVIDIA i checkpointu Qwen3-MoE; wzorzec liczy minutami na token"]
 fn the_mixture_agrees_with_the_host_reference() {
@@ -148,7 +154,8 @@ fn the_mixture_agrees_with_the_host_reference() {
     let mut cpu = Dense::load(&path, HostExec::new).expect("wczytanie na wzorcu");
     eprintln!("wzorzec wczytany w {:.1} s", t.elapsed().as_secs_f64());
 
-    let prompt = [785u32, 6722, 315, 9625, 374];
+    let unit = [785u32, 6722, 315, 9625, 374];
+    let prompt: Vec<u32> = unit.iter().cycle().take(20).copied().collect();
     let t = std::time::Instant::now();
     let gpu_first = gpu.prefill(SLOT, &prompt).expect("prefill CUDA");
     eprintln!("CUDA: prefill w {:.2} s", t.elapsed().as_secs_f64());
@@ -165,6 +172,20 @@ fn the_mixture_agrees_with_the_host_reference() {
     gpu.decode(&feed).expect("krok CUDA");
     cpu.decode(&feed).expect("krok wzorca");
     compare("krok", &gpu, &cpu);
+
+    // The same prompt, one token at a time: below the threshold every step
+    // routes token by token, so this is the OTHER route through the same
+    // weights. Comparing the two routes to each other says nothing on its own —
+    // two copies of one mistake agree — but the grouped side has just been
+    // pinned to the f32 reference above, so agreeing with it pins this one too.
+    let grouped = gpu.logits(0).expect("logity CUDA");
+    gpu.reset(SLOT).expect("reset");
+    for &token in &prompt {
+        gpu.decode(&[Feed { slot: SLOT, token }]).expect("krok");
+    }
+    gpu.decode(&feed).expect("krok po prompcie");
+    let stepped = gpu.logits(0).expect("logity kroków");
+    common::agrees("krok po kroku", &stepped, &grouped, 0.02);
 }
 
 fn compare(what: &str, gpu: &Dense<CudaExec>, cpu: &Dense<HostExec>) {

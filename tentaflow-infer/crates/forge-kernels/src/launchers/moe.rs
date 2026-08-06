@@ -150,19 +150,72 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// `out[0] = sigmoid(in[0])`: turns the shared-expert gate logit (f16) into
-    /// a device-resident f32 scale so `moe_scale_add_gidx_f16` can fold the
-    /// shared expert without a per-layer host round-trip.
+    /// `out[i] = sigmoid(in[i])` over `n` shared-expert gate logits: turns them
+    /// (f16, from the gate projection) into device-resident f32 scales, so
+    /// folding the shared expert costs no per-layer host round-trip. One logit
+    /// per token, and the whole step at once when its projection ran as one
+    /// matrix.
     pub fn moe_sigmoid_f16_to_f32(
         &self,
         out: &DevBuffer,
         input: &DevBuffer,
+        n: usize,
         stream: &Stream,
     ) -> Result<()> {
         let k = self.artifacts.get("moe_sigmoid_f16_to_f32")?;
-        let cfg = LaunchConfig::linear(1, BLOCK);
-        let args = LaunchArgs::new().buf(out).buf(input);
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(input).scalar(n as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `out[t] = Σ_j weights[t·top_k+j] · src[slots[t·top_k+j]]`, one block per
+    /// token: the inverse of the gather that groups a step's selections by
+    /// expert.
+    ///
+    /// The sum walks `j` in the order the router chose, as the per-token route
+    /// did, but keeps it in f32 across all `top_k` and rounds to f16 once —
+    /// where folding expert by expert rounded after each one. Toward the f32
+    /// reference, not away from it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_combine_f16(
+        &self,
+        out: &DevBuffer,
+        src: &DevBuffer,
+        slots: &DevBuffer,
+        weights: &DevBuffer,
+        tokens: usize,
+        cols: usize,
+        top_k: usize,
+        init: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        let selections = checked_buffer_bytes("moe_combine selections", &[tokens, top_k], 4)?;
+        let out_bytes = checked_buffer_bytes("moe_combine output", &[tokens, cols], 2)?;
+        if tokens == 0
+            || cols == 0
+            || top_k == 0
+            || out.len() < out_bytes
+            || slots.len() < selections
+            || weights.len() < selections
+        {
+            return Err(ForgeError::Kernel(
+                "moe_combine_f16: nieprawidłowy kształt lub zbyt mały bufor".into(),
+            ));
+        }
+        let k = self.artifacts.get("moe_combine_f16")?;
+        let cfg = LaunchConfig {
+            grid: (tokens as u32, 1, 1),
+            block: (BLOCK.min(cols as u32).max(32), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(src)
+            .buf(slots)
+            .buf(weights)
+            .scalar(cols as i64)
+            .scalar(top_k as i64)
+            .scalar(init as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
 }
