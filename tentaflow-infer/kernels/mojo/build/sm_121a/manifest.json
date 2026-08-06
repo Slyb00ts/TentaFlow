@@ -2149,6 +2149,10 @@
       "entry": "src_moe_moe_sigmoid_f16_to_f326A6A6A6A_f0d4fe72f78d15a2",
       "file": "moe_sigmoid_f16_to_f32.ptx"
     },
+    "moe_topk_f32": {
+      "entry": "src_moe_moe_topk_f32_Pointer6A6A6A6AoA6A6A_cd3476a0be05732d",
+      "file": "moe_topk_f32.ptx"
+    },
     "mtp_commit_catchup_metadata_segmented": {
       "entry": "src_mtp_mtp_commit_catchup_met6A6A6A6A_2a33d88a45a5dffd",
       "file": "mtp_commit_catchup_metadata_segmented.ptx"

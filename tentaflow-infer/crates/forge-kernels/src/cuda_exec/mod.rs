@@ -174,6 +174,8 @@ struct MoeScratch {
     /// overwrites it at `inter`, and nothing reads across that boundary.
     grouped_xq: DevBuffer,
     grouped_xs: DevBuffer,
+    /// Router logits of every row, `[rows][experts]` in f32.
+    logits: DevBuffer,
     selections: usize,
     experts: usize,
 }

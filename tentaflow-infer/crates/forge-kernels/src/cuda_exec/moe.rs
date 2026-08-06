@@ -78,6 +78,7 @@ impl CudaExec {
             grouped_out: dev(selections * hidden * 2)?,
             grouped_xq: dev(selections * hidden.max(inter) / 64 * 36)?,
             grouped_xs: dev(selections * 4)?,
+            logits: dev(rows * experts * 4)?,
             selections,
             experts,
         };
@@ -371,14 +372,38 @@ impl CudaExec {
         // rounding that flips a near-tie changes WHICH expert computes, not the
         // value it computes. The reference keeps f32 and the gate compares the
         // selections, so a flip is reported rather than absorbed.
-        self.kernels.moe_router_f16(
+        // Two launches and not one, because the two halves have opposite
+        // shapes. The projection is `experts x hidden` against the step's rows
+        // — an ordinary multiply, and at decode a million bytes of router
+        // weight that one block per token would push through a single
+        // multiprocessor. The selection genuinely is one block per token.
+        if rows == 1 {
+            self.kernels.gemv_f16_out_f32(
+                &moe.logits,
+                &router.blocks,
+                self.buf(x),
+                experts,
+                hidden,
+                &self.stream,
+            )?;
+        } else {
+            self.kernels.gemm_f16_out_f32_at(
+                &moe.logits,
+                &router.blocks,
+                0,
+                self.buf(x),
+                experts,
+                hidden,
+                rows,
+                &self.stream,
+            )?;
+        }
+        self.kernels.moe_topk_f32(
             &moe.ids,
             &moe.weights,
-            self.buf(x),
-            &router.blocks,
+            &moe.logits,
             &moe.counts,
             rows,
-            hidden,
             experts,
             top_k,
             norm_topk,

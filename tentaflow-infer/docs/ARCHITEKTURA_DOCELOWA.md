@@ -669,3 +669,58 @@ policzony dla obu. Bez tego wyboru rozpiętość wychodziła 0,806%, ale czwarte
 miejsce czołówki było ZAMIENIONE przy separacji pięciokrotnie większej od błędu —
 czyli liczba mniejsza, a wynik gorszy. To jest powód, dla którego bramką jest
 kolejność, a nie norma.
+
+### Generacja: router liczył projekcję jednym blokiem
+
+Sufit generacji jest tu policzalny i warto go mieć przed sobą. Qwen3.6-35B czyta
+na token 3,258 GB (2,710 GB części gęstej plus 8 z 256 ekspertów), więc 68,15
+tok/s llama.cpp to **222 GB/s** — praktycznie tyle, ile ta pamięć oddaje.
+Ścieżka gęsta FORGE jest już przy około 217 GB/s; cały dystans siedzi w
+mieszance.
+
+`moe_router_f16` liczył iloczyny ekspertów I wybór w JEDNYM BLOKU NA TOKEN. Przy
+prefillu bloków jest tyle, ile tokenów, i to jest w porządku. Przy generacji
+token jest jeden, więc cała projekcja routera — dla 256 ekspertów i 2048 kanałów
+milion bajtów wagi — przechodziła przez jeden multiprocesor. To było 29,5% kroku.
+
+Dwie połówki mają przeciwne kształty, więc są teraz dwoma uruchomieniami:
+projekcja jest zwykłym GEMV (albo GEMM przy wielu wierszach), a jednym blokiem
+na token jest wyłącznie softmax z top-k. Generacja: 24,4 -> 31,1 tok/s na
+hybrydzie i 45,2 -> 58,3 na mieszance Q4_K, gdzie ten sam kernel miał ten sam
+kształt.
+
+### GEMV ekspertów MXFP4: trzy hipotezy obalone pomiarem
+
+Po rozdzieleniu routera 48% kroku siedzi w `gemv_mxfp4_f16_gidx`. Izolowany
+pomiar tego samego launchera i tego samego kształtu (`examples/moe_gemv_bench`)
+stawia sprawę jednoznacznie:
+
+| kształt | MXFP4 | Q4_K | Q6_K |
+|---|---|---|---|
+| gate/up 512x2048 | 43,8 GB/s | 349,0 | 255,2 |
+| down 2048x512 | 38,9 GB/s | 222,9 | 84,1 |
+
+Ten sam launcher, ta sama siatka, te same selekcje — więc kształt wywołania jest
+bez winy, a różnica należy do formatu. Trzy wyjaśnienia sprawdzono i KAŻDE
+OKAZAŁO SIĘ NIEPRAWDĄ:
+
+1. **Tablica wartości w LDS.** `_dot_lut_block32` robił 32 skalarne odczyty
+   wspólne na blok szesnastu bajtów. Zastąpienie ich arytmetycznym
+   `_e2m1x8_f16` — tym samym, którym zdjęto tę ścianę w GEMV NVFP4 — dało 6%.
+2. **Powtórny odczyt aktywacji.** Każda fala czytała cały wektor z pamięci
+   globalnej: 4096 fal razy 4 KiB to 16,8 MB wobec 4,46 MB wagi. Zbuforowanie go
+   raz na blok, dokładnie jak robi to Q4_K, dało wynik GORSZY (109 zamiast 102
+   us) — aktywacja była już obsługiwana z cache'u, a 16 KiB pamięci
+   współdzielonej kosztowało więcej, niż oszczędziło.
+3. **Szerokość jednostki pracy.** Q6_K liczy 128 wartości na linię na iterację i
+   ma około 7 instrukcji na wartość wobec 29 w MXFP4; przejście na tę samą
+   jednostkę dało 36,4 zamiast 43,8 GB/s na gate/up i 12,3 zamiast 38,9 na down,
+   bo szeroka jednostka zostawia bezczynne linie, a ten kernel traci na tym
+   więcej, niż zyskuje.
+
+Co zostaje niesprawdzone: Q4_K różni się jeszcze JEDNĄ rzeczą — liczy w DP4A na
+aktywacji skwantyzowanej do int8, gdzie MXFP4 mnoży w f16. Wartości e2m1
+pomnożone przez dwa to dokładnie `{0,±1,±2,±3,±4,±6,±8,±12}`, czyli tablica
+MXFP4 GGML-a, więc int8 jest tu DOKŁADNY, nie przybliżony. Przeliczenie półbajtu
+na int8 kosztuje `prmt` plus maska znaku; czy to wystarczy, żeby dogonić Q4_K,
+jest pytaniem otwartym i pomiar go rozstrzygnie.

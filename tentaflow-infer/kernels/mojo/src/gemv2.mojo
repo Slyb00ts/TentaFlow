@@ -1429,6 +1429,102 @@ def gemv_mxfp4_f16_v2(
         y[row] = Float16(total)
 
 
+@always_inline
+def _e2m1x16_f16(codes: SIMD[DType.uint8, 16]) -> SIMD[DType.float16, 16]:
+    """`_e2m1x8_f16` na szesnastu kodach naraz — patrz tam po wyprowadzenie."""
+    m = (codes & 0x07).cast[DType.uint16]()
+    exponent = m >> 1
+    mantissa = (m & 1) & ((exponent + 3) >> 2)
+    bits = ((exponent + 14) << 10) | (mantissa << 9)
+    nonzero = SIMD[DType.uint16, 16](0) - ((m + 7) >> 3)
+    sign = ((codes >> 3) & 1).cast[DType.uint16]() << 15
+    return bitcast[DType.float16, 16]((bits & nonzero) | sign)
+
+
+comptime MXFP4_UNIT = 1
+"""Blokow MXFP4 na jedna iteracje linii.
+
+CZTERY — jak jednostka Q6_K, ktora na tym samym ksztalcie wyciaga 255 GB/s —
+zmierzono i jest GORSZE: 36,4 zamiast 44,9 GB/s na gate/up i 12,3 zamiast 41,1
+na down. Szeroka jednostka zostawia bezczynne linie (64 bloki wiersza dzielone
+na cztery to 16 jednostek na 32 linie, a 16 blokow `down` to raptem cztery), a
+ten kernel traci na tym wiecej, niz zyskuje na amortyzacji dekodowania."""
+
+
+@always_inline
+def _mxfp4_row_acc_fast(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    row: Int,
+    lane: Int,
+) -> Float32:
+    """`dot(W[row], x)` z blokow MXFP4, jednostka pracy to 128 wartosci.
+
+    Wariant z tablica w LDS robil TRZYDZIESCI DWA skalarne odczyty wspoldzielone
+    na blok szesnastu bajtow wagi, a jednostka pracy linii miala 32 wartosci —
+    czyli okolo 29 instrukcji na wartosc wobec 7 w Q6_K, ktory na tym samym
+    ksztalcie i przez ten sam launcher wyciaga 255 GB/s. Roznica byla dokladnie
+    ta: SZEROKOSC JEDNOSTKI. Tu linia bierze cztery bloki naraz i liczy je
+    wektorami szesnastu wartosci, wiec dekodowanie i redukcja amortyzuja sie na
+    128 wartosciach zamiast na 32.
+
+    Skala: `_e8m0_half(e)` razy tablica MXFP4 (dwukrotnosc e2m1) to `2^(e-127)`
+    razy e2m1 — bitowo ta sama liczba, jeden mnoznik mniej.
+    """
+    blocks_per_row = n_cols // 32
+    row_base = row * blocks_per_row * 17
+    units = blocks_per_row // MXFP4_UNIT
+    var acc: Float32 = 0.0
+    var u = lane
+    while u < units:
+        base = row_base + u * (MXFP4_UNIT * 17)
+        col = u * (MXFP4_UNIT * 32)
+        comptime for k in range(MXFP4_UNIT):
+            off = base + k * 17
+            codes = (w + off + 1).load[width=16, alignment=1]()
+            x0 = (x + col + k * 32).load[width=16, alignment=32]()
+            x1 = (x + col + k * 32 + 16).load[width=16, alignment=32]()
+            acc += _e8m0_pow2(w[off]) * (
+                (_e2m1x16_f16(codes & 0x0F) * x0)
+                .cast[DType.float32]()
+                .reduce_add()
+                + (_e2m1x16_f16(codes >> 4) * x1)
+                .cast[DType.float32]()
+                .reduce_add()
+            )
+        u += WARP
+
+    # Ogon: wiersz krotszy niz `WARP * MXFP4_UNIT` blokow zostawilby czesc
+    # kolumn nieprzeliczonych, wiec reszta idzie blok po bloku.
+    var b = units * MXFP4_UNIT + lane
+    while b < blocks_per_row:
+        off = row_base + b * 17
+        codes = (w + off + 1).load[width=16, alignment=1]()
+        col = b * 32
+        x0 = (x + col).load[width=16, alignment=32]()
+        x1 = (x + col + 16).load[width=16, alignment=32]()
+        acc += _e8m0_pow2(w[off]) * (
+            (_e2m1x16_f16(codes & 0x0F) * x0).cast[DType.float32]().reduce_add()
+            + (_e2m1x16_f16(codes >> 4) * x1)
+            .cast[DType.float32]()
+            .reduce_add()
+        )
+        b += WARP
+    return acc
+
+
+@always_inline
+def _e8m0_pow2(e: UInt8) -> Float32:
+    """`2^(e-127)`, czyli dwukrotnosc `_e8m0_half` — patrz `_mxfp4_row_acc_fast`."""
+    var bits: UInt32
+    if e < 1:
+        bits = UInt32(0x00400000) << UInt32(e)
+    else:
+        bits = UInt32(e) << 23
+    return UnsafePointer(to=bits).bitcast[Float32]()[0]
+
+
 def gemv_mxfp4_f16_gidx(
     y: UnsafePointer[Float16, MutAnyOrigin],
     wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
@@ -1444,15 +1540,13 @@ def gemv_mxfp4_f16_gidx(
     `wtab[e]` is expert `e`'s own weight base pointer, so experts need not be
     contiguous and each may sit in VRAM or pinned host memory independently.
     Bit-identical to gemv_mxfp4_f16_v2 launched against that expert's block."""
-    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
-    _init_lut16(lut, MXFP4_VALS)
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP
     lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
     if lrow >= n_rows:
         return
     w = wtab[Int(ids[sel])]
-    total = warp.sum(_gemv_mxfp4_row_acc(w, x, lut, n_cols, lrow, lane))
+    total = warp.sum(_mxfp4_row_acc_fast(w, x, n_cols, lrow, lane))
     if lane == 0:
         y[lrow] = Float16(total)
 

@@ -225,3 +225,84 @@ def moe_combine_f16(
         else:
             out_ptr[t * cols + i] = Float16(Float32(out_ptr[t * cols + i]) + acc)
         i += Int(block_dim.x)
+
+
+def moe_topk_f32(
+    ids_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    weights_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    logits_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    counts_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    n_expert: Int,
+    top_k: Int,
+    norm_topk: Int,
+):
+    """Softmax i wybór top-k z GOTOWYCH logitów routera.
+
+    `moe_router_f16` liczył iloczyny ekspertów i wybór w jednym bloku na token.
+    Przy generacji token jest JEDEN, więc cała projekcja routera — dla 256
+    ekspertów i 2048 kanałów milion bajtów wagi — szła przez jeden
+    multiprocesor, i to była prawie jedna trzecia czasu kroku. Iloczyny są
+    zwykłym GEMV, więc liczy je GEMV; tutaj zostaje wyłącznie to, co naprawdę
+    jest jednym blokiem na token.
+
+    Redukcje maksimum i sumy idą przez blok, a samo top-k pozostaje szeregowe na
+    zerowym wątku: przy `n_expert <= 256` i `top_k <= 8` to kilka tysięcy
+    iteracji, a kolejność rozstrzygania remisów zostaje ta sama co we wzorcu.
+    """
+    token = Int(block_idx.x)
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+
+    logits = stack_allocation[
+        MOE_MAX_EXPERTS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    base = token * n_expert
+    var i = tid
+    while i < n_expert:
+        logits[i] = logits_ptr[base + i]
+        i += nthreads
+    barrier()
+
+    if tid == 0:
+        var mx = logits[0]
+        var n = 1
+        while n < n_expert:
+            if logits[n] > mx:
+                mx = logits[n]
+            n += 1
+        var denom: Float32 = 0.0
+        n = 0
+        while n < n_expert:
+            denom += exp(logits[n] - mx)
+            n += 1
+        n = 0
+        while n < n_expert:
+            logits[n] = exp(logits[n] - mx) / denom
+            n += 1
+
+        var wsum: Float32 = 0.0
+        var kk = 0
+        while kk < top_k:
+            var best_i = 0
+            var best_v = NEG_BIG
+            n = 0
+            while n < n_expert:
+                if logits[n] > best_v:
+                    best_v = logits[n]
+                    best_i = n
+                n += 1
+            ids_ptr[token * top_k + kk] = Int32(best_i)
+            _ = Atomic.fetch_add(counts_ptr + best_i, Int32(1))
+            weights_ptr[token * top_k + kk] = best_v
+            wsum += best_v
+            logits[best_i] = NEG_BIG
+            kk += 1
+
+        if norm_topk != 0 and wsum > 0.0:
+            var inv = 1.0 / wsum
+            kk = 0
+            while kk < top_k:
+                weights_ptr[token * top_k + kk] = (
+                    weights_ptr[token * top_k + kk] * inv
+                )
+                kk += 1

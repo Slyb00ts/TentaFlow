@@ -50,6 +50,61 @@ impl Kernels {
     /// Writes `ids` ([n_tokens, top_k] i32) and `weights` ([n_tokens, top_k]
     /// f32). `norm_topk` renormalizes the selected weights to sum 1.
     #[allow(clippy::too_many_arguments)]
+    /// Softmax i top-k z GOTOWYCH logitow routera.
+    ///
+    /// Projekcja routera jest zwyklym GEMV i liczy ja GEMV; tutaj zostaje
+    /// wylacznie wybor, ktory naprawde jest jednym blokiem na token.
+    /// `moe_router_f16` robi jedno i drugie naraz, co przy generacji sciska
+    /// caly milion bajtow wagi routera przez jeden multiprocesor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_topk_f32(
+        &self,
+        ids: &DevBuffer,
+        weights: &DevBuffer,
+        logits: &DevBuffer,
+        counts: &DevBuffer,
+        n_tokens: usize,
+        n_expert: usize,
+        top_k: usize,
+        norm_topk: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n_expert > 256 {
+            return Err(ForgeError::Kernel(format!(
+                "moe_topk: n_expert {n_expert} przekracza limit kernela 256"
+            )));
+        }
+        if top_k == 0 || top_k > n_expert {
+            return Err(ForgeError::Kernel(format!(
+                "moe_topk: top_k {top_k} poza zakresem dla {n_expert} ekspertow"
+            )));
+        }
+        if ids.len() < n_tokens * top_k * 4
+            || weights.len() < n_tokens * top_k * 4
+            || logits.len() < n_tokens * n_expert * 4
+            || counts.len() < n_expert * 4
+        {
+            return Err(ForgeError::Kernel(
+                "moe_topk: bufor jest mniejszy od ksztaltu".into(),
+            ));
+        }
+        let k = self.artifacts.get("moe_topk_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(ids)
+            .buf(weights)
+            .buf(logits)
+            .buf(counts)
+            .scalar(n_expert as i64)
+            .scalar(top_k as i64)
+            .scalar(i64::from(norm_topk));
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     pub fn moe_router_f16(
         &self,
         ids: &DevBuffer,
@@ -350,11 +405,7 @@ impl Kernels {
         };
         let k = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
-            grid: (
-                (rows as u32).div_ceil(ROWS_PER_BLOCK),
-                selections as u32,
-                1,
-            ),
+            grid: ((rows as u32).div_ceil(ROWS_PER_BLOCK), selections as u32, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };

@@ -639,6 +639,7 @@ from src.mma_fp4 import (
     mma_rate_nvf4,
 )
 from src.moe import (
+    moe_topk_f32,
     moe_combine_f16,
     moe_router_f16,
     moe_scale_add_f16,
@@ -3193,6 +3194,11 @@ def main() raises:
         moe_combine_f16, dump_asm=Path("moe_combine_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "moe_combine_f16"))
+
+    _ = ctx.compile_function[
+        moe_topk_f32, dump_asm=Path("moe_topk_f32.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "moe_topk_f32"))
 
     _ = ctx.compile_function[
         mma_mxf4_probe, dump_asm=Path("mma_mxf4_probe.ptx")
