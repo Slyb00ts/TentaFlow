@@ -925,6 +925,14 @@
       "entry": "src_nvfp4_gguf_batch_gemm_nvfp6A6A6A6A_42761ff8ba85fb92",
       "file": "gemm_nvfp4_gguf_out_f32_b8.ptx"
     },
+    "gemm_nvfp4_mma_f16_bm128_bn128": {
+      "entry": "src_gemm_fp4_gemm_nvfp4_mma_im6A6A6A6A_ca80e5083819d800",
+      "file": "gemm_nvfp4_mma_f16_bm128_bn128.ptx"
+    },
+    "gemm_nvfp4_mma_f16_bm64_bn64": {
+      "entry": "src_gemm_fp4_gemm_nvfp4_mma_im6A6A6A6A_9b83cb0a1eea53a1",
+      "file": "gemm_nvfp4_mma_f16_bm64_bn64.ptx"
+    },
     "gemm_nvfp4_tile128_mma_f16_bm128_bn128": {
       "entry": "src_nvfp4_tile128_mma_gemm_nvf6A6A6A6A_670466cbc137b4cd",
       "file": "gemm_nvfp4_tile128_mma_f16_bm128_bn128.ptx"
@@ -2240,6 +2248,10 @@
     "quantize_act_fp8": {
       "entry": "src_gemm_fp8_quantize_act_fp86A6A6A6AoA_28a0fbe0a97b60ab",
       "file": "quantize_act_fp8.ptx"
+    },
+    "quantize_act_nvfp4": {
+      "entry": "src_quant_fp4_quantize_act_nvf6A6A6A6A_ece49050795502e4",
+      "file": "quantize_act_nvfp4.ptx"
     },
     "quantize_act_q8_1": {
       "entry": "src_gemm_quantize_act_q8_1_P6A6A6A6AoA6A6A_3306f3c2797f6f54",
