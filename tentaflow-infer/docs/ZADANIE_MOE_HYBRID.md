@@ -90,20 +90,57 @@ Kernele istnieją w komplecie — `moe_router_f16`, `moe_gate_sqrtsoftplus_f16`,
 praca to znowu WPIĘCIE, tak jak przy `CudaExec`. Jeśli okaże się inaczej, to jest
 wynik wart zapisania, a nie powód, żeby dopisywać kernele w tym kroku.
 
-### Czego wymaga, a czego nie mamy
+### Checkpoint: Qwen3-30B-A3B Q4_K_M, i dlaczego akurat ten
 
-**Małego checkpointu MoE.** To jedyna twarda przeszkoda i trzeba ją nazwać, a nie
-obejść. Lokalnie jest `DeepSeek-V4-Flash` (156 GiB) — za duży, żeby wzorzec
-hostowy policzył nim cokolwiek w rozsądnym czasie, a wzorzec jest tu całą
-bramką. Potrzebny jest MoE rzędu kilku GiB (np. Qwen3-30B-A3B w niskim kwancie
-albo cokolwiek mniejszego z tą samą strukturą routera).
+Pobrany do `.runtime/models/qwen3-30b-a3b-gguf/` (18,56 GiB, jeden plik z
+oficjalnego repo `Qwen/Qwen3-30B-A3B-GGUF`). Wybrany świadomie:
 
-Do czasu, aż taki checkpoint będzie, 4a da się napisać i zabramkować
-HERMETYCZNIE, tak jak tabela formatów w `forge-kernels/tests/format_table.rs`:
-router o znanych wagach, znany top-k, eksperci o znanych macierzach, wynik
-policzony wzorcem w f32. To sprawdza routing, wybór i akumulację — czyli
-wszystko, co w tym kroku jest nowe. Checkpoint dokłada tylko „wynik ma być
-językiem", i to jest jedyna rzecz, na którą trzeba poczekać.
+- **`qwen3moe`, czyli MoE BEZ hybrydy.** `qwen35moe` też jest zarejestrowany,
+  ale to MoE **razem z** DeltaNet — czyli obie rodziny naraz, czego §6 zabrania.
+- **Najprostszy wariant routingu, jaki mamy w rejestrze**: bez eksperta
+  współdzielonego, bez biasu routera (`noaux_tc` DeepSeeka), bez routingu
+  haszowanego. Zostaje samo jądro: logity routera, top-k, renormalizacja
+  (`norm_topk_prob = true`), SwiGLU wybranych ekspertów, akumulacja z wagami.
+  Wszystkie cztery pułapki z §5 są więc na tym modelu WYŁĄCZONE — wchodzą
+  dopiero z DeepSeekiem, i to jest właściwa kolejność.
+- **Wzorzec go udźwignie**, mimo 30B: `HostExec` trzyma bloki źródła i dekoduje
+  wiersz na żądanie, więc pamięć to rozmiar checkpointu, a nie f32. A MoE aktywuje
+  ~3B parametrów na token, czyli mniej niż dzisiejszy gęsty Bielik 7B, na którym
+  wzorzec liczy prefill sześciu tokenów w 24 s.
+- Q4_K_M, czyli format najlepiej sprawdzony w tej ścieżce.
+
+### 3a. Ten checkpoint wymusza JESZCZE JEDNĄ rzecz: QK-norm
+
+Wyszło z odczytania `arch/qwen3moe.ron` przed pisaniem, a nie w połowie: rodzina
+Qwen3 ma **normalizację per głowica na Q i K**, z UCZONĄ wagą
+(`attn_q_norm.weight`, `attn_k_norm.weight`, obie `required: true`). Dzisiejszy
+`Dense` w nowej ścieżce jej nie ma, bo Bielik ani llama jej nie używają — jego
+lista ról kończy się na `AttnO`.
+
+Więc kamień 4a rozpada się na dwa, i lepiej wiedzieć to teraz:
+
+- **4a-0: QK-norm.** Nie jest to praca MoE — potrzebuje jej także GĘSTY Qwen3,
+  więc to samodzielny, mały krok, który da się zabramkować osobno.
+- **4a-1: sam MoE.**
+
+Kernela nie trzeba pisać ani szukać osobnego: silnik robi tę normę przez zwykły
+`rmsnorm_f16_at`, licząc GŁOWICE JAKO WIERSZE o szerokości `head_dim`
+(`dense.rs`, gałąź `QkvWeights::Fused`). Uwaga na fałszywy trop: istnieje też
+`rmsnorm_head_f16`, ale on jest BEZ WAGI — to druga norma Q DeepSeeka V4, nie ta.
+
+Po stronie słownictwa to jest nowa operacja, a nie parametr do `RmsNorm`:
+`Op::RmsNorm` normalizuje dziś po `shape.hidden` i tak ma zostać. Rozszerzenie go
+o dowolną szerokość dałoby modelowi możliwość opisania normalizacji po kształcie,
+którego żaden kernel nie liczy — czyli dokładnie to, przed czym ostrzega §6.
+
+### Gdyby checkpointu zabrakło
+
+4a da się napisać i zabramkować HERMETYCZNIE, tak jak tabelę formatów w
+`forge-kernels/tests/format_table.rs`: router o znanych wagach, znany top-k,
+eksperci o znanych macierzach, wynik policzony wzorcem w f32. To sprawdza
+routing, wybór i akumulację — czyli wszystko, co w tym kroku jest nowe.
+Checkpoint dokłada „wynik ma być językiem", czyli jedyne kryterium, którego nie
+da się spełnić przez przypadek.
 
 ## 4. Kamień milowy 4b — hybryda, i gdzie mieszka jej stan
 
