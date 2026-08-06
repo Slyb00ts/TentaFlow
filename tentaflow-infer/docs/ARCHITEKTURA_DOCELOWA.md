@@ -459,6 +459,52 @@ Trzy rzeczy warte zapamiętania:
   tok/s, czyli e4m3 nie dawało tam NIC. Uwaga takiej dźwigni nie ma, i dlatego ta
   sama wymiana jest tam dobra, a tutaj zła.
 
+Drugi krok domknął to od strony DEKODOWANIA i od strony kerneli.
+
+Zgrupowanie po ekspercie zostawiło 384 uruchomienia na warstwę — po jednym na
+eksperta i projekcję — i każde obejmowało kilkanaście bloków. Profil `nsys`
+nazwał to wprost: 74,5% czasu w GEMM-ach ekspertów, po 39 µs przy 100 MFLOP-ach,
+czyli 2,6 TFLOPS na karcie robiącej ponad sto. To nie był narzut uruchomienia,
+tylko pusta karta. Kernel zgrupowany indeksuje KAFEL przez `block_idx.y`; kafel
+mówi, do którego eksperta należy i które wiersze obejmuje, więc jedna siatka
+obejmuje wszystkich ekspertów. Wzorzec był już w repozytorium — `triplet_bm64`
+scala trzy macierze w jedno uruchomienie — więc to rozszerzenie, nie wynalazek.
+
+Dekodowanie dostało to samo w wariancie wektorowym: `block_idx.y` JEST wyborem,
+więc warstwa kosztuje pięć kerneli zamiast pięciu na eksperta.
+
+Zmierzone, GB10, prompt 512, mediana z pięciu po rozgrzewce:
+
+| model | pp512 przed | pp512 po | tg128 przed | tg128 po |
+|---|---:|---:|---:|---:|
+| Qwen3-30B-A3B | 806 | **1478** | 36,1 | **45,4** |
+| Qwen3.6-35B-A3B | 72,9 | 72,5 | 19,9 | **24,7** |
+
+Trzy rzeczy, których nie dałoby się przewidzieć bez pomiaru:
+
+- **Jedna wielka siatka pomaga albo szkodzi, zależnie od RODZINY KERNELI, i to
+  przeciwstawnie.** Ten sam kernel puszczony kafel po kaflu daje na Qwen3-30B
+  194 tok/s wobec 1473 (siatka wygrywa 7,6×), a na Qwen3.6-35B 68,7 wobec 52,8
+  (siatka przegrywa 1,3×). Kafle int8 ogranicza to, ile karty pracuje, więc
+  siatka je ratuje; kafel MXFP4 rozpakowuje do f16 i ogranicza go pamięć, a tam
+  siatka dotykająca naraz 256 ekspertów traci na lokalności więcej, niż zyskuje
+  na zajętości. MXFP4 zostaje więc przy dyspozycji per ekspert — i to jest
+  wybór z pomiaru, nie preferencja.
+- **`n_tokens` w kaflu int8 jest SKOKIEM, nie granicą.** Skale kwantyzacji
+  aktywacji leżą blokowo-głównie (`xd_g[stage * n_tokens + token]`), więc kafel,
+  któremu poda się koniec jego bloku, czyta skale cudzego eksperta. Rozdzielone
+  na `n_tokens` i `t_end`.
+- **Wąski krok też nie miał bramki.** Test hermetyczny mieszanki puszczał jeden
+  token, a szeroki krok dopiero model 30B — gdzie błąd wyszedł jako NaN bez
+  niczego małego do bisekcji. Po dopisaniu szerokiego kroku do fikstury każdy
+  kolejny błąd wychodził w sekundę.
+
+Zmieniła się też sama reguła porównania. „Krok po kroku" trzymałem początkowo
+przy wyniku trasy zgrupowanej, czyli przy DRUGIM PRZYBLIŻENIU — a reguła remisu
+pyta, czy wzorzec rozdziela zamienioną parę bardziej niż błąd, co nie znaczy nic,
+gdy to, co nazywa się wzorcem, samo jest przybliżeniem. Obie trasy są teraz
+trzymane wprost przy wzorcu f32.
+
 Skoro szeroki prompt włącza inną trasę niż wąski, DŁUGOŚĆ PROMPTU W TEŚCIE
 ODNIESIENIA JEST CZĘŚCIĄ BRAMKI. Pięciotokenowy prompt zostawiał grupowanie,
 wsadowego eksperta współdzielonego i e4m3 w DeltaNet bez żadnej wyroczni —

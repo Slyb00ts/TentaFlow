@@ -71,7 +71,7 @@ impl CudaExec {
             tile_expert: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
             tile_first: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
             tile_end: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
-            identity: dev(rows * 4)?,
+            identity: dev(selections * 4)?,
             grouped_x: dev(selections * hidden * 2)?,
             grouped_gate: dev(selections * inter * 2)?,
             grouped_up: dev(selections * inter * 2)?,
@@ -79,10 +79,11 @@ impl CudaExec {
             selections,
             experts,
         };
-        // The shared expert folds through the same combine kernel as the routed
-        // sum, with one selection per token; its slot table is therefore the
-        // identity and never changes, so it is written once.
-        let identity: Vec<i32> = (0..rows as i32).collect();
+        // Both combines read a slot table, and for both it is the identity:
+        // the shared expert has one selection per token, and a decode step
+        // leaves every selection at its own row in the router's order. Written
+        // once, long enough for the wider of the two.
+        let identity: Vec<i32> = (0..selections as i32).collect();
         self.device
             .write(bytemuck::cast_slice(&identity), &fresh.identity, 0)?;
         *held = Some(fresh.clone());
@@ -123,38 +124,71 @@ impl CudaExec {
         Ok(table)
     }
 
-    /// One expert's projection, over the row window its id selects.
+
+    /// One projection of every expert over its own block of grouped rows.
     ///
-    /// The id is read ON DEVICE, which is the whole reason these kernels exist
-    /// and the reason the vocabulary carries no expert numbers: the selection
-    /// never crosses the bus. Three formats have such a kernel, and a stack in
-    /// a fourth stops here rather than reaching a kernel that would read its
-    /// bytes as another format's.
+    /// Two shapes, and which one is faster is a property of the FORMAT rather
+    /// than of the model — measured, because the two answers are opposite. The
+    /// int8 tiles want one grid spanning every expert (7,6× on Qwen3-30B); the
+    /// MXFP4 tile wants a launch per expert (1,3× on Qwen3.6-35B), because it
+    /// dequantizes to f16 and is limited by memory, where a grid touching all
+    /// 256 experts at once loses more in locality than it gains in occupancy.
     #[allow(clippy::too_many_arguments)]
-    fn gemv_gidx(
+    fn project_experts(
         &self,
+        id: WeightId,
         w: &Quantized,
-        table: &DevBuffer,
         y: &DevBuffer,
         x: &DevBuffer,
+        starts: &[u32],
+        tiles: &GroupedTiles<'_>,
+        experts: usize,
         rows: usize,
-        ids: &DevBuffer,
-        sel: usize,
+        selections: usize,
     ) -> Result<()> {
-        match w.quant {
-            QuantKind::Q4K => self
-                .kernels
-                .gemv_q4_k_dp4a_f16_gidx(y, table, x, rows, w.cols, ids, sel, &self.stream),
-            QuantKind::Q6K => self
-                .kernels
-                .gemv_q6_k_f16_gidx(y, table, x, rows, w.cols, ids, sel, &self.stream),
-            QuantKind::MXFP4 => self
-                .kernels
-                .gemv_mxfp4_f16_gidx(y, table, x, rows, w.cols, ids, sel, &self.stream),
-            other => Err(ForgeError::Unsupported(format!(
-                "{other:?}: stos ekspertów nie ma kernela adresowanego na urządzeniu"
-            ))),
+        let table = self.expert_table(id, w, experts)?;
+        if w.quant != QuantKind::MXFP4 {
+            return self.kernels.gemm_grouped_experts(
+                w.quant,
+                y,
+                &table,
+                x,
+                GroupedTiles {
+                    expert: tiles.expert,
+                    first: tiles.first,
+                    end: tiles.end,
+                    count: tiles.count,
+                },
+                rows,
+                w.cols,
+                selections,
+                &self.stream,
+            );
         }
+        let stride = w.blocks.len() / experts;
+        for e in 0..experts {
+            let (from, to) = (starts[e] as usize, starts[e + 1] as usize);
+            if from == to {
+                continue;
+            }
+            let n = to - from;
+            let xe = self
+                .device
+                .sub_buffer(x, from * w.cols * 2, n * w.cols * 2)?;
+            let ye = self.device.sub_buffer(y, from * rows * 2, n * rows * 2)?;
+            self.gemm_by_kind(
+                w.quant,
+                &ye,
+                &w.blocks,
+                e * stride,
+                &xe,
+                rows,
+                w.cols,
+                n,
+                w.output_scale,
+            )?;
+        }
+        Ok(())
     }
 
     /// The always-on expert of every row of the step.
@@ -305,7 +339,14 @@ impl CudaExec {
         Ok(())
     }
 
-    /// One token at a time, each of its experts read by id on device.
+    /// Every selection read by id on device, all of them in one launch each.
+    ///
+    /// The step is too narrow to group — every expert is chosen once or twice,
+    /// so sorting would hand a handful of rows to a tile built for hundreds —
+    /// but it is not too narrow to BATCH. The kernels are the single-row ones
+    /// either way; what changes is that the selection comes from the grid
+    /// instead of from a launch parameter, so a layer costs five kernels rather
+    /// than five per expert.
     fn moe_per_token(
         &self,
         out: Act,
@@ -319,47 +360,65 @@ impl CudaExec {
         let rows = step.rows() as usize;
         let hidden = self.shape.hidden as usize;
         let inter = self.shape.inter as usize;
+        let selections = rows * top_k;
         let [gate, up, down] = stacks.map(|id| self.quant(id));
         let (gate, up, down) = (gate?, up?, down?);
-        let tables = [
-            self.expert_table(stacks[0], gate, experts)?,
-            self.expert_table(stacks[1], up, experts)?,
-            self.expert_table(stacks[2], down, experts)?,
-        ];
-        for t in 0..rows {
-            let x_row = self
-                .device
-                .sub_buffer(self.buf(x), t * hidden * 2, hidden * 2)?;
-            let ids = self.device.sub_buffer(&moe.ids, t * top_k * 4, top_k * 4)?;
-            let picks = self
-                .device
-                .sub_buffer(&moe.weights, t * top_k * 4, top_k * 4)?;
-            for j in 0..top_k {
-                self.gemv_gidx(gate, &tables[0], &self.scratch.gate, &x_row, inter, &ids, j)?;
-                self.gemv_gidx(up, &tables[1], &self.scratch.up, &x_row, inter, &ids, j)?;
-                self.kernels.glu_mul_f16(
-                    FfnActivation::SiLU,
-                    &self.scratch.act,
-                    &self.scratch.gate,
-                    &self.scratch.up,
-                    inter,
-                    &self.stream,
-                )?;
-                self.gemv_gidx(down, &tables[2], &moe.tmp, &self.scratch.act, hidden, &ids, j)?;
-                self.kernels.moe_scale_add_gidx_f16(
-                    self.buf(out),
-                    t * hidden * 2,
-                    &moe.tmp,
-                    0,
-                    hidden,
-                    &picks,
-                    j,
-                    j == 0,
-                    &self.stream,
-                )?;
-            }
+
+        for (id, w, y, width) in [
+            (stacks[0], gate, &moe.grouped_gate, inter),
+            (stacks[1], up, &moe.grouped_up, inter),
+        ] {
+            let table = self.expert_table(id, w, experts)?;
+            self.kernels.gemv_gidx_batch(
+                w.quant,
+                y,
+                &table,
+                self.buf(x),
+                width,
+                w.cols,
+                &moe.ids,
+                selections,
+                top_k,
+                &self.stream,
+            )?;
         }
-        Ok(())
+        self.kernels.glu_mul_f16(
+            FfnActivation::SiLU,
+            &moe.grouped_gate,
+            &moe.grouped_gate,
+            &moe.grouped_up,
+            selections * inter,
+            &self.stream,
+        )?;
+        let down_table = self.expert_table(stacks[2], down, experts)?;
+        self.kernels.gemv_gidx_batch(
+            down.quant,
+            &moe.grouped_out,
+            &down_table,
+            &moe.grouped_gate,
+            hidden,
+            down.cols,
+            &moe.ids,
+            selections,
+            // One, not `top_k`: the half this reads was written per SELECTION
+            // above, so every selection already owns its row.
+            1,
+            &self.stream,
+        )?;
+        // Every selection sits at its own row here, in the router's order, so
+        // the slot table IS the identity over selections — no reorder happened
+        // to invert.
+        self.kernels.moe_combine_f16(
+            self.buf(out),
+            &moe.grouped_out,
+            &moe.identity,
+            &moe.weights,
+            rows,
+            hidden,
+            top_k,
+            true,
+            &self.stream,
+        )
     }
 
     /// Every expert once, over the block of rows that chose it.
@@ -469,20 +528,16 @@ impl CudaExec {
             (stacks[0], gate, &moe.grouped_gate),
             (stacks[1], up, &moe.grouped_up),
         ] {
-            let table = self.expert_table(id, w, experts)?;
-            self.kernels.gemm_grouped_experts(
-                w.quant,
+            self.project_experts(
+                id,
+                w,
                 y,
-                &table,
                 &moe.grouped_x,
-                GroupedTiles {
-                    count: tiles.count,
-                    ..tiles
-                },
+                &starts,
+                &tiles,
+                experts,
                 inter,
-                w.cols,
                 selections,
-                &self.stream,
             )?;
         }
         // The activation is elementwise, so the whole grouped block goes at
@@ -495,17 +550,16 @@ impl CudaExec {
             selections * inter,
             &self.stream,
         )?;
-        let down_table = self.expert_table(stacks[2], down, experts)?;
-        self.kernels.gemm_grouped_experts(
-            down.quant,
+        self.project_experts(
+            stacks[2],
+            down,
             &moe.grouped_out,
-            &down_table,
             &moe.grouped_gate,
-            tiles,
+            &starts,
+            &tiles,
+            experts,
             hidden,
-            down.cols,
             selections,
-            &self.stream,
         )?;
         self.kernels.moe_combine_f16(
             self.buf(out),

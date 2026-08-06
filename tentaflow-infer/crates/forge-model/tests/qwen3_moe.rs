@@ -178,14 +178,12 @@ fn the_mixture_agrees_with_the_host_reference() {
     // weights. Comparing the two routes to each other says nothing on its own —
     // two copies of one mistake agree — but the grouped side has just been
     // pinned to the f32 reference above, so agreeing with it pins this one too.
-    let grouped = gpu.logits(0).expect("logity CUDA");
     gpu.reset(SLOT).expect("reset");
     for &token in &prompt {
         gpu.decode(&[Feed { slot: SLOT, token }]).expect("krok");
     }
     gpu.decode(&feed).expect("krok po prompcie");
-    let stepped = gpu.logits(0).expect("logity kroków");
-    common::agrees("krok po kroku", &stepped, &grouped, 0.02);
+    compare("krok po kroku", &gpu, &cpu);
 }
 
 fn compare(what: &str, gpu: &Dense<CudaExec>, cpu: &Dense<HostExec>) {

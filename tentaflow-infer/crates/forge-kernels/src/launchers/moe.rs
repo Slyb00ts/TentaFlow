@@ -231,6 +231,16 @@ impl Kernels {
     /// `quant` picks the kernel exactly as the ungrouped table does, and the
     /// tile it runs is the same tile — grouping chooses `(row0, t0)` per block
     /// instead of per launch, and changes no arithmetic.
+    ///
+    /// NOT every format wants this, and the two answers are opposite enough
+    /// that only measurement settles it. On GB10 at a 512-token prompt the one
+    /// grid is worth 7,6× for the int8 tiles (Qwen3-30B: 1473 against 194 tok/s
+    /// launching the same kernel tile by tile) and COSTS 1,3× for MXFP4
+    /// (Qwen3.6-35B: 52,8 against 68,7). The int8 tiles are limited by how much
+    /// of the card is busy, which one grid fixes; the MXFP4 tile dequantizes to
+    /// f16 and is limited by memory instead, and there a grid that touches every
+    /// expert at once loses more in locality than it gains in occupancy. So
+    /// MXFP4 keeps the per-expert dispatch and refuses here by name.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_grouped_experts(
         &self,
@@ -261,10 +271,11 @@ impl Kernels {
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        // Q6_K reads f16 activations; the int8 tiles read the q8_1 form, which
-        // is quantized ONCE for the whole grouped block rather than once per
-        // expert — that repetition was its own line in the profile.
-        let args = if quant == QuantKind::Q6K {
+        // Q6_K and MXFP4 read f16 activations; the int8 tiles read the q8_1
+        // form, which is quantized ONCE for the whole grouped block rather than
+        // once per expert — that repetition was its own line in the profile.
+        let int8 = matches!(quant, QuantKind::Q4K | QuantKind::Q8_0);
+        let args = if !int8 {
             LaunchArgs::new().buf(y).buf(table).buf(x)
         } else {
             let (xq, xd, xsm) = self.prequant_q8_1(x, cols, selections, stream)?;
@@ -284,12 +295,78 @@ impl Kernels {
         // The int8 tiles read per-block activation scales laid out block-major,
         // so they need the length of the WHOLE grouped activation as a stride —
         // the tile's own end is a separate bound and travels in `tiles`.
-        let args = if quant == QuantKind::Q6K {
-            args
-        } else {
+        let args = if int8 {
             args.scalar(selections as i64)
+        } else {
+            args
         };
         self.device.launch(kernel, &cfg, &args, stream)
+    }
+
+    /// Every selection of a routed step, in ONE launch.
+    ///
+    /// The decode counterpart of `gemm_grouped_experts`, and the same lesson:
+    /// the per-selection route launched `3·top_k` kernels a layer and each
+    /// covered a handful of blocks, so they queued behind one another over a
+    /// mostly idle card. Here `block_idx.y` IS the selection — it picks the
+    /// expert out of `ids`, the token row that feeds it, and the slice of `y`
+    /// it writes.
+    ///
+    /// `share` is how many consecutive selections read the same input row:
+    /// `top_k` for the projections fed by the token's hidden state, 1 for the
+    /// one fed by the feed-forward half, where each selection already has its
+    /// own row.
+    ///
+    /// Not the grouped GEMM, deliberately. At this width every expert is chosen
+    /// once or twice, so grouping would sort a handful of rows and then hand
+    /// them to a tile built for hundreds; these are the kernels written for a
+    /// single row, launched once instead of `top_k` times.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_gidx_batch(
+        &self,
+        quant: QuantKind,
+        y: &DevBuffer,
+        table: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ids: &DevBuffer,
+        selections: usize,
+        share: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        // Rows one block covers, mirroring the single-selection launchers these
+        // wrap — the batched kernel only adds a grid dimension.
+        const ROWS_PER_BLOCK: u32 = 8;
+        let name = match quant {
+            QuantKind::Q4K => "gemv_q4_k_dp4a_f16_gidx_batch",
+            QuantKind::Q6K => "gemv_q6_k_f16_gidx_batch",
+            QuantKind::MXFP4 => "gemv_mxfp4_f16_gidx_batch",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "{other:?}: stos ekspertów nie ma wsadowego kernela adresowanego na urządzeniu"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (
+                (rows as u32).div_ceil(ROWS_PER_BLOCK),
+                selections as u32,
+                1,
+            ),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(table)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .buf(ids)
+            .scalar(share as i64);
+        self.device.launch(k, &cfg, &args, stream)
     }
 }
 

@@ -1522,10 +1522,35 @@ def gemm_mxfp4_gguf_impl[BM: Int, NW: Int](
     n_rows: Int,
     n_tokens: Int,
 ):
+    gemm_mxfp4_gguf_tile_impl[BM, NW](
+        y,
+        w,
+        x,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(block_idx.y) * BM,
+    )
+
+
+def gemm_mxfp4_gguf_tile_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    row0: Int,
+    t0: Int,
+):
     """GGML MXFP4 tensor-core GEMM (17-byte blocks: E8M0 scale + 16 e2m1
     pair bytes). Grid (ceil(rows/64), ceil(T/BM)), block NW*32, n_cols % 32
     == 0. The odd block size leaves only byte alignment for the quant
-    bytes."""
+    bytes.
+
+    `row0` and `t0` place the tile, so the same body serves the ungrouped grid
+    and the grouped launch that puts every expert in one grid."""
     comptime XTILE = BM * LDK
     comptime NT = NW * WARP
     comptime x_rpp = NT // 4
@@ -1535,8 +1560,6 @@ def gemm_mxfp4_gguf_impl[BM: Int, NW: Int](
     tid = Int(thread_idx.x)
     lane = tid % WARP
     wid = tid // WARP
-    row0 = Int(block_idx.x) * BN
-    t0 = Int(block_idx.y) * BM
 
     xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
     ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
@@ -3361,6 +3384,37 @@ def gemm_q6_k_grouped_impl[BM: Int, NW: Int](
         Int(tile_first[tile]),
     )
 
+
+def gemm_mxfp4_gguf_grouped_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Every expert of a routed step in one launch — the MXFP4 half of it.
+
+    Same construction as `gemm_i8mma_grouped_impl`. A hybrid whose expert stacks
+    are MXFP4 needs this one; without it the wide route refuses the very
+    checkpoint that brought the family in.
+    """
+    tile = Int(block_idx.y)
+    gemm_mxfp4_gguf_tile_impl[BM, NW](
+        y,
+        wtab[Int(tile_expert[tile])],
+        x,
+        n_cols,
+        n_rows,
+        Int(tile_end[tile]),
+        Int(block_idx.x) * BN,
+        Int(tile_first[tile]),
+    )
+
+
+comptime gemm_mxfp4_gguf_f16_grouped = gemm_mxfp4_gguf_grouped_impl[64, 4]
 
 comptime gemm_q6_k_f16_grouped = gemm_q6_k_grouped_impl[64, 4]
 

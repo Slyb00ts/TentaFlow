@@ -158,8 +158,9 @@ struct MoeScratch {
     tile_expert: DevBuffer,
     tile_first: DevBuffer,
     tile_end: DevBuffer,
-    /// `[0, 1, 2, …]`, the slot table of a single selection per token — the
-    /// shared expert folds through the same combine kernel as the routed sum.
+    /// `[0, 1, 2, …]`. The slot table of both combines that do not reorder:
+    /// the shared expert's one selection per token, and a decode step, whose
+    /// selections already sit in the router's order.
     identity: DevBuffer,
     /// Activations, both feed-forward halves and the answers, all in grouped
     /// order. Sized by SELECTIONS rather than rows: one token appears in

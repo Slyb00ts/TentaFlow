@@ -2228,3 +2228,68 @@ def gemv_iq1_m_out_f32_v2(
     total = warp.sum(_gemv_iq1_m_row_acc(w, grid, x, n_cols, row, lane))
     if lane == 0:
         y[row] = total
+
+
+def gemv_q6_k_f16_gidx_batch(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """Every selection of a routed step, in ONE launch.
+
+    `block_idx.y` IS the selection: it picks the expert out of `ids`, the input
+    row that feeds it, and the slice of `y` the answer goes to.
+
+    `share` is how many consecutive selections read the SAME input row. It is
+    `top_k` for the projections that take the token's hidden state, because a
+    token's experts all read it, and 1 for the one that takes the feed-forward
+    half, because there each selection already has a row of its own. Getting it
+    wrong feeds every expert of a token the first expert's intermediate values,
+    which is arithmetic that still produces text. A decode step used to launch one of these per selection per
+    projection — forty kernels a layer for eight experts — and each covered too
+    few blocks to fill the card, so they ran one after another over an idle GPU.
+
+    Calls the single-selection body rather than repeating it, so the arithmetic
+    is the same arithmetic by construction and not by review.
+    """
+    sel = Int(block_idx.y)
+    gemv_q6_k_f16_gidx(
+        y + sel * n_rows,
+        wtab,
+        x + (sel // share) * n_cols,
+        n_cols,
+        n_rows,
+        ids + sel,
+        0,
+    )
+
+
+def gemv_mxfp4_f16_gidx_batch(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """Every selection of a routed step in one launch — the MXFP4 half.
+
+    See `gemv_q6_k_f16_gidx_batch`; a mixture needs every one of its stacks
+    batched, because one projection left per selection sets the launch count for
+    the whole layer.
+    """
+    sel = Int(block_idx.y)
+    gemv_mxfp4_f16_gidx(
+        y + sel * n_rows,
+        wtab,
+        x + (sel // share) * n_cols,
+        n_cols,
+        n_rows,
+        ids + sel,
+        0,
+    )

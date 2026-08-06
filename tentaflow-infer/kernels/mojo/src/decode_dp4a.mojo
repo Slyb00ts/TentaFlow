@@ -1318,3 +1318,29 @@ def gemv_q8_0_dp4a_group4_f16(
         if lane == 0:
             y3[row3] = Float16(total3)
 
+
+
+def gemv_q4_k_dp4a_f16_gidx_batch(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """Every selection of a routed step in one launch — the Q4_K half.
+
+    See `gemv_q6_k_f16_gidx_batch` in gemv2.mojo for why the launch count and
+    not the arithmetic was the cost at decode width.
+    """
+    sel = Int(block_idx.y)
+    gemv_q4_k_dp4a_f16_gidx(
+        y + sel * n_rows,
+        wtab,
+        x + (sel // share) * n_cols,
+        n_cols,
+        n_rows,
+        ids + sel,
+        0,
+    )

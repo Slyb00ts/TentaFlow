@@ -276,7 +276,6 @@ fn the_hybrid_agrees_with_the_host_reference() {
     // routes the OTHER way — including a shared expert folded per token rather
     // than for the whole step. Two routes agreeing proves nothing by itself,
     // but the first has just been pinned to the f32 reference.
-    let grouped = gpu.logits(0).expect("logity CUDA");
     gpu.reset(0).expect("reset");
     for &token in &prompt {
         gpu.decode(&[Feed { slot: 0, token }]).expect("krok");
@@ -285,7 +284,7 @@ fn the_hybrid_agrees_with_the_host_reference() {
     common::agrees(
         "krok po kroku",
         &gpu.logits(0).expect("logity kroków"),
-        &grouped,
+        &cpu.logits(0).expect("logity wzorca"),
         0.02,
     );
 }

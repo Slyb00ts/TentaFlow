@@ -7,8 +7,8 @@
 .address_size 64
 
 	// .globl	src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0
-// src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_$__global_alloc_0_$__gpu_shared_mem has been demoted
-// src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_$__global_alloc_1_$__gpu_shared_mem has been demoted
+// src_gemm_gemm_mxfp4_gguf_tile_6A6A6A6A_39760702ae16ca48_$__global_alloc_0_$__gpu_shared_mem has been demoted
+// src_gemm_gemm_mxfp4_gguf_tile_6A6A6A6A_39760702ae16ca48_$__global_alloc_1_$__gpu_shared_mem has been demoted
 
 .visible .entry src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0(
 	.param .u64 .ptr .align 1 src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_param_0,
@@ -27,9 +27,9 @@
 	.reg .b32 	%r<338>;
 	.reg .b64 	%rd<232>;
 	// demoted variable
-	.shared .align 2 .b8 src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_$__global_alloc_0_$__gpu_shared_mem[10240];
+	.shared .align 2 .b8 src_gemm_gemm_mxfp4_gguf_tile_6A6A6A6A_39760702ae16ca48_$__global_alloc_0_$__gpu_shared_mem[10240];
 	// demoted variable
-	.shared .align 2 .b8 src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_$__global_alloc_1_$__gpu_shared_mem[10240];
+	.shared .align 2 .b8 src_gemm_gemm_mxfp4_gguf_tile_6A6A6A6A_39760702ae16ca48_$__global_alloc_1_$__gpu_shared_mem[10240];
 	mov.b64 	%SPL, __local_depot0;
 	cvta.local.u64 	%SP, %SPL;
 	ld.param.b64 	%rd51, [src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_param_5];
@@ -41,16 +41,16 @@
 	cvta.to.global.u64 	%rd1, %rd57;
 	cvta.to.global.u64 	%rd2, %rd54;
 	ld.param.b64 	%rd58, [src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_param_3];
-	mov.u32 	%r13, %tid.x;
-	cvt.u64.u32 	%rd3, %r13;
-	mov.u32 	%r14, %ctaid.x;
+	mov.u32 	%r13, %ctaid.x;
+	mul.wide.u32 	%rd3, %r13, 64;
+	mov.u32 	%r14, %ctaid.y;
 	mul.wide.u32 	%rd4, %r14, 64;
-	mov.u32 	%r15, %ctaid.y;
-	mul.wide.u32 	%rd5, %r15, 64;
-	shr.u64 	%rd6, %rd3, 2;
-	and.b64 	%rd7, %rd3, 3;
+	mov.u32 	%r15, %tid.x;
+	cvt.u64.u32 	%rd5, %r15;
+	shr.u64 	%rd6, %rd5, 2;
+	and.b64 	%rd7, %rd5, 3;
 	shl.b64 	%rd8, %rd7, 3;
-	add.s64 	%rd59, %rd6, %rd5;
+	add.s64 	%rd59, %rd6, %rd4;
 	add.s64 	%rd60, %rd51, -1;
 	min.s64 	%rd61, %rd59, %rd60;
 	add.s64 	%rd62, %rd59, 32;
@@ -67,7 +67,7 @@
 	cvt.u32.u64 	%r16, %rd6;
 	mul.lo.s32 	%r1, %r16, 40;
 	shl.b32 	%r17, %r1, 1;
-	mov.b32 	%r18, src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_$__global_alloc_0_$__gpu_shared_mem;
+	mov.b32 	%r18, src_gemm_gemm_mxfp4_gguf_tile_6A6A6A6A_39760702ae16ca48_$__global_alloc_0_$__gpu_shared_mem;
 	add.s32 	%r19, %r18, %r17;
 	cvt.u32.u64 	%r2, %rd8;
 	shl.b32 	%r20, %r2, 1;
@@ -81,7 +81,7 @@
 	setp.eq.b64 	%p1, %rd75, %rd58;
 	selp.b64 	%rd76, 0, %rd71, %p1;
 	add.s64 	%rd11, %rd76, %rd74;
-	add.s64 	%rd12, %rd4, %rd6;
+	add.s64 	%rd12, %rd3, %rd6;
 	add.s64 	%rd13, %rd50, -1;
 	min.s64 	%rd77, %rd12, %rd13;
 	mul.lo.s64 	%rd14, %rd11, 17;
@@ -98,7 +98,7 @@
 	cp.async.commit_group;
 	ld.global.b8 	%rs1, [%rd15];
 	cvt.u32.u16 	%r3, %rs1;
-	mul.wide.u32 	%rd81, %r13, 8;
+	mul.wide.u32 	%rd81, %r15, 8;
 	and.b64 	%rd18, %rd81, 8;
 	add.s64 	%rd19, %rd78, %rd18;
 	add.s64 	%rd82, %rd19, %rd1;
@@ -144,8 +144,8 @@ $L__BB0_3:
 	add.s64 	%rd210, %rd210, 1;
 	setp.ne.b64 	%p3, %rd210, 8;
 	@%p3 bra 	$L__BB0_3;
-	and.b64 	%rd24, %rd3, 32;
-	shr.u64 	%rd95, %rd3, 1;
+	and.b64 	%rd24, %rd5, 32;
+	shr.u64 	%rd95, %rd5, 1;
 	and.b64 	%rd25, %rd95, 480;
 	mov.b32 	%r31, 0f00000000;
 	mov.b64 	%rd216, {%r31, %r31};
@@ -166,11 +166,11 @@ $L__BB0_3:
 	mov.b64 	%rd230, %rd216;
 	mov.b64 	%rd231, %rd216;
 	@%p4 bra 	$L__BB0_16;
-	cvt.u32.u64 	%r21, %rd3;
-	mov.b32 	%r22, src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_7c5158e0ecbf82c0_$__global_alloc_1_$__gpu_shared_mem;
+	cvt.u32.u64 	%r21, %rd5;
+	mov.b32 	%r22, src_gemm_gemm_mxfp4_gguf_tile_6A6A6A6A_39760702ae16ca48_$__global_alloc_1_$__gpu_shared_mem;
 	add.s32 	%r23, %r22, %r17;
 	add.s32 	%r5, %r23, %r20;
-	and.b64 	%rd96, %rd3, 7;
+	and.b64 	%rd96, %rd5, 7;
 	and.b32 	%r24, %r21, 8;
 	and.b32 	%r25, %r21, 47;
 	mad.lo.s32 	%r26, %r25, 80, %r18;
@@ -787,11 +787,11 @@ $L__BB0_12:
 $L__BB0_16:
 	and.b64 	%rd199, %rd6, 7;
 	or.b64 	%rd200, %rd24, %rd199;
-	or.b64 	%rd30, %rd200, %rd5;
+	or.b64 	%rd30, %rd200, %rd4;
 	mul.lo.s64 	%rd201, %rd50, %rd30;
-	add.s64 	%rd202, %rd25, %rd4;
-	shl.b64 	%rd203, %rd7, 1;
-	or.b64 	%rd31, %rd202, %rd203;
+	shl.b64 	%rd202, %rd7, 1;
+	add.s64 	%rd203, %rd25, %rd3;
+	or.b64 	%rd31, %rd203, %rd202;
 	or.b64 	%rd32, %rd31, 1;
 	shl.b64 	%rd204, %rd201, 1;
 	add.s64 	%rd33, %rd2, %rd204;
