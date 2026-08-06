@@ -133,6 +133,31 @@ impl Step {
     }
 }
 
+/// The expert every token passes through, alongside the ones it was routed to.
+///
+/// One struct rather than four more optional fields on `MoeFfn`, because the
+/// four travel together: a block has this expert or it has not, and separate
+/// options would let a model describe half of one.
+///
+/// It is NOT a fifth routed expert. Its output is added on top of the routed
+/// sum, and its own gate is per token rather than per selection — so a mixture
+/// computed without it is a different model, one that still speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shared {
+    pub gate: WeightId,
+    pub up: WeightId,
+    pub down: WeightId,
+    /// A single row whose logit, through a sigmoid, scales this expert's
+    /// output for THIS token.
+    ///
+    /// Required rather than optional, and that is a decision. An architecture
+    /// whose shared expert has no gate means weight 1.0 — which is not the
+    /// same statement as having no shared expert, and the two would be one
+    /// `None` here. Such a checkpoint is refused at load instead, until there
+    /// is one to measure.
+    pub router: WeightId,
+}
+
 /// Jedna operacja architektury gęstej.
 ///
 /// Celowo wąskie i celowo nieogólne: to słownictwo JEDNEJ rodziny architektur,
@@ -229,6 +254,8 @@ pub enum Op {
         /// Whether the selected weights are renormalized to sum to one. A
         /// property of the architecture: OLMoE does not, the Qwen family does.
         norm_topk: bool,
+        /// The always-on expert, for the architectures that have one.
+        shared: Option<Shared>,
         step: Step,
     },
     /// RMSNorm followed by a projection, fused for decode-capable executors.

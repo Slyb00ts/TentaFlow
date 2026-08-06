@@ -8,7 +8,7 @@
 use super::{CudaExec, MoeScratch, Quantized};
 
 use forge_formats::FfnActivation;
-use forge_graph::{Act, Step, WeightId};
+use forge_graph::{Act, Shared, Step, WeightId};
 use forge_hal::{DevBuffer, Pool};
 use forge_types::{ForgeError, MemKind, QuantKind, Result};
 
@@ -38,6 +38,8 @@ impl CudaExec {
             tmp: self
                 .device
                 .alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
+            shared_logit: self.device.alloc(2, MemKind::Device, Pool::Activations)?,
+            shared_scale: self.device.alloc(4, MemKind::Device, Pool::Activations)?,
             selections,
             experts,
         };
@@ -110,6 +112,103 @@ impl CudaExec {
         }
     }
 
+    /// The always-on expert of one token, folded on top of the routed sum.
+    ///
+    /// Its gate never crosses the bus either, for the same reason the routed
+    /// ids do not: the logit is turned into a scale ON DEVICE and read from
+    /// there by the same accumulate kernel the routed experts use. A readback
+    /// here would cost one synchronize per layer per token, which on this
+    /// checkpoint is forty of them.
+    fn shared_expert(
+        &self,
+        sh: &Shared,
+        out: &DevBuffer,
+        out_off: usize,
+        x_row: &DevBuffer,
+        moe: &MoeScratch,
+    ) -> Result<()> {
+        let hidden = self.shape.hidden as usize;
+        let (gate, up, down, router) = (
+            self.quant(sh.gate)?,
+            self.quant(sh.up)?,
+            self.quant(sh.down)?,
+            self.quant(sh.router)?,
+        );
+        // This expert has a width of its own, stated only by its stacks. The
+        // shape's `inter` is the widest feed-forward in the model, so it bounds
+        // the scratch these projections write into without being their width.
+        let width = gate.rows;
+        if width > self.shape.inter as usize || up.rows != width || down.cols != width {
+            return Err(ForgeError::Unsupported(format!(
+                "ekspert współdzielony: gate {width}, up {}, down×{} przy szerokości pośredniej {}",
+                up.rows, down.cols, self.shape.inter
+            )));
+        }
+        if router.rows != 1 || down.rows != hidden {
+            return Err(ForgeError::Unsupported(format!(
+                "ekspert współdzielony: bramka {} wierszy, down {} wierszy wobec {hidden}",
+                router.rows, down.rows
+            )));
+        }
+        self.gemv_by_kind(
+            router.quant,
+            &moe.shared_logit,
+            &router.blocks,
+            x_row,
+            1,
+            hidden,
+            router.output_scale,
+        )?;
+        self.kernels
+            .moe_sigmoid_f16_to_f32(&moe.shared_scale, &moe.shared_logit, &self.stream)?;
+        self.gemv_by_kind(
+            gate.quant,
+            &self.scratch.gate,
+            &gate.blocks,
+            x_row,
+            width,
+            hidden,
+            gate.output_scale,
+        )?;
+        self.gemv_by_kind(
+            up.quant,
+            &self.scratch.up,
+            &up.blocks,
+            x_row,
+            width,
+            hidden,
+            up.output_scale,
+        )?;
+        self.kernels.glu_mul_f16(
+            FfnActivation::SiLU,
+            &self.scratch.act,
+            &self.scratch.gate,
+            &self.scratch.up,
+            width,
+            &self.stream,
+        )?;
+        self.gemv_by_kind(
+            down.quant,
+            &moe.tmp,
+            &down.blocks,
+            &self.scratch.act,
+            hidden,
+            width,
+            down.output_scale,
+        )?;
+        self.kernels.moe_scale_add_gidx_f16(
+            out,
+            out_off,
+            &moe.tmp,
+            0,
+            hidden,
+            &moe.shared_scale,
+            0,
+            false,
+            &self.stream,
+        )
+    }
+
     /// Routing, selection and the SwiGLU of the chosen experts.
     ///
     /// The router runs once for the whole step; the experts then run token by
@@ -125,6 +224,7 @@ impl CudaExec {
         experts: u32,
         top_k: u32,
         norm_topk: bool,
+        shared: Option<&Shared>,
         step: &Step,
     ) -> Result<()> {
         let [router, gate_id, up_id, down_id] = weights;
@@ -211,6 +311,10 @@ impl CudaExec {
                     j == 0,
                     &self.stream,
                 )?;
+            }
+            if let Some(sh) = shared {
+                let out_off = t * hidden * 2;
+                self.shared_expert(sh, self.buf(out), out_off, &x_row, &moe)?;
             }
         }
         Ok(())

@@ -133,6 +133,12 @@ struct MoeScratch {
     counts: DevBuffer,
     /// One expert's contribution before it is scaled into the accumulator.
     tmp: DevBuffer,
+    /// The shared expert's gate logit for this token, and the same after the
+    /// sigmoid — one f16 and one f32. The second is read by the accumulate
+    /// kernel in the very place it reads a routing weight, so the gate never
+    /// crosses the bus.
+    shared_logit: DevBuffer,
+    shared_scale: DevBuffer,
     selections: usize,
     experts: usize,
 }
@@ -495,6 +501,7 @@ impl Executor for CudaExec {
                 experts,
                 top_k,
                 norm_topk,
+                shared,
                 ..
             } => self.op_moe_ffn(
                 *out,
@@ -503,6 +510,7 @@ impl Executor for CudaExec {
                 *experts,
                 *top_k,
                 *norm_topk,
+                shared.as_ref(),
                 step,
             ),
             Op::Residual { src, .. } => {

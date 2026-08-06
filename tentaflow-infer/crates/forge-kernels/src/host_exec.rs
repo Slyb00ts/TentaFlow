@@ -672,6 +672,7 @@ impl Executor for HostExec {
                 experts,
                 top_k,
                 norm_topk,
+                shared,
                 step,
             } => {
                 let hidden = s.hidden as usize;
@@ -737,6 +738,44 @@ impl Executor for HostExec {
                             down_w.row_into(base + h, &mut row[..inter])?;
                             let v: f32 =
                                 row[..inter].iter().zip(&activated).map(|(w, z)| w * z).sum();
+                            *a += weight * v;
+                        }
+                    }
+                    // The always-on expert lands ON TOP of the routed sum, with
+                    // its own per-token gate rather than a routing weight.
+                    if let Some(sh) = shared {
+                        let (sg, su, sd) =
+                            (self.quant(sh.gate)?, self.quant(sh.up)?, self.quant(sh.down)?);
+                        // This expert's width is its own, and only the stacks'
+                        // shapes state it. The shape's `inter` is the WIDEST
+                        // feed-forward in the model, so it bounds the scratch
+                        // without being this expert's width.
+                        let (width, _) = sg.shape();
+                        if width > inter || su.shape().0 != width || sd.shape().1 != width {
+                            return Err(ForgeError::Unsupported(format!(
+                                "ekspert współdzielony: gate {width}, up {}, down×{} \
+                                 przy szerokości pośredniej {inter}",
+                                su.shape().0,
+                                sd.shape().1
+                            )));
+                        }
+                        self.quant(sh.router)?.row_into(0, &mut row[..hidden])?;
+                        let logit: f32 = row[..hidden].iter().zip(xt).map(|(w, v)| w * v).sum();
+                        let weight = 1.0 / (1.0 + (-logit).exp());
+                        for i in 0..width {
+                            sg.row_into(i, &mut row[..hidden])?;
+                            let g: f32 = row[..hidden].iter().zip(xt).map(|(w, v)| w * v).sum();
+                            su.row_into(i, &mut row[..hidden])?;
+                            let u: f32 = row[..hidden].iter().zip(xt).map(|(w, v)| w * v).sum();
+                            activated[i] = g / (1.0 + (-g).exp()) * u;
+                        }
+                        for (h, a) in acc.iter_mut().enumerate() {
+                            sd.row_into(h, &mut row[..width])?;
+                            let v: f32 = row[..width]
+                                .iter()
+                                .zip(&activated[..width])
+                                .map(|(w, z)| w * z)
+                                .sum();
                             *a += weight * v;
                         }
                     }

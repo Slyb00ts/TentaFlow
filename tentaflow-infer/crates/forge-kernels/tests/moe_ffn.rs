@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use forge_formats::dequantize_to_f32;
 use forge_graph::{
-    Act, ExecSpec, Executor, Layout, Op, PackedWeight, Planes, QuantWeight, Step, WeightId,
+    Act, ExecSpec, Executor, Layout, Op, PackedWeight, Planes, QuantWeight, Shared, Step, WeightId,
     WeightStore,
 };
 use forge_hal::{cuda::CudaDevice, PoolSizes};
@@ -27,9 +27,14 @@ use forge_kernels::{CudaExec, HostExec};
 use forge_types::{DType, DenseShape, QuantKind};
 
 const HIDDEN: usize = 256;
-const INTER: usize = 256;
+const INTER: usize = 512;
 const EXPERTS: usize = 4;
 const TOP_K: usize = 2;
+/// Deliberately NOT `INTER`. The always-on expert states its own width through
+/// its stacks, and the shape's `inter` only bounds the scratch — a path reading
+/// the width from the shape would address twice every row here. Still a
+/// multiple of 256, because that is the block a Q6_K row is read in.
+const SH_INTER: usize = 256;
 
 /// Gate and up are Q4_K, down is Q6_K — the exact pairing Qwen3-MoE ships and
 /// the only one the device-indexed kernels cover.
@@ -110,10 +115,15 @@ struct Fixture {
     gate: Vec<u8>,
     up: Vec<u8>,
     down: Vec<u8>,
+    sh_gate: Vec<u8>,
+    sh_up: Vec<u8>,
+    sh_down: Vec<u8>,
+    sh_router_bytes: Vec<u8>,
     table_bytes: Vec<u8>,
     /// What the executors see after f16 rounding.
     table: Vec<f32>,
     router: Vec<f32>,
+    sh_router: Vec<f32>,
 }
 
 fn fixture() -> Fixture {
@@ -138,19 +148,40 @@ fn fixture() -> Fixture {
             (next() as f32 / 255.0 - 0.5) * 0.2 + bias
         })
         .collect();
+    // The shared expert's gate is ONE row and its logit is a per-token number,
+    // so it is scaled to land the sigmoid decisively between 0 and 1. A gate
+    // saturated either way would let a path that ignores it pass.
+    let sh_router: Vec<f32> = (0..HIDDEN)
+        .map(|_| (next() as f32 / 255.0 - 0.35) * 150.0)
+        .collect();
     Fixture {
         router_bytes: f16_bytes(&router),
         gate: blocks(GATE_QUANT, EXPERTS * INTER, HIDDEN, 0x1111),
         up: blocks(GATE_QUANT, EXPERTS * INTER, HIDDEN, 0x2222),
         down: blocks(DOWN_QUANT, EXPERTS * HIDDEN, INTER, 0x3333),
+        sh_gate: blocks(GATE_QUANT, SH_INTER, HIDDEN, 0x4444),
+        sh_up: blocks(GATE_QUANT, SH_INTER, HIDDEN, 0x5555),
+        sh_down: blocks(DOWN_QUANT, HIDDEN, SH_INTER, 0x6666),
+        sh_router_bytes: f16_bytes(&sh_router),
         table_bytes: f16_bytes(&table),
         table: seen(&table),
         router: seen(&router),
+        sh_router: seen(&sh_router),
     }
 }
 
+/// The per-token gate of the shared expert, as the formula states it.
+fn shared_gate(f: &Fixture, x: &[f32]) -> f32 {
+    let logit: f32 = f.sh_router.iter().zip(x).map(|(w, v)| w * v).sum();
+    1.0 / (1.0 + (-logit).exp())
+}
+
 /// The formula, spelled out over the decoded stacks.
-fn expected(f: &Fixture, x: &[f32]) -> Vec<f32> {
+///
+/// `shared` chooses whether the always-on expert contributes, and `gated`
+/// whether its per-token sigmoid is applied — the second is the trap: dropping
+/// it means weight 1.0, which is a different model that still answers.
+fn expected(f: &Fixture, x: &[f32], shared: bool, gated: bool) -> Vec<f32> {
     let decode = |bytes: &[u8], quant: QuantKind, rows: usize, cols: usize| {
         dequantize_to_f32(DType::U8, quant, bytes, rows * cols).expect("dekoder wzorca")
     };
@@ -198,10 +229,35 @@ fn expected(f: &Fixture, x: &[f32]) -> Vec<f32> {
             *out += weight * v;
         }
     }
+    if !shared {
+        return acc;
+    }
+    // ON TOP of the routed sum, over its OWN width, with a per-token gate
+    // rather than a routing weight.
+    let sh_gate = decode(&f.sh_gate, GATE_QUANT, SH_INTER, HIDDEN);
+    let sh_up = decode(&f.sh_up, GATE_QUANT, SH_INTER, HIDDEN);
+    let sh_down = decode(&f.sh_down, DOWN_QUANT, HIDDEN, SH_INTER);
+    let mut activated = vec![0.0f32; SH_INTER];
+    for (i, a) in activated.iter_mut().enumerate() {
+        let r = i * HIDDEN;
+        let g: f32 = sh_gate[r..r + HIDDEN].iter().zip(x).map(|(w, v)| w * v).sum();
+        let u: f32 = sh_up[r..r + HIDDEN].iter().zip(x).map(|(w, v)| w * v).sum();
+        *a = g / (1.0 + (-g).exp()) * u;
+    }
+    let weight = if gated { shared_gate(f, x) } else { 1.0 };
+    for (h, out) in acc.iter_mut().enumerate() {
+        let r = h * SH_INTER;
+        let v: f32 = sh_down[r..r + SH_INTER]
+            .iter()
+            .zip(&activated)
+            .map(|(w, z)| w * z)
+            .sum();
+        *out += weight * v;
+    }
     acc
 }
 
-fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, token: u32) -> Vec<f32> {
+fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, token: u32, shared: bool) -> Vec<f32> {
     let embed = exec
         .put_quant(packed(
             f.table_bytes.clone(),
@@ -247,6 +303,26 @@ fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, token: u32) -> Vec<
             INTER,
         ))
         .expect("down");
+    let shared = shared.then(|| Shared {
+        gate: exec
+            .put_quant(packed(f.sh_gate.clone(), GATE_QUANT, DType::U8, SH_INTER, HIDDEN))
+            .expect("gate współdzielony"),
+        up: exec
+            .put_quant(packed(f.sh_up.clone(), GATE_QUANT, DType::U8, SH_INTER, HIDDEN))
+            .expect("up współdzielony"),
+        down: exec
+            .put_quant(packed(f.sh_down.clone(), DOWN_QUANT, DType::U8, HIDDEN, SH_INTER))
+            .expect("down współdzielony"),
+        router: exec
+            .put_quant(packed(
+                f.sh_router_bytes.clone(),
+                QuantKind::None,
+                DType::F16,
+                1,
+                HIDDEN,
+            ))
+            .expect("bramka współdzielona"),
+    });
 
     let step = Step::single(0, 0, 1).expect("krok");
     exec.run(&Op::Embed {
@@ -265,6 +341,7 @@ fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, token: u32) -> Vec<
         experts: EXPERTS as u32,
         top_k: TOP_K as u32,
         norm_topk: true,
+        shared,
         step,
     })
     .expect("mieszanka");
@@ -304,7 +381,7 @@ fn the_mixture_block_matches_the_formula_on_both_executors() {
     let f = fixture();
     let token = 5u32;
     let x = &f.table[token as usize * HIDDEN..(token as usize + 1) * HIDDEN];
-    let want = expected(&f, x);
+    let want = expected(&f, x, true, true);
     let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     assert!(
         peak > 1e-3,
@@ -316,19 +393,48 @@ fn the_mixture_block_matches_the_formula_on_both_executors() {
         "wzorzec sięga {peak}, czyli poza zakres f16 — mierzyłoby się przepełnienie fikstury"
     );
 
+    // Three things this fixture must be able to TELL APART, checked before
+    // anything computes. Without them the comparison below would pass for a
+    // path that skipped the shared expert, or applied it ungated — both of
+    // which answer fluently.
+    let routed_only = expected(&f, x, false, true);
+    let ungated = expected(&f, x, true, false);
+    let gate = shared_gate(&f, x);
+    assert!(
+        (0.15..0.85).contains(&gate),
+        "bramka {gate} jest nasycona, więc jej pominięcie byłoby nierozróżnialne"
+    );
+    assert!(
+        spread_error(&routed_only, &want) > 0.2,
+        "ekspert współdzielony nie zmienia wyniku tej fikstury"
+    );
+    assert!(
+        spread_error(&ungated, &want) > 0.2,
+        "bramka nie zmienia wyniku tej fikstury"
+    );
+
     let mut host = HostExec::new(spec()).expect("wzorzec");
-    let host_out = run(&mut host, &f, token);
+    let host_out = run(&mut host, &f, token, true);
     let host_err = spread_error(&host_out, &want);
 
     let mut cuda = CudaExec::new(device as Arc<_>, spec()).expect("wykonawca CUDA");
-    let cuda_out = run(&mut cuda, &f, token);
+    let cuda_out = run(&mut cuda, &f, token, true);
     let cuda_err = spread_error(&cuda_out, &want);
 
     eprintln!(
-        "wzorzec {:.3}%, CUDA {:.3}%",
+        "wzorzec {:.3}%, CUDA {:.3}% (bramka {gate:.3})",
         host_err * 100.0,
         cuda_err * 100.0
     );
     assert!(host_err < 0.01, "wzorzec: {:.3}%", host_err * 100.0);
     assert!(cuda_err < 0.03, "CUDA: {:.3}%", cuda_err * 100.0);
+
+    // And the mixture WITHOUT a shared expert still computes — the same op,
+    // the same weights, the branch a checkpoint like Qwen3-30B-A3B takes.
+    let bare = run(&mut host, &f, token, false);
+    assert!(
+        spread_error(&bare, &routed_only) < 0.01,
+        "mieszanka bez eksperta współdzielonego: {:.3}%",
+        spread_error(&bare, &routed_only) * 100.0
+    );
 }

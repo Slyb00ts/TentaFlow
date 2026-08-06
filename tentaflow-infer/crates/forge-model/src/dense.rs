@@ -21,8 +21,8 @@ use forge_formats::nvfp4::nvfp4_ct_to_gguf_blocks;
 use forge_formats::source::TensorSource;
 use forge_formats::WeightRole;
 use forge_graph::{
-    fuse::fuse, Act, ExecSpec, Executor, Lane, Layout, Op, PackedWeight, Planes, QuantWeight, Step,
-    Tile, WeightId, WeightStore,
+    fuse::fuse, Act, ExecSpec, Executor, Lane, Layout, Op, PackedWeight, Planes, QuantWeight,
+    Shared, Step, Tile, WeightId, WeightStore,
 };
 use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
@@ -89,6 +89,7 @@ enum Ffn {
         experts: u32,
         top_k: u32,
         norm_topk: bool,
+        shared: Option<Shared>,
     },
 }
 
@@ -141,23 +142,19 @@ impl<E: Executor + WeightStore> Dense<E> {
         check_roles(&desc.globals, &desc.layers)?;
 
         // Mixture parameters, refused rather than approximated where this model
-        // has no answer yet. A shared always-on expert is a second FFN added to
-        // every token; running the checkpoint without it would be a different
-        // model that still speaks.
+        // has no answer yet.
         let moe = desc.params.moe.as_ref();
         if let Some(m) = moe {
-            if m.shared_intermediate_size != 0 {
-                return Err(ForgeError::Unsupported(format!(
-                    "ekspert współdzielony o szerokości {} — ta ścieżka liczy tylko routowanych",
-                    m.shared_intermediate_size
-                )));
-            }
             // The executor sizes its expert scratch from `inter`, so a stack
-            // built for another width would be read with the wrong stride.
-            if m.moe_intermediate_size != shape.inter as usize {
+            // built for another width would be read with the wrong stride. The
+            // shared expert may be NARROWER — its own stacks say how wide — but
+            // never wider than the scratch it writes into.
+            if m.moe_intermediate_size != shape.inter as usize
+                || m.shared_intermediate_size > shape.inter as usize
+            {
                 return Err(ForgeError::Unsupported(format!(
-                    "ekspert ma szerokość {}, a kształt mówi {}",
-                    m.moe_intermediate_size, shape.inter
+                    "eksperci mają szerokość {} i {}, a kształt mówi {}",
+                    m.moe_intermediate_size, m.shared_intermediate_size, shape.inter
                 )));
             }
         }
@@ -264,6 +261,7 @@ impl<E: Executor + WeightStore> Dense<E> {
                         experts: n,
                         top_k: m.n_experts_used as u32,
                         norm_topk: m.norm_topk_prob,
+                        shared: shared_expert(&mut exec, src, l, m.shared_intermediate_size, h)?,
                     }
                 } else {
                     Ffn::Dense {
@@ -594,6 +592,7 @@ impl<E: Executor + WeightStore> Dense<E> {
                 experts,
                 top_k,
                 norm_topk,
+                shared,
             } => ops.push(Op::MoeFfn {
                 out: Act::Proj,
                 x: Act::Norm,
@@ -604,6 +603,7 @@ impl<E: Executor + WeightStore> Dense<E> {
                 experts,
                 top_k,
                 norm_topk,
+                shared,
                 step: step.clone(),
             }),
         }
@@ -637,6 +637,46 @@ fn quant<E: WeightStore>(
 /// The same, for a weight that is not quantized — the norms.
 fn plain<E: WeightStore>(exec: &mut E, src: &dyn TensorSource, name: &str) -> Result<WeightId> {
     exec.put_plain(src.fetch(name)?.0)
+}
+
+/// The always-on expert of one mixture layer, when the architecture has one.
+///
+/// All four weights or none: a layer carrying three of them is refused rather
+/// than computed as a mixture without a shared expert. That refusal covers the
+/// dangerous case too — a shared expert whose per-token gate is missing is not
+/// a shared expert with weight 1.0, and the two would otherwise be one `None`.
+fn shared_expert<E: WeightStore>(
+    exec: &mut E,
+    src: &dyn TensorSource,
+    layer: &HashMap<WeightRole, String>,
+    width: usize,
+    hidden: u32,
+) -> Result<Option<Shared>> {
+    const ROLES: [WeightRole; 4] = [
+        WeightRole::FfnGateShExp,
+        WeightRole::FfnUpShExp,
+        WeightRole::FfnDownShExp,
+        WeightRole::FfnGateInpShExp,
+    ];
+    let held = ROLES.iter().filter(|r| layer.contains_key(r)).count();
+    if held == 0 {
+        return Ok(None);
+    }
+    if held != ROLES.len() || width == 0 {
+        return Err(ForgeError::Unsupported(format!(
+            "ekspert współdzielony ma {held} z {} wag przy szerokości {width}",
+            ROLES.len()
+        )));
+    }
+    let name = |role: WeightRole| -> &str { layer[&role].as_str() };
+    let w = width as u32;
+    Ok(Some(Shared {
+        gate: quant(exec, src, name(WeightRole::FfnGateShExp), w, hidden, None)?,
+        up: quant(exec, src, name(WeightRole::FfnUpShExp), w, hidden, None)?,
+        down: quant(exec, src, name(WeightRole::FfnDownShExp), hidden, w, None)?,
+        // One row: the gate is a per-token logit, not a per-expert one.
+        router: quant(exec, src, name(WeightRole::FfnGateInpShExp), 1, hidden, None)?,
+    }))
 }
 
 /// A weight only some architectures carry.
@@ -841,7 +881,14 @@ const MOE_FFN_ROLES: &[WeightRole] = &[
 /// together would make every dense checkpoint look broken for lacking a norm
 /// that llama never had.
 pub fn optional_roles() -> &'static [WeightRole] {
-    &[WeightRole::AttnQNorm, WeightRole::AttnKNorm]
+    &[
+        WeightRole::AttnQNorm,
+        WeightRole::AttnKNorm,
+        WeightRole::FfnGateShExp,
+        WeightRole::FfnUpShExp,
+        WeightRole::FfnDownShExp,
+        WeightRole::FfnGateInpShExp,
+    ]
 }
 
 /// Names of the weights a dense checkpoint must provide, for callers that want
