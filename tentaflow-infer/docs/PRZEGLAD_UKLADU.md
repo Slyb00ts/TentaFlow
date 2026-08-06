@@ -88,6 +88,22 @@ siebie, ale nie w jednym rejestrze.
 
 ### 3.3. Co JUŻ jest wspólne i pokazuje docelowy kształt
 
+Formaty i kwantyzacje są dziś najdalej posuniętym przykładem tego, o co w tym
+całym układzie chodzi, więc warto zapisać, jak wygląda skończona wersja:
+
+| warstwa | gdzie | co wie |
+|---|---|---|
+| skąd bajty | `TensorSource` | GGUF / safetensors / MLX / NVFP4 |
+| co znaczą bajty | `forge-formats::dequantize_to_f32` | 22 kwantyzacje, wzorzec CPU |
+| czym je mnożyć | `block_formats!` w wykonawcy | 22 wiersze, kernel per format |
+| czy to prawda | `tests/format_table.rs` | te same bajty obiema drogami |
+
+Model nie występuje w tej tabeli ani razu — i to jest cała teza. Dodanie
+kwantyzacji dotyka dekodera CPU (wzorzec) i jednego wiersza tabeli wykonawcy;
+nie dotyka ani opisu architektury, ani loadera, ani drugiego backendu. Wykonawca
+na inną kartę wnosi WŁASNĄ tabelę wobec tego samego wzorca, więc „ten sam format
+na każdej architekturze" jest sprawdzalne, a nie deklarowane.
+
 Warstwa formatów, po zmianach z tej sesji, jest przykładem, jak to ma wyglądać:
 
 - `TensorSource` z implementacjami dla GGUF, safetensors, MLX, NVFP4

@@ -269,10 +269,35 @@ Kolejność, w której każdy krok odblokowuje następny:
    bajtów, nie ma czego przyspieszyć przy dekodowaniu**, a scalenie kupione
    drugą kopią wag musi mieć pomiar, dokładnie jak przepakowanie NVFP4→FP8 w
    `PLAN_ARCHITEKTURA.md`.
-3. **Formaty wag.** 24 wobec 2, ale to nie jest dwunastokrotność pracy:
-   `put_quant` bierze bloki źródła, launchery istnieją dla wszystkich, a
-   `forge-formats::dequant` jest wzorcem CPU każdego z nich. To tablica
-   dyspozycji w wykonawcy plus bramka na wzorcu per format.
+3. **Formaty wag.** ZROBIONE — i „24 wobec 2" było nieprawdą już w chwili
+   pisania. Tabela w wykonawcy (`block_formats!`) dyspozycjonuje **22
+   kwantyzacje**: całą rodzinę legacy, K-kwanty, I-kwanty, MXFP4 i NVFP4
+   w układzie GGUF-a. Dodanie kolejnej to jeden wiersz, a `match` nie ma
+   gałęzi „reszta", więc format spoza tabeli odbija się przy wgraniu.
+
+   Brakowało natomiast drugiej połowy — bramki. Osiemnaście z tych
+   dwudziestu dwóch było nazwą kernela i niczym więcej: nigdy nie zostały
+   URUCHOMIONE. To najgorszy możliwy stan akurat dla tej tabeli, bo wiersz
+   wskazujący zły kernel zwraca liczby, a nie błąd, i formaty, z którymi
+   można go pomylić, mają często ten sam rozmiar bloku.
+
+   Bramka jest hermetyczna, bo checkpoint per format się nie skaluje (jedno
+   pobranie na format plus kwantyzator, którego nie mamy):
+   `forge-kernels/tests/format_table.rs` mnoży TE SAME BAJTY dwa razy —
+   kernelem, który wybiera tabela, i przez `forge-formats::dequantize_to_f32`,
+   który dekoduje wszystkie 22 i nie dzieli z Mojo ani jednej linii. Idzie
+   przez publiczny kontrakt, więc trzyma też ścieżkę wgrania i sprawdzenie
+   geometrii bloku, i obejmuje wszystkie trzy rodziny tabeli, bo wiersz może
+   być dobry w jednej i zły w drugiej.
+
+   Wszystkie 22 zgadzają się, najgorszy przypadek 0,384% rozpiętości wiersza.
+   Q4_K, Q6_K i Q8_0 mają w GEMV 0,25–0,38%, bo idą ścieżką int8 — to ta sama
+   liczba, co zgodność formy wsadowej z wektorową.
+
+   Czego ta bramka NIE obejmuje i trzeba o tym wiedzieć: bajty kodów są
+   maskowane do sześciu bitów, żeby pole skali każdego układu wyszło skończone
+   bez znajomości, gdzie który układ je trzyma. Górne dwa bity kodu sprawdzają
+   więc tylko cztery formaty mające prawdziwe checkpointy.
 4. **MoE i hybrid w słownictwie.** Jedyna pozycja, która jest prawdziwą pracą
    projektową: `Op` musi wyrazić routing ekspertów i stan rekurencyjny
    DeltaNet, a każda platforma potrzebuje tych kerneli — inaczej „wszystko na
