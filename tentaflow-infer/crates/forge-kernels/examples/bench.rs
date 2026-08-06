@@ -1,4 +1,4 @@
-// ===== File: prefill_bench.rs — what the ops-as-data path actually sustains =====
+// ===== File: bench.rs — what the ops-as-data path actually sustains =====
 //
 // The correctness tests print a throughput because it is free to print, but
 // what they measure is a COLD run: the first prompt through a freshly loaded
@@ -7,18 +7,22 @@
 // builds when a projection is first multiplied wide. Reading a steady-state
 // number off that is how a path gets called fast or slow for the wrong reason.
 //
-// So: one warm-up prompt that is thrown away, then repeats, then the middle of
-// the distribution. Same reporting shape as `forge bench`, deliberately —
-// comparing this path against the engine is the entire reason the number
-// exists, and two different definitions of "tokens per second" would make the
-// comparison meaningless.
+// So: one warm-up that is thrown away, then repeats, then the middle of the
+// distribution.
+//
+// The two numbers are the two `llama-bench` reports, measured the way it
+// measures them: `pp<N>` is a prompt of N tokens divided by the time to ingest
+// it, `tg<N>` is N single-token steps AFTER a prompt divided by their time.
+// Deliberately the same definitions — comparing this path against another
+// engine is the entire reason the numbers exist, and two different meanings of
+// "tokens per second" would make the comparison say nothing.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use forge_hal::{cuda::CudaDevice, PoolSizes};
 use forge_kernels::CudaExec;
-use forge_model::dense::Dense;
+use forge_model::dense::{Dense, Feed};
 
 /// Prompt content does not change the arithmetic — every token walks the same
 /// projections — so the ids are synthetic and only the LENGTH is an input.
@@ -35,10 +39,11 @@ fn median(mut samples: Vec<f64>) -> (f64, f64, f64) {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next().map(PathBuf::from) else {
-        eprintln!("użycie: prefill_bench <gguf|katalog> [tokeny promptu] [powtórzenia]");
+        eprintln!("użycie: bench <gguf|katalog> [tokeny promptu] [tokeny generacji] [powtórzenia]");
         std::process::exit(2);
     };
-    let prompt_tokens: usize = args.next().map_or(512, |v| v.parse().expect("liczba tokenów"));
+    let prompt_tokens: usize = args.next().map_or(512, |v| v.parse().expect("tokeny promptu"));
+    let gen_tokens: usize = args.next().map_or(128, |v| v.parse().expect("tokeny generacji"));
     let reps: usize = args.next().map_or(5, |v| v.parse().expect("liczba powtórzeń"));
 
     let device = CudaDevice::new(0, pools()).expect("urządzenie CUDA");
@@ -53,16 +58,29 @@ fn main() {
     model.reset(0).expect("reset");
 
     let mut prefill = Vec::with_capacity(reps);
+    let mut generate = Vec::with_capacity(reps);
     for _ in 0..reps {
         let t = std::time::Instant::now();
-        model.prefill(0, &prompt).expect("prefill");
+        let mut token = model.prefill(0, &prompt).expect("prefill");
         prefill.push(prompt.len() as f64 / t.elapsed().as_secs_f64());
+
+        // Generation is timed SEPARATELY and after the prompt, because a step
+        // reads the context the prompt left behind: measuring it from an empty
+        // slot would measure a shorter context than any real answer has.
+        let t = std::time::Instant::now();
+        for _ in 0..gen_tokens {
+            token = model.decode(&[Feed { slot: 0, token }]).expect("krok")[0];
+        }
+        generate.push(gen_tokens as f64 / t.elapsed().as_secs_f64());
         model.reset(0).expect("reset");
     }
-    let (p10, med, p90) = median(prefill);
-    println!(
-        "prefill {prompt_tokens} tokenów × {reps}: p10 {p10:.0} | mediana {med:.0} | p90 {p90:.0} tok/s"
-    );
+    for (what, samples) in [
+        (format!("pp{prompt_tokens}"), prefill),
+        (format!("tg{gen_tokens}"), generate),
+    ] {
+        let (p10, med, p90) = median(samples);
+        println!("{what} × {reps}: p10 {p10:.1} | mediana {med:.1} | p90 {p90:.1} tok/s");
+    }
 }
 
 /// Pools claimed for the measurement.
