@@ -407,7 +407,7 @@ impl Executor for CudaExec {
                 step,
             } => {
                 let quant = self.quant(*w)?;
-                if step.tokens() == 1 && Self::fused_quant(quant.quant) {
+                if Self::fusable(step) && Self::fused_quant(quant.quant) {
                     self.gemv_norm_by_kind(
                         quant,
                         self.buf(*out),
@@ -431,7 +431,7 @@ impl Executor for CudaExec {
             }
             Op::FusedMatMulResidual { w, x, step } => {
                 let quant = self.quant(*w)?;
-                if step.tokens() == 1 && Self::fused_quant(quant.quant) {
+                if Self::fusable(step) && Self::fused_quant(quant.quant) {
                     self.gemv_residual_by_kind(quant, self.buf(*x))
                 } else {
                     self.run(&Op::MatMul {
@@ -455,7 +455,7 @@ impl Executor for CudaExec {
             } => {
                 let gate = self.quant(*gate_w)?;
                 let up = self.quant(*up_w)?;
-                if step.tokens() == 1 && Self::fused_quant(gate.quant) && gate.quant == up.quant {
+                if Self::fusable(step) && Self::fused_quant(gate.quant) && gate.quant == up.quant {
                     let fused = self.ensure_fused_gate_up(*gate_w, *up_w)?;
                     self.gemv_norm_silu_by_kind(
                         gate.quant,
@@ -1024,28 +1024,26 @@ impl CudaExec {
             .sub_buffer(buf, lane * rows * width, rows * width)
     }
 
-    /// `out = x * wagaᵀ`, in the form this row count wants.
-    ///
-    /// Three forms, and the split is between DECODING and a PROMPT rather than
-    /// between one row and many:
-    ///
-    ///   * one row — the vector form, weight-stationary, activations quantized
-    ///     to int8;
-    ///   * a handful of rows — a decode BATCH: one sweep of the weights serves
-    ///     every lane, same int8 activations;
-    ///   * many rows — a prompt tile, activations in f16.
-    ///
-    /// The first two share an arithmetic on purpose. The tile quantizes
-    /// differently, so a lane decoded alone and the same lane decoded in a
-    /// batch would otherwise disagree by 2,5% of the logit spread and pick the
-    /// other token on a tie; sharing it brings that to 0,38%.
-    ///
-    /// The prompt tile is a bad kernel for a decode batch and that had to be
+    /// Formats for which a fused kernel exists at all.
     fn fused_quant(quant: QuantKind) -> bool {
         matches!(
             quant,
             QuantKind::None | QuantKind::Q4K | QuantKind::Q6K | QuantKind::Q8_0
         )
+    }
+
+    /// Whether the step is one the fused kernels can take.
+    ///
+    /// The condition is ONE ACTIVATION ROW, and it is deliberately not "one
+    /// token": every fused form here is a GEMV, so it computes a single row no
+    /// matter how many the step carries. Four lanes of one token each is one
+    /// token per lane and four rows — asking a vector kernel for it computes
+    /// lane zero and leaves the other three holding the previous step, which
+    /// reads as one sequence answering another's prompt rather than as a
+    /// failure. That is the exact confusion `Step` exists to prevent, so the
+    /// row count is asked for by name and in one place.
+    fn fusable(step: &Step) -> bool {
+        step.rows() == 1
     }
 
     fn ensure_fused_gate_up(&self, gate: WeightId, up: WeightId) -> Result<DevBuffer> {
@@ -1354,6 +1352,23 @@ impl CudaExec {
         }
     }
 
+    /// `out = x * wagaᵀ`, in the form this row count wants.
+    ///
+    /// Three forms, and the split is between DECODING and a PROMPT rather than
+    /// between one row and many:
+    ///
+    ///   * one row — the vector form, weight-stationary, activations quantized
+    ///     to int8;
+    ///   * a handful of rows — a decode BATCH: one sweep of the weights serves
+    ///     every lane, same int8 activations;
+    ///   * many rows — a prompt tile, activations in f16.
+    ///
+    /// The first two share an arithmetic on purpose. The tile quantizes
+    /// differently, so a lane decoded alone and the same lane decoded in a
+    /// batch would otherwise disagree by 2,5% of the logit spread and pick the
+    /// other token on a tie; sharing it brings that to 0,38%.
+    ///
+    /// The prompt tile is a bad kernel for a decode batch and that had to be
     /// measured rather than assumed: at three lanes on a DGX Spark the batch
     /// through `gemm_q4_k_f16` was SLOWER (17,2 tok/s together) than three
     /// separate sequences, because that tile is built for hundreds of rows and
