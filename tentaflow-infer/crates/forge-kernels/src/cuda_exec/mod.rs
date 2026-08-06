@@ -95,6 +95,11 @@ struct Scratch {
     k: DevBuffer,
     v: DevBuffer,
     attn: DevBuffer,
+    /// The attention output gate. As wide as `attn`, and paid for by every
+    /// model — including the ones that never gate. Sized here rather than
+    /// lazily because it is the TARGET of an ordinary projection, so it has to
+    /// exist before the operation that fills it names it.
+    attn_gate: DevBuffer,
     proj: DevBuffer,
     gate: DevBuffer,
     up: DevBuffer,
@@ -210,6 +215,7 @@ impl CudaExec {
             k: f16b(n * shape.kv_width())?,
             v: f16b(n * shape.kv_width())?,
             attn: f16b(n * shape.attn_width())?,
+            attn_gate: f16b(n * shape.attn_width())?,
             proj: f16b(n * shape.hidden)?,
             gate: f16b(n * shape.inter)?,
             up: f16b(n * shape.inter)?,
@@ -415,6 +421,7 @@ impl Executor for CudaExec {
             | Op::KvAppend { step, .. }
             | Op::Attention { step, .. }
             | Op::SiluMul { step }
+            | Op::SigmoidMul { step, .. }
             | Op::MoeFfn { step, .. }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
@@ -481,6 +488,13 @@ impl Executor for CudaExec {
             }
             Op::HeadNorm { act, w, heads, .. } => self.op_head_norm(*act, *w, *heads, step),
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, step),
+            Op::SigmoidMul { act, gate, .. } => self.kernels.sigmoid_mul_f16(
+                self.buf(*act),
+                self.buf(*act),
+                self.buf(*gate),
+                step.rows() as usize * self.shape.attn_width() as usize,
+                &self.stream,
+            ),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, step),
             Op::Attention { layer, .. } => self.op_attention(*layer, step),
             Op::SiluMul { .. } => self.kernels.glu_mul_f16(
@@ -606,6 +620,7 @@ impl CudaExec {
             Act::Key => &self.scratch.k,
             Act::Value => &self.scratch.v,
             Act::Attn => &self.scratch.attn,
+            Act::AttnGate => &self.scratch.attn_gate,
             Act::Proj => &self.scratch.proj,
             Act::Gate => &self.scratch.gate,
             Act::Up => &self.scratch.up,
@@ -842,6 +857,22 @@ impl CudaExec {
                 .flat_map(|l| (0..step.tokens()).map(move |t| (l.pos + t) as i32))
                 .collect(),
         )?;
+        // A partial rotary is a DIFFERENT kernel, not the same one told to stop
+        // early: it pairs dimension j with j + rot/2 and derives the frequency
+        // from `rot`, so running the full kernel over a narrower slice would
+        // pair the wrong dimensions at the wrong frequencies.
+        if self.shape.rope_partial() {
+            return self.kernels.rope_neox_partial_f16(
+                self.buf(act),
+                &self.scratch.positions,
+                step.rows() as usize,
+                heads as usize,
+                self.shape.head_dim as usize,
+                self.shape.rope_rot as usize,
+                self.shape.rope_theta,
+                &self.stream,
+            );
+        }
         self.kernels.rope_neox_f16(
             self.buf(act),
             &self.scratch.positions,

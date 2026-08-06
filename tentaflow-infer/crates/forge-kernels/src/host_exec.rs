@@ -184,7 +184,7 @@ impl Slots {
     }
 }
 
-const SLOT_COUNT: usize = 11;
+const SLOT_COUNT: usize = 12;
 
 fn slot(a: Act) -> usize {
     match a {
@@ -199,6 +199,7 @@ fn slot(a: Act) -> usize {
         Act::Up => 8,
         Act::Activated => 9,
         Act::Logits => 10,
+        Act::AttnGate => 11,
     }
 }
 
@@ -533,7 +534,12 @@ impl Executor for HostExec {
 
             Op::Rope { act, heads, step } => {
                 let dims = s.head_dim as usize;
-                let half = dims / 2;
+                // A partial rotary turns only the first `rot` dimensions and
+                // pairs j with j + rot/2 — NOT with j + head_dim/2. Deriving
+                // the pairing from the head width instead would rotate real
+                // pairs at plausible angles and answer about another position.
+                let rot = s.rope_rot as usize;
+                let half = rot / 2;
                 let tokens = step.tokens() as usize;
                 let mut acts = self.acts.borrow_mut();
                 let v = &mut acts.by[slot(*act)];
@@ -545,7 +551,7 @@ impl Executor for HostExec {
                                 // Częstotliwość w f32 i podstawa z kształtu: przy
                                 // base 1e6 i dims 128 wykładnik schodzi do 1e-6.
                                 let freq = (l.pos as usize + t) as f32
-                                    * s.rope_theta.powf(-2.0 * i as f32 / dims as f32);
+                                    * s.rope_theta.powf(-2.0 * i as f32 / rot as f32);
                                 let (sin, cos) = freq.sin_cos();
                                 let x0 = v[base + i];
                                 let x1 = v[base + i + half];
@@ -652,6 +658,24 @@ impl Executor for HostExec {
                 for i in 0..n {
                     let g = gate[i];
                     dst[i] = g / (1.0 + (-g).exp()) * up[i];
+                }
+                Ok(())
+            }
+
+            Op::SigmoidMul { act, gate, step } => {
+                let n = step.rows() as usize * s.attn_width() as usize;
+                let g = self.with(*gate, <[f32]>::to_vec);
+                let mut acts = self.acts.borrow_mut();
+                let dst = &mut acts.by[slot(*act)];
+                if dst.len() < n || g.len() < n {
+                    return Err(ForgeError::Other(format!(
+                        "bramka {} i wejście {} nie pokrywają {n} wierszy",
+                        g.len(),
+                        dst.len()
+                    )));
+                }
+                for i in 0..n {
+                    dst[i] *= 1.0 / (1.0 + (-g[i]).exp());
                 }
                 Ok(())
             }

@@ -94,6 +94,7 @@ fn shape() -> DenseShape {
         vocab: WIDTH as u32,
         eps: 1e-5,
         rope_theta: 10_000.0,
+        rope_rot: (WIDTH / 2) as u32,
     }
 }
 

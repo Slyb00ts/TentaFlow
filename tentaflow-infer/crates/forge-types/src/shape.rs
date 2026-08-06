@@ -71,6 +71,18 @@ pub struct DenseShape {
     pub vocab: u32,
     pub eps: f32,
     pub rope_theta: f32,
+    /// How many dimensions of each head the rotary turns, counted from zero.
+    ///
+    /// Equal to `head_dim` for every architecture that rotates a whole head,
+    /// which is most of them. Qwen3.6 turns 64 of each 256 and passes the rest
+    /// through — and the pairing changes with it, since a partial rotary pairs
+    /// dimension `j` with `j + rot/2` rather than with `j + head_dim/2`.
+    ///
+    /// It lives in the shape rather than on `Op::Rope` deliberately. It is one
+    /// number for the whole model, so a per-operation field would let Q and K
+    /// disagree — and rotating a query and its key by different amounts is not
+    /// a crash, it is a model that answers about the wrong position.
+    pub rope_rot: u32,
 }
 
 impl DenseShape {
@@ -87,6 +99,11 @@ impl DenseShape {
     /// one, every such checkpoint sized half of the attention buffers.
     pub fn attn_width(&self) -> u32 {
         self.heads * self.head_dim
+    }
+
+    /// Whether the rotary leaves part of every head alone.
+    pub fn rope_partial(&self) -> bool {
+        self.rope_rot != self.head_dim
     }
 
     pub fn attn_scale(&self) -> f32 {

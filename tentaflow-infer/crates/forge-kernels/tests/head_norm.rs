@@ -47,6 +47,7 @@ fn shape() -> DenseShape {
         vocab: WIDTH as u32,
         eps: EPS,
         rope_theta: 10_000.0,
+        rope_rot: HEAD_DIM as u32,
     }
 }
 

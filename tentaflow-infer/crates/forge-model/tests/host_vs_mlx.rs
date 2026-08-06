@@ -103,6 +103,7 @@ fn the_reference_refuses_a_weight_it_was_not_set_up_for() {
         vocab: 32,
         eps: 1e-5,
         rope_theta: 1e4,
+        rope_rot: 16,
     };
     let mut exec = HostExec::new(ExecSpec {
         shape,

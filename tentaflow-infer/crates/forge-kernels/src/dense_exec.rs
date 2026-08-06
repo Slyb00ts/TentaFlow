@@ -107,6 +107,11 @@ struct Scratch {
     k: DevBuffer,
     v: DevBuffer,
     attn: DevBuffer,
+    /// The attention output gate. This executor refuses the operation that
+    /// READS it and still gives it a buffer of its own: aliasing it onto
+    /// `attn` would let the gate projection overwrite the answer it is meant
+    /// to scale, which is a wrong number rather than a refusal.
+    attn_gate: DevBuffer,
     proj: DevBuffer,
     gate: DevBuffer,
     up: DevBuffer,
@@ -211,6 +216,7 @@ impl MetalExec {
             k: f16b(n * shape.kv_width())?,
             v: f16b(n * shape.kv_width())?,
             attn: f16b(n * shape.attn_width())?,
+            attn_gate: f16b(n * shape.attn_width())?,
             proj: f32b(n * shape.hidden)?,
             gate: f16b(n * shape.inter)?,
             up: f16b(n * shape.inter)?,
@@ -344,6 +350,7 @@ impl Executor for MetalExec {
             | Op::Attention { step, .. }
             | Op::SiluMul { step }
             | Op::MoeFfn { step, .. }
+            | Op::SigmoidMul { step, .. }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
             | Op::Residual { step, .. }
@@ -409,6 +416,13 @@ impl Executor for MetalExec {
             // which is what this whole layout exists to avoid.
             Op::MoeFfn { .. } => Err(ForgeError::Unsupported(
                 "MoeFfn: ścieżka Metalowa nie ma kerneli mieszanki ekspertów".into(),
+            )),
+            // Refused rather than written blind. The kernel is two lines of
+            // MSL, and there is no Apple part here to run them on — an
+            // unverified elementwise kernel in the middle of attention would
+            // produce fluent, wrong text on the one machine nobody is testing.
+            Op::SigmoidMul { .. } => Err(ForgeError::Unsupported(
+                "SigmoidMul: ścieżka Metalowa nie ma kernela bramki uwagi".into(),
             )),
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, pos, tokens),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, pos, tokens),
@@ -485,6 +499,7 @@ impl MetalExec {
             Act::Key => &self.scratch.k,
             Act::Value => &self.scratch.v,
             Act::Attn => &self.scratch.attn,
+            Act::AttnGate => &self.scratch.attn_gate,
             Act::Proj => &self.scratch.proj,
             Act::Gate => &self.scratch.gate,
             Act::Up => &self.scratch.up,

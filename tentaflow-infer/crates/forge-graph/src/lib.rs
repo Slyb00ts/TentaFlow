@@ -51,6 +51,13 @@ pub enum Act {
     Value,
     /// Wyjście uwagi, przed projekcją wyjściową.
     Attn,
+    /// The output gate of attention, when the architecture has one.
+    ///
+    /// A slot of its own rather than `Gate`, which is the feed-forward's and is
+    /// as wide as `inter`. These two widths have no reason to agree — in
+    /// Qwen3.6 the attention gate is 4096 and `inter` is 512 — so sharing the
+    /// slot would silently write past the shorter of them.
+    AttnGate,
     /// Wynik projekcji, dodawany z powrotem do strumienia.
     Proj,
     Gate,
@@ -221,6 +228,21 @@ pub enum Op {
     },
     /// `Activated = silu(Gate) * Up`.
     SiluMul {
+        step: Step,
+    },
+    /// `act *= sigmoid(gate)`, over the width of the attention output.
+    ///
+    /// The output gate of the Qwen3.5/3.6 attention block, which stores its
+    /// query projection at twice the width and uses the second half of every
+    /// head to gate what attention returns. Applied AFTER attention and before
+    /// the output projection — a gate folded in earlier would scale the query
+    /// instead of the answer, which is fluent and wrong.
+    ///
+    /// The width comes from the shape, like `SiluMul`'s does, so the model
+    /// cannot name one no kernel computes.
+    SigmoidMul {
+        act: Act,
+        gate: Act,
         step: Step,
     },
     /// The whole mixture-of-experts feed-forward block as one operation:

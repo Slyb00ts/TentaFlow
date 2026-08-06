@@ -179,6 +179,53 @@ pub fn permute_rope_rows(data: &mut [u8], rows: usize, head_dim: usize) -> Resul
     Ok(())
 }
 
+/// Splits a projection that stores two of them interleaved PER HEAD.
+///
+/// Qwen3.5/3.6 keeps its query projection at twice the width: head `h` owns
+/// rows `h*2*head_dim ..` where the first `head_dim` are the query and the next
+/// `head_dim` are the gate that scales what attention returns. It is one tensor
+/// in the file and two projections in the model.
+///
+/// Splitting HERE rather than on the device is a role question, not a form one.
+/// Which rows mean what is stated by the architecture, the same way the rotary
+/// row permutation above is; how the resulting matrix is then laid out for a
+/// multiply stays the executor's. And it costs the vocabulary nothing: both
+/// halves come out as ordinary weights that ordinary projections multiply,
+/// instead of an operation that exists to take a tensor apart.
+///
+/// Works on the source's bytes for the same reason `permute_rope_rows` does —
+/// every GGUF block format keeps a row as one contiguous byte range, so this
+/// need not know which format it is holding, only that the rows are equal.
+pub fn split_head_interleaved(
+    data: &[u8],
+    rows: usize,
+    head_dim: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let pair = head_dim.checked_mul(2).unwrap_or(0);
+    if head_dim == 0 || rows == 0 || !rows.is_multiple_of(pair) {
+        return Err(ForgeError::Format(format!(
+            "bramka: {rows} wierszy nie dzieli się na głowice po 2×{head_dim}"
+        )));
+    }
+    if !data.len().is_multiple_of(rows) {
+        return Err(ForgeError::Format(format!(
+            "bramka: {} B nie dzieli się na {rows} równych wierszy",
+            data.len()
+        )));
+    }
+    let width = data.len() / rows;
+    let heads = rows / pair;
+    let mut first = Vec::with_capacity(heads * head_dim * width);
+    let mut second = Vec::with_capacity(heads * head_dim * width);
+    for head in 0..heads {
+        let base = head * pair * width;
+        let mid = base + head_dim * width;
+        first.extend_from_slice(&data[base..mid]);
+        second.extend_from_slice(&data[mid..mid + head_dim * width]);
+    }
+    Ok((first, second))
+}
+
 /// Whether `to_affine_triple` will take this format.
 pub fn is_affine(quant: QuantKind) -> bool {
     matches!(quant, QuantKind::Q4_1 | QuantKind::Q4K | QuantKind::Q6K)
@@ -341,6 +388,51 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 mod tests {
     use super::*;
     use crate::dequant::dequantize_to_f32;
+
+    /// The two halves of a gated projection, held against the numbers the whole
+    /// tensor decodes to.
+    ///
+    /// Through the DECODER rather than by comparing bytes, because equal bytes
+    /// would also be produced by a split that took the right ranges from the
+    /// wrong heads. The interleave is per head, so the failure that matters is
+    /// picking up head `h`'s gate as head `h+1`'s query — same bytes, same
+    /// count, different model.
+    #[test]
+    fn a_gated_projection_splits_into_the_rows_it_decodes_to() {
+        const HEADS: usize = 3;
+        const HEAD_DIM: usize = 4;
+        const COLS: usize = 64;
+        let rows = 2 * HEADS * HEAD_DIM;
+        let width = COLS / QuantKind::Q8_0.block_elems() * QuantKind::Q8_0.block_bytes();
+        // Every row a different byte, so a row taken from the wrong place is a
+        // different number rather than a coincidence.
+        let data: Vec<u8> = (0..rows * width)
+            .map(|i| ((i / width) * 7 + i % 13 + 1) as u8)
+            .collect();
+
+        let whole = dequantize_to_f32(DType::U8, QuantKind::Q8_0, &data, rows * COLS).unwrap();
+        let (q, gate) = split_head_interleaved(&data, rows, HEAD_DIM).unwrap();
+        let half = HEADS * HEAD_DIM;
+        let got_q = dequantize_to_f32(DType::U8, QuantKind::Q8_0, &q, half * COLS).unwrap();
+        let got_gate = dequantize_to_f32(DType::U8, QuantKind::Q8_0, &gate, half * COLS).unwrap();
+
+        for head in 0..HEADS {
+            for row in 0..HEAD_DIM {
+                let src = (head * 2 * HEAD_DIM + row) * COLS;
+                let dst = (head * HEAD_DIM + row) * COLS;
+                assert_eq!(&got_q[dst..dst + COLS], &whole[src..src + COLS], "q {head}/{row}");
+                let src = src + HEAD_DIM * COLS;
+                assert_eq!(
+                    &got_gate[dst..dst + COLS],
+                    &whole[src..src + COLS],
+                    "bramka {head}/{row}"
+                );
+            }
+        }
+
+        // A row count that is not two halves of whole heads has no split.
+        assert!(split_head_interleaved(&data, rows, HEAD_DIM * 5).is_err());
+    }
 
     /// Rozpakowanie trójki tą samą arytmetyką, którą liczy kernel.
     fn expand(t: &AffineTriple) -> Vec<f32> {

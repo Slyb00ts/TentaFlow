@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use forge_formats::affine::permute_rope_rows;
+use forge_formats::affine::{permute_rope_rows, split_head_interleaved};
 use forge_formats::checkpoint::Checkpoint;
 use forge_formats::nvfp4::nvfp4_ct_to_gguf_blocks;
 use forge_formats::source::TensorSource;
@@ -55,6 +55,10 @@ pub struct Feed {
 struct LayerIds {
     attn_norm: WeightId,
     q: WeightId,
+    /// The second half of a gated query projection: what attention returns is
+    /// scaled by its sigmoid. `None` for every architecture whose attention
+    /// answers unmodified.
+    q_gate: Option<WeightId>,
     k: WeightId,
     /// Normy Q i K per głowica. `None` dla architektur, które ich nie mają —
     /// llama i Bielik normalizują wyłącznie strumień rezydualny.
@@ -123,6 +127,13 @@ impl<E: Executor + WeightStore> Dense<E> {
             vocab: p.vocab_size as u32,
             eps: p.rms_norm_eps,
             rope_theta: p.rope_theta,
+            // How much of each head turns. The M-RoPE sections state it for the
+            // architectures that rotate only part of a head; everything else
+            // rotates all of it.
+            rope_rot: p
+                .rope_sections
+                .map(|s| s.iter().sum::<u32>() * 2)
+                .unwrap_or(p.head_dim as u32),
         };
         // Głowice zapytań dzielą się na grupy po jednej głowicy KV, więc kernele
         // uwagi adresują `heads / kv_heads` zapytań na klucz. Niepodzielność
@@ -136,6 +147,19 @@ impl<E: Executor + WeightStore> Dense<E> {
             return Err(ForgeError::Unsupported(format!(
                 "{} głowic nie dzieli się na {} głowic KV",
                 shape.heads, shape.kv_heads
+            )));
+        }
+        // A rotary that turns an odd number of dimensions, or more of a head
+        // than the head has, would address past its own pairing. Checked here
+        // because every executor derives it from the shape and none of them
+        // would notice.
+        if shape.rope_rot == 0
+            || !shape.rope_rot.is_multiple_of(2)
+            || shape.rope_rot > shape.head_dim
+        {
+            return Err(ForgeError::Unsupported(format!(
+                "obrót po {} wymiarach głowicy o szerokości {}",
+                shape.rope_rot, shape.head_dim
             )));
         }
 
@@ -205,9 +229,19 @@ impl<E: Executor + WeightStore> Dense<E> {
         let mut layers = Vec::with_capacity(desc.layers.len());
         for l in &desc.layers {
             let name = |role: WeightRole| -> &str { l[&role].as_str() };
+            let (q, q_gate) = query(
+                &mut exec,
+                src,
+                name(WeightRole::AttnQ),
+                qw,
+                h,
+                rope,
+                p.attn_gated.then_some(shape.head_dim),
+            )?;
             layers.push(LayerIds {
                 attn_norm: plain(&mut exec, src, name(WeightRole::AttnNorm))?,
-                q: quant(&mut exec, src, name(WeightRole::AttnQ), qw, h, rope)?,
+                q,
+                q_gate,
                 k: quant(&mut exec, src, name(WeightRole::AttnK), kvw, h, rope)?,
                 q_norm: optional(&mut exec, src, l, WeightRole::AttnQNorm)?,
                 k_norm: optional(&mut exec, src, l, WeightRole::AttnKNorm)?,
@@ -535,6 +569,11 @@ impl<E: Executor + WeightStore> Dense<E> {
             at(l.k, Act::Key, Act::Norm),
             at(l.v, Act::Value, Act::Norm),
         ];
+        // The gate is a projection of the SAME normed input, so it is computed
+        // here and applied much later. It deliberately skips the head norm and
+        // the rotary below: those carry position into the query, and the gate
+        // is not a query.
+        ops.extend(l.q_gate.map(|w| at(w, Act::AttnGate, Act::Norm)));
         ops.extend(head_norms.into_iter().flatten().map(|(w, act, heads)| {
             Op::HeadNorm {
                 act,
@@ -562,6 +601,16 @@ impl<E: Executor + WeightStore> Dense<E> {
                 layer: index,
                 step: step.clone(),
             },
+        ]);
+        // AFTER attention and before the output projection. Applied earlier it
+        // would scale the query rather than the answer — still fluent, still
+        // another model.
+        ops.extend(l.q_gate.map(|_| Op::SigmoidMul {
+            act: Act::Attn,
+            gate: Act::AttnGate,
+            step: step.clone(),
+        }));
+        ops.extend([
             at(l.o, Act::Proj, Act::Attn),
             Op::Residual {
                 src: Act::Proj,
@@ -632,6 +681,63 @@ fn quant<E: WeightStore>(
     let w = fetch_quant(src, name, rows, cols, rope)?;
     exec.put_quant(w)
         .map_err(|e| ForgeError::Format(format!("{name}: {e}")))
+}
+
+/// The query projection, and its output gate when the checkpoint stores one.
+///
+/// A gated architecture keeps both in ONE tensor of twice the width,
+/// interleaved per head — so this is where the file's single tensor becomes the
+/// model's two projections. `head_dim` arrives as `Some` exactly when the
+/// architecture gates, rather than as a flag plus a width, because those two
+/// can disagree and this cannot.
+fn query<E: WeightStore>(
+    exec: &mut E,
+    src: &dyn TensorSource,
+    name: &str,
+    rows: u32,
+    cols: u32,
+    rope: Option<usize>,
+    head_dim: Option<u32>,
+) -> Result<(WeightId, Option<WeightId>)> {
+    let Some(head_dim) = head_dim else {
+        return Ok((quant(exec, src, name, rows, cols, rope)?, None));
+    };
+    // The split works on the source's bytes, so a source that hands back an
+    // already-rewritten form has nothing here to split. No such checkpoint
+    // exists yet; the point is that it stops rather than being reinterpreted.
+    if src.fetch_affine(name)?.is_some() || src.fetch_nvfp4(name)?.is_some() {
+        return Err(ForgeError::Unsupported(format!(
+            "{name}: bramkowana projekcja Q wymaga bajtów źródła, a to źródło oddaje postać przepisaną"
+        )));
+    }
+    if rope.is_some() {
+        return Err(ForgeError::Unsupported(format!(
+            "{name}: permutacja wierszy RoPE i rozdzielenie bramki naraz"
+        )));
+    }
+    let (data, dtype, quant_kind, dims) = src.fetch(name)?;
+    let stored = 2 * rows;
+    if dims.last() != Some(&(cols as usize)) || dims.first() != Some(&(stored as usize)) {
+        return Err(ForgeError::Format(format!(
+            "{name}: kształt {dims:?}, oczekiwano [{stored}, {cols}] dla bramkowanego Q"
+        )));
+    }
+    let (q, gate) = split_head_interleaved(&data, stored as usize, head_dim as usize)?;
+    let mut hand = |codes: Vec<u8>| -> Result<WeightId> {
+        exec.put_quant(QuantWeight::Packed(PackedWeight {
+            planes: Planes {
+                codes,
+                ..Planes::default()
+            },
+            quant: quant_kind,
+            layout: Layout::Blocks,
+            dtype,
+            rows: rows as usize,
+            cols: cols as usize,
+        }))
+        .map_err(|e| ForgeError::Format(format!("{name}: {e}")))
+    };
+    Ok((hand(q)?, Some(hand(gate)?)))
 }
 
 /// The same, for a weight that is not quantized — the norms.
@@ -923,6 +1029,7 @@ mod tests {
             vocab: 32128,
             eps: 1e-5,
             rope_theta: 1e6,
+            rope_rot: 128,
         };
         assert_eq!(s.kv_width(), 1024);
         assert!((s.attn_scale() - 0.088_388).abs() < 1e-5);
