@@ -174,17 +174,23 @@ Rodzina Qwen3 normalizuje Q i K **per głowica**, z UCZONĄ wagą
 szerokości `head_dim`). Dzisiejszy `Dense` jej nie ma, bo Bielik ani llama jej nie
 używają — jego lista ról kończy się na `AttnO`.
 
-Kamień 4a rozpada się więc na trzy, w tej kolejności, każdy z własną bramką:
+Kamień 4a rozpadł się więc na trzy, w tej kolejności, każdy z własną bramką:
 
-- **4a-0: kształty.** Q i O przestają być kwadratowe. Nie dotyka słownictwa —
-  to loader i `DenseShape`. Bramka: Bielik dalej zgadza się ze wzorcem bit w bit,
-  bo dla niego `heads * head_dim == hidden` i nic się nie zmienia.
-- **4a-1: QK-norm.** Nie jest to praca MoE — potrzebuje jej także GĘSTY Qwen3,
-  więc to samodzielny krok. Bramka: wzorzec hostowy, dwa kroki.
-- **4a-2: sam MoE.**
+- **4a-0: kształty. ZROBIONE.** Q i O przestały być kwadratowe
+  (`DenseShape::attn_width`). Przy okazji wyszły dwie rzeczy o samym loaderze:
+  brakująca rola kończyła się PANICEM z indeksowania mapy, a rola, której model
+  NIE CZYTA, nie kończyła się niczym. `check_roles` trzyma teraz obie strony
+  przed pierwszym wgraniem i raportuje oba braki naraz.
+- **4a-1: QK-norm. ZROBIONE.** `Op::HeadNorm`, osobna operacja, nie szerokość w
+  `RmsNorm`. Role opcjonalne, bo llama ich nie ma. Bramka hermetyczna na obu
+  wykonawcach wobec formuły wypisanej w teście — jej pierwsza wersja NICZEGO nie
+  rozstrzygała, bo przy jednakowo rozłożonych głowicach norma per głowica i norma
+  po całej aktywacji zgadzają się co do kilku procent.
+- **4a-2: sam MoE.** ← tutaj jesteśmy.
 
-Po 4a-0 i 4a-1 checkpoint powinien już WCZYTAĆ się w całości poza warstwami FFN,
-co samo w sobie jest sprawdzalnym stanem pośrednim.
+Stan pośredni jest osiągnięty i sprawdzony: checkpoint przechodzi kształt i normy
+i zatrzymuje się DOKŁADNIE na FFN — „brakuje ról [FfnGate, FfnUp, FfnDown];
+niesie role [FfnGateExps, FfnGateInp, FfnUpExps, FfnDownExps]".
 
 Kernela nie trzeba pisać ani szukać osobnego: silnik robi tę normę przez zwykły
 `rmsnorm_f16_at`, licząc GŁOWICE JAKO WIERSZE o szerokości `head_dim`
