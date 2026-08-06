@@ -109,19 +109,82 @@ oficjalnego repo `Qwen/Qwen3-30B-A3B-GGUF`). Wybrany świadomie:
   wzorzec liczy prefill sześciu tokenów w 24 s.
 - Q4_K_M, czyli format najlepiej sprawdzony w tej ścieżce.
 
-### 3a. Ten checkpoint wymusza JESZCZE JEDNĄ rzecz: QK-norm
+**Drugi checkpoint, na 4b:** `FreedomAISVR/Qwen3.6-35B-A3B-MXFP4-MOE-Fast-GGUF`
+(20,26 GiB) w `.runtime/models/qwen36-35b-a3b-mxfp4-gguf/`. Jego tag to
+`qwen3_5_moe`, czyli nasz `qwen35moe` — hybryda — więc jest DOKŁADNIE tym, czego
+4a brać nie może i czego 4b potrzebuje. Leży od razu, żeby krok 4b nie zaczynał
+się od pobierania.
 
-Wyszło z odczytania `arch/qwen3moe.ron` przed pisaniem, a nie w połowie: rodzina
-Qwen3 ma **normalizację per głowica na Q i K**, z UCZONĄ wagą
-(`attn_q_norm.weight`, `attn_k_norm.weight`, obie `required: true`). Dzisiejszy
-`Dense` w nowej ścieżce jej nie ma, bo Bielik ani llama jej nie używają — jego
-lista ról kończy się na `AttnO`.
+Warto zapisać, dlaczego to nie jest ten sam model o innej nazwie. „Qwen3-30B-A3B"
+i „Qwen3.6-35B-A3B" brzmią jak dwa rozmiary jednej rodziny, a są dwiema
+architekturami: pierwsza to uwaga i MoE, druga przeplata uwagę z DeltaNet. Wzięcie
+drugiej jako pierwszej znaczy wpuścić naraz błąd routingu i błąd stanu
+rekurencyjnego, a oba objawiają się tak samo — płynnym, złym tekstem — więc nie
+byłoby jak rozstrzygnąć, który to.
 
-Więc kamień 4a rozpada się na dwa, i lepiej wiedzieć to teraz:
+Przy okazji 4b da MXFP4 pierwszy PRAWDZIWY checkpoint: dziś ten format jest
+sprawdzony wyłącznie hermetycznie w `format_table.rs`, na bajtach o zawężonym
+zakresie kodów.
 
-- **4a-0: QK-norm.** Nie jest to praca MoE — potrzebuje jej także GĘSTY Qwen3,
-  więc to samodzielny, mały krok, który da się zabramkować osobno.
-- **4a-1: sam MoE.**
+### 3a. Co ten plik naprawdę wymusza — odczytane z niego, nie założone
+
+Metadane i kształty tensorów pobranego pliku, bo „MoE" to nie jest cała lista:
+
+```
+general.architecture = qwen3moe        block_count = 48
+embedding_length = 2048                expert_count = 128
+head_count = 32, head_count_kv = 4     expert_used_count = 8
+key_length = 128                       expert_feed_forward_length = 768
+vocab = 151936
+
+blk.0.attn_q.weight        [2048, 4096]        Q4_K
+blk.0.attn_output.weight   [4096, 2048]        Q4_K
+blk.0.attn_q_norm.weight   [128]               F32
+blk.0.ffn_gate_inp.weight  [2048, 128]         F32
+blk.0.ffn_gate_exps.weight [2048, 768, 128]    Q4_K
+blk.0.ffn_down_exps.weight [768, 2048, 128]    Q6_K
+```
+
+Wynikają z tego **cztery** rzeczy do zrobienia, a MoE jest dopiero czwartą:
+
+1. **`heads * head_dim ≠ hidden`.** 32 × 128 = 4096, a hidden to 2048. `Dense`
+   zakłada dziś, że Q i O są kwadratowe (`quant(..., h, h, ...)`), i — co warto
+   pochwalić — nie zgaduje: `dense.rs:97` ODMAWIA z komunikatem „hidden 2048 nie
+   jest iloczynem 32 głowic po 128". Czyli ten checkpoint zatrzyma się przy
+   wczytaniu, a nie policzy źle. To jest pierwsza rzecz do zdjęcia i najmniejsza.
+2. **Ważony QK-norm per głowica** — patrz niżej.
+3. **Router jest F32, nie f16.** Ścieżka MoE silnika żąda f16 wprost („MoE router
+   must be f16"). Nowa ścieżka albo przyjmie f32, albo zwęzi go raz przy wgraniu
+   — ale to musi być DECYZJA, bo router wybiera ekspertów, więc jego
+   zaokrąglenie zmienia wybór, a nie tylko wynik.
+4. **Stos ekspertów jest tensorem TRÓJWYMIAROWYM** `[.., .., n_experts]`, w
+   dodatku o mieszanych formatach: gate i up w Q4_K, down w Q6_K. `PackedWeight`
+   ma dziś `rows`/`cols`, więc stos wchodzi spłaszczony jako
+   `[n_experts * moe_inter, hidden]` — tak samo, jak nazywa go silnik. Mieszane
+   formaty w jednej warstwie nie są niespodzianką (Q4_K_M robi to samo), ale
+   dyspozycja musi patrzeć na format WAGI, nie warstwy.
+
+Co się NIE okazało przeszkodą: słownik 151 936 mieści się w limicie wyboru
+(`SAMPLE_MAX_VOCAB` = 262 144).
+
+### 3b. Ważony QK-norm
+
+Rodzina Qwen3 normalizuje Q i K **per głowica**, z UCZONĄ wagą
+(`attn_q_norm.weight`, `attn_k_norm.weight`, obie `required: true`, f32 o
+szerokości `head_dim`). Dzisiejszy `Dense` jej nie ma, bo Bielik ani llama jej nie
+używają — jego lista ról kończy się na `AttnO`.
+
+Kamień 4a rozpada się więc na trzy, w tej kolejności, każdy z własną bramką:
+
+- **4a-0: kształty.** Q i O przestają być kwadratowe. Nie dotyka słownictwa —
+  to loader i `DenseShape`. Bramka: Bielik dalej zgadza się ze wzorcem bit w bit,
+  bo dla niego `heads * head_dim == hidden` i nic się nie zmienia.
+- **4a-1: QK-norm.** Nie jest to praca MoE — potrzebuje jej także GĘSTY Qwen3,
+  więc to samodzielny krok. Bramka: wzorzec hostowy, dwa kroki.
+- **4a-2: sam MoE.**
+
+Po 4a-0 i 4a-1 checkpoint powinien już WCZYTAĆ się w całości poza warstwami FFN,
+co samo w sobie jest sprawdzalnym stanem pośrednim.
 
 Kernela nie trzeba pisać ani szukać osobnego: silnik robi tę normę przez zwykły
 `rmsnorm_f16_at`, licząc GŁOWICE JAKO WIERSZE o szerokości `head_dim`
