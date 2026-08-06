@@ -8,6 +8,9 @@ use super::*;
 /// Bramka samej instrukcji blokowo-skalowanej; `src/mma_fp4.mojo`.
 const MMA_MXF4_PROBE: &str = "mma_mxf4_probe";
 
+/// To samo dla skal per 16 w E4M3, czyli układu bloku `NVFP4Gguf`.
+const MMA_NVF4_PROBE: &str = "mma_nvf4_probe";
+
 impl Kernels {
     /// Czy karta i artefakty niosą blokowo-skalowane MMA na czterech bitach.
     ///
@@ -18,9 +21,11 @@ impl Kernels {
         let caps = self.device.caps();
         forge_types::nvidia_warp32(caps.vendor, caps.warp_size)
             && self.artifacts.has(MMA_MXF4_PROBE)
+            && self.artifacts.has(MMA_NVF4_PROBE)
     }
 
-    /// Jedna instrukcja `m16n8k64` e2m1·e2m1 z per-32 skalami UE8M0.
+    /// Jedna instrukcja `m16n8k64` e2m1·e2m1: `nvf4` wybiera skale per 16 w
+    /// E4M3 (`NVFP4Gguf`) zamiast per 32 w UE8M0 (`MXFP4`).
     ///
     /// Rejestry A i B przychodzą już ułożone tak, jak chce instrukcja, bo to,
     /// co ta bramka sprawdza, to INSTRUKCJA i odwzorowanie rejestrów, a nie
@@ -34,6 +39,7 @@ impl Kernels {
         b: &DevBuffer,
         scale_a: &DevBuffer,
         scale_b: &DevBuffer,
+        nvf4: bool,
         stream: &Stream,
     ) -> Result<()> {
         if d.len() < 128 * 4
@@ -46,7 +52,9 @@ impl Kernels {
                 "mma_mxf4_probe: bufor jest mniejszy od fragmentu jednej osnowy".into(),
             ));
         }
-        let k = self.artifacts.get(MMA_MXF4_PROBE)?;
+        let k = self
+            .artifacts
+            .get(if nvf4 { MMA_NVF4_PROBE } else { MMA_MXF4_PROBE })?;
         let cfg = LaunchConfig {
             grid: (1, 1, 1),
             block: (32, 1, 1),

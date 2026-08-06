@@ -619,7 +619,7 @@ from src.sampling import (
     topk_batched_final_f32,
 )
 from src.sampling import penalize_histogram_f32, penalized_argmax_f32
-from src.mma_fp4 import mma_mxf4_probe
+from src.mma_fp4 import mma_mxf4_probe, mma_nvf4_probe
 from src.moe import (
     moe_combine_f16,
     moe_router_f16,
@@ -3180,6 +3180,11 @@ def main() raises:
         mma_mxf4_probe, dump_asm=Path("mma_mxf4_probe.ptx")
     ]()
     entries.append(_finalize(out_dir, "mma_mxf4_probe"))
+
+    _ = ctx.compile_function[
+        mma_nvf4_probe, dump_asm=Path("mma_nvf4_probe.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "mma_nvf4_probe"))
 
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_f16_gidx_batch,

@@ -129,6 +129,7 @@ fn run(
     b: &[[u8; N]; K],
     scale_a: &[u32; 32],
     scale_b: &[u32; 32],
+    nvf4: bool,
 ) -> [[f32; N]; M] {
     let stream = dev.create_stream().unwrap();
     let a_dev = upload(dev.as_ref(), &pack_a(a), Pool::Weights);
@@ -139,7 +140,7 @@ fn run(
         .alloc(M * N * 4, MemKind::Device, Pool::Activations)
         .unwrap();
     kernels
-        .mma_mxf4_probe(&d_dev, &a_dev, &b_dev, &sa_dev, &sb_dev, &stream)
+        .mma_mxf4_probe(&d_dev, &a_dev, &b_dev, &sa_dev, &sb_dev, nvf4, &stream)
         .unwrap();
     stream.synchronize().unwrap();
     let mut bytes = vec![0u8; M * N * 4];
@@ -198,7 +199,7 @@ fn the_block_scaled_op_computes_the_product() {
         }
     }
 
-    let got = run(&dev, &kernels, &a, &b, &UNIT_SCALES, &UNIT_SCALES);
+    let got = run(&dev, &kernels, &a, &b, &UNIT_SCALES, &UNIT_SCALES, false);
     let want = reference(&a, &b, |_, _| 1.0);
     for row in 0..M {
         assert_eq!(
@@ -230,19 +231,27 @@ fn b_scale_lane(col: usize) -> usize {
     4 * col
 }
 
-/// Packs UE8M0 exponents into the words each lane hands the instruction.
+/// Packs scale bytes into the words each lane hands the instruction.
+///
+/// `blocks` is how many of the four bytes the selector reads: two for
+/// `scale_vec::2X`, four for `4X`. The rest keep the unit value, so a byte read
+/// that should not have happened shows up as a wrong product rather than as
+/// nothing.
 fn pack_scales(
     per_block: impl Fn(usize, usize) -> u8,
     count: usize,
+    blocks: usize,
+    unit: u8,
     lane_of: fn(usize) -> usize,
 ) -> [u32; 32] {
-    let mut words = UNIT_SCALES;
+    let filler = u32::from_le_bytes([unit; 4]);
+    let mut words = [filler; 32];
     for i in 0..count {
         let lane = lane_of(i);
-        let mut word = 0x7F7F_7F7Fu32;
-        for half in 0..2 {
-            word &= !(0xFFu32 << (8 * half));
-            word |= u32::from(per_block(i, half)) << (8 * half);
+        let mut word = filler;
+        for block in 0..blocks {
+            word &= !(0xFFu32 << (8 * block));
+            word |= u32::from(per_block(i, block)) << (8 * block);
         }
         words[lane] = word;
     }
@@ -282,10 +291,10 @@ fn the_block_scaled_op_applies_per_32_scales() {
     // halves of k, so a k-block swapped with its neighbour cannot pass.
     let exp_a = |row: usize, half: usize| (127 + (row as i32 % 5) - 2 + half as i32) as u8;
     let exp_b = |col: usize, half: usize| (127 - (col as i32 % 4) + 2 * half as i32) as u8;
-    let scale_a = pack_scales(exp_a, M, a_scale_lane);
-    let scale_b = pack_scales(exp_b, N, b_scale_lane);
+    let scale_a = pack_scales(exp_a, M, 2, 0x7F, a_scale_lane);
+    let scale_b = pack_scales(exp_b, N, 2, 0x7F, b_scale_lane);
 
-    let got = run(&dev, &kernels, &a, &b, &scale_a, &scale_b);
+    let got = run(&dev, &kernels, &a, &b, &scale_a, &scale_b, false);
     let mut want = [[0f32; N]; M];
     for (row, out) in want.iter_mut().enumerate() {
         for (col, cell) in out.iter_mut().enumerate() {
@@ -311,4 +320,80 @@ fn the_block_scaled_op_applies_per_32_scales() {
 
 fn ue8m0(exponent: u8) -> f32 {
     f32::from_bits(u32::from(exponent) << 23)
+}
+
+/// UE4M3 is the same E4M3 as everywhere else; here only powers of two appear,
+/// so the comparison downstream stays exact.
+fn ue4m3(code: u8) -> f32 {
+    let exponent = i32::from((code >> 3) & 0x0F);
+    let mantissa = f32::from(code & 0x07) / 8.0;
+    let value = if exponent == 0 {
+        mantissa * (2f32).powi(-6)
+    } else {
+        (1.0 + mantissa) * (2f32).powi(exponent - 7)
+    };
+    if code & 0x80 != 0 {
+        -value
+    } else {
+        value
+    }
+}
+
+/// The per-16 E4M3 form — the one a `NVFP4Gguf` block already has on disk.
+///
+/// Four scale bytes per row instead of two, so this also settles whether the
+/// selector reads all four bytes under `scale_vec::4X` or keeps reading the
+/// pair. It reads four: a k-block that took its neighbour's scale would miss
+/// the reference by the ratio between them, which here is never 1.
+#[test]
+fn the_block_scaled_op_applies_per_16_scales() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    if !kernels.supports_mxf4_block_scale() {
+        eprintln!("pomijam: brak artefaktu mma_nvf4_probe");
+        return;
+    }
+
+    let mut a = [[0u8; K]; M];
+    for (row, line) in a.iter_mut().enumerate() {
+        for (k, cell) in line.iter_mut().enumerate() {
+            *cell = ((row * 11 + k * 3 + 1) % 16) as u8;
+        }
+    }
+    let mut b = [[0u8; N]; K];
+    for (k, line) in b.iter_mut().enumerate() {
+        for (col, cell) in line.iter_mut().enumerate() {
+            *cell = ((k * 7 + col * 5 + 3) % 16) as u8;
+        }
+    }
+
+    // E4M3 codes for 2^e with e in -3..3: exponent field 7+e, mantissa zero.
+    let code = |e: i32| ((7 + e) << 3) as u8;
+    let exp_a = move |row: usize, block: usize| code((row as i32 + block as i32) % 7 - 3);
+    let exp_b = move |col: usize, block: usize| code((2 * col as i32 + block as i32) % 7 - 3);
+    let scale_a = pack_scales(exp_a, M, 4, 0x38, a_scale_lane);
+    let scale_b = pack_scales(exp_b, N, 4, 0x38, b_scale_lane);
+
+    let got = run(&dev, &kernels, &a, &b, &scale_a, &scale_b, true);
+    let mut want = [[0f32; N]; M];
+    for (row, out) in want.iter_mut().enumerate() {
+        for (col, cell) in out.iter_mut().enumerate() {
+            *cell = (0..K)
+                .map(|k| {
+                    let block = k / 16;
+                    decode(a[row][k])
+                        * decode(b[k][col])
+                        * ue4m3(exp_a(row, block))
+                        * ue4m3(exp_b(col, block))
+                })
+                .sum();
+        }
+    }
+    for row in 0..M {
+        assert_eq!(
+            got[row], want[row],
+            "wiersz {row} rozjechał się ze wzorcem per-16: {:?} vs {:?}",
+            got[row], want[row]
+        );
+    }
 }
