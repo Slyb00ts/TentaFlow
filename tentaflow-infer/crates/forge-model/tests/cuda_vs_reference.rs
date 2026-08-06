@@ -125,7 +125,15 @@ fn the_cuda_executor_agrees_with_the_host_reference() {
     // Prefill: jeden kafel przez formę blokową po obu stronach.
     let t = std::time::Instant::now();
     let gpu_first = gpu.prefill(SLOT, &PROMPT).expect("prefill CUDA");
-    eprintln!("CUDA: prefill w {:.2} s", t.elapsed().as_secs_f64());
+    let took = t.elapsed().as_secs_f64();
+    // Throughput and not just the wall clock, because "prefill in 0.25 s" is
+    // only comparable against a prompt of the same length — and the number this
+    // path has to be held to is tokens per second.
+    eprintln!(
+        "CUDA: prefill {} tokenów w {took:.3} s = {:.0} tok/s",
+        PROMPT.len(),
+        PROMPT.len() as f64 / took
+    );
     let t = std::time::Instant::now();
     let cpu_first = cpu.prefill(SLOT, &PROMPT).expect("prefill wzorca");
     eprintln!("wzorzec: prefill w {:.1} s", t.elapsed().as_secs_f64());
@@ -195,6 +203,12 @@ fn the_batched_form_agrees_with_the_single_steps() {
     let t = std::time::Instant::now();
     let tiled = model.prefill(SLOT, &prompt).expect("prefill kaflem");
     let tiled_logits = model.logits(0).expect("logity kafla");
+    let took = t.elapsed().as_secs_f64();
+    eprintln!(
+        "kafel {} tokenów w {took:.3} s = {:.0} tok/s",
+        prompt.len(),
+        prompt.len() as f64 / took
+    );
     eprintln!(
         "kafel {} tokenów w {:.2} s",
         prompt.len(),

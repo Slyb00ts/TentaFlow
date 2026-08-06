@@ -172,6 +172,12 @@ fn the_hybrid_continues_a_factual_prompt() {
     let prompt = tok
         .encode("The capital of France is", true)
         .expect("tokenizacja");
+    let long: Vec<u32> = prompt.iter().cycle().take(256).copied().collect();
+    let t = std::time::Instant::now();
+    let _ = model.prefill(0, &long).expect("prefill długi");
+    let took = t.elapsed().as_secs_f64();
+    eprintln!("prefill {} tokenów = {:.0} tok/s", long.len(), long.len() as f64 / took);
+    model.reset(0).expect("reset");
     let t = std::time::Instant::now();
     let out = model.generate(0, &prompt, 20).expect("generacja");
     let text = tok.decode(&out, true).expect("dekodowanie");

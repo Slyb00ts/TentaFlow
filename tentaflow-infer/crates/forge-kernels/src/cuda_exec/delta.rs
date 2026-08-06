@@ -41,8 +41,14 @@ pub(super) struct DeltaScratch {
     /// Decay and write gate, in f32 because the recurrence is.
     g: DevBuffer,
     beta: DevBuffer,
-    /// The recurrence's answer, before and after its gated normalization.
+    /// The recurrence's answer, one row at a time — the fold is sequential, so
+    /// there is nothing to keep.
     o: DevBuffer,
+    /// Its gated normalization, for EVERY row. The output projection that
+    /// reads it is stateless, so keeping every row lets it run once over the
+    /// weights instead of once per token — which at this width is the
+    /// difference between reading nine megabytes and reading them `tokens`
+    /// times.
     normed: DevBuffer,
     rows: usize,
 }
@@ -78,7 +84,7 @@ impl CudaExec {
             g: f32b(ssm.v_heads)?,
             beta: f32b(ssm.v_heads)?,
             o: f16b(ssm.value_width())?,
-            normed: f16b(ssm.value_width())?,
+            normed: f16b(n * ssm.value_width())?,
             rows,
         };
         *held = Some(fresh.clone());
@@ -265,8 +271,11 @@ impl CudaExec {
                     d_state,
                     &self.stream,
                 )?;
+                let normed = self
+                    .device
+                    .sub_buffer(&s.normed, row * value * 2, value * 2)?;
                 self.kernels.deltanet_gated_rmsnorm_f16_at(
-                    &s.normed,
+                    &normed,
                     &s.o,
                     &s.z,
                     row * value * 2,
@@ -276,12 +285,13 @@ impl CudaExec {
                     self.shape.eps,
                     &self.stream,
                 )?;
-                let dst = self
-                    .device
-                    .sub_buffer(self.buf(out), row * hidden * 2, hidden * 2)?;
-                self.project(out_w, &dst, &s.normed, 1)?;
             }
         }
+        // ONE pass over the output weights for the whole step. Everything above
+        // is sequential because it carries state; this is not, and leaving it
+        // inside the loop made a prompt read the same nine megabytes once per
+        // token — per layer.
+        self.project(out_w, self.buf(out), &s.normed, rows)?;
         Ok(())
     }
 }
