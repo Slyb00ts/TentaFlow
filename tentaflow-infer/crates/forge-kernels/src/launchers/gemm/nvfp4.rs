@@ -22,8 +22,7 @@ impl Kernels {
     /// Zwraca największy chunk NVFP4 obsługiwany przez załadowane artefakty.
     pub fn hybrid_prefill_nvfp4_artifact_chunk_limit(&self) -> usize {
         let caps = self.device.caps();
-        let nvidia_warp32 =
-            forge_types::nvidia_warp32(caps.vendor, caps.warp_size);
+        let nvidia_warp32 = forge_types::nvidia_warp32(caps.vendor, caps.warp_size);
         hybrid_prefill_nvfp4_artifact_chunk_limit(nvidia_warp32, |name| self.artifacts.has(name))
     }
 
@@ -1708,5 +1707,4 @@ impl Kernels {
             .scalar(inv_global_scale);
         self.device.launch(k, &cfg, &args, stream)
     }
-
 }

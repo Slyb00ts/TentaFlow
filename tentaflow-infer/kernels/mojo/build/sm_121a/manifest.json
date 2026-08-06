@@ -2081,6 +2081,10 @@
       "entry": "src_onnx_ops_lstm_f32_Pointe6A6A6A6AoA6A6A_f087703d1fc6f40f",
       "file": "lstm_f32.ptx"
     },
+    "mma_mxf4_probe": {
+      "entry": "src_mma_fp4_mma_mxf4_probe_P6A6A6A6AoA6A6A_4b4052c9c3792e0f",
+      "file": "mma_mxf4_probe.ptx"
+    },
     "moe_combine_f16": {
       "entry": "src_moe_moe_combine_f16_Poin6A6A6A6AoA6A6A_f39556ba15edb720",
       "file": "moe_combine_f16.ptx"
