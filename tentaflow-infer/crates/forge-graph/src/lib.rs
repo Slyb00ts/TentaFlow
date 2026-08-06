@@ -162,6 +162,24 @@ pub enum Op {
         x: Act,
         step: Step,
     },
+    /// Normalizacja RMS OSOBNO DLA KAŻDEJ GŁOWICY, z uczoną wagą szerokości
+    /// `head_dim`, w miejscu.
+    ///
+    /// Osobna operacja, a nie szerokość dołożona do `RmsNorm`, i to jest
+    /// decyzja, nie wygoda. `RmsNorm` normalizuje strumień rezydualny i jego
+    /// szerokość wynika z kształtu, więc model nie ma jej jak podać źle.
+    /// Gdyby przyjmowała dowolną szerokość, dałoby się nią opisać podział na
+    /// wiersze, którego żaden kernel nie liczy — a to jest ta klasa błędu,
+    /// której całe to słownictwo ma nie dopuszczać.
+    ///
+    /// `heads` jest podane, bo dla Q i dla K jest RÓŻNE: rodzina Qwen3
+    /// normalizuje 32 głowice zapytań i 4 głowice KV tego samego kroku.
+    HeadNorm {
+        act: Act,
+        w: WeightId,
+        heads: u32,
+        step: Step,
+    },
     Rope {
         act: Act,
         heads: u32,

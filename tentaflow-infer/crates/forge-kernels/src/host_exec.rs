@@ -440,6 +440,33 @@ impl Executor for HostExec {
                 Ok(())
             }
 
+            // Ta sama formuła co wyżej, tylko wierszem jest GŁOWICA. Liczone w
+            // miejscu, więc slot nie zmienia rozmiaru — a gdyby zmienił, wynik
+            // uwagi czytałby wiersze z innego podziału.
+            Op::HeadNorm { act, w, heads, step } => {
+                let weight = self.plain(*w)?.to_vec();
+                let n = s.head_dim as usize;
+                let rows = step.rows() as usize * *heads as usize;
+                let mut acts = self.acts.borrow_mut();
+                let dst = &mut acts.by[slot(*act)];
+                if dst.len() < rows * n {
+                    return Err(ForgeError::Other(format!(
+                        "norma głowic chce {} wartości, a slot ma {}",
+                        rows * n,
+                        dst.len()
+                    )));
+                }
+                for t in 0..rows {
+                    let row = &mut dst[t * n..(t + 1) * n];
+                    let mean = row.iter().map(|v| v * v).sum::<f32>() / n as f32;
+                    let scale = 1.0 / (mean + s.eps).sqrt();
+                    for (c, v) in row.iter_mut().enumerate() {
+                        *v = *v * scale * weight[c];
+                    }
+                }
+                Ok(())
+            }
+
             Op::MatMul { out, w, x, step } => {
                 self.matmul(*out, self.quant(*w)?, *x, step.rows() as usize)
             }

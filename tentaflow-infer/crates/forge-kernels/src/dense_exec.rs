@@ -338,6 +338,7 @@ impl Executor for MetalExec {
             Op::Embed { step, .. }
             | Op::RmsNorm { step, .. }
             | Op::MatMul { step, .. }
+            | Op::HeadNorm { step, .. }
             | Op::Rope { step, .. }
             | Op::KvAppend { step, .. }
             | Op::Attention { step, .. }
@@ -396,6 +397,9 @@ impl Executor for MetalExec {
                     src: Act::Proj,
                     step: step.clone(),
                 })
+            }
+            Op::HeadNorm { act, w, heads, .. } => {
+                self.op_head_norm(*act, *w, *heads, tokens)
             }
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, pos, tokens),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, pos, tokens),
@@ -531,6 +535,22 @@ impl MetalExec {
                 .scalar(self.shape.hidden)
                 .scalar(self.shape.eps),
             tokens,
+            msl::RMSNORM_THREADS,
+        )
+    }
+
+    /// Ta sama norma, ale wierszem jest GŁOWICA — ten sam potok, inny podział
+    /// bufora. Liczona w miejscu: każda grupa czyta i zapisuje swój wiersz.
+    fn op_head_norm(&self, act: Act, w: WeightId, heads: u32, tokens: u32) -> Result<()> {
+        self.launch(
+            &self.pipes.rmsnorm,
+            LaunchArgs::new()
+                .buf(self.buf(act))
+                .buf(self.buf(act))
+                .buf(self.plain(w)?)
+                .scalar(self.shape.head_dim)
+                .scalar(self.shape.eps),
+            tokens * heads,
             msl::RMSNORM_THREADS,
         )
     }

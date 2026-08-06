@@ -374,6 +374,7 @@ impl Executor for CudaExec {
             Op::Embed { step, .. }
             | Op::RmsNorm { step, .. }
             | Op::MatMul { step, .. }
+            | Op::HeadNorm { step, .. }
             | Op::Rope { step, .. }
             | Op::KvAppend { step, .. }
             | Op::Attention { step, .. }
@@ -441,6 +442,7 @@ impl Executor for CudaExec {
                     })
                 }
             }
+            Op::HeadNorm { act, w, heads, .. } => self.op_head_norm(*act, *w, *heads, step),
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, step),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, step),
             Op::Attention { layer, .. } => self.op_attention(*layer, step),
@@ -743,6 +745,27 @@ impl CudaExec {
             self.plain(w)?,
             step.rows() as usize,
             self.shape.hidden as usize,
+            self.shape.eps,
+            &self.stream,
+        )
+    }
+
+    /// Norma RMS liczona GŁOWICAMI JAKO WIERSZAMI, w miejscu.
+    ///
+    /// Ten sam kernel co zwykła norma — różni się wyłącznie tym, na ile wierszy
+    /// dzieli bufor. Wejście i wyjście to jeden bufor, bo każdy blok czyta i
+    /// zapisuje wyłącznie własny wiersz.
+    ///
+    /// Nie mylić z `rmsnorm_head_f16` z katalogu: tamten jest BEZ WAGI i należy
+    /// do drugiej normy Q rodziny DeepSeek V4.
+    fn op_head_norm(&self, act: Act, w: WeightId, heads: u32, step: &Step) -> Result<()> {
+        let buf = self.buf(act);
+        self.kernels.rmsnorm_f16(
+            buf,
+            buf,
+            self.plain(w)?,
+            step.rows() as usize * heads as usize,
+            self.shape.head_dim as usize,
             self.shape.eps,
             &self.stream,
         )

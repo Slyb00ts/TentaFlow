@@ -56,6 +56,10 @@ struct LayerIds {
     attn_norm: WeightId,
     q: WeightId,
     k: WeightId,
+    /// Normy Q i K per głowica. `None` dla architektur, które ich nie mają —
+    /// llama i Bielik normalizują wyłącznie strumień rezydualny.
+    q_norm: Option<WeightId>,
+    k_norm: Option<WeightId>,
     v: WeightId,
     o: WeightId,
     ffn_norm: WeightId,
@@ -162,6 +166,8 @@ impl<E: Executor + WeightStore> Dense<E> {
                 attn_norm: plain(&mut exec, src, name(WeightRole::AttnNorm))?,
                 q: quant(&mut exec, src, name(WeightRole::AttnQ), qw, h, rope)?,
                 k: quant(&mut exec, src, name(WeightRole::AttnK), kvw, h, rope)?,
+                q_norm: optional(&mut exec, src, l, WeightRole::AttnQNorm)?,
+                k_norm: optional(&mut exec, src, l, WeightRole::AttnKNorm)?,
                 v: quant(&mut exec, src, name(WeightRole::AttnV), kvw, h, None)?,
                 o: quant(&mut exec, src, name(WeightRole::AttnO), h, qw, None)?,
                 ffn_norm: plain(&mut exec, src, name(WeightRole::FfnNorm))?,
@@ -414,7 +420,15 @@ impl<E: Executor + WeightStore> Dense<E> {
             x,
             step: step.clone(),
         };
-        vec![
+        // Normy głowic wchodzą MIĘDZY projekcję a RoPE i tylko wtedy, gdy
+        // architektura je ma. Kolejność nie jest dowolna: RoPE obraca pary
+        // wymiarów głowicy, więc normalizacja po obrocie normalizowałaby liczby,
+        // które już niosą pozycję — nadal poprawnie wyglądające, i nadal złe.
+        let head_norms = [
+            l.q_norm.map(|w| (w, Act::Query, s.heads)),
+            l.k_norm.map(|w| (w, Act::Key, s.kv_heads)),
+        ];
+        let mut ops = vec![
             Op::RmsNorm {
                 out: Act::Norm,
                 x: Act::Hidden,
@@ -424,6 +438,16 @@ impl<E: Executor + WeightStore> Dense<E> {
             at(l.q, Act::Query, Act::Norm),
             at(l.k, Act::Key, Act::Norm),
             at(l.v, Act::Value, Act::Norm),
+        ];
+        ops.extend(head_norms.into_iter().flatten().map(|(w, act, heads)| {
+            Op::HeadNorm {
+                act,
+                w,
+                heads,
+                step: step.clone(),
+            }
+        }));
+        ops.extend([
             Op::Rope {
                 act: Act::Query,
                 heads: s.heads,
@@ -461,7 +485,8 @@ impl<E: Executor + WeightStore> Dense<E> {
                 src: Act::Proj,
                 step: step.clone(),
             },
-        ]
+        ]);
+        ops
     }
 }
 
@@ -487,6 +512,24 @@ fn quant<E: WeightStore>(
 /// The same, for a weight that is not quantized — the norms.
 fn plain<E: WeightStore>(exec: &mut E, src: &dyn TensorSource, name: &str) -> Result<WeightId> {
     exec.put_plain(src.fetch(name)?.0)
+}
+
+/// A weight only some architectures carry.
+///
+/// Absence is an answer here, not a failure: llama has no per-head norm and
+/// Qwen3 does. The role is looked up in the layer's own map, so a checkpoint
+/// that declares it gets it loaded and one that does not gets `None` — and
+/// `check_roles` has already refused anything in between.
+fn optional<E: WeightStore>(
+    exec: &mut E,
+    src: &dyn TensorSource,
+    layer: &HashMap<WeightRole, String>,
+    role: WeightRole,
+) -> Result<Option<WeightId>> {
+    layer
+        .get(&role)
+        .map(|name| plain(exec, src, name))
+        .transpose()
 }
 
 /// One weight, in whatever form its source keeps it.
@@ -610,7 +653,7 @@ fn check_roles(
             .collect();
         let ignored: Vec<_> = layer
             .keys()
-            .filter(|role| !required_roles().contains(role))
+            .filter(|role| !required_roles().contains(role) && !optional_roles().contains(role))
             .collect();
         if missing.is_empty() && ignored.is_empty() {
             continue;
@@ -628,6 +671,17 @@ fn check_roles(
         return Err(ForgeError::Unsupported(why));
     }
     Ok(())
+}
+
+/// Weights this model computes with WHEN a checkpoint carries them.
+///
+/// Separate from `required_roles` because the distinction is real: a missing
+/// required role means this model cannot compute the file, while a missing
+/// optional one means the architecture does not have it. Folding the two lists
+/// together would make every dense checkpoint look broken for lacking a norm
+/// that llama never had.
+pub fn optional_roles() -> &'static [WeightRole] {
+    &[WeightRole::AttnQNorm, WeightRole::AttnKNorm]
 }
 
 /// Names of the weights a dense checkpoint must provide, for callers that want
@@ -721,10 +775,19 @@ mod tests {
         let err = check(&short).expect_err("brak roli przeszedł");
         assert!(format!("{err}").contains("FfnGate"), "{err}");
 
+        // Normy głowic są opcjonalne i CZYTANE, więc checkpoint, który je
+        // niesie, przechodzi — to jest cała treść tego kroku.
+        let mut with_norms = dense.clone();
+        with_norms.extend([WeightRole::AttnQNorm, WeightRole::AttnKNorm]);
+        check(&with_norms).expect("normy głowic mają być liczone, nie odrzucane");
+
+        // A rola, której ten model naprawdę nie liczy, nadal ma się odbić.
+        // Router MoE jest tu właściwym przykładem: warstwa, która go niesie, ma
+        // inne FFN, więc policzenie jej gęstym FFN dałoby inny model.
         let mut extra = dense.clone();
-        extra.push(WeightRole::AttnQNorm);
+        extra.push(WeightRole::FfnGateInp);
         let err = check(&extra).expect_err("cicho pominięta rola");
-        assert!(format!("{err}").contains("AttnQNorm"), "{err}");
+        assert!(format!("{err}").contains("FfnGateInp"), "{err}");
     }
 
     #[test]
