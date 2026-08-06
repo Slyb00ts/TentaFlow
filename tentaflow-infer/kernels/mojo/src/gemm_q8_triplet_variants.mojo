@@ -64,7 +64,7 @@ def gemm_q8_0_i8mma_triplet_single_bm64(
         selected[0], selected[1].unsafe_mut_cast[True](),
         xq.unsafe_mut_cast[True](), xd.unsafe_mut_cast[True](),
         xsm.unsafe_mut_cast[True](), n_cols, selected[2], n_tokens,
-        selected[3], Int(block_idx.y) * BM,
+        selected[3], Int(block_idx.y) * BM, n_tokens,
     )
 
 
@@ -95,5 +95,5 @@ def gemm_q8_0_i8mma_triplet_single_big(
         selected[0], selected[1].unsafe_mut_cast[True](),
         xq.unsafe_mut_cast[True](), xd.unsafe_mut_cast[True](),
         xsm.unsafe_mut_cast[True](), n_cols, selected[2], n_tokens,
-        selected[3], Int(block_idx.y) * BM,
+        selected[3], Int(block_idx.y) * BM, n_tokens,
     )

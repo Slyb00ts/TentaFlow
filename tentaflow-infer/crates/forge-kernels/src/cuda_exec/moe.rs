@@ -21,6 +21,8 @@ use super::{CudaExec, MoeScratch, Quantized};
 use forge_formats::FfnActivation;
 use forge_graph::{Act, Shared, Step, WeightId};
 use forge_hal::{DevBuffer, Pool};
+
+use crate::launchers::moe::{GroupedTiles, GROUPED_TILE_ROWS};
 use forge_types::{ForgeError, MemKind, QuantKind, Result};
 
 /// Rows below which grouping cannot pay for itself.
@@ -63,6 +65,12 @@ impl CudaExec {
             shared_scale: dev(rows * 4)?,
             order: dev(selections * 4)?,
             slots: dev(selections * 4)?,
+            // One entry per tile of the grouped launch. The worst case is one
+            // tile per expert plus one per full tile of selections, which is
+            // what an even split and a maximally uneven one each cost.
+            tile_expert: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
+            tile_first: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
+            tile_end: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
             identity: dev(rows * 4)?,
             grouped_x: dev(selections * hidden * 2)?,
             grouped_gate: dev(selections * inter * 2)?,
@@ -147,38 +155,6 @@ impl CudaExec {
                 "{other:?}: stos ekspertów nie ma kernela adresowanego na urządzeniu"
             ))),
         }
-    }
-
-    /// One expert's projection over a CONTIGUOUS block of rows.
-    ///
-    /// The expert is addressed by byte offset into the flat stack rather than
-    /// through the pointer table: a whole block of tokens shares one expert
-    /// here, so the id is a constant of the launch and does not have to be read
-    /// per row. Which also means an expert with no tokens costs nothing, where
-    /// the per-token route paid for it once per token that did not pick it.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_expert(
-        &self,
-        w: &Quantized,
-        expert: usize,
-        experts: usize,
-        y: &DevBuffer,
-        x: &DevBuffer,
-        rows: usize,
-        n_tokens: usize,
-    ) -> Result<()> {
-        let stride = w.blocks.len() / experts;
-        self.gemm_by_kind(
-            w.quant,
-            y,
-            &w.blocks,
-            expert * stride,
-            x,
-            rows,
-            w.cols,
-            n_tokens,
-            w.output_scale,
-        )
     }
 
     /// The always-on expert of every row of the step.
@@ -450,6 +426,37 @@ impl CudaExec {
         self.device
             .write(bytemuck::cast_slice(&slots), &moe.slots, 0)?;
 
+        // One entry per tile of `GROUPED_TILE_ROWS` rows, saying which expert
+        // that tile reads and where its expert's block begins and ends. Built
+        // here because this is where the row counts are known, and uploaded once
+        // for all three projections.
+        let mut tile_expert = Vec::new();
+        let mut tile_first = Vec::new();
+        let mut tile_end = Vec::new();
+        for e in 0..experts {
+            let (from, to) = (starts[e] as usize, starts[e + 1] as usize);
+            let mut at = from;
+            while at < to {
+                tile_expert.push(e as i32);
+                tile_first.push(at as i32);
+                tile_end.push(to as i32);
+                at += GROUPED_TILE_ROWS;
+            }
+        }
+        for (host, dev) in [
+            (&tile_expert, &moe.tile_expert),
+            (&tile_first, &moe.tile_first),
+            (&tile_end, &moe.tile_end),
+        ] {
+            self.device.write(bytemuck::cast_slice(host), dev, 0)?;
+        }
+        let tiles = GroupedTiles {
+            expert: &moe.tile_expert,
+            first: &moe.tile_first,
+            end: &moe.tile_end,
+            count: tile_expert.len(),
+        };
+
         self.kernels.gather_rows_f16(
             &moe.grouped_x,
             self.buf(x),
@@ -458,23 +465,25 @@ impl CudaExec {
             hidden,
             &self.stream,
         )?;
-        for e in 0..experts {
-            let (from, to) = (starts[e] as usize, starts[e + 1] as usize);
-            if from == to {
-                continue;
-            }
-            let n = to - from;
-            let xe = self
-                .device
-                .sub_buffer(&moe.grouped_x, from * hidden * 2, n * hidden * 2)?;
-            let ge = self
-                .device
-                .sub_buffer(&moe.grouped_gate, from * inter * 2, n * inter * 2)?;
-            let ue = self
-                .device
-                .sub_buffer(&moe.grouped_up, from * inter * 2, n * inter * 2)?;
-            self.gemm_expert(gate, e, experts, &ge, &xe, inter, n)?;
-            self.gemm_expert(up, e, experts, &ue, &xe, inter, n)?;
+        for (id, w, y) in [
+            (stacks[0], gate, &moe.grouped_gate),
+            (stacks[1], up, &moe.grouped_up),
+        ] {
+            let table = self.expert_table(id, w, experts)?;
+            self.kernels.gemm_grouped_experts(
+                w.quant,
+                y,
+                &table,
+                &moe.grouped_x,
+                GroupedTiles {
+                    count: tiles.count,
+                    ..tiles
+                },
+                inter,
+                w.cols,
+                selections,
+                &self.stream,
+            )?;
         }
         // The activation is elementwise, so the whole grouped block goes at
         // once — it does not care which expert produced which row.
@@ -486,20 +495,18 @@ impl CudaExec {
             selections * inter,
             &self.stream,
         )?;
-        for e in 0..experts {
-            let (from, to) = (starts[e] as usize, starts[e + 1] as usize);
-            if from == to {
-                continue;
-            }
-            let n = to - from;
-            let ae = self
-                .device
-                .sub_buffer(&moe.grouped_gate, from * inter * 2, n * inter * 2)?;
-            let ye = self
-                .device
-                .sub_buffer(&moe.grouped_out, from * hidden * 2, n * hidden * 2)?;
-            self.gemm_expert(down, e, experts, &ye, &ae, hidden, n)?;
-        }
+        let down_table = self.expert_table(stacks[2], down, experts)?;
+        self.kernels.gemm_grouped_experts(
+            down.quant,
+            &moe.grouped_out,
+            &down_table,
+            &moe.grouped_gate,
+            tiles,
+            hidden,
+            down.cols,
+            selections,
+            &self.stream,
+        )?;
         self.kernels.moe_combine_f16(
             self.buf(out),
             &moe.grouped_out,

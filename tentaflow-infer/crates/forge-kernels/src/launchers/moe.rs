@@ -218,4 +218,93 @@ impl Kernels {
             .scalar(init as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
+
+    /// Every expert's slice of one projection, in ONE launch.
+    ///
+    /// Replaces a loop that launched a GEMM per expert. Each of those covered
+    /// about a dozen blocks — a card with dozens of multiprocessors ran them one
+    /// after another and sat mostly idle — where this spans every expert's tiles
+    /// at once. The tile arrays say, per block, which expert it reads and which
+    /// rows of the grouped activation it owns; they are built where the grouping
+    /// is decided, because that is where the row counts are known.
+    ///
+    /// `quant` picks the kernel exactly as the ungrouped table does, and the
+    /// tile it runs is the same tile — grouping chooses `(row0, t0)` per block
+    /// instead of per launch, and changes no arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_grouped_experts(
+        &self,
+        quant: QuantKind,
+        y: &DevBuffer,
+        table: &DevBuffer,
+        x: &DevBuffer,
+        tiles: GroupedTiles<'_>,
+        rows: usize,
+        cols: usize,
+        selections: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        const BN: usize = 64;
+        let (name, block) = match quant {
+            QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256u32),
+            QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256),
+            QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128),
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "{other:?}: stos ekspertów nie ma zgrupowanego GEMM-u"
+                )))
+            }
+        };
+        let kernel = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (rows.div_ceil(BN) as u32, tiles.count as u32, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Q6_K reads f16 activations; the int8 tiles read the q8_1 form, which
+        // is quantized ONCE for the whole grouped block rather than once per
+        // expert — that repetition was its own line in the profile.
+        let args = if quant == QuantKind::Q6K {
+            LaunchArgs::new().buf(y).buf(table).buf(x)
+        } else {
+            let (xq, xd, xsm) = self.prequant_q8_1(x, cols, selections, stream)?;
+            LaunchArgs::new()
+                .buf(y)
+                .buf(table)
+                .buf(&xq)
+                .buf(&xd)
+                .buf(&xsm)
+        };
+        let args = args
+            .buf(tiles.expert)
+            .buf(tiles.first)
+            .buf(tiles.end)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        // The int8 tiles read per-block activation scales laid out block-major,
+        // so they need the length of the WHOLE grouped activation as a stride —
+        // the tile's own end is a separate bound and travels in `tiles`.
+        let args = if quant == QuantKind::Q6K {
+            args
+        } else {
+            args.scalar(selections as i64)
+        };
+        self.device.launch(kernel, &cfg, &args, stream)
+    }
 }
+
+/// Which expert each block of a grouped launch belongs to, and which rows of
+/// the grouped activation it owns.
+///
+/// One entry per tile of `BM` rows. Carried as a struct because the three
+/// arrays are meaningless apart — a mismatch between them multiplies one
+/// expert's weights by another expert's tokens, which answers fluently.
+pub struct GroupedTiles<'a> {
+    pub expert: &'a DevBuffer,
+    pub first: &'a DevBuffer,
+    pub end: &'a DevBuffer,
+    pub count: usize,
+}
+
+/// Rows of the grouped activation one tile of a grouped launch covers.
+pub const GROUPED_TILE_ROWS: usize = 64;

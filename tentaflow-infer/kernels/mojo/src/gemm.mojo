@@ -479,12 +479,37 @@ def gemm_q6_k_impl[BM: Int, NW: Int](
     n_rows: Int,
     n_tokens: Int,
 ):
+    gemm_q6_k_tile_impl[BM, NW](
+        y,
+        w,
+        x,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(block_idx.y) * BM,
+    )
+
+
+def gemm_q6_k_tile_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    row0: Int,
+    t0: Int,
+):
     """Q6_K tensor-core GEMM. Grid (ceil(rows/64), ceil(T/BM)), block NW*32,
     n_cols % 256 == 0 (whole 210-byte superblocks per row). Each 32-col stage
     covers one int8-scaled quadrant slice: ql nibbles + qh 2-bit highs are
     combined to (q - 32) f16 in registers (prefetched a stage ahead) and
     staged to smem like Q4_K. The 210-byte block is only 2-byte aligned, so
-    raw bytes load as u16 lanes."""
+    raw bytes load as u16 lanes.
+
+    `row0` and `t0` place the tile, so the same body serves the ungrouped grid
+    and the grouped launch that puts every expert in one grid."""
     comptime XTILE = BM * LDK
     comptime NT = NW * WARP
     comptime x_rpp = NT // 4
@@ -494,8 +519,6 @@ def gemm_q6_k_impl[BM: Int, NW: Int](
     tid = Int(thread_idx.x)
     lane = tid % WARP
     wid = tid // WARP
-    row0 = Int(block_idx.x) * BN
-    t0 = Int(block_idx.y) * BM
 
     xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
     ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
@@ -2911,7 +2934,14 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     n_tokens: Int,
     row0: Int,
     t0: Int,
+    t_end: Int,
 ):
+    # `n_tokens` is the STRIDE of the per-block activation scales, which are
+    # laid out block-major (`xd_g[stage * n_tokens + token]`) — it is not only a
+    # bound. `t_end` is the bound: the last token this tile may stage or write.
+    # The two differ for a grouped launch, where a tile owns one expert's slice
+    # of a much longer activation; passing that slice's end as the stride reads
+    # another expert's scales, which is arithmetic that still produces numbers.
     # NW-warp block (NW*32 threads). One block owns a BM-token x BN-row output
     # tile. Warps split M_WARPS x N_WARPS; each warp owns MT_PER_WARP=2 token
     # m-tiles (32 tokens) and NT_PER_WARP row n-tiles, so A fragments are reused
@@ -2951,8 +2981,8 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
 
     # X staging: one token per thread (tid < BM); NTHREADS >= BM.
     var xtok_c = t0 + tid
-    if xtok_c > n_tokens - 1:
-        xtok_c = n_tokens - 1
+    if xtok_c > t_end - 1:
+        xtok_c = t_end - 1
 
     # W staging: 4 threads per row, 8 codes each; W_PASSES row-passes cover BN.
     row_l = tid // 4
@@ -3157,12 +3187,12 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
             r_a = row0 + nb + 2 * tt
             r_b = row0 + nb + 2 * tt + 1
             d4 = acc[mi * NT_PER_WARP + nti]
-            if tok_a < n_tokens:
+            if tok_a < t_end:
                 if r_a < n_rows:
                     y[tok_a * n_rows + r_a] = Float16(d4[0])
                 if r_b < n_rows:
                     y[tok_a * n_rows + r_b] = Float16(d4[1])
-            if tok_b < n_tokens:
+            if tok_b < t_end:
                 if r_a < n_rows:
                     y[tok_b * n_rows + r_a] = Float16(d4[2])
                 if r_b < n_rows:
@@ -3190,6 +3220,7 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
         n_tokens,
         Int(block_idx.x) * BN,
         Int(block_idx.y) * BM,
+        n_tokens,
     )
 
 
@@ -3217,7 +3248,17 @@ def gemm_q8_0_i8mma_triplet_bm64(
     t0 = Int(block_idx.y) * BM
     if tile < blocks0:
         gemm_i8mma_tile_impl[BM, BN, 8, 0](
-            y0, w0, xq_g, xd_g, xsm_g, n_cols, n_rows0, n_tokens, tile * BN, t0
+            y0,
+            w0,
+            xq_g,
+            xd_g,
+            xsm_g,
+            n_cols,
+            n_rows0,
+            n_tokens,
+            tile * BN,
+            t0,
+            n_tokens,
         )
     elif tile < blocks0 + blocks1:
         gemm_i8mma_tile_impl[BM, BN, 8, 0](
@@ -3231,6 +3272,7 @@ def gemm_q8_0_i8mma_triplet_bm64(
             n_tokens,
             (tile - blocks0) * BN,
             t0,
+            n_tokens,
         )
     else:
         gemm_i8mma_tile_impl[BM, BN, 8, 0](
@@ -3244,8 +3286,86 @@ def gemm_q8_0_i8mma_triplet_bm64(
             n_tokens,
             (tile - blocks0 - blocks1) * BN,
             t0,
+            n_tokens,
         )
 
+
+def gemm_i8mma_grouped_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Every expert of a routed step, in ONE launch.
+
+    A mixture prefill used to launch one GEMM per expert per projection, and
+    each of those covered a dozen blocks — a card with dozens of multiprocessors
+    sat mostly idle while they ran one after another. Here `block_idx.y` indexes
+    a TILE, the tile says which expert it belongs to and which rows of the
+    grouped activation it owns, and the grid spans every expert at once.
+
+    Same tile as the ungrouped kernel, so the arithmetic is unchanged: what a
+    tile does is decided by (row0, t0) and the token bound, and grouping only
+    chooses those three per block instead of per launch. `tile_end` is the end
+    of that expert's block rather than the tile's, so the staging clamp lands
+    inside the expert it belongs to and never on a neighbour's rows.
+    """
+    tile = Int(block_idx.y)
+    gemm_i8mma_tile_impl[BM, BN, NW, FMT](
+        y,
+        wtab[Int(tile_expert[tile])],
+        xq_g,
+        xd_g,
+        xsm_g,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(tile_first[tile]),
+        Int(tile_end[tile]),
+    )
+
+
+def gemm_q6_k_grouped_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Every expert of a routed step in one launch — the Q6_K half of it.
+
+    Same construction as `gemm_i8mma_grouped_impl`; a mixture whose stacks are
+    Q4_K for gate and up and Q6_K for down needs both, and one of them grouped
+    leaves the other launching per expert.
+    """
+    tile = Int(block_idx.y)
+    gemm_q6_k_tile_impl[BM, NW](
+        y,
+        wtab[Int(tile_expert[tile])],
+        x,
+        n_cols,
+        n_rows,
+        Int(tile_end[tile]),
+        Int(block_idx.x) * BN,
+        Int(tile_first[tile]),
+    )
+
+
+comptime gemm_q6_k_f16_grouped = gemm_q6_k_grouped_impl[64, 4]
+
+comptime gemm_q8_0_i8mma_grouped = gemm_i8mma_grouped_impl[64, 64, 8, 0]
+comptime gemm_q4_k_i8mma_grouped = gemm_i8mma_grouped_impl[64, 64, 8, 1]
 
 comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 64, 8, 0]
 comptime gemm_q8_0_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 0]

@@ -468,8 +468,14 @@ impl CudaDevice {
 // Blackwell splits into two lines that do NOT share the tensor-core ISA, and
 // the compute capability alone does not say which one a device is on: sm_100
 // and sm_103 are the datacenter parts, sm_120 and sm_121 the consumer ones.
-// Establshed by assembling each instruction with `ptxas` on GB10 (sm_121a);
-// see docs/PLAN_ARCHITEKTURA.md.
+// Established by assembling each instruction with `ptxas` and reading the SASS
+// back with `nvdisasm`; see docs/PLAN_ARCHITEKTURA.md.
+//
+// Probe against the ARCHITECTURE-SPECIFIC target (`sm_121a`, not `sm_121`).
+// These are arch-specific instructions: the plain target refuses lines the `a`
+// target assembles, so a probe against it reports "unsupported" for a part that
+// supports the instruction — which is exactly how the NVFP4 entry below came to
+// claim the opposite of the truth for two Blackwell lines.
 
 /// Block-scaled FP4 MMA with UE8M0 scales — MXFP4. Present on both Blackwell
 /// lines; accepted by `ptxas` on sm_121a.
@@ -477,11 +483,21 @@ fn mxf4_block_scale(sm: i32) -> bool {
     sm >= 100
 }
 
-/// Block-scaled FP4 MMA with E4M3 scales — NVFP4 computed natively. Datacenter
-/// Blackwell only: `ptxas` REJECTS it on sm_121a, which is why the consumer
-/// part has to repack NVFP4 or unpack it into f16.
+/// Block-scaled FP4 MMA with E4M3 scales — NVFP4 computed natively. Present on
+/// both Blackwell lines, exactly like the UE8M0 variant above.
+///
+/// This said "datacenter only" and was WRONG. `ptxas` from CUDA 13.0 assembles
+/// `mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X
+/// .f32.e2m1.e2m1.f32.ue4m3` for sm_121a and sm_120a, and `nvdisasm` shows it
+/// reaching SASS as `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. The negative control
+/// holds: the same assembler refuses `tcgen05.alloc` on sm_121a by name, so it
+/// does reject what the part cannot do.
+///
+/// What produced the wrong conclusion is that these are ARCHITECTURE-SPECIFIC
+/// instructions: `sm_121` refuses the same line that `sm_121a` accepts. A probe
+/// against the plain target reports "unsupported" for a part that supports it.
 fn nvf4_block_scale(sm: i32) -> bool {
-    (100..120).contains(&sm)
+    sm >= 100
 }
 
 /// Warp-group MMA, the core of FlashAttention-3. Hopper-only architecture-

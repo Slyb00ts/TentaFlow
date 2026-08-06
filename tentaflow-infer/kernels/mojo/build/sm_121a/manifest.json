@@ -1013,6 +1013,10 @@
       "entry": "src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_ff33767d47de9a9c",
       "file": "gemm_q4_k_i8mma_bm64.ptx"
     },
+    "gemm_q4_k_i8mma_grouped": {
+      "entry": "src_gemm_gemm_i8mma_grouped_im6A6A6A6A_0c26c8eba26625df",
+      "file": "gemm_q4_k_i8mma_grouped.ptx"
+    },
     "gemm_q4k_i8_native_1024_4096_m1024": {
       "entry": "src_gemm_q4k_i8_multistage_gem6A6A6A6A_ea19fbe1668d3af3",
       "file": "gemm_q4k_i8_native_1024_4096_m1024.ptx"
@@ -1153,6 +1157,10 @@
       "entry": "src_gemm_gemm_q6_k_impl_SIMD6A6A6A6AcB6A6A_4f87635b7efccf96",
       "file": "gemm_q6_k_f16_bm64.ptx"
     },
+    "gemm_q6_k_f16_grouped": {
+      "entry": "src_gemm_gemm_q6_k_grouped_imp6A6A6A6A_7e95b2e06b07c085",
+      "file": "gemm_q6_k_f16_grouped.ptx"
+    },
     "gemm_q8_0_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_2291ef814d618ce4",
       "file": "gemm_q8_0_dot4_128x128.ptx"
@@ -1240,6 +1248,10 @@
     "gemm_q8_0_i8mma_bm64": {
       "entry": "src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_42b019b94dbff7fb",
       "file": "gemm_q8_0_i8mma_bm64.ptx"
+    },
+    "gemm_q8_0_i8mma_grouped": {
+      "entry": "src_gemm_gemm_i8mma_grouped_im6A6A6A6A_02a7d3521c96dbd0",
+      "file": "gemm_q8_0_i8mma_grouped.ptx"
     },
     "gemm_q8_0_i8mma_out_f32_b3": {
       "entry": "src_q8_0_batch_gemm_q8_0_small6A6A6A6A_766e77eaec21be21",

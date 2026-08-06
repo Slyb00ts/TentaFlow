@@ -261,14 +261,20 @@ w ciemno.
 Świadomie nie dopisałem też gałęzi „gdy karta ma natywne NVFP4", bo nie mamy
 kernela, który by ją obsłużył; byłby to stub udający wybór.
 
-Podstawa jest zweryfikowana sondowaniem `ptxas` na GB10:
+Podstawa jest zweryfikowana sondowaniem `ptxas` na GB10 — **przeciwko celowi
+`sm_121a`, nie `sm_121`**. Te instrukcje są specyficzne dla architektury: cel bez
+sufiksu `a` odrzuca linie, które cel z sufiksem składa bez zastrzeżeń. Sonda
+przeciw gołemu celowi mówi „brak" o części, która daną instrukcję wykonuje, i
+dokładnie tak powstał wcześniejszy błędny wiersz o NVFP4 w tabeli poniżej.
+Kontrola negatywna trzyma: ten sam asembler odrzuca `tcgen05.alloc` i `wgmma` na
+`sm_121a`, podając ich nazwy.
 
 | funkcja | sm_121a |
 |---|---|
 | `mma.sync`, `cp.async` | jest |
 | TMA (`cp.async.bulk.tensor`) | jest |
 | `mma.kind::mxf4.block_scale.m16n8k64` (FP4 2×) | jest — skale UE8M0 |
-| `mma...nvf4` (skale E4M3) | **brak** |
+| `mma.kind::mxf4nvf4.block_scale.scale_vec::4X` (skale UE4M3) | jest |
 | `wgmma` (rdzeń FA3) | **brak** |
 | `tcgen05` (rdzeń FA4) | **brak** |
 
@@ -293,14 +299,17 @@ Dlatego FA4 w całości jest tu niewykonalne, a jego dwie techniki algorytmiczne
 
   | ścieżka | MMA | skale per-grupa | dodatkowa pamięć | stratna |
   |---|---|---|---|---|
-  | NVFP4 natywnie (E4M3) | — | — | — | sprzęt nie wspiera |
+  | NVFP4 natywnie (E4M3) | `k64` | natywnie w MMA | 0 | nie |
   | wprost → f16 | `k16` | w kernelu | 0 | nie |
   | przepakowanie do FP8 (dziś) | `k32` | wtopione | +7,35 GB | tak |
   | MXFP4 | `k64` | natywnie w MMA | 0 | tak (skale) |
 
-  Zasada „licz wprost" zostaje słuszna, ale na tym sprzęcie nie da się jej
-  spełnić w pełni: natywnego NVFP4 z E4M3 nie ma. Wybór jest więc między trzema
-  kompromisami, a nie między czystością a konwersją. Rozstrzygnie pomiar
+  Zasada „licz wprost" jest na tym sprzęcie osiągalna w pełni, wbrew temu, co
+  ten akapit twierdził wcześniej: natywne NVFP4 z E4M3 JEST — `k64`, skale
+  wewnątrz MMA, zero dodatkowej pamięci i bez straty, czyli najlepszy wiersz tej
+  tabeli we wszystkich czterech kolumnach. Wniosek przeciwny brał się z sondy
+  przeciw `sm_121`, a nie `sm_121a`. Wybór nie jest więc między
+  czystością a konwersją: konwersja przestaje być potrzebna. Rozstrzygnie pomiar
   jakości (`forge ppl`) obu konwersji — również tej, którą stosujemy dziś i
   której nikt nie zmierzył.
 - **Hopper i Blackwell datacenter** — dziś nie budujemy `sm_90` ani `sm_100`, więc

@@ -260,7 +260,25 @@ fn expected(f: &Fixture, x: &[f32], shared: bool, gated: bool) -> Vec<f32> {
     acc
 }
 
+/// Tokens in the WIDE step.
+///
+/// Above the width at which the executor stops routing token by token and
+/// reorders the whole step by expert. That route existed for a while with no
+/// hermetic gate at all — a single token never reaches it — so a kernel that
+/// multiplied the wrong expert's rows only showed up on a 30B checkpoint, as a
+/// NaN with nothing small to bisect.
+const WIDE_TOKENS: u32 = 24;
+
 fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, token: u32, shared: bool) -> Vec<f32> {
+    run_at(exec, f, &[token], shared)
+}
+
+fn run_at<E: Executor + WeightStore>(
+    exec: &mut E,
+    f: &Fixture,
+    tokens: &[u32],
+    shared: bool,
+) -> Vec<f32> {
     let embed = exec
         .put_quant(packed(
             f.table_bytes.clone(),
@@ -327,10 +345,10 @@ fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, token: u32, shared:
             .expect("bramka współdzielona"),
     });
 
-    let step = Step::single(0, 0, 1).expect("krok");
+    let step = Step::single(0, 0, tokens.len() as u32).expect("krok");
     exec.run(&Op::Embed {
         table: embed,
-        tokens: vec![token],
+        tokens: tokens.to_vec(),
         step: step.clone(),
     })
     .expect("osadzenie");
@@ -348,7 +366,7 @@ fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, token: u32, shared:
         step,
     })
     .expect("mieszanka");
-    exec.read(Act::Proj, HIDDEN).expect("odczyt")
+    exec.read(Act::Proj, HIDDEN * tokens.len()).expect("odczyt")
 }
 
 fn spread_error(got: &[f32], want: &[f32]) -> f32 {
@@ -431,6 +449,25 @@ fn the_mixture_block_matches_the_formula_on_both_executors() {
     );
     assert!(host_err < 0.01, "wzorzec: {:.3}%", host_err * 100.0);
     assert!(cuda_err < 0.03, "CUDA: {:.3}%", cuda_err * 100.0);
+
+    // The WIDE step, which is a different route through the same weights: the
+    // executor reorders the whole step by expert instead of walking tokens. Each
+    // token's row is held to the same reference row it gets alone, so a tile
+    // reading a neighbour's rows shows up as one bad token rather than as an
+    // average that survives a bound.
+    let tokens: Vec<u32> = (0..WIDE_TOKENS).map(|i| (i * 7 + 3) % HIDDEN as u32).collect();
+    let wide = run_at(&mut cuda, &f, &tokens, true);
+    for (row, &t) in tokens.iter().enumerate() {
+        let x = &f.table[t as usize * HIDDEN..(t as usize + 1) * HIDDEN];
+        let want_row = expected(&f, x, true, true);
+        let err = spread_error(&wide[row * HIDDEN..(row + 1) * HIDDEN], &want_row);
+        assert!(
+            err < 0.03,
+            "krok szeroki, token {t} w wierszu {row}: {:.3}%",
+            err * 100.0
+        );
+    }
+    eprintln!("krok szeroki: {WIDE_TOKENS} tokenów zgodnych z wzorcem");
 
     // And the mixture WITHOUT a shared expert still computes — the same op,
     // the same weights, the branch a checkpoint like Qwen3-30B-A3B takes.

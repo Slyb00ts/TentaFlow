@@ -152,6 +152,12 @@ struct MoeScratch {
     order: DevBuffer,
     /// Its inverse: where each token's j-th selection landed in that order.
     slots: DevBuffer,
+    /// One entry per tile of the grouped launch: which expert that tile reads,
+    /// and where its expert's block of rows begins and ends. Three arrays
+    /// because a block reads all three and they are meaningless apart.
+    tile_expert: DevBuffer,
+    tile_first: DevBuffer,
+    tile_end: DevBuffer,
     /// `[0, 1, 2, …]`, the slot table of a single selection per token — the
     /// shared expert folds through the same combine kernel as the routed sum.
     identity: DevBuffer,

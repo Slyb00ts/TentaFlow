@@ -1723,7 +1723,7 @@ mod compressor;
 mod deltanet;
 mod elementwise;
 mod gemm;
-mod moe;
+pub mod moe;
 mod mtp;
 mod norm;
 mod quant;

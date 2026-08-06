@@ -289,6 +289,9 @@ from src.gemm import gemm_nvfp4_f16_bm32, gemm_f16_out_f32_bm32
 from src.gemm import gemm_q8_0_out_f32, gemm_q8_0_out_f32_bm64
 from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import (
+    gemm_q4_k_i8mma_grouped,
+    gemm_q6_k_f16_grouped,
+    gemm_q8_0_i8mma_grouped,
     gemm_q8_0_i8mma,
     gemm_q8_0_i8mma_bm64,
     gemm_q8_0_i8mma_big,
@@ -3169,6 +3172,21 @@ def main() raises:
         moe_combine_f16, dump_asm=Path("moe_combine_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "moe_combine_f16"))
+
+    _ = ctx.compile_function[
+        gemm_q4_k_i8mma_grouped, dump_asm=Path("gemm_q4_k_i8mma_grouped.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q4_k_i8mma_grouped"))
+
+    _ = ctx.compile_function[
+        gemm_q8_0_i8mma_grouped, dump_asm=Path("gemm_q8_0_i8mma_grouped.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_grouped"))
+
+    _ = ctx.compile_function[
+        gemm_q6_k_f16_grouped, dump_asm=Path("gemm_q6_k_f16_grouped.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q6_k_f16_grouped"))
 
     _ = ctx.compile_function[
         gemv_q5_k_f16_v2, dump_asm=Path("gemv_q5_k_f16_v2.ptx")
