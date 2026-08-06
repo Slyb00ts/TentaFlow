@@ -78,3 +78,59 @@ pub fn top_k(logits: &[f32], k: usize) -> Vec<usize> {
     idx.truncate(k);
     idx
 }
+
+/// Holds one executor's logits against another's: the chosen token exactly, and
+/// every other disagreement in the leading few required to be a TIE rather than
+/// forgiven.
+///
+/// The two sides round differently by construction — the reference keeps f32
+/// where the kernels quantize activations to int8 — so two logits within that
+/// rounding of each other may come out in either order. Demanding the exact
+/// order fails on arithmetic that is right; dropping the order entirely passes
+/// for arithmetic that is wrong. So a swap is allowed only when the REFERENCE
+/// itself separates the two by less than the error being measured, which is a
+/// check and not a relaxation.
+///
+/// One rule per RANK and none for the set, deliberately. A fixed window has an
+/// edge, and comparing membership across it fails for the pair that straddles
+/// it however close they are — which is an artefact of the window, not a
+/// finding. Holding each rank to the tie rule covers the same ground without
+/// it: a genuinely different token there is separated in the reference by far
+/// more than the error being measured, and says so.
+///
+/// Lives here rather than in one test file because both checkpoints on this
+/// path ask the same question, and two statements of it would drift.
+pub fn agrees(what: &str, got: &[f32], want: &[f32], bound: f64) {
+    assert_eq!(got.len(), want.len());
+    let err = spread_error(got, want);
+    let ours = top_k(got, 5);
+    let theirs = top_k(want, 5);
+    eprintln!("{what}: {:.3}% rozpiętości, argmax {}", err * 100.0, ours[0]);
+
+    assert_eq!(ours[0], theirs[0], "{what}: inny token");
+
+    // A swap is explained exactly when THIS RUN's error on THOSE TWO logits is
+    // together enough to invert their order. Local on purpose: the earlier
+    // version held the gap against the run's RMS over the whole vocabulary,
+    // which is the wrong statistic — the error at any single pair is routinely
+    // several times the mean, so a real tie could be reported as a divergence.
+    // A genuinely different token cannot pass this: its separation is orders
+    // above the error at either end of it.
+    for (rank, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+        if a == b {
+            continue;
+        }
+        let separation = (want[*a] - want[*b]).abs() as f64;
+        let slack = ((got[*a] - want[*a]).abs() + (got[*b] - want[*b]).abs()) as f64;
+        assert!(
+            separation <= slack,
+            "{what}: miejsce {rank} zamienione, a wzorzec dzieli je o {separation:.4} \
+             przy błędzie {slack:.4} na tej parze — to nie jest remis"
+        );
+    }
+    assert!(
+        err < bound,
+        "{what}: {:.3}% rozpiętości to nie jest ta sama arytmetyka",
+        err * 100.0
+    );
+}

@@ -244,14 +244,11 @@ fn the_hybrid_agrees_with_the_host_reference() {
     let cpu_first = cpu.prefill(0, &prompt).expect("prefill wzorca");
     eprintln!("wzorzec: prefill w {:.1} s", t.elapsed().as_secs_f64());
 
-    let got = gpu.logits(0).expect("logity CUDA");
-    let want = cpu.logits(0).expect("logity wzorca");
-    let err = common::spread_error(&got, &want);
-    eprintln!(
-        "prefill: {:.3}% rozpiętości, argmax {} wobec {}",
-        err * 100.0,
-        common::top_k(&got, 1)[0],
-        common::top_k(&want, 1)[0]
+    common::agrees(
+        "prefill",
+        &gpu.logits(0).expect("logity CUDA"),
+        &cpu.logits(0).expect("logity wzorca"),
+        0.02,
     );
     assert_eq!(gpu_first, cpu_first, "prefill wybrał inny token");
 
@@ -263,19 +260,10 @@ fn the_hybrid_agrees_with_the_host_reference() {
     }];
     gpu.decode(&feed).expect("krok CUDA");
     cpu.decode(&feed).expect("krok wzorca");
-    let got = gpu.logits(0).expect("logity CUDA");
-    let want = cpu.logits(0).expect("logity wzorca");
-    let step_err = common::spread_error(&got, &want);
-    eprintln!(
-        "krok: {:.3}% rozpiętości, argmax {}",
-        step_err * 100.0,
-        common::top_k(&got, 1)[0]
+    common::agrees(
+        "krok",
+        &gpu.logits(0).expect("logity CUDA"),
+        &cpu.logits(0).expect("logity wzorca"),
+        0.02,
     );
-    assert_eq!(
-        common::top_k(&got, 1)[0],
-        common::top_k(&want, 1)[0],
-        "krok wybrał inny token"
-    );
-    assert!(err < 0.02, "prefill: {:.3}% rozpiętości", err * 100.0);
-    assert!(step_err < 0.02, "krok: {:.3}% rozpiętości", step_err * 100.0);
 }

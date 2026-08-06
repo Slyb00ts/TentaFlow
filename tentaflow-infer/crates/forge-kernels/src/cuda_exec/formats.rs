@@ -75,9 +75,14 @@ macro_rules! block_formats {
                 scale: f32,
             ) -> Result<()> {
                 match quant {
-                    QuantKind::Q4K => {
-                        self.kernels.gemm_q4_k_f16_at(y, w, 0, x, rows, cols, n_tokens, &self.stream)
-                    }
+                    // The INTEGER MATRIX-UNIT form, not the portable f16 tile.
+                    // Both compute the same product; the difference is whether
+                    // the card's matrix units run at all, and a prompt is where
+                    // that is the whole cost. The launcher picks among its own
+                    // variants by shape and token count and always covers.
+                    QuantKind::Q4K => self
+                        .kernels
+                        .gemm_q4_k_i8mma_at(y, w, 0, x, rows, cols, n_tokens, &self.stream),
                     QuantKind::Q6K => {
                         self.kernels.gemm_q6_k_f16_at(y, w, 0, x, rows, cols, n_tokens, &self.stream)
                     }
@@ -120,7 +125,7 @@ block_formats! {
     plain {
     None   => gemv_f16        , gemm_f16_at        , gemv_f16_out_f32;
     Q5K    => gemv_q5_k_f16   , gemm_q5_k_f16_at   , gemv_q5_k_out_f32;
-    Q8_0   => gemv_q8_0_f16   , gemm_q8_0_f16_at   , gemv_q8_0_out_f32;
+    Q8_0   => gemv_q8_0_f16   , gemm_q8_0_i8mma_at , gemv_q8_0_out_f32;
     Q3K    => gemv_q3_k_f16   , gemm_q3_k_f16_at   , gemv_q3_k_out_f32;
     Q2K    => gemv_q2_k_f16   , gemm_q2_k_f16_at   , gemv_q2_k_out_f32;
     Q4_0   => gemv_q4_0_f16   , gemm_q4_0_f16_at   , gemv_q4_0_out_f32;

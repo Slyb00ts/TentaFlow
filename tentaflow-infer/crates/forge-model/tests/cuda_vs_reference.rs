@@ -472,26 +472,7 @@ fn the_cuda_executor_continues_a_polish_prompt() {
 fn compare(what: &str, gpu: &Dense<CudaExec>, cpu: &Dense<HostExec>) {
     let got = gpu.logits(0).expect("logity CUDA");
     let want = cpu.logits(0).expect("logity wzorca");
-    assert_eq!(got.len(), want.len());
-
-    let err = common::spread_error(&got, &want);
-    let ours = common::top_k(&got, 5);
-    let theirs = common::top_k(&want, 5);
-    eprintln!(
-        "{what}: {:.3}% rozpiętości, argmax {}",
-        err * 100.0,
-        ours[0]
-    );
-    assert_eq!(
-        ours[..3],
-        theirs[..3],
-        "{what}: czołówka rozjechała się; CUDA {ours:?}, wzorzec {theirs:?}"
-    );
-    assert!(
-        err < 0.02,
-        "{what}: {:.3}% rozpiętości to nie jest ta sama arytmetyka",
-        err * 100.0
-    );
+    common::agrees(what, &got, &want, 0.02);
 }
 
 #[test]

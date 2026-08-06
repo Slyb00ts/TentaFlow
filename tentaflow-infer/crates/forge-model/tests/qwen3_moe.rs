@@ -167,53 +167,10 @@ fn the_mixture_agrees_with_the_host_reference() {
     compare("krok", &gpu, &cpu);
 }
 
-/// Held to the argmax, to the top-5 as a SET, and to the spread — with any
-/// reordering inside that set required to be a TIE rather than forgiven.
-///
-/// The two sides round differently by construction: the reference keeps f32
-/// where the kernels use f16 and int8, so two logits within that rounding of
-/// each other may come out in either order. Demanding the exact order would
-/// fail on arithmetic that is right; dropping the order entirely would pass
-/// for arithmetic that is wrong. So a swap is allowed only when the reference
-/// itself says the two were closer together than the error being measured —
-/// which is a check, not a relaxation.
 fn compare(what: &str, gpu: &Dense<CudaExec>, cpu: &Dense<HostExec>) {
     let got = gpu.logits(0).expect("logity CUDA");
     let want = cpu.logits(0).expect("logity wzorca");
-    let err = common::spread_error(&got, &want);
-    let ours = common::top_k(&got, 5);
-    let theirs = common::top_k(&want, 5);
-    eprintln!("{what}: {:.3}% rozpiętości, argmax {}", err * 100.0, ours[0]);
-
-    assert_eq!(ours[0], theirs[0], "{what}: inny token");
-    let (mut a, mut b) = (ours.clone(), theirs.clone());
-    a.sort_unstable();
-    b.sort_unstable();
-    assert_eq!(a, b, "{what}: inna czołowa piątka; CUDA {ours:?}, wzorzec {theirs:?}");
-
-    let (lo, hi) = want
-        .iter()
-        .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-    let spread = hi - lo;
-    for (rank, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
-        if ours == theirs {
-            continue;
-        }
-        let gap = ((want[*ours as usize] - want[*theirs as usize]).abs() / spread) as f64;
-        assert!(
-            gap <= err,
-            "{what}: miejsce {rank} zamienione, a wzorzec dzieli je o {:.3}% \
-             przy błędzie {:.3}% — to nie jest remis",
-            gap * 100.0,
-            err * 100.0
-        );
-    }
-
     // The same threshold the dense path is held to. A routing that picked a
     // different expert would land orders of magnitude outside it.
-    assert!(
-        err < 0.02,
-        "{what}: {:.3}% rozpiętości to nie jest ta sama arytmetyka",
-        err * 100.0
-    );
+    common::agrees(what, &got, &want, 0.02);
 }
