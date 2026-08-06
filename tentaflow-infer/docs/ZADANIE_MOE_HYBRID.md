@@ -186,7 +186,29 @@ Kamień 4a rozpadł się więc na trzy, w tej kolejności, każdy z własną bra
   wykonawcach wobec formuły wypisanej w teście — jej pierwsza wersja NICZEGO nie
   rozstrzygała, bo przy jednakowo rozłożonych głowicach norma per głowica i norma
   po całej aktywacji zgadzają się co do kilku procent.
-- **4a-2: sam MoE.** ← tutaj jesteśmy.
+- **4a-2: sam MoE. ZROBIONE.** `Op::MoeFfn` jedną operacją, routing i wybór po
+  stronie wykonawcy. Bramka hermetyczna (wzorzec 0,000%, CUDA 0,194%) i pełna:
+  Qwen3-30B-A3B kontynuuje „The capital of France is" poprawnie i zgadza się ze
+  wzorcem na 0,433% w prefillu oraz 0,204% w kroku.
+
+  Trzy rzeczy, których karta nie przewidziała, warte zapisania przed 4b:
+
+  - **Kernele `_gidx` NIE biorą stosu, tylko TABLICĘ WSKAŹNIKÓW** i łuskają
+    `table[ids[sel]]`. Podanie im wagi czyta jej bajty jako adresy — nielegalny
+    dostęp zamiast złej liczby, i to jedyna łaska w tym. Tablica jest u nas
+    zdegenerowana (wszystko w jednym ciągłym stosie), ale to właśnie ta
+    pośredniość pozwoli później przesuwać ekspertów: rezydencja stanie się
+    przepisaniem tablicy, a nie zmianą wywołania kernela.
+  - **Stosy przychodzą trójwymiarowe**, a wiodące wymiary SKŁADAJĄ się w liczbę
+    wierszy bez przepakowania, bo źródło jest wierszowe. Szerokość wiersza jest
+    natomiast sprawdzana osobno.
+  - **Ekspert współdzielony jest ODRZUCANY**, nie pomijany. Policzenie
+    checkpointu bez niego to inny model, który dalej mówi. 4b go wnosi.
+
+  Rozstrzygnięte też pytanie o precyzję routera: CUDA zwęża go do f16, bo tego
+  chce kernel, a wzorzec trzyma f32 źródła. Na tym checkpoincie zamieniają się
+  miejscami dwa remisujące tokeny — i test tego nie wybacza, tylko SPRAWDZA, że
+  wzorzec dzieli je mniej niż wynosi mierzony błąd.
 
 Stan pośredni jest osiągnięty i sprawdzony: checkpoint przechodzi kształt i normy
 i zatrzymuje się DOKŁADNIE na FFN — „brakuje ról [FfnGate, FfnUp, FfnDown];
