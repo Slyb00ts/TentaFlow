@@ -2089,6 +2089,22 @@
       "entry": "src_mma_fp4_mma_nvf4_probe_P6A6A6A6AoA6A6A_63b7438a37d5d041",
       "file": "mma_nvf4_probe.ptx"
     },
+    "mma_rate_e4m3": {
+      "entry": "src_mma_fp4_mma_rate_probe_S6A6A6A6AcB6A6A_0b5361a8169be30b",
+      "file": "mma_rate_e4m3.ptx"
+    },
+    "mma_rate_f16": {
+      "entry": "src_mma_fp4_mma_rate_probe_S6A6A6A6AcB6A6A_ec13e37aa82db4d9",
+      "file": "mma_rate_f16.ptx"
+    },
+    "mma_rate_mxf4": {
+      "entry": "src_mma_fp4_mma_rate_probe_S6A6A6A6AcB6A6A_c8938b70c5ed2b52",
+      "file": "mma_rate_mxf4.ptx"
+    },
+    "mma_rate_nvf4": {
+      "entry": "src_mma_fp4_mma_rate_probe_S6A6A6A6AcB6A6A_df8a9730ba7b4ae5",
+      "file": "mma_rate_nvf4.ptx"
+    },
     "moe_combine_f16": {
       "entry": "src_moe_moe_combine_f16_Poin6A6A6A6AoA6A6A_f39556ba15edb720",
       "file": "moe_combine_f16.ptx"

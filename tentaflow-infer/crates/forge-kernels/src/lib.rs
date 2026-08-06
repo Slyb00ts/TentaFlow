@@ -30,4 +30,5 @@ pub use launchers::{
     Nvfp4CtProjection, Nvfp4CtS0View, Nvfp4GgufLayout, Nvfp4GgufQ8Projection, Q8ActPrepared,
     Q8PreparedProjection, SAMPLE_MAX_TOPK, SAMPLE_MAX_VOCAB, SAMPLE_SCRATCH_PAIRS,
 };
+pub use launchers::gemm::mxf4::{MmaKind, MMA_RATE_OPS};
 pub use registry::{KernelArtifacts, Manifest};

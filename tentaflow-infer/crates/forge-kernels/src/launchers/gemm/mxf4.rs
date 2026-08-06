@@ -11,6 +11,42 @@ const MMA_MXF4_PROBE: &str = "mma_mxf4_probe";
 /// To samo dla skal per 16 w E4M3, czyli układu bloku `NVFP4Gguf`.
 const MMA_NVF4_PROBE: &str = "mma_nvf4_probe";
 
+/// Ile instrukcji wykonuje jeden pas w `mma_rate_*`; `_RATE_STEPS * _RATE_MMAS`.
+pub const MMA_RATE_OPS: u64 = 2048 * 8;
+
+/// Rodzaj instrukcji mierzony przez `mma_rate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmaKind {
+    /// `kind::mxf4`, k=64, skale per 32 w UE8M0.
+    Mxf4,
+    /// `kind::mxf4nvf4`, k=64, skale per 16 w UE4M3.
+    Nvf4,
+    /// Zwykłe `m16n8k32.e4m3` — to, czym mnoży dzisiejsza ścieżka FP8.
+    E4m3,
+    /// `m16n8k16.f16` — kafel przenośny, na którym stoi reszta katalogu.
+    F16,
+}
+
+impl MmaKind {
+    fn artifact(self) -> &'static str {
+        match self {
+            MmaKind::Mxf4 => "mma_rate_mxf4",
+            MmaKind::Nvf4 => "mma_rate_nvf4",
+            MmaKind::E4m3 => "mma_rate_e4m3",
+            MmaKind::F16 => "mma_rate_f16",
+        }
+    }
+
+    /// Mnożenia-dodawania na jedną instrukcję: k=64 wobec k=32.
+    pub fn macs(self) -> u64 {
+        match self {
+            MmaKind::Mxf4 | MmaKind::Nvf4 => 16 * 8 * 64,
+            MmaKind::E4m3 => 16 * 8 * 32,
+            MmaKind::F16 => 16 * 8 * 16,
+        }
+    }
+}
+
 impl Kernels {
     /// Czy karta i artefakty niosą blokowo-skalowane MMA na czterech bitach.
     ///
@@ -67,5 +103,37 @@ impl Kernels {
             .buf(scale_a)
             .buf(scale_b);
         self.device.launch(k, &cfg, &args, stream)
+    }
+}
+
+impl Kernels {
+    /// Tempo wydawania jednej instrukcji mma, z operandami już w rejestrach.
+    ///
+    /// Nie mierzy kafla i nie ma mierzyć: kafel wnosi pamięć, której obie
+    /// rodziny nie dzielą, a pytanie brzmi, czy jednostka macierzowa w ogóle
+    /// oddaje cztery bity szybciej niż osiem. Odpowiedź na nie decyduje, czy
+    /// budowanie kafla FP4 ma sens.
+    pub fn mma_rate(
+        &self,
+        kind: MmaKind,
+        d: &DevBuffer,
+        a: &DevBuffer,
+        blocks: u32,
+        threads: u32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if d.len() < (blocks * threads) as usize * 4 || a.len() < 32 * 16 {
+            return Err(ForgeError::Kernel(
+                "mma_rate: bufor jest mniejszy od siatki".into(),
+            ));
+        }
+        let k = self.artifacts.get(kind.artifact())?;
+        let cfg = LaunchConfig {
+            grid: (blocks, 1, 1),
+            block: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.device
+            .launch(k, &cfg, &LaunchArgs::new().buf(d).buf(a), stream)
     }
 }

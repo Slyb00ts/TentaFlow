@@ -12,7 +12,7 @@
 # the instruction gets a gate of its own before any tile is built on it, and the
 # gate compares against arithmetic done on the host.
 
-from std.gpu import global_idx, thread_idx
+from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.memory import UnsafePointer
 from std.sys import _RegisterPackType
 from std.sys._assembly import inlined_assembly
@@ -145,3 +145,100 @@ def mma_mxf4_probe(
     d[lane * 4 + 1] = acc[1]
     d[lane * 4 + 2] = acc[2]
     d[lane * 4 + 3] = acc[3]
+
+
+comptime _RATE_MMAS = 8
+"""Independent chains per lane: enough to hide the issue latency of one op."""
+
+comptime _RATE_STEPS = 2048
+
+
+def _mma_e4m3_rate(
+    a0: UInt32,
+    a1: UInt32,
+    a2: UInt32,
+    a3: UInt32,
+    b0: UInt32,
+    b1: UInt32,
+    c: SIMD[DType.float32, 4],
+) -> SIMD[DType.float32, 4]:
+    """The op the FP8 path already uses, for the comparison to mean anything."""
+    var r = inlined_assembly[
+        (
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {$0, $1, $2,"
+            " $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};"
+        ),
+        _RegisterPackType[Float32, Float32, Float32, Float32],
+        constraints="=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effect=False,
+    ](a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3])
+    return SIMD[DType.float32, 4](r[0], r[1], r[2], r[3])
+
+
+def _mma_f16_rate(
+    a0: UInt32,
+    a1: UInt32,
+    a2: UInt32,
+    a3: UInt32,
+    b0: UInt32,
+    b1: UInt32,
+    c: SIMD[DType.float32, 4],
+) -> SIMD[DType.float32, 4]:
+    """The portable f16 tile's op, for the ratio the whole catalogue is built on."""
+    var r = inlined_assembly[
+        (
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {$0, $1, $2,"
+            " $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};"
+        ),
+        _RegisterPackType[Float32, Float32, Float32, Float32],
+        constraints="=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effect=False,
+    ](a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3])
+    return SIMD[DType.float32, 4](r[0], r[1], r[2], r[3])
+
+
+def mma_rate_probe[KIND: Int](
+    d: UnsafePointer[Float32, MutAnyOrigin],
+    a: UnsafePointer[UInt32, MutAnyOrigin],
+):
+    """Issue rate of one mma kind, with every operand already in registers.
+
+    Nothing here touches memory inside the loop and nothing depends on the
+    previous iteration except through the accumulators, of which there are
+    eight per lane — so what this measures is the rate the matrix unit RETIRES
+    the instruction, which is the only number that says whether a four-bit tile
+    can beat the eight-bit one already shipping. A tile measured instead would
+    fold in a memory system that the two kinds do not share.
+    """
+    lane = Int(thread_idx.x) % 32
+    var a0 = a[lane * 4]
+    var a1 = a[lane * 4 + 1]
+    var a2 = a[lane * 4 + 2]
+    var a3 = a[lane * 4 + 3]
+    var acc = InlineArray[SIMD[DType.float32, 4], _RATE_MMAS](
+        fill=SIMD[DType.float32, 4](0.0, 0.0, 0.0, 0.0)
+    )
+    var scale: UInt32 = 0x7F7F7F7F if KIND == 0 else 0x38383838
+
+    for _ in range(_RATE_STEPS):
+        comptime for i in range(_RATE_MMAS):
+            if KIND == 0:
+                acc[i] = _mma_mxf4(a0, a1, a2, a3, a0, a1, scale, scale, acc[i])
+            elif KIND == 1:
+                acc[i] = _mma_nvf4(a0, a1, a2, a3, a0, a1, scale, scale, acc[i])
+            elif KIND == 2:
+                acc[i] = _mma_e4m3_rate(a0, a1, a2, a3, a0, a1, acc[i])
+            else:
+                acc[i] = _mma_f16_rate(a0, a1, a2, a3, a0, a1, acc[i])
+
+    var total = SIMD[DType.float32, 4](0.0, 0.0, 0.0, 0.0)
+    comptime for i in range(_RATE_MMAS):
+        total += acc[i]
+    idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    d[idx] = total[0] + total[1] + total[2] + total[3]
+
+
+comptime mma_rate_mxf4 = mma_rate_probe[0]
+comptime mma_rate_nvf4 = mma_rate_probe[1]
+comptime mma_rate_e4m3 = mma_rate_probe[2]
+comptime mma_rate_f16 = mma_rate_probe[3]

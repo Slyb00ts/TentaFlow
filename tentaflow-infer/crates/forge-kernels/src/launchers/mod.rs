@@ -1722,7 +1722,7 @@ mod attention;
 mod compressor;
 mod deltanet;
 mod elementwise;
-mod gemm;
+pub mod gemm;
 pub mod moe;
 mod mtp;
 mod norm;

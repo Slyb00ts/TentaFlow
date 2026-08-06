@@ -619,7 +619,14 @@ from src.sampling import (
     topk_batched_final_f32,
 )
 from src.sampling import penalize_histogram_f32, penalized_argmax_f32
-from src.mma_fp4 import mma_mxf4_probe, mma_nvf4_probe
+from src.mma_fp4 import (
+    mma_mxf4_probe,
+    mma_nvf4_probe,
+    mma_rate_e4m3,
+    mma_rate_f16,
+    mma_rate_mxf4,
+    mma_rate_nvf4,
+)
 from src.moe import (
     moe_combine_f16,
     moe_router_f16,
@@ -3185,6 +3192,26 @@ def main() raises:
         mma_nvf4_probe, dump_asm=Path("mma_nvf4_probe.ptx")
     ]()
     entries.append(_finalize(out_dir, "mma_nvf4_probe"))
+
+    _ = ctx.compile_function[
+        mma_rate_mxf4, dump_asm=Path("mma_rate_mxf4.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "mma_rate_mxf4"))
+
+    _ = ctx.compile_function[
+        mma_rate_nvf4, dump_asm=Path("mma_rate_nvf4.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "mma_rate_nvf4"))
+
+    _ = ctx.compile_function[
+        mma_rate_e4m3, dump_asm=Path("mma_rate_e4m3.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "mma_rate_e4m3"))
+
+    _ = ctx.compile_function[
+        mma_rate_f16, dump_asm=Path("mma_rate_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "mma_rate_f16"))
 
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_f16_gidx_batch,

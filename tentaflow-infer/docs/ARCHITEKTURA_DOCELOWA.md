@@ -527,3 +527,43 @@ cargo check -p forge-kernels --features metal-check
 Zmiana `Op`, `Executor` albo `WeightStore` nie jest skończona, dopóki to nie
 przechodzi. Nie zastępuje budowy na Macu — kernele MSL kompilują się dopiero
 tam — ale łapie całą warstwę rustową, czyli to, co się właśnie zepsuło.
+
+### Cztery bity to nie oszczędność pamięci, tylko podwojenie jednostki
+
+Kontrola możliwości w HAL-u mówiła, że GB10 nie ma blokowo-skalowanego FP4, i
+było to nieprawdą. `ptxas` z CUDA 13.0 składa
+`mma.sync.aligned.m16n8k64...kind::mxf4nvf4.block_scale` dla `sm_121a` i
+`sm_120a`; ta sama linia dla `sm_121` bez sufiksu jest odrzucana. To instrukcje
+WŁAŚCIWE ARCHITEKTURZE i sonda, która pytała o `sm_121`, musiała odpowiedzieć
+„nie ma" niezależnie od tego, co karta potrafi.
+
+Zmierzone tempo wydawania, operandy w rejestrach, 512 bloków po 128 wątków,
+mediana z siedmiu przebiegów:
+
+| instrukcja | ms | TFLOP/s |
+|---|---|---|
+| `m16n8k16.f16` | 1,126 | 122,0 |
+| `m16n8k32.e4m3` | 1,126 | 244,2 |
+| `m16n8k64.mxf4` | 1,127 | 488,0 |
+| `m16n8k64.mxf4nvf4` | 1,134 | 484,8 |
+
+Każdy rodzaj zajmuje ten sam czas. Jednostka macierzowa oddaje JEDNĄ instrukcję
+na takt niezależnie od szerokości elementu, więc przepustowość skaluje się
+wyłącznie z `k` — a maszyneria skal blokowych, wraz z dobieraniem czterech bajtów
+skali na wiersz, jest darmowa. Cztery bity dają więc czterokrotność kafla f16, na
+którym stoi reszta katalogu, i dwukrotność drugiej postaci FP8 z poprzedniej
+sekcji.
+
+Oba formaty czterobitowe, które ten projekt już czyta z dysku, trafiają w te
+instrukcje bez przepakowania: blok `NVFP4Gguf` to 64 wartości, cztery skale E4M3
+i 32 bajty — dokładnie `scale_vec::4X` z `ue4m3`; blok `MXFP4` to 32 wartości i
+jedna skala E8M0 — dokładnie `scale_vec::2X` z `ue8m0`.
+
+Układ fragmentów wyprowadzony jest pomiarem, nie założeniem, i ma własną bramkę
+(`crates/forge-kernels/tests/mma_fp4.rs`), bo źle ułożony fragment nie zgłasza
+błędu, tylko zwraca liczby. Bajtowo jest to układ działającego obok
+`m16n8k32.e4m3` z dwiema wartościami na bajt, a selektor `{0, 0}` czyta bajty
+0-1 (`2X`) albo 0-3 (`4X`) słowa skali od pasów 0-1 (A) i pasa 0 (B) każdej
+czwórki. Porównanie jest DOKŁADNE: każda wartość e2m1 to wielokrotność 0,5 o
+module najwyżej 6, więc 64 iloczyny zsumowane w f32 wypadają na liczbach
+reprezentowalnych niezależnie od kolejności dodawania.
