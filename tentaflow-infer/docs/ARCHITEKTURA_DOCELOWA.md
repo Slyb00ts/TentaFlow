@@ -353,6 +353,59 @@ Reguła na cały ten czas: żaden krok nie kończy się deklaracją, tylko pomia
 wobec wzorca hostowego (poprawność) i wobec silnika (wydajność), na tym samym
 checkpoincie.
 
+### Drugą połowę tej reguły przez cztery kroki płacono tylko obietnicą
+
+Poprawność była mierzona za każdym razem. Wydajność nie była mierzona ANI RAZU
+wobec silnika — i różnica, gdy wreszcie padło pytanie, wynosiła **czterokrotność**
+na prefillu. Bielik 7B Q4_K_M, GB10, prompt 512 tokenów: silnik 5535 tok/s, nowa
+ścieżka 1256. Dekodowanie było równe od początku (35,8 wobec 34,2), więc nic w
+poprzednich pomiarach tego nie pokazywało.
+
+Bisekcja przez osobne drzewo robocze wykluczyła regresję: przed krokiem 4 było
+947 tok/s, po nim 939. Nie zepsuliśmy niczego — po prostu nigdy nie zbudowaliśmy
+tego, co silnik ma. Złożyły się na to dwie rzeczy i obie były jedną linią decyzji:
+
+- **Tabela formatów wysyłała prefill na przenośny kafel f16**, gdy dla Q4_K i
+  Q8_0 istniały warianty na całkowitoliczbowych jednostkach macierzowych.
+  939 → 1256 tok/s po zmianie dwóch wierszy. Wiersz tabeli, który wskazuje
+  wolniejszy kernel, nie różni się niczym od dobrego — liczy to samo.
+- **Prefill mnożył przez postać z dysku.** Postać blokowa jest właściwa dla
+  dekodowania, gdzie kosztem są przenoszone bajty; przy prompcie kosztem jest
+  arytmetyka, a superbloki dekodują się w pętli wewnętrznej. Silnik od dawna
+  trzymał DRUGĄ postać wagi (e4m3, skala na wiersz) i przełączał się na nią przy
+  szerokości promptu — nowa ścieżka nie miała jej wcale.
+
+Po dołożeniu drugiej postaci (`cuda_exec/fp8.rs`): **5230 tok/s wobec 5535
+silnika, czyli 95%**, przy 1478 tok/s tej samej ścieżki bez niej. Kosztuje to
+1,7× większy rozjazd z wzorcem na prefillu (0,326% → 0,557% rozpiętości, ten sam
+token i ta sama czołówka) — dokładnie tę samą wymianę robi silnik, bo to te same
+kernele.
+
+Trzy rzeczy z tego, ważniejsze niż sam mnożnik:
+
+- **Paczka powstaje przy PIERWSZYM szerokim mnożeniu, nie przy wczytaniu.**
+  Wykonawca nie zna roli wagi — `put_quant` widzi wiersze, kolumny i format —
+  więc pakowanie przy wczytaniu znaczyłoby pakowanie wszystkiego, ze stosami
+  ekspertów włącznie, których prefill i tak idzie kernelami adresowanymi na
+  urządzeniu i nie ma dla nich gęstego GEMM-u. Czekanie na użycie odpowiada na
+  to pytanie dokładnie i bez tabeli ról do utrzymywania.
+- **Szybsza ścieżka silnika jest zbudowana pod KSZTAŁTY jednego modelu.**
+  `gemm_fp8_modular` żąda skompilowanego z wyprzedzeniem kernela na każdą parę
+  `(wiersze, kolumny)`; w katalogu stoją dokładnie kształty Bielika. Poza nimi
+  zostaje kafel `gemm_fp8`, który obsługuje każdy kształt. Liczba 5535 nie jest
+  więc własnością silnika, tylko własnością modelu, dla którego ktoś te kernele
+  wpisał — i to samo dotyczy teraz nowej ścieżki.
+- **Mieszance i hybrydzie druga postać nie pomogła wcale** (83 i 38 tok/s przed i
+  po). Ich wąskim gardłem nie są projekcje gęste. Qwen3-30B: silnik 87,1 tok/s,
+  nowa ścieżka 83 — obie ścieżki są tam tak samo wolne, więc to dług całej bazy,
+  a nie tej ścieżki. Dla Qwen3.6-35B punktu odniesienia nie ma: silnik przewraca
+  się na nim na `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.
+
+`forge-kernels/examples/prefill_bench.rs` mierzy to powtarzalnie: rozgrzewka,
+którą się wyrzuca, bo to ona płaci za paczki, potem powtórzenia i mediana.
+Liczba z testu poprawności jest ZIMNA i nie nadaje się do porównań (1505 tok/s
+na tych samych wagach, dla których ustalona przepustowość to 5230).
+
 ### Kontrakt zmienia się na WSZYSTKICH platformach naraz
 
 Rozszerzenie `Op` o lane'y złamało `MetalExec` i nikt tego nie zauważył, bo

@@ -38,6 +38,7 @@ use crate::launchers::{Kernels, SAMPLE_SCRATCH_PAIRS};
 
 mod delta;
 mod formats;
+mod fp8;
 mod moe;
 
 /// Activation rows carried through the layers in one pass — lanes times tokens.
@@ -163,6 +164,10 @@ pub struct CudaExec {
     moe: RefCell<Option<MoeScratch>>,
     /// Per-expert base addresses, one table per stack, built on first use.
     expert_tables: RefCell<HashMap<u32, DevBuffer>>,
+    /// The e4m3 form of every weight that has been multiplied at prompt width.
+    /// `None` records a weight that cannot have one, so the question is asked
+    /// once per weight and not once per step.
+    fp8: RefCell<HashMap<u32, Option<fp8::Fp8Pack>>>,
     /// Scratch a recurrent layer needs, made on first demand and shared by all
     /// of them — nothing in it survives the operation.
     delta: RefCell<Option<delta::DeltaScratch>>,
@@ -299,6 +304,7 @@ impl CudaExec {
             weights: Vec::new(),
             moe: RefCell::new(None),
             expert_tables: RefCell::new(HashMap::new()),
+            fp8: RefCell::new(HashMap::new()),
             delta: RefCell::new(None),
             recurrent: RefCell::new(recurrent),
             ssm: spec.ssm,
@@ -481,8 +487,7 @@ impl Executor for CudaExec {
             }
             Op::RmsNorm { out, x, w, .. } => self.op_rmsnorm(*out, *x, *w, step),
             Op::MatMul { out, w, x, .. } => {
-                let w = self.quant(*w)?;
-                self.matmul(self.buf(*out), w, self.buf(*x), step.rows())
+                self.matmul(self.buf(*out), *w, self.buf(*x), step.rows())
             }
             Op::FusedNormMatMul {
                 out,
@@ -1361,7 +1366,13 @@ impl CudaExec {
     /// separate sequences, because that tile is built for hundreds of rows and
     /// four cannot fill its waves. The batch form knows widths 2/4/8/16 and
     /// refuses outside them, so three lanes fall back to the tile.
-    fn matmul(&self, out: &DevBuffer, w: &Quantized, x: &DevBuffer, rows: u32) -> Result<()> {
+    fn matmul(&self, out: &DevBuffer, id: WeightId, x: &DevBuffer, rows: u32) -> Result<()> {
+        let w = self.quant(id)?;
+        // A prompt-width step multiplies through the e4m3 form when this weight
+        // has one; see `fp8.rs` for why the second form exists at all.
+        if self.fp8_matmul(id, w, out, x, rows)? {
+            return Ok(());
+        }
         let (r, c) = (w.rows, w.cols);
         let q6 = w.quant != QuantKind::Q4K;
         // Aktywacja idzie do int8 w blokach po 32, a kernel adresuje te bloki

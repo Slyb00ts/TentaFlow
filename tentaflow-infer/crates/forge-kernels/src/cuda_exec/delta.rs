@@ -12,7 +12,7 @@
 
 use super::{CudaExec, Quantized};
 
-use forge_graph::{Act, DeltaWeights, SsmShape, Step};
+use forge_graph::{Act, DeltaWeights, SsmShape, Step, WeightId};
 use forge_hal::{DevBuffer, Pool};
 use forge_types::{ForgeError, MemKind, Result};
 
@@ -97,9 +97,19 @@ impl CudaExec {
     /// not activations the vocabulary names — they are this operation's
     /// insides. Same kernels and the same format table, though; a recurrent
     /// layer's projections are quantized like every other.
-    fn project(&self, w: &Quantized, y: &DevBuffer, x: &DevBuffer, rows: usize) -> Result<()> {
+    fn project(
+        &self,
+        id: WeightId,
+        w: &Quantized,
+        y: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+    ) -> Result<()> {
         if rows == 1 {
             return self.gemv_by_kind(w.quant, y, &w.blocks, x, w.rows, w.cols, w.output_scale);
+        }
+        if self.fp8_matmul(id, w, y, x, rows as u32)? {
+            return Ok(());
         }
         self.gemm_by_kind(
             w.quant,
@@ -172,10 +182,10 @@ impl CudaExec {
         // through them in ONE pass over the weights. Only the fold below has to
         // be walked token by token.
         let src = self.buf(x);
-        self.project(qkv, &s.mixed, src, rows)?;
-        self.project(gate, &s.z, src, rows)?;
-        self.project(alpha_w, &s.alpha, src, rows)?;
-        self.project(beta_w, &s.beta_raw, src, rows)?;
+        self.project(w.qkv, qkv, &s.mixed, src, rows)?;
+        self.project(w.gate, gate, &s.z, src, rows)?;
+        self.project(w.alpha, alpha_w, &s.alpha, src, rows)?;
+        self.project(w.beta, beta_w, &s.beta_raw, src, rows)?;
 
         let mut state = self.recurrent.borrow_mut();
         let held = state.ensure(&*self.device, layer)?;
@@ -291,7 +301,7 @@ impl CudaExec {
         // is sequential because it carries state; this is not, and leaving it
         // inside the loop made a prompt read the same nine megabytes once per
         // token — per layer.
-        self.project(out_w, self.buf(out), &s.normed, rows)?;
+        self.project(w.out, out_w, self.buf(out), &s.normed, rows)?;
         Ok(())
     }
 }

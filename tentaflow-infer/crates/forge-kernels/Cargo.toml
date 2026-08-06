@@ -33,3 +33,7 @@ thiserror.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Wyłącznie dla `examples/prefill_bench.rs`: mierzone są kernele tego crate'u, a
+# `forge-model` dostarcza opis modelu, który je uruchamia. Zależność dev, więc
+# nie wchodzi do grafu budowania biblioteki i nie odwraca warstw.
+forge-model.workspace = true
