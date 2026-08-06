@@ -724,3 +724,35 @@ pomnożone przez dwa to dokładnie `{0,±1,±2,±3,±4,±6,±8,±12}`, czyli tab
 MXFP4 GGML-a, więc int8 jest tu DOKŁADNY, nie przybliżony. Przeliczenie półbajtu
 na int8 kosztuje `prmt` plus maska znaku; czy to wystarczy, żeby dogonić Q4_K,
 jest pytaniem otwartym i pomiar go rozstrzygnie.
+
+### SIEDEMNAŚCIE BAJTÓW: blok MXFP4 rozbijał scalanie dostępów
+
+Po trzech obalonych hipotezach rozstrzygnęły to dwie sondy czytające DOKŁADNIE
+TE SAME BAJTY w tej samej siatce, różniące się wyłącznie wyrównaniem odczytu:
+
+| wzorzec dostępu | us | GB/s |
+|---|---|---|
+| krok 17 bajtów (bloki MXFP4, `17b+1`) | 98,0 | 45,5 |
+| krok 16 bajtów, wyrównany | 9,2 | **482,7** |
+
+DZIESIĘĆ RAZY, na samym wyrównaniu. Druga sonda — czytająca bajty i nierobiąca
+z nimi nic — zajmowała 98,0 us wobec 101,4 us pełnego kernela, więc
+dekwantyzacja kosztowała TRZY PROCENT, a nie połowę, jak sugerowały dwie
+pierwsze hipotezy. Blok MXFP4 ma siedemnaście bajtów, czyli linia `l` dostaje
+adres `17l+1` — i scalacz dostępów nie ma z czego złożyć transakcji.
+
+Waga wchodzi więc do pamięci współdzielonej KAWAŁKAMI WYRÓWNANYMI DO SZESNASTU
+BAJTÓW (od wyrównanego dołu okna, stąd jeden kawałek zapasu), a dopiero stamtąd
+jest dekodowana. Blok zaczyna się pod dowolnym bajtem kafla, więc szesnaście
+bajtów ładunku składa się z PIĘCIU WYROWNANYCH SŁÓW przesunięciem lejkowym —
+odczyt niewyrównany wprost z pamięci współdzielonej schodził do przestrzeni
+generycznej (`ld.v4.b32` bez kwalifikatora), co jest i wolne, i dla adresu
+niewyrównanego niezdefiniowane.
+
+gate/up 43,8 -> 137,8 GB/s, down 38,7 -> 75,4 GB/s, generacja hybrydy
+33,2 -> 44,3 tok/s. Wzorzec f32 zgadza się co do cyfry (0,954% / 1,141% /
+0,350%), więc składanie słów jest dokładne.
+
+`down` zostaje przy połowie tempa `gate/up`, bo jego wiersz ma szesnaście bloków
+na trzydzieści dwie linie — połowa fali nie ma czego liczyć. To jest następna
+rzecz do zrobienia, a nie własność formatu.

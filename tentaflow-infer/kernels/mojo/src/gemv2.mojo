@@ -1525,6 +1525,18 @@ def _e8m0_pow2(e: UInt8) -> Float32:
     return UnsafePointer(to=bits).bitcast[Float32]()[0]
 
 
+comptime MXFP4_PASS_BLOCKS = 32
+"""Blokow MXFP4 na jedno przejscie: po jednym na linie fali."""
+
+comptime MXFP4_PASS_BYTES = MXFP4_PASS_BLOCKS * 17
+
+comptime MXFP4_PASS_CHUNKS = MXFP4_PASS_BYTES // 16 + 1
+"""Szesnastobajtowych kawalkow na przejscie; jeden zapasowy, bo okno wiersza
+zaczyna sie w dowolnym miejscu, a czytamy od WYROWNANEGO dolu."""
+
+comptime MXFP4_STAGE_ROW = MXFP4_PASS_CHUNKS * 16
+
+
 def gemv_mxfp4_f16_gidx(
     y: UnsafePointer[Float16, MutAnyOrigin],
     wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
@@ -1534,21 +1546,109 @@ def gemv_mxfp4_f16_gidx(
     ids: UnsafePointer[Int32, MutAnyOrigin],
     sel: Int,
 ):
-    """Routed-MoE MXFP4 expert GEMV: identical math to gemv_mxfp4_f16_v2 but the
-    expert is chosen ON DEVICE from `ids[sel]` (no host readback).
+    """Routed-MoE MXFP4 expert GEMV: ekspert wybierany NA URZADZENIU z `ids[sel]`.
 
-    `wtab[e]` is expert `e`'s own weight base pointer, so experts need not be
-    contiguous and each may sit in VRAM or pinned host memory independently.
-    Bit-identical to gemv_mxfp4_f16_v2 launched against that expert's block."""
-    lane = Int(thread_idx.x) % WARP
-    wid = Int(thread_idx.x) // WARP
-    lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
-    if lrow >= n_rows:
-        return
+    Wage czyta sie do pamieci wspoldzielonej KAWALKAMI WYROWNANYMI DO SZESNASTU
+    BAJTOW, a dopiero stamtad dekoduje. Powod jest zmierzony i jest jedynym
+    powodem: blok MXFP4 ma SIEDEMNASCIE bajtow, wiec czytany wprost daje linii
+    adres `17b+1`, ktorego scalacz dostepow nie sklada. Ta sama liczba tych
+    samych bajtow, ta sama siatka, roznica wylacznie w wyrownaniu — 45,5 wobec
+    482,7 GB/s (`examples/moe_gemv_bench`). Dekodowanie kosztuje przy tym tyle,
+    co nic: sonda czytajaca bajty i nic z nimi nierobiaca miala 98,0 us wobec
+    101,4 us pelnego kernela.
+
+    `wtab[e]` jest wlasnym wskaznikiem wagi eksperta `e`, wiec eksperci nie musza
+    lezec ciagiem i kazdy moze siedziec w VRAM albo w pamieci hosta niezaleznie.
+    """
+    # Cztery bajty zapasu: ostatni blok kafla czyta piec slow, czyli o trzy
+    # bajty dalej niz siega jego siedemnascie.
+    sw = stack_allocation[
+        ROWS_PER_BLOCK * MXFP4_STAGE_ROW + 16,
+        UInt8,
+        alignment=16,
+        address_space = AddressSpace.SHARED,
+    ]()
+    swu = sw.bitcast[UInt32]()
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+    lane = tid % WARP
+    wid = tid // WARP
     w = wtab[Int(ids[sel])]
-    total = warp.sum(_mxfp4_row_acc_fast(w, x, n_cols, lrow, lane))
-    if lane == 0:
-        y[lrow] = Float16(total)
+    blocks_per_row = n_cols // 32
+    stride = blocks_per_row * 17
+    row0 = Int(block_idx.x) * ROWS_PER_BLOCK
+    # Ostatni legalny wyrownany kawalek stosu tego eksperta: okno ostatniego
+    # przejscia siega do szesnastu bajtow za wiersz, a czytanie za koniec
+    # alokacji jest bledem, nie niedokladnoscia.
+    last_chunk = (n_rows * stride // 16) * 16 - 16
+
+    var lrow = row0 + wid
+    if lrow > n_rows - 1:
+        lrow = n_rows - 1
+    var acc: Float32 = 0.0
+
+    var first = 0
+    while first < blocks_per_row:
+        var i = tid
+        while i < ROWS_PER_BLOCK * MXFP4_PASS_CHUNKS:
+            r = i // MXFP4_PASS_CHUNKS
+            c = i % MXFP4_PASS_CHUNKS
+            var src_row = row0 + r
+            if src_row > n_rows - 1:
+                src_row = n_rows - 1
+            win = src_row * stride + first * 17
+            var at = (win // 16) * 16 + c * 16
+            if at > last_chunk:
+                at = last_chunk
+            (sw + r * MXFP4_STAGE_ROW + c * 16).store[alignment=16](
+                (w + at).load[width=16, alignment=16]()
+            )
+            i += nthreads
+        barrier()
+
+        b = first + lane
+        if b < blocks_per_row:
+            win = lrow * stride + first * 17
+            skew = win - (win // 16) * 16
+            base = wid * MXFP4_STAGE_ROW + skew + lane * 17
+            # Blok zaczyna sie pod dowolnym bajtem kafla, wiec szesnaste bajty
+            # ladunku sklada sie z PIECIU WYROWNANYCH SLOW. Odczyt niewyrownany
+            # wprost schodzil do przestrzeni generycznej (`ld.v4.b32` bez
+            # kwalifikatora), co jest i wolne, i dla adresu niewyrownanego
+            # niezdefiniowane.
+            q = base + 1
+            words = swu + (q >> 2)
+            sh = UInt64((q & 3) << 3)
+            var v = SIMD[DType.uint32, 4](0)
+            comptime for j in range(4):
+                pair = UInt64(words[j]) | (UInt64(words[j + 1]) << 32)
+                v[j] = UInt32((pair >> sh) & 0xFFFFFFFF)
+            codes = bitcast[DType.uint8, 16](v)
+            col = b * 32
+            x0 = (x + col).load[width=8, alignment=16]()
+            x1 = (x + col + 8).load[width=8, alignment=16]()
+            x2 = (x + col + 16).load[width=8, alignment=16]()
+            x3 = (x + col + 24).load[width=8, alignment=16]()
+            lo = codes.slice[8]()
+            hi = codes.slice[8, offset=8]()
+            acc += _e8m0_pow2(sw[base]) * (
+                (_e2m1x8_f16(lo & 0x0F) * x0).cast[DType.float32]().reduce_add()
+                + (_e2m1x8_f16(hi & 0x0F) * x1)
+                .cast[DType.float32]()
+                .reduce_add()
+                + (_e2m1x8_f16(lo >> 4) * x2)
+                .cast[DType.float32]()
+                .reduce_add()
+                + (_e2m1x8_f16(hi >> 4) * x3)
+                .cast[DType.float32]()
+                .reduce_add()
+            )
+        barrier()
+        first += MXFP4_PASS_BLOCKS
+
+    total = warp.sum(acc)
+    if lane == 0 and row0 + wid < n_rows:
+        y[row0 + wid] = Float16(total)
 
 
 def gemv_mxfp4_out_f32_v2(
