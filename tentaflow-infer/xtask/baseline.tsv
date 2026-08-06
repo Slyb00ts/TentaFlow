@@ -75,6 +75,7 @@ hal_boundary	crates/forge-model/tests/cuda_vs_reference.rs	1
 hal_boundary	crates/forge-model/tests/decode_vs_mlx.rs	1
 hal_boundary	crates/forge-model/tests/generate_vs_mlx.rs	1
 hal_boundary	crates/forge-model/tests/gguf_loads.rs	1
+hal_boundary	crates/forge-model/tests/qwen3_moe.rs	1
 hal_boundary	crates/forge-onnx/src/gpu.rs	2
 hal_boundary	crates/forge-onnx/src/lib.rs	1
 hal_boundary	crates/forge-onnx/tests/silero_vad.rs	2

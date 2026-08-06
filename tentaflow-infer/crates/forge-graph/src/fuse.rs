@@ -62,9 +62,9 @@ fn count_consumers(ops: &[Op], act: Act) -> usize {
             Op::RmsNorm { x, .. } if *x == act => 1,
             Op::Residual { src, .. } if *src == act => 1,
             Op::LogitsOfLast { x, .. } if *x == act => 1,
-            // Czyta swój slot i pisze do niego z powrotem, więc jest jego
-            // czytelnikiem. Pominięcie go tutaj pozwoliłoby scalić parę, między
-            // którą ktoś jeszcze zagląda do tego slotu.
+            // It reads its slot and writes back into it, so it is a reader of
+            // that slot. Leaving it out here would allow fusing a pair that
+            // something else still looks into.
             Op::HeadNorm { act: a, .. } if *a == act => 1,
             _ => 0,
         })

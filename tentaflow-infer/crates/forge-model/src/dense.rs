@@ -63,9 +63,33 @@ struct LayerIds {
     v: WeightId,
     o: WeightId,
     ffn_norm: WeightId,
-    gate: WeightId,
-    up: WeightId,
-    down: WeightId,
+    ffn: Ffn,
+}
+
+/// The two shapes a feed-forward block comes in.
+///
+/// An enum rather than optional fields, because the two are alternatives and
+/// never a mixture: a layer has one FFN or the other, and optional fields would
+/// let a checkpoint describe a layer with both, or with neither.
+///
+/// It is per LAYER and not per model on purpose. Qwen3.6 interleaves attention
+/// with DeltaNet and would interleave these too, so the choice belongs where
+/// the layer is.
+enum Ffn {
+    Dense {
+        gate: WeightId,
+        up: WeightId,
+        down: WeightId,
+    },
+    Moe {
+        router: WeightId,
+        gate: WeightId,
+        up: WeightId,
+        down: WeightId,
+        experts: u32,
+        top_k: u32,
+        norm_topk: bool,
+    },
 }
 
 impl<E: Executor + WeightStore> Dense<E> {
@@ -115,6 +139,28 @@ impl<E: Executor + WeightStore> Dense<E> {
         }
 
         check_roles(&desc.globals, &desc.layers)?;
+
+        // Mixture parameters, refused rather than approximated where this model
+        // has no answer yet. A shared always-on expert is a second FFN added to
+        // every token; running the checkpoint without it would be a different
+        // model that still speaks.
+        let moe = desc.params.moe.as_ref();
+        if let Some(m) = moe {
+            if m.shared_intermediate_size != 0 {
+                return Err(ForgeError::Unsupported(format!(
+                    "ekspert współdzielony o szerokości {} — ta ścieżka liczy tylko routowanych",
+                    m.shared_intermediate_size
+                )));
+            }
+            // The executor sizes its expert scratch from `inter`, so a stack
+            // built for another width would be read with the wrong stride.
+            if m.moe_intermediate_size != shape.inter as usize {
+                return Err(ForgeError::Unsupported(format!(
+                    "ekspert ma szerokość {}, a kształt mówi {}",
+                    m.moe_intermediate_size, shape.inter
+                )));
+            }
+        }
 
         // DWA RÓŻNE typy, dotąd mylone w jeden, bo w MLX oba są bf16. Typ
         // parametrów kwantyzacji jest własnością źródła, więc wystarczy zapytać
@@ -171,9 +217,61 @@ impl<E: Executor + WeightStore> Dense<E> {
                 v: quant(&mut exec, src, name(WeightRole::AttnV), kvw, h, None)?,
                 o: quant(&mut exec, src, name(WeightRole::AttnO), h, qw, None)?,
                 ffn_norm: plain(&mut exec, src, name(WeightRole::FfnNorm))?,
-                gate: quant(&mut exec, src, name(WeightRole::FfnGate), inter, h, None)?,
-                up: quant(&mut exec, src, name(WeightRole::FfnUp), inter, h, None)?,
-                down: quant(&mut exec, src, name(WeightRole::FfnDown), h, inter, None)?,
+                ffn: if l.contains_key(&WeightRole::FfnGateInp) {
+                    let m = moe.ok_or_else(|| {
+                        ForgeError::Unsupported(
+                            "warstwa niesie router, a checkpoint nie podał parametrów mieszanki"
+                                .into(),
+                        )
+                    })?;
+                    let n = m.n_experts as u32;
+                    Ffn::Moe {
+                        router: quant(
+                            &mut exec,
+                            src,
+                            name(WeightRole::FfnGateInp),
+                            n,
+                            h,
+                            None,
+                        )?,
+                        // The stacks arrive three-dimensional and are addressed
+                        // as one flat row range per expert, which is how the
+                        // kernels index them.
+                        gate: quant(
+                            &mut exec,
+                            src,
+                            name(WeightRole::FfnGateExps),
+                            n * inter,
+                            h,
+                            None,
+                        )?,
+                        up: quant(
+                            &mut exec,
+                            src,
+                            name(WeightRole::FfnUpExps),
+                            n * inter,
+                            h,
+                            None,
+                        )?,
+                        down: quant(
+                            &mut exec,
+                            src,
+                            name(WeightRole::FfnDownExps),
+                            n * h,
+                            inter,
+                            None,
+                        )?,
+                        experts: n,
+                        top_k: m.n_experts_used as u32,
+                        norm_topk: m.norm_topk_prob,
+                    }
+                } else {
+                    Ffn::Dense {
+                        gate: quant(&mut exec, src, name(WeightRole::FfnGate), inter, h, None)?,
+                        up: quant(&mut exec, src, name(WeightRole::FfnUp), inter, h, None)?,
+                        down: quant(&mut exec, src, name(WeightRole::FfnDown), h, inter, None)?,
+                    }
+                },
             });
         }
 
@@ -477,15 +575,42 @@ impl<E: Executor + WeightStore> Dense<E> {
                 w: l.ffn_norm,
                 step: step.clone(),
             },
-            at(l.gate, Act::Gate, Act::Norm),
-            at(l.up, Act::Up, Act::Norm),
-            Op::SiluMul { step: step.clone() },
-            at(l.down, Act::Proj, Act::Activated),
-            Op::Residual {
-                src: Act::Proj,
-                step: step.clone(),
-            },
         ]);
+        // Both forms end the same way — a projection into `Proj` and one
+        // residual add — so the mixture is a drop-in for the four operations a
+        // dense block spends there.
+        match l.ffn {
+            Ffn::Dense { gate, up, down } => ops.extend([
+                at(gate, Act::Gate, Act::Norm),
+                at(up, Act::Up, Act::Norm),
+                Op::SiluMul { step: step.clone() },
+                at(down, Act::Proj, Act::Activated),
+            ]),
+            Ffn::Moe {
+                router,
+                gate,
+                up,
+                down,
+                experts,
+                top_k,
+                norm_topk,
+            } => ops.push(Op::MoeFfn {
+                out: Act::Proj,
+                x: Act::Norm,
+                router,
+                gate,
+                up,
+                down,
+                experts,
+                top_k,
+                norm_topk,
+                step: step.clone(),
+            }),
+        }
+        ops.push(Op::Residual {
+            src: Act::Proj,
+            step: step.clone(),
+        });
         ops
     }
 }
@@ -595,7 +720,18 @@ fn fetch_quant(
         }
         None => {
             let (mut data, dtype, quant, dims) = src.fetch(name)?;
-            if dims != vec![rows as usize, cols as usize] {
+            // A stack of experts arrives with a dimension per expert, and the
+            // leading dimensions FOLD into the row count rather than needing a
+            // reshape: the source is row-major, so an expert's rows are already
+            // contiguous and `[experts, inter, hidden]` and
+            // `[experts * inter, hidden]` are the same bytes in the same order.
+            //
+            // The row WIDTH is the part that may not fold, so it is checked on
+            // its own: a tensor whose last dimension is not `cols` would be
+            // read with the wrong stride at every row.
+            let folds = dims.last() == Some(&(cols as usize))
+                && dims.iter().take(dims.len() - 1).product::<usize>() == rows as usize;
+            if !folds {
                 return Err(ForgeError::Format(format!(
                     "{name}: kształt {dims:?}, oczekiwano [{rows}, {cols}]"
                 )));
@@ -647,13 +783,21 @@ fn check_roles(
     layers: &[HashMap<WeightRole, String>],
 ) -> Result<()> {
     for (index, layer) in layers.iter().enumerate() {
-        let missing: Vec<_> = required_roles()
-            .iter()
+        // A layer's feed-forward block is one shape or the other, and which one
+        // is answered by the router: only a mixture has one. Asking that first
+        // means a dense checkpoint is never told it is missing expert stacks.
+        let ffn = if layer.contains_key(&WeightRole::FfnGateInp) {
+            MOE_FFN_ROLES
+        } else {
+            DENSE_FFN_ROLES
+        };
+        let wanted = || required_roles().iter().chain(ffn);
+        let missing: Vec<_> = wanted()
             .filter(|role| !globals.contains_key(*role) && !layer.contains_key(*role))
             .collect();
         let ignored: Vec<_> = layer
             .keys()
-            .filter(|role| !required_roles().contains(role) && !optional_roles().contains(role))
+            .filter(|role| !wanted().any(|w| w == *role) && !optional_roles().contains(role))
             .collect();
         if missing.is_empty() && ignored.is_empty() {
             continue;
@@ -672,6 +816,22 @@ fn check_roles(
     }
     Ok(())
 }
+
+/// The feed-forward roles of a dense block.
+const DENSE_FFN_ROLES: &[WeightRole] = &[
+    WeightRole::FfnGate,
+    WeightRole::FfnUp,
+    WeightRole::FfnDown,
+];
+
+/// The feed-forward roles of a mixture block. The router is what tells the two
+/// apart, so it is the role looked at first.
+const MOE_FFN_ROLES: &[WeightRole] = &[
+    WeightRole::FfnGateInp,
+    WeightRole::FfnGateExps,
+    WeightRole::FfnUpExps,
+    WeightRole::FfnDownExps,
+];
 
 /// Weights this model computes with WHEN a checkpoint carries them.
 ///
@@ -697,9 +857,6 @@ pub fn required_roles() -> &'static [WeightRole] {
         WeightRole::AttnV,
         WeightRole::AttnO,
         WeightRole::FfnNorm,
-        WeightRole::FfnGate,
-        WeightRole::FfnUp,
-        WeightRole::FfnDown,
     ]
 }
 
@@ -738,11 +895,12 @@ mod tests {
     }
 
     /// A checkpoint this model cannot compute must be REFUSED, in both of the
-    /// two ways it can be uncomputable.
+    /// two ways it can be uncomputable, and for both shapes of feed-forward
+    /// block.
     ///
-    /// The second half is the one worth the test: a role the loop never reads
-    /// costs nothing at load and produces a model that runs. Qwen3 needs its
-    /// per-head Q/K norm, and without this check it would simply be skipped.
+    /// The silent direction is the one worth the test: a role the loop never
+    /// reads costs nothing at load and produces a model that runs. Qwen3 needs
+    /// its per-head Q/K norm, and without this check it would be skipped.
     #[test]
     fn a_checkpoint_this_model_cannot_compute_is_refused() {
         let layer = |roles: &[WeightRole]| -> HashMap<WeightRole, String> {
@@ -751,7 +909,7 @@ mod tests {
                 .map(|r| (*r, format!("{r:?}")))
                 .collect::<HashMap<_, _>>()
         };
-        let dense: Vec<WeightRole> = required_roles()
+        let attn: Vec<WeightRole> = required_roles()
             .iter()
             .copied()
             .filter(|r| {
@@ -761,6 +919,9 @@ mod tests {
                 )
             })
             .collect();
+        let with = |extra: &[WeightRole]| -> Vec<WeightRole> {
+            attn.iter().copied().chain(extra.iter().copied()).collect()
+        };
         let globals = layer(&[
             WeightRole::TokenEmbd,
             WeightRole::OutputNorm,
@@ -768,26 +929,43 @@ mod tests {
         ]);
         let check = |roles: &[WeightRole]| check_roles(&globals, &[layer(roles)]);
 
-        check(&dense).expect("komplet ról ma przejść");
+        // Both shapes of block are computable, and neither is told it is
+        // missing the other one's weights.
+        check(&with(DENSE_FFN_ROLES)).expect("dense FFN");
+        check(&with(MOE_FFN_ROLES)).expect("mixture FFN");
 
-        let mut short = dense.clone();
+        let mut short = with(DENSE_FFN_ROLES);
         short.retain(|r| *r != WeightRole::FfnGate);
         let err = check(&short).expect_err("brak roli przeszedł");
         assert!(format!("{err}").contains("FfnGate"), "{err}");
 
-        // Normy głowic są opcjonalne i CZYTANE, więc checkpoint, który je
-        // niesie, przechodzi — to jest cała treść tego kroku.
-        let mut with_norms = dense.clone();
-        with_norms.extend([WeightRole::AttnQNorm, WeightRole::AttnKNorm]);
-        check(&with_norms).expect("normy głowic mają być liczone, nie odrzucane");
+        // A mixture missing one stack must not fall back to being read as a
+        // dense block — the router is what decides which shape it is.
+        let mut lame = with(MOE_FFN_ROLES);
+        lame.retain(|r| *r != WeightRole::FfnUpExps);
+        let err = check(&lame).expect_err("niepełna mieszanka przeszła");
+        assert!(format!("{err}").contains("FfnUpExps"), "{err}");
 
-        // A rola, której ten model naprawdę nie liczy, nadal ma się odbić.
-        // Router MoE jest tu właściwym przykładem: warstwa, która go niesie, ma
-        // inne FFN, więc policzenie jej gęstym FFN dałoby inny model.
-        let mut extra = dense.clone();
-        extra.push(WeightRole::FfnGateInp);
-        let err = check(&extra).expect_err("cicho pominięta rola");
-        assert!(format!("{err}").contains("FfnGateInp"), "{err}");
+        // The head norms are optional and READ, so a checkpoint carrying them
+        // passes. That is the whole content of milestone 4a-1.
+        check(&with(&[
+            WeightRole::FfnGate,
+            WeightRole::FfnUp,
+            WeightRole::FfnDown,
+            WeightRole::AttnQNorm,
+            WeightRole::AttnKNorm,
+        ]))
+        .expect("normy głowic mają być liczone, nie odrzucane");
+
+        // A role this model genuinely does not compute still has to bounce.
+        let err = check(&with(&[
+            WeightRole::FfnGate,
+            WeightRole::FfnUp,
+            WeightRole::FfnDown,
+            WeightRole::SsmInProj,
+        ]))
+        .expect_err("cicho pominięta rola");
+        assert!(format!("{err}").contains("SsmInProj"), "{err}");
     }
 
     #[test]
@@ -797,12 +975,15 @@ mod tests {
             WeightRole::AttnK,
             WeightRole::AttnV,
             WeightRole::AttnO,
-            WeightRole::FfnGate,
-            WeightRole::FfnUp,
-            WeightRole::FfnDown,
             WeightRole::LmHead,
         ] {
             assert!(required_roles().contains(&role), "{role:?}");
+        }
+        for role in DENSE_FFN_ROLES.iter().chain(MOE_FFN_ROLES) {
+            assert!(
+                !required_roles().contains(role),
+                "{role:?} należy do jednego kształtu FFN, nie do wspólnych"
+            );
         }
     }
 }

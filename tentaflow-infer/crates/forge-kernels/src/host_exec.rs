@@ -440,9 +440,9 @@ impl Executor for HostExec {
                 Ok(())
             }
 
-            // Ta sama formuła co wyżej, tylko wierszem jest GŁOWICA. Liczone w
-            // miejscu, więc slot nie zmienia rozmiaru — a gdyby zmienił, wynik
-            // uwagi czytałby wiersze z innego podziału.
+            // The same formula as above, except a row is a HEAD. Computed in
+            // place, so the slot does not change size — and were it to, the
+            // attention would read rows from a different split.
             Op::HeadNorm { act, w, heads, step } => {
                 let weight = self.plain(*w)?.to_vec();
                 let n = s.head_dim as usize;
@@ -652,6 +652,96 @@ impl Executor for HostExec {
                 for i in 0..n {
                     let g = gate[i];
                     dst[i] = g / (1.0 + (-g).exp()) * up[i];
+                }
+                Ok(())
+            }
+
+            // The oracle for the mixture: everything in f32 and everything
+            // spelled out. The router multiplies, a softmax weights, the top
+            // few are selected, and each chosen expert computes SwiGLU over ITS
+            // OWN window of the stack. No residency and no device-side
+            // indexing — those belong to an executor, while the reference only
+            // has to answer which result is the right one.
+            Op::MoeFfn {
+                out,
+                x,
+                router,
+                gate,
+                up,
+                down,
+                experts,
+                top_k,
+                norm_topk,
+                step,
+            } => {
+                let hidden = s.hidden as usize;
+                let inter = s.inter as usize;
+                let (experts, top_k) = (*experts as usize, *top_k as usize);
+                let src = self.with(*x, <[f32]>::to_vec);
+                let rows = step.rows() as usize;
+                let (router, gate_w, up_w, down_w) = (
+                    self.quant(*router)?,
+                    self.quant(*gate)?,
+                    self.quant(*up)?,
+                    self.quant(*down)?,
+                );
+                self.resize(*out, rows * hidden);
+
+                let mut logits = vec![0.0f32; experts];
+                let mut row = vec![0.0f32; hidden.max(inter)];
+                let mut acc = vec![0.0f32; hidden];
+                let mut activated = vec![0.0f32; inter];
+                for t in 0..rows {
+                    let xt = &src[t * hidden..(t + 1) * hidden];
+                    for (e, logit) in logits.iter_mut().enumerate() {
+                        router.row_into(e, &mut row[..hidden])?;
+                        *logit = row[..hidden].iter().zip(xt).map(|(w, v)| w * v).sum();
+                    }
+                    // Softmax over ALL experts and only then the selection.
+                    // The other order yields different weights for the same
+                    // choice.
+                    let peak = logits.iter().copied().fold(f32::MIN, f32::max);
+                    let mut probs: Vec<f32> = logits.iter().map(|l| (l - peak).exp()).collect();
+                    let total: f32 = probs.iter().sum();
+                    for p in probs.iter_mut() {
+                        *p /= total;
+                    }
+                    let mut order: Vec<usize> = (0..experts).collect();
+                    order.sort_by(|a, b| {
+                        probs[*b]
+                            .partial_cmp(&probs[*a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.cmp(b))
+                    });
+                    let chosen = &order[..top_k];
+                    let scale = if *norm_topk {
+                        let sum: f32 = chosen.iter().map(|e| probs[*e]).sum();
+                        1.0 / sum
+                    } else {
+                        1.0
+                    };
+
+                    acc.fill(0.0);
+                    for &e in chosen {
+                        let base = e * inter;
+                        for i in 0..inter {
+                            gate_w.row_into(base + i, &mut row[..hidden])?;
+                            let g: f32 = row[..hidden].iter().zip(xt).map(|(w, v)| w * v).sum();
+                            up_w.row_into(base + i, &mut row[..hidden])?;
+                            let u: f32 = row[..hidden].iter().zip(xt).map(|(w, v)| w * v).sum();
+                            activated[i] = g / (1.0 + (-g).exp()) * u;
+                        }
+                        let weight = probs[e] * scale;
+                        let base = e * hidden;
+                        for (h, a) in acc.iter_mut().enumerate() {
+                            down_w.row_into(base + h, &mut row[..inter])?;
+                            let v: f32 =
+                                row[..inter].iter().zip(&activated).map(|(w, z)| w * z).sum();
+                            *a += weight * v;
+                        }
+                    }
+                    let mut acts = self.acts.borrow_mut();
+                    acts.by[slot(*out)][t * hidden..(t + 1) * hidden].copy_from_slice(&acc);
                 }
                 Ok(())
             }

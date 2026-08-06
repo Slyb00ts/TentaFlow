@@ -343,6 +343,7 @@ impl Executor for MetalExec {
             | Op::KvAppend { step, .. }
             | Op::Attention { step, .. }
             | Op::SiluMul { step }
+            | Op::MoeFfn { step, .. }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
             | Op::Residual { step, .. }
@@ -401,6 +402,14 @@ impl Executor for MetalExec {
             Op::HeadNorm { act, w, heads, .. } => {
                 self.op_head_norm(*act, *w, *heads, tokens)
             }
+            // Refused in one place rather than stubbed. The MSL catalogue has
+            // no kernel that reads its expert id on device, and writing one
+            // needs the machine with the Mac; a fallback that ran the experts
+            // some other way would be a second implementation of the routing,
+            // which is what this whole layout exists to avoid.
+            Op::MoeFfn { .. } => Err(ForgeError::Unsupported(
+                "MoeFfn: ścieżka Metalowa nie ma kerneli mieszanki ekspertów".into(),
+            )),
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, pos, tokens),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, pos, tokens),
             Op::Attention { layer, .. } => self.op_attention(*layer, pos + tokens, tokens),

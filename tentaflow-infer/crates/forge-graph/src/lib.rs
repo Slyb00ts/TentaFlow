@@ -162,18 +162,18 @@ pub enum Op {
         x: Act,
         step: Step,
     },
-    /// Normalizacja RMS OSOBNO DLA KAŻDEJ GŁOWICY, z uczoną wagą szerokości
-    /// `head_dim`, w miejscu.
+    /// RMS normalization SEPARATELY FOR EACH HEAD, with a learned weight of
+    /// width `head_dim`, in place.
     ///
-    /// Osobna operacja, a nie szerokość dołożona do `RmsNorm`, i to jest
-    /// decyzja, nie wygoda. `RmsNorm` normalizuje strumień rezydualny i jego
-    /// szerokość wynika z kształtu, więc model nie ma jej jak podać źle.
-    /// Gdyby przyjmowała dowolną szerokość, dałoby się nią opisać podział na
-    /// wiersze, którego żaden kernel nie liczy — a to jest ta klasa błędu,
-    /// której całe to słownictwo ma nie dopuszczać.
+    /// A separate operation rather than a width added to `RmsNorm`, and that is
+    /// a decision rather than a convenience. `RmsNorm` normalizes the residual
+    /// stream and takes its width from the shape, so the model cannot state it
+    /// wrongly. Were it to accept an arbitrary width, the model could describe
+    /// a row split no kernel computes — which is the class of mistake this
+    /// vocabulary exists to keep unrepresentable.
     ///
-    /// `heads` jest podane, bo dla Q i dla K jest RÓŻNE: rodzina Qwen3
-    /// normalizuje 32 głowice zapytań i 4 głowice KV tego samego kroku.
+    /// `heads` is carried because Q and K DIFFER: the Qwen3 family normalizes
+    /// 32 query heads and 4 KV heads within the same step.
     HeadNorm {
         act: Act,
         w: WeightId,
@@ -196,6 +196,39 @@ pub enum Op {
     },
     /// `Activated = silu(Gate) * Up`.
     SiluMul {
+        step: Step,
+    },
+    /// The whole mixture-of-experts feed-forward block as one operation:
+    /// routing, selection, the SwiGLU of the chosen experts, and their weighted
+    /// accumulation.
+    ///
+    /// ONE operation rather than five, and the decision is the same one paging
+    /// settled for `Attention`. Which expert computes is DATA produced on the
+    /// device — a model that named those ids would have to read them back,
+    /// buying back exactly the host round-trip the `_gidx` kernels exist to
+    /// avoid. Expert residency is the same problem as cache pages, memory that
+    /// does not hold everything, so it belongs to whoever holds it.
+    ///
+    /// The cost is that a pass cannot see inside the block. Measured: fusion at
+    /// decode is worth 0.8%, because the whole matrix is read either way.
+    ///
+    /// The expert stacks are FLAT, `[experts * inter, hidden]`. The source
+    /// keeps them three-dimensional, but an expert's rows are contiguous and
+    /// the executor addresses them as a row window regardless.
+    MoeFfn {
+        out: Act,
+        x: Act,
+        /// The gate, `[experts, hidden]`: its output both selects and weights.
+        router: WeightId,
+        gate: WeightId,
+        up: WeightId,
+        down: WeightId,
+        experts: u32,
+        /// How many experts compute one token.
+        top_k: u32,
+        /// Whether the selected weights are renormalized to sum to one. A
+        /// property of the architecture: OLMoE does not, the Qwen family does.
+        norm_topk: bool,
         step: Step,
     },
     /// RMSNorm followed by a projection, fused for decode-capable executors.

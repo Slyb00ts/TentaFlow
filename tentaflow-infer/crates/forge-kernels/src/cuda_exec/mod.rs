@@ -20,6 +20,7 @@
 //     nothing from the vocabulary, and it needs only one implementation.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use half::f16;
@@ -33,6 +34,9 @@ use forge_state::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
 use crate::launchers::{Kernels, SAMPLE_SCRATCH_PAIRS};
+
+mod formats;
+mod moe;
 
 /// Activation rows carried through the layers in one pass — lanes times tokens.
 ///
@@ -114,6 +118,25 @@ struct Scratch {
     sample_idx: DevBuffer,
 }
 
+/// Buffers only a mixture-of-experts layer needs.
+///
+/// Handles are cheap to clone and the allocations are not, so this is cloned
+/// out of its cell rather than borrowed across the launches that use it.
+#[derive(Clone)]
+struct MoeScratch {
+    /// Chosen expert per token, `[tokens][top_k]`, written by the router.
+    ids: DevBuffer,
+    /// Routing weight of each choice, same shape.
+    weights: DevBuffer,
+    /// How often each expert was picked — the router writes it; nothing here
+    /// reads it yet, and residency is what will.
+    counts: DevBuffer,
+    /// One expert's contribution before it is scaled into the accumulator.
+    tmp: DevBuffer,
+    selections: usize,
+    experts: usize,
+}
+
 /// The dense vocabulary on a CUDA device.
 pub struct CudaExec {
     device: Arc<dyn Device>,
@@ -122,6 +145,11 @@ pub struct CudaExec {
     weights: Vec<Weight>,
     /// Key and value per layer, `[strona][głowica KV][pozycja][wymiar]` f16 —
     /// the layout every paged kernel in the catalogue reads.
+    /// Scratch a mixture-of-experts layer needs, made on first demand so a
+    /// dense model never allocates it.
+    moe: RefCell<Option<MoeScratch>>,
+    /// Per-expert base addresses, one table per stack, built on first use.
+    expert_tables: RefCell<HashMap<u32, DevBuffer>>,
     kv: RefCell<KvCache>,
     /// One slot's page table and length, owned by the shared cache's types.
     seqs: RefCell<Vec<SeqKv>>,
@@ -216,6 +244,8 @@ impl CudaExec {
             kernels,
             stream,
             weights: Vec::new(),
+            moe: RefCell::new(None),
+            expert_tables: RefCell::new(HashMap::new()),
             kv: RefCell::new(kv),
             seqs: RefCell::new(seqs),
             scratch,
@@ -379,6 +409,7 @@ impl Executor for CudaExec {
             | Op::KvAppend { step, .. }
             | Op::Attention { step, .. }
             | Op::SiluMul { step }
+            | Op::MoeFfn { step, .. }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
             | Op::Residual { step, .. }
@@ -453,6 +484,26 @@ impl Executor for CudaExec {
                 &self.scratch.up,
                 step.rows() as usize * self.shape.inter as usize,
                 &self.stream,
+            ),
+            Op::MoeFfn {
+                out,
+                x,
+                router,
+                gate,
+                up,
+                down,
+                experts,
+                top_k,
+                norm_topk,
+                ..
+            } => self.op_moe_ffn(
+                *out,
+                *x,
+                [*router, *gate, *up, *down],
+                *experts,
+                *top_k,
+                *norm_topk,
+                step,
             ),
             Op::Residual { src, .. } => {
                 self.kernels.residual_add_f16(
@@ -750,14 +801,15 @@ impl CudaExec {
         )
     }
 
-    /// Norma RMS liczona GŁOWICAMI JAKO WIERSZAMI, w miejscu.
+
+    /// RMS normalization with HEADS AS ROWS, in place.
     ///
-    /// Ten sam kernel co zwykła norma — różni się wyłącznie tym, na ile wierszy
-    /// dzieli bufor. Wejście i wyjście to jeden bufor, bo każdy blok czyta i
-    /// zapisuje wyłącznie własny wiersz.
+    /// The same kernel as the ordinary norm — the only difference is how many
+    /// rows it splits the buffer into. Input and output are one buffer, since
+    /// every block reads and writes only its own row.
     ///
-    /// Nie mylić z `rmsnorm_head_f16` z katalogu: tamten jest BEZ WAGI i należy
-    /// do drugiej normy Q rodziny DeepSeek V4.
+    /// Not to be confused with the catalogue's `rmsnorm_head_f16`: that one
+    /// carries NO weight and belongs to DeepSeek V4's second Q norm.
     fn op_head_norm(&self, act: Act, w: WeightId, heads: u32, step: &Step) -> Result<()> {
         let buf = self.buf(act);
         self.kernels.rmsnorm_f16(
@@ -993,10 +1045,11 @@ impl CudaExec {
         Ok(())
     }
 
-    /// Wiersze jednego lane'a w buforze aktywacji jako własny uchwyt.
+    /// One lane's rows of an activation buffer, as a handle of their own.
     ///
-    /// Szerokość jest szerokością UWAGI, bo woła się to wyłącznie na `q` i
-    /// `attn`. Dla llamy równa się `hidden` i dlatego pomyłka nie bolała.
+    /// The width is the ATTENTION width, since this is only ever called on `q`
+    /// and `attn`. For llama it equals `hidden`, which is why the confusion did
+    /// not hurt.
     fn lane_rows(&self, buf: &DevBuffer, lane: usize, rows: usize) -> Result<DevBuffer> {
         let width = self.shape.attn_width() as usize * 2;
         self.device
@@ -1318,144 +1371,3 @@ fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
     Ok(buf)
 }
 
-/// Formaty, w których format wybiera WYŁĄCZNIE nazwę kernela.
-///
-/// Ta tabela jest przeniesiona z `forge-engine::model::quant_dispatch`, gdzie
-/// powstała po tym, jak cztery rodziny GEMV rozjechały się na dwudziestu jeden
-/// ramionach i Q4_K trafiło w jednej ścieżce na inny kernel niż w drugiej.
-/// Należy do wykonawcy, bo to on wie, czym mnoży — a dodanie kwantyzacji jest
-/// tu jednym wierszem.
-///
-/// `match` nie ma gałęzi „reszta": kwantyzacja spoza tabeli ma się TU odbić, a
-/// nie policzyć czymkolwiek.
-macro_rules! block_formats {
-    (
-        plain { $($k:ident => $gemv:ident, $gemm:ident, $out_f32:ident;)+ }
-        scaled { $($sk:ident => $sgemv:ident, $sgemm:ident, $sout:ident;)+ }
-    ) => {
-        impl CudaExec {
-            /// Czy ten wykonawca ma kernele dla tej kwantyzacji.
-            fn knows(quant: QuantKind) -> bool {
-                matches!(
-                    quant,
-                    QuantKind::Q4K | QuantKind::Q6K
-                        | $(QuantKind::$k)|+
-                        | $(QuantKind::$sk)|+
-                )
-            }
-
-            /// Czy kernele tego formatu biorą skalar całego tensora.
-            fn scaled(quant: QuantKind) -> bool {
-                matches!(quant, $(QuantKind::$sk)|+)
-            }
-
-            #[allow(clippy::too_many_arguments)]
-            fn gemv_by_kind(
-                &self,
-                quant: QuantKind,
-                y: &DevBuffer,
-                w: &DevBuffer,
-                x: &DevBuffer,
-                rows: usize,
-                cols: usize,
-                scale: f32,
-            ) -> Result<()> {
-                match quant {
-                    QuantKind::Q4K => {
-                        self.kernels.gemv_q4_k_f16(y, w, x, rows, cols, &self.stream)
-                    }
-                    QuantKind::Q6K => {
-                        self.kernels.gemv_q6_k_f16(y, w, x, rows, cols, &self.stream)
-                    }
-                    $(QuantKind::$k => self.kernels.$gemv(y, w, x, rows, cols, &self.stream),)+
-                    $(QuantKind::$sk => {
-                        self.kernels.$sgemv(y, w, x, rows, cols, scale, &self.stream)
-                    })+
-                    other => Err(ForgeError::Unsupported(format!("{other:?}: brak GEMV"))),
-                }
-            }
-
-            #[allow(clippy::too_many_arguments)]
-            fn gemm_by_kind(
-                &self,
-                quant: QuantKind,
-                y: &DevBuffer,
-                w: &DevBuffer,
-                x: &DevBuffer,
-                rows: usize,
-                cols: usize,
-                n_tokens: usize,
-                scale: f32,
-            ) -> Result<()> {
-                match quant {
-                    QuantKind::Q4K => {
-                        self.kernels.gemm_q4_k_f16_at(y, w, 0, x, rows, cols, n_tokens, &self.stream)
-                    }
-                    QuantKind::Q6K => {
-                        self.kernels.gemm_q6_k_f16_at(y, w, 0, x, rows, cols, n_tokens, &self.stream)
-                    }
-                    $(QuantKind::$k => {
-                        self.kernels.$gemm(y, w, 0, x, rows, cols, n_tokens, &self.stream)
-                    })+
-                    $(QuantKind::$sk => {
-                        self.kernels.$sgemm(y, w, x, rows, cols, n_tokens, scale, &self.stream)
-                    })+
-                    other => Err(ForgeError::Unsupported(format!("{other:?}: brak GEMM"))),
-                }
-            }
-
-            #[allow(clippy::too_many_arguments)]
-            fn gemv_out_f32_by_kind(
-                &self,
-                quant: QuantKind,
-                y: &DevBuffer,
-                w: &DevBuffer,
-                x: &DevBuffer,
-                rows: usize,
-                cols: usize,
-                scale: f32,
-            ) -> Result<()> {
-                match quant {
-                    $(QuantKind::$k => {
-                        self.kernels.$out_f32(y, w, x, rows, cols, &self.stream)
-                    })+
-                    $(QuantKind::$sk => {
-                        self.kernels.$sout(y, w, x, rows, cols, scale, &self.stream)
-                    })+
-                    other => Err(ForgeError::Unsupported(format!("{other:?}: brak głowy f32"))),
-                }
-            }
-        }
-    };
-}
-
-block_formats! {
-    plain {
-    None   => gemv_f16        , gemm_f16_at        , gemv_f16_out_f32;
-    Q5K    => gemv_q5_k_f16   , gemm_q5_k_f16_at   , gemv_q5_k_out_f32;
-    Q8_0   => gemv_q8_0_f16   , gemm_q8_0_f16_at   , gemv_q8_0_out_f32;
-    Q3K    => gemv_q3_k_f16   , gemm_q3_k_f16_at   , gemv_q3_k_out_f32;
-    Q2K    => gemv_q2_k_f16   , gemm_q2_k_f16_at   , gemv_q2_k_out_f32;
-    Q4_0   => gemv_q4_0_f16   , gemm_q4_0_f16_at   , gemv_q4_0_out_f32;
-    Q4_1   => gemv_q4_1_f16   , gemm_q4_1_f16_at   , gemv_q4_1_out_f32;
-    Q5_0   => gemv_q5_0_f16   , gemm_q5_0_f16_at   , gemv_q5_0_out_f32;
-    Q5_1   => gemv_q5_1_f16   , gemm_q5_1_f16_at   , gemv_q5_1_out_f32;
-    IQ4NL  => gemv_iq4_nl_f16 , gemm_iq4_nl_f16_at , gemv_iq4_nl_out_f32;
-    IQ4XS  => gemv_iq4_xs_f16 , gemm_iq4_xs_f16_at , gemv_iq4_xs_out_f32;
-    MXFP4  => gemv_mxfp4_f16  , gemm_mxfp4_f16_at  , gemv_mxfp4_out_f32;
-    IQ2XS  => gemv_iq2_xs_f16 , gemm_iq2_xs_f16_at , gemv_iq2_xs_out_f32;
-    IQ2S   => gemv_iq2_s_f16  , gemm_iq2_s_f16_at  , gemv_iq2_s_out_f32;
-    IQ3S   => gemv_iq3_s_f16  , gemm_iq3_s_f16_at  , gemv_iq3_s_out_f32;
-    IQ2XXS => gemv_iq2_xxs_f16, gemm_iq2_xxs_f16_at, gemv_iq2_xxs_out_f32;
-    IQ3XXS => gemv_iq3_xxs_f16, gemm_iq3_xxs_f16_at, gemv_iq3_xxs_out_f32;
-    IQ1S   => gemv_iq1_s_f16  , gemm_iq1_s_f16_at  , gemv_iq1_s_out_f32;
-    IQ1M   => gemv_iq1_m_f16  , gemm_iq1_m_f16_at  , gemv_iq1_m_out_f32;
-    }
-    // Kernele NVFP4 biorą skalar całego tensora, bo w bloku siedzi tylko
-    // czterobitowy wykładnik na szesnaście wartości — reszta zakresu jest w tym
-    // jednym mnożniku. To różnica w TREŚCI wywołania, nie w nazwie kernela, i
-    // dlatego osobna sekcja, a nie kolejny wiersz.
-    scaled {
-    NVFP4Gguf => gemv_nvfp4_gguf_f16, gemm_nvfp4_gguf_f16, gemv_nvfp4_gguf_out_f32;
-    }
-}
