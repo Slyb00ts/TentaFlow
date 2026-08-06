@@ -61,6 +61,7 @@ fn spec() -> ExecSpec {
             rope_rot: (HIDDEN / 2) as u32,
         },
         ssm: Some(ssm()),
+        attends: vec![true].into(),
         quant_params: DType::F16,
         norm_weights: DType::F32,
     }

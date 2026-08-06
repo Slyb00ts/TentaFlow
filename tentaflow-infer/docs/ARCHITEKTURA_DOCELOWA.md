@@ -245,6 +245,14 @@ Kolejność, w której każdy krok odblokowuje następny:
    PRZYROSTOWO, a mapowanie stron woła się raz na warstwę — czterdzieści razy na
    krok. Ręczna wersja była idempotentna przypadkiem, wspólna musi być celowo, i
    jest na to asercja, która sama powiedziała, co się stało.
+
+   Krok 4 dołożył drugą: wspólna warstwa stanu miała już zwartą mapę
+   `warstwa → slab` i nikt jej nie wołał, bo wykonawca brał `KvCache::new` z
+   mapą tożsamościową. Dla stosu, w którym uwagę ma co czwarta warstwa, kosztuje
+   to CZTEROKROTNIE większą pulę na tę samą pojemność (zmierzone: 1,28 GiB wobec
+   320 MiB). Wniosek nie dotyczy tej jednej mapy: **wspólny kod, którego druga
+   ścieżka nie woła, nie jest wspólny** — jest drugą implementacją czekającą, aż
+   ktoś napisze ją od nowa.
 2. **Fuzja jako pass** (§7.3 `ZADANIE_CUDA_EXECUTOR.md`). ZROBIONE dla dwóch
    par, ZMIERZONE, i pomiar okazał się ważniejszy niż sam pass.
 

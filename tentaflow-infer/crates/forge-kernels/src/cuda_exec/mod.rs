@@ -30,7 +30,7 @@ use forge_graph::{
     Act, ExecSpec, Executor, Layout, Op, QuantWeight, SsmShape, Step, Tile, WeightId, WeightStore,
 };
 use forge_hal::{DevBuffer, Device, Pool, Stream};
-use forge_state::kv::{KvCache, KvConfig, KvQuant, SeqKv};
+use forge_state::kv::{KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
 use forge_state::recurrent::{RecurrentConfig, RecurrentState};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
@@ -245,20 +245,41 @@ impl CudaExec {
             sample_idx: i32b(SAMPLE_SCRATCH_PAIRS as u32)?,
         };
 
+        // Only the layers that ATTEND get a slab. A page costs its bytes in
+        // every allocated layer at once, so a hybrid stack sized by
+        // `shape.layers` would need four times the pool to reach the same
+        // context — measured on Qwen3.6: 1.28 GiB against 320 MiB.
+        if spec.attends.len() != shape.layers as usize {
+            return Err(ForgeError::Unsupported(format!(
+                "maska uwagi ma {} warstw, a kształt mówi {}",
+                spec.attends.len(),
+                shape.layers
+            )));
+        }
+        let kv_layers = spec.attends.iter().filter(|a| **a).count();
+        if kv_layers == 0 {
+            return Err(ForgeError::Unsupported(
+                "żadna warstwa nie ma uwagi — ten wykonawca nie ma czego stronicować".into(),
+            ));
+        }
         let page_bytes = (shape.kv_heads * PAGE * shape.head_dim) as usize * 2;
         let cfg = KvConfig {
-            n_layers: shape.layers as usize,
+            n_layers: kv_layers,
             n_kv_heads: shape.kv_heads as usize,
             head_dim: shape.head_dim as usize,
             page_size: PAGE as usize,
-            n_pages: page_budget(&*device, page_bytes, shape.layers as usize, per_lane)?,
+            n_pages: page_budget(&*device, page_bytes, kv_layers, per_lane)?,
             max_pages_per_seq: per_lane,
             // Pełna wierność. Kwantyzacja KV jest w tym cache'u od dawna i to
             // jest właśnie powód, dla którego ten wykonawca go bierze zamiast
             // hodować własny — ale włączenie jej to osobny pomiar jakości.
             quant: KvQuant::F16,
         };
-        let kv = KvCache::new(&*device, cfg)?;
+        let kv = KvCache::new_mapped(
+            &*device,
+            cfg,
+            KvLayerMap::from_attention_mask(spec.attends.iter().copied()),
+        )?;
         let seqs = (0..MAX_LANES).map(|_| kv.new_seq()).collect();
         // Sized even for a model with no recurrent layer, because the config is
         // the only thing allocated here — the slabs arrive layer by layer, as

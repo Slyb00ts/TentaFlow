@@ -335,14 +335,24 @@ by nie dodała.
 
 ### 4c. Co ten krok zostawił niedokończone, świadomie
 
-- **Cache KV alokuje slab na KAŻDĄ warstwę, także rekurencyjną.** Trzydzieści z
-  czterdziestu slabów Qwen3.6 nigdy nie zostanie zapisanych, a budżet stron
-  dzieli się przez czterdzieści zamiast przez dziesięć — czyli sekwencja sięga
-  czterokrotnie krócej, niż mogłaby przy tej samej puli. To nie jest błąd
-  liczbowy i należy do ogona kroku 1 (wspólna warstwa stanu), a nie do
-  słownictwa: `forge-state` musi dostać zwartą mapę `warstwa → slab`, tak jak ma
-  ją silnik. Stan rekurencyjny już tak działa — alokuje warstwę przy pierwszym
-  jej użyciu.
+- **Cache KV na warstwy rekurencyjne: NAPRAWIONE**, i warto zapisać, dlaczego
+  wpis o tym nie przeżył jednego dnia. Zwarta mapa `warstwa → slab` już była w
+  `forge-state` (`KvLayerMap::from_attention_mask`) — nieużywana, bo wykonawca
+  wołał `KvCache::new`, które zakłada mapę tożsamościową. Brakowało jednej
+  rzeczy: kto ma powiedzieć, które warstwy mają uwagę. Odpowiedź jest ta sama,
+  co przy mikserze — checkpoint, przez tę samą rolę (`SsmInProj`), więc obie
+  odpowiedzi nie mogą się rozjechać. `ExecSpec` niesie maskę, bo cache powstaje
+  ZANIM przyjdzie pierwsza operacja.
+
+  Zmierzone na Qwen3.6: strona kosztuje swoje bajty we wszystkich zaalokowanych
+  warstwach naraz, więc **20 MiB przy czterdziestu slabach i 5 MiB przy
+  dziesięciu**. Pełna pojemność wymagała 1,28 GiB puli, teraz 320 MiB. Bramka
+  jest rozstrzygająca, a nie deklaratywna: test biegnie na puli 256 MiB, na
+  której stary układ ODMAWIA (`OutOfMemory`, 320 MiB żądane wobec 240
+  dostępnych) — sprawdzone przez chwilowe cofnięcie zmiany, nie przez rachunek.
+
+  Zła maska nie jest cicha: `KvAppend` nazwałby warstwę bez cache'u i odbiłby
+  się po nazwie, zamiast pisać w cudzy slab.
 - **Zwijanie idzie token po tokenie także w prefillu.** Rekurencji nie da się
   poszerzyć, ale splot, projekcje i normy owszem; silnik ma na to osobne kernele
   chunked/persistent. Ten krok mierzy poprawność, nie przepustowość, więc wejdą

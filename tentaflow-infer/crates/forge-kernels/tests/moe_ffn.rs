@@ -59,6 +59,7 @@ fn shape() -> DenseShape {
 fn spec() -> ExecSpec {
     ExecSpec {
         shape: shape(),
+        attends: vec![true].into(),
         quant_params: DType::F16,
         norm_weights: DType::F32,
         ssm: None,

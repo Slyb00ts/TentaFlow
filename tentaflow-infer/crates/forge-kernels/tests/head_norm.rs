@@ -54,6 +54,7 @@ fn shape() -> DenseShape {
 fn spec() -> ExecSpec {
     ExecSpec {
         shape: shape(),
+        attends: vec![true].into(),
         quant_params: DType::F16,
         // GGUF keeps normalization weights in f32 while the kernels read f16,
         // so this is the conversion the real path takes.

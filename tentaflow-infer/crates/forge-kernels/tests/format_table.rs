@@ -308,6 +308,7 @@ fn every_format_agrees_with_the_cpu_reference() {
             ExecSpec {
                 shape: shape(),
                 ssm: None,
+                attends: vec![true].into(),
                 quant_params: DType::F16,
                 norm_weights: DType::F32,
             },

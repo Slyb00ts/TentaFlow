@@ -221,9 +221,19 @@ impl<E: Executor + WeightStore> Dense<E> {
             k_heads: s.n_group as u32,
             v_heads: s.dt_rank as u32,
         });
+        // Which layers keep a cache is read from the SAME role the mixer is
+        // chosen by, so the two cannot disagree — and if they somehow did, the
+        // first `KvAppend` would name a layer with no cache rather than write
+        // into another layer's.
+        let attends: Vec<bool> = desc
+            .layers
+            .iter()
+            .map(|l| !l.contains_key(&WeightRole::SsmInProj))
+            .collect();
         let mut exec = make(ExecSpec {
             shape,
             ssm,
+            attends: attends.into(),
             quant_params,
             norm_weights,
         })?;

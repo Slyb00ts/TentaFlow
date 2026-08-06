@@ -443,9 +443,20 @@ pub struct Tile {
 /// normalizacji. W MLX oba są bf16, więc zlanie ich w jeden wyglądało na
 /// uproszczenie — i dawało poprawnie wyglądający, zły tekst dla każdego źródła,
 /// które trzyma normy inaczej niż skale.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ExecSpec {
     pub shape: DenseShape,
+    /// True for every layer that keeps a key/value cache.
+    ///
+    /// The executor allocates that cache before it sees an operation, and a
+    /// hybrid stack attends in a QUARTER of its layers — so sizing it by
+    /// `shape.layers` reserves four slabs for every one written, and a page
+    /// costs its bytes in all of them at once.
+    ///
+    /// Stated by the model rather than inferred, and it cannot drift: a mask
+    /// disagreeing with the operations means `KvAppend` names a layer with no
+    /// cache, which is refused by name at the first step.
+    pub attends: Arc<[bool]>,
     /// The recurrent mixer's geometry, for a hybrid stack. `None` for every
     /// model whose layers all mix with attention.
     pub ssm: Option<SsmShape>,

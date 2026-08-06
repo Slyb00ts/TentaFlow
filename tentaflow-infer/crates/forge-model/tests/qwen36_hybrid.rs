@@ -144,11 +144,16 @@ fn the_hybrid_continues_a_factual_prompt() {
     }
     let free = CudaDevice::free_vram(0).expect("wolna pamięć");
     eprintln!("wolne VRAM: {:.1} GiB", free as f64 / (1u64 << 30) as f64);
+    // 256 MiB of cache, which is the measurement rather than a round number:
+    // a page costs its bytes in every ALLOCATED layer at once, so sizing the
+    // cache by the layer count would make one page 20 MiB here and this pool
+    // would hold fewer than one sequence's worth. Only ten of forty layers
+    // attend, so a page costs 5 MiB and the pool holds four sequences.
     let device = CudaDevice::new(
         0,
         PoolSizes {
             weights: 24 << 30,
-            kv_cache: 1 << 30,
+            kv_cache: 256 << 20,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
             activations: 2 << 30,
         },
