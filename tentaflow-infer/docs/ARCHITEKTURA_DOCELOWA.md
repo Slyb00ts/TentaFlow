@@ -301,7 +301,14 @@ Kolejność, w której każdy krok odblokowuje następny:
 4. **MoE i hybrid w słownictwie.** Jedyna pozycja, która jest prawdziwą pracą
    projektową: `Op` musi wyrazić routing ekspertów i stan rekurencyjny
    DeltaNet, a każda platforma potrzebuje tych kerneli — inaczej „wszystko na
-   każdym systemie" jest nieprawdą, a nie planem.
+   każdym systemie" jest nieprawdą, a nie planem. **Karta:
+   `docs/ZADANIE_MOE_HYBRID.md`** — z rekomendacją, żeby obie rodziny weszły
+   JEDNĄ operacją każda (jak `Attention`, którego stronicowanie zmieściło się
+   całe po stronie wykonawcy), z MoE przed hybrydą, bo routing da się odtworzyć
+   na wzorcu dokładnie, a stan rekurencyjny nie. Jedna twarda przeszkoda,
+   nazwana zamiast obchodzona: brak małego checkpointu MoE — jedyny lokalny to
+   DeepSeek V4 Flash, 156 GiB, czyli za duży, żeby wzorzec nim cokolwiek
+   policzył.
 5. **Spekulacja jako pass plus kontrakt proposera.** `forge-engine::speculation`
    ma już typowany `Proposer` i statystyki akceptacji, więc to przeniesienie,
    nie wymyślanie.
