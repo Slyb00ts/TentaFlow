@@ -926,11 +926,15 @@
       "file": "gemm_nvfp4_gguf_out_f32_b8.ptx"
     },
     "gemm_nvfp4_mma_f16_bm128_bn128": {
-      "entry": "src_gemm_fp4_gemm_nvfp4_mma_im6A6A6A6A_ca80e5083819d800",
+      "entry": "src_gemm_fp4_gemm_nvfp4_mma_im6A6A6A6A_959d59bea04dff26",
       "file": "gemm_nvfp4_mma_f16_bm128_bn128.ptx"
     },
+    "gemm_nvfp4_mma_f16_bm128_bn256": {
+      "entry": "src_gemm_fp4_gemm_nvfp4_mma_im6A6A6A6A_37445bf961c649fa",
+      "file": "gemm_nvfp4_mma_f16_bm128_bn256.ptx"
+    },
     "gemm_nvfp4_mma_f16_bm64_bn64": {
-      "entry": "src_gemm_fp4_gemm_nvfp4_mma_im6A6A6A6A_9b83cb0a1eea53a1",
+      "entry": "src_gemm_fp4_gemm_nvfp4_mma_im6A6A6A6A_b06a9055a69915fe",
       "file": "gemm_nvfp4_mma_f16_bm64_bn64.ptx"
     },
     "gemm_nvfp4_tile128_mma_f16_bm128_bn128": {

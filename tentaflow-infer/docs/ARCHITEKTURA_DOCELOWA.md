@@ -567,3 +567,54 @@ błędu, tylko zwraca liczby. Bajtowo jest to układ działającego obok
 czwórki. Porównanie jest DOKŁADNE: każda wartość e2m1 to wielokrotność 0,5 o
 module najwyżej 6, więc 64 iloczyny zsumowane w f32 wypadają na liczbach
 reprezentowalnych niezależnie od kolejności dodawania.
+
+### Kafel FP4: nie instrukcja go ograniczała, tylko czekanie na pamięć
+
+Pierwszy kafel na `kind::mxf4nvf4` był WOLNIEJSZY od ścieżki f16, którą miał
+zastąpić — 0,36-0,69x, przy 20-40 TFLOP/s wobec zmierzonego sufitu 488. PTX nie
+miał ani jednego dostępu do pamięci lokalnej, a odczyty LDS wyszły bezkonfliktowe
+(adres pasa to `const + 36g + t`, a `36g mod 32 = 4g`, więc `4g + t` przebiega
+całe 32 banki). Ograniczeniem były dwie inne rzeczy, obie o ruchu, nie o liczeniu.
+
+PIERWSZA to WIELOKROTNE CZYTANIE KAFLA. Waga jest czytana `tokeny / BTOK` razy,
+aktywacja `wiersze / BROWS` razy. Dla 5120x5120 i 2048 tokenów kafel 128x128 to
+236 MB wagi plus 236 MB aktywacji, czyli 1,73 ms samego ruchu przy 273 GB/s —
+przy zmierzonych 2,75 ms. Poszerzenie kafla tokenów do 256 połowi pierwszy
+składnik.
+
+DRUGA to BARIERA. Przy jednym rezydentnym bloku na SM wątki stoją na barierze
+przez całą latencję pamięci globalnej, a jednostka macierzowa czeka. Pobranie
+NASTĘPNEGO kroku `k` do REJESTRÓW przed policzeniem bieżącego usuwa to czekanie
+i jest właściwym rozmiarem tej zmiany: `(BROWS + BTOK) * 9 / THREADS` rejestrów
+na wątek, czyli 14 przy BM128/BN256.
+
+Te dwie rzeczy razem dały 38,0 -> 83,5 TFLOP/s na projekcji QKV. Trzecia
+własność wypadła z nich obu: `KSTEP` musi być MAŁY, bo pobranie żyje w
+rejestrach — przy `KSTEP = 4` akumulator zaczynał lądować w pamięci lokalnej,
+a to jest zapaść, nie regresja.
+
+Zmierzone na GB10, mediana z siedmiu, kwantyzacja aktywacji JEST wliczona w czas
+FP4 (model, który nie umiałby jej zamortyzować na projekcjach warstwy, i tak
+musiałby ją zapłacić):
+
+| kształt | tokeny | f16 ms | fp4 ms | fp4 TFLOP/s | zysk |
+|---|---|---|---|---|---|
+| qkv 5120x5120 | 128 | 0,159 | 0,106 | 63,1 | 1,49x |
+| qkv 5120x5120 | 512 | 0,461 | 0,365 | 73,6 | 1,26x |
+| qkv 5120x5120 | 2048 | 1,594 | 1,286 | 83,5 | 1,24x |
+| o 5120x4096 | 2048 | 1,307 | 0,984 | 87,3 | 1,33x |
+| gate/up 17408x5120 | 2048 | 8,257 | 5,225 | 69,9 | 1,58x |
+| down 5120x17408 | 2048 | 7,031 | 5,368 | 68,0 | 1,31x |
+
+87 TFLOP/s to nadal 18% sufitu instrukcji, więc kafel ma jeszcze zapas — ale
+ścieżka f16 osiągała 68 z własnych 122, czyli 56%, i to jest liczba, wobec
+której FP4 musiało wygrać, żeby w ogóle wejść.
+
+CENĄ jest kwantyzacja aktywacji, której ścieżka FP8 nie płaciła: tam czterema
+bitami była tylko waga. Na syntetycznym zestawie o aktywacjach rozrzuconych na
+trzy rzędy wielkości wewnątrz tokena kosztuje ona 14,2% rozpiętości wyniku
+POJEDYNCZEGO GEMM-u, przy błędzie samego kernela 0,04%. Te dwie liczby mierzy
+się osobno i mylenie ich jest tu najłatwiejszym błędem: pierwsza jest własnością
+FORMATU i nie zmniejszy jej lepszy kafel. Ile z niej zostaje na prawdziwym
+checkpoincie — tak jak przy e4m3, gdzie 3-5% na danych syntetycznych zeszło do
+0,56% na Bieliku — jest osobnym pomiarem i warunkiem wpięcia tej ścieżki w model.

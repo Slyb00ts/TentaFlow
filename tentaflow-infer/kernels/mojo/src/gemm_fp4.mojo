@@ -50,9 +50,12 @@ def gemm_nvfp4_mma_impl[
     comptime BTOK = WARPS_TOK * NT * 8
     comptime TILE_W = BROWS * KSTEP * BLOCK_WORDS
     comptime TILE_X = BTOK * KSTEP * BLOCK_WORDS
+    comptime THREADS = WARPS_ROW * WARPS_TOK * 32
+    comptime WSLOTS = (TILE_W + THREADS - 1) // THREADS
+    comptime XSLOTS = (TILE_X + THREADS - 1) // THREADS
+    comptime STRIDE = KSTEP * BLOCK_WORDS
 
     tid = Int(thread_idx.x)
-    threads = Int(block_dim.x)
     lane = tid % 32
     warp = tid // 32
     quad = lane // 4
@@ -72,44 +75,64 @@ def gemm_nvfp4_mma_impl[
         fill=SIMD[DType.float32, 4](0.0, 0.0, 0.0, 0.0)
     )
 
+    # Kolejny kafel jest ŚCIĄGANY W REJESTRY, zanim policzy się bieżący. Bez
+    # tego jedyny rezydentny blok stoi na barierze przez całą latencję pamięci
+    # globalnej, a jednostka macierzowa czeka: zmierzone 62,9 wobec 38,0 TFLOP/s
+    # to właśnie ta zwłoka, a nie przepustowość instrukcji.
+    var stage_w = InlineArray[UInt32, WSLOTS](fill=UInt32(0))
+    var stage_x = InlineArray[UInt32, XSLOTS](fill=UInt32(0))
+
+    @parameter
+    def fetch(block0: Int):
+        comptime for i in range(WSLOTS):
+            slot = tid + i * THREADS
+            if slot < TILE_W:
+                row = slot // STRIDE
+                rest = slot % STRIDE
+                var src_row = base_row + row
+                if src_row > n_rows - 1:
+                    src_row = n_rows - 1
+                var src_blk = block0 + rest // BLOCK_WORDS
+                if src_blk > blocks_per_row - 1:
+                    src_blk = blocks_per_row - 1
+                stage_w[i] = weights[
+                    (src_row * blocks_per_row + src_blk) * BLOCK_WORDS
+                    + rest % BLOCK_WORDS
+                ]
+        comptime for i in range(XSLOTS):
+            slot = tid + i * THREADS
+            if slot < TILE_X:
+                tok = slot // STRIDE
+                rest = slot % STRIDE
+                var src_tok = base_tok + tok
+                if src_tok > n_tokens - 1:
+                    src_tok = n_tokens - 1
+                var src_blk = block0 + rest // BLOCK_WORDS
+                if src_blk > blocks_per_row - 1:
+                    src_blk = blocks_per_row - 1
+                stage_x[i] = x[
+                    (src_tok * blocks_per_row + src_blk) * BLOCK_WORDS
+                    + rest % BLOCK_WORDS
+                ]
+
+    # Wiersze i tokeny poza zakresem czytają ostatni legalny indeks: ich pola
+    # i tak nie są zapisywane, a zacisk trzyma odczyt w obrębie bufora.
+    fetch(0)
+
     var block0 = 0
     while block0 < blocks_per_row:
-        # Wiersze i tokeny poza zakresem czytają ostatni legalny indeks: ich
-        # pola i tak nie są zapisywane, a zacisk trzyma odczyt w buforze.
-        var slot = tid
-        while slot < TILE_W:
-            row = slot // (KSTEP * BLOCK_WORDS)
-            rest = slot % (KSTEP * BLOCK_WORDS)
-            kblk = rest // BLOCK_WORDS
-            word = rest % BLOCK_WORDS
-            var src_row = base_row + row
-            if src_row > n_rows - 1:
-                src_row = n_rows - 1
-            var src_blk = block0 + kblk
-            if src_blk > blocks_per_row - 1:
-                src_blk = blocks_per_row - 1
-            sw[slot] = weights[
-                (src_row * blocks_per_row + src_blk) * BLOCK_WORDS + word
-            ]
-            slot += threads
-
-        slot = tid
-        while slot < TILE_X:
-            tok = slot // (KSTEP * BLOCK_WORDS)
-            rest = slot % (KSTEP * BLOCK_WORDS)
-            kblk = rest // BLOCK_WORDS
-            word = rest % BLOCK_WORDS
-            var src_tok = base_tok + tok
-            if src_tok > n_tokens - 1:
-                src_tok = n_tokens - 1
-            var src_blk = block0 + kblk
-            if src_blk > blocks_per_row - 1:
-                src_blk = blocks_per_row - 1
-            sx[slot] = x[
-                (src_tok * blocks_per_row + src_blk) * BLOCK_WORDS + word
-            ]
-            slot += threads
+        comptime for i in range(WSLOTS):
+            slot = tid + i * THREADS
+            if slot < TILE_W:
+                sw[slot] = stage_w[i]
+        comptime for i in range(XSLOTS):
+            slot = tid + i * THREADS
+            if slot < TILE_X:
+                sx[slot] = stage_x[i]
         barrier()
+
+        if block0 + KSTEP < blocks_per_row:
+            fetch(block0 + KSTEP)
 
         comptime for kblk in range(KSTEP):
             if block0 + kblk < blocks_per_row:
@@ -118,9 +141,8 @@ def gemm_nvfp4_mma_impl[
                 comptime for mt in range(MT):
                     # Pas dostarcza słowo skali wiersza `quad` (in_quad == 0)
                     # albo `quad + 8` (in_quad == 1); pozostałe dwa pasy czwórki
-                    # nie są czytane przez instrukcję i wtedy `in_quad * 8`
-                    # daje ten sam adres co pas 0 albo 1 wiersza dalej — bez
-                    # znaczenia, bo wynik i tak jest ignorowany.
+                    # nie są czytane przez instrukcję, więc ich adres jest bez
+                    # znaczenia.
                     srow = warp_row + mt * 16 + quad + 8 * (in_quad % 2)
                     wsx[mt] = sw[(srow * KSTEP + kblk) * BLOCK_WORDS]
                     comptime for r in range(4):
@@ -135,12 +157,8 @@ def gemm_nvfp4_mma_impl[
                 comptime for nt in range(NT):
                     stok = warp_tok + nt * 8 + quad
                     xs = sx[(stok * KSTEP + kblk) * BLOCK_WORDS]
-                    b0 = sx[
-                        (stok * KSTEP + kblk) * BLOCK_WORDS + 1 + in_quad
-                    ]
-                    b1 = sx[
-                        (stok * KSTEP + kblk) * BLOCK_WORDS + 5 + in_quad
-                    ]
+                    b0 = sx[(stok * KSTEP + kblk) * BLOCK_WORDS + 1 + in_quad]
+                    b1 = sx[(stok * KSTEP + kblk) * BLOCK_WORDS + 5 + in_quad]
                     comptime for mt in range(MT):
                         acc[mt * NT + nt] = _mma_nvf4(
                             wa[mt * 4],
@@ -167,5 +185,15 @@ def gemm_nvfp4_mma_impl[
                     )
 
 
-comptime gemm_nvfp4_mma_f16_bm64_bn64 = gemm_nvfp4_mma_impl[2, 2, 2, 4, 4]
-comptime gemm_nvfp4_mma_f16_bm128_bn128 = gemm_nvfp4_mma_impl[2, 4, 4, 4, 4]
+# Kafel jest tu ograniczony REJESTRAMI AKUMULATORA: `BROWS * BTOK` pól f32
+# rozkłada się na wątki bloku, więc 256x128 przy 512 wątkach to już 64 rejestry
+# na wątek zanim policzy się fragmenty. Większy kafel czyta za to wagi mniej
+# razy, a przy 2048 tokenach to właśnie ruch, a nie jednostka macierzowa,
+# wyznacza czas.
+# `KSTEP` jest teraz mały z tego samego powodu, dla którego kafel jest duży:
+# pobranie następnego kroku żyje w REJESTRACH, więc każdy dodatkowy blok `k`
+# to `(BROWS + BTOK) * 9 / THREADS` rejestrów na wątek. Przy `KSTEP = 4`
+# wariant BM128/BN128 zaczynał zrzucać akumulator do pamięci lokalnej.
+comptime gemm_nvfp4_mma_f16_bm64_bn64 = gemm_nvfp4_mma_impl[2, 2, 2, 4, 1]
+comptime gemm_nvfp4_mma_f16_bm128_bn128 = gemm_nvfp4_mma_impl[2, 4, 4, 4, 1]
+comptime gemm_nvfp4_mma_f16_bm128_bn256 = gemm_nvfp4_mma_impl[2, 4, 4, 8, 1]

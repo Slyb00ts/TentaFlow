@@ -139,7 +139,8 @@ impl Kernels {
 }
 
 /// Wierszy wag i tokenów na blok wariantów `gemm_nvfp4_mma_f16_*`.
-const MMA_TILE: [(&str, usize, usize, u32); 2] = [
+const MMA_TILE: [(&str, usize, usize, u32); 3] = [
+    ("gemm_nvfp4_mma_f16_bm128_bn256", 128, 256, 256),
     ("gemm_nvfp4_mma_f16_bm128_bn128", 128, 128, 256),
     ("gemm_nvfp4_mma_f16_bm64_bn64", 64, 64, 128),
 ];
