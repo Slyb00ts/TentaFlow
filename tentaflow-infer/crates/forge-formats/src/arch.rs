@@ -1343,11 +1343,11 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
     } else {
         None
     };
-    if moe.is_some() && nextn > 0 {
-        return Err(fmt_err(
-            "qwen35moe: natywny runtime MTP nie obsługuje jeszcze bloku MoE",
-        ));
-    }
+    // A descriptor DESCRIBES the file; whether a given runtime can compute the
+    // speculation head is that runtime's answer, given where it builds it. This
+    // check used to stand here and refused the whole checkpoint — including its
+    // forty trunk layers, which have nothing to do with MTP — so a MoE hybrid
+    // could not be opened by anything, and `build_moe_mtp` below was unreachable.
     let mtp = if moe.is_some() {
         build_moe_mtp(gguf, block_count, nextn)?
     } else {

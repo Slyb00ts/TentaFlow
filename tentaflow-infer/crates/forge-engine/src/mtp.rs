@@ -182,6 +182,17 @@ impl MtpWeights {
         let inter = params.intermediate_size;
         let mut layers = Vec::with_capacity(descriptor.block_count);
         for (index, names) in descriptor.layers.iter().enumerate() {
+            // The speculation head repeats the trunk's block, so a mixture trunk
+            // gives it a mixture block — and this loader builds a dense one. It
+            // is refused HERE, where the native MTP runtime is assembled, rather
+            // than at the descriptor: a checkpoint whose head this runtime
+            // cannot compute is still a checkpoint whose trunk it can.
+            if names.contains_key(&MtpWeightRole::FfnGateExps) {
+                return Err(ForgeError::Unsupported(format!(
+                    "MTP: warstwa {index} niesie ekspertów, a natywny runtime MTP \
+                     liczy tylko blok gęsty"
+                )));
+            }
             let name = |role| {
                 names.get(&role).map(String::as_str).ok_or_else(|| {
                     ForgeError::Format(format!("MTP: warstwa {index} nie ma roli {role:?}"))
