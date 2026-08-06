@@ -5,10 +5,10 @@
 // names, and a state that outlives the step — every token folds itself into a
 // matrix that the next token reads.
 //
-// The token loop here is genuinely sequential and not a shortcut. A recurrence
-// cannot be widened the way a projection can: token t+1 reads the matrix token
-// t wrote. The projections in front of it ARE stateless, so they run for every
-// row of the step in one pass, and only the fold is walked one token at a time.
+// The FOLD here is genuinely sequential and not a shortcut. A recurrence cannot
+// be widened the way a projection can: token t+1 reads the matrix token t wrote.
+// What can be widened is everything AROUND it, and that turned out to be almost
+// all of it — see `op_delta_net`.
 
 use super::{CudaExec, Quantized};
 
@@ -30,19 +30,19 @@ pub(super) struct DeltaScratch {
     /// Per-head decay and write-gate projections of every row.
     alpha: DevBuffer,
     beta_raw: DevBuffer,
-    /// One row's convolved stream, then its pieces.
-    conv_out: DevBuffer,
-    q16: DevBuffer,
-    k16: DevBuffer,
-    /// The same, repeated to cover the value heads.
+    /// Query, key and value of ONE CHUNK, convolved, normalized and repeated to
+    /// cover the value heads — everything the fold reads.
     q32: DevBuffer,
     k32: DevBuffer,
     v: DevBuffer,
-    /// Decay and write gate, in f32 because the recurrence is.
+    /// Decay and write gate of the chunk, in f32 because the recurrence is.
     g: DevBuffer,
     beta: DevBuffer,
-    /// The recurrence's answer, one row at a time — the fold is sequential, so
-    /// there is nothing to keep.
+    /// The convolution window as it stood after each token of the chunk. The
+    /// prepare kernel writes them for rollback; here only the LAST one is read,
+    /// and it is the state the next chunk starts from.
+    conv_checkpoints: DevBuffer,
+    /// The fold's answer for the whole chunk.
     o: DevBuffer,
     /// Its gated normalization, for EVERY row. The output projection that
     /// reads it is stateless, so keeping every row lets it run once over the
@@ -51,7 +51,17 @@ pub(super) struct DeltaScratch {
     /// times.
     normed: DevBuffer,
     rows: usize,
+    chunk: usize,
 }
+
+/// Tokens the recurrent layer prepares and folds at a time.
+///
+/// Bounded, and not equal to the step, because the prepare kernel writes one
+/// convolution window PER TOKEN: at the width of a 27B hybrid that is about
+/// 48 KiB a token, so a 4096-token prompt would ask for two hundred megabytes
+/// of scratch to read three hundred bytes of it. The fold is in-place, so
+/// chunking it changes nothing about the result.
+const DELTA_CHUNK: usize = 256;
 
 impl CudaExec {
     fn ensure_delta(&self, ssm: SsmShape, rows: usize) -> Result<DeltaScratch> {
@@ -70,22 +80,24 @@ impl CudaExec {
                 .alloc(elems as usize * 4, MemKind::Device, Pool::Activations)
         };
         let n = rows as u32;
+        let chunk = rows.min(DELTA_CHUNK);
+        let c = chunk as u32;
+        let window = ssm.d_conv - 1;
         let fresh = DeltaScratch {
             mixed: f16b(n * ssm.mixed_width())?,
             z: f16b(n * ssm.value_width())?,
             alpha: f16b(n * ssm.v_heads)?,
             beta_raw: f16b(n * ssm.v_heads)?,
-            conv_out: f16b(ssm.mixed_width())?,
-            q16: f16b(ssm.key_width())?,
-            k16: f16b(ssm.key_width())?,
-            q32: f16b(ssm.value_width())?,
-            k32: f16b(ssm.value_width())?,
-            v: f16b(ssm.value_width())?,
-            g: f32b(ssm.v_heads)?,
-            beta: f32b(ssm.v_heads)?,
-            o: f16b(ssm.value_width())?,
+            q32: f16b(c * ssm.value_width())?,
+            k32: f16b(c * ssm.value_width())?,
+            v: f16b(c * ssm.value_width())?,
+            g: f32b(c * ssm.v_heads)?,
+            beta: f32b(c * ssm.v_heads)?,
+            conv_checkpoints: f16b(c * ssm.mixed_width() * window)?,
+            o: f16b(c * ssm.value_width())?,
             normed: f16b(n * ssm.value_width())?,
             rows,
+            chunk,
         };
         *held = Some(fresh.clone());
         Ok(fresh)
@@ -140,19 +152,16 @@ impl CudaExec {
         })?;
         let rows = step.rows() as usize;
         let hidden = self.shape.hidden as usize;
-        let (key, value, mixed) = (
-            ssm.key_width() as usize,
-            ssm.value_width() as usize,
-            ssm.mixed_width() as usize,
-        );
+        let (value, mixed) = (ssm.value_width() as usize, ssm.mixed_width() as usize);
         let (v_heads, d_state) = (ssm.v_heads as usize, ssm.d_state as usize);
+        // The prepare kernel repeats key head `h % k_heads` into value head `h`,
+        // so it needs the same divisibility the per-token path needed.
         if !ssm.v_heads.is_multiple_of(ssm.k_heads) || ssm.k_heads == 0 {
             return Err(ForgeError::Unsupported(format!(
                 "{} głowic wartości nie dzieli się na {} głowic klucza",
                 ssm.v_heads, ssm.k_heads
             )));
         }
-        let rep = v_heads / ssm.k_heads as usize;
 
         let qkv = self.quant(w.qkv)?;
         let gate = self.quant(w.gate)?;
@@ -193,6 +202,8 @@ impl CudaExec {
         let (conv_buf, state_buf) = (held.conv.clone(), held.state.clone());
         let cfg = state.config();
         let tokens = step.tokens() as usize;
+        let window = ssm.d_conv as usize - 1;
+        let checkpoint_bytes = mixed * window * 2;
         for (lane, l) in step.lanes().iter().enumerate() {
             let slot = l.slot as usize;
             // A lane starting at position zero is a sequence that starts here,
@@ -203,74 +214,66 @@ impl CudaExec {
             if l.pos == 0 {
                 state.clear(&*self.device, layer, slot)?;
             }
-            let window = self.device.sub_buffer(
-                &conv_buf,
-                cfg.conv_offset(slot),
-                cfg.conv_bytes(),
-            )?;
-            let matrix = self.device.sub_buffer(
-                &state_buf,
-                cfg.state_offset(slot),
-                cfg.state_bytes(),
-            )?;
-            for t in 0..tokens {
-                let row = lane * tokens + t;
-                self.kernels.deltanet_conv_silu_f16_at(
-                    &s.conv_out,
-                    0,
-                    &window,
-                    &s.mixed,
-                    row * mixed * 2,
-                    &conv_w,
-                    mixed,
-                    ssm.d_conv as usize,
-                    &self.stream,
-                )?;
-                // The convolved stream is query, key and value end to end. The
-                // norms read their slice by byte offset; the value needs a copy
-                // because the recurrence takes it as its own buffer.
+            let conv_state =
                 self.device
-                    .copy(&s.conv_out, 2 * key * 2, &s.v, 0, value * 2, &self.stream)?;
-                self.kernels.l2norm_heads_f16_at(
-                    &s.q16,
-                    &s.conv_out,
-                    0,
-                    ssm.k_heads as usize,
-                    d_state,
-                    self.shape.eps,
-                    &self.stream,
-                )?;
-                self.kernels.l2norm_heads_f16_at(
-                    &s.k16,
-                    &s.conv_out,
-                    key * 2,
-                    ssm.k_heads as usize,
-                    d_state,
-                    self.shape.eps,
-                    &self.stream,
-                )?;
-                // Value head h reads key head h % k_heads, so the key block is
-                // laid out repeated rather than indexed with a stride.
-                self.kernels
-                    .deltanet_repeat_qk_f16(&s.q32, &s.k32, &s.q16, &s.k16, key, rep, &self.stream)?;
-                self.kernels.deltanet_log_decay_f32_at(
+                    .sub_buffer(&conv_buf, cfg.conv_offset(slot), cfg.conv_bytes())?;
+            let matrix =
+                self.device
+                    .sub_buffer(&state_buf, cfg.state_offset(slot), cfg.state_bytes())?;
+            let mut first = 0usize;
+            while first < tokens {
+                let take = (tokens - first).min(s.chunk);
+                let row = lane * tokens + first;
+
+                // Everything between the two projections except the fold is a
+                // function of ONE token, so it does not have to be walked token
+                // by token — and walking it was what a prompt actually cost
+                // here. The convolution, both head norms, the repeat and both
+                // gates come out of one launch for the whole chunk.
+                self.kernels.deltanet_prepare_f16(
+                    &s.q32,
+                    &s.k32,
+                    &s.v,
                     &s.g,
-                    0,
-                    &s.alpha,
-                    row * v_heads * 2,
+                    &s.beta,
+                    &s.conv_checkpoints,
+                    &conv_state,
+                    &self
+                        .device
+                        .sub_buffer(&s.mixed, row * mixed * 2, take * mixed * 2)?,
+                    &conv_w,
+                    &self
+                        .device
+                        .sub_buffer(&s.alpha, row * v_heads * 2, take * v_heads * 2)?,
+                    &self
+                        .device
+                        .sub_buffer(&s.beta_raw, row * v_heads * 2, take * v_heads * 2)?,
                     &dt_bias,
                     &a,
+                    take,
+                    ssm.k_heads as usize,
                     v_heads,
+                    d_state,
+                    ssm.d_conv as usize,
+                    self.shape.eps,
                     &self.stream,
                 )?;
-                self.kernels.deltanet_beta_sigmoid_f32_at(
-                    &s.beta,
-                    &s.beta_raw,
-                    row * v_heads * 2,
-                    v_heads,
+                // The checkpoint of the chunk's last token IS the window the
+                // next chunk starts from — same layout, so it is a copy and not
+                // a recomputation. It has to happen after the prepare and
+                // before the next one, which the stream already guarantees.
+                self.device.copy(
+                    &s.conv_checkpoints,
+                    (take - 1) * checkpoint_bytes,
+                    &conv_state,
+                    0,
+                    checkpoint_bytes,
                     &self.stream,
                 )?;
-                self.kernels.deltanet_gated_step_f16(
+                // The fold, and only the fold, is sequential — and it is
+                // sequential INSIDE one launch, which is the difference between
+                // a kernel per token and a kernel per chunk.
+                self.kernels.deltanet_gated_scan_inplace_f16(
                     &s.o,
                     &matrix,
                     &s.q32,
@@ -278,24 +281,28 @@ impl CudaExec {
                     &s.v,
                     &s.g,
                     &s.beta,
+                    take,
                     v_heads,
                     d_state,
                     &self.stream,
                 )?;
-                let normed = self
-                    .device
-                    .sub_buffer(&s.normed, row * value * 2, value * 2)?;
+                // The gated norm is per (token, head) and the weight is shared
+                // across heads, so the chunk's tokens flatten into the head axis
+                // rather than needing a pass of their own.
                 self.kernels.deltanet_gated_rmsnorm_f16_at(
-                    &normed,
+                    &self
+                        .device
+                        .sub_buffer(&s.normed, row * value * 2, take * value * 2)?,
                     &s.o,
                     &s.z,
                     row * value * 2,
                     &norm_w,
-                    v_heads,
+                    take * v_heads,
                     d_state,
                     self.shape.eps,
                     &self.stream,
                 )?;
+                first += take;
             }
         }
         // ONE pass over the output weights for the whole step. Everything above

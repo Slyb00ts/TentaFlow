@@ -1037,6 +1037,7 @@ mod tests {
             Act::Key,
             Act::Value,
             Act::Attn,
+            Act::AttnGate,
             Act::Proj,
             Act::Gate,
             Act::Up,
