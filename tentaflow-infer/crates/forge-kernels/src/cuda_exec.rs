@@ -20,7 +20,6 @@
 //     nothing from the vocabulary, and it needs only one implementation.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use half::f16;
@@ -121,8 +120,6 @@ pub struct CudaExec {
     kernels: Kernels,
     stream: Stream,
     weights: Vec<Weight>,
-    /// Fused gate|up weight buffers, created lazily per weight pair.
-    fused_gate_up: RefCell<HashMap<(u32, u32), DevBuffer>>,
     /// Key and value per layer, `[strona][głowica KV][pozycja][wymiar]` f16 —
     /// the layout every paged kernel in the catalogue reads.
     kv: RefCell<KvCache>,
@@ -219,7 +216,6 @@ impl CudaExec {
             kernels,
             stream,
             weights: Vec::new(),
-            fused_gate_up: RefCell::new(HashMap::new()),
             kv: RefCell::new(kv),
             seqs: RefCell::new(seqs),
             scratch,
@@ -384,7 +380,6 @@ impl Executor for CudaExec {
             | Op::SiluMul { step }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
-            | Op::FusedNormSilu { step, .. }
             | Op::Residual { step, .. }
             | Op::LogitsOfLast { step, .. } => step,
         };
@@ -444,48 +439,6 @@ impl Executor for CudaExec {
                         src: Act::Proj,
                         step: step.clone(),
                     })
-                }
-            }
-            Op::FusedNormSilu {
-                gate_w,
-                up_w,
-                norm_w,
-                x,
-                step,
-            } => {
-                let gate = self.quant(*gate_w)?;
-                let up = self.quant(*up_w)?;
-                if Self::fusable(step) && Self::fused_quant(gate.quant) && gate.quant == up.quant {
-                    let fused = self.ensure_fused_gate_up(*gate_w, *up_w)?;
-                    self.gemv_norm_silu_by_kind(
-                        gate.quant,
-                        &self.scratch.act,
-                        &fused,
-                        self.buf(*x),
-                        self.plain(*norm_w)?,
-                        gate.rows,
-                        gate.cols,
-                    )
-                } else {
-                    self.run(&Op::RmsNorm {
-                        out: Act::Norm,
-                        x: *x,
-                        w: *norm_w,
-                        step: step.clone(),
-                    })?;
-                    self.run(&Op::MatMul {
-                        out: Act::Gate,
-                        w: *gate_w,
-                        x: Act::Norm,
-                        step: step.clone(),
-                    })?;
-                    self.run(&Op::MatMul {
-                        out: Act::Up,
-                        w: *up_w,
-                        x: Act::Norm,
-                        step: step.clone(),
-                    })?;
-                    self.run(&Op::SiluMul { step: step.clone() })
                 }
             }
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, step),
@@ -1044,138 +997,6 @@ impl CudaExec {
     /// row count is asked for by name and in one place.
     fn fusable(step: &Step) -> bool {
         step.rows() == 1
-    }
-
-    fn ensure_fused_gate_up(&self, gate: WeightId, up: WeightId) -> Result<DevBuffer> {
-        let key = (gate.0, up.0);
-        if let Some(buffer) = self.fused_gate_up.borrow().get(&key) {
-            return Ok(buffer.clone());
-        }
-
-        let gate_weight = self.quant(gate)?;
-        let up_weight = self.quant(up)?;
-        if gate_weight.quant != up_weight.quant
-            || gate_weight.rows != up_weight.rows
-            || gate_weight.cols != up_weight.cols
-        {
-            return Err(ForgeError::Unsupported(
-                "FusedNormSilu wymaga zgodnych wag gate i up".into(),
-            ));
-        }
-
-        let gate_bytes = gate_weight.blocks.len();
-        let up_bytes = up_weight.blocks.len();
-        let fused = self
-            .device
-            .alloc(gate_bytes + up_bytes, MemKind::Device, Pool::Weights)?;
-        self.device
-            .copy(&gate_weight.blocks, 0, &fused, 0, gate_bytes, &self.stream)?;
-        self.device.copy(
-            &up_weight.blocks,
-            0,
-            &fused,
-            gate_bytes,
-            up_bytes,
-            &self.stream,
-        )?;
-        self.stream.synchronize()?;
-        self.fused_gate_up.borrow_mut().insert(key, fused.clone());
-        Ok(fused)
-    }
-
-    fn gemv_norm_silu_by_kind(
-        &self,
-        quant: QuantKind,
-        act: &DevBuffer,
-        fused: &DevBuffer,
-        h: &DevBuffer,
-        norm_w: &DevBuffer,
-        inter: usize,
-        cols: usize,
-    ) -> Result<()> {
-        let dp4a = cols <= Kernels::DP4A_MAX_COLS;
-        match quant {
-            QuantKind::None => self.kernels.gemv_norm_silu_f16(
-                act,
-                fused,
-                h,
-                &self.scratch.h32,
-                norm_w,
-                inter,
-                cols,
-                self.shape.eps,
-                &self.stream,
-            ),
-            QuantKind::Q4K if dp4a => self.kernels.gemv_norm_silu_q4_k_dp4a_f16(
-                act,
-                fused,
-                h,
-                &self.scratch.h32,
-                norm_w,
-                inter,
-                cols,
-                self.shape.eps,
-                &self.stream,
-            ),
-            QuantKind::Q4K => self.kernels.gemv_norm_silu_q4_k_f16(
-                act,
-                fused,
-                h,
-                &self.scratch.h32,
-                norm_w,
-                inter,
-                cols,
-                self.shape.eps,
-                &self.stream,
-            ),
-            QuantKind::Q6K if dp4a => self.kernels.gemv_norm_silu_q6_k_dp4a_f16(
-                act,
-                fused,
-                h,
-                &self.scratch.h32,
-                norm_w,
-                inter,
-                cols,
-                self.shape.eps,
-                &self.stream,
-            ),
-            QuantKind::Q6K => self.kernels.gemv_norm_silu_q6_k_f16(
-                act,
-                fused,
-                h,
-                &self.scratch.h32,
-                norm_w,
-                inter,
-                cols,
-                self.shape.eps,
-                &self.stream,
-            ),
-            QuantKind::Q8_0 if dp4a => self.kernels.gemv_norm_silu_q8_0_dp4a_f16(
-                act,
-                fused,
-                h,
-                &self.scratch.h32,
-                norm_w,
-                inter,
-                cols,
-                self.shape.eps,
-                &self.stream,
-            ),
-            QuantKind::Q8_0 => self.kernels.gemv_norm_silu_q8_0_f16(
-                act,
-                fused,
-                h,
-                &self.scratch.h32,
-                norm_w,
-                inter,
-                cols,
-                self.shape.eps,
-                &self.stream,
-            ),
-            other => Err(ForgeError::Unsupported(format!(
-                "{other:?}: brak scalonego gemv_norm_silu"
-            ))),
-        }
     }
 
     fn gemv_norm_by_kind(

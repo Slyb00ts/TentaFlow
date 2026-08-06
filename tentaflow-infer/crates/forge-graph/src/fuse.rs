@@ -9,11 +9,6 @@ pub fn fuse(ops: &[Op]) -> Vec<Op> {
     let mut out = Vec::with_capacity(ops.len());
     let mut i = 0;
     while i < ops.len() {
-        if let Some((fused, consumed)) = try_fuse_norm_silu(&ops[i..]) {
-            out.push(fused);
-            i += consumed;
-            continue;
-        }
         if let Some((fused, consumed)) = try_fuse_norm_matmul(&ops[i..]) {
             out.push(fused);
             i += consumed;
@@ -95,49 +90,6 @@ fn try_fuse_matmul_residual(ops: &[Op]) -> Option<(Op, usize)> {
     ))
 }
 
-fn try_fuse_norm_silu(ops: &[Op]) -> Option<(Op, usize)> {
-    let [Op::RmsNorm {
-        out: norm_out,
-        x,
-        w: norm_w,
-        step: norm_step,
-    }, Op::MatMul {
-        out: gate_out,
-        w: gate_w,
-        x: gate_x,
-        step: gate_step,
-    }, Op::MatMul {
-        out: up_out,
-        w: up_w,
-        x: up_x,
-        step: up_step,
-    }, Op::SiluMul { step }, ..] = ops
-    else {
-        return None;
-    };
-    if norm_out != gate_x
-        || norm_out != up_x
-        || norm_step != gate_step
-        || norm_step != up_step
-        || *norm_step != *step
-        || count_consumers(ops, *norm_out) != 2
-        || *gate_out != Act::Gate
-        || *up_out != Act::Up
-    {
-        return None;
-    }
-    Some((
-        Op::FusedNormSilu {
-            gate_w: *gate_w,
-            up_w: *up_w,
-            norm_w: *norm_w,
-            x: *x,
-            step: step.clone(),
-        },
-        4,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,8 +137,16 @@ mod tests {
         assert!(matches!(fuse(&ops)[0], Op::FusedMatMulResidual { .. }));
     }
 
+    /// A norm read by TWO projections must survive the pass untouched.
+    ///
+    /// This is the FFN chain, and the fused form is a norm folded into the
+    /// projection that reads it. Folding it into the gate would leave the up
+    /// projection reading a slot nobody wrote this step — stale activations
+    /// from the previous layer, which is fluent output for someone else's
+    /// context rather than a failure. The consumer count is what refuses it,
+    /// so it is the thing worth a test.
     #[test]
-    fn fuses_ffn_chain() {
+    fn leaves_a_norm_with_two_readers_alone() {
         let s = step();
         let ops = vec![
             Op::RmsNorm {
@@ -209,7 +169,9 @@ mod tests {
             },
             Op::SiluMul { step: s },
         ];
-        assert!(matches!(fuse(&ops)[0], Op::FusedNormSilu { .. }));
+        let fused = fuse(&ops);
+        assert_eq!(fused.len(), 4, "chain with a shared norm was rewritten");
+        assert!(matches!(fused[0], Op::RmsNorm { .. }));
     }
 
     #[test]

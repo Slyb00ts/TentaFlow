@@ -344,7 +344,6 @@ impl Executor for MetalExec {
             | Op::SiluMul { step }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
-            | Op::FusedNormSilu { step, .. }
             | Op::Residual { step, .. }
             | Op::LogitsOfLast { step, .. } => step,
         };
@@ -397,33 +396,6 @@ impl Executor for MetalExec {
                     src: Act::Proj,
                     step: step.clone(),
                 })
-            }
-            Op::FusedNormSilu {
-                gate_w,
-                up_w,
-                norm_w,
-                x,
-                step,
-            } => {
-                self.run(&Op::RmsNorm {
-                    out: Act::Norm,
-                    x: *x,
-                    w: *norm_w,
-                    step: step.clone(),
-                })?;
-                self.run(&Op::MatMul {
-                    out: Act::Gate,
-                    w: *gate_w,
-                    x: Act::Norm,
-                    step: step.clone(),
-                })?;
-                self.run(&Op::MatMul {
-                    out: Act::Up,
-                    w: *up_w,
-                    x: Act::Norm,
-                    step: step.clone(),
-                })?;
-                self.run(&Op::SiluMul { step: step.clone() })
             }
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, pos, tokens),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, pos, tokens),

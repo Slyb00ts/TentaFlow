@@ -194,14 +194,6 @@ pub enum Op {
         x: Act,
         step: Step,
     },
-    /// RMSNorm, gate/up projections and SiLU multiplication as one operation.
-    FusedNormSilu {
-        gate_w: WeightId,
-        up_w: WeightId,
-        norm_w: WeightId,
-        x: Act,
-        step: Step,
-    },
     /// `Hidden += src`.
     Residual {
         src: Act,
