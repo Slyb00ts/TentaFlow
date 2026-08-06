@@ -245,10 +245,30 @@ Kolejność, w której każdy krok odblokowuje następny:
    PRZYROSTOWO, a mapowanie stron woła się raz na warstwę — czterdzieści razy na
    krok. Ręczna wersja była idempotentna przypadkiem, wspólna musi być celowo, i
    jest na to asercja, która sama powiedziała, co się stało.
-2. **Fuzja jako pass** (§7.3 `ZADANIE_CUDA_EXECUTOR.md`). Nowa ścieżka wykonuje
-   szesnaście uruchomień na warstwę tam, gdzie scalony łańcuch silnika ma trzy.
-   Dopóki tak jest, porównanie obu ścieżek mierzy narzut uruchomień, a nie
-   architekturę — i nie wolno na jego podstawie niczego przełączać.
+2. **Fuzja jako pass** (§7.3 `ZADANIE_CUDA_EXECUTOR.md`). ZROBIONE dla dwóch
+   par, ZMIERZONE, i pomiar okazał się ważniejszy niż sam pass.
+
+   `forge-graph::fuse` przepisuje `RmsNorm`+`MatMul` oraz `MatMul`+`Residual`
+   na operacje scalone, a wykonawca, który nie ma scalonego kernela, rozkłada
+   je z powrotem na składowe — dzięki temu pass jest niezależny od backendu i
+   wzorzec hostowy pozostaje wyrocznią dla ścieżki scalonej. Bielik 7B Q4_K_M,
+   DGX Spark, dekodowanie jednej sekwencji, mediana z trzech przebiegów jednej
+   sesji: **35,8 tok/s bez fuzji, 36,1 z nią**.
+
+   Czyli fuzja przy dekodowaniu jest oszczędnością URUCHOMIEŃ, a nie pasma —
+   0,8%. I to jest odpowiedź na „szesnaście uruchomień na warstwę wobec
+   trzech": ta różnica jest realna, ale kosztuje mniej, niż zakładaliśmy, więc
+   nie ona blokuje porównanie obu ścieżek. Przy dekodowaniu obie i tak czytają
+   całą macierz na krok.
+
+   Trzecia para, `RmsNorm`+gate+up+`SiLU`, została USUNIĘTA po pomiarze:
+   dawała 0,0% ponad pozostałe dwie, bo scalenie gate i up przenosi te same
+   bajty, a kosztowała kopię obu macierzy na warstwę — ~2 GiB na Q4_K_M i
+   3,7 GiB na Q8_0, na którym po prostu nie mieściła się w puli. Wniosek
+   ogólniejszy niż ta jedna operacja: **scalenie, które nie zmniejsza ruchu
+   bajtów, nie ma czego przyspieszyć przy dekodowaniu**, a scalenie kupione
+   drugą kopią wag musi mieć pomiar, dokładnie jak przepakowanie NVFP4→FP8 w
+   `PLAN_ARCHITEKTURA.md`.
 3. **Formaty wag.** 24 wobec 2, ale to nie jest dwunastokrotność pracy:
    `put_quant` bierze bloki źródła, launchery istnieją dla wszystkich, a
    `forge-formats::dequant` jest wzorcem CPU każdego z nich. To tablica

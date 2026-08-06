@@ -199,7 +199,23 @@ W tej kolejności, każdy krok z własnym testem:
 3. **Fuzja jako pass nad `Vec<Op>`** — `gemv_norm_*`, `gemv_norm_silu_*`,
    `gemv_residual_*` istnieją i są tym, czym silnik dziś ręcznie składa trzy
    łańcuchy dekodowania. Pass rozpoznaje parę `RmsNorm`+`MatMul` i
-   `MatMul`+`Residual` i podmienia je na operację scaloną.
+   `MatMul`+`Residual` i podmienia je na operację scaloną. **ZROBIONE**, z
+   dwoma wynikami, których nie dało się zgadnąć — oba w §8
+   `ARCHITEKTURA_DOCELOWA.md`:
+
+   - fuzja przy dekodowaniu daje **0,8%** (35,8 → 36,1 tok/s), bo oszczędza
+     uruchomienia, a nie pasmo;
+   - trzecia para (`RmsNorm`+gate+up+`SiLU`) dawała **zero** ponad pozostałe
+     dwie i kosztowała ~2 GiB zdublowanych wag, więc została usunięta.
+
+   Przy okazji wyszła klasa błędu, którą warto znać przed czwartym wykonawcą:
+   bramka scalonego kernela pytała `step.tokens() == 1`, czyli o tokeny NA
+   LANE, a każda scalona postać jest GEMV i liczy jeden wiersz. Cztery lane'y
+   po tokenie przechodziły tę bramkę, dostawały policzony lane zero i trzy
+   lane'y z aktywacjami poprzedniego kroku. Objaw: poprawna polszczyzna
+   odpowiadająca na cudzy prompt. Złapał to wyłącznie
+   `cuda_lanes_match_solo_runs` — czyli ten test, który porównuje wsad z
+   przebiegiem samotnym, a nie żaden test kształtu.
 4. **Dopiero teraz** silnik może zacząć chudnąć, bo dopiero teraz kontrakt
    wyraża to, co on robi.
 
@@ -238,7 +254,15 @@ Dwie rzeczy trzeba było przy tym zmierzyć, a nie założyć:
 - Komentarze, nazwy, testy, commity: **angielski**. Format: `[typ]: opis`.
 - **Żadnej atrybucji AI** — ani w commitach, ani w PR, ani w kodzie.
 - Commit na `main` i `git push` po każdym.
-- `cargo run -p xtask -- lint` musi zostać na 36 naruszeniach i 0 nieaktualnych
-  wpisach. Zapadka może tylko spadać.
+- `cargo run -p xtask -- lint` musi kończyć się „wszystkie bramki zielone",
+  czyli zero naruszeń i zero nieaktualnych wpisów. Zapadka może tylko spadać.
+
+  Uwaga na jej ślepy punkt, na który już raz weszliśmy: reguła jest kluczowana
+  ŚCIEŻKĄ, więc podział pliku wyłącza ją po cichu. Po rozbiciu `model.rs` i
+  `launchers.rs` baseline trzymał dług pod ścieżkami, których nie ma, a pliki
+  po podziale nie były pilnowane wcale — dwa wystąpienia `batch_antipattern`
+  siedziały tam nieliczone. Po każdym podziale pliku trzeba więc uruchomić
+  `--update-baseline` i PORÓWNAĆ SUMY per reguła, bo regeneracja potrafi
+  odsłonić dług, a nie tylko go zacisnąć.
 - Nie zgłaszać niczego jako zrobione bez uruchomienia. Wynik niesprawdzony
   opisać jako niesprawdzony.
