@@ -26,8 +26,13 @@ def gemv_q8_0_f16_v2(
     """Q8_0 GEMV, one warp per row. Grid.x = ceil(n_rows / 8), block = 256.
 
     The 34-byte block layout is only 2-byte aligned, so the 32 int8 values are
-    fetched as sixteen u16 lanes and reinterpreted — same trade llama.cpp
-    makes; throughput comes from utilization, not load width.
+    fetched as sixteen u16 lanes and reinterpreted — same trade llama.cpp makes.
+
+    Sprowadzenie wagi do pamieci wspoldzielonej kawalkami wyrownanymi do
+    szesnastu bajtow — to, co dalo MXFP4 trzykrotnosc — jest tu GORSZE: 45,7
+    zamiast 47,1 tok/s generacji. Blok siedemnastobajtowy daje linii adres
+    NIEPARZYSTY, blok trzydziestoczterobajtowy dwubajtowo wyrownany, a to
+    wystarcza scalaczowi; koszt kafla i barier przewyzsza wtedy zysk.
     """
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP

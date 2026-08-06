@@ -14,6 +14,8 @@ from std.memory import stack_allocation
 from std.math import exp
 from std.atomic import Atomic
 
+from src.reduce import block_reduce_max, block_reduce_sum
+
 # One block per token stages that token's hidden vector in shared f32; caps the
 # supported hidden size and expert count (every current MoE model fits).
 comptime MOE_MAX_HIDDEN = 8192
@@ -241,68 +243,97 @@ def moe_topk_f32(
     `moe_router_f16` liczył iloczyny ekspertów i wybór w jednym bloku na token.
     Przy generacji token jest JEDEN, więc cała projekcja routera — dla 256
     ekspertów i 2048 kanałów milion bajtów wagi — szła przez jeden
-    multiprocesor, i to była prawie jedna trzecia czasu kroku. Iloczyny są
-    zwykłym GEMV, więc liczy je GEMV; tutaj zostaje wyłącznie to, co naprawdę
-    jest jednym blokiem na token.
+    multiprocesor. Iloczyny są zwykłym GEMV, więc liczy je GEMV; tutaj zostaje
+    wyłącznie to, co naprawdę jest jednym blokiem na token.
 
-    Redukcje maksimum i sumy idą przez blok, a samo top-k pozostaje szeregowe na
-    zerowym wątku: przy `n_expert <= 256` i `top_k <= 8` to kilka tysięcy
-    iteracji, a kolejność rozstrzygania remisów zostaje ta sama co we wzorcu.
+    Wybór idzie PRZEZ CAŁY BLOK, nie przez zerowy wątek. Osiem rund po
+    dwieście pięćdziesiąt sześć ekspertów to na jednym wątku kilka tysięcy
+    iteracji szeregowych — zmierzone 45,7 us na warstwę, czyli 8,8% kroku
+    generacji. Drzewiasta redukcja robi z tego osiem rund po dziewięć kroków.
+    Remisy rozstrzyga NIŻSZY INDEKS, tak samo jak wzorzec: to jest część
+    porównania, a nie szczegół implementacji.
     """
     token = Int(block_idx.x)
     tid = Int(thread_idx.x)
     nthreads = Int(block_dim.x)
 
-    logits = stack_allocation[
+    val = stack_allocation[
         MOE_MAX_EXPERTS, Float32, address_space = AddressSpace.SHARED
     ]()
+    rv = stack_allocation[
+        MOE_MAX_EXPERTS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    ri = stack_allocation[
+        MOE_MAX_EXPERTS, Int32, address_space = AddressSpace.SHARED
+    ]()
+
     base = token * n_expert
+    var local_max = NEG_BIG
     var i = tid
     while i < n_expert:
-        logits[i] = logits_ptr[base + i]
+        v = logits_ptr[base + i]
+        val[i] = v
+        if v > local_max:
+            local_max = v
+        i += nthreads
+    mx = block_reduce_max(local_max)
+
+    var local_sum: Float32 = 0.0
+    i = tid
+    while i < n_expert:
+        e = exp(val[i] - mx)
+        val[i] = e
+        local_sum += e
+        i += nthreads
+    denom = block_reduce_sum(local_sum)
+    inv_denom = 1.0 / denom
+    i = tid
+    while i < n_expert:
+        val[i] = val[i] * inv_denom
         i += nthreads
     barrier()
 
-    if tid == 0:
-        var mx = logits[0]
-        var n = 1
-        while n < n_expert:
-            if logits[n] > mx:
-                mx = logits[n]
-            n += 1
-        var denom: Float32 = 0.0
-        n = 0
-        while n < n_expert:
-            denom += exp(logits[n] - mx)
-            n += 1
-        n = 0
-        while n < n_expert:
-            logits[n] = exp(logits[n] - mx) / denom
-            n += 1
-
-        var wsum: Float32 = 0.0
-        var kk = 0
-        while kk < top_k:
-            var best_i = 0
-            var best_v = NEG_BIG
-            n = 0
-            while n < n_expert:
-                if logits[n] > best_v:
-                    best_v = logits[n]
-                    best_i = n
-                n += 1
-            ids_ptr[token * top_k + kk] = Int32(best_i)
-            _ = Atomic.fetch_add(counts_ptr + best_i, Int32(1))
-            weights_ptr[token * top_k + kk] = best_v
-            wsum += best_v
-            logits[best_i] = NEG_BIG
-            kk += 1
-
-        if norm_topk != 0 and wsum > 0.0:
-            var inv = 1.0 / wsum
-            kk = 0
-            while kk < top_k:
-                weights_ptr[token * top_k + kk] = (
-                    weights_ptr[token * top_k + kk] * inv
+    var wsum: Float32 = 0.0
+    var kk = 0
+    while kk < top_k:
+        var best_v = NEG_BIG
+        var best_i: Int32 = 0
+        i = tid
+        while i < n_expert:
+            if val[i] > best_v:
+                best_v = val[i]
+                best_i = Int32(i)
+            i += nthreads
+        rv[tid] = best_v
+        ri[tid] = best_i
+        barrier()
+        var span = nthreads // 2
+        while span > 0:
+            if tid < span:
+                other = tid + span
+                take = rv[other] > rv[tid] or (
+                    rv[other] == rv[tid] and ri[other] < ri[tid]
                 )
-                kk += 1
+                if take:
+                    rv[tid] = rv[other]
+                    ri[tid] = ri[other]
+            barrier()
+            span //= 2
+        pick = Int(ri[0])
+        if tid == 0:
+            ids_ptr[token * top_k + kk] = Int32(pick)
+            _ = Atomic.fetch_add(counts_ptr + pick, Int32(1))
+            weights_ptr[token * top_k + kk] = rv[0]
+            val[pick] = NEG_BIG
+        wsum += rv[0]
+        barrier()
+        kk += 1
+
+    if tid == 0 and norm_topk != 0 and wsum > 0.0:
+        var inv = 1.0 / wsum
+        kk = 0
+        while kk < top_k:
+            weights_ptr[token * top_k + kk] = (
+                weights_ptr[token * top_k + kk] * inv
+            )
+            kk += 1

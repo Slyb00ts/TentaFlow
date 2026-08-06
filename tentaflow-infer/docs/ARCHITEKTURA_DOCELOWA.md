@@ -756,3 +756,18 @@ gate/up 43,8 -> 137,8 GB/s, down 38,7 -> 75,4 GB/s, generacja hybrydy
 `down` zostaje przy połowie tempa `gate/up`, bo jego wiersz ma szesnaście bloków
 na trzydzieści dwie linie — połowa fali nie ma czego liczyć. To jest następna
 rzecz do zrobienia, a nie własność formatu.
+
+### Wybór top-k szedł jednym wątkiem, a wyrównanie nie jest regułą uniwersalną
+
+Osiem rund argmaxa po 256 ekspertach na ZEROWYM WĄTKU to kilka tysięcy iteracji
+szeregowych: zmierzone 45,7 us na warstwę, czyli 8,8% kroku generacji. Redukcja
+drzewiasta przez cały blok robi z tego osiem rund po dziewięć kroków. Remisy
+nadal rozstrzyga niższy indeks — to część porównania ze wzorcem, nie szczegół
+implementacji. Generacja: 44,3 -> 47,1 tok/s na hybrydzie i 58,3 -> 60,7 na
+mieszance Q4_K.
+
+Ten sam kafel wyrównany zastosowany do Q8_0 jest GORSZY: 45,7 zamiast 47,1.
+Blok Q8_0 ma trzydzieści cztery bajty, czyli daje linii adres wyrównany do
+DWÓCH, a nie — jak siedemnastobajtowy blok MXFP4 — nieparzysty. Dwa bajty
+scalaczowi wystarczają, więc koszt kafla i barier przewyższa zysk. Wyrównanie
+jest odpowiedzią na NIEPARZYSTY krok, a nie na każdy krok niebędący potęgą dwójki.
