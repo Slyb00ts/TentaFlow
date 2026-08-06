@@ -333,6 +333,24 @@ To jest powód, żeby bramkę porównawczą trzymać krótką z innego powodu ni
 zakładany: nie dlatego, że dłuższa nie zdąży, tylko dlatego, że dłuższa niczego
 by nie dodała.
 
+### 4c. Co ten krok zostawił niedokończone, świadomie
+
+- **Cache KV alokuje slab na KAŻDĄ warstwę, także rekurencyjną.** Trzydzieści z
+  czterdziestu slabów Qwen3.6 nigdy nie zostanie zapisanych, a budżet stron
+  dzieli się przez czterdzieści zamiast przez dziesięć — czyli sekwencja sięga
+  czterokrotnie krócej, niż mogłaby przy tej samej puli. To nie jest błąd
+  liczbowy i należy do ogona kroku 1 (wspólna warstwa stanu), a nie do
+  słownictwa: `forge-state` musi dostać zwartą mapę `warstwa → slab`, tak jak ma
+  ją silnik. Stan rekurencyjny już tak działa — alokuje warstwę przy pierwszym
+  jej użyciu.
+- **Zwijanie idzie token po tokenie także w prefillu.** Rekurencji nie da się
+  poszerzyć, ale splot, projekcje i normy owszem; silnik ma na to osobne kernele
+  chunked/persistent. Ten krok mierzy poprawność, nie przepustowość, więc wejdą
+  dopiero przy porównaniu obu ścieżek.
+- **Metal odmawia obu rodzin.** Kerneli MSL nie ma, a maszyny, która by je
+  uruchomiła, też nie — więc odmowa jest w jednym miejscu na rodzinę zamiast
+  kernela napisanego na ślepo.
+
 ## 5. Rzeczy, które w tych dwóch rodzinach już raz kosztowały płynny, zły tekst
 
 Wszystkie dały poprawnie wyglądające zdania i żadna nie dała awarii:
