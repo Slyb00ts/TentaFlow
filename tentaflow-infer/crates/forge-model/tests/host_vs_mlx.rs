@@ -107,6 +107,7 @@ fn the_reference_refuses_a_weight_it_was_not_set_up_for() {
     };
     let mut exec = HostExec::new(ExecSpec {
         shape,
+        ssm: None,
         quant_params: DType::F16,
         norm_weights: DType::F32,
     })

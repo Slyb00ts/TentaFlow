@@ -104,11 +104,15 @@ fn device() -> Option<Arc<CudaDevice>> {
         eprintln!("pomijam: brak urządzenia CUDA");
         return None;
     }
+    // The activation pool holds one executor's scratch per format in the table,
+    // all of them at once, so it grows with the slot COUNT rather than with the
+    // work. Adding the attention gate cost 256 KB per executor at this width
+    // and this is the pool that felt it.
     let pools = PoolSizes {
         weights: 64 << 20,
         kv_cache: 32 << 20,
         kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
-        activations: 64 << 20,
+        activations: 128 << 20,
     };
     Some(CudaDevice::new(0, pools).expect("karta jest, a nie oddała pul"))
 }
@@ -303,6 +307,7 @@ fn every_format_agrees_with_the_cpu_reference() {
             device.clone() as Arc<_>,
             ExecSpec {
                 shape: shape(),
+                ssm: None,
                 quant_params: DType::F16,
                 norm_weights: DType::F32,
             },

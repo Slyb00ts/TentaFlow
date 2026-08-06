@@ -2,6 +2,45 @@
 use super::*;
 
 impl Kernels {
+    /// Routed-MoE MXFP4 expert GEMV whose expert is selected ON DEVICE from
+    /// `ids[sel]` (no host readback). `w_table` is a device array of per-expert
+    /// weight base pointers, so experts may sit in different memory tiers and
+    /// move independently. Bit-identical to `gemv_mxfp4_f16` launched against
+    /// that expert's own block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mxfp4_f16_gidx(
+        &self,
+        y: &DevBuffer,
+        w_table: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ids: &DevBuffer,
+        sel: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_mxfp4_f16_gidx requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_mxfp4_f16_gidx")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_table)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .buf(ids)
+            .scalar(sel as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// y = W·x with W in GGML MXFP4 blocks, x/y f16. Warp per row.
     pub fn gemv_mxfp4_f16(
         &self,

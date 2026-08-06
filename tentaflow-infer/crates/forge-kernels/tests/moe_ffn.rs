@@ -61,6 +61,7 @@ fn spec() -> ExecSpec {
         shape: shape(),
         quant_params: DType::F16,
         norm_weights: DType::F32,
+        ssm: None,
     }
 }
 

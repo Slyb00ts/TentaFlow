@@ -11,13 +11,17 @@
 // that quietly reported forty attention layers would be computed happily, and
 // the answer would be fluent, wrong text.
 
-use std::collections::HashMap;
+#[allow(dead_code)]
+mod common;
+
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use forge_formats::checkpoint::Checkpoint;
 use forge_formats::{LayerKind, WeightRole};
-use forge_kernels::HostExec;
-use forge_model::dense::Dense;
+use forge_hal::{cuda::CudaDevice, PoolSizes};
+use forge_kernels::{CudaExec, HostExec};
+use forge_model::dense::{Dense, Feed};
 
 fn checkpoint() -> Option<PathBuf> {
     let dir = PathBuf::from(concat!(
@@ -121,71 +125,146 @@ fn the_hybrid_checkpoint_describes_itself() {
     }
 }
 
-/// What this model cannot yet compute, refused BEFORE a weight is uploaded.
+/// The whole checkpoint, on the card.
 ///
-/// The executor is a factory that panics, so the test says something stronger
-/// than "an error came back": the refusal happens while reading the checkpoint,
-/// not after twenty gigabytes have gone to a device.
+/// Everything 4b built meets here for the first time: thirty recurrent layers
+/// interleaved with ten gated-attention ones, a mixture of 256 experts plus an
+/// always-on one under every single block, and MXFP4 weights on a real file
+/// rather than on masked bytes.
 #[test]
-#[ignore = "wymaga checkpointu Qwen3.6-MoE"]
-fn the_parts_not_yet_computed_are_refused_by_name() {
+#[ignore = "wymaga karty NVIDIA i checkpointu Qwen3.6-MoE"]
+fn the_hybrid_continues_a_factual_prompt() {
     let Some(path) = checkpoint() else {
         eprintln!("pomijam: brak checkpointu Qwen3.6-MoE");
         return;
     };
-    let loaded = Dense::load(&path, |_| -> forge_types::Result<HostExec> {
-        panic!("checkpoint ma zostać odrzucony ZANIM powstanie wykonawca")
-    });
-    let Err(err) = loaded else {
-        panic!("hybryda przeszła przez ścieżkę gęstą");
-    };
-    let why = format!("{err}");
-
-    // The first layer is DeltaNet, and the roles it carries are the ones this
-    // model does not read. Naming them is the whole point: "unsupported" alone
-    // would not say which milestone is missing.
-    for role in [
-        WeightRole::SsmInProj,
-        WeightRole::SsmConv1d,
-        WeightRole::SsmA,
-    ] {
-        assert!(why.contains(&format!("{role:?}")), "{why}");
+    if CudaDevice::free_vram(0).is_err() {
+        eprintln!("pomijam: brak urządzenia CUDA");
+        return;
     }
-    // The FIRST layer, and it is named. A refusal that pointed at layer 3 would
-    // mean the loader had walked past thirty recurrent blocks without noticing.
-    assert!(why.contains("warstwa 0:"), "{why}");
-    // The shared expert is refused in the same breath, and it is a separate
-    // milestone: it is a second feed-forward block on every token of every
-    // layer, including the ten this model already knows how to mix.
-    assert!(why.contains("FfnGateInpShExp"), "{why}");
+    let free = CudaDevice::free_vram(0).expect("wolna pamięć");
+    eprintln!("wolne VRAM: {:.1} GiB", free as f64 / (1u64 << 30) as f64);
+    let device = CudaDevice::new(
+        0,
+        PoolSizes {
+            weights: 24 << 30,
+            kv_cache: 1 << 30,
+            kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
+            activations: 2 << 30,
+        },
+    )
+    .expect("karta jest, a nie oddała pul");
+
+    let gguf = forge_formats::Gguf::open(&path).expect("otwarcie GGUF");
+    let vocab = forge_tokenize::gguf_vocab(&gguf).expect("słownik z GGUF");
+    let tok = forge_tokenize::Tokenizer::from_gguf_vocab(&vocab).expect("tokenizator");
+
+    let t = std::time::Instant::now();
+    let mut model = Dense::load(&path, |spec| CudaExec::new(device.clone() as Arc<_>, spec))
+        .expect("wczytanie hybrydy na CUDA");
+    eprintln!("wczytane w {:.1} s", t.elapsed().as_secs_f64());
+
+    let prompt = tok
+        .encode("The capital of France is", true)
+        .expect("tokenizacja");
+    let t = std::time::Instant::now();
+    let out = model.generate(0, &prompt, 20).expect("generacja");
+    let text = tok.decode(&out, true).expect("dekodowanie");
+    eprintln!(
+        "{} tokenów w {:.2} s: {text:?}",
+        out.len(),
+        t.elapsed().as_secs_f64()
+    );
+
+    assert!(
+        text.contains("Paris"),
+        "kontynuacja nie zna odpowiedzi: {text:?}"
+    );
+    assert!(
+        out.windows(4).any(|w| w.iter().any(|t| *t != w[0])),
+        "kontynuacja to jeden powtarzany token: {out:?}"
+    );
 }
 
-/// The role map is the contract between a checkpoint and this model, so the
-/// three things 4b still owes it are stated as a list rather than as a memory.
+/// The same forty layers, computed twice by executors sharing nothing below the
+/// contract.
 ///
-/// This runs without the checkpoint on purpose: it is the part of the
-/// description that does not depend on twenty gigabytes being present.
+/// This is the check the English continuation cannot make. A recurrent state
+/// that decays too fast, a convolution window that does not advance, an expert
+/// chosen one apart — all of them still produce sentences, and this checkpoint's
+/// greedy continuation of a factual prompt repeats itself either way.
+///
+/// Slow, and the slowness is thirty recurrent layers walked one token at a time
+/// in scalar f32 with every MXFP4 row decoded on demand. The prompt is as short
+/// as a prompt can be.
 #[test]
-fn the_hybrid_owes_three_things_to_the_role_map() {
-    let read: HashMap<WeightRole, ()> = forge_model::dense::required_roles()
-        .iter()
-        .chain(forge_model::dense::optional_roles())
-        .map(|r| (*r, ()))
-        .collect();
-    for role in [
-        // The shared expert — a second feed-forward block on every token.
-        WeightRole::FfnGateShExp,
-        WeightRole::FfnUpShExp,
-        WeightRole::FfnDownShExp,
-        WeightRole::FfnGateInpShExp,
-        // The recurrent mixer.
-        WeightRole::SsmInProj,
-        WeightRole::SsmConv1d,
-        WeightRole::SsmOut,
-    ] {
-        assert!(
-            !read.contains_key(&role),
-            "{role:?} jest już czytana, więc ta lista jest nieaktualna"
-        );
+#[ignore = "wymaga karty NVIDIA i checkpointu Qwen3.6-MoE; wzorzec liczy minutami na token"]
+fn the_hybrid_agrees_with_the_host_reference() {
+    let Some(path) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu Qwen3.6-MoE");
+        return;
+    };
+    if CudaDevice::free_vram(0).is_err() {
+        eprintln!("pomijam: brak urządzenia CUDA");
+        return;
     }
+    let device = CudaDevice::new(
+        0,
+        PoolSizes {
+            weights: 24 << 30,
+            kv_cache: 1 << 30,
+            kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
+            activations: 2 << 30,
+        },
+    )
+    .expect("karta jest, a nie oddała pul");
+
+    let mut gpu = Dense::load(&path, |spec| CudaExec::new(device.clone() as Arc<_>, spec))
+        .expect("wczytanie na CUDA");
+    let t = std::time::Instant::now();
+    let mut cpu = Dense::load(&path, HostExec::new).expect("wczytanie na wzorcu");
+    eprintln!("wzorzec wczytany w {:.1} s", t.elapsed().as_secs_f64());
+
+    let prompt = [785u32, 6722, 315, 9625, 374];
+    let t = std::time::Instant::now();
+    let gpu_first = gpu.prefill(0, &prompt).expect("prefill CUDA");
+    eprintln!("CUDA: prefill w {:.2} s", t.elapsed().as_secs_f64());
+    let t = std::time::Instant::now();
+    let cpu_first = cpu.prefill(0, &prompt).expect("prefill wzorca");
+    eprintln!("wzorzec: prefill w {:.1} s", t.elapsed().as_secs_f64());
+
+    let got = gpu.logits(0).expect("logity CUDA");
+    let want = cpu.logits(0).expect("logity wzorca");
+    let err = common::spread_error(&got, &want);
+    eprintln!(
+        "prefill: {:.3}% rozpiętości, argmax {} wobec {}",
+        err * 100.0,
+        common::top_k(&got, 1)[0],
+        common::top_k(&want, 1)[0]
+    );
+    assert_eq!(gpu_first, cpu_first, "prefill wybrał inny token");
+
+    // The step is what says the STATE agrees, not just the arithmetic of one
+    // token: it reads thirty state matrices the prefill left behind.
+    let feed = [Feed {
+        slot: 0,
+        token: gpu_first,
+    }];
+    gpu.decode(&feed).expect("krok CUDA");
+    cpu.decode(&feed).expect("krok wzorca");
+    let got = gpu.logits(0).expect("logity CUDA");
+    let want = cpu.logits(0).expect("logity wzorca");
+    let step_err = common::spread_error(&got, &want);
+    eprintln!(
+        "krok: {:.3}% rozpiętości, argmax {}",
+        step_err * 100.0,
+        common::top_k(&got, 1)[0]
+    );
+    assert_eq!(
+        common::top_k(&got, 1)[0],
+        common::top_k(&want, 1)[0],
+        "krok wybrał inny token"
+    );
+    assert!(err < 0.02, "prefill: {:.3}% rozpiętości", err * 100.0);
+    assert!(step_err < 0.02, "krok: {:.3}% rozpiętości", step_err * 100.0);
 }

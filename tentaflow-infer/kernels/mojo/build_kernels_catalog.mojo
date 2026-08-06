@@ -519,7 +519,7 @@ from src.decode_fused import (
 )
 from src.gemv2 import gemv_iq4_nl_f16_v2, gemv_iq4_nl_out_f32_v2
 from src.gemv2 import gemv_iq4_xs_f16_v2, gemv_iq4_xs_out_f32_v2
-from src.gemv2 import gemv_mxfp4_f16_v2, gemv_mxfp4_out_f32_v2
+from src.gemv2 import gemv_mxfp4_f16_v2, gemv_mxfp4_out_f32_v2, gemv_mxfp4_f16_gidx
 from src.gemm import gemm_iq4_nl_f16, gemm_iq4_nl_f16_bm64
 from src.gemm import gemm_iq4_xs_f16, gemm_iq4_xs_f16_bm64
 from src.gemm import gemm_mxfp4_gguf_f16, gemm_mxfp4_gguf_f16_bm64
@@ -3508,6 +3508,11 @@ def main() raises:
         gemv_mxfp4_out_f32_v2, dump_asm=Path("gemv_mxfp4_out_f32_v2.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_mxfp4_out_f32_v2"))
+
+    _ = ctx.compile_function[
+        gemv_mxfp4_f16_gidx, dump_asm=Path("gemv_mxfp4_f16_gidx.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemv_mxfp4_f16_gidx"))
 
     # arch: nvidia
     _ = ctx.compile_function[

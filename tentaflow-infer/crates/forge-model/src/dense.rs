@@ -21,8 +21,8 @@ use forge_formats::nvfp4::nvfp4_ct_to_gguf_blocks;
 use forge_formats::source::TensorSource;
 use forge_formats::WeightRole;
 use forge_graph::{
-    fuse::fuse, Act, ExecSpec, Executor, Lane, Layout, Op, PackedWeight, Planes, QuantWeight,
-    Shared, Step, Tile, WeightId, WeightStore,
+    fuse::fuse, Act, DeltaWeights, ExecSpec, Executor, Lane, Layout, Op, PackedWeight, Planes,
+    QuantWeight, Shared, SsmShape, Step, Tile, WeightId, WeightStore,
 };
 use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
@@ -54,6 +54,25 @@ pub struct Feed {
 /// Role wag jednej warstwy, po indeksie. Bez ani jednego bufora.
 struct LayerIds {
     attn_norm: WeightId,
+    mixer: Mixer,
+    ffn_norm: WeightId,
+    ffn: Ffn,
+}
+
+/// The two ways a layer mixes one token with the ones before it.
+///
+/// An enum for the same reason `Ffn` is one, and per layer for a stronger
+/// reason than symmetry: Qwen3.6 alternates them three to one, so "which mixer"
+/// is a property of the layer and there is no model-wide answer to give.
+enum Mixer {
+    /// Softmax attention over a paged cache.
+    Attention(Box<AttnIds>),
+    /// Linear attention over a recurrent state.
+    Delta(DeltaWeights),
+}
+
+/// The weights of one attention mixer.
+struct AttnIds {
     q: WeightId,
     /// The second half of a gated query projection: what attention returns is
     /// scaled by its sigmoid. `None` for every architecture whose attention
@@ -66,8 +85,6 @@ struct LayerIds {
     k_norm: Option<WeightId>,
     v: WeightId,
     o: WeightId,
-    ffn_norm: WeightId,
-    ffn: Ffn,
 }
 
 /// The two shapes a feed-forward block comes in.
@@ -195,8 +212,18 @@ impl<E: Executor + WeightStore> Dense<E> {
         let norm_name = &desc.globals[&WeightRole::OutputNorm];
         let norm_weights = src.fetch(norm_name)?.1;
 
+        // Head counts of the recurrent mixer are DERIVED, not stored: the group
+        // count is its key heads and the time-step rank its value heads, and
+        // both head widths are the state size.
+        let ssm = p.ssm.as_ref().map(|s| SsmShape {
+            d_conv: s.d_conv as u32,
+            d_state: s.d_state as u32,
+            k_heads: s.n_group as u32,
+            v_heads: s.dt_rank as u32,
+        });
         let mut exec = make(ExecSpec {
             shape,
+            ssm,
             quant_params,
             norm_weights,
         })?;
@@ -229,24 +256,50 @@ impl<E: Executor + WeightStore> Dense<E> {
         let mut layers = Vec::with_capacity(desc.layers.len());
         for l in &desc.layers {
             let name = |role: WeightRole| -> &str { l[&role].as_str() };
-            let (q, q_gate) = query(
-                &mut exec,
-                src,
-                name(WeightRole::AttnQ),
-                qw,
-                h,
-                rope,
-                p.attn_gated.then_some(shape.head_dim),
-            )?;
+            // Which mixer this layer has is answered by the weights it carries,
+            // not by its index. The interval that puts attention every fourth
+            // block is the checkpoint's business, and reading it here would be a
+            // second place for it to be stated wrongly.
+            let mixer = if l.contains_key(&WeightRole::SsmInProj) {
+                let g = ssm.ok_or_else(|| {
+                    ForgeError::Unsupported(
+                        "warstwa jest rekurencyjna, a checkpoint nie podał geometrii miksera".into(),
+                    )
+                })?;
+                Mixer::Delta(DeltaWeights {
+                    qkv: quant(&mut exec, src, name(WeightRole::SsmInProj), g.mixed_width(), h, None)?,
+                    gate: quant(&mut exec, src, name(WeightRole::SsmGate), g.value_width(), h, None)?,
+                    conv: plain(&mut exec, src, name(WeightRole::SsmConv1d))?,
+                    alpha: quant(&mut exec, src, name(WeightRole::SsmAlpha), g.v_heads, h, None)?,
+                    beta: quant(&mut exec, src, name(WeightRole::SsmBeta), g.v_heads, h, None)?,
+                    dt_bias: plain(&mut exec, src, name(WeightRole::SsmDt))?,
+                    a: plain(&mut exec, src, name(WeightRole::SsmA))?,
+                    norm: plain(&mut exec, src, name(WeightRole::SsmNorm))?,
+                    out: quant(&mut exec, src, name(WeightRole::SsmOut), h, g.value_width(), None)?,
+                })
+            } else {
+                let (q, q_gate) = query(
+                    &mut exec,
+                    src,
+                    name(WeightRole::AttnQ),
+                    qw,
+                    h,
+                    rope,
+                    p.attn_gated.then_some(shape.head_dim),
+                )?;
+                Mixer::Attention(Box::new(AttnIds {
+                    q,
+                    q_gate,
+                    k: quant(&mut exec, src, name(WeightRole::AttnK), kvw, h, rope)?,
+                    q_norm: optional(&mut exec, src, l, WeightRole::AttnQNorm)?,
+                    k_norm: optional(&mut exec, src, l, WeightRole::AttnKNorm)?,
+                    v: quant(&mut exec, src, name(WeightRole::AttnV), kvw, h, None)?,
+                    o: quant(&mut exec, src, name(WeightRole::AttnO), h, qw, None)?,
+                }))
+            };
             layers.push(LayerIds {
                 attn_norm: plain(&mut exec, src, name(WeightRole::AttnNorm))?,
-                q,
-                q_gate,
-                k: quant(&mut exec, src, name(WeightRole::AttnK), kvw, h, rope)?,
-                q_norm: optional(&mut exec, src, l, WeightRole::AttnQNorm)?,
-                k_norm: optional(&mut exec, src, l, WeightRole::AttnKNorm)?,
-                v: quant(&mut exec, src, name(WeightRole::AttnV), kvw, h, None)?,
-                o: quant(&mut exec, src, name(WeightRole::AttnO), h, qw, None)?,
+                mixer,
                 ffn_norm: plain(&mut exec, src, name(WeightRole::FfnNorm))?,
                 ffn: if l.contains_key(&WeightRole::FfnGateInp) {
                     let m = moe.ok_or_else(|| {
@@ -257,41 +310,13 @@ impl<E: Executor + WeightStore> Dense<E> {
                     })?;
                     let n = m.n_experts as u32;
                     Ffn::Moe {
-                        router: quant(
-                            &mut exec,
-                            src,
-                            name(WeightRole::FfnGateInp),
-                            n,
-                            h,
-                            None,
-                        )?,
+                        router: quant(&mut exec, src, name(WeightRole::FfnGateInp), n, h, None)?,
                         // The stacks arrive three-dimensional and are addressed
                         // as one flat row range per expert, which is how the
                         // kernels index them.
-                        gate: quant(
-                            &mut exec,
-                            src,
-                            name(WeightRole::FfnGateExps),
-                            n * inter,
-                            h,
-                            None,
-                        )?,
-                        up: quant(
-                            &mut exec,
-                            src,
-                            name(WeightRole::FfnUpExps),
-                            n * inter,
-                            h,
-                            None,
-                        )?,
-                        down: quant(
-                            &mut exec,
-                            src,
-                            name(WeightRole::FfnDownExps),
-                            n * h,
-                            inter,
-                            None,
-                        )?,
+                        gate: quant(&mut exec, src, name(WeightRole::FfnGateExps), n * inter, h, None)?,
+                        up: quant(&mut exec, src, name(WeightRole::FfnUpExps), n * inter, h, None)?,
+                        down: quant(&mut exec, src, name(WeightRole::FfnDownExps), n * h, inter, None)?,
                         experts: n,
                         top_k: m.n_experts_used as u32,
                         norm_topk: m.norm_topk_prob,
@@ -550,68 +575,85 @@ impl<E: Executor + WeightStore> Dense<E> {
             x,
             step: step.clone(),
         };
-        // Normy głowic wchodzą MIĘDZY projekcję a RoPE i tylko wtedy, gdy
-        // architektura je ma. Kolejność nie jest dowolna: RoPE obraca pary
-        // wymiarów głowicy, więc normalizacja po obrocie normalizowałaby liczby,
-        // które już niosą pozycję — nadal poprawnie wyglądające, i nadal złe.
-        let head_norms = [
-            l.q_norm.map(|w| (w, Act::Query, s.heads)),
-            l.k_norm.map(|w| (w, Act::Key, s.kv_heads)),
-        ];
-        let mut ops = vec![
-            Op::RmsNorm {
-                out: Act::Norm,
-                x: Act::Hidden,
-                w: l.attn_norm,
-                step: step.clone(),
-            },
-            at(l.q, Act::Query, Act::Norm),
-            at(l.k, Act::Key, Act::Norm),
-            at(l.v, Act::Value, Act::Norm),
-        ];
-        // The gate is a projection of the SAME normed input, so it is computed
-        // here and applied much later. It deliberately skips the head norm and
-        // the rotary below: those carry position into the query, and the gate
-        // is not a query.
-        ops.extend(l.q_gate.map(|w| at(w, Act::AttnGate, Act::Norm)));
-        ops.extend(head_norms.into_iter().flatten().map(|(w, act, heads)| {
-            Op::HeadNorm {
-                act,
-                w,
-                heads,
-                step: step.clone(),
-            }
-        }));
-        ops.extend([
-            Op::Rope {
-                act: Act::Query,
-                heads: s.heads,
-                step: step.clone(),
-            },
-            Op::Rope {
-                act: Act::Key,
-                heads: s.kv_heads,
-                step: step.clone(),
-            },
-            Op::KvAppend {
-                layer: index,
-                step: step.clone(),
-            },
-            Op::Attention {
-                layer: index,
-                step: step.clone(),
-            },
-        ]);
-        // AFTER attention and before the output projection. Applied earlier it
-        // would scale the query rather than the answer — still fluent, still
-        // another model.
-        ops.extend(l.q_gate.map(|_| Op::SigmoidMul {
-            act: Act::Attn,
-            gate: Act::AttnGate,
+        // Both mixers begin with the same normalization and end with the same
+        // projection sitting in `Proj`, so the feed-forward below does not know
+        // which one ran.
+        let mut ops = vec![Op::RmsNorm {
+            out: Act::Norm,
+            x: Act::Hidden,
+            w: l.attn_norm,
             step: step.clone(),
-        }));
+        }];
+        match &l.mixer {
+            Mixer::Attention(a) => {
+                ops.extend([
+                    at(a.q, Act::Query, Act::Norm),
+                    at(a.k, Act::Key, Act::Norm),
+                    at(a.v, Act::Value, Act::Norm),
+                ]);
+                // The gate is a projection of the SAME normed input, computed
+                // here and applied much later. It deliberately skips the head
+                // norm and the rotary: those carry position into the query, and
+                // the gate is not a query.
+                ops.extend(a.q_gate.map(|w| at(w, Act::AttnGate, Act::Norm)));
+                // Normy głowic wchodzą MIĘDZY projekcję a RoPE i tylko wtedy, gdy
+                // architektura je ma. Kolejność nie jest dowolna: RoPE obraca pary
+                // wymiarów głowicy, więc normalizacja po obrocie normalizowałaby
+                // liczby, które już niosą pozycję — nadal poprawnie wyglądające, i
+                // nadal złe.
+                let head_norms = [
+                    a.q_norm.map(|w| (w, Act::Query, s.heads)),
+                    a.k_norm.map(|w| (w, Act::Key, s.kv_heads)),
+                ];
+                ops.extend(head_norms.into_iter().flatten().map(|(w, act, heads)| {
+                    Op::HeadNorm {
+                        act,
+                        w,
+                        heads,
+                        step: step.clone(),
+                    }
+                }));
+                ops.extend([
+                    Op::Rope {
+                        act: Act::Query,
+                        heads: s.heads,
+                        step: step.clone(),
+                    },
+                    Op::Rope {
+                        act: Act::Key,
+                        heads: s.kv_heads,
+                        step: step.clone(),
+                    },
+                    Op::KvAppend {
+                        layer: index,
+                        step: step.clone(),
+                    },
+                    Op::Attention {
+                        layer: index,
+                        step: step.clone(),
+                    },
+                ]);
+                // AFTER attention and before the output projection. Applied
+                // earlier it would scale the query rather than the answer —
+                // still fluent, still another model.
+                ops.extend(a.q_gate.map(|_| Op::SigmoidMul {
+                    act: Act::Attn,
+                    gate: Act::AttnGate,
+                    step: step.clone(),
+                }));
+                ops.push(at(a.o, Act::Proj, Act::Attn));
+            }
+            // One operation, and it ends where the attention branch ends: a
+            // projection sitting in `Proj`, ready for the same residual add.
+            Mixer::Delta(w) => ops.push(Op::DeltaNet {
+                out: Act::Proj,
+                x: Act::Norm,
+                layer: index,
+                w: *w,
+                step: step.clone(),
+            }),
+        }
         ops.extend([
-            at(l.o, Act::Proj, Act::Attn),
             Op::Residual {
                 src: Act::Proj,
                 step: step.clone(),
@@ -937,7 +979,15 @@ fn check_roles(
         } else {
             DENSE_FFN_ROLES
         };
-        let wanted = || required_roles().iter().chain(ffn);
+        // And its token mixer is one of two, answered the same way: only a
+        // recurrent layer has an SSM in-projection. Asking per LAYER and not
+        // per model is the whole point — Qwen3.6 alternates them three to one.
+        let mixer = if layer.contains_key(&WeightRole::SsmInProj) {
+            DELTA_ROLES
+        } else {
+            ATTN_ROLES
+        };
+        let wanted = || required_roles().iter().chain(mixer).chain(ffn);
         let missing: Vec<_> = wanted()
             .filter(|role| !globals.contains_key(*role) && !layer.contains_key(*role))
             .collect();
@@ -948,7 +998,7 @@ fn check_roles(
         if missing.is_empty() && ignored.is_empty() {
             continue;
         }
-        let mut why = format!("warstwa {index}: architektura gęsta nie liczy tego checkpointu");
+        let mut why = format!("warstwa {index}: ten model nie liczy tego checkpointu");
         if !missing.is_empty() {
             why.push_str(&format!("; brakuje ról {missing:?}"));
         }
@@ -962,6 +1012,28 @@ fn check_roles(
     }
     Ok(())
 }
+
+/// The weights of a softmax-attention mixer.
+const ATTN_ROLES: &[WeightRole] = &[
+    WeightRole::AttnQ,
+    WeightRole::AttnK,
+    WeightRole::AttnV,
+    WeightRole::AttnO,
+];
+
+/// The weights of a recurrent mixer. The in-projection is what tells the two
+/// apart, so it is the role looked at first.
+const DELTA_ROLES: &[WeightRole] = &[
+    WeightRole::SsmInProj,
+    WeightRole::SsmGate,
+    WeightRole::SsmConv1d,
+    WeightRole::SsmAlpha,
+    WeightRole::SsmBeta,
+    WeightRole::SsmDt,
+    WeightRole::SsmA,
+    WeightRole::SsmNorm,
+    WeightRole::SsmOut,
+];
 
 /// The feed-forward roles of a dense block.
 const DENSE_FFN_ROLES: &[WeightRole] = &[
@@ -1005,10 +1077,6 @@ pub fn required_roles() -> &'static [WeightRole] {
         WeightRole::OutputNorm,
         WeightRole::LmHead,
         WeightRole::AttnNorm,
-        WeightRole::AttnQ,
-        WeightRole::AttnK,
-        WeightRole::AttnV,
-        WeightRole::AttnO,
         WeightRole::FfnNorm,
     ]
 }

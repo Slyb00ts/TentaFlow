@@ -1405,6 +1405,10 @@
       "entry": "src_decode_dp4a_gemv_mixed_dp46A6A6A6A_cc8b0c2c53265bbb",
       "file": "gemv_mixed_dp4a_group4_f16.ptx"
     },
+    "gemv_mxfp4_f16_gidx": {
+      "entry": "src_gemv2_gemv_mxfp4_f16_gidx6A6A6A6AoA_1a75e4d675f0c491",
+      "file": "gemv_mxfp4_f16_gidx.ptx"
+    },
     "gemv_mxfp4_f16_v2": {
       "entry": "src_gemv2_gemv_mxfp4_f16_v26A6A6A6AoA6A6A_1bffb3db4e9d331d",
       "file": "gemv_mxfp4_f16_v2.ptx"
@@ -1640,10 +1644,6 @@
     "gemv_nvfp4_gguf_f16_wave": {
       "entry": "src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_d5c794d0ed922682",
       "file": "gemv_nvfp4_gguf_f16_wave.ptx"
-    },
-    "gemv_nvfp4_gguf_out_f32": {
-      "entry": "src_nvfp4_gemv_nvfp4_gguf_out_6A6A6A6A_02571c71ee08c8f2",
-      "file": "gemv_nvfp4_gguf_out_f32.ptx"
     },
     "gemv_nvfp4_gguf_out_f32_wave": {
       "entry": "src_nvfp4_gemv_nvfp4_gguf_wave6A6A6A6A_339e8b90d4f4083d",

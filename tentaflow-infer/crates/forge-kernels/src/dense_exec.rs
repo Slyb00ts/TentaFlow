@@ -351,6 +351,7 @@ impl Executor for MetalExec {
             | Op::SiluMul { step }
             | Op::MoeFfn { step, .. }
             | Op::SigmoidMul { step, .. }
+            | Op::DeltaNet { step, .. }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
             | Op::Residual { step, .. }
@@ -423,6 +424,9 @@ impl Executor for MetalExec {
             // produce fluent, wrong text on the one machine nobody is testing.
             Op::SigmoidMul { .. } => Err(ForgeError::Unsupported(
                 "SigmoidMul: ścieżka Metalowa nie ma kernela bramki uwagi".into(),
+            )),
+            Op::DeltaNet { .. } => Err(ForgeError::Unsupported(
+                "DeltaNet: ścieżka Metalowa nie ma kerneli miksera rekurencyjnego".into(),
             )),
             Op::Rope { act, heads, .. } => self.op_rope(*act, *heads, pos, tokens),
             Op::KvAppend { layer, .. } => self.op_kv_append(*layer, pos, tokens),

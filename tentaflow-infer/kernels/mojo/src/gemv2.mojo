@@ -1429,6 +1429,34 @@ def gemv_mxfp4_f16_v2(
         y[row] = Float16(total)
 
 
+def gemv_mxfp4_f16_gidx(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    sel: Int,
+):
+    """Routed-MoE MXFP4 expert GEMV: identical math to gemv_mxfp4_f16_v2 but the
+    expert is chosen ON DEVICE from `ids[sel]` (no host readback).
+
+    `wtab[e]` is expert `e`'s own weight base pointer, so experts need not be
+    contiguous and each may sit in VRAM or pinned host memory independently.
+    Bit-identical to gemv_mxfp4_f16_v2 launched against that expert's block."""
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    _init_lut16(lut, MXFP4_VALS)
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if lrow >= n_rows:
+        return
+    w = wtab[Int(ids[sel])]
+    total = warp.sum(_gemv_mxfp4_row_acc(w, x, lut, n_cols, lrow, lane))
+    if lane == 0:
+        y[lrow] = Float16(total)
+
+
 def gemv_mxfp4_out_f32_v2(
     y: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],

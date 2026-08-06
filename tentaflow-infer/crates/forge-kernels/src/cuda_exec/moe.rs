@@ -106,6 +106,9 @@ impl CudaExec {
             QuantKind::Q6K => self
                 .kernels
                 .gemv_q6_k_f16_gidx(y, table, x, rows, w.cols, ids, sel, &self.stream),
+            QuantKind::MXFP4 => self
+                .kernels
+                .gemv_mxfp4_f16_gidx(y, table, x, rows, w.cols, ids, sel, &self.stream),
             other => Err(ForgeError::Unsupported(format!(
                 "{other:?}: stos ekspertów nie ma kernela adresowanego na urządzeniu"
             ))),

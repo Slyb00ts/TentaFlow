@@ -21,12 +21,15 @@
 // comparing against.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use half::{bf16, f16};
 
 use forge_formats::affine::AffineTriple;
 use forge_formats::dequant::dequantize_to_f32;
-use forge_graph::{Act, ExecSpec, Executor, Layout, Op, QuantWeight, Tile, WeightId, WeightStore};
+use forge_graph::{
+    Act, ExecSpec, Executor, Layout, Op, QuantWeight, SsmShape, Tile, WeightId, WeightStore,
+};
 use forge_types::{DType, DenseShape, ForgeError, QuantKind, Result};
 
 /// Tokens carried through the layers in one pass.
@@ -215,7 +218,12 @@ pub struct HostExec {
     /// for the same reason: nothing here is paged, so a slot IS its own run.
     kv: RefCell<Vec<Vec<(Vec<f32>, Vec<f32>)>>>,
     acts: RefCell<Slots>,
+    /// Convolution window and state matrix per (layer, slot). Grown on demand,
+    /// like the caches above and for the same reason: which layers are
+    /// recurrent is stated by the operations, not by the shape.
+    recurrent: RefCell<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>,
     shape: DenseShape,
+    ssm: Option<SsmShape>,
     quant_params: DType,
     norm_weights: DType,
 }
@@ -230,7 +238,9 @@ impl HostExec {
                     .collect(),
             ),
             acts: RefCell::new(Slots::new()),
+            recurrent: RefCell::new(HashMap::new()),
             shape: spec.shape,
+            ssm: spec.ssm,
             quant_params: spec.quant_params,
             norm_weights: spec.norm_weights,
         })
@@ -658,6 +668,137 @@ impl Executor for HostExec {
                 for i in 0..n {
                     let g = gate[i];
                     dst[i] = g / (1.0 + (-g).exp()) * up[i];
+                }
+                Ok(())
+            }
+
+            // The oracle for the recurrent mixer. Every piece of it is a
+            // function in `forge-formats::deltanet`, which is the SAME
+            // definition the Mojo kernels were written against — so this arm is
+            // composition, not a second derivation that could disagree.
+            Op::DeltaNet {
+                out,
+                x,
+                layer,
+                w,
+                step,
+            } => {
+                use forge_formats::deltanet as dn;
+                let ssm = self.ssm.ok_or_else(|| {
+                    ForgeError::Unsupported(
+                        "DeltaNet: wzorzec powstał bez geometrii miksera".into(),
+                    )
+                })?;
+                let hidden = s.hidden as usize;
+                let (key, value) = (ssm.key_width() as usize, ssm.value_width() as usize);
+                let (v_heads, d_state) = (ssm.v_heads as usize, ssm.d_state as usize);
+                let taps = ssm.d_conv as usize;
+                let k_heads = ssm.k_heads as usize;
+                let rows = step.rows() as usize;
+                let src = self.with(*x, <[f32]>::to_vec);
+                self.resize(*out, rows * hidden);
+
+                let project = |w: WeightId, n: usize, row: &[f32]| -> Result<Vec<f32>> {
+                    let m = self.quant(w)?;
+                    let mut scratch = vec![0.0f32; row.len()];
+                    (0..n)
+                        .map(|i| {
+                            m.row_into(i, &mut scratch)?;
+                            Ok(scratch.iter().zip(row).map(|(a, b)| a * b).sum())
+                        })
+                        .collect()
+                };
+                let conv_w = self.plain(w.conv)?;
+                let dt_bias = self.plain(w.dt_bias)?;
+                let a_scale = self.plain(w.a)?;
+                let norm_w = self.plain(w.norm)?;
+                let mixed_width = ssm.mixed_width() as usize;
+
+                let mut held = self.recurrent.borrow_mut();
+                let tokens = step.tokens() as usize;
+                for (lane, l) in step.lanes().iter().enumerate() {
+                    let carried = held.entry((*layer, l.slot as usize)).or_insert_with(|| {
+                        (
+                            vec![0.0f32; mixed_width * taps.saturating_sub(1)],
+                            vec![0.0f32; v_heads * d_state * d_state],
+                        )
+                    });
+                    // Position zero means the sequence starts here, so whatever
+                    // the previous occupant of this slot folded in is not its
+                    // history.
+                    if l.pos == 0 {
+                        carried.0.fill(0.0);
+                        carried.1.fill(0.0);
+                    }
+                    for t in 0..tokens {
+                        let row = &src[(lane * tokens + t) * hidden..][..hidden];
+                        let mixed = project(w.qkv, mixed_width, row)?;
+                        let z = project(w.gate, value, row)?;
+                        let alpha = project(w.alpha, v_heads, row)?;
+                        let beta_raw = project(w.beta, v_heads, row)?;
+
+                        // Causal convolution + SiLU, one channel at a time, the
+                        // window advancing behind it.
+                        let win = taps - 1;
+                        let mut convolved = vec![0.0f32; mixed_width];
+                        for c in 0..mixed_width {
+                            let window = &carried.0[c * win..(c + 1) * win];
+                            let taps_c = &conv_w[c * taps..(c + 1) * taps];
+                            convolved[c] = dn::silu(dn::causal_conv1d_step(window, mixed[c], taps_c));
+                        }
+                        for c in 0..mixed_width {
+                            let window = &mut carried.0[c * win..(c + 1) * win];
+                            dn::causal_conv1d_advance(window, mixed[c]);
+                        }
+
+                        // Query, key and value lie end to end; q and k are
+                        // normalized per KEY head and then repeated to cover the
+                        // value heads, which is what makes head h read key head
+                        // h % k_heads.
+                        let mut q = convolved[..key].to_vec();
+                        let mut k = convolved[key..2 * key].to_vec();
+                        let v = &convolved[2 * key..];
+                        for head in 0..k_heads {
+                            dn::l2_norm(&mut q[head * d_state..(head + 1) * d_state], s.eps);
+                            dn::l2_norm(&mut k[head * d_state..(head + 1) * d_state], s.eps);
+                        }
+
+                        let mut answer = vec![0.0f32; value];
+                        for head in 0..v_heads {
+                            let from = (head % k_heads) * d_state;
+                            let g = dn::delta_log_decay(alpha[head], dt_bias[head], a_scale[head]);
+                            let beta = 1.0 / (1.0 + (-beta_raw[head]).exp());
+                            let matrix =
+                                &mut carried.1[head * d_state * d_state..][..d_state * d_state];
+                            dn::gated_delta_step(
+                                matrix,
+                                d_state,
+                                &q[from..from + d_state],
+                                &k[from..from + d_state],
+                                &v[head * d_state..(head + 1) * d_state],
+                                g,
+                                beta,
+                                &mut answer[head * d_state..(head + 1) * d_state],
+                            );
+                        }
+
+                        let mut normed = vec![0.0f32; value];
+                        for head in 0..v_heads {
+                            let span = head * d_state..(head + 1) * d_state;
+                            dn::gated_rmsnorm(
+                                &answer[span.clone()],
+                                &z[span.clone()],
+                                norm_w,
+                                s.eps,
+                                &mut normed[span],
+                            );
+                        }
+                        let projected = project(w.out, hidden, &normed)?;
+                        let mut acts = self.acts.borrow_mut();
+                        let dst = &mut acts.by[slot(*out)];
+                        let base = (lane * tokens + t) * hidden;
+                        dst[base..base + hidden].copy_from_slice(&projected);
+                    }
                 }
                 Ok(())
             }

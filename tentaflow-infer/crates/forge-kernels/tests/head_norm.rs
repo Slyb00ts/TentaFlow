@@ -58,6 +58,7 @@ fn spec() -> ExecSpec {
         // GGUF keeps normalization weights in f32 while the kernels read f16,
         // so this is the conversion the real path takes.
         norm_weights: DType::F32,
+        ssm: None,
     }
 }
 

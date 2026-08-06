@@ -236,25 +236,102 @@ da się spełnić przez przypadek.
 ## 4. Kamień milowy 4b — hybryda, i gdzie mieszka jej stan
 
 `DeltaNet` niesie stan między krokami, więc pierwsze pytanie nie brzmi „jaka
-operacja", tylko **gdzie ten stan leży**.
+operacja", tylko **gdzie ten stan leży**. Odpowiedź wskazał precedens: obok KV,
+w `forge-state` (`recurrent.rs`). Powód nie jest estetyczny — spekulacja musi
+umieć ten stan zacheckpointować i wycofać, a stan schowany w wykonawcy jest
+stanem, do którego krok 5 nie ma jak sięgnąć.
 
-Odpowiedź jest już wskazana precedensem: obok KV, w `forge-state`. Powód nie jest
-estetyczny — spekulacja musi umieć ten stan zacheckpointować i wycofać (silnik
-robi to dziś przez `deltanet_commit_checkpoint_segmented_f32` i
-`deltanet_commit_recompute_segmented_shared_d128_f32`), a `forge-state` jest już
-tym miejscem, gdzie mieszka stan sekwencji dzielony przez obie ścieżki. Stan
-rekurencyjny w wykonawcy oznaczałby, że krok 5 (spekulacja jako pass) nie ma go
-jak cofnąć bez zaglądania do wykonawcy.
+### 4a. Czego ten checkpoint naprawdę wymaga — odczytane, nie założone
 
-Kernele DeltaNet są liczne i dojrzałe (ponad dwadzieścia wariantów w
-`launchers/deltanet.rs`, z persistent scan i układem `ValueKey`), więc tu również
-nie chodzi o pisanie matematyki.
+`FreedomAISVR/Qwen3.6-35B-A3B-MXFP4-MOE-Fast-GGUF`, 20,26 GiB:
 
-**Ostrzeżenie z pomiaru, nie z przeczucia:** wzorzec hostowy dla DeltaNet będzie
-BARDZO wolny — skan rekurencyjny w f32 po tokenie. Prefill 626 tokenów wzorcem
-gęstym kosztuje dziś 24 sekundy; skan rekurencyjny nie zrównolegli się tak jak
-mnożenie. Bramka 4b musi być zaprojektowana na krótkie sekwencje od początku,
-zamiast odkryć to po napisaniu.
+```
+general.architecture = qwen35moe    block_count = 41 (40 + 1 głowa MTP)
+embedding_length = 2048             full_attention_interval = 4
+head_count = 16, head_count_kv = 2  expert_count = 256, used = 8
+key_length = 256                    expert_ff_length = 512, shared = 512
+rope.dimension_sections=[11,11,10,0] ssm: conv 4, state 128, group 16, rank 32
+
+blk.0.attn_qkv.weight      [2048, 8192]      Q8_0    (DeltaNet: q|k|v)
+blk.3.attn_q.weight        [2048, 8192]      Q8_0    (uwaga: q|bramka na głowicę)
+blk.0.ffn_gate_exps.weight [2048, 512, 256]  MXFP4
+blk.0.ffn_gate_inp_shexp.weight [2048]       F32     (bramka sigmoid per token)
+```
+
+**Pięć rzeczy naraz**, więc kamień rozpadł się na cztery, każdy z własną bramką:
+
+- **4b-0: checkpoint w ogóle się otwiera. ZROBIONE.** Deskryptor ODRZUCAŁ każdą
+  hybrydę MoE niosącą głowę spekulacji, komunikatem o natywnym MTP JEDNEGO
+  runtime'u. Ta odmowa stała przed całym plikiem, więc czterdzieści warstw
+  trunku było ubocznym łupem, a `build_moe_mtp` tuż pod nią było martwym kodem,
+  do którego żaden test nie mógł dojść. Przeniesiona tam, gdzie ten runtime
+  naprawdę składa głowę.
+- **4b-1: ekspert współdzielony. ZROBIONE.** Wchodzi DO `Op::MoeFfn`, nie obok:
+  to jeden blok i jeden akumulator. Jego bramka jest WYMAGANA, a nie opcjonalna —
+  brak bramki znaczy wagę 1,0, co jest innym modelem, a `Option` zlałby oba
+  zdania w jedno. Szerokość bierze z własnych stosów, nie z `inter`. Zmierzone:
+  wzorzec 0,000%, CUDA 0,242%, bramka 0,267.
+- **4b-2: bramkowana uwaga i częściowe RoPE. ZROBIONE.** Projekcja Q leży w
+  pliku podwójnie szeroka, PRZEPLECIONA PER GŁOWICĘ; podział na dwie wagi robi
+  `forge-formats` przy wczytaniu, więc słownictwo dostaje dwie zwykłe macierze
+  zamiast operacji od rozbierania tensora. Bramka nakłada się PO uwadze
+  (`Op::SigmoidMul`), bo wcześniej skalowałaby pytanie zamiast odpowiedzi. Obrót
+  bierze 64 z 256 wymiarów i paruje `j` z `j + rot/2` — inny kernel, nie ten sam
+  zatrzymany wcześniej — a `rope_rot` mieszka w KSZTAŁCIE, żeby zapytanie i jego
+  klucz nie mogły obrócić się o różne kąty.
+- **4b-3: sam DeltaNet. ZROBIONE.** `Op::DeltaNet` jedną operacją, bo granica
+  operacji ma leżeć tam, gdzie granica STANU: jedno wywołanie to jedno
+  posunięcie okna splotu i macierzy, czyli dokładnie ta jednostka, którą
+  spekulacja będzie cofać. Projekcje są bezstanowe i liczą się dla wszystkich
+  wierszy kroku naraz; tylko zwijanie idzie token po tokenie, bo rekurencji nie
+  da się poszerzyć.
+
+  Rzeczy, których karta nie przewidziała:
+
+  - **Stos ekspertów MXFP4 nie miał kernela `_gidx`.** Istniały tylko Q4_K i
+    Q6_K — akurat te dwa, których używa Qwen3-30B. Checkpoint wczytywał się w
+    całości (20 GiB, 24 s) i zatrzymywał na PIERWSZYM routowanym mnożeniu. To
+    jest wynik warty zapisania: „kernele istnieją w komplecie" było prawdą dla
+    4a i nie było dla 4b. Dopisany `gemv_mxfp4_f16_gidx` to dwunastowierszowa
+    nakładka na istniejący akumulator wiersza — nowa jest ADRESACJA, nie
+    matematyka.
+  - **Zerowanie stanu wynika z KROKU, a nie z osobnego sygnału.** Lane
+    zaczynający od pozycji zero jest sekwencją, która zaczyna się tutaj — ten
+    sam sygnał, którym stronicowany cache nadpisuje od przodu. Osobne wywołanie
+    „wyczyść" dałoby się zapomnieć, a slot z połową cudzej rozmowy zwiniętą w
+    macierzy mówi płynnie.
+  - **Wagi zwykłe idą kontraktem `norm_weights`, nie f16.** Splot, `dt_bias`,
+    `a` i norma wyjścia to wektory f32 źródła; podanie ich jako połówek każe je
+    czytać parami jako pojedyncze liczby. Pierwsza wersja bramki padła na tym
+    właśnie, we własnej fiksturze.
+  - **Nowy slot aktywacji kosztuje pulę, a nie tylko pamięć.** `format_table`
+    trzyma po jednym wykonawcy na każdy z dwudziestu dwóch formatów naraz, więc
+    urósł mu budżet o liczbę SLOTÓW, nie o pracę.
+
+Bramka DeltaNet jest hermetyczna i sprawdza trzy osobne rzeczy: zgodność z
+formułą wypisaną w teście (nie przez `forge-formats::deltanet`, bo to jest to,
+co składa wzorzec — nieprzetestowana byłaby wtedy KOLEJNOŚĆ), zależność drugiego
+tokenu od pierwszego, i to, że restart od pozycji zero odtwarza wynik co do bitu.
+
+### 4b. Wynik, i ostrzeżenie, które się NIE sprawdziło
+
+Qwen3.6-35B-A3B wczytuje się w 9,7 s i kontynuuje „The capital of France is"
+poprawnie, 20 tokenów w 1,11 s. Wobec wzorca hostowego: **0,356% rozpiętości w
+prefillu i 0,178% w kroku, ten sam token po obu stronach.** Krok liczy się
+osobno od prefillu właśnie dlatego, że czyta trzydzieści macierzy stanu, które
+prefill zostawił — sama arytmetyka jednego tokenu tego nie sprawdza.
+
+Karta ostrzegała, że wzorzec dla DeltaNet będzie BARDZO wolny, bo skan
+rekurencyjny nie zrównolegli się jak mnożenie. **Zmierzone: 11,9 s na pięć
+tokenów**, czyli o połowę SZYBCIEJ niż gęsty Bielik 7B na sześciu (24,9 s).
+Przewidywanie było oparte na złej wielkości. Rekurencja nie jest kosztem: jej
+stan ma stały rozmiar, więc token kosztuje tyle samo na pozycji 5 co na 5000,
+podczas gdy uwaga czyta cały kontekst. Kosztem są PROJEKCJE — a tych mieszanka
+aktywuje 3B na token, mniej niż Bielik ma gęsto.
+
+To jest powód, żeby bramkę porównawczą trzymać krótką z innego powodu niż
+zakładany: nie dlatego, że dłuższa nie zdąży, tylko dlatego, że dłuższa niczego
+by nie dodała.
 
 ## 5. Rzeczy, które w tych dwóch rodzinach już raz kosztowały płynny, zły tekst
 

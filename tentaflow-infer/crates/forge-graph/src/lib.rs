@@ -165,6 +165,63 @@ pub struct Shared {
     pub router: WeightId,
 }
 
+/// The geometry of a recurrent mixer, for the executors that must size its
+/// state before they see a single operation.
+///
+/// Separate from `DenseShape` rather than folded into it: these numbers exist
+/// only for a hybrid stack, and a dense model that carried them could state a
+/// state matrix nothing keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsmShape {
+    /// Width of the causal convolution.
+    pub d_conv: u32,
+    /// Head width, and both dimensions of the state matrix.
+    pub d_state: u32,
+    /// Key/query heads. FEWER than value heads — the recurrence indexes by
+    /// value head, so keys are repeated to cover them.
+    pub k_heads: u32,
+    pub v_heads: u32,
+}
+
+impl SsmShape {
+    pub fn key_width(&self) -> u32 {
+        self.k_heads * self.d_state
+    }
+
+    pub fn value_width(&self) -> u32 {
+        self.v_heads * self.d_state
+    }
+
+    /// Query, key and value laid end to end — what the in-projection produces
+    /// and the convolution runs over.
+    pub fn mixed_width(&self) -> u32 {
+        2 * self.key_width() + self.value_width()
+    }
+}
+
+/// Everything one Gated-DeltaNet layer multiplies by.
+///
+/// Nine weights in a struct rather than nine fields on the operation, for the
+/// same reason `Shared` is one: they are one layer's worth and travel together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaWeights {
+    /// In-projection producing query, key and value in one row.
+    pub qkv: WeightId,
+    /// The output gate `z`, as wide as the value stream.
+    pub gate: WeightId,
+    /// Depthwise convolution taps, one set per channel.
+    pub conv: WeightId,
+    /// Per-head projections feeding the decay and the write gate.
+    pub alpha: WeightId,
+    pub beta: WeightId,
+    /// Loaded vectors, one number per value head.
+    pub dt_bias: WeightId,
+    pub a: WeightId,
+    /// Weight of the gated normalization on the way out.
+    pub norm: WeightId,
+    pub out: WeightId,
+}
+
 /// Jedna operacja architektury gęstej.
 ///
 /// Celowo wąskie i celowo nieogólne: to słownictwo JEDNEJ rodziny architektur,
@@ -288,6 +345,28 @@ pub enum Op {
         x: Act,
         step: Step,
     },
+    /// A whole Gated-DeltaNet layer as one operation: the in-projection, the
+    /// causal convolution, the per-head normalizations, the recurrence that
+    /// advances this sequence's state, the gated normalization and the output
+    /// projection.
+    ///
+    /// ONE operation for the same reason `Attention` is one, and then some.
+    /// Everything between the two projections is STATE — a convolution window
+    /// and a matrix that has absorbed the whole sequence — so the operation
+    /// boundary is put where the state boundary is: one operation is one
+    /// advance of that state, which is the unit speculation will have to undo.
+    /// Split into pieces it would need four activation slots that exist for one
+    /// architecture, and a rollback with no single thing to roll back.
+    ///
+    /// `layer` names the state, exactly as it names the pages for `Attention`.
+    /// Where that state physically sits is `forge-state`'s answer.
+    DeltaNet {
+        out: Act,
+        x: Act,
+        layer: usize,
+        w: DeltaWeights,
+        step: Step,
+    },
     /// Projection followed by adding its result to the hidden stream.
     FusedMatMulResidual {
         w: WeightId,
@@ -367,6 +446,9 @@ pub struct Tile {
 #[derive(Debug, Clone, Copy)]
 pub struct ExecSpec {
     pub shape: DenseShape,
+    /// The recurrent mixer's geometry, for a hybrid stack. `None` for every
+    /// model whose layers all mix with attention.
+    pub ssm: Option<SsmShape>,
     /// Typ, w którym leżą skale i przesunięcia kwantyzacji.
     pub quant_params: DType,
     /// Typ wag normalizacji.

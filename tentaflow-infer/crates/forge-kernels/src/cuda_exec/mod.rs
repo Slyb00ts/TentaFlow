@@ -27,14 +27,16 @@ use half::f16;
 
 use forge_formats::FfnActivation;
 use forge_graph::{
-    Act, ExecSpec, Executor, Layout, Op, QuantWeight, Step, Tile, WeightId, WeightStore,
+    Act, ExecSpec, Executor, Layout, Op, QuantWeight, SsmShape, Step, Tile, WeightId, WeightStore,
 };
 use forge_hal::{DevBuffer, Device, Pool, Stream};
 use forge_state::kv::{KvCache, KvConfig, KvQuant, SeqKv};
+use forge_state::recurrent::{RecurrentConfig, RecurrentState};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
 use crate::launchers::{Kernels, SAMPLE_SCRATCH_PAIRS};
 
+mod delta;
 mod formats;
 mod moe;
 
@@ -161,6 +163,14 @@ pub struct CudaExec {
     moe: RefCell<Option<MoeScratch>>,
     /// Per-expert base addresses, one table per stack, built on first use.
     expert_tables: RefCell<HashMap<u32, DevBuffer>>,
+    /// Scratch a recurrent layer needs, made on first demand and shared by all
+    /// of them — nothing in it survives the operation.
+    delta: RefCell<Option<delta::DeltaScratch>>,
+    /// The convolution windows and state matrices of every recurrent layer,
+    /// held by the same crate that holds the pages.
+    recurrent: RefCell<RecurrentState>,
+    /// Geometry of the recurrent mixer, when this model has one.
+    ssm: Option<SsmShape>,
     kv: RefCell<KvCache>,
     /// One slot's page table and length, owned by the shared cache's types.
     seqs: RefCell<Vec<SeqKv>>,
@@ -250,6 +260,16 @@ impl CudaExec {
         };
         let kv = KvCache::new(&*device, cfg)?;
         let seqs = (0..MAX_LANES).map(|_| kv.new_seq()).collect();
+        // Sized even for a model with no recurrent layer, because the config is
+        // the only thing allocated here — the slabs arrive layer by layer, as
+        // the operations that need them do.
+        let recurrent = RecurrentState::new(RecurrentConfig {
+            slots: MAX_LANES as usize,
+            conv_channels: spec.ssm.map(|s| s.mixed_width() as usize).unwrap_or(1),
+            conv_taps: spec.ssm.map(|s| s.d_conv as usize).unwrap_or(2),
+            v_heads: spec.ssm.map(|s| s.v_heads as usize).unwrap_or(1),
+            d_state: spec.ssm.map(|s| s.d_state as usize).unwrap_or(1),
+        })?;
 
         Ok(Self {
             device,
@@ -258,6 +278,9 @@ impl CudaExec {
             weights: Vec::new(),
             moe: RefCell::new(None),
             expert_tables: RefCell::new(HashMap::new()),
+            delta: RefCell::new(None),
+            recurrent: RefCell::new(recurrent),
+            ssm: spec.ssm,
             kv: RefCell::new(kv),
             seqs: RefCell::new(seqs),
             scratch,
@@ -422,6 +445,7 @@ impl Executor for CudaExec {
             | Op::Attention { step, .. }
             | Op::SiluMul { step }
             | Op::SigmoidMul { step, .. }
+            | Op::DeltaNet { step, .. }
             | Op::MoeFfn { step, .. }
             | Op::FusedNormMatMul { step, .. }
             | Op::FusedMatMulResidual { step, .. }
@@ -527,6 +551,9 @@ impl Executor for CudaExec {
                 shared.as_ref(),
                 step,
             ),
+            Op::DeltaNet {
+                out, x, layer, w, ..
+            } => self.op_delta_net(*out, *x, *layer, w, step),
             Op::Residual { src, .. } => {
                 self.kernels.residual_add_f16(
                     &self.scratch.h,
