@@ -242,3 +242,107 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 }
+
+/// Tokeny na kafel wariantow zgrupowanych, od najszerszego.
+const GROUPED_TILE: [(&str, usize, u32); 2] = [
+    ("gemm_mxf4_grouped_f16_bm128_bn32", 32, 128),
+    ("gemm_mxf4_grouped_f16_bm128_bn16", 16, 128),
+];
+
+/// Wierszy wyjscia na blok obu wariantow zgrupowanych.
+const GROUPED_ROWS: usize = 128;
+
+impl Kernels {
+    /// Czy stos ekspertow MXFP4 da sie mnozyc na jednostce macierzowej.
+    pub fn supports_mxf4_grouped(&self) -> bool {
+        self.supports_mxf4_block_scale()
+            && self.artifacts.has("quantize_act_mxf4")
+            && GROUPED_TILE
+                .iter()
+                .any(|(name, ..)| self.artifacts.has(name))
+    }
+
+    /// Kwantyzuje aktywacje do postaci MXFP4, w ukladzie `pack_mxfp4_mma`.
+    pub fn quantize_act_mxf4(
+        &self,
+        xq: &DevBuffer,
+        xs: &DevBuffer,
+        x: &DevBuffer,
+        cols: usize,
+        tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if cols == 0 || !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "quantize_act_mxf4 wymaga cols % 64 == 0, otrzymano {cols}"
+            )));
+        }
+        if xq.len() < tokens * cols / 64 * 36 || xs.len() < tokens * 4 {
+            return Err(ForgeError::Kernel(
+                "quantize_act_mxf4: bufor wyjsciowy jest za maly".into(),
+            ));
+        }
+        let k = self.artifacts.get("quantize_act_mxf4")?;
+        let cfg = LaunchConfig {
+            grid: (u32::try_from(tokens).unwrap_or(u32::MAX), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new().buf(xq).buf(xs).buf(x).scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Wszyscy eksperci MXFP4 kroku w JEDNYM uruchomieniu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mxf4_grouped(
+        &self,
+        y: &DevBuffer,
+        table: &DevBuffer,
+        xq: &DevBuffer,
+        xs: &DevBuffer,
+        tiles: crate::launchers::moe::GroupedTiles<'_>,
+        rows: usize,
+        cols: usize,
+        selections: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols < 64 || !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_mxf4_grouped wymaga cols % 64 == 0, otrzymano rows={rows}, cols={cols}"
+            )));
+        }
+        // Kafel szerszy w tokenach liczylby zera: przy 256 ekspertach na
+        // jednego przypada kilkanascie wierszy, a `GROUPED_TILE_ROWS` jest
+        // gorna granica, nie srednia.
+        let (name, _, threads) = GROUPED_TILE
+            .iter()
+            .copied()
+            .find(|(name, tokens, _)| {
+                crate::launchers::moe::GROUPED_TILE_ROWS >= *tokens && self.artifacts.has(name)
+            })
+            .unwrap_or(GROUPED_TILE[1]);
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (
+                u32::try_from(rows.div_ceil(GROUPED_ROWS)).unwrap_or(u32::MAX),
+                u32::try_from(tiles.count).unwrap_or(u32::MAX),
+                1,
+            ),
+            block: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(table)
+            .buf(xq)
+            .buf(xs)
+            .buf(tiles.expert)
+            .buf(tiles.first)
+            .buf(tiles.end)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(selections as i64)
+            .scalar(1.0f32);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+}

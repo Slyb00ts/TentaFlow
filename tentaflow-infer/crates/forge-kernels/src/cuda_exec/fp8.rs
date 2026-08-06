@@ -78,7 +78,10 @@ impl CudaExec {
             slot.insert(None);
             return Ok(false);
         };
-        let Ok(scales) = self.device.alloc(w.rows * 4, MemKind::Device, Pool::Weights) else {
+        let Ok(scales) = self
+            .device
+            .alloc(w.rows * 4, MemKind::Device, Pool::Weights)
+        else {
             slot.insert(None);
             return Ok(false);
         };

@@ -620,11 +620,16 @@ from src.sampling import (
 )
 from src.sampling import penalize_histogram_f32, penalized_argmax_f32
 from src.gemm_fp4 import (
+    gemm_mxf4_grouped_f16_bm128_bn16,
+    gemm_mxf4_grouped_f16_bm128_bn32,
     gemm_nvfp4_mma_f16_bm64_bn64,
     gemm_nvfp4_mma_f16_bm128_bn128,
     gemm_nvfp4_mma_f16_bm128_bn256,
 )
-from src.quant_fp4 import quantize_act_nvfp4
+from src.quant_fp4 import (
+    quantize_act_mxf4,
+    quantize_act_nvfp4,
+)
 from src.mma_fp4 import (
     mma_mxf4_probe,
     mma_nvf4_probe,
@@ -3238,6 +3243,21 @@ def main() raises:
         gemm_nvfp4_mma_f16_bm128_bn256, dump_asm=Path("gemm_nvfp4_mma_f16_bm128_bn256.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_nvfp4_mma_f16_bm128_bn256"))
+
+    _ = ctx.compile_function[
+        quantize_act_mxf4, dump_asm=Path("quantize_act_mxf4.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "quantize_act_mxf4"))
+
+    _ = ctx.compile_function[
+        gemm_mxf4_grouped_f16_bm128_bn16, dump_asm=Path("gemm_mxf4_grouped_f16_bm128_bn16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_mxf4_grouped_f16_bm128_bn16"))
+
+    _ = ctx.compile_function[
+        gemm_mxf4_grouped_f16_bm128_bn32, dump_asm=Path("gemm_mxf4_grouped_f16_bm128_bn32.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_mxf4_grouped_f16_bm128_bn32"))
 
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_f16_gidx_batch,

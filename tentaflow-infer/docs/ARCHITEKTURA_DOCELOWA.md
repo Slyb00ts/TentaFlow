@@ -618,3 +618,54 @@ się osobno i mylenie ich jest tu najłatwiejszym błędem: pierwsza jest własn
 FORMATU i nie zmniejszy jej lepszy kafel. Ile z niej zostaje na prawdziwym
 checkpoincie — tak jak przy e4m3, gdzie 3-5% na danych syntetycznych zeszło do
 0,56% na Bieliku — jest osobnym pomiarem i warunkiem wpięcia tej ścieżki w model.
+
+### Mieszanka MXFP4: 94% promptu szło w osiem bloków na uruchomienie
+
+Prefill hybrydy Qwen3.6-35B stał na 77,6 tok/s wobec 2609 llama.cpp i pierwsza
+hipoteza — sekwencyjna pętla po tokenach w DeltaNecie — była BŁĘDNA. Zwinięcie
+jej z ośmiu uruchomień na token do trzech na kawałek dało 72,5 -> 77,6, czyli
+siedem procent. Profil powiedział dlaczego: 94,1% czasu siedziało w
+`gemm_mxfp4_gguf`, w 43 206 uruchomieniach po 283 us.
+
+Ten model ma 256 ekspertów, 8 wybranych na token, 41 warstw. Mieszanka
+uruchamiała JEDEN GEMM NA EKSPERTA NA PROJEKCJĘ — 31 488 uruchomień na prompt,
+każde o siatce ośmiu bloków (512 wierszy wyjścia dzielone przez 64) na karcie o
+kilkudziesięciu multiprocesorach. Ekspert dostaje średnio szesnaście wierszy z
+512-tokenowego promptu, więc każde z tych uruchomień było i małe, i samotne.
+
+Wcześniejszy pomiar mówił, że kafel zgrupowany jest dla MXFP4 GORSZY (55,4 wobec
+77,6 tok/s), i to prawda — ale mierzył coś innego, niż się wydawało. Q4_K i Q8_0
+mają pod sobą CAŁKOWITOLICZBOWĄ JEDNOSTKĘ MACIERZOWĄ (`gemm_q4_k_i8mma_grouped`),
+a MXFP4 i Q6_K rozpakowują do f16 i liczą skalarnie. Porównywane były dwa
+kształty tego samego braku, a nie dwa kształty.
+
+MXFP4 to blokowo skalowane cztery bity, czyli dokładnie to, co je
+`mma...kind::mxf4`. Bajt skali GGML-a JEST bajtem `ue8m0` instrukcji
+(`_e8m0_half(e)` razy tablica MXFP4, która jest dwukrotnością e2m1, daje
+`2^(e-127)` razy e2m1), a kodowanie półbajtu jest identyczne z e2m1. Różni je
+WYŁĄCZNIE wyrównanie: 17 bajtów nie jest wielokrotnością słowa.
+
+Pierwsza wersja przepakowywała stos ekspertów do drugiej postaci wagi, jak
+ścieżka FP8 — 1011 tok/s, ale 17 GiB dodatkowej pamięci na 20-gigabajtowy model,
+czyli tyle, że testy odniesienia przestawały się mieścić. Składanie pary bloków
+w słowa fragmentu W TRAKCIE WPISYWANIA KAFLA DO PAMIĘCI WSPÓŁDZIELONEJ kosztuje
+8,7% przepustowości i ZERO pamięci: 923 tok/s przy tych samych pulach co
+poprzednio. To jest właściwa strona tego kompromisu.
+
+pp512 na Qwen3.6-35B: 77,6 -> 923,1 tok/s, czyli 11,9x. Q4_K (Qwen3-30B, 1487)
+i gęsty Q4_K (Bielik, 5126) nie zmieniły się, bo tamta ścieżka nie była ruszana.
+
+CENA JEST REALNA I TRZEBA JĄ NAZWAĆ. Instrukcja żąda czterech bitów PO OBU
+STRONACH, więc aktywacja ekspertów jest kwantyzowana do MXFP4, czego ścieżka f16
+nie robiła. Błąd logitów wobec wzorca f32 rośnie z 0,545% do 0,975% rozpiętości.
+Argmax i kolejność czołówki są zachowane, więc bramka przechodzi, ale margines
+jest mniejszy niż był. Sam kafel jest tu bez winy — w izolacji trzyma się 0,04%
+rozpiętości wobec arytmetyki hosta na tych samych kodach; to jest koszt FORMATU.
+
+Skala UE8M0 nie ma mantysy, więc zaokrąglenie wykładnika w górę marnuje do
+jednego bitu z dwóch, które ma e2m1, a w dół — przycina szczyt bloku do 6. Który
+kandydat jest lepszy, zależy od rozkładu w bloku, więc wybiera go błąd kwadratowy
+policzony dla obu. Bez tego wyboru rozpiętość wychodziła 0,806%, ale czwarte
+miejsce czołówki było ZAMIENIONE przy separacji pięciokrotnie większej od błędu —
+czyli liczba mniejsza, a wynik gorszy. To jest powód, dla którego bramką jest
+kolejność, a nie norma.

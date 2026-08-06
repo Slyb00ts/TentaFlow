@@ -721,6 +721,14 @@
       "entry": "src_gemm_gemm_iq4_lut_impl_S6A6A6A6AcB6A6A_447f93a6aa2d1ea5",
       "file": "gemm_iq4_xs_f16_bm64.ptx"
     },
+    "gemm_mxf4_grouped_f16_bm128_bn16": {
+      "entry": "src_gemm_fp4_gemm_mxf4_grouped6A6A6A6A_c414522126ded4d8",
+      "file": "gemm_mxf4_grouped_f16_bm128_bn16.ptx"
+    },
+    "gemm_mxf4_grouped_f16_bm128_bn32": {
+      "entry": "src_gemm_fp4_gemm_mxf4_grouped6A6A6A6A_9b1570cf62e8bdbf",
+      "file": "gemm_mxf4_grouped_f16_bm128_bn32.ptx"
+    },
     "gemm_mxfp4_gguf_f16": {
       "entry": "src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_4db4a9fb501fa2d5",
       "file": "gemm_mxfp4_gguf_f16.ptx"
@@ -2252,6 +2260,10 @@
     "quantize_act_fp8": {
       "entry": "src_gemm_fp8_quantize_act_fp86A6A6A6AoA_28a0fbe0a97b60ab",
       "file": "quantize_act_fp8.ptx"
+    },
+    "quantize_act_mxf4": {
+      "entry": "src_quant_fp4_quantize_act_mxf6A6A6A6A_eeca3e355035a95e",
+      "file": "quantize_act_mxf4.ptx"
     },
     "quantize_act_nvfp4": {
       "entry": "src_quant_fp4_quantize_act_nvf6A6A6A6A_ece49050795502e4",

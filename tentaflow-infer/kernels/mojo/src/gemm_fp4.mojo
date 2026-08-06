@@ -18,7 +18,7 @@ from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import UnsafePointer, stack_allocation
 
-from src.mma_fp4 import _mma_nvf4
+from src.mma_fp4 import _mma_mxf4, _mma_nvf4
 
 comptime BLOCK_VALUES = 64
 """Wartości w bloku GGUF NVFP4 — i `k` jednej instrukcji."""
@@ -26,25 +26,62 @@ comptime BLOCK_VALUES = 64
 comptime BLOCK_WORDS = 9
 """36 bajtów bloku jako słowa 32-bitowe: jedno skal, osiem ładunku."""
 
+comptime MXFP4_BYTES = 17
+"""Blok GGUF MXFP4: bajt skali E8M0 i szesnaście bajtów par e2m1."""
 
-def gemm_nvfp4_mma_impl[
-    WARPS_ROW: Int, WARPS_TOK: Int, MT: Int, NT: Int, KSTEP: Int
+
+@always_inline
+def _mxfp4_word(
+    src: UnsafePointer[UInt8, MutAnyOrigin], row_base: Int, blk: Int, word: Int
+) -> UInt32:
+    """Słowo `word` bloku fragmentu, ZŁOŻONE Z BLOKÓW GGUF MXFP4 W LOCIE.
+
+    Blok MXFP4 ma 17 bajtów, więc nie da się go podać jednostce macierzowej tam,
+    gdzie leży — ale jego BAJTY są już właściwymi bajtami, bo bajt skali GGML-a
+    jest bajtem `ue8m0` instrukcji, a kodowanie półbajtu jest identyczne z e2m1.
+    Zmienia się wyłącznie wyrównanie, więc para bloków składa się tutaj, przy
+    wpisywaniu kafla do pamięci współdzielonej, zamiast w drugiej kopii wagi na
+    całą kartę: dla 27B ta kopia to 17 GiB.
+    """
+    lo = src + row_base + 2 * blk * MXFP4_BYTES
+    if word == 0:
+        return UInt32(lo[0]) | (UInt32(lo[MXFP4_BYTES]) << 8)
+    half = (word - 1) // 4
+    b = lo + half * MXFP4_BYTES + 1 + 4 * ((word - 1) % 4)
+    v = b.load[width=4, alignment=1]()
+    return (
+        UInt32(v[0])
+        | (UInt32(v[1]) << 8)
+        | (UInt32(v[2]) << 16)
+        | (UInt32(v[3]) << 24)
+    )
+
+
+def _gemm_fp4_tile[
+    WARPS_ROW: Int, WARPS_TOK: Int, MT: Int, NT: Int, KSTEP: Int, NVF4: Int
 ](
     y: UnsafePointer[Float16, MutAnyOrigin],
-    weights: UnsafePointer[UInt32, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[UInt32, MutAnyOrigin],
     x_scale: UnsafePointer[Float32, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
     n_tokens: Int,
+    base_row: Int,
+    base_tok: Int,
+    tok_end: Int,
     output_scale: Float32,
 ):
     """`y[t, r] = dot(w[r], x[t]) * output_scale * x_scale[t]`, oba operandy FP4.
 
-    Siatka `(ceil(n_rows / BROWS), ceil(n_tokens / BTOK))`, blok
-    `WARPS_ROW * WARPS_TOK * 32` wątków, `n_cols % 64 == 0`. Układ wyjścia jest
-    ten sam co w rodzinie WMMA — `[token, row]` — więc wywołujący nie widzi,
-    którym kernelem policzono.
+    `NVF4` wybiera skale per 16 w E4M3 (`NVFP4Gguf`) albo per 32 w UE8M0
+    (`MXFP4`). To JEDYNA różnica między tymi dwoma formatami w tym kaflu: blok
+    36-bajtowy, adresowanie i miejsce słowa skali są wspólne, bo obie postaci
+    zostały do tego samego fragmentu przepakowane.
+
+    `base_row`, `base_tok` i `tok_end` przychodzą z zewnątrz, żeby ten sam kafel
+    obsłużył pojedynczy GEMM i wariant zgrupowany, w którym o tych trzech
+    liczbach decyduje tablica kafli ekspertów, a nie siatka.
     """
     comptime BROWS = WARPS_ROW * MT * 16
     comptime BTOK = WARPS_TOK * NT * 8
@@ -61,8 +98,6 @@ def gemm_nvfp4_mma_impl[
     quad = lane // 4
     in_quad = lane % 4
 
-    base_row = Int(block_idx.x) * BROWS
-    base_tok = Int(block_idx.y) * BTOK
     warp_row = (warp // WARPS_TOK) * MT * 16
     warp_tok = (warp % WARPS_TOK) * NT * 8
 
@@ -95,10 +130,18 @@ def gemm_nvfp4_mma_impl[
                 var src_blk = block0 + rest // BLOCK_WORDS
                 if src_blk > blocks_per_row - 1:
                     src_blk = blocks_per_row - 1
-                stage_w[i] = weights[
-                    (src_row * blocks_per_row + src_blk) * BLOCK_WORDS
-                    + rest % BLOCK_WORDS
-                ]
+                if NVF4 == 1:
+                    stage_w[i] = weights.bitcast[UInt32]()[
+                        (src_row * blocks_per_row + src_blk) * BLOCK_WORDS
+                        + rest % BLOCK_WORDS
+                    ]
+                else:
+                    stage_w[i] = _mxfp4_word(
+                        weights,
+                        src_row * blocks_per_row * 2 * MXFP4_BYTES,
+                        src_blk,
+                        rest % BLOCK_WORDS,
+                    )
         comptime for i in range(XSLOTS):
             slot = tid + i * THREADS
             if slot < TILE_X:
@@ -160,17 +203,30 @@ def gemm_nvfp4_mma_impl[
                     b0 = sx[(stok * KSTEP + kblk) * BLOCK_WORDS + 1 + in_quad]
                     b1 = sx[(stok * KSTEP + kblk) * BLOCK_WORDS + 5 + in_quad]
                     comptime for mt in range(MT):
-                        acc[mt * NT + nt] = _mma_nvf4(
-                            wa[mt * 4],
-                            wa[mt * 4 + 1],
-                            wa[mt * 4 + 2],
-                            wa[mt * 4 + 3],
-                            b0,
-                            b1,
-                            wsx[mt],
-                            xs,
-                            acc[mt * NT + nt],
-                        )
+                        if NVF4 == 1:
+                            acc[mt * NT + nt] = _mma_nvf4(
+                                wa[mt * 4],
+                                wa[mt * 4 + 1],
+                                wa[mt * 4 + 2],
+                                wa[mt * 4 + 3],
+                                b0,
+                                b1,
+                                wsx[mt],
+                                xs,
+                                acc[mt * NT + nt],
+                            )
+                        else:
+                            acc[mt * NT + nt] = _mma_mxf4(
+                                wa[mt * 4],
+                                wa[mt * 4 + 1],
+                                wa[mt * 4 + 2],
+                                wa[mt * 4 + 3],
+                                b0,
+                                b1,
+                                wsx[mt],
+                                xs,
+                                acc[mt * NT + nt],
+                            )
         barrier()
         block0 += KSTEP
 
@@ -179,7 +235,7 @@ def gemm_nvfp4_mma_impl[
             comptime for i in range(4):
                 row = base_row + warp_row + mt * 16 + quad + 8 * (i // 2)
                 tok = base_tok + warp_tok + nt * 8 + 2 * in_quad + i % 2
-                if row < n_rows and tok < n_tokens:
+                if row < n_rows and tok < tok_end:
                     y[tok * n_rows + row] = Float16(
                         acc[mt * NT + nt][i] * output_scale * x_scale[tok]
                     )
@@ -190,6 +246,80 @@ def gemm_nvfp4_mma_impl[
 # na wątek zanim policzy się fragmenty. Większy kafel czyta za to wagi mniej
 # razy, a przy 2048 tokenach to właśnie ruch, a nie jednostka macierzowa,
 # wyznacza czas.
+def gemm_nvfp4_mma_impl[
+    WARPS_ROW: Int, WARPS_TOK: Int, MT: Int, NT: Int, KSTEP: Int
+](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt32, MutAnyOrigin],
+    x: UnsafePointer[UInt32, MutAnyOrigin],
+    x_scale: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    output_scale: Float32,
+):
+    """Jedna waga, wszystkie tokeny kroku; siatka wybiera kafel."""
+    comptime BROWS = WARPS_ROW * MT * 16
+    comptime BTOK = WARPS_TOK * NT * 8
+    _gemm_fp4_tile[WARPS_ROW, WARPS_TOK, MT, NT, KSTEP, 1](
+        y,
+        weights.bitcast[UInt8](),
+        x,
+        x_scale,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BROWS,
+        Int(block_idx.y) * BTOK,
+        n_tokens,
+        output_scale,
+    )
+
+
+def gemm_mxf4_grouped_impl[
+    WARPS_ROW: Int, WARPS_TOK: Int, MT: Int, NT: Int, KSTEP: Int
+](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[UInt32, MutAnyOrigin],
+    x_scale: UnsafePointer[Float32, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    output_scale: Float32,
+):
+    """Wszyscy eksperci kroku w JEDNYM uruchomieniu, na czterech bitach.
+
+    Mieszanka MXFP4 uruchamiała jeden GEMM na eksperta na projekcję, a każdy z
+    nich obejmował osiem bloków — karta o kilkudziesięciu multiprocesorach stała
+    prawie bezczynnie, przechodząc trzydzieści tysięcy takich uruchomień na
+    prompt. Tu `block_idx.y` indeksuje KAFEL, kafel mówi, do którego eksperta
+    należy i które wiersze zgrupowanej aktywacji obejmuje, a siatka pokrywa
+    wszystkich ekspertów naraz.
+
+    `tile_end` to koniec bloku TEGO eksperta, a nie kafla, więc zacisk pobrania
+    ląduje wewnątrz eksperta, do którego należy, i nigdy na wierszach sąsiada.
+    """
+    comptime BROWS = WARPS_ROW * MT * 16
+    tile = Int(block_idx.y)
+    _gemm_fp4_tile[WARPS_ROW, WARPS_TOK, MT, NT, KSTEP, 0](
+        y,
+        wtab[Int(tile_expert[tile])],
+        x,
+        x_scale,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BROWS,
+        Int(tile_first[tile]),
+        Int(tile_end[tile]),
+        output_scale,
+    )
+
+
 # `KSTEP` jest teraz mały z tego samego powodu, dla którego kafel jest duży:
 # pobranie następnego kroku żyje w REJESTRACH, więc każdy dodatkowy blok `k`
 # to `(BROWS + BTOK) * 9 / THREADS` rejestrów na wątek. Przy `KSTEP = 4`
@@ -197,3 +327,10 @@ def gemm_nvfp4_mma_impl[
 comptime gemm_nvfp4_mma_f16_bm64_bn64 = gemm_nvfp4_mma_impl[2, 2, 2, 4, 1]
 comptime gemm_nvfp4_mma_f16_bm128_bn128 = gemm_nvfp4_mma_impl[2, 4, 4, 4, 1]
 comptime gemm_nvfp4_mma_f16_bm128_bn256 = gemm_nvfp4_mma_impl[2, 4, 4, 8, 1]
+
+# Kafel zgrupowany jest WĄSKI W TOKENACH, bo taki jest ruch: przy 256 ekspertach
+# i ośmiu wybranych na token na jednego eksperta przypada kilkanaście wierszy, a
+# kafel szerszy liczyłby zera. Wiersze wyjścia zostają szerokie, bo to one
+# amortyzują odczyt wagi eksperta.
+comptime gemm_mxf4_grouped_f16_bm128_bn16 = gemm_mxf4_grouped_impl[4, 1, 2, 2, 1]
+comptime gemm_mxf4_grouped_f16_bm128_bn32 = gemm_mxf4_grouped_impl[4, 1, 2, 4, 1]

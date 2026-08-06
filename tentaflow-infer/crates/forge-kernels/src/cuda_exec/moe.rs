@@ -76,6 +76,8 @@ impl CudaExec {
             grouped_gate: dev(selections * inter * 2)?,
             grouped_up: dev(selections * inter * 2)?,
             grouped_out: dev(selections * hidden * 2)?,
+            grouped_xq: dev(selections * hidden.max(inter) / 64 * 36)?,
+            grouped_xs: dev(selections * 4)?,
             selections,
             experts,
         };
@@ -118,21 +120,53 @@ impl CudaExec {
         let table = self
             .device
             .alloc(experts * 8, MemKind::Device, Pool::Weights)?;
-        self.device
-            .write(bytemuck::cast_slice(&addrs), &table, 0)?;
+        self.device.write(bytemuck::cast_slice(&addrs), &table, 0)?;
         self.expert_tables.borrow_mut().insert(id.0, table.clone());
         Ok(table)
     }
 
+    /// Puts the grouped activation into four-bit form, when the stack that will
+    /// read it is in four-bit form too.
+    ///
+    /// Nothing happens for any other format — the block-scaled instruction takes
+    /// FOUR BITS ON BOTH SIDES, so this pass exists for exactly the stacks that
+    /// can use it, and asking the weight is how it knows.
+    fn quantize_grouped(
+        &self,
+        w: &Quantized,
+        moe: &MoeScratch,
+        x: &DevBuffer,
+        cols: usize,
+        selections: usize,
+    ) -> Result<()> {
+        if w.quant != QuantKind::MXFP4
+            || !self.kernels.supports_mxf4_grouped()
+            || !cols.is_multiple_of(64)
+        {
+            return Ok(());
+        }
+        self.kernels.quantize_act_mxf4(
+            &moe.grouped_xq,
+            &moe.grouped_xs,
+            x,
+            cols,
+            selections,
+            &self.stream,
+        )
+    }
 
     /// One projection of every expert over its own block of grouped rows.
     ///
     /// Two shapes, and which one is faster is a property of the FORMAT rather
     /// than of the model — measured, because the two answers are opposite. The
     /// int8 tiles want one grid spanning every expert (7,6× on Qwen3-30B); the
-    /// MXFP4 tile wants a launch per expert (1,3× on Qwen3.6-35B), because it
-    /// dequantizes to f16 and is limited by memory, where a grid touching all
-    /// 256 experts at once loses more in locality than it gains in occupancy.
+    /// f16 MXFP4 tile wanted a launch per expert (1,3× on Qwen3.6-35B), because
+    /// it dequantizes to f16 and is limited by memory. What that comparison was
+    /// really measuring is that neither shape had a matrix unit under it: the
+    /// per-expert launch covers eight blocks, and thirty thousand of those per
+    /// prompt left the card idle. MXFP4 IS four-bit block-scaled data, so it
+    /// goes to the four-bit matrix unit and takes the grouped shape with it —
+    /// reading the SAME bytes, assembled into fragments as the tile is staged.
     #[allow(clippy::too_many_arguments)]
     fn project_experts(
         &self,
@@ -140,6 +174,7 @@ impl CudaExec {
         w: &Quantized,
         y: &DevBuffer,
         x: &DevBuffer,
+        moe: &MoeScratch,
         starts: &[u32],
         tiles: &GroupedTiles<'_>,
         experts: usize,
@@ -147,6 +182,24 @@ impl CudaExec {
         selections: usize,
     ) -> Result<()> {
         let table = self.expert_table(id, w, experts)?;
+        if w.quant == QuantKind::MXFP4 && self.kernels.supports_mxf4_grouped() {
+            return self.kernels.gemm_mxf4_grouped(
+                y,
+                &table,
+                &moe.grouped_xq,
+                &moe.grouped_xs,
+                GroupedTiles {
+                    expert: tiles.expert,
+                    first: tiles.first,
+                    end: tiles.end,
+                    count: tiles.count,
+                },
+                rows,
+                w.cols,
+                selections,
+                &self.stream,
+            );
+        }
         if w.quant != QuantKind::MXFP4 {
             return self.kernels.gemm_grouped_experts(
                 w.quant,
@@ -235,8 +288,12 @@ impl CudaExec {
             self.gemm_by_kind(w.quant, y, &w.blocks, 0, x, r, w.cols, rows, w.output_scale)
         };
         project(router, &moe.shared_logit, x, 1)?;
-        self.kernels
-            .moe_sigmoid_f16_to_f32(&moe.shared_scale, &moe.shared_logit, rows, &self.stream)?;
+        self.kernels.moe_sigmoid_f16_to_f32(
+            &moe.shared_scale,
+            &moe.shared_logit,
+            rows,
+            &self.stream,
+        )?;
         project(gate, &self.scratch.gate, x, width)?;
         project(up, &self.scratch.up, x, width)?;
         self.kernels.glu_mul_f16(
@@ -329,9 +386,25 @@ impl CudaExec {
         )?;
 
         if rows >= GROUPED_MIN_ROWS {
-            self.moe_grouped(out, x, [gate_id, up_id, down_id], experts, top_k, &moe, step)?;
+            self.moe_grouped(
+                out,
+                x,
+                [gate_id, up_id, down_id],
+                experts,
+                top_k,
+                &moe,
+                step,
+            )?;
         } else {
-            self.moe_per_token(out, x, [gate_id, up_id, down_id], experts, top_k, &moe, step)?;
+            self.moe_per_token(
+                out,
+                x,
+                [gate_id, up_id, down_id],
+                experts,
+                top_k,
+                &moe,
+                step,
+            )?;
         }
         if let Some(sh) = shared {
             self.shared_expert(sh, self.buf(out), self.buf(x), rows, &moe)?;
@@ -524,6 +597,10 @@ impl CudaExec {
             hidden,
             &self.stream,
         )?;
+        // Quantized ONCE for the pair that reads it, not once per projection:
+        // gate and up multiply the same rows, and this pass reads every one of
+        // them. `down` gets its own below, at the other width.
+        self.quantize_grouped(gate, &moe, &moe.grouped_x, hidden, selections)?;
         for (id, w, y) in [
             (stacks[0], gate, &moe.grouped_gate),
             (stacks[1], up, &moe.grouped_up),
@@ -533,6 +610,7 @@ impl CudaExec {
                 w,
                 y,
                 &moe.grouped_x,
+                &moe,
                 &starts,
                 &tiles,
                 experts,
@@ -550,11 +628,13 @@ impl CudaExec {
             selections * inter,
             &self.stream,
         )?;
+        self.quantize_grouped(down, &moe, &moe.grouped_gate, inter, selections)?;
         self.project_experts(
             stacks[2],
             down,
             &moe.grouped_out,
             &moe.grouped_gate,
+            &moe,
             &starts,
             &tiles,
             experts,

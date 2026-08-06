@@ -169,6 +169,11 @@ struct MoeScratch {
     grouped_gate: DevBuffer,
     grouped_up: DevBuffer,
     grouped_out: DevBuffer,
+    /// The grouped activation in four-bit form, and its per-row multiplier.
+    /// ONE buffer for both widths: gate and up read it at `hidden`, then `down`
+    /// overwrites it at `inter`, and nothing reads across that boundary.
+    grouped_xq: DevBuffer,
+    grouped_xs: DevBuffer,
     selections: usize,
     experts: usize,
 }
@@ -610,7 +615,7 @@ impl Executor for CudaExec {
                     &self.stream,
                 )?;
                 self.sync_h32(step.rows())
-            },
+            }
             Op::LogitsOfLast { w, x, .. } => self.op_logits_of_last(*w, *x, step),
         }
     }
@@ -898,7 +903,6 @@ impl CudaExec {
             &self.stream,
         )
     }
-
 
     /// RMS normalization with HEADS AS ROWS, in place.
     ///
@@ -1491,4 +1495,3 @@ fn upload(device: &dyn Device, bytes: &[u8]) -> Result<DevBuffer> {
     device.write(bytes, &buf, 0)?;
     Ok(buf)
 }
-
