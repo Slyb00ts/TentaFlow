@@ -78,6 +78,17 @@ impl DenseShape {
         self.kv_heads * self.head_dim
     }
 
+    /// Szerokość Q i wyjścia uwagi — głowice razy wymiar głowicy.
+    ///
+    /// To NIE jest `hidden`, choć w llamie i w Bieliku jest mu równe. Qwen3-MoE
+    /// ma 32 głowice po 128 przy `hidden` 2048, więc projekcja Q jest dwa razy
+    /// szersza od strumienia rezydualnego, a projekcja wyjściowa zwęża go z
+    /// powrotem. Póki obie liczby były mylone w jedną, każdy taki checkpoint
+    /// wymiarował połowę buforów uwagi.
+    pub fn attn_width(&self) -> u32 {
+        self.heads * self.head_dim
+    }
+
     pub fn attn_scale(&self) -> f32 {
         1.0 / (self.head_dim as f32).sqrt()
     }

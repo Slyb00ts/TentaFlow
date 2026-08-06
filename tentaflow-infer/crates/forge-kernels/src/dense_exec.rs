@@ -207,10 +207,10 @@ impl MetalExec {
         let scratch = Scratch {
             h: f16b(n * shape.hidden)?,
             norm: f16b(n * shape.hidden)?,
-            q: f16b(n * shape.hidden)?,
+            q: f16b(n * shape.attn_width())?,
             k: f16b(n * shape.kv_width())?,
             v: f16b(n * shape.kv_width())?,
-            attn: f16b(n * shape.hidden)?,
+            attn: f16b(n * shape.attn_width())?,
             proj: f32b(n * shape.hidden)?,
             gate: f16b(n * shape.inter)?,
             up: f16b(n * shape.inter)?,

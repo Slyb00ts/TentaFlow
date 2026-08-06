@@ -12,6 +12,7 @@
 // decision of the executor and of the variant registry, taken from measurements
 // this file is not allowed to see.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use forge_formats::affine::permute_rope_rows;
@@ -94,12 +95,22 @@ impl<E: Executor + WeightStore> Dense<E> {
             eps: p.rms_norm_eps,
             rope_theta: p.rope_theta,
         };
-        if shape.heads * shape.head_dim != shape.hidden {
+        // Głowice zapytań dzielą się na grupy po jednej głowicy KV, więc kernele
+        // uwagi adresują `heads / kv_heads` zapytań na klucz. Niepodzielność
+        // rozjeżdża to adresowanie, a nie zatrzymuje kernela.
+        //
+        // Iloczyn `heads * head_dim` NIE musi natomiast równać się `hidden` —
+        // przez ten warunek stała tu wcześniej odmowa. W llamie i w Bieliku obie
+        // liczby są równe, ale Qwen3-MoE ma 4096 wobec 2048, więc równość jest
+        // własnością tamtych checkpointów, a nie architektury gęstej.
+        if shape.kv_heads == 0 || !shape.heads.is_multiple_of(shape.kv_heads) {
             return Err(ForgeError::Unsupported(format!(
-                "hidden {} nie jest iloczynem {} głowic po {}",
-                shape.hidden, shape.heads, shape.head_dim
+                "{} głowic nie dzieli się na {} głowic KV",
+                shape.heads, shape.kv_heads
             )));
         }
+
+        check_roles(&desc.globals, &desc.layers)?;
 
         // DWA RÓŻNE typy, dotąd mylone w jeden, bo w MLX oba są bf16. Typ
         // parametrów kwantyzacji jest własnością źródła, więc wystarczy zapytać
@@ -129,7 +140,15 @@ impl<E: Executor + WeightStore> Dense<E> {
         let rope =
             (desc.rope_interleaved() && src.stores_original_rope_order()).then_some(p.head_dim);
 
-        let (h, kvw, inter) = (shape.hidden, shape.kv_width(), shape.inter);
+        // Cztery szerokości, nie dwie: strumień rezydualny, projekcja Q wraz z
+        // wyjściem uwagi, para K/V i FFN. Q i O są PROSTOKĄTNE, gdy głowice nie
+        // wypełniają dokładnie `hidden`.
+        let (h, qw, kvw, inter) = (
+            shape.hidden,
+            shape.attn_width(),
+            shape.kv_width(),
+            shape.inter,
+        );
         let src = &*src;
         let embed = quant(&mut exec, src, embd, shape.vocab, h, None)?;
         let final_norm = plain(&mut exec, src, norm_name)?;
@@ -141,10 +160,10 @@ impl<E: Executor + WeightStore> Dense<E> {
             let name = |role: WeightRole| -> &str { l[&role].as_str() };
             layers.push(LayerIds {
                 attn_norm: plain(&mut exec, src, name(WeightRole::AttnNorm))?,
-                q: quant(&mut exec, src, name(WeightRole::AttnQ), h, h, rope)?,
+                q: quant(&mut exec, src, name(WeightRole::AttnQ), qw, h, rope)?,
                 k: quant(&mut exec, src, name(WeightRole::AttnK), kvw, h, rope)?,
                 v: quant(&mut exec, src, name(WeightRole::AttnV), kvw, h, None)?,
-                o: quant(&mut exec, src, name(WeightRole::AttnO), h, h, None)?,
+                o: quant(&mut exec, src, name(WeightRole::AttnO), h, qw, None)?,
                 ffn_norm: plain(&mut exec, src, name(WeightRole::FfnNorm))?,
                 gate: quant(&mut exec, src, name(WeightRole::FfnGate), inter, h, None)?,
                 up: quant(&mut exec, src, name(WeightRole::FfnUp), inter, h, None)?,
@@ -563,6 +582,54 @@ fn fetch_quant(
     Ok(w)
 }
 
+/// What this model COMPUTES, held against what the checkpoint DECLARES —
+/// before a single weight goes to the device.
+///
+/// Both directions matter and only one of them is obvious.
+///
+/// A missing role is the ordinary answer "this architecture has a different
+/// FFN", and it used to be a bare `no entry found for key` from indexing the
+/// role map — a panic that names neither the role nor the layer.
+///
+/// A role this model does NOT read is the dangerous one, because it used to be
+/// nothing at all. Qwen3 requires a per-head normalization of Q and K; `Dense`
+/// never asks for it, so such a checkpoint would load and compute WITHOUT it.
+/// The result is fluent, wrong text — the same class as the RoPE permutation,
+/// and the same reason it is checked rather than remembered.
+///
+/// Both gaps are reported together, because a loader that reveals one missing
+/// role per run turns a straightforward "this needs work" into a queue.
+fn check_roles(
+    globals: &HashMap<WeightRole, String>,
+    layers: &[HashMap<WeightRole, String>],
+) -> Result<()> {
+    for (index, layer) in layers.iter().enumerate() {
+        let missing: Vec<_> = required_roles()
+            .iter()
+            .filter(|role| !globals.contains_key(*role) && !layer.contains_key(*role))
+            .collect();
+        let ignored: Vec<_> = layer
+            .keys()
+            .filter(|role| !required_roles().contains(role))
+            .collect();
+        if missing.is_empty() && ignored.is_empty() {
+            continue;
+        }
+        let mut why = format!("warstwa {index}: architektura gęsta nie liczy tego checkpointu");
+        if !missing.is_empty() {
+            why.push_str(&format!("; brakuje ról {missing:?}"));
+        }
+        if !ignored.is_empty() {
+            why.push_str(&format!(
+                "; niesie role {ignored:?}, których ten model nie czyta — policzenie go \
+                 bez nich dałoby inny model, a nie błąd"
+            ));
+        }
+        return Err(ForgeError::Unsupported(why));
+    }
+    Ok(())
+}
+
 /// Names of the weights a dense checkpoint must provide, for callers that want
 /// to check a file before paying for the upload.
 pub fn required_roles() -> &'static [WeightRole] {
@@ -601,9 +668,63 @@ mod tests {
         };
         assert_eq!(s.kv_width(), 1024);
         assert!((s.attn_scale() - 0.088_388).abs() < 1e-5);
-        // Głowice zapytań muszą wypełnić szerokość ukrytą — inaczej projekcja
-        // Q liczy inną liczbę kanałów niż czyta uwaga.
-        assert_eq!(s.heads * s.head_dim, s.hidden);
+        // Bielik wypełnia głowicami całą szerokość ukrytą, więc obie szerokości
+        // są tu równe — i właśnie dlatego trzeba je liczyć osobno. Póki ta
+        // równość była asercją, żaden checkpoint bez niej nie mógł wejść.
+        assert_eq!(s.attn_width(), 4096);
+        assert_eq!(s.attn_width(), s.hidden);
+
+        let wide = DenseShape {
+            hidden: 2048,
+            heads: 32,
+            head_dim: 128,
+            ..s
+        };
+        assert_eq!(wide.attn_width(), 4096, "Q jest szersze niż strumień");
+    }
+
+    /// A checkpoint this model cannot compute must be REFUSED, in both of the
+    /// two ways it can be uncomputable.
+    ///
+    /// The second half is the one worth the test: a role the loop never reads
+    /// costs nothing at load and produces a model that runs. Qwen3 needs its
+    /// per-head Q/K norm, and without this check it would simply be skipped.
+    #[test]
+    fn a_checkpoint_this_model_cannot_compute_is_refused() {
+        let layer = |roles: &[WeightRole]| -> HashMap<WeightRole, String> {
+            roles
+                .iter()
+                .map(|r| (*r, format!("{r:?}")))
+                .collect::<HashMap<_, _>>()
+        };
+        let dense: Vec<WeightRole> = required_roles()
+            .iter()
+            .copied()
+            .filter(|r| {
+                !matches!(
+                    r,
+                    WeightRole::TokenEmbd | WeightRole::OutputNorm | WeightRole::LmHead
+                )
+            })
+            .collect();
+        let globals = layer(&[
+            WeightRole::TokenEmbd,
+            WeightRole::OutputNorm,
+            WeightRole::LmHead,
+        ]);
+        let check = |roles: &[WeightRole]| check_roles(&globals, &[layer(roles)]);
+
+        check(&dense).expect("komplet ról ma przejść");
+
+        let mut short = dense.clone();
+        short.retain(|r| *r != WeightRole::FfnGate);
+        let err = check(&short).expect_err("brak roli przeszedł");
+        assert!(format!("{err}").contains("FfnGate"), "{err}");
+
+        let mut extra = dense.clone();
+        extra.push(WeightRole::AttnQNorm);
+        let err = check(&extra).expect_err("cicho pominięta rola");
+        assert!(format!("{err}").contains("AttnQNorm"), "{err}");
     }
 
     #[test]

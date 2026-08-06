@@ -172,10 +172,10 @@ impl CudaExec {
             h: f16b(n * shape.hidden)?,
             h32: f32b(n * shape.hidden)?,
             norm: f16b(n * shape.hidden)?,
-            q: f16b(n * shape.hidden)?,
+            q: f16b(n * shape.attn_width())?,
             k: f16b(n * shape.kv_width())?,
             v: f16b(n * shape.kv_width())?,
-            attn: f16b(n * shape.hidden)?,
+            attn: f16b(n * shape.attn_width())?,
             proj: f16b(n * shape.hidden)?,
             gate: f16b(n * shape.inter)?,
             up: f16b(n * shape.inter)?,
@@ -971,8 +971,11 @@ impl CudaExec {
     }
 
     /// Wiersze jednego lane'a w buforze aktywacji jako własny uchwyt.
+    ///
+    /// Szerokość jest szerokością UWAGI, bo woła się to wyłącznie na `q` i
+    /// `attn`. Dla llamy równa się `hidden` i dlatego pomyłka nie bolała.
     fn lane_rows(&self, buf: &DevBuffer, lane: usize, rows: usize) -> Result<DevBuffer> {
-        let width = self.shape.hidden as usize * 2;
+        let width = self.shape.attn_width() as usize * 2;
         self.device
             .sub_buffer(buf, lane * rows * width, rows * width)
     }
