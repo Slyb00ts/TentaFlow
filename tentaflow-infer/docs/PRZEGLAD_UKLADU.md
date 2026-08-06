@@ -115,6 +115,22 @@ Warstwa formatów, po zmianach z tej sesji, jest przykładem, jak to ma wygląda
 Model nie wie, z jakiego formatu został wczytany, i nie ma tam ani jednej
 gałęzi „jeśli GGUF". Tak samo ma wyglądać reszta.
 
+Ten sam kształt złapała warstwa architektur po kroku 4 (`ZADANIE_MOE_HYBRID.md`),
+i tu też model nie występuje w tabeli:
+
+| pytanie | gdzie | co wie |
+|---|---|---|
+| co niesie warstwa | `ModelDescriptor` | role, nie nazwy tensorów |
+| czym miesza tokeny | `Mixer` per warstwa | uwaga albo rekurencja |
+| gdzie leży jej stan | `forge-state` | strony KV, okna splotu, macierze |
+| jak to policzyć | `Op` + trzej wykonawcy | jedna operacja na rodzinę |
+
+Stos Qwen3.6 przeplata dwa miksery trzy do jednego, więc „który mikser" jest
+własnością WARSTWY, a nie modelu — i dlatego jest enumem w tym samym miejscu, co
+kształt bloku FFN. Trzy rodziny (gęsta, mieszanka, hybryda) liczą się dziś tym
+samym opisem; dodanie czwartej dotyka słownictwa tylko wtedy, gdy wnosi
+operację, której żaden wykonawca nie umie wykonać.
+
 ## 4. Trzy dźwignie, w kolejności opłacalności
 
 ### Dźwignia 1: opis modelu bez urządzenia (największa)

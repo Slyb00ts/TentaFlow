@@ -5,15 +5,15 @@ pozycją, która jest prawdziwą pracą projektową**, i zabrania pisać go na �
 błąd w tej ścieżce nie objawia się awarią, tylko płynnym, złym tekstem. Dlatego
 najpierw karta, potem wzorzec, potem wykonane porównanie.
 
-Kroki 1–3 są zamknięte i zmierzone, więc to jest następna rzecz w kolejce:
+Krok jest zamknięty; ta karta jest zapisem tego, co wymusił, a nie planem:
 
 | krok §8 | stan |
 |---|---|
 | 1. wspólna warstwa stanu | KV ✅, admission i continuous batching zostają |
 | 2. fuzja jako pass | ✅ zmierzone: +0,8% przy dekodowaniu |
 | 3. formaty wag | ✅ 22 kwantyzacje, bramka per format |
-| **4. MoE i hybryda w słownictwie** | **ten dokument** |
-| 5. spekulacja jako pass | czeka na 4 |
+| **4. MoE i hybryda w słownictwie** | **✅ obie rodziny, dwa checkpointy, zmierzone** |
+| 5. spekulacja jako pass | następny |
 | 6. serwer przechodzi, silnik chudnie | czeka na 5 |
 
 ## 1. Dlaczego to jest praca projektowa, a nie przeniesienie

@@ -216,8 +216,8 @@ Dziś w repozytorium liczą DWIE rzeczy i dzielą tylko kernele:
 
 | | `forge-engine` | `forge-model` + wykonawcy |
 |---|---|---|
-| formaty wag | **24** | 2 |
-| rodziny architektur | dense, MoE, hybrid, DeepSeek | dense |
+| formaty wag | **24** | 22 |
+| rodziny architektur | dense, MoE, hybrid, DeepSeek | dense, MoE, hybrid |
 | radix, continuous batching, spekulacja, TP | **jest** | nie ma |
 | Apple / Metal | **zero wystąpień** | jedyna, która tam liczy |
 
@@ -298,17 +298,44 @@ Kolejność, w której każdy krok odblokowuje następny:
    maskowane do sześciu bitów, żeby pole skali każdego układu wyszło skończone
    bez znajomości, gdzie który układ je trzyma. Górne dwa bity kodu sprawdzają
    więc tylko cztery formaty mające prawdziwe checkpointy.
-4. **MoE i hybrid w słownictwie.** Jedyna pozycja, która jest prawdziwą pracą
-   projektową: `Op` musi wyrazić routing ekspertów i stan rekurencyjny
-   DeltaNet, a każda platforma potrzebuje tych kerneli — inaczej „wszystko na
-   każdym systemie" jest nieprawdą, a nie planem. **Karta:
-   `docs/ZADANIE_MOE_HYBRID.md`** — z rekomendacją, żeby obie rodziny weszły
-   JEDNĄ operacją każda (jak `Attention`, którego stronicowanie zmieściło się
-   całe po stronie wykonawcy), z MoE przed hybrydą, bo routing da się odtworzyć
-   na wzorcu dokładnie, a stan rekurencyjny nie. Jedna twarda przeszkoda,
-   nazwana zamiast obchodzona: brak małego checkpointu MoE — jedyny lokalny to
-   DeepSeek V4 Flash, 156 GiB, czyli za duży, żeby wzorzec nim cokolwiek
-   policzył.
+4. **MoE i hybrid w słownictwie.** ZROBIONE. Karta:
+   `docs/ZADANIE_MOE_HYBRID.md`. Obie rodziny weszły JEDNĄ operacją każda —
+   `Op::MoeFfn` i `Op::DeltaNet` — dokładnie jak `Attention`, którego
+   stronicowanie zmieściło się całe po stronie wykonawcy. MoE poszło pierwsze,
+   bo routing da się odtworzyć na wzorcu dokładnie, a stan rekurencyjny wymaga,
+   żeby porównywalny był też sam stan.
+
+   Przeszkoda, którą karta nazwała — brak małego checkpointu MoE — okazała się
+   nie istnieć: Qwen3-30B-A3B (18,6 GiB, Q4_K_M) aktywuje ~3B parametrów na
+   token, więc wzorzec liczy go SZYBCIEJ niż gęstego Bielika 7B. Hybrydę wziął
+   Qwen3.6-35B-A3B MXFP4, który wnosi naraz DeltaNet, eksperta współdzielonego z
+   bramką sigmoid, bramkowaną uwagę i częściowe RoPE.
+
+   Cztery rzeczy warte zapamiętania ponad samą implementację:
+
+   - **Granica operacji ma leżeć tam, gdzie granica STANU.** `Op::DeltaNet`
+     obejmuje dziewięć kroków, bo jedno jej wywołanie to jedno posunięcie okna
+     splotu i macierzy — czyli dokładnie ta jednostka, którą krok 5 będzie
+     cofać. Rozbita na kawałki wymagałaby czterech slotów aktywacji istniejących
+     dla jednej architektury i wycofania bez jednej rzeczy do wycofania.
+   - **Stan rekurencyjny jest TAŃSZY niż uwaga, nie droższy.** Karta ostrzegała,
+     że wzorzec dla DeltaNet będzie bardzo wolny. Zmierzone: 11,9 s na pięć
+     tokenów wobec 24,9 s gęstego Bielika na sześciu. Stan ma stały rozmiar,
+     więc token na pozycji 5000 kosztuje tyle co na 5; kosztem są projekcje.
+   - **„Kernele istnieją w komplecie" było prawdą dla 4a i nie dla 4b.** Stosy
+     ekspertów MXFP4 nie miały kernela adresowanego na urządzeniu — istniały
+     tylko Q4_K i Q6_K, akurat te dwa, których używa Qwen3-30B. Checkpoint
+     wczytywał się w całości i zatrzymywał na pierwszym routowanym mnożeniu.
+   - **Postać wagi należy do wykonawcy, ale ROLA wiersza do modelu.** Bramkowana
+     projekcja Q leży w pliku podwójnie szeroka i przepleciona per głowicę;
+     rozdzielenie jej przy wczytaniu daje słownictwu dwie zwykłe macierze
+     zamiast operacji, której zadaniem jest rozbieranie tensora.
+
+   Zmierzone wobec wzorca: Qwen3-30B-A3B 0,433% / 0,204%, Qwen3.6-35B-A3B
+   0,356% / 0,178%, ten sam token po obu stronach. Metal odmawia obu rodzin w
+   jednym miejscu każdej — kerneli MSL nie ma, a napisanie ich na ślepo na
+   maszynie, która ich nie uruchomi, dałoby płynny, zły tekst dokładnie tam,
+   gdzie nikt nie patrzy.
 5. **Spekulacja jako pass plus kontrakt proposera.** `forge-engine::speculation`
    ma już typowany `Proposer` i statystyki akceptacji, więc to przeniesienie,
    nie wymyślanie.
