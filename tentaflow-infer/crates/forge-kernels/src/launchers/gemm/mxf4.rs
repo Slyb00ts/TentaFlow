@@ -244,9 +244,8 @@ impl Kernels {
 }
 
 /// Tokeny na kafel wariantow zgrupowanych, od najszerszego.
-const GROUPED_TILE: [(&str, usize, u32); 3] = [
-    ("gemm_mxf4_grouped_f16_bm128_bn32_k2", 32, 128),
-    ("gemm_mxf4_grouped_f16_bm128_bn32", 32, 128),
+const GROUPED_TILE: [(&str, usize, u32); 2] = [
+    ("gemm_mxf4_grouped_f16_bm128_bn32_w32", 32, 1024),
     ("gemm_mxf4_grouped_f16_bm128_bn16", 16, 128),
 ];
 

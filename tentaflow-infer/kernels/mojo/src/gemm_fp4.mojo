@@ -338,15 +338,29 @@ comptime gemm_nvfp4_mma_f16_bm128_bn256 = gemm_nvfp4_mma_impl[2, 4, 4, 8, 1]
 # kafel szerszy liczyłby zera. Wiersze wyjścia zostają szerokie, bo to one
 # amortyzują odczyt wagi eksperta.
 comptime gemm_mxf4_grouped_f16_bm128_bn16 = gemm_mxf4_grouped_impl[4, 1, 2, 2, 1]
-comptime gemm_mxf4_grouped_f16_bm128_bn32_k2 = gemm_mxf4_grouped_impl[4, 1, 2, 4, 2]
-"""Dwa bloki `k` na przejscie zamiast jednego.
+"""Wariant dla tablicy kafli wezszej niz trzydziesci dwa wiersze."""
+
+comptime gemm_mxf4_grouped_f16_bm128_bn32_w32 = gemm_mxf4_grouped_impl[8, 4, 1, 1, 2]
+"""Ten sam kafel wyjscia policzony TRZYDZIESTOMA DWOMA osnowami przy dwoch
+blokach `k` na przejscie.
+
+Ksztalt kafla i jego arytmetyka sa te same, co w wariancie czterech osnow —
+zmienia sie, ile linii go liczy, a przez to ile rejestrow zapowiedzi przypada na
+jedna. To one byly wiazaniem, i widac to po tym, ze glebsze przejscie oplaca sie
+dopiero po ich uwolnieniu. Prefill 512 tokenow Qwen3.6-35B, po kolei:
+
+    4 osnowy, k1   1989 tok/s
+    4 osnowy, k2   2119
+    4 osnowy, k4   1904   (36 rejestrow zapowiedzi na linie)
+    8 osnow,  k2   2245
+    16 osnow, k2   2426
+    16 osnow, k4   2358
+    32 osnowy, k2  2470
 
 Kafel czyta z kazdego wiersza tylko `34 * KSTEP` bajtow, a wiersze dzieli caly
 `blocks_per_row * 34`, wiec plytkie przejscie ciagnie trzy sektory po trzydziesci
-dwa bajty na trzydziesci cztery uzyte i placi bariera za kazdy blok. Glebsze
-placi za to pamiecia wspoldzielona i rejestrami zapowiedzi, wiec optimum jest
-wewnatrz: prefill 512 tokenow to 1989 tok/s przy jednym bloku, 2119 przy dwoch i
-1904 przy czterech, gdzie trzydziesci szesc rejestrow zapowiedzi zabiera
-zajetosc. Ogon krotszy niz `KSTEP` jest bezpieczny, bo mnozenie sprawdza
-`block0 + kblk` — dlatego to nie musi dzielic `blocks_per_row`."""
-comptime gemm_mxf4_grouped_f16_bm128_bn32 = gemm_mxf4_grouped_impl[4, 1, 2, 4, 1]
+dwa bajty na trzydziesci cztery uzyte i placi bariera za kazdy blok — dlatego k2
+wygrywa z k1. Glebiej juz nie, bo zapowiedz wraca do rejestrow. Ogon krotszy niz
+`KSTEP` jest bezpieczny, bo mnozenie sprawdza `block0 + kblk`, wiec to nie musi
+dzielic `blocks_per_row`."""
+

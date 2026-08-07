@@ -284,7 +284,16 @@ impl CudaExec {
                 // The fold, and only the fold, is sequential — and it is
                 // sequential INSIDE one launch, which is the difference between
                 // a kernel per token and a kernel per chunk.
-                if value_key {
+                // Długi kawałek dostaje wariant TRWAŁY, który przypisuje osnowie
+                // dwie kolumny stanu i przechodzi cały kawałek bez wracania po
+                // stan. Krótki go nie chce: jego przewaga jest w amortyzacji, a
+                // pojedynczy krok zapłaciłby tylko za rozruch.
+                if value_key && take > 128 {
+                    self.kernels.deltanet_value_key_scan_persistent_f16(
+                        &s.o, &matrix, &s.q32, &s.k32, &s.v, &s.g, &s.beta, take, v_heads,
+                        &self.stream,
+                    )?;
+                } else if value_key {
                     self.kernels.deltanet_value_key_scan_inplace_f16(
                         &s.o, &matrix, &matrix, &s.q32, &s.k32, &s.v, &s.g, &s.beta, 1, take,
                         v_heads, &self.stream,
