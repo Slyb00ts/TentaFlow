@@ -1200,3 +1200,64 @@ Hybryda WYPRZEDZA w dekodzie (1,006x), gęsty prefill 1,98x. Zostaje prefill
 hybrydy (0,93x), dekod mieszanki (0,96x) i dekod gęstego (0,94x) — a dekod obu
 jest ograniczony odczytem wag, więc dalsza przewaga wymaga wyższej sprawności
 kernela, nie mniejszej liczby bajtów.
+
+## Dekodowy iloczyn Q4_K: szerokość ŻĄDANIA, nie liczba warpów
+
+Poprzednia sekcja kończyła się wnioskiem, że dekod jest ograniczony odczytem
+wag i że dalsza przewaga wymaga wyższej sprawności kernela. Wymagała — i
+sprawność wzięła się z jednej wielkości, o którą wcześniej nikt nie zapytał:
+ILE BAJTÓW BIERZE JEDNO ŻĄDANIE.
+
+**Najpierw pomiar sufitu.** Zwykły kernel przemiatający 4 GiB odczytami
+`float4` osiąga na GB10 237 GB/s (192 bloki: 237,4; 4096 bloków: 232,6 — czyli
+sufit jest płaski i osiąga się go garścią bloków). Wobec tego dekod llama.cpp
+szedł 193 GB/s, a nasz 176. Obaj daleko od sufitu, więc nie było to „obie
+implementacje stoją na pamięci".
+
+**Zajętość nie była wąskim gardłem.** `ncu` na naszym GEMV: zajętość
+teoretyczna 75%, osiągnięta 46,55%, 97,8% z 46,9 cykli między wydaniami na
+`long_scoreboard`. Siatka trwała 288 bloków po 128 wątków to 6 bloków na SM
+przy 9 mieszczących się — więc warpów było mniej, niż karta trzyma. Dołożenie
+ich POGORSZYŁO wynik monotonicznie (96 bloków: 41,5 tok/s; 288: 40,6; 480:
+38,2). Warp tego kernela czyta DŁUGI ciągły odcinek jednej macierzy; więcej
+warpów to krótsze odcinki, nie więcej pasma.
+
+**Wąskim gardłem była szerokość odczytu.** `vec_dot_q4_K_q8_1` daje lane'owi
+dwa słowa int32 oddalone o szesnaście bajtów — jedna instrukcja warpa dotyka
+czterech rozłącznych odcinków superbloku i rusza cztery bajty na lane. Nowe
+odwzorowanie: osiem lane'ów na superblok, SZESNAŚCIE KOLEJNYCH BAJTÓW na lane,
+cztery superbloki na warp. Te same bajty, ta sama arytmetyka, ćwierć żądań.
+Gęsty dekod 39,2 -> 43,3 tok/s, mieszanka 79,0 -> 84,3.
+
+Q6_K tego nie dostanie bez przepakowania: superblok ma 210 bajtów, więc
+przesunięcie kolejnego jest podzielne tylko przez 2 i wektorowy odczyt
+16-bajtowy nie ma jak być wyrównany. Tam zostaje rozwinięcie po superblokach.
+
+### Stan wobec llama.cpp, jeden stan maszyny, 2026-08-07 wieczorem
+
+`/opt/repos/llama.cpp` 6db1304 wobec FORGE `d2540c894`:
+
+                        llama pp512  FORGE pp512   llama tg32  FORGE tg32
+    Qwen3.6-35B MXFP4      2502,5      2326,4         62,52      62,3
+    Qwen3-30B Q4_K         2273,6      2280,7         82,23      84,3
+    Bielik 7B Q4_K         2650,4      5135,2         42,59      43,3
+
+Cztery z sześciu pomiarów po naszej stronie, jeden remis (dekod hybrydy,
+0,996x), jeden zostaje: prefill hybrydy 0,93x.
+
+## Kontrakt lane'ów trzyma się logitów, nie szczęśliwego promptu
+
+`cuda_lanes_match_solo_runs` porównywał CIĄG TOKENÓW przebiegu wsadowego z
+ciągiem przebiegu samotnego i żądał równości co do identyfikatora. Obie drogi
+liczą INNYM kernelem — komentarz w samym teście to mówił — więc różnią się
+zaokrągleniem, a przy porównaniu ciągów jeden remis rozjeżdża całą resztę
+przebiegu. Zmierzone: na wersji, na której test przechodził, zmiana JEDNEGO
+identyfikatora w promptach wystarczała, żeby przestał. Test mówił więc o tym,
+czy dobrano szczęśliwy prompt, a nie o adresowaniu lane'ów.
+
+Teraz wsad dostaje na wejściu token przebiegu samotnego (każdy krok liczy się z
+tego samego stanu, więc różnica może być tylko zaokrągleniem TEGO kroku), a
+porównywane są logity regułą remisu tej samej postaci co `common::agrees` —
+z tą różnicą, że pierwsze miejsce też jej podlega, bo tu obie strony są nasze i
+żadna nie jest wzorcem. Zgodne lane'y dają 1,6% rozpiętości, podstawiony cudzy
+token daje 14,7%: reguła nie jest poluzowaniem, tylko właściwą miarą.
