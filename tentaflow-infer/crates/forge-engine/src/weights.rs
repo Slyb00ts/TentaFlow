@@ -2220,11 +2220,19 @@ fn expert_residency_budget(
         for (role, name) in layer {
             match role {
                 WeightRole::FfnGateExps | WeightRole::FfnUpExps | WeightRole::FfnDownExps => {
-                    // Rola per ekspert jest SZABLONEM — rozmiar bierzemy z
-                    // eksperta zerowego i mnożymy, bo wszyscy są równi.
-                    let n = n_experts?;
-                    let first = name.replace("{expert}", "0");
-                    expert_bytes += src.byte_len(&first)? * n;
+                    // Ta rola przychodzi w dwóch postaciach. Safetensors trzyma
+                    // eksperta w osobnym tensorze, więc nazwa jest SZABLONEM:
+                    // rozmiar bierzemy z eksperta zerowego i mnożymy, bo wszyscy
+                    // są równi. GGUF skleja ich w jeden tensor, który JUŻ niesie
+                    // komplet — pomnożony jeszcze raz kazałby silnikowi wierzyć,
+                    // że eksperci są setki razy więksi niż pamięć, i stronicować
+                    // model, który mieści się w niej w całości.
+                    expert_bytes += match name.split_once("{expert}") {
+                        Some((head, tail)) => {
+                            src.byte_len(&format!("{head}0{tail}"))? * n_experts?
+                        }
+                        None => src.byte_len(name)?,
+                    };
                 }
                 _ => layer_bytes += src.byte_len(name)?,
             }
