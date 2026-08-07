@@ -62,6 +62,22 @@ impl Model {
                     tracing::error!("nie można bezpiecznie zwolnić stanu hybrydowego: {error}");
                 }
             }
+            // Zwolnienie MUSI objąć każdą rangę. Pule rang są identyczne i
+            // wybierają slot tą samą kolejnością, więc pominięcie zwolnienia u
+            // jednej z nich rozjeżdża listy wolnych slotów — druga sekwencja
+            // dostaje wtedy inny slot na randze zerowej niż na pozostałych.
+            for index in 0..self.tp_rank_count() {
+                let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
+                let stream = rank.stream.clone();
+                if let Some(pool) = rank.hybrid_states.as_mut() {
+                    if let Err(error) = pool.release(lease, &stream) {
+                        tracing::error!(
+                            "nie można zwolnić stanu hybrydowego rangi {}: {error}",
+                            index + 1
+                        );
+                    }
+                }
+            }
         }
         if let Some(t) = &mut self.tier {
             t.drop_seq(seq);

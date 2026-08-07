@@ -57,9 +57,11 @@ impl Model {
             ));
         }
         let hybrid = self.is_hybrid();
+        // Ten sam warunek, co w `prefill_hybrid`: podział na rangi NIE używa
+        // layer-major, więc profil nie może rezerwować spanów na tę trasę.
         let layer_major_limit = self
             .hybrid_layer_major_prefill_limit()
-            .filter(|_| prompt_tokens >= 32);
+            .filter(|_| prompt_tokens >= 32 && self.tp.is_none());
         if let Some(limit) = layer_major_limit {
             let arena_tokens = prompt_tokens.min(limit);
             self.ensure_hybrid_layer_major_bufs(arena_tokens)?;
@@ -78,6 +80,7 @@ impl Model {
         let hybrid_batched = std::env::var("FORGE_HYBRID_BATCH_PREFILL")
             .map_or(true, |value| value != "0")
             && prompt_tokens > 1
+            && (self.tp.is_none() || self.split_batch_prefill_capable())
             && self.hybrid_batched_prefill_capable();
         let target_spans = if let Some(limit) = layer_major_limit {
             prompt_tokens.div_ceil(limit)

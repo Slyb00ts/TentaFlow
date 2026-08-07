@@ -409,6 +409,11 @@ enum Command {
         /// architektury bywa obarczone błędem samego pomiaru.
         #[arg(long = "tp-split")]
         tp_split: Option<String>,
+        /// Podział SPMD na N kart, jak w `forge run --tp`. Dzięki temu rozbicie
+        /// na prefill, TTFT i dekodowanie da się zmierzyć także dla podziału, a
+        /// nie tylko dla jednej karty.
+        #[arg(long = "tp", default_value_t = 1)]
+        tp: usize,
     },
     /// Measure next-token perplexity on a fixed held-out passage (W4A8 quality
     /// gate). Runs whatever GEMM `FORGE_GEMM` selects (W4A8 is calibrated first).
@@ -606,6 +611,7 @@ fn main() -> Result<()> {
             reps,
             tp_cards,
             tp_split,
+            tp,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -633,6 +639,7 @@ fn main() -> Result<()> {
                 reps,
                 parse_tp_cards(tp_cards.as_deref())?,
                 parse_tp_split(tp_split.as_deref())?,
+                tp,
             )
         }
         Command::Ppl { model_path, ctx } => cmd_ppl(&model_path, ctx),
@@ -2358,6 +2365,7 @@ fn cmd_bench(
     reps: usize,
     tp_cards: Vec<forge_hal::gpu::DeviceId>,
     tp_split: Option<Vec<usize>>,
+    tp_world: usize,
 ) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
@@ -2386,7 +2394,7 @@ fn cmd_bench(
             SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
         ),
         resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
-        1,
+        tp_world,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
     enable_tp_ffn_with(
