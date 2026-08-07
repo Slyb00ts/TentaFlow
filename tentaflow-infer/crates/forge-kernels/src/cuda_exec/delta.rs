@@ -11,6 +11,7 @@
 // all of it — see `op_delta_net`.
 
 use super::{CudaExec, Quantized};
+use crate::DeltaStateLayout;
 
 use forge_graph::{Act, DeltaWeights, SsmShape, Step};
 use forge_hal::{DevBuffer, Pool};
@@ -184,6 +185,14 @@ impl CudaExec {
             }
         }
 
+        // Który układ macierzy stanu ta karta liczy szybciej. `ValueKey` trzyma
+        // kolumnę wartości w rejestrach linii i rozkłada głowicę na trzydzieści
+        // dwa bloki zamiast na dwa, więc krok generacji ma czym zakryć opóźnienie
+        // pamięci: zmierzone 65 us wobec 6 us na warstwę. Układ jest własnością
+        // WYKONAWCY — poza tym skanem nikt tu w macierz nie zagląda.
+        let value_key =
+            self.kernels.preferred_delta_state_layout(d_state) == DeltaStateLayout::ValueKey;
+
         let s = self.ensure_delta(ssm, rows)?;
         let conv_w = self.plain(w.conv)?;
         let dt_bias = self.plain(w.dt_bias)?;
@@ -275,19 +284,26 @@ impl CudaExec {
                 // The fold, and only the fold, is sequential — and it is
                 // sequential INSIDE one launch, which is the difference between
                 // a kernel per token and a kernel per chunk.
-                self.kernels.deltanet_gated_scan_inplace_f16(
-                    &s.o,
-                    &matrix,
-                    &s.q32,
-                    &s.k32,
-                    &s.v,
-                    &s.g,
-                    &s.beta,
-                    take,
-                    v_heads,
-                    d_state,
-                    &self.stream,
-                )?;
+                if value_key {
+                    self.kernels.deltanet_value_key_scan_inplace_f16(
+                        &s.o, &matrix, &matrix, &s.q32, &s.k32, &s.v, &s.g, &s.beta, 1, take,
+                        v_heads, &self.stream,
+                    )?;
+                } else {
+                    self.kernels.deltanet_gated_scan_inplace_f16(
+                        &s.o,
+                        &matrix,
+                        &s.q32,
+                        &s.k32,
+                        &s.v,
+                        &s.g,
+                        &s.beta,
+                        take,
+                        v_heads,
+                        d_state,
+                        &self.stream,
+                    )?;
+                }
                 // The gated norm is per (token, head) and the weight is shared
                 // across heads, so the chunk's tokens flatten into the head axis
                 // rather than needing a pass of their own.
