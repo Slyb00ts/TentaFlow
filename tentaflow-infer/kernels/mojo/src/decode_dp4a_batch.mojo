@@ -39,48 +39,46 @@ def gemv_q4_k_dp4a_batch_impl[token_tile: Int](
 
     blocks_per_row = n_cols // 256
     row_base = row * blocks_per_row * 144
-    i = lane % 16
-    j = i // 4
-    w4 = i % 4
+    p = lane % 8
+    c = p // 2
+    half = p % 2
 
     var acc = InlineArray[Float32, token_tile](fill=0.0)
     var mins = InlineArray[Float32, token_tile](fill=0.0)
-    var b = lane // 16
+    var b = lane // 8
     while b < blocks_per_row:
         off = row_base + b * 144
         dm = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
         d = Float32(dm[0])
         dmin = Float32(dm[1])
-        sc, mn = _q4k_scale_pair(w, off, j)
-        qp = (w + off + 16 + j * 32 + 4 * w4).bitcast[Int32]()
-        v0 = qp[0]
-        v1 = qp[4]
-        lo0 = v0 & 0x0F0F0F0F
-        lo1 = v1 & 0x0F0F0F0F
-        hi0 = (v0 >> 4) & 0x0F0F0F0F
-        hi1 = (v1 >> 4) & 0x0F0F0F0F
-        seg = b * 8 + 2 * j
+        sc, mn = _q4k_scale_pair(w, off, c)
+        qv = (w + off + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
+            width=4, alignment=16
+        ]()
+        seg = b * 8 + 2 * c
         comptime for token in range(token_tile):
             if token < n_tokens:
                 xqi = (xq_g + token * n_cols).bitcast[Int32]()
-                u0a = xqi[seg * 8 + w4]
-                u0b = xqi[seg * 8 + w4 + 4]
-                u1a = xqi[seg * 8 + 8 + w4]
-                u1b = xqi[seg * 8 + 12 + w4]
-                s_lo = _dp4a(lo1, u0b, _dp4a(lo0, u0a, 0))
-                s_hi = _dp4a(hi1, u1b, _dp4a(hi0, u1a, 0))
+                var s_lo: Int32 = 0
+                var s_hi: Int32 = 0
+                comptime for t in range(4):
+                    q = Int32(qv[t])
+                    s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + half * 4 + t], s_lo)
+                    s_hi = _dp4a(
+                        (q >> 4) & 0x0F0F0F0F, xqi[seg * 8 + 8 + half * 4 + t], s_hi
+                    )
                 acc[token] += d * sc[0] * xd[seg * n_tokens + token] * Float32(
                     s_lo
                 )
                 acc[token] += d * sc[1] * xd[
                     (seg + 1) * n_tokens + token
                 ] * Float32(s_hi)
-                if w4 == 0:
+                if half == 0:
                     mins[token] += dmin * (
                         mn[0] * xs[seg * n_tokens + token]
                         + mn[1] * xs[(seg + 1) * n_tokens + token]
                     )
-        b += 2
+        b += 4
 
     comptime for token in range(token_tile):
         total = warp.sum(acc[token] - mins[token])

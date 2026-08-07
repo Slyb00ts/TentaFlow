@@ -239,7 +239,41 @@ fn the_batched_form_agrees_with_the_single_steps() {
     );
 }
 
-/// Wsad musi dać każdej sekwencji DOKŁADNIE to, co dała jej samotność.
+/// Dwa nasze własne przebiegi liczą to samo, z dokładnością do zaokrąglenia.
+///
+/// Różni się od `common::agrees` w JEDNYM miejscu i celowo: tam wzorcem jest
+/// mlx-lm, więc wybrany token JEST odpowiedzią i musi się zgadzać co do
+/// identyfikatora. Tutaj obie strony to nasze kernele, dzielące tę samą
+/// arytmetykę i różniące się wyłącznie kolejnością sumowania — więc pierwsze
+/// miejsce podlega tej samej regule remisu co dalsze: zamiana jest wyjaśniona
+/// wtedy, gdy błąd TEGO przebiegu na TYCH DWÓCH logitach wystarcza, żeby je
+/// odwrócić. Token naprawdę inny tego nie przejdzie: dzieli go od sąsiada
+/// wielokrotność błędu na obu końcach.
+fn same_arithmetic(what: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len());
+    let err = common::spread_error(got, want);
+    let ours = common::top_k(got, 5);
+    let theirs = common::top_k(want, 5);
+    for (rank, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+        if a == b {
+            continue;
+        }
+        let separation = (want[*a] - want[*b]).abs() as f64;
+        let slack = ((got[*a] - want[*a]).abs() + (got[*b] - want[*b]).abs()) as f64;
+        assert!(
+            separation <= slack,
+            "{what}: miejsce {rank} zamienione, a druga droga dzieli je o \
+             {separation:.4} przy błędzie {slack:.4} na tej parze — to nie jest remis"
+        );
+    }
+    assert!(
+        err < 0.05,
+        "{what}: {:.3}% rozpiętości to nie jest ta sama arytmetyka",
+        err * 100.0
+    );
+}
+
+/// Każdy lane wsadu musi liczyć to, co ta sama sekwencja liczy sama.
 ///
 /// To jest cały kontrakt lane'ów. Sekwencje dzielą jedno mnożenie i jedną
 /// tablicę stron, więc każda pomyłka w adresowaniu — wiersz aktywacji, strona
@@ -247,47 +281,71 @@ fn the_batched_form_agrees_with_the_single_steps() {
 /// prompt. Odpowiedź na cudzy prompt jest poprawną polszczyzną, więc nic poza
 /// porównaniem z przebiegiem samotnym tego nie złapie.
 ///
+/// Porównywane są LOGITY kroku, a wsad dostaje na wejściu token przebiegu
+/// samotnego. Samotny liczy innym kernelem niż wsad, więc oba zaokrąglają
+/// inaczej; przy porównaniu samych ciągów tokenów jeden remis rozjeżdża resztę
+/// przebiegu i test przestaje mówić o adresowaniu, a zaczyna o tym, czy dobrano
+/// szczęśliwy prompt — zmierzone: na wersji, na której ten test przechodził,
+/// zmiana jednego identyfikatora w promptach wystarczała, żeby przestał.
+/// Karmienie wsadu tokenem samotnego zamyka tę pętlę: każdy krok liczy się z
+/// tego samego stanu, więc różnica może być tylko zaokrągleniem TEGO kroku — a
+/// lane czytający cudze strony rozjeżdża się o całą rozpiętość, nie o
+/// zaokrąglenie (podstawiony cudzy token daje tu 14,7% wobec 1,6% zgodnych).
+///
 /// Prompty mają RÓŻNE długości: przy równych każda pomyłka w pozycji bazowej i
 /// w liczbie widocznych tokenów daje ten sam wynik co jej brak.
 fn lanes_match_solo<E>(model: &mut Dense<E>, prompts: &[Vec<u32>], steps: usize)
 where
     E: forge_graph::Executor + forge_graph::WeightStore,
 {
-    let solo: Vec<Vec<u32>> = prompts
-        .iter()
-        .map(|prompt| {
-            model.reset(SLOT).expect("reset");
-            model.generate(SLOT, prompt, steps).expect("przebieg samotny")
-        })
-        .collect();
+    let mut solo: Vec<Vec<u32>> = Vec::with_capacity(prompts.len());
+    let mut solo_logits: Vec<Vec<Vec<f32>>> = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        model.reset(SLOT).expect("reset");
+        let mut tokens = vec![model.prefill(SLOT, prompt).expect("prefill samotny")];
+        let mut rows = vec![model.logits(0).expect("logity promptu")];
+        for _ in 1..steps {
+            let token = *tokens.last().expect("krok samotny ma poprzednika");
+            tokens.push(
+                model
+                    .decode(&[Feed { slot: SLOT, token }])
+                    .expect("krok samotny")[0],
+            );
+            rows.push(model.logits(0).expect("logity kroku samotnego"));
+        }
+        solo.push(tokens);
+        solo_logits.push(rows);
+    }
 
     for (slot, prompt) in prompts.iter().enumerate() {
         model.reset(slot).expect("reset");
         model.prefill(slot, prompt).expect("prefill lane'a");
     }
-    let mut feed: Vec<Feed> = prompts
-        .iter()
-        .enumerate()
-        .map(|(slot, _)| Feed {
-            slot,
-            token: solo[slot][0],
-        })
-        .collect();
-    let mut batched: Vec<Vec<u32>> = solo.iter().map(|s| vec![s[0]]).collect();
-    for _ in 1..steps {
+    let mut worst = 0f64;
+    for step in 1..steps {
+        let feed: Vec<Feed> = (0..prompts.len())
+            .map(|slot| Feed {
+                slot,
+                token: solo[slot][step - 1],
+            })
+            .collect();
         let next = model.decode(&feed).expect("krok wsadowy");
         for (lane, &token) in next.iter().enumerate() {
-            batched[lane].push(token);
-            feed[lane].token = token;
+            let got = model.logits(lane).expect("logity lane'a");
+            let want = &solo_logits[lane][step];
+            worst = worst.max(common::spread_error(&got, want));
+            assert_eq!(
+                token,
+                common::top_k(&got, 1)[0] as u32,
+                "lane {lane}, krok {step}: oddany token to nie argmax tego lane'a"
+            );
+            same_arithmetic(&format!("lane {lane}, krok {step}"), &got, want);
         }
     }
-
-    for (lane, (want, got)) in solo.iter().zip(&batched).enumerate() {
-        assert_eq!(
-            want, got,
-            "lane {lane} we wsadzie poszedł inaczej niż sam: sam {want:?}, wsadem {got:?}"
-        );
-    }
+    eprintln!(
+        "wsad wobec samotności: najgorsze {:.3}% rozpiętości",
+        worst * 100.0
+    );
 
     // Ta sama sekwencja na innym miejscu we wsadzie musi dać DOKŁADNIE to samo.
     //

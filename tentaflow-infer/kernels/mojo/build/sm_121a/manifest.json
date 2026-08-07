@@ -1786,11 +1786,11 @@
       "file": "gemv_q4_k_dp4a_out_f32.ptx"
     },
     "gemv_q4_k_dp4a_persist_f16": {
-      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f",
+      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_ac46a1842540eca2",
       "file": "gemv_q4_k_dp4a_persist_f16.ptx"
     },
     "gemv_q4_k_dp4a_persist_x4k_f16": {
-      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad",
+      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_361c3bf0bbd3dae9",
       "file": "gemv_q4_k_dp4a_persist_x4k_f16.ptx"
     },
     "gemv_q4_k_f16_v2": {

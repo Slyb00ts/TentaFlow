@@ -4,7 +4,6 @@ use super::persist::persist_wave;
 
 const GEMV_Q4K_GROUP4: &str = "gemv_q4_k_dp4a_group4_f16";
 
-
 impl Kernels {
     /// y = W·x with W in GGML Q4_K superblocks, x/y f16. Warp per row.
     pub fn gemv_q4_k_f16(
@@ -305,7 +304,6 @@ impl Kernels {
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
-
 
     /// Logit GEMV over Q6_K weights → f32 logits.
     #[allow(clippy::too_many_arguments)]
@@ -712,28 +710,29 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
-        let tiles = (rows as u32).div_ceil(8);
-        // Powyżej ~2048 kafli kernel trwa dość długo, żeby rozbieg pamięci się
-        // zamortyzował, a sweep pokazał tam remis — zysk jest wyłącznie na
-        // wąskich macierzach, więc tylko one schodzą na siatkę trwałą.
-        let wave = persist_wave(self.device.caps().sm_count, tiles);
-        let persist =
-            wave.is_some() && self.artifacts.get("gemv_q4_k_dp4a_persist_f16").is_ok();
         // Narrow staging when the activation fits it: same arithmetic, a
-        // quarter of the shared memory, so an SM can hold more of these blocks.
-        let k = match persist {
-            true => match (cols <= 4096)
-                .then(|| self.artifacts.get("gemv_q4_k_dp4a_persist_x4k_f16").ok())
-                .flatten()
-            {
-                Some(n) => n,
-                None => self.artifacts.get("gemv_q4_k_dp4a_persist_f16")?,
-            },
-            false => self.artifacts.get("gemv_q4_k_dp4a_f16")?,
+        // quarter of the shared memory, and a block of four warps rather than
+        // eight — so a multiprocessor holds the same warps in more, and
+        // therefore shorter, grid strides.
+        let narrow = (cols <= 4096)
+            .then(|| self.artifacts.get("gemv_q4_k_dp4a_persist_x4k_f16").ok())
+            .flatten();
+        // One warp to a row, so a block's rows and its warps are one count.
+        let per_block = if narrow.is_some() { 4 } else { 8 };
+        let tiles = (rows as u32).div_ceil(per_block);
+        let wave = persist_wave(self.device.caps().sm_count, per_block, tiles);
+        let wide = || self.artifacts.get("gemv_q4_k_dp4a_persist_f16").ok();
+        let one_wave = narrow
+            .and_then(|n| Some((wave?, n, BLOCK / 2)))
+            .or_else(|| Some((wave?, wide()?, BLOCK)));
+        let plain = self.artifacts.get("gemv_q4_k_dp4a_f16");
+        let (grid, k, block) = match one_wave {
+            Some(w) => w,
+            None => ((rows as u32).div_ceil(8), plain?, BLOCK),
         };
         let cfg = LaunchConfig {
-            grid: (if persist { wave.unwrap_or(tiles) } else { tiles }, 1, 1),
-            block: (BLOCK, 1, 1),
+            grid: (grid, 1, 1),
+            block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -775,8 +774,6 @@ impl Kernels {
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
-
-
 
     /// Q4_K logit GEMV (f32 out) with dp4a dots.
     #[allow(clippy::too_many_arguments)]
@@ -1861,5 +1858,4 @@ impl Kernels {
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
-
 }

@@ -42,7 +42,7 @@ comptime MAX_HIDDEN = 8192
 comptime X_MAX = 16384
 
 # Superblocks whose weight loads a decode dot issues before consuming any.
-comptime DOT_UNROLL = 4
+comptime DOT_UNROLL = 2
 comptime XDS_MAX = X_MAX // 32 * 2
 comptime XDS_HID = MAX_HIDDEN // 32 * 2
 
@@ -96,7 +96,7 @@ def _stage_quant_global(
         (xq + s_i * 32).store[alignment=32](q)
         xds[2 * s_i] = d
         xds[2 * s_i + 1] = s
-        s_i += 256
+        s_i += Int(block_dim.x)
     barrier()
 
 
@@ -279,38 +279,40 @@ def _dot_q4k_i8(
     n_cols: Int,
     lane: Int,
 ) -> Float32:
-    # Warp-cooperative Q4_K row dot in llama.cpp's mmvq decomposition
-    # (vec_dot_q4_K_q8_1, VDR=2): 16 lanes share one superblock, each lane
-    # owns two int32 quant words 16 bytes apart, so a warp's weight loads are
-    # consecutive 4-byte words instead of 72-byte-strided vector loads. The
-    # dmin term uses the true f32 segment sums staged in xds (more precise
-    # than llama.cpp's quantized dot2 sum); lane w4==0 adds it once per
-    # segment pair.
+    # Warp-cooperative Q4_K row dot. The arithmetic is llama.cpp's
+    # vec_dot_q4_K_q8_1; the LANE MAPPING is not. Theirs gives a lane two int32
+    # quant words sixteen bytes apart, which spreads one warp instruction over
+    # four disjoint runs of a superblock. Here a lane owns SIXTEEN CONSECUTIVE
+    # BYTES, so eight lanes cover a superblock's 128 quant bytes in one
+    # contiguous run and a warp covers four superblocks per step.
+    #
+    # The measured reason: this dot spends 97,8% of its 46,9 cycles between
+    # issues stalled on `long_scoreboard`, and a plain grid-striding read of the
+    # same memory with 16-byte loads sustains 237 GB/s on this part while the
+    # 4-byte form of this kernel sustained about 150. Same bytes, a quarter of
+    # the requests.
     blocks_per_row = n_cols // 256
     row_base = row * blocks_per_row * 144
-    i = lane % 16
-    j = i // 4  # scale/chunk pair index; lo/hi segments are 2j / 2j+1
-    w4 = i % 4
+    p = lane % 8
+    c = p // 2  # 32-byte chunk; its low/high nibbles are segments 2c / 2c+1
+    half = p % 2  # which sixteen bytes of the chunk this lane owns
     xqi = xq.bitcast[Int32]()
 
     var acc: Float32 = 0.0
     var min_acc: Float32 = 0.0
-    var b = lane // 16
+    var b = lane // 8
 
     # DOT_UNROLL superblocks' worth of weight loads are issued before any of
-    # them is consumed. The profiler charged this dot 53,14 stalled
-    # instructions per issue to `long_scoreboard` at 11,8% issue activity: a
-    # decode GEMV is not short of bandwidth, it is short of REQUESTS IN FLIGHT,
-    # and one superblock at a time keeps only four or five per warp against the
-    # dozens the latency needs. The accumulation order is unchanged — the
-    # unrolled body adds b, then b + 2, in that order — so the answer is bit for
-    # bit what the rolled loop gave.
-    while b + (DOT_UNROLL - 1) * 2 < blocks_per_row:
+    # them is consumed: a decode GEMV is not short of bandwidth, it is short of
+    # REQUESTS IN FLIGHT, and one superblock at a time keeps only a handful per
+    # warp against the dozens the latency needs.
+    while b + (DOT_UNROLL - 1) * 4 < blocks_per_row:
         var dm = InlineArray[SIMD[DType.float16, 2], DOT_UNROLL](
             fill=SIMD[DType.float16, 2](0)
         )
-        var v0 = InlineArray[Int32, DOT_UNROLL](fill=0)
-        var v1 = InlineArray[Int32, DOT_UNROLL](fill=0)
+        var qv = InlineArray[SIMD[DType.uint32, 4], DOT_UNROLL](
+            fill=SIMD[DType.uint32, 4](0)
+        )
         var scs = InlineArray[SIMD[DType.float32, 2], DOT_UNROLL](
             fill=SIMD[DType.float32, 2](0)
         )
@@ -318,56 +320,53 @@ def _dot_q4k_i8(
             fill=SIMD[DType.float32, 2](0)
         )
         comptime for u in range(DOT_UNROLL):
-            off = row_base + (b + u * 2) * 144
+            off = row_base + (b + u * 4) * 144
             dm[u] = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
-            qp = (w + off + 16 + j * 32 + 4 * w4).bitcast[Int32]()
-            v0[u] = qp[0]
-            v1[u] = qp[4]
-            scs[u], mns[u] = _q4k_scale_pair(w, off, j)
+            qv[u] = (w + off + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
+                width=4, alignment=16
+            ]()
+            scs[u], mns[u] = _q4k_scale_pair(w, off, c)
         comptime for u in range(DOT_UNROLL):
-            seg = (b + u * 2) * 8 + 2 * j
-            u0a = xqi[seg * 8 + w4]
-            u0b = xqi[seg * 8 + w4 + 4]
-            u1a = xqi[seg * 8 + 8 + w4]
-            u1b = xqi[seg * 8 + 12 + w4]
-            s_lo = _dp4a(v1[u] & 0x0F0F0F0F, u0b, _dp4a(v0[u] & 0x0F0F0F0F, u0a, 0))
-            s_hi = _dp4a(
-                (v1[u] >> 4) & 0x0F0F0F0F, u1b, _dp4a((v0[u] >> 4) & 0x0F0F0F0F, u1a, 0)
-            )
+            seg = (b + u * 4) * 8 + 2 * c
+            var s_lo: Int32 = 0
+            var s_hi: Int32 = 0
+            comptime for t in range(4):
+                q = Int32(qv[u][t])
+                s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + half * 4 + t], s_lo)
+                s_hi = _dp4a(
+                    (q >> 4) & 0x0F0F0F0F, xqi[seg * 8 + 8 + half * 4 + t], s_hi
+                )
             d = Float32(dm[u][0])
             acc += d * scs[u][0] * xds[2 * seg] * Float32(s_lo)
             acc += d * scs[u][1] * xds[2 * seg + 2] * Float32(s_hi)
-            if w4 == 0:
+            if half == 0:
                 min_acc += Float32(dm[u][1]) * (
                     mns[u][0] * xds[2 * seg + 1] + mns[u][1] * xds[2 * seg + 3]
                 )
-        b += DOT_UNROLL * 2
+        b += DOT_UNROLL * 4
 
     while b < blocks_per_row:
         off = row_base + b * 144
         dm1 = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
         d = Float32(dm1[0])
-        dmin = Float32(dm1[1])
-        sc, mn = _q4k_scale_pair(w, off, j)
-        qp = (w + off + 16 + j * 32 + 4 * w4).bitcast[Int32]()
-        # Low nibbles = segment 2j, high nibbles = segment 2j+1 of the
-        # 32-byte chunk; each lane dots 2x8 int8 columns of each.
-        lo0 = qp[0] & 0x0F0F0F0F
-        lo1 = qp[4] & 0x0F0F0F0F
-        hi0 = (qp[0] >> 4) & 0x0F0F0F0F
-        hi1 = (qp[4] >> 4) & 0x0F0F0F0F
-        seg = b * 8 + 2 * j
-        u0a = xqi[seg * 8 + w4]
-        u0b = xqi[seg * 8 + w4 + 4]
-        u1a = xqi[seg * 8 + 8 + w4]
-        u1b = xqi[seg * 8 + 12 + w4]
-        s_lo = _dp4a(lo1, u0b, _dp4a(lo0, u0a, 0))
-        s_hi = _dp4a(hi1, u1b, _dp4a(hi0, u1a, 0))
+        sc, mn = _q4k_scale_pair(w, off, c)
+        qv1 = (w + off + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
+            width=4, alignment=16
+        ]()
+        seg = b * 8 + 2 * c
+        var s_lo: Int32 = 0
+        var s_hi: Int32 = 0
+        comptime for t in range(4):
+            q = Int32(qv1[t])
+            s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + half * 4 + t], s_lo)
+            s_hi = _dp4a((q >> 4) & 0x0F0F0F0F, xqi[seg * 8 + 8 + half * 4 + t], s_hi)
         acc += d * sc[0] * xds[2 * seg] * Float32(s_lo)
         acc += d * sc[1] * xds[2 * seg + 2] * Float32(s_hi)
-        if w4 == 0:
-            min_acc += dmin * (mn[0] * xds[2 * seg + 1] + mn[1] * xds[2 * seg + 3])
-        b += 2
+        if half == 0:
+            min_acc += Float32(dm1[1]) * (
+                mn[0] * xds[2 * seg + 1] + mn[1] * xds[2 * seg + 3]
+            )
+        b += 4
     return warp.sum(acc - min_acc)
 
 
@@ -394,50 +393,55 @@ def _dot2_q4k_i8(
     blocks_per_row = n_cols // 256
     base_g = row_g * blocks_per_row * 144
     base_u = row_u * blocks_per_row * 144
-    i = lane % 16
-    j = i // 4
-    w4 = i % 4
+    p = lane % 8
+    c = p // 2
+    half = p % 2
     xqi = xq.bitcast[Int32]()
 
     var acc_g: Float32 = 0.0
     var min_g: Float32 = 0.0
     var acc_u: Float32 = 0.0
     var min_u: Float32 = 0.0
-    var b = lane // 16
+    var b = lane // 8
     while b < blocks_per_row:
         off_g = base_g + b * 144
         off_u = base_u + b * 144
         dm_g = (w_g + off_g).bitcast[Float16]().load[width=2, alignment=4]()
         dm_u = (w_u + off_u).bitcast[Float16]().load[width=2, alignment=4]()
-        sc_g, mn_g = _q4k_scale_pair(w_g, off_g, j)
-        sc_u, mn_u = _q4k_scale_pair(w_u, off_u, j)
-        qp_g = (w_g + off_g + 16 + j * 32 + 4 * w4).bitcast[Int32]()
-        qp_u = (w_u + off_u + 16 + j * 32 + 4 * w4).bitcast[Int32]()
-        v0g = qp_g[0]
-        v1g = qp_g[4]
-        v0u = qp_u[0]
-        v1u = qp_u[4]
-        seg = b * 8 + 2 * j
-        u0a = xqi[seg * 8 + w4]
-        u0b = xqi[seg * 8 + w4 + 4]
-        u1a = xqi[seg * 8 + 8 + w4]
-        u1b = xqi[seg * 8 + 12 + w4]
-        s_lo_g = _dp4a(v1g & 0x0F0F0F0F, u0b, _dp4a(v0g & 0x0F0F0F0F, u0a, 0))
-        s_hi_g = _dp4a((v1g >> 4) & 0x0F0F0F0F, u1b, _dp4a((v0g >> 4) & 0x0F0F0F0F, u1a, 0))
-        s_lo_u = _dp4a(v1u & 0x0F0F0F0F, u0b, _dp4a(v0u & 0x0F0F0F0F, u0a, 0))
-        s_hi_u = _dp4a((v1u >> 4) & 0x0F0F0F0F, u1b, _dp4a((v0u >> 4) & 0x0F0F0F0F, u1a, 0))
+        sc_g, mn_g = _q4k_scale_pair(w_g, off_g, c)
+        sc_u, mn_u = _q4k_scale_pair(w_u, off_u, c)
+        qv_g = (w_g + off_g + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
+            width=4, alignment=16
+        ]()
+        qv_u = (w_u + off_u + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
+            width=4, alignment=16
+        ]()
+        seg = b * 8 + 2 * c
+        var s_lo_g: Int32 = 0
+        var s_hi_g: Int32 = 0
+        var s_lo_u: Int32 = 0
+        var s_hi_u: Int32 = 0
+        comptime for t in range(4):
+            xl = xqi[seg * 8 + half * 4 + t]
+            xh = xqi[seg * 8 + 8 + half * 4 + t]
+            qg = Int32(qv_g[t])
+            qu = Int32(qv_u[t])
+            s_lo_g = _dp4a(qg & 0x0F0F0F0F, xl, s_lo_g)
+            s_hi_g = _dp4a((qg >> 4) & 0x0F0F0F0F, xh, s_hi_g)
+            s_lo_u = _dp4a(qu & 0x0F0F0F0F, xl, s_lo_u)
+            s_hi_u = _dp4a((qu >> 4) & 0x0F0F0F0F, xh, s_hi_u)
         acc_g += Float32(dm_g[0]) * sc_g[0] * xds[2 * seg] * Float32(s_lo_g)
         acc_g += Float32(dm_g[0]) * sc_g[1] * xds[2 * seg + 2] * Float32(s_hi_g)
         acc_u += Float32(dm_u[0]) * sc_u[0] * xds[2 * seg] * Float32(s_lo_u)
         acc_u += Float32(dm_u[0]) * sc_u[1] * xds[2 * seg + 2] * Float32(s_hi_u)
-        if w4 == 0:
+        if half == 0:
             min_g += Float32(dm_g[1]) * (
                 mn_g[0] * xds[2 * seg + 1] + mn_g[1] * xds[2 * seg + 3]
             )
             min_u += Float32(dm_u[1]) * (
                 mn_u[0] * xds[2 * seg + 1] + mn_u[1] * xds[2 * seg + 3]
             )
-        b += 2
+        b += 4
     return SIMD[DType.float32, 2](warp.sum(acc_g - min_g), warp.sum(acc_u - min_u))
 
 
@@ -674,7 +678,7 @@ def gemv_q4_k_dp4a_f16(
 
 
 @always_inline
-def gemv_q4_k_dp4a_persist_impl[XCAP: Int](
+def gemv_q4_k_dp4a_persist_impl[XCAP: Int, RPB: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
@@ -707,8 +711,8 @@ def gemv_q4_k_dp4a_persist_impl[XCAP: Int](
     _stage_quant_global(x, xq, xds, n_cols, tid)
     lane = tid % WARP
     wid = tid // WARP
-    var row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
-    stride = Int(grid_dim.x) * ROWS_PER_BLOCK
+    var row = Int(block_idx.x) * RPB + wid
+    stride = Int(grid_dim.x) * RPB
     while row < n_rows:
         total = _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
         if lane == 0:
@@ -721,8 +725,8 @@ def gemv_q4_k_dp4a_persist_impl[XCAP: Int](
 # measured here needs a quarter of that. The narrow variant is not a different
 # kernel — same arithmetic, same bit-for-bit answer — it just does not reserve
 # what its shape cannot use.
-comptime gemv_q4_k_dp4a_persist_f16 = gemv_q4_k_dp4a_persist_impl[X_MAX]
-comptime gemv_q4_k_dp4a_persist_x4k_f16 = gemv_q4_k_dp4a_persist_impl[4096]
+comptime gemv_q4_k_dp4a_persist_f16 = gemv_q4_k_dp4a_persist_impl[X_MAX, 8]
+comptime gemv_q4_k_dp4a_persist_x4k_f16 = gemv_q4_k_dp4a_persist_impl[4096, 4]
 
 
 def gemv_q4_k_dp4a_f16_gidx(
