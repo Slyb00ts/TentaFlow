@@ -795,3 +795,33 @@ wobec 35 us formy wektorowej, czyli 20 GB/s; generacja spadła z 49,3 do 26,4
 tok/s. Tamte 199 GB/s pochodzą z wywołania obejmującego wszystkich 256 ekspertów
 i nie przenoszą się na osiem. Kafel macierzowy potrzebuje pracy w wymiarze
 tokenów, a krok jej nie ma.
+
+### Prefill: sufit to 98 GB/s, a nie 222, i wąskim gardłem jest kafel zgrupowany
+
+Prefill 512 tokenów po ośmiu ekspertach ze stu dwudziestu ośmiu (albo ośmiu z
+256) dotyka PRAKTYCZNIE KAŻDEGO eksperta, więc musi przeczytać cały plik: 18 GB
+dla Qwen3-30B Q4_K i 19 GB dla Qwen3.6-35B MXFP4. To jest miara, w której
+trzeba czytać wynik. llama.cpp robi oba w 183 i 194 ms, czyli oba przy 98 GB/s
+— nie przy suficie pamięci. My jesteśmy przy 78 GB/s na hybrydzie i 57 GB/s na
+mieszance, i cała różnica siedzi w kaflu zgrupowanym MoE.
+
+Dwa pomiary z tej ścieżki, oba zaskakujące w przeciwną stronę:
+
+Kwantyzacja aktywacji do MXFP4 była 12% prefillu, choć czyta 21 MB. Czytała
+blok trzema przebiegami po trzydzieści dwa ładunki SKALARNE, a sąsiednie linie
+fali dzieliły trzydzieści dwie wartości, więc każdy ładunek ciągnął własny
+sektor: 30 GB/s. Jeden ładunek wektorowy na blok plus rekonstrukcja e2m1
+składana z bitów zamiast czytana z tablicy (indeks z rejestru ląduje w pamięci
+lokalnej) dały 443 -> 83 us na wywołanie i prefill 1790 -> 1974 tok/s.
+
+Wyrównanie odczytu wagi, które w formie wektorowej dało dziesięciokrotność, w
+kaflu dało 0,8%. Kafel czyta z każdego wiersza tylko `34 * KSTEP` bajtów, a
+wiersze dzieli cały `blocks_per_row * 34`, więc kosztuje go GŁĘBOKOŚĆ
+PRZEJŚCIA, a nie wyrównanie: dwa bloki `k` zamiast jednego dały 1989 -> 2119
+tok/s, a cztery — 1904, bo trzydzieści sześć rejestrów zapowiedzi zabiera
+zajętość. Optimum jest wewnątrz i trzeba je znaleźć pomiarem.
+
+Ta sama diagnoza czeka na `gemm_i8mma_grouped` (63% prefillu mieszanki, 66
+GB/s): przy `BN=64` i czterech liniach na wiersz jedna linia sztapluje CZTERY I
+PÓŁ BAJTA Q4_K na przejście. Głębsze przejście wymaga tam przebudowy
+podwójnego buforowania, więc nie jest zmianą jednego parametru.
