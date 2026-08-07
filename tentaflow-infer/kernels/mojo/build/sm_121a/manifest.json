@@ -729,6 +729,10 @@
       "entry": "src_gemm_fp4_gemm_mxf4_grouped6A6A6A6A_9b1570cf62e8bdbf",
       "file": "gemm_mxf4_grouped_f16_bm128_bn32.ptx"
     },
+    "gemm_mxf4_grouped_f16_bm128_bn32_k2": {
+      "entry": "src_gemm_fp4_gemm_mxf4_grouped6A6A6A6A_11fe83a8dcf6c8ff",
+      "file": "gemm_mxf4_grouped_f16_bm128_bn32_k2.ptx"
+    },
     "gemm_mxfp4_gguf_f16": {
       "entry": "src_gemm_gemm_mxfp4_gguf_impl6A6A6A6AcB_4db4a9fb501fa2d5",
       "file": "gemm_mxfp4_gguf_f16.ptx"

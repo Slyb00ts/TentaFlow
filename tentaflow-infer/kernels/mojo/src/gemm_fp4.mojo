@@ -48,13 +48,18 @@ def _mxfp4_word(
         return UInt32(lo[0]) | (UInt32(lo[MXFP4_BYTES]) << 8)
     half = (word - 1) // 4
     b = lo + half * MXFP4_BYTES + 1 + 4 * ((word - 1) % 4)
-    v = b.load[width=4, alignment=1]()
-    return (
-        UInt32(v[0])
-        | (UInt32(v[1]) << 8)
-        | (UInt32(v[2]) << 16)
-        | (UInt32(v[3]) << 24)
-    )
+    # Cztery bajty spod adresu nieparzystego składają się z DWÓCH SŁÓW
+    # WYRÓWNANYCH. Żądanie czterech bajtów pod wyrównaniem jednego nie jest
+    # instrukcją, którą ta karta ma: kompilator rozwija je na cztery osobne
+    # odczyty bajtowe, czyli czterokrotność zarówno instrukcji, jak i transakcji.
+    #
+    # Drugie słowo sięga do czterech bajtów za czytaną czwórkę. Alokacje
+    # urządzenia zaokrąglają się do 256 bajtów wewnątrz jednej zarezerwowanej
+    # areny, więc ten odczyt nie wychodzi poza pulę.
+    mis = Int(b) & 3
+    words = (b - mis).bitcast[UInt32]()
+    pair = UInt64(words[0]) | (UInt64(words[1]) << 32)
+    return UInt32((pair >> UInt64(mis << 3)) & 0xFFFFFFFF)
 
 
 def _gemm_fp4_tile[
@@ -333,4 +338,15 @@ comptime gemm_nvfp4_mma_f16_bm128_bn256 = gemm_nvfp4_mma_impl[2, 4, 4, 8, 1]
 # kafel szerszy liczyłby zera. Wiersze wyjścia zostają szerokie, bo to one
 # amortyzują odczyt wagi eksperta.
 comptime gemm_mxf4_grouped_f16_bm128_bn16 = gemm_mxf4_grouped_impl[4, 1, 2, 2, 1]
+comptime gemm_mxf4_grouped_f16_bm128_bn32_k2 = gemm_mxf4_grouped_impl[4, 1, 2, 4, 2]
+"""Dwa bloki `k` na przejscie zamiast jednego.
+
+Kafel czyta z kazdego wiersza tylko `34 * KSTEP` bajtow, a wiersze dzieli caly
+`blocks_per_row * 34`, wiec plytkie przejscie ciagnie trzy sektory po trzydziesci
+dwa bajty na trzydziesci cztery uzyte i placi bariera za kazdy blok. Glebsze
+placi za to pamiecia wspoldzielona i rejestrami zapowiedzi, wiec optimum jest
+wewnatrz: prefill 512 tokenow to 1989 tok/s przy jednym bloku, 2119 przy dwoch i
+1904 przy czterech, gdzie trzydziesci szesc rejestrow zapowiedzi zabiera
+zajetosc. Ogon krotszy niz `KSTEP` jest bezpieczny, bo mnozenie sprawdza
+`block0 + kblk` — dlatego to nie musi dzielic `blocks_per_row`."""
 comptime gemm_mxf4_grouped_f16_bm128_bn32 = gemm_mxf4_grouped_impl[4, 1, 2, 4, 1]

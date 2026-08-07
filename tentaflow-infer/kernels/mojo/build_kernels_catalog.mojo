@@ -622,6 +622,7 @@ from src.sampling import penalize_histogram_f32, penalized_argmax_f32
 from src.gemm_fp4 import (
     gemm_mxf4_grouped_f16_bm128_bn16,
     gemm_mxf4_grouped_f16_bm128_bn32,
+    gemm_mxf4_grouped_f16_bm128_bn32_k2,
     gemm_nvfp4_mma_f16_bm64_bn64,
     gemm_nvfp4_mma_f16_bm128_bn128,
     gemm_nvfp4_mma_f16_bm128_bn256,
@@ -3264,6 +3265,12 @@ def main() raises:
         gemm_mxf4_grouped_f16_bm128_bn32, dump_asm=Path("gemm_mxf4_grouped_f16_bm128_bn32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_mxf4_grouped_f16_bm128_bn32"))
+
+    _ = ctx.compile_function[
+        gemm_mxf4_grouped_f16_bm128_bn32_k2,
+        dump_asm=Path("gemm_mxf4_grouped_f16_bm128_bn32_k2.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_mxf4_grouped_f16_bm128_bn32_k2"))
 
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_f16_gidx_batch,
