@@ -17,7 +17,7 @@
 from std.gpu import block_dim, block_idx, thread_idx
 from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
-from std.memory import UnsafePointer, stack_allocation
+from std.memory import UnsafePointer, bitcast, stack_allocation
 from std.sys import _RegisterPackType
 from std.sys._assembly import inlined_assembly
 
@@ -53,27 +53,50 @@ def _to_e4m3(value: Float32) -> UInt32:
 
 
 @always_inline
+def _to_e2m1_mag(a: Float32) -> UInt32:
+    """Kod e2m1 najbliższy `a >= 0`, bez bitu znaku.
+
+    ILE PROGÓW przekroczyła wartość, a nie łańcuch siedmiu gałęzi: kwantyzacja
+    aktywacji woła to trzy razy na wartość, więc rozgałęzienie liczyło się tu
+    bardziej niż porównanie. Nieskończoność przechodzi wszystkie siedem, czyli
+    przycina się do szóstki tak samo jak wcześniej, a NaN nie przechodzi
+    żadnego.
+    """
+    return (
+        UInt32(Int(a >= 0.25))
+        + UInt32(Int(a >= 0.75))
+        + UInt32(Int(a >= 1.25))
+        + UInt32(Int(a >= 1.75))
+        + UInt32(Int(a >= 2.5))
+        + UInt32(Int(a >= 3.5))
+        + UInt32(Int(a >= 5.0))
+    )
+
+
+@always_inline
 def _to_e2m1(value: Float32) -> UInt32:
     """Kod e2m1 najbliższy `value`; wartość spoza zakresu przycina się do 6."""
-    a = abs(value)
-    var code: UInt32 = 0
-    if a >= 5.0:
-        code = 7
-    elif a >= 3.5:
-        code = 6
-    elif a >= 2.5:
-        code = 5
-    elif a >= 1.75:
-        code = 4
-    elif a >= 1.25:
-        code = 3
-    elif a >= 0.75:
-        code = 2
-    elif a >= 0.25:
-        code = 1
-    if value < 0.0:
-        code |= 0x8
-    return code
+    code = _to_e2m1_mag(abs(value))
+    return code | 0x8 if value < 0.0 else code
+
+
+@always_inline
+def _e2m1_mag_value(code: UInt32) -> Float32:
+    """Liczba, którą instrukcja odczyta z tego półbajtu bez znaku.
+
+    Składana z bitów, a nie czytana z tablicy: indeks tablicy jest tu wartością
+    z rejestru, więc kompilator odkłada ją do pamięci lokalnej i każdy odczyt
+    schodzi poza multiprocesor.
+
+    Wykładnik e2m1 to `code >> 1` przy odchyleniu jeden, czyli `+126` w f32;
+    mantysa istnieje dopiero od `code >= 2`, bo `0,5` jest tu postacią
+    zdenormalizowaną.
+    """
+    e = code >> 1
+    mant = (code & 1) & ((e + 3) >> 2)
+    bits = ((e + 126) << 23) | (mant << 22)
+    nonzero = UInt32(0) - ((code + 7) >> 3)
+    return bitcast[DType.float32, 1](bits & nonzero)
 
 
 def quantize_act_nvfp4(
@@ -181,9 +204,15 @@ def quantize_act_mxf4(
     var b = tid
     while b < blocks:
         base = b * MXFP4_BLOCK
-        var amax: Float32 = 0.0
-        for j in range(MXFP4_BLOCK):
-            amax = max(amax, abs(Float32(row[base + j])))
+        # Blok wchodzi JEDNYM ładunkiem wektorowym. Trzy przebiegi po trzydzieści
+        # dwa ładunki skalarne kosztowały tu więcej niż cała reszta kernela:
+        # sąsiednie linie fali dzieli trzydzieści dwie wartości, więc każdy z
+        # nich ciągnął własny sektor i przejście szło 30 GB/s.
+        vv = (row + base).load[width=MXFP4_BLOCK, alignment=64]().cast[
+            DType.float32
+        ]()
+        av = abs(vv)
+        amax = av.reduce_max()
         # Skala jest POTĘGĄ DWÓJKI, bo UE8M0 nie ma mantysy, więc zaokrąglenie
         # w górę marnuje do jednego bitu z dwóch, które ma e2m1 — a zaokrąglenie
         # w dół przycina szczyt bloku do 6. Który z dwóch kandydatów jest lepszy,
@@ -199,10 +228,13 @@ def quantize_act_mxf4(
             lo_step = _e8m0(UInt8(code - 1))
             hi_inv = 1.0 / hi_step
             lo_inv = 1.0 / lo_step
-            for j in range(MXFP4_BLOCK):
-                v = Float32(row[base + j])
-                d_hi = v - _e2m1_value(_to_e2m1(v * hi_inv)) * hi_step
-                d_lo = v - _e2m1_value(_to_e2m1(v * lo_inv)) * lo_step
+            # Na module, nie na wartości ze znakiem: rekonstrukcja niesie znak
+            # wejścia, więc różnica jest co do bitu przeciwna, a jej kwadrat ten
+            # sam — a moduł oszczędza bit znaku w obu wywołaniach.
+            comptime for j in range(MXFP4_BLOCK):
+                a = av[j]
+                d_hi = a - _e2m1_mag_value(_to_e2m1_mag(a * hi_inv)) * hi_step
+                d_lo = a - _e2m1_mag_value(_to_e2m1_mag(a * lo_inv)) * lo_step
                 err_hi += d_hi * d_hi
                 err_lo += d_lo * d_lo
             if err_lo < err_hi:
@@ -214,21 +246,11 @@ def quantize_act_mxf4(
         half = b % 2
         dst[pair * BLOCK_BYTES + half] = UInt8(code)
         bytes_out = dst + pair * BLOCK_BYTES + 4 + half * 16
-        for j in range(16):
-            lo = _to_e2m1(Float32(row[base + j]) * inv)
-            hi = _to_e2m1(Float32(row[base + j + 16]) * inv)
+        comptime for j in range(16):
+            lo = _to_e2m1(vv[j] * inv)
+            hi = _to_e2m1(vv[j + 16] * inv)
             bytes_out[j] = UInt8(lo | (hi << 4))
         b += threads
-
-
-@always_inline
-def _e2m1_value(code: UInt32) -> Float32:
-    """Liczba, którą instrukcja odczyta z tego półbajtu."""
-    comptime MAG = SIMD[DType.float32, 8](
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-    )
-    v = MAG[Int(code & 0x7)]
-    return -v if (code & 0x8) != 0 else v
 
 
 @always_inline
