@@ -1,6 +1,8 @@
 // ===== File: formats.rs — which kernel multiplies which quantization =====
 
-use super::CudaExec;
+use super::{CudaExec, Quantized};
+
+use crate::launchers::Kernels;
 
 use forge_hal::DevBuffer;
 use forge_types::{ForgeError, QuantKind, Result};
@@ -160,5 +162,37 @@ block_formats! {
     // dlatego osobna sekcja, a nie kolejny wiersz.
     scaled {
     NVFP4Gguf => gemv_nvfp4_gguf_f16, gemm_nvfp4_gguf_f16, gemv_nvfp4_gguf_out_f32;
+    }
+}
+
+impl CudaExec {
+    /// Jeden wiersz przez wagę: forma z aktywacją w int8, gdy format ją ma i
+    /// szerokość się mieści, inaczej tablica formatów.
+    ///
+    /// `rows` jest osobnym argumentem, bo warstwa rekurencyjna liczy oknem
+    /// węższym niż cała waga.
+    pub(super) fn gemv_decode(
+        &self,
+        w: &Quantized,
+        y: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+    ) -> Result<()> {
+        if w.cols <= Kernels::DP4A_MAX_COLS {
+            let s = &self.stream;
+            match w.quant {
+                QuantKind::Q8_0 => {
+                    return self.kernels.gemv_q8_0_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                }
+                QuantKind::Q6K => {
+                    return self.kernels.gemv_q6_k_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                }
+                QuantKind::Q4K => {
+                    return self.kernels.gemv_q4_k_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                }
+                _ => {}
+            }
+        }
+        self.gemv_by_kind(w.quant, y, &w.blocks, x, rows, w.cols, w.output_scale)
     }
 }
