@@ -1155,3 +1155,48 @@ Pomiar dekodu: mieszanka 71,7 -> 78,0 tok/s, hybryda 61,9 -> 62,4, gęsty
 Licząc od początku dnia: prefill mieszanki 0,71x -> 0,985x, dekod mieszanki
 0,77x -> 0,96x, dekod hybrydy 0,87x -> 0,97x, gęsty prefill 1,82x -> 1,96x.
 Zostaje prefill hybrydy (0,93x) i dekod gęstego (0,91x).
+
+### Dekod gęstego: co zmierzono i co z tego wyszło
+
+Trzy hipotezy, dwie obalone, jedna częściowa — zapisane, bo każda kosztowała
+przebieg i żadnej nie warto sprawdzać drugi raz.
+
+**`PERSIST_GRID = 384` NIE jest strojeniem pod tę kartę, ale też nie szkodzi.**
+Stała nosi komentarz „zmierzone na R9700" — innej karcie, o innej liczbie
+multiprocesorów. Na GB10 (48 SM) 384 bloków po 256 wątków to 64 warpy na SM
+przy limicie 48, więc trwałość siatki wygląda na pozorną. Przemiatanie
+96/144/192/240/288/384 dało 37,1-37,9 tok/s: PŁASKO. Hipoteza obalona,
+stała zostaje.
+
+**Wąskie sztaplowanie nie podniosło zajętości.** Kernel rezerwował 20 KiB
+pamięci współdzielonej (16 KiB `X_MAX` int8 + skale) niezależnie od tego, że
+Bielik potrzebuje 5 KiB. Wariant parametryzowany pojemnością zszedł do 5120 B —
+a zajętość nie drgnęła (58,4% -> 56,9%), bo ogranicza ją REJESTR (56 na wątek,
+cztery bloki na SM), nie pamięć współdzielona. Wariant zostaje, bo jest
+strukturalnie właściwy, ale sam z siebie nic nie dał.
+
+**Rozwinięcie pętli superbloków dało 2,9%.** Profiler naliczył temu iloczynowi
+53,14 zatrzymanych instrukcji na wydanie w `long_scoreboard` przy 11,8%
+aktywności wydawania: dekodowy GEMV nie jest głodny pasma, jest głodny ŻĄDAŃ W
+LOCIE, a jeden superblok naraz trzyma ich cztery-pięć na warp. `DOT_UNROLL = 4`
+wydaje wszystkie odczyty czterech superbloków przed konsumpcją któregokolwiek;
+kolejność akumulacji jest zachowana, więc wynik jest bitowo ten sam.
+`long_scoreboard` spadł 53,14 -> 46,22, czas kernela 65,1 -> 62,3 us, dekod
+gęstego 37,7 -> 38,7 tok/s. Kompilator NIE utrzymał pełnej czwórki w rejestrach
+(56 rejestrów bez zmian), więc zysk jest częściowy — reszta wymagałaby
+przepisania iloczynu na dekompozycję llama.cpp (dwa warpy na wiersz,
+`blocks_per_iter` obejmujące kilka superbloków).
+
+### Stan wobec llama.cpp, jeden stan maszyny, koniec dnia 2026-08-07
+
+`/opt/repos/llama.cpp` 6db1304 wobec FORGE `9de9d70`:
+
+                        llama pp512  FORGE pp512   llama tg32  FORGE tg32
+    Qwen3.6-35B MXFP4      2510,8      2322,9         61,73      62,1
+    Qwen3-30B Q4_K         2282,6      2253,4         82,59      79,0
+    Bielik 7B Q4_K         2636,8      5217,9         41,48      39,0
+
+Hybryda WYPRZEDZA w dekodzie (1,006x), gęsty prefill 1,98x. Zostaje prefill
+hybrydy (0,93x), dekod mieszanki (0,96x) i dekod gęstego (0,94x) — a dekod obu
+jest ograniczony odczytem wag, więc dalsza przewaga wymaga wyższej sprawności
+kernela, nie mniejszej liczby bajtów.
