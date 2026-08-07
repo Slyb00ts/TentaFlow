@@ -172,12 +172,6 @@ fn the_hybrid_continues_a_factual_prompt() {
     let prompt = tok
         .encode("The capital of France is", true)
         .expect("tokenizacja");
-    let long: Vec<u32> = prompt.iter().cycle().take(256).copied().collect();
-    let t = std::time::Instant::now();
-    let _ = model.prefill(0, &long).expect("prefill długi");
-    let took = t.elapsed().as_secs_f64();
-    eprintln!("prefill {} tokenów = {:.0} tok/s", long.len(), long.len() as f64 / took);
-    model.reset(0).expect("reset");
     let t = std::time::Instant::now();
     let out = model.generate(0, &prompt, 20).expect("generacja");
     let text = tok.decode(&out, true).expect("dekodowanie");
@@ -194,6 +188,35 @@ fn the_hybrid_continues_a_factual_prompt() {
     assert!(
         out.windows(4).any(|w| w.iter().any(|t| *t != w[0])),
         "kontynuacja to jeden powtarzany token: {out:?}"
+    );
+
+    // Ten sam prompt, tylko DŁUGI, i kontynuowany — a nie odłożony.
+    //
+    // Mieszanka wybiera kernel po tym, ile wierszy wypada na eksperta, więc
+    // krótki prompt nigdy nie wchodzi w kafel zgrupowany, który liczy prefill
+    // szerokiego promptu. Poprzednia postać tego testu wgrywała 256 tokenów
+    // WYŁĄCZNIE dla pomiaru przepustowości, po czym robiła `reset` i generowała
+    // z sześciu — więc wyjście kafla nie było sprawdzane przez nic. Kernel
+    // czytający trzy czwarte słów wagi spod przesuniętego adresu przechodził
+    // wtedy CAŁY zestaw bramek, będąc o jedną czwartą szybszym; łapie go
+    // dopiero to.
+    model.reset(0).expect("reset");
+    let long: Vec<u32> = prompt.iter().cycle().take(1024).copied().collect();
+    let t = std::time::Instant::now();
+    let wide = model.generate(0, &long, 20).expect("generacja z długiego");
+    let took = t.elapsed().as_secs_f64();
+    let wide_text = tok.decode(&wide, true).expect("dekodowanie długiego");
+    eprintln!(
+        "{} tokenów promptu w {took:.2} s: {wide_text:?}",
+        long.len()
+    );
+    assert!(
+        wide_text.contains("France") || wide_text.contains("Paris"),
+        "kontynuacja długiego promptu zgubiła jego treść: {wide_text:?}"
+    );
+    assert!(
+        wide.windows(4).any(|w| w.iter().any(|t| *t != w[0])),
+        "kontynuacja długiego promptu to jeden powtarzany token: {wide:?}"
     );
 }
 
